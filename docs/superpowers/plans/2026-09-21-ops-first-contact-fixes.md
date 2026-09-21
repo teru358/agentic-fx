@@ -1,7 +1,9 @@
-# [ops-first-contact-fixes] 実装プラン v1.1
+# [ops-first-contact-fixes] 実装プラン v1.2
 
-設計書: `docs/superpowers/specs/2026-09-21-ops-first-contact-fixes-design.md` v1.1。
-v1.0 からの変更点は末尾「変更履歴」、および裁定の詳細は `tmp/design-ops-first-contact/codex-r1/verdicts.md`。
+設計書: `docs/superpowers/specs/2026-09-21-ops-first-contact-fixes-design.md` v1.2。
+v1.1 (main `34d3dc9` コミット済) からの変更点は末尾「変更履歴」。v1.0→v1.1 裁定の詳細は
+`tmp/design-ops-first-contact/codex-r1/verdicts.md`、v1.1→v1.2 裁定 (W1〜W4/M1/M2、全件採用) の根拠は
+`tmp/design-ops-first-contact/codex-r2/codex-out.md`。
 対象コードは main `ceedd1d` の現物。**実装は codex (terra/medium) に渡す前提** — 各 task は
 「failing test を先に固定 (テスト名・観測点・逐語の期待値) → 本体の最小変更」までを codex に渡し、
 **red/green の実測とフルスイート・変異確認は指揮者側の subagent が受ける** (codex は read-only sandbox で
@@ -9,7 +11,7 @@ pytest を回せないことがあるため)。
 
 ## Global Constraints
 
-- **設計を変えない。** 設計書 v1.1 が正。設計書に無い判断が要るときは実装を止めて申告
+- **設計を変えない。** 設計書 v1.2 が正。設計書に無い判断が要るときは実装を止めて申告
   ([[plan-code-defects-not-implementer-defects]])
 - **秘密 env の守りを弱めない。** `_SECRET_ENV_PATTERNS` (`service.py:200-201`) は 1 文字も変えない。
   T2 が足す allowlist は**名前の完全一致のみ**で、パターン・正規表現・前方一致を許す実装にしない
@@ -66,8 +68,8 @@ pytest を回せないことがあるため)。
 | `src/agentic_fx/config.py` | `ServiceSettings` 新設 + `Settings.service` フィールド (T2) | T2 |
 | `src/agentic_fx/commands.py` | `improve add` の echo-back + 警告 (T3) | T3 |
 | `config/settings.yaml.example` | `service.secret_env_allowlist` 追記 (T2) | T2 |
-| `tests/test_service_app.py` | **追記**: AC-1a〜AC-1c (T1) / AC-2a〜AC-2f (T2)。**加えて (v1.1)** 既存 4 箇所の `object()` 引数 stub 差し替え + 既存 3 箇所の monkeypatch スタブ関数への `which=`/`backend=` kwargs 追加 (assert 本体は無改変、T2) | T1・T2 |
-| `tests/commands/test_improve_commands.py` | **追記**: AC-3a〜AC-3h (T3、v1.1 で AC-3f〜AC-3h 追加) | T3 |
+| `tests/test_service_app.py` | **追記**: AC-1a〜AC-1c (T1) / AC-2a〜AC-2g (T2、v1.2 で AC-2g 追加)。**加えて (v1.1)** 既存 4 箇所の `object()` 引数 stub 差し替え + 既存 3 箇所の monkeypatch スタブ関数への `which=`/`backend=` kwargs 追加 (assert 本体は無改変、T2) | T1・T2 |
+| `tests/commands/test_improve_commands.py` | **追記**: AC-3a〜AC-3i (T3、v1.1 で AC-3f〜AC-3h、v1.2 で AC-3i 追加) | T3 |
 
 ## 受入条件 (設計書 §5) と task の対応
 
@@ -77,14 +79,16 @@ pytest を回せないことがあるため)。
 | AC-1c (v1.1: spy 方式) | T1 | `test_commands_optional_params_all_wired_by_build_app` |
 | AC-2a / AC-2b / AC-2e | T2 | `test_check_service_initial_env_has_no_secrets_allowlist_excludes_exact_name` / `test_check_service_initial_env_has_no_secrets_rejects_each_pattern` (assert・parametrize 無改変、回帰) / `test_check_service_initial_env_has_no_secrets_allowlist_is_exact_match_only` |
 | AC-2c / AC-2d | T2 | `test_check_service_initial_env_has_no_secrets_message_includes_which_backend_and_pattern` |
-| AC-2f (v1.1、新規) | T2 | `test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only` / `test_check_service_initial_env_has_no_secrets_allowlist_hit_with_no_exclusion_does_not_warn` |
+| AC-2f (v1.1、v1.2 で pin 追加) | T2 | `test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only` / `test_check_service_initial_env_has_no_secrets_no_warning_when_nothing_excluded` / `test_check_service_initial_env_has_no_secrets_allowlist_hit_requires_pattern_match` (v1.2) / `test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorted` (v1.2) |
+| AC-2g (v1.2、新規) | T2 | `test_check_cli_backend_forwards_which_trade_to_secret_check` |
 | AC-3a / AC-3c | T3 | `test_improve_add_echoes_the_registered_idea_text` |
 | AC-3b | T3 | `test_improve_add_warns_on_short_or_placeholder_idea` |
 | AC-3d | T3 | `test_improve_add_does_not_block_registration_when_warned` |
 | AC-3e | T3 | `test_improve_add_warning_text_does_not_leak_to_backlog_last_result` |
 | AC-3f (v1.1、新規) | T3 | `test_improve_add_warns_and_notes_removed_chars_for_zero_width_input` |
 | AC-3g (v1.1、新規) | T3 | `test_improve_add_strips_terminal_control_sequences_from_reply` |
-| AC-3h (v1.1、新規) | T3 | `test_improve_add_normalizes_multiline_input_newline_to_space` |
+| AC-3h (v1.1、新規) | T3 | `test_normalize_idea_display_converts_newline_to_space_before_removing_control_chars` |
+| AC-3i (v1.2、新規) | T3 | `test_improve_add_stores_idea_without_display_normalization` |
 
 ## task 依存図
 
@@ -264,6 +268,42 @@ def _settings_stub(allowlist=()):
     return SimpleNamespace(service=SimpleNamespace(secret_env_allowlist=list(allowlist)))
 
 
+@contextmanager
+def _capture_service_warnings():
+    """[ops-first-contact-fixes] T2 (v1.2、codex r2 W2): 既存 import
+    (`tests/test_service_app.py:7` `from contextlib import contextmanager`)
+    を流用する (新規 import 不要)。`agentic_fx` logger は
+    プロセス内で一度でも `setup_technical_logging()` (`_init`/`run_init` 経由)
+    が走ると `propagate=False` に固定され、以後戻らない
+    (`src/agentic_fx/logging_setup.py:28-30`)。pytest の `caplog` は
+    `at_level(..., logger=...)` 呼び出し時点でレベルを変えるだけで、
+    non-propagating な子ロガーに新たに handler を付けはしない (フィクスチャ
+    開始時に既に non-propagating だったロガーにしか付かない) ため、
+    `_settings_stub()` でフル `Settings`/`_init` を避けても、**同一プロセス内で
+    他のテストが先に `_init`/`build_app` を実行していれば** `caplog` は
+    `agentic_fx.service` の WARNING を拾えない (テスト順序に依存する落とし穴)。
+    これを避けるため、`agentic_fx.service` logger 自身に直接 handler を
+    付けて記録し、`finally` で確実に外す。"""
+    import logging
+
+    logger = logging.getLogger("agentic_fx.service")
+    records: list[str] = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _ListHandler()
+    orig_level = logger.level
+    logger.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(orig_level)
+
+
 def test_check_service_initial_env_has_no_secrets_allowlist_excludes_exact_name():
     """[ops-first-contact-fixes] T2 (AC-2a): settings.service.secret_env_allowlist
     に完全一致で載っている名前は誤検知から除外される。"""
@@ -308,43 +348,112 @@ def test_check_service_initial_env_has_no_secrets_message_includes_which_backend
     assert "secret_env_allowlist" in msg
 
 
-def test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only(caplog):
-    """[ops-first-contact-fixes] T2 (AC-2f、v1.1、codex r1 V2): allowlist が
-    実際に除外した名前 (allowlist に載っていて、かつ env に実在し、かつ
-    秘密名パターンに当たった名前) があれば起動時 WARNING が 1 回出る。値は
-    出さず変数名のみ含む — seam (`read_initial_env_names`) は名前しか
-    返さない契約なので「caplog に記録された文字列がこの名前集合の範囲に
-    収まる」ことで値が混ざらないことを確認できる。"""
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only():
+    """[ops-first-contact-fixes] T2 (AC-2f、v1.1、codex r1 V2。**v1.2、codex r2
+    W2 で `caplog` から `_capture_service_warnings()` に差し替え** — `caplog`
+    はプロセス内で他のテストが先に `_init`/`build_app` を実行済みだと
+    `agentic_fx.service` の WARNING を拾えない、テスト順序に依存する落とし穴が
+    あったため): allowlist が実際に除外した名前 (allowlist に載っていて、
+    かつ env に実在し、かつ秘密名パターンに当たった名前) があれば起動時
+    WARNING が 1 回出る。値は出さず変数名のみ含む — seam
+    (`read_initial_env_names`) は名前しか返さない契約なので「記録された
+    文字列がこの名前集合の範囲に収まる」ことで値が混ざらないことを
+    確認できる。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
     settings = _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"])
-    with caplog.at_level("WARNING", logger="agentic_fx.service"):
+    with _capture_service_warnings() as records:
         _check_service_initial_env_has_no_secrets(
             settings, which="trade", backend="codex",
             read_initial_env_names=lambda: {
                 "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS", "HOME"})
-    assert "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS" in caplog.text
-    assert "secret_env_allowlist" in caplog.text
+    text = "\n".join(records)
+    assert "CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS" in text
+    assert "secret_env_allowlist" in text
 
 
-def test_check_service_initial_env_has_no_secrets_no_warning_when_nothing_excluded(caplog):
-    """[ops-first-contact-fixes] T2 (AC-2f 否定側、v1.1): allowlist が空、
-    または allowlist の名前が env に無いときは WARNING を出さない
-    (雑音にしない)。"""
+def test_check_service_initial_env_has_no_secrets_no_warning_when_nothing_excluded():
+    """[ops-first-contact-fixes] T2 (AC-2f 否定側、v1.1、v1.2 で
+    `_capture_service_warnings()` に差し替え): allowlist が空、または
+    allowlist の名前が env に無いときは WARNING を出さない (雑音にしない)。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
-    with caplog.at_level("WARNING", logger="agentic_fx.service"):
+    with _capture_service_warnings() as records:
         _check_service_initial_env_has_no_secrets(
             _settings_stub([]), which="trade", backend="codex",
             read_initial_env_names=lambda: {"HOME", "PATH"})
-    assert caplog.text == ""
+    assert records == []
 
-    with caplog.at_level("WARNING", logger="agentic_fx.service"):
+    with _capture_service_warnings() as records:
         _check_service_initial_env_has_no_secrets(
             _settings_stub(["CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS"]),
             which="trade", backend="codex",
             read_initial_env_names=lambda: {"HOME", "PATH"})
-    assert caplog.text == ""
+    assert records == []
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_requires_pattern_match():
+    """[ops-first-contact-fixes] T2 (AC-2f 否定側、v1.2、codex r2 W3):
+    allowlist に載っていて env にも実在するが、秘密名パターンに当たらない
+    名前では WARNING を出さない — 「allowlist に載っている」だけでは
+    出さない条件を、AC-2f の 3 条件のうち「パターンに当たる」の欠落を
+    個別に pin する (この条件が抜けると無関係な allowlist 登録全てが
+    毎回 WARNING を出す雑音になる)。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub(["HARMLESS_NAME"]), which="trade", backend="codex",
+            read_initial_env_names=lambda: {"HARMLESS_NAME", "HOME"})
+    assert records == []
+
+
+def test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorted():
+    """[ops-first-contact-fixes] T2 (AC-2f、v1.2、codex r2 W3): 複数名が
+    同時に除外されたとき、WARNING 本文の名前はソート順 (辞書順) で並ぶ —
+    集合のイテレーション順のまま出す変異 (`sorted()` を外す) を検出する。"""
+    from agentic_fx.service import _check_service_initial_env_has_no_secrets
+
+    with _capture_service_warnings() as records:
+        _check_service_initial_env_has_no_secrets(
+            _settings_stub(["Z_TOKEN", "A_TOKEN"]), which="trade", backend="codex",
+            read_initial_env_names=lambda: {"Z_TOKEN", "A_TOKEN", "HOME"})
+    text = "\n".join(records)
+    assert text.index("A_TOKEN") < text.index("Z_TOKEN")
+
+
+def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkeypatch):
+    """[ops-first-contact-fixes] T2 (AC-2g、v1.2、codex r2 W1): 既存の 2 本
+    (`test_build_app_rejects_when_service_initial_env_has_secret_pattern` /
+    `test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend`)
+    はどちらも trade が既定の local のままなので、`build_app` が到達するのは
+    常に `which="improve"` 経路のみ — `_check_cli_backend` 内の `which=which`
+    を `which="improve"` に固定する変異があっても、この 2 本は red にならない
+    (codex r1 レビューでは検出できなかった穴、codex r2 が指摘)。trade 側を
+    非 local (claude、`runner.trade.backend` は codex/opencode 不可
+    [`config.py:108-113`]) にした構成で `build_app` を実行し、実際に
+    到達する `which` が `"trade"` であることを pin する (`build_app` は
+    trade→improve の順で `_check_cli_backend` を呼ぶ `service.py:851-852` —
+    trade 側の検査⑤で例外を投げれば improve 側の呼び出しは走らない)。"""
+    import sys
+    import agentic_fx.service as service_mod
+
+    captured = {}
+
+    def _raise(settings, *, which=None, backend=None, read_initial_env_names=None):
+        captured["which"], captured["backend"] = which, backend
+        raise RuntimeError("SOME_SERVICE_API_KEY leaked")
+
+    monkeypatch.setattr(service_mod, "_check_service_initial_env_has_no_secrets", _raise)
+    creds_file = tmp_path / ".credentials.json"
+    creds_file.write_text('{"token":"x"}')
+    creds_file.chmod(0o600)
+    root = _root_with_settings(tmp_path, runner={
+        "trade": {"backend": "claude", "model": "m"},
+        "claude": {"bin": sys.executable, "credentials_file": str(creds_file)}})
+    with pytest.raises(RuntimeError, match="API_KEY"):
+        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    assert captured == {"which": "trade", "backend": "claude"}
 ```
 
 - [ ] **既存呼び出しの stub 差し替え (v1.1、Global Constraints 参照)。assert 本体・parametrize の値は
@@ -418,18 +527,27 @@ def test_build_app_rejects_when_service_initial_env_has_secret_pattern(tmp_path,
   は両テストとも `config/settings.yaml.example:26` の既定 `local` のままのため、`build_app` の
   `_check_cli_backend(settings, which="trade")` (`service.py:851`) は検査⑤に到達する前に early
   return し、`which="improve")` (`:852`) の呼び出しだけが `_raise` に届く — `captured` が
-  `which="improve"` になるのはこの経路による)。
+  `which="improve"` になるのはこの経路による。**v1.2、codex r2 W1**: この 2 本は trade=local の構成
+  しか踏まないため、`_check_cli_backend` 内で `which=which` を `which="improve"` に固定する変異が
+  あっても両方 green のまま — improve 経路しか実際に検証していないことになる。これを埋めるのが
+  下記の `test_check_cli_backend_forwards_which_trade_to_secret_check` [AC-2g])。
 
-- [ ] red を確認する (**実測して埋める**): 新規 6 本 (allowlist 2 本・メッセージ 1 本・WARNING 2 本・
-      旧 settings.yaml 無改変ロード 1 本 [下記「T2 追加 Step」]) は
+- [ ] red を確認する (**実測して埋める**): 新規 9 本 (allowlist 2 本・メッセージ 1 本・WARNING 関連
+      4 本 [うち 2 本は v1.2 追加、AC-2f の否定側・ソート順 pin]・`which="trade"` 転送 pin 1 本
+      [v1.2 新規、AC-2g]・旧 settings.yaml 無改変ロード 1 本 [下記「T2 追加 Step」]) のうち 7 本
+      (allowlist・メッセージ・WARNING 関連) は
       `TypeError: _check_service_initial_env_has_no_secrets() got an unexpected keyword argument 'which'`
-      (シグネチャ変更前、旧 settings.yaml テストのみ `AttributeError: 'Settings' object has no
-      attribute 'service'`)。stub 差し替え後の既存 4 箇所は変更前は素通り (green のまま、`object()`
-      でも `settings` 未使用だったため) だが、**Step 2-b の本体変更を先に当ててから stub 差し替え前の
-      状態で走らせると** `AttributeError: 'object' object has no attribute 'service'` になることを
-      確認する (stub 差し替えの必要性そのものの red)。monkeypatch スタブ 3 箇所も同様に、本体変更後・
-      シグネチャ未修正の状態で `TypeError: ... unexpected keyword argument 'which'` になることを
-      確認する。
+      (シグネチャ変更前)。旧 settings.yaml テストは `AttributeError: 'Settings' object has no
+      attribute 'service'`。`test_check_cli_backend_forwards_which_trade_to_secret_check` は
+      シグネチャ変更前の `_check_cli_backend` が `which`/`backend` を渡さないため `TypeError` には
+      ならず、`captured` が `{"which": None, "backend": None}` のまま
+      `AssertionError: assert {'which': None, 'backend': None} == {'which': 'trade', 'backend': 'claude'}`
+      になる — **(逐語は実測後に埋める)**。stub 差し替え後の既存 4 箇所は変更前は素通り (green のまま、
+      `object()` でも `settings` 未使用だったため) だが、**Step 2-b の本体変更を先に当ててから stub
+      差し替え前の状態で走らせると** `AttributeError: 'object' object has no attribute 'service'` に
+      なることを確認する (stub 差し替えの必要性そのものの red)。monkeypatch スタブ 3 箇所も同様に、
+      本体変更後・シグネチャ未修正の状態で `TypeError: ... unexpected keyword argument 'which'` に
+      なることを確認する。
 
 ### Step 2-b: 実装を転写する
 
@@ -559,7 +677,8 @@ codex には 1 ファイル 2 箇所の変更としてまとめて渡してよ�
 
 ### Step 2-c: green + 既存 pin の無改変回帰確認
 
-- [ ] 新規 6 本 (allowlist 2 本・メッセージ 1 本・WARNING 2 本・旧 settings.yaml 無改変ロード 1 本
+- [ ] 新規 9 本 (allowlist 2 本・メッセージ 1 本・WARNING 関連 4 本 [うち 2 本 v1.2 追加]・
+      `which="trade"` 転送 pin 1 本 [v1.2 新規]・旧 settings.yaml 無改変ロード 1 本
       [下記「T2 追加 Step」、AC には対応せず問い5副産物の回帰点として追加]) が green、かつ
       **`tests/test_service_app.py` の検査⑤関連の既存テスト全部**
       (`test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam` /
@@ -584,6 +703,9 @@ codex には 1 ファイル 2 箇所の変更としてまとめて渡してよ�
 | T2-M5 | `_check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)` | `_check_service_initial_env_has_no_secrets(settings)` (呼び出し元で `which`/`backend` を渡さない) | `test_build_app_rejects_when_service_initial_env_has_secret_pattern` の `assert captured == {"which": "improve", "backend": "claude"}` (v1.1 追加の pin、既定値 `"improve"`/`"claude"` が渡らなくなるので即 red) / `test_check_service_initial_env_has_no_secrets_is_called_for_opencode_backend` の同型 assert |
 | T2-M6 (v1.1 追加) | `if excluded_by_allowlist: _log.warning(...)` | (この分岐ごと削除) | `test_check_service_initial_env_has_no_secrets_allowlist_hit_warns_names_only` |
 | T2-M7 (v1.1 追加) | `if excluded_by_allowlist:` | `if allowlist:` (allowlist が非空なら env との交差を見ずに常に警告する方向へ緩める) | `test_check_service_initial_env_has_no_secrets_no_warning_when_nothing_excluded` (allowlist に名前はあるが env に無いケースで警告が出てしまい red) |
+| T2-M8 (v1.2 追加、codex r2 W1) | `_check_cli_backend` 内の `_check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)` | `_check_service_initial_env_has_no_secrets(settings, which="improve", backend=backend)` (`which` を固定) | `test_check_cli_backend_forwards_which_trade_to_secret_check` (trade 経路の `captured["which"]` が `"trade"` にならず red。v1.1 の 2 本 [T2-M5 の対象] は trade=local のため検出できなかった変異) |
+| T2-M9 (v1.2 追加、codex r2 W3) | `if k in allowlist:` の内側の `if _matched_pattern(k) is not None: excluded_by_allowlist.append(k)` | `excluded_by_allowlist.append(k)` (パターン照合条件を外し、allowlist 一致だけで対象にする) | `test_check_service_initial_env_has_no_secrets_allowlist_hit_requires_pattern_match` (`HARMLESS_NAME` で警告が出てしまい red) |
+| T2-M10 (v1.2 追加、codex r2 W3) | `sorted(excluded_by_allowlist)` | `excluded_by_allowlist` (`sorted` を外す) | `test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorted` (集合のイテレーション順に依存し、`A_TOKEN` が `Z_TOKEN` より前に来る保証が失われる) |
 
 - [ ] commit: `fix(ops-first-contact): 起動時検査⑤に secret_env_allowlist + which/backend/パターン/allowlist除外WARNINGを含むメッセージ (T2)`
 
@@ -697,13 +819,39 @@ def test_normalize_idea_display_converts_newline_to_space_before_removing_contro
     display, removed = _normalize_idea_display("1行目\n2行目")
     assert display == "1行目 2行目"
     assert removed == 0  # 改行は「除去」ではなく置換 — 表示できない文字数には数えない
+
+
+def test_improve_add_stores_idea_without_display_normalization(commands):
+    """[ops-first-contact-fixes] T3 (AC-3i、v1.2、codex r2 W4): 表示用正規化
+    (`_normalize_idea_display`) は echo-back・警告判定にのみ使い、
+    `backlog.idea` に保存する文字列には適用しない。C* 文字 (ゼロ幅スペース
+    U+200B) を含む idea を登録しても、保存列にはこの文字が無加工のまま
+    残る — AC-3d は `<案1>` (C* を含まない) でしか保存無加工を確認して
+    いなかったので、C* を含むケースを個別に pin する。この idea は
+    tokenizer (`commands.py:63-67`) を通過した後の文字列であり (ここでは
+    空白を挟まない 1 トークンなので tokenizer による変化は無い)、それが
+    表示正規化されずに保存されることを見る。"""
+    cmds, conn, _ = commands
+    idea_with_zero_width = "課題​内容"
+    result = cmds.dispatch(f"improve add {idea_with_zero_width}")
+    bid = int(result.split("#")[1].split(" ")[0])
+    row = conn.execute(
+        "SELECT idea FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
+    assert row["idea"] == idea_with_zero_width
+    assert "​" in row["idea"]
 ```
 
 - [ ] red を確認する (**実測して埋める**): 1〜2 本目は `AssertionError: assert '「...」' in
       'backlog #78 を追加しました'` (echo-back が無い)、2 本目後半は `assert '⚠' in
-      'backlog #79 を追加しました: 「<案1>」'` (警告が無い)、v1.1 追加 3 本は
+      'backlog #79 を追加しました: 「<案1>」'` (警告が無い)、v1.1 追加 3 本 (ゼロ幅・端末制御・
+      `_normalize_idea_display` 単体) は
       `AttributeError: module 'agentic_fx.commands' has no attribute '_normalize_idea_display'`
-      (未実装) — **(逐語は実測後に埋める)**
+      (未実装)、v1.2 追加 1 本 (`test_improve_add_stores_idea_without_display_normalization`) は
+      **現行実装でも green になる可能性がある** (echo-back に正規化前の `text` を使う旧実装のままなら
+      保存も表示も無加工で一致するため) — 着手時に旧実装のまま走らせて実際に green か確認し、もし
+      green なら「この AC は実装差分ではなく回帰 pin」であることをそのまま記録する (どちらでも問題ない、
+      未実装の `_normalize_idea_display` に依存する他 3 本と同時に実装するので実質的には T3-b 適用後に
+      まとめて green 化する) — **(逐語は実測後に埋める)**
 
 ### Step 3-b: 実装を転写する
 
@@ -790,9 +938,11 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
 
 ### Step 3-c: green
 
-- [ ] 8 本とも pass、かつ**既存の `test_policy_add_appends_to_directives_file` を含む
-      `tests/commands/test_improve_commands.py` 全体**が無改変のまま green であることを確認
-      (**実測して埋める**)
+- [ ] 新規 8 本 (v1.1 時点で 7 本 — v1.0 の「8 本」表記は M1 で指摘された数え間違い、実数は
+      echo/警告/登録/last_result/ゼロ幅/端末制御/`_normalize_idea_display` 単体の 7 本。v1.2 で
+      AC-3i の保存無加工 pin 1 本を追加し、実数が 8 本に戻った) とも pass、かつ**既存の
+      `test_policy_add_appends_to_directives_file` を含む `tests/commands/test_improve_commands.py`
+      全体**が無改変のまま green であることを確認 (**実測して埋める**)
 
 ### Step 3-d: 逆変異
 
@@ -807,6 +957,7 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
 | T3-M7 (v1.1 追加) | `step1 = text.replace("\n", " ")` | `step1 = text` (改行→空白の置換を外す) | `test_normalize_idea_display_converts_newline_to_space_before_removing_control_chars` (`\n` が Cc として除去されるだけになり `"1行目 2行目"` ではなく `"1行目2行目"` になる) |
 | T3-M8 (v1.1 追加、判定だけ raw に戻す) | `is_placeholder`/`is_too_short` の判定対象を `display` から `text.strip()` に戻す (echo-back は正規化後のまま) | (上記の差し替え) | `test_improve_add_warns_and_notes_removed_chars_for_zero_width_input` (`len(text.strip())==4` になり短さ警告が出なくなる) |
 | T3-M9 (v1.1 追加、echo だけ raw に戻す) | `reply = f"backlog #{bid} を追加しました: 「{display}」"` の `display` を `text` に戻す (判定は正規化後のまま) | (上記の差し替え) | `test_improve_add_strips_terminal_control_sequences_from_reply` (`\x1b` が戻り値に残る) |
+| T3-M10 (v1.2 追加、codex r2 W4) | `bid = backlog.add(self.conn, idea=text, source="user", now=self.clock.now())` | `bid = backlog.add(self.conn, idea=display, source="user", now=self.clock.now())` (保存側にも表示用正規化をかけてしまう退行 — `display` は `_normalize_idea_display(text)` の後に計算されるため、実際の diff では `display, removed = _normalize_idea_display(text)` を `backlog.add` の**前**に繰り上げた上でこの変異を当てる) | `test_improve_add_stores_idea_without_display_normalization` (`row["idea"]` から `​` が消え、tokenizer 通過後の原文と一致しなくなる) |
 
 - [ ] commit: `fix(ops-first-contact): improve add の登録文を正規化して echo-back + 短文/プレースホルダ/不可視文字警告 (T3、拒否しない)`
 
@@ -838,6 +989,15 @@ codex には 1 ファイル 3 箇所の変更としてまとめて渡してよ�
   yaml をロードするテスト 1 本」を追加すること (下記追記)。
 - **T3-M3 の killer**: 逆変異表 (Step 3-d) に実測値 (`len("<案1>")` = 3、`len("[TODO]")` = 6) を反映済み。
   着手時に念のため再確認すること。
+- **v1.2 で解消 (codex r2 W2)**: v1.1 は「`_settings_stub()` でフル `Settings`/`_init` を避けたので
+  `caplog` が `agentic_fx` logger の `propagate=False` の罠を回避できる」としていたが、これは
+  **不十分だった** — `_settings_stub()` 自身が `_init`/`build_app` を呼ばなくても、**同一テストプロセス
+  内で他のテストが先に `_init`/`build_app` を実行していれば** `agentic_fx` logger は既に
+  `propagate=False` に固定されており、`caplog.at_level(..., logger=...)` はレベルを変えるだけで
+  non-propagating な子ロガーに新たに handler を付けない (`catching_logs.__enter__` はテスト開始時点で
+  既に non-propagating だったロガーにしか attach しない)。**対応**: WARNING テスト側で
+  `logging.getLogger("agentic_fx.service")` に直接 handler を付ける `_capture_service_warnings()`
+  contextmanager に差し替えた (Step 2-a)。テスト実行順序に依存しない。
 
 ### T2 追加 Step: 旧 settings.yaml の無改変ロード確認
 
@@ -873,4 +1033,5 @@ def test_settings_without_service_section_loads_with_default_empty_allowlist(tmp
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-21 | v1.0 | 初版。設計書 v1.0 の AC-1a〜AC-3e に対応する T1/T2/T3 を起こす。3 task は互いに独立ファイル域で完全並列、codex にはテスト+本体コードのみ渡し red/green・フルスイート・変異確認は指揮者側 subagent が担当する体制を明記 | 設計書 v1.0 承認 (2026-09-21) を受けたプラン起草 | (本 commit) |
-| 2026-09-21 | v1.1 | codex 設計レビュー r1 (Important 4) の反映。Global Constraints の「既存テストの書き換え 0 本」を訂正 (引数 stub 7 箇所・実行 11 本の差し替えを明記、assert 本体は無改変)。T1: 構造的テストを truthy 検査から spy 方式に変更 (AC-1c、`health_latch` の見逃しを解消)。T2: allowlist 除外時の起動 WARNING (AC-2f) を追加、テストヘルパーを `load_settings` 経由から軽量 `SimpleNamespace` (`_settings_stub`) に変更 (caplog が `agentic_fx` logger の `propagate=False` に阻まれる罠を回避)、旧 settings.yaml 無改変ロードの pin テストを追加。T3: 表示・警告判定共通の正規化関数 `_normalize_idea_display` を新設 (Unicode カテゴリ C* 除去 + 改行→空白、AC-3a/AC-3b 書き換え + AC-3f〜AC-3h 新設)、`commands` フィクスチャが `(cmds, conn, tmp_path)` のタプルを返す実仕様に合わせてテストコードの unpacking を訂正 (v1.0 の下書きコードのバグ) | codex 設計レビュー r1 (Important 4 件、Critical 0) + 実コード照合時に発見したプラン記述の欠陥 | (未コミット) |
+| 2026-09-21 | v1.1 | codex 設計レビュー r1 (Important 4) の反映。Global Constraints の「既存テストの書き換え 0 本」を訂正 (引数 stub 7 箇所・実行 11 本の差し替えを明記、assert 本体は無改変)。T1: 構造的テストを truthy 検査から spy 方式に変更 (AC-1c、`health_latch` の見逃しを解消)。T2: allowlist 除外時の起動 WARNING (AC-2f) を追加、テストヘルパーを `load_settings` 経由から軽量 `SimpleNamespace` (`_settings_stub`) に変更 (caplog が `agentic_fx` logger の `propagate=False` に阻まれる罠を回避)、旧 settings.yaml 無改変ロードの pin テストを追加。T3: 表示・警告判定共通の正規化関数 `_normalize_idea_display` を新設 (Unicode カテゴリ C* 除去 + 改行→空白、AC-3a/AC-3b 書き換え + AC-3f〜AC-3h 新設)、`commands` フィクスチャが `(cmds, conn, tmp_path)` のタプルを返す実仕様に合わせてテストコードの unpacking を訂正 (v1.0 の下書きコードのバグ) | codex 設計レビュー r1 (Important 4 件、Critical 0) + 実コード照合時に発見したプラン記述の欠陥 | `34d3dc9` |
+| 2026-09-21 | v1.2 | codex 設計レビュー r2 (Important 4・Minor 2) の反映。W1: AC-2g (`test_check_cli_backend_forwards_which_trade_to_secret_check`) を新設 — trade 非 local 経路で `which="trade"` の転送を pin し、v1.1 の 2 本 (trade=local のみ踏む) では検出できなかった `which="improve"` 固定変異を検出できるようにした (T2-M8)。W2: WARNING テスト 2 本を `caplog` から `_capture_service_warnings()` (`agentic_fx.service` logger への直接 handler 付与) に差し替え — `caplog` は `agentic_fx` logger の `propagate=False` がプロセス内で他テストにより既に固定されているとテスト順序依存で記録を拾えないことが判明したため。W3: AC-2f に否定側 (`HARMLESS_NAME`、秘密パターン不一致) とソート順 (`A_TOKEN`/`Z_TOKEN`) の pin テスト 2 本を追加 (T2-M9/T2-M10)。W4: AC-3a/AC-3d の「逐語」の定義を「`Commands.dispatch` の tokenizer [`commands.py:63-67`] 通過後の文字列」に訂正し、tokenizer の空白畳み込み変更を非スコープに明記。AC-3i (`test_improve_add_stores_idea_without_display_normalization`) を新設し、C* 文字を含む idea でも保存側が無加工であることを pin (T3-M10)。M1: T3 新規テスト本数の記載を実数 (v1.1 時点 7 本、v1.2 で 8 本) に訂正。M2: 設計書 §6 の変更ファイル表を AC-2f〜AC-2g・AC-3f〜AC-3i を含む形に更新 | codex 設計レビュー r2 (Important 4 件・Minor 2 件、Critical 0) | (未コミット) |

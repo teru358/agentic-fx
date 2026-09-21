@@ -1,4 +1,4 @@
-# [ops-first-contact-fixes] 設計書 v1.1
+# [ops-first-contact-fixes] 設計書 v1.2
 
 束: 2026-09-20 の実機運用でユーザー本人が直接踏んだ小さな不具合 3 件の是正。
 新しい機能・新しい配備経路・新しい自動化は作らない。3 件とも入口層 (`service.py` の起動時検査/配線、
@@ -44,6 +44,20 @@ v1.0 を対象に codex (terra/medium) 設計レビュー 1 周を実施 (Critic
 | V3 | T1 の構造的テストが「値が truthy」を見ているため、正当な falsy 値・truthy な default 値の未配線を見逃す (`commands.py:54` の `health_latch or HealthLatch()` は現に未配線でも truthy) | truthy 検査を廃止し、`Commands` を kwargs 記録 wrapper に差し替える spy 方式にする |
 | V4 | 「strip 後の可視文字数」の実装 (`len(stripped)`) は Unicode コードポイント数であり、ゼロ幅文字・端末制御列を可視文字として数えてしまう | 表示・警告判定共通の正規化 (Unicode カテゴリ C* 除去 + 改行→空白) を新設し、AC-3b をこの定義で書き換える。全角括弧の検出・長さ上限・対話確認は本束の範囲外のまま (不採用) |
 
+### 0.2 codex 設計レビュー r2 の反映 (2026-09-21、v1.2)
+
+v1.1 (main `34d3dc9` コミット済) を対象に codex (terra/medium) 設計レビュー 2 周目を実施 (Critical 0 /
+Important 4 / Minor 2)。裁定 (指揮者確定、全件採用) を反映して v1.2 とした:
+
+| # | 指摘 | 裁定 |
+|---|---|---|
+| W1 | T2 の転送 pin 2 本 (`captured == {"which": "improve", ...}`) はどちらも trade=local の構成なので、`_check_cli_backend` の `which` を `"improve"` に固定する変異でも green のまま — improve 経路しか実際に踏んでいない | trade 側を非 local (claude) にした構成で `build_app` を実行し、`captured["which"] == "trade"` を pin するテストを追加する (trade→improve の順で呼ばれるため trade 側の検査⑤で例外を投げれば improve 側は呼ばれない) |
+| W2 | WARNING テスト (AC-2f) が `caplog` に届かない — `agentic_fx` logger の `propagate=False` はプロセスに一度固定されると戻らず、`caplog.at_level(..., logger=...)` は handler を子 logger に付与しない (レベルを変えるだけ)。T2-M6/M7 の killer になっていない | `logging.getLogger("agentic_fx.service")` に直接 handler を付けて記録し、`finally` で外す contextmanager を使う。caplog の伝播・テスト実行順序に依存しない形にする |
+| W3 | AC-2f の「秘密パターンにも当たる」条件とソート済みという仕様がテストで pin されていない — allowlist に載っているが非秘密パターンの名前で warn してしまう変異、集合順のまま出す変異のどちらも green になりうる | 否定側テスト (allowlist に載っていて env に実在するが秘密パターンに当たらない → WARNING なし) とソート順テスト (`{"Z_TOKEN","A_TOKEN"}` → 文言中で `A_TOKEN` が先) を追加する |
+| W4 | `commands.py:63-67` の tokenizer (`line.strip().split()` → `" ".join`) が全角空白 (U+3000) を ASCII 空白へ畳んでから `backlog.add`/echo-back に渡す。「逐語表示」という表現が実態 (tokenizer 通過後の文字列) とずれている。加えて「保存は無加工」が C* 文字を含むケースで pin されていない | tokenizer は変更しない (本束の範囲外、既存挙動)。spec/plan の「逐語」の定義を「登録された課題文 (tokenizer 通過後 = 連続空白・全角空白は ASCII 空白 1 個に畳まれた状態) を表示用正規化したもの」に書き直す。目的は「何が登録されたかを目で確かめられること」であって入力行の再現ではない、と明記する。C* 文字を含む idea が `backlog.idea` に無加工 (tokenizer 通過後の文字列のまま、表示正規化はかからない) で残ることを pin するテストを追加する |
+| M1 | T3 の新規テスト本数の記載が実数 (7 本) と食い違っていた | 本数の記載を実装対象に合わせて数え直す (今回の追加分も含む) |
+| M2 | spec §6 の変更ファイル表が AC-2f・AC-3f〜h を含む v1.1 の AC 表と食い違っていた | §6 の表を v1.1/v1.2 の AC 一覧に合わせて更新する |
+
 ---
 
 ## 1. スコープと非スコープ
@@ -80,6 +94,11 @@ v1.0 を対象に codex (terra/medium) 設計レビュー 1 周を実施 (Critic
 - **件 3 の全角括弧 (`＜＞`・`【】`・`［］`) や `{…}` の検出 (v1.1、範囲外)**。R3 裁定の範囲は ASCII の
   `<…>`/`[…]` のみ。「プレースホルダのように見える」を広く意図する拡張は別途検討事項として別 ticket に回す
   (本束では追加しない)。
+- **`Commands.dispatch(line: str)` の tokenizer (`commands.py:63-67`、`line.strip().split()` →
+  `" ".join(args[1:])`) の変更 (v1.2、範囲外、codex r2 W4)**。この tokenizer は連続する空白・全角空白
+  (U+3000) を ASCII 空白 1 個に畳んでから `text` を組み立てる既存挙動であり、件 3 の変更対象ではない。
+  したがって件 3 が「表示する」のは入力行そのものの再現ではなく、**tokenizer を通過した後に実際に
+  `backlog.add`/echo-back へ渡る文字列**である (§2.3・§3.3 の「逐語」の定義はこれに揃えた)。
 
 ---
 
@@ -140,7 +159,11 @@ backlog #79 を追加しました: 「USDJPY のスプレッドが広い時間�
 警告判定と echo-back の表示はどちらも同じ正規化 (v1.1、§3.3 参照) を通した文字列を使う。ゼロ幅文字や
 端末制御列 (`\x1b[...` 等) を含む入力ではこの正規化で除去され、除去が起きた場合は 3 行目に
 `表示できない文字を N 個含みます` が付く。**backlog に保存する課題文自体は無加工のまま** — 正規化は
-表示・警告判定にのみ使う)
+表示・警告判定にのみ使う。**(v1.2、codex r2 W4)** ここでいう「表示する」「保存する」課題文は、いずれも
+`Commands.dispatch(line: str)` の tokenizer (`commands.py:63-67`) を通過した後の文字列 — 連続する空白・
+全角空白 (U+3000) は tokenizer によって既に ASCII 空白 1 個に畳まれている (この tokenizer 自体は件 3 の
+変更対象外、既存挙動)。件 3 が保証するのは「入力行そのものの再現」ではなく「実際に登録された文字列を
+利用者が目で確かめられること」)
 
 ---
 
@@ -261,8 +284,10 @@ LLM が内容を読んで判断する形の `observation` 落としは存在し�
 (§1 非スコープ参照、別途 ticket 化)。
 
 **選択肢**:
-- **A (採用)**: echo-back (登録直後に課題文を逐語表示) + 非ブロッキング警告
-  (R3 の条件: 可視 4 文字未満、または全体が `<…>`/`[…]` の形)。登録は止めない。
+- **A (採用)**: echo-back (登録直後に、tokenizer 通過後の課題文をそのまま表示 — v1.2、codex r2 W4:
+  「逐語」は入力行そのものの再現ではなく「実際に登録された文字列 (tokenizer が空白を畳んだ後) を見せる」
+  という意味) + 非ブロッキング警告 (R3 の条件: 可視 4 文字未満、または全体が `<…>`/`[…]` の形)。
+  登録は止めない。
   採用根拠: ①一般化する (echo-back は入力ミスの種類を問わず効く) ②資金・承認に関わらない低リスク
   操作なので「拒否」でなく「見せる + 軽く警告」で十分 ③実装が CLI 表示層のみに閉じ、遮断規律・承認の
   重みに触れない ④[[product-vision-grown-by-its-user]] の「失敗や空振りが見える・理由が分かる」に直接合致。
@@ -284,9 +309,12 @@ LLM が内容を読んで判断する形の `observation` 落としは存在し�
 echo-back の表示 (AC-3a) はどちらもこの正規化後の文字列を使う。正規化で 1 文字でも除去された場合は
 非ブロッキング警告と同じ枠で「表示できない文字を N 個含みます」を追加の 1 行で出す。**backlog に保存する
 課題文自体 (`backlog.idea`) は従来どおり無加工** — 保存側の変更は本束の範囲外。
-**不採用 (報告のみ、範囲外)**: 表示の長さ上限 (端末が折り返すだけで欠陥ではない — 逐語表示が件 3 の
-目的)。全角 `＜＞`・`【】`・`［］`・`{…}` のプレースホルダ検出 (R3 裁定の範囲は ASCII の `<…>`/`[…]` のみ
-— これを超える仕様拡張になるため本束では入れない)。対話確認は引き続き R4 により `[ops-ui]` へ先送り。
+**不採用 (報告のみ、範囲外)**: 表示の長さ上限 (端末が折り返すだけで欠陥ではない — 実際に登録された
+文字列を見せることが件 3 の目的)。全角 `＜＞`・`【】`・`［］`・`{…}` のプレースホルダ検出 (R3 裁定の範囲は
+ASCII の `<…>`/`[…]` のみ — これを超える仕様拡張になるため本束では入れない)。対話確認は引き続き R4 により
+`[ops-ui]` へ先送り。**(v1.2、codex r2 W4)** `Commands.dispatch` の tokenizer (`commands.py:63-67`、
+連続空白・全角空白を ASCII 空白 1 個に畳む) の変更も不採用 — 件 3 は tokenizer より後段 (echo-back・
+警告判定・保存) にのみ触れる。
 
 ---
 
@@ -316,6 +344,10 @@ echo-back の表示 (AC-3a) はどちらもこの正規化後の文字列を使�
 対応表を更新しない → AC-1c が red (この束で一番大事な変異 — 「次の再発」を模擬する)。
 `build_app` から `health_latch=` を渡す行を外す → AC-1c が red (v1.1 追加、truthy 検査では拾えなかった変異)。
 
+**AC-1c の pin における注意 (v1.2、codex r2 問い3)**: `agentic_fx.service.Commands` は `service.py:25` の
+import と `:1054` の呼び出しのみで参照され、`isinstance(x, Commands)` の類の他参照は無い (確認済み) ため
+spy wrapper への monkeypatch が `build_app` の他の挙動を壊さない。
+
 ### 件 2
 
 | ID | 観測 |
@@ -325,26 +357,32 @@ echo-back の表示 (AC-3a) はどちらもこの正規化後の文字列を使�
 | **AC-2c** | エラーメッセージに実際の `which` (`trade`/`improve`) と実際の `backend` (`claude`/`codex`/`opencode`) が入る (trade+codex で拒否したとき `improve+claude` と出ない) |
 | **AC-2d** | エラーメッセージに「当たったパターン名」と「allowlist へ追加する」案内文言が入る |
 | **AC-2e** | allowlist の一致は**完全一致のみ** — `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` を allowlist に入れても `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS_V2` のような類似名は除外されない (部分一致・前方一致に広げていないことの pin) |
-| **AC-2f** (v1.1、新規) | allowlist に載っていて、かつ初期 env に実在し、かつ秘密名パターンに当たった名前 (= 実際に除外された名前) があれば、起動時に WARNING が 1 回出る。ログ本文に変数**名**のみ (ソート済み) を含み、値に相当する文字列は含まない。allowlist に載っているが env に無い名前・パターンに当たらない名前がある場合は WARNING を出さない (雑音にしない)。除外が 0 件のとき (allowlist が空、または allowlist と env の交差が無いとき) は WARNING を出さない |
+| **AC-2f** (v1.1、新規) | allowlist に載っていて、かつ初期 env に実在し、かつ秘密名パターンに当たった名前 (= 実際に除外された名前) があれば、起動時に WARNING が 1 回出る。ログ本文に変数**名**のみ (ソート済み) を含み、値に相当する文字列は含まない。allowlist に載っているが env に無い名前・パターンに当たらない名前がある場合は WARNING を出さない (雑音にしない)。除外が 0 件のとき (allowlist が空、または allowlist と env の交差が無いとき) は WARNING を出さない。**(v1.2、codex r2 W3)** 「パターンに当たらない名前では出さない」条件と「複数名はソート順」の 2 点をそれぞれ個別にテストで pin する |
+| **AC-2g** (v1.2、新規、codex r2 W1) | `build_app` は `_check_cli_backend` を `which="trade"` → `which="improve"` の順に呼ぶ (`service.py:851-852`)。trade 側が非 local backend のとき、検査⑤に実際に渡る `which` は `"trade"` である (改行を跨いだ「`which` が `"improve"` に固定されていても見た目上は動く」という変異を、trade 経路でも検出できることの pin) |
 
 **変異案**: `k not in allowlist` の条件を落とす → AC-2a が red。allowlist 判定を `in` から
 先頭一致 (`any(k.startswith(a) for a in allowlist)`) に緩める → AC-2e が red。
 メッセージ文字列から `which`/`backend`/パターン名の埋め込みを外す → AC-2c/AC-2d が red。
 WARNING の呼び出しを削除する、または条件を「allowlist 非空なら常に出す」に変える (実際に除外した名前の
-有無を見ない) → AC-2f が red (v1.1 追加)。
+有無を見ない) → AC-2f が red (v1.1 追加)。**(v1.2 追加)** allowlist 一致だけで秘密パターン判定を
+省略する (`if k in allowlist:` の分岐内で `_matched_pattern` を確認せず常に WARNING 対象にする) →
+AC-2f の否定側 (パターン不一致) が red。`sorted(excluded_by_allowlist)` の `sorted` を外す →
+AC-2f のソート順 pin が red。`_check_cli_backend` 内で `which=which` を `which="improve"` に固定する →
+AC-2g が red (v1.2、`which="improve"` 固定変異が v1.1 の 2 本の pin では検出できなかったことに対する追加)。
 
 ### 件 3
 
 | ID | 観測 |
 |---|---|
-| **AC-3a** | `dispatch("improve add 何かの課題")` の戻り値に、登録した idea の**正規化後の表示文字列** (v1.1: 改行→空白 + Unicode カテゴリ C* 除去 + strip。制御文字・ゼロ幅文字を含まない通常の入力では原文と一致する) が `「…」` の形で含まれる |
+| **AC-3a** | `dispatch("improve add 何かの課題")` の戻り値に、登録した idea (v1.2、codex r2 W4: `Commands.dispatch` の tokenizer [`commands.py:63-67`] を通過した後の文字列 — 連続空白・全角空白は既にASCII空白1個に畳まれている、この tokenizer は件3の変更対象外) の**正規化後の表示文字列** (v1.1: 改行→空白 + Unicode カテゴリ C* 除去 + strip。制御文字・ゼロ幅文字を含まない通常の入力では tokenizer 通過後の文字列と一致する) が `「…」` の形で含まれる |
 | **AC-3b** (v1.1 書き換え) | 正規化後の表示文字列が `<…>` または `[…]` で完全に囲まれている、または**正規化後の文字列の `len()`** (= Unicode カテゴリ C* を除去済みなので「可視文字数」に一致する) が 4 未満のとき、戻り値に警告行 (`⚠` で始まる) が追加される |
 | **AC-3c** | AC-3b の条件に合致しない (通常の長さ・非プレースホルダの) idea では警告行が付かない (否定側 pin) |
-| **AC-3d** | 警告が出ても `backlog.add` は実行され、登録された行の `status` は従来通り `'open'` (ブロックしない)。`backlog.idea` 列には**正規化前の原文**がそのまま入る (保存側は無加工、本束の範囲外) |
+| **AC-3d** | 警告が出ても `backlog.add` は実行され、登録された行の `status` は従来通り `'open'` (ブロックしない)。`backlog.idea` 列には **tokenizer 通過後・表示正規化前の文字列**がそのまま入る (表示用正規化は保存側にかからない、本束の範囲外) |
 | **AC-3e** | echo-back・警告文言のいずれも `improvement_backlog.last_result` / `approval_requests.reason` 等 DB 列に新規の文字列を書き込まない (`dispatch` の戻り値以外に副作用が増えないことを確認する。activity ログの記録内容も従来 (`"#{bid} via shell"`) から変えない) |
 | **AC-3f** (v1.1、新規) | idea にゼロ幅スペース (U+200B) を 4 個含む入力は、正規化後の可視文字数が 0 になり AC-3b の短さ条件に合致して警告が出る。かつ戻り値に「表示できない文字を N 個含みます」の行が追加される |
 | **AC-3g** (v1.1、新規) | idea に端末制御列 (`\x1b[2J` 等) を含む入力では、戻り値 (echo-back・警告行とも) に `\x1b` に相当する文字が含まれない |
 | **AC-3h** (v1.1、新規) | idea が複数行にまたがる入力 (`\n` を含む) では、正規化後の表示文字列は改行が空白 1 個に置換され、単語同士が連結しない |
+| **AC-3i** (v1.2、新規、codex r2 W4) | ゼロ幅スペース (U+200B) を含む idea を登録すると、`backlog.idea` 列にはこの文字が無加工のまま残る (AC-3d の「保存側は表示正規化を通さない」を C* 文字を含むケースで個別に pin する — AC-3f の表示側とは別に、保存側が正規化されていないことを確認する) |
 
 **変異案**: echo-back の文字列連結を消す → AC-3a が red。警告条件の `<`/`[` 判定を落とす、
 短さ閾値 (`< 4`) を変える → AC-3b・AC-3c の両方 (正例・否定側) で検出。`backlog.add` 呼び出しを
@@ -352,6 +390,8 @@ WARNING の呼び出しを削除する、または条件を「allowlist 非空�
 正規化関数 (Unicode カテゴリ C* 除去) を丸ごと外す、または改行→空白の置換だけを外す → AC-3f/AC-3g/AC-3h が
 red (v1.1 追加)。警告判定だけを正規化前の生文字列に戻す、または echo-back だけを正規化前の生文字列に戻す →
 それぞれ AC-3b/AC-3f 側、AC-3a/AC-3g 側が red (v1.1 追加、正規化の適用箇所を個別に殺す変異)。
+正規化後の表示文字列を `backlog.add` の `idea=` に渡す (誤って保存側にも正規化をかける退行) →
+AC-3i が red (v1.2 追加)。
 
 ---
 
@@ -363,8 +403,8 @@ red (v1.1 追加)。警告判定だけを正規化前の生文字列に戻す、
 | `src/agentic_fx/config.py` | `ServiceSettings` 新設、`Settings.service` フィールド追加 | 2 |
 | `src/agentic_fx/commands.py` | `improve add` 分岐: echo-back + 警告判定 | 3 |
 | `config/settings.yaml.example` | 新規キー `service.secret_env_allowlist` を追記 (下記「settings.yaml.example の同期」参照) | 2 |
-| `tests/test_service_app.py` | AC-1a〜AC-1c、AC-2a〜AC-2e | 1・2 |
-| `tests/commands/test_improve_commands.py` | AC-3a〜AC-3e | 3 |
+| `tests/test_service_app.py` | AC-1a〜AC-1c、AC-2a〜AC-2g (v1.2、M2 訂正: AC-2f・AC-2g を含める) | 1・2 |
+| `tests/commands/test_improve_commands.py` | AC-3a〜AC-3i (v1.2、M2 訂正: AC-3f〜AC-3i を含める) | 3 |
 
 ### `settings.yaml.example` の同期 (CLAUDE.md 規約)
 
@@ -406,4 +446,5 @@ service:
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-09-21 | v1.0 | 初版。`tmp/design-ops-first-contact/design.md` (下書き、3 件とも A 案) のユーザー承認 (2026-09-21) を受けて spec 化。§0 に指揮者裁定 4 点 (R1〜R4: allowlist 置き場所 `service.*` 新設 / エラー文にパターン名を含める / 件 3 警告条件 = 4 文字未満 or `<…>`/`[…]` 完全一致・非ブロッキング / 対話確認は `[ops-ui]` へ先送り) を追加し、AC・変更ファイル表・不変条件表・`settings.yaml.example` 同期方針 (個人 `settings.yaml` はユーザー自身が追記するランブック扱い) を新設 | 下書き承認 + 指揮者裁定 | (本 commit) |
-| 2026-09-21 | v1.1 | §0.1 に codex r1 の反映を追記。V1: 既存テストの `object()` 引数 stub が `AttributeError` になることを認め、Global Constraints・スコープ側の記述を訂正 (本番コードへの互換層は入れない)。V2: AC-2f (allowlist 除外時の起動 WARNING、値は出さず名前のみ) を新設、IV-1 に追記。V3: AC-1c を truthy 検査から spy 方式 (kwargs 記録 wrapper) に書き換え、`health_latch` の truthy-default 見逃しを解消。V4: AC-3a/AC-3b を Unicode 正規化 (改行→空白 + カテゴリ C* 除去) 基準に書き換え、AC-3f〜AC-3h (ゼロ幅文字・端末制御列・複数行) を新設。全角括弧検出・長さ上限・対話確認は不採用のまま (非スコープに明記) | codex 設計レビュー r1 (Important 4 件、Critical 0) | (未コミット) |
+| 2026-09-21 | v1.1 | §0.1 に codex r1 の反映を追記。V1: 既存テストの `object()` 引数 stub が `AttributeError` になることを認め、Global Constraints・スコープ側の記述を訂正 (本番コードへの互換層は入れない)。V2: AC-2f (allowlist 除外時の起動 WARNING、値は出さず名前のみ) を新設、IV-1 に追記。V3: AC-1c を truthy 検査から spy 方式 (kwargs 記録 wrapper) に書き換え、`health_latch` の truthy-default 見逃しを解消。V4: AC-3a/AC-3b を Unicode 正規化 (改行→空白 + カテゴリ C* 除去) 基準に書き換え、AC-3f〜AC-3h (ゼロ幅文字・端末制御列・複数行) を新設。全角括弧検出・長さ上限・対話確認は不採用のまま (非スコープに明記) | codex 設計レビュー r1 (Important 4 件、Critical 0) | `34d3dc9` |
+| 2026-09-21 | v1.2 | §0.2 に codex r2 の反映を追記。W1: AC-2g (trade 非 local 経路での `which` 転送 pin) を新設 — v1.1 の pin 2 本は trade=local のため `which="improve"` 固定変異を検出できていなかった。W2: WARNING テストを `caplog` から `logging.getLogger("agentic_fx.service")` への直接 handler 付与に変更 (`agentic_fx` logger の `propagate=False` 固定に依存しない)。W3: AC-2f に否定側 (非秘密パターン名) とソート順の pin を追加。W4: AC-3a/AC-3d の「逐語」を「tokenizer (`commands.py:63-67`) 通過後の文字列」と定義し直し、tokenizer の空白畳み込み変更は非スコープに明記、AC-3i (保存側は C* 文字を含め無加工) を新設。M1/M2: T3 の新規テスト本数記載・§6 変更ファイル表を実数/実 AC に合わせて訂正 | codex 設計レビュー r2 (Important 4 件・Minor 2 件、Critical 0) | (未コミット) |
