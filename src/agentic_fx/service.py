@@ -298,9 +298,9 @@ def _check_service_initial_env_has_no_secrets(
     matches: dict[str, str] = {}
     excluded_by_allowlist: list[str] = []
     for k in names:
-        # [ops-first-contact-fixes r1-fix] F1: `errors="replace"` で復号した
-        # 名前 (U+FFFD を含む) は元の生バイト列を特定できないため、
-        # allowlist の完全一致対象から外す (fail-closed — 通常の検査に回す)。
+        # `errors="replace"` で復号した名前 (U+FFFD を含む) は元の生バイト列を
+        # 特定できないため、allowlist の完全一致対象から外す (fail-closed —
+        # 通常の検査に回す)。
         if "�" not in k and k in allowlist:
             if _matched_pattern(k) is not None:
                 excluded_by_allowlist.append(k)

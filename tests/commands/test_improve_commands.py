@@ -123,7 +123,7 @@ def test_improve_add_warning_text_does_not_leak_to_backlog_last_result(commands)
 def test_improve_add_warns_and_notes_removed_chars_for_zero_width_input(commands):
     """ゼロ幅文字だけの入力を短文として警告し、除去数を通知する。"""
     cmds, conn, _ = commands
-    idea = "​" * 4
+    idea = "\u200b" * 4
     result = cmds.dispatch(f"improve add {idea}")
     assert "⚠" in result
     assert "表示できない文字を 4 個含みます" in result
@@ -149,33 +149,28 @@ def test_normalize_idea_display_converts_newline_to_space_before_removing_contro
 def test_improve_add_stores_idea_without_display_normalization(commands):
     """表示用正規化は保存する課題文に適用しない。"""
     cmds, conn, _ = commands
-    idea_with_zero_width = "課題​内容"
+    idea_with_zero_width = "課題\u200b内容"
     result = cmds.dispatch(f"improve add {idea_with_zero_width}")
     bid = int(result.split("#")[1].split(" ")[0])
     row = conn.execute(
         "SELECT idea FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
     assert row["idea"] == idea_with_zero_width
-    assert "​" in row["idea"]
+    assert "\u200b" in row["idea"]
 
 
 def test_normalize_idea_display_strips_leading_and_trailing_whitespace():
-    """[ops-first-contact-fixes r2] E3 是正: 段 0 の生存変異
-    (`.strip()` を外しても既存テストは前後空白を含む入力を使っておらず
-    検出できなかった) の pin。前後の半角スペースと、間に挟んだゼロ幅
-    文字 (C* カテゴリ) を同時に含む入力で、表示文字列に前後の空白が
-    残らないことを見る (C* 除去とは独立した `.strip()` の効果)。"""
+    """前後の半角スペースと、間に挟んだゼロ幅文字 (C* カテゴリ) を同時に
+    含む入力で、表示文字列に前後の空白が残らないことを見る (C* 除去とは
+    独立した `.strip()` の効果)。"""
     from agentic_fx.commands import _normalize_idea_display
 
-    display, removed = _normalize_idea_display("  ​hello world​  ")
+    display, removed = _normalize_idea_display("  \u200bhello world\u200b  ")
     assert display == "hello world"
     assert removed == 2
 
 
 def test_improve_add_does_not_warn_on_unclosed_bracket_prefix(commands):
-    """[ops-first-contact-fixes r2] E6 是正: 段 0 の生存変異 (`is_placeholder`
-    から `endswith` 判定を外し開き括弧のみで判定しても、既存テストが
-    開閉揃ったケースしか使っておらず検出できなかった) の pin。`<`/`[` で
-    始まるが閉じ括弧が無く、かつ十分長い (4 文字以上) idea は
+    """`<`/`[` で始まるが閉じ括弧が無く、かつ十分長い (4 文字以上) idea は
     プレースホルダ扱いにならない (短さ判定にも引っかからない) ことを見る。"""
     cmds, conn, _ = commands
     result_angle = cmds.dispatch("improve add <案の詳細説明がここに続きます")
@@ -186,10 +181,7 @@ def test_improve_add_does_not_warn_on_unclosed_bracket_prefix(commands):
 
 
 def test_improve_add_warns_exactly_at_length_boundary(commands):
-    """[ops-first-contact-fixes r2] E7 是正: 段 0 の生存変異 (`< 4` を
-    `<= 4` に厳しくしても、既存テストは短文側 [`"ab"`, 2文字] しか見ておらず
-    「ちょうど4文字は警告なし」の正例が無いため検出できなかった) の pin。
-    ちょうど4文字 (プレースホルダでない) は警告なし、3文字は警告ありを
+    """ちょうど4文字 (プレースホルダでない) は警告なし、3文字は警告ありを
     同時に確認する。"""
     cmds, conn, _ = commands
     result_four = cmds.dispatch("improve add 利確早い")
@@ -200,31 +192,24 @@ def test_improve_add_warns_exactly_at_length_boundary(commands):
 
 
 def test_improve_add_placeholder_detection_uses_normalized_display_not_raw_text(commands):
-    """[ops-first-contact-fixes r1-fix] P1 (ローカル cC 確定): `is_placeholder`
-    の判定対象が**正規化後**の `display` であることの pin。既存テストの
-    生入力 (`<案1>` / `[TODO]` 等) は C* 文字がブラケットの外側に無いため
-    `display` 基準・`text` (正規化前) 基準のどちらで判定しても同じ結果に
-    なり、判定対象を取り違える変異を検出できなかった。ゼロ幅スペース
-    (U+200B、Cf) を `<`/`>` の外側に隣接させた入力 (`_normalize_idea_display`
-    で除去後 `<test>` になる) で、`display` 基準なら `is_placeholder=True`
-    (警告あり)・`text` 基準なら先頭がゼロ幅文字なので `False` (警告なし)
-    に分岐することを利用する。"""
+    """プレースホルダ判定は**正規化後**の `display` に対して行う。ゼロ幅
+    スペース (U+200B、Cf) を `<`/`>` の外側に隣接させた入力
+    (`_normalize_idea_display` で除去後 `<test>` になる) は、正規化後の
+    文字列を基準にすれば警告あり、正規化前の生テキストを基準にすると
+    先頭がゼロ幅文字のため警告なしに分かれることを利用して確認する。"""
     cmds, conn, _ = commands
-    idea = "​<test​>"
+    idea = "\u200b<test\u200b>"
     result = cmds.dispatch(f"improve add {idea}")
     assert "⚠" in result
 
 
 def test_improve_add_does_not_leak_warning_or_display_into_activity_log(commands):
-    """[ops-first-contact-fixes r1-fix] P2 (ローカル cD 確定): `improve add`
-    の警告文・echo-back・正規化後文字列 (`display`) が `self.activity.write`
-    の引数 (実際に書かれる activity ログの行) に混入しないことの pin。
-    既存テストは `improvement_backlog.last_result` (常に None) だけを見て
-    おり、`activity.write(...)` の第 3 引数 (summary) を検証するテストが
-    無かった。警告が出る入力 (`<案1>`) で dispatch した後、activity.log の
-    該当行が従来どおり `#<bid> via shell` だけ (タブ区切りの summary
-    フィールドで完全一致) であることを見る — `⚠`・`display` の内容
-    (`<案1>` 自体) がどちらも log ファイル全体に現れない。"""
+    """`improve add` の警告文・echo-back・正規化後文字列 (`display`) が
+    activity ログに混入しないことを見る。警告が出る入力 (`<案1>`) で
+    dispatch した後、activity.log の該当行が従来どおり `#<bid> via shell`
+    だけ (タブ区切りの summary フィールドで完全一致) であり、`⚠`・
+    `display` の内容 (`<案1>` 自体) がどちらも log ファイル全体に
+    現れないことを確認する。"""
     cmds, conn, tmp_path = commands
     result = cmds.dispatch("improve add <案1>")
     bid = int(result.split("#")[1].split(" ")[0])
@@ -237,10 +222,7 @@ def test_improve_add_does_not_leak_warning_or_display_into_activity_log(commands
 
 
 def test_improve_add_warning_includes_reject_command_with_actual_bid(commands):
-    """[ops-first-contact-fixes r2] E13 是正: 段 0 の生存変異 (警告本文の
-    案内文 [`backlog reject {bid}` での訂正手順] をマーカー `⚠` のみに
-    短縮しても、案内文自体を検証する assert が無く検出できなかった) の
-    pin。警告文に実際の bid を含む `backlog reject {bid}` の案内が
+    """警告文に実際の bid を含む `backlog reject {bid}` の案内が
     含まれることを見る。"""
     cmds, conn, _ = commands
     result = cmds.dispatch("improve add ab")

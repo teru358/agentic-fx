@@ -40,10 +40,7 @@ def test_example_file_loads():
     assert s.datafeed.yfinance.enabled is True
     assert s.datafeed.mt5.enabled is False
     assert s.datafeed.primary == "yfinance"
-    # [ops-first-contact-fixes r2] E15 是正: 段 0 の生存変異
-    # (settings.yaml.example の service.secret_env_allowlist を非空に
-    # 変更しても検出できなかった) の pin。既定の allowlist は空である
-    # べき (検査⑤の守りを弱めない既定値)。
+    # 既定の allowlist は空であるべき (検査⑤の守りを弱めない既定値)。
     assert s.service.secret_env_allowlist == []
 
 

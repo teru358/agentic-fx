@@ -279,8 +279,7 @@ def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
         missing = EXPECTED_OPTIONAL_PARAMS - captured_kwargs.keys()
         assert not missing, (
             f"build_app が Commands(...) に渡していないオプション引数: {missing}")
-        # [ops-first-contact-fixes r1-fix] P3 (ローカル cE 確定): 上の
-        # `missing` 判定は kwargs の**キーの有無**しか見ず、値が壊れて
+        # 上の `missing` 判定は kwargs の**キーの有無**しか見ず、値が壊れて
         # いても (例 `plugins_root=None`/`settings=None`) green になる。
         # `plugins_root` は build_app が計算する固定値 (`root / "plugins"`)
         # そのものなので**等値**で検査する (build_app 内で新規オブジェクトを
@@ -4116,15 +4115,10 @@ def test_check_service_initial_env_has_no_secrets_allowlist_hit_warning_is_sorte
 
 
 def test_check_service_initial_env_has_no_secrets_message_includes_exact_matched_pattern_clause():
-    """[ops-first-contact-fixes r2] T2-M4/E11 是正: 段 0 の生存変異
-    (`matches`/`patterns_hit` の追跡を無効化しても `assert "OPENAI_" in msg`
-    が別経路 — 当たった変数名の `leaked!r` 表示自体に偶然パターン文字列を
-    含む — で素通りしていた) の pin。変数名は `MY_TOKEN_NAME` (パターン
-    `TOKEN` に一致) にし、メッセージが `matched pattern(s) ['TOKEN']` という
-    **整形済みの句そのもの**を含むことを見る — `leaked!r` (`['MY_TOKEN_NAME']`)
-    にはこの角括弧付き句は現れないため、`matches`/`patterns_hit` の追跡が
-    無効化されれば (patterns_hit が空リストになれば) この assert は
-    `matched pattern(s) []` に変わり red になる。"""
+    """エラーメッセージが `matched pattern(s) [...]` という整形済みの句で、
+    実際に当たったパターンだけを含むことを見る (変数名 `leaked!r` の表示に
+    パターン文字列が偶然含まれるケースと区別するため、パターン名自体では
+    ない変数名 `MY_TOKEN_NAME` を使う)。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
     settings = _settings_stub([])
@@ -4137,12 +4131,10 @@ def test_check_service_initial_env_has_no_secrets_message_includes_exact_matched
 
 
 def test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive():
-    """[ops-first-contact-fixes r2] E1 是正: allowlist の完全一致は
-    大文字小文字も区別する (`k in allowlist` を `k.upper() in allowlist` に
-    緩める変異が、既存テストの env 変数名が全て大文字のため段 0 で検出
-    できなかった)。allowlist に大文字名 `MY_API_KEY` を登録しても、env に
-    実在するのが小文字 `my_api_key` (別名として完全一致しない) であれば
-    除外されず起動拒否のままであることを見る。"""
+    """allowlist の完全一致は大文字小文字も区別する。allowlist に大文字名
+    `MY_API_KEY` を登録しても、env に実在するのが小文字 `my_api_key`
+    (別名として完全一致しない) であれば除外されず起動拒否のままであることを
+    見る。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
     settings = _settings_stub(["MY_API_KEY"])
@@ -4153,8 +4145,7 @@ def test_check_service_initial_env_has_no_secrets_allowlist_is_case_sensitive():
 
 
 def test_check_service_initial_env_has_no_secrets_allowlist_excludes_neither_replacement_char_name():
-    """[ops-first-contact-fixes r1-fix] F1 是正 (codex 1周目レビュー
-    Important): `_read_proc_self_environ_names` は非 UTF-8 な env 名を
+    """`_read_proc_self_environ_names` は非 UTF-8 な env 名を
     `errors="replace"` で復号するため、異なる生バイト列の名前が同じ
     U+FFFD 入り文字列に多対一で潰れ得る。allowlist の完全一致がこの
     復号後文字列だけを比較すると、意図しない別名まで除外してしまう
