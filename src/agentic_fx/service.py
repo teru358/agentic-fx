@@ -1092,12 +1092,14 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             for interval in settings.datafeed.primary_intervals:
                 rows = ohlcv.load_cache_bars(conn_supervisor, pair, interval,
                                              source=source)
-                # DB には確定足しか無いので、最新の足は「終端 + 猶予」まで古くなり得る。
-                # 開始時刻だけで freshness_max_min を当てると、1h 足は毎時 20 分以降ずっと
-                # 不健全になり、判断 Mission が止まる (2026-09-22 の再起動直後に実機で観測)
+                # DB には確定足しか無い。最新の確定足 (開始 T) の次の足が確定するのは
+                # T + 2×足幅 (+ 猶予) で、それまで DB は更新されないのが正常。だから
+                # 「開始から 2×足幅 + 猶予 + freshness」以内なら健全とみなす。開始時刻に
+                # freshness だけを当てると 1h 足は毎時 20 分以降ずっと不健全になり、判断
+                # Mission が止まる (2026-09-22 の再起動直後に実機で観測)
                 allowed = timedelta(
                     minutes=settings.datafeed.freshness_max_min
-                    + sources.INTERVAL_MIN[interval]
+                    + 2 * sources.INTERVAL_MIN[interval]
                     + settings.datafeed.closed_bar_grace_sec / 60)
                 if not rows or now - rows[-1].ts > allowed:
                     raise DataUnhealthy(f"closed DB bars unhealthy for {pair} {interval}")
