@@ -56,6 +56,14 @@ def test_registry_uses_normalized_default_and_ignores_unrelated_intervals():
     assert a.required_closed_bars("XAUUSD", "1h") == 0
 
 
+def test_registry_health_uses_derived_decision_timeframe():
+    settings = _settings(intervals=("1m", "15m", "1h"), primary=("15m",))
+    registry = build_registry(settings, [])
+
+    assert registry.required_closed_bars("USDJPY", "15m") == 1
+    assert registry.required_closed_bars("USDJPY", "1h") == 0
+
+
 def test_planner_calculates_capability_and_transient_shortage():
     assert calendar_days(400, "1h", 0) == 27
     assert calendar_days(1600, "1h", 0) == 97

@@ -57,6 +57,7 @@ datafeed:
   closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
   conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
+  decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する
   primary_intervals: [1h]            # 判断 Mission が依存する足 (healthcheck の対象)。増やすほど単一障害点も増える
   watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
   cache_retention_days: 30    # ohlcv_cache の保持期間 (日)。intervals の構成が要求する最小日数を下回ると起動拒否 (プラン9 Task16)

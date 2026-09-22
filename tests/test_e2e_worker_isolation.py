@@ -142,7 +142,7 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
         ohlcv_store.upsert_cache_bars(
             app.conn_core,
                 [safe_bar,
-                 Bar("USDJPY", "1h", now, 148.00, 148.30, 147.90,
+                     Bar("USDJPY", "1h", now - timedelta(hours=1, seconds=30), 148.00, 148.30, 147.90,
                      148.20, 100.0)],
             source="yfinance")
         oid = orders_store.insert(

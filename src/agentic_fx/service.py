@@ -622,6 +622,19 @@ def _startup_plugin_dispositions(settings, plugins, activity):
             if getattr(plugin, "name", None) not in disabled]
 
 
+def _warn_strategy_timeframe_mismatches(settings, plugins) -> None:
+    decision_timeframe = settings.datafeed.decision_timeframe
+    for plugin in plugins:
+        if (getattr(plugin, "kind", None) == "strategy"
+                and plugin.timeframe != decision_timeframe):
+            _log.warning(
+                "strategy timeframe %s differs from decision timeframe %s "
+                "(plugin=%s); signal は strategy の足でしか更新されず、"
+                "get_signals は status を問わず 24h 分を返す。"
+                "consumed / abandoned の行は再提案しない",
+                plugin.timeframe, decision_timeframe, plugin.name)
+
+
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
     """配線ミスの即時検出 (上書き 5): 必要なツールが登録されていることを確認する。"""
     missing = set(names) - set(registry.names())
@@ -891,6 +904,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             conn_core, plugins_dir, settings=settings)
         approved = list(inventory_result.inventory.metas)
         approved = _startup_plugin_dispositions(settings, approved, activity)
+        _warn_strategy_timeframe_mismatches(settings, approved)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
         # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ

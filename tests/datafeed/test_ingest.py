@@ -113,6 +113,20 @@ def test_budget_defers_only_decision_keys_to_the_front_of_next_tick(tmp_path):
     conn.close()
 
 
+def test_decision_interval_is_a_health_requirement_and_ingest_priority(tmp_path):
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    settings = _settings()
+    settings.datafeed.intervals = ["1m", "15m", "1h"]
+    settings.datafeed.primary_intervals = ["15m"]
+    ingest = Ingest(settings, fetch=lambda *args, **kwargs: [])
+
+    assert "15m" in ingest.registry.required_intervals
+    assert ingest._priority(("USDJPY", "15m")) == 1
+    assert ingest._priority(("USDJPY", "1h")) == 2
+    conn.close()
+
+
 def test_budget_fetches_deferred_decision_within_two_ticks(tmp_path):
     conn = connect(tmp_path / "bars.db")
     init_db(conn)

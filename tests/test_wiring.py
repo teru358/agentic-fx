@@ -105,7 +105,7 @@ def test_scheduler_bars_fn_accepts_latest_1m_bar(tmp_path):
                return_value=_bars()) as m:
         scheduler.tick(OPEN_NOW)
     assert m.called                     # latest_1m_bar → get_bars → sources
-    assert trade_calls == ["cron"]  # trigger が on_trade_mission まで伝搬する
+    assert trade_calls == []  # 1m feed だけでは確定した判断足がなく cron は起動しない
 
 
 def test_scheduler_bars_fn_tolerates_unhealthy_feed(tmp_path):
@@ -114,7 +114,7 @@ def test_scheduler_bars_fn_tolerates_unhealthy_feed(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("offline")):
         scheduler.tick(OPEN_NOW)        # DataUnhealthy を漏らさない
-    assert trade_calls == ["cron"]  # trigger が on_trade_mission まで伝搬する
+    assert trade_calls == []  # feed 不健全でも判断足がないため cron は起動しない
 
 
 def test_scheduler_news_cycle_accepts_collector_collect(tmp_path):

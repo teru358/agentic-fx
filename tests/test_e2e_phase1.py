@@ -45,7 +45,8 @@ def test_phase1_full_cycle(tmp_path):
     ])
 
     from agentic_fx.core.contracts import InstrumentSpec, Quote
-    bars = []
+    bars = [Bar("USDJPY", "1h", WED - timedelta(hours=2),
+                148.00, 148.10, 147.90, 148.05, 100)]
     quote_fn = lambda p: Quote(p, 148.49, 148.51, WED, "test")  # noqa: E731
     # 上書き 2 補正: 実 InstrumentSpec は base_currency/quote_currency も
     # 必須 (逐語テストの 6 引数だけでは TypeError)。USDJPY の実値を明示する。
@@ -69,7 +70,8 @@ def test_phase1_full_cycle(tmp_path):
              patch.object(app.trade_loop.provider, "healthcheck",
                           return_value="test"), \
              _no_real_network():
-            # tick 1: 毎時 Mission → 指値発注
+            # tick 1: fake source から ingest が commit した確定 1h 足で
+            # cron Mission → 指値発注
             _scheduler_tick_once(app)
             time.sleep(0.5)  # supervisor スレッドが job を実行するまで待機
             rows = app.conn_core.execute("SELECT * FROM orders").fetchall()
@@ -99,8 +101,12 @@ def test_phase1_full_cycle(tmp_path):
             closed_order_id = row["id"]
 
             # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
-            bars[:] = [Bar("USDJPY", "1m", WED + timedelta(hours=1),
-                           149.00, 149.05, 148.95, 149.00, 100)]
+            bars[:] = [
+                Bar("USDJPY", "1m", WED + timedelta(hours=1),
+                    149.00, 149.05, 148.95, 149.00, 100),
+                Bar("USDJPY", "1h", WED,
+                    149.00, 149.05, 148.95, 149.00, 100),
+            ]
             app.clock = FixedClock(WED + timedelta(hours=1, minutes=1))
             _scheduler_tick_once(app)
             time.sleep(0.5)

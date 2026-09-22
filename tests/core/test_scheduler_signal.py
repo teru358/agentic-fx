@@ -21,6 +21,10 @@ from agentic_fx.store import missions, orders, signals
 from tests.core.test_scheduler import SAT, SETTINGS, WED, Env
 
 
+def _baseline_cron(env, now):
+    env.sched._baseline_cron_watermarks(now)
+
+
 def _signal_due_fn(conn, settings):
     """service.py の signal_due_fn 配線を模した combinator (D2 AND
     pending_exists AND signals_rate_ok)。"""
@@ -52,7 +56,7 @@ def _add_pending_signal(env, *, bar_ts):
 # ---------------------------------------------------------------------
 def test_signal_fires_when_pending_and_position_exist(tmp_path):
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED  # cron を非該当にして signal 経路だけ見る
+    _baseline_cron(env, WED)
     _open_position(env)
     _add_pending_signal(env, bar_ts=WED - timedelta(hours=1))
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
@@ -66,7 +70,7 @@ def test_signal_fires_when_pending_and_position_exist(tmp_path):
 # ---------------------------------------------------------------------
 def test_signal_does_not_fire_without_open_or_pending_position(tmp_path):
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED
+    _baseline_cron(env, WED)
     _add_pending_signal(env, bar_ts=WED - timedelta(hours=1))  # pending はある
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
 
@@ -83,16 +87,15 @@ def test_signal_dispatch_does_not_move_cron_deadline(tmp_path):
 
     env.sched.tick(WED)  # 初回は cron (締切未設定)
     assert env.trade_reasons == ["cron"]
-    cron_deadline = env.sched._last_cron_trade
-    assert cron_deadline == WED
+    cron_watermarks = dict(env.sched._cron_watermarks)
 
     env.sched.tick(WED + timedelta(minutes=10))  # cron 未到来 → signal
     assert env.trade_reasons == ["cron", "signal"]
-    assert env.sched._last_cron_trade == cron_deadline  # 締切は動かない
+    assert env.sched._cron_watermarks == cron_watermarks
 
     env.sched.tick(WED + timedelta(minutes=20))  # もう 1 tick — なお不変
     assert env.trade_reasons == ["cron", "signal", "signal"]
-    assert env.sched._last_cron_trade == cron_deadline
+    assert env.sched._cron_watermarks == cron_watermarks
 
 
 # ---------------------------------------------------------------------
@@ -101,7 +104,7 @@ def test_signal_dispatch_does_not_move_cron_deadline(tmp_path):
 def test_signal_rate_limit_min_interval(tmp_path):
     assert SETTINGS.plugin.signal_min_interval_min == 10
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED
+    _baseline_cron(env, WED)
     _open_position(env)
     _add_pending_signal(env, bar_ts=WED - timedelta(hours=1))
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
@@ -123,7 +126,7 @@ def test_skipped_signal_mission_counts_toward_min_interval(tmp_path):
     'signal%' にヒットし、レート制限に算入される (docstring 逐語の意図:
     「シグナル起動の試行そのもの」を数える)。"""
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED
+    _baseline_cron(env, WED)
     _open_position(env)
     _add_pending_signal(env, bar_ts=WED - timedelta(hours=1))
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
@@ -151,13 +154,13 @@ def test_signal_daily_max_and_rollover_reset(tmp_path):
         missions.start(env.conn, "trade", "local", "m", t, trigger="signal")
     last = times[-1]
 
-    env.sched._last_cron_trade = last - timedelta(minutes=5)  # cron を抑制
+    _baseline_cron(env, last)
     env.sched.tick(last + timedelta(minutes=11))  # 最短間隔は満たすが日次上限超過
     assert env.trade_reasons == []
 
     # 翌取引日 (trading_day_start のロールオーバー後) はカウンタがリセットされる
     next_day = day_start + timedelta(days=1, hours=1)
-    env.sched._last_cron_trade = next_day - timedelta(minutes=5)  # cron を抑制
+    _baseline_cron(env, next_day)
     env.sched.tick(next_day)
     assert env.trade_reasons == ["signal"]
 
@@ -206,7 +209,7 @@ def test_on_signal_maintenance_default_none_is_a_noop(tmp_path):
 # ---------------------------------------------------------------------
 def test_stale_pending_signal_is_abandoned_before_due_check(tmp_path):
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED - timedelta(minutes=5)  # cron を抑制
+    _baseline_cron(env, WED)
     _open_position(env)  # D2 を満たす
     stale_bar_ts = WED - timedelta(hours=10)  # 鮮度窓 (既定 2h) を大きく超える
     sid = _add_pending_signal(env, bar_ts=stale_bar_ts)
@@ -265,7 +268,7 @@ def test_signal_maintenance_and_activity_write_double_failure_does_not_kill_tick
 # ---------------------------------------------------------------------
 def test_signal_due_fn_exception_is_fail_open(tmp_path):
     env = Env(tmp_path)
-    env.sched._last_cron_trade = WED  # cron を抑制し signal 経路だけ見る
+    _baseline_cron(env, WED)
 
     def boom(now):
         raise RuntimeError("signal_due_fn boom")

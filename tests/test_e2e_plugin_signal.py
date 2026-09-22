@@ -19,7 +19,7 @@ brief 逐語のシナリオ 5 ステップを 1 本の流れで検証する。`b
    intent → Risk Gate → ペーパー発注 (market, 即時 open)。
 ⑤ 中間状態を含めて assert する: signals 行が consumed / missions.trigger
    == "signal:<plugin名>" / orders に発注到達 / cron 締切
-   (`scheduler._last_cron_trade`) がシグナル起動で変化しない。
+   (`scheduler._cron_watermarks`) がシグナル起動で変化しない。
 
 自己レビュー用の変異ピン: `test_producer_step_is_load_bearing_for_signal`
 が、③ (producer 呼び出し) をスキップすると signal トリガーの Mission が
@@ -251,8 +251,8 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
 
             # ④ cron 締切を「直前に済んだ」ことにして signal 起動だけを見る
             # (test_service_app.py の F1(b) と同じ手法)。
-            app.scheduler._last_cron_trade = NOW_PRODUCER
-            last_cron_before = app.scheduler._last_cron_trade
+            app.scheduler._baseline_cron_watermarks(NOW_TICK)
+            cron_watermarks_before = dict(app.scheduler._cron_watermarks)
 
             started = time.perf_counter()
             app.scheduler.tick(NOW_TICK)
@@ -300,7 +300,7 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
     assert intent_row["gate_result"] == "accepted"
 
     # -- cron 締切不変: signal 起動後の tick で cron Mission が前倒しされない
-    assert app.scheduler._last_cron_trade == last_cron_before
+    assert app.scheduler._cron_watermarks == cron_watermarks_before
 
 
 def test_producer_step_is_load_bearing_for_signal(tmp_path):
@@ -341,7 +341,7 @@ def test_producer_step_is_load_bearing_for_signal(tmp_path):
     app.scheduler.on_signal_maintenance = lambda now: None
     with _no_real_network(), \
          patch.object(app.provider, "healthcheck", return_value="yfinance"):
-        app.scheduler._last_cron_trade = NOW_PRODUCER
+        app.scheduler._baseline_cron_watermarks(NOW_PRODUCER)
         app.scheduler.tick(NOW_TICK)
 
     assert app.conn_core.execute(

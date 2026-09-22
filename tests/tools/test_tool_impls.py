@@ -34,7 +34,7 @@ def test_market_tools():
     reg.register_all(market_tools.build(provider, econ, SETTINGS))
     ohlcv = reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
     assert len(ohlcv) == 100  # 直近 100 本に制限
-    assert set(ohlcv[0]) == {"ts", "open", "high", "low", "close"}
+    assert set(ohlcv[0]) == {"ts", "interval", "open", "high", "low", "close"}
     ind = reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
     assert "rsi_14" in ind
     assert reg.func("get_econ_calendar")(days=1) == [{"name": "CPI"}]
@@ -132,6 +132,22 @@ def test_market_tools_schema_whitelist():
     assert set(specs["get_indicators"]) == {"pair", "timeframe"}
     # get_econ_calendar: exactly {"days"}
     assert set(specs["get_econ_calendar"]) == {"days"}
+
+
+def test_market_timeframe_defaults_to_decision_timeframe_and_is_not_required():
+    settings = SETTINGS.model_copy(deep=True)
+    settings.datafeed.decision_timeframes = ["15m"]
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=100, interval="15m")
+    tools = {tool.name: tool for tool in market_tools.build(provider, MagicMock(), settings)}
+
+    assert tools["get_ohlcv"].parameters["required"] == ["pair"]
+    assert tools["get_indicators"].parameters["required"] == ["pair"]
+    assert tools["get_ohlcv"].func("USDJPY")[0]["interval"] == "15m"
+    assert tools["get_ohlcv"].func("USDJPY", "1h")[0]["interval"] == "1h"
+    assert tools["get_indicators"].func("USDJPY")["interval"] == "15m"
+    settings.datafeed.decision_timeframes = ["1h"]
+    assert tools["get_ohlcv"].func("USDJPY")[0]["interval"] == "1h"
 
 
 def test_get_ohlcv_always_returns_at_most_100_bars():

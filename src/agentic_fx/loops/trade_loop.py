@@ -591,7 +591,13 @@ class TradeLoop:
 
     def _build_prompt(self, system: str) -> str:
         """システムプロンプト + policy + サマリを結合する。"""
-        parts = [system]
+        parts = [
+            system,
+            "## 判断足\n"
+            f"decision_timeframe: {self.settings.datafeed.decision_timeframe}\n"
+            "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
+            "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。",
+        ]
         tail = self.policy.tail(4000)
         if tail:
             parts.append(f"## ユーザー方針 (policy)\n{tail}")

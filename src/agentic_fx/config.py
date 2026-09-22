@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -159,6 +160,7 @@ class DatafeedSettings(_Strict):
     # 取引の時間軸は固定しない (設計書 §5)。扱う足と、判断が依存する足
     intervals: list[str] = Field(default_factory=lambda: ["1m", "1h"],
                                  min_length=1)
+    decision_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     primary_intervals: list[str] = Field(default_factory=lambda: ["1h"],
                                          min_length=1)
     # 取引不可・分析専用。pair enum には入らない (§6)
@@ -184,12 +186,34 @@ class DatafeedSettings(_Strict):
         return raw
 
     @model_validator(mode="after")
+    def _one_decision_timeframe(self) -> "DatafeedSettings":
+        count = len(self.decision_timeframes)
+        if count != 1:
+            if count > 1:
+                raise ValueError(
+                    "decision_timeframes must contain exactly one value "
+                    f"(got {self.decision_timeframes}); "
+                    "[multi-decision-timeframes] is not implemented")
+            raise ValueError("decision_timeframes must contain exactly one value")
+        return self
+
+    @property
+    def decision_timeframe(self) -> str:
+        return self.decision_timeframes[0]
+
+    @property
+    def decision_timeframe_width(self) -> timedelta:
+        from agentic_fx.datafeed.sources import INTERVAL_MIN
+        return timedelta(minutes=INTERVAL_MIN[self.decision_timeframe])
+
+    @model_validator(mode="after")
     def _check_intervals(self) -> "DatafeedSettings":
         # INTERVAL_MIN は関数内 import。モジュールトップだと
         # config → datafeed.sources → (yfinance/httpx) の重い依存が
         # 設定読み込みに巻き込まれ、循環 import の温床にもなる
         from agentic_fx.datafeed.sources import INTERVAL_MIN
-        unknown = [i for i in self.intervals + self.primary_intervals
+        unknown = [i for i in (self.intervals + self.decision_timeframes
+                                + self.primary_intervals)
                    if i not in INTERVAL_MIN]
         if unknown:
             raise ValueError(f"unknown interval(s): {unknown}")
@@ -301,7 +325,7 @@ class ImproveSettings(_Strict):
 
 
 class ScheduleSettings(_Strict):
-    trade_interval_min: int = Field(ge=1)
+    trade_interval_min: int = Field(default=60, ge=1)
     improve: str = Field(pattern="^(weekly|daily)$")
     improve_at: str = "Sat 03:00"
 
@@ -513,6 +537,56 @@ class Settings(_Strict):
             raise ValueError("primary_source_unusable")
         resolved_datafeed = dict(datafeed)
         resolved_datafeed["primary"] = primary
+        def canonical_interval(value):
+            return "1h" if value == "60m" else value
+
+        raw_decision = resolved_datafeed.get("decision_timeframes", ["1h"])
+        if isinstance(raw_decision, list) and len(raw_decision) == 1:
+            decision = [canonical_interval(raw_decision[0])]
+            schedule = values.get("schedule")
+            if isinstance(schedule, dict) and "trade_interval_min" in schedule:
+                from agentic_fx.datafeed.sources import INTERVAL_MIN
+                minutes = INTERVAL_MIN.get(decision[0])
+                if schedule["trade_interval_min"] != minutes:
+                    raise ValueError(
+                        "schedule.trade_interval_min must match "
+                        "datafeed.decision_timeframes")
+                _log.warning(
+                    "schedule.trade_interval_min is deprecated; use "
+                    "datafeed.decision_timeframes")
+            if "primary_intervals" in datafeed:
+                raw_primary = datafeed["primary_intervals"]
+                if not isinstance(raw_primary, list):
+                    raise ValueError("datafeed.primary_intervals must not contain duplicates")
+                primary = [canonical_interval(interval) for interval in raw_primary]
+                if len(set(primary)) != len(primary):
+                    raise ValueError("datafeed.primary_intervals must not contain duplicates")
+                from agentic_fx.datafeed.sources import INTERVAL_MIN
+                unknown_configured = [interval for interval in datafeed.get("intervals", [])
+                                      if interval not in INTERVAL_MIN]
+                if unknown_configured:
+                    raise ValueError(f"unknown interval(s): {unknown_configured}")
+                unknown = [interval for interval in primary
+                           if interval not in INTERVAL_MIN]
+                if unknown:
+                    raise ValueError(f"unknown interval(s): {unknown}")
+                configured_intervals = {
+                    canonical_interval(interval)
+                    for interval in datafeed.get("intervals", [])
+                }
+                missing = set(primary) - configured_intervals
+                if missing:
+                    raise ValueError(
+                        f"primary_intervals must be a subset of intervals: {missing}")
+                if set(primary) != set(decision):
+                    raise ValueError(
+                        "datafeed.primary_intervals must match "
+                        "datafeed.decision_timeframes")
+                _log.warning(
+                    "datafeed.primary_intervals is deprecated; it is derived "
+                    "from datafeed.decision_timeframes")
+            resolved_datafeed["decision_timeframes"] = decision
+            resolved_datafeed["primary_intervals"] = decision
         resolved_plugin = dict(plugin)
         resolved_plugin.pop("producer_source", None)
         resolved_values = dict(values)

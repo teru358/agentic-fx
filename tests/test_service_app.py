@@ -21,15 +21,59 @@ from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
+from agentic_fx.loops.trade_loop import TradeLoop
 from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
-    _exit_code, _startup_plugin_dispositions, build_app, build_splash, run_init, run_service,
+    _exit_code, _startup_plugin_dispositions, _warn_strategy_timeframe_mismatches,
+    build_app, build_splash, run_init, run_service,
 )
 from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+
+def test_strategy_timeframe_mismatch_warns_once_and_prompt_has_decision_metadata(
+        caplog, monkeypatch):
+    settings = SimpleNamespace(datafeed=SimpleNamespace(decision_timeframe="15m"))
+    plugins = [
+        SimpleNamespace(name="sma_cross_10_30", kind="strategy", timeframe="1h"),
+        SimpleNamespace(name="same", kind="strategy", timeframe="15m"),
+    ]
+    with caplog.at_level("WARNING"):
+        _warn_strategy_timeframe_mismatches(settings, plugins)
+    warnings = [record.message for record in caplog.records
+                if "strategy timeframe" in record.message]
+    assert len(warnings) == 1
+    assert "strategy timeframe 1h differs from decision timeframe 15m" in warnings[0]
+    assert "plugin=sma_cross_10_30" in warnings[0]
+    assert "get_signals は status を問わず 24h 分を返す" in warnings[0]
+
+    loop = object.__new__(TradeLoop)
+    loop.settings = SimpleNamespace(
+        datafeed=SimpleNamespace(decision_timeframe="15m"),
+        paper=SimpleNamespace(starting_balance=1),
+    )
+    loop.policy = SimpleNamespace(tail=lambda _limit: "")
+    loop.conn = loop.econ = loop.clock = object()
+    loop.executor = SimpleNamespace(broker=object())
+    monkeypatch.setattr("agentic_fx.loops.trade_loop.build_state_summary",
+                        lambda *_args: "state")
+    prompt = loop._build_prompt("system")
+    assert "decision_timeframe: 15m" in prompt
+    assert "consumed / abandoned の行は再提案しない" in prompt
+    loop.settings.datafeed.decision_timeframe = "1h"
+    assert "decision_timeframe: 1h" in loop._build_prompt("system")
+
+
+def _seed_decision_bar(conn, bar_time=NOW - timedelta(hours=1, seconds=30)):
+    conn.execute(
+        "INSERT INTO ohlcv_cache (symbol, interval, bar_time, open, high, "
+        "low, close, volume, source) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("USDJPY", "1h", bar_time.isoformat(), 148.0, 148.1, 147.9, 148.0,
+         1.0, "yfinance"))
+    conn.commit()
 
 
 def test_startup_dispositions_disable_plugin_for_insufficient_retention():
@@ -400,6 +444,7 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
     from agentic_fx.core.accounting import record_snapshot
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
+    _seed_decision_bar(app.conn_core)
     # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
     # ため、supervisor を起動してから tick を呼ぶ必要がある。
     app.supervisor.start()
@@ -448,6 +493,7 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
     from agentic_fx.store import orders as orders_store
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
+    _seed_decision_bar(app.conn_core)
     orders_store.insert(
         app.conn_core, pair="USDJPY", direction="long", entry_type="market",
         horizon="day", status="closed", now=NOW, quantity=0.1,
@@ -576,6 +622,7 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
     from agentic_fx.core.accounting import record_snapshot
     record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                     equity=1_000_000)
+    _seed_decision_bar(app.conn_core)
     # tick は on_news_cycle/on_econ_cycle 経由で本物の NewsCollector.collect /
     # EconCalendar.refresh を呼ぶため、_no_real_network() を挟まないと実 HTTP
     # (RSS フィード・ForexFactory カレンダー) が発火する (実測: 数秒のブレ —
@@ -726,7 +773,7 @@ def test_f1b_signal_mission_does_not_fire_without_d2_position(tmp_path):
                       pair="USDJPY", timeframe="1h",
                       bar_ts=(NOW - timedelta(hours=1)).isoformat(),
                       kind="signal", payload={"direction": "long"}, now=NOW)
-    app.scheduler._last_cron_trade = NOW  # cron を抑制し signal 経路だけ見る
+    app.scheduler._baseline_cron_watermarks(NOW)
     app.trade_loop.run_once = MagicMock(wraps=app.trade_loop.run_once)
 
     with _no_real_network(), \
@@ -2930,6 +2977,58 @@ def _root_with_settings(tmp_path, **overrides):
     _deep_update(raw, overrides)
     path.write_text(_yaml.safe_dump(raw), encoding="utf-8")
     return tmp_path
+
+
+def test_15m_ingest_commit_healthcheck_and_scheduler_contract(tmp_path):
+    """A committed 15m decision bar is required for both health and cron due."""
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed.health import DataUnhealthy
+    from agentic_fx.datafeed import sources
+
+    class Clock:
+        def __init__(self, now): self.current = now
+        def now(self): return self.current
+
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+    clock = Clock(now)
+    _root_with_settings(
+        tmp_path,
+        datafeed={"intervals": ["1m", "15m", "1h"],
+                  "decision_timeframes": ["15m"],
+                  "primary_intervals": ["15m"]},
+        schedule={"trade_interval_min": 15})
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert app.ingest.registry.required_closed_bars("USDJPY", "15m") == 1
+        fired = []
+        app.scheduler.on_trade_mission = lambda reason: fired.append(reason) or True
+        app.scheduler.tick(now)
+        assert fired == []
+        with pytest.raises(DataUnhealthy):
+            app.trade_loop.provider.healthcheck("USDJPY")
+
+        def fetch(pair, interval, start, end, *, timeout):
+            width = timedelta(minutes=sources.INTERVAL_MIN[interval])
+            return [Bar(pair, interval, now - 2 * width,
+                        150.0, 150.1, 149.9, 150.0, 1.0)]
+
+        app.ingest.fetch = fetch
+        assert app.ingest.prepare(now) >= 2
+        assert app.ingest.commit(app.conn_core) >= 2
+        assert app.trade_loop.provider.healthcheck("USDJPY") == "yfinance"
+        app.scheduler.tick(now)
+        assert fired == ["cron"]
+        app.scheduler.tick(now + timedelta(minutes=1))
+        assert fired == ["cron"]
+
+        clock.current = now + timedelta(minutes=20, seconds=30)
+        assert app.trade_loop.provider.healthcheck("USDJPY") == "yfinance"
+        clock.current += timedelta(seconds=1)
+        with pytest.raises(DataUnhealthy):
+            app.trade_loop.provider.healthcheck("USDJPY")
+    finally:
+        app.close()
 
 
 def _find_vendor_codex_bin() -> str | None:

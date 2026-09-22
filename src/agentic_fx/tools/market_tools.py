@@ -67,17 +67,19 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                         "available": len(df), "capability": "temporary"}
         return df, None
 
-    def get_ohlcv(pair: str, timeframe: str) -> list[dict]:
+    def get_ohlcv(pair: str, timeframe: str | None = None) -> list[dict]:
+        timeframe = timeframe or settings.datafeed.decision_timeframe
         df, shortage = _frame(pair, timeframe, required=100,
                               consumer="get_ohlcv")
         if shortage is not None:
             return {"insufficient_closed_bars": shortage}
         df = df.tail(100)
-        return [{"ts": ts.isoformat(), "open": r["open"], "high": r["high"],
+        return [{"ts": ts.isoformat(), "interval": timeframe,
+                 "open": r["open"], "high": r["high"],
                  "low": r["low"], "close": r["close"]}
                 for ts, r in df.iterrows()]
 
-    def get_indicators(pair: str, timeframe: str) -> dict:
+    def get_indicators(pair: str, timeframe: str | None = None) -> dict:
         """要求された足の指標を返す。
 
         MTF は「別の足を要求して呼び直す」で表現する (旧実装は 1h のとき
@@ -97,11 +99,13 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         (fail-open: plugin 出力は LLM 向けの参考情報であり、1 つの plugin
         の不調で get_indicators 全体を失敗させない)。
         """
+        timeframe = timeframe or settings.datafeed.decision_timeframe
         required = max([50, *(meta.max_bars for meta in indicator_plugins
                               if meta.kind == "indicator")])
         df, _ = _frame(pair, timeframe, required=required,
                        consumer="get_indicators")
         result = compute_indicators(df)
+        result["interval"] = timeframe
         # Do not claim a built-in value whose seed window is unavailable.
         missing = [name for name, need in (("sma_20", 20), ("sma_50", 50),
                                             ("ema_12", 12), ("ema_26", 26),
@@ -138,14 +142,14 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
     return [
         ToolDef("get_ohlcv", "OHLCV 価格データ (直近 100 本)",
                 {"type": "object", "properties": pair_schema,
-                 "required": ["pair", "timeframe"]}, get_ohlcv),
+                 "required": ["pair"]}, get_ohlcv),
         ToolDef("get_indicators",
                 "テクニカル指標 (SMA/EMA/RSI/ATR/MACD/BB)。"
                 "上位足を見たい場合は timeframe を変えて呼び直す。"
                 "承認済み plugin の指標が併記される場合は `plugin:<name>` "
                 "キーで区別できる",
                 {"type": "object", "properties": pair_schema,
-                 "required": ["pair", "timeframe"]}, get_indicators),
+                 "required": ["pair"]}, get_indicators),
         ToolDef("get_econ_calendar", "経済指標カレンダー (今後 N 日)",
                 {"type": "object",
                  "properties": {"days": {"type": "integer", "minimum": 1,

@@ -354,6 +354,65 @@ def test_empty_primary_intervals_rejected(tmp_path):
         load_settings(_with_datafeed(tmp_path, primary_intervals=[]))
 
 
+@pytest.mark.parametrize(
+    ("decision_timeframes", "expected", "error"),
+    [
+        (None, "1h", None),
+        (["15m"], "15m", None),
+        ([], None, "exactly one"),
+        (["15m", "1h"], None, "multi-decision-timeframes"),
+    ],
+)
+def test_decision_timeframe_contract(decision_timeframes, expected, error):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"].pop("primary_intervals")
+    raw["schedule"].pop("trade_interval_min")
+    if decision_timeframes is not None:
+        raw["datafeed"]["decision_timeframes"] = decision_timeframes
+    if error:
+        with pytest.raises(ValidationError, match=error):
+            Settings.model_validate(raw)
+    else:
+        settings = Settings.model_validate(raw)
+        assert settings.datafeed.decision_timeframe == expected
+        assert settings.datafeed.decision_timeframe_width.total_seconds() == {
+            "1h": 3600, "15m": 900,
+        }[expected]
+
+
+@pytest.mark.parametrize(
+    ("decision", "trade_interval_min", "primary_intervals", "error"),
+    [
+        (["1h"], 60, ["1h"], None),
+        (["60m"], 60, ["60m"], None),
+        (["15m"], 15, ["15m"], None),
+        (["15m"], 60, ["15m"], "trade_interval_min"),
+        (["15m"], 15, ["1h"], "primary_intervals"),
+    ],
+)
+def test_legacy_timeframe_values_must_agree_and_primary_is_derived(
+        caplog, decision, trade_interval_min, primary_intervals, error):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["decision_timeframes"] = decision
+    raw["datafeed"]["primary_intervals"] = primary_intervals
+    raw["schedule"]["trade_interval_min"] = trade_interval_min
+    if error:
+        with pytest.raises(ValidationError, match=error):
+            Settings.model_validate(raw)
+    else:
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="agentic_fx.config"):
+            normalized = Settings.model_validate(raw)
+        assert normalized.datafeed.primary_intervals == [
+            "1h" if interval == "60m" else interval for interval in decision]
+        assert caplog.text.count("trade_interval_min is deprecated") == 1
+        assert caplog.text.count("primary_intervals is deprecated") == 1
+
+
 # --- conversion_skew_max_min (レビュー指摘 F1: 換算 skew は freshness の
 # 使い回しにしない専用キー) -------------------------------------------------
 

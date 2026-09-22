@@ -173,6 +173,20 @@ def load_cache_bars(conn: sqlite3.Connection, symbol: str, interval: str, *,
             for r in rows]
 
 
+def latest_closed_cache_bar_time(conn: sqlite3.Connection, symbol: str,
+                                 interval: str, *, now: datetime,
+                                 width: timedelta, grace: timedelta) -> datetime | None:
+    """Return the newest committed cache bar which is closed at ``now``."""
+    cutoff = _require_aware_utc(now, "now") - width - grace
+    row = conn.execute(
+        "SELECT MAX(bar_time) AS bar_time FROM ohlcv_cache "
+        "WHERE symbol=? AND interval=? AND bar_time <= ?",
+        (symbol, interval, cutoff.isoformat())).fetchone()
+    if row is None or row["bar_time"] is None:
+        return None
+    return datetime.fromisoformat(row["bar_time"]).astimezone(timezone.utc)
+
+
 def prune_cache(conn: sqlite3.Connection, *, cutoff: datetime | None = None,
                 limit: int | None = None, plan: RetentionPlan | None = None) -> int:
     """`ohlcv_cache` の保持ポリシー。`bar_time < cutoff` の行を最大 `limit`

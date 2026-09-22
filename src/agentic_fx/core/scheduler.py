@@ -16,7 +16,7 @@ from agentic_fx.core import accounting, market_hours, transitions
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
-from agentic_fx.store import orders
+from agentic_fx.store import ohlcv, orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
@@ -89,11 +89,9 @@ class Scheduler:
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
         self.bar_freshness = bar_freshness
-        # 上書き 1 の改名: cron (1 時間毎) の締切だけを追跡する。signal
-        # 起動 (reason == "signal") はこの締切に触れない — signal 起動後も
-        # 次の cron 締切が早まったり延びたりしないことをテストで固定する
-        # (§5 必須事項 4)。
-        self._last_cron_trade: datetime | None = None
+        self._cron_watermarks: dict[tuple[str, str], datetime] = {}
+        self._pending_cron_watermarks: dict[tuple[str, str], datetime] = {}
+        self._warned_regressed_cron_watermarks: set[tuple[str, str]] = set()
         self._last_news: datetime | None = None
         self._last_econ: datetime | None = None
         self._was_open: bool | None = None
@@ -145,6 +143,7 @@ class Scheduler:
                 if self._was_open is not False:
                     self._on_market_close(now)
                 self._was_open = False
+                self._baseline_cron_watermarks(now)
                 return pending
             self._was_open = True
             self._observe_closed_bar_availability(now)
@@ -230,13 +229,9 @@ class Scheduler:
 
         reason = None if self._stopping() else self._trade_mission_due(now)
         if reason is not None:
-            # プラン 8 (設計書 §3.3): cron 締切の前進は on_trade_mission
-            # (supervisor.try_submit の結果) が受理 (True) のときだけ。
-            # busy (False) なら締切は維持し、次 tick 以降で必ず再試行
-            # させる (signal は claim 前なので取りこぼしなし)。
             accepted = self.on_trade_mission(reason)
             if accepted and reason == "cron":
-                self._last_cron_trade = now
+                self._advance_cron_watermarks(self._pending_cron_watermarks)
         return pending
 
     def _stopping(self) -> bool:
@@ -273,10 +268,10 @@ class Scheduler:
     # ---- internal -------------------------------------------------------
 
     def _trade_mission_due(self, now: datetime) -> str | None:
-        """毎時 Mission の起動要否と起動理由を返す (上書き 1 — 設計書改訂 5)。
+        """Mission の起動要否と起動理由を返す。
 
-        ①cron (1 時間毎) が優先 — 締切を過ぎていれば常に `"cron"`。
-        ②cron 未到来のときのみ `signal_due_fn` (既定 None = 常に不発火) を
+        ① cron は確定判断足の watermark に未消費分があるとき優先する。
+        ② cron が due でないときのみ `signal_due_fn` (既定 None = 常に不発火) を
         見て `"signal"` を返す。plugin 名はここでは確定しない (`"signal"`
         のまま — 実際にどの plugin の signal を消費するかは TradeLoop の
         claim 結果で確定する。codex R1 I3)。
@@ -296,8 +291,18 @@ class Scheduler:
         tick は殺さない) — 判定失敗が資金保護より後段の Mission 起動判断
         1 件を諦めるだけで済むようにする。
         """
-        if (self._last_cron_trade is None
-                or now - self._last_cron_trade >= timedelta(hours=1)):
+        latest = self._latest_cron_watermarks(now)
+        self._pending_cron_watermarks = latest
+        advanced = False
+        for key, watermark in latest.items():
+            cursor = self._cron_watermarks.get(key)
+            if cursor is None or watermark > cursor:
+                advanced = True
+            elif watermark < cursor and key not in self._warned_regressed_cron_watermarks:
+                self._warned_regressed_cron_watermarks.add(key)
+                _log.warning("cron watermark regressed for %s %s: %s < %s",
+                             key[0], key[1], watermark.isoformat(), cursor.isoformat())
+        if advanced:
             return "cron"
         if self.signal_due_fn is not None:
             try:
@@ -308,6 +313,30 @@ class Scheduler:
                 self.activity.write(Category.SYSTEM, "signal_due_check_error", text)
                 _log.warning("signal_due_fn failed: %s", text)
         return None
+
+    def _latest_cron_watermarks(self, now: datetime) -> dict[tuple[str, str], datetime]:
+        interval = self.settings.datafeed.decision_timeframe
+        width = self.settings.datafeed.decision_timeframe_width
+        grace = timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec)
+        latest: dict[tuple[str, str], datetime] = {}
+        for pair in self.settings.pairs:
+            bar_time = ohlcv.latest_closed_cache_bar_time(
+                self.conn, pair, interval, now=now, width=width, grace=grace)
+            if bar_time is not None:
+                latest[(pair, interval)] = bar_time
+        return latest
+
+    def _baseline_cron_watermarks(self, now: datetime) -> None:
+        self._advance_cron_watermarks(self._latest_cron_watermarks(now))
+
+    def _advance_cron_watermarks(self, latest: dict) -> None:
+        # cursor は key ごとに単調にしか進めない。別 pair の新しい足で受理した tick に
+        # 後退中の pair が混ざっても、その pair の cursor を巻き戻さない (巻き戻すと
+        # 元の足が戻ったときに同じ足で再発火する)
+        for key, bar_time in latest.items():
+            cur = self._cron_watermarks.get(key)
+            if cur is None or bar_time > cur:
+                self._cron_watermarks[key] = bar_time
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
         """ニュース / econ の収集フックを fail-open で呼ぶ。

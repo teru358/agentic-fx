@@ -60,7 +60,7 @@ def _default_rate_fn(ccy, account_ccy, now):
 
 class Env:
     def __init__(self, tmp_path, quote_fn=None, base=WED, news_fn=None,
-                 econ_fn=None, rate_fn=None):
+                 econ_fn=None, rate_fn=None, seed_cron_bar=True):
         from agentic_fx.core.notifier import Notifier
         self.conn = connect(tmp_path / "t.db")
         init_db(self.conn)
@@ -89,6 +89,8 @@ class Env:
             bars_fn=lambda p: self.bars.get(p),
             on_trade_mission=self._trade, on_news_cycle=self._news,
             on_econ_cycle=self._econ)
+        if seed_cron_bar:
+            _seed_decision_bar(self, base - timedelta(hours=1, seconds=30))
 
     def _trade(self, reason):
         self.trade_calls += 1
@@ -116,33 +118,184 @@ class Env:
 
 
 def test_hourly_trade_mission(tmp_path):
-    env = Env(tmp_path)
-    env.sched.tick(WED)
+    env = Env(tmp_path, seed_cron_bar=False)
+    _seed_decision_bar(env, WED - timedelta(hours=1))
+    env.sched.tick(WED + timedelta(seconds=30))
     assert env.trade_calls == 1
-    env.sched.tick(WED + timedelta(minutes=30))
-    assert env.trade_calls == 1  # まだ 1 時間経っていない
-    env.sched.tick(WED + timedelta(hours=1))
+    for minute in range(1, 101):
+        env.sched.tick(WED + timedelta(minutes=minute, seconds=30))
+    assert env.trade_calls == 1
+    _seed_decision_bar(env, WED)
+    env.sched.tick(WED + timedelta(hours=1, minutes=41, seconds=30))
     assert env.trade_calls == 2
 
 
+def _seed_decision_bar(env, bar_time, pair="USDJPY"):
+    env.conn.execute(
+        "INSERT INTO ohlcv_cache (symbol, interval, bar_time, open, high, "
+        "low, close, volume, source) VALUES (?,?,?,?,?,?,?,?,?)",
+        (pair, "1h", bar_time.isoformat(), 148.0, 148.1, 147.9, 148.0, 1.0,
+         "yfinance"))
+    env.conn.commit()
+
+
 def test_trade_mission_due_reasons(tmp_path):
-    """上書き 1: `_trade_mission_due` 単体の起動理由 (初回 cron / 1 時間未満
-    None / 1 時間経過で再度 cron)。"""
-    env = Env(tmp_path)
-    assert env.sched._trade_mission_due(WED) == "cron"      # 初回
-    env.sched._last_cron_trade = WED
-    assert env.sched._trade_mission_due(WED + timedelta(minutes=30)) is None
-    assert (env.sched._trade_mission_due(WED + timedelta(hours=1))
-            == "cron")
+    env = Env(tmp_path, seed_cron_bar=False)
+    assert env.sched._trade_mission_due(WED) is None
+    _seed_decision_bar(env, WED - timedelta(hours=1))
+    assert env.sched._trade_mission_due(WED + timedelta(seconds=30)) == "cron"
 
 
 def test_tick_passes_trade_mission_reason_to_callback(tmp_path):
     """上書き 1: tick 経由で `on_trade_mission` が起動理由 "cron" を受け取る。"""
-    env = Env(tmp_path)
+    env = Env(tmp_path, seed_cron_bar=False)
+    _seed_decision_bar(env, WED - timedelta(hours=1))
+    env.sched.tick(WED + timedelta(seconds=30))
+    assert env.trade_reasons == ["cron"]
+    _seed_decision_bar(env, WED)
+    env.sched.tick(WED + timedelta(hours=1, minutes=1, seconds=30))
+    assert env.trade_reasons == ["cron", "cron"]
+
+
+def test_cron_watermark_grace_pair_aggregation_and_busy_coalesce(tmp_path):
+    env = Env(tmp_path, seed_cron_bar=False)
+    later = WED + timedelta(hours=1, minutes=31)
+    _seed_decision_bar(env, WED - timedelta(hours=1))
+    env.sched.tick(WED + timedelta(minutes=31))
+    assert env.trade_reasons == ["cron"]
+    _seed_decision_bar(env, WED)
+    env.sched.tick(WED + timedelta(hours=1, seconds=29))
+    assert env.trade_reasons == ["cron"]
+    env.sched.tick(WED + timedelta(hours=1, seconds=30))
+    assert env.trade_reasons == ["cron", "cron"]
+
+    env._trade = lambda reason: False
+    env.sched.on_trade_mission = env._trade
+    _seed_decision_bar(env, WED + timedelta(hours=1))
+    env.sched.tick(later)
+    _seed_decision_bar(env, WED + timedelta(hours=2))
+    env.sched.tick(WED + timedelta(hours=3, minutes=31))
+    assert env.trade_reasons == ["cron", "cron"]
+    env.sched.on_trade_mission = lambda reason: env.trade_reasons.append(reason) or True
+    env.sched.tick(WED + timedelta(hours=3, minutes=32))
+    assert env.trade_reasons == ["cron", "cron", "cron"]
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == WED + timedelta(hours=2)
+
+
+def test_cron_pair_cursor_advances_all_available_pairs(tmp_path):
+    env = Env(tmp_path, seed_cron_bar=False)
+    env.sched.settings = SETTINGS.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    old = WED - timedelta(hours=1, seconds=30)
+    _seed_decision_bar(env, old, "USDJPY")
+    _seed_decision_bar(env, old, "EURUSD")
     env.sched.tick(WED)
     assert env.trade_reasons == ["cron"]
-    env.sched.tick(WED + timedelta(hours=1))
+    _seed_decision_bar(env, WED, "USDJPY")
+    env.sched.tick(WED + timedelta(hours=1, seconds=30))
     assert env.trade_reasons == ["cron", "cron"]
+    assert env.sched._cron_watermarks == {
+        ("USDJPY", "1h"): WED,
+        ("EURUSD", "1h"): old,
+    }
+
+
+def test_cron_watermark_regression_does_not_retrigger_or_rewind_cursor(tmp_path, caplog):
+    env = Env(tmp_path, seed_cron_bar=False)
+    first = WED - timedelta(hours=1, seconds=30)
+    _seed_decision_bar(env, first)
+    env.sched.tick(WED)
+    assert env.trade_reasons == ["cron"]
+    env.conn.execute("DELETE FROM ohlcv_cache WHERE interval='1h'")
+    _seed_decision_bar(env, first - timedelta(hours=1))
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.scheduler"):
+        env.sched.tick(WED + timedelta(minutes=1))
+        env.sched.tick(WED + timedelta(minutes=2))
+    assert env.trade_reasons == ["cron"]
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == first
+    assert caplog.text.count("cron watermark regressed") == 1
+
+
+def test_cron_accepting_other_pair_does_not_rewind_regressed_pair(tmp_path):
+    """別 pair の進行を受理しても後退した cursor は消費済みのままにする。"""
+    env = Env(tmp_path, seed_cron_bar=False)
+    env.sched.settings = SETTINGS.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    t1 = WED - timedelta(hours=1)
+    t2 = WED
+    t3 = WED + timedelta(hours=1)
+    _seed_decision_bar(env, t2, "USDJPY")
+    _seed_decision_bar(env, t2, "EURUSD")
+    env.sched.tick(WED + timedelta(hours=1, seconds=30))
+    assert env.trade_reasons == ["cron"]
+
+    env.conn.execute("DELETE FROM ohlcv_cache WHERE interval='1h'")
+    _seed_decision_bar(env, t3, "USDJPY")
+    _seed_decision_bar(env, t1, "EURUSD")
+    env.sched.tick(WED + timedelta(hours=2, seconds=30))
+    assert env.trade_reasons == ["cron", "cron"]
+    assert env.sched._cron_watermarks[("EURUSD", "1h")] == t2
+
+    env.conn.execute("DELETE FROM ohlcv_cache WHERE interval='1h'")
+    _seed_decision_bar(env, t3, "USDJPY")
+    _seed_decision_bar(env, t2, "EURUSD")
+    env.sched.tick(WED + timedelta(hours=2, minutes=1))
+    assert env.trade_reasons == ["cron", "cron"]
+
+
+def test_closed_baseline_does_not_rewind_regressed_pair_cursor(tmp_path):
+    env = Env(tmp_path, seed_cron_bar=False)
+    t1 = WED - timedelta(hours=1)
+    t2 = WED
+    _seed_decision_bar(env, t2)
+    env.sched.tick(WED + timedelta(hours=1, seconds=30))
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == t2
+
+    env.conn.execute("DELETE FROM ohlcv_cache WHERE interval='1h'")
+    _seed_decision_bar(env, t1)
+    env.sched._baseline_cron_watermarks(SAT)
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == t2
+
+
+def test_cron_available_pair_does_not_create_cursor_for_none_pair(tmp_path):
+    env = Env(tmp_path, seed_cron_bar=False)
+    env.sched.settings = SETTINGS.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    bar_time = WED - timedelta(hours=1, seconds=30)
+    _seed_decision_bar(env, bar_time, "USDJPY")
+    env.sched.tick(WED)
+    assert env.trade_reasons == ["cron"]
+    assert ("EURUSD", "1h") not in env.sched._cron_watermarks
+    _seed_decision_bar(env, bar_time, "EURUSD")
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.trade_reasons == ["cron", "cron"]
+
+
+def test_cron_none_pair_recovers_and_closed_restart_only_baselines(tmp_path):
+    closed = FRI.replace(hour=22)
+    opened = closed + timedelta(days=2)
+    env = Env(tmp_path, base=closed, seed_cron_bar=False)
+    env.sched.tick(closed)
+    assert env.trade_reasons == []
+    _seed_decision_bar(env, FRI - timedelta(hours=1, seconds=30))
+    env.sched.tick(closed + timedelta(minutes=1))
+    assert env.trade_reasons == []
+    env.sched.tick(opened)
+    assert env.trade_reasons == []
+    _seed_decision_bar(env, opened)
+    env.sched.tick(opened + timedelta(hours=1, seconds=30))
+    assert env.trade_reasons == ["cron"]
+    env.sched.tick(opened + timedelta(hours=1, minutes=31))
+    assert env.trade_reasons == ["cron"]
+
+
+def test_open_restart_runs_latest_watermark_once(tmp_path):
+    env = Env(tmp_path, seed_cron_bar=False)
+    _seed_decision_bar(env, WED - timedelta(hours=1, seconds=30))
+    env.sched.tick(WED)
+    assert env.trade_reasons == ["cron"]
+    restarted = Env(tmp_path, seed_cron_bar=False)
+    restarted.sched.tick(WED)
+    assert restarted.trade_reasons == ["cron"]
+    restarted.sched.tick(WED + timedelta(minutes=10))
+    assert restarted.trade_reasons == ["cron"]
 
 
 def test_market_closed_runs_data_cycles_but_no_trade_mission(tmp_path):
@@ -2763,7 +2916,7 @@ def test_maintain_reservations_span_min_not_committed_misses_old_then_new_violat
 
 def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
     """プラン 8 (Task 13): on_trade_mission が例外を送出する場合、
-    on_trade_mission は True を返さないため、_last_cron_trade は前進しない。
+    on_trade_mission は True を返さないため、watermark cursor は前進しない。
     これは新しい意図的な設計 — supervisor が busy の場合と同じく、締切を
     維持して次 tick で再試行する (Task 13 で on_trade_mission の戻り値型が
     None -> bool に変わった — 例外を出す場合は True を返さないため、
@@ -2776,15 +2929,16 @@ def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
         raise RuntimeError("mission callback failed")
 
     env.sched.on_trade_mission = boom
+    _seed_decision_bar(env, WED)
     first_call_time = WED
     with pytest.raises(RuntimeError):
         env.sched.tick(first_call_time)
     assert calls == ["cron"]
     # 例外が発生したので on_trade_mission は True を返さず、
-    # 締切は前進しない — 直後の tick でも再び "cron" が due になる
+    # cursor は前進しない — 直後の tick でも再び "cron" が due になる
     assert env.sched._trade_mission_due(
         first_call_time + timedelta(minutes=1)) == "cron"
-    # 1 時間後にも再試行される (締切が前進していないため)
+    # 1 時間後にも再試行される (cursor が前進していないため)
     assert env.sched._trade_mission_due(
         first_call_time + timedelta(hours=1)) == "cron"
 
@@ -2795,6 +2949,7 @@ def test_cron_deadline_only_advances_when_on_trade_mission_returns_true(tmp_path
     締切は維持され次 tick 以降で必ず再試行される。"""
     env = Env(tmp_path)
     env.sched.on_trade_mission = lambda reason: False  # busy を模す
+    _seed_decision_bar(env, WED)
 
     env.sched.tick(WED)
     # busy で拒否されたので締切は前進していない — 直後の tick でも
