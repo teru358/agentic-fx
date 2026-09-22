@@ -1,4 +1,4 @@
-# [closed-bars-and-required-window] 設計書 v1.0 (A2-1)
+# [closed-bars-and-required-window] 設計書 v1.1 (A2-1)
 
 対象 commit: `4321db3`。作成日・改訂日: 2026-09-21。A2 [live-price-source-mt5] を 4 束に分けた 1 本目 (後続: A2-2 tick snapshot + 要求予算 / A2-3 不通停止 + backfill / A2-4 bid/ask 約定)。下書きと設計レビュー 7 周の記録は `tmp/design-a2/` (リポジトリ外)。対象はライブ確定足、足別保存、必要本数の取得窓、primary 設定移行。根拠は現 worktree の静的読取りと §9 の実測である。
 
@@ -78,7 +78,7 @@ Scheduler はメモリ集合 `_closed_bar_unavailable_pairs` を持つ。対象 
 
 b の tick は同じ scheduler thread で `_scheduler_tick_once` を「取得の準備（lock 外、予算10秒）→ `core_lock` 内の commit → 既存 tick」に分ける。採用理由は、現行 `latest_1m_bar→get_bars` が scheduler の資金保護経路で同期通信し得る (`scheduler.py:346-353,416,938,989,1023`) 一方、通知も lock 外へ追い出している (`trade_loop.py:292-295`) ためである。lock 内取得案は timeout 中に SL/TP/MTM を止めるため不採用であり、保護処理は prepare の予算ぶん最大10秒遅れる。a は現行構造を崩さないが、1m に同じ明示 timeout と key/例外隔離を入れる。
 
-ingest は `(pair,native_interval)` ごとに例外を隔離する。wall-clock 予算は設定値、既定 10 秒。1m を最優先し、残時間で他足を処理、未処理は次 tick に回す。すべての source（yfinance を含む）に明示 timeout を渡す。予算切れ/失敗後も、paper limit/SL/TP、MTM/HWM の決定論ブロックは最後の確定行で必ず走る。
+ingest は `(pair,native_interval)` ごとに例外を隔離する。wall-clock 予算は設定値、既定 10 秒。優先順は 1m → 判断足 (`decision_timeframes`、束 B) → その他の足で、残時間で順に処理し未処理は次 tick に回す。判断足の key は、成功可能なら有限 tick 内に必ず probe される (1m が毎 tick 予算を使い切っても判断足が恒久に更新されない状態を作らない。fair queue の方式と上限は束 B の B1-0 spike で確定)。すべての source（yfinance を含む）に明示 timeout を渡す。予算切れ/失敗後も、paper limit/SL/TP、MTM/HWM の決定論ブロックは最後の確定行で必ず走る。
 
 watermark は DB の key ごとの `MAX(bar_time)`、`next_probe_at` はメモリ状態とする。`market_hours` が閉場なら due を立てない。開場中の空応答は成功であり、次 probe は `min(interval, exponential_backoff)` 後とする。cold fill range は planner の必要本数窓全体、定常 range は watermark の最低 1 本ぶん手前から cutoff までである。窓内の穴は cold fill の INSERT で埋めるが、残る穴は本数再計算による不足診断だけに出し、本格 backfill は A2-3 である。
 
@@ -319,3 +319,4 @@ rg -n --glob '!tmp/design-a2/design-A2-1.md' 'def (get_bars|latest_1m_bar|load_c
 | 2026-09-21 | v0.8 | ユーザー裁定 C1 を反映。a 導入時の migration を `ohlcv_cache` 全行の一回削除へ変更し、初回起動と同じ空 cache の振る舞い、印・history 不変・再実行 no-op を AC-23 と作業表へ明記した。残余リスクは旧版へ戻して再導入する場合だけとし、代案 A を採用へ移した。 | ユーザー裁定 (cache は削除してよい、初回起動と同じ状態なら問題ない) | — |
 | 2026-09-21 | v0.9 | r7 (codex terra、C0/I2/M1) を反映。全削除直後に建玉があり取得が失敗し続ける場合の導入時だけの既知の振る舞いと runbook を明記、AC-15 から全削除前の前提を除去、見出しの版を訂正。 | r7 (C0/I2/M1) | — |
 | 2026-09-21 | v1.0 | 確認 3 点のユーザー裁定を §8 に記録し、spec として清書 (内容は下書き v0.9 と同一) | codex 設計レビュー 7 周で Critical 0、ユーザー承認待ち | (本 commit) |
+| 2026-09-22 | v1.1 | §3.3 ingest の優先順を 1m → 判断足 → その他に固定し、判断足の有限 tick 内 probe を契約に | 束 B 設計レビュー r2 I4: 1m が予算を使い切ると判断足の watermark が進まず cron mission が起動しない | (本 commit) |
