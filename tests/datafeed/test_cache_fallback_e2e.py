@@ -7,7 +7,7 @@ import pytest
 
 from agentic_fx.core.contracts import Bar, FixedClock
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.service import build_app, run_init
+from agentic_fx.service import _scheduler_tick_once, build_app, run_init
 from agentic_fx.store import ohlcv
 from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import _no_real_network
@@ -49,8 +49,7 @@ def _build_real_app(root):
     )
 
 
-def _only_one_minute(pair: str, interval: str,
-                     lookback_days: int) -> list[Bar]:
+def _only_one_minute(pair: str, interval: str, start, end, *, timeout: float) -> list[Bar]:
     assert pair == PAIR
     if interval != "1m":
         raise OSError(f"fixture intentionally has no live {interval}")
@@ -68,10 +67,9 @@ def test_tick_processed_bar_marking_persists_one_minute_without_orders(tmp_path)
     app = _build_real_app(tmp_path)
     try:
         assert app.conn_core.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-        with _no_real_network(), \
-             patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
-                   side_effect=_only_one_minute):
-            app.scheduler.tick(OPEN_NOW)
+        app.ingest.fetch = _only_one_minute
+        with _no_real_network():
+            _scheduler_tick_once(app)
         rows = ohlcv.load_cache_bars(
             app.conn_core, PAIR, "1m", source=LIVE_SOURCE)
         assert rows
@@ -87,10 +85,9 @@ def test_build_app_tick_then_final_one_minute_to_one_hour_fallback(tmp_path):
     app = _build_real_app(tmp_path)
     try:
         assert app.conn_core.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
-        with _no_real_network(), \
-             patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
-                   side_effect=_only_one_minute):
-            app.scheduler.tick(OPEN_NOW)
+        app.ingest.fetch = _only_one_minute
+        with _no_real_network():
+            _scheduler_tick_once(app)
 
         one_hour_count = app.conn_core.execute(
             "SELECT COUNT(*) FROM ohlcv_cache WHERE symbol=? AND interval='1h' "

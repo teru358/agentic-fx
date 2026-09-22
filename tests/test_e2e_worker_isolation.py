@@ -15,7 +15,7 @@ import pytest
 from agentic_fx.core.contracts import (
     Bar, FixedClock, InstrumentSpec, OrderStatus, Quote,
 )
-from agentic_fx.service import build_app, run_init
+from agentic_fx.service import _scheduler_tick_once, build_app, run_init
 from agentic_fx.store import orders as orders_store
 from agentic_fx.store import ohlcv as ohlcv_store
 
@@ -141,8 +141,9 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
         # の対象外。実 DB キャッシュを用意し、本物の healthcheck を通す。
         ohlcv_store.upsert_cache_bars(
             app.conn_core,
-                [Bar("USDJPY", "1h", now - timedelta(minutes=70), 148.00, 148.30, 147.90,
-                 148.20, 100.0)],
+                [safe_bar,
+                 Bar("USDJPY", "1h", now, 148.00, 148.30, 147.90,
+                     148.20, 100.0)],
             source="yfinance")
         oid = orders_store.insert(
             app.conn_core, pair="USDJPY", direction="long",
@@ -159,13 +160,14 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
         app.trade_loop.runner = BlockingRunner()
         app.supervisor.start()
 
-        with app.core_lock:
-            app.scheduler.tick(now)
+        app.ingest = None
+        _scheduler_tick_once(app)
         assert reached.wait(5.0), (
             "scheduler→on_trade_mission→supervisor.try_submit→_trade_fn→"
             "TradeLoop.run_once→runner.run の本番配線に到達しなかった")
 
         current_bar["value"] = sl_bar
+        ohlcv_store.upsert_cache_bars(app.conn_core, [sl_bar], source="yfinance")
         acquired = app.core_lock.acquire(timeout=3.0)
         assert acquired, "Mission 実行中に core_lock を取得できなかった"
         try:

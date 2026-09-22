@@ -120,6 +120,23 @@ class PriceProvider:
         d = self.settings.datafeed
         td_key = self._td_key()
         chain: list[tuple[str, Callable[[], object]]] = []
+        if self.readonly:
+            primary = d.primary
+            if primary == "mt5" and d.mt5.enabled:
+                return [("mt5", (lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
+                         if kind == "quote" else
+                         (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
+                                                   lookback_days)))]
+            if primary == "twelvedata" and td_key:
+                return [("twelvedata", (lambda: sources.td_quote(td_key, pair))
+                         if kind == "quote" else
+                         (lambda: sources.td_bars(td_key, pair, interval,
+                                                  lookback_days)))]
+            if primary == "yfinance" and d.yfinance.enabled:
+                return [("yfinance", (lambda: sources.yf_quote(pair))
+                         if kind == "quote" else
+                         (lambda: sources.yf_bars(pair, interval, lookback_days)))]
+            return []
         if d.mt5.enabled:
             chain.append(("mt5", (
                 lambda: sources.mt5_quote(d.mt5.bridge_url, pair))

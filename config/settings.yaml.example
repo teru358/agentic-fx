@@ -49,6 +49,7 @@ llama_swap:
   max_turns: 16
 
 datafeed:
+  # primary: yfinance   # 省略時は enabled が 1 個ならそれ
   yfinance:   {enabled: true}
   mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
   twelvedata: {enabled: false}
@@ -59,6 +60,7 @@ datafeed:
   primary_intervals: [1h]            # 判断 Mission が依存する足 (healthcheck の対象)。増やすほど単一障害点も増える
   watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
   cache_retention_days: 30    # ohlcv_cache の保持期間 (日)。intervals の構成が要求する最小日数を下回ると起動拒否 (プラン9 Task16)
+  # retention: {yfinance: {1m: "2d", 1h: "30d"}}  # source ごとの保持。cache_retention_days とは併用不可
 
 news:
   cleanup_hours: 48

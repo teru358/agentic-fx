@@ -54,7 +54,7 @@ def test_tools_do_not_resample_and_delegate_the_timeframe_to_the_provider():
     reg = ToolRegistry()
     reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
     reg.func("get_ohlcv")(pair="USDJPY", timeframe="4h")
-    provider.get_bars.assert_called_with("USDJPY", "4h")
+    provider.get_bars.assert_called_with("USDJPY", "4h", lookback_days=27)
 
 
 def test_get_indicators_passes_timeframe_to_provider():
@@ -67,7 +67,18 @@ def test_get_indicators_passes_timeframe_to_provider():
     reg = ToolRegistry()
     reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
     reg.func("get_indicators")(pair="USDJPY", timeframe="4h")
-    provider.get_bars.assert_called_with("USDJPY", "4h")
+    provider.get_bars.assert_called_with("USDJPY", "4h", lookback_days=15)
+
+
+def test_get_ohlcv_passes_planned_lookback_days_to_provider():
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=100)
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(provider, MagicMock(), SETTINGS))
+
+    reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
+
+    provider.get_bars.assert_called_once_with("USDJPY", "1h", lookback_days=9)
 
 
 def test_timeframe_enum_comes_from_settings():
@@ -153,10 +164,10 @@ def test_get_ohlcv_returns_sorted_results_even_with_unsorted_input():
     the tool interface. Final element should have max ts.
     """
     provider = MagicMock()
-    bars = _bars(n=50)
+    bars = _bars(n=120)
     # Shuffle the bars to verify sorting is applied
     shuffled_bars = [bars[i] for i in [10, 5, 30, 2, 45, 1, 20, 40, 15, 35]]
-    shuffled_bars.extend([bars[i] for i in range(50) if i not in
+    shuffled_bars.extend([bars[i] for i in range(120) if i not in
                          [10, 5, 30, 2, 45, 1, 20, 40, 15, 35]])
     provider.get_bars.return_value = shuffled_bars
     reg = ToolRegistry()

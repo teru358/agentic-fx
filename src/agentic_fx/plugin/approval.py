@@ -23,7 +23,7 @@ content_hash` と検証完了時点のファイル内容が一致することを
 
 **承認 source と本番 source の差異を人間に見せる (opus R2 I1)**: payload
 の `eval_source` は承認バックテストが使う `settings.backtest.eval_source`、
-`live_source` は `settings.plugin.producer_source` (本番 producer が使う
+`live_source` は `settings.datafeed.primary` (本番 producer が使う
 source) — 両者が異なり得ることを承認レビュー時に人間が見えるようにする。
 **`eval_source` は strategy kind のみ実値 (indicator/signal は null —
 I2 是正、codex 段階2/3 是正 1周目)**: `base_interval`/`eval_timeframe` と
@@ -507,7 +507,7 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                           if meta.kind == "strategy" else None),
         "eval_timeframe": (_eval_timeframe(meta.timeframe)
                            if meta.kind == "strategy" else None),
-        "live_source": settings.plugin.producer_source,
+        "live_source": settings.datafeed.primary,
         "note": _NOTE,
     }
     # kind="plugin" は approval_requests.kind の値 (この承認要求が「plugin

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -138,6 +139,8 @@ class DatafeedSettings(_Strict):
     yfinance: SourceToggle
     mt5: SourceToggle
     twelvedata: SourceToggle
+    primary: str
+    ingest_budget_sec: float = Field(default=10, gt=0)
     freshness_max_min: float = Field(gt=0)
     # ソース時刻の遅延・境界丸めを吸収するための暫定猶予秒。
     closed_bar_grace_sec: int = Field(default=30, ge=0)
@@ -170,6 +173,15 @@ class DatafeedSettings(_Strict):
     # (cache_window) を import する必要があり、config.py を datafeed 層に
     # 依存させない方針を保つため service.py 側に置く)。
     cache_retention_days: int = Field(default=30, gt=0)
+    retention: dict[str, dict[str, str]] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _retention_modes_do_not_mix(cls, raw):
+        if (isinstance(raw, dict) and raw.get("retention") is not None
+                and "cache_retention_days" in raw):
+            raise ValueError("datafeed.retention and cache_retention_days cannot coexist")
+        return raw
 
     @model_validator(mode="after")
     def _check_intervals(self) -> "DatafeedSettings":
@@ -387,11 +399,6 @@ class PluginSettings(_Strict):
     # plugin に渡す DataFrame の末尾最大本数の上限 (config.yaml の
     # max_bars はこれ以下でなければならない — 照合は消費側の責務)。
     max_bars_limit: int = Field(ge=1, default=1000)
-    # 本番運用 (producer) が signal/strategy plugin を評価するときのデータ
-    # source。承認バックテスト (Task 6) は backtest.eval_source を使い、
-    # 承認 payload の "live_source" にこの値を載せて「評価 source と本番
-    # source の差異」を人間に見せる (プラン 7 Task 6, opus R2 I1)。
-    producer_source: str = "yfinance"
     # signals テーブル (プラン 7 Task 7) の requeue 上限。この回数以上
     # requeue_count が溜まると reclaim/requeue で abandoned に終端する。
     signal_requeue_max: int = Field(ge=0, default=2)
@@ -468,6 +475,51 @@ class Settings(_Strict):
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
     alert: AlertSettings = Field(default_factory=AlertSettings)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_primary_source(cls, values):
+        if not isinstance(values, dict):
+            return values
+        datafeed = values.get("datafeed")
+        plugin = values.get("plugin")
+        if not isinstance(datafeed, dict):
+            return values
+        plugin = plugin if isinstance(plugin, dict) else {}
+        has_primary = "primary" in datafeed
+        has_legacy = "producer_source" in plugin
+        if has_primary and has_legacy:
+            raise ValueError("ambiguous_primary_source")
+        enabled = [name for name in ("yfinance", "mt5", "twelvedata")
+                   if isinstance(datafeed.get(name), dict)
+                   and datafeed[name].get("enabled") is True]
+        if has_primary:
+            primary = datafeed["primary"]
+        elif has_legacy:
+            primary = plugin["producer_source"]
+            _log.warning("plugin.producer_source is deprecated; use datafeed.primary")
+        elif len(enabled) == 1:
+            primary = enabled[0]
+        elif len(enabled) > 1:
+            raise ValueError(
+                "primary_source_required: datafeed.primary を明記してください（enabled source が複数です）")
+        else:
+            raise ValueError("primary_source_required: no enabled source")
+        if primary not in {"yfinance", "mt5", "twelvedata"}:
+            raise ValueError("unknown_primary_source")
+        if primary not in enabled:
+            raise ValueError("primary_source_disabled")
+        if primary == "twelvedata" and not os.environ.get("TWELVEDATA_API_KEY"):
+            raise ValueError("primary_source_unusable")
+        resolved_datafeed = dict(datafeed)
+        resolved_datafeed["primary"] = primary
+        resolved_plugin = dict(plugin)
+        resolved_plugin.pop("producer_source", None)
+        resolved_values = dict(values)
+        resolved_values["datafeed"] = resolved_datafeed
+        if "plugin" in values:
+            resolved_values["plugin"] = resolved_plugin
+        return resolved_values
 
     @field_validator("display_timezone")
     @classmethod

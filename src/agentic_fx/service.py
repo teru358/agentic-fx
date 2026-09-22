@@ -32,6 +32,9 @@ from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor
 from agentic_fx.datafeed import cache_window, sources
+from agentic_fx.datafeed.ingest import Ingest
+from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
+from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
@@ -410,7 +413,7 @@ def run_init(root: Path) -> int:
     # 無くなる。この確認は state 更新より前に置いてあるので、想定外の例外で
     # 落ちた場合は未初期化のまま残り、起動ガードが引き続き止める。
     try:
-        source = PriceProvider(conn, settings, clock).healthcheck(
+        source = PriceProvider(conn, settings, clock, readonly=True).healthcheck(
             settings.pairs[0])   # pairs は空を config が弾く (min_length=1)
     except DataUnhealthy as e:
         # safe_error_text を再度通す (多層防御)。init の標準出力は人が見て
@@ -485,6 +488,7 @@ class App:
     health_latch: HealthLatch = field(default_factory=HealthLatch)
     watchdog_heartbeat: float = field(default_factory=time.monotonic)
     fatal_reason: str | None = None
+    ingest: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -523,6 +527,11 @@ def _validate_cache_retention(settings) -> None:
     した瞬間にキャッシュフォールバックが黙って壊れる余地を残す。
     """
     d = settings.datafeed
+    # ``cache_retention_days`` has a Pydantic default for legacy files.  A
+    # new-style raw ``retention`` mapping must not be mistaken for an explicit
+    # legacy setting merely because that default was populated.
+    if d.retention is not None:
+        return
     for interval in d.intervals:
         for source in sources.NATIVE_INTERVALS:
             try:
@@ -555,11 +564,62 @@ def _validate_startup(settings) -> None:
             jsonschema.Draft202012Validator.check_schema(schema)
         except jsonschema.exceptions.SchemaError as e:
             raise RuntimeError(f"invalid tool/output schema: {e}") from e
-    if settings.plugin.producer_source not in ohlcv.KNOWN_OHLCV_SOURCES:
+    if settings.datafeed.primary not in ohlcv.KNOWN_OHLCV_SOURCES:
         raise RuntimeError(
-            f"settings.plugin.producer_source={settings.plugin.producer_source!r} "
+            f"settings.datafeed.primary={settings.datafeed.primary!r} "
             f"is not a known source (known: {sorted(ohlcv.KNOWN_OHLCV_SOURCES)})")
     _validate_cache_retention(settings)
+
+
+def _startup_plugin_dispositions(settings, plugins, activity):
+    """Reject impossible core windows and remove impossible optional plugins."""
+    registry = build_registry(settings, plugins)
+    planner = RequirementPlanner()
+    source = settings.datafeed.primary
+    storage_source = "mt5-live" if source == "mt5" else source
+    legacy_days = (None if settings.datafeed.retention is not None
+                   else settings.datafeed.cache_retention_days)
+    retention = ohlcv.build_retention_plan(
+        settings.datafeed.retention, legacy_days=legacy_days,
+        required_intervals=registry.required_intervals)
+    disabled: set[str] = set()
+    for requirement in registry.entries:
+        native = "1h" if requirement.interval in {"4h", "1d", "1wk"} else requirement.interval
+        result = planner.plan(source, native, requirement.required_closed_bars,
+                              consumer=requirement.consumer_id)
+        disposition = startup_disposition(requirement, result)
+        if disposition == "enabled":
+            cutoff = retention.cutoffs.get((storage_source, native))
+            required_days = result.days
+            retained_days = (0 if cutoff is None else
+                             (datetime.now(timezone.utc) - cutoff).total_seconds() / 86400)
+            if cutoff is None or retained_days < required_days:
+                disposition = "reject_startup" if requirement.hard else "disabled"
+                detail = (f"retention_days={retained_days:g} required_days={required_days}")
+                reason = (f"{requirement.consumer_id}: {requirement.reason}; "
+                          f"source={source} interval={native} {detail}")
+                if disposition == "reject_startup":
+                    raise RuntimeError("core closed-bar requirement is structurally unavailable: " + reason)
+                disabled.add(requirement.consumer_id)
+                activity.write(Category.SYSTEM, "plugin_closed_bars_disabled",
+                               f"{reason} (retention structurally unavailable)",
+                               ref_id=requirement.consumer_id)
+                continue
+        if disposition == "enabled":
+            continue
+        detail = result.insufficient
+        reason = (f"{requirement.consumer_id}: {requirement.reason}; "
+                  f"source={source} interval={native} "
+                  f"required={requirement.required_closed_bars} "
+                  f"capability_days={detail.capability if detail else None}")
+        if disposition == "reject_startup":
+            raise RuntimeError(f"core closed-bar requirement is structurally unavailable: {reason}")
+        disabled.add(requirement.consumer_id)
+        activity.write(Category.SYSTEM, "plugin_closed_bars_disabled",
+                       f"{reason} (structurally unavailable)",
+                       ref_id=requirement.consumer_id)
+    return [plugin for plugin in plugins
+            if getattr(plugin, "name", None) not in disabled]
 
 
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
@@ -595,7 +655,7 @@ class _SupervisorAsk:
 
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
-                            now: datetime, resolved_by_identity) -> None:
+                            now: datetime, resolved_by_identity, activity=None) -> None:
     """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
     関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
     する)。
@@ -621,8 +681,8 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                          freshness_bars=settings.plugin.signal_freshness_bars)
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
-        source=settings.plugin.producer_source, settings=settings,
-        resolved_by_identity=resolved_by_identity)
+        source=settings.datafeed.primary, settings=settings,
+        resolved_by_identity=resolved_by_identity, activity=activity)
 
 
 def build_app(root: Path, *, runner: AgentRunner | None = None,
@@ -659,6 +719,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     カスタム PriceProvider を渡すこと (本 E2E テスト `tests/test_e2e_phase1.py`
     参照)。
     """
+    supplied_provider = provider is not None
     clock = clock or SystemClock()
     stop_event = stop_event if stop_event is not None else threading.Event()
     settings = load_settings(root / "config" / "settings.yaml")
@@ -829,6 +890,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         inventory_result = plugin_loader.approved_plugins(
             conn_core, plugins_dir, settings=settings)
         approved = list(inventory_result.inventory.metas)
+        approved = _startup_plugin_dispositions(settings, approved, activity)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
         # 評価 → signals キュー投入)。producer は評価 cursor をメモリに持つ
@@ -1007,16 +1069,41 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             _run_signal_maintenance(
                 conn=conn_core, signal_producer=signal_producer,
                 approved=approved, settings=settings, now=now,
-                resolved_by_identity=dict(inventory_result.resolved))
+                resolved_by_identity=dict(inventory_result.resolved),
+                activity=activity)
+
+        requirement_registry = build_registry(settings, approved)
+        retention_plan = ohlcv.build_retention_plan(
+            settings.datafeed.retention,
+            legacy_days=(None if settings.datafeed.retention is not None
+                         else settings.datafeed.cache_retention_days),
+            required_intervals=requirement_registry.required_intervals,
+            now=clock.now())
+        ingest = Ingest(settings, approved, read_conn=conn_supervisor)
+
+        def db_latest_1m_bar(pair: str):
+            source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
+            rows = ohlcv.load_cache_bars(conn_core, pair, "1m", source=source)
+            return rows[-1] if rows else None
+
+        def db_healthcheck(pair: str) -> str:
+            source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
+            now = clock.now()
+            for interval in settings.datafeed.primary_intervals:
+                rows = ohlcv.load_cache_bars(conn_supervisor, pair, interval,
+                                             source=source)
+                if not rows or now - rows[-1].ts > timedelta(minutes=settings.datafeed.freshness_max_min):
+                    raise DataUnhealthy(f"closed DB bars unhealthy for {pair} {interval}")
+            return settings.datafeed.primary
+
+        healthcheck_provider.healthcheck = db_healthcheck
 
         def on_cache_maintenance(now: datetime) -> None:
             # プラン 9 Task 16: ohlcv_cache の保持ポリシー。有界バッチ
             # (_OHLCV_PRUNE_BATCH_LIMIT) × 毎 maintenance 実行で、初回の
             # 大量削除 (既存蓄積分) の lock 保持窓を抑えつつ、定常状態では
             # 1 回の呼び出しで日次増分に追いつく (設計書 D2)。
-            cutoff = now - timedelta(days=settings.datafeed.cache_retention_days)
-            ohlcv.prune_cache(conn_core, cutoff=cutoff,
-                              limit=_OHLCV_PRUNE_BATCH_LIMIT)
+            ohlcv.prune_cache(conn_core, plan=retention_plan)
 
         def signal_due_fn(now: datetime) -> bool:
             # D2: オープンポジション or pending_fill の注文が無いなら signal
@@ -1030,7 +1117,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         scheduler = Scheduler(conn=conn_core, executor=executor,
                               settings=settings, state_store=state,
-                              activity=activity, bars_fn=bars_fn,
+                              activity=activity,
+                              bars_fn=bars_fn if supplied_provider else db_latest_1m_bar,
                               on_trade_mission=on_trade_mission,
                               on_news_cycle=collector.collect,
                               on_econ_cycle=econ.refresh,
@@ -1072,7 +1160,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    conn_supervisor=conn_supervisor, stop_event=stop_event,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
-                   fatal_reason=None)
+                   fatal_reason=None, ingest=ingest)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -1121,6 +1209,18 @@ def _scheduler_tick_once(app: App) -> None:
     伴うため core_lock 下では実行できない)。`with app.core_lock:` ブロック
     を抜けた**後**にそれらを順に実行する。
     """
+    if app.ingest is not None:
+        try:
+            app.ingest.prepare(app.clock.now())
+            with app.core_lock:
+                app.ingest.commit(app.conn_core)
+        except Exception as exc:  # noqa: BLE001 -- protection must still tick
+            _log.warning("ingest prepare failed: %s", safe_error_text(exc))
+            try:
+                app.activity.write(Category.SYSTEM, "ingest_prepare_failed",
+                                   safe_error_text(exc))
+            except Exception:  # noqa: BLE001 -- activity cannot stop protection
+                _log.exception("failed to record ingest prepare failure")
     pending = []
     deferred: list = []
     try:

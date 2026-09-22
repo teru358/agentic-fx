@@ -70,7 +70,7 @@ def _flatten_yf_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
+def yf_bars(pair: str, interval: str, lookback_days: int, *, timeout: float = 10) -> list[Bar]:
     # ignore_tz=False を明示: 既定 (None) だと yfinance が
     # `interval[-1] not in ('m', 'h')` で ignore_tz を解決してしまい、
     # 1d だけ取引所ローカル→naive (絶対時刻がずれる)、他の足は tz-aware
@@ -78,7 +78,7 @@ def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
     df = yfinance.download(
         vendor_symbol(pair, "yf"), interval=interval,
         period=f"{lookback_days}d", progress=False, auto_adjust=False,
-        multi_level_index=False, ignore_tz=False, timeout=10)
+        multi_level_index=False, ignore_tz=False, timeout=timeout)
     df = _flatten_yf_columns(df)
     bars: list[Bar] = []
     for ts, row in df.iterrows():
@@ -120,7 +120,7 @@ def mt5_quote(bridge_url: str, pair: str) -> Quote:
 
 
 def mt5_bars_range(bridge_url: str, pair: str, interval: str,
-                   start: datetime, end: datetime) -> list[Bar]:
+                   start: datetime, end: datetime, *, timeout: float = 30) -> list[Bar]:
     """期間指定でバーを取る (bridge の本来の形。copy_rates_range ベース)。
 
     Phase 2 の長期 backfill もこの関数をそのまま使う。
@@ -129,7 +129,7 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
     r = httpx.get(f"{bridge_url}/ohlcv/{sym}",
                   params={"from": start.isoformat(), "to": end.isoformat(),
                           "interval": interval},
-                  headers=_mt5_headers(), timeout=30)
+                  headers=_mt5_headers(), timeout=timeout)
     r.raise_for_status()
     payload = r.json()          # {symbol, interval, bars: [...]}
     # bar の出来高キーは "volume" (bridge が MT5 の tick_volume を変換済み)。
@@ -159,7 +159,7 @@ def td_quote(api_key: str, pair: str) -> Quote:
 
 
 def td_bars(api_key: str, pair: str, interval: str,
-            lookback_days: int) -> list[Bar]:
+            lookback_days: int, *, timeout: float = 30) -> list[Bar]:
     size = min(_TD_MAX_OUTPUTSIZE,
                int(lookback_days * 1440 / INTERVAL_MIN[interval]))
     # timezone を明示しないと Twelve Data は取引所ローカル時刻を既定にし、
@@ -168,7 +168,7 @@ def td_bars(api_key: str, pair: str, interval: str,
                   params={"symbol": vendor_symbol(pair, "td"),
                           "interval": _TD_INTERVAL[interval],
                           "outputsize": size, "timezone": "UTC",
-                          "apikey": api_key}, timeout=30)
+                          "apikey": api_key}, timeout=timeout)
     r.raise_for_status()
     values = r.json().get("values", [])
     bars = []

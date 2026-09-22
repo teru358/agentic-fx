@@ -337,7 +337,7 @@ def test_1d_bucket_anchored_at_utc_midnight(tmp_path):
 
 # --- source からのテーブル導出 (プラン 9 Task 16 欠陥 #6 の修正) ---------
 # load_resampled_frame は backtest 専用ではなく、本番の signal_producer
-# (source = settings.plugin.producer_source = "yfinance" 既定) からも呼ば
+# (source = settings.datafeed.primary = "yfinance" 既定) からも呼ば
 # れる共有リーダ。テーブルを `FROM ohlcv_history` に固定すると、ライブ経路
 # は空の履歴テーブルを読み、signal が永久に出ない (fail-open で WARNING が
 # 出るだけ) 状態になる。読むテーブルは source から導出する。

@@ -7,7 +7,7 @@ from unittest.mock import patch
 from agentic_fx.core.contracts import Bar, FixedClock
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.service import build_app, run_init
+from agentic_fx.service import _scheduler_tick_once, build_app, run_init
 
 from tests.test_service_app import _no_real_network
 from tests.store.test_rag import FakeEmbedding
@@ -45,7 +45,7 @@ def test_phase1_full_cycle(tmp_path):
     ])
 
     from agentic_fx.core.contracts import InstrumentSpec, Quote
-    bars = {}
+    bars = []
     quote_fn = lambda p: Quote(p, 148.49, 148.51, WED, "test")  # noqa: E731
     # 上書き 2 補正: 実 InstrumentSpec は base_currency/quote_currency も
     # 必須 (逐語テストの 6 引数だけでは TypeError)。USDJPY の実値を明示する。
@@ -54,8 +54,12 @@ def test_phase1_full_cycle(tmp_path):
     # build_app の注入点を使う (build 後の patch は bound クロージャに届かない)
     app = build_app(tmp_path, runner=fake, clock=FixedClock(WED),
                     quote_fn=quote_fn, spec_fn=spec_fn,
-                    bars_fn=lambda p: bars.get(p),
                     embedding_fn=FakeEmbedding())
+    app.scheduler.on_improve_tick = None
+    # The scheduler reads the committed cache.  Feed the same fake source into
+    # ingest, then use its prepare -> commit -> scheduler production route.
+    app.ingest.fetch = lambda pair, interval, start, end, **_: [
+        bar for bar in bars if bar.interval == interval]
 
     # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
     # ため、supervisor を起動する必要がある。
@@ -66,24 +70,26 @@ def test_phase1_full_cycle(tmp_path):
                           return_value="test"), \
              _no_real_network():
             # tick 1: 毎時 Mission → 指値発注
-            app.scheduler.tick(WED)
+            _scheduler_tick_once(app)
             time.sleep(0.5)  # supervisor スレッドが job を実行するまで待機
             rows = app.conn_core.execute("SELECT * FROM orders").fetchall()
             assert len(rows) == 1 and rows[0]["status"] == "pending_fill"
 
             # tick 2: 約定バー → open
-            bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
-                                 148.25, 100)
-            app.scheduler.tick(WED + timedelta(minutes=1))
+            bars[:] = [Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                           148.25, 100)]
+            app.clock = FixedClock(WED + timedelta(minutes=2))
+            _scheduler_tick_once(app)
             time.sleep(0.5)
             assert app.conn_core.execute(
                 "SELECT status FROM orders").fetchone()["status"] == "open"
 
             # tick 3: TP バー (新しい ts を渡す — 同一バー再処理ガードは
             # unit 側で検証済み: tests/core/test_scheduler.py)。→ closed
-            bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
-                                 148.90, 149.10, 148.85, 149.05, 100)
-            app.scheduler.tick(WED + timedelta(minutes=2))
+            bars[:] = [Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                           148.90, 149.10, 148.85, 149.05, 100)]
+            app.clock = FixedClock(WED + timedelta(minutes=3))
+            _scheduler_tick_once(app)
             time.sleep(0.5)
             row = app.conn_core.execute("SELECT * FROM orders").fetchone()
             assert row["status"] == "closed" and row["realized_pnl"] > 0
@@ -93,10 +99,10 @@ def test_phase1_full_cycle(tmp_path):
             closed_order_id = row["id"]
 
             # tick 4 (1 時間後): 2 周目 trade (hold) → reflection 生成
-            bars["USDJPY"] = Bar("USDJPY", "1m",
-                                 WED + timedelta(hours=1),
-                                 149.00, 149.05, 148.95, 149.00, 100)
-            app.scheduler.tick(WED + timedelta(hours=1, minutes=1))
+            bars[:] = [Bar("USDJPY", "1m", WED + timedelta(hours=1),
+                           149.00, 149.05, 148.95, 149.00, 100)]
+            app.clock = FixedClock(WED + timedelta(hours=1, minutes=1))
+            _scheduler_tick_once(app)
             time.sleep(0.5)
             refl = app.conn_core.execute("SELECT * FROM reflections").fetchall()
             assert len(refl) == 1

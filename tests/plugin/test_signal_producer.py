@@ -26,7 +26,7 @@ from agentic_fx.store.db import connect, init_db
 H = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 SETTINGS = load_settings(EXAMPLE)
-SOURCE = SETTINGS.plugin.producer_source  # "yfinance" (既定)
+SOURCE = SETTINGS.datafeed.primary  # "yfinance" (既定)
 
 
 def _conn(tmp_path):
@@ -37,17 +37,22 @@ def _conn(tmp_path):
 
 def _seed_flat(conn, start: datetime, minutes: int, *, price: float = 100.0,
                source: str = SOURCE, symbol: str = "USDJPY") -> None:
-    """producer は `settings.plugin.producer_source` (ライブ source) の足を
+    """producer は `settings.datafeed.primary` (ライブ source) の足を
     読むので、seed も**キャッシュ側**へ書く (プラン 9 Task 16 の分割以降、
     ライブ source を履歴 API へ渡すと allowlist が拒否する)。
     """
     bars = [Bar(symbol, "1m", start + timedelta(minutes=i),
                 price, price, price, price, 10.0) for i in range(minutes)]
     ohlcv_store.upsert_cache_bars(conn, bars, source=source)
+    first_hour = floor_to_bucket(start, "1h")
+    hourly = [Bar(symbol, "1h", first_hour + timedelta(hours=i),
+                  price, price, price, price, 10.0)
+              for i in range((minutes + 59) // 60)]
+    ohlcv_store.upsert_cache_bars(conn, hourly, source=source)
 
 
 def _meta(*, name: str = "sig", kind: str = "signal", timeframe: str = "1h",
-          max_bars: int = 50, pairs: tuple[str, ...] = ("USDJPY",),
+          max_bars: int = 2, pairs: tuple[str, ...] = ("USDJPY",),
           content_hash: str = "h" * 64) -> PluginMeta:
     """fake sandbox_run 経路専用の PluginMeta。path は実在しなくてよい
     (sandbox_run を常に注入し PluginSession を経由しない)。"""
@@ -471,7 +476,7 @@ def test_multiple_signals_in_same_bucket_drop_is_observed_via_warning(
     assert "UNIQUE" in caplog.text
 
 
-def test_short_window_is_reported(tmp_path, caplog):
+def test_short_window_is_recorded_once_until_the_state_changes(tmp_path):
     """要求 max_bars に満たない窓しか読めなかったら loud に知らせる。
 
     `load_resampled_frame(..., max_bars=N)` は「在る分だけ」を返す。
@@ -488,12 +493,21 @@ def test_short_window_is_reported(tmp_path, caplog):
     fake = _FakeSandbox()
     fake.queue("short", {"signals": []})
     producer = SignalProducer()
-    with caplog.at_level(logging.WARNING):
+    class RecordingActivity:
+        def __init__(self):
+            self.calls = []
+
+        def write(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    activity = RecordingActivity()
+    for now in (H + timedelta(hours=1), H + timedelta(hours=2)):
         producer.evaluate_due_plugins(
-            conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
-            sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("cache_retention_days" in m for m in msgs), msgs
+            conn, plugins=[meta], now=now, source=SOURCE,
+            sandbox_run=fake, settings=SETTINGS,
+            resolved_by_identity=_resolved_by_identity(meta), activity=activity)
+    assert len(activity.calls) == 1
+    assert activity.calls[0][0][1] == "plugin_insufficient_closed_bars"
 
 
 def test_signal_producer_module_does_not_read_settings_backtest():

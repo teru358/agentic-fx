@@ -4,7 +4,7 @@ import logging
 import math
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import db
@@ -26,6 +26,81 @@ IMPORT_SOURCES = frozenset({"dukascopy", "mt5"})
 # 真実の源にする — service.py:_validate_startup の producer_source typo
 # 検出が参照する)。
 KNOWN_OHLCV_SOURCES = LIVE_SOURCES | IMPORT_SOURCES
+
+
+@dataclass(frozen=True)
+class RetentionPlan:
+    """Per live-source and native-interval cache cutoffs."""
+    cutoffs: dict[tuple[str, str], datetime]
+
+    def __post_init__(self) -> None:
+        for cutoff in self.cutoffs.values():
+            _require_aware_utc(cutoff, "retention cutoff")
+
+    @classmethod
+    def from_registry(cls, registry, *, sources=LIVE_SOURCES, now: datetime | None = None,
+                      planner=None, margin_days: int = 3) -> "RetentionPlan":
+        from agentic_fx.datafeed.planner import RequirementPlanner
+
+        now = _require_aware_utc(now or datetime.now(timezone.utc), "now")
+        planner = planner or RequirementPlanner()
+        cutoffs: dict[tuple[str, str], datetime] = {}
+        for source in sources:
+            for interval in registry.required_intervals:
+                if interval == "1m":
+                    days = 2
+                else:
+                    required = max((registry.required_closed_bars(pair, interval)
+                                    for pair in {pair for entry in registry.entries
+                                                 for pair in entry.pairs}), default=1)
+                    result = planner.plan(source, interval, required)
+                    days = (result.days if result.ok else 0) + margin_days
+                cutoffs[(source, interval)] = now - timedelta(days=days)
+        return cls(cutoffs)
+
+
+def build_retention_plan(retention: dict | None, *, legacy_days: int | None,
+                         required_intervals, now: datetime | None = None,
+                         margin_days: int = 3) -> RetentionPlan:
+    if retention is not None and legacy_days is not None:
+        raise ValueError("datafeed.retention and cache_retention_days cannot coexist")
+    now = _require_aware_utc(now or datetime.now(timezone.utc), "now")
+    cutoffs: dict[tuple[str, str], datetime] = {}
+    if retention is None:
+        if legacy_days is None:
+            legacy_days = 30
+        for source in LIVE_SOURCES:
+            for interval in required_intervals:
+                cutoffs[(source, interval)] = now - timedelta(days=legacy_days)
+        return RetentionPlan(cutoffs)
+    for source, intervals in retention.items():
+        source = "mt5-live" if source == "mt5" else source
+        for interval, days in intervals.items():
+            if not isinstance(days, str) or not days.endswith("d") or not days[:-1].isdigit():
+                raise ValueError("retention values must be whole-day strings such as '2d'")
+            cutoffs[(source, interval)] = now - timedelta(days=int(days[:-1]))
+    return RetentionPlan(cutoffs)
+
+
+def retention_shortfalls(registry, plan: RetentionPlan, *, now: datetime,
+                         planner=None) -> tuple[tuple[object, str], ...]:
+    """Identify entries whose configured cache lifetime cannot cover their window."""
+    from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
+
+    now = _require_aware_utc(now, "now")
+    planner = planner or RequirementPlanner()
+    failures = []
+    for entry in registry.entries:
+        native = "1h" if entry.interval in {"4h", "1d", "1wk"} else entry.interval
+        for source, interval in plan.cutoffs:
+            if interval != native:
+                continue
+            required = planner.plan(source, native, entry.required_closed_bars,
+                                    consumer=entry.consumer_id)
+            retained_days = (now - plan.cutoffs[(source, interval)]).total_seconds() / 86400
+            if not required.ok or retained_days < required.days:
+                failures.append((entry, startup_disposition(entry, required)))
+    return tuple(failures)
 
 
 def _iso_utc(ts: datetime) -> str:
@@ -98,8 +173,8 @@ def load_cache_bars(conn: sqlite3.Connection, symbol: str, interval: str, *,
             for r in rows]
 
 
-def prune_cache(conn: sqlite3.Connection, *, cutoff: datetime,
-                limit: int) -> int:
+def prune_cache(conn: sqlite3.Connection, *, cutoff: datetime | None = None,
+                limit: int | None = None, plan: RetentionPlan | None = None) -> int:
     """`ohlcv_cache` の保持ポリシー。`bar_time < cutoff` の行を最大 `limit`
     件だけ削除する (有界バッチ — core_lock 保持窓を無制限に伸ばさないため)。
 
@@ -111,6 +186,18 @@ def prune_cache(conn: sqlite3.Connection, *, cutoff: datetime,
 
     削除件数を返す (呼び出し側は使わなくてよいが、テスト・ログで有用)。
     """
+    if plan is not None:
+        if cutoff is not None or limit is not None:
+            raise ValueError("plan cannot be combined with cutoff or limit")
+        deleted = 0
+        for (source, interval), plan_cutoff in plan.cutoffs.items():
+            cur = conn.execute("DELETE FROM ohlcv_cache WHERE source=? AND interval=? AND bar_time < ?",
+                               (source, interval, _require_aware_utc(plan_cutoff, "cutoff").isoformat()))
+            deleted += cur.rowcount
+        conn.commit()
+        return deleted
+    if cutoff is None or limit is None:
+        raise ValueError("cutoff and limit are required without a retention plan")
     cutoff_utc = _require_aware_utc(cutoff, "cutoff")
     if limit < 1:
         raise ValueError(f"prune_cache: limit must be >= 1, got {limit}")

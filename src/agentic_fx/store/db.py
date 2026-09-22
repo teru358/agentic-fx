@@ -1372,7 +1372,10 @@ def _migrate_ohlcv_cache_purge_pre_closed_v1(conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
             (name, datetime.now(timezone.utc).isoformat()))
-    _log.info("purged %d pre-closed ohlcv_cache rows", deleted)
+    # 新規 DB では消す行が無い。0 件の記録は既存の「init_db は log を出さない」
+    # 前提のテストを壊すだけなので、実際に消したときだけ残す
+    if deleted:
+        _log.info("purged %d pre-closed ohlcv_cache rows", deleted)
 
 
 def _backfill_improvement_backlog_idea_norm(conn: sqlite3.Connection) -> None:

@@ -24,7 +24,7 @@ def _table(source: str) -> str:
     """`source` から読むテーブルを導出する (プラン 9 Task 16)。
 
     本モジュールは backtest 専用ではない — `plugin/signal_producer.py` が
-    `settings.plugin.producer_source` (既定 "yfinance" = ライブ) で
+    `settings.datafeed.primary` (既定 "yfinance" = ライブ) で
     `load_resampled_frame` を呼ぶ。読むテーブルを `ohlcv_history` に固定
     すると、ライブ経路は空の履歴テーブルを読み、signal が 1 本も出ない
     (producer は plugin 単位で fail-open のため WARNING が出るだけで
@@ -207,3 +207,41 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
     if max_bars is not None:
         df = df.tail(max_bars)
     return df
+
+
+def load_closed_frame(conn: sqlite3.Connection, symbol: str, timeframe: str,
+                      source: str, required_bars: int, cutoff: datetime,
+                      grace: timedelta) -> pd.DataFrame:
+    """Return the closed live input for a producer evaluation.
+
+    Native rows are authoritative through 1h.  The two larger decision
+    intervals deliberately share the ordinary resampler, but feed it only
+    closed 1h rows so the live and backtest grids cannot drift apart.
+    """
+    _validate_timeframe(timeframe)
+    if required_bars < 1:
+        raise ValueError("required_bars must be >= 1")
+    cutoff_utc = _require_aware_utc(cutoff, "cutoff")
+    if grace < timedelta(0):
+        raise ValueError("grace must not be negative")
+
+    base_interval = "1h" if timeframe in ("4h", "1d") else timeframe
+    base_width = timedelta(minutes=TF_MINUTES[base_interval])
+    table = _table(source)
+    rows = conn.execute(
+        f"SELECT bar_time, open, high, low, close, volume FROM {table} "
+        "WHERE symbol=? AND interval=? AND source=? ORDER BY bar_time",
+        (symbol, base_interval, source)).fetchall()
+    if not rows:
+        return pd.DataFrame({c: pd.Series(dtype="float64") for c in _COLUMNS},
+                            index=pd.DatetimeIndex([], tz="UTC"))
+    df = pd.DataFrame(
+        {c: [r[c] for r in rows] for c in _COLUMNS},
+        index=pd.DatetimeIndex(pd.to_datetime(
+            [r["bar_time"] for r in rows], utc=True)), columns=list(_COLUMNS))
+    df = df[df.index + base_width + grace <= cutoff_utc]
+    if timeframe != base_interval:
+        df = resample(df, pandas_rule(timeframe))
+        width = timedelta(minutes=TF_MINUTES[timeframe])
+        df = df[df.index + width <= cutoff_utc]
+    return df.tail(required_bars)

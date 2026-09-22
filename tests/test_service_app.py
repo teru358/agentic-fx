@@ -7,6 +7,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -22,13 +23,39 @@ from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.service import (
     _assert_tools_registered, _check_llama_swap, _validate_startup,
-    _exit_code, build_app, build_splash, run_init, run_service,
+    _exit_code, _startup_plugin_dispositions, build_app, build_splash, run_init, run_service,
 )
 from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
+
+
+def test_startup_dispositions_disable_plugin_for_insufficient_retention():
+    settings = SimpleNamespace(
+        pairs=["USDJPY"],
+        datafeed=SimpleNamespace(primary="yfinance", primary_intervals=["1h"],
+                                 retention={"yfinance": {"1m": "20d", "1h": "20d"}},
+                                 cache_retention_days=30),
+    )
+    plugin = SimpleNamespace(name="long_window", kind="strategy", pairs=("USDJPY",),
+                             timeframe="1h", max_bars=400, indicators=())
+    activity = MagicMock()
+    assert _startup_plugin_dispositions(settings, [plugin], activity) == []
+    activity.write.assert_called_once()
+    assert activity.write.call_args.args[1] == "plugin_closed_bars_disabled"
+
+
+def test_startup_dispositions_reject_core_for_insufficient_retention():
+    settings = SimpleNamespace(
+        pairs=["USDJPY"],
+        datafeed=SimpleNamespace(primary="yfinance", primary_intervals=["1h"],
+                                 retention={"yfinance": {"1m": "0d", "1h": "20d"}},
+                                 cache_retention_days=30),
+    )
+    with pytest.raises(RuntimeError, match="core closed-bar requirement"):
+        _startup_plugin_dispositions(settings, [], MagicMock())
 
 
 def test_exit_code_is_failure_while_improve_thread_is_alive():
@@ -62,6 +89,17 @@ def _init(tmp_path):
          patch("agentic_fx.service._check_llama_swap"):
         pp.return_value.healthcheck.return_value = "yfinance"
         run_init(tmp_path)
+
+
+def test_init_healthcheck_is_readonly(tmp_path):
+    src = open("config/settings.yaml.example", encoding="utf-8").read()
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "settings.yaml.example").write_text(src)
+    with patch("agentic_fx.service.PriceProvider") as provider, \
+         patch("agentic_fx.service._check_llama_swap"):
+        provider.return_value.healthcheck.return_value = "yfinance"
+        run_init(tmp_path)
+    assert provider.call_args.kwargs["readonly"] is True
 
 
 def _seam_app(tmp_path, runner):
@@ -628,6 +666,11 @@ def _seed_1m(conn, source: str, start, minutes: int, *, price: float = 100.0,
     bars = [Bar(symbol, "1m", start + timedelta(minutes=i),
                 price, price, price, price, 10.0) for i in range(minutes)]
     ohlcv_store.upsert_cache_bars(conn, bars, source=source)
+    first_hour = start.replace(minute=0, second=0, microsecond=0)
+    hourly = [Bar(symbol, "1h", first_hour + timedelta(hours=i),
+                  price, price, price, price, 10.0)
+              for i in range((minutes + 59) // 60)]
+    ohlcv_store.upsert_cache_bars(conn, hourly, source=source)
 
 
 def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
@@ -657,8 +700,8 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
                         embedding_fn=FakeEmbedding())
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
                         equity=1_000_000)
-        _seed_1m(app.conn_core, app.settings.plugin.producer_source,
-                NOW - timedelta(hours=3), 3 * 60 + 1)
+        _seed_1m(app.conn_core, app.settings.datafeed.primary,
+                NOW - timedelta(hours=51), 51 * 60 + 1)
         with _no_real_network(), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"):
             app.scheduler.tick(NOW)
@@ -1949,12 +1992,13 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     def spy_run_signal_maintenance(*, conn, signal_producer, approved,
-                                  settings, now, resolved_by_identity):
+                                  settings, now, resolved_by_identity, activity):
         calls.append({
             "conn": conn is not None,
             "signal_producer": signal_producer is not None,
             "approved": approved is not None,
             "settings": settings is not None,
+            "activity": activity is not None,
             "now": now is not None,
             "now_value": now
         })
@@ -1973,12 +2017,13 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     assert call["signal_producer"] is True, "signal_producer should be passed"
     assert call["approved"] is True, "approved should be passed"
     assert call["settings"] is True, "settings should be passed"
+    assert call["activity"] is True, "activity should be passed"
     assert call["now"] is True, "now should be passed"
     assert call["now_value"] == test_now, "now value should match"
 
 
-def test_validate_startup_rejects_unknown_producer_source():
-    """producer_source が KNOWN_OHLCV_SOURCES に含まれない場合、
+def test_validate_startup_rejects_unknown_primary_source():
+    """primary が KNOWN_OHLCV_SOURCES に含まれない場合、
     RuntimeError で reject する。"""
     from agentic_fx.service import _validate_startup
     from agentic_fx.config import load_settings
@@ -1986,9 +2031,9 @@ def test_validate_startup_rejects_unknown_producer_source():
     settings = load_settings(
         Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
     settings = settings.model_copy(
-        update={"plugin": settings.plugin.model_copy(
-            update={"producer_source": "typo-source"})})
-    with pytest.raises(RuntimeError, match="producer_source"):
+        update={"datafeed": settings.datafeed.model_copy(
+            update={"primary": "typo-source"})})
+    with pytest.raises(RuntimeError, match="datafeed.primary"):
         _validate_startup(settings)
 
 
@@ -2126,6 +2171,22 @@ def test_scheduler_tick_once_uses_app_clock(tmp_path):
     app.scheduler.tick = _fake_tick
     _scheduler_tick_once(app)
     assert seen == [fixed.now()]
+
+
+def test_scheduler_tick_runs_when_ingest_prepare_raises(tmp_path, caplog):
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.ingest = MagicMock()
+    app.ingest.prepare.side_effect = RuntimeError("prepare boom")
+    app.activity.write = MagicMock()
+    seen = []
+    app.scheduler.tick = lambda now: seen.append(now) or []
+
+    _scheduler_tick_once(app)
+
+    assert seen == [app.clock.now()]
+    app.activity.write.assert_called_once()
 
 
 def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):

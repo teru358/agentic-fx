@@ -116,9 +116,9 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
         from datetime import timedelta
         step = timedelta(minutes=1)
         # Clock is at 2026-08-04 12:00, so generate bars ending close to that time
-        start = datetime(2026, 8, 4, 11, 30, tzinfo=timezone.utc)
+        start = datetime(2026, 8, 4, 10, 0, tzinfo=timezone.utc)
         return [Bar("USDJPY", "1m", start + step * i,
-                    148.0, 148.1, 147.9, 148.05, 10) for i in range(30)]
+                    148.0, 148.1, 147.9, 148.05, 10) for i in range(120)]
 
     ro_conn = connect_readonly(db_path)
     rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
@@ -135,7 +135,7 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     # get_ohlcv の正常戻り値は list[dict] (market_tools.py 45-49 行)。RO
     # 接続で書込が実際に走っていれば OperationalError が
     # `{"error": ...}` の dict に化けて型不一致で検出される。
-    assert isinstance(parsed, list) and len(parsed) == 29, result
+    assert isinstance(parsed, list) and len(parsed) == 100, result
     # 念のため RW 接続からも cache が空のままであることを確認する
     # (write skip の直接証跡)。
     assert ohlcv.load_cache_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []

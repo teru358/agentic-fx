@@ -61,6 +61,7 @@ def _app(root: Path, now: datetime, bars: dict[str, Bar | None]):
     app.scheduler.on_econ_cycle = lambda: None
     app.scheduler.on_signal_maintenance = None
     app.scheduler.on_cache_maintenance = None
+    app.scheduler.bars_fn = lambda pair: bars.get(pair)
     return app
 
 
@@ -72,14 +73,17 @@ def test_forming_bar_never_reaches_readers_after_fetch_failure(tmp_path):
     from agentic_fx.store.db import connect
     conn = connect(tmp_path / "data" / "agentic.db")
     provider = PriceProvider(conn, settings, clock)
-    closed = _bar(datetime(2026, 7, 22, 8, 59, tzinfo=UTC))
+    closed_bars = [
+        _bar(datetime(2026, 7, 22, 8, 59, tzinfo=UTC) - timedelta(minutes=i))
+        for i in reversed(range(101))]
+    closed = closed_bars[-1]
     forming = _bar(datetime(2026, 7, 22, 9, 0, tzinfo=UTC), close=157.70)
 
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
-               side_effect=[[closed, forming], RuntimeError("offline")]):
+               side_effect=[[*closed_bars, forming], RuntimeError("offline")]):
         assert provider.latest_1m_bar("USDJPY").ts == closed.ts
         assert [b.ts for b in ohlcv.load_cache_bars(
-            conn, "USDJPY", "1m", source="yfinance")] == [closed.ts]
+            conn, "USDJPY", "1m", source="yfinance")] == [b.ts for b in closed_bars]
 
         app = build_app(tmp_path, provider=provider, clock=clock,
                         embedding_fn=FakeEmbedding())
@@ -135,6 +139,7 @@ def test_forming_bar_never_reaches_readers_after_fetch_failure(tmp_path):
         tool = next(t for t in market_tools.build(readonly, object(), settings)
                     if t.name == "get_ohlcv")
         rows = tool.func("USDJPY", "1m")
+        assert isinstance(rows, list) and len(rows) == 100
         assert rows[-1]["ts"] != forming.ts.isoformat()
         app.close()
     conn.close()

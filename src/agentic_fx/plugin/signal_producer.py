@@ -24,7 +24,7 @@ floor`` かつ ``b >= now − tf幅 × signal_freshness_bars`` を満たすバ�
    再試行する。同じ理由でデータ欠損 (df 空) も同じ扱いにする — 「本番
    source にまだ取り込まれていないだけ」を fail-open で捌く。
 
-**source** は本番運用の data source (``settings.plugin.producer_source``、
+**source** は本番運用の data source (``settings.datafeed.primary``、
 既定 "yfinance") — 承認バックテスト (Task 6) の eval source とは意図的に
 異なる (承認 payload の "live_source" に差異を記載済み)。
 
@@ -51,7 +51,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable
 
-from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_resampled_frame
+from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_closed_frame
+from agentic_fx.activity import Category
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.store import signals
@@ -84,6 +85,9 @@ class SignalProducer:
     def __init__(self) -> None:
         # (plugin.name, content_hash, pair) -> 最後に評価成功したバケット開始時刻
         self._cursor: dict[tuple[str, str, str], datetime] = {}
+        # The set is deliberately in-memory like the cursor: an outage should
+        # yield one diagnostic per unchanged shortage, then recover silently.
+        self._insufficient_closed: set[tuple[str, str, str, str]] = set()
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
@@ -91,6 +95,7 @@ class SignalProducer:
                              settings: "Settings",
                              resolved_by_identity: (
                                  "dict[tuple[str, str], ResolvedIndicatorSet]"),
+                             activity=None,
                              ) -> int:
         """承認済み signal/strategy plugin のうち評価期限が来たバケットを
         評価し、新規挿入した signals 行の総数を返す。
@@ -158,7 +163,7 @@ class SignalProducer:
                         continue
                     inserted += self._evaluate_one(
                         conn, meta, pair, now=now, source=source, call=_call,
-                        settings=settings)
+                        settings=settings, activity=activity)
         finally:
             for session in sessions.values():
                 session.close()
@@ -166,7 +171,7 @@ class SignalProducer:
 
     def _evaluate_one(self, conn: "sqlite3.Connection", meta: PluginMeta,
                       pair: str, *, now: datetime, source: str,
-                      call: _CallFn, settings: "Settings") -> int:
+                      call: _CallFn, settings: "Settings", activity=None) -> int:
         """1 plugin × 1 pair 分の catch-up 評価。古いバケットから順に評価し、
         失敗したバケットの手前で打ち切る (cursor はそこまでしか進めない)。
         """
@@ -192,6 +197,18 @@ class SignalProducer:
                 inserted += self._evaluate_bucket(
                     conn, meta, pair, b, now=now, width=width, source=source,
                     call=call, settings=settings)
+            except _InsufficientClosedBars as e:
+                shortage = (meta.name, pair, source, meta.timeframe)
+                if shortage not in self._insufficient_closed:
+                    self._insufficient_closed.add(shortage)
+                    if activity is not None:
+                        activity.write(
+                            Category.TECH, "plugin_insufficient_closed_bars",
+                            "consumer=%s source=%s interval=%s required=%d available=%d"
+                            % (meta.name, source, meta.timeframe,
+                               meta.max_bars, e.available),
+                            ref_id=meta.name)
+                break
             except Exception as e:  # noqa: BLE001 — plugin 単位で fail-open
                 _log.warning(
                     "plugin %s (%s): evaluation failed at bucket %s (%s) — "
@@ -207,11 +224,10 @@ class SignalProducer:
                          width: timedelta, source: str, call: _CallFn,
                          settings: "Settings") -> int:
         bucket_end = bucket_start + width
-        df = load_resampled_frame(
-            conn, pair, meta.timeframe, source=source, base_interval="1m", until=bucket_end,
-            cutoff=now,
+        df = load_closed_frame(
+            conn, pair, meta.timeframe, source, meta.max_bars, now,
             grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
-            max_bars=meta.max_bars)
+        )
         # fix round 1 F3 (codex): df が非空でも「末尾行 = 対象バケット」と
         # は限らない — 取り込みラグ/欠損で対象バケット分の 1m 行が 1 本も
         # 無い場合、resample はそのバケットの行を生成せず、df の末尾は
@@ -233,14 +249,14 @@ class SignalProducer:
         # テーブルで評価するので、この劣化は本番でしか現れない。窓が
         # 足りない主因はキャッシュ保持期間なので、設定名を出して知らせる。
         if len(df) < meta.max_bars:
-            _log.warning(
-                "plugin %s (%s): %s の窓が %d 本しか読めなかった "
-                "(max_bars=%d 要求) — datafeed.cache_retention_days が "
-                "plugin の要求窓に対して短い可能性がある。指標は切り詰め"
-                "られた系列で計算される",
-                meta.name, pair, meta.timeframe, len(df), meta.max_bars)
+            raise _InsufficientClosedBars(len(df))
+        self._insufficient_closed.discard((meta.name, pair, source, meta.timeframe))
 
         bar_ts = bucket_start.isoformat()
+        native_interval = "1h" if meta.timeframe in ("4h", "1d") else meta.timeframe
+        provenance = {"live_source": source, "source": source,
+                      "interval": meta.timeframe, "bar_time": bar_ts,
+                      "bars_origin": f"{source}:{native_interval}"}
         if meta.kind == "signal":
             result = call(meta, {"df": df, "params": meta.params})
             inserted = 0
@@ -248,7 +264,7 @@ class SignalProducer:
                 row_id = signals.add(
                     conn, plugin=meta.name, content_hash=meta.content_hash,
                     pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
-                    kind="signal", payload=sig, now=now)
+                    kind="signal", payload={**sig, **provenance}, now=now)
                 if row_id is not None:
                     inserted += 1
                 elif i > 0:
@@ -274,5 +290,10 @@ class SignalProducer:
         row_id = signals.add(
             conn, plugin=meta.name, content_hash=meta.content_hash,
             pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
-            kind="strategy", payload=result, now=now)
+            kind="strategy", payload={**result, **provenance}, now=now)
         return 1 if row_id is not None else 0
+
+
+class _InsufficientClosedBars(Exception):
+    def __init__(self, available: int) -> None:
+        self.available = available

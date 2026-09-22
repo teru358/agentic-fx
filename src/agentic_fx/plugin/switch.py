@@ -1206,7 +1206,7 @@ def submit_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
-            "live_source": settings.plugin.producer_source,
+            "live_source": settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             # [profitability-floor] T1 Step 1-8 (codex I3): 適用した閾値
             # snapshot (approval 行を作る 3 箇所すべてに載せる)。CR4
@@ -2071,7 +2071,7 @@ def bless_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
-            "live_source": settings.plugin.producer_source,
+            "live_source": settings.datafeed.primary,
             "mission_id": None, "backlog_id": None,
             "floor_warning": outcome.floor_warning,
             "floor_detail": outcome.floor_detail,

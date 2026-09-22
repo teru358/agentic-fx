@@ -142,7 +142,7 @@ def _submit_and_approve(root: Path) -> None:
         "eval_source": settings.backtest.eval_source,
         "base_interval": settings.backtest.dataset().base_interval,
         "eval_timeframe": strategy_gate._eval_timeframe(meta.timeframe),
-        "live_source": settings.plugin.producer_source,
+        "live_source": settings.datafeed.primary,
         "note": "e2e fake",
     }
     approval_id = approvals_store.create(
@@ -153,23 +153,23 @@ def _submit_and_approve(root: Path) -> None:
 
 
 def _seed_crossover_history(conn, *, source: str) -> None:
-    """② 1m 履歴投入: バケット H で SMA(5) が SMA(20) を上抜けるクロスを
+    """② 1h native 履歴投入: バケット H で SMA(5) が SMA(20) を上抜けるクロスを
     1 回だけ作る (docs/examples/plugins/sma_cross/test_plugin.py の
     `test_evaluate_opens_long_on_upward_crossover` と同じ手計算値 — 20 本の
-    緩やかな下降 (120→101) の直後に急騰 (200) させる)。1 時間バケットにつき
-    1 本の 1m バーで足りる (resample はバケット内の存在する行だけを集計する
-    — `load_resampled_frame` の完成バケット判定は「行がバケット内に存在す
-    るか」のみを見る)。
+    緩やかな下降 (120→101) の直後に急騰 (200) させる)。
     """
     from agentic_fx.store import ohlcv as ohlcv_store
 
-    closes = [120.0 - i for i in range(20)] + [200.0]  # 21 本 (H-20h .. H)
+    closes = ([120.0] * 179 + [120.0 - i for i in range(20)] + [200.0])
     # producer が読むのはライブ source なので**キャッシュ側**へ書く
     # (プラン 9 Task 16 の分割以降、ライブ source は履歴 API が拒否する)。
-    bars = [Bar("USDJPY", "1m", H - timedelta(hours=20 - i),
+    bars = [Bar("USDJPY", "1h", H - timedelta(hours=len(closes) - 1 - i),
                 price, price, price, price, 10.0)
             for i, price in enumerate(closes)]
     ohlcv_store.upsert_cache_bars(conn, bars, source=source)
+    ohlcv_store.upsert_cache_bars(
+        conn, [Bar("USDJPY", "1m", NOW_TICK - timedelta(minutes=1),
+                   145.0, 145.1, 145.0, 145.05, 10.0)], source=source)
 
 
 def _seed_open_position(conn) -> int:
@@ -212,7 +212,7 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
                   settings=app.settings).inventory.metas)
 
     _seed_crossover_history(app.conn_core,
-                            source=app.settings.plugin.producer_source)
+                            source=app.settings.datafeed.primary)
     order_id = _seed_open_position(app.conn_core)
 
     # プラン 8 Task 13: on_trade_mission は supervisor 経由で非同期実行される
@@ -243,6 +243,11 @@ def test_approved_strategy_signal_triggers_advanced_mission(tmp_path):
             assert payload["direction"] == "long"
             assert payload["stop_loss"] is not None
             assert payload["take_profit"] is not None
+            assert {key: payload[key] for key in
+                    ("live_source", "source", "interval", "bar_time", "bars_origin")} == {
+                        "live_source": "yfinance", "source": "yfinance",
+                        "interval": "1h", "bar_time": H.isoformat(),
+                        "bars_origin": "yfinance:1h"}
 
             # ④ cron 締切を「直前に済んだ」ことにして signal 起動だけを見る
             # (test_service_app.py の F1(b) と同じ手法)。
@@ -326,7 +331,7 @@ def test_producer_step_is_load_bearing_for_signal(tmp_path):
     app = _build_app(tmp_path, runner=fake, bars=bars)
 
     _seed_crossover_history(app.conn_core,
-                            source=app.settings.plugin.producer_source)
+                            source=app.settings.datafeed.primary)
     _seed_open_position(app.conn_core)
 
     # ③ を意図的に無効化する (producer skip) — `on_signal_maintenance` は

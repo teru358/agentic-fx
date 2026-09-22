@@ -37,6 +37,16 @@ FEED_XML_PARSED.entries = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _no_network_for_feed_parser_tests():
+    """fetch_feed now obtains bytes before handing them to feedparser."""
+    with patch("agentic_fx.datafeed.fetchers.httpx.get",
+               return_value=httpx.Response(
+                   200, content=b"<rss/>",
+                   request=httpx.Request("GET", "https://feed.test/"))):
+        yield
+
+
 def test_fetch_feed_maps_entries():
     with patch("feedparser.parse", return_value=FEED_XML_PARSED):
         arts = fetch_feed("https://ex.com/rss", "example", timeout_sec=10)

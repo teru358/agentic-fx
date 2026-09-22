@@ -7,6 +7,7 @@ from agentic_fx.config import Settings
 from agentic_fx.datafeed.bars import bars_to_df
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.indicators import compute_indicators
+from agentic_fx.datafeed.planner import RequirementPlanner
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
@@ -40,15 +41,38 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
     """
     indicator_plugins = [m for m in (indicator_plugins or []) if m.kind == "indicator"]
     sandbox_run = sandbox_run if sandbox_run is not None else plugin_sandbox.run_plugin
+    planner = RequirementPlanner()
 
     # 足の導出 (ネイティブ / resample) は provider の責務。ここでは
     # 要求された足をそのまま渡す — ツール層で resample すると、MT5 の
     # ネイティブ 4h が使える環境でも 1h から作り直してしまう
-    def _frame(pair: str, timeframe: str):
-        return bars_to_df(provider.get_bars(pair, timeframe))
+    def _frame(pair: str, timeframe: str, *, required: int, consumer: str):
+        # Planning is deliberately performed before the readonly provider call.
+        # Provider owns the actual source-specific range request and never writes
+        # through this tool path.
+        plan = planner.plan(settings.datafeed.primary, timeframe, required,
+                            consumer=consumer)
+        if not plan.ok:
+            return bars_to_df([]), {"consumer": consumer,
+                                    "source": settings.datafeed.primary,
+                                    "interval": timeframe,
+                                    "required": required, "available": 0,
+                                    "capability": plan.insufficient.classification}
+        df = bars_to_df(provider.get_bars(pair, timeframe,
+                                          lookback_days=plan.days))
+        if len(df) < required:
+            return df, {"consumer": consumer,
+                        "source": settings.datafeed.primary,
+                        "interval": timeframe, "required": required,
+                        "available": len(df), "capability": "temporary"}
+        return df, None
 
     def get_ohlcv(pair: str, timeframe: str) -> list[dict]:
-        df = _frame(pair, timeframe).tail(100)
+        df, shortage = _frame(pair, timeframe, required=100,
+                              consumer="get_ohlcv")
+        if shortage is not None:
+            return {"insufficient_closed_bars": shortage}
+        df = df.tail(100)
         return [{"ts": ts.isoformat(), "open": r["open"], "high": r["high"],
                  "low": r["low"], "close": r["close"]}
                 for ts, r in df.iterrows()]
@@ -73,8 +97,22 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         (fail-open: plugin 出力は LLM 向けの参考情報であり、1 つの plugin
         の不調で get_indicators 全体を失敗させない)。
         """
-        df = _frame(pair, timeframe)
+        required = max([50, *(meta.max_bars for meta in indicator_plugins
+                              if meta.kind == "indicator")])
+        df, _ = _frame(pair, timeframe, required=required,
+                       consumer="get_indicators")
         result = compute_indicators(df)
+        # Do not claim a built-in value whose seed window is unavailable.
+        missing = [name for name, need in (("sma_20", 20), ("sma_50", 50),
+                                            ("ema_12", 12), ("ema_26", 26),
+                                            ("macd", 26), ("rsi_14", 15),
+                                            ("atr_14", 15), ("bb", 20))
+                   if len(df) < need]
+        if missing:
+            result["insufficient_closed_bars"] = {
+                "consumer": "get_indicators", "source": settings.datafeed.primary,
+                "interval": timeframe, "required": 50, "available": len(df),
+                "indicators": missing}
         for meta in indicator_plugins:
             if meta.max_bars > settings.plugin.max_bars_limit:
                 _log.warning(

@@ -29,6 +29,8 @@ def _settings(root, **datafeed):
         (root / "config" / "settings.yaml.example").read_text(encoding="utf-8"))
     for key, value in datafeed.items():
         raw["datafeed"][key] = value
+    if "primary" in datafeed:
+        raw["plugin"].pop("producer_source", None)
     (root / "config" / "settings.yaml").write_text(
         yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
 
@@ -251,7 +253,8 @@ def test_init_completes_offline_with_unreachable_bridge(tmp_path, capsys,
     _example(tmp_path)
     _settings(tmp_path, yfinance={"enabled": False},
               twelvedata={"enabled": False},
-              mt5={"enabled": True, "bridge_url": "http://127.0.0.1:1"})
+              mt5={"enabled": True, "bridge_url": "http://127.0.0.1:1"},
+              primary="mt5")
     assert run_init(tmp_path) == 0
     out = capsys.readouterr().out
     assert "警告" in out
@@ -266,7 +269,7 @@ def test_init_completes_when_every_source_refuses(tmp_path, capsys,
     """3 ソースすべてが接続エラーでも完了する (yfinance 分岐も含めて網羅)。"""
     monkeypatch.setenv("TWELVEDATA_API_KEY", "k")
     _example(tmp_path)
-    _settings(tmp_path, yfinance={"enabled": True},
+    _settings(tmp_path, primary="yfinance", yfinance={"enabled": True},
               twelvedata={"enabled": True},
               mt5={"enabled": True, "bridge_url": "http://127.0.0.1:1"})
     err = httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
@@ -279,9 +282,9 @@ def test_init_completes_when_every_source_refuses(tmp_path, capsys,
         assert run_init(tmp_path) == 0
     out = capsys.readouterr().out
     assert "警告" in out
-    # 3 ソース全部の失敗が 1 つの DataUnhealthy に集約されて警告になる
-    for name in ("mt5", "twelvedata", "yfinance"):
-        assert name in out
+    # 通常 reader は primary だけを読む。非 primary の失敗を警告に混ぜない。
+    assert "yfinance" in out
+    assert "mt5" not in out and "twelvedata" not in out
 
 
 def test_init_price_warning_does_not_leak_api_key(tmp_path, capsys, monkeypatch,
@@ -295,7 +298,8 @@ def test_init_price_warning_does_not_leak_api_key(tmp_path, capsys, monkeypatch,
     monkeypatch.setenv("TWELVEDATA_API_KEY", "SECRET_KEY_123")
     _example(tmp_path)
     _settings(tmp_path, yfinance={"enabled": False},
-              twelvedata={"enabled": True}, mt5={"enabled": False})
+              twelvedata={"enabled": True}, mt5={"enabled": False},
+              primary="twelvedata")
     url = ("https://api.twelvedata.com/quote"
            "?symbol=USD%2FJPY&apikey=SECRET_KEY_123")
     req = httpx.Request("GET", url)

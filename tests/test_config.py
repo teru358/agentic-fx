@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 from unittest.mock import MagicMock
 
 import pytest
@@ -36,6 +37,45 @@ def test_example_file_loads():
     assert s.runner.trade.backend == "local"
     assert s.datafeed.yfinance.enabled is True
     assert s.datafeed.mt5.enabled is False
+    assert s.datafeed.primary == "yfinance"
+
+
+@pytest.mark.parametrize(
+    ("primary", "enabled", "legacy", "has_key", "error", "expected"),
+    [
+        (None, {"yfinance"}, None, False, None, "yfinance"),
+        (None, set(), None, False, "primary_source_required", None),
+        (None, {"yfinance", "mt5"}, None, False, "primary_source_required", None),
+        ("yfinance", {"yfinance"}, None, False, None, "yfinance"),
+        ("unknown", {"yfinance", "mt5"}, None, False, "unknown_primary_source", None),
+        ("yfinance", {"mt5"}, None, False, "primary_source_disabled", None),
+        ("twelvedata", {"twelvedata"}, None, False, "primary_source_unusable", None),
+        ("twelvedata", {"twelvedata"}, None, True, None, "twelvedata"),
+        (None, {"yfinance"}, "yfinance", False, None, "yfinance"),
+        ("yfinance", {"yfinance"}, "yfinance", False, "ambiguous_primary_source", None),
+        ("yfinance", {"yfinance"}, "mt5", False, "ambiguous_primary_source", None),
+    ],
+)
+def test_primary_source_matrix(monkeypatch, primary, enabled, legacy, has_key,
+                               error, expected):
+    raw = load_settings(EXAMPLE).model_dump()
+    raw = deepcopy(raw)
+    for name in ("yfinance", "mt5", "twelvedata"):
+        raw["datafeed"][name]["enabled"] = name in enabled
+    if primary is None:
+        raw["datafeed"].pop("primary")
+    else:
+        raw["datafeed"]["primary"] = primary
+    if legacy is not None:
+        raw["plugin"]["producer_source"] = legacy
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    if has_key:
+        monkeypatch.setenv("TWELVEDATA_API_KEY", "test-key")
+    if error:
+        with pytest.raises(ValidationError, match=error):
+            Settings.model_validate(raw)
+    else:
+        assert Settings.model_validate(raw).datafeed.primary == expected
 
 
 def test_backtest_settings_eval_source_defaults_to_dukascopy():

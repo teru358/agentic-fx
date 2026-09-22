@@ -46,8 +46,8 @@ NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(_EXAMPLE).model_copy(update={
     "backtest": load_settings(_EXAMPLE).backtest.model_copy(
         update={"eval_source": "mt5", "base_interval": "5m"}),
-    "plugin": load_settings(_EXAMPLE).plugin.model_copy(
-        update={"producer_source": "twelvedata"})})
+    "datafeed": load_settings(_EXAMPLE).datafeed.model_copy(
+        update={"primary": "twelvedata"})})
 
 INDICATOR_PY = "def compute(df, params):\n    return {'v': 1.0}\n"
 STRATEGY_PY = ("def evaluate(df, indicators, signals, params):\n"

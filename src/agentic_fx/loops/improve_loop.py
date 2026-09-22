@@ -1622,7 +1622,7 @@ class ImproveLoop:
             "eval_timeframe": (_strategy_gate_eval_timeframe(
                                    getattr(gate_metrics.get("meta"), "timeframe", None))
                                if kind == "strategy" else None),
-            "live_source": self._settings.plugin.producer_source,
+            "live_source": self._settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),
             "holdout": gate_metrics.get("holdout"),
