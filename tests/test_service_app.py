@@ -3648,3 +3648,29 @@ def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
                 assert "42" in result
         finally:
             app.close()
+
+
+def test_db_healthcheck_accepts_latest_closed_hourly_bar_until_end_plus_grace(tmp_path):
+    """DB には確定足しか無いので、判断足 (1h) の最新行は「終端 + 猶予」まで新鮮とみなす。
+    開始時刻だけで freshness_max_min を当てると、毎時 20 分以降は常に不健全になり
+    判断 Mission が止まる (2026-09-22 の再起動直後に実機で観測した退行)。"""
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed.health import DataUnhealthy
+    from agentic_fx.store import ohlcv as ohlcv_store
+    _init(tmp_path)
+    # 最新の確定 1h 足 = 09:00 (終端 10:00)。now = 10:16 は開始から 76 分で、
+    # freshness 20 分 + 足幅 60 分 + 猶予 30 秒 = 80 分 30 秒の内側
+    class _Clock:
+        def __init__(self, t): self.t = t
+        def now(self): return self.t
+    clock = _Clock(datetime(2026, 9, 22, 10, 16, tzinfo=timezone.utc))
+    app = build_app(tmp_path, clock=clock)
+    bars = [Bar("USDJPY", "1h", datetime(2026, 9, 22, h, 0, tzinfo=timezone.utc),
+                150.0, 150.1, 149.9, 150.0, 10.0) for h in range(5, 10)]
+    ohlcv_store.upsert_cache_bars(app.conn_core, bars, source="yfinance")
+    assert app.trade_loop.provider.healthcheck("USDJPY") == "yfinance"
+    # 10:20:31 以降は不健全 (終端 10:00 + 20 分 + 30 秒を超える)。同じ root に
+    # 2 つ目の app は instance lock で作れないので clock を進めて再判定する
+    clock.t = datetime(2026, 9, 22, 10, 20, 31, tzinfo=timezone.utc)
+    with pytest.raises(DataUnhealthy):
+        app.trade_loop.provider.healthcheck("USDJPY")
