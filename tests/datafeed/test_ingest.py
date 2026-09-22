@@ -146,3 +146,36 @@ def test_budget_fetches_deferred_decision_within_two_ticks(tmp_path):
     ingest.prepare(NOW + timedelta(seconds=1), conn)
     assert calls == [("EURUSD", "1m"), ("EURUSD", "1h")]
     conn.close()
+
+
+def test_next_probe_is_the_next_bar_close_not_fetch_time_plus_interval(tmp_path):
+    """10:22 に 09:00 の 1h 足を取ったら、次に取りに行くのは 10:00 の足が確定する
+    11:00:30 であって 11:22 ではない (取得時刻 + 足幅にすると判断足が最大 1 足幅遅れる。
+    2026-09-22 の実機で 22 分遅れを観測)。期待時刻を過ぎても足が無ければ backoff で再試行。"""
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    now = datetime(2026, 9, 16, 10, 22, tzinfo=timezone.utc)
+
+    def fetch(pair, interval, start, end, *, timeout):
+        if interval == "1h":
+            return [Bar(pair, "1h", datetime(2026, 9, 16, 9, 0, tzinfo=timezone.utc), 1, 1, 1, 1, 1)]
+        return [Bar(pair, "1m", now - timedelta(minutes=2), 1, 1, 1, 1, 1)]
+
+    ingest = Ingest(_settings(), fetch=fetch)
+    ingest.prepare(now, conn)
+    ingest.commit(conn)
+    grace = timedelta(seconds=_settings().datafeed.closed_bar_grace_sec)
+    assert ingest.next_probe_at[("USDJPY", "1h")] == datetime(2026, 9, 16, 11, 0, tzinfo=timezone.utc) + grace
+    # 11:01 の tick で取りに行き、まだ 10:00 の足が無ければ backoff (足幅が上限) で再試行
+    calls = []
+
+    def fetch_empty(pair, interval, start, end, *, timeout):
+        calls.append(interval)
+        return []
+
+    ingest.fetch = fetch_empty
+    later = datetime(2026, 9, 16, 11, 1, tzinfo=timezone.utc)
+    ingest.prepare(later, conn)
+    assert "1h" in calls
+    assert later < ingest.next_probe_at[("USDJPY", "1h")] <= later + timedelta(hours=1)
+    conn.close()

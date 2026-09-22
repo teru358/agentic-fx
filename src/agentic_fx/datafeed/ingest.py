@@ -106,14 +106,22 @@ class Ingest:
                                               grace=timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec))
                 self._pending[key] = bars
                 self.last_request_count += 1
-                if bars:
+                # 次に取りに行くのは「次の足が確定する時刻」= 最新の足の開始 + 足幅 2 つ + 猶予。
+                # 取得時刻 + 足幅にすると、10:22 に 09:00 の 1h 足を取ったあと 11:22 まで
+                # 取りに行かず、10:00 の足が 22 分遅れて判断も遅れる (2026-09-22 実機)。
+                # 期待時刻を過ぎても足が無いときだけ、足幅を上限に指数 backoff で再試行
+                width = timedelta(minutes=sources.INTERVAL_MIN[interval])
+                grace = timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec)
+                newest = max((b.ts for b in bars), default=watermark)
+                expected = None if newest is None else newest + 2 * width + grace
+                if expected is not None and expected > now:
                     self._backoff[key] = 0
-                    delay = sources.INTERVAL_MIN[interval] * 60
+                    self.next_probe_at[key] = expected
                 else:
                     attempt = self._backoff.get(key, 0) + 1
                     self._backoff[key] = attempt
                     delay = min(sources.INTERVAL_MIN[interval] * 60, 2 ** attempt)
-                self.next_probe_at[key] = now + timedelta(seconds=delay)
+                    self.next_probe_at[key] = now + timedelta(seconds=delay)
             except Exception as exc:  # one broken key must not suppress protection
                 self.last_request_count += 1
                 self.last_errors[key] = str(exc)
