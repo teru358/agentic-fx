@@ -57,7 +57,7 @@ _SMA_CROSS_DIR = _REPO_ROOT / "docs" / "examples" / "plugins" / "sma_cross"
 # H は 1h 境界に整列した水曜 12:00 UTC (market open — 他テストと同じ選定理由)。
 H = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 # ③ producer 呼び出し: 非分格子の now (バケット進行検出の本番経路)。
-NOW_PRODUCER = H + timedelta(hours=1, seconds=3)
+NOW_PRODUCER = H + timedelta(hours=1, seconds=31)
 # ④ tick 呼び出し: producer と同一バケット floor 内 (追加の実サブプロセス
 # 起動を発生させない) かつ cron 締切 (1h) 未到来の時刻。
 NOW_TICK = H + timedelta(hours=1, minutes=5)

@@ -7,6 +7,8 @@ import pytest
 from agentic_fx.backtest import mt5_import
 from agentic_fx.backtest.mt5_import import (
     ImportConflictError, _default_fetch, compare_sources, import_mt5)
+from agentic_fx.core.contracts import Bar
+from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.store import ohlcv
 from tests.backtest.factories import H, SETTINGS, _conn
 
@@ -39,6 +41,52 @@ def test_import_mt5_pages_daily_and_imports(tmp_path):
     # 変異と同種の無音故障源)。
     assert ohlcv.load_history_spread(conn, "USDJPY", "1m", H.isoformat(),
                              source="mt5") is None
+
+
+def test_importer_window_filter_matches_shared_closed_normalizer(tmp_path):
+    """naive bridge time を UTC 化した後は live と同じ [start,end) 判定を使う。"""
+    conn = _conn(tmp_path)
+    start = H
+    end = H + timedelta(minutes=3)
+    raw = [_bar(start, time=start.replace(tzinfo=None).isoformat()),
+           _bar(start + timedelta(minutes=1)),
+           _bar(start + timedelta(minutes=2)), _bar(end)]
+    result = import_mt5(conn, "USDJPY", start, end, base_url="http://x",
+                        fetch=lambda _url: _payload(*raw))
+    expected = normalize_closed_range(
+        [Bar("USDJPY", "1m", start + timedelta(minutes=i),
+             148.0, 148.2, 147.9, 148.1, 10)
+         for i in range(3)], interval="1m", start=start, end=end,
+        cutoff=end, grace=timedelta(0))
+    got = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert result.inserted == 3
+    assert [bar.ts for bar in got] == [bar.ts for bar in expected]
+
+
+def test_importer_uses_normalized_boundary_rows_including_naive_time(monkeypatch):
+    start = H
+    end = H + timedelta(minutes=2)
+    naive_closed = _bar(start, time=start.replace(tzinfo=None).isoformat())
+    forming_before_cutoff = _bar(start + timedelta(minutes=1))
+    inclusive_right_edge = _bar(end)
+    received = []
+
+    def normalized_only_closed(raw, **kwargs):
+        received.append((raw, kwargs))
+        assert kwargs["start"] == start
+        assert kwargs["end"] == end
+        assert kwargs["cutoff"] == end
+        return [raw[0]]
+
+    monkeypatch.setattr(mt5_import, "normalize_closed_range", normalized_only_closed)
+    rows, naive_count, right_edge_count = mt5_import._validated_window_rows(
+        _payload(naive_closed, forming_before_cutoff, inclusive_right_edge),
+        symbol="USDJPY", interval="1m", current=start, window_end=end)
+
+    assert [bar.ts for bar in received[0][0]] == [start, start + timedelta(minutes=1)]
+    assert naive_count == 1
+    assert right_edge_count == 1
+    assert [row[2] for row in rows] == [start.isoformat()]
 
 
 def test_import_mt5_uses_default_fetch_when_none(monkeypatch, tmp_path):

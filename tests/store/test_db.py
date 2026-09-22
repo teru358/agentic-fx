@@ -8,7 +8,7 @@ from agentic_fx.store.db import TABLE_NAMES, connect, connect_readonly, init_db
 NOW = datetime(2026, 8, 11, tzinfo=timezone.utc)
 
 EXPECTED = {
-    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "ohlcv_cache", "ohlcv_history", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
@@ -17,7 +17,7 @@ EXPECTED = {
 }
 
 
-def test_init_creates_all_21_tables(tmp_path):
+def test_init_creates_all_22_tables(tmp_path):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     rows = conn.execute(
@@ -25,6 +25,71 @@ def test_init_creates_all_21_tables(tmp_path):
         "AND name NOT LIKE 'sqlite_%'").fetchall()
     assert {r["name"] for r in rows} == EXPECTED
     assert TABLE_NAMES == frozenset(EXPECTED)
+
+
+def test_init_purges_pre_closed_cache_once_and_preserves_history(tmp_path):
+    conn = connect(tmp_path / "legacy.db")
+    conn.executescript("""
+        CREATE TABLE ohlcv_cache (
+          symbol TEXT, interval TEXT, bar_time TEXT, open REAL, high REAL,
+          low REAL, close REAL, volume REAL, source TEXT);
+        CREATE TABLE ohlcv_history (
+          symbol TEXT, interval TEXT, bar_time TEXT, open REAL, high REAL,
+          low REAL, close REAL, volume REAL, source TEXT);
+        INSERT INTO ohlcv_cache VALUES ('USDJPY','1m','2026-09-21T09:00:00+00:00',1,1,1,1,0,'yfinance');
+        INSERT INTO ohlcv_history VALUES ('USDJPY','1m','2026-09-21T09:00:00+00:00',1,1,1,1,0,'dukascopy');
+    """)
+    history_before = tuple(conn.execute("SELECT * FROM ohlcv_history").fetchone())
+    init_db(conn)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 1
+    assert tuple(conn.execute("SELECT * FROM ohlcv_history").fetchone()) == history_before
+    assert conn.execute("SELECT name FROM data_migrations").fetchone()[0] == \
+        "ohlcv_cache_purge_pre_closed_v1"
+    conn.execute("INSERT INTO ohlcv_cache VALUES ('USDJPY','1m','x',1,1,1,1,0,'yfinance')")
+    conn.commit()
+    init_db(conn)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 1
+
+
+def test_fresh_db_records_closed_cache_migration_marker(tmp_path):
+    conn = connect(tmp_path / "fresh.db")
+    init_db(conn)
+    assert conn.execute(
+        "SELECT name FROM data_migrations WHERE name=?",
+        ("ohlcv_cache_purge_pre_closed_v1",)).fetchone() is not None
+
+
+def test_closed_cache_purge_and_marker_roll_back_together(tmp_path, monkeypatch):
+    import agentic_fx.store.db as db
+
+    conn = connect(tmp_path / "legacy.db")
+    conn.executescript("""
+        CREATE TABLE ohlcv_cache (
+          symbol TEXT, interval TEXT, bar_time TEXT, open REAL, high REAL,
+          low REAL, close REAL, volume REAL, source TEXT);
+        INSERT INTO ohlcv_cache VALUES ('USDJPY','1m','x',1,1,1,1,0,'yfinance');
+    """)
+    conn.execute("CREATE TABLE data_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+    original = conn.execute
+
+    class FailingConnection:
+        def __enter__(self):
+            conn.__enter__()
+            return self
+        def __exit__(self, *args):
+            return conn.__exit__(*args)
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        def execute(self, sql, parameters=()):
+            if "INSERT INTO data_migrations" in sql:
+                raise RuntimeError("injected marker failure")
+            return original(sql, parameters)
+
+    with pytest.raises(RuntimeError, match="injected marker failure"):
+        db._migrate_ohlcv_cache_purge_pre_closed_v1(FailingConnection())
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM data_migrations").fetchone()[0] == 0
 
 
 def _legacy_trade_intents_ddl():
@@ -382,13 +447,9 @@ def test_init_db_migrates_legacy_v1_ohlcv_into_cache_table(tmp_path):
     assert "ohlcv" not in names and "ohlcv_v1" not in names
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
     assert "source" in cols and "spread" not in cols
-    row = conn.execute("SELECT * FROM ohlcv_cache").fetchone()
-    assert row["source"] == "yfinance"
-    assert row["open"] == 1
-    assert row["high"] == 2
-    assert row["low"] == 0.5
-    assert row["close"] == 1.5
-    assert row["volume"] == 100
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
+    assert conn.execute("SELECT name FROM data_migrations").fetchone()[0] == \
+        "ohlcv_cache_purge_pre_closed_v1"
 
 
 def test_init_db_ohlcv_migration_is_idempotent(tmp_path):
@@ -453,8 +514,7 @@ def test_ohlcv_migration_rolls_back_on_failure_and_resumes(tmp_path):
     assert "ohlcv" not in names
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
     assert "source" in cols
-    row = conn.execute("SELECT source FROM ohlcv_cache").fetchone()
-    assert row["source"] == "yfinance"
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
 
 
 def _legacy_v1_ddl() -> str:
@@ -503,10 +563,7 @@ def test_ohlcv_migration_resumes_from_stale_ohlcv_v1(tmp_path):
     names = {r["name"] for r in
              conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "ohlcv_v1" not in names and "ohlcv" not in names
-    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 1
-    row = conn.execute("SELECT * FROM ohlcv_cache").fetchone()
-    assert (row["open"], row["high"], row["low"], row["close"],
-           row["volume"]) == (1, 2, 0.5, 1.5, 100)
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
 
 
 def test_ohlcv_migration_resume_raises_on_value_conflict(tmp_path):

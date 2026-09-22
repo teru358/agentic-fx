@@ -135,7 +135,7 @@ def test_build_mission_registry_readonly_skips_bar_cache_write(tmp_path):
     # get_ohlcv の正常戻り値は list[dict] (market_tools.py 45-49 行)。RO
     # 接続で書込が実際に走っていれば OperationalError が
     # `{"error": ...}` の dict に化けて型不一致で検出される。
-    assert isinstance(parsed, list) and len(parsed) == 30, result
+    assert isinstance(parsed, list) and len(parsed) == 29, result
     # 念のため RW 接続からも cache が空のままであることを確認する
     # (write skip の直接証跡)。
     assert ohlcv.load_cache_bars(rw_conn, "USDJPY", "1m", source="yfinance") == []

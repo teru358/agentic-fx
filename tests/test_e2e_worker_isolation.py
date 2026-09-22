@@ -141,7 +141,7 @@ def test_funds_protection_continues_during_blocked_mission(tmp_path):
         # の対象外。実 DB キャッシュを用意し、本物の healthcheck を通す。
         ohlcv_store.upsert_cache_bars(
             app.conn_core,
-            [Bar("USDJPY", "1h", now, 148.00, 148.30, 147.90,
+                [Bar("USDJPY", "1h", now - timedelta(minutes=70), 148.00, 148.30, 147.90,
                  148.20, 100.0)],
             source="yfinance")
         oid = orders_store.insert(

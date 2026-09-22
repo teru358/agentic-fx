@@ -18,6 +18,8 @@ from urllib.parse import quote
 import httpx
 
 from agentic_fx.datafeed.price_provider import _SPECS
+from agentic_fx.datafeed.closed_bars import normalize_closed_range
+from agentic_fx.core.contracts import Bar
 from agentic_fx.datafeed.sources import _mt5_headers
 from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
@@ -170,8 +172,16 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
             raise ValueError(
                 f"import_mt5: bar time {bar_dt.isoformat()} is off interval grid")
 
+    closed_times = {
+        bar.ts for bar in normalize_closed_range(
+            [Bar(symbol, interval, bar_dt, o, h, low, close, volume)
+             for _bar, bar_dt, _iso, o, h, low, close, volume in remaining],
+            interval=interval, start=current, end=window_end,
+            cutoff=window_end, grace=timedelta(0))
+    }
     rows = [(symbol, interval, bar_time_iso, o, h, low, close, volume, None)
-            for _bar, _dt, bar_time_iso, o, h, low, close, volume in remaining]
+            for _bar, bar_dt, bar_time_iso, o, h, low, close, volume in remaining
+            if bar_dt in closed_times]
     return rows, naive_count, right_edge_count
 
 

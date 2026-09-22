@@ -106,6 +106,8 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
                          base_interval: str,
                          since: datetime | None = None,
                          until: datetime | None = None,
+                         cutoff: datetime | None = None,
+                         grace: timedelta = timedelta(0),
                          max_bars: int | None = None) -> pd.DataFrame:
     """ohlcv の 1m 行 (単一 source) を timeframe へ読み取り時リサンプルする。
 
@@ -148,6 +150,9 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
     else:
         until_utc = _require_aware_utc(until, "until")
     since_utc = None if since is None else _require_aware_utc(since, "since")
+    cutoff_utc = None if cutoff is None else _require_aware_utc(cutoff, "cutoff")
+    if grace < timedelta(0):
+        raise ValueError("grace must not be negative")
     if max_bars is not None and max_bars < 1:
         raise ValueError("max_bars must be >= 1")
 
@@ -195,6 +200,8 @@ def load_resampled_frame(conn: sqlite3.Connection, symbol: str,
     if until_utc is not None:
         # 完成バケットのみ: bucket_end (= label + tf 幅) <= until
         df = df[df.index + width <= until_utc]
+    if cutoff_utc is not None and source in LIVE_SOURCES:
+        df = df[df.index + width + grace <= cutoff_utc]
     if since_utc is not None:
         df = df[df.index >= since_utc]
     if max_bars is not None:

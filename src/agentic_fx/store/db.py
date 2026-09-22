@@ -190,6 +190,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
 """
 
 _SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """
+CREATE TABLE IF NOT EXISTS data_migrations (
+  name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS missions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   loop TEXT NOT NULL,            -- trade | improve | ask | reflection
@@ -328,7 +331,7 @@ CREATE INDEX IF NOT EXISTS ix_ohlcv_cache_bar_time
 """ + _IMPROVE_WAVES_DDL + _IMPROVE_WAVE_SLOTS_DDL + _PLUGIN_SWITCH_JOURNAL_DDL + _PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL
 
 TABLE_NAMES = frozenset({
-    "ohlcv_cache", "ohlcv_history", "missions", "trade_intents", "orders",
+    "ohlcv_cache", "ohlcv_history", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
@@ -1304,6 +1307,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         if "source" not in cols or v1_leftover:
             _migrate_ohlcv_v2(conn)     # v1 → v2 (既存、無変更)
         _migrate_ohlcv_split(conn)      # v2 → ohlcv_cache/ohlcv_history (新設)
+    _migrate_ohlcv_cache_purge_pre_closed_v1(conn)
     _ensure_column(conn, "missions", "trigger", "trigger TEXT")
     _migrate_signals_fk(conn)           # Task 13
     _migrate_improvement_runs_v2(conn)  # Task 19 (追加するのはこの 1 行だけ)
@@ -1354,6 +1358,21 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(
         conn, "improvement_backlog", "origin_outcome", "origin_outcome TEXT")
     conn.commit()
+
+
+def _migrate_ohlcv_cache_purge_pre_closed_v1(conn: sqlite3.Connection) -> None:
+    """古いキャッシュを一度だけ捨て、確定足だけの系列へ切り替える。"""
+    name = "ohlcv_cache_purge_pre_closed_v1"
+    with conn:
+        applied = conn.execute(
+            "SELECT 1 FROM data_migrations WHERE name=?", (name,)).fetchone()
+        if applied is not None:
+            return
+        deleted = conn.execute("DELETE FROM ohlcv_cache").rowcount
+        conn.execute(
+            "INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
+            (name, datetime.now(timezone.utc).isoformat()))
+    _log.info("purged %d pre-closed ohlcv_cache rows", deleted)
 
 
 def _backfill_improvement_backlog_idea_norm(conn: sqlite3.Connection) -> None:

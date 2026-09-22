@@ -174,10 +174,11 @@ class SignalProducer:
         width = timedelta(minutes=TF_MINUTES[tf])
         floor = floor_to_bucket(now, tf)
         freshness_cutoff = now - width * settings.plugin.signal_freshness_bars
+        freshness_bucket = floor_to_bucket(freshness_cutoff, tf)
         key = (meta.name, meta.content_hash, pair)
         cursor = self._cursor.get(key)
         start = (cursor + width if cursor is not None
-                 else floor_to_bucket(freshness_cutoff, tf))
+                 else freshness_bucket)
 
         inserted = 0
         b = start
@@ -190,7 +191,7 @@ class SignalProducer:
             try:
                 inserted += self._evaluate_bucket(
                     conn, meta, pair, b, now=now, width=width, source=source,
-                    call=call)
+                    call=call, settings=settings)
             except Exception as e:  # noqa: BLE001 — plugin 単位で fail-open
                 _log.warning(
                     "plugin %s (%s): evaluation failed at bucket %s (%s) — "
@@ -203,10 +204,13 @@ class SignalProducer:
 
     def _evaluate_bucket(self, conn: "sqlite3.Connection", meta: PluginMeta,
                          pair: str, bucket_start: datetime, *, now: datetime,
-                         width: timedelta, source: str, call: _CallFn) -> int:
+                         width: timedelta, source: str, call: _CallFn,
+                         settings: "Settings") -> int:
         bucket_end = bucket_start + width
         df = load_resampled_frame(
             conn, pair, meta.timeframe, source=source, base_interval="1m", until=bucket_end,
+            cutoff=now,
+            grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
             max_bars=meta.max_bars)
         # fix round 1 F3 (codex): df が非空でも「末尾行 = 対象バケット」と
         # は限らない — 取り込みラグ/欠損で対象バケット分の 1m 行が 1 本も

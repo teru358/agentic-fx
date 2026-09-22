@@ -129,9 +129,9 @@ def test_fires_once_per_bucket_progression_with_non_minute_aligned_now(tmp_path)
     producer = SignalProducer()
 
     producer.evaluate_due_plugins(
-        conn, plugins=[meta], now=H + timedelta(hours=1, seconds=3),
+        conn, plugins=[meta], now=H + timedelta(hours=1, seconds=31),
         source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
-    assert len(fake.calls) == 1  # bucket H:00 のみ (H-1:00 は鮮度窓外)
+    assert len(fake.calls) == 1
 
     # 同一バケット (floor は依然 H+1:00) の間は非分格子 now で何度呼んでも
     # 追加発火しない
@@ -145,7 +145,7 @@ def test_fires_once_per_bucket_progression_with_non_minute_aligned_now(tmp_path)
 
     # バケット進行 (floor が H+2:00 へ進む) で 1 回だけ追加発火
     producer.evaluate_due_plugins(
-        conn, plugins=[meta], now=H + timedelta(hours=2, seconds=10),
+        conn, plugins=[meta], now=H + timedelta(hours=2, seconds=31),
         source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == 2
 
@@ -160,7 +160,7 @@ def test_no_reevaluation_within_same_bucket_across_ticks(tmp_path):
     fake = _FakeSandbox()
     producer = SignalProducer()
 
-    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1),
+    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1, seconds=31),
                                   source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n_after_first = len(fake.calls)
     assert n_after_first > 0
@@ -182,7 +182,7 @@ def test_4h_plugin_only_fires_on_4h_progression(tmp_path):
     fake = _FakeSandbox()
     producer = SignalProducer()
 
-    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=4),
+    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=4, seconds=31),
                                   source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n0 = len(fake.calls)
     assert n0 > 0
@@ -193,7 +193,7 @@ def test_4h_plugin_only_fires_on_4h_progression(tmp_path):
             source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
         assert len(fake.calls) == n0  # 発火しない
 
-    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=8),
+    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=8, seconds=31),
                                   source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     assert len(fake.calls) == n0 + 1  # 4h 境界進行で 1 回だけ発火
 
@@ -236,15 +236,31 @@ def test_stall_beyond_window_only_catches_up_within_freshness(tmp_path):
     fake = _FakeSandbox()
     producer = SignalProducer()
 
-    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1),
+    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=1, seconds=31),
                                   source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
     n0 = len(fake.calls)
-    assert n0 == 2  # 鮮度窓 (2 バケット) 分だけ catch-up
+    assert n0 == 1  # 鮮度窓は grace で広がらない
 
     # 9 時間分の停止を模す (9 バケット経過、鮮度窓 2 バケットを大きく超える)
-    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=10),
+    producer.evaluate_due_plugins(conn, plugins=[meta], now=H + timedelta(hours=10, seconds=31),
                                   source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
-    assert len(fake.calls) == n0 + 2  # 窓内 2 バケットのみ追加評価・窓外 7 は評価しない
+    assert len(fake.calls) == n0 + 1  # 窓内 1 バケットのみ追加評価・窓外は評価しない
+
+
+def test_freshness_window_does_not_expand_by_closed_bar_grace(tmp_path):
+    """grace は close 判定専用で、signal_freshness_bars を広げない。"""
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    fake = _FakeSandbox()
+    producer = SignalProducer()
+
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=H + timedelta(hours=1, seconds=31),
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+
+    assert len(fake.calls) == 1
 
 
 # ---------------------------------------------------------------------
@@ -288,12 +304,12 @@ def test_pair_outside_settings_pairs_is_skipped_with_warning(tmp_path, caplog):
 
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         producer.evaluate_due_plugins(
-            conn, plugins=[meta], now=H + timedelta(hours=1),
+                conn, plugins=[meta], now=H + timedelta(hours=1),
             source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     # settings.pairs (= ["USDJPY"]) に無い EURUSD は評価対象から除外される。
     # 呼び出し回数は USDJPY 分 (鮮度窓 2 バケット) のみのはず。
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 1
     assert "EURUSD" in caplog.text
     assert "settings.pairs" in caplog.text
 
@@ -404,7 +420,7 @@ def test_missing_target_bucket_data_is_not_mistaken_for_completion(tmp_path, cap
 
     with caplog.at_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer"):
         producer.evaluate_due_plugins(
-            conn, plugins=[meta], now=H + timedelta(hours=1),
+                conn, plugins=[meta], now=H + timedelta(hours=1),
             source=SOURCE, sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     # H-1:00 は評価され signal 化されるが、対象バケット H:00 は不在として
@@ -418,7 +434,7 @@ def test_missing_target_bucket_data_is_not_mistaken_for_completion(tmp_path, cap
     _seed_flat(conn, H, 60)
     fake.queue("sig", {"signals": [_signal_result()]})
     producer.evaluate_due_plugins(
-        conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+        conn, plugins=[meta], now=H + timedelta(hours=1, seconds=31), source=SOURCE,
         sandbox_run=fake, settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
 
     rows2 = conn.execute("SELECT bar_ts FROM signals ORDER BY bar_ts").fetchall()
@@ -598,7 +614,7 @@ def test_producer_uses_name_and_hash_identity_not_hash_alone(
     sentinel_b = ResolvedIndicatorSet.empty(tmp_path / "b")
     producer = SignalProducer()
     producer.evaluate_due_plugins(
-        conn, plugins=[meta_a, meta_b], now=H + timedelta(hours=1),
+        conn, plugins=[meta_a, meta_b], now=H + timedelta(hours=1, seconds=31),
         source=SOURCE, settings=SETTINGS,
         resolved_by_identity={
             ("strat_a", shared_hash): sentinel_a,
@@ -609,7 +625,7 @@ def test_producer_uses_name_and_hash_identity_not_hash_alone(
     assert seen == {"strat_a": sentinel_a}
     # meta_b は「未解決として skip」されたのではなく、共有 session 経由で
     # 実際に評価されている (skip なら call_count は meta_a 分の 2 回のまま)。
-    assert call_count["n"] == 4  # 鮮度窓 2 バケット × 2 meta
+    assert call_count["n"] == 2  # 鮮度窓 1 バケット × 2 meta
 
     # 2 つ目の meta 単独では、別バッチ (別 session) で自分自身の resolved
     # を正しく受け取る。

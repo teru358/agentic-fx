@@ -139,6 +139,8 @@ class DatafeedSettings(_Strict):
     mt5: SourceToggle
     twelvedata: SourceToggle
     freshness_max_min: float = Field(gt=0)
+    # ソース時刻の遅延・境界丸めを吸収するための暫定猶予秒。
+    closed_bar_grace_sec: int = Field(default=30, ge=0)
     # 換算レート (ConversionRate) の skew 許容 (設計書 §5): ①各脚の鮮度は
     # freshness_max_min で検証済みなのでここでは見ない。②クロス2脚間の
     # 時刻差 ③判断内スナップショット全体 (reference_ts) との時刻差、の

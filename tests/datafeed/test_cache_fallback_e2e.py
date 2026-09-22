@@ -116,8 +116,8 @@ def test_build_app_tick_then_final_one_minute_to_one_hour_fallback(tmp_path):
         app.close()
 
 
-def test_cache_fallback_keeps_trailing_in_progress_bucket(tmp_path):
-    """spec ③ テスト 10: 12:00〜12:47 の形成中 1h bucket を落とさない。"""
+def test_cache_fallback_excludes_trailing_in_progress_bucket(tmp_path):
+    """形成中の 1h bucket は cache fallback から返さない。"""
     app = _build_real_app(tmp_path)
     try:
         boundary = OPEN_NOW.replace(minute=0)
@@ -129,10 +129,7 @@ def test_cache_fallback_keeps_trailing_in_progress_bucket(tmp_path):
         ohlcv.upsert_cache_bars(app.conn_core, bars, source=LIVE_SOURCE)
         result = app.provider._cached_bars(PAIR, "1h", boundary + timedelta(minutes=47),
                                            [], 0)
-        assert result is not None
-        derived, origin = result
-        assert origin == "cache(1m→1h derived)"
-        assert [bar.ts for bar in derived] == [boundary]
+        assert result is None
     finally:
         app.close()
 

@@ -16,6 +16,7 @@ from agentic_fx.core.contracts import (
 from agentic_fx.datafeed import cache_window
 from agentic_fx.datafeed import sources
 from agentic_fx.datafeed.bars import bars_to_df, df_to_bars, pandas_rule, resample
+from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.datafeed.health import (
     DataUnhealthy, validate_bars, validate_conversion_skew, validate_quote,
 )
@@ -150,6 +151,8 @@ class PriceProvider:
             raise ValueError(f"unknown interval: {interval}")
         d = self.settings.datafeed
         now = self.clock.now()
+        grace = timedelta(seconds=d.closed_bar_grace_sec)
+        window_start = now - timedelta(days=lookback_days)
         interval_min = sources.INTERVAL_MIN[interval]
         errors: list[str] = []
         for name, fn in self._chain(pair, kind="bars", interval=interval,
@@ -159,6 +162,9 @@ class PriceProvider:
                         and interval not in DERIVE_ONLY_INTERVALS):
                     bars, origin = fn(), name
                     validate_bars(bars, now, d.freshness_max_min, interval_min)
+                    bars = normalize_closed_range(
+                        bars, interval=interval, start=window_start, end=now,
+                        cutoff=now, grace=grace)
                     # 境界がソース非依存の足だけを保存する。source にはチェーンの
                     # 実ソース名を渡す (全部 yfinance 名義で書くと live ソース同士
                     # が上書きし合い、source 列が嘘になる — レビュー裁定 codex I7)。
@@ -172,7 +178,14 @@ class PriceProvider:
                     bars = self._derive(pair, name, base, interval,
                                         lookback_days)
                     origin = f"{name}({base}→{interval} derived)"
-                    validate_bars(bars, now, d.freshness_max_min, interval_min)
+                    validate_bars(
+                        bars, now,
+                        # 確定足だけを返すので、最新の足は終端が interval+grace まで
+                        # 古くなり得る (validate_bars は開始時刻基準で interval を
+                        # 内部で足すため、ここでは終端分の interval と grace を足す)
+                        d.freshness_max_min + interval_min
+                        + d.closed_bar_grace_sec / 60,
+                        interval_min)
                 # source は素の名前、origin は導出情報つき (別々に持つ —
                 # 品質フラグの完全一致判定を導出で壊さないため)
                 self._bars_source[(pair, interval)] = name
@@ -231,19 +244,34 @@ class PriceProvider:
                 cached = ohlcv.load_cache_bars(self.conn, pair, src,
                                                source=storage_name,
                                                since=since)
+                cached = normalize_closed_range(
+                    cached, interval=src, start=since, end=now, cutoff=now,
+                    grace=timedelta(seconds=d.closed_bar_grace_sec))
                 if not cached:
                     continue
                 label = ("cache" if src == interval else f"cache({src})")
                 label = f"{label}[{storage_name}]"
                 try:
                     # キャッシュも健全性検証を通さない限り使わない (fail closed)
-                    validate_bars(cached, now, d.freshness_max_min,
-                                  sources.INTERVAL_MIN[src])
+                    cached_interval_min = sources.INTERVAL_MIN[src]
+                    validate_bars(
+                        cached, now,
+                        d.freshness_max_min + cached_interval_min
+                        + d.closed_bar_grace_sec / 60,
+                        cached_interval_min)
                     if src == interval:
                         return cached, "cache"
                     derived = self._resample(cached, pair, interval)
-                    validate_bars(derived, now, d.freshness_max_min,
-                                  sources.INTERVAL_MIN[interval])
+                    derived = normalize_closed_range(
+                        derived, interval=interval, start=derive_since, end=now,
+                        cutoff=now,
+                        grace=timedelta(seconds=d.closed_bar_grace_sec))
+                    derived_interval_min = sources.INTERVAL_MIN[interval]
+                    validate_bars(
+                        derived, now,
+                        d.freshness_max_min + derived_interval_min
+                        + d.closed_bar_grace_sec / 60,
+                        derived_interval_min)
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"{label}: {_safe_error_text(e)}")
                     continue
@@ -325,9 +353,20 @@ class PriceProvider:
         validate_bars(raw, self.clock.now(),
                       self.settings.datafeed.freshness_max_min,
                       sources.INTERVAL_MIN[base])
+        now = self.clock.now()
+        raw = normalize_closed_range(
+            raw, interval=base,
+            start=now - timedelta(days=lookback_days * ratio), end=now,
+            cutoff=now,
+            grace=timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec))
         if not self.readonly:
             ohlcv.upsert_cache_bars(self.conn, raw, source=_storage_source(source))
-        return self._resample(raw, pair, interval)
+        derived = self._resample(raw, pair, interval)
+        return normalize_closed_range(
+            derived, interval=interval,
+            start=now - timedelta(days=lookback_days * ratio), end=now,
+            cutoff=now,
+            grace=timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec))
 
     def _resample(self, base_bars: list[Bar], pair: str,
                   interval: str) -> list[Bar]:
@@ -339,8 +378,13 @@ class PriceProvider:
 
     def latest_1m_bar(self, pair: str) -> Bar | None:
         try:
-            return self.get_bars(pair, "1m", 1)[-1]
+            bars = self.get_bars(pair, "1m", 1)
+            return bars[-1] if bars else None
         except DataUnhealthy:
+            return None
+        except Exception as exc:  # noqa: BLE001 — tick の資金保護を止めない
+            _log.warning("latest 1m bar failed for %s: %s", pair,
+                         _safe_error_text(exc))
             return None
 
     # ---- misc -----------------------------------------------------------

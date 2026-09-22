@@ -78,7 +78,7 @@ def yf_bars(pair: str, interval: str, lookback_days: int) -> list[Bar]:
     df = yfinance.download(
         vendor_symbol(pair, "yf"), interval=interval,
         period=f"{lookback_days}d", progress=False, auto_adjust=False,
-        multi_level_index=False, ignore_tz=False)
+        multi_level_index=False, ignore_tz=False, timeout=10)
     df = _flatten_yf_columns(df)
     bars: list[Bar] = []
     for ts, row in df.iterrows():

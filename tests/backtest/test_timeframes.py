@@ -42,6 +42,20 @@ def test_enums_and_minutes_are_consistent():
                           "1d": 1440}
 
 
+def test_live_frame_excludes_bar_that_is_not_closed_at_cutoff(tmp_path):
+    conn = _conn(tmp_path)
+    bars = [Bar("USDJPY", "1m", H + timedelta(minutes=i), 1, 1, 1, 1, 0)
+            for i in range(3)]
+    ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
+
+    df = load_resampled_frame(
+        conn, "USDJPY", "1m", source="yfinance", base_interval="1m",
+        cutoff=H + timedelta(minutes=2, seconds=30),
+        grace=timedelta(seconds=30))
+
+    assert list(df.index.to_pydatetime()) == [H, H + timedelta(minutes=1)]
+
+
 # --- floor_to_bucket (Task 8 producer が使う epoch 錨切り下げ) ----------
 
 def test_floor_to_bucket_epoch_anchor():

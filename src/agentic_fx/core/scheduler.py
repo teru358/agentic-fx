@@ -98,6 +98,7 @@ class Scheduler:
         self._last_econ: datetime | None = None
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
+        self._closed_bar_unavailable_pairs: set[str] = set()
 
     def tick(self, now: datetime) -> list[Callable[[], None]]:
         """1 tick 分の決定論的処理。
@@ -146,6 +147,7 @@ class Scheduler:
                 self._was_open = False
                 return pending
             self._was_open = True
+            self._observe_closed_bar_availability(now)
 
             # レビュー修正 3: record_snapshot が時系列逆行 (NTP 補正等) で
             # ValueError を送出した場合、mark-to-market 自体が信頼できないため、
@@ -351,6 +353,28 @@ class Scheduler:
         if self._processed_bar_ts.get(pair) == bar.ts:
             return None
         return bar
+
+    def _observe_closed_bar_availability(self, now: datetime) -> None:
+        """保護対象の確定足欠落を、継続中の障害ごとに一度だけ記録する。"""
+        rows = orders.list_by_status(self.conn, S.OPEN, S.PENDING_FILL)
+        pairs = {row["pair"] for row in rows}
+        self._closed_bar_unavailable_pairs.intersection_update(pairs)
+        for pair in pairs:
+            try:
+                bar = self.bars_fn(pair)
+            except Exception as exc:  # noqa: BLE001 — 観測失敗は tick を止めない
+                _log.warning("closed-bar availability failed for %s: %s", pair,
+                             safe_error_text(exc))
+                bar = None
+            fresh = bar is not None and now - bar.ts <= self.bar_freshness
+            if fresh:
+                self._closed_bar_unavailable_pairs.discard(pair)
+            elif pair not in self._closed_bar_unavailable_pairs:
+                self.activity.write(
+                    Category.SYSTEM, "closed_bar_unavailable",
+                    f"{pair}: 確定 1 分足が欠落または陳腐化",
+                    ref_id=pair)
+                self._closed_bar_unavailable_pairs.add(pair)
 
     def _mark_to_market(self, now: datetime) -> bool:
         """時価 snapshot — gate の equity/hwm と kill switch (unrealized 込み) の源泉。

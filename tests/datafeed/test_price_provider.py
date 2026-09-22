@@ -105,7 +105,7 @@ def test_naive_datetime_from_bars_source_falls_through(tmp_path):
          patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars()):
         bars = p.get_bars("USDJPY", "1m", 1)
-    assert len(bars) == 30
+    assert len(bars) == 29
     assert p.last_bars_source("USDJPY", "1m") == "yfinance"
 
 
@@ -114,8 +114,8 @@ def test_get_bars_caches(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars()):
         bars = p.get_bars("USDJPY", "1m", 1)
-    assert len(bars) == 30
-    assert len(ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance")) == 30
+    assert len(bars) == 29
+    assert len(ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="yfinance")) == 29
 
 
 def test_get_bars_falls_back_to_cache(tmp_path):
@@ -124,7 +124,7 @@ def test_get_bars_falls_back_to_cache(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "1m", 1)
-    assert len(bars) == 30
+    assert len(bars) == 29
 
 
 def test_stale_cache_is_not_used(tmp_path):
@@ -140,6 +140,27 @@ def test_stale_cache_is_not_used(tmp_path):
             p.get_bars("USDJPY", "1m", 1)
 
 
+def test_cache_freshness_allows_closed_bar_until_end_plus_grace(
+        tmp_path):
+    """cache の確定 1m は終端 + freshness + grace (開始から 22 分 30 秒) まで新鮮とみなす。"""
+    settings = load_settings(EXAMPLE).model_copy(deep=True)
+    last = datetime(2026, 7, 22, 8, 59, tzinfo=timezone.utc)
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    ohlcv.upsert_cache_bars(
+        conn, [Bar("USDJPY", "1m", last, 148, 148.1, 147.9, 148.05, 10)],
+        source="yfinance")
+    healthy = PriceProvider(conn, settings, FixedClock(last + timedelta(minutes=22, seconds=30)))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")):
+        assert healthy.get_bars("USDJPY", "1m", 1)[-1].ts == last
+    stale = PriceProvider(
+        conn, settings, FixedClock(last + timedelta(minutes=22, seconds=30, microseconds=1)))
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=OSError("down")), pytest.raises(DataUnhealthy):
+        stale.get_bars("USDJPY", "1m", 1)
+
+
 def test_latest_1m_bar_none_on_unhealthy(tmp_path):
     _, p = _provider(tmp_path)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
@@ -147,12 +168,26 @@ def test_latest_1m_bar_none_on_unhealthy(tmp_path):
         assert p.latest_1m_bar("USDJPY") is None
 
 
+def test_latest_1m_bar_logs_unexpected_exception(tmp_path, monkeypatch, caplog):
+    """DataUnhealthy 以外も tick は止めないが、技術ログには残す。"""
+    _, p = _provider(tmp_path)
+
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("unexpected provider bug")
+
+    monkeypatch.setattr(p, "get_bars", broken)
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.datafeed.price_provider"):
+        assert p.latest_1m_bar("USDJPY") is None
+    assert "latest 1m bar failed for USDJPY" in caplog.text
+    assert "unexpected provider bug" in caplog.text
+
+
 def test_latest_1m_bar_returns_last(tmp_path):
     _, p = _provider(tmp_path)
     fresh = _fresh_bars()
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=fresh):
-        assert p.latest_1m_bar("USDJPY").ts == fresh[-1].ts
+        assert p.latest_1m_bar("USDJPY").ts == fresh[-2].ts
 
 
 def test_spec_builtin(tmp_path):
@@ -298,6 +333,7 @@ def test_get_bars_derives_4h_from_1h_on_yfinance(tmp_path):
     由来を記録して「ネイティブ 4h」と区別できることも併せて確認する。
     """
     _, p = _provider(tmp_path)   # yfinance のみ enabled
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="1h", n=100)) as yb:
         bars = p.get_bars("USDJPY", "4h")
@@ -315,6 +351,7 @@ def test_only_base_bars_are_cached_for_derive_only_intervals(tmp_path):
     格子の違う 4h が同じ系列に混ざると重複した足を 1 本の系列として返す。
     """
     conn, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="1h", n=100)):
         bars = p.get_bars("USDJPY", "4h")
@@ -326,8 +363,11 @@ def test_only_base_bars_are_cached_for_derive_only_intervals(tmp_path):
 def test_get_bars_1d_derives_from_1h_not_4h(tmp_path):
     """1d の base は 1h。4h を base にすると格子問題が裏口から入る。"""
     _, p = _provider(tmp_path, mt5=True)
+    p.clock = FixedClock(NOW + timedelta(days=1, hours=12, seconds=30))
+    p.settings = p.settings.model_copy(deep=True)
+    p.settings.datafeed.freshness_max_min = 3_000
     with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
-               return_value=_fresh_bars(interval="1h", n=100)) as mb:
+               return_value=_fresh_bars(interval="1h", n=200)) as mb:
         bars = p.get_bars("USDJPY", "1d")
     assert mb.call_args.args[2] == "1h"
     assert all(b.interval == "1d" for b in bars)
@@ -337,6 +377,7 @@ def test_get_bars_1d_derives_from_1h_not_4h(tmp_path):
 def test_get_bars_derives_30m_from_15m_on_yfinance(tmp_path):
     """分足の導出 (yfinance に 30m は無い)。pandas の freq alias 写像の実地確認。"""
     _, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="15m", n=200)) as yb:
         bars = p.get_bars("USDJPY", "30m")
@@ -368,6 +409,7 @@ def test_derive_rejects_source_with_gappy_base_bars(tmp_path):
 def test_derive_gappy_base_falls_through_to_next_candidate(tmp_path):
     """base 不健全の DataUnhealthy は get_bars ごと落とさずフォールバックに流す。"""
     conn, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     ohlcv.upsert_cache_bars(conn, _fresh_bars(interval="1h", n=100), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_gappy_1h_base()):
@@ -379,6 +421,7 @@ def test_derive_gappy_base_falls_through_to_next_candidate(tmp_path):
 def test_derive_accepts_healthy_base_bars(tmp_path):
     """base 足が健全なら従来どおり導出足を返す (非退行)。"""
     _, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="1h", n=100)):
         bars = p.get_bars("USDJPY", "4h")
@@ -394,6 +437,7 @@ def test_native_4h_is_never_requested_even_when_source_has_it(tmp_path):
     1 本も時刻を共有しない。混ざると重複した足が 1 本の系列として返る。
     """
     _, p = _provider(tmp_path, mt5=True)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
                return_value=_fresh_bars(interval="1h", n=100)) as mb:
         bars = p.get_bars("USDJPY", "4h")
@@ -413,7 +457,7 @@ def test_mt5_native_bars_are_stored_under_mt5_live_source(tmp_path):
                return_value=_fresh_bars(interval="1m", n=30)):
         p.get_bars("USDJPY", "1m", 1)
     assert p.last_bars_source("USDJPY", "1m") == "mt5"
-    assert len(ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="mt5-live")) == 30
+    assert len(ohlcv.load_cache_bars(conn, "USDJPY", "1m", source="mt5-live")) == 29
     # プラン 9 Task 16 以降、"mt5" は IMPORT_SOURCES 側の名前なので、
     # キャッシュ読みは「空が返る」ではなく「読み側 allowlist が拒否する」。
     # 混入していないことの保証としては後者の方が強い。
@@ -424,6 +468,7 @@ def test_mt5_native_bars_are_stored_under_mt5_live_source(tmp_path):
 def test_mt5_derived_base_bars_are_stored_under_mt5_live_source(tmp_path):
     """F1: `_derive` の base 足保存も同じ変換を通る。"""
     conn, p = _provider(tmp_path, mt5=True)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
                return_value=_fresh_bars(interval="1h", n=100)):
         p.get_bars("USDJPY", "4h")
@@ -440,7 +485,7 @@ def test_cache_fallback_reads_mt5_live_storage_source(tmp_path):
          patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "1m", 1)
-    assert len(bars) == 30
+    assert len(bars) == 29
     assert p.last_bars_source("USDJPY", "1m") == "cache"
 
 
@@ -474,13 +519,14 @@ def test_cache_fallback_does_not_use_only_first_live_source(tmp_path):
          patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "1m", 1)
-    assert len(bars) == 30
+    assert len(bars) == 29
     assert p.last_bars_source("USDJPY", "1m") == "cache"
 
 
 def test_cache_fallback_derives_4h_from_cached_1h(tmp_path):
     """全ソース失敗時、キャッシュの base 足から導出する (4h の行は読まない)。"""
     conn, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     ohlcv.upsert_cache_bars(conn, _fresh_bars(interval="1h", n=100), source="yfinance")
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
@@ -498,6 +544,7 @@ def test_cache_fallback_derives_30m_from_cached_15m(tmp_path):
     base (15m) の行へ流れないと、修正前は効いていたフォールバックが死ぬ。
     """
     conn, p = _provider(tmp_path)
+    p.clock = FixedClock(NOW + timedelta(seconds=30))
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="15m", n=200)):
         p.get_bars("USDJPY", "30m")
@@ -517,7 +564,7 @@ def test_cache_direct_read_still_works_for_native_intervals(tmp_path):
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                side_effect=OSError("down")):
         bars = p.get_bars("USDJPY", "15m")
-    assert len(bars) == 100
+    assert len(bars) == 99
     assert p.bars_origin("USDJPY", "15m") == "cache"
 
 
@@ -833,7 +880,7 @@ def test_readonly_provider_skips_bar_cache_write(tmp_path):
     s = load_settings(EXAMPLE)
     conn = connect(tmp_path / "t.db")
     init_db(conn)
-    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    p = PriceProvider(conn, s, FixedClock(NOW + timedelta(seconds=30)), readonly=True)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars()):
         bars = p.get_bars("USDJPY", "1m", 1)
@@ -846,7 +893,7 @@ def test_readonly_provider_skips_derived_bar_cache_write(tmp_path):
     s = load_settings(EXAMPLE)
     conn = connect(tmp_path / "t.db")
     init_db(conn)
-    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    p = PriceProvider(conn, s, FixedClock(NOW + timedelta(seconds=30)), readonly=True)
     with patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
                return_value=_fresh_bars(interval="1h", n=100)):
         p.get_bars("USDJPY", "4h", 5)
@@ -910,7 +957,7 @@ def test_rows_older_than_window_are_excluded(tmp_path):
     conn, p = _provider(tmp_path)
     old_bar = Bar("USDJPY", "1h", NOW - timedelta(days=10), 148, 148.1,
                  147.9, 148.05, 10)
-    fresh_bar = Bar("USDJPY", "1h", NOW - timedelta(hours=1), 148, 148.1,
+    fresh_bar = Bar("USDJPY", "1h", NOW - timedelta(hours=1, minutes=1), 148, 148.1,
                     147.9, 148.05, 10)
     ohlcv.upsert_cache_bars(conn, [old_bar, fresh_bar], source="yfinance")
 
@@ -927,7 +974,9 @@ def test_direct_read_candidate_since_is_not_floored(tmp_path, monkeypatch):
     """spec ③ テスト 6: 直読候補 (src == interval) は window_start を
     そのまま渡す (floor すると要求より広く返してしまう)。"""
     conn, p = _provider(tmp_path)
-    now = datetime(2026, 7, 22, 0, 47, 0, tzinfo=timezone.utc)
+    p.settings = p.settings.model_copy(deep=True)
+    p.settings.datafeed.freshness_max_min = 120
+    now = datetime(2026, 7, 22, 1, 30, 0, tzinfo=timezone.utc)
     captured = {}
     orig = ohlcv.load_cache_bars
 
@@ -970,28 +1019,31 @@ def test_query_truncation_does_not_leave_partial_leading_bucket(tmp_path):
     境界時刻の行ではなく now 直前の 1 行だけを反映してしまうことを検出
     する。"""
     conn, p = _provider(tmp_path)
-    now = datetime(2026, 7, 22, 0, 47, 0, tzinfo=timezone.utc)
+    p.settings = p.settings.model_copy(deep=True)
+    p.settings.datafeed.freshness_max_min = 120
+    now = datetime(2026, 7, 22, 1, 30, 0, tzinfo=timezone.utc)
     boundary = datetime(2026, 7, 22, 0, 0, 0, tzinfo=timezone.utc)
     bars = [Bar("USDJPY", "1m", boundary + timedelta(minutes=i),
                148.0 + i * 0.01, 148.1 + i * 0.01, 147.9 + i * 0.01,
                148.05 + i * 0.01, 10)
-           for i in range(48)]  # 00:00 (境界) 〜 00:47 (= now)
+               for i in range(91)]  # 00:00 (境界) 〜 01:30 (forming)
     ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
 
-    result = p._cached_bars("USDJPY", "1h", now, [], 0)  # lookback_days=0
+    result = p._cached_bars("USDJPY", "1h", now, [], 1)
 
     assert result is not None
     derived, origin = result
     assert origin == "cache(1m→1h derived)"
     assert len(derived) == 1
-    assert derived[0].open == pytest.approx(148.00)  # 境界行 (i=0) の open
+    assert derived[0].ts == boundary
+    assert derived[0].open == 148.0
 
 
 def test_read_volume_bounded_by_window_regardless_of_accumulation(tmp_path):
     """spec ③ テスト 13: DB の蓄積量に関係なく、読み込み件数が窓ぶんに
     収まる。"""
     conn, p = _provider(tmp_path)
-    bars = [Bar("USDJPY", "1h", NOW - timedelta(hours=i), 148, 148.1, 147.9,
+    bars = [Bar("USDJPY", "1h", NOW - timedelta(hours=i, minutes=1), 148, 148.1, 147.9,
                148.05, 10) for i in range(30 * 24)]  # 30 日分
     ohlcv.upsert_cache_bars(conn, bars, source="yfinance")
 
