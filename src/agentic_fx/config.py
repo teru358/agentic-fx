@@ -587,6 +587,14 @@ class Settings(_Strict):
                     "from datafeed.decision_timeframes")
             resolved_datafeed["decision_timeframes"] = decision
             resolved_datafeed["primary_intervals"] = decision
+            # 派生値を schedule にも書き戻す。worker は親の `model_dump()` を
+            # `model_validate` し直すので、legacy キーが既定値 (60) のまま残ると
+            # 判断足 15m と食い違って起動拒否になる (2026-09-24 実機)
+            from agentic_fx.datafeed.sources import INTERVAL_MIN as _im
+            schedule = values.get("schedule")
+            resolved_schedule = dict(schedule) if isinstance(schedule, dict) else {}
+            resolved_schedule["trade_interval_min"] = _im[decision[0]]
+            values = {**values, "schedule": resolved_schedule}
         resolved_plugin = dict(plugin)
         resolved_plugin.pop("producer_source", None)
         resolved_values = dict(values)

@@ -835,3 +835,23 @@ def test_max_backtests_per_candidate_equal_to_pairs_count_passes_f8_5b():
     raw.setdefault("improve", {}).setdefault(
         "tool_budget", {})["max_backtests_per_candidate"] = 2
     Settings.model_validate(raw)  # ValidationError を投げない
+
+
+def test_settings_round_trip_through_model_dump_keeps_decision_timeframe(tmp_path):
+    """mission worker は親の `model_dump()` を `model_validate` し直す。判断足を 15m に
+    した設定で、legacy の `trade_interval_min` が既定値 60 のまま dump されると再検証で
+    起動拒否になる (2026-09-24 実機)。派生値を書き戻して往復できること。"""
+    from agentic_fx.config import Settings
+    raw = _base_settings_dict() if "_base_settings_dict" in globals() else None
+    if raw is None:
+        import yaml
+        raw = yaml.safe_load(open("config/settings.yaml.example"))
+    raw["datafeed"]["decision_timeframes"] = ["15m"]
+    raw["datafeed"].pop("primary_intervals", None)
+    raw.get("schedule", {}).pop("trade_interval_min", None)
+    first = Settings.model_validate(raw)
+    assert first.datafeed.decision_timeframe == "15m"
+    assert first.schedule.trade_interval_min == 15
+    second = Settings.model_validate(first.model_dump())
+    assert second.datafeed.decision_timeframe == "15m"
+    assert second.datafeed.primary_intervals == ["15m"]
