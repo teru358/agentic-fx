@@ -123,7 +123,8 @@ def build_mission_registry(
             "readonly は無視される。子プロセスから呼ぶ場合は provider を渡さないこと。")
 
     if provider is None:
-        provider = PriceProvider(conn, settings, clock, readonly=readonly)
+        provider = PriceProvider(conn, settings, clock, readonly=readonly,
+                                 activity=activity)
     econ = EconCalendar(conn, activity, clock,
                         timeout_sec=settings.worker.data_hook_timeout_sec)
     broker = PaperBroker(conn, settings, clock)

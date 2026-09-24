@@ -50,6 +50,7 @@ llama_swap:
 
 datafeed:
   # primary: yfinance   # 省略時は enabled が 1 個ならそれ
+  # fallbacks: []   # primary が不通のときだけ順に試す源。既定は無し (無言の切替をしない)
   yfinance:   {enabled: true}
   mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
   twelvedata: {enabled: false}

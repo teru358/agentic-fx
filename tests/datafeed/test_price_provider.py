@@ -6,6 +6,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, FixedClock, Quote
 from agentic_fx.datafeed import sources
@@ -18,14 +19,19 @@ NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 
 
-def _provider(tmp_path, mt5=False):
+def _provider(tmp_path, mt5=False, activity=None):
     s = load_settings(EXAMPLE)
     if mt5:
+        # 既存テストの大半は「mt5 優先 + yfinance へのフォールバック」を
+        # 前提にしている。A2-3a (primary-only chain) では chain の並びが
+        # primary + 明示 fallbacks になったため、その前提をここで明示する。
         s = s.model_copy(deep=True)
         s.datafeed.mt5.enabled = True
+        s.datafeed.primary = "mt5"
+        s.datafeed.fallbacks = ["yfinance"]
     conn = connect(tmp_path / "t.db")
     init_db(conn)
-    return conn, PriceProvider(conn, s, FixedClock(NOW))
+    return conn, PriceProvider(conn, s, FixedClock(NOW), activity=activity)
 
 
 def _fresh_bars(pair="USDJPY", n=30, interval="1m"):
@@ -208,6 +214,8 @@ def test_td_quote_used_when_mt5_fails(tmp_path, monkeypatch):
     s = load_settings(EXAMPLE).model_copy(deep=True)
     s.datafeed.mt5.enabled = True
     s.datafeed.twelvedata.enabled = True
+    s.datafeed.primary = "mt5"
+    s.datafeed.fallbacks = ["twelvedata"]
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     p = PriceProvider(conn, s, FixedClock(NOW))
@@ -224,6 +232,7 @@ def _td_only_provider(tmp_path):
     s = load_settings(EXAMPLE).model_copy(deep=True)
     s.datafeed.twelvedata.enabled = True
     s.datafeed.yfinance.enabled = False
+    s.datafeed.primary = "twelvedata"
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     return PriceProvider(conn, s, FixedClock(NOW))
@@ -1091,3 +1100,143 @@ def test_cache_window_is_widened_by_derive_ratio(tmp_path, monkeypatch):
     p._cached_bars("USDJPY", "4h", NOW, [], 5)   # 4h は DERIVE_ONLY → base 1h, ratio 4
     span = NOW - captured["1h"]
     assert timedelta(days=20) <= span < timedelta(days=20, hours=4)
+
+
+# ---- A2-3a [quote-primary-only]: primary 固定 + 明示 fallback ---------------
+
+
+def _mt5_primary_provider(tmp_path, fallbacks=None, activity=None):
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.mt5.enabled = True
+    s.datafeed.primary = "mt5"
+    s.datafeed.fallbacks = fallbacks or []
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    return conn, PriceProvider(conn, s, FixedClock(NOW), activity=activity)
+
+
+def test_no_fallback_quote_does_not_call_yfinance_on_mt5_failure(tmp_path):
+    """fallbacks 無しなら primary (mt5) 失敗で即 DataUnhealthy。yfinance は
+    enabled でも一度も呼ばれない (無言のフォールバック禁止、2026-09 裁定)。"""
+    _, p = _mt5_primary_provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("bridge down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yf:
+        with pytest.raises(DataUnhealthy):
+            p.get_quote("USDJPY")
+    yf.assert_not_called()
+
+
+def test_no_fallback_bars_does_not_call_yfinance_on_mt5_failure(tmp_path):
+    _, p = _mt5_primary_provider(tmp_path)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_bars",
+               side_effect=OSError("bridge down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars") as yf:
+        with pytest.raises(DataUnhealthy):
+            p.get_bars("USDJPY", "1m", 1)
+    yf.assert_not_called()
+
+
+def test_explicit_fallback_used_when_primary_quote_fails(tmp_path):
+    _, p = _mt5_primary_provider(tmp_path, fallbacks=["yfinance"])
+    yq = Quote("USDJPY", 148.5, 148.5, NOW, "yfinance")
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=yq) as yf:
+        assert p.get_quote("USDJPY").source == "yfinance"
+    yf.assert_called_once()
+
+
+def test_fallback_activity_written_once_per_transition(tmp_path):
+    """状態が変わるまで activity は 1 回だけ (毎 tick は出さない)。復帰後に
+    再度落ちたら改めて 1 回出る。"""
+    activity = ActivityLog(tmp_path / "activity.log")
+    _, p = _mt5_primary_provider(tmp_path, fallbacks=["yfinance"],
+                                 activity=activity)
+    yq = Quote("USDJPY", 148.5, 148.5, NOW, "yfinance")
+    mq = Quote("USDJPY", 148.49, 148.51, NOW, "mt5")
+
+    def _fallback_events():
+        return [l for l in activity.tail(50, Category.SYSTEM)
+                if "price_source_fallback" in l]
+
+    # tick 1: mt5 down -> yfinance フォールバック、activity 1 件
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=yq):
+        assert p.get_quote("USDJPY").source == "yfinance"
+    assert len(_fallback_events()) == 1
+
+    # tick 2: 依然 mt5 down (状態不変) -> 増えない
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=yq):
+        assert p.get_quote("USDJPY").source == "yfinance"
+    assert len(_fallback_events()) == 1
+
+    # 復帰: mt5 が直る -> primary に戻る (通知しない)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               return_value=mq):
+        assert p.get_quote("USDJPY").source == "mt5"
+    assert len(_fallback_events()) == 1
+
+    # 再度 down -> 状態が変わったので 2 件目
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=yq):
+        assert p.get_quote("USDJPY").source == "yfinance"
+    assert len(_fallback_events()) == 2
+
+
+def test_readonly_provider_ignores_fallbacks_even_when_configured(tmp_path):
+    """readonly tool の契約 (A2-1b) は変えない: fallbacks が設定されていても
+    readonly provider は primary だけを試す。"""
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.mt5.enabled = True
+    s.datafeed.primary = "mt5"
+    s.datafeed.fallbacks = ["yfinance"]
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW), readonly=True)
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yf:
+        with pytest.raises(DataUnhealthy):
+            p.get_quote("USDJPY")
+    yf.assert_not_called()
+
+
+def test_fallbacks_are_tried_in_declared_order_and_stop_at_first_success(tmp_path, monkeypatch):
+    """fallbacks は宣言した順に試し、先に成功した源で止まる (順序を集合化・逆順にする
+    変異を殺す)。primary=mt5 失敗 → yfinance 成功 → twelvedata は呼ばれない。"""
+    monkeypatch.setenv("TWELVEDATA_API_KEY", "dummy")
+    _, p = _mt5_primary_provider(tmp_path, fallbacks=["yfinance", "twelvedata"])
+    p.settings.datafeed.twelvedata.enabled = True
+    calls = []
+
+    def yf_ok(*args, **kwargs):
+        calls.append("yfinance")
+        return Quote("USDJPY", 148.5, 148.5, NOW, "yfinance")
+
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("bridge down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote", side_effect=yf_ok), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote") as td:
+        p.get_quote("USDJPY")
+    assert calls == ["yfinance"]
+    td.assert_not_called()
+    # 逆順に宣言すれば twelvedata が先に呼ばれる
+    _, p2 = _mt5_primary_provider(tmp_path, fallbacks=["twelvedata", "yfinance"])
+    p2.settings.datafeed.twelvedata.enabled = True
+    with patch("agentic_fx.datafeed.price_provider.sources.mt5_quote",
+               side_effect=OSError("bridge down")), \
+         patch("agentic_fx.datafeed.price_provider.sources.td_quote",
+               return_value=Quote("USDJPY", 148.5, 148.5, NOW, "twelvedata")) as td2, \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_quote") as yf2:
+        p2.get_quote("USDJPY")
+    td2.assert_called_once()
+    yf2.assert_not_called()

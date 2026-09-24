@@ -78,6 +78,75 @@ def test_primary_source_matrix(monkeypatch, primary, enabled, legacy, has_key,
         assert Settings.model_validate(raw).datafeed.primary == expected
 
 
+# ---- datafeed.fallbacks (A2-3a [quote-primary-only]) ----------------------
+#
+# primary が不通のときだけ試す明示 fallback。既定は無し (無言の切替をしない)。
+
+
+def _base_raw_datafeed(monkeypatch):
+    monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    raw = deepcopy(load_settings(EXAMPLE).model_dump())
+    return raw
+
+
+def test_fallbacks_default_empty(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    s = Settings.model_validate(raw)
+    assert s.datafeed.fallbacks == []
+
+
+def test_fallback_source_must_be_enabled(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "yfinance"
+    raw["datafeed"]["fallbacks"] = ["mt5"]   # mt5 は example では disabled
+    with pytest.raises(ValidationError, match="fallback_source_disabled"):
+        Settings.model_validate(raw)
+
+
+def test_fallback_source_cannot_duplicate_primary(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "yfinance"
+    raw["datafeed"]["fallbacks"] = ["yfinance"]
+    with pytest.raises(ValidationError, match="fallback_duplicates_primary"):
+        Settings.model_validate(raw)
+
+
+def test_fallback_twelvedata_requires_api_key(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "yfinance"
+    raw["datafeed"]["twelvedata"]["enabled"] = True
+    raw["datafeed"]["fallbacks"] = ["twelvedata"]
+    with pytest.raises(ValidationError, match="fallback_source_unusable"):
+        Settings.model_validate(raw)
+
+
+def test_fallback_unknown_source_rejected(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "yfinance"
+    raw["datafeed"]["fallbacks"] = ["dukascopy"]
+    with pytest.raises(ValidationError, match="unknown_fallback_source"):
+        Settings.model_validate(raw)
+
+
+def test_fallback_duplicates_rejected(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "mt5"
+    raw["datafeed"]["mt5"]["enabled"] = True
+    raw["datafeed"]["fallbacks"] = ["yfinance", "yfinance"]
+    with pytest.raises(ValidationError, match="must not contain duplicates"):
+        Settings.model_validate(raw)
+
+
+def test_fallback_accepted_when_enabled_and_distinct_from_primary(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["primary"] = "mt5"
+    raw["datafeed"]["mt5"]["enabled"] = True
+    raw["datafeed"]["fallbacks"] = ["yfinance"]
+    s = Settings.model_validate(raw)
+    assert s.datafeed.primary == "mt5"
+    assert s.datafeed.fallbacks == ["yfinance"]
+
+
 def test_backtest_settings_eval_source_defaults_to_dukascopy():
     assert BacktestSettings(
         holdout_months=1, initial_balance=1.0).eval_source == "dukascopy"

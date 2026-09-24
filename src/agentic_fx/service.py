@@ -803,7 +803,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             spec_fn = provider.spec
             bars_fn = provider.latest_1m_bar
         else:
-            provider = PriceProvider(conn_core, settings, clock)
+            provider = PriceProvider(conn_core, settings, clock, activity=activity)
             # 注入された quote_fn/spec_fn/bars_fn は provider 自身の束縛メソッドにも
             # 反映する (Task 8 E2E で実測)。実際に内部 self-call が存在するのは
             # `self.get_quote` だけ (`PriceProvider._rate_of` および `healthcheck`

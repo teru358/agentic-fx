@@ -141,6 +141,11 @@ class DatafeedSettings(_Strict):
     mt5: SourceToggle
     twelvedata: SourceToggle
     primary: str
+    # primary が不通のときだけ、この順に試す明示 fallback。既定は無し
+    # (2026-09 裁定 [writable-provider-quote-chain-ignores-primary]:
+    # enabled であることは接続資格であって選択順ではない。無言の切替は
+    # しない — 利用者が明示したときだけ)。
+    fallbacks: list[str] = Field(default_factory=list)
     ingest_budget_sec: float = Field(default=10, gt=0)
     freshness_max_min: float = Field(gt=0)
     # ソース時刻の遅延・境界丸めを吸収するための暫定猶予秒。
@@ -537,6 +542,24 @@ class Settings(_Strict):
             raise ValueError("primary_source_unusable")
         resolved_datafeed = dict(datafeed)
         resolved_datafeed["primary"] = primary
+        fallbacks = resolved_datafeed.get("fallbacks", [])
+        if fallbacks:
+            if not isinstance(fallbacks, list):
+                raise ValueError("datafeed.fallbacks must be a list")
+            valid_names = {"yfinance", "mt5", "twelvedata"}
+            if len(set(fallbacks)) != len(fallbacks):
+                raise ValueError("datafeed.fallbacks must not contain duplicates")
+            for name in fallbacks:
+                if name not in valid_names:
+                    raise ValueError(f"unknown_fallback_source: {name}")
+                if name == primary:
+                    raise ValueError(
+                        f"fallback_duplicates_primary: {name} is already "
+                        "datafeed.primary")
+                if name not in enabled:
+                    raise ValueError(f"fallback_source_disabled: {name}")
+                if name == "twelvedata" and not os.environ.get("TWELVEDATA_API_KEY"):
+                    raise ValueError(f"fallback_source_unusable: {name}")
         def canonical_interval(value):
             return "1h" if value == "60m" else value
 

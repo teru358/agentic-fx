@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 
 from agentic_fx._safe_error import safe_error_text as _safe_error_text
+from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
 from agentic_fx.core.contracts import (
     Bar, Clock, ConversionRate, InstrumentSpec, Quote,
@@ -70,10 +71,16 @@ _SPECS = {
 
 class PriceProvider:
     def __init__(self, conn: sqlite3.Connection, settings: Settings,
-                 clock: Clock, readonly: bool = False) -> None:
+                 clock: Clock, readonly: bool = False,
+                 activity: ActivityLog | None = None) -> None:
         self.conn = conn
         self.settings = settings
         self.clock = clock
+        # 明示 fallback (datafeed.fallbacks) に落ちたことの通知先。None なら
+        # 通知を出さない (readonly provider や init 時の疎通確認など、
+        # activity ログを持たない呼び出し元向け)。
+        self.activity = activity
+        self._fallback_active: dict[tuple[str, str, str], bool] = {}
         # CR-4 (裁定書 F-5): 子プロセス (mission_worker.py) は conn に
         # db.connect_readonly (mode=ro) を渡す。get_bars/_derive の
         # cache 書込 (ohlcv.upsert_cache_bars) は RO 接続下で
@@ -103,6 +110,7 @@ class PriceProvider:
                 q = fn()
                 validate_quote(q, self.clock.now(),
                                self.settings.datafeed.freshness_max_min)
+                self._note_source_used(pair, "quote", "-", name)
                 return q
             except Exception as e:  # noqa: BLE001 — 次ソースへ
                 # 例外の型で絞らない。sources は naive datetime を ValueError で
@@ -116,45 +124,68 @@ class PriceProvider:
 
     def _chain(self, pair: str, *, kind: str, interval: str = "1m",
                lookback_days: int = 5) -> list[tuple[str, Callable[[], object]]]:
-        """優先順位 MT5 → TD → yfinance。enabled なソースのみ (設計書 §5)。"""
+        """優先順位は primary のみ、明示 fallback (`datafeed.fallbacks`) が
+        設定されていればその順に続く (2026-09 裁定
+        [writable-provider-quote-chain-ignores-primary])。enabled/鍵の有無は
+        接続資格であって選択順そのものではない — `enabled` の並びで無言に
+        フォールバックしていた挙動は廃止した。readonly provider (A2-1b の
+        読み取り専用ツールが使う) は fallbacks があっても常に primary だけ
+        (readonly tool の契約: 保存しない要求時取得であり、取得元は
+        primary 固定という既存契約を変えない)。"""
         d = self.settings.datafeed
         td_key = self._td_key()
-        chain: list[tuple[str, Callable[[], object]]] = []
+
+        def _entry(name: str) -> tuple[str, Callable[[], object]] | None:
+            if name == "mt5" and d.mt5.enabled:
+                return ("mt5", (lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
+                        if kind == "quote" else
+                        (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
+                                                  lookback_days)))
+            if name == "twelvedata" and td_key:
+                return ("twelvedata", (lambda: sources.td_quote(td_key, pair))
+                        if kind == "quote" else
+                        (lambda: sources.td_bars(td_key, pair, interval,
+                                                 lookback_days)))
+            if name == "yfinance" and d.yfinance.enabled:
+                return ("yfinance", (lambda: sources.yf_quote(pair))
+                        if kind == "quote" else
+                        (lambda: sources.yf_bars(pair, interval, lookback_days)))
+            return None
+
         if self.readonly:
-            primary = d.primary
-            if primary == "mt5" and d.mt5.enabled:
-                return [("mt5", (lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
-                         if kind == "quote" else
-                         (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
-                                                   lookback_days)))]
-            if primary == "twelvedata" and td_key:
-                return [("twelvedata", (lambda: sources.td_quote(td_key, pair))
-                         if kind == "quote" else
-                         (lambda: sources.td_bars(td_key, pair, interval,
-                                                  lookback_days)))]
-            if primary == "yfinance" and d.yfinance.enabled:
-                return [("yfinance", (lambda: sources.yf_quote(pair))
-                         if kind == "quote" else
-                         (lambda: sources.yf_bars(pair, interval, lookback_days)))]
-            return []
-        if d.mt5.enabled:
-            chain.append(("mt5", (
-                lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
-                if kind == "quote" else
-                (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
-                                          lookback_days))))
-        if td_key:
-            chain.append(("twelvedata", (
-                lambda: sources.td_quote(td_key, pair))
-                if kind == "quote" else
-                (lambda: sources.td_bars(td_key, pair, interval,
-                                         lookback_days))))
-        if d.yfinance.enabled:
-            chain.append(("yfinance", (
-                lambda: sources.yf_quote(pair))
-                if kind == "quote" else
-                (lambda: sources.yf_bars(pair, interval, lookback_days))))
+            entry = _entry(d.primary)
+            return [entry] if entry is not None else []
+
+        chain: list[tuple[str, Callable[[], object]]] = []
+        for name in (d.primary, *d.fallbacks):
+            entry = _entry(name)
+            if entry is not None:
+                chain.append(entry)
         return chain
+
+    def _note_source_used(self, pair: str, kind: str, interval: str,
+                          name: str) -> None:
+        """明示 fallback に落ちた/戻ったことを追跡する。
+
+        fallback に**落ちた**瞬間だけ activity + log warning を出す
+        (状態が変わるまで 1 回。毎 tick 出すと fallback 運用中は tick 毎に
+        activity が埋まる)。primary に戻ったときは黙って状態を戻す —
+        戻り自体は「壊れていた」記録ではないため通知しない。次に再度
+        落ちたときは、状態が変わった扱いになるので改めて 1 回出る。
+        """
+        primary = self.settings.datafeed.primary
+        key = (pair, kind, interval)
+        is_fallback = name != primary
+        was_fallback = self._fallback_active.get(key, False)
+        self._fallback_active[key] = is_fallback
+        if is_fallback and not was_fallback:
+            _log.warning(
+                "price source fallback: %s %s using %s (primary=%s down)",
+                pair, kind, name, primary)
+            if self.activity is not None:
+                self.activity.write(
+                    Category.SYSTEM, "price_source_fallback",
+                    f"{pair} {kind}: {primary} -> {name}", ref_id=pair)
 
     # ---- bars -----------------------------------------------------------
 
@@ -207,6 +238,7 @@ class PriceProvider:
                 # 品質フラグの完全一致判定を導出で壊さないため)
                 self._bars_source[(pair, interval)] = name
                 self._bars_origin[(pair, interval)] = origin
+                self._note_source_used(pair, "bars", interval, name)
                 return bars
             except Exception as e:  # noqa: BLE001 — get_quote と同じ理由で広く捕る
                 text = _safe_error_text(e)
