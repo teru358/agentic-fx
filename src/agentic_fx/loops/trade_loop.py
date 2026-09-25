@@ -137,7 +137,9 @@ class TradeLoop:
         許容される。
         """
         try:
-            self.provider.healthcheck(self.settings.pairs[0])
+            # `now` はここで 1 回だけ採り、healthcheck へ明示的に渡す
+            # (healthcheck 側が独自に時刻を読み直さない)。
+            self.provider.healthcheck(self.settings.pairs[0], now=self.clock.now())
         except DataUnhealthy as e:
             self.activity.write(Category.SYSTEM, "data_unhealthy", str(e))
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")

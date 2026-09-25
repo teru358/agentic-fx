@@ -10,6 +10,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.datafeed.outage import format_unprocessed_positions
 from agentic_fx.store import (approvals, backlog, candidate_archives,
                               missions, orders, reflection_attempts,
                               reflections)
@@ -21,6 +22,7 @@ _HELP = """コマンド一覧:
   log [n]                    技術ログの直近 n 行 (default 20)
   activity [n] [カテゴリ]     activity ログ (NEWS/TECH/AGGREGATE/TRADE/IMPROVE/APPROVAL/SYSTEM)
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
+  data resume [--acknowledge]  価格源 degraded からの手動復帰要求 (次 tick で判定)
   approve <id> / reject <id> [理由]   承認操作
   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
   approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
@@ -43,7 +45,8 @@ class Commands:
                  improve_supervisor: object | None = None,
                  policy_path: Path | None = None,
                  plugins_root: Path | None = None,
-                 settings: object | None = None) -> None:
+                 settings: object | None = None,
+                 outage: object | None = None) -> None:
         self.conn = conn
         self.state = state_store
         self.broker = broker
@@ -59,6 +62,11 @@ class Commands:
         # へ振り分けるために必要 (B-1 是正)。
         self.plugins_root = plugins_root
         self.settings = settings
+        # `OutageStateMachine`。`Commands` は `core_lock` を取得しない —
+        # `data resume` は `outage.request_resume()` で要求を永続化する
+        # だけで、実際の判定・遷移は次 scheduler tick の lock 区間で
+        # 行われる。
+        self.outage = outage
 
     def dispatch(self, line: str) -> str:
         parts = line.strip().split()
@@ -78,6 +86,8 @@ class Commands:
                 if not args:
                     return "usage: ask <質問>"
                 return self.trade_loop.ask_once(" ".join(args))
+            if cmd == "data" and args and args[0] == "resume":
+                return self._data_resume(args[1:])
             if cmd == "approve" and args:
                 approval_id = int(args[0])
                 # 裁定1 (11g Step1b): decide() 全廃。kind="plugin" は
@@ -328,7 +338,45 @@ class Commands:
         if self.health_latch.is_latched():
             reasons = "; ".join(self.health_latch.summary()[:3])
             result += f"\nhealth: LATCHED ({reasons})"
+        if self.outage is not None:
+            result += "\n" + self._data_state_line()
         return result
+
+    def _data_state_line(self) -> str:
+        """`status` 表示に足す 1 行: state / epoch / gap / 未処理建玉数 /
+        resume 要求の有無。"""
+        now = self.clock.now()
+        info = self.outage.gap_summary(now, conn=self.conn)
+        state = info["state"]
+        if state == "ready" and info["resume_requested_at"] is None:
+            return f"data: ready (epoch {info['epoch']})"
+        gap_texts = [f"{pair}/{interval} since {gs}"
+                    for (pair, interval), gs in sorted(info["gap_starts"].items())]
+        gap_text = "; ".join(gap_texts) if gap_texts else "-"
+        resume_text = (f" — resume 要求あり (acknowledge="
+                      f"{bool(info['resume_acknowledge'])})"
+                      if info["resume_requested_at"] is not None else "")
+        detail = format_unprocessed_positions(info.get("unprocessed_by_pair", {}))
+        unprocessed_text = f"未処理建玉 {info['unprocessed_positions']} 件"
+        if detail:
+            unprocessed_text += f" ({detail})"
+        return (f"data: {state.upper()} (epoch {info['epoch']}, "
+                f"since {info['entered_degraded_at']}, gap: {gap_text}) — "
+                f"{unprocessed_text}{resume_text}")
+
+    def _data_resume(self, args: list[str]) -> str:
+        if self.outage is None:
+            return "outage backend が未配線です"
+        acknowledge = "--acknowledge" in args
+        now = self.clock.now()
+        info = self.outage.gap_summary(now, conn=self.conn)
+        unprocessed = info["unprocessed_positions"]
+        detail = format_unprocessed_positions(info.get("unprocessed_by_pair", {}))
+        self.outage.request_resume(now, acknowledge=acknowledge, conn=self.conn)
+        return (f"resume 要求を記録しました。次の tick で判定します。"
+               f"未処理の足がある建玉 {unprocessed} 件"
+               + (f" ({detail})" if detail else "")
+               + (" (--acknowledge 指定あり)" if acknowledge else ""))
 
     @staticmethod
     def _metrics_line(prefix: str, metrics: dict | None) -> str:

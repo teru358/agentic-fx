@@ -175,13 +175,20 @@ def load_cache_bars(conn: sqlite3.Connection, symbol: str, interval: str, *,
 
 def latest_closed_cache_bar_time(conn: sqlite3.Connection, symbol: str,
                                  interval: str, *, now: datetime,
-                                 width: timedelta, grace: timedelta) -> datetime | None:
-    """Return the newest committed cache bar which is closed at ``now``."""
+                                 width: timedelta, grace: timedelta,
+                                 source: str) -> datetime | None:
+    """Return the newest committed cache bar which is closed at ``now``.
+
+    ``source`` は必須。``symbol``/``interval``/``bar_time`` だけで絞ると、
+    MT5 primary が不通でも別 source (readonly healthcheck 経由の yfinance
+    等) の新しい行が残っていれば誤って健全と判定し得る。呼び出し側は必ず
+    primary から導出した storage source (``"mt5-live"`` 等) を渡すこと。
+    """
     cutoff = _require_aware_utc(now, "now") - width - grace
     row = conn.execute(
         "SELECT MAX(bar_time) AS bar_time FROM ohlcv_cache "
-        "WHERE symbol=? AND interval=? AND bar_time <= ?",
-        (symbol, interval, cutoff.isoformat())).fetchone()
+        "WHERE symbol=? AND interval=? AND source=? AND bar_time <= ?",
+        (symbol, interval, source, cutoff.isoformat())).fetchone()
     if row is None or row["bar_time"] is None:
         return None
     return datetime.fromisoformat(row["bar_time"]).astimezone(timezone.utc)

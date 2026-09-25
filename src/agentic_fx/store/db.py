@@ -328,6 +328,27 @@ CREATE TABLE IF NOT EXISTS candidate_archives (
 -- 書き込み側の劣化は実運用経路 (per-tick 4 bars upsert) で 30→33µs のノイズ。
 CREATE INDEX IF NOT EXISTS ix_ohlcv_cache_bar_time
   ON ohlcv_cache(bar_time);
+CREATE TABLE IF NOT EXISTS datafeed_outage_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  state TEXT NOT NULL,
+  epoch INTEGER NOT NULL DEFAULT 0,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  entered_degraded_at TEXT,
+  ready_streak INTEGER NOT NULL DEFAULT 0,
+  pending_human_confirmation INTEGER NOT NULL DEFAULT 0,
+  resume_requested_at TEXT,
+  resume_acknowledge INTEGER NOT NULL DEFAULT 0,
+  recovered_notified_epoch INTEGER,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS datafeed_outage_gap (
+  pair TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  gap_start TEXT NOT NULL,
+  replay_through TEXT,
+  PRIMARY KEY (pair, interval, epoch)
+);
 """ + _IMPROVE_WAVES_DDL + _IMPROVE_WAVE_SLOTS_DDL + _PLUGIN_SWITCH_JOURNAL_DDL + _PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL
 
 TABLE_NAMES = frozenset({
@@ -336,7 +357,7 @@ TABLE_NAMES = frozenset({
     "improvement_runs", "econ_events", "approval_requests", "news_sources",
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
-    "candidate_archives",
+    "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
 })
 
 
@@ -1357,6 +1378,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         "origin_mission_id INTEGER")
     _ensure_column(
         conn, "improvement_backlog", "origin_outcome", "origin_outcome TEXT")
+    _ensure_column(
+        conn, "datafeed_outage_state", "recovered_notified_epoch",
+        "recovered_notified_epoch INTEGER")
     conn.commit()
 
 

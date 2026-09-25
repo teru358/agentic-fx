@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -13,6 +13,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
 from agentic_fx.store import approvals
 from agentic_fx.store import snapshots
 from agentic_fx.store.db import connect, init_db
@@ -46,6 +47,129 @@ def _commands(tmp_path):
                     log_dir=tmp_path / "logs", clock=FixedClock(NOW),
                     health_latch=health_latch)
     return conn, state, activity, cmds
+
+
+def _commands_with_outage(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    outage = OutageStateMachine(
+        conn, hard_keys=frozenset({("USDJPY", "1m")}),
+        interval_widths={"1m": timedelta(minutes=1)},
+        grace=timedelta(seconds=30), storage_source="mt5-live",
+        activity=activity)
+    cmds.outage = outage
+    return conn, state, activity, cmds, outage
+
+
+def _degrade(outage, now):
+    report = IngestTickReport(
+        attempted=frozenset({("USDJPY", "1m")}), succeeded=frozenset(),
+        failed=frozenset({(("USDJPY", "1m"), "ConnectError")}),
+        deferred=frozenset(), empty=frozenset())
+    return outage.observe(now, report)
+
+
+# --- [outage-stop-and-backfill]: `data resume` + status ---
+
+def test_status_shows_ready_data_line_by_default(tmp_path):
+    _, _, _, cmds, _ = _commands_with_outage(tmp_path)
+    out = cmds.dispatch("status")
+    assert "data: ready (epoch 0)" in out
+
+
+def test_status_shows_degraded_data_line(tmp_path):
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    out = cmds.dispatch("status")
+    assert "data: DEGRADED" in out
+    assert "epoch 1" in out
+    assert "未処理建玉" in out
+
+
+def test_status_shows_unprocessed_breakdown_by_pair(tmp_path):
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.store import orders
+    from agentic_fx.store.ohlcv import upsert_cache_bars
+
+    conn, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    upsert_cache_bars(conn, [Bar("USDJPY", "1m",
+                                 datetime(2026, 7, 22, 11, 57, tzinfo=timezone.utc),
+                                 1, 1, 1, 1, 1)], source="mt5-live")
+    assert _degrade(outage, NOW) == "degraded"  # gap_start = watermark = 11:57
+    orders.insert(
+        conn, pair="USDJPY", direction="long", entry_type="market",
+        horizon="day", status="open",
+        now=datetime(2026, 7, 22, 11, 30, tzinfo=timezone.utc),
+        quantity=0.1, avg_fill_price=148.0,
+        filled_at=datetime(2026, 7, 22, 11, 30, tzinfo=timezone.utc).isoformat())
+    upsert_cache_bars(conn, [Bar("USDJPY", "1m",
+                                 datetime(2026, 7, 22, 12, 2, tzinfo=timezone.utc),
+                                 1, 1, 1, 1, 1)], source="mt5-live")
+    cmds.clock = FixedClock(datetime(2026, 7, 22, 12, 5, tzinfo=timezone.utc))
+    out = cmds.dispatch("status")
+    # lower_bound = next_expected_trading_time(11:57) = 11:58、
+    # latest_confirmed = 12:02 (cutoff = 12:05 - 1min - 30s = 12:03:30) →
+    # bars = (12:02-11:58)/1min + 1 = 5。
+    assert "USDJPY: 1 positions / ~5 bars" in out
+
+
+def test_data_resume_without_ack_records_request_and_reports_unprocessed(tmp_path):
+    conn, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    from agentic_fx.store import orders
+    orders.insert(conn, pair="USDJPY", direction="long", entry_type="market",
+                 horizon="day", status="open", now=NOW, quantity=0.1,
+                 avg_fill_price=148.0, filled_at=NOW.isoformat())
+    out = cmds.dispatch("data resume")
+    assert "resume 要求を記録しました" in out
+    assert "未処理の足がある建玉" in out
+    row = outage.status()
+    assert row["resume_requested_at"] is not None
+    assert row["resume_acknowledge"] == 0
+    # state は直接書き換わっていない (シェルは要求を記録するだけの別スレッド
+    # 想定) — 次 tick の observe でしか消費されない。
+    assert outage.state == "degraded"
+
+
+def test_data_resume_with_acknowledge_flag(tmp_path):
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    out = cmds.dispatch("data resume --acknowledge")
+    assert "--acknowledge 指定あり" in out
+    row = outage.status()
+    assert row["resume_requested_at"] is not None
+    assert row["resume_acknowledge"] == 1
+
+
+def test_data_resume_writes_via_commands_connection_not_outage_bound_conn(tmp_path):
+    """`Commands` (シェルスレッド) は `outage` が構築時に束縛された接続
+    (scheduler tick が core_lock 下で使う想定の接続) を一切叩かず、自身の
+    接続 (`conn_shell` 相当) だけを使って resume 要求を書く。"""
+    conn, _, activity, cmds = _commands(tmp_path)
+    bound_conn = MagicMock()
+    bound_conn.execute.side_effect = AssertionError(
+        "outage 構築時の接続 (scheduler 側) が Commands から叩かれた")
+    outage = OutageStateMachine(
+        bound_conn, hard_keys=frozenset({("USDJPY", "1m")}),
+        interval_widths={"1m": timedelta(minutes=1)},
+        grace=timedelta(seconds=30), storage_source="mt5-live",
+        activity=activity)
+    cmds.outage = outage
+
+    out = cmds.dispatch("data resume")
+
+    assert "resume 要求を記録しました" in out
+    bound_conn.execute.assert_not_called()
+    row = conn.execute(
+        "SELECT resume_requested_at, resume_acknowledge "
+        "FROM datafeed_outage_state WHERE id=1").fetchone()
+    assert row["resume_requested_at"] is not None
+    assert row["resume_acknowledge"] == 0
+
+
+def test_data_resume_without_outage_backend(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    out = cmds.dispatch("data resume")
+    assert "未配線" in out
 
 
 def test_status(tmp_path):

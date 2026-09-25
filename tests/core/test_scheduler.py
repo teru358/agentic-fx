@@ -60,7 +60,8 @@ def _default_rate_fn(ccy, account_ccy, now):
 
 class Env:
     def __init__(self, tmp_path, quote_fn=None, base=WED, news_fn=None,
-                 econ_fn=None, rate_fn=None, seed_cron_bar=True):
+                 econ_fn=None, rate_fn=None, seed_cron_bar=True,
+                 state_fn=None, signal_due_fn=None, on_signal_maintenance=None):
         from agentic_fx.core.notifier import Notifier
         self.conn = connect(tmp_path / "t.db")
         init_db(self.conn)
@@ -82,13 +83,24 @@ class Env:
             activity=ActivityLog(tmp_path / "a.log"),
             notifier=Notifier(enabled=False, webhook_url=None), clock=clock,
             quote_fn=quote_fn or (lambda p: QUOTE), spec_fn=lambda p: SPEC,
-            rate_fn=rate_fn or _default_rate_fn)
+            rate_fn=rate_fn or _default_rate_fn,
+            **({"state_fn": state_fn} if state_fn is not None else {}))
+        self.signal_maintenance_calls = 0
+        self._on_signal_maintenance = on_signal_maintenance
+        sched_kwargs = {}
+        if state_fn is not None:
+            sched_kwargs["state_fn"] = state_fn
+        if signal_due_fn is not None:
+            sched_kwargs["signal_due_fn"] = signal_due_fn
+        if on_signal_maintenance is not None:
+            sched_kwargs["on_signal_maintenance"] = self._signal_maintenance
         self.sched = Scheduler(
             conn=self.conn, executor=self.executor, settings=SETTINGS,
             state_store=self.state, activity=ActivityLog(tmp_path / "a.log"),
             bars_fn=lambda p: self.bars.get(p),
             on_trade_mission=self._trade, on_news_cycle=self._news,
-            on_econ_cycle=self._econ)
+            on_econ_cycle=self._econ,
+            **sched_kwargs)
         if seed_cron_bar:
             _seed_decision_bar(self, base - timedelta(hours=1, seconds=30))
 
@@ -106,6 +118,11 @@ class Env:
         self.econ_calls += 1
         if self._econ_fn is not None:
             self._econ_fn()
+
+    def _signal_maintenance(self, now):
+        self.signal_maintenance_calls += 1
+        if self._on_signal_maintenance is not None:
+            self._on_signal_maintenance(now)
 
     def place_limit(self, price=148.20, sl=147.80, tp=149.00, hours=4):
         it = TradeIntent.from_llm_dict(
@@ -2989,3 +3006,138 @@ def test_close_retry_degraded_activity_carries_absorbed_cause(tmp_path):
     # 原因テキストが activity まで届いていること (これが M-a を殺す)
     assert "vendor outage for JPY" in degraded[0], degraded[0]
     assert "DataUnhealthy" in degraded[0], degraded[0]
+
+
+# --- [outage-stop-and-backfill]: state gate (state_fn 注入点) ---
+
+def test_state_gate_blocks_cron_and_coalesces_on_resume(tmp_path):
+    """`state != "ready"` の間は cron cursor が進まず mission も
+    起動しない。`ready` に戻った同一 tick で B-1 の coalesce (最新 1 本)
+    がそのまま働く。"""
+    state = {"v": "degraded"}
+    env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"])
+    _seed_decision_bar(env, WED - timedelta(hours=1))
+    env.sched.tick(WED + timedelta(seconds=30))
+    assert env.trade_calls == 0
+    assert ("USDJPY", "1h") not in env.sched._cron_watermarks
+    _seed_decision_bar(env, WED)  # degraded 中に判断足がもう 1 段進む
+    env.sched.tick(WED + timedelta(hours=1, seconds=30))
+    assert env.trade_calls == 0
+    state["v"] = "ready"
+    env.sched.tick(WED + timedelta(hours=1, minutes=1, seconds=30))
+    assert env.trade_calls == 1
+    assert env.trade_reasons == ["cron"]  # 2 段分が 1 回に coalesce
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == WED
+
+
+def test_state_gate_blocks_signal_mission(tmp_path):
+    """mission submit 側: signal 起動 mission も
+    `state != "ready"` の間は起動しない。"""
+    state = {"v": "degraded"}
+    env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"],
+             signal_due_fn=lambda now: True)
+    env.sched.tick(WED)
+    assert env.trade_calls == 0
+    state["v"] = "ready"
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.trade_reasons == ["signal"]
+
+
+def test_state_gate_blocks_new_limit_fill_but_not_existing_sl_exit(tmp_path):
+    """`state != "ready"` の間は新規ペーパー約定 (指値到達) を
+    止めるが、既存 OPEN 建玉の SL/TP 判定 (資金保護) は止めない。"""
+    state = {"v": "ready"}
+    env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"])
+    # 指値は "ready" のうちに置く (_open 自体の state gate はここでは
+    # 対象外 — 対象は「置かれた後」の到達判定 `_process_limit_fills`)。
+    pending_oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
+    open_oid = orders.insert(
+        env.conn, pair="USDJPY", direction="long", entry_type="market",
+        horizon="day", status="open", now=WED, quantity=0.1,
+        avg_fill_price=148.20, stop_loss=147.80, take_profit=149.00,
+        filled_at=WED.isoformat())
+    state["v"] = "degraded"
+    # low がどちらの価格 (指値 148.20・既存建玉の SL 147.80) にも届くバー。
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=1),
+                             148.30, 148.35, 147.75, 147.90, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, pending_oid)["status"] == "pending_fill"
+    assert orders.get(env.conn, open_oid)["status"] == "closed"
+    assert orders.get(env.conn, open_oid)["close_reason"] == "sl"
+
+    state["v"] = "ready"
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=2),
+                             148.30, 148.35, 148.15, 148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert orders.get(env.conn, pending_oid)["status"] == "open"
+
+
+def test_signal_maintenance_gated_but_news_and_econ_continue(tmp_path):
+    """degraded 中は `on_signal_maintenance` だけを止める。
+    news/econ は継続する。"""
+    state = {"v": "degraded"}
+    env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"],
+             on_signal_maintenance=lambda now: None)
+    env.sched.tick(WED)
+    assert env.signal_maintenance_calls == 0
+    assert env.news_calls == 1
+    assert env.econ_calls == 1
+    state["v"] = "ready"
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.signal_maintenance_calls == 1
+
+
+def test_closed_tick_baselines_cursor_only_when_state_is_ready(tmp_path):
+    """degraded 中に閉場を迎えても cron cursor を進めない。resume
+    (state=ready) 後の最初の開場 tick で、degraded 中に確定していた判断足の
+    mission が 1 回だけ submit される (coalesce)。"""
+    closed = FRI.replace(hour=22)  # 金曜 22:00 UTC (閉場)
+    opened = closed + timedelta(days=2)  # 日曜 22:00 UTC (開場後)
+    state = {"v": "ready"}
+    env = Env(tmp_path, base=FRI, seed_cron_bar=False,
+             state_fn=lambda: state["v"])
+    _seed_decision_bar(env, FRI - timedelta(hours=1, seconds=30))
+
+    # データ不通発生 (degraded)。判断足はすでに確定しているが gate で
+    # この tick では未 submit。
+    state["v"] = "degraded"
+    env.sched.tick(FRI + timedelta(seconds=30))
+    assert env.trade_calls == 0
+    assert ("USDJPY", "1h") not in env.sched._cron_watermarks
+
+    # 21:00 UTC 以降の閉場 tick — 依然 degraded。cursor を最新確定足まで
+    # 進めてしまうと、resume 後の開場 tick で mission が二度と発火しなく
+    # なる。
+    env.sched.tick(closed)
+    assert env.trade_calls == 0
+    assert ("USDJPY", "1h") not in env.sched._cron_watermarks
+
+    # データ側は復旧し resume (市場はまだ閉場中)。
+    state["v"] = "ready"
+
+    # 日曜 22:xx UTC (開場後) の tick で、degraded 中に確定していた判断足の
+    # mission が 1 回だけ submit される。
+    env.sched.tick(opened)
+    assert env.trade_calls == 1
+    assert env.trade_reasons == ["cron"]
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == (
+        FRI - timedelta(hours=1, seconds=30))
+
+    # coalesce: 同じ足のままもう一度開場 tick を打っても再発火しない。
+    env.sched.tick(opened + timedelta(minutes=1))
+    assert env.trade_calls == 1
+
+
+def test_closed_tick_baselines_cursor_when_state_stays_ready(tmp_path):
+    """対照: outage が無く state が終始 ready のまま閉場を跨いだ場合は、
+    従来どおり閉場 tick の baseline が効き、開場後に再発火しない。"""
+    closed = FRI.replace(hour=22)
+    opened = closed + timedelta(days=2)
+    env = Env(tmp_path, base=FRI, seed_cron_bar=False)
+    _seed_decision_bar(env, FRI - timedelta(hours=1, seconds=30))
+    env.sched.tick(closed)
+    assert env.trade_calls == 0
+    assert env.sched._cron_watermarks[("USDJPY", "1h")] == (
+        FRI - timedelta(hours=1, seconds=30))
+    env.sched.tick(opened)
+    assert env.trade_calls == 0

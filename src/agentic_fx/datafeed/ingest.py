@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from agentic_fx.core import market_hours
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
+from agentic_fx.datafeed.outage import EMPTY_REPORT, IngestTickReport
 from agentic_fx.datafeed.planner import RequirementPlanner
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed import sources
@@ -67,8 +68,14 @@ class Ingest:
             return self.fetch(pair, interval, start, end, timeout=timeout)
         return self.fetch(pair, interval, start, end)
 
-    def prepare(self, now: datetime, conn=None) -> int:
-        """Collect due keys without writing.  ``conn`` is read-only in production."""
+    def prepare(self, now: datetime, conn=None) -> tuple[int, IngestTickReport]:
+        """Collect due keys without writing.  ``conn`` is read-only in production.
+
+        戻り値は ``(count, report)``。``report`` はこの tick 限りの immutable
+        なスナップショットであり、``self.last_errors`` (失敗した key が後で
+        成功してもクリアされずに残り続ける永続的な再試行制御) には依存しない
+        — 一度失敗した key が次 tick で成功すれば ``report.succeeded`` に載る。
+        """
         conn = conn or self.read_conn
         if conn is None:
             raise ValueError("prepare requires a read connection")
@@ -79,10 +86,14 @@ class Ingest:
         self.last_request_count = 0
         self.budget_exhausted = False
         if not market_hours.is_market_open(now):
-            return 0
+            return 0, EMPTY_REPORT
         started = self.monotonic()
         budget = self.settings.datafeed.ingest_budget_sec
         deferred = []
+        attempted: set[tuple[str, str]] = set()
+        succeeded: set[tuple[str, str]] = set()
+        empty: set[tuple[str, str]] = set()
+        failed_errors: dict[tuple[str, str], str] = {}
         for key in self._ordered_keys():
             if self.next_probe_at.get(key, now) > now:
                 continue
@@ -91,11 +102,13 @@ class Ingest:
                 if self._priority(key) == 1:
                     deferred.append(key)
                 continue
+            attempted.add(key)
             pair, interval = key
             watermark = self._watermark(conn, key)
             required = self.registry.required_closed_bars(pair, interval)
             plan = self.planner.plan(self.source, interval, required)
             if not plan.ok:
+                attempted.discard(key)
                 continue
             start = (now - timedelta(days=plan.days) if watermark is None
                      else watermark - timedelta(minutes=sources.INTERVAL_MIN[interval]))
@@ -106,6 +119,9 @@ class Ingest:
                                               grace=timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec))
                 self._pending[key] = bars
                 self.last_request_count += 1
+                succeeded.add(key)
+                if not bars:
+                    empty.add(key)
                 # 次に取りに行くのは「次の足が確定する時刻」= 最新の足の開始 + 足幅 2 つ + 猶予。
                 # 取得時刻 + 足幅にすると、10:22 に 09:00 の 1h 足を取ったあと 11:22 まで
                 # 取りに行かず、10:00 の足が 22 分遅れて判断も遅れる (2026-09-22 実機)。
@@ -126,11 +142,18 @@ class Ingest:
                 self.last_request_count += 1
                 self.last_errors[key] = str(exc)
                 self.next_probe_at[key] = now
+                failed_errors[key] = str(exc)
                 _log.warning("ingest failed for %s %s: %s", pair, interval, exc)
         self._deferred = deferred
         _log.info("ingest requests=%d budget_exhausted=%s", self.last_request_count,
                   self.budget_exhausted)
-        return self.last_request_count
+        report = IngestTickReport(
+            attempted=frozenset(attempted),
+            succeeded=frozenset(succeeded),
+            failed=frozenset(failed_errors.items()),
+            deferred=frozenset(deferred),
+            empty=frozenset(empty))
+        return self.last_request_count, report
 
     def commit(self, conn) -> int:
         written = 0

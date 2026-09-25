@@ -33,6 +33,7 @@ from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
+from agentic_fx.datafeed.outage import OutageStateMachine
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed.econ_calendar import EconCalendar
@@ -489,6 +490,7 @@ class App:
     watchdog_heartbeat: float = field(default_factory=time.monotonic)
     fatal_reason: str | None = None
     ingest: object | None = None
+    outage: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -849,10 +851,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         broker = PaperBroker(conn_core, settings, clock)
         notifier = Notifier(enabled=settings.discord.enabled,
                             webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"))
+        # `outage` (OutageStateMachine) はこの後で構築される (hard_keys が
+        # RequirementRegistry に依存するため) — このクロージャは呼び出し
+        # 時点 (最初の `_open` 呼び出しはサービス起動が一通り終わった後) に
+        # しか評価されないので、後方参照で構わない。
         executor = Executor(conn=conn_core, broker=broker, settings=settings,
                             state_store=state, activity=activity,
                             notifier=notifier, clock=clock,
-                            quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn)
+                            quote_fn=quote_fn, spec_fn=spec_fn, rate_fn=rate_fn,
+                            state_fn=lambda: outage.state)
 
         plugins_dir = root / "plugins"
 
@@ -1095,14 +1102,39 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             now=clock.now())
         ingest = Ingest(settings, approved, read_conn=conn_supervisor)
 
+        # hard 必須 key (paper/mtm/hwm の 1m、health の判断足) だけを
+        # OutageStateMachine の観測対象にする。`RequirementRegistry.entries`
+        # の `hard=True` がそのまま核となる価格取得要求の定義 — strategy/
+        # indicator (hard=False) は欠けても資金保護に直結しないので対象外。
+        hard_keys = frozenset(
+            (pair, req.interval)
+            for req in requirement_registry.entries if req.hard
+            for pair in req.pairs)
+        outage_interval_widths = {
+            interval: timedelta(minutes=sources.INTERVAL_MIN[interval])
+            for _, interval in hard_keys}
+        outage = OutageStateMachine(
+            conn_core, hard_keys=hard_keys,
+            interval_widths=outage_interval_widths,
+            grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
+            storage_source=ingest.storage_source, activity=activity)
+
         def db_latest_1m_bar(pair: str):
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
             rows = ohlcv.load_cache_bars(conn_core, pair, "1m", source=source)
             return rows[-1] if rows else None
 
-        def db_healthcheck(pair: str) -> str:
+        def db_healthcheck(pair: str, now: datetime | None = None) -> str:
+            # `now` は呼び出し元 (TradeLoop) が単一の `clock.now()` から
+            # 渡す — ここでは独自に読み直さない。単一 arg 呼び出し (既存
+            # テスト・起動時チェック) との互換のため、省略時だけこの場で
+            # 読む。
+            if now is None:
+                now = clock.now()
+            if outage.state != "ready":
+                raise DataUnhealthy(
+                    f"data state degraded for {pair} (outage in progress)")
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
-            now = clock.now()
             for interval in settings.datafeed.primary_intervals:
                 rows = ohlcv.load_cache_bars(conn_supervisor, pair, interval,
                                              source=source)
@@ -1149,7 +1181,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                               on_cache_maintenance=on_cache_maintenance,
                               on_improve_tick=improve_supervisor.tick,
                               signal_due_fn=signal_due_fn,
-                              stop_event=stop_event)
+                              stop_event=stop_event,
+                              state_fn=lambda: outage.state)
 
         # 起動時 reclaim 1 回 (コントローラ裁定): 前回停止時に claimed のまま
         # 残った signal を、次の tick を待たずに起動直後から回収対象にする。
@@ -1168,7 +1201,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             activity=activity, log_dir=root / "logs", clock=clock,
                             health_latch=health_latch,
                             improve_supervisor=improve_supervisor,
-                            plugins_root=plugins_dir, settings=settings)
+                            plugins_root=plugins_dir, settings=settings,
+                            outage=outage)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1183,7 +1217,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    conn_supervisor=conn_supervisor, stop_event=stop_event,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
-                   fatal_reason=None, ingest=ingest)
+                   fatal_reason=None, ingest=ingest, outage=outage)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -1226,17 +1260,22 @@ def _scheduler_tick_once(app: App) -> None:
 
     app.clock.now() を読んで scheduler に渡すことを固定する。
 
+    tick 冒頭で `now` を 1 回だけ採り、`prepare`/`commit`/`observe`/`tick`
+    の全ステップへ同じ値を渡す — tick の途中で時刻源を再度読むと、
+    prepare が見た「不通の瞬間」と observe/tick が見る時刻がずれ得る。
+
     検収 B2 (2026-08-22): `Scheduler.tick()` は core_lock 保持下では
     improve tick の発火判定のみを行い、実際の呼び出しは遅延 callable の
     リストとして返す (`on_improve_tick` が sqlite write + thread spawn を
     伴うため core_lock 下では実行できない)。`with app.core_lock:` ブロック
     を抜けた**後**にそれらを順に実行する。
     """
+    now = app.clock.now()
+    ingest_result = None
     if app.ingest is not None:
         try:
-            app.ingest.prepare(app.clock.now())
-            with app.core_lock:
-                app.ingest.commit(app.conn_core)
+            _, report = app.ingest.prepare(now)
+            ingest_result = report
         except Exception as exc:  # noqa: BLE001 -- protection must still tick
             _log.warning("ingest prepare failed: %s", safe_error_text(exc))
             try:
@@ -1247,8 +1286,29 @@ def _scheduler_tick_once(app: App) -> None:
     pending = []
     deferred: list = []
     try:
-        with app.core_lock, app.executor.defer_notifications() as deferred:
-            pending = app.scheduler.tick(app.clock.now())
+        with app.core_lock:
+            # commit → observe (resume 要求の判定を含む) → scheduler.tick()
+            # を 1 つの lock 区間にまとめる — `data resume` が書いた要求は、
+            # 必ずこの tick の commit 直後の watermark を使って判定される。
+            # ingest 側の例外はここでも握って activity に書き、
+            # scheduler.tick() は資金保護のため必ず走らせる。
+            if app.ingest is not None and ingest_result is not None:
+                # prepare() が例外を投げた tick は commit/observe を行わない
+                # (元の挙動どおり — 対応する report が無いまま watermark を
+                # 進めたり observe したりしない)。
+                try:
+                    app.ingest.commit(app.conn_core)
+                    if app.outage is not None:
+                        app.outage.observe(now, ingest_result)
+                except Exception as exc:  # noqa: BLE001 -- protection must still tick
+                    _log.warning("ingest commit failed: %s", safe_error_text(exc))
+                    try:
+                        app.activity.write(Category.SYSTEM, "ingest_commit_failed",
+                                           safe_error_text(exc))
+                    except Exception:  # noqa: BLE001 -- activity cannot stop protection
+                        _log.exception("failed to record ingest commit failure")
+            with app.executor.defer_notifications() as deferred:
+                pending = app.scheduler.tick(now)
     finally:
         for text in deferred:
             try:

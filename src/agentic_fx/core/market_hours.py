@@ -56,6 +56,25 @@ def next_rollover(now: datetime) -> datetime:
     return boundary
 
 
+def next_expected_trading_time(after: datetime, width: timedelta) -> datetime:
+    """``after`` の次に確定するはずの足の開始時刻 (既知の休場を飛ばす)。
+
+    価格源の連続性・不通を判定する側は「固定 `width` 間隔で穴が無いか」を
+    見ると週末・12/25・1/1 の既知の休場を欠落と誤判定する。休場かどうかは
+    `is_market_open` が判定できるので、この関数はそれを踏まえた「次に期待
+    される取引時刻」を返す。
+
+    休場中は `next_rollover` (21:00 UTC 境界) で一気に飛ばす — 1 分刻みで
+    ループすると週末で最大 2880 回の反復になるため、既知の境界へジャンプする
+    実装にする。
+    """
+    after = _as_utc(after)
+    candidate = after + width
+    while not is_market_open(candidate):
+        candidate = next_rollover(candidate)
+    return candidate
+
+
 def is_friday_after(now: datetime, cutoff_hhmm: str) -> bool:
     """NY金曜の設定cutoff以降か。
 

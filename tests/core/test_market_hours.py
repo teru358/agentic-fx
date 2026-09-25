@@ -3,7 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.core.market_hours import (
-    is_friday_after, is_market_open, next_rollover, trading_day_start,
+    is_friday_after, is_market_open, next_expected_trading_time,
+    next_rollover, trading_day_start,
 )
 
 
@@ -157,3 +158,32 @@ def test_naive_datetime_rejected():
 
     with pytest.raises(ValueError, match="timezone-aware"):
         is_friday_after(naive, "18:00")
+
+
+def test_next_expected_trading_time_ordinary_weekday_is_just_after_width():
+    after = _dt(2026, 9, 24, 9, 59)  # Thursday
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 9, 24, 10, 0)
+
+
+def test_next_expected_trading_time_skips_the_weekend_gap():
+    # 金 20:59 の次の 1m 足は週末を飛ばして日 21:00 になる
+    after = _dt(2026, 7, 24, 20, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 7, 26, 21, 0)
+
+
+def test_next_expected_trading_time_skips_the_dec25_holiday():
+    # 2025 年は 12/25 が木曜 (週末と重ならない孤立した祝日) — 純粋な祝日区間の検証
+    after = _dt(2025, 12, 24, 20, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 12, 25, 21, 0)
+
+
+def test_next_expected_trading_time_skips_the_jan1_holiday():
+    # 2025 年は 1/1 が水曜 (週末と重ならない孤立した祝日)
+    after = _dt(2024, 12, 31, 20, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 1, 1, 21, 0)
+
+
+def test_next_expected_trading_time_holiday_merged_with_weekend_extends_through_it():
+    # 2026 年は 12/25 が金曜 — 祝日と週末が連続し、日曜 21:00 まで一体で閉場する
+    after = _dt(2026, 12, 24, 20, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 12, 27, 21, 0)

@@ -36,6 +36,10 @@ _EXPOSURE = (S.OPEN, S.PENDING_FILL, S.PROTECTION_PENDING, S.SUBMITTING,
 _UNKNOWN = (S.SUBMIT_UNKNOWN, S.CANCEL_UNKNOWN, S.CLOSE_UNKNOWN, S.CLOSING)
 
 
+def _always_ready() -> str:
+    return "ready"
+
+
 def open_risk_and_notional(
         conn: sqlite3.Connection, spec_fn: Callable[[str], InstrumentSpec],
         risk, rate_fn: Callable[[str], ConversionRate],
@@ -184,6 +188,7 @@ class Executor:
                  quote_fn: Callable[[str], Quote],
                  spec_fn: Callable[[str], InstrumentSpec],
                  rate_fn: RateFn,
+                 state_fn: Callable[[], str] = _always_ready,
                  ) -> None:
         self.conn = conn
         self.broker = broker
@@ -199,6 +204,10 @@ class Executor:
         self.monotonic_fn = monotonic_fn
         self.quote_fn = quote_fn
         self.spec_fn = spec_fn
+        # `app.outage` (OutageStateMachine) の観測結果を受け取る注入点
+        # (Scheduler の state_fn と同じ流儀)。既定は常に "ready" (既存
+        # 呼び出し元・テストは無改変で動く)。
+        self.state_fn = state_fn
         # 通貨 1 単位 = 口座通貨いくらか (設計書 §5)。quote_fn/spec_fn と同じ
         # 注入点の作法 (PriceProvider.to_account_rate を呼び出し側が
         # account_currency/max_skew_min を束縛して渡す想定)。
@@ -488,6 +497,17 @@ class Executor:
 
     def _open(self, intent: TradeIntent, iid: int) -> dict:
         now = self.clock.now()
+        # quote 取得・GateContext 構築より前に fail closed する — 不通中は
+        # 新規成行 open (新規の drawdown/kill switch 判定を含む) を一切
+        # 行わない。
+        if self.state_fn() != "ready":
+            reasons = ["data source degraded (fail closed)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
         quote = self.quote_fn(intent.pair)
         spec = self.spec_fn(intent.pair)
         account = accounting.current_account(self.conn, now)

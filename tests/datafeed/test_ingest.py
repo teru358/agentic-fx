@@ -30,12 +30,14 @@ def test_cold_fill_is_once_per_native_key_and_commit_is_separate(tmp_path):
                     else NOW.replace(minute=59, hour=11), 1, 1, 1, 1, 1)]
 
     ingest = Ingest(_settings(), fetch=fetch)
-    assert ingest.prepare(NOW, conn) == 2
+    count, _ = ingest.prepare(NOW, conn)
+    assert count == 2
     assert {call[1] for call in calls} == {"1m", "1h"}
     assert load_cache_bars(conn, "USDJPY", "1m", source="yfinance") == []
     assert ingest.commit(conn) == 2
     assert len(load_cache_bars(conn, "USDJPY", "1m", source="yfinance")) == 1
-    assert ingest.prepare(NOW, conn) == 0
+    count, _ = ingest.prepare(NOW, conn)
+    assert count == 0
     conn.close()
 
 
@@ -51,10 +53,14 @@ def test_failure_retries_once_next_tick_and_empty_response_backs_off(tmp_path):
         return []
 
     ingest = Ingest(_settings(), fetch=fetch)
-    assert ingest.prepare(NOW, conn) == 2
-    assert ingest.prepare(NOW + timedelta(seconds=1), conn) == 1
-    assert ingest.prepare(NOW + timedelta(seconds=2), conn) == 1
-    assert ingest.prepare(NOW + timedelta(seconds=4), conn) == 1
+    count, _ = ingest.prepare(NOW, conn)
+    assert count == 2
+    count, _ = ingest.prepare(NOW + timedelta(seconds=1), conn)
+    assert count == 1
+    count, _ = ingest.prepare(NOW + timedelta(seconds=2), conn)
+    assert count == 1
+    count, _ = ingest.prepare(NOW + timedelta(seconds=4), conn)
+    assert count == 1
     assert all(timeout > 0 for _, timeout in calls)
     conn.close()
 
@@ -65,9 +71,11 @@ def test_closed_market_and_request_cap_make_no_excess_requests(tmp_path):
     calls = []
     ingest = Ingest(_settings(), fetch=lambda *args, **kwargs: calls.append(args) or [])
     saturday = datetime(2026, 9, 19, 12, 0, tzinfo=timezone.utc)
-    assert ingest.prepare(saturday, conn) == 0
+    count, _ = ingest.prepare(saturday, conn)
+    assert count == 0
     assert calls == []
-    assert ingest.prepare(NOW, conn) == 2
+    count, _ = ingest.prepare(NOW, conn)
+    assert count == 2
     assert ingest.last_request_count <= len(ingest.keys)
     conn.close()
 
@@ -178,4 +186,55 @@ def test_next_probe_is_the_next_bar_close_not_fetch_time_plus_interval(tmp_path)
     ingest.prepare(later, conn)
     assert "1h" in calls
     assert later < ingest.next_probe_at[("USDJPY", "1h")] <= later + timedelta(hours=1)
+    conn.close()
+
+
+def test_report_marks_budget_deferred_decision_key_as_not_attempted(tmp_path):
+    """budget 切れで持ち越した判断足 key は report.deferred に載り、
+    report.attempted には含まれない (まだ試みていないため)。"""
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    settings = _settings()
+    settings.pairs = ["USDJPY", "EURUSD"]
+    settings.datafeed.primary_intervals = ["1h"]
+    settings.datafeed.ingest_budget_sec = 1
+    elapsed = [0.0]
+
+    def fetch(pair, interval, start, end, *, timeout):
+        elapsed[0] += 2.0  # 1 回で budget を使い切る
+        return []
+
+    ingest = Ingest(settings, fetch=fetch, monotonic=lambda: elapsed[0])
+    count, report = ingest.prepare(NOW, conn)
+    assert ("EURUSD", "1h") in report.deferred
+    assert ("EURUSD", "1h") not in report.attempted
+    assert ("EURUSD", "1h") not in report.succeeded
+    assert ("EURUSD", "1h") not in report.failed
+    conn.close()
+
+
+def test_report_excludes_backoff_waiting_key_from_every_set(tmp_path):
+    """backoff 待ち (next_probe_at がまだ先) の key はどの集合にも現れない
+    (「not-attempted」の契約)。"""
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    settings = _settings()
+
+    def fetch(pair, interval, start, end, *, timeout):
+        return [Bar(pair, interval, NOW.replace(minute=0, hour=11) if interval == "1h"
+                    else NOW.replace(minute=59, hour=11), 1, 1, 1, 1, 1)]
+
+    ingest = Ingest(settings, fetch=fetch)
+    ingest.prepare(NOW, conn)
+    ingest.commit(conn)
+    # 直後 (next_probe_at がまだ先) にもう一度 prepare すると、両方の key が
+    # backoff 待ちで probe されない
+    count, report = ingest.prepare(NOW + timedelta(seconds=1), conn)
+    assert count == 0
+    for key in (("USDJPY", "1m"), ("USDJPY", "1h")):
+        assert key not in report.attempted
+        assert key not in report.succeeded
+        assert key not in report.failed
+        assert key not in report.deferred
+        assert key not in report.empty
     conn.close()

@@ -35,7 +35,7 @@ def test_table_names_include_candidate_archives():
         "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
         "alert_state", "improve_waves", "improve_wave_slots",
         "plugin_switch_journal",
-        "candidate_archives",
+        "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     })
 
 
@@ -327,3 +327,53 @@ def test_fresh_and_migrated_backtest_runs_have_same_columns(tmp_path):
                 for r in conn.execute("PRAGMA table_info(backtest_runs)")]
 
     assert shape(migrated) == shape(fresh)
+
+
+def test_datafeed_outage_state_recovered_notified_epoch_column_added_via_ensure_column(
+        tmp_path):
+    """`recovered_notified_epoch` 列を持たない旧 `datafeed_outage_state`
+    (列追加前の DDL) に既存行を INSERT しておき、`init_db` を通した後に
+    列が追加され、既存行は NULL のまま読めることを pin する。"""
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "t.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.execute("""
+        CREATE TABLE datafeed_outage_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          state TEXT NOT NULL,
+          epoch INTEGER NOT NULL DEFAULT 0,
+          confirmed INTEGER NOT NULL DEFAULT 0,
+          entered_degraded_at TEXT,
+          ready_streak INTEGER NOT NULL DEFAULT 0,
+          pending_human_confirmation INTEGER NOT NULL DEFAULT 0,
+          resume_requested_at TEXT,
+          resume_acknowledge INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        )
+    """)
+    legacy.execute(
+        "INSERT INTO datafeed_outage_state (id, state, epoch, confirmed, "
+        "updated_at) VALUES (1, 'degraded', 3, 1, '2026-01-01T00:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    conn = connect(db_path)
+    init_db(conn)  # ALTER TABLE ... ADD COLUMN recovered_notified_epoch
+
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(datafeed_outage_state)")}
+    assert "recovered_notified_epoch" in cols
+    row = conn.execute(
+        "SELECT state, epoch, recovered_notified_epoch FROM "
+        "datafeed_outage_state WHERE id=1").fetchone()
+    assert row["state"] == "degraded"
+    assert row["epoch"] == 3
+    assert row["recovered_notified_epoch"] is None
+
+    init_db(conn)  # 2 回目 (再起動相当) — ALTER TABLE で例外が出たら red
+    assert conn.execute(
+        "SELECT recovered_notified_epoch FROM datafeed_outage_state "
+        "WHERE id=1").fetchone()["recovered_notified_epoch"] is None

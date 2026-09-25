@@ -20,6 +20,12 @@ from agentic_fx.store import ohlcv, orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
+
+
+def _always_ready() -> str:
+    return "ready"
+
+
 _NEWS_INTERVAL = timedelta(minutes=30)
 # 経済指標カレンダーは **週次** の JSON なので 30 分ごとに取り直しても無駄。
 # ただし当日の forecast/previous は更新されうるので 1 日 1 回よりは細かく。
@@ -51,7 +57,8 @@ class Scheduler:
                  on_improve_tick: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
                  stop_event: threading.Event | None = None,
-                 bar_freshness: timedelta = _BAR_FRESHNESS) -> None:
+                 bar_freshness: timedelta = _BAR_FRESHNESS,
+                 state_fn: Callable[[], str] = _always_ready) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -89,6 +96,12 @@ class Scheduler:
         self.signal_due_fn = signal_due_fn
         self._stop_event = stop_event
         self.bar_freshness = bar_freshness
+        # `app.outage` (OutageStateMachine) の観測結果を Scheduler へ
+        # 注入する。Scheduler 自身は outage を知らない (signal_due_fn と
+        # 同じ流儀の注入点) — 既定は常に "ready" (既存呼び出し元・テストは
+        # 無改変で動く)。"ready" 以外の間、新規判断 mission (cron/signal)・
+        # signal maintenance・新規ペーパー約定を止める。
+        self.state_fn = state_fn
         self._cron_watermarks: dict[tuple[str, str], datetime] = {}
         self._pending_cron_watermarks: dict[tuple[str, str], datetime] = {}
         self._warned_regressed_cron_watermarks: set[tuple[str, str]] = set()
@@ -143,7 +156,15 @@ class Scheduler:
                 if self._was_open is not False:
                     self._on_market_close(now)
                 self._was_open = False
-                self._baseline_cron_watermarks(now)
+                # state_fn() が "ready" のときだけ cursor を最新確定足まで
+                # 進める。degraded 中に閉場を迎えた場合、gate でまだ未
+                # submit の判断足まで cursor を進めてしまうと、resume 後
+                # 最初の開場 tick で cron mission が (その足はもう
+                # 「baseline 済み」扱いになり) 発火しなくなる。degraded 中は
+                # cursor を保持し、resume 後の最初の開場 tick で最新確定足
+                # の mission を 1 回発火させる (coalesce)。
+                if self.state_fn() == "ready":
+                    self._baseline_cron_watermarks(now)
                 return pending
             self._was_open = True
             self._observe_closed_bar_availability(now)
@@ -209,7 +230,12 @@ class Scheduler:
                     _log.warning("maintain_reservations failed: %s", text)
                     fills_allowed = False
             self._force_close_day(now)
-            filled_ids = self._process_limit_fills(now) if fills_allowed else set()
+            # 新規ペーパー約定 (指値到達) は state != "ready" の間止める —
+            # 既存 OPEN の SL/TP 判定 (_process_exits) はここでは止めない
+            # (資金保護は継続)。
+            filled_ids = (self._process_limit_fills(now)
+                         if fills_allowed and self.state_fn() == "ready"
+                         else set())
             self._process_exits(now, filled_ids)
         finally:
             self._run_hooks(now)
@@ -258,7 +284,9 @@ class Scheduler:
         if self._last_econ is None or now - self._last_econ >= _ECON_INTERVAL:
             self._last_econ = now
             self._run_data_hook("econ", self.on_econ_cycle)
-        if self.on_signal_maintenance is not None:
+        # signal maintenance (producer 評価 = signal 生成) だけを outage
+        # gate する。news/econ/cache maintenance は継続 (価格源不通と無関係)。
+        if self.on_signal_maintenance is not None and self.state_fn() == "ready":
             self._run_data_hook(
                 "signal_maintenance", lambda: self.on_signal_maintenance(now))
         if self.on_cache_maintenance is not None:
@@ -290,7 +318,20 @@ class Scheduler:
         `signal_due_fn` 自体の例外は「起動しない」に倒す (fail-open だが
         tick は殺さない) — 判定失敗が資金保護より後段の Mission 起動判断
         1 件を諦めるだけで済むようにする。
+
+        **[outage-stop-and-backfill]**: 最前段で
+        `state_fn() != "ready"` なら cron/signal のどちらも起動しない。
+        `_latest_cron_watermarks` 自体を呼ばない (呼ぶだけなら副作用は
+        無いが、下の cursor 前進判定に一切触れないことを明示するため) —
+        `_cron_watermarks` (受理時だけ前進する cursor) は
+        `_advance_cron_watermarks` 経由でしか書き換わらないので、ここで
+        `return None` するだけで cursor は自動的に停止する。`ready` に
+        戻った同一 tick では、それまで停止していた cursor に対し進んだ
+        watermark が一度に見えるため、B-1 の coalesce (最新の確定足 1 本)
+        がそのまま働く。
         """
+        if self.state_fn() != "ready":
+            return None
         latest = self._latest_cron_watermarks(now)
         self._pending_cron_watermarks = latest
         advanced = False
@@ -318,10 +359,15 @@ class Scheduler:
         interval = self.settings.datafeed.decision_timeframe
         width = self.settings.datafeed.decision_timeframe_width
         grace = timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec)
+        # primary から導出した storage source で絞る。別 source (readonly
+        # healthcheck 経由の yfinance 等) の残存行を cron 起動の根拠にしない。
+        source = ("mt5-live" if self.settings.datafeed.primary == "mt5"
+                  else self.settings.datafeed.primary)
         latest: dict[tuple[str, str], datetime] = {}
         for pair in self.settings.pairs:
             bar_time = ohlcv.latest_closed_cache_bar_time(
-                self.conn, pair, interval, now=now, width=width, grace=grace)
+                self.conn, pair, interval, now=now, width=width, grace=grace,
+                source=source)
             if bar_time is not None:
                 latest[(pair, interval)] = bar_time
         return latest
