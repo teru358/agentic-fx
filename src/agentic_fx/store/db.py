@@ -349,6 +349,20 @@ CREATE TABLE IF NOT EXISTS datafeed_outage_gap (
   replay_through TEXT,
   PRIMARY KEY (pair, interval, epoch)
 );
+CREATE TABLE IF NOT EXISTS cron_cursor (
+  pair TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  bar_time TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (pair, interval)
+);
+CREATE TABLE IF NOT EXISTS mission_decision_bars (
+  mission_id INTEGER NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+  pair TEXT NOT NULL,
+  interval TEXT NOT NULL,
+  bar_time TEXT NOT NULL,
+  PRIMARY KEY (mission_id, pair, interval)
+);
 """ + _IMPROVE_WAVES_DDL + _IMPROVE_WAVE_SLOTS_DDL + _PLUGIN_SWITCH_JOURNAL_DDL + _PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL
 
 TABLE_NAMES = frozenset({
@@ -358,6 +372,7 @@ TABLE_NAMES = frozenset({
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+    "cron_cursor", "mission_decision_bars",
 })
 
 

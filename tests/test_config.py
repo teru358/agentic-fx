@@ -451,6 +451,19 @@ def test_decision_timeframe_contract(decision_timeframes, expected, error):
         }[expected]
 
 
+@pytest.mark.parametrize("decision", ["4h", "1d"])
+def test_derived_only_decision_timeframe_is_rejected(decision):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"].pop("primary_intervals")
+    raw["schedule"].pop("trade_interval_min")
+    raw["datafeed"]["decision_timeframes"] = [decision]
+    with pytest.raises(ValidationError, match="派生専用") as exc:
+        Settings.model_validate(raw)
+    assert "[1h]" in str(exc.value)
+
+
 @pytest.mark.parametrize(
     ("decision", "trade_interval_min", "primary_intervals", "error"),
     [
@@ -924,3 +937,15 @@ def test_settings_round_trip_through_model_dump_keeps_decision_timeframe(tmp_pat
     second = Settings.model_validate(first.model_dump())
     assert second.datafeed.decision_timeframe == "15m"
     assert second.datafeed.primary_intervals == ["15m"]
+
+
+@pytest.mark.parametrize("value", [0, -1.0])
+def test_dispatch_ceiling_sec_must_be_positive(value):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["worker"]["dispatch_ceiling_sec"] = value
+    with pytest.raises(ValidationError, match="dispatch_ceiling_sec"):
+        Settings.model_validate(raw)
+    raw["worker"]["dispatch_ceiling_sec"] = 1800.0
+    assert Settings.model_validate(raw).worker.dispatch_ceiling_sec == 1800.0

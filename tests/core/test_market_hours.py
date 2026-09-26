@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agentic_fx.core import market_hours
 from agentic_fx.core.market_hours import (
     is_friday_after, is_market_open, next_expected_trading_time,
     next_rollover, trading_day_start,
@@ -187,3 +188,37 @@ def test_next_expected_trading_time_holiday_merged_with_weekend_extends_through_
     # 2026 年は 12/25 が金曜 — 祝日と週末が連続し、日曜 21:00 まで一体で閉場する
     after = _dt(2026, 12, 24, 20, 59)
     assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 12, 27, 21, 0)
+
+
+_U = timezone.utc
+
+
+@pytest.mark.parametrize(("now", "expected"), [
+    # 週中 → 直前の日曜 21:00
+    (datetime(2026, 9, 24, 12, 0, tzinfo=_U), datetime(2026, 9, 20, 21, 0, tzinfo=_U)),
+    # 開場の瞬間はその境界自身
+    (datetime(2026, 9, 27, 21, 0, tzinfo=_U), datetime(2026, 9, 27, 21, 0, tzinfo=_U)),
+    # 金曜 20:59:59 はまだ同じセッション
+    (datetime(2026, 9, 25, 20, 59, 59, tzinfo=_U), datetime(2026, 9, 20, 21, 0, tzinfo=_U)),
+    # 祝日 (2025-12-25 木) が週末と連結しない: 祝日明けの 21:00
+    (datetime(2025, 12, 26, 12, 0, tzinfo=_U), datetime(2025, 12, 25, 21, 0, tzinfo=_U)),
+    # 2026-12-25 (金) は週末と連結: 金 21:00 ではなく日 27 21:00
+    (datetime(2026, 12, 28, 12, 0, tzinfo=_U), datetime(2026, 12, 27, 21, 0, tzinfo=_U)),
+    # 2027-01-01 (金) も連結: 日 2027-01-03 21:00
+    (datetime(2027, 1, 4, 12, 0, tzinfo=_U), datetime(2027, 1, 3, 21, 0, tzinfo=_U)),
+])
+def test_session_start_is_last_closed_to_open_transition(now, expected):
+    assert market_hours.session_start(now) == expected
+
+
+def test_session_start_from_inside_joined_closure_is_previous_open():
+    """閉場中 (2026-12-31 21:00 〜 2027-01-03 21:00 の連結閉場の途中) に
+    呼ぶと、閉場中の境界ではなく直前の開場遷移 (日 2026-12-27 21:00) を返す。"""
+    now = datetime(2027, 1, 2, 12, 0, tzinfo=_U)
+    assert market_hours.session_start(now) == datetime(2026, 12, 27, 21, 0, tzinfo=_U)
+
+
+def test_session_start_raises_when_no_transition_is_found(monkeypatch):
+    monkeypatch.setattr(market_hours, "is_market_open", lambda now: False)
+    with pytest.raises(ValueError, match="no closed-to-open transition"):
+        market_hours.session_start(datetime(2026, 9, 24, 12, 0, tzinfo=_U))

@@ -16,10 +16,20 @@ class _Notifier:
     def send(self, message): pass
 
 
-def _minimal_app():
-    class Worker: worker_grace_sec = 3.0; worker_terminate_grace_sec = 2.0
+def _minimal_app(*, backend="local", dispatch_ceiling_sec=None):
+    class Worker:
+        worker_grace_sec = 3.0
+        worker_terminate_grace_sec = 2.0
+        worker_startup_timeout_sec = 4.0
+        rpc_timeout_sec = 1.0
+    Worker.dispatch_ceiling_sec = dispatch_ceiling_sec
     class Llama: timeout_sec = 42.0
-    class Settings: worker = Worker(); llama_swap = Llama()
+    class Trade: pass
+    Trade.backend = backend
+    class Runner:
+        trade = Trade()
+        cli_terminate_grace_sec = 7.0
+    class Settings: worker = Worker(); llama_swap = Llama(); runner = Runner()
     class Supervisor:
         heartbeat = time.monotonic()
         busy_since = None
@@ -45,16 +55,17 @@ def test_record_fatal_preserves_first_reason_and_sets_stop():
 
 
 def test_dispatch_ceiling_formula():
-    """裁定 B: ceiling は trade 1 回 + reflection 最大 3 回を包含する。
+    """ceiling は Cd (trade 1 回 + reflection 最大 3 回、worker 1 回の上限 Cw
+    の 4 倍 + 余白 10) + watchdog 余裕 60。明示設定があればそれを使う。
 
-    (レビュー1周目 I-3) 旧 `test_dispatch_ceiling_and_join_budget_share_same_
-    lower_bound` は `_default_dispatch_ceiling_sec` を 2 回呼んで比較する
-    **完全な恒真テスト**だった (実装をどう壊しても検出しない)。順序関係の
-    ピンは `test_watchdog_uses_a_ceiling_not_larger_than_the_join_budget`
-    が担う。
+    Cw = 起動待ち 4 + deadline (42+3) + SIGTERM 猶予 2 + kill wait 5 + 再実行 5
+         + reader.join 5 + dispatcher.join (1+5) = 72
     """
-    app = _minimal_app()
-    assert _default_dispatch_ceiling_sec(app) == (42.0 + 3.0 + 2.0) * 4 + 60.0
+    assert _default_dispatch_ceiling_sec(_minimal_app()) == 72.0 * 4 + 10.0 + 60.0
+    assert _default_dispatch_ceiling_sec(_minimal_app(backend="claude")) == \
+        (72.0 + 7.0) * 4 + 10.0 + 60.0
+    assert _default_dispatch_ceiling_sec(
+        _minimal_app(dispatch_ceiling_sec=500.0)) == 500.0
 
 
 def test_record_fatal_sets_stop_even_if_activity_write_raises():

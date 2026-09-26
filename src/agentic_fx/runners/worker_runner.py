@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.mission_ceiling import (DISPATCHER_JOIN_MARGIN_SEC, KILL_WAIT_SEC, READER_JOIN_SEC)
 from agentic_fx.core.mission_protocol import (
     ProtocolError, SeqTracker, read_frame, write_frame,
 )
@@ -614,7 +615,7 @@ class WorkerRunner(AgentRunner):
             self._ensure_dead(proc, w)
             if "pgid" in cli_pgid_holder:
                 self._terminate_cli_pgid(cli_pgid_holder["pgid"])
-            reader.join(timeout=5.0)
+            reader.join(timeout=READER_JOIN_SEC)
             # IM-7 対応: dispatcher は `with stdin_lock: write_frame(proc.stdin,
             # ...)` を実行し得る (tool_rpc_result 応答の送出中)。ここで
             # stdin_lock の外から proc.stdin.close() すると、dispatcher が
@@ -627,7 +628,7 @@ class WorkerRunner(AgentRunner):
             # する — 有界待ち)。
             dispatcher_timeout_sec = max(
                 [w.rpc_timeout_sec, *self._rpc_timeout_sec_by_kind.values()])
-            dispatcher.join(timeout=dispatcher_timeout_sec + 5.0)
+            dispatcher.join(timeout=dispatcher_timeout_sec + DISPATCHER_JOIN_MARGIN_SEC)
             with stdin_lock:
                 stdin_state["closed"] = True
                 try:
@@ -707,7 +708,7 @@ class WorkerRunner(AgentRunner):
         except (ProcessLookupError, PermissionError, OSError):
             pass
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=KILL_WAIT_SEC)
         except subprocess.TimeoutExpired:
             pass
 

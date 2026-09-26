@@ -14,6 +14,7 @@ EXPECTED = {
     "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+    "cron_cursor", "mission_decision_bars",
 }
 
 

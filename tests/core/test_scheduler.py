@@ -16,6 +16,7 @@ from agentic_fx.core.executor import Executor, has_unresolved_unknown
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.store import missions, orders
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
@@ -104,10 +105,10 @@ class Env:
         if seed_cron_bar:
             _seed_decision_bar(self, base - timedelta(hours=1, seconds=30))
 
-    def _trade(self, reason):
+    def _trade(self, reason, **_kwargs):
         self.trade_calls += 1
         self.trade_reasons.append(reason)
-        return True  # プラン 8 Task 13: on_trade_mission は bool を返す (accepted/rejected)
+        return SubmitResult.accepted_with(None, checked_at=0.0)
 
     def _news(self):
         self.news_calls += 1
@@ -186,14 +187,14 @@ def test_cron_watermark_grace_pair_aggregation_and_busy_coalesce(tmp_path):
     env.sched.tick(WED + timedelta(hours=1, seconds=30))
     assert env.trade_reasons == ["cron", "cron"]
 
-    env._trade = lambda reason: False
+    env._trade = lambda reason, **_: SubmitResult.rejected("running", checked_at=0.0)
     env.sched.on_trade_mission = env._trade
     _seed_decision_bar(env, WED + timedelta(hours=1))
     env.sched.tick(later)
     _seed_decision_bar(env, WED + timedelta(hours=2))
     env.sched.tick(WED + timedelta(hours=3, minutes=31))
     assert env.trade_reasons == ["cron", "cron"]
-    env.sched.on_trade_mission = lambda reason: env.trade_reasons.append(reason) or True
+    env.sched.on_trade_mission = lambda reason, **_: env.trade_reasons.append(reason) or SubmitResult.accepted_with(None, checked_at=0.0)
     env.sched.tick(WED + timedelta(hours=3, minutes=32))
     assert env.trade_reasons == ["cron", "cron", "cron"]
     assert env.sched._cron_watermarks[("USDJPY", "1h")] == WED + timedelta(hours=2)
@@ -303,15 +304,18 @@ def test_cron_none_pair_recovers_and_closed_restart_only_baselines(tmp_path):
     assert env.trade_reasons == ["cron"]
 
 
-def test_open_restart_runs_latest_watermark_once(tmp_path):
+def test_open_restart_restores_cursor_and_does_not_rerun_latest_watermark(tmp_path):
     env = Env(tmp_path, seed_cron_bar=False)
     _seed_decision_bar(env, WED - timedelta(hours=1, seconds=30))
     env.sched.tick(WED)
     assert env.trade_reasons == ["cron"]
     restarted = Env(tmp_path, seed_cron_bar=False)
     restarted.sched.tick(WED)
-    assert restarted.trade_reasons == ["cron"]
+    assert restarted.trade_reasons == []
     restarted.sched.tick(WED + timedelta(minutes=10))
+    assert restarted.trade_reasons == []
+    _seed_decision_bar(restarted, WED)
+    restarted.sched.tick(WED + timedelta(hours=1, seconds=30))
     assert restarted.trade_reasons == ["cron"]
 
 
@@ -2933,7 +2937,7 @@ def test_maintain_reservations_span_min_not_committed_misses_old_then_new_violat
 
 def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
     """プラン 8 (Task 13): on_trade_mission が例外を送出する場合、
-    on_trade_mission は True を返さないため、watermark cursor は前進しない。
+    on_trade_mission は SubmitResult.accepted を返さないため、watermark cursor は前進しない。
     これは新しい意図的な設計 — supervisor が busy の場合と同じく、締切を
     維持して次 tick で再試行する (Task 13 で on_trade_mission の戻り値型が
     None -> bool に変わった — 例外を出す場合は True を返さないため、
@@ -2941,7 +2945,7 @@ def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
     env = Env(tmp_path)
     calls: list[str] = []
 
-    def boom(reason):
+    def boom(reason, **_kwargs):
         calls.append(reason)
         raise RuntimeError("mission callback failed")
 
@@ -2962,10 +2966,10 @@ def test_cron_deadline_does_not_advance_when_mission_callback_raises(tmp_path):
 
 def test_cron_deadline_only_advances_when_on_trade_mission_returns_true(tmp_path):
     """設計書 §3.3: cron 締切の前進は on_trade_mission (supervisor.
-    try_submit の結果) が True (受理) のときだけ。busy (False) なら
+    try_submit の結果) が SubmitResult.accepted のときだけ。busy (拒否) なら
     締切は維持され次 tick 以降で必ず再試行される。"""
     env = Env(tmp_path)
-    env.sched.on_trade_mission = lambda reason: False  # busy を模す
+    env.sched.on_trade_mission = lambda reason, **_: SubmitResult.rejected("running", checked_at=0.0)  # busy を模す
     _seed_decision_bar(env, WED)
 
     env.sched.tick(WED)
@@ -3115,17 +3119,16 @@ def test_closed_tick_baselines_cursor_only_when_state_is_ready(tmp_path):
     # データ側は復旧し resume (市場はまだ閉場中)。
     state["v"] = "ready"
 
-    # 日曜 22:xx UTC (開場後) の tick で、degraded 中に確定していた判断足の
-    # mission が 1 回だけ submit される。
+    # 日曜 22:xx UTC (開場後) の tick: degraded 中に確定していた判断足は
+    # 前セッションの足なので mission は起こさず、cursor だけその足まで進める。
     env.sched.tick(opened)
-    assert env.trade_calls == 1
-    assert env.trade_reasons == ["cron"]
+    assert env.trade_calls == 0
     assert env.sched._cron_watermarks[("USDJPY", "1h")] == (
         FRI - timedelta(hours=1, seconds=30))
 
-    # coalesce: 同じ足のままもう一度開場 tick を打っても再発火しない。
+    # 同じ足のままもう一度開場 tick を打っても発火しない。
     env.sched.tick(opened + timedelta(minutes=1))
-    assert env.trade_calls == 1
+    assert env.trade_calls == 0
 
 
 def test_closed_tick_baselines_cursor_when_state_stays_ready(tmp_path):

@@ -5,7 +5,8 @@ import logging
 import re
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from types import MappingProxyType
 from typing import Callable
 from zoneinfo import ZoneInfo
 
@@ -16,7 +17,8 @@ from agentic_fx.core import accounting, market_hours, transitions
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
-from agentic_fx.store import ohlcv, orders
+from agentic_fx.core.supervisor import SubmitResult
+from agentic_fx.store import cron_cursor, ohlcv, orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
@@ -49,7 +51,7 @@ class Scheduler:
                  settings: Settings, state_store: StateStore,
                  activity: ActivityLog,
                  bars_fn: Callable[[str], Bar | None],
-                 on_trade_mission: Callable[[str], bool],
+                 on_trade_mission: Callable[..., SubmitResult],
                  on_news_cycle: Callable[[], None],
                  on_econ_cycle: Callable[[], None],
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
@@ -104,12 +106,28 @@ class Scheduler:
         self.state_fn = state_fn
         self._cron_watermarks: dict[tuple[str, str], datetime] = {}
         self._pending_cron_watermarks: dict[tuple[str, str], datetime] = {}
-        self._warned_regressed_cron_watermarks: set[tuple[str, str]] = set()
+        self._cron_hold: set[tuple[str, str]] = set()
+        # その tick に「前進した」(W > L) pair だけの確定足。見送り・合流の
+        # 記録と (受理時の) provenance に使う。
+        self._due_cron_watermarks: dict[tuple[str, str], datetime] = {}
+        # cron_mission_deferred を書いた (pair, interval, bar_time)。
+        # 同じ watermark の見送りは 1 回だけ書く。受理で空に戻す。
+        self._cron_deferred_logged: set[tuple[str, str, datetime]] = set()
         self._last_news: datetime | None = None
         self._last_econ: datetime | None = None
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
         self._closed_bar_unavailable_pairs: set[str] = set()
+        # 永続化に失敗した (pair, interval)。同一プロセスが生きている間は
+        # tick の finally で再試行する (at-least-once)。
+        self._dirty_cron_cursor: set[tuple[str, str]] = set()
+        # tick ごとに tick() の冒頭で空集合にリセットし、(pair, interval)
+        # ごとに記録した時点でその key を追加する (tick ローカルの集合)。
+        # `now` の値同士を比べると、同一 `now` で tick が 2 回呼ばれた場合に
+        # 2 回目が無音になる。単一の bool にすると、同じ tick 内で複数
+        # pair が失敗したとき 2 件目以降が無音になる。
+        self._cron_cursor_failure_logged_this_tick: set[tuple[str, str]] = set()
+        self._restore_cron_cursor()
 
     def tick(self, now: datetime) -> list[Callable[[], None]]:
         """1 tick 分の決定論的処理。
@@ -145,6 +163,7 @@ class Scheduler:
         確実に実行される (プラン 8 レビュー修正 F1)。
         """
         pending: list[Callable[[], None]] = []
+        self._cron_cursor_failure_logged_this_tick.clear()
         try:
             open_now = market_hours.is_market_open(now)
             if not open_now:
@@ -238,7 +257,15 @@ class Scheduler:
                          else set())
             self._process_exits(now, filled_ids)
         finally:
-            self._run_hooks(now)
+            # dirty cursor の再試行は `_run_hooks` の成否に
+            # 関係なく必ず走る独立した try/finally にする。`_run_hooks` が
+            # (signal maintenance ゲートの `state_fn()` 等で) 例外を
+            # 送出すると、以前は同じ finally 節内の後続文である
+            # `_retry_dirty_cron_cursor` がスキップされていた。
+            try:
+                self._run_hooks(now)
+            finally:
+                self._retry_dirty_cron_cursor(now)
             # 検収 B2 (2026-08-22): improve tick の発火判定。
             # `on_improve_tick` が None (未配線、Task 9 単独では常にこれ) な
             # ら何も積まない。停止中 (`_stopping()`) も判定のみで発火しない
@@ -255,9 +282,22 @@ class Scheduler:
 
         reason = None if self._stopping() else self._trade_mission_due(now)
         if reason is not None:
-            accepted = self.on_trade_mission(reason)
-            if accepted and reason == "cron":
-                self._advance_cron_watermarks(self._pending_cron_watermarks)
+            # その tick で前進した pair だけの確定足を不変の snapshot にして渡す。
+            # 次 tick で _due_cron_watermarks が上書きされても受理済み mission
+            # が見る値は変わらない。signal 起動では空。
+            snapshot = MappingProxyType(
+                dict(self._due_cron_watermarks) if reason == "cron" else {})
+            result = self.on_trade_mission(reason, decision_bars=snapshot)
+            if reason == "cron":
+                if result.accepted:
+                    previous = dict(self._cron_watermarks)
+                    advanced = self._advance_cron_watermarks(
+                        self._pending_cron_watermarks)
+                    self._cron_deferred_logged.clear()
+                    self._persist_cron_cursor(advanced, now)
+                    self._record_cron_coalesced(previous)
+                else:
+                    self._record_cron_deferred(result)
         return pending
 
     def _stopping(self) -> bool:
@@ -330,20 +370,30 @@ class Scheduler:
         watermark が一度に見えるため、B-1 の coalesce (最新の確定足 1 本)
         がそのまま働く。
         """
+        self._due_cron_watermarks = {}
         if self.state_fn() != "ready":
             return None
+        # [decision-timeframe-b2] I3: 毎 tick、受理判定 (L/W 比較・hold 判定)
+        # の前に永続 L を読み直し、メモリ L と max で合流する。稼働中に別
+        # 接続 (手動 DB 編集等) で cron_cursor が書き換えられても、次 tick
+        # で確実に拾う (upsert 自体が < 0.03ms/tick なので読みも安価)。
+        self._reload_cron_cursor()
         latest = self._latest_cron_watermarks(now)
         self._pending_cron_watermarks = latest
-        advanced = False
+        due: dict[tuple[str, str], datetime] = {}
         for key, watermark in latest.items():
             cursor = self._cron_watermarks.get(key)
+            if cursor is not None and watermark < cursor:
+                self._hold_future_cursor(key, cursor, watermark)
+                continue
+            if key in self._cron_hold:
+                self._release_future_cursor(key, cursor, watermark)
             if cursor is None or watermark > cursor:
-                advanced = True
-            elif watermark < cursor and key not in self._warned_regressed_cron_watermarks:
-                self._warned_regressed_cron_watermarks.add(key)
-                _log.warning("cron watermark regressed for %s %s: %s < %s",
-                             key[0], key[1], watermark.isoformat(), cursor.isoformat())
-        if advanced:
+                due[key] = watermark
+        if due:
+            due = self._drop_previous_session_bars(due, now)
+        self._due_cron_watermarks = due
+        if due:
             return "cron"
         if self.signal_due_fn is not None:
             try:
@@ -361,8 +411,7 @@ class Scheduler:
         grace = timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec)
         # primary から導出した storage source で絞る。別 source (readonly
         # healthcheck 経由の yfinance 等) の残存行を cron 起動の根拠にしない。
-        source = ("mt5-live" if self.settings.datafeed.primary == "mt5"
-                  else self.settings.datafeed.primary)
+        source = self._storage_source()
         latest: dict[tuple[str, str], datetime] = {}
         for pair in self.settings.pairs:
             bar_time = ohlcv.latest_closed_cache_bar_time(
@@ -373,16 +422,164 @@ class Scheduler:
         return latest
 
     def _baseline_cron_watermarks(self, now: datetime) -> None:
-        self._advance_cron_watermarks(self._latest_cron_watermarks(now))
+        advanced = self._advance_cron_watermarks(self._latest_cron_watermarks(now))
+        # 前進した pair だけ書く (閉場中に同じ値を毎 tick 書き直さない)
+        self._persist_cron_cursor(advanced, now)
 
-    def _advance_cron_watermarks(self, latest: dict) -> None:
+    def _advance_cron_watermarks(self, latest: dict) -> list[tuple[str, str]]:
         # cursor は key ごとに単調にしか進めない。別 pair の新しい足で受理した tick に
         # 後退中の pair が混ざっても、その pair の cursor を巻き戻さない (巻き戻すと
         # 元の足が戻ったときに同じ足で再発火する)
+        advanced: list[tuple[str, str]] = []
         for key, bar_time in latest.items():
             cur = self._cron_watermarks.get(key)
             if cur is None or bar_time > cur:
                 self._cron_watermarks[key] = bar_time
+                advanced.append(key)
+        return advanced
+
+    def _storage_source(self) -> str:
+        # primary から導出した storage source。別 source の残存行を cron の
+        # 根拠にしない。
+        return ("mt5-live" if self.settings.datafeed.primary == "mt5"
+                else self.settings.datafeed.primary)
+
+    def _record_cron_deferred(self, result: SubmitResult) -> None:
+        for (pair, interval), bar_time in sorted(self._due_cron_watermarks.items()):
+            marker = (pair, interval, bar_time)
+            if marker in self._cron_deferred_logged:
+                continue
+            self._cron_deferred_logged.add(marker)
+            self.activity.write(
+                Category.SYSTEM, "cron_mission_deferred",
+                f"{pair} {interval} bar={_fmt_bar(bar_time)} "
+                f"busy ({_busy_text(result)})")
+
+    def _record_cron_coalesced(self, previous: dict) -> None:
+        source = self._storage_source()
+        for (pair, interval), bar_time in sorted(self._due_cron_watermarks.items()):
+            prev = previous.get((pair, interval))
+            if prev is None:
+                continue
+            try:
+                rows = ohlcv.load_cache_bars(self.conn, pair, interval,
+                                             source=source, since=prev,
+                                             until=bar_time)
+            except Exception as e:  # noqa: BLE001 — 観測の失敗で受理済みの判断を巻き戻さない
+                _log.warning("coalesced count failed for %s %s: %s",
+                             pair, interval, safe_error_text(e))
+                continue
+            skipped = [row.ts for row in rows if prev < row.ts < bar_time]
+            if skipped:
+                self.activity.write(
+                    Category.SYSTEM, "cron_mission_coalesced",
+                    f"{pair} {interval} accepted={_fmt_bar(bar_time)} "
+                    f"skipped={len(skipped)} "
+                    f"({', '.join(_fmt_bar(t) for t in skipped)})")
+
+    def _drop_previous_session_bars(self, due: dict, now: datetime) -> dict:
+        """`W + 足幅 <= session_start(now)` の足 (前セッションの足) では
+        起動しない。cursor はその足まで進め、1 回だけ記録する。"""
+        session = market_hours.session_start(now)
+        width = self.settings.datafeed.decision_timeframe_width
+        current = {key: bar for key, bar in due.items() if bar + width > session}
+        previous = {key: bar for key, bar in due.items() if bar + width <= session}
+        if previous:
+            self._persist_cron_cursor(self._advance_cron_watermarks(previous), now)
+            for (pair, interval), bar_time in sorted(previous.items()):
+                self.activity.write(
+                    Category.SYSTEM, "cron_previous_session_bar_skipped",
+                    f"{pair} {interval} bar={_fmt_bar(bar_time)} "
+                    f"session_start={_fmt_bar(session)}")
+        return current
+
+    def _restore_cron_cursor(self) -> None:
+        try:
+            restored = cron_cursor.load_all(self.conn)
+        except Exception as e:  # noqa: BLE001 — 空の cursor で起動する (現行どおり最新 1 本で発火)
+            text = safe_error_text(e)
+            _log.warning("cron cursor restore failed: %s", text)
+            self.activity.write(
+                Category.SYSTEM, "cron_cursor_restore_failed",
+                f"{text} — 空の cursor で起動 (最新の確定足 1 本で発火し得る)")
+            return
+        self._cron_watermarks.update(restored)
+
+    def _reload_cron_cursor(self) -> None:
+        """永続 L を読み直し、メモリ L (`_cron_watermarks`) と max で合流
+        する。読み直しに失敗した場合はメモリ L を維持する (fail-safe —
+        `_restore_cron_cursor` の起動時読み込みと同じ方針)。"""
+        try:
+            persisted = cron_cursor.load_all(self.conn)
+        except Exception as e:  # noqa: BLE001 — 読み直しの失敗でメモリ L を維持
+            _log.warning("cron cursor reload failed: %s", safe_error_text(e))
+            return
+        for key, bar_time in persisted.items():
+            cur = self._cron_watermarks.get(key)
+            if cur is None or bar_time > cur:
+                self._cron_watermarks[key] = bar_time
+
+    def _persist_cron_cursor(self, keys, now: datetime) -> None:
+        for key in keys:
+            bar_time = self._cron_watermarks.get(key)
+            if bar_time is None:
+                self._dirty_cron_cursor.discard(key)
+                continue
+            try:
+                cron_cursor.upsert(self.conn, key[0], key[1], bar_time, now=now)
+            except Exception as e:  # noqa: BLE001 — 永続化の失敗で tick を止めない (at-least-once)
+                self._dirty_cron_cursor.add(key)
+                self._note_cron_cursor_write_failure(key, bar_time, e, now)
+            else:
+                self._dirty_cron_cursor.discard(key)
+
+    def _retry_dirty_cron_cursor(self, now: datetime) -> None:
+        # tick の finally から呼ぶ: 閉場中・degraded 中の早期 return を含む
+        # 全 return 経路で再試行する。
+        if not self._dirty_cron_cursor:
+            return
+        try:
+            self._persist_cron_cursor(sorted(self._dirty_cron_cursor), now)
+        except Exception:  # noqa: BLE001 — finally から例外を漏らさない
+            _log.exception("cron cursor retry failed")
+
+    def _note_cron_cursor_write_failure(self, key, bar_time: datetime,
+                                        error: Exception, now: datetime) -> None:
+        text = safe_error_text(error)
+        _log.warning("cron cursor write failed for %s %s: %s", key[0], key[1], text)
+        # 失敗が続く間は key (pair, interval) ごとに tick 内で 1 回だけ
+        # 書く (同じ tick の受理と再試行で二重に書かない)。tick ローカルの
+        # 集合で判定する — `now` の値の同一性で判定すると、同じ `now` で
+        # tick が 2 回呼ばれた場合に 2 回目が無音になる。単一の bool だと
+        # 同じ tick 内で他 key が先に記録済みだと無音になる。
+        if key in self._cron_cursor_failure_logged_this_tick:
+            return
+        self._cron_cursor_failure_logged_this_tick.add(key)
+        self.activity.write(
+            Category.SYSTEM, "cron_cursor_write_failed",
+            f"{key[0]} {key[1]} bar={_fmt_bar(bar_time)} "
+            f"dirty={len(self._dirty_cron_cursor)}: {text} — 次 tick で再試行 "
+            "(成功までの間に再起動すると同じ足を再判断し得る)")
+
+    def _hold_future_cursor(self, key, cursor: datetime,
+                            watermark: datetime) -> None:
+        if key in self._cron_hold:
+            return
+        self._cron_hold.add(key)
+        _log.warning("cron watermark regressed for %s %s: %s < %s",
+                     key[0], key[1], watermark.isoformat(), cursor.isoformat())
+        self.activity.write(
+            Category.SYSTEM, "cron_cursor_future_watermark",
+            f"{key[0]} {key[1]} L={_fmt_bar(cursor)} W={_fmt_bar(watermark)} "
+            "(この pair の cron 判定を保留、W が L に追いつくと自動で再開)")
+
+    def _release_future_cursor(self, key, cursor: datetime,
+                               watermark: datetime) -> None:
+        self._cron_hold.discard(key)
+        self.activity.write(
+            Category.SYSTEM, "cron_cursor_future_watermark_resolved",
+            f"{key[0]} {key[1]} L={_fmt_bar(cursor)} W={_fmt_bar(watermark)} "
+            "(cron 判定を再開)")
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
         """ニュース / econ の収集フックを fail-open で呼ぶ。
@@ -1213,3 +1410,13 @@ def period_key_of(occurrence: datetime, *, cadence: str) -> str:
         iso = occurrence.isocalendar()
         return f"{iso.year}-W{iso.week:02d}"
     raise ValueError(f"unknown cadence: {cadence!r}")
+
+
+def _fmt_bar(bar_time: datetime) -> str:
+    return bar_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+def _busy_text(result: SubmitResult) -> str:
+    if result.reason == "running" and result.busy_elapsed_sec is not None:
+        return f"running {result.busy_elapsed_sec / 60:.1f} min"
+    return str(result.reason)

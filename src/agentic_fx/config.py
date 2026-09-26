@@ -202,6 +202,19 @@ class DatafeedSettings(_Strict):
             raise ValueError("decision_timeframes must contain exactly one value")
         return self
 
+    @model_validator(mode="after")
+    def _decision_timeframe_is_stored(self) -> "DatafeedSettings":
+        # 4h 以上は registry が 1h 保存へ正規化する派生専用の足で、判断足の
+        # 確定 watermark が永久に空になり cron が発火しない。換算はしない。
+        from agentic_fx.datafeed.sources import INTERVAL_MIN
+        timeframe = self.decision_timeframes[0]
+        if INTERVAL_MIN.get(timeframe, 0) >= 240:
+            raise ValueError(
+                f"decision_timeframes=[{timeframe}] は派生専用の足です "
+                "(保存は 1h に正規化されるため判断足の cron が発火しません)。"
+                "判断足には [1h] か [15m] を指定してください")
+        return self
+
     @property
     def decision_timeframe(self) -> str:
         return self.decision_timeframes[0]
@@ -478,6 +491,11 @@ class WorkerSettings(_Strict):
     # 開始時にこれを超えていれば発注拒否する (lock 内での再取得はしない
     # — 設計書 §3.1)。
     snapshot_max_age_sec: float = Field(gt=0, default=10.0)
+    # watchdog と停止時 join 予算が共有する dispatch 上限 (秒)。未設定なら
+    # Cd (trade 1 + reflection 最大 3 の worker 上限 + 余白) + 60 を自動導出する。
+    # 明示する場合は Cd 未満だと起動拒否 (正常な dispatch の途中で watchdog が
+    # サービスを止め得るため)。
+    dispatch_ceiling_sec: float | None = Field(default=None, gt=0)
 
 
 class Settings(_Strict):

@@ -18,6 +18,7 @@ from agentic_fx.core.contracts import (
     InstrumentSpec, Origin, Quote, TradeIntent,
 )
 from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -433,6 +434,127 @@ def test_splash_contains_key_fields(tmp_path):
     assert "qwen" in splash  # runner モデル名
 
 
+def test_service_tick_records_deferred_with_supervisor_phase(tmp_path):
+    """本物の MissionSupervisor (スレッド未起動 = 受理後 queued のまま) で、
+    次の確定足の cron が queued 理由で見送られ activity に 1 行出る。
+
+    この配線 (`try_submit` の phase 判定 →
+    queued 拒否) が壊れた実装では、2 回目の受理が queue (maxsize=1) へ
+    `put` を試み、supervisor スレッド未起動のため誰も消費せず永久に
+    ブロックする。テストプロセスがハングして原因を特定しづらくなるのを
+    避けるため、tick 呼び出し列を別スレッドで実行し `join(timeout=...)` の
+    backstop で red に落とす (`_submit_within` と同じ形)。"""
+    from agentic_fx.core.accounting import record_snapshot
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    hung = False
+    try:
+        record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                        equity=1_000_000)
+        _seed_decision_bar(app.conn_core)
+
+        done = threading.Event()
+
+        def _run_ticks():
+            with _no_real_network():
+                with app.core_lock:
+                    app.scheduler.tick(NOW)
+                _seed_decision_bar(app.conn_core, NOW - timedelta(hours=1))
+                with app.core_lock:
+                    app.scheduler.tick(NOW + timedelta(minutes=1))
+            done.set()
+
+        th = threading.Thread(target=_run_ticks, daemon=True)
+        th.start()
+        th.join(timeout=5.0)
+        hung = th.is_alive()
+        # hung な場合、`_run_ticks` は `app.core_lock` を保持したまま
+        # ブロックし続ける (queue.put が戻らない) — 後始末の
+        # shutdown/close が同じ lock を待ってテストプロセスごと道連れに
+        # ならないよう、その場合は後始末をスキップして即座に assert で
+        # 失敗させる (daemon thread なのでプロセス終了時に回収される)。
+        assert done.is_set() and not hung, (
+            "2 回目の tick が戻らない (queue.put が満杯のままブロックした"
+            "可能性 — try_submit の phase 判定が壊れている)")
+
+        lines = [line.split("\t") for line in
+                 (tmp_path / "logs" / "activity.log").read_text(
+                     encoding="utf-8").splitlines()]
+        deferred = [row[3] for row in lines if row[2] == "cron_mission_deferred"]
+        assert deferred == ["USDJPY 1h bar=2026-07-22T11:00 busy (queued)"]
+    finally:
+        if not hung:
+            app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+            app.close()
+
+
+def test_cron_tick_records_decision_bar_provenance_end_to_end(tmp_path):
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.core.supervisor import MissionSupervisor
+    from agentic_fx.store import mission_decision_bars
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"}, [])])
+    app = build_app(tmp_path, runner=fake, clock=FixedClock(NOW))
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+    bar_time = NOW - timedelta(hours=1, seconds=30)
+    _seed_decision_bar(app.conn_core, bar_time)
+    app.supervisor.start()
+    try:
+        captured = []
+        original_try_submit = MissionSupervisor.try_submit
+
+        def spy_try_submit(self, kind, **kw):
+            r = original_try_submit(self, kind, **kw)
+            if r.accepted:
+                captured.append(r.future)
+            return r
+
+        with _no_real_network(), \
+             patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"), \
+             patch.object(app.trade_loop.provider, "healthcheck",
+                          return_value="yfinance"):
+            # 本番と同じく core_lock の中で tick する (受理後の cron_cursor
+            # upsert と supervisor スレッドの prepare が conn_core を同時に
+            # 触らないように)
+            with app.core_lock:
+                app.scheduler.tick(NOW)
+            assert len(captured) == 1
+            captured[0].result(timeout=5.0)
+        mid = app.conn_core.execute(
+            "SELECT id FROM missions WHERE loop='trade'").fetchone()["id"]
+        assert mission_decision_bars.for_mission(app.conn_core, mid) == {
+            ("USDJPY", "1h"): bar_time}
+    finally:
+        app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+        app.close()
+
+
+def test_supervisor_ask_returns_busy_message_on_rejection():
+    from concurrent.futures import Future
+
+    from agentic_fx.core.supervisor import SubmitResult
+    from agentic_fx.service import _SupervisorAsk
+
+    class _Sup:
+        def __init__(self, result):
+            self.result = result
+
+        def try_submit(self, kind, **kwargs):
+            return self.result
+
+    busy = _SupervisorAsk(_Sup(SubmitResult.rejected("running", checked_at=0.0)), 1.0)
+    assert "Mission 実行中" in busy.ask_once("q")
+    done: Future = Future()
+    done.set_result("answer")
+    ok = _SupervisorAsk(_Sup(SubmitResult.accepted_with(done, checked_at=0.0)), 1.0)
+    assert ok.ask_once("q") == "answer"
+
+
 def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
     """Task 13 fix (coordinator指摘): scheduler.tick() 起点で on_trade_mission の
     配線を検証。Future 待ちを patch 内側に移動。"""
@@ -454,17 +576,18 @@ def test_on_trade_mission_runs_loop_and_reflection(tmp_path):
         captured = []
         original_try_submit = MissionSupervisor.try_submit
         def spy_try_submit(self, kind, **kw):
-            f = original_try_submit(self, kind, **kw)
-            if f is not None:
-                captured.append(f)
-            return f
+            r = original_try_submit(self, kind, **kw)
+            if r.accepted:
+                captured.append(r.future)
+            return r
         # 重要: Future.result() を patch の内側で呼ぶ
         with _no_real_network(), \
              patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"), \
              patch.object(app.trade_loop.provider, "healthcheck",
                           return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                app.scheduler.tick(NOW)
             assert captured, "no Future was captured"
             assert captured[0] is not None
             captured[0].result(timeout=5.0)  # Mission 完了まで待つ (patch 内側)
@@ -508,17 +631,18 @@ def test_on_trade_mission_wrapper_also_runs_reflection(tmp_path):
         captured = []
         original_try_submit = MissionSupervisor.try_submit
         def spy_try_submit(self, kind, **kw):
-            f = original_try_submit(self, kind, **kw)
-            if f is not None:
-                captured.append(f)
-            return f
+            r = original_try_submit(self, kind, **kw)
+            if r.accepted:
+                captured.append(r.future)
+            return r
         # 重要: Future.result() を patch の内側で呼ぶ
         with _no_real_network(), \
              patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"), \
              patch.object(app.trade_loop.provider, "healthcheck",
                           return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                app.scheduler.tick(NOW)
             assert captured, "no Future was captured"
             assert captured[0] is not None
             captured[0].result(timeout=5.0)  # Mission 完了まで待つ (patch 内側)
@@ -586,7 +710,7 @@ def test_reflection_fn_wiring_does_not_hold_core_lock_during_run(tmp_path):
                       return_value="yfinance"):
         app.supervisor.start()
         try:
-            future = app.supervisor.try_submit("trade", trigger="cron")
+            future = app.supervisor.try_submit("trade", trigger="cron").future
             assert future is not None, "supervisor がジョブを受理しなかった"
             assert runner.entered_reflection.wait(5.0), (
                 "reflection の run 相 (runner.run) に到達しなかった")
@@ -637,10 +761,10 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
         captured = []
         original_try_submit = MissionSupervisor.try_submit
         def spy_try_submit(self, kind, **kw):
-            f = original_try_submit(self, kind, **kw)
-            if f is not None:
-                captured.append(f)
-            return f
+            r = original_try_submit(self, kind, **kw)
+            if r.accepted:
+                captured.append(r.future)
+            return r
         # 重要: Future.result() を patch の内側で呼ぶ
         # (非同期実行なので patch が効いている間に完了させる)
         with _no_real_network(), \
@@ -648,7 +772,8 @@ def test_tick_propagates_trigger_to_missions_row(tmp_path):
              patch.object(app.provider, "healthcheck", return_value="yfinance"), \
              patch.object(app.trade_loop.provider, "healthcheck",
                           return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                app.scheduler.tick(NOW)
             # Future が返されたことを確認
             assert captured, "no Future was captured (on_trade_mission not called)"
             assert captured[0] is not None, "Supervisor rejected the job"
@@ -1438,7 +1563,8 @@ def test_run_service_derives_supervisor_join_timeout_from_dispatch_ceiling(
         rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
 
     assert rc == 0
-    assert recorded.get("timeout") == pytest.approx((42.0 + 3.0 + 2.0) * 4 + 60.0)
+    # Cw = 30 + (42+3) + 2 + 5 + 5 + 5 + (15+5) = 112、Cd = 112*4 + 10、+60
+    assert recorded.get("timeout") == pytest.approx(112.0 * 4 + 10.0 + 60.0)
 
 
 def test_scheduler_tick_actually_invokes_the_watchdog_health_check(tmp_path):
@@ -1594,7 +1720,7 @@ def test_run_service_records_shutdown_timeout_when_commit_core_is_stuck(tmp_path
         # 二重起動 (別スレッドで queue を奪い合う) を避けて no-op に
         # 差し替える。
         app.supervisor.start()
-        future = app.supervisor.try_submit("trade", trigger="cron")
+        future = app.supervisor.try_submit("trade", trigger="cron").future
         assert future is not None, "supervisor がジョブを受理しなかった"
         assert entered.wait(5.0), (
             "commit-core (record_and_validate_intent) に到達しなかった")
@@ -1670,7 +1796,8 @@ def test_run_service_rejects_try_submit_during_shutdown_before_scheduler_exits(
         # run_service の finally が supervisor.shutdown() まで到達する
         # ための猶予 (shutdown() 自体は一瞬で終わる — ブロックしない)。
         time.sleep(0.3)
-        assert app.supervisor.try_submit("trade", trigger="cron") is None, (
+        rejected = app.supervisor.try_submit("trade", trigger="cron")
+        assert rejected.accepted is False and rejected.reason == "shutdown", (
             "shutdown() が th.join() より後に実行されている — 停止処理の"
             "最中に新しい Mission が受理されてしまう")
     finally:
@@ -3089,7 +3216,7 @@ def test_15m_ingest_commit_healthcheck_and_scheduler_contract(tmp_path):
     try:
         assert app.ingest.registry.required_closed_bars("USDJPY", "15m") == 1
         fired = []
-        app.scheduler.on_trade_mission = lambda reason: fired.append(reason) or True
+        app.scheduler.on_trade_mission = lambda reason, **_: fired.append(reason) or SubmitResult.accepted_with(None, checked_at=0.0)
         app.scheduler.tick(now)
         assert fired == []
         with pytest.raises(DataUnhealthy):
@@ -3991,7 +4118,7 @@ def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path
         # させない) — `on_trade_mission` 呼び出し自体を直接検証する。
         mission_calls = []
         app.scheduler.on_trade_mission = (
-            lambda reason: mission_calls.append(reason) or True)
+            lambda reason, **_: mission_calls.append(reason) or SubmitResult.accepted_with(None, checked_at=0.0))
         clock.current = t0 + timedelta(hours=1, minutes=1)
         _scheduler_tick_once(app)
         assert app.outage.state == "ready"

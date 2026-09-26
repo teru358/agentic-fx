@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.replay import BarFeed
 from agentic_fx.backtest.runner import run_replay, _aggregate_bucket
@@ -846,7 +847,7 @@ def test_bar_freshness_boundary_exact_fresh_and_one_second_stale():
     scheduler = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                           state_store=state, activity=_NullActivity(),
                           bars_fn=lambda pair: bar,
-                          on_trade_mission=lambda reason: None,
+                          on_trade_mission=lambda reason, **_: SubmitResult.rejected("shutdown", checked_at=0.0),
                           on_news_cycle=lambda: None, on_econ_cycle=lambda: None,
                           bar_freshness=timedelta(minutes=6))
     assert scheduler._fresh_bar("USDJPY", now) is not None
@@ -854,7 +855,7 @@ def test_bar_freshness_boundary_exact_fresh_and_one_second_stale():
     scheduler2 = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                            state_store=state, activity=_NullActivity(),
                            bars_fn=lambda pair: bar,
-                           on_trade_mission=lambda reason: None,
+                           on_trade_mission=lambda reason, **_: SubmitResult.rejected("shutdown", checked_at=0.0),
                            on_news_cycle=lambda: None, on_econ_cycle=lambda: None,
                            bar_freshness=timedelta(minutes=6))
     now_stale = bar_ts + timedelta(minutes=6, seconds=1)
@@ -909,7 +910,7 @@ def test_evaluate_positions_uses_self_bar_freshness_not_module_constant():
     scheduler = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                           state_store=state, activity=_NullActivity(),
                           bars_fn=lambda pair: bar,
-                          on_trade_mission=lambda reason: None,
+                          on_trade_mission=lambda reason, **_: SubmitResult.rejected("shutdown", checked_at=0.0),
                           on_news_cycle=lambda: None, on_econ_cycle=lambda: None,
                           bar_freshness=timedelta(minutes=6))
     _, unrealized, stale = scheduler._evaluate_positions(now)

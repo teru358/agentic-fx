@@ -14,7 +14,8 @@ import queue
 import threading
 import time
 from concurrent.futures import Future
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Literal
 
 _log = logging.getLogger("agentic_fx.supervisor")
 
@@ -23,11 +24,44 @@ _log = logging.getLogger("agentic_fx.supervisor")
 _HEARTBEAT_PUMP_INTERVAL_SEC = 5.0
 
 
+@dataclass(frozen=True)
+class SubmitResult:
+    """`try_submit` の結果。accepted / reason / busy_since / checked_at は
+    `MissionSupervisor._lock` の中で 1 回に読んだ値の組。
+
+    reason: "queued" = 受理済みで dispatch 前 / "running" = dispatch 中
+    (busy_since あり) / "shutdown" = 停止中で新規を受けない。
+    """
+    accepted: bool
+    reason: Literal["queued", "running", "shutdown"] | None
+    busy_since: float | None
+    checked_at: float
+    future: Future | None
+
+    @property
+    def busy_elapsed_sec(self) -> float | None:
+        if self.busy_since is None:
+            return None
+        return self.checked_at - self.busy_since
+
+    @classmethod
+    def accepted_with(cls, future: Future | None, *,
+                      checked_at: float) -> "SubmitResult":
+        return cls(True, None, None, checked_at, future)
+
+    @classmethod
+    def rejected(cls, reason: Literal["queued", "running", "shutdown"], *,
+                 busy_since: float | None = None,
+                 checked_at: float) -> "SubmitResult":
+        return cls(False, reason, busy_since, checked_at, None)
+
+
 class MissionSupervisor:
-    def __init__(self, *, trade_fn: Callable[[str], object],
+    def __init__(self, *, trade_fn: Callable[..., object],
                 reflection_fn: Callable[[], object],
                 ask_fn: Callable[[str], str],
                 heartbeat_pump_interval_sec: float = _HEARTBEAT_PUMP_INTERVAL_SEC,
+                clock_fn: Callable[[], float] = time.monotonic,
                 ) -> None:
         self._trade_fn = trade_fn
         self._reflection_fn = reflection_fn
@@ -36,7 +70,11 @@ class MissionSupervisor:
         # よう、pump 間隔を注入可能にする (既定は本番用の定数)。
         self._heartbeat_pump_interval_sec = heartbeat_pump_interval_sec
         self._lock = threading.Lock()
-        self._busy = False
+        self._clock_fn = clock_fn
+        # "idle" = 空き / "queued" = 受理済み・dispatch 前 / "running" =
+        # dispatch 中。遷移は self._lock の中だけで行い、busy_since と組で
+        # 読み書きする (running なのに busy_since が None の区間を作らない)。
+        self._phase: Literal["idle", "queued", "running"] = "idle"
         self._queue: "queue.Queue[tuple[str, dict, Future] | None]" = \
             queue.Queue(maxsize=1)
         self._thread: threading.Thread | None = None
@@ -58,41 +96,70 @@ class MissionSupervisor:
             target=self._run, daemon=True, name="afx-supervisor")
         self._thread.start()
 
-    def try_submit(self, kind: str, **kwargs) -> Future | None:
+    def try_submit(self, kind: str, **kwargs) -> SubmitResult:
         with self._lock:
+            # clock_fn は lock 内で 1 回だけ読み、accepted/queued/
+            # running/shutdown の全結果に同じ checked_at を渡す
+            # (IV-12: SubmitResult の値は同じ lock 内で原子的に読む)。
+            checked_at = self._clock_fn()
             # C2 fix: shutdown 後は新規受付を停止する
             if self._stop_event.is_set():
-                return None
-            if self._busy:
-                return None
-            self._busy = True
+                return SubmitResult.rejected("shutdown", checked_at=checked_at)
+            if self._phase != "idle":
+                return SubmitResult.rejected(
+                    self._phase, busy_since=self.busy_since,
+                    checked_at=checked_at)
+            self._phase = "queued"
             future: Future = Future()
             self._queue.put((kind, kwargs, future))
-            return future
+            return SubmitResult.accepted_with(future, checked_at=checked_at)
 
     def shutdown(self, *, drain_exc: Exception) -> None:
         """新規受付停止 + queue 内の未着手ジョブを例外完了させる (ブロック
-        しない — 実行中ジョブの完了待ちは呼び出し側の join() の責務)。"""
-        self._stop_event.set()
-        self.fail_pending(exc=drain_exc)
+        しない — 実行中ジョブの完了待ちは呼び出し側の join() の責務)。
+
+        `_stop_event.set()` と queue のドレインを `try_submit` と同じ
+        `_lock` 区間で行う (TOCTOU 封鎖)。以前は
+        `_stop_event.set()` が lock 外だったため、「`try_submit` が
+        stop_event 判定を終えた直後・enqueue する直前」に `shutdown` が
+        割り込んで queue を空のまま drain してしまい、その後に
+        enqueue された job の Future が誰にも消費されず永久に未解決の
+        まま残り得た。"""
+        with self._lock:
+            self._stop_event.set()
+            item = self._drain_pending_locked()
+        self._settle_drained(item, drain_exc)
 
     def fail_pending(self, *, exc: Exception) -> None:
         """queue 内 (まだディスパッチされていない) の pending Future を
         `exc` で例外完了させる。supervisor スレッド死亡時に watchdog
         (Task 19) が呼ぶ経路と shutdown の両方から共有される。"""
+        with self._lock:
+            item = self._drain_pending_locked()
+        self._settle_drained(item, exc)
+
+    def _drain_pending_locked(self):
+        """`self._lock` を保持した状態で呼ぶ。queue 内の未着手ジョブを
+        1 件取り出せた場合だけ phase/busy_since を解放する — 実行中
+        (`phase == "running"`) の job には触れない (queue は空のまま
+        なので `get_nowait` は Empty になる)。"""
         try:
             item = self._queue.get_nowait()
         except queue.Empty:
+            return None
+        self._phase = "idle"
+        self.busy_since = None
+        return item
+
+    @staticmethod
+    def _settle_drained(item, exc: Exception) -> None:
+        """lock を解放した後に呼ぶ — done callback が `try_submit` を
+        呼んでも (非再入 Lock で) デッドロックしない。"""
+        if item is None:
             return
-        # m2 fix: None センチネルの場合でも _busy を必ず解放する
-        try:
-            if item is not None:
-                _, _, future = item
-                if not future.done():
-                    future.set_exception(exc)
-        finally:
-            with self._lock:
-                self._busy = False
+        _, _, future = item
+        if not future.done():
+            future.set_exception(exc)
 
     def join(self, timeout: float | None = None) -> None:
         if self._thread is not None:
@@ -125,21 +192,30 @@ class MissionSupervisor:
                 target=self._pump_heartbeat, args=(pump_stop,),
                 daemon=True, name="afx-supervisor-heartbeat-pump")
             pump.start()
-            self.busy_since = time.monotonic()
+            with self._lock:
+                self._phase = "running"
+                self.busy_since = self._clock_fn()
+            result = None
+            error: Exception | None = None
             try:
                 result = self._dispatch(kind, kwargs)
-                if not future.cancelled():
-                    future.set_result(result)
             except Exception as e:  # noqa: BLE001 — supervisor スレッドを殺さない
                 _log.exception("mission job %r failed", kind)
-                if not future.cancelled():
-                    future.set_exception(e)
+                error = e
             finally:
                 pump_stop.set()
+                # future を解決する前にスロットを空ける: result() が返った
+                # 時点 (および完了 callback の中) で次の try_submit が必ず
+                # 受理される。
                 with self._lock:
-                    self._busy = False
-                self.busy_since = None
-                pump.join(timeout=1.0)
+                    self._phase = "idle"
+                    self.busy_since = None
+            if not future.cancelled():
+                if error is not None:
+                    future.set_exception(error)
+                else:
+                    future.set_result(result)
+            pump.join(timeout=1.0)
 
     def _pump_heartbeat(self, stop: threading.Event) -> None:
         """裁定書 F-3 (CR-1): `_dispatch` 実行中も `heartbeat` を
@@ -165,7 +241,9 @@ class MissionSupervisor:
 
     def _dispatch(self, kind: str, kwargs: dict) -> object:
         if kind == "trade":
-            trade_result = self._trade_fn(kwargs["trigger"])
+            extra = ({"decision_bars": kwargs["decision_bars"]}
+                     if "decision_bars" in kwargs else {})
+            trade_result = self._trade_fn(kwargs["trigger"], **extra)
             reflection_count = self._reflection_fn()
             return {"trade": trade_result,
                    "reflection_count": reflection_count}

@@ -51,6 +51,7 @@ from agentic_fx.core.executor import Executor
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.store import missions, snapshots as snapshot_store
 from agentic_fx.store.db import connect, init_db
@@ -416,7 +417,10 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     scheduler = Scheduler(
         conn=conn, executor=executor, settings=bt_settings, state_store=state,
         activity=activity, bars_fn=bars_fn,
-        on_trade_mission=lambda reason: None,
+        # バックテストは判断 mission を起こさない (in-memory DB の ohlcv_cache
+        # は空で cron は due にならない)。呼ばれても受理しない。
+        on_trade_mission=lambda reason, **_: SubmitResult.rejected(
+            "shutdown", checked_at=0.0),
         on_news_cycle=lambda: None, on_econ_cycle=lambda: None,
         bar_freshness=dataset.width + timedelta(minutes=1))
 

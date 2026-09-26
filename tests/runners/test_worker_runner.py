@@ -1578,6 +1578,171 @@ def _silent_child_proc(tmp_path):
     return FakeProc(), w, th
 
 
+def _rpc_hang_child_proc(tmp_path):
+    """`ready` 応答の直後に `tool_rpc` を投げたきり、以後は一切応答しない
+    子 (measurements.md #1 シナリオ C 相当)。`poll()` は常に `None` =
+    SIGTERM を無視し続ける子を模す。参照は `kept` で保持し、GC による
+    fd の early close を防ぐ (`_silent_child_proc` と同じ理由)。
+    """
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    kept: list = []
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        kept.append(child_in)
+        child_out = os.fdopen(w, "wb")
+        kept.append(child_out)
+        child_in.readline()  # handshake を読み捨てる
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
+                                "name": "search_news",
+                                "args": {"query": "q", "n": 5}})
+        # 以後、tool_rpc_result も result も送らず放置する。
+
+    th = threading.Thread(target=child_thread_fn, daemon=True)
+    th.start()
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None          # SIGTERM を無視し続ける子を模す
+
+        def wait(self, timeout=None):
+            return -9
+
+    return FakeProc(), w, th
+
+
+@pytest.mark.slow
+def test_rpc_dispatcher_join_budget_dominates_real_elapsed_when_rpc_handler_hangs(
+        tmp_path, monkeypatch):
+    """measurements.md #1 シナリオ C 相当 (AC-B2-03)。child は `ready`
+    応答の直後に `tool_rpc` を投げたきり以後 `tool_rpc_result`/`result` を
+    一切送らずに放置し (SIGTERM も無視する)、RPC ハンドラ自体もハングする
+    — このとき打ち切り完了までの実時間は mission timeout 系の短い予算
+    (timeout + worker_grace_sec + worker_terminate_grace_sec ≈ 2.0s) では
+    収まらず、`dispatcher.join` の `rpc_timeout_sec` 側の待ち (Cw の
+    `rpc_timeout_sec + 5` 項) に支配される (実時間、許容 ±1 秒)。"""
+    from agentic_fx.core.supervisor import MissionSupervisor
+
+    proc, w, _th = _rpc_hang_child_proc(tmp_path)
+    rag = _rag(tmp_path)
+    rpc_handler_started = threading.Event()
+
+    def _hanging_search_news(query, n=5):
+        rpc_handler_started.set()
+        threading.Event().wait()  # RPC ハンドラも永久ハング
+
+    rag.search_news = _hanging_search_news
+    settings = _tiny_worker_settings(
+        worker_startup_timeout_sec=2.0, worker_grace_sec=0.5,
+        worker_terminate_grace_sec=0.5, rpc_timeout_sec=3.0)
+    runner, _kill_calls, _ = _spawn_runner(monkeypatch, tmp_path, proc, settings,
+                                           rag=rag, close_on_kill=w)
+
+    # wall-clock の下限は狭い経路識別に使わない (負荷下で緩い実時間比較は
+    # 偽陽性になりうる)。経路の識別は RPC ハンドラの開始イベント・
+    # "afx-worker-dispatcher" スレッドの終了イベント (spy) と、その間
+    # `MissionSupervisor` の phase が running のまま (= 再 submit が
+    # "running" で拒否され続ける) ことの直接観測で行う — dispatcher.join
+    # が実際に rpc_timeout_sec 側の待ちで戻ったことを経路として固定する。
+    join_calls: list[tuple[float, float, float | None]] = []
+    dispatcher_ended = threading.Event()
+    real_join = threading.Thread.join
+
+    def spy_join(self, timeout=None):
+        if self.name == "afx-worker-dispatcher":
+            t0 = time.monotonic()
+            real_join(self, timeout)
+            join_calls.append((t0, time.monotonic(), timeout))
+            dispatcher_ended.set()
+        else:
+            real_join(self, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", spy_join)
+
+    def trade_fn(trigger):
+        return runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                  max_turns=1, timeout_sec=1.0))
+
+    sup = MissionSupervisor(trade_fn=trade_fn, reflection_fn=lambda: 0,
+                            ask_fn=lambda q: q)
+    sup.start()
+    try:
+        first = sup.try_submit("trade", trigger="cron")
+        assert first.accepted is True
+
+        def _poll_submit_within(timeout):
+            """try_submit を別スレッドで呼び、戻らなければ None を返す
+            (busy 判定が壊れて queue.put が満杯のままブロックする壊れた
+            実装を、ポーリングループごとハングさせず失敗として検出する)。"""
+            box: list = []
+            th = threading.Thread(
+                target=lambda: box.append(sup.try_submit("trade", trigger="cron")),
+                daemon=True)
+            th.start()
+            th.join(timeout)
+            return box[0] if box and not th.is_alive() else None
+
+        # RPC ハンドラが実際に呼ばれたことを経路の起点として確認する。
+        assert rpc_handler_started.wait(timeout=5.0), (
+            "RPC handler (search_news) が呼ばれていない")
+
+        # dispatcher.join が rpc_timeout_sec 側の待ちで戻るまでの間、
+        # supervisor の phase は running のまま — 再 submit は "running"
+        # で拒否され続ける。mission timeout 系の短い予算 (timeout 1.0 +
+        # worker_grace 0.5 + worker_terminate_grace 0.5) だけで打ち切りが
+        # 完了していれば、この窓の途中で受理に転じてしまうはず。
+        deadline = time.monotonic() + 20.0
+        polled_at_least_once = False
+        while not dispatcher_ended.is_set() and time.monotonic() < deadline:
+            r = _poll_submit_within(1.0)
+            assert r is not None, (
+                "try_submit が戻らない (busy 判定が壊れて queue.put が"
+                "満杯のままブロックした可能性)")
+            assert not r.accepted and r.reason == "running", (
+                f"dispatcher 終了前に受理された (経路が想定と異なる): {r}")
+            polled_at_least_once = True
+        assert polled_at_least_once, "running での拒否を一度も観測できなかった"
+
+        # 広いハング防止ガード (負荷下でも十分な余裕): dispatcher.join
+        # 自体が有限時間で戻ることの最終防波堤。
+        assert dispatcher_ended.wait(timeout=10.0), (
+            "afx-worker-dispatcher の join が有限時間で戻らない")
+
+        dispatch_result = first.future.result(timeout=10.0)
+
+        # dispatcher の join が 1 回、rpc_timeout_sec+MARGIN の予算
+        # (8.0s) で呼ばれたことを直接観測する — これが「rpc_timeout_sec
+        # 側の待ちが実時間を支配した」経路の識別そのもの。
+        assert len(join_calls) == 1, (
+            f"afx-worker-dispatcher の join 呼び出し回数が想定と異なる: "
+            f"{join_calls}")
+        t0, t1, timeout = join_calls[0]
+        assert timeout == pytest.approx(8.0), (
+            f"dispatcher.join の予算 (rpc_timeout_sec+MARGIN) が想定と異なる: "
+            f"{timeout}")
+
+        # 終端 status (timeout/failed) はどちらの経路で打ち切られても実害は
+        # 無く AC-B2-03 の対象外 — ここで見るのは経路の識別のみ。
+        assert dispatch_result["trade"].status in ("timeout", "failed")
+    finally:
+        shutdown_th = threading.Thread(
+            target=lambda: sup.shutdown(drain_exc=RuntimeError("test shutdown")),
+            daemon=True)
+        shutdown_th.start()
+        shutdown_th.join(timeout=2.0)
+        try:
+            os.close(w)          # SIGKILL 時に閉じ済みなら OSError で無視
+        except OSError:
+            pass
+
+
 def test_startup_timeout_actually_kills_the_child(tmp_path, monkeypatch):
     """**S1 系 / sonnet I-1**: startup timeout で子が**実際に kill される**。
 
@@ -1596,6 +1761,218 @@ def test_startup_timeout_actually_kills_the_child(tmp_path, monkeypatch):
         assert kill_calls, "startup timeout なのに子を kill していない"
         assert kill_calls[0][1] == signal.SIGTERM
     finally:
+        try:
+            os.close(w)          # SIGKILL 時に閉じ済みなら OSError で無視
+        except OSError:
+            pass
+
+
+def _silent_child_with_cli_started_proc(tmp_path, cli_pgid=987_654):
+    """`_silent_child_proc` と同じ (`ready` を一切送らない子) だが、
+    handshake 直後に `cli_started` フレーム (claude 系 backend の CLI
+    子プロセス相当、別 pgid) を追加で送る。fake pgid は実プロセスでは
+    ないため `os.killpg` は必ず monkeypatch 経由で使うこと。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+    kept: list = []
+
+    def consume_handshake_then_cli_started():
+        child_in = os.fdopen(r2, "rb")
+        kept.append(child_in)
+        child_out = os.fdopen(w, "wb")
+        kept.append(child_out)
+        child_in.readline()          # handshake を読み捨てる
+        write_frame(child_out, {"type": "cli_started", "seq": 1,
+                                "pgid": cli_pgid})
+        # 以後、ready も何も送らず放置する (startup timeout 前提)。
+
+    th = threading.Thread(target=consume_handshake_then_cli_started, daemon=True)
+    th.start()
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None          # 常に生存 = SIGTERM を無視する子
+
+        def wait(self, timeout=None):
+            return -9
+
+    return FakeProc(), w, th, cli_pgid
+
+
+def _fast_ok_child_proc():
+    """handshake→ready→result(completed) を即座に返す子 (reflection の
+    実 WorkerRunner 接続用)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        child_in.readline()
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    threading.Thread(target=child_thread_fn, daemon=True).start()
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    return FakeProc()
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("backend", ["local", "claude"])
+def test_supervisor_reports_running_through_worker_cleanup_then_accepts(
+        tmp_path, monkeypatch, backend):
+    """AC-B2-03 の結合経路防御: 実 `WorkerRunner` + fake 子
+    プロセスを実 `MissionSupervisor` の `trade_fn`/`reflection_fn` に
+    接続する。子が SIGTERM を無視し SIGKILL 到達・後片付け完了まで生存し
+    続ける間 (`runner.run()` はその間ずっと戻らない)、再 submit は
+    "running" で拒否され続け、`run()` が戻って reflection 連鎖 (最大 3
+    件、実 `WorkerRunner` 経由) まで含めて dispatch が完了した直後の
+    submit は受理される。`backend="claude"` では `cli_started` フレームを
+    送る fake CLI (§7.1-2 のフィクスチャと同じ手) を追加し、CLI pgid の
+    回収完了もイベントで固定する。短縮値を使い、実 CLI プロセスは起動
+    しない (fake 子プロセスのみ)。"""
+    from agentic_fx.core.supervisor import MissionSupervisor
+
+    cli_pgid = None
+    if backend == "local":
+        proc, w, _th = _silent_child_proc(tmp_path)
+    else:
+        proc, w, _th, cli_pgid = _silent_child_with_cli_started_proc(tmp_path)
+
+    settings = _tiny_worker_settings(
+        worker_startup_timeout_sec=0.3, worker_grace_sec=0.1,
+        worker_terminate_grace_sec=0.3, rpc_timeout_sec=0.2)
+    if backend == "claude":
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(
+                update={"cli_terminate_grace_sec": 0.1})})
+
+    runner, kill_calls, _ = _spawn_runner(monkeypatch, tmp_path, proc, settings,
+                                          close_on_kill=w)
+
+    cli_reap_done = threading.Event()
+    if backend == "claude":
+        real_terminate_cli_pgid = runner._terminate_cli_pgid
+
+        def _wrapped_terminate_cli_pgid(pgid):
+            real_terminate_cli_pgid(pgid)
+            cli_reap_done.set()
+
+        monkeypatch.setattr(runner, "_terminate_cli_pgid",
+                            _wrapped_terminate_cli_pgid)
+
+    def trade_fn(trigger):
+        return runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                  max_turns=1, timeout_sec=0.3))
+
+    reflection_statuses: list[str] = []
+
+    def reflection_fn():
+        """trade 完了直後の reflection バッチ (最大 3 件) を実
+        `WorkerRunner` 経由で接続する — 各回とも独立の fake 子で即完了
+        する。"""
+        completed = 0
+        for i in range(3):
+            r_proc = _fast_ok_child_proc()
+            r_tmp_path = tmp_path / f"reflection_{i}"
+            r_tmp_path.mkdir()
+            r_runner, _r_kill_calls, _ = _spawn_runner(
+                monkeypatch, r_tmp_path, r_proc, _tiny_worker_settings())
+            r_result = r_runner.run(Mission(prompt="r", tools=[],
+                                            output_schema={}, max_turns=1,
+                                            timeout_sec=1.0))
+            reflection_statuses.append(r_result.status)
+            if r_result.status == "completed":
+                completed += 1
+        return completed
+
+    sup = MissionSupervisor(trade_fn=trade_fn, reflection_fn=reflection_fn,
+                            ask_fn=lambda q: q)
+    sup.start()
+    try:
+        first = sup.try_submit("trade", trigger="cron")
+        assert first.accepted is True
+
+        def _poll_submit_within(timeout):
+            """try_submit を別スレッドで呼び、戻らなければ None を返す
+            (busy 判定が壊れて queue.put が満杯のままブロックする壊れた実装を、
+            ポーリングループごとハングさせず失敗として検出する)。"""
+            box: list = []
+            th = threading.Thread(
+                target=lambda: box.append(sup.try_submit("trade", trigger="cron")),
+                daemon=True)
+            th.start()
+            th.join(timeout)
+            return box[0] if box and not th.is_alive() else None
+
+        # startup timeout → SIGTERM → (grace) → SIGKILL → 後片付け (claude
+        # では CLI pgid 回収も含む) → reflection 連鎖、が進行している間、
+        # 再 submit は running 以外で受理・拒否されてはならない。
+        deadline = time.monotonic() + 10.0
+        seen_running = False
+        while time.monotonic() < deadline and not first.future.done():
+            r = _poll_submit_within(1.0)
+            assert r is not None, (
+                "try_submit が戻らない (busy 判定が壊れて queue.put が"
+                "満杯のままブロックした可能性)")
+            assert not r.accepted, (
+                f"poll 中に受理されてしまった (経路が想定と異なる): {r}")
+            if r.reason == "running":
+                seen_running = True
+            time.sleep(0.01)
+        assert seen_running, "cleanup 中に running での拒否が観測できなかった"
+        assert kill_calls, "SIGKILL 到達を経由していない (この pin の前提)"
+        assert any(sig == signal.SIGKILL for _pid, sig, _t in kill_calls), (
+            f"SIGKILL が観測できていない: {kill_calls}")
+
+        dispatch_result = first.future.result(timeout=10.0)
+        if backend == "claude":
+            assert cli_reap_done.wait(timeout=5.0), (
+                "CLI pgid の回収完了イベントが立たない")
+            assert any(pid == cli_pgid for pid, _sig, _t in kill_calls), (
+                f"CLI pgid ({cli_pgid}) への killpg が観測できていない — "
+                f"cli_started で得た pgid が回収されていない疑い: {kill_calls}")
+        assert dispatch_result["trade"].status in ("failed", "timeout")
+        assert dispatch_result["reflection_count"] == 3
+        assert reflection_statuses == ["completed", "completed", "completed"]
+
+        # dispatch 完了直後は受理される (次の runner.run() は子プロセスの
+        # fd が閉じ済みで失敗し得るが、ここで見るのは受理そのもの)。future
+        # 完了を起点に 1 回だけ submit する。
+        again = sup.try_submit("trade", trigger="cron")
+        assert again.accepted is True
+        try:
+            again.future.exception(timeout=2.0)
+        except TimeoutError:
+            pytest.fail("2 回目の dispatch が有限時間で終わらなかった")
+    finally:
+        # busy 判定が壊れて `_lock` を保持したまま戻らないスレッドが
+        # 残った場合、`shutdown` (同じ lock を取る) が道連れでハングし
+        # 得る — daemon スレッドで実行し bounded join にする。
+        shutdown_th = threading.Thread(
+            target=lambda: sup.shutdown(drain_exc=RuntimeError("test shutdown")),
+            daemon=True)
+        shutdown_th.start()
+        shutdown_th.join(timeout=2.0)
         try:
             os.close(w)          # SIGKILL 時に閉じ済みなら OSError で無視
         except OSError:
@@ -4876,3 +5253,39 @@ def test_rpc_accepted_completes_before_response_reaches_child(
         on_child_response=lambda: seen.append(accepted_done.is_set()))
     assert seen == [True]   # 応答が子に届いた時点で accepted は完了済み
     assert response["result"] == {"value": 7}
+
+
+def test_abort_path_waits_use_the_shared_ceiling_constants(tmp_path, monkeypatch):
+    """打ち切り経路の固定待ち (SIGKILL 後の wait・reader.join・dispatcher.join
+    の余白) は mission_ceiling の定数そのもので待つ (上限 Cw の見積もりと
+    実際の待ちが食い違わない)。"""
+    from agentic_fx.core import mission_ceiling
+
+    settings = _tiny_worker_settings()
+    proc, w, _th = _silent_child_proc(tmp_path)
+    waits: list = []
+    proc.wait = lambda timeout=None: waits.append(timeout) or -9
+    joins: list = []
+    real_join = threading.Thread.join
+
+    def spy_join(self, timeout=None):
+        joins.append(timeout)
+        return real_join(self, timeout)
+
+    runner, kill_calls, _ = _spawn_runner(monkeypatch, tmp_path, proc, settings,
+                                          close_on_kill=w)
+    monkeypatch.setattr(threading.Thread, "join", spy_join)
+    try:
+        runner.run(Mission(prompt="p", tools=[], output_schema={},
+                           max_turns=1, timeout_sec=5.0))
+    finally:
+        monkeypatch.undo()
+        try:
+            os.close(w)
+        except OSError:
+            pass
+    assert any(sig == signal.SIGKILL for _, sig, _ in kill_calls)
+    assert waits and set(waits) == {mission_ceiling.KILL_WAIT_SEC}
+    assert mission_ceiling.READER_JOIN_SEC in joins
+    assert (settings.worker.rpc_timeout_sec
+            + mission_ceiling.DISPATCHER_JOIN_MARGIN_SEC) in joins

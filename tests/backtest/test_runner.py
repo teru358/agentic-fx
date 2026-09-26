@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import agentic_fx.backtest.runner as runner_module
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
     ConversionRate, FixedClock, InstrumentSpec, Origin, Quote, TradeIntent,
@@ -667,7 +668,7 @@ def test_expire_limits_reached_despite_stale_mark_to_market(tmp_path):
     sched = Scheduler(
         conn=conn, executor=executor, settings=SETTINGS, state_store=state,
         activity=activity, bars_fn=lambda p: None,   # 常に None — stale 経路
-        on_trade_mission=lambda reason: None, on_news_cycle=lambda: None,
+        on_trade_mission=lambda reason, **_: SubmitResult.rejected("shutdown", checked_at=0.0), on_news_cycle=lambda: None,
         on_econ_cycle=lambda: None)
 
     before = snapshots.latest(conn)["ts"]

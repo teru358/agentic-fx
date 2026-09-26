@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.accounting import record_snapshot
@@ -54,7 +55,7 @@ def test_full_paper_cycle(tmp_path):
     sched = Scheduler(conn=conn, executor=executor, settings=SETTINGS,
                       state_store=state, activity=activity,
                       bars_fn=lambda p: bars.get(p),
-                      on_trade_mission=lambda reason: None,
+                      on_trade_mission=lambda reason, **_: SubmitResult.rejected("shutdown", checked_at=0.0),
                       on_news_cycle=lambda: None,
                       on_econ_cycle=lambda: None)
 

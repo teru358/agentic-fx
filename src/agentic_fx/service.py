@@ -24,13 +24,14 @@ from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
 from agentic_fx.config import load_settings
+from agentic_fx.core import mission_ceiling
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import Scheduler
-from agentic_fx.core.supervisor import MissionSupervisor
+from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
 from agentic_fx.datafeed.outage import OutageStateMachine
@@ -637,6 +638,41 @@ def _warn_strategy_timeframe_mismatches(settings, plugins) -> None:
                 plugin.timeframe, decision_timeframe, plugin.name)
 
 
+def _check_mission_ceilings(settings, activity) -> None:
+    """判断足幅と mission 上限を突き合わせる。
+
+    worker 1 回の上限 Cw が判断足幅以上なら 1 確定足に 1 回の判断が構造的に
+    成立しないので起動を拒否する。dispatch 全体の上限 Cd が足幅以上でも
+    起動は妨げず WARNING を 1 回書く (実際の見送り・合流は稼働中の
+    cron_mission_deferred / cron_mission_coalesced で観測する)。
+    """
+    timeframe = settings.datafeed.decision_timeframe
+    width_sec = settings.datafeed.decision_timeframe_width.total_seconds()
+    cw = mission_ceiling.worker_ceiling(settings)
+    if cw.total >= width_sec:
+        raise RuntimeError(
+            f"判断足 {timeframe} ({width_sec:.0f} 秒) に対し worker 1 回の上限 "
+            f"Cw {cw.total:.0f} 秒 ({cw.breakdown_text()}) が足幅以上です。"
+            "1 確定足に 1 回の判断が成立しません。判断足を 15m 以上にするか "
+            "llama_swap.timeout_sec を下げてください")
+    cd = mission_ceiling.dispatch_ceiling_sec(settings)
+    explicit = settings.worker.dispatch_ceiling_sec
+    if explicit is not None and explicit < cd:
+        raise RuntimeError(
+            f"worker.dispatch_ceiling_sec={explicit:g} は dispatch 全体の上限 "
+            f"Cd {cd:.0f} 秒未満です。正常な dispatch の途中で watchdog が"
+            f"サービスを止め得るため、{cd:.0f} 以上にするか未設定 (自動導出) に"
+            "してください")
+    if cd >= width_sec:
+        activity.write(
+            Category.SYSTEM, "mission_ceiling_dispatch_warning",
+            f"判断足 {timeframe} ({width_sec:.0f} 秒) に対し dispatch 全体の上限 "
+            f"Cd {cd:.0f} 秒 (trade 1 + reflection 最大 "
+            f"{mission_ceiling.REFLECTIONS_PER_DISPATCH}、Cw {cw.total:.0f} 秒) が"
+            "足幅以上です。起動は続けます。見送り・合流は cron_mission_deferred / "
+            "cron_mission_coalesced で確認できます")
+
+
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
     """配線ミスの即時検出 (上書き 5): 必要なツールが登録されていることを確認する。"""
     missing = set(names) - set(registry.names())
@@ -654,10 +690,11 @@ class _SupervisorAsk:
         self._wait_timeout_sec = wait_timeout_sec
 
     def ask_once(self, question: str) -> str:
-        future = self._supervisor.try_submit("ask", question=question)
-        if future is None:
+        submitted = self._supervisor.try_submit("ask", question=question)
+        if not submitted.accepted:
             return ("(現在 Mission 実行中のため質問を受け付けられません。"
                     "しばらくして再試行してください)")
+        future = submitted.future
         try:
             return future.result(timeout=self._wait_timeout_sec)
         except TimeoutError:
@@ -928,6 +965,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             indicator_plugins=approved, provider=provider)
         # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
         _validate_startup(settings)
+        _check_mission_ceilings(settings, activity)
         # 段 0 F1 是正: 戻り値 (bin を解決済み絶対パスへ書き戻した settings)
         # で差し替える。この後に構築する WorkerRunner/registry が絶対パスの
         # settings を受け取るようにするため、必ず WorkerRunner 構築より前に置く。
@@ -998,12 +1036,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                                      clock=clock, core_lock=core_lock,
                                      watch=mission_watch)
 
-        def _trade_fn(trigger: str):
+        def _trade_fn(trigger: str, decision_bars=None):
             # プラン 8 (Task 15): TradeLoop 自身が prepare/commit-core で
             # core_lock を保持する五相構造になったため、ここでは lock を
             # 掴まない (二重取得は RLock で技術的には安全だが、run 相の
             # 間ずっと lock を保持したままになり Task 15 の目的を無効化する)。
-            return trade_loop.run_once(trigger)
+            return trade_loop.run_once(trigger, decision_bars=decision_bars)
 
         def _reflection_fn():
             # プラン 8 (Task 16): ReflectionCycle 自身が prepare/commit-core で
@@ -1074,11 +1112,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             activity.write(Category.IMPROVE, "improve_report_reconcile_failed",
                            safe_error_text(exc))
 
-        def on_trade_mission(trigger: str) -> bool:
+        def on_trade_mission(trigger: str, *, decision_bars) -> SubmitResult:
             # trigger は scheduler._trade_mission_due() が返した起動理由。
-            # supervisor.try_submit が受理すれば True (scheduler 側が cron
-            # 締切を前進させる判断材料になる — 設計書 §3.3)。
-            return supervisor.try_submit("trade", trigger=trigger) is not None
+            # decision_bars はその tick に前進した (pair, 判断足) の確定足。
+            # 受理/拒否と拒否理由をそのまま scheduler へ返す。
+            return supervisor.try_submit("trade", trigger=trigger,
+                                         decision_bars=decision_bars)
 
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
         def on_signal_maintenance(now: datetime) -> None:
@@ -1390,10 +1429,7 @@ def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
 
 
 def _default_dispatch_ceiling_sec(app: App) -> float:
-    w = app.settings.worker
-    per_mission = (app.settings.llama_swap.timeout_sec
-                   + w.worker_grace_sec + w.worker_terminate_grace_sec)
-    return per_mission * 4 + 60.0
+    return mission_ceiling.watchdog_ceiling_sec(app.settings)
 
 
 def _watchdog_check(app: App, scheduler_thread_obj: threading.Thread,

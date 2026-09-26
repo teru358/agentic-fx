@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import (
@@ -79,7 +80,7 @@ def _env(tmp_path, now, on_econ_cycle=None):
         conn=conn, executor=executor, settings=settings, state_store=state,
         activity=activity,
         bars_fn=provider.latest_1m_bar,          # ★ 注入点
-        on_trade_mission=lambda reason: trade_calls.append(reason),
+        on_trade_mission=lambda reason, **_: trade_calls.append(reason) or SubmitResult.rejected("running", checked_at=0.0),
         on_news_cycle=collector.collect,         # ★ 注入点
         # econ は既定ではカウンタ (EconCalendar.refresh は fetch_ff_calendar を
         # 直接呼ぶため、既定で渡すとこのファイルの全 tick が外部アクセスする)

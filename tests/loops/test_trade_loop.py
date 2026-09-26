@@ -1,8 +1,10 @@
 """取引判断 loop テスト — fail closed・全記録・ask 回答専用・二層境界・trigger 記録。"""
+import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import MagicMock, call, patch
 
 from agentic_fx.activity import ActivityLog
@@ -20,7 +22,7 @@ from agentic_fx.loops.trade_loop import TradeLoop
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.store import signals
+from agentic_fx.store import mission_decision_bars, signals
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 
@@ -31,8 +33,9 @@ SPEC = InstrumentSpec("USDJPY", 0.01, 0.01, 50.0, 0.01, 100_000, "USD", "JPY")
 QUOTE = Quote("USDJPY", 148.49, 148.51, NOW, "test")
 
 
-def _loop(tmp_path, results, healthy=True, monotonic_fn=None):
-    conn = connect(tmp_path / "t.db")
+def _loop(tmp_path, results, healthy=True, monotonic_fn=None, conn=None):
+    if conn is None:
+        conn = connect(tmp_path / "t.db")
     init_db(conn)
     record_snapshot(conn, now=NOW, balance=1_000_000, equity=1_000_000)
     clock = FixedClock(NOW)
@@ -800,3 +803,161 @@ def test_ask_once_non_mission_result_is_attributed_not_boundary_swallowed(
     row = conn.execute(
         "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
     assert row["status"] == "failed"
+
+
+_OPEN_USDJPY = {"action": "open", "pair": "USDJPY", "direction": "long",
+                "entry_type": "limit", "horizon": "day", "limit_price": 148.20,
+                "expires_in": "4h", "stop_loss": 147.80, "take_profit": 149.00,
+                "reasoning": "test"}
+
+
+def test_cron_mission_records_decision_bars_per_pair_and_order_joins_back(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", _OPEN_USDJPY, [])])
+    bars = {("USDJPY", "15m"): NOW - timedelta(minutes=45),
+            ("EURUSD", "15m"): NOW - timedelta(minutes=30)}
+    out = loop.run_once("cron", decision_bars=MappingProxyType(bars))
+    assert out["result"] == "pending"
+    mid = conn.execute("SELECT id FROM missions").fetchone()["id"]
+    assert mission_decision_bars.for_mission(conn, mid) == bars
+    row = conn.execute(
+        "SELECT b.bar_time FROM orders o "
+        "JOIN trade_intents i ON o.intent_id = i.id "
+        "JOIN mission_decision_bars b ON b.mission_id = i.mission_id "
+        "AND b.pair = o.pair WHERE o.pair = 'USDJPY'").fetchone()
+    assert row["bar_time"] == "2026-07-22T11:15:00+00:00"
+
+
+def test_start_cron_mission_happens_under_core_lock(tmp_path):
+    """`_start_cron_mission` (missions 行 +
+    mission_decision_bars 行の commit) は core_lock 保持中に呼ばれる —
+    呼び出し中は他スレッドから core_lock を取得できないことを実際に
+    検証する (骨格・恒真テストではない)。RLock は同一スレッドからの
+    acquire(blocking=False) は常に成功してしまうため、別スレッド
+    (checker) から確認する (test_requeue_signal_happens_under_core_lock
+    と同じ形)。"""
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    original = loop._start_cron_mission
+
+    def spy_start_cron_mission(*args, **kwargs):
+        entered.set()
+        assert proceed.wait(5.0), "checker スレッドが確認を完了しなかった"
+        return original(*args, **kwargs)
+
+    loop._start_cron_mission = spy_start_cron_mission
+
+    t = threading.Thread(
+        target=lambda: loop.run_once("cron", decision_bars=MappingProxyType(
+            {("USDJPY", "15m"): NOW - timedelta(minutes=15)})),
+        daemon=True)
+    t.start()
+    assert entered.wait(5.0), "_start_cron_mission が呼ばれなかった"
+
+    acquired: list[bool] = []
+
+    def _check():
+        ok = loop._core_lock.acquire(blocking=False)
+        acquired.append(ok)
+        if ok:
+            loop._core_lock.release()  # 誤って取れてしまった場合の後始末 (同一スレッドで)
+
+    checker = threading.Thread(target=_check)
+    checker.start()
+    checker.join(timeout=5.0)
+    assert acquired == [False], (
+        "_start_cron_mission 実行中は他スレッドから core_lock を取得できない"
+        "はず (prepare 相が with self._core_lock: で包んでいることの検証)")
+
+    proceed.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+
+def test_decision_bars_insert_failure_rolls_back_mission_and_leaves_mid_none(tmp_path):
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    conn.executescript(
+        "CREATE TRIGGER fail_mdb BEFORE INSERT ON mission_decision_bars "
+        "BEGIN SELECT RAISE(ABORT, 'injected decision bars failure'); END;")
+    out = loop.run_once("cron", decision_bars=MappingProxyType(
+        {("USDJPY", "15m"): NOW - timedelta(minutes=15)}))
+    assert out is None
+    assert conn.execute("SELECT COUNT(*) c FROM missions").fetchone()["c"] == 0
+    assert not conn.in_transaction
+    assert runner.missions == []
+    log = (tp / "a.log").read_text(encoding="utf-8")
+    assert "mission_boundary_failed" in log
+    assert "mission_finalize_conflict" not in log
+
+
+class _CommitFailsOnce(sqlite3.Connection):
+    """commit() を `fail_remaining` 回だけ失敗させる sqlite3.Connection の
+    サブクラス。失敗後は通常どおり動作する (retry 用)。"""
+    fail_remaining = 0
+
+    def commit(self):
+        if self.fail_remaining > 0:
+            self.fail_remaining -= 1
+            raise sqlite3.OperationalError("injected commit failure")
+        return super().commit()
+
+
+def _connect_commit_fails_once(db_path):
+    conn = sqlite3.connect(db_path, check_same_thread=False,
+                           factory=_CommitFailsOnce)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def test_start_cron_mission_commit_failure_rolls_back_and_reraises(tmp_path):
+    """`_start_cron_mission` の commit が 1 回失敗しても transaction を開いた
+    まま残さない (IV-11): rollback して `in_transaction` が False に戻り、
+    missions 行・mission_decision_bars 行のどちらも残らない。"""
+    conn = _connect_commit_fails_once(tmp_path / "t.db")
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])], conn=conn)
+    conn.fail_remaining = 1
+    bars = {("USDJPY", "15m"): NOW - timedelta(minutes=15)}
+    out = loop.run_once("cron", decision_bars=MappingProxyType(bars))
+    assert out is None
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) c FROM missions").fetchone()["c"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) c FROM mission_decision_bars").fetchone()["c"] == 0
+    assert runner.missions == []
+    log = (tp / "a.log").read_text(encoding="utf-8")
+    assert "mission_boundary_failed" in log
+
+
+def test_cron_mission_rows_are_committed_before_runner_starts(tmp_path):
+    """missions 行と mission_decision_bars 行は run 相 (runner.run) に入る前に
+    commit 済みで、別接続から両方見える。"""
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "x"}, [])])
+    bars = {("USDJPY", "15m"): NOW - timedelta(minutes=15)}
+    seen = []
+    real_run = runner.run
+
+    def run(mission):
+        other = connect(tmp_path / "t.db")
+        try:
+            mids = [r["id"] for r in other.execute("SELECT id FROM missions")]
+            seen.append((conn.in_transaction, mids,
+                         [mission_decision_bars.for_mission(other, m) for m in mids]))
+        finally:
+            other.close()
+        return real_run(mission)
+
+    runner.run = run
+    loop.run_once("cron", decision_bars=MappingProxyType(bars))
+    assert len(seen) == 1
+    in_tx, mids, provenance = seen[0]
+    assert in_tx is False
+    assert len(mids) == 1
+    assert provenance == [bars]

@@ -25,6 +25,65 @@ def test_ensure_column_migration_is_idempotent_for_mission_id(tmp_path):
     assert "mission_id" in cols
 
 
+def test_init_db_adds_new_b2_tables_without_touching_existing_rows(tmp_path):
+    """M1: `cron_cursor`/`mission_decision_bars` の 2 表が無い旧 schema の
+    DB に `missions`/`orders` の監査行を入れてから `init_db` を通しても、
+    既存行の値・件数は不変で、新表だけが (空で) 増える。"""
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "t.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+
+    # 旧 schema を模す: B-2 で新設した 2 表を落としてから監査行を入れる。
+    raw = sqlite3.connect(db_path)
+    raw.row_factory = sqlite3.Row
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.executescript(
+        "DROP TABLE cron_cursor;\n"
+        "DROP TABLE mission_decision_bars;\n"
+        "INSERT INTO missions (id,loop,runner,model,status,trigger,started_at,"
+        "finished_at) VALUES "
+        "(1,'trade','local','m','completed','cron','2026-01-01T00:00:00+00:00',"
+        "'2026-01-01T00:01:00+00:00');\n"
+        "INSERT INTO orders (id,pair,direction,entry_type,horizon,status,"
+        "quantity,avg_fill_price,close_price,realized_pnl,close_reason,"
+        "created_at,updated_at) VALUES "
+        "(1,'USDJPY','long','market','day','closed',0.1,148.0,149.0,100.0,"
+        "'tp','2026-01-01T00:00:00+00:00','2026-01-01T00:01:00+00:00');")
+    raw.commit()
+    tables_before = {r[0] for r in raw.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "cron_cursor" not in tables_before
+    assert "mission_decision_bars" not in tables_before
+    mission_before = dict(raw.execute(
+        "SELECT * FROM missions WHERE id=1").fetchone())
+    order_before = dict(raw.execute(
+        "SELECT * FROM orders WHERE id=1").fetchone())
+    raw.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+
+    tables_after = {r["name"] for r in
+                    conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "cron_cursor" in tables_after
+    assert "mission_decision_bars" in tables_after
+    assert conn.execute("SELECT COUNT(*) AS c FROM cron_cursor").fetchone()["c"] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) AS c FROM mission_decision_bars").fetchone()["c"] == 0
+
+    assert conn.execute("SELECT COUNT(*) AS c FROM missions").fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"] == 1
+    mission_after = dict(conn.execute("SELECT * FROM missions WHERE id=1").fetchone())
+    order_after = dict(conn.execute("SELECT * FROM orders WHERE id=1").fetchone())
+    assert mission_after == mission_before
+    assert order_after == order_before
+
+
 def test_table_names_include_candidate_archives():
     from agentic_fx.store.db import TABLE_NAMES
 
@@ -36,6 +95,7 @@ def test_table_names_include_candidate_archives():
         "alert_state", "improve_waves", "improve_wave_slots",
         "plugin_switch_journal",
         "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+        "cron_cursor", "mission_decision_bars",
     })
 
 

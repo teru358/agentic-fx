@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from collections.abc import Mapping
+from datetime import datetime
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
@@ -35,7 +37,7 @@ from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
 from agentic_fx.store import intents as intents_store
-from agentic_fx.store import missions, signals
+from agentic_fx.store import mission_decision_bars, missions, signals
 
 import logging
 
@@ -88,9 +90,10 @@ class TradeLoop:
 
     # ---- 公開 API (never-raise サービス境界) -----------------------------------
 
-    def run_once(self, trigger: str = "cron") -> dict | None:
+    def run_once(self, trigger: str = "cron",
+                 decision_bars: Mapping[tuple[str, str], datetime] | None = None) -> dict | None:
         try:
-            return self._run_once_impl(trigger)
+            return self._run_once_impl(trigger, decision_bars)
         except Exception:  # noqa: BLE001 — サービス境界: 周期を殺さない
             _log.exception("trade mission service boundary failed")
             self._safe_report_boundary_failure("trade")
@@ -106,7 +109,8 @@ class TradeLoop:
 
     # ---- 実装本体 ---------------------------------------------------
 
-    def _run_once_impl(self, trigger: str = "cron") -> dict | None:
+    def _run_once_impl(self, trigger: str = "cron",
+                       decision_bars: Mapping[tuple[str, str], datetime] | None = None) -> dict | None:
         """取引判断 Mission 1 回分 (プラン8 五相再構成 — 設計書 §3.1)。
 
         prepare (lock 保持) → run (lock 非保持) → commit-pre (lock 非保持:
@@ -208,10 +212,13 @@ class TradeLoop:
                     prompt = self._build_prompt(load_prompt("trade_mission"))
                 mission = self._build_mission(prompt)
                 if mid is None:
-                    mid = missions.start(self.conn, "trade",
-                                         self.settings.runner.trade.backend,
-                                         self.settings.runner.trade.model, now,
-                                         trigger=trigger)
+                    if trigger == "cron" and decision_bars:
+                        mid = self._start_cron_mission(now, decision_bars)
+                    else:
+                        mid = missions.start(self.conn, "trade",
+                                             self.settings.runner.trade.backend,
+                                             self.settings.runner.trade.model, now,
+                                             trigger=trigger)
 
             # ---- run (core_lock 非保持) ----
             self.watch.begin(mid, "trade", mission.timeout_sec)
@@ -435,6 +442,23 @@ class TradeLoop:
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
+
+    def _start_cron_mission(self, now, decision_bars) -> int:
+        """missions 行と mission_decision_bars 行を 1 transaction で確定する
+        (core_lock 保持中に呼ぶ)。例外時は両方を rollback して再送出する —
+        呼び出し元の mid には何も代入されないので、外側 finally の
+        finalize (commit されていない mission の終端) は走らない。"""
+        try:
+            mid = missions.start(self.conn, "trade",
+                                 self.settings.runner.trade.backend,
+                                 self.settings.runner.trade.model, now,
+                                 trigger="cron", commit=False)
+            mission_decision_bars.insert_many(self.conn, mid, decision_bars)
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        return mid
 
     def _notify_gate_reject_streak(self) -> None:
         """commit-post 専用 (設計書 D3 / D3')。判定は `_conn_supervisor`、

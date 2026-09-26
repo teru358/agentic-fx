@@ -56,6 +56,28 @@ def next_rollover(now: datetime) -> datetime:
     return boundary
 
 
+_SESSION_SEARCH_MAX_DAYS = 14
+
+
+def session_start(now: datetime) -> datetime:
+    """直近の「閉場→開場」遷移の時刻 (21:00 UTC 境界) を返す。
+
+    開閉の状態は 21:00 UTC の rollover 境界でしか変わらないので、直近の
+    境界から 1 日ずつ遡り、その境界で開場かつ 1 分前が閉場の最初の境界を
+    返す。曜日の固定パターンではないので、祝日と週末が連結した閉場
+    (2026-12-25 金・2027-01-01 金) の途中の金曜 21:00 を開場と誤らない。
+    """
+    boundary = trading_day_start(_as_utc(now))
+    for _ in range(_SESSION_SEARCH_MAX_DAYS):
+        if (is_market_open(boundary)
+                and not is_market_open(boundary - timedelta(minutes=1))):
+            return boundary
+        boundary -= timedelta(days=1)
+    raise ValueError(
+        f"no closed-to-open transition within {_SESSION_SEARCH_MAX_DAYS} "
+        f"days before {now.isoformat()}")
+
+
 def next_expected_trading_time(after: datetime, width: timedelta) -> datetime:
     """``after`` の次に確定するはずの足の開始時刻 (既知の休場を飛ばす)。
 
