@@ -254,7 +254,7 @@ def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
 
     EXPECTED_OPTIONAL_PARAMS = {
         "health_latch", "improve_supervisor", "policy_path",
-        "plugins_root", "settings",
+        "plugins_root", "settings", "outage",
     }
     sig = inspect.signature(RealCommands.__init__)
     optional_params = {
@@ -291,6 +291,9 @@ def test_commands_optional_params_all_wired_by_build_app(tmp_path, monkeypatch):
         # 差し替え — 等値だが同一でない model_copy 漏れ — も検出したい)。
         assert captured_kwargs["plugins_root"] == tmp_path / "plugins"
         assert captured_kwargs["settings"] is app.settings
+        # `outage` も build_app が作った唯一のインスタンスが App と Commands の
+        # 両方へ同一のまま渡る (data resume の要求先が App の観測対象と一致する)。
+        assert captured_kwargs["outage"] is app.outage
     finally:
         app.close()
 
