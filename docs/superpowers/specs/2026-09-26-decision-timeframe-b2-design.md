@@ -1,4 +1,4 @@
-# [decision-timeframe-config] B-2 設計書 v1.3
+# [decision-timeframe-config] B-2 設計書 v1.4
 
 対象 commit: `ada582b`。作成日: 2026-09-26。先行 spec: A2-1 [closed-bars-and-required-window] v1.1、B-1 [decision-timeframe-config] v1.0、A2-3 [outage-stop-and-backfill] v1.1 (いずれも main に merge 済み)。範囲の正は `docs/superpowers/specs/2026-09-22-decision-timeframe-config-design.md` §2 の B-2 行 5 つと §4 である。範囲外: `[multi-decision-timeframes]`、`[intent-evidence-timeframe-gate]`、`[first-run-setup]`。
 
@@ -95,7 +95,7 @@
 
 **abandoned の付与条件 (明文化、変更なし)**: 鮮度切れ、または requeue 回数の上限。購読後は 「どの mission にも引き受けられないまま鮮度が切れた」(不通・busy 継続) の意味になる。
 
-**失敗時**: cron mission の timeout・max_turns・パース失敗・prepare 例外 → claim 分を requeue (requeue_count+1)。lease 切れ (15 分) の回収も同じ上限判定。claim 後にプロセスが落ちた場合は 起動時の `reclaim_expired` が回収する (`service.py:1187-1191`)。
+**失敗時**: cron mission の timeout・max_turns・パース失敗・prepare 例外 → claim 分を requeue (requeue_count+1)。lease 切れ (15 分) の回収も同じ上限判定。 **lease は mission の worker 上限 Cw より長くなければならない** (短いと走行中に `reclaim_expired` が pending に戻し、mission の consume が CAS で失敗して判断が捨てられる)。起動時に `signal_lease_min × 60 > Cw` を検査し、満たさなければ理由を出して起動拒否 (IV-7 と同じ型)。claim 後にプロセスが落ちた場合は 起動時の `reclaim_expired` が回収する (`service.py:1187-1191`)。
 
 ### 3.2 restart catch-up の一般化と閉場境界
 
@@ -432,3 +432,4 @@ bridge や外部 source を叩く測定は無い。
 |2026-09-26|v1.1|§11 の task 割当を修正: AC-B2-21 を (a)Tb2/(b)Tb1/(c)Tc1 に分割し段 a では「1h の発火リズムが B-1 と同じ」ことだけを確認、AC-B2-24 を (a)Ta3/(b)Tb1 に分割 (§11)。§10 の記述を訂正: `try_submit` spy は `:452-463・506-517・635-647` の 3 本 (§10)、`test_service_app.py:1487-1589` は書換え不要で、実際に旧式を pin しているのは `:1409-1441` (書換え式・新 pin 値 518.0 を明記、§10)。cursor 復元は `Scheduler.__init__` (`init_db` が先行) で完結し `service.py` の起動処理は変えないと訂正 (§2, §3.2, §10, §11)。`SubmitResult` に `checked_at` を追加し、`_run` のスロット解放を future 解決の**前**に置き換える設計に修正、現物 (`supervisor.py:106-141`) がスロットを future 解決の**後**に空ける潜在欠陥を §1 に事実として追加、AC-B2-03 に対応する逆変異を追加 (§1, §3.3, §4, §5, §8)。§3.3 の Cw 内訳に余白の性質差 (SIGKILL 系 15 秒は正常系でほぼ未消費 / `dispatcher.join` の `rpc_timeout_sec+5` は RPC 張り付きで実測でも支配的) を注記し、AC-B2-03 に RPC 投げっぱなし fake のケースを追加 (§3.3, §5)。§3.5 の provenance 表から「mission 開始 summary に `decision_tf`」の記述を削除 (該当 event が無いため。provenance は `mission_decision_bars` が正、§3.5)。§3.5 の `mid=None` の記述を「例外ハンドラでの明示代入」から「prepare 関数が成功時のみ値を返す構成による構造的な `None`」に訂正 (§3.5)。§3.2 の cron due 規則に pair 単位の判定を明記: 同一 tick で前セッション足の pair と今セッション足の pair が混在し得ることを式・遷移表に反映 (§3.2)。|実装プラン執筆・着手前検証・外部レビューで判明した現物との差|—|
 |2026-09-26|v1.2|§3.2 に復元の 2 段 (起動時読み = 起動拒否判定、毎 tick 再読込 = 通常復元) を明記。§3.3 に Cd の前提 (reflection = trade と同じ runner) を明記。|実装後の変異スイープの申し送り (起動時復元と毎 tick 再読込の重複、Cd の見積り前提)|—|
 |2026-09-27|v1.3|IV-2 の失敗記録を (pair, interval) 単位と明記。|実装レビュー 2 周目で、複数 pair が同 tick に失敗すると 2 件目以降が無音になる欠陥を是正したため|`b0de51f`|
+|2026-09-27|v1.4|§3.1 失敗時に lease と Cw の関係 (`signal_lease_min × 60 > Cw` の起動時検査) を追加。|段 c 実装後の変異スイープで、lease 切れにより cron の判断が捨てられる新経路が見つかったため|—|
