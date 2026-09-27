@@ -134,7 +134,7 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   max_bars_limit: 1000          # plugin config.yaml の max_bars 上限。discover では照合しない — 承認 (submit/bless) と get_indicators (indicator 合成) で照合し、超過は拒否する
   producer_source: yfinance     # 本番 producer が signal/strategy plugin を評価する際の data source (プラン 7 Task 6)
   signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)
-  signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)
+  signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)。mission の worker 上限 Cw + 60 秒より長くないと起動拒否 (既定 Cw 405 秒 → 8 分以上)
   signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか
   signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
   signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限

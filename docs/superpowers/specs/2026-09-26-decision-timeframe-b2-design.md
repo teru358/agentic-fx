@@ -1,4 +1,4 @@
-# [decision-timeframe-config] B-2 設計書 v1.4
+# [decision-timeframe-config] B-2 設計書 v1.5
 
 対象 commit: `ada582b`。作成日: 2026-09-26。先行 spec: A2-1 [closed-bars-and-required-window] v1.1、B-1 [decision-timeframe-config] v1.0、A2-3 [outage-stop-and-backfill] v1.1 (いずれも main に merge 済み)。範囲の正は `docs/superpowers/specs/2026-09-22-decision-timeframe-config-design.md` §2 の B-2 行 5 つと §4 である。範囲外: `[multi-decision-timeframes]`、`[intent-evidence-timeframe-gate]`、`[first-run-setup]`。
 
@@ -95,7 +95,7 @@
 
 **abandoned の付与条件 (明文化、変更なし)**: 鮮度切れ、または requeue 回数の上限。購読後は 「どの mission にも引き受けられないまま鮮度が切れた」(不通・busy 継続) の意味になる。
 
-**失敗時**: cron mission の timeout・max_turns・パース失敗・prepare 例外 → claim 分を requeue (requeue_count+1)。lease 切れ (15 分) の回収も同じ上限判定。 **lease は mission の worker 上限 Cw より長くなければならない** (短いと走行中に `reclaim_expired` が pending に戻し、mission の consume が CAS で失敗して判断が捨てられる)。起動時に `signal_lease_min × 60 > Cw` を検査し、満たさなければ理由を出して起動拒否 (IV-7 と同じ型)。claim 後にプロセスが落ちた場合は 起動時の `reclaim_expired` が回収する (`service.py:1187-1191`)。
+**失敗時**: cron mission の timeout・max_turns・パース失敗・prepare 例外 → claim 分を requeue (requeue_count+1)。lease 切れ (15 分) の回収も同じ上限判定。 **lease は mission の worker 上限 Cw より長くなければならない** (短いと走行中に `reclaim_expired` が pending に戻し、mission の consume が CAS で失敗して判断が捨てられる)。起動時に `signal_lease_min × 60 > Cw + 60 秒` (余白 60 秒 = claim から consume までに worker 外で走る commit-pre のネットワーク呼出し分) を検査し、満たさなければ理由を出して起動拒否 (IV-7 と同じ型)。claim 後にプロセスが落ちた場合は 起動時の `reclaim_expired` が回収する (`service.py:1187-1191`)。
 
 ### 3.2 restart catch-up の一般化と閉場境界
 
@@ -433,3 +433,4 @@ bridge や外部 source を叩く測定は無い。
 |2026-09-26|v1.2|§3.2 に復元の 2 段 (起動時読み = 起動拒否判定、毎 tick 再読込 = 通常復元) を明記。§3.3 に Cd の前提 (reflection = trade と同じ runner) を明記。|実装後の変異スイープの申し送り (起動時復元と毎 tick 再読込の重複、Cd の見積り前提)|—|
 |2026-09-27|v1.3|IV-2 の失敗記録を (pair, interval) 単位と明記。|実装レビュー 2 周目で、複数 pair が同 tick に失敗すると 2 件目以降が無音になる欠陥を是正したため|`b0de51f`|
 |2026-09-27|v1.4|§3.1 失敗時に lease と Cw の関係 (`signal_lease_min × 60 > Cw` の起動時検査) を追加。|段 c 実装後の変異スイープで、lease 切れにより cron の判断が捨てられる新経路が見つかったため|—|
+|2026-09-27|v1.5|lease 検査に commit-pre の余白 60 秒を加える。|worker 上限だけでは claim〜consume の実拘束期間を覆わないと指摘されたため|—|
