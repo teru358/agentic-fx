@@ -33,6 +33,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin import approval as plugin_approval
+from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
@@ -521,6 +522,18 @@ _UNRESOLVED_JOURNAL_RECOVERY_HINT = (
     "  収束手順: サービスの対話シェルで `approval list` → "
     "`approval retry <approval_id>`")
 
+_HISTORY_GIT_RECOVERY_HINT = (
+    "  次の一手: `plugins/.history.git` の状態を確認し、"
+    "`git -C plugins/.history.git fsck` 相当で整合性を直してから"
+    "同じ bless をやり直してください。")
+
+
+def _version_hash_recovery_hint(name: str) -> str:
+    return (
+        f"  次の一手: 版 dir の内容が候補と一致しません。"
+        f"`plugins/.versions/{name}/` を確認し、必要なら候補を直して "
+        "bless をやり直してください。")
+
 
 def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
     if getattr(args, "from_kind", None) == "_human":
@@ -602,6 +615,15 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
         # 元メッセージの `op_id=` / `approval_id=` は runbook と既存テストが
         # 依存しているので必ず含める。
         print(f"エラー: {e}\n{_UNRESOLVED_JOURNAL_RECOVERY_HINT}", file=sys.stderr)
+        return 1
+    except HistoryGitError as e:
+        print(f"エラー: {e}\n{_HISTORY_GIT_RECOVERY_HINT}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        hint = (_UNRESOLVED_JOURNAL_RECOVERY_HINT
+                if "after switch" in str(e)
+                else _version_hash_recovery_hint(args.name))
+        print(f"エラー: {e}\n{hint}", file=sys.stderr)
         return 1
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)

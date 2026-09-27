@@ -1659,6 +1659,75 @@ def test_plugin_materialize_os_error_subclass_is_rc1_message(tmp_path, monkeypat
     assert "permission denied" in err
 
 
+def test_plugin_bless_after_switch_runtime_error_has_recovery_hint(
+        tmp_path, monkeypatch, capsys):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError(
+            "plugin 'x': live content_hash mismatch after switch (...)")
+
+    monkeypatch.setattr(_switch, "bless_candidate", _boom)
+    rc = _cli._plugin_bless(
+        None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "エラー:" in captured.err
+    assert "live content_hash mismatch after switch (...)" in captured.err
+    assert "approval retry" in captured.err
+    assert "approval id=" not in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_plugin_bless_version_runtime_error_has_version_dir_hint(
+        tmp_path, monkeypatch, capsys):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("plugin 'x': version content_hash mismatch")
+
+    monkeypatch.setattr(_switch, "bless_candidate", _boom)
+    rc = _cli._plugin_bless(
+        None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "エラー:" in err
+    assert "plugins/.versions/x/" in err
+    assert "approval retry" not in err
+    assert "Traceback" not in err
+
+
+def test_plugin_bless_history_git_error_has_fsck_hint(
+        tmp_path, monkeypatch, capsys):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import history_git as _history_git
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise _history_git.HistoryGitError("plugins/.history.git: damaged")
+
+    monkeypatch.setattr(_switch, "bless_candidate", _boom)
+    rc = _cli._plugin_bless(
+        None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "エラー:" in err
+    assert "plugins/.history.git" in err
+    assert "git -C plugins/.history.git fsck" in err
+    assert "Traceback" not in err
+
+
 def _cli_root_for_plugin_commands(tmp_path: Path) -> Path:
     """`afx plugin ...` が要求する tmp root
     (`tests/plugin/test_indicator_initial_set.py::_cli_env` と同じ作り —
