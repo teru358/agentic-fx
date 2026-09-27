@@ -1679,6 +1679,8 @@ def test_plugin_bless_after_switch_runtime_error_has_recovery_hint(
     assert "エラー:" in captured.err
     assert "live content_hash mismatch after switch (...)" in captured.err
     assert "approval retry" in captured.err
+    assert ".versions/" in captured.err and "reject" in captured.err
+    assert "fsck" not in captured.err
     assert "approval id=" not in captured.out
     assert "Traceback" not in captured.err
 
@@ -1703,6 +1705,8 @@ def test_plugin_bless_version_runtime_error_has_version_dir_hint(
     assert "エラー:" in captured.err
     assert "plugin 'x': version content_hash mismatch" in captured.err
     assert "approval retry" in captured.err
+    assert ".versions/" in captured.err and "reject" in captured.err
+    assert "fsck" not in captured.err
     assert "approval id=" not in captured.out
     assert "Traceback" not in captured.err
 
@@ -1727,6 +1731,8 @@ def test_plugin_bless_history_git_error_has_fsck_hint(
     assert "エラー:" in captured.err
     assert "plugins/.history.git: damaged" in captured.err
     assert "approval retry" in captured.err
+    assert "fsck" in captured.err
+    assert ".versions/" not in captured.err
     assert "approval id=" not in captured.out
     assert "Traceback" not in captured.err
 

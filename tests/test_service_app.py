@@ -2772,6 +2772,8 @@ def test_signal_maintenance_notifies_unknown_timeframe_once(tmp_path):
     _, event, summary, ref_id = activity.calls[0]
     assert event == "signal_abandoned_invalid_timeframe"
     assert str(signal_id) in summary
+    assert "unknown_plugin" in summary
+    assert "'9x'" in summary
     assert ref_id == str(signal_id)
     conn.close()
 
