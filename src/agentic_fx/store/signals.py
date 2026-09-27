@@ -42,9 +42,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES, TF_MINUTES
 
 # timeframe → 分数の CASE 式。鮮度・失効判定はここだけを参照する
 # (式を複製すると将来 timeframe を追加したときに片方だけ更新され乖離する
@@ -67,7 +67,14 @@ _CUTOFF_EXPR = (
     "|| ' minutes')"
 )
 _FRESH_CONDITION = f"datetime(bar_ts) >= {_CUTOFF_EXPR}"
-_STALE_CONDITION = f"datetime(bar_ts) < {_CUTOFF_EXPR}"
+# `_TF_MINUTES_CASE` が NULL (= 未知 timeframe) の行は `_CUTOFF_EXPR` も
+# NULL になり、通常の日時比較はどちらの向きでも NULL (偽) になる —
+# 「claim も expire もされない不死身の pending」(`add` の docstring 参照)。
+# expire_stale 側は無条件 stale 扱いにして終端させる (claim_oldest 側は
+# 触れない — `_FRESH_CONDITION` が NULL/偽のままなので構造的に claim
+# されない、そちらはそれで安全)。
+_STALE_CONDITION = (
+    f"({_TF_MINUTES_CASE} IS NULL OR datetime(bar_ts) < {_CUTOFF_EXPR})")
 
 # requeue / reclaim_expired 共有の遷移式 (controller 解決 #6 逐語):
 # requeue_count >= max_requeue なら abandoned (増分なし)、
@@ -126,6 +133,24 @@ def _validate_bar_ts(conn: sqlite3.Connection, bar_ts: str) -> None:
     if row[0] is None:
         raise ValueError(
             f"bar_ts is not accepted by SQLite datetime(): {bar_ts!r}")
+
+
+def freshness_window(timeframe: str, bar_ts: str,
+                     freshness_bars: int) -> tuple[str, str]:
+    """signal の ``(bar_close, fresh_until)`` を ISO 文字列で返す (DB は触らない)。
+
+    ``bar_close`` は strategy 足の確定時刻 (``bar_ts`` + 足幅)。
+    ``fresh_until`` は ``bar_ts`` + 足幅 × ``freshness_bars`` で、
+    ``_FRESH_CONDITION`` / ``_STALE_CONDITION`` と同じ境界 — now がこの時刻
+    以下なら pending のまま claim でき、超えると maintenance の
+    ``expire_stale`` が abandoned にする。``freshness_bars`` は
+    ``settings.plugin.signal_freshness_bars`` (``Field(ge=1)``) 由来で
+    常に int — 鮮度ゲート無効の経路は本番に存在しない。
+    """
+    start = datetime.fromisoformat(bar_ts)
+    width = timedelta(minutes=TF_MINUTES[timeframe])
+    fresh_until = (start + width * freshness_bars).isoformat()
+    return (start + width).isoformat(), fresh_until
 
 
 def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
@@ -187,20 +212,38 @@ def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
 
 
 def expire_stale(conn: sqlite3.Connection, *, now: datetime,
-                  freshness_bars: int) -> int:
+                  freshness_bars: int, activity=None) -> int:
     """鮮度切れの pending を一括で abandoned にする。claimed には触れない。
 
     claim_oldest とは独立の公開関数 (呼び出し側が通知件数に使う)。claim
     前に呼ぶ想定だが、呼び忘れ・競合があっても claim_oldest 自身の鮮度
     条件が防波堤になる (このモジュール docstring 参照)。
+
+    ``_STALE_CONDITION`` は未知 timeframe の行 (`_TF_MINUTES_CASE` が NULL)
+    も無条件に対象へ含む。``activity`` を渡すと、そのうち未知 timeframe が
+    理由の行だけ 1 件ずつ理由付きで記録する (``ActivityLog.write`` は例外
+    を送出しない契約なので try で包まない)。``activity=None`` (既定) は
+    記録しない — 呼び出し規約を壊さない後方互換のデフォルト。
     """
     _require_aware(now, "now")
     cur = conn.execute(
         "UPDATE signals SET status='abandoned' "
-        f"WHERE status='pending' AND {_STALE_CONDITION}",
+        f"WHERE status='pending' AND {_STALE_CONDITION} "
+        f"RETURNING id, plugin, timeframe, ({_TF_MINUTES_CASE} IS NULL) "
+        "AS invalid_timeframe",
         {"now": now.isoformat(), "freshness_bars": freshness_bars})
+    rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
-    return cur.rowcount
+    if activity is not None:
+        from agentic_fx.activity import Category
+        for row in rows:
+            if row["invalid_timeframe"]:
+                activity.write(
+                    Category.TRADE, "signal_abandoned_invalid_timeframe",
+                    f"signal #{row['id']} ({row['plugin']}) "
+                    f"timeframe={row['timeframe']!r} — invalid_timeframe",
+                    ref_id=str(row["id"]))
+    return len(rows)
 
 
 def consume(conn: sqlite3.Connection, signal_id: int, *, mission_id: int,

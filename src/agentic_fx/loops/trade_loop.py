@@ -48,6 +48,9 @@ _TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
                 "get_recent_reflections", "search_reflections",
                 "get_signals"]
 
+# 最古の pending signal を 1 件 claim する trigger (判断足の cron と signal 起動)。
+_CLAIMING_TRIGGERS = frozenset({"cron", "signal"})
+
 
 def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
     """(streak_id, rejected_count, dominant_category) — 設計書 D3 の SQL ①②③。
@@ -166,29 +169,35 @@ class TradeLoop:
             # ---- prepare (core_lock 保持) ----
             with self._core_lock:
                 now = self.clock.now()
-                if trigger == "signal":
-                    # ②missions.start(trigger="signal") — 暫定値。NULL 窓を作らず、
+                if trigger == "cron" and decision_bars:
+                    mid = self._start_cron_mission(now, decision_bars)
+                else:
+                    # signal 起動では trigger="signal" が暫定値。NULL 窓を作らず、
                     # signals_rate_ok の LIKE 'signal%' がこの行も数える (§12 不変
                     # 条件は維持したまま常に非 NULL trigger を持たせる)。
                     mid = missions.start(self.conn, "trade",
                                          self.settings.runner.trade.backend,
                                          self.settings.runner.trade.model, now,
-                                         trigger="signal")
-                    # ③claim_oldest — 失敗なら LLM を起こさず即 finalize (skipped)。
+                                         trigger=trigger)
+                if trigger in _CLAIMING_TRIGGERS:
+                    # claim_oldest は mission 行 (cron では mission_decision_bars
+                    # 行も) が commit された後に呼ぶ — claim_oldest は自身で
+                    # commit する別トランザクションなので、claim 済みなのに
+                    # mission が未確定という状態を作らない。1 mission が引き受ける
+                    # signal は最古の 1 件だけ (1 mission = 1 claim = 1 intent)。
+                    # signal 起動で claim できなければ LLM を起こさず skipped、
+                    # cron は signal なしで判断を続ける。
                     try:
                         claimed = signals.claim_oldest(
                             self.conn, mission_id=mid, now=now,
                             freshness_bars=self.settings.plugin.signal_freshness_bars)
-                        if claimed is None:
+                        if claimed is None and trigger == "signal":
                             missions.finish(self.conn, mid, "skipped", None, [], now)
                             finalized = True
                             return None
                     except Exception:
-                        # fix round 1 F2 (codex): claim_oldest (または直後の
-                        # "skipped" finish) が例外を出すと、以前は mission が
-                        # running のまま永久残留していた。missions.start と
-                        # claim_oldest の間、または claim 失敗直後の finish の間で
-                        # 例外が起きても、mission を必ず終端させる。
+                        # claim_oldest (または直後の "skipped" finish) が例外を
+                        # 出しても mission を running のまま残さず必ず終端させる。
                         #
                         # claim_oldest 内部で「DB は commit 済みだが呼び出し直後に
                         # Python 例外」という曖昧窓は原理的に残る (claimed 行が
@@ -204,21 +213,15 @@ class TradeLoop:
                             finalized = True
                         raise
                 if claimed is not None:
-                    # ④set_trigger で plugin 名を確定 ⑤プロンプトへシグナル行を注入
-                    missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
+                    # signal 起動では set_trigger で plugin 名を確定する。cron は
+                    # "cron" のまま (signal 起動の頻度制限に数えない)。
+                    if trigger == "signal":
+                        missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
                     prompt = (self._build_prompt(load_prompt("trade_mission"))
-                             + self._format_signal_injection(claimed))
+                             + self._format_signal_injection(claimed, trigger))
                 else:
                     prompt = self._build_prompt(load_prompt("trade_mission"))
                 mission = self._build_mission(prompt)
-                if mid is None:
-                    if trigger == "cron" and decision_bars:
-                        mid = self._start_cron_mission(now, decision_bars)
-                    else:
-                        mid = missions.start(self.conn, "trade",
-                                             self.settings.runner.trade.backend,
-                                             self.settings.runner.trade.model, now,
-                                             trigger=trigger)
 
             # ---- run (core_lock 非保持) ----
             self.watch.begin(mid, "trade", mission.timeout_sec)
@@ -514,19 +517,46 @@ class TradeLoop:
             max_turns=self.settings.llama_swap.max_turns,
             timeout_sec=self.settings.llama_swap.timeout_sec)
 
-    def _format_signal_injection(self, claimed: dict) -> str:
-        """claim した signals 行 (plugin/pair/timeframe/bar_ts/payload) を
-        LLM が判断材料にできる形でプロンプトに追記する (brief 上書き 6)。"""
+    def _format_signal_injection(self, claimed: dict, trigger: str) -> str:
+        """claim した signals 行を「この判断で扱う signal」節としてプロンプトに
+        追記する。strategy_timeframe は signal を作った strategy の足 (判断足
+        とは限らない)、bar_close は strategy 足の確定時刻、fresh_until は
+        pending のまま引き受けられる最後の時刻 (これを過ぎると abandoned)。"""
         payload = json.loads(claimed["payload_json"])
+        direction = payload.get("direction") if isinstance(payload, dict) else None
+        try:
+            bar_close, fresh_until = signals.freshness_window(
+                claimed["timeframe"], claimed["bar_ts"],
+                self.settings.plugin.signal_freshness_bars)
+        except KeyError:
+            # fail-open: 未知 timeframe (通常は claim_oldest 自身の鮮度
+            # ゲートが構造的に弾く — signal_tools.get_signals と同じ
+            # 規律の防御的複製) で例外を出すと、この Mission は failed →
+            # requeue → 次 cron が同じ最古行を再 claim → 再度失敗、を
+            # 繰り返す (`_run_signal_maintenance` の abandoned 化は
+            # pending にしか効かず、claimed 中の同じ 1 tick は救えない)。
+            # プロンプトへは「不明」で埋めて判断そのものは続行させる。
+            bar_close = fresh_until = "不明"
+        if trigger == "signal":
+            lead = ("このMissionは以下の signal/strategy plugin の出力をトリガーに"
+                    "起動されました。判断の参考にしてください。\n")
+        else:
+            lead = ("この判断足の Mission は以下の signal を引き受けています。"
+                    "signal は strategy の足の確定に対する plugin の判定で、"
+                    "発注指示ではありません。判断が確定すると (hold を含む) "
+                    "この signal は consumed になり、他の Mission には渡りません。\n")
         return (
-            "\n\n## 起動シグナル\n"
-            "このMissionは以下の signal/strategy plugin の出力をトリガーに"
-            "起動されました。判断の参考にしてください。\n"
+            "\n\n## この判断で扱う signal\n"
+            + lead
+            + f"- signal_id: {claimed['id']}\n"
             f"- plugin: {claimed['plugin']}\n"
             f"- kind: {claimed['kind']}\n"
             f"- pair: {claimed['pair']}\n"
-            f"- timeframe: {claimed['timeframe']}\n"
+            f"- direction: {direction}\n"
+            f"- strategy_timeframe: {claimed['timeframe']}\n"
             f"- bar_ts: {claimed['bar_ts']}\n"
+            f"- bar_close: {bar_close}\n"
+            f"- fresh_until: {fresh_until}\n"
             f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
 
     def _requeue_signal(self, claimed: dict) -> str | None:

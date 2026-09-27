@@ -197,6 +197,24 @@ def test_corrupt_payload_json_skips_row_fail_open(tmp_path):
     assert hashes == {"good"}
 
 
+# ---- 未知 timeframe (freshness_window 失敗) も fail-open (行 skip) ------------
+
+def test_unknown_timeframe_skips_row_fail_open(tmp_path):
+    """`freshness_window` が未知 timeframe で KeyError を送出しても
+    (`TF_MINUTES[timeframe]`)、payload 破損と同じ fail-open — 該当行だけ
+    skip し、他の行はそのまま返る。"""
+    conn = _conn(tmp_path)
+    _add_signal(conn, hours_ago=1, content_hash="good")
+    _add_signal(conn, hours_ago=1, content_hash="bad")
+    conn.execute("UPDATE signals SET timeframe='9x' "
+                "WHERE content_hash='bad'")
+    conn.commit()
+    tool = _tool(conn)
+    out = tool.func(pair="USDJPY")
+    hashes = {r["content_hash"] for r in out}
+    assert hashes == {"good"}
+
+
 # ---- payload は decode 済み dict で返る ---------------------------------------
 
 def test_payload_returned_as_decoded_dict(tmp_path):
@@ -258,8 +276,8 @@ def test_signal_row_status_present_and_exact_key_set(tmp_path):
     out = tool.func(pair="USDJPY")
     assert out[0]["status"] == "pending"
     assert set(out[0].keys()) == {
-        "id", "plugin", "content_hash", "pair", "timeframe", "bar_ts",
-        "kind", "status", "payload"}
+        "id", "plugin", "content_hash", "pair", "strategy_timeframe", "bar_ts",
+        "bar_close", "fresh_until", "kind", "status", "payload"}
 
 
 def test_strategy_row_status_present_and_exact_key_set(tmp_path):
@@ -269,8 +287,9 @@ def test_strategy_row_status_present_and_exact_key_set(tmp_path):
     out = tool.func(pair="USDJPY")
     assert out[0]["status"] == "pending"
     assert set(out[0].keys()) == {
-        "id", "plugin", "content_hash", "pair", "timeframe", "bar_ts",
-        "kind", "status", "payload", "in_sample_metrics", "note"}
+        "id", "plugin", "content_hash", "pair", "strategy_timeframe", "bar_ts",
+        "bar_close", "fresh_until", "kind", "status", "payload",
+        "in_sample_metrics", "note"}
 
 
 # ---- fix round 1 F4 (Important, codex): metrics_json 破損の fail-open -------
@@ -320,3 +339,59 @@ def test_get_signals_description_reflects_default_lookback(tmp_path, monkeypatch
         f"description should contain '37h' when _DEFAULT_SINCE_HOURS=37, got: {tool_mutated.description}"
     assert "24h" not in tool_mutated.description, \
         f"description should not contain '24h' when _DEFAULT_SINCE_HOURS=37, got: {tool_mutated.description}"
+
+
+# ---- strategy の足・確定時刻・鮮度期限の明示 --------------------------------
+
+def test_row_shows_strategy_timeframe_bar_close_and_fresh_until(tmp_path):
+    """行の足は strategy の足として `strategy_timeframe` の名で見せ、
+    bar_close (= bar_ts + 足幅) と fresh_until (= bar_ts + 足幅 × 鮮度本数)
+    を明示する。1h・鮮度 2 本なら bar_ts 13:00 の signal は 15:00 まで。"""
+    conn = _conn(tmp_path)
+    assert SETTINGS.plugin.signal_freshness_bars == 2  # 前提
+    signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
+                timeframe="1h", bar_ts="2026-08-03T10:00:00+00:00",
+                kind="strategy", payload={"direction": "long"}, now=NOW)
+    signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
+                timeframe="15m", bar_ts="2026-08-03T11:30:00+00:00",
+                kind="signal", payload={"direction": "short"}, now=NOW)
+    out = _tool(conn).func(pair="USDJPY")
+    assert [(r["strategy_timeframe"], r["bar_ts"], r["bar_close"], r["fresh_until"])
+            for r in out] == [
+        ("1h", "2026-08-03T10:00:00+00:00", "2026-08-03T11:00:00+00:00",
+         "2026-08-03T12:00:00+00:00"),
+        ("15m", "2026-08-03T11:30:00+00:00", "2026-08-03T11:45:00+00:00",
+         "2026-08-03T12:00:00+00:00")]
+    assert all("timeframe" not in r for r in out)
+
+
+def test_description_states_abandoned_conditions_and_strategy_timeframe(tmp_path):
+    tool = _tool(_conn(tmp_path))
+    assert "abandoned" in tool.description
+    assert "fresh_until" in tool.description
+    assert "requeue 上限" in tool.description
+    assert "strategy_timeframe" in tool.description
+    assert "判断足とは限らない" in tool.description
+
+
+def test_row_fresh_until_follows_configured_freshness_bars(tmp_path):
+    conn = _conn(tmp_path)
+    settings3 = SETTINGS.model_copy(deep=True)
+    settings3.plugin.signal_freshness_bars = 3
+    signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
+                timeframe="1h", bar_ts="2026-08-03T10:00:00+00:00",
+                kind="strategy", payload={"direction": "long"}, now=NOW)
+
+    out = _tool(conn, settings=settings3).func(pair="USDJPY")
+
+    assert [(r["bar_close"], r["fresh_until"]) for r in out] == [
+        ("2026-08-03T11:00:00+00:00", "2026-08-03T13:00:00+00:00")]
+
+
+def test_description_explains_each_status_and_forbids_reproposing_finished_rows(tmp_path):
+    description = _tool(_conn(tmp_path)).description
+    for phrase in ("pending (未判断)",
+                   "claimed (判断中の Mission が引き受け済み)",
+                   "consumed (判断済み)",
+                   "consumed / abandoned の行は再提案しない"):
+        assert phrase in description

@@ -534,6 +534,457 @@ def test_cron_tick_records_decision_bar_provenance_end_to_end(tmp_path):
         app.close()
 
 
+class _MutableClock:
+    def __init__(self, now):
+        self.current = now
+
+    def now(self):
+        return self.current
+
+
+def _run_tick_and_wait(app, now):
+    """本番と同じく core_lock の中で 1 tick し、受理された mission の完了を待つ。"""
+    from agentic_fx.core.supervisor import MissionSupervisor
+
+    captured = []
+    original_try_submit = MissionSupervisor.try_submit
+
+    def spy_try_submit(self, kind, **kw):
+        r = original_try_submit(self, kind, **kw)
+        if r.accepted:
+            captured.append(r.future)
+        return r
+
+    with _no_real_network(), \
+         patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+         patch.object(app.trade_loop.provider, "healthcheck",
+                      return_value="yfinance"):
+        with app.core_lock:
+            app.scheduler.tick(now)
+        for future in captured:
+            future.result(timeout=5.0)
+    return len(captured)
+
+
+def _tick_once_and_wait(app):
+    """本番の 1 tick 全体 (`_scheduler_tick_once` — ingest→commit→observe→
+    scheduler.tick→hook) を実行し、受理された mission の完了を待つ。"""
+    from agentic_fx.core.supervisor import MissionSupervisor
+    from agentic_fx.service import _scheduler_tick_once
+
+    captured = []
+    original_try_submit = MissionSupervisor.try_submit
+
+    def spy_try_submit(self, kind, **kw):
+        r = original_try_submit(self, kind, **kw)
+        if r.accepted:
+            captured.append(r.future)
+        return r
+
+    with _no_real_network(), \
+         patch.object(MissionSupervisor, "try_submit", spy_try_submit), \
+         patch.object(app.trade_loop.provider, "healthcheck",
+                      return_value="yfinance"):
+        _scheduler_tick_once(app)
+        for future in captured:
+            future.result(timeout=5.0)
+    return len(captured)
+
+
+class _ToolCallingFakeRunner(FakeRunner):
+    """`get_signals` を実際に (`registry.execute` 経由で) 呼び出す
+    FakeRunner。mission の tools に `get_signals` が含まれる限り、run() の
+    時点でそのツールを実行し、返った行を `tool_observations` に積む —
+    LLM のツール呼び出しを模す唯一の seam (FakeRunner はツールループ自体
+    を持たない)。"""
+
+    def __init__(self, results, *, registry, pair):
+        super().__init__(results)
+        self._registry = registry
+        self._pair = pair
+        self.tool_observations: list[list[dict]] = []
+
+    def run(self, mission):
+        if "get_signals" in mission.tools:
+            rows = json.loads(self._registry.execute(
+                "get_signals", {"pair": self._pair}, allowed=["get_signals"]))
+            self.tool_observations.append(rows)
+        return super().run(mission)
+
+
+def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
+    """判断足 15m・strategy 1h: 14:00:30 の `_scheduler_tick_once` (本番の 1
+    tick 全体) で、実 approved plugin (kind=strategy) が bucket 13:00 を評価
+    して signal を作り、同じ tick の cron mission がそれを claim して hold
+    で consume する。14:03:30 には signal 起動の条件 (pending) が残らず、
+    14:15:30 の cron mission は実際に `get_signals` ツールを呼び、mission
+    内から consumed を観測する。"""
+    from pathlib import Path as _Path
+
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.plugin.loader import PluginMeta
+    from agentic_fx.plugin.resolve import (
+        ApprovedInventory, InventoryBuildResult, ResolvedIndicatorSet,
+    )
+    from agentic_fx.store import orders as orders_store
+
+    t_cron = datetime(2026, 9, 24, 14, 0, 30, tzinfo=timezone.utc)
+    bucket = datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc)
+    clock = _MutableClock(t_cron)
+    _root_with_settings(
+        tmp_path,
+        datafeed={"intervals": ["1m", "15m", "1h"],
+                  "decision_timeframes": ["15m"],
+                  "primary_intervals": ["15m"]},
+        schedule={"trade_interval_min": 15})
+
+    # meta.max_bars=1: producer の鮮度窓 (既定 2 本) は bucket 13:00 の
+    # ひとつ手前 (12:00) を「窓外」として評価せず自然放棄する
+    # (`SignalProducer._evaluate_one` の `b < freshness_cutoff` 分岐) ので、
+    # 実データが要るのは bucket 13:00 の 1h 足 1 本だけでよい。
+    meta = PluginMeta(name="sma_cross_10_30", kind="strategy",
+                      path=_Path("/nonexistent"), params={}, timeframe="1h",
+                      pairs=("USDJPY",), max_bars=1, content_hash="h" * 64)
+    inventory_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=_Path("/nonexistent"), metas=(meta,)),
+        phase1_metas=(meta,),
+        resolved={(meta.name, meta.content_hash):
+                 ResolvedIndicatorSet.empty(_Path("/nonexistent"))},
+        rejected_strategies=())
+
+    class _FakeStrategySession:
+        """`plugin_sandbox.PluginSession` の代わりに注入する fake — bucket
+        13:00 の df (末尾行が対象バケット) だけ action="open" を返す。"""
+
+        def __init__(self, meta, *, settings, resolved=None) -> None:
+            del meta, settings, resolved
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> bool:
+            return False
+
+        def call(self, payload: dict) -> dict:
+            df = payload["df"]
+            if df.index[-1] == bucket:
+                return {"action": "open", "direction": "long",
+                        "stop_loss": 147.0, "take_profit": 150.0}
+            return {"action": "hold"}
+
+        def close(self) -> None:
+            pass
+
+    with patch("agentic_fx.service.plugin_loader.approved_plugins",
+              return_value=inventory_result), \
+         patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+              _FakeStrategySession):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
+                        embedding_fn=FakeEmbedding())
+        fake = _ToolCallingFakeRunner(
+            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
+             MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
+            registry=app.registry, pair="USDJPY")
+        app.trade_loop.runner = fake
+        app.scheduler.on_improve_tick = None
+        # このテストの関心は producer/claim/get_signals ツールの配線であり、
+        # 価格取得・outage 状態機械は対象外 (それぞれ専用テストで検証済み —
+        # test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery
+        # 等)。実 ingest を通すと 2 tick 目で outage が ready を外れ cron が
+        # due にならない (実測。1m の実データ供給はこのテストの関心外)。
+        # `_scheduler_tick_once` は `app.ingest is None` を正式にサポート
+        # するので、producer/claim/get_signals ツールの配線だけを見るために
+        # 経路から外す。
+        app.ingest = None
+        record_snapshot(app.conn_core, now=t_cron, balance=1_000_000,
+                        equity=1_000_000)
+        for interval, bar_time in (
+                ("15m", t_cron - timedelta(minutes=15, seconds=30)),
+                ("15m", t_cron - timedelta(seconds=30)),
+                ("1h", bucket)):
+            app.conn_core.execute(
+                "INSERT INTO ohlcv_cache (symbol, interval, bar_time, open, "
+                "high, low, close, volume, source) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("USDJPY", interval, bar_time.isoformat(),
+                 148.0, 148.1, 147.9, 148.0, 1.0, "yfinance"))
+        app.conn_core.commit()
+
+        app.supervisor.start()
+        try:
+            assert _tick_once_and_wait(app) == 1
+            sid = app.conn_core.execute(
+                "SELECT id FROM signals WHERE pair='USDJPY' AND bar_ts=?",
+                (bucket.isoformat(),)).fetchone()["id"]
+            mission = app.conn_core.execute(
+                "SELECT id, trigger, status FROM missions WHERE loop='trade'"
+            ).fetchone()
+            assert (mission["trigger"], mission["status"]) == ("cron", "completed")
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            assert dict(row) == {"status": "consumed",
+                                 "claimed_by_mission_id": mission["id"]}
+            assert "## この判断で扱う signal" in fake.missions[0].prompt
+            # 1 本目の mission も get_signals を呼んでいる (claim 直後・
+            # consume 前の状態を観測)。
+            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
+                (sid, "claimed")]
+
+            # 建玉 (PENDING_FILL) がある状態で、signal 起動の条件を満たすのは
+            # pending の signal だけ — それが残っていない。
+            orders_store.insert(
+                app.conn_core, pair="USDJPY", direction="long",
+                entry_type="limit", horizon="day", status="pending_fill",
+                now=t_cron, quantity=0.1, requested_price=147.5)
+            t_signal = datetime(2026, 9, 24, 14, 3, 30, tzinfo=timezone.utc)
+            clock.current = t_signal
+            assert app.scheduler.signal_due_fn(t_signal) is False
+
+            t_next = datetime(2026, 9, 24, 14, 15, 30, tzinfo=timezone.utc)
+            clock.current = t_next
+            assert _tick_once_and_wait(app) == 1
+            # 2 本目の mission が実際に get_signals ツールを呼び、mission の
+            # 内側から consumed を観測する (テスト直呼びではない)。
+            assert [(r["id"], r["status"]) for r in fake.tool_observations[-1]] == [
+                (sid, "consumed")]
+        finally:
+            app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+            app.close()
+
+
+def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
+    """AC-B2-13 の 14:00:30 だけを対象に、実 `Ingest` (`app.ingest` はそのまま
+    残し、`fetch` だけを時刻ごとの bars fixture に差し替える —
+    `test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery` と
+    同じ注入方式) で `_scheduler_tick_once` を 1 回通す。prepare で取得した
+    bucket 13:00 の 1h 足が commit → outage observe (ready 継続) → hooks 内の
+    signal maintenance (実 approved strategy plugin が bucket 13:00 を評価し
+    signal を作る) → due 判定 → cron mission 受理 → claim までを、
+    `test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick`
+    (`app.ingest = None` で経路を外している) が見ていない、ingest 自体の
+    配線込みで確認する。14:15:30 以降の継続 tick は既存テストの範囲のまま
+    (実測: 2 tick 目は 1m の実データ供給が無いと outage が ready を外れる —
+    このテストの関心外)。"""
+    from pathlib import Path as _Path
+
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed import sources as ds
+    from agentic_fx.plugin.loader import PluginMeta
+    from agentic_fx.plugin.resolve import (
+        ApprovedInventory, InventoryBuildResult, ResolvedIndicatorSet,
+    )
+
+    t_cron = datetime(2026, 9, 24, 14, 0, 30, tzinfo=timezone.utc)
+    bucket = datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc)
+    clock = _MutableClock(t_cron)
+    _root_with_settings(
+        tmp_path,
+        datafeed={"intervals": ["1m", "15m", "1h"],
+                  "decision_timeframes": ["15m"],
+                  "primary_intervals": ["15m"]},
+        schedule={"trade_interval_min": 15})
+
+    meta = PluginMeta(name="sma_cross_10_30", kind="strategy",
+                      path=_Path("/nonexistent"), params={}, timeframe="1h",
+                      pairs=("USDJPY",), max_bars=1, content_hash="h" * 64)
+    inventory_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=_Path("/nonexistent"), metas=(meta,)),
+        phase1_metas=(meta,),
+        resolved={(meta.name, meta.content_hash):
+                 ResolvedIndicatorSet.empty(_Path("/nonexistent"))},
+        rejected_strategies=())
+
+    class _FakeStrategySession:
+        """bucket 13:00 の df (末尾行が対象バケット) だけ action="open" を
+        返す — producer が実 ingest の commit 結果を読んで評価すること
+        自体がこのテストの検証対象。"""
+
+        def __init__(self, meta, *, settings, resolved=None) -> None:
+            del meta, settings, resolved
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> bool:
+            return False
+
+        def call(self, payload: dict) -> dict:
+            df = payload["df"]
+            if df.index[-1] == bucket:
+                return {"action": "open", "direction": "long",
+                        "stop_loss": 147.0, "take_profit": 150.0}
+            return {"action": "hold"}
+
+        def close(self) -> None:
+            pass
+
+    def fetch(pair, interval, start, end, *, timeout):
+        """時刻ごとの bars fixture: 要求区間を interval 幅で機械的に埋める
+        (outage lifecycle テストと同じ生成方式)。閉じ足判定
+        (`normalize_closed_range`) が cutoff=now=14:00:30 に対して
+        bucket 13:00 (1h) を境界ちょうどで確定済みと扱う。"""
+        width = timedelta(minutes=ds.INTERVAL_MIN[interval])
+        bars = []
+        t = start + width
+        while t <= end:
+            bars.append(Bar(pair, interval, t, 148.0, 148.1, 147.9, 148.0, 1.0))
+            t += width
+        return bars
+
+    with patch("agentic_fx.service.plugin_loader.approved_plugins",
+              return_value=inventory_result), \
+         patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+              _FakeStrategySession):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
+                        embedding_fn=FakeEmbedding())
+        fake = _ToolCallingFakeRunner(
+            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
+            registry=app.registry, pair="USDJPY")
+        app.trade_loop.runner = fake
+        app.scheduler.on_improve_tick = None
+        app.ingest.fetch = fetch
+        record_snapshot(app.conn_core, now=t_cron, balance=1_000_000,
+                        equity=1_000_000)
+        # 前 tick までに蓄積済みの watermark だけを種として置く。この tick
+        # で実際に fetch/commit される新しい確定足 (1m は 13:59、15m は
+        # 13:45、1h は bucket 13:00) はテストからは直接書き込まない —
+        # `Ingest.prepare`/`commit` が fetch fixture から取得して書く。
+        for interval, watermark in (
+                ("1m", datetime(2026, 9, 24, 13, 58, tzinfo=timezone.utc)),
+                ("15m", datetime(2026, 9, 24, 13, 30, tzinfo=timezone.utc)),
+                ("1h", datetime(2026, 9, 24, 12, 0, tzinfo=timezone.utc))):
+            app.conn_core.execute(
+                "INSERT INTO ohlcv_cache (symbol, interval, bar_time, open, "
+                "high, low, close, volume, source) VALUES (?,?,?,?,?,?,?,?,?)",
+                ("USDJPY", interval, watermark.isoformat(),
+                 148.0, 148.1, 147.9, 148.0, 1.0, "yfinance"))
+        app.conn_core.commit()
+
+        app.supervisor.start()
+        try:
+            assert _tick_once_and_wait(app) == 1
+            assert app.outage.state == "ready"
+            row = app.conn_core.execute(
+                "SELECT bar_time FROM ohlcv_cache WHERE symbol='USDJPY' "
+                "AND interval='1h' ORDER BY bar_time DESC LIMIT 1").fetchone()
+            assert row["bar_time"] == bucket.isoformat()
+            sid = app.conn_core.execute(
+                "SELECT id FROM signals WHERE pair='USDJPY' AND bar_ts=?",
+                (bucket.isoformat(),)).fetchone()["id"]
+            mission = app.conn_core.execute(
+                "SELECT id, trigger, status FROM missions WHERE loop='trade'"
+            ).fetchone()
+            assert (mission["trigger"], mission["status"]) == ("cron", "completed")
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            assert dict(row) == {"status": "consumed",
+                                 "claimed_by_mission_id": mission["id"]}
+            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
+                (sid, "claimed")]
+        finally:
+            app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+            app.close()
+
+
+def test_signal_not_taken_by_any_mission_is_abandoned_only_after_fresh_until(tmp_path):
+    """cron が busy で引き受けられない間に鮮度が切れる: 1h・鮮度 2 本の
+    bucket 13:00 の signal は 15:00:00 の tick では pending、15:00:30 の tick
+    の maintenance で abandoned。"""
+    from agentic_fx.store import signals as signals_store
+
+    clock = _MutableClock(datetime(2026, 9, 24, 14, 0, 30, tzinfo=timezone.utc))
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
+                    embedding_fn=FakeEmbedding())
+    app.scheduler.on_improve_tick = None
+    submitted = []
+
+    def busy(reason, **_kwargs):
+        submitted.append(reason)
+        return SubmitResult.rejected("running", checked_at=0.0)
+
+    app.scheduler.on_trade_mission = busy
+    sid = signals_store.add(
+        app.conn_core, plugin="sma_cross_10_30", content_hash="h",
+        pair="USDJPY", timeframe="1h",
+        bar_ts=datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc).isoformat(),
+        kind="strategy", payload={"direction": "long"}, now=clock.current)
+    _seed_decision_bar(app.conn_core,
+                       datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc))
+    try:
+        statuses = []
+        for now in (datetime(2026, 9, 24, 15, 0, 0, tzinfo=timezone.utc),
+                    datetime(2026, 9, 24, 15, 0, 30, tzinfo=timezone.utc)):
+            clock.current = now
+            with _no_real_network(), app.core_lock:
+                app.scheduler.tick(now)
+            statuses.append(app.conn_core.execute(
+                "SELECT status FROM signals WHERE id=?", (sid,)
+            ).fetchone()["status"])
+        assert statuses == ["pending", "abandoned"]
+        assert submitted == ["cron", "cron"]
+        assert app.conn_core.execute(
+            "SELECT COUNT(*) c FROM missions").fetchone()["c"] == 0
+    finally:
+        app.close()
+
+
+def test_default_1h_cron_claims_signal_and_keeps_existing_prompt_and_rhythm(tmp_path):
+    """既定設定 (判断足 1h) との差分は signal の claim・prompt の signal 節・
+    provenance の追加だけ: cron は毎正時の確定足で 1 回だけ発火し、prompt の
+    signal 節より前は signal が無いときの prompt と同じ。"""
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.loops.prompts_loader import load_prompt
+    from agentic_fx.store import mission_decision_bars
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    fake = FakeRunner([MissionResult("completed",
+                                     {"action": "hold", "reasoning": "w"}, [])])
+    clock = _MutableClock(NOW)
+    app = build_app(tmp_path, runner=fake, clock=clock,
+                    embedding_fn=FakeEmbedding())
+    app.scheduler.on_improve_tick = None
+    assert app.settings.datafeed.decision_timeframe == "1h"  # 前提
+    record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                    equity=1_000_000)
+    bar_time = NOW - timedelta(hours=1, seconds=30)
+    _seed_decision_bar(app.conn_core, bar_time)
+    sid = signals_store.add(
+        app.conn_core, plugin="sma_cross_10_30", content_hash="h",
+        pair="USDJPY", timeframe="1h",
+        bar_ts=(NOW - timedelta(hours=1)).isoformat(), kind="strategy",
+        payload={"direction": "long"}, now=NOW)
+    app.supervisor.start()
+    try:
+        assert _run_tick_and_wait(app, NOW) == 1
+        clock.current = NOW + timedelta(minutes=15)
+        assert _run_tick_and_wait(app, clock.current) == 0
+        mission = app.conn_core.execute(
+            "SELECT id, trigger, status FROM missions WHERE loop='trade'"
+        ).fetchall()
+        assert [(m["trigger"], m["status"]) for m in mission] == [
+            ("cron", "completed")]
+        mid = mission[0]["id"]
+        assert dict(app.conn_core.execute(
+            "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+            (sid,)).fetchone()) == {"status": "consumed",
+                                    "claimed_by_mission_id": mid}
+        assert mission_decision_bars.for_mission(app.conn_core, mid) == {
+            ("USDJPY", "1h"): bar_time}
+        head, signal_section = fake.missions[0].prompt.split(
+            "\n\n## この判断で扱う signal\n", 1)
+        clock.current = NOW
+        assert head == app.trade_loop._build_prompt(load_prompt("trade_mission"))
+        assert "decision_timeframe: 1h" in head
+        assert "- strategy_timeframe: 1h\n" in signal_section
+    finally:
+        app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
+        app.close()
+
+
 def test_supervisor_ask_returns_busy_message_on_rejection():
     from concurrent.futures import Future
 
@@ -951,6 +1402,46 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
     row = app2.conn_core.execute(
         "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
     assert row["status"] == "pending"  # 起動時 reclaim が回収した
+
+
+def test_startup_recover_interrupted_requeues_signal_claimed_by_running_cron_mission(
+        tmp_path):
+    """cron mission が running のまま (finish されず) プロセスが落ちた場合、
+    次回起動の `missions.recover_interrupted` がその mission を
+    'interrupted' へ終端し、claim していた signal を同一トランザクション
+    で requeue する — lease (既定 15 分) の経過を待たない (test_f1c の
+    lease 経路とは別の回収主体)。"""
+    from agentic_fx.store import missions as missions_module
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app1 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+    sid = signals_store.add(
+        app1.conn_core, plugin="sma_cross_10_30", content_hash="h1",
+        pair="USDJPY", timeframe="1h",
+        bar_ts=(NOW - timedelta(hours=1)).isoformat(), kind="strategy",
+        payload={"direction": "long"}, now=NOW)
+    mid = missions_module.start(app1.conn_core, "trade", "local", "m", NOW,
+                                trigger="cron")
+    claimed = signals_store.claim_oldest(app1.conn_core, mission_id=mid,
+                                         now=NOW, freshness_bars=None)
+    assert claimed is not None and claimed["id"] == sid  # 前提
+    # mission は finish しない — running のまま「再起動」を模す。
+
+    app1.instance_lock.close()
+
+    app2 = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                     embedding_fn=FakeEmbedding())
+
+    row = dict(app2.conn_core.execute(
+        "SELECT status, requeue_count, claimed_by_mission_id FROM signals "
+        "WHERE id=?", (sid,)).fetchone())
+    assert row == {"status": "pending", "requeue_count": 1,
+                   "claimed_by_mission_id": None}
+    mission_row = app2.conn_core.execute(
+        "SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
+    assert mission_row["status"] == "interrupted"
 
 
 # ---- 上書き 3: MissionWatch は 1 インスタンスを共有注入 --------------------

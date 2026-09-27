@@ -371,6 +371,45 @@ def test_expire_stale_mixed_timeframes_cutoff(tmp_path):
 
 
 # ---------------------------------------------------------------------
+# 未知 timeframe の pending は「claim も expire もされない不死身の
+# pending」にならず、expire_stale で abandoned へ落ちる (`_TF_MINUTES_CASE`
+# が NULL を返す行 = 通常経路の cutoff 判定ができない行を無条件 stale
+# 扱いにする)。activity が渡されたときだけ理由付きで 1 行記録する
+# (`_run_signal_maintenance` からの実配線は test_service_app.py 側)。
+# ---------------------------------------------------------------------
+def test_expire_stale_abandons_unknown_timeframe_pending(tmp_path):
+    conn = _conn(tmp_path)
+    valid_id = _add(conn, bar_ts=datetime(2026, 8, 3, 11, 0, tzinfo=timezone.utc),
+                    content_hash="valid")  # fresh (1h 前)
+    unknown_id = _add(conn, bar_ts=datetime(2026, 8, 3, 11, 0, tzinfo=timezone.utc),
+                      content_hash="unknown")
+    conn.execute("UPDATE signals SET timeframe='9x' WHERE id=?", (unknown_id,))
+    conn.commit()
+
+    class _RecordingActivity:
+        def __init__(self):
+            self.calls = []
+
+        def write(self, category, event, summary, ref_id=None):
+            self.calls.append((category, event, summary, ref_id))
+
+    activity = _RecordingActivity()
+    count = signals.expire_stale(conn, now=NOW, freshness_bars=2,
+                                 activity=activity)
+    assert count == 1
+
+    assert conn.execute("SELECT status FROM signals WHERE id=?",
+                        (unknown_id,)).fetchone()["status"] == "abandoned"
+    assert conn.execute("SELECT status FROM signals WHERE id=?",
+                        (valid_id,)).fetchone()["status"] == "pending"
+    assert len(activity.calls) == 1
+    _, event, summary, ref_id = activity.calls[0]
+    assert event == "signal_abandoned_invalid_timeframe"
+    assert str(unknown_id) in summary
+    assert ref_id == str(unknown_id)
+
+
+# ---------------------------------------------------------------------
 # ⑪ expire_stale を呼ばずに claim_oldest だけ呼んでも stale 行は claim
 #    されない (claim 側の鮮度条件ピン)
 # ---------------------------------------------------------------------
@@ -600,3 +639,62 @@ def test_add_rejects_bar_ts_python_parseable_but_sqlite_null(tmp_path):
                     payload={}, now=NOW)
     assert conn.execute(
         "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
+# ---------------------------------------------------------------------
+# 最古 1 件の定義: bar_ts を時刻として比較し、同時刻は id の小さい方。
+# 鮮度の境界は fresh_until ちょうどまで claim できる。
+# ---------------------------------------------------------------------
+def test_claim_oldest_breaks_bar_ts_tie_by_lower_id(tmp_path):
+    conn = _conn(tmp_path)
+    bar = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    first = _add(conn, bar_ts=bar, content_hash="first")
+    second = _add(conn, bar_ts=bar, content_hash="second")
+    assert first < second
+
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                                   freshness_bars=3)
+
+    assert claimed["id"] == first
+
+
+def test_claim_oldest_compares_bar_ts_as_instants_across_utc_offsets(tmp_path):
+    """+09:00 表記の 19:00 (= 10:00Z) は 10:30Z より古い。文字列順でも
+    id 順でも 10:30Z が先に来る並びにしておく。"""
+    conn = _conn(tmp_path)
+    utc_1030 = _add(conn, bar_ts=datetime(2026, 8, 3, 10, 30, tzinfo=timezone.utc),
+                    content_hash="utc")
+    jst_1900 = _add(conn, bar_ts=datetime(2026, 8, 3, 19, 0,
+                                          tzinfo=timezone(timedelta(hours=9))),
+                    content_hash="jst")
+    assert utc_1030 < jst_1900
+
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                                   freshness_bars=3)
+
+    assert claimed["id"] == jst_1900
+
+
+def test_freshness_window_requires_int_freshness_bars(tmp_path):
+    """settings.plugin.signal_freshness_bars は int 必須 (config.py
+    `Field(ge=1)`) なので `freshness_window` に None を渡す経路は本番に
+    存在しない。`freshness_window` は int 専用の算術のみを行い、None を
+    渡すと失敗することをピンする。"""
+    bar = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    with pytest.raises(TypeError):
+        signals.freshness_window("1h", bar.isoformat(), None)
+
+
+def test_claim_oldest_accepts_row_exactly_at_fresh_until_and_not_after(tmp_path):
+    conn = _conn(tmp_path)
+    bar = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc)
+    sid = _add(conn, bar_ts=bar)
+    _, fresh_until = signals.freshness_window("1h", bar.isoformat(), 2)
+    assert fresh_until == NOW.isoformat()
+
+    assert signals.claim_oldest(conn, mission_id=_mid(conn),
+                                now=NOW + timedelta(seconds=1),
+                                freshness_bars=2) is None
+    claimed = signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW,
+                                   freshness_bars=2)
+    assert claimed["id"] == sid

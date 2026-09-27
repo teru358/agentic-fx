@@ -132,6 +132,77 @@ def test_startup_rejects_when_worker_ceiling_equals_width(tmp_path):
     assert "Cw 900 秒" in str(exc.value)
 
 
+def test_startup_rejects_lease_not_longer_than_worker_ceiling(tmp_path):
+    """signal_lease_min * 60 が Cw (worker 上限) + commit-pre 余白
+    (`LEASE_COMMIT_MARGIN_SEC`) 以下だと、mission 実行中に lease が切れて
+    reclaim_expired が claim 済み signal を pending に戻し得る。cron の
+    consume CAS が失敗して判断が捨てられるので起動を拒否する。既定
+    (local backend, Cw 405 秒 + 余白 60 秒 = 465 秒) で
+    signal_lease_min=5 (300 秒)。"""
+    activity = ActivityLog(tmp_path / "a.log")
+    settings = EXAMPLE.model_copy(update={"plugin": EXAMPLE.plugin.model_copy(
+        update={"signal_lease_min": 5})})
+    with pytest.raises(RuntimeError) as exc:
+        _check_mission_ceilings(settings, activity)
+    msg = str(exc.value)
+    assert "signal_lease_min 5 分 (300 秒)" in msg
+    assert "上限 405 秒" in msg
+    assert "余白 60 秒" in msg
+    assert "465 秒以下です" in msg
+    assert "signal_lease_min を 8 分以上にしてください" in msg
+
+
+def test_startup_rejects_lease_margin_not_just_worker_ceiling(tmp_path):
+    """commit-pre のネットワーク呼出し分の余白
+    (`LEASE_COMMIT_MARGIN_SEC` = 60 秒) を含めない旧判定
+    (`lease_sec <= cw.total`) では、Cw (405 秒) より長いが Cw+余白 (465 秒)
+    以下の signal_lease_min=7 (420 秒) は素通りしてしまっていた —
+    余白込みでも拒否することをピンする。"""
+    activity = ActivityLog(tmp_path / "a.log")
+    settings = EXAMPLE.model_copy(update={"plugin": EXAMPLE.plugin.model_copy(
+        update={"signal_lease_min": 7})})
+    with pytest.raises(RuntimeError) as exc:
+        _check_mission_ceilings(settings, activity)
+    msg = str(exc.value)
+    assert "signal_lease_min 7 分 (420 秒)" in msg
+    assert "465 秒以下です" in msg
+
+
+def test_startup_rejects_lease_equal_to_worker_ceiling_plus_margin(tmp_path):
+    """境界: signal_lease_min * 60 == Cw + 余白 も拒否する (等しいは拒否)。
+    llama_swap.timeout_sec=315 で Cw = 30+345+10+5+5+5+20 = 420 秒、
+    余白 60 秒を足した 480 秒に signal_lease_min=8 (480 秒) をちょうど
+    合わせる。"""
+    activity = ActivityLog(tmp_path / "a.log")
+    settings = _with(EXAMPLE, llama_swap_timeout_sec=315)
+    settings = settings.model_copy(update={"plugin": settings.plugin.model_copy(
+        update={"signal_lease_min": 8})})
+    with pytest.raises(RuntimeError) as exc:
+        _check_mission_ceilings(settings, activity)
+    msg = str(exc.value)
+    assert "signal_lease_min 8 分 (480 秒)" in msg
+    assert "上限 420 秒" in msg
+    assert "余白 60 秒" in msg
+    assert "480 秒以下です" in msg
+
+
+def test_startup_allows_lease_longer_than_worker_ceiling_plus_margin(tmp_path):
+    """Cw 420 + 余白 60 = 480 秒に対し 9 分 (540 秒) は通る。
+    llama_swap.timeout_sec=315 で Cw=420 秒。"""
+    activity = ActivityLog(tmp_path / "a.log")
+    settings = _with(EXAMPLE, llama_swap_timeout_sec=315)
+    settings = settings.model_copy(update={"plugin": settings.plugin.model_copy(
+        update={"signal_lease_min": 9})})
+    _check_mission_ceilings(settings, activity)  # 例外を投げない
+
+
+def test_startup_allows_default_lease_min(tmp_path):
+    """既定値 (signal_lease_min 15 分 = 900 秒 > Cw 405 秒 + 余白 60 秒) は
+    通る。"""
+    activity = ActivityLog(tmp_path / "a.log")
+    _check_mission_ceilings(EXAMPLE, activity)  # 例外を投げない
+
+
 def test_startup_warns_when_dispatch_ceiling_equals_width(tmp_path):
     """Cd == 判断足幅でも WARNING を書く (境界は「以上」)。
     llama_swap.timeout_sec=117.5 で Cw = 222.5、Cd = 222.5×4+10 = 900。"""

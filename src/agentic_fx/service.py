@@ -638,6 +638,15 @@ def _warn_strategy_timeframe_mismatches(settings, plugins) -> None:
                 plugin.timeframe, decision_timeframe, plugin.name)
 
 
+# mission 実行中の commit-pre 相 (claim 直後、consume 直前) で行う quote/
+# spec 取得等のネットワーク呼出し分の余白。worker 1 回の上限 Cw だけを
+# signal_lease_min の下限にすると、lease が Cw ちょうど過ぎた直後の
+# commit-pre で切れて reclaim_expired に先を越され、consume の CAS が
+# 不一致で判断が捨てられる窓が Cw と signal_lease_min の間に残ったまま
+# になる。
+LEASE_COMMIT_MARGIN_SEC = 60.0
+
+
 def _check_mission_ceilings(settings, activity) -> None:
     """判断足幅と mission 上限を突き合わせる。
 
@@ -655,6 +664,17 @@ def _check_mission_ceilings(settings, activity) -> None:
             f"Cw {cw.total:.0f} 秒 ({cw.breakdown_text()}) が足幅以上です。"
             "1 確定足に 1 回の判断が成立しません。判断足を 15m 以上にするか "
             "llama_swap.timeout_sec を下げてください")
+    lease_min = settings.plugin.signal_lease_min
+    lease_sec = lease_min * 60
+    lease_threshold = cw.total + LEASE_COMMIT_MARGIN_SEC
+    if lease_sec <= lease_threshold:
+        suggested_min = int(lease_threshold // 60) + 1
+        raise RuntimeError(
+            f"signal_lease_min {lease_min} 分 ({lease_sec} 秒) が mission の"
+            f"上限 {cw.total:.0f} 秒 + commit-pre のネットワーク呼出し分の"
+            f"余白 {LEASE_COMMIT_MARGIN_SEC:.0f} 秒 = {lease_threshold:.0f} "
+            "秒以下です。lease 切れで判断が捨てられるので signal_lease_min を"
+            f" {suggested_min} 分以上にしてください")
     cd = mission_ceiling.dispatch_ceiling_sec(settings)
     explicit = settings.worker.dispatch_ceiling_sec
     if explicit is not None and explicit < cd:
@@ -730,7 +750,8 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                             lease_min=settings.plugin.signal_lease_min,
                             max_requeue=settings.plugin.signal_requeue_max)
     signals.expire_stale(conn, now=now,
-                         freshness_bars=settings.plugin.signal_freshness_bars)
+                         freshness_bars=settings.plugin.signal_freshness_bars,
+                         activity=activity)
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
         source=settings.datafeed.primary, settings=settings,

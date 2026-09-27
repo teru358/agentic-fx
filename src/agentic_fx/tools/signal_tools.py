@@ -21,6 +21,10 @@
 round 1 F2 (content_hash はコード由来で pair 非依存。渡さないと多 pair
 strategy で他 pair の成績が誤帰属される)。
 
+**足と鮮度の明示**: 列 ``timeframe`` は signal を作った strategy の足
+なので ``strategy_timeframe`` の名で返し、``bar_close`` (strategy 足の
+確定時刻) と ``fresh_until`` (``signals.freshness_window``) を添える。
+
 **返却 projection**: 返却 item は明示的なキー列挙で構築する
 (``dict(row)`` は使わない) — signals テーブルの内部管理列
 (``claimed_by_mission_id``/``claimed_at``/``requeue_count``/
@@ -94,6 +98,7 @@ def build(conn: sqlite3.Connection, settings: Settings,
     # — in_sample_metrics の絞りは現行 settings.backtest.dataset() を単一の
     # 評価基準として使う (strategy_gate/approval と同じ dataset 所有規律)。
     dataset = settings.backtest.dataset()
+    freshness_bars = settings.plugin.signal_freshness_bars
 
     def get_signals(pair: str, since_hours: int = _DEFAULT_SINCE_HOURS) -> list[dict]:
         if pair not in settings.pairs:
@@ -114,9 +119,22 @@ def build(conn: sqlite3.Connection, settings: Settings,
                     "get_signals: payload_json decode failed for signal "
                     "id=%s — skipping", row["id"])
                 continue
+            try:
+                bar_close, fresh_until = signals.freshness_window(
+                    row["timeframe"], row["bar_ts"], freshness_bars)
+            except KeyError:
+                # fail-open: 未知 timeframe (`TF_MINUTES` に無い) も payload
+                # 破損と同じ規律で 1 行 skip する — get_signals 全体を
+                # 失敗させない。
+                _log.warning(
+                    "get_signals: unknown timeframe %r for signal id=%s — "
+                    "skipping", row["timeframe"], row["id"])
+                continue
             item = {"id": row["id"], "plugin": row["plugin"],
                      "content_hash": row["content_hash"], "pair": row["pair"],
-                     "timeframe": row["timeframe"], "bar_ts": row["bar_ts"],
+                     "strategy_timeframe": row["timeframe"],
+                     "bar_ts": row["bar_ts"], "bar_close": bar_close,
+                     "fresh_until": fresh_until,
                      "kind": row["kind"], "status": row["status"],
                      "payload": payload}
             if row["kind"] == "strategy":
@@ -139,7 +157,14 @@ def build(conn: sqlite3.Connection, settings: Settings,
             "取引判断 loop 専用: 承認済み signal/strategy plugin の直近 "
             f"出力 (pair, 直近 since_hours 時間分・既定 {_DEFAULT_SINCE_HOURS}h)。"
             "strategy 行には in_sample バックテスト成績 (in_sample_metrics) "
-            "と、実運用成績の予測値ではない旨の注記 (note) が付く",
+            "と、実運用成績の予測値ではない旨の注記 (note) が付く。"
+            "strategy_timeframe は signal を作った strategy の足で判断足とは"
+            "限らない。bar_close は strategy 足の確定時刻、fresh_until は"
+            "判断に使える最後の時刻。status は pending (未判断) / claimed "
+            "(判断中の Mission が引き受け済み) / consumed (判断済み) / "
+            "abandoned (どの Mission にも引き受けられないまま fresh_until を"
+            "過ぎた、または requeue 上限に達した)。consumed / abandoned の行は"
+            "再提案しない",
             {"type": "object",
              "properties": {
                  "pair": pair_schema,
