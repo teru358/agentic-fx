@@ -131,6 +131,118 @@ def test_market_closure_pauses_once_and_resumes_evaluation(tmp_path, monkeypatch
         "market open — signal evaluation resumed"]
 
 
+def _closure_call(producer, conn, meta, now, *, sandbox=None):
+    return producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=now, source=SOURCE,
+        sandbox_run=sandbox if sandbox is not None else _FakeSandbox(),
+        settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta))
+
+
+def _levels_and_messages(caplog) -> list[tuple[int, str]]:
+    return [(record.levelno, record.getMessage()) for record in caplog.records]
+
+
+def test_market_closure_logs_one_info_per_transition_across_a_week(
+        tmp_path, monkeypatch, caplog):
+    """閉場入りと開場で INFO が 1 回ずつ出て、開場中の後続 tick は無音、
+    次の閉場で再び INFO が出る。閉場中の戻り値は 0。"""
+    conn = _conn(tmp_path)
+    meta = _meta()
+    producer = SignalProducer()
+    evaluated: list[datetime] = []
+
+    def record_evaluation(*args, now, **kwargs):
+        evaluated.append(now)
+        return 0
+
+    monkeypatch.setattr(producer, "_evaluate_one", record_evaluation)
+    caplog.set_level(logging.DEBUG, logger="agentic_fx.plugin.signal_producer")
+
+    saturday = datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc)
+    assert _closure_call(producer, conn, meta, saturday) == 0
+    assert _levels_and_messages(caplog) == [(
+        logging.INFO,
+        "market closed — signal evaluation paused until 2026-09-27T21:00:00+00:00")]
+
+    caplog.clear()
+    reopened = datetime(2026, 9, 27, 21, 0, 30, tzinfo=timezone.utc)
+    _closure_call(producer, conn, meta, reopened)
+    assert _levels_and_messages(caplog) == [
+        (logging.INFO, "market open — signal evaluation resumed")]
+
+    caplog.clear()
+    next_tick = reopened + timedelta(minutes=1)
+    _closure_call(producer, conn, meta, next_tick)
+    assert caplog.records == []
+    assert evaluated == [reopened, next_tick]
+
+    friday_close = datetime(2026, 10, 2, 21, 0, 30, tzinfo=timezone.utc)
+    assert _closure_call(producer, conn, meta, friday_close) == 0
+    assert _levels_and_messages(caplog) == [(
+        logging.INFO,
+        "market closed — signal evaluation paused until 2026-10-04T21:00:00+00:00")]
+    assert evaluated == [reopened, next_tick]
+
+
+def test_market_closure_first_seen_shortly_before_open_names_that_open(
+        tmp_path, monkeypatch, caplog):
+    """閉場中の最初の tick が再開 30 分前でも、再開予定は同じ日曜 21:00。"""
+    conn = _conn(tmp_path)
+    meta = _meta()
+    producer = SignalProducer()
+    monkeypatch.setattr(producer, "_evaluate_one",
+                        lambda *args, **kwargs: 0)
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.signal_producer")
+
+    _closure_call(producer, conn, meta,
+                  datetime(2026, 9, 27, 20, 30, tzinfo=timezone.utc))
+    assert [record.getMessage() for record in caplog.records] == [
+        "market closed — signal evaluation paused until 2026-09-27T21:00:00+00:00"]
+
+
+def test_market_open_resume_is_logged_before_the_evaluation_warning(
+        tmp_path, caplog):
+    """開場直後の評価で対象 bucket が無ければ従来どおり WARNING が出るが、
+    その前に再開の INFO が出ている。"""
+    conn = _conn(tmp_path)
+    meta = _meta()
+    producer = SignalProducer()
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.signal_producer")
+
+    _closure_call(producer, conn, meta,
+                  datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc))
+    caplog.clear()
+    _closure_call(producer, conn, meta,
+                  datetime(2026, 9, 27, 21, 0, 30, tzinfo=timezone.utc))
+
+    levels = [record.levelno for record in caplog.records]
+    assert caplog.records[0].getMessage() == "market open — signal evaluation resumed"
+    assert levels[0] == logging.INFO
+    assert logging.WARNING in levels[1:]
+
+
+def test_market_closure_is_silent_for_plugins_that_would_be_skipped(
+        tmp_path, caplog):
+    """閉場中は skip 理由の WARNING (pair が settings 外 / strategy 未解決) も
+    出さず、paused の INFO だけを出す。"""
+    conn = _conn(tmp_path)
+    outside_pair = _meta(name="other_pair", pairs=("EURUSD",))
+    unresolved = _meta(name="unresolved", kind="strategy",
+                       content_hash="u" * 64)
+    producer = SignalProducer()
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.signal_producer")
+
+    for minute in (0, 1):
+        producer.evaluate_due_plugins(
+            conn, plugins=[outside_pair, unresolved],
+            now=datetime(2026, 9, 26, 8, minute, tzinfo=timezone.utc),
+            source=SOURCE, sandbox_run=_FakeSandbox(), settings=SETTINGS,
+            resolved_by_identity={})
+    assert _levels_and_messages(caplog) == [(
+        logging.INFO,
+        "market closed — signal evaluation paused until 2026-09-27T21:00:00+00:00")]
+
+
 class _FakeSandbox:
     """`SandboxRunFn` 契約 (meta, payload, *, settings) -> dict の fake。
 
