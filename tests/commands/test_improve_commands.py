@@ -180,6 +180,17 @@ def test_improve_add_does_not_warn_on_unclosed_bracket_prefix(commands):
     assert "⚠" not in result_square
 
 
+def test_improve_add_closing_bracket_must_be_at_the_end(commands):
+    """閉じ括弧が途中にあるだけ (`[a]b…` / `<a>b…`) では末尾判定を満たさない
+    ので、プレースホルダ扱いにならないことを見る (十分長い idea)。"""
+    cmds, conn, _ = commands
+    result_square = cmds.dispatch("improve add [案]の詳細説明がここに続きます")
+    assert "⚠" not in result_square
+
+    result_angle = cmds.dispatch("improve add <案>の詳細説明がここに続きます")
+    assert "⚠" not in result_angle
+
+
 def test_improve_add_warns_exactly_at_length_boundary(commands):
     """ちょうど4文字 (プレースホルダでない) は警告なし、3文字は警告ありを
     同時に確認する。"""
