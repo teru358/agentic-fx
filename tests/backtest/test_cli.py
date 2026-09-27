@@ -1667,7 +1667,7 @@ def test_plugin_bless_after_switch_runtime_error_has_recovery_hint(
     from agentic_fx.plugin import switch as _switch
 
     def _boom(*args, **kwargs):
-        raise RuntimeError(
+        raise _switch.LiveHashMismatchAfterSwitchError(
             "plugin 'x': live content_hash mismatch after switch (...)")
 
     monkeypatch.setattr(_switch, "bless_candidate", _boom)
@@ -1691,18 +1691,20 @@ def test_plugin_bless_version_runtime_error_has_version_dir_hint(
     from agentic_fx.plugin import switch as _switch
 
     def _boom(*args, **kwargs):
-        raise RuntimeError("plugin 'x': version content_hash mismatch")
+        raise _switch.VersionHashMismatchError(
+            "plugin 'x': version content_hash mismatch")
 
     monkeypatch.setattr(_switch, "bless_candidate", _boom)
     rc = _cli._plugin_bless(
         None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
 
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "エラー:" in err
-    assert "plugins/.versions/x/" in err
-    assert "approval retry" not in err
-    assert "Traceback" not in err
+    captured = capsys.readouterr()
+    assert "エラー:" in captured.err
+    assert "plugin 'x': version content_hash mismatch" in captured.err
+    assert "approval retry" in captured.err
+    assert "approval id=" not in captured.out
+    assert "Traceback" not in captured.err
 
 
 def test_plugin_bless_history_git_error_has_fsck_hint(
@@ -1721,11 +1723,27 @@ def test_plugin_bless_history_git_error_has_fsck_hint(
         None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
 
     assert rc == 1
-    err = capsys.readouterr().err
-    assert "エラー:" in err
-    assert "plugins/.history.git" in err
-    assert "git -C plugins/.history.git fsck" in err
-    assert "Traceback" not in err
+    captured = capsys.readouterr()
+    assert "エラー:" in captured.err
+    assert "plugins/.history.git: damaged" in captured.err
+    assert "approval retry" in captured.err
+    assert "approval id=" not in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_plugin_bless_base_runtime_error_propagates(tmp_path, monkeypatch):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(_switch, "bless_candidate", _boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        _cli._plugin_bless(
+            None, None, _argparse.Namespace(name="x", from_kind="_human"), tmp_path)
 
 
 def _cli_root_for_plugin_commands(tmp_path: Path) -> Path:

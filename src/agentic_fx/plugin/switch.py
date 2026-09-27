@@ -1355,7 +1355,7 @@ def _advance_to_decided(
             # `test_approve_upgrade_reverifies_content_hash_after_switch`
             # の `pytest.raises(match=...)` が pin している (既存テスト
             # 書き換え禁止のため文言を維持)。
-            raise RuntimeError(
+            raise LiveHashMismatchAfterSwitchError(
                 f"plugin {name!r}: live content_hash mismatch after switch "
                 f"(expected content_hash={content_hash} "
                 f"artifact_hash={artifact_hash})")
@@ -1795,6 +1795,14 @@ class UnresolvedJournalError(Exception):
     """retire は未完 switch ジャーナルがあれば拒否する (§5.1)。"""
 
 
+class LiveHashMismatchAfterSwitchError(RuntimeError):
+    """切替後の live 版が、承認したハッシュと一致しない。"""
+
+
+class VersionHashMismatchError(RuntimeError):
+    """切替不要の既存版が、承認したハッシュと一致しない。"""
+
+
 def materialize_plugin(root: Path, name: str) -> Path:
     live = root / name
     dest = root / "_human" / name
@@ -2136,7 +2144,7 @@ def bless_candidate(
             # この分岐は switch_required=0 (recorded 止まり) の枝でのみ
             # `_advance_to_decided` が False を返す — switch_live は呼ばれて
             # いないので、文言に "after switch" (切替後) を含めない。
-            raise RuntimeError(
+            raise VersionHashMismatchError(
                 f"plugin {name!r}: 版 dir の content_hash mismatch "
                 f"(expected content_hash={content_hash} "
                 f"artifact_hash={artifact_hash})")

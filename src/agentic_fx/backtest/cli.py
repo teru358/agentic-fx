@@ -523,16 +523,21 @@ _UNRESOLVED_JOURNAL_RECOVERY_HINT = (
     "`approval retry <approval_id>`")
 
 _HISTORY_GIT_RECOVERY_HINT = (
-    "  次の一手: `plugins/.history.git` の状態を確認し、"
-    "`git -C plugins/.history.git fsck` 相当で整合性を直してから"
-    "同じ bless をやり直してください。")
+    "  次の一手: 表示された原因を確認してください "
+    "(初期化先・権限・git 実行環境・履歴 repo "
+    "`plugins/.history.git`・候補と版の一致)。"
+    "`git -C plugins/.history.git fsck` は repo が使える場合の診断のみで、"
+    "修復はしません。原因を解消したらサービスの対話シェルで "
+    "`approval list` から対象を確認し、`approval retry <id>` を実行してください。"
+)
 
-
-def _version_hash_recovery_hint(name: str) -> str:
-    return (
-        f"  次の一手: 版 dir の内容が候補と一致しません。"
-        f"`plugins/.versions/{name}/` を確認し、必要なら候補を直して "
-        "bless をやり直してください。")
+_HASH_MISMATCH_RECOVERY_HINT = (
+    "  次の一手: サービスの対話シェルで `approval list` → "
+    "`approval <id>` で対象を確認し、版 "
+    "(`plugins/.versions/<name>/`) を承認対象と一致するよう復旧してから "
+    "`approval retry <id>` を実行してください。取り消すなら "
+    "`reject <id> [理由]` を実行してください。"
+)
 
 
 def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
@@ -619,11 +624,9 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
     except HistoryGitError as e:
         print(f"エラー: {e}\n{_HISTORY_GIT_RECOVERY_HINT}", file=sys.stderr)
         return 1
-    except RuntimeError as e:
-        hint = (_UNRESOLVED_JOURNAL_RECOVERY_HINT
-                if "after switch" in str(e)
-                else _version_hash_recovery_hint(args.name))
-        print(f"エラー: {e}\n{hint}", file=sys.stderr)
+    except (plugin_switch.LiveHashMismatchAfterSwitchError,
+            plugin_switch.VersionHashMismatchError) as e:
+        print(f"エラー: {e}\n{_HASH_MISMATCH_RECOVERY_HINT}", file=sys.stderr)
         return 1
     except (ValueError, plugin_sandbox.SandboxError) as e:
         print(f"エラー: {e}", file=sys.stderr)

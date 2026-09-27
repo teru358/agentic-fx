@@ -1465,6 +1465,7 @@ def test_ac19d_bless_raises_when_version_dir_is_tampered(tmp_path, monkeypatch):
             conn, name="sma", human_dir=human_dir, settings=SETTINGS,
             now=NOW, decided_by="human_cli")
 
+    assert isinstance(excinfo.value, plugin_switch.VersionHashMismatchError)
     # 2 周目やり直し /code-review r2b #3 の是正 (`b126dd2`) の pin:
     # switch_required=0 の枝 (switch_live 未実行) なので "after switch"
     # (切替後) と言わない。switch_required=1 側 (`_advance_to_decided`

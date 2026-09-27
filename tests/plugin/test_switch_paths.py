@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -1460,13 +1461,40 @@ def test_advance_to_decided_detects_in_place_tamper_of_artifact_hash_only(env, m
     monkeypatch.setattr("agentic_fx.plugin.switch.history_git.record_version",
                         _record_then_tamper)
 
-    with pytest.raises(RuntimeError, match="content_hash mismatch"):
+    with pytest.raises(RuntimeError, match="content_hash mismatch") as excinfo:
         switch.approve_candidate(conn, aid, decided_by="human", now=NOW,
                                  plugins_root=plugins_dir, settings=settings)
+
+    assert isinstance(excinfo.value, switch.LiveHashMismatchAfterSwitchError)
 
     status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                           (aid,)).fetchone()["status"]
     assert status == "pending"
+
+
+def test_plugin_bless_history_git_file_reports_recovery_hint(env, monkeypatch, capsys):
+    root, plugins_dir, conn, settings = env
+    _write_candidate(plugins_dir / "_human" / "sma")
+    (plugins_dir / ".history.git").write_text("not a repository")
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+
+    from agentic_fx.backtest import cli
+
+    rc = cli._plugin_bless(
+        conn, settings, argparse.Namespace(name="sma", from_kind="_human"), root)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "エラー:" in captured.err
+    assert "failed to initialize bare repo" in captured.err
+    assert "approval retry" in captured.err
+    assert "approval id=" not in captured.out
+    assert "Traceback" not in captured.err
+    approval = approvals_store.pending(conn, kind="plugin")
+    assert len(approval) == 1
+    journal = journal_store.list_non_terminal(conn)
+    assert len(journal) == 1
+    assert journal[0]["phase"] == "versioned"
 
 
 # --- 段階 2 レビュー是正: submit/bless payload の base_interval/eval_timeframe ---
