@@ -401,6 +401,20 @@ def test_expire_stale_abandons_unknown_timeframe_pending(tmp_path):
                         (valid_id,)).fetchone()["status"] == "pending"
 
 
+def test_expire_stale_works_on_connection_without_row_factory(tmp_path):
+    conn = _conn(tmp_path)
+    unknown_id = _add(conn, bar_ts=datetime(2026, 8, 3, 11, 0, tzinfo=timezone.utc),
+                      content_hash="unknown")
+    conn.execute("UPDATE signals SET timeframe='9x' WHERE id=?", (unknown_id,))
+    conn.commit()
+    conn.row_factory = None  # 素の sqlite3.Connection (tuple 行)
+
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=2)
+    assert result.total == 1
+    assert result.invalid_timeframe == (
+        signals.AbandonedRow(id=unknown_id, plugin="p.py", timeframe="9x"),)
+
+
 # ---------------------------------------------------------------------
 # ⑪ expire_stale を呼ばずに claim_oldest だけ呼んでも stale 行は claim
 #    されない (claim 側の鮮度条件ピン)

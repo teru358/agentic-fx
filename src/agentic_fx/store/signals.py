@@ -246,10 +246,11 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
         {"now": now.isoformat(), "freshness_bars": freshness_bars})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
+    # RETURNING 列は位置で読む — row_factory を設定していない素の接続でも
+    # 動くように (呼び出し側の接続の作り方に依存しない)。
     invalid_timeframe = tuple(
-        AbandonedRow(id=row["id"], plugin=row["plugin"],
-                     timeframe=row["timeframe"])
-        for row in rows if row["invalid_timeframe"]
+        AbandonedRow(id=row[0], plugin=row[1], timeframe=row[2])
+        for row in rows if row[3]
     )
     return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe)
 
