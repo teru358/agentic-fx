@@ -1,4 +1,4 @@
-# [decision-timeframe-config] B-2 設計書 v1.5
+# [decision-timeframe-config] B-2 設計書 v1.6
 
 対象 commit: `ada582b`。作成日: 2026-09-26。先行 spec: A2-1 [closed-bars-and-required-window] v1.1、B-1 [decision-timeframe-config] v1.0、A2-3 [outage-stop-and-backfill] v1.1 (いずれも main に merge 済み)。範囲の正は `docs/superpowers/specs/2026-09-22-decision-timeframe-config-design.md` §2 の B-2 行 5 つと §4 である。範囲外: `[multi-decision-timeframes]`、`[intent-evidence-timeframe-gate]`、`[first-run-setup]`。
 
@@ -198,6 +198,8 @@ previous_session(pair) を満たす pair は、mission の起動有無に関わ�
 
 **失敗時**: context 足の取得失敗は tool の結果として LLM に返るだけで、health・outage には入らない。
 
+**予算の計数方式 (B-2d 実装時の裁定、2026-09-27)**: 計るのは market tool (`get_ohlcv` / `get_indicators`) の**起動回数** (pair・timeframe を問わず、引数不正や planner 不可で provider に届かなかった回も含む) であって HTTP 要求数ではない。対象は trade loop が runner に渡す全 mission (cron / signal / ask)。tool は子プロセス (`mission_worker`) の registry で実行されるため、子が `ToolRegistry(on_result=…)` で tool 名別に数え、正常・例外の両 result フレームに `market_tool_calls` としてスナップショットを載せ、`worker_runner` が `MissionResult.market_tool_calls` (旧フレーム・timeout・eof は `None` = **不明、ゼロではない**。不正な形も `None` に正規化) へ写す。親 `TradeLoop` は runner が結果を返した直後 (core_lock 非保持、失敗・パース不能・ask を含む全経路で 1 回) に UTC 暦日 (`as_utc(now).date()`、集計の約束事であり provider の quota 境界の実測ではない) で加算し、不明 mission 数も数える。状態はプロセスメモリのみ (再起動でリセット、警告は「プロセス生存中、UTC 日ごとに 1 回」)。観測処理は全体を例外隔離し mission の結果に影響させない。既定値 = **1000** (§9-4 再計測: 15m 運用 平均 4.53 回/mission × 96 mission/日 ≈ 435 の約 2.3 倍。観測ベースの異常検知閾値であり yfinance の安全上限ではない)。永続化 (`alert_state` 再利用) は `[market-tool-budget-persist-via-alert-state]` に起票 (集計位置が conn_core を触れない層にあるため)。
+
 ### 3.5 初回ウィザードへの要件と provenance
 
 **ウィザードへ渡す要件 (`[first-run-setup]` で実装。本書は実装しない)**:
@@ -272,7 +274,7 @@ previous_session(pair) を満たす pair は、mission の起動有無に関わ�
 |AC-B2-17|d|`context_timeframes: [1h]`、判断足 15m: prompt に「参考足」「発注判断の足ではない」と `1h`。`get_ohlcv()` の行は interval 15m・role decision、`get_ohlcv(timeframe="1h")` は role context、`"4h"` は role other。**必要本数不足で `insufficient_closed_bars` になった場合も** shortage dict に `interval`・`role` が入る (decision/context/other 各ケース)。|context を判断足として表示 / role を付けない / enum から 4h を外す (互換差) / shortage 応答には role を付けない (成功時にだけ付ける)。|
 |AC-B2-18|d|context 1h の足が取れない (source 失敗・cache 無し) 状態でも 15m の cron mission は発火し、healthcheck は 15m だけを見る。|context を `primary_intervals` か health に足す。|
 |AC-B2-19|d|context に判断足を含む・`intervals` 外・重複 → 起動拒否 (理由つき)。|黙って除去する。|
-|AC-B2-20|d|2026-09-24 20:45:31 開始の mission の prompt に「day の強制決済 20:55:00 UTC (残り 9 分)」。21:00:31 開始なら翌日 20:55:00。|20:55〜21:00 開始の mission で、新規 day 建玉の期限 (当日 20:55) が既に過ぎているのに「残り 0 分」や翌日の時刻を出す (正しくは「新規 day は次 tick で強制決済される」と出す) / 5 分の buffer を引かない。|
+|AC-B2-20|d|2026-09-24 20:45:31 開始の mission の prompt に「day 建玉の強制決済 20:55:00 UTC (残り 9 分、開始時点の見込み)」。21:00:31 開始なら翌日 20:55:00。20:55:00〜20:59:59 開始 (期限経過後) は「当日の day 期限 20:55:00 UTC は経過。いま建てる day 建玉は 21:00 UTC より前に約定すれば次 tick で強制決済の対象 (quote が取れた時点で実行)、21:00 以降の約定は翌営業日の期限」と出し、翌日の時刻を主表示にしない。実際の期限は `filled_at` 起点 (`_force_close_day`) なので文言は見込みと明記する。閉場中 (金曜 21:00 以降を含む) は期限を出さない。時刻は `next_rollover` と共有定数 `DAY_CLOSE_BUFFER` から導出し、残り分は切り捨て。|「残り 0 分」や翌日の時刻を出す / 5 分の buffer を引かない / 文言に 20:55 をハードコード / 分を四捨五入 / 金曜 21:00 以降に土曜の時刻を出す。|
 |AC-B2-21|全|`decision_timeframes` 未記載・context 未記載の設定 (1h) で、**意図的な差分を列挙**: (a) 再起動をまたいでも `cron_cursor` から復元した足は再判断しない (B-1 の `tests/core/test_scheduler.py:306-315`、旧仕様「再起動のたびに最新 1 本を再判断する」を書き換える対象そのもの)、(b) 日曜開場 tick に前セッション (金曜) の最終足では mission が起動しない (§3.2 IV-3)、(c) cron mission が pending signal を `claim_oldest` で引き受け prompt に signal 節・provenance を追加する (§3.1, §3.5)。**それ以外の cron 発火時刻・回数・prompt の既存節は B-1 と変わらない** (毎正時 :30 の発火リズム、busy 時の coalesce 挙動、通常 tick の trade_reasons 系列)。|(a)(b)(c) を含めて 1h の挙動が一切変わらないと主張する (`test_open_restart_runs_latest_watermark_once` を無改訂のまま green と誤認する) / 逆に (a)(b)(c) 以外の発火リズムまで変えてしまう。|
 |AC-B2-22|b|復元 cursor に **行がある** `(USDJPY, 15m, L=12:45)` が、対応する `W(USDJPY,15m)` は未観測 (`None`、その pair だけ確定足キャッシュが空) の状態、かつ outage は **`ready`** (state_fn は早期 return しない) で起動・tick → `_trade_mission_due` は due 判定まで進むが `W is None` のため `L > W` の比較自体を行わず保留 (`cron_cursor_future_watermark` は出ない、mission も起動しない)。EURUSD 側は `W` が観測できているので通常どおり due 判定する。**別途**: state_fn が `ready` でない (MT5 不通) 間は `_trade_mission_due` が最前段で早期 return し比較自体に到達しない (この経路は保留ロジックを経由しないので ⑥ の検証にはならない)。outage が `ready` に戻り最初に `W` (例: 13:00) が観測された tick で、初めて通常の due 判定 (受理 or 前セッション skip) に合流する。|`W is None` を `L > W` の特殊値 (例: 0) として比較し誤って拒否/受理する / outage 未 ready の早期 return だけを検査して ⑥ の比較スキップ自体を検証しない / outage 解消を待たず比較を始める / EURUSD も一緒に保留する。|
 |AC-B2-23|b|`missions.start(commit=False)` の直後・`mission_decision_bars` への INSERT 実行中 (claim はまだ呼ばれていない) に例外を注入 → トランザクション全体が rollback され、`missions` に該当行が残らない。呼び出し元の `mid` はこの例外ハンドラで明示的に `None` へ戻され、`finally` の `if mid is not None and not finalized:` は no-op になる (偽の `mission_finalize_conflict` を書かない)。再実行では `AUTOINCREMENT` の採番がロールバック分を再利用し得るため「新しい mission_id が必ず発行される」とは限らない。正常系では `missions` 行と `mission_decision_bars` 行 (pair 数分) が同一 commit で確定する。|`missions.start` だけ即 commit し `mission_decision_bars` の失敗を切り離す (mission_id だけ残る) / 例外を握りつぶして片方だけ書く / rollback 後も `mid` を整数のまま残し `finally` が存在しない mission を finalize しようとする。|
@@ -306,9 +308,9 @@ previous_session(pair) を満たす pair は、mission の起動有無に関わ�
 |(新キーなし) Cd ≥ 足幅の検査 (起動時 WARNING のみ)|a|—|`Cw(trade) + 3×Cw(reflection) + 10 (余白、固定)`。拒否はしない。|
 |(新キーなし) 派生専用足の判断足拒否|a|—|`decision_timeframes` が `4h`/`1d` なら起動拒否。|
 |`worker.dispatch_ceiling_sec`|a|`None` (未設定時は `Cd(runner.trade.backend) + 60` を自動導出、既定 1690 秒 local / 1730 秒 claude)|watchdog (`_watchdog_check`) と `supervisor_join_timeout_sec` が共有する単一の上限。明示設定する場合は `Cd(runner.trade.backend)` 未満を拒否 (起動拒否) — 未満だと正常な dispatch の途中で watchdog が発火し `_record_fatal` がサービスを止め得る。|
-|`datafeed.context_daily_call_budget`|d|未設定 (無制限)|source 別 (yfinance/MT5 bridge) の日次上限または警告閾値。**既定値は §9-4 の実測前は定めない** — B-2d 着手前に §9-4 を実施し、実測を根拠に確定する。超過は WARNING のみ、tool 呼出しは拒否しない。|
+|`datafeed.context_daily_call_budget`|d|`1000` (`null` で警告無効)|market tool 起動回数の UTC 日次警告閾値 (§3.4「予算の計数方式」)。`ge=1`。超過は WARNING を activity へプロセス生存中 1 日 1 回、tool 呼出しは拒否しない。|
 
-`config/settings.yaml.example` には `context_timeframes: []` とコメント「参考足。発注判断の足ではない。 判断足を含めない (表示のみ、強制ではない)」を足す。`worker.dispatch_ceiling_sec` は既定 `None` (自動導出) のままコメントで式を示し、明示値は必要になるまで書かない。`context_daily_call_budget` は §9-4 実測後に確定した既定値と共に B-2d で追加する (本書の時点ではキー名の予約のみ)。個人の `settings.yaml` は書き換えない。DB 表 `cron_cursor`・`mission_decision_bars` は設定キーにしない (内部状態)。
+`config/settings.yaml.example` には `context_timeframes: []` とコメント「参考足。発注判断の足ではない。 判断足を含めない (表示のみ、強制ではない)」を足す。`worker.dispatch_ceiling_sec` は既定 `None` (自動導出) のままコメントで式を示し、明示値は必要になるまで書かない。`context_daily_call_budget` は §9-4 再計測 (2026-09-27) を根拠に既定 1000 で追加した。個人の `settings.yaml` は書き換えない。DB 表 `cron_cursor`・`mission_decision_bars` は設定キーにしない (内部状態)。
 
 ## 8. 人間の裁定が要る点
 
@@ -369,7 +371,7 @@ previous_session(pair) を満たす pair は、mission の起動有無に関わ�
 |1|**実 `WorkerRunner`** + `SIGTERM` を無視して居座る fake 子プロセス (`os.fork`/subprocess スタブ、実際の handshake フレームだけ最小実装) で、`_escalate_kill`→`_ensure_dead`→`reader.join`→`dispatcher.join` の打ち切り経路を実時間で計測する (local/claude 両 backend、`MissionSupervisor._dispatch()` は fake `trade_fn`/`reflection_fn` で trade+最大 3 reflection を通す)。**Cw/Cd の各区間のうち config 値の単純合計 (起動待ち・実行 deadline・SIGTERM 猶予・`rpc_timeout_sec` 由来の join 上限) は算術で確定済みとし、測定するのは「SIGKILL 後に本当に `proc.wait` が 2 回発生し得るか」「`reader`/`dispatcher` の実際の join 所要時間が理論上限に収まるか」の実測でしか確かめられない部分に絞る**。「指定秒後に完了を返す fake worker」は supervisor 層の時間計算 (fake clock) しか通さず、この OS レベルの打ち切り経路を一切 exercise しないため測定として成立しない。|tmp 環境、実 subprocess + fake clock は使わない (実時間計測)。外部通信なし|§3.3 の Cw の「SIGKILL 後 wait 再実行」区間の実測裏取り・AC-B2-03 の fake worker 設計。B-2a 着手前必須|
 |2|**現行 (B-2 適用前) の**日曜 21:0x UTC 開始の `trigger='cron'` mission が実在し、前セッション (金曜) の最終足で起動していたか — B-2b が塞ぐ対象を実データで裏取りする (修正後の期待は「起動しない」で、これは AC-B2-05 が検証する)|実 DB `missions` の read-only 集計 (2026-09-15 以降の日曜 21:00〜21:15)。無ければ AC-B2-05 の fake で再現|§3.2 の推測 (前セッション足の誤発火) を事実にする|
 |3|15m 判断足で cron mission が見た strategy signal を signal mission が再 claim した実例|実 DB の `signals.claimed_by_mission_id` と `missions.trigger` の read-only 突合|§3.1 の優先度|
-|4|mission あたりの market tool 呼出し数 (get_ohlcv / get_indicators、足別)|実 DB `missions.transcript_json` の read-only 集計|§3.4 の外向き予算式の係数、`datafeed.context_daily_call_budget` の既定値。B-2d 着手前必須|
+|4|mission あたりの market tool 呼出し数 (get_ohlcv / get_indicators、足別)|実 DB `missions.transcript_json` の read-only 集計|§3.4 の外向き予算式の係数、`datafeed.context_daily_call_budget` の既定値。B-2d 着手前必須 **実測 (2026-09-27、`tmp/impl-b2d/measure/measurements-9-4.md`)**: 91 mission、15m 運用 平均 4.53 / p95 9 / 最大 17 回、最大日次 169 回 (36 mission)、4h 足への get_indicators 109 回 (宣言なしでも参考足を呼んでいる)、source は yfinance (設定からの推定)。|
 |5|`cron_cursor` の upsert が core_lock 内の tick 時間に与える影響|tmp SQLite で 1000 tick|B-2b|
 |6|busy 見送りの頻度|B-2a で `cron_mission_deferred` を導入した後、実 DB の該当 activity 行を集計する (現行 DB には拒否された submit が残らず、受理時刻だけからは busy を識別できないため今回は測らない)|§3.3 の event の重要度 (次段の観測)|
 
@@ -434,3 +436,4 @@ bridge や外部 source を叩く測定は無い。
 |2026-09-27|v1.3|IV-2 の失敗記録を (pair, interval) 単位と明記。|実装レビュー 2 周目で、複数 pair が同 tick に失敗すると 2 件目以降が無音になる欠陥を是正したため|`b0de51f`|
 |2026-09-27|v1.4|§3.1 失敗時に lease と Cw の関係 (`signal_lease_min × 60 > Cw` の起動時検査) を追加。|段 c 実装後の変異スイープで、lease 切れにより cron の判断が捨てられる新経路が見つかったため|—|
 |2026-09-27|v1.5|lease 検査に commit-pre の余白 60 秒を加える。|worker 上限だけでは claim〜consume の実拘束期間を覆わないと指摘されたため|—|
+|2026-09-27|v1.6|§3.4 に予算の計数方式 (子 registry の on_result → result フレーム → `MissionResult` → 親の run 相直後、UTC 暦日、プロセスメモリ、None = 不明、ask も対象、観測処理の例外隔離) と既定 1000 の根拠を追加。§7 の既定値を確定。AC-B2-20 の文言を精密化 (期限経過後の見込み表示、`filled_at` 起点、閉場中は非表示、定数導出・切り捨て)。§9-4 に再計測結果。起票 `[market-tool-budget-persist-via-alert-state]`。|B-2d 実装 (codex advise / 段 0 / codex 2 周 / `/code-review high` / ローカル 2 周) で確定した裁定の反映|`79db5b7`|
