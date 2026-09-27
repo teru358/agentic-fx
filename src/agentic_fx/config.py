@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -61,11 +62,25 @@ class RiskSettings(_Strict):
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
     max_slippage_pct: float = Field(gt=0)
-    # NY 現地時間。市場クローズ (NY 金 17:00) からの逆算で指定する
-    # (America/New_York は DST を跨ぐため、UTC 固定だと季節でずれる)
+    # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)
+    # なので、通年でクローズより前になる範囲だけを受け入れる。
     friday_swing_cutoff_ny: str = "14:00"
     commission_per_lot: float = Field(ge=0)
     pair_rules: dict[str, PairRule]
+
+    @field_validator("friday_swing_cutoff_ny")
+    @classmethod
+    def _friday_swing_cutoff_before_close(cls, value: str) -> str:
+        if not re.fullmatch(r"\d{2}:\d{2}", value, flags=re.ASCII):
+            raise ValueError(
+                "friday_swing_cutoff_ny must be ASCII HH:MM in range "
+                f"00:00 <= cutoff < 16:00; got {value!r}")
+        hour, minute = map(int, value.split(":"))
+        if hour > 23 or minute > 59 or hour >= 16:
+            raise ValueError(
+                "friday_swing_cutoff_ny must be in range "
+                f"00:00 <= cutoff < 16:00; got {value!r}")
+        return value
 
 
 class ClaudeCliSettings(_Strict):

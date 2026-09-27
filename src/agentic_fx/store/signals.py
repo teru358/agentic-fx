@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES, TF_MINUTES
@@ -87,6 +88,19 @@ _REQUEUE_COUNT_EXPR = (
     "CASE WHEN requeue_count >= :max_requeue THEN requeue_count "
     "ELSE requeue_count + 1 END"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class AbandonedRow:
+    id: int
+    plugin: str
+    timeframe: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExpireResult:
+    total: int
+    invalid_timeframe: tuple[AbandonedRow, ...]
 
 
 def _require_aware(dt: datetime, label: str) -> None:
@@ -212,7 +226,7 @@ def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
 
 
 def expire_stale(conn: sqlite3.Connection, *, now: datetime,
-                  freshness_bars: int, activity=None) -> int:
+                  freshness_bars: int) -> ExpireResult:
     """鮮度切れの pending を一括で abandoned にする。claimed には触れない。
 
     claim_oldest とは独立の公開関数 (呼び出し側が通知件数に使う)。claim
@@ -220,10 +234,8 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
     条件が防波堤になる (このモジュール docstring 参照)。
 
     ``_STALE_CONDITION`` は未知 timeframe の行 (`_TF_MINUTES_CASE` が NULL)
-    も無条件に対象へ含む。``activity`` を渡すと、そのうち未知 timeframe が
-    理由の行だけ 1 件ずつ理由付きで記録する (``ActivityLog.write`` は例外
-    を送出しない契約なので try で包まない)。``activity=None`` (既定) は
-    記録しない — 呼び出し規約を壊さない後方互換のデフォルト。
+    も無条件に対象へ含む。通知が必要な未知 timeframe の行は戻り値で呼び出し
+    側へ渡し、store 層では activity を記録しない。
     """
     _require_aware(now, "now")
     cur = conn.execute(
@@ -234,16 +246,12 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
         {"now": now.isoformat(), "freshness_bars": freshness_bars})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
-    if activity is not None:
-        from agentic_fx.activity import Category
-        for row in rows:
-            if row["invalid_timeframe"]:
-                activity.write(
-                    Category.TRADE, "signal_abandoned_invalid_timeframe",
-                    f"signal #{row['id']} ({row['plugin']}) "
-                    f"timeframe={row['timeframe']!r} — invalid_timeframe",
-                    ref_id=str(row["id"]))
-    return len(rows)
+    invalid_timeframe = tuple(
+        AbandonedRow(id=row["id"], plugin=row["plugin"],
+                     timeframe=row["timeframe"])
+        for row in rows if row["invalid_timeframe"]
+    )
+    return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe)
 
 
 def consume(conn: sqlite3.Connection, signal_id: int, *, mission_id: int,

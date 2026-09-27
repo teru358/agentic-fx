@@ -16,7 +16,7 @@ risk:
   limit_deviation_pct: 0.5    # 指値の現値乖離上限
   limit_expiry_max_h: 24
   max_slippage_pct: 0.1
-  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズ (NY 金 17:00) からの逆算で指定する。この時刻以降の新規 swing 建て禁止
+  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)。この時刻以降の新規 swing 建て禁止
   commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
   pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
     USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}

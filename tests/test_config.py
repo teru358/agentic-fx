@@ -45,6 +45,28 @@ def test_example_file_loads():
 
 
 @pytest.mark.parametrize(
+    ("cutoff", "valid"),
+    [
+        ("15:59", True),
+        ("16:00", False),
+        ("17:00", False),
+        ("9:00", False),
+        ("14:60", False),
+        ("１４:００", False),
+        ("14:00", True),
+    ],
+)
+def test_friday_swing_cutoff_ny_validation(cutoff, valid):
+    raw = deepcopy(load_settings(EXAMPLE).model_dump())
+    raw["risk"]["friday_swing_cutoff_ny"] = cutoff
+    if valid:
+        assert Settings.model_validate(raw).risk.friday_swing_cutoff_ny == cutoff
+    else:
+        with pytest.raises(ValidationError, match="friday_swing_cutoff_ny"):
+            Settings.model_validate(raw)
+
+
+@pytest.mark.parametrize(
     ("primary", "enabled", "legacy", "has_key", "error", "expected"),
     [
         (None, {"yfinance"}, None, False, None, "yfinance"),

@@ -3,11 +3,9 @@
 OANDA Japan MT5 実測 (2026-09-06、2025-05〜2026-09 の 5m 実データ):
 週末境界・日次ロールオーバーは 21:00 UTC 固定で、DST に追従しない。
 
-`is_friday_after` も設定キー `friday_swing_cutoff_ny` の名前が示すとおり
-NY 現地時間基準に変更した (レビュー修正: 従来は UTC 固定の cutoff だったため、
-市場クローズ (NY 金 17:00) までの残り時間が DST の季節で 1 時間ずれる欠陥が
-あった)。渡される cutoff_hhmm は NY 現地時間の hh:mm として扱い、曜日判定も
-NY 現地の曜日で行う。
+`is_friday_after` は `friday_swing_cutoff_ny` を NY 現地時間の hh:mm として
+扱い、曜日判定も NY 現地で行う。市場クローズは 21:00 UTC 固定で、NY では
+17:00 EDT / 16:00 EST に相当するため、cutoff は通年でその前に設定する。
 
 """
 from __future__ import annotations

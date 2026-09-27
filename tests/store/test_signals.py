@@ -330,8 +330,9 @@ def test_expire_stale_only_touches_stale_pending(tmp_path):
                        (claimed_stale_id,)).fetchone()
     assert row["status"] == "claimed"
 
-    count = signals.expire_stale(conn, now=NOW, freshness_bars=freshness_bars)
-    assert count == 1
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=freshness_bars)
+    assert result.total == 1
+    assert result.invalid_timeframe == ()
 
     assert conn.execute("SELECT status FROM signals WHERE id=?",
                         (stale_id,)).fetchone()["status"] == "abandoned"
@@ -359,8 +360,9 @@ def test_expire_stale_mixed_timeframes_cutoff(tmp_path):
     d1_id = _add(conn, bar_ts=datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc),
                 content_hash="d1", timeframe="1d")
 
-    count = signals.expire_stale(conn, now=NOW, freshness_bars=freshness_bars)
-    assert count == 1  # 1h の行だけ stale
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=freshness_bars)
+    assert result.total == 1  # 1h の行だけ stale
+    assert result.invalid_timeframe == ()
 
     assert conn.execute("SELECT status FROM signals WHERE id=?",
                         (h1_id,)).fetchone()["status"] == "abandoned"
@@ -374,8 +376,7 @@ def test_expire_stale_mixed_timeframes_cutoff(tmp_path):
 # 未知 timeframe の pending は「claim も expire もされない不死身の
 # pending」にならず、expire_stale で abandoned へ落ちる (`_TF_MINUTES_CASE`
 # が NULL を返す行 = 通常経路の cutoff 判定ができない行を無条件 stale
-# 扱いにする)。activity が渡されたときだけ理由付きで 1 行記録する
-# (`_run_signal_maintenance` からの実配線は test_service_app.py 側)。
+# 扱いにする)。理由付き通知に必要な行情報を呼び出し側へ返す。
 # ---------------------------------------------------------------------
 def test_expire_stale_abandons_unknown_timeframe_pending(tmp_path):
     conn = _conn(tmp_path)
@@ -386,27 +387,18 @@ def test_expire_stale_abandons_unknown_timeframe_pending(tmp_path):
     conn.execute("UPDATE signals SET timeframe='9x' WHERE id=?", (unknown_id,))
     conn.commit()
 
-    class _RecordingActivity:
-        def __init__(self):
-            self.calls = []
-
-        def write(self, category, event, summary, ref_id=None):
-            self.calls.append((category, event, summary, ref_id))
-
-    activity = _RecordingActivity()
-    count = signals.expire_stale(conn, now=NOW, freshness_bars=2,
-                                 activity=activity)
-    assert count == 1
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=2)
+    assert result.total == 1
+    assert len(result.invalid_timeframe) == 1
+    abandoned = result.invalid_timeframe[0]
+    assert abandoned.id == unknown_id
+    assert abandoned.plugin == "p.py"
+    assert abandoned.timeframe == "9x"
 
     assert conn.execute("SELECT status FROM signals WHERE id=?",
                         (unknown_id,)).fetchone()["status"] == "abandoned"
     assert conn.execute("SELECT status FROM signals WHERE id=?",
                         (valid_id,)).fetchone()["status"] == "pending"
-    assert len(activity.calls) == 1
-    _, event, summary, ref_id = activity.calls[0]
-    assert event == "signal_abandoned_invalid_timeframe"
-    assert str(unknown_id) in summary
-    assert ref_id == str(unknown_id)
 
 
 # ---------------------------------------------------------------------

@@ -2641,7 +2641,7 @@ def test_signal_maintenance_reclaims_before_expiring(monkeypatch):
 
     def fake_expire(*a, **k):
         calls.append("expire")
-        return 0
+        return service_mod.signals.ExpireResult(total=0, invalid_timeframe=())
 
     monkeypatch.setattr(service_mod.signals, "reclaim_expired", fake_reclaim)
     monkeypatch.setattr(service_mod.signals, "expire_stale", fake_expire)
@@ -2730,6 +2730,49 @@ def test_signal_maintenance_state_transition_stale_claimed_becomes_abandoned(tmp
     assert row_after["requeue_count"] == 1, \
         f"Expected requeue_count=1, got {row_after['requeue_count']}"
 
+    conn.close()
+
+
+def test_signal_maintenance_notifies_unknown_timeframe_once(tmp_path):
+    """unknown timeframe の abandoned 遷移だけを activity に記録する。"""
+    import agentic_fx.service as service_mod
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(conn)
+    settings = service_mod.load_settings(
+        Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    signal_id = conn.execute(
+        "INSERT INTO signals (plugin, content_hash, pair, timeframe, bar_ts, kind, "
+        "status, created_at, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("unknown_plugin", "unknown-tf", "USDJPY", "9x", now.isoformat(),
+         "signal", "pending", now.isoformat(), "{}"),
+    ).lastrowid
+    conn.commit()
+
+    class _NoOpProducer:
+        def evaluate_due_plugins(self, **k):
+            pass
+
+    class _RecordingActivity:
+        def __init__(self):
+            self.calls = []
+
+        def write(self, category, event, summary, ref_id=None):
+            self.calls.append((category, event, summary, ref_id))
+
+    activity = _RecordingActivity()
+    for _ in range(2):
+        service_mod._run_signal_maintenance(
+            conn=conn, signal_producer=_NoOpProducer(), approved=[],
+            settings=settings, now=now, resolved_by_identity={}, activity=activity)
+
+    assert len(activity.calls) == 1
+    _, event, summary, ref_id = activity.calls[0]
+    assert event == "signal_abandoned_invalid_timeframe"
+    assert str(signal_id) in summary
+    assert ref_id == str(signal_id)
     conn.close()
 
 

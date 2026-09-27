@@ -778,9 +778,15 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
     signals.reclaim_expired(conn, now=now,
                             lease_min=settings.plugin.signal_lease_min,
                             max_requeue=settings.plugin.signal_requeue_max)
-    signals.expire_stale(conn, now=now,
-                         freshness_bars=settings.plugin.signal_freshness_bars,
-                         activity=activity)
+    expired = signals.expire_stale(
+        conn, now=now, freshness_bars=settings.plugin.signal_freshness_bars)
+    if activity is not None:
+        for row in expired.invalid_timeframe:
+            activity.write(
+                Category.TRADE, "signal_abandoned_invalid_timeframe",
+                f"signal #{row.id} ({row.plugin}) "
+                f"timeframe={row.timeframe!r} — invalid_timeframe",
+                ref_id=str(row.id))
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
         source=settings.datafeed.primary, settings=settings,
