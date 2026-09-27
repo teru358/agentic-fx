@@ -4190,8 +4190,8 @@ def test_check_cli_backend_forwards_which_trade_to_secret_check(tmp_path, monkey
 
 def test_check_service_initial_env_has_no_secrets_rejects_leaked_key_via_seam():
     """⑤ 検査本体 (R3): seam に注入した名前集合に秘密パターンがあれば拒否する。
-    `settings` 引数は現状未使用 (呼び出し規約を `_check_cli_backend` と
-    揃えるために受け取るのみ) — ダミー値でよい。"""
+    `settings` は `service.secret_env_allowlist` の読み出しに使う (ここでは
+    空の allowlist を持つスタブでよい)。"""
     from agentic_fx.service import _check_service_initial_env_has_no_secrets
 
     with pytest.raises(RuntimeError, match="API_KEY|secret"):
