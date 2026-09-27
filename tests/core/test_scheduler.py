@@ -3144,3 +3144,17 @@ def test_closed_tick_baselines_cursor_when_state_stays_ready(tmp_path):
         FRI - timedelta(hours=1, seconds=30))
     env.sched.tick(opened)
     assert env.trade_calls == 0
+
+
+def test_day_forced_close_starts_exactly_five_minutes_before_rollover(tmp_path):
+    env = Env(tmp_path)
+    oid = env.place_limit()
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(WED + timedelta(minutes=1))
+    env.sched.tick(WED.replace(hour=20, minute=54, second=59))
+    assert orders.get(env.conn, oid)["status"] == "open"
+    env.sched.tick(WED.replace(hour=20, minute=55))
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "day_rollover"

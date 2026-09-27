@@ -53,7 +53,7 @@ def test_strategy_timeframe_mismatch_warns_once_and_prompt_has_decision_metadata
 
     loop = object.__new__(TradeLoop)
     loop.settings = SimpleNamespace(
-        datafeed=SimpleNamespace(decision_timeframe="15m"),
+        datafeed=SimpleNamespace(decision_timeframe="15m", context_timeframes=[]),
         paper=SimpleNamespace(starting_balance=1),
     )
     loop.policy = SimpleNamespace(tail=lambda _limit: "")
@@ -61,11 +61,11 @@ def test_strategy_timeframe_mismatch_warns_once_and_prompt_has_decision_metadata
     loop.executor = SimpleNamespace(broker=object())
     monkeypatch.setattr("agentic_fx.loops.trade_loop.build_state_summary",
                         lambda *_args: "state")
-    prompt = loop._build_prompt("system")
+    prompt = loop._build_prompt("system", NOW)
     assert "decision_timeframe: 15m" in prompt
     assert "consumed / abandoned の行は再提案しない" in prompt
     loop.settings.datafeed.decision_timeframe = "1h"
-    assert "decision_timeframe: 1h" in loop._build_prompt("system")
+    assert "decision_timeframe: 1h" in loop._build_prompt("system", NOW)
 
 
 def _seed_decision_bar(conn, bar_time=NOW - timedelta(hours=1, seconds=30)):
@@ -977,7 +977,7 @@ def test_default_1h_cron_claims_signal_and_keeps_existing_prompt_and_rhythm(tmp_
         head, signal_section = fake.missions[0].prompt.split(
             "\n\n## この判断で扱う signal\n", 1)
         clock.current = NOW
-        assert head == app.trade_loop._build_prompt(load_prompt("trade_mission"))
+        assert head == app.trade_loop._build_prompt(load_prompt("trade_mission"), NOW)
         assert "decision_timeframe: 1h" in head
         assert "- strategy_timeframe: 1h\n" in signal_section
     finally:
@@ -2001,6 +2001,10 @@ def test_run_service_daemon_graceful_shutdown_with_injected_runner(tmp_path):
     assert rc == 0
     act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     assert "service_stopped" in act and "graceful" in act
+    assert "decision_timeframe=1h" in act
+    assert "context_timeframes=[]" in act
+    assert "context_daily_call_budget=1000 (UTC 日, プロセス内)" in act
+    assert "プロセス再起動で当日カウンタは 0 に戻る" in act
 
 
 def test_run_service_closes_owned_runner_on_graceful_shutdown(tmp_path):

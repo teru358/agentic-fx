@@ -166,6 +166,8 @@ class DatafeedSettings(_Strict):
     intervals: list[str] = Field(default_factory=lambda: ["1m", "1h"],
                                  min_length=1)
     decision_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
+    context_timeframes: list[str] = Field(default_factory=list)
+    context_daily_call_budget: int | None = Field(default=1000, ge=1)
     primary_intervals: list[str] = Field(default_factory=lambda: ["1h"],
                                          min_length=1)
     # 取引不可・分析専用。pair enum には入らない (§6)
@@ -231,6 +233,7 @@ class DatafeedSettings(_Strict):
         # 設定読み込みに巻き込まれ、循環 import の温床にもなる
         from agentic_fx.datafeed.sources import INTERVAL_MIN
         unknown = [i for i in (self.intervals + self.decision_timeframes
+                                + self.context_timeframes
                                 + self.primary_intervals)
                    if i not in INTERVAL_MIN]
         if unknown:
@@ -242,6 +245,18 @@ class DatafeedSettings(_Strict):
         if missing:
             raise ValueError(
                 f"primary_intervals must be a subset of intervals: {missing}")
+        if len(set(self.context_timeframes)) != len(self.context_timeframes):
+            raise ValueError("context_timeframes must not contain duplicates")
+        decision_context = set(self.context_timeframes) & set(self.decision_timeframes)
+        if decision_context:
+            raise ValueError(
+                "context_timeframes must not include the decision timeframe: "
+                f"{decision_context}")
+        missing_context = set(self.context_timeframes) - set(self.intervals)
+        if missing_context:
+            raise ValueError(
+                "context_timeframes must be a subset of intervals: "
+                f"{missing_context}")
         return self
 
     @model_validator(mode="after")

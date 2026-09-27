@@ -32,7 +32,6 @@ _NEWS_INTERVAL = timedelta(minutes=30)
 # 経済指標カレンダーは **週次** の JSON なので 30 分ごとに取り直しても無駄。
 # ただし当日の forecast/previous は更新されうるので 1 日 1 回よりは細かく。
 _ECON_INTERVAL = timedelta(hours=6)
-_DAY_CLOSE_BUFFER = timedelta(minutes=5)
 _BAR_FRESHNESS = timedelta(minutes=5)
 
 
@@ -1170,7 +1169,7 @@ class Scheduler:
                 anchor = row["filled_at"] or row["created_at"]
                 deadline = market_hours.next_rollover(
                     datetime.fromisoformat(anchor))
-                if now < deadline - _DAY_CLOSE_BUFFER:
+                if now < deadline - market_hours.DAY_CLOSE_BUFFER:
                     continue
                 try:
                     q = self.executor.quote_fn(row["pair"])

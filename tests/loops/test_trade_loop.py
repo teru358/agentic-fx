@@ -2,10 +2,12 @@
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.config import load_settings
@@ -93,6 +95,64 @@ def test_hold_mission_recorded(tmp_path):
     assert "現在の状態" in prompt
 
 
+def test_prompt_lists_context_timeframes_only_when_configured(tmp_path):
+    _, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "様子見"}, [])])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_timeframes = ["1h", "4h"]
+    loop.settings.datafeed.decision_timeframes = ["15m"]
+    loop.run_once()
+    assert (
+        "context_timeframes: 1h, 4h "
+        "(参考足。発注判断の足ではない。確定足だけ)"
+    ) in runner.missions[0].prompt
+
+    empty_path = tmp_path / "empty"
+    empty_path.mkdir()
+    _, empty_loop, empty_runner, _ = _loop(
+        empty_path, [MissionResult(
+            "completed", {"action": "hold", "reasoning": "様子見"}, [])])
+    empty_loop.run_once()
+    assert "context_timeframes:" not in empty_runner.missions[0].prompt
+
+
+@pytest.mark.parametrize(
+    ("now", "expected", "absent"),
+    [
+        (datetime(2026, 7, 22, 20, 54, 59, tzinfo=timezone.utc),
+         "day 建玉の強制決済 20:55:00 UTC (残り 0 分、開始時点の見込み)",
+         "当日の day 期限"),
+        (datetime(2026, 7, 22, 20, 55, 0, tzinfo=timezone.utc),
+         "当日の day 期限 20:55:00 UTC は経過", "残り 0 分"),
+        (datetime(2026, 7, 22, 20, 59, 59, tzinfo=timezone.utc),
+         "当日の day 期限 20:55:00 UTC は経過", "翌日 20:55:00"),
+        (datetime(2026, 7, 22, 21, 0, 0, tzinfo=timezone.utc),
+         "day 建玉の強制決済 翌日 20:55:00 UTC", "当日の day 期限"),
+    ],
+)
+def test_prompt_day_horizon_deadline_boundaries(tmp_path, now, expected, absent):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt("system", now)
+    assert expected in prompt
+    assert absent not in prompt
+    assert "実際の期限は約定時刻で決まる" in prompt
+
+
+def test_prompt_day_horizon_remaining_minutes_are_floored(tmp_path):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 7, 22, 20, 45, 31, tzinfo=timezone.utc))
+    assert "day 建玉の強制決済 20:55:00 UTC (残り 9 分、開始時点の見込み)" in prompt
+
+
+def test_prompt_friday_elapsed_deadline_does_not_show_saturday(tmp_path):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 7, 24, 20, 56, tzinfo=timezone.utc))
+    assert "当日の day 期限 20:55:00 UTC は経過" in prompt
+    assert "翌日" not in prompt
+
+
 def test_run_once_mission_tools_include_get_signals(tmp_path):
     """⑧プラン 7 Task 9: _TRADE_TOOLS への get_signals 追加が実際に
     Mission.tools まで届くことのピン (registry 登録だけでは Mission から
@@ -150,6 +210,187 @@ def test_unparsable_intent_recorded(tmp_path):
         "completed", {"action": "buy!"}, [])])
     assert loop.run_once() is None
     assert "intent_parse_failed" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_market_budget_counts_failed_mission_before_early_return(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], market_tool_calls={
+            "get_ohlcv": 4, "get_indicators": 2})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    assert loop.run_once() is None
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("market_tool_daily_budget_exceeded") == 1
+    assert "calls=6 budget=5 unknown_missions=0" in activity
+    assert "mission_failed\trunner status=failed market_tool_calls=6" in activity
+
+
+def test_market_budget_counts_unparsable_completed_mission(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "invalid"}, [], market_tool_calls={
+            "get_ohlcv": 3, "get_indicators": 3})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    assert loop.run_once() is None
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("market_tool_daily_budget_exceeded") == 1
+    assert "intent_parse_failed" in activity
+    assert "market_tool_calls=6" in activity
+
+
+def test_market_budget_warns_only_after_exceeding_once_per_utc_day(tmp_path):
+    results = [
+        MissionResult("completed", {"action": "hold", "reasoning": "a"}, [],
+                      market_tool_calls={"get_ohlcv": 3, "get_indicators": 2}),
+        MissionResult("completed", {"action": "hold", "reasoning": "b"}, [],
+                      market_tool_calls={"get_ohlcv": 1, "get_indicators": 0}),
+        MissionResult("completed", {"action": "hold", "reasoning": "c"}, [],
+                      market_tool_calls={"get_ohlcv": 1, "get_indicators": 0}),
+        MissionResult("completed", {"action": "hold", "reasoning": "d"}, [],
+                      market_tool_calls={"get_ohlcv": 6, "get_indicators": 0}),
+    ]
+    _, loop, _, tp = _loop(tmp_path, results)
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+
+    loop.run_once()
+    assert "market_tool_daily_budget_exceeded" not in (
+        tp / "a.log").read_text(encoding="utf-8")
+    loop.run_once()
+    loop.run_once()
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("market_tool_daily_budget_exceeded") == 1
+
+    loop.clock = FixedClock(NOW + timedelta(days=1))
+    loop.run_once()
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("market_tool_daily_budget_exceeded") == 2
+
+
+def test_market_budget_unknown_disabled_and_ask_paths(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [
+        MissionResult("completed", {"action": "hold", "reasoning": "a"}, [],
+                      market_tool_calls=None),
+        MissionResult("completed", {"answer": "ok"}, [],
+                      market_tool_calls={"get_ohlcv": 4, "get_indicators": 2}),
+    ])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = None
+    loop.run_once()
+    assert loop._market_tool_daily[NOW.date()]["unknown_missions"] == 1
+    loop.ask_once("status?")
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert "market_tool_daily_budget_exceeded" not in activity
+    assert "decision\thold -> hold market_tool_calls=unknown" in activity
+    assert "ask_answered\tstatus? market_tool_calls=6" in activity
+
+
+def test_invalid_market_tool_calls_do_not_change_completed_mission(tmp_path):
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "ok"}, [],
+        market_tool_calls="x")])
+    assert loop._run_once_impl()["result"] == "hold"
+    assert [row["status"] for row in conn.execute(
+        "SELECT status FROM missions")] == ["completed"]
+    assert "decision\thold -> hold market_tool_calls=unknown" in (
+        tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_market_budget_restarts_from_zero_in_new_loop_instance(tmp_path):
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    first_path.mkdir()
+    second_path.mkdir()
+    result = MissionResult(
+        "failed", None, [],
+        market_tool_calls={"get_ohlcv": 6, "get_indicators": 0})
+    for path in (first_path, second_path):
+        _, loop, _, tp = _loop(path, [result])
+        loop.settings = SETTINGS.model_copy(deep=True)
+        loop.settings.datafeed.context_daily_call_budget = 5
+        loop.run_once()
+        assert (tp / "a.log").read_text(encoding="utf-8").count(
+            "market_tool_daily_budget_exceeded") == 1
+
+
+def test_market_budget_trade_warning_write_failure_retries_without_changing_result(
+        tmp_path):
+    result = MissionResult(
+        "completed", {"action": "hold", "reasoning": "ok"}, [],
+        market_tool_calls={"get_ohlcv": 6, "get_indicators": 0})
+    conn, loop, _, tp = _loop(tmp_path, [result, result])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    real_write = loop.activity.write
+    warning_attempts = 0
+
+    def flaky_write(category, event, summary, ref_id=None):
+        nonlocal warning_attempts
+        if event == "market_tool_daily_budget_exceeded":
+            warning_attempts += 1
+            if warning_attempts == 1:
+                raise OSError("activity unavailable")
+        return real_write(category, event, summary, ref_id)
+
+    loop.activity.write = flaky_write
+    assert loop.run_once()["result"] == "hold"
+    assert loop.run_once()["result"] == "hold"
+    assert warning_attempts == 2
+    assert [row["status"] for row in conn.execute(
+        "SELECT status FROM missions ORDER BY id")] == ["completed", "completed"]
+    assert (tp / "a.log").read_text(encoding="utf-8").count(
+        "market_tool_daily_budget_exceeded") == 1
+
+
+def test_market_budget_ask_warning_write_failure_retries_without_changing_result(
+        tmp_path):
+    result = MissionResult(
+        "completed", {"answer": "ok"}, [],
+        market_tool_calls={"get_ohlcv": 6, "get_indicators": 0})
+    conn, loop, _, tp = _loop(tmp_path, [result, result])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    real_write = loop.activity.write
+    warning_attempts = 0
+
+    def flaky_write(category, event, summary, ref_id=None):
+        nonlocal warning_attempts
+        if event == "market_tool_daily_budget_exceeded":
+            warning_attempts += 1
+            if warning_attempts == 1:
+                raise OSError("activity unavailable")
+        return real_write(category, event, summary, ref_id)
+
+    loop.activity.write = flaky_write
+    assert loop.ask_once("first") == "ok"
+    assert loop.ask_once("second") == "ok"
+    assert warning_attempts == 2
+    assert [row["status"] for row in conn.execute(
+        "SELECT status FROM missions ORDER BY id")] == ["completed", "completed"]
+    assert (tp / "a.log").read_text(encoding="utf-8").count(
+        "market_tool_daily_budget_exceeded") == 1
+
+
+def test_trade_market_calls_are_counted_before_watch_end_failure(tmp_path):
+    result = MissionResult(
+        "completed", {"action": "hold", "reasoning": "ok"}, [],
+        market_tool_calls={"get_ohlcv": 2, "get_indicators": 1})
+    _, loop, _, _ = _loop(tmp_path, [result])
+    loop.watch.end = MagicMock(side_effect=RuntimeError("watch unavailable"))
+    assert loop.run_once() is None
+    assert loop._market_tool_daily[NOW.date()]["get_ohlcv"] == 2
+    assert loop._market_tool_daily[NOW.date()]["get_indicators"] == 1
+
+
+def test_ask_market_calls_are_counted_before_watch_end_failure(tmp_path):
+    result = MissionResult(
+        "completed", {"answer": "ok"}, [],
+        market_tool_calls={"get_ohlcv": 2, "get_indicators": 1})
+    _, loop, _, _ = _loop(tmp_path, [result])
+    loop.watch.end = MagicMock(side_effect=RuntimeError("watch unavailable"))
+    assert loop.ask_once("status?") == "(Mission 失敗: internal_error)"
+    assert loop._market_tool_daily[NOW.date()]["get_ohlcv"] == 2
+    assert loop._market_tool_daily[NOW.date()]["get_indicators"] == 1
 
 
 def test_open_intent_executes(tmp_path):
@@ -707,7 +948,8 @@ def test_mission_failed_activity_line_is_pinned_field_by_field(tmp_path):
     _ts, category, event, summary, ref_id = lines[0].split("\t")
     assert category == "AGGREGATE"
     assert event == "mission_failed"
-    assert summary == f"runner status=failed — {reason}"
+    assert summary == (
+        f"runner status=failed — {reason} market_tool_calls=unknown")
     assert ref_id == str(mid)
 
 
@@ -961,3 +1203,194 @@ def test_cron_mission_rows_are_committed_before_runner_starts(tmp_path):
     assert in_tx is False
     assert len(mids) == 1
     assert provenance == [bars]
+
+
+class _StepClock:
+    """Returns ``first`` on the first call and ``later`` on every later call."""
+
+    def __init__(self, first, later):
+        self._values = [first]
+        self._later = later
+
+    def now(self):
+        return self._values.pop() if self._values else self._later
+
+
+def test_prompt_timeframe_section_is_exact_and_precedes_day_horizon(tmp_path):
+    _, loop, _, _ = _loop(tmp_path, [])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.decision_timeframes = ["15m"]
+    loop.settings.datafeed.context_timeframes = ["1h", "4h"]
+    prompt = loop._build_prompt("system", NOW)
+    section = (
+        "## 判断足\n"
+        "decision_timeframe: 15m\n"
+        "context_timeframes: 1h, 4h (参考足。発注判断の足ではない。確定足だけ)\n"
+        "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
+        "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
+    )
+    assert f"system\n\n{section}\n\n## day 建玉期限\n" in prompt
+
+
+def test_prompt_day_horizon_minutes_are_floored_not_rounded(tmp_path):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 7, 22, 20, 45, 29, tzinfo=timezone.utc))
+    assert "day 建玉の強制決済 20:55:00 UTC (残り 9 分、開始時点の見込み)" in prompt
+
+
+def test_prompt_day_horizon_next_day_across_month_end(tmp_path):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 6, 30, 21, 0, 0, tzinfo=timezone.utc))
+    assert "day 建玉の強制決済 翌日 20:55:00 UTC (残り 1435 分" in prompt
+
+
+def test_prompt_day_horizon_uses_utc_date_for_non_utc_now(tmp_path):
+    jst = timezone(timedelta(hours=9))
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 7, 23, 6, 0, 0, tzinfo=jst))
+    assert "day 建玉の強制決済 翌日 20:55:00 UTC (残り 1435 分" in prompt
+
+
+@pytest.mark.parametrize("now", [
+    datetime(2026, 7, 24, 21, 0, 0, tzinfo=timezone.utc),
+    datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc),
+    datetime(2026, 7, 26, 20, 59, 59, tzinfo=timezone.utc),
+])
+def test_prompt_day_horizon_closed_market_shows_no_deadline(tmp_path, now):
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt("system", now)
+    assert ("## day 建玉期限\n市場は閉場中。次の day 期限は開始時点では表示しない。"
+            "実際の期限は約定時刻で決まる。") in prompt
+    assert "強制決済" not in prompt
+    assert "翌日" not in prompt
+
+
+def test_prompt_day_horizon_follows_shared_close_buffer(tmp_path, monkeypatch):
+    from agentic_fx.core import market_hours
+    monkeypatch.setattr(market_hours, "DAY_CLOSE_BUFFER", timedelta(minutes=10))
+    monkeypatch.setattr(
+        market_hours, "next_rollover",
+        lambda now: now.replace(hour=22, minute=0, second=0, microsecond=0))
+    _, loop, _, _ = _loop(tmp_path, [])
+    prompt = loop._build_prompt(
+        "system", datetime(2026, 7, 22, 21, 51, 0, tzinfo=timezone.utc))
+    assert "当日の day 期限 21:50:00 UTC は経過" in prompt
+    assert "22:00 UTC より前" in prompt
+    assert "22:00 以降の約定" in prompt
+    assert "20:55:00" not in prompt
+    assert "21:00" not in prompt
+
+    before_deadline = loop._build_prompt(
+        "system", datetime(2026, 7, 22, 21, 45, 31, tzinfo=timezone.utc))
+    assert "強制決済 21:50:00 UTC (残り 4 分" in before_deadline
+
+
+def test_trade_prompt_uses_tick_start_time_not_a_later_clock_read(tmp_path):
+    _, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "a"}, [])])
+    loop.clock = _StepClock(
+        datetime(2026, 7, 22, 20, 45, 31, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 21, 0, 31, tzinfo=timezone.utc))
+    loop.run_once()
+    prompt = runner.missions[0].prompt
+    assert "day 建玉の強制決済 20:55:00 UTC (残り 9 分" in prompt
+    assert "翌日" not in prompt
+
+
+def test_ask_prompt_uses_ask_start_time_not_a_later_clock_read(tmp_path):
+    _, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "ok"}, [])])
+    loop.clock = _StepClock(
+        datetime(2026, 7, 22, 20, 45, 31, tzinfo=timezone.utc),
+        datetime(2026, 7, 22, 21, 0, 31, tzinfo=timezone.utc))
+    assert loop.ask_once("status?") == "ok"
+    prompt = runner.missions[0].prompt
+    assert "day 建玉の強制決済 20:55:00 UTC (残り 9 分" in prompt
+    assert "翌日" not in prompt
+
+
+def test_market_budget_warning_line_is_pinned_field_by_field(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], market_tool_calls={
+            "get_ohlcv": 4, "get_indicators": 2})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    loop.settings.datafeed.primary = "mt5"
+    loop.run_once()
+    lines = [ln for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()
+             if "\tmarket_tool_daily_budget_exceeded\t" in ln]
+    assert len(lines) == 1, lines
+    _ts, category, event, summary, ref_id = lines[0].split("\t")
+    assert category == "SYSTEM"
+    assert event == "market_tool_daily_budget_exceeded"
+    assert summary == (
+        "source=mt5 date=2026-07-22 calls=6 budget=5 unknown_missions=0 "
+        "(WARNING のみ、tool 呼出しは拒否しない。"
+        "プロセス再起動で当日カウンタは 0 に戻る)")
+    assert ref_id == "-"
+
+
+def test_market_budget_ask_mission_counts_toward_warning(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"answer": "ok"}, [],
+        market_tool_calls={"get_ohlcv": 4, "get_indicators": 2})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    assert loop.ask_once("status?") == "ok"
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("market_tool_daily_budget_exceeded") == 1
+    assert "calls=6 budget=5 unknown_missions=0" in activity
+
+
+def test_market_budget_attributes_calls_to_mission_start_day(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], market_tool_calls={
+            "get_ohlcv": 6, "get_indicators": 0})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    loop.clock = _StepClock(
+        datetime(2026, 7, 22, 23, 59, 30, tzinfo=timezone.utc),
+        datetime(2026, 7, 23, 0, 0, 30, tzinfo=timezone.utc))
+    loop.run_once()
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert "date=2026-07-22 calls=6" in activity
+    assert list(loop._market_tool_daily) == [date(2026, 7, 22)]
+
+
+def test_market_budget_uses_utc_date_for_non_utc_clock(tmp_path):
+    jst = timezone(timedelta(hours=9))
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "failed", None, [], market_tool_calls={
+            "get_ohlcv": 6, "get_indicators": 0})])
+    loop.settings = SETTINGS.model_copy(deep=True)
+    loop.settings.datafeed.context_daily_call_budget = 5
+    loop.clock = FixedClock(datetime(2026, 7, 23, 8, 0, tzinfo=jst))
+    loop.run_once()
+    assert "date=2026-07-22 calls=6" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_market_budget_keeps_only_current_day_state(tmp_path):
+    result = MissionResult("completed", {"action": "hold", "reasoning": "a"}, [],
+                           market_tool_calls={"get_ohlcv": 1, "get_indicators": 0})
+    _, loop, _, _ = _loop(tmp_path, [result, result])
+    loop.run_once()
+    assert list(loop._market_tool_daily) == [NOW.date()]
+    loop.clock = FixedClock(NOW + timedelta(days=1))
+    loop.run_once()
+    assert list(loop._market_tool_daily) == [(NOW + timedelta(days=1)).date()]
+
+
+def test_intent_execution_failed_line_carries_market_tool_calls(tmp_path):
+    _, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "test"}, [],
+        market_tool_calls={"get_ohlcv": 2, "get_indicators": 1})])
+    loop.executor.record_and_validate_intent = MagicMock(
+        side_effect=RuntimeError("executor_boom"))
+    assert loop.run_once() is None
+    lines = [ln for ln in (tp / "a.log").read_text(encoding="utf-8").splitlines()
+             if "\tintent_execution_failed\t" in ln]
+    assert len(lines) == 1, lines
+    assert lines[0].split("\t")[3].endswith(" market_tool_calls=3")

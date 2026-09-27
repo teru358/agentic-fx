@@ -1563,7 +1563,13 @@ def run_service(root: Path, *, daemon: bool = False,
         print(warning)
     print(build_splash(app))
     app.activity.write(Category.SYSTEM, "service_started",
-                       f"daemon={daemon}")
+                       f"daemon={daemon} "
+                       f"decision_timeframe={settings.datafeed.decision_timeframe} "
+                       f"context_timeframes={settings.datafeed.context_timeframes} "
+                       "context_daily_call_budget="
+                       f"{settings.datafeed.context_daily_call_budget} "
+                       "(UTC 日, プロセス内) "
+                       "プロセス再起動で当日カウンタは 0 に戻る")
 
     scheduler_busy = threading.Event()
 

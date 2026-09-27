@@ -70,6 +70,7 @@ class MissionResult:
     # 1 行要約。既定 None。runner (`CliRunner`) が埋め、improve_loop の
     # 終端で activity `cli_stderr_fatal` として書く。
     stderr_fatal: str | None = None
+    market_tool_calls: dict[str, int] | None = None
 
 
 class AgentRunner(ABC):

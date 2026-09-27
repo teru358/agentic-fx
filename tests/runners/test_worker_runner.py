@@ -455,6 +455,8 @@ def test_worker_runner_result_frame_carries_tool_calls_and_stderr_fatal(
         write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
         write_frame(child_out, {"type": "result", "seq": 2,
                                 "status": "completed", "output": {"x": 1},
+                                "market_tool_calls": {
+                                    "get_ohlcv": 2, "get_indicators": 1},
                                 "tool_calls": 11,
                                 "stderr_fatal": "pattern=SIGTRAP tail=x"})
         child_out.close()
@@ -490,6 +492,57 @@ def test_worker_runner_result_frame_carries_tool_calls_and_stderr_fatal(
     assert result.status == "completed"
     assert result.tool_calls == 11
     assert result.stderr_fatal == "pattern=SIGTRAP tail=x"
+    assert result.market_tool_calls == {"get_ohlcv": 2, "get_indicators": 1}
+
+
+@pytest.mark.parametrize("market_tool_calls", [
+    "x",
+    {"get_ohlcv": "1"},
+])
+def test_worker_runner_invalid_market_tool_calls_are_discarded(
+        tmp_path, monkeypatch, caplog, market_tool_calls):
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())
+        child_in.close()
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        write_frame(child_out, {"type": "result", "seq": 2,
+                                "status": "completed", "output": {"x": 1},
+                                "market_tool_calls": market_tool_calls})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+    runner = WorkerRunner(root=_root(tmp_path), settings=SETTINGS,
+                          clock=FixedClock(NOW), rag=_rag(tmp_path))
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert result.market_tool_calls is None
+    warnings = [record for record in caplog.records
+                if record.levelname == "WARNING"
+                and "invalid market_tool_calls" in record.getMessage()]
+    assert len(warnings) == 1
 
 
 def test_worker_runner_result_frame_without_tool_calls_key_defaults_none(
@@ -542,6 +595,7 @@ def test_worker_runner_result_frame_without_tool_calls_key_defaults_none(
     assert result.status == "completed"
     assert result.tool_calls is None
     assert result.stderr_fatal is None
+    assert result.market_tool_calls is None
 
 
 def test_worker_runner_result_frame_falls_back_to_error_key_for_reason(
@@ -563,6 +617,8 @@ def test_worker_runner_result_frame_falls_back_to_error_key_for_reason(
         write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
         write_frame(child_out, {"type": "result", "seq": 2,
                                 "status": "failed", "output": None,
+                                "market_tool_calls": {
+                                    "get_ohlcv": 4, "get_indicators": 2},
                                 "error": "ValueError: boom"})
         child_out.close()
 
@@ -596,6 +652,7 @@ def test_worker_runner_result_frame_falls_back_to_error_key_for_reason(
 
     assert result.status == "failed"
     assert result.reason == "ValueError: boom"
+    assert result.market_tool_calls == {"get_ohlcv": 4, "get_indicators": 2}
 
 
 def test_worker_runner_eof_without_result_sets_worker_eof_reason(
@@ -644,6 +701,7 @@ def test_worker_runner_eof_without_result_sets_worker_eof_reason(
 
     assert result.status == "failed"
     assert result.reason == "worker eof"
+    assert result.market_tool_calls is None
 
 
 def test_worker_runner_ensure_dead_is_noop_when_child_already_terminated(

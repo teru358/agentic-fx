@@ -307,6 +307,9 @@ def test_build_mission_registry_improve_rejects_trade_only_kwargs(tmp_path):
         build_mission_registry(**{**kwargs, "sandbox_run": lambda *a, **kw: None})
     with pytest.raises(ValueError, match="provider/readonly"):
         build_mission_registry(**{**kwargs, "provider": object()})  # L04
+    with pytest.raises(ValueError, match="on_tool_result"):
+        build_mission_registry(
+            **{**kwargs, "on_tool_result": lambda *_args: None})
 
 
 @pytest.mark.parametrize("missing_kwarg", [
@@ -427,3 +430,44 @@ def test_improve_registry_reports_tool_errors_to_shared_counters(tmp_path):
     assert counters.errors == 2
     assert counters.abort_pending is True
     assert counters.abort_trigger == "tool_errors:analyze_corr"
+
+
+def test_build_mission_registry_trade_reports_tool_results_to_hook(tmp_path):
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    seen = []
+
+    registry = build_mission_registry(
+        "trade", conn, SETTINGS, _clock(), rag, activity=activity,
+        on_tool_result=lambda name, ok, error: seen.append((name, ok, error)))
+    registry.execute("get_ohlcv", {}, ["get_ohlcv"])
+    assert seen == [("get_ohlcv", False, "invalid_args")]
+
+
+def test_trade_registry_mcp_call_counts_market_tool(tmp_path):
+    from agentic_fx.tools.mcp_shim import McpShimDispatcher
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    counts = {"get_ohlcv": 0, "get_indicators": 0}
+
+    def count_market(name, _ok, _error):
+        if name in counts:
+            counts[name] += 1
+
+    registry = build_mission_registry(
+        "trade", conn, SETTINGS, _clock(), rag, activity=activity,
+        on_tool_result=count_market)
+    dispatcher = McpShimDispatcher(
+        sock_path=tmp_path / "afx.sock", registry=registry,
+        allowed=["get_ohlcv"])
+    response = dispatcher._dispatch({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "get_ohlcv", "arguments": {}},
+    })
+    assert "result" in response
+    assert counts == {"get_ohlcv": 1, "get_indicators": 0}

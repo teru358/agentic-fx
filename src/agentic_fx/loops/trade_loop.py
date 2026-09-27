@@ -19,6 +19,7 @@ from datetime import datetime
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
+from agentic_fx.core import market_hours
 from agentic_fx.core.contracts import (
     Action, Clock, IntentParseError, Origin, OrderStatus as S, TradeIntent,
 )
@@ -38,6 +39,7 @@ from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import mission_decision_bars, missions, signals
+from agentic_fx.core.timeutil import as_utc
 
 import logging
 
@@ -90,6 +92,7 @@ class TradeLoop:
         self._core_lock = core_lock
         self._conn_supervisor = conn_supervisor
         self.watch = watch if watch is not None else MissionWatch()
+        self._market_tool_daily: dict = {}
 
     # ---- 公開 API (never-raise サービス境界) -----------------------------------
 
@@ -143,10 +146,11 @@ class TradeLoop:
         ない) を採用している — ask は読み取り専用で資金に影響しないため
         許容される。
         """
+        now = self.clock.now()
         try:
             # `now` はここで 1 回だけ採り、healthcheck へ明示的に渡す
             # (healthcheck 側が独自に時刻を読み直さない)。
-            self.provider.healthcheck(self.settings.pairs[0], now=self.clock.now())
+            self.provider.healthcheck(self.settings.pairs[0], now=now)
         except DataUnhealthy as e:
             self.activity.write(Category.SYSTEM, "data_unhealthy", str(e))
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")
@@ -168,7 +172,6 @@ class TradeLoop:
         try:
             # ---- prepare (core_lock 保持) ----
             with self._core_lock:
-                now = self.clock.now()
                 if trigger == "cron" and decision_bars:
                     mid = self._start_cron_mission(now, decision_bars)
                 else:
@@ -217,21 +220,23 @@ class TradeLoop:
                     # "cron" のまま (signal 起動の頻度制限に数えない)。
                     if trigger == "signal":
                         missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
-                    prompt = (self._build_prompt(load_prompt("trade_mission"))
+                    prompt = (self._build_prompt(load_prompt("trade_mission"), now)
                              + self._format_signal_injection(claimed, trigger))
                 else:
-                    prompt = self._build_prompt(load_prompt("trade_mission"))
+                    prompt = self._build_prompt(load_prompt("trade_mission"), now)
                 mission = self._build_mission(prompt)
 
             # ---- run (core_lock 非保持) ----
             self.watch.begin(mid, "trade", mission.timeout_sec)
             try:
-                result = self.runner.run(mission)
-                if not isinstance(result, MissionResult):
+                try:
+                    result = self.runner.run(mission)
+                    if not isinstance(result, MissionResult):
+                        result = MissionResult("failed", None, [])
+                except Exception:  # noqa: BLE001 — runner 例外で周期を殺さない
+                    _log.exception("runner raised")
                     result = MissionResult("failed", None, [])
-            except Exception:  # noqa: BLE001 — runner 例外で周期を殺さない
-                _log.exception("runner raised")
-                result = MissionResult("failed", None, [])
+                self._record_market_tool_calls(result, now)
             finally:
                 self.watch.end(mid)
 
@@ -244,7 +249,8 @@ class TradeLoop:
                 self.activity.write(
                     Category.AGGREGATE, "mission_failed",
                     f"runner status={result.status}"
-                    + (f" — {result.reason}" if result.reason else ""),
+                    + (f" — {result.reason}" if result.reason else "")
+                    + self._market_tool_calls_suffix(result),
                     ref_id=str(mid))
                 self.notifier.send(
                     f"[agentic-fx] 判断 Mission 失敗: {result.status}"
@@ -259,7 +265,8 @@ class TradeLoop:
                                      mid, result)
                 finalized = True
                 self.activity.write(Category.AGGREGATE, "intent_parse_failed",
-                                    str(e), ref_id=str(mid))
+                                    str(e) + self._market_tool_calls_suffix(result),
+                                    ref_id=str(mid))
                 return None
 
             open_snapshot = None
@@ -385,7 +392,9 @@ class TradeLoop:
                     finalized = True
                     self.activity.write(Category.AGGREGATE,
                                         "intent_execution_failed",
-                                        safe_error_text(e), ref_id=str(mid))
+                                        safe_error_text(e)
+                                        + self._market_tool_calls_suffix(result),
+                                        ref_id=str(mid))
                     # **`self.notifier.send` をここで呼んではならない** —
                     # まだ core_lock 保持中であり、urlopen(timeout=10) で
                     # 最大 10 秒ブロックする。commit-post まで遅延させ、
@@ -412,7 +421,8 @@ class TradeLoop:
             if out is None:
                 return None
             self.activity.write(Category.AGGREGATE, "decision",
-                                f"{intent.action.value} -> {out['result']}",
+                                f"{intent.action.value} -> {out['result']}"
+                                + self._market_tool_calls_suffix(result),
                                 ref_id=str(mid))
             return out
         finally:
@@ -597,7 +607,7 @@ class TradeLoop:
         try:
             with self._core_lock:
                 now = self.clock.now()
-                prompt = self._build_prompt(load_prompt("ask_mission")) \
+                prompt = self._build_prompt(load_prompt("ask_mission"), now) \
                     + f"\n\n## ユーザーの質問\n{question}"
                 mission = Mission(
                     prompt=prompt, tools=_TRADE_TOOLS,
@@ -610,12 +620,14 @@ class TradeLoop:
 
             self.watch.begin(mid, "ask", mission.timeout_sec)
             try:
-                result = self.runner.run(mission)
-                if not isinstance(result, MissionResult):
+                try:
+                    result = self.runner.run(mission)
+                    if not isinstance(result, MissionResult):
+                        result = MissionResult("failed", None, [])
+                except Exception:  # noqa: BLE001
+                    _log.exception("runner raised")
                     result = MissionResult("failed", None, [])
-            except Exception:  # noqa: BLE001
-                _log.exception("runner raised")
-                result = MissionResult("failed", None, [])
+                self._record_market_tool_calls(result, now)
             finally:
                 self.watch.end(mid)
 
@@ -632,7 +644,9 @@ class TradeLoop:
             if not isinstance(answer, str):
                 return "(Mission 失敗: completed)"
             self.activity.write(Category.AGGREGATE, "ask_answered",
-                                question[:80], ref_id=str(mid))
+                                question[:80]
+                                + self._market_tool_calls_suffix(result),
+                                ref_id=str(mid))
             return answer
         finally:
             # レビュー 1 周目 codex A3: prepare/run 相の想定外例外
@@ -645,14 +659,105 @@ class TradeLoop:
 
     # ---- Internal -------------------------------------------------------
 
-    def _build_prompt(self, system: str) -> str:
+    def _record_market_tool_calls(self, result: MissionResult,
+                                  now: datetime) -> None:
+        """Accumulate market tool starts for warning-only observability.
+
+        A start is an allowed registry execution of ``get_ohlcv`` or
+        ``get_indicators``. Invalid arguments and failures before provider I/O,
+        including planner refusal, still count; this is not an HTTP-request
+        counter. UTC calendar date is only an aggregation convention, not a
+        measured provider quota boundary. A mission crossing midnight is fully
+        attributed to its start date. State is process memory and is discarded
+        on restart, so a warning may be emitted again on the same UTC day after
+        restart.
+        """
+        try:
+            day = as_utc(now).date()
+            state = self._market_tool_daily.get(day)
+            if state is None:
+                state = {
+                    "get_ohlcv": 0, "get_indicators": 0,
+                    "unknown_missions": 0, "warned": False,
+                }
+            self._market_tool_daily = {day: state}
+            calls = result.market_tool_calls
+            if calls is None:
+                state["unknown_missions"] += 1
+            else:
+                state["get_ohlcv"] += calls.get("get_ohlcv", 0)
+                state["get_indicators"] += calls.get("get_indicators", 0)
+            total = state["get_ohlcv"] + state["get_indicators"]
+            budget = self.settings.datafeed.context_daily_call_budget
+            if budget is None or state["warned"] or total <= budget:
+                return
+            self.activity.write(
+                Category.SYSTEM, "market_tool_daily_budget_exceeded",
+                f"source={self.settings.datafeed.primary} date={day} "
+                f"calls={total} budget={budget} "
+                f"unknown_missions={state['unknown_missions']} "
+                "(WARNING のみ、tool 呼出しは拒否しない。"
+                "プロセス再起動で当日カウンタは 0 に戻る)")
+            state["warned"] = True
+        except Exception:  # noqa: BLE001 — 観測障害で mission を失敗させない
+            _log.exception("market tool call observation failed")
+
+    @staticmethod
+    def _market_tool_calls_suffix(result: MissionResult) -> str:
+        calls = result.market_tool_calls
+        if (not isinstance(calls, dict)
+                or any(not isinstance(value, int) or isinstance(value, bool)
+                       for value in calls.values())):
+            return " market_tool_calls=unknown"
+        total = calls.get("get_ohlcv", 0) + calls.get("get_indicators", 0)
+        return f" market_tool_calls={total}"
+
+    def _build_prompt(self, system: str, now: datetime) -> str:
         """システムプロンプト + policy + サマリを結合する。"""
-        parts = [
-            system,
+        timeframe_section = (
             "## 判断足\n"
             f"decision_timeframe: {self.settings.datafeed.decision_timeframe}\n"
+        )
+        if self.settings.datafeed.context_timeframes:
+            timeframe_section += (
+                "context_timeframes: "
+                f"{', '.join(self.settings.datafeed.context_timeframes)} "
+                "(参考足。発注判断の足ではない。確定足だけ)\n"
+            )
+        timeframe_section += (
             "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
-            "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。",
+            "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
+        )
+        utc_now = as_utc(now)
+        if not market_hours.is_market_open(utc_now):
+            day_horizon = (
+                "市場は閉場中。次の day 期限は開始時点では表示しない。"
+                "実際の期限は約定時刻で決まる。"
+            )
+        else:
+            rollover = market_hours.next_rollover(utc_now)
+            deadline = rollover - market_hours.DAY_CLOSE_BUFFER
+            if utc_now < deadline:
+                remaining = int((deadline - utc_now).total_seconds() // 60)
+                relative = "翌日 " if deadline.date() > utc_now.date() else ""
+                day_horizon = (
+                    f"day 建玉の強制決済 {relative}{deadline:%H:%M:%S} UTC "
+                    f"(残り {remaining} 分、開始時点の見込み)。"
+                    "実際の期限は約定時刻で決まる。"
+                )
+            else:
+                day_horizon = (
+                    f"当日の day 期限 {deadline:%H:%M:%S} UTC は経過。"
+                    f"いま建てる day 建玉は {rollover:%H:%M} UTC より前に"
+                    "約定すれば"
+                    "次 tick で強制決済の対象 (quote が取れた時点で実行)、"
+                    f"{rollover:%H:%M} 以降の約定は翌営業日の期限。"
+                    "開始時点の見込みであり、実際の期限は約定時刻で決まる。"
+                )
+        parts = [
+            system,
+            timeframe_section,
+            f"## day 建玉期限\n{day_horizon}",
         ]
         tail = self.policy.tail(4000)
         if tail:

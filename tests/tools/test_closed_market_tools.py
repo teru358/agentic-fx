@@ -19,7 +19,8 @@ def test_get_ohlcv_returns_structured_shortage_below_100_closed_bars():
                 if t.name == "get_ohlcv")
     assert tool.func("USDJPY", "1h") == {"insufficient_closed_bars": {
         "consumer": "get_ohlcv", "source": settings.datafeed.primary,
-        "interval": "1h", "required": 100, "available": 99,
+        "interval": "1h", "role": "decision",
+        "required": 100, "available": 99,
         "capability": "temporary"}}
 
 

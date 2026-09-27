@@ -16,7 +16,9 @@ def test_improve_tool_budget_rejects_threshold_above_run_limit(values):
         ImproveToolBudgetSettings(**values)
 from pydantic import ValidationError
 
-from agentic_fx.config import BacktestSettings, ConfigError, Settings, load_settings
+from agentic_fx.config import (
+    BacktestSettings, ConfigError, DatafeedSettings, Settings, load_settings,
+)
 from agentic_fx.core.accounting import drawdown_pct
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
@@ -449,6 +451,91 @@ def test_decision_timeframe_contract(decision_timeframes, expected, error):
         assert settings.datafeed.decision_timeframe_width.total_seconds() == {
             "1h": 3600, "15m": 900,
         }[expected]
+
+
+def test_context_timeframes_accept_valid_values_in_all_validation_paths():
+    settings = _settings_with(context_timeframes=["4h"])
+    assert settings.datafeed.context_timeframes == ["4h"]
+
+    direct = DatafeedSettings.model_validate(settings.datafeed.model_dump())
+    assert direct.context_timeframes == ["4h"]
+
+    worker_copy = Settings.model_validate(settings.model_dump())
+    assert worker_copy.datafeed.context_timeframes == ["4h"]
+
+
+@pytest.mark.parametrize(
+    ("context_timeframes", "reason"),
+    [
+        (["4h", "4h"], "context_timeframes must not contain duplicates"),
+        (["1h"], "context_timeframes must not include the decision timeframe"),
+        (["1d"], "context_timeframes must be a subset of intervals"),
+    ],
+)
+def test_context_timeframes_rejected_consistently_in_all_validation_paths(
+        tmp_path, context_timeframes, reason):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    datafeed = _settings_with(context_timeframes=[]).datafeed.model_dump()
+    datafeed["context_timeframes"] = context_timeframes
+    with pytest.raises(ValidationError, match=reason):
+        DatafeedSettings.model_validate(datafeed)
+
+    # Settings は YAML から得た正規化前の生 dict を通す。
+    settings_raw = deepcopy(raw)
+    settings_raw["datafeed"]["context_timeframes"] = context_timeframes
+    with pytest.raises(ValidationError, match=reason):
+        Settings.model_validate(settings_raw)
+
+    # YAML 読込も同じく正規化前の生 dict をファイルへ書く。
+    yaml_path = tmp_path / "settings.yaml"
+    yaml_path.write_text(yaml.safe_dump(settings_raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=reason):
+        load_settings(yaml_path)
+
+    # worker 経路だけは検証済み Settings の dump を再検証する。
+    valid = _settings_with(context_timeframes=[])
+    worker_copy = valid.model_dump()
+    worker_copy["datafeed"]["context_timeframes"] = context_timeframes
+    with pytest.raises(ValidationError, match=reason):
+        Settings.model_validate(worker_copy)
+
+
+def test_context_daily_call_budget_defaults_and_validates():
+    settings = _settings_with()
+    assert settings.datafeed.context_daily_call_budget == 1000
+    assert _settings_with(context_daily_call_budget=1).datafeed.context_daily_call_budget == 1
+    assert _settings_with(context_daily_call_budget=None).datafeed.context_daily_call_budget is None
+    with pytest.raises(ValidationError, match="greater than or equal to 1"):
+        _settings_with(context_daily_call_budget=0)
+
+
+def test_context_daily_call_budget_yaml_null_is_accepted_without_warning(
+        tmp_path, caplog):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["context_daily_call_budget"] = None
+    raw["datafeed"].pop("primary_intervals")
+    raw["schedule"].pop("trade_interval_min")
+    raw["plugin"].pop("producer_source")
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    caplog.clear()
+    assert load_settings(path).datafeed.context_daily_call_budget is None
+    assert not caplog.records
+
+
+def test_context_daily_call_budget_yaml_zero_is_rejected(tmp_path):
+    import yaml
+
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["context_daily_call_budget"] = 0
+    path = tmp_path / "settings.yaml"
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match="greater than or equal to 1"):
+        load_settings(path)
 
 
 @pytest.mark.parametrize("decision", ["4h", "1d"])
@@ -949,3 +1036,24 @@ def test_dispatch_ceiling_sec_must_be_positive(value):
         Settings.model_validate(raw)
     raw["worker"]["dispatch_ceiling_sec"] = 1800.0
     assert Settings.model_validate(raw).worker.dispatch_ceiling_sec == 1800.0
+
+
+@pytest.mark.parametrize(
+    ("context_timeframes", "reason"),
+    [
+        (["4h", "1h"], "context_timeframes must not include the decision timeframe"),
+        (["4h", "1d"], "context_timeframes must be a subset of intervals"),
+    ],
+)
+def test_context_timeframes_checks_every_element(context_timeframes, reason):
+    with pytest.raises(ValidationError, match=reason):
+        _settings_with(context_timeframes=context_timeframes)
+
+
+def test_context_timeframes_compared_with_decision_timeframe_when_constructed_directly():
+    datafeed = _settings_with().datafeed.model_dump()
+    datafeed.update(intervals=["1m", "15m", "1h"], decision_timeframes=["15m"],
+                    primary_intervals=["1h"], context_timeframes=["15m"])
+    with pytest.raises(ValidationError,
+                       match="context_timeframes must not include the decision timeframe"):
+        DatafeedSettings.model_validate(datafeed)

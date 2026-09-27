@@ -44,6 +44,7 @@ def build_mission_registry(
         ledger: "ImproveRpcLedger | None" = None,
         rpc_handlers: "dict[str, Callable[[dict], dict]] | None" = None,
         counters: MissionToolCounters | None = None,
+        on_tool_result: "Callable[[str, bool, str | None], None] | None" = None,
         inventory_view: dict | None = None,
         ) -> ToolRegistry:
     """`loop == "improve"` は 7-E (プラン10 Task 7) で分岐するようになった
@@ -85,10 +86,11 @@ def build_mission_registry(
         # にする — 誤配線 (例: 子プロセスから trade 用引数のまま呼んだ) を
         # 検出可能にする。
         if provider is not None or readonly or indicator_plugins is not None \
-                or sandbox_run is not None:
+                or sandbox_run is not None or on_tool_result is not None:
             raise ValueError(
                 "loop='improve' は provider/readonly/indicator_plugins/"
-                "sandbox_run を受け付けません (trade 専用の注入 seam)")
+                "sandbox_run/on_tool_result を受け付けません "
+                "(trade 専用の注入 seam)")
         if staging_dir is None or source_snapshot_dir is None or ledger is None \
                 or rpc_handlers is None:
             raise ValueError(
@@ -129,7 +131,7 @@ def build_mission_registry(
                         timeout_sec=settings.worker.data_hook_timeout_sec)
     broker = PaperBroker(conn, settings, clock)
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(on_result=on_tool_result)
     registry.register_all(market_tools.build(
         provider, econ, settings, indicator_plugins=indicator_plugins,
         sandbox_run=sandbox_run))

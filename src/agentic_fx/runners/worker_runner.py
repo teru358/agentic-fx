@@ -596,6 +596,14 @@ class WorkerRunner(AgentRunner):
                 # 無し) は既定 None — `MissionResult.tool_calls`/
                 # `.stderr_fatal` の既定と一致させる後方互換。
                 tool_calls = payload.get("tool_calls")
+                market_tool_calls = payload.get("market_tool_calls")
+                if (not isinstance(market_tool_calls, dict)
+                        or any(not isinstance(value, int)
+                               or isinstance(value, bool)
+                               for value in market_tool_calls.values())):
+                    if market_tool_calls is not None:
+                        _log.warning("invalid market_tool_calls in result frame")
+                    market_tool_calls = None
                 stderr_fatal = payload.get("stderr_fatal")
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
@@ -606,9 +614,11 @@ class WorkerRunner(AgentRunner):
                 reason = f"worker {kind}"
                 recovered = False
                 tool_calls = None
+                market_tool_calls = None
                 stderr_fatal = None
             return MissionResult(status, output, transcript, reason=reason,
                                  recovered=recovered, tool_calls=tool_calls,
+                                 market_tool_calls=market_tool_calls,
                                  stderr_fatal=stderr_fatal)
         finally:
             dispatch_queue.put(None)

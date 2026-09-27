@@ -658,6 +658,31 @@ def test_healthcheck_covers_all_primary_intervals(tmp_path):
             p.healthcheck("USDJPY")
 
 
+def test_healthcheck_ignores_unavailable_context_timeframe(tmp_path):
+    s = load_settings(EXAMPLE).model_copy(deep=True)
+    s.datafeed.decision_timeframes = ["15m"]
+    s.datafeed.primary_intervals = ["15m"]
+    s.datafeed.context_timeframes = ["1h"]
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    p = PriceProvider(conn, s, FixedClock(NOW))
+    q = Quote("USDJPY", 148.5, 148.5, NOW, "yfinance")
+    requested = []
+
+    def _bars(pair, interval, days):
+        requested.append(interval)
+        if interval == "1h":
+            raise OSError("context unavailable")
+        return _fresh_bars(interval=interval, n=50)
+
+    with patch("agentic_fx.datafeed.price_provider.sources.yf_quote",
+               return_value=q), \
+         patch("agentic_fx.datafeed.price_provider.sources.yf_bars",
+               side_effect=_bars):
+        assert p.healthcheck("USDJPY") == "yfinance"
+    assert requested == ["15m"]
+
+
 # ---- to_account_rate -------------------------------------------------------
 #
 # 改訂第 16 版 (口座通貨と換算) 準拠。旧 quote_to_account_rate からの変更点:

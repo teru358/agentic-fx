@@ -43,6 +43,13 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
     sandbox_run = sandbox_run if sandbox_run is not None else plugin_sandbox.run_plugin
     planner = RequirementPlanner()
 
+    def _timeframe_role(timeframe: str) -> str:
+        if timeframe == settings.datafeed.decision_timeframe:
+            return "decision"
+        if timeframe in settings.datafeed.context_timeframes:
+            return "context"
+        return "other"
+
     # 足の導出 (ネイティブ / resample) は provider の責務。ここでは
     # 要求された足をそのまま渡す — ツール層で resample すると、MT5 の
     # ネイティブ 4h が使える環境でも 1h から作り直してしまう
@@ -56,6 +63,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
             return bars_to_df([]), {"consumer": consumer,
                                     "source": settings.datafeed.primary,
                                     "interval": timeframe,
+                                    "role": _timeframe_role(timeframe),
                                     "required": required, "available": 0,
                                     "capability": plan.insufficient.classification}
         df = bars_to_df(provider.get_bars(pair, timeframe,
@@ -63,7 +71,9 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         if len(df) < required:
             return df, {"consumer": consumer,
                         "source": settings.datafeed.primary,
-                        "interval": timeframe, "required": required,
+                        "interval": timeframe,
+                        "role": _timeframe_role(timeframe),
+                        "required": required,
                         "available": len(df), "capability": "temporary"}
         return df, None
 
@@ -75,6 +85,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
             return {"insufficient_closed_bars": shortage}
         df = df.tail(100)
         return [{"ts": ts.isoformat(), "interval": timeframe,
+                 "role": _timeframe_role(timeframe),
                  "open": r["open"], "high": r["high"],
                  "low": r["low"], "close": r["close"]}
                 for ts, r in df.iterrows()]
@@ -106,6 +117,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                        consumer="get_indicators")
         result = compute_indicators(df)
         result["interval"] = timeframe
+        result["role"] = _timeframe_role(timeframe)
         # Do not claim a built-in value whose seed window is unavailable.
         missing = [name for name, need in (("sma_20", 20), ("sma_50", 50),
                                             ("ema_12", 12), ("ema_26", 26),
@@ -115,7 +127,8 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         if missing:
             result["insufficient_closed_bars"] = {
                 "consumer": "get_indicators", "source": settings.datafeed.primary,
-                "interval": timeframe, "required": 50, "available": len(df),
+                "interval": timeframe, "role": _timeframe_role(timeframe),
+                "required": 50, "available": len(df),
                 "indicators": missing}
         for meta in indicator_plugins:
             if meta.max_bars > settings.plugin.max_bars_limit:

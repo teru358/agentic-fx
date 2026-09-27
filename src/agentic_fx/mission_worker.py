@@ -760,6 +760,7 @@ def main() -> None:
     # 移動した — 外側 `except` からも採番できる必要があるため。
     out_seq = SeqTracker()
     ready_sent = False
+    market_tool_calls: dict[str, int] | None = None
     try:
         # レビュー 1 周目 (codex I-1): handshake の読み取りを `try` の**内側**
         # へ移した。旧実装は `try` の外で `read_frame` を呼んでいたため、
@@ -938,6 +939,13 @@ def main() -> None:
                        if handshake.get("plugins_dir") else None)
         approved = _build_trade_indicator_metas(conn, plugins_dir, settings)
 
+        market_tool_calls = {"get_ohlcv": 0, "get_indicators": 0}
+
+        def count_market_tool_result(
+                name: str, _ok: bool, _error: str | None) -> None:
+            if name in market_tool_calls:
+                market_tool_calls[name] += 1
+
         # CR-3 対応: `main()` 冒頭で構築した out_seq を、_RagRpcProxy と
         # on_message (event フレーム送出) の両方に**同一インスタンス**で
         # 共有させる。
@@ -947,7 +955,8 @@ def main() -> None:
                 lambda frame: _write_frame_or_die(protocol_out, frame),
                 lambda: read_frame(sys.stdin.buffer),
                 out_seq, in_seq),
-            activity=activity, indicator_plugins=approved, readonly=True)
+            activity=activity, indicator_plugins=approved, readonly=True,
+            on_tool_result=count_market_tool_result)
 
         from agentic_fx.runners.base import Mission
 
@@ -983,11 +992,13 @@ def main() -> None:
                 _send_frame(protocol_out, out_seq, {
                     "type": "result",
                     "status": result.status, "output": result.output,
-                    "reason": result.reason})
+                    "reason": result.reason,
+                    "market_tool_calls": dict(market_tool_calls)})
             except Exception as exc:  # noqa: BLE001 — 必ず result を送る
                 _send_frame(protocol_out, out_seq, {
                     "type": "result", "status": "failed", "output": None,
-                    "error": f"{type(exc).__name__}: {exc}"})
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "market_tool_calls": dict(market_tool_calls)})
         finally:
             dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
             if dispatcher is not None:
@@ -1001,9 +1012,12 @@ def main() -> None:
             # `SeqTracker` から見て seq=1 の**重複**になっていた。
             # 送出済みなら `result: failed` として報告する。
             if ready_sent:
-                _send_frame(protocol_out, out_seq, {
+                frame = {
                     "type": "result", "status": "failed", "output": None,
-                    "error": f"{type(exc).__name__}: {exc}"})
+                    "error": f"{type(exc).__name__}: {exc}"}
+                if market_tool_calls is not None:
+                    frame["market_tool_calls"] = dict(market_tool_calls)
+                _send_frame(protocol_out, out_seq, frame)
             else:
                 _send_frame(protocol_out, out_seq, {
                     "type": "ready", "ok": False,

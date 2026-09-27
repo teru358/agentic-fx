@@ -490,10 +490,36 @@ class _FakeLocalRunner:
         return MissionResult(status="completed", output={"action": "no_trade"})
 
 
+class _FakeMarketCallingRunner(_FakeLocalRunner):
+    def run(self, mission):
+        registry = self.kwargs["registry"]
+        allowed = ["get_ohlcv", "get_indicators"]
+        registry.execute("get_ohlcv", {"pair": "USDJPY"}, allowed)
+        registry.execute("get_ohlcv", {"pair": "USDJPY"}, allowed)
+        registry.execute("get_indicators", {"pair": "USDJPY"}, allowed)
+        registry.execute("get_indicators", {}, allowed)
+        return super().run(mission)
+
+
+class _FakeMixedToolRunner(_FakeLocalRunner):
+    def run(self, mission):
+        registry = self.kwargs["registry"]
+        allowed = ["get_ohlcv", "get_account"]
+        registry.execute("get_ohlcv", {"pair": "USDJPY"}, allowed)
+        registry.execute("get_account", {"pair": "USDJPY"}, allowed)
+        return super().run(mission)
+
+
+class _FakeMarketCallingRunnerRaises(_FakeMarketCallingRunner):
+    def run(self, mission):
+        super().run(mission)
+        raise RuntimeError("runner exploded after tools")
+
+
 def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
                 settings_mutator=None, runner_raises=False,
                 raw_stdin=None, out_stream=None, resource_limits_raise=False,
-                runner_cls=None, send_go=True):
+                runner_cls=None, send_go=True, market_registry=False):
     """`main()` をインプロセスで駆動し、送出フレーム列と観測点を返す。
 
     `raw_stdin`: handshake の JSON 化を飛ばして生バイト列を stdin に流す
@@ -578,8 +604,23 @@ def _drive_main(monkeypatch, tmp_path, *, handshake_overrides=None,
 
     def fake_build_mission_registry(*args, **kwargs):
         registry_calls.append((args, kwargs))
-        from agentic_fx.tools.registry import ToolRegistry
-        return ToolRegistry()
+        from agentic_fx.tools.registry import ToolDef, ToolRegistry
+        if not market_registry:
+            return ToolRegistry()
+        registry = ToolRegistry(on_result=kwargs.get("on_tool_result"))
+        parameters = {
+            "type": "object",
+            "properties": {"pair": {"type": "string"}},
+            "required": ["pair"],
+            "additionalProperties": False,
+        }
+        registry.register(ToolDef("get_ohlcv", "test", parameters,
+                                  lambda pair: {"pair": pair}))
+        registry.register(ToolDef("get_indicators", "test", parameters,
+                                  lambda pair: {"pair": pair}))
+        registry.register(ToolDef("get_account", "test", parameters,
+                                  lambda pair: {"pair": pair}))
+        return registry
 
     monkeypatch.setattr("agentic_fx.tools.mission_registry.build_mission_registry",
                         fake_build_mission_registry)
@@ -1569,6 +1610,37 @@ def test_result_frame_carries_null_reason_when_runner_leaves_it_unset(
     assert result_frame["status"] == "completed"
     assert "reason" in result_frame
     assert result_frame["reason"] is None
+
+
+def test_trade_result_frame_counts_market_tool_starts(monkeypatch, tmp_path):
+    frames, _, registry_calls = _drive_main(
+        monkeypatch, tmp_path, runner_cls=_FakeMarketCallingRunner,
+        market_registry=True)
+    assert callable(registry_calls[0][1]["on_tool_result"])
+    assert frames[-1]["market_tool_calls"] == {
+        "get_ohlcv": 2, "get_indicators": 2,
+    }
+
+
+def test_trade_result_frame_counts_only_market_tools(monkeypatch, tmp_path, caplog):
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, runner_cls=_FakeMixedToolRunner,
+        market_registry=True)
+    assert frames[-1]["market_tool_calls"] == {
+        "get_ohlcv": 1, "get_indicators": 0,
+    }
+    assert "on_result hook raised" not in caplog.text
+
+
+def test_trade_exception_result_frame_keeps_market_tool_counts(
+        monkeypatch, tmp_path):
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path, runner_cls=_FakeMarketCallingRunnerRaises,
+        market_registry=True)
+    assert frames[-1]["status"] == "failed"
+    assert frames[-1]["market_tool_calls"] == {
+        "get_ohlcv": 2, "get_indicators": 2,
+    }
 
 
 def test_result_frame_carries_null_reason_for_improve_profile(

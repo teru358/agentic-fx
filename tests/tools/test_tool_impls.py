@@ -1,7 +1,10 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
+
+import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar, FixedClock, OrderStatus
@@ -34,9 +37,13 @@ def test_market_tools():
     reg.register_all(market_tools.build(provider, econ, SETTINGS))
     ohlcv = reg.func("get_ohlcv")(pair="USDJPY", timeframe="1h")
     assert len(ohlcv) == 100  # 直近 100 本に制限
-    assert set(ohlcv[0]) == {"ts", "interval", "open", "high", "low", "close"}
+    assert set(ohlcv[0]) == {
+        "ts", "interval", "role", "open", "high", "low", "close",
+    }
+    assert ohlcv[0]["role"] == "decision"
     ind = reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
     assert "rsi_14" in ind
+    assert ind["role"] == "decision"
     assert reg.func("get_econ_calendar")(days=1) == [{"name": "CPI"}]
     # F3: Verify days*24 multiplication (catches mutation days → days*24)
     econ.upcoming.assert_called_with(hours=24)
@@ -83,11 +90,65 @@ def test_get_ohlcv_passes_planned_lookback_days_to_provider():
 
 def test_timeframe_enum_comes_from_settings():
     """timeframe の enum は設定の datafeed.intervals から作られる。"""
+    settings = SETTINGS.model_copy(deep=True)
+    settings.datafeed.context_timeframes = ["4h"]
     reg = ToolRegistry()
-    reg.register_all(market_tools.build(MagicMock(), MagicMock(), SETTINGS))
+    reg.register_all(market_tools.build(MagicMock(), MagicMock(), settings))
     spec = next(s for s in reg.openai_tools(allowed=["get_ohlcv"]))
     enum = spec["function"]["parameters"]["properties"]["timeframe"]["enum"]
-    assert enum == list(SETTINGS.datafeed.intervals)
+    assert enum == list(settings.datafeed.intervals)
+    assert set(settings.datafeed.context_timeframes) <= set(enum)
+
+
+def test_market_tool_roles_cover_decision_context_and_other():
+    settings = SETTINGS.model_copy(deep=True)
+    settings.datafeed.context_timeframes = ["4h"]
+    provider = MagicMock()
+    provider.get_bars.side_effect = lambda _pair, interval, **_kw: _bars(
+        n=120, interval=interval)
+    tools = {tool.name: tool for tool in market_tools.build(
+        provider, MagicMock(), settings)}
+
+    for timeframe, expected in (("1h", "decision"), ("4h", "context"),
+                                ("15m", "other")):
+        assert tools["get_ohlcv"].func("USDJPY", timeframe)[0]["role"] == expected
+        indicators = tools["get_indicators"].func("USDJPY", timeframe)
+        assert indicators["interval"] == timeframe
+        assert indicators["role"] == expected
+
+
+@pytest.mark.parametrize("timeframe, expected_role", [
+    ("1h", "decision"),
+    ("4h", "context"),
+    ("15m", "other"),
+])
+def test_market_tool_shortages_always_include_interval_and_role(
+        monkeypatch, timeframe, expected_role):
+    settings = SETTINGS.model_copy(deep=True)
+    settings.datafeed.context_timeframes = ["4h"]
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=2, interval=timeframe)
+    tools = {tool.name: tool for tool in market_tools.build(
+        provider, MagicMock(), settings)}
+
+    ohlcv_shortage = tools["get_ohlcv"].func("USDJPY", timeframe)
+    assert ohlcv_shortage["insufficient_closed_bars"]["interval"] == timeframe
+    assert ohlcv_shortage["insufficient_closed_bars"]["role"] == expected_role
+
+    indicator_shortage = tools["get_indicators"].func("USDJPY", timeframe)
+    shortage = indicator_shortage["insufficient_closed_bars"]
+    assert shortage["interval"] == timeframe
+    assert shortage["role"] == expected_role
+
+    unavailable = SimpleNamespace(
+        ok=False, insufficient=SimpleNamespace(classification="unavailable"))
+    monkeypatch.setattr(
+        "agentic_fx.tools.market_tools.RequirementPlanner.plan",
+        lambda *_args, **_kwargs: unavailable)
+    planner_shortage = tools["get_ohlcv"].func("USDJPY", timeframe)
+    shortage = planner_shortage["insufficient_closed_bars"]
+    assert shortage["interval"] == timeframe
+    assert shortage["role"] == expected_role
 
 
 def test_no_tool_exposes_an_arbitrary_history_window():

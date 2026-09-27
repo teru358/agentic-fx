@@ -20,6 +20,7 @@ from agentic_fx.core.timeutil import as_utc as _as_utc
 _NY = ZoneInfo("America/New_York")
 _ROLLOVER_UTC = time(21, 0)
 _HOLIDAYS_MONTH_DAY = frozenset({(12, 25), (1, 1)})
+DAY_CLOSE_BUFFER = timedelta(minutes=5)
 
 
 def is_market_open(now: datetime) -> bool:
