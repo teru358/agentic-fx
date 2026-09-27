@@ -1542,7 +1542,8 @@ def _tiny_worker_settings(**over):
 
 
 def _spawn_runner(monkeypatch, tmp_path, fake_proc, settings, *, rag=None,
-                  on_rpc_leak=None, close_on_kill=None, stop_event=None):
+                  on_rpc_leak=None, close_on_kill=None, stop_event=None,
+                  rpc_handlers=None, rpc_timeout_sec_by_kind=None):
     """`subprocess.Popen` と `os.killpg` を差し替えて WorkerRunner を作り、
     `killpg` の呼び出し (pid, signal, 時刻) を記録するリストを返す。"""
     import agentic_fx.runners.worker_runner as wr_mod
@@ -1592,7 +1593,9 @@ def _spawn_runner(monkeypatch, tmp_path, fake_proc, settings, *, rag=None,
                           clock=FixedClock(datetime(2026, 8, 4,
                                                     tzinfo=timezone.utc)),
                           rag=rag if rag is not None else _rag(tmp_path),
-                          on_rpc_leak=on_rpc_leak, stop_event=stop_event)
+                          on_rpc_leak=on_rpc_leak, stop_event=stop_event,
+                          rpc_handlers=rpc_handlers,
+                          rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind)
     return runner, kill_calls, popen_kwargs
 
 
@@ -1636,7 +1639,7 @@ def _silent_child_proc(tmp_path):
     return FakeProc(), w, th
 
 
-def _rpc_hang_child_proc(tmp_path):
+def _rpc_hang_child_proc(tmp_path, *, name="search_news"):
     """`ready` 応答の直後に `tool_rpc` を投げたきり、以後は一切応答しない
     子 (measurements.md #1 シナリオ C 相当)。`poll()` は常に `None` =
     SIGTERM を無視し続ける子を模す。参照は `kept` で保持し、GC による
@@ -1654,7 +1657,7 @@ def _rpc_hang_child_proc(tmp_path):
         child_in.readline()  # handshake を読み捨てる
         write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
         write_frame(child_out, {"type": "tool_rpc", "seq": 2, "rpc_id": "1",
-                                "name": "search_news",
+                                "name": name,
                                 "args": {"query": "q", "n": 5}})
         # 以後、tool_rpc_result も result も送らず放置する。
 
@@ -1674,6 +1677,42 @@ def _rpc_hang_child_proc(tmp_path):
             return -9
 
     return FakeProc(), w, th
+
+
+@pytest.mark.parametrize(("kind_timeout", "expected_timeout"), [
+    (7.0, 12.0),
+    (0.1, 5.2),
+])
+def test_dispatcher_join_budget_uses_largest_rpc_timeout(
+        tmp_path, monkeypatch, kind_timeout, expected_timeout):
+    proc, w, _th = _rpc_hang_child_proc(tmp_path, name="some_kind")
+    rpc_started = threading.Event()
+    join_timeouts: list[float] = []
+
+    def hang(_args):
+        rpc_started.set()
+        threading.Event().wait()
+
+    settings = _tiny_worker_settings(rpc_timeout_sec=0.2)
+    runner, _kill_calls, _ = _spawn_runner(
+        monkeypatch, tmp_path, proc, settings, close_on_kill=w,
+        rpc_handlers={"some_kind": hang},
+        rpc_timeout_sec_by_kind={"some_kind": kind_timeout})
+    real_join = threading.Thread.join
+
+    def capture_dispatcher_join(self, timeout=None):
+        if self.name == "afx-worker-dispatcher":
+            join_timeouts.append(timeout)
+            return None
+        return real_join(self, timeout)
+
+    monkeypatch.setattr(threading.Thread, "join", capture_dispatcher_join)
+    result = runner.run(Mission(prompt="p", tools=[], output_schema={},
+                                max_turns=1, timeout_sec=0.1))
+
+    assert rpc_started.is_set()
+    assert result.status in ("timeout", "failed")
+    assert join_timeouts == [pytest.approx(expected_timeout)]
 
 
 @pytest.mark.slow

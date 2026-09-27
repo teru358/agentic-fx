@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_closed_frame
 from agentic_fx.activity import Category
+from agentic_fx.core import market_hours
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.store import signals
@@ -88,6 +89,7 @@ class SignalProducer:
         # The set is deliberately in-memory like the cursor: an outage should
         # yield one diagnostic per unchanged shortage, then recover silently.
         self._insufficient_closed: set[tuple[str, str, str, str]] = set()
+        self._paused = False
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
@@ -128,6 +130,19 @@ class SignalProducer:
         (3) `(name, hash)` を session cache キーに含めると、同一コードの
         strategy を改名しただけで無駄に subprocess が増える退行を生む。
         """
+        if not market_hours.is_market_open(now):
+            if not self._paused:
+                next_open = market_hours.next_expected_trading_time(
+                    now, timedelta(minutes=1))
+                _log.info(
+                    "market closed — signal evaluation paused until %s",
+                    next_open.isoformat())
+                self._paused = True
+            return 0
+        if self._paused:
+            _log.info("market open — signal evaluation resumed")
+            self._paused = False
+
         inserted = 0
         sessions: dict[str, plugin_sandbox.PluginSession] = {}
 

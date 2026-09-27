@@ -91,6 +91,46 @@ def _resolved_by_identity(meta: PluginMeta) -> dict:
             ResolvedIndicatorSet.empty(Path("/nonexistent"))}
 
 
+def test_market_closure_pauses_once_and_resumes_evaluation(tmp_path, monkeypatch,
+                                                            caplog):
+    conn = _conn(tmp_path)
+    meta = _meta()
+    producer = SignalProducer()
+    evaluated: list[datetime] = []
+
+    def record_evaluation(*args, now, **kwargs):
+        evaluated.append(now)
+        return 0
+
+    monkeypatch.setattr(producer, "_evaluate_one", record_evaluation)
+    closed = datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc)
+    reopened = datetime(2026, 9, 27, 21, 0, 30, tzinfo=timezone.utc)
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.signal_producer")
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=closed, source=SOURCE,
+        sandbox_run=_FakeSandbox(), settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+    assert evaluated == []
+    assert [record.getMessage() for record in caplog.records] == [
+        "market closed — signal evaluation paused until 2026-09-27T21:00:00+00:00"]
+
+    caplog.clear()
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=closed + timedelta(minutes=1), source=SOURCE,
+        sandbox_run=_FakeSandbox(), settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+    assert caplog.records == []
+
+    producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=reopened, source=SOURCE,
+        sandbox_run=_FakeSandbox(), settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+    assert evaluated == [reopened]
+    assert [record.getMessage() for record in caplog.records] == [
+        "market open — signal evaluation resumed"]
+
+
 class _FakeSandbox:
     """`SandboxRunFn` 契約 (meta, payload, *, settings) -> dict の fake。
 
