@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,8 +19,7 @@ UTC = timezone.utc
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
 
 
-def test_signal_maintenance_reads_mt5_live_cache_for_mt5_primary(tmp_path, caplog,
-                                                                   monkeypatch):
+def test_signal_maintenance_reads_mt5_live_cache_for_mt5_primary(tmp_path, caplog):
     conn = connect(tmp_path / "agentic.db")
     init_db(conn)
     base_settings = load_settings(EXAMPLE)
@@ -45,13 +45,13 @@ def test_signal_maintenance_reads_mt5_live_cache_for_mt5_primary(tmp_path, caplo
                 "entry_type": None, "limit_price": None, "stop_loss": None,
                 "take_profit": None}
 
-    producer = SignalProducer()
-    evaluate_due_plugins = producer.evaluate_due_plugins
+    real_producer = SignalProducer()
 
     def evaluate_with_record(*args, **kwargs):
-        return evaluate_due_plugins(*args, sandbox_run=record, **kwargs)
+        # 本物の producer / reader をそのまま通し、sandbox 境界だけを記録用に差し替える
+        return real_producer.evaluate_due_plugins(*args, sandbox_run=record, **kwargs)
 
-    monkeypatch.setattr(producer, "evaluate_due_plugins", evaluate_with_record)
+    producer = SimpleNamespace(evaluate_due_plugins=evaluate_with_record)
     caplog.set_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer")
     _run_signal_maintenance(
         conn=conn, signal_producer=producer, approved=[meta],
