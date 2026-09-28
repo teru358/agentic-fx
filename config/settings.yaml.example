@@ -49,7 +49,7 @@ llama_swap:
   max_turns: 16
 
 datafeed:
-  # primary: yfinance   # 省略時は enabled が 1 個ならそれ
+  # primary: yfinance   # 省略時は enabled が 1 個ならそれ。複数 source を enabled にするなら必須
   # fallbacks: []   # primary が不通のときだけ順に試す源。既定は無し (無言の切替をしない)
   yfinance:   {enabled: true}
   mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
@@ -61,7 +61,6 @@ datafeed:
   decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する
   context_timeframes: []             # 参考足。発注判断の足ではない。判断足を含めない (表示のみ、強制ではない)。tool 呼出しごとに primary へ要求が出得る
   context_daily_call_budget: 1000    # market tool (get_ohlcv/get_indicators) の起動回数の 1 日 (UTC) あたり警告閾値 (観測ベース、代表的なフル稼働日の実測後に再調整)。超えると activity に WARNING を 1 回書くだけで拒否はしない。プロセス再起動で当日カウンタは 0 に戻る。null で警告無効
-  primary_intervals: [1h]            # 判断 Mission が依存する足 (healthcheck の対象)。増やすほど単一障害点も増える
   watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
   cache_retention_days: 30    # ohlcv_cache の保持期間 (日)。intervals の構成が要求する最小日数を下回ると起動拒否 (プラン9 Task16)
   # retention: {yfinance: {1m: "2d", 1h: "30d"}}  # source ごとの保持。cache_retention_days とは併用不可
@@ -70,7 +69,6 @@ news:
   cleanup_hours: 48
 
 schedule:
-  trade_interval_min: 60
   improve: weekly             # weekly | daily
   improve_at: "Sat 03:00"     # weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ)
 
@@ -138,7 +136,6 @@ plugin:                        # plugin サンドボックス (プラン 7 Task 
   sandbox_nofile: 128           # RLIMIT_NOFILE: worker が同時に開けるファイル記述子数の上限
   sandbox_fsize_mb: 8           # RLIMIT_FSIZE (MiB): 1 ファイルあたりの書き込みサイズ上限。pytest サブプロセスにも流用
   max_bars_limit: 1000          # plugin config.yaml の max_bars 上限。discover では照合しない — 承認 (submit/bless) と get_indicators (indicator 合成) で照合し、超過は拒否する
-  producer_source: yfinance     # 本番 producer が signal/strategy plugin を評価する際の data source (プラン 7 Task 6)
   signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)
   signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)。mission の worker 上限 Cw + 60 秒より長くないと起動拒否 (既定 Cw 405 秒 → 8 分以上)
   signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか

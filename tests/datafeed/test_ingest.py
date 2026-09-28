@@ -189,6 +189,28 @@ def test_next_probe_is_the_next_bar_close_not_fetch_time_plus_interval(tmp_path)
     conn.close()
 
 
+def test_next_probe_skips_weekend_to_next_bar_confirmation(tmp_path):
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    settings = _settings()
+    settings.datafeed.intervals = ["1m", "15m"]
+    settings.datafeed.primary_intervals = ["15m"]
+    settings.datafeed.closed_bar_grace_sec = 30
+    friday = datetime(2026, 9, 25, 20, 45, tzinfo=timezone.utc)
+    calls = []
+
+    def fetch(pair, interval, start, end, *, timeout):
+        calls.append((pair, interval))
+        return [Bar(pair, interval, friday if interval == "15m" else friday + timedelta(minutes=14), 1, 1, 1, 1, 1)]
+
+    ingest = Ingest(settings, fetch=fetch)
+    ingest.prepare(datetime(2026, 9, 27, 21, 0, 4, tzinfo=timezone.utc), conn)
+    assert ingest.next_probe_at[("USDJPY", "15m")] == datetime(2026, 9, 27, 21, 15, 30, tzinfo=timezone.utc)
+    assert ingest._backoff[("USDJPY", "15m")] == 0
+    assert calls.count(("USDJPY", "15m")) == 1
+    conn.close()
+
+
 def test_report_marks_budget_deferred_decision_key_as_not_attempted(tmp_path):
     """budget 切れで持ち越した判断足 key は report.deferred に載り、
     report.attempted には含まれない (まだ試みていないため)。"""

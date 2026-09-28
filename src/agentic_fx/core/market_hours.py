@@ -96,6 +96,15 @@ def next_expected_trading_time(after: datetime, width: timedelta) -> datetime:
     return candidate
 
 
+def next_bar_confirmation(bar_start: datetime, width: timedelta,
+                          grace: timedelta) -> datetime:
+    """この足の次に取引される足が確定する時刻を返す。
+
+    閉場をまたぐ場合は、開場後の最初の足の確定時刻になる。
+    """
+    return next_expected_trading_time(bar_start, width) + width + grace
+
+
 def is_friday_after(now: datetime, cutoff_hhmm: str) -> bool:
     """NY金曜の設定cutoff以降か。
 

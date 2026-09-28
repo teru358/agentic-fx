@@ -4,7 +4,7 @@ import pytest
 
 from agentic_fx.core import market_hours
 from agentic_fx.core.market_hours import (
-    is_friday_after, is_market_open, next_expected_trading_time,
+    is_friday_after, is_market_open, next_bar_confirmation, next_expected_trading_time,
     next_rollover, trading_day_start,
 )
 
@@ -188,6 +188,17 @@ def test_next_expected_trading_time_holiday_merged_with_weekend_extends_through_
     # 2026 年は 12/25 が金曜 — 祝日と週末が連続し、日曜 21:00 まで一体で閉場する
     after = _dt(2026, 12, 24, 20, 59)
     assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 12, 27, 21, 0)
+
+
+def test_next_bar_confirmation_skips_closed_hours_and_matches_continuous_session():
+    grace = timedelta(seconds=30)
+    assert next_bar_confirmation(_dt(2026, 9, 25, 20, 45), timedelta(minutes=15), grace) == _dt(2026, 9, 27, 21, 15, 30)
+    assert next_bar_confirmation(_dt(2026, 9, 25, 20, 59), timedelta(minutes=1), grace) == _dt(2026, 9, 27, 21, 1, 30)
+    weekday = _dt(2026, 9, 23, 10, 0)
+    assert next_bar_confirmation(weekday, timedelta(minutes=15), grace) == _dt(2026, 9, 23, 10, 30, 30)
+    assert next_bar_confirmation(weekday, timedelta(minutes=15), grace) == weekday + 2 * timedelta(minutes=15) + grace
+    assert next_bar_confirmation(_dt(2025, 12, 31, 20, 45), timedelta(minutes=15), grace) == _dt(2026, 1, 1, 21, 15, 30)
+    assert next_bar_confirmation(_dt(2026, 12, 24, 20, 45), timedelta(minutes=15), grace) == _dt(2026, 12, 27, 21, 15, 30)
 
 
 _U = timezone.utc

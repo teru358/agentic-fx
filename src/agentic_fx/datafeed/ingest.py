@@ -122,14 +122,15 @@ class Ingest:
                 succeeded.add(key)
                 if not bars:
                     empty.add(key)
-                # 次に取りに行くのは「次の足が確定する時刻」= 最新の足の開始 + 足幅 2 つ + 猶予。
+                # 次に取りに行くのは次に取引される足の確定時刻 (閉場は飛ばす)。
                 # 取得時刻 + 足幅にすると、10:22 に 09:00 の 1h 足を取ったあと 11:22 まで
                 # 取りに行かず、10:00 の足が 22 分遅れて判断も遅れる (2026-09-22 実機)。
                 # 期待時刻を過ぎても足が無いときだけ、足幅を上限に指数 backoff で再試行
                 width = timedelta(minutes=sources.INTERVAL_MIN[interval])
                 grace = timedelta(seconds=self.settings.datafeed.closed_bar_grace_sec)
                 newest = max((b.ts for b in bars), default=watermark)
-                expected = None if newest is None else newest + 2 * width + grace
+                expected = None if newest is None else market_hours.next_bar_confirmation(
+                    newest, width, grace)
                 if expected is not None and expected > now:
                     self._backoff[key] = 0
                     self.next_probe_at[key] = expected

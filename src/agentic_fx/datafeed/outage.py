@@ -355,7 +355,7 @@ class OutageStateMachine:
 
     def _is_stalled(self, now: datetime, interval: str,
                     watermark: datetime | None) -> bool:
-        """`expected = watermark + 2×足幅 + grace` を過ぎた最初の tick で
+        """`expected = next_bar_confirmation(watermark, 足幅, grace)` を過ぎた最初の tick で
         停滞と判定する単一の式 (ingest 内部の処理時間予算などを重ねて
         二重に猶予を加算しない)。
         """
@@ -364,7 +364,7 @@ class OutageStateMachine:
             # 対象外にする (ingest 自体の失敗は report.failed 側で拾う)。
             return False
         width = self.interval_widths[interval]
-        expected = watermark + 2 * width + self.grace
+        expected = market_hours.next_bar_confirmation(watermark, width, self.grace)
         return now > expected
 
     # ---- internal: unprocessed positions --------------------------------

@@ -44,6 +44,12 @@ def test_example_file_loads():
     assert s.service.secret_env_allowlist == []
 
 
+def test_example_does_not_emit_deprecated_key_warnings(caplog):
+    load_settings(EXAMPLE)
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any(key in message for key in ("producer_source", "trade_interval_min", "primary_intervals") for message in messages)
+
+
 @pytest.mark.parametrize(
     ("cutoff", "valid"),
     [
@@ -462,8 +468,8 @@ def test_decision_timeframe_contract(decision_timeframes, expected, error):
     import yaml
 
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    raw["datafeed"].pop("primary_intervals")
-    raw["schedule"].pop("trade_interval_min")
+    raw["datafeed"].pop("primary_intervals", None)
+    raw["schedule"].pop("trade_interval_min", None)
     if decision_timeframes is not None:
         raw["datafeed"]["decision_timeframes"] = decision_timeframes
     if error:
@@ -541,9 +547,9 @@ def test_context_daily_call_budget_yaml_null_is_accepted_without_warning(
 
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
     raw["datafeed"]["context_daily_call_budget"] = None
-    raw["datafeed"].pop("primary_intervals")
-    raw["schedule"].pop("trade_interval_min")
-    raw["plugin"].pop("producer_source")
+    raw["datafeed"].pop("primary_intervals", None)
+    raw["schedule"].pop("trade_interval_min", None)
+    raw["plugin"].pop("producer_source", None)
     path = tmp_path / "settings.yaml"
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     caplog.clear()
@@ -567,8 +573,8 @@ def test_derived_only_decision_timeframe_is_rejected(decision):
     import yaml
 
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    raw["datafeed"].pop("primary_intervals")
-    raw["schedule"].pop("trade_interval_min")
+    raw["datafeed"].pop("primary_intervals", None)
+    raw["schedule"].pop("trade_interval_min", None)
     raw["datafeed"]["decision_timeframes"] = [decision]
     with pytest.raises(ValidationError, match="派生専用") as exc:
         Settings.model_validate(raw)

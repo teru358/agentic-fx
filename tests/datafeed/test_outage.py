@@ -110,6 +110,21 @@ def test_stall_formula_1h_boundary(tmp_path):
                      _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "degraded"
 
 
+def test_stall_formula_skips_weekend_until_next_bar_confirmation(tmp_path):
+    conn = _db(tmp_path)
+    machine = OutageStateMachine(
+        conn, hard_keys=frozenset({(PAIR, "1m"), (PAIR, "15m")}),
+        interval_widths={"1m": timedelta(minutes=1), "15m": timedelta(minutes=15)},
+        grace=GRACE, storage_source="mt5-live")
+    friday_15m = datetime(2026, 9, 25, 20, 45, tzinfo=timezone.utc)
+    assert not machine._is_stalled(datetime(2026, 9, 27, 21, 0, 3, tzinfo=timezone.utc), "15m", friday_15m)
+    assert not machine._is_stalled(datetime(2026, 9, 27, 21, 15, 29, tzinfo=timezone.utc), "15m", friday_15m)
+    assert machine._is_stalled(datetime(2026, 9, 27, 21, 15, 31, tzinfo=timezone.utc), "15m", friday_15m)
+    friday_1m = datetime(2026, 9, 25, 20, 59, tzinfo=timezone.utc)
+    assert not machine._is_stalled(datetime(2026, 9, 27, 21, 1, 29, tzinfo=timezone.utc), "1m", friday_1m)
+    assert machine._is_stalled(datetime(2026, 9, 27, 21, 1, 31, tzinfo=timezone.utc), "1m", friday_1m)
+
+
 def test_two_consecutive_hard_problem_ticks_confirm_exactly_once(tmp_path):
     conn = _db(tmp_path)
     _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 9, 59, tzinfo=timezone.utc))
