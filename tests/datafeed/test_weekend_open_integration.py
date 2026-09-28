@@ -20,9 +20,12 @@ def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
     init_db(conn)
     friday_15m = datetime(2026, 9, 25, 20, 45, tzinfo=_UTC)
     friday_1m = datetime(2026, 9, 25, 20, 59, tzinfo=_UTC)
+    # 金曜の最終足 (15m 20:45 / 1m 20:59) は 21:00 の閉場と同時に確定するので
+    # 閉場前の tick では取り込めず、cache には 1 本前までしか無い。最終足は
+    # 週明け最初の tick で取り込まれる。
     upsert_cache_bars(conn, [
-        Bar(PAIR, "15m", friday_15m, 1, 1, 1, 1, 1),
-        Bar(PAIR, "1m", friday_1m, 1, 1, 1, 1, 1),
+        Bar(PAIR, "15m", friday_15m - timedelta(minutes=15), 1, 1, 1, 1, 1),
+        Bar(PAIR, "1m", friday_1m - timedelta(minutes=1), 1, 1, 1, 1, 1),
     ], source="mt5-live")
     settings = SimpleNamespace(
         pairs=[PAIR],
@@ -57,6 +60,12 @@ def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
         _, report = ingest.prepare(now, conn)
         ingest.commit(conn)
         assert outage.observe(now, report) == "ready"
+        if offset == 0:
+            # 最初の tick で金曜の最終足が入る (これが無いと 20:30 起点の期限
+            # 金 21:00:30 を過ぎていて即停滞になる)
+            assert latest_closed_cache_bar_time(
+                conn, PAIR, "15m", now=now, width=timedelta(minutes=15),
+                grace=timedelta(seconds=30), source="mt5-live") == friday_15m
 
     assert [when for interval, when in requests if interval == "15m"] == [
         datetime(2026, 9, 27, 21, 0, 4, tzinfo=_UTC),
