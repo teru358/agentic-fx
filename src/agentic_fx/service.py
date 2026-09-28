@@ -787,9 +787,11 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                 f"signal #{row.id} ({row.plugin}) "
                 f"timeframe={row.timeframe!r} — invalid_timeframe",
                 ref_id=str(row.id))
+    # producer はライブ cache を読む。保存名は primary と異なり得る (mt5 → mt5-live)。
+    source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
-        source=settings.datafeed.primary, settings=settings,
+        source=source, settings=settings,
         resolved_by_identity=resolved_by_identity, activity=activity)
 
 
