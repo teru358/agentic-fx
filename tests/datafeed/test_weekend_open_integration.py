@@ -14,6 +14,8 @@ _UTC = timezone.utc
 
 
 def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
+    """開場と同時に足を配信する source (MT5 bridge と同じ振る舞い) を想定する。
+    日曜 21:00 の足を持たない source (yfinance) はこの前提の外。"""
     conn = connect(tmp_path / "bars.db")
     init_db(conn)
     friday_15m = datetime(2026, 9, 25, 20, 45, tzinfo=_UTC)
@@ -21,10 +23,10 @@ def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
     upsert_cache_bars(conn, [
         Bar(PAIR, "15m", friday_15m, 1, 1, 1, 1, 1),
         Bar(PAIR, "1m", friday_1m, 1, 1, 1, 1, 1),
-    ], source="yfinance")
+    ], source="mt5-live")
     settings = SimpleNamespace(
         pairs=[PAIR],
-        datafeed=SimpleNamespace(primary="yfinance", intervals=["1m", "15m"],
+        datafeed=SimpleNamespace(primary="mt5", intervals=["1m", "15m"],
                                  primary_intervals=["15m"], ingest_budget_sec=10,
                                  closed_bar_grace_sec=30),
     )
@@ -48,7 +50,7 @@ def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
     outage = OutageStateMachine(
         conn, hard_keys=frozenset({(PAIR, "1m"), (PAIR, "15m")} ),
         interval_widths={"1m": timedelta(minutes=1), "15m": timedelta(minutes=15)},
-        grace=timedelta(seconds=30), storage_source="yfinance", activity=activity)
+        grace=timedelta(seconds=30), storage_source="mt5-live", activity=activity)
     first = datetime(2026, 9, 27, 21, 0, 4, tzinfo=_UTC)
     for offset in range(18):
         now = first + timedelta(minutes=offset)
@@ -62,11 +64,11 @@ def test_weekend_open_stays_ready_until_first_15m_bar_is_ingested(tmp_path):
     ]
     assert latest_closed_cache_bar_time(
         conn, PAIR, "15m", now=datetime(2026, 9, 27, 21, 17, 4, tzinfo=_UTC),
-        width=timedelta(minutes=15), grace=timedelta(seconds=30), source="yfinance",
+        width=timedelta(minutes=15), grace=timedelta(seconds=30), source="mt5-live",
     ) == datetime(2026, 9, 27, 21, 0, tzinfo=_UTC)
     assert latest_closed_cache_bar_time(
         conn, PAIR, "1m", now=datetime(2026, 9, 27, 21, 2, 4, tzinfo=_UTC),
-        width=timedelta(minutes=1), grace=timedelta(seconds=30), source="yfinance",
+        width=timedelta(minutes=1), grace=timedelta(seconds=30), source="mt5-live",
     ) == datetime(2026, 9, 27, 21, 0, tzinfo=_UTC)
     assert not any("datafeed_degraded" in line or "data_outage_degraded" in line
                    for line in activity.tail(50))

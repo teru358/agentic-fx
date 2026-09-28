@@ -119,6 +119,8 @@ def test_stall_formula_skips_weekend_until_next_bar_confirmation(tmp_path):
     friday_15m = datetime(2026, 9, 25, 20, 45, tzinfo=timezone.utc)
     assert not machine._is_stalled(datetime(2026, 9, 27, 21, 0, 3, tzinfo=timezone.utc), "15m", friday_15m)
     assert not machine._is_stalled(datetime(2026, 9, 27, 21, 15, 29, tzinfo=timezone.utc), "15m", friday_15m)
+    # 期限ちょうどはまだ停滞ではない (確定規則は `<= cutoff` で足を受け入れる側)
+    assert not machine._is_stalled(datetime(2026, 9, 27, 21, 15, 30, tzinfo=timezone.utc), "15m", friday_15m)
     assert machine._is_stalled(datetime(2026, 9, 27, 21, 15, 31, tzinfo=timezone.utc), "15m", friday_15m)
     friday_1m = datetime(2026, 9, 25, 20, 59, tzinfo=timezone.utc)
     assert not machine._is_stalled(datetime(2026, 9, 27, 21, 1, 29, tzinfo=timezone.utc), "1m", friday_1m)

@@ -208,6 +208,18 @@ def test_next_probe_skips_weekend_to_next_bar_confirmation(tmp_path):
     assert ingest.next_probe_at[("USDJPY", "15m")] == datetime(2026, 9, 27, 21, 15, 30, tzinfo=timezone.utc)
     assert ingest._backoff[("USDJPY", "15m")] == 0
     assert calls.count(("USDJPY", "15m")) == 1
+    # 期限ちょうどに新しい足がまだ無ければ予約でなく短い再試行 (backoff 1 回目 = 2 秒)
+    at_deadline = datetime(2026, 9, 27, 21, 15, 30, tzinfo=timezone.utc)
+    ingest.prepare(at_deadline, conn)
+    assert ingest._backoff[("USDJPY", "15m")] == 1
+    assert ingest.next_probe_at[("USDJPY", "15m")] == at_deadline + timedelta(seconds=2)
+    # 再試行の間隔は足幅 (15 分 = 900 秒) を上限に指数で伸びる
+    now = at_deadline
+    for attempt in range(2, 12):
+        now = ingest.next_probe_at[("USDJPY", "15m")]
+        ingest.prepare(now, conn)
+        assert ingest._backoff[("USDJPY", "15m")] == attempt
+        assert ingest.next_probe_at[("USDJPY", "15m")] - now == timedelta(seconds=min(900, 2 ** attempt))
     conn.close()
 
 
