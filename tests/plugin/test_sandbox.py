@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import os
+import signal
 from pathlib import Path
 
 import pandas as pd
@@ -1314,3 +1316,160 @@ def test_standalone_indicator_response_rejects_extra_or_missing_outputs_keys():
     # outputs=None (standalone 宣言なし、S1) は任意のキー集合を許す
     assert _validate_indicator_result({"whatever": 1.0}, outputs=None) == \
         {"whatever": 1.0}
+
+
+class _NoWaitProcess:
+    def __init__(self, pid=43210):
+        self.pid = pid
+        self.returncode = None
+
+    def wait(self, *args, **kwargs):
+        pytest.fail("Popen.wait must not be used")
+
+    def poll(self):
+        pytest.fail("Popen.poll must not be used")
+
+    def communicate(self, *args, **kwargs):
+        pytest.fail("Popen.communicate must not be used")
+
+
+def test_reap_records_wait4_usage_once(monkeypatch, tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "once", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _NoWaitProcess()
+    calls = []
+
+    class Usage:
+        ru_utime = 1.25
+        ru_stime = 0.5
+
+    def wait4(pid, flags):
+        calls.append((pid, flags))
+        if len(calls) > 1:
+            pytest.fail("wait4 called after the child was reaped")
+        return pid, 0, Usage()
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    assert session._reap_worker()
+    assert session._reap_worker()
+    assert calls == [(43210, os.WNOHANG)]
+    assert session.worker_cpu_sec == pytest.approx(1.75)
+
+
+def test_cpu_classification_uses_parent_observation(tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "classify", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session.worker_signal = signal.SIGKILL
+    session.worker_cpu_sec = plugin_settings.sandbox_session_cpu_sec - sandbox._CPU_TOLERANCE_SEC
+    assert session._worker_error("dead").code == "cpu_limit"
+    session.parent_kill_sent = True
+    assert session._worker_error("dead").code == "crashed"
+    session.parent_kill_sent = False
+    session.worker_signal = signal.SIGXFSZ
+    assert session._worker_error("dead").code == "crashed"
+
+
+def test_internal_lifecycle_constants_are_fixed():
+    from agentic_fx.plugin import sandbox
+
+    assert sandbox._KILL_REAP_TIMEOUT_SEC == 5.0
+    assert sandbox._CPU_TOLERANCE_SEC == 0.05
+    assert sandbox._ORPHAN_CAPACITY == 64
+
+
+def test_worker_sets_requested_cpu_limit_and_core_limit(monkeypatch):
+    from agentic_fx.plugin import worker
+
+    calls = []
+    monkeypatch.setattr(worker.resource, "setrlimit",
+                        lambda limit, value: calls.append((limit, value)))
+    worker._set_resource_limits(5, 512, 128, 8)
+    assert (worker.resource.RLIMIT_CPU, (5, 5)) in calls
+    assert (worker.resource.RLIMIT_CORE, (0, 0)) in calls
+
+
+@pytest.mark.parametrize("requested", [1, 5, 60])
+def test_handshake_carries_configured_cpu_limit(monkeypatch, tmp_path, plugin_settings,
+                                                 requested):
+    from agentic_fx.plugin import sandbox
+
+    captured = []
+
+    class Process:
+        pid = 9001
+        returncode = None
+        stdin = None
+        stdout = None
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(PluginSession, "_write_line", lambda self, item: captured.append(item))
+    monkeypatch.setattr(PluginSession, "_read_response",
+                        lambda self, timeout, maximum: {"ok": True, "pid": 9001})
+    settings = plugin_settings.model_copy(update={"sandbox_session_cpu_sec": requested})
+    session = PluginSession(_meta(tmp_path, f"cpu-{requested}", "indicator", INDICATOR_OK_PY),
+                            settings=settings)
+    assert session.__enter__() is session
+    assert captured[0]["cpu_sec"] == requested
+    session._proc = None
+    session.close()
+
+
+def test_default_cpu_limit_is_sixty(plugin_settings):
+    assert plugin_settings.sandbox_session_cpu_sec == 60
+
+
+def test_core_limit_failure_prevents_plugin_import(monkeypatch, tmp_path):
+    from agentic_fx.plugin import worker
+
+    imported = []
+    def fail_core(limit, value):
+        if limit == worker.resource.RLIMIT_CORE:
+            raise OSError("core disabled")
+    monkeypatch.setattr(worker.resource, "setrlimit", fail_core)
+    monkeypatch.setattr(worker, "_import_plugin", lambda path: imported.append(path))
+    with pytest.raises(OSError, match="core disabled"):
+        worker._set_resource_limits(1, 1, 16, 1)
+    assert imported == []
+
+
+def test_cpu_limit_worker_is_classified_from_wait4(tmp_path, plugin_settings):
+    busy = """
+def compute(df, params):
+    n = 0
+    while True:
+        n += 1
+"""
+    meta = _meta(tmp_path, "busy", "indicator", busy)
+    settings = plugin_settings.model_copy(update={"sandbox_session_cpu_sec": 1,
+                                                   "sandbox_timeout_sec": 3.0})
+    session = PluginSession(meta, settings=settings)
+    with pytest.raises(SandboxError) as exc_info:
+        with session:
+            session.call({"df": _df(), "params": {}})
+    assert exc_info.value.code == "cpu_limit"
+    assert session.worker_cpu_sec is not None
+    assert session.worker_cpu_sec >= 0.95
+
+
+def test_large_stderr_is_bounded_and_not_in_exception(tmp_path, plugin_settings, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    marker = "stderr-secret-marker"
+    plugin = f"""
+def compute(df, params):
+    print({marker!r} + "x" * (8 * 1024 * 1024 + 1))
+    return {{"x": 1.0}}
+"""
+    meta = _meta(tmp_path, "stderr", "indicator", plugin)
+    with PluginSession(meta, settings=plugin_settings) as session:
+        assert session.call({"df": _df(), "params": {}}) == {"x": 1.0}
+    assert session.stderr_tail is not None
+    assert len(session.stderr_tail.encode()) <= 8192
+    records = [r for r in caplog.records if r.name.endswith("sandbox")]
+    assert len(records) == 1
+    assert "truncated=true" in records[0].message
+    assert "\n" not in records[0].message
+    assert marker not in str(SandboxError("ordinary failure"))

@@ -330,6 +330,7 @@ _STARTUP_TIMEOUT_SEC = 30.0
 _STARTUP_MAX_BYTES = 65536
 _CPU_TOLERANCE_SEC = 0.05
 _KILL_REAP_TIMEOUT_SEC = 5.0
+_ORPHAN_CAPACITY = 64
 _ORPHANS: list["PluginSession"] = []
 _ORPHAN_OVERFLOW_LOGGED = False
 _log = logging.getLogger(__name__)
@@ -579,8 +580,13 @@ class PluginSession:
                     stream.close()
             except OSError:
                 pass
+        # An unreaped child must remain strongly reachable for a later
+        # WNOHANG attempt, but none of the parent's pipe/file descriptors are
+        # needed for that attempt.  Keeping them open here leaks an fd for
+        # every stopped worker and, more importantly, prevents close() from
+        # being a terminal operation from the caller's point of view.
+        self._close_stderr()
         if not self.worker_unreaped:
-            self._close_stderr()
             self._proc = None
 
     def call(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -736,7 +742,7 @@ class PluginSession:
         if self not in _ORPHANS:
             global _ORPHAN_OVERFLOW_LOGGED
             _ORPHANS.append(self)
-            if len(_ORPHANS) > 64 and not _ORPHAN_OVERFLOW_LOGGED:
+            if len(_ORPHANS) > _ORPHAN_CAPACITY and not _ORPHAN_OVERFLOW_LOGGED:
                 _ORPHAN_OVERFLOW_LOGGED = True
                 _log.warning("plugin worker orphan list exceeds 64 entries")
 
