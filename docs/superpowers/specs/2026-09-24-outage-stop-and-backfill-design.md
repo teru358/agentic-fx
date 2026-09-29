@@ -329,6 +329,19 @@ backfill (nocommit)・注文遷移 (nocommit)・pair cursor・state の更新を
   自動経路そのものが無い。人間が新設シェルコマンド (仮称 `data resume`、§3.4/§8) を
   叩いたときだけ `ready` に戻す。
 
+### 段 c-lite: 建玉も指値も無い episode の自動復帰 (2026-09-29)
+
+`degraded` 中、全 hard key の最後の試行が非 empty 成功で今 tick に停滞がなく、これが
+`datafeed.outage.ready_confirm_ticks` (既定 3) tick 連続し、orders の OPEN/PENDING_FILL が
+ともに 0 件で `pending_human_confirmation=0` なら `ready` へ戻す。`ready_streak` は失敗・
+empty・停滞・新 episode・再起動で 0 に戻し、復帰時は `datafeed_recovered_auto` を epoch と
+streak 付きで 1 回だけ記録する。flat でない場合は従来どおり
+`datafeed_recovered_awaiting_resume` を epoch ごとに 1 回記録する。
+
+`datafeed.outage.auto_resume_when_flat: false` では手動復帰を維持する。replay cursor を完了
+扱いにせず、`pending_human_confirmation` も解除しないため、段 c 本体の連続性検査・replay
+の責務は変えない。
+
   **v0.2 の前提条件は不十分だった (r2 裁定 C1、Critical)**: v0.2 は「全 hard 必須 key が
   直近 tick で succeeded」だけを前提条件にしていたが、これは資金保護にならない。反例:
   10:01 に停止、10:03 の未処理足で SL 到達、10:05 に復旧して全 hard key が succeeded に
@@ -789,6 +802,7 @@ datafeed:
   fallbacks: []
   outage:
     ready_confirm_ticks: 3       # backfilling → ready に必要な連続健全 tick 数
+    auto_resume_when_flat: true  # OPEN/PENDING_FILL が無い episode の自動復帰
     # max_flap_duration_min は §9 実測後に既定値を置く (未裁定)
 ```
 
@@ -957,3 +971,4 @@ T7 store/orders の commit しない primitive + with conn: (C6) ─┘         
 |2026-09-24|v0.4|codex レビュー r3 (`tmp/design-a23/r3/codex-out.md`、C3/I3) の指揮者裁定 (`tmp/design-a23/r3/verdicts.md`、全件採用) を反映。**C1 (Critical)**: `data resume` の「未処理の確定足がある建玉」判定を、根拠薄弱な「`filled_at` または `entered_degraded_at`」の単純存在チェックから**保守規則**に置き換えた — 段 b は建玉別の適用 cursor を持たないため、episode 内の対象足は pair の全 OPEN について無条件に未処理扱いとし、各建玉の下限は `max(next_expected_trading_time(gap_start), filled_at)`、`PENDING_FILL` の下限は `created_at` とする (§3.1、IV-11 更新、AC-14 新設)。**C2 (Critical)**: `data resume` を tick-local な直列化に改めた — `Commands` は `core_lock` を取らず state を直接書かない (現物のまま)。resume は「resume 要求」(`resume_requested_at`/`resume_acknowledge`、§3.1 DDL に列追加) として永続化するだけにとどめ、次 scheduler tick の同一 `now`・`report`・`watermarks` を使う `commit → observe → resume 判定 → scheduler.tick()` という単一 lock 区間で消費する (§3.1「resume 要求の消費」新設、§3.2 Commands 行、IV-14 新設、AC-15 新設)。**C3 (Critical)**: c 段の永続方式を候補 A (DB 表 2 つ) に確定し、候補 B (`StateStore`) を退けた案に移した — `state.json` は別ファイルであり SQLite transaction に原理的に参加できないため (§3.1 永続化パラグラフ、§6 退けた案に行追加、IV-8 更新、§11 T0/T1 の記述を候補選択から crash-safe 確認へ縮小)。§3.3 冒頭を「段 c は `ingest.commit()` を呼ばない、`upsert_cache_bars_nocommit` で pair/key 別に nocommit 書込みし外側の 1 つの明示 `with conn:` transaction でまとめて commit する」に書き換え、現物の内部 commit を呼ぶ経路を残さないようにした。**I1 (Important)**: replay cursor (`replay_through`) の前進をヒットの有無・OPEN 件数に従属させない — pair のバッチが例外なく処理された時点で最後の入力足まで無条件に進めるよう手順 5 を改訂し、全ヒット・OPEN ゼロ・一部生存の 3 ケースを AC-1c として新設 (§3.3、IV-13 新設)。**I2 (Important)**: replay→通常 exit の drain/handoff 規律を専用の受入条件 AC-1d (11:47→11:50 の時刻列で 11:46/47/48 が順に 1 回ずつ処理され、失敗 pair の通常 exit 呼出しが 0 回) で反証可能にした (§3.3)。**I3 (Important)**: §11 の b 段 task–AC 対応の誤りを是正 — T3 が誤って参照していた (c 段の) AC-1b を外し、新設 AC-14 (b 専用 resume 存在チェック) を割当てた。Tb-cmd に AC-14/AC-15 を割当てた (従来「なし」)。T5b の統合対象に AC-2b・AC-14・AC-15 を追加した (従来 AC-2b が漏れていた)。T8/T10 にも AC-1c/AC-1d を追加した。|指揮者裁定 (全件採用、蒸し返さない)|—|
 |2026-09-24|v1.0|ユーザー裁定 (3 段分割・b 段の手動復帰を承認、replay の SL/TP は実口座と同じ結果で決済扱い、実口座は reconcile) を §8 に記録し、spec として清書。r4 (codex terra、C0/I1/M1) で Critical 0|||
 | 2026-09-25 | v1.1 | 段 b 実装完了 (`dea38d7`)。実装で確定した細部: resume 前提 (1) は「hard key ごとの最後の試行が非 empty で succeeded かつ停滞なし」(同一 tick 要求は 15m 足で運用不能のため)、新 epoch で証拠全クリア、再起動直後は不健全。閉場 tick の cron baseline は ready 時のみ。復旧待ち通知の一回性は `recovered_notified_epoch` 列で永続。`data_outage_unprocessed_bars` は内訳変化時のみ。resume 時の強制 probe と IngestTickReport への source 付与は段 c の設計項目 | 実装レビュー terra 4 周の是正 | `dea38d7` |
+|2026-09-29|v1.2|建玉も指値も無い episode の連続健全 tick による自動 ready 復帰を追加。|flat 時の長時間停止を避けつつ、建玉・指値・人間確認・replay は手動/段 c の責務に残す。|`(this)`|

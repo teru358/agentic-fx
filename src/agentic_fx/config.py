@@ -151,6 +151,11 @@ class SourceToggle(_Strict):
     bridge_url: str | None = None
 
 
+class OutageSettings(_Strict):
+    ready_confirm_ticks: int = Field(default=3, ge=1)
+    auto_resume_when_flat: bool = True
+
+
 class DatafeedSettings(_Strict):
     yfinance: SourceToggle
     mt5: SourceToggle
@@ -165,6 +170,7 @@ class DatafeedSettings(_Strict):
     freshness_max_min: float = Field(gt=0)
     # ソース時刻の遅延・境界丸めを吸収するための暫定猶予秒。
     closed_bar_grace_sec: int = Field(default=30, ge=0)
+    outage: OutageSettings = Field(default_factory=OutageSettings)
     # 換算レート (ConversionRate) の skew 許容 (設計書 §5): ①各脚の鮮度は
     # freshness_max_min で検証済みなのでここでは見ない。②クロス2脚間の
     # 時刻差 ③判断内スナップショット全体 (reference_ts) との時刻差、の

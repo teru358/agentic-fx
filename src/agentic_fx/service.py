@@ -1214,7 +1214,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             conn_core, hard_keys=hard_keys,
             interval_widths=outage_interval_widths,
             grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
-            storage_source=ingest.storage_source, activity=activity)
+            storage_source=ingest.storage_source, activity=activity,
+            ready_confirm_ticks=settings.datafeed.outage.ready_confirm_ticks,
+            auto_resume_when_flat=settings.datafeed.outage.auto_resume_when_flat)
 
         def db_latest_1m_bar(pair: str):
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary

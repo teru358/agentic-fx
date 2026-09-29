@@ -56,6 +56,7 @@ datafeed:
   twelvedata: {enabled: false}
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い
   closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
+  outage: {ready_confirm_ticks: 3, auto_resume_when_flat: true}  # 建玉も指値も無い episode は連続 N tick 健全で自動 ready、それ以外は `data resume`
   conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
   decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する

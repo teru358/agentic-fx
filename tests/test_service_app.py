@@ -4857,6 +4857,8 @@ def test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery(tmp_path
     app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                     embedding_fn=FakeEmbedding())
     try:
+        # 手動復帰の経路を固定する (建玉なしの自動復帰は別テスト)
+        app.outage.auto_resume_when_flat = False
         _outage_seed_bar(app.conn_core, "USDJPY", "1m",
                       t0 - timedelta(minutes=1))       # 09:59
         _outage_seed_bar(app.conn_core, "USDJPY", "1h",

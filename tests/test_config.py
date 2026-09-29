@@ -44,6 +44,18 @@ def test_example_file_loads():
     assert s.service.secret_env_allowlist == []
 
 
+def test_datafeed_outage_defaults_and_example_are_validated():
+    assert Settings.model_validate(_base_raw_datafeed(pytest.MonkeyPatch())).datafeed.outage.ready_confirm_ticks == 3
+    assert load_settings(EXAMPLE).datafeed.outage.auto_resume_when_flat is True
+
+
+def test_datafeed_outage_rejects_zero_ready_confirm_ticks(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["outage"] = {"ready_confirm_ticks": 0}
+    with pytest.raises(ValidationError, match="ready_confirm_ticks"):
+        Settings.model_validate(raw)
+
+
 def test_example_does_not_emit_deprecated_key_warnings(caplog):
     load_settings(EXAMPLE)
     messages = [record.getMessage() for record in caplog.records]

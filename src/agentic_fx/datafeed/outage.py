@@ -69,13 +69,19 @@ class OutageStateMachine:
     """
 
     def __init__(self, conn, *, hard_keys, interval_widths: dict[str, timedelta],
-                 grace: timedelta, storage_source: str, activity=None) -> None:
+                 grace: timedelta, storage_source: str, activity=None,
+                 ready_confirm_ticks: int = 3,
+                 auto_resume_when_flat: bool = True) -> None:
         self.conn = conn
         self.hard_keys = frozenset(hard_keys)
         self.interval_widths = dict(interval_widths)
         self.grace = grace
         self.storage_source = storage_source
         self.activity = activity
+        self.ready_confirm_ticks = ready_confirm_ticks
+        self.auto_resume_when_flat = auto_resume_when_flat
+        # 継続した健全 tick はプロセスをまたいで数えない。
+        self._reset_ready_streak = True
         # 「2 tick 連続」判定用のプロセス内カウンタ。`confirmed` フラグ自体は
         # DB に永続化されるが、再起動直後は最大 1 tick 分だけ再確認が遅れる
         # (confirmed は通知の重み付けにのみ使い、起動可否の判定には使わない)。
@@ -156,6 +162,11 @@ class OutageStateMachine:
         """
         now = as_utc(now)
         self._ensure_row(now)
+        if self._reset_ready_streak:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE datafeed_outage_state SET ready_streak=0 WHERE id=1")
+            self._reset_ready_streak = False
         row = self._load_row()
         if not market_hours.is_market_open(now):
             # 休場中は ingest 自体も due を立てない — 観測しない。
@@ -196,14 +207,20 @@ class OutageStateMachine:
         state = row["state"]
         epoch = row["epoch"]
         confirmed = row["confirmed"]
+        ready_streak = row.get("ready_streak", 0)
         entered_degraded_at = row["entered_degraded_at"]
         recovered_notified_epoch = row.get("recovered_notified_epoch")
         was_degraded = state == "degraded"
 
         if hard_problem:
             self._problem_streak += 1
+            ready_streak = 0
         else:
             self._problem_streak = 0
+
+        healthy_tick = not hard_problem and not unconfirmed_keys
+        if state == "degraded":
+            ready_streak = ready_streak + 1 if healthy_tick else 0
 
         if hard_problem and state == "ready":
             # 最初の失敗・停滞を検出したその tick のうちに遷移する — 2 回連続を
@@ -212,6 +229,7 @@ class OutageStateMachine:
             entered_degraded_at = _iso(now)
             confirmed = 0
             state = "degraded"
+            ready_streak = 0
             recovered_notified_epoch = None
             self._open_gaps(epoch, now, watermarks)
             self._write_activity(
@@ -224,18 +242,29 @@ class OutageStateMachine:
             self._write_activity(
                 "data_outage_degraded",
                 f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}")
-        elif not hard_problem and was_degraded and recovered_notified_epoch != epoch:
-            # 復旧を検知したが、自動の連続性検査・replay を持たないため
-            # 自動では ready に戻さない — 人間の明示コマンド待ち。
-            recovered_notified_epoch = epoch
-            self._write_activity(
-                "datafeed_recovered_awaiting_resume",
-                f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}")
-        # hard_problem が False でもここでは自動で ready に戻らない。
+        elif not hard_problem and was_degraded:
+            flat = not orders.list_by_status(self.conn, "open", "pending_fill")
+            if (self.auto_resume_when_flat and flat
+                    and ready_streak >= self.ready_confirm_ticks
+                    and not row.get("pending_human_confirmation", 0)):
+                state = "ready"
+                confirmed = 0
+                ready_streak = 0
+                self._last_unprocessed_by_pair = None
+                self._write_activity(
+                    "datafeed_recovered_auto",
+                    f"epoch={epoch} streak={self.ready_confirm_ticks}")
+            elif ((not flat or not self.auto_resume_when_flat)
+                  and recovered_notified_epoch != epoch):
+                recovered_notified_epoch = epoch
+                self._write_activity(
+                    "datafeed_recovered_awaiting_resume",
+                    f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}")
 
         self._save_state(state=state, epoch=epoch, confirmed=confirmed,
                           entered_degraded_at=entered_degraded_at,
                           recovered_notified_epoch=recovered_notified_epoch,
+                          ready_streak=ready_streak,
                           updated_at=_iso(now))
 
         if state == "degraded":
@@ -300,14 +329,15 @@ class OutageStateMachine:
     def _save_state(self, *, state: str, epoch: int, confirmed: int,
                     entered_degraded_at: str | None,
                     recovered_notified_epoch: int | None,
+                    ready_streak: int,
                     updated_at: str) -> None:
         with self.conn:
             self.conn.execute(
                 "UPDATE datafeed_outage_state SET state=?, epoch=?, "
                 "confirmed=?, entered_degraded_at=?, "
-                "recovered_notified_epoch=?, updated_at=? WHERE id=1",
+                "recovered_notified_epoch=?, ready_streak=?, updated_at=? WHERE id=1",
                 (state, epoch, confirmed, entered_degraded_at,
-                 recovered_notified_epoch, updated_at))
+                 recovered_notified_epoch, ready_streak, updated_at))
 
     def _open_gaps(self, epoch: int, now: datetime,
                    watermarks: dict[tuple[str, str], datetime | None]) -> None:
@@ -410,6 +440,7 @@ class OutageStateMachine:
             self._save_state(state=state, epoch=epoch, confirmed=0,
                              entered_degraded_at=row.get("entered_degraded_at"),
                              recovered_notified_epoch=row.get("recovered_notified_epoch"),
+                             ready_streak=0,
                              updated_at=_iso(now))
             self._write_activity(
                 "data_resume_accepted",
