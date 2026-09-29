@@ -45,7 +45,11 @@ def test_example_file_loads():
 
 
 def test_datafeed_outage_defaults_and_example_are_validated():
-    assert Settings.model_validate(_base_raw_datafeed(pytest.MonkeyPatch())).datafeed.outage.ready_confirm_ticks == 3
+    raw = _base_raw_datafeed(pytest.MonkeyPatch())
+    del raw["datafeed"]["outage"]
+    defaults = Settings.model_validate(raw).datafeed.outage
+    assert defaults.ready_confirm_ticks == 3
+    assert defaults.auto_resume_when_flat is True
     assert load_settings(EXAMPLE).datafeed.outage.auto_resume_when_flat is True
 
 

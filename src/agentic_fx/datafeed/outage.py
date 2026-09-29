@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from agentic_fx.activity import Category
+from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.core import market_hours
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.store import ohlcv, orders
@@ -220,7 +221,8 @@ class OutageStateMachine:
 
         healthy_tick = not hard_problem and not unconfirmed_keys
         if state == "degraded":
-            ready_streak = ready_streak + 1 if healthy_tick else 0
+            ready_streak = (ready_streak + 1
+                            if self.auto_resume_when_flat and healthy_tick else 0)
 
         if hard_problem and state == "ready":
             # 最初の失敗・停滞を検出したその tick のうちに遷移する — 2 回連続を
@@ -243,7 +245,9 @@ class OutageStateMachine:
                 "data_outage_degraded",
                 f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}")
         elif not hard_problem and was_degraded:
-            flat = not orders.list_by_status(self.conn, "open", "pending_fill")
+            # close 失敗・取消競合で非終端状態に残った注文は建玉があるかもしれない。
+            # broker 上の存在を否定できるまで flat とみなさない。
+            flat = not orders.list_by_status(self.conn, *_EXPOSURE)
             if (self.auto_resume_when_flat and flat
                     and ready_streak >= self.ready_confirm_ticks
                     and not row.get("pending_human_confirmation", 0)):

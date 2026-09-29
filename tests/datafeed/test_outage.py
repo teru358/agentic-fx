@@ -6,8 +6,11 @@ fake transport なし (bridge 通信は datafeed/test_ingest.py 側)。ここで
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import Bar
+from agentic_fx.core.executor import _EXPOSURE
 from agentic_fx.datafeed.outage import (
     EMPTY_REPORT,
     IngestTickReport,
@@ -924,6 +927,22 @@ def test_flat_episode_auto_resumes_after_three_healthy_ticks(tmp_path):
     assert not any("datafeed_recovered_awaiting_resume" in line for line in lines)
 
 
+def test_auto_resume_clears_confirmed_after_two_problem_ticks(tmp_path):
+    conn = _db(tmp_path)
+    machine = _auto_machine(conn)
+    failed = _report(failed=[((PAIR, "1m"), "ConnectError")],
+                     succeeded=[(PAIR, "1h")])
+    machine.observe(datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc), failed)
+    machine.observe(datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc), failed)
+    assert machine.status()["confirmed"] == 1
+
+    healthy = _report(succeeded=HARD_KEYS)
+    for minute in (3, 4):
+        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert machine.observe(datetime(2026, 9, 24, 10, 5, tzinfo=timezone.utc), healthy) == "ready"
+    assert machine.status()["confirmed"] == 0
+
+
 def test_auto_resume_streak_resets_on_empty_tick(tmp_path):
     conn = _db(tmp_path)
     machine = _auto_machine(conn)
@@ -938,19 +957,21 @@ def test_auto_resume_streak_resets_on_empty_tick(tmp_path):
     assert machine.observe(datetime(2026, 9, 24, 10, 7, tzinfo=timezone.utc), healthy) == "ready"
 
 
-def test_open_or_pending_order_prevents_auto_resume(tmp_path):
-    for status in ("open", "pending_fill"):
-        conn = _db(tmp_path / status)
-        log = ActivityLog(tmp_path / status / "activity.log")
-        machine = _auto_machine(conn, activity=log)
-        _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
-        orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
-                      horizon="swing", status=status,
-                      now=datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
-        healthy = _report(succeeded=HARD_KEYS)
-        for minute in (2, 3, 4):
-            assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
-        assert len([line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]) == 1
+@pytest.mark.parametrize("status", [
+    status.value for status in _EXPOSURE
+])
+def test_exposure_order_prevents_auto_resume(status, tmp_path):
+    conn = _db(tmp_path / status)
+    log = ActivityLog(tmp_path / status / "activity.log")
+    machine = _auto_machine(conn, activity=log)
+    _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
+    orders.insert(conn, pair=PAIR, direction="buy", entry_type="market",
+                  horizon="swing", status=status,
+                  now=datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
+    healthy = _report(succeeded=HARD_KEYS)
+    for minute in (2, 3, 4):
+        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+    assert len([line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]) == 1
 
 
 def test_auto_resume_uses_last_success_for_not_attempted_key(tmp_path):
@@ -1025,3 +1046,15 @@ def test_auto_resume_can_be_disabled_or_blocked_by_human_confirmation(tmp_path):
             assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
         awaiting = [line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]
         assert len(awaiting) == (1 if kwargs else 0)
+
+
+def test_disabled_auto_resume_keeps_ready_streak_zero(tmp_path):
+    conn = _db(tmp_path)
+    machine = _auto_machine(conn, auto_resume_when_flat=False)
+    _degrade(machine, datetime(2026, 9, 24, 10, 1, tzinfo=timezone.utc))
+    healthy = _report(succeeded=HARD_KEYS)
+    for minute in (2, 3, 4):
+        assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
+        assert conn.execute(
+            "SELECT ready_streak FROM datafeed_outage_state WHERE id=1"
+        ).fetchone()["ready_streak"] == 0

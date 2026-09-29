@@ -136,6 +136,24 @@ def _init(tmp_path):
         run_init(tmp_path)
 
 
+def test_build_app_wires_outage_auto_resume_settings(tmp_path):
+    _init(tmp_path)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings = settings_path.read_text(encoding="utf-8")
+    settings = settings.replace(
+        "outage: {ready_confirm_ticks: 3, auto_resume_when_flat: true}",
+        "outage: {ready_confirm_ticks: 5, auto_resume_when_flat: false}")
+    settings_path.write_text(settings, encoding="utf-8")
+
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        assert app.outage.ready_confirm_ticks == 5
+        assert app.outage.auto_resume_when_flat is False
+    finally:
+        app.close()
+
+
 def test_init_healthcheck_is_readonly(tmp_path):
     src = open("config/settings.yaml.example", encoding="utf-8").read()
     (tmp_path / "config").mkdir()

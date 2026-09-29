@@ -332,15 +332,17 @@ backfill (nocommit)・注文遷移 (nocommit)・pair cursor・state の更新を
 ### 段 c-lite: 建玉も指値も無い episode の自動復帰 (2026-09-29)
 
 `degraded` 中、全 hard key の最後の試行が非 empty 成功で今 tick に停滞がなく、これが
-`datafeed.outage.ready_confirm_ticks` (既定 3) tick 連続し、orders の OPEN/PENDING_FILL が
-ともに 0 件で `pending_human_confirmation=0` なら `ready` へ戻す。`ready_streak` は失敗・
+`datafeed.outage.ready_confirm_ticks` (既定 3) tick 連続し、executor の `_EXPOSURE` に属する
+orders が 0 件で `pending_human_confirmation=0` なら `ready` へ戻す。これは broker 上の存在を
+否定できない全注文がないことを flat とする定義であり、close 失敗・取消競合で残る非終端状態も
+flat とみなさない。`ready_streak` は失敗・
 empty・停滞・新 episode・再起動で 0 に戻し、復帰時は `datafeed_recovered_auto` を epoch と
 streak 付きで 1 回だけ記録する。flat でない場合は従来どおり
 `datafeed_recovered_awaiting_resume` を epoch ごとに 1 回記録する。
 
 `datafeed.outage.auto_resume_when_flat: false` では手動復帰を維持する。replay cursor を完了
 扱いにせず、`pending_human_confirmation` も解除しないため、段 c 本体の連続性検査・replay
-の責務は変えない。
+の責務は変えない。この設定では `ready_streak` を常に 0 とする。
 
   **v0.2 の前提条件は不十分だった (r2 裁定 C1、Critical)**: v0.2 は「全 hard 必須 key が
   直近 tick で succeeded」だけを前提条件にしていたが、これは資金保護にならない。反例:
