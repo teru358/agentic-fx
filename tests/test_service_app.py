@@ -2447,6 +2447,21 @@ def test_shutdown_sequence_completes_even_if_supervisor_shutdown_raises(tmp_path
         "supervisor.shutdown() の失敗で停止シーケンスが途中で落ちている")
 
 
+def test_shutdown_continues_when_reap_orphans_raises(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"), \
+         patch("agentic_fx.service.reap_orphans", side_effect=OSError("wait4 failed")):
+        assert run_service(tmp_path, daemon=True, _stop_event=stop_event) == 0
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "service_stopped" in act
+    assert "plugin orphan reap failed during shutdown" in (
+        tmp_path / "logs" / "agentic.log").read_text(encoding="utf-8")
+
+
 def test_interactive_mode_actually_stops_via_stop_event_end_to_end(
         tmp_path, capsys):
     """裁定 C の E2E: 対話モードで `stop_event` が実際にシェルを起こし、

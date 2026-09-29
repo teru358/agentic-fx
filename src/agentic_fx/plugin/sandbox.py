@@ -333,15 +333,17 @@ _KILL_REAP_TIMEOUT_SEC = 5.0
 _ORPHAN_CAPACITY = 64
 _ORPHANS: list["PluginSession"] = []
 _ORPHAN_OVERFLOW_LOGGED = False
+_ORPHANS_LOCK = threading.RLock()
 _log = logging.getLogger(__name__)
 
 
 def reap_orphans() -> None:
     """Keep unreaped children strongly referenced until the kernel releases them."""
-    for session in list(_ORPHANS):
-        if session._reap_worker():
-            _ORPHANS.remove(session)
-            _log.info("plugin worker orphan reaped pid=%s", session.pid)
+    with _ORPHANS_LOCK:
+        for session in list(_ORPHANS):
+            if session._reap_worker():
+                _ORPHANS.remove(session)
+                _log.info("plugin worker orphan reaped pid=%s", session.pid)
 
 
 class PluginSession:
@@ -381,6 +383,7 @@ class PluginSession:
         self.error_code: str | None = None
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
+        self._parent_fds_closed = False
         # プラン 8 B 束: PluginSession は単一スレッド所有が前提
         # (全使用箇所が単一スレッド — ロックは追加しない)。construction
         # したスレッドを記録し、実行時 assert で境界越えを検出する。
@@ -520,6 +523,7 @@ class PluginSession:
 
             response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
             if not response.get("ok"):
+                self.error_code = "plugin_error"
                 raise SandboxError(
                     f"plugin worker failed to start: {response.get('error')}",
                     code="plugin_error")
@@ -531,6 +535,7 @@ class PluginSession:
             raise
         except Exception as exc:
             self._dead = True
+            self.error_code = "plugin_error"
             self.close()
             raise SandboxError(f"failed to start plugin worker: {exc}") from exc
 
@@ -545,6 +550,8 @@ class PluginSession:
         来なければ従来どおり SIGKILL (`cpu_sec` は None のまま)。"""
         self._check_owner_thread()
         if self.worker_unreaped:
+            self._close_parent_fds()
+            self._close_stderr()
             return
         proc = self._proc
         if proc is None:
@@ -574,12 +581,7 @@ class PluginSession:
         # `_kill()` no-op → ここで停止 → RLIMIT_CPU の SIGXCPU で worker
         # が自滅し EOF が出るまで解けなかった)。順序 (`_kill()` を必ず
         # 先に完了させる) を変えないこと。
-        for stream in (proc.stdin, proc.stdout):
-            try:
-                if stream is not None:
-                    stream.close()
-            except OSError:
-                pass
+        self._close_parent_fds()
         # An unreaped child must remain strongly reachable for a later
         # WNOHANG attempt, but none of the parent's pipe/file descriptors are
         # needed for that attempt.  Keeping them open here leaks an fd for
@@ -588,6 +590,26 @@ class PluginSession:
         self._close_stderr()
         if not self.worker_unreaped:
             self._proc = None
+
+    def _close_parent_fds(self) -> None:
+        """Close parent pipe descriptors without contending with the reader lock."""
+        if self._parent_fds_closed or self._proc is None:
+            return
+        self._parent_fds_closed = True
+        for stream in (self._proc.stdin, self._proc.stdout):
+            if stream is None:
+                continue
+            try:
+                if self.worker_unreaped and stream is self._proc.stdout:
+                    os.close(stream.fileno())
+                else:
+                    stream.close()
+            except (OSError, AttributeError):
+                # Test doubles and already-closed streams have no usable fd.
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
     def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """1 回の plugin 呼び出し。payload は kind に応じて `df` (pandas
@@ -624,13 +646,16 @@ class PluginSession:
             raise
         except OSError as exc:
             self._dead = True
+            self.error_code = "protocol_error"
             self._kill()
-            raise SandboxError(f"failed to write to plugin worker: {exc}") from exc
+            code = "crashed" if self.worker_unreaped else "protocol_error"
+            raise SandboxError(f"failed to write to plugin worker: {exc}", code=code) from exc
 
         response = self._read_response(self._settings.sandbox_timeout_sec,
                                        self._settings.sandbox_output_max_bytes)
         self.pid = response.get("pid", self.pid)
         if not response.get("ok"):
+            self.error_code = "plugin_error"
             raise SandboxError(str(response.get("error", "unknown plugin error")),
                                code="plugin_error")
 
@@ -691,31 +716,36 @@ class PluginSession:
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
                 if time.monotonic() >= deadline:
                     self._dead = True
+                    self.error_code = "timeout"
                     self._kill()
-                    raise SandboxError(f"plugin call timed out after {timeout_sec}s", code="timeout")
+                    code = "crashed" if self.worker_unreaped else "timeout"
+                    raise SandboxError(f"plugin call timed out after {timeout_sec}s", code=code)
 
         if kind == "line":
             try:
                 return json.loads(payload)
             except json.JSONDecodeError as exc:
                 self._dead = True
+                self.error_code = "protocol_error"
                 self._kill()
                 raise SandboxError(f"plugin worker returned invalid JSON: {exc}",
-                                   code="protocol_error") from exc
+                                   code="crashed" if self.worker_unreaped else "protocol_error") from exc
         if kind == "eof":
             self._dead = True
             self._kill()
             raise self._worker_error("plugin worker exited unexpectedly (EOF)")
         if kind == "oversize":
             self._dead = True
+            self.error_code = "protocol_error"
             self._kill()
             raise SandboxError(f"plugin worker output exceeded {max_bytes} bytes",
-                               code="protocol_error")
+                               code="crashed" if self.worker_unreaped else "protocol_error")
         # kind == "error"
         self._dead = True
+        self.error_code = "protocol_error"
         self._kill()
         raise SandboxError(f"error reading plugin worker output: {payload}",
-                           code="protocol_error")
+                           code="crashed" if self.worker_unreaped else "protocol_error")
 
     def _kill(self) -> None:
         if self._proc is None:
@@ -730,7 +760,9 @@ class PluginSession:
             # プロセスグループ id。killpg で孫プロセスも道連れにする。
             os.killpg(self._proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            self.parent_kill_sent = False
+            self._reap_worker()
+            return
         deadline = time.monotonic() + _KILL_REAP_TIMEOUT_SEC
         while time.monotonic() < deadline:
             if self._reap_worker():
@@ -739,12 +771,15 @@ class PluginSession:
         self.worker_unreaped = True
         self.worker_cpu_sec = None
         self.error_code = "crashed"
-        if self not in _ORPHANS:
-            global _ORPHAN_OVERFLOW_LOGGED
-            _ORPHANS.append(self)
-            if len(_ORPHANS) > _ORPHAN_CAPACITY and not _ORPHAN_OVERFLOW_LOGGED:
-                _ORPHAN_OVERFLOW_LOGGED = True
-                _log.warning("plugin worker orphan list exceeds 64 entries")
+        self._close_parent_fds()
+        self._close_stderr()
+        with _ORPHANS_LOCK:
+            if self not in _ORPHANS:
+                global _ORPHAN_OVERFLOW_LOGGED
+                _ORPHANS.append(self)
+                if len(_ORPHANS) > _ORPHAN_CAPACITY and not _ORPHAN_OVERFLOW_LOGGED:
+                    _ORPHAN_OVERFLOW_LOGGED = True
+                    _log.warning("plugin worker orphan list exceeds 64 entries")
 
     def _reap_worker(self) -> bool:
         """Record the one authoritative wait status before any classification."""
@@ -790,11 +825,21 @@ class PluginSession:
             f.seek(max(0, size - 8192))
             raw = f.read(8192)
             text = raw.decode("utf-8", "backslashreplace")
-            escaped = "".join(ch if ch != "\\\\" and unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp"}
-                              else ch.encode("unicode_escape").decode("ascii") for ch in text)
+            escaped_parts: list[str] = []
+            escaped_size = 0
+            escaped_truncated = False
+            for ch in text:
+                unit = (ch if ch != "\\" and unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp"}
+                        else ch.encode("unicode_escape").decode("ascii"))
+                if escaped_size + len(unit.encode("utf-8")) > 8192:
+                    escaped_truncated = True
+                    break
+                escaped_parts.append(unit)
+                escaped_size += len(unit.encode("utf-8"))
+            escaped = "".join(escaped_parts)
             self.stderr_tail = escaped or None
             fields = f"plugin={self._meta.name} code={self.error_code} cpu_sec={self.worker_cpu_sec} returncode={self.worker_returncode} signal={self.worker_signal} stderr_unavailable={self.stderr_unavailable}"
-            if size > 8192:
+            if size > 8192 or escaped_truncated:
                 fields += " truncated=true"
             if escaped:
                 fields += f" stderr_tail={escaped}"

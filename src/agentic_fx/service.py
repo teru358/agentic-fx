@@ -1772,7 +1772,10 @@ def run_service(root: Path, *, daemon: bool = False,
         skipped = app.close(busy_resources=_busy_resources_after_join(
             scheduler_still_busy, supervisor_still_busy,
             improve_still_busy))
-        reap_orphans()
+        try:
+            reap_orphans()
+        except Exception:
+            _log.exception("plugin orphan reap failed during shutdown")
         if skipped:
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")

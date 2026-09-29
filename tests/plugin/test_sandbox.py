@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import os
 import signal
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -18,7 +21,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import (
     SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
-    _reader_worker, PluginSession,
+    _reader_worker, PluginSession, reap_orphans,
 )
 
 
@@ -1473,3 +1476,160 @@ def compute(df, params):
     assert "truncated=true" in records[0].message
     assert "\n" not in records[0].message
     assert marker not in str(SandboxError("ordinary failure"))
+
+
+# --- T1 remediation: terminal lifecycle and diagnostics -----------------
+
+class _CloseTrackingStream:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _PipeHandle:
+    pid = 43211
+    returncode = None
+
+    def __init__(self):
+        self.stdin = _CloseTrackingStream()
+        self.stdout = _CloseTrackingStream()
+
+
+def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
+        monkeypatch, tmp_path, plugin_settings):
+    """UNREAPED_CLOSED は一度だけ kill/reap し、以後の close は即時 return。"""
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "stopped", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    session._proc = proc
+    session._stderr_file = tempfile.TemporaryFile(mode="w+b")
+    before = len(os.listdir("/proc/self/fd"))
+    kills = []
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(os, "wait4", lambda *_: (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *args: kills.append(args))
+
+    session._kill()
+    assert session.worker_unreaped is True
+    session.close()
+    session.__exit__(None, None, None)
+    assert kills == [(proc.pid, signal.SIGKILL)]
+    assert proc.stdin.closed and proc.stdout.closed
+    assert session._stderr_file is None
+    assert len(os.listdir("/proc/self/fd")) == before - 1
+    sandbox._ORPHANS.remove(session)
+
+
+def test_killpg_esrch_rolls_back_parent_kill_and_preserves_cpu_classification(
+        monkeypatch, tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "race", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([False, True])
+
+    def reap():
+        result = next(states)
+        if result:
+            session.worker_signal = signal.SIGKILL
+            session.worker_cpu_sec = plugin_settings.sandbox_session_cpu_sec
+        return result
+
+    monkeypatch.setattr(session, "_reap_worker", reap)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
+    session._kill()
+    assert session.parent_kill_sent is False
+    assert session._worker_error("dead").code == "cpu_limit"
+
+
+def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "unreaped", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._proc.stdout.read1 = lambda _n: b""
+    monkeypatch.setattr(session, "_reap_worker", lambda: False)
+    monkeypatch.setattr(session, "_kill", lambda: setattr(session, "worker_unreaped", True))
+    with pytest.raises(SandboxError) as exc_info:
+        session._read_response(0.0, 1)
+    assert exc_info.value.code == "crashed"
+
+
+def test_reap_orphans_serializes_wait_and_removal(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "orphan", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    calls = []
+    def reap():
+        calls.append(1)
+        time.sleep(0.01)
+        return True
+    monkeypatch.setattr(session, "_reap_worker", reap)
+    sandbox._ORPHANS.append(session)
+    threads = [threading.Thread(target=reap_orphans) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert calls == [1]
+    assert session not in sandbox._ORPHANS
+
+
+def test_stderr_escape_is_bounded_after_expansion(tmp_path, plugin_settings, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "escaped", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    f = tempfile.TemporaryFile(mode="w+b")
+    f.write(b"\\" * 8192)
+    f.flush()
+    session._stderr_file = f
+    session.error_code = "protocol_error"
+    session._close_stderr()
+    assert session.stderr_tail is not None
+    assert len(session.stderr_tail.encode()) <= 8192
+    assert "truncated=true" in caplog.records[-1].message
+
+
+def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
+        monkeypatch, tmp_path, plugin_settings, caplog):
+    """protocol/plugin/startup branches retain the same internal code in logs."""
+    from agentic_fx.plugin import sandbox
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "codes", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._proc.stdin.write = lambda _data: None
+    session._proc.stdin.flush = lambda: None
+    monkeypatch.setattr(session, "_read_response", lambda *_: {"ok": False, "error": "boom"})
+    with pytest.raises(SandboxError) as plugin_error:
+        session.call({"df": _df(), "params": {}})
+    assert plugin_error.value.code == session.error_code == "plugin_error"
+
+    protocol = PluginSession(_meta(tmp_path, "protocol", "indicator", INDICATOR_OK_PY),
+                             settings=plugin_settings)
+    protocol._proc = _PipeHandle()
+    protocol._proc.stdout.read1 = lambda _n: b"{\n"
+    monkeypatch.setattr(protocol, "_reap_worker", lambda: False)
+    monkeypatch.setattr(protocol, "_kill", lambda: None)
+    with pytest.raises(SandboxError) as protocol_error:
+        protocol._read_response(0.1, 1024)
+    assert protocol_error.value.code == protocol.error_code == "protocol_error"
+    protocol._stderr_file = tempfile.TemporaryFile(mode="w+b")
+    protocol._close_stderr()
+    assert "code=protocol_error" in caplog.records[-1].message
+
+    startup = PluginSession(_meta(tmp_path, "startup", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_args, **_kwargs: _PipeHandle())
+    monkeypatch.setattr(PluginSession, "_write_line", lambda *_: None)
+    monkeypatch.setattr(PluginSession, "_read_response", lambda *_: {"ok": False, "error": "start"})
+    monkeypatch.setattr(startup, "close", lambda: None)
+    with pytest.raises(SandboxError) as startup_error:
+        startup.__enter__()
+    assert startup_error.value.code == startup.error_code == "plugin_error"
