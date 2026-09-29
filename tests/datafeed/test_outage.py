@@ -923,8 +923,12 @@ def test_flat_episode_auto_resumes_after_three_healthy_ticks(tmp_path):
         assert machine.observe(datetime(2026, 9, 24, 10, minute, tzinfo=timezone.utc), healthy) == "degraded"
     assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), healthy) == "ready"
     lines = log.tail(50)
-    assert len([line for line in lines if "datafeed_recovered_auto" in line]) == 1
+    auto_lines = [line for line in lines if "datafeed_recovered_auto" in line]
+    assert len(auto_lines) == 1
+    assert "streak=3" in auto_lines[0]
     assert not any("datafeed_recovered_awaiting_resume" in line for line in lines)
+    # 自動復帰でも「未処理足の建玉」表示のメモは手動復帰と同じく捨てる
+    assert machine._last_unprocessed_by_pair is None
 
 
 def test_auto_resume_clears_confirmed_after_two_problem_ticks(tmp_path):
