@@ -48,6 +48,7 @@ from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
 from agentic_fx.plugin import switch
+from agentic_fx.plugin.sandbox import reap_orphans
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner
@@ -1771,6 +1772,7 @@ def run_service(root: Path, *, daemon: bool = False,
         skipped = app.close(busy_resources=_busy_resources_after_join(
             scheduler_still_busy, supervisor_still_busy,
             improve_still_busy))
+        reap_orphans()
         if skipped:
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")

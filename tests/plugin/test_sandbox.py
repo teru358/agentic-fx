@@ -19,6 +19,21 @@ from agentic_fx.plugin.sandbox import (
     _reader_worker, PluginSession,
 )
 
+
+def test_sandbox_error_has_compatible_default_code():
+    assert SandboxError("unchanged message").code == "backtest_failed"
+    assert str(SandboxError("unchanged message", code="crashed")) == "unchanged message"
+
+
+def test_session_exposes_parent_observation_fields(tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "fields", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    assert session.worker_returncode is None
+    assert session.worker_signal is None
+    assert session.worker_cpu_sec is None
+    assert session.parent_kill_sent is False
+    assert session.worker_unreaped is False
+
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 SAMPLES = Path(__file__).resolve().parents[2] / "docs" / "examples" / "plugins"
 

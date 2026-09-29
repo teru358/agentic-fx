@@ -97,6 +97,8 @@ def _set_resource_limits(cpu_sec: int, memory_mb: int, nofile: int,
                           fsize_mb: int) -> None:
     cpu = int(cpu_sec)
     resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
+    # Core images may expose plugin data outside the protocol boundary.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
     mem_bytes = int(memory_mb) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
