@@ -1,5 +1,6 @@
 ---
 id: a23c-lite-auto-resume-when-flat
+title: 建玉・指値ゼロの episode は degraded から自動で ready に戻す
 status: 是正済
 priority: 高
 opened: 2026-09-29
@@ -23,4 +24,4 @@ source_section: 是正済み
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-09-30: 題名: 建玉・指値ゼロの episode は degraded から自動で ready に戻す — 実機受入 合格: 9/29 21:17 UTC datafeed_degraded (epoch 3、1m 停滞) → 21:33 datafeed_recovered_auto (streak 3、人手なし) → 21:36 mission 再開
