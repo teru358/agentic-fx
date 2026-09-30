@@ -1929,6 +1929,60 @@ def test_timeout_uses_reaped_esrch_worker_classification(monkeypatch, tmp_path,
     assert error.value.code == session.error_code == "cpu_limit"
 
 
+def test_timeout_reclassifies_worker_reaped_before_kill(monkeypatch, tmp_path,
+                                                        plugin_settings):
+    session = PluginSession(_meta(tmp_path, "deadline-race", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([0, 0, session._proc.pid])
+
+    class Usage:
+        ru_utime = plugin_settings.sandbox_session_cpu_sec
+        ru_stime = 0.0
+
+    def wait4(pid, _flags):
+        result = next(states)
+        return (result, signal.SIGKILL if result else 0, Usage() if result else None)
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    with pytest.raises(SandboxError) as error:
+        session._read_response(0.0, 1)
+    assert error.value.code == session.error_code == "cpu_limit"
+    assert session.parent_kill_sent is False
+
+
+def test_closed_session_cannot_be_entered_again(tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "closed-reenter", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session.__enter__()
+    session.close()
+    before = (session._proc, bytes(session._stdout_buffer), session.worker_returncode,
+              session.worker_signal, session.worker_cpu_sec)
+    try:
+        with pytest.raises(SandboxError, match="session cannot be reused"):
+            session.__enter__()
+    finally:
+        session.close()
+    assert (session._proc, bytes(session._stdout_buffer), session.worker_returncode,
+            session.worker_signal, session.worker_cpu_sec) == before
+
+
+def test_live_session_cannot_be_entered_twice(tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "live-reenter", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session.__enter__()
+    proc = session._proc
+    assert proc is not None
+    try:
+        with pytest.raises(SandboxError, match="session cannot be reused"):
+            session.__enter__()
+        assert session._proc is proc
+        os.kill(proc.pid, 0)
+    finally:
+        session.close()
+
+
 def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_path,
                                                             plugin_settings):
     from agentic_fx.plugin import sandbox

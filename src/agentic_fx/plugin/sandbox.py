@@ -386,6 +386,7 @@ class PluginSession:
         self._stdin_fd: int | None = None
         self._stdout_fd: int | None = None
         self._stdout_buffer = bytearray()
+        self._started = False
         # プラン 8 B 束: PluginSession は単一スレッド所有が前提
         # (全使用箇所が単一スレッド — ロックは追加しない)。construction
         # したスレッドを記録し、実行時 assert で境界越えを検出する。
@@ -442,6 +443,9 @@ class PluginSession:
         不注意な plugin コードの事故を防ぐことが目的) の範囲では許容する。
         """
         self._check_owner_thread()
+        if self._started:
+            raise SandboxError("plugin session cannot be reused")
+        self._started = True
         try:
             current_hash = content_hash(self._meta.path)
             if current_hash != self._meta.content_hash:
@@ -806,11 +810,11 @@ class PluginSession:
         raise SandboxError(message, code="protocol_error")
 
     def _kill(self) -> bool:
-        """Kill the process group and report an ESRCH race that was reaped."""
+        """Kill the process group and report a reap completed without parent kill."""
         if self._proc is None:
             return False
         if self._reap_worker():
-            return False
+            return True
         self.parent_kill_sent = True
         esrch = False
         # The legacy property intentionally keeps its old timeout contract.
