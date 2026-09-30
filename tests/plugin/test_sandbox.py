@@ -1336,6 +1336,9 @@ def test_internal_lifecycle_constants_are_fixed():
     assert sandbox._KILL_REAP_TIMEOUT_SEC == 5.0
     assert sandbox._CPU_TOLERANCE_SEC == 0.05
     assert sandbox._ORPHAN_CAPACITY == 64
+    assert sandbox._STARTUP_MAX_BYTES == 65536
+    assert sandbox._EOF_REAP_GRACE_SEC == 1.0
+    assert sandbox._EOF_REAP_POLL_SEC == 0.002
 
 
 def test_worker_sets_requested_cpu_limit_and_core_limit(monkeypatch):
@@ -1429,6 +1432,21 @@ def compute(df, params):
 
 
 # --- T1 remediation: terminal lifecycle and diagnostics -----------------
+
+@pytest.fixture(autouse=True)
+def _stand_in_pids_look_like_live_children(monkeypatch):
+    """`_PipeHandle` の pid は実在しない。wait4 が ChildProcessError (回収済み
+    扱い) を返すと終端になるので、明示的に wait4 を差し替えないテストでは
+    「まだ生きている子」に見せる。"""
+    real_wait4 = os.wait4
+
+    def wait4(pid, flags):
+        if pid == _PipeHandle.pid:
+            return (0, 0, None)
+        return real_wait4(pid, flags)
+
+    monkeypatch.setattr(os, "wait4", wait4)
+
 
 class _PipeHandle:
     pid = 43211
@@ -2011,7 +2029,8 @@ def test_popen_failure_code_matches_session(monkeypatch, tmp_path, plugin_settin
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("no exec")))
     with pytest.raises(SandboxError) as error:
         session.__enter__()
-    assert error.value.code == session.error_code
+    assert error.value.code == "backtest_failed"
+    assert session.error_code == "backtest_failed"
 
 
 def test_reap_orphans_serializes_wait_and_removal(monkeypatch, tmp_path, plugin_settings):
@@ -2393,7 +2412,7 @@ def test_killpg_permission_failure_is_not_recorded_as_a_parent_kill(
     monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(PermissionError()))
-    assert session._kill() is False
+    assert session._kill() is True
     assert session.parent_kill_sent is False
     assert session._worker_error("dead").code == "cpu_limit"
 
@@ -2457,6 +2476,8 @@ def test_eof_from_a_worker_that_is_still_alive_kills_it(monkeypatch, tmp_path,
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
                                                         "eof-alive")
     kills = []
+    from agentic_fx.plugin import sandbox
+    monkeypatch.setattr(sandbox, "_EOF_REAP_GRACE_SEC", 0.01)
     monkeypatch.setattr(time, "sleep", lambda _: None)
     monkeypatch.setattr(session, "_reap_worker", lambda: False)
     monkeypatch.setattr(session, "_kill", lambda: kills.append(1) or False)
@@ -2540,3 +2561,327 @@ def test_close_of_a_dead_session_sends_no_close_request(monkeypatch, tmp_path,
     monkeypatch.setattr(session, "_write_line", lambda obj: sent.append(obj))
     session.close()
     assert sent == []
+
+
+# --- stderr tail keeps the newest lines ----------------------------------
+
+def _session_with_stderr(tmp_path, plugin_settings, name, data: bytes):
+    session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    f = tempfile.TemporaryFile(mode="w+b")
+    f.write(data)
+    f.flush()
+    session._stderr_file = f
+    session.error_code = "crashed"
+    return session
+
+
+def test_stderr_tail_keeps_the_last_line_of_a_long_multiline_traceback(
+        tmp_path, plugin_settings, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    last = "ZeroDivisionError: unique-final-exception-line"
+    lines = [f"  File \"frame_{i:05d}.py\", line {i}, in step\n" for i in range(400)]
+    data = ("Traceback (most recent call last):\n" + "".join(lines) + last + "\n").encode()
+    assert len(data) > 16000
+    session = _session_with_stderr(tmp_path, plugin_settings, "tail-last", data)
+    session._close_stderr()
+    assert session.stderr_tail is not None
+    assert len(session.stderr_tail.encode("utf-8")) <= 8192
+    assert session.stderr_tail.endswith(last + "\\n")
+    assert "Traceback (most" not in session.stderr_tail
+    message = caplog.records[-1].message
+    assert "truncated=true" in message
+    assert last in message
+
+
+def test_stderr_tail_drops_whole_escape_units_from_the_head(tmp_path, plugin_settings,
+                                                           caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = _session_with_stderr(tmp_path, plugin_settings, "tail-units",
+                                   b"\x1b" * 3000)
+    session._close_stderr()
+    tail = session.stderr_tail
+    assert tail is not None
+    assert len(tail.encode("utf-8")) == 8192
+    assert set(tail.split("\\x1b")) == {""}
+    assert "truncated=true" in caplog.records[-1].message
+
+
+def test_stderr_tail_that_fits_is_not_marked_truncated(tmp_path, plugin_settings, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = _session_with_stderr(tmp_path, plugin_settings, "tail-fits", b"short\n")
+    session._close_stderr()
+    assert session.stderr_tail == "short\\n"
+    assert "truncated" not in caplog.records[-1].message
+
+
+# --- grace period after stdout EOF -------------------------------------
+
+def _eof_session(tmp_path, plugin_settings, name):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings, name)
+    os.close(writer)
+    return session
+
+
+def test_worker_reaped_a_while_after_eof_keeps_its_cpu_limit_classification(
+        monkeypatch, tmp_path, plugin_settings):
+    session = _eof_session(tmp_path, plugin_settings, "eof-late-cpu")
+    calls = []
+
+    class Usage:
+        ru_utime = float(plugin_settings.sandbox_session_cpu_sec)
+        ru_stime = 0.0
+
+    def wait4(pid, _flags):
+        calls.append(pid)
+        if len(calls) <= 31:
+            return (0, 0, None)
+        return (pid, signal.SIGKILL, Usage())
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(5.0, 64)
+        assert error.value.code == session.error_code == "cpu_limit"
+        assert session.parent_kill_sent is False
+        assert len(calls) == 32
+    finally:
+        session._close_parent_fds()
+
+
+def test_worker_alive_past_the_eof_grace_is_killed(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = _eof_session(tmp_path, plugin_settings, "eof-grace-over")
+    monkeypatch.setattr(sandbox, "_EOF_REAP_GRACE_SEC", 0.05)
+    killed = {"value": False}
+    kills = []
+
+    class Usage:
+        ru_utime = 0.0
+        ru_stime = 0.0
+
+    def wait4(pid, _flags):
+        return (pid, 0, Usage()) if killed["value"] else (0, 0, None)
+
+    def killpg(*args):
+        kills.append(args)
+        killed["value"] = True
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", killpg)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(5.0, 64)
+        assert error.value.code == "crashed"
+        assert len(kills) == 1
+        assert time.monotonic() - started >= 0.05
+    finally:
+        session._close_parent_fds()
+
+
+def test_eof_grace_never_extends_past_the_call_deadline(monkeypatch, tmp_path,
+                                                        plugin_settings):
+    session = _eof_session(tmp_path, plugin_settings, "eof-deadline")
+    monkeypatch.setattr(os, "wait4", lambda *_: (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
+    monkeypatch.setattr("agentic_fx.plugin.sandbox._KILL_REAP_TIMEOUT_SEC", 0.0)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SandboxError):
+            session._read_response(0.2, 64)
+        assert time.monotonic() - started < 0.6
+    finally:
+        session._close_parent_fds()
+        from agentic_fx.plugin import sandbox
+        if session in sandbox._ORPHANS:
+            sandbox._ORPHANS.remove(session)
+
+
+# --- stderr content never reaches exceptions ---------------------------
+
+_MARKER = "stderr-leak-marker-7f3a"
+
+_LEAK_CRASH_PY = f"""
+def compute(df, params):
+    print({_MARKER!r}, flush=True)
+    n = 0
+    while True:
+        n += 1
+"""
+
+_LEAK_TIMEOUT_PY = f"""
+def compute(df, params):
+    print({_MARKER!r}, flush=True)
+    while True:
+        pass
+"""
+
+_LEAK_PLUGIN_ERROR_PY = f"""
+def compute(df, params):
+    print({_MARKER!r}, flush=True)
+    raise ValueError("ordinary plugin failure")
+"""
+
+
+@pytest.mark.parametrize("shape, source, updates", [
+    ("cpu-limit", _LEAK_CRASH_PY, {"sandbox_session_cpu_sec": 1, "sandbox_timeout_sec": 5.0}),
+    ("timeout", _LEAK_TIMEOUT_PY, {"sandbox_session_cpu_sec": 10, "sandbox_timeout_sec": 0.5}),
+    ("plugin-error", _LEAK_PLUGIN_ERROR_PY, {}),
+])
+def test_worker_stderr_reaches_only_the_technical_log(tmp_path, plugin_settings, caplog,
+                                                      shape, source, updates):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    settings = plugin_settings.model_copy(update=updates)
+    session = PluginSession(_meta(tmp_path, f"leak-{shape}", "indicator", source),
+                            settings=settings)
+    with pytest.raises(SandboxError) as error:
+        with session:
+            session.call({"df": _df(), "params": {}})
+    exc = error.value
+    surfaces = [str(exc), repr(exc), repr(exc.args), str(exc.code)]
+    for chained in (exc.__cause__, exc.__context__):
+        if chained is not None:
+            surfaces += [str(chained), repr(chained)]
+    for name, value in vars(session).items():
+        if not name.startswith("_") and name != "stderr_tail":
+            surfaces.append(f"{name}={value!r}")
+    assert all(_MARKER not in text for text in surfaces)
+    assert session.stderr_tail is not None and _MARKER in session.stderr_tail
+    records = [r for r in caplog.records
+               if r.name.endswith("sandbox") and _MARKER in r.getMessage()]
+    assert len(records) == 1
+    assert [r for r in caplog.records if r.name.endswith("sandbox")] == records
+
+
+# --- worker already collected by someone else --------------------------
+
+def test_child_collected_elsewhere_is_terminal_without_waiting(monkeypatch, tmp_path,
+                                                               plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "collected", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._dead = True
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    started = time.monotonic()
+    session.close()
+    assert time.monotonic() - started < 0.25
+    assert session.worker_unreaped is False
+    assert sandbox._ORPHANS == []
+    assert session.worker_returncode is None
+    assert session.worker_signal is None
+    assert session.worker_cpu_sec is None
+    assert session._worker_error("gone").code == "crashed"
+
+
+def test_orphan_collected_elsewhere_leaves_the_orphan_list(monkeypatch, tmp_path,
+                                                           plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "orphan-collected", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session.worker_unreaped = True
+    monkeypatch.setattr(sandbox, "_ORPHANS", [session])
+    monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    reap_orphans()
+    assert sandbox._ORPHANS == []
+
+
+# --- kill could not be sent but the worker was reaped -------------------
+
+@pytest.mark.parametrize("failure", [PermissionError(), OSError(5, "io error")])
+def test_deadline_with_failed_kill_and_reaped_worker_uses_worker_classification(
+        monkeypatch, tmp_path, plugin_settings, failure):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "kill-failed-reaped", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([False, False, False, True])
+
+    def reap():
+        if not next(states):
+            return False
+        session.worker_signal = signal.SIGKILL
+        session.worker_cpu_sec = 0.0
+        return True
+
+    monkeypatch.setattr(session, "_reap_worker", reap)
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(failure))
+    with pytest.raises(SandboxError) as error:
+        session._read_response(0.0, 1)
+    assert error.value.code == "crashed"
+    assert session.error_code == "crashed"
+    assert session.parent_kill_sent is False
+
+
+# --- startup response size limit ---------------------------------------
+
+def _startup_session(monkeypatch, tmp_path, plugin_settings, name, total_bytes):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    read_fd, writer = os.pipe()
+    proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
+    killed = {"value": False}
+
+    class Usage:
+        ru_utime = 0.0
+        ru_stime = 0.0
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(os, "wait4",
+                        lambda pid, _f: (pid, 0, Usage()) if killed["value"] else (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    head = b'{"ok": true, "pid": 4242, "pad": "'
+    tail = b'"}\n'
+    session._stdout_buffer.extend(head + b"x" * (total_bytes - len(head) - len(tail)) + tail)
+    assert len(session._stdout_buffer) == total_bytes
+    return session, writer
+
+
+def test_startup_response_at_the_size_limit_is_accepted(monkeypatch, tmp_path,
+                                                        plugin_settings):
+    session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
+                                       "startup-exact", 65536)
+    try:
+        assert session.__enter__() is session
+        assert session.pid == 4242
+    finally:
+        os.close(writer)
+        session._dead = True
+        session.close()
+
+
+def test_valid_startup_response_one_byte_over_the_limit_is_protocol_error(
+        monkeypatch, tmp_path, plugin_settings):
+    session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
+                                       "startup-over", 65537)
+    try:
+        with pytest.raises(SandboxError) as error:
+            session.__enter__()
+        assert error.value.code == session.error_code == "protocol_error"
+    finally:
+        os.close(writer)

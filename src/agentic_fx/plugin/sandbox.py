@@ -330,6 +330,11 @@ _STARTUP_TIMEOUT_SEC = 30.0
 _STARTUP_MAX_BYTES = 65536
 _CPU_TOLERANCE_SEC = 0.05
 _KILL_REAP_TIMEOUT_SEC = 5.0
+# stdout が EOF になっても、worker の終了状態が wait4 で見えるまで数 ms 遅れる
+# ことがある。ここで待たずに kill すると CPU 上限死が親 kill (crashed) に
+# 化けるので、呼び出しの deadline を超えない範囲でこの時間だけ回収を待つ。
+_EOF_REAP_GRACE_SEC = 1.0
+_EOF_REAP_POLL_SEC = 0.002
 _ORPHAN_CAPACITY = 64
 _ORPHANS: list["PluginSession"] = []
 _ORPHAN_OVERFLOW_LOGGED = False
@@ -380,6 +385,7 @@ class PluginSession:
         self.worker_cpu_sec: float | None = None
         self.parent_kill_sent = False
         self.worker_unreaped = False
+        self._collected_elsewhere = False
         self.error_code: str | None = None
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
@@ -666,10 +672,10 @@ class PluginSession:
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
-            recovered_after_esrch = self._kill()
+            recovered_without_kill = self._kill()
             if self.worker_unreaped:
                 code = "crashed"
-            elif recovered_after_esrch:
+            elif recovered_without_kill:
                 code = self._worker_error(
                     "plugin worker exited unexpectedly (EOF)").code
             else:
@@ -759,11 +765,11 @@ class PluginSession:
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
                 self._dead = True
                 self.error_code = "timeout"
-                recovered_after_esrch = self._kill()
+                recovered_without_kill = self._kill()
                 if self.worker_unreaped:
                     raise SandboxError(
                         f"plugin call timed out after {timeout_sec}s", code="crashed")
-                if recovered_after_esrch:
+                if recovered_without_kill:
                     raise self._worker_error(
                         "plugin worker exited unexpectedly (EOF)")
                 raise SandboxError(f"plugin call timed out after {timeout_sec}s", code="timeout")
@@ -789,11 +795,14 @@ class PluginSession:
                             f"error reading plugin worker output: {exc}")
                     if not chunk:
                         self._dead = True
-                        for _ in range(5):
+                        grace_end = min(deadline, time.monotonic() + _EOF_REAP_GRACE_SEC)
+                        while True:
                             if self._reap_worker():
                                 raise self._worker_error(
                                     "plugin worker exited unexpectedly (EOF)")
-                            time.sleep(0.001)
+                            if time.monotonic() >= grace_end:
+                                break
+                            time.sleep(_EOF_REAP_POLL_SEC)
                         self._kill()
                         raise self._worker_error(
                             "plugin worker exited unexpectedly (EOF)")
@@ -802,21 +811,24 @@ class PluginSession:
     def _protocol_failure(self, message: str) -> dict[str, Any]:
         self._dead = True
         self.error_code = "protocol_error"
-        recovered_after_esrch = self._kill()
+        recovered_without_kill = self._kill()
         if self.worker_unreaped:
             raise SandboxError(message, code="crashed")
-        if recovered_after_esrch:
+        if recovered_without_kill:
             raise self._worker_error("plugin worker exited unexpectedly (EOF)")
         raise SandboxError(message, code="protocol_error")
 
     def _kill(self) -> bool:
-        """Kill the process group and report a reap completed without parent kill."""
+        """Kill the process group and report a reap completed without parent kill.
+
+        killpg が ESRCH 以外 (EPERM 等) で失敗した場合も、kill を送れずに回収
+        できたなら親 kill による死ではないので同じ扱いにする。"""
         if self._proc is None:
             return False
         if self._reap_worker():
             return True
         self.parent_kill_sent = True
-        esrch = False
+        kill_not_sent = False
         # The legacy property intentionally keeps its old timeout contract.
         self._cpu_sec = None
         try:
@@ -825,13 +837,14 @@ class PluginSession:
             os.killpg(self._proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             self.parent_kill_sent = False
-            esrch = True
-        except (PermissionError, OSError):
+            kill_not_sent = True
+        except OSError:
             self.parent_kill_sent = False
+            kill_not_sent = True
         deadline = time.monotonic() + _KILL_REAP_TIMEOUT_SEC
         while time.monotonic() < deadline:
             if self._reap_worker():
-                return esrch
+                return kill_not_sent
             time.sleep(0.01)
         self.worker_unreaped = True
         self.worker_cpu_sec = None
@@ -850,12 +863,15 @@ class PluginSession:
     def _reap_worker(self) -> bool:
         """Record the one authoritative wait status before any classification."""
         proc = self._proc
-        if proc is None or self.worker_returncode is not None:
-            return self.worker_returncode is not None
+        if proc is None or self.worker_returncode is not None or self._collected_elsewhere:
+            return self.worker_returncode is not None or self._collected_elsewhere
         try:
             pid, status, usage = os.wait4(proc.pid, os.WNOHANG)
         except ChildProcessError:
-            return False
+            # SIGCHLD=SIG_IGN や他の waiter が先に回収済み。終了状態は分から
+            # ないが、待ち続けても永久に回収できないので終端として扱う。
+            self._collected_elsewhere = True
+            return True
         if pid == 0:
             return False
         rc = os.waitstatus_to_exitcode(status)
@@ -891,10 +907,12 @@ class PluginSession:
             f.seek(max(0, size - 8192))
             raw = f.read(8192)
             text = raw.decode("utf-8", "backslashreplace")
+            # 診断で最も価値があるのは末尾 (最後の例外行) なので、escape で
+            # 上限を超える分は先頭側から落とす。escape 単位は壊さない。
             escaped_parts: list[str] = []
             escaped_size = 0
             escaped_truncated = False
-            for ch in text:
+            for ch in reversed(text):
                 unit = (ch if ch != "\\" and unicodedata.category(ch) not in {"Cc", "Cf", "Zl", "Zp"}
                         else ch.encode("unicode_escape").decode("ascii"))
                 if escaped_size + len(unit.encode("utf-8")) > 8192:
@@ -902,7 +920,7 @@ class PluginSession:
                     break
                 escaped_parts.append(unit)
                 escaped_size += len(unit.encode("utf-8"))
-            escaped = "".join(escaped_parts)
+            escaped = "".join(reversed(escaped_parts))
             self.stderr_tail = escaped or None
             fields = f"plugin={self._meta.name} code={self.error_code} cpu_sec={self.worker_cpu_sec} returncode={self.worker_returncode} signal={self.worker_signal} stderr_unavailable={self.stderr_unavailable}"
             if size > 8192 or escaped_truncated:
