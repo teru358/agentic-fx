@@ -2308,3 +2308,235 @@ def test_unreaped_child_is_later_collected_from_orphan_list(monkeypatch, tmp_pat
     reap_orphans()
     assert session not in sandbox._ORPHANS
     assert sum("plugin worker orphan reaped" in rec.message for rec in caplog.records) == 1
+
+
+# --- lifecycle edges that the broader tests leave unobserved -------------
+
+
+def _stuck_child_session(monkeypatch, tmp_path, plugin_settings, name):
+    from agentic_fx.plugin import sandbox
+
+    item = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                         settings=plugin_settings)
+    item._proc = _PipeHandle()
+    monkeypatch.setattr(item, "_reap_worker", lambda: False)
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    return item
+
+
+def test_orphan_warning_appears_only_after_the_list_exceeds_capacity(
+        monkeypatch, tmp_path, plugin_settings, caplog):
+    from agentic_fx.plugin import sandbox
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agentic_fx.plugin.sandbox")
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    monkeypatch.setattr(sandbox, "_ORPHAN_OVERFLOW_LOGGED", False)
+
+    def warnings():
+        return sum("exceeds 64 entries" in record.message for record in caplog.records)
+
+    for number in range(64):
+        _stuck_child_session(monkeypatch, tmp_path, plugin_settings,
+                             f"full-{number}")._kill()
+    assert len(sandbox._ORPHANS) == 64
+    assert warnings() == 0
+    _stuck_child_session(monkeypatch, tmp_path, plugin_settings, "over-1")._kill()
+    assert warnings() == 1
+    _stuck_child_session(monkeypatch, tmp_path, plugin_settings, "over-2")._kill()
+    assert len(sandbox._ORPHANS) == 66
+    assert warnings() == 1
+
+
+def test_killing_an_unreaped_session_twice_lists_it_once(monkeypatch, tmp_path,
+                                                         plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    session = _stuck_child_session(monkeypatch, tmp_path, plugin_settings, "twice")
+    session._kill()
+    session._kill()
+    assert sandbox._ORPHANS == [session]
+
+
+def test_reap_orphans_collects_every_reapable_session_in_one_pass(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    sessions = [PluginSession(_meta(tmp_path, f"pass-{n}", "indicator", INDICATOR_OK_PY),
+                              settings=plugin_settings) for n in range(3)]
+    for session in sessions:
+        monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    monkeypatch.setattr(sandbox, "_ORPHANS", list(sessions))
+    reap_orphans()
+    assert sandbox._ORPHANS == []
+
+
+def test_killpg_permission_failure_is_not_recorded_as_a_parent_kill(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "eperm-later-reap", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([False, False, True])
+
+    def reap():
+        if not next(states):
+            return False
+        session.worker_signal = signal.SIGKILL
+        session.worker_cpu_sec = plugin_settings.sandbox_session_cpu_sec
+        return True
+
+    monkeypatch.setattr(session, "_reap_worker", reap)
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(PermissionError()))
+    assert session._kill() is False
+    assert session.parent_kill_sent is False
+    assert session._worker_error("dead").code == "cpu_limit"
+
+
+def test_exact_limit_without_newline_is_rejected_at_once_not_as_timeout(
+        monkeypatch, tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "limit-no-newline")
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    try:
+        os.write(writer, b"a" * 8)
+        started = time.monotonic()
+        with pytest.raises(SandboxError) as error:
+            session._read_response(5.0, 8)
+        assert error.value.code == "protocol_error"
+        assert time.monotonic() - started < 2.0
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_dead_worker_holding_stdout_open_is_noticed_within_a_second(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    program = '''import os, sys, time
+sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\\n' % os.getpid()); sys.stdout.flush()
+sys.stdin.readline()
+sys.stdin.readline()
+if os.fork() == 0:
+    time.sleep(10)
+os._exit(0)
+'''
+    real_popen = subprocess.Popen
+
+    def start_worker(*args, **kwargs):
+        return real_popen([sys.executable, "-c", program], stdin=kwargs["stdin"],
+                          stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    session = PluginSession(_meta(tmp_path, "prompt-death", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    try:
+        session.__enter__()
+        started = time.monotonic()
+        with pytest.raises(SandboxError):
+            session.call({"df": _df(), "params": {}})
+        assert time.monotonic() - started < 1.0
+    finally:
+        if session.pid is not None:
+            try:
+                os.killpg(session.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        session.close()
+
+
+def test_eof_from_a_worker_that_is_still_alive_kills_it(monkeypatch, tmp_path,
+                                                        plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "eof-alive")
+    kills = []
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(session, "_reap_worker", lambda: False)
+    monkeypatch.setattr(session, "_kill", lambda: kills.append(1) or False)
+    os.close(writer)
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(2.0, 64)
+        assert error.value.code == "crashed"
+        assert kills == [1]
+    finally:
+        session._close_parent_fds()
+
+
+def test_timeout_is_recorded_on_the_session_itself(monkeypatch, tmp_path,
+                                                   plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "timeout-code")
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.05, 64)
+        assert error.value.code == "timeout"
+        assert session.error_code == "timeout"
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+@pytest.mark.parametrize("char, escaped", [
+    ("\\", "\\\\"),
+    ("\x1b", "\\x1b"),
+    ("​", "\\u200b"),
+    ("‮", "\\u202e"),
+    (" ", "\\u2028"),
+    (" ", "\\u2029"),
+])
+def test_stderr_tail_escapes_each_dangerous_character_class(tmp_path, plugin_settings,
+                                                            caplog, char, escaped):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "escape-class", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    f = tempfile.TemporaryFile(mode="w+b")
+    f.write(("before" + char + "after").encode("utf-8"))
+    f.flush()
+    session._stderr_file = f
+    session.error_code = "crashed"
+    session._close_stderr()
+    assert session.stderr_tail == "before" + escaped + "after"
+    assert char == "\\" or char not in caplog.records[-1].message
+    assert "stderr_tail=before" + escaped + "after" in caplog.records[-1].message
+
+
+def test_close_keeps_an_unreaped_worker_reachable_for_a_later_collection(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    session = _stuck_child_session(monkeypatch, tmp_path, plugin_settings, "close-orphan")
+    proc = session._proc
+    session._dead = True
+    session.close()
+    assert session.worker_unreaped is True
+    assert session._proc is proc
+    assert sandbox._ORPHANS == [session]
+    monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    reap_orphans()
+    assert sandbox._ORPHANS == []
+
+
+def test_close_of_a_dead_session_sends_no_close_request(monkeypatch, tmp_path,
+                                                        plugin_settings):
+    session = PluginSession(_meta(tmp_path, "dead-close", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._dead = True
+    sent = []
+    monkeypatch.setattr(session, "_reap_worker", lambda: False)
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    monkeypatch.setattr(session, "_write_line", lambda obj: sent.append(obj))
+    session.close()
+    assert sent == []
