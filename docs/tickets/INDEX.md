@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 132 件。完了分は CLOSED.md。
+未完了: 134 件。完了分は CLOSED.md。
 
 ## 実装中 (7)
 
@@ -42,7 +42,7 @@
 | [gate-noop-followup](gate-noop-followup.md) | 未設定 |  | 現行 note 化されていない fact 行が残る間は選択され得る (裁定待ち)。次回 E2E で `kind` 必須… |
 | [improve-mission-zero-tool-calls-undetected](improve-mission-zero-tool-calls-undetected.md) | 未設定 |  | registry の tool 呼び出し 0 件で終端した improve mission が「agent が自主的に… |
 
-## 設計待ち (108)
+## 設計待ち (110)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -63,6 +63,7 @@
 | [live-storage-source-mapping-scattered](live-storage-source-mapping-scattered.md) | 中 | 2026-09-28 | primary → ライブ保存名 (`mt5` → `mt5-live`) の写像が 8 箇所に散在 (service… |
 | [signal-producer-catchup-requires-latest-tail](signal-producer-catchup-requires-latest-tail.md) | 中 | 2026-09-28 | producer は過去 bucket を順に評価 (`signal_producer.py:195`) しながら、毎… |
 | [trade-cron-hybrid-mode](trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
+| [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 中 | 2026-09-30 | worker 応答の pid と error 文字列が無検証で session とログに入る |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [reject-revert-without-live-classification](reject-revert-without-live-classification.md) | 低 | 2026-09-20 | `reject_candidate` (`switch.py:1866-1875`) は自分の未完 journal が… |
@@ -70,6 +71,7 @@
 | [trade-prompt-says-hourly](trade-prompt-says-hourly.md) | 低 | 2026-09-28 | 取引判断 prompt の冒頭「1 時間毎に呼び出され」が固定文言のまま (判断足 15m では 15 分毎)。`de… |
 | [outage-observe-closed-guard-unpinned](outage-observe-closed-guard-unpinned.md) | 低 | 2026-09-29 | `OutageStateMachine.observe` の「閉場中は観測しない」early return を落として… |
 | [signal-producer-hourly-warning-before-confirmation](signal-producer-hourly-warning-before-confirmation.md) | 低 | 2026-09-29 | producer が毎時 xx:00:07 の tick で「1h bucket not yet present」を … |
+| [sandbox-lifecycle-minor-followups](sandbox-lifecycle-minor-followups.md) | 低 | 2026-09-30 | worker 観測境界の残り: ready 直後の死亡で code が割れる、細部の未 pin |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [credentials-file-copied-unused](credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |

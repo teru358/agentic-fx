@@ -2,11 +2,12 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-09 (33)
+## 2026-09 (34)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
 | [ticket-cli-and-index-split](ticket-cli-and-index-split.md) | 是正済 | 中 | 2026-09-30 | チケット操作を plugin tickets に移し、完了分を CLOSED.md へ分離 |
+| [worker-death-cause-observed-by-parent](worker-death-cause-observed-by-parent.md) | 是正済 | 高 | 2026-09-30 | plugin worker の死因を親プロセスで固定して読めるようにする |
 | [a23c-lite-auto-resume-when-flat](a23c-lite-auto-resume-when-flat.md) | 是正済 | 高 | 2026-09-29 | 建玉・指値ゼロの episode は degraded から自動で ready に戻す |
 | [expire-stale-activity-in-store](expire-stale-activity-in-store.md) | 是正済 | 未設定 | 2026-09-28 | / [friday-cutoff-validation] / [cli-bless-runtime-error-tra… |
 | [outage-stalled-ignores-closed-hours](outage-stalled-ignores-closed-hours.md) | 是正済 | 未設定 | 2026-09-28 | / [settings-example-deprecated-keys] **是正済 main `ed2de56` (… |
