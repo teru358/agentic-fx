@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1325,6 +1327,8 @@ class _NoWaitProcess:
     def __init__(self, pid=43210):
         self.pid = pid
         self.returncode = None
+        self.stdin = None
+        self.stdout = None
 
     def wait(self, *args, **kwargs):
         pytest.fail("Popen.wait must not be used")
@@ -1633,3 +1637,214 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     with pytest.raises(SandboxError) as startup_error:
         startup.__enter__()
     assert startup_error.value.code == startup.error_code == "plugin_error"
+
+
+def test_close_response_cpu_is_ignored_in_favor_of_wait4(monkeypatch, tmp_path,
+                                                          plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "reported-cpu", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._proc.stdin.write = lambda _data: None
+    session._proc.stdin.flush = lambda: None
+    session._read_response = lambda *_: {"ok": True, "cpu_sec": 999}
+    calls = 0
+
+    class Usage:
+        ru_utime = 1.0
+        ru_stime = 0.25
+
+    def wait4(pid, flags):
+        nonlocal calls
+        calls += 1
+        return (0, 0, None) if calls == 1 else (pid, 0, Usage())
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    session.close()
+    assert session.worker_cpu_sec == pytest.approx(1.25)
+    assert session.cpu_sec == pytest.approx(1.25)
+
+
+@pytest.mark.parametrize("route", ["close", "timeout", "eof", "startup"])
+def test_lifecycle_routes_use_one_wait4_without_popen_wait_apis(
+        monkeypatch, tmp_path, plugin_settings, route):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, f"single-{route}", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _NoWaitProcess(7100)
+    session._proc = proc
+    calls = []
+
+    class Usage:
+        ru_utime = 0.0
+        ru_stime = 0.0
+
+    def wait4(pid, flags):
+        calls.append((pid, flags))
+        if len(calls) > 1:
+            pytest.fail("one pid must not be waited twice")
+        return pid, 0, Usage()
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    if route == "close":
+        session.close()
+    elif route == "timeout":
+        session._kill()
+    elif route == "eof":
+        assert session._reap_worker()
+        assert session._worker_error("eof").code == "crashed"
+    else:
+        assert session._reap_worker()
+    assert calls == [(7100, os.WNOHANG)]
+
+
+def test_dead_worker_is_observed_before_stdout_holding_grandchild(monkeypatch, tmp_path,
+                                                                  plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    program = '''import os, sys, time
+sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\\n' % os.getpid()); sys.stdout.flush()
+if os.fork() == 0:
+    time.sleep(10)
+os._exit(0)
+'''
+    real_popen = subprocess.Popen
+
+    def start_worker(*args, **kwargs):
+        return real_popen([sys.executable, "-c", program], stdin=kwargs["stdin"],
+                          stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    session = PluginSession(_meta(tmp_path, "stdout-grandchild", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    try:
+        session.__enter__()
+        with pytest.raises(SandboxError) as exc_info:
+            session.call({"df": _df(), "params": {}})
+        assert exc_info.value.code == "crashed"
+        assert session.parent_kill_sent is False
+    finally:
+        if session.pid is not None:
+            try:
+                os.killpg(session.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        session.close()
+
+
+def test_deadline_only_marks_timeout_when_worker_is_still_alive(monkeypatch, tmp_path,
+                                                                plugin_settings):
+    class BlockingStream:
+        def read1(self, _size):
+            threading.Event().wait(1)
+
+    session = PluginSession(_meta(tmp_path, "deadline", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._proc.stdout = BlockingStream()
+    states = iter([True])
+    monkeypatch.setattr(session, "_reap_worker", lambda: next(states))
+    with pytest.raises(SandboxError) as dead:
+        session._read_response(0.0, 1)
+    assert dead.value.code == "crashed"
+    assert session.parent_kill_sent is False
+
+    live = PluginSession(_meta(tmp_path, "deadline-live", "indicator", INDICATOR_OK_PY),
+                         settings=plugin_settings)
+    live._proc = _PipeHandle()
+    live._proc.stdout = BlockingStream()
+    monkeypatch.setattr(live, "_reap_worker", lambda: False)
+    monkeypatch.setattr(live, "_kill", lambda: setattr(live, "parent_kill_sent", True))
+    with pytest.raises(SandboxError) as timed_out:
+        live._read_response(0.0, 1)
+    assert timed_out.value.code == "timeout"
+    assert live.parent_kill_sent is True
+
+
+def test_stderr_fallback_and_session_fd_growth(monkeypatch, tmp_path, plugin_settings,
+                                               caplog):
+    from agentic_fx.plugin import sandbox
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    real_temporary_file = sandbox.tempfile.TemporaryFile
+    monkeypatch.setattr(sandbox.tempfile, "TemporaryFile",
+                        lambda **_kwargs: (_ for _ in ()).throw(OSError("full")))
+    fallback = PluginSession(_meta(tmp_path, "no-stderr", "indicator", INDICATOR_OK_PY),
+                             settings=plugin_settings)
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: _PipeHandle())
+    monkeypatch.setattr(fallback, "_write_line", lambda *_: None)
+    monkeypatch.setattr(fallback, "_read_response", lambda *_: {"ok": True, "pid": 1})
+    fallback.__enter__()
+    monkeypatch.setattr(fallback, "_reap_worker", lambda: True)
+    fallback.close()
+    assert fallback.stderr_unavailable
+    assert any("stderr_unavailable=true" in rec.message for rec in caplog.records)
+    monkeypatch.setattr(sandbox.tempfile, "TemporaryFile", real_temporary_file)
+
+    before = len(os.listdir("/proc/self/fd"))
+    sessions = [PluginSession(_meta(tmp_path, f"fds-{i}", "indicator", INDICATOR_OK_PY),
+                              settings=plugin_settings) for i in range(50)]
+    for item in sessions:
+        item._stderr_file = tempfile.TemporaryFile(mode="w+b")
+    during = len(os.listdir("/proc/self/fd"))
+    for item in sessions:
+        item._close_stderr()
+    assert during - before <= 50
+
+
+def test_orphan_capacity_keeps_all_sessions_and_warns_once(monkeypatch, tmp_path,
+                                                           plugin_settings, caplog):
+    from agentic_fx.plugin import sandbox
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="agentic_fx.plugin.sandbox")
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    monkeypatch.setattr(sandbox, "_ORPHAN_OVERFLOW_LOGGED", False)
+    sessions = []
+    for number in range(65):
+        item = PluginSession(_meta(tmp_path, f"kept-{number}", "indicator", INDICATOR_OK_PY),
+                             settings=plugin_settings)
+        item._proc = _PipeHandle()
+        monkeypatch.setattr(item, "_reap_worker", lambda: False)
+        monkeypatch.setattr(os, "killpg", lambda *_: None)
+        monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+        item._kill()
+        sessions.append(item)
+    assert sandbox._ORPHANS == sessions
+    assert sum("exceeds 64 entries" in record.message for record in caplog.records) == 1
+
+
+def test_unreaped_child_is_later_collected_from_orphan_list(monkeypatch, tmp_path,
+                                                            plugin_settings, caplog):
+    from agentic_fx.plugin import sandbox
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "later-reap", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session.__enter__()
+    assert session.pid is not None
+    target_pid = session.pid
+    real_wait4 = os.wait4
+
+    def unavailable(pid, flags):
+        if pid == target_pid:
+            return 0, 0, None
+        return real_wait4(pid, flags)
+
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.3)
+    monkeypatch.setattr(os, "wait4", unavailable)
+    session._kill()
+    assert session.worker_unreaped is True
+    assert session.worker_cpu_sec is None
+    assert session.error_code == "crashed"
+    assert session in sandbox._ORPHANS
+    assert session._parent_fds_closed is True
+    monkeypatch.setattr(os, "wait4", real_wait4)
+    reap_orphans()
+    assert session not in sandbox._ORPHANS
+    assert sum("plugin worker orphan reaped" in rec.message for rec in caplog.records) == 1

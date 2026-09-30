@@ -601,7 +601,7 @@ class PluginSession:
                 continue
             try:
                 if self.worker_unreaped and stream is self._proc.stdout:
-                    os.close(stream.fileno())
+                    stream.detach().close()
                 else:
                     stream.close()
             except (OSError, AttributeError):
