@@ -1362,6 +1362,7 @@ def test_worker_sets_requested_cpu_limit_and_core_limit(monkeypatch):
     assert (worker.resource.RLIMIT_CORE, (0, 0)) in calls
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("requested", [1, 5, 60])
 def test_handshake_carries_configured_cpu_limit(monkeypatch, tmp_path, plugin_settings,
                                                  requested):
@@ -1443,8 +1444,8 @@ def compute(df, params):
 
 # --- T1 remediation: terminal lifecycle and diagnostics -----------------
 
-@pytest.fixture(autouse=True)
-def _stand_in_pids_look_like_live_children(monkeypatch):
+@pytest.fixture
+def stand_in_pids_look_live(monkeypatch):
     """`_PipeHandle` の pid は実在しない。wait4 が ChildProcessError (回収済み
     扱い) を返すと終端になるので、明示的に wait4 を差し替えないテストでは
     「まだ生きている子」に見せる。"""
@@ -1456,6 +1457,20 @@ def _stand_in_pids_look_like_live_children(monkeypatch):
         return real_wait4(pid, flags)
 
     monkeypatch.setattr(os, "wait4", wait4)
+
+
+@pytest.fixture(autouse=True)
+def _never_signal_stand_in_pids(monkeypatch):
+    """回収済み扱いの子には process group へ SIGKILL を送る。偽 pid が実在の
+    group に当たらないよう、killpg を差し替えないテストでも偽 pid は拒否する。"""
+    real_killpg = os.killpg
+
+    def killpg(pgid, sig):
+        if pgid == _PipeHandle.pid:
+            raise ProcessLookupError
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", killpg)
 
 
 class _PipeHandle:
@@ -1482,6 +1497,7 @@ def _session_with_stdout_pipe(tmp_path, plugin_settings, name="pipe"):
     return session, proc, write_fd
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_response_at_exact_byte_limit_is_accepted(tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
                                                         "exact-limit")
@@ -1494,6 +1510,7 @@ def test_response_at_exact_byte_limit_is_accepted(tmp_path, plugin_settings):
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_response_one_byte_over_limit_is_protocol_error(monkeypatch, tmp_path,
                                                          plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -1510,6 +1527,7 @@ def test_response_one_byte_over_limit_is_protocol_error(monkeypatch, tmp_path,
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_unterminated_response_stops_after_limit_crossing(monkeypatch, tmp_path,
                                                           plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -1536,6 +1554,7 @@ def test_unterminated_response_stops_after_limit_crossing(monkeypatch, tmp_path,
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_read_response_keeps_second_line_for_next_read(tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
                                                         "two-lines")
@@ -1548,6 +1567,7 @@ def test_read_response_keeps_second_line_for_next_read(tmp_path, plugin_settings
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [("eof", "crashed"), ("invalid", "protocol_error"),
@@ -1600,6 +1620,7 @@ def test_startup_failure_sets_the_documented_code(monkeypatch, tmp_path,
             os.close(writer)
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_unreaped_session_keeps_closed_streams_and_process_alive(monkeypatch, tmp_path,
                                                                   plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -1632,6 +1653,7 @@ def test_unreaped_session_keeps_closed_streams_and_process_alive(monkeypatch, tm
         os.close(replacement_write)
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_poll_reads_stdout_above_fd_setsize(tmp_path, plugin_settings):
     import resource
 
@@ -1659,6 +1681,7 @@ def test_poll_reads_stdout_above_fd_setsize(tmp_path, plugin_settings):
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_hup_only_reports_eof_but_delivers_buffered_last_line(monkeypatch, tmp_path,
                                                                plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -1689,6 +1712,7 @@ def test_hup_only_reports_eof_but_delivers_buffered_last_line(monkeypatch, tmp_p
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
         monkeypatch, tmp_path, plugin_settings):
     """UNREAPED_CLOSED は一度だけ kill/reap し、以後の close は即時 return。"""
@@ -1715,6 +1739,7 @@ def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
     assert len(os.listdir("/proc/self/fd")) == before - 3
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_killpg_esrch_rolls_back_parent_kill_and_preserves_cpu_classification(
         monkeypatch, tmp_path, plugin_settings):
     session = PluginSession(_meta(tmp_path, "race", "indicator", INDICATOR_OK_PY),
@@ -1736,6 +1761,7 @@ def test_killpg_esrch_rolls_back_parent_kill_and_preserves_cpu_classification(
     assert session._worker_error("dead").code == "cpu_limit"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_settings):
     session = PluginSession(_meta(tmp_path, "unreaped", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
@@ -1747,6 +1773,7 @@ def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_setting
     assert exc_info.value.code == "crashed"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_path,
                                                               plugin_settings):
     session = PluginSession(_meta(tmp_path, "buffered-calls", "indicator", INDICATOR_OK_PY),
@@ -1768,6 +1795,7 @@ def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_pa
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_terminal_close_closes_each_original_stream_once(tmp_path, plugin_settings):
     import gc
 
@@ -1810,6 +1838,7 @@ def test_terminal_close_closes_each_original_stream_once(tmp_path, plugin_settin
             stdout.close()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_buffered_line_is_checked_against_next_call_limit(monkeypatch, tmp_path,
                                                            plugin_settings):
     session = PluginSession(_meta(tmp_path, "buffer-limit", "indicator", INDICATOR_OK_PY),
@@ -1831,6 +1860,7 @@ def test_buffered_line_is_checked_against_next_call_limit(monkeypatch, tmp_path,
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_read_response_does_not_use_select_select(monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
@@ -1851,6 +1881,7 @@ def test_read_response_does_not_use_select_select(monkeypatch, tmp_path, plugin_
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_session_io_never_creates_a_thread(monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
@@ -1882,6 +1913,7 @@ def test_session_io_never_creates_a_thread(monkeypatch, tmp_path, plugin_setting
     eof._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_unreaped_close_releases_all_parent_descriptors(monkeypatch, tmp_path,
                                                          plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -1898,6 +1930,7 @@ def test_unreaped_close_releases_all_parent_descriptors(monkeypatch, tmp_path,
     assert len(os.listdir("/proc/self/fd")) == before
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_killpg_permission_failure_keeps_unreaped_worker(monkeypatch, tmp_path,
                                                           plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -1914,6 +1947,7 @@ def test_killpg_permission_failure_keeps_unreaped_worker(monkeypatch, tmp_path,
     assert session in sandbox._ORPHANS
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
@@ -1930,6 +1964,7 @@ def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_set
     assert not session.parent_kill_sent
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_timeout_uses_reaped_esrch_worker_classification(monkeypatch, tmp_path,
                                                           plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -1955,6 +1990,7 @@ def test_timeout_uses_reaped_esrch_worker_classification(monkeypatch, tmp_path,
     assert error.value.code == session.error_code == "cpu_limit"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_timeout_reclassifies_worker_reaped_before_kill(monkeypatch, tmp_path,
                                                         plugin_settings):
     session = PluginSession(_meta(tmp_path, "deadline-race", "indicator",
@@ -2009,6 +2045,7 @@ def test_live_session_cannot_be_entered_twice(tmp_path, plugin_settings):
         session.close()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_path,
                                                             plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2077,6 +2114,7 @@ def test_stderr_escape_is_bounded_after_expansion(tmp_path, plugin_settings, cap
     assert "truncated=true" in caplog.records[-1].message
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
         monkeypatch, tmp_path, plugin_settings, caplog):
     """protocol/plugin/startup branches retain the same internal code in logs."""
@@ -2122,6 +2160,7 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     assert startup_error.value.code == startup.error_code == "plugin_error"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_close_response_cpu_is_ignored_in_favor_of_wait4(monkeypatch, tmp_path,
                                                           plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2218,6 +2257,7 @@ os._exit(0)
         session.close()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_deadline_only_marks_timeout_when_worker_is_still_alive(monkeypatch, tmp_path,
                                                                 plugin_settings):
     session = PluginSession(_meta(tmp_path, "deadline", "indicator", INDICATOR_OK_PY),
@@ -2249,6 +2289,7 @@ def test_deadline_only_marks_timeout_when_worker_is_still_alive(monkeypatch, tmp
     os.close(writer_fd)
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_stderr_fallback_and_session_fd_growth(monkeypatch, tmp_path, plugin_settings,
                                                caplog):
     from agentic_fx.plugin import sandbox
@@ -2281,6 +2322,7 @@ def test_stderr_fallback_and_session_fd_growth(monkeypatch, tmp_path, plugin_set
     assert during - before <= 50
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_orphan_capacity_keeps_all_sessions_and_warns_once(monkeypatch, tmp_path,
                                                            plugin_settings, caplog):
     from agentic_fx.plugin import sandbox
@@ -2351,6 +2393,7 @@ def _stuck_child_session(monkeypatch, tmp_path, plugin_settings, name):
     return item
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_orphan_warning_appears_only_after_the_list_exceeds_capacity(
         monkeypatch, tmp_path, plugin_settings, caplog):
     from agentic_fx.plugin import sandbox
@@ -2375,6 +2418,7 @@ def test_orphan_warning_appears_only_after_the_list_exceeds_capacity(
     assert warnings() == 1
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_killing_an_unreaped_session_twice_lists_it_once(monkeypatch, tmp_path,
                                                          plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2399,6 +2443,7 @@ def test_reap_orphans_collects_every_reapable_session_in_one_pass(
     assert sandbox._ORPHANS == []
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_killpg_permission_failure_is_not_recorded_as_a_parent_kill(
         monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2424,6 +2469,7 @@ def test_killpg_permission_failure_is_not_recorded_as_a_parent_kill(
     assert session._worker_error("dead").code == "cpu_limit"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_exact_limit_without_newline_is_rejected_at_once_not_as_timeout(
         monkeypatch, tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -2478,6 +2524,7 @@ os._exit(0)
         session.close()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_eof_from_a_worker_that_is_still_alive_kills_it(monkeypatch, tmp_path,
                                                         plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -2498,6 +2545,7 @@ def test_eof_from_a_worker_that_is_still_alive_kills_it(monkeypatch, tmp_path,
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_timeout_is_recorded_on_the_session_itself(monkeypatch, tmp_path,
                                                    plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -2539,6 +2587,7 @@ def test_stderr_tail_escapes_each_dangerous_character_class(tmp_path, plugin_set
     assert "stderr_tail=before" + escaped + "after" in caplog.records[-1].message
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_close_keeps_an_unreaped_worker_reachable_for_a_later_collection(
         monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2556,6 +2605,7 @@ def test_close_keeps_an_unreaped_worker_reachable_for_a_later_collection(
     assert sandbox._ORPHANS == []
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_close_of_a_dead_session_sends_no_close_request(monkeypatch, tmp_path,
                                                         plugin_settings):
     session = PluginSession(_meta(tmp_path, "dead-close", "indicator", INDICATOR_OK_PY),
@@ -2636,6 +2686,7 @@ def _eof_session(tmp_path, plugin_settings, name):
     return session
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_worker_reaped_a_while_after_eof_keeps_its_cpu_limit_classification(
         monkeypatch, tmp_path, plugin_settings):
     session = _eof_session(tmp_path, plugin_settings, "eof-late-cpu")
@@ -2663,6 +2714,7 @@ def test_worker_reaped_a_while_after_eof_keeps_its_cpu_limit_classification(
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_worker_alive_past_the_eof_grace_is_killed(monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
@@ -2695,6 +2747,7 @@ def test_worker_alive_past_the_eof_grace_is_killed(monkeypatch, tmp_path, plugin
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_eof_grace_never_extends_past_the_call_deadline(monkeypatch, tmp_path,
                                                         plugin_settings):
     session = _eof_session(tmp_path, plugin_settings, "eof-deadline")
@@ -2770,6 +2823,7 @@ def test_worker_stderr_reaches_only_the_technical_log(tmp_path, plugin_settings,
 
 # --- worker already collected by someone else --------------------------
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_child_collected_elsewhere_is_terminal_without_waiting(monkeypatch, tmp_path,
                                                                plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2781,7 +2835,7 @@ def test_child_collected_elsewhere_is_terminal_without_waiting(monkeypatch, tmp_
     monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.3)
     monkeypatch.setattr(sandbox, "_ORPHANS", [])
     monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
-    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
     started = time.monotonic()
     session.close()
     assert time.monotonic() - started < 0.25
@@ -2793,6 +2847,41 @@ def test_child_collected_elsewhere_is_terminal_without_waiting(monkeypatch, tmp_
     assert session._worker_error("gone").code == "crashed"
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
+def test_child_collected_elsewhere_sends_one_group_kill_and_no_parent_kill_flag(
+        monkeypatch, tmp_path, plugin_settings):
+    session = PluginSession(_meta(tmp_path, "collected-group", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._pgid = _PipeHandle.pid
+    session._dead = True
+    kills = []
+    monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(os, "killpg", lambda *args: kills.append(args))
+    session.close()
+    session.close()
+    assert kills == [(_PipeHandle.pid, signal.SIGKILL)]
+    assert session.parent_kill_sent is False
+    assert session._worker_error("gone").code == "crashed"
+
+
+@pytest.mark.usefixtures("stand_in_pids_look_live")
+@pytest.mark.parametrize("failure", [ProcessLookupError(), PermissionError(),
+                                     OSError(5, "io error")])
+def test_child_collected_elsewhere_tolerates_a_failed_group_kill(
+        monkeypatch, tmp_path, plugin_settings, failure):
+    session = PluginSession(_meta(tmp_path, "collected-group-fail", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._pgid = _PipeHandle.pid
+    session._dead = True
+    monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(failure))
+    session.close()
+    assert session.parent_kill_sent is False
+
+
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_orphan_collected_elsewhere_leaves_the_orphan_list(monkeypatch, tmp_path,
                                                            plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -2803,12 +2892,14 @@ def test_orphan_collected_elsewhere_leaves_the_orphan_list(monkeypatch, tmp_path
     session.worker_unreaped = True
     monkeypatch.setattr(sandbox, "_ORPHANS", [session])
     monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
     reap_orphans()
     assert sandbox._ORPHANS == []
 
 
 # --- kill could not be sent but the worker was reaped -------------------
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("failure", [PermissionError(), OSError(5, "io error")])
 def test_deadline_with_failed_kill_and_reaped_worker_uses_worker_classification(
         monkeypatch, tmp_path, plugin_settings, failure):
@@ -2866,6 +2957,7 @@ def _startup_session(monkeypatch, tmp_path, plugin_settings, name, total_bytes):
     return session, writer
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_startup_response_at_the_size_limit_is_accepted(monkeypatch, tmp_path,
                                                         plugin_settings):
     session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
@@ -2879,6 +2971,7 @@ def test_startup_response_at_the_size_limit_is_accepted(monkeypatch, tmp_path,
         session.close()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_valid_startup_response_one_byte_over_the_limit_is_protocol_error(
         monkeypatch, tmp_path, plugin_settings):
     session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
@@ -2937,6 +3030,68 @@ def test_response_written_just_before_exit_is_delivered_not_classified_as_crash(
         session.close()
 
 
+_FINAL_RESULT_JSON = '{"ok": true, "result": {"mean_close": 1.5}, "pid": 1}'
+_FINAL_ERROR_JSON = '{"ok": false, "error": "last words"}'
+
+
+def _final_answer_program(line: str) -> str:
+    return (
+        "import os, sys\n"
+        "sys.stdin.readline()\n"
+        "sys.stdout.write('{\"ok\": true, \"ready\": true, \"pid\": %d}\\n' % os.getpid())\n"
+        "sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+        f"sys.stdout.write({line!r} + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "os._exit(0)\n")
+
+
+@pytest.mark.parametrize("line", [_FINAL_RESULT_JSON, _FINAL_ERROR_JSON])
+def test_last_response_of_a_dead_worker_is_delivered_and_ends_the_session(
+        monkeypatch, tmp_path, plugin_settings, line):
+    from agentic_fx.plugin import sandbox
+
+    real_popen = subprocess.Popen
+
+    def start_worker(*args, **kwargs):
+        return real_popen([sys.executable, "-c", _final_answer_program(line)],
+                          stdin=kwargs["stdin"], stdout=kwargs["stdout"],
+                          stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    kills = []
+    monkeypatch.setattr(os, "killpg", lambda *args: kills.append(args))
+    session = PluginSession(_meta(tmp_path, "final-answer", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    real_read = session._read_response
+
+    def read_after_worker_exit(timeout_sec, max_bytes):
+        os.waitid(os.P_PID, session.pid, os.WEXITED | os.WNOWAIT)
+        return real_read(timeout_sec, max_bytes)
+
+    session.__enter__()
+    stdin, stdout = session._proc.stdin, session._proc.stdout
+    monkeypatch.setattr(session, "_read_response", read_after_worker_exit)
+    try:
+        if line == _FINAL_RESULT_JSON:
+            assert session.call({"df": _df(), "params": {}}) == {"mean_close": 1.5}
+        else:
+            with pytest.raises(SandboxError, match="last words") as error:
+                session.call({"df": _df(), "params": {}})
+            assert error.value.code == "plugin_error"
+        assert session._dead is True
+        assert stdin.closed and stdout.closed
+        with pytest.raises(SandboxError, match="not usable"):
+            session.call({"df": _df(), "params": {}})
+        session.close()
+        session.close()
+        assert kills == []
+    finally:
+        session.close()
+
+
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_line_already_in_the_pipe_is_returned_when_the_worker_is_seen_dead(
         monkeypatch, tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -2950,6 +3105,7 @@ def test_line_already_in_the_pipe_is_returned_when_the_worker_is_seen_dead(
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_dead_worker_with_only_a_partial_line_is_classified_by_its_death(
         monkeypatch, tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -2967,6 +3123,7 @@ def test_dead_worker_with_only_a_partial_line_is_classified_by_its_death(
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_oversize_line_from_a_dead_worker_is_not_returned(monkeypatch, tmp_path,
                                                           plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -3002,6 +3159,7 @@ def _broken_pipe_write(monkeypatch):
     monkeypatch.setattr(os, "write", write)
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_call_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_after(
         monkeypatch, tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
@@ -3026,6 +3184,7 @@ def test_call_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_call_write_failure_kills_a_worker_that_stays_alive(monkeypatch, tmp_path,
                                                             plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -3061,6 +3220,7 @@ def _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings, name)
     return session
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_startup_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_after(
         monkeypatch, tmp_path, plugin_settings):
     session = _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings,
@@ -3080,6 +3240,7 @@ def test_startup_write_failure_reports_cpu_limit_when_the_worker_is_reaped_short
     assert session.parent_kill_sent is False
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_startup_write_failure_of_a_live_worker_is_killed_and_backtest_failed(
         monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
@@ -3112,6 +3273,7 @@ def test_stderr_unavailable_diagnostic_is_logged_once_per_session(
     assert sum("stderr_unavailable=true" in r.message for r in caplog.records) == 1
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_stderr_read_failure_does_not_escape_close_and_the_file_is_closed(
         monkeypatch, tmp_path, plugin_settings, caplog):
     import logging
@@ -3137,6 +3299,7 @@ def test_stderr_read_failure_does_not_escape_close_and_the_file_is_closed(
     assert any("plugin_worker_diagnostic" in r.message for r in caplog.records)
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("line", [b"[1]", b"1", b'"x"', b"null"])
 def test_call_with_a_non_object_json_response_is_a_protocol_error(
         monkeypatch, tmp_path, plugin_settings, line):
@@ -3159,6 +3322,7 @@ def test_call_with_a_non_object_json_response_is_a_protocol_error(
         session._close_parent_fds()
 
 
+@pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("line", [b"[1]", b"1", b'"x"', b"null"])
 def test_startup_with_a_non_object_json_response_is_a_protocol_error(
         monkeypatch, tmp_path, plugin_settings, line):

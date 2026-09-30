@@ -386,6 +386,10 @@ class PluginSession:
         self.parent_kill_sent = False
         self.worker_unreaped = False
         self._collected_elsewhere = False
+        # start_new_session の group id (= worker の pid)。worker が他所で回収
+        # されると pid では辿れなくなるので、起動時に控えておく。
+        self._pgid: int | None = None
+        self._pgid_kill_sent = False
         self.error_code: str | None = None
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
@@ -516,6 +520,7 @@ class PluginSession:
                 stderr=stderr, cwd=str(self._meta.path), env=env,
                 start_new_session=True, bufsize=0,
             )
+            self._pgid = self._proc.pid
             self._ensure_pipe_ownership()
             handshake = {
                 "cpu_sec": self._settings.sandbox_session_cpu_sec,
@@ -748,6 +753,7 @@ class PluginSession:
         deadline = time.monotonic() + timeout_sec
         poller = select.poll()
         poller.register(self._stdout_fd, select.POLLIN)
+        worker_gone = False
         while True:
             newline = self._stdout_buffer.find(b"\n")
             if newline != -1:
@@ -765,6 +771,10 @@ class PluginSession:
                 if not isinstance(decoded, dict):
                     return self._protocol_failure(
                         "plugin worker returned a JSON value that is not an object")
+                if worker_gone:
+                    # 最後の応答は呼び出し元へ返すが、死んだ worker の session を
+                    # 使い回せる形で残さない。
+                    self._terminalize_after_final_response(decoded)
                 return decoded
             if len(self._stdout_buffer) >= max_bytes:
                 return self._protocol_failure(
@@ -772,6 +782,7 @@ class PluginSession:
 
             if self._reap_worker():
                 if self._drain_dead_worker_stdout(max_bytes):
+                    worker_gone = True
                     continue
                 self._dead = True
                 raise self._worker_error("plugin worker exited unexpectedly (EOF)")
@@ -780,6 +791,7 @@ class PluginSession:
             if remaining <= 0:
                 if self._reap_worker():
                     if self._drain_dead_worker_stdout(max_bytes):
+                        worker_gone = True
                         continue
                     self._dead = True
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
@@ -820,6 +832,14 @@ class PluginSession:
                         raise self._worker_error(
                             "plugin worker exited unexpectedly (EOF)")
                     self._stdout_buffer.extend(chunk)
+
+    def _terminalize_after_final_response(self, response: dict[str, Any]) -> None:
+        self._dead = True
+        if not response.get("ok"):
+            # 診断ログがこの時点で出るので、call() が後から付ける分類を先に入れる。
+            self.error_code = "plugin_error"
+        self._close_parent_fds()
+        self._close_stderr()
 
     def _await_reap_grace(self, deadline: float) -> bool:
         """終了状態が wait4 に見えるまで、`deadline` を超えない範囲で
@@ -921,6 +941,7 @@ class PluginSession:
             # SIGCHLD=SIG_IGN や他の waiter が先に回収済み。終了状態は分から
             # ないが、待ち続けても永久に回収できないので終端として扱う。
             self._collected_elsewhere = True
+            self._kill_leftover_group()
             return True
         if pid == 0:
             return False
@@ -932,6 +953,22 @@ class PluginSession:
         if not self.parent_kill_sent:
             self._cpu_sec = self.worker_cpu_sec
         return True
+
+    def _kill_leftover_group(self) -> None:
+        """リーダーが他所で回収された後も、同じ group の孫が残りうる。死因は
+        不明なので parent_kill_sent は立てず、best-effort で 1 回だけ送る。"""
+        if self._pgid_kill_sent:
+            return
+        self._pgid_kill_sent = True
+        pgid = self._pgid
+        if pgid is None and self._proc is not None:
+            pgid = self._proc.pid
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def _worker_error(self, message: str) -> SandboxError:
         code = "crashed"
