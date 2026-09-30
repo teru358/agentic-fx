@@ -28,6 +28,16 @@ from agentic_fx.plugin.sandbox import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_orphan_registry(monkeypatch):
+    """orphan 一覧と超過警告フラグはモジュールグローバル。テストが失敗しても
+    偽の子プロセスが後続テストへ残らないよう、毎回空で始めて戻す。"""
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox, "_ORPHANS", [])
+    monkeypatch.setattr(sandbox, "_ORPHAN_OVERFLOW_LOGGED", False)
+
+
 def test_sandbox_error_has_compatible_default_code():
     assert SandboxError("unchanged message").code == "backtest_failed"
     assert str(SandboxError("unchanged message", code="crashed")) == "unchanged message"
@@ -1567,6 +1577,8 @@ def test_startup_failure_sets_the_documented_code(monkeypatch, tmp_path,
     monkeypatch.setattr(os, "wait4", wait4)
     monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
     if mode == "write":
+        # 回収できない worker への猶予待ちを短くする (期待値は変えない)。
+        monkeypatch.setattr(sandbox, "_EOF_REAP_GRACE_SEC", 0.01)
         monkeypatch.setattr(os, "write", lambda *_: (_ for _ in ()).throw(OSError("broken")))
     elif mode == "eof":
         os.close(writer)
@@ -1618,7 +1630,6 @@ def test_unreaped_session_keeps_closed_streams_and_process_alive(monkeypatch, tm
     finally:
         os.close(replacement_read)
         os.close(replacement_write)
-        sandbox._ORPHANS[:] = [item for item in sandbox._ORPHANS if item._proc is not proc]
 
 
 def test_poll_reads_stdout_above_fd_setsize(tmp_path, plugin_settings):
@@ -1702,7 +1713,6 @@ def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
     assert proc.stdin is None and proc.stdout is None
     assert session._stderr_file is None
     assert len(os.listdir("/proc/self/fd")) == before - 3
-    sandbox._ORPHANS.remove(session)
 
 
 def test_killpg_esrch_rolls_back_parent_kill_and_preserves_cpu_classification(
@@ -1886,7 +1896,6 @@ def test_unreaped_close_releases_all_parent_descriptors(monkeypatch, tmp_path,
     monkeypatch.setattr(os, "killpg", lambda *_: None)
     session._kill()
     assert len(os.listdir("/proc/self/fd")) == before
-    sandbox._ORPHANS.remove(session)
 
 
 def test_killpg_permission_failure_keeps_unreaped_worker(monkeypatch, tmp_path,
@@ -1903,7 +1912,6 @@ def test_killpg_permission_failure_keeps_unreaped_worker(monkeypatch, tmp_path,
     assert session.worker_unreaped
     assert session.error_code == "crashed"
     assert session in sandbox._ORPHANS
-    sandbox._ORPHANS.remove(session)
 
 
 def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_settings):
@@ -2017,7 +2025,6 @@ def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_pat
     with pytest.raises(SandboxError) as error:
         session.__enter__()
     assert error.value.code == session.error_code == "crashed"
-    sandbox._ORPHANS.remove(session)
 
 
 def test_popen_failure_code_matches_session(monkeypatch, tmp_path, plugin_settings):
@@ -2701,9 +2708,6 @@ def test_eof_grace_never_extends_past_the_call_deadline(monkeypatch, tmp_path,
         assert time.monotonic() - started < 0.6
     finally:
         session._close_parent_fds()
-        from agentic_fx.plugin import sandbox
-        if session in sandbox._ORPHANS:
-            sandbox._ORPHANS.remove(session)
 
 
 # --- stderr content never reaches exceptions ---------------------------
@@ -2885,3 +2889,292 @@ def test_valid_startup_response_one_byte_over_the_limit_is_protocol_error(
         assert error.value.code == session.error_code == "protocol_error"
     finally:
         os.close(writer)
+
+
+# --- worker の最後の言葉・書き込み失敗・dict 以外の応答 ------------------
+
+_ANSWER_THEN_EXIT_PROGRAM = r'''
+import os, sys
+sys.stdin.readline()
+sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\n' % os.getpid())
+sys.stdout.flush()
+sys.stdin.readline()
+sys.stdout.write('{"ok": false, "error": "last words"}\n')
+sys.stdout.flush()
+os._exit(0)
+'''
+
+
+def test_response_written_just_before_exit_is_delivered_not_classified_as_crash(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    real_popen = subprocess.Popen
+
+    def start_worker(*args, **kwargs):
+        return real_popen([sys.executable, "-c", _ANSWER_THEN_EXIT_PROGRAM],
+                          stdin=kwargs["stdin"], stdout=kwargs["stdout"],
+                          stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    session = PluginSession(_meta(tmp_path, "last-words", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    real_read = session._read_response
+
+    def read_after_worker_exit(timeout_sec, max_bytes):
+        # 死亡を先に観測する経路を決定的にするため、回収せずに終了を待つ。
+        os.waitid(os.P_PID, session.pid, os.WEXITED | os.WNOWAIT)
+        return real_read(timeout_sec, max_bytes)
+
+    session.__enter__()
+    monkeypatch.setattr(session, "_read_response", read_after_worker_exit)
+    try:
+        with pytest.raises(SandboxError, match="last words") as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == "plugin_error"
+    finally:
+        session.close()
+
+
+def test_line_already_in_the_pipe_is_returned_when_the_worker_is_seen_dead(
+        monkeypatch, tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "dead-with-line")
+    os.write(writer, b'{"ok": false, "error": "boom"}\n')
+    monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    try:
+        assert session._read_response(5.0, 65536) == {"ok": False, "error": "boom"}
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_dead_worker_with_only_a_partial_line_is_classified_by_its_death(
+        monkeypatch, tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "dead-partial")
+    os.write(writer, b'{"ok": fal')
+    monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(5.0, 65536)
+        assert error.value.code == "crashed"
+        assert time.monotonic() - started < 1.0
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_oversize_line_from_a_dead_worker_is_not_returned(monkeypatch, tmp_path,
+                                                          plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "dead-oversize")
+    os.write(writer, b"x" * 100 + b"\n")
+    monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    try:
+        with pytest.raises(SandboxError):
+            session._read_response(5.0, 64)
+        assert session._dead is True
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+class _Usage:
+    ru_utime = 0.0
+    ru_stime = 0.0
+
+
+def _cpu_usage(plugin_settings):
+    class Usage:
+        ru_utime = float(plugin_settings.sandbox_session_cpu_sec)
+        ru_stime = 0.0
+
+    return Usage
+
+
+def _broken_pipe_write(monkeypatch):
+    def write(_fd, _data):
+        raise BrokenPipeError("worker is gone")
+
+    monkeypatch.setattr(os, "write", write)
+
+
+def test_call_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_after(
+        monkeypatch, tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "write-cpu")
+    usage = _cpu_usage(plugin_settings)
+    calls = []
+
+    def wait4(pid, _flags):
+        calls.append(pid)
+        return (0, 0, None) if len(calls) <= 4 else (pid, signal.SIGKILL, usage())
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    _broken_pipe_write(monkeypatch)
+    try:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == session.error_code == "cpu_limit"
+        assert session.parent_kill_sent is False
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_call_write_failure_kills_a_worker_that_stays_alive(monkeypatch, tmp_path,
+                                                            plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "write-alive")
+    monkeypatch.setattr(sandbox, "_EOF_REAP_GRACE_SEC", 0.05)
+    killed = {"value": False}
+    monkeypatch.setattr(os, "wait4",
+                        lambda pid, _f: (pid, 0, _Usage()) if killed["value"] else (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    _broken_pipe_write(monkeypatch)
+    started = time.monotonic()
+    try:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == session.error_code == "protocol_error"
+        assert killed["value"] is True
+        assert time.monotonic() - started >= 0.05
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings, name):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: proc)
+    _broken_pipe_write(monkeypatch)
+    return session
+
+
+def test_startup_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_after(
+        monkeypatch, tmp_path, plugin_settings):
+    session = _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings,
+                                             "startup-write-cpu")
+    usage = _cpu_usage(plugin_settings)
+    calls = []
+
+    def wait4(pid, _flags):
+        calls.append(pid)
+        return (0, 0, None) if len(calls) <= 4 else (pid, signal.SIGKILL, usage())
+
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code == "cpu_limit"
+    assert session.parent_kill_sent is False
+
+
+def test_startup_write_failure_of_a_live_worker_is_killed_and_backtest_failed(
+        monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings,
+                                             "startup-write-alive")
+    monkeypatch.setattr(sandbox, "_EOF_REAP_GRACE_SEC", 0.05)
+    killed = {"value": False}
+    monkeypatch.setattr(os, "wait4",
+                        lambda pid, _f: (pid, 0, _Usage()) if killed["value"] else (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code == "backtest_failed"
+    assert killed["value"] is True
+
+
+def test_stderr_unavailable_diagnostic_is_logged_once_per_session(
+        monkeypatch, tmp_path, plugin_settings, caplog):
+    import logging
+    from agentic_fx.plugin import sandbox
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "diag-once", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session.stderr_unavailable = True
+    session.close()
+    session.__exit__(None, None, None)
+    session._close_stderr()
+    assert sum("stderr_unavailable=true" in r.message for r in caplog.records) == 1
+
+
+def test_stderr_read_failure_does_not_escape_close_and_the_file_is_closed(
+        monkeypatch, tmp_path, plugin_settings, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = PluginSession(_meta(tmp_path, "stderr-oserror", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    real = tempfile.TemporaryFile(mode="w+b")
+
+    class Broken:
+        def seek(self, *_a):
+            raise OSError("disk gone")
+
+        def close(self):
+            real.close()
+
+    session._stderr_file = Broken()
+    session._proc = _PipeHandle()
+    monkeypatch.setattr(session, "_reap_worker", lambda: True)
+    session.close()
+    assert real.closed
+    assert session._stderr_file is None
+    assert any("plugin_worker_diagnostic" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("line", [b"[1]", b"1", b'"x"', b"null"])
+def test_call_with_a_non_object_json_response_is_a_protocol_error(
+        monkeypatch, tmp_path, plugin_settings, line):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "call-non-object")
+    killed = {"value": False}
+    monkeypatch.setattr(os, "wait4",
+                        lambda pid, _f: (pid, 0, _Usage()) if killed["value"] else (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    session._stdout_buffer.extend(line + b"\n")
+    try:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == session.error_code == "protocol_error"
+        assert session._dead is True
+        assert killed["value"] is True
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+@pytest.mark.parametrize("line", [b"[1]", b"1", b'"x"', b"null"])
+def test_startup_with_a_non_object_json_response_is_a_protocol_error(
+        monkeypatch, tmp_path, plugin_settings, line):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "startup-non-object", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    proc = _PipeHandle()
+    killed = {"value": False}
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(os, "wait4",
+                        lambda pid, _f: (pid, 0, _Usage()) if killed["value"] else (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    session._stdout_buffer.extend(line + b"\n")
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code == "protocol_error"
+    assert killed["value"] is True

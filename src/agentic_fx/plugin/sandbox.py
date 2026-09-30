@@ -389,6 +389,7 @@ class PluginSession:
         self.error_code: str | None = None
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
+        self._stderr_unavailable_logged = False
         self._stdin_fd: int | None = None
         self._stdout_fd: int | None = None
         self._stdout_buffer = bytearray()
@@ -400,12 +401,13 @@ class PluginSession:
 
     @property
     def cpu_sec(self) -> float | None:
-        """worker の累積 CPU 秒。**`close()` 完了後に確定する** —
-        **正常終了・plugin error 後はいずれも float** (plugin コード自身の例外は
-        セッションを `_dead` にしない既存契約なので graceful close が成立する)。
-        **`None` は 2 経路のみ**: SIGKILL fallback (timeout 後の強制終了) と、
-        `__enter__` 失敗による worker 未起動 (設計書 v1.4 §6 C1、ユーザー裁定 ④)。
-        """
+        """worker の累積 CPU 秒。値は親が `wait4` で回収したときの rusage
+        (utime + stime) であり、worker 自己申告の close 応答ではない。
+        **`close()` 完了後に確定する**。正常終了・plugin error 後・worker の
+        自死後は float。**`None` になるのは** 親が SIGKILL を送った場合、
+        worker を回収できなかった (unreaped) 場合、他所で先に回収されて
+        rusage が得られなかった場合、`__enter__` 失敗で worker が
+        起動しなかった場合、まだ終了していない場合。"""
         return self._cpu_sec
 
     def _check_owner_thread(self) -> None:
@@ -532,7 +534,13 @@ class PluginSession:
                 handshake["outputs"] = (list(self._meta.outputs)
                                         if self._meta.outputs is not None
                                         else None)
-            self._write_line(handshake)
+            try:
+                self._write_line(handshake)
+            except OSError as exc:
+                if self._await_reap_grace(time.monotonic() + _STARTUP_TIMEOUT_SEC):
+                    raise self._worker_error(
+                        f"failed to write to plugin worker: {exc}") from exc
+                raise
 
             response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
             if not response.get("ok"):
@@ -661,6 +669,7 @@ class PluginSession:
         for key in required:
             request[key] = _df_to_wire(payload[key]) if key == "df" else payload[key]
 
+        write_deadline = time.monotonic() + self._settings.sandbox_timeout_sec
         try:
             self._write_line(request)
         except SandboxError:
@@ -672,6 +681,9 @@ class PluginSession:
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
+            # 終了状態が見えるまでの数 ms で kill すると、親 kill 扱いになって
+            # 死因 (CPU 上限など) が失われる。
+            self._await_reap_grace(write_deadline)
             recovered_without_kill = self._kill()
             if self.worker_unreaped:
                 code = "crashed"
@@ -745,22 +757,30 @@ class PluginSession:
                 payload = bytes(self._stdout_buffer[:newline])
                 del self._stdout_buffer[:newline + 1]
                 try:
-                    return json.loads(payload)
+                    decoded = json.loads(payload)
                 except json.JSONDecodeError as exc:
                     self._protocol_failure(
                         f"plugin worker returned invalid JSON: {exc}")
                     raise AssertionError("unreachable") from exc
+                if not isinstance(decoded, dict):
+                    return self._protocol_failure(
+                        "plugin worker returned a JSON value that is not an object")
+                return decoded
             if len(self._stdout_buffer) >= max_bytes:
                 return self._protocol_failure(
                     f"plugin worker output exceeded {max_bytes} bytes")
 
             if self._reap_worker():
+                if self._drain_dead_worker_stdout(max_bytes):
+                    continue
                 self._dead = True
                 raise self._worker_error("plugin worker exited unexpectedly (EOF)")
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if self._reap_worker():
+                    if self._drain_dead_worker_stdout(max_bytes):
+                        continue
                     self._dead = True
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
                 self._dead = True
@@ -795,18 +815,47 @@ class PluginSession:
                             f"error reading plugin worker output: {exc}")
                     if not chunk:
                         self._dead = True
-                        grace_end = min(deadline, time.monotonic() + _EOF_REAP_GRACE_SEC)
-                        while True:
-                            if self._reap_worker():
-                                raise self._worker_error(
-                                    "plugin worker exited unexpectedly (EOF)")
-                            if time.monotonic() >= grace_end:
-                                break
-                            time.sleep(_EOF_REAP_POLL_SEC)
+                        self._await_reap_grace(deadline)
                         self._kill()
                         raise self._worker_error(
                             "plugin worker exited unexpectedly (EOF)")
                     self._stdout_buffer.extend(chunk)
+
+    def _await_reap_grace(self, deadline: float) -> bool:
+        """終了状態が wait4 に見えるまで、`deadline` を超えない範囲で
+        `_EOF_REAP_GRACE_SEC` だけ待つ。回収できたら True。"""
+        grace_end = min(deadline, time.monotonic() + _EOF_REAP_GRACE_SEC)
+        while True:
+            if self._reap_worker():
+                return True
+            if time.monotonic() >= grace_end:
+                return False
+            time.sleep(_EOF_REAP_POLL_SEC)
+
+    def _drain_dead_worker_stdout(self, max_bytes: int) -> bool:
+        """死亡を観測した worker が残したパイプ内容を、待たずに buffer へ取り込む。
+
+        孫が stdout を握っていても EOF を待たないよう、読める間だけ読み、
+        EOF か「今は読めない」で止める。改行が揃うか上限に達したら True
+        (呼び出し側が通常の行判定・上限判定へ戻る)。"""
+        fd = self._stdout_fd
+        if fd is None:
+            return False
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        while (b"\n" not in self._stdout_buffer
+               and len(self._stdout_buffer) < max_bytes):
+            try:
+                if not poller.poll(0):
+                    break
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self._stdout_buffer.extend(chunk)
+        return (b"\n" in self._stdout_buffer
+                or len(self._stdout_buffer) >= max_bytes)
 
     def _protocol_failure(self, message: str) -> dict[str, Any]:
         self._dead = True
@@ -857,7 +906,8 @@ class PluginSession:
                 _ORPHANS.append(self)
                 if len(_ORPHANS) > _ORPHAN_CAPACITY and not _ORPHAN_OVERFLOW_LOGGED:
                     _ORPHAN_OVERFLOW_LOGGED = True
-                    _log.warning("plugin worker orphan list exceeds 64 entries")
+                    _log.warning("plugin worker orphan list exceeds %d entries",
+                                 _ORPHAN_CAPACITY)
         return False
 
     def _reap_worker(self) -> bool:
@@ -896,7 +946,8 @@ class PluginSession:
         f = self._stderr_file
         self._stderr_file = None
         if f is None:
-            if self.stderr_unavailable:
+            if self.stderr_unavailable and not self._stderr_unavailable_logged:
+                self._stderr_unavailable_logged = True
                 _log.info("plugin_worker_diagnostic plugin=%s code=%s cpu_sec=%s returncode=%s signal=%s stderr_unavailable=true",
                           self._meta.name, self.error_code, self.worker_cpu_sec,
                           self.worker_returncode, self.worker_signal)
@@ -928,8 +979,15 @@ class PluginSession:
             if escaped:
                 fields += f" stderr_tail={escaped}"
             _log.info("plugin_worker_diagnostic %s", fields)
+        except Exception as exc:
+            # 診断は補助。読めなくても close 系の契約 (例外を出さない) を守る。
+            _log.info("plugin_worker_diagnostic plugin=%s stderr_read_failed=%r",
+                      self._meta.name, exc)
         finally:
-            f.close()
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
