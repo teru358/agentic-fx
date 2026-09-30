@@ -80,6 +80,7 @@ import json
 import math
 import os
 import queue
+import select
 import signal
 import subprocess
 import sys
@@ -383,7 +384,11 @@ class PluginSession:
         self.error_code: str | None = None
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
-        self._parent_fds_closed = False
+        self._stdin_fd: int | None = None
+        self._stdout_fd: int | None = None
+        self._stdout_buffer = bytearray()
+        self._reader_cancel = threading.Event()
+        self._reader_thread: threading.Thread | None = None
         # プラン 8 B 束: PluginSession は単一スレッド所有が前提
         # (全使用箇所が単一スレッド — ロックは追加しない)。construction
         # したスレッドを記録し、実行時 assert で境界越えを検出する。
@@ -500,8 +505,9 @@ class PluginSession:
                  str(self._meta.path)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=stderr, cwd=str(self._meta.path), env=env,
-                start_new_session=True,
+                start_new_session=True, bufsize=0,
             )
+            self._ensure_pipe_ownership()
             handshake = {
                 "cpu_sec": self._settings.sandbox_session_cpu_sec,
                 "memory_mb": self._settings.sandbox_memory_mb,
@@ -529,15 +535,17 @@ class PluginSession:
                     code="plugin_error")
             self.pid = response.get("pid")
             return self
-        except SandboxError:
-            self._dead = True
-            self.close()
-            raise
         except Exception as exc:
             self._dead = True
-            self.error_code = "plugin_error"
+            requested_code = exc.code if isinstance(exc, SandboxError) else "backtest_failed"
+            self.error_code = requested_code
             self.close()
-            raise SandboxError(f"failed to start plugin worker: {exc}") from exc
+            final_code = "crashed" if self.worker_unreaped else requested_code
+            self.error_code = final_code
+            if isinstance(exc, SandboxError):
+                raise SandboxError(str(exc), code=final_code) from exc
+            raise SandboxError(f"failed to start plugin worker: {exc}",
+                               code=final_code) from exc
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
         self.close()
@@ -591,25 +599,58 @@ class PluginSession:
         if not self.worker_unreaped:
             self._proc = None
 
+    def _ensure_pipe_ownership(self) -> None:
+        proc = self._proc
+        assert proc is not None
+        if self._stdin_fd is None:
+            assert proc.stdin is not None
+            self._stdin_fd = proc.stdin.fileno()
+        if self._stdout_fd is None:
+            assert proc.stdout is not None
+            self._stdout_fd = proc.stdout.fileno()
+
+    def _stop_reader(self) -> bool:
+        self._reader_cancel.set()
+        reader = self._reader_thread
+        if reader is None:
+            return True
+        reader.join(1.0)
+        if reader.is_alive():
+            _log.warning("plugin worker reader did not stop before fd close")
+            return False
+        self._reader_thread = None
+        return True
+
     def _close_parent_fds(self) -> None:
-        """Close parent pipe descriptors without contending with the reader lock."""
-        if self._parent_fds_closed or self._proc is None:
+        """Release raw pipe ownership after the select-based reader has stopped."""
+        proc = self._proc
+        if proc is None:
             return
-        self._parent_fds_closed = True
-        for stream in (self._proc.stdin, self._proc.stdout):
-            if stream is None:
-                continue
-            try:
-                if self.worker_unreaped and stream is self._proc.stdout:
-                    stream.detach().close()
-                else:
-                    stream.close()
-            except (OSError, AttributeError):
-                # Test doubles and already-closed streams have no usable fd.
+        if self._stdin_fd is None and proc.stdin is not None:
+            self._stdin_fd = proc.stdin.fileno()
+        if self._stdout_fd is None and proc.stdout is not None:
+            self._stdout_fd = proc.stdout.fileno()
+        stdin = proc.stdin
+        if self._stdin_fd is not None:
+            self._stdin_fd = None
+            proc.stdin = None
+            if stdin is not None:
                 try:
-                    stream.close()
+                    stdin.close()
                 except OSError:
                     pass
+        if self._stdout_fd is None:
+            return
+        if not self._stop_reader():
+            return
+        stdout = proc.stdout
+        self._stdout_fd = None
+        proc.stdout = None
+        if stdout is not None:
+            try:
+                stdout.close()
+            except OSError:
+                pass
 
     def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         """1 回の plugin 呼び出し。payload は kind に応じて `df` (pandas
@@ -677,13 +718,17 @@ class PluginSession:
         送出し、実際のパイプ書き込みで失敗したら `OSError` をそのまま
         伝播させる (呼び出し元の `call()`/`__enter__` が使い分ける)。
         """
-        assert self._proc is not None and self._proc.stdin is not None
+        assert self._proc is not None
+        self._ensure_pipe_ownership()
+        assert self._stdin_fd is not None
         try:
             data = json.dumps(obj).encode("utf-8") + b"\n"
         except (TypeError, ValueError) as exc:
             raise SandboxError(f"failed to serialize request: {exc}") from exc
-        self._proc.stdin.write(data)
-        self._proc.stdin.flush()
+        view = memoryview(data)
+        while view:
+            sent = os.write(self._stdin_fd, view)
+            view = view[sent:]
 
     def _read_response(self, timeout_sec: float, max_bytes: int) -> dict[str, Any]:
         """1 行を「timeout・出力上限超過・EOF」いずれかに達するまで別
@@ -695,20 +740,27 @@ class PluginSession:
         `settings.sandbox_output_max_bytes` (plugin コードの出力なので
         こちらは利用者設定に従う) を使う、と使い分けるため。
         """
-        assert self._proc is not None and self._proc.stdout is not None
+        assert self._proc is not None
+        self._ensure_pipe_ownership()
+        assert self._stdout_fd is not None
         result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
         # daemon スレッド: 親が timeout で諦めた後もこのスレッドは stdout
         # を読み続け得るが、その後 kill するため程なく EOF で自然終了する
         # (kill せず放置すると次の call() のバイト列を盗み読みしかねない
         # ため、timeout 時は必ず kill してセッションを使用不能にする)。
+        self._reader_cancel = threading.Event()
         t = threading.Thread(target=_reader_worker,
-                             args=(self._proc.stdout, max_bytes, result_queue),
+                             args=(self._stdout_fd, max_bytes, result_queue,
+                                   self._reader_cancel, self._stdout_buffer),
                              daemon=True)
+        self._reader_thread = t
         t.start()
         deadline = time.monotonic() + timeout_sec
         while True:
             try:
                 kind, payload = result_queue.get(timeout=min(0.02, max(0, deadline - time.monotonic())))
+                t.join(1.0)
+                self._reader_thread = None
                 break
             except queue.Empty:
                 if self._reap_worker():
@@ -761,8 +813,6 @@ class PluginSession:
             os.killpg(self._proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError, OSError):
             self.parent_kill_sent = False
-            self._reap_worker()
-            return
         deadline = time.monotonic() + _KILL_REAP_TIMEOUT_SEC
         while time.monotonic() < deadline:
             if self._reap_worker():
@@ -848,8 +898,9 @@ class PluginSession:
             f.close()
 
 
-def _reader_worker(stream: Any, max_bytes: int,
-                   result_queue: "queue.Queue[tuple[str, Any]]") -> None:
+def _reader_worker(fd: int, max_bytes: int,
+                   result_queue: "queue.Queue[tuple[str, Any]]",
+                   cancel: threading.Event, buffer: bytearray) -> None:
     """境界の意味論 (レビュー fix round 1 F7 で明文化):
     累積バイト数が **`max_bytes` ちょうど** なら許容 (`>` であって `>=`
     ではない)、1 バイトでも超えたら oversize。判定は `read1()` の
@@ -860,24 +911,42 @@ def _reader_worker(stream: Any, max_bytes: int,
     と判定され得る (「超過検知は次チャンク到着時」の意味論 — 出力を
     無制限にバッファしないためのトレードオフ)。
     """
-    buf = bytearray()
     try:
         while True:
-            chunk = stream.read1(65536) if hasattr(stream, "read1") else stream.read(65536)
+            if cancel.is_set():
+                return
+            newline = buffer.find(b"\n")
+            if newline != -1:
+                result_queue.put(("line", bytes(buffer[:newline])))
+                del buffer[:newline + 1]
+                return
+            if len(buffer) > max_bytes:
+                result_queue.put(("oversize", None))
+                return
+            readable, _, _ = select.select([fd], [], [], 0.05)
+            if cancel.is_set():
+                return
+            if not readable:
+                continue
+            chunk = os.read(fd, 65536)
             if not chunk:
                 result_queue.put(("eof", None))
                 return
-            buf.extend(chunk)
+            buffer.extend(chunk)
             # サイズ判定を改行検出より先に行う: worker の出力が小さければ
             # 1 回の read1() で改行まで丸ごと届くことがあり、「改行が
             # 見つかったら先に line を確定」の順だと、その 1 チャンクの
             # 中身がどれだけ大きくても上限チェックを素通りしてしまう。
-            if len(buf) > max_bytes:
+            newline = buffer.find(b"\n")
+            if newline == -1 and len(buffer) > max_bytes:
                 result_queue.put(("oversize", None))
                 return
-            nl = buf.find(b"\n")
-            if nl != -1:
-                result_queue.put(("line", bytes(buf[:nl])))
+            if newline != -1:
+                if newline + 1 > max_bytes:
+                    result_queue.put(("oversize", None))
+                    return
+                result_queue.put(("line", bytes(buffer[:newline])))
+                del buffer[:newline + 1]
                 return
     except Exception as exc:  # noqa: BLE001 — スレッド境界を越えて報告する
         try:

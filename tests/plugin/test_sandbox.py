@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -565,52 +566,42 @@ def test_oversize_output_marks_session_dead(tmp_path, plugin_settings):
             session.call({"df": _df(), "params": {}})
 
 
-# --- レビュー fix round 1 F7: _reader_worker の境界ピン (実プロセス無し) --
-
-class _FakeStream:
-    """`.read1(n)` だけを実装する最小限のフェイク stdout。事前に用意した
-    チャンク列を順に返す (実プロセス無しで境界の意味論を決定的に検証)。"""
-
-    def __init__(self, chunks: list[bytes]) -> None:
-        self._chunks = list(chunks)
-
-    def read1(self, _n: int) -> bytes:
-        return self._chunks.pop(0) if self._chunks else b""
+def _read_pipe_line(data: bytes, maximum: int):
+    read_fd, write_fd = os.pipe()
+    result = queue.Queue()
+    try:
+        os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+        _reader_worker(read_fd, maximum, result, threading.Event(), bytearray())
+        return result.get_nowait()
+    finally:
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
 
 
 def test_reader_worker_accepts_exact_boundary_size():
-    import queue as queue_module
-
     content = b'{"ok": true, "x": 1}'
     line = content + b"\n"
 
-    q = queue_module.Queue()
-    _reader_worker(_FakeStream([line]), len(line), q)  # ちょうど境界: 受理
-    kind, payload = q.get_nowait()
+    kind, payload = _read_pipe_line(line, len(line))
     assert kind == "line"
     assert payload == content
 
 
 def test_reader_worker_rejects_one_byte_over_boundary():
-    import queue as queue_module
-
     content = b'{"ok": true, "x": 1}'
     line = content + b"\n"
 
-    q = queue_module.Queue()
-    _reader_worker(_FakeStream([line]), len(line) - 1, q)  # 1 バイト超過
-    kind, _payload = q.get_nowait()
+    kind, _payload = _read_pipe_line(line, len(line) - 1)
     assert kind == "oversize"
 
 
 def test_reader_worker_oversize_detected_incrementally_across_chunks():
     """1 行がまだ完成していなくても、蓄積済みバイト数が上限を超えた時点
     (次チャンク到着時) で打ち切る意味論のピン。"""
-    import queue as queue_module
-
-    q = queue_module.Queue()
-    _reader_worker(_FakeStream([b"aaaa", b"bbbb\n"]), 6, q)
-    kind, _payload = q.get_nowait()
+    kind, _payload = _read_pipe_line(b"aaaa" + b"bbbb\n", 6)
     assert kind == "oversize"
 
 
@@ -657,8 +648,8 @@ def test_enter_failure_closes_pipes_and_marks_dead(tmp_path, plugin_settings,
     assert session._proc is None  # close() が proc を確実に None にした
     assert len(captured) == 1
     proc = captured[0]
-    assert proc.stdin.closed
-    assert proc.stdout.closed
+    assert proc.stdin is None
+    assert proc.stdout is None
 
 
 def test_enter_wraps_unexpected_popen_failure_as_sandbox_error(
@@ -1404,13 +1395,7 @@ def test_handshake_carries_configured_cpu_limit(monkeypatch, tmp_path, plugin_se
 
     captured = []
 
-    class Process:
-        pid = 9001
-        returncode = None
-        stdin = None
-        stdout = None
-
-    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *args, **kwargs: Process())
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *args, **kwargs: _PipeHandle())
     monkeypatch.setattr(PluginSession, "_write_line", lambda self, item: captured.append(item))
     monkeypatch.setattr(PluginSession, "_read_response",
                         lambda self, timeout, maximum: {"ok": True, "pid": 9001})
@@ -1484,21 +1469,17 @@ def compute(df, params):
 
 # --- T1 remediation: terminal lifecycle and diagnostics -----------------
 
-class _CloseTrackingStream:
-    def __init__(self):
-        self.closed = False
-
-    def close(self):
-        self.closed = True
-
-
 class _PipeHandle:
     pid = 43211
     returncode = None
 
     def __init__(self):
-        self.stdin = _CloseTrackingStream()
-        self.stdout = _CloseTrackingStream()
+        stdin_read, stdin_write = os.pipe()
+        stdout_read, stdout_write = os.pipe()
+        os.close(stdin_read)
+        os.close(stdout_write)
+        self.stdin = os.fdopen(stdin_write, "wb", buffering=0)
+        self.stdout = os.fdopen(stdout_read, "rb", buffering=0)
 
 
 def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
@@ -1522,9 +1503,9 @@ def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
     session.close()
     session.__exit__(None, None, None)
     assert kills == [(proc.pid, signal.SIGKILL)]
-    assert proc.stdin.closed and proc.stdout.closed
+    assert proc.stdin is None and proc.stdout is None
     assert session._stderr_file is None
-    assert len(os.listdir("/proc/self/fd")) == before - 1
+    assert len(os.listdir("/proc/self/fd")) == before - 3
     sandbox._ORPHANS.remove(session)
 
 
@@ -1553,12 +1534,179 @@ def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_setting
     session = PluginSession(_meta(tmp_path, "unreaped", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     session._proc = _PipeHandle()
-    session._proc.stdout.read1 = lambda _n: b""
     monkeypatch.setattr(session, "_reap_worker", lambda: False)
     monkeypatch.setattr(session, "_kill", lambda: setattr(session, "worker_unreaped", True))
     with pytest.raises(SandboxError) as exc_info:
         session._read_response(0.0, 1)
     assert exc_info.value.code == "crashed"
+
+
+def test_reader_preserves_second_line_from_one_read():
+    import queue as queue_module
+
+    read_fd, write_fd = os.pipe()
+    cancel = threading.Event()
+    buffer = bytearray()
+    result = queue_module.Queue()
+    try:
+        os.write(write_fd, b'{"n": 1}\n{"n": 2}\n')
+        os.close(write_fd)
+        write_fd = -1
+        _reader_worker(read_fd, 1024, result, cancel, buffer)
+        first_kind, first_payload = result.get_nowait()
+        assert first_kind == "line"
+        assert first_payload == b'{"n": 1}'
+        _reader_worker(read_fd, 1024, result, cancel, buffer)
+        second_kind, second_payload = result.get_nowait()
+        assert second_kind == "line"
+        assert second_payload == b'{"n": 2}'
+    finally:
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+
+
+def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_path,
+                                                              plugin_settings):
+    session = PluginSession(_meta(tmp_path, "buffered-calls", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
+    session._proc = proc
+    real_write = os.write
+    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    try:
+        real_write(writer_fd, b'{"ok": true, "result": {"value": 1}}\n'
+                   b'{"ok": true, "result": {"value": 2}}\n')
+        assert session.call({"df": _df(), "params": {}}) == {"value": 1.0}
+        assert session.call({"df": _df(), "params": {}}) == {"value": 2.0}
+    finally:
+        os.close(writer_fd)
+        session._close_parent_fds()
+
+
+def test_terminal_close_waits_for_reader_before_reused_fd_is_closed(
+        tmp_path, plugin_settings):
+    import gc
+    import queue as queue_module
+
+    session = PluginSession(_meta(tmp_path, "reader-close", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    reader_fd, held_write = os.pipe()
+    proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
+    session._proc = proc
+    session._ensure_pipe_ownership()
+    closed_stdout_fd = session._stdout_fd
+    try:
+        result = queue_module.Queue()
+        session._reader_cancel = threading.Event()
+        session._reader_thread = threading.Thread(
+            target=_reader_worker,
+            args=(session._stdout_fd, 1024, result, session._reader_cancel,
+                  session._stdout_buffer),
+            daemon=True)
+        session._reader_thread.start()
+        started = time.monotonic()
+        session._close_parent_fds()
+        assert time.monotonic() - started < 1
+        replacement_read, replacement_write = os.pipe()
+        try:
+            assert replacement_read == closed_stdout_fd
+            os.fstat(replacement_read)
+            del session
+            gc.collect()
+            os.fstat(replacement_read)
+            os.fstat(replacement_write)
+        finally:
+            os.close(replacement_read)
+            os.close(replacement_write)
+    finally:
+        os.close(held_write)
+
+
+def test_unreaped_close_releases_all_parent_descriptors(monkeypatch, tmp_path,
+                                                         plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    before = len(os.listdir("/proc/self/fd"))
+    session = PluginSession(_meta(tmp_path, "fd-count", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    session._stderr_file = tempfile.TemporaryFile(mode="w+b")
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(os, "wait4", lambda *_: (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
+    session._kill()
+    assert len(os.listdir("/proc/self/fd")) == before
+    sandbox._ORPHANS.remove(session)
+
+
+def test_killpg_permission_failure_keeps_unreaped_worker(monkeypatch, tmp_path,
+                                                          plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "eperm", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(session, "_reap_worker", lambda: False)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(PermissionError()))
+    session._kill()
+    assert session.worker_unreaped
+    assert session.error_code == "crashed"
+    assert session in sandbox._ORPHANS
+    sandbox._ORPHANS.remove(session)
+
+
+def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "esrch", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([False, False, True])
+    monkeypatch.setattr(session, "_reap_worker", lambda: next(states))
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
+    session._kill()
+    assert not session.worker_unreaped
+    assert not session.parent_kill_sent
+
+
+def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_path,
+                                                            plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "startup-unreaped", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: _PipeHandle())
+    monkeypatch.setattr(PluginSession, "_write_line", lambda *_: None)
+    monkeypatch.setattr(PluginSession, "_read_response",
+                        lambda *_: {"ok": False, "error": "start"})
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(os, "wait4", lambda *_: (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code == "crashed"
+    sandbox._ORPHANS.remove(session)
+
+
+def test_popen_failure_code_matches_session(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "popen-code", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    monkeypatch.setattr(sandbox.subprocess, "Popen",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("no exec")))
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code
 
 
 def test_reap_orphans_serializes_wait_and_removal(monkeypatch, tmp_path, plugin_settings):
@@ -1608,8 +1756,8 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     session = PluginSession(_meta(tmp_path, "codes", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     session._proc = _PipeHandle()
-    session._proc.stdin.write = lambda _data: None
-    session._proc.stdin.flush = lambda: None
+    real_write = os.write
+    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
     monkeypatch.setattr(session, "_read_response", lambda *_: {"ok": False, "error": "boom"})
     with pytest.raises(SandboxError) as plugin_error:
         session.call({"df": _df(), "params": {}})
@@ -1618,7 +1766,11 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     protocol = PluginSession(_meta(tmp_path, "protocol", "indicator", INDICATOR_OK_PY),
                              settings=plugin_settings)
     protocol._proc = _PipeHandle()
-    protocol._proc.stdout.read1 = lambda _n: b"{\n"
+    protocol._proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    protocol._proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
+    real_write(writer_fd, b"{\n")
+    os.close(writer_fd)
     monkeypatch.setattr(protocol, "_reap_worker", lambda: False)
     monkeypatch.setattr(protocol, "_kill", lambda: None)
     with pytest.raises(SandboxError) as protocol_error:
@@ -1737,31 +1889,33 @@ os._exit(0)
 
 def test_deadline_only_marks_timeout_when_worker_is_still_alive(monkeypatch, tmp_path,
                                                                 plugin_settings):
-    class BlockingStream:
-        def read1(self, _size):
-            threading.Event().wait(1)
-
     session = PluginSession(_meta(tmp_path, "deadline", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     session._proc = _PipeHandle()
-    session._proc.stdout = BlockingStream()
+    session._proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    session._proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
     states = iter([True])
     monkeypatch.setattr(session, "_reap_worker", lambda: next(states))
     with pytest.raises(SandboxError) as dead:
         session._read_response(0.0, 1)
     assert dead.value.code == "crashed"
     assert session.parent_kill_sent is False
+    os.close(writer_fd)
 
     live = PluginSession(_meta(tmp_path, "deadline-live", "indicator", INDICATOR_OK_PY),
                          settings=plugin_settings)
     live._proc = _PipeHandle()
-    live._proc.stdout = BlockingStream()
+    live._proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    live._proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
     monkeypatch.setattr(live, "_reap_worker", lambda: False)
     monkeypatch.setattr(live, "_kill", lambda: setattr(live, "parent_kill_sent", True))
     with pytest.raises(SandboxError) as timed_out:
         live._read_response(0.0, 1)
     assert timed_out.value.code == "timeout"
     assert live.parent_kill_sent is True
+    os.close(writer_fd)
 
 
 def test_stderr_fallback_and_session_fd_growth(monkeypatch, tmp_path, plugin_settings,
@@ -1843,7 +1997,8 @@ def test_unreaped_child_is_later_collected_from_orphan_list(monkeypatch, tmp_pat
     assert session.worker_cpu_sec is None
     assert session.error_code == "crashed"
     assert session in sandbox._ORPHANS
-    assert session._parent_fds_closed is True
+    assert session._stdin_fd is None
+    assert session._stdout_fd is None
     monkeypatch.setattr(os, "wait4", real_wait4)
     reap_orphans()
     assert session not in sandbox._ORPHANS
