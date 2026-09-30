@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -1440,6 +1441,223 @@ class _PipeHandle:
         os.close(stdout_write)
         self.stdin = os.fdopen(stdin_write, "wb", buffering=0)
         self.stdout = os.fdopen(stdout_read, "rb", buffering=0)
+
+
+def _session_with_stdout_pipe(tmp_path, plugin_settings, name="pipe"):
+    session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    read_fd, write_fd = os.pipe()
+    proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
+    session._proc = proc
+    return session, proc, write_fd
+
+
+def test_response_at_exact_byte_limit_is_accepted(tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "exact-limit")
+    line = b'{"ok": true}\n'
+    try:
+        os.write(writer, line)
+        assert session._read_response(0.1, len(line)) == {"ok": True}
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_response_one_byte_over_limit_is_protocol_error(monkeypatch, tmp_path,
+                                                         plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "over-limit")
+    line = b'{"ok": true}\n'
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    try:
+        os.write(writer, line)
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.1, len(line) - 1)
+        assert error.value.code == session.error_code == "protocol_error"
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_unterminated_response_stops_after_limit_crossing(monkeypatch, tmp_path,
+                                                          plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "chunk-limit")
+    maximum = 6
+    reads: list[int] = []
+    real_read = os.read
+
+    def small_read(fd, size):
+        chunk = real_read(fd, min(size, 4))
+        reads.append(len(chunk))
+        return chunk
+
+    monkeypatch.setattr(os, "read", small_read)
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    try:
+        os.write(writer, b"abcdefghijk")
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.1, maximum)
+        assert error.value.code == "protocol_error"
+        assert sum(reads) <= maximum + 4
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_read_response_keeps_second_line_for_next_read(tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "two-lines")
+    try:
+        os.write(writer, b'{"n": 1}\n{"n": 2}\n')
+        assert session._read_response(0.1, 1024) == {"n": 1}
+        assert session._read_response(0.1, 1024) == {"n": 2}
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [("eof", "crashed"), ("invalid", "protocol_error"),
+     ("oversize", "protocol_error"), ("timeout", "timeout"),
+     ("write", "backtest_failed")],
+)
+def test_startup_failure_sets_the_documented_code(monkeypatch, tmp_path,
+                                                  plugin_settings, mode, expected):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, f"startup-{mode}", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    read_fd, writer = os.pipe()
+    proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
+    killed = {"value": False}
+
+    class Usage:
+        ru_utime = 0.0
+        ru_stime = 0.0
+
+    def wait4(pid, _flags):
+        return (pid, 0, Usage()) if killed["value"] else (0, 0, None)
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: proc)
+    monkeypatch.setattr(os, "wait4", wait4)
+    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
+    if mode == "write":
+        monkeypatch.setattr(os, "write", lambda *_: (_ for _ in ()).throw(OSError("broken")))
+    elif mode == "eof":
+        os.close(writer)
+        writer = None
+    elif mode == "invalid":
+        os.write(writer, b"{\n")
+    elif mode == "oversize":
+        session._stdout_buffer.extend(b"x" * 65536 + b"\n")
+    else:
+        monkeypatch.setattr(sandbox, "_STARTUP_TIMEOUT_SEC", 0.0)
+    if mode != "write":
+        monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    try:
+        with pytest.raises(SandboxError) as error:
+            session.__enter__()
+        assert error.value.code == session.error_code == expected
+    finally:
+        if writer is not None:
+            os.close(writer)
+
+
+def test_unreaped_session_keeps_closed_streams_and_process_alive(monkeypatch, tmp_path,
+                                                                  plugin_settings):
+    from agentic_fx.plugin import sandbox
+    import gc
+    import weakref
+
+    session = PluginSession(_meta(tmp_path, "unreaped-reference", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    proc = _PipeHandle()
+    stdin, stdout = proc.stdin, proc.stdout
+    closed_fds = {stdin.fileno(), stdout.fileno()}
+    session._proc = proc
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(os, "wait4", lambda *_: (0, 0, None))
+    monkeypatch.setattr(os, "killpg", lambda *_: None)
+    session._kill()
+    assert session._proc is proc
+    assert stdin.closed and stdout.closed
+    replacement_read, replacement_write = os.pipe()
+    session_ref = weakref.ref(session)
+    try:
+        assert closed_fds & {replacement_read, replacement_write}
+        del session
+        gc.collect()
+        assert session_ref() is not None
+        os.fstat(replacement_read)
+        os.fstat(replacement_write)
+    finally:
+        os.close(replacement_read)
+        os.close(replacement_write)
+        sandbox._ORPHANS[:] = [item for item in sandbox._ORPHANS if item._proc is not proc]
+
+
+def test_poll_reads_stdout_above_fd_setsize(tmp_path, plugin_settings):
+    import resource
+
+    target = 1024
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft <= target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, target + 32), hard))
+        except (OSError, ValueError):
+            pytest.skip("cannot raise RLIMIT_NOFILE for a high-fd poll test")
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= target:
+        pytest.skip("RLIMIT_NOFILE does not permit fd 1024")
+
+    session, proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "high-fd")
+    old_stdout = proc.stdout
+    try:
+        os.dup2(old_stdout.fileno(), target)
+        old_stdout.close()
+        proc.stdout = os.fdopen(target, "rb", buffering=0)
+        os.write(writer, b'{"ok": true}\n')
+        assert session._read_response(0.1, 1024) == {"ok": True}
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+def test_hup_only_reports_eof_but_delivers_buffered_last_line(monkeypatch, tmp_path,
+                                                               plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    class HupPoll:
+        def register(self, *_args):
+            pass
+
+        def poll(self, _timeout):
+            return [(session._stdout_fd, select.POLLHUP)]
+
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                        "hup")
+    monkeypatch.setattr(sandbox.select, "poll", HupPoll)
+    monkeypatch.setattr(session, "_kill", lambda: False)
+    monkeypatch.setattr(session, "_reap_worker", lambda: False)
+    try:
+        os.write(writer, b'{"ok": true}\n')
+        os.close(writer)
+        writer = None
+        assert session._read_response(0.1, 1024) == {"ok": True}
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.1, 1024)
+        assert error.value.code == session.error_code == "crashed"
+    finally:
+        if writer is not None:
+            os.close(writer)
+        session._close_parent_fds()
 
 
 def test_unreaped_is_terminal_closes_parent_fds_and_never_kills_again(
