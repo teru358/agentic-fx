@@ -79,7 +79,6 @@ import ast
 import json
 import math
 import os
-import queue
 import select
 import signal
 import subprocess
@@ -387,8 +386,6 @@ class PluginSession:
         self._stdin_fd: int | None = None
         self._stdout_fd: int | None = None
         self._stdout_buffer = bytearray()
-        self._reader_cancel = threading.Event()
-        self._reader_thread: threading.Thread | None = None
         # プラン 8 B 束: PluginSession は単一スレッド所有が前提
         # (全使用箇所が単一スレッド — ロックは追加しない)。construction
         # したスレッドを記録し、実行時 assert で境界越えを検出する。
@@ -580,15 +577,8 @@ class PluginSession:
                     pass
             if not self._reap_worker():
                 self._kill()
-        # 不変条件: この時点で proc は必ず終了済み (`_kill()` が
-        # `wait()` まで済ませている)。`_kill()` が実効性を失う変異を
-        # 注入すると `proc.stdout.close()` が **デッドロックする**
-        # (別スレッドの `_reader_worker` が `read1()` でブロックしたまま
-        # 戻ってこない — worker がまだ生きて出力を出さない限り解放され
-        # ない。レビュー fix round 1 F3 の変異テストで実際に踏んだ経路:
-        # `_kill()` no-op → ここで停止 → RLIMIT_CPU の SIGXCPU で worker
-        # が自滅し EOF が出るまで解けなかった)。順序 (`_kill()` を必ず
-        # 先に完了させる) を変えないこと。
+        # stdout を読んだ owner thread だけがここで stream を閉じる。
+        # kill が効かない場合も close は待機せず、この終端化だけで完了する。
         self._close_parent_fds()
         # An unreaped child must remain strongly reachable for a later
         # WNOHANG attempt, but none of the parent's pipe/file descriptors are
@@ -609,20 +599,8 @@ class PluginSession:
             assert proc.stdout is not None
             self._stdout_fd = proc.stdout.fileno()
 
-    def _stop_reader(self) -> bool:
-        self._reader_cancel.set()
-        reader = self._reader_thread
-        if reader is None:
-            return True
-        reader.join(1.0)
-        if reader.is_alive():
-            _log.warning("plugin worker reader did not stop before fd close")
-            return False
-        self._reader_thread = None
-        return True
-
     def _close_parent_fds(self) -> None:
-        """Release raw pipe ownership after the select-based reader has stopped."""
+        """Close each parent stream once and detach it from the process object."""
         proc = self._proc
         if proc is None:
             return
@@ -639,10 +617,6 @@ class PluginSession:
                     stdin.close()
                 except OSError:
                     pass
-        if self._stdout_fd is None:
-            return
-        if not self._stop_reader():
-            return
         stdout = proc.stdout
         self._stdout_fd = None
         proc.stdout = None
@@ -688,8 +662,14 @@ class PluginSession:
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
-            self._kill()
-            code = "crashed" if self.worker_unreaped else "protocol_error"
+            recovered_after_esrch = self._kill()
+            if self.worker_unreaped:
+                code = "crashed"
+            elif recovered_after_esrch:
+                code = self._worker_error(
+                    "plugin worker exited unexpectedly (EOF)").code
+            else:
+                code = "protocol_error"
             raise SandboxError(f"failed to write to plugin worker: {exc}", code=code) from exc
 
         response = self._read_response(self._settings.sandbox_timeout_sec,
@@ -731,8 +711,8 @@ class PluginSession:
             view = view[sent:]
 
     def _read_response(self, timeout_sec: float, max_bytes: int) -> dict[str, Any]:
-        """1 行を「timeout・出力上限超過・EOF」いずれかに達するまで別
-        スレッドで読み、結果を待つ。**出力を無制限にバッファしない**
+        """1 行を「timeout・出力上限超過・EOF」いずれかに達するまで読む。
+        **出力を無制限にバッファしない**
         (`max_bytes` を超えた時点で読み取りを打ち切る)。timeout/oversize/
         EOF はすべてセッションを使用不能にする。`max_bytes` は呼び出し元
         が渡す — 起動応答 (ready) は worker 自身が生成する小さな固定文言
@@ -743,80 +723,111 @@ class PluginSession:
         assert self._proc is not None
         self._ensure_pipe_ownership()
         assert self._stdout_fd is not None
-        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
-        # daemon スレッド: 親が timeout で諦めた後もこのスレッドは stdout
-        # を読み続け得るが、その後 kill するため程なく EOF で自然終了する
-        # (kill せず放置すると次の call() のバイト列を盗み読みしかねない
-        # ため、timeout 時は必ず kill してセッションを使用不能にする)。
-        self._reader_cancel = threading.Event()
-        t = threading.Thread(target=_reader_worker,
-                             args=(self._stdout_fd, max_bytes, result_queue,
-                                   self._reader_cancel, self._stdout_buffer),
-                             daemon=True)
-        self._reader_thread = t
-        t.start()
         deadline = time.monotonic() + timeout_sec
+        poller = select.poll()
+        poller.register(self._stdout_fd, select.POLLIN)
         while True:
-            try:
-                kind, payload = result_queue.get(timeout=min(0.02, max(0, deadline - time.monotonic())))
-                t.join(1.0)
-                self._reader_thread = None
-                break
-            except queue.Empty:
+            newline = self._stdout_buffer.find(b"\n")
+            if newline != -1:
+                if newline + 1 > max_bytes:
+                    return self._protocol_failure(
+                        f"plugin worker output exceeded {max_bytes} bytes")
+                payload = bytes(self._stdout_buffer[:newline])
+                del self._stdout_buffer[:newline + 1]
+                try:
+                    return json.loads(payload)
+                except json.JSONDecodeError as exc:
+                    self._protocol_failure(
+                        f"plugin worker returned invalid JSON: {exc}")
+                    raise AssertionError("unreachable") from exc
+            if len(self._stdout_buffer) >= max_bytes:
+                return self._protocol_failure(
+                    f"plugin worker output exceeded {max_bytes} bytes")
+
+            if self._reap_worker():
+                self._dead = True
+                raise self._worker_error("plugin worker exited unexpectedly (EOF)")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 if self._reap_worker():
                     self._dead = True
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
-                if time.monotonic() >= deadline:
-                    self._dead = True
-                    self.error_code = "timeout"
-                    self._kill()
-                    code = "crashed" if self.worker_unreaped else "timeout"
-                    raise SandboxError(f"plugin call timed out after {timeout_sec}s", code=code)
-
-        if kind == "line":
-            try:
-                return json.loads(payload)
-            except json.JSONDecodeError as exc:
                 self._dead = True
-                self.error_code = "protocol_error"
-                self._kill()
-                raise SandboxError(f"plugin worker returned invalid JSON: {exc}",
-                                   code="crashed" if self.worker_unreaped else "protocol_error") from exc
-        if kind == "eof":
-            self._dead = True
-            self._kill()
-            raise self._worker_error("plugin worker exited unexpectedly (EOF)")
-        if kind == "oversize":
-            self._dead = True
-            self.error_code = "protocol_error"
-            self._kill()
-            raise SandboxError(f"plugin worker output exceeded {max_bytes} bytes",
-                               code="crashed" if self.worker_unreaped else "protocol_error")
-        # kind == "error"
+                self.error_code = "timeout"
+                recovered_after_esrch = self._kill()
+                if self.worker_unreaped:
+                    raise SandboxError(
+                        f"plugin call timed out after {timeout_sec}s", code="crashed")
+                if recovered_after_esrch:
+                    raise self._worker_error(
+                        "plugin worker exited unexpectedly (EOF)")
+                raise SandboxError(f"plugin call timed out after {timeout_sec}s", code="timeout")
+
+            try:
+                events = poller.poll(max(0, min(20, int(remaining * 1000))))
+            except (InterruptedError, BlockingIOError):
+                events = []
+            except OSError as exc:
+                return self._protocol_failure(
+                    f"error reading plugin worker output: {exc}")
+            if events:
+                event_mask = 0
+                for _fd, mask in events:
+                    event_mask |= mask
+                if event_mask & (select.POLLIN | select.POLLHUP | select.POLLERR):
+                    try:
+                        chunk = os.read(self._stdout_fd, 65536)
+                    except (InterruptedError, BlockingIOError):
+                        continue
+                    except OSError as exc:
+                        return self._protocol_failure(
+                            f"error reading plugin worker output: {exc}")
+                    if not chunk:
+                        self._dead = True
+                        for _ in range(5):
+                            if self._reap_worker():
+                                raise self._worker_error(
+                                    "plugin worker exited unexpectedly (EOF)")
+                            time.sleep(0.001)
+                        self._kill()
+                        raise self._worker_error(
+                            "plugin worker exited unexpectedly (EOF)")
+                    self._stdout_buffer.extend(chunk)
+
+    def _protocol_failure(self, message: str) -> dict[str, Any]:
         self._dead = True
         self.error_code = "protocol_error"
-        self._kill()
-        raise SandboxError(f"error reading plugin worker output: {payload}",
-                           code="crashed" if self.worker_unreaped else "protocol_error")
+        recovered_after_esrch = self._kill()
+        if self.worker_unreaped:
+            raise SandboxError(message, code="crashed")
+        if recovered_after_esrch:
+            raise self._worker_error("plugin worker exited unexpectedly (EOF)")
+        raise SandboxError(message, code="protocol_error")
 
-    def _kill(self) -> None:
+    def _kill(self) -> bool:
+        """Kill the process group and report an ESRCH race that was reaped."""
         if self._proc is None:
-            return
+            return False
         if self._reap_worker():
-            return
+            return False
         self.parent_kill_sent = True
+        esrch = False
         # The legacy property intentionally keeps its old timeout contract.
         self._cpu_sec = None
         try:
             # start_new_session=True によりセッションリーダーの pid ==
             # プロセスグループ id。killpg で孫プロセスも道連れにする。
             os.killpg(self._proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
+        except ProcessLookupError:
+            self.parent_kill_sent = False
+            esrch = True
+        except (PermissionError, OSError):
             self.parent_kill_sent = False
         deadline = time.monotonic() + _KILL_REAP_TIMEOUT_SEC
         while time.monotonic() < deadline:
             if self._reap_worker():
-                return
+                return esrch
             time.sleep(0.01)
         self.worker_unreaped = True
         self.worker_cpu_sec = None
@@ -830,6 +841,7 @@ class PluginSession:
                 if len(_ORPHANS) > _ORPHAN_CAPACITY and not _ORPHAN_OVERFLOW_LOGGED:
                     _ORPHAN_OVERFLOW_LOGGED = True
                     _log.warning("plugin worker orphan list exceeds 64 entries")
+        return False
 
     def _reap_worker(self) -> bool:
         """Record the one authoritative wait status before any classification."""
@@ -898,63 +910,6 @@ class PluginSession:
             f.close()
 
 
-def _reader_worker(fd: int, max_bytes: int,
-                   result_queue: "queue.Queue[tuple[str, Any]]",
-                   cancel: threading.Event, buffer: bytearray) -> None:
-    """境界の意味論 (レビュー fix round 1 F7 で明文化):
-    累積バイト数が **`max_bytes` ちょうど** なら許容 (`>` であって `>=`
-    ではない)、1 バイトでも超えたら oversize。判定は `read1()` の
-    チャンク到着ごとに行う — 1 行がまだ完成していなくても、蓄積量が
-    その時点で上限を超えていれば直ちに打ち切る (改行の到着を待たない)。
-    そのため、最終的な行の総バイト数が結果的に上限以内に収まる場合
-    でも、チャンク分割の途中経過で一時的に上限を超えていれば oversize
-    と判定され得る (「超過検知は次チャンク到着時」の意味論 — 出力を
-    無制限にバッファしないためのトレードオフ)。
-    """
-    try:
-        while True:
-            if cancel.is_set():
-                return
-            newline = buffer.find(b"\n")
-            if newline != -1:
-                result_queue.put(("line", bytes(buffer[:newline])))
-                del buffer[:newline + 1]
-                return
-            if len(buffer) > max_bytes:
-                result_queue.put(("oversize", None))
-                return
-            readable, _, _ = select.select([fd], [], [], 0.05)
-            if cancel.is_set():
-                return
-            if not readable:
-                continue
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                result_queue.put(("eof", None))
-                return
-            buffer.extend(chunk)
-            # サイズ判定を改行検出より先に行う: worker の出力が小さければ
-            # 1 回の read1() で改行まで丸ごと届くことがあり、「改行が
-            # 見つかったら先に line を確定」の順だと、その 1 チャンクの
-            # 中身がどれだけ大きくても上限チェックを素通りしてしまう。
-            newline = buffer.find(b"\n")
-            if newline == -1 and len(buffer) > max_bytes:
-                result_queue.put(("oversize", None))
-                return
-            if newline != -1:
-                if newline + 1 > max_bytes:
-                    result_queue.put(("oversize", None))
-                    return
-                result_queue.put(("line", bytes(buffer[:newline])))
-                del buffer[:newline + 1]
-                return
-    except Exception as exc:  # noqa: BLE001 — スレッド境界を越えて報告する
-        try:
-            result_queue.put(("error", exc))
-        except Exception:
-            pass
-
-
 def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
                timeout_sec: float | None = None,
                settings: "PluginSettings",
@@ -969,7 +924,7 @@ def run_plugin(meta: PluginMeta, payload: dict[str, Any], *,
         # `PluginSettings.sandbox_timeout_sec` は pydantic の `Field(gt=0)`
         # で検証されるが、`model_copy(update=...)` はバリデータを一切
         # 再実行しない (pydantic の既知の挙動) — ここで検証せず素通しする
-        # と、0/負値が `queue.Queue.get(timeout=...)` まで届いてから生の
+        # と、0/負値が待機 API まで届いてから生の
         # `ValueError` になり「SandboxError 1 種だけ catch すればよい」
         # 契約を破る (レビュー fix round 1 F5)。ここで明示的に fail closed。
         if (isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float))

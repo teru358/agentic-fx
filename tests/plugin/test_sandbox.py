@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import os
-import queue
 import signal
 import subprocess
 import sys
@@ -24,7 +23,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import (
     SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
-    _reader_worker, PluginSession, reap_orphans,
+    PluginSession, reap_orphans,
 )
 
 
@@ -564,45 +563,6 @@ def test_oversize_output_marks_session_dead(tmp_path, plugin_settings):
             session.call({"df": _df(), "params": {}})
         with pytest.raises(SandboxError, match="not usable"):
             session.call({"df": _df(), "params": {}})
-
-
-def _read_pipe_line(data: bytes, maximum: int):
-    read_fd, write_fd = os.pipe()
-    result = queue.Queue()
-    try:
-        os.write(write_fd, data)
-        os.close(write_fd)
-        write_fd = -1
-        _reader_worker(read_fd, maximum, result, threading.Event(), bytearray())
-        return result.get_nowait()
-    finally:
-        os.close(read_fd)
-        if write_fd != -1:
-            os.close(write_fd)
-
-
-def test_reader_worker_accepts_exact_boundary_size():
-    content = b'{"ok": true, "x": 1}'
-    line = content + b"\n"
-
-    kind, payload = _read_pipe_line(line, len(line))
-    assert kind == "line"
-    assert payload == content
-
-
-def test_reader_worker_rejects_one_byte_over_boundary():
-    content = b'{"ok": true, "x": 1}'
-    line = content + b"\n"
-
-    kind, _payload = _read_pipe_line(line, len(line) - 1)
-    assert kind == "oversize"
-
-
-def test_reader_worker_oversize_detected_incrementally_across_chunks():
-    """1 行がまだ完成していなくても、蓄積済みバイト数が上限を超えた時点
-    (次チャンク到着時) で打ち切る意味論のピン。"""
-    kind, _payload = _read_pipe_line(b"aaaa" + b"bbbb\n", 6)
-    assert kind == "oversize"
 
 
 # --- worker 起動失敗 (__enter__ の ready=false 診断パス) -------------------
@@ -1541,31 +1501,6 @@ def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_setting
     assert exc_info.value.code == "crashed"
 
 
-def test_reader_preserves_second_line_from_one_read():
-    import queue as queue_module
-
-    read_fd, write_fd = os.pipe()
-    cancel = threading.Event()
-    buffer = bytearray()
-    result = queue_module.Queue()
-    try:
-        os.write(write_fd, b'{"n": 1}\n{"n": 2}\n')
-        os.close(write_fd)
-        write_fd = -1
-        _reader_worker(read_fd, 1024, result, cancel, buffer)
-        first_kind, first_payload = result.get_nowait()
-        assert first_kind == "line"
-        assert first_payload == b'{"n": 1}'
-        _reader_worker(read_fd, 1024, result, cancel, buffer)
-        second_kind, second_payload = result.get_nowait()
-        assert second_kind == "line"
-        assert second_payload == b'{"n": 2}'
-    finally:
-        os.close(read_fd)
-        if write_fd != -1:
-            os.close(write_fd)
-
-
 def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_path,
                                                               plugin_settings):
     session = PluginSession(_meta(tmp_path, "buffered-calls", "indicator", INDICATOR_OK_PY),
@@ -1587,45 +1522,118 @@ def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_pa
         session._close_parent_fds()
 
 
-def test_terminal_close_waits_for_reader_before_reused_fd_is_closed(
-        tmp_path, plugin_settings):
+def test_terminal_close_closes_each_original_stream_once(tmp_path, plugin_settings):
     import gc
-    import queue as queue_module
 
-    session = PluginSession(_meta(tmp_path, "reader-close", "indicator", INDICATOR_OK_PY),
+    class CountingStream:
+        def __init__(self, stream):
+            self.stream = stream
+            self.close_calls = 0
+
+        @property
+        def closed(self):
+            return self.stream.closed
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def close(self):
+            self.close_calls += 1
+            self.stream.close()
+
+    session = PluginSession(_meta(tmp_path, "stream-close", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdin = CountingStream(proc.stdin)
+    proc.stdout = CountingStream(proc.stdout)
+    session._proc = proc
+    session._ensure_pipe_ownership()
+    stdin, stdout = proc.stdin, proc.stdout
+    try:
+        session._close_parent_fds()
+        assert stdin.closed and stdout.closed
+        assert proc.stdin is None and proc.stdout is None
+        assert stdin.close_calls == stdout.close_calls == 1
+        del session
+        gc.collect()
+        assert stdin.close_calls == stdout.close_calls == 1
+    finally:
+        if not stdin.closed:
+            stdin.close()
+        if not stdout.closed:
+            stdout.close()
+
+
+def test_buffered_line_is_checked_against_next_call_limit(monkeypatch, tmp_path,
+                                                           plugin_settings):
+    session = PluginSession(_meta(tmp_path, "buffer-limit", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     proc = _PipeHandle()
     proc.stdout.close()
-    reader_fd, held_write = os.pipe()
+    reader_fd, writer_fd = os.pipe()
     proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
     session._proc = proc
-    session._ensure_pipe_ownership()
-    closed_stdout_fd = session._stdout_fd
+    monkeypatch.setattr(session, "_kill", lambda: False)
     try:
-        result = queue_module.Queue()
-        session._reader_cancel = threading.Event()
-        session._reader_thread = threading.Thread(
-            target=_reader_worker,
-            args=(session._stdout_fd, 1024, result, session._reader_cancel,
-                  session._stdout_buffer),
-            daemon=True)
-        session._reader_thread.start()
-        started = time.monotonic()
-        session._close_parent_fds()
-        assert time.monotonic() - started < 1
-        replacement_read, replacement_write = os.pipe()
-        try:
-            assert replacement_read == closed_stdout_fd
-            os.fstat(replacement_read)
-            del session
-            gc.collect()
-            os.fstat(replacement_read)
-            os.fstat(replacement_write)
-        finally:
-            os.close(replacement_read)
-            os.close(replacement_write)
+        os.write(writer_fd, b'{"ok": true}\n' + b'x' * 32 + b'\n')
+        assert session._read_response(0.1, 65536) == {"ok": True}
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.1, 16)
+        assert error.value.code == session.error_code == "protocol_error"
     finally:
-        os.close(held_write)
+        os.close(writer_fd)
+        session._close_parent_fds()
+
+
+def test_read_response_does_not_use_select_select(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "poll", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
+    session._proc = proc
+    monkeypatch.setattr(sandbox.select, "select",
+                        lambda *_args: pytest.fail("select.select was used"))
+    try:
+        os.write(writer_fd, b'{"ok": true}\n')
+        assert session._read_response(0.1, 1024) == {"ok": True}
+    finally:
+        os.close(writer_fd)
+        session._close_parent_fds()
+
+
+def test_session_io_never_creates_a_thread(monkeypatch, tmp_path, plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox.threading, "Thread",
+                        lambda *_args, **_kwargs: pytest.fail("thread was created"))
+    meta = _meta(tmp_path, "no-thread", "indicator", INDICATOR_OK_PY)
+    assert run_plugin(meta, {"df": _df(), "params": {}}, settings=plugin_settings) == {
+        "mean_close": pytest.approx(101.45)}
+
+    timed_out = PluginSession(meta, settings=plugin_settings)
+    timed_out._proc = _PipeHandle()
+    monkeypatch.setattr(timed_out, "_kill", lambda: False)
+    with pytest.raises(SandboxError) as timeout_error:
+        timed_out._read_response(0.0, 1)
+    assert timeout_error.value.code == "timeout"
+    timed_out._close_parent_fds()
+
+    eof = PluginSession(meta, settings=plugin_settings)
+    proc = _PipeHandle()
+    proc.stdout.close()
+    reader_fd, writer_fd = os.pipe()
+    proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
+    os.close(writer_fd)
+    eof._proc = proc
+    monkeypatch.setattr(eof, "_kill", lambda: False)
+    with pytest.raises(SandboxError) as eof_error:
+        eof._read_response(0.1, 1024)
+    assert eof_error.value.code == "crashed"
+    eof._close_parent_fds()
 
 
 def test_unreaped_close_releases_all_parent_descriptors(monkeypatch, tmp_path,
@@ -1668,7 +1676,7 @@ def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_set
     session = PluginSession(_meta(tmp_path, "esrch", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     session._proc = _PipeHandle()
-    states = iter([False, False, True])
+    states = iter([False, False, False, True])
     monkeypatch.setattr(session, "_reap_worker", lambda: next(states))
     monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
     monkeypatch.setattr(time, "sleep", lambda _: None)
@@ -1676,6 +1684,31 @@ def test_killpg_esrch_reaps_after_initial_miss(monkeypatch, tmp_path, plugin_set
     session._kill()
     assert not session.worker_unreaped
     assert not session.parent_kill_sent
+
+
+def test_timeout_uses_reaped_esrch_worker_classification(monkeypatch, tmp_path,
+                                                          plugin_settings):
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "esrch-timeout", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    states = iter([False, False, False, True])
+
+    def reap():
+        if not next(states):
+            return False
+        session.worker_signal = signal.SIGKILL
+        session.worker_cpu_sec = plugin_settings.sandbox_session_cpu_sec
+        return True
+
+    monkeypatch.setattr(session, "_reap_worker", reap)
+    monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.1)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(ProcessLookupError()))
+    with pytest.raises(SandboxError) as error:
+        session._read_response(0.0, 1)
+    assert error.value.code == session.error_code == "cpu_limit"
 
 
 def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_path,
