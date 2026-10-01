@@ -1,4 +1,4 @@
-# [quiet-market-restricted-state] 設計書 v1.1
+# [quiet-market-restricted-state] 設計書 v1.2
 
 作成日: 2026-10-01。対象は、日次 rollover などで primary の 1m 足が短時間欠ける間の新規 entry 停止境界である。既存の outage/backfill 設計を置換するのではなく、flat 時の短い 1m stall に `restricted` を追加し、既存の `ready` / `degraded` / `backfilling`、backfill、replay の安全規則を補足する。
 
@@ -84,6 +84,16 @@ tick 冒頭で UTC `now` を一度だけ採取し、observe、state transaction�
 |`degraded`|その他|`degraded`|不変|
 
 flat の deadline 昇格、又は flat の empty/failed による direct degraded で `pending_human_confirmation=1` を立てないのは、`auto_resume_when_flat=true` かつ既存の人手確認要件が無いときだけである。`pending=1` は `auto_resume_when_flat=false`、exposure、又は既存仕様の人手確認要件で立てる。`pending=1` は automatic ready を妨げ、受理された `data resume` transaction だけが 0 にできる。再起動後は state/deadline/pending を保持し、in-memory healthy 証拠を捨てるため H3 を改めて数える。
+
+**健全判定の対象 key (v1.2 で明確化):** 「当 tick に取得成功かつ非 empty」を求めるのは hard の 1m key だけである。1m 以外の hard key (判断足など) は足の確定時刻まで再取得されないため、当 tick に failed / empty / stalled でなく、最後に確認できた試行が失敗でなければ健全側に数える。failed / empty はどの hard key でも即 `degraded`、stalled はどの hard key でも `restricted` (flat) または `degraded` (exposure) の入口になる。上位足の停滞を無視しないためである。
+
+**`restricted` の時刻の保持:** `restricted → degraded` に上がっても `restricted_since` と `restricted_deadline_at` は消さない。停滞の起点の記録として残し、`ready` に戻ったときに NULL にする。
+
+**取得結果の保存失敗:** ingest の commit が例外を出した tick も、prepare の例外と同じく全 hard key が失敗した report として観測する。
+
+**signal の整理:** 鮮度切れの abandoned と lease 切れの reclaim を行う maintenance は `ready` のときだけ動く。`restricted` / `degraded` の間に鮮度が切れた signal は、`ready` 復帰後の最初の maintenance で abandoned になる。その間も claim 側の鮮度条件が効くので発注には至らない。
+
+**理由の文言:** 発注拒否と mission 不開始の理由には実際の state 名を入れる (`data state restricted (fail closed)` など)。可変情報は state 名だけとする。
 
 ### 発注と mission の gate
 
@@ -223,3 +233,4 @@ backfill、replay、既存建玉の連続性検査、`backfilling` 中の drain/
 |---|---|---|---|---|
 |2026-10-01|v1.0|flat 1m stall の bounded `restricted`、deadline 優先、state/gap transaction、best-effort activity、1m read-tool 契約、fixture acceptance を spec として確定。|設計レビュー 2 周の裁定。状態名は `ready` / `restricted` / `degraded` (形容詞 1 語で揃える、ユーザー裁定)。既定の上限 30 分・3 tick・取得失敗と empty は即 degraded も同裁定|`(this)`|
 |2026-10-01|v1.1|受入条件 AC-1 の 9/29 の時刻を訂正 (episode 2 の ready は 21:25、episode 3 は 21:32)。AC-3 の 9/13 は 18 連続の後にも欠落があり 3 episode (21:03→21:23、21:24→21:35、21:43→21:49)。連続 2 本欠落の分だけ stalled が 1 tick 長い。|実装時に fixture を停滞式で再生して判明。仕様の動作は変えていない|`(this)`|
+|2026-10-01|v1.2|健全判定の対象 key を明確化 (当 tick の成功を求めるのは 1m だけ、上位足は据え置き)。`restricted` 時刻の保持、commit 例外の扱い、signal 整理の収束時点、理由の文言を追記。|実設定 (1m + 判断足) の再生で自動復帰しない退行が見つかったため。変異スイープとレビューの指摘|`(this)`|
