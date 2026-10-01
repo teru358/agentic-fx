@@ -167,7 +167,7 @@ fixture は実装時に `tests/fixtures/outage/` に置く。バー時刻は実�
 |---|---|---|
 |AC-1|9/29 の実バーは三つの別 episode を作る。|episode 1: 21:17 restricted（deadline 21:46:30）→ 21:18/19/20 healthy → 21:20 ready。episode 2: 21:21 restricted（21:50:30）→ 21:22 は stalled のまま (21:19・21:20 の 2 本欠落) → 21:23/24/25 healthy → 21:25 ready。episode 3: 21:28 restricted（21:57:30）→ 21:29 は stalled のまま (21:26・21:27 の 2 本欠落) → 21:30/31/32 healthy → 21:32 ready。確定足は close の 1 分後の poll で見える前提 (60 秒 poll、grace 30 秒)。いずれも deadline 非到達、degraded なし。|
 |AC-2|deadline 超過は fixture に依存しない合成 case で検証する。|watermark と restricted 起点を固定し、`now == deadline` は restricted、`now > deadline` は healthy でも degraded を assert。**合成** case と明記する。|
-|AC-3|9/13 の日曜開場は bounded restricted から回復する。|21:03 restricted（deadline 21:32:30）、21:21/22/23 の H3 で ready。deadline 非到達。exposure 一件なら 21:03 同 tick で degraded。|
+|AC-3|9/13 の日曜開場は三つの別 episode を作り、どれも bounded restricted から回復する。|episode 1: 21:03 restricted（deadline 21:32:30）→ 21:21/22/23 healthy → 21:23 ready。episode 2: 21:24 restricted（21:53:30）→ 21:35 ready。episode 3: 21:43 restricted（22:12:30）→ 21:49 ready。いずれも deadline 非到達、degraded なし。exposure 一件なら 21:03 同 tick で degraded。|
 |AC-4|9/30 は遷移なし。|66 本の連続列で、低 tick 数を注入しても restricted/degraded/activity が発生しない。|
 |AC-5|deadline 優先と週末自動復帰。|金曜 flat restricted が週末に期限切れ後、日曜最初の healthy tick でも degraded。flat+auto=true+pending=0 ではその後 H3 で ready。DB state から停止時間を測り、activity 列 `datafeed_restricted` → `datafeed_degraded` → `datafeed_recovered_auto` を確認する。|
 |AC-6|empty/failed の全セル。|ready/restricted/degraded と exposure の有無の組で empty/failed を投入し、ready/restricted は同 tick degraded、degraded は維持。deferred/not-attempted が healthy streak を進めないことも assert。|
@@ -222,4 +222,4 @@ backfill、replay、既存建玉の連続性検査、`backfilling` 中の drain/
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
 |2026-10-01|v1.0|flat 1m stall の bounded `restricted`、deadline 優先、state/gap transaction、best-effort activity、1m read-tool 契約、fixture acceptance を spec として確定。|設計レビュー 2 周の裁定。状態名は `ready` / `restricted` / `degraded` (形容詞 1 語で揃える、ユーザー裁定)。既定の上限 30 分・3 tick・取得失敗と empty は即 degraded も同裁定|`(this)`|
-|2026-10-01|v1.1|受入条件 AC-1 の 9/29 の時刻を訂正 (episode 2 の ready は 21:25、episode 3 は 21:32)。連続 2 本欠落の分だけ stalled が 1 tick 長い。|実装時に fixture を停滞式で再生して判明。仕様の動作は変えていない|`(this)`|
+|2026-10-01|v1.1|受入条件 AC-1 の 9/29 の時刻を訂正 (episode 2 の ready は 21:25、episode 3 は 21:32)。AC-3 の 9/13 は 18 連続の後にも欠落があり 3 episode (21:03→21:23、21:24→21:35、21:43→21:49)。連続 2 本欠落の分だけ stalled が 1 tick 長い。|実装時に fixture を停滞式で再生して判明。仕様の動作は変えていない|`(this)`|
