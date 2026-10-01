@@ -4,6 +4,8 @@
 (同期経路の OPEN 拒否と、submit 直前の state 変化は test_executor.py /
 test_executor_snapshot.py が pin している。)
 """
+import pytest
+
 from agentic_fx.core.contracts import OrderStatus as S, Origin, TradeIntent
 from agentic_fx.store import orders
 
@@ -13,17 +15,19 @@ from tests.core.test_executor_snapshot import (
 )
 
 
-def test_open_from_snapshot_is_rejected_at_the_entry_when_restricted(tmp_path):
+@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
+def test_open_from_snapshot_is_rejected_at_the_entry_when_not_ready(tmp_path, data_state):
     ex = _make_executor(tmp_path)
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
-    ex.state_fn = lambda: "restricted"
+    ex.state_fn = lambda: data_state
 
     out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
 
     assert out["result"] == "rejected"
+    assert out["reasons"] == [f"data state {data_state} (fail closed)"]
     assert orders.list_by_status(ex.conn, S.OPEN, S.PENDING_FILL, S.SUBMITTING,
                                  S.REJECTED) == []
     row = ex.conn.execute("SELECT gate_result, reject_category FROM trade_intents "

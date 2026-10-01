@@ -1232,9 +1232,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             # 読む。
             if now is None:
                 now = clock.now()
-            if outage.state != "ready":
+            data_state = outage.state
+            if data_state != "ready":
                 raise DataUnhealthy(
-                    f"data state degraded for {pair} (outage in progress)")
+                    f"data state {data_state} for {pair} (outage in progress)")
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
             for interval in settings.datafeed.primary_intervals:
                 rows = ohlcv.load_cache_bars(conn_supervisor, pair, interval,
@@ -1357,6 +1358,15 @@ def build_splash(app: App) -> str:
         "コマンドは help を参照。stop で終了。")
 
 
+def _all_hard_keys_failed(app: App, exc: Exception) -> IngestTickReport:
+    """取得を完了できなかった tick を、全 hard key が失敗した報告として表す。"""
+    keys = app.outage.hard_keys
+    return IngestTickReport(
+        attempted=frozenset(keys), succeeded=frozenset(),
+        failed=frozenset((key, safe_error_text(exc)) for key in keys),
+        deferred=frozenset(), empty=frozenset())
+
+
 def _scheduler_tick_once(app: App) -> None:
     """scheduler_thread の 1 tick 分 (抽出 — 単体テスト用シーム)。
 
@@ -1383,12 +1393,7 @@ def _scheduler_tick_once(app: App) -> None:
             prepare_failed = True
             _log.warning("ingest prepare failed: %s", safe_error_text(exc))
             if app.outage is not None:
-                failed = frozenset((key, safe_error_text(exc))
-                                   for key in app.outage.hard_keys)
-                ingest_result = IngestTickReport(
-                    attempted=frozenset(app.outage.hard_keys),
-                    succeeded=frozenset(), failed=failed,
-                    deferred=frozenset(), empty=frozenset())
+                ingest_result = _all_hard_keys_failed(app, exc)
             try:
                 app.activity.write(Category.SYSTEM, "ingest_prepare_failed",
                                    safe_error_text(exc))
@@ -1407,18 +1412,29 @@ def _scheduler_tick_once(app: App) -> None:
                 # prepare() が例外を投げた tick は、全 hard key が失敗した
                 # report に置き換えて observe まで進める (取得できなかった
                 # tick を「観測なし」で流すと、停止の判定が 1 tick 遅れる)。
+                # commit が例外を出した tick も同じ扱いにする。
                 try:
                     if not prepare_failed:
                         app.ingest.commit(app.conn_core)
-                    if app.outage is not None:
-                        app.outage.observe(now, ingest_result)
                 except Exception as exc:  # noqa: BLE001 -- protection must still tick
                     _log.warning("ingest commit failed: %s", safe_error_text(exc))
+                    if app.outage is not None:
+                        ingest_result = _all_hard_keys_failed(app, exc)
                     try:
                         app.activity.write(Category.SYSTEM, "ingest_commit_failed",
                                            safe_error_text(exc))
                     except Exception:  # noqa: BLE001 -- activity cannot stop protection
                         _log.exception("failed to record ingest commit failure")
+                try:
+                    if app.outage is not None:
+                        app.outage.observe(now, ingest_result)
+                except Exception as exc:  # noqa: BLE001 -- protection must still tick
+                    _log.warning("outage observe failed: %s", safe_error_text(exc))
+                    try:
+                        app.activity.write(Category.SYSTEM, "outage_observe_failed",
+                                           safe_error_text(exc))
+                    except Exception:  # noqa: BLE001 -- activity cannot stop protection
+                        _log.exception("failed to record outage observe failure")
             with app.executor.defer_notifications() as deferred:
                 pending = app.scheduler.tick(now)
     finally:

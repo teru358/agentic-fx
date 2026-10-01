@@ -104,18 +104,19 @@ def test_open_limit_creates_pending_fill(tmp_path):
 
 # --- [outage-stop-and-backfill]: state gate ---
 
-def test_open_rejected_fail_closed_when_state_not_ready(tmp_path):
+@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
+def test_open_rejected_fail_closed_when_state_not_ready(tmp_path, data_state):
     """`state_fn() != "ready"` の間、`_open` は quote_fn/GateContext を作る
     前に fail closed する — 新規成行 open (新規 drawdown 判定を含む) を
     一切行わない。"""
     conn, ex, _, mid = _setup(tmp_path)
     quote_calls = []
     ex.quote_fn = lambda p: (quote_calls.append(p), QUOTE)[1]
-    ex.state_fn = lambda: "restricted"
+    ex.state_fn = lambda: data_state
     out = ex.handle_intent(_open_intent(entry_type="market", limit_price=None,
                                         expires_in=None), mid)
     assert out["result"] == "rejected"
-    assert any("degraded" in r for r in out["reasons"])
+    assert out["reasons"] == [f"data state {data_state} (fail closed)"]
     assert quote_calls == []  # quote_fn 自体に到達していない
     row = conn.execute("SELECT * FROM trade_intents").fetchone()
     assert row["gate_result"] == "rejected"

@@ -4874,10 +4874,30 @@ def test_db_healthcheck_raises_while_the_data_state_is_restricted(tmp_path):
         app.conn_core.execute(
             "UPDATE datafeed_outage_state SET state='restricted' WHERE id=1")
         app.conn_core.commit()
-        with pytest.raises(DataUnhealthy):
+        with pytest.raises(DataUnhealthy, match="data state restricted for USDJPY"):
             app.trade_loop.provider.healthcheck("USDJPY")
     finally:
         app.close()
+
+
+def test_scheduler_tick_observes_a_failed_report_when_ingest_commit_raises(tmp_path):
+    from agentic_fx.datafeed.outage import EMPTY_REPORT
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.ingest = MagicMock()
+    app.ingest.prepare.return_value = (0, EMPTY_REPORT)
+    app.ingest.commit.side_effect = RuntimeError("commit boom")
+    app.activity.write = MagicMock()
+    seen = []
+    app.scheduler.tick = lambda now: seen.append(now) or []
+
+    _scheduler_tick_once(app)
+
+    assert app.outage.state == "degraded"
+    assert seen == [app.clock.now()]
+    events = [call.args[1] for call in app.activity.write.call_args_list]
+    assert events.count("ingest_commit_failed") == 1
 
 
 def test_scheduler_tick_does_not_commit_ingest_bars_when_prepare_raises(tmp_path):

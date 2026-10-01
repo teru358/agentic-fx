@@ -1001,7 +1001,7 @@ def test_exposure_order_prevents_auto_resume(status, tmp_path):
     assert len([line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]) == 1
 
 
-def test_auto_resume_requires_a_current_success_for_every_key(tmp_path):
+def test_auto_resume_uses_last_success_for_not_attempted_key(tmp_path):
     conn = _db(tmp_path)
     keys = frozenset({(PAIR, "1m"), (PAIR, "15m")})
     machine = OutageStateMachine(conn, hard_keys=keys,
@@ -1013,7 +1013,7 @@ def test_auto_resume_requires_a_current_success_for_every_key(tmp_path):
         _report(succeeded=keys)) == "degraded"
     one_minute = _report(succeeded=[(PAIR, "1m")])
     assert machine.observe(datetime(2026, 9, 24, 10, 3, tzinfo=timezone.utc), one_minute) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "degraded"
+    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "ready"
 
 
 def test_auto_resume_streak_resets_after_process_restart(tmp_path):

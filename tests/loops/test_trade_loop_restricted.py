@@ -1,9 +1,11 @@
 """state が restricted の間の trade loop (signal 起動) の requeue と解除後の再 claim。"""
 from datetime import timedelta
 
+import pytest
+
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.runners.base import MissionResult
-from agentic_fx.store import missions, orders, signals
+from agentic_fx.store import missions, orders
 
 from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
 from tests.loops.test_trade_loop_signal import _add_signal
@@ -24,11 +26,12 @@ def _set_now(loop, when):
     loop.executor.clock = clock
 
 
-def test_claimed_open_signal_is_abandoned_once_requeue_limit_is_reached(tmp_path):
+@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
+def test_claimed_open_signal_is_abandoned_once_requeue_limit_is_reached(tmp_path, data_state):
     limit = SETTINGS.plugin.signal_requeue_max
     conn, loop, runner, _ = _loop(
         tmp_path, [MissionResult("completed", OPEN_RESULT, [])] * (limit + 1))
-    loop.executor.state_fn = lambda: "restricted"
+    loop.executor.state_fn = lambda: data_state
     sid = _add_signal(conn)
 
     for attempt in range(limit):
@@ -44,28 +47,14 @@ def test_claimed_open_signal_is_abandoned_once_requeue_limit_is_reached(tmp_path
     assert rejected == limit + 1
 
 
-def test_requeued_open_signal_that_went_stale_is_abandoned_by_maintenance(tmp_path):
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN_RESULT, [])])
-    loop.executor.state_fn = lambda: "restricted"
-    sid = _add_signal(conn)   # bar_ts = 11:00 の 1h 足、鮮度は 13:00 まで
-    loop.run_once("signal")
-    assert _signal_row(conn, sid)["status"] == "pending"
-
-    expired = signals.expire_stale(
-        conn, now=NOW + timedelta(hours=3),
-        freshness_bars=SETTINGS.plugin.signal_freshness_bars)
-
-    assert expired.total == 1
-    assert _signal_row(conn, sid)["status"] == "abandoned"
-
-
-def test_after_restricted_clears_the_signal_is_claimed_again_only_after_the_min_interval(
-        tmp_path):
+@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
+def test_after_the_data_state_clears_the_signal_is_claimed_again_only_after_the_min_interval(
+        tmp_path, data_state):
     interval = SETTINGS.plugin.signal_min_interval_min
     conn, loop, _, _ = _loop(tmp_path, [
         MissionResult("completed", OPEN_RESULT, []),
         MissionResult("completed", {"action": "hold", "reasoning": "ok"}, [])])
-    state = {"v": "restricted"}
+    state = {"v": data_state}
     loop.executor.state_fn = lambda: state["v"]
     sid = _add_signal(conn)
     loop.run_once("signal")

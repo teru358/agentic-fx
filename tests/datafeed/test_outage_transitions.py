@@ -355,3 +355,118 @@ def test_accepted_resume_clears_the_pending_human_confirmation(tmp_path):
 
     assert machine.observe(NOW, _report()) == "ready"
     assert machine.status()["pending_human_confirmation"] == 0
+
+
+KEY_15M = (PAIR, "15m")
+WIDTHS_WITH_15M = {"1m": timedelta(minutes=1), "15m": timedelta(minutes=15)}
+
+
+def _rig_with_15m(tmp_path, **kw):
+    conn = connect(tmp_path / "outage.db")
+    init_db(conn)
+    machine = OutageStateMachine(
+        conn, hard_keys=frozenset({KEY, KEY_15M}), interval_widths=WIDTHS_WITH_15M,
+        grace=GRACE, storage_source="mt5-live", **kw)
+    return conn, machine
+
+
+def _fresh_both(conn, now):
+    _fresh(conn, now)
+    upsert_cache_bars(conn, [Bar(PAIR, "15m", now - timedelta(minutes=20), 1, 1, 1, 1, 1)],
+                      source="mt5-live")
+    conn.commit()
+
+
+def _only_1m():
+    """15m は取りに行かない tick の報告 (attempted にも deferred にも入らない)。"""
+    return _report(ok=(KEY,))
+
+
+def _both():
+    return _report(ok=(KEY, KEY_15M))
+
+
+@pytest.mark.parametrize("start_state", ["restricted", "degraded"])
+def test_a_higher_timeframe_key_probed_once_in_a_while_does_not_block_auto_recovery(
+        tmp_path, start_state):
+    conn, machine = _rig_with_15m(tmp_path)
+    _put_state(conn, machine, start_state,
+               deadline=NOW + timedelta(minutes=30) if start_state == "restricted" else None)
+    states = []
+    for minute, report in enumerate([_both(), _only_1m(), _only_1m()]):
+        now = NOW + timedelta(minutes=minute)
+        _fresh_both(conn, now)
+        states.append(machine.observe(now, report))
+
+    assert states == [start_state, start_state, "ready"]
+
+
+def test_a_failed_higher_timeframe_key_degrades_immediately(tmp_path):
+    conn, machine = _rig_with_15m(tmp_path)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=30))
+    _fresh_both(conn, NOW)
+
+    assert machine.observe(NOW, _report(ok=(KEY,), failed=(KEY_15M,))) == "degraded"
+
+
+def test_a_failed_higher_timeframe_key_from_ready_opens_a_degraded_episode(tmp_path):
+    conn, machine = _rig_with_15m(tmp_path)
+    _fresh_both(conn, NOW)
+
+    assert machine.observe(NOW, _report(ok=(KEY,), failed=(KEY_15M,))) == "degraded"
+
+
+def test_a_higher_timeframe_failure_blocks_recovery_until_that_key_succeeds_again(tmp_path):
+    conn, machine = _rig_with_15m(tmp_path)
+    _put_state(conn, machine, "degraded")
+    states = []
+    reports = [_report(ok=(KEY,), failed=(KEY_15M,)), _only_1m(), _only_1m(), _only_1m(),
+               _both(), _only_1m(), _only_1m()]
+    for minute, report in enumerate(reports):
+        now = NOW + timedelta(minutes=minute)
+        _fresh_both(conn, now)
+        states.append(machine.observe(now, report))
+
+    assert states == ["degraded"] * 6 + ["ready"]
+
+
+@pytest.mark.parametrize("skipped", [
+    IngestTickReport(attempted=frozenset(), succeeded=frozenset({KEY_15M}),
+                     failed=frozenset(), deferred=frozenset({KEY}), empty=frozenset()),
+    IngestTickReport(attempted=frozenset(), succeeded=frozenset({KEY_15M}),
+                     failed=frozenset(), deferred=frozenset(), empty=frozenset()),
+])
+def test_a_1m_key_that_is_deferred_or_not_attempted_does_not_advance_the_streak(
+        tmp_path, skipped):
+    conn, machine = _rig_with_15m(tmp_path)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=30))
+    states = []
+    for minute, report in enumerate([_both(), _only_1m(), skipped, _only_1m(), _only_1m()]):
+        now = NOW + timedelta(minutes=minute)
+        _fresh_both(conn, now)
+        states.append(machine.observe(now, report))
+    assert states == ["restricted"] * 5
+    now = NOW + timedelta(minutes=5)
+    _fresh_both(conn, now)
+    assert machine.observe(now, _only_1m()) == "ready"
+
+
+def test_degrading_from_restricted_discards_the_healthy_streak_collected_so_far(tmp_path):
+    conn, machine = _rig(tmp_path)
+    deadline = NOW + timedelta(minutes=2, seconds=30)
+    _put_state(conn, machine, "restricted", deadline=deadline)
+    states = []
+    # 10:00 / 10:01 は健全 (streak=2)、10:03 は期限 10:02:30 を過ぎて degraded
+    for minute in (0, 1, 3):
+        now = NOW + timedelta(minutes=minute)
+        _fresh(conn, now)
+        states.append(machine.observe(now, _report()))
+    assert states == ["restricted", "restricted", "degraded"]
+    assert machine.status()["ready_streak"] == 0
+
+    # degraded に上がってからは健全 tick が 3 回要る (1 回で戻らない)
+    for minute in (4, 5, 6):
+        now = NOW + timedelta(minutes=minute)
+        _fresh(conn, now)
+        states.append(machine.observe(now, _report()))
+    assert states[3:] == ["degraded", "degraded", "ready"]

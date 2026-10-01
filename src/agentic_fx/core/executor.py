@@ -500,8 +500,9 @@ class Executor:
         # quote 取得・GateContext 構築より前に fail closed する — 不通中は
         # 新規成行 open (新規の drawdown/kill switch 判定を含む) を一切
         # 行わない。
-        if self.state_fn() != "ready":
-            reasons = ["data source degraded (fail closed)"]
+        data_state = self.state_fn()
+        if data_state != "ready":
+            reasons = [f"data state {data_state} (fail closed)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0],
                                           reject_category="risk_gate")
@@ -587,8 +588,9 @@ class Executor:
             expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
             if intent.expires_in_h else None)
         row = orders.get(self.conn, oid)
-        if self.state_fn() != "ready":
-            reasons = ["data source degraded (fail closed)"]
+        data_state = self.state_fn()
+        if data_state != "ready":
+            reasons = [f"data state {data_state} (fail closed)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0],
                                           reject_category="risk_gate")
@@ -728,8 +730,9 @@ class Executor:
         完全共有 — 判定ロジック不変)。
         """
         now = self.clock.now()
-        if self.state_fn() != "ready":
-            reasons = ["data source degraded (fail closed)"]
+        data_state = self.state_fn()
+        if data_state != "ready":
+            reasons = [f"data state {data_state} (fail closed)"]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0],
                                           reject_category="risk_gate")

@@ -201,18 +201,20 @@ def test_open_from_snapshot_matches_handle_intent(tmp_path):
     assert row1["avg_fill_price"] == row2["avg_fill_price"]
 
 
-def test_open_from_snapshot_stops_when_state_changes_before_submit(tmp_path):
+@pytest.mark.parametrize("data_state", ["degraded", "restricted"])
+def test_open_from_snapshot_stops_when_state_changes_before_submit(tmp_path, data_state):
     ex = _make_executor(tmp_path)
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
-    states = iter(("ready", "restricted"))
+    states = iter(("ready", data_state))
     ex.state_fn = lambda: next(states)
 
     out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
 
     assert out["result"] == "rejected"
+    assert out["reasons"] == [f"data state {data_state} (fail closed)"]
     assert orders.list_by_status(ex.conn, S.OPEN, S.PENDING_FILL, S.SUBMITTING) == []
 
 

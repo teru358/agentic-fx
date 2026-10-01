@@ -147,6 +147,8 @@ class OutageStateMachine:
             "state": row.get("state", "ready"),
             "epoch": epoch,
             "entered_degraded_at": row.get("entered_degraded_at"),
+            "restricted_since": row.get("restricted_since"),
+            "restricted_deadline_at": row.get("restricted_deadline_at"),
             "pending_human_confirmation": row.get("pending_human_confirmation", 0),
             "resume_requested_at": row.get("resume_requested_at"),
             "resume_acknowledge": row.get("resume_acknowledge", 0),
@@ -185,14 +187,21 @@ class OutageStateMachine:
                    if self._is_stalled(now, key[1], watermarks.get(key))}
         expected = {key: self._expected(key[1], watermarks[key]) for key in stalled}
         flat = not orders.list_by_status(self.conn, *_EXPOSURE)
-        healthy = (not hard_failed and not hard_empty and not stalled
-                   and all(key in report.succeeded and key not in report.empty
-                           for key in self.hard_keys))
         for key in self.hard_keys:
             if key in report.succeeded and key not in report.empty:
                 self._last_attempt_ok[key] = True
             elif key in hard_failed or key in hard_empty:
                 self._last_attempt_ok[key] = False
+        # 回復の根拠として「この tick に succeeded かつ非 empty」を要求するのは
+        # 1m の hard key だけ (1m が無い構成では全 key)。上位足は取得の周期が
+        # 長く、取りに行かない tick (deferred / not-attempted) が普通にあるので、
+        # この tick で failed / empty / stalled でない限り前回の結果を据え置く。
+        gate_keys = frozenset(key for key in self.hard_keys if key[1] == "1m") or self.hard_keys
+        healthy = (not hard_failed and not hard_empty and not stalled
+                   and all(key in report.succeeded and key not in report.empty
+                           for key in gate_keys)
+                   and all(self._last_attempt_ok.get(key) is not False
+                           for key in self.hard_keys - gate_keys))
         unconfirmed = frozenset(
             key for key in self.hard_keys
             if key in stalled or self._last_attempt_ok.get(key) is not True)
@@ -351,12 +360,10 @@ class OutageStateMachine:
                     entered_degraded_at: str | None,
                     restricted_since: str | None = None,
                     restricted_deadline_at: str | None = None,
-                    pending_human_confirmation: int | None = None,
+                    pending_human_confirmation: int,
                     recovered_notified_epoch: int | None,
                     ready_streak: int,
                     updated_at: str) -> None:
-        if pending_human_confirmation is None:
-            pending_human_confirmation = self._load_row().get("pending_human_confirmation", 0)
         self.conn.execute(
             "UPDATE datafeed_outage_state SET state=?, epoch=?, confirmed=?, "
             "entered_degraded_at=?, restricted_since=?, restricted_deadline_at=?, "

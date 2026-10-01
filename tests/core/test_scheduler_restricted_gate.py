@@ -6,9 +6,9 @@
 from datetime import timedelta
 
 from agentic_fx.core.contracts import Bar
-from agentic_fx.store import orders
+from agentic_fx.store import orders, signals
 
-from tests.core.test_scheduler import FRI, WED, Env, _seed_decision_bar
+from tests.core.test_scheduler import FRI, SETTINGS, WED, Env, _seed_decision_bar
 
 
 def test_restricted_blocks_cron_mission_and_does_not_advance_the_cursor(tmp_path):
@@ -80,3 +80,28 @@ def test_restricted_keeps_the_cron_cursor_unadvanced_across_a_market_close(tmp_p
 
     assert env.trade_calls == 0
     assert ("USDJPY", "1h") not in env.sched._cron_watermarks
+
+
+def test_stale_pending_signal_is_abandoned_by_the_first_maintenance_after_restricted_clears(
+        tmp_path):
+    state = {"v": "restricted"}
+    env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"],
+              on_signal_maintenance=lambda now: signals.expire_stale(
+                  env.conn, now=now,
+                  freshness_bars=SETTINGS.plugin.signal_freshness_bars))
+    bar_ts = WED - timedelta(hours=5)   # 1h 足の鮮度 (2 本) はとうに切れている
+    sid = signals.add(
+        env.conn, plugin="sig1", content_hash="h1", pair="USDJPY", timeframe="1h",
+        bar_ts=bar_ts.isoformat(), kind="signal",
+        payload={"direction": "long", "strength": 0.7, "rationale": "up"}, now=bar_ts)
+
+    env.sched.tick(WED)
+    assert env.signal_maintenance_calls == 0
+    assert env.conn.execute("SELECT status FROM signals WHERE id=?",
+                            (sid,)).fetchone()[0] == "pending"
+
+    state["v"] = "ready"
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert env.signal_maintenance_calls == 1
+    assert env.conn.execute("SELECT status FROM signals WHERE id=?",
+                            (sid,)).fetchone()[0] == "abandoned"

@@ -23,7 +23,7 @@ _HELP = """コマンド一覧:
   log [n]                    技術ログの直近 n 行 (default 20)
   activity [n] [カテゴリ]     activity ログ (NEWS/TECH/AGGREGATE/TRADE/IMPROVE/APPROVAL/SYSTEM)
   ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
-  data resume [--acknowledge]  価格源 degraded からの手動復帰要求 (次 tick で判定)
+  data resume [--acknowledge]  価格源 degraded / restricted からの手動復帰要求 (次 tick で判定)
   approve <id> / reject <id> [理由]   承認操作
   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
   approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
@@ -381,8 +381,15 @@ class Commands:
         unprocessed_text = f"未処理建玉 {info['unprocessed_positions']} 件"
         if detail:
             unprocessed_text += f" ({detail})"
+        if state == "restricted":
+            since_text = (f"since {info['restricted_since']}, "
+                          f"deadline {info['restricted_deadline_at']}")
+        else:
+            since_text = f"since {info['entered_degraded_at']}"
+            if info["restricted_since"] is not None:
+                since_text += f", restricted from {info['restricted_since']}"
         return (f"data: {state.upper()} (epoch {info['epoch']}, "
-                f"since {info['entered_degraded_at']}, gap: {gap_text}) — "
+                f"{since_text}, gap: {gap_text}) — "
                 f"{unprocessed_text}{resume_text}")
 
     def _data_resume(self, args: list[str]) -> str:

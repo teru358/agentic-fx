@@ -85,6 +85,47 @@ def test_status_shows_degraded_data_line(tmp_path):
     assert "未処理建玉" in out
 
 
+def _stall(conn, outage, now):
+    """1m の確定足が 10 分前で止まった状態の観測 (建玉なし → restricted になる)。"""
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.store.ohlcv import upsert_cache_bars
+    upsert_cache_bars(conn, [Bar("USDJPY", "1m", now - timedelta(minutes=10),
+                                 1, 1, 1, 1, 1)], source="mt5-live")
+    conn.commit()
+    report = IngestTickReport(
+        attempted=frozenset({("USDJPY", "1m")}), succeeded=frozenset({("USDJPY", "1m")}),
+        failed=frozenset(), deferred=frozenset(), empty=frozenset())
+    return outage.observe(now, report), report
+
+
+def test_status_shows_restricted_origin_and_deadline(tmp_path):
+    conn, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _stall(conn, outage, NOW)[0] == "restricted"
+    out = cmds.dispatch("status")
+    assert "data: RESTRICTED" in out
+    assert "since 2026-07-22T11:52:30+00:00" in out
+    assert "deadline 2026-07-22T12:22:30+00:00" in out
+    assert "since None" not in out
+
+
+def test_status_shows_where_a_degraded_state_came_from_when_it_rose_from_restricted(tmp_path):
+    conn, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    _, report = _stall(conn, outage, NOW)
+    later = NOW + timedelta(minutes=31)
+    assert outage.observe(later, report) == "degraded"
+    out = cmds.dispatch("status")
+    assert "data: DEGRADED" in out
+    assert f"since {later.isoformat()}" in out
+    assert "restricted from 2026-07-22T11:52:30+00:00" in out
+
+
+def test_status_shows_no_restricted_origin_for_a_degraded_state_that_never_was_restricted(
+        tmp_path):
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+    assert _degrade(outage, NOW) == "degraded"
+    assert "restricted from" not in cmds.dispatch("status")
+
+
 def test_status_shows_unprocessed_breakdown_by_pair(tmp_path):
     from agentic_fx.core.contracts import Bar
     from agentic_fx.store import orders

@@ -13,12 +13,14 @@ from types import SimpleNamespace
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import Bar
 from agentic_fx.datafeed.ingest import Ingest
-from agentic_fx.datafeed.outage import OutageStateMachine
+from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
 from agentic_fx.store import orders
 from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.ohlcv import upsert_cache_bars
 
 PAIR = "USDJPY"
 KEY = (PAIR, "1m")
+KEY_15M = (PAIR, "15m")
 UTC = timezone.utc
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "outage"
 
@@ -36,7 +38,7 @@ def _settings():
                                  ingest_budget_sec=10, closed_bar_grace_sec=30))
 
 
-def _rig(tmp_path, bars, *, activity=None):
+def _rig(tmp_path, bars, *, activity=None, with_15m=False):
     conn = connect(tmp_path / "outage.db")
     init_db(conn)
 
@@ -45,8 +47,10 @@ def _rig(tmp_path, bars, *, activity=None):
         return [b for b in bars if start <= b.ts <= end]
 
     ingest = Ingest(_settings(), fetch=fetch)
+    hard_keys = frozenset({KEY, KEY_15M}) if with_15m else frozenset({KEY})
+    widths = {"1m": timedelta(minutes=1), "15m": timedelta(minutes=15)}
     machine = OutageStateMachine(
-        conn, hard_keys=frozenset({KEY}), interval_widths={"1m": timedelta(minutes=1)},
+        conn, hard_keys=hard_keys, interval_widths=widths,
         grace=timedelta(seconds=30), storage_source="mt5-live", activity=activity)
     return conn, ingest, machine
 
@@ -58,6 +62,37 @@ def _replay(conn, ingest, machine, start, end):
     while now <= end:
         _, report = ingest.prepare(now, conn)
         ingest.commit(conn)
+        trace[now] = (machine.observe(now, report), machine.status())
+        now += timedelta(minutes=1)
+    return trace
+
+
+def _replay_with_15m(conn, ingest, machine, start, end):
+    """`_replay` と同じだが、15m の hard key を合成した報告で足す。
+
+    15m の足は fixture に無いので合成する: 実 ingest と同じく 15m は次の足の確定
+    時刻 (毎時 :01 / :16 / :31 / :46 の tick) にだけ取得を試みて succeeded とし、
+    直前に確定した 15m 足を cache に入れる。それ以外の tick は 15m を attempted
+    にも deferred にもしない (not-attempted)。
+    """
+    trace = {}
+    now = start
+    while now <= end:
+        _, report = ingest.prepare(now, conn)
+        ingest.commit(conn)
+        succeeded = set(report.succeeded)
+        attempted = set(report.attempted)
+        if now.minute % 15 == 1:
+            bar_start = (now - timedelta(minutes=1)).replace(
+                minute=((now - timedelta(minutes=1)).minute // 15) * 15) - timedelta(minutes=15)
+            upsert_cache_bars(conn, [Bar(PAIR, "15m", bar_start, 1, 1, 1, 1, 1)],
+                              source="mt5-live")
+            conn.commit()
+            succeeded.add(KEY_15M)
+            attempted.add(KEY_15M)
+        report = IngestTickReport(
+            attempted=frozenset(attempted), succeeded=frozenset(succeeded),
+            failed=report.failed, deferred=report.deferred, empty=report.empty)
         trace[now] = (machine.observe(now, report), machine.status())
         now += timedelta(minutes=1)
     return trace
@@ -179,3 +214,18 @@ def test_contiguous_day_has_no_state_transition_or_activity(tmp_path):
     assert set(_states(trace).values()) == {"ready"}
     assert machine.status()["epoch"] == 0
     assert log.tail(100) == []
+
+
+def test_real_config_with_a_15m_hard_key_recovers_at_the_same_times_as_1m_alone(tmp_path):
+    bars = _load("usdjpy-1m-20260929-rollover.json")
+    conn, ingest, machine = _rig(tmp_path, bars, with_15m=True)
+    states = _states(_replay_with_15m(conn, ingest, machine, _at(29, 20, 52), _at(29, 21, 40)))
+
+    restricted_ticks = [t for t, s in states.items() if s == "restricted"]
+    assert restricted_ticks == _ticks(29, [
+        (21, 17), (21, 18), (21, 19),
+        (21, 21), (21, 22), (21, 23), (21, 24),
+        (21, 28), (21, 29), (21, 30), (21, 31)])
+    assert "degraded" not in states.values()
+    for t in _ticks(29, [(21, 20), (21, 25), (21, 32), (21, 40)]):
+        assert states[t] == "ready"
