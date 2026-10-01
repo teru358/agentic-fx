@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 134 件。完了分は CLOSED.md。
+未完了: 137 件。完了分は CLOSED.md。
 
 ## 実装中 (7)
 
@@ -42,7 +42,7 @@
 | [gate-noop-followup](gate-noop-followup.md) | 未設定 |  | 現行 note 化されていない fact 行が残る間は選択され得る (裁定待ち)。次回 E2E で `kind` 必須… |
 | [improve-mission-zero-tool-calls-undetected](improve-mission-zero-tool-calls-undetected.md) | 未設定 |  | registry の tool 呼び出し 0 件で終端した improve mission が「agent が自主的に… |
 
-## 設計待ち (110)
+## 設計待ち (113)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -72,6 +72,9 @@
 | [outage-observe-closed-guard-unpinned](outage-observe-closed-guard-unpinned.md) | 低 | 2026-09-29 | `OutageStateMachine.observe` の「閉場中は観測しない」early return を落として… |
 | [signal-producer-hourly-warning-before-confirmation](signal-producer-hourly-warning-before-confirmation.md) | 低 | 2026-09-29 | producer が毎時 xx:00:07 の tick で「1h bucket not yet present」を … |
 | [sandbox-lifecycle-minor-followups](sandbox-lifecycle-minor-followups.md) | 低 | 2026-09-30 | worker 観測境界の残り: ready 直後の死亡で code が割れる、細部の未 pin |
+| [backtest-aggregates-partial-minute-bars](backtest-aggregates-partial-minute-bars.md) | 低 | 2026-10-01 | backtest と resample が欠けた 1m 足をある分だけ集約し、部分的な足を作る |
+| [plugin-sees-live-spread](plugin-sees-live-spread.md) | 低 | 2026-10-01 | plugin と判断 mission が実 spread を見られるようにする |
+| [risk-gate-rr-uses-configured-spread](risk-gate-rr-uses-configured-spread.md) | 低 | 2026-10-01 | risk gate の RR 計算が設定値の spread を使い、実 spread と乖離する |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [credentials-file-copied-unused](credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
