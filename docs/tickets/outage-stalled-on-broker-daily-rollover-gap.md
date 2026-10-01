@@ -1,6 +1,7 @@
 ---
 id: outage-stalled-on-broker-daily-rollover-gap
-status: 設計待ち
+title: 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加)
+status: 実装中
 priority: 高
 opened: 2026-09-29
 closed: null
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [outage-stalled-on-broker-daily-rollover-gap]
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-01: 状態: 実装中、題名: 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) — spec docs/superpowers/specs/2026-10-01-quiet-market-restricted-state-design.md v1.0。原因は broker が無 tick の分の足を作らないこと (bridge・取得の失敗ではない、60 日実測で USDJPY 96 分・他銘柄は時間帯を問わず)。時間帯規則・固定銘柄群・気配は使わず、建玉なしの停滞は restricted (新規リスク停止、上限 30 分)、建玉ありは現行どおり degraded

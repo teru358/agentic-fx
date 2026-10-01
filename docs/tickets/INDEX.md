@@ -3,10 +3,11 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 137 件。完了分は CLOSED.md。
 
-## 実装中 (7)
+## 実装中 (8)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [outage-stalled-on-broker-daily-rollover-gap](outage-stalled-on-broker-daily-rollover-gap.md) | 高 | 2026-09-29 | 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) |
 | [strategy-gate-data-error-crashes-commit](strategy-gate-data-error-crashes-commit.md) | 未設定 | 2026-09-02 | /[run-backtest-error-opaque]/[staging-snapshot-src-leak]/[s… |
 | [backtest-rpc-timeout-15s](backtest-rpc-timeout-15s.md) | 未設定 | 2026-09-03 | /[gate-failed-rows-not-persisted] **是正済 0a453af 2026-09-03、… |
 | [eval-source-consolidation](eval-source-consolidation.md) | 未設定 | 2026-09-03 | `_EVAL_SOURCE`×3 + `ANALYSIS_SOURCE` → `settings.backtest.e… |
@@ -42,14 +43,13 @@
 | [gate-noop-followup](gate-noop-followup.md) | 未設定 |  | 現行 note 化されていない fact 行が残る間は選択され得る (裁定待ち)。次回 E2E で `kind` 必須… |
 | [improve-mission-zero-tool-calls-undetected](improve-mission-zero-tool-calls-undetected.md) | 未設定 |  | registry の tool 呼び出し 0 件で終端した improve mission が「agent が自主的に… |
 
-## 設計待ち (113)
+## 設計待ち (112)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [indicator-consumption-wiring](indicator-consumption-wiring.md) | 高 | 2026-09-12 | plugin 契約 `evaluate(df, indicators, signals, params)` は ind… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](backtest-rpc-timeout-does-not-stop-parent-work.md) | 高 | 2026-09-21 | `backtest_rpc_timeout_sec=600` は agent への応答を打ち切るだけで、親サービス内の… |
-| [outage-stalled-on-broker-daily-rollover-gap](outage-stalled-on-broker-daily-rollover-gap.md) | 高 | 2026-09-29 | MT5 (OANDA Japan、サーバ UTC+3) は日次ロールオーバー 21:00 UTC 前後に数分ティックが… |
 | [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 高 |  | signal maintenance は scheduler tick 内の同期 hook。例外は握るが、「完了はする… |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
