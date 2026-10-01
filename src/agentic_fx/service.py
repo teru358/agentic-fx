@@ -1404,9 +1404,9 @@ def _scheduler_tick_once(app: App) -> None:
             # ingest 側の例外はここでも握って activity に書き、
             # scheduler.tick() は資金保護のため必ず走らせる。
             if app.ingest is not None and ingest_result is not None:
-                # prepare() が例外を投げた tick は commit/observe を行わない
-                # (元の挙動どおり — 対応する report が無いまま watermark を
-                # 進めたり observe したりしない)。
+                # prepare() が例外を投げた tick は、全 hard key が失敗した
+                # report に置き換えて observe まで進める (取得できなかった
+                # tick を「観測なし」で流すと、停止の判定が 1 tick 遅れる)。
                 try:
                     if not prepare_failed:
                         app.ingest.commit(app.conn_core)
