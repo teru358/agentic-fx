@@ -56,8 +56,12 @@ def test_phase1_full_cycle(tmp_path):
     ])
 
     from agentic_fx.core.contracts import InstrumentSpec, Quote
+    # 1m は hard key。成功だが空の応答は停止扱いになるので、tick 1 でも
+    # 直近の確定 1m 足を 1 本返す (指値に届かない値幅にしておく)。
     bars = [Bar("USDJPY", "1h", WED - timedelta(hours=2),
-                148.00, 148.10, 147.90, 148.05, 100)]
+                148.00, 148.10, 147.90, 148.05, 100),
+            Bar("USDJPY", "1m", WED - timedelta(minutes=2),
+                148.50, 148.51, 148.49, 148.50, 100)]
     quote_fn = lambda p: Quote(p, 148.49, 148.51, WED, "test")  # noqa: E731
     # 上書き 2 補正: 実 InstrumentSpec は base_currency/quote_currency も
     # 必須 (逐語テストの 6 引数だけでは TypeError)。USDJPY の実値を明示する。

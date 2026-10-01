@@ -493,6 +493,27 @@ class Executor:
             return self.close_intent(intent, iid)
         return self.cancel_intent(intent, iid)
 
+    def _reject_if_data_not_ready(self, iid: int, *, order_id: int | None = None,
+                                  now=None) -> dict | None:
+        """データ状態が ready でなければ intent を fail closed で却下する。
+
+        入口 (quote 取得より前) と submit 直前は別の時点の検査。後者は
+        SUBMITTING の order 行を作った後なので、`order_id` を渡して
+        REJECTED にする。ready なら None。
+        """
+        data_state = self.state_fn()
+        if data_state == "ready":
+            return None
+        reasons = [f"data state {data_state} (fail closed)"]
+        intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                      reject_reason=reasons[0],
+                                      reject_category="risk_gate")
+        if order_id is not None:
+            transitions.transition(self.conn, order_id, S.REJECTED, now)
+        self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                            ref_id=str(iid))
+        return {"result": "rejected", "order_id": order_id, "reasons": reasons}
+
     # ---- open -----------------------------------------------------------
 
     def _open(self, intent: TradeIntent, iid: int) -> dict:
@@ -500,15 +521,9 @@ class Executor:
         # quote 取得・GateContext 構築より前に fail closed する — 不通中は
         # 新規成行 open (新規の drawdown/kill switch 判定を含む) を一切
         # 行わない。
-        data_state = self.state_fn()
-        if data_state != "ready":
-            reasons = [f"data state {data_state} (fail closed)"]
-            intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0],
-                                          reject_category="risk_gate")
-            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
-                                ref_id=str(iid))
-            return {"result": "rejected", "order_id": None, "reasons": reasons}
+        rejected = self._reject_if_data_not_ready(iid)
+        if rejected is not None:
+            return rejected
         quote = self.quote_fn(intent.pair)
         spec = self.spec_fn(intent.pair)
         account = accounting.current_account(self.conn, now)
@@ -588,16 +603,9 @@ class Executor:
             expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
             if intent.expires_in_h else None)
         row = orders.get(self.conn, oid)
-        data_state = self.state_fn()
-        if data_state != "ready":
-            reasons = [f"data state {data_state} (fail closed)"]
-            intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0],
-                                          reject_category="risk_gate")
-            transitions.transition(self.conn, oid, S.REJECTED, now)
-            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
-                                ref_id=str(iid))
-            return {"result": "rejected", "order_id": oid, "reasons": reasons}
+        rejected = self._reject_if_data_not_ready(iid, order_id=oid, now=now)
+        if rejected is not None:
+            return rejected
         # レビュー修正 (codex 2): タイムアウト等の broker 例外は「結果不明」
         # として扱う (設計書 §12)。Phase 3 の MT5 実装で必ず起きる経路。
         try:
@@ -730,15 +738,9 @@ class Executor:
         完全共有 — 判定ロジック不変)。
         """
         now = self.clock.now()
-        data_state = self.state_fn()
-        if data_state != "ready":
-            reasons = [f"data state {data_state} (fail closed)"]
-            intents_store.set_gate_result(self.conn, iid, accepted=False,
-                                          reject_reason=reasons[0],
-                                          reject_category="risk_gate")
-            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
-                                ref_id=str(iid))
-            return {"result": "rejected", "order_id": None, "reasons": reasons}
+        rejected = self._reject_if_data_not_ready(iid)
+        if rejected is not None:
+            return rejected
         age_sec = (now - snapshot.captured_at).total_seconds()
         if age_sec > max_snapshot_age_sec:
             reasons = [

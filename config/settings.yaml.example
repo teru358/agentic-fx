@@ -56,7 +56,10 @@ datafeed:
   twelvedata: {enabled: false}
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い
   closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
-  outage: {flat_stall_max_sec: 1800, ready_confirm_ticks: 3, auto_resume_when_flat: true}  # flat の 1m stall を restricted に留める最大秒。0 で restricted を無効化し即 degraded
+  outage:
+    flat_stall_max_sec: 1800     # 建玉も未約定指値も無いときの 1m 停滞を restricted (新規リスク停止) に留める最大秒。0 で無効 (即 degraded)
+    ready_confirm_ticks: 3       # restricted / degraded から ready に戻るのに必要な連続健全 tick 数 (1 以上)
+    auto_resume_when_flat: true  # flat の episode は連続健全 tick で自動 ready。false だと人の `data resume` が要る
   conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
   decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する

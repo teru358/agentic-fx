@@ -1,9 +1,12 @@
 """MT5 (価格源) 不通の検出・永続化。
 
-`ready`/`degraded` の 2 状態だけを扱う永続状態機械 (`backfilling` への
-自動復旧・連続性検査・SL/TP replay は別モジュールで扱う対象で、ここには
-含まない)。復旧は人間が明示コマンドで要求し、その要求は次の観測 tick で
-判定・消費される。
+`ready` / `restricted` / `degraded` の 3 状態を扱う永続状態機械。
+`restricted` は建玉も未約定指値も無いときの 1m 停滞を新規リスク停止だけで
+受ける状態 (期限内に健全な tick が続けば自動で ready へ戻る)。`degraded` は
+従来どおりの不通状態で、復旧は自動 (flat かつ設定が許すとき) か、人間が
+明示コマンドで要求してその要求が次の観測 tick で判定・消費される。
+`backfilling` への自動復旧・連続性検査・SL/TP replay は別モジュールで扱う
+対象で、ここには含まない。
 """
 from __future__ import annotations
 
@@ -57,7 +60,7 @@ def _parse(text: str | None) -> datetime | None:
 
 
 class OutageStateMachine:
-    """`ready`/`degraded` の永続状態機械。
+    """`ready` / `restricted` / `degraded` の永続状態機械。
 
     `datafeed_outage_state` (1 行、id=1) + `datafeed_outage_gap`
     (pair×interval×epoch) に永続化する。呼び出し側は core の書込みロック
@@ -99,8 +102,9 @@ class OutageStateMachine:
         # unconfirmed 扱いされず、停滞式の境界に達する前に resume が誤って
         # 受理されうる — 空応答は明示的に不健全側へ倒す。未知 (再起動直後を
         # 含む) は不健全側に倒すため、キーが無い場合は不健全として扱う。
-        # ready → degraded (新 epoch 開始) の tick で全 key クリアする —
-        # 前 episode の成功実績を今回の episode の証拠として残さないため。
+        # ready → restricted/degraded (新 epoch 開始) の tick では、その tick の
+        # 取得結果を記録する前に全 key をクリアする — 前 episode の成功実績を
+        # 今回の episode の証拠として残さず、当 tick の結果だけを残すため。
         self._last_attempt_ok: dict[tuple[str, str], bool] = {}
         # 直近に activity へ出した未処理建玉の内訳 (pair 単位)。episode が
         # 開いている間、内訳が前回と変わった tick でだけ再送する — 通知専用
@@ -187,6 +191,9 @@ class OutageStateMachine:
                    if self._is_stalled(now, key[1], watermarks.get(key))}
         expected = {key: self._expected(key[1], watermarks[key]) for key in stalled}
         flat = not orders.list_by_status(self.conn, *_EXPOSURE)
+        immediate = bool(hard_failed or hard_empty)
+        if row["state"] == "ready" and (immediate or stalled):
+            self._last_attempt_ok.clear()
         for key in self.hard_keys:
             if key in report.succeeded and key not in report.empty:
                 self._last_attempt_ok[key] = True
@@ -228,27 +235,39 @@ class OutageStateMachine:
             ready_streak = 0
             pending = int(bool(pending) or not flat or not self.auto_resume_when_flat)
 
-        immediate = bool(hard_failed or hard_empty)
+        def degraded_activity() -> tuple[str, str]:
+            return ("datafeed_degraded",
+                    f"epoch={epoch} failed={sorted(hard_failed)} "
+                    f"empty={sorted(hard_empty)} stalled={sorted(stalled)}")
+
+        def recovered_activity() -> tuple[str, str]:
+            return ("datafeed_recovered_auto",
+                    f"epoch={epoch} streak={self.ready_confirm_ticks}")
+
         if state == "ready" and (immediate or stalled):
             epoch += 1
             confirmed = 0
             recovered_notified_epoch = None
             opened = True
-            self._last_attempt_ok.clear()
-            if immediate or not flat or self.flat_stall_max_sec == 0:
+            origin = min(expected.values()) if expected else None
+            # 停滞を初めて見た時点で既に期限を過ぎているとき (長い停滞の途中での
+            # 再起動、tick の大幅な遅延) は、restricted を経由させず直接 degraded。
+            past_deadline = (
+                origin is not None and self.flat_stall_max_sec > 0
+                and now > origin + timedelta(seconds=self.flat_stall_max_sec))
+            if immediate or not flat or self.flat_stall_max_sec == 0 or past_deadline:
                 degrade()
-                activities.append(("datafeed_degraded", f"epoch={epoch} failed={sorted(hard_failed)} empty={sorted(hard_empty)} stalled={sorted(stalled)}"))
+                activities.append(degraded_activity())
             else:
                 state = "restricted"
                 ready_streak = 0
-                origin = min(expected.values())
                 restricted_since = _iso(origin)
                 deadline = _iso(origin + timedelta(seconds=self.flat_stall_max_sec))
                 activities.append(("datafeed_restricted", f"epoch={epoch} stalled={sorted(stalled)} expected={_iso(origin)} deadline={deadline}"))
         elif state == "restricted":
             if (deadline is not None and now > _parse(deadline)) or immediate or not flat:
                 degrade()
-                activities.append(("datafeed_degraded", f"epoch={epoch} failed={sorted(hard_failed)} empty={sorted(hard_empty)} stalled={sorted(stalled)}"))
+                activities.append(degraded_activity())
             elif healthy:
                 ready_streak += 1
                 if ready_streak >= self.ready_confirm_ticks:
@@ -258,9 +277,15 @@ class OutageStateMachine:
                         ready_streak = 0
                         restricted_since = None
                         deadline = None
-                        activities.append(("datafeed_recovered_auto", f"epoch={epoch} streak={self.ready_confirm_ticks}"))
+                        activities.append(recovered_activity())
                     else:
+                        # 復帰はしないが健全に戻っている — 人の resume 待ちとして
+                        # 同じ tick で知らせる。
                         degrade()
+                        activities.append(degraded_activity())
+                        if recovered_notified_epoch != epoch:
+                            recovered_notified_epoch = epoch
+                            activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
             else:
                 ready_streak = 0
         elif state == "degraded":
@@ -272,7 +297,7 @@ class OutageStateMachine:
                     ready_streak = 0
                     restricted_since = None
                     deadline = None
-                    activities.append(("datafeed_recovered_auto", f"epoch={epoch} streak={self.ready_confirm_ticks}"))
+                    activities.append(recovered_activity())
             else:
                 ready_streak = 0
                 if healthy and (not flat or not self.auto_resume_when_flat) and recovered_notified_epoch != epoch:
@@ -364,6 +389,7 @@ class OutageStateMachine:
                     recovered_notified_epoch: int | None,
                     ready_streak: int,
                     updated_at: str) -> None:
+        """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。"""
         self.conn.execute(
             "UPDATE datafeed_outage_state SET state=?, epoch=?, confirmed=?, "
             "entered_degraded_at=?, restricted_since=?, restricted_deadline_at=?, "
@@ -384,18 +410,18 @@ class OutageStateMachine:
         gap_start 列の NOT NULL 制約を安全側の値で満たすことを優先する)。
         """
         for key in self.hard_keys:
-                pair, interval = key
-                exists = self.conn.execute(
-                    "SELECT 1 FROM datafeed_outage_gap WHERE pair=? AND "
-                    "interval=? AND epoch=?", (pair, interval, epoch)).fetchone()
-                if exists is not None:
-                    continue
-                gap_start = watermarks.get(key) or now
-                self.conn.execute(
-                    "INSERT INTO datafeed_outage_gap "
-                    "(pair, interval, epoch, gap_start, replay_through) "
-                    "VALUES (?, ?, ?, ?, NULL)",
-                    (pair, interval, epoch, _iso(gap_start)))
+            pair, interval = key
+            exists = self.conn.execute(
+                "SELECT 1 FROM datafeed_outage_gap WHERE pair=? AND "
+                "interval=? AND epoch=?", (pair, interval, epoch)).fetchone()
+            if exists is not None:
+                continue
+            gap_start = watermarks.get(key) or now
+            self.conn.execute(
+                "INSERT INTO datafeed_outage_gap "
+                "(pair, interval, epoch, gap_start, replay_through) "
+                "VALUES (?, ?, ?, ?, NULL)",
+                (pair, interval, epoch, _iso(gap_start)))
 
     def _gap_start(self, pair: str, interval: str, epoch: int,
                   conn=None) -> datetime | None:
@@ -465,7 +491,8 @@ class OutageStateMachine:
         acknowledge = bool(row.get("resume_acknowledge"))
         if state == "ready":
             # 既に ready — 要求は無意味なので消費して終える。
-            self._clear_resume_request()
+            with self.conn:
+                self._clear_resume_request()
             return state
         watermark_healthy = not unconfirmed_keys
         unprocessed_by_pair = self._unprocessed_positions_by_pair(now, epoch)
@@ -474,14 +501,18 @@ class OutageStateMachine:
         if watermark_healthy and (unprocessed == 0 or acknowledge):
             state = "ready"
             self._last_unprocessed_by_pair = None
-            self._save_state(state=state, epoch=epoch, confirmed=0,
-                             entered_degraded_at=row.get("entered_degraded_at"),
-                             restricted_since=None,
-                             restricted_deadline_at=None,
-                             pending_human_confirmation=0,
-                             recovered_notified_epoch=row.get("recovered_notified_epoch"),
-                             ready_streak=0,
-                             updated_at=_iso(now))
+            # state の更新と要求の消去は 1 つの transaction。途中で落ちたら
+            # どちらも元のまま残り、次 tick が同じ要求を判定し直す。
+            with self.conn:
+                self._save_state(state=state, epoch=epoch, confirmed=0,
+                                 entered_degraded_at=row.get("entered_degraded_at"),
+                                 restricted_since=None,
+                                 restricted_deadline_at=None,
+                                 pending_human_confirmation=0,
+                                 recovered_notified_epoch=row.get("recovered_notified_epoch"),
+                                 ready_streak=0,
+                                 updated_at=_iso(now))
+                self._clear_resume_request()
             self._write_activity(
                 "data_resume_accepted",
                 f"epoch={epoch} unprocessed_positions={unprocessed}"
@@ -501,14 +532,15 @@ class OutageStateMachine:
                     + (f" ({detail})" if detail else ""))
             self._write_activity(
                 "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
-        self._clear_resume_request()
+            with self.conn:
+                self._clear_resume_request()
         return state
 
     def _clear_resume_request(self) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE datafeed_outage_state SET resume_requested_at=NULL, "
-                "resume_acknowledge=0 WHERE id=1")
+        """呼び出し側の `with self.conn:` の中で使う (自前では commit しない)。"""
+        self.conn.execute(
+            "UPDATE datafeed_outage_state SET resume_requested_at=NULL, "
+            "resume_acknowledge=0 WHERE id=1")
 
     # ---- internal: activity --------------------------------------------
 

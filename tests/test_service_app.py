@@ -1,3 +1,4 @@
+import re
 import json
 import os
 import sqlite3
@@ -140,9 +141,12 @@ def test_build_app_wires_outage_auto_resume_settings(tmp_path):
     _init(tmp_path)
     settings_path = tmp_path / "config" / "settings.yaml"
     settings = settings_path.read_text(encoding="utf-8")
-    settings = settings.replace(
-        "outage: {flat_stall_max_sec: 1800, ready_confirm_ticks: 3, auto_resume_when_flat: true}",
-        "outage: {flat_stall_max_sec: 90, ready_confirm_ticks: 5, auto_resume_when_flat: false}")
+    for key, old, new in (("flat_stall_max_sec", "1800", "90"),
+                          ("ready_confirm_ticks", "3", "5"),
+                          ("auto_resume_when_flat", "true", "false")):
+        pattern = rf"(\n\s+{key}: ){old}\b"
+        assert re.search(pattern, settings)
+        settings = re.sub(pattern, rf"\g<1>{new}", settings, count=1)
     settings_path.write_text(settings, encoding="utf-8")
 
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),

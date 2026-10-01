@@ -5,6 +5,8 @@
 """
 from datetime import datetime, timedelta, timezone
 
+import sqlite3
+
 import pytest
 
 from agentic_fx.activity import ActivityLog
@@ -470,3 +472,118 @@ def test_degrading_from_restricted_discards_the_healthy_streak_collected_so_far(
         _fresh(conn, now)
         states.append(machine.observe(now, _report()))
     assert states[3:] == ["degraded", "degraded", "ready"]
+
+
+# ---- episode を開く tick の証拠 / 昇格 / 期限切れ後の初観測 -----------------
+
+
+def _events_of(log):
+    return [line.split("\t")[2] for line in log.tail(50)]
+
+
+def test_resume_requested_while_ready_is_not_accepted_on_the_tick_a_stall_opens_an_episode(
+        tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log)
+    _fresh(conn, NOW)
+    assert machine.observe(NOW, _report()) == "ready"
+    machine.request_resume(NOW)
+    now = NOW + timedelta(minutes=10)
+    _seed_bar(conn, NOW - timedelta(minutes=2))
+
+    assert machine.observe(now, _report()) == "restricted"
+    assert "data_resume_rejected" in _events_of(log)
+    assert "data_resume_accepted" not in _events_of(log)
+    assert machine.status()["resume_requested_at"] is None
+
+
+def test_higher_timeframe_success_on_the_episode_opening_tick_counts_as_confirmed_for_resume(
+        tmp_path):
+    conn, machine = _rig_with_15m(tmp_path, flat_stall_max_sec=0)
+    _fresh_both(conn, NOW)
+    assert machine.observe(NOW, _both()) == "ready"
+    # 1m だけが止まる tick (15m は成功) で episode が開く
+    now = NOW + timedelta(minutes=10)
+    upsert_cache_bars(conn, [Bar(PAIR, "15m", now - timedelta(minutes=20), 1, 1, 1, 1, 1)],
+                      source="mt5-live")
+    conn.commit()
+    assert machine.observe(now, _both()) == "degraded"
+    # 1m が回復、15m は取りに行かない tick に resume を要求する
+    later = now + timedelta(minutes=1)
+    _fresh_both(conn, later)
+    machine.request_resume(later)
+
+    assert machine.observe(later, _only_1m()) == "ready"
+
+
+def test_restricted_to_degraded_by_healthy_streak_announces_degraded_and_awaiting_resume(
+        tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log, auto_resume_when_flat=False)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=20))
+    for minute in (0, 1, 2):
+        now = NOW + timedelta(minutes=minute)
+        _fresh(conn, now)
+        machine.observe(now, _report())
+
+    assert _events_of(log) == ["datafeed_degraded", "datafeed_recovered_awaiting_resume"]
+    now = NOW + timedelta(minutes=3)
+    _fresh(conn, now)
+    machine.observe(now, _report())
+    assert _events_of(log).count("datafeed_recovered_awaiting_resume") == 1
+
+
+def test_first_sighting_of_a_stall_already_past_its_deadline_degrades_directly(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log, flat_stall_max_sec=1800)
+    _seed_bar(conn, NOW - timedelta(hours=3))
+
+    assert machine.observe(NOW, _report()) == "degraded"
+    row = machine.status()
+    assert row["epoch"] == 1
+    assert row["restricted_since"] is None and row["restricted_deadline_at"] is None
+    assert row["pending_human_confirmation"] == 0
+    assert conn.execute("SELECT count(*) FROM datafeed_outage_gap WHERE epoch=1"
+                        ).fetchone()[0] == 1
+    assert _events_of(log) == ["datafeed_degraded"]
+
+
+def test_first_sighting_of_a_stall_exactly_at_its_deadline_enters_restricted(tmp_path):
+    conn, machine = _rig(tmp_path, flat_stall_max_sec=1800)
+    watermark = NOW - timedelta(hours=3)
+    _seed_bar(conn, watermark)
+    expected = machine._expected("1m", machine._read_watermarks(NOW)[KEY])
+    now = expected + timedelta(seconds=1800)
+
+    assert machine.observe(now, _report()) == "restricted"
+
+
+def test_first_sighting_past_its_deadline_with_auto_resume_disabled_needs_human_confirmation(
+        tmp_path):
+    conn, machine = _rig(tmp_path, auto_resume_when_flat=False)
+    _seed_bar(conn, NOW - timedelta(hours=3))
+
+    assert machine.observe(NOW, _report()) == "degraded"
+    assert machine.status()["pending_human_confirmation"] == 1
+
+
+def test_failure_while_accepting_a_resume_keeps_both_the_state_and_the_request(
+        tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    _put_state(conn, machine, "degraded", pending=1)
+    _fresh(conn, NOW)
+    machine.request_resume(NOW, acknowledge=True)
+    original = machine._clear_resume_request
+
+    def clear_then_crash():
+        original()
+        raise sqlite3.OperationalError("injected crash")
+
+    monkeypatch.setattr(machine, "_clear_resume_request", clear_then_crash)
+    with pytest.raises(sqlite3.OperationalError):
+        machine.observe(NOW, _report())
+
+    row = machine.status()
+    assert row["state"] == "degraded"
+    assert row["pending_human_confirmation"] == 1
+    assert row["resume_requested_at"] is not None
