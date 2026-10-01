@@ -587,6 +587,15 @@ class Executor:
             expires_at=(now + timedelta(hours=intent.expires_in_h)).isoformat()
             if intent.expires_in_h else None)
         row = orders.get(self.conn, oid)
+        if self.state_fn() != "ready":
+            reasons = ["data source degraded (fail closed)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
+            transitions.transition(self.conn, oid, S.REJECTED, now)
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": oid, "reasons": reasons}
         # レビュー修正 (codex 2): タイムアウト等の broker 例外は「結果不明」
         # として扱う (設計書 §12)。Phase 3 の MT5 実装で必ず起きる経路。
         try:

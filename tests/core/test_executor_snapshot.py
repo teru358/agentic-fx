@@ -201,6 +201,21 @@ def test_open_from_snapshot_matches_handle_intent(tmp_path):
     assert row1["avg_fill_price"] == row2["avg_fill_price"]
 
 
+def test_open_from_snapshot_stops_when_state_changes_before_submit(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    states = iter(("ready", "restricted"))
+    ex.state_fn = lambda: next(states)
+
+    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    assert out["result"] == "rejected"
+    assert orders.list_by_status(ex.conn, S.OPEN, S.PENDING_FILL, S.SUBMITTING) == []
+
+
 def test_open_from_snapshot_matches_handle_intent_on_gate_rejection(tmp_path):
     """却下側も一致すること — kill switch ラッチ等の副作用込みで
     `_evaluate_and_execute_open` を両経路が共有していることの pin。"""

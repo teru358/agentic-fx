@@ -1,4 +1,4 @@
-# [quiet-market-restricted-state] 設計書 v1.0
+# [quiet-market-restricted-state] 設計書 v1.1
 
 作成日: 2026-10-01。対象は、日次 rollover などで primary の 1m 足が短時間欠ける間の新規 entry 停止境界である。既存の outage/backfill 設計を置換するのではなく、flat 時の短い 1m stall に `restricted` を追加し、既存の `ready` / `degraded` / `backfilling`、backfill、replay の安全規則を補足する。
 
@@ -165,7 +165,7 @@ fixture は実装時に `tests/fixtures/outage/` に置く。バー時刻は実�
 
 |ID|条件|検証|
 |---|---|---|
-|AC-1|9/29 の実バーは三つの別 episode を作る。|episode 1: 21:17 restricted（deadline 21:46:30）→ 21:18/19/20 healthy → 21:20 ready。episode 2: 21:21 restricted（21:50:30）→ 21:22/23/24 healthy → 21:24 ready。episode 3: 21:28 restricted（21:57:30）→ 21:29/30/31 healthy → 21:31 ready。全 episode が deadline 非到達であることを assert。|
+|AC-1|9/29 の実バーは三つの別 episode を作る。|episode 1: 21:17 restricted（deadline 21:46:30）→ 21:18/19/20 healthy → 21:20 ready。episode 2: 21:21 restricted（21:50:30）→ 21:22 は stalled のまま (21:19・21:20 の 2 本欠落) → 21:23/24/25 healthy → 21:25 ready。episode 3: 21:28 restricted（21:57:30）→ 21:29 は stalled のまま (21:26・21:27 の 2 本欠落) → 21:30/31/32 healthy → 21:32 ready。確定足は close の 1 分後の poll で見える前提 (60 秒 poll、grace 30 秒)。いずれも deadline 非到達、degraded なし。|
 |AC-2|deadline 超過は fixture に依存しない合成 case で検証する。|watermark と restricted 起点を固定し、`now == deadline` は restricted、`now > deadline` は healthy でも degraded を assert。**合成** case と明記する。|
 |AC-3|9/13 の日曜開場は bounded restricted から回復する。|21:03 restricted（deadline 21:32:30）、21:21/22/23 の H3 で ready。deadline 非到達。exposure 一件なら 21:03 同 tick で degraded。|
 |AC-4|9/30 は遷移なし。|66 本の連続列で、低 tick 数を注入しても restricted/degraded/activity が発生しない。|
@@ -222,3 +222,4 @@ backfill、replay、既存建玉の連続性検査、`backfilling` 中の drain/
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
 |2026-10-01|v1.0|flat 1m stall の bounded `restricted`、deadline 優先、state/gap transaction、best-effort activity、1m read-tool 契約、fixture acceptance を spec として確定。|設計レビュー 2 周の裁定。状態名は `ready` / `restricted` / `degraded` (形容詞 1 語で揃える、ユーザー裁定)。既定の上限 30 分・3 tick・取得失敗と empty は即 degraded も同裁定|`(this)`|
+|2026-10-01|v1.1|受入条件 AC-1 の 9/29 の時刻を訂正 (episode 2 の ready は 21:25、episode 3 は 21:32)。連続 2 本欠落の分だけ stalled が 1 tick 長い。|実装時に fixture を停滞式で再生して判明。仕様の動作は変えていない|`(this)`|
