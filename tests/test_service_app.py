@@ -141,8 +141,8 @@ def test_build_app_wires_outage_auto_resume_settings(tmp_path):
     settings_path = tmp_path / "config" / "settings.yaml"
     settings = settings_path.read_text(encoding="utf-8")
     settings = settings.replace(
-        "outage: {ready_confirm_ticks: 3, auto_resume_when_flat: true}",
-        "outage: {ready_confirm_ticks: 5, auto_resume_when_flat: false}")
+        "outage: {flat_stall_max_sec: 1800, ready_confirm_ticks: 3, auto_resume_when_flat: true}",
+        "outage: {flat_stall_max_sec: 90, ready_confirm_ticks: 5, auto_resume_when_flat: false}")
     settings_path.write_text(settings, encoding="utf-8")
 
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
@@ -150,6 +150,7 @@ def test_build_app_wires_outage_auto_resume_settings(tmp_path):
     try:
         assert app.outage.ready_confirm_ticks == 5
         assert app.outage.auto_resume_when_flat is False
+        assert app.outage.flat_stall_max_sec == 90
     finally:
         app.close()
 
@@ -3111,7 +3112,8 @@ def test_scheduler_tick_runs_when_ingest_prepare_raises(tmp_path, caplog):
     _scheduler_tick_once(app)
 
     assert seen == [app.clock.now()]
-    app.activity.write.assert_called_once()
+    assert app.activity.write.call_count == 2
+    assert app.outage.state == "degraded"
 
 
 def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):

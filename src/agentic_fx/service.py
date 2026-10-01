@@ -34,7 +34,7 @@ from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
-from agentic_fx.datafeed.outage import OutageStateMachine
+from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed.econ_calendar import EconCalendar
@@ -1217,7 +1217,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             grace=timedelta(seconds=settings.datafeed.closed_bar_grace_sec),
             storage_source=ingest.storage_source, activity=activity,
             ready_confirm_ticks=settings.datafeed.outage.ready_confirm_ticks,
-            auto_resume_when_flat=settings.datafeed.outage.auto_resume_when_flat)
+            auto_resume_when_flat=settings.datafeed.outage.auto_resume_when_flat,
+            flat_stall_max_sec=settings.datafeed.outage.flat_stall_max_sec)
 
         def db_latest_1m_bar(pair: str):
             source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
@@ -1373,12 +1374,21 @@ def _scheduler_tick_once(app: App) -> None:
     """
     now = app.clock.now()
     ingest_result = None
+    prepare_failed = False
     if app.ingest is not None:
         try:
             _, report = app.ingest.prepare(now)
             ingest_result = report
         except Exception as exc:  # noqa: BLE001 -- protection must still tick
+            prepare_failed = True
             _log.warning("ingest prepare failed: %s", safe_error_text(exc))
+            if app.outage is not None:
+                failed = frozenset((key, safe_error_text(exc))
+                                   for key in app.outage.hard_keys)
+                ingest_result = IngestTickReport(
+                    attempted=frozenset(app.outage.hard_keys),
+                    succeeded=frozenset(), failed=failed,
+                    deferred=frozenset(), empty=frozenset())
             try:
                 app.activity.write(Category.SYSTEM, "ingest_prepare_failed",
                                    safe_error_text(exc))
@@ -1398,7 +1408,8 @@ def _scheduler_tick_once(app: App) -> None:
                 # (元の挙動どおり — 対応する report が無いまま watermark を
                 # 進めたり observe したりしない)。
                 try:
-                    app.ingest.commit(app.conn_core)
+                    if not prepare_failed:
+                        app.ingest.commit(app.conn_core)
                     if app.outage is not None:
                         app.outage.observe(now, ingest_result)
                 except Exception as exc:  # noqa: BLE001 -- protection must still tick

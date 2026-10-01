@@ -72,7 +72,8 @@ class OutageStateMachine:
     def __init__(self, conn, *, hard_keys, interval_widths: dict[str, timedelta],
                  grace: timedelta, storage_source: str, activity=None,
                  ready_confirm_ticks: int = 3,
-                 auto_resume_when_flat: bool = True) -> None:
+                 auto_resume_when_flat: bool = True,
+                 flat_stall_max_sec: int = 1800) -> None:
         self.conn = conn
         self.hard_keys = frozenset(hard_keys)
         self.interval_widths = dict(interval_widths)
@@ -81,6 +82,7 @@ class OutageStateMachine:
         self.activity = activity
         self.ready_confirm_ticks = ready_confirm_ticks
         self.auto_resume_when_flat = auto_resume_when_flat
+        self.flat_stall_max_sec = flat_stall_max_sec
         # 継続した健全 tick はプロセスをまたいで数えない。
         self._reset_ready_streak = True
         # 「2 tick 連続」判定用のプロセス内カウンタ。`confirmed` フラグ自体は
@@ -172,6 +174,7 @@ class OutageStateMachine:
         if not market_hours.is_market_open(now):
             # 休場中は ingest 自体も due を立てない — 観測しない。
             return row["state"]
+        return self._observe_open(now, report, row)
 
         watermarks = self._read_watermarks(now)
         hard_failed = {key for key, _err in report.failed if key in self.hard_keys}
@@ -285,6 +288,131 @@ class OutageStateMachine:
         state = self._consume_resume_request(now, state, epoch, unconfirmed_keys)
         return state
 
+    def _observe_open(self, now: datetime, report: IngestTickReport,
+                      row: dict) -> str:
+        watermarks = self._read_watermarks(now)
+        hard_failed = {key for key, _ in report.failed if key in self.hard_keys}
+        hard_empty = self.hard_keys & report.empty
+        stalled = {key for key in self.hard_keys
+                   if self._is_stalled(now, key[1], watermarks.get(key))}
+        expected = {key: self._expected(key[1], watermarks[key]) for key in stalled}
+        flat = not orders.list_by_status(self.conn, *_EXPOSURE)
+        healthy = (not hard_failed and not hard_empty and not stalled
+                   and all(key in report.succeeded and key not in report.empty
+                           for key in self.hard_keys))
+        for key in self.hard_keys:
+            if key in report.succeeded and key not in report.empty:
+                self._last_attempt_ok[key] = True
+            elif key in hard_failed or key in hard_empty:
+                self._last_attempt_ok[key] = False
+        unconfirmed = frozenset(
+            key for key in self.hard_keys
+            if key in stalled or self._last_attempt_ok.get(key) is not True)
+        state = row["state"]
+        epoch = row["epoch"]
+        confirmed = row["confirmed"]
+        ready_streak = row.get("ready_streak", 0)
+        entered = row["entered_degraded_at"]
+        restricted_since = row.get("restricted_since")
+        deadline = row.get("restricted_deadline_at")
+        pending = row.get("pending_human_confirmation", 0)
+        recovered_notified_epoch = row.get("recovered_notified_epoch")
+        activities: list[tuple[str, str]] = []
+        opened = False
+
+        def degrade() -> None:
+            nonlocal state, entered, restricted_since, deadline, ready_streak, pending
+            was_restricted = state == "restricted"
+            state = "degraded"
+            entered = _iso(now)
+            if not was_restricted:
+                restricted_since = None
+                deadline = None
+            ready_streak = 0
+            pending = int(bool(pending) or not flat or not self.auto_resume_when_flat)
+
+        immediate = bool(hard_failed or hard_empty)
+        if state == "ready" and (immediate or stalled):
+            epoch += 1
+            confirmed = 0
+            recovered_notified_epoch = None
+            opened = True
+            self._last_attempt_ok.clear()
+            if immediate or not flat or self.flat_stall_max_sec == 0:
+                degrade()
+                activities.append(("datafeed_degraded", f"epoch={epoch} failed={sorted(hard_failed)} empty={sorted(hard_empty)} stalled={sorted(stalled)}"))
+            else:
+                state = "restricted"
+                ready_streak = 0
+                origin = min(expected.values())
+                restricted_since = _iso(origin)
+                deadline = _iso(origin + timedelta(seconds=self.flat_stall_max_sec))
+                activities.append(("datafeed_restricted", f"epoch={epoch} stalled={sorted(stalled)} expected={_iso(origin)} deadline={deadline}"))
+        elif state == "restricted":
+            if (deadline is not None and now > _parse(deadline)) or immediate or not flat:
+                degrade()
+                activities.append(("datafeed_degraded", f"epoch={epoch} failed={sorted(hard_failed)} empty={sorted(hard_empty)} stalled={sorted(stalled)}"))
+            elif healthy:
+                ready_streak += 1
+                if ready_streak >= self.ready_confirm_ticks:
+                    if self.auto_resume_when_flat and not pending:
+                        state = "ready"
+                        confirmed = 0
+                        ready_streak = 0
+                        restricted_since = None
+                        deadline = None
+                        activities.append(("datafeed_recovered_auto", f"epoch={epoch} streak={self.ready_confirm_ticks}"))
+                    else:
+                        degrade()
+            else:
+                ready_streak = 0
+        elif state == "degraded":
+            if healthy and flat and self.auto_resume_when_flat and not pending:
+                ready_streak += 1
+                if ready_streak >= self.ready_confirm_ticks:
+                    state = "ready"
+                    confirmed = 0
+                    ready_streak = 0
+                    restricted_since = None
+                    deadline = None
+                    activities.append(("datafeed_recovered_auto", f"epoch={epoch} streak={self.ready_confirm_ticks}"))
+            else:
+                ready_streak = 0
+                if healthy and (not flat or not self.auto_resume_when_flat) and recovered_notified_epoch != epoch:
+                    recovered_notified_epoch = epoch
+                    activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
+
+        if immediate or stalled:
+            self._problem_streak += 1
+            if state == "degraded" and not confirmed and self._problem_streak >= 2:
+                confirmed = 1
+                activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
+        else:
+            self._problem_streak = 0
+
+        with self.conn:
+            if opened:
+                self._open_gaps(epoch, now, watermarks)
+            self._save_state(state=state, epoch=epoch, confirmed=confirmed,
+                             entered_degraded_at=entered,
+                             restricted_since=restricted_since,
+                             restricted_deadline_at=deadline,
+                             pending_human_confirmation=pending,
+                             recovered_notified_epoch=recovered_notified_epoch,
+                             ready_streak=ready_streak, updated_at=_iso(now))
+        for event, summary in activities:
+            self._write_activity(event, summary)
+        if state == "degraded":
+            by_pair = self._unprocessed_positions_by_pair(now, epoch)
+            if by_pair != self._last_unprocessed_by_pair:
+                self._last_unprocessed_by_pair = by_pair
+                detail = format_unprocessed_positions(by_pair)
+                if detail:
+                    self._write_activity("data_outage_unprocessed_bars", f"epoch={epoch} {detail}")
+        else:
+            self._last_unprocessed_by_pair = None
+        return self._consume_resume_request(now, state, epoch, unconfirmed)
+
     def request_resume(self, now: datetime, *, acknowledge: bool = False,
                        conn=None) -> None:
         """手動復旧コマンドから呼ばれる。state は直接書き換えず、要求を
@@ -319,9 +447,10 @@ class OutageStateMachine:
                 c.execute(
                     "INSERT INTO datafeed_outage_state "
                     "(id, state, epoch, confirmed, entered_degraded_at, "
+                    "restricted_since, restricted_deadline_at, "
                     "ready_streak, pending_human_confirmation, "
                     "resume_requested_at, resume_acknowledge, updated_at) "
-                    "VALUES (1, 'ready', 0, 0, NULL, 0, 0, NULL, 0, ?)",
+                    "VALUES (1, 'ready', 0, 0, NULL, NULL, NULL, 0, 0, NULL, 0, ?)",
                     (_iso(now),))
 
     def _load_row(self, conn=None) -> dict:
@@ -332,16 +461,22 @@ class OutageStateMachine:
 
     def _save_state(self, *, state: str, epoch: int, confirmed: int,
                     entered_degraded_at: str | None,
+                    restricted_since: str | None = None,
+                    restricted_deadline_at: str | None = None,
+                    pending_human_confirmation: int | None = None,
                     recovered_notified_epoch: int | None,
                     ready_streak: int,
                     updated_at: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE datafeed_outage_state SET state=?, epoch=?, "
-                "confirmed=?, entered_degraded_at=?, "
-                "recovered_notified_epoch=?, ready_streak=?, updated_at=? WHERE id=1",
-                (state, epoch, confirmed, entered_degraded_at,
-                 recovered_notified_epoch, ready_streak, updated_at))
+        if pending_human_confirmation is None:
+            pending_human_confirmation = self._load_row().get("pending_human_confirmation", 0)
+        self.conn.execute(
+            "UPDATE datafeed_outage_state SET state=?, epoch=?, confirmed=?, "
+            "entered_degraded_at=?, restricted_since=?, restricted_deadline_at=?, "
+            "pending_human_confirmation=?, recovered_notified_epoch=?, "
+            "ready_streak=?, updated_at=? WHERE id=1",
+            (state, epoch, confirmed, entered_degraded_at, restricted_since,
+             restricted_deadline_at, pending_human_confirmation,
+             recovered_notified_epoch, ready_streak, updated_at))
 
     def _open_gaps(self, epoch: int, now: datetime,
                    watermarks: dict[tuple[str, str], datetime | None]) -> None:
@@ -353,8 +488,7 @@ class OutageStateMachine:
         必要本数からの計算開始点で厳密化する余地は残る — ここでは
         gap_start 列の NOT NULL 制約を安全側の値で満たすことを優先する)。
         """
-        with self.conn:
-            for key in self.hard_keys:
+        for key in self.hard_keys:
                 pair, interval = key
                 exists = self.conn.execute(
                     "SELECT 1 FROM datafeed_outage_gap WHERE pair=? AND "
@@ -401,6 +535,10 @@ class OutageStateMachine:
         expected = market_hours.next_bar_confirmation(watermark, width, self.grace)
         return now > expected
 
+    def _expected(self, interval: str, watermark: datetime) -> datetime:
+        return market_hours.next_bar_confirmation(
+            watermark, self.interval_widths[interval], self.grace)
+
     # ---- internal: unprocessed positions --------------------------------
 
     def _unprocessed_positions_by_pair(self, now: datetime, epoch: int,
@@ -443,6 +581,9 @@ class OutageStateMachine:
             self._last_unprocessed_by_pair = None
             self._save_state(state=state, epoch=epoch, confirmed=0,
                              entered_degraded_at=row.get("entered_degraded_at"),
+                             restricted_since=None,
+                             restricted_deadline_at=None,
+                             pending_human_confirmation=0,
                              recovered_notified_epoch=row.get("recovered_notified_epoch"),
                              ready_streak=0,
                              updated_at=_iso(now))

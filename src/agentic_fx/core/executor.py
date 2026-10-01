@@ -719,6 +719,14 @@ class Executor:
         完全共有 — 判定ロジック不変)。
         """
         now = self.clock.now()
+        if self.state_fn() != "ready":
+            reasons = ["data source degraded (fail closed)"]
+            intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                          reject_reason=reasons[0],
+                                          reject_category="risk_gate")
+            self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
+                                ref_id=str(iid))
+            return {"result": "rejected", "order_id": None, "reasons": reasons}
         age_sec = (now - snapshot.captured_at).total_seconds()
         if age_sec > max_snapshot_age_sec:
             reasons = [

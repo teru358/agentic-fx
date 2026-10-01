@@ -94,9 +94,32 @@ def test_stall_formula_single_grace_no_double_counting_1m_and_1h(tmp_path):
     # 10:01:00 はまだ ready (10:01:30 を過ぎていない)
     assert m.observe(datetime(2026, 9, 24, 10, 1, 0, tzinfo=timezone.utc),
                      _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "ready"
-    # 10:02:00 (1m の停滞式を過ぎた最初の tick) で degraded
+    # 10:02:00 (1m の停滞式を過ぎた最初の tick) で restricted
     assert m.observe(datetime(2026, 9, 24, 10, 2, 0, tzinfo=timezone.utc),
-                     _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "degraded"
+                     _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "restricted"
+
+
+def test_restricted_deadline_is_absolute_and_strictly_exclusive(tmp_path):
+    conn = _db(tmp_path)
+    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 9, 59, tzinfo=timezone.utc))
+    _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    m = _machine(conn)
+    report = _report(succeeded=HARD_KEYS)
+    assert m.observe(datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc), report) == "restricted"
+    row = m.status()
+    assert row["restricted_since"] == "2026-09-24T10:01:30+00:00"
+    assert row["restricted_deadline_at"] == "2026-09-24T10:31:30+00:00"
+    assert m.observe(datetime(2026, 9, 24, 10, 31, 30, tzinfo=timezone.utc), report) == "restricted"
+    assert m.observe(datetime(2026, 9, 24, 10, 31, 31, tzinfo=timezone.utc), report) == "degraded"
+
+
+def test_zero_flat_stall_timeout_degrades_immediately(tmp_path):
+    conn = _db(tmp_path)
+    _seed_bar(conn, PAIR, "1m", datetime(2026, 9, 24, 9, 59, tzinfo=timezone.utc))
+    _seed_bar(conn, PAIR, "1h", datetime(2026, 9, 24, 9, 0, tzinfo=timezone.utc))
+    m = _machine(conn, flat_stall_max_sec=0)
+    assert m.observe(datetime(2026, 9, 24, 10, 2, tzinfo=timezone.utc),
+                     _report(succeeded=HARD_KEYS)) == "degraded"
 
 
 def test_stall_formula_1h_boundary(tmp_path):
@@ -110,7 +133,7 @@ def test_stall_formula_1h_boundary(tmp_path):
     assert m.observe(datetime(2026, 9, 24, 11, 0, 0, tzinfo=timezone.utc),
                      _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "ready"
     assert m.observe(datetime(2026, 9, 24, 11, 1, 0, tzinfo=timezone.utc),
-                     _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "degraded"
+                     _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")])) == "restricted"
 
 
 def test_stall_formula_skips_weekend_until_next_bar_confirmation(tmp_path):
@@ -252,7 +275,7 @@ def test_watermark_reads_are_scoped_by_storage_source(tmp_path):
     # 1m の ingest 自体は succeeded だったことにしても (例えば「別 source から
     # 取ってしまった」誤設定を模す)、mt5-live 側の watermark 停滞は検出される
     state = m.observe(now, _report(succeeded=[(PAIR, "1m"), (PAIR, "1h")]))
-    assert state == "degraded"
+    assert state == "restricted"
 
 
 def test_ingest_tick_report_is_not_affected_by_last_errors_residue(tmp_path):
@@ -978,7 +1001,7 @@ def test_exposure_order_prevents_auto_resume(status, tmp_path):
     assert len([line for line in log.tail(50) if "datafeed_recovered_awaiting_resume" in line]) == 1
 
 
-def test_auto_resume_uses_last_success_for_not_attempted_key(tmp_path):
+def test_auto_resume_requires_a_current_success_for_every_key(tmp_path):
     conn = _db(tmp_path)
     keys = frozenset({(PAIR, "1m"), (PAIR, "15m")})
     machine = OutageStateMachine(conn, hard_keys=keys,
@@ -990,7 +1013,7 @@ def test_auto_resume_uses_last_success_for_not_attempted_key(tmp_path):
         _report(succeeded=keys)) == "degraded"
     one_minute = _report(succeeded=[(PAIR, "1m")])
     assert machine.observe(datetime(2026, 9, 24, 10, 3, tzinfo=timezone.utc), one_minute) == "degraded"
-    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "ready"
+    assert machine.observe(datetime(2026, 9, 24, 10, 4, tzinfo=timezone.utc), one_minute) == "degraded"
 
 
 def test_auto_resume_streak_resets_after_process_restart(tmp_path):

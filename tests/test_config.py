@@ -48,6 +48,7 @@ def test_datafeed_outage_defaults_and_example_are_validated():
     raw = _base_raw_datafeed(pytest.MonkeyPatch())
     del raw["datafeed"]["outage"]
     defaults = Settings.model_validate(raw).datafeed.outage
+    assert defaults.flat_stall_max_sec == 1800
     assert defaults.ready_confirm_ticks == 3
     assert defaults.auto_resume_when_flat is True
     assert load_settings(EXAMPLE).datafeed.outage.auto_resume_when_flat is True
@@ -57,6 +58,13 @@ def test_datafeed_outage_rejects_zero_ready_confirm_ticks(monkeypatch):
     raw = _base_raw_datafeed(monkeypatch)
     raw["datafeed"]["outage"] = {"ready_confirm_ticks": 0}
     with pytest.raises(ValidationError, match="ready_confirm_ticks"):
+        Settings.model_validate(raw)
+
+
+def test_datafeed_outage_rejects_negative_flat_stall_max_sec(monkeypatch):
+    raw = _base_raw_datafeed(monkeypatch)
+    raw["datafeed"]["outage"] = {"flat_stall_max_sec": -1}
+    with pytest.raises(ValidationError, match="flat_stall_max_sec"):
         Settings.model_validate(raw)
 
 

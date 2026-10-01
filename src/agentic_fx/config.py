@@ -152,6 +152,7 @@ class SourceToggle(_Strict):
 
 
 class OutageSettings(_Strict):
+    flat_stall_max_sec: int = Field(default=1800, ge=0)
     ready_confirm_ticks: int = Field(default=3, ge=1)
     auto_resume_when_flat: bool = True
 

@@ -334,6 +334,8 @@ CREATE TABLE IF NOT EXISTS datafeed_outage_state (
   epoch INTEGER NOT NULL DEFAULT 0,
   confirmed INTEGER NOT NULL DEFAULT 0,
   entered_degraded_at TEXT,
+  restricted_since TEXT,
+  restricted_deadline_at TEXT,
   ready_streak INTEGER NOT NULL DEFAULT 0,
   pending_human_confirmation INTEGER NOT NULL DEFAULT 0,
   resume_requested_at TEXT,
@@ -1396,6 +1398,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(
         conn, "datafeed_outage_state", "recovered_notified_epoch",
         "recovered_notified_epoch INTEGER")
+    _ensure_column(
+        conn, "datafeed_outage_state", "restricted_since",
+        "restricted_since TEXT")
+    _ensure_column(
+        conn, "datafeed_outage_state", "restricted_deadline_at",
+        "restricted_deadline_at TEXT")
     conn.commit()
 
 

@@ -75,6 +75,23 @@ def test_signal_claim_set_trigger_prompt_injection_and_consume(tmp_path):
     assert row["status"] == "consumed"  # パース成功時点で確定
 
 
+def test_claimed_open_signal_is_requeued_without_consuming_when_restricted(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "open", "pair": "USDJPY", "direction": "long",
+                      "entry_type": "market", "horizon": "day",
+                      "stop_loss": 147.0, "take_profit": 149.0,
+                      "reasoning": "x"}, [])])
+    loop.executor.state_fn = lambda: "restricted"
+    sid = _add_signal(conn)
+
+    loop.run_once("signal")
+
+    row = conn.execute("SELECT status, requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert dict(row) == {"status": "pending", "requeue_count": 1}
+    intent = conn.execute("SELECT gate_result, reject_category FROM trade_intents").fetchone()
+    assert dict(intent) == {"gate_result": "rejected", "reject_category": "risk_gate"}
+
+
 # ---------------------------------------------------------------------
 # ⑦ runner/パース失敗で requeue
 # ---------------------------------------------------------------------

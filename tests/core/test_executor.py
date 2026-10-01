@@ -111,7 +111,7 @@ def test_open_rejected_fail_closed_when_state_not_ready(tmp_path):
     conn, ex, _, mid = _setup(tmp_path)
     quote_calls = []
     ex.quote_fn = lambda p: (quote_calls.append(p), QUOTE)[1]
-    ex.state_fn = lambda: "degraded"
+    ex.state_fn = lambda: "restricted"
     out = ex.handle_intent(_open_intent(entry_type="market", limit_price=None,
                                         expires_in=None), mid)
     assert out["result"] == "rejected"

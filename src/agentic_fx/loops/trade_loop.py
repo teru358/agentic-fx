@@ -320,7 +320,9 @@ class TradeLoop:
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
                     consume_error = None
-                    if claimed is not None:
+                    if (claimed is not None and not (
+                            intent.action is Action.OPEN
+                            and self.executor.state_fn() != "ready")):
                         # ⑥consume/requeue の確定規則: パース成功の時点で
                         # consume する (プロンプトに実際に載せた Mission が
                         # 確定できる)。executor 実行後の requeue は二重発注
