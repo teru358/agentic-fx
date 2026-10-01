@@ -437,3 +437,42 @@ def test_datafeed_outage_state_recovered_notified_epoch_column_added_via_ensure_
     assert conn.execute(
         "SELECT recovered_notified_epoch FROM datafeed_outage_state "
         "WHERE id=1").fetchone()["recovered_notified_epoch"] is None
+
+
+def test_datafeed_outage_state_restricted_columns_are_added_to_an_old_table(tmp_path):
+    import sqlite3
+
+    from agentic_fx.store.db import connect, init_db
+
+    db_path = tmp_path / "t.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.execute("""
+        CREATE TABLE datafeed_outage_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          state TEXT NOT NULL,
+          epoch INTEGER NOT NULL DEFAULT 0,
+          confirmed INTEGER NOT NULL DEFAULT 0,
+          entered_degraded_at TEXT,
+          ready_streak INTEGER NOT NULL DEFAULT 0,
+          pending_human_confirmation INTEGER NOT NULL DEFAULT 0,
+          resume_requested_at TEXT,
+          resume_acknowledge INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        )
+    """)
+    legacy.execute(
+        "INSERT INTO datafeed_outage_state (id, state, epoch, confirmed, "
+        "updated_at) VALUES (1, 'degraded', 3, 1, '2026-01-01T00:00:00+00:00')")
+    legacy.commit()
+    legacy.close()
+
+    conn = connect(db_path)
+    init_db(conn)
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT state, epoch, restricted_since, restricted_deadline_at "
+        "FROM datafeed_outage_state WHERE id=1").fetchone()
+    assert (row["state"], row["epoch"]) == ("degraded", 3)
+    assert row["restricted_since"] is None
+    assert row["restricted_deadline_at"] is None

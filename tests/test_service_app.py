@@ -4853,6 +4853,46 @@ def test_db_healthcheck_accepts_latest_closed_hourly_bar_until_end_plus_grace(tm
         app.trade_loop.provider.healthcheck("USDJPY")
 
 
+def test_db_healthcheck_raises_while_the_data_state_is_restricted(tmp_path):
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed.health import DataUnhealthy
+    from agentic_fx.store import ohlcv as ohlcv_store
+    _init(tmp_path)
+
+    class _Clock:
+        def __init__(self, t): self.t = t
+        def now(self): return self.t
+    clock = _Clock(datetime(2026, 9, 22, 10, 59, tzinfo=timezone.utc))
+    app = build_app(tmp_path, clock=clock)
+    try:
+        bars = [Bar("USDJPY", "1h", datetime(2026, 9, 22, h, 0, tzinfo=timezone.utc),
+                    150.0, 150.1, 149.9, 150.0, 10.0) for h in range(5, 10)]
+        ohlcv_store.upsert_cache_bars(app.conn_core, bars, source="yfinance")
+        assert app.trade_loop.provider.healthcheck("USDJPY") == "yfinance"
+
+        app.outage._ensure_row(clock.now())
+        app.conn_core.execute(
+            "UPDATE datafeed_outage_state SET state='restricted' WHERE id=1")
+        app.conn_core.commit()
+        with pytest.raises(DataUnhealthy):
+            app.trade_loop.provider.healthcheck("USDJPY")
+    finally:
+        app.close()
+
+
+def test_scheduler_tick_does_not_commit_ingest_bars_when_prepare_raises(tmp_path):
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    app.ingest = MagicMock()
+    app.ingest.prepare.side_effect = RuntimeError("prepare boom")
+    app.scheduler.tick = lambda now: []
+
+    _scheduler_tick_once(app)
+
+    app.ingest.commit.assert_not_called()
+
+
 # --- [outage-stop-and-backfill]: 価格源不通からの停止・観測・手動復旧
 # (fake、実 bridge なし) ---
 

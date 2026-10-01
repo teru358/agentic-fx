@@ -275,3 +275,83 @@ def test_restart_keeps_the_deadline_stored_in_the_database(tmp_path):
     _fresh(conn, now)
 
     assert restarted.observe(now, _report()) == "degraded"
+
+
+def test_pending_confirmation_keeps_a_restricted_state_from_returning_to_ready(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _put_state(conn, machine, "restricted", deadline=NOW + timedelta(minutes=20), pending=1)
+    states = []
+    for minute in (0, 1, 2):
+        now = NOW + timedelta(minutes=minute)
+        _fresh(conn, now)
+        states.append(machine.observe(now, _report()))
+
+    assert states == ["restricted", "restricted", "degraded"]
+    assert machine.status()["pending_human_confirmation"] == 1
+
+
+def test_promotion_from_restricted_keeps_the_recorded_origin_and_deadline(tmp_path):
+    conn, machine = _rig(tmp_path)
+    deadline = datetime(2026, 9, 30, 10, 0, tzinfo=UTC)
+    _put_state(conn, machine, "restricted", deadline=deadline)
+    now = deadline + timedelta(seconds=1)
+    _fresh(conn, now)
+
+    assert machine.observe(now, _report()) == "degraded"
+    row = machine.status()
+    assert row["restricted_deadline_at"] == deadline.isoformat()
+    assert row["restricted_since"] == (deadline - timedelta(seconds=1800)).isoformat()
+
+
+def test_awaiting_resume_is_announced_only_after_a_healthy_tick(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log, auto_resume_when_flat=False)
+    _put_state(conn, machine, "degraded", pending=1)
+    deferred = IngestTickReport(attempted=frozenset(), succeeded=frozenset(),
+                                failed=frozenset(), deferred=frozenset({KEY}),
+                                empty=frozenset())
+    _fresh(conn, NOW)
+
+    machine.observe(NOW, deferred)
+    assert "datafeed_recovered_awaiting_resume" not in [
+        line.split("\t")[2] for line in log.tail(10)]
+
+    now = NOW + timedelta(minutes=1)
+    _fresh(conn, now)
+    machine.observe(now, _report())
+    assert [line.split("\t")[2] for line in log.tail(10)].count(
+        "datafeed_recovered_awaiting_resume") == 1
+
+
+def test_restricted_stalled_ticks_do_not_mark_the_episode_confirmed(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _put_state(conn, machine, "ready")
+    _seed_bar(conn, datetime(2026, 9, 30, 9, 50, tzinfo=UTC))
+    states = [machine.observe(NOW + timedelta(seconds=30 * i), _report()) for i in range(4)]
+
+    assert states == ["restricted"] * 4
+    assert machine.status()["confirmed"] == 0
+
+
+def test_second_stalled_tick_with_an_exposure_confirms_the_outage_and_notifies(tmp_path):
+    log = ActivityLog(tmp_path / "activity.log")
+    conn, machine = _rig(tmp_path, activity=log)
+    _put_state(conn, machine, "ready")
+    _open_position(conn, NOW - timedelta(minutes=30))
+    _seed_bar(conn, NOW - timedelta(minutes=10))
+
+    assert machine.observe(NOW, _report()) == "degraded"
+    assert machine.status()["confirmed"] == 0
+    assert machine.observe(NOW + timedelta(seconds=30), _report()) == "degraded"
+    assert machine.status()["confirmed"] == 1
+    assert "data_outage_degraded" in [line.split("\t")[2] for line in log.tail(20)]
+
+
+def test_accepted_resume_clears_the_pending_human_confirmation(tmp_path):
+    conn, machine = _rig(tmp_path)
+    _put_state(conn, machine, "degraded", pending=1)
+    _fresh(conn, NOW)
+    machine.request_resume(NOW, acknowledge=True)
+
+    assert machine.observe(NOW, _report()) == "ready"
+    assert machine.status()["pending_human_confirmation"] == 0

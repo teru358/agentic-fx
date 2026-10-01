@@ -8,7 +8,7 @@ from datetime import timedelta
 from agentic_fx.core.contracts import Bar
 from agentic_fx.store import orders
 
-from tests.core.test_scheduler import WED, Env, _seed_decision_bar
+from tests.core.test_scheduler import FRI, WED, Env, _seed_decision_bar
 
 
 def test_restricted_blocks_cron_mission_and_does_not_advance_the_cursor(tmp_path):
@@ -68,3 +68,15 @@ def test_restricted_blocks_signal_maintenance_but_not_news_and_econ(tmp_path):
     state["v"] = "ready"
     env.sched.tick(WED + timedelta(minutes=1))
     assert env.signal_maintenance_calls == 1
+
+
+def test_restricted_keeps_the_cron_cursor_unadvanced_across_a_market_close(tmp_path):
+    state = {"v": "restricted"}
+    closed = FRI.replace(hour=22)
+    env = Env(tmp_path, base=FRI, seed_cron_bar=False, state_fn=lambda: state["v"])
+    _seed_decision_bar(env, FRI - timedelta(hours=1, seconds=30))
+
+    env.sched.tick(closed)
+
+    assert env.trade_calls == 0
+    assert ("USDJPY", "1h") not in env.sched._cron_watermarks
