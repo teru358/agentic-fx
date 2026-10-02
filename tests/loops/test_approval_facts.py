@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
@@ -531,21 +533,87 @@ def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
     assert "  引用: 選んだ課題の文面 (agent 起票): 課題の文面" in lines
 
 
-def test_a_failure_other_than_facts_error_creates_no_approval_and_fails_the_mission(
-        loop_min, conn, clock, tmp_path, monkeypatch):
+_FINALIZE_PAYLOAD = {"name": "x", "kind": "strategy",
+                     "content_hash": SUBMITTED}
+
+
+def _finalize_with_failing_collection(loop_min, conn, clock, tmp_path,
+                                      monkeypatch, exc):
     mission_id, run_id, backlog_id = _setup(conn, clock)
     ctx = _ctx(tmp_path, mission_id, run_id, [_persistable_bt(tmp_path)])
 
-    def boom(*args, **kwargs):
-        raise RuntimeError("storage failure")
+    def boom(conn_, **kwargs):
+        conn_.execute("INSERT INTO improvement_backlog(idea, source, created_at, "
+                      "updated_at) VALUES ('leaked', 'user', 'x', 'x')")
+        raise exc
     monkeypatch.setattr(approval_facts, "build_facts_payload", boom)
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None,
-        approval_payload={"name": "x", "kind": "strategy",
-                          "content_hash": SUBMITTED},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        slot_key=None, approval_payload=dict(_FINALIZE_PAYLOAD), now=NOW,
+        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    return mission_id
+
+
+@pytest.mark.parametrize("exc", [
+    FactsError("shape"),
+    sqlite3.OperationalError("database is locked"),
+    sqlite3.DatabaseError("malformed"),
+    TypeError("shape"),
+    KeyError("shape"),
+    ValueError("shape"),
+])
+def test_a_continuable_collection_failure_still_creates_a_facts_less_approval(
+        loop_min, conn, clock, tmp_path, monkeypatch, caplog, exc):
+    with caplog.at_level(logging.WARNING):
+        mission_id = _finalize_with_failing_collection(
+            loop_min, conn, clock, tmp_path, monkeypatch, exc)
+    payload = _stored_payload(conn)
+    assert "facts_version" not in payload and "parent_facts" not in payload
+    assert payload["name"] == "x"
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (mission_id,)).fetchone()["status"] == "completed"
+    assert any("approval facts not built" in r.getMessage()
+               for r in caplog.records if r.levelno == logging.WARNING)
+    # 収集の途中で書いた行は SAVEPOINT で戻る
+    assert conn.execute("SELECT COUNT(*) AS n FROM improvement_backlog "
+                        "WHERE idea='leaked'").fetchone()["n"] == 0
+
+
+@pytest.mark.parametrize("exc", [
+    sqlite3.InterfaceError("Cannot operate on a closed database."),
+    sqlite3.ProgrammingError("Cannot operate on a closed database."),
+    RuntimeError("storage failure"),
+])
+def test_a_non_continuable_collection_failure_creates_no_approval_and_fails_the_mission(
+        loop_min, conn, clock, tmp_path, monkeypatch, exc):
+    mission_id = _finalize_with_failing_collection(
+        loop_min, conn, clock, tmp_path, monkeypatch, exc)
     assert conn.execute(
         "SELECT COUNT(*) AS n FROM approval_requests").fetchone()["n"] == 0
     assert conn.execute("SELECT status FROM missions WHERE id=?",
                         (mission_id,)).fetchone()["status"] != "completed"
+    assert conn.execute("SELECT COUNT(*) AS n FROM improvement_backlog "
+                        "WHERE idea='leaked'").fetchone()["n"] == 0
+
+
+def test_the_facts_of_the_current_run_exclude_that_run_and_count_its_backtests(
+        loop_min, conn, clock, tmp_path):
+    mission_id, run_id, backlog_id = _setup(conn, clock)
+    older = _finished_run(conn, backlog_id, None)
+    newer = _finished_run(conn, backlog_id, "report")
+    # 現在の run の行も完了印が付いている状態にして、除外が run_id の一致
+    # だけで成り立つようにする。
+    improve_runs_store.finish(conn, run_id, result=None, now=NOW,
+                              commit=False)
+    conn.commit()
+    entries = [_persistable_bt(tmp_path), _persistable_bt(tmp_path, "ee" * 32)]
+    ctx = _ctx(tmp_path, mission_id, run_id, entries)
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None, approval_payload=dict(_FINALIZE_PAYLOAD), now=NOW,
+        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    facts = _stored_payload(conn)["parent_facts"]
+    ids = [r["run_id"] for r in facts["prior_runs"]]
+    assert run_id not in ids
+    assert ids == [newer, older]
+    assert len(facts["trials"]) == 2 and facts["trials_omitted"] == 0

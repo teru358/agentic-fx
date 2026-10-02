@@ -437,10 +437,30 @@ def test_unhashable_backlog_status_only_replaces_the_parent_section(
 
 @pytest.mark.parametrize("claims", [["summary"], "summary selection_rationale",
                                     5, None])
-def test_non_dict_agent_claims_show_no_claims_section(tmp_path, claims):
+def test_non_dict_agent_claims_show_the_claims_heading_and_an_invalid_line(
+        tmp_path, claims):
     out = _show(tmp_path, _new_payload(agent_claims=claims))
+    lines = out.split("\n")
+    assert PARENT_HEADING in lines
+    assert lines.count(CLAIMS_HEADING) == 1
+    assert lines[lines.index(CLAIMS_HEADING) + 1] == (
+        approval_facts.CLAIMS_INVALID_LINE)
+    assert approval_facts.CLAIMS_INVALID_LINE.endswith(INVALID)
+    assert "自己申告: selection_rationale" not in out
+
+
+def test_missing_agent_claims_key_in_the_new_format_shows_an_invalid_line(
+        tmp_path):
+    payload = _new_payload()
+    del payload["agent_claims"]
+    lines = _show(tmp_path, payload).split("\n")
+    assert lines[lines.index(CLAIMS_HEADING) + 1] == (
+        approval_facts.CLAIMS_INVALID_LINE)
+
+
+def test_empty_agent_claims_dict_shows_no_claims_section(tmp_path):
+    out = _show(tmp_path, _new_payload(agent_claims={}))
     assert CLAIMS_HEADING not in out
-    assert PARENT_HEADING in out.split("\n")
 
 
 def test_empty_metrics_dict_is_shown_as_a_dash_line(tmp_path):
@@ -499,3 +519,85 @@ def test_archive_path_has_its_own_longer_limit(tmp_path, length, cut):
     expected = ("p" * 300 + approval_facts.TRUNCATION_SUFFIX) if cut else path
     assert f"archive={expected}" in cmds.dispatch(
         f"approval {approval_id}").split("\n")
+
+
+# ---- 行区切り・結合文字・サロゲート ----
+
+NASTY = "a\u2028b\u2029c\x85d\x0be\x1cf\ud800g"
+COMBINED = "e\u0301"
+FORGED = "\u2028" + PARENT_HEADING + "\u2029" + CLAIMS_HEADING + "\x85"
+
+
+def _assert_one_line_per_row(out):
+    _assert_clean(out)
+    assert out.splitlines() == out.split("\n")
+    assert not any(0xD800 <= ord(ch) <= 0xDFFF for ch in out)
+    lines = out.split("\n")
+    assert sum(ln.startswith(PARENT_HEADING) for ln in lines) == 1
+    assert lines.count(CLAIMS_HEADING) == 1
+
+
+def _inject(key):
+    value = NASTY + COMBINED + FORGED
+    payload = _new_payload()
+    if key == "name":
+        payload["name"] = value
+    elif key == "pair":
+        payload["in_sample"] = {value: {"pf": 1.0}}
+    else:
+        payload["agent_claims"][key] = value
+    return payload
+
+
+@pytest.mark.parametrize("key", ["name", "pair", "selection_rationale",
+                                 "summary", "selected_backlog_idea"])
+def test_payload_values_with_line_separators_and_surrogates_stay_one_line(
+        tmp_path, key):
+    out = _show(tmp_path, _inject(key))
+    _assert_one_line_per_row(out)
+    assert COMBINED in out
+
+
+def test_reason_with_line_separators_stays_one_line(tmp_path):
+    out = _show(tmp_path, _new_payload(),
+                reason=NASTY.replace("\ud800", "") + COMBINED + FORGED)
+    _assert_one_line_per_row(out)
+    assert COMBINED in out
+
+
+def test_archive_path_with_line_separators_stays_one_line(tmp_path):
+    conn, cmds = _commands(tmp_path)
+    payload = _new_payload(kind="indicator", name="ind", mission_id=7,
+                           content_hash="h")
+    approval_id = approvals.create(conn, kind="plugin", payload=payload,
+                                   now=NOW)
+    candidate_archives.insert(
+        conn, mission_id=7, name="ind", content_hash="h", artifact_hash="a",
+        archive_path="p/" + NASTY.replace("\ud800", "") + COMBINED + FORGED,
+        pair="USDJPY", metrics={}, now=NOW)
+    cmds._dependent_strategies = lambda **kw: ([NASTY + FORGED], [])
+    out = cmds.dispatch(f"approval {approval_id}")
+    _assert_one_line_per_row(out)
+    assert COMBINED in out
+
+
+# ---- 省略の接尾辞 ----
+
+def test_a_claim_cut_at_save_time_shows_the_suffix_once(tmp_path):
+    suffix = approval_facts.TRUNCATION_SUFFIX
+    stored = "あ" * approval_facts.CLAIM_STORE_LIMIT + suffix
+    payload = _new_payload()
+    payload["agent_claims"]["summary"] = stored
+    out = _show(tmp_path, payload)
+    line = next(ln for ln in out.split("\n")
+                if ln.startswith("  自己申告: summary: "))
+    assert line.count(suffix) == 1 and line.endswith(suffix)
+    assert line == ("  自己申告: summary: "
+                    + "あ" * approval_facts.CLAIM_DISPLAY_LIMIT + suffix)
+
+
+def test_a_short_value_that_already_ends_with_the_suffix_is_not_doubled():
+    suffix = approval_facts.TRUNCATION_SUFFIX
+    value = "x" * (approval_facts.CLAIM_DISPLAY_LIMIT - 3) + suffix
+    assert approval_facts.display_text(
+        value, approval_facts.CLAIM_DISPLAY_LIMIT) == value

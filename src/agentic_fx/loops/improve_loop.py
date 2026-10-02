@@ -2396,6 +2396,12 @@ class ImproveLoop:
                     1 for e in accepted if e["kind"] == "analyze_corr")
                 approval_payload["trial_count"] = sum(
                     e["trial_count"] for e in accepted)
+                # 親の事実の収集は SAVEPOINT の中で行う。続行できる失敗
+                # (形の不一致・接続喪失でない DB 失敗) は収集の書き込みを
+                # 戻し、旧形式 (facts なし) のまま承認依頼を作る。接続が
+                # 使えない失敗 (InterfaceError / ProgrammingError) と想定外の
+                # 例外は外へ伝え、補償経路に入る。
+                conn.execute("SAVEPOINT approval_facts")
                 try:
                     approval_payload.update(approval_facts.build_facts_payload(
                         conn, run_id=run_id, backlog_id=backlog_id,
@@ -2405,11 +2411,14 @@ class ImproveLoop:
                         selection_rationale=approval_payload.get(
                             "selection_rationale"),
                         summary=approval_payload.get("summary")))
-                except approval_facts.FactsError:
-                    # 親の事実表を組めないときは旧形式のまま承認依頼を作る
-                    # (表示側が旧形式として扱う)。
+                except (sqlite3.InterfaceError, sqlite3.ProgrammingError):
+                    raise
+                except (approval_facts.FactsError, sqlite3.DatabaseError,
+                        TypeError, KeyError, ValueError):
+                    conn.execute("ROLLBACK TO SAVEPOINT approval_facts")
                     _log.warning("approval facts not built for mission_id=%s",
                                  mission_id, exc_info=True)
+                conn.execute("RELEASE SAVEPOINT approval_facts")
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)

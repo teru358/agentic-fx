@@ -29,6 +29,7 @@ PARENT_INVALID_LINE = f"{PARENT_HEADING} {INVALID_FORMAT_TEXT}"
 LEGACY_LINE = (f"{PARENT_HEADING} 旧形式の承認依頼です。"
                "親の事実表は保存されていません。以下の自己申告は未検証です。")
 CLAIMS_HEADING = "--- agent の自己申告 (未検証。親は内容の真偽を確認していない) ---"
+CLAIMS_INVALID_LINE = f"  自己申告: {INVALID_FORMAT_TEXT}"
 PARENT_NOTE = ("注記: backtest の回数と同じ内容の再実行は agent が依頼したもので、"
                "試行の独立性を示しません。どの課題を選ぶかは agent が決めています。")
 
@@ -65,9 +66,13 @@ def display_text(value: object, limit: int = FIELD_DISPLAY_LIMIT) -> str:
     text = " ".join(text.split())
     if not text:
         return "-"
-    if len(text) > limit:
-        text = text[:limit] + TRUNCATION_SUFFIX
-    return text
+    # 保存時に切って接尾辞が付いた値は、接尾辞を除いた本体で長さを測り、
+    # 接尾辞が重ならないようにする。
+    body = text[:-len(TRUNCATION_SUFFIX)] if text.endswith(
+        TRUNCATION_SUFFIX) else text
+    if len(body) <= limit:
+        return text
+    return body[:limit] + TRUNCATION_SUFFIX
 
 
 def _store_text(value: object) -> str | None:
@@ -302,7 +307,7 @@ def render_facts_lines(payload: dict) -> list[str]:
             lines = [PARENT_INVALID_LINE]
         claims = payload.get("agent_claims")
         if not isinstance(claims, dict):
-            claims = {}
+            return lines + [CLAIMS_HEADING, CLAIMS_INVALID_LINE]
     else:
         lines = [LEGACY_LINE]
         claims = {key: payload[key]
