@@ -37,6 +37,7 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # ため効かない)
 from agentic_fx.loops.improve_context import build_improve_context
 from agentic_fx.loops.improve_run_context import ImproveRunContext
+from agentic_fx.loops import approval_facts
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import is_tool_budget_abort
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
@@ -2395,6 +2396,20 @@ class ImproveLoop:
                     1 for e in accepted if e["kind"] == "analyze_corr")
                 approval_payload["trial_count"] = sum(
                     e["trial_count"] for e in accepted)
+                try:
+                    approval_payload.update(approval_facts.build_facts_payload(
+                        conn, run_id=run_id, backlog_id=backlog_id,
+                        accepted_entries=accepted,
+                        submitted_content_hash=approval_payload.get(
+                            "content_hash"),
+                        selection_rationale=approval_payload.get(
+                            "selection_rationale"),
+                        summary=approval_payload.get("summary")))
+                except approval_facts.FactsError:
+                    # 親の事実表を組めないときは旧形式のまま承認依頼を作る
+                    # (表示側が旧形式として扱う)。
+                    _log.warning("approval facts not built for mission_id=%s",
+                                 mission_id, exc_info=True)
                 approval_id = approvals_store.create(
                     conn, kind="plugin", payload=approval_payload, now=now,
                     commit=False)
