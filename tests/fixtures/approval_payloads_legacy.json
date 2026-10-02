@@ -1,0 +1,170 @@
+{
+ "agent_strategy_rejected_22": {
+  "name": "sma_cross_10_40",
+  "kind": "strategy",
+  "candidate_origin": "staging",
+  "candidate_path": "plugins/_staging/86/sma_cross_10_40",
+  "content_hash": "61b76093b22c0fb01750000f91754add6bb0a5b75567aec478d36c5403c96977",
+  "artifact_hash": "732347350cc7739c9e8dc9a2e4bd76a6c8e68a01fda8a7a9d1f1b36d0f9c98de",
+  "eval_source": "mt5",
+  "base_interval": "5m",
+  "eval_timeframe": "1h",
+  "live_source": "yfinance",
+  "mission_id": 86,
+  "backlog_id": 77,
+  "in_sample": {
+   "USDJPY": {
+    "trades": 166,
+    "pf": 1.486059426538984,
+    "win_rate": 0.4819277108433735,
+    "avg_r": 0.1754819651933809,
+    "max_drawdown": 0.02658592138153873,
+    "total_pnl": 144853.00000001374,
+    "evaluable": true,
+    "fallback_spread_used": true,
+    "kill_switch_latches": 4
+   }
+  },
+  "holdout": {
+   "trades": 40,
+   "pf": 1.119387128367802,
+   "win_rate": 0.45,
+   "avg_r": 0.035287701475467614,
+   "max_drawdown": 0.01478890831875918,
+   "total_pnl": 7192.0000000045,
+   "evaluable": true,
+   "fallback_spread_used": true,
+   "kill_switch_latches": 0
+  },
+  "baseline": {
+   "plugin_ref": "no_strategy:sma_cross_10_40",
+   "content_hash": "61b76093b22c0fb01750000f91754add6bb0a5b75567aec478d36c5403c96977",
+   "kind": "strategy",
+   "variant": "no_strategy"
+  },
+  "analysis_run_ids": [],
+  "trial_count": 2,
+  "analysis_call_count": 0,
+  "backtest_call_count": 2,
+  "selection_rationale": "既存の fast=10/slow=30 候補と同一条件の再提出を避け、slow_period=40 へ変更した未着手の #77 を選択した。依存ロック後に self-test と backtest を再実行し、artifact の一致を確認した。",
+  "summary": "配備済み SMA indicator に依存する USDJPY 1h SMA(10/40) クロス戦略。SL/TPは30/60 pips。ロック後 self-test は4件通過し、in_sample は trades=166、PF=1.4861、勝率48.19%、avg_r=0.1755。",
+  "audit_note": "RPC timeout した呼出しは数えていない",
+  "profitability_floor": {
+   "min_pf": 0.0,
+   "require_positive_avg_r": false,
+   "require_holdout_evaluable": false
+  },
+  "indicator_deps": {
+   "fast_sma": {
+    "plugin": "sma",
+    "content_hash": "7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2",
+    "params": {
+     "period": 10
+    }
+   },
+   "slow_sma": {
+    "plugin": "sma",
+    "content_hash": "7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2",
+    "params": {
+     "period": 40
+    }
+   }
+  }
+ },
+ "agent_strategy_approved_21": {
+  "name": "sma_cross_10_30",
+  "kind": "strategy",
+  "candidate_origin": "staging",
+  "candidate_path": "plugins/_staging/85/sma_cross_10_30",
+  "content_hash": "9d8f83366a3da8d2ef8b4d65c0225605a81d326f0ed7e41c42660fe203af5e6d",
+  "artifact_hash": "395e2ce2d0651d574fa85b81b498db26fe8317566cc8a3068c6211a589e394f7",
+  "eval_source": "mt5",
+  "base_interval": "5m",
+  "eval_timeframe": "1h",
+  "live_source": "yfinance",
+  "mission_id": 85,
+  "backlog_id": 73,
+  "in_sample": {
+   "USDJPY": {
+    "trades": 201,
+    "pf": 1.4440572139303938,
+    "win_rate": 0.48258706467661694,
+    "avg_r": 0.18095898178667616,
+    "max_drawdown": 0.03763163337640746,
+    "total_pnl": 178511.00000001668,
+    "evaluable": true,
+    "fallback_spread_used": true,
+    "kill_switch_latches": 3
+   }
+  },
+  "holdout": {
+   "trades": 48,
+   "pf": 0.7624153836938286,
+   "win_rate": 0.2916666666666667,
+   "avg_r": -0.08701456478852544,
+   "max_drawdown": 0.03714922190184371,
+   "total_pnl": -19829.99999999368,
+   "evaluable": true,
+   "fallback_spread_used": true,
+   "kill_switch_latches": 1
+  },
+  "baseline": {
+   "plugin_ref": "no_strategy:sma_cross_10_30",
+   "content_hash": "9d8f83366a3da8d2ef8b4d65c0225605a81d326f0ed7e41c42660fe203af5e6d",
+   "kind": "strategy",
+   "variant": "no_strategy"
+  },
+  "analysis_run_ids": [],
+  "trial_count": 2,
+  "analysis_call_count": 0,
+  "backtest_call_count": 2,
+  "selection_rationale": "hold率1.0への対応として、既知の実績があり再検証でもPF>1となった未試行backlog #73を選択した。",
+  "summary": "配備済みSMAをfast=10/slow=30で利用するUSDJPY 1hクロス戦略。SL/TP=30/60 pips。ロック後のself-testは4件成功、in_sampleはtrades=201、PF=1.4441、avg_r=0.1810。",
+  "audit_note": "RPC timeout した呼出しは数えていない",
+  "profitability_floor": {
+   "min_pf": 0.0,
+   "require_positive_avg_r": false,
+   "require_holdout_evaluable": false
+  },
+  "indicator_deps": {
+   "fast_sma": {
+    "plugin": "sma",
+    "content_hash": "7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2",
+    "params": {
+     "period": 10
+    }
+   },
+   "slow_sma": {
+    "plugin": "sma",
+    "content_hash": "7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2",
+    "params": {
+     "period": 30
+    }
+   }
+  }
+ },
+ "human_indicator_approved_20": {
+  "name": "ema",
+  "kind": "indicator",
+  "candidate_origin": "human",
+  "candidate_path": "plugins/_human/ema",
+  "content_hash": "43f56088d9b3fd212d936f2e768533dd2f08ffdf48874d614a76bf46970e9623",
+  "artifact_hash": "05f4201a64d398394f925bc3cf00a99681a92d5398d94776c9db590ea12d9bab",
+  "metrics": {},
+  "evaluable": true,
+  "eval_source": null,
+  "base_interval": null,
+  "eval_timeframe": null,
+  "live_source": "yfinance",
+  "mission_id": null,
+  "backlog_id": null,
+  "floor_warning": "",
+  "floor_detail": "",
+  "profitability_floor": {
+   "min_pf": 1.0,
+   "require_positive_avg_r": true,
+   "require_holdout_evaluable": false
+  },
+  "indicator_deps": {}
+ }
+}

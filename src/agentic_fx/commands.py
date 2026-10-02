@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import unicodedata
 from pathlib import Path
@@ -12,6 +13,8 @@ from agentic_fx.core.contracts import Clock
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.datafeed.outage import format_unprocessed_positions
+from agentic_fx.loops import approval_facts
+from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.store import (approvals, backlog, candidate_archives,
                               missions, orders, reflection_attempts,
                               reflections)
@@ -412,31 +415,40 @@ class Commands:
 
     @staticmethod
     def _metrics_line(prefix: str, metrics: dict | None) -> str:
-        """1 行分の pf/trades/avg_r/max_drawdown 表示。値が無ければ `-`。"""
+        """1 行分の pf/trades/avg_r/max_drawdown 表示。値が無ければ `-`。
+        dict でない・値が数値でない場合はこの行だけを不正形式表示にする。"""
+        prefix = display_text(prefix)
         if metrics is None:
             return f"{prefix}: -"
-
-        def _fmt(v):
-            return "-" if v is None else v
-        return (f"{prefix}: pf={_fmt(metrics.get('pf'))} "
-                f"trades={_fmt(metrics.get('trades'))} "
-                f"avg_r={_fmt(metrics.get('avg_r'))} "
-                f"max_drawdown={_fmt(metrics.get('max_drawdown'))}")
+        if not isinstance(metrics, dict):
+            return f"{prefix}: {approval_facts.INVALID_FORMAT_TEXT}"
+        cells = []
+        for key in ("pf", "trades", "avg_r", "max_drawdown"):
+            v = metrics.get(key)
+            if v is None:
+                cells.append(f"{key}=-")
+            elif type(v) is int or (type(v) is float and math.isfinite(v)):
+                cells.append(f"{key}={v}")
+            else:
+                return f"{prefix}: {approval_facts.INVALID_FORMAT_TEXT}"
+        return f"{prefix}: " + " ".join(cells)
 
     @classmethod
     def _metrics_lines(cls, prefix: str, value) -> list[str]:
         """`value` は単一 pair の metrics dict (`"trades"` キーを持つ) か、
         複数 pair の `{pair: metrics}` dict、あるいは None
         ([approval-payload-missing-gate-metrics] 是正前の旧 payload との
-        後方互換)。単一 dict は 1 行、per-pair dict は pair ごとに 1 行。"""
-        if value is None:
+        後方互換)。単一 dict は 1 行、per-pair dict は pair ごとに 1 行。
+        その他の型は 1 行の不正形式表示。"""
+        if value is None or value == {}:
             return [cls._metrics_line(prefix, None)]
-        if isinstance(value, dict) and "trades" in value:
+        if not isinstance(value, dict):
+            return [f"{display_text(prefix)}: "
+                    f"{approval_facts.INVALID_FORMAT_TEXT}"]
+        if "trades" in value:
             return [cls._metrics_line(prefix, value)]
-        if isinstance(value, dict):
-            return [cls._metrics_line(f"{prefix} {pair}", metrics)
-                   for pair, metrics in value.items()]
-        return [cls._metrics_line(prefix, None)]
+        return [cls._metrics_line(f"{prefix} {display_text(pair)}", metrics)
+                for pair, metrics in value.items()]
 
     _APPROVAL_LIST_DEFAULT = 20
     _APPROVAL_LIST_MAX = 200
@@ -517,6 +529,17 @@ class Commands:
         return [f"op_id={r['op_id']} name={r['name']} phase={r['phase']} "
                 f"approval_id={r['approval_id']}" for r in rows]
 
+    @staticmethod
+    def _free_text(value) -> str:
+        """payload 由来の自由な値を 1 行の安全な文字列にする。文字列以外は
+        JSON (ASCII エスケープ) にして表示する。"""
+        if not isinstance(value, str):
+            try:
+                value = json.dumps(value, ensure_ascii=True)
+            except (TypeError, ValueError):
+                return approval_facts.INVALID_FORMAT_TEXT
+        return display_text(value, approval_facts.CLAIM_DISPLAY_LIMIT)
+
     def _approval_detail(self, approval_id: int) -> str:
         row = self.conn.execute(
             "SELECT kind, status, payload_json, reason, decided_by, "
@@ -524,40 +547,48 @@ class Commands:
             (approval_id,)).fetchone()
         if row is None:
             return f"approval #{approval_id} は存在しません"
+        header = (f"approval #{approval_id} kind={display_text(row['kind'])} "
+                  f"status={display_text(row['status'])}")
+        decision_line = (
+            f"reason={display_text(row['reason'], approval_facts.CLAIM_DISPLAY_LIMIT)} "
+            f"decided_by={display_text(row['decided_by'])} "
+            f"decided_at={display_text(row['decided_at'])}")
         try:
             payload = (json.loads(row["payload_json"])
                       if row["payload_json"] else {})
-        except (TypeError, ValueError):
-            payload = {}
+        except (TypeError, ValueError, RecursionError):
+            payload = None
+        if not isinstance(payload, dict):
+            return "\n".join([header, approval_facts.PAYLOAD_INVALID_LINE,
+                              decision_line])
         lines = [
-            f"approval #{approval_id} kind={row['kind']} status={row['status']}",
-            f"name={payload.get('name', '-')} "
-            f"content_hash={payload.get('content_hash', '-')} "
-            f"eval_timeframe={payload.get('eval_timeframe') or '-'}",
+            header,
+            f"name={display_text(payload.get('name'))} "
+            f"content_hash={display_text(payload.get('content_hash'))} "
+            f"eval_timeframe={display_text(payload.get('eval_timeframe'))}",
         ]
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
+        lines += approval_facts.render_facts_lines(payload)
         # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の
         # 読み出し導線。`approval_requests.reason` は backlog の
         # `last_result` (固定文言 `rejected_by_human`) へは流れないため、
         # ここで表示しないと write-only になる。
-        lines.append(
-            f"reason={row['reason'] or '-'} "
-            f"decided_by={row['decided_by'] or '-'} "
-            f"decided_at={row['decided_at'] or '-'}")
+        lines.append(decision_line)
         # [profitability-floor] T0 (2026-09-12、T1 Step 1-8 と対): 収益性
         # フロア警告 (`bless_candidate` の `floor_mode="warn"` 経路) の
         # payload キーを表示する。T1 実装前は payload に無いため fail-soft
         # (キー欠落時は行を出さない)。
         floor_warning = payload.get("floor_warning")
         if floor_warning:
-            lines.append(f"floor_warning={floor_warning}")
+            lines.append(f"floor_warning={self._free_text(floor_warning)}")
         floor_detail = payload.get("floor_detail")
         if floor_detail:
-            lines.append(f"floor_detail={floor_detail}")
+            lines.append(f"floor_detail={self._free_text(floor_detail)}")
         profitability_floor = payload.get("profitability_floor")
         if profitability_floor:
-            lines.append(f"profitability_floor={profitability_floor}")
+            lines.append(
+                f"profitability_floor={self._free_text(profitability_floor)}")
         # [indicator-consumption-wiring] §2.7 (codex r4 M1): indicator の
         # 承認詳細に依存 strategy を 2 欄で列挙する。**payload には入れない**
         # (表示時に `InventoryBuildResult` を逆引きする — payload は承認時点の
@@ -570,9 +601,11 @@ class Commands:
             here, elsewhere = self._dependent_strategies(
                 indicator_name=payload.get("name"),
                 candidate_hash=payload.get("content_hash"))
-            lines.append(f"dependent_pinned_here={', '.join(here) or '-'}")
+            lines.append("dependent_pinned_here="
+                         + (", ".join(display_text(n) for n in here) or "-"))
             lines.append(
-                f"dependent_pinned_elsewhere={', '.join(elsewhere) or '-'}")
+                "dependent_pinned_elsewhere="
+                + (", ".join(display_text(n) for n in elsewhere) or "-"))
         lines.append(self._archive_line(payload))
         return "\n".join(lines)
 
@@ -663,7 +696,7 @@ class Commands:
         archive_path = row.get("archive_path")
         if archive_path is None:
             return "archive=不明 (パス欠落、GC 済みの可能性)"
-        return f"archive={archive_path}"
+        return f"archive={display_text(archive_path, 300)}"
 
     def _log(self, n: int) -> str:
         if n <= 0:

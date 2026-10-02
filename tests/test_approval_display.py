@@ -1,0 +1,423 @@
+"""`approval <id>` の表示: 親が受理・記録した内容と agent の自己申告の分離、
+保存形式が壊れていても落ちないこと、表示する全文字列の無害化。"""
+from __future__ import annotations
+
+import json
+import unicodedata
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from agentic_fx.activity import ActivityLog
+from agentic_fx.commands import Commands
+from agentic_fx.core.contracts import FixedClock
+from agentic_fx.core.health_latch import HealthLatch
+from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.config import load_settings
+from agentic_fx.loops import approval_facts
+from agentic_fx.store import approvals, candidate_archives
+from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.state import StateStore
+
+NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
+SETTINGS = load_settings(
+    Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
+LEGACY = json.loads(
+    (Path(__file__).parent / "fixtures" / "approval_payloads_legacy.json"
+     ).read_text(encoding="utf-8"))
+
+INVALID = approval_facts.INVALID_FORMAT_TEXT
+PARENT_HEADING = approval_facts.PARENT_HEADING
+CLAIMS_HEADING = approval_facts.CLAIMS_HEADING
+
+
+def _commands(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    cmds = Commands(
+        conn=conn, state_store=StateStore(tmp_path / "s.json"),
+        broker=PaperBroker(conn, SETTINGS, FixedClock(NOW)),
+        trade_loop=MagicMock(),
+        activity=ActivityLog(tmp_path / "logs" / "activity.log"),
+        log_dir=tmp_path / "logs", clock=FixedClock(NOW),
+        health_latch=HealthLatch())
+    return conn, cmds
+
+
+def _new_payload(**overrides):
+    payload = {
+        "name": "sma_cross", "kind": "strategy", "content_hash": "c" * 64,
+        "eval_timeframe": "1h", "mission_id": 5,
+        "in_sample": {"USDJPY": {"pf": 1.2, "trades": 100, "avg_r": 0.1,
+                                 "max_drawdown": 0.05}},
+        "holdout": {"pf": 0.9, "trades": 40, "avg_r": -0.1,
+                    "max_drawdown": 0.06},
+        "selection_rationale": "RATIONALE", "summary": "SUMMARY",
+        "facts_version": 1,
+        "parent_facts": {
+            "backlog": {"id": 101, "attempts": 1, "status": "selected"},
+            "prior_runs": [
+                {"run_id": 8, "result": None, "approval_id": None},
+                {"run_id": 7, "result": "report", "approval_id": None},
+                {"run_id": 6, "result": "approval", "approval_id": 33}],
+            "trials": [{"n": 1, "content_hash8": "1a2b3c4d",
+                        "same_hash_as_submitted": True, "trades": 100,
+                        "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.05}],
+            "trials_omitted": 0, "analysis_call_count": 0},
+        "agent_claims": {"selection_rationale": "RATIONALE",
+                         "summary": "SUMMARY",
+                         "selected_backlog_idea": "IDEA"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _show(tmp_path, payload, *, raw=None, **row):
+    conn, cmds = _commands(tmp_path)
+    approval_id = approvals.create(conn, kind="plugin", payload={}, now=NOW)
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                 (raw if raw is not None else json.dumps(payload),
+                  approval_id))
+    for column, value in row.items():
+        conn.execute(f"UPDATE approval_requests SET {column}=? WHERE id=?",
+                     (value, approval_id))
+    conn.commit()
+    return cmds.dispatch(f"approval {approval_id}")
+
+
+def _assert_clean(out):
+    for ch in out:
+        if ch == "\n":
+            continue
+        assert unicodedata.category(ch) not in ("Cc", "Cf"), repr(ch)
+
+
+# ---- 新形式 ----
+
+def test_new_format_shows_parent_section_before_claims_with_fixed_note(
+        tmp_path):
+    out = _show(tmp_path, _new_payload())
+    lines = out.split("\n")
+    parent = lines.index(PARENT_HEADING)
+    claims = lines.index(CLAIMS_HEADING)
+    assert parent < claims
+    assert lines[parent + 1:claims] == [
+        "backlog #101 (今回を含め attempts=1) status=selected",
+        "過去の完了 run:",
+        "  run #8: 観測のみ (承認依頼なし)",
+        "  run #7: 報告として完了 (承認依頼なし)",
+        "  run #6: 承認依頼 #33",
+        "mission 内の backtest 1 件 (in_sample の受理分) / 分析 0 件:",
+        "  1. hash=1a2b3c4d (提出と同一) trades=100 pf=1.2 avg_r=0.1 mdd=0.05",
+        approval_facts.PARENT_NOTE]
+    assert lines[claims + 1:claims + 4] == [
+        "  自己申告: selection_rationale: RATIONALE",
+        "  自己申告: summary: SUMMARY",
+        "  引用: 選んだ課題の文面 (agent 起票): IDEA"]
+    # 親欄は metrics の後、自己申告欄は reason 行の前
+    assert lines.index("holdout: pf=0.9 trades=40 avg_r=-0.1 "
+                       "max_drawdown=0.06") < parent
+    assert claims < next(i for i, ln in enumerate(lines)
+                         if ln.startswith("reason="))
+
+
+def test_no_prior_runs_and_no_backlog_are_stated(tmp_path):
+    payload = _new_payload()
+    payload["parent_facts"]["backlog"] = None
+    payload["parent_facts"]["prior_runs"] = []
+    out = _show(tmp_path, payload)
+    assert "backlog: なし" in out
+    assert "過去の完了 run: なし" in out
+
+
+def test_omitted_trials_are_counted_in_the_total(tmp_path):
+    payload = _new_payload()
+    payload["parent_facts"]["trials_omitted"] = 3
+    out = _show(tmp_path, payload)
+    assert "mission 内の backtest 4 件" in out
+    assert "(ほか 3 件は省略)" in out
+
+
+def test_trial_not_same_as_submitted_and_none_metrics(tmp_path):
+    payload = _new_payload()
+    payload["parent_facts"]["trials"] = [{
+        "n": 1, "content_hash8": "aaaaaaaa", "same_hash_as_submitted": False,
+        "trades": 0, "pf": None, "avg_r": None, "max_drawdown": 0.0}]
+    out = _show(tmp_path, payload)
+    assert "  1. hash=aaaaaaaa (提出と別) trades=0 pf=- avg_r=- mdd=0.0" in out
+
+
+def test_claims_without_quote_have_no_quote_line(tmp_path):
+    payload = _new_payload()
+    del payload["agent_claims"]["selected_backlog_idea"]
+    assert "引用:" not in _show(tmp_path, payload)
+
+
+def test_claims_come_from_agent_claims_not_the_top_level_keys(tmp_path):
+    payload = _new_payload(selection_rationale="TOP")
+    out = _show(tmp_path, payload)
+    assert "自己申告: selection_rationale: RATIONALE" in out
+    assert "TOP" not in out
+
+
+# ---- 旧形式 (実 DB の現物の形) ----
+
+@pytest.mark.parametrize("key", sorted(LEGACY))
+def test_legacy_payloads_from_the_real_db_show_legacy_line(tmp_path, key):
+    payload = LEGACY[key]
+    assert "facts_version" not in payload
+    out = _show(tmp_path, payload)
+    assert approval_facts.LEGACY_LINE in out
+    assert PARENT_HEADING + " " + INVALID not in out
+    assert not any(ln.startswith("backlog #") for ln in out.split("\n"))
+    assert f"name={payload['name']} " in out
+
+
+def test_legacy_agent_payload_keeps_old_key_claims_under_unverified_heading(
+        tmp_path):
+    payload = LEGACY["agent_strategy_approved_21"]
+    out = _show(tmp_path, payload)
+    lines = out.split("\n")
+    heading = lines.index(CLAIMS_HEADING)
+    assert lines[heading + 1] == (
+        "  自己申告: selection_rationale: " + payload["selection_rationale"])
+    assert lines[heading + 2] == "  自己申告: summary: " + payload["summary"]
+    assert "in_sample USDJPY: pf=1.4440572139303938 trades=201" in out
+    assert "holdout: pf=0.7624153836938286 trades=48" in out
+
+
+def test_legacy_human_payload_has_no_claims_section(tmp_path):
+    out = _show(tmp_path, LEGACY["human_indicator_approved_20"])
+    assert approval_facts.LEGACY_LINE in out
+    assert CLAIMS_HEADING not in out
+
+
+@pytest.mark.parametrize("version", [None, 0, "1", 1.0, True, 2, [1]])
+def test_other_facts_versions_are_legacy_and_facts_are_not_backfilled(
+        tmp_path, version):
+    payload = _new_payload()
+    if version is None:
+        del payload["facts_version"]
+    else:
+        payload["facts_version"] = version
+    out = _show(tmp_path, payload)
+    assert approval_facts.LEGACY_LINE in out
+    assert "backlog #" not in out and "run #8" not in out
+    assert "自己申告: selection_rationale: RATIONALE" in out
+
+
+# ---- 壊れた形式 ----
+
+@pytest.mark.parametrize("raw", [
+    "[]", '"text"', "null", "5", "true", "not json at all", "{",
+    "[" * 100000])
+def test_non_dict_payload_root_never_raises_and_shows_invalid_line(
+        tmp_path, raw):
+    out = _show(tmp_path, None, raw=raw, reason="human reason")
+    lines = out.split("\n")
+    assert lines[0].startswith("approval #")
+    assert approval_facts.PAYLOAD_INVALID_LINE in lines
+    assert "reason=human reason decided_by=- decided_at=-" in out
+
+
+def _break(fn):
+    payload = _new_payload()
+    fn(payload["parent_facts"])
+    return payload
+
+
+PARENT_BREAKERS = {
+    "root list": lambda f: None,
+    "missing key": lambda f: f.pop("trials"),
+    "extra key": lambda f: f.update(extra=1),
+    "trials not list": lambda f: f.update(trials="x"),
+    "trial extra key": lambda f: f["trials"][0].update(note="x"),
+    "trial nan": lambda f: f["trials"][0].update(pf=float("nan")),
+    "trial bool number": lambda f: f["trials"][0].update(trades=True),
+    "run bad result": lambda f: f["prior_runs"][0].update(result="x"),
+    "run approval without id": lambda f: f["prior_runs"][2].update(
+        approval_id=None),
+    "run report with id": lambda f: f["prior_runs"][1].update(approval_id=3),
+    "backlog bad status": lambda f: f["backlog"].update(status="zzz"),
+    "backlog not dict": lambda f: f.update(backlog="x"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PARENT_BREAKERS))
+def test_broken_parent_facts_only_replace_the_parent_section(tmp_path, name):
+    conn_dir = tmp_path
+    payload = _break(PARENT_BREAKERS[name])
+    if name == "root list":
+        payload["parent_facts"] = []
+    out = _show(conn_dir, payload, reason="REASON")
+    lines = out.split("\n")
+    assert f"{PARENT_HEADING} {INVALID}" in lines
+    assert "backlog #" not in out and "run #8" not in out
+    assert approval_facts.PARENT_NOTE not in out
+    assert "  自己申告: selection_rationale: RATIONALE" in out
+    assert "reason=REASON" in out
+    assert any(ln.startswith("archive=") for ln in lines)
+    assert any(ln.startswith("in_sample USDJPY:") for ln in lines)
+
+
+@pytest.mark.parametrize("field,value,expected", [
+    ("in_sample", [], f"in_sample: {INVALID}"),
+    ("in_sample", "x", f"in_sample: {INVALID}"),
+    ("in_sample", 5, f"in_sample: {INVALID}"),
+    ("in_sample", {"USDJPY": []}, f"in_sample USDJPY: {INVALID}"),
+    ("in_sample", {"USDJPY": {"pf": "1.2"}}, f"in_sample USDJPY: {INVALID}"),
+    ("in_sample", {"USDJPY": {"trades": True}}, None),
+    ("in_sample", {"USDJPY": {"pf": float("inf")}}, f"in_sample USDJPY: {INVALID}"),
+    ("in_sample", {"USDJPY": {"avg_r": [1]}}, f"in_sample USDJPY: {INVALID}"),
+    ("holdout", [], f"holdout: {INVALID}"),
+    ("holdout", {"trades": "many"}, f"holdout: {INVALID}"),
+    ("holdout", {"trades": 3, "pf": {"a": 1}}, f"holdout: {INVALID}"),
+])
+def test_broken_metrics_replace_only_their_own_line(
+        tmp_path, field, value, expected):
+    payload = _new_payload()
+    payload[field] = value
+    out = _show(tmp_path, payload)
+    lines = out.split("\n")
+    if expected is None:
+        expected = f"in_sample USDJPY: {INVALID}"
+    assert expected in lines
+    other = "holdout" if field == "in_sample" else "in_sample"
+    assert any(ln.startswith(other) and INVALID not in ln for ln in lines)
+    assert PARENT_HEADING in lines and CLAIMS_HEADING in lines
+    assert any(ln.startswith("archive=") for ln in lines)
+
+
+def test_one_bad_pair_does_not_hide_the_other_pair(tmp_path):
+    payload = _new_payload()
+    payload["in_sample"] = {"USDJPY": {"pf": 1.1, "trades": 5},
+                            "EURUSD": "oops"}
+    lines = _show(tmp_path, payload).split("\n")
+    assert "in_sample USDJPY: pf=1.1 trades=5 avg_r=- max_drawdown=-" in lines
+    assert f"in_sample EURUSD: {INVALID}" in lines
+
+
+# ---- 無害化 ----
+
+HOSTILE = ("A\x1b[31m\x00\x07B‮C‪‫‬‭⁦⁧"
+           "⁨⁩​‏﻿D\r\nE\tF")
+
+
+def test_every_displayed_string_is_sanitized_to_one_line(tmp_path):
+    forged = "x\n" + PARENT_HEADING + "\n" + CLAIMS_HEADING + "\nbacklog #9"
+    payload = _new_payload(
+        name=HOSTILE, content_hash=HOSTILE, eval_timeframe=HOSTILE,
+        floor_warning=HOSTILE, floor_detail=HOSTILE,
+        profitability_floor={HOSTILE: HOSTILE})
+    payload["in_sample"] = {HOSTILE: {"pf": 1.0}}
+    payload["agent_claims"] = {"selection_rationale": forged + HOSTILE,
+                               "summary": forged, "selected_backlog_idea":
+                               forged}
+    out = _show(tmp_path, payload, reason=HOSTILE, decided_by=HOSTILE,
+                decided_at=HOSTILE, status=HOSTILE, kind=HOSTILE)
+    _assert_clean(out)
+    lines = out.split("\n")
+    assert lines.count(PARENT_HEADING) == 1
+    assert lines.count(CLAIMS_HEADING) == 1
+    assert not any(ln.startswith("backlog #9") for ln in lines)
+    assert any(ln.startswith("  自己申告: selection_rationale: x ")
+               for ln in lines)
+    assert "name=A[31mBCD E F content_hash=A[31mBCD E F" in out
+
+
+def test_sanitized_name_reads_as_text_without_control_characters(tmp_path):
+    out = _show(tmp_path, _new_payload(name=HOSTILE))
+    assert "name=A[31mBCD E F content_hash=" in out
+
+
+def test_dependent_plugin_names_and_archive_path_are_sanitized(tmp_path):
+    conn, cmds = _commands(tmp_path)
+    payload = _new_payload(kind="indicator", name="ind", mission_id=7,
+                           content_hash="h")
+    approval_id = approvals.create(conn, kind="plugin", payload=payload,
+                                   now=NOW)
+    candidate_archives.insert(
+        conn, mission_id=7, name="ind", content_hash="h",
+        artifact_hash="a", archive_path="plugins/_archive/" + HOSTILE,
+        pair="USDJPY", metrics={}, now=NOW)
+    cmds._dependent_strategies = lambda **kw: ([HOSTILE], [HOSTILE + "2"])
+    out = cmds.dispatch(f"approval {approval_id}")
+    _assert_clean(out)
+    assert "dependent_pinned_here=A[31mBCD E F" in out
+    assert "archive=plugins/_archive/A[31mBCD E F" in out
+
+
+def test_long_free_text_is_cut_with_fixed_suffix_on_one_line(tmp_path):
+    payload = _new_payload()
+    payload["agent_claims"]["summary"] = "あ" * 5000
+    out = _show(tmp_path, payload, reason="い" * 5000)
+    suffix = approval_facts.TRUNCATION_SUFFIX
+    assert ("  自己申告: summary: " + "あ" * 600 + suffix) in out.split("\n")
+    assert ("い" * 600 + suffix + " decided_by") in out
+
+
+def test_long_single_value_fields_are_cut(tmp_path):
+    out = _show(tmp_path, _new_payload(name="n" * 1000))
+    first = out.split("\n")[1]
+    assert first.startswith("name=" + "n" * 200 + approval_facts.TRUNCATION_SUFFIX)
+
+
+def test_fullwidth_lookalikes_are_kept(tmp_path):
+    payload = _new_payload()
+    payload["agent_claims"]["summary"] = "＝＝＝ 親が受理・記録した内容 ＝＝＝"
+    out = _show(tmp_path, payload)
+    assert "  自己申告: summary: ＝＝＝ 親が受理・記録した内容 ＝＝＝" in out
+
+
+def test_non_string_values_are_not_rendered_with_str(tmp_path):
+    payload = _new_payload(name={"a": 1}, content_hash=["x"],
+                           eval_timeframe=5)
+    out = _show(tmp_path, payload)
+    assert "name=- content_hash=- eval_timeframe=-" in out
+
+
+def test_non_string_claim_value_shows_invalid_text(tmp_path):
+    payload = _new_payload()
+    payload["agent_claims"]["summary"] = {"x": 1}
+    assert f"  自己申告: summary: {INVALID}" in _show(tmp_path, payload)
+
+
+# ---- 決定経路の独立 ----
+
+@pytest.mark.parametrize("decision,expected", [
+    ("approve", "approved"), ("reject because", "rejected")])
+def test_decisions_do_not_use_the_display_path(
+        tmp_path, monkeypatch, decision, expected):
+    conn, cmds = _commands(tmp_path)
+    approval_id = approvals.create(
+        conn, kind="live_trade", payload=_new_payload(), now=NOW)
+
+    def boom(*a, **k):
+        raise AssertionError("display path must not be called")
+    monkeypatch.setattr(Commands, "_approval_detail", boom)
+    monkeypatch.setattr(approval_facts, "render_facts_lines", boom)
+    monkeypatch.setattr(approval_facts, "validate_parent_facts", boom)
+    monkeypatch.setattr(approval_facts, "display_text", boom)
+
+    out = cmds.dispatch(f"{decision.split()[0]} {approval_id} "
+                        + " ".join(decision.split()[1:]))
+
+    assert "エラー" not in out
+    status = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                          (approval_id,)).fetchone()["status"]
+    assert status == expected
+
+
+def test_decision_succeeds_on_corrupt_payload(tmp_path):
+    conn, cmds = _commands(tmp_path)
+    approval_id = approvals.create(conn, kind="live_trade", payload={},
+                                   now=NOW)
+    conn.execute("UPDATE approval_requests SET payload_json='[[' WHERE id=?",
+                 (approval_id,))
+    conn.commit()
+    cmds.dispatch(f"approve {approval_id}")
+    assert conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (approval_id,)).fetchone()["status"] == "approved"
