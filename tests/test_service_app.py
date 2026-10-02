@@ -5207,3 +5207,46 @@ def test_db_healthcheck_fails_closed_when_outage_degraded(tmp_path):
             app.trade_loop.provider.healthcheck("USDJPY")
     finally:
         app.close()
+
+
+def test_scheduler_tick_once_calls_observe_outside_any_transaction_after_a_real_ingest_commit(
+        tmp_path):
+    """本番の 1 tick (ingest.commit → observe) で、observe の入口では接続が
+    transaction の外にある。bar を書く commit が確定済みであり、observe は
+    拒否されずに完了する。"""
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.datafeed.outage import IngestTickReport
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    key = next(iter(sorted(app.outage.hard_keys)))
+    bar = Bar(key[0], key[1], NOW - timedelta(minutes=2), 1, 1, 1, 1, 1)
+    report = IngestTickReport(
+        attempted=frozenset({key}), succeeded=frozenset({key}),
+        failed=frozenset(), deferred=frozenset(), empty=frozenset())
+
+    def prepare(now, *args, **kwargs):
+        app.ingest._pending[key] = [bar]
+        return 1, report
+
+    app.ingest.prepare = prepare
+    app.activity.write = MagicMock()
+    seen: dict = {}
+    original_observe = app.outage.observe
+
+    def observe(now, rep):
+        seen["in_transaction"] = app.conn_core.in_transaction
+        seen["bars"] = app.conn_core.execute(
+            "SELECT count(*) FROM ohlcv_cache").fetchone()[0]
+        return original_observe(now, rep)
+
+    app.outage.observe = observe
+    app.scheduler.tick = lambda now: []
+
+    _scheduler_tick_once(app)
+
+    assert seen["in_transaction"] is False
+    assert seen["bars"] >= 1
+    assert app.outage._observe_failed is False
+    assert not [c for c in app.activity.write.call_args_list
+                if "outage_observe_failed" in c.args]

@@ -227,23 +227,33 @@ class OutageStateMachine:
 
     def _commit_observation(self, now: datetime, report: IngestTickReport):
         """休場なら現在の state (str)、そうでなければ commit 済みの遷移結果。"""
-        self._ensure_row(now)
-        if self._reset_ready_streak:
-            with self.conn:
+        # observe は自分の transaction を所有する。呼び出し元の未確定の書き込みが
+        # ある状態で入ると、それを黙って commit してしまうので入口で拒否する。
+        if self.conn.in_transaction:
+            raise RuntimeError(
+                "observe は自分の transaction を所有する: 呼び出し元の未確定の"
+                "書き込みがある状態では呼べない")
+        # row の作成・streak のリセット・flat 判定に使う exposure と現在の state の
+        # 読み取り・遷移の書き込みを 1 つの write transaction に入れる。読んだ後に
+        # 別接続が建玉を作る隙間をなくし、途中で落ちたら全部元に戻す。
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._insert_row_if_missing(self.conn, now)
+            if self._reset_ready_streak:
                 self.conn.execute(
                     "UPDATE datafeed_outage_state SET ready_streak=0 WHERE id=1")
-            self._reset_ready_streak = False
-        if not market_hours.is_market_open(now):
-            # 休場中は ingest 自体も due を立てない — 観測しない。
-            return self._load_row()["state"]
-        # flat 判定に使う exposure・現在の state・遷移の書き込みを 1 つの
-        # write transaction に入れる。読んだ後に別接続が建玉を作る隙間を
-        # なくし、state の確定が必ずその建玉を見た上で行われるようにする。
-        with self.conn:
+            if not market_hours.is_market_open(now):
+                # 休場中は ingest 自体も due を立てない — 観測しない。
+                result = self._load_row()["state"]
+            else:
+                result = self._observe_open(now, report, self._load_row())
+            self.conn.commit()
+        except BaseException:
             if self.conn.in_transaction:
-                self.conn.commit()
-            self.conn.execute("BEGIN IMMEDIATE")
-            return self._observe_open(now, report, self._load_row())
+                self.conn.rollback()
+            raise
+        self._reset_ready_streak = False
+        return result
 
     def _observe_open(self, now: datetime, report: IngestTickReport,
                       row: dict) -> "_Outcome":
@@ -420,17 +430,21 @@ class OutageStateMachine:
     def _ensure_row(self, now: datetime, conn=None) -> None:
         c = conn if conn is not None else self.conn
         with c:
-            row = c.execute(
-                "SELECT 1 FROM datafeed_outage_state WHERE id=1").fetchone()
-            if row is None:
-                c.execute(
-                    "INSERT INTO datafeed_outage_state "
-                    "(id, state, epoch, confirmed, entered_degraded_at, "
-                    "restricted_since, restricted_deadline_at, "
-                    "ready_streak, pending_human_confirmation, "
-                    "resume_requested_at, resume_acknowledge, updated_at) "
-                    "VALUES (1, 'ready', 0, 0, NULL, NULL, NULL, 0, 0, NULL, 0, ?)",
-                    (_iso(now),))
+            self._insert_row_if_missing(c, now)
+
+    def _insert_row_if_missing(self, c, now: datetime) -> None:
+        """commit はしない。呼び出し側の transaction の中で使う。"""
+        row = c.execute(
+            "SELECT 1 FROM datafeed_outage_state WHERE id=1").fetchone()
+        if row is None:
+            c.execute(
+                "INSERT INTO datafeed_outage_state "
+                "(id, state, epoch, confirmed, entered_degraded_at, "
+                "restricted_since, restricted_deadline_at, "
+                "ready_streak, pending_human_confirmation, "
+                "resume_requested_at, resume_acknowledge, updated_at) "
+                "VALUES (1, 'ready', 0, 0, NULL, NULL, NULL, 0, 0, NULL, 0, ?)",
+                (_iso(now),))
 
     def _load_row(self, conn=None) -> dict:
         c = conn if conn is not None else self.conn

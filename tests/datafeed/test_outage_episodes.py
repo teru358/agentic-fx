@@ -107,6 +107,7 @@ def test_failure_inside_the_state_write_rolls_back_state_and_gap_rows_together(
     conn, machine = _rig(tmp_path, keys=(KEY, OTHER_KEY), activity=log)
     _bar(conn, WED - timedelta(minutes=10))
     _bar(conn, WED - timedelta(minutes=10), OTHER)
+    machine._ensure_row(WED)  # row の作成は observe の transaction の中なので、先に確定させておく
     original = machine._save_state
 
     def save_then_crash(**kwargs):
@@ -136,6 +137,7 @@ def test_failure_while_writing_gap_rows_leaves_the_state_row_untouched(
     conn, machine = _rig(tmp_path, keys=(KEY, OTHER_KEY))
     _bar(conn, WED - timedelta(minutes=10))
     _bar(conn, WED - timedelta(minutes=10), OTHER)
+    machine._ensure_row(WED)  # row の作成は observe の transaction の中なので、先に確定させておく
     def half_written(epoch, now, watermarks):
         # 1 key 分の gap を書いた後で落とす
         machine.conn.execute(
