@@ -10,6 +10,7 @@ alert_state (key-value) に残し、再起動をまたいで間隔を守る。
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -60,7 +61,13 @@ def record_retry_after(conn: sqlite3.Connection, key: str, now: datetime,
 
 def load(conn: sqlite3.Connection,
          key: str) -> tuple[datetime, timedelta] | None:
-    """(試行時刻, Retry-After)。行が無ければ None、壊れていれば ValueError。"""
+    """(試行時刻, Retry-After)。行が無ければ None、壊れていれば ValueError。
+
+    永続層そのものが壊れて読めない間は、呼び出し側 (scheduler / news) が
+    fail-open で取得を続ける。再起動のたびに取得することになるが、この機能が
+    無かった頃と同じ頻度でそれ以上には増えない。取得を止める側に倒すと、DB の
+    一時的な不調で経済指標が更新されなくなり、取引判断が古い指標で動く。
+    """
     row = conn.execute(
         "SELECT value FROM alert_state WHERE key=?", (key,)).fetchone()
     if row is None:
@@ -68,9 +75,15 @@ def load(conn: sqlite3.Connection,
     try:
         data = json.loads(row["value"])
         attempted = datetime.fromisoformat(data["attempted_at"])
-        retry = timedelta(seconds=float(data["retry_after_sec"]))
-        return _utc(attempted), max(retry, timedelta(0))
-    except (ValueError, KeyError, TypeError) as e:
+        raw = data["retry_after_sec"]
+        # inf / nan / 負値 / 型違い / 記録側の上限超えは、書いた覚えのない値
+        # (破損)。保守的な待機に倒すため、ここで弾いて呼び出し側に任せる。
+        if (isinstance(raw, bool) or not isinstance(raw, (int, float))
+                or not math.isfinite(raw) or raw < 0
+                or raw > MAX_RETRY_AFTER.total_seconds()):
+            raise ValueError("retry_after_sec が範囲外")
+        return _utc(attempted), timedelta(seconds=raw)
+    except (ValueError, KeyError, TypeError, OverflowError) as e:
         raise ValueError(f"fetch_attempts: {key} の値が壊れている") from e
 
 
@@ -104,6 +117,9 @@ def blocked_until(conn: sqlite3.Connection, key: str,
     を見る。値が未来・壊れている場合は待たせない (その場合の連打防止は
     scheduler の間隔側が担う)。
     """
+    # 壊れた値は Retry-After 無しとして扱う。news は source ごとの値で、
+    # 全体の間隔 (scheduler) が先に取得頻度を縛り、この source の記録は
+    # 直後の試行で正常な値に書き直される。
     try:
         loaded = load(conn, key)
     except ValueError:
@@ -111,5 +127,8 @@ def blocked_until(conn: sqlite3.Connection, key: str,
     if loaded is None:
         return None
     attempted, retry = loaded
-    until = attempted + retry
+    try:
+        until = attempted + retry
+    except OverflowError:
+        return None
     return until if retry > timedelta(0) and until > _utc(now) else None

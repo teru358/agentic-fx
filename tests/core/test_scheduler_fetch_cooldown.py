@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import pytest
 
 from agentic_fx.core.scheduler import Scheduler
 from agentic_fx.store import fetch_attempts
@@ -176,3 +177,24 @@ def test_attempt_is_stored_as_tz_aware_utc(tmp_path):
         (fetch_attempts.ECON_KEY,)).fetchone()
     stored = datetime.fromisoformat(json.loads(row["value"])["attempted_at"])
     assert stored == T_1038 and stored.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize("raw", [
+    "Infinity", "-Infinity", "NaN", "1e308", "-5", '"abc"', "true", "null",
+    "86401"])
+def test_corrupt_retry_after_waits_one_interval(tmp_path, raw):
+    env = Env(tmp_path, base=T_1038)
+    # 試行時刻だけ見れば 6 時間以上前で、直ちに取得してよい記録
+    stored = ('{"attempted_at": "%s", "retry_after_sec": %s}'
+              % ((T_1038 - timedelta(hours=7)).isoformat(), raw))
+    with env.conn:
+        env.conn.execute(
+            "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?)",
+            (fetch_attempts.ECON_KEY, stored, T_1038.isoformat()))
+    sched2 = _restart(env)
+    sched2.tick(T_1038)
+    assert env.econ_calls == 0
+    sched2.tick(T_1038 + timedelta(hours=6) - timedelta(seconds=1))
+    assert env.econ_calls == 0
+    sched2.tick(T_1038 + timedelta(hours=6))
+    assert env.econ_calls == 1

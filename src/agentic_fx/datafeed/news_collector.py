@@ -80,6 +80,7 @@ class NewsCollector:
         self.activity = activity
         self.clock = clock
         self.timeout_sec = timeout_sec
+        self._skip_reported: dict[str, datetime] = {}
 
     def collect(self) -> int:
         """1 サイクル分の収集を実行する。取得記事総数を返す。
@@ -93,12 +94,16 @@ class NewsCollector:
             key = fetch_attempts.news_source_key(src["name"])
             until = self._blocked_until(key, now)
             if until is not None:
-                # 先方が Retry-After で待てと言った間は叩かない
-                self.activity.write(
-                    Category.NEWS, "news_source_skipped",
-                    f"{src['name']}: 先方の指示により "
-                    f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
+                # 先方が Retry-After で待てと言った間は叩かない。cycle ごとに
+                # 記録すると長い待ちで activity が埋まるので、期限ごとに 1 回
+                if self._skip_reported.get(src["name"]) != until:
+                    self._skip_reported[src["name"]] = until
+                    self.activity.write(
+                        Category.NEWS, "news_source_skipped",
+                        f"{src['name']}: 先方の指示により "
+                        f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
                 continue
+            self._skip_reported.pop(src["name"], None)
             self._remember_attempt(key, now)
             try:
                 if src["fetcher"] == "feed":

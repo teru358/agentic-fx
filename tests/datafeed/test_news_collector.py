@@ -337,6 +337,38 @@ def test_source_with_retry_after_is_skipped_until_it_elapses(tmp_path):
     assert calls[-2:] == ["fxstreet", "other"]
 
 
+def test_skipped_source_is_reported_once_per_deadline(tmp_path):
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="fxstreet", fetcher="feed",
+                     url="https://ex.com/rss", added_by="user", now=NOW,
+                     enabled=True)
+
+    def fake_feed(url, name, *, timeout_sec):
+        raise _too_many_requests("86400")
+
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed", fake_feed):
+        col.collect()
+        for minutes in (30, 60, 90):
+            col.clock = FixedClock(NOW + timedelta(minutes=minutes))
+            col.collect()
+        log = (tmp_path / "a.log").read_text()
+        assert log.count("news_source_skipped") == 1
+        # 期限が延びたら (先方が再び待てと言った) 改めて 1 件
+        with conn:
+            conn.execute("DELETE FROM alert_state")
+        from agentic_fx.store import fetch_attempts
+        fetch_attempts.record_attempt(
+            conn, fetch_attempts.news_source_key("fxstreet"),
+            NOW + timedelta(minutes=90))
+        fetch_attempts.record_retry_after(
+            conn, fetch_attempts.news_source_key("fxstreet"),
+            NOW + timedelta(minutes=90), timedelta(hours=10))
+        col.clock = FixedClock(NOW + timedelta(minutes=120))
+        col.collect()
+        col.collect()
+    assert (tmp_path / "a.log").read_text().count("news_source_skipped") == 2
+
+
 def test_source_failure_without_retry_after_is_not_blocked(tmp_path):
     conn, rag, col = _env(tmp_path)
     news_sources.add(conn, name="s1", fetcher="feed", url="https://ex.com/rss",

@@ -68,3 +68,19 @@ def test_future_attempt_is_rebased_to_now(conn):
 def test_naive_datetime_is_rejected(conn):
     with pytest.raises(ValueError):
         fa.record_attempt(conn, fa.ECON_KEY, NOW.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize("raw", [
+    "Infinity", "-Infinity", "NaN", "1e308", "-5", '"abc"', "86401"])
+def test_corrupt_retry_after_is_not_a_retry_after_nor_an_overflow(conn, raw):
+    stored = ('{"attempted_at": "%s", "retry_after_sec": %s}'
+              % (NOW.isoformat(), raw))
+    with conn:
+        conn.execute(
+            "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?)",
+            (fa.ECON_KEY, stored, NOW.isoformat()))
+    with pytest.raises(ValueError):
+        fa.load(conn, fa.ECON_KEY)
+    assert fa.blocked_until(conn, fa.ECON_KEY, NOW) is None
+    assert fa.due_anchor(conn, fa.ECON_KEY, now=NOW,
+                         interval=timedelta(hours=6)) is not None
