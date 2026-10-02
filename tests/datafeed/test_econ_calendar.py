@@ -371,3 +371,35 @@ def test_fetch_ff_calendar_uses_injected_timeout(monkeypatch):
     with pytest.raises(RuntimeError):
         econ_mod.fetch_ff_calendar(timeout_sec=7.5)
     assert captured["timeout"] == 7.5
+
+
+def _status_error(status: int, retry_after: str | None) -> httpx.HTTPStatusError:
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    req = httpx.Request("GET", "https://example.invalid/x")
+    return httpx.HTTPStatusError(
+        "err", request=req, response=httpx.Response(status, headers=headers,
+                                                    request=req))
+
+
+def test_429_retry_after_is_persisted_for_the_scheduler(tmp_path):
+    from agentic_fx.store import fetch_attempts
+    cal = _cal(tmp_path)
+    fetch_attempts.record_attempt(cal.conn, fetch_attempts.ECON_KEY, NOW)
+    with patch("agentic_fx.datafeed.econ_calendar.httpx.get",
+               side_effect=_status_error(429, "7200")):
+        assert cal.refresh() == 0
+    anchor = fetch_attempts.due_anchor(
+        cal.conn, fetch_attempts.ECON_KEY, now=NOW, interval=timedelta(hours=6))
+    assert anchor is not None and anchor + timedelta(hours=6) == NOW + timedelta(hours=6)
+    loaded = fetch_attempts.load(cal.conn, fetch_attempts.ECON_KEY)
+    assert loaded[1] == timedelta(hours=2)
+
+
+def test_non_http_failure_records_no_retry_after(tmp_path):
+    from agentic_fx.store import fetch_attempts
+    cal = _cal(tmp_path)
+    fetch_attempts.record_attempt(cal.conn, fetch_attempts.ECON_KEY, NOW)
+    with patch("agentic_fx.datafeed.econ_calendar.httpx.get",
+               side_effect=httpx.ConnectTimeout("t")):
+        cal.refresh()
+    assert fetch_attempts.load(cal.conn, fetch_attempts.ECON_KEY)[1] == timedelta(0)

@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from urllib.error import URLError
 
@@ -296,3 +296,53 @@ def test_collect_records_dead_feed_as_failure_and_continues(tmp_path, caplog):
     assert any("dead" in m and "failed" in m for m in from_collector)
     messages = [r.getMessage() for r in caplog.records]
     assert "dead.example" not in " ".join(messages)  # URL は出さない
+
+
+def _too_many_requests(retry_after: str):
+    import httpx
+    req = httpx.Request("GET", "https://ex.com/rss")
+    return httpx.HTTPStatusError(
+        "429", request=req,
+        response=httpx.Response(429, headers={"Retry-After": retry_after},
+                                request=req))
+
+
+def test_source_with_retry_after_is_skipped_until_it_elapses(tmp_path):
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="fxstreet", fetcher="feed",
+                     url="https://ex.com/rss", added_by="user", now=NOW,
+                     enabled=True)
+    news_sources.add(conn, name="other", fetcher="feed",
+                     url="https://ex.com/other", added_by="user", now=NOW,
+                     enabled=True)
+    calls: list[str] = []
+
+    def fake_feed(url, name, *, timeout_sec):
+        calls.append(name)
+        if name == "fxstreet":
+            raise _too_many_requests("5400")
+        return [ART]
+
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed", fake_feed):
+        col.collect()
+        assert calls == ["fxstreet", "other"]
+        col.clock = FixedClock(NOW + timedelta(minutes=30))
+        col.collect()
+    # 2 回目は fxstreet を叩かず、他のソースは叩く
+    assert calls == ["fxstreet", "other", "other"]
+    assert "news_source_skipped" in (tmp_path / "a.log").read_text()
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed", fake_feed):
+        col.clock = FixedClock(NOW + timedelta(minutes=90))
+        col.collect()
+    assert calls[-2:] == ["fxstreet", "other"]
+
+
+def test_source_failure_without_retry_after_is_not_blocked(tmp_path):
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="s1", fetcher="feed", url="https://ex.com/rss",
+                     added_by="user", now=NOW, enabled=True)
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed",
+               side_effect=OSError("down")) as f:
+        col.collect()
+        col.collect()
+    assert f.call_count == 2

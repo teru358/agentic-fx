@@ -30,10 +30,11 @@ from datetime import datetime, timezone
 
 import httpx
 
+from agentic_fx._retry_after import retry_after_from
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
-from agentic_fx.store import econ_events
+from agentic_fx.store import econ_events, fetch_attempts
 
 _log = logging.getLogger("agentic_fx.econ")
 
@@ -221,9 +222,22 @@ class EconCalendar:
     def _record_failure(self, stage: str, e: BaseException) -> int:
         text = safe_error_text(e)
         _log.warning("econ calendar %s failed: %s", stage, text)
+        self._remember_retry_after(e)
         self.activity.write(Category.NEWS, "econ_refresh_failed",
                             f"{stage}: {text}")
         return 0
+
+    def _remember_retry_after(self, e: BaseException) -> None:
+        """429 等の Retry-After を残し、scheduler が次の取得時刻に反映する。"""
+        try:
+            now = self.clock.now()
+            wait = retry_after_from(e, now)
+            if wait is not None:
+                fetch_attempts.record_retry_after(
+                    self.conn, fetch_attempts.ECON_KEY, now, wait)
+        except Exception as exc:  # noqa: BLE001 — 失敗の記録で失敗を増やさない
+            _log.warning("econ retry-after record failed: %s",
+                         safe_error_text(exc))
 
     def upcoming(self, hours: int = 24) -> list[dict]:
         """now から hours 以内のイベント (両端を含む) を ts 昇順で返す。

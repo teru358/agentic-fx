@@ -18,7 +18,7 @@ from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as 
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
 from agentic_fx.core.supervisor import SubmitResult
-from agentic_fx.store import cron_cursor, ohlcv, orders
+from agentic_fx.store import cron_cursor, fetch_attempts, ohlcv, orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
@@ -114,6 +114,8 @@ class Scheduler:
         self._cron_deferred_logged: set[tuple[str, str, datetime]] = set()
         self._last_news: datetime | None = None
         self._last_econ: datetime | None = None
+        # 永続した前回の試行時刻で _last_* を初期化したか (プロセスで 1 回だけ)
+        self._fetch_anchors_loaded = False
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
         self._closed_bar_unavailable_pairs: set[str] = set()
@@ -317,12 +319,19 @@ class Scheduler:
         """
         if self._stopping():
             return
+        self._load_fetch_anchors(now)
         if self._last_news is None or now - self._last_news >= _NEWS_INTERVAL:
             self._last_news = now
+            self._record_fetch_attempt(fetch_attempts.NEWS_KEY, now)
             self._run_data_hook("news", self.on_news_cycle)
+            self._last_news = self._reload_anchor(
+                fetch_attempts.NEWS_KEY, now, _NEWS_INTERVAL)
         if self._last_econ is None or now - self._last_econ >= _ECON_INTERVAL:
             self._last_econ = now
+            self._record_fetch_attempt(fetch_attempts.ECON_KEY, now)
             self._run_data_hook("econ", self.on_econ_cycle)
+            self._last_econ = self._reload_anchor(
+                fetch_attempts.ECON_KEY, now, _ECON_INTERVAL)
         # signal maintenance (producer 評価 = signal 生成) だけを outage
         # gate する。news/econ/cache maintenance は継続 (価格源不通と無関係)。
         if self.on_signal_maintenance is not None and self.state_fn() == "ready":
@@ -579,6 +588,60 @@ class Scheduler:
             Category.SYSTEM, "cron_cursor_future_watermark_resolved",
             f"{key[0]} {key[1]} L={_fmt_bar(cursor)} W={_fmt_bar(watermark)} "
             "(cron 判定を再開)")
+
+    def _load_fetch_anchors(self, now: datetime) -> None:
+        """再起動をまたいで取得の間隔を守る。
+
+        メモリの _last_* だけだと起動のたびに取得が走り、再起動の連打が先方への
+        連打 (429) になる。永続した前回の試行時刻 (成功・失敗とも) から間隔が
+        経つまでは取得しない。記録が無い (初回起動) なら従来どおり直ちに取得する。
+        永続層の故障は取得を止める理由にしない (fail-open、記録は技術ログのみ)。
+        """
+        if self._fetch_anchors_loaded:
+            return
+        self._fetch_anchors_loaded = True
+        for kind, key, interval in (
+                ("news", fetch_attempts.NEWS_KEY, _NEWS_INTERVAL),
+                ("econ", fetch_attempts.ECON_KEY, _ECON_INTERVAL)):
+            try:
+                anchor = fetch_attempts.due_anchor(
+                    self.conn, key, now=now, interval=interval)
+            except Exception as e:  # noqa: BLE001 — 取得の間隔管理で tick を止めない
+                _log.warning("%s fetch anchor load failed: %s", kind,
+                             safe_error_text(e))
+                continue
+            if anchor is None:
+                continue
+            if kind == "news":
+                self._last_news = anchor
+            else:
+                self._last_econ = anchor
+            due = anchor + interval
+            if due > now:
+                self.activity.write(
+                    Category.NEWS, f"{kind}_fetch_skipped",
+                    f"前回の取得から間もないので次回は "
+                    f"{due.astimezone(timezone.utc):%H:%M} UTC")
+
+    def _record_fetch_attempt(self, key: str, now: datetime) -> None:
+        # 取得の前に残す: 取得中にプロセスが落ちても「試みた」ことは残る
+        try:
+            fetch_attempts.record_attempt(self.conn, key, now)
+        except Exception as e:  # noqa: BLE001 — 記録できなくても取得は続ける
+            _log.warning("fetch attempt record failed (%s): %s", key,
+                         safe_error_text(e))
+
+    def _reload_anchor(self, key: str, now: datetime,
+                       interval: timedelta) -> datetime:
+        """取得フックが残した Retry-After を、次の取得時刻に反映する。"""
+        try:
+            anchor = fetch_attempts.due_anchor(
+                self.conn, key, now=now, interval=interval)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("fetch anchor reload failed (%s): %s", key,
+                         safe_error_text(e))
+            return now
+        return now if anchor is None else max(anchor, now)
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
         """ニュース / econ の収集フックを fail-open で呼ぶ。

@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 
+from agentic_fx._retry_after import retry_after_from
 from agentic_fx._safe_error import safe_error_text as _safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.datafeed.default_sources import DEFAULT_SOURCES
 from agentic_fx.datafeed.fetchers import fetch_feed, fetch_web
-from agentic_fx.store import news_sources
+from agentic_fx.store import fetch_attempts, news_sources
 from agentic_fx.store.rag import Rag
 
 _log = logging.getLogger("agentic_fx.news")
@@ -89,6 +90,16 @@ class NewsCollector:
         now = self.clock.now()
         total = 0
         for src in news_sources.list_enabled(self.conn):
+            key = fetch_attempts.news_source_key(src["name"])
+            until = self._blocked_until(key, now)
+            if until is not None:
+                # 先方が Retry-After で待てと言った間は叩かない
+                self.activity.write(
+                    Category.NEWS, "news_source_skipped",
+                    f"{src['name']}: 先方の指示により "
+                    f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
+                continue
+            self._remember_attempt(key, now)
             try:
                 if src["fetcher"] == "feed":
                     fetch = fetch_feed
@@ -110,11 +121,37 @@ class NewsCollector:
                       "source_name": a.source_name, "published": a.published}
                      for a in articles], now)
             except Exception as e:  # noqa: BLE001 — 1 ソース障害で止めない
+                self._remember_retry_after(key, e, now)
                 self._record_failure(src["name"], _safe_error_text(e))
         removed = self.rag.cleanup_news(now, hours=48)
         self.activity.write(Category.NEWS, "collected",
                             f"{total} articles ({removed} cleaned)")
         return total
+
+    def _blocked_until(self, key: str, now: datetime) -> datetime | None:
+        try:
+            return fetch_attempts.blocked_until(self.conn, key, now)
+        except Exception as e:  # noqa: BLE001 — 永続層の故障で取得を止めない
+            _log.warning("news fetch gate failed (%s): %s", key,
+                         _safe_error_text(e))
+            return None
+
+    def _remember_attempt(self, key: str, now: datetime) -> None:
+        try:
+            fetch_attempts.record_attempt(self.conn, key, now)
+        except Exception as e:  # noqa: BLE001
+            _log.warning("news attempt record failed (%s): %s", key,
+                         _safe_error_text(e))
+
+    def _remember_retry_after(self, key: str, e: BaseException,
+                              now: datetime) -> None:
+        try:
+            wait = retry_after_from(e, now)
+            if wait is not None:
+                fetch_attempts.record_retry_after(self.conn, key, now, wait)
+        except Exception as exc:  # noqa: BLE001 — 失敗の記録で失敗を増やさない
+            _log.warning("news retry-after record failed (%s): %s", key,
+                         _safe_error_text(exc))
 
     def _record_failure(self, source_name: str, detail: str) -> None:
         """ソース単位の失敗を技術ログ **と** activity の両方に残す。
