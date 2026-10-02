@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentic_fx.backtest import holdout
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
@@ -183,6 +183,7 @@ def evaluate_strategy_adoption_gate(
     run_in_sample_fn=None, run_holdout_gate_fn=None,
     record_fn: "Callable[[dict], None] | None" = None,
     floor_mode: Literal["enforce", "warn"] = "enforce",
+    evaluation_sink: "Callable[[str, str, Any, BaseException | None], None] | None" = None,
 ) -> "StrategyGateVerdict | None":
     """candidate/baseline/no_strategy の identity と評価可能性。
     indicator/signal はこのゲートを課さない (None を返す)。
@@ -307,6 +308,14 @@ def evaluate_strategy_adoption_gate(
     else:
         _in_sample_record_fn = record_fn
 
+    # 評価 1 回ごとに (scope, pair, intent_source, 失敗した例外 | None) を
+    # 渡す。失敗で例外が伝播する場合も、worker に触れた評価の診断は
+    # verdict に載らないため、この sink でしか呼び出し元へ届かない。
+    def _notify(scope: str, pair: str, source: Any,
+                error: BaseException | None) -> None:
+        if evaluation_sink is not None:
+            evaluation_sink(scope, pair, source, error)
+
     cpu_samples: list[tuple[str, str, float | None]] = []
     dataset = settings.backtest.dataset()
     per_pair = {}
@@ -314,6 +323,7 @@ def evaluate_strategy_adoption_gate(
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings, resolved=resolved)
+        error: BaseException | None = None
         try:
             per_pair[pair] = run_in_sample(
                 settings, history_conn=history_conn, symbol=pair,
@@ -321,11 +331,15 @@ def evaluate_strategy_adoption_gate(
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=_in_sample_record_fn)
+        except Exception as exc:
+            error = exc
+            raise
         finally:
             intent_source.close()
             # [indicator-consumption-wiring] §2.9(e): close 完了後に確定する
             # property。例外終了時も必ず 1 件積む (cpu_sec=None)。
             cpu_samples.append(("in_sample", pair, intent_source.cpu_sec))
+            _notify("in_sample", pair, intent_source, error)
     total_trades = sum(m["trades"] for m in per_pair.values())
     evaluable = total_trades >= EVALUABLE_MIN_TRADES
     if not evaluable:
@@ -355,6 +369,7 @@ def evaluate_strategy_adoption_gate(
         intent_source = strategy_adapter.build_intent_source(
             meta, conn=conn, pair=pair, dataset=dataset,
             settings=settings, resolved=resolved)
+        error = None
         try:
             # 現行は戻り値を捨てていた (§0「前提を疑う」) — フロア判定の
             # holdout 段はこの戻り値が要る。
@@ -364,9 +379,13 @@ def evaluate_strategy_adoption_gate(
                 eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                 content_hash=content_hash, kind="strategy", now=now,
                 record_fn=record_fn)
+        except Exception as exc:
+            error = exc
+            raise
         finally:
             intent_source.close()
             cpu_samples.append(("holdout", pair, intent_source.cpu_sec))
+            _notify("holdout", pair, intent_source, error)
 
     holdout_floor_reason, holdout_floor_detail = _check_profitability_floor(
         holdout_per_pair, settings=settings, scope="holdout")

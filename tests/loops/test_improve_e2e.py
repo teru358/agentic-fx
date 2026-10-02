@@ -2108,9 +2108,10 @@ def test_backtest_cpu_activity_lines_are_verbatim(tmp_path):
     assert all("holdout_gate" not in l for l in lines)   # scope は holdout 表記
 
 
-def test_backtest_cpu_is_written_with_null_when_the_session_died(
+def test_backtest_cpu_is_written_with_parent_observed_cpu_when_the_session_was_killed(
         tmp_path, monkeypatch):
-    """C1: 例外終了でも `cpu_sec=null` で 1 行積む。"""
+    """親が SIGKILL で終わらせた session でも 1 行積む。回収時の rusage は
+    親が取れるので、`cpu_sec` は null ではなく親観測の数値になる。"""
     from tests.fixtures import indicator_wiring as fx
     from agentic_fx.plugin import sandbox as plugin_sandbox
     loop, conn, root, activity = _improve_env_with_activity(tmp_path)
@@ -2134,7 +2135,13 @@ def test_backtest_cpu_is_written_with_null_when_the_session_died(
                 result=_completed_result(
                     _plugin_artifact("rsi_pullback", kind="strategy")),
                 now=fx.NOW)
-    assert "cpu_sec=null" in _activity_text(activity)
+    lines = [l for l in _activity_text(activity).splitlines()
+             if "backtest_cpu" in l and "mission=1 plugin=rsi_pullback" in l]
+    assert lines
+    for line in lines:
+        assert "cpu_sec=null" not in line
+        assert re.search(r"cpu_sec=\d+(\.\d+)? cpu_source=parent_wait4", line), line
+        assert "signal=9" in line
 
 
 def test_prompt_inventory_includes_params_outputs_and_hash(tmp_path):

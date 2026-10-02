@@ -125,7 +125,8 @@ class PluginStrategyIntentSource:
     @property
     def cpu_sec(self) -> float | None:
         """自分が生成したセッションの累積 CPU 秒 (`close()` 後に確定)。
-        注入セッション・未評価・異常終了では `None` (設計書 §2.4、C1)。"""
+        親の `wait4` で回収できた worker は、親が kill した場合も値を持つ。
+        注入セッション・未評価・回収できなかった worker では `None`。"""
         return self._cpu_sec
 
     def __call__(self, closed_bar: Bar) -> dict | None:
@@ -168,7 +169,12 @@ class PluginStrategyIntentSource:
         return self._session
 
     def _take_diagnostics(self, session: Any) -> None:
-        self._cpu_sec = getattr(session, "cpu_sec", None)
+        # 親が wait4 で回収した rusage を優先する。親が timeout で kill した
+        # worker も回収時に累積 CPU が分かるので、活動記録では null にしない。
+        # 回収できなかった (取得不能) ときだけ null のまま。
+        worker_cpu = getattr(session, "worker_cpu_sec", None)
+        self._cpu_sec = (worker_cpu if worker_cpu is not None
+                         else getattr(session, "cpu_sec", None))
         self.worker_returncode = getattr(session, "worker_returncode", None)
         self.worker_signal = getattr(session, "worker_signal", None)
 

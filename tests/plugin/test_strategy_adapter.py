@@ -761,3 +761,59 @@ def test_session_start_failure_keeps_diagnostics_and_marks_evaluation_started(
         src(_bar(H))
     assert src.evaluation_started is True
     assert src.worker_returncode == 1
+
+
+def test_close_keeps_the_cpu_of_a_worker_the_parent_killed_and_reaped(
+        tmp_path, monkeypatch):
+    """親が timeout で kill した worker も、回収時の rusage は親が持つ。旧来の
+    `cpu_sec` が kill で None になっても、取り込む値は親の観測を採る。"""
+    class _Killed:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.cpu_sec = None
+            self.worker_cpu_sec = None
+            self.worker_returncode = None
+            self.worker_signal = None
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD_RESULT)
+        def close(self):
+            self.worker_cpu_sec = 1.25
+            self.worker_returncode = -9
+            self.worker_signal = 9
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _Killed)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    src(_bar(H))
+    src.close()
+    assert src.cpu_sec == 1.25
+
+
+def test_close_reports_no_cpu_when_the_worker_was_never_reaped(
+        tmp_path, monkeypatch):
+    class _Unreaped:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.cpu_sec = None
+            self.worker_cpu_sec = None
+            self.worker_returncode = None
+            self.worker_signal = None
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD_RESULT)
+        def close(self):
+            pass
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _Unreaped)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    src(_bar(H))
+    src.close()
+    assert src.cpu_sec is None

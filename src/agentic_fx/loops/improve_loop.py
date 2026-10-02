@@ -989,7 +989,7 @@ class ImproveLoop:
 
     def _write_backtest_cpu(self, outcome: str | None, intent_source: Any, *,
                             mission: str, plugin: str, pair: str,
-                            deps: int) -> None:
+                            deps: int, scope: str = "in_sample") -> None:
         """started 後の backtest ごとに `backtest_cpu` をちょうど 1 行書く。
         評価前の失敗 (履歴なし・pair 未宣言) は worker に触れていないので
         書かない。書き込みの失敗は本来の結果を変えない。"""
@@ -1005,7 +1005,7 @@ class ImproveLoop:
         try:
             self._activity.write(
                 Category.IMPROVE, "backtest_cpu",
-                f"mission={mission} plugin={plugin} scope=in_sample "
+                f"mission={mission} plugin={plugin} scope={scope} "
                 f"pair={pair} deps={deps} "
                 f"cpu_sec={_fmt(getattr(intent_source, 'cpu_sec', None))} "
                 f"cpu_source=parent_wait4 result={outcome} "
@@ -1013,6 +1013,23 @@ class ImproveLoop:
                 f"signal={_fmt(getattr(intent_source, 'worker_signal', None))}")
         except Exception:
             _log.warning("backtest_cpu activity write failed", exc_info=True)
+
+    def _backtest_cpu_sink(self, *, mission: str, plugin: str, deps: int):
+        """commit gate の評価 1 回ごとに `backtest_cpu` を 1 行書く sink。
+        gate は失敗を例外で伝播させ、verdict を返さないため、失敗した評価の
+        診断は評価の直後にここで書く。書式は run_backtest handler と同じ。"""
+        def _sink(scope: str, pair: str, intent_source: Any,
+                  error: BaseException | None) -> None:
+            if error is None:
+                outcome = "ok"
+            elif isinstance(error, SandboxError):
+                outcome = _SANDBOX_CODE_TO_RESULT.get(error.code, "backtest_failed")
+            else:
+                outcome = "backtest_failed"
+            self._write_backtest_cpu(
+                outcome, intent_source, mission=mission, plugin=plugin,
+                pair=pair, deps=deps, scope=scope)
+        return _sink
 
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
                             staging_dir: Path,
@@ -1647,7 +1664,8 @@ class ImproveLoop:
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, resolved, kind="strategy",
-                           record_fn=None, inventory=None):
+                           record_fn=None, inventory=None,
+                           evaluation_sink=None):
         # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
         # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
         # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
@@ -1661,7 +1679,7 @@ class ImproveLoop:
             conn, name=name, pairs=pairs, timeframe=timeframe,
             content_hash=content_hash, now=now, settings=self._settings,
             meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce",
-            inventory=inventory,
+            inventory=inventory, evaluation_sink=evaluation_sink,
             resolved=resolved)
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
@@ -2642,7 +2660,11 @@ class ImproveLoop:
                             content_hash=gate_verdict.content_hash, now=now,
                             meta=candidate_meta, kind=kind,
                             record_fn=gate_rows.append,
-                            resolved=resolved, inventory=ctx.inventory)
+                            resolved=resolved, inventory=ctx.inventory,
+                            evaluation_sink=self._backtest_cpu_sink(
+                                mission=str(ctx.mission_id),
+                                plugin=artifact["name"],
+                                deps=len(candidate_meta.indicators)))
                     except holdout.NoHistoryError as exc:
                         # Missing market history is an expected gate verdict;
                         # unrelated ValueErrors still abort the commit.
@@ -2652,20 +2674,9 @@ class ImproveLoop:
                                     f"{exc}"), now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls)
                         return
-                    # [indicator-consumption-wiring] §2.9(e): commit gate は
-                    # adapter を `strategy_gate` の内部で生成・close するため、
-                    # CPU 実測は `StrategyGateVerdict.cpu_samples` 経由でしか
-                    # ここへ届かない (codex r5 I4)。scope × pair ごとに 1 行。
-                    # 評価不能な候補でも CPU は記録する (evaluable 判定の前)。
-                    deps = len(candidate_meta.indicators)
-                    for scope, pair, cpu_sec in strategy_verdict.cpu_samples:
-                        self._activity.write(
-                            Category.IMPROVE, "backtest_cpu",
-                            f"mission={ctx.mission_id} "
-                            f"plugin={artifact['name']} scope={scope} "
-                            f"pair={pair} deps={deps} "
-                            f"cpu_sec={'null' if cpu_sec is None else cpu_sec} "
-                            f"cpu_source=parent_wait4")
+                    # `backtest_cpu` は gate が評価 1 回ごとに `evaluation_sink`
+                    # へ渡し、そこで書く (失敗で例外が伝播する評価でも
+                    # 1 行残すため、verdict 経由では書かない)。
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
