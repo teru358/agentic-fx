@@ -46,8 +46,6 @@
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
-| [backtest-rpc-timeout-does-not-stop-parent-work](backtest-rpc-timeout-does-not-stop-parent-work.md) | 高 | 2026-09-21 | `backtest_rpc_timeout_sec=600` は agent への応答を打ち切るだけで、親サービス内の… |
-| [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 高 |  | signal maintenance は scheduler tick 内の同期 hook。例外は握るが、「完了はする… |
 | [selection-rationale-unverified](selection-rationale-unverified.md) | 高 |  | 承認材料の selection_rationale が未検証で捏造され得る |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
@@ -58,6 +56,7 @@
 | [retire-symlink-deployed-plugin](retire-symlink-deployed-plugin.md) | 中 | 2026-09-19 | afx plugin retire が symlink 配備の指標を退役できない |
 | [policy-add-unwired-in-service](policy-add-unwired-in-service.md) | 中 | 2026-09-20 | `service.py:1054` の `Commands(...)` に `policy_path` を渡していない… |
 | [secret-env-guard-false-positive](secret-env-guard-false-positive.md) | 中 | 2026-09-20 | 改善 backend を CLI 系 (claude / codex) にすると、起動時の検査⑤ (`service.… |
+| [backtest-rpc-timeout-does-not-stop-parent-work](backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
 | [db-healthcheck-continuous-session-freshness](db-healthcheck-continuous-session-freshness.md) | 中 | 2026-09-28 | `service.py:1243` `db_healthcheck` の鮮度式 `bar start + 2×幅 + … |
 | [live-storage-source-mapping-scattered](live-storage-source-mapping-scattered.md) | 中 | 2026-09-28 | primary → ライブ保存名 (`mt5` → `mt5-live`) の写像が 8 箇所に散在 (service… |
 | [signal-producer-catchup-requires-latest-tail](signal-producer-catchup-requires-latest-tail.md) | 中 | 2026-09-28 | producer は過去 bucket を順に評価 (`signal_producer.py:195`) しながら、毎… |
@@ -65,6 +64,7 @@
 | [trade-timeout-on-startup](trade-timeout-on-startup.md) | 中 | 2026-09-28 | 停止による打ち切りの trade mission が timeout と記録される |
 | [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 中 | 2026-09-30 | worker 応答の pid と error 文字列が無検証で session とログに入る |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
+| [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
 | [fail-observability](fail-observability.md) | 低 | 2026-08-30 | 改善 mission 失敗の死因が記録されない問題は是正済 |
