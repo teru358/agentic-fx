@@ -2,7 +2,7 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (26)
+## 2026-10 (27)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
@@ -20,6 +20,7 @@
 | [legacy-2026-08-22-a-1](legacy-2026-08-22-a-1.md) | 見送り | 未設定 | 2026-10-02 | (対象消滅) 起動時検査④の変異が未注入 |
 | [legacy-d-5](legacy-d-5.md) | 是正済 | 未設定 | 2026-10-02 | 旧 submit 回廊が strategy の gate を素通りする問題は是正済 |
 | [legacy-e2e-codex-sigtrap](legacy-e2e-codex-sigtrap.md) | 是正済 | 未設定 | 2026-10-02 | codex 子の tool 実行基盤が SIGTRAP 死する問題は是正済 |
+| [legacy-e2e-econ-429](legacy-e2e-econ-429.md) | 是正済 | 中 | 2026-10-02 | 再起動のたびに経済指標を取得し連打で 429 になる |
 | [legacy-e2e-local-mcp](legacy-e2e-local-mcp.md) | 見送り | 未設定 | 2026-10-02 | codex + llama-swap で MCP tool が使えない (opencode に裁定) |
 | [mission-prompt-in-argv-readable-via-proc](mission-prompt-in-argv-readable-via-proc.md) | 是正済 | 未設定 | 2026-10-02 | mission の prompt が /proc/*/cmdline から読める (是正済) |
 | [mission46-selftest-loop](mission46-selftest-loop.md) | 是正済 | 未設定 | 2026-10-02 | self-test 修正ループで backtest に進めない問題は是正済 |

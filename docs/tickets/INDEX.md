@@ -1,15 +1,14 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 114 件。完了分は CLOSED.md。
+未完了: 113 件。完了分は CLOSED.md。
 
-## 実装待ち (23)
+## 実装待ち (22)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
-| [legacy-e2e-econ-429](legacy-e2e-econ-429.md) | 中 |  | 再起動のたびに経済指標を取得し連打で 429 になる |
 | [legacy-2026-08-22-a-4](legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
