@@ -130,6 +130,11 @@ class OutageStateMachine:
         # state に従えばよく、次の observe が同じ失敗をすればこの印が再び立つ
         # (その間に動く新規リスクの窓は 1 tick 分以下) ため。
         self._observe_failed = False
+        # observe が自分で開いた transaction を rollback し損ねて接続に残した間
+        # True。入口の「transaction 中は拒否」が自分の残骸にも当たって恒久的に
+        # non-ready になるのを避けるため、この印があるときだけ入口で片付け直す
+        # (呼び出し元の transaction には印が立たず、従来どおり拒否する)。
+        self._own_transaction_left_open = False
 
     # ---- public -------------------------------------------------------
 
@@ -229,6 +234,13 @@ class OutageStateMachine:
         """休場なら現在の state (str)、そうでなければ commit 済みの遷移結果。"""
         # observe は自分の transaction を所有する。呼び出し元の未確定の書き込みが
         # ある状態で入ると、それを黙って commit してしまうので入口で拒否する。
+        if self._own_transaction_left_open:
+            # 残骸が既に無ければ (接続側で閉じられた) 何もせず印だけ下ろす。
+            # 他人の transaction を巻き込まないため、印が立っていないときは触らない。
+            # rollback が失敗すれば例外で抜ける (印は残り、次の tick でまた試す)。
+            if self.conn.in_transaction:
+                self.conn.rollback()
+            self._own_transaction_left_open = False
         if self.conn.in_transaction:
             raise RuntimeError(
                 "observe は自分の transaction を所有する: 呼び出し元の未確定の"
@@ -250,7 +262,10 @@ class OutageStateMachine:
             self.conn.commit()
         except BaseException:
             if self.conn.in_transaction:
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    self._own_transaction_left_open = True
             raise
         self._reset_ready_streak = False
         return result

@@ -301,3 +301,84 @@ def test_a_failed_tick_does_not_lose_the_pending_streak_reset(tmp_path, monkeypa
     assert conn.execute(
         "SELECT ready_streak FROM datafeed_outage_state").fetchone()[0] == 2
     assert machine._reset_ready_streak is True
+
+
+# ---- rollback 自体が失敗しても自己回復する -----------------------------------
+
+
+class _RollbackFailsTimes:
+    """conn の薄い wrapper。rollback を指定回数だけ失敗させる。"""
+
+    def __init__(self, conn, failures):
+        self._conn = conn
+        self.failures = failures
+
+    def rollback(self):
+        if self.failures > 0:
+            self.failures -= 1
+            raise sqlite3.OperationalError("database is locked")
+        self._conn.rollback()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_a_leftover_transaction_of_a_failed_rollback_is_cleaned_up_by_the_next_observe(
+        tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    later = NOW + timedelta(minutes=1)
+    _fresh(conn, NOW)
+    _fresh(conn, later)  # 残骸を commit で片付けてしまわないよう先に用意する
+    machine.conn = _RollbackFailsTimes(conn, 1)
+    with monkeypatch.context() as m:
+        _crash_on_save(machine, m)
+        with pytest.raises(sqlite3.OperationalError, match="injected crash"):
+            machine.observe(NOW, _report())
+    assert conn.in_transaction
+    assert machine.state == "degraded"
+
+    assert machine.observe(later, _report()) == "ready"
+    assert not conn.in_transaction
+    assert machine._own_transaction_left_open is False
+    assert machine.state == "ready"
+    assert conn.execute("SELECT state FROM datafeed_outage_state").fetchone()[0] == "ready"
+
+
+def test_the_state_stays_degraded_every_tick_while_the_rollback_keeps_failing(
+        tmp_path, monkeypatch):
+    conn, machine = _rig(tmp_path)
+    for i in range(0, 6):
+        _fresh(conn, NOW + timedelta(minutes=i))
+    machine.conn = _RollbackFailsTimes(conn, 100)
+    with monkeypatch.context() as m:
+        _crash_on_save(machine, m)
+        with pytest.raises(sqlite3.OperationalError, match="injected crash"):
+            machine.observe(NOW, _report())
+
+    for i in range(1, 4):
+        later = NOW + timedelta(minutes=i)
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            machine.observe(later, _report())
+        assert machine.state == "degraded"
+        assert machine._own_transaction_left_open is True
+
+    machine.conn.failures = 0
+    later = NOW + timedelta(minutes=5)
+    assert machine.observe(later, _report()) == "ready"
+
+
+def test_the_callers_uncommitted_writes_are_neither_committed_nor_rolled_back_by_the_refusal(
+        tmp_path):
+    conn, machine = _rig(tmp_path)
+    _fresh(conn, NOW)
+    machine.observe(NOW, _report())
+
+    _write_without_commit(conn)
+    with pytest.raises(RuntimeError):
+        machine.observe(NOW + timedelta(minutes=1), _report())
+
+    assert conn.in_transaction
+    assert _count_caller_rows(conn) == 1
+    assert machine._own_transaction_left_open is False
+    conn.rollback()
+    assert _count_caller_rows(conn) == 0
