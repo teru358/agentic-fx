@@ -2,6 +2,12 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
+## 2026-10 (1)
+
+| id | 状態 | 優先 | 完了 | 概要 |
+|---|---|---|---|---|
+| [outage-stalled-on-broker-daily-rollover-gap](outage-stalled-on-broker-daily-rollover-gap.md) | 是正済 | 高 | 2026-10-02 | 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) |
+
 ## 2026-09 (34)
 
 | id | 状態 | 優先 | 完了 | 概要 |

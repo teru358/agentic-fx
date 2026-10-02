@@ -1,13 +1,12 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 137 件。完了分は CLOSED.md。
+未完了: 139 件。完了分は CLOSED.md。
 
-## 実装中 (8)
+## 実装中 (7)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [outage-stalled-on-broker-daily-rollover-gap](outage-stalled-on-broker-daily-rollover-gap.md) | 高 | 2026-09-29 | 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) |
 | [strategy-gate-data-error-crashes-commit](strategy-gate-data-error-crashes-commit.md) | 未設定 | 2026-09-02 | /[run-backtest-error-opaque]/[staging-snapshot-src-leak]/[s… |
 | [backtest-rpc-timeout-15s](backtest-rpc-timeout-15s.md) | 未設定 | 2026-09-03 | /[gate-failed-rows-not-persisted] **是正済 0a453af 2026-09-03、… |
 | [eval-source-consolidation](eval-source-consolidation.md) | 未設定 | 2026-09-03 | `_EVAL_SOURCE`×3 + `ANALYSIS_SOURCE` → `settings.backtest.e… |
@@ -43,7 +42,7 @@
 | [gate-noop-followup](gate-noop-followup.md) | 未設定 |  | 現行 note 化されていない fact 行が残る間は選択され得る (裁定待ち)。次回 E2E で `kind` 必須… |
 | [improve-mission-zero-tool-calls-undetected](improve-mission-zero-tool-calls-undetected.md) | 未設定 |  | registry の tool 呼び出し 0 件で終端した improve mission が「agent が自主的に… |
 
-## 設計待ち (112)
+## 設計待ち (115)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -75,6 +74,9 @@
 | [backtest-aggregates-partial-minute-bars](backtest-aggregates-partial-minute-bars.md) | 低 | 2026-10-01 | backtest と resample が欠けた 1m 足をある分だけ集約し、部分的な足を作る |
 | [plugin-sees-live-spread](plugin-sees-live-spread.md) | 低 | 2026-10-01 | plugin と判断 mission が実 spread を見られるようにする |
 | [risk-gate-rr-uses-configured-spread](risk-gate-rr-uses-configured-spread.md) | 低 | 2026-10-01 | risk gate の RR 計算が設定値の spread を使い、実 spread と乖離する |
+| [first-run-empty-1m-starts-degraded](first-run-empty-1m-starts-degraded.md) | 低 | 2026-10-02 | 初期化直後に 1m 足が空だと degraded から始まる (実機で確認) |
+| [outage-leftover-transaction-partial-commit](outage-leftover-transaction-partial-commit.md) | 低 | 2026-10-02 | 停止判定の rollback 失敗で残った中途の書き込みが、次の足の保存で確定し得る |
+| [restricted-state-followups](restricted-state-followups.md) | 低 | 2026-10-02 | restricted 状態の残り: 欠落の記録、入力契約のテスト、結合検証 |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [credentials-file-copied-unused](credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
