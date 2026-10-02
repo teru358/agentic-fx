@@ -89,6 +89,10 @@ class SignalProducer:
         # The set is deliberately in-memory like the cursor: an outage should
         # yield one diagnostic per unchanged shortage, then recover silently.
         self._insufficient_closed: set[tuple[str, str, str, str]] = set()
+        # 評価失敗の通知間引き: (plugin, content_hash, pair, bucket, result)
+        # -> 同じ失敗を観測した回数。メモリのみ (再起動で初回通知に戻る)。
+        self._failure_notices: dict[
+            tuple[str, str, str, datetime, str], int] = {}
         self._paused = False
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
@@ -196,6 +200,12 @@ class SignalProducer:
         freshness_cutoff = now - width * settings.plugin.signal_freshness_bars
         freshness_bucket = floor_to_bucket(freshness_cutoff, tf)
         key = (meta.name, meta.content_hash, pair)
+        # content hash が変わった plugin の旧 hash の失敗記録は残さない
+        # (戻したときに、間引き中の古い状態で初回通知が出ないのを避ける)。
+        self._release_failures(meta.name, pair, keep_hash=meta.content_hash)
+        # 鮮度窓を過ぎて評価されなくなった (自然放棄された) バケットの失敗記録。
+        # cursor が無いまま窓が進んだ場合はループに入らないので、ここで落とす。
+        self._release_failures(meta.name, pair, older_than=freshness_cutoff)
         cursor = self._cursor.get(key)
         start = (cursor + width if cursor is not None
                  else freshness_bucket)
@@ -224,15 +234,68 @@ class SignalProducer:
                                meta.max_bars, e.available),
                             ref_id=meta.name)
                 break
-            except Exception as e:  # noqa: BLE001 — plugin 単位で fail-open
+            except _BucketDataMissing as e:
+                # 取り込みラグ等でデータが無いだけで plugin の失敗ではない。
+                # 人間向けの activity にはせず、技術ログだけに残す。
                 _log.warning(
                     "plugin %s (%s): evaluation failed at bucket %s (%s) — "
                     "cursor not advanced, retry next tick",
                     meta.name, pair, b.isoformat(), e)
                 break
+            except Exception as e:  # noqa: BLE001 — plugin 単位で fail-open
+                self._report_failure(meta, pair, b, e, activity)
+                break
             self._cursor[key] = b
+            # 成功したら、この plugin × pair の失敗の間引き状態は解除する。
+            self._release_failures(meta.name, pair, hash_=meta.content_hash)
             b += width
         return inserted
+
+    def _release_failures(self, name: str, pair: str, *,
+                          keep_hash: str | None = None,
+                          hash_: str | None = None,
+                          older_than: datetime | None = None) -> None:
+        """間引き状態を解除する。`keep_hash` は「それ以外の hash」、`hash_`
+        は「その hash」、`older_than` は「それより古いバケット」を対象に絞る。"""
+        for k in list(self._failure_notices):
+            if k[0] != name or k[2] != pair:
+                continue
+            if keep_hash is not None and k[1] == keep_hash:
+                continue
+            if hash_ is not None and k[1] != hash_:
+                continue
+            if older_than is not None and k[3] >= older_than:
+                continue
+            del self._failure_notices[k]
+
+    def _report_failure(self, meta: PluginMeta, pair: str, bucket: datetime,
+                        exc: Exception, activity) -> None:
+        """評価失敗を固定分類にし、初回と 61・121…回目だけ activity と
+        warning に出す。同じ失敗を毎 tick 出すと、人間の読む面が埋まる。"""
+        result = _failure_result(exc)
+        key = (meta.name, meta.content_hash, pair, bucket, result)
+        count = self._failure_notices.get(key, 0) + 1
+        self._failure_notices[key] = count
+        if count % _NOTICE_INTERVAL != 1:
+            return
+        suffix = (f" suppressed_count={_NOTICE_INTERVAL}" if count > 1 else "")
+        _log.warning(
+            "plugin %s (%s): evaluation failed at bucket %s (%s) result=%s — "
+            "cursor not advanced, retry next tick",
+            meta.name, pair, bucket.isoformat(), exc, result)
+        if activity is None:
+            return
+        try:
+            # 本文は固定分類だけ (例外文字列・stderr・パスは技術ログにのみ残す)。
+            activity.write(
+                Category.TECH, "plugin_eval_failed",
+                "consumer=%s pair=%s interval=%s bucket=%s result=%s%s"
+                % (meta.name, pair, meta.timeframe, bucket.isoformat(),
+                   result, suffix),
+                ref_id=meta.name)
+        except Exception:  # noqa: BLE001 — 記録の失敗で評価を止めない
+            _log.warning("plugin %s: failed to write evaluation failure activity",
+                         meta.name)
 
     def _evaluate_bucket(self, conn: "sqlite3.Connection", meta: PluginMeta,
                          pair: str, bucket_start: datetime, *, now: datetime,
@@ -252,7 +315,7 @@ class SignalProducer:
         # 再評価されない (cursor はバケット単位の単調増加のみ)。空 df と
         # 同じ扱い (fail-open・cursor を進めず次 tick 再試行) にする。
         if df.empty or df.index[-1] != bucket_start:
-            raise ValueError(
+            raise _BucketDataMissing(
                 f"target bucket not yet present in {source} data for "
                 f"{pair} {meta.timeframe} bucket starting "
                 f"{bucket_start.isoformat()}")
@@ -307,6 +370,31 @@ class SignalProducer:
             pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
             kind="strategy", payload={**result, **provenance}, now=now)
         return 1 if row_id is not None else 0
+
+
+# 失敗通知の再通知間隔 (初回の次は 61・121… 回目)。内部定数。
+_NOTICE_INTERVAL = 60
+
+# SandboxError.code → live の固定分類。ここに無い code (検証失敗など
+# 既定の backtest_failed を含む) は plugin 側の失敗として plugin_error にする。
+_SANDBOX_CODE_TO_RESULT = {
+    "timeout": "timeout",
+    "cpu_limit": "cpu_limit",
+    "crashed": "crashed",
+    "plugin_error": "plugin_error",
+    "protocol_error": "plugin_error",
+}
+
+
+def _failure_result(exc: Exception) -> str:
+    if isinstance(exc, plugin_sandbox.SandboxError):
+        return _SANDBOX_CODE_TO_RESULT.get(
+            getattr(exc, "code", None), "plugin_error")
+    return "internal_error"
+
+
+class _BucketDataMissing(ValueError):
+    """対象バケットの確定足がまだ cache に無い (plugin の失敗ではない)。"""
 
 
 class _InsufficientClosedBars(Exception):

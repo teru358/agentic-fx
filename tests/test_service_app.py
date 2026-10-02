@@ -1448,6 +1448,49 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
     assert count >= 1
 
 
+def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
+    """build_app が組んだ実 scheduler の tick で plugin 評価が失敗すると、
+    本番の activity.log に固定分類の行が届く (producer への配線)。"""
+    from agentic_fx.core.accounting import record_snapshot
+    from agentic_fx.plugin.loader import PluginMeta
+    from agentic_fx.plugin.resolve import ApprovedInventory, InventoryBuildResult
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    class _FailingSession(_FakeSignalSession):
+        def call(self, payload: dict) -> dict:
+            raise SandboxError("STDERR-MARKER /home/x/secret.py", code="cpu_limit")
+
+    _init(tmp_path)
+    meta = PluginMeta(name="sig1", kind="signal", path=Path("/nonexistent"),
+                      params={}, timeframe="1h", pairs=("USDJPY",),
+                      max_bars=50, content_hash="h" * 64)
+    inventory_result = InventoryBuildResult(
+        inventory=ApprovedInventory(root=Path("/nonexistent"), metas=(meta,)),
+        phase1_metas=(meta,), resolved={}, rejected_strategies=())
+
+    with patch("agentic_fx.service.plugin_loader.approved_plugins",
+              return_value=inventory_result), \
+         patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+              _FailingSession):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+        record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
+                        equity=1_000_000)
+        _seed_1m(app.conn_core, app.settings.datafeed.primary,
+                NOW - timedelta(hours=51), 51 * 60 + 1)
+        with _no_real_network(), \
+             patch.object(app.provider, "healthcheck", return_value="yfinance"):
+            app.scheduler.tick(NOW)
+
+    text = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    lines = [l for l in text.splitlines() if "\tplugin_eval_failed\t" in l]
+    assert len(lines) == 1
+    assert "result=cpu_limit" in lines[0] and "consumer=sig1" in lines[0]
+    assert "STDERR-MARKER" not in text and "/home/x" not in text
+    assert app.conn_core.execute(
+        "SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
+
+
 def test_f1b_signal_mission_does_not_fire_without_d2_position(tmp_path):
     """F1(b): open/pending_fill の注文が皆無 (D2 不成立) だと、pending
     signal があっても signal トリガーの trade mission が起動しないこと。"""

@@ -852,3 +852,246 @@ def test_producer_looks_up_resolved_by_key_not_by_dict_position(
             ("strat_a", hash_a): sentinel_a,
         })
     assert seen == {"strat_a": sentinel_a}
+
+
+# ---------------------------------------------------------------------
+# live の評価失敗 activity (固定分類・間引き・解除)
+# ---------------------------------------------------------------------
+import pytest  # noqa: E402
+
+_FAILURE_CASES = [
+    pytest.param(SandboxError("x", code="timeout"), "timeout", id="timeout"),
+    pytest.param(SandboxError("x", code="cpu_limit"), "cpu_limit", id="cpu_limit"),
+    pytest.param(SandboxError("x", code="crashed"), "crashed", id="crashed"),
+    pytest.param(SandboxError("x", code="plugin_error"), "plugin_error",
+                 id="plugin_error"),
+    pytest.param(SandboxError("x", code="protocol_error"), "plugin_error",
+                 id="protocol_error"),
+    pytest.param(SandboxError("x"), "plugin_error", id="default_code"),
+    pytest.param(RuntimeError("x"), "internal_error", id="non_sandbox"),
+]
+
+
+class _RecordingActivity:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def write(self, category, event, summary, ref_id=None) -> None:
+        self.calls.append((category, event, summary, ref_id))
+
+    def failures(self) -> list[str]:
+        return [c[2] for c in self.calls if c[1] == "plugin_eval_failed"]
+
+
+class _AlwaysFailingSandbox:
+    """呼ばれるたびに指定の例外を送出し、評価したバケット (df 末尾) を残す。"""
+
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+        self.buckets: list[datetime] = []
+
+    def __call__(self, meta, payload, *, settings):
+        self.buckets.append(payload["df"].index[-1].to_pydatetime())
+        raise self.exc
+
+
+def _run(producer, conn, meta, now, sandbox, activity):
+    return producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=now, source=SOURCE, sandbox_run=sandbox,
+        settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta),
+        activity=activity)
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_keeps_cursor_breaks_the_tick_and_reports_the_fixed_class(
+        tmp_path, exc, result):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=8), 8 * 60 + 61)
+    meta = _meta(kind="signal", timeframe="1h")
+    sandbox = _AlwaysFailingSandbox(exc)
+    activity = _RecordingActivity()
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+
+    assert _run(producer, conn, meta, now, sandbox, activity) == 0
+    # 同 tick は最初に失敗したバケットで打ち切る (後続バケットを評価しない)
+    assert len(sandbox.buckets) == 1
+    # cursor は進まず、次 tick は同じバケットから再試行する
+    assert _run(producer, conn, meta, now, sandbox, activity) == 0
+    assert sandbox.buckets[1] == sandbox.buckets[0]
+    assert len(sandbox.buckets) == 2
+    # 通知は初回の 1 件だけ (2 回目は間引き)、本文は固定分類
+    assert len(activity.failures()) == 1
+    assert f"result={result}" in activity.failures()[0]
+    assert activity.calls[0][3] == "sig"
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_uses_a_new_worker_every_tick(tmp_path, exc, result):
+    from unittest.mock import patch
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    sessions: list = []
+
+    class _Session:
+        def __init__(self, m, *, settings, resolved=None) -> None:
+            self.pid = 1000 + len(sessions)
+            self.closed = False
+            sessions.append(self)
+
+        def __enter__(self):
+            return self
+
+        def call(self, payload):
+            raise exc
+
+        def close(self) -> None:
+            self.closed = True
+
+    producer = SignalProducer()
+    activity = _RecordingActivity()
+    with patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+               _Session):
+        for _ in range(2):
+            _run(producer, conn, meta, H + timedelta(hours=1), None, activity)
+    assert [s.pid for s in sessions] == [1000, 1001]
+    assert all(s.closed for s in sessions)
+    assert f"result={result}" in activity.failures()[0]
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_notifies_only_on_attempts_1_61_121(tmp_path, exc, result,
+                                                          caplog):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    sandbox = _AlwaysFailingSandbox(exc)
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+
+    notified: list[int] = []
+    warned: list[int] = []
+    caplog.set_level(logging.WARNING, logger="agentic_fx.plugin.signal_producer")
+    for attempt in range(1, 122):
+        activity = _RecordingActivity()
+        caplog.clear()
+        _run(producer, conn, meta, now, sandbox, activity)
+        if activity.failures():
+            notified.append(attempt)
+            assert f"result={result}" in activity.failures()[0]
+            assert ("suppressed_count=60" in activity.failures()[0]) == (attempt > 1)
+        if "evaluation failed" in caplog.text:
+            warned.append(attempt)
+    assert notified == [1, 61, 121]
+    assert warned == [1, 61, 121]
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_key_is_released_after_the_hash_changes_back(
+        tmp_path, exc, result):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    old = _meta(kind="signal", timeframe="1h", content_hash="a" * 64)
+    new = _meta(kind="signal", timeframe="1h", content_hash="b" * 64)
+    sandbox = _AlwaysFailingSandbox(exc)
+    activity = _RecordingActivity()
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+
+    _run(producer, conn, old, now, sandbox, activity)
+    _run(producer, conn, old, now, sandbox, activity)
+    assert len(activity.failures()) == 1
+    _run(producer, conn, new, now, sandbox, activity)  # hash 変更 (別 key で初回)
+    assert len(activity.failures()) == 2
+    _run(producer, conn, old, now, sandbox, activity)  # 戻しても初回扱い
+    assert len(activity.failures()) == 3
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_key_is_released_after_a_success(tmp_path, exc, result):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    fake = _FakeSandbox()
+    activity = _RecordingActivity()
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    key = ("sig", meta.content_hash, "USDJPY")
+
+    fake.raise_once("sig", exc)
+    _run(producer, conn, meta, now, fake, activity)
+    fake.raise_once("sig", exc)
+    _run(producer, conn, meta, now, fake, activity)
+    assert len(activity.failures()) == 1
+    _run(producer, conn, meta, now, fake, activity)  # 成功して追いつく
+    assert key in producer._cursor
+    # 再起動以外で同じバケットが再び失敗する状況 (cursor を戻して再現)
+    producer._cursor.pop(key)
+    fake.raise_once("sig", exc)
+    _run(producer, conn, meta, now, fake, activity)
+    assert len(activity.failures()) == 2
+
+
+@pytest.mark.parametrize("exc, result", _FAILURE_CASES)
+def test_live_failure_key_is_released_when_the_bucket_is_abandoned(
+        tmp_path, exc, result):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 40 * 60)
+    meta = _meta(kind="signal", timeframe="1h")
+    sandbox = _AlwaysFailingSandbox(exc)
+    activity = _RecordingActivity()
+    producer = SignalProducer()
+
+    _run(producer, conn, meta, H + timedelta(hours=1), sandbox, activity)
+    assert len(producer._failure_notices) == 1
+    # 鮮度窓を過ぎて失敗バケットが自然放棄されたら key も消える
+    far = H + timedelta(hours=1 + SETTINGS.plugin.signal_freshness_bars + 2)
+    old_bucket = next(iter(producer._failure_notices))[3]
+    # 放棄後の最初の確定バケットも失敗させ、成功による解除と区別する
+    _run(producer, conn, meta, far, _AlwaysFailingSandbox(exc), activity)
+    assert all(k[3] != old_bucket for k in producer._failure_notices)
+    assert len(producer._failure_notices) <= 1
+
+
+def test_live_failure_activity_text_has_no_exception_text_or_path(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    sandbox = _AlwaysFailingSandbox(SandboxError(
+        "/home/x/secret.py line 3 Traceback STDERR-MARKER", code="crashed"))
+    activity = _RecordingActivity()
+    _run(SignalProducer(), conn, meta, H + timedelta(hours=1), sandbox, activity)
+    text = " ".join(str(part) for call in activity.calls for part in call)
+    assert "STDERR-MARKER" not in text and "/home/x" not in text
+    assert "Traceback" not in text
+    assert "result=crashed" in text
+
+
+def test_live_missing_bucket_data_is_not_reported_as_a_plugin_failure(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 3 * 60)
+    meta = _meta(kind="signal", timeframe="1h")
+    activity = _RecordingActivity()
+    _run(SignalProducer(), conn, meta, H + timedelta(hours=1), _FakeSandbox(),
+         activity)
+    assert activity.failures() == []
+
+
+def test_live_failure_activity_write_error_does_not_stop_the_producer(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+
+    class _Broken:
+        def write(self, *a, **k):
+            raise OSError("disk full")
+
+    fake = _FakeSandbox()
+    fake.raise_once("sig", SandboxError("x", code="crashed"))
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    assert _run(producer, conn, meta, now, fake, _Broken()) == 0
+    fake.queue("sig", {"signals": [_signal_result()]})
+    assert _run(producer, conn, meta, now, fake, _Broken()) == 1
