@@ -215,8 +215,22 @@ T1 と T3 は旧形式 fallback により独立して導入できる。T2 は ap
 - parent facts は事実であっても、agent が backtest 回数と課題選択へ影響できる。固定注記は独立性を保証しない。
 - sanitizer は表示安全策であり、DB 内の agent 文を親の事実へ昇格させない。
 
+## v1.1 の補足 (実装とレビュー 2 周で確定した読み替え)
+
+本節は v1.0 の本文に優先する。
+
+1. **過去 run の result の語彙**: result=null を一律「観測のみ」とはしない。`improvement_runs.result` / `report_state` と `missions.status` (LEFT JOIN) から、`approval` / `report` / `observation` (completed かつ report_state=none) / `failed` / `interrupted` / `report_failed` に分け、どれにも当たらなければ `null` = 「結果なし (観測または失敗。区別できる記録がありません)」と表示する。失敗した run を観測と誤認させないため。
+2. **試行の件数上限**: 提出 hash と同一の行は上限 (20) に関わらず残し、残りの枠を受理順の先頭で埋める。表示番号は受理順のまま。提出した候補の行が省略側に落ちないため。
+3. **収集に失敗した承認依頼**: 収集で `FactsError` (入力の形の不一致。台帳 entry・backlog 行・metrics の型の境界で `approval_facts.py` の中で変換) が出たときだけ続行し、payload に `{"facts_version": 1, "parent_facts": null, "facts_error": "collection_failed"}` を残して承認依頼を作る。表示は「親の事実表の収集に失敗した承認依頼です (理由は技術ログ)」で、本物の旧形式 (facts_version なし) と区別する。`facts_version` が 1 以外の整数は「未知の版」。sqlite3 の例外と想定外の例外は握らず、従来の補償経路 (承認依頼を作らず mission failed) に入る。収集は読み取りだけで書き込みが無いので SAVEPOINT は使わない。
+4. **trial の pf / avg_r / max_drawdown は null を許す** (`compute_metrics` は損失 0 または trades=0 で pf=None を返す)。trades は bool でない非負整数のみ。NaN / inf / bool / 文字列は拒否。
+5. **無害化の順序**: CR / LF / TAB を空白にしてから Cc / Cf / Cs (孤立サロゲート) を除去し、空白を畳む (`str.split()` なので U+2028 / U+2029 / U+0085 も 1 行になる)。結合文字 (Mn) は保つ。v1.0 の「Cc / Cf を除去してから改行を空白化」の順だと `a\nb` が `ab` になるため。上限は単値欄 200 字、自由文は表示 600 字・保存 2000 字、archive path 300 字。保存時の省略接尾辞 `…(省略)` は表示でもう一度切り詰めても 1 つだけ付く。数値も文字列化して同じ上限を通す。
+6. **`agent_claims` が dict でない・欠落**: 自己申告欄の見出しと固定の不正形式行を出す (黙って消さない)。空 dict は欄なし。
+7. **per-pair と単一 metrics の判別**: 全値が dict なら per-pair、混在時は指標名のキー (pf / trades / avg_r / max_drawdown) の有無で決める。空 dict は `prefix: -` の 1 行。
+8. **payload root が不正**: header に加えて reason / decided_by / decided_at の行も出す (DB 行由来)。
+
 ## 変更履歴
 
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
 |2026-10-02|v1.0|親の記録と agent の自己申告の分離、過去 run の null result、field-level fail-soft、全表示文字列の無害化、固定注記、受入条件を確定した。|未検証の自然文を承認根拠と混同せず、既存の承認画面で構造化事実を読めるようにするため。||
+|2026-10-03|v1.1|「v1.1 の補足」節を追加 (過去 run の語彙、提出行の保持、収集失敗の印、null の許容、無害化の順序と上限、agent_claims の不正形式表示、per-pair 判別、root 不正時の行)。|実装 (段 0 変異 109 本) とレビュー 2 周 (codex terra / sol、/code-review high、ローカル 3 本) で確定した読み替えを仕様に反映するため。|ae2c858 まで|
