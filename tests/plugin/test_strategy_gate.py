@@ -820,3 +820,102 @@ def test_baseline_uses_the_inventory_even_without_an_approved_row(
         timeframe="1h", content_hash="h2", now=datetime(2026, 8, 22),
         settings=_SETTINGS, meta=_meta(content_hash="h2"))
     assert verdict.baseline_variant == "baseline"
+
+
+# ---- evaluation_sink: 評価 1 回ごとの通知 -----------------------------------
+
+class _SinkSource:
+    def __init__(self, pair):
+        self.pair = pair
+        self.closed = False
+        self.cpu_sec = None
+
+    def close(self):
+        self.closed = True
+
+
+def _arrange_sink_gate(monkeypatch, *, in_sample, holdout):
+    sources = []
+
+    def _build(meta, *, pair, **kw):
+        src = _SinkSource(pair)
+        sources.append(src)
+        return src
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        _build)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_in_sample", in_sample)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.holdout.run_holdout_gate", holdout)
+    return sources
+
+
+def _run_sink_gate(conn, calls, **kw):
+    def _sink(scope, pair, source, error):
+        calls.append((scope, pair, source, error, source.closed))
+    return evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY", "EURUSD"],
+        timeframe="1h", resolved=_EMPTY, content_hash="h20",
+        now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", pairs=("USDJPY", "EURUSD"),
+                   content_hash="h20"),
+        evaluation_sink=_sink, **kw)
+
+
+def test_sink_is_notified_once_per_scope_and_pair_after_the_source_is_closed(
+        monkeypatch, conn):
+    sources = _arrange_sink_gate(
+        monkeypatch,
+        in_sample=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2),
+        holdout=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2))
+    calls = []
+
+    _run_sink_gate(conn, calls)
+
+    assert [(c[0], c[1], c[3], c[4]) for c in calls] == [
+        ("in_sample", "USDJPY", None, True), ("in_sample", "EURUSD", None, True),
+        ("holdout", "USDJPY", None, True), ("holdout", "EURUSD", None, True)]
+    assert [c[2] for c in calls] == [sources[0], sources[1], sources[2], sources[3]]
+
+
+def test_failing_holdout_evaluation_reaches_the_sink_and_still_raises(
+        monkeypatch, conn):
+    from agentic_fx.plugin.sandbox import SandboxError
+    boom = SandboxError("worker died", code="crashed")
+
+    def _holdout(*a, **kw):
+        raise boom
+    _arrange_sink_gate(
+        monkeypatch,
+        in_sample=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2),
+        holdout=_holdout)
+    calls = []
+
+    with pytest.raises(SandboxError) as caught:
+        _run_sink_gate(conn, calls)
+
+    assert caught.value is boom
+    scope, pair, _src, error, closed = calls[-1]
+    assert (scope, pair, closed) == ("holdout", "USDJPY", True)
+    assert error is boom
+    assert [c[0] for c in calls] == ["in_sample", "in_sample", "holdout"]
+
+
+def test_failing_in_sample_evaluation_reaches_the_sink_and_still_raises(
+        monkeypatch, conn):
+    from agentic_fx.plugin.sandbox import SandboxError
+    boom = SandboxError("worker died", code="timeout")
+
+    def _in_sample(*a, **kw):
+        raise boom
+    _arrange_sink_gate(monkeypatch, in_sample=_in_sample,
+                       holdout=lambda *a, **kw: _metrics(trades=30, pf=1.5))
+    calls = []
+
+    with pytest.raises(SandboxError) as caught:
+        _run_sink_gate(conn, calls)
+
+    assert caught.value is boom
+    assert [(c[0], c[1], c[3], c[4]) for c in calls] == [
+        ("in_sample", "USDJPY", boom, True)]

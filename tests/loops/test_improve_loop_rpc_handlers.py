@@ -1378,3 +1378,113 @@ def test_activity_writer_failure_never_changes_the_public_result(
                 if k not in ("archive_tmp", "artifact_hash")}
     assert _norm(actual) == _norm(expected)
     assert _cpu_lines(tmp_path) == []
+
+
+# --- 写像表・起動前の失敗・書き込み失敗・commit 側 sink の穴埋め --------------
+
+# (SandboxError.code, 公開 error, 公開 hint の第 1 文, activity の result)
+_CODE_TABLE = [
+    ("cpu_limit", "worker_cpu_limit", "CPU 上限に達しました", "cpu_limit"),
+    ("timeout", "worker_timeout", "評価が時間内に完了しません", "timeout"),
+    ("crashed", "worker_crashed", "worker が異常終了しました", "crashed"),
+    ("plugin_error", "backtest_failed", "候補を確認して修正してください",
+     "plugin_error"),
+    ("protocol_error", "backtest_failed", "候補を確認して修正してください",
+     "plugin_error"),
+    ("backtest_failed", "backtest_failed", "候補を確認して修正してください",
+     "backtest_failed"),
+    ("unheard_of_code", "backtest_failed", "候補を確認して修正してください",
+     "backtest_failed"),
+]
+
+
+@pytest.mark.parametrize("code,public,hint_head,result", _CODE_TABLE)
+def test_each_sandbox_code_has_its_own_public_error_hint_and_activity_result(
+        loop_min, tmp_path, monkeypatch, code, public, hint_head, result):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=2.5, returncode=-9, signal=9))
+    _raising_run_in_sample(monkeypatch, _leaky(code))
+    handler, _ = _handler(loop_min, tmp_path)
+
+    response = handler({"name": "myst", "pair": "USDJPY"})
+
+    assert response["error"] == public
+    assert response["hint"].split("。")[0] == hint_head
+    (line,) = _cpu_lines(tmp_path)
+    assert f"result={result} " in line
+
+
+def test_failure_while_building_the_source_writes_no_backtest_cpu_line(
+        loop_min, tmp_path, monkeypatch):
+    from agentic_fx.plugin.sandbox import SandboxError
+    _patch_strategy_lookup(monkeypatch)
+
+    def _boom(meta, **kw):
+        raise SandboxError("cannot build", code="crashed")
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source", _boom)
+    handler, _ = _handler(loop_min, tmp_path)
+
+    response = handler({"name": "myst", "pair": "USDJPY"})
+
+    assert response["error"] == "worker_crashed"
+    assert _cpu_lines(tmp_path) == []
+
+
+def test_a_source_that_never_reports_evaluation_started_writes_no_line_on_failure(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)  # source は close しか持たない
+    _raising_run_in_sample(monkeypatch, RuntimeError("anything"))
+    handler, _ = _handler(loop_min, tmp_path)
+
+    assert handler({"name": "myst", "pair": "USDJPY"}) == {
+        "error": "backtest_failed"}
+    assert _cpu_lines(tmp_path) == []
+
+
+@pytest.mark.parametrize("kind", ["ok_path", "crashed"])
+def test_any_exception_from_the_activity_writer_leaves_the_result_unchanged(
+        loop_min, tmp_path, monkeypatch, kind):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=1.5, returncode=-9, signal=9))
+    _arrange_outcome(monkeypatch, None if kind == "ok_path" else "crashed")
+    handler, _ = _handler(loop_min, tmp_path)
+    expected = handler({"name": "myst", "pair": "USDJPY"})
+
+    real_write = loop_min._activity.write
+
+    def _write(category, event, *a, **kw):
+        if event == "backtest_cpu":
+            raise RuntimeError("serializer broke")
+        return real_write(category, event, *a, **kw)
+    monkeypatch.setattr(loop_min._activity, "write", _write)
+
+    actual = handler({"name": "myst", "pair": "USDJPY"})
+
+    def _norm(r):
+        return {k: v for k, v in dict(r).items()
+                if k not in ("archive_tmp", "artifact_hash")}
+    assert _norm(actual) == _norm(expected)
+
+
+@pytest.mark.parametrize("error_factory,result", [
+    (lambda: None, "ok"),
+    (lambda: RuntimeError("boom"), "backtest_failed"),
+    (lambda: _leaky("crashed"), "crashed"),
+    (lambda: _leaky("protocol_error"), "plugin_error"),
+    (lambda: _leaky("unheard_of_code"), "backtest_failed"),
+])
+def test_commit_sink_writes_scope_deps_and_result_of_each_evaluation(
+        loop_min, tmp_path, error_factory, result):
+    sink = loop_min._backtest_cpu_sink(mission="m-77", plugin="cand", deps=3)
+    source = _ParentObservedSource(cpu=4.25, returncode=-9, signal=9)
+
+    sink("holdout", "EURUSD", source, error_factory())
+
+    (line,) = _cpu_lines(tmp_path)
+    assert line.split("\t")[3] == (
+        "mission=m-77 plugin=cand scope=holdout pair=EURUSD deps=3 "
+        f"cpu_sec=4.25 cpu_source=parent_wait4 result={result} "
+        "returncode=-9 signal=9"), line

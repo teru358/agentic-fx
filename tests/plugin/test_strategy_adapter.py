@@ -817,3 +817,73 @@ def test_close_reports_no_cpu_when_the_worker_was_never_reaped(
     src(_bar(H))
     src.close()
     assert src.cpu_sec is None
+
+
+def _session_class_finishing_with(cpu_sec, worker_cpu_sec, *, close_raises=None):
+    closes = []
+
+    class _Finishing:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.cpu_sec = None
+            self.worker_cpu_sec = None
+            self.worker_returncode = None
+            self.worker_signal = None
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD_RESULT)
+        def close(self):
+            closes.append(1)
+            self.cpu_sec = cpu_sec
+            self.worker_cpu_sec = worker_cpu_sec
+            self.worker_returncode = -9
+            self.worker_signal = 9
+            if close_raises is not None:
+                raise close_raises
+    return _Finishing, closes
+
+
+def _fired_source(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    src(_bar(H))
+    return src
+
+
+def test_parent_observed_cpu_wins_over_the_session_self_report_even_when_zero(
+        tmp_path, monkeypatch):
+    cls, _ = _session_class_finishing_with(cpu_sec=5.0, worker_cpu_sec=0.0)
+    monkeypatch.setattr(strategy_adapter, "PluginSession", cls)
+    src = _fired_source(tmp_path)
+
+    src.close()
+
+    assert src.cpu_sec == 0.0
+
+
+def test_session_self_reported_cpu_is_used_only_when_the_parent_observed_none(
+        tmp_path, monkeypatch):
+    cls, _ = _session_class_finishing_with(cpu_sec=5.0, worker_cpu_sec=None)
+    monkeypatch.setattr(strategy_adapter, "PluginSession", cls)
+    src = _fired_source(tmp_path)
+
+    src.close()
+
+    assert src.cpu_sec == 5.0
+
+
+def test_close_that_raises_still_keeps_diagnostics_and_drops_the_session(
+        tmp_path, monkeypatch):
+    cls, closes = _session_class_finishing_with(
+        cpu_sec=None, worker_cpu_sec=1.25, close_raises=RuntimeError("close failed"))
+    monkeypatch.setattr(strategy_adapter, "PluginSession", cls)
+    src = _fired_source(tmp_path)
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        src.close()
+    assert (src.cpu_sec, src.worker_returncode, src.worker_signal) == (1.25, -9, 9)
+    src.close()  # session 参照は消えている: 2 度目は何もしない
+    assert closes == [1]
