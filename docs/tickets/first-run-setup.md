@@ -2,7 +2,7 @@
 id: first-run-setup
 title: 初回起動の対話設定と service 設置が無い
 status: 設計待ち
-priority: 低
+priority: 中
 opened: 2026-09-17
 closed: null
 related: [indicator-consumption-wiring, indicator-initial-set]
@@ -11,7 +11,7 @@ source_section: 未完了
 ---
 # [first-run-setup]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 中
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +21,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: 初回起動の対話設定と service 設置が無い — 仕分け (2026-10-02、現物で成立を確認): 着手は戦略調整・ペーパー到達の後、詳細設計はその時点。 根拠: 初回起動の対話ウィザードは未実装。方針は 2026-09-17 のユーザー指示、着手は戦略調整後。
+- 2026-10-02: 優先: 中 — ユーザー方針 (2026-10-02): 優先度 高 のチケットが片付いたら、次の束として初期設定ウィザードに進む。着手条件を「戦略のペーパー到達の後」から変更

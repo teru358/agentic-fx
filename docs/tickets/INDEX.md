@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 113 件。完了分は CLOSED.md。
+未完了: 114 件。完了分は CLOSED.md。
 
 ## 実装待ち (22)
 
@@ -41,7 +41,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (85)
+## 設計待ち (86)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -53,6 +53,7 @@
 | [human-corridor-gate-rows-null-outcome](human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [improve-targeted-run](improve-targeted-run.md) | 中 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [legacy-submit-corridor-bypasses-gate](legacy-submit-corridor-bypasses-gate.md) | 中 | 2026-09-12 | `afx plugin submit <name>` (live plugins/ の既存 plugin) は `ap… |
+| [first-run-setup](first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 | [retire-symlink-deployed-plugin](retire-symlink-deployed-plugin.md) | 中 | 2026-09-19 | afx plugin retire が symlink 配備の指標を退役できない |
 | [policy-add-unwired-in-service](policy-add-unwired-in-service.md) | 中 | 2026-09-20 | `service.py:1054` の `Commands(...)` に `policy_path` を渡していない… |
 | [secret-env-guard-false-positive](secret-env-guard-false-positive.md) | 中 | 2026-09-20 | 改善 backend を CLI 系 (claude / codex) にすると、起動時の検査⑤ (`service.… |
@@ -63,6 +64,7 @@
 | [trade-cron-hybrid-mode](trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
 | [trade-timeout-on-startup](trade-timeout-on-startup.md) | 中 | 2026-09-28 | 停止による打ち切りの trade mission が timeout と記録される |
 | [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 中 | 2026-09-30 | worker 応答の pid と error 文字列が無検証で session とログに入る |
+| [plugin-ast-check-bypass-via-library-attributes](plugin-ast-check-bypass-via-library-attributes.md) | 中 | 2026-10-02 | plugin がライブラリの属性経由で os に届き、コード検査を回避できる |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -78,7 +80,6 @@
 | [indicator-reference-oracle-gate](indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
 | [multi-timeframe-indicator-deps](multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 | [fake-run-context-consolidation](fake-run-context-consolidation.md) | 低 | 2026-09-17 | テストのフェイク RunContext が散在し追随漏れで壊れやすい |
-| [first-run-setup](first-run-setup.md) | 低 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 | [iw-r3-unverified-residuals](iw-r3-unverified-residuals.md) | 低 | 2026-09-19 | iw 3 周目で未検証のまま残った 3 点 |
 | [ops-ui](ops-ui.md) | 低 | 2026-09-19 | 承認 bot と読み取り専用 web ダッシュボードが無い |
 | [reject-revert-without-live-classification](reject-revert-without-live-classification.md) | 低 | 2026-09-20 | `reject_candidate` (`switch.py:1866-1875`) は自分の未完 journal が… |
