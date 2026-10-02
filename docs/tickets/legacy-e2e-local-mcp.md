@@ -1,16 +1,17 @@
 ---
 id: legacy-e2e-local-mcp
-status: 設計待ち
+title: codex + llama-swap で MCP tool が使えない (opencode に裁定)
+status: 見送り
 priority: 未設定
 opened: 2026-08-30
-closed: null
+closed: 2026-10-02
 related: []
 backfilled: true
 source_section: 未完了
 ---
 # [legacy-e2e-local-mcp]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 見送り / **優先**: 未設定
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,5 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 題名: codex + llama-swap で MCP tool が使えない (opencode に裁定) — 仕分け (2026-10-02): 題名を付与
+- 2026-10-02: 見送り理由 — 仕分け (2026-10-02): ローカル LLM のハーネスを opencode に裁定したため、codex llama_swap 経路は追わない。 根拠: ローカルハーネスは opencode に裁定済み (2026-08-30)。codex + llama_swap は namespace tools 不成立で封鎖。

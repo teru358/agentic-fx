@@ -1,7 +1,8 @@
 ---
 id: switch-ops-code-review-r2-altitude
+title: switch ops の重複コードや型の緩さの整理
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-20
 closed: null
 related: [switch-ops-hardening]
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [switch-ops-code-review-r2-altitude]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: switch ops の重複コードや型の緩さの整理 — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): lock 内再読の 3 重複、Literal 化、print 重複などの整理候補。未再確認。 根拠: 保守性の指摘 8 点の現存は個別に読まないと決まらない。現挙動の欠陥ではない。

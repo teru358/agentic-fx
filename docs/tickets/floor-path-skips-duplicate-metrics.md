@@ -1,16 +1,17 @@
 ---
 id: floor-path-skips-duplicate-metrics
-status: 設計待ち
+title: フロア経路が重複 metrics を検査しない件 (現状維持で裁定)
+status: 見送り
 priority: 未設定
 opened: 2026-09-13
-closed: null
+closed: 2026-10-02
 related: [unprofitable-note-hygiene]
 backfilled: true
 source_section: 未完了
 ---
 # [floor-path-skips-duplicate-metrics]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 見送り / **優先**: 未設定
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,5 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 題名: フロア経路が重複 metrics を検査しない件 (現状維持で裁定) — 仕分け (2026-10-02): 題名を付与
+- 2026-10-02: 見送り理由 — 仕分け (2026-10-02): 質検査はフロア経路に入れないと裁定。原因は note 衛生で、後継チケットで対応済み。 根拠: 2026-09-13 に (c) 現状維持で裁定済み。後継は unprofitable-note-hygiene (是正済)。

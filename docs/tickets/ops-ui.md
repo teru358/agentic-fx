@@ -1,7 +1,8 @@
 ---
 id: ops-ui
+title: 承認 bot と読み取り専用 web ダッシュボードが無い
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-19
 closed: null
 related: [first-run-setup, first-run-setup]
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [ops-ui]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: 承認 bot と読み取り専用 web ダッシュボードが無い — 仕分け (2026-10-02、現物で成立を確認): 付属型 (別プロセス) で進める裁定済み、着手はペーパー到達の後。 根拠: 同梱 bot / web は未実装。裁定 2026-09-19 で付属型に決定、着手はペーパー到達後。

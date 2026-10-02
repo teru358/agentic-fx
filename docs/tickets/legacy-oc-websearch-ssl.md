@@ -1,7 +1,8 @@
 ---
 id: legacy-oc-websearch-ssl
+title: web 検索が間欠的に SSL 検証失敗する
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: null
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [legacy-oc-websearch-ssl]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: web 検索が間欠的に SSL 検証失敗する — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): DDG 側の遮断・レートの疑い、外向き予算の再確認が残る。 根拠: afx_web_search の DDG 間欠 SSL 失敗は実測のみ。config.py:311 max_searches=20 の妥当性は再確認が要る。

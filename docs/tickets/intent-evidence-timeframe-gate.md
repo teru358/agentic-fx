@@ -1,7 +1,8 @@
 ---
 id: intent-evidence-timeframe-gate
+title: 判断足と無関係な足を根拠にした OPEN を gate が弾かない
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-27
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [intent-evidence-timeframe-gate]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: 判断足と無関係な足を根拠にした OPEN を gate が弾かない — 仕分け (2026-10-02、現物で成立を確認): TradeIntent に根拠足を持たせて照合する別設計が必要。現状は表示で抑制。 根拠: executor.py:435-481 付近に根拠足の検証は無く、evidence_timeframe の語も src に存在しない。

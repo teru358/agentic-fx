@@ -1,7 +1,8 @@
 ---
 id: legacy-oc-tool-not-found
-status: 設計待ち
-priority: 未設定
+title: 存在しない候補名を読むときの誘導が足りない
+status: 実装待ち
+priority: 低
 opened: null
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [legacy-oc-tool-not-found]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 実装待ち、優先: 低、題名: 存在しない候補名を読むときの誘導が足りない — 仕分け (2026-10-02、現物で成立を確認): not found 応答の hint は部分対応。list_staging への誘導文が残る。 根拠: ed0f0f1 で hint 追加済み。improve_staging_tools.py:258,280,320 の not found は available を返すが、誘導文は部分的。

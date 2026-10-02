@@ -1,7 +1,8 @@
 ---
 id: indicator-result-wire-validation-unify
-status: 設計待ち
-priority: 未設定
+title: 指標結果の検査が 2 箇所に重複している
+status: 実装待ち
+priority: 低
 opened: 2026-09-18
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [indicator-result-wire-validation-unify]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 実装待ち、優先: 低、題名: 指標結果の検査が 2 箇所に重複している — 仕分け (2026-10-02、現物で成立を確認): 現行は健全、共通 validator に統一できる (整理)。 根拠: plugin/sandbox.py:1082 _validate_indicator_result と core/plugin_contract.py:35 _check_number に検査が重複。

@@ -1,7 +1,8 @@
 ---
 id: flake
+title: 全スイート負荷時に対話停止テストが落ちる (タイミング依存)
 status: 実装待ち
-priority: 未設定
+priority: 低
 opened: null
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [flake]
 
-**状態**: 実装待ち / **優先**: 未設定
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 実装待ち、優先: 低、題名: 全スイート負荷時に対話停止テストが落ちる (タイミング依存) — 仕分け (2026-10-02、現物で成立を確認): 単独では安定 pass、負荷耐性のある待ち方への修正が未着手。 根拠: tests/test_service_app.py:2470 のテストが現存、負荷下タイミング依存の記述のみ。

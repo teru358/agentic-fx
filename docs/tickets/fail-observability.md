@@ -1,7 +1,8 @@
 ---
 id: fail-observability
+title: 改善 mission 失敗の死因が記録されない問題は是正済
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: 2026-08-30
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [fail-observability]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: 改善 mission 失敗の死因が記録されない問題は是正済 — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): 仕分け (2026-10-02): 主要部分は是正済とみられるが本文の一部を追跡できていない — 失敗 mission の reason を activity に記録 (18f5fc4)。worker の error キー伝搬は未確認。 根拠: 18f5fc4。improve_loop.py:2944 _finalize_failed_mission が activity に mission_failed と reason を書く。

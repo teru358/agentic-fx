@@ -1,7 +1,8 @@
 ---
 id: selftest-loop-no-cutoff
+title: self-test の無限修正ループに打ち切りが無い問題は是正済
 status: 設計待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-07
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [selftest-loop-no-cutoff]
 
-**状態**: 設計待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: self-test の無限修正ループに打ち切りが無い問題は是正済 — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): 仕分け (2026-10-02): 主要部分は是正済とみられるが本文の一部を追跡できていない — Tier A〜E を実装しレビュー 2 周済み、成功 backtest の定義も 6f01221 で確定。 根拠: e8aa28f (実装)、75b3663・49a6bd5・4c6e27e・8721b6a・f637fb6 (是正)、tools/improve_rpc_tools.py:84 _is_successful_backtest が Tier B を実装。

@@ -1,7 +1,8 @@
 ---
 id: test-isolation
-status: 実装待ち
-priority: 未設定
+title: 特定 4 ファイルの部分実行で loops の fixture が見えなくなる
+status: 設計待ち
+priority: 低
 opened: null
 closed: null
 related: []
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [test-isolation]
 
-**状態**: 実装待ち / **優先**: 未設定
+**状態**: 設計待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 設計待ち、優先: 低、題名: 特定 4 ファイルの部分実行で loops の fixture が見えなくなる — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): 全スイートでは発生せず、原因未特定のまま。 根拠: tests/loops/conftest.py:58,63 に loop_min/loop_full、4 ファイル部分実行での消失は再現手順が本文に無く未確認。部分実行で再現すれば原因が決まる。

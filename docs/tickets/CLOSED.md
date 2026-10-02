@@ -2,11 +2,36 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (1)
+## 2026-10 (26)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
+| [approval-payload-missing-gate-metrics](approval-payload-missing-gate-metrics.md) | 是正済 | 未設定 | 2026-10-02 | 承認 payload に gate の測定値が載らない問題は是正済 |
+| [backtest-base-interval](backtest-base-interval.md) | 是正済 | 未設定 | 2026-10-02 | バックテスト基底足の可変化 (1m/5m/15m) は完了 |
+| [backtest-rpc-timeout-15s](backtest-rpc-timeout-15s.md) | 是正済 | 未設定 | 2026-10-02 | backtest の RPC が 15 秒で必ず timeout する不具合 (是正済) |
+| [claude-builtin-tools-exposed](claude-builtin-tools-exposed.md) | 是正済 | 未設定 | 2026-10-02 | claude 子プロセスに組み込みツールが露出する問題は是正済 |
+| [eval-source-consolidation](eval-source-consolidation.md) | 是正済 | 未設定 | 2026-10-02 | 評価 source が 4 箇所に散る問題は是正済 |
+| [floor-path-skips-duplicate-metrics](floor-path-skips-duplicate-metrics.md) | 見送り | 未設定 | 2026-10-02 | フロア経路が重複 metrics を検査しない件 (現状維持で裁定) |
+| [improve-mission-zero-tool-calls-undetected](improve-mission-zero-tool-calls-undetected.md) | 是正済 | 未設定 | 2026-10-02 | improve mission のツール呼び出し 0 件が検知できない (是正済) |
+| [indicator-consumption-wiring](indicator-consumption-wiring.md) | 是正済 | 高 | 2026-10-02 | 戦略が配備済みの指標を受け取れず自前で計算している |
+| [indicator-first-seeding](indicator-first-seeding.md) | 是正済 | 未設定 | 2026-10-02 | 初期 indicator セットを人間が用意する方針 (配備済) |
+| [indicator-initial-set](indicator-initial-set.md) | 是正済 | 未設定 | 2026-10-02 | 標準指標の初期セット導入は完了 |
+| [ledger-never-populated-in-production](ledger-never-populated-in-production.md) | 是正済 | 未設定 | 2026-10-02 | 親の台帳が本番で空のまま trial_count が 0 固定 (是正済) |
+| [legacy-2026-08-22-a-1](legacy-2026-08-22-a-1.md) | 見送り | 未設定 | 2026-10-02 | (対象消滅) 起動時検査④の変異が未注入 |
+| [legacy-d-5](legacy-d-5.md) | 是正済 | 未設定 | 2026-10-02 | 旧 submit 回廊が strategy の gate を素通りする問題は是正済 |
+| [legacy-e2e-codex-sigtrap](legacy-e2e-codex-sigtrap.md) | 是正済 | 未設定 | 2026-10-02 | codex 子の tool 実行基盤が SIGTRAP 死する問題は是正済 |
+| [legacy-e2e-local-mcp](legacy-e2e-local-mcp.md) | 見送り | 未設定 | 2026-10-02 | codex + llama-swap で MCP tool が使えない (opencode に裁定) |
+| [mission-prompt-in-argv-readable-via-proc](mission-prompt-in-argv-readable-via-proc.md) | 是正済 | 未設定 | 2026-10-02 | mission の prompt が /proc/*/cmdline から読める (是正済) |
+| [mission46-selftest-loop](mission46-selftest-loop.md) | 是正済 | 未設定 | 2026-10-02 | self-test 修正ループで backtest に進めない問題は是正済 |
+| [news-source-route-omitted](news-source-route-omitted.md) | 是正済 | 未設定 | 2026-10-02 | 改善ループ経由のニュースソース追加経路の廃止 (反映済) |
 | [outage-stalled-on-broker-daily-rollover-gap](outage-stalled-on-broker-daily-rollover-gap.md) | 是正済 | 高 | 2026-10-02 | 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) |
+| [rpc-result-not-json-serializable](rpc-result-not-json-serializable.md) | 是正済 | 未設定 | 2026-10-02 | RPC 結果が直列化できず dispatcher が死ぬ不具合 (是正済) |
+| [scheduler-fires-on-startup](scheduler-fires-on-startup.md) | 是正済 | 未設定 | 2026-10-02 | 起動直後の trade 発火と空振り backtest の問題は是正済 |
+| [sl-gap-fill-ignores-gap](sl-gap-fill-ignores-gap.md) | 是正済 | 未設定 | 2026-10-02 | SL の足中スパイク約定が楽観 (裁定済、仕様に明記) |
+| [strategy-gate-data-error-crashes-commit](strategy-gate-data-error-crashes-commit.md) | 是正済 | 未設定 | 2026-10-02 | 戦略ゲートのデータ不備が commit を落とす問題は是正済 |
+| [trade-consume-before-record](trade-consume-before-record.md) | 是正済 | 未設定 | 2026-10-02 | 取引の消費が記録より先に起きる問題は是正済 |
+| [unprofitable-note-hygiene](unprofitable-note-hygiene.md) | 是正済 | 未設定 | 2026-10-02 | 不採算で終わった候補の note が成功語彙で残り再提出される (是正済) |
+| [unreviewed-bundle-2026-09-05](unreviewed-bundle-2026-09-05.md) | 是正済 | 未設定 | 2026-10-02 | 未レビュー束の 3 周レビュー (記録のみ) |
 
 ## 2026-09 (34)
 

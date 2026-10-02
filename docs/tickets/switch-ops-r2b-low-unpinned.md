@@ -1,7 +1,8 @@
 ---
 id: switch-ops-r2b-low-unpinned
+title: 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残
 status: 実装待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-20
 closed: null
 related: [switch-ops-hardening]
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [switch-ops-r2b-low-unpinned]
 
-**状態**: 実装待ち / **優先**: 未設定
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 実装待ち、優先: 低、題名: 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 — 仕分け (2026-10-02、現物で成立を確認): 変異に耐える pin 3 本と関数名の整理が未実施。 根拠: switch.py:1370 _version_dir_hashes_ok が現存。test_switch_ops_hardening.py:1179 の関数名 (ac16c6) も残る。

@@ -1,7 +1,8 @@
 ---
 id: flake-trade-claude-real-process
+title: 全スイート負荷時に claude 実プロセスのテストが稀に落ちる
 status: 実装待ち
-priority: 未設定
+priority: 低
 opened: 2026-09-20
 closed: null
 related: [switch-ops-hardening]
@@ -10,7 +11,7 @@ source_section: 未完了
 ---
 # [flake-trade-claude-real-process]
 
-**状態**: 実装待ち / **優先**: 未設定
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +20,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-02: 状態: 実装待ち、優先: 低、題名: 全スイート負荷時に claude 実プロセスのテストが稀に落ちる — 仕分け (2026-10-02、現物で成立を確認): 1 回だけ負荷下 fail (単独 0.78s で pass)、再発頻度を見る段階。 根拠: tests/runners/test_worker_runner.py:5197 の実プロセス起動テスト。全スイート負荷下で 1 回 fail、再発の記録は本文のみ。
