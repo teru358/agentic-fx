@@ -223,6 +223,7 @@ def test_resolved_is_passed_to_the_lazily_created_session(tmp_path, monkeypatch)
         def close(self):
             return None
         cpu_sec = 1.25
+        worker_cpu_sec = 1.25
 
     monkeypatch.setattr(strategy_adapter, "PluginSession", _Spy)
     sentinel = ResolvedIndicatorSet.empty(Path("/plugins"))
@@ -864,7 +865,7 @@ def test_parent_observed_cpu_wins_over_the_session_self_report_even_when_zero(
     assert src.cpu_sec == 0.0
 
 
-def test_session_self_reported_cpu_is_used_only_when_the_parent_observed_none(
+def test_cpu_is_none_when_only_the_session_self_report_exists(
         tmp_path, monkeypatch):
     cls, _ = _session_class_finishing_with(cpu_sec=5.0, worker_cpu_sec=None)
     monkeypatch.setattr(strategy_adapter, "PluginSession", cls)
@@ -872,7 +873,7 @@ def test_session_self_reported_cpu_is_used_only_when_the_parent_observed_none(
 
     src.close()
 
-    assert src.cpu_sec == 5.0
+    assert src.cpu_sec is None
 
 
 def test_close_that_raises_still_keeps_diagnostics_and_drops_the_session(

@@ -172,9 +172,8 @@ class PluginStrategyIntentSource:
         # 親が wait4 で回収した rusage を優先する。親が timeout で kill した
         # worker も回収時に累積 CPU が分かるので、活動記録では null にしない。
         # 回収できなかった (取得不能) ときだけ null のまま。
-        worker_cpu = getattr(session, "worker_cpu_sec", None)
-        self._cpu_sec = (worker_cpu if worker_cpu is not None
-                         else getattr(session, "cpu_sec", None))
+        # worker 自己申告の値へはフォールバックしない。
+        self._cpu_sec = getattr(session, "worker_cpu_sec", None)
         self.worker_returncode = getattr(session, "worker_returncode", None)
         self.worker_signal = getattr(session, "worker_signal", None)
 

@@ -4,6 +4,7 @@
 (統合裁定 R-i3 — plugin/ 配下の独立ファイルに置く)。"""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
     from agentic_fx.plugin.resolve import (
         InventoryBuildResult, ResolvedIndicatorSet,
     )
+
+_log = logging.getLogger("agentic_fx.plugin.strategy_gate")
 
 # timeframe 正規化の単一所有者 (codex 段階2/3 是正 1周目): `plugin/
 # approval.py` はこの辞書を再実装せず `strategy_gate._eval_timeframe` を
@@ -313,8 +316,15 @@ def evaluate_strategy_adoption_gate(
     # verdict に載らないため、この sink でしか呼び出し元へ届かない。
     def _notify(scope: str, pair: str, source: Any,
                 error: BaseException | None) -> None:
-        if evaluation_sink is not None:
+        if evaluation_sink is None:
+            return
+        # 通知の失敗は評価結果 (成功の verdict、または失敗の元の例外) を
+        # 隠してはならない。finally から呼ばれるので握ってログに残す。
+        try:
             evaluation_sink(scope, pair, source, error)
+        except Exception:
+            _log.warning("evaluation sink failed scope=%s pair=%s",
+                         scope, pair, exc_info=True)
 
     cpu_samples: list[tuple[str, str, float | None]] = []
     dataset = settings.backtest.dataset()

@@ -919,3 +919,86 @@ def test_failing_in_sample_evaluation_reaches_the_sink_and_still_raises(
     assert caught.value is boom
     assert [(c[0], c[1], c[3], c[4]) for c in calls] == [
         ("in_sample", "USDJPY", boom, True)]
+
+
+# ---- evaluation_sink 自身の失敗は評価結果も元の例外も隠さない ---------------
+
+def _raising_sink_gate(conn, sink_errors, **kw):
+    def _sink(scope, pair, source, error):
+        sink_errors.append((scope, pair))
+        raise OSError("disk full")
+    return evaluate_strategy_adoption_gate(
+        conn, name="brand_new_strategy", pairs=["USDJPY"],
+        timeframe="1h", resolved=_EMPTY, content_hash="h20",
+        now=datetime(2026, 8, 22), settings=_SETTINGS,
+        meta=_meta(name="brand_new_strategy", pairs=("USDJPY",),
+                   content_hash="h20"),
+        evaluation_sink=_sink, **kw)
+
+
+def test_sink_failure_does_not_hide_a_successful_verdict(
+        monkeypatch, conn, caplog):
+    _arrange_sink_gate(
+        monkeypatch,
+        in_sample=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2),
+        holdout=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2))
+    errors = []
+
+    verdict = _raising_sink_gate(conn, errors)
+
+    assert verdict.evaluable is True
+    assert errors == [("in_sample", "USDJPY"), ("holdout", "USDJPY")]
+    assert "evaluation sink failed" in caplog.text
+
+
+@pytest.mark.parametrize("scope", ["in_sample", "holdout"])
+def test_sink_failure_does_not_replace_the_original_evaluation_error(
+        monkeypatch, conn, caplog, scope):
+    boom = RuntimeError("evaluation broke")
+
+    def _raise(*a, **kw):
+        raise boom
+    ok = lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2)  # noqa: E731
+    _arrange_sink_gate(
+        monkeypatch,
+        in_sample=_raise if scope == "in_sample" else ok,
+        holdout=_raise if scope == "holdout" else ok)
+    errors = []
+
+    with pytest.raises(RuntimeError) as caught:
+        _raising_sink_gate(conn, errors)
+
+    assert caught.value is boom
+    assert errors[-1] == (scope, "USDJPY")
+    assert "evaluation sink failed" in caplog.text
+
+
+def test_sink_failure_of_a_successful_in_sample_does_not_stop_the_holdout(
+        monkeypatch, conn):
+    _arrange_sink_gate(
+        monkeypatch,
+        in_sample=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2),
+        holdout=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2))
+    errors = []
+
+    _raising_sink_gate(conn, errors)
+
+    assert [e[0] for e in errors] == ["in_sample", "holdout"]
+
+
+def test_sink_base_exception_is_not_swallowed(monkeypatch, conn):
+    _arrange_sink_gate(
+        monkeypatch,
+        in_sample=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2),
+        holdout=lambda *a, **kw: _metrics(trades=30, pf=1.5, avg_r=0.2))
+
+    def _sink(scope, pair, source, error):
+        raise KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        evaluate_strategy_adoption_gate(
+            conn, name="brand_new_strategy", pairs=["USDJPY"],
+            timeframe="1h", resolved=_EMPTY, content_hash="h20",
+            now=datetime(2026, 8, 22), settings=_SETTINGS,
+            meta=_meta(name="brand_new_strategy", pairs=("USDJPY",),
+                       content_hash="h20"),
+            evaluation_sink=_sink)

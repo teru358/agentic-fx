@@ -1395,6 +1395,8 @@ _CODE_TABLE = [
      "backtest_failed"),
     ("unheard_of_code", "backtest_failed", "候補を確認して修正してください",
      "backtest_failed"),
+    (None, "backtest_failed", "候補を確認して修正してください",
+     "backtest_failed"),
 ]
 
 
