@@ -428,14 +428,25 @@ class Commands:
             if v is None:
                 cells.append(f"{key}=-")
             elif type(v) is int or (type(v) is float and math.isfinite(v)):
-                cells.append(f"{key}={v}")
+                cells.append(f"{key}={approval_facts.num_text(v)}")
             else:
                 return f"{prefix}: {approval_facts.INVALID_FORMAT_TEXT}"
         return f"{prefix}: " + " ".join(cells)
 
+    _METRIC_KEYS = frozenset({"pf", "trades", "avg_r", "max_drawdown"})
+
+    @classmethod
+    def _is_single_metrics(cls, value: dict) -> bool:
+        """値の型で判別する: 全ての値が dict なら per-pair。そうでないとき
+        (dict でない値を含む) は、指標名のキーを持てば単一の metrics、
+        持たなければ不正な値を含む per-pair として扱う。"""
+        if all(isinstance(v, dict) for v in value.values()):
+            return False
+        return bool(cls._METRIC_KEYS & set(value))
+
     @classmethod
     def _metrics_lines(cls, prefix: str, value) -> list[str]:
-        """`value` は単一 pair の metrics dict (`"trades"` キーを持つ) か、
+        """`value` は単一 pair の metrics dict (値が dict でない) か、
         複数 pair の `{pair: metrics}` dict、あるいは None
         ([approval-payload-missing-gate-metrics] 是正前の旧 payload との
         後方互換)。単一 dict は 1 行、per-pair dict は pair ごとに 1 行。
@@ -445,7 +456,7 @@ class Commands:
         if not isinstance(value, dict):
             return [f"{display_text(prefix)}: "
                     f"{approval_facts.INVALID_FORMAT_TEXT}"]
-        if "trades" in value:
+        if cls._is_single_metrics(value):
             return [cls._metrics_line(prefix, value)]
         return [cls._metrics_line(f"{prefix} {display_text(pair)}", metrics)
                 for pair, metrics in value.items()]

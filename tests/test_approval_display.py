@@ -107,7 +107,7 @@ def test_new_format_shows_parent_section_before_claims_with_fixed_note(
     assert lines[parent + 1:claims] == [
         "backlog #101 (今回を含め attempts=1) status=selected",
         "過去の完了 run:",
-        "  run #8: 観測のみ (承認依頼なし)",
+        "  run #8: 結果なし (観測または失敗。区別できる記録がありません)",
         "  run #7: 報告として完了 (承認依頼なし)",
         "  run #6: 承認依頼 #33",
         "mission 内の backtest 1 件 (in_sample の受理分) / 分析 0 件:",
@@ -195,8 +195,8 @@ def test_legacy_human_payload_has_no_claims_section(tmp_path):
     assert CLAIMS_HEADING not in out
 
 
-@pytest.mark.parametrize("version", [None, 0, "1", 1.0, True, 2, [1]])
-def test_other_facts_versions_are_legacy_and_facts_are_not_backfilled(
+@pytest.mark.parametrize("version", [None, "1", 1.0, True, [1]])
+def test_non_integer_facts_versions_are_legacy_and_facts_are_not_backfilled(
         tmp_path, version):
     payload = _new_payload()
     if version is None:
@@ -205,8 +205,67 @@ def test_other_facts_versions_are_legacy_and_facts_are_not_backfilled(
         payload["facts_version"] = version
     out = _show(tmp_path, payload)
     assert approval_facts.LEGACY_LINE in out
+    assert approval_facts.UNKNOWN_VERSION_LINE not in out
     assert "backlog #" not in out and "run #8" not in out
     assert "自己申告: selection_rationale: RATIONALE" in out
+
+
+@pytest.mark.parametrize("version", [0, 2, 99])
+def test_other_integer_facts_versions_are_shown_as_unknown_not_legacy(
+        tmp_path, version):
+    out = _show(tmp_path, _new_payload(facts_version=version))
+    assert approval_facts.UNKNOWN_VERSION_LINE in out
+    assert approval_facts.LEGACY_LINE not in out
+    assert "backlog #" not in out and "run #8" not in out
+    assert "自己申告: selection_rationale: RATIONALE" in out
+
+
+def test_a_collection_failed_approval_is_told_apart_from_legacy(tmp_path):
+    payload = _new_payload(parent_facts=None,
+                           facts_error="collection_failed")
+    del payload["agent_claims"]
+    out = _show(tmp_path, payload)
+    assert approval_facts.COLLECTION_FAILED_LINE in out
+    assert approval_facts.LEGACY_LINE not in out
+    assert INVALID not in out
+    assert "backlog #" not in out and "run #8" not in out
+    assert "自己申告: selection_rationale: RATIONALE" in out
+
+
+def test_version_one_with_null_facts_and_no_error_mark_is_invalid(tmp_path):
+    out = _show(tmp_path, _new_payload(parent_facts=None))
+    assert f"{PARENT_HEADING} {INVALID}" in out.split("\n")
+    assert approval_facts.COLLECTION_FAILED_LINE not in out
+
+
+def test_prior_runs_without_a_result_are_not_called_observation_only(
+        tmp_path):
+    payload = _new_payload()
+    payload["parent_facts"]["prior_runs"] = [
+        {"run_id": 9, "result": None, "approval_id": None},
+        {"run_id": 8, "result": "observation", "approval_id": None},
+        {"run_id": 7, "result": "failed", "approval_id": None},
+        {"run_id": 6, "result": "interrupted", "approval_id": None},
+        {"run_id": 5, "result": "report_failed", "approval_id": None}]
+    lines = _show(tmp_path, payload).split("\n")
+    assert "  run #9: 結果なし (観測または失敗。区別できる記録がありません)" \
+        in lines
+    assert "  run #8: 観測のみ (承認依頼なし)" in lines
+    assert "  run #7: 失敗 (mission status=failed)" in lines
+    assert "  run #6: 失敗 (mission status=interrupted)" in lines
+    assert "  run #5: 報告の作成に失敗 (承認依頼なし)" in lines
+
+
+def test_numeric_cells_are_cut_at_the_field_limit(tmp_path):
+    huge = 10 ** 400
+    payload = _new_payload()
+    payload["in_sample"] = {"USDJPY": {"trades": huge, "pf": 1.0}}
+    payload["parent_facts"]["trials"][0]["trades"] = huge
+    out = _show(tmp_path, payload)
+    assert str(huge) not in out
+    suffix = approval_facts.TRUNCATION_SUFFIX
+    limit = approval_facts.FIELD_DISPLAY_LIMIT
+    assert f"trades={str(huge)[:limit]}{suffix}" in out
 
 
 # ---- 壊れた形式 ----

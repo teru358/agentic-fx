@@ -28,6 +28,14 @@ PARENT_HEADING = "--- 親が受理・記録した内容 ---"
 PARENT_INVALID_LINE = f"{PARENT_HEADING} {INVALID_FORMAT_TEXT}"
 LEGACY_LINE = (f"{PARENT_HEADING} 旧形式の承認依頼です。"
                "親の事実表は保存されていません。以下の自己申告は未検証です。")
+COLLECTION_FAILED_LINE = (
+    f"{PARENT_HEADING} 親の事実表の収集に失敗した承認依頼です "
+    "(理由は技術ログ)。親の事実表は保存されていません。"
+    "以下の自己申告は未検証です。")
+UNKNOWN_VERSION_LINE = (
+    f"{PARENT_HEADING} 未知の版の承認依頼です。"
+    "この版の親の事実表は読めません。以下の自己申告は未検証です。")
+FACTS_ERROR_COLLECTION_FAILED = "collection_failed"
 CLAIMS_HEADING = "--- agent の自己申告 (未検証。親は内容の真偽を確認していない) ---"
 CLAIMS_INVALID_LINE = f"  自己申告: {INVALID_FORMAT_TEXT}"
 PARENT_NOTE = ("注記: backtest の回数と同じ内容の再実行は agent が依頼したもので、"
@@ -41,7 +49,11 @@ _TRIAL_KEYS = frozenset({"n", "content_hash8", "same_hash_as_submitted",
 _PRIOR_RUN_KEYS = frozenset({"run_id", "result", "approval_id"})
 _BACKLOG_STATUSES = frozenset({"open", "observation", "note", "selected",
                                "done", "rejected"})
-_RESULTS = (None, "approval", "report")
+# improvement_runs.result が NULL の run を、mission の status と
+# report_state で分類した値。None は区別に使える情報が無い run
+# (mission が無い等) を表し、観測とも失敗とも断定しない。
+_RESULTS = (None, "approval", "report", "observation", "failed",
+            "interrupted", "report_failed")
 _HASH8_RE = re.compile(r"[0-9a-f]{8}")
 _AGENT_ORIGINS = frozenset({"agent", "research"})
 _NEWLINE_TABLE = {ord("\r"): " ", ord("\n"): " ", ord("\t"): " "}
@@ -123,7 +135,7 @@ def validate_parent_facts(facts: object) -> None:
         if not _is_int(run["run_id"], minimum=1):
             raise FactsError("prior_runs.run_id")
         result, approval_id = run["result"], run["approval_id"]
-        if not (result is None or result in ("approval", "report")):
+        if result not in _RESULTS:
             raise FactsError("prior_runs.result")
         if result == "approval":
             if not _is_int(approval_id, minimum=1):
@@ -156,6 +168,13 @@ def validate_parent_facts(facts: object) -> None:
 
 # ---------------------------------------------------------------- 保存側
 
+def collection_failed_payload() -> dict:
+    """親の事実表の収集に失敗したことを示す固定の印。旧形式 (印なし) とも
+    成功形とも区別して表示される。"""
+    return {"facts_version": FACTS_VERSION, "parent_facts": None,
+            "facts_error": FACTS_ERROR_COLLECTION_FAILED}
+
+
 def _trial_from_entry(n: int, entry: dict, submitted_hash: object) -> dict:
     summary = entry["result_summary"]
     metrics = summary["metrics"]
@@ -169,6 +188,23 @@ def _trial_from_entry(n: int, entry: dict, submitted_hash: object) -> dict:
         "avg_r": metrics.get("avg_r"),
         "max_drawdown": metrics.get("max_drawdown"),
     }
+
+
+def _run_result(result: object, mission_status: object,
+                report_state: object) -> object:
+    """`improvement_runs.result` が NULL の run を mission の status と
+    report_state で分ける。区別に使える行が無ければ None のまま。"""
+    if result is not None:
+        return result
+    if mission_status == "failed":
+        return "failed"
+    if mission_status == "interrupted":
+        return "interrupted"
+    if report_state == "failed":
+        return "report_failed"
+    if mission_status == "completed" and report_state == "none":
+        return "observation"
+    return None
 
 
 def build_facts_payload(conn: sqlite3.Connection, *, run_id: int,
@@ -192,26 +228,39 @@ def build_facts_payload(conn: sqlite3.Connection, *, run_id: int,
     prior_runs = []
     if backlog_id is not None:
         for row in conn.execute(
-                "SELECT id, result, approval_id FROM improvement_runs "
-                "WHERE backlog_id=? AND id<>? AND finished_at IS NOT NULL "
-                "ORDER BY finished_at DESC, id DESC LIMIT ?",
+                "SELECT r.id, r.result, r.approval_id, r.report_state, "
+                "m.status AS mission_status "
+                "FROM improvement_runs r "
+                "LEFT JOIN missions m ON m.id=r.mission_id "
+                "WHERE r.backlog_id=? AND r.id<>? "
+                "AND r.finished_at IS NOT NULL "
+                "ORDER BY r.finished_at DESC, r.id DESC LIMIT ?",
                 (backlog_id, run_id, MAX_PRIOR_RUNS)):
-            prior_runs.append({"run_id": row["id"], "result": row["result"],
-                               "approval_id": row["approval_id"]})
+            prior_runs.append({
+                "run_id": row["id"],
+                "result": _run_result(row["result"], row["mission_status"],
+                                      row["report_state"]),
+                "approval_id": row["approval_id"]})
     entries = list(accepted_entries)
-    backtests = [e for e in entries if e["kind"] == "run_backtest"]
     try:
-        trials = [_trial_from_entry(i, e, submitted_content_hash)
-                  for i, e in enumerate(backtests[:MAX_TRIALS], start=1)]
+        backtests = [e for e in entries if e["kind"] == "run_backtest"]
+        analysis_call_count = sum(
+            1 for e in entries if e["kind"] == "analyze_corr")
+        all_trials = [_trial_from_entry(i, e, submitted_content_hash)
+                      for i, e in enumerate(backtests, start=1)]
     except (KeyError, TypeError, AttributeError) as exc:
         raise FactsError(f"ledger entry shape: {exc!r}") from exc
+    # 提出と同一の行は件数上限に関わらず残し、残りの枠を受理順の先頭で埋める。
+    same = [t for t in all_trials if t["same_hash_as_submitted"]][:MAX_TRIALS]
+    others = [t for t in all_trials if not t["same_hash_as_submitted"]]
+    kept = same + others[:MAX_TRIALS - len(same)]
+    trials = sorted(kept, key=lambda t: t["n"])
     parent_facts = {
         "backlog": backlog,
         "prior_runs": prior_runs,
         "trials": trials,
-        "trials_omitted": max(len(backtests) - MAX_TRIALS, 0),
-        "analysis_call_count": sum(
-            1 for e in entries if e["kind"] == "analyze_corr"),
+        "trials_omitted": len(all_trials) - len(trials),
+        "analysis_call_count": analysis_call_count,
     }
     validate_parent_facts(parent_facts)
     claims: dict = {}
@@ -231,12 +280,23 @@ def build_facts_payload(conn: sqlite3.Connection, *, run_id: int,
 
 # ---------------------------------------------------------------- 表示側
 
-_RESULT_TEXT = {None: "観測のみ (承認依頼なし)",
-                "report": "報告として完了 (承認依頼なし)"}
+_RESULT_TEXT = {
+    None: "結果なし (観測または失敗。区別できる記録がありません)",
+    "observation": "観測のみ (承認依頼なし)",
+    "report": "報告として完了 (承認依頼なし)",
+    "failed": "失敗 (mission status=failed)",
+    "interrupted": "失敗 (mission status=interrupted)",
+    "report_failed": "報告の作成に失敗 (承認依頼なし)",
+}
 
 
-def _num(value: object) -> str:
-    return "-" if value is None else f"{value}"
+def num_text(value: object) -> str:
+    """数値セルの表示。None は `-`。文字列にして `display_text` の長さ上限を
+    通す (検証済みの型でも桁数が際限なく長い値を表示しない)。"""
+    return "-" if value is None else display_text(f"{value}")
+
+
+_num = num_text
 
 
 def _parent_lines(facts: dict) -> list[str]:
@@ -246,8 +306,8 @@ def _parent_lines(facts: dict) -> list[str]:
         lines.append("backlog: なし")
     else:
         lines.append(
-            f"backlog #{backlog['id']} (今回を含め attempts="
-            f"{backlog['attempts']}) status="
+            f"backlog #{num_text(backlog['id'])} (今回を含め attempts="
+            f"{num_text(backlog['attempts'])}) status="
             f"{display_text(backlog['status'])}")
     prior_runs = facts["prior_runs"]
     if not prior_runs:
@@ -256,22 +316,25 @@ def _parent_lines(facts: dict) -> list[str]:
         lines.append("過去の完了 run:")
         for run in prior_runs:
             if run["result"] == "approval":
-                text = f"承認依頼 #{run['approval_id']}"
+                text = f"承認依頼 #{num_text(run['approval_id'])}"
             else:
                 text = _RESULT_TEXT[run["result"]]
-            lines.append(f"  run #{run['run_id']}: {text}")
+            lines.append(f"  run #{num_text(run['run_id'])}: {text}")
     trials = facts["trials"]
     total = len(trials) + facts["trials_omitted"]
-    lines.append(f"mission 内の backtest {total} 件 (in_sample の受理分) / "
-                 f"分析 {facts['analysis_call_count']} 件:")
+    lines.append(f"mission 内の backtest {num_text(total)} 件 "
+                 f"(in_sample の受理分) / "
+                 f"分析 {num_text(facts['analysis_call_count'])} 件:")
     for trial in trials:
         same = "提出と同一" if trial["same_hash_as_submitted"] else "提出と別"
         lines.append(
-            f"  {trial['n']}. hash={display_text(trial['content_hash8'])} "
-            f"({same}) trades={trial['trades']} pf={_num(trial['pf'])} "
+            f"  {num_text(trial['n'])}. "
+            f"hash={display_text(trial['content_hash8'])} "
+            f"({same}) trades={num_text(trial['trades'])} "
+            f"pf={_num(trial['pf'])} "
             f"avg_r={_num(trial['avg_r'])} mdd={_num(trial['max_drawdown'])}")
     if facts["trials_omitted"]:
-        lines.append(f"  (ほか {facts['trials_omitted']} 件は省略)")
+        lines.append(f"  (ほか {num_text(facts['trials_omitted'])} 件は省略)")
     lines.append(PARENT_NOTE)
     return lines
 
@@ -300,6 +363,12 @@ def render_facts_lines(payload: dict) -> list[str]:
     version = payload.get("facts_version")
     if type(version) is int and version == FACTS_VERSION:
         facts = payload.get("parent_facts")
+        if (facts is None and payload.get("facts_error")
+                == FACTS_ERROR_COLLECTION_FAILED):
+            claims = {key: payload[key]
+                      for key in ("selection_rationale", "summary")
+                      if key in payload}
+            return [COLLECTION_FAILED_LINE] + _claims_lines(claims)
         try:
             validate_parent_facts(facts)
             lines = _parent_lines(facts)
@@ -309,7 +378,8 @@ def render_facts_lines(payload: dict) -> list[str]:
         if not isinstance(claims, dict):
             return lines + [CLAIMS_HEADING, CLAIMS_INVALID_LINE]
     else:
-        lines = [LEGACY_LINE]
+        lines = [UNKNOWN_VERSION_LINE
+                 if type(version) is int else LEGACY_LINE]
         claims = {key: payload[key]
                   for key in ("selection_rationale", "summary")
                   if key in payload}

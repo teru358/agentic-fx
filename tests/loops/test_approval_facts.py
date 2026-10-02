@@ -64,11 +64,21 @@ def _build(conn, run_id, backlog_id, entries, **kw):
         submitted_content_hash=SUBMITTED, **kw)
 
 
-def _finished_run(conn, backlog_id, result, approval_id=None, finished=True):
-    run_id = improve_runs_store.start(conn, backlog_id, NOW, commit=False)
+def _finished_run(conn, backlog_id, result, approval_id=None, finished=True,
+                  mission_status=None, report_state="none"):
+    mission_id = None
+    if mission_status is not None:
+        mission_id = missions_store.start(conn, "improve", "codex", "m", NOW,
+                                          commit=False)
+        if mission_status != "running":
+            missions_store.finish(conn, mission_id, mission_status, None, [],
+                                  NOW, commit=False)
+    run_id = improve_runs_store.start(conn, backlog_id, NOW,
+                                      mission_id=mission_id, commit=False)
     if finished:
         improve_runs_store.finish(conn, run_id, result=result, now=NOW,
-                                  approval_id=approval_id, commit=False)
+                                  approval_id=approval_id,
+                                  report_state=report_state, commit=False)
     conn.commit()
     return run_id
 
@@ -93,6 +103,29 @@ def test_more_than_twenty_trials_keep_first_twenty_and_count_omitted(
     facts = _build(conn, run_id, backlog_id, entries)["parent_facts"]
     assert [t["trades"] for t in facts["trials"]] == list(range(1, 21))
     assert facts["trials_omitted"] == 3
+
+
+def test_the_submitted_hash_row_is_kept_even_when_it_is_past_the_twentieth(
+        conn, clock):
+    _, run_id, backlog_id = _setup(conn, clock)
+    entries = [_bt("a" * 64, trades=i) for i in range(1, 24)]
+    entries[21] = _bt(SUBMITTED, trades=999)
+    facts = _build(conn, run_id, backlog_id, entries)["parent_facts"]
+    trials = facts["trials"]
+    assert len(trials) == 20
+    assert [t["n"] for t in trials] == sorted(t["n"] for t in trials)
+    assert [t["n"] for t in trials if t["same_hash_as_submitted"]] == [22]
+    assert [t["n"] for t in trials if not t["same_hash_as_submitted"]] == \
+        list(range(1, 20))
+    assert facts["trials_omitted"] == 3
+
+
+def test_more_than_twenty_submitted_hash_rows_are_cut_at_twenty(conn, clock):
+    _, run_id, backlog_id = _setup(conn, clock)
+    entries = [_bt(SUBMITTED, trades=i) for i in range(1, 26)]
+    facts = _build(conn, run_id, backlog_id, entries)["parent_facts"]
+    assert [t["n"] for t in facts["trials"]] == list(range(1, 21))
+    assert facts["trials_omitted"] == 5
 
 
 def test_analysis_call_count_counts_accepted_analyses_only(conn, clock):
@@ -158,6 +191,26 @@ def test_prior_runs_only_same_backlog_finished_other_runs(conn, clock):
         {"run_id": null_run, "result": None, "approval_id": None},
         {"run_id": report_run, "result": "report", "approval_id": None},
         {"run_id": approval_run, "result": "approval", "approval_id": 7}]
+
+
+def test_prior_runs_without_a_result_are_told_apart_by_mission_and_report_state(
+        conn, clock):
+    _, run_id, backlog_id = _setup(conn, clock)
+    observed = _finished_run(conn, backlog_id, None,
+                             mission_status="completed")
+    failed = _finished_run(conn, backlog_id, None, mission_status="failed")
+    interrupted = _finished_run(conn, backlog_id, None,
+                                mission_status="interrupted")
+    report_failed = _finished_run(conn, backlog_id, None,
+                                  mission_status="completed",
+                                  report_state="failed")
+    unknown = _finished_run(conn, backlog_id, None)
+    facts = _build(conn, run_id, backlog_id, [])["parent_facts"]
+    assert {r["run_id"]: r["result"] for r in facts["prior_runs"]} == {
+        observed: "observation", failed: "failed",
+        interrupted: "interrupted", report_failed: "report_failed",
+        unknown: None}
+    approval_facts.validate_parent_facts(facts)
 
 
 def test_prior_runs_exclude_current_run_even_when_finished(conn, clock):
@@ -365,7 +418,9 @@ def test_finalize_success_without_buildable_facts_still_creates_approval(
         slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
     payload = _stored_payload(conn)
-    assert "facts_version" not in payload and "parent_facts" not in payload
+    assert payload["facts_version"] == 1 and payload["parent_facts"] is None
+    assert payload["facts_error"] == "collection_failed"
+    assert "agent_claims" not in payload
     assert payload["name"] == "x"
 
 
@@ -497,7 +552,7 @@ def _persistable_bt(tmp_path, content_hash=SUBMITTED, pf=1.2):
 def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
         loop_min, conn, clock, tmp_path):
     mission_id, run_id, backlog_id = _setup(conn, clock)
-    prior = _finished_run(conn, backlog_id, None)
+    prior = _finished_run(conn, backlog_id, None, mission_status="completed")
     entries = [_persistable_bt(tmp_path),
                _persistable_bt(tmp_path, "ee" * 32, 0.8), _ac()]
     ctx = _ctx(tmp_path, mission_id, run_id, entries)
@@ -537,6 +592,47 @@ _FINALIZE_PAYLOAD = {"name": "x", "kind": "strategy",
                      "content_hash": SUBMITTED}
 
 
+def _finalize_with_ledger(loop_min, conn, clock, tmp_path, entries):
+    mission_id, run_id, backlog_id = _setup(conn, clock)
+    ctx = _ctx(tmp_path, mission_id, run_id, entries)
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None,
+        approval_payload={**_FINALIZE_PAYLOAD, "selection_rationale": "意図"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    return mission_id
+
+
+def _bt_with(tmp_path, **summary):
+    entry = _persistable_bt(tmp_path)
+    entry["result_summary"].update(summary)
+    return entry
+
+
+@pytest.mark.parametrize("make_entry", [
+    lambda tp: _bt_with(tp, metrics={"pf": 1.2}),
+    lambda tp: _bt_with(tp, metrics=None),
+    lambda tp: _bt_with(tp, metrics={"trades": "many"}),
+    lambda tp: _bt_with(tp, metrics={"trades": 3, "pf": float("nan")}),
+    lambda tp: _bt_with(tp, content_hash=12345),
+], ids=["no-trades", "metrics-none", "trades-str", "pf-nan", "hash-not-str"])
+def test_a_ledger_entry_shape_failure_creates_an_approval_marked_as_collection_failed(
+        loop_min, conn, clock, tmp_path, caplog, make_entry):
+    with caplog.at_level(logging.WARNING):
+        mission_id = _finalize_with_ledger(
+            loop_min, conn, clock, tmp_path, [make_entry(tmp_path)])
+    payload = _stored_payload(conn)
+    assert payload["facts_version"] == 1
+    assert payload["parent_facts"] is None
+    assert payload["facts_error"] == "collection_failed"
+    assert "agent_claims" not in payload
+    assert payload["selection_rationale"] == "意図"
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (mission_id,)).fetchone()["status"] == "completed"
+    assert any("approval facts not built" in r.getMessage()
+               for r in caplog.records if r.levelno == logging.WARNING)
+
+
 def _finalize_with_failing_collection(loop_min, conn, clock, tmp_path,
                                       monkeypatch, exc):
     mission_id, run_id, backlog_id = _setup(conn, clock)
@@ -555,36 +651,16 @@ def _finalize_with_failing_collection(loop_min, conn, clock, tmp_path,
 
 
 @pytest.mark.parametrize("exc", [
-    FactsError("shape"),
-    sqlite3.OperationalError("database is locked"),
-    sqlite3.DatabaseError("malformed"),
-    TypeError("shape"),
-    KeyError("shape"),
-    ValueError("shape"),
-])
-def test_a_continuable_collection_failure_still_creates_a_facts_less_approval(
-        loop_min, conn, clock, tmp_path, monkeypatch, caplog, exc):
-    with caplog.at_level(logging.WARNING):
-        mission_id = _finalize_with_failing_collection(
-            loop_min, conn, clock, tmp_path, monkeypatch, exc)
-    payload = _stored_payload(conn)
-    assert "facts_version" not in payload and "parent_facts" not in payload
-    assert payload["name"] == "x"
-    assert conn.execute("SELECT status FROM missions WHERE id=?",
-                        (mission_id,)).fetchone()["status"] == "completed"
-    assert any("approval facts not built" in r.getMessage()
-               for r in caplog.records if r.levelno == logging.WARNING)
-    # 収集の途中で書いた行は SAVEPOINT で戻る
-    assert conn.execute("SELECT COUNT(*) AS n FROM improvement_backlog "
-                        "WHERE idea='leaked'").fetchone()["n"] == 0
-
-
-@pytest.mark.parametrize("exc", [
+    sqlite3.OperationalError("disk I/O error"),
+    sqlite3.DatabaseError("database disk image is malformed"),
     sqlite3.InterfaceError("Cannot operate on a closed database."),
     sqlite3.ProgrammingError("Cannot operate on a closed database."),
     RuntimeError("storage failure"),
+    TypeError("unexpected"),
+    KeyError("unexpected"),
+    ValueError("unexpected"),
 ])
-def test_a_non_continuable_collection_failure_creates_no_approval_and_fails_the_mission(
+def test_any_collection_failure_other_than_a_facts_error_creates_no_approval_and_fails_the_mission(
         loop_min, conn, clock, tmp_path, monkeypatch, exc):
     mission_id = _finalize_with_failing_collection(
         loop_min, conn, clock, tmp_path, monkeypatch, exc)
