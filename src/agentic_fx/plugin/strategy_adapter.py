@@ -110,6 +110,13 @@ class PluginStrategyIntentSource:
         # 既定 (None) はこのアダプタ自身が lazy 生成し、自分で閉じる。
         self._owns_session = session is None
         self._cpu_sec: float | None = None
+        # 親が観測した worker の終了状態。session 参照を消す前に取り込む
+        # (close 応答の自己申告ではなく親の wait4 が出所)。
+        self.worker_returncode: int | None = None
+        self.worker_signal: int | None = None
+        # worker の起動を試みた時点で True。評価前の失敗 (pair 未宣言・履歴なし)
+        # と、worker に触れた後の失敗を呼び出し側が区別する。
+        self.evaluation_started = False
         # 観測性用カウンタ (brief 上書き節 6): 発火格子に乗り、かつ df が
         # 非空で実際に plugin を評価した回数。CLI はバックテスト完走後に
         # これが 0 なら「plugin が一度も発火しなかった」警告を出せる。
@@ -139,6 +146,7 @@ class PluginStrategyIntentSource:
         if df.empty:
             return None  # 発火格子に乗っていてもデータが無ければ評価しない
 
+        self.evaluation_started = True
         session = self._ensure_session()
         self.eval_count += 1
         result = session.call({"df": df, "params": self._meta.params})
@@ -150,9 +158,19 @@ class PluginStrategyIntentSource:
         if self._session is None:
             session = PluginSession(self._meta, settings=self._settings.plugin,
                                     resolved=self._resolved)
-            session.__enter__()
+            try:
+                session.__enter__()
+            except BaseException:
+                # 起動失敗でも親が見た死因は診断として残す。
+                self._take_diagnostics(session)
+                raise
             self._session = session
         return self._session
+
+    def _take_diagnostics(self, session: Any) -> None:
+        self._cpu_sec = getattr(session, "cpu_sec", None)
+        self.worker_returncode = getattr(session, "worker_returncode", None)
+        self.worker_signal = getattr(session, "worker_signal", None)
 
     def close(self) -> None:
         """自分が生成したセッションのみ閉じる (注入されたセッションは
@@ -160,9 +178,14 @@ class PluginStrategyIntentSource:
         に `cpu_sec` を取り込む (`PluginSession.cpu_sec` は close 後に確定
         する property)。"""
         if self._owns_session and self._session is not None:
-            self._session.close()
-            self._cpu_sec = getattr(self._session, "cpu_sec", None)
-            self._session = None
+            session = self._session
+            try:
+                session.close()
+            finally:
+                # close が例外で終わっても、session 参照を消す前に親観測を
+                # 取り込む。
+                self._take_diagnostics(session)
+                self._session = None
 
 
 def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,

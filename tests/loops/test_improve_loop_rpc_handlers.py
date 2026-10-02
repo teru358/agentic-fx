@@ -1114,3 +1114,267 @@ def test_run_backtest_handler_refuses_names_outside_the_plugin_name_grammar(
     json.dumps(out)
     # 検証は join より**前**。ディレクトリを一切読んでいないこと。
     assert seen == []
+
+
+# --- 公開分類と backtest_cpu activity ------------------------------------------
+
+_LEAK_MARKERS = ("STDERR-MARKER", "/home/secret/path", "pid=4242",
+                 "Traceback", "holdout-pf=9.99")
+
+
+class _ParentObservedSource:
+    """親が観測した診断を持つ intent source の fake。"""
+
+    def __init__(self, *, cpu=None, returncode=None, signal=None,
+                 started=True):
+        self.cpu_sec = cpu
+        self.worker_returncode = returncode
+        self.worker_signal = signal
+        self.evaluation_started = started
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def _install_source(monkeypatch, source):
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: source)
+
+
+def _raising_run_in_sample(monkeypatch, exc):
+    def _boom(*a, **kw):
+        raise exc
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample", _boom)
+
+
+def _handler(loop_min, tmp_path):
+    staging = tmp_path / "staging"
+    (staging / "myst").mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    return loop_min._build_rpc_handlers(
+        ledger, staging_dir=staging)["run_backtest"], ledger
+
+
+def _cpu_lines(tmp_path):
+    log = tmp_path / "activity.log"
+    if not log.exists():
+        return []
+    return [l for l in log.read_text().splitlines() if "backtest_cpu" in l]
+
+
+def _leaky(code):
+    from agentic_fx.plugin.sandbox import SandboxError
+    return SandboxError(" ".join(_LEAK_MARKERS), code=code)
+
+
+_CODE_TO_PUBLIC = [
+    ("cpu_limit", "worker_cpu_limit"),
+    ("timeout", "worker_timeout"),
+    ("crashed", "worker_crashed"),
+    ("plugin_error", "backtest_failed"),
+    ("protocol_error", "backtest_failed"),
+    ("backtest_failed", "backtest_failed"),
+]
+
+
+@pytest.mark.parametrize("code,public", _CODE_TO_PUBLIC)
+def test_sandbox_failure_maps_to_fixed_public_error_and_hint_only(
+        loop_min, tmp_path, monkeypatch, code, public):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=59.97, returncode=-9, signal=9))
+    _raising_run_in_sample(monkeypatch, _leaky(code))
+    handler, _ = _handler(loop_min, tmp_path)
+
+    result = handler({"name": "myst", "pair": "USDJPY"})
+
+    assert set(result) == {"started", "error", "hint"}
+    assert result["started"] is True
+    assert result["error"] == public
+    assert isinstance(result["hint"], str) and result["hint"]
+    dumped = json.dumps(result)
+    for marker in _LEAK_MARKERS + ("59.97", "-9"):
+        assert marker not in dumped
+
+
+def test_cpu_limit_hint_is_a_fixed_sentence_without_numbers(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(cpu=59.97, returncode=-9, signal=9))
+    _raising_run_in_sample(monkeypatch, _leaky("cpu_limit"))
+    handler, _ = _handler(loop_min, tmp_path)
+    first = handler({"name": "myst", "pair": "USDJPY"})
+    _install_source(monkeypatch, _ParentObservedSource(cpu=12.5, returncode=-9, signal=9))
+    second = handler({"name": "myst", "pair": "USDJPY"})
+    assert first == second
+    assert not any(ch.isdigit() for ch in first["hint"])
+
+
+def test_non_sandbox_failure_and_existing_branches_keep_their_classification(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource())
+    _raising_run_in_sample(monkeypatch, RuntimeError("STDERR-MARKER"))
+    handler, _ = _handler(loop_min, tmp_path)
+    assert handler({"name": "myst", "pair": "USDJPY"}) == {
+        "error": "backtest_failed"}
+    _raising_run_in_sample(monkeypatch, NoHistoryError("no 1m history"))
+    assert handler({"name": "myst", "pair": "USDJPY"})["error"] == (
+        "no_history_for_symbol")
+    _raising_run_in_sample(monkeypatch, ValueError(
+        "pair 'X' is not in plugin 'myst's declared pairs ('USDJPY',)"))
+    assert handler({"name": "myst", "pair": "USDJPY"})["error"] == (
+        "pair_not_declared_by_plugin")
+
+
+def test_public_error_is_identical_across_response_ledger_and_counter(
+        loop_min, tmp_path, monkeypatch):
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    from agentic_fx.tools.registry import ToolRegistry
+
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(cpu=59.97, returncode=-9, signal=9))
+    _raising_run_in_sample(monkeypatch, _leaky("cpu_limit"))
+    staging = tmp_path / "staging"
+    (staging / "myst").mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging)
+    budget = ImproveToolBudgetSettings()
+    counters = MissionToolCounters(budget=budget)
+    defs = build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"],
+        staging_dir=None, counters=counters, budget=budget)
+    registry = ToolRegistry(on_result=counters.record_tool_result)
+    registry.register_all(defs)
+
+    raw = registry.execute("run_backtest", {"name": "myst", "pair": "USDJPY"},
+                           allowed=registry.names())
+    transcript_result = json.loads(raw)
+    ledger.freeze()
+    entry = ledger.entries()[0]
+
+    assert transcript_result["error"] == "worker_cpu_limit"
+    assert entry["result_summary"]["error"] == "worker_cpu_limit"
+    assert counters.recoverable_refusal_streak[
+        ("run_backtest", "tool_error:worker_cpu_limit")] == 1
+    for sink in (raw, json.dumps(entry, default=str)):
+        for marker in _LEAK_MARKERS:
+            assert marker not in sink
+
+
+def test_timeout_crash_and_cpu_limit_have_separate_error_streaks(
+        loop_min, tmp_path, monkeypatch):
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    counters = MissionToolCounters(budget=ImproveToolBudgetSettings())
+    for public in ("worker_cpu_limit", "worker_timeout", "worker_crashed"):
+        counters.record_tool_result("run_backtest", False, public)
+    keys = {k for k in counters.recoverable_refusal_streak
+            if k[0] == "run_backtest"}
+    assert keys == {("run_backtest", f"tool_error:{p}") for p in (
+        "worker_cpu_limit", "worker_timeout", "worker_crashed")}
+
+
+_OUTCOME_CASES = [
+    ("ok", None, "ok"),
+    ("plugin_error", "plugin_error", "plugin_error"),
+    ("cpu_limit", "cpu_limit", "cpu_limit"),
+    ("timeout", "timeout", "timeout"),
+    ("crashed", "crashed", "crashed"),
+    ("backtest_failed", "general", "backtest_failed"),
+]
+
+
+def _arrange_outcome(monkeypatch, kind):
+    if kind is None:
+        _patch_run_in_sample(monkeypatch)
+    elif kind == "general":
+        _raising_run_in_sample(monkeypatch, RuntimeError("STDERR-MARKER"))
+    else:
+        _raising_run_in_sample(monkeypatch, _leaky(kind))
+
+
+@pytest.mark.parametrize("label,kind,result", _OUTCOME_CASES)
+def test_every_started_outcome_writes_exactly_one_backtest_cpu_line(
+        loop_min, tmp_path, monkeypatch, label, kind, result):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=1.5, returncode=-9, signal=9))
+    _arrange_outcome(monkeypatch, kind)
+    handler, _ = _handler(loop_min, tmp_path)
+
+    handler({"name": "myst", "pair": "USDJPY"})
+
+    lines = _cpu_lines(tmp_path)
+    assert len(lines) == 1, lines
+    assert "cpu_source=parent_wait4" in lines[0]
+    assert f"result={result}" in lines[0]
+    assert "cpu_sec=1.5" in lines[0]
+    assert "returncode=-9" in lines[0] and "signal=9" in lines[0]
+    assert "plugin=myst scope=in_sample pair=USDJPY deps=0" in lines[0]
+    for marker in _LEAK_MARKERS:
+        assert marker not in lines[0]
+
+
+def test_missing_diagnostics_are_written_as_null(loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource())
+    _raising_run_in_sample(monkeypatch, _leaky("crashed"))
+    handler, _ = _handler(loop_min, tmp_path)
+    handler({"name": "myst", "pair": "USDJPY"})
+    (line,) = _cpu_lines(tmp_path)
+    assert "cpu_sec=null" in line and "returncode=null" in line
+    assert "signal=null" in line
+
+
+def test_failures_before_started_write_no_backtest_cpu_line(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(started=False))
+    handler, _ = _handler(loop_min, tmp_path)
+    _raising_run_in_sample(monkeypatch, NoHistoryError("no 1m history"))
+    handler({"name": "myst", "pair": "USDJPY"})
+    _raising_run_in_sample(monkeypatch, ValueError(
+        "pair 'X' is not in plugin 'myst's declared pairs ('USDJPY',)"))
+    handler({"name": "myst", "pair": "USDJPY"})
+    # worker に触れる前に起きた一般の失敗 (評価期間が空など) も書かない。
+    _raising_run_in_sample(monkeypatch, ValueError(
+        "in-sample period is empty (oldest bar >= holdout boundary)"))
+    assert handler({"name": "myst", "pair": "USDJPY"}) == {
+        "error": "backtest_failed"}
+    assert handler({"name": "bad name!", "pair": "USDJPY"})["started"] is False
+    assert _cpu_lines(tmp_path) == []
+
+
+@pytest.mark.parametrize("label,kind,result", _OUTCOME_CASES)
+def test_activity_writer_failure_never_changes_the_public_result(
+        loop_min, tmp_path, monkeypatch, label, kind, result):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=1.5, returncode=-9, signal=9))
+    _arrange_outcome(monkeypatch, kind)
+    handler, _ = _handler(loop_min, tmp_path)
+    expected = handler({"name": "myst", "pair": "USDJPY"})
+    (tmp_path / "activity.log").unlink(missing_ok=True)
+
+    real_write = loop_min._activity.write
+
+    def _write(category, event, *a, **kw):
+        if event == "backtest_cpu":
+            raise OSError("disk full")
+        return real_write(category, event, *a, **kw)
+    monkeypatch.setattr(loop_min._activity, "write", _write)
+
+    actual = handler({"name": "myst", "pair": "USDJPY"})
+
+    def _norm(r):
+        return {k: v for k, v in dict(r).items()
+                if k not in ("archive_tmp", "artifact_hash")}
+    assert _norm(actual) == _norm(expected)
+    assert _cpu_lines(tmp_path) == []

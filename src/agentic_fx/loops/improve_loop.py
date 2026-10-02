@@ -16,7 +16,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import json
 import jsonschema
@@ -73,6 +73,34 @@ if TYPE_CHECKING:
     from agentic_fx.store.rag import Rag  # precheck 2026-08-22 wave2: T10-B10
 
 _log = logging.getLogger("agentic_fx.improve_loop")
+
+# worker の死因 (SandboxError.code) から agent へ返す公開 error と固定 hint。
+# agent に見える面へ出してよいのはこの表の文言だけで、CPU 値・設定値・
+# returncode/signal・stderr は含めない。
+_SANDBOX_CODE_TO_PUBLIC: dict[str, tuple[str, str]] = {
+    "cpu_limit": (
+        "worker_cpu_limit",
+        "CPU 上限に達しました。より粗い timeframe、依存や計算の削減を試すか、"
+        "人間に報告してください"),
+    "timeout": (
+        "worker_timeout",
+        "評価が時間内に完了しません。計算を減らすか、人間に報告してください"),
+    "crashed": (
+        "worker_crashed",
+        "worker が異常終了しました。原因は推測せず、人間に報告してください"),
+    "backtest_failed": (
+        "backtest_failed",
+        "候補を確認して修正してください。繰り返すなら人間に報告してください"),
+}
+_SANDBOX_CODE_TO_PUBLIC["plugin_error"] = _SANDBOX_CODE_TO_PUBLIC["backtest_failed"]
+_SANDBOX_CODE_TO_PUBLIC["protocol_error"] = _SANDBOX_CODE_TO_PUBLIC["backtest_failed"]
+
+# activity の `result` (人間向け) の固定値。protocol_error は plugin_error に寄せる。
+_SANDBOX_CODE_TO_RESULT = {
+    "cpu_limit": "cpu_limit", "timeout": "timeout", "crashed": "crashed",
+    "plugin_error": "plugin_error", "protocol_error": "plugin_error",
+    "backtest_failed": "backtest_failed",
+}
 
 
 
@@ -959,6 +987,33 @@ class ImproveLoop:
         # (第 2 相フィルタ済み — snapshot 材料の第 1 相 `metas` とは別)。
         return staging_dir, source_snapshot_root, inventory_result
 
+    def _write_backtest_cpu(self, outcome: str | None, intent_source: Any, *,
+                            mission: str, plugin: str, pair: str,
+                            deps: int) -> None:
+        """started 後の backtest ごとに `backtest_cpu` をちょうど 1 行書く。
+        評価前の失敗 (履歴なし・pair 未宣言) は worker に触れていないので
+        書かない。書き込みの失敗は本来の結果を変えない。"""
+        if outcome is None or intent_source is None:
+            return
+        if outcome == "backtest_failed" and not getattr(
+                intent_source, "evaluation_started", False):
+            return
+
+        def _fmt(value: Any) -> str:
+            return "null" if value is None else str(value)
+
+        try:
+            self._activity.write(
+                Category.IMPROVE, "backtest_cpu",
+                f"mission={mission} plugin={plugin} scope=in_sample "
+                f"pair={pair} deps={deps} "
+                f"cpu_sec={_fmt(getattr(intent_source, 'cpu_sec', None))} "
+                f"cpu_source=parent_wait4 result={outcome} "
+                f"returncode={_fmt(getattr(intent_source, 'worker_returncode', None))} "
+                f"signal={_fmt(getattr(intent_source, 'worker_signal', None))}")
+        except Exception:
+            _log.warning("backtest_cpu activity write failed", exc_info=True)
+
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
                             staging_dir: Path,
                             inventory: "InventoryBuildResult | None" = None,
@@ -1058,6 +1113,11 @@ class ImproveLoop:
                         m.name for m in inv.inventory.metas
                         if m.kind == "indicator" and m.outputs is not None),
                 }
+            # backtest_cpu は started 後の全 outcome で outer finally から
+            # ちょうど 1 行書く。成功の書き込み失敗が backtest_failed に
+            # 化けないよう、書き込みは本来の結果と切り離す。
+            outcome: str | None = None
+            intent_source = None
             try:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
@@ -1076,24 +1136,21 @@ class ImproveLoop:
                         content_hash=meta.content_hash, kind="strategy",
                         now=self._clock.now(), record_fn=captured.append)
                 finally:
+                    # 親観測の診断は close が取り込む。`build_intent_source`
+                    # を `close` だけの SimpleNamespace で差し替える既存
+                    # テストがあるので、診断は getattr で読む。
                     intent_source.close()
-                    # [indicator-consumption-wiring] T5b Step 5-6c: `getattr`
-                    # 既定 `None` — 既存テストの多くが `strategy_adapter.
-                    # build_intent_source` を `cpu_sec` を持たない
-                    # `SimpleNamespace(close=lambda: None)` で差し替えている
-                    # (`tests/loops/test_improve_loop_rpc_handlers.py::
-                    # _patch_strategy_lookup`)。直接属性アクセスだと
-                    # それらが軒並み `AttributeError` で退行する (実測で
-                    # 確認) — `activity_extra` と同じく本経路は活動ログの
-                    # 補助情報なので欠測は `null` として扱う。
-                    cpu_sec = getattr(intent_source, "cpu_sec", None)
                     conn.close()
-                self._activity.write(
-                    Category.IMPROVE, "backtest_cpu",
-                    f"mission={staging_dir.name} plugin={args['name']} "
-                    f"scope=in_sample pair={args['pair']} "
-                    f"deps={len(meta.indicators)} "
-                    f"cpu_sec={'null' if cpu_sec is None else cpu_sec}")
+                outcome = "ok"
+            except SandboxError as exc:
+                # 公開分類は例外の code だけから決める。例外文字列・stderr・
+                # returncode は agent に出さない。
+                outcome = _SANDBOX_CODE_TO_RESULT.get(exc.code, "backtest_failed")
+                _log.warning("run_backtest_handler sandbox failure for %r "
+                             "code=%s", args.get("name"), exc.code)
+                public_error, hint = _SANDBOX_CODE_TO_PUBLIC.get(
+                    exc.code, _SANDBOX_CODE_TO_PUBLIC["backtest_failed"])
+                return {"started": True, "error": public_error, "hint": hint}
             except ValueError as exc:
                 message = str(exc)
                 if isinstance(exc, holdout.NoHistoryError):
@@ -1138,13 +1195,20 @@ class ImproveLoop:
                         "hint": ("Request one of the plugin's declared pairs: "
                                  f"{declared}."),
                     }
+                outcome = "backtest_failed"
                 _log.exception("run_backtest_handler failed for %r",
                                args.get("name"))
                 return {"error": "backtest_failed"}
             except Exception:
+                outcome = "backtest_failed"
                 _log.exception("run_backtest_handler failed for %r",
                                args.get("name"))
                 return {"error": "backtest_failed"}
+            finally:
+                self._write_backtest_cpu(
+                    outcome, intent_source, mission=staging_dir.name,
+                    plugin=args["name"], pair=args["pair"],
+                    deps=len(meta.indicators))
             save_kwargs = captured[0]
             # [profitability-floor] T2 Step 2-1 (2026-09-13、設計書 §6
             # T2、codex I7): `submission_blocked` は親 handler (ここ) の
@@ -2600,7 +2664,8 @@ class ImproveLoop:
                             f"mission={ctx.mission_id} "
                             f"plugin={artifact['name']} scope={scope} "
                             f"pair={pair} deps={deps} "
-                            f"cpu_sec={'null' if cpu_sec is None else cpu_sec}")
+                            f"cpu_sec={'null' if cpu_sec is None else cpu_sec} "
+                            f"cpu_source=parent_wait4")
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,

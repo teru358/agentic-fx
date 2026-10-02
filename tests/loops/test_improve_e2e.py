@@ -2307,3 +2307,25 @@ def test_commit_gate_passes_ctx_inventory_identity_to_the_strategy_gate(tmp_path
 
     spy.assert_called_once()
     assert spy.call_args.kwargs["inventory"] is ctx.inventory
+
+
+def test_commit_gate_backtest_cpu_line_names_its_cpu_source(tmp_path):
+    """旧行 (worker 自己申告) と新行 (親 wait4) を同列比較させないため、
+    commit gate が書く行にも出所を明記する。"""
+    from tests.fixtures import indicator_wiring as fx
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    hashes = fx.deploy_approved(conn, plugins_root, ["rsi"], now=fx.NOW)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = fx.write_rsi_pullback(ctx.staging_dir, pins={"rsi": hashes["rsi"]})
+    (cand / "test_plugin.py").write_text(_MIN3_TEST_PY)
+    loop.commit(mission=_mission(ctx), ctx=ctx,
+                result=_completed_result(
+                    _plugin_artifact("rsi_pullback", kind="strategy")),
+                now=fx.NOW)
+    lines = [l for l in _activity_text(activity).splitlines()
+             if "backtest_cpu" in l and f"mission={ctx.mission_id}" in l]
+    assert lines
+    assert all("cpu_source=parent_wait4" in l for l in lines)

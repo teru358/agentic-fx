@@ -705,3 +705,59 @@ def test_no_caller_calls_build_intent_source_without_resolved():
     assert offenders == [], (
         "build_intent_source(...) を resolved= 無しで呼んでいる箇所: "
         f"{offenders}")
+
+
+# --- 親観測の死因診断を close で取り込む ---------------------------------------
+
+def test_close_takes_parent_observed_worker_diagnostics_before_dropping_session(
+        tmp_path, monkeypatch):
+    """session 参照を消す前に親観測の CPU/returncode/signal を取り込む。
+    close 応答由来の値ではなく session の親観測属性が採用される。"""
+    class _Dying:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.cpu_sec = None
+            self.worker_returncode = None
+            self.worker_signal = None
+        def __enter__(self):
+            return self
+        def call(self, payload):
+            return dict(_HOLD_RESULT)
+        def close(self):
+            self.cpu_sec = 59.97
+            self.worker_returncode = -9
+            self.worker_signal = 9
+            self.worker_cpu_sec = 59.97
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _Dying)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    assert src.evaluation_started is False
+    src(_bar(H))
+    assert src.evaluation_started is True
+    src.close()
+    assert (src.cpu_sec, src.worker_returncode, src.worker_signal) == (59.97, -9, 9)
+
+
+def test_session_start_failure_keeps_diagnostics_and_marks_evaluation_started(
+        tmp_path, monkeypatch):
+    class _FailsToStart:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.cpu_sec = None
+            self.worker_returncode = 1
+            self.worker_signal = None
+        def __enter__(self):
+            raise SandboxError("startup failed", code="crashed")
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _FailsToStart)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    with pytest.raises(SandboxError):
+        src(_bar(H))
+    assert src.evaluation_started is True
+    assert src.worker_returncode == 1
