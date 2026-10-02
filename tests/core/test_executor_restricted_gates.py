@@ -63,3 +63,36 @@ def test_cancel_intent_is_executed_when_restricted(tmp_path):
 
     assert out["result"] == "cancelled"
     assert orders.get(ex.conn, oid)["status"] == "cancelled"
+
+
+def test_while_an_observe_failure_is_marked_open_is_rejected_and_close_is_executed(
+        tmp_path, monkeypatch):
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from agentic_fx.datafeed.outage import EMPTY_REPORT, OutageStateMachine
+
+    ex = _make_executor(tmp_path)
+    machine = OutageStateMachine(
+        ex.conn, hard_keys=frozenset({("USDJPY", "1m")}),
+        interval_widths={"1m": timedelta(minutes=1)}, grace=timedelta(seconds=30),
+        storage_source="mt5-live")
+    ex.state_fn = lambda: machine.state
+
+    def crash(**kwargs):
+        raise sqlite3.OperationalError("injected crash")
+
+    monkeypatch.setattr(machine, "_save_state", crash)
+    with pytest.raises(sqlite3.OperationalError):
+        machine.observe(datetime(2026, 9, 30, 10, 0, tzinfo=timezone.utc), EMPTY_REPORT)
+
+    intent = _open_intent(pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+    assert out["result"] == "rejected"
+    assert out["reasons"] == ["data state degraded (fail closed)"]
+
+    oid = _insert_open_order(ex.conn, "USDJPY")["id"]
+    assert ex.handle_intent(_close_intent(oid), mid)["result"] == "closed"

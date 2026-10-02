@@ -85,6 +85,24 @@ def test_status_shows_degraded_data_line(tmp_path):
     assert "未処理建玉" in out
 
 
+def test_status_says_when_the_state_could_not_be_saved_and_new_risk_is_stopped(
+        tmp_path, monkeypatch):
+    import sqlite3
+    _, _, _, cmds, outage = _commands_with_outage(tmp_path)
+
+    def crash(**kwargs):
+        raise sqlite3.OperationalError("injected crash")
+
+    monkeypatch.setattr(outage, "_save_state", crash)
+    with pytest.raises(sqlite3.OperationalError):
+        _degrade(outage, NOW)
+
+    out = cmds.dispatch("status")
+    assert "data: ready (epoch 0)" in out
+    assert "状態の保存に失敗中" in out
+    assert "新規リスクは停止" in out
+
+
 def _stall(conn, outage, now):
     """1m の確定足が 10 分前で止まった状態の観測 (建玉なし → restricted になる)。"""
     from agentic_fx.core.contracts import Bar

@@ -369,8 +369,12 @@ class Commands:
         now = self.clock.now()
         info = self.outage.gap_summary(now, conn=self.conn)
         state = info["state"]
+        # 状態の保存に失敗した直後は DB の行 (ready 等) が古い。実際は新規リスクが
+        # 止まっているので、行の値だけを見せて安心させない。
+        failed_note = (" [状態の保存に失敗中: 新規リスクは停止、資金保護は継続]"
+                       if info.get("observe_failed") else "")
         if state == "ready" and info["resume_requested_at"] is None:
-            return f"data: ready (epoch {info['epoch']})"
+            return f"data: ready (epoch {info['epoch']}){failed_note}"
         gap_texts = [f"{pair}/{interval} since {gs}"
                     for (pair, interval), gs in sorted(info["gap_starts"].items())]
         gap_text = "; ".join(gap_texts) if gap_texts else "-"
@@ -390,7 +394,7 @@ class Commands:
                 since_text += f", restricted from {info['restricted_since']}"
         return (f"data: {state.upper()} (epoch {info['epoch']}, "
                 f"{since_text}, gap: {gap_text}) — "
-                f"{unprocessed_text}{resume_text}")
+                f"{unprocessed_text}{resume_text}{failed_note}")
 
     def _data_resume(self, args: list[str]) -> str:
         if self.outage is None:

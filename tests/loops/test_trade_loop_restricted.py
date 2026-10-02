@@ -94,3 +94,52 @@ def test_close_and_cancel_signals_are_consumed_and_executed_when_restricted(tmp_
     assert _signal_row(conn, sid_cancel)["status"] == "consumed"
     assert orders.get(conn, open_oid)["status"] == "closed"
     assert orders.get(conn, pending_oid)["status"] == "cancelled"
+
+
+def _run_with_clock_jump(loop, runner, jump_to):
+    """mission の実行中 (claim の後・consume の前) に時刻が進む状況を作る。"""
+    original = runner.run
+
+    def run(mission):
+        result = original(mission)
+        _set_now(loop, jump_to)
+        return result
+
+    runner.run = run
+
+
+def test_claimed_open_signal_that_went_stale_during_the_mission_is_abandoned_not_requeued(
+        tmp_path):
+    conn, loop, runner, _ = _loop(
+        tmp_path, [MissionResult("completed", OPEN_RESULT, [])])
+    loop.executor.state_fn = lambda: "restricted"
+    sid = _add_signal(conn)
+    _run_with_clock_jump(loop, runner, NOW + timedelta(hours=5))
+
+    loop.run_once("signal")
+
+    assert _signal_row(conn, sid) == {"status": "abandoned", "requeue_count": 0}
+
+
+def test_claimed_open_signal_that_is_still_fresh_is_requeued_when_restricted(tmp_path):
+    conn, loop, runner, _ = _loop(
+        tmp_path, [MissionResult("completed", OPEN_RESULT, [])])
+    loop.executor.state_fn = lambda: "restricted"
+    sid = _add_signal(conn)
+    _run_with_clock_jump(loop, runner, NOW + timedelta(minutes=5))
+
+    loop.run_once("signal")
+
+    assert _signal_row(conn, sid) == {"status": "pending", "requeue_count": 1}
+
+
+def test_a_failed_mission_still_requeues_its_claimed_signal_even_when_it_has_gone_stale(
+        tmp_path):
+    # 実行失敗 (state と無関係) の requeue 経路は従来どおり
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult("timeout", None, [])])
+    sid = _add_signal(conn)
+    _run_with_clock_jump(loop, runner, NOW + timedelta(hours=5))
+
+    loop.run_once("signal")
+
+    assert _signal_row(conn, sid) == {"status": "pending", "requeue_count": 1}

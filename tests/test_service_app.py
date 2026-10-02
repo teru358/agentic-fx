@@ -3120,6 +3120,88 @@ def test_scheduler_tick_runs_when_ingest_prepare_raises(tmp_path, caplog):
     assert app.outage.state == "degraded"
 
 
+def _observe_that_cannot_save(app, monkeypatch):
+    """prepare は成功するが、observe の state 保存だけが失敗する ingest にする。"""
+    import sqlite3
+    from agentic_fx.datafeed.outage import EMPTY_REPORT
+
+    app.ingest = MagicMock()
+    app.ingest.prepare.return_value = (None, EMPTY_REPORT)
+    state = {"broken": True}
+    original = app.outage._save_state
+
+    def save(**kwargs):
+        if state["broken"]:
+            raise sqlite3.OperationalError("injected crash")
+        return original(**kwargs)
+
+    monkeypatch.setattr(app.outage, "_save_state", save)
+    return state
+
+
+def _spy_new_risk_paths(app):
+    from agentic_fx.core.contracts import FixedClock  # noqa: F401
+    calls = {"mission": 0, "fills": 0, "exits": 0, "maintenance": 0}
+
+    def mission(reason, decision_bars=None):
+        calls["mission"] += 1
+        return MagicMock(accepted=False)
+
+    def fills(now):
+        calls["fills"] += 1
+        return set()
+
+    real_exits = app.scheduler._process_exits
+
+    def exits(now, filled_ids):
+        calls["exits"] += 1
+        return real_exits(now, filled_ids)
+
+    def maintenance(now):
+        calls["maintenance"] += 1
+
+    app.scheduler.on_trade_mission = mission
+    app.scheduler._process_limit_fills = fills
+    app.scheduler._process_exits = exits
+    app.scheduler.on_signal_maintenance = maintenance
+    app.scheduler.signal_due_fn = lambda now: True
+    return calls
+
+
+def test_a_tick_whose_observe_failed_stops_new_risk_but_keeps_protection(
+        tmp_path, monkeypatch):
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    _observe_that_cannot_save(app, monkeypatch)
+    calls = _spy_new_risk_paths(app)
+    app.activity.write = MagicMock()
+
+    _scheduler_tick_once(app)
+
+    assert app.outage.state == "degraded"
+    assert calls == {"mission": 0, "fills": 0, "exits": 1, "maintenance": 0}
+    events = [c.args[1] for c in app.activity.write.call_args_list]
+    assert events.count("outage_observe_failed") == 1
+
+
+def test_the_next_tick_whose_observe_succeeds_returns_to_the_normal_decision(
+        tmp_path, monkeypatch):
+    from agentic_fx.service import _scheduler_tick_once
+
+    app = _seam_app(tmp_path, FakeRunner([]))
+    broken = _observe_that_cannot_save(app, monkeypatch)
+    calls = _spy_new_risk_paths(app)
+    _scheduler_tick_once(app)
+    assert calls["mission"] == 0
+
+    broken["broken"] = False
+    _scheduler_tick_once(app)
+
+    assert app.outage.state == "ready"
+    assert calls["mission"] == 1 and calls["maintenance"] == 1 and calls["fills"] == 1
+
+
 def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):
     """tick 中の close 通知は tick 復帰後かつ core_lock 解放後に送る。"""
     from agentic_fx.service import _scheduler_tick_once

@@ -215,6 +215,20 @@ def test_requeue_rejects_non_claimed_status(tmp_path):
         signals.requeue(conn, sid, now=NOW, max_requeue=2)
 
 
+def test_abandon_claimed_ends_the_signal_without_spending_a_requeue(tmp_path):
+    conn = _conn(tmp_path)
+    sid = _add(conn, bar_ts=NOW)
+    signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW, freshness_bars=None)
+
+    signals.abandon_claimed(conn, sid)
+
+    row = conn.execute("SELECT status, requeue_count, claimed_by_mission_id, claimed_at "
+                       "FROM signals WHERE id=?", (sid,)).fetchone()
+    assert tuple(row) == ("abandoned", 0, None, None)
+    with pytest.raises(ValueError, match="is not claimed"):
+        signals.abandon_claimed(conn, sid)
+
+
 # ---------------------------------------------------------------------
 # ⑦ reclaim_expired: 期限内は不変・期限切れは requeue_count 増・
 #    上限超過 abandoned。lease 境界 <= を厳密にピン。

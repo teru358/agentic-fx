@@ -51,6 +51,18 @@ EMPTY_REPORT = IngestTickReport(
     deferred=frozenset(), empty=frozenset())
 
 
+@dataclass(frozen=True, slots=True)
+class _Outcome:
+    """1 tick の遷移の計算結果。commit が成功した後にだけ使う値を運ぶ。"""
+
+    state: str
+    epoch: int
+    activities: list
+    attempt_ok: dict
+    problem_streak: int
+    unconfirmed: frozenset
+
+
 def _iso(dt: datetime) -> str:
     return as_utc(dt).isoformat()
 
@@ -111,6 +123,13 @@ class OutageStateMachine:
         # のプロセス内メモ (再起動後は「変化あり」扱いで 1 回出る)。
         # episode が閉じる (state == "ready") たびに None へ戻す。
         self._last_unprocessed_by_pair: dict[str, dict[str, int]] | None = None
+        # observe() が例外で抜けた間 True (次に observe が正常に完了すると下りる)。
+        # 失敗の原因が state/gap の保存そのものだと DB の行は書き換えられない
+        # ので、行が古い ready のままでも新規リスクが通らないよう、state の読み口
+        # だけを degraded に倒す印にする。永続化しないのは、再起動後は DB の
+        # state に従えばよく、次の observe が同じ失敗をすればこの印が再び立つ
+        # (その間に動く新規リスクの窓は 1 tick 分以下) ため。
+        self._observe_failed = False
 
     # ---- public -------------------------------------------------------
 
@@ -118,6 +137,10 @@ class OutageStateMachine:
     def state(self) -> str:
         # observe() をまだ一度も呼んでいない (行が無い) 場合は既定の
         # 'ready' を返す — この読み出し専用アクセサ自体は行を作らない。
+        # 全 gate はこの読み口を見るので、直近の observe が失敗している間は
+        # 行の値にかかわらず新規リスクを止める側 (degraded) を返す。
+        if self._observe_failed:
+            return "degraded"
         return self._load_row().get("state", "ready")
 
     def status(self, *, conn=None) -> dict:
@@ -149,6 +172,7 @@ class OutageStateMachine:
                 gaps[(pair, interval)] = gs
         return {
             "state": row.get("state", "ready"),
+            "observe_failed": self._observe_failed,
             "epoch": epoch,
             "entered_degraded_at": row.get("entered_degraded_at"),
             "restricted_since": row.get("restricted_since"),
@@ -168,22 +192,65 @@ class OutageStateMachine:
         watermark は内部で `storage_source` 絞りで読み直す — 不通中の
         primary とは別の source (readonly healthcheck 経由の yfinance 等)
         の残存行を健全の根拠にしないため。
+
+        state/gap の commit に至らず例外で抜けたら `state` の読み口が
+        degraded を返す印を立て、次に commit まで完了するまで下ろさない。
+        commit 後の例外 (activity 書き込み等) は DB が確定済みなので印を
+        立てない。
         """
         now = as_utc(now)
+        try:
+            outcome = self._commit_observation(now, report)
+        except Exception:
+            self._observe_failed = True
+            raise
+        self._observe_failed = False
+        if isinstance(outcome, str):
+            return outcome
+        # commit 済み。プロセス内の記録は commit が成功した後にだけ進める
+        # (失敗した tick の観測を次の tick の判定に持ち越さない)。
+        self._last_attempt_ok = outcome.attempt_ok
+        self._problem_streak = outcome.problem_streak
+        state, epoch = outcome.state, outcome.epoch
+        for event, summary in outcome.activities:
+            self._write_activity(event, summary)
+        if state == "degraded":
+            by_pair = self._unprocessed_positions_by_pair(now, epoch)
+            if by_pair != self._last_unprocessed_by_pair:
+                self._last_unprocessed_by_pair = by_pair
+                detail = format_unprocessed_positions(by_pair)
+                if detail:
+                    self._write_activity("data_outage_unprocessed_bars", f"epoch={epoch} {detail}")
+        else:
+            self._last_unprocessed_by_pair = None
+        return self._consume_resume_request(now, state, epoch, outcome.unconfirmed)
+
+    def _commit_observation(self, now: datetime, report: IngestTickReport):
+        """休場なら現在の state (str)、そうでなければ commit 済みの遷移結果。"""
         self._ensure_row(now)
         if self._reset_ready_streak:
             with self.conn:
                 self.conn.execute(
                     "UPDATE datafeed_outage_state SET ready_streak=0 WHERE id=1")
             self._reset_ready_streak = False
-        row = self._load_row()
         if not market_hours.is_market_open(now):
             # 休場中は ingest 自体も due を立てない — 観測しない。
-            return row["state"]
-        return self._observe_open(now, report, row)
+            return self._load_row()["state"]
+        # flat 判定に使う exposure・現在の state・遷移の書き込みを 1 つの
+        # write transaction に入れる。読んだ後に別接続が建玉を作る隙間を
+        # なくし、state の確定が必ずその建玉を見た上で行われるようにする。
+        with self.conn:
+            if self.conn.in_transaction:
+                self.conn.commit()
+            self.conn.execute("BEGIN IMMEDIATE")
+            return self._observe_open(now, report, self._load_row())
 
     def _observe_open(self, now: datetime, report: IngestTickReport,
-                      row: dict) -> str:
+                      row: dict) -> "_Outcome":
+        """遷移を計算して state/gap を書く (呼び出し側の write transaction の中)。
+        インスタンス属性は触らず、commit 後に反映する値を返す。"""
+        attempt_ok = dict(self._last_attempt_ok)
+        problem_streak = self._problem_streak
         watermarks = self._read_watermarks(now)
         hard_failed = {key for key, _ in report.failed if key in self.hard_keys}
         hard_empty = self.hard_keys & report.empty
@@ -193,12 +260,12 @@ class OutageStateMachine:
         flat = not orders.list_by_status(self.conn, *_EXPOSURE)
         immediate = bool(hard_failed or hard_empty)
         if row["state"] == "ready" and (immediate or stalled):
-            self._last_attempt_ok.clear()
+            attempt_ok.clear()
         for key in self.hard_keys:
             if key in report.succeeded and key not in report.empty:
-                self._last_attempt_ok[key] = True
+                attempt_ok[key] = True
             elif key in hard_failed or key in hard_empty:
-                self._last_attempt_ok[key] = False
+                attempt_ok[key] = False
         # 回復の根拠として「この tick に succeeded かつ非 empty」を要求するのは
         # 1m の hard key だけ (1m が無い構成では全 key)。上位足は取得の周期が
         # 長く、取りに行かない tick (deferred / not-attempted) が普通にあるので、
@@ -207,11 +274,11 @@ class OutageStateMachine:
         healthy = (not hard_failed and not hard_empty and not stalled
                    and all(key in report.succeeded and key not in report.empty
                            for key in gate_keys)
-                   and all(self._last_attempt_ok.get(key) is not False
+                   and all(attempt_ok.get(key) is not False
                            for key in self.hard_keys - gate_keys))
         unconfirmed = frozenset(
             key for key in self.hard_keys
-            if key in stalled or self._last_attempt_ok.get(key) is not True)
+            if key in stalled or attempt_ok.get(key) is not True)
         state = row["state"]
         epoch = row["epoch"]
         confirmed = row["confirmed"]
@@ -305,35 +372,25 @@ class OutageStateMachine:
                     activities.append(("datafeed_recovered_awaiting_resume", f"epoch={epoch}"))
 
         if immediate or stalled:
-            self._problem_streak += 1
-            if state == "degraded" and not confirmed and self._problem_streak >= 2:
+            problem_streak += 1
+            if state == "degraded" and not confirmed and problem_streak >= 2:
                 confirmed = 1
                 activities.append(("data_outage_degraded", f"epoch={epoch} unprocessed_positions={self._unprocessed_position_count(now, epoch)}"))
         else:
-            self._problem_streak = 0
+            problem_streak = 0
 
-        with self.conn:
-            if opened:
-                self._open_gaps(epoch, now, watermarks)
-            self._save_state(state=state, epoch=epoch, confirmed=confirmed,
-                             entered_degraded_at=entered,
-                             restricted_since=restricted_since,
-                             restricted_deadline_at=deadline,
-                             pending_human_confirmation=pending,
-                             recovered_notified_epoch=recovered_notified_epoch,
-                             ready_streak=ready_streak, updated_at=_iso(now))
-        for event, summary in activities:
-            self._write_activity(event, summary)
-        if state == "degraded":
-            by_pair = self._unprocessed_positions_by_pair(now, epoch)
-            if by_pair != self._last_unprocessed_by_pair:
-                self._last_unprocessed_by_pair = by_pair
-                detail = format_unprocessed_positions(by_pair)
-                if detail:
-                    self._write_activity("data_outage_unprocessed_bars", f"epoch={epoch} {detail}")
-        else:
-            self._last_unprocessed_by_pair = None
-        return self._consume_resume_request(now, state, epoch, unconfirmed)
+        if opened:
+            self._open_gaps(epoch, now, watermarks)
+        self._save_state(state=state, epoch=epoch, confirmed=confirmed,
+                         entered_degraded_at=entered,
+                         restricted_since=restricted_since,
+                         restricted_deadline_at=deadline,
+                         pending_human_confirmation=pending,
+                         recovered_notified_epoch=recovered_notified_epoch,
+                         ready_streak=ready_streak, updated_at=_iso(now))
+        return _Outcome(state=state, epoch=epoch, activities=activities,
+                        attempt_ok=attempt_ok, problem_streak=problem_streak,
+                        unconfirmed=unconfirmed)
 
     def request_resume(self, now: datetime, *, acknowledge: bool = False,
                        conn=None) -> None:
@@ -530,10 +587,10 @@ class OutageStateMachine:
                 reason.append(
                     f"unprocessed_positions={unprocessed}"
                     + (f" ({detail})" if detail else ""))
-            self._write_activity(
-                "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
             with self.conn:
                 self._clear_resume_request()
+            self._write_activity(
+                "data_resume_rejected", f"epoch={epoch} reason={','.join(reason)}")
         return state
 
     def _clear_resume_request(self) -> None:

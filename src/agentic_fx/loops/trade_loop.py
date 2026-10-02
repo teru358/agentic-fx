@@ -168,6 +168,7 @@ class TradeLoop:
         claimed: dict | None = None
         mid: int | None = None
         consumed = False
+        stopped_by_data_state = False
         finalized = False
         try:
             # ---- prepare (core_lock 保持) ----
@@ -320,6 +321,12 @@ class TradeLoop:
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
                     consume_error = None
+                    if (claimed is not None
+                            and intent.action is Action.OPEN
+                            and self.executor.state_fn() != "ready"):
+                        # consume せずに止める。finally の後始末で、鮮度が
+                        # 切れていれば pending に戻さず abandoned にする。
+                        stopped_by_data_state = True
                     if (claimed is not None and not (
                             intent.action is Action.OPEN
                             and self.executor.state_fn() != "ready")):
@@ -440,7 +447,8 @@ class TradeLoop:
             # (文面を返すだけ)。
             if claimed is not None and not consumed:
                 with self._core_lock:
-                    _requeue_msg = self._requeue_signal(claimed)
+                    _requeue_msg = self._requeue_signal(
+                            claimed, abandon_if_stale=stopped_by_data_state)
                 if _requeue_msg:
                     try:
                         self.notifier.send(_requeue_msg)
@@ -571,7 +579,8 @@ class TradeLoop:
             f"- fresh_until: {fresh_until}\n"
             f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
 
-    def _requeue_signal(self, claimed: dict) -> str | None:
+    def _requeue_signal(self, claimed: dict, *,
+                        abandon_if_stale: bool = False) -> str | None:
         """claim した signal を pending へ戻す (**core_lock 保持中に呼ぶ** —
         signals.requeue は conn_core を書き込むため)。
 
@@ -584,6 +593,13 @@ class TradeLoop:
         結果/例外) を上書きしないよう、例外は握りつぶしログのみに残す。
         """
         try:
+            if abandon_if_stale and self._claimed_signal_is_stale(claimed):
+                # 新規リスクが止まっている間に鮮度が切れた signal は、
+                # requeue 回数を使って pending に戻さず、その場で終端する。
+                signals.abandon_claimed(self.conn, claimed["id"])
+                return (f"[agentic-fx] signal #{claimed['id']} "
+                        f"({claimed['plugin']}) は鮮度切れのため "
+                        "abandoned になりました")
             status = signals.requeue(
                 self.conn, claimed["id"], now=self.clock.now(),
                 max_requeue=self.settings.plugin.signal_requeue_max)
@@ -595,6 +611,17 @@ class TradeLoop:
             _log.exception("signal requeue failed for signal_id=%s",
                            claimed["id"])
         return None
+
+    def _claimed_signal_is_stale(self, claimed: dict) -> bool:
+        """鮮度の境界は `expire_stale` と同じ (`freshness_window` の
+        fresh_until を now が超えたら切れ)。未知の timeframe も切れ扱い。"""
+        try:
+            _, fresh_until = signals.freshness_window(
+                claimed["timeframe"], claimed["bar_ts"],
+                self.settings.plugin.signal_freshness_bars)
+        except KeyError:
+            return True
+        return self.clock.now() > datetime.fromisoformat(fresh_until)
 
     def _ask_once_impl(self, question: str) -> str:
         """ask Mission (プラン8 三相再構成 — trade と同じ理由: WorkerRunner

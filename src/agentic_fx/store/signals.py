@@ -299,6 +299,19 @@ def requeue(conn: sqlite3.Connection, signal_id: int, *, now: datetime,
     return row["status"]
 
 
+def abandon_claimed(conn: sqlite3.Connection, signal_id: int) -> None:
+    """claimed の行を requeue_count を増やさず abandoned にする。対象が
+    claimed でなければ ValueError (fail closed)。鮮度切れが確定した signal を
+    pending に戻して再 claim の候補にしないために使う。"""
+    cur = conn.execute(
+        "UPDATE signals SET status='abandoned', "
+        "claimed_by_mission_id=NULL, claimed_at=NULL "
+        "WHERE id=? AND status='claimed'", (signal_id,))
+    conn.commit()
+    if cur.rowcount == 0:
+        raise ValueError(f"signal {signal_id} is not claimed")
+
+
 def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
                      lease_min: int, max_requeue: int) -> list[str]:
     """lease (claimed_at からの経過分) が切れた claimed 行を全件回収する。
