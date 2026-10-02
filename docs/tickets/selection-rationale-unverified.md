@@ -1,7 +1,7 @@
 ---
 id: selection-rationale-unverified
 title: 承認材料の selection_rationale が未検証で捏造され得る
-status: 設計待ち
+status: 実装待ち
 priority: 高
 opened: null
 closed: null
@@ -11,7 +11,7 @@ source_section: 未完了
 ---
 # [selection-rationale-unverified]
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装待ち / **優先**: 高
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +21,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 高、題名: 承認材料の selection_rationale が未検証で捏造され得る — 仕分け (2026-10-02、現物で成立を確認): attempts との突き合わせで検出可能、m40 で attempts を捏造した実例。 根拠: loops/improve_loop.py:1636 で output の selection_rationale を未検証のまま payload に載せる。
+- 2026-10-02: 状態: 実装待ち — spec docs/superpowers/specs/2026-10-02-approval-parent-facts-design.md v1.0。承認画面 (approval <id>) に「親が受理・記録した内容」欄を新設し、agent の選定理由・要約・課題の文面は「agent の自己申告 (未検証)」欄に下げる。機械照合はしない。prompt の出力例から回数を除く。実例: 試行回数の捏造 2 件を確認。現状は承認画面に選定理由が表示されていなかった
