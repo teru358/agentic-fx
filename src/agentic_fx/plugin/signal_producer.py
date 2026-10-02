@@ -163,26 +163,35 @@ class SignalProducer:
                 sessions[meta.content_hash] = session
             return session.call(payload)
 
-        try:
-            for meta in plugins:
-                if meta.kind not in ("signal", "strategy"):
-                    continue
-                if (meta.kind == "strategy"
-                        and (meta.name, meta.content_hash)
-                        not in resolved_by_identity):
+        # 今回評価する (plugin, pair)。対象から外れた plugin・pair や旧 hash の
+        # 失敗記録を残すと、plugin の更新のたびに増え続けるので先に落とす。
+        work: list[tuple[PluginMeta, str]] = []
+        for meta in plugins:
+            if meta.kind not in ("signal", "strategy"):
+                continue
+            if (meta.kind == "strategy"
+                    and (meta.name, meta.content_hash)
+                    not in resolved_by_identity):
+                _log.warning(
+                    "plugin %s: indicator dependencies are unresolved — "
+                    "skipping (fail closed)", meta.name)
+                continue
+            for pair in meta.pairs:
+                if pair not in settings.pairs:
                     _log.warning(
-                        "plugin %s: indicator dependencies are unresolved — "
-                        "skipping (fail closed)", meta.name)
+                        "plugin %s: pair %s is not in settings.pairs — "
+                        "skipping", meta.name, pair)
                     continue
-                for pair in meta.pairs:
-                    if pair not in settings.pairs:
-                        _log.warning(
-                            "plugin %s: pair %s is not in settings.pairs — "
-                            "skipping", meta.name, pair)
-                        continue
-                    inserted += self._evaluate_one(
-                        conn, meta, pair, now=now, source=source, call=_call,
-                        settings=settings, activity=activity)
+                work.append((meta, pair))
+        live = {(m.name, m.content_hash, p) for m, p in work}
+        for k in [k for k in self._failure_notices if k[:3] not in live]:
+            del self._failure_notices[k]
+
+        try:
+            for meta, pair in work:
+                inserted += self._evaluate_one(
+                    conn, meta, pair, now=now, source=source, call=_call,
+                    settings=settings, activity=activity)
         finally:
             for session in sessions.values():
                 session.close()
@@ -200,9 +209,6 @@ class SignalProducer:
         freshness_cutoff = now - width * settings.plugin.signal_freshness_bars
         freshness_bucket = floor_to_bucket(freshness_cutoff, tf)
         key = (meta.name, meta.content_hash, pair)
-        # content hash が変わった plugin の旧 hash の失敗記録は残さない
-        # (戻したときに、間引き中の古い状態で初回通知が出ないのを避ける)。
-        self._release_failures(meta.name, pair, keep_hash=meta.content_hash)
         # 鮮度窓を過ぎて評価されなくなった (自然放棄された) バケットの失敗記録。
         # cursor が無いまま窓が進んだ場合はループに入らないので、ここで落とす。
         self._release_failures(meta.name, pair, older_than=freshness_cutoff)
@@ -226,13 +232,12 @@ class SignalProducer:
                 shortage = (meta.name, pair, source, meta.timeframe)
                 if shortage not in self._insufficient_closed:
                     self._insufficient_closed.add(shortage)
-                    if activity is not None:
-                        activity.write(
-                            Category.TECH, "plugin_insufficient_closed_bars",
-                            "consumer=%s source=%s interval=%s required=%d available=%d"
-                            % (meta.name, source, meta.timeframe,
-                               meta.max_bars, e.available),
-                            ref_id=meta.name)
+                    _write_activity(
+                        activity, "plugin_insufficient_closed_bars",
+                        "consumer=%s source=%s interval=%s required=%d available=%d"
+                        % (meta.name, source, meta.timeframe,
+                           meta.max_bars, e.available),
+                        meta.name)
                 break
             except _BucketDataMissing as e:
                 # 取り込みラグ等でデータが無いだけで plugin の失敗ではない。
@@ -252,15 +257,12 @@ class SignalProducer:
         return inserted
 
     def _release_failures(self, name: str, pair: str, *,
-                          keep_hash: str | None = None,
                           hash_: str | None = None,
                           older_than: datetime | None = None) -> None:
-        """間引き状態を解除する。`keep_hash` は「それ以外の hash」、`hash_`
-        は「その hash」、`older_than` は「それより古いバケット」を対象に絞る。"""
+        """間引き状態を解除する。`hash_` は「その hash」、`older_than` は
+        「それより古いバケット」を対象に絞る。"""
         for k in list(self._failure_notices):
             if k[0] != name or k[2] != pair:
-                continue
-            if keep_hash is not None and k[1] == keep_hash:
                 continue
             if hash_ is not None and k[1] != hash_:
                 continue
@@ -283,19 +285,13 @@ class SignalProducer:
             "plugin %s (%s): evaluation failed at bucket %s (%s) result=%s — "
             "cursor not advanced, retry next tick",
             meta.name, pair, bucket.isoformat(), exc, result)
-        if activity is None:
-            return
-        try:
-            # 本文は固定分類だけ (例外文字列・stderr・パスは技術ログにのみ残す)。
-            activity.write(
-                Category.TECH, "plugin_eval_failed",
-                "consumer=%s pair=%s interval=%s bucket=%s result=%s%s"
-                % (meta.name, pair, meta.timeframe, bucket.isoformat(),
-                   result, suffix),
-                ref_id=meta.name)
-        except Exception:  # noqa: BLE001 — 記録の失敗で評価を止めない
-            _log.warning("plugin %s: failed to write evaluation failure activity",
-                         meta.name)
+        # 本文は固定分類だけ (例外文字列・stderr・パスは技術ログにのみ残す)。
+        _write_activity(
+            activity, "plugin_eval_failed",
+            "consumer=%s pair=%s interval=%s bucket=%s result=%s%s"
+            % (meta.name, pair, meta.timeframe, bucket.isoformat(),
+               result, suffix),
+            meta.name)
 
     def _evaluate_bucket(self, conn: "sqlite3.Connection", meta: PluginMeta,
                          pair: str, bucket_start: datetime, *, now: datetime,
@@ -384,6 +380,17 @@ _SANDBOX_CODE_TO_RESULT = {
     "plugin_error": "plugin_error",
     "protocol_error": "plugin_error",
 }
+
+
+def _write_activity(activity, event: str, summary: str, ref_id: str) -> None:
+    """activity への書き込みの失敗で scheduler tick を落とさない。例外文字列は
+    人間向けの面に出さないので、技術ログにも固定の文言だけ残す。"""
+    if activity is None:
+        return
+    try:
+        activity.write(Category.TECH, event, summary, ref_id=ref_id)
+    except Exception:  # noqa: BLE001 — 記録の失敗で評価を止めない
+        _log.warning("plugin %s: failed to write %s activity", ref_id, event)
 
 
 def _failure_result(exc: Exception) -> str:

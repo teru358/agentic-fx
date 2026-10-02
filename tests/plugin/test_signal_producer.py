@@ -1095,3 +1095,98 @@ def test_live_failure_activity_write_error_does_not_stop_the_producer(tmp_path):
     assert _run(producer, conn, meta, now, fake, _Broken()) == 0
     fake.queue("sig", {"signals": [_signal_result()]})
     assert _run(producer, conn, meta, now, fake, _Broken()) == 1
+
+
+def test_insufficient_bars_activity_write_error_does_not_stop_the_producer(
+        tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 3 * 60 + 1)
+    short = _meta(name="short", timeframe="1h", max_bars=50)
+    ok = _meta(name="ok", timeframe="1h", max_bars=2)
+
+    class _Broken:
+        def write(self, *a, **k):
+            raise OSError("disk full SECRET")
+
+    fake = _FakeSandbox()
+    fake.queue("ok", {"signals": [_signal_result()]})
+    plugins = [short, ok]
+    resolved = {**_resolved_by_identity(short), **_resolved_by_identity(ok)}
+    n = SignalProducer().evaluate_due_plugins(
+        conn, plugins=plugins, now=H + timedelta(hours=1), source=SOURCE,
+        sandbox_run=fake, settings=SETTINGS, resolved_by_identity=resolved,
+        activity=_Broken())
+    assert n == 1
+
+
+_TWO_PAIRS = SETTINGS.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+
+
+def _fail_two_pairs(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1, symbol="EURUSD")
+    return conn
+
+
+def _run_many(producer, conn, metas, now, sandbox):
+    resolved: dict = {}
+    for m in metas:
+        resolved.update(_resolved_by_identity(m))
+    return producer.evaluate_due_plugins(
+        conn, plugins=metas, now=now, source=SOURCE, sandbox_run=sandbox,
+        settings=_TWO_PAIRS, resolved_by_identity=resolved,
+        activity=_RecordingActivity())
+
+
+def test_failure_keys_of_a_pair_dropped_from_the_plugin_are_removed(tmp_path):
+    conn = _fail_two_pairs(tmp_path)
+    both = _meta(pairs=("USDJPY", "EURUSD"))
+    one = _meta(pairs=("USDJPY",))
+    sandbox = _AlwaysFailingSandbox(SandboxError("x", code="crashed"))
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    _run_many(producer, conn, [both], now, sandbox)
+    assert {k[2] for k in producer._failure_notices} == {"USDJPY", "EURUSD"}
+    _run_many(producer, conn, [one], now, sandbox)
+    assert {k[2] for k in producer._failure_notices} == {"USDJPY"}
+
+
+def test_failure_keys_of_a_removed_plugin_are_all_removed(tmp_path):
+    conn = _fail_two_pairs(tmp_path)
+    gone = _meta(name="gone", pairs=("USDJPY", "EURUSD"))
+    stay = _meta(name="stay", pairs=("USDJPY",))
+    sandbox = _AlwaysFailingSandbox(SandboxError("x", code="crashed"))
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    _run_many(producer, conn, [gone, stay], now, sandbox)
+    assert {k[0] for k in producer._failure_notices} == {"gone", "stay"}
+    _run_many(producer, conn, [stay], now, sandbox)
+    assert {k[0] for k in producer._failure_notices} == {"stay"}
+
+
+def test_failure_keys_of_the_old_hash_are_removed_for_every_pair(tmp_path):
+    conn = _fail_two_pairs(tmp_path)
+    old = _meta(pairs=("USDJPY", "EURUSD"), content_hash="a" * 64)
+    new = _meta(pairs=("USDJPY", "EURUSD"), content_hash="b" * 64)
+    sandbox = _AlwaysFailingSandbox(SandboxError("x", code="crashed"))
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    _run_many(producer, conn, [old], now, sandbox)
+    assert {k[1] for k in producer._failure_notices} == {"a" * 64}
+    _run_many(producer, conn, [new], now, sandbox)
+    assert {k[1] for k in producer._failure_notices} == {"b" * 64}
+    assert {k[2] for k in producer._failure_notices} == {"USDJPY", "EURUSD"}
+
+
+def test_failure_keys_of_a_live_plugin_are_kept_across_ticks(tmp_path):
+    conn = _fail_two_pairs(tmp_path)
+    meta = _meta(pairs=("USDJPY", "EURUSD"))
+    sandbox = _AlwaysFailingSandbox(SandboxError("x", code="crashed"))
+    producer = SignalProducer()
+    now = H + timedelta(hours=1)
+    _run_many(producer, conn, [meta], now, sandbox)
+    before = dict(producer._failure_notices)
+    _run_many(producer, conn, [meta], now, sandbox)
+    assert set(producer._failure_notices) == set(before)
+    assert all(v == 2 for v in producer._failure_notices.values())
