@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 118 件。完了分は CLOSED.md。
+未完了: 127 件。完了分は CLOSED.md。
 
 ## 実装待ち (23)
 
@@ -42,11 +42,13 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (89)
+## 設計待ち (98)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
+| [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
+| [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
 | [candidates-converge-to-example-sma](candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
@@ -64,11 +66,16 @@
 | [trade-cron-hybrid-mode](trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
 | [trade-timeout-on-startup](trade-timeout-on-startup.md) | 中 | 2026-09-28 | 停止による打ち切りの trade mission が timeout と記録される |
 | [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 中 | 2026-09-30 | worker 応答の pid と error 文字列が無検証で session とログに入る |
+| [example-eval-source-defaults-to-dukascopy](example-eval-source-defaults-to-dukascopy.md) | 中 | 2026-10-02 | 設定例の履歴源の既定が dukascopy で大量取得を促す |
 | [full-suite-fd-over-1024-breaks-shell-tests](full-suite-fd-over-1024-breaks-shell-tests.md) | 中 | 2026-10-02 | 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる |
 | [gate-pytest-tail-stored-in-last-result](gate-pytest-tail-stored-in-last-result.md) | 中 | 2026-10-02 | gate の pytest 出力末尾が次回の改善 mission の材料になる |
 | [improve-handler-unexpected-exception-text-reaches-agent](improve-handler-unexpected-exception-text-reaches-agent.md) | 中 | 2026-10-02 | 改善 mission の handler で想定外例外の文面が agent に届く |
+| [load-settings-loads-dotenv-as-side-effect](load-settings-loads-dotenv-as-side-effect.md) | 中 | 2026-10-02 | 設定の検証が .env を環境に読み込む副作用を持つ |
 | [news-fetch-no-user-agent-yahoo-429](news-fetch-no-user-agent-yahoo-429.md) | 中 | 2026-10-02 | ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す |
 | [plugin-ast-check-bypass-via-library-attributes](plugin-ast-check-bypass-via-library-attributes.md) | 中 | 2026-10-02 | plugin がライブラリの属性経由で os に届き、コード検査を回避できる |
+| [repo-readme-empty](repo-readme-empty.md) | 中 | 2026-10-02 | README.md が 0 バイト |
+| [research-user-agent-claims-unverified-url](research-user-agent-claims-unverified-url.md) | 中 | 2026-10-02 | 研究用取得の User-Agent が実在未確認の URL を名乗る |
+| [settings-yaml-duplicate-key-silently-last-wins](settings-yaml-duplicate-key-silently-last-wins.md) | 中 | 2026-10-02 | settings.yaml の重複キーは黙って後の値が効く |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -106,6 +113,8 @@
 | [first-run-empty-1m-starts-degraded](first-run-empty-1m-starts-degraded.md) | 低 | 2026-10-02 | 初期化直後に 1m 足が空だと degraded から始まる (実機で確認) |
 | [outage-leftover-transaction-partial-commit](outage-leftover-transaction-partial-commit.md) | 低 | 2026-10-02 | 停止判定の rollback 失敗で残った中途の書き込みが、次の足の保存で確定し得る |
 | [restricted-state-followups](restricted-state-followups.md) | 低 | 2026-10-02 | restricted 状態の残り: 欠落の記録、入力契約のテスト、結合検証 |
+| [runner-trade-backend-error-wording-mismatch](runner-trade-backend-error-wording-mismatch.md) | 低 | 2026-10-02 | runner.trade の backend の検証文言が受け付け方と食い違う |
+| [tracked-files-contain-author-home-path](tracked-files-contain-author-home-path.md) | 低 | 2026-10-02 | 追跡ファイルに作者のホームの絶対パスが残る |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
