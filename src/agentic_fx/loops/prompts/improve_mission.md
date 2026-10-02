@@ -125,9 +125,9 @@
     "name": "rsi_indicator",
     "kind": "indicator",
     "self_test": "passed",
-    "summary": "RSI(14) を算出する indicator plugin。warmup 14 本。"
+    "summary": "RSI を算出する indicator plugin。期間は config.yaml の params で変えられる。"
   }},
-  "selection_rationale": "backlog #12 は試行 1 回目で、直近成績の hold 率の高さに直結するため。"
+  "selection_rationale": "直近の hold 率の高さに直結する課題で、RSI という標準指標を足すことで判断材料が増えるため。"
 }}
 
 - `discoveries` は**オブジェクトの配列**です (文字列の配列ではない)。
@@ -141,3 +141,10 @@
   - report 形: `{{"type": "report", "proposal_kind": "core" | "risk_gate" | "research", "title": "...", "body_md": "..."}}`
   - observation 形 (実施まで至らなかった場合): `{{"type": "observation", "reason": "..."}}`
 - 上に挙げたキー以外は追加しないでください。
+- **書く欄によって、成績を書くかどうかが違います。**
+  - `selection_rationale` と plugin の `summary` は人間の承認画面にそのまま
+    転載されます。ここには**試行回数・過去の回数・pf / avg_r / trades などの
+    成績を書かず**、何を選んだか・何をどう変えたかという意図だけを書いて
+    ください (回数や成績は親が記録した値が別の欄に出ます)。
+  - observation の `reason` は次回の自分への申し送りです。規律 3 のとおり、
+    試したパラメータと得られた pf / avg_r を具体的に書いてください。

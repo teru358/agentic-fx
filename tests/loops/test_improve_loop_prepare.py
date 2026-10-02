@@ -411,6 +411,51 @@ def test_render_prompt_separates_selectable_backlog_from_notes(tmp_path):
     assert "market closes Friday" in notes
 
 
+def _rendered_prompt_and_example(tmp_path):
+    import json
+    from agentic_fx.loops.improve_loop import ImproveLoop
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+    text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
+    start = text.index('{\n  "discoveries"')
+    end = text.index("\n\n- `discoveries`")
+    return text, json.loads(text[start:end])
+
+
+def test_prompt_example_free_text_has_no_counts_or_backlog_numbers(tmp_path):
+    import re
+
+    text, example = _rendered_prompt_and_example(tmp_path)
+
+    assert set(example) == {"discoveries", "selected", "artifact",
+                            "selection_rationale"}
+    for value in (example["selection_rationale"],
+                  example["artifact"]["summary"]):
+        assert isinstance(value, str) and value
+        assert not re.search(r"\d", value), value
+    assert not re.search(r"backlog\s*#\s*\d", text.split("## 最終出力")[1])
+
+
+def test_prompt_tells_agent_not_to_write_counts_in_approval_free_text(tmp_path):
+    text, _ = _rendered_prompt_and_example(tmp_path)
+
+    tail = text.split("書く欄によって、成績を書くかどうかが違います", 1)[1]
+    approval_part, reason_part = tail.split("observation の `reason`", 1)
+    assert "`selection_rationale`" in approval_part
+    assert "`summary`" in approval_part
+    assert "承認画面" in approval_part
+    assert "成績を書かず" in approval_part
+    assert "試行回数" in approval_part
+    # observation の reason には成績を具体的に書く要求が残る。
+    assert "pf / avg_r を具体的に書いて" in reason_part
+    # 規律 3 (observation に試したパラメータと成績を書く要求) も残る。
+    rules = " ".join(text.split("## 最終出力")[0].split())
+    assert "observation` として理由を残し" in rules
+    assert "得られた pf / avg_r を具体的に" in rules
+
+
 def test_render_improve_mission_prompt_fails_closed_on_missing_key(tmp_path):
     """RB4: 対応表のキーが 1 つでも欠けたら (`references` セクション欠落
     などの上流バグ) `KeyError` で fail closed する — 空文字列で握り潰し
