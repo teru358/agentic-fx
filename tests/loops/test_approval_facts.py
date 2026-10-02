@@ -393,3 +393,159 @@ def test_finalize_success_stores_accepted_backtest_trials(
     assert _stored_payload(conn)["parent_facts"]["trials"] == [{
         "n": 1, "content_hash8": "1a2b3c4d", "same_hash_as_submitted": True,
         "trades": 100, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.05}]
+
+
+# ---- 無害化・保存・検証の境界 ----
+
+def test_display_text_keeps_a_value_of_exactly_the_limit():
+    limit = approval_facts.FIELD_DISPLAY_LIMIT
+    assert approval_facts.display_text("a" * limit) == "a" * limit
+    assert approval_facts.display_text("a" * (limit + 1)) == (
+        "a" * limit + approval_facts.TRUNCATION_SUFFIX)
+
+
+def test_display_text_removes_lone_surrogates():
+    assert approval_facts.display_text("a\ud800b") == "ab"
+
+
+def test_display_text_turns_cr_lf_tab_into_spaces():
+    assert approval_facts.display_text("a\rb\nc\td") == "a b c d"
+
+
+def test_display_text_collapses_whitespace_before_cutting():
+    text = "x" * 190 + " " * 30 + "y" * 50
+    assert approval_facts.display_text(text) == (
+        "x" * 190 + " " + "y" * 9 + approval_facts.TRUNCATION_SUFFIX)
+
+
+@pytest.mark.parametrize("value", ["", " ", " \t\r\n ", "\x1b‮"])
+def test_display_text_shows_dash_for_empty_values(value):
+    assert approval_facts.display_text(value) == "-"
+
+
+def test_claim_of_exactly_the_store_limit_is_stored_whole(conn, clock):
+    _, run_id, backlog_id = _setup(conn, clock)
+    limit = approval_facts.CLAIM_STORE_LIMIT
+    payload = _build(conn, run_id, backlog_id, [], summary="s" * limit)
+    assert payload["agent_claims"]["summary"] == "s" * limit
+    payload = _build(conn, run_id, backlog_id, [], summary="s" * (limit + 1))
+    assert payload["agent_claims"]["summary"] == (
+        "s" * limit + approval_facts.TRUNCATION_SUFFIX)
+
+
+@pytest.mark.parametrize("hash8", ["1a2b3c4d9", "1A2B3C4D", " 1a2b3c4d"])
+def test_validator_rejects_a_hash_that_is_not_exactly_eight_lowercase_hex(
+        conn, clock, hash8):
+    facts = _valid_facts(conn, clock)
+    facts["trials"][0]["content_hash8"] = hash8
+    with pytest.raises(FactsError):
+        approval_facts.validate_parent_facts(facts)
+
+
+@pytest.mark.parametrize("status", ["open", "observation", "done"])
+def test_selected_idea_is_quoted_only_while_the_backlog_is_selected(
+        conn, clock, status):
+    _, run_id, backlog_id = _setup(conn, clock)
+    conn.execute("UPDATE improvement_backlog SET status=? WHERE id=?",
+                 (status, backlog_id))
+    conn.commit()
+    payload = _build(conn, run_id, backlog_id, [])
+    assert "selected_backlog_idea" not in payload["agent_claims"]
+
+
+# ---- 保存から表示まで通す ----
+
+def _commands(tmp_path, conn):
+    from unittest.mock import MagicMock
+
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.commands import Commands
+    from agentic_fx.core.contracts import FixedClock
+    from agentic_fx.core.health_latch import HealthLatch
+    from agentic_fx.core.paper_broker import PaperBroker
+    from agentic_fx.store.state import StateStore
+    from tests.loops.conftest import SETTINGS
+
+    (tmp_path / "logs").mkdir(exist_ok=True)
+    return Commands(
+        conn=conn, state_store=StateStore(tmp_path / "s.json"),
+        broker=PaperBroker(conn, SETTINGS, FixedClock(NOW)),
+        trade_loop=MagicMock(),
+        activity=ActivityLog(tmp_path / "logs" / "activity.log"),
+        log_dir=tmp_path / "logs", clock=FixedClock(NOW),
+        health_latch=HealthLatch())
+
+
+def _persistable_bt(tmp_path, content_hash=SUBMITTED, pf=1.2):
+    return {
+        "opaque_ref": "bt", "kind": "run_backtest",
+        "params": {"name": "x", "pair": "USDJPY"}, "trial_count": 1,
+        "result_summary": {
+            "scope": "in_sample", "plugin_ref": "plugins/x",
+            "content_hash": content_hash, "kind": "strategy",
+            "pair": "USDJPY", "timeframe": "1h", "source": "test",
+            "base_interval": "1m", "period": (NOW, NOW),
+            "metrics": {"trades": 100, "pf": pf, "avg_r": 0.1,
+                        "max_drawdown": 0.05},
+            "settings_hash": "settings", "core_commit": "core",
+            "initial_balance": 10000.0, "now": NOW, "params": {},
+            "artifact_hash": "h", "archive_tmp": str(tmp_path / "gone")}}
+
+
+def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
+        loop_min, conn, clock, tmp_path):
+    mission_id, run_id, backlog_id = _setup(conn, clock)
+    prior = _finished_run(conn, backlog_id, None)
+    entries = [_persistable_bt(tmp_path),
+               _persistable_bt(tmp_path, "ee" * 32, 0.8), _ac()]
+    ctx = _ctx(tmp_path, mission_id, run_id, entries)
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None,
+        approval_payload={"name": "x", "kind": "strategy",
+                          "content_hash": SUBMITTED, "eval_timeframe": "1h",
+                          "selection_rationale": "意図です",
+                          "summary": "概要です"},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    approval_id = conn.execute(
+        "SELECT id FROM approval_requests ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    out = _commands(tmp_path, conn).dispatch(f"approval {approval_id}")
+    lines = out.split("\n")
+    assert approval_facts.PARENT_HEADING in lines
+    assert approval_facts.INVALID_FORMAT_TEXT not in out
+    assert approval_facts.LEGACY_LINE not in out
+    assert f"backlog #{backlog_id} (今回を含め attempts=1) status=selected" \
+        in lines
+    assert f"  run #{prior}: 観測のみ (承認依頼なし)" in lines
+    assert ("mission 内の backtest 2 件 (in_sample の受理分) / 分析 1 件:"
+            in lines)
+    assert ("  1. hash=1a2b3c4d (提出と同一) trades=100 pf=1.2 avg_r=0.1 "
+            "mdd=0.05") in lines
+    assert ("  2. hash=eeeeeeee (提出と別) trades=100 pf=0.8 avg_r=0.1 "
+            "mdd=0.05") in lines
+    assert lines.index(approval_facts.PARENT_NOTE) < lines.index(
+        approval_facts.CLAIMS_HEADING)
+    assert "  自己申告: selection_rationale: 意図です" in lines
+    assert "  自己申告: summary: 概要です" in lines
+    assert "  引用: 選んだ課題の文面 (agent 起票): 課題の文面" in lines
+
+
+def test_a_failure_other_than_facts_error_creates_no_approval_and_fails_the_mission(
+        loop_min, conn, clock, tmp_path, monkeypatch):
+    mission_id, run_id, backlog_id = _setup(conn, clock)
+    ctx = _ctx(tmp_path, mission_id, run_id, [_persistable_bt(tmp_path)])
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("storage failure")
+    monkeypatch.setattr(approval_facts, "build_facts_payload", boom)
+    loop_min._finalize_success(
+        conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
+        slot_key=None,
+        approval_payload={"name": "x", "kind": "strategy",
+                          "content_hash": SUBMITTED},
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+    assert conn.execute(
+        "SELECT COUNT(*) AS n FROM approval_requests").fetchone()["n"] == 0
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (mission_id,)).fetchone()["status"] != "completed"

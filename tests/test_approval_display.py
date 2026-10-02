@@ -421,3 +421,81 @@ def test_decision_succeeds_on_corrupt_payload(tmp_path):
     cmds.dispatch(f"approve {approval_id}")
     assert conn.execute("SELECT status FROM approval_requests WHERE id=?",
                         (approval_id,)).fetchone()["status"] == "approved"
+
+
+# ---- 壊れた保存形式の細部と欄ごとの上限 ----
+
+@pytest.mark.parametrize("status", [["open"], {"a": 1}])
+def test_unhashable_backlog_status_only_replaces_the_parent_section(
+        tmp_path, status):
+    payload = _new_payload()
+    payload["parent_facts"]["backlog"]["status"] = status
+    out = _show(tmp_path, payload)
+    assert f"{PARENT_HEADING} {INVALID}" in out.split("\n")
+    assert "  自己申告: summary: SUMMARY" in out.split("\n")
+
+
+@pytest.mark.parametrize("claims", [["summary"], "summary selection_rationale",
+                                    5, None])
+def test_non_dict_agent_claims_show_no_claims_section(tmp_path, claims):
+    out = _show(tmp_path, _new_payload(agent_claims=claims))
+    assert CLAIMS_HEADING not in out
+    assert PARENT_HEADING in out.split("\n")
+
+
+def test_empty_metrics_dict_is_shown_as_a_dash_line(tmp_path):
+    payload = _new_payload()
+    payload["in_sample"] = {}
+    payload["holdout"] = {}
+    lines = _show(tmp_path, payload).split("\n")
+    assert "in_sample: -" in lines
+    assert "holdout: -" in lines
+
+
+def test_pair_label_with_a_line_break_stays_on_one_line(tmp_path):
+    payload = _new_payload()
+    payload["in_sample"] = {"US\nDJPY": {"pf": 1.0, "trades": 1}}
+    lines = _show(tmp_path, payload).split("\n")
+    assert "in_sample US DJPY: pf=1.0 trades=1 avg_r=- max_drawdown=-" in lines
+
+
+def test_floor_strings_are_cut_at_the_free_text_limit(tmp_path):
+    limit = approval_facts.CLAIM_DISPLAY_LIMIT
+    suffix = approval_facts.TRUNCATION_SUFFIX
+    payload = _new_payload(floor_warning="w" * (limit + 100),
+                           floor_detail="d" * limit,
+                           profitability_floor="p" * (limit + 1))
+    lines = _show(tmp_path, payload).split("\n")
+    assert "floor_warning=" + "w" * limit + suffix in lines
+    assert "floor_detail=" + "d" * limit in lines
+    assert "profitability_floor=" + "p" * limit + suffix in lines
+
+
+def test_non_string_floor_values_are_shown_as_ascii_json(tmp_path):
+    payload = _new_payload(floor_detail={"理由": "日本"})
+    out = _show(tmp_path, payload)
+    assert 'floor_detail={"\\u7406\\u7531": "\\u65e5\\u672c"}' in out
+
+
+def test_profitability_floor_text_is_sanitized(tmp_path):
+    out = _show(tmp_path, _new_payload(profitability_floor="a\n" + HOSTILE))
+    _assert_clean(out)
+    assert "profitability_floor=a A[31mBCD E F" in out.split("\n")
+
+
+@pytest.mark.parametrize("length,cut", [(300, False), (301, True)])
+def test_archive_path_has_its_own_longer_limit(tmp_path, length, cut):
+    conn, cmds = _commands(tmp_path)
+    payload = _new_payload(kind="indicator", name="ind", mission_id=7,
+                           content_hash="h")
+    approval_id = approvals.create(conn, kind="plugin", payload=payload,
+                                   now=NOW)
+    path = "p" * length
+    candidate_archives.insert(
+        conn, mission_id=7, name="ind", content_hash="h",
+        artifact_hash="a", archive_path=path, pair="USDJPY", metrics={},
+        now=NOW)
+    cmds._dependent_strategies = lambda **kw: ([], [])
+    expected = ("p" * 300 + approval_facts.TRUNCATION_SUFFIX) if cut else path
+    assert f"archive={expected}" in cmds.dispatch(
+        f"approval {approval_id}").split("\n")
