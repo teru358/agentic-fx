@@ -107,3 +107,44 @@ def test_health_has_no_auth_dependency():
 def test_read_dependency_allows_no_key_when_unset(monkeypatch):
     monkeypatch.setattr(server, "_settings", SimpleNamespace(auth_required=False, api_key=""))
     server.require_api_key(None)
+
+
+@pytest.mark.parametrize("host", ["LOCALHOST", " 127.0.0.1 ", "[::1]", "::ffff:127.0.0.1"])
+def test_loopback_spellings_are_recognised(host):
+    from config import is_loopback_host
+
+    assert is_loopback_host(host)
+
+
+@pytest.mark.parametrize("host", ["", "   ", "example.test", "0.0.0.0", "::", "8.8.8.8"])
+def test_unparseable_or_non_loopback_host_is_not_loopback(host):
+    from config import is_loopback_host
+
+    assert not is_loopback_host(host)
+
+
+@pytest.mark.parametrize("host", ["example.test", "not an address"])
+def test_hostname_without_key_is_refused(env, monkeypatch, host):
+    monkeypatch.setenv("BRIDGE_HOST", host)
+    with pytest.raises(ValueError, match="BRIDGE_API_KEY"):
+        load_settings(env)
+
+
+def test_whitespace_only_key_counts_as_unset(env, monkeypatch):
+    monkeypatch.setenv("BRIDGE_HOST", "0.0.0.0")
+    monkeypatch.setenv("BRIDGE_API_KEY", "   ")
+    with pytest.raises(ValueError, match="BRIDGE_API_KEY"):
+        load_settings(env)
+
+
+def test_auth_required_follows_key_presence(env, monkeypatch):
+    assert load_settings(env).auth_required is False
+    monkeypatch.setenv("BRIDGE_API_KEY", "k")
+    assert load_settings(env).auth_required is True
+
+
+def test_order_dependency_refuses_before_settings_loaded(monkeypatch):
+    monkeypatch.setattr(server, "_settings", None)
+    with pytest.raises(HTTPException) as e:
+        server.require_order_api_key("anything")
+    assert e.value.status_code == 403
