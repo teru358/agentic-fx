@@ -496,3 +496,68 @@ def test_reset_transitions_over_latch_cycles(tmp_path):
         for g in range(0, gen + 2):
             with pytest.raises(NotLatched):
                 store.reset_kill_switch(g)
+
+
+def _fail_dir_fsync(monkeypatch, times):
+    dir_fds = set()
+    real_open, real_fsync = os.open, os.fsync
+    left = [times]
+
+    def spy_open(p, flags, *a, **k):
+        fd = real_open(p, flags, *a, **k)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            dir_fds.add(fd)
+        return fd
+
+    def fsync(fd):
+        if fd in dir_fds and left[0] > 0:
+            left[0] -= 1
+            raise OSError(5, "injected")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def test_dir_fsync_failure_after_replace_is_durability_uncertain(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import DurabilityUncertain
+    store = StateStore(tmp_path / "app_state.json")
+    _fail_dir_fsync(monkeypatch, 1)
+    with pytest.raises(DurabilityUncertain) as ei:
+        store.update(initialized=True)
+    assert isinstance(ei.value.__cause__, OSError)
+    assert store.load().initialized is True  # 書かれてはいる
+
+
+def test_reset_with_failed_dir_fsync_restores_latched_state(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import ResetNotApplied
+    store = StateStore(tmp_path / "app_state.json")
+    store.update(kill_switch_latched=True)
+    before = store.load()
+    _fail_dir_fsync(monkeypatch, 1)
+    with pytest.raises(ResetNotApplied):
+        store.reset_kill_switch(before.kill_switch_generation)
+    assert store.load() == before
+
+
+def test_reset_raises_state_uncertain_when_restore_also_fails(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import StateUncertain
+    store = StateStore(tmp_path / "app_state.json")
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    _fail_dir_fsync(monkeypatch, 2)
+    with pytest.raises(StateUncertain):
+        store.reset_kill_switch(gen)
+
+
+def test_latching_with_failed_dir_fsync_propagates_and_file_stays_latched(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import DurabilityUncertain
+    store = StateStore(tmp_path / "app_state.json")
+    _fail_dir_fsync(monkeypatch, 1)
+    with pytest.raises(DurabilityUncertain):
+        store.update(kill_switch_latched=True)
+    assert store.load().kill_switch_latched is True

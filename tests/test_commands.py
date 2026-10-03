@@ -395,7 +395,11 @@ def test_killswitch_reset(tmp_path):
                   hwm=1_000_000, cashflow=0, source="paper")
     before = [dict(row) for row in conn.execute(
         "SELECT * FROM account_snapshots ORDER BY id")]
-    out = cmds.dispatch("killswitch reset")
+    gen = state.load().kill_switch_generation
+    guide = cmds.dispatch("killswitch reset")
+    assert state.load().kill_switch_latched is True  # 引数なしは何も書かない
+    assert f"killswitch reset {gen}" in guide
+    out = cmds.dispatch(f"killswitch reset {gen}")
     after = [dict(row) for row in conn.execute(
         "SELECT * FROM account_snapshots ORDER BY id")]
     # kill_switch_latched=False に変更されること
@@ -419,26 +423,97 @@ def test_killswitch_reset_when_not_latched_says_so(tmp_path):
 
 
 def test_killswitch_reset_refuses_when_latch_was_renewed(tmp_path):
-    """表示後にラッチが更新されたら、新しいラッチを消さずに確認を促す。"""
+    """status で見た世代の後にラッチが更新されたら、新しいラッチを消さない。"""
     conn, state, activity, cmds = _commands(tmp_path)
     state.update(kill_switch_latched=True)
-    real_load = state.load
-
-    def load_then_relatch():
-        s = real_load()
-        # シェルが読んだ直後に、解除と再ラッチが起きる
-        state.load = real_load
-        state.reset_kill_switch(s.kill_switch_generation)
-        state.update(kill_switch_latched=True)
-        return s
-
-    state.load = load_then_relatch
-    out = cmds.dispatch("killswitch reset")
-    state.load = real_load
-    assert "ラッチが更新されました" in out
+    seen = state.load().kill_switch_generation
+    # 人が確認した後に、解除と再ラッチが起きる
+    state.reset_kill_switch(seen)
+    state.update(kill_switch_latched=True)
+    out = cmds.dispatch(f"killswitch reset {seen}")
+    assert "ラッチが更新されたので" in out
     assert state.load().kill_switch_latched is True
     assert not any("kill_switch_reset" in r
                    for r in activity.tail(10, Category.SYSTEM))
+
+
+def test_killswitch_reset_without_generation_only_shows_the_latch(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    s = state.load()
+    out = cmds.dispatch("killswitch reset")
+    assert f"gen={s.kill_switch_generation}" in out
+    assert s.kill_switch_latched_at in out
+    assert state.load() == s
+    assert not any("kill_switch_reset" in r
+                   for r in activity.tail(10, Category.SYSTEM))
+
+
+def test_killswitch_reset_rejects_a_non_numeric_generation(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    out = cmds.dispatch("killswitch reset abc")
+    assert "usage" in out
+    assert state.load().kill_switch_latched is True
+
+
+def test_status_shows_generation_and_time_only_while_latched(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    assert "kill switch: ok\n" in cmds.dispatch("status")
+    state.update(kill_switch_latched=True)
+    s = state.load()
+    out = cmds.dispatch("status")
+    assert (f"kill switch: LATCHED gen={s.kill_switch_generation} "
+            f"since={s.kill_switch_latched_at}") in out
+
+
+def _fail_dir_fsync(monkeypatch, *, times):
+    """親 dir の fsync を指定回数だけ失敗させる (replace 後の段)。"""
+    import os
+    dir_fds = set()
+    real_open, real_fsync = os.open, os.fsync
+    left = [times]
+
+    def spy_open(p, flags, *a, **k):
+        fd = real_open(p, flags, *a, **k)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            dir_fds.add(fd)
+        return fd
+
+    def fsync(fd):
+        if fd in dir_fds and left[0] > 0:
+            left[0] -= 1
+            raise OSError(5, "injected")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "fsync", fsync)
+
+
+def test_killswitch_reset_says_not_applied_when_save_fails_but_old_state_is_restored(
+        tmp_path, monkeypatch):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    gen = state.load().kill_switch_generation
+    _fail_dir_fsync(monkeypatch, times=1)
+    out = cmds.dispatch(f"killswitch reset {gen}")
+    assert "解除は適用されていません" in out
+    assert state.load().kill_switch_latched is True
+    assert not any("kill_switch_reset" in r
+                   for r in activity.tail(10, Category.SYSTEM))
+
+
+def test_killswitch_reset_reports_uncertain_state_and_writes_activity(
+        tmp_path, monkeypatch):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    gen = state.load().kill_switch_generation
+    _fail_dir_fsync(monkeypatch, times=2)
+    out = cmds.dispatch(f"killswitch reset {gen}")
+    assert "状態が不明です" in out
+    recs = activity.tail(10, Category.SYSTEM)
+    assert any("kill_switch_state_uncertain" in r for r in recs)
+    assert not any("kill_switch_reset" in r for r in recs)
 
 
 def test_unknown_shows_help(tmp_path):

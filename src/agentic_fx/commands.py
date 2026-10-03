@@ -19,7 +19,8 @@ from agentic_fx.store import (approvals, backlog, candidate_archives,
                               missions, orders, reflection_attempts,
                               reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
-from agentic_fx.store.state import GenerationMismatch, NotLatched, StateStore
+from agentic_fx.store.state import (
+    GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 
 _HELP = """コマンド一覧:
   status                     残高・モード・kill switch・直近 mission
@@ -31,7 +32,7 @@ _HELP = """コマンド一覧:
   approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
   approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
-  killswitch reset           kill switch ラッチの解除 (人間の明示操作)
+  killswitch reset [<世代>]  kill switch ラッチの解除 (人間の明示操作)
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   improve                    手動 improve one-shot (全バックログ担当)
   improve add <idea text>    バックログへ課題を追加
@@ -198,14 +199,37 @@ class Commands:
                 # いた欠陥の一部。
                 return self._approval_detail(int(args[0]))
             if cmd == "killswitch" and args and args[0] == "reset":
-                shown = self.state.load()
+                if len(args) == 1:
+                    shown = self.state.load()
+                    if not shown.kill_switch_latched:
+                        return "kill switch はラッチされていません"
+                    return (f"kill switch は LATCHED です "
+                            f"(gen={shown.kill_switch_generation} "
+                            f"since={shown.kill_switch_latched_at})。"
+                            f"解除するには `killswitch reset "
+                            f"{shown.kill_switch_generation}` を実行してください")
                 try:
-                    self.state.reset_kill_switch(shown.kill_switch_generation)
+                    generation = int(args[1]) if len(args) == 2 else None
+                except ValueError:
+                    generation = None
+                if generation is None:
+                    return "usage: killswitch reset [<世代>]"
+                try:
+                    self.state.reset_kill_switch(generation)
                 except NotLatched:
                     return "kill switch はラッチされていません"
                 except GenerationMismatch:
-                    return ("kill switch のラッチが更新されました。"
-                            "status を確認してからもう一度実行してください")
+                    return ("kill switch のラッチが更新されたので status を"
+                            "確認してからもう一度実行してください")
+                except ResetNotApplied:
+                    return ("解除は適用されていません (保存に失敗)。"
+                            "再試行してください")
+                except StateUncertain:
+                    msg = ("状態ファイルの保存に失敗し、kill switch の状態が不明です。"
+                           "新規の取引を止め、ディスクを確認してください")
+                    self.activity.write(Category.SYSTEM,
+                                        "kill_switch_state_uncertain", msg)
+                    return msg
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",
                                     "human explicit reset via shell")
                 return "kill switch ラッチを解除しました"
@@ -360,9 +384,12 @@ class Commands:
         recent = missions.recent(self.conn, 1)
         last = (f"{recent[0]['loop']}:{recent[0]['status']} "
                 f"({recent[0]['started_at']})") if recent else "なし"
+        ks = ("LATCHED" + (f" gen={s.kill_switch_generation}"
+                           f" since={s.kill_switch_latched_at}")
+              if s.kill_switch_latched else "ok")
         result = (f"mode: {s.mode.value} / autopilot: "
                 f"{'on' if s.autopilot else 'off'} / kill switch: "
-                f"{'LATCHED' if s.kill_switch_latched else 'ok'}\n"
+                f"{ks}\n"
                 f"残高: {balance:,.0f} / エクイティ: {equity:,.0f}\n"
                 f"アクティブ orders: {len(active)}\n"
                 f"直近 mission: {last}")

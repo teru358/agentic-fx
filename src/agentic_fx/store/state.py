@@ -34,6 +34,21 @@ class GenerationMismatch(Exception):
         self.latched_at = latched_at
 
 
+class DurabilityUncertain(Exception):
+    """os.replace は済んだが、その後の親 dir の fsync 系が失敗した。
+
+    新しい内容が書かれたが、耐久性が未確認の状態。元の例外を __cause__ に持つ。
+    """
+
+
+class ResetNotApplied(Exception):
+    """解除の保存に失敗したが、旧状態 (ラッチ中) を書き戻せた。解除は適用されていない。"""
+
+
+class StateUncertain(Exception):
+    """解除の保存に失敗し、旧状態の書き戻しにも失敗した。ラッチの状態が不明。"""
+
+
 @dataclass(frozen=True, slots=True)
 class AppState:
     initialized: bool = False
@@ -137,11 +152,15 @@ class StateStore:
             except FileNotFoundError:
                 pass
             raise
-        dfd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+            dfd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as e:
+            raise DurabilityUncertain(
+                "state file was replaced but directory fsync failed") from e
 
     def update(self, **changes) -> AppState:
         valid = {f.name for f in fields(AppState)}
@@ -172,5 +191,17 @@ class StateStore:
                 raise GenerationMismatch(current.kill_switch_generation,
                                          current.kill_switch_latched_at)
             state = replace(current, kill_switch_latched=False)
-            self.save(state)
+            try:
+                self.save(state)
+            except DurabilityUncertain as first:
+                # 解除が書かれたかもしれない。ラッチ中の旧状態を書き直し、
+                # 解除は適用されなかったことに揃える。
+                try:
+                    self.save(current)
+                except Exception as second:
+                    raise StateUncertain(
+                        "kill switch state is unknown after a failed save"
+                    ) from second
+                raise ResetNotApplied(
+                    "kill switch reset was not applied") from first
             return state
