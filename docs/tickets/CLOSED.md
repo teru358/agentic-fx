@@ -2,10 +2,11 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (27)
+## 2026-10 (28)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
+| [selection-rationale-unverified](selection-rationale-unverified.md) | 是正済 | 高 | 2026-10-03 | 承認材料の selection_rationale が未検証で捏造され得る |
 | [approval-payload-missing-gate-metrics](approval-payload-missing-gate-metrics.md) | 是正済 | 未設定 | 2026-10-02 | 承認 payload に gate の測定値が載らない問題は是正済 |
 | [backtest-base-interval](backtest-base-interval.md) | 是正済 | 未設定 | 2026-10-02 | バックテスト基底足の可変化 (1m/5m/15m) は完了 |
 | [backtest-rpc-timeout-15s](backtest-rpc-timeout-15s.md) | 是正済 | 未設定 | 2026-10-02 | backtest の RPC が 15 秒で必ず timeout する不具合 (是正済) |

@@ -1,13 +1,12 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 127 件。完了分は CLOSED.md。
+未完了: 126 件。完了分は CLOSED.md。
 
-## 実装待ち (23)
+## 実装待ち (22)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [selection-rationale-unverified](selection-rationale-unverified.md) | 高 |  | 承認材料の selection_rationale が未検証で捏造され得る |
 | [legacy-e2e-diag](legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [legacy-2026-08-22-a-4](legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
