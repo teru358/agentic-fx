@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-10-03
 closed: null
-related: [baseline-replay-unimplemented]
+related: [first-run-setup]
 ---
 # [improve-daily-params-weekly-algorithm] 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける
 
@@ -29,3 +29,4 @@ cadence が 1 種類で、軽い調整 (params) と重い改善 (ロジック) �
 
 - 2026-10-03: 起票。
 - 2026-10-03: 関連: [baseline-replay-unimplemented] — 2026-10-03: この環境の settings は Sat 08:00 に変更済。製品既定 (config.py の Sat 03:00、settings.yaml.example) は取引中なので、設計時に閉場後の既定へ変える。
+- 2026-10-03: 関連: [first-run-setup] — 2026-10-03: improve_at は display_timezone で解釈されるので他の標準時でも動くが、「閉場後」の時刻は標準時ごとに違う (JST Sat 08:00 = London Sat 00:00 頃 = NY Fri 19:00 頃)。製品既定は固定文字列でなく市場基準 (NY 閉場の N 時間後を表示 TZ に換算) も選べる形にし、ウィザードで提案する。
