@@ -23,7 +23,7 @@ from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import missions as missions_store
 from agentic_fx.store import orders
-from agentic_fx.store.state import StateStore
+from agentic_fx.store.state import DurabilityUncertain, StateStore
 
 # broker 上で存在を否定できない全状態 (保守的にリスク予約へ算入)
 _EXPOSURE = (S.OPEN, S.PENDING_FILL, S.PROTECTION_PENDING, S.SUBMITTING,
@@ -566,6 +566,16 @@ class Executor:
             now=now)
         return self._evaluate_and_execute_open(intent, iid, ctx)
 
+    def _best_effort_record(self, kind: str, msg: str) -> None:
+        try:
+            self.activity.write(Category.SYSTEM, kind, msg)
+        except Exception:  # noqa: BLE001 — 記録の失敗で拒否の完結を妨げない
+            pass
+        try:
+            self._notify(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _evaluate_and_execute_open(self, intent: TradeIntent, iid: int,
                                    ctx: GateContext) -> dict:
         """`_open`/`open_from_snapshot` の共有末尾 (判定ロジック不変—
@@ -578,9 +588,21 @@ class Executor:
                                           reject_category="risk_gate")
             if any("kill switch" in r and "latched" not in r
                    for r in result.reasons):
-                self.state.update(kill_switch_latched=True)
-                self.activity.write(Category.SYSTEM, "kill_switch_latched",
-                                    "drawdown threshold hit — 新規停止 (解除は明示操作)")
+                try:
+                    self.state.update(kill_switch_latched=True)
+                except DurabilityUncertain:
+                    # 書かれてはいるが耐久性が未確認。現在値を確かめ、
+                    # ラッチ済みなら専用の記録を残して拒否として完結させる。
+                    if not self.state.load().kill_switch_latched:
+                        raise
+                    msg = ("drawdown threshold hit — 新規停止。ラッチは保存"
+                           "されたが耐久性が未確認 (ディスクを確認)")
+                    self._best_effort_record("kill_switch_latched_durability_uncertain",
+                                             msg)
+                else:
+                    self.activity.write(
+                        Category.SYSTEM, "kill_switch_latched",
+                        "drawdown threshold hit — 新規停止 (解除は明示操作)")
             self.activity.write(Category.TRADE, "gate_rejected",
                                 "; ".join(result.reasons)[:200], ref_id=str(iid))
             return {"result": "rejected", "order_id": None,

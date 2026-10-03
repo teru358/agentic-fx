@@ -775,3 +775,40 @@ def test_close_with_no_rate_ever_leaves_realized_pnl_none(tmp_path):
     closed = orders.get(conn, oid)
     assert closed["status"] == "closed"
     assert closed["realized_pnl"] is None
+
+
+def test_open_is_rejected_when_state_file_is_unlatched_but_state_is_uncertain(
+        tmp_path):
+    """解除の復旧に失敗した後は、ファイルが未ラッチでも新規 OPEN を通さない。"""
+    import json
+    from agentic_fx.store import state as state_mod
+    conn, ex, state, mid = _setup(tmp_path)
+    state.update(kill_switch_latched=True)
+    state._mark_uncertain()
+    raw = json.loads((tmp_path / "state.json").read_text())
+    raw["kill_switch_latched"] = False
+    (tmp_path / "state.json").write_text(json.dumps(raw))
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "rejected"
+    assert any("latched" in r for r in out["reasons"])
+    assert orders.list_by_status(conn, "open") == []
+    assert orders.list_by_status(conn, "pending_fill") == []
+
+
+def test_latch_with_uncertain_durability_still_rejects_and_records(tmp_path):
+    from agentic_fx.store.state import DurabilityUncertain
+    conn, ex, state, mid = _setup(tmp_path)
+    real_update = state.update
+
+    def update(**kw):
+        real_update(**kw)
+        raise DurabilityUncertain("injected")
+
+    state.update = update
+    record_snapshot(conn, now=NOW, balance=970_000, equity=970_000)  # DD 3%
+    out = ex.handle_intent(_open_intent(), mid)
+    assert out["result"] == "rejected"
+    log = (tmp_path / "activity.log").read_text()
+    assert "kill_switch_latched_durability_uncertain" in log
+    assert "gate_rejected" in log
+    assert state.load().kill_switch_latched is True

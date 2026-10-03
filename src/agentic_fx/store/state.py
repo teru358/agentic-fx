@@ -4,8 +4,8 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import tempfile
 import threading
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import timezone
@@ -63,6 +63,16 @@ _BOOL_FIELDS = ("initialized", "autopilot", "kill_switch_latched")
 _REQUIRED_KEYS = ("initialized", "mode", "autopilot", "kill_switch_latched")
 
 
+# 状態が不明になったパスの集合 (プロセス内)。service はコマンドごとに
+# StateStore を作り直すので、インスタンスでなくパスで覚える。再起動まで解けない。
+_UNCERTAIN_PATHS: set[str] = set()
+_UNCERTAIN_GUARD = threading.Lock()
+
+
+def _path_key(path: Path) -> str:
+    return os.path.abspath(str(path))
+
+
 class StateStore:
     def __init__(self, path: Path, *, clock: Clock | None = None) -> None:
         self._path = path
@@ -86,7 +96,48 @@ class StateStore:
             finally:
                 os.close(fd)  # close で flock も解放される
 
+    def _is_uncertain(self) -> bool:
+        with _UNCERTAIN_GUARD:
+            return _path_key(self._path) in _UNCERTAIN_PATHS
+
+    def _mark_uncertain(self) -> None:
+        with _UNCERTAIN_GUARD:
+            _UNCERTAIN_PATHS.add(_path_key(self._path))
+
+    @contextmanager
+    def _shared(self):
+        """writer の復旧または fail-closed 化が終わるまで読者を待たせる共有 lock。
+
+        lock ファイルを作れない (読み取り専用領域等) ときは開けるなら読み取りで、
+        存在しなければ writer が居ないので lock なしで読む。
+        """
+        if not self._path.parent.exists():
+            yield
+            return
+        lock = str(self._path) + ".lock"
+        try:
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            try:
+                fd = os.open(lock, os.O_RDONLY)
+            except OSError:
+                yield
+                return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH)
+            yield
+        finally:
+            os.close(fd)
+
     def load(self) -> AppState:
+        """共有 lock を取って読む。状態不明になったパスは常にラッチ済みとして返す。"""
+        with self._shared():
+            state = self._load_unlocked()
+        if self._is_uncertain():
+            return replace(state, kill_switch_latched=True)
+        return state
+
+    def _load_unlocked(self) -> AppState:
         if not self._path.exists():
             return AppState()
         raw = json.loads(self._path.read_text(encoding="utf-8"))
@@ -138,10 +189,18 @@ class StateStore:
         d = asdict(state)
         d["mode"] = state.mode.value
         payload = json.dumps(d, ensure_ascii=False, indent=1).encode("utf-8")
-        fd, tmp = tempfile.mkstemp(dir=parent, prefix=self._path.name + ".",
-                                   suffix=".tmp")
+        self._purge_orphan_temps(parent)
         try:
+            mode = self._path.stat().st_mode & 0o7777
+        except FileNotFoundError:
+            mode = None
+        tmp = str(parent / f"{self._path.name}.{os.getpid()}."
+                           f"{uuid.uuid4().hex}.tmp")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
             with os.fdopen(fd, "wb") as f:
+                if mode is not None:
+                    os.fchmod(f.fileno(), mode)
                 f.write(payload)
                 f.flush()
                 os.fsync(f.fileno())
@@ -162,13 +221,26 @@ class StateStore:
             raise DurabilityUncertain(
                 "state file was replaced but directory fsync failed") from e
 
+    def _purge_orphan_temps(self, parent: Path) -> None:
+        """kill で残った一時ファイルを消す。save は排他中にしか呼ばれない。"""
+        for orphan in parent.glob(self._path.name + ".*.tmp"):
+            try:
+                orphan.unlink()
+            except OSError:
+                pass
+
     def update(self, **changes) -> AppState:
         valid = {f.name for f in fields(AppState)}
         unknown = set(changes) - valid
         if unknown:
             raise TypeError(f"unknown state fields: {unknown}")
         with self._exclusive():
-            current = self.load()
+            current = self._load_unlocked()
+            if changes == {"kill_switch_latched": True} \
+                    and current.kill_switch_latched:
+                return current  # 既にラッチ済み。書かない
+            if changes.get("kill_switch_latched") is False:
+                changes = {**changes, "kill_switch_latched_at": None}
             if changes.get("kill_switch_latched") is True \
                     and not current.kill_switch_latched:
                 changes = {
@@ -184,7 +256,10 @@ class StateStore:
     def reset_kill_switch(self, expected_generation: int) -> AppState:
         """ラッチ中かつ世代が一致するときだけ解除する。それ以外は何も書かない。"""
         with self._exclusive():
-            current = self.load()
+            if self._is_uncertain():
+                raise StateUncertain(
+                    "kill switch state is unknown; restart after checking it")
+            current = self._load_unlocked()
             if not current.kill_switch_latched:
                 raise NotLatched()
             if current.kill_switch_generation != expected_generation:
@@ -199,6 +274,7 @@ class StateStore:
                 try:
                     self.save(current)
                 except Exception as second:
+                    self._mark_uncertain()
                     raise StateUncertain(
                         "kill switch state is unknown after a failed save"
                     ) from second

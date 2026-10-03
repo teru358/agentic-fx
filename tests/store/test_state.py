@@ -89,6 +89,7 @@ def test_load_rejects_int_for_bool_field(tmp_path):
 
 # --- 排他・耐久性・世代付きラッチ -------------------------------------------
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -145,7 +146,7 @@ def test_update_holds_lock_across_read_modify_write(tmp_path):
     other = StateStore(path)
     inside = threading.Event()
     release = threading.Event()
-    real_load = store.load
+    real_load = store._load_unlocked
 
     def slow_load():
         s = real_load()
@@ -153,7 +154,7 @@ def test_update_holds_lock_across_read_modify_write(tmp_path):
         release.wait(5)
         return s
 
-    store.load = slow_load
+    store._load_unlocked = slow_load
     t = threading.Thread(target=lambda: store.update(autopilot=True))
     t.start()
     assert inside.wait(5)
@@ -359,7 +360,7 @@ def test_reset_holds_lock_across_read_modify_write(tmp_path):
     store.update(kill_switch_latched=True)
     inside = threading.Event()
     release = threading.Event()
-    real_load = store.load
+    real_load = store._load_unlocked
 
     def slow_load():
         s = real_load()
@@ -367,7 +368,7 @@ def test_reset_holds_lock_across_read_modify_write(tmp_path):
         release.wait(5)
         return s
 
-    store.load = slow_load
+    store._load_unlocked = slow_load
     t = threading.Thread(target=lambda: store.reset_kill_switch(1))
     t.start()
     assert inside.wait(5)
@@ -561,3 +562,151 @@ def test_latching_with_failed_dir_fsync_propagates_and_file_stays_latched(
     with pytest.raises(DurabilityUncertain):
         store.update(kill_switch_latched=True)
     assert store.load().kill_switch_latched is True
+
+
+def test_reader_waits_for_writer_recovery_and_never_sees_unlatched(
+        tmp_path, monkeypatch):
+    """解除の置き換え後・復旧前に別インスタンスが読んでも、復旧完了まで待つ。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    _fail_dir_fsync(monkeypatch, 1)
+    at_recovery = threading.Event()
+    release = threading.Event()
+    real_save = StateStore.save
+    calls = []
+
+    def save(self, state):
+        calls.append(state.kill_switch_latched)
+        if len(calls) == 2:  # 復旧の保存の手前で止める
+            at_recovery.set()
+            release.wait(5)
+        return real_save(self, state)
+
+    monkeypatch.setattr(StateStore, "save", save)
+    from agentic_fx.store.state import ResetNotApplied
+
+    def reset():
+        with pytest.raises(ResetNotApplied):
+            store.reset_kill_switch(gen)
+
+    t = threading.Thread(target=reset)
+    t.start()
+    assert at_recovery.wait(5)
+    assert json.loads(path.read_text())["kill_switch_latched"] is False
+    seen = []
+    done = threading.Event()
+
+    def reader():
+        seen.append(StateStore(path).load().kill_switch_latched)
+        done.set()
+
+    r = threading.Thread(target=reader)
+    r.start()
+    assert not done.wait(0.3)  # 復旧が終わるまで読者は待たされる
+    release.set()
+    t.join()
+    r.join()
+    assert seen == [True]
+
+
+def _fail_recovery_stage(monkeypatch, stage):
+    """最初の保存は親 dir の fsync で失敗させ、復旧の保存を stage で失敗させる。"""
+    real_fsync = os.fsync
+    real_replace, real_fdopen = os.replace, os.fdopen
+    n = {"dir": 0, "file_fsync": 0, "replace": 0, "fdopen": 0}
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            n["dir"] += 1
+            if n["dir"] == 1 or stage == "dir_fsync":
+                raise OSError(5, "injected")
+        else:
+            n["file_fsync"] += 1
+            if n["file_fsync"] == 2 and stage == "fsync":
+                raise OSError(5, "injected")
+        return real_fsync(fd)
+
+    def replace(a, b):
+        n["replace"] += 1
+        if n["replace"] == 2 and stage == "replace":
+            raise OSError(28, "injected")
+        return real_replace(a, b)
+
+    def fdopen(fd, *a, **k):
+        f = real_fdopen(fd, *a, **k)
+        n["fdopen"] += 1
+        if n["fdopen"] == 2 and stage == "write":
+            def boom(_data):
+                raise OSError(28, "injected")
+            f.write = boom
+        return f
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "fdopen", fdopen)
+
+
+@pytest.mark.parametrize("stage", ["write", "fsync", "replace", "dir_fsync"])
+def test_state_uncertain_makes_every_later_load_latched(
+        tmp_path, monkeypatch, stage):
+    """復旧が失敗してファイルが解除済みのままでも、以後は別インスタンスも含めラッチ。"""
+    from agentic_fx.store.state import StateUncertain
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    _fail_recovery_stage(monkeypatch, stage)
+    with pytest.raises(StateUncertain):
+        store.reset_kill_switch(gen)
+    monkeypatch.undo()
+    on_disk = json.loads(path.read_text())["kill_switch_latched"]
+    assert on_disk is (stage == "dir_fsync")  # 復旧の replace が済んだ段だけ
+    assert store.load().kill_switch_latched is True
+    assert StateStore(path).load().kill_switch_latched is True
+    with pytest.raises(StateUncertain):  # 再起動まで解除は受け付けない
+        StateStore(path).reset_kill_switch(gen)
+
+
+def test_update_latch_when_already_latched_writes_nothing(
+        tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "app_state.json")
+    store.update(kill_switch_latched=True)
+    before = (tmp_path / "app_state.json").stat().st_mtime_ns
+
+    def boom(*a, **k):
+        raise AssertionError("must not write")
+
+    monkeypatch.setattr(os, "replace", boom)
+    assert store.update(kill_switch_latched=True).kill_switch_latched is True
+    assert (tmp_path / "app_state.json").stat().st_mtime_ns == before
+
+
+def test_orphan_temp_files_are_removed_on_next_save(tmp_path):
+    orphan = tmp_path / "app_state.json.99999.deadbeef.tmp"
+    orphan.write_text("junk")
+    StateStore(tmp_path / "app_state.json").update(initialized=True)
+    assert not orphan.exists()
+
+
+def test_saved_file_keeps_umask_permissions_and_existing_mode(tmp_path):
+    old = os.umask(0o022)
+    try:
+        path = tmp_path / "app_state.json"
+        store = StateStore(path)
+        store.update(initialized=True)
+        assert (path.stat().st_mode & 0o777) == 0o644
+        os.chmod(path, 0o640)
+        store.update(autopilot=True)
+        assert (path.stat().st_mode & 0o777) == 0o640
+    finally:
+        os.umask(old)
+
+
+def test_update_to_unlatched_clears_latched_at_but_keeps_generation(tmp_path):
+    store = StateStore(tmp_path / "app_state.json", clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    s = store.update(kill_switch_latched=False)
+    assert s.kill_switch_latched_at is None
+    assert s.kill_switch_generation == 1

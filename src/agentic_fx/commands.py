@@ -50,6 +50,9 @@ def _normalize_idea_display(text: str) -> tuple[str, int]:
     return "".join(kept).strip(), removed
 
 
+_MAX_GENERATION = 2**31
+
+
 class Commands:
     def __init__(self, *, conn: sqlite3.Connection, state_store: StateStore,
                  broker: PaperBroker, trade_loop, activity: ActivityLog,
@@ -208,20 +211,32 @@ class Commands:
                             f"since={shown.kill_switch_latched_at})。"
                             f"解除するには `killswitch reset "
                             f"{shown.kill_switch_generation}` を実行してください")
-                try:
-                    generation = int(args[1]) if len(args) == 2 else None
-                except ValueError:
-                    generation = None
+                generation = None
+                if len(args) == 2 and args[1].isascii() and args[1].isdigit():
+                    generation = int(args[1])
+                    if generation > _MAX_GENERATION:
+                        generation = None
                 if generation is None:
                     return "usage: killswitch reset [<世代>]"
                 try:
+                    before = self.state.load()
                     self.state.reset_kill_switch(generation)
                 except NotLatched:
+                    self.activity.write(
+                        Category.SYSTEM, "killswitch_release_refused",
+                        f"not latched (requested gen={generation})")
                     return "kill switch はラッチされていません"
-                except GenerationMismatch:
+                except GenerationMismatch as e:
+                    self.activity.write(
+                        Category.SYSTEM, "killswitch_release_refused",
+                        f"generation mismatch (requested gen={generation} "
+                        f"current gen={e.current})")
                     return ("kill switch のラッチが更新されたので status を"
                             "確認してからもう一度実行してください")
                 except ResetNotApplied:
+                    self.activity.write(
+                        Category.SYSTEM, "killswitch_release_not_applied",
+                        f"save failed, latch kept (gen={generation})")
                     return ("解除は適用されていません (保存に失敗)。"
                             "再試行してください")
                 except StateUncertain:
@@ -230,8 +245,10 @@ class Commands:
                     self.activity.write(Category.SYSTEM,
                                         "kill_switch_state_uncertain", msg)
                     return msg
-                self.activity.write(Category.SYSTEM, "kill_switch_reset",
-                                    "human explicit reset via shell")
+                self.activity.write(
+                    Category.SYSTEM, "kill_switch_reset",
+                    f"human explicit reset via shell gen={generation} "
+                    f"latched_at={before.kill_switch_latched_at}")
                 return "kill switch ラッチを解除しました"
             if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
                 order_id = int(args[1])
