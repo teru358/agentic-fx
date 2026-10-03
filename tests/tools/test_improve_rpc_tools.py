@@ -670,3 +670,176 @@ def test_started_true_keeps_the_reservation(tmp_path):
     tools["run_backtest"](name="cand", pair="USDJPY")
     assert counters.backtest_calls["cand"] == 1
     assert counters.successful_backtests["cand"] == 1
+
+
+# --- 同じ CPU 上限失敗は 3 回目から実行しない ---
+
+def _cpu_env(tmp_path, replies, *, max_backtests=6):
+    """registry 経由 (tool call -> counters -> ledger -> 応答) の環境。
+    `replies` は handler が呼ばれるたびに順に返す応答 (尽きたら最後を繰り返す)。"""
+    import shutil
+
+    from agentic_fx.tools.registry import ToolRegistry
+    from tests.fixtures import indicator_wiring as fx
+
+    staging = tmp_path / "staging"
+    fx.write_rsi_pullback(staging, pins=None)
+    shutil.copytree(staging / "rsi_pullback", staging / "cand")
+    calls: list[dict] = []
+
+    def handler(args):
+        calls.append(dict(args))
+        return dict(replies[min(len(calls), len(replies)) - 1])
+
+    budget = ImproveToolBudgetSettings(
+        max_backtests_per_candidate=max_backtests)
+    counters = MissionToolCounters(budget=budget)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 60})
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handler,
+        analyze_corr_handler=lambda a: {}, staging_dir=staging,
+        counters=counters, budget=budget))
+
+    def call(name="cand", pair="USDJPY"):
+        return json.loads(registry.execute(
+            "run_backtest", {"name": name, "pair": pair},
+            allowed=registry.names()))
+
+    return call, calls, counters, ledger, staging
+
+
+_CPU_REPLY = {"started": True, "error": "worker_cpu_limit", "hint": "h"}
+
+
+def test_third_identical_cpu_limit_is_refused_without_running_or_spending_the_slot(
+        tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+
+    first, second, third = call(), call(), call()
+
+    assert first["error"] == second["error"] == "worker_cpu_limit"
+    assert len(calls) == 2
+    assert third["started"] is False
+    assert third["error"] == "repeated_worker_cpu_limit"
+    assert isinstance(third["hint"], str) and third["hint"]
+    assert counters.backtest_calls["cand"] == 2
+    assert third["remaining_budget"] == {"backtests_for_candidate": 4}
+    assert counters.total_calls == 3
+    assert counters.errors == 3
+    assert counters.recoverable_refusal_streak[
+        ("run_backtest", "tool_error:repeated_worker_cpu_limit")] == 1
+    assert sum(counters.cpu_limit_observations.values()) == 2
+    assert counters.refusals == 0 and not counters.abort_pending
+
+
+def test_repeated_cpu_limit_refusal_is_recorded_in_the_ledger_with_the_same_error(
+        tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call()
+    third = call()
+    ledger.freeze()
+    entries = ledger.entries()
+
+    assert len(entries) == 3
+    refusal = entries[2]
+    assert refusal["kind"] == "run_backtest"
+    assert refusal["params"] == {"name": "cand", "pair": "USDJPY"}
+    assert refusal["result_summary"]["error"] == third["error"] \
+        == "repeated_worker_cpu_limit"
+    assert refusal["result_summary"]["started"] is False
+    assert refusal["result_summary"]["hint"] == third["hint"]
+    assert refusal["trial_count"] == 0
+
+
+def test_repeated_cpu_limit_refusal_exposes_no_internal_values(tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call()
+    third = call()
+    ledger.freeze()
+    dumped = json.dumps([third, ledger.entries()[2]], default=str)
+    assert set(third) == {"started", "error", "hint", "remaining_budget"}
+    assert not any(ch.isdigit() for ch in third["hint"])
+    for marker in ("cpu_sec", "limit", "stderr", "returncode", "signal",
+                   "observ"):
+        assert marker not in third["hint"].lower()
+    assert "stderr" not in dumped and "returncode" not in dumped
+
+
+def test_repeated_cpu_limit_refusal_wins_over_an_exhausted_candidate_budget(
+        tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(
+        tmp_path, [_CPU_REPLY], max_backtests=2)
+    call(), call()
+    third = call()
+    assert third["error"] == "repeated_worker_cpu_limit"
+    assert counters.refusals == 0
+    assert counters.backtest_calls["cand"] == 2
+
+
+def test_cpu_limit_is_retried_when_content_hash_changes(tmp_path):
+    call, calls, counters, ledger, staging = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call()
+    assert call()["error"] == "repeated_worker_cpu_limit"
+    assert len(calls) == 2
+
+    plugin_py = staging / "cand" / "plugin.py"
+    plugin_py.write_text(plugin_py.read_text() + "\n# edited\n")
+    assert call()["error"] == "worker_cpu_limit"
+    assert len(calls) == 3
+    assert call()["error"] == "worker_cpu_limit"
+    assert len(calls) == 4
+    assert call()["error"] == "repeated_worker_cpu_limit"
+    assert len(calls) == 4
+
+
+def test_cpu_limit_is_retried_when_pair_changes(tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call()
+    assert call()["error"] == "repeated_worker_cpu_limit"
+    assert call(pair="EURUSD")["error"] == "worker_cpu_limit"
+    assert [c["pair"] for c in calls] == ["USDJPY", "USDJPY", "EURUSD"]
+
+
+@pytest.mark.parametrize("public", [
+    "worker_crashed", "worker_timeout", "backtest_failed"])
+def test_other_worker_failures_never_count_towards_the_cpu_refusal(
+        tmp_path, public):
+    reply = {"started": True, "error": public, "hint": "h"}
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [reply])
+    results = [call() for _ in range(4)]
+    assert [r["error"] for r in results] == [public] * 4
+    assert len(calls) == 4
+    assert sum(counters.cpu_limit_observations.values()) == 0
+
+
+def test_cpu_limit_without_started_true_is_not_counted(tmp_path):
+    reply = {"error": "worker_cpu_limit"}
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [reply])
+    for _ in range(3):
+        assert call()["error"] == "worker_cpu_limit"
+    assert len(calls) == 3
+    assert sum(counters.cpu_limit_observations.values()) == 0
+
+
+def test_a_successful_run_between_cpu_failures_does_not_reset_the_observations(
+        tmp_path):
+    ok = {"started": True, "metrics": {"trades": 5}}
+    call, calls, counters, ledger, _ = _cpu_env(
+        tmp_path, [_CPU_REPLY, ok, _CPU_REPLY, _CPU_REPLY])
+    call(), call()
+    call()
+    assert call()["error"] == "repeated_worker_cpu_limit"
+    assert len(calls) == 3
+
+
+def test_existing_preflight_refusals_do_not_touch_cpu_observations_or_ledger_rows(
+        tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    assert call(name="Bad-Name")["error"] == "invalid candidate name"
+    assert call(name="missing")["error"].startswith("loader_rejected")
+    assert calls == []
+    ledger.freeze()
+    assert ledger.entries() == []
+    assert sum(counters.cpu_limit_observations.values()) == 0

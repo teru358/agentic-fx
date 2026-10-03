@@ -254,3 +254,24 @@ def test_release_backtest_does_not_touch_successful_backtests():
     before = c.successful_backtests["cand"]
     c.release_backtest("cand")
     assert c.successful_backtests["cand"] == before
+
+
+def test_cpu_limit_observations_are_counted_per_hash_and_pair():
+    counters = MissionToolCounters(budget=_budget())
+    assert counters.cpu_limit_observations[("h1", "USDJPY")] == 0
+    counters.record_cpu_limit_observation(("h1", "USDJPY"))
+    counters.record_cpu_limit_observation(("h1", "USDJPY"))
+    counters.record_cpu_limit_observation(("h1", "EURUSD"))
+    counters.record_cpu_limit_observation(("h2", "USDJPY"))
+    assert counters.cpu_limit_observations[("h1", "USDJPY")] == 2
+    assert counters.cpu_limit_observations[("h1", "EURUSD")] == 1
+    assert counters.cpu_limit_observations[("h2", "USDJPY")] == 1
+
+
+def test_cpu_limit_observation_count_is_exact_under_concurrency():
+    counters = MissionToolCounters(budget=_budget())
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda _: counters.record_cpu_limit_observation(("h", "P")),
+            range(200)))
+    assert counters.cpu_limit_observations[("h", "P")] == 200

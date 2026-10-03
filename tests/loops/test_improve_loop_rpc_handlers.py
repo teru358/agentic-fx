@@ -1242,6 +1242,10 @@ def test_public_error_is_identical_across_response_ledger_and_counter(
     _raising_run_in_sample(monkeypatch, _leaky("cpu_limit"))
     staging = tmp_path / "staging"
     (staging / "myst").mkdir(parents=True)
+    for filename, body in (("plugin.py", "def evaluate(*args): return {}\n"),
+                           ("config.yaml", "kind: strategy\n"),
+                           ("test_plugin.py", "def test_candidate(): pass\n")):
+        (staging / "myst" / filename).write_text(body)
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
     handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging)
     budget = ImproveToolBudgetSettings()
@@ -1265,6 +1269,65 @@ def test_public_error_is_identical_across_response_ledger_and_counter(
         ("run_backtest", "tool_error:worker_cpu_limit")] == 1
     for sink in (raw, json.dumps(entry, default=str)):
         for marker in _LEAK_MARKERS:
+            assert marker not in sink
+
+
+def _registry_with_real_handler(loop_min, tmp_path):
+    from agentic_fx.config import ImproveToolBudgetSettings
+    from agentic_fx.tools.improve_rpc_tools import build_improve_rpc_tooldefs
+    from agentic_fx.tools.mission_counters import MissionToolCounters
+    from agentic_fx.tools.registry import ToolRegistry
+
+    staging = tmp_path / "staging"
+    (staging / "myst").mkdir(parents=True)
+    for filename, body in (("plugin.py", "def evaluate(*args): return {}\n"),
+                           ("config.yaml", "kind: strategy\n"),
+                           ("test_plugin.py", "def test_candidate(): pass\n")):
+        (staging / "myst" / filename).write_text(body)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_min._build_rpc_handlers(ledger, staging_dir=staging)
+    budget = ImproveToolBudgetSettings()
+    counters = MissionToolCounters(budget=budget)
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"],
+        staging_dir=staging, counters=counters, budget=budget))
+    return registry, counters, ledger
+
+
+def test_third_cpu_limit_never_reaches_the_parent_handler_through_the_registry(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _install_source(monkeypatch, _ParentObservedSource(
+        cpu=59.97, returncode=-9, signal=9))
+    evaluations = []
+
+    def _boom(*a, **kw):
+        evaluations.append(1)
+        raise _leaky("cpu_limit")
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample", _boom)
+    registry, counters, ledger = _registry_with_real_handler(loop_min, tmp_path)
+
+    raws = [registry.execute("run_backtest", {"name": "myst", "pair": "USDJPY"},
+                             allowed=registry.names()) for _ in range(3)]
+    results = [json.loads(r) for r in raws]
+    ledger.freeze()
+    entries = ledger.entries()
+
+    assert len(evaluations) == 2
+    assert [r["error"] for r in results] == [
+        "worker_cpu_limit", "worker_cpu_limit", "repeated_worker_cpu_limit"]
+    assert results[2]["started"] is False
+    assert counters.backtest_calls["myst"] == 2
+    assert [e["result_summary"]["error"] for e in entries] == [
+        r["error"] for r in results]
+    assert counters.total_calls == 3 and counters.errors == 3
+    for sink in (raws[2], json.dumps(entries[2], default=str)):
+        for marker in _LEAK_MARKERS + ("59.97",):
             assert marker not in sink
 
 

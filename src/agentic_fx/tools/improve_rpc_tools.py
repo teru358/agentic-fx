@@ -25,6 +25,15 @@ _RUN_BACKTEST_KIND_HINT = (
     "kind: strategy / timeframe / pairs / exit_mode / max_bars を書きます "
     '(read_example_plugin(name="sma_cross") 参照)')
 
+# 同じ (内容, pair) で実測 CPU 上限が 2 回続いたあとの拒否。固定文言で、
+# 回数・上限・計測値は載せない。
+_REPEATED_CPU_LIMIT_ERROR = "repeated_worker_cpu_limit"
+_REPEATED_CPU_LIMIT_HINT = (
+    "同じ候補を同じ pair で評価すると CPU 上限に達する結果が続いたため、"
+    "この組み合わせはこれ以上実行しません。より粗い timeframe、依存や計算の"
+    "削減、または人間への報告を検討してください")
+_CPU_LIMIT_THRESHOLD = 2
+
 _FORBIDDEN_KEYS = frozenset({
     "period_start", "period_end", "start", "end", "window", "timestamps",
     # `period`/`now` (10.9 節 Step 11 追記): `_build_rpc_handlers` の
@@ -115,6 +124,7 @@ def build_improve_rpc_tooldefs(
         raise ValueError("counters と budget は両方渡すか両方省く")
 
     def run_backtest(name: str, pair: str) -> dict:
+        cpu_key: tuple[str, str] | None = None
         if staging_dir is not None:
             candidate_dir = _safe_join(staging_dir, name)
             if candidate_dir is None:
@@ -128,6 +138,25 @@ def build_improve_rpc_tooldefs(
                 return {"error": "run_backtest is only for kind=strategy candidates",
                         "candidate_kind": meta.kind,
                         "hint": _RUN_BACKTEST_KIND_HINT}
+            cpu_key = (meta.content_hash, pair)
+        # 同じ (内容, pair) で実測 CPU 上限が続いた評価は、候補枠を reserve する
+        # **前**に事前拒否する。handler は呼ばず、枠も消費しない。拒否は専用の
+        # 台帳行として残る (`error` を持つので永続化と trial 集計の対象外)。
+        if (counters is not None and cpu_key is not None
+                and counters.cpu_limit_observation_count(cpu_key)
+                >= _CPU_LIMIT_THRESHOLD):
+            refusal = {"started": False, "error": _REPEATED_CPU_LIMIT_ERROR,
+                       "hint": _REPEATED_CPU_LIMIT_HINT}
+            ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
+                          kind="run_backtest",
+                          params={"name": name, "pair": pair},
+                          result_summary=refusal, trial_count=0)
+            response = _RpcToolResult(refusal)
+            response["remaining_budget"] = {
+                "backtests_for_candidate": max(
+                    budget.max_backtests_per_candidate
+                    - counters.backtest_calls[name], 0)}
+            return response
         # codex 1 周目 Important 2 (2026-09-07): 予算の消費は候補名・loader・kind
         # 検証の **後**。誤呼び出し (名前不正 / loader 拒否 / indicator) で候補
         # あたり枠を減らさない — 設計 v4 Tier C の目的は「実 backtest の修正
@@ -165,6 +194,10 @@ def build_improve_rpc_tooldefs(
             counters.record_backtest_result(name, ok=backtest_ok)
             if backtest_ok:
                 counters.record_progress(name, "backtest_ok")
+        if (counters is not None and cpu_key is not None
+                and result.get("started") is True
+                and result.get("error") == "worker_cpu_limit"):
+            counters.record_cpu_limit_observation(cpu_key)
         # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
         # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
         ledger_result = getattr(result, "save_kwargs", result)

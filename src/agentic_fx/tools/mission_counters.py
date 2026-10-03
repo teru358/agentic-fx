@@ -28,6 +28,9 @@ class MissionToolCounters:
         self.self_tests_before_backtest = 0
         self.successful_backtests = defaultdict(int)
         self.backtest_calls = defaultdict(int)
+        # 実測 CPU 上限で終わった評価の回数。key = (content_hash, pair)。
+        # mission 内だけで数え、候補名ではなく内容で区別する。
+        self.cpu_limit_observations = defaultdict(int)
         self.last_signature: dict[str, tuple] = {}
         self.consecutive_same = defaultdict(int)
         self._self_tests_by_name = defaultdict(int)
@@ -160,6 +163,14 @@ class MissionToolCounters:
         with self._lock:
             if self.backtest_calls[name] > 0:
                 self.backtest_calls[name] -= 1
+
+    def cpu_limit_observation_count(self, key: tuple[str, str]) -> int:
+        with self._lock:
+            return self.cpu_limit_observations.get(key, 0)
+
+    def record_cpu_limit_observation(self, key: tuple[str, str]) -> None:
+        with self._lock:
+            self.cpu_limit_observations[key] += 1
 
     def record_backtest_result(self, name: str, ok: bool) -> None:
         if not ok:
