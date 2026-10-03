@@ -1,13 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 134 件。完了分は CLOSED.md。
-
-## 実装中 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
+未完了: 133 件。完了分は CLOSED.md。
 
 ## 実装待ち (22)
 

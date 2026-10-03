@@ -1,15 +1,15 @@
 ---
 id: app-state-write-has-no-lock-latch-can-be-lost
 title: kill switch の状態ファイルの書き込みに lock が無い
-status: 実装中
+status: 是正済
 priority: 高
 opened: 2026-10-03
-closed: null
+closed: 2026-10-03
 related: []
 ---
 # [app-state-write-has-no-lock-latch-can-be-lost] kill switch の状態ファイルの書き込みに lock が無い
 
-**状態**: 実装中 / **優先**: 高
+**状態**: 是正済 / **優先**: 高
 
 ## 現象
 
@@ -23,7 +23,10 @@ StateStore にプロセス内 lock と一意の一時名を足す。解除は「
 
 ## 修正内容
 
+- 2026-10-03: StateStore の更新をプロセス内 lock + flock で排他 (読者も共有 lock)。一意の一時名 + fsync + replace + 親 dir fsync。kill_switch_generation / latched_at を追加し、解除は status で見た世代の指定 (killswitch reset <世代>) のみ。解除は write-ahead の marker で、途中失敗は別プロセス・再起動後もラッチ中として読まれ、killswitch reconcile confirm でラッチ中として確定する手順のみ。lock が取れないときは fail closed。段 0 変異 60 本、codex sol 4 周 + /code-review high。main 投入 2026-10-03。
+
 ## 経緯
 
 - 2026-10-03: 起票。
 - 2026-10-03: 状態: 実装中 — 2026-10-03 着手 (並行実装、Landlock 設計の収束待ちの間)。
+- 2026-10-03: 是正内容 — StateStore の更新をプロセス内 lock + flock で排他 (読者も共有 lock)。一意の一時名 + fsync + replace + 親 dir fsync。kill_switch_generation / latched_at を追加し、解除は status で見た世代の指定 (killswitch reset <世代>) のみ。解除は write-ahead の marker で、途中失敗は別プロセス・再起動後もラッチ中として読まれ、killswitch reconcile confirm でラッチ中として確定する手順のみ。lock が取れないときは fail closed。段 0 変異 60 本、codex sol 4 周 + /code-review high。main 投入 2026-10-03。

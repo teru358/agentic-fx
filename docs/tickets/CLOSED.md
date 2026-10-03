@@ -2,10 +2,11 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (30)
+## 2026-10 (31)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
+| [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 是正済 | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 是正済 | 高 | 2026-10-03 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 是正済 | 高 | 2026-10-03 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [selection-rationale-unverified](selection-rationale-unverified.md) | 是正済 | 高 | 2026-10-03 | 承認材料の selection_rationale が未検証で捏造され得る |
