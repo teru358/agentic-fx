@@ -171,7 +171,7 @@ async def lifespan(app: FastAPI):
         probe_symbol=_settings.server_time_symbol,
     )
     logger.warning(
-        f"DRY_RUN={_runtime.dry_run} | api_key={'set' if _settings.auth_required else 'NOT SET (LAN trust mode)'}"
+        f"DRY_RUN={_runtime.dry_run} | api_key={'set' if _settings.auth_required else 'NOT SET (order endpoints refused)'} | host={_settings.host}"
     )
     try:
         _client.connect()
@@ -187,7 +187,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="MT5 Bridge",
     version="0.1.0",
-    description="Read-only bridge over MetaTrader5 Python package. Phase 1+2 (no order placement).",
+    description="HTTP bridge over MetaTrader5 Python package (price data + order endpoints).",
     lifespan=lifespan,
 )
 
@@ -202,6 +202,19 @@ def require_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing X-Bridge-Api-Key",
         )
+
+
+ORDER_KEY_REQUIRED_DETAIL = "発注系は API キーが必要"
+
+
+def require_order_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None:
+    """発注系 endpoint 用。API キー未設定なら (DRY_RUN に関係なく) 拒否する。"""
+    if _settings is None or not _settings.auth_required:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ORDER_KEY_REQUIRED_DETAIL,
+        )
+    require_api_key(x_bridge_api_key)
 
 
 # ── レスポンスモデル ────────────────────────────────────────────────
@@ -350,7 +363,7 @@ _RETCODE_RATE_LIMIT = 10024   # TOO_MANY_REQUESTS → 100ms backoff + 1 回再�
 
 
 @app.post("/order", response_model=OrderResponse,
-          dependencies=[Depends(require_api_key)])
+          dependencies=[Depends(require_order_api_key)])
 def place_order(req: OrderRequest):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
@@ -429,7 +442,7 @@ def place_order(req: OrderRequest):
 
 
 @app.post("/positions/{ticket}/modify", response_model=ModifyPositionResponse,
-          dependencies=[Depends(require_api_key)])
+          dependencies=[Depends(require_order_api_key)])
 def modify_position(ticket: int, req: ModifyPositionRequest):
     if req.sl is None and req.tp is None:
         raise HTTPException(400, "sl or tp must be provided")
@@ -450,7 +463,7 @@ def modify_position(ticket: int, req: ModifyPositionRequest):
 
 
 @app.post("/positions/{ticket}/close", response_model=ClosePositionResponse,
-          dependencies=[Depends(require_api_key)])
+          dependencies=[Depends(require_order_api_key)])
 def close_position(ticket: int, symbol: str | None = None):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
@@ -485,7 +498,7 @@ def _build_admin_status() -> AdminStatus:
 
 
 @app.post("/admin/halt", response_model=AdminStatus,
-          dependencies=[Depends(require_api_key)])
+          dependencies=[Depends(require_order_api_key)])
 def admin_halt(req: HaltRequest):
     if _runtime is None:
         raise HTTPException(503, "runtime not initialized")
@@ -497,7 +510,7 @@ def admin_halt(req: HaltRequest):
 
 
 @app.post("/admin/resume", response_model=AdminStatus,
-          dependencies=[Depends(require_api_key)])
+          dependencies=[Depends(require_order_api_key)])
 def admin_resume():
     if _runtime is None:
         raise HTTPException(503, "runtime not initialized")

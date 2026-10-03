@@ -1,6 +1,7 @@
 """ブリッジサーバー設定 (.env からロード)。"""
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v in ("false", "0", "no", "off"):
         return False
     return default
+
+
+_LOOPBACK_NAMES = frozenset({"localhost"})
+
+
+def is_loopback_host(host: str) -> bool:
+    """待受 host が自機内のみ (loopback) か。"""
+    h = host.strip().lower()
+    if h in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(h.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -63,13 +78,22 @@ def load_settings(env_file: Path | None = None) -> BridgeSettings:
     if not server:
         raise ValueError("MT5_SERVER is required")
 
+    host = _env("BRIDGE_HOST", "127.0.0.1")
+    api_key = _env("BRIDGE_API_KEY")
+    if not is_loopback_host(host) and not api_key:
+        raise ValueError(
+            f"BRIDGE_HOST={host!r} は自機以外から届く待受です。この場合は "
+            "BRIDGE_API_KEY が必要です (mt5_bridge/.env に設定するか、"
+            "BRIDGE_HOST を 127.0.0.1 に戻してください)"
+        )
+
     return BridgeSettings(
         mt5_login=login,
         mt5_password=password,
         mt5_server=server,
-        host=_env("BRIDGE_HOST", "0.0.0.0"),
+        host=host,
         port=int(_env("BRIDGE_PORT", "8812")),
-        api_key=_env("BRIDGE_API_KEY"),
+        api_key=api_key,
         dry_run=_env_bool("DRY_RUN", True),
         halt_state_path=_env("HALT_STATE_PATH", "logs/hard_halt.flag"),
         filling_mode=_env("FILLING_MODE", "IOC"),
