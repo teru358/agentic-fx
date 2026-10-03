@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 127 件。完了分は CLOSED.md。
+未完了: 128 件。完了分は CLOSED.md。
 
 ## 実装待ち (16)
 
@@ -36,7 +36,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (104)
+## 設計待ち (105)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -115,6 +115,7 @@
 | [runner-trade-backend-error-wording-mismatch](runner-trade-backend-error-wording-mismatch.md) | 低 | 2026-10-02 | runner.trade の backend の検証文言が受け付け方と食い違う |
 | [tracked-files-contain-author-home-path](tracked-files-contain-author-home-path.md) | 低 | 2026-10-02 | 追跡ファイルに作者のホームの絶対パスが残る |
 | [rlimit-nproc-per-uid-does-not-bound-worker](rlimit-nproc-per-uid-does-not-bound-worker.md) | 低 | 2026-10-03 | RLIMIT_NPROC は uid 全体の値で worker の子プロセス数を縛れない |
+| [supervisor-cleanup-test-leaks-36-fds](supervisor-cleanup-test-leaks-36-fds.md) | 低 | 2026-10-03 | worker supervisor の cleanup テストが 1 回で fd を 36 本増やす |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
