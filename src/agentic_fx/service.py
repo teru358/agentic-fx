@@ -853,6 +853,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     instance_lock = acquire_instance_lock(root / "data")
 
     try:
+        if state.reconcile_marker() is not None:
+            activity.write(
+                Category.SYSTEM, "kill_switch_reconcile_required",
+                "kill switch の状態が不確定 (解除が途中で止まった印あり)。"
+                "新規 OPEN は止まる。`killswitch reconcile` で確認")
         conn_core = connect(root / "data" / "agentic.db")
         init_db(conn_core)
         seeded = seed_default_sources(conn_core, clock.now())
@@ -1335,6 +1340,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         raise
 
 
+_RECONCILE_SPLASH_LINE = (
+    "kill switch の状態が不確定 (解除が途中で止まった印あり)。"
+    "`killswitch reconcile` で確認\n")
+
+
 def build_splash(app: App) -> str:
     """起動スプラッシュ。項目は最小でよい (運用しながら調整 — 設計書 §8)。
 
@@ -1348,6 +1358,7 @@ def build_splash(app: App) -> str:
         "=== agentic-fx ===\n"
         f"mode: {s.mode.value} / autopilot: {'on' if s.autopilot else 'off'}"
         f" / kill switch: {'LATCHED' if s.kill_switch_latched else 'ok'}\n"
+        f"{_RECONCILE_SPLASH_LINE if app.state.reconcile_marker() is not None else ''}"
         f"pairs: {', '.join(app.settings.pairs)}\n"
         f"runner: {app.settings.runner.trade.backend}"
         f" ({app.settings.runner.trade.model})\n"

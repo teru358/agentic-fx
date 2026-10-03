@@ -33,6 +33,7 @@ _HELP = """コマンド一覧:
   approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
   approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
   killswitch reset [<世代>]  kill switch ラッチの解除 (人間の明示操作)
+  killswitch reconcile [confirm]  解除が途中で止まったときの確認 / ラッチ中として確定
   reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
   improve                    手動 improve one-shot (全バックログ担当)
   improve add <idea text>    バックログへ課題を追加
@@ -51,6 +52,10 @@ def _normalize_idea_display(text: str) -> tuple[str, int]:
 
 
 _MAX_GENERATION = 2**31
+
+_RECONCILE_NOTICE = (
+    "kill switch の状態が不確定です (解除の途中で止まった印が残っています)。"
+    "新規の取引は止めたままです。`killswitch reconcile` で確認してください。")
 
 
 class Commands:
@@ -201,6 +206,8 @@ class Commands:
                 # 承認待ち件数のみ)、承認判断が agent の自己申告に偏って
                 # いた欠陥の一部。
                 return self._approval_detail(int(args[0]))
+            if cmd == "killswitch" and args and args[0] == "reconcile":
+                return self._killswitch_reconcile(args[1:])
             if cmd == "killswitch" and args and args[0] == "reset":
                 if len(args) == 1:
                     shown = self.state.load()
@@ -234,14 +241,17 @@ class Commands:
                     return ("kill switch のラッチが更新されたので status を"
                             "確認してからもう一度実行してください")
                 except ResetNotApplied:
+                    pending = self.state.reconcile_marker() is not None
                     self.activity.write(
                         Category.SYSTEM, "killswitch_release_not_applied",
-                        f"save failed, latch kept (gen={generation})")
+                        f"save failed, latch kept (gen={generation}) "
+                        f"reconcile_required={pending}")
+                    if pending:
+                        return (_RECONCILE_NOTICE + "解除は完了していません。")
                     return ("解除は適用されていません (保存に失敗)。"
                             "再試行してください")
                 except StateUncertain:
-                    msg = ("状態ファイルの保存に失敗し、kill switch の状態が不明です。"
-                           "新規の取引を止め、ディスクを確認してください")
+                    msg = _RECONCILE_NOTICE
                     self.activity.write(Category.SYSTEM,
                                         "kill_switch_state_uncertain", msg)
                     return msg
@@ -393,6 +403,45 @@ class Commands:
             return f"エラー: {safe_error_text(e)}"
         return _HELP
 
+    def _killswitch_reconcile(self, rest: list[str]) -> str:
+        if rest not in ([], ["confirm"]):
+            return "usage: killswitch reconcile [confirm]"
+        marker = self.state.reconcile_marker()
+        if marker is None:
+            return "確認が必要な状態はありません (解除の途中で止まった印は無し)"
+        if rest == ["confirm"]:
+            try:
+                state = self.state.confirm_latched()
+            except Exception as e:  # noqa: BLE001 — 確定に失敗しても印は残る
+                msg = (f"確定に失敗しました ({type(e).__name__})。印は残して"
+                       "新規の取引は止めたままです。ディスクを確認して再実行してください")
+                self.activity.write(Category.SYSTEM,
+                                    "kill_switch_reconcile_failed", msg)
+                return msg
+            self.activity.write(
+                Category.SYSTEM, "kill_switch_reconcile_confirmed",
+                f"latched confirmed gen={state.kill_switch_generation}")
+            return (f"kill switch をラッチ中として確定しました "
+                    f"(gen={state.kill_switch_generation})。解除するには "
+                    f"`killswitch reset {state.kill_switch_generation}`")
+        try:
+            raw = self.state.file_value()
+        except Exception as e:  # noqa: BLE001
+            return f"状態ファイルを読めません ({type(e).__name__})"
+        file_line = ("LATCHED" if raw.kill_switch_latched else "解除済み")
+        return (
+            "解除の途中で止まった印があります。新規の取引は止めています。\n"
+            f"状態ファイルの値: {file_line} "
+            f"(gen={raw.kill_switch_generation} "
+            f"since={raw.kill_switch_latched_at})\n"
+            f"印の内容: requested_generation="
+            f"{marker.get('requested_generation')} "
+            f"started_at={marker.get('started_at')}"
+            + (f" unreadable={marker['unreadable']}"
+               if "unreadable" in marker else "") + "\n"
+            "ラッチ中として確定するには `killswitch reconcile confirm` を実行して"
+            "ください (解除する場合は確定のあとに `killswitch reset <世代>`)")
+
     def _status(self) -> str:
         s = self.state.load()
         balance, equity = self.broker.equity()
@@ -410,6 +459,9 @@ class Commands:
                 f"残高: {balance:,.0f} / エクイティ: {equity:,.0f}\n"
                 f"アクティブ orders: {len(active)}\n"
                 f"直近 mission: {last}")
+        if self.state.reconcile_marker() is not None:
+            result += ("\nkill switch: 解除の途中で止まった印あり "
+                       "(`killswitch reconcile` で確認)")
         if self.health_latch.is_latched():
             reasons = "; ".join(self.health_latch.summary()[:3])
             result += f"\nhealth: LATCHED ({reasons})"

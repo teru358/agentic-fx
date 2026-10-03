@@ -531,7 +531,7 @@ def test_dir_fsync_failure_after_replace_is_durability_uncertain(
     assert store.load().initialized is True  # 書かれてはいる
 
 
-def test_reset_with_failed_dir_fsync_restores_latched_state(
+def test_reset_with_failed_marker_dir_fsync_changes_nothing(
         tmp_path, monkeypatch):
     from agentic_fx.store.state import ResetNotApplied
     store = StateStore(tmp_path / "app_state.json")
@@ -541,17 +541,6 @@ def test_reset_with_failed_dir_fsync_restores_latched_state(
     with pytest.raises(ResetNotApplied):
         store.reset_kill_switch(before.kill_switch_generation)
     assert store.load() == before
-
-
-def test_reset_raises_state_uncertain_when_restore_also_fails(
-        tmp_path, monkeypatch):
-    from agentic_fx.store.state import StateUncertain
-    store = StateStore(tmp_path / "app_state.json")
-    store.update(kill_switch_latched=True)
-    gen = store.load().kill_switch_generation
-    _fail_dir_fsync(monkeypatch, 2)
-    with pytest.raises(StateUncertain):
-        store.reset_kill_switch(gen)
 
 
 def test_latching_with_failed_dir_fsync_propagates_and_file_stays_latched(
@@ -564,28 +553,174 @@ def test_latching_with_failed_dir_fsync_propagates_and_file_stays_latched(
     assert store.load().kill_switch_latched is True
 
 
-def test_reader_waits_for_writer_recovery_and_never_sees_unlatched(
-        tmp_path, monkeypatch):
-    """解除の置き換え後・復旧前に別インスタンスが読んでも、復旧完了まで待つ。"""
+_LOAD_CHILD = (
+    "import sys; from pathlib import Path; "
+    "from agentic_fx.store.state import StateStore; "
+    "print(StateStore(Path(sys.argv[1])).load().kill_switch_latched)")
+
+
+def _latched_in_new_process(path) -> bool:
+    out = subprocess.run([sys.executable, "-c", _LOAD_CHILD, str(path)],
+                         capture_output=True, text=True, timeout=60,
+                         check=True).stdout.strip()
+    assert out in ("True", "False")
+    return out == "True"
+
+
+def _marker_of(path):
+    return path.parent / (path.name + ".reset-in-progress")
+
+
+def _inject_reset_failure(monkeypatch, stage):
+    """reset の各段 (marker 作成 / marker fsync / marker の親 dir fsync /
+    保存の fsync / replace / replace 後の親 dir fsync / marker 削除 /
+    削除後の親 dir fsync) を 1 回だけ失敗させる。"""
+    real_open, real_fsync = os.open, os.fsync
+    real_replace, real_unlink = os.replace, os.unlink
+    n = {"file_fsync": 0, "dir_fsync": 0}
+
+    def open_(p, flags, *a, **k):
+        if stage == "marker_create" and str(p).endswith(".reset-in-progress"):
+            raise OSError(28, "injected")
+        return real_open(p, flags, *a, **k)
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            n["dir_fsync"] += 1
+            order = {"marker_dir_fsync": 1, "post_replace_dir_fsync": 2,
+                     "final_dir_fsync": 3}
+            if order.get(stage) == n["dir_fsync"]:
+                raise OSError(5, "injected")
+        else:
+            n["file_fsync"] += 1
+            order = {"marker_fsync": 1, "save_fsync": 2}
+            if order.get(stage) == n["file_fsync"]:
+                raise OSError(5, "injected")
+        return real_fsync(fd)
+
+    def replace(a, b):
+        if stage == "replace":
+            raise OSError(28, "injected")
+        return real_replace(a, b)
+
+    def unlink(p, *a, **k):
+        if stage == "marker_unlink" and str(p).endswith(".reset-in-progress"):
+            raise OSError(13, "injected")
+        return real_unlink(p, *a, **k)
+
+    monkeypatch.setattr(os, "open", open_)
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "unlink", unlink)
+
+
+# 段 -> (ディスクの kill_switch_latched, marker が残る, reset は成功)
+_RESET_STAGES = {
+    "marker_create": (True, False, False),
+    "marker_fsync": (True, False, False),
+    "marker_dir_fsync": (True, False, False),
+    "save_fsync": (True, True, False),
+    "replace": (True, True, False),
+    "post_replace_dir_fsync": (False, True, False),
+    "marker_unlink": (False, True, False),
+    "final_dir_fsync": (False, False, True),
+}
+
+
+@pytest.mark.parametrize("stage", list(_RESET_STAGES))
+def test_reset_failure_at_each_stage_is_latched_for_a_new_process(
+        tmp_path, monkeypatch, stage):
+    from agentic_fx.store.state import ResetNotApplied
+    disk_latched, marker_left, succeeds = _RESET_STAGES[stage]
     path = tmp_path / "app_state.json"
     store = StateStore(path)
     store.update(kill_switch_latched=True)
     gen = store.load().kill_switch_generation
-    _fail_dir_fsync(monkeypatch, 1)
-    at_recovery = threading.Event()
-    release = threading.Event()
-    real_save = StateStore.save
-    calls = []
+    _inject_reset_failure(monkeypatch, stage)
+    if succeeds:
+        assert store.reset_kill_switch(gen).kill_switch_latched is False
+    else:
+        with pytest.raises(ResetNotApplied):
+            store.reset_kill_switch(gen)
+    monkeypatch.undo()
+    assert json.loads(path.read_text())["kill_switch_latched"] is disk_latched
+    assert _marker_of(path).exists() is marker_left
+    expected = not succeeds
+    assert store.load().kill_switch_latched is expected
+    assert _latched_in_new_process(path) is expected
 
-    def save(self, state):
-        calls.append(state.kill_switch_latched)
-        if len(calls) == 2:  # 復旧の保存の手前で止める
-            at_recovery.set()
-            release.wait(5)
-        return real_save(self, state)
 
-    monkeypatch.setattr(StateStore, "save", save)
+@pytest.mark.parametrize("via", ["file_symlink", "dir_symlink"])
+def test_unfinished_reset_is_latched_through_a_symlinked_path(
+        tmp_path, monkeypatch, via):
     from agentic_fx.store.state import ResetNotApplied
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    real = real_dir / "app_state.json"
+    if via == "file_symlink":
+        alias = tmp_path / "alias.json"
+        alias.symlink_to(real)
+    else:
+        (tmp_path / "alias").symlink_to(real_dir)
+        alias = tmp_path / "alias" / "app_state.json"
+    store = StateStore(alias)
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    _inject_reset_failure(monkeypatch, "post_replace_dir_fsync")
+    with pytest.raises(ResetNotApplied):
+        store.reset_kill_switch(gen)
+    monkeypatch.undo()
+    assert json.loads(real.read_text())["kill_switch_latched"] is False
+    assert _latched_in_new_process(real) is True
+    assert _latched_in_new_process(alias) is True
+    assert StateStore(real).load().kill_switch_latched is True
+
+
+def test_reset_is_refused_while_a_marker_remains(tmp_path, monkeypatch):
+    from agentic_fx.store.state import StateUncertain
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    _marker_of(path).write_text("{}")
+    before = path.read_bytes()
+    with pytest.raises(StateUncertain):
+        StateStore(path).reset_kill_switch(gen)
+    assert path.read_bytes() == before
+
+
+def test_marker_records_requested_generation_and_time(tmp_path, monkeypatch):
+    from agentic_fx.store.state import ResetNotApplied
+    path = tmp_path / "app_state.json"
+    store = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    _inject_reset_failure(monkeypatch, "replace")
+    with pytest.raises(ResetNotApplied):
+        store.reset_kill_switch(1)
+    monkeypatch.undo()
+    assert json.loads(_marker_of(path).read_text()) == {
+        "kind": "kill_switch_reset", "requested_generation": 1,
+        "started_at": "2026-10-03T08:00:00+00:00"}
+
+
+def test_reader_waits_for_an_unfinished_reset_and_then_sees_latched(
+        tmp_path, monkeypatch):
+    """replace 後・完了前に別インスタンスが読んでも、書き手が終わるまで待ち、
+    失敗で終わったときはラッチ中を読む。"""
+    from agentic_fx.store.state import ResetNotApplied
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(kill_switch_latched=True)
+    gen = store.load().kill_switch_generation
+    at_cleanup = threading.Event()
+    release = threading.Event()
+
+    def remove_marker(self):
+        at_cleanup.set()
+        release.wait(5)
+        raise OSError(13, "injected")
+
+    monkeypatch.setattr(StateStore, "_remove_marker", remove_marker)
 
     def reset():
         with pytest.raises(ResetNotApplied):
@@ -593,7 +728,7 @@ def test_reader_waits_for_writer_recovery_and_never_sees_unlatched(
 
     t = threading.Thread(target=reset)
     t.start()
-    assert at_recovery.wait(5)
+    assert at_cleanup.wait(5)
     assert json.loads(path.read_text())["kill_switch_latched"] is False
     seen = []
     done = threading.Event()
@@ -604,69 +739,95 @@ def test_reader_waits_for_writer_recovery_and_never_sees_unlatched(
 
     r = threading.Thread(target=reader)
     r.start()
-    assert not done.wait(0.3)  # 復旧が終わるまで読者は待たされる
+    assert not done.wait(0.3)
     release.set()
     t.join()
     r.join()
     assert seen == [True]
 
 
-def _fail_recovery_stage(monkeypatch, stage):
-    """最初の保存は親 dir の fsync で失敗させ、復旧の保存を stage で失敗させる。"""
-    real_fsync = os.fsync
-    real_replace, real_fdopen = os.replace, os.fdopen
-    n = {"dir": 0, "file_fsync": 0, "replace": 0, "fdopen": 0}
-
-    def fsync(fd):
-        if stat.S_ISDIR(os.fstat(fd).st_mode):
-            n["dir"] += 1
-            if n["dir"] == 1 or stage == "dir_fsync":
-                raise OSError(5, "injected")
-        else:
-            n["file_fsync"] += 1
-            if n["file_fsync"] == 2 and stage == "fsync":
-                raise OSError(5, "injected")
-        return real_fsync(fd)
-
-    def replace(a, b):
-        n["replace"] += 1
-        if n["replace"] == 2 and stage == "replace":
-            raise OSError(28, "injected")
-        return real_replace(a, b)
-
-    def fdopen(fd, *a, **k):
-        f = real_fdopen(fd, *a, **k)
-        n["fdopen"] += 1
-        if n["fdopen"] == 2 and stage == "write":
-            def boom(_data):
-                raise OSError(28, "injected")
-            f.write = boom
-        return f
-
-    monkeypatch.setattr(os, "fsync", fsync)
-    monkeypatch.setattr(os, "replace", replace)
-    monkeypatch.setattr(os, "fdopen", fdopen)
+def test_confirm_latched_rewrites_latched_then_removes_marker(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import ResetNotApplied
+    path = tmp_path / "app_state.json"
+    store = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    _inject_reset_failure(monkeypatch, "post_replace_dir_fsync")
+    with pytest.raises(ResetNotApplied):
+        store.reset_kill_switch(1)
+    monkeypatch.undo()
+    s = StateStore(path, clock=_FixedClock(LATCH_TIME)).confirm_latched()
+    assert s.kill_switch_latched is True and s.kill_switch_generation == 2
+    assert json.loads(path.read_text())["kill_switch_latched"] is True
+    assert not _marker_of(path).exists()
+    assert _latched_in_new_process(path) is True
+    StateStore(path).reset_kill_switch(2)  # 解除は確定の後に通常の手順で
+    assert StateStore(path).load().kill_switch_latched is False
 
 
-@pytest.mark.parametrize("stage", ["write", "fsync", "replace", "dir_fsync"])
-def test_state_uncertain_makes_every_later_load_latched(
-        tmp_path, monkeypatch, stage):
-    """復旧が失敗してファイルが解除済みのままでも、以後は別インスタンスも含めラッチ。"""
-    from agentic_fx.store.state import StateUncertain
+def test_confirm_latched_keeps_marker_when_the_rewrite_fails(
+        tmp_path, monkeypatch):
     path = tmp_path / "app_state.json"
     store = StateStore(path)
     store.update(kill_switch_latched=True)
-    gen = store.load().kill_switch_generation
-    _fail_recovery_stage(monkeypatch, stage)
-    with pytest.raises(StateUncertain):
-        store.reset_kill_switch(gen)
+    _marker_of(path).write_text("{}")
+
+    def boom(a, b):
+        raise OSError(28, "injected")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        store.confirm_latched()
     monkeypatch.undo()
-    on_disk = json.loads(path.read_text())["kill_switch_latched"]
-    assert on_disk is (stage == "dir_fsync")  # 復旧の replace が済んだ段だけ
-    assert store.load().kill_switch_latched is True
-    assert StateStore(path).load().kill_switch_latched is True
-    with pytest.raises(StateUncertain):  # 再起動まで解除は受け付けない
-        StateStore(path).reset_kill_switch(gen)
+    assert _marker_of(path).exists()
+    assert _latched_in_new_process(path) is True
+
+
+def test_confirm_latched_without_marker_writes_nothing(tmp_path):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(autopilot=True)
+    before = path.stat().st_mtime_ns
+    assert store.confirm_latched().kill_switch_latched is False
+    assert path.stat().st_mtime_ns == before
+
+
+def test_load_raises_lock_unavailable_when_dir_exists_but_lock_cannot_open(
+        tmp_path, monkeypatch):
+    from agentic_fx.store.state import LockUnavailable
+    path = tmp_path / "app_state.json"
+    StateStore(path).update(initialized=True)
+    real_open = os.open
+
+    def deny(p, flags, *a, **k):
+        if str(p).endswith(".lock"):
+            raise PermissionError(13, "denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", deny)
+    with pytest.raises(LockUnavailable):
+        StateStore(path).load()
+    assert issubclass(LockUnavailable, StateError)
+
+
+def test_load_reads_default_without_lock_when_parent_dir_is_missing(tmp_path):
+    store = StateStore(tmp_path / "not_yet" / "app_state.json")
+    assert store.load() == AppState()
+    assert not (tmp_path / "not_yet").exists()  # 読むだけで作らない
+
+
+def test_load_falls_back_to_readonly_lock_when_it_exists(tmp_path, monkeypatch):
+    path = tmp_path / "app_state.json"
+    StateStore(path).update(initialized=True)
+    real_open = os.open
+
+    def no_write(p, flags, *a, **k):
+        if str(p).endswith(".lock") and flags & os.O_CREAT:
+            raise PermissionError(13, "denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", no_write)
+    assert StateStore(path).load().initialized is True
 
 
 def test_update_latch_when_already_latched_writes_nothing(

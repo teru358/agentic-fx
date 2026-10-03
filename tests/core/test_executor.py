@@ -779,12 +779,11 @@ def test_close_with_no_rate_ever_leaves_realized_pnl_none(tmp_path):
 
 def test_open_is_rejected_when_state_file_is_unlatched_but_state_is_uncertain(
         tmp_path):
-    """解除の復旧に失敗した後は、ファイルが未ラッチでも新規 OPEN を通さない。"""
+    """解除が途中で止まった印が残る間は、ファイルが未ラッチでも新規 OPEN を通さない。"""
     import json
-    from agentic_fx.store import state as state_mod
     conn, ex, state, mid = _setup(tmp_path)
     state.update(kill_switch_latched=True)
-    state._mark_uncertain()
+    (tmp_path / "state.json.reset-in-progress").write_text("{}")
     raw = json.loads((tmp_path / "state.json").read_text())
     raw["kill_switch_latched"] = False
     (tmp_path / "state.json").write_text(json.dumps(raw))
@@ -812,3 +811,25 @@ def test_latch_with_uncertain_durability_still_rejects_and_records(tmp_path):
     assert "kill_switch_latched_durability_uncertain" in log
     assert "gate_rejected" in log
     assert state.load().kill_switch_latched is True
+
+
+def test_open_is_not_placed_when_state_lock_is_unavailable(tmp_path, monkeypatch):
+    """状態の lock を取れず load() が失敗したら、例外が伝わり注文は作られない。"""
+    import os
+    from agentic_fx.store.state import LockUnavailable
+    conn, ex, state, mid = _setup(tmp_path)
+    state.update(initialized=True)
+    real_open = os.open
+
+    def deny(p, flags, *a, **k):
+        if str(p).endswith("state.json.lock"):
+            raise PermissionError(13, "denied")
+        return real_open(p, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", deny)
+    with pytest.raises(LockUnavailable):
+        ex.handle_intent(_open_intent(), mid)
+    monkeypatch.undo()
+    assert orders.list_by_status(conn, "open") == []
+    assert orders.list_by_status(conn, "pending_fill") == []
+    assert orders.list_by_status(conn, "protection_pending") == []

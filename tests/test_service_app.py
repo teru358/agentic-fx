@@ -548,6 +548,29 @@ def test_splash_contains_key_fields(tmp_path):
     assert "qwen" in splash  # runner モデル名
 
 
+def test_unfinished_reset_marker_is_shown_at_startup_and_in_splash(tmp_path):
+    _init(tmp_path)
+    marker = tmp_path / "data" / "state" / "app_state.json.reset-in-progress"
+    marker.write_text("{}")
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        assert app.state.load().kill_switch_latched is True  # 起動は拒否しない
+        assert "killswitch reconcile" in build_splash(app)
+        log = (tmp_path / "logs" / "activity.log").read_text()
+        assert "kill_switch_reconcile_required" in log
+    finally:
+        app.conn_core.close()
+
+
+def test_splash_has_no_reconcile_line_without_marker(tmp_path):
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        assert "reconcile" not in build_splash(app)
+    finally:
+        app.conn_core.close()
+
+
 def test_service_tick_records_deferred_with_supervisor_phase(tmp_path):
     """本物の MissionSupervisor (スレッド未起動 = 受理後 queued のまま) で、
     次の確定足の cron が queued 理由で見送られ activity に 1 行出る。

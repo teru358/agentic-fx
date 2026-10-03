@@ -503,17 +503,54 @@ def test_killswitch_reset_says_not_applied_when_save_fails_but_old_state_is_rest
                    for r in activity.tail(10, Category.SYSTEM))
 
 
-def test_killswitch_reset_reports_uncertain_state_and_writes_activity(
+def test_killswitch_reset_reports_pending_marker_and_writes_activity(
         tmp_path, monkeypatch):
+    import os
     conn, state, activity, cmds = _commands(tmp_path)
     state.update(kill_switch_latched=True)
     gen = state.load().kill_switch_generation
-    _fail_dir_fsync(monkeypatch, times=2)
+    real_replace = os.replace
+
+    def boom(a, b):
+        raise OSError(28, "injected")
+
+    monkeypatch.setattr(os, "replace", boom)
     out = cmds.dispatch(f"killswitch reset {gen}")
-    assert "状態が不明です" in out
+    monkeypatch.setattr(os, "replace", real_replace)
+    assert "killswitch reconcile" in out
+    assert state.load().kill_switch_latched is True
     recs = activity.tail(10, Category.SYSTEM)
-    assert any("kill_switch_state_uncertain" in r for r in recs)
+    assert any("killswitch_release_not_applied" in r for r in recs)
     assert not any("kill_switch_reset" in r for r in recs)
+    again = cmds.dispatch(f"killswitch reset {gen}")  # 印が残る間は受け付けない
+    assert "killswitch reconcile" in again
+    assert any("kill_switch_state_uncertain" in r
+               for r in activity.tail(10, Category.SYSTEM))
+
+
+def test_killswitch_reconcile_shows_state_and_confirm_latches(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    assert "確認が必要な状態はありません" in cmds.dispatch("killswitch reconcile")
+    state.update(kill_switch_latched=True)
+    marker = tmp_path / "s.json.reset-in-progress"
+    marker.write_text('{"kind": "kill_switch_reset", '
+                      '"requested_generation": 1, "started_at": "T"}')
+    import json
+    raw = json.loads((tmp_path / "s.json").read_text())
+    raw["kill_switch_latched"] = False
+    (tmp_path / "s.json").write_text(json.dumps(raw))
+    out = cmds.dispatch("killswitch reconcile")
+    assert "解除済み" in out and "requested_generation=1" in out
+    assert "killswitch reconcile confirm" in out
+    assert marker.exists()  # 表示だけでは何も変えない
+    assert "reconcile" in cmds.dispatch("status")
+    out = cmds.dispatch("killswitch reconcile confirm")
+    assert "ラッチ中として確定" in out
+    assert not marker.exists()
+    assert state.load().kill_switch_latched is True
+    assert any("kill_switch_reconcile_confirmed" in r
+               for r in activity.tail(10, Category.SYSTEM))
+    assert "usage" in cmds.dispatch("killswitch reconcile bogus")
 
 
 def test_unknown_shows_help(tmp_path):

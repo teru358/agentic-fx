@@ -42,11 +42,24 @@ class DurabilityUncertain(Exception):
 
 
 class ResetNotApplied(Exception):
-    """解除の保存に失敗したが、旧状態 (ラッチ中) を書き戻せた。解除は適用されていない。"""
+    """解除は完了しなかった。完了前の失敗なので新規 OPEN は止まったまま。
+
+    marker が残っているときは load() がラッチ中として返し続ける (`reconcile`)。
+    """
 
 
 class StateUncertain(Exception):
-    """解除の保存に失敗し、旧状態の書き戻しにも失敗した。ラッチの状態が不明。"""
+    """kill switch の状態が不確定のまま (marker が残っている、または消せない)。
+
+    人が `killswitch reconcile` で確認するまで解除を受け付けない。
+    """
+
+
+class LockUnavailable(StateError):
+    """状態ファイルの親 dir があるのに、読み取り用の lock を取れない。
+
+    writer が居ないことの証拠にならないので、読み取りを続けず fail closed にする。
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,19 +76,14 @@ _BOOL_FIELDS = ("initialized", "autopilot", "kill_switch_latched")
 _REQUIRED_KEYS = ("initialized", "mode", "autopilot", "kill_switch_latched")
 
 
-# 状態が不明になったパスの集合 (プロセス内)。service はコマンドごとに
-# StateStore を作り直すので、インスタンスでなくパスで覚える。再起動まで解けない。
-_UNCERTAIN_PATHS: set[str] = set()
-_UNCERTAIN_GUARD = threading.Lock()
-
-
-def _path_key(path: Path) -> str:
-    return os.path.abspath(str(path))
+_MARKER_SUFFIX = ".reset-in-progress"
 
 
 class StateStore:
     def __init__(self, path: Path, *, clock: Clock | None = None) -> None:
-        self._path = path
+        # symlink 経由の別名でも lock・marker・一時ファイルが同じ場所になるよう、
+        # 実体のパスに揃える。
+        self._path = Path(os.path.realpath(path))
         self._clock = clock if clock is not None else SystemClock()
         self._thread_lock = threading.Lock()
 
@@ -96,20 +104,37 @@ class StateStore:
             finally:
                 os.close(fd)  # close で flock も解放される
 
-    def _is_uncertain(self) -> bool:
-        with _UNCERTAIN_GUARD:
-            return _path_key(self._path) in _UNCERTAIN_PATHS
+    @property
+    def _marker(self) -> Path:
+        return Path(str(self._path) + _MARKER_SUFFIX)
 
-    def _mark_uncertain(self) -> None:
-        with _UNCERTAIN_GUARD:
-            _UNCERTAIN_PATHS.add(_path_key(self._path))
+    def reconcile_marker(self) -> dict | None:
+        """解除の途中で止まった印。無ければ None。壊れていても「有る」として返す。"""
+        try:
+            raw = self._marker.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            return {"unreadable": f"{type(e).__name__}"}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {"unreadable": "invalid json"}
+        return data if isinstance(data, dict) else {"unreadable": "not an object"}
+
+    def _fsync_dir(self) -> None:
+        dfd = os.open(str(self._path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     @contextmanager
     def _shared(self):
-        """writer の復旧または fail-closed 化が終わるまで読者を待たせる共有 lock。
+        """writer の replace 途中を読者に見せない共有 lock。
 
-        lock ファイルを作れない (読み取り専用領域等) ときは開けるなら読み取りで、
-        存在しなければ writer が居ないので lock なしで読む。
+        親 dir が無ければ初期化前で writer も居ないので lock なしで読む。親 dir が
+        あるのに lock を開けないときは writer の不在を言えないので LockUnavailable。
         """
         if not self._path.parent.exists():
             yield
@@ -120,9 +145,9 @@ class StateStore:
         except OSError:
             try:
                 fd = os.open(lock, os.O_RDONLY)
-            except OSError:
-                yield
-                return
+            except OSError as e:
+                raise LockUnavailable(
+                    f"cannot open state lock: {type(e).__name__}") from e
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
             yield
@@ -130,12 +155,18 @@ class StateStore:
             os.close(fd)
 
     def load(self) -> AppState:
-        """共有 lock を取って読む。状態不明になったパスは常にラッチ済みとして返す。"""
+        """共有 lock を取って読む。解除の途中 marker があればラッチ済みとして返す。"""
         with self._shared():
             state = self._load_unlocked()
-        if self._is_uncertain():
+            pending = self.reconcile_marker() is not None
+        if pending:
             return replace(state, kill_switch_latched=True)
         return state
+
+    def file_value(self) -> AppState:
+        """marker を無視した、ファイルそのままの値 (reconcile の表示用)。"""
+        with self._shared():
+            return self._load_unlocked()
 
     def _load_unlocked(self) -> AppState:
         if not self._path.exists():
@@ -212,11 +243,7 @@ class StateStore:
                 pass
             raise
         try:
-            dfd = os.open(str(parent), os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
+            self._fsync_dir()
         except OSError as e:
             raise DurabilityUncertain(
                 "state file was replaced but directory fsync failed") from e
@@ -253,12 +280,60 @@ class StateStore:
             self.save(state)
             return state
 
-    def reset_kill_switch(self, expected_generation: int) -> AppState:
-        """ラッチ中かつ世代が一致するときだけ解除する。それ以外は何も書かない。"""
-        with self._exclusive():
-            if self._is_uncertain():
+    def _write_marker(self, expected_generation: int) -> None:
+        """marker を作って fsync し、親 dir も fsync する。作れなければ何も残さない。"""
+        body = json.dumps({
+            "kind": "kill_switch_reset",
+            "requested_generation": expected_generation,
+            "started_at": self._clock.now().astimezone(timezone.utc).isoformat(),
+        }, ensure_ascii=False).encode("utf-8")
+        created = False
+        try:
+            fd = os.open(str(self._marker),
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            created = True
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            self._fsync_dir()
+        except BaseException as e:
+            try:
+                if created:
+                    self._marker.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as unlink_error:
+                # 作りかけの印が残った。ラッチ側に倒れたまま人の確認を待つ。
                 raise StateUncertain(
-                    "kill switch state is unknown; restart after checking it")
+                    "reset marker could not be created or removed") \
+                    from unlink_error
+            if isinstance(e, OSError):
+                raise ResetNotApplied(
+                    "reset marker could not be written; nothing changed") from e
+            raise
+
+    def _remove_marker(self) -> None:
+        """marker を消す。消えたあとの親 dir fsync の失敗は伝えない。
+
+        消えた marker が crash で戻っても、ラッチ側に倒れるだけで安全側。
+        """
+        self._marker.unlink()
+        try:
+            self._fsync_dir()
+        except OSError:
+            pass
+
+    def reset_kill_switch(self, expected_generation: int) -> AppState:
+        """ラッチ中かつ世代が一致するときだけ解除する。それ以外は何も書かない。
+
+        write-ahead: replace の前に marker を永続化し、全工程が済んでから消す。
+        途中で止まれば marker が残り、load() は(別プロセスでも)ラッチ中を返す。
+        """
+        with self._exclusive():
+            if self.reconcile_marker() is not None:
+                raise StateUncertain(
+                    "a previous reset did not finish; run `killswitch reconcile`")
             current = self._load_unlocked()
             if not current.kill_switch_latched:
                 raise NotLatched()
@@ -266,18 +341,38 @@ class StateStore:
                 raise GenerationMismatch(current.kill_switch_generation,
                                          current.kill_switch_latched_at)
             state = replace(current, kill_switch_latched=False)
+            self._write_marker(expected_generation)
             try:
                 self.save(state)
-            except DurabilityUncertain as first:
-                # 解除が書かれたかもしれない。ラッチ中の旧状態を書き直し、
-                # 解除は適用されなかったことに揃える。
-                try:
-                    self.save(current)
-                except Exception as second:
-                    self._mark_uncertain()
-                    raise StateUncertain(
-                        "kill switch state is unknown after a failed save"
-                    ) from second
+            except Exception as e:
+                # marker は残す。ファイルが解除済みかどうかを復旧で確かめない。
                 raise ResetNotApplied(
-                    "kill switch reset was not applied") from first
+                    "kill switch reset did not finish; marker kept") from e
+            try:
+                self._remove_marker()
+            except OSError as e:
+                raise ResetNotApplied(
+                    "kill switch reset did not finish; marker kept") from e
+            return state
+
+    def confirm_latched(self) -> AppState:
+        """marker を「ラッチ中として確定」して消す (解除側には倒さない)。
+
+        ファイルをラッチ状態で書き直し、成功してから marker を消す。marker が無ければ
+        何も書かず現在値を返す。
+        """
+        with self._exclusive():
+            if self.reconcile_marker() is None:
+                return self._load_unlocked()
+            current = self._load_unlocked()
+            if current.kill_switch_latched:
+                state = current
+            else:
+                state = replace(
+                    current, kill_switch_latched=True,
+                    kill_switch_generation=current.kill_switch_generation + 1,
+                    kill_switch_latched_at=self._clock.now().astimezone(
+                        timezone.utc).isoformat())
+            self.save(state)
+            self._remove_marker()
             return state
