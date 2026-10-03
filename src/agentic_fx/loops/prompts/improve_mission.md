@@ -130,14 +130,13 @@
   "selection_rationale": "<選択理由>"
 }}
 
-実例の `<…>` はプレースホルダです。そのまま出力せず、必ず実際の内容に置き換えてください。
-
 - `discoveries` は**オブジェクトの配列**です (文字列の配列ではない)。
   各要素は `idea` / `source` (`agent` か `research`) / `evidence` / `kind`
   の 4 キー。`kind` は `task` (実装できる変更) か `fact` (観察・制約の
   記録。backlog には note として保存され選択対象外)。発見が無ければ `[]`。
 - `selected` も**オブジェクト**です。`backlog_id` は整数 (新規課題なら
   null)、`idea` は選んだ課題の説明文字列。
+- 実例の `<…>` はプレースホルダです。そのまま出力せず、必ず実際の内容に置き換えてください。
 - `artifact` は 3 形のいずれか:
   - plugin 形: 上の実例のとおり (`name` は候補置き場に書いた plugin 名)
   - report 形: `{{"type": "report", "proposal_kind": "core" | "risk_gate" | "research", "title": "...", "body_md": "..."}}`
