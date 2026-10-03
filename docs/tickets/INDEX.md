@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 124 件。完了分は CLOSED.md。
+未完了: 125 件。完了分は CLOSED.md。
 
 ## 実装待ち (12)
 
@@ -32,7 +32,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (105)
+## 設計待ち (106)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -69,6 +69,7 @@
 | [research-user-agent-claims-unverified-url](research-user-agent-claims-unverified-url.md) | 中 | 2026-10-02 | 研究用取得の User-Agent が実在未確認の URL を名乗る |
 | [settings-yaml-duplicate-key-silently-last-wins](settings-yaml-duplicate-key-silently-last-wins.md) | 中 | 2026-10-02 | settings.yaml の重複キーは黙って後の値が効く |
 | [backlog-status-update-is-two-step-and-races-selection](backlog-status-update-is-two-step-and-races-selection.md) | 中 | 2026-10-03 | backlog reject/reopen/note が SELECT 後の更新で選択と競合する |
+| [improve-daily-params-weekly-algorithm](improve-daily-params-weekly-algorithm.md) | 中 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
 | [manual-improve-runs-synchronously-on-caller-thread](manual-improve-runs-synchronously-on-caller-thread.md) | 中 | 2026-10-03 | 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する |
 | [plugin-worker-startup-failure-unreadable](plugin-worker-startup-failure-unreadable.md) | 中 | 2026-10-03 | plugin worker の起動失敗の理由が読めない |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
