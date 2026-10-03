@@ -843,3 +843,46 @@ def test_existing_preflight_refusals_do_not_touch_cpu_observations_or_ledger_row
     ledger.freeze()
     assert ledger.entries() == []
     assert sum(counters.cpu_limit_observations.values()) == 0
+
+
+def test_cpu_limit_refusal_still_holds_when_observations_exceed_the_threshold(
+        tmp_path):
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call()
+    (key,) = list(counters.cpu_limit_observations)
+    counters.record_cpu_limit_observation(key)
+    assert counters.cpu_limit_observation_count(key) == 3
+    assert call()["error"] == "repeated_worker_cpu_limit"
+    assert len(calls) == 2
+
+
+def test_cpu_limit_is_not_observed_when_there_is_no_staging_dir():
+    calls = []
+
+    def handler(args):
+        calls.append(args)
+        return dict(_CPU_REPLY)
+
+    budget = ImproveToolBudgetSettings()
+    counters = MissionToolCounters(budget=budget)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 60}),
+        run_backtest_handler=handler, analyze_corr_handler=lambda a: {},
+        counters=counters, budget=budget)}
+    for _ in range(3):
+        assert tools["run_backtest"].func(
+            name="cand", pair="USDJPY")["error"] == "worker_cpu_limit"
+    assert len(calls) == 3
+    assert dict(counters.cpu_limit_observations) == {}
+
+
+def test_repeated_cpu_limit_refusal_row_is_not_an_accepted_ledger_entry(
+        tmp_path):
+    from agentic_fx.loops.improve_loop import accepted_entries
+
+    call, calls, counters, ledger, _ = _cpu_env(tmp_path, [_CPU_REPLY])
+    call(), call(), call()
+    ledger.freeze()
+    entries = ledger.entries()
+    assert len(entries) == 3
+    assert accepted_entries(entries) == []

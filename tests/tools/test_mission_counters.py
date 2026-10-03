@@ -275,3 +275,12 @@ def test_cpu_limit_observation_count_is_exact_under_concurrency():
             lambda _: counters.record_cpu_limit_observation(("h", "P")),
             range(200)))
     assert counters.cpu_limit_observations[("h", "P")] == 200
+
+
+def test_cpu_limit_observation_count_is_zero_for_an_unseen_key_and_does_not_register_it():
+    counters = MissionToolCounters(budget=_budget())
+    assert counters.cpu_limit_observation_count(("h", "P")) == 0
+    assert ("h", "P") not in counters.cpu_limit_observations
+    counters.record_cpu_limit_observation(("h", "P"))
+    assert counters.cpu_limit_observation_count(("h", "P")) == 1
+    assert counters.cpu_limit_observation_count(("h", "Q")) == 0
