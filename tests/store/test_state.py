@@ -92,7 +92,7 @@ import os
 import subprocess
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from agentic_fx.store.state import GenerationMismatch, NotLatched
 
@@ -349,3 +349,150 @@ def test_wrong_type_generation_keys_fail_closed(tmp_path, key, bad):
     path.write_text(json.dumps(raw))
     with pytest.raises(StateError):
         StateStore(path).load()
+
+
+def test_reset_holds_lock_across_read_modify_write(tmp_path):
+    """解除の load と save の間に、別インスタンスの更新は割り込めない。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    other = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    inside = threading.Event()
+    release = threading.Event()
+    real_load = store.load
+
+    def slow_load():
+        s = real_load()
+        inside.set()
+        release.wait(5)
+        return s
+
+    store.load = slow_load
+    t = threading.Thread(target=lambda: store.reset_kill_switch(1))
+    t.start()
+    assert inside.wait(5)
+    done = threading.Event()
+
+    def writer():
+        other.update(autopilot=True)
+        done.set()
+
+    w = threading.Thread(target=writer)
+    w.start()
+    assert not done.wait(0.3)
+    release.set()
+    t.join()
+    w.join()
+    s = other.load()
+    assert s.autopilot is True and s.kill_switch_latched is False
+
+
+def test_lock_is_released_after_failed_update_even_if_exception_is_kept(
+        tmp_path, monkeypatch):
+    """更新が例外で失敗しても、例外を保持している間に別インスタンスが更新できる。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    other = StateStore(path)
+
+    def boom(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError) as ei:  # ei が traceback (= frame) を保持する
+        store.update(autopilot=True)
+    monkeypatch.undo()
+    done = threading.Event()
+
+    def writer():
+        other.update(initialized=True)
+        done.set()
+
+    w = threading.Thread(target=writer, daemon=True)
+    w.start()
+    assert done.wait(2), "lock was not released after a failed update"
+    assert ei.value is not None
+
+
+def test_failed_replace_propagates_and_keeps_original(tmp_path, monkeypatch):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(initialized=True)
+    before = path.read_bytes()
+
+    def boom(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        store.update(autopilot=True)
+    monkeypatch.undo()
+    assert path.read_bytes() == before
+
+
+def test_file_contents_are_flushed_before_fsync(tmp_path, monkeypatch):
+    """fsync の時点で、書き込む内容が全てファイルに渡っている。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    sizes = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        if not os.path.isdir(f"/proc/self/fd/{fd}"):
+            sizes.append(os.fstat(fd).st_size)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    store.update(initialized=True)
+    assert sizes and all(n > 0 for n in sizes)
+    assert sizes[0] == len(path.read_bytes())
+
+
+def test_latched_at_is_utc_even_if_clock_is_not(tmp_path):
+    jst = timezone(timedelta(hours=9))
+    store = StateStore(tmp_path / "app_state.json",
+                       clock=_FixedClock(datetime(2026, 10, 3, 17, 0,
+                                                  tzinfo=jst)))
+    s = store.update(kill_switch_latched=True)
+    assert s.kill_switch_latched_at == "2026-10-03T08:00:00+00:00"
+
+
+def test_updates_not_latching_the_switch_leave_generation_alone(tmp_path):
+    store = StateStore(tmp_path / "app_state.json",
+                       clock=_FixedClock(LATCH_TIME))
+    s = store.update(autopilot=True)
+    assert (s.kill_switch_generation, s.kill_switch_latched_at) == (0, None)
+    s = store.update(kill_switch_latched=False)  # ラッチしていない所への False
+    assert (s.kill_switch_generation, s.kill_switch_latched_at) == (0, None)
+    store.update(kill_switch_latched=True)
+    s = store.update(autopilot=False)  # ラッチ中の無関係な更新
+    assert (s.kill_switch_generation, s.kill_switch_latched_at) == (
+        1, "2026-10-03T08:00:00+00:00")
+
+
+def test_reset_with_future_generation_writes_nothing(tmp_path):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    before = path.read_bytes()
+    with pytest.raises(GenerationMismatch):
+        store.reset_kill_switch(2)
+    assert path.read_bytes() == before
+
+
+def test_reset_transitions_over_latch_cycles(tmp_path):
+    """(ラッチ, 世代) の遷移: 古い世代の解除は、何回目のラッチでも新ラッチを消さない。"""
+    store = StateStore(tmp_path / "app_state.json",
+                       clock=_FixedClock(LATCH_TIME))
+    for gen in (1, 2, 3):
+        store.update(kill_switch_latched=True)
+        assert store.load().kill_switch_generation == gen
+        for stale in range(0, gen):
+            with pytest.raises(GenerationMismatch):
+                store.reset_kill_switch(stale)
+            assert store.load().kill_switch_latched is True
+        store.reset_kill_switch(gen)
+        s = store.load()
+        assert s.kill_switch_latched is False and s.kill_switch_generation == gen
+        for g in range(0, gen + 2):
+            with pytest.raises(NotLatched):
+                store.reset_kill_switch(g)
