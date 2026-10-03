@@ -2564,9 +2564,27 @@ def test_interactive_mode_actually_stops_via_stop_event_end_to_end(
         def fileno():
             return r
 
-    timer = threading.Timer(0.5, stop_event.set)
+    stop_at: list[float] = []
+    watcher_done = threading.Event()
+
+    def _stop_after_service_started() -> None:
+        # 起動完了 (service_started の記録) を待ってから止める。固定の遅延だと
+        # 負荷下で起動が遅れた分まで「停止の遅さ」に数えてしまう。
+        activity = tmp_path / "logs" / "activity.log"
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline and not watcher_done.is_set():
+            try:
+                if "service_started" in activity.read_text(encoding="utf-8"):
+                    break
+            except OSError:
+                pass
+            time.sleep(0.02)
+        time.sleep(0.2)  # シェルがポーリングに入る猶予 (無くても停止は観測される)
+        stop_at.append(time.monotonic())
+        stop_event.set()
+
+    timer = threading.Thread(target=_stop_after_service_started, daemon=True)
     timer.start()
-    started = time.monotonic()
     try:
         with _no_real_network(), \
              patch("agentic_fx.service.build_app", return_value=app), \
@@ -2574,10 +2592,12 @@ def test_interactive_mode_actually_stops_via_stop_event_end_to_end(
              patch("sys.stdin", _Stdin()):
             rc = run_service(tmp_path, daemon=False, _stop_event=stop_event)
     finally:
-        timer.cancel()
+        watcher_done.set()
+        timer.join(timeout=5.0)
         stdin_stream.close()
         os.close(w)
-    elapsed = time.monotonic() - started
+    assert stop_at, "stop_event が一度もセットされていない"
+    elapsed = time.monotonic() - stop_at[0]
 
     assert rc == 0
     assert elapsed < 15.0, (

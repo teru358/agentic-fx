@@ -1312,21 +1312,33 @@ def test_worker_runner_uses_rpc_kind_timeout_and_default_for_other_names(
     monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: FakeProc())
     monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
 
+    # 既定 timeout (1.0s) を超えるが種別 timeout (100s) には十分収まる遅延の
+    # ハンドラと、解放されるまで返らないハンドラ。後者は負荷に関わらず必ず
+    # 既定 timeout に達する。
+    release = threading.Event()
+
     def slow_success(_args):
-        time.sleep(0.5)
+        time.sleep(1.5)
         return {"finished": True}
 
-    settings = _tiny_worker_settings(rpc_timeout_sec=0.2)
+    def blocked(_args):
+        release.wait(60.0)
+        return {"finished": True}
+
+    settings = _tiny_worker_settings(rpc_timeout_sec=1.0)
     runner = WorkerRunner(
         root=_root(tmp_path), settings=settings, clock=FixedClock(NOW),
         rag=_rag(tmp_path),
-        rpc_handlers={"run_backtest": slow_success, "other_rpc": slow_success},
-        rpc_timeout_sec_by_kind={"run_backtest": 2.0},
+        rpc_handlers={"run_backtest": slow_success, "other_rpc": blocked},
+        rpc_timeout_sec_by_kind={"run_backtest": 100.0},
     )
 
     child_thread.start()
-    result = runner.run(_mission())
-    child_thread.join(timeout=3.0)
+    try:
+        result = runner.run(_mission())
+    finally:
+        release.set()
+    child_thread.join(timeout=30.0)
 
     assert result.status == "completed"
     assert responses[0]["ok"] is True
@@ -5225,10 +5237,10 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
             "claude": SETTINGS.runner.claude.model_copy(update={
                 "bin": str(FAKE_CLAUDE_TRADE_DRIVER),
                 "credentials_file": str(creds)}),
-            "cli_terminate_grace_sec": 5.0,
+            "cli_terminate_grace_sec": 20.0,
         }),
         "worker": SETTINGS.worker.model_copy(update={
-            "worker_startup_timeout_sec": 15.0, "worker_grace_sec": 5.0}),
+            "worker_startup_timeout_sec": 90.0, "worker_grace_sec": 20.0}),
     })
 
     captured_cwd: dict[str, object] = {}
@@ -5272,7 +5284,7 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
     runner = WorkerRunner(root=root, settings=settings, clock=FixedClock(NOW),
                           rag=_rag(tmp_path), worker_profile="trade")
     mission = Mission(prompt="hi", tools=[], output_schema={},
-                      max_turns=1, timeout_sec=30.0)
+                      max_turns=1, timeout_sec=180.0)
     # 段A (mission transcript 常時保存): このテストは本物の
     # mission_worker 子プロセスを spawn する — 子は別プロセスなので
     # `tests/conftest.py` の `_isolate_mission_transcripts_default_dir`

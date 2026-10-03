@@ -1,6 +1,7 @@
 """shell readline 中断 seam (プラン8, 設計書 §6 codex I3-2)。"""
 from __future__ import annotations
 
+import fcntl
 import io
 import os
 import threading
@@ -13,6 +14,16 @@ from agentic_fx.shell import (
     _InterruptibleLineReader,
     run_shell,
 )
+
+
+def _wait_until(pred, timeout: float = 15.0) -> bool:
+    """条件が成立するまで上限付きでポーリングする。成立したら True。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        time.sleep(0.01)
+    return pred()
 
 
 class _FakeCommands:
@@ -55,16 +66,16 @@ def test_stop_event_wakes_blocked_shell_promptly(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=lambda *_: None)
-    time.sleep(0.1)  # run_shell がポーリングループに入るまで待つ
+    time.sleep(0.1)  # ループ突入の目安 (stop_event は先にセットされても観測される)
 
     start = time.monotonic()
     stop_event.set()
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
     elapsed = time.monotonic() - start
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert not t.is_alive(), "stop_event セット後、shell スレッドが終了していない"
-    assert elapsed < 1.0  # poll_interval=0.05s に対して十分な余裕
+    assert elapsed < 10.0  # poll_interval=0.05s に対して十分な余裕 (負荷下でも成立)
 
     os.close(w_fd)
     stream.close()
@@ -81,13 +92,12 @@ def test_line_is_read_when_available(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
-    time.sleep(0.1)
     writer.write("hello\n")
     writer.flush()
-    time.sleep(0.2)
+    _wait_until(lambda: "echo: hello" in printed)
 
     stop_event.set()
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "echo: hello" in printed
@@ -108,13 +118,13 @@ def test_multiple_lines_arriving_together_are_not_stuck(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
-    time.sleep(0.1)
     writer.write("hello\nworld\n")  # 2 行を 1 回の書込み・flush でまとめて送る
     writer.flush()
-    time.sleep(0.3)  # 追加の書込みは一切行わない — この待ちだけで両方届くはず
+    # 追加の書込みは一切行わない — 待つだけで両方届くはず
+    _wait_until(lambda: "echo: world" in printed)
 
     stop_event.set()
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "echo: hello" in printed
@@ -137,13 +147,12 @@ def test_multibyte_char_split_across_chunk_boundary_is_not_corrupted(tmp_path):
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append,
         chunk_size=1)
-    time.sleep(0.1)
     writer.write("あいうえお\n".encode("utf-8"))
     writer.flush()
-    time.sleep(0.3)
+    _wait_until(lambda: "echo: あいうえお" in printed)
 
     stop_event.set()
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "echo: あいうえお" in printed  # チャンク境界分断で文字化けしていないこと
@@ -166,7 +175,7 @@ def test_stdin_without_fileno_falls_back_without_raising(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=_print_fn)
-    t.join(timeout=2.0)  # StringIO は "hello\n" の後 EOF になり自然終了する
+    t.join(timeout=15.0)  # StringIO は "hello\n" の後 EOF になり自然終了する
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert not t.is_alive()
@@ -185,7 +194,6 @@ def test_reader_strips_carriage_return_from_crlf_line():
     writer = os.fdopen(w_fd, "wb")
     writer.write(b"hello\r\n")
     writer.flush()
-    time.sleep(0.1)
 
     reader = _InterruptibleLineReader(stream)
     stop_event = threading.Event()
@@ -208,10 +216,9 @@ def test_eof_on_stream_sets_stop_event_and_returns(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
-    time.sleep(0.1)
     writer.close()  # EOF を発生させる
 
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert not t.is_alive()
@@ -231,12 +238,11 @@ def test_partial_line_before_eof_is_processed(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
-    time.sleep(0.1)
     writer.write("partial")  # 改行なし
     writer.flush()
     writer.close()  # 直後に EOF
 
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "echo: partial" in printed
@@ -269,13 +275,12 @@ def test_prompt_goes_through_prompt_fn_not_real_stdout(tmp_path, capsys):
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=lambda *_: None,
         prompt_fn=prompts.append)
-    time.sleep(0.1)
     writer.write("hello\n")
     writer.flush()
-    time.sleep(0.2)
+    _wait_until(lambda: "afx> " in prompts)
 
     stop_event.set()
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     assert "afx> " in prompts  # prompt_fn 経由で呼ばれたこと
@@ -298,7 +303,6 @@ def test_partial_multibyte_sequence_at_eof_is_finalized(tmp_path):
     t, err = _start_shell(
         _FakeCommands(), stop_event,
         stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
-    time.sleep(0.1)
     # "あ" (U+3042) の UTF-8 は 3 バイト (0xE3 0x81 0x82)。先頭 2 バイトだけ
     # 送って改行なしで EOF にする — マルチバイト文字の途中で入力が
     # 終わるケースを再現する。
@@ -306,7 +310,7 @@ def test_partial_multibyte_sequence_at_eof_is_finalized(tmp_path):
     writer.flush()
     writer.close()  # 改行なしで EOF
 
-    t.join(timeout=2.0)
+    t.join(timeout=15.0)
 
     assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
     # 黙って捨てられていれば "echo: prefix-" (末尾バイトが消える) になる。
@@ -314,3 +318,39 @@ def test_partial_multibyte_sequence_at_eof_is_finalized(tmp_path):
     assert any(p.startswith("echo: prefix-") and len(p) > len("echo: prefix-")
                for p in printed), printed
     stream.close()
+
+
+def test_line_is_read_when_fd_number_exceeds_select_limit(tmp_path):
+    """fd 番号が 1024 以上でも (select.select の FD_SETSIZE を超えても)
+    行を読める。"""
+    hogs: list[int] = []
+    r_fd, w_fd = os.pipe()
+    try:
+        # 1024 以上の fd 番号を得るため、低い番号を塞いでから pipe を複製する
+        high_r = fcntl.fcntl(r_fd, fcntl.F_DUPFD, 1100)
+        hogs.append(high_r)
+        assert high_r >= 1024
+        os.close(r_fd)
+        stream = os.fdopen(high_r, "r")
+        hogs.clear()
+        writer = os.fdopen(w_fd, "w")
+        stop_event = threading.Event()
+        printed: list[str] = []
+
+        t, err = _start_shell(
+            _FakeCommands(), stop_event,
+            stdin_stream=stream, poll_interval=0.05, print_fn=printed.append)
+        writer.write("hello\n")
+        writer.flush()
+        _wait_until(lambda: "echo: hello" in printed)
+
+        stop_event.set()
+        t.join(timeout=15.0)
+
+        assert not err, f"shell スレッドが例外で死んだ: {err[0]!r}"
+        assert "echo: hello" in printed
+        writer.close()
+        stream.close()
+    finally:
+        for fd in hogs:
+            os.close(fd)

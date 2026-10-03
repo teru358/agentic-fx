@@ -2,7 +2,7 @@
 
 readline 中断 seam (プラン8, 設計書 §6 codex I3-2): 対話モードの main は
 `input()` でブロックするため、`stop_event` が別スレッドからセットされても
-自然には解けない。`select.select` によるポーリングへ置き換え、定期的に
+自然には解けない。`select.poll` によるポーリングへ置き換え、定期的に
 `stop_event` をチェックできるようにする。
 
 (レビュー反映 H2) 現時点で `stop_event` を立てる producer は存在しない —
@@ -49,7 +49,7 @@ class _InterruptibleLineReader:
     replacement 文字が出る)。`codecs.getincrementaldecoder` を使い、
     境界をまたぐ未確定バイト列をデコーダ内部に保持させる。
 
-    (レビュー反映 G2) `select.select` はストリームが `fileno()` を持たない
+    (レビュー反映 G2) `select.poll` への登録はストリームが `fileno()` を持たない
     (例: `StringIO`、キャプチャされた stdin) と例外になる。構築時に
     `fileno()` の可否を確認し、`usable` フラグで呼び出し側 (`run_shell`)
     に判断材料を渡す — 使えない場合は割込み可能経路を諦め、
@@ -57,6 +57,14 @@ class _InterruptibleLineReader:
     フォールバックする (黙って停止性を失わないよう、フォールバックした
     事実は `print_fn` 経由でログに残す)。
     """
+
+    def _poll_readable(self, timeout: float) -> bool:
+        """読み取り可能 (データ到着・EOF・エラー) なら True。`select.select` は
+        fd 番号が 1024 以上で ValueError になるため poll を使う。"""
+        poller = select.poll()
+        poller.register(self._stream.fileno(),
+                        select.POLLIN | select.POLLHUP | select.POLLERR)
+        return bool(poller.poll(int(timeout * 1000)))
 
     def __init__(self, stream, *, chunk_size: int = 4096) -> None:
         self._stream = stream
@@ -97,8 +105,8 @@ class _InterruptibleLineReader:
             # 実測確認済み): `BufferedReader.read1(n)` は内部バッファが
             # 空のとき raw からちょうど n バイト読むだけで先読みしない。
             # そのため `read1(1)` の後も残りのバイトは OS 側パイプに
-            # 残ったままになり、次回の `select` が正しく検知できる。
-            ready, _, _ = select.select([self._stream], [], [], poll_interval)
+            # 残ったままになり、次回の poll が正しく検知できる。
+            ready = self._poll_readable(poll_interval)
             if not ready:
                 continue
             chunk = self._raw.read1(self._chunk_size) \

@@ -1,23 +1,28 @@
 ---
 id: flake-trade-claude-real-process
 title: 全スイート負荷時に claude 実プロセスのテストが稀に落ちる
-status: 実装待ち
+status: 是正済
 priority: 低
 opened: 2026-09-20
-closed: null
+closed: 2026-10-03
 related: [switch-ops-hardening]
 backfilled: true
 source_section: 未完了
 ---
 # [flake-trade-claude-real-process]
 
-**状態**: 実装待ち / **優先**: 低
+**状態**: 是正済 / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
 [flake-trade-claude-real-process] 起票 2026-09-20 ([switch-ops-hardening] 1 周目是正のフルスイート): `tests/runners/test_worker_runner.py::test_trade_claude_real_process_completes_via_factory_build_runner` (fake claude CLI の実プロセス起動) が全スイート負荷下で 1 回 fail、単独 0.78s で pass、同一コマンド再実行で 4304 passed。束の変更とは無関係 (触っていないファイル)。再発頻度を見る
 
+## 修正内容
+
+- 2026-10-03: 実プロセスの上限を startup 90s / mission 180s / grace 20s に
+
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 低、題名: 全スイート負荷時に claude 実プロセスのテストが稀に落ちる — 仕分け (2026-10-02、現物で成立を確認): 1 回だけ負荷下 fail (単独 0.78s で pass)、再発頻度を見る段階。 根拠: tests/runners/test_worker_runner.py:5197 の実プロセス起動テスト。全スイート負荷下で 1 回 fail、再発の記録は本文のみ。
+- 2026-10-03: 是正内容 — 実プロセスの上限を startup 90s / mission 180s / grace 20s に

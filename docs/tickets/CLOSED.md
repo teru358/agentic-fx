@@ -2,13 +2,17 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (37)
+## 2026-10 (41)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 是正済 | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 是正済 | 高 | 2026-10-03 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 是正済 | 高 | 2026-10-03 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
+| [flake-rpc-timeout-by-kind](flake-rpc-timeout-by-kind.md) | 是正済 | 低 | 2026-10-03 | 種別 timeout テストが実時間依存で負荷下に落ち得る |
+| [flake-shell-interrupt-timing](flake-shell-interrupt-timing.md) | 是正済 | 低 | 2026-10-03 | 別 pytest 並走で shell 割り込みテストが落ちる |
+| [flake-trade-claude-real-process](flake-trade-claude-real-process.md) | 是正済 | 低 | 2026-10-03 | 全スイート負荷時に claude 実プロセスのテストが稀に落ちる |
+| [flake](flake.md) | 是正済 | 低 | 2026-10-03 | 全スイート負荷時に対話停止テストが落ちる (タイミング依存) |
 | [kind-read-duplication](kind-read-duplication.md) | 是正済 | 低 | 2026-10-03 | 候補の kind 読み出しが config.yaml 再パースで重複 |
 | [legacy-e2e-daemon-quiet](legacy-e2e-daemon-quiet.md) | 是正済 | 低 | 2026-10-03 | stdin が非 TTY だと afx が黙って daemon 動作になる |
 | [legacy-oc-example-leak](legacy-oc-example-leak.md) | 是正済 | 低 | 2026-10-03 | プロンプトの実例 idea がそのまま backlog に実在化する |
