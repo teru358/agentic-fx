@@ -169,3 +169,29 @@ def test_inventory_view_overrides_the_live_plugins_dir(tmp_path):
     # 遮断 8: view にしか無い情報でも成績・期間・段名は載らない
     assert set(ctx["current_inventory"]["approved_plugins"][0]) == {
         "name", "kind", "pairs", "params", "outputs", "content_hash"}
+
+
+def test_context_never_carries_the_human_logs(tmp_path):
+    """次回 mission の材料は DB と方針ファイルから組み、人間向けの技術ログ・
+    activity の内容も位置も載せない。"""
+    import json
+
+    from agentic_fx.activity import ActivityLog, Category
+
+    marker = "HUMAN-LOG-MARKER-7b3e"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "agentic.log").write_text(
+        f"plugin_worker_diagnostic code=cpu_limit stderr_tail={marker}\n")
+    ActivityLog(logs / "activity.log").write(
+        Category.IMPROVE, "backtest_cpu",
+        f"mission=1 plugin={marker} cpu_sec=59.97 cpu_source=parent_wait4 "
+        "result=cpu_limit returncode=-9 signal=9")
+    c = connect(tmp_path / "t.db"); init_db(c)
+    backlog.add(c, "idea1", "user", NOW)
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    text = json.dumps(ctx, default=str, ensure_ascii=False)
+    for needle in (marker, "agentic.log", "activity.log", "59.97",
+                   "parent_wait4", "stderr_tail"):
+        assert needle not in text, needle

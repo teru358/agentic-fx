@@ -38,3 +38,49 @@ def test_set_resource_limits_sets_nofile_and_fsize():
     assert nofile_limit == (128, 128)
     fsize_limit = next(v for w, v in calls if w == resource.RLIMIT_FSIZE)
     assert fsize_limit == (8 * 1024 * 1024, 8 * 1024 * 1024)
+
+
+def _drive_worker_main(monkeypatch, tmp_path, *, limits_fail: bool):
+    import io
+    import json
+
+    from agentic_fx.plugin import worker
+
+    events = []
+    out = io.BytesIO()
+    handshakes = [{"cpu_sec": 5, "memory_mb": 512, "nofile": 64,
+                   "fsize_mb": 8, "kind": "indicator"}]
+
+    def set_limits(*args):
+        events.append("limits")
+        if limits_fail:
+            raise OSError("core disabled")
+
+    def import_plugin(path):
+        events.append("import")
+        raise RuntimeError("stop after import")
+
+    monkeypatch.setattr(worker.sys, "argv", ["worker", str(tmp_path)])
+    monkeypatch.setattr(worker, "_protect_protocol_stdout", lambda: out)
+    monkeypatch.setattr(worker, "_read_line",
+                        lambda: handshakes.pop(0) if handshakes else None)
+    monkeypatch.setattr(worker, "_set_resource_limits", set_limits)
+    monkeypatch.setattr(worker, "_poison_network_modules", lambda: None)
+    monkeypatch.setattr(worker, "_import_plugin", import_plugin)
+    worker.main()
+    reply = json.loads(out.getvalue().decode().splitlines()[0])
+    return events, reply
+
+
+def test_worker_main_sets_resource_limits_before_importing_the_plugin(
+        monkeypatch, tmp_path):
+    events, reply = _drive_worker_main(monkeypatch, tmp_path, limits_fail=False)
+    assert events == ["limits", "import"]
+    assert reply["ok"] is False and reply["ready"] is False
+
+
+def test_worker_main_never_imports_the_plugin_when_a_limit_cannot_be_set(
+        monkeypatch, tmp_path):
+    events, reply = _drive_worker_main(monkeypatch, tmp_path, limits_fail=True)
+    assert events == ["limits"]
+    assert reply["ok"] is False and reply["ready"] is False

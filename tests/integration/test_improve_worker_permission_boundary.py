@@ -84,7 +84,8 @@ _EACCES_PRELUDE = textwrap.dedent("""
 
 def _run_probe(script: str, *, staging_dir: Path, mission_id: str,
               source_snapshot_dir: Path, workdir: Path,
-              backend: str = "local") -> subprocess.CompletedProcess:
+              backend: str = "local",
+              transcripts_dir: Path | None = None) -> subprocess.CompletedProcess:
     full = textwrap.dedent(f"""
         import sys
         sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
@@ -103,7 +104,8 @@ def _run_probe(script: str, *, staging_dir: Path, mission_id: str,
     # と同じ手当て)。
     env = {"PATH": "/usr/bin:/bin", "HOME": str(workdir / "home"),
            "AGENTIC_FX_MISSION_TRANSCRIPTS_DIR":
-               str(workdir / "mission-transcripts-isolated")}
+               str(transcripts_dir if transcripts_dir is not None
+                   else workdir / "mission-transcripts-isolated")}
     return subprocess.run([sys.executable, "-c", full], cwd=str(workdir),
                           env=env,
                           capture_output=True, text=True, timeout=30)
@@ -155,6 +157,63 @@ def test_invariant1_cannot_truncate_agentic_db(tmp_path):
                         workdir=layout["workdir"])
     assert result.returncode == 0, result.stderr
     assert "OK: truncate EACCES" in result.stdout
+
+
+# --- 人間向けの技術ログと activity は worker から読めない ---------------------
+# 本番では transcript の保存先 `logs/mission-transcripts/` だけが rw に入り、
+# 同じ `logs/` にある `agentic.log` と `activity.log` は入らない。同じ並びを
+# tmp_path 上に作り、transcript 側に書けることを対照にして確かめる。
+
+def _logs_layout(tmp_path: Path) -> dict:
+    layout = _mk_repo_layout(tmp_path)
+    logs = layout["root"] / "logs"
+    logs.mkdir()
+    (logs / "agentic.log").write_text("TECH-LOG-LINE stderr_tail=secret\n")
+    (logs / "activity.log").write_text("ACTIVITY-LINE backtest_cpu cpu_sec=59.97\n")
+    layout["logs"] = logs
+    layout["transcripts"] = logs / "mission-transcripts"
+    return layout
+
+
+@pytest.mark.parametrize("filename", ["agentic.log", "activity.log"])
+def test_worker_cannot_open_the_technical_log_or_activity_log(tmp_path, filename):
+    layout = _logs_layout(tmp_path)
+    target = layout["logs"] / filename
+    script = f"""
+    from pathlib import Path
+    Path({str(layout['transcripts'] / 'probe.json')!r}).write_text('{{}}')
+    print('OK: transcript writable')
+    _expect_eacces(lambda: open({str(target)!r}, 'rb'),
+                  'log EACCES', 'opened ' + {filename!r})
+    """
+    result = _run_probe(script, staging_dir=layout["my_staging"],
+                        mission_id="m-001", source_snapshot_dir=layout["source_snapshot"],
+                        workdir=layout["workdir"],
+                        transcripts_dir=layout["transcripts"])
+    assert result.returncode == 0, result.stderr
+    assert "OK: transcript writable" in result.stdout
+    assert "OK: log EACCES" in result.stdout
+    assert "FAIL" not in result.stdout
+
+
+def test_worker_cannot_list_the_logs_directory(tmp_path):
+    layout = _logs_layout(tmp_path)
+    script = f"""
+    import os
+    from pathlib import Path
+    Path({str(layout['transcripts'] / 'probe.json')!r}).write_text('{{}}')
+    print('OK: transcript writable')
+    _expect_eacces(lambda: os.listdir({str(layout['logs'])!r}),
+                  'logs/ EACCES', 'listed logs/')
+    """
+    result = _run_probe(script, staging_dir=layout["my_staging"],
+                        mission_id="m-001", source_snapshot_dir=layout["source_snapshot"],
+                        workdir=layout["workdir"],
+                        transcripts_dir=layout["transcripts"])
+    assert result.returncode == 0, result.stderr
+    assert "OK: transcript writable" in result.stdout
+    assert "OK: logs/ EACCES" in result.stdout
+    assert "FAIL" not in result.stdout
 
 
 # --- 不変条件 2: 書込可能パスは staging/workdir/dev のみ --------------------

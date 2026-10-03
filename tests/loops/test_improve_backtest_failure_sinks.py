@@ -24,7 +24,8 @@ _CASE_PARAMS = [(k, u, p) for k, u, p, _r in _CASES]
 
 # plugin / worker の死因を直接語る文字列。agent が読める面には出ない。
 _FORBIDDEN = (_MARKER, "plugin says no", "timed out", "exited unexpectedly",
-              "returncode", "cpu_sec", "signal=", "parent_wait4")
+              "returncode", "cpu_sec", "signal=", "parent_wait4",
+              "stderr_tail", "has_stderr_tail", "stderr_unavailable")
 
 
 def _table_text(db_path, table: str) -> str:

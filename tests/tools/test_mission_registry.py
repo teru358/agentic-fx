@@ -471,3 +471,50 @@ def test_trade_registry_mcp_call_counts_market_tool(tmp_path):
     })
     assert "result" in response
     assert counts == {"get_ohlcv": 1, "get_indicators": 0}
+
+
+def test_improve_registry_has_no_tool_or_path_that_reads_the_human_logs(tmp_path):
+    """improve の tool は人間向けの技術ログと activity を読む経路を持たない。
+    tool の説明・引数に log の名前が無く、staging / plugin / example を読む
+    tool に log の位置を渡しても中身は返らない。"""
+    from agentic_fx.activity import Category
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    marker = "HUMAN-LOG-MARKER-5d2a"
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "agentic.log").write_text(
+        f"plugin_worker_diagnostic stderr_tail={marker}\n")
+    activity = ActivityLog(logs / "activity.log")
+    activity.write(Category.IMPROVE, "backtest_cpu",
+                   f"mission=1 plugin={marker} cpu_sec=59.97")
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    staging_dir = tmp_path / "plugins" / "_staging" / "m-1"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir(parents=True)
+    source_snapshot_dir.mkdir()
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag, activity=activity,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+    names = registry.names()
+
+    schemas = json.dumps(registry.openai_tools(names), ensure_ascii=False)
+    for needle in ("agentic.log", "activity.log", "logs/", "stderr"):
+        assert needle not in schemas, needle
+
+    outputs = []
+    for rel_name in ("../../../logs", "../../logs", "logs", "../logs"):
+        outputs.append(registry.execute(
+            "read_staging_file", {"name": rel_name, "rel": "plugin.py"}, names))
+        for tool in ("read_plugin_source", "read_example_plugin"):
+            outputs.append(registry.execute(tool, {"name": rel_name}, names))
+    for tool in ("list_staging", "list_examples", "list_deployed_plugins"):
+        outputs.append(registry.execute(tool, {}, names))
+    for out in outputs:
+        assert marker not in out
+        assert "59.97" not in out

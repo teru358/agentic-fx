@@ -1474,6 +1474,60 @@ def test_every_improve_rpc_crosses_child_frame_and_parent_wrapper(monkeypatch, t
     assert received["run_backtest"] == {"name": "cand", "pair": "USDJPY"}
 
 
+
+def test_child_registry_refuses_the_third_cpu_limit_before_crossing_to_the_parent(
+        monkeypatch, tmp_path):
+    """本番の子 registry (`_build_improve_registry`) で、親の handler が同じ
+    候補・pair に 2 回 `worker_cpu_limit` を返すと、3 回目は RPC を送らずに
+    子で拒否される。親から子へ戻る応答は親側の公開 wrapper を通す。"""
+    import json as _json
+    import shutil
+    from pathlib import Path as _P
+
+    import agentic_fx.mission_worker as mw_mod
+    from agentic_fx.tools.improve_rpc_tools import build_rpc_handlers
+
+    raw_calls = []
+
+    def raw_run_backtest(args):
+        raw_calls.append(dict(args))
+        return {"started": True, "error": "worker_cpu_limit",
+                "hint": "fixed hint"}
+
+    parent = build_rpc_handlers(
+        {"run_backtest": raw_run_backtest,
+         "analyze_corr": lambda a: {"rows": []}}, staging_dir=None)
+    frames = []
+
+    def fake_rpc_client(name, args):
+        frames.append(name)
+        return parent[name](args).public
+
+    staging = tmp_path / "staging"; staging.mkdir(); (tmp_path / "source").mkdir()
+    shutil.copytree(_P(__file__).resolve().parents[1] / "docs/examples/plugins/sma_cross",
+                    staging / "cand")
+    registry, counters = mw_mod._build_improve_registry(
+        settings=_settings_with_improve_backend("local"), workdir=tmp_path,
+        staging_dir=staging, source_snapshot_dir=tmp_path / "source",
+        rpc_client=fake_rpc_client)
+    names = list(registry.names())
+
+    outs = [_json.loads(registry.execute(
+        "run_backtest", {"name": "cand", "pair": "USDJPY"}, names))
+        for _ in range(3)]
+
+    assert [o["error"] for o in outs] == [
+        "worker_cpu_limit", "worker_cpu_limit", "repeated_worker_cpu_limit"]
+    assert outs[2]["started"] is False
+    assert frames == ["run_backtest", "run_backtest"]
+    assert len(raw_calls) == 2
+    assert counters.backtest_calls["cand"] == 2
+    # 別の pair は同じ内容でも親へ届く。
+    other = _json.loads(registry.execute(
+        "run_backtest", {"name": "cand", "pair": "EURUSD"}, names))
+    assert other["error"] == "worker_cpu_limit"
+    assert len(raw_calls) == 3
+
 def test_local_backend_end_to_end_abort_on_broken_tool_exceptions(monkeypatch, tmp_path):
     """codex Minor 3 (run8 是正): 壊れた tool (例外) の連打が **実配線** で abort に至る —
     実 counters → 実 registry (on_result) → 実 factory (local) → 実 LocalRunner (HTTP のみ Mock)

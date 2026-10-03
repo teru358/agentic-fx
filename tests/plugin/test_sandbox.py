@@ -2678,6 +2678,20 @@ def test_stderr_tail_that_fits_is_not_marked_truncated(tmp_path, plugin_settings
     assert "truncated" not in caplog.records[-1].message
 
 
+
+def test_empty_stderr_leaves_no_tail_in_the_technical_log(tmp_path, plugin_settings, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="agentic_fx.plugin.sandbox")
+    session = _session_with_stderr(tmp_path, plugin_settings, "tail-empty", b"")
+    session._close_stderr()
+    assert session.stderr_tail is None
+    message = caplog.records[-1].message
+    assert message.startswith("plugin_worker_diagnostic ")
+    assert "stderr_tail" not in message
+    assert "truncated" not in message
+    assert not hasattr(session, "has_stderr_tail")
+
 # --- grace period after stdout EOF -------------------------------------
 
 def _eof_session(tmp_path, plugin_settings, name):
@@ -3342,3 +3356,54 @@ def test_startup_with_a_non_object_json_response_is_a_protocol_error(
         session.__enter__()
     assert error.value.code == session.error_code == "protocol_error"
     assert killed["value"] is True
+
+
+# --- a real Popen reaped by the session helper ----------------------------
+
+@pytest.mark.parametrize("shape", ["normal-close", "cpu-limit"])
+def test_real_popen_keeps_the_helper_returncode_and_is_never_waited_again(
+        monkeypatch, tmp_path, plugin_settings, shape):
+    import gc
+    import subprocess
+    import warnings
+
+    from agentic_fx.plugin import sandbox
+
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def recording_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", recording_popen)
+    if shape == "normal-close":
+        source, settings = INDICATOR_OK_PY, plugin_settings
+    else:
+        source = "\ndef compute(df, params):\n    n = 0\n    while True:\n        n += 1\n"
+        settings = plugin_settings.model_copy(update={"sandbox_session_cpu_sec": 1,
+                                                       "sandbox_timeout_sec": 5.0})
+    session = PluginSession(_meta(tmp_path, f"real-{shape}", "indicator", source),
+                            settings=settings)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ResourceWarning)
+        try:
+            with session:
+                session.call({"df": _df(), "params": {}})
+        except SandboxError as exc:
+            assert shape == "cpu-limit" and exc.code == "cpu_limit"
+        (proc,) = spawned
+        assert session.worker_returncode is not None
+        assert proc.returncode == session.worker_returncode
+        waits = []
+        monkeypatch.setattr(os, "waitpid",
+                            lambda *a: waits.append(a) or (_ for _ in ()).throw(
+                                ChildProcessError()))
+        assert proc.poll() == session.worker_returncode
+        assert proc.wait(timeout=0.1) == session.worker_returncode
+        assert waits == []
+        del proc, spawned[:]
+        gc.collect()
+    if shape == "cpu-limit":
+        assert session.worker_signal == signal.SIGKILL

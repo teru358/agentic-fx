@@ -215,3 +215,60 @@ def test_commit_gate_line_for_a_completed_evaluation_has_the_same_format(
         r"scope=(in_sample|holdout) pair=USDJPY deps=0 cpu_sec=\d+(\.\d+)? "
         r"cpu_source=parent_wait4 result=ok returncode=0 signal=null", l)
         for l in lines), lines
+
+
+# --- 実測 CPU 上限から 3 回目の拒否まで ----------------------------------------
+
+def test_real_cpu_limit_twice_then_the_third_identical_run_is_refused(tmp_path):
+    """本物の worker が CPU 上限で 2 回死ぬと、各回が activity に親観測の
+    `backtest_cpu result=cpu_limit` を残し、agent には `worker_cpu_limit` だけが
+    届く。同じ内容・pair の 3 回目は worker を起こさずに拒否される。"""
+    loop, ctx, activity = _arrange(
+        tmp_path, "cpu_limit",
+        {"sandbox_session_cpu_sec": 1, "sandbox_timeout_sec": 8.0})
+    budget = ImproveToolBudgetSettings()
+    counters = MissionToolCounters(budget=budget)
+    defs = build_improve_rpc_tooldefs(
+        ledger=ctx.ledger, run_backtest_handler=ctx.rpc_handlers["run_backtest"],
+        analyze_corr_handler=ctx.rpc_handlers["analyze_corr"],
+        staging_dir=ctx.staging_dir, counters=counters, budget=budget)
+    registry = ToolRegistry(on_execute=counters.record_call,
+                            on_result=counters.record_tool_result)
+    registry.register_all(defs)
+
+    raws = []
+    lines_after = []
+    for _ in range(3):
+        raws.append(registry.execute(
+            "run_backtest", {"name": "probe", "pair": "USDJPY"},
+            allowed=registry.names()))
+        lines_after.append([l for l in _activity_text(activity).splitlines()
+                            if "backtest_cpu" in l])
+    ctx.ledger.freeze()
+    entries = ctx.ledger.entries()
+    responses = [json.loads(r) for r in raws]
+
+    assert [r["error"] for r in responses] == [
+        "worker_cpu_limit", "worker_cpu_limit", "repeated_worker_cpu_limit"]
+    assert [r["started"] for r in responses] == [True, True, False]
+    # 1 回目・2 回目はそれぞれ親観測の CPU 上限として 1 行ずつ残る。
+    assert [len(x) for x in lines_after] == [1, 2, 2]
+    for line in lines_after[1]:
+        assert "result=cpu_limit" in line
+        assert "cpu_source=parent_wait4" in line
+        assert "signal=9" in line
+        assert re.search(r"cpu_sec=\d+(\.\d+)?\s", line), line
+    # 3 回目は worker を起こさず、候補枠も消費しない。
+    assert counters.backtest_calls["probe"] == 2
+    assert counters.total_calls == 3 and counters.errors == 3
+    # activity は人間向けだが、stderr とその有無は技術ログにしか出ない。
+    assert _MARKER not in _activity_text(activity)
+    assert "stderr" not in _activity_text(activity)
+    assert [e["result_summary"]["error"] for e in entries] == [
+        r["error"] for r in responses]
+    for sink in raws + [json.dumps(entries, default=str)]:
+        assert _MARKER not in sink
+        for text in ("returncode", "signal", "cpu_sec", "parent_wait4",
+                     "stderr", "pid"):
+            assert text not in sink
+        assert not re.search(r"\d+\.\d{2,}", sink)
