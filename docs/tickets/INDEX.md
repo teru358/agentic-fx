@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 131 件。完了分は CLOSED.md。
+未完了: 134 件。完了分は CLOSED.md。
 
 ## 実装待ち (22)
 
@@ -42,7 +42,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (102)
+## 設計待ち (105)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -50,6 +50,8 @@
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
+| [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 高 | 2026-10-03 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
+| [gate-pytest-dev-writable-and-ldso-exec](gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [sandbox-escape-via-user-daemons-unmeasured](sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測 |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
@@ -80,6 +82,7 @@
 | [settings-yaml-duplicate-key-silently-last-wins](settings-yaml-duplicate-key-silently-last-wins.md) | 中 | 2026-10-02 | settings.yaml の重複キーは黙って後の値が効く |
 | [backlog-status-update-is-two-step-and-races-selection](backlog-status-update-is-two-step-and-races-selection.md) | 中 | 2026-10-03 | backlog reject/reopen/note が SELECT 後の更新で選択と競合する |
 | [manual-improve-runs-synchronously-on-caller-thread](manual-improve-runs-synchronously-on-caller-thread.md) | 中 | 2026-10-03 | 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する |
+| [plugin-worker-startup-failure-unreadable](plugin-worker-startup-failure-unreadable.md) | 中 | 2026-10-03 | plugin worker の起動失敗の理由が読めない |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
