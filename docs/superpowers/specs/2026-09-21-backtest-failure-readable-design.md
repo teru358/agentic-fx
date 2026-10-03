@@ -1,4 +1,4 @@
-# [backtest-failure-readable] 設計書 v1.2
+# [backtest-failure-readable] 設計書 v1.3
 
 対象 commit: `fc318ab`。束 A は、現行の CPU 上限を変えずに、backtest と live plugin 評価の失敗を人間には診断可能に、改善 agent には安全な固定分類として届ける。
 
@@ -295,3 +295,4 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 | 2026-09-21 | v1.1 | 清書時に圧縮で落ちた8契約と対応ACを復元 | 清書時の圧縮で落ちた契約の復元 | `d95990d` |
 | 2026-09-21 | v1.2 | `cpu_limit` 判定の許容幅を 0 → 0.05 秒 (内部定数) | 実測: RLIMIT_CPU の kill 時、親が観測する累積 CPU は上限を最大 26 ms 下回る | `4321db3` |
 | 2026-09-29 | v1.3 | §5.1 項目 1 の停止条件を v1.2 の許容幅 (0.05 秒) に揃える (「`cpu_sec < limit` で停止」は v1.1 の残骸) | astra 設計助言 2026-09-29 で矛盾を指摘 | (本 commit) |
+| 2026-10-03 | v1.4 | §2.4 の補足: (a) 3 回目拒否の記録先は子プロセスの tool 応答 (transcript) と counters で、親の ledger・activity には出ない (「ledger に残す」はこの読み替え。拒否は handler を呼ばないため親へ届く経路が無く、追加 RPC は本束の範囲外)。本番では handler は子プロセス (`mission_worker._build_improve_registry`) で動き、子の ledger は親に読まれない。(b) 拒否は errors と streak を増やすので `max_refusal_streak` の閾値に数えられる (閾値 1 なら 1 回で abort_pending が立つ)。(c) 受付は「観測数 + 実行中の数」で判定し、同時実行での 3 回目を防ぐ | 実装レビューで同時実行の抜けと記録先の不整合を指摘 | (本 commit) |
