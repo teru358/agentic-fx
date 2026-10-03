@@ -674,7 +674,7 @@ def test_started_true_keeps_the_reservation(tmp_path):
 
 # --- 同じ CPU 上限失敗は 3 回目から実行しない ---
 
-def _cpu_env(tmp_path, replies, *, max_backtests=6):
+def _cpu_env(tmp_path, replies, *, max_backtests=6, wrap=None):
     """registry 経由 (tool call -> counters -> ledger -> 応答) の環境。
     `replies` は handler が呼ばれるたびに順に返す応答 (尽きたら最後を繰り返す)。"""
     import shutil
@@ -690,6 +690,11 @@ def _cpu_env(tmp_path, replies, *, max_backtests=6):
     def handler(args):
         calls.append(dict(args))
         return dict(replies[min(len(calls), len(replies)) - 1])
+
+    inner_handler = handler
+    if wrap is not None:
+        def handler(args):
+            return wrap(inner_handler, args)
 
     budget = ImproveToolBudgetSettings(
         max_backtests_per_candidate=max_backtests)
@@ -886,3 +891,53 @@ def test_repeated_cpu_limit_refusal_row_is_not_an_accepted_ledger_entry(
     entries = ledger.entries()
     assert len(entries) == 3
     assert accepted_entries(entries) == []
+
+
+def test_concurrent_third_cpu_limit_run_is_refused_when_one_observation_exists(
+        tmp_path):
+    import threading
+
+    barrier = threading.Barrier(2, timeout=5)
+    release = threading.Event()
+
+    def wrap(inner, args):
+        out = inner(args)
+        if not release.is_set():
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+        return out
+
+    call, calls, counters, ledger, _ = _cpu_env(
+        tmp_path, [_CPU_REPLY], wrap=wrap)
+    release.set()
+    call()                       # 観測数 1
+    release.clear()
+    results: list[dict] = []
+    threads = [threading.Thread(target=lambda: results.append(call()))
+               for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+        if t.is_alive():
+            barrier.abort()
+    errors = sorted(r["error"] for r in results)
+    assert errors == ["repeated_worker_cpu_limit", "worker_cpu_limit"]
+    assert len(calls) == 2
+    (key,) = list(counters.cpu_limit_observations)
+    assert counters.cpu_limit_observations[key] == 2
+    assert counters.cpu_limit_in_flight[key] == 0
+
+
+def test_cpu_limit_in_flight_is_returned_when_the_handler_raises(tmp_path):
+    def wrap(inner, args):
+        raise RuntimeError("pipe closed")
+
+    call, calls, counters, ledger, _ = _cpu_env(
+        tmp_path, [_CPU_REPLY], wrap=wrap)
+    for _ in range(3):
+        assert "error" in call()
+    assert all(v == 0 for v in counters.cpu_limit_in_flight.values())
+    assert sum(counters.cpu_limit_observations.values()) == 0

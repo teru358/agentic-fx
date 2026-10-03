@@ -142,77 +142,84 @@ def build_improve_rpc_tooldefs(
         # 同じ (内容, pair) で実測 CPU 上限が続いた評価は、候補枠を reserve する
         # **前**に事前拒否する。handler は呼ばず、枠も消費しない。拒否は専用の
         # 台帳行として残る (`error` を持つので永続化と trial 集計の対象外)。
-        if (counters is not None and cpu_key is not None
-                and counters.cpu_limit_observation_count(cpu_key)
-                >= _CPU_LIMIT_THRESHOLD):
-            refusal = {"started": False, "error": _REPEATED_CPU_LIMIT_ERROR,
-                       "hint": _REPEATED_CPU_LIMIT_HINT}
+        admitted = False
+        if counters is not None and cpu_key is not None:
+            admitted = counters.admit_cpu_limit_candidate(
+                cpu_key, _CPU_LIMIT_THRESHOLD)
+            if not admitted:
+                refusal = {"started": False, "error": _REPEATED_CPU_LIMIT_ERROR,
+                           "hint": _REPEATED_CPU_LIMIT_HINT}
+                ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
+                              kind="run_backtest",
+                              params={"name": name, "pair": pair},
+                              result_summary=refusal, trial_count=0)
+                response = _RpcToolResult(refusal)
+                response["remaining_budget"] = {
+                    "backtests_for_candidate": max(
+                        budget.max_backtests_per_candidate
+                        - counters.backtest_calls[name], 0)}
+                return response
+        observed = False
+        try:
+            # codex 1 周目 Important 2 (2026-09-07): 予算の消費は候補名・loader・kind
+            # 検証の **後**。誤呼び出し (名前不正 / loader 拒否 / indicator) で候補
+            # あたり枠を減らさない — 設計 v4 Tier C の目的は「実 backtest の修正
+            # ループ」の上限であって、検証エラーは対象外。
+            if counters is not None and not counters.reserve_backtest(
+                        name, budget.max_backtests_per_candidate):
+                from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
+                counters.record_terminal_refusal()
+                return {"error": "budget exhausted",
+                        "budget": "max_backtests_per_candidate",
+                        "directive": BUDGET_EXHAUSTED_DIRECTIVE}
+            result = run_backtest_handler({"name": name, "pair": pair})
+            # [indicator-consumption-wiring] §2.9(c): 予約 (子) → 親 RPC →
+            # **未開始なら解放**。`started` が明示的に False のときだけ戻す —
+            # キーが無い応答 (旧形式・RPC 失敗) では戻さない (fail closed:
+            # 予算は消費されたまま)。
+            #
+            # /code-review 2 周目 CR5 (2026-09-18、却下 = 設計既定):
+            # `run_backtest_handler` が**応答を返さず例外を投げた**場合
+            # (`_make_rpc_client` の `RuntimeError`/`ProtocolError`、seq 不一致、
+            # パイプ切断) も同じ扱い — 例外は `reserve_backtest` の予約を
+            # 素通りし、`ToolRegistry.execute` の外側 `except Exception` が
+            # 受けるだけで counters には触らない。これは設計書 §2.9c / §6 F4 の
+            # 「RPC 失敗では解放しない (fail closed)」の**より全面的な**ケース
+            # であり、意図どおり。上の「キーが無い応答」という言い方が
+            # 「例外は別扱い」と読めるので明示しておく。
+            # `error` キーがあるので registry の
+            # `on_result` が `errors` と recoverable refusal streak に自動計上し、
+            # 同じ未解決を繰り返す agent は既存規律で abort する。
+            # `max_tool_calls` は常に +1 (`record_call` は registry 側)。
+            if counters is not None and result.get("started") is False:
+                counters.release_backtest(name)
+            if counters is not None and result.get("started") is not False:
+                backtest_ok = _is_successful_backtest(result)
+                counters.record_backtest_result(name, ok=backtest_ok)
+                if backtest_ok:
+                    counters.record_progress(name, "backtest_ok")
+            if (counters is not None and cpu_key is not None
+                    and result.get("started") is True
+                    and result.get("error") == "worker_cpu_limit"):
+                observed = True
+            # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
+            # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
+            ledger_result = getattr(result, "save_kwargs", result)
             ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
-                          kind="run_backtest",
-                          params={"name": name, "pair": pair},
-                          result_summary=refusal, trial_count=0)
-            response = _RpcToolResult(refusal)
-            response["remaining_budget"] = {
-                "backtests_for_candidate": max(
-                    budget.max_backtests_per_candidate
-                    - counters.backtest_calls[name], 0)}
+                          kind="run_backtest", params={"name": name, "pair": pair},
+                          result_summary=ledger_result,
+                          trial_count=result.get("trial_count", 1))
+            response = _RpcToolResult(
+                _strip_forbidden(result), save_kwargs=getattr(result, "save_kwargs", None))
+            if counters is not None:
+                response["remaining_budget"] = {
+                    "backtests_for_candidate": max(
+                        budget.max_backtests_per_candidate
+                        - counters.backtest_calls[name], 0)}
             return response
-        # codex 1 周目 Important 2 (2026-09-07): 予算の消費は候補名・loader・kind
-        # 検証の **後**。誤呼び出し (名前不正 / loader 拒否 / indicator) で候補
-        # あたり枠を減らさない — 設計 v4 Tier C の目的は「実 backtest の修正
-        # ループ」の上限であって、検証エラーは対象外。
-        if counters is not None and not counters.reserve_backtest(
-                    name, budget.max_backtests_per_candidate):
-            from agentic_fx.tools.improve_staging_tools import BUDGET_EXHAUSTED_DIRECTIVE
-            counters.record_terminal_refusal()
-            return {"error": "budget exhausted",
-                    "budget": "max_backtests_per_candidate",
-                    "directive": BUDGET_EXHAUSTED_DIRECTIVE}
-        result = run_backtest_handler({"name": name, "pair": pair})
-        # [indicator-consumption-wiring] §2.9(c): 予約 (子) → 親 RPC →
-        # **未開始なら解放**。`started` が明示的に False のときだけ戻す —
-        # キーが無い応答 (旧形式・RPC 失敗) では戻さない (fail closed:
-        # 予算は消費されたまま)。
-        #
-        # /code-review 2 周目 CR5 (2026-09-18、却下 = 設計既定):
-        # `run_backtest_handler` が**応答を返さず例外を投げた**場合
-        # (`_make_rpc_client` の `RuntimeError`/`ProtocolError`、seq 不一致、
-        # パイプ切断) も同じ扱い — 例外は `reserve_backtest` の予約を
-        # 素通りし、`ToolRegistry.execute` の外側 `except Exception` が
-        # 受けるだけで counters には触らない。これは設計書 §2.9c / §6 F4 の
-        # 「RPC 失敗では解放しない (fail closed)」の**より全面的な**ケース
-        # であり、意図どおり。上の「キーが無い応答」という言い方が
-        # 「例外は別扱い」と読めるので明示しておく。
-        # `error` キーがあるので registry の
-        # `on_result` が `errors` と recoverable refusal streak に自動計上し、
-        # 同じ未解決を繰り返す agent は既存規律で abort する。
-        # `max_tool_calls` は常に +1 (`record_call` は registry 側)。
-        if counters is not None and result.get("started") is False:
-            counters.release_backtest(name)
-        if counters is not None and result.get("started") is not False:
-            backtest_ok = _is_successful_backtest(result)
-            counters.record_backtest_result(name, ok=backtest_ok)
-            if backtest_ok:
-                counters.record_progress(name, "backtest_ok")
-        if (counters is not None and cpu_key is not None
-                and result.get("started") is True
-                and result.get("error") == "worker_cpu_limit"):
-            counters.record_cpu_limit_observation(cpu_key)
-        # 台帳は永続化用 save_kwargs (period/now 込み) を読む契約 —
-        # agent 向け応答 (JSON-safe、期間端点なし) とは別物として受け取る。
-        ledger_result = getattr(result, "save_kwargs", result)
-        ledger.record(opaque_ref=f"run_backtest:{name}:{pair}",
-                      kind="run_backtest", params={"name": name, "pair": pair},
-                      result_summary=ledger_result,
-                      trial_count=result.get("trial_count", 1))
-        response = _RpcToolResult(
-            _strip_forbidden(result), save_kwargs=getattr(result, "save_kwargs", None))
-        if counters is not None:
-            response["remaining_budget"] = {
-                "backtests_for_candidate": max(
-                    budget.max_backtests_per_candidate
-                    - counters.backtest_calls[name], 0)}
-        return response
+        finally:
+            if admitted:
+                counters.finish_cpu_limit_candidate(cpu_key, observed=observed)
 
     def analyze_corr(request: dict) -> dict:
         result = analyze_corr_handler(request)

@@ -31,6 +31,9 @@ class MissionToolCounters:
         # 実測 CPU 上限で終わった評価の回数。key = (content_hash, pair)。
         # mission 内だけで数え、候補名ではなく内容で区別する。
         self.cpu_limit_observations = defaultdict(int)
+        # 実行中 (受理済みで未終了) の評価数。同時実行の 3 回目を防ぐため、
+        # 受付は観測数 + 実行中の数で判定する。
+        self.cpu_limit_in_flight = defaultdict(int)
         self.last_signature: dict[str, tuple] = {}
         self.consecutive_same = defaultdict(int)
         self._self_tests_by_name = defaultdict(int)
@@ -171,6 +174,27 @@ class MissionToolCounters:
     def record_cpu_limit_observation(self, key: tuple[str, str]) -> None:
         with self._lock:
             self.cpu_limit_observations[key] += 1
+
+    def admit_cpu_limit_candidate(self, key: tuple[str, str], limit: int) -> bool:
+        """観測数 + 実行中の数が limit 未満のときだけ、同じ lock 区間で実行中を
+        +1 して受理する。受理した呼び出しは必ず `finish_cpu_limit_candidate`
+        で戻す。"""
+        with self._lock:
+            if (self.cpu_limit_observations.get(key, 0)
+                    + self.cpu_limit_in_flight.get(key, 0)) >= limit:
+                return False
+            self.cpu_limit_in_flight[key] += 1
+            return True
+
+    def finish_cpu_limit_candidate(self, key: tuple[str, str], *,
+                                   observed: bool) -> None:
+        """受理した評価の終了。実行中を -1 し、実測 CPU 上限で終わったなら
+        同じ lock 区間で観測数を +1 する。"""
+        with self._lock:
+            if self.cpu_limit_in_flight.get(key, 0) > 0:
+                self.cpu_limit_in_flight[key] -= 1
+            if observed:
+                self.cpu_limit_observations[key] += 1
 
     def record_backtest_result(self, name: str, ok: bool) -> None:
         if not ok:

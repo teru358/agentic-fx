@@ -284,3 +284,45 @@ def test_cpu_limit_observation_count_is_zero_for_an_unseen_key_and_does_not_regi
     counters.record_cpu_limit_observation(("h", "P"))
     assert counters.cpu_limit_observation_count(("h", "P")) == 1
     assert counters.cpu_limit_observation_count(("h", "Q")) == 0
+
+
+def _admit_concurrently(counters, key, n):
+    import threading
+
+    barrier = threading.Barrier(n, timeout=5)
+    out: list[bool] = []
+
+    def run():
+        barrier.wait()
+        out.append(counters.admit_cpu_limit_candidate(key, 2))
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    return out
+
+
+def test_concurrent_admission_with_one_observation_admits_exactly_one():
+    counters = MissionToolCounters(budget=_budget())
+    counters.record_cpu_limit_observation(("h", "P"))
+    assert sorted(_admit_concurrently(counters, ("h", "P"), 2)) == [False, True]
+
+
+def test_concurrent_admission_with_no_observation_admits_both():
+    counters = MissionToolCounters(budget=_budget())
+    assert _admit_concurrently(counters, ("h", "P"), 2) == [True, True]
+    assert counters.admit_cpu_limit_candidate(("h", "P"), 2) is False
+
+
+def test_finishing_an_admitted_run_returns_the_slot_and_counts_the_observation():
+    counters = MissionToolCounters(budget=_budget())
+    assert counters.admit_cpu_limit_candidate(("h", "P"), 2)
+    counters.finish_cpu_limit_candidate(("h", "P"), observed=False)
+    assert counters.cpu_limit_in_flight[("h", "P")] == 0
+    assert counters.cpu_limit_observations[("h", "P")] == 0
+    assert counters.admit_cpu_limit_candidate(("h", "P"), 2)
+    counters.finish_cpu_limit_candidate(("h", "P"), observed=True)
+    assert counters.cpu_limit_in_flight[("h", "P")] == 0
+    assert counters.cpu_limit_observations[("h", "P")] == 1
