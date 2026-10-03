@@ -30,10 +30,11 @@
 | [legacy-oc-example-leak](legacy-oc-example-leak.md) | 低 |  | プロンプトの実例 idea がそのまま backlog に実在化する |
 | [legacy-oc-tool-not-found](legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
-## 裁定待ち (6)
+## 裁定待ち (7)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 高 | 2026-10-03 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
 | [legacy-2026-08-23-e-11-m3-m7](legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 | [improve-catchup-runs-at-startup](improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [gate-noop-followup](gate-noop-followup.md) | 低 |  | fact 行が選択され得る件は kind 必須化の追随が未観測 |
@@ -41,7 +42,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (103)
+## 設計待ち (102)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -49,7 +50,6 @@
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
-| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 高 | 2026-10-03 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
 | [sandbox-escape-via-user-daemons-unmeasured](sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測 |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |

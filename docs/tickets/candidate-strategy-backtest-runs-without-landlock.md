@@ -1,7 +1,7 @@
 ---
 id: candidate-strategy-backtest-runs-without-landlock
 title: 候補 strategy の backtest が Landlock の無い plugin worker で動く
-status: 設計待ち
+status: 裁定待ち
 priority: 高
 opened: 2026-10-03
 closed: null
@@ -9,7 +9,7 @@ related: []
 ---
 # [candidate-strategy-backtest-runs-without-landlock] 候補 strategy の backtest が Landlock の無い plugin worker で動く
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 裁定待ち / **優先**: 高
 
 ## 現象
 
@@ -26,3 +26,4 @@ plugin worker にも gate pytest と同じ Landlock (読み取り allowlist、da
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-03: 状態: 裁定待ち — 2026-10-03 裁定: 操作 API の前提条件として先に実施する (設計レビュー r1 で、Landlock の無い plugin worker が鍵を読めるため承認・資金保護の解除を API に載せられないと判定)。設計 C0 を tmp/design-plugin-landlock/ で作成中。
