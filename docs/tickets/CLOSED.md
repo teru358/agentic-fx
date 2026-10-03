@@ -2,10 +2,12 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (28)
+## 2026-10 (30)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
+| [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 是正済 | 高 | 2026-10-03 | bridge の発注系 endpoint が既定で LAN に開く |
+| [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 是正済 | 高 | 2026-10-03 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [selection-rationale-unverified](selection-rationale-unverified.md) | 是正済 | 高 | 2026-10-03 | 承認材料の selection_rationale が未検証で捏造され得る |
 | [approval-payload-missing-gate-metrics](approval-payload-missing-gate-metrics.md) | 是正済 | 未設定 | 2026-10-02 | 承認 payload に gate の測定値が載らない問題は是正済 |
 | [backtest-base-interval](backtest-base-interval.md) | 是正済 | 未設定 | 2026-10-02 | バックテスト基底足の可変化 (1m/5m/15m) は完了 |

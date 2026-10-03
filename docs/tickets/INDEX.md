@@ -1,14 +1,12 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 135 件。完了分は CLOSED.md。
+未完了: 133 件。完了分は CLOSED.md。
 
-## 実装中 (3)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
-| [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 
 ## 実装待ち (22)
