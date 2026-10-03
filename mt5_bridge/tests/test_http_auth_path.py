@@ -199,3 +199,38 @@ def test_order_routes_are_registered_through_the_order_router():
         "/order", "/positions/{ticket}/modify", "/positions/{ticket}/close",
         "/admin/halt", "/admin/resume",
     }
+
+
+_DOC_PATHS = ["/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect", "/no-such-path"]
+
+
+@pytest.mark.parametrize("path", _DOC_PATHS)
+def test_keyless_bridge_refuses_remote_client_on_doc_and_unknown_paths(monkeypatch, path):
+    _configure(monkeypatch, "")
+    assert _call("GET", path, client=("192.168.1.5", 4000)) == (403, _LOCAL_ONLY_BODY)
+
+
+@pytest.mark.parametrize("path", ["/openapi.json", "/docs", "/redoc"])
+def test_doc_endpoints_are_not_served_even_to_loopback(monkeypatch, path):
+    _configure(monkeypatch, "")
+    assert _call("GET", path)[0] == 404
+
+
+@pytest.mark.parametrize("path", ["/symbols", "/health", "/openapi.json"])
+def test_forwarded_header_does_not_make_remote_client_local(monkeypatch, path):
+    _configure(monkeypatch, "")
+    status, data = _call(
+        "GET", path, {"X-Forwarded-For": "127.0.0.1", "X-Real-IP": "127.0.0.1", "Forwarded": "for=127.0.0.1"},
+        client=("192.168.1.5", 4000),
+    )
+    assert (status, data) == (403, _LOCAL_ONLY_BODY)
+
+
+def test_main_disables_proxy_headers(monkeypatch):
+    import uvicorn
+
+    seen = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    monkeypatch.setattr(server, "load_settings", lambda: SimpleNamespace(host="127.0.0.1", port=8812))
+    server.main()
+    assert seen["proxy_headers"] is False

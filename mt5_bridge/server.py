@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel
+from starlette.responses import JSONResponse
 
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, is_loopback_host, load_settings
@@ -202,18 +203,34 @@ def require_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None
 LOCAL_ONLY_DETAIL = "API キー未設定の bridge は自機内からの接続のみ受け付ける"
 
 
-def require_local_client_without_key(request: Request) -> None:
-    """API キー未設定なら、接続元が loopback の IP リテラルでない要求を全 endpoint で拒否する。
+class LocalOnlyWithoutKeyMiddleware:
+    """API キー未設定なら、接続元が loopback の IP リテラルでない要求を経路解決の前に全て拒否する。
 
+    純粋な ASGI middleware なので、route に属さない応答 (未知の path、404 を含む) も覆う。
+    接続元は ASGI scope の client だけを見る (X-Forwarded-For などのヘッダは見ない)。
     待受先 (uvicorn の --host など) がどう指定されても「キー無し = 自機内だけ」を保つ。
     """
-    if _settings is not None and _settings.auth_required:
-        return
-    client = request.client
-    if client is None or not is_loopback_host(client.host):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_ONLY_DETAIL
-        )
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if _settings is not None and _settings.auth_required:
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client")
+        if client is not None and is_loopback_host(client[0]):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await JSONResponse(
+            {"detail": LOCAL_ONLY_DETAIL}, status_code=status.HTTP_403_FORBIDDEN
+        )(scope, receive, send)
 
 
 ORDER_KEY_REQUIRED_DETAIL = "発注系は API キーが必要"
@@ -234,8 +251,12 @@ app = FastAPI(
     version="0.1.0",
     description="HTTP bridge over MetaTrader5 Python package (price data + order endpoints).",
     lifespan=lifespan,
-    dependencies=[Depends(require_local_client_without_key)],
+    # 取引 bridge に対話 docs は不要。公開面を減らすため生成しない
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
+app.add_middleware(LocalOnlyWithoutKeyMiddleware)
 
 # 発注・管理書き込み系。認証は router 単位で付ける (個別 decorator には付けない)
 order_router = APIRouter(dependencies=[Depends(require_order_api_key)])
@@ -656,6 +677,8 @@ def main() -> None:
     uvicorn.run(
         app, host=cfg.host, port=cfg.port,
         log_level="info", log_config=_build_log_config(),
+        # X-Forwarded-For で scope の client が置き換わる経路を閉じる
+        proxy_headers=False,
     )
 
 

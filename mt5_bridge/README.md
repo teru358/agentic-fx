@@ -45,6 +45,8 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 - `BRIDGE_HOST=localhost` は `127.0.0.1` に読み替えて待ち受ける (hosts の設定次第で `localhost` が LAN の IP を指す環境があるため)。`::1` で待ちたい場合は `::1` と明示する。IP リテラル以外のホスト名はループバック扱いにならず、`BRIDGE_API_KEY` が必須。
 - `127.0.0.1` / `::1` 以外で待ち受けるには `BRIDGE_API_KEY` が必須。空のままだと bridge は理由を示して起動を拒否する。
 - `BRIDGE_API_KEY` が空のあいだは、待受先の指定方法 (`uvicorn server:app --host 0.0.0.0` のような別経路の起動を含む) に関係なく、接続元が自機 (ループバックの IP) でない要求は `/health` を含む全 endpoint で 403 になる。afx が `http://localhost:8812` で接続する構成はそのまま通る。
+- bridge は `X-Forwarded-For` などの proxy header を読まない (uvicorn は `proxy_headers=False` で起動する)。接続元の判定は TCP 接続の相手だけで行うので、リバースプロキシの背後には置かないこと。proxy を使う構成は別設計が必要。
+- `/docs`・`/redoc`・`/openapi.json` は提供しない。
 - 起動は `uv run python server.py` を使う。
 - API キーを設定すると、全 endpoint (`/health` 以外。キーを設定済みなら `/health` は接続元を問わず開いている) が `X-Bridge-Api-Key` ヘッダを要求する。
 - この bridge には認可や rate limit の仕組みは無い。インターネットには公開しないこと。
