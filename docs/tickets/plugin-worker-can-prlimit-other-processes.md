@@ -1,0 +1,28 @@
+---
+id: plugin-worker-can-prlimit-other-processes
+title: plugin worker から同 uid の他プロセスの rlimit を書き換えられる
+status: 設計待ち
+priority: 高
+opened: 2026-10-03
+closed: null
+related: []
+---
+# [plugin-worker-can-prlimit-other-processes] plugin worker から同 uid の他プロセスの rlimit を書き換えられる
+
+**状態**: 設計待ち / **優先**: 高
+
+## 現象
+
+plugin worker (候補 strategy の backtest、live の signal 計算) は Landlock が無く seccomp も無いため、prlimit64 で同じ uid の他プロセス (afx 本体を含む) の RLIMIT_CPU 等を書き換えられる。setpriority / sched_setaffinity / pidfd_open も通る。2026-10-03 実測 (tmp/design-plugin-landlock/measure/probe4_*.log)。afx の RLIMIT_CPU を下げてサービスを落とす経路。
+
+## 原因
+
+## 処置案・裁定
+
+plugin worker Landlock の束 (tmp/design-plugin-landlock/C0.md v0.4 §6) の seccomp で、prlimit64 / setpriority / sched_setaffinity / pidfd_open / kill / tgkill を「pid が 0 か自分」のときだけ許可する。gate pytest worker にも同じ filter を掛ける (別チケット gate-pytest-dev-writable-and-ldso-exec と同時)。
+
+## 修正内容
+
+## 経緯
+
+- 2026-10-03: 起票。
