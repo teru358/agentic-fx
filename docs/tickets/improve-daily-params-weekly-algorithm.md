@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-10-03
 closed: null
-related: [improve-targeted-run]
+related: [baseline-replay-unimplemented]
 ---
 # [improve-daily-params-weekly-algorithm] 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける
 
@@ -28,3 +28,4 @@ cadence が 1 種類で、軽い調整 (params) と重い改善 (ロジック) �
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-03: 関連: [baseline-replay-unimplemented] — 2026-10-03: この環境の settings は Sat 08:00 に変更済。製品既定 (config.py の Sat 03:00、settings.yaml.example) は取引中なので、設計時に閉場後の既定へ変える。
