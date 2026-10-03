@@ -85,3 +85,267 @@ def test_load_rejects_int_for_bool_field(tmp_path):
     }))
     with pytest.raises(StateError):
         StateStore(path).load()
+
+
+# --- 排他・耐久性・世代付きラッチ -------------------------------------------
+import os
+import subprocess
+import sys
+import threading
+from datetime import datetime, timezone
+
+from agentic_fx.store.state import GenerationMismatch, NotLatched
+
+LATCH_TIME = datetime(2026, 10, 3, 8, 0, tzinfo=timezone.utc)
+
+
+class _FixedClock:
+    def __init__(self, t):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+
+def test_concurrent_updates_in_threads_lose_nothing(tmp_path):
+    """別々のキーを同時に更新しても、どちらの更新も失われない。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def a():
+        try:
+            for _ in range(40):
+                barrier.wait()
+                store.update(autopilot=True)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    def b():
+        try:
+            for _ in range(40):
+                barrier.wait()
+                store.update(kill_switch_latched=True)
+        except Exception as e:  # pragma: no cover
+            errors.append(e)
+
+    ts = [threading.Thread(target=a), threading.Thread(target=b)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errors
+    s = store.load()
+    assert s.autopilot is True and s.kill_switch_latched is True
+
+
+def test_update_holds_lock_across_read_modify_write(tmp_path):
+    """load と save の間に別の書き手が割り込めない (lost update が無い)。"""
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    other = StateStore(path)
+    inside = threading.Event()
+    release = threading.Event()
+    real_load = store.load
+
+    def slow_load():
+        s = real_load()
+        inside.set()
+        release.wait(5)
+        return s
+
+    store.load = slow_load
+    t = threading.Thread(target=lambda: store.update(autopilot=True))
+    t.start()
+    assert inside.wait(5)
+    done = threading.Event()
+
+    def writer():
+        other.update(initialized=True)
+        done.set()
+
+    w = threading.Thread(target=writer)
+    w.start()
+    assert not done.wait(0.3)  # 先の更新が終わるまで待たされる
+    release.set()
+    t.join()
+    w.join()
+    s = other.load()
+    assert s.autopilot is True and s.initialized is True
+
+
+_CHILD = """
+import sys
+from agentic_fx.store.state import StateStore
+from pathlib import Path
+s = StateStore(Path(sys.argv[1]))
+for _ in range(60):
+    s.update(initialized=True)
+    s.update(kill_switch_latched=True)
+"""
+
+
+def test_concurrent_update_from_another_process_loses_nothing(tmp_path):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    procs = [subprocess.Popen([sys.executable, "-c", _CHILD, str(path)])
+             for _ in range(2)]
+    for _ in range(60):
+        store.update(autopilot=True)
+        store.update(mode=Mode.LEARNING)
+    assert [p.wait(60) for p in procs] == [0, 0]
+    s = store.load()
+    assert s.autopilot is True and s.initialized is True
+    assert s.kill_switch_latched is True
+
+
+def test_temp_names_differ_per_call_and_none_left(tmp_path, monkeypatch):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    names = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        names.append(os.path.basename(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    store.update(initialized=True)
+    store.update(autopilot=True)
+    assert len(names) == 2 and names[0] != names[1]
+    assert "app_state.tmp" not in names
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_failed_write_keeps_original_and_leaves_no_temp(tmp_path, monkeypatch):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    store.update(initialized=True)
+    before = path.read_bytes()
+
+    def boom(fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "fsync", boom)
+    with pytest.raises(OSError):
+        store.update(autopilot=True)
+    monkeypatch.undo()
+    assert path.read_bytes() == before
+    assert not [p for p in tmp_path.iterdir()
+                if p.name not in ("app_state.json", "app_state.json.lock")]
+
+
+def test_parent_directory_is_fsynced_after_replace(tmp_path, monkeypatch):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    events = []
+    real_replace, real_fsync = os.replace, os.fsync
+    dir_fds = []
+    real_open = os.open
+
+    def spy_open(p, flags, *a, **k):
+        fd = real_open(p, flags, *a, **k)
+        if flags & getattr(os, "O_DIRECTORY", 0):
+            dir_fds.append(fd)
+        return fd
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "replace",
+                        lambda a, b: (events.append("replace"),
+                                      real_replace(a, b))[1])
+    monkeypatch.setattr(os, "fsync",
+                        lambda fd: (events.append(
+                            "dirsync" if fd in dir_fds else "fsync"),
+                            real_fsync(fd))[1])
+    store.update(initialized=True)
+    assert events.index("replace") < len(events) - 1
+    assert events[-1] == "dirsync"
+
+
+def test_latch_increments_generation_and_stamps_time(tmp_path):
+    store = StateStore(tmp_path / "app_state.json",
+                       clock=_FixedClock(LATCH_TIME))
+    s = store.update(kill_switch_latched=True)
+    assert s.kill_switch_generation == 1
+    assert s.kill_switch_latched_at == "2026-10-03T08:00:00+00:00"
+
+
+def test_relatch_while_latched_keeps_generation_and_time(tmp_path):
+    clock = _FixedClock(LATCH_TIME)
+    store = StateStore(tmp_path / "app_state.json", clock=clock)
+    store.update(kill_switch_latched=True)
+    clock.t = datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc)
+    s = store.update(kill_switch_latched=True)
+    assert s.kill_switch_generation == 1
+    assert s.kill_switch_latched_at == "2026-10-03T08:00:00+00:00"
+
+
+def test_reset_succeeds_only_for_matching_generation(tmp_path):
+    store = StateStore(tmp_path / "app_state.json",
+                       clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    s = store.reset_kill_switch(1)
+    assert s.kill_switch_latched is False
+    assert s.kill_switch_generation == 1
+    assert s.kill_switch_latched_at == "2026-10-03T08:00:00+00:00"
+    assert store.load() == s
+    # 解除後に再ラッチすると世代が進む
+    assert store.update(kill_switch_latched=True).kill_switch_generation == 2
+
+
+def test_reset_with_stale_generation_writes_nothing(tmp_path):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path, clock=_FixedClock(LATCH_TIME))
+    store.update(kill_switch_latched=True)
+    store.reset_kill_switch(1)
+    store.update(kill_switch_latched=True)  # 新しいラッチ (generation 2)
+    before = path.read_bytes()
+    with pytest.raises(GenerationMismatch) as ei:
+        store.reset_kill_switch(1)
+    assert ei.value.current == 2
+    assert ei.value.latched_at == "2026-10-03T08:00:00+00:00"
+    assert path.read_bytes() == before
+    assert store.load().kill_switch_latched is True
+
+
+def test_reset_when_not_latched_raises_and_writes_nothing(tmp_path):
+    path = tmp_path / "app_state.json"
+    store = StateStore(path)
+    with pytest.raises(NotLatched):
+        store.reset_kill_switch(0)
+    assert not path.exists()
+
+
+def test_legacy_state_file_without_generation_keys_loads(tmp_path):
+    path = tmp_path / "app_state.json"
+    path.write_text(json.dumps({"initialized": True, "mode": "learning",
+                                "autopilot": False,
+                                "kill_switch_latched": True}))
+    s = StateStore(path).load()
+    assert s.kill_switch_generation == 0
+    assert s.kill_switch_latched_at is None
+    assert s.kill_switch_latched is True
+
+
+def test_generation_keys_roundtrip_through_file(tmp_path):
+    path = tmp_path / "app_state.json"
+    StateStore(path, clock=_FixedClock(LATCH_TIME)).update(
+        kill_switch_latched=True)
+    raw = json.loads(path.read_text())
+    assert raw["kill_switch_generation"] == 1
+    assert raw["kill_switch_latched_at"] == "2026-10-03T08:00:00+00:00"
+    s = StateStore(path).load()
+    assert s.kill_switch_generation == 1
+    assert s.kill_switch_latched_at == "2026-10-03T08:00:00+00:00"
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("kill_switch_generation", "1"), ("kill_switch_generation", True),
+    ("kill_switch_generation", 1.5), ("kill_switch_latched_at", 5),
+])
+def test_wrong_type_generation_keys_fail_closed(tmp_path, key, bad):
+    path = tmp_path / "app_state.json"
+    raw = {"initialized": True, "mode": "learning", "autopilot": False,
+           "kill_switch_latched": True, key: bad}
+    path.write_text(json.dumps(raw))
+    with pytest.raises(StateError):
+        StateStore(path).load()

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -377,7 +378,7 @@ def test_compensation_failure_aborts_replay_operation(tmp_path, monkeypatch):
     before = list(state.kill_switch_transitions)
     real_replace = state_module.os.replace
     def fail_compensation_replace(src, dst):
-        payload = json.loads(src.read_text(encoding="utf-8"))
+        payload = json.loads(Path(src).read_text(encoding="utf-8"))
         if payload["kill_switch_latched"] is True:
             raise OSError("compensation replace")
         return real_replace(src, dst)

@@ -409,6 +409,38 @@ def test_killswitch_reset(tmp_path):
     assert any("kill_switch_reset" in r for r in records)
 
 
+def test_killswitch_reset_when_not_latched_says_so(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    out = cmds.dispatch("killswitch reset")
+    assert "ラッチされていません" in out
+    assert state.load().kill_switch_latched is False
+    assert not any("kill_switch_reset" in r
+                   for r in activity.tail(10, Category.SYSTEM))
+
+
+def test_killswitch_reset_refuses_when_latch_was_renewed(tmp_path):
+    """表示後にラッチが更新されたら、新しいラッチを消さずに確認を促す。"""
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    real_load = state.load
+
+    def load_then_relatch():
+        s = real_load()
+        # シェルが読んだ直後に、解除と再ラッチが起きる
+        state.load = real_load
+        state.reset_kill_switch(s.kill_switch_generation)
+        state.update(kill_switch_latched=True)
+        return s
+
+    state.load = load_then_relatch
+    out = cmds.dispatch("killswitch reset")
+    state.load = real_load
+    assert "ラッチが更新されました" in out
+    assert state.load().kill_switch_latched is True
+    assert not any("kill_switch_reset" in r
+                   for r in activity.tail(10, Category.SYSTEM))
+
+
 def test_unknown_shows_help(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
     out = cmds.dispatch("nonsense")

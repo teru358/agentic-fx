@@ -104,7 +104,7 @@ class _RecordingStateStore(StateStore):
 
     def __init__(self, path: Path, *, clock: ReplayClock,
                  snapshot_id_fn: Callable[[], int | None] | None = None) -> None:
-        super().__init__(path)
+        super().__init__(path, clock=clock)
         self._clock = clock
         self._snapshot_id_fn = snapshot_id_fn
         self.kill_switch_transitions: list[dict] = []

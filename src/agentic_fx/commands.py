@@ -19,7 +19,7 @@ from agentic_fx.store import (approvals, backlog, candidate_archives,
                               missions, orders, reflection_attempts,
                               reflections)
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
-from agentic_fx.store.state import StateStore
+from agentic_fx.store.state import GenerationMismatch, NotLatched, StateStore
 
 _HELP = """コマンド一覧:
   status                     残高・モード・kill switch・直近 mission
@@ -198,7 +198,14 @@ class Commands:
                 # いた欠陥の一部。
                 return self._approval_detail(int(args[0]))
             if cmd == "killswitch" and args and args[0] == "reset":
-                self.state.update(kill_switch_latched=False)
+                shown = self.state.load()
+                try:
+                    self.state.reset_kill_switch(shown.kill_switch_generation)
+                except NotLatched:
+                    return "kill switch はラッチされていません"
+                except GenerationMismatch:
+                    return ("kill switch のラッチが更新されました。"
+                            "status を確認してからもう一度実行してください")
                 self.activity.write(Category.SYSTEM, "kill_switch_reset",
                                     "human explicit reset via shell")
                 return "kill switch ラッチを解除しました"
