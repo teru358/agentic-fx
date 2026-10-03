@@ -3,6 +3,14 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 135 件。完了分は CLOSED.md。
 
+## 実装中 (3)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
+| [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
+| [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
+
 ## 実装待ち (22)
 
 | id | 優先 | 起票 | 概要 |
@@ -42,14 +50,11 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (106)
+## 設計待ち (103)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
-| [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 高 | 2026-10-02 | bridge の発注系 endpoint が既定で LAN に開く |
-| [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 高 | 2026-10-02 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
-| [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 | [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 高 | 2026-10-03 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
 | [gate-pytest-dev-writable-and-ldso-exec](gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [sandbox-escape-via-user-daemons-unmeasured](sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測 |

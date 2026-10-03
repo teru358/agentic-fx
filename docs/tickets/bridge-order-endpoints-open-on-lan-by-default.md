@@ -1,7 +1,7 @@
 ---
 id: bridge-order-endpoints-open-on-lan-by-default
 title: bridge の発注系 endpoint が既定で LAN に開く
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-02
 closed: null
@@ -9,7 +9,7 @@ related: []
 ---
 # [bridge-order-endpoints-open-on-lan-by-default] bridge の発注系 endpoint が既定で LAN に開く
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -26,3 +26,4 @@ mt5_bridge の BRIDGE_HOST 既定は 0.0.0.0 (config.py:70)、API キー未設�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-03: 状態: 実装中 — 2026-10-03 着手 (並行実装、Landlock 設計の収束待ちの間)。

@@ -1,7 +1,7 @@
 ---
 id: app-state-write-has-no-lock-latch-can-be-lost
 title: kill switch の状態ファイルの書き込みに lock が無い
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-03
 closed: null
@@ -9,7 +9,7 @@ related: []
 ---
 # [app-state-write-has-no-lock-latch-can-be-lost] kill switch の状態ファイルの書き込みに lock が無い
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -26,3 +26,4 @@ StateStore にプロセス内 lock と一意の一時名を足す。解除は「
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-03: 状態: 実装中 — 2026-10-03 着手 (並行実装、Landlock 設計の収束待ちの間)。
