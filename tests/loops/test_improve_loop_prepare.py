@@ -872,7 +872,7 @@ def test_build_worker_runner_passes_ctx_as_run_context(
     }
     monkeypatch.setattr(
         "agentic_fx.tools.improve_rpc_tools.plugin_loader.discover_one_with_reason",
-        lambda *args: (SimpleNamespace(kind="strategy"), "ok"))
+        lambda *args: (SimpleNamespace(kind="strategy", content_hash="0" * 64), "ok"))
     ctx = ImproveRunContext(
         mission_id=1, run_id=1, staging_dir=Path("/tmp/x"),
         source_snapshot_dir=Path("/tmp/y"), allowed_backlog_ids=None,
