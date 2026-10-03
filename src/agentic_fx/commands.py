@@ -51,7 +51,6 @@ def _normalize_idea_display(text: str) -> tuple[str, int]:
     return "".join(kept).strip(), removed
 
 
-_MAX_GENERATION = 2**31
 
 _RECONCILE_NOTICE = (
     "kill switch の状態が不確定です (解除の途中で止まった印が残っています)。"
@@ -221,8 +220,6 @@ class Commands:
                 generation = None
                 if len(args) == 2 and args[1].isascii() and args[1].isdigit():
                     generation = int(args[1])
-                    if generation > _MAX_GENERATION:
-                        generation = None
                 if generation is None:
                     return "usage: killswitch reset [<世代>]"
                 try:

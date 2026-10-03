@@ -1830,8 +1830,7 @@ def test_approve_non_plugin_kind_is_unchanged(tmp_path):
     assert any("approved" in r for r in activity.tail(10, Category.APPROVAL))
 
 
-@pytest.mark.parametrize("arg", ["-1", "2147483649", "99999999999999999999",
-                                 "１", "1.5", "abc", "1 2"])
+@pytest.mark.parametrize("arg", ["-1", "１", "1.5", "abc", "1 2"])
 def test_killswitch_reset_rejects_out_of_range_generation(tmp_path, arg):
     conn, state, activity, cmds = _commands(tmp_path)
     state.update(kill_switch_latched=True)
@@ -1863,3 +1862,12 @@ def test_killswitch_reset_refusals_leave_an_activity_with_generation(tmp_path):
     assert len(recs) == 2
     assert "gen=1" in recs[0]
     assert "requested gen=5" in recs[1] and "current gen=1" in recs[1]
+
+
+def test_killswitch_reset_accepts_any_non_negative_generation_and_compares_it(tmp_path):
+    conn, state, activity, cmds = _commands(tmp_path)
+    state.update(kill_switch_latched=True)
+    out = cmds.dispatch("killswitch reset 99999999999999999999")
+    assert not out.startswith("usage:")
+    assert "更新された" in out
+    assert state.load().kill_switch_latched is True
