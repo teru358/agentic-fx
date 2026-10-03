@@ -2631,7 +2631,7 @@ class ImproveLoop:
                         tool_calls=tool_calls)
                     return
 
-                kind = self._read_candidate_kind(candidate_dir)
+                kind = candidate_meta.kind
                 if kind not in {"indicator", "strategy"}:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -2643,9 +2643,7 @@ class ImproveLoop:
                 # (`last_result` にそのまま流れる — 遮断 8)。
                 # /code-review 2 周目 CR7 (2026-09-18): 条件式は
                 # `approval.outputs_required_violation` に一本化
-                # (`switch._run_full_gate` と共有 — 挙動不変。
-                # `candidate_meta.kind` は discover 由来で、上の
-                # `_read_candidate_kind` と同じ config の `kind`)。
+                # (`switch._run_full_gate` と共有 — 挙動不変)。
                 if approval.outputs_required_violation(candidate_meta):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -2994,15 +2992,6 @@ class ImproveLoop:
         # (この経路の台帳エントリは実際には永続化されていないため、
         # mark_persisted は元々誤り — 副次的に解消する)。
         self._delete_staging(ctx)
-
-    def _read_candidate_kind(self, candidate_dir: Path) -> str:
-        """candidate の config.yaml から kind (indicator/strategy) を読む。"""
-        import yaml
-        config_path = candidate_dir / "config.yaml"
-        if not config_path.exists():
-            raise FileNotFoundError(f"config.yaml not found: {config_path}")
-        config = yaml.safe_load(config_path.read_text())
-        return config.get("kind", "indicator")
 
     def _read_candidate_pairs(self, candidate_dir: Path) -> list[str]:
         """candidate の config.yaml から pairs リストを読む。"""

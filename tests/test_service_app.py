@@ -5316,3 +5316,20 @@ def test_scheduler_tick_once_calls_observe_outside_any_transaction_after_a_real_
     assert app.outage._observe_failed is False
     assert not [c for c in app.activity.write.call_args_list
                 if "outage_observe_failed" in c.args]
+
+
+def test_policy_add_target_is_mission_injection_source(tmp_path):
+    """policy add の追記先 = 改善 Mission の注入元 = 共有の directives_path。"""
+    from agentic_fx.loops.improve_context import _user_policy_section
+    from agentic_fx.policy import directives_path
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        assert app.commands._policy_path == directives_path(tmp_path)
+        app.commands.dispatch("policy add 注入元の確認")
+        assert "注入元の確認" in _user_policy_section(tmp_path)["tail"]
+        assert "注入元の確認" in directives_path(tmp_path).read_text(
+            encoding="utf-8")
+    finally:
+        app.close()

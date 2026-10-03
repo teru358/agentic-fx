@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 131 件。完了分は CLOSED.md。
+未完了: 127 件。完了分は CLOSED.md。
 
-## 実装待ち (20)
+## 実装待ち (16)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -14,18 +14,14 @@
 | [backtest-available-lists-over-max-bars](backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
 | [indicator-result-wire-validation-unify](indicator-result-wire-validation-unify.md) | 低 | 2026-09-18 | 指標結果の検査が 2 箇所に重複している |
 | [subprocess-allowlist-by-line-number](subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
-| [wire-list-branch-unreachable](wire-list-branch-unreachable.md) | 低 | 2026-09-18 | 到達しない list 分岐が読み手を惑わす |
 | [flake-trade-claude-real-process](flake-trade-claude-real-process.md) | 低 | 2026-09-20 | 全スイート負荷時に claude 実プロセスのテストが稀に落ちる |
 | [switch-ops-r2b-low-unpinned](switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
-| [policy-path-literal-in-four-places](policy-path-literal-in-four-places.md) | 低 | 2026-09-21 | directives.md のパスが 4 箇所に散在する |
 | [improve-add-fullwidth-placeholder](improve-add-fullwidth-placeholder.md) | 低 | 2026-09-27 | improve add で全角プレースホルダが警告されない |
-| [service-secret-env-leaked-matches-redundant](service-secret-env-leaked-matches-redundant.md) | 低 | 2026-09-27 | 秘密 env 検査の leaked と matches が冗長 |
 | [flake](flake.md) | 低 |  | 全スイート負荷時に対話停止テストが落ちる (タイミング依存) |
 | [flake-rpc-timeout-by-kind](flake-rpc-timeout-by-kind.md) | 低 |  | 種別 timeout テストが実時間依存で負荷下に落ち得る |
 | [flake-shell-interrupt-timing](flake-shell-interrupt-timing.md) | 低 |  | 別 pytest 並走で shell 割り込みテストが落ちる |
 | [flaky-tool-schemas](flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
-| [kind-read-duplication](kind-read-duplication.md) | 低 |  | 候補の kind 読み出しが config.yaml 再パースで重複 |
 | [legacy-oc-tool-not-found](legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ## 裁定待ち (7)

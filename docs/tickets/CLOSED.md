@@ -2,16 +2,20 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (33)
+## 2026-10 (37)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 是正済 | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 是正済 | 高 | 2026-10-03 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 是正済 | 高 | 2026-10-03 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |
+| [kind-read-duplication](kind-read-duplication.md) | 是正済 | 低 | 2026-10-03 | 候補の kind 読み出しが config.yaml 再パースで重複 |
 | [legacy-e2e-daemon-quiet](legacy-e2e-daemon-quiet.md) | 是正済 | 低 | 2026-10-03 | stdin が非 TTY だと afx が黙って daemon 動作になる |
 | [legacy-oc-example-leak](legacy-oc-example-leak.md) | 是正済 | 低 | 2026-10-03 | プロンプトの実例 idea がそのまま backlog に実在化する |
+| [policy-path-literal-in-four-places](policy-path-literal-in-four-places.md) | 是正済 | 低 | 2026-10-03 | directives.md のパスが 4 箇所に散在する |
 | [selection-rationale-unverified](selection-rationale-unverified.md) | 是正済 | 高 | 2026-10-03 | 承認材料の selection_rationale が未検証で捏造され得る |
+| [service-secret-env-leaked-matches-redundant](service-secret-env-leaked-matches-redundant.md) | 是正済 | 低 | 2026-10-03 | 秘密 env 検査の leaked と matches が冗長 |
+| [wire-list-branch-unreachable](wire-list-branch-unreachable.md) | 是正済 | 低 | 2026-10-03 | 到達しない list 分岐が読み手を惑わす |
 | [approval-payload-missing-gate-metrics](approval-payload-missing-gate-metrics.md) | 是正済 | 未設定 | 2026-10-02 | 承認 payload に gate の測定値が載らない問題は是正済 |
 | [backtest-base-interval](backtest-base-interval.md) | 是正済 | 未設定 | 2026-10-02 | バックテスト基底足の可変化 (1m/5m/15m) は完了 |
 | [backtest-rpc-timeout-15s](backtest-rpc-timeout-15s.md) | 是正済 | 未設定 | 2026-10-02 | backtest の RPC が 15 秒で必ず timeout する不具合 (是正済) |

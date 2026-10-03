@@ -420,21 +420,22 @@ def test_gate_failure_stops_before_any_further_candidate_processing(
     (状態ベースの assert はこの種の間接効果を区別できない)。
 
     そこで手段を変え、「ゲート不合格の直後は後続の候補処理
-    (`_read_candidate_kind` 以降) に一切進まないこと」そのものを spy で
+    (`_discover_one` 以降) に一切進まないこと」そのものを spy で
     直接固定する — `_delete_staging`/Tx-2 のどちらの巻き添えにも依存しない。
     早期 `return` が削除されると `_read_candidate_kind` が (staging の
     生死に関わらず) 呼ばれてしまうため、この spy は単独で red になる。"""
     from agentic_fx.loops.improve_loop import ImproveLoop
 
+    from agentic_fx.plugin import loader as plugin_loader
+
     called = {"read_candidate_kind": False}
-    orig_read_candidate_kind = ImproveLoop._read_candidate_kind
+    orig_discover_one = plugin_loader._discover_one
 
-    def _spy_read_candidate_kind(self, candidate_dir):
+    def _spy_discover_one(*args, **kwargs):
         called["read_candidate_kind"] = True
-        return orig_read_candidate_kind(self, candidate_dir)
+        return orig_discover_one(*args, **kwargs)
 
-    monkeypatch.setattr(ImproveLoop, "_read_candidate_kind",
-                        _spy_read_candidate_kind)
+    monkeypatch.setattr(plugin_loader, "_discover_one", _spy_discover_one)
 
     app, root = improve_env
     conn = app.conn_core

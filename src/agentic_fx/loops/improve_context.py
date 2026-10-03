@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from agentic_fx.policy import Policy
+from agentic_fx.policy import Policy, directives_path
 from agentic_fx.store import news_sources
 from agentic_fx.tools.plugin_loader import approved_plugins
 
@@ -135,7 +135,7 @@ def _backlog_section(conn: "sqlite3.Connection",
 
 
 def _user_policy_section(root: Path) -> dict:
-    policy = Policy(root / "policy" / "directives.md")
+    policy = Policy(directives_path(root))
     return {"tail": policy.tail(4000)}
 
 

@@ -188,7 +188,7 @@ def test_commit_signal_candidate_is_gate_failed_without_approval(
         "selection_rationale": "r"}, transcript=[])
     gate_verdict = SimpleNamespace(
         passed=True, content_hash="c" * 64, artifact_hash="a" * 64)
-    candidate_meta = SimpleNamespace(max_bars=100, indicators=())
+    candidate_meta = SimpleNamespace(max_bars=100, indicators=(), kind="signal")
     monkeypatch.setattr(
         loop_full, "_run_plugin_gate", lambda *a, **kw: gate_verdict)
     monkeypatch.setattr(

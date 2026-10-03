@@ -4,6 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def directives_path(root: Path) -> Path:
+    """`policy add` の追記先であり Mission 注入元でもある directives.md の場所。"""
+    return root / "policy" / "directives.md"
+
+
 class Policy:
     def __init__(self, path: Path) -> None:
         self._path = path

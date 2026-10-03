@@ -50,7 +50,7 @@ from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
 from agentic_fx.plugin import switch
 from agentic_fx.plugin.sandbox import reap_orphans
 from agentic_fx.plugin.signal_producer import SignalProducer
-from agentic_fx.policy import Policy
+from agentic_fx.policy import Policy, directives_path
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -295,7 +295,6 @@ def _check_service_initial_env_has_no_secrets(
                 return pat
         return None
 
-    leaked = []
     matches: dict[str, str] = {}
     excluded_by_allowlist: list[str] = []
     for k in names:
@@ -308,18 +307,17 @@ def _check_service_initial_env_has_no_secrets(
             continue
         pat = _matched_pattern(k)
         if pat is not None:
-            leaked.append(k)
             matches[k] = pat
     if excluded_by_allowlist:
         _log.warning(
             "secret_env_allowlist により次の名前を検査⑤から除外した: %s "
             "— 同 UID の CLI worker は /proc/<pid>/environ からこの値を"
             "読める", sorted(excluded_by_allowlist))
-    if leaked:
+    if matches:
         patterns_hit = sorted(set(matches.values()))
         raise RuntimeError(
             f"{which}+{backend} backend refuses to start: service initial env "
-            f"contains secret-like variable name(s) {leaked!r} — same-UID "
+            f"contains secret-like variable name(s) {list(matches)!r} — same-UID "
             "CLI worker can read this service's /proc/<pid>/environ "
             f"(R10) (matched pattern(s) {patterns_hit!r}). Put secrets in "
             ".env, not exported shell env. If a name is NOT a secret, either "
@@ -1048,7 +1046,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                                   stop_event=stop_event,
                                   on_rpc_leak=_on_rpc_leak)
 
-        policy = Policy(root / "policy" / "directives.md")
+        policy = Policy(directives_path(root))
         # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
         mission_watch = MissionWatch()
 
@@ -1308,7 +1306,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             activity=activity, log_dir=root / "logs", clock=clock,
                             health_latch=health_latch,
                             improve_supervisor=improve_supervisor,
-                            policy_path=root / "policy" / "directives.md",
+                            policy_path=directives_path(root),
                             plugins_root=plugins_dir, settings=settings,
                             outage=outage)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
@@ -1637,7 +1635,7 @@ def run_service(root: Path, *, daemon: bool = False,
     stop_event = _stop_event if _stop_event is not None else threading.Event()
     app = build_app(root, stop_event=stop_event)
 
-    warning = Policy(root / "policy" / "directives.md").size_warning()
+    warning = Policy(directives_path(root)).size_warning()
     if warning:
         print(warning)
     print(build_splash(app))
