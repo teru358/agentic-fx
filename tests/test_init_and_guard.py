@@ -351,3 +351,38 @@ def test_init_does_not_swallow_unexpected_errors(tmp_path, mock_price_check):
     with pytest.raises(SystemExit) as e:
         ensure_initialized(tmp_path)
     assert e.value.code == 2
+
+
+# ---- stdin 非 TTY での daemon fallback の通知 --------------------------------
+
+
+def _run_entry(tmp_path, monkeypatch, argv, isatty):
+    _example(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: isatty)
+    seen = []
+    monkeypatch.setattr("agentic_fx.service.run_service",
+                        lambda root, daemon: seen.append(daemon) or 0)
+    assert entry_main(argv) == 0
+    return seen
+
+
+def test_entry_non_tty_without_flag_falls_back_to_daemon_with_notice(
+        tmp_path, monkeypatch, capsys):
+    seen = _run_entry(tmp_path, monkeypatch, [], isatty=False)
+    assert seen == [True]
+    err = capsys.readouterr().err
+    assert len(err.strip().splitlines()) == 1
+    assert "daemon" in err and "--daemon" in err
+
+
+def test_entry_explicit_daemon_flag_is_silent(tmp_path, monkeypatch, capsys):
+    seen = _run_entry(tmp_path, monkeypatch, ["--daemon"], isatty=False)
+    assert seen == [True]
+    assert capsys.readouterr().err == ""
+
+
+def test_entry_tty_runs_interactive_and_silent(tmp_path, monkeypatch, capsys):
+    seen = _run_entry(tmp_path, monkeypatch, [], isatty=True)
+    assert seen == [False]
+    assert capsys.readouterr().err == ""

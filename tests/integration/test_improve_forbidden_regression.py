@@ -418,3 +418,25 @@ def test_new_improve_tools_are_registered_and_not_forbidden():
               / "loops" / "prompts" / "improve_mission.md").read_text()
     for name in names:
         assert name in prompt
+
+
+def test_rendered_output_example_has_no_copyable_concrete_values():
+    """最終出力の実例は逐語コピーされても実在の課題にならない値だけで書く。
+    描画 (`str.format`) 後も JSON の構造が保たれることも見る。"""
+    import re
+    from collections import defaultdict
+    template = (Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
+                / "loops" / "prompts" / "improve_mission.md").read_text()
+    rendered = template.format_map(defaultdict(lambda: "x"))
+    assert "RSI の期間を 14 から 21" not in rendered
+    assert "RSI インジケータ plugin を追加する" not in rendered
+    assert "example.com/rsi" not in rendered
+    start = rendered.index('"discoveries": [')
+    start = rendered.rindex("{", 0, start)
+    end = rendered.index("\n\n", start)
+    block = rendered[start:end]
+    assert block.count("{") == block.count("}") > 0
+    for key in ('"discoveries"', '"selected"', '"artifact"',
+                '"selection_rationale"'):
+        assert key in block
+    assert re.search(r'"kind": "task"', block)

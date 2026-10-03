@@ -25,7 +25,12 @@ def main(argv: list[str] | None = None) -> int:
         return service.run_init(root)
     if args.command in _BACKTEST_COMMANDS:
         return backtest_cli.dispatch(args, root)
-    daemon = args.daemon or not sys.stdin.isatty()
+    daemon = args.daemon
+    if not daemon and not sys.stdin.isatty():
+        daemon = True
+        print("afx: stdin が端末ではないため daemon モードで起動します "
+              "(対話コマンドは受け付けません。明示するには --daemon)",
+              file=sys.stderr)
     return service.run_service(root, daemon=daemon)
 
 

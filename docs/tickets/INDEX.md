@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 133 件。完了分は CLOSED.md。
+未完了: 131 件。完了分は CLOSED.md。
 
-## 実装待ち (22)
+## 実装待ち (20)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -26,8 +26,6 @@
 | [flaky-tool-schemas](flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [kind-read-duplication](kind-read-duplication.md) | 低 |  | 候補の kind 読み出しが config.yaml 再パースで重複 |
-| [legacy-e2e-daemon-quiet](legacy-e2e-daemon-quiet.md) | 低 |  | stdin が非 TTY だと afx が黙って daemon 動作になる |
-| [legacy-oc-example-leak](legacy-oc-example-leak.md) | 低 |  | プロンプトの実例 idea がそのまま backlog に実在化する |
 | [legacy-oc-tool-not-found](legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ## 裁定待ち (7)

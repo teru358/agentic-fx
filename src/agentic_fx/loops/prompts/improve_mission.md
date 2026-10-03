@@ -105,30 +105,32 @@
 ミッションの最後のメッセージは **JSON オブジェクト 1 個のみ** にして
 ください。前置きの文章・コードフェンス・後書きは付けないでください。
 
-形式の実例 (値は例。この構造をそのまま守ること):
+形式の実例 (キーと構造を守ること。`<…>` の部分と `backlog_id` の数値は例であり、実際の内容に置き換えること):
 
 {{
   "discoveries": [
     {{
-      "idea": "RSI の期間を 14 から 21 に伸ばしてダマシを減らす",
+      "idea": "<発見した課題を 1 文で>",
       "source": "research",
-      "evidence": "https://example.com/rsi-period-study の要約: ...",
+      "evidence": "<根拠の要約か URL>",
       "kind": "task"
     }}
   ],
   "selected": {{
     "backlog_id": 12,
-    "idea": "RSI インジケータ plugin を追加する"
+    "idea": "<選んだ課題の説明文>"
   }},
   "artifact": {{
     "type": "plugin",
-    "name": "rsi_indicator",
+    "name": "<候補置き場に書いた plugin 名>",
     "kind": "indicator",
     "self_test": "passed",
-    "summary": "RSI を算出する indicator plugin。期間は config.yaml の params で変えられる。"
+    "summary": "<人間の承認画面に出る要約>"
   }},
-  "selection_rationale": "直近の hold 率の高さに直結する課題で、RSI という標準指標を足すことで判断材料が増えるため。"
+  "selection_rationale": "<選択理由>"
 }}
+
+実例の `<…>` はプレースホルダです。そのまま出力せず、必ず実際の内容に置き換えてください。
 
 - `discoveries` は**オブジェクトの配列**です (文字列の配列ではない)。
   各要素は `idea` / `source` (`agent` か `research`) / `evidence` / `kind`
