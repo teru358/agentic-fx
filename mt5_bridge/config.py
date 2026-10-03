@@ -22,18 +22,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-_LOOPBACK_NAMES = frozenset({"localhost"})
+def normalize_host(host: str) -> str:
+    """`localhost` は hosts の設定次第で LAN IP を指し得るので 127.0.0.1 に固定する。"""
+    h = host.strip()
+    return "127.0.0.1" if h.lower() == "localhost" else h
 
 
 def is_loopback_host(host: str) -> bool:
-    """待受 host が自機内のみ (loopback) か。"""
-    h = host.strip().lower()
-    if h in _LOOPBACK_NAMES:
-        return True
+    """IP リテラルで、かつ loopback か。ホスト名は名前解決に依存するので False。"""
     try:
-        return ipaddress.ip_address(h.strip("[]")).is_loopback
+        ip = ipaddress.ip_address(host.strip().strip("[]"))
     except ValueError:
         return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return (mapped or ip).is_loopback
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,7 @@ def load_settings(env_file: Path | None = None) -> BridgeSettings:
     if not server:
         raise ValueError("MT5_SERVER is required")
 
-    host = _env("BRIDGE_HOST", "127.0.0.1")
+    host = normalize_host(_env("BRIDGE_HOST", "127.0.0.1"))
     api_key = _env("BRIDGE_API_KEY")
     if not is_loopback_host(host) and not api_key:
         raise ValueError(

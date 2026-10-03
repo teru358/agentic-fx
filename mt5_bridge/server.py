@@ -9,16 +9,17 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from admin_models import AdminStatus, HaltRequest
-from config import BridgeSettings, load_settings
+from config import BridgeSettings, is_loopback_host, load_settings
 from mt5_client import Mt5Client, PreflightError, ServerTimeUnknownError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
@@ -184,23 +185,34 @@ async def lifespan(app: FastAPI):
         _client.disconnect()
 
 
-app = FastAPI(
-    title="MT5 Bridge",
-    version="0.1.0",
-    description="HTTP bridge over MetaTrader5 Python package (price data + order endpoints).",
-    lifespan=lifespan,
-)
-
-
 # ── 認証 (api_key 設定時のみ強制) ────────────────────────────────────
 
 def require_api_key(x_bridge_api_key: str | None = Header(default=None)) -> None:
     if _settings is None or not _settings.auth_required:
         return
-    if x_bridge_api_key != _settings.api_key:
+    if x_bridge_api_key is None or not secrets.compare_digest(
+        x_bridge_api_key.encode(), _settings.api_key.encode()
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid or missing X-Bridge-Api-Key",
+        )
+
+
+LOCAL_ONLY_DETAIL = "API キー未設定の bridge は自機内からの接続のみ受け付ける"
+
+
+def require_local_client_without_key(request: Request) -> None:
+    """API キー未設定なら、接続元が loopback の IP リテラルでない要求を全 endpoint で拒否する。
+
+    待受先 (uvicorn の --host など) がどう指定されても「キー無し = 自機内だけ」を保つ。
+    """
+    if _settings is not None and _settings.auth_required:
+        return
+    client = request.client
+    if client is None or not is_loopback_host(client.host):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_ONLY_DETAIL
         )
 
 
@@ -215,6 +227,18 @@ def require_order_api_key(x_bridge_api_key: str | None = Header(default=None)) -
             detail=ORDER_KEY_REQUIRED_DETAIL,
         )
     require_api_key(x_bridge_api_key)
+
+
+app = FastAPI(
+    title="MT5 Bridge",
+    version="0.1.0",
+    description="HTTP bridge over MetaTrader5 Python package (price data + order endpoints).",
+    lifespan=lifespan,
+    dependencies=[Depends(require_local_client_without_key)],
+)
+
+# 発注・管理書き込み系。認証は router 単位で付ける (個別 decorator には付けない)
+order_router = APIRouter(dependencies=[Depends(require_order_api_key)])
 
 
 # ── レスポンスモデル ────────────────────────────────────────────────
@@ -362,8 +386,7 @@ _RETCODE_RETRYABLE = {10004, 10020}  # REQUOTE / PRICE_CHANGED → 1 回再試�
 _RETCODE_RATE_LIMIT = 10024   # TOO_MANY_REQUESTS → 100ms backoff + 1 回再試行
 
 
-@app.post("/order", response_model=OrderResponse,
-          dependencies=[Depends(require_order_api_key)])
+@order_router.post("/order", response_model=OrderResponse)
 def place_order(req: OrderRequest):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
@@ -441,8 +464,7 @@ def place_order(req: OrderRequest):
     )
 
 
-@app.post("/positions/{ticket}/modify", response_model=ModifyPositionResponse,
-          dependencies=[Depends(require_order_api_key)])
+@order_router.post("/positions/{ticket}/modify", response_model=ModifyPositionResponse)
 def modify_position(ticket: int, req: ModifyPositionRequest):
     if req.sl is None and req.tp is None:
         raise HTTPException(400, "sl or tp must be provided")
@@ -462,8 +484,7 @@ def modify_position(ticket: int, req: ModifyPositionRequest):
         raise HTTPException(409, str(e))
 
 
-@app.post("/positions/{ticket}/close", response_model=ClosePositionResponse,
-          dependencies=[Depends(require_order_api_key)])
+@order_router.post("/positions/{ticket}/close", response_model=ClosePositionResponse)
 def close_position(ticket: int, symbol: str | None = None):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
@@ -497,8 +518,7 @@ def _build_admin_status() -> AdminStatus:
     )
 
 
-@app.post("/admin/halt", response_model=AdminStatus,
-          dependencies=[Depends(require_order_api_key)])
+@order_router.post("/admin/halt", response_model=AdminStatus)
 def admin_halt(req: HaltRequest):
     if _runtime is None:
         raise HTTPException(503, "runtime not initialized")
@@ -509,8 +529,7 @@ def admin_halt(req: HaltRequest):
     return _build_admin_status()
 
 
-@app.post("/admin/resume", response_model=AdminStatus,
-          dependencies=[Depends(require_order_api_key)])
+@order_router.post("/admin/resume", response_model=AdminStatus)
 def admin_resume():
     if _runtime is None:
         raise HTTPException(503, "runtime not initialized")
@@ -622,6 +641,9 @@ def _build_log_config() -> dict:
             "uvicorn.access": {"handlers": ["access"],  "level": "INFO", "propagate": False},
         },
     }
+
+
+app.include_router(order_router)
 
 
 def main() -> None:

@@ -42,8 +42,11 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 
 - `BRIDGE_HOST` の既定は `127.0.0.1` (自機内のみ)。afx が同じマシンならこのままでよい。
 - afx が別マシンのときだけ、届く最小の範囲のアドレスに変える (`0.0.0.0` は同じネットワークの全員に届く)。
-- `127.0.0.1` / `::1` / `localhost` 以外で待ち受けるには `BRIDGE_API_KEY` が必須。空のままだと bridge は理由を示して起動を拒否する。
-- API キーを設定すると、全 endpoint (`/health` 以外) が `X-Bridge-Api-Key` ヘッダを要求する。
+- `BRIDGE_HOST=localhost` は `127.0.0.1` に読み替えて待ち受ける (hosts の設定次第で `localhost` が LAN の IP を指す環境があるため)。`::1` で待ちたい場合は `::1` と明示する。IP リテラル以外のホスト名はループバック扱いにならず、`BRIDGE_API_KEY` が必須。
+- `127.0.0.1` / `::1` 以外で待ち受けるには `BRIDGE_API_KEY` が必須。空のままだと bridge は理由を示して起動を拒否する。
+- `BRIDGE_API_KEY` が空のあいだは、待受先の指定方法 (`uvicorn server:app --host 0.0.0.0` のような別経路の起動を含む) に関係なく、接続元が自機 (ループバックの IP) でない要求は `/health` を含む全 endpoint で 403 になる。afx が `http://localhost:8812` で接続する構成はそのまま通る。
+- 起動は `uv run python server.py` を使う。
+- API キーを設定すると、全 endpoint (`/health` 以外。キーを設定済みなら `/health` は接続元を問わず開いている) が `X-Bridge-Api-Key` ヘッダを要求する。
 - この bridge には認可や rate limit の仕組みは無い。インターネットには公開しないこと。
 
 ## セットアップ
@@ -121,6 +124,7 @@ bridge は `symbol_info_tick(symbol).time` と UTC 時計の差からオフセ�
 | 症状 | 原因 / 対処 |
 |---|---|
 | 起動時に `BRIDGE_API_KEY が必要です` | `BRIDGE_HOST` が自機以外から届く値になっている。キーを設定するか `127.0.0.1` に戻す |
+| 全 endpoint が 403 `API キー未設定の bridge は自機内からの接続のみ受け付ける` | キー未設定のまま別マシンから接続している。`BRIDGE_API_KEY` を設定するか、afx を同じマシンで動かす |
 | 発注系が 403 `発注系は API キーが必要` | `BRIDGE_API_KEY` が空。設定し、リクエストに `X-Bridge-Api-Key` を付ける |
 | `ImportError: MetaTrader5 package is Windows-only` | Linux/Mac のネイティブ Python で動かしている。MT5 端末のある Windows (Wine 含む) の Python で実行する |
 | `MT5 initialize() failed: (-10004, ...)` | MT5 端末が起動していない、または別ユーザーで起動している |

@@ -31,10 +31,16 @@ def test_non_loopback_host_without_key_is_refused(env, monkeypatch):
         load_settings(env)
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1", "localhost"])
+@pytest.mark.parametrize("host", ["127.0.0.1", "127.0.0.2", "::1"])
 def test_loopback_host_without_key_is_allowed(env, monkeypatch, host):
     monkeypatch.setenv("BRIDGE_HOST", host)
     assert load_settings(env).host == host
+
+
+@pytest.mark.parametrize("host", ["localhost", "LOCALHOST", " Localhost "])
+def test_localhost_is_normalised_to_ipv4_loopback(env, monkeypatch, host):
+    monkeypatch.setenv("BRIDGE_HOST", host)
+    assert load_settings(env).host == "127.0.0.1"
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.168.1.10", "example.test"])
@@ -100,8 +106,10 @@ def test_read_routes_keep_optional_key_dependency(method, path):
     assert server.require_order_api_key not in deps
 
 
-def test_health_has_no_auth_dependency():
-    assert _route_deps("GET", "/health") == set()
+def test_health_has_no_key_dependency():
+    deps = _route_deps("GET", "/health")
+    assert server.require_api_key not in deps
+    assert server.require_order_api_key not in deps
 
 
 def test_read_dependency_allows_no_key_when_unset(monkeypatch):
@@ -109,14 +117,14 @@ def test_read_dependency_allows_no_key_when_unset(monkeypatch):
     server.require_api_key(None)
 
 
-@pytest.mark.parametrize("host", ["LOCALHOST", " 127.0.0.1 ", "[::1]", "::ffff:127.0.0.1"])
+@pytest.mark.parametrize("host", [" 127.0.0.1 ", "[::1]", "::ffff:127.0.0.1"])
 def test_loopback_spellings_are_recognised(host):
     from config import is_loopback_host
 
     assert is_loopback_host(host)
 
 
-@pytest.mark.parametrize("host", ["", "   ", "example.test", "0.0.0.0", "::", "8.8.8.8"])
+@pytest.mark.parametrize("host", ["", "   ", "example.test", "localhost", "LOCALHOST", "0.0.0.0", "::", "8.8.8.8"])
 def test_unparseable_or_non_loopback_host_is_not_loopback(host):
     from config import is_loopback_host
 
