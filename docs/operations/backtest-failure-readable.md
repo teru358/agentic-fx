@@ -129,4 +129,5 @@ live の signal 計算は maintenance tick ごとに新しい worker で行う�
 - **`deps`**: その戦略が使う依存 (指標 plugin) の本数。依存が多いほど worker の CPU が増える。CPU の大小を比べるときは `deps` と pair・scope・足をそろえる。
 - **`scope`**: `in_sample` と `holdout` の評価は別の行になる。同じ mission で行が複数あるのは正常。
 - **`unreaped` / `orphan`**: kill のあと 5 秒たっても worker を回収できなかった印 (カーネル側で終了待ちなど)。その評価は `crashed`、CPU は `null` になる。回収待ちの worker は本体が内部で保持し、次の worker 作成時とサービス終了時に再試行して、回収できたら技術ログに `plugin worker orphan reaped pid=...` と 1 行残す。**たまに出る程度なら放置してよい。** 保持数が 64 を超えたときだけ `plugin worker orphan list exceeds 64 entries` が 1 回 warning で出る。これが出たら放置せず、OS 側 (D 状態のプロセスや、ディスク・NFS の詰まり) を調べる。
-- **`stderr_unavailable=True`**: stderr を保存する一時ファイルを作れなかったことを示す。評価は続いているが、`stderr_tail` は無い。
+- **`stderr_unavailable=true`**: stderr を保存する一時ファイルを作れなかったことを示す。評価は続いているが、この行には `stderr_tail` も `truncated` も付かない。
+- **拒否も `max_refusal_streak` に数える**: 3 回目拒否は tool の error として errors と streak を増やすので、閾値が 1 なら 1 回で mission が打ち切られる。

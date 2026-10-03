@@ -1,4 +1,4 @@
-# [backtest-failure-readable] 設計書 v1.3
+# [backtest-failure-readable] 設計書 v1.4
 
 対象 commit: `fc318ab`。束 A は、現行の CPU 上限を変えずに、backtest と live plugin 評価の失敗を人間には診断可能に、改善 agent には安全な固定分類として届ける。
 
@@ -118,7 +118,7 @@ response に許すのは `error`、固定 `hint`、`started`、既存 wrapper �
 2. handler が `started:true, error:"worker_cpu_limit"` を返したときだけ、lock 内で +1 する。
 3. 観測数 2 は handler を呼ばず、候補枠も消費せず、`started:false, error:"repeated_worker_cpu_limit"` と固定 hint を返す。
 
-この 3 回目拒否だけは専用 finalization で ledger に残す。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。agent が hash/pair を変えて続行すれば、既存の候補別 6 回枠、budget refusal、refusal/tool-call 上限、runner の待ち loop が最終停止を担い、3 回目拒否だけで `abort_pending` を立てない。
+この 3 回目拒否は handler を呼ばないので、記録先は tool 応答 (mission の transcript) と counters だけである (本番では handler は子プロセスで動き、子の ledger は親に読まれない。v1.4)。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。agent が hash/pair を変えて続行すれば、既存の候補別 6 回枠、budget refusal、refusal/tool-call 上限、runner の待ち loop が最終停止を担い、3 回目拒否だけで `abort_pending` を立てない。
 
 ### 2.5 人間: activity で backtest と live を読む
 
@@ -294,5 +294,5 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 | 2026-09-21 | v1.0 | orphan 強参照・冪等終端状態・live 完全写像・runbook を反映して公開向けに清書 | 最終裁定を全設計要素へ反映 | `630edc8` |
 | 2026-09-21 | v1.1 | 清書時に圧縮で落ちた8契約と対応ACを復元 | 清書時の圧縮で落ちた契約の復元 | `d95990d` |
 | 2026-09-21 | v1.2 | `cpu_limit` 判定の許容幅を 0 → 0.05 秒 (内部定数) | 実測: RLIMIT_CPU の kill 時、親が観測する累積 CPU は上限を最大 26 ms 下回る | `4321db3` |
-| 2026-09-29 | v1.3 | §5.1 項目 1 の停止条件を v1.2 の許容幅 (0.05 秒) に揃える (「`cpu_sec < limit` で停止」は v1.1 の残骸) | astra 設計助言 2026-09-29 で矛盾を指摘 | (本 commit) |
-| 2026-10-03 | v1.4 | §2.4 の補足: (a) 3 回目拒否の記録先は子プロセスの tool 応答 (transcript) と counters で、親の ledger・activity には出ない (「ledger に残す」はこの読み替え。拒否は handler を呼ばないため親へ届く経路が無く、追加 RPC は本束の範囲外)。本番では handler は子プロセス (`mission_worker._build_improve_registry`) で動き、子の ledger は親に読まれない。(b) 拒否は errors と streak を増やすので `max_refusal_streak` の閾値に数えられる (閾値 1 なら 1 回で abort_pending が立つ)。(c) 受付は「観測数 + 実行中の数」で判定し、同時実行での 3 回目を防ぐ | 実装レビューで同時実行の抜けと記録先の不整合を指摘 | (本 commit) |
+| 2026-09-29 | v1.3 | §5.1 項目 1 の停止条件を v1.2 の許容幅 (0.05 秒) に揃える (「`cpu_sec < limit` で停止」は v1.1 の残骸) | astra 設計助言 2026-09-29 で矛盾を指摘 | `a300c6d` |
+| 2026-10-03 | v1.4 | §2.4 の補足: (a) 3 回目拒否の記録先は子プロセスの tool 応答 (transcript) と counters で、親の ledger・activity には出ない (「ledger に残す」はこの読み替え。拒否は handler を呼ばないため親へ届く経路が無く、追加 RPC は本束の範囲外)。本番では handler は子プロセス (`mission_worker._build_improve_registry`) で動き、子の ledger は親に読まれない。(b) 拒否は errors と streak を増やすので `max_refusal_streak` の閾値に数えられる (閾値 1 なら 1 回で abort_pending が立つ)。(c) 受付は「観測数 + 実行中の数」で判定し、同時実行での 3 回目を防ぐ | 実装レビューで同時実行の抜けと記録先の不整合を指摘 | `5ca2ede` |
