@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 125 件。完了分は CLOSED.md。
+未完了: 127 件。完了分は CLOSED.md。
 
 ## 実装待ち (15)
 
@@ -34,13 +34,14 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (104)
+## 設計待ち (106)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [gate-pytest-dev-writable-and-ldso-exec](gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [sandbox-escape-via-user-daemons-unmeasured](sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測 |
+| [deployed-plugin-has-no-disable-or-rollback](deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
 | [candidates-converge-to-example-sma](candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
@@ -113,6 +114,7 @@
 | [tracked-files-contain-author-home-path](tracked-files-contain-author-home-path.md) | 低 | 2026-10-02 | 追跡ファイルに作者のホームの絶対パスが残る |
 | [rlimit-nproc-per-uid-does-not-bound-worker](rlimit-nproc-per-uid-does-not-bound-worker.md) | 低 | 2026-10-03 | RLIMIT_NPROC は uid 全体の値で worker の子プロセス数を縛れない |
 | [supervisor-cleanup-test-leaks-36-fds](supervisor-cleanup-test-leaks-36-fds.md) | 低 | 2026-10-03 | worker supervisor の cleanup テストが 1 回で fd を 36 本増やす |
+| [activity-log-grows-without-rotation](activity-log-grows-without-rotation.md) | 低 | 2026-10-04 | activity ログが無期限に伸びる |
 | [approval-no-history-passthrough](approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
