@@ -1,4 +1,4 @@
-# [backtest-failure-readable] 設計書 v1.4
+# [backtest-failure-readable] 設計書 v1.5
 
 対象 commit: `fc318ab`。束 A は、現行の CPU 上限を変えずに、backtest と live plugin 評価の失敗を人間には診断可能に、改善 agent には安全な固定分類として届ける。
 
@@ -9,6 +9,7 @@
 - 変わる: 同じ content hash・pair の CPU 上限失敗は 2 回観測後、3 回目から実行せずに拒否する。
 - 変わらない: `plugin.sandbox_session_cpu_sec` は worker 1 プロセス寿命の累積 CPU 上限、既定 60 秒、soft==hard のままである。
 - 変わらない: 15m・依存 3 本の戦略は束 A 後も 60 秒付近で失敗する。完走ではなく、`worker_cpu_limit` として読める失敗になる。
+- 変わる (v1.5): plugin worker の隔離を準備・検証できない失敗は `sandbox_unavailable` とする。`load` 前の起動 timeout、継承 seccomp filter、runtime fingerprint 自己試験失敗もここに入る。`load` 後の SIGSYS は禁止 syscall と外部 signal を区別できないため `crashed / sigsys_unattributed` とし、候補の修正要求を出さない。
 - 束 B へ送る: per-call/平均 CPU、planned call 数、CPU 予算式・設定移行、timeout の cancellation、live hook の非同期化と wall 遅延対策。
 
 下書きと設計レビュー記録（リポジトリ外）は `tmp/design-b1/design-A.md` および `tmp/design-b1/r4/verdicts.md` に保管する。本書はそれらを参照せず単体で読める完成版である。
@@ -21,7 +22,7 @@
 
 1. worker が死んだとき、人間は親観測の終了 code/signal、累積 CPU、bounded・escaped stderr tail を技術ログで読める。
 2. 改善 agent は固定分類と固定 hint だけを受け、CPU 数値、設定値、終了 code/signal、stderr は受け取らない。
-3. started 後の improve backtest は成功・失敗を問わず `backtest_cpu` activity をちょうど 1 行残し、live の失敗も activity で見える。
+3. worker の起動を試みた後の improve backtest は成功・失敗 (`sandbox_unavailable` を含む) を問わず `backtest_cpu` activity をちょうど 1 行残し、live の失敗も activity で見える。
 4. 同じ `(content_hash, pair)` の実測済み CPU 上限失敗だけを、3 回目から実行前に抑制する。
 
 ### 1.2 範囲
@@ -31,6 +32,7 @@
 - 匿名 stderr file の bounded tail・escape と、人間向け技術ログだけへの出力。
 - improve の固定公開分類、counter/ledger の整合、全 outcome の activity。
 - live の failure activity、固定分類、間引き通知、サービス composition root の配線。
+- 隔離の準備・検証の失敗 `sandbox_unavailable` の分類・公開写像・activity・live 写像。隔離そのものは `[plugin-worker-landlock]` の範囲とする。
 - unreaped worker の強参照 orphan 管理と、終端状態の冪等 close。
 - 運用 runbook と、各条件を殺す逆変異テスト。
 
@@ -65,25 +67,32 @@
 | `parent_kill_sent` | timeout/cleanup の SIGKILL を親が送ったか。signal より先に固定する |
 | `worker_unreaped` | kill 後 5 秒でも reap できない PID |
 | `error_code` | 内部固定 enum |
+| `sandbox_reason` | `sandbox_unavailable` の固定 enum、または SIGSYS による `crashed` の `sigsys_unattributed`。他は `None` |
 | `stderr_tail` | 技術ログ出力直前だけに保持する最大 8 KiB の escaped text |
 
-`_read_response()` は reader queue だけを待たず、短い間隔で queue と `wait4(WNOHANG)` を競合させる。worker が死に、孫だけが stdout を保持しても deadline より先に死因を確定する。deadline 時は最後にもう一度 reap を試し、生存しているときだけ `parent_kill_sent=True` を保存して killpg する。kill 後は最大 5 秒、non-blocking `wait4` だけを再試行する。正常 close を含め、`PluginStrategyIntentSource.close()` は session 参照を消す前に親観測の `cpu_sec`、`worker_returncode`、`worker_signal` を adapter へ取り込む。handler の outer `finally` はこの診断を成功・失敗を問わず activity に渡し、close 応答の worker 自己申告 `cpu_sec` は protocol 互換のため残しても比較・fallback に使わない。
+`_read_response()` は reader queue だけを待たず、短い間隔で queue と `wait4(WNOHANG)` を競合させる。worker が死に、孫だけが stdout を保持しても deadline より先に死因を確定する。deadline 時は最後にもう一度 reap を試し、生存しているときだけ `parent_kill_sent=True` を保存して killpg する。kill 後は最大 5 秒、non-blocking `wait4` だけを再試行する。正常 close を含め、`PluginStrategyIntentSource.close()` と起動失敗時の `_ensure_session` は session 参照を消す前に親観測の `cpu_sec`、`worker_returncode`、`worker_signal`、`sandbox_reason` を adapter へ取り込む。handler の outer `finally` はこの診断を成功・失敗を問わず activity に渡し、close 応答の worker 自己申告 `cpu_sec` は protocol 互換のため残しても比較・fallback に使わない。
 
 5 秒以内に reap できなければ session は `UNREAPED_CLOSED` となる。CPU は `null`、分類は `crashed`、親側 fd は閉じる。この状態で 2 回目以降の `close()` と `__exit__()` は kill、reap、fd close をせず即 return する。
 
 unreaped `Popen` は session が参照を外さず、モジュール内の上限 64 の強参照 orphan リストへ移す。これにより destructor の cleanup 経路に渡さない。新 session 作成直前とサービス終了時に helper が各 orphan を一度だけ `WNOHANG` で試し、回収できればリストから外して技術ログに 1 行記録する。64 を超えても最古を捨てず、GC cleanup を避けるため保持したまま WARNING を 1 回だけ出す。64 は設定ノブにしない内部定数である。
 
-分類は親の行為と観測値だけで決める。
+分類は親の行為と観測値だけで決める。上の行ほど優先する。SIGSYS は `load` 前だけ `sandbox_unavailable`、後は既存の `crashed` に reason を付ける。
 
 | 観測 | `SandboxError.code` | 扱い |
 |---|---|---|
 | kill 後 5 秒の reap 期限超過 | `crashed` | unreaped、`cpu_sec=null` |
+| 親が `load` を送る前に、起動の wall deadline で親が kill | `sandbox_unavailable` | plugin 未読込。reason `sandbox_startup_timeout` |
 | `parent_kill_sent` かつ wall deadline | `timeout` | 親が生存確認後に timeout kill |
+| Popen 直前の親 preflight、隔離の要求水準、runtime fingerprint admission、継承 seccomp filter、`Popen` 自体、または `load` 前の自己終了が失敗 | `sandbox_unavailable` | plugin 未読込。SIGSYS は `startup_sigsys_unattributed`、fingerprint 自己試験は `runtime_fingerprint_selftest_failed`、その他は固定 reason |
+| `sandbox_ready` が `ok:false`、attestation または子の `/proc` status の検証不一致 | `sandbox_unavailable` | plugin 未読込。固定 reason は技術ログへ |
 | 親 kill なし、`SIGKILL`、CPU が `limit − 0.05 秒` 以上 | `cpu_limit` | worker 寿命の累積 CPU 上限 |
+| 親が `load` を送った後、親 kill なし、`SIGSYS` | `crashed` | 原因未確定。reason `sigsys_unattributed`。禁止 syscall または同 uid 外部 process の signal |
 | 親 kill なしの `SIGKILL` で CPU 欠測/閾値未満 | `crashed` | OOM/external kill 等を CPU と断定しない |
 | `SIGXFSZ`、その他 signal/exit/EOF 未確定 | `crashed` | 技術ログには事実を残し原因は断定しない |
 | 生存 worker の `ok:false` | `plugin_error` | plugin/依存/validation/serialization failure |
 | invalid JSON、oversize、read failure | `protocol_error` | IPC protocol failure |
+
+`sandbox_unavailable` の reason は `[plugin-worker-landlock]` の固定 enum に限り、`inherited_seccomp_filter`、`runtime_fingerprint_selftest_failed`、`startup_sigsys_unattributed`、`sandbox_startup_timeout` を含む。SIGSYS の `crashed` だけ `sandbox_reason=sigsys_unattributed` を持つ。親は固定 1 行で「禁止 syscall または外部 signal。kernel log を見よ」と出し、kernel log の有無で分類を変えない。
 
 CPU 判定の許容幅は 0.05 秒の内部定数である (設定ノブにしない)。カーネルが `RLIMIT_CPU` を判定する時刻と `wait4` が返す精密な累積 CPU は一致せず、実測 (2026-09-21、設定値 1/2/5/60、計 56 回) では親観測値が上限を最大 26 ms 下回った。許容幅 0 では CPU 上限死のほぼ全部が `crashed` になるため、実測最大の約 2 倍を取る。実装前 harness は実 plugin worker でも同じ測定を行い、不足が 0.05 秒を超えたら分類を実装せず裁定へ戻す。OOM、外部 kill、自発 `SIGKILL` が閾値近くで重なる誤分類、kernel tick/float の丸め、worker が wait していない孫（特に group 外へ逃げた孫）の未計上・未回収は残余リスクとして隠さない。activity/技術ログに親観測 CPU と signal を併記し、人間が再判定できるようにする。
 
@@ -95,7 +104,7 @@ CPU 判定の許容幅は 0.05 秒の内部定数である (設定ノブにし�
 
 回収時は末尾最大 8 KiB の bytes を読み、backslash、不正 UTF-8、Unicode `Cc`/`Cf`/`Zl`/`Zp` を可視 escape して 1 log record にする。先頭を落としたときは `truncated=true` を加える。tail が空なら `stderr_tail` 本文を出さない。raw bytes や複数行は logger に渡さない。worker は handshake 後、plugin/依存 import 前に `RLIMIT_CORE=(0,0)` を fail closed で設定する。pipe 型 `core_pattern` 等の host 側 collector が limit 0 をどう扱うかは host policy に依存するため、束 A だけでの完全封鎖は主張しない。
 
-技術ログには固定 prefix、plugin 名、内部 code、親 CPU、returncode/signal、`stderr_unavailable`、escaped `stderr_tail` だけを許す。stderr と、その有無を示す bool は、tool response、transcript、ledger、`last_result`、改善 prompt、report、activity、`SandboxError.__str__` へ出さない。改善 agent が `agentic.log` と `activity.log` を read/listdir できないことを実 worker の Landlock negative test と registry/context inventory の両方で固定する。
+技術ログには固定 prefix、plugin 名、内部 code、親 CPU、returncode/signal、`stderr_unavailable`、escaped `stderr_tail`、`sandbox_reason` (固定 enum) と、SIGSYS のときの固定 1 行 (pid と kernel log の読み方) だけを許す。stderr と、その有無を示す bool は、tool response、transcript、ledger、`last_result`、改善 prompt、report、activity、`SandboxError.__str__` へ出さない。改善 agent が `agentic.log` と `activity.log` を read/listdir できないことを実 worker の Landlock negative test と registry/context inventory の両方で固定する。
 
 ### 2.3 改善 agent: 固定公開分類と固定 hint を受ける
 
@@ -106,9 +115,12 @@ CPU 判定の許容幅は 0.05 秒の内部定数である (設定ノブにし�
 | `cpu_limit` | `worker_cpu_limit` | CPU 上限に達した。より粗い timeframe、依存・計算削減、または人間への報告 |
 | `timeout` | `worker_timeout` | 評価が時間内に完了しない。計算削減、または人間への報告 |
 | `crashed` | `worker_crashed` | worker が異常終了。原因を推測せず人間へ報告 |
+| `sandbox_unavailable` | `worker_sandbox_unavailable` | この環境では候補を安全に実行できない。候補の問題ではないので、候補の修正や再試行はせず、人間へ報告 |
 | `plugin_error` / `protocol_error` / `backtest_failed` | `backtest_failed` | 候補を確認・修正し、繰り返すなら人間へ報告 |
 
 response に許すのは `error`、固定 `hint`、`started`、既存 wrapper の `remaining_budget` だけである。`no_history_for_symbol` と `pair_not_declared_by_plugin` の既存固定分岐は維持する。tool response、transcript、ledger の `result_summary`、counter は同一の公開 `error` を扱い、成功のみが同 tool の error streak を reset する。
+
+`started` は「plugin のコードが動き得たか」、すなわち親が `load` を送ったかを表す。`worker_sandbox_unavailable` は `started:false` を返し、既存の解放経路が候補枠を戻して `record_backtest_result` と CPU 観測を行わない。ただし `tool_error:worker_sandbox_unavailable` の streak には入れ、同じ mission で `max_refusal_streak` 回続けば `abort_pending` を立てる。`load` 後の SIGSYS は `worker_crashed`・`started:true` とし、通常の crash と同じ候補枠・tool error streak に入れる。holdout gate と commit gate の `sandbox_unavailable` は固定文言の gate 不合格とする。
 
 ### 2.4 改善 agent: 同じ CPU 失敗は 3 回目から実行しない
 
@@ -118,11 +130,11 @@ response に許すのは `error`、固定 `hint`、`started`、既存 wrapper �
 2. handler が `started:true, error:"worker_cpu_limit"` を返したときだけ、lock 内で +1 する。
 3. 観測数 2 は handler を呼ばず、候補枠も消費せず、`started:false, error:"repeated_worker_cpu_limit"` と固定 hint を返す。
 
-この 3 回目拒否は handler を呼ばないので、記録先は tool 応答 (mission の transcript) と counters だけである (本番では handler は子プロセスで動き、子の ledger は親に読まれない。v1.4)。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。agent が hash/pair を変えて続行すれば、既存の候補別 6 回枠、budget refusal、refusal/tool-call 上限、runner の待ち loop が最終停止を担い、3 回目拒否だけで `abort_pending` を立てない。
+この 3 回目拒否は handler を呼ばないので、記録先は tool 応答 (mission の transcript) と counters だけである (本番では handler は子プロセスで動き、子の ledger は親に読まれない。v1.4)。tool call として `total_calls`、`errors`、refusal streak は増えるが、候補別 `backtest_calls` と CPU 観測数は増えない。既存 3 種の preflight は変えない。`worker_crashed`、`worker_timeout`、`backtest_failed`、`worker_sandbox_unavailable` は対象外であり、content hash または pair が変われば再試行できる。これは mission 終了保証ではない。agent が hash/pair を変えて続行すれば、既存の候補別 6 回枠、budget refusal、refusal/tool-call 上限、runner の待ち loop が最終停止を担い、3 回目拒否だけで `abort_pending` を立てない。
 
 ### 2.5 人間: activity で backtest と live を読む
 
-improve backtest は started 後、resource close と分類確定を行う outer `finally` から `backtest_cpu` をちょうど 1 行書く。既存の mission/plugin/scope/pair/deps に `result` と `cpu_source=parent_wait4` を加える。`result` は `ok|plugin_error|cpu_limit|timeout|crashed|backtest_failed` の固定値だけである。取得不能の CPU、returncode、signal は推測せず `null` とする。旧 activity は `cpu_source` がなく worker 自己申告なので、新行の `cpu_sec` と同列比較しない。activity writer failure は本来の結果を変えない。
+improve backtest は worker の起動を試みた後 (adapter の `evaluation_started`。tool 応答の `started` とは別)、resource close と分類確定を行う outer `finally` から `backtest_cpu` をちょうど 1 行書く。既存の mission/plugin/scope/pair/deps に `result` と `cpu_source=parent_wait4` を加える。`result` は `ok|plugin_error|cpu_limit|timeout|crashed|backtest_failed|sandbox_unavailable` の固定値だけである。`result=sandbox_unavailable` と SIGSYS による `result=crashed` の行だけ固定 enum の `sandbox_reason` を足す。Popen 前の失敗では CPU、returncode、signal は `null`、worker を回収できた場合は親 `wait4` の値とする。`cpu_source` は常に `parent_wait4` とし、取得不能値は推測せず `null` とする。旧 activity は `cpu_source` がなく worker 自己申告なので、新行の `cpu_sec` と同列比較しない。activity writer failure は本来の結果を変えない。
 
 live producer は `ActivityLog` を composition root から受け、bucket 評価の catch 箇所で `plugin_eval_failed` を記録する。公開 `SandboxError.code` と live `result` の写像は次で固定する。
 
@@ -131,10 +143,11 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | `SandboxError(timeout)` | `timeout` |
 | `SandboxError(cpu_limit)` | `cpu_limit` |
 | `SandboxError(crashed)` | `crashed` |
+| `SandboxError(sandbox_unavailable)` | `sandbox_unavailable` |
 | `SandboxError(plugin_error)` / `SandboxError(protocol_error)` | `plugin_error` |
 | `SandboxError` 以外 | `internal_error` |
 
-抑制 key は `(plugin_name, content_hash, pair, bucket, result)` とする。key ごとに初回、以後 60 回抑制した次の試行（61、121、…回目）だけ activity と warning を出し、再通知に `suppressed_count=60` を載せる。成功、content hash 変更、bucket 放棄で key を解除する。抑制された結果も同じ写像を使う。cursor 不変、同 tick の break、次 tick の新 worker、scheduler 非終了は現状どおりである。live maintenance は同期 hook のままなので、束 A が保証するのは例外で scheduler を終了させないことまでであり、完了する重い plugin の wall 遅延や hook の非同期化は束 B の範囲である。
+写像に無い code の既定は従来どおり `plugin_error` だが、`sandbox_unavailable` は必ず専用行で写像する。抑制 key は `(plugin_name, content_hash, pair, bucket, result)` とする。key ごとに初回、以後 60 回抑制した次の試行（61、121、…回目）だけ activity と warning を出し、再通知に `suppressed_count=60` を載せる。`sandbox_unavailable` も同じ規律に従う。成功、content hash 変更、bucket 放棄で key を解除する。抑制された結果も同じ写像を使う。cursor 不変、同 tick の break、次 tick の新 worker、scheduler 非終了は現状どおりである。service 起動時の要求水準診断は `[plugin-worker-landlock]` の範囲とする。live maintenance は同期 hook のままなので、束 A が保証するのは例外で scheduler を終了させないことまでであり、完了する重い plugin の wall 遅延や hook の非同期化は束 B の範囲である。
 
 ### 2.6 15m 戦略で実際に見えること
 
@@ -145,12 +158,12 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | ID | 不変条件 |
 |---|---|
 | IV-1 | `sandbox_session_cpu_sec` は worker 寿命の累積 CPU 上限、既定 60、soft==hard を維持する |
-| IV-2 | CPU 判定は親 kill なし、`SIGKILL`、親観測 CPU `>= limit − 0.05 秒` の積だけで行う |
+| IV-2 | CPU 判定は親 kill なし、`SIGKILL`、親観測 CPU `>= limit − 0.05 秒` の積だけで行う。親が `load` を送る前の終了は CPU 判定に入れない |
 | IV-3 | stderr は匿名 file から技術ログへの一方向で、agent 面へ出ない |
 | IV-4 | tool/transcript/ledger/counter の公開 error は一致する |
 | IV-5 | 欠測値は推測せず `null` にする |
 | IV-6 | live failure と activity writer failure は scheduler/本来の結果を変えない |
-| IV-7 | 3 回目拒否は実測 CPU limit だけを対象にし、crash/timeout を巻き込まない |
+| IV-7 | 3 回目拒否は実測 CPU limit だけを対象にし、crash/timeout/sandbox_unavailable を巻き込まない |
 | IV-8 | wall timeout、AS/NOFILE/FSIZE/output/hash/AST、process-group cleanup を弱めない |
 | IV-9 | activity/technical log は改善 agent が読めない |
 | IV-10 | 既存 `SandboxError` の人間向け message 互換を維持する |
@@ -163,13 +176,15 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | IV-17 | 新 `backtest_cpu` は `parent_wait4` を明記し、旧 self-report 行と CPU を比較しない |
 | IV-18 | orphan リストは内部上限 64 を超えても最古を捨てず、WARNING は 1 回だけ出す |
 | IV-19 | raw grid metadata は replay 後にだけ得られ、束 A の planned call 数や CPU 予算式に使わない |
+| IV-20 | `sandbox_unavailable` は plugin のコードが読まれる前 (`load` 前) の失敗だけに付き、agent には固定 `worker_sandbox_unavailable`、固定 hint、`started:false` だけを返す。候補枠・`record_backtest_result`・CPU 観測には入れず、tool error streak には入れる。reason は固定 enum で技術ログと activity にだけ出す |
+| IV-21 | 分類は親が `load` を送ったかで分ける。`load` 前の起動 deadline 超過は `sandbox_unavailable / sandbox_startup_timeout`、親または worker が検出した継承 seccomp filter は `sandbox_unavailable / inherited_seccomp_filter`、親 kill なしの SIGSYS は `load` 後なら `crashed / sigsys_unattributed`、前なら `sandbox_unavailable / startup_sigsys_unattributed` とする。kernel log の有無・内容で公開分類を変えない |
 
 ## 4. 受入条件
 
 | ID | 観測可能な受入条件 |
 |---|---|
 | AC-1 | 正常 close と異常終了の `cpu_sec` はともに親 `wait4` rusage であり、close 応答の偽 CPU は採用しない |
-| AC-1a | `PluginStrategyIntentSource.close()` は session 参照を消す前に親観測の CPU/returncode/signal を adapter へ取り込み、outer `finally` の activity が成功・失敗ともその診断を使う。逆変異: session 参照を先に消す。殺すテスト: close 応答の偽 CPU と親 `wait4` 診断を異なる値にした成功/失敗 fixture で、activity が親診断のみを記録することを assert する |
+| AC-1a | `PluginStrategyIntentSource.close()` と起動失敗時の `_ensure_session` は session 参照を消す前に親観測の CPU/returncode/signal と `sandbox_reason` を adapter へ取り込み、outer `finally` の activity が成功・失敗ともその診断を使う。逆変異: session 参照を先に消す。殺すテスト: close 応答の偽 CPU と親 `wait4` 診断を異なる値にした成功/失敗 fixture で、activity が親診断のみを記録することを assert する |
 | AC-2 | 全 reap は単一 helper を通り、1 PID を一度だけ wait する。fake process の `wait/poll` と、2 回目の `wait4` を fail にして各 path を検証する |
 | AC-2a | reap 不能後の `UNREAPED_CLOSED` は backtest/live/close/`__exit__` から復帰し、二重 close と close→`__exit__` は kill/reap/fd close を追加しない |
 | AC-2b | helper reap 後は `Popen` wait 系 API を混在させず、実 Popen の `ECHILD` harness でも returncode を固定する |
@@ -192,16 +207,24 @@ live producer は `ActivityLog` を composition root から受け、bucket 評�
 | AC-16 | 3 回目拒否は ledger に記録し、既存 3 preflight の ledger/counter 挙動は変えない |
 | AC-17 | content hash または pair が変われば同名でも handler を再実行する |
 | AC-18 | `worker_crashed` を 3 回返しても CPU 観測数は 0、handler は 3 回実行される |
-| AC-19 | started 後の `ok/plugin_error/cpu_limit/timeout/crashed/backtest_failed` は各 1 行の `backtest_cpu` と `cpu_source=parent_wait4` を残す |
-| AC-20 | started 前失敗は `backtest_cpu` を書かない |
-| AC-21 | activity writer 例外は 6 outcome の公開結果を変えない |
-| AC-22 | live の全分類を parameterize し、cursor 不変・同 tick break・次 tick 新 PID と、1/61/121 回目だけの通知を確認する |
+| AC-19 | worker の起動を試みた後の `ok/plugin_error/cpu_limit/timeout/crashed/backtest_failed/sandbox_unavailable` は各 1 行の `backtest_cpu` と `cpu_source=parent_wait4` を残す。`sandbox_unavailable` の行は `sandbox_reason` を持ち、Popen 前の失敗では `cpu_sec`・`returncode`・`signal` が `null` |
+| AC-20 | worker の起動を試みる前の失敗 (履歴なし・pair 未宣言・3 回目拒否・loader 拒否) は `backtest_cpu` を書かない。tool 応答の `started:false` (`worker_sandbox_unavailable`) はこれに当たらない |
+| AC-21 | activity writer 例外は 7 outcome の公開結果を変えない |
+| AC-22 | live の全分類 (`sandbox_unavailable` を含む 7 種) を parameterize し、cursor 不変・同 tick break・次 tick 新 PID と、1/61/121 回目だけの通知を確認する |
 | AC-23 | live の全分類で、成功/hash 変更/bucket 放棄による key 解除後の次失敗は初回通知となる |
 | AC-24 | 実 improve worker は `logs/agentic.log` と `logs/activity.log` の open/listdir を `EACCES` で拒否する |
 | AC-25 | registry/context に両 log を読む tool/path/content がない |
 | AC-26a | config 省略時も明示 60 時も handshake は 60 |
 | AC-26b | 親診断から公開分類までの短縮 15m 相当 E2E は `worker_cpu_limit` となり、内部診断を漏らさない |
 | AC-27 | runbook は `backtest_cpu`、`plugin_eval_failed`、技術ログの死因行、`cpu_source` の非比較性、CPU 上限時の人間の選択肢と運用注意を明記する |
+| AC-28 | `SandboxError(sandbox_unavailable)` の run_backtest は `{"started": false, "error": "worker_sandbox_unavailable", "hint": <固定>}` (+ `remaining_budget`) だけを返し、候補枠が増えず、CPU 観測が 0 のまま、`tool_error:worker_sandbox_unavailable` の streak が 1 増える。`max_refusal_streak` 回で `abort_pending` が立つ |
+| AC-29 | 親が `load` を送る前に親 kill なしで SIGKILL・CPU `>= limit` で終わっても `sandbox_unavailable` とし、`cpu_limit` にしない。`load` 後の CPU 上限死は従来どおり `cpu_limit` とする |
+| AC-30 | live の `sandbox_unavailable` は `result=sandbox_unavailable` で通知され、`plugin_error` にならない。commit gate の `backtest_cpu` sink も同じ写像を使う |
+| AC-31 | `worker_sandbox_unavailable` の応答・transcript・ledger・counter・activity・例外文字列に reason 以外の内部診断を出さない。reason は activity と技術ログにだけ出す |
+| AC-32 | `load` 前の起動 deadline kill は公開 `worker_sandbox_unavailable`・`started:false`、activity `result=sandbox_unavailable sandbox_reason=sandbox_startup_timeout` とし、候補枠と CPU 観測を変えず streak を 1 増やす。`load` 後は `worker_timeout`・`started:true` で候補枠を 1 消費する |
+| AC-33 | `load` 後に親 kill なしで SIGSYS 終了した worker は公開 `worker_crashed`・`started:true`、通常の crash と同じ候補枠・tool error streak、activity `result=crashed sandbox_reason=sigsys_unattributed` とする。技術ログに固定 1 行を残し、live でも `crashed`、候補の修正要求なしとする。`load` 前は `worker_sandbox_unavailable / startup_sigsys_unattributed / started:false` とする |
+| AC-34 | `load` 後の SIGSYS は kernel log が読めない、該当行がない、`code=0x80000000` がある、のいずれでも公開 `worker_crashed` と activity `result=crashed sandbox_reason=sigsys_unattributed` から変えない |
+| AC-35 | `PluginSession` は Popen 直前に現在 thread の `/proc/thread-self/status` を検査し、`Seccomp_filters` の field 不在・読取不能・非 0 を Popen 未実行の `worker_sandbox_unavailable / inherited_seccomp_filter / started:false` とする。worker も自身の filter と Landlock の前に同じ検査を行う |
 
 ## 5. 実装 task
 
@@ -219,6 +242,10 @@ T5 運用 runbook ────────────────────�
 | T4 | mission-local CPU 観測と専用 finalization。開始前に counter/reserve/ledger の早期 return を inventory する | AC-15〜18 |
 | T5 | `docs/operations/backtest-failure-readable.md` を新設し、人間が見る activity/技術ログ、`cpu_source` の新旧非比較、`worker_cpu_limit` 時の選択肢を記載する。上限を上げる場合は再起動が必要で live にも効くと明記する | AC-27 |
 | T6 | response/transcript/ledger/last_result/prompt/report/activity の漏洩否定、Landlock/inventory、短縮 E2E、全逆変異の統合検収 | AC-11〜14、24〜26b |
+
+`sandbox_unavailable` の追加分 (AC-19〜22・29 の更新と AC-28〜35) は、束 A の T1〜T6 の後に `[plugin-worker-landlock]` の T4 (二段 protocol、共通 admission gate、全呼び出し元) と同じ task で実装する。束 A の既存テストで `result` を 6 種に固定している箇所も T4 の inventory に含める。
+
+`tools/improve_rpc_tools.py` の `started is False` による枠解放と既存 streak 経路はそのまま利用し、v1.5 のためには変更しない。
 
 ### 5.1 実装前に測る項目
 
@@ -249,12 +276,12 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 |---|---|
 | `src/agentic_fx/plugin/sandbox.py` | wait4/reap、parent kill、typed error、匿名 stderr、technical log、orphan 管理 |
 | `src/agentic_fx/plugin/worker.py` | soft==hard 維持、plugin import 前の CORE 無効化 |
-| `src/agentic_fx/loops/improve_loop.py` | 固定公開分類、全 outcome activity、`cpu_source` |
+| `src/agentic_fx/loops/improve_loop.py` | 固定公開分類、全 outcome activity、`cpu_source`、`sandbox_unavailable` の公開/result 写像、`started:false`、`sandbox_reason`、gate sink |
 | `src/agentic_fx/tools/mission_counters.py` | CPU observation map |
 | `src/agentic_fx/tools/improve_rpc_tools.py` | reserve 前の 3 回目拒否、ledger 整合 |
-| `src/agentic_fx/plugin/signal_producer.py` | live activity、result 写像、抑制/解除 |
+| `src/agentic_fx/plugin/signal_producer.py` | live activity、`sandbox_unavailable` を含む result 写像、抑制/解除 |
 | `src/agentic_fx/service.py` | `SignalProducer` への `ActivityLog` 注入、サービス終了時 orphan 回収 |
-| `docs/operations/backtest-failure-readable.md` | 人間向け failure runbook（AC-27） |
+| `docs/operations/backtest-failure-readable.md` | 人間向け failure runbook（AC-27）、`sandbox_unavailable` の reason 別対処と service 起動時診断 |
 | `tests/plugin/test_sandbox.py` | AC-1〜11、26a |
 | `tests/loops/test_improve_loop_rpc_handlers.py` | AC-12、13、19〜21 |
 | `tests/tools/test_mission_counters.py` / `tests/tools/test_improve_rpc_tools.py` | AC-13〜18 |
@@ -269,6 +296,13 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 3. **すべての `SIGKILL` を CPU 扱い**: OOM/external kill を巻き込むため採用しない。
 4. **stderr を PIPE、例外、tool、activity に載せる**: backpressure と prompt injection 面を作るため採用しない。
 5. **`worker_crashed` も 3 回目拒否する / 即 mission abort する**: 一過性失敗を恒久扱いにし、修正余地を失わせるため採用しない。
+6. **`sandbox_unavailable` を `started:true` にする**: 候補の責任でない失敗で候補枠を消費するため採用しない。再試行上限は tool error streak が担う。
+7. **`sandbox_unavailable` を tool error streak から除外する**: host 状態が直らない mission の再試行上限が弱くなるため採用しない。
+8. **`sandbox_unavailable` を 1 回で terminal refusal にする**: 一過性の起動失敗まで即時停止するため採用しない。
+9. **`sandbox_unavailable` の `backtest_cpu` を書かない**: 人間が 1 種類の activity で全試行を追えなくなるため採用しない。
+10. **Popen 前失敗の `cpu_source` を別値にする**: 新旧行の識別規則が条件付きになるため採用せず、欠測は `null` で表す。
+11. **`load` 後の SIGSYS を候補責任にする**: 同 uid 外部 signal と禁止 syscall を wait status で区別できず誤帰責になるため採用しない。
+12. **SIGSYS 専用の公開 error を増やす**: agent 面を増やさず、既存 `worker_crashed` と人間向け `sandbox_reason` で表せるため採用しない。
 
 ## 8. 人間の裁定が要る点
 
@@ -296,3 +330,4 @@ pytest や実サービスではなく、実装 task の最初に小さい proces
 | 2026-09-21 | v1.2 | `cpu_limit` 判定の許容幅を 0 → 0.05 秒 (内部定数) | 実測: RLIMIT_CPU の kill 時、親が観測する累積 CPU は上限を最大 26 ms 下回る | `4321db3` |
 | 2026-09-29 | v1.3 | §5.1 項目 1 の停止条件を v1.2 の許容幅 (0.05 秒) に揃える (「`cpu_sec < limit` で停止」は v1.1 の残骸) | astra 設計助言 2026-09-29 で矛盾を指摘 | `a300c6d` |
 | 2026-10-03 | v1.4 | §2.4 の補足: (a) 3 回目拒否の記録先は子プロセスの tool 応答 (transcript) と counters で、親の ledger・activity には出ない (「ledger に残す」はこの読み替え。拒否は handler を呼ばないため親へ届く経路が無く、追加 RPC は本束の範囲外)。本番では handler は子プロセス (`mission_worker._build_improve_registry`) で動き、子の ledger は親に読まれない。(b) 拒否は errors と streak を増やすので `max_refusal_streak` の閾値に数えられる (閾値 1 なら 1 回で abort_pending が立つ)。(c) 受付は「観測数 + 実行中の数」で判定し、同時実行での 3 回目を防ぐ | 実装レビューで同時実行の抜けと記録先の不整合を指摘 | `5ca2ede` |
+| 2026-10-04 | v1.5 | `sandbox_unavailable`、公開 `worker_sandbox_unavailable`、`started:false`、`backtest_cpu` の 7 outcome と `sandbox_reason`、live 写像、`load` 前後の timeout/SIGSYS 分類、Popen 直前の継承 seccomp preflight、IV-20・21、AC-28〜35を追加 | plugin worker 隔離の最終契約と束 A の分類を一致させるため | — |

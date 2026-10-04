@@ -3,10 +3,13 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 125 件。完了分は CLOSED.md。
 
-## 実装待ち (12)
+## 実装待ち (15)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 高 | 2026-10-03 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
+| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 高 | 2026-10-03 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
+| [plugin-worker-can-prlimit-other-processes](plugin-worker-can-prlimit-other-processes.md) | 高 | 2026-10-03 | plugin worker から同 uid の他プロセスの rlimit を書き換えられる |
 | [legacy-e2e-diag](legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [legacy-2026-08-22-a-4](legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
@@ -20,11 +23,10 @@
 | [improve-add-quotes](improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
-## 裁定待ち (7)
+## 裁定待ち (6)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 高 | 2026-10-03 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
 | [legacy-2026-08-23-e-11-m3-m7](legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 | [improve-catchup-runs-at-startup](improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [gate-noop-followup](gate-noop-followup.md) | 低 |  | fact 行が選択され得る件は kind 必須化の追随が未観測 |
@@ -32,14 +34,12 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (106)
+## 設計待ち (104)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
-| [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 高 | 2026-10-03 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
 | [gate-pytest-dev-writable-and-ldso-exec](gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
-| [plugin-worker-can-prlimit-other-processes](plugin-worker-can-prlimit-other-processes.md) | 高 | 2026-10-03 | plugin worker から同 uid の他プロセスの rlimit を書き換えられる |
 | [sandbox-escape-via-user-daemons-unmeasured](sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測 |
 | [backtest-dedup-cache](backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
