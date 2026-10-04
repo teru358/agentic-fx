@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-09-19
 closed: null
-related: [indicator-initial-set]
+related: [deployed-plugin-has-no-disable-or-rollback]
 backfilled: true
 source_section: 未完了
 ---
@@ -21,3 +21,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 中、題名: afx plugin retire が symlink 配備の指標を退役できない — 仕分け (2026-10-02、現物で成立を確認): symlink 配備の退役と、退役前の依存 strategy 表示が必要。当面は併存で運用。 根拠: switch.py:1857-1859 が symlink 配備を ValueError で拒否する。依存 strategy の検査も無い。
+- 2026-10-04: 関連: [deployed-plugin-has-no-disable-or-rollback] — 2026-10-04: 配備済み plugin の disable / rollback の設計 (deployed-plugin-has-no-disable-or-rollback) に統合して扱う (操作 API spec v1.3 §9)。

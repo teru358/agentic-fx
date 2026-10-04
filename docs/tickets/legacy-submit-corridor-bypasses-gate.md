@@ -1,6 +1,6 @@
 ---
 id: legacy-submit-corridor-bypasses-gate
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-09-12
 closed: null
@@ -10,7 +10,7 @@ source_section: 未完了
 ---
 # [legacy-submit-corridor-bypasses-gate]
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +19,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-04: 状態: 実装待ち — 2026-10-04: 操作 API spec v1.3 (docs/superpowers/specs/2026-10-04-ops-api-design.md) の T1 の範囲に含めてユーザー承認。実装は plugin worker 隔離の main 投入と脱出の実測の後。

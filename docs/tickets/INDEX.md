@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 127 件。完了分は CLOSED.md。
 
-## 実装待ち (15)
+## 実装待ち (17)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -12,6 +12,8 @@
 | [plugin-worker-can-prlimit-other-processes](plugin-worker-can-prlimit-other-processes.md) | 高 | 2026-10-03 | plugin worker から同 uid の他プロセスの rlimit を書き換えられる |
 | [legacy-e2e-diag](legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
+| [legacy-submit-corridor-bypasses-gate](legacy-submit-corridor-bypasses-gate.md) | 中 | 2026-09-12 | `afx plugin submit <name>` (live plugins/ の既存 plugin) は `ap… |
+| [load-settings-loads-dotenv-as-side-effect](load-settings-loads-dotenv-as-side-effect.md) | 中 | 2026-10-02 | 設定の検証が .env を環境に読み込む副作用を持つ |
 | [legacy-2026-08-22-a-4](legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -34,7 +36,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (106)
+## 設計待ち (104)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -47,7 +49,6 @@
 | [candidates-converge-to-example-sma](candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
 | [human-corridor-gate-rows-null-outcome](human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [improve-targeted-run](improve-targeted-run.md) | 中 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
-| [legacy-submit-corridor-bypasses-gate](legacy-submit-corridor-bypasses-gate.md) | 中 | 2026-09-12 | `afx plugin submit <name>` (live plugins/ の既存 plugin) は `ap… |
 | [first-run-setup](first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 | [retire-symlink-deployed-plugin](retire-symlink-deployed-plugin.md) | 中 | 2026-09-19 | afx plugin retire が symlink 配備の指標を退役できない |
 | [policy-add-unwired-in-service](policy-add-unwired-in-service.md) | 中 | 2026-09-20 | `service.py:1054` の `Commands(...)` に `policy_path` を渡していない… |
@@ -63,7 +64,6 @@
 | [full-suite-fd-over-1024-breaks-shell-tests](full-suite-fd-over-1024-breaks-shell-tests.md) | 中 | 2026-10-02 | 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる |
 | [gate-pytest-tail-stored-in-last-result](gate-pytest-tail-stored-in-last-result.md) | 中 | 2026-10-02 | gate の pytest 出力末尾が次回の改善 mission の材料になる |
 | [improve-handler-unexpected-exception-text-reaches-agent](improve-handler-unexpected-exception-text-reaches-agent.md) | 中 | 2026-10-02 | 改善 mission の handler で想定外例外の文面が agent に届く |
-| [load-settings-loads-dotenv-as-side-effect](load-settings-loads-dotenv-as-side-effect.md) | 中 | 2026-10-02 | 設定の検証が .env を環境に読み込む副作用を持つ |
 | [news-fetch-no-user-agent-yahoo-429](news-fetch-no-user-agent-yahoo-429.md) | 中 | 2026-10-02 | ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す |
 | [plugin-ast-check-bypass-via-library-attributes](plugin-ast-check-bypass-via-library-attributes.md) | 中 | 2026-10-02 | plugin がライブラリの属性経由で os に届き、コード検査を回避できる |
 | [repo-readme-empty](repo-readme-empty.md) | 中 | 2026-10-02 | README.md が 0 バイト |

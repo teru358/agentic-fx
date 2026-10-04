@@ -1,7 +1,7 @@
 ---
 id: load-settings-loads-dotenv-as-side-effect
 title: 設定の検証が .env を環境に読み込む副作用を持つ
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-02
 closed: null
@@ -9,7 +9,7 @@ related: []
 ---
 # [load-settings-loads-dotenv-as-side-effect] 設定の検証が .env を環境に読み込む副作用を持つ
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -26,3 +26,4 @@ config.load_settings が load_dotenv() を引数なしで呼ぶ (config.py:742-7
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-04: 状態: 実装待ち — 2026-10-04: 操作 API spec v1.3 (docs/superpowers/specs/2026-10-04-ops-api-design.md) の T1 の範囲に含めてユーザー承認。実装は plugin worker 隔離の main 投入と脱出の実測の後。
