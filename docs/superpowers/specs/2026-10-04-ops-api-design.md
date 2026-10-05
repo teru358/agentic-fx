@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.4
+# [ops-api] 操作 API と client 契約設計 v1.5
 
-版: v1.4
+版: v1.5
 
 日付: 2026-10-05
 
@@ -10,7 +10,7 @@
 
 ## 要点
 
-- API は agentic-fx daemon の同一プロセス内で動く有界な UDS HTTP server とし、全 endpoint を初回リリースから公開する。実装着手前に plugin worker 隔離を投入し、UDS listener と鍵を有効化する T3 の前に改善 mission worker の seccomp を投入するため、機能を段階開放する実行時状態は持たない。
+- API は agentic-fx daemon の同一プロセス内で動く有界な UDS HTTP server とし、全 endpoint を初回リリースから公開する。実装着手前に plugin worker 隔離を投入し、改善 mission worker の seccomp は実装の着手条件ではなく **運用上の有効化 (listener を開く) の条件** とし、seccomp 投入まで `api.enabled` の既定を false にする。機能を段階開放する実行時状態は持たない。
 - 認証は導入インスタンス固有の principal 鍵で行い、GET も用途別 scope で最小権限化する。承認、kill switch 解除とその回復確定、価格源復帰は approver に限る。発注、SL 変更、クローズ、資金保護の無効化、`autopilot on`、サービス停止は API に出さない。
 - 鍵は `~/.config/agentic-fx/api/<instance_id>/` に principal ごとの別ファイルで置く。`.ready` は鍵集合の commit marker とし、client は鍵を生成しない。
 - 承認画面は既存の `approval_facts` が親の受理・計測・状態遷移として記録した `parent_facts` と、agent の自己申告 `agent_claims` を分けて表示する。決定内容の digest を再照合し、`decided_by` は要求本文でなく認証 principal からサーバが記録する。
@@ -26,7 +26,7 @@
 
 ### 1.2 実装着手の条件
 
-**前提: plugin worker 隔離が main に投入されていること (2026-10-05 `afdfb81` で充足)。** sandbox から他デーモン経由の脱出は実測せず塞ぐ (チケット `sandbox-escape-via-user-daemons-unmeasured`、2026-10-04 ユーザー裁定 案 1): 改善 mission worker への seccomp 投入を **T3 (UDS listener と鍵の有効化) の着手ゲート** とする。T1・T2 は server を公開しないので seccomp と独立に着手できる。人手実測はチケット `escape-probe-manual-measurement` で別途扱う。
+**前提: plugin worker 隔離が main に投入されていること (2026-10-05 `afdfb81` で充足)。** sandbox から他デーモン経由の脱出は実測せず塞ぐ (チケット `sandbox-escape-via-user-daemons-unmeasured`、2026-10-04 ユーザー裁定 案 1): 改善 mission worker への seccomp 投入 (別設計 `improve-cli-seccomp`、plugin worker 隔離と同規模) は **実装の着手条件ではなく、運用上 listener を開く条件** とする (2026-10-05 ユーザー裁定 案 2: 最終的な結果が変わらないこと)。T1〜T5 は seccomp と並行して進め、seccomp 投入まで `api.enabled` の既定は false (daemon は警告のみ、§5)。seccomp 投入後に既定を true へ変える変更を seccomp 束の完了条件に含める。人手実測はチケット `escape-probe-manual-measurement` で別途扱う。
 
 trade worker の Landlock はこの前提に含めない。trade profile の `ClaudeRunner` の argv を `--tools StructuredOutput,ToolSearch` に pin し、LocalRunner の registry を読み取り専用に固定する。trade worker 自体の Landlock は別チケットとする。
 
@@ -294,7 +294,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |AC-2|鍵なし / 不一致は 401、operator の decide / local_guard は 403、approver は成功する|
 |AC-3|service 子 process は正しい鍵でも本文読取前に 403、activity と notifier に記録。二重 fork は既知の限界として通る再現 test を持つ|
 |AC-3b|接続直後に peer が exit し pidfd が `Pid:-1`、または pid 不一致なら 403|
-|AC-4|**前提側へ移管**。隔離は実装着手条件 (§1.2)、改善 worker の seccomp は T3 の着手ゲートとして先に受入済みとし、本束では重複実装・重複検収しない|
+|AC-4|**前提側へ移管**。隔離は実装着手条件 (§1.2)、改善 worker の seccomp は運用上の有効化条件 (`api.enabled` 既定 false) として別束で受け入れ、本束では重複実装・重複検収しない|
 |AC-5|token dir を隔離 allowlist 内、`/etc`、venv、`/proc` に置くと API を起動せず `token_dir_in_sandbox` を記録する|
 |AC-6|0644 の鍵 principal は読み込まず 401、他 principal は動く|
 |AC-7|起動後 env、`/proc/self/environ`、worker env、log、activity に鍵文字列が無い|
@@ -360,7 +360,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |---|---|---|---|---|---|
 |T1 config / corridor|dotenv 明示化、legacy submit 拒否、既存 policy / secret env 配線と trade tool pin の結合確認|`config.py`、service / CLI entry、`plugin/approval.py`、`backtest/cli.py`、tests|着手条件 (隔離投入)|AC-31、39〜41|T2 と可（所有分離）|
 |T2 ops core|schema、error、2 レーン、deadline-aware StateStore / approval facts 利用、backlog 条件更新、bounded flock、job、全変更要求の crash 回復を含む監査・冪等状態機械、event 投影|`ops/`、`store/db.py`、`store/state.py`、`store/backlog.py`、`plugin/switch.py`、`core/improve_supervisor.py`、`commands.py`、tests|着手条件 (隔離投入)、V-4 (T2 内の最初の gate として消化し、30 秒・AC-14・AC-24 の閾値を確定してから deadline / queue 容量 / flock 待機を固定する)|AC-8〜13、23〜26、32〜38、45、48 (journal 結果の追記と reflect 冪等の部分)、49、50 (回復規則)、52|T1 と可、内部は直列|
-|T3 keys / server|鍵 lifecycle、rotate / revoke、設定、UDS listener、peer / auth / scope、上限、起動停止と service 配線|`ops/keys.py`、`ops/api_server.py`、`service.py`、`config/settings.yaml.example`、tests|T1、T2、改善 mission worker の seccomp 投入 (§1.2)|AC-1〜3b、5〜7、14〜17、21〜22、27、29、43、46、50 (起動順序)、51|不可|
+|T3 keys / server|鍵 lifecycle、rotate / revoke、設定、UDS listener、peer / auth / scope、上限、起動停止と service 配線|`ops/keys.py`、`ops/api_server.py`、`service.py`、`config/settings.yaml.example`、tests|T1、T2 (`api.enabled` 既定 false、§1.2)|AC-1〜3b、5〜7、14〜17、21〜22、27、29、43、46、50 (起動順序)、51|不可|
 |T4 CLI client|`afx ctl`、対話、server 認証、確認、sanitizer、job / event polling、key command|`ops/client.py`、entry、tests|T3、V-10|AC-18〜20、28、30、53|不可|
 |T5 integration / docs|worker の Landlock 鍵隔離、実 process、pty、負荷、鍵漏洩 runbook、運用文書。「承認後の回復手段は未整備」を明記|tests、運用 docs|T4|本束に残る AC 全件（移管済み AC-4、44、47 を除く）、特に AC-42、48 (journal phase × crash 点、reset / reconcile / reflect retry の crash 点の実 process 試験)、49 (mode 遷移)|不可|
 
@@ -404,3 +404,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-04|v1.2|設計レビュー r3 と裁定を反映。`afx-ops` / Discord cog 契約を次束へ移し、初版 principal を2つに限定。全変更要求の crash 回復と event の保証境界を改訂|
 |2026-10-04|v1.3|設計レビュー r4 (収束) と裁定を反映。queued job の開始時 autopilot 再確認、起動順序 (journal reconcile → ops 回復)、`killswitch reconcile` と reflection GET の追加 (endpoint 24 本)、`reflect retry` の冪等 key と試行識別子、対象チケットの整理、I-32〜35、AC-49〜53。`killswitch reconcile` は autopilot 中も許可、個数 (24 / 変更系 15 / 冪等 key 5 / `local_guard` 3) を数え直して一致|
 |2026-10-05|v1.4|着手条件を改訂。脱出実測を廃し (ユーザー裁定 案 1)、改善 mission worker の seccomp 投入を T3 の着手ゲートに移した。T1・T2 は隔離投入のみを条件に着手可。V-4 の計測内容を具体化 (root 一式の隔離複製、3 条件 × 20 回、tick 差の同時観測)。sol advise 2026-10-05|
+|2026-10-05|v1.5|改善 worker の seccomp を T3 の着手ゲートから運用上の有効化条件へ (ユーザー裁定 案 2)。seccomp 投入まで `api.enabled` 既定 false|
