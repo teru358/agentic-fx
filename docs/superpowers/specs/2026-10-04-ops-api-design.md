@@ -385,7 +385,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 
 |ID|未決|実装前の扱い|
 |---|---|---|
-|V-4|実 DB / 稼働負荷での approve、flock、tick latency|T2 の最初の gate として測る。DB だけでなく version dir・journal・symlink を含む root 一式の隔離複製上で `approve_candidate` を無競合 / flock 競合 / core 書込み 100 ms 間隔の 3 条件 × 20 回走らせ、approve 総時間・flock 待機 / 保持・SQLite busy・tick p95 / p99 / max を同一時系列で採り、30 秒と AC-14 / AC-24 の閾値を確定する。bless の gate 所要は approve latency の代理にしない (approve は gate を再実行しない)|
+|V-4|**実測済 (2026-10-05、`tmp/impl-ops/v4/result.md`)**: approve 無競合 p99 22 ms、flock 待機 = 保持 + 約 20 ms、core write 競合で SQLite busy 0、tick 差 p99 +0.01 ms|同期 deadline 5 秒と `plugin_busy` 30 秒を維持、決定 job deadline は 35 秒以上、AC-14 / AC-24 の閾値は維持|
 |V-10|`/proc/locks` から instance lock holder を一意取得できるか|T4 前に実測。不能なら弱い pid file fallback ではなく client 認証方式を再設計する|
 
 `ops_requests` は無期限、idempotency key は 24 時間、trade worker は信頼境界内、鍵 `.ready` の意味、全 endpoint の初期公開、全変更要求の accepted-only 回復、event の保証境界は裁定済みであり未決ではない。外部 client の principal 追加と `enroll` は本書の未決ではなく次の `afx-ops` 束へ移した。旧 R-1 は未決から外し、チケット `deployed-plugin-has-no-disable-or-rollback` の設計時に通常退役と緊急 disable / rollback の責務を決め、`retire-symlink-deployed-plugin` をそこへ統合する。
