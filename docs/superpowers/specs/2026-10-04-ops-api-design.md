@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.5
+# [ops-api] 操作 API と client 契約設計 v1.6
 
-版: v1.5
+版: v1.6
 
 日付: 2026-10-05
 
@@ -230,7 +230,7 @@ daemon は API listener を開く前に、次の順で起動時回復を行う�
 
 `reflect retry` の冪等化は二重の保護を持つ。(1) `Idempotency-Key` により応答喪失後の同じ要求の再送は保存応答を返し、clear を繰り返さない。(2) 試行記録の識別子による条件付き clear により、clear 後に reflection 処理が新しい失敗試行を記録した後でも、古い識別子を持つ要求がその新しい記録を消さない。識別子は現物の台帳 `reflection_attempts` に既にある `attempts` と `last_attempt_at` の組を使い、新しい列は足さない。clear 後の最初の bump でも `last_attempt_at` が進むため、`attempts` が同じ値に戻っても区別できる。
 
-`policy` は要求本文を idempotency request id 付きの canonical DB record として一度だけ保存し、`directives_path(root)` の file はその順序付き record 集合から一時 file + fsync + atomic replace + dir fsync で再生成する。file append 自体を副作用の正にしないため、file 更新後・終端監査前に crash しても再送や復旧で同じ directive を二重追記しない。
+`policy` は要求本文を idempotency request id 付きの canonical DB record として一度だけ保存し、`directives_path(root)` の file は、利用者が手で書いた既存行を保ったまま、record 由来の行だけをその順序付き record 集合から作り直し (record 由来の行は末尾に並ぶ)、一時 file + fsync + atomic replace + dir fsync で書き換える。`directives.md` は利用者方針チャネルであり、API の record 集合から全文再生成すると手書きの方針が消えるため。file append 自体を副作用の正にしないため、file 更新後・終端監査前に crash しても再送や復旧で同じ directive を二重追記しない。
 
 activity は best-effort の人向け投影で、読み取り要求は DEBUG、変更要求は固定 event と audit id を記録する。認証失敗、peer 拒否、上限拒否は分類ごとに 1 分の最初の 5 件だけ個別記録し、30 秒周期、分境界、shutdown の 3 契機で suppressed 件数を flush する。`activity.log` 自体の無期限増加は `activity-log-grows-without-rotation` に残す。
 
@@ -405,3 +405,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-04|v1.3|設計レビュー r4 (収束) と裁定を反映。queued job の開始時 autopilot 再確認、起動順序 (journal reconcile → ops 回復)、`killswitch reconcile` と reflection GET の追加 (endpoint 24 本)、`reflect retry` の冪等 key と試行識別子、対象チケットの整理、I-32〜35、AC-49〜53。`killswitch reconcile` は autopilot 中も許可、個数 (24 / 変更系 15 / 冪等 key 5 / `local_guard` 3) を数え直して一致|
 |2026-10-05|v1.4|着手条件を改訂。脱出実測を廃し (ユーザー裁定 案 1)、改善 mission worker の seccomp 投入を T3 の着手ゲートに移した。T1・T2 は隔離投入のみを条件に着手可。V-4 の計測内容を具体化 (root 一式の隔離複製、3 条件 × 20 回、tick 差の同時観測)。sol advise 2026-10-05|
 |2026-10-05|v1.5|改善 worker の seccomp を T3 の着手ゲートから運用上の有効化条件へ (ユーザー裁定 案 2)。seccomp 投入まで `api.enabled` 既定 false|
+|2026-10-05|v1.6|policy file の再生成を「record 由来の行だけを作り直し、手書き行は保つ」に (T2 実装時の逸脱を採用。全文再生成は利用者の手書き方針を消す)|
