@@ -26,3 +26,4 @@ plugin worker の RLIMIT_NPROC=512 は uid 全体のプロセス・スレッド�
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-05: 優先: 低 — 2026-10-05: process 生成は seccomp (fork/vfork/clone/execve EPERM) で閉じたことを E2E で確認。NPROC 512 は thread 可用性だけに効き、uid の task 数が多い host では worker 内で thread を作れない (単一 thread env で運用)。値の見直しだけが残る。

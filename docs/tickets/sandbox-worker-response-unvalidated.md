@@ -1,15 +1,15 @@
 ---
 id: sandbox-worker-response-unvalidated
 title: worker 応答の pid と error 文字列が無検証で session とログに入る
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-09-30
-closed: null
+closed: 2026-10-05
 related: [worker-death-cause-observed-by-parent]
 ---
 # [sandbox-worker-response-unvalidated] worker 応答の pid と error 文字列が無検証で session とログに入る
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,6 +23,9 @@ plugin worker の応答に含まれる pid が検証なしで session.pid に入
 
 ## 修正内容
 
+- 2026-10-05: 二段 protocol で pid を Popen.pid と照合、応答の field と型を検証、error 文字列は untrusted_text で整形してから使う
+
 ## 経緯
 
 - 2026-09-30: 起票。
+- 2026-10-05: 是正内容 — 二段 protocol で pid を Popen.pid と照合、応答の field と型を検証、error 文字列は untrusted_text で整形してから使う

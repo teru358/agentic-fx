@@ -272,3 +272,40 @@ def test_real_cpu_limit_twice_then_the_third_identical_run_is_refused(tmp_path):
                      "stderr", "pid"):
             assert text not in sink
         assert not re.search(r"\d+\.\d{2,}", sink)
+
+
+# --- worker 由来の文字列が agent の面に出ない ------------------------------------
+
+_WS_MARKER = "MARKER_FROM_PLUGIN_7f3a"
+
+_WS_PLUGINS = {
+    # 例外メッセージと stdout に目印を入れて失敗する
+    "raises": (
+        "import pandas as pd\n\n\n"
+        "def evaluate(df, indicators, signals, params):\n"
+        f"    print({_WS_MARKER!r}, flush=True)\n"
+        f"    raise ValueError({_WS_MARKER!r})\n"),
+    # 最後まで走り、戻り値の rationale と stdout に目印を入れる
+    "succeeds": (
+        "import pandas as pd\n\n\n"
+        "def evaluate(df, indicators, signals, params):\n"
+        f"    print({_WS_MARKER!r}, flush=True)\n"
+        f"    return {{'action': 'hold', 'rationale': {_WS_MARKER!r}}}\n"),
+}
+
+
+@pytest.mark.parametrize("kind", ["raises", "succeeds"])
+def test_run_backtest_response_carries_no_string_from_the_worker(tmp_path, kind):
+    loop, conn, root, activity = _improve_env_with_activity(tmp_path)
+    fx.seed_history(conn)
+    ctx = _prepare_ctx(loop, now=fx.NOW)
+    cand = ctx.staging_dir / "probe"
+    cand.mkdir(parents=True)
+    (cand / "plugin.py").write_text(_WS_PLUGINS[kind], encoding="utf-8")
+    (cand / "config.yaml").write_text(_CONFIG, encoding="utf-8")
+    (cand / "test_plugin.py").write_text(_TEST_PY, encoding="utf-8")
+
+    raw, entries = _call_through_registry(ctx)
+
+    for sink in (raw, json.dumps(entries, default=str), _activity_text(activity)):
+        assert _WS_MARKER not in sink

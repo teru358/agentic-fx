@@ -869,6 +869,11 @@ _FAILURE_CASES = [
                  id="protocol_error"),
     pytest.param(SandboxError("x"), "plugin_error", id="default_code"),
     pytest.param(RuntimeError("x"), "internal_error", id="non_sandbox"),
+    pytest.param(SandboxError("x", code="sandbox_unavailable",
+                              sandbox_reason="inherited_seccomp_filter"),
+                 "sandbox_unavailable", id="sandbox_unavailable"),
+    pytest.param(SandboxError("x", code="crashed", sandbox_reason="sigsys_unattributed"),
+                 "crashed", id="crashed_sigsys"),
 ]
 
 
@@ -1190,3 +1195,93 @@ def test_failure_keys_of_a_live_plugin_are_kept_across_ticks(tmp_path):
     _run_many(producer, conn, [meta], now, sandbox)
     assert set(producer._failure_notices) == set(before)
     assert all(v == 2 for v in producer._failure_notices.values())
+
+
+@pytest.mark.parametrize("exc, expected", [
+    pytest.param(SandboxError("x", code="sandbox_unavailable",
+                              sandbox_reason="runtime_fingerprint_selftest_failed"),
+                 " sandbox_reason=runtime_fingerprint_selftest_failed", id="unavailable"),
+    pytest.param(SandboxError("x", code="crashed", sandbox_reason="sigsys_unattributed"),
+                 " sandbox_reason=sigsys_unattributed", id="sigsys"),
+    pytest.param(SandboxError("x", code="crashed"), "", id="crashed"),
+    pytest.param(SandboxError("x", code="timeout", sandbox_reason="sigsys_unattributed"),
+                 "", id="reason-on-other-code"),
+])
+def test_live_failure_activity_carries_the_sandbox_reason_only_for_its_two_results(
+        tmp_path, exc, expected):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(kind="signal", timeframe="1h")
+    activity = _RecordingActivity()
+    _run(SignalProducer(), conn, meta, H + timedelta(hours=1),
+         _AlwaysFailingSandbox(exc), activity)
+    (line,) = activity.failures()
+    assert ("sandbox_reason=" in line) == bool(expected)
+    if expected:
+        assert expected in line
+
+
+def test_live_tick_without_isolation_emits_no_signal_and_keeps_the_cursor(
+        tmp_path, monkeypatch):
+    """実 PluginSession で admission が失敗する host: worker を起こさず、signal を
+    出さず、cursor を進めず、次 tick にまた試みる (scheduler は止まらない)。"""
+    from agentic_fx.core import runtime_fingerprint
+    from agentic_fx.plugin import sandbox as sandbox_module
+
+    monkeypatch.setattr(sandbox_module, "_RUNTIME_ADMISSION",
+                        runtime_fingerprint.RuntimeAdmission(
+                            selftest=lambda: runtime_fingerprint.SelftestOutcome(False, "x"),
+                            supported=()))
+    monkeypatch.setattr(sandbox_module, "_ADMISSION_RESULT", None)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    d = tmp_path / "sig"
+    d.mkdir()
+    (d / "plugin.py").write_text("def detect(df, params):\n    return []\n")
+    (d / "config.yaml").write_text("kind: signal\n")
+    from agentic_fx.plugin.loader import content_hash
+    meta = PluginMeta(name="sig", kind="signal", path=d, params={}, timeframe="1h",
+                      pairs=("USDJPY",), max_bars=2, content_hash=content_hash(d))
+    producer = SignalProducer()
+    activity = _RecordingActivity()
+    for _ in range(2):
+        assert producer.evaluate_due_plugins(
+            conn, plugins=[meta], now=H + timedelta(hours=1), source=SOURCE,
+            settings=SETTINGS, resolved_by_identity={}, activity=activity) == 0
+    assert producer._cursor.get(("sig", meta.content_hash, "USDJPY")) is None
+    (line,) = activity.failures()
+    assert "result=sandbox_unavailable" in line
+    assert "sandbox_reason=runtime_fingerprint_selftest_failed" in line
+    assert conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
+
+
+def test_one_failing_session_close_does_not_skip_the_next(tmp_path):
+    from unittest.mock import patch
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    metas = [_meta(name="a", kind="signal", timeframe="1h", content_hash="a" * 64),
+             _meta(name="b", kind="signal", timeframe="1h", content_hash="b" * 64)]
+    closed: list[str] = []
+
+    class _Session:
+        def __init__(self, m, *, settings, resolved=None) -> None:
+            self.name = m.name
+
+        def __enter__(self):
+            return self
+
+        def call(self, payload):
+            return {"signals": []}
+
+        def close(self) -> None:
+            closed.append(self.name)
+            if self.name == "a":
+                raise RuntimeError("close failed")
+
+    with patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
+               _Session):
+        SignalProducer().evaluate_due_plugins(
+            conn, plugins=metas, now=H + timedelta(hours=1), source=SOURCE,
+            settings=SETTINGS, resolved_by_identity={}, activity=None)
+    assert closed == ["a", "b"]

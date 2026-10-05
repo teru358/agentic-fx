@@ -28,6 +28,7 @@ from pathlib import Path
 import yaml
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.core import plugin_files
 
 _log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ DEFAULT_MAX_BARS = 200
 # C7)。巨大ファイルで discovery が資源を食い潰すのを防ぐ。テストは
 # monkeypatch でこの定数を小さくして高速化してよい (関数内で毎回この
 # モジュール属性を参照するため monkeypatch が効く)。
-_MAX_FILE_BYTES = 1_048_576  # 1 MiB
+_MAX_FILE_BYTES = plugin_files.MAX_PLUGIN_FILE_BYTES  # 1 MiB (worker の loader と同じ出所)
 
 
 class _NoDuplicateKeySafeLoader(yaml.SafeLoader):
@@ -159,11 +160,11 @@ def content_hash(plugin_dir: Path) -> str:
     承認 (Task 6) と signals 書き込み (Task 7/8) はこの関数だけを呼ぶ。
     `version_store.content_hash_bytes` の薄いラッパ (レビュー1周目 M2、設計書 §5.2) —
     式の実体は `version_store` 側の 1 箇所にのみ存在する。
+    各ファイルは上限 (`plugin_files.MAX_PLUGIN_FILE_BYTES`) + 1 bytes までしか読まない。
+    超過は `plugin_files.PluginFileTooLarge` (ValueError)。巨大ファイルを置かれても
+    hash の計算でメモリがファイル量に比例して増えないようにする。
     """
-    from agentic_fx.plugin import version_store
-    plugin_bytes = (plugin_dir / "plugin.py").read_bytes()
-    config_bytes = (plugin_dir / "config.yaml").read_bytes()
-    return version_store.content_hash_bytes(plugin_bytes, config_bytes)
+    return plugin_files.content_hash_of_dir(plugin_dir)
 
 
 def _reject(name: str, reason: str) -> None:

@@ -5353,3 +5353,97 @@ def test_policy_add_target_is_mission_injection_source(tmp_path):
             encoding="utf-8")
     finally:
         app.close()
+
+
+# --- plugin worker の隔離: 起動時の eager 診断 --------------------------------
+
+def _sandbox_log_lines(tmp_path) -> list[str]:
+    """技術ログの、起動時診断の行 (時刻を除いた `LEVEL logger: message`)。"""
+    text = (tmp_path / "logs" / "agentic.log").read_text(encoding="utf-8")
+    return [line.split(" UTC ", 1)[1] for line in text.splitlines()
+            if "plugin sandbox " in line]
+
+
+def _run_once(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        return run_service(tmp_path, daemon=True, _stop_event=stop_event)
+
+
+def test_run_service_logs_the_plugin_sandbox_admission_and_kernel_log_eagerly(
+        tmp_path, monkeypatch, caplog):
+    import logging
+
+    from agentic_fx.core import runtime_fingerprint, seccomp
+    from agentic_fx.plugin import sandbox
+
+    runs = []
+    monkeypatch.setattr(sandbox, "_RUNTIME_ADMISSION", runtime_fingerprint.RuntimeAdmission(
+        selftest=lambda: runs.append(1) or runtime_fingerprint.SelftestOutcome(False, "x"),
+        supported=()))
+    monkeypatch.setattr(sandbox, "_ADMISSION_RESULT", None)
+    monkeypatch.setattr(sandbox.seccomp, "check_kernel_log",
+                        lambda **_k: seccomp.KERNEL_LOG_PERMISSION)
+    caplog.set_level(logging.INFO, logger="agentic_fx.service")
+
+    assert _run_once(tmp_path) == 0   # 隔離できなくても service は起動・停止する
+
+    assert runs == [1]
+    lines = _sandbox_log_lines(tmp_path)
+    assert lines == [
+        "WARNING agentic_fx.service: plugin sandbox admission: unavailable "
+        "sandbox_reason=runtime_fingerprint_selftest_failed — plugin の評価は行わない "
+        "(signal・strategy・indicator の評価ごとに sandbox_unavailable になる)",
+        "WARNING agentic_fx.service: plugin sandbox kernel log: "
+        "kernel_log_unreadable:permission"]
+    # 同じ process の以後の session は自己試験をやり直さない
+    assert sandbox.runtime_admission().reason == "runtime_fingerprint_selftest_failed"
+    assert runs == [1]
+
+
+def test_run_service_logs_a_healthy_plugin_sandbox_at_info(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from agentic_fx.core import seccomp
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox.seccomp, "check_kernel_log",
+                        lambda **_k: seccomp.KERNEL_LOG_READABLE)
+    caplog.set_level(logging.INFO, logger="agentic_fx.service")
+    if sandbox.host_preflight()[0] is not None:
+        pytest.skip("this host cannot isolate plugin workers")
+
+    assert _run_once(tmp_path) == 0
+
+    lines = _sandbox_log_lines(tmp_path)
+    assert lines[0].startswith("INFO agentic_fx.service: plugin sandbox admission: ok ")
+    assert lines[1] == ("INFO agentic_fx.service: plugin sandbox kernel log: "
+                        "kernel_log_readable")
+
+
+def test_run_service_starts_even_if_the_sandbox_diagnostics_raise(tmp_path, monkeypatch):
+    def boom():
+        raise RuntimeError("diagnostics broke")
+
+    monkeypatch.setattr("agentic_fx.service.startup_diagnostics", boom)
+    assert _run_once(tmp_path) == 0
+
+
+def test_sandbox_diagnostics_run_off_the_main_startup_thread(tmp_path, monkeypatch):
+    """起動時診断は同期経路から外す — 資金保護 (scheduler) の起動を止めないよう、
+    admission (最大 120 秒) と journalctl (最大 5 秒) を別 thread で走らせる。"""
+    main_ident = threading.get_ident()
+    seen: dict = {}
+
+    def diag():
+        seen["ident"] = threading.get_ident()
+        return []
+
+    monkeypatch.setattr("agentic_fx.service.startup_diagnostics", diag)
+    assert _run_once(tmp_path) == 0
+    assert seen.get("ident") is not None
+    assert seen["ident"] != main_ident

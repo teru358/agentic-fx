@@ -193,8 +193,12 @@ class SignalProducer:
                     conn, meta, pair, now=now, source=source, call=_call,
                     settings=settings, activity=activity)
         finally:
+            # 1 本の close の失敗で後続の session の後始末を飛ばさない
             for session in sessions.values():
-                session.close()
+                try:
+                    session.close()
+                except Exception:  # noqa: BLE001
+                    _log.warning("plugin session close failed", exc_info=True)
         return inserted
 
     def _evaluate_one(self, conn: "sqlite3.Connection", meta: PluginMeta,
@@ -280,7 +284,8 @@ class SignalProducer:
         self._failure_notices[key] = count
         if count % _NOTICE_INTERVAL != 1:
             return
-        suffix = (f" suppressed_count={_NOTICE_INTERVAL}" if count > 1 else "")
+        suffix = _sandbox_reason_suffix(result, exc)
+        suffix += (f" suppressed_count={_NOTICE_INTERVAL}" if count > 1 else "")
         _log.warning(
             "plugin %s (%s): evaluation failed at bucket %s (%s) result=%s — "
             "cursor not advanced, retry next tick",
@@ -379,6 +384,7 @@ _SANDBOX_CODE_TO_RESULT = {
     "crashed": "crashed",
     "plugin_error": "plugin_error",
     "protocol_error": "plugin_error",
+    "sandbox_unavailable": "sandbox_unavailable",
 }
 
 
@@ -391,6 +397,17 @@ def _write_activity(activity, event: str, summary: str, ref_id: str) -> None:
         activity.write(Category.TECH, event, summary, ref_id=ref_id)
     except Exception:  # noqa: BLE001 — 記録の失敗で評価を止めない
         _log.warning("plugin %s: failed to write %s activity", ref_id, event)
+
+
+def _sandbox_reason_suffix(result: str, exc: Exception) -> str:
+    """`sandbox_unavailable` と SIGSYS による `crashed` にだけ固定 enum の reason を足す。"""
+    reason = getattr(exc, "sandbox_reason", None)
+    if not isinstance(exc, plugin_sandbox.SandboxError) or not isinstance(reason, str):
+        return ""
+    if result == "sandbox_unavailable" or (
+            result == "crashed" and reason == "sigsys_unattributed"):
+        return f" sandbox_reason={reason}"
+    return ""
 
 
 def _failure_result(exc: Exception) -> str:

@@ -39,16 +39,33 @@ stdin/stdout の JSON 1 行ずつで `call()` を繰り返せる。`run_plugin` 
 すること。これは sandbox.py/worker.py だけが知っていればよい内部契約
 であり、他モジュールから import して使うものではない)**:
 
-- handshake (セッション開始直後に親から送る 1 行のみ):
-  `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int, "kind": "indicator"|"signal"|"strategy"}`
-- ready (handshake に対する worker からの応答。plugin.py の import が
-  成功したら送られる。**この 1 行だけは call() の応答ではなく起動応答**
-  であり、`sandbox_timeout_sec` ではなく別枠の起動タイムアウトで待つ):
-  `{"ok": true, "ready": true, "pid": int}` /
-  `{"ok": false, "ready": false, "error": "<message>"}`
-- request (call() のたびに親が送る 1 行):
-  - kind=indicator/signal: `{"df": <df wire>, "params": {...}}`
-  - kind=strategy: `{"df": <df wire>, "indicators": {...}, "signals": [...], "params": {...}}`
+起動は二段 (詳細と各行の形は worker.py の docstring):
+
+1. 親は全 session 共通の admission (host の要求水準 → runtime fingerprint →
+   集合外なら代表自己試験) を通し、`Popen` の直前に現在 thread の継承 seccomp
+   filter を検査してから `python -B -m agentic_fx.plugin.worker` を起こす。
+2. handshake (`attest_nonce`・`content_hash` を含む) を送り、`sandbox_ready` を
+   読む。attestation を固定の順で検査し (`verify_sandbox_ready`)、受信側に余分な
+   行が無いこと、子の全 task の `/proc` status を確かめてから `{"op": "load"}` を
+   送る。どれかに通らなければ load を送らずに kill し `sandbox_unavailable`。
+3. `plugin_ready` を読む。起動の deadline は handshake の直前に 1 つだけ作り、
+   ここまでの全段で共有する。
+
+分類は「親が load を送ったか」で分ける。load 前の失敗・timeout・SIGSYS は
+`sandbox_unavailable` (reason 別)、load 後の SIGSYS (親 kill なし) は原因未確定の
+`crashed / sigsys_unattributed`。
+
+**load の後に worker から届く行は、すべて候補が制御し得る入力として扱う**
+(plugin は worker と同じ process で protocol fd へ直接書ける)。親は次を自分で
+担保し、worker 側の整形に頼らない: パースの例外はどれも protocol 違反 (NaN・
+重複キーも拒否)、要求ごとの乱数 id と応答の照合、要求の前に届いていた行と
+1 要求への複数行の拒否、死を観測した worker の残した行の不採用、応答の `pid` は
+`Popen.pid` との照合だけ、戻り値は kind 別に親で検証 (indicator の系列長は親が
+渡した df の index で)、worker 由来の文字列は `untrusted_text` を通してから例外・
+ログへ出す。request id は応答の出所の証明ではなく (plugin も id を観測できる)、
+ずれと先回りを排除するためのもの。
+
+- request (call() のたびに親が送る 1 行): `{"df": <df wire>, "params": {...}, "id": "<hex>"}`
   - df wire (DataFrame の JSON 安全な表現。**index は UTC の ISO8601
     文字列**、カラムは OHLCV の 5 本固定):
     `{"index": [iso8601 str, ...], "open": [...], "high": [...],
@@ -57,13 +74,10 @@ stdin/stdout の JSON 1 行ずつで `call()` を繰り返せる。`run_plugin` 
     表現 (repr アルゴリズム) であるため、往復させても bit-exact に一致
     する — 精度劣化を心配してカスタムシリアライザを書く必要はない。
 - response (request 1 件につき 1 行):
-  `{"ok": true, "result": <kind別 dict/list>, "pid": int}` または
-  `{"ok": false, "error": "<message>", "pid": int}`
-  — `result` の構造は worker から見て「plugin が返した生の値」であり、
-  kind 別のスキーマ検証・harness 専有キー (`bar_ts`) の拒否は **すべて
-  この親プロセス側 (sandbox.py) で行う** (worker は信頼境界の内側に
-  近い実行体であり、検証ロジック — 特に `contracts.StrategyDecision` の
-  import — を二重に持ち込みたくないため)。
+  `{"ok": true, "result": <kind別 dict/list>, "pid": int, "id": <要求の id>}` または
+  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`
+  — kind 別のスキーマ検証・harness 専有キー (`bar_ts`) の拒否は **すべて
+  この親プロセス側 (sandbox.py) で行う**。
 
 **タイムアウト・上限超過はセッションを使用不能にする**: `call()` が
 timeout/出力上限超過/worker 予期せぬ終了のいずれかに遭遇したら、その
@@ -76,9 +90,13 @@ timeout/出力上限超過/worker 予期せぬ終了のいずれかに遭遇し�
 from __future__ import annotations
 
 import ast
+import ctypes
+import errno
 import json
 import math
 import os
+import platform
+import secrets
 import select
 import signal
 import subprocess
@@ -88,13 +106,18 @@ import tempfile
 import time
 import logging
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agentic_fx.core import landlock, runtime_fingerprint, seccomp
 from agentic_fx.core.contracts import (
     Direction, EntryType, StrategyAction, StrategyDecision,
 )
+from agentic_fx.core.plugin_files import PluginFileTooLarge
 from agentic_fx.plugin.loader import PluginMeta, content_hash
+from agentic_fx.plugin.worker_isolation import (
+    ATTESTED_FIELDS, CANDIDATE_ISOLATION_REASONS, WORKER_SANDBOX_REASONS)
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -108,9 +131,13 @@ class SandboxError(Exception):
     する全エラーの単一表現。呼び出し側はこれ 1 種類だけを catch すれば
     よい (実装内訳を漏らさない)。"""
 
-    def __init__(self, message: str, *, code: str = "backtest_failed") -> None:
+    def __init__(self, message: str, *, code: str = "backtest_failed",
+                 sandbox_reason: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        # `sandbox_unavailable` の固定 reason、または SIGSYS による `crashed` の
+        # `sigsys_unattributed`。技術ログと activity にだけ出す (例外文字列には入れない)
+        self.sandbox_reason = sandbox_reason
 
 
 # --- check_source ----------------------------------------------------
@@ -308,6 +335,334 @@ def _build_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+# --- 隔離の admission と起動応答の検証 -------------------------------------
+
+#: `sandbox_unavailable` の例外文字列 (固定。reason は `sandbox_reason` 属性と技術ログだけ)
+SANDBOX_UNAVAILABLE_MESSAGE = (
+    "plugin worker could not be started under the required isolation "
+    "(sandbox unavailable)")
+#: `load` 後の SIGSYS による `crashed` の例外文字列 (固定)
+SIGSYS_CRASH_MESSAGE = (
+    "plugin worker was killed by SIGSYS (a forbidden syscall or an external "
+    "signal; cause not determined)")
+
+# 代表自己試験の子が呼ぶ隔離の入口 (本番と同じ Landlock / seccomp を直接掛ける。
+# PluginSession は経由しない)
+_SELFTEST_HOOK = "agentic_fx.plugin.worker_isolation:isolate_for_selftest"
+
+# Popen 直前に読む、現在 thread の status
+_THREAD_STATUS_PATH = "/proc/thread-self/status"
+
+# 子の全 task に期待する status (継承 filter は事前に拒否するので filter は 1 本固定)
+_EXPECTED_TASK_STATUS = (("NoNewPrivs", "1"), ("Seccomp", "2"), ("Seccomp_filters", "1"))
+
+_ENVELOPE_FIELDS = ("phase", "ok", "pid")
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    """全 `PluginSession` 共通の admission の結果。`landlock_abi` は親が測った ABI
+    (`plan_for_abi` の切り詰め後) で、成功 attestation の期待値に使う。"""
+
+    admitted: bool
+    reason: str | None
+    warning: str | None
+    landlock_abi: int | None
+    supported: bool
+
+
+def _run_selftest() -> runtime_fingerprint.SelftestOutcome:
+    return runtime_fingerprint.run_representative_selftest(isolation_hook=_SELFTEST_HOOK)
+
+
+# fingerprint ごとの判定 (集合外の自己試験は process 内で 1 回だけ)
+_RUNTIME_ADMISSION = runtime_fingerprint.RuntimeAdmission(selftest=_run_selftest)
+# この process の判定。fingerprint の計算 (数十 ms) を session ごとに繰り返さない
+_ADMISSION_RESULT: AdmissionResult | None = None
+_ADMISSION_LOCK = threading.Lock()
+
+
+def host_preflight() -> tuple[str | None, int]:
+    """x86_64、Landlock ABI 3 以上、seccomp (TSYNC・LOG・KILL_PROCESS・ERRNO) を測る。
+    使えなければ固定 reason、使えれば (None, 切り詰め後の ABI)。"""
+    if platform.machine() != "x86_64":
+        return "arch_unsupported", 0
+    abi = landlock.landlock_abi()
+    if abi <= 0:
+        return "landlock_unavailable", 0
+    if abi < landlock.PLUGIN_MIN_ABI:
+        return "landlock_abi_too_old", abi
+    if not seccomp.probe_support().available:
+        return "seccomp_unavailable", abi
+    missing = landlock.missing_required_system_dirs()
+    if missing:
+        # zoneinfo 等が無いと worker は fd_open_failed で落ち、同じ allowlist の
+        # 自己試験も落ちて誤解を招く reason になる。ここで明確に止める
+        return f"missing_system_dir:{missing[0].name}", abi
+    if _seccomp_status_field_missing():
+        return "seccomp_status_field_unavailable", abi
+    return None, landlock.plan_for_abi(abi).abi
+
+
+def _seccomp_status_field_missing() -> bool:
+    """この kernel が `/proc/<pid>/status` に `Seccomp_filters` 欄を出すかを調べる。
+    欄の無い kernel では worker の継承 filter 検査が全 session を
+    `inherited_seccomp_filter` にするので、host preflight で先に検知する。自分の
+    status すら読めない host では判断を保留し、Popen 直前の継承検査に委ねる。"""
+    try:
+        with open(_THREAD_STATUS_PATH, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return False
+    return seccomp.seccomp_filters_field(data) is None
+
+
+def runtime_admission() -> AdmissionResult:
+    """全 `PluginSession` が起動前に通る共通の admission。
+
+    host の要求水準 → runtime fingerprint → (集合外なら) 代表自己試験の順で判定し、
+    結果を process 内に保持する。service は起動時に呼び (eager)、その他の入口は最初の
+    session で呼ぶ (lazy)。fingerprint を計算できないときも自己試験失敗と同じ固定
+    reason にする (fail closed)。
+    """
+    global _ADMISSION_RESULT
+    with _ADMISSION_LOCK:
+        cached = _ADMISSION_RESULT
+        if cached is not None:
+            return cached
+        reason, abi = host_preflight()
+        # host preflight の失敗 (arch・ABI・zoneinfo 等) は恒久。fingerprint が作れない
+        # ・一時的な selftest 失敗は恒久 cache せず、評価ごとに再判定させる (RuntimeAdmission
+        # 側が間隔を空けて selftest を再試行する)
+        cacheable = True
+        if reason is not None:
+            result = AdmissionResult(False, reason, None, None, False)
+        else:
+            try:
+                fingerprint = runtime_fingerprint.compute_fingerprint(landlock_abi=abi)
+                decision = _RUNTIME_ADMISSION.admit(fingerprint)
+            except Exception:  # noqa: BLE001  fingerprint が作れない環境は集合外の失敗扱い
+                _log.warning("plugin sandbox: runtime fingerprint could not be computed",
+                             exc_info=True)
+                decision = None
+                cacheable = False  # 一時要因 (fd・メモリ逼迫) かもしれないので恒久化しない
+            if decision is not None and decision.admitted:
+                result = AdmissionResult(True, None, decision.warning, abi, decision.supported)
+                if decision.warning:
+                    _log.warning("plugin sandbox: %s", decision.warning)
+            else:
+                result = AdmissionResult(False, runtime_fingerprint.SELFTEST_FAILED_REASON,
+                                         None, None, False)
+                if decision is not None and decision.retryable:
+                    cacheable = False
+        if cacheable:
+            _ADMISSION_RESULT = result
+        return result
+
+
+def inherited_filter_preflight() -> str | None:
+    """`Popen` の直前に、現在 thread の `Seccomp_filters` が 0 であることを確かめる。
+
+    field が無い・読めない・0 でないときは `inherited_seccomp_filter`。継承した filter
+    を持つ親から起こした worker は attestation の `Seccomp_filters=1` を満たせず、
+    filter の合成もしないので、CPython を起動する前にここで止める。
+    """
+    try:
+        with open(_THREAD_STATUS_PATH, "rb") as f:
+            data = f.read(65536)
+    except OSError:
+        return "inherited_seccomp_filter"
+    for line in data.split(b"\n"):
+        if line.startswith(b"Seccomp_filters:"):
+            if line.split(b":", 1)[1].strip() == b"0":
+                return None
+            return "inherited_seccomp_filter"
+    return "inherited_seccomp_filter"
+
+
+def expected_attestation(landlock_abi: int, nonce: str) -> dict[str, object]:
+    """成功 `sandbox_ready` の attested field の期待値。すべて親が自分で決める
+    (worker の申告から作らない)。"""
+    plan = landlock.plan_for_abi(landlock_abi)
+    values = {
+        "sandbox_profile_version": runtime_fingerprint.SANDBOX_PROFILE_VERSION,
+        "landlock_fs_abi": plan.abi,
+        "landlock_tsync": plan.tsync,
+        "seccomp": seccomp.SECCOMP_PROFILE,
+        "keyring": "anonymous",
+        "network": plan.network,
+        "scope": plan.scope,
+        "nonce": nonce,
+    }
+    return {k: values[k] for k in ATTESTED_FIELDS}
+
+
+def _same_value(actual: object, expected: object) -> bool:
+    # True == 1 のような型の違う一致を許さない
+    return type(actual) is type(expected) and actual == expected
+
+
+def verify_sandbox_ready(message: dict[str, Any], *, expected: dict[str, object],
+                         popen_pid: int) -> str | None:
+    """worker の 1 行目 (`sandbox_ready`) を検査し、拒否する reason を返す (通れば None)。
+
+    検査の順は固定 (複数の違反があっても先の項目の reason になる):
+    phase の有無 → phase の値 → `ok:false` → 未知 field → `pid` → attested field
+    (表の順、`nonce` が最後) → field の並び順。
+    """
+    if "phase" not in message:
+        return "attestation_missing"
+    phase = message["phase"]
+    if phase == "plugin_ready":
+        return "attestation_order"
+    if phase != "sandbox_ready":
+        return "attestation_unexpected_message"
+    ok = message.get("ok")
+    if ok is False:
+        reason = message.get("reason")
+        if reason == "inherited_seccomp_filter":
+            return reason
+        if isinstance(reason, str) and reason in WORKER_SANDBOX_REASONS:
+            return f"sandbox_setup_failed:{reason}"
+        return "sandbox_setup_failed:unknown"
+    if ok is not True:
+        return "attestation_unexpected_message"
+    allowed = set(_ENVELOPE_FIELDS) | set(ATTESTED_FIELDS)
+    if any(key not in allowed for key in message):
+        return "attestation_unexpected_field"
+    if "pid" not in message:
+        return "attestation_missing:pid"
+    if not _same_value(message["pid"], int(popen_pid)):
+        return "attestation_mismatch:pid"
+    for name in ATTESTED_FIELDS:
+        if name not in message:
+            return f"attestation_missing:{name}"
+        if not _same_value(message[name], expected[name]):
+            return f"attestation_mismatch:{name}"
+    order = (*_ENVELOPE_FIELDS, *ATTESTED_FIELDS)
+    for actual, wanted in zip(message, order):
+        if actual != wanted:
+            if wanted == "pid" or wanted in ATTESTED_FIELDS:
+                return f"attestation_mismatch:{wanted}"
+            return "attestation_unexpected_field"
+    return None
+
+
+def check_worker_tasks(pid: int, *, proc_root: str = "/proc") -> str | None:
+    """`pid` 配下の全 task の status が NoNewPrivs 1 / Seccomp 2 / Seccomp_filters 1
+    であることを確かめる。読めない・field が無いときは `proc_status_unreadable`。"""
+    task_dir = os.path.join(proc_root, str(int(pid)), "task")
+    try:
+        tids = sorted(os.listdir(task_dir))
+    except OSError:
+        return "proc_status_unreadable"
+    if not tids:
+        return "proc_status_unreadable"
+    for tid in tids:
+        try:
+            with open(os.path.join(task_dir, tid, "status"), "rb") as f:
+                data = f.read(65536)
+        except OSError:
+            return "proc_status_unreadable"
+        fields: dict[str, str] = {}
+        for line in data.decode("ascii", "replace").splitlines():
+            key, sep, value = line.partition(":")
+            if sep:
+                fields[key] = value.strip()
+        for name, wanted in _EXPECTED_TASK_STATUS:
+            if name not in fields:
+                return "proc_status_unreadable"
+            if fields[name] != wanted:
+                return f"proc_status_mismatch:{name}"
+    return None
+
+
+def startup_diagnostics() -> list[str]:
+    """service の起動時に eager に回す診断。admission と seccomp の kernel log の読める
+    状態を 1 行ずつ返す。失敗しても例外にはしない (service は起動し、評価ごとに
+    fail closed する)。"""
+    lines: list[str] = []
+    try:
+        result = runtime_admission()
+        if result.admitted:
+            lines.append(
+                "plugin sandbox admission: ok "
+                f"fingerprint={'supported' if result.supported else 'out_of_set_selftest_passed'} "
+                f"landlock_abi={result.landlock_abi} seccomp={seccomp.SECCOMP_PROFILE} "
+                f"profile={runtime_fingerprint.SANDBOX_PROFILE_VERSION}")
+        else:
+            lines.append(
+                "plugin sandbox admission: unavailable "
+                f"sandbox_reason={result.reason} — plugin の評価は行わない "
+                "(signal・strategy・indicator の評価ごとに sandbox_unavailable になる)")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"plugin sandbox admission: check_failed ({type(exc).__name__})")
+    try:
+        lines.append(f"plugin sandbox kernel log: {seccomp.check_kernel_log()}")
+    except Exception as exc:  # noqa: BLE001
+        lines.append(f"plugin sandbox kernel log: check_failed ({type(exc).__name__})")
+    return lines
+
+
+#: worker 由来の文字列をログ・例外・CLI へ出すときの上限 (文字数)
+UNTRUSTED_TEXT_MAX_CHARS = 300
+
+
+def untrusted_text(value: object, *, fallback: str = "unknown error") -> str:
+    """worker (= plugin と同じ process) から来た文字列を、例外文字列・技術ログ・
+    人間向け CLI へ出してよい形にする唯一の関数。
+
+    str 以外や空は `fallback`。制御文字・書式文字・行区切り (Unicode の Cc・Cf・
+    Zl・Zp) は取り除き、`UNTRUSTED_TEXT_MAX_CHARS` 文字で切る。
+    """
+    if not isinstance(value, str) or not value:
+        return fallback
+    kept: list[str] = []
+    for ch in value:
+        if unicodedata.category(ch) in {"Cc", "Cf", "Zl", "Zp"}:
+            continue
+        kept.append(ch)
+        if len(kept) > UNTRUSTED_TEXT_MAX_CHARS:
+            break
+    text = "".join(kept[:UNTRUSTED_TEXT_MAX_CHARS])
+    if len(kept) > UNTRUSTED_TEXT_MAX_CHARS:
+        text += "...(truncated)"
+    return text or fallback
+
+
+class _ProtocolViolation(ValueError):
+    """worker の行が protocol の形をしていない (パース不能・NaN・重複キー等)。"""
+
+
+def _reject_constant(name: str) -> object:
+    raise _ProtocolViolation(f"non-finite number {name} is not allowed")
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    out: dict[str, object] = {}
+    for key, value in pairs:
+        if key in out:
+            raise _ProtocolViolation("duplicate key in worker response")
+        out[key] = value
+    return out
+
+
+def parse_worker_line(payload: bytes) -> object:
+    """worker の 1 行を JSON として読む。NaN・Infinity・重複キーは拒否する。
+
+    load 後の行は plugin が protocol fd へ直接書き得るので、パーサが投げ得る例外
+    (巨大な整数の ValueError、深い入れ子の RecursionError 等) はすべて
+    `_ProtocolViolation` にまとめる。
+    """
+    try:
+        return json.loads(payload, parse_constant=_reject_constant,
+                          object_pairs_hook=_no_duplicate_keys)
+    except _ProtocolViolation:
+        raise
+    except Exception as exc:  # noqa: BLE001  どの例外でも protocol 違反として扱う
+        raise _ProtocolViolation(f"unparsable worker line ({type(exc).__name__})") from None
+
+
 # --- PluginSession -------------------------------------------------------
 
 _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
@@ -340,6 +695,56 @@ _ORPHANS: list["PluginSession"] = []
 _ORPHAN_OVERFLOW_LOGGED = False
 _ORPHANS_LOCK = threading.RLock()
 _log = logging.getLogger(__name__)
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+# pidfd は数値の pid と違い、指す process が回収された後に番号が再利用されても別の
+# process を指さない。この Python には os.pidfd_open / signal.pidfd_send_signal が
+# 無い build があるので syscall を直接呼ぶ (番号は全 arch 共通の表、Linux 5.1+)。
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+# pidfd の指す pid を pgid とする process group 全体へ送る (Linux 6.9+)
+_PIDFD_SIGNAL_PROCESS_GROUP = 1 << 2
+_P_PIDFD = 3
+_LIBC: Any = None
+
+
+def _libc() -> Any:
+    global _LIBC
+    if _LIBC is None:
+        lib = ctypes.CDLL(None, use_errno=True)
+        lib.syscall.restype = ctypes.c_long
+        _LIBC = lib
+    return _LIBC
+
+
+def _pidfd_open(pid: int) -> int:
+    """pid の pidfd を返す。失敗は OSError (errno つき)。"""
+    lib = _libc()
+    ctypes.set_errno(0)
+    fd = lib.syscall(ctypes.c_long(_SYS_PIDFD_OPEN), ctypes.c_int(pid), ctypes.c_uint(0))
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return int(fd)
+
+
+def _pidfd_send_signal(pidfd: int, sig: int, flags: int = 0) -> None:
+    """pidfd へ signal を送る。失敗は OSError (ESRCH は ProcessLookupError)。"""
+    lib = _libc()
+    ctypes.set_errno(0)
+    rc = lib.syscall(ctypes.c_long(_SYS_PIDFD_SEND_SIGNAL), ctypes.c_int(pidfd),
+                     ctypes.c_int(sig), ctypes.c_void_p(None), ctypes.c_uint(flags))
+    if rc < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+class _WriteDeadlineExpired(Exception):
+    """worker への 1 行を deadline までに書き切れなかった (worker が stdin を読まない)。"""
 
 
 def reap_orphans() -> None:
@@ -386,11 +791,31 @@ class PluginSession:
         self.parent_kill_sent = False
         self.worker_unreaped = False
         self._collected_elsewhere = False
-        # start_new_session の group id (= worker の pid)。worker が他所で回収
-        # されると pid では辿れなくなるので、起動時に控えておく。
-        self._pgid: int | None = None
-        self._pgid_kill_sent = False
+        # Popen 直後に取る worker の pidfd。数値の pid / pgid は回収後に再利用され得る
+        # ので、回収の後に signal を送るのはこれ経由だけにする。取れない環境では None
+        self._pidfd: int | None = None
+        # pidfd の使用と close を直列にする (別 thread の close が、閉じて番号が
+        # 再利用された fd へ signal を送らないように)。中で他の lock を取らない
+        self._pidfd_lock = threading.Lock()
+        self._group_signal_unsupported = False
+        self._leftover_kill_sent = False
+        # __enter__・call・close の本体を直列にする。別 thread の close が、owner の
+        # 読み書き中の fd を閉じて番号を再利用させないため
+        self._lock = threading.RLock()
         self.error_code: str | None = None
+        # `sandbox_unavailable` の固定 reason、または load 後の SIGSYS の
+        # `sigsys_unattributed`。それ以外は None
+        self.sandbox_reason: str | None = None
+        # worker を起こしてから load を送るまでの間だけ True。この間の失敗は
+        # plugin のコードが動き得なかった失敗 (`sandbox_unavailable`) になる
+        self._awaiting_load = False
+        # load を送った後、`plugin_ready` (load への正規の 1 応答) を読む間だけ True。
+        # この 1 行は候補が死んでも読む (plugin_error を crashed に化けさせない)。
+        # これ以降の call() 応答では False に戻し、死後の行は採用しない (§2.5)
+        self._reading_load_response = False
+        # graceful close (close op を送って応答を待つ) の間だけ True
+        self._closing = False
+        self._sigsys_reported = False
         self.stderr_tail: str | None = None
         self.stderr_unavailable = False
         self._stderr_unavailable_logged = False
@@ -398,9 +823,8 @@ class PluginSession:
         self._stdout_fd: int | None = None
         self._stdout_buffer = bytearray()
         self._started = False
-        # プラン 8 B 束: PluginSession は単一スレッド所有が前提
-        # (全使用箇所が単一スレッド — ロックは追加しない)。construction
-        # したスレッドを記録し、実行時 assert で境界越えを検出する。
+        # __enter__ と call は construction したスレッドだけが呼ぶ。close は
+        # 後始末の契約 (例外を出さない) を優先し、どの thread からでも受ける。
         self._owner_thread = threading.get_ident()
 
     @property
@@ -423,43 +847,28 @@ class PluginSession:
                 f"current={current}) — PluginSession is single-thread-owned")
 
     def __enter__(self) -> "PluginSession":
-        """起動シーケンス全体を 1 つの try/except で包む (レビュー fix
-        round 1 F2)。**`__enter__` が例外を投げると Python は `__exit__`
-        を一切呼ばない** — 以前は個別の失敗パスでだけ `close()`/`_kill()`
-        を呼んでいたため、想定していなかった失敗経路 (`subprocess.Popen`
-        自体の例外等) では `self._proc` の stdin/stdout パイプが GC 任せ
-        になり fd がリークし得た。ここで一括して `self.close()` を必ず
-        通してから re-raise する (`SandboxError` はメッセージを保持して
-        そのまま、それ以外の例外は `SandboxError` へ写像 — 呼び出し側が
-        `SandboxError` 1 種だけ catch すればよい契約を `__enter__` でも
-        維持する)。
+        """起動シーケンス全体を 1 つの try/except で包む (`__enter__` が例外を
+        投げると `__exit__` は呼ばれないので、ここで必ず `close()` を通してから
+        `SandboxError` として投げ直す)。
 
-        **実行時ハッシュ再検証 (プラン 7 Task 3 レビュー fix round 1 F1
-        — TOCTOU 封鎖)**: `check_source`/`subprocess.Popen` より前に
-        `loader.content_hash(self._meta.path)` を再計算し、`self._meta.
-        content_hash` (呼び出し元がこの meta を取得した時点でのハッシュ
-        — 通常は `plugin_loader.approved_plugins()` が起動時に承認と
-        照合したもの) と不一致なら `SandboxError` を送出する。
-        `approved_plugins()` は起動時 (discover 時点) にディスク内容を
-        検証するだけで、実際に worker が plugin.py を import するのは
-        その後の `get_indicators` 呼び出し時 — その間隔で plugin.py が
-        承認内容と異なる内容に差し替えられても、再検証が無ければ古い
-        承認のまま新しい (未承認の) コードが実行されてしまう
-        (「承認は内容ハッシュに対して行う」設計書 §6 の実行時破れ)。
-        ここでの再検証により、`run_plugin`/`PluginSession` を経由する
-        全消費者 (本 task の `get_indicators` 合成、将来の signal/strategy
-        評価) が一括で守られる。**なお、この再検証自体と実際の import
-        (worker プロセス起動後) の間にも理論上ミリ秒級のレースが残る
-        (再検証直後に書き換えられれば検出できない) — 本モジュールの
-        脅威モデル (悪意ある攻撃者からの完全な隔離は保証せず、善意だが
-        不注意な plugin コードの事故を防ぐことが目的) の範囲では許容する。
-        """
+        worker を起こす前に `loader.content_hash` (上限つきの読み) で plugin を
+        再計算して discovery 時の hash と照合し、`check_source` を通す。worker には
+        同じ hash を渡し、worker は自分が読んだ bytes をその hash と照合してから
+        exec する。その後の手順はモジュール docstring の「起動は二段」を参照。"""
         self._check_owner_thread()
+        with self._lock:
+            return self._enter_locked()
+
+    def _enter_locked(self) -> "PluginSession":
         if self._started:
             raise SandboxError("plugin session cannot be reused")
         self._started = True
         try:
-            current_hash = content_hash(self._meta.path)
+            try:
+                current_hash = content_hash(self._meta.path)
+            except PluginFileTooLarge as exc:
+                raise SandboxError(f"plugin {self._meta.name!r}: {exc.reason}",
+                                   code="plugin_error") from exc
             if current_hash != self._meta.content_hash:
                 raise SandboxError(
                     f"plugin {self._meta.name!r}: content changed since "
@@ -471,13 +880,8 @@ class PluginSession:
                 raise SandboxError(
                     f"plugin {self._meta.name!r}: strategy session requires "
                     "a resolved indicator set (resolved=...)")
-            # codex plan r2 束1 Minor: 契約は片方向だけでは不十分 —
-            # strategy は `resolved` 必須 (上記) だが、indicator/signal は
-            # `resolved` を**受け取ってはいけない** (`None` 固定)。ここを
-            # 検査しないと、indicator/signal に誤って `ResolvedIndicatorSet`
-            # を渡す呼び出しが静かに通り、依存情報 (indicator の実体パス等)
-            # が handshake に混入し得る (kind 別の契約が片方向にしか pin
-            # されていなかった)。
+            # 逆向きの契約: indicator/signal は `resolved` を受け取らない。受け取ると
+            # 依存情報 (indicator の実体パス等) が handshake に混入し得る。
             if self._meta.kind != "strategy" and self._resolved is not None:
                 raise SandboxError(
                     f"plugin {self._meta.name!r}: kind={self._meta.kind!r} "
@@ -494,7 +898,12 @@ class PluginSession:
                         raise SandboxError(
                             f"indicator {item.plugin_name!r} resolves outside "
                             f"inventory_root ({real})") from None
-                    current = content_hash(real.parent)
+                    try:
+                        current = content_hash(real.parent)
+                    except PluginFileTooLarge as exc:
+                        raise SandboxError(
+                            f"indicator {item.plugin_name!r}: {exc.reason}",
+                            code="plugin_error") from exc
                     if current != item.content_hash:
                         raise SandboxError(
                             f"indicator {item.plugin_name!r}: content changed "
@@ -502,9 +911,16 @@ class PluginSession:
                             f"execute (expected {item.content_hash}, got {current})")
                     check_source(real)
                 indicator_specs = self._resolved.handshake_items()
-                # 検査済みの実体パスだけを handshake に載せる
+                # 検査済みの実体パスと、worker が読んだ bytes と照合する hash を載せる
                 for spec, item in zip(indicator_specs, self._resolved.items):
                     spec["plugin_py"] = str(Path(item.plugin_py).resolve())
+                    spec["content_hash"] = item.content_hash
+
+            # 隔離を準備できない host・runtime では plugin を一切起動しない
+            admission = runtime_admission()
+            if not admission.admitted:
+                raise self._unavailable(admission.reason or "runtime_fingerprint_selftest_failed")
+            assert admission.landlock_abi is not None
 
             env = _build_env()
             try:
@@ -513,59 +929,151 @@ class PluginSession:
             except OSError:
                 self.stderr_unavailable = True
                 stderr = subprocess.DEVNULL
-            self._proc = subprocess.Popen(
-                [sys.executable, "-m", "agentic_fx.plugin.worker",
-                 str(self._meta.path)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=stderr, cwd=str(self._meta.path), env=env,
-                start_new_session=True, bufsize=0,
-            )
-            self._pgid = self._proc.pid
+            # これ以降 load を送るまでの失敗は、plugin が動き得なかった失敗として分類する
+            self._awaiting_load = True
+            reason = inherited_filter_preflight()
+            if reason is not None:
+                raise self._unavailable(reason)
+            try:
+                # -B: sandbox 下の遅延 import が __pycache__ を作ろうとしないように
+                self._proc = subprocess.Popen(
+                    [sys.executable, "-B", "-m", "agentic_fx.plugin.worker",
+                     str(self._meta.path)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=stderr, cwd=str(self._meta.path), env=env,
+                    start_new_session=True, bufsize=0,
+                )
+            except Exception as exc:  # noqa: BLE001  起動自体の失敗は隔離の手前の失敗
+                _log.warning("plugin worker spawn failed plugin=%s (%s)",
+                             self._meta.name, type(exc).__name__)
+                raise self._unavailable("worker_bootstrap_failed") from exc
+            self.pid = self._proc.pid
+            self._pidfd = self._open_child_pidfd(self._proc.pid)
             self._ensure_pipe_ownership()
+            nonce = secrets.token_hex(16)
             handshake = {
                 "cpu_sec": self._settings.sandbox_session_cpu_sec,
                 "memory_mb": self._settings.sandbox_memory_mb,
                 "nofile": self._settings.sandbox_nofile,
                 "fsize_mb": self._settings.sandbox_fsize_mb,
+                "attest_nonce": nonce,
+                "content_hash": self._meta.content_hash,
                 "kind": self._meta.kind,
                 "indicators": indicator_specs,
             }
-            # [indicator-consumption-wiring] §2.4 (codex plan r1 M5):
-            # `outputs` は **kind == "indicator" のときだけ**載せる契約
-            # (設計書 §2.4 / codex 設計 r7 M1)。辞書リテラルに直接書くと
-            # strategy / signal にもキー自体 (`null`) が届き、契約が
-            # 「常に存在する nullable キー」に変質する。**分岐で足す**。
+            # `outputs` は kind == "indicator" のときだけ載せる契約 (strategy / signal に
+            # null のキーを届けない)。
             if self._meta.kind == "indicator":
                 handshake["outputs"] = (list(self._meta.outputs)
                                         if self._meta.outputs is not None
                                         else None)
+            # 起動の deadline は 1 つだけ作り、sandbox_ready の読取・検証・load の送信・
+            # plugin_ready の読取で共有する
+            deadline = time.monotonic() + _STARTUP_TIMEOUT_SEC
+            self._send_startup_line(handshake, deadline)
+            ready = self._read_response(_remaining(deadline), _STARTUP_MAX_BYTES)
+            reason = verify_sandbox_ready(
+                ready, expected=expected_attestation(admission.landlock_abi, nonce),
+                popen_pid=self._proc.pid)
+            if reason is None and self._stdout_buffer:
+                reason = "attestation_unexpected_message"
+            if reason is None:
+                reason = check_worker_tasks(self._proc.pid)
+            if reason is not None:
+                self._refuse_startup(reason)
+            if time.monotonic() >= deadline:
+                self._refuse_startup("sandbox_startup_timeout")
+            self._send_startup_line({"op": "load"}, deadline)
+            self._awaiting_load = False
+            # plugin_ready は load への正規の 1 応答。候補が ok:false を書いて
+            # すぐ死に、親が遅れて死を先に観測しても、この 1 行は読んで分類する
+            self._reading_load_response = True
             try:
-                self._write_line(handshake)
-            except OSError as exc:
-                if self._await_reap_grace(time.monotonic() + _STARTUP_TIMEOUT_SEC):
-                    raise self._worker_error(
-                        f"failed to write to plugin worker: {exc}") from exc
-                raise
-
-            response = self._read_response(_STARTUP_TIMEOUT_SEC, _STARTUP_MAX_BYTES)
-            if not response.get("ok"):
+                loaded = self._read_response(_remaining(deadline), _STARTUP_MAX_BYTES)
+            finally:
+                self._reading_load_response = False
+            if loaded.get("ok") is False:
                 self.error_code = "plugin_error"
                 raise SandboxError(
-                    f"plugin worker failed to start: {response.get('error')}",
+                    "plugin worker failed to start: "
+                    + untrusted_text(loaded.get("error"), fallback="unknown error"),
                     code="plugin_error")
-            self.pid = response.get("pid")
+            if loaded.get("ok") is not True:
+                self._protocol_failure("plugin worker returned an invalid startup response")
+            if loaded.get("phase") != "plugin_ready":
+                # load の後でも、plugin_ready で始まらない応答は隔離の検証に通っていない
+                self._dead = True
+                self._kill()
+                if self.worker_unreaped:
+                    raise SandboxError("plugin worker could not be reaped", code="crashed")
+                raise self._unavailable("attestation_order")
+            if self.worker_returncode is not None:
+                # plugin_ready ok:true を書いた直後に worker が死んでいた
+                # (drain 経由で読んだ)。load 後の死として分類する
+                raise self._worker_error("plugin worker exited after plugin_ready")
             return self
         except Exception as exc:
             self._dead = True
+            self._awaiting_load = False
             requested_code = exc.code if isinstance(exc, SandboxError) else "backtest_failed"
+            requested_reason = (exc.sandbox_reason if isinstance(exc, SandboxError)
+                                else None)
             self.error_code = requested_code
+            self.sandbox_reason = requested_reason
             self.close()
             final_code = "crashed" if self.worker_unreaped else requested_code
+            final_reason = requested_reason if final_code == requested_code else None
             self.error_code = final_code
+            self.sandbox_reason = final_reason
             if isinstance(exc, SandboxError):
-                raise SandboxError(str(exc), code=final_code) from exc
+                raise SandboxError(str(exc), code=final_code,
+                                   sandbox_reason=final_reason) from exc
             raise SandboxError(f"failed to start plugin worker: {exc}",
                                code=final_code) from exc
+
+    def _unavailable(self, reason: str) -> SandboxError:
+        """`sandbox_unavailable` の例外を作り、session にも分類を記録する。"""
+        self.error_code = "sandbox_unavailable"
+        self.sandbox_reason = reason
+        return SandboxError(SANDBOX_UNAVAILABLE_MESSAGE, code="sandbox_unavailable",
+                            sandbox_reason=reason)
+
+    def _refuse_startup(self, reason: str) -> None:
+        """起動応答の検証に通らなかった worker を、load を送らずに止める。戻らない。"""
+        self._dead = True
+        self._kill()
+        if self.worker_unreaped:
+            raise SandboxError("plugin worker could not be reaped", code="crashed")
+        raw = (reason.split(":", 1)[1]
+               if reason.startswith("sandbox_setup_failed:") else reason)
+        if raw in CANDIDATE_ISOLATION_REASONS:
+            # 候補の plugin.py / config.yaml が原因 (symlink・非通常ファイル・guarded
+            # dir)。環境障害ではなく候補の責任なので plugin_error にする
+            # reason は例外文字列に出さず技術ログにだけ出す (§5.1)
+            _log.warning("plugin worker refused candidate files plugin=%s reason=%s",
+                         self._meta.name, raw)
+            self.error_code = "plugin_error"
+            raise SandboxError(
+                "candidate plugin files could not be read under isolation",
+                code="plugin_error")
+        raise self._unavailable(reason)
+
+    def _send_startup_line(self, obj: dict[str, Any], deadline: float) -> None:
+        """起動中の 1 行を起動の deadline の中で送る。書けなければ worker の終了を
+        待って分類する。書き切れないまま期限が切れたら、読取の期限切れと同じく
+        `sandbox_startup_timeout` (load をまだ送り切っていないので)。"""
+        try:
+            self._write_line(obj, deadline=deadline)
+        except _WriteDeadlineExpired:
+            raise self._deadline_expired(_STARTUP_TIMEOUT_SEC) from None
+        except OSError as exc:
+            self._dead = True
+            self._await_reap_grace(deadline)
+            self._kill()
+            if self.worker_unreaped:
+                raise SandboxError("plugin worker could not be reaped",
+                                   code="crashed") from exc
+            raise self._worker_error(f"failed to write to plugin worker: {exc}") from exc
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
         self.close()
@@ -575,8 +1083,24 @@ class PluginSession:
         """graceful close (設計書 §2.4): worker が生きていれば
         `{"op": "close"}` を送り `{"ok": true, "cpu_sec": ...}` を
         `sandbox_timeout_sec` 以内で待つ。応答が来れば `cpu_sec` が確定し、
-        来なければ従来どおり SIGKILL (`cpu_sec` は None のまま)。"""
-        self._check_owner_thread()
+        来なければ従来どおり SIGKILL (`cpu_sec` は None のまま)。
+
+        どの thread から呼ばれても例外を出さず、kill・reap・fd の close まで行う。
+        owner 以外の thread からの close は、pidfd があれば owner が call の途中でも
+        待たされないよう先に worker を kill してから (このとき graceful close は
+        成立しない)、owner の読み書きが終わるのを lock で待って後始末する。"""
+        try:
+            if threading.get_ident() != self._owner_thread:
+                self._interrupt_from_other_thread()
+            with self._lock:
+                self._close_locked()
+        except Exception:  # noqa: BLE001  close は例外を出さない
+            _log.warning("plugin worker close failed plugin=%s", self._meta.name,
+                         exc_info=True)
+        finally:
+            self._close_pidfd()
+
+    def _close_locked(self) -> None:
         if self.worker_unreaped:
             self._close_parent_fds()
             self._close_stderr()
@@ -585,21 +1109,27 @@ class PluginSession:
         if proc is None:
             self._close_stderr()
             return
-        if not self._reap_worker():
-            if not self._dead:
-                try:
-                    self._write_line({"op": "close"})
-                    self._read_response(
-                        self._settings.sandbox_timeout_sec, _STARTUP_MAX_BYTES)
-                    close_deadline = time.monotonic() + self._settings.sandbox_timeout_sec
-                    while not self._reap_worker() and time.monotonic() < close_deadline:
-                        time.sleep(0.01)
-                except (SandboxError, OSError):
-                    # timeout/EOF/書き込み失敗 — fallback で kill する
-                    # (`_read_response` は失敗時に自分で _kill する)。
-                    pass
+        try:
             if not self._reap_worker():
+                if not self._dead:
+                    self._closing = True
+                    try:
+                        self._graceful_close()
+                    except Exception:  # noqa: BLE001
+                        # timeout・EOF・書き込み失敗・壊れた応答のどれでも、下の
+                        # kill へ進む (close は例外を投げない)
+                        pass
+                    finally:
+                        self._closing = False
+                if not self._reap_worker():
+                    self._kill()
+        except Exception:  # noqa: BLE001  後始末を飛ばさない
+            _log.warning("plugin worker close failed plugin=%s; killing",
+                         self._meta.name, exc_info=True)
+            try:
                 self._kill()
+            except Exception:  # noqa: BLE001
+                pass
         # stdout を読んだ owner thread だけがここで stream を閉じる。
         # kill が効かない場合も close は待機せず、この終端化だけで完了する。
         self._close_parent_fds()
@@ -612,12 +1142,68 @@ class PluginSession:
         if not self.worker_unreaped:
             self._proc = None
 
+    def _graceful_close(self) -> None:
+        self._check_no_stray_output()
+        request_id = secrets.token_hex(8)
+        # close の要求と応答の待ちで 1 つの deadline を共有する
+        deadline = time.monotonic() + self._settings.sandbox_timeout_sec
+        self._write_line({"op": "close", "id": request_id}, deadline=deadline)
+        response = self._read_response(_remaining(deadline),
+                                       _STARTUP_MAX_BYTES)
+        self._check_response_envelope(response, request_id,
+                                      allowed=frozenset({"ok", "cpu_sec", "pid", "id"}))
+        close_deadline = time.monotonic() + self._settings.sandbox_timeout_sec
+        while not self._reap_worker() and time.monotonic() < close_deadline:
+            time.sleep(0.01)
+
+    def _check_no_stray_output(self) -> None:
+        """要求を送る前に、受信側に何も残っていないことを確かめる。
+
+        load 後の worker は plugin のコードと同じ process で、plugin は protocol fd へ
+        直接書ける。要求より先に届いた行・bytes は次の応答として使わず protocol 違反に
+        する (先回りの応答を排除する)。"""
+        if self._proc is not None:
+            self._ensure_pipe_ownership()
+        fd = self._stdout_fd
+        if fd is not None and not self._stdout_buffer:
+            poller = select.poll()
+            poller.register(fd, select.POLLIN)
+            try:
+                if poller.poll(0):
+                    chunk = os.read(fd, 65536)
+                    self._stdout_buffer.extend(chunk)
+            except OSError:
+                pass
+        if self._stdout_buffer:
+            self._stdout_buffer.clear()
+            self._protocol_failure("plugin worker wrote output before the request")
+
+    def _check_response_envelope(self, response: dict[str, Any], request_id: str, *,
+                                 allowed: frozenset[str]) -> None:
+        """応答の形を確かめる: 未知 field なし、`id` が要求と同じ、`pid` が Popen.pid、
+        `ok` が bool、受信側に余分な bytes が無い。違反は protocol 違反 (kill + reap)。
+
+        `id` は応答の出所の証明ではない (plugin は同じ process で id を観測できる)。
+        要求と応答のずれと、先回りの応答を排除するためのもの。"""
+        assert self._proc is not None
+        if self._stdout_buffer:
+            self._stdout_buffer.clear()
+            self._protocol_failure("plugin worker wrote more than one line per request")
+        if (any(key not in allowed for key in response)
+                or response.get("id") != request_id
+                or not _same_value(response.get("pid"), int(self._proc.pid))
+                or not isinstance(response.get("ok"), bool)):
+            self._protocol_failure("plugin worker response does not match the request")
+
     def _ensure_pipe_ownership(self) -> None:
         proc = self._proc
         assert proc is not None
         if self._stdin_fd is None:
             assert proc.stdin is not None
-            self._stdin_fd = proc.stdin.fileno()
+            fd = proc.stdin.fileno()
+            # 書き込みを deadline で打ち切れるように (worker 側の読み口には影響しない)
+            os.set_blocking(fd, False)
+            self._stdin_fd = fd
         if self._stdout_fd is None:
             assert proc.stdout is not None
             self._stdout_fd = proc.stdout.fileno()
@@ -659,6 +1245,10 @@ class PluginSession:
         `{"signals": [検証済み dict, ...]}` にラップして返す。
         """
         self._check_owner_thread()
+        with self._lock:
+            return self._call_locked(payload)
+
+    def _call_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._dead or self._proc is None:
             raise SandboxError(
                 "plugin session is not usable (not started, or a previous "
@@ -673,10 +1263,18 @@ class PluginSession:
         request: dict[str, Any] = {}
         for key in required:
             request[key] = _df_to_wire(payload[key]) if key == "df" else payload[key]
+        request_id = secrets.token_hex(8)
+        request["id"] = request_id
+        self._check_no_stray_output()
 
-        write_deadline = time.monotonic() + self._settings.sandbox_timeout_sec
+        # 1 回の call は 1 つの deadline を書き込みと読み取りで共有する
+        # (`sandbox_timeout_sec` が call 全体の上限)
+        deadline = time.monotonic() + self._settings.sandbox_timeout_sec
         try:
-            self._write_line(request)
+            self._write_line(request, deadline=deadline)
+        except _WriteDeadlineExpired:
+            # load の後なので、読取の期限切れと同じ `timeout`
+            raise self._deadline_expired(self._settings.sandbox_timeout_sec) from None
         except SandboxError:
             # `_write_line` 内の json.dumps 失敗 (payload に numpy スカラー
             # 等シリアライズ不能な値が混入) — 実際にはまだ何もパイプへ
@@ -688,35 +1286,56 @@ class PluginSession:
             self.error_code = "protocol_error"
             # 終了状態が見えるまでの数 ms で kill すると、親 kill 扱いになって
             # 死因 (CPU 上限など) が失われる。
-            self._await_reap_grace(write_deadline)
+            self._await_reap_grace(deadline)
             recovered_without_kill = self._kill()
             if self.worker_unreaped:
                 code = "crashed"
             elif recovered_without_kill:
-                code = self._worker_error(
-                    "plugin worker exited unexpectedly (EOF)").code
+                classified = self._worker_error("plugin worker exited unexpectedly (EOF)")
+                raise SandboxError(f"failed to write to plugin worker: {exc}",
+                                   code=classified.code,
+                                   sandbox_reason=classified.sandbox_reason) from exc
             else:
                 code = "protocol_error"
             raise SandboxError(f"failed to write to plugin worker: {exc}", code=code) from exc
 
-        response = self._read_response(self._settings.sandbox_timeout_sec,
+        response = self._read_response(_remaining(deadline),
                                        self._settings.sandbox_output_max_bytes)
-        self.pid = response.get("pid", self.pid)
-        if not response.get("ok"):
+        # 応答の pid は Popen.pid と照合するだけで保持しない
+        self._check_response_envelope(
+            response, request_id, allowed=frozenset({"ok", "result", "error", "pid", "id"}))
+        if not response["ok"]:
             self.error_code = "plugin_error"
-            raise SandboxError(str(response.get("error", "unknown plugin error")),
-                               code="plugin_error")
+            raise SandboxError(
+                untrusted_text(response.get("error"), fallback="unknown plugin error"),
+                code="plugin_error")
+        if self._reap_worker():
+            # 応答の後に死んでいた worker の結果は使わない
+            self._dead = True
+            self._kill()
+            raise self._worker_error("plugin worker exited after its response")
+        if "result" not in response:
+            self._protocol_failure("plugin worker response has no result")
 
         result = response.get("result")
-        if kind == "indicator":
-            return _validate_indicator_result(result, outputs=self._meta.outputs)
-        if kind == "signal":
-            return {"signals": _validate_signal_result(result)}
-        return _validate_strategy_result(result)
+        # load 後の応答は候補が制御し得る入力。検証の失敗はどの例外でも
+        # SandboxError にし、文言は worker 由来の文字列と同じ規則で整える
+        try:
+            if kind == "indicator":
+                return _validate_indicator_result(result, outputs=self._meta.outputs,
+                                                  df_index=payload["df"].index)
+            if kind == "signal":
+                return {"signals": _validate_signal_result(result)}
+            return _validate_strategy_result(result)
+        except SandboxError as exc:
+            raise SandboxError(untrusted_text(str(exc), fallback="invalid plugin result"),
+                               code=exc.code) from exc
+        except Exception as exc:  # noqa: BLE001  OverflowError・RecursionError 等
+            raise SandboxError(f"invalid plugin result ({type(exc).__name__})") from exc
 
     # -- IPC 詳細 --
 
-    def _write_line(self, obj: dict[str, Any]) -> None:
+    def _write_line(self, obj: dict[str, Any], *, deadline: float) -> None:
         """1 行書き込む。**例外の型で「シリアライズ失敗 (書き込み前、
         セッション継続可)」と「I/O 失敗 (壊れたパイプ、セッション死亡)」
         を呼び出し元が区別できるようにする** (レビュー fix round 1 F5):
@@ -724,6 +1343,10 @@ class PluginSession:
         等シリアライズ不能な値が混入) を出したら `SandboxError` として
         送出し、実際のパイプ書き込みで失敗したら `OSError` をそのまま
         伝播させる (呼び出し元の `call()`/`__enter__` が使い分ける)。
+
+        stdin は non-blocking にしてあり、書ける分だけ書いて POLLOUT を待つ。worker が
+        stdin を読まずに pipe が埋まっても、`deadline` を過ぎれば
+        `_WriteDeadlineExpired` で戻る (期限切れの分類は呼び出し元が決める)。
         """
         assert self._proc is not None
         self._ensure_pipe_ownership()
@@ -732,10 +1355,30 @@ class PluginSession:
             data = json.dumps(obj).encode("utf-8") + b"\n"
         except (TypeError, ValueError) as exc:
             raise SandboxError(f"failed to serialize request: {exc}") from exc
+        fd = self._stdin_fd
         view = memoryview(data)
+        poller: Any = None
         while view:
-            sent = os.write(self._stdin_fd, view)
-            view = view[sent:]
+            try:
+                sent = os.write(fd, view)
+            except BlockingIOError:
+                sent = 0
+            except InterruptedError:
+                continue
+            if sent:
+                view = view[sent:]
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _WriteDeadlineExpired()
+            if poller is None:
+                poller = select.poll()
+                poller.register(fd, select.POLLOUT)
+            try:
+                # POLLERR・POLLHUP でも戻り、次の write が BrokenPipeError になる
+                poller.poll(max(1, min(20, math.ceil(remaining * 1000))))
+            except InterruptedError:
+                pass
 
     def _read_response(self, timeout_sec: float, max_bytes: int) -> dict[str, Any]:
         """1 行を「timeout・出力上限超過・EOF」いずれかに達するまで読む。
@@ -763,8 +1406,9 @@ class PluginSession:
                 payload = bytes(self._stdout_buffer[:newline])
                 del self._stdout_buffer[:newline + 1]
                 try:
-                    decoded = json.loads(payload)
-                except json.JSONDecodeError as exc:
+                    decoded = parse_worker_line(payload)
+                except _ProtocolViolation as exc:
+                    self._stdout_buffer.clear()
                     self._protocol_failure(
                         f"plugin worker returned invalid JSON: {exc}")
                     raise AssertionError("unreachable") from exc
@@ -772,16 +1416,22 @@ class PluginSession:
                     return self._protocol_failure(
                         "plugin worker returned a JSON value that is not an object")
                 if worker_gone:
-                    # 最後の応答は呼び出し元へ返すが、死んだ worker の session を
-                    # 使い回せる形で残さない。
-                    self._terminalize_after_final_response(decoded)
+                    # 起動中 (load 前) の最後の行だけは隔離段の固定応答として読む。
+                    # stderr はここで閉じない: 診断ログは分類 (code・sandbox_reason) が
+                    # 決まった後の close() で 1 回だけ出す
+                    self._dead = True
+                    self._close_parent_fds()
                 return decoded
             if len(self._stdout_buffer) >= max_bytes:
                 return self._protocol_failure(
                     f"plugin worker output exceeded {max_bytes} bytes")
 
             if self._reap_worker():
-                if self._drain_dead_worker_stdout(max_bytes):
+                # load 前の隔離段の固定応答と、load への正規の 1 応答 (plugin_ready) は
+                # 死んだ worker が残していても読む。それ以外 (call 応答) は採用しない
+                # (plugin が protocol fd へ直接書き得る、§2.5)
+                if (self._awaiting_load or self._reading_load_response) \
+                        and self._drain_dead_worker_stdout(max_bytes):
                     worker_gone = True
                     continue
                 self._dead = True
@@ -790,21 +1440,13 @@ class PluginSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if self._reap_worker():
-                    if self._drain_dead_worker_stdout(max_bytes):
+                    if (self._awaiting_load or self._reading_load_response) \
+                            and self._drain_dead_worker_stdout(max_bytes):
                         worker_gone = True
                         continue
                     self._dead = True
                     raise self._worker_error("plugin worker exited unexpectedly (EOF)")
-                self._dead = True
-                self.error_code = "timeout"
-                recovered_without_kill = self._kill()
-                if self.worker_unreaped:
-                    raise SandboxError(
-                        f"plugin call timed out after {timeout_sec}s", code="crashed")
-                if recovered_without_kill:
-                    raise self._worker_error(
-                        "plugin worker exited unexpectedly (EOF)")
-                raise SandboxError(f"plugin call timed out after {timeout_sec}s", code="timeout")
+                raise self._deadline_expired(timeout_sec)
 
             try:
                 events = poller.poll(max(0, min(20, int(remaining * 1000))))
@@ -833,13 +1475,21 @@ class PluginSession:
                             "plugin worker exited unexpectedly (EOF)")
                     self._stdout_buffer.extend(chunk)
 
-    def _terminalize_after_final_response(self, response: dict[str, Any]) -> None:
+    def _deadline_expired(self, timeout_sec: float) -> SandboxError:
+        """読み書きの期限切れ。worker を kill + reap して分類した例外を返す。
+
+        load を送り切る前は `sandbox_unavailable / sandbox_startup_timeout`、後は
+        `timeout`。kill の前に終わっていた worker は、その終了状態で分類する。"""
         self._dead = True
-        if not response.get("ok"):
-            # 診断ログがこの時点で出るので、call() が後から付ける分類を先に入れる。
-            self.error_code = "plugin_error"
-        self._close_parent_fds()
-        self._close_stderr()
+        self.error_code = "timeout"
+        recovered_without_kill = self._kill()
+        if self.worker_unreaped:
+            return SandboxError(f"plugin call timed out after {timeout_sec}s", code="crashed")
+        if recovered_without_kill:
+            return self._worker_error("plugin worker exited unexpectedly (EOF)")
+        if self._awaiting_load:
+            return self._unavailable("sandbox_startup_timeout")
+        return SandboxError(f"plugin call timed out after {timeout_sec}s", code="timeout")
 
     def _await_reap_grace(self, deadline: float) -> bool:
         """終了状態が wait4 に見えるまで、`deadline` を超えない範囲で
@@ -885,6 +1535,9 @@ class PluginSession:
             raise SandboxError(message, code="crashed")
         if recovered_without_kill:
             raise self._worker_error("plugin worker exited unexpectedly (EOF)")
+        if self._awaiting_load:
+            # 隔離の報告より前の壊れた応答。plugin はまだ読まれていない
+            raise self._unavailable("attestation_unexpected_message")
         raise SandboxError(message, code="protocol_error")
 
     def _kill(self) -> bool:
@@ -901,9 +1554,8 @@ class PluginSession:
         # The legacy property intentionally keeps its old timeout contract.
         self._cpu_sec = None
         try:
-            # start_new_session=True によりセッションリーダーの pid ==
-            # プロセスグループ id。killpg で孫プロセスも道連れにする。
-            os.killpg(self._proc.pid, signal.SIGKILL)
+            # 直前の wait4 が「まだ回収していない自分の子」を返した区間で送る
+            self._send_group_kill()
         except ProcessLookupError:
             self.parent_kill_sent = False
             kill_not_sent = True
@@ -954,23 +1606,128 @@ class PluginSession:
             self._cpu_sec = self.worker_cpu_sec
         return True
 
+    def _open_child_pidfd(self, pid: int) -> int | None:
+        """Popen 直後の worker の pidfd を取る。取れない環境 (syscall が無い等) と、
+        取った fd が自分の未回収の子を指していない場合 (Popen から今までの間に
+        他所で回収され、番号が再利用された) は None。"""
+        try:
+            fd = _pidfd_open(pid)
+        except OSError as exc:
+            _log.info("plugin worker pidfd unavailable plugin=%s (%s); signals use the "
+                      "pid only while the worker is known to be unreaped",
+                      self._meta.name, errno.errorcode.get(exc.errno or 0, "unknown"))
+            return None
+        try:
+            os.waitid(_P_PIDFD, fd, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def _send_group_kill(self) -> None:
+        """worker の process group へ SIGKILL を送る。失敗は OSError のまま返す。
+
+        start_new_session=True で worker の pid == pgid。数値の killpg は、呼び出し元が
+        直前の wait4 で「まだ回収していない自分の子」と確かめた区間でだけ使う
+        (回収前の pid と、それを pgid とする group は再利用されない)。"""
+        assert self._proc is not None
+        with self._pidfd_lock:
+            pidfd = self._pidfd
+            if pidfd is not None and not self._group_signal_unsupported:
+                try:
+                    _pidfd_send_signal(pidfd, signal.SIGKILL, _PIDFD_SIGNAL_PROCESS_GROUP)
+                    return
+                except OSError as exc:
+                    if exc.errno != errno.EINVAL:
+                        raise
+                    # group 指定の無い kernel (6.9 未満)。数値の killpg に戻る
+                    self._group_signal_unsupported = True
+        os.killpg(self._proc.pid, signal.SIGKILL)
+
     def _kill_leftover_group(self) -> None:
         """リーダーが他所で回収された後も、同じ group の孫が残りうる。死因は
-        不明なので parent_kill_sent は立てず、best-effort で 1 回だけ送る。"""
-        if self._pgid_kill_sent:
+        不明なので parent_kill_sent は立てず、best-effort で 1 回だけ送る。
+
+        回収済みの pid / pgid の番号は別 process に再利用され得るので、数値では
+        送らない。pidfd が無い・group 指定が使えない環境では孫を諦める。"""
+        if self._leftover_kill_sent:
             return
-        self._pgid_kill_sent = True
-        pgid = self._pgid
-        if pgid is None and self._proc is not None:
-            pgid = self._proc.pid
-        if pgid is None:
-            return
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except OSError:
-            pass
+        self._leftover_kill_sent = True
+        with self._pidfd_lock:
+            pidfd = self._pidfd
+            if pidfd is None or self._group_signal_unsupported:
+                _log.info("plugin worker collected elsewhere plugin=%s; leftover group "
+                          "not signalled (no pidfd group signal)", self._meta.name)
+                return
+            try:
+                _pidfd_send_signal(pidfd, signal.SIGKILL, _PIDFD_SIGNAL_PROCESS_GROUP)
+            except OSError:
+                pass
+
+    def _interrupt_from_other_thread(self) -> None:
+        """owner 以外の thread の close が、owner の読み書きの終わりを待たずに済む
+        よう、worker の group を pidfd で kill する。pidfd が無ければ何もしない
+        (数値の pid は owner の回収と競合し得るので、ここでは使わない)。"""
+        with self._pidfd_lock:
+            pidfd = self._pidfd
+            if (pidfd is None or self.worker_returncode is not None
+                    or self._collected_elsewhere):
+                return
+            # owner の分類が「親 kill」になるよう、送る前に立てる
+            previous = self.parent_kill_sent
+            self.parent_kill_sent = True
+            flags = 0 if self._group_signal_unsupported else _PIDFD_SIGNAL_PROCESS_GROUP
+            try:
+                _pidfd_send_signal(pidfd, signal.SIGKILL, flags)
+            except OSError as exc:
+                if flags and exc.errno == errno.EINVAL:
+                    self._group_signal_unsupported = True
+                    try:
+                        _pidfd_send_signal(pidfd, signal.SIGKILL, 0)
+                        return
+                    except OSError:
+                        pass
+                self.parent_kill_sent = previous
+
+    def _close_pidfd(self) -> None:
+        with self._pidfd_lock:
+            fd = self._pidfd
+            self._pidfd = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _worker_error(self, message: str) -> SandboxError:
+        """worker の終了 (親が見た wait4 の結果) から分類する。
+
+        load 前の終了は plugin が動き得なかった失敗なので `sandbox_unavailable`
+        (SIGSYS は `startup_sigsys_unattributed`、それ以外は CPU 上限死も含めて
+        `worker_bootstrap_failed`)。load 後に親 kill なしで SIGSYS なら、禁止 syscall と
+        同 uid の外部 signal を区別できないので原因未確定の `crashed`。kernel log の
+        有無では分類を変えない。"""
+        sigsys = (not self.parent_kill_sent and self.worker_signal == signal.SIGSYS)
+        if self.worker_unreaped:
+            self.error_code = "crashed"
+            return SandboxError(message, code="crashed")
+        if self._awaiting_load:
+            if sigsys:
+                self._report_sigsys()
+                return self._unavailable("startup_sigsys_unattributed")
+            return self._unavailable("worker_bootstrap_failed")
+        if sigsys:
+            self._report_sigsys()
+            self.error_code = "crashed"
+            self.sandbox_reason = "sigsys_unattributed"
+            return SandboxError(SIGSYS_CRASH_MESSAGE, code="crashed",
+                                sandbox_reason="sigsys_unattributed")
+        if (self._closing and not self.parent_kill_sent
+                and self.worker_returncode == 0):
+            # close op に応じて正常終了した worker。応答行は死後なので読まないが、
+            # 終了状態は正常なので session の分類を crashed に汚染しない
+            # (close() はこの例外を握りつぶす)
+            return SandboxError(message, code="crashed")
         code = "crashed"
         if (not self.parent_kill_sent and self.worker_signal == signal.SIGKILL
                 and self.worker_cpu_sec is not None
@@ -979,15 +1736,26 @@ class PluginSession:
         self.error_code = code
         return SandboxError(message, code=code)
 
+    def _report_sigsys(self) -> None:
+        """SIGSYS で終わった worker について、運用者向けの固定 1 行を 1 回だけ出す。"""
+        if self._sigsys_reported or self._proc is None:
+            return
+        self._sigsys_reported = True
+        _log.warning("%s; cause is a forbidden syscall or an external signal "
+                     "(not attributed to the plugin)",
+                     seccomp.sigsys_diagnostic_line(self._proc.pid))
+
     def _close_stderr(self) -> None:
         f = self._stderr_file
         self._stderr_file = None
         if f is None:
             if self.stderr_unavailable and not self._stderr_unavailable_logged:
                 self._stderr_unavailable_logged = True
-                _log.info("plugin_worker_diagnostic plugin=%s code=%s cpu_sec=%s returncode=%s signal=%s stderr_unavailable=true",
+                _log.info("plugin_worker_diagnostic plugin=%s code=%s cpu_sec=%s returncode=%s signal=%s stderr_unavailable=true%s",
                           self._meta.name, self.error_code, self.worker_cpu_sec,
-                          self.worker_returncode, self.worker_signal)
+                          self.worker_returncode, self.worker_signal,
+                          (f" sandbox_reason={self.sandbox_reason}"
+                           if self.sandbox_reason is not None else ""))
             return
         try:
             f.seek(0, os.SEEK_END)
@@ -1011,6 +1779,8 @@ class PluginSession:
             escaped = "".join(reversed(escaped_parts))
             self.stderr_tail = escaped or None
             fields = f"plugin={self._meta.name} code={self.error_code} cpu_sec={self.worker_cpu_sec} returncode={self.worker_returncode} signal={self.worker_signal} stderr_unavailable={self.stderr_unavailable}"
+            if self.sandbox_reason is not None:
+                fields += f" sandbox_reason={self.sandbox_reason}"
             if size > 8192 or escaped_truncated:
                 fields += " truncated=true"
             if escaped:
@@ -1079,8 +1849,17 @@ def _df_to_wire(df: "pd.DataFrame") -> dict[str, Any]:
 
 # --- 戻り値のスキーマ検証 (kind 別) -------------------------------------
 
+def _finite_float(value: Any) -> bool:
+    """float に変換でき、有限であるか。巨大な整数 (10**400) の OverflowError も偽。"""
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError, TypeError):
+        return False
+
+
 def _validate_indicator_result(result: Any, *,
-                               outputs: "tuple[str, ...] | None") -> dict[str, Any]:
+                               outputs: "tuple[str, ...] | None",
+                               df_index: Any = None) -> dict[str, Any]:
     """standalone (`run_plugin` / `PluginSession.call(kind="indicator")`) の
     応答を親側で**再検証**する ([indicator-consumption-wiring] §2.5)。
 
@@ -1118,7 +1897,7 @@ def _validate_indicator_result(result: Any, *,
                     raise SandboxError(
                         f"indicator result[{key!r}] series must contain "
                         f"numbers or null, got {item!r}")
-                if not math.isfinite(float(item)):
+                if not _finite_float(item):
                     raise SandboxError(
                         f"indicator result[{key!r}] series must be finite")
             out[key] = [None if item is None else float(item) for item in series]
@@ -1129,11 +1908,10 @@ def _validate_indicator_result(result: Any, *,
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise SandboxError(
                 f"indicator result[{key!r}] must be a number, got {value!r}")
-        fvalue = float(value)
-        if not math.isfinite(fvalue):
+        if not _finite_float(value):
             raise SandboxError(
-                f"indicator result[{key!r}] must be finite, got {value!r}")
-        out[key] = fvalue
+                f"indicator result[{key!r}] must be finite")
+        out[key] = float(value)
 
     from agentic_fx.core.plugin_contract import (
         IndicatorResultError, validate_indicator_result as _validate_common)
@@ -1149,9 +1927,12 @@ def _validate_indicator_result(result: Any, *,
     for key in nan_keys:
         out[key] = float("nan")
     try:
-        _validate_common(out, df_index=None, outputs=outputs)
+        # 系列の長さは親が渡した df の index でも確かめる (worker の検証に頼らない)
+        _validate_common(out, df_index=df_index, outputs=outputs)
     except IndicatorResultError as exc:
         raise SandboxError(str(exc)) from exc
+    except (OverflowError, ValueError, TypeError) as exc:
+        raise SandboxError(f"indicator result is not representable ({type(exc).__name__})") from exc
     finally:
         for key in nan_keys:
             out[key] = None
@@ -1198,9 +1979,9 @@ def _validate_signal_result(result: Any) -> list[dict[str, Any]]:
         strength = item.get("strength")
         if isinstance(strength, bool) or not isinstance(strength, (int, float)):
             raise SandboxError(f"signal[{i}].strength must be a number")
+        if not _finite_float(strength) or not (0.0 <= float(strength) <= 1.0):
+            raise SandboxError(f"signal[{i}].strength must be in [0, 1]")
         strength = float(strength)
-        if not math.isfinite(strength) or not (0.0 <= strength <= 1.0):
-            raise SandboxError(f"signal[{i}].strength must be in [0, 1], got {strength!r}")
 
         # fix round 2 F8 残ギャップ: strategy 経路は StrategyDecision を
         # 実構築するため contracts._require_nonempty_str (非空 str 検証)
@@ -1230,9 +2011,9 @@ def _validate_signal_result(result: Any) -> list[dict[str, Any]]:
                 validated[opt] = None
                 continue
             if (isinstance(value, bool) or not isinstance(value, (int, float))
-                    or not math.isfinite(value) or value <= 0):
+                    or not _finite_float(value) or value <= 0):
                 raise SandboxError(
-                    f"signal[{i}].{opt} must be a finite positive number, got {value!r}")
+                    f"signal[{i}].{opt} must be a finite positive number")
             validated[opt] = float(value)
         out.append(validated)
     return out
@@ -1277,7 +2058,7 @@ def _validate_strategy_result(result: Any) -> dict[str, Any]:
         if kwargs.get("entry_type") is not None:
             kwargs["entry_type"] = EntryType(kwargs["entry_type"])
         decision = StrategyDecision(action=action, **kwargs)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise SandboxError(f"invalid strategy result: {exc}") from exc
 
     return {

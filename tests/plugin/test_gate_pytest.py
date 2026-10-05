@@ -177,13 +177,10 @@ def test_check_candidate_snapshot_still_rejects_unrelated_extra_file_alongside_p
 
 def test_check_candidate_snapshot_passes_after_plugin_session_execution(
         tmp_path, settings):
-    """主 pin: `submit_plugin` の後段が使う `sandbox.PluginSession` を
-    実際に起動すると、worker (`agentic_fx.plugin.worker._import_plugin`)
-    の `importlib.util.spec_from_file_location` が候補ディレクトリに
-    `__pycache__` を書く (`sandbox._build_env` は
-    `PYTHONDONTWRITEBYTECODE`/`PYTHONPYCACHEPREFIX` を設定しないため)。
-    是正前はこの後の再ゲートが `CandidateSnapshotError` で恒久的に
-    失敗していた (検収 Blocking B2) — 是正後は通ることを確認する。"""
+    """主 pin: `submit_plugin` の後段が使う `sandbox.PluginSession` を実際に
+    起動しても、後の再ゲート (`check_candidate_snapshot`) が通る。worker は `-B` で
+    起動し plugin を source のまま読む (pyc を読まない・書かない) ので、候補
+    ディレクトリに `__pycache__` は作られない。"""
     from agentic_fx.plugin.loader import PluginMeta, content_hash as real_content_hash
     from agentic_fx.plugin.sandbox import PluginSession
 
@@ -194,11 +191,10 @@ def test_check_candidate_snapshot_passes_after_plugin_session_execution(
                       timeframe=None, pairs=(), max_bars=200,
                       content_hash=real_content_hash(d))
     with PluginSession(meta, settings=settings.plugin):
-        pass  # __enter__ が plugin.py を import させ __pycache__ を作る
+        pass  # __enter__ が worker に plugin.py を読ませる
 
-    assert (d / "__pycache__").is_dir(), \
-        "前提: PluginSession 実行後は __pycache__ が生成される"
-    check_candidate_snapshot(d)  # 再ゲート: __pycache__ があっても通る (B2 是正)
+    assert not (d / "__pycache__").exists()
+    check_candidate_snapshot(d)  # 再ゲート: 実行後も 3 本ちょうどで通る
 
 
 def test_hashes_of_returns_content_and_artifact_hash(tmp_path):

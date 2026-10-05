@@ -764,6 +764,32 @@ def test_session_start_failure_keeps_diagnostics_and_marks_evaluation_started(
     assert src.worker_returncode == 1
 
 
+def test_session_start_without_isolation_hands_its_sandbox_reason_to_the_adapter(
+        tmp_path, monkeypatch):
+    class _Unavailable:
+        def __init__(self, meta_arg, *, settings, resolved=None):
+            self.worker_cpu_sec = None
+            self.worker_returncode = None
+            self.worker_signal = None
+            self.sandbox_reason = None
+        def __enter__(self):
+            self.sandbox_reason = "inherited_seccomp_filter"
+            raise SandboxError("unavailable", code="sandbox_unavailable",
+                               sandbox_reason="inherited_seccomp_filter")
+
+    monkeypatch.setattr(strategy_adapter, "PluginSession", _Unavailable)
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 8 * 60 + 1)
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=_EMPTY)
+    assert src.sandbox_reason is None
+    with pytest.raises(SandboxError):
+        src(_bar(H))
+    assert src.sandbox_reason == "inherited_seccomp_filter"
+    assert (src.cpu_sec, src.worker_returncode, src.worker_signal) == (None, None, None)
+
+
 def test_close_keeps_the_cpu_of_a_worker_the_parent_killed_and_reaped(
         tmp_path, monkeypatch):
     """親が timeout で kill した worker も、回収時の rusage は親が持つ。旧来の

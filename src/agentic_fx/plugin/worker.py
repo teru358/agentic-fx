@@ -1,71 +1,54 @@
-"""plugin サンドボックスの子プロセス本体 (プラン 7 Task 2)。
+"""plugin サンドボックスの子プロセス本体。
 
-`python -m agentic_fx.plugin.worker <plugin_dir>` として起動される。
+`python -B -m agentic_fx.plugin.worker <plugin_dir>` として起動される。
 `sandbox.PluginSession` が spawn する唯一の想定呼び出し元。
 
-**起動順序は厳守** (`resource.setrlimit` を通した後でないと `import
-pandas` 自体が plugin コードと同じ資源制約の外で走ってしまう):
+**起動は二段** (plugin を 1 行も読む前に自分自身を隔離する):
 
-0. 元の stdout fd を複製して退避し、fd 1 を stderr へ付け替える
-   (`_protect_protocol_stdout` — plugin.py 内の `print` 等が JSON-lines
-   プロトコルに混ざるのを防ぐ。handshake を読む前、他の何より先に行う)
-1. handshake (最初の 1 行) を読み、`resource.setrlimit` で CPU 時間
-   (RLIMIT_CPU, セッション寿命累積)・仮想アドレス空間 (RLIMIT_AS)・
-   プロセス/スレッド数 (RLIMIT_NPROC) の上限を設定する
-2. `socket`/`urllib`/`http` を `sys.modules` にダミー登録して塞ぐ
-   (plugin.py が import する前に、でなければ意味が無い)
-3. `plugin.py` (main kind) と、strategy の場合は同居する indicator の
-   `plugin.py` 群を、それぞれ一意なモジュール名で import する (以後、
-   同じモジュールオブジェクトを全 call で使い回す — セッション型 IPC の要)
-4. stdin から JSON 1 行を読むたびに、main kind に対応する関数
-   (compute/detect/evaluate) を呼ぶ。strategy の場合は呼ぶ前に同居
-   indicator を `compute` → 共通 validator → 親 df.index へ整列した
-   `indicators` 引数を組み立てる。結果を JSON 1 行で返す
-5. `{"op": "close"}` を受け取ったら `cpu_sec` を添えて応答し終了する
-   (graceful close)
+1. `worker_isolation.run_isolation_stage`: bytecode の書き出しを止め、protocol 用に
+   stdout を退避して fd 1 を stderr へ向け、handshake を読み、rlimit → 継承 seccomp
+   filter の検査 → 匿名 keyring → Landlock → seccomp → sandbox 下の runtime import
+   自己試験を行う。失敗はそこで固定の `sandbox_ready ok:false` を書いて終了する。
+2. 成功したら `sandbox_ready` (attestation) を書き、親の `{"op": "load"}` を待つ。
+   EOF や別の行なら plugin を読まずに終了する。
+3. `load` を受けたら `socket` 等を塞ぎ、source-only loader で main と依存 indicator
+   を読み (hash を照合した同じ bytes を exec する)、`plugin_ready` を返す。
+4. 以後は stdin から JSON 1 行を読むたびに kind の関数 (compute/detect/evaluate) を
+   呼び、結果を JSON 1 行で返す。`{"op": "close"}` で `cpu_sec` を添えて応答し終了する。
 
-**worker はこのプロセス自身が信頼境界の内側寄りの実行体である** —
-kind 別の戻り値スキーマ検証 (`bar_ts` 拒否、`StrategyDecision` 構築等)
-は一切ここでは行わない。すべて親プロセス (`sandbox.py`) の責務。**ただし
-indicator の戻り値検証だけは例外** — 同居 indicator の compute 結果は
-`core.plugin_contract.validate_indicator_result` (worker/sandbox の両方が
-import する唯一の実装) を worker 内でも通す。strategy に渡す前に
-不正な indicator 出力を弾く必要があるため。worker は plugin が返した
-生の値をそのまま JSON にして返すだけであり、JSON 化に失敗する値
-(numpy スカラー等、plugin 作者が `float()` で明示変換し忘れた場合) は
-ここで構造化エラーとして報告する。
+**worker はこのプロセス自身が信頼境界の内側寄りの実行体である** — kind 別の戻り値
+スキーマ検証は親 (`sandbox.py`) の責務。ただし同居 indicator の compute 結果は
+`core.plugin_contract.validate_indicator_result` を worker 内でも通す (strategy に
+渡す前に不正な indicator 出力を弾くため)。
 
-**ワイヤ形式は `sandbox.py` と対の契約** (変更する場合は両方のモジュール
-docstring を同期すること):
+**ワイヤ形式は `sandbox.py` と対の契約** (変更する場合は両方のモジュール docstring を
+同期すること):
 
 - handshake (最初の 1 行、親から):
   `{"cpu_sec": int, "memory_mb": int, "nofile": int, "fsize_mb": int,
+    "attest_nonce": "<32 hex>", "content_hash": "<64 hex>",
     "kind": "indicator"|"signal"|"strategy",
     "outputs": [...]|null,          # kind == "indicator" のときのみ存在
-    "indicators": [{"alias","plugin_py","params","max_bars","outputs"}]}
-  (`indicators` は strategy のみ非空。indicator/signal は常に `[]`)
-- ready (handshake への応答、plugin.py の import 成功後に送る):
-  `{"ok": true, "ready": true, "pid": int}` /
-  `{"ok": false, "ready": false, "error": "<message>"}`
-- request (call() のたびに親から):
-  `{"df": <df wire>, "params": {...}}` (indicator/signal/strategy 共通。
-  strategy の `indicators`/`signals` は worker 内で計算・`None` 固定に
-  なったため、もう request には乗らない)
+    "indicators": [{"alias","plugin_py","content_hash","params","max_bars","outputs"}]}
+- sandbox_ready (worker から): 成功は
+  `{"phase": "sandbox_ready", "ok": true, "pid": int, <attested field 8 個>}`、
+  失敗は `{"phase": "sandbox_ready", "ok": false, "stage": "sandbox", "reason": ..., "pid": int}`
+- load (親から、検証に通ったときだけ): `{"op": "load"}`
+- plugin_ready (worker から): `{"phase": "plugin_ready", "ok": true}` /
+  `{"phase": "plugin_ready", "ok": false, "error": "<message>"}`
+- request (call() のたびに親から): `{"df": <df wire>, "params": {...}, "id": "<hex>"}`
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
-  (float は JSON 往復で bit-exact — CPython の shortest-roundtrip repr)
-- close request (親から、セッション終了時): `{"op": "close"}`
-- close response: `{"ok": true, "cpu_sec": <float>, "pid": int}`
-- response (request 1 件につき 1 行):
-  `{"ok": true, "result": <plugin の生の戻り値>, "pid": int}` /
-  `{"ok": false, "error": "<message>", "pid": int}`
-  kind == "indicator" の main plugin 応答の `result` は standalone wire
-  形式 (`{key: float|null | {"series": [float|null, ...]}}`)。strategy の
-  `result` は `evaluate()` の生の戻り値 (スキーマ検証は親側)。
+- response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
+  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`
+- close request: `{"op": "close", "id": "<hex>"}` / close response:
+  `{"ok": true, "cpu_sec": <float>, "pid": int, "id": <要求の id>}`
 
-脅威モデルは `sandbox.py` のモジュール docstring を参照 (構文名ベースの
-静的検査・resource limit は善意の plugin コードの事故防止が目的であり、
-悪意ある攻撃者からの完全な隔離を保証しない。最終防衛線は人間承認)。
+load の後に届く行は plugin が protocol fd へ直接書き得る。親はそれらを候補が制御
+し得る入力として扱い、ここでの整形には頼らない。
+
+起動失敗と call 中の例外は、protocol の応答より前に traceback を stderr に書く
+(親は stderr を人間向けの技術ログにだけ出す)。
 """
 from __future__ import annotations
 
@@ -73,57 +56,14 @@ import json
 import os
 import resource
 import sys
+import traceback
 from typing import Any
 
-# RLIMIT_NPROC の固定上限。**per-uid の累積カウンタ**なので、値が小さす
-# ぎると「同一 uid が既に多数のプロセス/スレッドを持つ」通常の開発機
-# (常態) で worker 自身の起動が壊れる — レビュー fix round 1 F6:
-# 当初 32 だったが、これは典型的な開発機の同時プロセス/スレッド数を軽く
-# 下回り、正常な plugin 実行まで巻き込んで失敗させていた (setrlimit
-# 自体は成功するが、以後 clone()/pthread_create() が即座に失敗する)。
-# fork bomb 事故防止という目的に対しては十分に寛大な値で足りる —
-# plugin.py が subprocess/os/threading を import すること自体が
-# check_source の allowlist (math/statistics/numpy/pandas のみ) で既に
-# 拒否されており plugin コードが自発的に fork/thread を増やす経路が無い
-# のと、worker 起動時に env で BLAS/OpenMP をシングルスレッド化している
-# (sandbox._SINGLE_THREAD_ENV) ため worker 自身が新規スレッドをほぼ必要
-# としないため、512 という寛大な値でも fail closed の実効性は変わらない
-# (RLIMIT_CPU/RLIMIT_AS が主防御、RLIMIT_NPROC はベストエフォートの追加
-# 防御という位置づけも変更なし)。
-_NPROC_CAP = 512
+from agentic_fx.core.worker_limits import NPROC_CAP as _NPROC_CAP
+from agentic_fx.plugin import worker_isolation
 
-
-def _set_resource_limits(cpu_sec: int, memory_mb: int, nofile: int,
-                          fsize_mb: int) -> None:
-    cpu = int(cpu_sec)
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-    # Core images may expose plugin data outside the protocol boundary.
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-
-    mem_bytes = int(memory_mb) * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-
-    # プラン 8 B 束: worker は plugin.py の import と call() の応答書き込み
-    # 以外にファイル記述子を要しない (stdin/stdout/stderr の 3 つ +
-    # import 時の一時的な .so/.pyc オープン)。想定外の大量オープン
-    # (fork bomb 的 fd リーク) を検知する上限として十分寛大な値を渡す
-    # (呼び出し元が settings.plugin.sandbox_nofile を渡す — 既定 128)。
-    resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
-
-    # RLIMIT_FSIZE: plugin コードは check_source の denylist
-    # (open/to_*/read_* 等) により意図的なファイル書き込みができない —
-    # ここでの上限は「想定外の書き込みを小さく抑える」多層防御 (呼び出し
-    # 元が settings.plugin.sandbox_fsize_mb を渡す — 既定 8MB)。
-    fsize_bytes = int(fsize_mb) * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
-
-    try:
-        resource.setrlimit(resource.RLIMIT_NPROC, (_NPROC_CAP, _NPROC_CAP))
-    except (ValueError, OSError):
-        # per-uid の既存使用量次第では失敗し得る (最終防衛線ではなく
-        # ベストエフォートの追加防御 — CPU/AS の 2 軸が主防御)。
-        pass
-
+# `_NPROC_CAP` は `core.worker_limits` が単一の出所。gate pytest worker と plugin
+# worker (隔離段) が同じ値を使う。この別名は既存の import 元を保つためのもの
 
 class _BlockedModule:
     """import 済み扱いにして `ImportError` を強制する偽モジュール。"""
@@ -152,24 +92,6 @@ def _poison_network_modules() -> None:
         sys.modules[name] = _BlockedModule()  # type: ignore[assignment]
 
 
-def _import_plugin_as(module_name: str, plugin_path: str):
-    """`plugin.py` を **一意なモジュール名**で import する。strategy と
-    同居する indicator を `"plugin"` 固定名で import すると sys.modules が
-    衝突して 2 本目以降が 1 本目に化ける。"""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(module_name, plugin_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load plugin module from {plugin_path!r}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _import_plugin(plugin_dir: str):
-    return _import_plugin_as("plugin", os.path.join(plugin_dir, "plugin.py"))
-
-
 def _deep_copy_json(obj):
     """params の deep copy (call ごとに独立。nested mutation を次 call へ
     持ち越さない — codex r3 C3)。params は JSON-safe が loader/resolver で
@@ -178,8 +100,7 @@ def _deep_copy_json(obj):
 
 
 def _cpu_sec() -> float:
-    import resource as _res
-    usage = _res.getrusage(_res.RUSAGE_SELF)
+    usage = resource.getrusage(resource.RUSAGE_SELF)
     return float(usage.ru_utime + usage.ru_stime)
 
 
@@ -192,36 +113,6 @@ def _wire_to_df(wire: dict[str, Any]):
     index = pd.to_datetime(wire["index"], utc=True)
     data = {col: wire[col] for col in ("open", "high", "low", "close", "volume")}
     return pd.DataFrame(data, index=index)
-
-
-def _read_line() -> dict[str, Any] | None:
-    line = sys.stdin.buffer.readline()
-    if not line:
-        return None
-    return json.loads(line)
-
-
-def _write_line(stream: Any, obj: dict[str, Any]) -> None:
-    stream.write(json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n")
-    stream.flush()
-
-
-def _protect_protocol_stdout() -> Any:
-    """JSON-lines プロトコル専用の書き込み先を確保し、fd 1 (stdout) を
-    fd 2 (stderr) へ付け替えて返す。
-
-    `check_source` の denylist に `print` は含まれない (brief 逐語リスト
-    に無く、善意の plugin がデバッグ用に残しがちな呼び出しを一律禁止する
-    のは過剰) — その代わり、plugin.py 内の `print(...)` や C 拡張の
-    printf がプロトコルの JSON 1 行ストリームに紛れ込まないよう、
-    plugin.py を import する**前**に元の stdout fd を複製して退避し、
-    fd 1 自体を stderr (親プロセスは `stderr=subprocess.DEVNULL` で起動
-    するため、混入するはずだった出力は静かに捨てられる) へ向け直す。
-    以後 `_write_line` は必ずこの複製 fd に書く。
-    """
-    protocol_out = os.fdopen(os.dup(sys.stdout.fileno()), "wb")
-    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    return protocol_out
 
 
 def _indicator_result_to_wire(validated: dict) -> dict:
@@ -245,45 +136,104 @@ def _indicator_result_to_wire(validated: dict) -> dict:
     return out
 
 
+def _read_line() -> dict[str, Any] | None:
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    return json.loads(line)
+
+
+def _write_line(fd: int, obj: dict[str, Any]) -> None:
+    data = json.dumps(obj, allow_nan=False).encode("utf-8") + b"\n"
+    view = memoryview(data)
+    while view:
+        n = os.write(fd, view)
+        view = view[n:]
+
+
+def _load_error_text(exc: BaseException) -> str:
+    cause = exc.__cause__
+    if isinstance(exc, worker_isolation.PluginLoadError) and cause is not None:
+        return f"{exc.reason}: {type(cause).__name__}: {cause}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _print_load_traceback(exc: BaseException) -> None:
+    """読み込み失敗の traceback を stderr に書く。loader の失敗は元の例外
+    (`__cause__`、plugin の行を含む) を出す。"""
+    shown = exc.__cause__ if exc.__cause__ is not None else exc
+    try:
+        sys.stderr.write("plugin worker: plugin load failed\n")
+        traceback.print_exception(shown, file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001  診断が書けなくても応答は返す
+        pass
+
+
+def _load_plugins(isolated: "worker_isolation.IsolatedWorker",
+                  handshake: dict[str, Any]):
+    kind = handshake["kind"]
+    module = worker_isolation.load_plugin_module(isolated.main)
+    fn = getattr(module, _KIND_FUNC[kind])
+    specs = {spec["alias"]: spec for spec in handshake.get("indicators") or []}
+    deps = []
+    for record in isolated.indicators:
+        spec = specs[record.alias]
+        dep_module = worker_isolation.load_plugin_module(record)
+        deps.append({
+            "alias": record.alias, "compute": getattr(dep_module, "compute"),
+            "params": spec["params"], "max_bars": int(spec["max_bars"]),
+            "outputs": tuple(spec["outputs"])})
+    return fn, deps
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("usage: python -m agentic_fx.plugin.worker <plugin_dir>")
     plugin_dir = sys.argv[1]
 
-    protocol_out = _protect_protocol_stdout()
+    captured: dict[str, Any] = {}
 
-    handshake = _read_line()
-    if handshake is None:
+    def read_handshake() -> dict[str, Any] | None:
+        handshake = _read_line()
+        captured["handshake"] = handshake
+        return handshake
+
+    isolated = worker_isolation.run_isolation_stage(plugin_dir, read_handshake)
+    if isolated is None:
         return
-
+    handshake = captured["handshake"]
+    protocol_fd = isolated.protocol_fd
     pid = os.getpid()
+    os.write(protocol_fd, isolated.sandbox_ready_line(pid))
+
+    # 親が attestation と /proc を確かめて load を送るまで plugin を読まない
     try:
-        _set_resource_limits(handshake["cpu_sec"], handshake["memory_mb"],
-                              handshake["nofile"], handshake["fsize_mb"])
-        _poison_network_modules()
-        plugin_module = _import_plugin(plugin_dir)
-        kind = handshake["kind"]
-        func_name = _KIND_FUNC[kind]
-        fn = getattr(plugin_module, func_name)
-        main_outputs = handshake.get("outputs") if kind == "indicator" else None
-        # 同居 indicator (strategy のみ非空)。alias 順で来る。
-        deps = []
-        for spec in handshake.get("indicators") or []:
-            module = _import_plugin_as(f"indicator_{spec['alias']}",
-                                       spec["plugin_py"])
-            deps.append({
-                "alias": spec["alias"], "compute": getattr(module, "compute"),
-                "params": spec["params"], "max_bars": int(spec["max_bars"]),
-                "outputs": tuple(spec["outputs"])})
-    except Exception as exc:  # noqa: BLE001 — 起動失敗を構造化エラーで報告
-        _write_line(protocol_out, {"ok": False, "ready": False,
-                    "error": f"{type(exc).__name__}: {exc}", "pid": pid})
+        load = _read_line()
+    except ValueError:
+        load = None
+    if load != {"op": "load"}:
+        isolated.close()
         return
 
-    _write_line(protocol_out, {"ok": True, "ready": True, "pid": pid})
+    _poison_network_modules()
+    try:
+        fn, deps = _load_plugins(isolated, handshake)
+    except Exception as exc:  # noqa: BLE001  候補側の読み込み失敗を構造化して返す
+        _print_load_traceback(exc)
+        isolated.close()
+        _write_line(protocol_fd, {"phase": "plugin_ready", "ok": False,
+                                  "error": _load_error_text(exc)})
+        return
+    isolated.close()
+    _write_line(protocol_fd, {"phase": "plugin_ready", "ok": True})
 
-    import pandas as pd
+    kind = handshake["kind"]
+    main_outputs = handshake.get("outputs") if kind == "indicator" else None
+
     import numpy as np
+    import pandas as pd
+
     from agentic_fx.core.plugin_contract import validate_indicator_result
 
     baseline_chained = pd.get_option("mode.chained_assignment")
@@ -293,10 +243,10 @@ def main() -> None:
         request = _read_line()
         if request is None:
             return
-        # graceful close (設計書 §2.4): 親が {"op": "close"} を送る。
+        request_id = request.get("id")
         if request.get("op") == "close":
-            _write_line(protocol_out,
-                        {"ok": True, "cpu_sec": _cpu_sec(), "pid": pid})
+            _write_line(protocol_fd, {"ok": True, "cpu_sec": _cpu_sec(), "pid": pid,
+                                      "id": request_id})
             return
         try:
             df = _wire_to_df(request["df"])
@@ -312,7 +262,7 @@ def main() -> None:
                         key: (value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)
                         for key, value in validated.items()}
-                # グローバル状態の不変 assert (設計書 §2.4、V2)
+                # indicator が pandas/numpy の process 全体の状態を変えていないこと
                 if (pd.get_option("mode.chained_assignment") != baseline_chained
                         or dict(np.geterr()) != baseline_errstate):
                     raise RuntimeError(
@@ -324,12 +274,17 @@ def main() -> None:
                     result = _indicator_result_to_wire(
                         validate_indicator_result(result, df_index=df.index,
                                                   outputs=main_outputs))
-            _write_line(protocol_out, {"ok": True, "result": result, "pid": pid})
-        except Exception as exc:  # noqa: BLE001 — トレースバックを stdout
-            # プロトコルに乗せない (worker-side エラーは構造化 1 行で
-            # 報告する — brief 「never tracebacks to stdout mid-protocol」)。
-            _write_line(protocol_out, {"ok": False,
-                        "error": f"{type(exc).__name__}: {exc}", "pid": pid})
+            _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
+                                      "id": request_id})
+        except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ
+            try:
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            _write_line(protocol_fd, {"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}", "pid": pid,
+                        "id": request_id})
 
 
 if __name__ == "__main__":

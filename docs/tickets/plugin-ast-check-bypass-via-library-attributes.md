@@ -1,15 +1,15 @@
 ---
 id: plugin-ast-check-bypass-via-library-attributes
 title: plugin がライブラリの属性経由で os に届き、コード検査を回避できる
-status: 設計待ち
+status: 見送り
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-05
 related: []
 ---
 # [plugin-ast-check-bypass-via-library-attributes] plugin がライブラリの属性経由で os に届き、コード検査を回避できる
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 見送り / **優先**: 中
 
 ## 現象
 
@@ -28,3 +28,4 @@ AST 検査は import 文と名前の直接参照を見るが、許可済みオ�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-05: 見送り理由 — 残余として受容。隔離の実測で、ライブラリ属性経由で os に届いても檻の中で届くのは自分の plugin.py の読み取りと自 process に閉じた操作だけ (他 file・listing・作成・socket・fork・exec は拒否)。AST 検査は主防御ではなく檻が主防御

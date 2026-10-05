@@ -92,6 +92,10 @@ _SANDBOX_CODE_TO_PUBLIC: dict[str, tuple[str, str]] = {
     "backtest_failed": (
         "backtest_failed",
         "候補を確認して修正してください。繰り返すなら人間に報告してください"),
+    "sandbox_unavailable": (
+        "worker_sandbox_unavailable",
+        "この環境では候補を安全に実行できません。候補の問題ではないので、"
+        "候補の修正や再試行はせず、人間に報告してください"),
 }
 _SANDBOX_CODE_TO_PUBLIC["plugin_error"] = _SANDBOX_CODE_TO_PUBLIC["backtest_failed"]
 _SANDBOX_CODE_TO_PUBLIC["protocol_error"] = _SANDBOX_CODE_TO_PUBLIC["backtest_failed"]
@@ -100,8 +104,27 @@ _SANDBOX_CODE_TO_PUBLIC["protocol_error"] = _SANDBOX_CODE_TO_PUBLIC["backtest_fa
 _SANDBOX_CODE_TO_RESULT = {
     "cpu_limit": "cpu_limit", "timeout": "timeout", "crashed": "crashed",
     "plugin_error": "plugin_error", "protocol_error": "plugin_error",
-    "backtest_failed": "backtest_failed",
+    "backtest_failed": "backtest_failed", "sandbox_unavailable": "sandbox_unavailable",
 }
+
+# activity に sandbox_reason を足す result と、そのときに許す reason
+_SANDBOX_REASON_RESULTS = frozenset({"sandbox_unavailable", "crashed"})
+
+
+def _sandbox_reason_suffix(outcome: str | None, intent_source: Any,
+                           error: BaseException | None = None) -> str:
+    """`result=sandbox_unavailable` と SIGSYS による `result=crashed` の行にだけ
+    固定 enum の `sandbox_reason` を足す。"""
+    if outcome not in _SANDBOX_REASON_RESULTS:
+        return ""
+    reason = getattr(intent_source, "sandbox_reason", None)
+    if reason is None and isinstance(error, SandboxError):
+        reason = error.sandbox_reason
+    if not isinstance(reason, str):
+        return ""
+    if outcome == "crashed" and reason != "sigsys_unattributed":
+        return ""
+    return f" sandbox_reason={reason}"
 
 
 
@@ -990,7 +1013,8 @@ class ImproveLoop:
 
     def _write_backtest_cpu(self, outcome: str | None, intent_source: Any, *,
                             mission: str, plugin: str, pair: str,
-                            deps: int, scope: str = "in_sample") -> None:
+                            deps: int, scope: str = "in_sample",
+                            error: BaseException | None = None) -> None:
         """started 後の backtest ごとに `backtest_cpu` をちょうど 1 行書く。
         評価前の失敗 (履歴なし・pair 未宣言) は worker に触れていないので
         書かない。書き込みの失敗は本来の結果を変えない。"""
@@ -1011,7 +1035,8 @@ class ImproveLoop:
                 f"cpu_sec={_fmt(getattr(intent_source, 'cpu_sec', None))} "
                 f"cpu_source=parent_wait4 result={outcome} "
                 f"returncode={_fmt(getattr(intent_source, 'worker_returncode', None))} "
-                f"signal={_fmt(getattr(intent_source, 'worker_signal', None))}")
+                f"signal={_fmt(getattr(intent_source, 'worker_signal', None))}"
+                f"{_sandbox_reason_suffix(outcome, intent_source, error)}")
         except Exception:
             _log.warning("backtest_cpu activity write failed", exc_info=True)
 
@@ -1029,7 +1054,7 @@ class ImproveLoop:
                 outcome = "backtest_failed"
             self._write_backtest_cpu(
                 outcome, intent_source, mission=mission, plugin=plugin,
-                pair=pair, deps=deps, scope=scope)
+                pair=pair, deps=deps, scope=scope, error=error)
         return _sink
 
     def _build_rpc_handlers(self, ledger: "ImproveRpcLedger", *,
@@ -1092,11 +1117,12 @@ class ImproveLoop:
                 raise RuntimeError(
                     f"run_backtest requires a strategy candidate: "
                     f"{args['name']!r}. {_RUN_BACKTEST_KIND_HINT}")
+            from agentic_fx.core.plugin_files import read_file_bounded
             try:
-                plugin_py = (candidate_dir / "plugin.py").read_bytes()
-                config_yaml = (candidate_dir / "config.yaml").read_bytes()
-                test_plugin = (candidate_dir / "test_plugin.py").read_bytes()
-            except OSError:
+                plugin_py = read_file_bounded(candidate_dir / "plugin.py")
+                config_yaml = read_file_bounded(candidate_dir / "config.yaml")
+                test_plugin = read_file_bounded(candidate_dir / "test_plugin.py")
+            except (OSError, ValueError):
                 return {"error": "loader_rejected: content changed during backtest"}
             if content_hash_bytes(plugin_py, config_yaml) != meta.content_hash:
                 return {"error": "loader_rejected: content changed during backtest"}
@@ -1168,7 +1194,11 @@ class ImproveLoop:
                              "code=%s", args.get("name"), exc.code)
                 public_error, hint = _SANDBOX_CODE_TO_PUBLIC.get(
                     exc.code, _SANDBOX_CODE_TO_PUBLIC["backtest_failed"])
-                return {"started": True, "error": public_error, "hint": hint}
+                # started は「plugin のコードが動き得たか」(親が load を送ったか)。
+                # 隔離できなかった失敗は候補枠と CPU 観測に数えない (tool error の
+                # streak には入る)
+                started = exc.code != "sandbox_unavailable"
+                return {"started": started, "error": public_error, "hint": hint}
             except ValueError as exc:
                 message = str(exc)
                 if isinstance(exc, holdout.NoHistoryError):
@@ -2683,6 +2713,19 @@ class ImproveLoop:
                                 mission=str(ctx.mission_id),
                                 plugin=artifact["name"],
                                 deps=len(candidate_meta.indicators)))
+                    except SandboxError as exc:
+                        if exc.code == "sandbox_unavailable":
+                            # 環境側の失敗。候補の責任ではないので staging を残し、
+                            # backlog を observation にせず、mission を failed で終端
+                            # する (環境が直れば再試行できるよう候補を失わない)
+                            self._finalize_gate_sandbox_unavailable(
+                                conn, ctx=ctx, backlog_id=selection.backlog_id,
+                                sandbox_reason=exc.sandbox_reason, now=now,
+                                tool_calls=tool_calls)
+                            return
+                        # 候補由来の失敗 (plugin_error 等) は従来どおり commit の外へ
+                        # 伝播させ、compensate_commit_failure の固定文言で終端する
+                        raise
                     except holdout.NoHistoryError as exc:
                         # Missing market history is an expected gate verdict;
                         # unrelated ValueErrors still abort the commit.
@@ -3106,6 +3149,48 @@ class ImproveLoop:
                 slot_key=ctx.slot_key if slot_terminalize else None,
                 mission_status="failed",
                 run_result=None, now=now, backlog_transition=None,
+                commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        self._settle_ledger_after_commit(
+            conn, ctx=ctx, ledger_ids=ledger_ids, outcome="failed", now=now)
+
+    def _finalize_gate_sandbox_unavailable(self, conn, *, ctx, backlog_id,
+                                           sandbox_reason, now,
+                                           tool_calls: int | None = None) -> None:
+        """commit gate で隔離不能 (環境側の失敗) になったときの終端。候補の責任では
+        ないので、`_finalize_gate_failed` と違い **staging を削除せず**、backlog を
+        `observation` にもしない。mission は固定 reason で `failed` 終端し、backlog は
+        再選択可能な `open` へ戻す (環境が直れば後続 mission が同じ候補を作り直せる —
+        旧実装は observation + staging 削除で候補が二度と戻らなかった)。
+
+        `sandbox_reason` は activity (技術ログ) にだけ出し、`last_result`・backlog・
+        agent 応答には流さない (遮断 8)。backlog を `open` へ戻すとき `last_result` は
+        NULL にする (`set_status` は常に上書きするため。sandbox_reason を書かない)。
+        `select_for_mission` が増やした `attempts` は戻さない (表示用の回数で、
+        選択の上限や優先度には使われていない)。"""
+        # staging は残す (候補の問題ではない。環境が直れば作り直せるよう消さない)
+        self._activity.write(
+            Category.IMPROVE, "mission_failed",
+            f"mission={ctx.mission_id} status=failed "
+            f"reason=gate_worker_sandbox_unavailable"
+            f"{f' sandbox_reason={sandbox_reason}' if sandbox_reason else ''}"
+            f"{_tool_calls_suffix(tool_calls)}")
+        conn.execute("BEGIN IMMEDIATE")
+        ledger_ids = None
+        try:
+            ledger_ids = self._persist_ledger_in_tx(
+                conn, ctx=ctx, now=now, mission_outcome="failed")
+            missions_store.finish_improve_mission(
+                conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
+                slot_key=ctx.slot_key, mission_status="failed",
+                run_result=None, now=now,
+                # observation にはしない。再選択可能な open へ戻す (last_result は NULL)
+                backlog_transition=(
+                    {"backlog_id": backlog_id, "status": "open", "last_result": None}
+                    if backlog_id is not None else None),
                 commit=False)
             conn.commit()
         except BaseException:

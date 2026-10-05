@@ -1,15 +1,12 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 128 件。完了分は CLOSED.md。
+未完了: 120 件。完了分は CLOSED.md。
 
-## 実装待ち (17)
+## 実装待ち (14)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 高 | 2026-10-03 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
-| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 高 | 2026-10-03 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
-| [plugin-worker-can-prlimit-other-processes](plugin-worker-can-prlimit-other-processes.md) | 高 | 2026-10-03 | plugin worker から同 uid の他プロセスの rlimit を書き換えられる |
 | [legacy-e2e-diag](legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [legacy-submit-corridor-bypasses-gate](legacy-submit-corridor-bypasses-gate.md) | 中 | 2026-09-12 | `afx plugin submit <name>` (live plugins/ の既存 plugin) は `ap… |
@@ -37,7 +34,7 @@
 | [mt5-import-window-before-data-start](mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (104)
+## 設計待ち (99)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -60,20 +57,17 @@
 | [signal-producer-catchup-requires-latest-tail](signal-producer-catchup-requires-latest-tail.md) | 中 | 2026-09-28 | producer は過去 bucket を順に評価 (`signal_producer.py:195`) しながら、毎… |
 | [trade-cron-hybrid-mode](trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
 | [trade-timeout-on-startup](trade-timeout-on-startup.md) | 中 | 2026-09-28 | 停止による打ち切りの trade mission が timeout と記録される |
-| [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 中 | 2026-09-30 | worker 応答の pid と error 文字列が無検証で session とログに入る |
 | [example-eval-source-defaults-to-dukascopy](example-eval-source-defaults-to-dukascopy.md) | 中 | 2026-10-02 | 設定例の履歴源の既定が dukascopy で大量取得を促す |
 | [full-suite-fd-over-1024-breaks-shell-tests](full-suite-fd-over-1024-breaks-shell-tests.md) | 中 | 2026-10-02 | 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる |
 | [gate-pytest-tail-stored-in-last-result](gate-pytest-tail-stored-in-last-result.md) | 中 | 2026-10-02 | gate の pytest 出力末尾が次回の改善 mission の材料になる |
 | [improve-handler-unexpected-exception-text-reaches-agent](improve-handler-unexpected-exception-text-reaches-agent.md) | 中 | 2026-10-02 | 改善 mission の handler で想定外例外の文面が agent に届く |
 | [news-fetch-no-user-agent-yahoo-429](news-fetch-no-user-agent-yahoo-429.md) | 中 | 2026-10-02 | ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す |
-| [plugin-ast-check-bypass-via-library-attributes](plugin-ast-check-bypass-via-library-attributes.md) | 中 | 2026-10-02 | plugin がライブラリの属性経由で os に届き、コード検査を回避できる |
 | [repo-readme-empty](repo-readme-empty.md) | 中 | 2026-10-02 | README.md が 0 バイト |
 | [research-user-agent-claims-unverified-url](research-user-agent-claims-unverified-url.md) | 中 | 2026-10-02 | 研究用取得の User-Agent が実在未確認の URL を名乗る |
 | [settings-yaml-duplicate-key-silently-last-wins](settings-yaml-duplicate-key-silently-last-wins.md) | 中 | 2026-10-02 | settings.yaml の重複キーは黙って後の値が効く |
 | [backlog-status-update-is-two-step-and-races-selection](backlog-status-update-is-two-step-and-races-selection.md) | 中 | 2026-10-03 | backlog reject/reopen/note が SELECT 後の更新で選択と競合する |
 | [improve-daily-params-weekly-algorithm](improve-daily-params-weekly-algorithm.md) | 中 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
 | [manual-improve-runs-synchronously-on-caller-thread](manual-improve-runs-synchronously-on-caller-thread.md) | 中 | 2026-10-03 | 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する |
-| [plugin-worker-startup-failure-unreadable](plugin-worker-startup-failure-unreadable.md) | 中 | 2026-10-03 | plugin worker の起動失敗の理由が読めない |
 | [harness-failure-becomes-fact](harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -104,7 +98,6 @@
 | [trade-prompt-says-hourly](trade-prompt-says-hourly.md) | 低 | 2026-09-28 | 取引判断 prompt の冒頭「1 時間毎に呼び出され」が固定文言のまま (判断足 15m では 15 分毎)。`de… |
 | [outage-observe-closed-guard-unpinned](outage-observe-closed-guard-unpinned.md) | 低 | 2026-09-29 | `OutageStateMachine.observe` の「閉場中は観測しない」early return を落として… |
 | [signal-producer-hourly-warning-before-confirmation](signal-producer-hourly-warning-before-confirmation.md) | 低 | 2026-09-29 | producer が毎時 xx:00:07 の tick で「1h bucket not yet present」を … |
-| [sandbox-lifecycle-minor-followups](sandbox-lifecycle-minor-followups.md) | 低 | 2026-09-30 | worker 観測境界の残り: ready 直後の死亡で code が割れる、細部の未 pin |
 | [backtest-aggregates-partial-minute-bars](backtest-aggregates-partial-minute-bars.md) | 低 | 2026-10-01 | backtest と resample が欠けた 1m 足をある分だけ集約し、部分的な足を作る |
 | [plugin-sees-live-spread](plugin-sees-live-spread.md) | 低 | 2026-10-01 | plugin と判断 mission が実 spread を見られるようにする |
 | [risk-gate-rr-uses-configured-spread](risk-gate-rr-uses-configured-spread.md) | 低 | 2026-10-01 | risk gate の RR 計算が設定値の spread を使い、実 spread と乖離する |
@@ -142,7 +135,6 @@
 | [opencode-node-modules-copytree](opencode-node-modules-copytree.md) | 低 |  | mission 毎に node_modules 63MB/3648 file を copytree。symlink +… |
 | [primary-transcript-lost-on-timeout](primary-transcript-lost-on-timeout.md) | 低 |  | timeout→段B 追撃経路で primary の transcript (tool 64 件) が保存されず消える |
 | [rpc-call-helper](rpc-call-helper.md) | 低 |  | RPC の framing が 2 箇所で重複実装されている |
-| [sandbox-pycache-prefix](sandbox-pycache-prefix.md) | 低 |  | `sandbox._build_env` が PYTHONPYCACHEPREFIX 未設定 → 候補 dir に _… |
 | [settings-hash-excludes-improve-gate](settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 

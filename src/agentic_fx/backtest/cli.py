@@ -380,6 +380,29 @@ def _backtest_run_proposal(conn, settings, args: argparse.Namespace) -> int:
     return 0
 
 
+def _sandbox_failure_text(plugin: str, e: "plugin_sandbox.SandboxError",
+                          intent_source) -> str:
+    """`backtest run --plugin` の SandboxError を人間向けの固定文にする。
+
+    隔離できない環境 (`sandbox_unavailable`) は plugin の問題ではないことを、load 後の
+    SIGSYS は原因未確定であることと kernel log の読み方を示す。それ以外は従来どおり
+    例外文字列 (worker 由来の部分は sandbox 側で整形済み) を出す。"""
+    head = (f"エラー: plugin '{plugin}' の評価がサンドボックスエラーで停止しました "
+            "(backtest_runs 行は残しません): ")
+    reason = getattr(e, "sandbox_reason", None)
+    if e.code == "sandbox_unavailable":
+        return (head + "この環境では plugin を隔離して実行できないため、plugin を読み込んで"
+                "いません (plugin の問題ではありません)。sandbox_reason="
+                f"{reason}。対処は docs/operations/backtest-failure-readable.md を参照")
+    if e.code == "crashed" and reason == "sigsys_unattributed":
+        pid = getattr(intent_source, "worker_pid", None)
+        hint = (plugin_sandbox.seccomp.sigsys_diagnostic_line(pid) if pid is not None
+                else "kernel log: journalctl -k -g 'type=1326'")
+        return (head + "worker が SIGSYS で終了しました。許可していない syscall か外部からの"
+                f"signal で、原因は確定していません。{hint} (strace -f で再現できます)")
+    return head + safe_error_text(e)
+
+
 def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
                          root: Path) -> int:
     """`--plugin <name>` 経路 (プラン 7 Task 5)。discover + check_source は
@@ -446,13 +469,15 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
                             intent_source=intent_source,
                             eval_timeframe=timeframe, history_conn=conn)
     except plugin_sandbox.SandboxError as e:
-        print(f"エラー: plugin '{args.plugin}' の評価がサンドボックスエラーで"
-             f"停止しました (backtest_runs 行は残しません): "
-             f"{safe_error_text(e)}", file=sys.stderr)
+        # 失敗文言を組む前に close で親の診断 (worker_pid 等) を取り込む。
+        # call() 中に worker が死ぬと worker_pid は診断取り込みまで None なので、
+        # 先に print すると pid つきの SIGSYS 案内が出せない。close は冪等なので
+        # finally の再 close は no-op になる。
+        intent_source.close()
+        print(_sandbox_failure_text(args.plugin, e, intent_source), file=sys.stderr)
         return 1
     finally:
-        # 上書き節 3: run_replay が例外で終わってもサンドボックスプロセス
-        # をリークさせない。
+        # run_replay が例外で終わってもサンドボックスプロセスをリークさせない。
         intent_source.close()
 
     if intent_source.eval_count == 0:

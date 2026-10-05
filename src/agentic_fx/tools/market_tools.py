@@ -141,9 +141,17 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
             try:
                 plugin_result = sandbox_run(meta, payload, settings=settings.plugin)
             except plugin_sandbox.SandboxError as exc:
-                _log.warning("plugin %s: indicator failed (%s) — dropping "
-                             "plugin:%s key (built-ins unaffected)",
-                             meta.name, exc, meta.name)
+                _log.warning("plugin %s: indicator failed (%s code=%s reason=%s) — "
+                             "built-ins unaffected",
+                             meta.name, exc, exc.code, exc.sandbox_reason)
+                fixed = _fixed_indicator_error(exc)
+                if fixed is not None:
+                    result[f"plugin:{meta.name}"] = {"error": fixed}
+                continue
+            except Exception as exc:  # noqa: BLE001  想定外の例外も tool 全体を落とさない
+                _log.warning("plugin %s: indicator failed unexpectedly (%s) — "
+                             "built-ins unaffected", meta.name, type(exc).__name__)
+                result[f"plugin:{meta.name}"] = {"error": INDICATOR_INTERNAL_ERROR}
                 continue
             result[f"plugin:{meta.name}"] = _project_indicator_output(plugin_result)
         return result
@@ -169,6 +177,22 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                                          "maximum": 7}},
                  "required": []}, get_econ_calendar),
     ]
+
+
+#: indicator plugin の隔離不能 (`sandbox_unavailable`)・SIGSYS 死・想定外の例外で tool 応答に載せる
+#: 固定文言。worker 由来の文字列や内部 reason は入れない (reason は技術ログだけ)
+INDICATOR_SANDBOX_UNAVAILABLE_ERROR = "plugin indicator unavailable: sandbox unavailable"
+INDICATOR_SIGSYS_CRASH_ERROR = "plugin indicator failed: worker crashed (cause not determined)"
+INDICATOR_INTERNAL_ERROR = "plugin indicator failed: internal error"
+
+
+def _fixed_indicator_error(exc: plugin_sandbox.SandboxError) -> str | None:
+    """固定文言を返す分類。それ以外の失敗は従来どおり plugin の key を落とすだけ (None)。"""
+    if exc.code == "sandbox_unavailable":
+        return INDICATOR_SANDBOX_UNAVAILABLE_ERROR
+    if exc.code == "crashed" and exc.sandbox_reason == "sigsys_unattributed":
+        return INDICATOR_SIGSYS_CRASH_ERROR
+    return None
 
 
 def _project_indicator_output(plugin_result: dict) -> dict:

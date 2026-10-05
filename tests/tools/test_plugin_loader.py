@@ -1163,3 +1163,50 @@ def test_market_tools_ignores_non_indicator_kind_after_two_phase(tmp_path):
                                sandbox_run=lambda *a, **k: {"x": 1.0})
     get_indicators = next(t.func for t in tools if t.name == "get_indicators")
     assert not any(k.startswith("plugin:") for k in get_indicators("USDJPY", "1h"))
+
+
+# ⑥ 隔離不能・SIGSYS・想定外の例外は固定文言で返る ---------------------------------
+
+def _indicator_result_for(tmp_path, caplog, exc):
+    d = _write_plugin(tmp_path, "fixed_err_ind")
+    from agentic_fx.plugin.loader import content_hash as ch
+    meta = PluginMeta(name="fixed_err_ind", kind="indicator", path=d, params={},
+                      timeframe=None, pairs=(), max_bars=50, content_hash=ch(d))
+
+    def failing_sandbox_run(meta_arg, payload, *, settings):
+        raise exc
+
+    provider = MagicMock()
+    provider.get_bars.return_value = _bars(n=120, interval="1h")
+    from agentic_fx.config import load_settings
+    settings = load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+    reg = ToolRegistry()
+    reg.register_all(market_tools.build(
+        provider, MagicMock(), settings, indicator_plugins=[meta],
+        sandbox_run=failing_sandbox_run))
+    with caplog.at_level(logging.WARNING):
+        return reg.func("get_indicators")(pair="USDJPY", timeframe="1h")
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (SandboxError("MARKER_MSG", code="sandbox_unavailable",
+                  sandbox_reason="MARKER_REASON"),
+     market_tools.INDICATOR_SANDBOX_UNAVAILABLE_ERROR),
+    (SandboxError("MARKER_MSG", code="crashed", sandbox_reason="sigsys_unattributed"),
+     market_tools.INDICATOR_SIGSYS_CRASH_ERROR),
+    (RuntimeError("MARKER_MSG"), market_tools.INDICATOR_INTERNAL_ERROR),
+])
+def test_get_indicators_reports_a_fixed_error_for_the_plugin_key(tmp_path, caplog, exc,
+                                                                 expected):
+    import json
+    result = _indicator_result_for(tmp_path, caplog, exc)
+    assert result["plugin:fixed_err_ind"] == {"error": expected}
+    assert "rsi_14" in result  # 組み込みは必ず返る
+    assert "MARKER" not in json.dumps(result, default=str)
+
+
+def test_get_indicators_logs_the_sandbox_reason_but_not_in_the_response(tmp_path, caplog):
+    exc = SandboxError("fixed", code="sandbox_unavailable", sandbox_reason="landlock_x")
+    _indicator_result_for(tmp_path, caplog, exc)
+    assert "landlock_x" in caplog.text

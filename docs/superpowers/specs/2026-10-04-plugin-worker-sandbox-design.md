@@ -1,12 +1,12 @@
-# [plugin-worker-landlock] plugin worker 隔離設計 v1.0
+# [plugin-worker-landlock] plugin worker 隔離設計 v1.3
 
-版: v1.0
+版: v1.3
 
 日付: 2026-10-04
 
 対象チケット: `candidate-strategy-backtest-runs-without-landlock` (高)
 
-対象: `PluginSession` が起動する `python -m agentic_fx.plugin.worker <plugin_dir>`
+対象: `PluginSession` が起動する `python -B -m agentic_fx.plugin.worker <plugin_dir>`
 
 ## 要点
 
@@ -34,6 +34,8 @@ AST の `check_source` は善意の事故防止として残すが、隔離の主
 ### 1.2 信頼境界
 
 信頼済み runtime は uv 管理の CPython、repo の `.venv`、`src/agentic_fx`、`sysconfig` が返す runtime path である。これらは interpreter と隔離コードを動かすため sandbox 適用前にも読まれ、改竄されていれば本設計は保証しない。
+
+**親が `load` を送った後に worker から届く行は、すべて候補が制御し得る入力として扱う。** worker は protocol 用の fd を持ったまま同じ process で plugin を実行するので、plugin はその fd へ直接書ける (要求行を先に読むこともできる)。`sandbox_ready` は plugin が 1 行も動く前に検証を終えるので偽造できないが、それより後の `plugin_ready`、call の応答、error 文字列、申告 pid は、worker の信頼コードを経由した保証を持たない。安全は親の検証だけで成立させ、worker 側の検証に依存しない (§2.5、LL-29)。supervisor process と plugin 実行 process の分離は採らない (§12)。
 
 同 uid の外部 process は worker へ signal を送れるため信頼境界外である。外部 SIGSYS は防御対象外だが、候補の syscall と誤帰責しない。
 
@@ -64,7 +66,7 @@ AST の `check_source` は善意の事故防止として残すが、隔離の主
 2. 対応集合内なら admission 成功とする。集合外なら専用 harness で代表自己試験を 1 回行い、成功時だけ WARNING 付きで許可する。失敗は `sandbox_unavailable / runtime_fingerprint_selftest_failed` とする。
 3. 結果を fingerprint 単位で process 内 cache する。service は eager、その他の入口は最初の session で lazy に実行する。自己試験 harness は `PluginSession` を再帰的に呼ばず、同じ Landlock/seccomp profile を直接適用する。
 4. x86_64、Landlock ABI 3 以上、seccomp TSYNC/LOG の利用可否を測り、固定 reason と期待 attestation を作る。
-5. **`Popen` の直前**に現在 thread の `/proc/thread-self/status` を読む。`Seccomp_filters` field がない、読めない、または 0 でない場合は Popen を呼ばず `sandbox_unavailable / inherited_seccomp_filter` とする。
+5. **`Popen` の直前**に現在 thread の `/proc/thread-self/status` を読む。`Seccomp_filters` field がない、読めない、または 0 でない場合は Popen を呼ばず `sandbox_unavailable / inherited_seccomp_filter` とする。なお `Seccomp_filters` 欄の無い kernel は host preflight が先に `seccomp_status_field_unavailable` で検知するので、通常この field 不在には至らない (多層防御として残す)。
 
 親 preflight と worker 再検査の両方を必須にする。親 preflight は CPython 起動前に固定 reason を保証し、worker 再検査は起動経路の取り違えに対する多層防御になる。
 
@@ -72,7 +74,7 @@ AST の `check_source` は善意の事故防止として残すが、隔離の主
 
 worker は次の順序を変えない。
 
-1. stdout を protocol 用に退避し、fd 1 を stderr へ向ける。rlimit 前に全固定失敗行を bytes 化し、隔離段が使う module、traceback、linecache、tokenize を import する。
+1. `sys.dont_write_bytecode = True` を設定する (親も `-B` で起動する。sandbox 下の遅延 import が `__pycache__` を作ろうとすると `mkdir` が allowlist 外で worker が SIGSYS 死するため、bytecode の書き出しそのものを止める)。stdout を protocol 用に退避し、fd 1 を stderr へ向ける。rlimit 前に全固定失敗行を bytes 化し、隔離段が使う module、traceback、linecache、tokenize を import する。
 2. handshake を読み、main/indicator の `content_hash` と 128 bit の `attest_nonce` を得る。
 3. CPU、CORE、AS、NOFILE、FSIZE、NPROC の rlimit を設定する。失敗は `rlimit_failed`。
 4. `/proc/self/status` の `Seccomp_filters` を読み、field 不在・読取不能・非 0 を `inherited_seccomp_filter` で拒否する。
@@ -111,7 +113,7 @@ worker は次の順序を変えない。
 
 親は envelope/attested field の完全一致と、`Popen.pid` 配下の全 task の `/proc/<pid>/task/*/status` が `NoNewPrivs: 1`、`Seccomp: 2`、`Seccomp_filters: 1` であることを検査する。継承 filter を事前拒否するため `N+1` は使わず 1 固定とする。`/proc` 検査の対象は常に `Popen.pid` で、worker の `pid` 申告は使わない。
 
-検査は次の順で行い、どれかで止まれば `load` を送らず kill して `sandbox_unavailable` とする。複数の違反が同時にあっても、先に検査される項目の reason に固定される。
+検査は次の順で行い、どれかで止まれば `load` を送らず kill して `sandbox_unavailable` とする。ただし順 3 の `ok:false` のうち候補由来の reason (`plugin_file_invalid`・`allowlist_not_leaf`・`allowlist_guarded`) は `plugin_error` とする (§5.1)。複数の違反が同時にあっても、先に検査される項目の reason に固定される。
 
 |順|検査|reason|
 |---|---|---|
@@ -141,6 +143,19 @@ main と各 indicator は次だけで読む。
 `importlib` の file loader は使わない。読取上限超過、hash 不一致、decode 失敗、規則追加後の rename による `openat` の EACCES、exec 失敗はすべて起動失敗の `plugin_error` で、候補側の事象とする。exec 失敗時は module を捨てる (どこにも登録しないので掃除は不要)。
 
 plugin dir 自体に read 規則を張らないため、pyc、`test_plugin.py`、追加 payload、dir listing は使えない。規則追加後の rename で別 inode に差し替えられた名前も EACCES になる。
+
+### 2.5 `load` 後の応答の検証 (親)
+
+親は `load` 送信後の全ての行を次の規則で扱う。違反は protocol 違反として session を kill + reap し、候補側の失敗に分類する。
+
+1. 行長の上限を超える行、JSON として読めない行、読み取りが例外になる行 (桁数の多すぎる整数、深すぎる入れ子を含む)、`NaN`・`Infinity`、重複キー、object でない値は拒否する。どの例外も session の後始末を飛ばさない。
+2. 要求ごとに親が乱数の request id を入れ、応答に同じ id が無ければ拒否する。要求を送る前に受信済みの bytes が残っていれば拒否する。1 要求に 2 行以上届けば拒否する。id は plugin からも観測できるので出所の証明ではなく、ずれと先回りを排除するためのものである。
+3. worker の終了を観測した後に残っていた行は採用しない。ただし `load` への正規の 1 応答である `plugin_ready` だけは例外で、worker が ok:false を書いて即座に死に、親が遅れて死を先に観測したときも、その 1 行は読んで分類する (候補の import 失敗 `plugin_error` を `crashed` に化けさせない)。drain で読んだ `plugin_ready` が ok:true なら `load` 後の死として `crashed` にする。call 応答 (`plugin_ready` より後の行) はこの例外に含めない。
+4. 応答の中身は、要求の種類ごとに親が意味まで検証する (indicator は系列長と index を親が渡した frame と照合、数値は有限で float に表せること、signal・strategy は既存の contract)。worker 側の検証と同じかそれ以上を親が行う。
+5. 申告 pid は `Popen.pid` と照合するだけで保持しない。error 文字列と未知 field は、ログ・activity・CLI に出す前に長さ上限と制御文字の除去を通す。改善 agent への tool 応答と承認 payload には worker 由来の文字列を入れない。
+6. `close()` は例外を出さず、必ず kill・reap・fd の close まで行う。
+
+親の検証を通る値を正しい request id つきで plugin が直接書いた場合は、plugin の通常の戻り値と区別しない (plugin は同じ値を戻り値として返せる)。CPU 超過・crash・SIGSYS・timeout の分類と CPU の値は親の wait4 と時計で決まり、行の内容では変わらない。
 
 ## 3. Landlock / FS allowlist
 
@@ -278,10 +293,11 @@ KILL は `actions_logged` の `kill_process`、errno 判定は `SECCOMP_FILTER_F
 
 |発生点|固定 reason|内部 code|公開分類 / 動作|
 |---|---|---|---|
-|親 host preflight|`arch_unsupported`、`landlock_unavailable`、`landlock_abi_too_old`、`seccomp_unavailable`|`sandbox_unavailable`|`worker_sandbox_unavailable`、`started:false`|
+|親 host preflight|`arch_unsupported`、`landlock_unavailable`、`landlock_abi_too_old`、`seccomp_unavailable`、`missing_system_dir:<name>` (zoneinfo 等が無い)、`seccomp_status_field_unavailable` (`Seccomp_filters` 欄の無い kernel)|`sandbox_unavailable`|`worker_sandbox_unavailable`、`started:false`|
 |共通 fingerprint gate|`runtime_fingerprint_selftest_failed`|`sandbox_unavailable`|同上。Popen/load 前|
 |親 Popen 直前または worker 再検査|`inherited_seccomp_filter`|`sandbox_unavailable`|同上。親で検出した場合は Popen 未実行|
-|worker 隔離段|`rlimit_failed`、`landlock_abi_too_old`、`keyring_join_failed`、`landlock_task_inspection_failed`、`landlock_multithreaded`、`runtime_root_too_wide`、`fd_open_failed`、`allowlist_guarded`、`allowlist_not_leaf`、`plugin_file_invalid`、`landlock_create_failed`、`landlock_add_rule_failed`、`no_new_privs_failed`、`landlock_restrict_failed`、`seccomp_failed`、`isolation_unexpected_error`、`runtime_import_failed`|`sandbox_unavailable`|親 reason は `sandbox_setup_failed:<reason>`、未知値は `sandbox_setup_failed:unknown`|
+|worker 隔離段 (環境側)|`rlimit_failed`、`landlock_abi_too_old`、`keyring_join_failed`、`landlock_task_inspection_failed`、`landlock_multithreaded`、`runtime_root_too_wide`、`fd_open_failed`、`landlock_create_failed`、`landlock_add_rule_failed`、`no_new_privs_failed`、`landlock_restrict_failed`、`seccomp_failed`、`isolation_unexpected_error`、`runtime_import_failed`|`sandbox_unavailable`|親 reason は `sandbox_setup_failed:<reason>`、未知値は `sandbox_setup_failed:unknown`|
+|worker 隔離段 (候補側)|`plugin_file_invalid`、`allowlist_not_leaf`、`allowlist_guarded`|`plugin_error`|候補の `plugin.py`/`config.yaml` が原因 (symlink・非通常ファイル・guarded dir)。`started:true`、候補枠を消費、agent に修正を促す|
 |attestation|`attestation_missing`、`attestation_missing:<field>`、`attestation_order`、`attestation_unexpected_message`、`attestation_unexpected_field`、`attestation_mismatch:<field>`|`sandbox_unavailable`|`load` を送らず kill|
 |子 `/proc` 検査|`proc_status_mismatch:<NoNewPrivs\|Seccomp\|Seccomp_filters>`、`proc_status_unreadable`|`sandbox_unavailable`|同上|
 |Popen/worker bootstrap|`worker_bootstrap_failed`|`sandbox_unavailable`|Popen OSError、`load` 前の非 SIGSYS 自己終了|
@@ -297,7 +313,7 @@ KILL は `actions_logged` の `kill_process`、errno 判定は `SECCOMP_FILTER_F
 |呼び出し元|`sandbox_unavailable`|SIGSYS after `load`|
 |---|---|---|
 |改善 run_backtest|`worker_sandbox_unavailable`、固定 hint、`started:false`。候補枠・CPU 観測は不変、tool error streak は増加。activity は `result=sandbox_unavailable sandbox_reason=...`|`worker_crashed`、`started:true`、通常 crash と同じ候補枠/streak。activity は `result=crashed sandbox_reason=sigsys_unattributed`|
-|holdout / commit gate|固定文言で gate 不合格|原因未確定 crash として人間へ報告|
+|holdout / commit gate|候補の不合格にしない。staging を残し backlog を observation にせず、mission を固定 reason で `failed` 終端 (backlog は再選択可能な `open` へ戻す)。候補側の失敗 (`plugin_error` 等) は従来どおり commit の外へ伝播し、補償 (`commit_failed`) で終端|原因未確定 crash として人間へ報告|
 |live|signal を出さず `result=sandbox_unavailable` を初回 + 60 回ごとに通知。scheduler は継続|`result=crashed`、候補修正要求なし|
 |indicator tool|固定 tool error|固定 crash error|
 |CLI|rc=1 と人間向け固定理由|rc=1 と SIGSYS 診断|
@@ -313,7 +329,7 @@ KILL は `actions_logged` の `kill_process`、errno 判定は `SECCOMP_FILTER_F
 - glibc version と package/build identity。
 - CPython major/minor/micro、build string、executable identity。
 - numpy/pandas の version、wheel Generator、compatibility Tag。
-- installed numpy/pandas の各 `.dist-info/RECORD` bytes の SHA-256。
+- installed numpy/pandas の各 `.dist-info/RECORD` の正規化 SHA-256。正規化は、path が `../` で始まる行 (site-packages の外を指す console script 等。shebang に venv の絶対 path が入り、同じ wheel でも venv の場所ごとに hash が変わる) を除き、残りの行を並び順・行末のまま連結した bytes の SHA-256 とする。
 - sandbox profile と seccomp filter の版。
 
 ### 6.2 対応済み集合
@@ -325,8 +341,8 @@ KILL は `actions_logged` の `kill_process`、errno 判定は `SECCOMP_FILTER_F
 |kernel / arch / Landlock|`7.0.0-38-generic` / `x86_64` / ABI `8`|
 |glibc|`2.43` (`Ubuntu GLIBC 2.43-2ubuntu2.4`)|
 |CPython|`3.13.14` (`main`, 2026-06-11 04:03:13)|
-|numpy|`2.5.1`、Generator `meson`、Tag `cp313-cp313-manylinux_2_27_x86_64` / `manylinux_2_28_x86_64`、RECORD SHA-256 `dee14f0a4495645fe7103a65e7232f2f121e61f8a486757d33f080b9bf7dc602`|
-|pandas|`3.0.5`、Generator `meson`、Tag `cp313-cp313-manylinux_2_24_x86_64` / `manylinux_2_28_x86_64`、RECORD SHA-256 `e9ba5610142346491f808af3ed84b371105e227ddb43d5b761bff583c2c990f3`|
+|numpy|`2.5.1`、Generator `meson`、Tag `cp313-cp313-manylinux_2_27_x86_64` / `manylinux_2_28_x86_64`、RECORD 正規化 SHA-256 `1302287028025a50047b0a8ca45e78195209fdc9a53efb0d25c3a7a86a2e792b`|
+|pandas|`3.0.5`、Generator `meson`、Tag `cp313-cp313-manylinux_2_24_x86_64` / `manylinux_2_28_x86_64`、RECORD 正規化 SHA-256 `e9ba5610142346491f808af3ed84b371105e227ddb43d5b761bff583c2c990f3` (`../` 行なし)|
 |profile|`plugin-worker/6` / seccomp `allow/6`|
 
 ABI 3〜7 は構造上サポートする分岐を持つが、対応済み集合には入れない。kernel/ABI、userspace、wheel artifact のどれかが違えば集合外である。
@@ -364,7 +380,7 @@ ABI 3〜7 は構造上サポートする分岐を持つが、対応済み集合�
 |LL-3|allowlist は guarded root を覆わない。runtime/system は `/tmp` 子孫でなく、plugin は親が選んだ leaf の 2 ファイルだけ、runtime は `sysconfig` subtree だけとする|
 |LL-4|規則追加、自己検査、source 読取に同じ fd 系統を使う。plugin dir に規則を張らず、`plugin.py` と `config.yaml` の inode に `READ_FILE` だけを張る|
 |LL-5|`socket` と `io_uring_setup` は常に EACCES。利用できる kernel では Landlock network/scope も必ず適用する|
-|LL-6|隔離不能 host、admission 失敗、worker 隔離失敗は `sandbox_unavailable` とし、`plugin_error` / `backtest_failed` にしない。agent には固定文言だけを出す|
+|LL-6|隔離不能 host、admission 失敗、環境側の worker 隔離失敗は `sandbox_unavailable` とし、`backtest_failed` にしない。候補の `plugin.py`/`config.yaml` が原因の隔離失敗 (`plugin_file_invalid`・`allowlist_not_leaf`・`allowlist_guarded`) だけは候補の責任として `plugin_error` にする。agent には固定文言だけを出す|
 |LL-7|隔離を無効化する設定キーを作らない|
 |LL-8|pyc と追加 payload を読まず `__pycache__` を書かない。hash 照合した同じ source bytes だけを実行し、traceback も同じ bytes を表示する|
 |LL-9|束 A v1.5 の IV-1〜IV-21 を弱めない|
@@ -383,22 +399,23 @@ ABI 3〜7 は構造上サポートする分岐を持つが、対応済み集合�
 |LL-22|kernel log の可読性を隔離要件や分類条件にしない。wait4 status、親 kill、`load` の印だけで分類する|
 |LL-23|親 kill なしの SIGSYS は `load` 後なら `crashed / sigsys_unattributed`、前なら `sandbox_unavailable / startup_sigsys_unattributed` とし、候補へ誤帰責しない|
 |LL-24|継承 seccomp filter を worker が独自 filter/Landlock 前に再検査し、非 0・field 不在・読取不能を `inherited_seccomp_filter` で拒否する。filter 合成と `N+1` 検査はしない|
-|LL-25|親は `Popen` 直前に現在 thread の `/proc/thread-self/status` を検査し、`Seccomp_filters` の非 0・field 不在・読取不能を `sandbox_unavailable / inherited_seccomp_filter` として Popen 未実行で拒否する|
-|LL-26|fingerprint 判定と集合外の代表自己試験は全 `PluginSession` の共通 admission gate であり、`PluginSession` の全呼び出し元 (service の live、improve の backtest、CLI) のどの入口からも迂回できない。結果は fingerprint 単位で process 内 cache し、失敗 reason は `runtime_fingerprint_selftest_failed` とする|
-|LL-27|fingerprint は numpy/pandas の version/tag だけでなく、各 dist-info `RECORD` bytes の SHA-256 と Landlock ABI を含む|
+|LL-25|親は `Popen` 直前に現在 thread の `/proc/thread-self/status` を検査し、`Seccomp_filters` の非 0・field 不在・読取不能を `sandbox_unavailable / inherited_seccomp_filter` として Popen 未実行で拒否する。欄の無い kernel は host preflight が先に `seccomp_status_field_unavailable` で拒否するので、field 不在の拒否は多層防御として残す|
+|LL-26|fingerprint 判定と集合外の代表自己試験は全 `PluginSession` の共通 admission gate であり、`PluginSession` の全呼び出し元 (service の live、improve の backtest、CLI) のどの入口からも迂回できない。成功と恒久失敗は fingerprint 単位で process 内 cache する (選択肢が変わらないので再試行しない)。一時要因 (`timeout`・`spawn_failed` = 負荷・fd/メモリ逼迫) の失敗は恒久 cache せず、最小間隔 (`SELFTEST_RETRY_INTERVAL_SEC`) を空けて再試行する (環境が直れば service 再起動なしで許可へ戻れる)。失敗 reason はいずれも `runtime_fingerprint_selftest_failed` とする|
+|LL-27|fingerprint は numpy/pandas の version/tag だけでなく、各 dist-info `RECORD` の正規化 SHA-256 (§6.1) と Landlock ABI を含む|
 |LL-28|対応済み集合は §6.2 の ABI 8 の 1 組だけとする。ABI 3〜7 は集合外として代表自己試験へ送り、実 kernel 測定なしに対応集合へ追加しない|
+|LL-29|`load` 送信後に worker から届く行は候補が制御し得る入力であり、親は §2.5 の検証だけで安全を成立させる。worker 側の検証・正規化に親が依存する箇所を持たない|
 
 ## 9. 受入条件
 
 1. 実 worker の probe が allowlist 外 FS、兄弟 plugin、作成、pathname/fd exec、TCP、abstract/pathname UDS への到達に失敗し、server hit は 0。seccomp の exec 行だけを外した対照でも pathname exec は Landlock の EACCES になる。
 2. guarded root 判定の純関数は、全拒否の 3 方向、覆い拒否の 2 方向、runtime/system の `/tmp` 子孫、plugin leaf/symlink、広すぎる runtime root を全て拒否する。
 3. examples の rsi_pullback と symlink 配備 rsi_indicator の in_sample が完走し、独立 oracle と全件一致する。
-4. 既存の実 worker tests 14 ファイル 518 件を変更なしで通し、92 worker 全てで二段検証が成功し、正常系 SIGSYS が 0 である。examples 1508 評価と thread/BLAS workload も完走し、ENOSYS は `clone3` だけである。
+4. 既存の実 worker tests 14 ファイル 518 件を通し (bytecode cache の生成を前提にしていた 1 件は #40 により期待を反転)、92 worker 全てで二段検証が成功し、正常系 SIGSYS が 0 である。examples 1508 評価と thread/BLAS workload も完走し、ENOSYS は `clone3` だけである。
 5. 実子 process で rlimit、ABI 3〜7 task 検査経路、未知例外、guarded path、EMFILE を実際に失敗させ、固定 reason、traceback、`sandbox_ready ok:false` を確認する。親の写像は制御 worker で `sandbox_unavailable` と stderr 技術ログを確認する。
 6. 偽 pyc を無視し `__pycache__` を作らない。rename 差替えと hash 不一致を実行せず、top-level/call traceback の source 行は書換え前の実行 bytes と一致する。main の module 名は `plugin`、複数 indicator は各 `indicator_<alias>` で互いに衝突せず、`__spec__` の name・origin (= `__file__`)・`has_location`、`__loader__ is None` を確認する。decode 失敗、hash 不一致、rename 後の open 失敗、exec 失敗はいずれも `plugin_error` となる。
 7. 同一 host の隔離あり/なし 7 回の `__enter__` 中央値差が 20 ms 以下。時間 assert は CI 単体テストにしない。
 8. 実 worker から fork/vfork/非 thread clone/posix_spawn は EPERM、`clone3` は ENOSYS、thread は成功する。拒否されなかった対照子は即 `_exit` して残さない。
-9. 実 Popen の二段 protocol で、旧一段、順序違い、余分な行、nonce/pid/field 不一致、隔離なし偽 attestation、plugin による偽造を拒否し、親が `load` を送らなかったとき plugin top-level が動いていないことを確認する。複数の違反が同時にある応答 (例: `ok:false` と余分 field、余分 field と pid 不一致、pid 不一致と nonce 不一致、attestation 不一致と先読み余分行) は、§2.3 の表で先に検査される項目の reason に固定される。
+9. 実 Popen の二段 protocol で、旧一段、順序違い、余分な行、nonce/pid/field 不一致、隔離なし偽 attestation、plugin による `sandbox_ready` (attestation) の偽造を拒否し、親が `load` を送らなかったとき plugin top-level が動いていないことを確認する。複数の違反が同時にある応答 (例: `ok:false` と余分 field、余分 field と pid 不一致、pid 不一致と nonce 不一致、attestation 不一致と先読み余分行) は、§2.3 の表で先に検査される項目の reason に固定される。
 10. ABI 8 の実 host で raw syscall の名前つき errno、ruleset、network/scope、attestation、全正常 workload を確認する。ABI 3、4〜5、6〜7 の ruleset 構造体サイズ、optional field、TSYNC/single-task、attestation 分岐は構造検査で確認する。旧 ABI の実 kernel 完走は対応集合を広げる条件であり、本受入の完了条件にしない。
 11. live tick 相当の 1 本/5 本直列測定で増分を記録し、複数 plugin 配備前に `live-signal-eval-blocks-protection-tick` を解決する。
 12. 実 worker で `keyctl`、`add_key`、`request_key` が SIGSYS となり、匿名 session keyring が親と別である。helper がある host で対照だけ helper が起動することは対応拡張時に測る。
@@ -424,11 +441,13 @@ ABI 3〜7 は構造上サポートする分岐を持つが、対応済み集合�
 32. 継承 filter を持つ環境では worker 再検査が独自 filter/Landlock 前に `inherited_seccomp_filter` を返し、親は `load` を送らない。独自 filter 後の全 task は `Seccomp_filters=1` 固定とする。
 33. `load` 後に同 uid helper が外部から SIGSYS を送ると `crashed / sigsys_unattributed`、公開 `worker_crashed`、`started:true`、通常 crash と同じ候補枠/streak、候補修正要求なしとなる。
 34. 同じ SIGSYS wait status について kernel log が読める、該当行なし、権限で読めない、の全てで公開分類、reason、候補枠、hint が同一になる。
-35. 実 filter を持つ別 process 内で `PluginSession` を呼ぶと、親の `/proc/thread-self/status` preflight が field 非 0 を検出し、Popen を 1 回も呼ばず `sandbox_unavailable / inherited_seccomp_filter` とする。field 不在・読取不能も同じとする。
-36. `PluginSession` の全呼び出し元である service eager、CLI、`signal_eval`、live、improve の backtest の各入口で同じ fingerprint gate が必ず動く。集合外 fingerprint の自己試験は process 内で 1 回だけ、cache hit では再実行せず、失敗は全入口で `runtime_fingerprint_selftest_failed` とする。専用 harness は再帰しない。
-37. fingerprint の単体テストは numpy/pandas の version/tag が同じでも `RECORD` bytes のどちらか 1 bit が変われば別 fingerprint とし、§6.2 の 2 SHA-256 を正規化後も保持する。
+35. 実 filter を持つ別 process 内で `PluginSession` を呼ぶと、親の `/proc/thread-self/status` preflight が field 非 0 を検出し、Popen を 1 回も呼ばず `sandbox_unavailable / inherited_seccomp_filter` とする。読取不能も同じとする。読めるが `Seccomp_filters` 欄の無い kernel は host preflight が先に `sandbox_unavailable / seccomp_status_field_unavailable` とする (Popen 未実行)。
+36. `PluginSession` の全呼び出し元である service eager、CLI、`signal_eval`、live、improve の backtest の各入口で同じ fingerprint gate が必ず動く。集合外 fingerprint の自己試験は、成功・恒久失敗なら process 内で 1 回だけ (cache hit では再実行しない)。一時失敗 (`timeout`・`spawn_failed`) は最小間隔内では再実行せず、間隔を超えたら再試行する。失敗は全入口で `runtime_fingerprint_selftest_failed` とする。専用 harness は再帰しない。
+37. fingerprint の単体テストは numpy/pandas の version/tag が同じでも `RECORD` の `../` 以外の行のどちらか 1 bit が変われば別 fingerprint とし、`../` で始まる行の変更では変わらず、§6.2 の 2 SHA-256 を正規化後も保持する。
 38. Landlock ABI が 8 から 3〜7 のいずれかへ変われば集合外になり、代表自己試験へ送られる。T1 は ABI 分岐の構造検査と ABI 8 host の正常 workload 完走で完了し、ABI 3〜7 の実 kernel 測定なしに対応集合を広げない。
 39. config schema、`config/settings.yaml.example`、環境変数、CLI flag のいずれにも隔離 (admission、Landlock、seccomp、二段 protocol) を無効化・緩和する設定口がないことを検査する。schema の全 key、example、`os.environ` の参照、`backtest run` と `afx` の全 flag を走査し、隔離に関わる名前が存在せず、未知 key を与えても隔離が有効のままである。
+40. bytecode cache (`__pycache__`) が 1 つも無い venv (`uv sync` 直後に相当) で実 worker を起動し、runtime 自己試験と examples の in_sample が SIGSYS 0 で完走する。worker の `sys.dont_write_bytecode` を外す変異、および親の `-B` と worker の設定の両方を外す変異では、遅延 import の `mkdir` で worker が SIGSYS 死する。完走後も venv と plugin dir に `__pycache__` が増えていない。
+41. 実 worker の中で plugin が protocol fd へ直接、(a) 壊れた行・桁数の多すぎる整数・深すぎる入れ子・`NaN`・上限超の行、(b) 余分な行と先回りの応答、(c) 偽の `plugin_ready`・`sandbox_ready`、(d) 応答の直後の SIGSYS 死・CPU の空転、を起こしても、親は protocol 違反または通常の失敗分類にし、worker を残さず、候補枠・CPU 観測・cursor・signal の commit を誤って進めない。親の検証を通る値を正しい request id つきで直接書いた場合は通常の戻り値と同じ扱いになり、その値が親の validator を通ったものだけであることを確認する。indicator の系列長の不一致、float に表せない数値は、worker の検証を迂回して届いても親が拒否する。
 
 ## 10. テスト方針
 
@@ -467,8 +486,8 @@ T1・T2 の完了判定は、二段 protocol を通さない直接子 process �
 |---|---|---|---|---|---|
 |T1 Landlock|ABI 別 ruleset、fd/file 規則、TSYNC/single-task、ABI API。既存 `restrict_to` の呼び出し元 (gate、improve) の挙動は変えない|なし|`core/landlock.py`、tests|#2、#10、#13、#15、#16、#28、#38。この host で直接子 harness による正常 workload 完走 + ABI 3〜7 分岐の構造検査|T2 と可|
 |T2 seccomp + fingerprint|データ表から `allow/6` 生成、引数条件、fallback、fingerprint/RECORD hash、代表自己試験 harness/cache 契約|なし|`core/seccomp.py` (新設)、fingerprint と自己試験 harness の新設 module、開発用スクリプト、tests|#8、#10、#14、#17、#19〜21、#25〜26、#29、#31、#37。直接子 harness による単独 process 受入|T1 と可|
-|T3 worker isolation + loader|protocol を通さない実子で隔離段、固定失敗応答、source-only loader|T1、T2|`plugin/worker_isolation.py` (新設)、tests。`plugin/worker.py`・`plugin/sandbox.py` は触らない|#5〜6、#12〜17、#19、#22、#24〜25、#27〜29、#31|不可|
-|T4 親 + 共通 admission + 束 A + live/CLI|Popen 直前 preflight、二段 protocol、`PluginSession` の全呼び出し元、束 A v1.5、service eager/CLI lazy gate|T3|`plugin/worker.py`、`plugin/sandbox.py`、`loops/improve_loop.py`、`plugin/signal_producer.py`、`backtest/cli.py`、`service.py`、tests|#1、#3〜5、#9、#18、#21〜23、#25〜26、#30、#32〜36、#39、束 A AC-28〜35|不可|
+|T3 worker isolation + loader|protocol を通さない実子で隔離段、固定失敗応答、source-only loader|T1、T2|`plugin/worker_isolation.py` (新設)、tests。`plugin/worker.py`・`plugin/sandbox.py` は触らない|#5〜6、#12〜17、#19、#22、#24〜25、#27〜29、#31、#40|不可|
+|T4 親 + 共通 admission + 束 A + live/CLI|Popen 直前 preflight、二段 protocol、`PluginSession` の全呼び出し元、束 A v1.5、service eager/CLI lazy gate|T3|`plugin/worker.py`、`plugin/sandbox.py`、`loops/improve_loop.py`、`plugin/signal_producer.py`、`backtest/cli.py`、`service.py`、tests|#1、#3〜5、#9、#18、#21〜23、#25〜26、#30、#32〜36、#41、#39、束 A AC-28〜35|不可|
 |T5 運用 + perf + gate profile|service uid の kernel log、起動/tick性能、SIGSYS/coredump負荷、runbook、別 gate pytest profile/ticket (`gate-pytest-dev-writable-and-ldso-exec`)|T4|`docs/tickets/`、runbook、実測表|#7、#11、#26、実測表と運用手順の更新|不可|
 
 T1 は `core/landlock.py` だけ、T2 は新設の `core/seccomp.py` と fingerprint/自己試験 module だけを所有し、同じファイルを触らない。`plugin/sandbox.py` と `plugin/worker.py` を触るのは T4 だけである。
@@ -487,6 +506,9 @@ T4 の最初に偽 worker fixture、Popen seam、旧一段 ready、既存 6 outc
 |metadata side channel|`stat` 系により allowlist 外 path の存在・size・mtime が見える場合がある。内容と書込みは拒否|
 |`/usr/lib`|distro 配布物だけを置く運用前提。秘密を置く運用は対応外|
 |RLIMIT_NPROC|per-uid 累積で thread 可用性が host 依存。別チケットで扱う|
+
+- **`load` 後の応答は plugin が直接書ける。** 同じ process に protocol fd があるため、plugin は worker の信頼コードを通さずに応答行を書ける。親の検証 (§2.5) を通る値については通常の戻り値と区別できない。supervisor process と plugin 実行 process の分離は、process 生成を閉じる構造と起動時間 (1 worker 約 150 ms) を大きく変えるため採らず、親側の検証で閉じる。
+- **cwd に依存する API は worker を殺す。** `getcwd` は allowlist 外なので、sandbox 下で `os.getcwd()`、相対 path の `os.path.abspath()`、`Path.resolve()`、`Path.cwd()` を呼ぶと SIGSYS 死する。worker は `-m` 起動で `sys.path` を起動時に絶対化しているので import は影響を受けない。候補 plugin がこれらを呼んだ場合は `crashed / sigsys_unattributed` になり、人間の診断を要する。
 
 ## 13. 未決事項
 
@@ -515,3 +537,7 @@ T4 の最初に偽 worker fixture、Popen seam、旧一段 ready、既存 6 outc
 |2026-10-03|C0 v0.8|8 周目直前までの隔離、allowlist、二段 protocol、loader、分類、実測を統合|設計レビュー 7 周と裁定の統合|未コミット|
 |2026-10-04|v1.0|r8 5 件を反映し、最終動作、表、LL-1〜28、受入 #1〜38、task、残余を公開 spec として清書|設計レビュー収束と実装着手条件の固定|—|
 |2026-10-04|v1.0|受入レビューの反映: admission gate の対象を `PluginSession` の全呼び出し元に限定 (gate pytest worker を除外)、attestation 検査順と source-only loader 契約を C0 から復元、T1・T2 の直接子 harness と所有ファイル境界を task 表へ、LL-7 の受入 #39 を追加|受入レビュー r9 の High 1 / Medium 3 / Low 1|—|
+|2026-10-04|v1.1|実装 (seccomp・fingerprint) で見つかった 2 点を反映: RECORD hash を `../` 行を除く正規化に変更し numpy の値を差し替え (LL-27、#37)。worker は隔離前に `sys.dont_write_bytecode = True`、親は `-B` で起動、受入 #40 を追加|numpy の RECORD は console script 行が venv の絶対 path に依存し別の場所の同じ wheel が集合外になる / pycache の無い venv では遅延 import の `mkdir` で worker が SIGSYS 死する (実測)|—|
+|2026-10-04|v1.2|`load` 後の応答を候補が制御し得る入力と定め、親の検証 (§2.5、LL-29、受入 #41) を追加。#9 の「偽造」が `sandbox_ready` を指すことを明記。残余に追記|実装レビューの指摘 (plugin が protocol fd へ直接書ける)。現物の調査で、worker だけが担保し親が再検証していない性質 (indicator の系列長、数値の表現可能性、パース例外、要求と応答の対応、死後の最終行) を特定し、親側で閉じる裁定|—|
+|2026-10-04|v1.2|受入 #4 の文言を訂正: `tests/plugin/test_gate_pytest.py` の 1 件 (PluginSession 実行後に `__pycache__` が生成される前提) は #40 により「生成されない」へ反転したため、「変更なしで通す」を「通す (反転 1 件を除く)」に直した|実装で #40 と #4 の文が食い違った|—|
+|2026-10-04|v1.3|実装レビューの指摘 14 件のうち spec に影響する 5 件を反映: (1) commit gate の環境側失敗は候補の不合格にせず staging を残し backlog を `open` へ戻して mission を `failed` 終端 (§5.2)。(2) admission の一時失敗 (`timeout`・`spawn_failed`) は恒久 cache せず間隔を空けて再試行、成功・恒久失敗だけ cache (LL-26、#36)。(4) 候補由来の隔離失敗 (`plugin_file_invalid`・`allowlist_not_leaf`・`allowlist_guarded`) は `plugin_error` に分類 (§5.1、LL-6)。(5) host preflight が zoneinfo 欠落と `Seccomp_filters` 欄なし kernel を先に検知 (§2.1、§5.1、LL-25)。(6) `load` 後に死んだ worker の `plugin_ready` を読んでから分類 (§2.5)|実装レビュー (/code-review) の指摘。環境側失敗で候補が失われる・一時失敗が恒久化する・候補責任を環境障害に写す・事前診断できない水準・死後の `plugin_ready` を取りこぼす、の是正|—|

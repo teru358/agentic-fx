@@ -638,8 +638,10 @@ def test_enter_wraps_unexpected_popen_failure_as_sandbox_error(
     monkeypatch.setattr(sandbox_module.subprocess, "Popen", _raising_popen)
 
     session = PluginSession(meta, settings=plugin_settings)
-    with pytest.raises(SandboxError, match="simulated exec failure"):
+    with pytest.raises(SandboxError) as error:
         session.__enter__()
+    assert error.value.code == "sandbox_unavailable"
+    assert error.value.sandbox_reason == "worker_bootstrap_failed"
     assert session._dead is True
     assert session._proc is None
 
@@ -1025,9 +1027,9 @@ def test_handshake_omits_outputs_key_for_non_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings, resolved=resolved)
     real_write_line = session._write_line
 
-    def _spy(obj):
+    def _spy(obj, **kwargs):
         sent.append(obj)
-        real_write_line(obj)
+        real_write_line(obj, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1044,9 +1046,9 @@ def test_handshake_includes_outputs_key_for_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings)
     real_write_line = session._write_line
 
-    def _spy(obj):
+    def _spy(obj, **kwargs):
         sent.append(obj)
-        real_write_line(obj)
+        real_write_line(obj, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1351,29 +1353,14 @@ def test_internal_lifecycle_constants_are_fixed():
     assert sandbox._EOF_REAP_POLL_SEC == 0.002
 
 
-def test_worker_sets_requested_cpu_limit_and_core_limit(monkeypatch):
-    from agentic_fx.plugin import worker
-
-    calls = []
-    monkeypatch.setattr(worker.resource, "setrlimit",
-                        lambda limit, value: calls.append((limit, value)))
-    worker._set_resource_limits(5, 512, 128, 8)
-    assert (worker.resource.RLIMIT_CPU, (5, 5)) in calls
-    assert (worker.resource.RLIMIT_CORE, (0, 0)) in calls
-
-
 @pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("requested", [1, 5, 60])
 def test_handshake_carries_configured_cpu_limit(monkeypatch, tmp_path, plugin_settings,
                                                  requested):
     from agentic_fx.plugin import sandbox
 
-    captured = []
-
     monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *args, **kwargs: _PipeHandle())
-    monkeypatch.setattr(PluginSession, "_write_line", lambda self, item: captured.append(item))
-    monkeypatch.setattr(PluginSession, "_read_response",
-                        lambda self, timeout, maximum: {"ok": True, "pid": 9001})
+    captured = _scripted_startup(monkeypatch, PluginSession)
     settings = plugin_settings.model_copy(update={"sandbox_session_cpu_sec": requested})
     session = PluginSession(_meta(tmp_path, f"cpu-{requested}", "indicator", INDICATOR_OK_PY),
                             settings=settings)
@@ -1385,20 +1372,6 @@ def test_handshake_carries_configured_cpu_limit(monkeypatch, tmp_path, plugin_se
 
 def test_default_cpu_limit_is_sixty(plugin_settings):
     assert plugin_settings.sandbox_session_cpu_sec == 60
-
-
-def test_core_limit_failure_prevents_plugin_import(monkeypatch, tmp_path):
-    from agentic_fx.plugin import worker
-
-    imported = []
-    def fail_core(limit, value):
-        if limit == worker.resource.RLIMIT_CORE:
-            raise OSError("core disabled")
-    monkeypatch.setattr(worker.resource, "setrlimit", fail_core)
-    monkeypatch.setattr(worker, "_import_plugin", lambda path: imported.append(path))
-    with pytest.raises(OSError, match="core disabled"):
-        worker._set_resource_limits(1, 1, 16, 1)
-    assert imported == []
 
 
 def test_cpu_limit_worker_is_classified_from_wait4(tmp_path, plugin_settings):
@@ -1471,6 +1444,17 @@ def _never_signal_stand_in_pids(monkeypatch):
         return real_killpg(pgid, sig)
 
     monkeypatch.setattr(os, "killpg", killpg)
+    # Popen を偽 handle に差し替えるテストでも、偽 pid で実在の process の pidfd を
+    # 取らない (取れなければ session は数値の killpg に戻る)
+    from agentic_fx.plugin import sandbox
+    real_pidfd_open = getattr(sandbox, "_pidfd_open", None)
+
+    def pidfd_open(pid):
+        if pid == _PipeHandle.pid:
+            raise ProcessLookupError
+        return real_pidfd_open(pid)
+
+    monkeypatch.setattr(sandbox, "_pidfd_open", pidfd_open, raising=False)
 
 
 class _PipeHandle:
@@ -1495,6 +1479,77 @@ def _session_with_stdout_pipe(tmp_path, plugin_settings, name="pipe"):
     proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
     session._proc = proc
     return session, proc, write_fd
+
+
+# --- 起動の二段 protocol を演じる偽 worker ------------------------------
+# 隔離の効きは実 worker の E2E (test_plugin_worker_protocol.py) が確かめる。ここの
+# 偽 worker は起動検証を通すためだけのもので、/proc の全 task 検査は外す。
+
+def _skip_task_check(monkeypatch):
+    from agentic_fx.plugin import sandbox
+
+    monkeypatch.setattr(sandbox, "check_worker_tasks", lambda pid, **_k: None)
+
+
+def _sandbox_ready_for(nonce: str, pid: int) -> dict:
+    from agentic_fx.plugin import sandbox
+
+    abi = sandbox.runtime_admission().landlock_abi
+    return {"phase": "sandbox_ready", "ok": True, "pid": pid,
+            **sandbox.expected_attestation(abi, nonce)}
+
+
+def _scripted_startup(monkeypatch, target, *, pid=None, loaded=None, sent=None):
+    """`target` (PluginSession のクラスかインスタンス) の `_write_line` と
+    `_read_response` を、二段の起動応答を返す台本に差し替える。送った行は
+    `sent` に溜まる。"""
+    _skip_task_check(monkeypatch)
+    sent = [] if sent is None else sent
+    reads = {"n": 0}
+
+    def write(*args, **_kwargs):
+        sent.append(args[-1])
+
+    def read(*_args):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            return _sandbox_ready_for(sent[0]["attest_nonce"],
+                                      _PipeHandle.pid if pid is None else pid)
+        if reads["n"] == 2:
+            return loaded if loaded is not None else {"phase": "plugin_ready", "ok": True}
+        raise AssertionError("unexpected read after startup")
+
+    monkeypatch.setattr(target, "_write_line", write)
+    monkeypatch.setattr(target, "_read_response", read)
+    return sent
+
+
+# 実 Popen で起こす偽 worker の冒頭。handshake を読んで sandbox_ready を返し、
+# load を受けて plugin_ready を返す (隔離は掛けない)。
+_TWO_STAGE_PRELUDE = r'''
+import json, os, sys
+from agentic_fx.core import landlock as _ll
+from agentic_fx.plugin import sandbox as _sb
+_hs = json.loads(sys.stdin.readline())
+_ready = {"phase": "sandbox_ready", "ok": True, "pid": os.getpid()}
+_ready.update(_sb.expected_attestation(_ll.plan_for_abi(_ll.landlock_abi()).abi,
+                                       _hs["attest_nonce"]))
+sys.stdout.write(json.dumps(_ready) + "\n"); sys.stdout.flush()
+sys.stdin.readline()
+sys.stdout.write(PLUGIN_READY + "\n"); sys.stdout.flush()
+'''
+
+
+def _two_stage_program(after: str, *, plugin_ready: str = '{"phase": "plugin_ready", "ok": true}') -> str:
+    return (_TWO_STAGE_PRELUDE.replace("PLUGIN_READY", repr(plugin_ready)) + after)
+
+
+def _echo_response(fields: str) -> str:
+    """要求を 1 行読み、その id と pid を付けた応答を書く program 片 (`fields` は dict の中身)。"""
+    return ("_req = json.loads(sys.stdin.readline())\n"
+            "sys.stdout.write(json.dumps({" + fields
+            + ", \"pid\": os.getpid(), \"id\": _req[\"id\"]}) + \"\\n\")\n"
+            "sys.stdout.flush()\n")
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
@@ -1568,14 +1623,16 @@ def test_read_response_keeps_second_line_for_next_read(tmp_path, plugin_settings
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
+# load を送る前の失敗は、どれも plugin が動き得なかった失敗 (sandbox_unavailable)。
+# 壊れた・大きすぎる起動応答は隔離の報告として読めない応答として扱う。
 @pytest.mark.parametrize(
-    ("mode", "expected"),
-    [("eof", "crashed"), ("invalid", "protocol_error"),
-     ("oversize", "protocol_error"), ("timeout", "timeout"),
-     ("write", "backtest_failed")],
+    ("mode", "reason"),
+    [("eof", "worker_bootstrap_failed"), ("invalid", "attestation_unexpected_message"),
+     ("oversize", "attestation_unexpected_message"), ("timeout", "sandbox_startup_timeout"),
+     ("write", "worker_bootstrap_failed")],
 )
 def test_startup_failure_sets_the_documented_code(monkeypatch, tmp_path,
-                                                  plugin_settings, mode, expected):
+                                                  plugin_settings, mode, reason):
     from agentic_fx.plugin import sandbox
 
     session = PluginSession(_meta(tmp_path, f"startup-{mode}", "indicator",
@@ -1614,7 +1671,8 @@ def test_startup_failure_sets_the_documented_code(monkeypatch, tmp_path,
     try:
         with pytest.raises(SandboxError) as error:
             session.__enter__()
-        assert error.value.code == session.error_code == expected
+        assert error.value.code == session.error_code == "sandbox_unavailable"
+        assert error.value.sandbox_reason == session.sandbox_reason == reason
     finally:
         if writer is not None:
             os.close(writer)
@@ -1774,8 +1832,10 @@ def test_timeout_after_unreaped_is_crashed(monkeypatch, tmp_path, plugin_setting
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
-def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_path,
-                                                              plugin_settings):
+def test_a_line_buffered_before_the_request_is_a_protocol_violation(monkeypatch, tmp_path,
+                                                                    plugin_settings):
+    """load 後の行は plugin が protocol fd へ直接書き得る。要求より先に届いていた
+    行は次の応答として使わない。"""
     session = PluginSession(_meta(tmp_path, "buffered-calls", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     proc = _PipeHandle()
@@ -1784,12 +1844,17 @@ def test_calls_consume_buffered_responses_one_line_at_a_time(monkeypatch, tmp_pa
     proc.stdout = os.fdopen(reader_fd, "rb", buffering=0)
     session._proc = proc
     real_write = os.write
-    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
+    written = []
+    monkeypatch.setattr(os, "write", lambda _fd, data: written.append(data) or len(data))
     try:
-        real_write(writer_fd, b'{"ok": true, "result": {"value": 1}}\n'
-                   b'{"ok": true, "result": {"value": 2}}\n')
-        assert session.call({"df": _df(), "params": {}}) == {"value": 1.0}
-        assert session.call({"df": _df(), "params": {}}) == {"value": 2.0}
+        real_write(writer_fd, b'{"ok": true, "result": {"value": 1}}\n')
+        killed = []
+        monkeypatch.setattr(session, "_kill", lambda: killed.append(True) or False)
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == "protocol_error"
+        assert killed == [True]
+        assert written == []   # 要求は送らない
     finally:
         os.close(writer_fd)
         session._close_parent_fds()
@@ -2053,7 +2118,7 @@ def test_startup_failure_code_matches_session_after_cleanup(monkeypatch, tmp_pat
     session = PluginSession(_meta(tmp_path, "startup-unreaped", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: _PipeHandle())
-    monkeypatch.setattr(PluginSession, "_write_line", lambda *_: None)
+    monkeypatch.setattr(PluginSession, "_write_line", lambda *_a, **_k: None)
     monkeypatch.setattr(PluginSession, "_read_response",
                         lambda *_: {"ok": False, "error": "start"})
     monkeypatch.setattr(sandbox, "_KILL_REAP_TIMEOUT_SEC", 0.0)
@@ -2073,8 +2138,9 @@ def test_popen_failure_code_matches_session(monkeypatch, tmp_path, plugin_settin
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("no exec")))
     with pytest.raises(SandboxError) as error:
         session.__enter__()
-    assert error.value.code == "backtest_failed"
-    assert session.error_code == "backtest_failed"
+    assert error.value.code == "sandbox_unavailable"
+    assert session.error_code == "sandbox_unavailable"
+    assert session.sandbox_reason == "worker_bootstrap_failed"
 
 
 def test_reap_orphans_serializes_wait_and_removal(monkeypatch, tmp_path, plugin_settings):
@@ -2127,7 +2193,10 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     session._proc = _PipeHandle()
     real_write = os.write
     monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
-    monkeypatch.setattr(session, "_read_response", lambda *_: {"ok": False, "error": "boom"})
+    sent = []
+    monkeypatch.setattr(session, "_write_line", lambda obj, **_k: sent.append(obj))
+    monkeypatch.setattr(session, "_read_response", lambda *_: {
+        "ok": False, "error": "boom", "pid": _PipeHandle.pid, "id": sent[-1]["id"]})
     with pytest.raises(SandboxError) as plugin_error:
         session.call({"df": _df(), "params": {}})
     assert plugin_error.value.code == session.error_code == "plugin_error"
@@ -2152,8 +2221,8 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     startup = PluginSession(_meta(tmp_path, "startup", "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
     monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_args, **_kwargs: _PipeHandle())
-    monkeypatch.setattr(PluginSession, "_write_line", lambda *_: None)
-    monkeypatch.setattr(PluginSession, "_read_response", lambda *_: {"ok": False, "error": "start"})
+    _scripted_startup(monkeypatch, PluginSession,
+                      loaded={"phase": "plugin_ready", "ok": False, "error": "start"})
     monkeypatch.setattr(startup, "close", lambda: None)
     with pytest.raises(SandboxError) as startup_error:
         startup.__enter__()
@@ -2226,12 +2295,12 @@ def test_dead_worker_is_observed_before_stdout_holding_grandchild(monkeypatch, t
                                                                   plugin_settings):
     from agentic_fx.plugin import sandbox
 
-    program = '''import os, sys, time
-sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\\n' % os.getpid()); sys.stdout.flush()
+    program = _two_stage_program('''import time
 if os.fork() == 0:
     time.sleep(10)
 os._exit(0)
-'''
+''')
+    _skip_task_check(monkeypatch)
     real_popen = subprocess.Popen
 
     def start_worker(*args, **kwargs):
@@ -2255,6 +2324,143 @@ os._exit(0)
             except ProcessLookupError:
                 pass
         session.close()
+
+
+def _start_unisolated_worker(monkeypatch, tmp_path, plugin_settings, name, after):
+    """二段 protocol だけを演じる隔離なしの実 worker で session を起こす。"""
+    from agentic_fx.plugin import sandbox
+
+    program = _two_stage_program(after)
+    _skip_task_check(monkeypatch)
+    real_popen = subprocess.Popen
+
+    def start_worker(*args, **kwargs):
+        return real_popen([sys.executable, "-c", program], stdin=kwargs["stdin"],
+                          stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session.__enter__()
+    return session
+
+
+def _record_numeric_signals(monkeypatch) -> list:
+    """数値の pid / pgid への signal 送信を、送らずに記録する。"""
+    sent: list = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append(("killpg", pgid, sig)))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(("kill", pid, sig)))
+    return sent
+
+
+def _really_gone(pid: int, within: float = 3.0) -> bool:
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.mark.parametrize("route", ["close", "call"])
+def test_worker_reaped_elsewhere_is_never_signalled_by_number(monkeypatch, tmp_path,
+                                                              plugin_settings, route):
+    """他所で回収された worker の pid / pgid は別 process に再利用され得るので、
+    数値の pid / pgid へは signal を送らない。"""
+    session = _start_unisolated_worker(monkeypatch, tmp_path, plugin_settings,
+                                       f"reaped-elsewhere-{route}",
+                                       "import time\ntime.sleep(60)\n")
+    pid = session.pid
+    try:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        with monkeypatch.context() as mp:
+            sent = _record_numeric_signals(mp)
+            if route == "call":
+                with pytest.raises(SandboxError):
+                    session.call({"df": _df(), "params": {}})
+            session.close()
+        assert sent == []
+        assert session._pidfd is None
+    finally:
+        session.close()
+
+
+def test_grandchild_of_a_worker_reaped_elsewhere_is_killed_through_the_pidfd(
+        monkeypatch, tmp_path, plugin_settings):
+    """leader を他所で回収されても、起動時に取った pidfd が指す group の孫は
+    数値の pgid を使わずに止める。"""
+    from agentic_fx.plugin import sandbox
+
+    pid_file = tmp_path / "grandchild.pid"
+    session = _start_unisolated_worker(monkeypatch, tmp_path, plugin_settings,
+                                       "reaped-elsewhere-grandchild", f'''import time
+if os.fork() == 0:
+    open({str(pid_file)!r}, "w").write(str(os.getpid()))
+    time.sleep(60)
+    os._exit(0)
+time.sleep(60)
+''')
+    grandchild = None
+    try:
+        assert session._pidfd is not None
+        try:
+            sandbox._pidfd_send_signal(session._pidfd, 0,
+                                       sandbox._PIDFD_SIGNAL_PROCESS_GROUP)
+        except OSError as exc:
+            pytest.skip(f"kernel lacks PIDFD_SIGNAL_PROCESS_GROUP ({exc})")
+        deadline = time.monotonic() + 5
+        while grandchild is None and time.monotonic() < deadline:
+            if pid_file.exists() and pid_file.read_text():
+                grandchild = int(pid_file.read_text())
+            else:
+                time.sleep(0.02)
+        assert grandchild is not None
+        os.kill(session.pid, signal.SIGKILL)
+        os.waitpid(session.pid, 0)
+        os.kill(grandchild, 0)
+        with monkeypatch.context() as mp:
+            sent = _record_numeric_signals(mp)
+            session.close()
+        assert sent == []
+        assert _really_gone(grandchild)
+    finally:
+        if grandchild is not None:
+            try:
+                os.kill(grandchild, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        session.close()
+
+
+def test_pidfd_that_does_not_name_an_unreaped_child_is_discarded(monkeypatch, tmp_path,
+                                                                 plugin_settings):
+    """Popen から pidfd を取るまでに他所で回収され番号が再利用されていたら、その
+    pidfd は自分の子を指さないので捨てる (取れない環境と同じ扱い)。"""
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "pidfd-stranger", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    stranger = sandbox._pidfd_open(os.getpid())  # pytest 自身は自分の子ではない
+    monkeypatch.setattr(sandbox, "_pidfd_open", lambda _pid: stranger)
+    assert session._open_child_pidfd(os.getpid()) is None
+    with pytest.raises(OSError):
+        os.fstat(stranger)
+
+
+def test_pidfd_unavailable_falls_back_to_none(monkeypatch, tmp_path, plugin_settings):
+    import errno as _errno
+
+    from agentic_fx.plugin import sandbox
+
+    session = PluginSession(_meta(tmp_path, "pidfd-none", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    monkeypatch.setattr(sandbox, "_pidfd_open",
+                        lambda _pid: (_ for _ in ()).throw(OSError(_errno.ENOSYS, "nosys")))
+    assert session._open_child_pidfd(os.getpid()) is None
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
@@ -2302,8 +2508,7 @@ def test_stderr_fallback_and_session_fd_growth(monkeypatch, tmp_path, plugin_set
     fallback = PluginSession(_meta(tmp_path, "no-stderr", "indicator", INDICATOR_OK_PY),
                              settings=plugin_settings)
     monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: _PipeHandle())
-    monkeypatch.setattr(fallback, "_write_line", lambda *_: None)
-    monkeypatch.setattr(fallback, "_read_response", lambda *_: {"ok": True, "pid": 1})
+    _scripted_startup(monkeypatch, fallback)
     fallback.__enter__()
     monkeypatch.setattr(fallback, "_reap_worker", lambda: True)
     fallback.close()
@@ -2491,14 +2696,13 @@ def test_dead_worker_holding_stdout_open_is_noticed_within_a_second(
         monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
-    program = '''import os, sys, time
-sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\\n' % os.getpid()); sys.stdout.flush()
-sys.stdin.readline()
+    program = _two_stage_program('''import time
 sys.stdin.readline()
 if os.fork() == 0:
     time.sleep(10)
 os._exit(0)
-'''
+''')
+    _skip_task_check(monkeypatch)
     real_popen = subprocess.Popen
 
     def start_worker(*args, **kwargs):
@@ -2615,7 +2819,7 @@ def test_close_of_a_dead_session_sends_no_close_request(monkeypatch, tmp_path,
     sent = []
     monkeypatch.setattr(session, "_reap_worker", lambda: False)
     monkeypatch.setattr(session, "_kill", lambda: False)
-    monkeypatch.setattr(session, "_write_line", lambda obj: sent.append(obj))
+    monkeypatch.setattr(session, "_write_line", lambda obj, **_k: sent.append(obj))
     session.close()
     assert sent == []
 
@@ -2862,21 +3066,48 @@ def test_child_collected_elsewhere_is_terminal_without_waiting(monkeypatch, tmp_
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
-def test_child_collected_elsewhere_sends_one_group_kill_and_no_parent_kill_flag(
+def test_child_collected_elsewhere_sends_one_group_kill_through_the_pidfd_only(
         monkeypatch, tmp_path, plugin_settings):
+    """他所で回収された子の group へは、pidfd 経由で 1 回だけ送る。数値の pgid は
+    再利用され得るので killpg は使わない。親 kill の印は立てない。"""
+    from agentic_fx.plugin import sandbox
+
     session = PluginSession(_meta(tmp_path, "collected-group", "indicator",
                                   INDICATOR_OK_PY), settings=plugin_settings)
     session._proc = _PipeHandle()
-    session._pgid = _PipeHandle.pid
+    pidfd = os.open(os.devnull, os.O_RDONLY)
+    session._pidfd = pidfd
+    session._dead = True
+    kills = []
+    group_signals = []
+    monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
+    monkeypatch.setattr(os, "killpg", lambda *args: kills.append(args))
+    monkeypatch.setattr(sandbox, "_pidfd_send_signal",
+                        lambda *args: group_signals.append(args))
+    session.close()
+    session.close()
+    assert kills == []
+    assert group_signals == [(pidfd, signal.SIGKILL, sandbox._PIDFD_SIGNAL_PROCESS_GROUP)]
+    assert session._pidfd is None
+    assert session.parent_kill_sent is False
+    assert session._worker_error("gone").code == "crashed"
+
+
+@pytest.mark.usefixtures("stand_in_pids_look_live")
+def test_child_collected_elsewhere_without_a_pidfd_sends_nothing(
+        monkeypatch, tmp_path, plugin_settings):
+    """pidfd が取れなかった環境では、回収済みの子の group は諦める (数値では送らない)。"""
+    session = PluginSession(_meta(tmp_path, "collected-no-pidfd", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
     session._dead = True
     kills = []
     monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
     monkeypatch.setattr(os, "killpg", lambda *args: kills.append(args))
+    monkeypatch.setattr(os, "kill", lambda *args: kills.append(args))
     session.close()
-    session.close()
-    assert kills == [(_PipeHandle.pid, signal.SIGKILL)]
+    assert kills == []
     assert session.parent_kill_sent is False
-    assert session._worker_error("gone").code == "crashed"
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
@@ -2884,15 +3115,19 @@ def test_child_collected_elsewhere_sends_one_group_kill_and_no_parent_kill_flag(
                                      OSError(5, "io error")])
 def test_child_collected_elsewhere_tolerates_a_failed_group_kill(
         monkeypatch, tmp_path, plugin_settings, failure):
+    from agentic_fx.plugin import sandbox
+
     session = PluginSession(_meta(tmp_path, "collected-group-fail", "indicator",
                                   INDICATOR_OK_PY), settings=plugin_settings)
     session._proc = _PipeHandle()
-    session._pgid = _PipeHandle.pid
+    session._pidfd = os.open(os.devnull, os.O_RDONLY)
     session._dead = True
     monkeypatch.setattr(os, "wait4", lambda *_: (_ for _ in ()).throw(ChildProcessError()))
-    monkeypatch.setattr(os, "killpg", lambda *_: (_ for _ in ()).throw(failure))
+    monkeypatch.setattr(sandbox, "_pidfd_send_signal",
+                        lambda *_: (_ for _ in ()).throw(failure))
     session.close()
     assert session.parent_kill_sent is False
+    assert session._pidfd is None
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
@@ -2945,75 +3180,62 @@ def test_deadline_with_failed_kill_and_reaped_worker_uses_worker_classification(
 # --- startup response size limit ---------------------------------------
 
 def _startup_session(monkeypatch, tmp_path, plugin_settings, name, total_bytes):
+    """plugin_ready の行 (改行込み) がちょうど `total_bytes` になる偽 worker の session。"""
     from agentic_fx.plugin import sandbox
 
+    head = '{"phase": "plugin_ready", "ok": true, "pad": "'
+    tail = '"}'
+    line = head + "x" * (total_bytes - 1 - len(head) - len(tail)) + tail
+    assert len(line) + 1 == total_bytes
+    program = _two_stage_program("sys.stdin.readline()\n", plugin_ready=line)
+    real_popen = subprocess.Popen
+    spawned = []
+
+    def start_worker(*args, **kwargs):
+        proc = real_popen([sys.executable, "-c", program], stdin=kwargs["stdin"],
+                          stdout=kwargs["stdout"], stderr=kwargs["stderr"],
+                          start_new_session=kwargs["start_new_session"])
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", start_worker)
+    _skip_task_check(monkeypatch)
     session = PluginSession(_meta(tmp_path, name, "indicator", INDICATOR_OK_PY),
                             settings=plugin_settings)
-    proc = _PipeHandle()
-    proc.stdout.close()
-    read_fd, writer = os.pipe()
-    proc.stdout = os.fdopen(read_fd, "rb", buffering=0)
-    killed = {"value": False}
-
-    class Usage:
-        ru_utime = 0.0
-        ru_stime = 0.0
-
-    monkeypatch.setattr(sandbox.subprocess, "Popen", lambda *_a, **_k: proc)
-    monkeypatch.setattr(os, "wait4",
-                        lambda pid, _f: (pid, 0, Usage()) if killed["value"] else (0, 0, None))
-    monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
-    monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
-    head = b'{"ok": true, "pid": 4242, "pad": "'
-    tail = b'"}\n'
-    session._stdout_buffer.extend(head + b"x" * (total_bytes - len(head) - len(tail)) + tail)
-    assert len(session._stdout_buffer) == total_bytes
-    return session, writer
+    return session, spawned
 
 
-@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_startup_response_at_the_size_limit_is_accepted(monkeypatch, tmp_path,
                                                         plugin_settings):
-    session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
-                                       "startup-exact", 65536)
+    session, spawned = _startup_session(monkeypatch, tmp_path, plugin_settings,
+                                        "startup-exact", 65536)
     try:
         assert session.__enter__() is session
-        assert session.pid == 4242
+        # worker の申告ではなく Popen.pid
+        assert session.pid == spawned[0].pid
     finally:
-        os.close(writer)
-        session._dead = True
         session.close()
 
 
-@pytest.mark.usefixtures("stand_in_pids_look_live")
 def test_valid_startup_response_one_byte_over_the_limit_is_protocol_error(
         monkeypatch, tmp_path, plugin_settings):
-    session, writer = _startup_session(monkeypatch, tmp_path, plugin_settings,
-                                       "startup-over", 65537)
-    try:
-        with pytest.raises(SandboxError) as error:
-            session.__enter__()
-        assert error.value.code == session.error_code == "protocol_error"
-    finally:
-        os.close(writer)
+    session, _spawned = _startup_session(monkeypatch, tmp_path, plugin_settings,
+                                         "startup-over", 65537)
+    with pytest.raises(SandboxError) as error:
+        session.__enter__()
+    assert error.value.code == session.error_code == "protocol_error"
 
 
 # --- worker の最後の言葉・書き込み失敗・dict 以外の応答 ------------------
 
-_ANSWER_THEN_EXIT_PROGRAM = r'''
-import os, sys
-sys.stdin.readline()
-sys.stdout.write('{"ok": true, "ready": true, "pid": %d}\n' % os.getpid())
-sys.stdout.flush()
-sys.stdin.readline()
-sys.stdout.write('{"ok": false, "error": "last words"}\n')
-sys.stdout.flush()
-os._exit(0)
-'''
+_ANSWER_THEN_EXIT_PROGRAM = _two_stage_program(
+    _echo_response('"ok": False, "error": "last words"') + "os._exit(0)\n")
 
 
-def test_response_written_just_before_exit_is_delivered_not_classified_as_crash(
+def test_response_written_just_before_exit_is_discarded_and_classified_by_the_death(
         monkeypatch, tmp_path, plugin_settings):
+    """load 後の行は plugin が書き得る。死を観測した worker が残した行は採用せず、
+    死因で分類する。"""
     from agentic_fx.plugin import sandbox
 
     real_popen = subprocess.Popen
@@ -3034,34 +3256,28 @@ def test_response_written_just_before_exit_is_delivered_not_classified_as_crash(
         os.waitid(os.P_PID, session.pid, os.WEXITED | os.WNOWAIT)
         return real_read(timeout_sec, max_bytes)
 
+    _skip_task_check(monkeypatch)
     session.__enter__()
     monkeypatch.setattr(session, "_read_response", read_after_worker_exit)
     try:
-        with pytest.raises(SandboxError, match="last words") as error:
+        with pytest.raises(SandboxError) as error:
             session.call({"df": _df(), "params": {}})
-        assert error.value.code == "plugin_error"
+        assert error.value.code == "crashed"
+        assert "last words" not in str(error.value)
     finally:
         session.close()
 
 
-_FINAL_RESULT_JSON = '{"ok": true, "result": {"mean_close": 1.5}, "pid": 1}'
-_FINAL_ERROR_JSON = '{"ok": false, "error": "last words"}'
+_FINAL_RESULT_JSON = '"ok": True, "result": {"mean_close": 1.5}'
+_FINAL_ERROR_JSON = '"ok": False, "error": "last words"'
 
 
 def _final_answer_program(line: str) -> str:
-    return (
-        "import os, sys\n"
-        "sys.stdin.readline()\n"
-        "sys.stdout.write('{\"ok\": true, \"ready\": true, \"pid\": %d}\\n' % os.getpid())\n"
-        "sys.stdout.flush()\n"
-        "sys.stdin.readline()\n"
-        f"sys.stdout.write({line!r} + '\\n')\n"
-        "sys.stdout.flush()\n"
-        "os._exit(0)\n")
+    return _two_stage_program(_echo_response(line) + "os._exit(0)\n")
 
 
 @pytest.mark.parametrize("line", [_FINAL_RESULT_JSON, _FINAL_ERROR_JSON])
-def test_last_response_of_a_dead_worker_is_delivered_and_ends_the_session(
+def test_last_response_of_a_dead_worker_is_discarded_and_ends_the_session(
         monkeypatch, tmp_path, plugin_settings, line):
     from agentic_fx.plugin import sandbox
 
@@ -3084,17 +3300,17 @@ def test_last_response_of_a_dead_worker_is_delivered_and_ends_the_session(
         os.waitid(os.P_PID, session.pid, os.WEXITED | os.WNOWAIT)
         return real_read(timeout_sec, max_bytes)
 
+    _skip_task_check(monkeypatch)
     session.__enter__()
     stdin, stdout = session._proc.stdin, session._proc.stdout
     monkeypatch.setattr(session, "_read_response", read_after_worker_exit)
     try:
-        if line == _FINAL_RESULT_JSON:
-            assert session.call({"df": _df(), "params": {}}) == {"mean_close": 1.5}
-        else:
-            with pytest.raises(SandboxError, match="last words") as error:
-                session.call({"df": _df(), "params": {}})
-            assert error.value.code == "plugin_error"
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(), "params": {}})
+        assert error.value.code == "crashed"
+        assert "last words" not in str(error.value)
         assert session._dead is True
+        session.close()
         assert stdin.closed and stdout.closed
         with pytest.raises(SandboxError, match="not usable"):
             session.call({"df": _df(), "params": {}})
@@ -3106,14 +3322,16 @@ def test_last_response_of_a_dead_worker_is_delivered_and_ends_the_session(
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
-def test_line_already_in_the_pipe_is_returned_when_the_worker_is_seen_dead(
+def test_line_left_in_the_pipe_by_a_dead_worker_is_not_returned(
         monkeypatch, tmp_path, plugin_settings):
     session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
                                                        "dead-with-line")
-    os.write(writer, b'{"ok": false, "error": "boom"}\n')
+    os.write(writer, b'{"ok": true, "result": {"x": 1.0}}\n')
     monkeypatch.setattr(session, "_reap_worker", lambda: True)
     try:
-        assert session._read_response(5.0, 65536) == {"ok": False, "error": "boom"}
+        with pytest.raises(SandboxError) as error:
+            session._read_response(5.0, 65536)
+        assert error.value.code == "crashed"
     finally:
         os.close(writer)
         session._close_parent_fds()
@@ -3235,8 +3453,9 @@ def _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings, name)
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
-def test_startup_write_failure_reports_cpu_limit_when_the_worker_is_reaped_shortly_after(
+def test_startup_write_failure_before_load_is_never_cpu_limit(
         monkeypatch, tmp_path, plugin_settings):
+    """load 前に CPU 上限で死んだ worker は plugin を読んでいない (sandbox_unavailable)。"""
     session = _startup_write_failure_session(monkeypatch, tmp_path, plugin_settings,
                                              "startup-write-cpu")
     usage = _cpu_usage(plugin_settings)
@@ -3250,12 +3469,13 @@ def test_startup_write_failure_reports_cpu_limit_when_the_worker_is_reaped_short
     monkeypatch.setattr(os, "killpg", lambda *_: pytest.fail("killpg was called"))
     with pytest.raises(SandboxError) as error:
         session.__enter__()
-    assert error.value.code == session.error_code == "cpu_limit"
+    assert error.value.code == session.error_code == "sandbox_unavailable"
+    assert error.value.sandbox_reason == "worker_bootstrap_failed"
     assert session.parent_kill_sent is False
 
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
-def test_startup_write_failure_of_a_live_worker_is_killed_and_backtest_failed(
+def test_startup_write_failure_of_a_live_worker_is_killed_and_sandbox_unavailable(
         monkeypatch, tmp_path, plugin_settings):
     from agentic_fx.plugin import sandbox
 
@@ -3268,7 +3488,8 @@ def test_startup_write_failure_of_a_live_worker_is_killed_and_backtest_failed(
     monkeypatch.setattr(os, "killpg", lambda *_: killed.__setitem__("value", True))
     with pytest.raises(SandboxError) as error:
         session.__enter__()
-    assert error.value.code == session.error_code == "backtest_failed"
+    assert error.value.code == session.error_code == "sandbox_unavailable"
+    assert error.value.sandbox_reason == "worker_bootstrap_failed"
     assert killed["value"] is True
 
 
@@ -3338,7 +3559,7 @@ def test_call_with_a_non_object_json_response_is_a_protocol_error(
 
 @pytest.mark.usefixtures("stand_in_pids_look_live")
 @pytest.mark.parametrize("line", [b"[1]", b"1", b'"x"', b"null"])
-def test_startup_with_a_non_object_json_response_is_a_protocol_error(
+def test_startup_with_a_non_object_json_response_is_sandbox_unavailable(
         monkeypatch, tmp_path, plugin_settings, line):
     from agentic_fx.plugin import sandbox
 
@@ -3354,7 +3575,8 @@ def test_startup_with_a_non_object_json_response_is_a_protocol_error(
     session._stdout_buffer.extend(line + b"\n")
     with pytest.raises(SandboxError) as error:
         session.__enter__()
-    assert error.value.code == session.error_code == "protocol_error"
+    assert error.value.code == session.error_code == "sandbox_unavailable"
+    assert error.value.sandbox_reason == "attestation_unexpected_message"
     assert killed["value"] is True
 
 
@@ -3407,3 +3629,92 @@ def test_real_popen_keeps_the_helper_returncode_and_is_never_waited_again(
         gc.collect()
     if shape == "cpu-limit":
         assert session.worker_signal == signal.SIGKILL
+
+
+# --- 起動検証の純関数: 全 task・全 field、型まで一致 ---------------------------
+
+_GOOD_TASK = {"NoNewPrivs": "1", "Seccomp": "2", "Seccomp_filters": "1"}
+
+
+def _fake_proc(root: Path, pid: int, tasks: dict[str, dict[str, str]]) -> None:
+    for tid, fields in tasks.items():
+        d = root / str(pid) / "task" / tid
+        d.mkdir(parents=True)
+        (d / "status").write_text(
+            "Name:\tpython\n" + "".join(f"{k}:\t{v}\n" for k, v in fields.items()))
+
+
+@pytest.mark.parametrize("field, bad", [("NoNewPrivs", "0"), ("Seccomp", "0"),
+                                        ("Seccomp_filters", "2")])
+def test_task_check_looks_at_every_field_of_every_task(tmp_path, field, bad):
+    from agentic_fx.plugin import sandbox
+
+    # 違反は 2 番目の task の、その field だけ
+    _fake_proc(tmp_path, 4242, {"4242": _GOOD_TASK, "4243": {**_GOOD_TASK, field: bad}})
+    assert sandbox.check_worker_tasks(4242, proc_root=str(tmp_path)) == (
+        f"proc_status_mismatch:{field}")
+
+
+def test_task_check_passes_only_when_every_task_matches(tmp_path):
+    from agentic_fx.plugin import sandbox
+
+    _fake_proc(tmp_path, 4242, {"4242": _GOOD_TASK, "4243": _GOOD_TASK})
+    assert sandbox.check_worker_tasks(4242, proc_root=str(tmp_path)) is None
+    _fake_proc(tmp_path, 5252, {"5252": _GOOD_TASK,
+                                "5253": {"NoNewPrivs": "1", "Seccomp": "2"}})
+    assert sandbox.check_worker_tasks(5252, proc_root=str(tmp_path)) == "proc_status_unreadable"
+
+
+@pytest.mark.parametrize("key, value, reason", [
+    ("landlock_fs_abi", 8.0, "attestation_mismatch:landlock_fs_abi"),
+    ("pid", 4242.0, "attestation_mismatch:pid"),
+])
+def test_sandbox_ready_values_must_match_in_type_too(key, value, reason):
+    from agentic_fx.plugin import sandbox
+
+    expected = sandbox.expected_attestation(8, "0" * 32)
+    message = {"phase": "sandbox_ready", "ok": True, "pid": 4242, **expected}
+    assert sandbox.verify_sandbox_ready(message, expected=expected, popen_pid=4242) is None
+    message[key] = value
+    assert sandbox.verify_sandbox_ready(message, expected=expected, popen_pid=4242) == reason
+
+
+# --- load 後に期限切れで死を観測した worker の残り行 ------------------------------
+
+@pytest.mark.usefixtures("stand_in_pids_look_live")
+def test_line_of_a_worker_found_dead_at_the_deadline_is_not_returned(
+        monkeypatch, tmp_path, plugin_settings):
+    session, _proc, writer = _session_with_stdout_pipe(tmp_path, plugin_settings,
+                                                       "dead-at-deadline")
+    os.write(writer, b'{"ok": true, "result": {"x": 1.0}}\n')
+    # 最初の確認ではまだ生きていて、期限切れの確認で死んでいたと見える
+    seen = iter([False])
+    monkeypatch.setattr(session, "_reap_worker", lambda: next(seen, True))
+    try:
+        with pytest.raises(SandboxError) as error:
+            session._read_response(0.0, 65536)
+        assert error.value.code == "crashed"
+    finally:
+        os.close(writer)
+        session._close_parent_fds()
+
+
+# --- 戻り値の検証 (親) -----------------------------------------------------------
+
+@pytest.mark.parametrize("opt", ["stop_loss", "take_profit"])
+@pytest.mark.parametrize("value", [0, 0.0, -0.5, -1])
+def test_signal_stop_and_target_must_be_positive(opt, value):
+    from agentic_fx.plugin import sandbox
+
+    base = {"direction": "long", "strength": 0.5, "rationale": "r"}
+    assert sandbox._validate_signal_result([{**base, opt: 0.5}])[0][opt] == 0.5
+    with pytest.raises(SandboxError, match="finite positive"):
+        sandbox._validate_signal_result([{**base, opt: value}])
+
+
+def test_indicator_scalar_null_is_kept_as_an_undetermined_value():
+    # wire の null はスカラー NaN。親の検証で落とさず None のまま返す
+    from agentic_fx.plugin import sandbox
+
+    assert sandbox._validate_indicator_result({"x": None, "y": 1.5},
+                                              outputs=("x", "y")) == {"x": None, "y": 1.5}

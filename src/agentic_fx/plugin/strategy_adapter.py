@@ -114,6 +114,10 @@ class PluginStrategyIntentSource:
         # (close 応答の自己申告ではなく親の wait4 が出所)。
         self.worker_returncode: int | None = None
         self.worker_signal: int | None = None
+        # `sandbox_unavailable` の固定 reason、または load 後の SIGSYS の
+        # `sigsys_unattributed` (人間向けの activity にだけ出す)
+        self.sandbox_reason: str | None = None
+        self.worker_pid: int | None = None
         # worker の起動を試みた時点で True。評価前の失敗 (pair 未宣言・履歴なし)
         # と、worker に触れた後の失敗を呼び出し側が区別する。
         self.evaluation_started = False
@@ -176,6 +180,9 @@ class PluginStrategyIntentSource:
         self._cpu_sec = getattr(session, "worker_cpu_sec", None)
         self.worker_returncode = getattr(session, "worker_returncode", None)
         self.worker_signal = getattr(session, "worker_signal", None)
+        self.sandbox_reason = getattr(session, "sandbox_reason", None)
+        # 運用者向け診断 (SIGSYS の kernel log を引く) 用の Popen.pid
+        self.worker_pid = getattr(session, "pid", None)
 
     def close(self) -> None:
         """自分が生成したセッションのみ閉じる (注入されたセッションは

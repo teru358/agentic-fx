@@ -2,10 +2,18 @@
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 
-## 2026-10 (41)
+## 2026-10 (49)
 
 | id | 状態 | 優先 | 完了 | 概要 |
 |---|---|---|---|---|
+| [candidate-pyc-overrides-inspected-source](candidate-pyc-overrides-inspected-source.md) | 是正済 | 高 | 2026-10-05 | 候補の偽 pyc が検査済み plugin.py の代わりに実行される |
+| [candidate-strategy-backtest-runs-without-landlock](candidate-strategy-backtest-runs-without-landlock.md) | 是正済 | 高 | 2026-10-05 | 候補 strategy の backtest が Landlock の無い plugin worker で動く |
+| [plugin-ast-check-bypass-via-library-attributes](plugin-ast-check-bypass-via-library-attributes.md) | 見送り | 中 | 2026-10-05 | plugin がライブラリの属性経由で os に届き、コード検査を回避できる |
+| [plugin-worker-can-prlimit-other-processes](plugin-worker-can-prlimit-other-processes.md) | 是正済 | 高 | 2026-10-05 | plugin worker から同 uid の他プロセスの rlimit を書き換えられる |
+| [plugin-worker-startup-failure-unreadable](plugin-worker-startup-failure-unreadable.md) | 是正済 | 中 | 2026-10-05 | plugin worker の起動失敗の理由が読めない |
+| [sandbox-lifecycle-minor-followups](sandbox-lifecycle-minor-followups.md) | 是正済 | 低 | 2026-10-05 | worker 観測境界の残り: ready 直後の死亡で code が割れる、細部の未 pin |
+| [sandbox-pycache-prefix](sandbox-pycache-prefix.md) | 是正済 | 低 | 2026-10-05 | `sandbox._build_env` が PYTHONPYCACHEPREFIX 未設定 → 候補 dir に _… |
+| [sandbox-worker-response-unvalidated](sandbox-worker-response-unvalidated.md) | 是正済 | 中 | 2026-10-05 | worker 応答の pid と error 文字列が無検証で session とログに入る |
 | [app-state-write-has-no-lock-latch-can-be-lost](app-state-write-has-no-lock-latch-can-be-lost.md) | 是正済 | 高 | 2026-10-03 | kill switch の状態ファイルの書き込みに lock が無い |
 | [bridge-order-endpoints-open-on-lan-by-default](bridge-order-endpoints-open-on-lan-by-default.md) | 是正済 | 高 | 2026-10-03 | bridge の発注系 endpoint が既定で LAN に開く |
 | [bridge-readme-stale-and-contradicts-code](bridge-readme-stale-and-contradicts-code.md) | 是正済 | 高 | 2026-10-03 | bridge の README が現物と逆 (発注 endpoint は未実装と記載) |

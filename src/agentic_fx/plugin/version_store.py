@@ -16,12 +16,9 @@ import os
 import sqlite3
 from pathlib import Path
 
-
-def content_hash_bytes(plugin_py: bytes, config_yaml: bytes) -> str:
-    """既存 content_hash の定義 (spec 逐語、不変)。"""
-    return hashlib.sha256(
-        b"plugin.py\0" + plugin_py + b"\0config.yaml\0" + config_yaml
-    ).hexdigest()
+# 定義は core.plugin_files にある (worker が pandas を読まずに使えるように)。
+# 互換のため `version_store.content_hash_bytes` の名前は残す
+from agentic_fx.core.plugin_files import content_hash_bytes  # noqa: F401
 
 
 def artifact_hash_bytes(plugin_py: bytes, config_yaml: bytes,

@@ -17,12 +17,18 @@ ABI バージョン 8 を返す / `landlock_add_rule` で O_PATH ディレクト
 from __future__ import annotations
 
 import ctypes
+import errno
 import os
 import platform
 import stat as _stat
 import struct
+import sys
+import sysconfig
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from agentic_fx.core.plugin_files import PLUGIN_FILE_NAMES
 
 # x86_64 の landlock syscall 番号 (Linux 5.13+)。
 _SYS_LANDLOCK_CREATE_RULESET = 444
@@ -320,3 +326,477 @@ def restrict_to(*, read_only_paths: list[Path],
                 f"landlock_restrict_self failed: {os.strerror(errno)}")
     finally:
         os.close(ruleset_fd)
+
+
+# ---------------------------------------------------------------------------
+# plugin worker 用の ruleset
+#
+# `restrict_to` (improve / gate の dir 単位 allowlist) とは別系統。plugin worker は
+# 読み取り専用の最小規則を「検査済み fd」だけで組み、ABI に応じて network / scope /
+# TSYNC を足す。`restrict_to` と上の定数は変えない。
+# ---------------------------------------------------------------------------
+
+_ACCESS_NET_BIND_TCP = 1 << 0     # ABI v4
+_ACCESS_NET_CONNECT_TCP = 1 << 1  # ABI v4
+_SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0  # ABI v6
+_SCOPE_SIGNAL = 1 << 1                # ABI v6
+# landlock_restrict_self の flag。ABI 8 以上で、呼び出し元以外の全 thread にも
+# 同じ domain を掛ける。
+RESTRICT_SELF_TSYNC = 1 << 3
+
+# 本 profile が定義済みの最大 ABI。これを超える kernel でも ABI 8 の定義で掛ける。
+_MAX_KNOWN_ABI = 8
+# plugin worker が許す最低 ABI (TRUNCATE を強制できること)。
+PLUGIN_MIN_ABI = _REQUIRED_ABI
+
+# ABI ごとの ruleset 構造体の大きさ (fs のみ / + net / + scope)。
+_RULESET_SIZE_FS = 8
+_RULESET_SIZE_NET = 16
+_RULESET_SIZE_SCOPE = 24
+
+# 規則の種別。
+KIND_RUNTIME = "runtime"
+KIND_SYSTEM = "system"
+KIND_PLUGIN = "plugin"
+KIND_PLUGIN_FILE = "plugin_file"
+KIND_DEVICE = "device"
+
+_DEVICE_PATH = "/dev/urandom"
+
+SANDBOX_REASONS = (
+    "landlock_abi_too_old", "landlock_task_inspection_failed",
+    "landlock_multithreaded", "runtime_root_too_wide", "fd_open_failed",
+    "allowlist_guarded", "allowlist_not_leaf", "plugin_file_invalid",
+    "landlock_create_failed", "landlock_add_rule_failed",
+    "no_new_privs_failed", "landlock_restrict_failed",
+)
+
+
+class LandlockSetupError(Exception):
+    """plugin worker 用 ruleset の準備・適用の失敗。`reason` は固定の enum
+    (`SANDBOX_REASONS`) で、呼び出し側が公開用の分類へ写す。`detail` は
+    技術ログ用の自由文。"""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+
+def landlock_abi() -> int:
+    """kernel が提供する Landlock ABI 版を返す。非 x86_64・Landlock 無効・
+    syscall 失敗は 0。"""
+    if platform.machine() != "x86_64":
+        return 0
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    version = libc.syscall(
+        ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET), None, ctypes.c_size_t(0),
+        ctypes.c_uint32(_LANDLOCK_CREATE_RULESET_VERSION))
+    return int(version) if version > 0 else 0
+
+
+@dataclass(frozen=True)
+class RulesetPlan:
+    """ABI から決まる ruleset の形 (純データ)。"""
+
+    abi: int
+    handled_fs: int
+    handled_net: int
+    handled_scope: int
+    attr_size: int
+    restrict_flags: int
+    tsync: str      # "applied" (flag で全 thread) | "single_task" (適用前に task 1 本を検査)
+    network: str    # "applied" | "unsupported"
+    scope: str      # "applied" | "unsupported"
+
+
+def plan_for_abi(abi: int) -> RulesetPlan:
+    """ABI 3 以上から ruleset の構造を決める。3 未満は `landlock_abi_too_old`。
+
+    handled FS は ABI によらず同じ (EXECUTE を含む v1 の 13 種 + TRUNCATE)。
+    network は ABI 4+、scope は ABI 6+、TSYNC は ABI 8+ だけ足す。TSYNC が
+    使えない ABI で flag を渡すと kernel が EINVAL にするため、その ABI では
+    flags 0 とし、呼び出し側が single-task を検査する。"""
+    if abi < PLUGIN_MIN_ABI:
+        raise LandlockSetupError("landlock_abi_too_old", f"abi={abi}")
+    abi = min(abi, _MAX_KNOWN_ABI)
+    net = abi >= 4
+    scope = abi >= 6
+    tsync = abi >= 8
+    return RulesetPlan(
+        abi=abi,
+        handled_fs=_HANDLED_ACCESS_FS,
+        handled_net=(_ACCESS_NET_BIND_TCP | _ACCESS_NET_CONNECT_TCP) if net else 0,
+        handled_scope=(_SCOPE_ABSTRACT_UNIX_SOCKET | _SCOPE_SIGNAL) if scope else 0,
+        attr_size=(_RULESET_SIZE_SCOPE if scope
+                   else _RULESET_SIZE_NET if net else _RULESET_SIZE_FS),
+        restrict_flags=RESTRICT_SELF_TSYNC if tsync else 0,
+        tsync="applied" if tsync else "single_task",
+        network="applied" if net else "unsupported",
+        scope="applied" if scope else "unsupported",
+    )
+
+
+def check_single_task(task_dir: str = "/proc/self/task") -> None:
+    """TSYNC を使えない ABI で、適用時に自 process の task が 1 本だけで
+    あることを確認する (他の thread に domain が及ばないため)。"""
+    try:
+        n = len(os.listdir(task_dir))
+    except OSError as exc:
+        raise LandlockSetupError(
+            "landlock_task_inspection_failed", f"{task_dir}: {exc}") from None
+    if n != 1:
+        raise LandlockSetupError("landlock_multithreaded", f"tasks={n}")
+
+
+# --- guarded root と allowlist の自己検査 (純関数) -----------------------------
+
+def default_repo_root() -> Path:
+    """この module の位置から導く repo root (呼び出し元の引数・handshake からは
+    導かない)。"""
+    return Path(__file__).resolve().parents[3]
+
+
+def default_home() -> Path:
+    return Path(os.path.expanduser("~")).resolve()
+
+
+@dataclass(frozen=True)
+class GuardedRoots:
+    """full = 祖先・一致・子孫のどれも allowlist に入れない。
+    cover = 祖先・一致 (= その root を覆う規則) を入れない。"""
+
+    full: tuple[Path, ...]
+    cover: tuple[Path, ...]
+
+
+def guarded_roots(repo_root: Path, home: Path) -> GuardedRoots:
+    repo_root, home = Path(repo_root).resolve(), Path(home).resolve()
+    full = (repo_root / "data", repo_root / "config", repo_root / "logs",
+            home / ".config")
+    cover = (repo_root, repo_root / "plugins",
+             repo_root / "plugins" / "_staging", home, Path("/tmp"), Path("/"))
+    return GuardedRoots(tuple(p.resolve() for p in full),
+                        tuple(p.resolve() for p in cover))
+
+
+def path_relation(a: Path, b: Path) -> str | None:
+    """a から見た b との関係: "equal" | "descendant" (a が b の子孫) |
+    "ancestor" (a が b の祖先) | None。"""
+    if a == b:
+        return "equal"
+    if b in a.parents:
+        return "descendant"
+    if a in b.parents:
+        return "ancestor"
+    return None
+
+
+def check_runtime_root(path: Path, *, repo_root: Path, home: Path) -> None:
+    """runtime root が `/`、`/usr`、`/usr/local`、`/opt`、`/var`、`/home`、
+    `$HOME`、repo root の一致または祖先なら `runtime_root_too_wide`。"""
+    wide = [Path(p).resolve() for p in ("/", "/usr", "/usr/local", "/opt",
+                                         "/var", "/home")]
+    wide += [Path(home).resolve(), Path(repo_root).resolve()]
+    for w in wide:
+        rel = path_relation(path, w)
+        if rel in ("equal", "ancestor"):
+            raise LandlockSetupError(
+                "runtime_root_too_wide", f"{path} is {rel} of {w}")
+
+
+def check_allowlist_path(kind: str, path: Path, guarded: GuardedRoots) -> None:
+    """allowlist の 1 エントリを guarded root と照合し、違反は
+    `allowlist_guarded`。plugin_file は親 dir (plugin) の検査で代表する。
+    runtime / system は `/tmp` 配下も拒否する (`/tmp` 配下を取れるのは plugin
+    leaf だけ)。"""
+    if kind == KIND_PLUGIN_FILE:
+        return
+    for g in guarded.full:
+        rel = path_relation(path, g)
+        if rel:
+            raise LandlockSetupError(
+                "allowlist_guarded", f"{kind} {path} is {rel} of {g}")
+    for g in guarded.cover:
+        rel = path_relation(path, g)
+        if rel in ("equal", "ancestor"):
+            raise LandlockSetupError(
+                "allowlist_guarded", f"{kind} {path} is {rel} of {g}")
+    if kind in (KIND_RUNTIME, KIND_SYSTEM):
+        if path_relation(path, Path("/tmp").resolve()) == "descendant":
+            raise LandlockSetupError(
+                "allowlist_guarded", f"{kind} {path} is under /tmp")
+
+
+def runtime_subtree(code_root: Path, *, paths: dict[str, str] | None = None,
+                    sys_path: Sequence[str] | None = None) -> list[Path]:
+    """runtime として読ませる dir の集合。`code_root` (src/agentic_fx)、
+    `sysconfig` の stdlib / platstdlib / purelib / platlib、`sys.path` 上の
+    実体の lib-dynload だけ。実在する dir に限り、子孫は親へ畳む。"""
+    paths = paths if paths is not None else sysconfig.get_paths()
+    sys_path = sys_path if sys_path is not None else sys.path
+    cand = [Path(code_root)]
+    cand += [Path(paths[k]) for k in ("stdlib", "platstdlib", "purelib",
+                                       "platlib") if k in paths]
+    cand += [Path(p) for p in sys_path if str(p).endswith("lib-dynload")]
+    real: list[Path] = []
+    for p in cand:
+        r = p.resolve()
+        if r.is_dir() and r not in real:
+            real.append(r)
+    return [r for r in real
+            if not any(o != r and o in r.parents for o in real)]
+
+
+#: worker が必ず read 規則を張って開く system dir。存在しない host では worker が
+#: 起動段で `fd_open_failed` になるので、host preflight が先に明確な reason を出す。
+REQUIRED_SYSTEM_DIRS = (Path("/usr/lib"), Path("/usr/share/zoneinfo"))
+
+
+def system_dirs() -> list[Path]:
+    """配布物だけを置く読み取り専用 dir。実体が別なら `/usr/lib64`・`/lib64` も。"""
+    out = list(REQUIRED_SYSTEM_DIRS)
+    for extra in (Path("/usr/lib64"), Path("/lib64")):
+        if extra.exists() and extra.resolve() not in [p.resolve() for p in out]:
+            out.append(extra)
+    return out
+
+
+def missing_required_system_dirs() -> list[Path]:
+    """`REQUIRED_SYSTEM_DIRS` のうち存在しないもの。tzdata の無い minimal 環境で
+    zoneinfo が欠けると worker が起動できないため、host preflight が使う。"""
+    return [p for p in REQUIRED_SYSTEM_DIRS if not p.exists()]
+
+
+# --- allowlist (fd 系統) と適用 ------------------------------------------------
+
+@dataclass(frozen=True)
+class Rule:
+    kind: str
+    path: Path
+    fd: int
+    access: int
+
+
+@dataclass
+class Allowlist:
+    """検査済み fd の規則集合。`plugin_dir_fds` (実体 path -> dir fd) は後段の
+    loader が `openat` に使うため、`close_rule_fds` の後も残す。plugin dir 自体
+    には規則を張らない。"""
+
+    rules: list[Rule] = field(default_factory=list)
+    plugin_dir_fds: dict[str, int] = field(default_factory=dict)
+
+    def close_rule_fds(self) -> None:
+        keep = set(self.plugin_dir_fds.values())
+        for r in self.rules:
+            if r.fd not in keep:
+                _close_quietly(r.fd)
+
+    def close_all(self) -> None:
+        for r in self.rules:
+            _close_quietly(r.fd)
+        for fd in self.plugin_dir_fds.values():
+            _close_quietly(fd)
+
+
+def _close_quietly(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _open_dir_fd(path: Path, kind: str) -> tuple[int, Path]:
+    try:
+        fd = os.open(str(path), os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        raise LandlockSetupError("fd_open_failed", f"{kind} {path}: {exc}") from None
+    try:
+        real = Path(os.readlink(f"/proc/self/fd/{fd}"))
+    except OSError as exc:
+        os.close(fd)
+        raise LandlockSetupError("fd_open_failed", f"{kind} {path}: {exc}") from None
+    return fd, real
+
+
+def _open_plugin_file(dir_fd: int, name: str) -> int:
+    """検査済み dir fd から `O_PATH|O_NOFOLLOW` で開く。symlink は symlink 自身の
+    fd になるので通常ファイル検査で落ちる。"""
+    try:
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=dir_fd)
+    except OSError as exc:
+        # fd / メモリの枯渇は環境側の事情で、候補の plugin が不正という意味にしない
+        reason = ("fd_open_failed"
+                  if exc.errno in (errno.EMFILE, errno.ENFILE, errno.ENOMEM)
+                  else "plugin_file_invalid")
+        raise LandlockSetupError(reason, f"{name}: {exc}") from None
+    if not _stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise LandlockSetupError(
+            "plugin_file_invalid", f"{name} is not a regular file")
+    return fd
+
+
+def build_allowlist(plugin_dirs: Sequence[Path], *,
+                    repo_root: Path | None = None, home: Path | None = None,
+                    ) -> Allowlist:
+    """runtime / system / plugin file / device の規則を検査済み fd で組む。
+
+    plugin は親が選んだ leaf だけを受け、dir には規則を張らず、直下の
+    `plugin.py` と `config.yaml` の 2 ファイルの inode に READ_FILE だけを張る。
+    失敗時は開いた fd を全て閉じてから `LandlockSetupError`。"""
+    repo_root = Path(repo_root).resolve() if repo_root else default_repo_root()
+    home = Path(home).resolve() if home else default_home()
+    guarded = guarded_roots(repo_root, home)
+    code_root = Path(__file__).resolve().parents[1]
+    allow = Allowlist()
+    try:
+        seen: set[Path] = set()
+        entries: list[tuple[str, Path, int]] = []
+        groups = ((KIND_RUNTIME, runtime_subtree(code_root)),
+                  (KIND_SYSTEM, system_dirs()),
+                  (KIND_PLUGIN, [Path(p) for p in plugin_dirs]))
+        for kind, group in groups:
+            for p in group:
+                fd, real = _open_dir_fd(p, kind)
+                if real in seen:
+                    os.close(fd)
+                    continue
+                seen.add(real)
+                entries.append((kind, real, fd))
+                # 失敗時に漏らさないよう、開いたらすぐ Allowlist に載せる
+                if kind == KIND_PLUGIN:
+                    allow.plugin_dir_fds[str(real)] = fd
+                else:
+                    allow.rules.append(Rule(kind, real, fd, _READ_ONLY_ACCESS))
+        try:
+            dev_fd = os.open(_DEVICE_PATH, os.O_PATH | os.O_CLOEXEC)
+        except OSError as exc:
+            raise LandlockSetupError(
+                "fd_open_failed", f"{_DEVICE_PATH}: {exc}") from None
+        allow.rules.append(Rule(KIND_DEVICE, Path(_DEVICE_PATH), dev_fd,
+                                _ACCESS_FS_READ_FILE))
+        if not _stat.S_ISCHR(os.fstat(dev_fd).st_mode):
+            raise LandlockSetupError(
+                "fd_open_failed", f"{_DEVICE_PATH} is not a character device")
+
+        for kind, real, _fd in entries:
+            if kind == KIND_RUNTIME:
+                check_runtime_root(real, repo_root=repo_root, home=home)
+        for kind, real, _fd in entries:
+            check_allowlist_path(kind, real, guarded)
+        for kind, real, fd in entries:
+            if kind != KIND_PLUGIN:
+                continue
+            try:
+                st = os.stat("plugin.py", dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                st = None
+            if st is None or not _stat.S_ISREG(st.st_mode):
+                raise LandlockSetupError(
+                    "allowlist_not_leaf", f"{real} has no regular plugin.py")
+            for name in PLUGIN_FILE_NAMES:
+                ffd = _open_plugin_file(fd, name)
+                allow.rules.append(
+                    Rule(KIND_PLUGIN_FILE, real / name, ffd, _ACCESS_FS_READ_FILE))
+    except BaseException:
+        allow.close_all()
+        raise
+    return allow
+
+
+def restrict_with_allowlist(allow: Allowlist, plan: RulesetPlan) -> None:
+    """ruleset を作り、規則を足し、NO_NEW_PRIVS の後に restrict_self する
+    (不可逆)。flag は `plan.restrict_flags` のまま使い、失敗しても flags 0 へ
+    落とさない。"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+
+    class _Attr(ctypes.Structure):
+        _fields_ = [("handled_access_fs", ctypes.c_uint64),
+                    ("handled_access_net", ctypes.c_uint64),
+                    ("scoped", ctypes.c_uint64)]
+
+    attr = _Attr(plan.handled_fs, plan.handled_net, plan.handled_scope)
+    rfd = libc.syscall(
+        ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET), ctypes.byref(attr),
+        ctypes.c_size_t(plan.attr_size), ctypes.c_uint32(0))
+    if rfd < 0:
+        raise LandlockSetupError(
+            "landlock_create_failed",
+            f"errno={ctypes.get_errno()} size={plan.attr_size}")
+    try:
+        for r in allow.rules:
+            rule = _PathBeneathAttr(allowed_access=r.access, parent_fd=r.fd)
+            rc = libc.syscall(
+                ctypes.c_long(_SYS_LANDLOCK_ADD_RULE), ctypes.c_int(rfd),
+                ctypes.c_int(_LANDLOCK_RULE_PATH_BENEATH), ctypes.byref(rule),
+                ctypes.c_uint32(0))
+            if rc != 0:
+                raise LandlockSetupError(
+                    "landlock_add_rule_failed",
+                    f"{r.kind} {r.path} errno={ctypes.get_errno()}")
+        if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            raise LandlockSetupError(
+                "no_new_privs_failed", f"errno={ctypes.get_errno()}")
+        rc = libc.syscall(ctypes.c_long(_SYS_LANDLOCK_RESTRICT_SELF),
+                          ctypes.c_int(rfd),
+                          ctypes.c_uint32(plan.restrict_flags))
+        if rc != 0:
+            raise LandlockSetupError(
+                "landlock_restrict_failed",
+                f"errno={ctypes.get_errno()} flags={plan.restrict_flags}")
+    finally:
+        os.close(rfd)
+
+
+@dataclass(frozen=True)
+class AppliedRuleset:
+    """適用結果。`plugin_dir_fds` は loader 用に開いたまま返す (呼び出し側が閉じる)。"""
+
+    plan: RulesetPlan
+    plugin_dir_fds: dict[str, int]
+
+    def attestation_fields(self) -> dict[str, object]:
+        """二段 protocol の attested field のうち Landlock 由来の 4 つ。"""
+        return {"landlock_fs_abi": self.plan.abi,
+                "landlock_tsync": self.plan.tsync,
+                "network": self.plan.network, "scope": self.plan.scope}
+
+
+def apply_plugin_ruleset(plugin_dirs: Sequence[Path], *,
+                         repo_root: Path | None = None,
+                         home: Path | None = None) -> AppliedRuleset:
+    """plugin worker の process に Landlock を掛ける (不可逆、継承される)。
+
+    順序: ABI 測定 → (TSYNC 不可の ABI だけ) task 数 1 の検査 → allowlist を
+    fd で組んで自己検査 → ruleset 適用。ABI 8 以上は `RESTRICT_SELF_TSYNC` で
+    全 thread に及ぼす。常に kernel の実 ABI を使う。失敗は
+    `LandlockSetupError`。"""
+    return _apply_plugin_ruleset_for_abi(
+        plugin_dirs, landlock_abi(), repo_root=repo_root, home=home)
+
+
+def _apply_plugin_ruleset_for_abi(plugin_dirs: Sequence[Path], abi: int, *,
+                                  repo_root: Path | None = None,
+                                  home: Path | None = None) -> AppliedRuleset:
+    """旧 ABI の分岐をこの kernel 上で検査するテスト専用。本体コードから
+    呼ばない。実 ABI を超える値は実 ABI に切り詰める。"""
+    abi = min(abi, landlock_abi())
+    plan = plan_for_abi(abi)
+    if plan.tsync == "single_task":
+        check_single_task()
+    allow = build_allowlist(plugin_dirs, repo_root=repo_root, home=home)
+    try:
+        # 規則を組む間に増えた thread は domain を受けないので、適用の直前にもう一度確かめる
+        if plan.tsync == "single_task":
+            check_single_task()
+        restrict_with_allowlist(allow, plan)
+    except BaseException:
+        allow.close_all()
+        raise
+    allow.close_rule_fds()
+    return AppliedRuleset(plan=plan, plugin_dir_fds=dict(allow.plugin_dir_fds))

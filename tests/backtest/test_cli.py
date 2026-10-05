@@ -691,11 +691,118 @@ def test_cli_backtest_run_plugin_closes_session_even_if_run_replay_raises(
                   "--plugin", "strat"])
     assert rc == 1
     assert rr.called
-    sentinel_source.close.assert_called_once()
+    # SandboxError 経路は失敗文言を組む前に close で診断を取り込むため、
+    # except と finally で close が呼ばれる (実アダプタの 2 回目は no-op)。
+    assert sentinel_source.close.called
     br.save_human_run.assert_not_called()  # run_replay が例外なので保存まで進まない
     err = capsys.readouterr().err
     assert "plugin crashed mid-replay" in err
     assert "Traceback" not in err
+
+
+def _seed_one_bar(tmp_path):
+    from agentic_fx.store import ohlcv as ohlcv_store
+    seed_conn = connect(tmp_path / "data" / "agentic.db")
+    init_db(seed_conn)
+    ohlcv_store.import_history_bars(
+        seed_conn, [("USDJPY", "1m", "2026-07-01T00:00:00+00:00",
+                    148.0, 148.2, 147.9, 148.1, 10.0, 0.01)],
+        source="dukascopy")
+    seed_conn.close()
+
+
+def test_cli_backtest_run_plugin_without_isolation_is_rc1_with_a_fixed_reason(
+        tmp_path, monkeypatch, capsys):
+    """人間 CLI も共通 admission を lazy に通る。隔離できない環境では worker を起こさず、
+    plugin の問題ではない固定の理由で rc=1。"""
+    from agentic_fx.core import runtime_fingerprint
+    from agentic_fx.plugin import sandbox
+
+    runs = []
+    monkeypatch.setattr(sandbox, "_RUNTIME_ADMISSION", runtime_fingerprint.RuntimeAdmission(
+        selftest=lambda: runs.append(1) or runtime_fingerprint.SelftestOutcome(False, "x"),
+        supported=()))
+    monkeypatch.setattr(sandbox, "_ADMISSION_RESULT", None)
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["USDJPY"])
+    _seed_one_bar(tmp_path)
+
+    def replay_that_starts_the_worker(settings, *, intent_source, **_kw):
+        intent_source._ensure_session()
+
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay",
+               side_effect=replay_that_starts_the_worker), \
+         patch("agentic_fx.backtest.cli.backtest_runs") as br:
+        rc = main(["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02", "--plugin", "strat"])
+    assert rc == 1
+    assert runs == [1]
+    br.save_human_run.assert_not_called()
+    err = capsys.readouterr().err
+    assert "隔離して実行できない" in err and "plugin の問題ではありません" in err
+    assert "sandbox_reason=runtime_fingerprint_selftest_failed" in err
+    assert "Traceback" not in err
+
+
+def test_cli_backtest_run_plugin_sigsys_crash_shows_the_kernel_log_hint(
+        tmp_path, monkeypatch, capsys):
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["USDJPY"])
+    _seed_one_bar(tmp_path)
+    source = MagicMock()
+    source.worker_pid = 4321
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay", side_effect=SandboxError(
+             "x", code="crashed", sandbox_reason="sigsys_unattributed")), \
+         patch("agentic_fx.backtest.cli.backtest_runs"), \
+         patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
+               return_value=source):
+        rc = main(["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02", "--plugin", "strat"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "SIGSYS" in err and "原因は確定していません" in err
+    assert "journalctl -k -g 'type=1326.*pid=4321 '" in err
+
+
+def test_cli_backtest_run_plugin_sigsys_hint_has_pid_from_diagnostics_at_call_time(
+        tmp_path, monkeypatch, capsys):
+    """call() 中に worker が死ぬと `worker_pid` は診断取り込み (close) までは
+    None。失敗文言を組む前に診断を取り込まないと pid つきの journalctl 案内が
+    出せない。pid は close で初めて埋まる source で、案内に pid が載ることを確認する。"""
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    _write_strategy_plugin(tmp_path / "plugins", "strat", pairs=["USDJPY"])
+    _seed_one_bar(tmp_path)
+
+    class _Source:
+        # 実アダプタと同じく、worker_pid は親の wait4 診断を取り込む close まで None
+        def __init__(self):
+            self.worker_pid = None
+            self.eval_count = 0
+
+        def close(self):
+            self.worker_pid = 4321
+
+    source = _Source()
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.run_replay", side_effect=SandboxError(
+             "x", code="crashed", sandbox_reason="sigsys_unattributed")), \
+         patch("agentic_fx.backtest.cli.backtest_runs"), \
+         patch("agentic_fx.backtest.cli.strategy_adapter.build_intent_source",
+               return_value=source):
+        rc = main(["backtest", "run", "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--from", "2026-07-01", "--to", "2026-07-02", "--plugin", "strat"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "journalctl -k -g 'type=1326.*pid=4321 '" in err
 
 
 def test_cli_backtest_run_plugin_not_found_rc1(tmp_path, monkeypatch):

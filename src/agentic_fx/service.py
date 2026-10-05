@@ -48,7 +48,7 @@ from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
 from agentic_fx.plugin import switch
-from agentic_fx.plugin.sandbox import reap_orphans
+from agentic_fx.plugin.sandbox import reap_orphans, startup_diagnostics
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy, directives_path
 from agentic_fx.runners.base import AgentRunner
@@ -1621,6 +1621,29 @@ def _exit_code(app: App, scheduler_alive: bool,
     return 1 if scheduler_alive or supervisor_alive or improve_alive else 0
 
 
+#: 起動時診断 thread の shutdown 時の join 上限。通常は即座に終わる。集合外で自己試験が
+#: 長引いても shutdown をこれ以上は待たせない (daemon thread なので process 終了で片付く)
+_SANDBOX_DIAG_JOIN_TIMEOUT_SEC = 10.0
+
+
+def _log_plugin_sandbox_diagnostics() -> None:
+    """plugin worker を隔離できるか (共通 admission) と seccomp の kernel log を
+    読めるかを起動時に eager に測り、1 行ずつ技術ログに出す。
+
+    失敗しても service は起動する (隔離できない間は、plugin の評価ごとに
+    `sandbox_unavailable` で fail closed する)。admission の結果は process 内に
+    残るので、以後の評価は測り直さない。"""
+    try:
+        lines = startup_diagnostics()
+    except Exception:  # noqa: BLE001  診断の失敗で起動を止めない
+        _log.exception("plugin sandbox startup diagnostics failed")
+        return
+    for line in lines:
+        degraded = (": unavailable" in line or "check_failed" in line
+                    or ("kernel log:" in line and "kernel_log_readable" not in line))
+        (_log.warning if degraded else _log.info)("%s", line)
+
+
 def run_service(root: Path, *, daemon: bool = False,
                _stop_event: threading.Event | None = None) -> int:
     """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
@@ -1639,6 +1662,13 @@ def run_service(root: Path, *, daemon: bool = False,
     if warning:
         print(warning)
     print(build_splash(app))
+    # 診断は起動の同期経路から外す。admission の代表自己試験 (最大 120 秒) と
+    # journalctl (最大 5 秒) を同期で走らせると service_started と scheduler
+    # (資金保護) の起動がそのぶん遅れる。別 daemon thread で走らせ、結果は
+    # 非同期にログへ出す。shutdown では bounded に join する (下の finally)
+    diag_thread = threading.Thread(
+        target=_log_plugin_sandbox_diagnostics, daemon=True, name="sandbox-diag")
+    diag_thread.start()
     app.activity.write(Category.SYSTEM, "service_started",
                        f"daemon={daemon} "
                        f"decision_timeframe={settings.datafeed.decision_timeframe} "
@@ -1772,6 +1802,11 @@ def run_service(root: Path, *, daemon: bool = False,
         # 加える (完全な停止状態機械は Task 19 の担当 — ここでは
         # 「join 完了 = 実行中 Mission も完了」という壊れた不変条件の
         # 最小修復に留める)。
+        # 起動時診断の daemon thread を bounded に join する。新規受付を閉じる
+        # shutdown() より後に置く (前に置くと待つ間に tick が mission を投入できる)。
+        # 通常は 1 秒未満で終わり即座に返る。集合外で自己試験が長引く host でも
+        # _SANDBOX_DIAG_JOIN_TIMEOUT_SEC で打ち切る (daemon なので process 終了で片付く)
+        diag_thread.join(timeout=_SANDBOX_DIAG_JOIN_TIMEOUT_SEC)
         th.join(timeout=30)
         scheduler_still_busy = scheduler_busy.is_set() and th.is_alive()
         # **(レビュー 3 周目 codex E2)** `shutdown_join_timeout_sec`

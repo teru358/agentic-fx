@@ -2337,3 +2337,37 @@ def test_commit_gate_backtest_cpu_line_names_its_cpu_source(tmp_path):
              if "backtest_cpu" in l and f"mission={ctx.mission_id}" in l]
     assert lines
     assert all("cpu_source=parent_wait4" in l for l in lines)
+
+
+# worker が stdout に書いた文字列は、承認画面の入力 (approval_requests) にも activity にも出ない。
+# 目印は実行時に組み立て、候補の source に文字列として現れないようにする
+_MARKED_INDICATOR_PY = """
+def compute(df, params):
+    print("MARKER_FROM_" + "PLUGIN_" + "c41d", flush=True)
+    return {"value": df['close'].iloc[-1]}
+"""
+
+
+def test_approval_payload_carries_no_string_from_the_worker(improve_env):
+    app, root = improve_env
+    conn: sqlite3.Connection = app.conn_core
+    result = MissionResult(status="completed", output=_plugin_artifact("marked_ind"),
+                           transcript=[])
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=FixedClock(NOW),
+        db_write_conn_factory=lambda: connect(root / "data" / "agentic.db"),
+        db_readonly_conn_factory=lambda: connect_readonly(root / "data" / "agentic.db"),
+        activity=app.activity, rag=app.rag)
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+        _write_staging_plugin(ctx.staging_dir, "marked_ind", _MARKED_INDICATOR_PY,
+                              _PASSING_INDICATOR_CONFIG, _PASSING_INDICATOR_TEST)
+        loop.commit(mission=mission, ctx=ctx, result=worker.run(mission), now=NOW)
+
+    rows = conn.execute("SELECT payload_json FROM approval_requests "
+                        "WHERE kind='plugin'").fetchall()
+    # 承認 payload を作る経路まで届いた場合だけ pin になる
+    assert len(rows) == 1
+    assert "MARKER_FROM_" not in rows[0][0]
+    assert "MARKER_FROM_" not in _activity_text(app.activity)

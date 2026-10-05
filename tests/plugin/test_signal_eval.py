@@ -625,3 +625,26 @@ def test_default_sandbox_run_opens_single_plugin_session(tmp_path, settings, mon
     assert len(session_opens) == 1
     assert session_opens[0] == (meta, settings.plugin)
     assert len(calls) == 3
+
+
+def test_default_evaluation_goes_through_the_common_isolation_admission(
+        tmp_path, settings, monkeypatch):
+    """既定経路 (実 PluginSession) も共通 admission を通る。隔離できない環境では
+    worker を起こさず `sandbox_unavailable` をそのまま伝える (fail closed)。"""
+    from agentic_fx.core import runtime_fingerprint
+    from agentic_fx.plugin import sandbox
+    from agentic_fx.plugin.sandbox import SandboxError
+
+    runs = []
+    monkeypatch.setattr(sandbox, "_RUNTIME_ADMISSION", runtime_fingerprint.RuntimeAdmission(
+        selftest=lambda: runs.append(1) or runtime_fingerprint.SelftestOutcome(False, "x"),
+        supported=()))
+    monkeypatch.setattr(sandbox, "_ADMISSION_RESULT", None)
+    d = _plugin_dir(tmp_path, "gated")
+    idx = pd.date_range("2026-01-01T00:00:00Z", periods=2, freq="1h", tz="UTC")
+    _write_labels(d, _bars(2), [{"bar_ts": idx[0].isoformat(), "direction": "long"}])
+    with pytest.raises(SandboxError) as error:
+        signal_eval.evaluate_detection(_meta(d, "gated"), settings=settings)
+    assert (error.value.code, error.value.sandbox_reason) == (
+        "sandbox_unavailable", "runtime_fingerprint_selftest_failed")
+    assert runs == [1]
