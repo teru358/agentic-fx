@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.7
+# [ops-api] 操作 API と client 契約設計 v1.8
 
-版: v1.7
+版: v1.8
 
 日付: 2026-10-05
 
@@ -312,7 +312,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |AC-19|socket 無し / 拒否 / 鍵無し / 401 / 403 / 503 / server 認証失敗で規定文面と rc|
 |AC-20|stdin pipe の approve は `/dev/tty` があっても送らず rc=2。pty で正しい id の場合だけ送る|
 |AC-21|API 起動、100 要求、停止の前後で open fd 数が同じ|
-|AC-22|1 分 100 回の 401 は DB / activity 各 5 個別 + 1 集約、notifier 1 回。無通信でも分境界後 30 秒以内と shutdown 時に flushし、`00:00:59Z`→`00:01:00Z` を wall clock で pin|
+|AC-22|1 分 100 回の 401 は activity に 5 個別 + 1 集約、notifier 1 回 (`ops_requests` は認証済み要求だけを持つので未認証の拒否は書かない)。無通信でも分境界後 30 秒以内と shutdown 時に flushし、`00:00:59Z`→`00:01:00Z` を wall clock で pin|
 |AC-23|autopilot=true で policy・approve・retry・`killswitch reset`・data resume・improve は 403、reject / ask / GET / jobs / `killswitch reconcile` は通る|
 |AC-24|別 process の plugin flock 待ち中も status / backlog / killswitch reset は各 50 回で p95 100 ms、p99 300 ms、最大 1 秒以内。解放後 job は done。決定 20 回と core write 100 ms 間隔の双方向 SQLite busy は 0、core write 最大 1 秒。API 側 busy 注入は 503 `database_busy`|
 |AC-25|digest 不一致 / 決定済み / 不在は同期 409 / 409 / 404 で job 無し。202 後切断でも job 完了し二重送信は in-progress|
@@ -407,3 +407,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-05|v1.5|改善 worker の seccomp を T3 の着手ゲートから運用上の有効化条件へ (ユーザー裁定 案 2)。seccomp 投入まで `api.enabled` 既定 false|
 |2026-10-05|v1.6|policy file の再生成を「record 由来の行だけを作り直し、手書き行は保つ」に (T2 実装時の逸脱を採用。全文再生成は利用者の手書き方針を消す)|
 |2026-10-06|v1.7|ask の回答本文は memory 上の job result にだけ置く例外を明文化 (実装レビュー r1 OPS-R1-02 の裁定: spec の欠落)|
+|2026-10-06|v1.8|AC-22 の未認証拒否の記録先を activity + notifier に限定 (`ops_requests` は認証済み要求のみ。T3 実装時の契約の穴)|
