@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.6
+# [ops-api] 操作 API と client 契約設計 v1.7
 
-版: v1.6
+版: v1.7
 
 日付: 2026-10-05
 
@@ -234,7 +234,7 @@ daemon は API listener を開く前に、次の順で起動時回復を行う�
 
 activity は best-effort の人向け投影で、読み取り要求は DEBUG、変更要求は固定 event と audit id を記録する。認証失敗、peer 拒否、上限拒否は分類ごとに 1 分の最初の 5 件だけ個別記録し、30 秒周期、分境界、shutdown の 3 契機で suppressed 件数を flush する。`activity.log` 自体の無期限増加は `activity-log-grows-without-rotation` に残す。
 
-自由文は `ops_requests`、job、activity、event に保存しない。ただし既存運用との互換のため activity の `policy_added` だけは policy 先頭 200 文字を残す。人間の reject reason は既存の保存先 `approval_requests.reason` だけを明示的な例外とし、承認詳細で sanitizer 適用後に表示する。改善 agent へは reject reason 本文を渡さず、既存どおり固定文言の拒否状態だけを渡す。表示や境界を通る既存文字列の除染規律も維持する。
+自由文は `ops_requests`、job、activity、event に保存しない。例外は `ask` の回答本文で、これは ask の成果物そのものなので memory 上の job result にだけ置き (DB / activity / event には書かない)、`jobs.own` の所有者だけが job GET で読める。job の evict と再起動で消える。ただし既存運用との互換のため activity の `policy_added` だけは policy 先頭 200 文字を残す。人間の reject reason は既存の保存先 `approval_requests.reason` だけを明示的な例外とし、承認詳細で sanitizer 適用後に表示する。改善 agent へは reject reason 本文を渡さず、既存どおり固定文言の拒否状態だけを渡す。表示や境界を通る既存文字列の除染規律も維持する。
 
 ## 9. 関連チケットの扱い
 
@@ -406,3 +406,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-05|v1.4|着手条件を改訂。脱出実測を廃し (ユーザー裁定 案 1)、改善 mission worker の seccomp 投入を T3 の着手ゲートに移した。T1・T2 は隔離投入のみを条件に着手可。V-4 の計測内容を具体化 (root 一式の隔離複製、3 条件 × 20 回、tick 差の同時観測)。sol advise 2026-10-05|
 |2026-10-05|v1.5|改善 worker の seccomp を T3 の着手ゲートから運用上の有効化条件へ (ユーザー裁定 案 2)。seccomp 投入まで `api.enabled` 既定 false|
 |2026-10-05|v1.6|policy file の再生成を「record 由来の行だけを作り直し、手書き行は保つ」に (T2 実装時の逸脱を採用。全文再生成は利用者の手書き方針を消す)|
+|2026-10-06|v1.7|ask の回答本文は memory 上の job result にだけ置く例外を明文化 (実装レビュー r1 OPS-R1-02 の裁定: spec の欠落)|
