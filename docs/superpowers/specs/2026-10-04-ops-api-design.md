@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.8
+# [ops-api] 操作 API と client 契約設計 v1.9
 
-版: v1.8
+版: v1.9
 
 日付: 2026-10-05
 
@@ -187,7 +187,7 @@ ops lock、decide lock、plugin flock、StateStore flock、SQLite busy、socket 
 
 `api.enabled=false` の daemon 起動は拒否せず警告する。daemon と API の可用性を同一視せず、資金保護を優先する。
 
-autopilot 中は全 GET、reject、ask、jobs、`killswitch reconcile` だけを許し、その他の変更 (`killswitch reset` を含む) を 403 `autopilot_restricted` にする。`killswitch reconcile` を許すのは、回復はラッチ中への確定だけを行い、資金保護を弱めないためである。`autopilot on` 自体は API に存在しない。
+autopilot 中は全 GET、reject、ask、jobs、`killswitch reconcile` だけを許し、その他の変更 (`killswitch reset` を含む) を 403 `autopilot_restricted` にする。`killswitch reconcile` を許すのは、回復はラッチ中への確定だけを行い、資金保護を弱めないためである。`autopilot on` 自体は API に存在しない。 autopilot の制限は API の principal に掛かるものであり、対話シェル (信頼境界内の人間の操作) は従来どおり制限しない。
 
 **queued の job は実行開始時に autopilot を再確認する。** autopilot で制限される job (approve、retry、手動 improve) は、worker が最初の変更に入る直前に StateStore の flock 内で autopilot を読み、true なら `autopilot_restricted` で終端して何も変更しない。autopilot の切替も同じ flock 内の書込みなので、順序は 2 通りに定まる。切替が先なら job は開始判定で終端し、開始判定が先なら job は autopilot 前に開始したものとして定義済みの終端まで収束し、その後に新しい変更を始めない。どちらの順でも、autopilot=true になった後に新しい変更が始まることはない。受理時の autopilot 判定は維持し、queue 中の状態変化だけを開始判定が補う。
 
@@ -408,3 +408,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-05|v1.6|policy file の再生成を「record 由来の行だけを作り直し、手書き行は保つ」に (T2 実装時の逸脱を採用。全文再生成は利用者の手書き方針を消す)|
 |2026-10-06|v1.7|ask の回答本文は memory 上の job result にだけ置く例外を明文化 (実装レビュー r1 OPS-R1-02 の裁定: spec の欠落)|
 |2026-10-06|v1.8|AC-22 の未認証拒否の記録先を activity + notifier に限定 (`ops_requests` は認証済み要求のみ。T3 実装時の契約の穴)|
+|2026-10-06|v1.9|autopilot 制限は API の principal にだけ掛かり対話シェルは従来どおり、を明文化 (トリアージ d-list D2 の裁定)|
