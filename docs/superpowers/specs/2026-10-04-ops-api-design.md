@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.9
+# [ops-api] 操作 API と client 契約設計 v1.10
 
-版: v1.9
+版: v1.10
 
 日付: 2026-10-05
 
@@ -209,7 +209,7 @@ approver 操作は stdin と `/dev/tty` の両方が端末の場合だけ送る�
 
 監査の正は append-only DB `ops_requests` とする。各行に `authenticated_principal` と nullable な `asserted_actor` を分けて持ち、初版では後者を常に null とする。全ての変更要求は副作用より前に `accepted` を INSERT し、`PRAGMA synchronous=FULL` の transaction commit が成功した時点を accepted の commit 点とする。書けなければ実行しない。完了は別の終端行で INSERT し、`ops_requests` は UPDATE / DELETE しない。ほかに endpoint、peer pid / exe、idempotency key と本文 digest、対象 ref、phase、result code、job id、再送用 response を持つ。
 
-冪等要求は durable 表で `(authenticated_principal, endpoint, idempotency_key)` を一意にし、本文 digest と `accepted → succeeded | failed | outcome_unknown` の一方向状態を持つ。accepted 行と状態の作成を同じ transaction で commit してから副作用へ進み、終端状態と `ops_requests` 終端行も同じ transaction で commit する。同じ key / digest の終端後再送は保存済み response / job id を返し、異なる digest は 409 `idempotency_mismatch` とする。
+冪等要求は durable 表で `(authenticated_principal, endpoint, idempotency_key)` を一意にし、本文 digest と `accepted → succeeded | failed | outcome_unknown` の一方向状態を持つ。 ただし一時的な失敗 (`database_busy`、`request_timeout`、`unavailable`、`mission_busy`、`decision_in_progress`、`improve_running`、`plugin_busy`) は再送で成功し得るので、`ops_requests` には `failed` の終端行を残しつつ、冪等 durable 表の行は同じ transaction で削除する。同じ key の再送は新規要求として受理される。恒久的な失敗 (`invalid_argument`、`not_found`、`already_decided`、`payload_changed`、`invalid_state` 等) は `failed` のまま保持し、再送に保存応答を返す。accepted 行と状態の作成を同じ transaction で commit してから副作用へ進み、終端状態と `ops_requests` 終端行も同じ transaction で commit する。同じ key / digest の終端後再送は保存済み response / job id を返し、異なる digest は 409 `idempotency_mismatch` とする。
 
 daemon は API listener を開く前に、次の順で起動時回復を行う。**先に既存の plugin 切替 journal の reconcile (`system_reconcile`、`service.py` の起動処理で reconcile → sweep → expire の順に既に走る) を済ませ、その後に ops の回復を行う。** 決定 (approve / reject / retry) の結果の正は `approval_requests` と切替 journal であり、ops の回復はそれを読むだけで書き換えない。既存の reconcile は journal の `switched` 行で live 側が新版なら `retry_approval(decided_by="system_reconcile")` で決定を完遂し、live が旧版のままなら journal を巻き戻し、それ以外の phase は明示 retry を待つ。ops の回復は、journal reconcile が既に終端を決めた決定要求にはその結果 (approval の終端状態と `decided_by`) を元要求の終端行へ追記し、結果が `system_reconcile` による場合はそれを終端行に記す。journal が決められない要求だけを `outcome_unknown` にする。ops の回復が決定を自動で再実行することは無く、`system_reconcile` による完遂は既存の journal 規律であって元要求の自動再送ではない。
 
@@ -409,3 +409,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-06|v1.7|ask の回答本文は memory 上の job result にだけ置く例外を明文化 (実装レビュー r1 OPS-R1-02 の裁定: spec の欠落)|
 |2026-10-06|v1.8|AC-22 の未認証拒否の記録先を activity + notifier に限定 (`ops_requests` は認証済み要求のみ。T3 実装時の契約の穴)|
 |2026-10-06|v1.9|autopilot 制限は API の principal にだけ掛かり対話シェルは従来どおり、を明文化 (トリアージ d-list D2 の裁定)|
+|2026-10-07|v1.10|一時的な失敗は冪等 durable 表の行を削除し再送を新規要求として受理 (2 周目 /code-review CR-01 の裁定。監査の終端行は残す)|
