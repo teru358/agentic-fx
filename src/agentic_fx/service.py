@@ -23,7 +23,7 @@ import jsonschema
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
-from agentic_fx.config import load_settings
+from agentic_fx.config import load_env_file, load_settings
 from agentic_fx.core import mission_ceiling
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
@@ -42,6 +42,9 @@ from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
+from agentic_fx.ops import keys as ops_keys
+from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
+from agentic_fx.ops.service import OpsLimits, OpsService
 from agentic_fx.loops import reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
@@ -520,6 +523,12 @@ class App:
     fatal_reason: str | None = None
     ingest: object | None = None
     outage: object | None = None
+    # 操作 API と対話シェルが共有する ops 層 (conn_ops は ops レーン専用の接続)。
+    ops: object | None = None
+    conn_ops: object | None = None
+    # 起動時回復が済んだときだけ listener を開く。
+    ops_recovered: bool = False
+    api: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -527,6 +536,9 @@ class App:
             ("runner", lambda: self.runner.close()
              if self.owns_runner and hasattr(self.runner, "close") else None),
             ("rag", self.rag.close),
+            ("ops", lambda: self.ops.shutdown() if self.ops is not None else None),
+            ("conn_ops", lambda: self.conn_ops.close()
+             if self.conn_ops is not None else None),
             ("conn_supervisor", self.conn_supervisor.close),
             ("conn_core", self.conn_core.close),
             ("conn_shell", self.conn_shell.close),
@@ -849,6 +861,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     # closed — InstanceAlreadyRunning は呼び出し元の run_service/CLI
     # エントリまで伝播させ、非ゼロ終了させる)。
     instance_lock = acquire_instance_lock(root / "data")
+    # 失敗時に閉じるため、ops 層の資源は try の外で名前を用意しておく。
+    conn_ops = None
+    ops_service = None
 
     try:
         if state.reconcile_marker() is not None:
@@ -1309,6 +1324,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                             policy_path=directives_path(root),
                             plugins_root=plugins_dir, settings=settings,
                             outage=outage)
+        # ops 層は reconcile → sweep → expire (上) の後に作り、対話シェルにも同じ
+        # レーンを使わせる。回復は listener を開く前 (run_service) に済ませる。
+        conn_ops = connect(root / "data" / "agentic.db")
+        ops_service = _build_ops_service(
+            root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
+            health_latch=health_latch, supervisor=supervisor,
+            improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage)
+        commands.use_ops_service(ops_service)
+        ops_recovered = _recover_ops(ops_service, conn_ops, activity)
         return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1323,7 +1347,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    conn_supervisor=conn_supervisor, stop_event=stop_event,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
-                   fatal_reason=None, ingest=ingest, outage=outage)
+                   fatal_reason=None, ingest=ingest, outage=outage,
+                   ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -1331,11 +1356,205 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # に退避されるだけで、except 節やエントリの終了コード判定は新しい例外を
         # 見る)。解放の失敗より原因の伝播を優先する — ロックは fd なので
         # プロセス終了時に OS が回収する。
+        # ops 層の接続 (ops レーンと決定用) は fd と WAL handle を持つので、
+        # 元の例外を隠さない形で閉じる。
+        if ops_service is not None:
+            try:
+                ops_service.shutdown(join_timeout=0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        if conn_ops is not None:
+            try:
+                conn_ops.close()
+            except Exception:  # noqa: BLE001
+                pass
         try:
             instance_lock.close()
         except Exception:  # noqa: BLE001 — 元の例外を握り潰さないための抑制
             pass
         raise
+
+
+# ---- 操作 API (ops 層・鍵・UDS listener) ---------------------------------------
+
+_OPS_FLUSH_INTERVAL_SEC = 30.0
+
+
+def _ops_limits(settings) -> OpsLimits:
+    api = settings.api
+    return OpsLimits(request_deadline_seconds=api.request_deadline_sec,
+                     ops_lock_wait_seconds=api.ops_lock_wait_sec,
+                     decision_deadline_seconds=api.decision_deadline_sec,
+                     plugin_lock_wait_seconds=api.plugin_lock_wait_sec,
+                     ask_deadline_seconds=api.ask_deadline_sec,
+                     improve_start_deadline_seconds=api.improve_start_deadline_sec,
+                     shutdown_join_seconds=api.shutdown_join_sec)
+
+
+def _api_limits(settings) -> ApiLimits:
+    api = settings.api
+    return ApiLimits(max_connections=api.max_connections,
+                     max_body_bytes=api.max_body_bytes,
+                     request_deadline_seconds=api.request_deadline_sec)
+
+
+def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
+                       health_latch, supervisor, improve_supervisor, plugins_dir,
+                       outage) -> OpsService:
+    db_path = root / "data" / "agentic.db"
+    status_lock = threading.Lock()
+
+    def status_provider() -> dict:
+        # API thread から呼ばれる。core_lock も ops の接続も使わず、読み取り専用の
+        # 短命な接続で読む。
+        with status_lock:
+            conn = connect_readonly(db_path)
+            try:
+                balance, equity = PaperBroker(conn, settings, clock).equity()
+                active = orders.list_by_status(conn, "open", "pending_fill",
+                                               "protection_pending")
+                recent = missions.recent(conn, 1)
+            finally:
+                conn.close()
+        mission = None
+        if recent:
+            mission = {"loop": recent[0]["loop"], "status": recent[0]["status"],
+                       "started_at": recent[0]["started_at"]}
+        return {"balance": balance, "equity": equity,
+                "orders": {"active": len(active)}, "mission": mission,
+                "health": {"latched": health_latch.is_latched(),
+                           "failures": len(health_latch.summary())},
+                "data": {"state": str(outage.state)}}
+
+    def ask_submitter(question: str):
+        submitted = supervisor.try_submit("ask", question=question)
+        return submitted.future if submitted.accepted else None
+
+    holder: list[OpsService] = []
+
+    def data_resume(acknowledge: bool) -> dict:
+        # ops レーンの中 (ops lock 保持中) で呼ばれる。生の接続でなく、要求 deadline と
+        # 停止合図に従うレーンの接続で書く (SQLite busy を待ち切らない)。
+        lane = holder[0].lane_connection
+        now = clock.now()
+        info = outage.gap_summary(now, conn=lane)
+        outage.request_resume(now, acknowledge=acknowledge, conn=lane)
+        gaps = [{"pair": pair, "interval": interval,
+                 "since": since.isoformat() if hasattr(since, "isoformat") else str(since)}
+                for (pair, interval), since in sorted(info["gap_starts"].items())]
+        return {"requested": True, "acknowledge": acknowledge, "state": info["state"],
+                "unprocessed_positions": info["unprocessed_positions"], "gaps": gaps}
+
+    service = OpsService(
+        conn_ops, wall_clock=clock.now, limits=_ops_limits(settings),
+        policy_path=directives_path(root), state_store=state,
+        status_provider=status_provider, log_path=root / "logs" / "agentic.log",
+        activity_path=root / "logs" / "activity.log", data_resume=data_resume,
+        ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
+        plugins_root=plugins_dir, settings=settings, activity_log=activity)
+    holder.append(service)
+    return service
+
+
+def _recover_ops(ops: OpsService, conn_ops, activity) -> bool:
+    """起動時回復 (plugin 切替 journal の reconcile の後)。失敗したら listener を開かない。"""
+    try:
+        ops.recover_after_journal()
+        if conn_ops.execute("SELECT 1 FROM ops_policies LIMIT 1").fetchone() is not None:
+            ops.regenerate_policy()
+    except Exception as exc:  # noqa: BLE001 — 取引と資金保護は止めない
+        _log.exception("ops startup recovery failed")
+        activity.write(Category.SYSTEM, "ops_recover_failed", safe_error_text(exc))
+        return False
+    return True
+
+
+@dataclass
+class ApiRuntime:
+    server: ApiServer
+    flush_stop: threading.Event
+    flush_thread: threading.Thread
+
+
+def _api_start_failed(app: App, code: str) -> None:
+    """listener を開けなくても daemon と tick は続ける。health / activity / notifier へ。"""
+    app.health_latch.record_failure(f"api_start_failed: {code}")
+    try:
+        app.activity.write(Category.SYSTEM, "api_start_failed", code)
+    except Exception:  # noqa: BLE001
+        _log.exception("api_start_failed activity write failed")
+    try:
+        app.notifier.send(f"[agentic-fx] 操作 API を起動できません ({code})。取引と資金保護は継続します")
+    except Exception:  # noqa: BLE001
+        _log.exception("api_start_failed notify failed")
+
+
+def start_ops_api(app: App, root: Path) -> None:
+    """鍵を読み、UDS listener を開く。失敗しても例外は出さない (I-8)。"""
+    settings = app.settings
+    if app.ops is None:
+        return
+    # bool の True だけを有効とみなす (設定以外の値で鍵を作り listener を開かない)。
+    if settings.api.enabled is not True:
+        # 改善 worker の seccomp が入るまでの既定。daemon の起動は拒否しない。
+        _log.warning("operations API is disabled (api.enabled=false); listener not opened")
+        app.activity.write(Category.SYSTEM, "api_disabled",
+                           "api.enabled=false のため操作 API の listener を開きません")
+        return
+    if app.ops_recovered is not True:
+        _api_start_failed(app, "ops_recovery_failed")
+        return
+    directory = ops_keys.key_dir(root)
+    try:
+        ops_keys.check_token_dir(directory, root=root)
+        ops_keys.ensure_initialized(directory, root=root)
+        keyset = ops_keys.load_keyset(directory)
+        server = ApiServer(app.ops, keyset, Path(root) / settings.api.socket_path,
+                           limits=_api_limits(settings), wall_clock=app.clock.now,
+                           notifier=app.notifier)
+        server.start()
+    except (ops_keys.KeySetError, ApiStartError) as exc:
+        _api_start_failed(app, exc.code)
+        return
+    except Exception:  # noqa: BLE001 — API の失敗で daemon を止めない
+        _log.exception("operations API start failed")
+        _api_start_failed(app, "api_start_failed")
+        return
+    flush_stop = threading.Event()
+
+    def flush_loop() -> None:
+        # 認証失敗等の抑止件数を 30 秒周期で書き出す (分境界の後 30 秒以内)。
+        while not flush_stop.wait(_OPS_FLUSH_INTERVAL_SEC):
+            try:
+                server.flush_rejections()
+            except Exception:  # noqa: BLE001
+                _log.exception("api rejection flush failed")
+
+    flush_thread = threading.Thread(target=flush_loop, name="afx-api-flush", daemon=True)
+    flush_thread.start()
+    app.api = ApiRuntime(server, flush_stop, flush_thread)
+    app.activity.write(Category.SYSTEM, "api_started", f"socket={server.socket_path}")
+
+
+def stop_ops_api(app: App) -> None:
+    """停止順序: (1) listener を閉じる → (2) queued を shutdown 終端 → (3) running に
+    停止合図 → (4) API thread・決定 worker・improve thread を bounded join。"""
+    budget = getattr(getattr(app.settings, "api", None), "shutdown_join_sec", 5.0)
+    if not isinstance(budget, (int, float)):
+        budget = 5.0
+    deadline = time.monotonic() + budget
+    api = app.api if isinstance(app.api, ApiRuntime) else None
+    if api is not None:
+        api.server.close_listener()
+    if app.ops is not None:
+        try:
+            app.ops.shutdown(join_timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:  # noqa: BLE001 — 停止シーケンスは最後まで走らせる
+            _log.exception("ops shutdown failed")
+    if api is not None:
+        api.flush_stop.set()
+        api.server.join(max(0.0, deadline - time.monotonic()))
+        api.flush_thread.join(max(0.0, deadline - time.monotonic()))
 
 
 _RECONCILE_SPLASH_LINE = (
@@ -1652,6 +1871,9 @@ def run_service(root: Path, *, daemon: bool = False,
     実装を注入することで、実スリープ・実シグナルなしに shutdown 経路を検証
     できる。"""
     ensure_initialized(root)
+    # 設定の検証は環境を変えないので、.env はここ (daemon 起動の top-level) で
+    # 明示的に読む。build_app 以降の env 参照より前に置く。
+    load_env_file(root / ".env")
     settings = load_settings(root / "config" / "settings.yaml")
     setup_technical_logging(root / "logs", settings.logging.level,
                             daemon=daemon)
@@ -1745,6 +1967,8 @@ def run_service(root: Path, *, daemon: bool = False,
     wd.start()
 
     try:
+        # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
+        start_ops_api(app, root)
         if daemon:
             while not stop_event.is_set():
                 try:
@@ -1767,6 +1991,8 @@ def run_service(root: Path, *, daemon: bool = False,
         # 例外を握りつぶさない (return を置かない) — 記録後、元の例外があれば
         # そのまま再送出される。
         stop_event.set()
+        # 操作 API は新規受付を先に止めてから ops の job を収束させる (§5 の停止順序)。
+        stop_ops_api(app)
         # **(レビュー 3 周目 codex E3)** supervisor.shutdown() を
         # th.join() より前に呼ぶ — stop_event.set() の時点で既に走って
         # いた scheduler tick は on_trade_mission → supervisor.try_submit

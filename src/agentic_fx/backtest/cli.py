@@ -29,10 +29,9 @@ from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
     ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest.runner import run_replay
-from agentic_fx.config import load_settings
+from agentic_fx.config import load_env_file, load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
-from agentic_fx.plugin import approval as plugin_approval
 from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
@@ -522,17 +521,6 @@ def _analyze_corr(conn, args: argparse.Namespace) -> int:
 # ---- plugin submit / bless (プラン 7 Task 6) --------------------------------
 
 
-def _find_plugin_meta(root: Path, name: str):
-    """discover して ``name`` に一致する ``PluginMeta`` を探す。
-    ``(plugins_dir, meta)`` を返す (``meta`` は見つからなければ ``None`` —
-    呼び出し元がエラーメッセージに ``plugins_dir`` を使うため一緒に返す)。
-    plugins_dir 規約はアプリ全体で確立済みの ``root / "plugins"``
-    (`--plugin` 経路・service.py の承認済み plugin ロードと同じ)。"""
-    plugins_dir = root / "plugins"
-    metas = plugin_loader.discover(plugins_dir) if plugins_dir.is_dir() else []
-    return plugins_dir, next((m for m in metas if m.name == name), None)
-
-
 # 裁定3 (11d/11e): `afx plugin bless <name>` (--from なし) は常に拒否する。
 _BLESS_NO_FROM_ERROR = (
     "afx plugin bless <name> は廃止されました。"
@@ -565,6 +553,13 @@ _HASH_MISMATCH_RECOVERY_HINT = (
 )
 
 
+_SUBMIT_NO_FROM_ERROR = (
+    "afx plugin submit は候補領域を明示する必要があります。"
+    "'afx plugin materialize <name>' で候補を書き出し、"
+    "'afx plugin submit --from _human <name>' を実行してください "
+    "(live plugins/ を直接申請する旧経路は廃止しました)。")
+
+
 def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
     if getattr(args, "from_kind", None) == "_human":
         # 11d/11e: --from _human は switch.submit_candidate (P1) を通す
@@ -589,20 +584,10 @@ def _plugin_submit(conn, settings, args: argparse.Namespace, root: Path) -> int:
         print(f"承認申請 id={approval_id} (pending)")
         return 0
 
-    plugins_dir, meta = _find_plugin_meta(root, args.name)
-    if meta is None:
-        print(f"エラー: plugin '{args.name}' が {plugins_dir} に見つかりません "
-             "(discover で検出できる 3 ファイル構成か確認してください)",
-             file=sys.stderr)
-        return 1
-    try:
-        approval_id = plugin_approval.submit_plugin(
-            conn, meta, settings=settings, now=datetime.now(timezone.utc))
-    except (ValueError, plugin_sandbox.SandboxError) as e:
-        print(f"エラー: {e}", file=sys.stderr)
-        return 1
-    print(f"approval id={approval_id}")
-    return 0
+    # --from _human 以外は共有 gate (固定 holdout を含む) を通らない旧経路になる。
+    # plugin の探索・検証に入る前に全 kind で拒否し、pending 行を作らない。
+    print(_SUBMIT_NO_FROM_ERROR, file=sys.stderr)
+    return 1
 
 
 def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
@@ -806,6 +791,8 @@ def _improve_verify_backend(conn, settings, args: argparse.Namespace,
 
 def dispatch(args: argparse.Namespace, root: Path) -> int:
     ensure_initialized(root)
+    # 設定の検証は環境を変えないので、.env はこの CLI の入口で明示的に読む。
+    load_env_file(root / ".env")
     settings = load_settings(root / "config" / "settings.yaml")
 
     # Fix Round 1 F6 (sonnet I-3): 統一エラー境界。人間向け CLI なので生の

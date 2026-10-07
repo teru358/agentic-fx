@@ -5,6 +5,7 @@ import json
 import math
 import sqlite3
 import unicodedata
+import uuid
 from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
@@ -21,6 +22,7 @@ from agentic_fx.store import (approvals, backlog, candidate_archives,
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
+from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 
 _HELP = """コマンド一覧:
   status                     残高・モード・kill switch・直近 mission
@@ -87,6 +89,18 @@ class Commands:
         # だけで、実際の判定・遷移は次 scheduler tick の lock 区間で
         # 行われる。
         self.outage = outage
+        # 操作 API と同じ ops / 決定レーンを共有するときに use_ops_service で
+        # 注入する。未注入の間は従来の直接経路のまま動く。
+        self.ops_service = None
+
+    def use_ops_service(self, ops_service) -> None:
+        """操作 API と同じレーンを使うよう切り替える。
+
+        配線は service の起動処理が行う (OpsService を作った直後に呼ぶ)。以後、
+        approve / reject / approval retry、backlog・policy・reflect retry、improve は
+        ops 関数を通り、決定は API と同じ単一の決定 worker で直列に実行される。
+        """
+        self.ops_service = ops_service
 
     def dispatch(self, line: str) -> str:
         parts = line.strip().split()
@@ -110,6 +124,8 @@ class Commands:
                 return self._data_resume(args[1:])
             if cmd == "approve" and args:
                 approval_id = int(args[0])
+                if self.ops_service is not None:
+                    return self._ops_decide("approve", approval_id, None, args[0])
                 # 裁定1 (11g Step1b): decide() 全廃。kind="plugin" は
                 # plugin flock を経由する switch.approve_candidate を、
                 # それ以外は apply_decision を直接通す (二重経路にしない)。
@@ -142,16 +158,15 @@ class Commands:
                     self.activity.write(Category.APPROVAL, "approved",
                                         f"#{args[0]} via shell", ref_id=args[0])
                     return f"approval #{args[0]} approved: {text}"
-                else:
-                    approvals.apply_decision(
-                        self.conn, approval_id, "approved", decided_by="shell",
-                        now=self.clock.now(), commit=True)
-                self.activity.write(Category.APPROVAL, "approved",
-                                    f"#{args[0]} via shell", ref_id=args[0])
-                return f"approval #{args[0]} approved"
+                # 決定の対象は kind='plugin' だけ (他の kind は将来枠で、決定経路を持たない)。
+                if row is None:
+                    raise ApprovalNotFoundError(approval_id)
+                return f"approval #{args[0]} は plugin 以外の kind のため決定できません"
             if cmd == "reject" and args:
                 approval_id = int(args[0])
                 reason = " ".join(args[1:]) or None
+                if self.ops_service is not None:
+                    return self._ops_decide("reject", approval_id, reason, args[0])
                 row = self.conn.execute(
                     "SELECT kind FROM approval_requests WHERE id=?",
                     (approval_id,)).fetchone()
@@ -164,9 +179,9 @@ class Commands:
                         reason=reason or "", now=self.clock.now(),
                         plugins_root=self.plugins_root, activity=self.activity)
                 else:
-                    approvals.apply_decision(
-                        self.conn, approval_id, "rejected", decided_by="shell",
-                        now=self.clock.now(), reason=reason, commit=True)
+                    if row is None:
+                        raise ApprovalNotFoundError(approval_id)
+                    return f"approval #{args[0]} は plugin 以外の kind のため決定できません"
                 self.activity.write(Category.APPROVAL, "rejected",
                                     f"#{args[0]} via shell", ref_id=args[0])
                 return f"approval #{args[0]} rejected"
@@ -174,10 +189,12 @@ class Commands:
                 # §5.3 契機③ (11e 新規命名): 手順を頭から再試行する。
                 # plugin flock を経由する switch.retry_approval を呼ぶため
                 # plugins_root/settings の配線が必須 (B-1 是正)。
-                if self.plugins_root is None or self.settings is None:
+                if self.ops_service is None and (self.plugins_root is None or self.settings is None):
                     return "approval retry backend (plugins_root/settings) が未配線です"
                 from agentic_fx.plugin import switch as plugin_switch
                 approval_id = int(args[1])
+                if self.ops_service is not None:
+                    return self._ops_decide("retry", approval_id, None, args[1])
                 # [switch-ops-hardening] T5 (設計書 §3.5): `retry_approval` が
                 # **plugin flock の内側で確定した** outcome を返す。ここでは
                 # それを文言に写すだけで、lock の外で DB / FS を読み直さない
@@ -259,6 +276,8 @@ class Commands:
                 return "kill switch ラッチを解除しました"
             if cmd == "reflect" and len(args) == 2 and args[0] == "retry":
                 order_id = int(args[1])
+                if self.ops_service is not None:
+                    return self._ops_reflect_retry(order_id)
                 order = orders.get(self.conn, order_id)
                 if order is None:
                     raise ValueError(f"order #{order_id} does not exist")
@@ -287,14 +306,21 @@ class Commands:
             if cmd == "improve" and not args:
                 if self.improve_supervisor is None:
                     return "improve backend が未配線です"
+                if self.ops_service is not None:
+                    reply = self.ops_service.improve(ShellCaller.SHELL, uuid.uuid4().hex)
+                    return f"improve job {reply['job_id']} を受理しました"
                 mission_id = self.improve_supervisor.submit_manual()
                 return f"improve mission #{mission_id} を起動しました"
             if cmd == "improve" and args and args[0] == "add":
                 text = " ".join(args[1:])
                 if not text:
                     return "usage: improve add <idea text>"
-                bid = backlog.add(self.conn, idea=text, source="user",
-                                  now=self.clock.now())
+                if self.ops_service is not None:
+                    bid = self.ops_service.add_backlog(
+                        ShellCaller.SHELL, uuid.uuid4().hex, text)["id"]
+                else:
+                    bid = backlog.add(self.conn, idea=text, source="user",
+                                      now=self.clock.now())
                 self.activity.write(Category.IMPROVE, "backlog_added",
                                     f"#{bid} via shell", ref_id=str(bid))
                 display, removed = _normalize_idea_display(text)
@@ -312,6 +338,8 @@ class Commands:
                 return reply
             if cmd == "backlog" and len(args) == 2 and args[0] == "reject":
                 bid = int(args[1])
+                if self.ops_service is not None:
+                    return self._ops_backlog(bid, "reject")
                 # 検収 B3 (2026-08-22): 設計書 §4.3 の状態機械 — reject は
                 # open|observation からのみ。`backlog.set_status` (Task 8)
                 # は `apply_approval_outcome` 用の汎用 setter でガードを
@@ -334,6 +362,8 @@ class Commands:
                 return f"backlog #{bid} を rejected にしました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "note":
                 bid = int(args[1])
+                if self.ops_service is not None:
+                    return self._ops_backlog(bid, "note")
                 row = self.conn.execute(
                     "SELECT status FROM improvement_backlog WHERE id=?",
                     (bid,)).fetchone()
@@ -350,6 +380,8 @@ class Commands:
                 return f"backlog #{bid} を note にしました"
             if cmd == "backlog" and len(args) == 2 and args[0] == "reopen":
                 bid = int(args[1])
+                if self.ops_service is not None:
+                    return self._ops_backlog(bid, "reopen")
                 # 検収 B3: reopen は done|rejected|note (終端) からのみ。
                 # note からの reopen は d894983 (CR8) で追加 (note に出口を作る)。
                 # `selected` (Mission 実行中) から reopen を許すと
@@ -374,6 +406,9 @@ class Commands:
                 text = " ".join(args[1:])
                 if not text:
                     return "usage: policy add <text>"
+                if self.ops_service is not None:
+                    self.ops_service.add_policy(ShellCaller.SHELL, uuid.uuid4().hex, text)
+                    return "policy に追記しました"
                 if self._policy_path is None:
                     return "policy directives の path が未配線です"
                 self._policy_path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +434,101 @@ class Commands:
         except Exception as e:
             return f"エラー: {safe_error_text(e)}"
         return _HELP
+
+    def _ops_decide(self, kind: str, approval_id: int, reason: str | None,
+                    shown_id: str) -> str:
+        """API と同じ決定レーンで決め、従来の文言で返す。"""
+        try:
+            job = self.ops_service.decide_from_shell(kind, approval_id, reason)
+        except OpsError as e:
+            if e.code is ErrorCode.NOT_FOUND:
+                return f"approval #{approval_id} は存在しません"
+            if e.code is ErrorCode.ALREADY_DECIDED:
+                return "その approval は決定済みです"
+            if e.code is ErrorCode.UNSUPPORTED_KIND:
+                return f"approval #{approval_id} は plugin 以外の kind のため決定できません"
+            return f"エラー: {e.code.value}"
+        outcome = job.detail
+        if kind == "reject":
+            if job.error_code is not None:
+                return self._ops_decision_error(job.error_code, approval_id)
+            self.activity.write(Category.APPROVAL, "rejected",
+                                f"#{shown_id} via shell", ref_id=shown_id)
+            return f"approval #{shown_id} rejected"
+        if outcome is None:
+            return self._ops_decision_error(job.error_code, approval_id)
+        text = self._approval_outcome_text(outcome)
+        if kind == "retry":
+            self.activity.write(Category.APPROVAL, "retry",
+                                f"#{approval_id} via shell", ref_id=str(approval_id))
+            return f"approval #{approval_id} を再試行しました: {text}"
+        if outcome.outcome not in ("deployed", "deployed_after_rollback"):
+            return (f"approval #{shown_id} は今回の操作では承認されません"
+                    f"でした (status={outcome.status}): {text}")
+        self.activity.write(Category.APPROVAL, "approved",
+                            f"#{shown_id} via shell", ref_id=shown_id)
+        return f"approval #{shown_id} approved: {text}"
+
+    @staticmethod
+    def _ops_decision_error(code: str | None, approval_id: int) -> str:
+        if code == ErrorCode.NOT_FOUND.value:
+            return f"approval #{approval_id} は存在しません"
+        if code == ErrorCode.ALREADY_DECIDED.value:
+            return "その approval は決定済みです"
+        if code == ErrorCode.UNSUPPORTED_KIND.value:
+            return f"approval #{approval_id} は plugin 以外の kind のため決定できません"
+        return f"エラー: {code}"
+
+    def _ops_backlog(self, bid: int, action: str) -> str:
+        labels = {"reject": ("rejected", "open|observation", "reject できません",
+                             "backlog_rejected"),
+                  "note": ("note", "open|observation", "note にできません", "backlog_noted"),
+                  "reopen": ("open", "done|rejected|note", "reopen できません",
+                             "backlog_reopened")}
+        target, allowed, refusal, event = labels[action]
+        try:
+            self.ops_service.transition_backlog(ShellCaller.SHELL, bid, action)
+        except OpsError as e:
+            if e.code is ErrorCode.NOT_FOUND:
+                return f"backlog #{bid} は存在しません"
+            if e.code is ErrorCode.INVALID_STATE:
+                row = self.conn.execute(
+                    "SELECT status FROM improvement_backlog WHERE id=?", (bid,)).fetchone()
+                status = row["status"] if row is not None else "?"
+                return (f"backlog #{bid} は status={status} のため"
+                        f" {refusal} ({allowed} からのみ可)")
+            return f"エラー: {e.code.value}"
+        self.activity.write(Category.IMPROVE, event, f"#{bid} via shell", ref_id=str(bid))
+        if action == "reopen":
+            return f"backlog #{bid} を open に戻しました"
+        return f"backlog #{bid} を {target} にしました"
+
+    def _ops_reflect_retry(self, order_id: int) -> str:
+        try:
+            seen = self.ops_service.reflection_status(ShellCaller.SHELL, order_id)
+        except OpsError as e:
+            if e.code is ErrorCode.NOT_FOUND:
+                raise ValueError(f"order #{order_id} does not exist") from None
+            raise
+        if seen["status"] != "closed":
+            raise ValueError(f"order #{order_id} は closed ではありません "
+                             f"(status={seen['status']})")
+        if seen["reflected"]:
+            raise ValueError(f"order #{order_id} は既に reflection 済みです")
+        try:
+            self.ops_service.retry_reflection(
+                ShellCaller.SHELL, uuid.uuid4().hex, order_id,
+                expected_attempts=seen["attempts"],
+                expected_last_attempt_at=seen["last_attempt_at"])
+        except OpsError as e:
+            if e.code is ErrorCode.ATTEMPT_CHANGED:
+                return (f"order #{order_id} の試行記録が更新されたため戻しませんでした。"
+                        "もう一度実行してください")
+            return f"エラー: {e.code.value}"
+        self.activity.write(Category.SYSTEM, "reflection_requeued",
+                            f"order_id={order_id} via shell", ref_id=str(order_id))
+        suffix = "" if seen["attempts"] > 0 else " (台帳に試行記録なし)"
+        return f"order #{order_id} を reflection 再試行対象へ戻しました{suffix}"
 
     def _killswitch_reconcile(self, rest: list[str]) -> str:
         if rest not in ([], ["confirm"]):

@@ -1,15 +1,15 @@
 ---
 id: load-settings-loads-dotenv-as-side-effect
 title: 設定の検証が .env を環境に読み込む副作用を持つ
-status: 実装待ち
+status: 是正済
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-05
 related: []
 ---
 # [load-settings-loads-dotenv-as-side-effect] 設定の検証が .env を環境に読み込む副作用を持つ
 
-**状態**: 実装待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,7 +23,10 @@ config.load_settings が load_dotenv() を引数なしで呼ぶ (config.py:742-7
 
 ## 修正内容
 
+- 2026-10-05: load_settings から dotenv 読み込みを除去し、config.load_env_file(path) を service の run_service と設定を要する CLI (backtest dispatch) の入口だけから明示的に呼ぶ。tests/test_dotenv_explicit.py で pin
+
 ## 経緯
 
 - 2026-10-02: 起票。
 - 2026-10-04: 状態: 実装待ち — 2026-10-04: 操作 API spec v1.3 (docs/superpowers/specs/2026-10-04-ops-api-design.md) の T1 の範囲に含めてユーザー承認。実装は plugin worker 隔離の main 投入と脱出の実測の後。
+- 2026-10-05: 是正内容 — load_settings から dotenv 読み込みを除去し、config.load_env_file(path) を service の run_service と設定を要する CLI (backtest dispatch) の入口だけから明示的に呼ぶ。tests/test_dotenv_explicit.py で pin

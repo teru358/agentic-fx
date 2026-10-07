@@ -96,3 +96,33 @@ def test_logs_dir_leaked_false_when_removed_during_session():
     """稀だが元々あったものが session 中に消えたケースは「残骸」ではない
     ので False (この guard の対象外 — 別の懸念)。"""
     assert _logs_dir_leaked(existed_before=True, exists_after=False) is False
+
+
+def test_home_and_xdg_config_point_away_from_the_real_user_home():
+    """全スイートで HOME / XDG_CONFIG_HOME は一時 dir を指す。実 home に鍵や設定を
+    書くテストがあっても、書込み先は一時 dir に逸れる。"""
+    import os
+    import pwd
+    from pathlib import Path
+
+    from agentic_fx.ops.keys import key_dir
+
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    home = Path.home().resolve()
+    assert home != real and not home.is_relative_to(real)
+    assert Path(os.environ["XDG_CONFIG_HOME"]).resolve().is_relative_to(home)
+    assert not key_dir(Path("/nonexistent-root")).resolve().is_relative_to(real)
+
+
+def test_real_config_signature_detects_creation_and_change(tmp_path):
+    from tests.conftest import _tree_signature
+
+    target = tmp_path / "agentic-fx"
+    absent = _tree_signature(target)
+    target.mkdir()
+    created = _tree_signature(target)
+    (target / "api").mkdir()
+    (target / "api" / "operator.token").write_text("x")
+    changed = _tree_signature(target)
+    assert absent is None and created is not None
+    assert len({absent, created, changed}) == 3

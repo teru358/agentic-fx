@@ -293,19 +293,16 @@ def test_ask_delegates(tmp_path):
     cmds.trade_loop.ask_once.assert_called_once_with("今の相場は？")
 
 
-def test_approve(tmp_path):
-    """F2: approve は DB 状態と activity 記録を検証。"""
+def test_approve_refuses_non_plugin_kind_and_leaves_it_pending(tmp_path):
+    """決定の対象は kind='plugin' だけ。他の kind は拒否し、行も activity も変えない。"""
     conn, _, activity, cmds = _commands(tmp_path)
     aid = approvals.create(conn, "tech_plugin", {}, NOW)
     out = cmds.dispatch(f"approve {aid}")
-    assert "approved" in out
-    # DB に status="approved" が記録されること
+    assert out == f"approval #{aid} は plugin 以外の kind のため決定できません"
     row = conn.execute(
         "SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
-    assert row["status"] == "approved"
-    # activity に APPROVAL レコードが記録されること
-    records = activity.tail(10, Category.APPROVAL)
-    assert any("approved" in r for r in records)
+    assert row["status"] == "pending"
+    assert not activity.tail(10, Category.APPROVAL)
 
 
 def test_approve_plugin_kind_reports_actual_outcome_not_always_approved(tmp_path):
@@ -341,30 +338,24 @@ def test_approve_plugin_kind_reports_actual_outcome_not_always_approved(tmp_path
     assert "pending" in out
 
 
-def test_reject(tmp_path):
-    """F2: reject は理由を保存し activity に記録。"""
+def test_reject_refuses_non_plugin_kind_and_leaves_it_pending(tmp_path):
     conn, _, activity, cmds = _commands(tmp_path)
     aid = approvals.create(conn, "tech_plugin", {}, NOW)
-    reason_text = "テスト理由"
-    out = cmds.dispatch(f"reject {aid} {reason_text}")
-    assert "rejected" in out
-    # DB に status="rejected" と reason が保存されること
+    out = cmds.dispatch(f"reject {aid} テスト理由")
+    assert out == f"approval #{aid} は plugin 以外の kind のため決定できません"
     row = conn.execute(
         "SELECT status, reason FROM approval_requests WHERE id=?", (aid,)).fetchone()
-    assert row["status"] == "rejected"
-    assert row["reason"] == reason_text
-    # activity に APPROVAL レコードが記録されること
-    records = activity.tail(10, Category.APPROVAL)
-    assert any("rejected" in r for r in records)
+    assert (row["status"], row["reason"]) == ("pending", None)
+    assert not activity.tail(10, Category.APPROVAL)
 
 
 def test_approve_already_decided(tmp_path):
-    """F2: 決定済み approval への二重決定は例外でなくメッセージ。"""
+    """決定済み approval への二重決定は例外でなくメッセージ。"""
     conn, _, _, cmds = _commands(tmp_path)
-    aid = approvals.create(conn, "tech_plugin", {}, NOW)
-    # 1 度目の approve
-    cmds.dispatch(f"approve {aid}")
-    # 2 度目は決定済みメッセージ
+    aid = approvals.create(conn, "plugin", {"name": "sma"}, NOW)
+    approvals.apply_decision(conn, aid, "approved", decided_by="shell", now=NOW, commit=True)
+    cmds.plugins_root = tmp_path / "plugins"
+    cmds.settings = SETTINGS
     out = cmds.dispatch(f"reject {aid} 理由")
     assert "決定済み" in out or "already" in out.lower()
 
@@ -1814,20 +1805,9 @@ def test_approve_plugin_outcome_text_is_shared_with_retry(tmp_path, monkeypatch)
     assert approve_text == retry_text
 
 
-def test_approve_non_plugin_kind_is_unchanged(tmp_path):
-    """§3.6.4: 非 plugin kind の approve は `approve_candidate` を通らず、
-    `approval #<id> approved` (逐語) + DB `approved` + activity `approved`
-    のまま (非 plugin 枝が巻き添えにならないことの pin)。"""
-    conn, _, activity, cmds = _commands(tmp_path)
-    aid = approvals.create(conn, "tech_plugin", {}, NOW)
-
-    out = cmds.dispatch(f"approve {aid}")
-
-    assert out == f"approval #{aid} approved"
-    row = conn.execute(
-        "SELECT status FROM approval_requests WHERE id=?", (aid,)).fetchone()
-    assert row["status"] == "approved"
-    assert any("approved" in r for r in activity.tail(10, Category.APPROVAL))
+def test_reject_nonexistent_is_reported_as_missing(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    assert "存在しません" in cmds.dispatch("reject 9999 理由")
 
 
 @pytest.mark.parametrize("arg", ["-1", "１", "1.5", "abc", "1 2"])

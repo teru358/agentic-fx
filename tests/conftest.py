@@ -34,6 +34,8 @@ fixture が届かない)。そこで `WorkerRunner.run` = 起動引数が確定�
 """
 from __future__ import annotations
 
+import os
+import pwd
 import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -286,6 +288,61 @@ def _guard_real_data_dir_is_never_touched():
             "テストが実リポジトリの data/ を絶対座標で触っている "
             "(2026-08-30 の gate_pytest 事故の再演)。tmp_path / mkdtemp へ隔離すること。",
             pytrace=False)
+
+
+# 実 home は HOME を差し替える前に passwd から取る (差し替え後の Path.home() は一時 dir)。
+# sandbox から実 home に届かないことを確かめるテストは、これを探査先に使う。
+REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+_REAL_AGENTIC_CONFIG = REAL_HOME / ".config" / "agentic-fx"
+
+
+def _tree_signature(path: Path):
+    """path 配下の (相対 path, mtime, size) 一覧。存在しなければ None。"""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return None
+    entries = []
+    if path.is_dir():
+        for child in sorted(path.rglob("*")):
+            try:
+                cst = child.lstat()
+            except FileNotFoundError:
+                continue
+            entries.append((str(child.relative_to(path)), cst.st_mtime_ns, cst.st_size))
+    return (st.st_mtime_ns, st.st_size, tuple(entries))
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolated_home_dir(tmp_path_factory):
+    """全スイート共通の一時 home。実 home への書込み (鍵 dir など) を構造的に逸らす。
+
+    真偽の曖昧な設定 (MagicMock の App 等) で実 `~/.config/agentic-fx` に鍵が
+    作られた事故があり、tests/ops だけの隔離では他の dir のテストを守れない。
+    session の前後で実 `~/.config/agentic-fx` が作られていない・変わっていないことも
+    確かめる。"""
+    before = _tree_signature(_REAL_AGENTIC_CONFIG)
+    home = tmp_path_factory.mktemp("home")
+    (home / ".config").mkdir()
+    yield home
+    after = _tree_signature(_REAL_AGENTIC_CONFIG)
+    if before != after:
+        pytest.fail(
+            f"実 {_REAL_AGENTIC_CONFIG} がテスト実行中に作成・変更された。"
+            "テストが実 home を触っている。HOME / XDG_CONFIG_HOME の隔離を確かめること。",
+            pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_home(request, _isolated_home_dir, monkeypatch):
+    """各テストの HOME / XDG_CONFIG_HOME を一時 home に向ける (子 process にも継承される)。
+
+    実 backend の認証情報を読む realbackend だけは実 home のまま回す
+    (既定の addopts で除外され、明示指定したときだけ走る)。"""
+    if request.node.get_closest_marker("realbackend") is not None:
+        return
+    monkeypatch.setenv("HOME", str(_isolated_home_dir))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(_isolated_home_dir / ".config"))
 
 
 @pytest.fixture(autouse=True)

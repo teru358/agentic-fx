@@ -6,10 +6,12 @@ import contextlib
 import fcntl
 import json
 import os
+import hashlib
 import re
 import shutil
 import sqlite3
 import stat
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +65,34 @@ class ApprovalOutcome:
     def __post_init__(self) -> None:
         if self.outcome not in APPROVAL_OUTCOMES:
             raise ValueError(f"unknown approval outcome: {self.outcome!r}")
+
+
+class PluginBusyError(RuntimeError):
+    """ops 要求の deadline 内に plugin flock を取得できなかった。"""
+
+
+class ApprovalKindUnsupported(RuntimeError):
+    """plugin 以外の kind を plugin 決定の経路で扱おうとした (lock 内で検出)。"""
+
+
+class ApprovalPayloadChanged(RuntimeError):
+    """受理時に表示した payload と lock 内で再読した payload が一致しない。"""
+
+
+def payload_sha256(payload_json: str) -> str:
+    """承認画面に出す `payload_json` 文字列そのものの SHA-256。"""
+    return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
+
+def _check_in_lock(row, *, require_plugin_kind: bool,
+                   expected_payload_sha256: str | None) -> None:
+    # 受理時の照合と lock 内の照合の両方を通った決定だけを進める。lock の外で
+    # 読んだ値は lock を待つ間に変わりうるので、ここが最後の照合点になる。
+    if require_plugin_kind and row["kind"] != "plugin":
+        raise ApprovalKindUnsupported(f"kind={row['kind']!r}")
+    if expected_payload_sha256 is not None and row["status"] == "pending" \
+            and payload_sha256(row["payload_json"]) != expected_payload_sha256:
+        raise ApprovalPayloadChanged("payload digest differs from the accepted one")
 
 
 def classify_live(plugins_root: Path, row) -> str:
@@ -881,7 +911,8 @@ def _drop_staging_candidate(plugins_root: Path, payload: dict, *,
 # ============================================================
 
 @contextlib.contextmanager
-def _plugin_lock(plugins_root: Path, name: str):
+def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None,
+                 stop_event=None, monotonic: Callable[[], float] = time.monotonic):
     """`plugins/.locks/<name>.lock` を blocking `flock(LOCK_EX)` で取る
     (§5.1 手順 1・11g の multi-process 期待どおり、`LOCK_NB` は使わない —
     reject/approve の競合は待ち合わせで解決する)。"""
@@ -901,7 +932,20 @@ def _plugin_lock(plugins_root: Path, name: str):
     lock_path = lock_dir / f"{name}.lock"
     fh = open(lock_path, "a+")
     try:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        if deadline is None and stop_event is None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        else:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise PluginBusyError("plugin lock cancelled")
+                try:
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if deadline is not None and monotonic() >= deadline:
+                        raise PluginBusyError("plugin lock deadline exceeded")
+                    remaining = 0.1 if deadline is None else max(0.0, deadline - monotonic())
+                    time.sleep(min(0.1, remaining))
         yield
     finally:
         fcntl.flock(fh, fcntl.LOCK_UN)
@@ -909,7 +953,8 @@ def _plugin_lock(plugins_root: Path, name: str):
 
 
 @contextlib.contextmanager
-def _plugin_locks(plugins_root: Path, names):
+def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
+                  stop_event=None):
     """[indicator-consumption-wiring] §2.3 (codex r4 I1 / r5 I2):
     strategy + 依存 indicator 名を `sorted(set(names))` の順に取る。
 
@@ -931,9 +976,18 @@ def _plugin_locks(plugins_root: Path, names):
       順序を 1 箇所に固定する (P2')。
     """
     with contextlib.ExitStack() as stack:
+        bounded = _bounded_lock_kwargs(deadline, stop_event)
         for name in sorted(set(names)):
-            stack.enter_context(_plugin_lock(plugins_root, name))
+            # 2 個目以降で期限切れになっても、ExitStack が取得済みの lock を解放する。
+            stack.enter_context(_plugin_lock(plugins_root, name, **bounded))
         yield
+
+
+def _bounded_lock_kwargs(deadline: float | None, stop_event) -> dict:
+    # 期限を持たない既存の呼び出し元には従来どおりの引数だけを渡す。
+    if deadline is None and stop_event is None:
+        return {}
+    return {"deadline": deadline, "stop_event": stop_event}
 
 
 def _dependency_names(candidate_dir: Path, name: str) -> list[str]:
@@ -1493,6 +1547,9 @@ def approve_candidate(
     conn: sqlite3.Connection, approval_id: int, *,
     decided_by: str, now: datetime, plugins_root: Path, settings,
     activity: "ActivityLog | None" = None,
+    deadline: float | None = None, stop_event=None,
+    require_plugin_kind: bool = False,
+    expected_payload_sha256: str | None = None,
 ) -> "ApprovalOutcome":
     """P2 (approve) の入口。plugins_root は FS 操作 (版・git・切替) の起点、
     settings は将来のゲート再検証・kind 別分岐のために渡す (現行 P2 手順は
@@ -1521,9 +1578,12 @@ def approve_candidate(
     except CandidateMissingError:
         dep_names = [name]
 
-    with _plugin_locks(plugins_root, dep_names):  # 0b
+    with _plugin_locks(plugins_root, dep_names,
+                       **_bounded_lock_kwargs(deadline, stop_event)):  # 0b
         row = conn.execute(
             "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+        _check_in_lock(row, require_plugin_kind=require_plugin_kind,
+                       expected_payload_sha256=expected_payload_sha256)
         if row["status"] != "pending":
             # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
             return ApprovalOutcome(outcome="already_decided", name=name,
@@ -1872,7 +1932,10 @@ def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
 def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
                    decided_by: str, now: datetime, plugins_root: Path,
                    settings: "Settings",
-                   activity: "ActivityLog | None" = None) -> "ApprovalOutcome":
+                   activity: "ActivityLog | None" = None,
+                   deadline: float | None = None, stop_event=None,
+                   require_plugin_kind: bool = False,
+                   expected_payload_sha256: str | None = None) -> "ApprovalOutcome":
     """§5.3 契機③: 手順を頭から流す (lock → plain 検出 → ⓓ → ⓐ → 版(冪等) →
     git(no-op) → 切替(no-op なら済み) → apply_decision)。approve_candidate と
     同じ実装を呼ぶだけ (retry は「approve をもう一度呼ぶ」と同義 — §5.3 本文)。
@@ -1882,13 +1945,18 @@ def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
     確定した `ApprovalOutcome` を**そのまま透過する** (§3.5)。"""
     return approve_candidate(conn, approval_id, decided_by=decided_by, now=now,
                              plugins_root=plugins_root, settings=settings,
-                             activity=activity)
+                             activity=activity, deadline=deadline,
+                             stop_event=stop_event,
+                             require_plugin_kind=require_plugin_kind,
+                             expected_payload_sha256=expected_payload_sha256)
 
 
 def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                      decided_by: str, reason: str, now: datetime,
                      plugins_root: Path,
-                     activity: "ActivityLog | None" = None) -> None:
+                     activity: "ActivityLog | None" = None,
+                     deadline: float | None = None, stop_event=None,
+                     require_plugin_kind: bool = False) -> bool:
     """§8.1-32: 全 terminal decision (approve/reject/expire/reconcile) が
     同じ plugin flock を通る。本 task (11g) が新規命名 (骨格 Interfaces 節
     に無い — submit/approve/bless の 3 関数しか列挙されていないが、reject
@@ -1917,9 +1985,14 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
                 Category.APPROVAL, "reject_rejected_payload_missing_name",
                 f"approval_id={approval_id}: plugin payload に name が無く "
                 "契約違反のため reject を実行せず pending 留置")
-        return
+        return False
 
-    with _plugin_lock(plugins_root, name):
+    with _plugin_lock(plugins_root, name, **_bounded_lock_kwargs(deadline, stop_event)):
+        locked_row = conn.execute(
+            "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+        if locked_row is not None:
+            _check_in_lock(locked_row, require_plugin_kind=require_plugin_kind,
+                           expected_payload_sha256=None)
         # 未完ジャーナル収束: この approval 自身の未完ジャーナルが残って
         # いれば (preparing 等で中断した再試行分) reject 前に巻き戻す
         # (§5.1-1 の収束規則と同じ精神 — reject は「この承認を成立させ
@@ -1936,6 +2009,7 @@ def reject_candidate(conn: sqlite3.Connection, approval_id: int, *,
         # I1 是正: 終端決定 (rejected) の tx 直後に staging 候補を削除する
         # (§5.1 手順 3)。
         _drop_staging_candidate(plugins_root, payload, activity=activity)
+    return True
 
 
 def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,

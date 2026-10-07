@@ -83,6 +83,22 @@ def set_status(conn: sqlite3.Connection, backlog_id: int, status: str,
     return cur.rowcount == 1
 
 
+def transition(conn: sqlite3.Connection, backlog_id: int, *,
+               allowed_from: tuple[str, ...], target: str, now: datetime,
+               last_result: str | None = None, commit: bool = True) -> bool:
+    """状態を読んでから書く競合を作らない、人手操作用の条件付き更新。"""
+    if not allowed_from:
+        raise ValueError("allowed_from must not be empty")
+    marks = ",".join("?" for _ in allowed_from)
+    cur = conn.execute(
+        "UPDATE improvement_backlog SET status=?, last_result=?, updated_at=? "
+        f"WHERE id=? AND status IN ({marks})",
+        (target, last_result, now.isoformat(), backlog_id, *allowed_from))
+    if commit:
+        conn.commit()
+    return cur.rowcount == 1
+
+
 def select_for_mission(conn: sqlite3.Connection, backlog_id: int, *,
                        now: datetime, commit: bool = True) -> bool:
     """§4.1 Tx-1・裁定7: `open|observation` からの CAS。rowcount=1 が

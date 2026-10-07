@@ -94,9 +94,10 @@ def test_table_names_include_candidate_archives():
         "backtest_runs", "analysis_runs", "signals", "reflection_attempts",
         "alert_state", "improve_waves", "improve_wave_slots",
         "plugin_switch_journal",
-        "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
-        "cron_cursor", "mission_decision_bars",
-    })
+            "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
+            "cron_cursor", "mission_decision_bars",
+            "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
+        })
 
 
 # round2 D4 是正 (検収 acceptance-round2.md D4): #8 是正 (idea_norm 列の

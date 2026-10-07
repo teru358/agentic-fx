@@ -4568,6 +4568,15 @@ def test_build_app_rejects_opencode_when_not_verified(tmp_path):
 # 段 0 F1: 相対 CLI bin の絶対化書き戻し
 # ============================================================================
 
+def _fake_claude_credentials(tmp_path: Path) -> str:
+    """実 home の認証情報に頼らないための一時 credentials (mode 0600)。"""
+    creds = tmp_path / "claude-creds" / ".credentials.json"
+    creds.parent.mkdir(exist_ok=True)
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
+    return str(creds)
+
+
 @pytest.mark.parametrize("which_runner", ["trade", "improve"])
 def test_build_app_rewrites_relative_claude_bin_to_absolute_path(
         tmp_path, monkeypatch, which_runner):
@@ -4625,7 +4634,8 @@ def test_build_app_rewrites_relative_claude_bin_to_absolute_path(
         root = _root_with_settings(tmp_path, runner={
             which_runner: {"backend": "claude", "model": "m"},
             other_runner: {"backend": "local"},
-            "claude": {"bin": "afx-fake-claude"}})
+            "claude": {"bin": "afx-fake-claude",
+                       "credentials_file": _fake_claude_credentials(tmp_path)}})
         app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
         try:
             resolved = app.settings.runner.claude.bin
@@ -4682,7 +4692,8 @@ def test_improve_loop_receives_settings_with_resolved_cli_bin(tmp_path, monkeypa
         mp.setenv("PATH", f"{bin_dir}:{old_path}")
         root = _root_with_settings(tmp_path, runner={
             "improve": {"backend": "claude", "model": "m"},
-            "claude": {"bin": "afx-fake-claude"}})
+            "claude": {"bin": "afx-fake-claude",
+                       "credentials_file": _fake_claude_credentials(tmp_path)}})
         app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
         try:
             improve_loop = app.improve_supervisor._improve_loop
@@ -4993,7 +5004,10 @@ def test_improve_tick_and_supervisor_wired_after_task12(tmp_path):
             with _patch.object(app.improve_supervisor, "submit_manual",
                                return_value=42):
                 result = app.commands.dispatch("improve")
-                assert "42" in result
+                # 対話シェルは ops 層の job として受理し、mission id は job 結果に載る。
+                job_id = re.search(r"job ([0-9a-f]+)", result).group(1)
+                view = app.ops.wait_for_job(job_id, timeout=10)
+                assert view["result"] == {"mission_id": 42}
         finally:
             app.close()
 

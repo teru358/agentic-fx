@@ -27,6 +27,7 @@ from agentic_fx.core import runtime_fingerprint, seccomp
 from agentic_fx.plugin import sandbox
 from agentic_fx.plugin.loader import PluginMeta, content_hash
 from agentic_fx.plugin.sandbox import PluginSession, SandboxError, run_plugin
+from tests.conftest import REAL_HOME
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 CONTROL = Path(__file__).with_name("_control_worker.py")
@@ -663,7 +664,7 @@ def test_plugin_reaching_os_through_a_library_attribute_stays_in_the_cage(
              "own_test_plugin": str(meta.path / "test_plugin.py"),
              "own_dir": str(meta.path), "sibling_plugin": str(sibling / "plugin.py"),
              "repo_root": str(landlock.default_repo_root()),
-             "home_config": str(Path.home() / ".config"),
+             "home_config": str(REAL_HOME / ".config"),
              "new_file": str(tmp_path / "created")}
     try:
         out = run_plugin(meta, {"df": _df(), "params": {"paths": paths}},

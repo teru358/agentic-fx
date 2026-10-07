@@ -17,7 +17,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.activity import Category
 from agentic_fx.core.scheduler import latest_scheduled_occurrence, period_key_of
@@ -114,7 +114,7 @@ class ImproveSupervisor:
         for k in pending_ks:
             self._spawn_slot_thread(period_key, k)
 
-    def submit_manual(self) -> int:
+    def submit_manual(self, *, on_prepared: "Callable[[int], None] | None" = None) -> int:
         """手動 one-shot。slot/wave 行を作らず M=1 で全バックログを担当
         させる (§8.1-該当、9.7 節「improve」コマンドから呼ばれる)。
         wave slot が無いため on_ready コールバックは不要 (mark_running する
@@ -128,6 +128,13 @@ class ImproveSupervisor:
         now = self._clock.now()
         mission, ctx, runner = self._improve_loop.prepare(
             slot_key=None, now=now)
+        if on_prepared is not None:
+            # 操作 API の job は mission id を走行中から見せる。通知の失敗で
+            # mission を止めない。
+            try:
+                on_prepared(ctx.mission_id)
+            except Exception:  # noqa: BLE001
+                _log.exception("on_prepared callback failed")
         result = runner.run(mission)
         try:
             self._improve_loop.commit(

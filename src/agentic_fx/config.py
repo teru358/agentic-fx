@@ -415,9 +415,25 @@ class ServiceSettings(_Strict):
 
 
 class ApiSettings(_Strict):
+    """操作 API (UDS)。TCP listener は作らない。
+
+    改善 worker の seccomp が入るまで既定は無効 (起動は拒否せず警告だけ)。
+    ``host`` / ``port`` は旧版の設定ファイルを読めるように受け付けるだけで使わない。
+    """
     enabled: bool = False
-    host: str = "127.0.0.1"
-    port: int = 8420
+    socket_path: str = "data/run/api.sock"
+    host: str | None = None
+    port: int | None = None
+    max_connections: int = Field(default=4, ge=1, le=64)
+    max_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    request_deadline_sec: float = Field(default=5.0, gt=0, le=60)
+    ops_lock_wait_sec: float = Field(default=10.0, gt=0)
+    # 決定 job の期限は plugin flock 30 秒 + 実行時間 (実測 p99 22 ms) を覆う。
+    decision_deadline_sec: float = Field(default=35.0, ge=35.0)
+    plugin_lock_wait_sec: float = Field(default=30.0, gt=0)
+    ask_deadline_sec: float = Field(default=900.0, gt=0)
+    improve_start_deadline_sec: float = Field(default=35.0, gt=0)
+    shutdown_join_sec: float = Field(default=5.0, gt=0)
 
 
 class BacktestSettings(_Strict):
@@ -739,8 +755,16 @@ class Settings(_Strict):
         return self
 
 
+def load_env_file(path: Path) -> None:
+    """`.env` を `os.environ` へ読み込む唯一の関数 (既存の環境変数は上書きしない)。
+
+    設定の検証 (`load_settings`) は環境を変えない。起動経路 (service・設定を要する
+    CLI) だけがここを明示的に呼ぶ。探索はせず、渡された path だけを読む。
+    """
+    load_dotenv(dotenv_path=path, override=False)
+
+
 def load_settings(path: Path) -> Settings:
-    load_dotenv()
     if not path.exists():
         raise ConfigError(f"settings file not found: {path}")
     try:

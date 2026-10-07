@@ -346,7 +346,8 @@ def test_invariant4_home_is_scratch_not_real_home(tmp_path):
 
 def test_invariant4_real_claude_home_is_unreachable(tmp_path):
     layout = _mk_repo_layout(tmp_path)
-    real_home = Path.home()
+    from tests.conftest import REAL_HOME
+    real_home = REAL_HOME
     if not (real_home / ".claude").exists():
         pytest.skip("no ~/.claude on this host to probe against")
     script = f"""

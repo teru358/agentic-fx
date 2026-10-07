@@ -446,13 +446,25 @@ def test_non_string_claim_value_shows_invalid_text(tmp_path):
 
 # ---- 決定経路の独立 ----
 
+def _wire_plugins(tmp_path, cmds):
+    plugins = tmp_path / "plugins"
+    (plugins / ".locks").mkdir(parents=True)
+    cmds.plugins_root = plugins
+    cmds.settings = SETTINGS
+
+
 @pytest.mark.parametrize("decision,expected", [
-    ("approve", "approved"), ("reject because", "rejected")])
+    # plugin の approve は候補の実体が要るので、候補欠損では承認されず pending のまま
+    # (表示経路を通らずに backend の結果が返ることだけを見る)。
+    ("approve", "pending"), ("reject because", "rejected")])
 def test_decisions_do_not_use_the_display_path(
         tmp_path, monkeypatch, decision, expected):
     conn, cmds = _commands(tmp_path)
-    approval_id = approvals.create(
-        conn, kind="live_trade", payload=_new_payload(), now=NOW)
+    _wire_plugins(tmp_path, cmds)
+    payload = _new_payload(candidate_origin="staging",
+                           candidate_path="plugins/_staging/1/sma_cross",
+                           artifact_hash="a" * 64)
+    approval_id = approvals.create(conn, kind="plugin", payload=payload, now=NOW)
 
     def boom(*a, **k):
         raise AssertionError("display path must not be called")
@@ -471,15 +483,27 @@ def test_decisions_do_not_use_the_display_path(
 
 
 def test_decision_succeeds_on_corrupt_payload(tmp_path):
+    # plugin の決定は payload の name を要る。表示用の欄 (親の事実・自己申告) が壊れていても
+    # 決定は通ることを見る (JSON 自体が壊れた行は決定側が fail closed で扱う)。
     conn, cmds = _commands(tmp_path)
-    approval_id = approvals.create(conn, kind="live_trade", payload={},
-                                   now=NOW)
-    conn.execute("UPDATE approval_requests SET payload_json='[[' WHERE id=?",
-                 (approval_id,))
-    conn.commit()
-    cmds.dispatch(f"approve {approval_id}")
+    _wire_plugins(tmp_path, cmds)
+    payload = {"name": "sma_cross", "parent_facts": "[[", "agent_claims": 5,
+               "in_sample": [None], "holdout": "x"}
+    approval_id = approvals.create(conn, kind="plugin", payload=payload, now=NOW)
+    cmds.dispatch(f"reject {approval_id} because")
     assert conn.execute("SELECT status FROM approval_requests WHERE id=?",
-                        (approval_id,)).fetchone()["status"] == "approved"
+                        (approval_id,)).fetchone()["status"] == "rejected"
+
+
+@pytest.mark.parametrize("command", ["approve {id}", "reject {id} because"])
+def test_live_trade_kind_is_refused_by_the_shell_and_stays_pending(tmp_path, command):
+    conn, cmds = _commands(tmp_path)
+    approval_id = approvals.create(conn, kind="live_trade", payload={}, now=NOW)
+    out = cmds.dispatch(command.format(id=approval_id))
+    assert "plugin 以外の kind" in out
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "pending"
 
 
 # ---- 壊れた保存形式の細部と欄ごとの上限 ----

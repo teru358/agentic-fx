@@ -117,10 +117,18 @@ service:
   secret_env_allowlist: []   # ⑤検査 (起動時、CLI backend のみ) が誤検知した exported env 変数の名前をここに書くと除外される。
                               # 名前の完全一致のみ (パターン不可)。値は見ない — 本当に秘密でないと自分で確認してから追加すること
 
-api:
-  enabled: false
-  host: 127.0.0.1
-  port: 8420
+api:                          # 操作 API (同じマシンの UDS だけ。TCP listener は作らない)
+  enabled: false              # 改善 worker の seccomp が入るまで false (false でも daemon は起動し警告だけ)
+  socket_path: data/run/api.sock   # root からの相対 path (dir 0700 / socket 0600)
+  max_connections: 4          # 同時接続。超えた接続は 503
+  max_body_bytes: 65536       # 本文上限。超えたら 413
+  request_deadline_sec: 5.0   # 受付から応答までの期限 (slowloris は 408)
+  ops_lock_wait_sec: 10.0     # ops lock 待ちの上限 (実効値は要求の残り時間以下)
+  decision_deadline_sec: 35.0 # 決定 job の期限 (35 以上)
+  plugin_lock_wait_sec: 30.0  # plugin flock 待ちの上限 (超えたら plugin_busy)
+  ask_deadline_sec: 900.0     # ask job の期限
+  improve_start_deadline_sec: 35.0  # 手動 improve の開始までの期限
+  shutdown_join_sec: 5.0      # 停止時に API / 決定 worker を待つ上限
 
 discord:
   enabled: false              # webhook 通知 (URL は .env の DISCORD_WEBHOOK_URL)

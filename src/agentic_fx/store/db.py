@@ -367,6 +367,54 @@ CREATE TABLE IF NOT EXISTS mission_decision_bars (
 );
 """ + _IMPROVE_WAVES_DDL + _IMPROVE_WAVE_SLOTS_DDL + _PLUGIN_SWITCH_JOURNAL_DDL + _PLUGIN_SWITCH_JOURNAL_OPEN_UNIQUE_DDL
 
+_OPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ops_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  endpoint TEXT NOT NULL,
+  authenticated_principal TEXT NOT NULL,
+  asserted_actor TEXT,
+  peer_pid INTEGER,
+  peer_exe TEXT,
+  idempotency_key TEXT,
+  body_sha256 TEXT NOT NULL,
+  target_ref TEXT,
+  phase TEXT NOT NULL CHECK(phase IN ('accepted','succeeded','failed','outcome_unknown')),
+  result_code TEXT,
+  job_id TEXT,
+  response_json TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS ops_requests_no_update
+BEFORE UPDATE ON ops_requests BEGIN SELECT RAISE(ABORT, 'ops_requests is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS ops_requests_no_delete
+BEFORE DELETE ON ops_requests BEGIN SELECT RAISE(ABORT, 'ops_requests is append-only'); END;
+CREATE TABLE IF NOT EXISTS ops_idempotency (
+  authenticated_principal TEXT NOT NULL,
+  endpoint TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  body_sha256 TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('accepted','succeeded','failed','outcome_unknown')),
+  accepted_request_id TEXT NOT NULL,
+  response_json TEXT,
+  expires_at TEXT NOT NULL,
+  PRIMARY KEY(authenticated_principal, endpoint, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS ops_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  code TEXT NOT NULL,
+  ref TEXT NOT NULL,
+  fields_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ops_policies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL UNIQUE,
+  directive TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+"""
+
 TABLE_NAMES = frozenset({
     "ohlcv_cache", "ohlcv_history", "data_migrations", "missions", "trade_intents", "orders",
     "reflections", "account_snapshots", "improvement_backlog",
@@ -375,6 +423,7 @@ TABLE_NAMES = frozenset({
     "alert_state", "improve_waves", "improve_wave_slots", "plugin_switch_journal",
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     "cron_cursor", "mission_decision_bars",
+    "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
 })
 
 
@@ -1337,6 +1386,7 @@ def _migrate_legacy_plugin_approval_payloads(conn: sqlite3.Connection) -> None:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    conn.executescript(_OPS_SCHEMA)
     if _ohlcv_legacy_exists(conn):
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv)")}
         v1_leftover = conn.execute(

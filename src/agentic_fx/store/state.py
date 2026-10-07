@@ -5,11 +5,13 @@ import fcntl
 import json
 import os
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import timezone
 from pathlib import Path
+from typing import Callable
 
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 
@@ -62,6 +64,14 @@ class LockUnavailable(StateError):
     """
 
 
+class StateLockTimeout(StateError):
+    """状態更新の排他取得が caller の monotonic deadline を越えた。"""
+
+
+class StateLockCancelled(StateError):
+    """停止中なので状態更新の排他待機を中止した。"""
+
+
 @dataclass(frozen=True, slots=True)
 class AppState:
     initialized: bool = False
@@ -80,29 +90,61 @@ _MARKER_SUFFIX = ".reset-in-progress"
 
 
 class StateStore:
-    def __init__(self, path: Path, *, clock: Clock | None = None) -> None:
+    def __init__(self, path: Path, *, clock: Clock | None = None,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         # symlink 経由の別名でも lock・marker・一時ファイルが同じ場所になるよう、
         # 実体のパスに揃える。
         self._path = Path(os.path.realpath(path))
         self._clock = clock if clock is not None else SystemClock()
+        self._monotonic = monotonic
         self._thread_lock = threading.Lock()
 
     @contextmanager
-    def _exclusive(self):
+    def _exclusive(self, *, deadline: float | None = None,
+                   stop_event: threading.Event | None = None):
         """プロセス内 (threading.Lock) → プロセス間 (flock) の順で取る。
 
         flock は open file description 単位なので、同一プロセスの別スレッドは
         先に threading.Lock で直列化する。
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._thread_lock:
-            fd = os.open(str(self._path) + ".lock",
-                         os.O_RDWR | os.O_CREAT, 0o644)
+        bounded = deadline is not None or stop_event is not None
+        if bounded:
+            while not self._thread_lock.acquire(blocking=False):
+                self._wait_or_raise(deadline, stop_event)
+        else:
+            # 期限を持たない既存の呼び出し元 (tick 等) は従来どおり blocking で待つ。
+            self._thread_lock.acquire()
+        try:
+            fd = os.open(str(self._path) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                self._flock(fd, fcntl.LOCK_EX, deadline, stop_event)
                 yield
             finally:
                 os.close(fd)  # close で flock も解放される
+        finally:
+            self._thread_lock.release()
+
+    def _flock(self, fd: int, mode: int, deadline: float | None,
+               stop_event: threading.Event | None) -> None:
+        if deadline is None and stop_event is None:
+            fcntl.flock(fd, mode)
+            return
+        while True:
+            try:
+                fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                self._wait_or_raise(deadline, stop_event)
+
+    def _wait_or_raise(self, deadline: float | None,
+                       stop_event: threading.Event | None) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise StateLockCancelled("state lock wait cancelled")
+        if deadline is not None and self._monotonic() >= deadline:
+            raise StateLockTimeout("state lock deadline exceeded")
+        remaining = float("inf") if deadline is None else deadline - self._monotonic()
+        time.sleep(max(0.0, min(0.01, remaining)))
 
     @property
     def _marker(self) -> Path:
@@ -130,11 +172,13 @@ class StateStore:
             os.close(dfd)
 
     @contextmanager
-    def _shared(self):
+    def _shared(self, *, deadline: float | None = None,
+                stop_event: threading.Event | None = None):
         """writer の replace 途中を読者に見せない共有 lock。
 
         親 dir が無ければ初期化前で writer も居ないので lock なしで読む。親 dir が
         あるのに lock を開けないときは writer の不在を言えないので LockUnavailable。
+        deadline / stop_event を渡した読者は、writer が長く居座っても待ち続けない。
         """
         if not self._path.parent.exists():
             yield
@@ -149,23 +193,35 @@ class StateStore:
                 raise LockUnavailable(
                     f"cannot open state lock: {type(e).__name__}") from e
         try:
-            fcntl.flock(fd, fcntl.LOCK_SH)
+            self._flock(fd, fcntl.LOCK_SH, deadline, stop_event)
             yield
         finally:
             os.close(fd)
 
-    def load(self) -> AppState:
+    def load(self, *, deadline: float | None = None,
+             stop_event: threading.Event | None = None) -> AppState:
         """共有 lock を取って読む。解除の途中 marker があればラッチ済みとして返す。"""
-        with self._shared():
+        with self._shared(deadline=deadline, stop_event=stop_event):
             state = self._load_unlocked()
             pending = self.reconcile_marker() is not None
         if pending:
             return replace(state, kill_switch_latched=True)
         return state
 
-    def file_value(self) -> AppState:
+    def autopilot_at_start(self, *, deadline: float | None = None,
+                           stop_event: threading.Event | None = None) -> bool:
+        """Read autopilot while holding the writer flock used by state changes.
+
+        A queued operation calls this immediately before its first side effect,
+        making its ordering against an autopilot update deterministic.
+        """
+        with self._exclusive(deadline=deadline, stop_event=stop_event):
+            return self._load_unlocked().autopilot
+
+    def file_value(self, *, deadline: float | None = None,
+                   stop_event: threading.Event | None = None) -> AppState:
         """marker を無視した、ファイルそのままの値 (reconcile の表示用)。"""
-        with self._shared():
+        with self._shared(deadline=deadline, stop_event=stop_event):
             return self._load_unlocked()
 
     def _load_unlocked(self) -> AppState:
@@ -256,12 +312,13 @@ class StateStore:
             except OSError:
                 pass
 
-    def update(self, **changes) -> AppState:
+    def update(self, *, deadline: float | None = None,
+               stop_event: threading.Event | None = None, **changes) -> AppState:
         valid = {f.name for f in fields(AppState)}
         unknown = set(changes) - valid
         if unknown:
             raise TypeError(f"unknown state fields: {unknown}")
-        with self._exclusive():
+        with self._exclusive(deadline=deadline, stop_event=stop_event):
             current = self._load_unlocked()
             if changes == {"kill_switch_latched": True} \
                     and current.kill_switch_latched:
@@ -324,13 +381,14 @@ class StateStore:
         except OSError:
             pass
 
-    def reset_kill_switch(self, expected_generation: int) -> AppState:
+    def reset_kill_switch(self, expected_generation: int, *, deadline: float | None = None,
+                          stop_event: threading.Event | None = None) -> AppState:
         """ラッチ中かつ世代が一致するときだけ解除する。それ以外は何も書かない。
 
         write-ahead: replace の前に marker を永続化し、全工程が済んでから消す。
         途中で止まれば marker が残り、load() は(別プロセスでも)ラッチ中を返す。
         """
-        with self._exclusive():
+        with self._exclusive(deadline=deadline, stop_event=stop_event):
             if self.reconcile_marker() is not None:
                 raise StateUncertain(
                     "a previous reset did not finish; run `killswitch reconcile`")
@@ -355,13 +413,14 @@ class StateStore:
                     "kill switch reset did not finish; marker kept") from e
             return state
 
-    def confirm_latched(self) -> AppState:
+    def confirm_latched(self, *, deadline: float | None = None,
+                        stop_event: threading.Event | None = None) -> AppState:
         """marker を「ラッチ中として確定」して消す (解除側には倒さない)。
 
         ファイルをラッチ状態で書き直し、成功してから marker を消す。marker が無ければ
         何も書かず現在値を返す。
         """
-        with self._exclusive():
+        with self._exclusive(deadline=deadline, stop_event=stop_event):
             if self.reconcile_marker() is None:
                 return self._load_unlocked()
             current = self._load_unlocked()

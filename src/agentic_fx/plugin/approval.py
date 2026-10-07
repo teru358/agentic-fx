@@ -391,6 +391,11 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                   run_in_sample_fn: RunInSampleFn | None = None) -> int:
     """plugin (kind=plugin) の承認申請行を作り、その id を返す。
 
+    **CLI・service のどの入口からも呼ばれない** (`afx plugin submit` の旧経路は
+    共有 gate を通らないため廃止した。人間の申請は `switch.submit_candidate`
+    だけを通る)。この関数は旧 gate の検証部品として残るもので、入口を足す場合は
+    共有 gate (`switch.submit_candidate`) へ繋ぐこと。
+
     どの検証ゲート (max_bars_limit/check_source/pytest/kind 別検証/
     content_hash 再検証) が失敗しても `approval_requests` 行は作らない
     (fail closed)。

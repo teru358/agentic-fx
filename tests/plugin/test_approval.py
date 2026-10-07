@@ -987,26 +987,6 @@ def _write_cli_indicator_plugin(plugins_dir: Path, name: str) -> Path:
     return d
 
 
-def test_entry_plugin_submit_dispatches_to_approval_submit_plugin(
-        tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    _install_settings(tmp_path)
-    _write_cli_indicator_plugin(tmp_path / "plugins", "ind")
-
-    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
-         patch("agentic_fx.entry.service.run_service") as run_service, \
-         patch("agentic_fx.plugin.approval.submit_plugin") as submit_mock:
-        submit_mock.return_value = 42
-        rc = main(["plugin", "submit", "ind"])
-
-    assert rc == 0
-    run_service.assert_not_called()
-    assert submit_mock.called
-    args, kwargs = submit_mock.call_args
-    assert args[1].name == "ind"
-    assert "42" in capsys.readouterr().out
-
-
 def test_entry_plugin_bless_without_from_is_always_rejected(
         tmp_path, monkeypatch, capsys):
     """プラン10 Task11 裁定3是正: `afx plugin bless <name>` (--from なし) は
@@ -1029,36 +1009,6 @@ def test_entry_plugin_bless_without_from_is_always_rejected(
     assert not bless_mock.called
     # 検収 m9 是正: 他の全 CLI エラーと同じく stderr へ統一 (旧稿は stdout)
     assert "materialize" in capsys.readouterr().err
-
-
-def test_entry_plugin_submit_not_found_rc1(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    _install_settings(tmp_path)
-    (tmp_path / "plugins").mkdir()
-
-    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
-         patch("agentic_fx.entry.service.run_service") as run_service:
-        rc = main(["plugin", "submit", "nope"])
-
-    assert rc == 1
-    run_service.assert_not_called()
-    assert "エラー" in capsys.readouterr().err
-
-
-def test_entry_plugin_submit_validation_failure_rc1(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
-    _install_settings(tmp_path)
-    _write_cli_indicator_plugin(tmp_path / "plugins", "ind")
-
-    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
-         patch("agentic_fx.entry.service.run_service") as run_service, \
-         patch("agentic_fx.plugin.approval.submit_plugin") as submit_mock:
-        submit_mock.side_effect = ValueError("boom")
-        rc = main(["plugin", "submit", "ind"])
-
-    assert rc == 1
-    run_service.assert_not_called()
-    assert "エラー" in capsys.readouterr().err
 
 
 # --- [indicator-consumption-wiring] T4: 未解決の非送出 (F3) ---------------

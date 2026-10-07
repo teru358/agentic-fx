@@ -445,7 +445,8 @@ def _fs_probe_targets(selected: list[Path], sibling: Path) -> tuple[dict, dict]:
         dirs[str(d.resolve())] = 13
     files[str(sibling.resolve() / "plugin.py")] = 13
     dirs[str(sibling.resolve())] = 13
-    home = Path.home().resolve()
+    from tests.conftest import REAL_HOME
+    home = REAL_HOME.resolve()
     for p in (home, home / ".config", REPO, REPO / "src", REPO / "docs", Path("/tmp"),
               Path("/etc"), REPO / "data", REPO / "config", REPO / "logs"):
         if p.is_dir():

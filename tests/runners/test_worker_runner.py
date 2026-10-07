@@ -3071,9 +3071,15 @@ def test_worker_runner_creates_home_tmp_cfg_subdirs(monkeypatch, tmp_path):
         return orig_popen([sys.executable, "-c", _READY_CHILD_SCRIPT], **kw)
 
     monkeypatch.setattr(subprocess, "Popen", spy)
+    # 実 home の認証情報を写さないよう、一時 dir の偽 credentials を使う。
+    creds = tmp_path / "creds" / ".credentials.json"
+    creds.parent.mkdir()
+    creds.write_text('{"token":"x"}')
+    creds.chmod(0o600)
     root = _root(tmp_path)
     runner = WorkerRunner(root=root,
-                          settings=_worker_settings(claude_backend=True),
+                          settings=_worker_settings(claude_backend=True,
+                                                    credentials_file=str(creds)),
                           clock=FixedClock(NOW), rag=_rag(tmp_path),
                           worker_profile="improve")
     runner.run(_mission())
