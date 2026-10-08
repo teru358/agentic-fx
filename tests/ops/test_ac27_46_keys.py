@@ -426,3 +426,82 @@ def test_keys_cli_does_not_load_dotenv(tmp_path, monkeypatch):
     monkeypatch.delenv("AFX_KEYS_PROBE", raising=False)
     assert main(["keys", "init"]) == 0
     assert called == [] and "AFX_KEYS_PROBE" not in os.environ
+
+
+def test_ac27_first_init_leaves_only_the_two_keys_and_ready(tmp_path):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    assert sorted(os.listdir(directory)) == sorted(
+        [keys.READY_NAME] + [keys.key_file_name(p) for p in Principal])
+
+
+def test_ac46_key_dir_owned_by_another_uid_is_refused(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    actual = keys.os.fstat
+
+    def fstat(opened):
+        st = actual(opened)
+        if not stat.S_ISDIR(st.st_mode):
+            return st
+        return SimpleNamespace(st_mode=st.st_mode, st_uid=os.getuid() + 1)
+
+    monkeypatch.setattr(keys.os, "fstat", fstat)
+    with pytest.raises(keys.KeySetError) as err:
+        keys.load_keyset(directory)
+    assert err.value.code == "key_dir_invalid"
+
+
+@pytest.mark.parametrize("mode", [0o711, 0o750, 0o500], ids=["0711", "0750", "0500"])
+def test_ac6_key_dir_mode_other_than_0700_fails(tmp_path, mode):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    os.chmod(directory, mode)
+    try:
+        with pytest.raises(keys.KeySetError) as err:
+            keys.load_keyset(directory)
+        assert err.value.code == "key_dir_invalid"
+    finally:
+        os.chmod(directory, 0o700)
+
+
+@pytest.mark.parametrize("tamper", ["state", "generation", "extra_principal", "version"])
+def test_ac46_ready_with_unexpected_content_is_refused(tmp_path, tamper):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    path = directory / keys.READY_NAME
+    ready = json.loads(path.read_text())
+    operator = ready["principals"]["operator"]
+    if tamper == "state":
+        operator["state"] = "enabled"
+    elif tamper == "generation":
+        operator["generation"] = "1"
+    elif tamper == "extra_principal":
+        ready["principals"]["intruder"] = dict(operator)
+    else:
+        ready["version"] = keys.READY_VERSION + 1
+    path.write_text(json.dumps(ready))
+    assert _mode(path) == 0o600
+    with pytest.raises(keys.KeySetError) as err:
+        keys.load_keyset(directory)
+    assert err.value.code == "ready_invalid"
+
+
+def test_ac46_rotate_does_not_take_over_an_unfinished_revoke(tmp_path):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    old = _token(directory, Principal.APPROVER)
+    with pytest.raises(Crash):
+        keys.revoke(directory, Principal.APPROVER, hook=_crash_at("tombstone:renamed"))
+    with pytest.raises(keys.KeySetError) as err:
+        keys.rotate(directory, Principal.APPROVER)
+    assert err.value.code == "invalid_state"
+    keys.revoke(directory, Principal.APPROVER)
+    loaded = keys.load_keyset(directory)
+    assert Principal.APPROVER in loaded.disabled
+    assert loaded.authenticate(old) is None

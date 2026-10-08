@@ -313,3 +313,20 @@ def test_ac1_building_routes_from_a_broken_table_fails_closed():
     bad["status"] = dataclasses.replace(ENDPOINTS["status"], route="FETCH /v1/status")
     with pytest.raises(RuntimeError):
         build_routes(bad)
+
+
+@pytest.mark.parametrize("status", ["done", "all", ""])
+def test_ac1_approval_list_serves_only_pending(api, status):
+    response = api.client(Principal.OPERATOR).get(f"/v1/approvals?status={status}")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_argument"
+
+
+@pytest.mark.parametrize("content", [b"[]", b'"idea"', b"{", b"null"])
+def test_ac1_body_that_is_not_a_json_object_is_400_and_not_accepted(api, content):
+    response = api.client(Principal.OPERATOR).post(
+        "/v1/backlog", content=content,
+        headers={"Idempotency-Key": "b", "Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_argument"
+    assert api.env.conn.execute("SELECT COUNT(*) FROM ops_requests").fetchone()[0] == 0

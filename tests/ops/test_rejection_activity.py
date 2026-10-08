@@ -73,3 +73,13 @@ def test_rejection_category_outside_the_fixed_set_is_refused_without_writing(ops
         service.record_rejection(category)
     service.shutdown(join_timeout=1)
     assert _lines(ops_env) == before
+
+
+def test_category_with_exactly_five_rejections_reports_nothing_suppressed(ops_env):
+    service = ops_env.service()
+    for _ in range(5):
+        service.record_rejection("peer_rejected")
+    service.shutdown(join_timeout=1)
+    lines = _lines(ops_env)
+    assert len([l for l in lines if "\tpeer_rejected\t" in l]) == 5
+    assert [l for l in lines if "\tsuppressed\t" in l] == []

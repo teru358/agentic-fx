@@ -439,3 +439,14 @@ def test_shell_requests_are_accepted_while_autopilot_is_on(ops_env):
             break
         time.sleep(0.01)
     assert codes == ["ok"] * 6
+
+
+def test_ac11_finished_ask_frees_the_slot_for_the_next_one(ops_env):
+    slot = _Slot()
+    service = ops_env.service(ask_submitter=slot)
+    first = service.ask(OPERATOR, "k1", "一つ目")
+    slot.futures[0].set_result("回答")
+    assert wait_job(service, first["job_id"])["state"] == "done"
+    second = service.ask(OPERATOR, "k2", "二つ目")
+    assert second["state"] == "running"
+    assert second["job_id"] != first["job_id"]

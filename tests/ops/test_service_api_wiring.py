@@ -502,3 +502,55 @@ def test_ac22_periodic_flush_timer_runs_while_listener_is_open(tmp_path, monkeyp
 
 def test_ac22_default_flush_interval_is_30_seconds():
     assert service_mod._OPS_FLUSH_INTERVAL_SEC == 30.0
+
+
+def test_unexpected_listener_start_error_is_recorded_and_daemon_runs(tmp_path, monkeypatch):
+    _init(tmp_path)
+    _settings(tmp_path, enabled=True)
+
+    def broken(self):
+        raise RuntimeError("listener exploded")
+
+    monkeypatch.setattr(ApiServer, "start", broken)
+    app = _app(tmp_path)
+    assert _run(tmp_path, app) == 0
+    assert "api_start_failed" in _activity(tmp_path)
+    assert any("api_start_failed" in r for r in app.health_latch.summary())
+    assert any("api_start_failed" in t for t in app.notifier.sent)
+    assert "listener exploded" not in _activity(tmp_path)
+
+
+def test_ac22_periodic_flush_keeps_running_after_a_failed_flush(tmp_path, monkeypatch):
+    _init(tmp_path)
+    _settings(tmp_path, enabled=True)
+    monkeypatch.setattr(service_mod, "_OPS_FLUSH_INTERVAL_SEC", 0.05)
+    calls = []
+
+    def flush(self):
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            raise OSError("activity log unavailable")
+
+    monkeypatch.setattr(ApiServer, "flush_rejections", flush)
+    app = _app(tmp_path)
+
+    def three_calls():
+        end = time.monotonic() + 5.0
+        while len(calls) < 3:
+            assert time.monotonic() < end, len(calls)
+            time.sleep(0.02)
+
+    assert _run(tmp_path, app, until=three_calls) == 0
+
+
+def test_startup_rebuilds_the_policy_file_from_its_records(tmp_path):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    app.ops.add_policy(Principal.OPERATOR, "p1", "risk small")
+    assert _run(tmp_path, app) == 0
+    path = tmp_path / "policy" / "directives.md"
+    kept = [line for line in path.read_text(encoding="utf-8").splitlines()
+            if line != "- risk small"]
+    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    assert _run(tmp_path, _app(tmp_path)) == 0
+    assert path.read_text(encoding="utf-8").splitlines().count("- risk small") == 1

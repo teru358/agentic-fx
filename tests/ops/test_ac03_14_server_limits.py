@@ -4,11 +4,14 @@ AC-3 / 3b / 6 / 14 / 15 / 16 / 17 / 21 / 22 / 29。
 """
 from __future__ import annotations
 
+import errno
 import os
 import resource
 import socket
 import sqlite3
+import stat
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -17,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_fx.ops import keys
+from agentic_fx.ops import api_server, keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.contracts import Principal
 
@@ -482,3 +485,111 @@ def _own_socket_inodes() -> set[str]:
 def test_ac29_server_creates_no_tcp_listener(api):
     assert api.client(Principal.OPERATOR).get("/v1/whoami").status_code == 200
     assert not (_tcp_listen_inodes() & _own_socket_inodes())
+
+
+# ---------------------------------------------------------------- peer 検査の単体
+
+class _PeerSocket:
+    """SO_PEERCRED と SO_PEERPIDFD の答えを決めた接続の代役。"""
+
+    def __init__(self, pid: int, uid: int, pidfd_error: int = errno.ENOPROTOOPT) -> None:
+        self.pid, self.uid, self.pidfd_error = pid, uid, pidfd_error
+
+    def getsockopt(self, level, name, size=None):
+        if name == socket.SO_PEERCRED:
+            return struct.pack("3i", self.pid, self.uid, os.getgid())
+        raise OSError(self.pidfd_error, os.strerror(self.pidfd_error))
+
+
+@pytest.mark.parametrize("pid,uid", [(os.getpid(), os.getuid() + 1), (0, os.getuid()),
+                                     (-1, os.getuid())],
+                         ids=["other_uid", "pid_zero", "pid_negative"])
+def test_ac3_peer_with_another_uid_or_without_a_pid_is_rejected(pid, uid):
+    with pytest.raises(api_server._Reject) as err:
+        api_server.check_peer(_PeerSocket(pid, uid), service_pid=os.getpid())
+    assert err.value.code == api_server.PEER_REJECTED
+
+
+def test_ac3b_peer_gone_before_its_pidfd_is_taken_is_rejected():
+    peer = _PeerSocket(os.getpid(), os.getuid(), pidfd_error=errno.ESRCH)
+    with pytest.raises(api_server._Reject) as err:
+        api_server.check_peer(peer, service_pid=os.getpid())
+    assert err.value.code == api_server.PEER_REJECTED
+
+
+def test_ac3b_peer_replaced_during_the_descendant_check_is_rejected(monkeypatch):
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        pid = os.getpid()
+        checked = []
+        real = api_server.is_descendant
+
+        def descendant(candidate, ancestor):
+            checked.append(candidate)
+            return real(candidate, ancestor)
+
+        monkeypatch.setattr(api_server, "is_descendant", descendant)
+        monkeypatch.setattr(api_server, "_pidfd_pid", lambda fd: -1 if checked else pid)
+        with pytest.raises(api_server._Reject) as err:
+            api_server.check_peer(left, service_pid=pid)
+        assert err.value.code == api_server.PEER_REJECTED
+        assert checked == [pid]
+    finally:
+        left.close()
+        right.close()
+
+
+def test_ac3_descendant_check_follows_more_than_one_generation(monkeypatch):
+    parents = {50: 40, 40: 30, 30: 20, 20: 1}
+    monkeypatch.setattr(api_server, "_parent_pid", parents.get)
+    assert api_server.is_descendant(50, 40) is True
+    assert api_server.is_descendant(50, 30) is True
+    assert api_server.is_descendant(50, 20) is True
+    assert api_server.is_descendant(50, 99) is False
+    assert api_server.is_descendant(50, 50) is False
+
+
+# ---------------------------------------------------------------- 要求の形
+
+def test_ac14_chunked_is_refused_even_with_a_content_length(api):
+    token = api.token(Principal.OPERATOR)
+    body = b'{"idea":"x"}'
+    sock = api.raw()
+    sock.sendall((f"POST /v1/backlog HTTP/1.1\r\nAuthorization: Bearer {token}\r\n"
+                  "Idempotency-Key: te\r\nTransfer-Encoding: chunked\r\n"
+                  f"Content-Length: {len(body)}\r\n\r\n").encode() + body)
+    line = _status_line(sock)
+    sock.close()
+    assert line.split()[1] == "400", line
+    assert api.env.conn.execute("SELECT COUNT(*) FROM ops_requests").fetchone()[0] == 0
+
+
+def test_ac14_body_of_exactly_64k_is_read_not_413(api):
+    client = api.client(Principal.OPERATOR)
+    response = client.post("/v1/policy", content=b" " * 65536,
+                           headers={"Idempotency-Key": "k",
+                                    "Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_argument"
+
+
+def test_ac14_header_over_16k_is_413(api):
+    token = api.token(Principal.OPERATOR)
+    sock = api.raw()
+    sock.sendall((f"GET /v1/whoami HTTP/1.1\r\nAuthorization: Bearer {token}\r\n"
+                  f"X-Padding: {'a' * 17000}\r\nContent-Length: 0\r\n\r\n").encode())
+    line = _status_line(sock)
+    sock.close()
+    assert line.split()[1] == "413", line
+
+
+def test_ac16_existing_socket_dir_with_a_loose_mode_is_narrowed_to_0700(ops_env):
+    path = ops_env.root / "data" / "run" / "api.sock"
+    path.parent.mkdir(parents=True)
+    os.chmod(path.parent, 0o755)
+    api = make_api(ops_env)
+    try:
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    finally:
+        api.server.stop(5.0)

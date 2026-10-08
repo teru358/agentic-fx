@@ -339,3 +339,15 @@ def test_ac45_lane_wait_setting_shorter_than_the_request_deadline_bounds_the_wai
     assert raised.value.code is ErrorCode.REQUEST_TIMEOUT
     assert 0.3 <= elapsed <= 1.0
     assert ops_env.ops_rows() == []
+
+
+@pytest.mark.parametrize("value", [True, False, -1, "1", None, 1.0])
+def test_ac10_reset_generation_must_be_a_non_negative_int(ops_env, value):
+    service = ops_env.service()
+    generation = ops_env.state.update(kill_switch_latched=True).kill_switch_generation
+    assert generation in (0, 1)
+    with pytest.raises(OpsError) as raised:
+        service.reset_kill_switch(APPROVER, value)
+    assert raised.value.code is ErrorCode.INVALID_ARGUMENT
+    assert ops_env.state.load().kill_switch_latched is True
+    assert ops_env.ops_rows() == []
