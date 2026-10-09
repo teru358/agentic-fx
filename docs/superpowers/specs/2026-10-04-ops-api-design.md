@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.12
+# [ops-api] 操作 API と client 契約設計 v1.13
 
-版: v1.12
+版: v1.13
 
 日付: 2026-10-05
 
@@ -14,7 +14,7 @@
 - 認証は導入インスタンス固有の principal 鍵で行い、GET も用途別 scope で最小権限化する。承認、kill switch 解除とその回復確定、価格源復帰は approver に限る。発注、SL 変更、クローズ、資金保護の無効化、`autopilot on`、サービス停止は API に出さない。
 - 鍵は `~/.config/agentic-fx/api/<instance_id>/` に principal ごとの別ファイルで置く。`.ready` は鍵集合の commit marker とし、client は鍵を生成しない。
 - 承認画面は既存の `approval_facts` が親の受理・計測・状態遷移として記録した `parent_facts` と、agent の自己申告 `agent_claims` を分けて表示する。決定内容の digest を再照合し、`decided_by` は要求本文でなく認証 principal からサーバが記録する。
-- 初版 principal は `operator` と `approver` の 2 つだけとする。scope は用途別に細分し、principal から scope 集合への対応をデータとして持つため、後続設計で principal を追加できる。
+- principal は `operator`、`approver`、`ops-bot`、`ops-web`、`ops-notify` とする。scope は用途別に細分し、principal から scope 集合への対応を versioned な認可データとして持つ。
 - `GET /v1/events` と固定 schema の event は API 側で実装する。永続化された event の配送は at-least-once、event の生成は best-effort とする。
 - 監査の正は append-only DB `ops_requests`。activity と通知 event は人向けの投影であり、監査判定には使わない。
 
@@ -47,7 +47,7 @@ trade worker の Landlock はこの前提に含めない。trade profile の `Cl
 - `activity.log` の rotation / retention。`activity-log-grows-without-rotation` (低) で扱う。
 - symlink 配備の通常退役、緊急 disable / rollback、依存 strategy 確認。チケット `retire-symlink-deployed-plugin` は `deployed-plugin-has-no-disable-or-rollback` の設計へ統合して責務を決める。
 
-`afx-ops`（bot / web / notify を機能ごとに別 process・別鍵で動かす）と Discord cog は次の束の別設計で扱う。そこで process 間の鍵分離、process を縛った後の server 認証、外部利用者の認可と確認、principal の鍵を追加する `enroll` を決める。本 spec はそれらの principal を追加できる principal → scope のデータ構造と、nullable な `asserted_actor` 欄だけを用意し、外部 client の principal・scope・process・unit・利用者規則は定めない。
+`afx-ops` の process 分離、自己隔離、unit、外部利用者の確認状態は別設計で扱う。本 spec はその T1 前提として、bot / web / notify の principal・scope、停止中の `enroll`、および bot が Discord 利用者を監査・job 所有へ結び付ける `asserted_actor` の wire 契約を定める。外部 client の process・unit・確認状態の規則は定めない。
 
 ## 2. 信頼境界と通信
 
@@ -88,18 +88,23 @@ client は鍵を送る前に、socket の型・所有者・親 dir 0700、`SO_PE
 |---|---|---|---|
 |`operator`|`status.read events.read approvals.list approvals.detail logs.read jobs.own operate`|—|`operator.token`|
 |`approver`|`status.read events.read approvals.list approvals.detail logs.read jobs.own operate decide local_guard`|`api:approver`|`approver.token`|
+|`ops-bot`|`status.read events.read approvals.list approvals.detail jobs.own decide`|`api:ops-bot`|`ops-bot.token`|
+|`ops-web`|`status.read events.read approvals.list approvals.detail logs.read`|—|`ops-web.token`|
+|`ops-notify`|`events.read`|—|`ops-notify.token`|
 
-初版はこの表を設定ではなく versioned な認可データとして持ち、未知 principal / scope、重複、`local_guard` を `approver` 以外へ与える表では API を起動しない。endpoint の認可はこのデータを参照し、後続束は同じ構造へ principal を追加する。承認詳細の holdout / in-sample 数値と reject reason を読めるのは `approvals.detail` を持つ principal だけである。
+この表は設定ではなく versioned な認可データとして持ち、未知 principal / scope、重複、`local_guard` を `approver` 以外へ与える表では API を起動しない。endpoint の認可はこのデータだけを参照する。`ops-bot` は `decide` と決定 job polling に必要な `jobs.own` だけを持ち、`operate`、`local_guard`、`logs.read` は持たない。`ops-web` は読取専用、`ops-notify` は event 読取専用である。承認詳細の holdout / in-sample 数値と reject reason を読めるのは `approvals.detail` を持つ principal だけである。`autopilot on`、発注、停止は引き続きいずれの principal にも与えず、API endpoint にも置かない。
 
-server が鍵から確定した主体を `authenticated_principal`、将来 client が外部主体を申告するため予約する nullable 欄を `asserted_actor` として、監査・job 所有者・表示で必ず別欄に持つ。初版の CLI は `asserted_actor` を送らず、server は常に null を記録する。`asserted_actor` は認証や認可の根拠にせず、`decided_by` は必ず `authenticated_principal` だけから生成して要求 body では変えられない。job 所有者の schema は `(authenticated_principal, asserted_actor)` とする。
+server が鍵から確定した主体を `authenticated_principal`、外部主体を申告する nullable 欄を `asserted_actor` として、監査・job 所有者・表示で必ず別欄に持つ。同梱 CLI と `ops-web` / `ops-notify` は `asserted_actor` を送らず null とする。`X-Afx-Asserted-Actor` を送れるのは `ops-bot` だけで、値は ASCII の `discord:` に 17〜20 桁の十進 Discord user ID を連結したもの（`^discord:[0-9]{17,20}$`、最大 28 byte）に限る。空・空白・制御文字・非 ASCII・CR/LF・形式外の値、又は `ops-bot` 以外からの header は 400 `invalid_argument` とする。`asserted_actor` は認証や認可の根拠にせず、`decided_by` は必ず `authenticated_principal` だけから生成して要求 body や header では変えられない。job 所有者の schema は `(authenticated_principal, asserted_actor)` とする。
 
 ### 3.2 鍵 lifecycle
 
 鍵 dir は `~/.config/agentic-fx/api/<instance_id>/`、dir 0700、principal ごとの鍵と `.ready` は 0600 とする。鍵は 256 bit の CSPRNG 出力とし、読込・検査は `O_NOFOLLOW`、通常 file、期待 owner、dir 0700 / file 0600 を必須にする。サービス起動時に鍵を読み、平文を捨てて digest だけを保持し、照合は定時間比較とする。鍵を env、argv、子 env、ログ、activity、応答へ載せない。
 
-`afx keys init` と `afx keys rotate|revoke <principal>` は `data/instance.lock` を non-blocking で取得できる停止中だけ実行する。`init` は `.ready` が無い初回だけ `O_CREAT|O_EXCL` で欠けた初版鍵を作る。`rotate` は `active(g) → preparing(g+1) → active(g+1)` と遷移し、新鍵を同じ dir の一時 file に書いて file fsync、atomic rename、dir fsync、最後に新しい `.ready` を atomic rename + dir fsync で commit する。`revoke` は `active(g) → preparing(g+1) → revoked(g+1)` とし、鍵 file を non-secret tombstone へ atomic rename で置換して dir fsync、最後に revoked を示す `.ready` を atomic rename + dir fsync で commit する。既に revoked の revoke は同じ状態を返す。
+`.ready` manifest v2 は `{"version":2,"principals":{...}}` とし、`principals` は固定集合ではなく登録済み principal 名から `{generation, state, op?}`（active では鍵 digest、revoked では tombstone を示す値も持つ）への map とする。`state` は `active`、`preparing`、`revoked`、`op` は preparing 時だけの `enroll` / `rotate` / `revoke` である。v1 の固定集合 `operator` / `approver` の `.ready` は読取り互換とし、この 2 principal を登録済みとして読む。v1 又は v2 に存在しない既知 principal は未登録であり、未知 principal は manifest として拒否する。
 
-`.ready` は principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。準備状態の上で別の key command (rotate の残骸に revoke、revoke の残骸に rotate) を実行した場合は `invalid_state` で拒否し、dir を変更しない。漏洩時に rotate の残骸がある場合は、先に rotate を完了させてから revoke する。
+`afx keys init`、`afx keys enroll <principal>`、`afx keys rotate|revoke <principal>` は `data/instance.lock` を non-blocking で取得できる停止中だけ実行する。`init` は `.ready` が無い初回だけ `O_CREAT|O_EXCL` で `operator` と `approver` の初版鍵を作る。`enroll` は未登録 principal だけを `未登録 → preparing(op=enroll, generation=1) → active(1)` と遷移させる。鍵 file は rotate と同じく同一 dir の一時 file へ書込み、file fsync、atomic rename、dir fsync、最後に `.ready` を atomic rename + dir fsync で commit する。既に active の principal への enroll は無変更で成功し、revoked principal への enroll は `invalid_state`（復活は rotate）とする。`rotate` は `active(g) → preparing(g+1) → active(g+1)` と遷移し、新鍵を同じ手順で commit する。`revoke` は `active(g) → preparing(g+1) → revoked(g+1)` とし、鍵 file を non-secret tombstone へ atomic rename で置換して dir fsync、最後に revoked を示す `.ready` を atomic rename + dir fsync で commit する。既に revoked の revoke は同じ状態を返す。
+
+`.ready` は登録済み principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke / enroll の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。準備状態の上で別の key command（enroll の残骸に rotate / revoke を含む）を実行した場合は `invalid_state` で拒否し、dir を変更しない。漏洩時に rotate の残骸がある場合は、先に rotate を完了させてから revoke する。
 
 漏洩時は、(1) daemon を停止、(2) `afx keys rotate <principal>` または権限を止めるなら `revoke`、(3) daemon を起動して旧鍵が拒否されることを確認、(4) rotate なら同梱 CLI が新鍵を読めることを確認する。停止中も資金保護は既存の latch と運用手順で維持し、鍵交換のために guard を緩めない。
 
@@ -109,13 +114,15 @@ server が鍵から確定した主体を `authenticated_principal`、将来 clie
 
 承認詳細は既存の `approval_facts` が保存した `parent_facts` と `agent_claims` を分離して表示する。親が受理・計測・状態遷移として記録した値だけを判断材料の親欄に置き、agent の自由文を事実扱いしない。全表示文字列は既存 sanitizer で Cc / Cf を除去し、1 行化と長さ上限を適用する。
 
-approve と retry は表示した `payload_json` の SHA-256 を必須とし、受理時と plugin flock 内の再読時に照合する。決定は `kind='plugin'` に限り、未知 kind と `live_trade` は受理時と job 実行時の両方で fail closed にする。`decided_by` は server が `authenticated_principal` から生成し、初版の `asserted_actor` は null を記録する。
+approve と retry は表示した `payload_json` の SHA-256 を必須とし、受理時と plugin flock 内の再読時に照合する。決定は `kind='plugin'` に限り、未知 kind と `live_trade` は受理時と job 実行時の両方で fail closed にする。`decided_by` は server が `authenticated_principal` から生成する。`ops-bot` の決定作成は有効な `X-Afx-Asserted-Actor` を必須とし、その actor を監査行と job 所有へ保存する。
 
 ## 4. API 契約
 
 ### 4.1 共通形
 
 全 endpoint は `/v1/` 配下、JSON、`Content-Length` 必須、chunked 不可、1 接続 1 要求とする。認証は `Authorization: Bearer <token>`。成功は `{"ok":true,"data":{...}}`、失敗は固定 code / 固定文の `{"ok":false,"error":{...}}` とし、内部例外は incident id だけを返す。
+
+`X-Afx-Asserted-Actor` は §3.1 の形式検査を認証後・routing 前に行う。header を送った `ops-bot` 以外の principal は、endpoint の scope があっても 400 `invalid_argument` とする。`ops-bot` の approve / reject / retry と、その結果の `GET /v1/jobs/{id}` / `POST /v1/jobs/{id}/cancel` には header を必須とし、欠落は 400 `invalid_argument` とする。決定作成時の actor を job 所有者へ保存し、polling / queued cancel では同じ `(authenticated_principal, asserted_actor)` だけを許可する。有効だが異なる actor は 403 `forbidden` とする。header が任意の `ops-bot` 読取要求は、送れば形式を検査して表示・監査に渡し、送らなければ null とする。
 
 実装着手条件を満たした完成形だけを実装するため、実行時の段階状態、段階専用の応答・schema 欄、切替 task は作らない。
 
@@ -134,9 +141,9 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |5|`approval list [n]`|`GET /v1/approvals?status=pending&limit=`|`approvals.list`|pending と未終端 journal。holdout / in-sample 数値、reason は一覧に出さない|
 |6|`ask <質問>`|`POST /v1/asks` → job|operate|冪等 key、1〜4,000 文字、mission slot の原子的受理|
 |7|`data resume --acknowledge`|`POST /v1/data/resume`|local_guard|UDS のみ。gap summary を返し、次 tick で判定|
-|8|`approve <id>`|`POST /v1/approvals/{id}/approve` → job|decide|plugin kind、digest 二重照合、既存 CAS、`decided_by` 記録|
-|9|`reject <id> [理由]`|`POST /v1/approvals/{id}/reject` → job|decide|plugin kind、既存 CAS。理由は既存 `approval_requests.reason` だけに保存し、監査・activity・job・event に残さない|
-|10|`approval retry <id>`|`POST /v1/approvals/{id}/retry` → job|decide|approve と同じ digest、flock、outcome 規律|
+|8|`approve <id>`|`POST /v1/approvals/{id}/approve` → job|decide|plugin kind、digest 二重照合、既存 CAS、`decided_by` 記録。`ops-bot` は有効な `X-Afx-Asserted-Actor` 必須|
+|9|`reject <id> [理由]`|`POST /v1/approvals/{id}/reject` → job|decide|plugin kind、既存 CAS。理由は既存 `approval_requests.reason` だけに保存し、監査・activity・job・event に残さない。`ops-bot` は有効な `X-Afx-Asserted-Actor` 必須|
+|10|`approval retry <id>`|`POST /v1/approvals/{id}/retry` → job|decide|approve と同じ digest、flock、outcome 規律。`ops-bot` は有効な `X-Afx-Asserted-Actor` 必須|
 |11|`killswitch reset <世代>`|`POST /v1/killswitch/reset`|local_guard|UDS のみ。main に既存の `reset_kill_switch(expected_generation)` を呼ぶ。解除の途中状態 (marker 残存) では既存実装が `StateUncertain` で拒否し、行 11b へ誘導する|
 |11b|`killswitch reconcile confirm`|`POST /v1/killswitch/reconcile`|local_guard|UDS のみ。解除が途中で止まり marker が残った状態を、**ラッチ中として確定**して marker を消す (既存 `confirm_latched`)。ファイルを解除側へ倒す操作ではなく、資金保護を弱めない。marker が無ければ 409 `invalid_state` で無変更。autopilot 中も許可する (ラッチ側にしか倒れないため)。確定後の解除は行 11 を世代付きで改めて実行する。marker の内容表示は行 1 の status が担い、確定だけを本 endpoint が行う|
 |12|`reflect retry <order_id>`|`POST /v1/reflections/{order_id}/retry`|operate|`Idempotency-Key` 必須。body に client が行 12b で見た試行記録の識別子 (`expected_attempts`、`expected_last_attempt_at`、記録なしは `0` / null) を必須で送り、台帳の現在値と一致する場合だけ clear する。不一致は 409 `attempt_changed` で無変更。closed かつ reflection 未済の条件は従来どおり|
@@ -150,8 +157,8 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |19|`stop`|**廃止: endpoint に載せない**|—|systemd の SIGTERM を使う|
 |-|`help`|client 内|—|server へ送らない|
 |新|—|`GET /v1/whoami`|`status.read`|`authenticated_principal`、`asserted_actor`、scopes|
-|新|—|`GET /v1/jobs/{id}`|`jobs.own`|所有者の組が一致する job の状態と結果|
-|新|—|`POST /v1/jobs/{id}/cancel`|`jobs.own`|所有者の組が一致する queued だけ cancelled、running は 409|
+|新|—|`GET /v1/jobs/{id}`|`jobs.own`|所有者の組が一致する job の状態と結果。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
+|新|—|`POST /v1/jobs/{id}/cancel`|`jobs.own`|所有者の組が一致する queued だけ cancelled、running は 409。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`GET /v1/events?after=&limit=`|`events.read`|DB cursor 後の通知用投影。limit 1〜500、長い待受はしない|
 
 実装する endpoint は 24 本で、内訳は変更系 15 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy、jobs cancel) と読取 9 本 (status、log、activity、approval 詳細、approval 一覧、reflection 試行記録、whoami、job get、events) である。このうち冪等 key 必須は 5 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
@@ -211,7 +218,7 @@ approver 操作は stdin と `/dev/tty` の両方が端末の場合だけ送る�
 
 ## 8. 監査と activity
 
-監査の正は append-only DB `ops_requests` とする。各行に `authenticated_principal` と nullable な `asserted_actor` を分けて持ち、初版では後者を常に null とする。全ての変更要求は副作用より前に `accepted` を INSERT し、`PRAGMA synchronous=FULL` の transaction commit が成功した時点を accepted の commit 点とする。書けなければ実行しない。完了は別の終端行で INSERT し、`ops_requests` は UPDATE / DELETE しない。ほかに endpoint、peer pid / exe、idempotency key と本文 digest、対象 ref、phase、result code、job id、再送用 response を持つ。
+監査の正は append-only DB `ops_requests` とする。各行に `authenticated_principal` と nullable な `asserted_actor` を分けて持ち、`ops-bot` の有効な actor header はそのまま記録する。他 principal と header 無しの要求は後者を null とする。全ての変更要求は副作用より前に `accepted` を INSERT し、`PRAGMA synchronous=FULL` の transaction commit が成功した時点を accepted の commit 点とする。書けなければ実行しない。完了は別の終端行で INSERT し、`ops_requests` は UPDATE / DELETE しない。ほかに endpoint、peer pid / exe、idempotency key と本文 digest、対象 ref、phase、result code、job id、再送用 response を持つ。`decided_by` は従来どおり認証 principal だけから導き、actor header により変えない。
 
 冪等要求は durable 表で `(authenticated_principal, endpoint, idempotency_key)` を一意にし、本文 digest と `accepted → succeeded | failed | outcome_unknown` の一方向状態を持つ。 ただし一時的な失敗 (`database_busy`、`request_timeout`、`unavailable`、`mission_busy`、`decision_in_progress`、`improve_running`、`plugin_busy`) は再送で成功し得るので、`ops_requests` には `failed` の終端行を残しつつ、冪等 durable 表の行は同じ transaction で削除する。同じ key の再送は新規要求として受理される。恒久的な失敗 (`invalid_argument`、`not_found`、`already_decided`、`payload_changed`、`invalid_state` 等) は `failed` のまま保持し、再送に保存応答を返す。accepted 行と状態の作成を同じ transaction で commit してから副作用へ進み、終端状態と `ops_requests` 終端行も同じ transaction で commit する。同じ key / digest の終端後再送は保存済み response / job id を返し、異なる digest は 409 `idempotency_mismatch` とする。
 
@@ -256,7 +263,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |---|---|
 |I-1|発注・SL 変更・クローズ・risk gate 等の資金関連設定・`mode`・`autopilot`・サービス停止の endpoint は存在しない|
 |I-2|全 endpoint は認証を通る。認証前に peer uid と子孫を検査し、不一致は本文を読まず拒否する|
-|I-3|権限は endpoint scope と `authenticated_principal` の集合だけで決まり、本文で権限・`decided_by` は変わらない。`asserted_actor` は別欄とし、初版では常に null にする|
+|I-3|権限は endpoint scope と `authenticated_principal` の集合だけで決まり、本文又は actor header で権限・`decided_by` は変わらない。`asserted_actor` は別欄とし、`ops-bot` のみが §3.1 の形式で記録できる|
 |I-4|`local_guard` は approver 以外へ付与できず、違反する principal 表では API を起動しない|
 |I-5|server は鍵平文を保持せず、env / argv / 子 env / log / activity / response に鍵を出さない|
 |I-6|plugin worker、改善 worker、gate pytest worker は鍵 dir 全体へ到達不能とし、違反時は該当 worker を起動しない|
@@ -273,7 +280,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |I-17|1 接続 1 要求で、接続数、要求全体時間、本文、tail scan、job 数に上限を持つ|
 |I-18|公式 CLI は approver 操作を端末確認なしに送らず、stdin 非端末なら送らない|
 |I-19|`local_guard` は UDS listener だけで routing し、approver 以外へ付与しない。同 uid の隔離されていない process から呼べることは保証外とする|
-|I-20|`.ready` は鍵集合の commit marker とする。初回 init 以外を自動補完せず、不一致は fail closed、client は生成せず、手動管理は停止中だけ行う|
+|I-20|`.ready` manifest v2 は登録済み principal map の鍵集合 commit marker とし、v1 の `operator` / `approver` は読取り互換とする。初回 init 以外を自動補完せず、不一致は fail closed、client は生成せず、手動管理（enroll を含む）は停止中だけ行う|
 |I-21|子孫検査後に pidfd と peer pid を再確認し、不能なら拒否する。pidfd 非対応時は `decide` / `local_guard` を拒否する|
 |I-22|公式 client は peer が同 uid の instance lock 保持者だと確認する前に鍵を送らない|
 |I-23|決定 3 本は plugin kind だけを扱い、未知 kind / `live_trade` は受理時と実行時の両方で fail closed|
@@ -281,9 +288,9 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |I-25|**廃止**。段階開放を表した不変条件だったが、実装着手条件を満たしてから全 endpoint を公開する裁定により不要|
 |I-26|**次の束（`afx-ops` の設計）へ移管**|
 |I-27|全ての待機は `min(設定値, caller deadline の残り時間)` を上限とし、停止合図を観測する|
-|I-28|job 所有者は `(authenticated_principal, asserted_actor)` であり、初版の `asserted_actor` は null とする|
+|I-28|job 所有者は `(authenticated_principal, asserted_actor)` であり、`ops-bot` の決定 job の polling / queued cancel は決定作成時と同じ actor だけを許可する|
 |I-29|event は固定 schema とし、永続化された event の配送は at-least-once、生成は best-effort とする。client は event id で冪等化し、生成失敗は監査と正の業務表でのみ復元する|
-|I-30|鍵 rotate / revoke は 256 bit CSPRNG、`O_NOFOLLOW`、owner / mode 検査、atomic rename と fsync を用い、`.ready` commit 前後を fail closed にする|
+|I-30|鍵 enroll / rotate / revoke は 256 bit CSPRNG、`O_NOFOLLOW`、owner / mode 検査、atomic rename と fsync を用い、`.ready` commit 前後を fail closed にする|
 |I-31|全変更要求の accepted-only 行は起動時に `outcome_unknown` 終端を追記し、副作用を自動再実行しない。ただし I-33 により、journal が既に終端を決めた決定要求はその結果を追記する|
 |I-32|autopilot で制限される job (approve、retry、手動 improve) は実行開始の直前に StateStore flock 内で autopilot を再確認し、true なら `autopilot_restricted` で終端して無変更とする。autopilot 切替後に新しい変更は始まらない|
 |I-33|起動時は既存 plugin 切替 journal の reconcile が先、ops の回復が後。決定の結果の正は `approval_requests` と切替 journal で、ops の回復はそれを追記するだけで決定を自動再実行せず、決められない要求だけを `outcome_unknown` にする|
@@ -337,7 +344,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |AC-40|legacy `afx plugin submit` は全 kind で gate 前に拒否し、`--from _human` だけが共有 gate を通る。legacy 経路で pending 行は増えない|
 |AC-41|policy path と secret env allowlist の既存実装が `build_app` + API 起動結合で有効。誤検知 allowlist は完全一致だけ|
 |AC-42|実 process の plugin worker、改善 worker、gate pytest worker は鍵 dir の全 file を読めない。利用者 shell と Landlock のない trade worker は読めることも確認し、信頼境界の記述と一致する|
-|AC-43|全 endpoint を scope ごとに総当たりし、表で許可された `operator` / `approver` だけ成功する。未知 principal / scope、重複、approver 以外への `local_guard` を含む認可データでは起動しない。`asserted_actor` は全 CLI 要求で null、body で `decided_by` / `asserted_actor` を指定しても変わらず、`approvals.detail` のない scope 集合は詳細を取得できない|
+|AC-43|全 endpoint を scope ごとに総当たりし、§3.1 の各 principal で表に許可されたものだけ成功する。未知 principal / scope、重複、approver 以外への `local_guard` を含む認可データでは起動しない。`ops-bot` 以外の CLI 要求の `asserted_actor` は null、body で `decided_by` / `asserted_actor` を指定しても変わらず、`approvals.detail` のない scope 集合は詳細を取得できない|
 |AC-44|**次の束（`afx-ops` の設計）へ移管**|
 |AC-45|ops lock と StateStore flock を要求 deadline より長く保持しても 5.5 秒以内に timeout し、stop 中は 0.5 秒以内に待機を抜ける。受付停止→queued 終端→running 収束→join の順序を barrier で観測する|
 |AC-46|rotate / revoke の各 fsync / rename 前後へ crash を注入し、旧 token の再有効化、symlink 追従、owner / mode 不正の受理が 0。rotate 後は新 token だけ成功、revoke 後は当該 principal が常に 401、`.ready` 不一致では API を起動しない|
@@ -348,6 +355,10 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |AC-51|kill switch reset の途中 (marker 書込み後、state replace 後、marker 削除後) で落ちた後、`GET /v1/status` が `reconcile_required` と marker 内容を返し、同じ世代の reset は拒否され、`POST /v1/killswitch/reconcile` でラッチ中に確定でき、その後に世代付き reset で解除できる。確定は状態を解除側へ倒さず、取引は確定前後とも止まったまま。marker が無いときは 409 `invalid_state` で無変更。autopilot=true でも reconcile は通り、reset は 403。TCP listener と operator では 404 / 403|
 |AC-52|reflect retry は key 無しで 400、識別子の欠落で 400。同じ key / 識別子の再送は 1 回しか clear せず同じ応答を返す。clear 後に新しい試行が bump された状態で古い識別子と別 key を送ると 409 `attempt_changed` で新しい記録は残る。`GET /v1/reflections/{order_id}` は `last_reason` を返さない|
 |AC-53|`afx ctl killswitch reconcile` は autopilot 中も送れ、 marker 内容とファイル上のラッチ値を表示して y/N を求め、stdin 非端末では送らず rc=2。承認後の確定結果を表示し、解除は `killswitch reset <世代>` を別に案内する|
+|AC-54|v1 の固定 `operator` / `approver` manifest を v1.13 reader が読取り互換で読み、v2 では absent known principal を未登録として扱う。未知 principal は起動拒否、鍵欠損・digest 不一致・`.ready` 不一致は fail closed で API を開かない|
+|AC-55|停止中の `enroll` は未登録 principal だけを generation 1 / active にし、既存 principal の鍵、digest、generation、mtime を変えない。`enroll(active)` は無変更成功、`enroll(revoked)` は `invalid_state`。鍵 file fsync、鍵 rename、鍵 dir fsync、preparing manifest、ready manifest、各 dir fsync の前後に `os._exit` を注入し、同じ enroll だけが完結し、別 key command は `invalid_state`・無変更となる|
+|AC-56|§3.1 の `ops-bot` / `ops-web` / `ops-notify` の全 scope を表どおりに検査し、許可外 endpoint は 403、特に bot の `operate` / `local_guard`、web の変更、notify の event 以外は成功しない。`autopilot on`、発注、停止は全 principal で到達不能のままである|
+|AC-57|`X-Afx-Asserted-Actor` は ASCII `discord:` + 17〜20 桁 ID、最大 28 byte だけを受理し、空・空白・制御文字・非 ASCII・CR/LF・形式外と `ops-bot` 以外からの header は 400。`ops-bot` の決定作成と job polling は同じ actor で成功して `ops_requests` と job 所有に記録され、必須 header 無しは 400、有効だが actor 不一致の polling / queued cancel は 403、`decided_by` は常に `api:ops-bot` のままである|
 
 ## 12. テスト方針
 
@@ -355,7 +366,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 - pid、全 flock、deadline / stop-aware StateStore、SQLite 双方向、shutdown 順序、Landlock 鍵到達性は実 process と barrier で検査する。端末確認は実 process + pty を使う。
 - wall clock（監査時刻、集約、event 時刻、idempotency 24 時間）と monotonic（request、lock、job timeout）を別注入し、片方を進めても他方が動かないことを pin する。
 - 実 home、実 `data/`、実 socket、実鍵へ触れないガードを conftest に置く。全資源は `tmp_path` を使う。
-- 変異対象は scope 表、`authenticated_principal` / `asserted_actor` 分離、server 認証、digest の二地点照合、kind 二地点検査、世代 CAS 呼出し、2 レーン、全待機 deadline、停止順序、append-only 監査、全変更要求の accepted-only 回復、冪等状態遷移、policy 再生成、`.ready` commit、rotate / revoke、dotenv 非副作用、legacy corridor 拒否、event 固定 schema / 永続化後の冪等配送 / best-effort 生成、表示 sanitizer とする。
+- 変異対象は scope 表、`authenticated_principal` / `asserted_actor` 分離と actor header 形式・job 所有照合、server 認証、digest の二地点照合、kind 二地点検査、世代 CAS 呼出し、2 レーン、全待機 deadline、停止順序、append-only 監査、全変更要求の accepted-only 回復、冪等状態遷移、policy 再生成、`.ready` manifest v1 / v2 commit、enroll / rotate / revoke、dotenv 非副作用、legacy corridor 拒否、event 固定 schema / 永続化後の冪等配送 / best-effort 生成、表示 sanitizer とする。
 - 性能閾値は稼働中相当 CPU 負荷でも測る。bless の合成履歴 33,984 本では indicator 約 1.3〜1.4 秒、strategy 約 27〜29 秒だったが、API approve は gate を再実行しない。長い待ちの理由は外部 process の plugin flock である。
 
 ## 13. 実装 task
@@ -364,7 +375,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |---|---|---|---|---|---|
 |T1 config / corridor|dotenv 明示化、legacy submit 拒否、既存 policy / secret env 配線と trade tool pin の結合確認|`config.py`、service / CLI entry、`plugin/approval.py`、`backtest/cli.py`、tests|着手条件 (隔離投入)|AC-31、39〜41|T2 と可（所有分離）|
 |T2 ops core|schema、error、2 レーン、deadline-aware StateStore / approval facts 利用、backlog 条件更新、bounded flock、job、全変更要求の crash 回復を含む監査・冪等状態機械、event 投影|`ops/`、`store/db.py`、`store/state.py`、`store/backlog.py`、`plugin/switch.py`、`core/improve_supervisor.py`、`commands.py`、tests|着手条件 (隔離投入)、V-4 (T2 内の最初の gate として消化し、30 秒・AC-14・AC-24 の閾値を確定してから deadline / queue 容量 / flock 待機を固定する)|AC-8〜13、23〜26、32〜38、45、48 (journal 結果の追記と reflect 冪等の部分)、49、50 (回復規則)、52|T1 と可、内部は直列|
-|T3 keys / server|鍵 lifecycle、rotate / revoke、設定、UDS listener、peer / auth / scope、上限、起動停止と service 配線|`ops/keys.py`、`ops/api_server.py`、`service.py`、`config/settings.yaml.example`、tests|T1、T2 (`api.enabled` 既定 false、§1.2)|AC-1〜3b、5〜7、14〜17、21〜22、27、29、43、46、50 (起動順序)、51|不可|
+|T3 keys / server|manifest v2 と鍵 lifecycle、enroll / rotate / revoke、設定、UDS listener、peer / auth / scope / actor header、上限、起動停止と service 配線|`ops/keys.py`、`ops/api_server.py`、`service.py`、`config/settings.yaml.example`、tests|T1、T2 (`api.enabled` 既定 false、§1.2)|AC-1〜3b、5〜7、14〜17、21〜22、27、29、43、46、50 (起動順序)、51、54〜57|不可|
 |T4 CLI client|`afx ctl`、対話、server 認証、確認、sanitizer、job / event polling、key command|`ops/client.py`、entry、tests|T3、V-10|AC-18〜20、28、30、53|不可|
 |T5 integration / docs|worker の Landlock 鍵隔離、実 process、pty、負荷、鍵漏洩 runbook、運用文書。「承認後の回復手段は未整備」を明記|tests、運用 docs|T4|本束に残る AC 全件（移管済み AC-4、44、47 を除く）、特に AC-42、48 (journal phase × crash 点、reset / reconcile / reflect retry の crash 点の実 process 試験)、49 (mode 遷移)|不可|
 
@@ -392,7 +403,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |V-4|**実測済 (2026-10-05、`tmp/impl-ops/v4/result.md`)**: approve 無競合 p99 22 ms、flock 待機 = 保持 + 約 20 ms、core write 競合で SQLite busy 0、tick 差 p99 +0.01 ms|同期 deadline 5 秒と `plugin_busy` 30 秒を維持、決定 job deadline は 35 秒以上、AC-14 / AC-24 の閾値は維持|
 |V-10|`/proc/locks` から instance lock holder を一意取得できるか|T4 前に実測。不能なら弱い pid file fallback ではなく client 認証方式を再設計する|
 
-`ops_requests` は無期限、idempotency key は 24 時間、trade worker は信頼境界内、鍵 `.ready` の意味、全 endpoint の初期公開、全変更要求の accepted-only 回復、event の保証境界は裁定済みであり未決ではない。外部 client の principal 追加と `enroll` は本書の未決ではなく次の `afx-ops` 束へ移した。旧 R-1 は未決から外し、チケット `deployed-plugin-has-no-disable-or-rollback` の設計時に通常退役と緊急 disable / rollback の責務を決め、`retire-symlink-deployed-plugin` をそこへ統合する。
+`ops_requests` は無期限、idempotency key は 24 時間、trade worker は信頼境界内、鍵 `.ready` の意味、manifest v2 / `enroll`、全 endpoint の初期公開、全変更要求の accepted-only 回復、event の保証境界、actor header の認可非関与は裁定済みであり未決ではない。外部 client の process・unit・自己隔離・利用者確認状態は次の `afx-ops` 束で扱う。旧 R-1 は未決から外し、チケット `deployed-plugin-has-no-disable-or-rollback` の設計時に通常退役と緊急 disable / rollback の責務を決め、`retire-symlink-deployed-plugin` をそこへ統合する。
 
 ## 16. 設計レビューの経過
 
@@ -416,3 +427,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-07|v1.10|一時的な失敗は冪等 durable 表の行を削除し再送を新規要求として受理 (2 周目 /code-review CR-01 の裁定。監査の終端行は残す)|
 |2026-10-09|v1.11|§3.2 準備状態の上の別 command は invalid_state (両向き)|実装の revoke 例外が spec に無く、fail closed と不整合 (ローカルレビュー 2 周目 F027)|d67d943|
 |2026-10-09|v1.12|§7.1 に events の cursor (保存位置、`--after` は閲覧専用、high watermark 後退時の復旧) と決定結果の表示・引数範囲を追記|CLI 実装で決めた挙動が spec に無く、運用文書だけに書かれていた||
+|2026-10-09|v1.13|afx-ops spec v1.0 §2 の変更要求を反映。manifest v2 / enroll、新 principal の scope、`X-Afx-Asserted-Actor` と監査・job 所有契約、AC-54〜57 を追加|
