@@ -505,3 +505,30 @@ def test_ac46_rotate_does_not_take_over_an_unfinished_revoke(tmp_path):
     loaded = keys.load_keyset(directory)
     assert Principal.APPROVER in loaded.disabled
     assert loaded.authenticate(old) is None
+
+
+def _dir_snapshot(directory: Path) -> dict:
+    snap = {}
+    for p in sorted(directory.iterdir()):
+        st = p.lstat()
+        snap[p.name] = (st.st_mtime_ns, st.st_size, p.read_bytes() if p.is_file() else None)
+    return snap
+
+
+@pytest.mark.parametrize("step", ["key:written", "key:renamed"])
+def test_ac46_revoke_does_not_take_over_an_unfinished_rotate(tmp_path, step):
+    root = _root(tmp_path)
+    directory = keys.key_dir(root)
+    keys.initialize(directory, root=root)
+    old = _token(directory, Principal.APPROVER)
+    with pytest.raises(Crash):
+        keys.rotate(directory, Principal.APPROVER, hook=_crash_at(step))
+    before = _dir_snapshot(directory)
+    with pytest.raises(keys.KeySetError) as err:
+        keys.revoke(directory, Principal.APPROVER)
+    assert err.value.code == "invalid_state"
+    assert _dir_snapshot(directory) == before
+    keys.rotate(directory, Principal.APPROVER)
+    loaded = keys.load_keyset(directory)
+    assert loaded.authenticate(_token(directory, Principal.APPROVER)) is Principal.APPROVER
+    assert loaded.authenticate(old) is None

@@ -376,7 +376,7 @@ def _begin(directory: Path, principal: Principal, op: str, hook: Hook,
             os.close(dir_fd)
             return None
         if state == "preparing":
-            if entry.get("op") != op and op != "revoke":
+            if entry.get("op") != op:
                 raise KeySetError("invalid_state")
             generation = entry["generation"]
         elif state in allowed:
@@ -386,9 +386,6 @@ def _begin(directory: Path, principal: Principal, op: str, hook: Hook,
             _replace(dir_fd, READY_NAME, _ready_bytes(principals), hook, "preparing")
         else:
             raise KeySetError("invalid_state")
-        if entry.get("op") != op:
-            principals[principal.value] = {"generation": generation, "state": "preparing",
-                                           "op": op}
         return dir_fd, principals, generation
     except BaseException:
         os.close(dir_fd)
