@@ -1,7 +1,7 @@
 ---
 id: sandbox-escape-via-user-daemons-unmeasured
 title: 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-03
 closed: null
@@ -9,7 +9,7 @@ related: []
 ---
 # [sandbox-escape-via-user-daemons-unmeasured] sandbox から他デーモン (D-Bus / screen) 経由で抜けられるかが未実測
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -27,3 +27,4 @@ Landlock は pathname UDS の connect を仲介しない (実測)。sandbox 内�
 
 - 2026-10-03: 起票。
 - 2026-10-04: 題名: 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ — 2026-10-04 ユーザー裁定 (案 1): 実測は安全分類器に止められたため行わない。読み取りで得た事実 (改善 worker の檻は /usr/bin を exec 可、session bus の socket は同 uid で接続可、Landlock は UNIX socket の connect を仲介しない) から「成り立つ」前提で塞ぐ。塞ぎ方 = 改善 mission worker (mission_worker._bootstrap_improve_profile) に seccomp を足して UNIX socket と localhost TCP の接続を拒否する (plugin worker 用の core/seccomp を再利用)。確認は無害な形 (各 backend claude / codex / opencode が強化後の檻で起動・動作するか) だけ。着手は plugin worker 隔離の main 投入後、操作 API の実装と並行可。
+- 2026-10-09: 状態: 実装中 — 2026-10-09: spec improve-cli-seccomp v1.2 をユーザー承認、第 1 波 (A1/A2/T2/T3a/T4a/T4b/T5) を worktree 並列で実装中。T2 を main 投入
