@@ -14,7 +14,7 @@
 - bot、web、notify は機能ごとに別 process、別 principal、別鍵で動かす。既定は全 off であり、全 off の instance には ops 用 unit を置かない。
 - principal の追加と bot の利用者名申告には操作 API spec v1.13 が必要である。v1.13 が確定するまで本番鍵で ops process を起動しない。
 - bot は Discord interaction だけで plugin の決定を扱う。Discord 利用者の認可、確認状態、daemon 側の digest 再照合の全てを通った場合だけ決定を送る。
-- web は loopback の read-only 表示、notify は `events.read` による generic HTTPS webhook 配送だけとする。いずれも承認権限を持たない。
+- bot は承認に加えて通知の主経路でもある: event cursor から読んだ event を Discord の channel にメンション付きで投稿する (afx → ops-bot → Discord)。web は loopback の read-only 表示、notify は `events.read` による generic HTTPS webhook 配送だけで、bot を設置する構成では bot 停止時の backup / 補助通知と位置づける。web と notify は承認権限を持たない。
 
 ## 1. 目的と信頼境界
 
@@ -29,7 +29,7 @@
 |主体|扱うもの|境界での扱い|
 |---|---|---|
 |afx daemon|操作 API、instance lock、承認・監査の正本|server。鍵を受け取る前に client を検査する|
-|`ops-bot`|bot 鍵、Discord token、gate 状態|決定専用。web / notify / 本体の鍵を読めない|
+|`ops-bot`|bot 鍵、Discord token、gate 状態、通知 cursor|決定と Discord への通知投稿。web / notify / 本体の鍵を読めない|
 |`ops-web`|web 鍵、UI 認証 secret、read-only 表示|変更 scope を持たず、他 principal の鍵を読めない|
 |`ops-notify`|notify 鍵、送信先、配送位置|event 読取りと webhook 送信だけを行う|
 |Discord 利用者|Discord user ID、interaction|allowlist 外を deny-by-default で拒否する。channel は認可根拠にしない|
@@ -59,6 +59,8 @@
 各機能の設定、secret、静的資材、状態領域を分離する。一方の領域を他方の Landlock 許可へ入れない。共通 gate module は Discord SDK と cog lifecycle から独立し、表示、対応表、確認状態、interaction 認可、reconcile を担当する。同梱 bot は `discord.Client` と View から直接使い、既存の汎用 bot は薄い cog shim で同じ module を使う。
 
 ### 3.2 bot
+
+bot は二つの流れを持つ。(1) 通知: event cursor (`events.read`) から固定 schema の event を読み、event 種別ごとの文面と設定済みのメンション (承認者 role / user) を付けて単一 channel に投稿する。投稿済み位置は bot の状態領域に保存し、配送は at-least-once、重複は event ID で落とす。(2) 承認: 承認依頼 event を受けたら承認 message (persistent View 付き) を投稿し、以下の確認状態で決定を扱う。notify (webhook) は同じ event を別経路で配送する backup であり、bot と notify の両方を有効にした構成では同じ event が二つの経路で届き得ることを運用文書に明記する。
 
 bot は pending 承認、親が記録した facts と agent claims を区別した判断材料、payload SHA-256、期限、決定状態を表示する。自由文を event から復元せず、API が許す承認詳細だけを出す。`message_content` intent は要求も使用もしない。
 
@@ -243,7 +245,7 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 
 1. **web 認証** — **裁定済み (2026-10-09 ユーザー): 初版はローカル限定 (127.0.0.1 bind) で認証を持たず、後で拡張する。** 拡張時の候補は cookie session とする。UI 用 secret は API 鍵と分離し、`afx ops` が初回に生成して表示する。secret rotation、session の有効期間、loopback HTTP の `Secure` 非設定の扱いを設定 schema で確定する。根拠は、read-only であっても loopback 利用者を認証し、API 鍵の露出と bearer secret の常設を避けるためである。
 2. **bot の設置範囲** — **裁定済み (2026-10-09 ユーザー): 初版は単一 guild・単一 channel。**複数 guild / channel の設定、allowlist、状態領域分離は初版に含めない。根拠は、承認の表示起点と確認 record の束縛を単一の運用境界で検証可能に保つためである。
-3. **notify の配送先** — **裁定済み (2026-10-09 ユーザー): generic HTTPS webhook だけ (Discord の webhook URL もこの形で使える)。承認を含む Discord 上の操作は bot (`ops-bot`) が担い、bot を設置する構成では bot が主、notify (webhook) は bot 停止時の backup 通知と位置づける。**Discord、Slack、email 等の種類別 adapter は初版に含めない。根拠は、固定 schema と event cursor の配送契約を adapter 固有の認証・再試行規則から独立させるためである。
+3. **notify の配送先** — **裁定済み (2026-10-09 ユーザー): 通知とメンションの主経路は afx → ops-bot → Discord (§3.2 の流れ 1)。notify は generic HTTPS webhook だけで、bot の backup / 補助とする。**Discord、Slack、email 等の種類別 adapter は初版に含めない。根拠は、固定 schema と event cursor の配送契約を adapter 固有の認証・再試行規則から独立させるためである。
 4. **`ops-bot` の権限** — **裁定済み (2026-10-09 ユーザー): 初版は operator 操作 (`ask`、`improve` 等) を与えないが、将来与える可能性を設計で考慮する。** 具体的には principal → scope 集合の対応をデータとして持ち (操作 API spec の方針どおり)、operator 操作を許す別 principal (例 `ops-bot-operator`) と別 process を追加できる形にし、bot 側は action ごとに principal 鍵を選べる構造にしておく。確認状態の (actor, action, nonce) の規則は operator 操作にも同じ形で適用する。根拠は、Discord interaction が plugin 決定以外の操作権限へ拡大することを防ぐためである。
 
 ## 13. 変更履歴
@@ -253,3 +255,4 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 |2026-10-09|v1.0|C0 revision 0.4 (設計レビュー 4 周、最終周で収束) を公開 spec として清書|実装着手条件の固定 (未決 4 件はユーザー裁定待ち)|—|
 |2026-10-09|v1.0|§12-1 web 認証をユーザー裁定で確定 (初版ローカル限定・認証なし、後で拡張)|ユーザー裁定|—|
 |2026-10-09|v1.0|§12-2〜4 をユーザー裁定で確定 (単一 guild・channel / notify は generic webhook で bot の backup / ops-bot の operator 操作は初版なし、将来の追加を principal 追加で考慮)|ユーザー裁定|—|
+|2026-10-09|v1.0|§3.2 に bot の通知の流れ (event → メンション付き投稿) を追加、notify を backup と明記|ユーザー再確認 (afx → ops-bot → Discord が主経路)|—|
