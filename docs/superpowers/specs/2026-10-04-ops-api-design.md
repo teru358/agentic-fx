@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.10
+# [ops-api] 操作 API と client 契約設計 v1.11
 
-版: v1.10
+版: v1.11
 
 日付: 2026-10-05
 
@@ -99,7 +99,7 @@ server が鍵から確定した主体を `authenticated_principal`、将来 clie
 
 `afx keys init` と `afx keys rotate|revoke <principal>` は `data/instance.lock` を non-blocking で取得できる停止中だけ実行する。`init` は `.ready` が無い初回だけ `O_CREAT|O_EXCL` で欠けた初版鍵を作る。`rotate` は `active(g) → preparing(g+1) → active(g+1)` と遷移し、新鍵を同じ dir の一時 file に書いて file fsync、atomic rename、dir fsync、最後に新しい `.ready` を atomic rename + dir fsync で commit する。`revoke` は `active(g) → preparing(g+1) → revoked(g+1)` とし、鍵 file を non-secret tombstone へ atomic rename で置換して dir fsync、最後に revoked を示す `.ready` を atomic rename + dir fsync で commit する。既に revoked の revoke は同じ状態を返す。
 
-`.ready` は principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。
+`.ready` は principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。準備状態の上で別の key command (rotate の残骸に revoke、revoke の残骸に rotate) を実行した場合は `invalid_state` で拒否し、dir を変更しない。漏洩時に rotate の残骸がある場合は、先に rotate を完了させてから revoke する。
 
 漏洩時は、(1) daemon を停止、(2) `afx keys rotate <principal>` または権限を止めるなら `revoke`、(3) daemon を起動して旧鍵が拒否されることを確認、(4) rotate なら同梱 CLI が新鍵を読めることを確認する。停止中も資金保護は既存の latch と運用手順で維持し、鍵交換のために guard を緩めない。
 
@@ -410,3 +410,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-06|v1.8|AC-22 の未認証拒否の記録先を activity + notifier に限定 (`ops_requests` は認証済み要求のみ。T3 実装時の契約の穴)|
 |2026-10-06|v1.9|autopilot 制限は API の principal にだけ掛かり対話シェルは従来どおり、を明文化 (トリアージ d-list D2 の裁定)|
 |2026-10-07|v1.10|一時的な失敗は冪等 durable 表の行を削除し再送を新規要求として受理 (2 周目 /code-review CR-01 の裁定。監査の終端行は残す)|
+|2026-10-09|v1.11|§3.2 準備状態の上の別 command は invalid_state (両向き)|実装の revoke 例外が spec に無く、fail closed と不整合 (ローカルレビュー 2 周目 F027)|d67d943|

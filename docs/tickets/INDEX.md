@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 120 件。完了分は closed/。
+未完了: 121 件。完了分は closed/。
 
 ## 実装待ち (12)
 
@@ -33,7 +33,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (100)
+## 設計待ち (101)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -108,6 +108,7 @@
 | [rlimit-nproc-per-uid-does-not-bound-worker](open/rlimit-nproc-per-uid-does-not-bound-worker.md) | 低 | 2026-10-03 | RLIMIT_NPROC は uid 全体の値で worker の子プロセス数を縛れない |
 | [supervisor-cleanup-test-leaks-36-fds](open/supervisor-cleanup-test-leaks-36-fds.md) | 低 | 2026-10-03 | worker supervisor の cleanup テストが 1 回で fd を 36 本増やす |
 | [activity-log-grows-without-rotation](open/activity-log-grows-without-rotation.md) | 低 | 2026-10-04 | activity ログが無期限に伸びる |
+| [ops-keys-orphan-secret-temp-after-hard-crash](open/ops-keys-orphan-secret-temp-after-hard-crash.md) | 低 | 2026-10-09 | 鍵 rotate が key:written 直後に強制停止されると平文の一時 file が鍵 dir に残る |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
