@@ -1,6 +1,6 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.1
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.2
 
-版: v1.1
+版: v1.2
 
 日付: 2026-10-09
 
@@ -85,7 +85,7 @@ worker から CLI への `killpg` は、親 Landlock domain から子 domain へ
 - filter flag は `TSYNC | TSYNC_ESRCH | NEW_LISTENER | WAIT_KILLABLE_RECV` とし、`LOG` は含めない。
 - `TSYNC_ESRCH` は `TSYNC | NEW_LISTENER` の install に必須である。`WAIT_KILLABLE_RECV` は signal 下の notification livelock を防ぐ。
 - 全 syscall 番号 0〜471 を明示分類し、ceiling 472 を data として固定する。割当済み name の未分類または重複は生成失敗とする。
-- canonical table、生成 BPF、profile 版、policy hash は 1 対 1 とする。v1 の件数は ALLOW 202、COND 12、NOTIF 1、EPERM 150、EACCES 1、ENOSYS 106、policy hash は `ba84a09d706dad6a92250c3725ea95e189b53f0e3447430de3d002bca385fc9a` である。
+- canonical table、生成 BPF、profile 版、policy hash は 1 対 1 とする。v1 の件数は ALLOW 202、COND 12、NOTIF 1、EPERM 150、EACCES 1、ENOSYS 106、policy hash は `411c5239c362429890312987d9cb0f534f2a5c826123a6125931a6d788466108` である (canonical text = `nr\tname\taction\tcondition_id` の 472 行に、`cond\t<syscall>\t<condition_id>\t<条件定義 JSON>` 12 行を続けた ASCII の SHA-256。条件定義を含むので条件の 1 bit の変更で hash が変わる)。生成 BPF は 404 命令、filter flags は `TSYNC|NEW_LISTENER|TSYNC_ESRCH|WAIT_KILLABLE_RECV` (LOG なし)。
 - errno の既定は EPERM とする。ENOSYS は `clone3` fallback、廃止・未実装、keyring に限定し、各 fallback は受入 12b で差分試験する。
 
 ### 3.2 ALLOW
@@ -600,3 +600,4 @@ worker は CLI binary を `O_RDONLY|O_CLOEXEC` で開き、同じ fd を hash �
 |---|---|---|---|---|
 |2026-10-09|v1.0|C0 revision 0.12 (設計レビュー 12 周、r12 で収束) を公開 spec として清書|実装着手条件の固定|—|
 |2026-10-09|v1.1|§1.3: MCP transport の置換 (spool、`afx.sock` 廃止) は trade にも適用と明記。§3.4: `perf_event_open` を EPERM 列から外す (分類表の EACCES 1 件が正)。§3.1 の policy hash は canonical 形を `nr\tname\taction\tcondition_id` (条件定義を含む) に改めた後、実装時に更新する|第 1 波ブリーフの要確認 (sol 助言 2026-10-09)|—|
+|2026-10-09|v1.2|§3.1 policy hash を canonical 形改定後の値に更新、BPF 命令数と filter flags を記載|A2 実装 (sc-a2) の受領|—|
