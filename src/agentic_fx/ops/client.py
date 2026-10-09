@@ -1,0 +1,1301 @@
+"""同梱 CLI client ``afx ctl``。
+
+同じマシンの daemon の操作 API (`data/run/api.sock`) へ httpx の UDS transport で
+接続する。鍵を送る前に接続先を確かめる: socket の型・所有者・親 dir 0700、接続した
+socket の ``SO_PEERCRED`` uid、``data/instance.lock`` の保持者 pid と peer pid、
+可能なら pidfd の pid。確かめられなければ鍵を送らず rc=3 で終える。
+
+確認は接続ごとに行う (server は 1 接続 1 要求なので、要求ごとに新しい接続になる)。
+検査は httpx が socket をつないだ直後、1 byte も書く前に走るので、検査に落ちた接続
+には要求の頭も鍵も流れない。
+
+この module は ``.env`` を読まず、鍵を生成しない。
+"""
+from __future__ import annotations
+
+import errno
+import os
+import re
+import socket
+import stat
+import struct
+import sys
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, TextIO
+
+import httpcore
+import httpx
+
+from agentic_fx.loops import approval_facts
+from agentic_fx.loops.approval_facts import display_text
+
+from . import keys
+from .contracts import Principal
+from .events import EventCursor, EventPage
+from .tail import ACTIVITY_CATEGORIES
+
+RC_OK = 0
+RC_FAILED = 1
+RC_USAGE = 2
+RC_UNREACHABLE = 3
+RC_INTERRUPTED = 130
+
+DEFAULT_SOCKET = "data/run/api.sock"
+SO_PEERPIDFD = getattr(socket, "SO_PEERPIDFD", 77)
+_UCRED = struct.Struct("3i")
+_HTTP_TIMEOUT = 15.0
+_POLL_INTERVAL = 0.25
+# job の poll 上限。server 側の job deadline に少し足した値 (待ちを無期限にしない)。
+_POLL_LIMITS = {"approve": 45.0, "reject": 45.0, "retry": 45.0, "improve": 45.0,
+                "ask": 905.0}
+_TEXT_LIMIT = 2000
+_JOB_ID = re.compile(r"[0-9a-f]{32}")
+_INCIDENT = re.compile(r"[0-9a-f]{1,32}")
+
+USAGE = """usage: afx ctl [--as operator|approver] <操作>
+       afx ctl [--as operator|approver]        (端末なら対話モード afx ctl>)
+
+操作:
+  status / whoami
+  log [n] / activity [n] [カテゴリ]
+  events [--after <id>] [--limit <n>] [--follow]
+  approval list [n] / approvals list [n]
+  approval <id> / approvals show <id>
+  ask <質問>
+  improve / improve add <idea>
+  backlog reject|reopen|note <id>
+  policy add <text>
+  reflect retry <order_id>
+  jobs get <id>
+  -- 端末からの確認が要る操作 --
+  approve <id> / reject <id> [理由] / approval retry <id>   (--as approver)
+  killswitch reset <世代> / killswitch reconcile             (--as approver)
+  data resume [--acknowledge]                               (--as approver)
+  jobs cancel <id>
+  help
+サービスの停止は API では行いません (systemctl --user stop で SIGTERM)。"""
+
+STOP_GUIDANCE = ("afx ctl は stop を送りません。サービスを止めるには "
+                 "`systemctl --user stop <unit>` (SIGTERM) を使ってください")
+
+# 失敗の文面。rc=3 は「接続先へ届かない・認証できない・受け付けられない」。
+MESSAGES = {
+    "no_socket": "サービスに接続できません: socket がありません ({path})。"
+                 "afx が稼働中で api.enabled=true か確認してください",
+    "refused": "サービスに接続できません: 接続を拒否されました ({path})。"
+               "afx が稼働中か確認してください",
+    "no_key": "鍵を読めません ({code}): {path}。`afx keys init` の状態を確認してください",
+    "server_auth": "接続先を agentic-fx の daemon と確認できないため、鍵を送りませんでした "
+                   "({reason})",
+    "unauthenticated": "認証に失敗しました (鍵が daemon の鍵と一致しません)。"
+                       "鍵の交換後は daemon を再起動してください",
+    "forbidden": "この操作の権限がありません。approver 操作は `afx ctl --as approver` で"
+                 "実行してください",
+    "peer_rejected": "daemon が接続元を拒否しました (サービス自身の子 process からは"
+                     "使えません)",
+    "autopilot_restricted": "autopilot 中はこの操作を受け付けません",
+    "unavailable": "daemon が要求を受け付けられません (混雑または停止中)。"
+                   "少し待ってから再実行してください",
+    "lost": "応答を受け取れませんでした。結果は status / jobs get で確認してください",
+    "config": "設定を読めません: {path}",
+    "need_approver": "この操作は approver の権限が要ります。`afx ctl --as approver ...` で"
+                     "実行してください (何も送っていません)",
+    "need_terminal": "この操作は端末からの確認が要ります。stdin と /dev/tty の両方が端末の"
+                     "ときだけ送ります (何も送っていません)",
+    "cancelled": "取り消しました (何も送っていません)",
+}
+
+# 409 などの業務上の失敗。対話シェルと同じ言い回しにそろえる。
+_ERROR_TEXT = {
+    "invalid_argument": "引数が不正です",
+    "not_found": "対象が存在しません",
+    "request_timeout": "時間内に処理できませんでした",
+    "already_decided": "その approval は決定済みです",
+    "payload_changed": "表示した後に承認依頼の内容が変わったため決定しませんでした。"
+                       "もう一度内容を確認してください",
+    "unsupported_kind": "plugin 以外の kind のため決定できません",
+    "plugin_busy": "plugin が別の処理で使用中です。少し待ってから再実行してください",
+    "mission_busy": "mission が実行中のため受け付けられません",
+    "improve_running": "improve が既に実行中です",
+    "decision_in_progress": "同じ approval の決定が進行中です",
+    "generation_mismatch": "kill switch のラッチが更新されたので status を確認してから"
+                           "もう一度実行してください",
+    "not_latched": "kill switch はラッチされていません",
+    "invalid_state": "現在の状態ではこの操作を行えません",
+    "attempt_changed": "試行記録が更新されたため戻しませんでした。もう一度実行してください",
+    "idempotency_mismatch": "同じ要求 key で別の内容が送られました",
+    "outcome_unknown": "以前の同じ要求の結果が不明です。対象の状態を確認してください",
+    "job_running": "job は既に実行中のため取り消せません",
+    "payload_too_large": "本文が大きすぎます",
+    "internal": "daemon の内部エラーです",
+    "database_busy": "daemon の DB が混雑しています",
+}
+
+
+class ClientError(Exception):
+    """rc と固定の文面を持つ失敗。"""
+
+    def __init__(self, rc: int, message: str) -> None:
+        super().__init__(message)
+        self.rc, self.message = rc, message
+
+
+class _ResponseLost(ClientError):
+    """要求を書いた後に応答を受け取れなかった。"""
+
+    def __init__(self) -> None:
+        super().__init__(RC_UNREACHABLE, MESSAGES["lost"])
+
+
+class ServerAuthError(Exception):
+    """接続先を確かめられない。``reason`` は固定語。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _NoSocket(Exception):
+    pass
+
+
+# --------------------------------------------------------------- server 認証
+
+def check_socket_path(path: Path, *, uid: int) -> None:
+    """接続前の静的検査: 親 dir は同 uid の 0700 の dir、socket は同 uid の socket。"""
+    # 無いことが分かった場合だけ「socket 無し」。権限などで確かめられなければ鍵を送らない。
+    try:
+        dir_st = os.lstat(path.parent)
+    except FileNotFoundError:
+        raise _NoSocket() from None
+    except OSError:
+        raise ServerAuthError("socket_dir") from None
+    if (not stat.S_ISDIR(dir_st.st_mode) or dir_st.st_uid != uid
+            or stat.S_IMODE(dir_st.st_mode) != 0o700):
+        raise ServerAuthError("socket_dir")
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        raise _NoSocket() from None
+    except OSError:
+        raise ServerAuthError("socket_file") from None
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != uid:
+        raise ServerAuthError("socket_file")
+
+
+def lock_holders(lock_path: Path, *, proc_locks: Path = Path("/proc/locks")) -> set[int]:
+    """``/proc/locks`` から lock file の FLOCK WRITE 保持者の pid を集める。
+
+    行は ``N: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF`` で、
+    major / minor は 16 進。``->`` の付いた行は待っている側なので数えない。
+
+    inode の一致は必須。装置番号は btrfs・overlayfs・NFS では stat の値 (匿名 dev) と
+    ``/proc/locks`` の値 (superblock の dev) が食い違うので、一致すれば速い経路で数え、
+    食い違うときはその pid が lock file を fd で開いていることを確かめて数える。
+    """
+    try:
+        st = os.stat(lock_path)
+        real_path = os.path.realpath(lock_path)
+    except OSError:
+        return set()
+    device = (os.major(st.st_dev), os.minor(st.st_dev))
+    holders = set()
+    try:
+        text = proc_locks.read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or "->" in parts:
+            continue
+        kind, mode, pid_text, dev_text = parts[1], parts[3], parts[4], parts[5]
+        if kind != "FLOCK" or mode != "WRITE":
+            continue
+        fields = dev_text.split(":")
+        try:
+            ident = (int(fields[0], 16), int(fields[1], 16), int(fields[2]))
+            pid = int(pid_text)
+        except (IndexError, ValueError):
+            continue
+        if ident[2] != st.st_ino:
+            continue
+        if ident[:2] == device or _has_open_fd(pid, real_path):
+            holders.add(pid)
+    return holders
+
+
+def _has_open_fd(pid: int, real_path: str) -> bool:
+    # 同 uid の process の fd は読める。読めなければ数えない (保持者と確かめられない)。
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            if os.readlink(f"{fd_dir}/{name}") == real_path:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _pidfd_pid(pidfd: int) -> int | None:
+    with open(f"/proc/self/fdinfo/{pidfd}", encoding="ascii") as file:
+        for line in file:
+            if line.startswith("Pid:"):
+                return int(line.split()[1])
+    return None
+
+
+def verify_peer(sock: socket.socket, *, uid: int, lock_path: Path,
+                proc_locks: Path = Path("/proc/locks")) -> int:
+    """接続済み socket の相手が、同 uid で instance lock を持つ生きた process か確かめる。"""
+    # 調べられないことは「接続先を確認できない」で、接続の拒否ではない (鍵は送らない)。
+    try:
+        raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
+    except OSError:
+        raise ServerAuthError("peer_check") from None
+    pid, peer_uid, _gid = _UCRED.unpack(raw)
+    if peer_uid != uid or pid <= 0:
+        raise ServerAuthError("peer_uid")
+    try:
+        pidfd = sock.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            raise ServerAuthError("peer_gone") from None
+        pidfd = None
+    if pidfd is not None:
+        try:
+            try:
+                pidfd_pid = _pidfd_pid(pidfd)
+            except OSError:
+                raise ServerAuthError("peer_check") from None
+            if pidfd_pid != pid:
+                raise ServerAuthError("peer_gone")
+        finally:
+            os.close(pidfd)
+    # 保持者を一意に確定できなければ送らない (弱い pid file には落とさない)。
+    if lock_holders(lock_path, proc_locks=proc_locks) != {pid}:
+        raise ServerAuthError("not_lock_holder")
+    # /proc/locks の pid は取得した process。生きていることも確かめる。
+    if not os.path.isdir(f"/proc/{pid}"):
+        raise ServerAuthError("holder_gone")
+    return pid
+
+
+class _VerifyingBackend(httpcore.SyncBackend):
+    """UDS をつないだ直後、書き込む前に接続先を検査する。"""
+
+    def __init__(self, verify: Callable[[socket.socket], object]) -> None:
+        self._verify = verify
+
+    def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        stream = super().connect_unix_socket(path, timeout=timeout,
+                                             socket_options=socket_options)
+        try:
+            self._verify(stream.get_extra_info("socket"))
+        except BaseException:
+            stream.close()
+            raise
+        return stream
+
+
+# httpcore の例外を同名の httpx の例外へ写す。細かい型を先に並べ、最初に当たったものを使う。
+_HTTPCORE_TO_HTTPX = tuple((getattr(httpcore, name), getattr(httpx, name)) for name in (
+    "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException",
+    "ConnectError", "ReadError", "WriteError", "NetworkError",
+    "LocalProtocolError", "RemoteProtocolError", "ProtocolError",
+    "UnsupportedProtocol", "ProxyError"))
+
+
+class _MappedErrors:
+    """httpcore の例外だけを httpx の例外にする。それ以外 (ServerAuthError など) はそのまま。"""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, _type, exc, _tb) -> bool:
+        if exc is None or not isinstance(exc, Exception):
+            return False
+        for source, target in _HTTPCORE_TO_HTTPX:
+            if isinstance(exc, source):
+                # 原因の連鎖は残す (FileNotFoundError を「socket 無し」と読むため)。
+                raise target(str(exc)) from exc
+        return False
+
+
+class _ResponseBody(httpx.SyncByteStream):
+    def __init__(self, stream) -> None:
+        self._stream = stream
+
+    def __iter__(self):
+        with _MappedErrors():
+            yield from self._stream
+
+    def close(self) -> None:
+        close = getattr(self._stream, "close", None)
+        if close is not None:
+            close()
+
+
+class _VerifyingTransport(httpx.BaseTransport):
+    """1 接続 1 要求の UDS transport。つないだ直後に接続先を検査する backend を使う。"""
+
+    def __init__(self, socket_path: Path, verify: Callable[[socket.socket], object]) -> None:
+        self._connections = httpcore.ConnectionPool(
+            uds=str(socket_path), network_backend=_VerifyingBackend(verify),
+            max_connections=1, max_keepalive_connections=0, retries=0)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        core_request = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(scheme=request.url.raw_scheme, host=request.url.raw_host,
+                             port=request.url.port, target=request.url.raw_path),
+            headers=request.headers.raw, content=request.stream,
+            extensions=request.extensions)
+        with _MappedErrors():
+            response = self._connections.handle_request(core_request)
+        return httpx.Response(status_code=response.status, headers=response.headers,
+                              stream=_ResponseBody(response.stream),
+                              extensions=response.extensions)
+
+    def close(self) -> None:
+        self._connections.close()
+
+
+def _declare_empty_body(request: httpx.Request) -> None:
+    # server は本文なしの要求にも Content-Length を求める。
+    if "content-length" not in request.headers:
+        request.headers["Content-Length"] = "0"
+
+
+def _cause_chain(exc: BaseException):
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        exc = exc.__cause__ or exc.__context__
+
+
+# --------------------------------------------------------------- 要求
+
+@dataclass
+class Reply:
+    status: int
+    data: dict | None
+    code: str | None
+
+
+class ApiClient:
+    def __init__(self, root: Path, principal: Principal, *, uid: int | None = None,
+                 socket_path: Path | None = None) -> None:
+        self.root = Path(root)
+        self.principal = principal
+        self.uid = os.getuid() if uid is None else uid
+        self.socket_path = socket_path or self._configured_socket()
+        self.lock_path = self.root / "data" / "instance.lock"
+        self._token: str | None = None
+
+    def _configured_socket(self) -> Path:
+        path = self.root / "config" / "settings.yaml"
+        if not path.exists():
+            return self.root / DEFAULT_SOCKET
+        from agentic_fx.config import ConfigError, load_settings
+        try:
+            return self.root / load_settings(path).api.socket_path
+        except ConfigError:
+            raise ClientError(RC_UNREACHABLE, MESSAGES["config"].format(path=path)) from None
+
+    def _read_token(self) -> str:
+        if self._token is None:
+            directory = keys.key_dir(self.root)
+            try:
+                self._token = keys.read_token(directory, self.principal)
+            except keys.KeySetError as err:
+                raise ClientError(RC_UNREACHABLE, MESSAGES["no_key"].format(
+                    code=err.code, path=directory)) from None
+        return self._token
+
+    def _verify(self, sock: socket.socket) -> None:
+        verify_peer(sock, uid=self.uid, lock_path=self.lock_path)
+
+    def request(self, method: str, path: str, *, body: dict | None = None,
+                params: dict | None = None, idempotent: bool = False) -> Reply:
+        token = self._read_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        if idempotent:
+            headers["Idempotency-Key"] = uuid.uuid4().hex
+        # 応答を失ったときに同じ key で 1 回だけ送り直してよいのは冪等 key 付きだけ。
+        attempts = 2 if idempotent else 1
+        for attempt in range(attempts):
+            try:
+                return self._send(method, path, headers, body, params)
+            except _ResponseLost:
+                if attempt + 1 >= attempts:
+                    raise
+        raise AssertionError("unreachable")
+
+    def _send(self, method: str, path: str, headers: dict, body: dict | None,
+              params: dict | None) -> Reply:
+        try:
+            check_socket_path(self.socket_path, uid=self.uid)
+        except _NoSocket:
+            raise ClientError(RC_UNREACHABLE,
+                              MESSAGES["no_socket"].format(path=self.socket_path)) from None
+        except ServerAuthError as err:
+            raise ClientError(RC_UNREACHABLE,
+                              MESSAGES["server_auth"].format(reason=err.reason)) from None
+        transport = _VerifyingTransport(self.socket_path, self._verify)
+        sent = False
+        try:
+            with httpx.Client(transport=transport, base_url="http://afx",
+                              timeout=_HTTP_TIMEOUT,
+                              event_hooks={"request": [_declare_empty_body]}) as http:
+                request = http.build_request(method, path, headers=headers, params=params,
+                                             json=body if method == "POST" else None)
+                response = http.send(request)
+                sent = True
+        except ServerAuthError as err:
+            raise ClientError(RC_UNREACHABLE,
+                              MESSAGES["server_auth"].format(reason=err.reason)) from None
+        except httpx.ConnectError as err:
+            for cause in _cause_chain(err):
+                if isinstance(cause, FileNotFoundError):
+                    raise ClientError(RC_UNREACHABLE, MESSAGES["no_socket"].format(
+                        path=self.socket_path)) from None
+                if isinstance(cause, ServerAuthError):
+                    raise ClientError(RC_UNREACHABLE, MESSAGES["server_auth"].format(
+                        reason=cause.reason)) from None
+            raise ClientError(RC_UNREACHABLE,
+                              MESSAGES["refused"].format(path=self.socket_path)) from None
+        except httpx.HTTPError:
+            raise _ResponseLost() from None
+        assert sent
+        return _reply(response)
+
+
+def _reply(response: httpx.Response) -> Reply:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise ClientError(RC_FAILED, f"daemon の応答を解釈できません (HTTP {response.status_code})")
+    if payload.get("ok") is True and isinstance(payload.get("data"), dict):
+        return Reply(response.status_code, payload["data"], None)
+    error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+    code = error.get("code") if isinstance(error.get("code"), str) else "internal"
+    reply = Reply(response.status_code, None, code)
+    if response.status_code in (401, 403, 503):
+        key = {401: "unauthenticated", 503: "unavailable"}.get(response.status_code)
+        if response.status_code == 403:
+            key = code if code in ("peer_rejected", "autopilot_restricted") else "forbidden"
+        raise ClientError(RC_UNREACHABLE, MESSAGES[key])
+    if code == "internal":
+        incident = error.get("incident")
+        suffix = (f" (incident {incident})" if isinstance(incident, str)
+                  and _INCIDENT.fullmatch(incident) else "")
+        raise ClientError(RC_FAILED, _ERROR_TEXT["internal"] + suffix)
+    return reply
+
+
+def error_text(code: str | None) -> str:
+    if code in _ERROR_TEXT:
+        return _ERROR_TEXT[code]
+    return f"失敗しました ({display_text(code, 64)})"
+
+
+def _fail(reply: Reply) -> ClientError:
+    return ClientError(RC_FAILED, error_text(reply.code))
+
+
+# --------------------------------------------------------------- 端末確認
+
+class Terminal:
+    """``/dev/tty`` と対話する確認口。stdin と /dev/tty の両方が端末のときだけ作れる。"""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    @classmethod
+    def open(cls, stdin: TextIO) -> "Terminal | None":
+        try:
+            if not stdin.isatty():
+                return None
+        except (AttributeError, ValueError):
+            return None
+        try:
+            fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
+        except OSError:
+            return None
+        if not os.isatty(fd):
+            os.close(fd)
+            return None
+        return cls(fd)
+
+    def close(self) -> None:
+        if self._fd >= 0:
+            os.close(self._fd)
+            self._fd = -1
+
+    def ask(self, prompt: str) -> str | None:
+        os.write(self._fd, prompt.encode())
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = os.read(self._fd, 1)
+            if not chunk:
+                return None
+            data += chunk
+        return data.decode(errors="replace").strip()
+
+    def yes(self, prompt: str) -> bool:
+        answer = self.ask(f"{prompt} [y/N]: ")
+        return answer is not None and answer.lower() in ("y", "yes")
+
+
+# --------------------------------------------------------------- 表示
+
+def _ident(value) -> str:
+    """世代や id。整数でなければ (欠落を含め) 無害化した文字列か `-`。"""
+    if type(value) is int:
+        return str(value)
+    return display_text(value)
+
+
+def _num(value) -> str:
+    if type(value) is int or (type(value) is float and value == value):
+        return f"{value:,.0f}"
+    return "-"
+
+
+def format_status(data: dict) -> str:
+    kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
+    if kill.get("latched") is True:
+        ks = (f"LATCHED gen={_ident(kill.get('generation'))} "
+              f"since={display_text(kill.get('latched_at'))}")
+    else:
+        ks = "ok"
+    mission = data.get("mission")
+    if isinstance(mission, dict):
+        last = (f"{display_text(mission.get('loop'))}:{display_text(mission.get('status'))} "
+                f"({display_text(mission.get('started_at'))})")
+    else:
+        last = "なし"
+    orders = data.get("orders") if isinstance(data.get("orders"), dict) else {}
+    lines = [f"mode: {display_text(data.get('mode'))} / autopilot: "
+             f"{'on' if data.get('autopilot') is True else 'off'} / kill switch: {ks}",
+             f"残高: {_num(data.get('balance'))} / エクイティ: {_num(data.get('equity'))}",
+             f"アクティブ orders: {_num(orders.get('active'))}",
+             f"直近 mission: {last}"]
+    if kill.get("reconcile_required") is True:
+        lines.append("kill switch: 解除の途中で止まった印あり "
+                     "(`afx ctl killswitch reconcile` で確認)")
+    health = data.get("health") if isinstance(data.get("health"), dict) else {}
+    if health.get("latched") is True:
+        lines.append(f"health: LATCHED (failures {_num(health.get('failures'))})")
+    feed = data.get("data") if isinstance(data.get("data"), dict) else None
+    if feed is not None:
+        lines.append(f"data: {display_text(feed.get('state'))}")
+    return "\n".join(lines)
+
+
+def _lines(data: dict) -> str:
+    lines = data.get("lines") if isinstance(data.get("lines"), list) else []
+    text = "\n".join(display_text(line, _TEXT_LIMIT) for line in lines) or "(なし)"
+    if data.get("truncated") is True:
+        text += "\n(走査上限で打ち切り)"
+    return text
+
+
+def format_approval_list(data: dict) -> str:
+    lines = []
+    for row in data.get("approvals") or []:
+        if not isinstance(row, dict):
+            continue
+        content_hash = row.get("content_hash")
+        short = content_hash[:8] if isinstance(content_hash, str) and content_hash != "-" else "-"
+        lines.append(f"#{_ident(row.get('id'))} kind={display_text(row.get('kind'))} "
+                     f"name={display_text(row.get('name'))} "
+                     f"created_at={display_text(row.get('created_at'))} "
+                     f"content_hash={display_text(short)}")
+    if not lines:
+        lines.append("承認待ちはありません")
+    journals = [j for j in data.get("open_journals") or [] if isinstance(j, dict)]
+    if journals:
+        lines.append("-- 未終端の切替ジャーナル --")
+        lines += [f"name={display_text(j.get('name'))} phase={display_text(j.get('phase'))} "
+                  f"approval_id={_ident(j.get('approval_id'))}" for j in journals]
+    return "\n".join(lines)
+
+
+def format_approval_detail(data: dict) -> str:
+    # in_sample / holdout の行は対話シェルの承認詳細と同じ renderer を使う。
+    from agentic_fx.commands import Commands
+    lines = [f"approval #{_ident(data.get('id'))} kind={display_text(data.get('kind'))} "
+             f"status={display_text(data.get('status'))}"]
+    lines += Commands._metrics_lines("in_sample", data.get("in_sample"))
+    lines += Commands._metrics_lines("holdout", data.get("holdout"))
+    facts = data.get("facts_lines")
+    if isinstance(facts, list):
+        lines += [display_text(line, approval_facts.CLAIM_DISPLAY_LIMIT) for line in facts]
+    lines.append(
+        f"reason={display_text(data.get('reason'), approval_facts.CLAIM_DISPLAY_LIMIT)} "
+        f"decided_by={display_text(data.get('decided_by'))} "
+        f"decided_at={display_text(data.get('decided_at'))}")
+    lines.append(f"payload_sha256={display_text(data.get('payload_sha256'))}")
+    return "\n".join(lines)
+
+
+def format_event(event: dict) -> str:
+    fields = event.get("fields") if isinstance(event.get("fields"), dict) else {}
+    cells = " ".join(f"{display_text(str(k))}={display_text(str(v))}"
+                     for k, v in sorted(fields.items()))
+    return (f"#{display_text(str(event.get('id')))} {display_text(event.get('ts'))} "
+            f"{display_text(event.get('code'))} {display_text(event.get('ref'))} {cells}").rstrip()
+
+
+def _multiline(text) -> str:
+    """ask の回答のような複数行の本文。行ごとに制御文字を除いて表示する。"""
+    if not isinstance(text, str):
+        return "-"
+    return "\n".join(display_text(line, _TEXT_LIMIT) if line.strip() else ""
+                     for line in text.splitlines())
+
+
+# --------------------------------------------------------------- 実行
+
+def _int_arg(text: str) -> int:
+    if not (text.isascii() and text.isdigit()) or len(text) > 18:
+        raise ClientError(RC_USAGE, USAGE)
+    return int(text)
+
+
+def _count_arg(text: str, upper: int) -> int:
+    """件数の引数。範囲外は丸めず usage にする (server へ届く値と画面の指定を一致させる)。"""
+    value = _int_arg(text)
+    if not 1 <= value <= upper:
+        raise ClientError(RC_USAGE, USAGE)
+    return value
+
+
+def _events_cursor_path(root: Path) -> Path:
+    return (Path.home() / ".local" / "state" / "agentic-fx" / keys.instance_id(root)
+            / "events.cursor")
+
+
+def _load_cursor_state(path: Path) -> tuple[int, int]:
+    """保存した (位置, 前回見た high watermark)。位置だけの旧形式は watermark 0 と読む。"""
+    try:
+        parts = path.read_text(encoding="ascii").split()
+    except (OSError, UnicodeDecodeError):
+        return 0, 0
+    if not parts or not all(p.isdigit() for p in parts[:2]):
+        return 0, 0
+    position = int(parts[0])
+    return position, int(parts[1]) if len(parts) > 1 else 0
+
+
+def _load_cursor(path: Path) -> int:
+    return _load_cursor_state(path)[0]
+
+
+def _save_cursor(path: Path, position: int, high_watermark: int = 0) -> None:
+    # high watermark も残し、次の起動で DB の巻き戻りを検知できるようにする。
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(f"{position} {max(high_watermark, 0)}\n", encoding="ascii")
+        os.replace(temporary, path)
+    except OSError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+_APPROVER_OPS = frozenset({"approve", "reject", "retry", "killswitch_reset",
+                           "killswitch_reconcile", "data_resume"})
+_CONFIRM_OPS = _APPROVER_OPS | {"job_cancel"}
+# approve job が done で返す outcome のうち、承認されて版が切り替わったもの。
+_APPROVING_OUTCOMES = frozenset({"deployed", "deployed_after_rollback"})
+
+
+@dataclass
+class Op:
+    name: str
+    args: list
+
+
+def parse(tokens: list[str]) -> Op:
+    """対話シェルと同じ語順の操作を読む。読めなければ usage (rc=2)。"""
+    if not tokens:
+        raise ClientError(RC_USAGE, USAGE)
+    cmd, args = tokens[0], tokens[1:]
+    n = len(args)
+    if cmd == "help" and n == 0:
+        return Op("help", [])
+    if cmd == "stop":
+        return Op("stop", [])
+    if cmd in ("status", "whoami") and n == 0:
+        return Op(cmd, [])
+    if cmd == "log" and n <= 1:
+        return Op("log", [_count_arg(args[0], 500) if args else 20])
+    if cmd == "activity" and n <= 2:
+        category = args[1].upper() if n == 2 else None
+        if category is not None and category not in ACTIVITY_CATEGORIES:
+            raise ClientError(RC_USAGE, USAGE)
+        return Op("activity", [_count_arg(args[0], 500) if args else 20, category])
+    if cmd == "events":
+        return Op("events", _parse_events(args))
+    if cmd in ("approval", "approvals"):
+        if n in (1, 2) and args[0] == "list":
+            return Op("approval_list", [_count_arg(args[1], 200) if n == 2 else 20])
+        if n == 2 and args[0] == "show":
+            return Op("approval_detail", [_int_arg(args[1])])
+        if cmd == "approval" and n == 2 and args[0] == "retry":
+            return Op("retry", [_int_arg(args[1])])
+        if cmd == "approval" and n == 1:
+            return Op("approval_detail", [_int_arg(args[0])])
+    if cmd == "approve" and n == 1:
+        return Op("approve", [_int_arg(args[0])])
+    if cmd == "retry" and n == 1:
+        return Op("retry", [_int_arg(args[0])])
+    if cmd == "reject" and n >= 1:
+        return Op("reject", [_int_arg(args[0]), " ".join(args[1:]) or None])
+    if cmd == "ask" and n >= 1:
+        return Op("ask", [" ".join(args)])
+    if cmd == "improve" and n == 0:
+        return Op("improve", [])
+    if cmd == "improve" and n >= 2 and args[0] == "add":
+        return Op("backlog_add", [" ".join(args[1:])])
+    if cmd == "backlog" and n == 2 and args[0] in ("reject", "reopen", "note"):
+        return Op("backlog_transition", [args[0], _int_arg(args[1])])
+    if cmd == "policy" and n >= 2 and args[0] == "add":
+        return Op("policy", [" ".join(args[1:])])
+    if cmd == "reflect" and n == 2 and args[0] == "retry":
+        return Op("reflection_retry", [_int_arg(args[1])])
+    if cmd == "killswitch" and n >= 1 and args[0] == "reset":
+        if n == 1:
+            return Op("killswitch_show", [])
+        if n == 2:
+            return Op("killswitch_reset", [_int_arg(args[1])])
+    if cmd == "killswitch" and args in (["reconcile"], ["reconcile", "confirm"]):
+        return Op("killswitch_reconcile", [])
+    if cmd == "data" and args in (["resume"], ["resume", "--acknowledge"]):
+        return Op("data_resume", [n == 2])
+    if cmd == "jobs" and n == 2 and args[0] in ("get", "cancel"):
+        if _JOB_ID.fullmatch(args[1]) is None:
+            raise ClientError(RC_USAGE, USAGE)
+        return Op("job_get" if args[0] == "get" else "job_cancel", [args[1]])
+    raise ClientError(RC_USAGE, USAGE)
+
+
+def _parse_events(args: list[str]) -> list:
+    after, limit, follow = None, 100, False
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--follow":
+            follow = True
+        elif flag in ("--after", "--limit") and rest:
+            value = _int_arg(rest.pop(0))
+            if flag == "--after":
+                after = value
+            else:
+                limit = value
+        else:
+            raise ClientError(RC_USAGE, USAGE)
+    if not 1 <= limit <= 500:
+        raise ClientError(RC_USAGE, USAGE)
+    return [after, limit, follow]
+
+
+class Runner:
+    def __init__(self, api: ApiClient, *, stdin: TextIO, stdout: TextIO,
+                 sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self.api = api
+        self.stdin, self.stdout = stdin, stdout
+        self.sleep, self.monotonic = sleep, monotonic
+
+    def say(self, text: str) -> None:
+        print(text, file=self.stdout, flush=True)
+
+    def run(self, op: Op) -> int:
+        if op.name == "help":
+            self.say(USAGE)
+            return RC_OK
+        if op.name == "stop":
+            raise ClientError(RC_USAGE, STOP_GUIDANCE)
+        if op.name in _APPROVER_OPS and self.api.principal is not Principal.APPROVER:
+            raise ClientError(RC_UNREACHABLE, MESSAGES["need_approver"])
+        terminal = None
+        if op.name in _CONFIRM_OPS:
+            # 確認が要る操作は、端末を確かめる前に何も送らない。
+            terminal = Terminal.open(self.stdin)
+            if terminal is None:
+                raise ClientError(RC_USAGE, MESSAGES["need_terminal"])
+        try:
+            return getattr(self, f"_op_{op.name}")(*op.args, terminal=terminal)
+        finally:
+            if terminal is not None:
+                terminal.close()
+
+    def _get(self, path: str, **params) -> dict:
+        reply = self.api.request("GET", path, params=params or None)
+        if reply.data is None:
+            raise _fail(reply)
+        return reply.data
+
+    def _post(self, path: str, body: dict | None = None, *, idempotent: bool = False) -> Reply:
+        return self.api.request("POST", path, body=body or {}, idempotent=idempotent)
+
+    # ---- 読取
+    def _op_status(self, *, terminal) -> int:
+        self.say(format_status(self._get("/v1/status")))
+        return RC_OK
+
+    def _op_whoami(self, *, terminal) -> int:
+        data = self._get("/v1/whoami")
+        scopes = data.get("scopes") if isinstance(data.get("scopes"), list) else []
+        self.say(f"principal: {display_text(data.get('authenticated_principal'))}\n"
+                 f"scopes: {' '.join(display_text(s) for s in scopes)}")
+        return RC_OK
+
+    def _op_log(self, n: int, *, terminal) -> int:
+        self.say(_lines(self._get("/v1/log", n=n)))
+        return RC_OK
+
+    def _op_activity(self, n: int, category: str | None, *, terminal) -> int:
+        params = {"n": n}
+        if category is not None:
+            params["category"] = category
+        self.say(_lines(self._get("/v1/activity", **params)))
+        return RC_OK
+
+    def _op_approval_list(self, limit: int, *, terminal) -> int:
+        self.say(format_approval_list(self._get("/v1/approvals", status="pending",
+                                                limit=limit)))
+        return RC_OK
+
+    def _op_approval_detail(self, approval_id: int, *, terminal) -> int:
+        self.say(format_approval_detail(self._get(f"/v1/approvals/{approval_id}")))
+        return RC_OK
+
+    def _op_job_get(self, job_id: str, *, terminal) -> int:
+        self.say(self._job_line(self._get(f"/v1/jobs/{job_id}")))
+        return RC_OK
+
+    def _op_events(self, after: int | None, limit: int, follow: bool, *, terminal) -> int:
+        path = _events_cursor_path(self.api.root)
+        # --after の明示は過去を覗くだけの閲覧で、保存した cursor を動かさない。
+        persist = after is None
+        if persist:
+            position, high_watermark = _load_cursor_state(path)
+            cursor = EventCursor(position=position, high_watermark=high_watermark)
+        else:
+            cursor = EventCursor(position=after)
+        saved = (cursor.position, cursor.high_watermark)
+        while True:
+            data = self._get("/v1/events", after=cursor.position, limit=limit)
+            events = [e for e in data.get("events") or [] if isinstance(e, dict)
+                      and type(e.get("id")) is int]
+            high = data.get("high_watermark")
+            fresh = cursor.consume(EventPage(events, high if type(high) is int else -1))
+            if cursor.health_error:
+                hint = (f"。復旧するには cursor file ({display_text(str(path), _TEXT_LIMIT)}) "
+                        "を削除してください" if persist else "")
+                raise ClientError(RC_FAILED, "event の high watermark が後退しました。"
+                                  f"cursor は進めていません{hint}")
+            for event in fresh:
+                self.say(format_event(event))
+            # 表示してから cursor を保存する (切断後は同じ位置から再開する)。
+            # 位置も watermark も変わらない周回では書かない (follow の常駐中の無駄な I/O)。
+            current = (cursor.position, cursor.high_watermark)
+            if persist and current != saved:
+                try:
+                    _save_cursor(path, *current)
+                except OSError:
+                    # 表示は済んでいる。次の起動では同じ event を再表示し得ることを伝えて止める。
+                    raise ClientError(RC_FAILED, "event は表示しましたが cursor を保存できません"
+                                      f"でした ({display_text(str(path))})。次回は同じ event を"
+                                      "再表示することがあります") from None
+                saved = current
+            if not follow:
+                if not fresh:
+                    self.say("(新しい event はありません)")
+                return RC_OK
+            if len(events) < limit:
+                self.sleep(2.0)
+
+    # ---- 日常操作
+    def _op_ask(self, question: str, *, terminal) -> int:
+        reply = self._post("/v1/asks", {"question": question}, idempotent=True)
+        job = self._accepted(reply, "ask")
+        if job is None:
+            return RC_FAILED
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        self.say(_multiline(result.get("answer")))
+        return RC_OK
+
+    def _op_improve(self, *, terminal) -> int:
+        reply = self._post("/v1/improve/runs", idempotent=True)
+        job = self._accepted(reply, "improve")
+        if job is None:
+            return RC_FAILED
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        self.say(f"improve mission #{_ident(result.get('mission_id'))} を起動しました")
+        return RC_OK
+
+    def _op_backlog_add(self, idea: str, *, terminal) -> int:
+        from agentic_fx.commands import _normalize_idea_display
+        reply = self._post("/v1/backlog", {"idea": idea}, idempotent=True)
+        if reply.data is None:
+            raise _fail(reply)
+        bid = _ident(reply.data.get("id"))
+        display, removed = _normalize_idea_display(idea)
+        text = f"backlog #{bid} を追加しました: 「{display_text(display, _TEXT_LIMIT)}」"
+        if removed:
+            text += f"\n表示できない文字を {removed} 個含みます"
+        self.say(text)
+        return RC_OK
+
+    def _op_backlog_transition(self, action: str, bid: int, *, terminal) -> int:
+        reply = self._post(f"/v1/backlog/{bid}/{action}")
+        if reply.data is None:
+            if reply.code == "not_found":
+                raise ClientError(RC_FAILED, f"backlog #{bid} は存在しません")
+            if reply.code == "invalid_state":
+                allowed = "done|rejected|note" if action == "reopen" else "open|observation"
+                raise ClientError(RC_FAILED, f"backlog #{bid} は現在の status のため {action} "
+                                  f"できません ({allowed} からのみ可)")
+            raise _fail(reply)
+        if action == "reopen":
+            self.say(f"backlog #{bid} を open に戻しました")
+        else:
+            self.say(f"backlog #{bid} を {'rejected' if action == 'reject' else 'note'} にしました")
+        return RC_OK
+
+    def _op_policy(self, text: str, *, terminal) -> int:
+        reply = self._post("/v1/policy", {"text": text}, idempotent=True)
+        if reply.data is None:
+            raise _fail(reply)
+        self.say("policy に追記しました")
+        return RC_OK
+
+    def _op_reflection_retry(self, order_id: int, *, terminal) -> int:
+        reply = self.api.request("GET", f"/v1/reflections/{order_id}")
+        if reply.data is None:
+            if reply.code == "not_found":
+                raise ClientError(RC_FAILED, f"order #{order_id} は存在しません")
+            raise _fail(reply)
+        seen = reply.data
+        if seen.get("status") != "closed":
+            raise ClientError(RC_FAILED, f"order #{order_id} は closed ではありません "
+                              f"(status={display_text(seen.get('status'))})")
+        if seen.get("reflected") is True:
+            raise ClientError(RC_FAILED, f"order #{order_id} は既に reflection 済みです")
+        posted = self._post(f"/v1/reflections/{order_id}/retry",
+                            {"expected_attempts": seen.get("attempts"),
+                             "expected_last_attempt_at": seen.get("last_attempt_at")},
+                            idempotent=True)
+        if posted.data is None:
+            raise _fail(posted)
+        suffix = "" if seen.get("attempts") else " (台帳に試行記録なし)"
+        self.say(f"order #{order_id} を reflection 再試行対象へ戻しました{suffix}")
+        return RC_OK
+
+    def _op_killswitch_show(self, *, terminal) -> int:
+        kill = _kill_switch(self._get("/v1/status"))
+        if kill.get("latched") is not True:
+            self.say("kill switch はラッチされていません")
+            return RC_OK
+        generation = _ident(kill.get("generation"))
+        self.say(f"kill switch は LATCHED です (gen={generation} "
+                 f"since={display_text(kill.get('latched_at'))})。解除するには "
+                 f"`afx ctl --as approver killswitch reset {generation}` を実行してください")
+        return RC_OK
+
+    # ---- 確認の要る操作
+    def _op_approve(self, approval_id: int, *, terminal: Terminal) -> int:
+        detail = self._get(f"/v1/approvals/{approval_id}")
+        self.say(format_approval_detail(detail))
+        digest = detail.get("payload_sha256")
+        answer = terminal.ask(f"承認するには approval id ({approval_id}) をもう一度入力して"
+                              "ください: ")
+        if answer != str(approval_id):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        # 表示した payload の digest を送る。表示後に変わっていれば server が拒否する。
+        return self._decide("approve", approval_id, {"payload_sha256": digest})
+
+    def _op_retry(self, approval_id: int, *, terminal: Terminal) -> int:
+        detail = self._get(f"/v1/approvals/{approval_id}")
+        self.say(format_approval_detail(detail))
+        if not terminal.yes(f"approval #{approval_id} の承認手順を再試行しますか"):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        return self._decide("retry", approval_id,
+                            {"payload_sha256": detail.get("payload_sha256")})
+
+    def _op_reject(self, approval_id: int, reason: str | None, *, terminal: Terminal) -> int:
+        # 却下は取り戻しにくい。id の打ち間違いに気付けるよう、先に対象を見せる。
+        self.say(format_approval_detail(self._get(f"/v1/approvals/{approval_id}")))
+        if not terminal.yes(f"approval #{approval_id} を却下しますか"):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        body = {} if reason is None else {"reason": reason}
+        return self._decide("reject", approval_id, body)
+
+    def _decide(self, kind: str, approval_id: int, body: dict) -> int:
+        reply = self._post(f"/v1/approvals/{approval_id}/{kind}", body)
+        if reply.data is None:
+            if reply.code == "not_found":
+                raise ClientError(RC_FAILED, f"approval #{approval_id} は存在しません")
+            raise _fail(reply)
+        job = self._poll(reply.data, kind)
+        if job is None:
+            return RC_FAILED
+        result = job.get("result") if isinstance(job.get("result"), dict) else {}
+        outcome = display_text(result.get("outcome"))
+        status = display_text(result.get("status"))
+        if job.get("state") != "done":
+            code = job.get("result_code")
+            if kind == "retry" and result:
+                raise ClientError(RC_FAILED, f"approval #{approval_id} の再試行は完了しませんでした "
+                                  f"(status={status} outcome={outcome})")
+            if kind == "approve" and result:
+                raise ClientError(RC_FAILED, f"approval #{approval_id} は今回の操作では承認され"
+                                  f"ませんでした (status={status} outcome={outcome})")
+            raise ClientError(RC_FAILED, error_text(code if isinstance(code, str) else None))
+        if kind == "reject":
+            self.say(f"approval #{approval_id} rejected")
+        elif kind == "retry":
+            self.say(f"approval #{approval_id} を再試行しました (status={status} outcome={outcome})")
+        elif result.get("outcome") in _APPROVING_OUTCOMES:
+            self.say(f"approval #{approval_id} approved (outcome={outcome})")
+        else:
+            # done でも承認に至らない終端 (invalidated など) を「approved」と言わない。
+            self.say(f"approval #{approval_id} の処理が完了しました (outcome={outcome})")
+        return RC_OK
+
+    def _op_killswitch_reset(self, generation: int, *, terminal: Terminal) -> int:
+        data = self._get("/v1/status")
+        kill = _kill_switch(data)
+        self.say(f"kill switch: {'LATCHED' if kill.get('latched') is True else '解除済み'} "
+                 f"gen={_ident(kill.get('generation'))} "
+                 f"発動時刻={display_text(kill.get('latched_at'))} "
+                 f"エクイティ={_num(data.get('equity'))}")
+        if kill.get("reconcile_required") is True:
+            self.say("解除の途中で止まった印があります。先に `afx ctl --as approver killswitch "
+                     "reconcile` でラッチ中として確定してください")
+        if kill.get("latched") is not True:
+            raise ClientError(RC_FAILED, "kill switch はラッチされていません")
+        answer = terminal.ask(f"世代 {generation} のラッチを解除するには reset と入力して"
+                              "ください: ")
+        if answer != "reset":
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        reply = self._post("/v1/killswitch/reset", {"expected_generation": generation})
+        if reply.data is None:
+            if reply.code == "invalid_state":
+                raise ClientError(RC_FAILED, "kill switch の状態が不確定です (解除の途中で止まった"
+                                  "印が残っています)。`afx ctl --as approver killswitch "
+                                  "reconcile` で確認してください")
+            raise _fail(reply)
+        self.say(f"kill switch ラッチを解除しました (gen={_ident(reply.data.get('generation'))})")
+        return RC_OK
+
+    def _op_killswitch_reconcile(self, *, terminal: Terminal) -> int:
+        kill = _kill_switch(self._get("/v1/status"))
+        if kill.get("reconcile_required") is not True:
+            self.say("確認が必要な状態はありません (解除の途中で止まった印は無し)")
+            return RC_OK
+        file_line = "LATCHED" if kill.get("file_latched") is True else "解除済み"
+        self.say("解除の途中で止まった印があります。新規の取引は止めています。\n"
+                 f"状態ファイルの値: {file_line}\n"
+                 f"印の内容: requested_generation="
+                 f"{_ident(kill.get('requested_generation'))} "
+                 f"started_at={display_text(kill.get('started_at'))}\n"
+                 "ラッチ中として確定し、印を消します (解除側には倒しません)。")
+        if not terminal.yes("ラッチ中として確定しますか"):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        reply = self._post("/v1/killswitch/reconcile")
+        if reply.data is None:
+            raise _fail(reply)
+        generation = _ident(reply.data.get("generation"))
+        self.say(f"kill switch をラッチ中として確定しました (gen={generation})。"
+                 "自動では解除しません。解除するには別に "
+                 f"`afx ctl --as approver killswitch reset {generation}` を実行してください")
+        return RC_OK
+
+    def _op_data_resume(self, acknowledge: bool, *, terminal: Terminal) -> int:
+        if not terminal.yes("価格源の手動復帰を要求しますか"
+                            + (" (--acknowledge)" if acknowledge else "")):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        reply = self._post("/v1/data/resume", {"acknowledge": acknowledge})
+        if reply.data is None:
+            raise _fail(reply)
+        unprocessed = reply.data.get("unprocessed_positions")
+        self.say("resume 要求を記録しました。次の tick で判定します。"
+                 + (f"未処理の足がある建玉 {_num(unprocessed)} 件" if unprocessed is not None
+                    else "")
+                 + (" (--acknowledge 指定あり)" if acknowledge else ""))
+        return RC_OK
+
+    def _op_job_cancel(self, job_id: str, *, terminal: Terminal) -> int:
+        if not terminal.yes(f"job {job_id} を取り消しますか"):
+            raise ClientError(RC_FAILED, MESSAGES["cancelled"])
+        reply = self._post(f"/v1/jobs/{job_id}/cancel")
+        if reply.data is None:
+            raise _fail(reply)
+        self.say(f"job {job_id}: {display_text(reply.data.get('state'))}")
+        return RC_OK
+
+    # ---- job
+    @staticmethod
+    def _job_line(job: dict) -> str:
+        text = (f"job {display_text(job.get('id'))} kind={display_text(job.get('kind'))} "
+                f"state={display_text(job.get('state'))}")
+        if job.get("result_code"):
+            text += f" result_code={display_text(job.get('result_code'))}"
+        result = job.get("result")
+        if isinstance(result, dict):
+            cells = " ".join(f"{display_text(str(k))}={display_text(str(v))}"
+                             for k, v in sorted(result.items()) if k != "answer")
+            if cells:
+                text += f" {cells}"
+            if "answer" in result:
+                text += "\n" + _multiline(result.get("answer"))
+        return text
+
+    def _accepted(self, reply: Reply, kind: str) -> dict | None:
+        if reply.data is None:
+            raise _fail(reply)
+        job = self._poll(reply.data, kind)
+        if job is not None and job.get("state") != "done":
+            code = job.get("result_code")
+            raise ClientError(RC_FAILED, error_text(code if isinstance(code, str) else None))
+        return job
+
+    def _poll(self, accepted: dict, kind: str) -> dict | None:
+        job_id = accepted.get("job_id")
+        if not isinstance(job_id, str) or _JOB_ID.fullmatch(job_id) is None:
+            raise ClientError(RC_FAILED, "daemon の応答を解釈できません (job id)")
+        state = accepted.get("state")
+        self.say(f"job {job_id} を受理しました")
+        deadline = self.monotonic() + _POLL_LIMITS.get(kind, 45.0)
+        try:
+            while True:
+                job = self._get(f"/v1/jobs/{job_id}")
+                state = job.get("state")
+                if state in ("done", "failed", "cancelled", "shutdown"):
+                    return job
+                if self.monotonic() >= deadline:
+                    self.say(interrupt_notice(job_id, state, timed_out=True))
+                    return None
+                self.sleep(_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            self.say(interrupt_notice(job_id, state))
+            raise
+        except ClientError:
+            # 受理の行は流れ去っているかもしれない。結果を確かめる id をここで示す。
+            self.say(interrupt_notice(job_id, state, lost=True))
+            raise
+
+
+def _kill_switch(status: dict) -> dict:
+    # 形の崩れた応答は「ラッチ無し」として読む (表示側で traceback にしない)。
+    kill = status.get("kill_switch")
+    return kill if isinstance(kill, dict) else {}
+
+
+def interrupt_notice(job_id: str, state, *, timed_out: bool = False,
+                     lost: bool = False) -> str:
+    """poll を離れるときの案内。受理済みの job は続く。取消は queued の間だけ。"""
+    head = ("待ち時間の上限に達しました。" if timed_out
+            else "job の状態を取得できませんでした。" if lost else "")
+    text = (f"{head}job {job_id} は受理済みで、この client を離れても続きます "
+            f"(state={display_text(str(state))})。状態: `afx ctl jobs get {job_id}`")
+    if state == "queued":
+        text += f"\n実行前 (queued) の間だけ取り消せます: `afx ctl jobs cancel {job_id}`"
+    return text
+
+
+# --------------------------------------------------------------- 入口
+
+def _split_principal(argv: list[str]) -> tuple[Principal, list[str]]:
+    rest = list(argv)
+    principal = Principal.OPERATOR
+    if rest and rest[0].startswith("--as"):
+        flag = rest.pop(0)
+        if flag == "--as" and rest:
+            value = rest.pop(0)
+        elif flag.startswith("--as="):
+            value = flag[len("--as="):]
+        else:
+            raise ClientError(RC_USAGE, USAGE)
+        try:
+            principal = Principal(value)
+        except ValueError:
+            raise ClientError(RC_USAGE, USAGE) from None
+    return principal, rest
+
+
+def _is_terminal(stream: TextIO) -> bool:
+    try:
+        return stream.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def main(argv: list[str], *, root: Path, stdin: TextIO | None = None,
+         stdout: TextIO | None = None, stderr: TextIO | None = None,
+         uid: int | None = None, sleep: Callable[[float], None] = time.sleep) -> int:
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else sys.stdout
+    stderr = stderr if stderr is not None else sys.stderr
+    try:
+        principal, tokens = _split_principal(argv)
+        if not tokens:
+            if not (_is_terminal(stdin) and _is_terminal(stdout)):
+                raise ClientError(RC_USAGE, USAGE)
+            return _interactive(root, principal, uid=uid, stdin=stdin, stdout=stdout,
+                                stderr=stderr, sleep=sleep)
+        op = parse(tokens)
+        api = ApiClient(root, principal, uid=uid) if op.name not in ("help", "stop") else None
+        return Runner(api, stdin=stdin, stdout=stdout, sleep=sleep).run(op)
+    except ClientError as err:
+        print(f"afx ctl: {err.message}", file=stderr, flush=True)
+        return err.rc
+    except KeyboardInterrupt:
+        return RC_INTERRUPTED
+
+
+def _interactive(root: Path, principal: Principal, *, uid, stdin, stdout, stderr,
+                 sleep) -> int:
+    """``afx ctl>``。approver 操作は 1 回ごとに端末で確認する (まとめて許可しない)。"""
+    api = ApiClient(root, principal, uid=uid)
+    runner = Runner(api, stdin=stdin, stdout=stdout, sleep=sleep)
+    print(f"afx ctl ({principal.value})。help で一覧、exit で終了", file=stdout, flush=True)
+    while True:
+        print("afx ctl> ", end="", file=stdout, flush=True)
+        try:
+            line = stdin.readline()
+        except KeyboardInterrupt:
+            print("", file=stdout)
+            return RC_OK
+        if not line:
+            return RC_OK
+        tokens = line.split()
+        if not tokens:
+            continue
+        if tokens[0] in ("exit", "quit") and len(tokens) == 1:
+            return RC_OK
+        try:
+            runner.run(parse(tokens))
+        except ClientError as err:
+            print(f"afx ctl: {err.message}", file=stderr, flush=True)
+        except KeyboardInterrupt:
+            print("", file=stdout, flush=True)

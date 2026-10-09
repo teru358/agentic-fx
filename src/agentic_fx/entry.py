@@ -12,7 +12,18 @@ _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "improve")
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="afx", description="agentic-fx")
+    args_list = sys.argv[1:] if argv is None else list(argv)
+    # 全体 flag の後ろの ctl も argparse に通さない (REMAINDER は `--as` 始まりを
+    # 受け取れない)。全体 flag は client には関係ないので読み捨て、daemon も起動しない。
+    head = 0
+    while args_list[head:head + 1] == ["--daemon"]:
+        head += 1
+    if args_list[head:head + 1] == ["ctl"]:
+        # client は .env も設定の dotenv も読まない。--as を含む残りの引数は client が読む。
+        from agentic_fx.ops.client import main as ctl_main
+        return ctl_main(args_list[head + 1:], root=Path.cwd())
+    # 略記 (--dae など) を許すと、上の完全一致の前置きをすり抜けて ctl が argparse に届く。
+    parser = argparse.ArgumentParser(prog="afx", description="agentic-fx", allow_abbrev=False)
     parser.add_argument("--daemon", action="store_true",
                         help="systemd 用 (コマンド受付なし)")
     sub = parser.add_subparsers(dest="command")
@@ -23,8 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     for action in ("rotate", "revoke"):
         p = keys_sub.add_parser(action, help=f"principal の鍵を {action} する")
         p.add_argument("principal", choices=("operator", "approver"))
+    # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
+    sub.add_parser("ctl", add_help=False,
+                   help="稼働中の daemon を操作 API で操作する (afx ctl help)")
     backtest_cli.register_subparsers(sub)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(args_list)
 
     root = Path.cwd()
     if args.command == "init":
