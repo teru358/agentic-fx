@@ -1,6 +1,6 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.0
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.1
 
-版: v1.0
+版: v1.1
 
 日付: 2026-10-09
 
@@ -51,7 +51,7 @@ network の保証は application host 名ではなく、proxy が定数 host 名
 
 - `sched_get*`、`getpriority`、`ioprio_get`、`pidfd_open`、`/proc/<pid>/stat` など、他 process の公開 metadata の読取り。
 - file metadata の読取り (`stat`、`statx`、`access`、`getxattr`、`listxattr`、`O_PATH + fstat`)。
-- `/proc/<pid>/cmdline` の露出、trade profile、local backend。
+- `/proc/<pid>/cmdline` の露出、trade profile、local backend。ただし MCP transport の置換 (§4.1 の spool dispatcher と `afx.sock` 廃止) は trade profile にも適用する。trade には seccomp・nested Landlock・cgroup の隔離を掛けないが、transport は一本化する。
 
 ## 2. 起動、所有権、データフロー
 
@@ -141,7 +141,7 @@ ALLOW は自 process に閉じる memory、thread、signal mask、時刻と id �
 | IPC | SysV IPC 12 個、POSIX mq 6 個 | EPERM |
 | keyring | `add_key`、`request_key`、`keyctl` | ENOSYS |
 | io_uring | `io_uring_setup`、`io_uring_enter`、`io_uring_register` | EPERM |
-| kernel | `bpf`、`perf_event_open`、`userfaultfd`、`fanotify_init`、`fanotify_mark`、`syslog`、`_sysctl`、`adjtimex`、`settimeofday`、`clock_settime`、`clock_adjtime`、`sethostname`、`setdomainname`、`sync`、`syncfs`、`kexec_*`、`*_module`、`reboot`、`swapon`、`swapoff`、`acct`、`quotactl*`、`iopl`、`ioperm`、`open_by_handle_at`、`name_to_handle_at`、`lookup_dcookie`、`vhangup`、`nfsservctl`、`lsm_*`、`pkey_*`、`modify_ldt`、`mknod*`、`remap_file_pages`、`memfd_secret`、`map_shadow_stack`、`mseal` | EPERM |
+| kernel | `bpf`、`userfaultfd`、`fanotify_init`、`fanotify_mark`、`syslog`、`_sysctl`、`adjtimex`、`settimeofday`、`clock_settime`、`clock_adjtime`、`sethostname`、`setdomainname`、`sync`、`syncfs`、`kexec_*`、`*_module`、`reboot`、`swapon`、`swapoff`、`acct`、`quotactl*`、`iopl`、`ioperm`、`open_by_handle_at`、`name_to_handle_at`、`lookup_dcookie`、`vhangup`、`nfsservctl`、`lsm_*`、`pkey_*`、`modify_ldt`、`mknod*`、`remap_file_pages`、`memfd_secret`、`map_shadow_stack`、`mseal` | EPERM |
 | obsolete | `create_module`、`get_kernel_syms`、`query_module`、`afs_syscall`、`tuxcall`、`security`、`getpmsg`、`putpmsg`、`vserver`、`*_old`、`uprobe`、`uretprobe`、`set/get_thread_area`、`clone3` | ENOSYS |
 | path metadata | `chmod`、`fchmodat*`、`chown`、`lchown`、`fchownat`、`utime*`、`setxattr*`、`removexattr*`、`file_setattr` | EPERM |
 | fd metadata | `fchmod`、`fchown`、`fsetxattr`、`fremovexattr`、`utimensat` の全形 | EPERM |
@@ -599,3 +599,4 @@ worker は CLI binary を `O_RDONLY|O_CLOEXEC` で開き、同じ fd を hash �
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
 |2026-10-09|v1.0|C0 revision 0.12 (設計レビュー 12 周、r12 で収束) を公開 spec として清書|実装着手条件の固定|—|
+|2026-10-09|v1.1|§1.3: MCP transport の置換 (spool、`afx.sock` 廃止) は trade にも適用と明記。§3.4: `perf_event_open` を EPERM 列から外す (分類表の EACCES 1 件が正)。§3.1 の policy hash は canonical 形を `nr\tname\taction\tcondition_id` (条件定義を含む) に改めた後、実装時に更新する|第 1 波ブリーフの要確認 (sol 助言 2026-10-09)|—|
