@@ -241,7 +241,7 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 
 次の四件はユーザー裁定で確定する。初版実装は仮置きの範囲を超えない。
 
-1. **web 認証** — 仮置きは cookie session とする。UI 用 secret は API 鍵と分離し、`afx ops` が初回に生成して表示する。secret rotation、session の有効期間、loopback HTTP の `Secure` 非設定の扱いを設定 schema で確定する。根拠は、read-only であっても loopback 利用者を認証し、API 鍵の露出と bearer secret の常設を避けるためである。
+1. **web 認証** — **裁定済み (2026-10-09 ユーザー): 初版はローカル限定 (127.0.0.1 bind) で認証を持たず、後で拡張する。** 拡張時の候補は cookie session とする。UI 用 secret は API 鍵と分離し、`afx ops` が初回に生成して表示する。secret rotation、session の有効期間、loopback HTTP の `Secure` 非設定の扱いを設定 schema で確定する。根拠は、read-only であっても loopback 利用者を認証し、API 鍵の露出と bearer secret の常設を避けるためである。
 2. **bot の設置範囲** — 仮置きは単一 guild・単一 channel とする。複数 guild / channel の設定、allowlist、状態領域分離は初版に含めない。根拠は、承認の表示起点と確認 record の束縛を単一の運用境界で検証可能に保つためである。
 3. **notify の配送先** — 仮置きは generic HTTPS webhook だけとする。Discord、Slack、email 等の種類別 adapter は初版に含めない。根拠は、固定 schema と event cursor の配送契約を adapter 固有の認証・再試行規則から独立させるためである。
 4. **`ops-bot` の権限** — 仮置きは `ask`、`improve`、その他 operator 操作を与えないこととする。必要になれば別 principal と別 process を設計する。根拠は、Discord interaction が plugin 決定以外の操作権限へ拡大することを防ぐためである。
@@ -251,3 +251,4 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
 |2026-10-09|v1.0|C0 revision 0.4 (設計レビュー 4 周、最終周で収束) を公開 spec として清書|実装着手条件の固定 (未決 4 件はユーザー裁定待ち)|—|
+|2026-10-09|v1.0|§12-1 web 認証をユーザー裁定で確定 (初版ローカル限定・認証なし、後で拡張)|ユーザー裁定|—|
