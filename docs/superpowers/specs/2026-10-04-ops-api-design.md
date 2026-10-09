@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.11
+# [ops-api] 操作 API と client 契約設計 v1.12
 
-版: v1.11
+版: v1.12
 
 日付: 2026-10-05
 
@@ -204,6 +204,10 @@ main の `approval_facts.py` は親が受理・記録した `parent_facts` と `
 `afx ctl <操作>` と、端末上の `afx ctl>` 対話モードを実装する。parser、結果 formatter、sanitizer は対話シェルと共有する。引数なしを非端末で起動した場合は usage と rc=2。`stop` は送らず systemd の停止方法を案内する。
 
 approver 操作は stdin と `/dev/tty` の両方が端末の場合だけ送る。`--yes` は作らない。approve は親記録と自己申告を表示して id の再入力、reject / retry / data resume / job cancel は y/N、kill switch reset は世代と発動時刻と equity を表示して `reset` の入力を求める。`afx ctl killswitch reconcile` は status の marker 内容 (要求世代、開始時刻、ファイル上のラッチ値) を表示し、ラッチ中として確定する旨を示して y/N を求める。確定後は `killswitch reset <世代>` を別に案内し、自動では解除しない。途中で Ctrl-C しても受理済み job は続き、queued の間だけ明示 cancel できる。
+
+`afx ctl events` は最後に表示した位置と high watermark を `~/.local/state/agentic-fx/<instance_id>/events.cursor` に保存し、表示してから進めて次回はそこから再開する。`--after <id>` を明示した取得は閲覧専用で、保存した cursor を動かさない。high watermark が前回より後退したら cursor を進めずに rc=1 で止まり、復旧には cursor file を削除するよう file のパスを示して案内する (`--after` の閲覧ではパスを示さない)。
+
+決定 job の結果表示は、approve の outcome が `deployed` または `deployed_after_rollback` のときだけ「approved」と表示し、それ以外の done は outcome を添えて「処理が完了しました」と表示して承認とは言わない。結果を伴う失敗は approve なら「今回の操作では承認されませんでした」、retry なら「再試行は完了しませんでした」と表示する。reject も確認の前に承認の内容 (detail) を表示する。引数の範囲は `log` / `activity` の n が 1〜500、`approval list` の n が 1〜200、`events --limit` が 1〜500 で、範囲外は鍵を読む前・接続する前に usage (rc=2) とする。
 
 ## 8. 監査と activity
 
@@ -411,3 +415,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-06|v1.9|autopilot 制限は API の principal にだけ掛かり対話シェルは従来どおり、を明文化 (トリアージ d-list D2 の裁定)|
 |2026-10-07|v1.10|一時的な失敗は冪等 durable 表の行を削除し再送を新規要求として受理 (2 周目 /code-review CR-01 の裁定。監査の終端行は残す)|
 |2026-10-09|v1.11|§3.2 準備状態の上の別 command は invalid_state (両向き)|実装の revoke 例外が spec に無く、fail closed と不整合 (ローカルレビュー 2 周目 F027)|d67d943|
+|2026-10-09|v1.12|§7.1 に events の cursor (保存位置、`--after` は閲覧専用、high watermark 後退時の復旧) と決定結果の表示・引数範囲を追記|CLI 実装で決めた挙動が spec に無く、運用文書だけに書かれていた||

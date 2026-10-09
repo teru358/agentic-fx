@@ -15,6 +15,8 @@ unit を設置する想定で、本手順はそれまでの仮運用。
 
 前提: `loginctl show-user $USER -p Linger` が `Linger=yes` (確認済み)。`.venv` が `uv sync` 済み。
 
+操作 API (`afx ctl` / `afx keys`) を使う場合は [操作 API と `afx ctl` の運用](ops-api-2026-10-09.md) を参照。
+
 ## 設置 (初回、ユーザー操作)
 
 1. いま端末で動いている afx を止める: その端末で `stop`。
