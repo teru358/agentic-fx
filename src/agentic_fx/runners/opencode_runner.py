@@ -11,7 +11,9 @@ from typing import Any, Callable, Literal
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.cli_runner import CliRunner, _detect_stderr_fatal
+from agentic_fx.runners.cli_runner import (
+    CliRunner, _detect_stderr_fatal, require_mcp_spool,
+)
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -84,14 +86,16 @@ class OpencodeRunner(CliRunner):
                          abort_event=abort_event,
                          abort_reason_fn=abort_reason_fn)
 
-    def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
+    def _build_argv(self, mission: Mission, *,
+                    mcp_spool: Path | None) -> list[str]:
+        mcp_spool = require_mcp_spool(mcp_spool)
         path = self._workdir / "home/.config/opencode/opencode.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"provider": {"llama-swap": {
             "npm": "@ai-sdk/openai-compatible", "name": "llama-swap",
             "options": {"baseURL": self._llama_swap_base_url},
             "models": {self._model: {"name": self._model, "limit": {"context": self._context_limit, "output": 8192}}}}},
-            "mcp": {"afx": {"type": "local", "command": [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(mcp_socket)], "enabled": True,
+            "mcp": {"afx": {"type": "local", "command": [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(mcp_spool)], "enabled": True,
                             "timeout": self._mcp_timeout_ms}},
             # 組み込み tool は afx MCP 以外の全部を無効化 (実測: probe で bash が
             # tool_use イベント自体を出さなくなることを確認済み)。MCP 側は

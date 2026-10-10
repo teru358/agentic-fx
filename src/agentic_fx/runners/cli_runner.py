@@ -228,7 +228,21 @@ def _write_prompt_file(workdir: Path, prompt: str) -> Path:
     return path
 
 
+def require_mcp_spool(mcp_spool: Path | None) -> Path:
+    """MCP の spool directory が渡されていなければ CLI を起動しない
+    (tool 0 個で CLI を走らせない)。"""
+    if mcp_spool is None:
+        raise RuntimeError(
+            "MCP spool directory is not attached to the runner — refusing "
+            "to start the CLI with 0 tools")
+    return mcp_spool
+
+
 class CliRunner(AgentRunner):
+    # mission worker が dispatcher を起動した後に設定する MCP の spool
+    # directory (`mission_worker._attach_mcp_dispatcher`)。
+    mcp_spool_dir: Path | None = None
+
     def __init__(self, *, bin_path: Path, model: str, workdir: Path,
                  cli_terminate_grace_sec: float,
                  registry: ToolRegistry,
@@ -266,7 +280,8 @@ class CliRunner(AgentRunner):
         self._recovery_stderr_fatal: str | None = None
 
     @abstractmethod
-    def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]: ...
+    def _build_argv(self, mission: Mission, *,
+                    mcp_spool: Path | None) -> list[str]: ...
 
     @abstractmethod
     def _build_env(self, mission: Mission) -> dict[str, str]: ...
@@ -406,13 +421,11 @@ class CliRunner(AgentRunner):
         return cause, proc.returncode, stdout_lines, stderr_chunks
 
     def run(self, mission: Mission) -> MissionResult:
-        # B2-r2 是正: bind 側 (`mission_worker._start_mcp_dispatcher`) と
-        # 同じ `mcp_socket_path()` から導出する — 独立したリテラルの
-        # 偶然の一致に頼らない (検収 B2-r2、`cli_runner.py:88` のパス
-        # 変異が全スイートを生き延びた指摘への対応)。
-        from agentic_fx.mission_worker import mcp_socket_path
-        mcp_socket = mcp_socket_path(self._workdir)
-        inner_argv = self._build_argv(mission, mcp_socket=mcp_socket)
+        # dispatcher 側 (`mission_worker._start_mcp_dispatcher`)
+        # が作った spool の path をそのまま受け取る — 独立したリテラルの
+        # 偶然の一致に頼らない (path の導出は `mcp_spool.mcp_spool_dir` の
+        # 1 関数)。
+        inner_argv = self._build_argv(mission, mcp_spool=self.mcp_spool_dir)
         env = self._build_env(mission)
 
         # /code-review 2 周目 CR5 是正 (2026-09-12): `_stdin_prompt` を

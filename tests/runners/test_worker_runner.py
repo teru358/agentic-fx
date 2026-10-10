@@ -4401,9 +4401,9 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     参照されなかった (haiku が Step 3 で param を追加した際に消費側の
     配線を書き忘れた)。
 
-    実 `mission_worker.py` 子プロセスを spawn し、子の `afx.sock`
-    (MCP dispatcher, `_start_mcp_dispatcher`) へ `tools/call(run_backtest)`
-    を直接投げて子→親の `tool_rpc`/`tool_rpc_result` 往復を実測する。
+    実 `mission_worker.py` 子プロセスを spawn し、子の MCP spool
+    (`_start_mcp_dispatcher`) へ `tools/call(run_backtest)` を直接置いて
+    子→親の `tool_rpc`/`tool_rpc_result` 往復を実測する。
     修正前は `self._rag` に `run_backtest` 属性が無いため
     `AttributeError` が握り潰されて `{"error": ...}` が返り、修正後は
     このテストが渡した `rpc_handlers["run_backtest"]` が呼ばれてその
@@ -4411,7 +4411,6 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
     if not landlock_available():
         pytest.skip("Landlock not available on this kernel/architecture")
     _isolate_real_mission_worker_transcripts_dir(monkeypatch, tmp_path)
-    import socket as socket_mod
     import agentic_fx.runners.worker_runner as wr_mod
 
     # `tests/conftest._LLAMA_SWAP_UNREACHABLE_URL` (127.0.0.1:1) は
@@ -4486,28 +4485,15 @@ def test_worker_runner_dispatches_improve_tool_rpc_via_rpc_handlers_not_rag(
         # 取り違えて即終了する (このテスト特有のセットアップ上の競合—
         # `_wait_for_go` スレッドが確実に抜けた後に投げれば避けられる)。
         time.sleep(0.5)
-        sock_path = Path(str(captured["cwd"])) / "afx.sock"
-        deadline = time.monotonic() + 10.0
-        while not sock_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.02)
+        from agentic_fx.tools import mcp_spool_client
         try:
-            with socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM) as s:
-                s.settimeout(10.0)
-                s.connect(str(sock_path))
-                req = (json.dumps({
-                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                    "params": {"name": "run_backtest",
-                              "arguments": {"name": "x", "pair": "USDJPY"}},
-                }) + "\n").encode()
-                s.sendall(req)
-                buf = b""
-                while not buf.endswith(b"\n"):
-                    chunk = s.recv(65536)
-                    if not chunk:
-                        break
-                    buf += chunk
-            if buf:
-                responses["run_backtest"] = json.loads(buf.decode())
+            spools = list((Path(str(captured["cwd"])) / "afx-spool").glob("*"))
+            assert len(spools) == 1, spools
+            responses["run_backtest"] = mcp_spool_client.call(spools[0], {
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "run_backtest",
+                           "arguments": {"name": "x", "pair": "USDJPY"}},
+            }, timeout_sec=10.0)
         finally:
             probe_done.set()
 
@@ -5224,8 +5210,8 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
         profile 不問・backend 条件で走った)
     (c) CLI が受け取った `--allowedTools` が `mcp__afx__*` ちょうど
         (trade 用 allowed_tools、`factory.py:38` の完全一致)
-    (d) `afx.sock` が CLI 起動時点で bind されている — fake CLI が
-        `--mcp-config` の指す socket へ直接接続し `initialize`/
+    (d) MCP の spool が CLI 起動時点で処理されている — fake CLI が
+        `--mcp-config` の指す shim を起動し `initialize`/
         `tools/list` を発行できることで実測する (trade 分岐にも
         dispatcher を配線した是正そのものの killer)
     """
@@ -5323,7 +5309,7 @@ def test_trade_claude_real_process_completes_via_factory_build_runner(
             (mission_workdir / "observed_tools.json").read_text())
         assert observed_tools["initialize_ok"] is True
         assert observed_tools["tool_names"], (
-            "afx.sock 経由の tools/list が空 — dispatcher が trade 分岐に"
+            "MCP spool 経由の tools/list が空 — dispatcher が trade 分岐に"
             "配線されていない疑い (段 0 検収 B1 と同型の欠落)")
     finally:
         import shutil as _shutil

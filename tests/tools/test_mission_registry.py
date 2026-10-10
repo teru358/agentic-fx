@@ -463,8 +463,7 @@ def test_trade_registry_mcp_call_counts_market_tool(tmp_path):
         "trade", conn, SETTINGS, _clock(), rag, activity=activity,
         on_tool_result=count_market)
     dispatcher = McpShimDispatcher(
-        sock_path=tmp_path / "afx.sock", registry=registry,
-        allowed=["get_ohlcv"])
+        registry=registry, allowed=["get_ohlcv"])
     response = dispatcher._dispatch({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "get_ohlcv", "arguments": {}},

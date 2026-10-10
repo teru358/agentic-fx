@@ -104,7 +104,7 @@ def test_trade_claude_runner_tools_are_exactly_structured_output_and_toolsearch(
     argv = runner._build_argv(
         Mission(prompt="p", tools=list(_TRADE_TOOLS),
                 output_schema={"type": "object"}, max_turns=3, timeout_sec=10),
-        mcp_socket=workdir / "afx.sock")
+        mcp_spool=workdir / "afx-spool" / "spool")
 
     assert argv.count("--tools") == 1
     assert argv[argv.index("--tools") + 1] == "StructuredOutput,ToolSearch"

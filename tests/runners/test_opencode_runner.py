@@ -6,6 +6,8 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.opencode_runner import OpencodeRunner
 from agentic_fx.runners.opencode_runner import _disable_mcp_for_recovery
@@ -70,7 +72,8 @@ def _resume_runner(tmp_path: Path, bin_path: Path, **over):
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
     runner = OpencodeRunner(**kw)
-    runner._build_argv(_resume_mission(), mcp_socket=workdir / "afx.sock")
+    runner.mcp_spool_dir = workdir / "afx-spool" / "spool"
+    runner._build_argv(_resume_mission(), mcp_spool=runner.mcp_spool_dir)
     return runner, workdir
 
 
@@ -122,7 +125,7 @@ def test_opencode_config_sets_mcp_timeout(tmp_path):
         mcp_timeout_ms=12000, cli_terminate_grace_sec=1,
         registry=ToolRegistry())
 
-    runner._build_argv(_mission(), mcp_socket=tmp_path / "mcp.sock")
+    runner._build_argv(_mission(), mcp_spool=tmp_path / "afx-spool" / "spool")
 
     config = json.loads(
         (workdir / "home/.config/opencode/opencode.json").read_text())
@@ -485,13 +488,13 @@ def test_opencode_argv_writes_self_contained_mcp_provider_config(tmp_path):
     project 外境界越え・徘徊 (probe 実証済み、2026-08-30) を再度許してしまう
     ため、無効化する tool の完全な集合も pin する。"""
     runner, workdir = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     config = json.loads((workdir / "home/.config/opencode/opencode.json").read_text())
     assert argv == ["/opt/opencode", "run", "reply", "--format", "json", "--pure",
                     "-m", "llama-swap/qwen-test", "--dir", str(workdir)]
     assert config["provider"]["llama-swap"]["options"]["baseURL"] == "http://localhost:8080/v1"
     assert config["provider"]["llama-swap"]["models"]["qwen-test"]["limit"] == {"context": 65536, "output": 8192}
-    assert config["mcp"]["afx"]["command"] == [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(workdir / "afx.sock")]
+    assert config["mcp"]["afx"]["command"] == [sys.executable, "-m", "agentic_fx.tools.mcp_shim", str(workdir / "afx-spool" / "spool")]
     assert config["tools"] == {
         "bash": False, "read": False, "write": False, "edit": False, "patch": False,
         "glob": False, "grep": False, "list": False, "webfetch": False,
@@ -599,3 +602,11 @@ def test_recover_output_disables_mcp_before_launching_resume(tmp_path):
     stdout_lines = [json.dumps({"sessionID": "ses_abc123"})]
     runner._recover_output(_resume_mission(), stdout_lines, 10.0)
     assert seen["enabled_at_launch"] is False
+
+
+def test_opencode_refuses_to_build_argv_without_mcp_spool(tmp_path):
+    """MCP の spool directory が無ければ設定を書かずに止まる。"""
+    runner, workdir = _runner(tmp_path)
+    with pytest.raises(RuntimeError, match="MCP spool"):
+        runner._build_argv(_mission(), mcp_spool=None)
+    assert not (workdir / "home/.config/opencode/opencode.json").exists()

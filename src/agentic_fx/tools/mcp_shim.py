@@ -1,25 +1,27 @@
 """MCP stdio シム (設計書 §1.6)。
 
 `run_mcp_shim`: CLI が子プロセスとして起動するエントリ。stdio の
-JSON-RPC 行を Unix ドメインソケット越しに mission_worker (`McpShimDispatcher`)
-へ転送するだけ — ツール本体は持たない。
+JSON-RPC 行を spool directory 経由で mission worker へ渡すだけ — ツール
+本体は持たない。CLI の部分木 (seccomp と nested Landlock の下) で動くので、
+この module の先頭では spool の client と標準ライブラリの軽いものだけを
+import する (`ToolRegistry` 等の worker 側 module を読まない)。
 
-`McpShimDispatcher`: mission_worker 側の専用スレッド。`tools/call` を
-lock で直列化する (in-flight 1)。
+`McpShimDispatcher`: worker 側の JSON-RPC 処理部。spool の dispatcher
+(`mcp_spool.SpoolDispatcher`) から呼ばれ、`tools/call` を lock で直列化する
+(in-flight 1)。
 """
 from __future__ import annotations
 
 import json
-import logging
-import socket
+import os
 import sys
-import threading
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from agentic_fx.tools.registry import ToolRegistry
+from agentic_fx.tools import mcp_spool_client
 
-_log = logging.getLogger("agentic_fx.mcp_shim")
+if TYPE_CHECKING:
+    from agentic_fx.tools.registry import ToolRegistry
 
 # 裁定 5: 実 CLI の initialize 要求を実測して確定する (Task 13 → [T13-5c])。
 # 実測 (2026-08-30、runbook「claude 実ターン」節): claude CLI 2.1.251 は
@@ -38,122 +40,40 @@ def _mcp_tool_from_openai_tool(openai_tool: dict) -> dict:
 
 
 class McpShimDispatcher:
-    def __init__(self, *, sock_path: Path, registry: ToolRegistry,
-                 allowed: list[str],
+    """JSON-RPC の処理部 (worker 側)。spool の dispatcher から 1 要求ずつ
+    `respond` が呼ばれる。"""
+
+    def __init__(self, *, registry: "ToolRegistry", allowed: list[str],
                  after_send: Callable[[], None] | None = None) -> None:
-        self._sock_path = sock_path
+        import threading
         self._registry = registry
         self._allowed = list(allowed)
         self._call_lock = threading.Lock()
         self._after_send = after_send
+        # (kind, detail) を spool の ledger に書く先。tool を実際に実行した
+        # ことの正本を ledger に置くため、spool の dispatcher が配線する。
+        self.record: Callable[[str, str], None] | None = None
         self.protocol_version = _SUPPORTED_PROTOCOL_VERSION
-        # A-4 検収是正 (r2, B1-r2): bind 済み server socket。`bind()` が
-        # 呼び出しスレッドで同期実行され、`self._server` が設定された時点で
-        # bind 成否が確定する — `serve_forever` 側の非同期 accept ループと
-        # 分離することで、呼び出し元が bind の成否を直接 (例外として)
-        # 観測できるようにする。
-        self._server: socket.socket | None = None
-        # 段 0 申し送り 2: `close()` が意図的に呼ばれたことを示すフラグ。
-        # `serve_forever` の accept ループが `close()` 起因の `OSError`
-        # (Bad file descriptor 等) を「意図的な停止」として区別するため
-        # に使う — フラグを見ずに `except OSError: return` にすると、
-        # RLIMIT_NOFILE 枯渇 (EMFILE/ENFILE) 等の**意図しない** accept 失敗
-        # まで静かに dispatcher を止めてしまい、CLI 側は以降のツール呼び
-        # 出しが connection-refused になるだけで診断情報が残らない。
-        self._closing = False
 
-    def bind(self) -> None:
-        """`sock_path` へ同期で bind+listen する (B1-r2 是正)。
+    def respond(self, req: dict, publish: Callable[[dict], None]) -> None:
+        """要求 1 件を処理して応答を `publish` に渡す。
 
-        例外 (`OSError` とそのサブクラス — `unlink()` の `IsADirectoryError`
-        や `bind()` の `FileNotFoundError`/`PermissionError` 等) はそのまま
-        呼び出し元へ伝播させる。旧実装は `serve_forever` を daemon thread に
-        投げてから `sock_path.exists()` を 3 秒ポーリングする**代理観測**で
-        bind 成否を判定していたため、bind 前に何らかのエントリが同名で
-        存在すると (例: 他プロセスの残骸、または `sock_path` が既に
-        ディレクトリ) 誤って成功と判定していた (検収 B1-r2 の masking
-        probe)。`bind()` を同期実行し例外をそのまま伝播させることで、
-        代理観測を排除し真の fail closed にする。
-        """
-        if self._sock_path.exists():
-            self._sock_path.unlink()
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(self._sock_path))
-        server.listen(8)
-        self._server = server
+        `tools/call` は allowed の検査・budget・実行・counter の更新・応答の
+        publish・`after_send` を一つの lock 区間で行う。`after_send` (budget
+        打ち切りの発火) を応答の publish より後に置くのは、CLI が最後の
+        応答を受け取る前に打ち切られないようにするため。"""
+        if req.get("method") == "tools/call":
+            with self._call_lock:
+                resp = self._dispatch(req)
+                publish(resp)
+                if self._after_send is not None:
+                    self._after_send()
+        else:
+            publish(self._dispatch(req))
 
-    def close(self) -> None:
-        """dispatcher を停止する (段 0 申し送り 2)。
-
-        `server.close()` で `serve_forever` の `accept()` を脱出させ
-        (accept 中のブロッキング呼び出しは close 後に `OSError` を送出する
-        ため、`serve_forever` の `finally: server.close()` が二重 close に
-        なるが `socket.close()` は冪等なので害はない)、bind した
-        socket ファイルを削除する。呼び出し元 (`_run_improve_mission` の
-        戻り値を保持する `main()`) が Mission 終了時に呼ぶ想定 —
-        `bind()` していない (= `_server is None`) 状態での呼び出しは
-        no-op。"""
-        self._closing = True
-        if self._server is not None:
-            try:
-                self._server.close()
-            except OSError:
-                pass
-        try:
-            self._sock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-    def serve_forever(self) -> None:
-        if self._server is None:
-            self.bind()
-        server = self._server
-        try:
-            while True:
-                try:
-                    conn, _ = server.accept()
-                except OSError:
-                    if self._closing:
-                        # `close()` が呼び出しスレッドから `server.close()`
-                        # した結果の `OSError` (Bad file descriptor 等) —
-                        # 意図的な停止なので、スレッドの未処理例外として
-                        # pytest/ログに漏らさず静かにループを抜ける。
-                        return
-                    # `close()` が呼ばれていない accept 失敗 (RLIMIT_NOFILE
-                    # 枯渇による EMFILE/ENFILE 等) は意図しない異常なので
-                    # 握りつぶさず再送出する — 診断情報 (thread traceback)
-                    # を残す。
-                    raise
-                threading.Thread(target=self._handle_conn, args=(conn,),
-                                 daemon=True).start()
-        finally:
-            server.close()
-
-    def _handle_conn(self, conn: socket.socket) -> None:
-        try:
-            buf = b""
-            while not buf.endswith(b"\n"):
-                chunk = conn.recv(65536)
-                if not chunk:
-                    return
-                buf += chunk
-            req = json.loads(buf.decode())
-            if req.get("method") == "tools/call":
-                with self._call_lock:
-                    resp = self._dispatch(req)
-                    try:
-                        conn.sendall((json.dumps(resp) + "\n").encode())
-                    except (BrokenPipeError, ConnectionResetError):
-                        _log.warning("MCP client disconnected while sending response")
-                    if self._after_send is not None:
-                        self._after_send()
-            else:
-                try:
-                    conn.sendall((json.dumps(self._dispatch(req)) + "\n").encode())
-                except (BrokenPipeError, ConnectionResetError):
-                    _log.warning("MCP client disconnected while sending response")
-        finally:
-            conn.close()
+    def _note(self, kind: str, detail: str = "") -> None:
+        if self.record is not None:
+            self.record(kind, detail)
 
     def _dispatch(self, req: dict) -> dict:
         rpc_id = req.get("id")
@@ -161,9 +81,11 @@ class McpShimDispatcher:
         if method == "initialize":
             requested = (req.get("params") or {}).get("protocolVersion")
             if requested not in _SUPPORTED_PROTOCOL_VERSIONS:
+                self._note("rejected", "unsupported_protocol_version")
                 return {"jsonrpc": "2.0", "id": rpc_id,
                         "error": {"code": -32600,
                                  "message": f"unsupported protocolVersion {requested!r}"}}
+            self._note("served", "initialize")
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
@@ -173,48 +95,88 @@ class McpShimDispatcher:
             # (実 API、統合裁定 R-i7) — dispatcher 側で二重にフィルタしない。
             tools = [_mcp_tool_from_openai_tool(t)
                     for t in self._registry.openai_tools(self._allowed)]
+            self._note("served", "tools/list")
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {"tools": tools}}
         if method == "tools/call":
             params = req.get("params") or {}
             name = params.get("name")
             if name not in self._allowed:
+                self._note("rejected", "tool_not_allowed")
                 return {"jsonrpc": "2.0", "id": rpc_id,
                         "error": {"code": -32601, "message": f"tool not allowed: {name!r}"}}
             # execute() は例外を送出せず、失敗時も JSON エラー文字列を
-            # 返す。呼び出し側 `_handle_conn` が execute + sendall を同じ
-            # lock 区間に置く。
+            # 返す。呼び出し側 `respond` が execute + publish を同じ lock
+            # 区間に置く。
+            self._note("tool_executed", str(name))
             result = self._registry.execute(name, params.get("arguments") or {},
                                             self._allowed)
             # result は既に JSON 文字列 (execute の戻り値) — json.dumps で
             # 再エンコードすると二重エンコードになるため、そのまま入れる。
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "content": [{"type": "text", "text": result}]}}
+        self._note("rejected", "unknown_method")
         return {"jsonrpc": "2.0", "id": rpc_id,
                 "error": {"code": -32601, "message": f"unknown method {method!r}"}}
 
 
-def run_mcp_shim(sock_path: Path) -> None:
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            return
-        req = json.loads(line)
-        if "id" not in req:
-            # JSON-RPC 通知 (id 無し、例: codex の notifications/initialized)
-            # には応答してはならない — 実機実測 (2026-08-30 mission #6):
-            # 旧実装は dispatcher へ転送して -32601 error を書き戻していた。
-            continue
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(str(sock_path))
-            s.sendall((json.dumps(req) + "\n").encode())
-            buf = b""
-            while not buf.endswith(b"\n"):
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            sys.stdout.write(buf.decode())
+# 応答待ちの期限。settings からは変えられない定数。応答が置かれない要求
+# (応答の一時 file を先置きされた、dispatcher が止まった) で CLI を永久に
+# 待たせないため、期限で JSON-RPC error を返して次の要求へ進む。正常な tool
+# 実行を切らないよう、backtest の RPC 期限の既定 (600 秒) より長く取る。
+SHIM_RESPONSE_TIMEOUT_SEC = 900.0
+
+_DISPATCHER_UNAVAILABLE = -32000
+
+
+def _with_request_id(resp: str, rpc_id: object) -> str:
+    """dispatcher は拒否した要求の id を読まずに `id: null` の error を返す。
+    CLI が応答を要求と対応づけられるよう、shim が自分の要求の id を補う。"""
+    try:
+        body = json.loads(resp)
+    except ValueError:
+        return resp
+    if (isinstance(body, dict) and body.get("id") is None
+            and "error" in body):
+        body["id"] = rpc_id
+        return json.dumps(body)
+    return resp
+
+
+def run_mcp_shim(spool_dir: Path | str, *,
+                 response_timeout_sec: float = SHIM_RESPONSE_TIMEOUT_SEC) -> None:
+    """stdio の JSON-RPC を spool 経由で worker へ渡す。
+
+    応答の一時 file の先置きは自己妨害として扱い、dispatcher は実行も応答も
+    しない。shim は `response_timeout_sec` で諦めて error を返す。"""
+    dirfd = mcp_spool_client.open_spool_dir(spool_dir)
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                return
+            req = json.loads(line)
+            if "id" not in req:
+                # JSON-RPC 通知 (id 無し、例: codex の notifications/initialized)
+                # には応答してはならない — 実機実測 (2026-08-30 mission #6):
+                # 旧実装は dispatcher へ転送して -32601 error を書き戻していた。
+                continue
+            rid = mcp_spool_client.publish_request(
+                dirfd, (json.dumps(req) + "\n").encode())
+            try:
+                resp = mcp_spool_client.wait_response(
+                    dirfd, rid, response_timeout_sec).decode()
+            except TimeoutError:
+                resp = json.dumps({
+                    "jsonrpc": "2.0", "id": req["id"],
+                    "error": {"code": _DISPATCHER_UNAVAILABLE,
+                              "message": "dispatcher_unavailable"}})
+            resp = _with_request_id(resp, req["id"])
+            if not resp.endswith("\n"):
+                resp += "\n"
+            sys.stdout.write(resp)
             sys.stdout.flush()
+    finally:
+        os.close(dirfd)
 
 
 if __name__ == "__main__":

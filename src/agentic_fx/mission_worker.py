@@ -34,8 +34,8 @@
 `settings.runner.<profile>.backend` は `runner_factory.build_runner()` が
 選ぶ (local/claude/codex、trade は codex を `config.py` の
 `_trade_backend_not_codex` が起動前に拒否済み — I-1 是正)。CLI backend
-(claude/codex) のときは `_start_mcp_dispatcher` で `afx.sock` を `ready`
-送出前に bind する。trade は `runner.trade.backend`、improve は
+(claude/codex) のときは `_start_mcp_dispatcher` で MCP の spool
+(`workdir/afx-spool/<nonce>/`) とその dispatcher を `ready` 送出前に用意する。trade は `runner.trade.backend`、improve は
 `runner.improve.backend` をそれぞれ見る。
 
 **I4 対応 (実時計)**: 子は Mission 実行中の鮮度判定 (`get_signals` 等)
@@ -88,6 +88,7 @@ from agentic_fx.runners.cli_runner import _normalize_reason
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
 # `_run_improve_mission` 内の関数内 import だったものを引き上げた)。
+from agentic_fx.tools import mcp_spool
 from agentic_fx.tools.mcp_shim import McpShimDispatcher
 from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, is_tool_budget_abort
 from agentic_fx.tools.registry import ToolRegistry
@@ -523,7 +524,7 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
     送受信の規律 (rpc_id 採番・seq 検証・エラー伝播) は `_RagRpcProxy._call`
     (:307-330) と一字一句同じにする。呼び出し元
     (`_build_improve_registry` が組む registry の `rpc_handlers`) は
-    `McpShimDispatcher._call_lock` (`tools/mcp_shim.py:38`) 経由で常に
+    `McpShimDispatcher._call_lock` (`tools/mcp_shim.py`) 経由で常に
     同時 1 件以下しか呼ばれない — `_RagRpcProxy` が単一の
     `sys.stdin.buffer` 読取を安全に共有できているのと同じ前提。"""
     rpc_counter = {"n": 0}
@@ -595,59 +596,63 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
     return registry, counters
 
 
-def mcp_socket_path(workdir: Path) -> Path:
-    """improve worker の MCP dispatcher socket パス (A-4 検収是正 r2、B2-r2)。
+def _mission_spool_nonce() -> str:
+    """MCP spool root の名前に使う mission nonce (128 bit)。
 
-    `_start_mcp_dispatcher` が bind するパスと、CLI 側
-    (`CliRunner.run`) が `_build_argv` へ渡す `mcp_socket` は、**この関数
-    1 本**から導出する。前回是正 (r2 以前) は両者が独立した
-    `workdir / "afx.sock"` リテラルとして別々の場所に書かれており、
-    `cli_runner.py` 側のパス式のみを変異させても検出できなかった
-    (検収 B2-r2: 全スイートで Survived)。式を 1 本に統合することで、
-    どちら側の呼び出しを変異させても不一致が実プロセス経由で検出できる。
+    設計では WorkerRunner が handshake で渡す値を使う。handshake に載るまで
+    はここで作り、差し替えはこの関数 1 か所で行う。"""
+    return os.urandom(16).hex()
+
+
+def _create_mcp_spool_root(workdir: Path) -> mcp_spool.SpoolRoot:
+    """`workdir/afx-spool/<nonce>/` を 0700 で新設する。作れなければ
+    `SpoolCreateFailed` (`spool_create_failed`) で mission を始めない。
+    path は `mcp_spool.mcp_spool_dir` の 1 関数から導出し、CLI に渡す MCP
+    設定の引数も同じ値 (`SpoolDispatcher.spool_dir`) を使う。"""
+    return mcp_spool.SpoolRoot.create(workdir, _mission_spool_nonce())
+
+
+def _start_mcp_dispatcher(
+    *, workdir: Path, registry: ToolRegistry,
+    after_send: Callable[[], None] | None = None,
+    spool_root: mcp_spool.SpoolRoot | None = None,
+    on_fatal: Callable[[str], None] | None = None,
+) -> mcp_spool.SpoolDispatcher:
+    """MCP の spool dispatcher を起動して返す (設計書 §1.6、spool 契約)。
+
+    spool root の作成は呼び出しスレッドで同期に行い、失敗はそのまま
+    `SpoolCreateFailed` で伝える — 黙って進むと CLI は tool 0 個で走る。
+    この関数が返った時点で spool directory は在り、dispatcher の thread は
+    起動済みなので、呼び出し元が `ready` を送る時点で shim の要求は処理
+    される (子は「spool + registry 構築 → ready 送出 → go 待ち」の順)。
+    `spool_root` を渡せば (Landlock の前に作った root) それを使う。
     """
-    return workdir / "afx.sock"
-
-
-def _start_mcp_dispatcher(*, workdir: Path, registry: ToolRegistry,
-                          after_send: Callable[[], None] | None = None) -> McpShimDispatcher:
-    """improve worker 側の Unix socket dispatcher を起動する
-    (A-4 検収是正 Step 7a/7b、設計書 §1.6、r2 是正 B1-r2/RW6)。
-
-    `McpShimDispatcher.bind()` を**呼び出しスレッドで同期実行**する —
-    bind の成否をそのまま例外として受け取れるため、以前の実装
-    (`serve_forever` を daemon thread へ投げてから `sock_path.exists()` を
-    3 秒ポーリングする代理観測) が持っていた 2 つの欠陥が同時に消える:
-    (a) 代理観測は「そのパスに何か在るか」しか見ておらず、bind 前から
-    別エントリ (他プロセスの残骸やディレクトリ) が同名で存在すると
-    誤って成功と判定していた (masking probe、検収 B1-r2 (a))。
-    (b) daemon thread の非同期 bind がテスト間で cwd を共有する
-    in-process 呼び出し (`main()` を直接駆動する improve profile テスト)
-    と競合し、全スイートを flaky にしていた (検収 B1-r2 (b))。
-    同期 bind によりポーリング・3 秒 deadline は不要になる。
-
-    bind (+ registry 構築) が完了してからこの関数が返ることで、呼び出し元
-    (`_run_improve_mission` → `main()`) が `ready` フレームを送出する時点
-    では既に dispatcher が accept 可能な状態にある (RW6: 子は
-    「bind + registry 構築 → ready 送出 → go 待ち」の順)。
-    """
-    sock_path = mcp_socket_path(workdir)
-    dispatcher = McpShimDispatcher(
-        sock_path=sock_path, registry=registry, allowed=registry.names(),
-        after_send=after_send)
-    try:
-        dispatcher.bind()
-    except OSError as e:
-        # bind の失敗 (Landlock 拒否、ENOENT、既存エントリがディレクトリ
-        # 等) をそのまま呼び出し元へ fail closed で伝える。黙って見逃すと
-        # CLI へ存在しない socket path を渡し続け、B1 (bind されない
-        # socket = ツール 0 個) を再発させる。
-        raise RuntimeError(
-            f"MCP dispatcher failed to bind {sock_path} — refusing to "
-            "start (fail closed: CLI would run with 0 tools, 検収 B1)") from e
-    thread = threading.Thread(target=dispatcher.serve_forever, daemon=True)
-    thread.start()
+    root = spool_root if spool_root is not None else _create_mcp_spool_root(workdir)
+    mcp = McpShimDispatcher(registry=registry, allowed=registry.names(),
+                            after_send=after_send)
+    dispatcher = mcp_spool.SpoolDispatcher(root, mcp.respond, on_fatal=on_fatal)
+    mcp.record = dispatcher.record_current
+    dispatcher.start()
     return dispatcher
+
+
+def _attach_mcp_dispatcher(runner: Any,
+                           dispatcher: mcp_spool.SpoolDispatcher) -> None:
+    """runner に dispatcher と spool directory を持たせる。CLI runner は
+    `mcp_spool_dir` を MCP 設定の引数に使う。"""
+    runner._afx_mcp_dispatcher = dispatcher
+    runner.mcp_spool_dir = dispatcher.spool_dir
+
+
+def _stop_mcp_dispatcher(runner: Any) -> None:
+    dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
+    if dispatcher is not None:
+        dispatcher.stop()
+
+
+def _spool_failure(runner: Any) -> str | None:
+    dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
+    return None if dispatcher is None else dispatcher.failure_reason
 
 
 def _wait_for_go(in_seq: "SeqTracker", timeout_sec: float) -> bool:
@@ -688,12 +693,13 @@ def _run_improve_mission(
     *, settings: Any, workdir: Path, staging_dir: str,
     source_snapshot_dir: str, protocol_out: Any = None, out_seq: Any = None,
     in_seq: Any = None, inventory_view: dict | None = None,
+    spool_root: mcp_spool.SpoolRoot | None = None,
 ) -> Any:
     """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
     是正 Step 7a/7b)。
 
     `_build_improve_registry` で registry を組み立て、`_start_mcp_dispatcher`
-    で同じ `workdir` に `afx.sock` を bind してから、factory.build_runner
+    で同じ `workdir` の MCP spool に dispatcher を起動してから、factory.build_runner
     経由で backend (local/claude/codex) を選択し runner を構築する。
     unit test は protocol_out/out_seq をデフォルト None で呼び出し、
     monkeypatch で factory.build_runner (と必要なら `_build_improve_registry`)
@@ -703,8 +709,8 @@ def _run_improve_mission(
     `runner` に紐づけて呼び出し元へ返す — `_run_improve_mission` 自身は
     Mission を実行しない (呼び出し元の `main()` が `runner.run(mission)`
     する) ため、dispatcher の close は呼び出し元の責務。旧実装は戻り値を
-    破棄しており、参照が `serve_forever` の daemon thread (bound method)
-    だけになるため、GC のタイミングに socket の生死が暗黙に依存していた。
+    破棄しており、参照が dispatcher の daemon thread (bound method)
+    だけになるため、GC のタイミングに dispatcher の生死が暗黙に依存していた。
     `runner._afx_mcp_dispatcher` に保持することで、既存の `runner = ...`
     呼び出し側 (テスト含む) の呼び出し形は変えずに済む。
 
@@ -712,17 +718,28 @@ def _run_improve_mission(
     :param workdir: Mission 実行用 workdir (Landlock rw 許可範囲)
     :param protocol_out: stdout プロトコル出力 (main で生成、フレーム送信用)
     :param out_seq: SeqTracker インスタンス (protocol_out 送信時に採番用)
+    :param spool_root: Landlock の前に作った MCP spool root (省略時は
+        ここで作る)
     :return: AgentRunner インスタンス (`_afx_mcp_dispatcher` 属性に
-        `McpShimDispatcher` を保持する)
+        `SpoolDispatcher`、`mcp_spool_dir` 属性に spool directory を保持する)
     """
     rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq)
     registry, counters = _build_improve_registry(
         settings=settings, workdir=workdir, staging_dir=Path(staging_dir),
         source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client,
         inventory_view=inventory_view)
+    spool_fatal: list[str] = []
+
+    def on_spool_fatal(reason: str) -> None:
+        # spool の異常 (`spool_flood`) は mission failure。CLI を止めるため
+        # budget 打ち切りと同じ abort 経路を使い、理由は spool 側を優先する。
+        spool_fatal.append(reason)
+        counters.abort_event.set()
+
     dispatcher = _start_mcp_dispatcher(
         workdir=workdir, registry=registry,
-        after_send=counters.fire_if_pending)
+        after_send=counters.fire_if_pending, spool_root=spool_root,
+        on_fatal=on_spool_fatal)
     on_message = _make_on_message(protocol_out, out_seq)
     runner = runner_factory.build_runner(
         "improve", settings, registry, workdir=workdir,
@@ -734,9 +751,11 @@ def _run_improve_mission(
         cli_started_sink=lambda pgid: _send_frame(
             protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}),
         abort_event=counters.abort_event,
-        abort_reason_fn=lambda: f"{TOOL_BUDGET_ABORT_PREFIX}{counters.abort_trigger or ''}",
+        abort_reason_fn=lambda: (
+            spool_fatal[0] if spool_fatal
+            else f"{TOOL_BUDGET_ABORT_PREFIX}{counters.abort_trigger or ''}"),
         after_tool_call=counters.fire_if_pending)
-    runner._afx_mcp_dispatcher = dispatcher
+    _attach_mcp_dispatcher(runner, dispatcher)
     runner._afx_mission_counters = counters
     return runner
 
@@ -804,6 +823,8 @@ def main() -> None:
                 claude_bin = None
                 codex_bin = None
                 opencode_bin = None
+            # MCP の spool root は Landlock を掛ける前に作り、dirfd を保持する。
+            spool_root = _create_mcp_spool_root(Path.cwd())
             _bootstrap_improve_profile(
                 backend=improve_backend,
                 mission_id=handshake["mission_id"],
@@ -840,7 +861,8 @@ def main() -> None:
                 staging_dir=handshake["staging_dir"],
                 source_snapshot_dir=handshake["source_snapshot_dir"],
                 protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq,
-                inventory_view=handshake.get("inventory_view"))
+                inventory_view=handshake.get("inventory_view"),
+                spool_root=spool_root)
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,
@@ -874,6 +896,11 @@ def main() -> None:
                     # 既存の local 終端 activity の文面を変えない)。
                     tool_calls = _improve_result_tool_calls(
                         counters, improve_backend)
+                    spool_failure = _spool_failure(runner)
+                    if spool_failure is not None:
+                        result.status = "failed"
+                        result.output = None
+                        result.reason = spool_failure
                     _send_frame(protocol_out, out_seq, {
                         "type": "result",
                         "status": result.status, "output": result.output,
@@ -895,13 +922,11 @@ def main() -> None:
             finally:
                 # 段 0 申し送り 2: `_run_improve_mission` が保持した
                 # dispatcher を Mission 終了時 (成功/失敗いずれの経路でも)
-                # に close する。`ready` 前後の送出順序はここでは一切
-                # 触れない — bind→ready→go の順序 (RW6) は
+                # に止める。`ready` 前後の送出順序はここでは一切
+                # 触れない — spool→ready→go の順序は
                 # `_start_mcp_dispatcher`/上の `_send_frame` 呼び出し順の
-                # ままで、close は `runner.run()` 完了後の後始末のみ。
-                dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
-                if dispatcher is not None:
-                    dispatcher.close()
+                # ままで、stop は `runner.run()` 完了後の後始末のみ。
+                _stop_mcp_dispatcher(runner)
             return
         if worker_profile != "trade":
             raise RuntimeError(
@@ -967,21 +992,34 @@ def main() -> None:
         # I-1 是正: trade も improve と同じ factory.build_runner 経由で
         # backend (local/claude) を選ぶ (config.py の
         # `_trade_backend_not_codex` が codex を既に拒否済み)。CLI
-        # backend (claude) のときは improve と同形で `afx.sock` を
-        # `ready` 送出前に bind する — CLI に渡す `--mcp-config` の
-        # socket が bind 済みであることを保証するため (段 0 検収の
-        # 「ツール 0 個で走る」欠落の是正)。
+        # backend (claude) のときは improve と同形で MCP の spool と
+        # dispatcher を `ready` 送出前に用意する — CLI に渡す
+        # `--mcp-config` の spool が処理されることを保証するため (CLI を
+        # ツール 0 個で走らせない)。
         trade_dispatcher = None
+        # spool の異常 (`spool_flood`) では CLI を止める。budget の abort 経路は
+        # trade に無いので、専用の abort_event を runner に渡して止める。
+        trade_abort = threading.Event()
+        trade_spool_fatal: list[str] = []
+
+        def on_trade_spool_fatal(reason: str) -> None:
+            trade_spool_fatal.append(reason)
+            trade_abort.set()
+
         if settings.runner.trade.backend != "local":
             trade_dispatcher = _start_mcp_dispatcher(
-                workdir=Path.cwd(), registry=registry)
+                workdir=Path.cwd(), registry=registry,
+                on_fatal=on_trade_spool_fatal)
         runner = runner_factory.build_runner(
             "trade", settings, registry, workdir=Path.cwd(),
             on_message=on_message,
             cli_started_sink=lambda pgid: _send_frame(
-                protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}))
+                protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}),
+            abort_event=trade_abort,
+            abort_reason_fn=lambda: (
+                trade_spool_fatal[0] if trade_spool_fatal else "aborted"))
         if trade_dispatcher is not None:
-            runner._afx_mcp_dispatcher = trade_dispatcher
+            _attach_mcp_dispatcher(runner, trade_dispatcher)
 
         _send_frame(protocol_out, out_seq, {"type": "ready", "ok": True})
         ready_sent = True
@@ -989,6 +1027,11 @@ def main() -> None:
         try:
             try:
                 result = runner.run(mission)
+                spool_failure = _spool_failure(runner)
+                if spool_failure is not None:
+                    result.status = "failed"
+                    result.output = None
+                    result.reason = spool_failure
                 _send_frame(protocol_out, out_seq, {
                     "type": "result",
                     "status": result.status, "output": result.output,
@@ -1000,9 +1043,7 @@ def main() -> None:
                     "error": f"{type(exc).__name__}: {exc}",
                     "market_tool_calls": dict(market_tool_calls)})
         finally:
-            dispatcher = getattr(runner, "_afx_mcp_dispatcher", None)
-            if dispatcher is not None:
-                dispatcher.close()
+            _stop_mcp_dispatcher(runner)
     except Exception as exc:  # noqa: BLE001 — ready 送出前の失敗も報告する
         try:
             # レビュー 1 周目 (codex I-2): 旧実装は無条件に

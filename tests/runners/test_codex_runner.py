@@ -35,6 +35,7 @@ def _runner(tmp_path, *, behavior="success", **over):
     kw.update(over)
     r = CodexRunner(**kw)
     r._bin_path = FAKE_CODEX
+    r.mcp_spool_dir = workdir / "afx-spool" / "spool"
     return r, workdir, behavior
 
 
@@ -51,7 +52,7 @@ def test_codex_argv_shape_pins_plugin_disable_flags(tmp_path):
     --disable recommended_plugins` (probe §5-②: 落とすとカタログ取得で
     RLIMIT_FSIZE=8MB に当たり SIGXFSZ で即死する)。"""
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     disables = [argv[i + 1] for i, a in enumerate(argv) if a == "--disable"]
     assert "plugins" in disables
     assert "remote_plugin" in disables
@@ -61,7 +62,7 @@ def test_codex_argv_shape_pins_plugin_disable_flags(tmp_path):
 
 def test_codex_argv_shape_pins_bypass_and_ignore_user_config(tmp_path):
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert "--ignore-user-config" in argv
     assert "exec" in argv
@@ -78,7 +79,7 @@ def test_codex_argv_does_not_contain_prompt_and_uses_exec_dash(tmp_path):
     明示の `-` (stdin 読み指定) にする (指揮者の CLI 事前確認)。"""
     mission = _mission()
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(mission, mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(mission, mcp_spool=workdir / "afx-spool" / "spool")
     assert mission.prompt not in argv
     exec_idx = argv.index("exec")
     assert argv[exec_idx + 1] == "-"
@@ -88,7 +89,7 @@ def test_codex_argv_has_no_llama_swap_provider_config(tmp_path):
     """llama_swap 用 argv を復活させる変異は namespace tools 非互換を再導入
     するため、chatgpt 固定の argv から設定片が消えていることを pin する。"""
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     joined = " ".join(argv)
     assert "llamaswap" not in joined
 
@@ -162,7 +163,7 @@ def test_codex_argv_shape_has_no_extra_elements(tmp_path):
     要素数チェックが無く、未知フラグを 1 つ足す変異が SURVIVED だった
     (claude 側は `len(argv) == 20` で守られている)。要素数を pin する。"""
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     assert len(argv) == 24, argv
 
 
@@ -215,7 +216,7 @@ def test_codex_argv_does_not_pass_max_turns_flag(tmp_path):
     無視されると docstring に書いてあるだけでは不十分 — argv に含めないこと
     を pin する)。"""
     runner, workdir, _ = _runner(tmp_path)
-    argv = runner._build_argv(_mission(max_turns=1), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(max_turns=1), mcp_spool=workdir / "afx-spool" / "spool")
     assert "--max-turns" not in argv
 
 
@@ -293,3 +294,12 @@ def test_trade_backend_codex_rejected_by_settings_validator():
     from agentic_fx.config import Settings
     with pytest.raises(ValidationError, match="codex"):
         Settings(**raw)
+
+
+def test_codex_refuses_to_start_without_mcp_spool(tmp_path):
+    """MCP の spool directory が渡されていなければ CLI を起動しない。"""
+    runner, workdir, _ = _runner(tmp_path)
+    runner.mcp_spool_dir = None
+    with pytest.raises(RuntimeError, match="MCP spool"):
+        runner.run(_mission())
+    assert not (workdir / "output.txt").exists()

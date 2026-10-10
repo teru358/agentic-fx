@@ -996,7 +996,7 @@ def test_main_routes_trade_claude_backend_through_factory_build_runner(
     ここでは `main()` の trade 分岐が実際に `runner_factory.build_runner`
     を `profile="trade"` で呼ぶ**配線**を in-process で pin する。実
     プロセス (fake claude CLI + 0600 credentials + allowed_tools 完全一致
-    + `afx.sock` bind 実測) の pin は
+    + MCP spool 経由の tools/list 実測) の pin は
     `tests/runners/test_worker_runner.py::
     test_trade_claude_real_process_completes_via_factory_build_runner`。"""
     monkeypatch.chdir(tmp_path)
@@ -1041,9 +1041,9 @@ def test_main_trade_local_backend_does_not_bind_mcp_dispatcher(
         monkeypatch, tmp_path):
     """I-1 是正の条件化そのものの pin (`verified-round1.md` §4 修正範囲 1
     「条件化するならその分岐自体を pin すること」)。trade.backend=local の
-    ときは CLI を経由しないため `afx.sock` を bind する必要が無い —
-    `_start_mcp_dispatcher` を無条件化する変異、または local でも bind
-    してしまう変異への pin。"""
+    ときは CLI を経由しないため MCP の spool を作る必要が無い —
+    `_start_mcp_dispatcher` を無条件化する変異、または local でも spool を
+    作ってしまう変異への pin。"""
     monkeypatch.chdir(tmp_path)
 
     dispatcher_calls: list[object] = []
@@ -1062,38 +1062,45 @@ def test_main_trade_local_backend_does_not_bind_mcp_dispatcher(
     assert frames[-1]["status"] == "completed"
     assert dispatcher_calls == [], (
         "trade+local でも _start_mcp_dispatcher が呼ばれている — "
-        "afx.sock を不要に bind している (I-1 条件化の pin)")
-    assert not (tmp_path / "afx.sock").exists()
+        "MCP spool を不要に作っている")
+    assert not (tmp_path / "afx-spool").exists()
 
 
-def test_main_trade_claude_backend_binds_mcp_dispatcher_before_ready(
+def _observe_spool_at_ready(tmp_path, observed: dict) -> None:
+    """`ready` 送出の直前に、workdir の MCP spool が 1 個だけあり、要求に
+    応答することを記録する。"""
+    from agentic_fx.tools import mcp_spool_client
+
+    spools = sorted((tmp_path / "afx-spool").glob("*"))
+    observed["spool_count"] = len(spools)
+    if len(spools) != 1:
+        return
+    try:
+        resp = mcp_spool_client.call(
+            spools[0], {"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                        "params": {}}, timeout_sec=5)
+        observed["spool_served"] = "result" in resp
+    except TimeoutError:
+        observed["spool_served"] = False
+
+
+def test_main_trade_claude_backend_starts_mcp_spool_before_ready(
         monkeypatch, tmp_path):
-    """I-1 是正 codex 指摘 (d) の直接 pin: 「`ready` 受信時点で `afx.sock`
-    が bind されている」を、実プロセスの CLI 接続 (`test_worker_runner.py`
-    の実測は `runner.run()` = `go` 受領後まで進んで初めて CLI が socket に
+    """「`ready` 受信時点で MCP の
+    spool が処理されている」を、実プロセスの CLI 接続 (`test_worker_runner.py`
+    の実測は `runner.run()` = `go` 受領後まで進んで初めて CLI が spool に
     触れるため、この性質そのものは検証していない) ではなく、`ready`
-    フレーム送出の**直前**の時点で socket が実在し `connect()` できることを
-    `_send_frame` spy で観測する (`test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile`
+    フレーム送出の**直前**の時点で spool が実在し要求に応答することを
+    `_send_frame` spy で観測する (`test_ready_is_sent_only_after_mcp_spool_is_served_for_improve_profile`
     の trade 版)。"""
-    import socket as socket_mod
-
     monkeypatch.chdir(tmp_path)
 
     observed: dict = {}
     orig_send_frame = mission_worker._send_frame
 
     def spy_send_frame(protocol_out, out_seq, frame):
-        if frame.get("type") == "ready" and "sock_exists" not in observed:
-            sock_path = tmp_path / "afx.sock"
-            observed["sock_exists"] = sock_path.exists()
-            if observed["sock_exists"]:
-                try:
-                    with socket_mod.socket(socket_mod.AF_UNIX,
-                                           socket_mod.SOCK_STREAM) as s:
-                        s.connect(str(sock_path))
-                    observed["sock_connect_ok"] = True
-                except OSError:
-                    observed["sock_connect_ok"] = False
+        if frame.get("type") == "ready" and "spool_count" not in observed:
+            _observe_spool_at_ready(tmp_path, observed)
         return orig_send_frame(protocol_out, out_seq, frame)
 
     monkeypatch.setattr(mission_worker, "_send_frame", spy_send_frame)
@@ -1120,18 +1127,40 @@ def test_main_trade_claude_backend_binds_mcp_dispatcher_before_ready(
     assert frames[0]["type"] == "ready"
     # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
     assert frames[0]["ok"] is True
-    assert observed.get("sock_exists") is True, (
-        "trade+claude で ready 送出時点で afx.sock が bind されていない")
-    assert observed.get("sock_connect_ok") is True, (
-        "trade+claude で ready 送出時点で afx.sock へ接続できない")
+    assert observed.get("spool_count") == 1, (
+        "trade+claude で ready 送出時点で MCP spool が作られていない")
+    assert observed.get("spool_served") is True, (
+        "trade+claude で ready 送出時点で MCP spool の要求が処理されない")
 
 
-def test_main_trade_claude_closes_mcp_dispatcher_after_mission_completes(
+def _assert_dispatcher_stopped(runner, tmp_path) -> None:
+    """dispatcher が止まり、thread が終わり、以後に置いた要求が処理されない。"""
+    import time as _time
+
+    from agentic_fx.tools import mcp_spool_client
+
+    dispatcher = runner._afx_mcp_dispatcher
+    assert dispatcher is not None
+    assert dispatcher.stopped
+    assert not dispatcher.thread.is_alive()
+    dirfd = mcp_spool_client.open_spool_dir(dispatcher.spool_dir)
+    try:
+        rid = mcp_spool_client.publish_request(dirfd, b'{"jsonrpc": "2.0", '
+                                               b'"id": 9, "method": "tools/list"}\n')
+    finally:
+        os.close(dirfd)
+    _time.sleep(1.5)
+    assert (dispatcher.spool_dir / ("req-" + rid)).exists()
+    assert not (dispatcher.spool_dir / ("resp-" + rid)).exists()
+
+
+def test_main_trade_claude_stops_mcp_dispatcher_after_mission_completes(
         monkeypatch, tmp_path):
     """trade+claude 版の段 0 申し送り 2 pin
-    (`test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes`
-    の trade 版): Mission 終了後に `afx.sock` が unlink されている。"""
+    (`test_mcp_dispatcher_is_stopped_after_improve_mission_completes`
+    の trade 版): Mission 終了後に dispatcher が止まっている。"""
     monkeypatch.chdir(tmp_path)
+    made: list = []
 
     class _FakeClaudeRunner:
         def __init__(self):
@@ -1144,7 +1173,7 @@ def test_main_trade_claude_closes_mcp_dispatcher_after_mission_completes(
 
     monkeypatch.setattr(
         mission_worker.runner_factory, "build_runner",
-        lambda *a, **kw: _FakeClaudeRunner())
+        lambda *a, **kw: made.append(_FakeClaudeRunner()) or made[-1])
 
     def to_claude(d):
         d["runner"]["trade"]["backend"] = "claude"
@@ -1153,9 +1182,7 @@ def test_main_trade_claude_closes_mcp_dispatcher_after_mission_completes(
         monkeypatch, tmp_path, settings_mutator=to_claude)
 
     assert frames[-1]["type"] == "result"
-    sock_path = tmp_path / "afx.sock"
-    assert not sock_path.exists(), (
-        "trade+claude の Mission 終了後も afx.sock が残っている")
+    _assert_dispatcher_stopped(made[0], tmp_path)
 
 
 def test_set_resource_limits_sets_all_four_limits(monkeypatch):
@@ -1731,22 +1758,19 @@ def test_result_frame_carries_recovered_false_for_improve_profile_default(
     assert result_frame["recovered"] is False
 
 
-def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_profile(
+def test_ready_is_sent_only_after_mcp_spool_is_served_for_improve_profile(
         monkeypatch, tmp_path):
     """RW6 是正 pin (プラン10 着手前検証 rulings 末尾): improve worker は
-    「`afx.sock` bind + registry 構築 → `ready` 送出 → `go` 待ち」の順で
+    「MCP spool + registry 構築 → `ready` 送出 → `go` 待ち」の順で
     動く — `go` 待ち自体は Task 9 再工事 (t9b) が配線するためここでは
     触れないが、「`ready` の前に dispatcher が上がっている」ことは本是正
     (r2) の責務であり pin する。
 
     `_send_frame` を monkeypatch でラップし、`type="ready"` のフレームが
-    実際に送出される**直前**の時点で `workdir/afx.sock` が存在し、
-    実際に `connect()` できることを観測する (親の `on_ready` コールバック
-    が読む時点に相当)。`_start_mcp_dispatcher` (bind を含む) の呼び出しを
-    `ready` 送出の後へ移す変異は、この時点でまだ socket が存在しないため
-    red になる。"""
-    import socket as socket_mod
-
+    実際に送出される**直前**の時点で `workdir/afx-spool/<nonce>/` が存在し、
+    要求に応答することを観測する (親の `on_ready` コールバックが読む時点に
+    相当)。`_start_mcp_dispatcher` の呼び出しを `ready` 送出の後へ移す
+    変異は、この時点でまだ spool が無いため red になる。"""
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
@@ -1755,17 +1779,8 @@ def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_pro
     orig_send_frame = mission_worker._send_frame
 
     def spy_send_frame(protocol_out, out_seq, frame):
-        if frame.get("type") == "ready" and "sock_exists" not in observed:
-            sock_path = tmp_path / "afx.sock"
-            observed["sock_exists"] = sock_path.exists()
-            if observed["sock_exists"]:
-                try:
-                    with socket_mod.socket(socket_mod.AF_UNIX,
-                                           socket_mod.SOCK_STREAM) as s:
-                        s.connect(str(sock_path))
-                    observed["sock_connect_ok"] = True
-                except OSError:
-                    observed["sock_connect_ok"] = False
+        if frame.get("type") == "ready" and "spool_count" not in observed:
+            _observe_spool_at_ready(tmp_path, observed)
         return orig_send_frame(protocol_out, out_seq, frame)
 
     monkeypatch.setattr(mission_worker, "_send_frame", spy_send_frame)
@@ -1785,22 +1800,22 @@ def test_ready_is_sent_only_after_mcp_dispatcher_socket_is_bound_for_improve_pro
     assert frames[0]["type"] == "ready"
     # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
     assert frames[0]["ok"] is True
-    assert observed.get("sock_exists") is True, (
-        "ready 送出時点で afx.sock が bind されていない (RW6)")
-    assert observed.get("sock_connect_ok") is True, (
-        "ready 送出時点で afx.sock へ接続できない (RW6)")
+    assert observed.get("spool_count") == 1, (
+        "ready 送出時点で MCP spool が作られていない")
+    assert observed.get("spool_served") is True, (
+        "ready 送出時点で MCP spool の要求が処理されない")
 
 
-def test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes(
+def test_mcp_dispatcher_is_stopped_after_improve_mission_completes(
         monkeypatch, tmp_path):
     """段 0 申し送り 2 pin: `_run_improve_mission` が保持した dispatcher を
-    `main()` の improve 分岐が Mission 終了時に close する。旧実装は
+    `main()` の improve 分岐が Mission 終了時に止める。旧実装は
     `_start_mcp_dispatcher(...)` の戻り値を捨てており、参照が
-    `serve_forever` の daemon thread だけになるため socket の生死が
-    暗黙に GC タイミングへ依存していた — この pin は「`result` フレーム
-    送出後に `afx.sock` が unlink されている」ことを実ファイルで観測する
-    (`ready`/`go` の送出順序は上の RW6 テストが別途固定しており、ここでは
-    触れない)。"""
+    dispatcher の daemon thread だけになるため生死が暗黙に GC タイミングへ
+    依存していた — この pin は「`result` フレーム送出後に dispatcher の
+    thread が終わり、以後に置いた要求が処理されない」ことを実 spool で観測
+    する (`ready`/`go` の送出順序は上のテストが別途固定しており、
+    ここでは触れない)。"""
     monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile",
                         lambda *args, **kwargs: None)
     monkeypatch.chdir(tmp_path)
@@ -1818,10 +1833,8 @@ def test_mcp_dispatcher_socket_is_closed_after_improve_mission_completes(
         settings_mutator=settings_mutator)
 
     assert frames[-1]["type"] == "result"
-    sock_path = tmp_path / "afx.sock"
-    assert not sock_path.exists(), (
-        "Mission 終了後も afx.sock が残っている — dispatcher が close "
-        "されていない (段 0 申し送り 2)")
+    assert len(_FakeLocalRunner.instances) == 1
+    _assert_dispatcher_stopped(_FakeLocalRunner.instances[0], tmp_path)
 
 
 def test_main_fails_closed_when_improve_backend_is_claude_without_bin_key(

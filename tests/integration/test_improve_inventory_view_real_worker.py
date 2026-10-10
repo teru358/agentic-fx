@@ -12,16 +12,16 @@
 引数名・registry 登録の接続ずれはどの層の pin にも映らない (段 0 M2 の
 構造 pin の限界、段 0 6 節末尾)。
 
-**LLM は使わない** — improve worker は `ready` を送る前に MCP dispatcher を
-`workdir/afx.sock` へ同期 bind する (`_start_mcp_dispatcher`) ので、親から
-その socket へ JSON-RPC `tools/call` を直接投げれば registry 経由で tool を
-実行できる。実 llama-swap にも `go` にも触らない。
+**LLM は使わない** — improve worker は `ready` を送る前に MCP の spool
+(`workdir/afx-spool/<nonce>/`) と dispatcher を用意する
+(`_start_mcp_dispatcher`) ので、親からその spool へ JSON-RPC `tools/call`
+を直接置けば registry 経由で tool を実行できる。実 llama-swap にも `go` にも
+触らない。
 """
 from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -46,18 +46,12 @@ _VIEW = {
 }
 
 
-def _rpc(sock_path: Path, payload: dict) -> dict:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-        s.settimeout(15.0)
-        s.connect(str(sock_path))
-        s.sendall((json.dumps(payload) + "\n").encode())
-        buf = b""
-        while not buf.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-    return json.loads(buf.decode())
+def _rpc(workdir: Path, payload: dict) -> dict:
+    from agentic_fx.tools import mcp_spool_client
+
+    spools = list((workdir / "afx-spool").glob("*"))
+    assert len(spools) == 1, spools
+    return mcp_spool_client.call(spools[0], payload, timeout_sec=15.0)
 
 
 def test_real_improve_worker_serves_the_prepare_time_inventory_view(tmp_path):
@@ -66,7 +60,6 @@ def test_real_improve_worker_serves_the_prepare_time_inventory_view(tmp_path):
 
     from agentic_fx.config import load_settings
     from agentic_fx.core.mission_protocol import read_frame, write_frame
-    from agentic_fx.mission_worker import mcp_socket_path
     from tests.conftest import _LLAMA_SWAP_UNREACHABLE_URL
 
     settings = load_settings(_REPO_ROOT / "config" / "settings.yaml.example")
@@ -123,8 +116,7 @@ def test_real_improve_worker_serves_the_prepare_time_inventory_view(tmp_path):
         assert frame["type"] == "ready" and frame.get("ok") is True, (
             f"{frame} stderr={proc.stderr.read(4096) if proc.stderr else ''}")
 
-        sock_path = mcp_socket_path(workdir)
-        resp = _rpc(sock_path, {
+        resp = _rpc(workdir, {
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": {"name": "list_deployed_plugins", "arguments": {}}})
         assert "error" not in resp, resp

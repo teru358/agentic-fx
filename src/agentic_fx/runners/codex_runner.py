@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.cli_runner import CliRunner
+from agentic_fx.runners.cli_runner import CliRunner, require_mcp_spool
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -42,8 +42,10 @@ class CodexRunner(CliRunner):
                          abort_event=abort_event,
                          abort_reason_fn=abort_reason_fn)
 
-    def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
+    def _build_argv(self, mission: Mission, *,
+                    mcp_spool: Path | None) -> list[str]:
         import sys as _sys
+        mcp_spool = require_mcp_spool(mcp_spool)
         schema_path = self._workdir / "schema.json"
         schema_path.write_text(json.dumps(mission.output_schema))
         out_path = self._workdir / "output.txt"
@@ -63,7 +65,7 @@ class CodexRunner(CliRunner):
             "--disable", "apps",
             "-c", f"mcp_servers.afx.command={_sys.executable}",
             "-c", "mcp_servers.afx.args=[\"-m\",\"agentic_fx.tools.mcp_shim\","
-                  f"\"{mcp_socket}\"]",
+                  f"\"{mcp_spool}\"]",
         ]
         argv += ["-m", self._model]
         return argv

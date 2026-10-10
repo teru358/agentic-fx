@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from agentic_fx.runners.base import Mission
-from agentic_fx.runners.cli_runner import CliRunner
+from agentic_fx.runners.cli_runner import CliRunner, require_mcp_spool
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -60,11 +60,13 @@ class ClaudeRunner(CliRunner):
                          abort_event=abort_event,
                          abort_reason_fn=abort_reason_fn)
 
-    def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
+    def _build_argv(self, mission: Mission, *,
+                    mcp_spool: Path | None) -> list[str]:
+        mcp_spool = require_mcp_spool(mcp_spool)
         mcp_config_path = self._workdir / "mcp.json"
         mcp_config = {"mcpServers": {"afx": {
             "command": str(Path(__import__("sys").executable)),
-            "args": ["-m", "agentic_fx.tools.mcp_shim", str(mcp_socket)],
+            "args": ["-m", "agentic_fx.tools.mcp_shim", str(mcp_spool)],
             "env": {}}}}
         mcp_config_path.write_text(json.dumps(mcp_config))
         return [

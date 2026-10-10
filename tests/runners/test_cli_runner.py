@@ -45,7 +45,7 @@ class _FakeCliRunner(CliRunner):
         self._script = script
         super().__init__(**kw)
 
-    def _build_argv(self, mission: Mission, *, mcp_socket: Path) -> list[str]:
+    def _build_argv(self, mission: Mission, *, mcp_spool: Path | None) -> list[str]:
         return [sys.executable, "-c", self._script]
 
     def _build_env(self, mission: Mission) -> dict[str, str]:
@@ -425,11 +425,11 @@ def test_cli_runner_stdin_prompt_default_guards_argv_leak(tmp_path):
     従来どおり argv 渡しのまま)。"""
 
     class _LeakyRunner(_FakeCliRunner):
-        def _build_argv(self, mission, *, mcp_socket):
+        def _build_argv(self, mission, *, mcp_spool):
             return [sys.executable, "-c", self._script, mission.prompt]
 
     class _OptedOutLeakyRunner(_OptOutStdinFakeCliRunner):
-        def _build_argv(self, mission, *, mcp_socket):
+        def _build_argv(self, mission, *, mcp_spool):
             return [sys.executable, "-c", self._script, mission.prompt]
 
     kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
@@ -464,7 +464,7 @@ def test_cli_runner_stdin_prompt_default_guards_argv_leak_partial_match(
     long_prompt = "S" * 40 + "ecret" + "-payload" * 10  # 64 字超の prompt
 
     class _LeakyRunner(_FakeCliRunner):
-        def _build_argv(self, mission, *, mcp_socket):
+        def _build_argv(self, mission, *, mcp_spool):
             return build_leaky_argv(self._script, mission.prompt)
 
     kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,
@@ -480,7 +480,7 @@ def test_cli_runner_stdin_prompt_default_guard_allows_argv_without_prompt(
     部分一致化で偽陽性を作っていないことの pin。"""
 
     class _CleanRunner(_FakeCliRunner):
-        def _build_argv(self, mission, *, mcp_socket):
+        def _build_argv(self, mission, *, mcp_spool):
             return [sys.executable, "-c", self._script, "--flag", "value"]
 
     kw = dict(bin_path=Path(sys.executable), model="m", workdir=tmp_path,

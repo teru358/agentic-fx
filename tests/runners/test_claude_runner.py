@@ -40,6 +40,7 @@ def _runner(tmp_path, *, allowed_tools=None, behavior="success", **over):
               cli_terminate_grace_sec=0.3, registry=ToolRegistry())
     kw.update(over)
     r = ClaudeRunner(**kw)
+    r.mcp_spool_dir = workdir / "afx-spool" / "spool"
     return r, workdir
 
 
@@ -71,9 +72,11 @@ def test_claude_argv_shape(tmp_path):
     値として食われる形) を殺すため、メンバシップではなく隣接値まで pin する。"""
     mission = _mission()
     runner, workdir = _runner(tmp_path)
-    mcp_socket = workdir / "afx.sock"
-    argv = runner._build_argv(mission, mcp_socket=mcp_socket)
+    mcp_spool = workdir / "afx-spool" / "spool"
+    argv = runner._build_argv(mission, mcp_spool=mcp_spool)
     mcp_config_path = workdir / "mcp.json"
+    server = json.loads(mcp_config_path.read_text())["mcpServers"]["afx"]
+    assert server["args"] == ["-m", "agentic_fx.tools.mcp_shim", str(mcp_spool)]
 
     assert argv[0] == str(runner._bin_path)
     assert argv[1] == "-p"
@@ -113,7 +116,7 @@ def test_claude_argv_uses_tools_allowlist_and_excludes_read(tmp_path):
     現れない。"""
     mission = _mission()
     runner, workdir = _runner(tmp_path)
-    argv = runner._build_argv(mission, mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(mission, mcp_spool=workdir / "afx-spool" / "spool")
 
     assert argv.count("--tools") == 1
     assert "--disallowedTools" not in argv
@@ -244,7 +247,7 @@ def test_claude_env_uses_scratch_home_and_config_dir(tmp_path):
 def test_claude_trade_profile_allowed_tools_excludes_bash(tmp_path):
     """§1.6: trade + claude は `mcp__afx__*` のみ。`Bash`/`Write` を含まない。"""
     runner, workdir = _runner(tmp_path, allowed_tools=["mcp__afx__*"])
-    argv = runner._build_argv(_mission(), mcp_socket=workdir / "afx.sock")
+    argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     idx = argv.index("--allowedTools")
     allowed = argv[idx + 1]
     assert "Bash" not in allowed
@@ -289,3 +292,13 @@ def test_claude_reason_does_not_leak_stderr_body(tmp_path):
     runner, workdir = _runner(tmp_path, behavior="nonzero_exit")
     result = runner.run(_mission())
     assert len(result.reason) <= 500
+
+
+def test_claude_refuses_to_start_without_mcp_spool(tmp_path):
+    """MCP の spool directory が渡されていなければ CLI を起動しない
+    (tool 0 個で走らせない)。"""
+    runner, workdir = _runner(tmp_path)
+    runner.mcp_spool_dir = None
+    with pytest.raises(RuntimeError, match="MCP spool"):
+        runner.run(_mission())
+    assert not (workdir / "mcp.json").exists()
