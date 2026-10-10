@@ -1,0 +1,440 @@
+{
+ "contract": "afx ctl が鍵 (Authorization) を送る前に行う server 認証。判定順は 親 dir (lstat: dir・所有者・0700) → socket (lstat: socket・所有者) → 接続 → SO_PEERCRED uid → SO_PEERPIDFD (ESRCH は拒否、無ければ省略) → /proc/locks の FLOCK WRITE 保持者が {peer pid} と一致 → 保持者の生存",
+ "expect_fields": {
+  "decision": "allow = 鍵を送る / reject = 鍵を送らない",
+  "rc": "afx ctl whoami の終了コード (allow は偽 daemon が成功応答を返すので 0、reject は 3)",
+  "reason": "reject のとき stderr に出る固定語 (client.ServerAuthError.reason)",
+  "key_sent": "偽 daemon が Authorization を受信したか",
+  "pre_auth_bytes": "reject のとき、偽 daemon が受信した bytes の合計 (接続しない場合も 0)"
+ },
+ "setup_fields": {
+  "socket": "socket | regular_file | symlink_to_socket | socket_of_other_uid",
+  "dir": "real | symlink (data/run の実体)",
+  "dir_mode": "data/run の mode",
+  "client_uid": "self | other (client が期待する uid)",
+  "server_lock": "held | none | other_process | replaced_inode | multiple",
+  "server_process": "alive | exited_after_listen | other_uid",
+  "pidfd": "(省略時は kernel のまま) unsupported | esrch | pid_mismatch",
+  "proc_locks": "(省略時は読める) unreadable",
+  "filesystem": "(省略時は dev 一致) dev_mismatch"
+ },
+ "cases": [
+  {
+   "id": "baseline_lock_holder",
+   "axis": "保持者照合 (一致)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "allow",
+    "rc": 0,
+    "reason": null,
+    "key_sent": true
+   }
+  },
+  {
+   "id": "socket_is_regular_file",
+   "axis": "socket 型",
+   "setup": {
+    "socket": "regular_file",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_file",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   }
+  },
+  {
+   "id": "socket_path_is_symlink",
+   "axis": "symlink (socket)",
+   "setup": {
+    "socket": "symlink_to_socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_file",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "symlink 先は lock 保持者の本物の socket。lstat で socket でないと判定する"
+  },
+  {
+   "id": "parent_dir_mode_0755",
+   "axis": "親 dir mode",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0755",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_dir",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   }
+  },
+  {
+   "id": "parent_dir_mode_0750",
+   "axis": "親 dir mode",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0750",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_dir",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   }
+  },
+  {
+   "id": "parent_dir_is_symlink",
+   "axis": "symlink (親 dir)",
+   "setup": {
+    "socket": "socket",
+    "dir": "symlink",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_dir",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "data/run が 0700 の dir への symlink"
+  },
+  {
+   "id": "owner_differs_from_client_uid",
+   "axis": "親 dir 所有者 / socket 所有者",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "other",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_dir",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "client が期待する uid を変えて同じ判定を通す。親 dir が先に検査されるので reason は socket_dir"
+  },
+  {
+   "id": "lock_held_by_another_process",
+   "axis": "保持者照合 (不一致)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "other_process",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "not_lock_holder",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   }
+  },
+  {
+   "id": "lock_not_held",
+   "axis": "保持者照合 (保持者なし)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "none",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "not_lock_holder",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   }
+  },
+  {
+   "id": "lock_inode_replaced",
+   "axis": "保持者照合 (lock file の inode 交換)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "replaced_inode",
+    "server_process": "alive"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "not_lock_holder",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "server が lock を取った後、data/instance.lock を別 inode の file で置き換える"
+  },
+  {
+   "id": "peer_exited_after_listen",
+   "axis": "pidfd の pid 照合 (peer exit 済み) / 保持者生存",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "exited_after_listen"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "peer_gone",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "listen と lock 取得をした process が exit・回収済みで、fork した子が accept する。SO_PEERCRED の pid と lock 保持者はどちらも exit した process。pidfd を取れる kernel では保持者生存より先に pidfd で拒否する (kernel により ESRCH か Pid:-1 の pidfd、どちらも peer_gone)。7.0 系の実測は Pid:-1"
+  },
+  {
+   "id": "peer_pidfd_esrch",
+   "axis": "pidfd ESRCH",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "exited_after_listen",
+    "pidfd": "esrch"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "peer_gone",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "試験 kernel (7.0 系) は exit 済み peer にも Pid:-1 の pidfd を返し ESRCH を返さない。ESRCH を返す kernel では peer_exited_after_listen がこの経路を通る"
+  },
+  {
+   "id": "socket_owner_differs_only",
+   "axis": "socket 所有者",
+   "setup": {
+    "socket": "socket_of_other_uid",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "socket_file",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "親 dir は自分・socket だけ別 uid の所有は root なしでは作れない"
+  },
+  {
+   "id": "peer_uid_differs",
+   "axis": "SO_PEERCRED uid",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "other_uid"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "peer_uid",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "別 uid の peer は root なしでは作れない。verify_peer 単体の期待 uid 変更で別に確かめている"
+  },
+  {
+   "id": "pidfd_unavailable_holder_alive",
+   "axis": "pidfd 無し",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive",
+    "pidfd": "unsupported"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "allow",
+    "rc": 0,
+    "reason": null,
+    "key_sent": true
+   },
+   "unrealizable_because": "SO_PEERPIDFD の無い kernel が要る (kernel の応答はモックしない)"
+  },
+  {
+   "id": "pidfd_unavailable_holder_dead",
+   "axis": "pidfd 無し / 保持者生存",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "exited_after_listen",
+    "pidfd": "unsupported"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "holder_gone",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "SO_PEERPIDFD の無い kernel が要る (kernel の応答はモックしない)"
+  },
+  {
+   "id": "pidfd_pid_mismatch",
+   "axis": "pidfd の pid 照合",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive",
+    "pidfd": "pid_mismatch"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "peer_gone",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "pidfd の Pid と SO_PEERCRED の pid の食い違いは pid の再利用競合が要り、決定的に作れない"
+  },
+  {
+   "id": "multiple_lock_holders",
+   "axis": "保持者照合 (複数)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "multiple",
+    "server_process": "alive"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "not_lock_holder",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "排他 flock は 1 inode に保持者 1 つ。/proc/locks の解析単体で別に確かめている"
+  },
+  {
+   "id": "proc_locks_unreadable",
+   "axis": "/proc/locks 不可",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive",
+    "proc_locks": "unreadable"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "not_lock_holder",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "unrealizable_because": "/proc/locks を読めなくするには mount namespace か root が要る"
+  },
+  {
+   "id": "dev_mismatch_readlink_fallback",
+   "axis": "dev 不一致時の readlink fallback",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "alive",
+    "filesystem": "dev_mismatch"
+   },
+   "realizable": false,
+   "expect": {
+    "decision": "allow",
+    "rc": 0,
+    "reason": null,
+    "key_sent": true
+   },
+   "unrealizable_because": "stat と /proc/locks の dev が食い違う btrfs / overlayfs 等の上でだけ起きる (試験環境の tmp は一致する)"
+  }
+ ]
+}
