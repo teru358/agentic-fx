@@ -1,8 +1,7 @@
 """AC-13: 第三者 oracle を afx-ops の verifier へ別 process で与える。
 
 harness 自身の検査 (組み立て・fake daemon・probe の出力形式) と、oracle ケース本体。
-oracle ケース本体は verifier が未実装の間は期待と一致しないので xfail(strict) で置き、
-verifier を実装した task がこの印を外す。
+oracle ケース本体は realizable な全ケースで期待と一致すること。
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ from _oracle_harness import (TOKEN, build, flock_write_holders, load_cases, no_c
 
 CASES = load_cases()
 REALIZABLE = [c for c in CASES if c["realizable"]]
-BASELINE = next(c for c in CASES if c["id"] == "baseline_lock_holder")
+LOCK_NOT_HELD = next(c for c in CASES if c["id"] == "lock_not_held")
 
 
 def _connect_and_send(path: Path, payload: bytes = b"GET / HTTP/1.1\r\n\r\n") -> bytes:
@@ -126,8 +125,8 @@ def _check_built(case: dict, built) -> None:
     holders = flock_write_holders(lock) if lock.exists() else set()
     kind = setup["server_lock"]
     if kind == "held":
-        expected = built.daemon_parent_pid if setup["server_process"] == "exited_after_listen" \
-            else built.daemon_pid
+        expected = built.daemon_parent_pid if setup["server_process"] in (
+            "exited_after_listen", "zombie_after_listen") else built.daemon_pid
         assert holders == {expected}
     elif kind == "none":
         assert holders == set()
@@ -144,6 +143,10 @@ def _check_built(case: dict, built) -> None:
         raise AssertionError(f"組み立てを検算できない server_lock: {kind}")
     if setup["server_process"] == "exited_after_listen":
         assert not os.path.isdir(f"/proc/{built.daemon_parent_pid}")
+        assert os.path.isdir(f"/proc/{built.daemon_pid}")
+    elif setup["server_process"] == "zombie_after_listen":
+        stat_text = Path(f"/proc/{built.daemon_parent_pid}/stat").read_text()
+        assert stat_text.rsplit(") ", 1)[1][0] == "Z"
         assert os.path.isdir(f"/proc/{built.daemon_pid}")
     else:
         assert os.path.isdir(f"/proc/{built.daemon_pid}")
@@ -164,16 +167,16 @@ def test_the_realizable_cases_cover_every_buildable_axis_value():
     assert seen["dir_mode"] == {"0700", "0755", "0750"}
     assert seen["client_uid"] == {"self", "other"}
     assert seen["server_lock"] == {"held", "none", "other_process", "replaced_inode"}
-    assert seen["server_process"] == {"alive", "exited_after_listen"}
+    assert seen["server_process"] == {"alive", "exited_after_listen", "zombie_after_listen"}
 
 
 def test_probe_prints_rc_and_reason_line(tmp_path, child_env):
-    with build(BASELINE["setup"], tmp_path) as built:
+    with build(LOCK_NOT_HELD["setup"], tmp_path) as built:
         done = run_probe(built, child_env)
-        assert done.stdout == "rc=3 reason=peer_check\n"
+        assert done.stdout == "rc=3 reason=not_lock_holder\n"
         assert done.returncode == 3
         assert done.stderr == ""
-        assert received(built.record, expect_any=False) == []
+        assert sum(map(len, received(built.record, expect_any=False))) == 0
 
 
 # ------------------------------------------------ oracle ケース本体
@@ -182,8 +185,7 @@ def _param(case: dict):
     if not case["realizable"]:
         return pytest.param(case, id=case["id"],
                             marks=pytest.mark.skip(reason=case["unrealizable_because"]))
-    return pytest.param(case, id=case["id"], marks=pytest.mark.xfail(
-        strict=True, raises=AssertionError, reason="verifier 未実装"))
+    return pytest.param(case, id=case["id"])
 
 
 @pytest.mark.parametrize("case", [_param(c) for c in CASES])

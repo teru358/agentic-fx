@@ -13,7 +13,7 @@
   "dir_mode": "data/run の mode",
   "client_uid": "self | other (client が期待する uid)",
   "server_lock": "held | none | other_process | replaced_inode | multiple",
-  "server_process": "alive | exited_after_listen | other_uid",
+  "server_process": "alive | exited_after_listen | zombie_after_listen | other_uid",
   "pidfd": "(省略時は kernel のまま) unsupported | esrch | pid_mismatch",
   "proc_locks": "(省略時は読める) unreadable",
   "filesystem": "(省略時は dev 一致) dev_mismatch"
@@ -242,6 +242,27 @@
     "pre_auth_bytes": 0
    },
    "note": "listen と lock 取得をした process が exit・回収済みで、fork した子が accept する。SO_PEERCRED の pid と lock 保持者はどちらも exit した process。pidfd を取れる kernel では保持者生存より先に pidfd で拒否する (kernel により ESRCH か Pid:-1 の pidfd、どちらも peer_gone)。7.0 系の実測は Pid:-1"
+  },
+  {
+   "id": "peer_zombie_after_listen",
+   "axis": "保持者生存 (listen した process が zombie、子が accept)",
+   "setup": {
+    "socket": "socket",
+    "dir": "real",
+    "dir_mode": "0700",
+    "client_uid": "self",
+    "server_lock": "held",
+    "server_process": "zombie_after_listen"
+   },
+   "realizable": true,
+   "expect": {
+    "decision": "reject",
+    "rc": 3,
+    "reason": "holder_gone",
+    "key_sent": false,
+    "pre_auth_bytes": 0
+   },
+   "note": "listen と lock 取得をした process が exit したが親に回収されず zombie のまま残り、fork した子が accept する。SO_PEERCRED の pid と lock 保持者はどちらも zombie の親で、/proc/<pid> は存在する。pidfd を取れる環境では pidfd の POLLIN (zombie を含む) で保持者の終了を見て拒否する"
   },
   {
    "id": "peer_pidfd_esrch",

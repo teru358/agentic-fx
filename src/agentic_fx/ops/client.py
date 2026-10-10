@@ -16,6 +16,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import select
 import socket
 import stat
 import struct
@@ -251,6 +252,14 @@ def _pidfd_pid(pidfd: int) -> int | None:
     return None
 
 
+def _pidfd_exited(pidfd: int) -> bool:
+    """pidfd が POLLIN (相手が終了済み。zombie を含む) なら True。"""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return any(mask & (select.POLLIN | select.POLLHUP | select.POLLERR)
+               for _fd, mask in poller.poll(0))
+
+
 def verify_peer(sock: socket.socket, *, uid: int, lock_path: Path,
                 proc_locks: Path = Path("/proc/locks")) -> int:
     """接続済み socket の相手が、同 uid で instance lock を持つ生きた process か確かめる。"""
@@ -268,22 +277,27 @@ def verify_peer(sock: socket.socket, *, uid: int, lock_path: Path,
         if exc.errno == errno.ESRCH:
             raise ServerAuthError("peer_gone") from None
         pidfd = None
-    if pidfd is not None:
-        try:
+    try:
+        if pidfd is not None:
             try:
                 pidfd_pid = _pidfd_pid(pidfd)
             except OSError:
                 raise ServerAuthError("peer_check") from None
             if pidfd_pid != pid:
                 raise ServerAuthError("peer_gone")
-        finally:
+        # 保持者を一意に確定できなければ送らない (弱い pid file には落とさない)。
+        if lock_holders(lock_path, proc_locks=proc_locks) != {pid}:
+            raise ServerAuthError("not_lock_holder")
+        # 保持者 (= peer) の生存。pidfd があれば poll で見る (zombie も終了とみなせる)。
+        # 無ければ /proc/<pid> の存在で見る。
+        if pidfd is not None:
+            if _pidfd_exited(pidfd):
+                raise ServerAuthError("holder_gone")
+        elif not os.path.isdir(f"/proc/{pid}"):
+            raise ServerAuthError("holder_gone")
+    finally:
+        if pidfd is not None:
             os.close(pidfd)
-    # 保持者を一意に確定できなければ送らない (弱い pid file には落とさない)。
-    if lock_holders(lock_path, proc_locks=proc_locks) != {pid}:
-        raise ServerAuthError("not_lock_holder")
-    # /proc/locks の pid は取得した process。生きていることも確かめる。
-    if not os.path.isdir(f"/proc/{pid}"):
-        raise ServerAuthError("holder_gone")
     return pid
 
 

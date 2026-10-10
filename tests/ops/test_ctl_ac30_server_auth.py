@@ -187,7 +187,7 @@ def _no_core() -> None:
 
 
 def _start_oracle_server(socket_path: Path, record: Path, *, lock_dir: Path | None,
-                         orphan: bool) -> tuple[subprocess.Popen, int]:
+                         orphan: bool, reap: bool = True) -> tuple[subprocess.Popen, int]:
     args = [sys.executable, str(ORACLE_SERVER), str(socket_path), str(record),
             str(lock_dir) if lock_dir is not None else "-", "answer"]
     if orphan:
@@ -195,10 +195,26 @@ def _start_oracle_server(socket_path: Path, record: Path, *, lock_dir: Path | No
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, preexec_fn=_no_core)
     word, pid = proc.stdout.readline().split()
     assert word == "ready"
-    if orphan:
+    if orphan and reap:
         # listen した親を回収し、peer の pid を「存在しない」にする。
         assert proc.wait(10) == 0
+    elif orphan:
+        # 回収しない: 親は exit 済みの zombie のまま残り、/proc/<pid> は存在する。
+        _wait_zombie(proc.pid)
     return proc, int(pid)
+
+
+def _wait_zombie(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0]
+        except OSError:
+            state = ""
+        if state == "Z":
+            return
+        time.sleep(0.02)
+    raise AssertionError("listen した process が zombie にならなかった")
 
 
 def _received(record: Path, *, expect_any: bool) -> list[bytes]:
@@ -243,7 +259,9 @@ def test_server_auth_oracle_case(ops_env, tmp_path, case):
             lock_dir = data if setup["server_lock"] in ("held", "replaced_inode") else None
             proc, server_pid = _start_oracle_server(
                 socket_path, record, lock_dir=lock_dir,
-                orphan=setup["server_process"] == "exited_after_listen")
+                orphan=setup["server_process"] in ("exited_after_listen",
+                                                   "zombie_after_listen"),
+                reap=setup["server_process"] != "zombie_after_listen")
             if setup["server_lock"] == "replaced_inode":
                 fresh = data / "instance.lock.fresh"
                 fresh.write_text("")

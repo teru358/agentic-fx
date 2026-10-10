@@ -49,9 +49,26 @@ class Built:
     extra: dict = field(default_factory=dict)
 
 
+def wait_zombie(pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1][0]
+        except OSError:
+            state = ""
+        if state == "Z":
+            return
+        time.sleep(0.02)
+    raise AssertionError("listen した process が zombie にならなかった")
+
+
 def start_daemon(socket_path: Path, record: Path, *, lock_dir: Path | None, orphan: bool,
-                 mode: str = "answer") -> tuple[subprocess.Popen, int, int]:
-    """(Popen, 受け付ける pid, listen した pid)。orphan は親を回収してから返す。"""
+                 mode: str = "answer", reap: bool = True) -> tuple[subprocess.Popen, int, int]:
+    """(Popen, 受け付ける pid, listen した pid)。
+
+    orphan は親を回収してから返す。reap=False なら回収せず、親が zombie になるのを
+    待って返す (/proc/<親 pid> は残る)。
+    """
     args = [sys.executable, str(DAEMON), str(socket_path), str(record),
             str(lock_dir) if lock_dir is not None else "-", mode]
     if orphan:
@@ -59,8 +76,10 @@ def start_daemon(socket_path: Path, record: Path, *, lock_dir: Path | None, orph
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, preexec_fn=no_core)
     word, serve_pid, listen_pid = proc.stdout.readline().split()
     assert word == "ready"
-    if orphan:
+    if orphan and reap:
         assert proc.wait(10) == 0
+    elif orphan:
+        wait_zombie(proc.pid)
     return proc, int(serve_pid), int(listen_pid)
 
 
@@ -117,7 +136,9 @@ def build(setup: dict, tmp: Path, *, mode: str = "answer"):
             lock_dir = data if setup["server_lock"] in ("held", "replaced_inode") else None
             proc, built.daemon_pid, built.daemon_parent_pid = start_daemon(
                 bound, built.record, lock_dir=lock_dir, mode=mode,
-                orphan=setup["server_process"] == "exited_after_listen")
+                orphan=setup["server_process"] in ("exited_after_listen",
+                                                   "zombie_after_listen"),
+                reap=setup["server_process"] != "zombie_after_listen")
             built.bound_path = bound
             if setup["server_lock"] == "replaced_inode":
                 fresh = data / "instance.lock.fresh"

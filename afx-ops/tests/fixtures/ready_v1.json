@@ -1,0 +1,15 @@
+{
+ "principals": {
+  "approver": {
+   "generation": 1,
+   "sha256": "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+   "state": "active"
+  },
+  "operator": {
+   "generation": 1,
+   "sha256": "2b2858dbb4c85c8e7e6de337295549a6a4553950919765750f09815096b99f2f",
+   "state": "active"
+  }
+ },
+ "version": 1
+}
