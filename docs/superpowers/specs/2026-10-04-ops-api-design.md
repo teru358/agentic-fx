@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.14
+# [ops-api] 操作 API と client 契約設計 v1.15
 
-版: v1.14
+版: v1.15
 
 日付: 2026-10-05
 
@@ -369,6 +369,8 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 - 変異対象は scope 表、`authenticated_principal` / `asserted_actor` 分離と actor header 形式・job 所有照合、server 認証、digest の二地点照合、kind 二地点検査、世代 CAS 呼出し、2 レーン、全待機 deadline、停止順序、append-only 監査、全変更要求の accepted-only 回復、冪等状態遷移、policy 再生成、`.ready` manifest v1 / v2 commit、enroll / rotate / revoke、dotenv 非副作用、legacy corridor 拒否、event 固定 schema / 永続化後の冪等配送 / best-effort 生成、表示 sanitizer とする。
 - 性能閾値は稼働中相当 CPU 負荷でも測る。bless の合成履歴 33,984 本では indicator 約 1.3〜1.4 秒、strategy 約 27〜29 秒だったが、API approve は gate を再実行しない。長い待ちの理由は外部 process の plugin flock である。
 
+- server 認証 (§2) の判定は機械可読の oracle `tests/ops/fixtures/server_auth_oracle.json` に列挙する (検査順、各軸の設定、期待 = allow / reject・rc・reason・鍵送信前の受信 byte 数)。本体 client と afx-ops client は同じ oracle を black-box で通す (afx-ops spec AC-13)。この host で作れない行 (別 uid、pidfd 非対応 kernel、btrfs 等) は理由付き skip で残す。
+
 ## 13. 実装 task
 
 |task|範囲|所有ファイル|依存|完了条件|並列|
@@ -429,3 +431,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-09|v1.12|§7.1 に events の cursor (保存位置、`--after` は閲覧専用、high watermark 後退時の復旧) と決定結果の表示・引数範囲を追記|CLI 実装で決めた挙動が spec に無く、運用文書だけに書かれていた||
 |2026-10-09|v1.13|afx-ops spec v1.0 §2 の変更要求を反映。manifest v2 / enroll、新 principal の scope、`X-Afx-Asserted-Actor` と監査・job 所有契約、AC-54〜57 を追加|
 |2026-10-10|v1.14|§3.2 準備状態の検査は鍵集合全体 (別 principal の残骸の上でも別 command は invalid_state)|T1 実装で fail closed 側に揃えた裁定を文言化||
+|2026-10-10|v1.15|§12 に server 認証の oracle fixture (tests/ops/fixtures/server_auth_oracle.json) を記載|afx-ops T1 実装 (AC-13 の black-box oracle)||
