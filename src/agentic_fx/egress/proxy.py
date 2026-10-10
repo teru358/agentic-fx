@@ -146,6 +146,7 @@ class ConnectProxy:
         total_timeout: float = TOTAL_TIMEOUT_SEC,
         connector: Connector = connect_fixed,
         on_tunnel_closed: TunnelObserver | None = None,
+        on_stopping: Callable[[], None] | None = None,
     ) -> None:
         self._listener = listener
         self._resolver = resolver
@@ -156,6 +157,7 @@ class ConnectProxy:
         self._total_timeout = total_timeout
         self._connector = connector
         self._on_tunnel_closed = on_tunnel_closed
+        self._on_stopping = on_stopping
         self._port = listener.getsockname()[1]
         self._lock = threading.Lock()
         self._tunnels: set[Tunnel] = set()
@@ -202,6 +204,12 @@ class ConnectProxy:
                 return True
             self._stopping = True
             tunnels = list(self._tunnels)
+        if self._on_stopping is not None:
+            # 判定側 (同期 handoff) に停止を知らせる。以後の ack は立たず、待ちは解放される
+            try:
+                self._on_stopping()
+            except Exception:  # noqa: BLE001 - 通知の失敗で停止を止めない
+                pass
         os.eventfd_write(self._stop_fd, 1)
         try:
             self._listener.close()
@@ -286,6 +294,14 @@ class ConnectProxy:
             return self._stopping
 
     def _on_accepted(self, conn: socket.socket, accepted_at: float) -> None:
+        """停止中に accept した接続は判定にも入らず閉じる。
+
+        停止後に ack を立てない保証は判定側 (ack を立てる直前の、begin_stop と同じ lock の中の
+        検査) が持つ。ここの検査は保証ではなく、停止中の接続に netlink の lookup を使わない
+        ための早期の拒否。"""
+        if self._is_stopping():
+            conn.close()
+            return
         # 判定は上限より先に行う。supervisor を経ない接続には 503 も含めて何も返さない
         try:
             admitted = self._admit(conn) is True

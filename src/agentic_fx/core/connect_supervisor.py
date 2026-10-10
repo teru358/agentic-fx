@@ -36,7 +36,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from agentic_fx.core import cli_launch_protocol as P
 
@@ -243,20 +243,28 @@ def destinations_for(backend: str, proxy_port: int) -> Destinations:
     return Destinations(proxy_port, OPENCODE_UPSTREAM_PORT if backend == "opencode" else None)
 
 
+class PendingToken:
+    """`ProxyHandoff.add_pending` が返す値の基底。supervisor は中身を見ず、そのまま
+    `wait_ack` / `remove_pending` に渡す。"""
+
+    __slots__ = ()
+
+
 class ProxyHandoff(Protocol):
     """proxy 宛 connect の同期 handoff の差し込み口。
 
-    - `add_pending(dup_fd)` は commit の lock の中で呼ばれ、pending entry を返す。
+    - `add_pending(dup_fd)` は commit の lock の中で呼ばれ、pending entry を必ず返す
+      (使えない entry でもよい。作れなければ例外で、handler の fault 経路に入る)。
     - `wait_ack(entry, client, deadline)` は connect が 0 / EINPROGRESS のとき、
       複製の `getsockname` を添えて呼ばれ、proxy が同じ client tuple を照合して ack
       を立てたら真。deadline は monotonic の絶対時刻。
     - `remove_pending(entry)` は lock の中で、応答の後に呼ばれる。"""
 
-    def add_pending(self, dup_fd: int) -> object: ...
+    def add_pending(self, dup_fd: int) -> PendingToken: ...
 
-    def wait_ack(self, entry: object, client: tuple[str, int], deadline: float) -> bool: ...
+    def wait_ack(self, entry: PendingToken, client: tuple[str, int], deadline: float) -> bool: ...
 
-    def remove_pending(self, entry: object) -> None: ...
+    def remove_pending(self, entry: PendingToken) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -781,7 +789,7 @@ class ConnectSupervisor:
             began = self._started.get(notif.id, time.monotonic())
         pidfd = -1
         dup = -1
-        entry: object | None = None
+        entry: Any = None  # add_pending の返り値。契約違反で None でも wait_ack に渡す
         proxy = self._proxy
         try:
             # 段 2
@@ -876,7 +884,7 @@ class ConnectSupervisor:
                 self._reply(notif, rec, 11, -_errno.EPERM)
                 return
             # 段 11b
-            if entry is not None and proxy is not None and rc in (0, -_errno.EINPROGRESS):
+            if kind == "proxy" and proxy is not None and rc in (0, -_errno.EINPROGRESS):
                 ok = False
                 starved = False
                 late = False
@@ -898,6 +906,7 @@ class ConnectSupervisor:
                             late = True
                             rec["reason"] = CONNECT_TIMEOUT
                         else:
+                            # entry が空 (差し込み口の契約違反) でも待ちを通し、偽なら拒否にする
                             ok = proxy.wait_ack(entry, client, ack_end)
                 finally:
                     if not ok:
