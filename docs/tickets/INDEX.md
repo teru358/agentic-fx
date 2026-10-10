@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 124 件。完了分は closed/。
+未完了: 126 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -39,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (103)
+## 設計待ち (105)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -117,6 +117,8 @@
 | [activity-log-grows-without-rotation](open/activity-log-grows-without-rotation.md) | 低 | 2026-10-04 | activity ログが無期限に伸びる |
 | [gate-pytest-worker-dev-dir-rw](open/gate-pytest-worker-dev-dir-rw.md) | 低 | 2026-10-09 | gate pytest worker が /dev をディレクトリ単位 read_write で許している |
 | [ops-keys-orphan-secret-temp-after-hard-crash](open/ops-keys-orphan-secret-temp-after-hard-crash.md) | 低 | 2026-10-09 | 鍵 rotate が key:written 直後に強制停止されると平文の一時 file が鍵 dir に残る |
+| [cli-launch-malformed-frames-order-dependent](open/cli-launch-malformed-frames-order-dependent.md) | 低 | 2026-10-10 | cli_launch の malformed frame 試験が実行順に依存 |
+| [ops-ac25-decision-lane-test-race](open/ops-ac25-decision-lane-test-race.md) | 低 | 2026-10-10 | ops ac25 決定レーン試験が順序窓で不安定 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
