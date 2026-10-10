@@ -1,6 +1,6 @@
-# [afx-ops] operations surface の分離と自己隔離 v1.1
+# [afx-ops] operations surface の分離と自己隔離 v1.2
 
-版: v1.1
+版: v1.2
 
 日付: 2026-10-10
 
@@ -76,7 +76,7 @@ bot 再起動時は gateway 接続前に既存 message の View を再登録し�
 
 web は損益、成績、稼働状態、承認一覧・詳細だけを表示する。HTTP 要求から変更 API を作る route、フォーム、バックグラウンド処理は作らない。web principal にその scope が無いため、侵害されても bot の決定権と `local_guard` に届かない。
 
-隔離前に `127.0.0.1` の socket を bind + listen し、`SO_TYPE`、`SO_ACCEPTCONN`、`getsockname()` の loopback address と想定 port、close-on-exec を検査する。この時点では accept を呼ばず、接続は backlog に溜めるだけとする。Landlock、seccomp、`PR_SET_DUMPABLE=0`、fd 閉鎖の自己検査が完了した後、trace で固定した `accept4` 又は `accept` による自前 accept loop で受け、accepted socket を `loop.connect_accepted_socket` で aiohttp の `web.Server` protocol へ渡す。`create_server` と `SockSite` は listener に `listen` を再実行するため使わない。隔離前に到着した接続も隔離後に初めて処理される。
+隔離前に `127.0.0.1` の socket を bind + listen し、`SO_TYPE`、`SO_ACCEPTCONN`、`getsockname()` の loopback address と想定 port、close-on-exec を検査する。この時点では accept を呼ばず、接続は backlog に溜めるだけとする。Landlock、seccomp、`PR_SET_DUMPABLE=0`、fd 閉鎖の自己検査が完了した後、trace で固定した `accept4` 又は `accept` による自前 accept loop で受け、accepted socket を `loop.connect_accepted_socket` で aiohttp の `web.Server` protocol へ渡す。`create_server` と `SockSite` は listener に `listen` を再実行するため使わない。隔離前に到着した接続も隔離後に初めて処理される。accept の `EMFILE` / `ENFILE` は 50 ms 間隔で再試行し、連続 200 回で listener を閉じ、固定 reason `accept_exhausted` (終了コード 72) で終了する (systemd が再起動する)。
 
 UI 認証は初版から必須である。API 鍵とは分離した cookie session secret を `afx ops` が初回に生成して表示し、`ops-web` 領域にだけ保管する。127.0.0.1 限定の password entry から短命 session cookie を発行し、`HttpOnly`、`SameSite=Strict`、loopback HTTP では `Secure` を付けられないこと、Host / Origin 検査、rotation、失効を設定 schema で一意にする。bearer secret は初版候補に含めない。
 
@@ -98,7 +98,7 @@ enroll は §2 の v1.13 manifest 遷移にだけ従い、online enroll は行�
 
 Landlock は pathname UDS への `connect` を仲介せず、path 指定の接続は Landlock 下でも通る。`lstat` / `stat` の metadata 読取りも Landlock の対象外である。このため、隔離後も socket path に connect し、既存の server 認証をその接続ごとに行う。保持した UDS 親 directory fd や instance lock fd、`openat` / `connectat` による接続は用いない。socket activation も採用しない。本体は ops を spawn せず、UDS server を本体自身が作る契約だからである。
 
-鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。
+鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。配置の検査は次のとおりとする。config dir は 0755 または 0750 (他者書込み不可、group 書込みも不可)、state dir は 0700 で ops が隔離前に作る、secret dir は 0700、secret file は 0600 とし、secret は bot = `discord.token`、notify = `webhook.url`、web は持たない。既存 dir は親から `O_NOFOLLOW` で開いて fstat で検査し、symlink・他 uid・緩い mode は固定 reason `config_dir_invalid` / `state_dir_invalid` で隔離前に止まる。Landlock 規則は検査した fd から作る。
 
 Landlock には自分の鍵・設定・状態、必要ランタイム、機能に必要な外向き通信だけを許す。server 認証の `/proc` 規則は `/proc/locks` の leaf file に対する `READ_FILE` と、起動時に `os.getpid()` で解決した自己 `/proc/<ops-pid>` directory に対する `READ_FILE` と `READ_DIR` だけとする。`/proc/self` symlink は使わない。後者は `SO_PEERPIDFD` の fdinfo を読み pid を照合するためだけに使う。`/proc` 全体、他 pid の directory、`/proc/<peer-pid>/fd` は許可しない。同 uid の別 process の `environ` 等を侵害 process に読ませないためである。
 
@@ -110,6 +110,8 @@ Landlock には自分の鍵・設定・状態、必要ランタイム、機能�
 4. pidfd は接続を所有する要求 object が取得から要求終了まで保持する。所有者は token 送信直前と要求中に `poll` し、`POLLIN` を peer exit として失敗にする。reply 完了又は接続を閉じる例外処理で、所有者だけが pidfd を一回 close する。`/proc/<peer-pid>` は読まない。
 
 前段 admission 又は共有 server 認証のいずれかを確定できなければ token は一 byte も送らない。本体再起動で lock inode が変われば、新 path を stat して新しい server と再認証する。認証不能なら終了し、systemd の restart で新 process が隔離前からやり直す。
+
+pidfd と lock の判定は次の固定規則に従う。`/proc/locks` の行は (装置番号, inode) で同定し、装置が違う同 inode の行は別 file として無視する。pidfd の errno は ESRCH / ENODATA を `peer_gone`、EMFILE / ENFILE / ENOBUFS / ENOMEM を `pidfd_transient` (readiness 待ちは再試行する)、それ以外を `ops_requires_so_peerpidfd` に分類する。UDS connect は `SO_SNDTIMEO` で上限を置き、`timeout` は再試行しない。EACCES / ENOTSOCK 等は `socket_unusable` で即失敗する。
 
 ### 5.2 seccomp
 
@@ -136,14 +138,16 @@ DNS は宛先 address と port を seccomp で判定しないため、bot / noti
 |stage|処理|失敗時の durable 遷移と再開先|
 |---|---|---|
 |`staged`|設定、機能別 secret、UI secret、token 形式、unit 資材、鍵 directory を検証する (外部変更なし)|外部変更なしで `staged`。修正後に同段を再実行する|
-|`stopped`|marker `enroll_in_progress` を durable に置き (feature と開始時刻を書く)、`systemctl --user stop afx.service` して `ActiveState=inactive` 又は `failed` を確認し、afx と同じ instance flock を取得できることを確認する|停止できなければ `staged` (marker は残し、同じ enable の再実行が回収する)。既に停止済みなら停止は no-op で次段へ進む|
+|`stopped`|marker `enroll_in_progress` を durable に置き (feature と開始時刻を書く)、`systemctl --user stop afx.service` して `ActiveState=inactive` 又は `failed` を確認し、afx と同じ instance flock を取得できることを確認する。`afx_before_stop` (停止前の afx の状態) は最初の marker 設置より前に stage file へ記録し、再実行で上書きしない。`enrolled` 以降の再実行は afx を止めない (enroll 後は停止不要)|停止できなければ `staged` (marker は残し、同じ enable の再実行が回収する)。既に停止済みなら停止は no-op で次段へ進む|
 |`enrolled`|instance flock を保持したまま、未登録 principal だけを enroll する。enroll commit 後に flock を解放し、marker を削除して `enrolled` を commit する|`preparing(op=enroll)` は同じ command の再実行で完結する。active principal への enroll は無変更成功。enroll commit 後の crash は marker 削除から続けて `enrolled` として再開する|
 |`installed`|unit、設定、`Wants=` を設置する。`Wants=` による先行 pull-in 済みの ops を許容する|installing 失敗では対象 unit と未完了 artifact を除去して `enrolled` へ戻す。鍵は残す。次回は `enrolled` から設置をやり直して `installed` へ進む|
-|`started`|afx を起動し API を開き、対象 ops が既に pull-in されていても idempotent に ensure-active する|起動不能は `installed` に留める。unit と鍵は残し、同じ enable は `started` の到達を再試行する|
+|`started`|停止前の afx が active (activating / reloading 含む) だったときだけ afx を start し API を開く。対象 ops が既に pull-in されていても idempotent に ensure-active する。元が inactive なら start も ready 観測もせず `started` と `checked` を no-op で通過して `enabled` へ進み、ops unit は afx の `Wants=` で引かれるまで起動しない|起動不能は `installed` に留める。unit と鍵は残し、同じ enable は `started` の到達を再試行する|
 |`checked`|実 UDS の server 認証と機能別疎通を確認し、ops の ready 待ち成功を観測する|checking 失敗では `installed` に留める。ops unit は `Restart=on-failure` で再試行し、`afx ops status` は固定 reason と直近失敗理由を示す。同じ enable が `started` の到達を再試行する|
 |`enabled`|有効化済みとして commit する|以後通常運転。再実行は no-op|
 
-再実行時は stage file だけを信じず、marker の有無、flock の取得可否、`ActiveState`、manifest の principal entry を実物として照合し、その組から同じ段を決める (enroll 済みなら marker 削除から続ける)。
+再実行時は stage file だけを信じず、marker の有無、flock の取得可否、`ActiveState`、manifest の principal entry を実物として照合し、その組から同じ段を決める (enroll 済みなら marker 削除から続ける)。terminal stage (`enabled` / `disabled`) でも同じ実物照合を行い、崩れていれば `stage_mismatch` で該当段へ戻す。manager に問い合わせられないときは理由を記録して止まり、資材は戻さない。
+
+enable の固定 reason は次のとおりとする。`ops_exec_not_found` は ExecStart に書く実行ファイルの検査に失敗したときに出す。実行ファイルは絶対 path・regular file・自 uid か uid 0 所有・他者書込み不可・空白や `%$"'\` を含まないことを要求し、`python -m afx_ops` 形式も同じ検査を受ける。`principal_key_mismatch` は manifest entry と token の digest 不一致で、回復は afx 停止中に `afx keys rotate <principal>` を行い、再 enable する。`marker_foreign` / `marker_corrupt` は detail に path、所有 feature、回復手順を出し、自動削除しない。`material_write_failed`、`afx_still_running` も固定 reason とする。`SystemdError` の reason は subcommand で固定し、detail に rc と redact 済み stderr 末尾 200 byte を入れる。`afx ops status` は failure detail、marker の所有者と path、`afx_before_enable`、`warn=afx_restart_prevent_missing` (afx.service に `RestartPreventExitStatus=75` が無い) を表示する。
 
 `started` の ops は `Wants=` により先に起動され得るため、初回起動を仮定しない。ops は UDS と server 認証の有界 ready 待ち後にだけ業務開始し、timeout 又は認証不能なら fail closed で終了し systemd restart に委ねる。enable の `checked` はこの成功を観測する。`stopped` 以後の未終端 enable では afx を停止状態のまま保持し、同じ enable の再実行だけが次段又は失敗段から再開する。未終端 enable がある間、通常 start と別機能操作は `invalid_state`・無変更とする。
 
@@ -153,7 +157,7 @@ disable は feature ごとの durable stage file に `operation=disable` を記�
 
 |stage|処理|失敗時の durable 遷移と再開先|
 |---|---|---|
-|`enabled`|対象 `afx-ops@<機能>.service` を stop する|stop 又は停止確認に失敗すれば `enabled` に留め、同じ disable が stop を再試行する。stop 成功後は `stopping-ops` へ進む|
+|`enabled`|対象 `afx-ops@<機能>.service` を stop する。停止確認は `is_stopped` (`inactive` / `failed` / `unknown`) で行う|stop 又は停止確認に失敗すれば `enabled` に留め、同じ disable が stop を再試行する。manager に問い合わせられなければ `unavailable` として `enabled` に留まる。stop 成功後は `stopping-ops` へ進む|
 |`stopping-ops`|対象 unit を削除し、`afx.service` の対象 `Wants=` 行を削除し、daemon-reload を完了する。最後の有効機能なら ops 用 unit 雛形も削除する|削除、`Wants=` 更新、daemon-reload、又は最後の雛形削除のいずれかに失敗すれば `stopping-ops` に留める。実物との差分を再照合して同じ uninstall 操作を冪等に再実行する|
 |`uninstalled`|対象 unit、対象 `Wants=` 行、対象設定 artifact が無く、daemon-reload 済みであることを確認する。最後の有効機能なら ops 用 unit 雛形も無いことを確認する|確認失敗の戻り先は実物で決める。対象 unit がまだ active なら `enabled` へ戻し (stop からやり直す)。unit は止まっているが資材・`Wants=`・load 状態が残っていれば `stopping-ops` へ戻し、uninstall を再実行する。`stopping-ops` は unit を止めないので、active のまま戻すと永久ループするためである。確認成功後だけ `disabled` へ進む|
 |`disabled`|無効化済みとして commit する。principal 鍵は保持する|再実行は no-op。再有効化は独立した enable として `staged` から開始する|
@@ -164,7 +168,7 @@ disable は feature ごとの durable stage file に `operation=disable` を記�
 
 enroll 中に afx が manifest を読む競合を、marker と flock の二重で塞ぐ。marker `enroll_in_progress` は ops_setup の stage dir と同じ場所に置く durable file で、feature と開始時刻を持つ。
 
-afx 側の契約は次のとおりとする。afx は起動時、manifest を読む前に marker を見る。marker があれば固定 reason `enroll_in_progress` を stderr に 1 行出し、専用終了コード 75 (既存の終了コードと衝突しない値) で即終了する。marker があって instance flock が取れない場合 (enable 側が保持している) も同じ扱いとする。afx.service は `RestartPreventExitStatus=75` を持ち、systemd が即終了を再起動で繰り返さない。first-run-setup が書く unit 雛形にもこれを入れる。現行の仮運用 unit には利用者が手で足す (注記)。
+afx 側の契約は次のとおりとする。afx は起動時、manifest を読む前に marker を見る。marker があれば固定 reason `enroll_in_progress` を stderr に 1 行出し、専用終了コード 75 (既存の終了コードと衝突しない値) で即終了する。marker があって instance flock が取れない場合 (enable 側が保持している) も同じ扱いとする。afx.service は `RestartPreventExitStatus=75` を持ち、systemd が即終了を再起動で繰り返さない。first-run-setup が書く unit 雛形にもこれを入れる。現行の仮運用 unit には利用者が手で足す (注記)。ただし仮運用は `screen -Dm` 経由で終了コードを伝えず、効かない (§11)。
 
 enable が crash して marker が残ると afx は起動できない。`afx ops status` は marker を表示し、同じ enable の再実行が marker を回収する。再実行の途中で enroll 済みなら、marker 削除から続ける。
 
@@ -258,15 +262,17 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 |tgkill 拒否|`tgkill` の拒否により `abort()` は SIGSEGV で終わる|
 |web の port 源|web の loopback port の設定源は T7 まで無い|
 |承認後の回復|誤承認後の plugin disable / rollback は既存の未整備事項のままであり、afx-ops は解決しない|
+|仮運用の afx の終了コード|仮運用の `afx.service` は `screen -Dm` 経由で起動するため終了コードを伝えず、`RestartPreventExitStatus=75` が効かない。恒久形の unit で有効になる|
 
 ## 12. 未決事項 (ユーザー裁定待ち)
 
-次の四件はユーザー裁定で確定する。初版実装は仮置きの範囲を超えない。
+1〜4 はユーザー裁定で確定済みである。5 は未裁定で、初版実装は仮置きの範囲を超えない。
 
 1. **web 認証** — **裁定済み (2026-10-09 ユーザー): 初版はローカル限定 (127.0.0.1 bind) で認証を持たず、後で拡張する。** 拡張時の候補は cookie session とする。UI 用 secret は API 鍵と分離し、`afx ops` が初回に生成して表示する。secret rotation、session の有効期間、loopback HTTP の `Secure` 非設定の扱いを設定 schema で確定する。根拠は、read-only であっても loopback 利用者を認証し、API 鍵の露出と bearer secret の常設を避けるためである。
 2. **bot の設置範囲** — **裁定済み (2026-10-09 ユーザー): 初版は単一 guild・単一 channel。**複数 guild / channel の設定、allowlist、状態領域分離は初版に含めない。根拠は、承認の表示起点と確認 record の束縛を単一の運用境界で検証可能に保つためである。
 3. **notify の配送先** — **裁定済み (2026-10-09 ユーザー): 通知とメンションの主経路は afx → ops-bot → Discord (§3.2 の流れ 1)。notify は generic HTTPS webhook だけで、bot の backup / 補助とする。**Discord、Slack、email 等の種類別 adapter は初版に含めない。根拠は、固定 schema と event cursor の配送契約を adapter 固有の認証・再試行規則から独立させるためである。
 4. **`ops-bot` の権限** — **裁定済み (2026-10-09 ユーザー): 初版は operator 操作 (`ask`、`improve` 等) を与えないが、将来与える可能性を設計で考慮する。** 具体的には principal → scope 集合の対応をデータとして持ち (操作 API spec の方針どおり)、operator 操作を許す別 principal (例 `ops-bot-operator`) と別 process を追加できる形にし、bot 側は action ごとに principal 鍵を選べる構造にしておく。確認状態の (actor, action, nonce) の規則は operator 操作にも同じ形で適用する。根拠は、Discord interaction が plugin 決定以外の操作権限へ拡大することを防ぐためである。
+5. **途中で詰まった enable を捨てる操作** — 未実装、要裁定。`afx ops enable --abort` 相当 (marker 除去・unit 戻し・`disabled` へ、鍵は revoke しない) を設けるかどうか。
 
 ## 13. 変更履歴
 
@@ -277,3 +283,4 @@ T1、T3、T4、T5 が完了するまで、ops process を本番鍵で起動し�
 |2026-10-09|v1.0|§12-2〜4 をユーザー裁定で確定 (単一 guild・channel / notify は generic webhook で bot の backup / ops-bot の operator 操作は初版なし、将来の追加を principal 追加で考慮)|ユーザー裁定|—|
 |2026-10-09|v1.0|§3.2 に bot の通知の流れ (event → メンション付き投稿) を追加、notify を backup と明記|ユーザー再確認 (afx → ops-bot → Discord が主経路)|—|
 |2026-10-10|v1.1|§6.1 enable の systemd 停止固定を廃し durable marker `enroll_in_progress` + instance flock に変更し、afx 側の契約 (reason、終了コード 75、`RestartPreventExitStatus`) を §6.1.2 に新設。§6.1.1 の `uninstalled` 確認失敗の戻り先を実物で決める形に変更。§5.1 鍵配置と holder 生存の pidfd poll、§5.2 の sendto / recvfrom・AF_NETLINK・tgkill / flock・PROFILE_VERSION 2、§6.2 の Type=notify と drop-in、§11 の残余を追記|本番 afx.service は `~/.config/systemd/user/` に実体があり `systemctl --user` の停止固定が同名ファイル衝突で失敗する (実測、systemd 259)。runtime 版は検索順で効かない。ユーザー裁定 2026-10-10 (案 A)。他は実装で確定した小修正|—|
+|2026-10-10|v1.2|T3 / T4 / T5 の実装 (main 3873a99) で確定した小修正。§6.1 started は停止前の afx が active のときだけ起動、afx_before_stop の記録、terminal stage の実物照合、固定 reason 追加、§6.1.1 の is_stopped、§5.1 配置の検査、§5 の pidfd / lock / errno 分類、§3.3 の accept_exhausted、§11 に仮運用の終了コード残余、§12 に abort 操作の未決を追加|T3 / T4 / T5 の実装で確定した小修正|| 
