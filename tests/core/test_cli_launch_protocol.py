@@ -17,12 +17,12 @@ def _prep() -> P.Prepared:
 
 def test_frame_layout_is_fixed():
     assert P.HEADER_LEN == 24
-    assert P.FRAME_LEN == {P.HELLO: 28, P.JOINED: 24, P.PREPARED: 128, P.GO: 24,
+    assert P.FRAME_LEN == {P.HELLO: 28, P.JOINED: 24, P.PREPARED: 132, P.GO: 24,
                            P.EXEC_FAILED: 28, P.SETUP_FAILED: 32}
     assert (P.HELLO, P.JOINED, P.PREPARED, P.GO, P.EXEC_FAILED, P.SETUP_FAILED) == (
         1, 2, 3, 4, 5, 6)
     hello = P.encode_hello(NONCE, 1234)
-    assert hello == b"AFXL" + struct.pack("<HH", 1, 1) + NONCE + struct.pack("<i", 1234)
+    assert hello == b"AFXL" + struct.pack("<HH", 2, 1) + NONCE + struct.pack("<i", 1234)
 
 
 @pytest.mark.parametrize("data, frame_type", [
@@ -56,7 +56,7 @@ def _replace(data: bytes, offset: int, raw: bytes) -> bytes:
     ("header_only_hello", P.encode_hello(NONCE, 1)[:24]),
     ("long", P.encode_hello(NONCE, 1) + b"\0"),
     ("magic", _replace(P.encode_go(NONCE), 0, b"AFXM")),
-    ("version", _replace(P.encode_go(NONCE), 4, struct.pack("<H", 2))),
+    ("version", _replace(P.encode_go(NONCE), 4, struct.pack("<H", 1))),
     ("type", _replace(P.encode_go(NONCE), 6, struct.pack("<H", 7))),
     ("nonce", P.encode_go(bytes(16))),
     ("nonce_last_byte", P.encode_go(NONCE[:15] + bytes([NONCE[15] ^ 1]))),

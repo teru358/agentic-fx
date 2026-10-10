@@ -100,7 +100,7 @@ elif s == "long":
 elif s == "magic":
     send(b"XFXL" + hello()[4:]); block()
 elif s == "version":
-    send(hello()[:4] + struct.pack("<H", 2) + hello()[6:]); block()
+    send(hello()[:4] + struct.pack("<H", 1) + hello()[6:]); block()
 elif s == "nonce":
     send(hello(nonce=bytes(16))); block()
 elif s == "unknown_type":

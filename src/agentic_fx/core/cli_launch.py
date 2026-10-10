@@ -77,7 +77,7 @@ def expected_prepared() -> P.Prepared:
     """worker 側で compile した値と実 Landlock ABI。PREPARED はこれと一致を要求する。"""
     c = seccomp_cli_bpf.compile_policy()
     return P.Prepared(c.profile_id, c.policy_hash, c.bpf_hash, c.filter_flags,
-                      landlock_nested.probe_abi())
+                      landlock_nested.probe_abi(), subreaper=1)
 
 
 def open_cli_binary(path: str) -> int:

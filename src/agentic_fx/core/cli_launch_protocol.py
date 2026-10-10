@@ -18,7 +18,7 @@ import struct
 from dataclasses import dataclass
 
 MAGIC = b"AFXL"
-VERSION = 1
+VERSION = 2
 NONCE_LEN = 16
 
 _HEADER = struct.Struct("<4sHH16s")
@@ -41,8 +41,8 @@ _BODY = {
     HELLO: struct.Struct("<i"),                 # pid
     JOINED: struct.Struct("<"),
     # profile id (ASCII、NUL 詰め)、policy hash、BPF hash (SHA-256 の生 32 byte)、
-    # filter flags、実 Landlock ABI
-    PREPARED: struct.Struct("<32s32s32sII"),
+    # filter flags、実 Landlock ABI、subreaper の読み値 (1 = 立っている)
+    PREPARED: struct.Struct("<32s32s32sIII"),
     GO: struct.Struct("<"),
     EXEC_FAILED: struct.Struct("<i"),           # errno
     SETUP_FAILED: struct.Struct("<HHi"),        # reason code、予約 (0)、errno / 補足
@@ -156,6 +156,7 @@ class Prepared:
     bpf_hash: str      # hex
     filter_flags: int
     landlock_abi: int
+    subreaper: int = 1   # launcher が `PR_GET_CHILD_SUBREAPER` で読んだ値
 
 
 @dataclass(frozen=True)
@@ -201,7 +202,7 @@ def encode_prepared(nonce: bytes, p: Prepared) -> bytes:
         raise ValueError("profile id too long")
     return _header(PREPARED, nonce) + _BODY[PREPARED].pack(
         pid, bytes.fromhex(p.policy_hash), bytes.fromhex(p.bpf_hash),
-        p.filter_flags, p.landlock_abi)
+        p.filter_flags, p.landlock_abi, p.subreaper)
 
 
 def decode(data: bytes, nonce: bytes) -> Frame:
@@ -231,7 +232,7 @@ def decode(data: bytes, nonce: bytes) -> Frame:
             raise MalformedFrame(f"setup reason {code}/{reserved}")
         return Frame(ftype, got_nonce, reason=SETUP_REASONS[code], errno=detail)
     if ftype == PREPARED:
-        raw_id, ph, bh, flags, abi = body
+        raw_id, ph, bh, flags, abi, subreaper = body
         stripped = raw_id.rstrip(b"\0")
         if b"\0" in stripped:
             raise MalformedFrame("profile id")
@@ -240,7 +241,7 @@ def decode(data: bytes, nonce: bytes) -> Frame:
         except UnicodeDecodeError:
             raise MalformedFrame("profile id") from None
         return Frame(ftype, got_nonce, prepared=Prepared(
-            profile_id, ph.hex(), bh.hex(), flags, abi))
+            profile_id, ph.hex(), bh.hex(), flags, abi, subreaper))
     return Frame(ftype, got_nonce)
 
 

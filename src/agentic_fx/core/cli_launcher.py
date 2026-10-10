@@ -8,8 +8,8 @@
   supplementary group が worker の期待値と一致すること
 - L4: HELLO{pid} を送り、JOINED を厳密に検査する
 - L5: subreaper、no_new_privs、nested Landlock (TSYNC)
-- L6〜L7: seccomp `improve-cli/1` を install して listener を得て、seccomp mode 2
-  と no_new_privs 1 を自己検査する
+- L6〜L7: seccomp `improve-cli/1` を install して listener を得て、seccomp mode 2、
+  no_new_privs 1、subreaper 1 を自己検査する
 - L8: PREPARED と listener fd 1 個を送り、送信の成否によらず自分の copy を閉じる
 - L8w: GO を厳密に検査する
 - L9: fd 3 以上を CLOEXEC にしてから CLI fd を `execveat(AT_EMPTY_PATH)`
@@ -52,6 +52,7 @@ _PR_GET_NO_NEW_PRIVS = 39
 _SYS_CAPGET = 125
 _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
 _PR_SET_NO_NEW_PRIVS = 38
 
 _LIBC = None
@@ -194,6 +195,16 @@ def _seccomp_mode() -> int:
 
 def _no_new_privs() -> int:
     return _prctl_get(_PR_GET_NO_NEW_PRIVS)
+
+
+def _subreaper_flag() -> int:
+    """`PR_GET_CHILD_SUBREAPER` の読み値。flag は exec をまたいで CLI に残る。
+    seccomp の後でも読める (CLI 側で許可されているのは GET だけ)。"""
+    flag = ctypes.c_int(-1)
+    ctypes.set_errno(0)
+    if _libc().prctl(_PR_GET_CHILD_SUBREAPER, ctypes.addressof(flag), 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl PR_GET_CHILD_SUBREAPER")
+    return flag.value
 
 
 class _CapHeader(ctypes.Structure):
@@ -344,13 +355,20 @@ def _run(cfg: dict) -> None:
                 ok = False
             if not ok:
                 raise _SetupFailed("seccomp_self_check_failed")
+            # 孤児の引取り先が CLI になる前提。立っていなければ孤児が worker へ上がる
+            try:
+                subreaper = _subreaper_flag()
+            except OSError:
+                subreaper = 0
+            if subreaper != 1:
+                raise _SetupFailed("subreaper_failed")
         except BaseException:
             os.close(listener)
             raise
 
         # L8: 送信の成否によらず launcher の copy は閉じる
         prepared = P.Prepared(compiled.profile_id, compiled.policy_hash, compiled.bpf_hash,
-                              compiled.filter_flags, abi)
+                              compiled.filter_flags, abi, subreaper)
         try:
             _send(sock, P.encode_prepared(nonce, prepared), fds=[listener])
         finally:
