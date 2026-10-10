@@ -1,6 +1,6 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.6
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.7
 
-版: v1.6
+版: v1.7
 
 日付: 2026-10-10
 
@@ -267,15 +267,15 @@ relay は CONNECTING、OPEN、HALF_CLOSED、CLOSED の状態を持つ。tunnel �
 
 #### 4.3.1 同期 handoff
 
-pending entry は複製 fd、`fstat().st_ino`、connect 後の client tuple、ack Event、ack tuple を持つ。`SO_COOKIE` は `dict[cookie, list[entry]]` の索引だけであり、同一性の根拠にはしない。
+pending entry は複製 fd、`fstat().st_ino`、connect 後の client tuple、ack Event、ack tuple を持つ。`SO_COOKIE` は `dict[cookie, list[entry]]` の索引だけであり、同一性の根拠にはしない。`add_pending` は常に token を返し、登録できなかった場合の token は使えない token とする。supervisor は proxy 経路で connect が rc 0 / EINPROGRESS を返したなら、必ず ack を待つ。
 
-1. supervisor は commit lock 内で pending entry を bucket に追加し、connect 成功 / EINPROGRESS 後に client tuple を記録する。
-2. proxy accept thread は待たずに `getpeername`、client tuple と server tuple の AF_INET exact INET_DIAG lookup を行う。
+1. supervisor は commit lock 内で pending entry を bucket に追加して token を返し、connect 成功 / EINPROGRESS 後に client tuple を記録する。
+2. proxy accept thread は待たずに `getpeername`、client tuple と server tuple の AF_INET exact INET_DIAG lookup を行う。netlink 応答は、送信元 (pid 0, groups 0) と `nlmsg_pid` が自分の port id (kernel は宛先 port id を入れる、実測) であることを検査し、非 multi-part を seq 判定より先に検査する。違反は `malformed` とする。seq 不一致の正規 datagram だけ捨て、件数を `discarded` として記録する。client の `idiag_family` は IPv4-mapped の接続で AF_INET6 として返る (実測) ので、AF_INET 以外は `not_inet` で拒否する。
 3. 両側が ESTABLISHED であり、bucket 内で「複製の現在の `getsockname` が peer、client `idiag_inode` が entry inode、server `idiag_inode` が accept fd inode」を満たす entry がちょうど 1 件なら受理する。
-4. client lookup をもう一度行い inode と cookie が不変であることを確認し、peer tuple を添えて ack を立てる。
-5. supervisor は 1 秒まで ack を待ち、tuple が一致すれば tracee に実値を返す。不一致・timeout は複製を `shutdown(SHUT_RDWR)` して ECONNREFUSED とする。
+4. 再 lookup は pending の lock の外で行う。ack を立てる直前に lock を取り直して entry の同一性と inode を再確認し、peer tuple を添えて ack を立てる。再確認で entry が消えていれば `pending_gone`、再 lookup の inode / cookie が不一致なら `relookup_changed` とする。
+5. supervisor は 1 秒まで ack を待ち、tuple が一致すれば tracee に実値を返す。不一致・timeout は複製を `shutdown(SHUT_RDWR)` して ECONNREFUSED とする。proxy の stop 開始後は admit を全部拒否 (`stopping`) し、待ちを解放する。
 
-0 件、2 件以上、lookup 消失、state 不一致、再 lookup 不一致、IPv4-mapped、supervisor を経ない接続は要求行を読まずに close する。IPv4-mapped は、client の family 判別が INET_DIAG でできれば明示検査し、できなければ一致 0 件で拒否する（実測で確定し、T4d の報告で版を合わせる）。NETLINK_SOCK_DIAG を作れなければ `proxy_start_failed` とする。
+0 件 (`no_match`)、2 件以上 (`multiple_match`)、lookup 消失 (`lookup_failed`)、state 不一致、再 lookup 不一致 (`relookup_changed`)、`not_inet`、`pending_gone`、`stopping`、supervisor を経ない接続は要求行を読まずに close する。IPv4-mapped は `not_inet` で明示的に拒否する。
 
 ### 4.4 nested Landlock
 
@@ -410,6 +410,7 @@ worker は launcher 起動前、backend execution artifact を open した同じ
 | admission | `arch_unsupported`、`landlock_abi_too_old`、`seccomp_unavailable`、`seccomp_user_notif_unavailable`、`seccomp_wait_killable_unavailable`、`pidfd_thread_unavailable`、`ptrace_scope_unsupported`、`cli_artifact_unsupported`、`cgroup_*`、`unit_stop_policy_unsupported`、`cgroup_create_failed`（mkdir・上限・fd open）、`cgroup_topology_unsupported`（自己位置）、`spool_create_failed`、`proxy_start_failed`、`runtime_fingerprint_selftest_failed`、`safety_canary_failed` は `sandbox_unavailable` |
 | setup | `inherited_seccomp_filter`、`credentials_unexpected`、`rlimit_failed`、`subreaper_failed`、Landlock / seccomp / self-check failure、`attestation_*`、`launcher_died`、`cgroup_join_failed` は `sandbox_unavailable` |
 | runtime | `supervisor_died`、`supervisor_stalled`、`proxy_died` は `sandbox_unavailable`。`spool_flood` と `cli_exec_unproven` は `failed` |
+| proxy 接続判定 (接続単位) | `not_inet`、`pending_gone`、`stopping`、`relookup_changed`、`multiple_match`、`lookup_failed`、`no_match`、`malformed` は §4.3.1 の判定結果であり、接続を閉じて proxy の判定記録 (history / counts) に残す。mission の sandbox 状態は変えない |
 | 通知単位 | `supervisor_resource`（fd 枯渇等、または O_NONBLOCK の復元失敗）、`connect_timeout`（複製への connect が `CONNECT_WAIT_SEC` 内に確定しない、または ack 待ちの期限切れ）、`handler_start`（handler thread を起動できず receiver が EPERM を返す）は、その通知の EPERM の理由であり、supervisor は続行する（復元失敗は加えて `supervisor_died`） |
 | cleanup | `cleanup_deadline_exceeded` は `sandbox_unavailable`。`worker_not_reaped`、`cgroup_cleanup_timeout`、`cgroup_not_empty`、`cgroup_rmdir_failed` は次 mission gate を閉じる |
 
@@ -513,7 +514,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | T4a | CONNECT parser | なし |
 | T4b | resolver、range、fixed address set | なし |
 | T4c | relay、tunnel lifecycle | T4a、T4b |
-| T4d | proxy / supervisor synchronous handoff | T3d1、T4c |
+| T4d | proxy / supervisor synchronous handoff（投入済み、main `01f313f`） | T3d1、T4c |
 | T5 | spool dispatcher / shim、UDS removal | なし |
 | T6 | fingerprint、canary、selftest | T3c、T3d2、T4d、T5 |
 | T7a | product BPF recheck | A2、T3b、T3d1 |
@@ -541,6 +542,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 - 共有 ro file の `flock` と read lock は外部 process を mission 終了まで待たせ得る。
 - uid 単位の inotify、watch、pipe、epoll、pending signal と disk capacity は共有資源である。
 - supervisor / proxy は worker 内で動くため部分木が可用性を圧迫し得る。slot、tunnel、resolver 上限は互換性 failure を起こし得る。
+- proxy の accept thread は admission を同期に行い、1 接続あたり最大 3 回の lookup (client・server・再 lookup) × `DIAG_RECV_TIMEOUT_SEC` (100 ms) = 300 ms 塞がる。外部接続の lookup が 1 本ごとに timeout する場合、正規の handoff が ack 期限 1.0 s 内に通るのは実測で約 10 本まで。超えると正規の handoff が ECONNREFUSED になりうる (安全側、誤受理にはならない)。単純計算 (1.0 s ÷ 0.3 s ≈ 3 本) とは差があり、実測条件の再確認を残余とする。
 - INET_DIAG の挙動変更は fail closed の可用性低下になる。proxy listener への外部接続は backlog を一時圧迫し得る。
 - CLI zombie は `pids.max` を自己消費する。Yama >= 2、ABI < 8、未計測 AppArmor は admission で fail closed とする。
 - cleanup watchdog は GIL 停止時 best-effort である。IC-FINITE は deadline 発行・監視・SIGKILL 配送を担う制御経路の forward progress を前提とする。
@@ -629,3 +631,4 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 |2026-10-10|v1.4|§7.1 に SETUP_FAILED (type 6) と frame 6 種を明記、§12 に multicall・即終了 CLI・main thread 限定 (launch_thread_unsupported) の残余を追加|T3b 実装の実測と /code-review の指摘|—|
 |2026-10-10|v1.5|§4.2 段 1: RECV の ENOENT は通知単位の終了 (receiver 続行)、POLLHUP は drain → CLOSED と明記|T3d1 実装の裁定|—|
 |2026-10-10|v1.6|§4.2.1 段 11: blocking connect の一時 O_NONBLOCK・`CONNECT_WAIT_SEC` 0.75 秒・再 connect での確定・`connect_timeout`、libc 直呼び。§4.2.2: receiver の O_NONBLOCK、`HANDLER_SPAWN_MAX`、ack 期限、handoff の watchdog 先行起動。§4.2.3: dispatcher 停止は `populated 0` の後、handoff 前 kill は launcher pid へ SIGKILL。§4.3.1: IPv4-mapped の扱い。§7.2: `supervisor_resource` / `connect_timeout` / `handler_start`、`cgroup_create_failed` / `cgroup_topology_unsupported`。§10 受入 43、§12 残余、§12.1 R6、§11 T3d1|T3d1 実装の投入と T3d2 / T4d 裁定の反映|—|
+|2026-10-10|v1.7|§4.3.1: IPv4-mapped を `not_inet` で明示拒否 (client の idiag_family は AF_INET6、実測)。netlink 応答の送信元・nlmsg_pid・非 multi-part を seq 判定より先に検査し違反は `malformed`、seq 不一致は `discarded` として計数。再 lookup は lock の外、ack 直前に lock を取り直して `pending_gone`。stop 開始後は `stopping`。add_pending は常に token を返す。§7.2 に proxy 接続判定の理由を列挙。§12 に accept thread 同期 admission の可用性残余。§11 T4d を投入済みに|T4d 実装 (main `01f313f`) の結果を spec へ反映 (spec-v17 ブリーフ)|—|
