@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import shutil
 import signal
 import subprocess
@@ -25,8 +26,10 @@ from typing import Callable, Mapping
 
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.mission_ceiling import (DISPATCHER_JOIN_MARGIN_SEC, KILL_WAIT_SEC, READER_JOIN_SEC)
+from agentic_fx.core import mission_cleanup as MC
 from agentic_fx.core.mission_protocol import (
-    ProtocolError, SeqTracker, read_frame, write_frame,
+    CLEANUP_ACK, CLEANUP_DEADLINE, CLEANUP_REQUEST, HANDSHAKE_NONCE_FIELD, MissionNonce,
+    ProtocolError, SeqTracker, encode_frame, read_frame, write_frame,
 )
 from agentic_fx.plugin.sandbox import _build_env
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
@@ -36,6 +39,11 @@ from agentic_fx.tools.improve_rpc_tools import RpcOutcome
 import logging
 
 _log = logging.getLogger("agentic_fx.worker_runner")
+
+#: cleanup deadline の送信で stdin の lock と書込み可を待つ上限 (それぞれ)。worker が stdin を
+#: 読まない・別の書き手が詰まっているときは送らずに SIGKILL と再 wait の経路へ進む
+#: (deadline は親の時計で決まっているので、送れなくても後始末の期限は変わらない)
+_DEADLINE_SEND_WAIT_SEC = 0.5
 
 _DATA_PROVIDER_ENV_ALLOWLIST = ("TWELVEDATA_API_KEY", "MT5_BRIDGE_API_KEY")
 _MAX_CREDENTIALS_FILE_BYTES = 64 * 1024
@@ -100,6 +108,19 @@ def _stat_is_regular(st: os.stat_result) -> bool:
     return _stat.S_ISREG(st.st_mode)
 
 
+class _CleanupWake(Exception):
+    """worker の cleanup 要求で待ちを打ち切る (cleanup protocol の経路だけ)。"""
+
+
+def _take_until(q: queue.Queue, deadline: float | None) -> tuple[str, object]:
+    """reap の後、reader が渡した終端 (result / eof など) を deadline まで待って取る。"""
+    remaining = 0.0 if deadline is None else deadline - time.monotonic()
+    try:
+        return q.get(timeout=max(0.0, remaining))
+    except queue.Empty:
+        return ("eof", None)
+
+
 class WorkerRunner(AgentRunner):
     def __init__(self, *, root: Path, settings, clock: Clock, rag: Rag,
                 worker_profile: str = "trade",
@@ -111,7 +132,13 @@ class WorkerRunner(AgentRunner):
                 on_rpc_begin: Callable[[str], bool] | None = None,
                 on_rpc_accepted: Callable[[str, dict, RpcOutcome], None] | None = None,
                 on_rpc_released: Callable[[str], None] | None = None,
-                stop_event: threading.Event | None = None) -> None:
+                stop_event: threading.Event | None = None,
+                cleanup_protocol: MC.CleanupProtocol | None = None) -> None:
+        # cleanup protocol (単一の absolute cleanup deadline と direct-parent reap) は改善
+        # mission の隔離構成だけの経路。既定 (None) は従来の終了経路のまま
+        if cleanup_protocol is not None and worker_profile == "trade":
+            raise ValueError("cleanup protocol is not used by the trade profile")
+        self._cleanup = cleanup_protocol
         self._root = root
         self._settings = settings
         self._clock = clock
@@ -255,6 +282,102 @@ class WorkerRunner(AgentRunner):
         transcript: list[dict] = []
         state = {"bytes": 0, "truncated": False}
         cli_pgid_holder: dict[str, int] = {}
+        # mission nonce は全 profile で handshake に載せる。worker はここから spool root 名・
+        # mission cgroup 名・launcher の status protocol の nonce を導く
+        nonce = MissionNonce(os.urandom(16).hex())
+        cleanup = self._cleanup
+        issuer = MC.DeadlineIssuer() if cleanup is not None else None
+        issue_lock = threading.Lock()
+        cleanup_requested = threading.Event()
+        cleanup_state: dict[str, object] = {"done": False, "trigger": None}
+        ack_state = {"seen": False}
+
+        def write_numbered(build: Callable[[int], dict],
+                           fallback: Callable[[int], dict] | None = None) -> bool:
+            """親→子の seq の採番と書込みを同じ lock の中で行う (seq は書かれた順に増える)。
+            stdin が閉じていれば書かずに False。`build` の frame を符号化できなければ
+            `fallback` の frame を同じ seq で書く。"""
+            with stdin_lock:
+                if stdin_state["closed"]:
+                    return False
+                seq = out_seq_holder["n"] + 2  # handshake=1 済み
+                try:
+                    data = encode_frame(build(seq))
+                except (TypeError, ValueError):
+                    if fallback is None:
+                        raise
+                    data = encode_frame(fallback(seq))
+                out_seq_holder["n"] += 1
+                proc.stdin.write(data)
+                proc.stdin.flush()
+                return True
+
+        def send_deadline(deadline: float) -> str | None:
+            """cleanup_deadline を詰まらずに送る。送れたら None、送れなければ理由。
+
+            lock は短く試み、書込みは書込み可を短く待ってから non-blocking で行う (frame は
+            PIPE_BUF より小さいので、書ければ全体が 1 回で書かれる)。"""
+            if not stdin_lock.acquire(timeout=_DEADLINE_SEND_WAIT_SEC):
+                return "stdin_lock_busy"
+            try:
+                if stdin_state["closed"]:
+                    return "stdin_closed"
+                seq = out_seq_holder["n"] + 2
+                data = encode_frame({"type": CLEANUP_DEADLINE, "seq": seq, "deadline": deadline})
+                fd = proc.stdin.fileno()
+                _, writable, _ = select.select([], [fd], [], _DEADLINE_SEND_WAIT_SEC)
+                if not writable:
+                    return "stdin_full"
+                blocking = os.get_blocking(fd)
+                os.set_blocking(fd, False)
+                try:
+                    written = os.write(fd, data)
+                except BlockingIOError:
+                    return "stdin_full"
+                finally:
+                    os.set_blocking(fd, blocking)
+                out_seq_holder["n"] += 1
+                return None if written == len(data) else "short_write"
+            except (OSError, ValueError) as e:
+                return type(e).__name__
+            finally:
+                stdin_lock.release()
+
+        def issue_deadline(trigger: str) -> float:
+            """deadline を 1 回だけ発行し、cleanup の最初の操作より前に worker へ送る。"""
+            assert cleanup is not None and issuer is not None
+            with issue_lock:
+                deadline, new = issuer.issue(trigger)
+                if not new:
+                    return deadline
+                cleanup.record("issued", trigger=trigger, deadline=deadline)
+                why = send_deadline(deadline)
+                if why is None:
+                    cleanup.record("deadline_sent", ok=True)
+                else:
+                    cleanup.record("deadline_sent", ok=False, why=why)
+                return deadline
+
+        def finish_cleanup(trigger: str) -> None:
+            """発行 → ACK 非依存の wait → SIGKILL → 再 wait → hook。1 mission に 1 回。"""
+            assert cleanup is not None
+            if cleanup_state["done"]:
+                return
+            cleanup_state["done"] = True
+            cleanup.record("finish", trigger=trigger)
+            deadline = issue_deadline(trigger)
+            reaped = MC.reap_worker(proc, deadline, cleanup)
+            if cleanup.on_reaped is not None:
+                cleanup.record("hook", reaped=reaped)
+                try:
+                    cleanup.on_reaped(nonce.cgroup_name, reaped, deadline)
+                except Exception:  # noqa: BLE001 — hook の失敗で後始末を止めない
+                    _log.exception("cleanup on_reaped hook failed")
+
+        def stop_or(trigger: str) -> str:
+            if self._stop_event is not None and self._stop_event.is_set():
+                return MC.TRIGGER_STOP
+            return trigger
 
         def handle_event(frame: dict) -> None:
             if state["truncated"]:
@@ -296,6 +419,23 @@ class WorkerRunner(AgentRunner):
                     elif ftype == "result":
                         done_queue.put(("result", frame))
                         return
+                    elif cleanup is not None and ftype == CLEANUP_REQUEST:
+                        cleanup.record("request", reason=frame.get("reason"))
+                        issue_deadline(MC.TRIGGER_WORKER_REQUEST)
+                        cleanup_requested.set()
+                    elif cleanup is not None and ftype == CLEANUP_ACK:
+                        # ACK は wait の条件にしない。発行済みの deadline と一致するものを
+                        # 1 回だけ受理し、それ以外は拒否として記録する (kill は deadline が担保)
+                        acked = frame.get("deadline")
+                        if issuer.deadline is None:
+                            cleanup.record("ack_rejected", why="before_issue", deadline=acked)
+                        elif acked != issuer.deadline:
+                            cleanup.record("ack_rejected", why="mismatch", deadline=acked)
+                        elif ack_state["seen"]:
+                            cleanup.record("ack_rejected", why="duplicate", deadline=acked)
+                        else:
+                            ack_state["seen"] = True
+                            cleanup.record("ack", deadline=acked)
                     else:
                         done_queue.put(
                             ("protocol_error", f"unknown frame type {ftype!r}"))
@@ -332,17 +472,11 @@ class WorkerRunner(AgentRunner):
                         accepted = False
                         begin_error = "rpc_begin_failed"
                 if not accepted:
-                    out_seq_holder["n"] += 1
-                    result_frame = {
-                        "type": "tool_rpc_result",
-                        "seq": out_seq_holder["n"] + 1,
-                        "rpc_id": frame["rpc_id"], "ok": False,
-                        "error": begin_error}
                     try:
-                        with stdin_lock:
-                            if stdin_state["closed"]:
-                                return
-                            write_frame(proc.stdin, result_frame)
+                        if not write_numbered(lambda seq, rpc_id=frame["rpc_id"]: {
+                                "type": "tool_rpc_result", "seq": seq,
+                                "rpc_id": rpc_id, "ok": False, "error": begin_error}):
+                            return
                     except (BrokenPipeError, OSError, ValueError):
                         return
                     continue
@@ -374,17 +508,11 @@ class WorkerRunner(AgentRunner):
                         except Exception:  # noqa: BLE001
                             _log.warning("on_rpc_released callback failed",
                                          exc_info=True)
-                    out_seq_holder["n"] += 1
-                    result_frame = {
-                        "type": "tool_rpc_result",
-                        "seq": out_seq_holder["n"] + 1,
-                        "rpc_id": frame["rpc_id"], "ok": False,
-                        "error": "rpc_start_failed"}
                     try:
-                        with stdin_lock:
-                            if stdin_state["closed"]:
-                                return
-                            write_frame(proc.stdin, result_frame)
+                        if not write_numbered(lambda seq, rpc_id=frame["rpc_id"]: {
+                                "type": "tool_rpc_result", "seq": seq,
+                                "rpc_id": rpc_id, "ok": False, "error": "rpc_start_failed"}):
+                            return
                     except (BrokenPipeError, OSError, ValueError):
                         return
                     continue
@@ -446,32 +574,21 @@ class WorkerRunner(AgentRunner):
                             _log.warning("on_rpc_released callback failed",
                                          exc_info=True)
                     response = {"ok": False, "error": "rag rpc timed out"}
-                out_seq_holder["n"] += 1
-                result_frame = {
-                    "type": "tool_rpc_result",
-                    "seq": out_seq_holder["n"] + 1,  # handshake=1 済み
-                    "rpc_id": frame["rpc_id"], **response}
-                try:
-                    with stdin_lock:
-                        if stdin_state["closed"]:
-                            return
-                        write_frame(proc.stdin, result_frame)
-                except (TypeError, ValueError):
+                def unserializable(seq: int, name=frame["name"], rpc_id=frame["rpc_id"],
+                                   payload=payload) -> dict:
                     _log.error("rpc result not serializable name=%s type=%s",
-                               frame["name"], type(payload).__name__)
-                    try:
-                        with stdin_lock:
-                            if stdin_state["closed"]:
-                                return
-                            write_frame(proc.stdin, {
-                                "type": "tool_rpc_result",
-                                "seq": result_frame["seq"],
-                                "rpc_id": frame["rpc_id"],
-                                "ok": False,
-                                "error": "rpc result not serializable"})
-                    except (BrokenPipeError, OSError):
+                               name, type(payload).__name__)
+                    return {"type": "tool_rpc_result", "seq": seq, "rpc_id": rpc_id,
+                            "ok": False, "error": "rpc result not serializable"}
+
+                try:
+                    if not write_numbered(
+                            lambda seq, rpc_id=frame["rpc_id"], response=response: {
+                                "type": "tool_rpc_result", "seq": seq,
+                                "rpc_id": rpc_id, **response},
+                            fallback=unserializable):
                         return
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError, ValueError):
                     return  # 子が既に死んでいる — 応答不能
 
         reader = threading.Thread(target=reader_loop, daemon=True,
@@ -497,6 +614,7 @@ class WorkerRunner(AgentRunner):
             "worker_profile": self._worker_profile,
             "now": now.isoformat(),
             "credentials": credentials or {},
+            HANDSHAKE_NONCE_FIELD: nonce.hex,
             **(run_context_fields or {}),
         }
         with stdin_lock:
@@ -507,9 +625,18 @@ class WorkerRunner(AgentRunner):
         try:
             try:
                 ready = self._wait_with_stop(
-                    ready_queue, timeout=w.worker_startup_timeout_sec)
+                    ready_queue, timeout=w.worker_startup_timeout_sec,
+                    wake=cleanup_requested if cleanup is not None else None)
+            except _CleanupWake:
+                # ready の前に worker が後始末を求めた (起動の失敗)。起動の期限まで待たない
+                finish_cleanup(MC.TRIGGER_WORKER_REQUEST)
+                return MissionResult("failed", None, transcript,
+                                     reason="worker requested cleanup before ready")
             except queue.Empty:
-                self._escalate_kill(proc, w)
+                if cleanup is None:
+                    self._escalate_kill(proc, w)
+                else:
+                    cleanup_state["trigger"] = stop_or(MC.TRIGGER_NO_RESPONSE)
                 return MissionResult("failed", None, transcript)
 
             # I1 是正 (プラン10 束D round1、verified-codex-round1.md、
@@ -524,7 +651,10 @@ class WorkerRunner(AgentRunner):
             # なる)。子を明示的に `_escalate_kill` する (旧来は `finally`
             # の `_ensure_dead` に依存していたが、意図を明示する)。
             if not ready.get("ok", False):
-                self._escalate_kill(proc, w)
+                if cleanup is None:
+                    self._escalate_kill(proc, w)
+                else:
+                    cleanup_state["trigger"] = MC.TRIGGER_WORKER_EXIT
                 return MissionResult(
                     "failed", None, transcript,
                     reason=f"child ready ok=false: {ready.get('error')}")
@@ -543,7 +673,10 @@ class WorkerRunner(AgentRunner):
                     # 要求し、新規プロトコルフレームの追加は明示的に不要と
                     # している。設計書 プラン 9.3 節「実装時改訂 R-D1」参照)。
                     _log.exception("on_ready callback failed")
-                    self._escalate_kill(proc, w)
+                    if cleanup is None:
+                        self._escalate_kill(proc, w)
+                    else:
+                        cleanup_state["trigger"] = MC.TRIGGER_ABORT
                     return MissionResult(
                         "failed", None, transcript,
                         reason=f"on_ready failed: {type(e).__name__}: {e}")
@@ -555,23 +688,27 @@ class WorkerRunner(AgentRunner):
             # 待つため、この非対称を避ける。trade profile は `go` を
             # 待たない旧来のプロトコルを維持するため一切送らない)。
             if self._worker_profile == "improve":
-                out_seq_holder["n"] += 1
                 try:
-                    with stdin_lock:
-                        if not stdin_state["closed"]:
-                            write_frame(proc.stdin, {
-                                "type": "go",
-                                "seq": out_seq_holder["n"] + 1,
-                            })
+                    write_numbered(lambda seq: {"type": "go", "seq": seq})
                 except (BrokenPipeError, OSError):
                     pass  # 子が既に死んでいる — 以降の done_queue 待ちが検知する
 
             deadline_budget = mission.timeout_sec + w.worker_grace_sec
             try:
                 kind, payload = self._wait_with_stop(
-                    done_queue, timeout=deadline_budget)
+                    done_queue, timeout=deadline_budget,
+                    wake=cleanup_requested if cleanup is not None else None,
+                    prefer_queued=True)
+            except _CleanupWake:
+                # worker の cleanup 要求で発行済み。ACK を待たずに reap し、その間に届いた
+                # result があれば拾う (待ちは発行済み deadline まで)
+                finish_cleanup(MC.TRIGGER_WORKER_REQUEST)
+                kind, payload = _take_until(done_queue, issuer.deadline)
             except queue.Empty:
-                self._escalate_kill(proc, w)
+                if cleanup is None:
+                    self._escalate_kill(proc, w)
+                else:
+                    cleanup_state["trigger"] = stop_or(MC.TRIGGER_MISSION_DEADLINE)
                 return MissionResult("timeout", None, transcript)
 
             if kind == "result":
@@ -622,9 +759,15 @@ class WorkerRunner(AgentRunner):
                                  stderr_fatal=stderr_fatal)
         finally:
             dispatch_queue.put(None)
-            self._ensure_dead(proc, w)
-            if "pgid" in cli_pgid_holder:
-                self._terminate_cli_pgid(cli_pgid_holder["pgid"])
+            if cleanup is None:
+                self._ensure_dead(proc, w)
+                if "pgid" in cli_pgid_holder:
+                    self._terminate_cli_pgid(cli_pgid_holder["pgid"])
+            else:
+                # 既存の _ensure_dead → _kill → 相対の wait を置き換える (足さない)。CLI 部分木は
+                # mission cgroup の cgroup.kill と hook の後始末が受け持つので、pgid への
+                # SIGTERM → 猶予 → SIGKILL (別の相対期限) は使わない
+                finish_cleanup(cleanup_state["trigger"] or stop_or(MC.TRIGGER_WORKER_EXIT))
             reader.join(timeout=READER_JOIN_SEC)
             # IM-7 対応: dispatcher は `with stdin_lock: write_frame(proc.stdin,
             # ...)` を実行し得る (tool_rpc_result 応答の送出中)。ここで
@@ -651,11 +794,23 @@ class WorkerRunner(AgentRunner):
                 pass
 
     def _wait_with_stop(self, q: queue.Queue, *, timeout: float,
-                        poll_interval: float = 0.2):
+                        poll_interval: float = 0.2,
+                        wake: threading.Event | None = None,
+                        prefer_queued: bool = False):
         deadline = time.monotonic() + timeout
         while True:
             if self._stop_event is not None and self._stop_event.is_set():
                 raise queue.Empty
+            if wake is not None and wake.is_set():
+                # 終端の待ちでは、既に届いている result などを wake より先に取る (wake は次の
+                # 判定で)。ready の待ちでは取らない: 先に届いた後起動前の cleanup 要求を、
+                # 後から来た ready で通過させない
+                if prefer_queued:
+                    try:
+                        return q.get_nowait()
+                    except queue.Empty:
+                        pass
+                raise _CleanupWake from None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise queue.Empty

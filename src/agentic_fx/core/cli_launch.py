@@ -124,7 +124,10 @@ class LaunchResult:
 
     偽なら `reason` は固定 reason、`series` は cleanup の系列 (handoff 前 / 後)。
     handoff 前の失敗は返す前に kill と reap を済ませる (`reaped`)。handoff 後の失敗は
-    receiver の停止が先なので reap せずに返し、呼び出し側が `reap_launcher` する。"""
+    receiver の停止が先なので reap せずに返し、呼び出し側が `reap_launcher` する。
+
+    `untransferred_fds` は呼び出し側が閉じる fd。handoff 前の listener と status 親端は
+    `launch_cli` 自身が閉じてから返すので常に空 (閉じる所有者を 1 つにする)。"""
 
     started: bool
     reason: str | None
@@ -134,6 +137,7 @@ class LaunchResult:
     reaped: bool
     detail: str = ""
     setup_detail: int | None = None
+    untransferred_fds: tuple[int, ...] = ()
 
 
 class LaunchError(Exception):
@@ -142,7 +146,10 @@ class LaunchError(Exception):
     launcher は起動済みで未 reap のまま渡すので、呼び出し側が `series` に従って
     停止と reap をする (handoff 前なら kill → reap、handoff 後なら receiver の停止が
     先)。包むのは `Exception` 系だけで、KeyboardInterrupt / SystemExit /
-    GeneratorExit は呼び出し側の `except Exception` に捕まらないよう包まない。"""
+    GeneratorExit は呼び出し側の `except Exception` に捕まらないよう包まない。
+    handoff 前の listener と status 親端は送出の前に閉じてあり、`untransferred_fds` は空。"""
+
+    untransferred_fds: tuple[int, ...] = ()
 
     def __init__(self, launcher_proc: subprocess.Popen, series: str) -> None:
         super().__init__(f"unexpected error in launch_cli ({series})")
@@ -156,7 +163,9 @@ class LaunchInterrupted(BaseException):
     `Exception` を継承しないので呼び出し側の `except Exception` には捕まらず、中断の
     要求は通る。元の例外は `__cause__`。launcher は起動済みで未 reap のまま渡すので、
     呼び出し側が `series` に従って停止と reap をする。handoff 前なら受け取り途中の
-    listener と status 親端はここで閉じてある。"""
+    listener と status 親端はここで閉じてあり、`untransferred_fds` は空。"""
+
+    untransferred_fds: tuple[int, ...] = ()
 
     def __init__(self, launcher_proc: subprocess.Popen, series: str) -> None:
         super().__init__(f"launch_cli interrupted ({series})")
@@ -166,12 +175,20 @@ class LaunchInterrupted(BaseException):
 
 def reap_launcher(proc: subprocess.Popen, *, deadline: float,
                   kill: Callable[[], None] | None = None) -> bool:
-    """kill (既定は launcher pid への SIGKILL) の後、deadline までに reap する。
+    """kill (cgroup.kill など) の後に必ず launcher pid への SIGKILL も送り、deadline までに
+    reap する。
 
-    未 reap の pid は再利用されないので、pid 指定の kill はこの process に届く。"""
+    JOINED より前に止まった・死んだ launcher は mission cgroup に居ないので、cgroup.kill
+    だけでは届かない。未 reap の pid は再利用されないので、pid 指定の kill はこの process に
+    届く。"""
     if proc.returncode is None:
+        if kill is not None:
+            try:
+                kill()
+            except Exception:  # noqa: BLE001  kill の失敗でも pid 宛の SIGKILL は送る
+                pass
         try:
-            (kill or proc.kill)()
+            proc.kill()
         except (OSError, ProcessLookupError):
             pass
     try:
@@ -328,8 +345,8 @@ def launch_cli(
       完了とし、worker は以後その fd に触れない。例外なら fd を保持していない約束で、
       worker が閉じて `receiver_handoff_failed` (handoff 前)。
     - `deadline`: setup 全体の monotonic absolute deadline。
-    - `kill`: handoff 前の失敗で reap の前に呼ぶ停止 (cgroup.kill に差し替える)。既定は
-      launcher pid への SIGKILL。
+    - `kill`: handoff 前の失敗で reap の前に呼ぶ停止 (cgroup.kill に差し替える)。その後に
+      launcher pid への SIGKILL も必ず送る (既定は SIGKILL だけ)。
     - 想定外の例外 (`Exception` 系) は `LaunchError` (launcher の handle と系列を持つ)
       に包んで送出する。KeyboardInterrupt / SystemExit / GeneratorExit は
       `LaunchInterrupted` (`BaseException`、同じく handle と系列を持つ) で送出する。
@@ -422,18 +439,18 @@ def launch_cli(
         fds = ev.fds
         held = list(fds)
         if len(fds) != 1 or not is_seccomp_notify_fd(fds[0]):
-            P.close_fds(fds)
+            _close_held(held)
             raise _Fail(P.ATTESTATION_MALFORMED, series,
                         f"PREPARED carries {len(fds)} fd(s) / not a seccomp listener")
         if ev.frame.prepared != expected:
-            P.close_fds(fds)
+            _close_held(held)
             raise _Fail(P.ATTESTATION_MISMATCH, series,
                         f"prepared {ev.frame.prepared} != {expected}")
         listener = fds[0]
         try:
             handoff(listener)
         except Exception as e:  # noqa: BLE001  receiver が受け取らなかった
-            os.close(listener)
+            _close_held(held)
             raise _Fail(P.RECEIVER_HANDOFF_FAILED, series, repr(e)) from None
         # handoff 完了: worker は listener の参照を破棄する
         del listener, fds, ev
@@ -465,23 +482,34 @@ def launch_cli(
         return LaunchResult(False, f.reason, f.series, _classify(f.reason), proc, reaped,
                             f.detail, f.setup_detail)
     except Exception as e:
-        # 想定外の例外では status 親端だけ閉じ、launcher の handle と系列を付けて
+        # 想定外の例外では status 親端と handoff 前の listener を閉じ、launcher の handle と系列を付けて
         # 呼び出し側へ渡す。kill と reap の順序は handoff の前後で違うのでここでは
         # 決めない
+        _close_held(held)
         parent.close()
         raise LaunchError(proc, series) from e
     except BaseException as e:
         # 中断・終了の要求は `except Exception` に捕まらない型で通すが、launcher の
         # handle は失わない。handoff 前に worker が持つ listener と status 親端は閉じる
-        for fd in held:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        _close_held(held)
         parent.close()
         raise LaunchInterrupted(proc, series) from e
     parent.close()
     return LaunchResult(True, None, None, None, proc, False)
+
+
+def _close_held(held: list[int]) -> None:
+    """handoff 前に worker が持つ listener を閉じる (receiver にも呼び出し側にも
+    渡っていないので、ここで閉じないと worker の終了まで残る)。
+
+    close の前に `held` から外す。Linux の close は EINTR を返しても fd を解放しているので、
+    失敗した番号を残すと後の経路がもう一度閉じ、再利用された別の fd を閉じ得る。"""
+    while held:
+        fd = held.pop()
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _exe_identity(pid: int) -> tuple[int, int] | None:

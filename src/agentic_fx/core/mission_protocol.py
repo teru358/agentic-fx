@@ -13,11 +13,29 @@ codex M2-1):
   `go` を受けるまで Mission/LLM を起動しない — 「`go` 前は副作用ゼロ」)
 - 子→親: `ready` (起動応答) / `event` (transcript メッセージ 1 件) /
   `tool_rpc` (RPC 要求) / `result` (最終ステータス、正常終端で 1 回)
+
+cleanup protocol (WorkerRunner が constructor 引数で有効にしたときだけ送受する。
+trade profile と既定の WorkerRunner では使わない):
+- 子→親 `cleanup_request{reason}`: worker が後始末を始めたい (mission の終了、
+  supervisor の障害、`spool_flood` など)。
+- 親→子 `cleanup_deadline{deadline}`: WorkerRunner が 1 回だけ発行する monotonic の
+  absolute deadline (秒、float)。CLOCK_MONOTONIC は host 全体で共通なので値をそのまま渡す。
+- 子→親 `cleanup_ack{deadline}`: 受領の確認。worker はこれを送るまで停止と cgroup 操作を
+  始めない。
+
+handshake の `mission_nonce` は WorkerRunner が mission ごとに作る 128 bit の小文字 hex。
+worker は spool root 名・mission cgroup 名・launcher の status protocol の nonce を
+この 1 個の値から導く (`MissionNonce`)。
 """
 from __future__ import annotations
 
 import json
+import math
+import re
+from dataclasses import dataclass
 from typing import Any, BinaryIO
+
+from agentic_fx.core import cgroup_host as _cgroup_host
 
 
 class ProtocolError(Exception):
@@ -26,8 +44,16 @@ class ProtocolError(Exception):
     違反を検出したらセッションは即座に死んだものとして扱う)。"""
 
 
-FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result", "go"})
-FRAME_TYPES_CHILD_TO_PARENT = frozenset({"ready", "event", "tool_rpc", "result"})
+CLEANUP_REQUEST = "cleanup_request"
+CLEANUP_DEADLINE = "cleanup_deadline"
+CLEANUP_ACK = "cleanup_ack"
+
+FRAME_TYPES_PARENT_TO_CHILD = frozenset({"handshake", "tool_rpc_result", "go", CLEANUP_DEADLINE})
+FRAME_TYPES_CHILD_TO_PARENT = frozenset({"ready", "event", "tool_rpc", "result",
+                                         CLEANUP_REQUEST, CLEANUP_ACK})
+
+HANDSHAKE_NONCE_FIELD = "mission_nonce"
+_NONCE_HEX = re.compile(r"[0-9a-f]{32}")
 
 
 class SeqTracker:
@@ -95,3 +121,45 @@ def read_frame(stream: BinaryIO) -> dict | None:
         raise ProtocolError(
             f"frame must be a JSON object, got {type(frame).__name__}")
     return frame
+
+
+@dataclass(frozen=True)
+class MissionNonce:
+    """mission nonce の 1 個の値と、そこから導く 3 つの表現。"""
+
+    hex: str
+
+    @property
+    def raw(self) -> bytes:
+        """launcher の status protocol に渡す 16 byte。"""
+        return bytes.fromhex(self.hex)
+
+    @property
+    def spool_name(self) -> str:
+        return self.hex
+
+    @property
+    def cgroup_name(self) -> str:
+        # 接頭辞は host の掃除と同じ定義を引く (名前がずれると afx が別の cgroup を片付ける)
+        return _cgroup_host.MISSION_PREFIX + self.hex
+
+
+def parse_mission_nonce(value: Any) -> MissionNonce:
+    """handshake の `mission_nonce` を検査する。小文字 32 hex 以外は `ProtocolError`。"""
+    if not isinstance(value, str) or _NONCE_HEX.fullmatch(value) is None:
+        raise ProtocolError(f"{HANDSHAKE_NONCE_FIELD} must be 32 lowercase hex digits")
+    return MissionNonce(value)
+
+
+def parse_cleanup_deadline(frame: dict, *, now: float, max_ahead: float) -> float:
+    """`cleanup_deadline` の `deadline` を検査する (有限の float で `now <= deadline <=
+    now + max_ahead`)。
+
+    受け手はこの値で watchdog を起こすので、過去の値 (即 exit) も過大な値 (watchdog が
+    効かない) も protocol 違反として拒む。"""
+    value = frame.get("deadline")
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        raise ProtocolError(f"{frame.get('type')}: deadline must be a finite number")
+    if not now <= value <= now + max_ahead:
+        raise ProtocolError(f"{frame.get('type')}: deadline out of range")
+    return float(value)

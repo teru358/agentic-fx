@@ -21,6 +21,7 @@ import select
 import stat
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -345,10 +346,15 @@ class SpoolDispatcher:
             target=self._run, name="afx-mcp-spool", daemon=True)
         self._thread.start()
 
-    def stop(self, timeout_sec: float = 5.0) -> bool:
+    def stop(self, timeout_sec: float = 5.0, *, deadline: float | None = None) -> bool:
         """以後 rescan も実行もしない。thread が期限内に終われば True。
         実行中の tool があれば、その完了までは thread が残る (fd は thread
-        の終わりで閉じる)。"""
+        の終わりで閉じる)。
+
+        `deadline` (monotonic の絶対時刻) を渡すと `timeout_sec` の代わりにそれまでしか
+        待たない (mission の cleanup deadline を段ごとに足し直さないため)。"""
+        if deadline is not None:
+            timeout_sec = max(0.0, deadline - time.monotonic())
         self._stop.set()
         with self._state_lock:
             # 閉じた fd 番号は再利用され得るので、閉じた後は書かない。

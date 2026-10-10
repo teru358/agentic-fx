@@ -273,6 +273,42 @@ def test_receiver_handoff_failure_closes_the_listener(h):
     assert _fds() == before
 
 
+@pytest.mark.parametrize("err", [errno.EINTR, errno.EBADF])
+def test_listener_close_error_in_handoff_failure_is_not_retried(h, monkeypatch, err):
+    """handoff 失敗で listener を閉じる close が EINTR / EBADF を返しても、同じ番号をもう
+    一度閉じない (Linux の close は EINTR でも fd を解放しており、再 close は再利用された
+    別の fd を閉じ得る)。結果は handoff 前の固定 reason のまま。"""
+    real_close = os.close
+    target: list[int] = []
+    calls: list[int] = []
+
+    def refuse(fd: int) -> None:
+        target.append(fd)
+        raise RuntimeError("receiver not running")
+
+    def flaky_close(fd: int) -> None:
+        if target and fd == target[0]:
+            calls.append(fd)
+            if len(calls) == 1:
+                if err == errno.EINTR:
+                    real_close(fd)
+                raise OSError(err, os.strerror(err))
+        real_close(fd)
+
+    monkeypatch.setattr(os, "close", flaky_close)
+    try:
+        r = h.launch(handoff=refuse)
+    finally:
+        monkeypatch.setattr(os, "close", real_close)
+        if err == errno.EBADF and target:
+            try:
+                real_close(target[0])
+            except OSError:
+                pass
+    assert (r.reason, r.series) == (P.RECEIVER_HANDOFF_FAILED, L.BEFORE_HANDOFF), r
+    assert calls == [target[0]]
+
+
 def test_cgroup_join_failure_is_fixed_reason(h):
     def no_join(pid: int) -> None:
         raise OSError(errno.EACCES, "cgroup.procs")
@@ -813,6 +849,66 @@ def test_unexpected_exception_closes_status_end(h, monkeypatch):
         assert L.reap_launcher(err.launcher_proc, deadline=time.monotonic() + 5)
 
 
+def test_unexpected_exception_after_prepared_closes_held_listener(h, monkeypatch):
+    """PREPARED を受けた後・handoff 前の想定外例外でも、worker が持つ listener は閉じる
+    (呼び出し側にも receiver にも渡っていないので、残ると worker の終了まで生きる)。"""
+    before = _fds()
+
+    def bad_probe(fd: int) -> bool:
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(L, "is_seccomp_notify_fd", bad_probe)
+    with pytest.raises(L.LaunchError) as excinfo:
+        h.launch()
+    err = excinfo.value
+    try:
+        assert err.series == L.BEFORE_HANDOFF and not h.listeners
+        assert _notify_fds() == []
+        assert _fds() == before
+    finally:
+        assert L.reap_launcher(err.launcher_proc, deadline=time.monotonic() + 5)
+
+
+class _NullCgroup:
+    def kill_quietly(self) -> bool:
+        return True
+
+    def wait_unpopulated(self, deadline: float) -> bool:
+        return True
+
+
+def test_listener_closed_by_launch_cli_is_not_closed_again_by_cleanup(h, monkeypatch):
+    """handoff 前に launch_cli が閉じた listener は結果に「未移譲 fd なし」と載る。後始末の
+    系列は結果に載った fd だけを閉じるので、番号が別の fd に再利用されていても閉じない。"""
+    from agentic_fx.core import mission_cleanup as MC
+
+    seen: list[int] = []
+
+    def bad_probe(fd: int) -> bool:
+        seen.append(fd)
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(L, "is_seccomp_notify_fd", bad_probe)
+    with pytest.raises(L.LaunchError) as excinfo:
+        h.launch()
+    err = excinfo.value
+    assert err.series == L.BEFORE_HANDOFF and err.untransferred_fds == ()
+    assert L.reap_launcher(err.launcher_proc, deadline=time.monotonic() + 5)
+    # 閉じられた listener の番号を別の fd に再利用させる
+    reused = []
+    try:
+        while not reused or reused[-1] < seen[0]:
+            reused.append(os.open("/dev/null", os.O_RDONLY))
+        assert reused[-1] == seen[0]
+        rep = MC.cleanup_after_launch(
+            err, acquire=lambda: MC.AckedDeadline(time.monotonic() + 30), cgroup=_NullCgroup())
+        assert {s["step"]: s for s in rep.steps}["close_untransferred"]["fds"] == []
+        os.fstat(seen[0])  # 再利用された fd は開いたまま
+    finally:
+        for fd in reused:
+            os.close(fd)
+
+
 @pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit, GeneratorExit])
 def test_interrupt_is_raised_as_launch_interrupted_with_handle(h, exc):
     """KeyboardInterrupt / SystemExit / GeneratorExit は `LaunchInterrupted` (BaseException)
@@ -1156,3 +1252,60 @@ def test_launcher_waits_for_go():
         if proc.poll() is None:
             proc.kill()
         proc.wait(10)
+
+
+class _FakeCapLibc:
+    """capget / capset だけを受ける libc の代役。capset で渡された値を以後の capget で返す。
+    `drop_capset=True` は capset が成功を返しても値を変えない kernel を模す。"""
+
+    def __init__(self, caps: dict[str, tuple[int, int]], drop_capset: bool = False) -> None:
+        self.caps = dict(caps)
+        self.drop_capset = drop_capset
+        self.capsets: list[dict[str, tuple[int, int]]] = []
+
+    def syscall(self, *args) -> int:
+        raise AssertionError("capget / capset は glibc の wrapper で呼ぶ (syscall 番号を持たない)")
+
+    def capget(self, hdr, data) -> int:
+        for k, (lo, hi) in self.caps.items():
+            setattr(data[0], k, lo)
+            setattr(data[1], k, hi)
+        return 0
+
+    def capset(self, hdr, data) -> int:
+        new = {k: (getattr(data[0], k), getattr(data[1], k)) for k in self.caps}
+        self.capsets.append(new)
+        if not self.drop_capset:
+            self.caps = new
+        return 0
+
+
+_CAPS = {"effective": (0x5, 0x1), "permitted": (0x7, 0x1), "inheritable": (0x30, 0x2)}
+
+
+def test_clear_inheritable_caps_clears_only_inheritable(monkeypatch):
+    libc = _FakeCapLibc(_CAPS)
+    monkeypatch.setattr(cli_launcher, "_libc", lambda: libc)
+    cli_launcher.clear_inheritable_caps()
+    assert libc.capsets == [{**_CAPS, "inheritable": (0, 0)}]
+
+
+def test_clear_inheritable_caps_verifies_after_capset(monkeypatch):
+    libc = _FakeCapLibc(_CAPS, drop_capset=True)
+    monkeypatch.setattr(cli_launcher, "_libc", lambda: libc)
+    with pytest.raises(OSError) as e:
+        cli_launcher.clear_inheritable_caps()
+    assert e.value.errno == errno.EPERM
+    assert len(libc.capsets) == 1
+
+
+def test_capability_calls_carry_no_syscall_numbers():
+    """capget / capset の syscall 番号は arch ごとに違うので、module は番号を持たない。"""
+    assert not [n for n in vars(cli_launcher) if n.startswith("_SYS_CAP")]
+    # 実 kernel への呼び出しは子 process で (試験 process の capability を変えない)
+    code = ("from agentic_fx.core import cli_launcher as m\n"
+            "m.clear_inheritable_caps()\n"
+            "print(m._capabilities()[2])\n")
+    proc = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode()
+    assert proc.stdout.decode().strip() == "0"

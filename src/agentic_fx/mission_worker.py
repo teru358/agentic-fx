@@ -62,7 +62,8 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 from agentic_fx.core import landlock
 from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 from agentic_fx.core.mission_protocol import (
-    ProtocolError, SeqTracker, encode_frame, read_frame,
+    HANDSHAKE_NONCE_FIELD, MissionNonce, ProtocolError, SeqTracker, encode_frame,
+    parse_mission_nonce, read_frame,
 )
 # precheck 2026-08-22 pass2: RB3 (Step 7d) — factory.build_runner への
 # monkeypatch を可能にするため module level import (test 側から
@@ -596,11 +597,31 @@ def _build_improve_registry(*, settings: Any, workdir: Path, staging_dir: Path,
     return registry, counters
 
 
+# handshake から受けた mission nonce。main() の間だけ保持し、spool root 名・mission
+# cgroup 名・launcher の status protocol の nonce をこの 1 個から導く。
+_mission_nonce: MissionNonce | None = None
+
+
+def _accept_mission_nonce(handshake: dict) -> MissionNonce:
+    """handshake の `mission_nonce` を 1 回だけ読む。形式違反は `ProtocolError`。
+
+    キーそのものが無い handshake (field を持たない送り手) では、従来どおり worker が
+    作る。WorkerRunner は全 profile で必ず送る。"""
+    global _mission_nonce
+    if HANDSHAKE_NONCE_FIELD in handshake:
+        nonce = parse_mission_nonce(handshake[HANDSHAKE_NONCE_FIELD])
+    else:
+        nonce = MissionNonce(os.urandom(16).hex())
+    _mission_nonce = nonce
+    return nonce
+
+
 def _mission_spool_nonce() -> str:
     """MCP spool root の名前に使う mission nonce (128 bit)。
 
-    設計では WorkerRunner が handshake で渡す値を使う。handshake に載るまで
-    はここで作り、差し替えはこの関数 1 か所で行う。"""
+    main() の中では handshake で受けた値。handshake の外の単体呼び出しでは都度作る。"""
+    if _mission_nonce is not None:
+        return _mission_nonce.spool_name
     return os.urandom(16).hex()
 
 
@@ -780,6 +801,8 @@ def main() -> None:
     out_seq = SeqTracker()
     ready_sent = False
     market_tool_calls: dict[str, int] | None = None
+    global _mission_nonce
+    _mission_nonce = None
     try:
         # レビュー 1 周目 (codex I-1): handshake の読み取りを `try` の**内側**
         # へ移した。旧実装は `try` の外で `read_frame` を呼んでいたため、
@@ -793,6 +816,7 @@ def main() -> None:
             raise ProtocolError(
                 f"expected handshake, got {handshake.get('type')!r}")
         in_seq.check(handshake.get("seq"))
+        _accept_mission_nonce(handshake)
 
         expected_parent_pid = handshake["expected_parent_pid"]
         _set_pdeathsig(signal.SIGTERM)
@@ -1065,6 +1089,8 @@ def main() -> None:
                     "error": f"{type(exc).__name__}: {exc}"})
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める
             pass
+    finally:
+        _mission_nonce = None
 
 
 def _write_frame_or_die(protocol_out: Any, frame: dict) -> None:

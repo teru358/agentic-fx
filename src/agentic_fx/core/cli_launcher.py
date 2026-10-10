@@ -49,7 +49,6 @@ _CLOSE_RANGE_CLOEXEC = 1 << 2
 _PR_SET_PDEATHSIG = 1
 _PR_GET_SECCOMP = 21
 _PR_GET_NO_NEW_PRIVS = 39
-_SYS_CAPGET = 125
 _LINUX_CAPABILITY_VERSION_3 = 0x20080522
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
@@ -66,6 +65,9 @@ def _libc():
         libc.prctl.restype = ctypes.c_int
         libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
                                ctypes.c_ulong, ctypes.c_ulong]
+        # capget / capset は glibc の wrapper で呼ぶ (syscall 番号は arch ごとに違う)
+        libc.capget.restype = ctypes.c_int
+        libc.capset.restype = ctypes.c_int
         _LIBC = libc
     return _LIBC
 
@@ -221,10 +223,33 @@ def _capabilities() -> tuple[int, int, int]:
     hdr = _CapHeader(_LINUX_CAPABILITY_VERSION_3, 0)
     data = (_CapData * 2)()
     ctypes.set_errno(0)
-    if _libc().syscall(ctypes.c_long(_SYS_CAPGET), ctypes.byref(hdr), data) != 0:
+    if _libc().capget(ctypes.byref(hdr), data) != 0:
         raise OSError(ctypes.get_errno(), "capget")
     return tuple(getattr(data[0], k) | (getattr(data[1], k) << 32)
                  for k in ("effective", "permitted", "inheritable"))
+
+
+
+def clear_inheritable_caps() -> None:
+    """自 process の inheritable capability を空にする (effective / permitted は触らない)。
+
+    user service の process は systemd から CapInh に CAP_WAKE_ALARM 等を受け継ぐことがあり、
+    子の launcher は「effective / permitted / inheritable が全部 0」を要求するので、worker が
+    launch_cli の前に呼ぶ。inheritable は非特権でも下げられる。effective / permitted が
+    非ゼロの process は launcher の検査が従来どおり fail closed にする。
+    空になったことは capget で確かめる (`/proc` を読まないので Landlock の後でも呼べる)。"""
+    hdr = _CapHeader(_LINUX_CAPABILITY_VERSION_3, 0)
+    data = (_CapData * 2)()
+    ctypes.set_errno(0)
+    if _libc().capget(ctypes.byref(hdr), data) != 0:
+        raise OSError(ctypes.get_errno(), "capget")
+    for d in data:
+        d.inheritable = 0
+    ctypes.set_errno(0)
+    if _libc().capset(ctypes.byref(hdr), data) != 0:
+        raise OSError(ctypes.get_errno(), "capset")
+    if _capabilities()[2] != 0:
+        raise OSError(_errno.EPERM, "inheritable capabilities remain after capset")
 
 
 def _send(sock: socket.socket, data: bytes, fds=()) -> None:
