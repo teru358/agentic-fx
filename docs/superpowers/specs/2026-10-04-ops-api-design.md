@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.13
+# [ops-api] 操作 API と client 契約設計 v1.14
 
-版: v1.13
+版: v1.14
 
 日付: 2026-10-05
 
@@ -104,7 +104,7 @@ server が鍵から確定した主体を `authenticated_principal`、外部主�
 
 `afx keys init`、`afx keys enroll <principal>`、`afx keys rotate|revoke <principal>` は `data/instance.lock` を non-blocking で取得できる停止中だけ実行する。`init` は `.ready` が無い初回だけ `O_CREAT|O_EXCL` で `operator` と `approver` の初版鍵を作る。`enroll` は未登録 principal だけを `未登録 → preparing(op=enroll, generation=1) → active(1)` と遷移させる。鍵 file は rotate と同じく同一 dir の一時 file へ書込み、file fsync、atomic rename、dir fsync、最後に `.ready` を atomic rename + dir fsync で commit する。既に active の principal への enroll は無変更で成功し、revoked principal への enroll は `invalid_state`（復活は rotate）とする。`rotate` は `active(g) → preparing(g+1) → active(g+1)` と遷移し、新鍵を同じ手順で commit する。`revoke` は `active(g) → preparing(g+1) → revoked(g+1)` とし、鍵 file を non-secret tombstone へ atomic rename で置換して dir fsync、最後に revoked を示す `.ready` を atomic rename + dir fsync で commit する。既に revoked の revoke は同じ状態を返す。
 
-`.ready` は登録済み principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke / enroll の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。準備状態の上で別の key command（enroll の残骸に rotate / revoke を含む）を実行した場合は `invalid_state` で拒否し、dir を変更しない。漏洩時に rotate の残骸がある場合は、先に rotate を完了させてから revoke する。
+`.ready` は登録済み principal ごとの generation、状態、鍵 digest を持つ鍵集合の commit marker である。鍵操作の途中で失敗して `.ready` と実体が一致しない状態は「旧世代も新世代も ready ではない」を意味し、daemon は API を起動しない。自動補完は初回 `init` の `.ready` 未作成時だけに限り、rotate / revoke / enroll の残骸を自動生成や旧鍵への rollback で隠さない。同じ key command を再実行して準備状態から完了させる。準備状態の上で別の key command（enroll の残骸に rotate / revoke を含む）を実行した場合は `invalid_state` で拒否し、dir を変更しない。準備状態の検査は鍵集合全体に掛かり、どの principal かを問わず準備状態の entry が 1 つでもあれば、完結できるのは (同じ principal, 同じ op) の再実行だけとする。漏洩時に rotate の残骸がある場合は、先に rotate を完了させてから revoke する。
 
 漏洩時は、(1) daemon を停止、(2) `afx keys rotate <principal>` または権限を止めるなら `revoke`、(3) daemon を起動して旧鍵が拒否されることを確認、(4) rotate なら同梱 CLI が新鍵を読めることを確認する。停止中も資金保護は既存の latch と運用手順で維持し、鍵交換のために guard を緩めない。
 
@@ -428,3 +428,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-09|v1.11|§3.2 準備状態の上の別 command は invalid_state (両向き)|実装の revoke 例外が spec に無く、fail closed と不整合 (ローカルレビュー 2 周目 F027)|d67d943|
 |2026-10-09|v1.12|§7.1 に events の cursor (保存位置、`--after` は閲覧専用、high watermark 後退時の復旧) と決定結果の表示・引数範囲を追記|CLI 実装で決めた挙動が spec に無く、運用文書だけに書かれていた||
 |2026-10-09|v1.13|afx-ops spec v1.0 §2 の変更要求を反映。manifest v2 / enroll、新 principal の scope、`X-Afx-Asserted-Actor` と監査・job 所有契約、AC-54〜57 を追加|
+|2026-10-10|v1.14|§3.2 準備状態の検査は鍵集合全体 (別 principal の残骸の上でも別 command は invalid_state)|T1 実装で fail closed 側に揃えた裁定を文言化||

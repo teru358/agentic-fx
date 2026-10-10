@@ -1,6 +1,6 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.3
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.4
 
-版: v1.3
+版: v1.4
 
 日付: 2026-10-09
 
@@ -369,6 +369,7 @@ worker は `launcher_proc` の前に `SOCK_SEQPACKET` socketpair を作り、chi
 | L6–L7 | seccomp install、listener 取得、seccomp=2 と no_new_privs=1 を自己検査 |
 | L8 | PREPARED と listener fd 一つを送る。送信成否によらず launcher copy を close |
 | L8w | GO を厳密に検査 |
+| L1–L7 の失敗 | SETUP_FAILED{reason code, errno} を送って終了する。reason code は §7.2 の固定語に 1 対 1 で対応し、stderr や exit code を根拠にしない。frame type は HELLO / JOINED / PREPARED / GO / EXEC_FAILED / SETUP_FAILED の 6 種で、長さは type ごとに 1 通りに固定する |
 | L9 | `close_range(...,CLOEXEC)` 後、hash 済み backend execution artifact fd を `execveat`。codex は native ELF (`codex-rs`、static PIE musl) の fd とし、npm wrapper は実行 TCB に含めない。失敗は EXEC_FAILED |
 
 | worker state | 判定 |
@@ -516,6 +517,10 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 
 ## 12. 残余リスク
 
+- multicall 型の binary (uutils の `sleep` 等) は fd 経由の exec で自分の名前を照合できず即終了する。backend の実行 artifact (claude / codex native / opencode) は multicall ではないことを受入で確認し、利用者が multicall binary を artifact に設定した場合は `cli_exec_unproven` で fail closed になる。
+- 即終了する CLI (起動直後に exit) は EOF 後の `/proc/<pid>/exe` が読めず `cli_exec_unproven` になる。確認不能は fail closed とし、成功へ推測昇格しない。
+- `launch_cli` は worker の main thread からだけ呼ぶ (`PR_SET_PDEATHSIG` は親 thread に結びつく)。別 thread からの呼出は固定 reason `launch_thread_unsupported` で拒否する。
+
 - allowlist 外 path の metadata 読取りと O_PATH は残る。
 - High: proxy は address 集合のみを制限し、TLS SNI と HTTP Host を検査しない。同一 CDN / anycast address の他 site / tenant に届き得る。
 - 最初の DNS 解決が外部 resolver / hosts により攻撃者 global address を返す問題は閉じない。
@@ -608,3 +613,4 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 |2026-10-09|v1.1|§1.3: MCP transport の置換 (spool、`afx.sock` 廃止) は trade にも適用と明記。§3.4: `perf_event_open` を EPERM 列から外す (分類表の EACCES 1 件が正)。§3.1 の policy hash は canonical 形を `nr\tname\taction\tcondition_id` (条件定義を含む) に改めた後、実装時に更新する|第 1 波ブリーフの要確認 (sol 助言 2026-10-09)|—|
 |2026-10-09|v1.2|§3.1 policy hash を canonical 形改定後の値に更新、BPF 命令数と filter flags を記載|A2 実装 (sc-a2) の受領|—|
 |2026-10-09|v1.3|codex の実行 artifact を native ELF に固定 (shebang wrapper は cli_artifact_unsupported)、wait_exec は保存した (st_dev, st_ino) と比較、fingerprint から wrapper を除外|T3b 実装で nvm の codex (Node の #! script) が execveat(AT_EMPTY_PATH) で ENOENT と実測|—|
+|2026-10-10|v1.4|§7.1 に SETUP_FAILED (type 6) と frame 6 種を明記、§12 に multicall・即終了 CLI・main thread 限定 (launch_thread_unsupported) の残余を追加|T3b 実装の実測と /code-review の指摘|—|
