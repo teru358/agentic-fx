@@ -1,8 +1,8 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.5
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.6
 
-版: v1.5
+版: v1.6
 
-日付: 2026-10-09
+日付: 2026-10-10
 
 対象チケット: `sandbox-escape-via-user-daemons-unmeasured`
 
@@ -192,21 +192,30 @@ seccomp は `connect` を USER_NOTIF にする。supervisor は `CONTINUE` を�
 | 9 | `pidfd_getfd`、SO_DOMAIN、SOCK_STREAM、TCP を検査 | ENOTSOCK / EPERM |
 | 10 | ID_VALID (4 回目) | ENOENT なら複製を閉じ接続しない |
 | 10b | lock 下で RUNNING の検査と committed 記録を原子的に更新。proxy 宛は pending entry を追加 | STOPPING なら EPERM |
-| 11 | copy 済み sockaddr で複製 fd に raw `connect` | tracee の nonblocking 設定を維持 |
+| 11 | copy 済み sockaddr で複製 fd に raw `connect`。複製の socket が blocking なら、tracee が connect で停止している間だけ一時的に `O_NONBLOCK` を立てて connect し、poll で `CONNECT_WAIT_SEC` まで待つ。完了は再 connect で確定する。元が nonblocking なら flag に触れず 1 回だけ connect する | 期限切れは複製を shutdown して EPERM `connect_timeout`。flag を元へ戻せなければ EPERM `supervisor_resource` と `supervisor_died` |
 | 11b | proxy 宛の成功 / EINPROGRESS は client tuple を記録し、1 秒の ack を待つ | 不一致・timeout は shutdown して ECONNREFUSED |
 | 12 | `NOTIF_SEND`、entry 削除、複製と pidfd close | ENOENT は正常 race として記録 |
 
 IPv6、IPv4-mapped、`AF_UNSPEC`、scope id 付き IPv6 は拒否する。fd 番号の差替えは同一 principal の race だが、複製 fd は TCP と許可宛先を再検査するため境界を越えない。
 
+段 11 の待ちと確定の契約は次のとおり。
+
+- `CONNECT_WAIT_SEC` = `HANDLER_DEADLINE_SEC` 2.0 − proxy ack 1.0 − `RESPONSE_MARGIN_SEC` 0.25 = 0.75 秒とし、handler の起動時点から数える。待ちの後に proxy の ack を待っても watchdog の期限に届くようにするための配分である。期限を既に過ぎていれば connect を打たない。
+- 再 connect による確定: Linux の inet_stream_connect は SS_CONNECTING の socket への再 connect で結果を返し、成功なら SS_CONNECTED に遷移する。SO_ERROR を読むだけでは SS_CONNECTING が残り、tracee の次の connect が 0 を返してしまうため使わない。再 connect の EISCONN は 0 に揃え、最初の connect の EISCONN は透過する。
+- flag は応答より前に元へ戻す（tracee は起きた瞬間に flag を観測できる）。期限切れは shutdown し（SYN_SENT の shutdown は切断になる）、EPERM `connect_timeout` で返す。
+- getsockname と shutdown は複製 fd に socket オブジェクトを作らず libc を直接呼ぶ。`socket.socket(fileno=)` は既定 timeout で複製を nonblocking にし、初期化に失敗すると fd を閉じるためである。
+- 一時的な `O_NONBLOCK` は open file description に付くため、その間に tracee の別 thread が同じ socket を使うと `O_NONBLOCK` が見える（EAGAIN を受け得る）。同一 principal 内の窓で、境界は越えない（§12）。
+
 #### 4.2.2 supervisor、receiver、deadline
 
 | 部品 | 契約 |
 |---|---|
-| receiver | handoff 完了後の listener の唯一の所有者。`poll([listener, stop_efd])` の POLLIN 時だけ RECV。最外周 `finally` で receiver 異常を確定する |
+| receiver | handoff 完了後の listener の唯一の所有者。`poll([listener, stop_efd])` の POLLIN 時だけ RECV。最外周 `finally` で receiver 異常を確定する。handoff で listener に `O_NONBLOCK` を立て、RECV の EAGAIN は poll へ戻る（実測 kernel 7.0: NOTIF_RECV は `O_NONBLOCK` を無視し、POLLIN 後に取り消された通知は ENOENT。`O_NONBLOCK` は将来の kernel 向けの防御） |
 | state | `RUNNING`、`STOPPING`、`CLOSED`、`STUCK`、`in_flight`、committed record は一つの lock で守る |
-| slot | `CONNECT_SLOTS = 16`。handler 起動前に nonblocking 取得し、飽和は EAGAIN |
-| watchdog | handler deadline は monotonic 2 秒、監視頻度 100 ms。例外、timeout、想定外 RECV / SEND errno は supervisor fault |
+| slot | `CONNECT_SLOTS = 16`。handler 起動前に nonblocking 取得し、飽和は EAGAIN。handler の生涯起動数 `HANDLER_SPAWN_MAX = 1 << 16` は thread 生成の暴走防御で、接続数の割り当てではない（slot を取って実際に起動した数だけ数え、構築失敗は戻す）。超過は EPERM と `supervisor_stalled` |
+| watchdog | handler deadline は monotonic 2 秒、監視頻度 100 ms。例外、timeout、想定外 RECV / SEND errno は supervisor fault。proxy ack の待ち期限は `min(now + 1 s, began + HANDLER_DEADLINE_SEC − RESPONSE_MARGIN_SEC)` |
 | stop | lock 下の RUNNING → STOPPING が線形化点。stop_efd に書いた後、新しい RECV・commit・handler 起動を禁止 |
+| handoff | watchdog を receiver より先に起動する。起動できなければ listener を受け取らずに `supervisor_died` を記録し、handoff から例外を送出する（呼び出し側が listener を閉じる） |
 | close | receiver は `in_flight` が 0 になるまで close しない。CLOSED は不可逆で ack を立てる |
 | STUCK | handler が drain deadline 内に終わらなければ、listener を開いたまま RECV / commit を禁止し ack を立てる。最終 close は worker process の終了 |
 
@@ -236,6 +245,8 @@ worker は deadline を受けて ACK を返すまで stop と cgroup 操作を�
 | handoff 前 setup 失敗 | worker が所有する未移譲 listener fd（存在する場合）と status 親端を close → `cgroup.kill` → `populated 0` → worker の `launcher_proc.wait()` / reap → WorkerRunner の `worker_proc.wait()` / reap → afx の保険 kill / 空確認 → rmdir |
 | handoff 後 setup / runtime 失敗 | `GO` 送信失敗、`wait_exec` の `EXEC_FAILED` / order / malformed / timeout、`cli_exec_unproven`、`spool_flood` は receiver-owned STOPPING → drain → CLOSED、または STUCK の系列に入る。その後は該当する handoff 後の行に従う |
 
+全系列で dispatcher の停止は `populated 0` の後とする。handoff 前（JOINED 前）の kill は、launcher が mission cgroup に居ないため、`cgroup.kill` に加えて launcher pid への SIGKILL を行う。CLI 本体が先に終わり reap 済みの場合、reap の段は no-op として記録する。
+
 EOF、cleanup ACK、`populated 0` は worker exit の証拠ではない。最初の worker wait の timeout は SIGKILL 後の再 wait を必要とし、deadline までに reap できなければ `worker_not_reaped` とする。CLOSED、STUCK ack、`populated 0`、direct-parent reap、保険 kill / 確認、rmdir は全て同じ deadline 内に終える。
 
 ### 4.3 CONNECT proxy
@@ -264,7 +275,7 @@ pending entry は複製 fd、`fstat().st_ino`、connect 後の client tuple、ac
 4. client lookup をもう一度行い inode と cookie が不変であることを確認し、peer tuple を添えて ack を立てる。
 5. supervisor は 1 秒まで ack を待ち、tuple が一致すれば tracee に実値を返す。不一致・timeout は複製を `shutdown(SHUT_RDWR)` して ECONNREFUSED とする。
 
-0 件、2 件以上、lookup 消失、state 不一致、再 lookup 不一致、IPv4-mapped、supervisor を経ない接続は要求行を読まずに close する。NETLINK_SOCK_DIAG を作れなければ `proxy_start_failed` とする。
+0 件、2 件以上、lookup 消失、state 不一致、再 lookup 不一致、IPv4-mapped、supervisor を経ない接続は要求行を読まずに close する。IPv4-mapped は、client の family 判別が INET_DIAG でできれば明示検査し、できなければ一致 0 件で拒否する（実測で確定し、T4d の報告で版を合わせる）。NETLINK_SOCK_DIAG を作れなければ `proxy_start_failed` とする。
 
 ### 4.4 nested Landlock
 
@@ -396,9 +407,10 @@ worker は launcher 起動前、backend execution artifact を open した同じ
 
 | 発生点 | reason / 分類 |
 |---|---|
-| admission | `arch_unsupported`、`landlock_abi_too_old`、`seccomp_unavailable`、`seccomp_user_notif_unavailable`、`seccomp_wait_killable_unavailable`、`pidfd_thread_unavailable`、`ptrace_scope_unsupported`、`cli_artifact_unsupported`、`cgroup_*`、`unit_stop_policy_unsupported`、`spool_create_failed`、`proxy_start_failed`、`runtime_fingerprint_selftest_failed`、`safety_canary_failed` は `sandbox_unavailable` |
+| admission | `arch_unsupported`、`landlock_abi_too_old`、`seccomp_unavailable`、`seccomp_user_notif_unavailable`、`seccomp_wait_killable_unavailable`、`pidfd_thread_unavailable`、`ptrace_scope_unsupported`、`cli_artifact_unsupported`、`cgroup_*`、`unit_stop_policy_unsupported`、`cgroup_create_failed`（mkdir・上限・fd open）、`cgroup_topology_unsupported`（自己位置）、`spool_create_failed`、`proxy_start_failed`、`runtime_fingerprint_selftest_failed`、`safety_canary_failed` は `sandbox_unavailable` |
 | setup | `inherited_seccomp_filter`、`credentials_unexpected`、`rlimit_failed`、`subreaper_failed`、Landlock / seccomp / self-check failure、`attestation_*`、`launcher_died`、`cgroup_join_failed` は `sandbox_unavailable` |
 | runtime | `supervisor_died`、`supervisor_stalled`、`proxy_died` は `sandbox_unavailable`。`spool_flood` と `cli_exec_unproven` は `failed` |
+| 通知単位 | `supervisor_resource`（fd 枯渇等、または O_NONBLOCK の復元失敗）、`connect_timeout`（複製への connect が `CONNECT_WAIT_SEC` 内に確定しない、または ack 待ちの期限切れ）、`handler_start`（handler thread を起動できず receiver が EPERM を返す）は、その通知の EPERM の理由であり、supervisor は続行する（復元失敗は加えて `supervisor_died`） |
 | cleanup | `cleanup_deadline_exceeded` は `sandbox_unavailable`。`worker_not_reaped`、`cgroup_cleanup_timeout`、`cgroup_not_empty`、`cgroup_rmdir_failed` は次 mission gate を閉じる |
 
 ## 8. fingerprint と admission
@@ -480,7 +492,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 40. fork、vfork、posix_spawn、thread、`clone3` fallback、subreaper child を実 syscall trace で検証する。
 41. EAGAIN と 503 注入下の三 CLI を検証し、失敗 fingerprint を登録しない。
 42. disposable user service で unit name、11 property、self move、wrapper / Delegate 対照、unit removal を検証する。
-43. STUCK blocking connect を実 cgroup で fault inject し、listener open、new tracee block、direct-parent reap、SIGKILL 後再 wait、rmdir gate、commit 後 stop を検証する。
+43. blocking connect は STUCK にならず `connect_timeout` で拒否されることを観測する。STUCK は「commit 後に handler が止まる場合」を実 cgroup で fault inject し、listener open、new tracee block、direct-parent reap、SIGKILL 後再 wait、rmdir gate、commit 後 stop を検証する。
 44. cleanup request 前、deadline 受領前、ACK 後の worker 停止を fault inject し、deadline 一回発行、ACK 非依存 wait、SIGKILL 後再 wait、`worker_not_reaped` gate を検証する。
 45. `pids.max` 到達時の zombie、`populated 0`、rmdir、次 subreaper、外部 process 非影響を検証する。
 46. disposable `Type=exec` / `NotifyAccess=none` service の stop が有限 timeout 後 cgroup 全体を SIGKILL し、unit fixture と admission 負例を検証する。
@@ -496,7 +508,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | T3a | unit admission、cgroup topology、cleanup gate | D-12、D-19、D-23、D-24 |
 | T3b | launcher、status protocol、close table | A2、T2 |
 | T3c | CLI subreaper | T3b |
-| T3d1 | notification、receiver、handoff、watchdog | A2、T3b |
+| T3d1 | notification、receiver、handoff、watchdog（投入済み、main `adc26eb`） | A2、T3b |
 | T3d2 | cgroup lifecycle、deadline、direct-parent reap | T3a、T3d1 |
 | T4a | CONNECT parser | なし |
 | T4b | resolver、range、fixed address set | なし |
@@ -521,6 +533,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 - 即終了する CLI (起動直後に exit) は EOF 後の `/proc/<pid>/exe` が読めず `cli_exec_unproven` になる。確認不能は fail closed とし、成功へ推測昇格しない。
 - `launch_cli` は worker の main thread からだけ呼ぶ (`PR_SET_PDEATHSIG` は親 thread に結びつく)。別 thread からの呼出は固定 reason `launch_thread_unsupported` で拒否する。
 
+- connect 代行中の一時的な `O_NONBLOCK` は open file description に付くため、tracee の別 thread が同じ socket を使うと見える。同一 principal 内の窓で境界は越えない。
 - allowlist 外 path の metadata 読取りと O_PATH は残る。
 - High: proxy は address 集合のみを制限し、TLS SNI と HTTP Host を検査しない。同一 CDN / anycast address の他 site / tenant に届き得る。
 - 最初の DNS 解決が外部 resolver / hosts により攻撃者 global address を返す問題は閉じない。
@@ -545,7 +558,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | R3 | `pids.max`、`memory.max`、worker NOFILE の実測固定 |
 | R4 | ABI 8、user notification、WAIT_KILLABLE、PIDFD_THREAD、INET_DIAG、Yama の admission |
 | R5 | inode handoff、collision、disconnect、mapped IPv6 |
-| R6 | STUCK、blocking connect、commit 後 stop、実 cgroup kill |
+| R6 | STUCK（commit 後に handler が止まる場合）、blocking connect の `connect_timeout` 拒否、commit 後 stop、実 cgroup kill |
 | R7 | deadline emission fault injection、wait / reap / re-wait |
 | R8 | product BPF、canary、mutation、handoff 前後 cleanup、direct-parent wait |
 | R9 | supported fingerprint 集合が空 |
@@ -615,3 +628,4 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 |2026-10-09|v1.3|codex の実行 artifact を native ELF に固定 (shebang wrapper は cli_artifact_unsupported)、wait_exec は保存した (st_dev, st_ino) と比較、fingerprint から wrapper を除外|T3b 実装で nvm の codex (Node の #! script) が execveat(AT_EMPTY_PATH) で ENOENT と実測|—|
 |2026-10-10|v1.4|§7.1 に SETUP_FAILED (type 6) と frame 6 種を明記、§12 に multicall・即終了 CLI・main thread 限定 (launch_thread_unsupported) の残余を追加|T3b 実装の実測と /code-review の指摘|—|
 |2026-10-10|v1.5|§4.2 段 1: RECV の ENOENT は通知単位の終了 (receiver 続行)、POLLHUP は drain → CLOSED と明記|T3d1 実装の裁定|—|
+|2026-10-10|v1.6|§4.2.1 段 11: blocking connect の一時 O_NONBLOCK・`CONNECT_WAIT_SEC` 0.75 秒・再 connect での確定・`connect_timeout`、libc 直呼び。§4.2.2: receiver の O_NONBLOCK、`HANDLER_SPAWN_MAX`、ack 期限、handoff の watchdog 先行起動。§4.2.3: dispatcher 停止は `populated 0` の後、handoff 前 kill は launcher pid へ SIGKILL。§4.3.1: IPv4-mapped の扱い。§7.2: `supervisor_resource` / `connect_timeout` / `handler_start`、`cgroup_create_failed` / `cgroup_topology_unsupported`。§10 受入 43、§12 残余、§12.1 R6、§11 T3d1|T3d1 実装の投入と T3d2 / T4d 裁定の反映|—|
