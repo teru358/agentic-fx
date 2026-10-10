@@ -1,6 +1,6 @@
-# [afx-ops] operations surface の分離と自己隔離 v1.3
+# [afx-ops] operations surface の分離と自己隔離 v1.4
 
-版: v1.3
+版: v1.4
 
 日付: 2026-10-10
 
@@ -71,7 +71,7 @@
 
 notify の送信先 URL は設定ではなく secret として `secret/webhook.url` に置く (§5.1)。bot の token は `secret/discord.token` である。bot の allowlist と mention 先のキー名は T6 で固定し、bot の固定 plan に加える。
 
-`ops.toml` は ops が隔離前に config dir の検査済み fd から読み、機能ごとの固定 plan と照合する。その機能に固有のキーだけを許し、未知のキー、他機能のキー、型違反は固定 reason `config_invalid` で隔離前に止まる。`ops.toml` を隔離後に読み直さない。
+`ops.toml` は ops が隔離前に config dir の検査済み fd から読み、機能ごとの固定 plan と照合する。その機能に固有のキーだけを許し、未知のキー、他機能のキー、型違反は固定 reason `config_invalid` で隔離前に止まる。`key_dir` は config / state / secret dir と同一又はその内側であってはならない。`read_config` と、`prepare_dirs` より前の隔離処理の両方で、realpath と directory 境界により検査し、違反は `config_invalid` とする。config dir の fd は起動処理だけが所有し、隔離後の body へ渡さない (`Isolated.config.config_dir_fd` は `None`)。`ops.toml` を隔離後に読み直さない。
 
 ### 3.2 bot
 
@@ -97,6 +97,8 @@ web は損益、成績、稼働状態、承認一覧・詳細だけを表示す�
 
 web は初版では認証を持たず、127.0.0.1 限定・read-only の route だけを境界とする (§12 裁定 1)。UI 用の secret も session も作らない。listener の port は `ops.toml` の `port` から読み、production では `0` を許さない。
 
+`aiohttp.web` の import は `mimetypes` が `/etc/mime.types` を開くため、隔離後に初めて import すると `EACCES` になる。web runtime module の import は隔離前に済ませ、Landlock 規則は追加しない。
+
 ### 3.4 notify
 
 notify は event cursor から固定 schema の event を読み、event ID で重複を落としてから generic HTTPS webhook へ送る。成功した位置だけを機能固有の状態領域に保存するため、配送は at-least-once である。送信先には event code と許可された固定 fields だけを summary として送り、approval payload、agent claim、reject reason、鍵、自由文、内部例外を送らない。送信失敗は上限付き exponential retry と原因別警告抑制で扱う。
@@ -109,15 +111,17 @@ enroll は §2 の v1.13 manifest 遷移にだけ従い、online enroll は行�
 
 本体 client と afx-ops client は、socket 所有者、親 directory、`SO_PEERCRED`、instance lock の FLOCK WRITE 保持者、保持者の生存を確認してから鍵を送る共有 server 認証契約を独立実装する。共有契約では `SO_PEERPIDFD` は取得できる場合に pid 照合へ使い、取得不能でも拒否理由にしない。`/proc/locks` の dev 不一致は保持者の `/proc/<pid>/fd` readlink 照合へ fallback する。共通の fixture や一方の内部実装を正とせず、共有契約の spec 表から生成した JSON ケースを第三者 oracle として両 client の別 process に流す。fixture は隔離した HOME / root、実 UDS fake daemon、実 instance lock、server が受信した pre-auth byte 数、client の rc / code を固定成果物とし、oracle の許可 / 拒否判定と照合する。
 
+起動順は固定する。`cli` が `ops.toml` を読む → `prepare_dirs` → API 鍵を `read_token` で digest 照合して `Isolated.api_token: bytes` として保持 → feature secret → listener の pre-bind → fd 整理 → Landlock → seccomp → `PR_SET_DUMPABLE=0` → 自己検査 → `run(plan, config, body)` が server 認証 `wait_ready` → `READY=1` → 通知 fd close → body、である。鍵読取りの失敗 reason は `key_not_initialized` / `key_dir_invalid` / `key_ready_invalid` / `key_not_enrolled` / `key_ready_not_committed` / `key_revoked` / `key_missing` / `key_file_invalid` / `key_digest_mismatch` / `key_path_mismatch`（rc 71）とし、server 認証の失敗は rc 3 と `ApiError.reason` とする。
+
 ## 5. 自己隔離と server 認証
 
 ### 5.1 Landlock と接続
 
 Landlock は pathname UDS への `connect` を仲介せず、path 指定の接続は Landlock 下でも通る。`lstat` / `stat` の metadata 読取りも Landlock の対象外である。このため、隔離後も socket path に connect し、既存の server 認証をその接続ごとに行う。保持した UDS 親 directory fd や instance lock fd、`openat` / `connectat` による接続は用いない。socket activation も採用しない。本体は ops を spawn せず、UDS server を本体自身が作る契約だからである。
 
-鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。配置の検査は次のとおりとする。config dir は 0755 または 0750 (他者書込み不可、group 書込みも不可)、state dir は 0700 で ops が隔離前に作る、secret dir は 0700、secret file は 0600 とし、secret は bot = `discord.token`、notify = `webhook.url`、web は持たない。既存 dir は親から `O_NOFOLLOW` で開いて fstat で検査し、symlink・他 uid・緩い mode は固定 reason `config_dir_invalid` / `state_dir_invalid` で隔離前に止まる。Landlock 規則は検査した fd から作る。
+鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。`key_dir` は config / state / secret dir と同一又はその内側に置かず、`read_config` と `prepare_dirs` 前の隔離処理で realpath と directory 境界により二重に検査する。違反は `config_invalid` とする。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。配置の検査は次のとおりとする。config dir は 0755 または 0750 (他者書込み不可、group 書込みも不可)、state dir は 0700 で ops が隔離前に作る、secret dir は 0700、secret file は 0600 とし、secret は bot = `discord.token`、notify = `webhook.url`、web は持たない。既存 dir は親から `O_NOFOLLOW` で開いて fstat で検査し、symlink・他 uid・緩い mode は固定 reason `config_dir_invalid` / `state_dir_invalid` で隔離前に止まる。Landlock 規則は検査した fd から作る。
 
-Landlock には自分の鍵・設定・状態、必要ランタイム、機能に必要な外向き通信だけを許す。server 認証の `/proc` 規則は `/proc/locks` の leaf file に対する `READ_FILE` と、起動時に `os.getpid()` で解決した自己 `/proc/<ops-pid>` directory に対する `READ_FILE` と `READ_DIR` だけとする。`/proc/self` symlink は使わない。後者は `SO_PEERPIDFD` の fdinfo を読み pid を照合するためだけに使う。`/proc` 全体、他 pid の directory、`/proc/<peer-pid>/fd` は許可しない。同 uid の別 process の `environ` 等を侵害 process に読ませないためである。
+Landlock には自分の鍵・設定・状態、必要ランタイム、機能に必要な外向き通信だけを許す。全 feature の規則に `/dev/urandom` の `READ_FILE` を加える。隔離後の `os.urandom`、`secrets`、`uuid4` が `/dev/urandom` を再 open するためである。server 認証の `/proc` 規則は `/proc/locks` の leaf file に対する `READ_FILE` と、起動時に `os.getpid()` で解決した自己 `/proc/<ops-pid>` directory に対する `READ_FILE` と `READ_DIR` だけとする。`/proc/self` symlink は使わない。後者は `SO_PEERPIDFD` の fdinfo を読み pid を照合するためだけに使う。`/proc` 全体、他 pid の directory、`/proc/<peer-pid>/fd` は許可しない。同 uid の別 process の `environ` 等を侵害 process に読ませないためである。
 
 接続ごとに、afx-ops 固有 admission を共有 server 認証の前段として適用する。これは共有契約を置き換えず、より厳しくするだけである。
 
@@ -132,7 +136,7 @@ pidfd と lock の判定は次の固定規則に従う。`/proc/locks` の行は
 
 ### 5.2 seccomp
 
-隔離順は、(1) `ops.toml`、API 鍵、feature secret を安全に開いて読み (§3.1.1、§4)、web は loopback listener を pre-bind / listen して検査する、(2) 不要な継承 fd を閉じる、(3) Landlock、(4) seccomp、(5) `PR_SET_DUMPABLE=0` と自己検査、(6) server 認証 (`wait_ready`) の成功後に `READY=1` を送る (§6.2)、(7) 業務処理、とする。web は (5) の自己検査成功後まで accept を呼ばない。任意段の失敗は token を送らず終了する。
+隔離順は §4 の固定順に従う。すなわち `ops.toml` → `prepare_dirs` → digest 照合済み API 鍵 → feature secret → web の loopback listener の pre-bind / listen → fd 整理 → Landlock → seccomp → `PR_SET_DUMPABLE=0` → 自己検査 → `wait_ready` → `READY=1` → 通知 fd close → body とする。`run(plan, config, body)` が後半を担い、web は自己検査成功後まで accept を呼ばない。任意段の失敗は token を送らず終了する。
 
 全 profile は canonical syscall 番号表を持つ。architecture、番号上限、同一番号の重複、未分類、条件式を生成時に拒否し、最終 BPF の hash を検査する。`clone3` は ENOSYS とし glibc に legacy `clone` への fallback をさせる。afx-ops は固有条件 ID `afx-ops-clone-thread-only-v1` と、それを実装する独立 BPF 条件を持つ。`clone` は `CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID` の thread flags と完全一致するときだけ許可し、それ以外は EPERM とする。`CLONE_NEW*` 又は `CLONE_PARENT` を含む `clone`、`unshare`、`setns` は EPERM とする。共通拒否集合は `ptrace`、`process_vm_readv`、`process_vm_writev`、`pidfd_getfd`、`kcmp`、`process_madvise`、`perf_event_open`、`bpf`、`io_uring_setup` / `io_uring_enter` / `io_uring_register`、keyring、namespace / mount 操作、`bind`、`listen` とする。`PR_SET_PTRACER` は拒否し、`PR_SET_DUMPABLE` は setup 中の 0 設定だけを許す。
 
@@ -191,7 +195,7 @@ enable が crash して marker が残ると afx は起動できない。`afx ops
 
 ### 6.2 unit 契約
 
-各有効機能の unit は `Type=notify`、`Requisite=afx.service`、`PartOf=afx.service`、`After=afx.service`、`Restart=on-failure`、`RestartSec=5s`、`StartLimitIntervalSec=60s`、`StartLimitBurst=3` を持つ。`afx.service` 側の該当 `Wants=afx-ops@<機能>.service` は維持する。`BindsTo=afx.service` は使わない。`BindsTo=` は `Requires=` の強い版で、ops の単独 start が afx を start してしまうためである。`Requisite=` は afx が inactive なら ops の start を失敗させ、afx を pull-in しない。afx の `Wants=` が ops を pull-in し、`After=` の後に ops 自身が afx の生存を server 認証で確認して readiness を待つ。ops crash は afx の取引・資金保護 tick を止めない。afx の停止・再起動が ops へ伝わること、afx 復帰時に `Wants=` で ops も再起動することは、実 user manager で実証するまで契約に含めない (§11、AC-12)。
+各有効機能の unit は `Type=notify`、`Requisite=afx.service`、`PartOf=afx.service`、`After=afx.service`、`Restart=on-failure`、`RestartSec=5s`、`StartLimitIntervalSec=60s`、`StartLimitBurst=3` を持つ。`afx.service` 側の該当 `Wants=afx-ops@<機能>.service` は維持する。`BindsTo=afx.service` は使わない。`BindsTo=` は `Requires=` の強い版で、ops の単独 start が afx を start してしまうためである。実 systemd user manager 259 では、`Requisite=` により afx inactive 時の ops 単独 start は失敗し afx を起こさず、afx start は `Wants=` で ops を引く。afx の explicit restart は `PartOf=` により ops も再起動する。afx の main を SIGKILL すると、ops は afx が死んでいる窓の間 active のまま残り、afx の自動再起動の restart job が `PartOf=` を伝播して ops を stop → start する。この伝播は ops の `NRestarts` を増やさない。`After=` の後に ops 自身が afx の生存を server 認証で確認して readiness を待つ。ops crash は afx の取引・資金保護 tick を止めない。
 
 `afx.service` 側の `Wants=afx-ops@<機能>.service` は drop-in `afx.service.d/afx-ops.conf` で足す。ops は `NOTIFY_SOCKET` へ鍵を読む前に connect し、`READY=1` は自己隔離の自己検査の後ではなく、server 認証 (`wait_ready`) の成功後に送る。通知 fd は起動処理の中だけで保持し、送信後すぐ閉じて body へ渡さない。認証が通らなければ `READY=1` は送られず、unit は active にならない。
 
@@ -208,6 +212,8 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 |notify|generic HTTPS webhook の URL (secret に置く) と event 種類|送信先へ到達できる。probe の送信が実運用 event と区別できる形は T8 で固定する|
 
 疎通確認は本体 (`afx ops enable`) が `afx-ops probe <feature>` を subprocess で呼んで行う。本体と afx-ops は互いを import しない (O-1)。呼出しは afx-ops の絶対 path で行い、secret は先に feature の secret file に置いてから呼び、argv、env、stdin に渡さない。probe は secret file と `ops.toml` を自分で読む。戻りは終了コードと固定 reason だけで、secret や外部サービスの応答本文を返さない。
+
+probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）、未知 feature は rc 2 `unknown_feature`、bot / notify の未実装 probe は rc 69 `probe_not_implemented`、runtime 表で利用不能は rc 70 `runtime_unavailable`、`config_dir_missing` / `config_dir_invalid` / `config_invalid` / `secrets_failed` は rc 71（想定外は `startup_internal_error`）、web の bind 失敗は rc 73 `probe_bind_failed` とする。web probe は loopback に bind して直ちに close し、port 0 を `config_invalid` として拒否する。probe は非隔離で state dir を作らず、argv / env / stdin に secret を渡さない。
 
 疎通に失敗したら、ウィザードは設定と secret を再質問できる (`--reconfigure` 相当)。誤った token や URL は、疎通に成功するまで確定せず (stage は `staged` のまま)、既存設定が揃っているという理由で再質問を省いて誤設定を固定しない。
 
@@ -246,7 +252,7 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 |AC-9|`ops-bot` の正しい actor header は監査行と `(principal, actor)` job 所有に残り、決定作成と polling が同じ actor で成功する。ops-bot の決定 / polling で header なし、形式外、又は他 principal の header は v1.13 契約どおり拒否され、`decided_by` は principal のままである|
 |AC-10|web は隔離前の `127.0.0.1` listener だけで (認証なし、§12 裁定 1) 表示でき、隔離前の接続が handler に届かず隔離後に初めて処理される。実 trace は runtime が使う `accept4` 又は `accept` を一つに固定し、番号表はその syscall だけを許す。直接 HTTP、web 鍵、侵害を模した route のいずれからも変更 / 承認はできない|
 |AC-11|notify は実 event を generic HTTPS webhook へ送り、重複 event ID を識別できる。許可外 field、自由文、鍵が payload に無い|
-|AC-12|実 systemd user manager で機能別 unit の `Requisite=`、`PartOf=`、`After=`、restart / start-limit 設定を観測する。afx が inactive のとき ops の単独 start は失敗し、afx を pull-in しない。afx の `Wants=` は ops を pull-in する。ops crash は 5 秒後に再起動、60 秒 3 回で start-limit となる。afx 停止、explicit restart、crash での ops の停止・再起動の伝播は、実 user manager で観測して挙動を確定してから、この条件へ追記する (それまでは §11 の残余)。READY は server 認証成功後に送られるので、UDS が 30 秒以内に認証できれば active になり、期限超過なら `READY=1` を送らず fail closed となる。UDS ready が 30 秒以内なら起動し、期限超過なら fail closed となる|
+|AC-12|実 systemd user manager 259 で機能別 unit の `Requisite=`、`PartOf=`、`After=`、restart / start-limit 設定を観測する。afx が inactive のとき ops の単独 start は `Requisite=` で失敗し、afx を pull-in しない。afx の `Wants=` は ops を pull-in する。afx の explicit restart は ops も再起動する。afx main の SIGKILL では、ops は afx が死んでいる窓の間 active のまま残り、afx の自動再起動の restart job が `PartOf=` で ops を stop → start する。この ops の再起動で `NRestarts` は増えない。ops crash は 5 秒後に再起動、60 秒 3 回で start-limit となる。READY は server 認証成功後に送られるので、UDS が 30 秒以内に認証できれば active になり、期限超過なら `READY=1` を送らず fail closed となる。UDS ready が 30 秒以内なら起動し、期限超過なら fail closed となる|
 |AC-13|共有 server 認証の spec 表から生成した JSON の black-box ケースを、本体 client と afx-ops の**共有 server 認証 verifier**へ同一入力として与える。afx-ops 側は固有 admission を通さない専用 harness から、その verifier を別 process で直接呼ぶ。socket 所有者、親 directory、peer uid、lock holder、保持者生存、optional pidfd、lock inode 交換、dev 不一致時の readlink fallback、`/proc/locks` 不可を含み、各ケースの fake daemon が記録した pre-auth byte 数、client rc / code が第三者 oracle の許可 / 拒否結果と一致する|
 |AC-14|全 off では ops unit と `Wants=` が無い。disable の各外部操作の直前・直後、stage 更新の直前・直後で crash させ、`enabled → stopping-ops → uninstalled → disabled` の唯一の再開規則を観測する。停止失敗は `enabled`、uninstall 失敗は `stopping-ops` から再開し、uninstall 確認失敗は対象 unit が active なら `enabled`、止まっているが資材・`Wants=`・load 状態が残るなら `stopping-ops` へ戻り、最後の disable 後には対象 unit、`Wants=`、ops 用 unit 雛形が無く、鍵は revoke されない|
 |AC-15|**公開 afx-ops 要求経路**を、固有 admission と共有 server 認証 verifier の連鎖で呼ぶ。pidfd 不可と dev 不一致は共有 oracle が許可するケースでも afx-ops が固定 reason で拒否し、pre-auth byte 数は 0 となる。本体 client は共有契約どおり optional pidfd と dev 不一致 fallback を維持する|
@@ -260,7 +266,7 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 |T3|鍵 lifecycle と enable 状態機械|停止中 enroll、crash 回復、stage file の再開 / rollback 境界を実 systemd で証明する|
 |T4|UDS client と再認証|共有 server 認証 oracle、ops 固有 pidfd / dev admission、要求期間の pidfd 所有、lock holder 照合、偽 server 拒否、再起動時 fail closed を実 UDS で証明する|
 |T5|自己隔離|Landlock 規則、feature 別 seccomp 番号表、`clone3` ENOSYS、thread-only legacy `clone`、trace 固定 accept loop、canary、cross-process token 防御を実 process で証明する|
-|P|前提束|依存 (`discord.py` / `aiohttp`) の一括追加、`ops.toml` schema と隔離前の読取り・固定 plan 照合、`cli.py` の feature → runtime 表、API 鍵の受け渡し (`Isolated` の field)、READY の時機 (server 認証後)、JSON snapshot の書込み部品、unit の依存変更 (`Requisite=`) を固定する。T6〜T9 より前に投入する|
+|P|前提束|**実装済み（ops-p-b、main 投入前）**。依存 (`discord.py` / `aiohttp`) の一括追加、`ops.toml` schema と隔離前の読取り・固定 plan 照合、`cli.py` の feature → runtime 表、API 鍵の受け渡し (`Isolated` の field)、READY の時機 (server 認証後)、JSON snapshot の書込み部品、unit の依存変更 (`Requisite=`) を固定した。T6〜T9 の前提は揃った。|
 |T6|plain gate と bot|allowlist、二段の原子的確認 (claim と ephemeral confirm)、JSON snapshot の永続化、3 秒 defer と worker thread、action 付き persistent View、actor header、指定順の adopt / repost / reconcile / View 除去を実装・試験する|
 |T7|web|認証なしのローカル限定 (§12 裁定 1)、`ops.toml` の port、loopback pre-bind、自前 accept loop、read-only principal、書込み到達不能を確認する|
 |T8|notify|event cursor、重複許容、DNS を含む generic HTTPS webhook 配送を確認する|
@@ -283,7 +289,7 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 |resolv.conf の置換|resolv.conf が rename で置き換わると名前解決が失敗し、機能が非零終了する。再起動で張り直す|
 |tgkill 拒否|`tgkill` の拒否により `abort()` は SIGSEGV で終わる|
 |web の port 源|web の loopback port は `ops.toml` の `port` から読む。衝突すると ops は非零終了し、`StartLimitBurst` で止まる|
-|afx 側の障害の伝播|`BindsTo=` を使わないので、afx が crash したとき ops が連動して止まる保証はない。`Requisite=` + `PartOf=` の停止・再起動の伝播は実 user manager で実証するまで契約に含めない。afx が居ない間、ops は server 認証に失敗して `READY=1` を送れず、非零終了する|
+|afx 側の障害の伝播|afx main の SIGKILL では、ops は afx が死んでいる窓の間 active のまま残る。その後 afx の自動再起動の restart job が `PartOf=` を伝播し、ops を stop → start する（この再起動で `NRestarts` は増えない）。この一時的な active 状態では ops が daemon の可用性を保証するものではない|
 |承認後の回復|誤承認後の plugin disable / rollback は既存の未整備事項のままであり、afx-ops は解決しない|
 |bot の永続状態|SQLite を使わないので、snapshot は単一 file の全体書換えである。rename の前後の crash では旧版か新版のどちらかが残る (部分書込みは残らない)。規模は承認件数に比例して小さく、書込み頻度は承認の操作に限る|
 |仮運用の afx の終了コード|仮運用の `afx.service` は `screen -Dm` 経由で起動するため終了コードを伝えず、`RestartPreventExitStatus=75` が効かない。恒久形の unit で有効になる|
@@ -309,3 +315,4 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 |2026-10-10|v1.1|§6.1 enable の systemd 停止固定を廃し durable marker `enroll_in_progress` + instance flock に変更し、afx 側の契約 (reason、終了コード 75、`RestartPreventExitStatus`) を §6.1.2 に新設。§6.1.1 の `uninstalled` 確認失敗の戻り先を実物で決める形に変更。§5.1 鍵配置と holder 生存の pidfd poll、§5.2 の sendto / recvfrom・AF_NETLINK・tgkill / flock・PROFILE_VERSION 2、§6.2 の Type=notify と drop-in、§11 の残余を追記|本番 afx.service は `~/.config/systemd/user/` に実体があり `systemctl --user` の停止固定が同名ファイル衝突で失敗する (実測、systemd 259)。runtime 版は検索順で効かない。ユーザー裁定 2026-10-10 (案 A)。他は実装で確定した小修正|—|
 |2026-10-10|v1.2|T3 / T4 / T5 の実装 (main 3873a99) で確定した小修正。§6.1 started は停止前の afx が active のときだけ起動、afx_before_stop の記録、terminal stage の実物照合、固定 reason 追加、§6.1.1 の is_stopped、§5.1 配置の検査、§5 の pidfd / lock / errno 分類、§3.3 の accept_exhausted、§11 に仮運用の終了コード残余、§12 に abort 操作の未決を追加|T3 / T4 / T5 の実装で確定した小修正||
 |2026-10-10|v1.3|前提束 P の裁定 8 件を反映。§3.1.1 に `ops.toml` を新設、§4 / §5.1 に API 鍵の隔離前読取りと `Isolated` での受渡し、§3.2 に JSON snapshot の永続化 (SQLite 不使用)・投稿識別子から generation を除外・二段承認 (claim / confirm / cancel)・worker thread、§6.2 の READY=1 を server 認証後へ、unit を `Requisite=` + `PartOf=` + `After=` へ変更 (伝播は実証後に AC-12 へ)、§7 を `afx-ops probe` 契約と再質問へ、§10 に前提束 P と順序、§3.3 / AC-10 / T7 の cookie 認証を初版認証なしに統一、drop-in 名を実装に合わせる|前提束 P の裁定 (ユーザー承認 2026-10-10)、T6〜T9 草案の検収で出た不一致の解消|—|
+|2026-10-10|v1.4|前提束 P の実装確定事項を反映。`/dev/urandom` の Landlock 許可、`key_dir` の二重境界検査と config fd 非継承、固定起動順と鍵 / probe の reason・rc 契約、aiohttp import 時機、systemd 259 の `Requisite=` / `Wants=` / `PartOf=` の実測、P 実装済み状態を明記|ops-p-b の実装・実測を spec へ反映||
