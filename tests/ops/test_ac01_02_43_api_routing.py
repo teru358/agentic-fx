@@ -156,7 +156,7 @@ _ALLOWED = {
 }
 
 
-@pytest.mark.parametrize("principal", list(Principal))
+@pytest.mark.parametrize("principal", [Principal.OPERATOR, Principal.APPROVER])
 def test_ac43_every_route_by_scope_matches_the_table(api, principal):
     env = api.env
     client = api.client(principal)

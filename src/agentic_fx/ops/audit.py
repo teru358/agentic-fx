@@ -128,7 +128,8 @@ class AuditStore:
         try:
             self._conn.execute("BEGIN IMMEDIATE")
             request = self._conn.execute(
-                "SELECT request_id,authenticated_principal,endpoint,idempotency_key,job_id "
+                "SELECT request_id,authenticated_principal,asserted_actor,endpoint,"
+                "idempotency_key,job_id "
                 "FROM ops_requests a WHERE id=? AND phase='accepted' AND NOT EXISTS "
                 "(SELECT 1 FROM ops_requests t WHERE t.target_ref='audit:' || a.id)",
                 (audit_id,)).fetchone()
@@ -137,10 +138,10 @@ class AuditStore:
                 return False
             self._conn.execute(
                 "INSERT INTO ops_requests(request_id,endpoint,authenticated_principal,"
-                "body_sha256,target_ref,phase,result_code,job_id,response_json,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "asserted_actor,body_sha256,target_ref,phase,result_code,job_id,"
+                "response_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (uuid.uuid4().hex, request["endpoint"], request["authenticated_principal"],
-                 "", f"audit:{audit_id}", phase, code, request["job_id"], payload,
+                 request["asserted_actor"], "", f"audit:{audit_id}", phase, code, request["job_id"], payload,
                  self._wall_clock().isoformat()))
             if request["idempotency_key"] is not None and code in TRANSIENT_FAILURES:
                 # 監査の終端行は残し、冪等行だけを同じ transaction で消す。

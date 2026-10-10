@@ -475,3 +475,99 @@ def test_ac36_accepted_is_durable_before_the_first_side_effect(ops_env, monkeypa
     assert set(calls) == {c for c, e in ENDPOINTS.items() if e.mutating}
     assert seams.seen.get(code), f"side-effect seam for {code} was not reached"
     assert seams.seen[code] == [1] * len(seams.seen[code]), seams.seen
+
+
+@pytest.mark.parametrize("kind", ["ask", "ask_failed", "improve", "reject", "reject_failed"])
+def test_terminal_row_exists_before_the_job_is_seen_terminal(ops_env, kind):
+    # polling で終端状態が見えた時点で、監査の終端行が別接続から読めること。
+    future = concurrent.futures.Future()
+    if kind == "ask_failed":
+        future.set_exception(RuntimeError("boom"))
+    else:
+        future.set_result("answer")
+    service = ops_env.service(ask_submitter=lambda q: future, improve_supervisor=_Improve())
+    seen = []
+    original = service.jobs.finish
+
+    def observed_finish(job, **kwargs):
+        reader = ops_env.connect()
+        try:
+            row = reader.execute(
+                "SELECT phase FROM ops_requests WHERE target_ref=?",
+                (f"audit:{job.audit_id}",)).fetchone()
+        finally:
+            reader.close()
+        seen.append(None if row is None else row["phase"])
+        return original(job, **kwargs)
+
+    service.jobs.finish = observed_finish
+    if kind in ("ask", "ask_failed"):
+        reply = service.ask(OPERATOR, "k-ask", QUESTION)
+    elif kind == "improve":
+        reply = service.improve(OPERATOR, "k-imp")
+    else:
+        approval = ops_env.make_plugin_approval(name="p1", mission_id=1)
+        if kind == "reject_failed":
+            def failing(_job):
+                raise OpsError(ErrorCode.INVALID_STATE)
+            service._execute_decision = failing
+        reply = service.reject(APPROVER, approval, REASON)
+    job = wait_job(service, reply["job_id"])
+    failed = kind.endswith("_failed")
+    expected = "failed" if failed else "succeeded"
+    assert job["state"] == ("failed" if failed else "done")
+    assert seen == [expected]
+
+
+def _terminal_phases(ops_env, audit_id):
+    reader = ops_env.connect()
+    try:
+        return [r["phase"] for r in reader.execute(
+            "SELECT phase FROM ops_requests WHERE target_ref=?",
+            (f"audit:{audit_id}",)).fetchall()]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize("kind,fault", [("ask", "lane"), ("ask", "insert"),
+                                        ("reject", "insert")])
+def test_job_whose_terminal_audit_cannot_be_written_is_not_done(ops_env, monkeypatch,
+                                                                 kind, fault):
+    # 終端行を書けない job を done にすると「done なら終端行がある」が崩れる。
+    future = concurrent.futures.Future()
+    future.set_result("answer")
+    state = {"armed": False}
+
+    def submitter(_question):
+        state["armed"] = True
+        return future
+
+    service = ops_env.service(ask_submitter=submitter, improve_supervisor=_Improve())
+    if fault == "lane":
+        original_lane = service._ops_lane
+
+        def lane(deadline):
+            if state["armed"]:
+                raise OpsError(ErrorCode.DATABASE_BUSY)
+            return original_lane(deadline)
+
+        monkeypatch.setattr(service, "_ops_lane", lane)
+    else:
+        target = service.audit if kind == "ask" else service._decide_audit
+
+        def broken(*_args, **_kwargs):
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(target, "terminal", broken)
+    if kind == "ask":
+        reply = service.ask(OPERATOR, "k-audit", QUESTION)
+    else:
+        approval = ops_env.make_plugin_approval(name="p1", mission_id=1)
+        reply = service.reject(APPROVER, approval, REASON)
+    job = wait_job(service, reply["job_id"])
+    assert (job["state"], job["result_code"]) == ("failed", "audit_write_failed")
+    audit_id = service.jobs.lookup(reply["job_id"]).audit_id
+    assert _terminal_phases(ops_env, audit_id) == []
+    monkeypatch.undo()
+    service.recover_after_journal()
+    assert _terminal_phases(ops_env, audit_id) == ["outcome_unknown"]

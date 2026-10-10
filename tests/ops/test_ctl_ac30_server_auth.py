@@ -5,9 +5,14 @@
 """
 from __future__ import annotations
 
+import json
 import os
+import resource
+import signal
 import subprocess
 import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -162,3 +167,105 @@ def test_lock_holders_ignores_waiters_and_other_files(tmp_path):
         f"3: POSIX  ADVISORY  WRITE 400 {dev} 0 EOF\n"
         f"4: FLOCK  ADVISORY  READ 500 {dev} 0 EOF\n")
     assert client.lock_holders(lock_path, proc_locks=proc) == {100}
+
+
+# ------------------------------------------------ 機械可読 oracle (fixtures/server_auth_oracle.json)
+
+ORACLE = Path(__file__).with_name("fixtures") / "server_auth_oracle.json"
+ORACLE_SERVER = Path(__file__).with_name("_auth_oracle_server.py")
+
+
+def _oracle_params():
+    cases = json.loads(ORACLE.read_text(encoding="utf-8"))["cases"]
+    return [pytest.param(case, id=case["id"], marks=() if case["realizable"] else
+                         pytest.mark.skip(reason=case["unrealizable_because"]))
+            for case in cases]
+
+
+def _no_core() -> None:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+
+def _start_oracle_server(socket_path: Path, record: Path, *, lock_dir: Path | None,
+                         orphan: bool) -> tuple[subprocess.Popen, int]:
+    args = [sys.executable, str(ORACLE_SERVER), str(socket_path), str(record),
+            str(lock_dir) if lock_dir is not None else "-", "answer"]
+    if orphan:
+        args.append("orphan")
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True, preexec_fn=_no_core)
+    word, pid = proc.stdout.readline().split()
+    assert word == "ready"
+    if orphan:
+        # listen した親を回収し、peer の pid を「存在しない」にする。
+        assert proc.wait(10) == 0
+    return proc, int(pid)
+
+
+def _received(record: Path, *, expect_any: bool) -> list[bytes]:
+    deadline = time.monotonic() + (5.0 if expect_any else 0.5)
+    while True:
+        lines = record.read_text().splitlines() if record.exists() else []
+        if lines or time.monotonic() >= deadline:
+            return [bytes.fromhex(line) for line in lines]
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("case", _oracle_params())
+def test_server_auth_oracle_case(ops_env, tmp_path, case):
+    keys.ensure_initialized(keys.key_dir(ops_env.root), root=ops_env.root)
+    setup, expect = case["setup"], case["expect"]
+    data = ops_env.root / "data"
+    run_dir = data / "run"
+    assert not run_dir.exists()
+    if setup["dir"] == "symlink":
+        real_dir = tmp_path / "real-run"
+        real_dir.mkdir(mode=0o700)
+        run_dir.symlink_to(real_dir)
+    else:
+        run_dir.mkdir(mode=0o700)
+        real_dir = run_dir
+    os.chmod(real_dir, 0o700)
+    socket_path = real_dir / "api.sock"
+    if setup["socket"] == "symlink_to_socket":
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir(mode=0o700)
+        socket_path = elsewhere / "real.sock"
+        (run_dir / "api.sock").symlink_to(socket_path)
+    record = tmp_path / "record"
+    proc, server_pid, other_lock = None, None, None
+    try:
+        if setup["socket"] == "regular_file":
+            (run_dir / "api.sock").write_text("")
+            os.chmod(run_dir / "api.sock", 0o600)
+        else:
+            if setup["server_lock"] == "other_process":
+                other_lock = acquire_instance_lock(data)
+            lock_dir = data if setup["server_lock"] in ("held", "replaced_inode") else None
+            proc, server_pid = _start_oracle_server(
+                socket_path, record, lock_dir=lock_dir,
+                orphan=setup["server_process"] == "exited_after_listen")
+            if setup["server_lock"] == "replaced_inode":
+                fresh = data / "instance.lock.fresh"
+                fresh.write_text("")
+                os.replace(fresh, data / "instance.lock")
+        os.chmod(real_dir, int(setup["dir_mode"], 8))
+        uid = os.getuid() if setup["client_uid"] == "self" else os.getuid() + 1
+        rc, out, err = run_ctl(ops_env.root, ["whoami"], uid=uid)
+        received = _received(record, expect_any=expect["key_sent"])
+    finally:
+        if other_lock is not None:
+            other_lock.close()
+        if server_pid is not None:
+            os.kill(server_pid, signal.SIGKILL)
+        if proc is not None:
+            if proc.poll() is None:
+                proc.wait(5)
+            proc.stdout.close()
+    assert rc == expect["rc"], err
+    if expect["key_sent"]:
+        assert received and b"Authorization: Bearer " + _token(ops_env) in received[0]
+        assert "principal: operator" in out
+    else:
+        assert sum(len(chunk) for chunk in received) == expect["pre_auth_bytes"]
+        assert "鍵を送りませんでした" in err
+        assert f"({expect['reason']})" in err

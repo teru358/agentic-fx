@@ -342,7 +342,7 @@ def test_ac16_live_socket_is_not_removed(api, ops_env):
 # ---------------------------------------------------------------- AC-17
 
 def test_ac17_internal_error_returns_incident_only_and_logs_it(api, caplog):
-    def broken(principal):
+    def broken(principal, **_kwargs):
         raise RuntimeError("secret internal detail /home/x")
 
     api.service.whoami = broken

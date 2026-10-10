@@ -31,8 +31,8 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
-from .contracts import (PRINCIPAL_SCOPES, ErrorCode, OpsError, Principal, Scope,
-                        validate_principal_scopes)
+from .contracts import (PRINCIPAL_SCOPES, ErrorCode, OpsError, Principal,
+                        Scope, validate_asserted_actor, validate_principal_scopes)
 from .keys import KeySet
 from .service import ENDPOINTS
 
@@ -292,6 +292,7 @@ def build_routes(endpoints: dict) -> tuple[Route, ...]:
 # local_guard の 3 本は UDS listener だけで routing する。
 ROUTES = build_routes(ENDPOINTS)
 _PIDFD_REQUIRED = frozenset({Scope.DECIDE, Scope.LOCAL_GUARD})
+ACTOR_HEADER = "x-afx-asserted-actor"
 
 
 def _match(method: str, path: str, transport: str) -> tuple[Route, dict] | None:
@@ -317,8 +318,12 @@ def _body(request: Request) -> dict:
 
 
 def _call(ops, route: Route, params: dict, request: Request, principal: Principal,
-          deadline: float):
-    """route を ops 関数へ写す。本文の decided_by / asserted_actor 等は読まない。"""
+          deadline: float, actor: str | None = None):
+    """route を ops 関数へ写す。本文の decided_by / asserted_actor 等は読まない。
+
+    ``actor`` は検査済みの ``X-Afx-Asserted-Actor``。認可には使わず、記録と job
+    所有者の照合にだけ渡す。
+    """
     q, h = request.query, request.headers
     key = h.get("idempotency-key")
     name = route.handler
@@ -338,9 +343,9 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
     if name == "reflection_status":
         return ops.reflection_status(principal, _int(params["order_id"]), deadline=deadline)
     if name == "whoami":
-        return ops.whoami(principal)
+        return ops.whoami(principal, asserted_actor=actor)
     if name == "job_get":
-        return ops.get_job(principal, params["id"])
+        return ops.get_job(principal, params["id"], asserted_actor=actor)
     if name == "events":
         limit = _int(q.get("limit"), default=100)
         if not 1 <= limit <= 500:
@@ -356,10 +361,10 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
     if name in ("approve", "retry"):
         method = ops.approve if name == "approve" else ops.retry
         return method(principal, _int(params["id"]), body.get("payload_sha256"),
-                      deadline=deadline)
+                      deadline=deadline, asserted_actor=actor)
     if name == "reject":
         return ops.reject(principal, _int(params["id"]), body.get("reason"),
-                          deadline=deadline)
+                          deadline=deadline, asserted_actor=actor)
     if name == "killswitch_reset":
         return ops.reset_kill_switch(principal, body.get("expected_generation"),
                                      deadline=deadline)
@@ -383,7 +388,8 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
     if name == "policy":
         return ops.add_policy(principal, key, body.get("text"), deadline=deadline)
     if name == "job_cancel":
-        return ops.cancel_job(principal, params["id"], deadline=deadline)
+        return ops.cancel_job(principal, params["id"], deadline=deadline,
+                              asserted_actor=actor)
     raise OpsError(ErrorCode.NOT_FOUND)
 
 
@@ -592,13 +598,16 @@ class ApiServer:
                                    max_body=self.limits.max_body_bytes,
                                    monotonic=self._monotonic)
             principal = self._authenticate(request)
+            # 申告主体の形式と送信元は認証後・routing 前に検査する (path や scope に依らず 400)。
+            # 必須かどうかは service が handler ごとに判定する。
+            actor = validate_asserted_actor(principal, request.headers.get(ACTOR_HEADER))
             found = _match(request.method, request.path, transport)
             if found is None:
                 raise _Reject(404, ErrorCode.NOT_FOUND)
             route, params = found
             if route.scope in _PIDFD_REQUIRED and not peer.pidfd_verified:
                 raise _Reject(403, ErrorCode.FORBIDDEN)
-            data = _call(self._ops, route, params, request, principal, deadline)
+            data = _call(self._ops, route, params, request, principal, deadline, actor)
             if route.method == "GET":
                 _log.debug("api read %s", route.handler)
             return route.accepted, {"ok": True, "data": data}

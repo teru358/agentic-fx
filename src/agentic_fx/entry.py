@@ -7,6 +7,7 @@ from pathlib import Path
 
 from agentic_fx import service
 from agentic_fx.backtest import cli as backtest_cli
+from agentic_fx.ops.contracts import Principal
 
 _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "improve")
 
@@ -31,9 +32,11 @@ def main(argv: list[str] | None = None) -> int:
     keys_parser = sub.add_parser("keys", help="操作 API の鍵管理 (サービス停止中だけ)")
     keys_sub = keys_parser.add_subparsers(dest="keys_action", required=True)
     keys_sub.add_parser("init", help="初回の鍵を作る (作成済みなら何もしない)")
-    for action in ("rotate", "revoke"):
-        p = keys_sub.add_parser(action, help=f"principal の鍵を {action} する")
-        p.add_argument("principal", choices=("operator", "approver"))
+    for action, text in (("enroll", "未登録の principal の鍵を作って登録する"),
+                         ("rotate", "principal の鍵を rotate する"),
+                         ("revoke", "principal の鍵を revoke する")):
+        p = keys_sub.add_parser(action, help=text)
+        p.add_argument("principal", choices=tuple(member.value for member in Principal))
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")

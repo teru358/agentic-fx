@@ -1240,6 +1240,9 @@ def _split_principal(argv: list[str]) -> tuple[Principal, list[str]]:
             principal = Principal(value)
         except ValueError:
             raise ClientError(RC_USAGE, USAGE) from None
+        # 常駐 service 用の principal は人間の CLI から名乗らせない。
+        if principal not in (Principal.OPERATOR, Principal.APPROVER):
+            raise ClientError(RC_USAGE, USAGE)
     return principal, rest
 
 

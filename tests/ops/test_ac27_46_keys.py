@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from agentic_fx.ops import keys
-from agentic_fx.ops.contracts import Principal
+from agentic_fx.ops.contracts import INITIAL_PRINCIPALS, Principal
 
 
 def _root(tmp_path: Path, name: str = "root") -> Path:
@@ -46,20 +46,20 @@ def test_ac27_first_init_creates_instance_dir_0700_and_two_keys_and_ready_0600(t
     directory = keys.key_dir(root)
     assert directory == Path.home() / ".config" / "agentic-fx" / "api" / keys.instance_id(root)
     created = keys.initialize(directory, root=root)
-    assert set(created) == set(Principal)
+    assert set(created) == set(INITIAL_PRINCIPALS)
     assert _mode(directory) == 0o700
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         path = directory / keys.key_file_name(principal)
         assert _mode(path) == 0o600
         token = _token(directory, principal)
         assert len(token) == 64 and int(token, 16) >= 0  # 256 bit
     assert _mode(directory / keys.READY_NAME) == 0o600
     ready = json.loads((directory / keys.READY_NAME).read_text())
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         entry = ready["principals"][principal.value]
         assert entry["state"] == "active" and entry["generation"] == 1
     loaded = keys.load_keyset(directory)
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         assert loaded.authenticate(_token(directory, principal)) is principal
     assert loaded.authenticate("0" * 64) is None
     assert loaded.authenticate("") is None
@@ -73,7 +73,7 @@ def test_ac27_keyset_holds_digests_not_plaintext(tmp_path):
     blob = repr(loaded) + repr(vars(loaded) if hasattr(loaded, "__dict__") else "")
     for slot in getattr(type(loaded), "__slots__", ()):
         blob += repr(getattr(loaded, slot))
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         assert _token(directory, principal) not in blob
 
 
@@ -116,7 +116,7 @@ def test_ac27_crashed_first_init_completes_only_the_missing_parts(tmp_path, step
     with pytest.raises(Crash):
         keys.initialize(directory, root=root, hook=_crash_at(step))
     before = {}
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         path = directory / keys.key_file_name(principal)
         if path.exists():
             before[principal] = (path.read_bytes(), path.stat().st_mtime_ns)
@@ -126,7 +126,7 @@ def test_ac27_crashed_first_init_completes_only_the_missing_parts(tmp_path, step
         assert path.read_bytes() == content
         assert path.stat().st_mtime_ns == mtime
     loaded = keys.load_keyset(directory)
-    for principal in Principal:
+    for principal in INITIAL_PRINCIPALS:
         assert loaded.authenticate(_token(directory, principal)) is principal
     leftovers = [p.name for p in directory.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == [] or all(name.startswith(".") for name in leftovers)
@@ -433,7 +433,7 @@ def test_ac27_first_init_leaves_only_the_two_keys_and_ready(tmp_path):
     directory = keys.key_dir(root)
     keys.initialize(directory, root=root)
     assert sorted(os.listdir(directory)) == sorted(
-        [keys.READY_NAME] + [keys.key_file_name(p) for p in Principal])
+        [keys.READY_NAME] + [keys.key_file_name(p) for p in INITIAL_PRINCIPALS])
 
 
 def test_ac46_key_dir_owned_by_another_uid_is_refused(tmp_path, monkeypatch):

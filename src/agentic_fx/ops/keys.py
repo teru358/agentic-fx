@@ -1,9 +1,13 @@
 """操作 API の principal 鍵: 生成・検査・rotate / revoke と `.ready` commit marker。
 
 鍵 dir は ``~/.config/agentic-fx/api/<instance_id>/`` (0700)、principal ごとの鍵と
-``.ready`` は 0600。``.ready`` は principal ごとの generation・状態・digest を持つ
-鍵集合の commit marker で、実体と一致しない状態は「どの世代も ready ではない」と
+``.ready`` は 0600。``.ready`` は登録済み principal ごとの generation・状態・digest を
+持つ鍵集合の commit marker で、実体と一致しない状態は「どの世代も ready ではない」と
 読み、API を起動しない。自動補完は初回 init (``.ready`` 未作成) だけ。
+
+manifest は v2 (``{"version": 2, "principals": {名前: entry}}``) で、map に無い既知
+principal は未登録。旧形式 v1 は固定の operator / approver だけを持つものとして読み、
+書換えは最初に成功した鍵変更 (enroll / rotate / revoke) のときだけ v2 で行う。
 
 server は鍵を読んだら平文を捨てて SHA-256 digest だけを保持し、定時間比較する。
 この module は ``.env`` を読まない。
@@ -25,10 +29,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .contracts import Principal
+from .contracts import INITIAL_PRINCIPALS, Principal
 
 READY_NAME = ".ready"
-READY_VERSION = 1
+READY_VERSION = 2
+_LEGACY_READY_VERSION = 1
+_KEY_OPS = ("enroll", "rotate", "revoke")
 _TOMBSTONE = b"revoked\n"
 _TOKEN_HEX_LEN = 64
 
@@ -203,15 +209,48 @@ def _read_ready(dir_fd: int) -> dict:
     except (ValueError, UnicodeDecodeError):
         raise KeySetError("ready_invalid") from None
     principals = ready.get("principals") if isinstance(ready, dict) else None
-    if (not isinstance(ready, dict) or ready.get("version") != READY_VERSION
-            or not isinstance(principals, dict)
-            or set(principals) != {p.value for p in Principal}):
+    if not isinstance(ready, dict) or not isinstance(principals, dict) or not principals:
+        # 登録が 1 件も無い manifest で API を開くと、誰も認証できない状態を黙って許す。
+        raise KeySetError("ready_invalid")
+    version = ready.get("version")
+    known = {p.value for p in Principal}
+    if type(version) is not int:
+        raise KeySetError("ready_invalid")
+    if version == _LEGACY_READY_VERSION:
+        # 旧形式は enum ではなく固定集合として読む (後から増えた principal を含めない)。
+        if set(principals) != {p.value for p in INITIAL_PRINCIPALS}:
+            raise KeySetError("ready_invalid")
+    elif version != READY_VERSION or not set(principals) <= known:
         raise KeySetError("ready_invalid")
     for entry in principals.values():
-        if (not isinstance(entry, dict) or type(entry.get("generation")) is not int
-                or entry.get("state") not in ("active", "preparing", "revoked")):
+        if not _entry_valid(entry):
             raise KeySetError("ready_invalid")
     return ready
+
+
+def _is_hex_digest(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == _TOKEN_HEX_LEN
+            and all(c in "0123456789abcdef" for c in value))
+
+
+def _entry_valid(entry: object) -> bool:
+    """state ごとの entry の形。active は digest、revoked は null、preparing は op を持つ。"""
+    if not isinstance(entry, dict) or type(entry.get("generation")) is not int:
+        return False
+    state = entry.get("state")
+    if state == "active":
+        return _is_hex_digest(entry.get("sha256"))
+    if state == "revoked":
+        # digest を持つ revoked は「旧鍵がまだ有効かもしれない」状態と区別できない。
+        return "sha256" in entry and entry["sha256"] is None
+    if state == "preparing":
+        return entry.get("op") in _KEY_OPS
+    return False
+
+
+def _registered(ready: dict) -> list[Principal]:
+    """manifest に載っている principal (enum の順)。"""
+    return [p for p in Principal if p.value in ready["principals"]]
 
 
 def _ready_bytes(principals: dict) -> bytes:
@@ -250,11 +289,12 @@ def load_keyset(directory: Path) -> KeySet:
         ready = _read_ready(dir_fd)
         digests: dict[Principal, str] = {}
         disabled: set[Principal] = set()
-        for principal in Principal:
+        for principal in _registered(ready):
             entry = ready["principals"][principal.value]
             if entry["state"] == "preparing":
                 raise KeySetError("ready_not_committed")
             if entry["state"] == "revoked":
+                _check_tombstone(dir_fd, principal)
                 disabled.add(principal)
                 continue
             try:
@@ -270,7 +310,7 @@ def load_keyset(directory: Path) -> KeySet:
                 raise KeySetError("digest_mismatch") from None
             digest = _digest(token)
             del token, raw
-            if not hmac.compare_digest(digest, str(entry.get("sha256", ""))):
+            if not hmac.compare_digest(digest, entry["sha256"]):
                 raise KeySetError("digest_mismatch")
             digests[principal] = digest
         return KeySet(digests, frozenset(disabled))
@@ -278,12 +318,30 @@ def load_keyset(directory: Path) -> KeySet:
         os.close(dir_fd)
 
 
+def _check_tombstone(dir_fd: int, principal: Principal) -> None:
+    """revoked の鍵 file が tombstone であることを内容で確かめる。
+
+    manifest だけが revoked で旧鍵が残っている状態は、鍵集合と実体の不一致として扱う。
+    """
+    try:
+        raw = _read_checked(dir_fd, key_file_name(principal))
+    except FileNotFoundError:
+        raise KeySetError("key_missing") from None
+    except OSError:
+        raise KeySetError("ready_invalid") from None
+    if not hmac.compare_digest(raw, _TOMBSTONE):
+        raise KeySetError("ready_invalid")
+
+
 def read_token(directory: Path, principal: Principal) -> str:
     """client が鍵を読む。同じ検査を通し、生成はしない。"""
     dir_fd = _open_dir(Path(directory))
     try:
         ready = _read_ready(dir_fd)
-        if ready["principals"][principal.value]["state"] != "active":
+        entry = ready["principals"].get(principal.value)
+        if entry is None:
+            raise KeySetError("not_enrolled")
+        if entry["state"] != "active":
             raise KeySetError("ready_not_committed")
         try:
             return _parse_token(_read_checked(dir_fd, key_file_name(principal)))
@@ -333,14 +391,14 @@ def initialize(directory: Path, *, root: Path, hook: Hook = _noop) -> list[Princ
             load_keyset(directory)
             return []
         created = []
-        for principal in Principal:
+        for principal in INITIAL_PRINCIPALS:
             name = key_file_name(principal)
             if _create_exclusive(dir_fd, name, (new_token() + "\n").encode(), hook, "key"):
                 created.append(principal)
         os.fsync(dir_fd)
         hook("keys_dir_synced")
         principals = {}
-        for principal in Principal:
+        for principal in INITIAL_PRINCIPALS:
             try:
                 token = _parse_token(_read_checked(dir_fd, key_file_name(principal)))
             except (OSError, ValueError, UnicodeDecodeError):
@@ -364,26 +422,38 @@ def ensure_initialized(directory: Path, *, root: Path) -> None:
     initialize(directory, root=root)
 
 
-def _begin(directory: Path, principal: Principal, op: str, hook: Hook,
-           allowed: tuple[str, ...]) -> tuple[int, dict, int] | None:
+# op ごとに、準備状態へ進めてよい元の状態。None は未登録。
+_BEGIN_FROM = {"enroll": (None,), "rotate": ("active", "revoked"), "revoke": ("active",)}
+# 既にその状態なら何も書かずに成功する (同じ command の結果が既に commit 済み)。
+_ALREADY_DONE = {"enroll": "active", "revoke": "revoked"}
+
+
+def _begin(directory: Path, principal: Principal, op: str,
+           hook: Hook) -> tuple[int, dict, int] | None:
     dir_fd = _open_dir(Path(directory))
     try:
         ready = _read_ready(dir_fd)
         principals = ready["principals"]
-        entry = principals[principal.value]
-        state = entry["state"]
-        if op == "revoke" and state == "revoked":
+        # 準備状態の残骸を完結できるのは、同じ principal への同じ command だけ。
+        # 別の command は残骸の上に重ねず、dir を変えずに断る。
+        for name, other in principals.items():
+            if other["state"] == "preparing" and (name, other["op"]) != (principal.value, op):
+                raise KeySetError("invalid_state")
+        entry = principals.get(principal.value)
+        state = None if entry is None else entry["state"]
+        if state == "preparing":
+            generation = entry["generation"]
+        elif op in _ALREADY_DONE and state == _ALREADY_DONE[op]:
             os.close(dir_fd)
             return None
-        if state == "preparing":
-            if entry.get("op") != op:
-                raise KeySetError("invalid_state")
-            generation = entry["generation"]
-        elif state in allowed:
-            generation = entry["generation"] + 1
+        elif state in _BEGIN_FROM[op]:
+            generation = 1 if entry is None else entry["generation"] + 1
             principals[principal.value] = {"generation": generation, "state": "preparing",
                                            "op": op}
             _replace(dir_fd, READY_NAME, _ready_bytes(principals), hook, "preparing")
+        elif state is None:
+            # 未登録への rotate / revoke は再実行しても通らない。enroll を促せる code にする。
+            raise KeySetError("not_enrolled")
         else:
             raise KeySetError("invalid_state")
         return dir_fd, principals, generation
@@ -392,25 +462,48 @@ def _begin(directory: Path, principal: Principal, op: str, hook: Hook,
         raise
 
 
+def _commit_new_key(dir_fd: int, principals: dict, principal: Principal, generation: int,
+                    hook: Hook) -> None:
+    """新鍵を一時 file → fsync → rename → dir fsync で置き、最後に ``.ready`` を commit。"""
+    token = new_token()
+    _replace(dir_fd, key_file_name(principal), (token + "\n").encode(), hook, "key")
+    principals[principal.value] = {"generation": generation, "state": "active",
+                                   "sha256": _digest(token)}
+    del token
+    _replace(dir_fd, READY_NAME, _ready_bytes(principals), hook, "ready")
+
+
+def enroll(directory: Path, principal: Principal, *, hook: Hook = _noop) -> bool:
+    """``未登録 → preparing(op=enroll, generation=1) → active(1)``。
+
+    既に active なら何も書かずに False。revoked は invalid_state (復活は rotate)。
+    途中で落ちたら同じ command で完了させる。他の principal の鍵と entry は変えない。
+    """
+    begun = _begin(directory, principal, "enroll", hook)
+    if begun is None:
+        return False
+    dir_fd, principals, generation = begun
+    try:
+        _commit_new_key(dir_fd, principals, principal, generation, hook)
+    finally:
+        os.close(dir_fd)
+    return True
+
+
 def rotate(directory: Path, principal: Principal, *, hook: Hook = _noop) -> None:
     """``active(g) → preparing(g+1) → active(g+1)``。途中で落ちたら同じ command で完了。"""
-    begun = _begin(directory, principal, "rotate", hook, ("active", "revoked"))
+    begun = _begin(directory, principal, "rotate", hook)
     assert begun is not None
     dir_fd, principals, generation = begun
     try:
-        token = new_token()
-        _replace(dir_fd, key_file_name(principal), (token + "\n").encode(), hook, "key")
-        principals[principal.value] = {"generation": generation, "state": "active",
-                                       "sha256": _digest(token)}
-        del token
-        _replace(dir_fd, READY_NAME, _ready_bytes(principals), hook, "ready")
+        _commit_new_key(dir_fd, principals, principal, generation, hook)
     finally:
         os.close(dir_fd)
 
 
 def revoke(directory: Path, principal: Principal, *, hook: Hook = _noop) -> None:
     """``active(g) → preparing(g+1) → revoked(g+1)``。既に revoked なら無変更。"""
-    begun = _begin(directory, principal, "revoke", hook, ("active",))
+    begun = _begin(directory, principal, "revoke", hook)
     if begun is None:
         return
     dir_fd, principals, generation = begun
@@ -426,7 +519,7 @@ def revoke(directory: Path, principal: Principal, *, hook: Hook = _noop) -> None
 # ------------------------------------------------------------ afx keys
 
 def run_keys_command(root: Path, action: str, principal: str | None = None) -> int:
-    """``afx keys init|rotate|revoke``。instance lock を取れる停止中だけ実行する。"""
+    """``afx keys init|enroll|rotate|revoke``。instance lock を取れる停止中だけ実行する。"""
     from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
     root = Path(root)
     directory = key_dir(root)
@@ -448,6 +541,11 @@ def run_keys_command(root: Path, action: str, principal: str | None = None) -> i
                 print(f"鍵を作成しました: {', '.join(p.value for p in created)} ({directory})")
             else:
                 print(f"鍵は初期化済みです ({directory})")
+        elif action == "enroll":
+            if enroll(directory, Principal(principal)):
+                print(f"{principal} の鍵を登録しました ({directory})")
+            else:
+                print(f"{principal} は登録済みです (無変更)")
         elif action == "rotate":
             rotate(directory, Principal(principal))
             print(f"{principal} の鍵を交換しました。daemon を起動して旧鍵が拒否されることを確認してください")
@@ -458,6 +556,10 @@ def run_keys_command(root: Path, action: str, principal: str | None = None) -> i
             return 2
         return 0
     except KeySetError as err:
+        if err.code == "not_enrolled":
+            print(f"afx keys: {principal} は未登録です (not_enrolled)。"
+                  f"先に `afx keys enroll {principal}` を実行してください", file=sys.stderr)
+            return 1
         print(f"afx keys: 失敗しました ({err.code})。同じ command の再実行で準備状態から"
               "完了させてください", file=sys.stderr)
         return 1

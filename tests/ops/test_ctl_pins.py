@@ -630,6 +630,16 @@ def test_unknown_principal_or_out_of_range_argument_is_usage_rc2(tmp_path, argv)
     assert "usage: afx ctl" in err
 
 
+@pytest.mark.parametrize("value", ["ops-bot", "ops-web", "ops-notify"])
+def test_ctl_refuses_service_principals_without_touching_keys(tmp_path, value):
+    # 常駐 service 用の鍵を CLI から選ばせない。鍵の読込も接続も起こさない。
+    for argv in (["--as", value, "whoami"], [f"--as={value}", "whoami"]):
+        rc, out, err = run_ctl(tmp_path, argv)
+        assert (rc, out) == (2, "")
+        assert "usage: afx ctl" in err
+    assert not keys.key_dir(tmp_path).exists()
+
+
 def test_socket_missing_from_an_existing_dir_is_reported_as_no_socket(ops_env):
     sock = _fake_env(ops_env)
     sock.parent.mkdir(mode=0o700, parents=True)

@@ -20,7 +20,7 @@ import pytest
 
 from agentic_fx.core.landlock import is_available
 from agentic_fx.ops import keys
-from agentic_fx.ops.contracts import Principal
+from agentic_fx.ops.contracts import INITIAL_PRINCIPALS
 
 from ._daemon import Daemon, base_env, init_root, socket_path
 
@@ -40,7 +40,7 @@ def test_ac7_real_daemon_env_cmdline_log_activity_and_stdout_hold_no_key(tmp_pat
     try:
         daemon.wait_listening()
         directory = keys.key_dir(root)
-        tokens = [keys.read_token(directory, p) for p in Principal]
+        tokens = [keys.read_token(directory, p) for p in INITIAL_PRINCIPALS]
         statuses = []
         for token in tokens:
             with _client(root, token) as client:
@@ -74,7 +74,7 @@ def test_ac7_worker_env_builders_drop_a_key_present_in_the_parent_env(tmp_path):
     (root / "data").mkdir(parents=True)
     directory = keys.key_dir(root)
     keys.initialize(directory, root=root)
-    tokens = [keys.read_token(directory, p) for p in Principal]
+    tokens = [keys.read_token(directory, p) for p in INITIAL_PRINCIPALS]
     env = base_env()
     # 起こす側の env に鍵がある最悪の場合を作る (本番では起きない)。
     env["AFX_LEAK_SENTINEL"] = tokens[0]

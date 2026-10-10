@@ -18,7 +18,7 @@ import httpx
 from agentic_fx.activity import ActivityLog
 from agentic_fx.ops import keys
 from agentic_fx.ops.api_server import ApiServer
-from agentic_fx.ops.contracts import Principal
+from agentic_fx.ops.contracts import INITIAL_PRINCIPALS
 from agentic_fx.ops.service import OpsService
 from agentic_fx.store import db
 
@@ -37,7 +37,7 @@ def main() -> int:
     keys.ensure_initialized(directory, root=root)
     server = ApiServer(service, keys.load_keyset(directory), root / "data" / "run" / "api.sock")
     server.start()
-    tokens = [keys.read_token(directory, p) for p in Principal]
+    tokens = [keys.read_token(directory, p) for p in INITIAL_PRINCIPALS]
     statuses = []
     for token in tokens + ["0" * 64]:
         transport = httpx.HTTPTransport(uds=str(server.socket_path))

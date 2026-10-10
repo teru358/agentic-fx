@@ -1,0 +1,7 @@
+{
+ "ready": "{\n \"principals\": {\n  \"approver\": {\n   \"generation\": 1,\n   \"sha256\": \"3e314c8f3181daa7b5cd6475213af05373319aab82b4e409d279a922427c8b28\",\n   \"state\": \"active\"\n  },\n  \"operator\": {\n   \"generation\": 1,\n   \"sha256\": \"a70749b75704deb8b8d49802c4ec8a25bf9c6232d18055305532f0a25f2db3a6\",\n   \"state\": \"active\"\n  }\n },\n \"version\": 1\n}\n",
+ "tokens": {
+  "operator": "83a88cc22e5acd1442da35d620923276974dbeb9d58cb0f2c38c8f25e1f1a84c\n",
+  "approver": "920a0622b9a1a9637cb96adc206d629f2e827dc886e237bf5daa151ac4ee82b4\n"
+ }
+}

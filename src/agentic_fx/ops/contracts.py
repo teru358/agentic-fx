@@ -1,6 +1,7 @@
 """ops 層の固定エラーと versioned な認可データ。"""
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 
@@ -63,6 +64,13 @@ class Scope(StrEnum):
 class Principal(StrEnum):
     OPERATOR = "operator"
     APPROVER = "approver"
+    OPS_BOT = "ops-bot"
+    OPS_WEB = "ops-web"
+    OPS_NOTIFY = "ops-notify"
+
+
+# 初回 init が鍵を作る principal (旧形式の固定集合と同じ)。他は enroll で後から登録する。
+INITIAL_PRINCIPALS: tuple[Principal, ...] = (Principal.OPERATOR, Principal.APPROVER)
 
 
 class ShellCaller(StrEnum):
@@ -83,7 +91,20 @@ PRINCIPAL_SCOPES: dict[Principal, frozenset[Scope]] = {
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
         Scope.APPROVALS_DETAIL, Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE}),
     Principal.APPROVER: frozenset(Scope),
+    # bot は決定と、その job を追う jobs.own だけ。operate / local_guard / logs.read は持たない。
+    Principal.OPS_BOT: frozenset({
+        Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
+        Scope.APPROVALS_DETAIL, Scope.JOBS_OWN, Scope.DECIDE}),
+    Principal.OPS_WEB: frozenset({
+        Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
+        Scope.APPROVALS_DETAIL, Scope.LOGS_READ}),
+    Principal.OPS_NOTIFY: frozenset({Scope.EVENTS_READ}),
 }
+
+# 外部主体を申告できる principal と、その値の形式 (Discord user ID)。
+ACTOR_PRINCIPALS: frozenset[Principal] = frozenset({Principal.OPS_BOT})
+_ACTOR_PATTERN = re.compile(r"discord:[0-9]{17,20}")
+ACTOR_MAX_BYTES = 28
 
 
 def validate_principal_scopes(table: dict[Principal, frozenset[Scope]] = PRINCIPAL_SCOPES) -> None:
@@ -102,3 +123,20 @@ def assert_authorized(principal: Caller, scope: Scope) -> None:
         return
     if not isinstance(principal, Principal) or scope not in PRINCIPAL_SCOPES[principal]:
         raise OpsError(ErrorCode.FORBIDDEN)
+
+
+def validate_asserted_actor(principal: Caller, actor: str | None) -> str | None:
+    """申告された外部主体を検査する。認可や decided_by の根拠にはしない。
+
+    申告できるのは ``ACTOR_PRINCIPALS`` だけで、値は ASCII の ``discord:`` と
+    17〜20 桁の十進数。それ以外 (空・空白・制御文字・非 ASCII を含む) は invalid_argument。
+    """
+    if actor is None:
+        return None
+    if principal not in ACTOR_PRINCIPALS or not isinstance(actor, str):
+        raise OpsError(ErrorCode.INVALID_ARGUMENT)
+    # \d は全角数字にも一致するので [0-9] の fullmatch で決める (末尾改行も許さない)。
+    if (not actor.isascii() or len(actor.encode("ascii")) > ACTOR_MAX_BYTES
+            or _ACTOR_PATTERN.fullmatch(actor) is None):
+        raise OpsError(ErrorCode.INVALID_ARGUMENT)
+    return actor

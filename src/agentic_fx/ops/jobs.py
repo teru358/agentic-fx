@@ -142,18 +142,36 @@ class JobRegistry:
         with self._lock:
             return self._jobs.get(job_id)
 
+    @staticmethod
+    def _owner_error(job: Job | None, principal: Caller, actor: str | None) -> ErrorCode | None:
+        """所有者の判定はここ一か所。別 principal の job は無いものとして扱い (NOT_FOUND)、
+        同じ principal で申告主体だけが違う場合は FORBIDDEN と区別する。"""
+        if job is None or job.authenticated_principal != principal:
+            return ErrorCode.NOT_FOUND
+        return None if job.asserted_actor == actor else ErrorCode.FORBIDDEN
+
+    @classmethod
+    def _owned(cls, job: Job | None, principal: Caller, actor: str | None) -> Job:
+        # 取得・取消は (principal, actor) の組が違えば job を見せない。
+        if cls._owner_error(job, principal, actor) is not None:
+            raise OpsError(ErrorCode.NOT_FOUND)
+        return job
+
+    def check_owner(self, job_id: str, principal: Caller, actor: str | None) -> None:
+        """受理前の拒否用。同じ principal で申告主体だけが違う job は FORBIDDEN。
+        存在しない・別 principal の job はここでは断らず、取得・取消の NOT_FOUND に任せる。"""
+        with self._lock:
+            error = self._owner_error(self._jobs.get(job_id), principal, actor)
+        if error is ErrorCode.FORBIDDEN:
+            raise OpsError(error)
+
     def get(self, job_id: str, principal: Caller, actor: str | None) -> Job:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or (job.authenticated_principal, job.asserted_actor) != (principal, actor):
-                raise OpsError(ErrorCode.NOT_FOUND)
-            return job
+            return self._owned(self._jobs.get(job_id), principal, actor)
 
     def cancel(self, job_id: str, principal: Caller, actor: str | None) -> Job:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None or (job.authenticated_principal, job.asserted_actor) != (principal, actor):
-                raise OpsError(ErrorCode.NOT_FOUND)
+            job = self._owned(self._jobs.get(job_id), principal, actor)
             if job.state in TERMINAL_STATES:
                 return job
             if job.state is JobState.RUNNING:

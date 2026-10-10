@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 from agentic_fx.ops import keys
-from agentic_fx.ops.contracts import Principal
+from agentic_fx.ops.contracts import INITIAL_PRINCIPALS
 
 CHILD = Path(__file__).with_name("_keyleak_child.py")
 
@@ -29,6 +29,6 @@ def test_ac7_keys_never_reach_env_argv_worker_env_log_or_activity(tmp_path):
     # 正しい鍵の要求が実際に通っている (拒否だけを見て緑にしない)
     assert report["statuses"] == [200, 200, 200, 200, 401, 401]
     assert report["log_bytes"] > 0 and report["activity_bytes"] > 0
-    tokens = [keys.read_token(keys.key_dir(root), p) for p in Principal]
+    tokens = [keys.read_token(keys.key_dir(root), p) for p in INITIAL_PRINCIPALS]
     for token in tokens:
         assert token not in result.stdout and token not in result.stderr

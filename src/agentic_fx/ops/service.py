@@ -33,8 +33,9 @@ from typing import Callable
 
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
-from .contracts import (PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError, Principal, Scope,
-                        ShellCaller, assert_authorized)
+from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
+                        Principal, Scope, ShellCaller, assert_authorized,
+                        validate_asserted_actor)
 from .events import EventStore
 from .jobs import Job, JobRegistry, JobState, new_job_id
 from .tail import activity_filter, tail_lines
@@ -123,6 +124,8 @@ def _is_busy(exc: BaseException) -> bool:
 
 
 _BUSY_ATTEMPT_MS = 50
+# 終端の監査行を書けなかった job の固定 code。
+AUDIT_WRITE_FAILED = "audit_write_failed"
 
 
 class _PatientConnection:
@@ -201,6 +204,14 @@ class _PatientConnection:
 def _authorize(caller: Caller, endpoint_code: str) -> None:
     """endpoint の認可は表の scope だけを参照する (§3.1)。"""
     assert_authorized(caller, ENDPOINTS[endpoint_code].scope)
+
+
+def _actor(caller: Caller, actor: str | None, *, required: bool) -> str | None:
+    """申告主体の検査。申告できる principal の決定作成と job 操作では欠落を許さない。"""
+    actor = validate_asserted_actor(caller, actor)
+    if required and actor is None and caller in ACTOR_PRINCIPALS:
+        raise OpsError(ErrorCode.INVALID_ARGUMENT)
+    return actor
 
 
 def _error_response(code: ErrorCode | str) -> dict:
@@ -373,13 +384,15 @@ class OpsService:
 
     def _accept(self, caller: Caller, endpoint: Endpoint, body: dict, target: str,
                 *, key: str | None, job_id: str | None = None,
-                audit: AuditStore | None = None) -> AcceptedRequest | IdempotencyReplay:
+                audit: AuditStore | None = None,
+                asserted_actor: str | None = None) -> AcceptedRequest | IdempotencyReplay:
         audit = audit or self.audit
         if endpoint.idempotent:
             return audit.accept_idempotent(
-                endpoint=endpoint.route, principal=caller, asserted_actor=None, key=key,
-                body=body, target_ref=target, job_id=job_id)
-        return audit.accept(endpoint=endpoint.route, principal=caller, asserted_actor=None,
+                endpoint=endpoint.route, principal=caller, asserted_actor=asserted_actor,
+                key=key, body=body, target_ref=target, job_id=job_id)
+        return audit.accept(endpoint=endpoint.route, principal=caller,
+                            asserted_actor=asserted_actor,
                             peer_pid=None, peer_exe=None, body=body, target_ref=target,
                             job_id=job_id)
 
@@ -430,14 +443,15 @@ class OpsService:
 
     def _mutate(self, caller: Caller, endpoint: Endpoint, body: dict, target: str,
                 action: Callable[[float, AcceptedRequest], dict], *, key: str | None = None,
-                deadline: float | None = None) -> dict:
+                deadline: float | None = None, asserted_actor: str | None = None) -> dict:
         """同期の変更要求。accepted を commit してから副作用、最後に終端行。"""
         self._ensure_accepting()
         deadline = self._deadline(deadline)
         with self._ops_lane(deadline):
             # lane 待ちの間に停止が始まっていれば、accepted を書かずに断る。
             self._ensure_accepting()
-            accepted = self._accept(caller, endpoint, body, target, key=key)
+            accepted = self._accept(caller, endpoint, body, target, key=key,
+                                    asserted_actor=asserted_actor)
             if isinstance(accepted, IdempotencyReplay):
                 return self._replay(accepted)
             try:
@@ -457,9 +471,10 @@ class OpsService:
 
     # ------------------------------------------------------------------ reads
 
-    def whoami(self, principal: Principal) -> dict:
+    def whoami(self, principal: Principal, *, asserted_actor: str | None = None) -> dict:
         _authorize(principal, "whoami")
-        return {"authenticated_principal": principal.value, "asserted_actor": None,
+        actor = _actor(principal, asserted_actor, required=False)
+        return {"authenticated_principal": principal.value, "asserted_actor": actor,
                 "scopes": sorted(scope.value for scope in PRINCIPAL_SCOPES[principal])}
 
     def status(self, principal: Caller, *, deadline: float | None = None) -> dict:
@@ -600,9 +615,12 @@ class OpsService:
                 "attempts": 0 if attempt is None else attempt["attempts"],
                 "last_attempt_at": None if attempt is None else attempt["last_attempt_at"]}
 
-    def get_job(self, principal: Caller, job_id: str) -> dict:
+    def get_job(self, principal: Caller, job_id: str, *,
+                asserted_actor: str | None = None) -> dict:
         _authorize(principal, "job_get")
-        return self._job_view(self.jobs.get(job_id, principal, None))
+        actor = _actor(principal, asserted_actor, required=True)
+        self.jobs.check_owner(job_id, principal, actor)
+        return self._job_view(self.jobs.get(job_id, principal, actor))
 
     @staticmethod
     def _job_view(job: Job) -> dict:
@@ -813,20 +831,24 @@ class OpsService:
                             action, deadline=deadline)
 
     def cancel_job(self, principal: Caller, job_id: str, *,
-                   deadline: float | None = None) -> dict:
+                   deadline: float | None = None, asserted_actor: str | None = None) -> dict:
         _authorize(principal, "job_cancel")
+        actor = _actor(principal, asserted_actor, required=True)
         if not isinstance(job_id, str) or not job_id:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        # 申告主体の不一致は受理前に断る (監査行を作らない)。照合は registry の一か所。
+        self.jobs.check_owner(job_id, principal, actor)
 
         def action(_deadline: float, _accepted: AcceptedRequest) -> dict:
-            job = self.jobs.cancel(job_id, principal, None)
+            job = self.jobs.cancel(job_id, principal, actor)
             if job.state is JobState.CANCELLED and job.audit_id is not None:
                 self._finish_job_audit(job, self.audit, self.events)
             self._job_event(job, self.events)
             return {"id": job.id, "state": job.state.value}
 
         return self._mutate(principal, ENDPOINTS["job_cancel"], {"job_id": job_id},
-                            f"job:{job_id}", action, deadline=deadline)
+                            f"job:{job_id}", action, deadline=deadline,
+                            asserted_actor=actor)
 
     def _guard_event(self, guard_kind: str, state: str, generation: int | None) -> None:
         self.events.emit_best_effort("guard_state_changed", "instance", {
@@ -943,35 +965,65 @@ class OpsService:
         try:
             try:
                 result = job.action(job)
+                state, code = JobState.DONE, None
             except BaseException as exc:
-                code = self._map_exception(exc) or ErrorCode.INTERNAL
-                if code is ErrorCode.INTERNAL:
+                mapped = self._map_exception(exc) or ErrorCode.INTERNAL
+                if mapped is ErrorCode.INTERNAL:
                     _log.exception("ops job failed kind=%s", job.kind)
-                state = (JobState.SHUTDOWN if code is ErrorCode.UNAVAILABLE
+                state = (JobState.SHUTDOWN if mapped is ErrorCode.UNAVAILABLE
                          and self.stop_event.is_set() else JobState.FAILED)
-                self.jobs.finish(job, state=state, error_code=code.value, result=job.result)
-            else:
-                self.jobs.finish(job, state=JobState.DONE, result=result)
-            self._close_job_with_ops_lane(job)
+                code, result = mapped.value, job.result
+            state, code, result = self._seal_terminal_audit(
+                job, state, code, result, self._close_job_with_ops_lane)
+            self.jobs.finish(job, state=state, error_code=code, result=result)
+            self._job_event_with_ops_lane(job)
         finally:
             with self._threads_lock:
                 self._operation_threads.discard(threading.current_thread())
 
-    def _close_job_with_ops_lane(self, job: Job) -> None:
+    def _seal_terminal_audit(self, job: Job, state: JobState, code: str | None,
+                             result: dict | None, close) -> tuple[JobState, str | None,
+                                                                    dict | None]:
+        # 終端行は job を終端状態として見せる前に書く。polling で done が見えたら監査に
+        # 終端行がある保証のため、書けなかった done の job は failed で終える (失敗・停止の
+        # job は元の終端のまま)。accepted のまま残る行は次回起動の回復が outcome_unknown にする。
+        try:
+            close(job, state, code)
+        except Exception:
+            _log.warning("ops job terminal audit failed job=%s", job.id, exc_info=True)
+            if state is JobState.DONE:
+                return JobState.FAILED, AUDIT_WRITE_FAILED, job.result
+        return state, code, result
+
+    def _close_job_with_ops_lane(self, job: Job, state: JobState,
+                                 error_code: str | None) -> None:
+        with self._ops_lane(self._monotonic() + self.limits.request_deadline_seconds):
+            self._finish_job_audit(job, self.audit, self.events, state=state,
+                                   error_code=error_code)
+
+    def _job_event_with_ops_lane(self, job: Job) -> None:
+        # 共有接続を使うので event も ops lane の中で書く。
         try:
             with self._ops_lane(self._monotonic() + self.limits.request_deadline_seconds):
-                self._finish_job_audit(job, self.audit, self.events)
                 self._job_event(job, self.events)
         except Exception:
-            # 終端行を書けなければ accepted のまま残り、次の起動時回復が
-            # outcome_unknown を追記する。
-            _log.warning("ops job terminal audit failed job=%s", job.id, exc_info=True)
+            _log.warning("ops job event failed job=%s", job.id, exc_info=True)
 
-    def _finish_job_audit(self, job: Job, audit: AuditStore, events: EventStore) -> None:
+    def _job_event_best_effort(self, job: Job, events: EventStore) -> None:
+        try:
+            self._job_event(job, events)
+        except Exception:
+            _log.warning("decision job event failed job=%s", job.id, exc_info=True)
+
+    def _finish_job_audit(self, job: Job, audit: AuditStore, events: EventStore, *,
+                          state: JobState | None = None,
+                          error_code: str | None = None) -> None:
         if job.audit_id is None:
             return
-        code = "ok" if job.state is JobState.DONE else (job.error_code or job.state.value)
-        response = {"job_id": job.id, "state": job.state.value, "result_code": code}
+        if state is None:
+            state, error_code = job.state, job.error_code
+        code = "ok" if state is JobState.DONE else (error_code or state.value)
+        response = {"job_id": job.id, "state": state.value, "result_code": code}
         if audit.terminal(job.audit_id, code=code, response=response):
             self._project(job.audit_id, job.authenticated_principal,
                           ENDPOINTS[job.kind], code, events=events)
@@ -990,25 +1042,28 @@ class OpsService:
     # ------------------------------------------------------------- decisions
 
     def approve(self, principal: Caller, approval_id: int, payload_sha256: str, *,
-                deadline: float | None = None) -> dict:
+                deadline: float | None = None, asserted_actor: str | None = None) -> dict:
         return self._submit_decision(principal, "approve", approval_id, payload_sha256,
-                                     None, deadline)
+                                     None, deadline, asserted_actor)
 
     def reject(self, principal: Caller, approval_id: int, reason: str | None = None, *,
-               deadline: float | None = None) -> dict:
-        return self._submit_decision(principal, "reject", approval_id, None, reason, deadline)
+               deadline: float | None = None, asserted_actor: str | None = None) -> dict:
+        return self._submit_decision(principal, "reject", approval_id, None, reason, deadline,
+                                     asserted_actor)
 
     def retry(self, principal: Caller, approval_id: int, payload_sha256: str, *,
-              deadline: float | None = None) -> dict:
+              deadline: float | None = None, asserted_actor: str | None = None) -> dict:
         return self._submit_decision(principal, "retry", approval_id, payload_sha256,
-                                     None, deadline)
+                                     None, deadline, asserted_actor)
 
     def _submit_decision(self, caller: Caller, kind: str, approval_id: int,
                          digest: str | None, reason: str | None,
-                         deadline: float | None) -> dict:
+                         deadline: float | None, asserted_actor: str | None = None) -> dict:
         if kind not in _DECISION_KINDS:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
         _authorize(caller, kind)
+        # 申告主体は監査と job 所有者にだけ記録する。decided_by は principal から作る。
+        actor = _actor(caller, asserted_actor, required=True)
         if type(approval_id) is not int:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
         if kind != "reject" and (not isinstance(digest, str) or len(digest) != 64):
@@ -1026,7 +1081,7 @@ class OpsService:
         with self._ops_lane(deadline):
             self._ensure_accepting()
             accepted = self._accept(caller, endpoint, body, f"approval:{approval_id}",
-                                    key=None, job_id=job_id)
+                                    key=None, job_id=job_id, asserted_actor=actor)
             try:
                 self._preflight_decision(self._conn, approval_id, kind, digest)
                 if self._restricted(caller, endpoint, deadline):
@@ -1034,7 +1089,7 @@ class OpsService:
                 action = self._decision_action(kind, approval_id, digest, reason,
                                                _decided_by(caller))
                 job = self.jobs.enqueue_decision(
-                    caller, None, kind, action,
+                    caller, actor, kind, action,
                     deadline_seconds=self.limits.decision_deadline_seconds,
                     target=f"approval:{approval_id}", job_id=job_id,
                     audit_id=accepted.audit_id)
@@ -1141,22 +1196,26 @@ class OpsService:
         if job is None:
             return None
         try:
-            self._execute_decision(job)
+            result = self._execute_decision(job)
+            state, code = JobState.DONE, None
         except BaseException as exc:
-            code = self._map_exception(exc) or ErrorCode.INTERNAL
-            if code is ErrorCode.INTERNAL:
+            mapped = self._map_exception(exc) or ErrorCode.INTERNAL
+            if mapped is ErrorCode.INTERNAL:
                 _log.exception("decision job failed kind=%s", job.kind)
-            result, detail = None, job.detail
+            result = None
             if isinstance(exc, _DecisionOutcome):
-                result, detail = exc.result, exc.outcome
-            state = (JobState.SHUTDOWN if code is ErrorCode.UNAVAILABLE
+                result, job.detail = exc.result, exc.outcome
+            state = (JobState.SHUTDOWN if mapped is ErrorCode.UNAVAILABLE
                      and self.stop_event.is_set() else JobState.FAILED)
-            self.jobs.finish(job, state=state, error_code=code.value, result=result,
-                             detail=detail)
-        self._close_decision(job)
+            code = mapped.value
+        state, code, result = self._seal_terminal_audit(
+            job, state, code, result, self._close_decision)
+        self.jobs.finish(job, state=state, error_code=code, result=result,
+                         detail=job.detail)
+        self._job_event_best_effort(job, self._decide_events)
         return job
 
-    def _execute_decision(self, job: Job) -> None:
+    def _execute_decision(self, job: Job) -> dict:
         if self.stop_event.is_set():
             raise OpsError(ErrorCode.UNAVAILABLE)
         if self._monotonic() >= job.deadline_mono:
@@ -1168,15 +1227,11 @@ class OpsService:
                     and job.authenticated_principal is not ShellCaller.SHELL \
                     and self._autopilot_at_start(job):
                 raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
-            result = job.action(job)
-        self.jobs.finish(job, state=JobState.DONE, result=result, detail=job.detail)
+            return job.action(job)
 
-    def _close_decision(self, job: Job) -> None:
-        try:
-            self._finish_job_audit(job, self._decide_audit, self._decide_events)
-            self._job_event(job, self._decide_events)
-        except Exception:
-            _log.warning("decision terminal audit failed job=%s", job.id, exc_info=True)
+    def _close_decision(self, job: Job, state: JobState, error_code: str | None) -> None:
+        self._finish_job_audit(job, self._decide_audit, self._decide_events,
+                               state=state, error_code=error_code)
 
     def decide_from_shell(self, kind: str, approval_id: int, reason: str | None = None,
                           *, timeout: float | None = None) -> Job:
