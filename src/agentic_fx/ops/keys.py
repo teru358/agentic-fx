@@ -118,6 +118,12 @@ def _open_dir(directory: Path) -> int:
     return fd
 
 
+def check_key_dir_usable(directory: Path, *, root: Path) -> None:
+    """鍵 dir が置き場所・所有者・mode の検査を通り、開けることを確かめる (中身は読まない)。"""
+    check_token_dir(directory, root=root)
+    os.close(_open_dir(Path(directory)))
+
+
 def _read_checked(dir_fd: int, name: str) -> bytes:
     """``O_NOFOLLOW`` で開き、通常 file・所有者・0600 を確かめてから読む。
 
@@ -331,6 +337,38 @@ def _check_tombstone(dir_fd: int, principal: Principal) -> None:
         raise KeySetError("ready_invalid") from None
     if not hmac.compare_digest(raw, _TOMBSTONE):
         raise KeySetError("ready_invalid")
+
+
+def enrolled_key_matches(directory: Path, principal: Principal) -> bool:
+    """manifest が active で、鍵 file の digest がその entry と一致すれば True。
+
+    未登録・preparing・revoked は False (enroll が完結させるか断る)。active なのに鍵 file が
+    無い・検査を通らない・digest が違えば :class:`KeySetError`。active への enroll は無変更で
+    成功するので、ここで止めないと認証できない鍵のまま有効化が進む。
+    """
+    dir_fd = _open_dir(Path(directory))
+    try:
+        ready = _read_ready(dir_fd)
+        entry = ready["principals"].get(principal.value)
+        if entry is None or entry["state"] != "active":
+            return False
+        try:
+            raw = _read_checked(dir_fd, key_file_name(principal))
+        except FileNotFoundError:
+            raise KeySetError("key_missing") from None
+        except OSError:
+            raise KeySetError("key_file_invalid") from None
+        try:
+            digest = _digest(_parse_token(raw))
+        except (ValueError, UnicodeDecodeError):
+            raise KeySetError("key_file_invalid") from None
+        finally:
+            del raw
+        if not hmac.compare_digest(digest, entry["sha256"]):
+            raise KeySetError("digest_mismatch")
+        return True
+    finally:
+        os.close(dir_fd)
 
 
 def read_token(directory: Path, principal: Principal) -> str:

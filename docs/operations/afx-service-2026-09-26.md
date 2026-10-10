@@ -48,3 +48,4 @@ systemctl --user status afx.service --no-pager
 - unit の `PATH` に nvm の bin を入れてある (claude / codex runner が CLI を探すため)。node のバージョンを変えたら unit の PATH も直す。
 - `CLAUDE_CODE_OPENAI_CONTEXT_WINDOWS` など Claude Code 端末由来の環境変数は systemd 環境には入らないので、手動起動時に付けていた `env -u` は不要。
 - 二重起動防止は screen セッション名だけで見ている。手動で `main.py` を別に起こすと DB を 2 プロセスが触るので、unit 運用中は手動起動しない。
+- `afx ops enable` が鍵を登録している間 (`data/ops/enroll_in_progress` がある間)、afx は起動直後に stderr へ `afx: enroll_in_progress` を出して終了コード 75 で終わる。systemd がこれを再起動で繰り返さないよう、`~/.config/systemd/user/afx.service` の `[Service]` に `RestartPreventExitStatus=75` を手で足して `systemctl --user daemon-reload` する。ただし screen 経由の起動 (`deploy/afx-start.sh`) では screen が子の終了コードによらず 0 で終わる (実測) ので 75 は unit に届かず、`Restart=on-failure` のため再起動もされない。この設定が効くのは afx を直接 exec する unit にしたとき。いずれの場合も `journalctl --user -u afx` と `afx ops status bot` (残った marker を表示する) で確かめる。marker が残ったら同じ `afx ops enable <機能>` を再実行して回収する。

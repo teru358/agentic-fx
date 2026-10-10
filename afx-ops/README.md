@@ -10,5 +10,5 @@ afx-ops <bot|web|notify>
 ```
 
 - `afx_ops/gate/` : 機能ごとの plain gate module の置き場
-- `systemd/` : 機能別 unit の雛形を置く場所
+- 機能別 unit の雛形は本体 `agentic_fx.ops_setup` の package data (`afx ops enable` が設置する)
 - `tests/fixtures/server_auth_oracle.json` : 本体 `tests/ops/fixtures/` の写し (本体側のテストが bytes 一致を見張る)

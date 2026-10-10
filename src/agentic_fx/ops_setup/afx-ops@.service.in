@@ -1,0 +1,15 @@
+[Unit]
+Description=agentic-fx operations process (%i)
+BindsTo=@AFX_UNIT@
+PartOf=@AFX_UNIT@
+After=@AFX_UNIT@
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=notify
+ExecStart=@AFX_OPS_EXEC@ %i
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+KillMode=control-group

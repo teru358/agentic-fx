@@ -59,7 +59,10 @@ from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, connect_readonly, init_db
-from agentic_fx.store.instance_lock import acquire_instance_lock
+from agentic_fx.store.enroll_marker import (
+    ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, EnrollInProgress, enroll_marker_present,
+)
+from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.state import StateStore
 from agentic_fx.tools import (
@@ -806,6 +809,26 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
         resolved_by_identity=resolved_by_identity, activity=activity)
 
 
+def _acquire_lock_unless_enrolling(root: Path):
+    """enable が鍵を enroll している間は manifest に触れる前に起動を断る。
+
+    marker を flock より先に見る。確認と取得の間に enable が marker を置いて flock を
+    握ることもあるので、取得の失敗時と成功直後にも marker を見直す。
+    """
+    if enroll_marker_present(root):
+        raise EnrollInProgress(ENROLL_IN_PROGRESS)
+    try:
+        lock = acquire_instance_lock(root / "data")
+    except InstanceAlreadyRunning:
+        if enroll_marker_present(root):
+            raise EnrollInProgress(ENROLL_IN_PROGRESS) from None
+        raise
+    if enroll_marker_present(root):
+        lock.close()
+        raise EnrollInProgress(ENROLL_IN_PROGRESS)
+    return lock
+
+
 def build_app(root: Path, *, runner: AgentRunner | None = None,
               clock: Clock | None = None, quote_fn=None, spec_fn=None,
               bars_fn=None, embedding_fn=None,
@@ -860,7 +883,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     # 排他 flock を取得する。取得できなければ起動を中止する (fail
     # closed — InstanceAlreadyRunning は呼び出し元の run_service/CLI
     # エントリまで伝播させ、非ゼロ終了させる)。
-    instance_lock = acquire_instance_lock(root / "data")
+    instance_lock = _acquire_lock_unless_enrolling(root)
     # 失敗時に閉じるため、ops 層の資源は try の外で名前を用意しておく。
     conn_ops = None
     ops_service = None
@@ -1878,7 +1901,12 @@ def run_service(root: Path, *, daemon: bool = False,
     setup_technical_logging(root / "logs", settings.logging.level,
                             daemon=daemon)
     stop_event = _stop_event if _stop_event is not None else threading.Event()
-    app = build_app(root, stop_event=stop_event)
+    try:
+        app = build_app(root, stop_event=stop_event)
+    except EnrollInProgress:
+        # systemd が RestartPreventExitStatus で再起動しないよう、専用の終了コードで返す。
+        print(f"afx: {ENROLL_IN_PROGRESS}", file=sys.stderr)
+        return EXIT_ENROLL_IN_PROGRESS
 
     warning = Policy(directives_path(root)).size_warning()
     if warning:

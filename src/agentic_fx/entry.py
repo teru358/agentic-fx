@@ -37,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
                          ("revoke", "principal の鍵を revoke する")):
         p = keys_sub.add_parser(action, help=text)
         p.add_argument("principal", choices=tuple(member.value for member in Principal))
+    ops_parser = sub.add_parser("ops", help="外部 operations 機能の有効化・無効化・状態表示")
+    ops_sub = ops_parser.add_subparsers(dest="ops_action", required=True)
+    for action, text in (("enable", "機能を停止中に有効化する"),
+                         ("disable", "機能を停止せずに無効化する"),
+                         ("status", "機能の durable stage を表示する")):
+        p = ops_sub.add_parser(action, help=text)
+        p.add_argument("feature", choices=("bot", "web", "notify"))
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")
@@ -50,6 +57,9 @@ def main(argv: list[str] | None = None) -> int:
         # 鍵管理は .env を読まない (鍵を env に載せない・設定にも依存しない)。
         from agentic_fx.ops.keys import run_keys_command
         return run_keys_command(root, args.keys_action, getattr(args, "principal", None))
+    if args.command == "ops":
+        from agentic_fx.ops_setup.stages import run_ops_command
+        return run_ops_command(root, args.ops_action, args.feature)
     if args.command in _BACKTEST_COMMANDS:
         return backtest_cli.dispatch(args, root)
     daemon = args.daemon
