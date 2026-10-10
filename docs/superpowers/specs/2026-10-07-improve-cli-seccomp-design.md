@@ -1,6 +1,6 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.4
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.5
 
-版: v1.4
+版: v1.5
 
 日付: 2026-10-09
 
@@ -181,7 +181,7 @@ seccomp は `connect` を USER_NOTIF にする。supervisor は `CONTINUE` を�
 | 段 | 動作 | 失敗時 |
 |---|---|---|
 | 0 | `SECCOMP_GET_NOTIF_SIZES` から buffer size を取得 | `seccomp_user_notif_unavailable` |
-| 1 | zeroed buffer で `NOTIF_RECV` | EINTR retry、ENOENT は終了、その他は supervisor fault |
+| 1 | zeroed buffer で `NOTIF_RECV` | EINTR retry、ENOENT はその通知だけ終了 (tracee が RECV 前に死んだ正常 race、receiver は続行)、その他は supervisor fault。POLLHUP (filter の利用者が全部いなくなった) は障害でなく drain → CLOSED |
 | 2 | x86_64、`connect`、addrlen 16〜128 を検査 | 不整合は EPERM と fault、範囲外は EINVAL |
 | 3 | ID_VALID (1 回目) | ENOENT は無応答終了 |
 | 4 | `pidfd_open(tid, PIDFD_THREAD)` | 有効なら EPERM、無効なら無応答終了 |
@@ -614,3 +614,4 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 |2026-10-09|v1.2|§3.1 policy hash を canonical 形改定後の値に更新、BPF 命令数と filter flags を記載|A2 実装 (sc-a2) の受領|—|
 |2026-10-09|v1.3|codex の実行 artifact を native ELF に固定 (shebang wrapper は cli_artifact_unsupported)、wait_exec は保存した (st_dev, st_ino) と比較、fingerprint から wrapper を除外|T3b 実装で nvm の codex (Node の #! script) が execveat(AT_EMPTY_PATH) で ENOENT と実測|—|
 |2026-10-10|v1.4|§7.1 に SETUP_FAILED (type 6) と frame 6 種を明記、§12 に multicall・即終了 CLI・main thread 限定 (launch_thread_unsupported) の残余を追加|T3b 実装の実測と /code-review の指摘|—|
+|2026-10-10|v1.5|§4.2 段 1: RECV の ENOENT は通知単位の終了 (receiver 続行)、POLLHUP は drain → CLOSED と明記|T3d1 実装の裁定|—|
