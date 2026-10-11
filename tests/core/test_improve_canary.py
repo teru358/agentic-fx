@@ -361,3 +361,34 @@ def test_saturation_and_503_do_not_register(isolation_units, kind, backend):
     assert res["selftest_runs"] == 1
     assert res["supported"] == []
     assert res["mission"]["m_dirs_left"] == []
+
+
+def test_selftest_mission_timeout_is_below_the_unit_runtime_max(monkeypatch, tmp_path):
+    """自己試験の mission の上限は settings の値によらず RuntimeMaxSec (900) より短い値に固定する
+    (unit に切られる前に自分で止まる)。短い設定はそのまま使う。"""
+    from types import SimpleNamespace
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.core import improve_admission as IA
+    from agentic_fx.loops import verify_backend as VB
+
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config"
+                             / "settings.yaml.example")
+    seen = []
+
+    def fake(root, st, **kw):
+        seen.append((st.improve.mission_timeout_sec, kw["stop_on_echo"]))
+        return VB.VerifyBackendResult(True, kw["backend"], None, "f", "")
+
+    monkeypatch.setattr(VB, "verify_backend", fake)
+    host = SimpleNamespace(mission_allowed=lambda: True, blocking_reasons=lambda: [])
+    ctx = SimpleNamespace(host=host, backend="opencode",
+                          artifact=SimpleNamespace(as_dict=lambda: {}),
+                          fingerprint=SimpleNamespace(aggregate="a"))
+    for configured in (3600, 120):
+        st = settings.model_copy(update={"improve": settings.improve.model_copy(
+            update={"mission_timeout_sec": configured})})
+        assert C.run_selftest(ctx, settings=st, root=tmp_path).ok is True
+    assert seen == [(C.SELFTEST_MISSION_TIMEOUT_SEC, True), (120, True)]
+    assert C.SELFTEST_MISSION_TIMEOUT_SEC < 900
+    _ = IA

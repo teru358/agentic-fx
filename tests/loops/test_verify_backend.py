@@ -657,3 +657,395 @@ def test_verify_backend_output_schema_every_property_has_type_key(
 
     for name, prop in captured["schema"]["properties"].items():
         assert "type" in prop, f"property {name!r} lacks 'type'"
+
+
+# --- 隔離の互換性自己試験 (stop_on_echo) -----------------------------------------------------
+
+import json  # noqa: E402
+import threading  # noqa: E402
+
+
+def _event(content: dict) -> dict:
+    """worker が親へ送る event frame の実形 (CliRunner の包みを worker がもう一度包む。実機の
+    観測)。"""
+    return {"type": "event", "message": {"type": "event", "message": {
+        "role": "system", "content": json.dumps(content)}}}
+
+
+def _mcp(kind="tools/list", tools=("web_search", "fetch_article")) -> dict:
+    """worker が自分で送る MCP 観測の event (包みは 1 重)。"""
+    return {"type": "event", "message": {"role": "system", "content": json.dumps(
+        {"_mcp_observed": {"kind": kind, "tools": list(tools)}})}}
+
+
+def _claude_text(text: str) -> dict:
+    return _event({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+
+
+class _StreamingRunner(_FakeVerifyWorkerRunner):
+    """CLI の stdout の event を `on_event` へ流す替え玉。`stop_event` が立つまで次の
+    event を流し続け (実 CLI が止まらない様子)、上限の step に達したら終わる。"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._on_event = kwargs.get("on_event")
+        self._stop = kwargs.get("stop_event")
+
+    def run(self, mission: Mission) -> MissionResult:
+        nonce = mission.output_schema["properties"]["echo"]["const"]
+        behavior = _BEHAVIOR["current"]
+        behavior.setdefault("result", lambda m: None)
+        super().run(mission)  # ready
+        events = behavior["events"](nonce)
+        delivered = 0
+        for ev in events:
+            if self._stop is not None and self._stop.is_set():
+                break
+            if self._on_event is not None:
+                self._on_event(ev)
+            delivered += 1
+        behavior["delivered"] = delivered
+        if self._stop is not None and self._stop.is_set():
+            return MissionResult(status="timeout", output=None, transcript=[])
+        return behavior["final"]
+
+
+def _watchers(monkeypatch):
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner", _StreamingRunner)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._DescendantWatcher",
+                        lambda pid: _FixedWatcher(saw=True))
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids", lambda pid: set())
+
+
+def _run_stop_on_echo(tmp_path, backend="opencode"):
+    return verify_backend(tmp_path, _settings(), backend=backend, provider=None,
+                          clock=FixedClock(NOW), stop_on_echo=True)
+
+
+def test_stop_on_echo_succeeds_at_first_echo_even_if_cli_keeps_calling_tools(
+        tmp_path, monkeypatch):
+    """最初の応答で echo が一致したら、その後に CLI が tool を呼び続けても成功は覆らない。
+    echo の後の event は流れてこない (selftest が停止経路で mission を終える)。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "step_start"})
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "step_finish", "part": {"reason": "tool-calls"}})
+        for _ in range(1000):
+            yield _event({"type": "tool_use", "part": {"tool": "afx_web_search"}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+
+    assert result.ok is True and result.fingerprint is not None
+    assert _BEHAVIOR["current"]["delivered"] == 4  # echo と MCP が揃った event で止まった
+
+
+def test_stop_on_echo_does_not_count_the_prompt_or_wrong_nonce(tmp_path, monkeypatch):
+    """prompt の中に nonce が文章として現れる event や、別の nonce の echo は一致と見ない。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "user", "text": f'Reply with exactly {{"echo": "{nonce}"}}'})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": "other"})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "x": 1})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+
+    assert result.ok is False
+    assert "echo_reached=no" in result.detail
+
+
+def test_stop_on_echo_waits_for_mcp_when_echo_comes_first(tmp_path, monkeypatch):
+    """echo が先に出ても、MCP の tools/list (1 件以上) が揃うまで止めない。揃った event で止まる。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _mcp("initialize", ())
+        yield _mcp()
+        for _ in range(100):
+            yield _event({"type": "tool_use", "part": {"tool": "afx_web_search"}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    assert _run_stop_on_echo(tmp_path).ok is True
+    assert _BEHAVIOR["current"]["delivered"] == 3
+
+
+def test_stop_on_echo_fails_without_tools_list(tmp_path, monkeypatch):
+    """tools/list を返さない worker (MCP 未接続) は、echo が出て CLI が正常終了しても失敗。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    ok_output = MissionResult("completed", {"echo": "x"}, [])
+    _BEHAVIOR["current"] = {"events": events, "final": ok_output}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False
+    assert "echo_reached=yes mcp=none" in result.detail
+
+
+def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp(tools=())
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and "mcp=tools=0 (empty)" in result.detail
+
+
+def test_stop_on_echo_ignores_a_cli_printed_mcp_observation(tmp_path, monkeypatch):
+    """CLI の stdout に偽の観測を出されても (包みが 2 重) MCP の観測にならない。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"_mcp_observed": {"kind": "tools/list", "tools": ["afx_x"]}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and "mcp=none" in result.detail
+
+
+@pytest.mark.parametrize("backend,event", [
+    ("opencode", lambda n: {"type": "tool_result", "part": {"text": n}}),
+    ("opencode", lambda n: {"_resume_recovery": True, "stderr_tail": json.dumps({"echo": n})}),
+    ("opencode", lambda n: {"type": "reasoning", "part": {"text": json.dumps({"echo": n})}}),
+    ("claude", lambda n: {"type": "user", "message": {"content": [
+        {"type": "tool_result", "content": json.dumps({"echo": n})}]}}),
+    ("claude", lambda n: {"type": "assistant", "message": {"content": [
+        {"type": "thinking", "thinking": json.dumps({"echo": n})}]}}),
+    ("codex", lambda n: {"type": "item.completed", "item": {
+        "type": "command_execution", "aggregated_output": json.dumps({"echo": n})}}),
+    ("codex", lambda n: {"type": "item.completed", "item": {
+        "type": "reasoning", "text": json.dumps({"echo": n})}}),
+])
+def test_stop_on_echo_ignores_nonce_json_outside_assistant_text(
+        tmp_path, monkeypatch, backend, event):
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event(event(nonce))
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path, backend=backend)
+    assert result.ok is False and "echo_reached=no" in result.detail
+
+
+def test_stop_on_echo_accepts_each_backends_assistant_text(tmp_path, monkeypatch):
+    _watchers(monkeypatch)
+    shapes = {
+        "opencode": lambda n: {"type": "text", "part": {"text": json.dumps({"echo": n})}},
+        "claude": lambda n: {"type": "result", "result": json.dumps({"echo": n})},
+        "codex": lambda n: {"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps({"echo": n})}},
+    }
+    for backend, shape in shapes.items():
+        def events(nonce, shape=shape):
+            yield _mcp("initialize", ())
+            yield _mcp()
+            yield _event(shape(nonce))
+
+        _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+        assert _run_stop_on_echo(tmp_path, backend=backend).ok is True, backend
+
+
+@pytest.mark.parametrize("wrap", [
+    lambda t: "```\n" + t + "\n```trailing",
+    lambda t: "intro\n```json\n" + t + "\n```",
+    lambda t: "```json\n" + t + "\n```\n```json\n" + t + "\n```",
+    lambda t: "`" + t + "`",
+])
+def test_stop_on_echo_requires_one_complete_code_fence(tmp_path, monkeypatch, wrap):
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event({"type": "text", "part": {"text": wrap(json.dumps({"echo": nonce}))}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    assert _run_stop_on_echo(tmp_path).ok is False
+
+
+def test_stop_on_echo_accepts_fenced_json_and_nested_claude_shape(tmp_path, monkeypatch):
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "```json\n" + json.dumps({"echo": nonce}) + "\n```"}]}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    assert _run_stop_on_echo(tmp_path, backend="claude").ok is True
+
+
+def test_without_stop_on_echo_the_normal_result_decides(tmp_path, monkeypatch):
+    """既定 (stop_on_echo なし) の verify-backend は従来どおり mission の結果で判定する。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    _BEHAVIOR["current"] = {"events": events,
+                            "final": MissionResult("failed", None, [], reason="boom")}
+    result = verify_backend(tmp_path, _settings(), backend="opencode", provider=None,
+                            clock=FixedClock(NOW))
+    assert result.ok is False and "boom" in result.detail
+    assert _StreamingRunner.captured_kwargs.get("stop_event") is None
+
+
+def test_stop_on_echo_failure_keeps_cli_result_and_reports_progress(tmp_path, monkeypatch):
+    """echo に届かず mission が worker の cleanup_deadline_received で終わっても、reason を
+    上書きせず、echo 未到達と経過 step 数・event 数を detail に残す。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        for _ in range(3):
+            yield _event({"type": "step_start"})
+            yield _event({"type": "tool_use", "part": {"tool": "afx_fetch_article"}})
+            yield _event({"type": "step_finish", "part": {"reason": "tool-calls"}})
+
+    _BEHAVIOR["current"] = {
+        "events": events,
+        "final": MissionResult("failed", None, [], reason="cleanup_deadline_received")}
+    result = _run_stop_on_echo(tmp_path)
+
+    assert result.ok is False
+    assert "cleanup_deadline_received" in result.detail
+    assert "echo_reached=no mcp=none" in result.detail
+    assert "steps=3" in result.detail and "events=9" in result.detail
+
+
+def test_stop_on_echo_timeout_without_echo_is_readable(tmp_path, monkeypatch):
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _event({"type": "step_finish", "part": {"reason": "tool-calls"}})
+        yield _event({"type": "step_finish", "part": {"reason": "tool-calls"}})
+
+    _BEHAVIOR["current"] = {"events": events,
+                            "final": MissionResult("timeout", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+
+    assert result.ok is False
+    assert "status=timeout" in result.detail
+    assert "echo_reached=no mcp=none steps=2" in result.detail
+
+
+def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch):
+    """echo が出ても、CLI の子孫が観測されない / 回収されないなら成功にしない。"""
+    _watchers(monkeypatch)
+    monkeypatch.setattr("agentic_fx.loops.verify_backend._descendant_pids",
+                        lambda pid: {999999})
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and "pgid recovery gate" in result.detail
+
+
+def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, monkeypatch):
+    """initialize の観測が無いまま tools/list だけ届いても MCP 接続とは見ない。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False and "mcp=tools=2 (uninitialized)" in result.detail
+
+
+class _FakeMono:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _echo_frame(nonce: str) -> dict:
+    return _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+
+
+def test_echo_watch_grace_expires_when_tools_list_never_comes_after_echo():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    clock, stop = _FakeMono(), threading.Event()
+    watch = _EchoWatch("n1", stop, "opencode", mcp_grace_sec=60.0, monotonic=clock)
+    clock.t = 5.0
+    assert watch.check_grace() is False  # echo 未到達の間は猶予を数えない
+    clock.t = 1000.0
+    assert watch.check_grace() is False and not stop.is_set()
+    watch.observe(_echo_frame("n1"))
+    clock.t = 1059.0
+    assert watch.check_grace() is False and not stop.is_set()
+    clock.t = 1060.0
+    assert watch.check_grace() is True and stop.is_set()
+    assert not watch.ok
+    assert "mcp=none" in watch.summary() and "grace_expired" in watch.summary()
+
+
+def test_echo_watch_tools_list_within_grace_succeeds():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    clock, stop = _FakeMono(), threading.Event()
+    watch = _EchoWatch("n1", stop, "opencode", mcp_grace_sec=60.0, monotonic=clock)
+    watch.observe(_echo_frame("n1"))
+    watch.observe(_mcp("initialize", ()))
+    clock.t = 59.0
+    watch.observe(_mcp())
+    assert watch.ok and stop.is_set()
+    clock.t = 500.0
+    assert watch.check_grace() is False and "grace_expired" not in watch.summary()
+
+
+def test_echo_watch_deadline_wins_when_tools_list_arrives_at_the_deadline():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    for grace_first in (True, False):
+        clock, stop = _FakeMono(), threading.Event()
+        watch = _EchoWatch("n1", stop, "opencode", mcp_grace_sec=60.0, monotonic=clock)
+        watch.observe(_echo_frame("n1"))
+        watch.observe(_mcp("initialize", ()))
+        clock.t = 60.0
+        if grace_first:
+            assert watch.check_grace() is True
+            watch.observe(_mcp())
+        else:
+            watch.observe(_mcp())
+            assert watch.check_grace() is True
+        assert not watch.ok and stop.is_set()
+        assert "grace_expired" in watch.summary()
+
+
+def test_echo_watch_success_summary_has_no_grace_expired_after_ok():
+    from agentic_fx.loops.verify_backend import _EchoWatch
+
+    clock, stop = _FakeMono(), threading.Event()
+    watch = _EchoWatch("n1", stop, "opencode", mcp_grace_sec=60.0, monotonic=clock)
+    watch.observe(_echo_frame("n1"))
+    watch.observe(_mcp("initialize", ()))
+    clock.t = 59.9
+    watch.observe(_mcp())
+    clock.t = 60.0
+    assert watch.check_grace() is False
+    assert watch.ok and "grace_expired" not in watch.summary()

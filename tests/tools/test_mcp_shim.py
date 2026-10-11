@@ -451,3 +451,43 @@ def test_call_lock_covers_publish_so_refusal_cannot_execute_during_send(tmp_path
     first.join(5); second.join(5)
     assert refused_entered.is_set()
     assert order == ["send:accepted", "send:refused", "event"]
+
+
+def test_dispatcher_reports_successful_initialize_and_tools_list_only():
+    """成功した initialize / tools/list だけを観測として通知し、tools/list には返した名前を渡す。
+    拒否した initialize・未知の method は通知しない。観測の callback が落ちても応答は返る。"""
+    d = McpShimDispatcher(registry=_make_registry(), allowed=["slow_echo"])
+    seen: list[tuple[str, list[str]]] = []
+    d.on_observe = lambda kind, names: seen.append((kind, names))
+    out: list[dict] = []
+    d.respond({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+               "params": {"protocolVersion": "0-unsupported"}}, out.append)
+    d.respond({"jsonrpc": "2.0", "id": 2, "method": "nope"}, out.append)
+    assert seen == []
+    d.respond({"jsonrpc": "2.0", "id": 3, "method": "initialize",
+               "params": {"protocolVersion": d.protocol_version}}, out.append)
+    d.respond({"jsonrpc": "2.0", "id": 4, "method": "tools/list", "params": {}}, out.append)
+    assert seen == [("initialize", []), ("tools/list", ["slow_echo"])]
+
+    def boom(kind, names):
+        raise RuntimeError("observer failed")
+    d.on_observe = boom
+    d.respond({"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": {}}, out.append)
+    assert "result" in out[-1]
+
+
+def test_dispatcher_does_not_observe_when_publish_fails():
+    """応答が CLI へ渡らなかった (publish が失敗した) 要求は観測として通知しない。"""
+    d = McpShimDispatcher(registry=_make_registry(), allowed=["slow_echo"])
+    seen: list[tuple[str, list[str]]] = []
+    d.on_observe = lambda kind, names: seen.append((kind, names))
+
+    def failing_publish(resp):
+        raise OSError("spool write failed")
+
+    for method, params in (("initialize", {"protocolVersion": d.protocol_version}),
+                           ("tools/list", {})):
+        with pytest.raises(OSError):
+            d.respond({"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                      failing_publish)
+    assert seen == []

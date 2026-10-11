@@ -654,6 +654,7 @@ def _start_mcp_dispatcher(
     after_send: Callable[[], None] | None = None,
     spool_root: mcp_spool.SpoolRoot | None = None,
     on_fatal: Callable[[str], None] | None = None,
+    on_observe: Callable[[str, list[str]], None] | None = None,
 ) -> mcp_spool.SpoolDispatcher:
     """MCP の spool dispatcher を起動して返す (設計書 §1.6、spool 契約)。
 
@@ -669,8 +670,28 @@ def _start_mcp_dispatcher(
                             after_send=after_send)
     dispatcher = mcp_spool.SpoolDispatcher(root, mcp.respond, on_fatal=on_fatal)
     mcp.record = dispatcher.record_current
+    mcp.on_observe = on_observe
     dispatcher.start()
     return dispatcher
+
+
+def _mcp_observation_sender(protocol_out: Any, out_seq: SeqTracker | None,
+                            ) -> Callable[[str, list[str]], None] | None:
+    """成功した MCP の initialize / tools/list を、worker 自身の event として親へ送る。
+
+    CLI の stdout の event は worker がもう一度包んで送るので、ここで送る 1 重の包みの event
+    とは親で区別できる (CLI が同じ文字列を出しても観測にならない)。"""
+    if protocol_out is None or out_seq is None:
+        return None
+
+    def send(kind: str, names: list[str]) -> None:
+        try:
+            _send_frame(protocol_out, out_seq, {"type": "event", "message": {
+                "role": "system",
+                "content": json.dumps({"_mcp_observed": {"kind": kind, "tools": names}})}})
+        except Exception:  # noqa: BLE001 — 観測の送出失敗で MCP の応答を止めない
+            pass
+    return send
 
 
 def _attach_mcp_dispatcher(runner: Any,
@@ -780,7 +801,7 @@ def _run_improve_mission(
     dispatcher = _start_mcp_dispatcher(
         workdir=workdir, registry=registry,
         after_send=counters.fire_if_pending, spool_root=spool_root,
-        on_fatal=on_spool_fatal)
+        on_fatal=on_spool_fatal, on_observe=_mcp_observation_sender(protocol_out, out_seq))
     on_message = _make_on_message(protocol_out, out_seq)
 
     def abort_reason() -> str:

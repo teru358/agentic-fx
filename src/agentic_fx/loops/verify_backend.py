@@ -22,8 +22,10 @@ run() 完了後の子孫プロセス 0 件 (pgid 回収) — の 4 点。
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -129,15 +131,177 @@ class _DescendantWatcher:
         return bool(self._seen)
 
 
+#: 進行の目安として数える event の type (opencode の step_finish、claude の assistant、
+#: codex の turn.completed)
+_STEP_EVENT_TYPES = frozenset({"step_finish", "step-finish", "assistant", "turn.completed"})
+
+
+#: echo に届いてから MCP の観測 (initialize と tools/list) が揃うまで待つ上限 (秒)
+MCP_GRACE_SEC = 60.0
+
+_FENCE = re.compile(r"\A```(?:json)?[ \t]*\n([^`]*?)\n?```\Z")
+
+
+def _is_echo_text(text: object, nonce: str) -> bool:
+    """文字列の全体が `{"echo": <nonce>}` だけ (完全な 1 つの code fence に収まる形は許す)。
+    prompt の文章に埋まった nonce や、他のキーを足した JSON は一致と見ない。"""
+    if not isinstance(text, str):
+        return False
+    body = text.strip()
+    fenced = _FENCE.match(body)
+    if fenced is not None:
+        body = fenced.group(1).strip()
+    if not body.startswith("{"):
+        return False
+    try:
+        return json.loads(body) == {"echo": nonce}
+    except ValueError:
+        return False
+
+
+def _assistant_texts(backend: str, event: dict) -> list[object]:
+    """backend の stdout の event のうち、assistant の本文 (出力 text) だけを返す。
+    tool の結果・thinking・回復の記録 (stderr 末尾を含む) は含めない。各 runner が出力と
+    見なす経路 (opencode の text part、claude の assistant の text block と最終 result、
+    codex の agent_message) に対応する。"""
+    kind = event.get("type")
+    if backend == "opencode":
+        part = event.get("part")
+        if kind == "text" and isinstance(part, dict):
+            return [part.get("text")]
+    elif backend == "claude":
+        if kind == "assistant":
+            message = event.get("message")
+            blocks = message.get("content") if isinstance(message, dict) else None
+            if isinstance(blocks, list):
+                return [b.get("text") for b in blocks
+                        if isinstance(b, dict) and b.get("type") == "text"]
+        elif kind == "result":
+            structured = event.get("structured_output")
+            return [event.get("result"),
+                    json.dumps(structured) if isinstance(structured, dict) else None]
+    elif backend == "codex":
+        item = event.get("item")
+        if kind == "item.completed" and isinstance(item, dict) \
+                and item.get("type") == "agent_message":
+            return [item.get("text")]
+    return []
+
+
+class _EchoWatch:
+    """子が流す event を見て、(1) assistant の本文が echo と一致した、(2) worker の MCP が
+    `tools/list` に tool を 1 つ以上返した、の両方が揃った時点で `stop` を立てる。
+    どちらかが欠けたまま終わった場合に読めるよう、event 数・step 数・MCP の観測も持つ。"""
+
+    def __init__(self, nonce: str, stop: threading.Event, backend: str, *,
+                 mcp_grace_sec: float = MCP_GRACE_SEC,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._mcp_grace_sec = mcp_grace_sec
+        self._monotonic = monotonic
+        self._echo_at: float | None = None
+        self.grace_expired = False
+        # grace thread と event reader の両方が状態を更新するので、observe / check_grace /
+        # summary は同じ lock の下で原子的に動く
+        self._lock = threading.Lock()
+        self._nonce = nonce
+        self._stop = stop
+        self._backend = backend
+        self.seen = False
+        self.events = 0
+        self.steps = 0
+        self.initialized = False
+        self.listed: list[str] | None = None
+
+    # tools/list は server 側の名前 (web_search 等) を返す。`afx_` 付きは CLI 側の呼び名
+    @property
+    def mcp_ok(self) -> bool:
+        return self.initialized and self.listed is not None and len(self.listed) > 0
+
+    @property
+    def ok(self) -> bool:
+        return self.seen and self.mcp_ok and not self.grace_expired
+
+    def observe(self, frame: dict) -> None:
+        with self._lock:
+            # 期限優先: 期限に達していたら、同時に届いた frame より先に失敗を確定する
+            self._expire_if_due()
+            self._observe_locked(frame)
+
+    def _expire_if_due(self) -> None:
+        if (self._echo_at is not None and not self.ok and not self.grace_expired
+                and self._monotonic() - self._echo_at >= self._mcp_grace_sec):
+            self.grace_expired = True
+            self._stop.set()
+
+    def _observe_locked(self, frame: dict) -> None:
+        self.events += 1
+        msg = frame.get("message") or {}
+        cli_output = msg.get("type") == "event" and isinstance(msg.get("message"), dict)
+        if cli_output:
+            # CliRunner が流す {"type": "event", "message": {...}} は worker がもう一度包む
+            msg = msg["message"]
+        content = msg.get("content")
+        try:
+            event = json.loads(content) if isinstance(content, str) else None
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        if not cli_output:
+            # 包みが 1 重の event は worker 自身が送ったもの (CLI の出力は 2 重)
+            observed = event.get("_mcp_observed")
+            if isinstance(observed, dict):
+                if observed.get("kind") == "initialize":
+                    self.initialized = True
+                elif observed.get("kind") == "tools/list" \
+                        and isinstance(observed.get("tools"), list):
+                    self.listed = [str(n) for n in observed["tools"]]
+        if event.get("type") in _STEP_EVENT_TYPES:
+            self.steps += 1
+        if not self.seen and any(_is_echo_text(t, self._nonce)
+                                 for t in _assistant_texts(self._backend, event)):
+            self.seen = True
+            self._echo_at = self._monotonic()
+        if self.ok:
+            self._stop.set()
+
+    def check_grace(self) -> bool:
+        """echo に届いたのに MCP の観測が揃わないまま猶予 (`mcp_grace_sec`) を過ぎたら、
+        失敗として `stop` を立てる。echo 未到達の間は何もしない (mission の上限に従う)。"""
+        with self._lock:
+            self._expire_if_due()
+            return self.grace_expired
+
+    def summary(self) -> str:
+        with self._lock:
+            return self._summary_locked()
+
+    def _summary_locked(self) -> str:
+        if self.listed is not None:
+            suffix = ("" if self.mcp_ok else
+                      " (empty)" if not self.listed else " (uninitialized)")
+            mcp = f"tools={len(self.listed)}{suffix}"
+        else:
+            mcp = "init_only" if self.initialized else "none"
+        grace = " grace_expired" if self.grace_expired else ""
+        return (f"echo_reached={'yes' if self.seen else 'no'} mcp={mcp} "
+                f"steps={self.steps} events={self.events}{grace}")
+
+
 def verify_backend(
     root: Path, settings: "Settings", *,
     backend: Literal["local", "claude", "codex", "opencode"],
     provider: Literal["chatgpt"] | None,
     clock: "Clock",
     isolation_options: dict | None = None,
+    stop_on_echo: bool = False,
 ) -> VerifyBackendResult:
     """`isolation_options` は CLI 隔離の WorkerRunner の引数 (隔離の互換性自己試験が渡す)。
-    省略時は改善 mission と同じ判定 (有効化の定数が偽なら隔離なし) に従う。"""
+    省略時は改善 mission と同じ判定 (有効化の定数が偽なら隔離なし) に従う。
+
+    `stop_on_echo` (隔離の互換性自己試験が立てる): assistant の本文の echo 一致と、MCP の
+    `tools/list` が tool を 1 つ以上返した観測の両方が揃った時点を成功とし、mission は通常の停止経路 (stop_event) で終える。その後に CLI が tool を呼び続けても
+    成功は覆らない。失敗したときは echo 未到達と step 数を detail に残す。"""
     now = clock.now()
     nonce = secrets.token_hex(16)
 
@@ -234,13 +398,16 @@ def verify_backend(
                     detail=f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}")
             isolation_options = choice.worker_options
         rag = Rag(scratch_root / "rag")
+        stop = threading.Event()
+        watch = _EchoWatch(nonce, stop, backend) if stop_on_echo else None
+        extra = {"stop_event": stop, "on_event": watch.observe} if watch is not None else {}
         runner = WorkerRunner(
             root=root, settings=scoped_settings, clock=clock, rag=rag,
             worker_profile="improve", run_context=ctx, on_ready=on_ready,
             rpc_handlers=build_ledger_wrapped_rpc_handlers(
                 ledger=ctx.ledger, rpc_handlers=ctx.rpc_handlers,
                 staging_dir=ctx.staging_dir),
-            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind, **isolation_options)
+            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind, **isolation_options, **extra)
 
         mission = Mission(
             prompt=(
@@ -258,24 +425,47 @@ def verify_backend(
             max_turns=1,
             timeout_sec=scoped_settings.improve.mission_timeout_sec)
 
-        with _DescendantWatcher(os.getpid()) as watcher:
-            result = runner.run(mission)
+        grace_done = threading.Event()
+        grace_thread = None
+        if watch is not None:
+            def _grace_loop() -> None:
+                while not grace_done.wait(0.2):
+                    if watch.check_grace():
+                        return
+            grace_thread = threading.Thread(target=_grace_loop, daemon=True)
+            grace_thread.start()
+        try:
+            with _DescendantWatcher(os.getpid()) as watcher:
+                result = runner.run(mission)
+        finally:
+            grace_done.set()
+            if grace_thread is not None:
+                # _grace_loop は grace_done.wait(0.2) で必ず抜けるので、join は有限時間で終わる
+                grace_thread.join()
         after_descendants = _descendant_pids(os.getpid())
 
         if not ready_frames:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="mission never reached ready (handshake failed)")
-        if result.status != "completed" or not result.output:
+        progress = f" [{watch.summary()}]" if watch is not None else ""
+        echoed = watch is not None and watch.ok
+        if watch is not None and not watch.ok:
+            # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=f"mission did not complete: status={result.status} "
-                      f"reason={result.reason}")
-        if result.output.get("echo") != nonce:
+                      f"reason={result.reason}{progress}")
+        if not echoed and (result.status != "completed" or not result.output):
+            return VerifyBackendResult(
+                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
+                detail=f"mission did not complete: status={result.status} "
+                      f"reason={result.reason}{progress}")
+        if not echoed and result.output.get("echo") != nonce:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail="mission output failed the nonce round-trip "
-                      "(schema/nonce gate)")
+                      f"(schema/nonce gate){progress}")
         if backend != "local" and not watcher.saw_any_descendant():
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
@@ -296,6 +486,6 @@ def verify_backend(
             ok=True, backend=backend, provider=effective_provider,
             fingerprint=fingerprint,
             detail=f"backend={backend} provider={effective_provider} "
-                  f"model={model} fingerprint={fingerprint}")
+                  f"model={model} fingerprint={fingerprint}{progress}")
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)

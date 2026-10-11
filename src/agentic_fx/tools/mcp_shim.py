@@ -53,6 +53,9 @@ class McpShimDispatcher:
         # (kind, detail) を spool の ledger に書く先。tool を実際に実行した
         # ことの正本を ledger に置くため、spool の dispatcher が配線する。
         self.record: Callable[[str, str], None] | None = None
+        # 成功した initialize / tools/list の観測 (kind, tools/list に返した名前) を
+        # 受け取る先。自己試験が「CLI が MCP に繋がった」ことを親で確かめるのに使う。
+        self.on_observe: Callable[[str, list[str]], None] | None = None
         self.protocol_version = _SUPPORTED_PROTOCOL_VERSION
 
     def respond(self, req: dict, publish: Callable[[dict], None]) -> None:
@@ -62,20 +65,35 @@ class McpShimDispatcher:
         publish・`after_send` を一つの lock 区間で行う。`after_send` (budget
         打ち切りの発火) を応答の publish より後に置くのは、CLI が最後の
         応答を受け取る前に打ち切られないようにするため。"""
+        observed: list[tuple[str, list[str]]] = []
         if req.get("method") == "tools/call":
             with self._call_lock:
-                resp = self._dispatch(req)
+                resp = self._dispatch(req, observed)
                 publish(resp)
                 if self._after_send is not None:
                     self._after_send()
         else:
-            publish(self._dispatch(req))
+            resp = self._dispatch(req, observed)
+            publish(resp)
+        # 観測は応答が CLI へ渡る (publish が成功する) 後にだけ通知する
+        for kind, names in observed:
+            self._observe(kind, names)
+
+    def _observe(self, kind: str, names: list[str]) -> None:
+        if self.on_observe is not None:
+            try:
+                self.on_observe(kind, names)
+            except Exception:  # noqa: BLE001 — 観測の失敗で MCP の応答を止めない
+                pass
 
     def _note(self, kind: str, detail: str = "") -> None:
         if self.record is not None:
             self.record(kind, detail)
 
-    def _dispatch(self, req: dict) -> dict:
+    def _dispatch(self, req: dict,
+                  observed: list[tuple[str, list[str]]] | None = None) -> dict:
+        if observed is None:
+            observed = []
         rpc_id = req.get("id")
         method = req.get("method")
         if method == "initialize":
@@ -86,6 +104,7 @@ class McpShimDispatcher:
                         "error": {"code": -32600,
                                  "message": f"unsupported protocolVersion {requested!r}"}}
             self._note("served", "initialize")
+            observed.append(("initialize", []))
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "protocolVersion": requested,
                 "capabilities": {"tools": {}},
@@ -96,6 +115,7 @@ class McpShimDispatcher:
             tools = [_mcp_tool_from_openai_tool(t)
                     for t in self._registry.openai_tools(self._allowed)]
             self._note("served", "tools/list")
+            observed.append(("tools/list", [str(t.get("name")) for t in tools]))
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {"tools": tools}}
         if method == "tools/call":
             params = req.get("params") or {}

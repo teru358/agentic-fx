@@ -525,6 +525,10 @@ def run_canary(ctx, *, settings: Any, root: Path, expected: dict[str, str] | Non
     return IA.ProbeOutcome(True, False, "")
 
 
+#: 自己試験の mission の上限 (秒)。unit の RuntimeMaxSec (900) に切られる前に自分で止まる値
+SELFTEST_MISSION_TIMEOUT_SEC = 600
+
+
 def run_selftest(ctx, *, settings: Any, root: Path):
     """互換性自己試験: 実 CLI を隔離の下で 1 mission (verify-backend と同じ 1 ターンの接続性
     probe) 走らせる。schema の往復、終了後の cgroup の片付け、gate が開いたままを確かめる。"""
@@ -533,11 +537,16 @@ def run_selftest(ctx, *, settings: Any, root: Path):
     from agentic_fx.loops.verify_backend import verify_backend
 
     host = ctx.host
+    improve = settings.improve
+    if improve.mission_timeout_sec > SELFTEST_MISSION_TIMEOUT_SEC:
+        settings = settings.model_copy(update={"improve": improve.model_copy(
+            update={"mission_timeout_sec": SELFTEST_MISSION_TIMEOUT_SEC})})
     decision = IA.AdmissionDecision(True, None, ctx.backend, ctx.fingerprint, ctx.artifact)
     options = IA.worker_runner_options(decision, host)
     try:
         res = verify_backend(root, settings, backend=ctx.backend, provider=None,
-                             clock=SystemClock(), isolation_options=options)
+                             clock=SystemClock(), isolation_options=options,
+                             stop_on_echo=True)
     except Exception as e:  # noqa: BLE001
         return IA.ProbeOutcome(False, True, f"selftest spawn: {type(e).__name__}")
     if not res.ok:
@@ -548,6 +557,7 @@ def run_selftest(ctx, *, settings: Any, root: Path):
 
 
 __all__ = [
-    "BURST", "CANARY_ITEMS", "CANARY_PROBE_SRC", "EXPECTED", "PROXY_ITEMS", "CanaryRunner",
+    "BURST", "CANARY_ITEMS", "CANARY_PROBE_SRC", "EXPECTED", "PROXY_ITEMS",
+    "SELFTEST_MISSION_TIMEOUT_SEC", "CanaryRunner",
     "canary_runner_factory", "evaluate", "run_canary", "run_selftest",
 ]

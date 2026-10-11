@@ -1079,6 +1079,66 @@ def test_worker_runner_transcript_truncates_at_cap(tmp_path, monkeypatch):
     assert len(events_after_truncate) == 0
 
 
+def test_worker_runner_on_event_sees_every_event_before_transcript_truncation(
+        tmp_path, monkeypatch):
+    """`on_event` は実 worker の event frame ごとに、transcript の切り詰めの前に呼ばれる
+    (切り詰め後の event も、result を受ける前に届く)。"""
+    r, w = os.pipe()
+    r2, w2 = os.pipe()
+
+    def child_thread_fn():
+        child_in = os.fdopen(r2, "rb")
+        child_out = os.fdopen(w, "wb")
+        json.loads(child_in.readline())  # handshake
+        write_frame(child_out, {"type": "ready", "seq": 1, "ok": True})
+        for i in range(2, 10):
+            write_frame(child_out, {"type": "event", "seq": i,
+                                    "message": {"role": "user", "content": f"e{i}" + "x" * 50}})
+        write_frame(child_out, {"type": "result", "seq": 10,
+                                "status": "completed", "output": {}})
+        child_out.close()
+
+    t = threading.Thread(target=child_thread_fn, daemon=True)
+
+    class FakeProc:
+        pid = os.getpid()
+        stdin = os.fdopen(w2, "wb")
+        stdout = os.fdopen(r, "rb")
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return -9
+
+    fake_proc = FakeProc()
+    import agentic_fx.runners.worker_runner as wr_mod
+    monkeypatch.setattr(wr_mod.subprocess, "Popen", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(wr_mod.os, "killpg", lambda pid, sig: None)
+
+    settings = SETTINGS.model_copy(update={
+        "worker": SETTINGS.worker.model_copy(update={"transcript_max_bytes": 200})})
+    seen: list[str] = []
+
+    def on_event(frame):
+        seen.append(frame["message"]["content"][:2])
+        if len(seen) == 3:
+            raise RuntimeError("observer failure must not stop the mission")
+
+    runner = WorkerRunner(root=_root(tmp_path), settings=settings,
+                          clock=FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)),
+                          rag=_rag(tmp_path), on_event=on_event)
+    t.start()
+    result = runner.run(_mission())
+    t.join(timeout=2.0)
+
+    assert result.status == "completed"
+    assert seen == [f"e{i}" for i in range(2, 10)]
+    assert any("truncated" in m.get("content", "") for m in result.transcript)
+    assert sum(1 for m in result.transcript if m.get("role") == "user") < 8
+
+
 def test_worker_runner_rag_rpc_dispatches_to_rag_and_responds(
         tmp_path, monkeypatch):
     """`tool_rpc` (`name="search_news"`) を送り、fake `Rag.search_news` が

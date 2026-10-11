@@ -274,9 +274,6 @@ class CgroupWatch:
 #: backend ごとに実在する改善 mission の model (実 CLI の自己試験がそのまま使う。example の
 #: improve.model は local の model なので claude / codex では通らない)。opencode は example のまま
 REAL_MODELS = {"claude": "haiku", "codex": "gpt-5.6-luna"}
-#: 実 CLI の自己試験の mission の上限。unit の RuntimeMaxSec (900) より十分内側に置き、mission が
-#: 自分で終わらなくても結果の JSON と片付けの観測が残るようにする
-REAL_SELFTEST_MISSION_TIMEOUT_SEC = 600
 
 
 def make_settings(backend: str, artifact: str):
@@ -691,7 +688,7 @@ def sc_real_selftest(r: dict, backend: str, artifact: str) -> None:
     isolate_transcripts()
     settings = make_settings(backend, artifact)
     settings = settings.model_copy(update={"improve": settings.improve.model_copy(update={
-        "mission_timeout_sec": REAL_SELFTEST_MISSION_TIMEOUT_SEC})})
+        "mission_timeout_sec": 3600})})  # 本番の既定相当。自己試験が自分で 600 秒に下げる
     ctx = admission_context(host, backend, artifact)
     t0 = time.monotonic()
     out = C.run_selftest(ctx, settings=settings, root=REPO)

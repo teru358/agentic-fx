@@ -1813,6 +1813,8 @@ def test_ready_is_sent_only_after_mcp_spool_is_served_for_improve_profile(
                              "source_snapshot_dir": str(tmp_path / "source")},
         settings_mutator=settings_mutator)
 
+    # ready 時点の spool への探りの要求が worker の MCP 観測の event を出すので除く
+    frames = [f for f in frames if "_mcp_observed" not in json.dumps(f)]
     assert frames[0]["type"] == "ready"
     # #54 (`verified-round1.md` 1-B): `ok is True` も見る (未検証だった)。
     assert frames[0]["ok"] is True
@@ -2178,3 +2180,28 @@ def test_frame_writes_are_serialized_by_a_lock():
     inner = ast.unparse(withs[0])
     assert "proc.stdin.write(data)" in inner and "proc.stdin.flush()" in inner
     assert "out_seq_holder['n'] += 1" in inner
+
+
+def test_mcp_observation_sender_emits_a_single_wrapped_system_event(monkeypatch):
+    """MCP の観測は worker 自身の event として 1 重の包みで送る (CLI の出力は 2 重)。
+    送出に失敗しても例外を出さない。protocol_out が無ければ送らない (None)。"""
+    import io as _io
+
+    from agentic_fx.core.mission_protocol import SeqTracker, read_frame
+
+    assert mission_worker._mcp_observation_sender(None, None) is None
+    stream = _io.BytesIO()
+    send = mission_worker._mcp_observation_sender(stream, SeqTracker())
+    send("tools/list", ["afx_a"])
+    frame = read_frame(_io.BytesIO(stream.getvalue()))
+    assert frame["type"] == "event" and frame["message"]["role"] == "system"
+    assert json.loads(frame["message"]["content"]) == {
+        "_mcp_observed": {"kind": "tools/list", "tools": ["afx_a"]}}
+
+    exit_calls: list[int] = []
+    monkeypatch.setattr(mission_worker.os, "_exit", exit_calls.append)
+
+    class Broken:
+        def write(self, data):
+            raise ValueError("closed")
+    mission_worker._mcp_observation_sender(Broken(), SeqTracker())("initialize", [])

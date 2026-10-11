@@ -133,6 +133,7 @@ class WorkerRunner(AgentRunner):
                 on_rpc_accepted: Callable[[str, dict, RpcOutcome], None] | None = None,
                 on_rpc_released: Callable[[str], None] | None = None,
                 stop_event: threading.Event | None = None,
+                on_event: Callable[[dict], None] | None = None,
                 cleanup_protocol: MC.CleanupProtocol | None = None,
                 isolation: dict | None = None) -> None:
         # cleanup protocol (単一の absolute cleanup deadline と direct-parent reap) は改善
@@ -159,6 +160,8 @@ class WorkerRunner(AgentRunner):
         self._on_rpc_accepted = on_rpc_accepted
         self._on_rpc_released = on_rpc_released
         self._stop_event = stop_event
+        # 子が流す event frame (CLI の stdout 1 行ごと) を呼び出し側が観測する口。例外は握る
+        self._on_event = on_event
 
     def close(self) -> None:
         """no-op — 各 Mission が自分の子プロセスを spawn/reap するため
@@ -387,6 +390,11 @@ class WorkerRunner(AgentRunner):
             return trigger
 
         def handle_event(frame: dict) -> None:
+            if self._on_event is not None:
+                try:
+                    self._on_event(frame)
+                except Exception:  # noqa: BLE001 — 観測の失敗で mission を止めない
+                    _log.exception("on_event callback failed")
             if state["truncated"]:
                 return
             msg = frame["message"]
