@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 131 件。完了分は closed/。
+未完了: 132 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -39,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (110)
+## 設計待ち (111)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -123,6 +123,7 @@
 | [improve-admission-hashes-cli-every-mission](open/improve-admission-hashes-cli-every-mission.md) | 低 | 2026-10-11 | 改善 mission の admission が毎回 CLI binary を hash し fingerprint … |
 | [ops-bot-display-residuals](open/ops-bot-display-residuals.md) | 低 | 2026-10-11 | ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、承認単位 Lock の表が増え… |
 | [ops-bot-initial-start-replays-all-events](open/ops-bot-initial-start-replays-all-events.md) | 低 | 2026-10-11 | ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する |
+| [rpc-dispatcher-join-budget-test-flaky-under-load](open/rpc-dispatcher-join-budget-test-flaky-under-load.md) | 低 | 2026-10-11 | rpc dispatcher の join budget 試験が高負荷時に揺れる |
 | [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
