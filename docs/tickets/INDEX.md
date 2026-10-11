@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 130 件。完了分は closed/。
+未完了: 131 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -39,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (109)
+## 設計待ち (110)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -119,10 +119,11 @@
 | [ops-keys-orphan-secret-temp-after-hard-crash](open/ops-keys-orphan-secret-temp-after-hard-crash.md) | 低 | 2026-10-09 | 鍵 rotate が key:written 直後に強制停止されると平文の一時 file が鍵 dir に残る |
 | [cli-launch-malformed-frames-order-dependent](open/cli-launch-malformed-frames-order-dependent.md) | 低 | 2026-10-10 | cli_launch の malformed frame 試験が実行順に依存 |
 | [ops-ac25-decision-lane-test-race](open/ops-ac25-decision-lane-test-race.md) | 低 | 2026-10-10 | ops ac25 決定レーン試験が順序窓で不安定 |
-| [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
-| [improve-admission-hashes-cli-every-mission](open/improve-admission-hashes-cli-every-mission.md) | 低 | 2026-10-11 | 改善 mission の admission が毎回 CLI binary を hash し fingerprint を再計算する |
-| [ops-bot-display-residuals](open/ops-bot-display-residuals.md) | 低 | 2026-10-11 | ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、Lock の表が増え続ける) |
+| [canary-reject-flaky-port-reuse-forward](open/canary-reject-flaky-port-reuse-forward.md) | 低 | 2026-10-11 | canary の reject 試験が稀に port_reuse_forward も失敗項目に含めて落ちる |
+| [improve-admission-hashes-cli-every-mission](open/improve-admission-hashes-cli-every-mission.md) | 低 | 2026-10-11 | 改善 mission の admission が毎回 CLI binary を hash し fingerprint … |
+| [ops-bot-display-residuals](open/ops-bot-display-residuals.md) | 低 | 2026-10-11 | ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、承認単位 Lock の表が増え… |
 | [real-cli-selftest-opencode-does-not-stop](open/real-cli-selftest-opencode-does-not-stop.md) | 低 | 2026-10-11 | 実 CLI selftest の opencode が echo の後に止まらず tool を呼び続ける |
+| [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |

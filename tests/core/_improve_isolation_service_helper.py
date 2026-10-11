@@ -38,38 +38,58 @@ MOUNT = "/sys/fs/cgroup"
 
 # --- worker 役 -------------------------------------------------------------------
 
-def _probe_runner_class(backend: str):
-    from agentic_fx.runners.claude_runner import ClaudeRunner
-    from agentic_fx.runners.codex_runner import CodexRunner
-    from agentic_fx.runners.opencode_runner import OpencodeRunner
+#: probe が受け取った argv / env などを書く file (worker 役の cwd = mission の workdir)
+OBSERVE_FILE = "probe-observed.json"
 
-    base = {"claude": ClaudeRunner, "codex": CodexRunner, "opencode": OpencodeRunner}[backend]
+#: worker 役が自分の process で計算し直した fingerprint (verify_fingerprint の計算を記録する)
+OBSERVED: dict = {}
 
-    class ProbeRunner(base):
-        """argv と出力の取り出しだけを probe に替える (env は backend の本物)。"""
 
-        probe_cfg: dict = {}
+def _observe_fingerprint() -> None:
+    from agentic_fx.core import improve_fingerprint as F
 
-        def _build_argv(self, mission, *, mcp_spool):
-            cfg = {**self.probe_cfg, "spool": str(mcp_spool) if mcp_spool else None}
-            # argv[0] は venv の python (site-packages を見つけるため)。exec されるのは
-            # artifact の fd (hash したもの)
-            return [VENV_PY, "-I", "-c", PROBE_SRC, json.dumps(cfg)]
+    real = F.compute_fingerprint
 
-        def _extract_output(self, stdout_lines, workdir):
-            for line in reversed(stdout_lines):
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict) and "probe" in obj:
-                    return obj
-            return None
+    def compute(backend, *a, **kw):
+        fp = real(backend, *a, **kw)
+        OBSERVED.update(fp_backend=backend, fp_aggregate=fp.aggregate,
+                        fp_components=dict(fp.components))
+        return fp
+    F.compute_fingerprint = compute
 
-        def _recovery_reserve_sec(self):
-            return 0.0
 
-    return ProbeRunner
+def _probe_runner(runner, backend: str, probe_cfg: dict):
+    """production の `runner_factory.build_runner` が返した runner の instance を probe 用にする。
+
+    runner の種類・コンストラクタ引数・`_build_argv` / `_build_env` / MCP 設定 file は production の
+    もののまま。差し替えるのは argv の先頭 (CLI の path) の後ろへ probe の source を挟む点と、出力の
+    取り出しだけ。probe が受け取った argv の残り・env・設定 file を結果に書く。"""
+    real_argv = runner._build_argv
+
+    def build_argv(mission, *, mcp_spool):
+        real = real_argv(mission, mcp_spool=mcp_spool)
+        cfg = {**probe_cfg, "observe_to": str(Path.cwd() / OBSERVE_FILE),
+               "spool": str(mcp_spool) if mcp_spool else None,
+               "observed": {"runner_class": type(runner).__name__,
+                            "backend": backend, **OBSERVED}}
+        # argv[0] は venv の python (site-packages を見つけるため)。exec されるのは artifact の
+        # fd (hash したもの)。本物の argv の先頭 (CLI の path) 以外はそのまま渡す
+        return [VENV_PY, "-I", "-c", PROBE_SRC, json.dumps(cfg), *real[1:]]
+
+    def extract_output(stdout_lines, workdir):
+        for line in reversed(stdout_lines):
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and "probe" in obj:
+                return obj
+        return None
+
+    runner._build_argv = build_argv
+    runner._extract_output = extract_output
+    runner._recovery_reserve_sec = lambda: 0.0
+    return runner
 
 
 def _inject(kind: str) -> None:
@@ -138,27 +158,22 @@ def _record_dispatcher_stops() -> None:
 
 def worker_main(backend: str, probe_json: str) -> None:
     from agentic_fx import mission_worker as MW
+    from agentic_fx.runners import factory as runner_factory
 
-    cls = _probe_runner_class(backend)
-    cls.probe_cfg = json.loads(probe_json)
-    _inject(cls.probe_cfg.get("inject", ""))
+    probe_cfg = json.loads(probe_json)
+    _observe_fingerprint()
+    _inject(probe_cfg.get("inject", ""))
     _record_dispatcher_stops()
 
-    def build_runner(profile, settings, registry, *, workdir, launch=None, **kw):
-        common = dict(model="probe", workdir=workdir, cli_terminate_grace_sec=2.0,
-                      registry=registry, launch=launch, **kw)
-        kw_runner = {k: v for k, v in common.items() if k != "after_tool_call"}
-        bin_path = Path(getattr(settings.runner, backend).bin)
-        if backend == "claude":
-            return cls(bin_path=bin_path, credentials_file_copied=True,
-                       allowed_tools=["mcp__afx__*"], **kw_runner)
-        if backend == "codex":
-            return cls(bin_path=bin_path, provider="chatgpt", **kw_runner)
-        from agentic_fx.egress.policy import LLAMA_SWAP_URL
-        return cls(bin_path=bin_path, llama_swap_base_url=LLAMA_SWAP_URL, context_limit=4096,
-                   mcp_timeout_ms=10000, **kw_runner)
+    def build_runner(profile, settings, registry, **kw):
+        # backend の選択・引数は production の factory (model だけ probe 名にする)
+        improve = settings.runner.improve.model_copy(update={"model": "probe"})
+        settings = settings.model_copy(update={
+            "runner": settings.runner.model_copy(update={"improve": improve})})
+        runner = runner_factory.build_runner(profile, settings, registry, **kw)
+        return _probe_runner(runner, backend, probe_cfg)
 
-    if cls.probe_cfg.get("inject") == "system_exit":
+    if probe_cfg.get("inject") == "system_exit":
         real_build = build_runner
 
         def build_runner(*a, **kw):  # noqa: F811
@@ -360,6 +375,8 @@ def run_mission(r: dict, *, host, backend: str, artifact: str, probe_cfg: dict,
     obs["mission_allowed"] = host.mission_allowed()
     obs["m_dirs_left"] = sorted(p.name for p in host.root.iterdir() if p.name.startswith("m-"))
     obs["handshake_field"] = options.get("isolation")
+    observed = workdir / OBSERVE_FILE
+    obs["probe_observed"] = json.loads(observed.read_text()) if observed.exists() else None
     stops = workdir / STOP_LOG
     obs["dispatcher_stops"] = (stops.read_text().count("stop\n") if stops.exists() else 0)
     for d in (base, staging.parent, transcripts):
@@ -550,7 +567,7 @@ def admission_context(host, backend: str, artifact: str):
     return IA.AdmissionContext(backend, artifact, ident, fp, host)
 
 
-def sc_canary(r: dict, backend: str, flip: str | None = None) -> None:
+def sc_canary(r: dict, backend: str, flip: str | None = None, mismatch: bool = False) -> None:
     """製品の canary (WorkerRunner.run → 実 mission worker → 同じ launch と cleanup)。"""
     from agentic_fx.core import improve_canary as C
 
@@ -559,6 +576,13 @@ def sc_canary(r: dict, backend: str, flip: str | None = None) -> None:
     isolate_transcripts()
     settings = make_settings(backend, BASE_PY)
     ctx = admission_context(host, backend, BASE_PY)
+    if mismatch:
+        # worker に渡す handshake の fingerprint を、別 backend の値 (正しい形で値だけ違う) にする
+        other = "claude" if backend != "claude" else "codex"
+        wrong = admission_context(host, other, BASE_PY).fingerprint
+        assert wrong.aggregate != ctx.fingerprint.aggregate
+        import dataclasses
+        ctx = dataclasses.replace(ctx, fingerprint=wrong)
     seen: dict = {}
 
     def on_result(res) -> None:
@@ -584,7 +608,7 @@ def sc_canary(r: dict, backend: str, flip: str | None = None) -> None:
     leftover_cleanup(host, r)
 
 
-def sc_canary_blocks(r: dict) -> None:
+def sc_canary_blocks(r: dict, backend: str) -> None:
     """canary の 1 項目の期待値を反転すると admission は safety_canary_failed で、CLI を起こさない。"""
     from agentic_fx.core import improve_admission as IA
     from agentic_fx.core import improve_canary as C
@@ -592,35 +616,55 @@ def sc_canary_blocks(r: dict) -> None:
     host = start_host()
     fake_credentials()
     isolate_transcripts()
-    settings = make_settings("codex", BASE_PY)
+    settings = make_settings(backend, BASE_PY)
     flipped = dict(C.EXPECTED)
     flipped["listen_ipv4_eperm"] = "ok"
+    if backend == "opencode":
+        flipped.update({k: "n/a" for k in C.PROXY_ITEMS})
     selftest_calls = []
+    seen: dict = {}
+
+    def on_result(res) -> None:
+        for msg in res.transcript:
+            c = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(c, str) and c.startswith('{"_improve_isolation"'):
+                seen["report"] = json.loads(c)["_improve_isolation"]
+
     adm = IA.ImproveAdmission(
-        canary=lambda c: C.run_canary(c, settings=settings, root=REPO, expected=flipped),
+        canary=lambda c: C.run_canary(c, settings=settings, root=REPO, expected=flipped,
+                                      on_result=on_result),
         selftest=lambda c: selftest_calls.append(1) or IA.ProbeOutcome(True))
     choice = IA.choose_for_mission(settings, REPO, enabled=True, host=host, admission=adm)
     r["refusal"] = choice.refusal
     r["detail"] = choice.decision.detail if choice.decision else None
     r["selftest_calls"] = len(selftest_calls)
+    r["canary_report"] = seen.get("report")
     r["options"] = sorted(choice.worker_options)
     r["mission_allowed"] = host.mission_allowed()
     r["m_dirs_left"] = sorted(p.name for p in host.root.iterdir() if p.name.startswith("m-"))
     leftover_cleanup(host, r)
 
 
-def sc_saturate(r: dict, kind: str) -> None:
+def sc_saturate(r: dict, kind: str, backend: str) -> None:
     """飽和の注入の下の自己試験 (probe CLI) が失敗すると admission は不可、許可として覚えない。"""
     from agentic_fx.core import improve_admission as IA
     from agentic_fx.core import improve_fingerprint as F
 
     host = start_host()
     missions: list = []
+    if backend == "opencode":
+        # proxy を持たない backend は、飽和させる slot も tunnel も無い (直接の宛先は 8080 だけ)
+        choice = admitted_options(host, backend, BASE_PY)
+        r["mission"] = run_mission(r, host=host, backend=backend, artifact=BASE_PY,
+                                   probe_cfg={"inject": kind, "hold": 0.2},
+                                   options=choice.worker_options)
+        leftover_cleanup(host, r)
+        return
 
     def selftest(ctx):
         options = IA.worker_runner_options(
             IA.AdmissionDecision(True, None, ctx.backend, ctx.fingerprint, ctx.artifact), host)
-        m = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+        m = run_mission(r, host=host, backend=backend, artifact=BASE_PY,
                         probe_cfg={"connect": "saturate", "inject": kind, "hold": 0.2},
                         options=options)
         missions.append(m)
@@ -628,7 +672,7 @@ def sc_saturate(r: dict, kind: str) -> None:
         return IA.ProbeOutcome(ok, False, "" if ok else str(m["result"]["reason"])[:200])
 
     adm = IA.ImproveAdmission(canary=lambda c: IA.ProbeOutcome(True), selftest=selftest)
-    settings = make_settings("codex", BASE_PY)
+    settings = make_settings(backend, BASE_PY)
     first = IA.choose_for_mission(settings, REPO, enabled=True, host=host, admission=adm)
     second = IA.choose_for_mission(settings, REPO, enabled=True, host=host, admission=adm)
     r["first"] = {"refusal": first.refusal, "detail": first.decision.detail}
@@ -743,8 +787,9 @@ SCENARIOS = {
     "abort": lambda r, arg: sc_abort(r),
     "real_selftest": lambda r, arg: sc_real_selftest(r, *arg.split("@", 1)),
     "canary": lambda r, arg: sc_canary(r, arg or "codex"),
-    "canary_blocks": lambda r, arg: sc_canary_blocks(r),
-    "saturate": lambda r, arg: sc_saturate(r, arg),
+    "canary_mismatch": lambda r, arg: sc_canary(r, arg or "codex", mismatch=True),
+    "canary_blocks": lambda r, arg: sc_canary_blocks(r, arg or "codex"),
+    "saturate": lambda r, arg: sc_saturate(r, *arg.split("@", 1)),
     "e2e": lambda r, arg: sc_e2e(r, arg or "codex"),
     "renamed": lambda r, arg: sc_renamed(r),
     "in_place": lambda r, arg: sc_in_place(r),

@@ -17,7 +17,26 @@ r["exe"] = [st.st_dev, st.st_ino]
 r["env"] = {k: os.environ.get(k) for k in (
     "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy")
     if k in os.environ}
+# backend の本物の runner が組んだ argv (artifact の次から)・env と MCP / CLI の設定 file を残す
+r["argv"] = sys.argv[2:]
+r["env_keys"] = sorted(os.environ)
+r["env_values"] = {k: os.environ.get(k) for k in (
+    "CODEX_HOME", "CLAUDE_CONFIG_DIR", "TERM", "HOME", "TMPDIR") if k in os.environ}
+r["observed"] = cfg.get("observed")
+_files = {}
+for _p in [a for a in sys.argv[2:] if a.endswith(".json")] + [
+        os.path.join(os.environ.get("HOME", ""), ".config/opencode/opencode.json")]:
+    try:
+        with open(_p) as _f:
+            _files[os.path.basename(_p)] = json.load(_f)
+    except (OSError, ValueError):
+        pass
+r["config_files"] = _files
 r["managed_env"] = sorted(k for k in os.environ if k.startswith("CODEX_MANAGED_"))
+if cfg.get("observe_to"):
+    # 異常終了 (飽和で 7) する場合も、起動時に受け取ったものを afx に渡せるようにする
+    with open(cfg["observe_to"], "w") as _f:
+        json.dump(r, _f)
 
 if cfg.get("spool"):
     from agentic_fx.tools import mcp_spool_client as C

@@ -187,18 +187,171 @@ def test_canary_runs_under_real_isolation(isolation_units, backend):
     assert res["blocking_reasons"] == []
 
 
-def test_canary_failure_blocks_exec_under_real_isolation(isolation_units):
-    res = run_service(isolation_units, "canary-flip", "canary_blocks")
+BACKENDS = ["codex", "claude", "opencode"]
+RUNNER_CLASS = {"codex": "CodexRunner", "claude": "ClaudeRunner", "opencode": "OpencodeRunner"}
+PATH_COMPONENTS = ("profile", "launch_kind", "outer_landlock", "argv_env_policy")
+
+# どの scenario も CLI 役の artifact は共通の probe (Python の ELF) で、実 CLI は使わない (課金なし)。
+# backend 固有であることは artifact ではなく、production の runner が組んだ argv / env / 設定 file と
+# worker が計算し直した fingerprint の要素 (backend ごとに別の hash) で証明する。
+
+
+def _expected_components(backend: str) -> dict:
+    import sys
+
+    from agentic_fx.core import improve_admission as IA
+    from agentic_fx.core import improve_fingerprint as F
+
+    fp = F.compute_fingerprint(backend, IA.inspect_artifact(sys.executable), F.probe_kernel())
+    return {n: fp.component(n) for n in PATH_COMPONENTS}
+
+
+def _assert_worker_observed(observed: dict, backend: str) -> None:
+    """worker 役 (isolation を張った process) が観測した backend と fingerprint の要素が、backend
+    ごとの期待 hash と一致する。"""
+    assert observed["backend"] == backend
+    assert observed["runner_class"] == RUNNER_CLASS[backend]
+    assert observed["fp_backend"] == backend
+    got = {n: observed["fp_components"][n] for n in PATH_COMPONENTS}
+    assert got == _expected_components(backend)
+    _assert_independent_digests(observed)
+
+
+#: source を直接 hash する要素 (群 → 相対 path)。`SOURCE_GROUPS` を経ず、test が path を持つ
+INDEPENDENT_SOURCES = {
+    "source_launcher": ("core/cli_launcher.py", "core/cli_artifact_copy.py"),
+    "source_supervisor": ("core/connect_supervisor.py",),
+    "source_canary": ("core/improve_canary.py",),
+}
+
+
+def _assert_independent_digests(observed: dict) -> None:
+    """worker が計算し直した要素のうち source の群と aggregate を、production の fingerprint module を
+    通さずに hashlib だけで求めた値と照合する。
+
+    独立に確かめられるのは source_* の bytes の digest と、要素の並びからの aggregate の計算。
+    outer_landlock / argv_env_policy は AST の追跡で組む正規形で、test が同じ形を作り直すと
+    production の写しになるので、上の `_expected_components` (production の関数) との照合に留まる。
+    よって outer_landlock / argv_env_policy の canonicalization と production の
+    `compute_fingerprint` が同時に壊れる変更は、ここでは検出できない。"""
+    import hashlib
+
+    from agentic_fx import core
+
+    root = Path(core.__file__).resolve().parents[1]
+    comps = observed["fp_components"]
+    for name, rels in INDEPENDENT_SOURCES.items():
+        lines = "".join(f"{rel}\0{hashlib.sha256((root / rel).read_bytes()).hexdigest()}\n"
+                        for rel in rels)
+        digest = hashlib.sha256(lines.encode()).hexdigest()
+        # 要素の値は文字列 digest を JSON にしたもの (引用符つき) を hash する
+        assert comps[name] == hashlib.sha256(f'"{digest}"'.encode()).hexdigest(), name
+    joined = "".join(f"{n}\t{h}\n" for n, h in comps.items())
+    assert observed["fp_aggregate"] == hashlib.sha256(joined.encode()).hexdigest()
+
+
+def _assert_runner_built_cli_inputs(probe: dict, backend: str) -> None:
+    """probe が受け取った argv / env / 設定 file は、その backend の runner が作ったもの。"""
+    argv, env, files = probe["argv"], probe["env_values"], probe["config_files"]
+    assert "PATH" in probe["env_keys"] and "PYTHONSAFEPATH" in probe["env_keys"]
+    if backend == "codex":
+        assert argv[:3] == ["exec", "-", "--json"]
+        assert argv[argv.index("-m") + 1] == "probe"
+        assert any(a.startswith("mcp_servers.afx.command=") for a in argv)
+        assert "--ignore-user-config" in argv and "--output-schema" in argv
+        assert env["CODEX_HOME"].endswith("/cfg") and "CLAUDE_CONFIG_DIR" not in env
+        assert files["schema.json"] == {"type": "object", "required": ["probe"]}
+    elif backend == "claude":
+        assert argv[0] == "-p" and "--strict-mcp-config" in argv
+        assert argv[argv.index("--model") + 1] == "probe"
+        assert argv[argv.index("--mcp-config") + 1].endswith("/mcp.json")
+        assert files["mcp.json"]["mcpServers"]["afx"]["args"][:2] == ["-m", "agentic_fx.tools.mcp_shim"]
+        assert env["CLAUDE_CONFIG_DIR"].endswith("/cfg") and "CODEX_HOME" not in env
+    else:
+        assert argv[:2] == ["run", "隔離の結合の mission (CLI は probe)"]
+        assert argv[argv.index("-m") + 1] == "llama-swap/probe"
+        assert env["TERM"] == "dumb" and "CODEX_HOME" not in env
+        assert "CLAUDE_CONFIG_DIR" not in env
+        assert files["opencode.json"]["mcp"]["afx"]["enabled"] is True
+        assert files["opencode.json"]["provider"]["llama-swap"]["models"]["probe"]
+
+
+def test_backend_specific_fingerprint_components_differ():
+    import sys
+
+    from agentic_fx.core import improve_admission as IA
+    from agentic_fx.core import improve_fingerprint as F
+
+    ident = IA.inspect_artifact(sys.executable)
+    kernel = F.probe_kernel()
+    fps = {b: F.compute_fingerprint(b, ident, kernel) for b in BACKENDS}
+    for name in ("argv_env_policy", "outer_landlock"):
+        values = {b: fps[b].component(name) for b in BACKENDS}
+        assert len(set(values.values())) == 3, (name, values)
+    assert len({fp.aggregate for fp in fps.values()}) == 3
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_worker_recomputes_and_rejects_a_different_fingerprint(isolation_units, backend):
+    """afx が worker に渡す fingerprint が違えば、worker は自分で計算し直して fingerprint_mismatch で
+    止まる (handshake の値をそのまま返す実装では止まらない)。CLI は起こさない。"""
+    res = run_service(isolation_units, f"canary-mismatch-{backend}", f"canary_mismatch:{backend}")
+    m = res["mission"]
+    assert m["status"] != "completed", m
+    assert "fingerprint_mismatch" in (m.get("reason") or ""), m
+    assert res["outcome"]["ok"] is False, res
+    assert m.get("output") is None or not m["output"].get("canary"), m
+    assert res["m_dirs_left"] == [] and res["mission_allowed"] is True
+    assert res["blocking_reasons"] == []
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_canary_failure_blocks_exec_under_real_isolation(isolation_units, backend):
+    from agentic_fx.core import improve_admission as IA
+    from agentic_fx.core import improve_fingerprint as F
+
+    res = run_service(isolation_units, f"canary-flip-{backend}", f"canary_blocks:{backend}")
     assert res["refusal"] == "safety_canary_failed"
     assert res["detail"] == "listen_ipv4_eperm"
+    # canary を走らせた worker が観測した backend と、計算し直した fingerprint (backend ごとに別)
+    rep = res["canary_report"]
+    assert rep["kind"] == "canary" and rep["backend"] == backend
+    ident = IA.inspect_artifact(__import__("sys").executable)
+    expected = F.compute_fingerprint(backend, ident, F.probe_kernel()).aggregate
+    assert rep["fingerprint_check"]["computed"] == expected
+    assert rep["fingerprint_check"]["expected"] == expected
     # canary を通らなければ実 CLI の自己試験も mission も起こさない
     assert res["selftest_calls"] == 0 and res["options"] == []
     assert res["m_dirs_left"] == [] and res["mission_allowed"] is True
 
 
 @pytest.mark.parametrize("kind", ["eagain", "503"])
-def test_saturation_and_503_do_not_register(isolation_units, kind):
-    res = run_service(isolation_units, f"sat-{kind}", f"saturate:{kind}")
+def test_opencode_has_no_saturable_proxy(isolation_units, kind):
+    """opencode は proxy を持たないので、飽和させる slot も tunnel も無い (宛先は直接の 8080 だけ)。
+
+    proxy を持つ backend の負例 (飽和で admission が拒否・未登録) の代わりに、proxy が無いことを
+    実機で確認する。opencode に proxy が付くと `proxy_port is None` / proxy env 空 / handoff 空の
+    assert が赤になるので、その時点でこの test を proxy saturation の負例へ置換する。"""
+    res = run_service(isolation_units, f"sat-{kind}-opencode", f"saturate:{kind}@opencode")
+    m = res["mission"]
+    assert m["result"]["status"] == "completed", m
+    _assert_worker_observed(m["result"]["output"]["probe"]["observed"], "opencode")
+    _assert_runner_built_cli_inputs(m["probe_observed"], "opencode")
+    assert m["result"]["output"]["probe"]["env"] == {}
+    assert m["report"]["proxy_port"] is None and m["report"]["handoff_verdicts"] == {}
+    assert m["report"]["backend"] == "opencode"
+    assert m["m_dirs_left"] == []
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude"])
+@pytest.mark.parametrize("kind", ["eagain", "503"])
+def test_saturation_and_503_do_not_register(isolation_units, kind, backend):
+    res = run_service(isolation_units, f"sat-{kind}-{backend}", f"saturate:{kind}@{backend}")
+    m = res["mission"]
+    # 失敗した mission でも、起動時に probe が受け取ったものは残る
+    _assert_worker_observed(m["probe_observed"]["observed"], backend)
+    _assert_runner_built_cli_inputs(m["probe_observed"], backend)
+    assert m["report"]["backend"] == backend
     probe = res["mission"]["result"]
     # probe は EAGAIN / 503 を見たときだけ 7 で終わる (実 CLI と同じく要求の失敗で異常終了)
     assert probe["status"] == "failed" and "rc=7" in probe["reason"], probe
