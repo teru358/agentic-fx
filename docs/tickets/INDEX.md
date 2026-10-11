@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 134 件。完了分は closed/。
+未完了: 136 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -39,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (113)
+## 設計待ち (115)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -75,6 +75,7 @@
 | [reference-symbols-as-indicator-inputs](open/reference-symbols-as-indicator-inputs.md) | 中 | 2026-10-08 | 戦略 plugin に株価指数など参照 symbol の値を指標として渡す |
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
+| [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | repo root から full suite を回すと実 data/ を掴んで固まる |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -125,6 +126,7 @@
 | [ops-bot-display-residuals](open/ops-bot-display-residuals.md) | 低 | 2026-10-11 | ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、承認単位 Lock の表が増え… |
 | [ops-bot-initial-start-replays-all-events](open/ops-bot-initial-start-replays-all-events.md) | 低 | 2026-10-11 | ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する |
 | [rpc-dispatcher-join-budget-test-flaky-under-load](open/rpc-dispatcher-join-budget-test-flaky-under-load.md) | 低 | 2026-10-11 | rpc dispatcher の join budget 試験が高負荷時に揺れる |
+| [seccomp-chmod-eperm-breaks-codex-rollout](open/seccomp-chmod-eperm-breaks-codex-rollout.md) | 低 | 2026-10-11 | seccomp の chmod/fchmod EPERM で codex の rollout 書込みが失敗する |
 | [verify-backend-isolated-via-service](open/verify-backend-isolated-via-service.md) | 低 | 2026-10-11 | 隔離付きの backend 疎通確認を service 経由 (ops API / afx ctl) で提供する |
 | [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
