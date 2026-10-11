@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 RC_RUNTIME_IMPORT_FAILED = 70
 RC_ISOLATION_FAILED = 71
+# 隔離と server 認証が済んだ後の、機能本体の想定外の失敗 (起動失敗とは区別する)
+RC_BODY_FAILED = 1
 
 REASONS = (
     "multithreaded",
@@ -80,6 +82,7 @@ REASONS = (
     "unit_notify_socket",
     "notify_failed",
     "startup_internal_error",
+    "body_failed",
     "config_dir_missing",
     "config_dir_invalid",
     "state_dir_failed",
@@ -867,6 +870,9 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
             "startup_internal_error"
         rc = RC_ISOLATION_FAILED
     else:
-        return body(isolated)
+        try:
+            return body(isolated)
+        except Exception:  # 機能本体の想定外の失敗も、path・URL・token を含み得る traceback にしない
+            reason, rc = "body_failed", RC_BODY_FAILED
     print(f"afx-ops: {reason}", file=sys.stderr, flush=True)
     return rc

@@ -73,7 +73,8 @@ def _break(case: str, home: Path, feature: str) -> None:
 _CASES = {
     "ok_web": ("web", None, 0, None),
     "not_implemented_bot": ("bot", None, 69, "probe_not_implemented"),
-    "not_implemented_notify": ("notify", None, 69, "probe_not_implemented"),
+    # 試験の secret は URL でないので、notify は送信せず入力の失敗で止まる
+    "url_invalid_notify": ("notify", None, 71, "url_invalid"),
     "config_dir_missing": ("bot", "config_dir_missing", 71, "config_dir_missing"),
     "config_dir_invalid": ("notify", "config_dir_invalid", 71, "config_dir_invalid"),
     "config_invalid": ("web", "config_invalid", 71, "config_invalid"),
@@ -133,7 +134,7 @@ def test_probe_reads_its_own_inputs_and_nothing_from_argv_env_or_stdin(child_env
     os.close(write_end)
     try:
         done = _probe(["probe", "notify"], child_env, home, stdin=read_end)
-        assert done.returncode == 69
+        assert (done.returncode, done.stderr) == (71, "afx-ops: url_invalid\n")
         # stdin は 1 byte も消費していない
         assert os.read(read_end, 4096) == f"{MARK}-stdin\n".encode()
     finally:
@@ -163,7 +164,7 @@ def test_probe_creates_nothing_and_needs_neither_unit_nor_key_dir(feature, child
     before = sorted((str(p), p.stat().st_mtime_ns) for p in home.rglob("*"))
     # 通常の子 process (NoNewPrivs なし、unit の外)。key_dir は存在しない
     done = _probe(["probe", feature], child_env, home)
-    assert done.returncode in (0, 69), done.stderr
+    assert done.returncode == {"bot": 69, "web": 0, "notify": 71}[feature], done.stderr
     assert sorted((str(p), p.stat().st_mtime_ns) for p in home.rglob("*")) == before
     assert not (home / ".local").exists()
 
@@ -215,7 +216,8 @@ def test_web_probe_never_accepts(tmp_path, child_env, home):
 def test_bot_and_notify_probes_make_no_network_calls(feature, tmp_path, child_env, home):
     _install(home, feature)
     done, lines = _trace(tmp_path, feature, "socket,connect,openat", child_env, home)
-    assert done.returncode == 69, done.stderr
+    # notify は URL でない secret を入力の失敗として止める (名前解決にも進まない)
+    assert done.returncode == {"bot": 69, "notify": 71}[feature], done.stderr
     assert [line for line in lines if "AF_INET" in line] == []
     assert [line for line in lines if re.search(r"\bconnect\(", line)] == []
     # 観測が空振りでないこと: secret file は開いている

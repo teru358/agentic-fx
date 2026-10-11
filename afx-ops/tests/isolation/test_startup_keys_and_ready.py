@@ -131,6 +131,17 @@ def test_body_sees_the_config_endpoint_and_state_dir(feature, root, child_env):
 
 @needs_x86_64
 @needs_landlock
+@pytest.mark.parametrize("feature", FEATURES)
+def test_unexpected_exception_in_body_becomes_one_fixed_line(feature, root, child_env):
+    got = run_canary(_spec(root, feature, "raise_in_body"), child_env)
+    # 隔離が済んだ後の失敗は、起動失敗 (rc 71) と区別できる固定 reason と rc にする
+    assert got.rc == 1, got.stderr[-2000:]
+    assert got.stderr.strip().splitlines() == ["afx-ops: body_failed"]
+    assert "Traceback" not in got.stderr and token_for(PRINCIPAL[feature]) not in got.stderr
+
+
+@needs_x86_64
+@needs_landlock
 @pytest.mark.parametrize("feature", ["bot", "notify"])
 def test_repr_and_error_text_never_contain_the_token_or_secret(feature, root, child_env):
     got = run_canary(_spec(root, feature, "repr_isolated"), child_env)

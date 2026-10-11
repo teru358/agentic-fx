@@ -33,6 +33,8 @@ spec:
   require_notify: 真なら NOTIFY_SOCKET を必須にする (unit の Type=notify と同じ扱い)
   swap_after_prepare: {"path": p, "to": q} なら領域の検査の直後 (Landlock の前) に p を
          p.orig へ退け、p を q への symlink に置き換える (検査と規則の間の差し替え)
+  resolv_conf: 名前解決の規則に使う resolv.conf の path を差し替える (実 /etc/resolv.conf を
+         書き換えずに、rename 置換で規則の外れた inode を作る試験のため)
 
 出力: 隔離に成功すると "ISOLATED" を出し、操作の結果を "RESULT <json>"、最後に
 token 送信を模した "TOKEN-SENT" を出す。隔離に失敗すると非零終了し、どちらも出さない。
@@ -54,6 +56,9 @@ resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 # -I で起動されるので、試験用 plan の helper (同じ dir) は path を明示して読む
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _test_plans import check_feature_only, test_plan  # noqa: E402
+# notify の試験用の名前解決と試験 CA (隔離後は tests 配下を読めないので、ここで読み込む)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+import _notify_seams as notify_seams  # noqa: E402
 from afx_ops import api_client, cli  # noqa: E402
 from afx_ops.config import OpsConfig  # noqa: E402
 from afx_ops.isolation import startup  # noqa: E402
@@ -488,6 +493,10 @@ def op_config_view(p, iso):
             "config_dir_fd": iso.config.config_dir_fd}
 
 
+def op_raise_in_body(p, iso):
+    raise RuntimeError(iso.api_token.decode("ascii", "replace") + " /secret/path")
+
+
 def op_repr_isolated(p, iso):
     text = repr(iso) + str(iso)
     sys.stderr.write(text + "\n")
@@ -502,6 +511,37 @@ def op_client_status(p, iso):
     except api_client.ApiError as exc:
         return [-1, exc.reason]
     return [reply.status, 0]
+
+
+def op_notify_runtime(p, iso):
+    """notify の配送 loop を試験 CA と試験用の名前解決で回す。
+
+    取得 1 回で 1 件も送らなかったら止める。retry の待ちは 0 にする。結果は
+    {"rc", "new_modules" (loop の間に import した module), "after" (続けて試した操作の結果)}。
+    """
+    import functools
+
+    from afx_ops.notify import runtime, transport
+    if p.get("resolver") == "nss":
+        factory = notify_seams.nss_resolver_factory(port=p["port"])
+    else:
+        factory = notify_seams.udp_resolver_factory(dns_port=p["dns_port"], port=p["port"],
+                                                    resolv_conf=p.get("resolv_conf"))
+    send = functools.partial(transport.post, ssl_context=notify_seams.test_ca_context(p["ca_pem"]),
+                             resolver_factory=factory, timeout=p.get("timeout"))
+    if p.get("crash_after_2xx"):
+        # 2xx を受けた後・snapshot の置換の前に落ちる (kill は seccomp で拒否されるので exit)
+        runtime.save = lambda _fd, _state: os._exit(86)
+    if p.get("pause"):
+        sys.stdout.write("PAUSED\n")
+        sys.stdout.flush()
+        sys.stdin.readline()
+    before = set(sys.modules)
+    rc = runtime.run(iso, send=send, sleep=lambda _seconds: None,
+                     stop=lambda delivered: delivered == 0)
+    new_modules = sorted(set(sys.modules) - before)
+    after = [OPS[step["op"]](step.get("params", {}), iso) for step in p.get("after", [])]
+    return {"rc": rc, "new_modules": new_modules, "after": after}
 
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
@@ -694,6 +734,8 @@ def main() -> int:
         sys.stdout.write(f"READY {os.getpid()} {port}\n")
         sys.stdout.flush()
         sys.stdin.readline()
+    if spec.get("resolv_conf"):
+        startup.RESOLV_CONF = spec["resolv_conf"]
     plan, plan_check = _plan(spec)
 
     def body(iso: startup.Isolated) -> int:

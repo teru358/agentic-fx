@@ -13,8 +13,8 @@
 | 2 | ``unknown_feature`` (起動口が返す) |
 | 69 | ``probe_not_implemented`` |
 | 70 | ``runtime_unavailable`` (表の値を呼べない) |
-| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` (想定外の失敗は ``startup_internal_error``) |
-| 73 | ``probe_bind_failed`` (機能の確認の失敗) |
+| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL。想定外の失敗は ``startup_internal_error``) |
+| 73 | ``probe_bind_failed`` (web) / ``probe_<原因>`` (notify の送信失敗。語は ``afx_ops.notify.probe.REASONS``) |
 """
 from __future__ import annotations
 
@@ -57,6 +57,13 @@ def probe_web(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
     listener.close()
 
 
+def probe_notify(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
+    """webhook へ予約 namespace の probe body を 1 回送る (中身は notify.probe)。"""
+    # notify.probe はこの module の ProbeError を使うので、呼ぶときに読む (循環 import を避ける)
+    from afx_ops.notify import probe as notify_probe
+    notify_probe.probe(config, secrets)
+
+
 def probe_not_implemented(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
     """外向きの疎通確認がまだ無い機能。入力の検査までで止める。"""
     raise ProbeError("probe_not_implemented", RC_NOT_IMPLEMENTED)
@@ -66,8 +73,8 @@ PROBES: Mapping[str, Callable[[OpsConfig, Mapping[str, bytes]], None]] = Mapping
     "bot": probe_not_implemented,
     # web は listener の bind だけを確かめる
     "web": probe_web,
-    # notify は送信先の確認が入るまで入力の検査だけ
-    "notify": probe_not_implemented,
+    # notify は送信先の webhook へ probe body を 1 回送る
+    "notify": probe_notify,
 })
 
 

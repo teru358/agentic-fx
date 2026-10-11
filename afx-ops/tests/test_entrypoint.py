@@ -240,3 +240,19 @@ def test_web_startup_plan_carries_the_configured_port(home, monkeypatch):
     monkeypatch.setattr(cli.startup, "run", lambda plan, config, body, **kwargs: seen.append(plan) or 0)
     assert cli.main(["web"]) == 0
     assert seen[0].web_port == 18080
+
+
+def test_notify_runtime_is_wired_and_the_others_stay_not_implemented():
+    from afx_ops.notify import runtime as notify_runtime
+    assert cli.RUNTIMES["notify"] is notify_runtime.run
+    assert cli.RUNTIMES["bot"] is cli.feature_not_implemented
+    assert cli.RUNTIMES["web"] is cli.feature_not_implemented
+
+
+def test_importing_the_entrypoint_leaves_aiohttp_to_the_preload():
+    # aiohttp の import は起動順の preload (隔離前、失敗は runtime_import_failed) が行う
+    done = subprocess.run([sys.executable, "-I", "-c",
+                           "import sys, afx_ops.cli; print('aiohttp' in sys.modules)"],
+                          capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
