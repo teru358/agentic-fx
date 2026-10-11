@@ -1206,6 +1206,22 @@ def test_set_resource_limits_sets_all_four_limits(monkeypatch):
     ]
 
 
+def test_set_resource_limits_keeps_the_fsize_hard_limit_for_the_isolated_copy(monkeypatch):
+    """CLI 隔離の経路だけ RLIMIT_FSIZE の hard を artifact の大きさまで残す (soft は既定のまま)。
+    既定より小さい値は既定に丸める。"""
+    import resource as _resource
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(_resource, "setrlimit",
+                        lambda which, limits: calls.append((which, limits)))
+    mib = 1024 * 1024
+    mission_worker._set_resource_limits(as_mb=64, nofile=32, fsize_mb=2,
+                                        fsize_hard_bytes=300 * mib)
+    mission_worker._set_resource_limits(as_mb=64, nofile=32, fsize_mb=2, fsize_hard_bytes=1)
+    fsize = [lim for which, lim in calls if which == _resource.RLIMIT_FSIZE]
+    assert fsize == [(2 * mib, 300 * mib), (2 * mib, 2 * mib)]
+
+
 # ---- mission_protocol / _RagRpcProxy の残りの防御 (同上) ------------------
 
 
@@ -2059,3 +2075,106 @@ def test_main_improve_result_tool_calls_receives_configured_backend(
     assert seen == ["claude"], seen
     assert frames[-1]["type"] == "result", frames[-1]
     assert frames[-1]["tool_calls"] == 7
+
+
+def _isolation_field(backend: str) -> dict:
+    return {"kind": "mission", "backend": backend,
+            "artifact": {"sha256": "a" * 64, "dev": 1, "ino": 2, "size": 3, "mtime_ns": 4},
+            "fingerprint": "b" * 64}
+
+
+def _no_prepare(monkeypatch):
+    """判定が外れた場合にも隔離の資源 (cgroup・fd・listener) を実際に確保しないよう prepare を封じる。"""
+    from agentic_fx.core import improve_isolation
+
+    def refuse(*a, **kw):
+        raise AssertionError("prepare must not be reached")
+
+    monkeypatch.setattr(improve_isolation.WorkerIsolation, "prepare", refuse)
+
+
+def test_isolation_backend_must_match_improve_backend(monkeypatch, tmp_path):
+    from agentic_fx.core import improve_isolation
+
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile", lambda **kw: None)
+    _no_prepare(monkeypatch)
+
+    def to_codex(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "codex"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve", "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-iso-mismatch",
+                             "staging_dir": str(tmp_path / "staging" / "m"),
+                             "source_snapshot_dir": str(tmp_path / "source"),
+                             improve_isolation.HANDSHAKE_FIELD: _isolation_field("claude")},
+        settings_mutator=to_codex)
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
+    assert "isolation backend differs" in frames[0]["error"]
+
+
+def test_isolation_requires_the_mission_nonce(monkeypatch, tmp_path):
+    from agentic_fx.core import improve_isolation
+    from agentic_fx.core.mission_protocol import HANDSHAKE_NONCE_FIELD
+
+    monkeypatch.setattr(mission_worker, "_bootstrap_improve_profile", lambda **kw: None)
+    _no_prepare(monkeypatch)
+
+    def to_codex(settings_dict):
+        settings_dict["runner"]["improve"]["backend"] = "codex"
+
+    frames, _, _ = _drive_main(
+        monkeypatch, tmp_path,
+        handshake_overrides={"worker_profile": "improve", "db_path": None, "plugins_dir": None,
+                             "mission_id": "m-iso-nonce",
+                             "staging_dir": str(tmp_path / "staging" / "m"),
+                             "source_snapshot_dir": str(tmp_path / "source"),
+                             improve_isolation.HANDSHAKE_FIELD: _isolation_field("codex")},
+        settings_mutator=to_codex)
+    assert frames[0]["type"] == "ready" and frames[0]["ok"] is False
+    assert HANDSHAKE_NONCE_FIELD in frames[0]["error"]
+
+
+def _function_node(path: Path, name: str):
+    import ast
+
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(name)
+
+
+def _with_lock_names(node) -> list[str]:
+    import ast
+
+    return [item.context_expr.id for item in node.items
+            if isinstance(item.context_expr, ast.Name)]
+
+
+def test_frame_writes_are_serialized_by_a_lock():
+    """frame の seq の採番と書込みを lock の中で行う (弱い pin: 並行の混線そのものは決定論的に
+    再現できないので、lock が掛かっている形だけを固定する)。
+
+    - 子→親: `_send_frame` の本体 (docstring の後) は `with _SEND_LOCK:` の 1 文で、採番・書込み・
+      採番の前進がその中にある。
+    - 親→子: `write_numbered` は `with stdin_lock:` の中で採番・書込み・flush をする。"""
+    import ast
+
+    src = Path(mission_worker.__file__)
+    send = _function_node(src, "_send_frame")
+    body = [n for n in send.body
+            if not (isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+    assert len(body) == 1 and isinstance(body[0], ast.With), ast.dump(send)
+    assert _with_lock_names(body[0]) == ["_SEND_LOCK"]
+    inner = ast.unparse(body[0])
+    assert "_write_frame_or_die" in inner and "_expected += 1" in inner
+    assert isinstance(mission_worker._SEND_LOCK, type(__import__("threading").Lock()))
+
+    from agentic_fx.runners import worker_runner
+    write = _function_node(Path(worker_runner.__file__), "write_numbered")
+    withs = [n for n in write.body if isinstance(n, ast.With)]
+    assert len(withs) == 1 and _with_lock_names(withs[0]) == ["stdin_lock"]
+    inner = ast.unparse(withs[0])
+    assert "proc.stdin.write(data)" in inner and "proc.stdin.flush()" in inner
+    assert "out_seq_holder['n'] += 1" in inner

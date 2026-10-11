@@ -1,26 +1,31 @@
 """改善 mission の CLI launcher (worker の direct child、exec 前は自前 code)。
 
 `python -I -m agentic_fx.core.cli_launcher '<config json>'` で worker から起こされ、
-自分を隔離してから渡された CLI binary の fd を `execveat` する。段の並び:
+自分を隔離してから、渡された CLI binary の bytes を封印した memfd を `execveat` する。
+段の並び:
 
-- L1〜L3: status fd を CLOEXEC にする、PDEATHSIG と ppid の再照合、rlimit の hard
-  固定、継承 seccomp filter が無いこと、capability が全部 0 で uid / gid /
-  supplementary group が worker の期待値と一致すること
+- L1〜L3: status fd を CLOEXEC にする、PDEATHSIG と ppid の再照合、継承 seccomp filter が
+  無いこと、capability が全部 0 で uid / gid / supplementary group が worker の期待値と
+  一致すること
 - L4: HELLO{pid} を送り、JOINED を厳密に検査する
+- L4a: mission cgroup に入った後で、渡された fd の bytes を封印した memfd に写し (memfd の
+  page は mission cgroup に課金される)、SHA-256 を afx が admission で見た digest と照合し、
+  memfd を ELF として検査し直す。元の fd は閉じる
+- L4b: rlimit の hard 固定 (RLIMIT_FSIZE が memfd への書込みに掛からないよう、写した後)
 - L5: subreaper、no_new_privs、nested Landlock (TSYNC)
 - L6〜L7: seccomp `improve-cli/1` を install して listener を得て、seccomp mode 2、
   no_new_privs 1、subreaper 1 を自己検査する
 - L8: PREPARED と listener fd 1 個を送り、送信の成否によらず自分の copy を閉じる
 - L8w: GO を厳密に検査する
-- L9: fd 3 以上を CLOEXEC にしてから CLI fd を `execveat(AT_EMPTY_PATH)`
+- L9: fd 3 以上を CLOEXEC にしてから memfd を `execveat(AT_EMPTY_PATH)`
 
 失敗の申告は SETUP_FAILED / EXEC_FAILED の frame だけで行い、stderr や exit code
 には意味を持たせない。single thread の前提で書く (seccomp の TSYNC と nested
 Landlock の TSYNC は thread が増えても全 thread に掛かるが、launcher 自身は thread
 を作らない)。
 
-import は標準ライブラリと、protocol・nested Landlock・seccomp 表と生成器の module
-だけに限る (launcher source hash の範囲を小さく保つため)。
+import は標準ライブラリと、protocol・artifact の copy・nested Landlock・seccomp 表と生成器の
+module だけに限る (launcher source hash の範囲を小さく保つため)。
 """
 import ctypes
 import errno as _errno
@@ -31,6 +36,7 @@ import signal
 import socket
 import sys
 
+from agentic_fx.core import cli_artifact_copy as AC
 from agentic_fx.core import cli_launch_protocol as P
 from agentic_fx.core import landlock_nested
 from agentic_fx.core import seccomp_cli_bpf
@@ -305,6 +311,40 @@ def _set_rlimits(backend: str) -> None:
         raise _SetupFailed("rlimit_failed", getattr(e, "errno", 0) or 0) from None
 
 
+def _sealed_exec_artifact(src_fd: int, digest: str) -> int:
+    """mission cgroup の中で src_fd の bytes を封印した memfd に写し、digest と ELF を検査して
+    memfd を返す (src_fd はここで閉じる)。失敗は固定 reason の `_SetupFailed`。
+
+    worker は RLIMIT_FSIZE の soft を小さく、hard を artifact の大きさ以上にして起こすので、
+    memfd への書込みの前に soft を hard まで上げる (8 MiB への固定は写した後の `_set_rlimits`)。"""
+    try:
+        try:
+            _soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (hard, hard))
+            memfd = AC.sealed_copy(src_fd)
+        except (OSError, ValueError) as e:
+            raise _SetupFailed("artifact_copy_failed", getattr(e, "errno", 0) or 0) from None
+    finally:
+        os.close(src_fd)
+    try:
+        try:
+            got = AC.sha256_fd(memfd)
+        except OSError as e:
+            raise _SetupFailed("artifact_copy_failed", e.errno or 0) from None
+        if got != digest:
+            raise _SetupFailed("artifact_digest_mismatch")
+        try:
+            identity, _why = AC.inspect_cli_artifact(memfd)
+        except OSError:
+            identity = None
+        if identity is None:
+            raise _SetupFailed("artifact_copy_unsupported")
+    except BaseException:
+        os.close(memfd)
+        raise
+    return memfd
+
+
 def _execveat(cli_fd: int, argv, envp) -> int:
     """成功すれば戻らない。失敗の errno を返す。"""
     c_argv = (ctypes.c_char_p * (len(argv) + 1))(*[a.encode() if isinstance(a, str) else a
@@ -319,7 +359,8 @@ def _execveat(cli_fd: int, argv, envp) -> int:
 def _run(cfg: dict) -> None:
     libc = _libc()
     status_fd = int(cfg["status_fd"])
-    cli_fd = int(cfg["cli_fd"])
+    src_fd = int(cfg["cli_fd"])
+    digest = str(cfg["artifact_sha256"])
     nonce = bytes.fromhex(cfg["nonce"])
     if len(nonce) != P.NONCE_LEN:
         raise _Abort("nonce")
@@ -340,7 +381,6 @@ def _run(cfg: dict) -> None:
 
     try:
         # L3
-        _set_rlimits(cfg["backend"])
         try:
             inherited = _seccomp_mode() != 0
         except OSError:
@@ -356,6 +396,13 @@ def _run(cfg: dict) -> None:
         # L4
         _send(sock, P.encode_hello(nonce, os.getpid()))
         _expect(sock, nonce, P.JOINED)
+
+        # L4a: mission cgroup に入った後で写す (memfd の page を mission cgroup に課金する)
+        cli_fd = _sealed_exec_artifact(src_fd, digest)
+        st = os.fstat(cli_fd)
+        exec_identity = (st.st_dev, st.st_ino)
+        # L4b: RLIMIT_FSIZE は memfd への書込みにも掛かるので、写した後に固定する
+        _set_rlimits(cfg["backend"])
 
         # L5: subreaper → no_new_privs → nested Landlock
         if libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
@@ -395,7 +442,7 @@ def _run(cfg: dict) -> None:
         prepared = P.Prepared(compiled.profile_id, compiled.policy_hash, compiled.bpf_hash,
                               compiled.filter_flags, abi, subreaper)
         try:
-            _send(sock, P.encode_prepared(nonce, prepared), fds=[listener])
+            _send(sock, P.encode_prepared(nonce, prepared, exec_identity), fds=[listener])
         finally:
             os.close(listener)
     except _SetupFailed as e:

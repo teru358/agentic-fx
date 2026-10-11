@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.core import cli_artifact_copy as AC
 from agentic_fx.core import cli_launch as L
 from agentic_fx.core import cli_launch_protocol as P
 from tests.core import test_cli_launch as base
@@ -198,11 +199,18 @@ def _replaced_after_open(tmp_path: Path) -> tuple[int, Path, int, int]:
     cli, other = tmp_path / "python", tmp_path / "python.new"
     copy_python(cli)
     copy_python(other)
+    with open(other, "ab") as f:
+        f.write(b"\0" * 16)  # 内容も違う別 inode
     fd = L.open_cli_binary(str(cli))
     opened_ino = os.fstat(fd).st_ino
     new_ino = os.stat(other).st_ino
     os.rename(other, cli)
     return fd, cli, opened_ino, new_ino
+
+
+def _sha_of(path: Path) -> str:
+    with open(path, "rb") as f:
+        return AC.sha256_fd(f.fileno())
 
 
 def _launch_fd(h, fd: int, cli: Path, **kw) -> L.LaunchResult:
@@ -216,14 +224,19 @@ def _launch_fd(h, fd: int, cli: Path, **kw) -> L.LaunchResult:
 
 
 def test_fd_exec_runs_the_opened_inode_after_path_replacement(h, tmp_path):
-    """本物の launcher は開いた fd を exec するので、path を置き換えても開いた inode が
-    動き `cli_started`。"""
-    fd, _cli, opened_ino, _new_ino = _replaced_after_open(tmp_path)
+    """本物の launcher は開いた fd の bytes を写した memfd を exec するので、path を置き換えても
+    動くのは開いた inode の内容で `cli_started`。"""
+    fd, _cli, opened_ino, new_ino = _replaced_after_open(tmp_path)
+    opened_sha = AC.sha256_fd(fd)
     r = _launch_fd(h, fd, _cli)
     assert r.started, r
     time.sleep(0.2)
     assert r.launcher_proc.poll() is None
-    assert os.stat(f"/proc/{r.launcher_proc.pid}/exe").st_ino == opened_ino
+    exe = f"/proc/{r.launcher_proc.pid}/exe"
+    assert (os.stat(exe).st_dev, os.stat(exe).st_ino) == r.exec_identity
+    assert os.stat(exe).st_ino not in (opened_ino, new_ino)
+    with open(exe, "rb") as f:
+        assert AC.sha256_fd(f.fileno()) == opened_sha != _sha_of(_cli)
 
 
 def test_path_exec_is_detected_as_unproven(h, tmp_path):

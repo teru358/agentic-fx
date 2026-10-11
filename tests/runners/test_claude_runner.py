@@ -212,6 +212,28 @@ def test_claude_nonzero_exit_is_failed_with_reason(tmp_path):
     assert "\n" not in result.reason
 
 
+def test_nonzero_exit_reason_carries_the_stderr_tail(tmp_path):
+    """異常終了の reason は stderr の 1 行目でなく末尾の数行 (失敗の理由は最後に出ることが多い)。"""
+    runner, workdir = _runner(tmp_path, behavior="nonzero_exit_multiline")
+    result = runner.run(_mission())
+    assert result.status == "failed"
+    assert result.reason == ("HTTP-like CLI exit rc=1: claude: line 3 | claude: line 4 | "
+                             "claude: the real cause")
+
+
+def test_stderr_reason_tail_keeps_the_end():
+    from agentic_fx.runners import cli_runner as CR
+
+    assert CR._stderr_reason_tail("") == ""
+    assert CR._stderr_reason_tail("a\n\nb\n") == "a | b"
+    long = "x" * 2000 + "\nthe end\n"
+    tail = CR._stderr_reason_tail(long)
+    assert tail.endswith("| the end") and tail.startswith("…")
+    assert len(tail) == CR._STDERR_REASON_CHARS
+    reason = CR._normalize_reason(f"HTTP-like CLI exit rc=1: {tail}")
+    assert reason.endswith("the end") and "truncated" not in reason
+
+
 def test_claude_ignoring_sigterm_reaches_timeout(tmp_path):
     runner, workdir = _runner(tmp_path, behavior="hang_then_ignore_sigterm")
     result = runner.run(_mission(timeout_sec=0.3))

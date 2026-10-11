@@ -5390,3 +5390,26 @@ def test_abort_path_waits_use_the_shared_ceiling_constants(tmp_path, monkeypatch
     assert mission_ceiling.READER_JOIN_SEC in joins
     assert (settings.worker.rpc_timeout_sec
             + mission_ceiling.DISPATCHER_JOIN_MARGIN_SEC) in joins
+
+
+def test_escalate_kill_leaves_no_child_that_ignores_sigterm(tmp_path):
+    """SIGTERM を無視する子は grace 後の SIGKILL を `_escalate_kill` の中で受けて死ぬ (finally 任せにしない)。"""
+    from types import SimpleNamespace
+
+    runner = WorkerRunner(root=_root(tmp_path), settings=SETTINGS,
+                          clock=FixedClock(datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)),
+                          rag=_rag(tmp_path))
+    script = ("import signal, sys, time\n"
+              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+              "print('ready', flush=True)\n"
+              "time.sleep(600)\n")
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                            start_new_session=True)
+    try:
+        assert proc.stdout.readline().strip() == b"ready"
+        runner._escalate_kill(proc, SimpleNamespace(worker_terminate_grace_sec=0.3))
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

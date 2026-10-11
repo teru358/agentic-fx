@@ -15,14 +15,18 @@ def _prep() -> P.Prepared:
     return P.Prepared("improve-cli/1", "ab" * 32, "cd" * 32, 57, 8)
 
 
+#: launcher が exec する memfd の (st_dev, st_ino)
+EXEC_ID = (2 ** 40 + 3, 2 ** 63 + 5)
+
+
 def test_frame_layout_is_fixed():
     assert P.HEADER_LEN == 24
-    assert P.FRAME_LEN == {P.HELLO: 28, P.JOINED: 24, P.PREPARED: 132, P.GO: 24,
+    assert P.FRAME_LEN == {P.HELLO: 28, P.JOINED: 24, P.PREPARED: 148, P.GO: 24,
                            P.EXEC_FAILED: 28, P.SETUP_FAILED: 32}
     assert (P.HELLO, P.JOINED, P.PREPARED, P.GO, P.EXEC_FAILED, P.SETUP_FAILED) == (
         1, 2, 3, 4, 5, 6)
     hello = P.encode_hello(NONCE, 1234)
-    assert hello == b"AFXL" + struct.pack("<HH", 2, 1) + NONCE + struct.pack("<i", 1234)
+    assert hello == b"AFXL" + struct.pack("<HH", 3, 1) + NONCE + struct.pack("<i", 1234)
 
 
 @pytest.mark.parametrize("data, frame_type", [
@@ -31,7 +35,7 @@ def test_frame_layout_is_fixed():
     (P.encode_go(NONCE), P.GO),
     (P.encode_exec_failed(NONCE, 2), P.EXEC_FAILED),
     (P.encode_setup_failed(NONCE, "credentials_unexpected", 1), P.SETUP_FAILED),
-    (P.encode_prepared(NONCE, _prep()), P.PREPARED),
+    (P.encode_prepared(NONCE, _prep(), EXEC_ID), P.PREPARED),
 ])
 def test_round_trip(data, frame_type):
     f = P.decode(data, NONCE)
@@ -44,6 +48,8 @@ def test_round_trip(data, frame_type):
         assert (f.reason, f.errno) == ("credentials_unexpected", 1)
     if frame_type == P.PREPARED:
         assert f.prepared == _prep()
+        # exec する memfd の identity は Prepared (期待値と比べる値) の外に持つ
+        assert f.exec_identity == EXEC_ID
 
 
 def _replace(data: bytes, offset: int, raw: bytes) -> bytes:
@@ -64,8 +70,10 @@ def _replace(data: bytes, offset: int, raw: bytes) -> bytes:
                               struct.pack("<H", 999))),
     ("setup_reserved", _replace(P.encode_setup_failed(NONCE, "rlimit_failed"), 26,
                                 struct.pack("<H", 1))),
-    ("profile_id_nul", _replace(P.encode_prepared(NONCE, _prep()), 24, b"a\0b")),
-    ("profile_id_non_ascii", _replace(P.encode_prepared(NONCE, _prep()), 24, b"\xff")),
+    ("profile_id_nul", _replace(P.encode_prepared(NONCE, _prep(), EXEC_ID), 24, b"a\0b")),
+    ("profile_id_non_ascii", _replace(P.encode_prepared(NONCE, _prep(), EXEC_ID), 24,
+                                      b"\xff")),
+    ("prepared_v2_length", P.encode_prepared(NONCE, _prep(), EXEC_ID)[:-16]),
 ])
 def test_malformed_frames(name, data):
     with pytest.raises(P.MalformedFrame):
@@ -143,7 +151,9 @@ def test_fixed_reason_words():
         1: "inherited_seccomp_filter", 2: "credentials_unexpected", 3: "rlimit_failed",
         4: "subreaper_failed", 5: "landlock_abi_too_old", 6: "landlock_create_failed",
         7: "no_new_privs_failed", 8: "landlock_restrict_failed", 9: "seccomp_install_failed",
-        10: "seccomp_self_check_failed", 11: "policy_compile_failed"}
+        10: "seccomp_self_check_failed", 11: "policy_compile_failed",
+        12: "artifact_copy_failed", 13: "artifact_digest_mismatch",
+        14: "artifact_copy_unsupported"}
     assert (P.LAUNCHER_DIED, P.LAUNCHER_SPAWN_FAILED, P.CGROUP_JOIN_FAILED,
             P.RECEIVER_HANDOFF_FAILED, P.CLI_EXEC_UNPROVEN) == (
         "launcher_died", "launcher_spawn_failed", "cgroup_join_failed",

@@ -27,7 +27,14 @@ def build_runner(
     abort_event: threading.Event | None = None,
     abort_reason_fn: Callable[[], str] | None = None,
     after_tool_call: Callable[[], None] | None = None,
+    launch: Any | None = None,
 ) -> AgentRunner:
+    """`launch` は CLI を起こす方法の差し替え (改善 mission の隔離の経路だけが渡す)。
+    claude / codex / opencode の runner にそのまま渡し、local は使わない。隔離の経路の
+    opencode は llama-swap の URL を設定値でなく egress 定数の literal にする (supervisor は
+    `127.0.0.1:8080` だけを通す)。"""
+    if launch is not None and profile != "improve":
+        raise ValueError("launch is used only by the improve profile")
     choice = getattr(settings.runner, profile)
     if choice.backend == "local":
         from agentic_fx.runners.local_runner import LocalRunner
@@ -47,7 +54,7 @@ def build_runner(
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,
             cli_started_sink=cli_started_sink, abort_event=abort_event,
-            abort_reason_fn=abort_reason_fn)
+            abort_reason_fn=abort_reason_fn, launch=launch)
     if choice.backend == "codex":
         from agentic_fx.runners.codex_runner import CodexRunner
         codex_settings = settings.runner.codex
@@ -57,7 +64,7 @@ def build_runner(
             cli_started_sink=cli_started_sink,
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,
-            abort_event=abort_event, abort_reason_fn=abort_reason_fn)
+            abort_event=abort_event, abort_reason_fn=abort_reason_fn, launch=launch)
     if choice.backend == "opencode":
         from agentic_fx.runners.opencode_runner import OpencodeRunner
         # verify_backend は model_copy(update={"backend": backend}) で backend
@@ -77,9 +84,17 @@ def build_runner(
             context_limit=settings.runner.opencode.context_limit,
             mcp_timeout_ms=int(
                 settings.improve.backtest_rpc_timeout_sec * 1000) + 5000,
-            workdir=workdir, llama_swap_base_url=settings.llama_swap.base_url,
+            workdir=workdir,
+            llama_swap_base_url=(settings.llama_swap.base_url if launch is None
+                                 else _isolated_llama_swap_url()),
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,
             registry=registry, on_message=on_message,
             cli_started_sink=cli_started_sink, abort_event=abort_event,
-            abort_reason_fn=abort_reason_fn)
+            abort_reason_fn=abort_reason_fn, launch=launch)
     raise ValueError(f"unknown runner backend: {choice.backend!r}")
+
+
+def _isolated_llama_swap_url() -> str:
+    from agentic_fx.egress.policy import LLAMA_SWAP_URL
+
+    return LLAMA_SWAP_URL

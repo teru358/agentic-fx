@@ -133,12 +133,18 @@ class WorkerRunner(AgentRunner):
                 on_rpc_accepted: Callable[[str, dict, RpcOutcome], None] | None = None,
                 on_rpc_released: Callable[[str], None] | None = None,
                 stop_event: threading.Event | None = None,
-                cleanup_protocol: MC.CleanupProtocol | None = None) -> None:
+                cleanup_protocol: MC.CleanupProtocol | None = None,
+                isolation: dict | None = None) -> None:
         # cleanup protocol (単一の absolute cleanup deadline と direct-parent reap) は改善
         # mission の隔離構成だけの経路。既定 (None) は従来の終了経路のまま
         if cleanup_protocol is not None and worker_profile == "trade":
             raise ValueError("cleanup protocol is not used by the trade profile")
         self._cleanup = cleanup_protocol
+        # 改善 mission の CLI 隔離の指示 (afx が admission を通したときだけ)。handshake に
+        # そのまま載せる。隔離は cleanup protocol (mission cgroup の後始末) を前提にする
+        if isolation is not None and (cleanup_protocol is None or worker_profile != "improve"):
+            raise ValueError("isolation requires the improve profile and the cleanup protocol")
+        self._isolation = isolation
         self._root = root
         self._settings = settings
         self._clock = clock
@@ -282,10 +288,11 @@ class WorkerRunner(AgentRunner):
         transcript: list[dict] = []
         state = {"bytes": 0, "truncated": False}
         cli_pgid_holder: dict[str, int] = {}
-        # mission nonce は全 profile で handshake に載せる。worker はここから spool root 名・
-        # mission cgroup 名・launcher の status protocol の nonce を導く
-        nonce = MissionNonce(os.urandom(16).hex())
         cleanup = self._cleanup
+        # mission nonce は隔離の構成 (cleanup protocol) のときだけ作って handshake に載せる。
+        # worker はここから spool root 名・mission cgroup 名・launcher の status protocol の
+        # nonce を導く。既定の経路と trade の handshake は nonce を持たない (worker が自前で作る)
+        nonce = MissionNonce(os.urandom(16).hex()) if cleanup is not None else None
         issuer = MC.DeadlineIssuer() if cleanup is not None else None
         issue_lock = threading.Lock()
         cleanup_requested = threading.Event()
@@ -614,9 +621,13 @@ class WorkerRunner(AgentRunner):
             "worker_profile": self._worker_profile,
             "now": now.isoformat(),
             "credentials": credentials or {},
-            HANDSHAKE_NONCE_FIELD: nonce.hex,
             **(run_context_fields or {}),
         }
+        if nonce is not None:
+            handshake[HANDSHAKE_NONCE_FIELD] = nonce.hex
+        if self._isolation is not None:
+            from agentic_fx.core.improve_isolation import HANDSHAKE_FIELD
+            handshake[HANDSHAKE_FIELD] = self._isolation
         with stdin_lock:
             write_frame(proc.stdin, handshake)
 

@@ -16,6 +16,7 @@ _fake_claude_behavior ファイルが存在する場合、その内容が behavi
   "schema_mismatch" schema 不適合の出力を返す
   "hang_then_ignore_sigterm" SIGTERM を無視して sleep し続ける
   "nonzero_exit"   rc=1 で終了、stderr にエラーメッセージ
+  "nonzero_exit_multiline" rc=1 で終了、stderr の最後の行に本当の理由
   "max_turns_exceeded" stop_reason="max_turns" 相当のエラー行を返す
 """
 import json
@@ -64,6 +65,12 @@ def main() -> int:
 
     if behavior == "nonzero_exit":
         sys.stderr.write("claude: internal error occurred\n")
+        return 1
+
+    if behavior == "nonzero_exit_multiline":
+        for i in range(5):
+            sys.stderr.write(f"claude: line {i}\n")
+        sys.stderr.write("\nclaude: the real cause\n")
         return 1
 
     if behavior == "max_turns_exceeded":

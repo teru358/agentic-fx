@@ -2,7 +2,9 @@
 
 worker は CLI の実行 artifact (x86_64 の 64 bit ELF に限る) を検査してから
 `SOCK_SEQPACKET` の socketpair を作り、子端と CLI
-binary の fd だけを launcher に渡す。`launcher_proc` は worker の direct child で、
+binary の fd だけを launcher に渡す。launcher は mission cgroup に入った後でその bytes を封印した
+memfd に写し、admission の digest と照合してから memfd を exec する (memfd の page は mission
+cgroup に課金される)。`launcher_proc` は worker の direct child で、
 wait / reap するのは worker だけ。setup の成否は frame だけで決め、launcher の
 stderr や exit code は見ない。
 
@@ -17,7 +19,8 @@ close の所有:
 | status 親端 | worker が結果の確定時に閉じる |
 | listener (handoff 前) | 受信した worker が、PREPARED が不正なら閉じる |
 | listener (handoff 後) | receiver だけ。worker は参照を持たない |
-| CLI binary fd | worker は Popen 直後に閉じる、launcher は exec で閉じる |
+| CLI binary fd | worker は Popen 直後に閉じる、launcher は memfd に写した後で閉じる |
+| 封印済み memfd | launcher が作り、exec で閉じる (CLOEXEC) |
 
 cgroup の join と receiver への handoff は呼び出し側が関数で渡す (この module は
 cgroup も receiver も持たない)。
@@ -31,7 +34,6 @@ import math
 import os
 import select
 import socket
-import stat
 import struct
 import subprocess
 import sys
@@ -40,6 +42,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
+from agentic_fx.core import cli_artifact_copy as AC
 from agentic_fx.core import cli_launch_protocol as P
 from agentic_fx.core import landlock_nested
 from agentic_fx.core import seccomp_cli_bpf
@@ -86,36 +89,9 @@ def open_cli_binary(path: str) -> int:
     return os.open(path, os.O_RDONLY | os.O_CLOEXEC)
 
 
-# ELF header の受け入れ値: 64 bit、little endian、x86_64、EXEC / DYN
-_ELFCLASS64 = 2
-_ELFDATA2LSB = 1
-_EM_X86_64 = 62
-_ET_EXEC_DYN = (2, 3)
-_ELF_HEADER_PREFIX = 20
-
-
-def inspect_cli_artifact(fd: int) -> tuple[tuple[int, int] | None, str]:
-    """開いた fd そのものを `fstat` と先頭 bytes で検査し、x86_64 の 64 bit ELF
-    (EXEC / DYN) なら `((st_dev, st_ino), "")`、そうでなければ `(None, 理由)` を返す。
-
-    `#!` script は exec 時に fd が CLOEXEC で閉じて interpreter が開けないので、
-    launcher を起こす前に落とす (codex は npm の wrapper でなく native ELF を渡す)。
-    path は開き直さない (検査した fd と hash・exec する fd を同じにするため)。
-
-    multicall binary (uutils coreutils 等) は ELF として通るが、fd 経由の exec では
-    呼ばれた名前を判定できず目的の動作にならない。この検査では見分けられない。"""
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):
-        return None, "not a regular file"
-    head = os.pread(fd, _ELF_HEADER_PREFIX, 0)
-    if len(head) < _ELF_HEADER_PREFIX or head[:4] != b"\x7fELF":
-        return None, f"not ELF: {head[:4]!r}"
-    if head[4] != _ELFCLASS64 or head[5] != _ELFDATA2LSB:
-        return None, f"ELF class={head[4]} data={head[5]}"
-    e_type, e_machine = struct.unpack_from("<HH", head, 16)
-    if e_machine != _EM_X86_64 or e_type not in _ET_EXEC_DYN:
-        return None, f"ELF type={e_type} machine={e_machine}"
-    return (st.st_dev, st.st_ino), ""
+#: 開いた fd を x86_64 の 64 bit ELF (EXEC / DYN) として検査する (launcher も同じ関数で memfd を
+#: 検査し直す)
+inspect_cli_artifact = AC.inspect_cli_artifact
 
 
 @dataclass
@@ -127,7 +103,9 @@ class LaunchResult:
     receiver の停止が先なので reap せずに返し、呼び出し側が `reap_launcher` する。
 
     `untransferred_fds` は呼び出し側が閉じる fd。handoff 前の listener と status 親端は
-    `launch_cli` 自身が閉じてから返すので常に空 (閉じる所有者を 1 つにする)。"""
+    `launch_cli` 自身が閉じてから返すので常に空 (閉じる所有者を 1 つにする)。
+
+    `exec_identity` は launcher が PREPARED で申告した、exec する memfd の (st_dev, st_ino)。"""
 
     started: bool
     reason: str | None
@@ -138,6 +116,7 @@ class LaunchResult:
     detail: str = ""
     setup_detail: int | None = None
     untransferred_fds: tuple[int, ...] = ()
+    exec_identity: tuple[int, int] | None = None
 
 
 class LaunchError(Exception):
@@ -324,10 +303,12 @@ def launch_cli(
     expected: P.Prepared | None = None,
     credentials: ExpectedCredentials | None = None,
     cwd: str | None = None,
+    artifact_sha256: str | None = None,
     stdin=subprocess.DEVNULL,
     stdout=None,
     stderr=None,
     launcher_cmd: Sequence[str] | None = None,
+    after_spawn: Callable[[], None] | None = None,
 ) -> LaunchResult:
     """launcher を起こし、`cli_started` か固定 reason の失敗を返す。
 
@@ -356,8 +337,13 @@ def launch_cli(
       `launch_thread_unsupported` で返す。
     - 残余: CLI が zombie になっていて exe を照合できないときは、証明できないので
       `cli_exec_unproven` で fail closed とする (仕様どおり)。
+    - `artifact_sha256`: launcher が写した bytes に求める SHA-256 (afx が admission で見た値)。
+      None なら `cli_fd` をここで読んで取る (隔離の mission は必ず admission の値を渡す)。
+      違えば launcher が `artifact_digest_mismatch` で止まる。
     - `launcher_cmd`: launcher の起動 argv の前半 (config の JSON が後ろに付く)。既定は
       `python -I -m agentic_fx.core.cli_launcher`。
+    - `after_spawn()`: launcher を fork した直後 (HELLO を待つ前) に worker 側で 1 回呼ぶ。
+      launcher にだけ要る rlimit を worker 自身から外すのに使う。例外は `LaunchError`。
     """
     if threading.current_thread() is not threading.main_thread():
         os.close(cli_fd)
@@ -369,9 +355,11 @@ def launch_cli(
     cmd = list(launcher_cmd) if launcher_cmd is not None else [
         sys.executable, "-I", "-m", LAUNCHER_MODULE]
 
-    # wait_exec の照合に使う (st_dev, st_ino) は、検査したこの fd から保存する
+    # ELF でなければ launcher を起こさない (launcher も写した memfd を検査し直す)
     try:
         cli_identity, why = inspect_cli_artifact(cli_fd)
+        if cli_identity is not None and artifact_sha256 is None:
+            artifact_sha256 = AC.sha256_fd(cli_fd)
     except OSError as e:
         cli_identity, why = None, f"inspect: {e}"
     if cli_identity is None:
@@ -389,6 +377,7 @@ def launch_cli(
         "status_fd": child.fileno(), "cli_fd": cli_fd, "nonce": nonce.hex(),
         "expected_ppid": os.getpid(), "uid": creds.uid, "gid": creds.gid,
         "groups": list(creds.groups), "backend": backend, "argv": list(argv),
+        "artifact_sha256": artifact_sha256,
     }
     try:
         proc = subprocess.Popen(
@@ -407,7 +396,10 @@ def launch_cli(
 
     series = BEFORE_HANDOFF
     held: list[int] = []  # handoff 前に worker が持っている listener
+    exec_identity: tuple[int, int] | None = None
     try:
+        if after_spawn is not None:
+            after_spawn()
         # wait_hello
         frame = _plain_frame(_recv(parent, nonce, deadline), series,
                              eof_reason=P.LAUNCHER_DIED)
@@ -446,6 +438,8 @@ def launch_cli(
             _close_held(held)
             raise _Fail(P.ATTESTATION_MISMATCH, series,
                         f"prepared {ev.frame.prepared} != {expected}")
+        # exe の照合は launcher が申告した memfd の identity で行う
+        exec_identity = ev.frame.exec_identity
         listener = fds[0]
         try:
             handoff(listener)
@@ -464,7 +458,7 @@ def launch_cli(
         # wait_exec
         ev = _recv(parent, nonce, deadline)
         if ev.kind == "eof":
-            if _exe_identity(proc.pid) != cli_identity:
+            if exec_identity is None or _exe_identity(proc.pid) != exec_identity:
                 raise _Fail(P.CLI_EXEC_UNPROVEN, series)
         else:
             frame = _plain_frame(ev, series, eof_reason=P.LAUNCHER_DIED)
@@ -480,7 +474,7 @@ def launch_cli(
                 max(deadline, time.monotonic()) + _DEFAULT_REAP_GRACE_SEC)
             reaped = reap_launcher(proc, deadline=rd, kill=kill)
         return LaunchResult(False, f.reason, f.series, _classify(f.reason), proc, reaped,
-                            f.detail, f.setup_detail)
+                            f.detail, f.setup_detail, exec_identity=exec_identity)
     except Exception as e:
         # 想定外の例外では status 親端と handoff 前の listener を閉じ、launcher の handle と系列を付けて
         # 呼び出し側へ渡す。kill と reap の順序は handoff の前後で違うのでここでは
@@ -495,7 +489,7 @@ def launch_cli(
         parent.close()
         raise LaunchInterrupted(proc, series) from e
     parent.close()
-    return LaunchResult(True, None, None, None, proc, False)
+    return LaunchResult(True, None, None, None, proc, False, exec_identity=exec_identity)
 
 
 def _close_held(held: list[int]) -> None:

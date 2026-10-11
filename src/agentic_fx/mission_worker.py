@@ -56,10 +56,13 @@ import signal
 import sys
 import sysconfig
 import threading
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
+from agentic_fx.core import improve_isolation
 from agentic_fx.core import landlock
+from agentic_fx.core import mission_cleanup as MC
 from agentic_fx.core.landlock import _assert_allowlist_excludes_data_dir
 from agentic_fx.core.mission_protocol import (
     HANDSHAKE_NONCE_FIELD, MissionNonce, ProtocolError, SeqTracker, encode_frame,
@@ -152,14 +155,22 @@ def _set_pdeathsig(sig: int) -> None:
                              f"{os.strerror(errno)}")
 
 
-def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int) -> None:
+def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int,
+                         fsize_hard_bytes: int | None = None) -> None:
+    """worker 自身の rlimit (soft = hard)。`fsize_hard_bytes` は CLI 隔離の経路だけが渡し、
+    RLIMIT_FSIZE の hard をそこまで残す (soft は `fsize_mb` のまま)。launcher が mission cgroup の
+    中で CLI の artifact を memfd に写すとき soft を hard まで上げ、写した後で 8 MiB に固定する。
+    worker 自身は launcher を fork した直後に hard を soft まで下げる
+    (`improve_isolation.pin_worker_fsize`)。"""
     import resource
 
     as_bytes = int(as_mb) * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (as_bytes, as_bytes))
     resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
     fsize_bytes = int(fsize_mb) * 1024 * 1024
-    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_bytes))
+    fsize_hard = (fsize_bytes if fsize_hard_bytes is None
+                  else max(fsize_bytes, int(fsize_hard_bytes)))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_bytes, fsize_hard))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 def _bootstrap_improve_profile(
@@ -520,7 +531,9 @@ def _protect_protocol_stdout() -> Any:
 
 
 def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
-                     in_seq: SeqTracker) -> Callable[[str, dict], Any]:
+                     in_seq: SeqTracker,
+                     read_fn: Callable[[], dict | None] | None = None,
+                     ) -> Callable[[str, dict], Any]:
     """`run_backtest`/`analyze_corr` の親呼び出し RPC client。フレーム
     送受信の規律 (rpc_id 採番・seq 検証・エラー伝播) は `_RagRpcProxy._call`
     (:307-330) と一字一句同じにする。呼び出し元
@@ -529,6 +542,8 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
     同時 1 件以下しか呼ばれない — `_RagRpcProxy` が単一の
     `sys.stdin.buffer` 読取を安全に共有できているのと同じ前提。"""
     rpc_counter = {"n": 0}
+    # 隔離の経路では stdin の読み手が 1 本 (`StdinRouter`) で、seq もそこで検査済み
+    routed = read_fn is not None
 
     def call(name: str, args: dict) -> Any:
         rpc_counter["n"] += 1
@@ -537,14 +552,15 @@ def _make_rpc_client(protocol_out: Any, out_seq: SeqTracker,
         _send_frame(protocol_out, out_seq,
                    {"type": "tool_rpc", "rpc_id": rpc_id, "name": name,
                     "args": args})
-        response = read_frame(sys.stdin.buffer)
+        response = read_fn() if routed else read_frame(sys.stdin.buffer)
         if response is None:
             raise RuntimeError(
                 "parent closed the pipe while awaiting tool_rpc_result")
         if response.get("type") != "tool_rpc_result":
             raise ProtocolError(
                 f"expected tool_rpc_result, got {response.get('type')!r}")
-        in_seq.check(response.get("seq"))
+        if not routed:
+            in_seq.check(response.get("seq"))
         if response.get("rpc_id") != rpc_id:
             raise RuntimeError(
                 f"tool_rpc_result rpc_id mismatch: expected {rpc_id}, "
@@ -715,6 +731,10 @@ def _run_improve_mission(
     source_snapshot_dir: str, protocol_out: Any = None, out_seq: Any = None,
     in_seq: Any = None, inventory_view: dict | None = None,
     spool_root: mcp_spool.SpoolRoot | None = None,
+    launch: Any = None,
+    rpc_read: Callable[[], dict | None] | None = None,
+    isolation_fault: Callable[[], str | None] | None = None,
+    build_runner: Callable[..., Any] | None = None,
 ) -> Any:
     """improve profile での runner 構築・Mission 実行 (Step 7d + A-4 検収
     是正 Step 7a/7b)。
@@ -744,7 +764,7 @@ def _run_improve_mission(
     :return: AgentRunner インスタンス (`_afx_mcp_dispatcher` 属性に
         `SpoolDispatcher`、`mcp_spool_dir` 属性に spool directory を保持する)
     """
-    rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq)
+    rpc_client = _make_rpc_client(protocol_out, out_seq, in_seq, read_fn=rpc_read)
     registry, counters = _build_improve_registry(
         settings=settings, workdir=workdir, staging_dir=Path(staging_dir),
         source_snapshot_dir=Path(source_snapshot_dir), rpc_client=rpc_client,
@@ -762,7 +782,18 @@ def _run_improve_mission(
         after_send=counters.fire_if_pending, spool_root=spool_root,
         on_fatal=on_spool_fatal)
     on_message = _make_on_message(protocol_out, out_seq)
-    runner = runner_factory.build_runner(
+
+    def abort_reason() -> str:
+        # 隔離の障害 (supervisor / proxy / afx の deadline) を最優先にする
+        fault = isolation_fault() if isolation_fault is not None else None
+        if fault is not None:
+            return fault
+        if spool_fatal:
+            return spool_fatal[0]
+        return f"{TOOL_BUDGET_ABORT_PREFIX}{counters.abort_trigger or ''}"
+
+    extra = {"launch": launch} if launch is not None else {}
+    runner = (build_runner or runner_factory.build_runner)(
         "improve", settings, registry, workdir=workdir,
         on_message=on_message,
         # precheck 2026-08-22 pass2: RB3 (裁定 R1 の 2 段配線のうち後段) — CLI
@@ -772,10 +803,8 @@ def _run_improve_mission(
         cli_started_sink=lambda pgid: _send_frame(
             protocol_out, out_seq, {"type": "cli_started", "pgid": pgid}),
         abort_event=counters.abort_event,
-        abort_reason_fn=lambda: (
-            spool_fatal[0] if spool_fatal
-            else f"{TOOL_BUDGET_ABORT_PREFIX}{counters.abort_trigger or ''}"),
-        after_tool_call=counters.fire_if_pending)
+        abort_reason_fn=abort_reason,
+        after_tool_call=counters.fire_if_pending, **extra)
     _attach_mcp_dispatcher(runner, dispatcher)
     runner._afx_mission_counters = counters
     return runner
@@ -788,7 +817,8 @@ def _run_improve_mission(
 # (本文は完全同一、差分は docstring 1 行のみだった)。
 
 
-def main() -> None:
+def main(*, build_runner: Callable[..., Any] | None = None) -> None:
+    """`build_runner` は improve の runner の組み立ての差し替え (試験だけが渡す)。"""
     protocol_out = _protect_protocol_stdout()
 
     # I2 対応: 親→子方向 (handshake/tool_rpc_result) 専用の受信検証
@@ -801,8 +831,13 @@ def main() -> None:
     out_seq = SeqTracker()
     ready_sent = False
     market_tool_calls: dict[str, int] | None = None
-    global _mission_nonce
+    # 隔離の経路で起こす stdin の読み手 (daemon thread)
+    router = None
+    #: router を起こした経路の終了 code (main を抜けようとしている例外から決める)
+    exit_code = 0
+    global _mission_nonce, _isolation_close_failed
     _mission_nonce = None
+    _isolation_close_failed = False
     try:
         # レビュー 1 周目 (codex I-1): handshake の読み取りを `try` の**内側**
         # へ移した。旧実装は `try` の外で `read_frame` を呼んでいたため、
@@ -847,8 +882,31 @@ def main() -> None:
                 claude_bin = None
                 codex_bin = None
                 opencode_bin = None
+            # afx が admission を通したときだけ、CLI を隔離の下で起こす
+            isolation_spec = None
+            if improve_isolation.HANDSHAKE_FIELD in handshake:
+                isolation_spec = improve_isolation.parse_isolation_field(
+                    handshake[improve_isolation.HANDSHAKE_FIELD])
+                if isolation_spec.backend != improve_backend:
+                    raise ProtocolError("isolation backend differs from runner.improve.backend")
+                # cgroup・spool・launcher の nonce は afx が発行した 1 個から導く (worker が作らない)
+                if HANDSHAKE_NONCE_FIELD not in handshake:
+                    raise ProtocolError(f"isolation requires {HANDSHAKE_NONCE_FIELD}")
+                if isolation_spec.kind == improve_isolation.KIND_CANARY:
+                    # canary の CLI 役は Python の ELF (試験 script を -c で渡す)
+                    canary_bin = os.path.realpath(sys.executable)
+                    claude_bin = canary_bin if improve_backend == "claude" else None
+                    codex_bin = canary_bin if improve_backend == "codex" else None
+                    opencode_bin = canary_bin if improve_backend == "opencode" else None
             # MCP の spool root は Landlock を掛ける前に作り、dirfd を保持する。
             spool_root = _create_mcp_spool_root(Path.cwd())
+            isolation = None
+            if isolation_spec is not None:
+                artifact_bin = {"claude": claude_bin, "codex": codex_bin,
+                                "opencode": opencode_bin}[improve_backend]
+                # mission cgroup・artifact fd・proxy listener・NETLINK_SOCK_DIAG も Landlock の前
+                isolation = improve_isolation.WorkerIsolation.prepare(
+                    isolation_spec, _mission_nonce, str(Path(artifact_bin).expanduser()))
             _bootstrap_improve_profile(
                 backend=improve_backend,
                 mission_id=handshake["mission_id"],
@@ -870,23 +928,56 @@ def main() -> None:
             as_mb = settings_dict["worker"]["child_as_mb"]
             if improve_backend in ("opencode", "codex"):
                 as_mb = max(as_mb, 262144)
+            # 隔離の経路では launcher が artifact を memfd に写せるよう FSIZE の hard を残す
+            fsize_kw = ({"fsize_hard_bytes": isolation.spec.artifact.size}
+                        if isolation is not None else {})
             _set_resource_limits(
                 as_mb=as_mb,
                 nofile=settings_dict["worker"]["child_nofile"],
-                fsize_mb=settings_dict["worker"]["child_fsize_mb"])
+                fsize_mb=settings_dict["worker"]["child_fsize_mb"], **fsize_kw)
             from agentic_fx.config import Settings
             settings = Settings.model_validate(settings_dict)
             from agentic_fx.runners.base import Mission
 
             workdir = Path.cwd()
             mission = Mission(**handshake["mission"])
+            router = channel = None
+            stop_box: dict[str, str] = {}
+            if isolation is not None:
+                channel = MC.WorkerCleanupChannel(
+                    lambda f: _send_frame(protocol_out, out_seq, f))
+                isolation.start()
+                if isolation_spec.kind == improve_isolation.KIND_CANARY:
+                    from agentic_fx.core import improve_canary
+                    build_runner = improve_canary.canary_runner_factory(isolation)
+
+            def isolation_fault() -> str | None:
+                return _isolation_fault_reason(isolation, stop_box)
+
             runner = _run_improve_mission(
                 settings=settings, workdir=workdir,
                 staging_dir=handshake["staging_dir"],
                 source_snapshot_dir=handshake["source_snapshot_dir"],
                 protocol_out=protocol_out, out_seq=out_seq, in_seq=in_seq,
                 inventory_view=handshake.get("inventory_view"),
-                spool_root=spool_root)
+                spool_root=spool_root,
+                launch=isolation.launcher(channel) if isolation is not None else None,
+                isolation_fault=isolation_fault,
+                rpc_read=(lambda: router.read_rpc()) if isolation is not None else None,
+                build_runner=build_runner)
+            if isolation is not None:
+                isolation.dispatcher = runner._afx_mcp_dispatcher
+                abort_event = runner._afx_mission_counters.abort_event
+                # supervisor / proxy の障害と afx の deadline は CLI を止める契機
+                isolation.on_fault(lambda _r: abort_event.set())
+
+                def on_router_stop(why: str) -> None:
+                    stop_box.setdefault("reason", why)
+                    abort_event.set()
+
+                router = improve_isolation.StdinRouter(
+                    sys.stdin.buffer, in_seq, deliver=channel.deliver, on_stop=on_router_stop)
+                router.start()
 
             _send_frame(protocol_out, out_seq, {
                 "type": "ready", "ok": True,
@@ -901,8 +992,12 @@ def main() -> None:
             ready_sent = True
             # precheck 2026-08-23 wave3: RW1/RW6 — go 前は副作用ゼロ。
             # runner.run(mission) (= LLM 起動) は go を受けてから呼ぶ。
-            if not _wait_for_go(
-                    in_seq, settings.worker.worker_startup_timeout_sec):
+            if router is not None:
+                got_go = router.wait_go(settings.worker.worker_startup_timeout_sec)
+            else:
+                got_go = _wait_for_go(in_seq, settings.worker.worker_startup_timeout_sec)
+            if not got_go:
+                _close_isolation(isolation)
                 return  # timeout/EOF/不正フレーム — result も送らず終了
             try:
                 try:
@@ -925,6 +1020,12 @@ def main() -> None:
                         result.status = "failed"
                         result.output = None
                         result.reason = spool_failure
+                    _finish_isolation(isolation, protocol_out, out_seq)
+                    if isolation is not None and isolation.fault is not None:
+                        # supervisor / proxy の障害は CLI の結果によらず mission の失敗
+                        result.status = "failed"
+                        result.output = None
+                        result.reason = improve_isolation.classified(isolation.fault)
                     _send_frame(protocol_out, out_seq, {
                         "type": "result",
                         "status": result.status, "output": result.output,
@@ -940,6 +1041,7 @@ def main() -> None:
                         # getattr で安全に既定 None。
                         "stderr_fatal": getattr(result, "stderr_fatal", None)})
                 except Exception as exc:  # noqa: BLE001
+                    _finish_isolation(isolation, protocol_out, out_seq)
                     _send_frame(protocol_out, out_seq, {
                         "type": "result", "status": "failed", "output": None,
                         "error": f"{type(exc).__name__}: {exc}"})
@@ -950,7 +1052,11 @@ def main() -> None:
                 # 触れない — spool→ready→go の順序は
                 # `_start_mcp_dispatcher`/上の `_send_frame` 呼び出し順の
                 # ままで、stop は `runner.run()` 完了後の後始末のみ。
-                _stop_mcp_dispatcher(runner)
+                # 隔離の経路では dispatcher は cleanup の系列 (`populated 0` の後) が止める
+                if isolation is None:
+                    _stop_mcp_dispatcher(runner)
+                else:
+                    _close_isolation(isolation)
             return
         if worker_profile != "trade":
             raise RuntimeError(
@@ -1089,8 +1195,80 @@ def main() -> None:
                     "error": f"{type(exc).__name__}: {exc}"})
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める
             pass
+    except BaseException as exc:
+        # SystemExit・KeyboardInterrupt など。router を起こした経路では下の finally が
+        # interpreter を通さずに終えるので、終了 code (と interpreter が出すはずの stderr) を
+        # ここで決めておく。router の無い経路は interpreter に任せる
+        if router is not None:
+            exit_code = _exit_code_for(exc)
+        raise
     finally:
         _mission_nonce = None
+        if router is not None:
+            # 読み手の thread は stdin の BufferedReader の lock を握ったまま read で止まって
+            # いる。このまま interpreter を終えると finalization がその lock を取れず abort
+            # (SIGABRT) する。frame は書くたびに flush 済みなので、ここで直ちに終わる
+            if exit_code == 0 and _isolation_close_failed:
+                exit_code = 1
+            _exit_with_router_running(exit_code)
+
+
+#: 隔離の資源を閉じられなかった (router を起こした経路の終了 code を 1 にする)
+_isolation_close_failed = False
+#: 隔離の資源を閉じられなかったときに stderr へ出す固定 reason
+ISOLATION_CLOSE_FAILED = "isolation_close_failed"
+
+
+def _close_isolation(isolation: Any) -> bool:
+    """隔離の資源を閉じる。失敗は stderr に固定 reason を 1 行出して False (例外は上げない)。"""
+    global _isolation_close_failed
+    if isolation is None:
+        return True
+    try:
+        isolation.close()
+    except Exception as e:  # noqa: BLE001
+        _isolation_close_failed = True
+        try:
+            sys.stderr.write(f"mission_worker: {ISOLATION_CLOSE_FAILED}: {type(e).__name__}\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+        return False
+    return True
+
+
+def _exit_code_for(exc: BaseException) -> int:
+    """main を抜けようとしている例外の終了 code (interpreter が終えるときと同じ値)。
+
+    SystemExit は code (None は 0、int でなければ stderr に出して 1)、KeyboardInterrupt は
+    130、それ以外は traceback を stderr に出して 1。"""
+    if isinstance(exc, SystemExit):
+        code = exc.code
+        if code is None:
+            return 0
+        if isinstance(code, int) and not isinstance(code, bool):
+            return code
+        try:
+            sys.stderr.write(f"{code}\n")
+        except (OSError, ValueError):
+            pass
+        return 1
+    if isinstance(exc, KeyboardInterrupt):
+        return 130
+    try:
+        traceback.print_exception(exc, file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+    return 1
+
+
+def _exit_with_router_running(code: int = 0) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)
 
 
 def _write_frame_or_die(protocol_out: Any, frame: dict) -> None:
@@ -1119,6 +1297,39 @@ def _write_frame_or_die(protocol_out: Any, frame: dict) -> None:
         os._exit(1)
 
 
+def _isolation_fault_reason(isolation: Any, stop_box: dict) -> str | None:
+    """CLI を止めた隔離の理由 (`<分類>: <固定 reason>`)。supervisor / proxy の障害を先に、
+    stdin の読み手の停止 (afx の deadline・parent の EOF) を次に見る。"""
+    if isolation is None:
+        return None
+    if isolation.fault is not None:
+        return improve_isolation.classified(isolation.fault)
+    reason = stop_box.get("reason")
+    return improve_isolation.classified(reason) if reason is not None else None
+
+
+def _finish_isolation(isolation: Any, protocol_out: Any, out_seq: SeqTracker) -> None:
+    """隔離の資源を閉じ、観測 (固定語と数) を transcript の event として 1 行残す。
+
+    result より前に送る (afx は result の後の frame を読まない)。"""
+    if isolation is None:
+        return
+    if not _close_isolation(isolation):
+        raise RuntimeError(ISOLATION_CLOSE_FAILED)
+    try:
+        _send_frame(protocol_out, out_seq, {"type": "event", "message": {
+            "role": "system",
+            "content": json.dumps({"_improve_isolation": isolation.report.as_dict()},
+                                  default=str)}})
+    except (TypeError, ValueError):
+        pass
+
+
+#: 子→親の送出 (seq の採番と書込み) を直列にする。CLI の出力の event、tool_rpc、cleanup の
+#: 要求と ACK は別々の thread から送られる
+_SEND_LOCK = threading.Lock()
+
+
 def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     """子→親のフレームを 1 件送出する (`seq` はここで採番して付す)。
 
@@ -1136,10 +1347,11 @@ def _send_frame(protocol_out: Any, out_seq: SeqTracker, frame: dict) -> None:
     `SeqTracker` を採番器として流用する意図は Task 7 本文のとおり
     (「次に来る/送り出すべき値」の意味が受信検証と送信採番で一致する)。
     """
-    payload = dict(frame)
-    payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
-    _write_frame_or_die(protocol_out, payload)
-    out_seq._expected += 1  # noqa: SLF001
+    with _SEND_LOCK:
+        payload = dict(frame)
+        payload["seq"] = out_seq._expected  # noqa: SLF001 — 送出側は採番に使う
+        _write_frame_or_die(protocol_out, payload)
+        out_seq._expected += 1  # noqa: SLF001
 
 
 if __name__ == "__main__":

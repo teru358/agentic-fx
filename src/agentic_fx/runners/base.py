@@ -71,6 +71,10 @@ class MissionResult:
     # 終端で activity `cli_stderr_fatal` として書く。
     stderr_fatal: str | None = None
     market_tool_calls: dict[str, int] | None = None
+    # 改善 CLI の隔離の判定 (admission) が mission を拒否した (CLI も worker も起こしていない)。
+    # 拒否は固定 reason で決まり、同じ process で起こし直しても同じ結果になるので、improve の
+    # supervisor は pre-ready 失敗の再試行に回さず終端する。既定 False。
+    refused: bool = False
 
 
 class AgentRunner(ABC):

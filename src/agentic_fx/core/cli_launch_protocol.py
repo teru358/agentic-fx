@@ -18,7 +18,7 @@ import struct
 from dataclasses import dataclass
 
 MAGIC = b"AFXL"
-VERSION = 2
+VERSION = 3
 NONCE_LEN = 16
 
 _HEADER = struct.Struct("<4sHH16s")
@@ -41,8 +41,9 @@ _BODY = {
     HELLO: struct.Struct("<i"),                 # pid
     JOINED: struct.Struct("<"),
     # profile id (ASCII、NUL 詰め)、policy hash、BPF hash (SHA-256 の生 32 byte)、
-    # filter flags、実 Landlock ABI、subreaper の読み値 (1 = 立っている)
-    PREPARED: struct.Struct("<32s32s32sIII"),
+    # filter flags、実 Landlock ABI、subreaper の読み値 (1 = 立っている)、exec する
+    # 封印済み memfd の (st_dev, st_ino)
+    PREPARED: struct.Struct("<32s32s32sIIIQQ"),
     GO: struct.Struct("<"),
     EXEC_FAILED: struct.Struct("<i"),           # errno
     SETUP_FAILED: struct.Struct("<HHi"),        # reason code、予約 (0)、errno / 補足
@@ -70,6 +71,12 @@ SETUP_REASONS = {
     9: "seccomp_install_failed",
     10: "seccomp_self_check_failed",
     11: "policy_compile_failed",
+    # mission cgroup の中で artifact を封印した memfd に写せなかった (errno を補足に載せる)
+    12: "artifact_copy_failed",
+    # 写した bytes の SHA-256 が afx の admission で見た digest と違う
+    13: "artifact_digest_mismatch",
+    # 写した bytes が x86_64 の 64 bit ELF (EXEC / DYN) でない
+    14: "artifact_copy_unsupported",
 }
 SETUP_REASON_CODES = {v: k for k, v in SETUP_REASONS.items()}
 
@@ -167,6 +174,9 @@ class Frame:
     prepared: Prepared | None = None
     errno: int | None = None
     reason: str | None = None
+    #: PREPARED だけ: launcher が exec する memfd の (st_dev, st_ino)。`Prepared` (worker の期待値と
+    #: 一致を求める値) には入れない
+    exec_identity: tuple[int, int] | None = None
 
 
 def _header(ftype: int, nonce: bytes) -> bytes:
@@ -196,13 +206,14 @@ def encode_setup_failed(nonce: bytes, reason: str, detail: int = 0) -> bytes:
         SETUP_REASON_CODES[reason], 0, detail)
 
 
-def encode_prepared(nonce: bytes, p: Prepared) -> bytes:
+def encode_prepared(nonce: bytes, p: Prepared, exec_identity: tuple[int, int]) -> bytes:
     pid = p.profile_id.encode("ascii")
     if len(pid) > PROFILE_ID_LEN:
         raise ValueError("profile id too long")
+    dev, ino = exec_identity
     return _header(PREPARED, nonce) + _BODY[PREPARED].pack(
         pid, bytes.fromhex(p.policy_hash), bytes.fromhex(p.bpf_hash),
-        p.filter_flags, p.landlock_abi, p.subreaper)
+        p.filter_flags, p.landlock_abi, p.subreaper, dev, ino)
 
 
 def decode(data: bytes, nonce: bytes) -> Frame:
@@ -232,7 +243,7 @@ def decode(data: bytes, nonce: bytes) -> Frame:
             raise MalformedFrame(f"setup reason {code}/{reserved}")
         return Frame(ftype, got_nonce, reason=SETUP_REASONS[code], errno=detail)
     if ftype == PREPARED:
-        raw_id, ph, bh, flags, abi, subreaper = body
+        raw_id, ph, bh, flags, abi, subreaper, dev, ino = body
         stripped = raw_id.rstrip(b"\0")
         if b"\0" in stripped:
             raise MalformedFrame("profile id")
@@ -241,7 +252,7 @@ def decode(data: bytes, nonce: bytes) -> Frame:
         except UnicodeDecodeError:
             raise MalformedFrame("profile id") from None
         return Frame(ftype, got_nonce, prepared=Prepared(
-            profile_id, ph.hex(), bh.hex(), flags, abi, subreaper))
+            profile_id, ph.hex(), bh.hex(), flags, abi, subreaper), exec_identity=(dev, ino))
     return Frame(ftype, got_nonce)
 
 

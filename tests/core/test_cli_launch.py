@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.core import cli_artifact_copy as AC
 from agentic_fx.core import cli_launch as L
 from agentic_fx.core import cli_launch_protocol as P
 from agentic_fx.core import cli_launcher
@@ -167,9 +168,14 @@ def test_real_launcher_reaches_cli_started(h):
     assert fds == [0, 1, 2]
     st = _status(pid)
     assert st["Seccomp"] == "2" and st["NoNewPrivs"] == "1"
+    # exec されたのは launcher が mission cgroup の中で写した封印済み memfd で、その内容は
+    # 渡した artifact の bytes。worker は launcher の申告した identity で exe を照合した
     exe = os.stat(f"/proc/{pid}/exe")
     want = os.stat(PY)
-    assert (exe.st_dev, exe.st_ino) == (want.st_dev, want.st_ino)
+    assert (exe.st_dev, exe.st_ino) == r.exec_identity != (want.st_dev, want.st_ino)
+    assert os.readlink(f"/proc/{pid}/exe").startswith("/memfd:afx-cli")
+    with open(f"/proc/{pid}/exe", "rb") as f, open(PY, "rb") as g:
+        assert AC.sha256_fd(f.fileno()) == AC.sha256_fd(g.fileno())
     assert len(h.listeners) == 1 and L.is_seccomp_notify_fd(h.listeners[0])
 
 
@@ -683,26 +689,91 @@ def test_launcher_imports_only_stdlib_and_isolation_modules():
     proc = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, timeout=60)
     assert proc.returncode == 0, proc.stderr.decode()
     mods = eval(proc.stdout.decode())  # noqa: S307  自分の子の出力
-    assert mods == ["agentic_fx", "agentic_fx.core", "agentic_fx.core.cli_launch_protocol",
+    assert mods == ["agentic_fx", "agentic_fx.core", "agentic_fx.core.cli_artifact_copy",
+                    "agentic_fx.core.cli_launch_protocol",
                     "agentic_fx.core.cli_launcher", "agentic_fx.core.landlock_nested",
                     "agentic_fx.core.seccomp", "agentic_fx.core.seccomp_cli_bpf",
                     "agentic_fx.core.seccomp_cli_policy"]
 
 
 def test_shebang_script_past_inspection_is_exec_failed_enoent(h, tmp_path, monkeypatch):
-    """`#!` の script は worker の artifact 検査で launcher 前に落ちる。検査を
-    すり抜けた場合も、exec 時に fd が CLOEXEC で閉じるため interpreter が
-    `/dev/fd/N` を開けず kernel が ENOENT を返し、EXEC_FAILED として handoff 後の
-    失敗になる (fd を開いたままにする迂回は IC-FD を破るので取らない)。"""
+    """`#!` の script は worker の artifact 検査で launcher 前に落ちる。worker の検査を
+    すり抜けても、launcher が写した memfd を検査し直して handoff の前に
+    `artifact_copy_unsupported` で止まる。両方をすり抜けた場合も、exec 時に fd が CLOEXEC で
+    閉じるため interpreter が `/dev/fd/N` を開けず kernel が ENOENT を返し、EXEC_FAILED として
+    handoff 後の失敗になる (fd を開いたままにする迂回は IC-FD を破るので取らない)。"""
     script = tmp_path / "cli.sh"
     script.write_text("#!/bin/sh\nexec sleep 30\n")
     script.chmod(0o700)
     monkeypatch.setattr(L, "inspect_cli_artifact",
                         lambda fd: ((os.fstat(fd).st_dev, os.fstat(fd).st_ino), ""))
     r = h.launch(cli=str(script), argv=[str(script)])
+    assert (r.reason, r.series) == ("artifact_copy_unsupported", L.BEFORE_HANDOFF), r
+    assert r.reaped and h.listeners == []
+    r = h.launch(cli=str(script), argv=[str(script)], launcher_cmd=_wrapped_launcher(
+        "m.AC.inspect_cli_artifact = lambda fd: ((1, 1), '')"))
     assert (r.reason, r.series) == (P.ATTESTATION_EXEC_FAILED, L.AFTER_HANDOFF), r
     assert r.setup_detail == errno.ENOENT
     assert L.reap_launcher(r.launcher_proc, deadline=time.monotonic() + 5)
+
+
+def test_digest_mismatch_stops_before_handoff(h):
+    """launcher が写した bytes の SHA-256 が渡された digest と違えば、PREPARED を送らず
+    `artifact_digest_mismatch` (listener は作られず、CLI は exec されない)。"""
+    before = _notify_fds()
+    r = h.launch(artifact_sha256="0" * 64)
+    assert (r.reason, r.series, r.classification) == (
+        "artifact_digest_mismatch", L.BEFORE_HANDOFF, L.SANDBOX_UNAVAILABLE), r
+    assert r.reaped and h.listeners == [] and r.exec_identity is None
+    assert h.joined == [r.launcher_proc.pid]
+    assert _notify_fds() == before
+
+
+def test_artifact_copy_runs_after_the_cgroup_join(h):
+    """copy は JOINED の後 (mission cgroup に入った後) に行う。copy の失敗は errno 付きの
+    `artifact_copy_failed`。"""
+    r = h.launch(launcher_cmd=_wrapped_launcher("""
+        import errno
+        def boom(fd):
+            raise OSError(errno.ENOMEM, "injected")
+        m.AC.sealed_copy = boom
+        """))
+    assert (r.reason, r.series, r.setup_detail) == (
+        "artifact_copy_failed", L.BEFORE_HANDOFF, errno.ENOMEM), r
+    assert h.joined == [r.launcher_proc.pid] and h.listeners == []
+
+
+def test_artifact_larger_than_rlimit_fsize_is_copied(h, tmp_path):
+    """RLIMIT_FSIZE (8 MiB) は copy の後に掛ける。8 MiB を超える artifact も写して exec できる。"""
+    assert os.stat(PY).st_size > P.RLIMIT_FSIZE_MB * 1024 * 1024
+    r = h.launch()
+    assert r.started, r
+    assert os.stat(f"/proc/{r.launcher_proc.pid}/exe").st_size == os.stat(PY).st_size
+
+
+def test_copy_raises_the_inherited_fsize_soft_limit_to_its_hard_limit(h):
+    """worker は RLIMIT_FSIZE の soft を 8 MiB、hard を artifact の大きさ以上にして launcher を
+    起こす。launcher は copy の前に soft を hard まで上げ、copy の後で 8 MiB に固定する。"""
+    size = os.stat(PY).st_size
+    r = h.launch(launcher_cmd=_wrapped_launcher(f"""
+        import resource
+        resource.setrlimit(resource.RLIMIT_FSIZE, (8 << 20, {size}))
+        """))
+    assert r.started, r
+    limits = Path(f"/proc/{r.launcher_proc.pid}/limits").read_text()
+    line = [ln for ln in limits.splitlines() if ln.startswith("Max file size")][0]
+    assert line.split()[3:5] == [str(8 << 20)] * 2
+
+
+def test_copy_beyond_the_inherited_fsize_hard_limit_is_a_fixed_reason(h):
+    """hard が artifact より小さければ copy は EFBIG の `artifact_copy_failed`。"""
+    r = h.launch(launcher_cmd=_wrapped_launcher("""
+        import resource
+        resource.setrlimit(resource.RLIMIT_FSIZE, (8 << 20, 8 << 20))
+        """))
+    assert (r.reason, r.series, r.setup_detail) == (
+        "artifact_copy_failed", L.BEFORE_HANDOFF, errno.EFBIG), r
+    assert h.listeners == []
 
 
 def test_launcher_works_under_outer_domain_without_proc():
@@ -771,7 +842,7 @@ def _raw_launcher():
     cfg = {"status_fd": child.fileno(), "cli_fd": cli_fd, "nonce": nonce.hex(),
            "expected_ppid": os.getpid(), "uid": creds.uid, "gid": creds.gid,
            "groups": list(creds.groups), "backend": "claude",
-           "argv": PY_SLEEP_ARGV}
+           "argv": PY_SLEEP_ARGV, "artifact_sha256": AC.sha256_fd(cli_fd)}
     proc = subprocess.Popen([sys.executable, "-I", "-m", L.LAUNCHER_MODULE, json.dumps(cfg)],
                             pass_fds=(child.fileno(), cli_fd), env=_env(),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -847,6 +918,47 @@ def test_unexpected_exception_closes_status_end(h, monkeypatch):
         assert _fds() == before
     finally:
         assert L.reap_launcher(err.launcher_proc, deadline=time.monotonic() + 5)
+
+
+def test_after_spawn_runs_once_after_the_fork_before_hello(h):
+    """`after_spawn` は launcher を fork した後、HELLO (cgroup への join) より前に 1 回呼ばれる。"""
+    calls: list[tuple[list[int], set[int]]] = []
+
+    def after_spawn() -> None:
+        children = {int(p) for p in os.listdir("/proc") if p.isdigit()
+                    and _ppid_of(p) == os.getpid()}
+        calls.append((list(h.joined), children))
+
+    r = h.launch(after_spawn=after_spawn)
+    assert r.started, r
+    assert len(calls) == 1
+    joined_then, children_then = calls[0]
+    assert joined_then == [] and r.launcher_proc.pid in children_then
+
+
+def test_after_spawn_failure_is_a_launch_error(h):
+    """`after_spawn` の例外は `LaunchError` (launcher の handle と handoff 前の系列を持つ)。"""
+    before = _fds()
+
+    def after_spawn() -> None:
+        raise OSError("injected")
+
+    with pytest.raises(L.LaunchError) as excinfo:
+        h.launch(after_spawn=after_spawn)
+    err = excinfo.value
+    try:
+        assert isinstance(err.__cause__, OSError) and err.series == L.BEFORE_HANDOFF
+        assert h.joined == [] and _fds() == before
+    finally:
+        assert L.reap_launcher(err.launcher_proc, deadline=time.monotonic() + 5)
+
+
+def _ppid_of(pid: str) -> int:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return -1
 
 
 def test_unexpected_exception_after_prepared_closes_held_listener(h, monkeypatch):

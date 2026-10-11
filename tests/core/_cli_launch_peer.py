@@ -71,7 +71,9 @@ def prepared(**override) -> bytes:
     fields = dict(profile_id=c.profile_id, policy_hash=c.policy_hash, bpf_hash=c.bpf_hash,
                   filter_flags=c.filter_flags, landlock_abi=landlock_nested.probe_abi())
     fields.update(override)
-    return P.encode_prepared(NONCE, P.Prepared(**fields))
+    # exec する artifact の identity は渡された fd のもの (この偽 launcher は copy せず fd を exec する)
+    st = os.fstat(CFG["cli_fd"])
+    return P.encode_prepared(NONCE, P.Prepared(**fields), (st.st_dev, st.st_ino))
 
 
 def hello(pid: int | None = None, nonce: bytes = NONCE) -> bytes:

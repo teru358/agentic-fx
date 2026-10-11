@@ -1886,6 +1886,26 @@ def _log_plugin_sandbox_diagnostics() -> None:
         (_log.warning if degraded else _log.info)("%s", line)
 
 
+def _log_improve_isolation_diagnostics(settings: object, root: Path,
+                                       stop_event: threading.Event | None = None) -> None:
+    """改善 mission の CLI 隔離の起動時の処理と、その結果の 1 行 (技術ログ)。
+
+    有効化の定数が真なら mission cgroup host を 1 回起こし (unit の admission、afx の
+    `supervisor/` への自己移動、前回の `m-*` の回収) 設定の backend を判定する。偽なら afx の
+    cgroup を動かさず、unit admission と kernel の probe の結果を読むだけ。失敗しても起動は
+    止めない (隔離できない間、隔離の経路は mission ごとに fail closed する)。"""
+    from agentic_fx.core import improve_admission
+
+    try:
+        line = improve_admission.startup(settings, root,
+                                         deadline=time.monotonic() + 10.0,
+                                         stop_event=stop_event)
+    except Exception:  # noqa: BLE001  診断の失敗で起動を止めない
+        _log.exception("improve isolation startup failed")
+        return
+    _log.info("%s", line)
+
+
 def run_service(root: Path, *, daemon: bool = False,
                _stop_event: threading.Event | None = None) -> int:
     """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
@@ -1919,6 +1939,13 @@ def run_service(root: Path, *, daemon: bool = False,
     diag_thread = threading.Thread(
         target=_log_plugin_sandbox_diagnostics, daemon=True, name="sandbox-diag")
     diag_thread.start()
+    # 改善 CLI の隔離: 有効化の定数が真なら mission cgroup host の起動と admission、偽なら
+    # 読むだけの診断。どちらも起動を遅らせないよう別 thread で行う
+    isolation_thread = threading.Thread(
+        target=_log_improve_isolation_diagnostics, args=(settings, root, stop_event),
+        daemon=True,
+        name="improve-isolation-diag")
+    isolation_thread.start()
     app.activity.write(Category.SYSTEM, "service_started",
                        f"daemon={daemon} "
                        f"decision_timeframe={settings.datafeed.decision_timeframe} "
@@ -2061,6 +2088,7 @@ def run_service(root: Path, *, daemon: bool = False,
         # 通常は 1 秒未満で終わり即座に返る。集合外で自己試験が長引く host でも
         # _SANDBOX_DIAG_JOIN_TIMEOUT_SEC で打ち切る (daemon なので process 終了で片付く)
         diag_thread.join(timeout=_SANDBOX_DIAG_JOIN_TIMEOUT_SEC)
+        isolation_thread.join(timeout=_SANDBOX_DIAG_JOIN_TIMEOUT_SEC)
         th.join(timeout=30)
         scheduler_still_busy = scheduler_busy.is_set() and th.is_alive()
         # **(レビュー 3 周目 codex E2)** `shutdown_join_timeout_sec`

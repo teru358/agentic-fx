@@ -188,9 +188,9 @@ def test_prepared_claims_subreaper_and_worker_checks_it():
     bad = dataclasses.replace(L.expected_prepared(), subreaper=0)
     assert bad != L.expected_prepared()
     nonce = bytes(16)
-    frame = P.decode(P.encode_prepared(nonce, bad), nonce)
+    frame = P.decode(P.encode_prepared(nonce, bad, (1, 2)), nonce)
     assert frame.prepared == bad
-    assert P.decode(P.encode_prepared(nonce, L.expected_prepared()), nonce).prepared \
+    assert P.decode(P.encode_prepared(nonce, L.expected_prepared(), (1, 2)), nonce).prepared \
         == L.expected_prepared()
 
 
@@ -276,15 +276,17 @@ def test_prepared_subreaper_value_round_trips_unmodified(value):
     """decode は申告値を加工しない (2 や 3 を 1 に丸めない)。判定は worker の照合が行う。"""
     nonce = bytes(16)
     p = dataclasses.replace(L.expected_prepared(), subreaper=value)
-    assert P.decode(P.encode_prepared(nonce, p), nonce).prepared.subreaper == value
+    assert P.decode(P.encode_prepared(nonce, p, (1, 2)), nonce).prepared.subreaper == value
 
 
 def test_prepared_length_and_version_are_strict():
     nonce = bytes(16)
-    data = P.encode_prepared(nonce, L.expected_prepared())
-    assert len(data) == 24 + 108
+    data = P.encode_prepared(nonce, L.expected_prepared(), (1, 2))
+    assert len(data) == 24 + 124
     with pytest.raises(P.MalformedFrame):
-        P.decode(data[:-4], nonce)       # version 1 の長さ
+        P.decode(data[:-16], nonce)      # version 2 の長さ (exec identity が無い)
+    with pytest.raises(P.MalformedFrame):
+        P.decode(data[:-20], nonce)      # version 1 の長さ
     with pytest.raises(P.MalformedFrame):
         P.decode(data + b"\0" * 4, nonce)
     for v in (1, P.VERSION + 1):

@@ -478,8 +478,10 @@ def test_mission_nonce_is_cleared_after_main(monkeypatch):
 
 
 @pytest.mark.parametrize("profile", ["trade", "improve"])
-def test_handshake_carries_nonce_for_every_profile(tmp_path, monkeypatch, profile):
-    """既定の WorkerRunner (cleanup protocol なし) も全 profile で nonce を送る。"""
+def test_default_handshake_bytes_are_unchanged(tmp_path, monkeypatch, profile):
+    """隔離を使わない WorkerRunner (cleanup protocol なし) の handshake は、mission nonce を
+    導入する前と byte 単位で同じ (key の並びも含む)。nonce は worker が自前で作る。"""
+    raw: list[bytes] = []
     seen: list[dict] = []
     r_fd, w_fd = os.pipe()
     r2_fd, w2_fd = os.pipe()
@@ -487,7 +489,7 @@ def test_handshake_carries_nonce_for_every_profile(tmp_path, monkeypatch, profil
     def child() -> None:
         cin = os.fdopen(r2_fd, "rb")
         cout = os.fdopen(w_fd, "wb")
-        seen.append(MP.read_frame(cin))
+        raw.append(cin.readline())
         MP.write_frame(cout, {"type": "ready", "seq": 1, "ok": False, "error": "x"})
         cout.close()
         # 親が stdin を閉じるまでに送った frame をすべて読む
@@ -510,12 +512,30 @@ def test_handshake_carries_nonce_for_every_profile(tmp_path, monkeypatch, profil
     t.start()
     runner = WorkerRunner(root=tmp_path, settings=SETTINGS, clock=FixedClock(NOW), rag=None,
                           worker_profile=profile)
-    mission = Mission(prompt="p", tools=[], output_schema={}, max_turns=1, timeout_sec=1)
-    runner._run_with_child(Proc(), mission, W)
+    mission = Mission(prompt="p", tools=["a"], output_schema={"type": "object"}, max_turns=3,
+                      timeout_sec=1)
+    fields = {"mission_id": "7", "staging_dir": "/s"} if profile == "improve" else None
+    runner._run_with_child(Proc(), mission, W, credentials={"K": "v"} if profile == "trade"
+                           else None, run_context_fields=fields)
     t.join(5)
-    assert HEX32.fullmatch(seen[0][MP.HANDSHAKE_NONCE_FIELD])
-    # cleanup protocol を有効にしない WorkerRunner は、どの profile でも deadline を送らない
     assert not t.is_alive()
+    trade = profile == "trade"
+    golden = {
+        "type": "handshake", "seq": 1,
+        "expected_parent_pid": os.getpid(),
+        "db_path": str(tmp_path / "data" / "agentic.db") if trade else None,
+        "plugins_dir": str(tmp_path / "plugins") if trade else None,
+        "settings": SETTINGS.model_dump(),
+        "mission": {"prompt": "p", "tools": ["a"], "output_schema": {"type": "object"},
+                    "max_turns": 3, "timeout_sec": 1},
+        "worker_profile": profile,
+        "now": NOW.isoformat(),
+        "credentials": {"K": "v"} if trade else {},
+        **(fields or {}),
+    }
+    assert raw[0] == MP.encode_frame(golden)
+    assert MP.HANDSHAKE_NONCE_FIELD not in json.loads(raw[0])
+    # cleanup protocol を有効にしない WorkerRunner は、どの profile でも deadline を送らない
     assert [f["type"] for f in seen if f["type"] == MP.CLEANUP_DEADLINE] == []
 
 

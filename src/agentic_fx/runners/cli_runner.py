@@ -26,6 +26,7 @@ import jsonschema
 
 from agentic_fx._safe_error import safe_text
 from agentic_fx.runners.base import TOOL_BUDGET_ABORT_PREFIX, AgentRunner, Mission, MissionResult
+from agentic_fx.core.improve_isolation import CliLaunchRefused
 from agentic_fx.runners.launcher import build_launcher_argv
 from agentic_fx.tools.registry import ToolRegistry
 
@@ -214,6 +215,22 @@ def _normalize_reason(text: str) -> str:
     return text
 
 
+#: 異常終了の reason に載せる stderr の末尾の行数 (CLI は失敗の理由を最後に書くことが多い)
+_STDERR_REASON_LINES = 3
+#: reason の上限 (`_MAX_REASON_CHARS`) のうち stderr の末尾に使う文字数 (先頭の rc の分を残す)
+_STDERR_REASON_CHARS = _MAX_REASON_CHARS - 60
+
+
+def _stderr_reason_tail(stderr_text: str) -> str:
+    """stderr の空でない末尾 `_STDERR_REASON_LINES` 行を ` | ` でつなぐ。長ければ末尾を残す
+    (`_normalize_reason` は後ろを切るので、ここで先に前を落とす)。"""
+    lines = [ln.strip() for ln in stderr_text.splitlines() if ln.strip()]
+    tail = " | ".join(lines[-_STDERR_REASON_LINES:])
+    if len(tail) > _STDERR_REASON_CHARS:
+        tail = "…" + tail[-(_STDERR_REASON_CHARS - 1):]
+    return tail
+
+
 def _write_prompt_file(workdir: Path, prompt: str) -> Path:
     """設計書 §D: mission prompt を argv に載せず stdin 経由で渡すための
     一時ファイル。`workdir/prompt.txt` を **0600 で新規作成**する
@@ -253,7 +270,8 @@ class CliRunner(AgentRunner):
                  popen: Callable[..., subprocess.Popen] | None = None,
                  transcript_dir: Path | None = None,
                  abort_event: threading.Event | None = None,
-                 abort_reason_fn: Callable[[], str] | None = None) -> None:
+                 abort_reason_fn: Callable[[], str] | None = None,
+                 launch: Any | None = None) -> None:
         self._bin_path = bin_path
         self._model = model
         self._workdir = workdir
@@ -264,6 +282,9 @@ class CliRunner(AgentRunner):
         self._rlimits = rlimits
         self._build_launcher_argv = launcher or build_launcher_argv
         self._popen = popen or subprocess.Popen
+        # CLI を起こす方法の差し替え (改善 mission の隔離の経路)。None なら launcher
+        # (`runners.launcher`) 経由の Popen と pgid 単位の停止を使う
+        self._launch = launch
         # 段A: 既定 None なら `_save_transcript` が呼び出し時点で
         # `_TRANSCRIPT_DIR_DEFAULT` を読む (固定値をここでキャッシュしない
         # — テストの monkeypatch がインスタンス生成後でも効くようにする)。
@@ -349,9 +370,6 @@ class CliRunner(AgentRunner):
         `TerminationCause` ("completed" / "timeout" / "abort") の**文字列**で、
         真偽値ではない — 呼び出し側は `==` で比較する ("completed" は truthy)。
         """
-        launcher_argv = self._build_launcher_argv(
-            os.getpid(), argv, rlimits=self._rlimits)
-
         # 設計書 §D: `prompt` が渡されたときだけ `workdir/prompt.txt`
         # (0600) をファイル読み出しで stdin に充てる — pipe に書きながら
         # 流すのではなくファイル読み出しにすることで、prompt サイズによる
@@ -364,15 +382,25 @@ class CliRunner(AgentRunner):
         else:
             stdin_r = os.open(os.devnull, os.O_RDONLY)
         try:
-            proc = self._popen(
-                launcher_argv, cwd=str(self._workdir), env=env,
-                stdin=stdin_r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=True, text=True)
+            if self._launch is None:
+                launcher_argv = self._build_launcher_argv(
+                    os.getpid(), argv, rlimits=self._rlimits)
+                proc = self._popen(
+                    launcher_argv, cwd=str(self._workdir), env=env,
+                    stdin=stdin_r, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    start_new_session=True, text=True)
+                pgid: int | None = os.getpgid(proc.pid)
+                stop = lambda: self._terminate_pgid(pgid, proc)  # noqa: E731
+            else:
+                # 隔離の経路: 起動と停止 (cgroup.kill を含む後始末) は launch 側が持つ。
+                # CLI は worker の process group に居るので pgid を通知しない
+                handle = self._launch.start(argv, env, cwd=str(self._workdir),
+                                            stdin=stdin_r)
+                proc, pgid, stop = handle.proc, handle.pgid, handle.terminate
         finally:
             os.close(stdin_r)
 
-        pgid = os.getpgid(proc.pid)
-        if on_started is not None:
+        if on_started is not None and pgid is not None:
             on_started(pgid)  # <!-- precheck 2026-08-22: T1-B10 --> §7.1-2
         stdout_lines: list[str] = []
         stderr_chunks: list[str] = []
@@ -410,10 +438,8 @@ class CliRunner(AgentRunner):
                 continue
 
         try:
-            if cause != "completed" or proc.poll() is None:
-                self._terminate_pgid(pgid, proc)
-            else:
-                self._terminate_pgid(pgid, proc)  # completed でも孫を確実に回収する (§1.1-4)
+            # completed でも孫を確実に回収する (§1.1-4)
+            stop()
         finally:
             t_out.join(timeout=5.0)
             t_err.join(timeout=5.0)
@@ -485,10 +511,15 @@ class CliRunner(AgentRunner):
         # 通例でも、前回呼び出しの残骸を次の `run()` に持ち越さない。
         self._recovery_stderr_fatal = None
 
-        cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
-            inner_argv, env, timeout_sec=primary_timeout,
-            on_started=self._cli_started_sink, abort_event=self._abort_event,
-            prompt=stdin_prompt)
+        try:
+            cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
+                inner_argv, env, timeout_sec=primary_timeout,
+                on_started=self._cli_started_sink, abort_event=self._abort_event,
+                prompt=stdin_prompt)
+        except CliLaunchRefused as e:
+            # 隔離の起動が成立しなかった。CLI は exec されていない (または片付け済み)
+            self._save_transcript([], [])
+            return MissionResult("failed", None, [], reason=_normalize_reason(e.reason))
 
         # 段A: どの終端経路 (timeout/failed/schema mismatch/completed) でも
         # 漏れなく保存する — 追撃 (`_recover_output`) より前のこの位置に
@@ -510,7 +541,7 @@ class CliRunner(AgentRunner):
             # 段B: timeout 経路でも追撃回収を 1 回試みる (SIGTERM 中断後も
             # session が継続できる backend 向け)。基底実装は no-op (None) の
             # ため、追撃を実装しない backend は従来どおり "timeout" になる。
-            raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+            raw = self._recover_with_launch(mission, list(stdout_lines), recovery_timeout)
             stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
             if cause == "abort":
                 abort_reason = _normalize_reason(
@@ -525,16 +556,15 @@ class CliRunner(AgentRunner):
             via_recovery = True
         else:
             if rc != 0:
-                stderr_text = "".join(stderr_chunks)
                 reason = _normalize_reason(
-                    f"HTTP-like CLI exit rc={rc}: {stderr_text.splitlines()[0] if stderr_text else ''}")
+                    f"HTTP-like CLI exit rc={rc}: {_stderr_reason_tail(''.join(stderr_chunks))}")
                 return MissionResult("failed", None, [], reason=reason,
                                      stderr_fatal=stderr_fatal)
 
             raw = self._extract_output(stdout_lines, self._workdir)
             if raw is None:
                 # 段B: 最終出力が回収できない場合も追撃回収を 1 回試みる。
-                raw = self._recover_output(mission, list(stdout_lines), recovery_timeout)
+                raw = self._recover_with_launch(mission, list(stdout_lines), recovery_timeout)
                 stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
                 if raw is None:
                     return MissionResult("failed", None, [],
@@ -554,6 +584,16 @@ class CliRunner(AgentRunner):
         return MissionResult("completed", raw, [], recovered=via_recovery,
                              reason=abort_reason if cause == "abort" else None,
                              stderr_fatal=stderr_fatal)
+
+    def _recover_with_launch(self, mission: Mission, stdout_lines: list[str],
+                             recovery_timeout_sec: float) -> dict[str, Any] | None:
+        """追撃回収。隔離の経路は CLI を 1 mission に 1 回しか起こせないので、追撃の起動が
+        断られたら回収なし (追撃前と同じ failed / timeout) にする。"""
+        try:
+            return self._recover_output(mission, stdout_lines, recovery_timeout_sec)
+        except CliLaunchRefused as e:
+            logging.warning("cli recovery skipped: %s", safe_text(e.reason))
+            return None
 
     def _save_transcript(self, stdout_lines: list[str],
                           stderr_chunks: list[str]) -> None:

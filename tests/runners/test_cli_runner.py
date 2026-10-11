@@ -1288,3 +1288,41 @@ def test_cli_runner_empty_prompt_does_not_trip_argv_leak_guard(tmp_path):
     runner = _new_runner(_PRINT_ANSWER_AND_EXIT, tmp_path)
     result = runner.run(_mission(prompt=""))
     assert result.status == "completed"
+
+
+def test_cli_runner_sigkill_reaches_grandchildren_that_ignore_sigterm(tmp_path):
+    """SIGTERM を無視する CLI の孫が残っても、SIGKILL の段は pgid 全体に届く (leader だけを殺さない)。"""
+    marker = tmp_path / "grandchild-ready"
+    grand = ("import pathlib, signal, time\n"
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+             f"pathlib.Path({str(marker)!r}).touch()\n"
+             "time.sleep(600)\n")
+    script = ("import os, signal, subprocess, sys, time\n"
+              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+              f"subprocess.Popen([sys.executable, '-c', {grand!r}])\n"
+              "for _ in range(500):\n"
+              f"    if os.path.exists({str(marker)!r}):\n"
+              "        break\n"
+              "    time.sleep(0.01)\n"
+              "time.sleep(600)\n")
+    seen_pgid: dict[str, int] = {}
+    real_popen = subprocess.Popen
+
+    def spying_popen(*a, **kw):
+        p = real_popen(*a, **kw)
+        seen_pgid["pgid"] = os.getpgid(p.pid)
+        return p
+
+    runner = _new_runner(script, tmp_path, popen=spying_popen)
+    try:
+        result = runner.run(_mission(timeout_sec=3))
+        assert result.status == "timeout"
+        time.sleep(0.5)
+        assert marker.exists()
+        assert _no_process_group_members(seen_pgid["pgid"])
+    finally:
+        if "pgid" in seen_pgid:
+            try:
+                os.killpg(seen_pgid["pgid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass

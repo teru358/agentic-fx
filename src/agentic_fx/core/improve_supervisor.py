@@ -284,10 +284,12 @@ class ImproveSupervisor:
                 self._improve_loop.compensate_launch_failure(
                     ctx=ctx, now=self._clock.now())
                 raise
-            if reached_running or result.status == "completed":
+            if (reached_running or result.status == "completed"
+                    or getattr(result, "refused", False)):
                 # on_ready 到達後 (= running へ遷移済み) の失敗、または
                 # 完走 — 通常の commit 終端へ渡す。retry しない (二重実行
-                # を避ける、コメント上部の区別どおり)。
+                # を避ける、コメント上部の区別どおり)。隔離の判定の拒否も
+                # ここで終端する (固定 reason なので起こし直しても同じ)。
                 try:
                     self._improve_loop.commit(
                         mission=mission, ctx=ctx, result=result,

@@ -1368,7 +1368,14 @@ class ImproveLoop:
     def _build_worker_runner(self, ctx: ImproveRunContext, *,
                              on_ready: Callable[[dict], None] | None = None) -> "WorkerRunner":
         """10.9 Step 7: ImproveRunContext を WorkerRunner へ渡す。"""
+        from agentic_fx.core import improve_admission
         from agentic_fx.runners.worker_runner import WorkerRunner
+
+        # CLI 隔離の判定 (有効化の定数が偽なら空の引数で、今までどおりの WorkerRunner)。
+        # 判定を通らなければ CLI を起こさずに失敗する runner を返す (隔離なしに落とさない)
+        choice = improve_admission.choose_for_mission(self._settings, self._root)
+        if choice.refusal is not None:
+            return improve_admission.RefusedRunner(choice.refusal)
 
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
         # 元コードは `Rag(self._db_readonly_conn_factory)` — `Rag.__init__`
@@ -1427,7 +1434,7 @@ class ImproveLoop:
             rpc_handlers=build_rpc_handlers(ctx.rpc_handlers, ctx.staging_dir),
             rpc_timeout_sec_by_kind=self._improve_rpc_timeout_sec_by_kind(),
             on_rpc_begin=on_rpc_begin, on_rpc_accepted=on_rpc_accepted,
-            on_rpc_released=release)
+            on_rpc_released=release, **choice.worker_options)
 
     def _improve_rpc_timeout_sec_by_kind(self) -> dict[str, float]:
         timeout = self._settings.improve.backtest_rpc_timeout_sec

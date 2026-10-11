@@ -897,6 +897,61 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_wiring(tmp_path):
         check.close()
 
 
+def test_isolation_refusal_is_terminal_without_retry(tmp_path, monkeypatch):
+    """隔離の判定 (admission) の拒否は固定 reason なので pre-ready 失敗の再試行に回さない。
+    実 `ImproveLoop` (prepare / commit 本物) と実 `_build_worker_runner` を通し、判定だけを
+    拒否に差し替える: claim は 1 回 (spawn_attempts=1)、mission と run は 1 件ずつで終端する。"""
+    from agentic_fx.activity import ActivityLog
+    from agentic_fx.core import improve_admission
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.store import backlog as backlog_store
+
+    from tests.loops.conftest import SETTINGS, _FakeRag
+
+    db_path = tmp_path / "refused.db"
+    bootstrap = db_mod.connect(db_path)
+    db_mod.init_db(bootstrap)
+    now = datetime(2026, 8, 22, 3, 0)
+    improve_waves.create_wave_and_slots(
+        bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
+    backlog_store.add(bootstrap, "idea-for-partition", "user", now)
+    bootstrap.commit()
+    bootstrap.close()
+
+    calls: list[str] = []
+
+    def refuse(settings, root, **kw):
+        calls.append("admission")
+        return improve_admission.MissionChoice(refusal="safety_canary_failed")
+
+    monkeypatch.setattr(improve_admission, "choose_for_mission", refuse)
+    loop = ImproveLoop(
+        root=tmp_path, settings=SETTINGS, clock=_FixedClock(now),
+        db_write_conn_factory=lambda: db_mod.connect(db_path),
+        db_readonly_conn_factory=lambda: db_mod.connect_readonly(db_path),
+        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=SETTINGS,
+                            clock=_FixedClock(now), db_path=db_path,
+                            stop_event=threading.Event())
+    sup._improve_loop = loop
+
+    sup._launch_slot("2026-W34", 0)
+
+    assert calls == ["admission"]
+    check = db_mod.connect(db_path)
+    try:
+        slot = check.execute(
+            "SELECT status, spawn_attempts FROM improve_wave_slots "
+            "WHERE wave_period_key='2026-W34' AND k=0").fetchone()
+        assert (slot["status"], slot["spawn_attempts"]) == ("failed", 1)
+        missions = check.execute("SELECT status FROM missions").fetchall()
+        assert [m["status"] for m in missions] == ["failed"]
+        runs = check.execute("SELECT count(*) c FROM improvement_runs").fetchone()
+        assert runs["c"] == 1
+    finally:
+        check.close()
+
+
 def test_real_wiring_runner_run_exception_terminalizes_via_real_compensate(tmp_path):
     """runner.run 例外も実 loop/store を通して failed に終端する。"""
     from agentic_fx.activity import ActivityLog

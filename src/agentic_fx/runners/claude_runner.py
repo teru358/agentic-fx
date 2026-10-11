@@ -45,7 +45,8 @@ class ClaudeRunner(CliRunner):
                  on_message: Callable[[dict], None] | None = None,
                  cli_started_sink: Callable[[int], None] | None = None,
                  abort_event: threading.Event | None = None,
-                 abort_reason_fn: Callable[[], str] | None = None) -> None:
+                 abort_reason_fn: Callable[[], str] | None = None,
+                 launch: Any | None = None) -> None:
         # #26 (`verified-round1.md` 1-B): `--allowedTools ""` (空リスト) は
         # claude CLI の意味論では「制限なし」に近い挙動になりうる —
         # 空リストを渡す変異/設定ミスを fail closed で拒否する (production
@@ -58,7 +59,8 @@ class ClaudeRunner(CliRunner):
                          registry=registry, on_message=on_message,
                          cli_started_sink=cli_started_sink,
                          abort_event=abort_event,
-                         abort_reason_fn=abort_reason_fn)
+                         abort_reason_fn=abort_reason_fn,
+                         launch=launch)
 
     def _build_argv(self, mission: Mission, *,
                     mcp_spool: Path | None) -> list[str]:

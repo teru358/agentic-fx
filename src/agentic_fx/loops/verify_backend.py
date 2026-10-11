@@ -134,7 +134,10 @@ def verify_backend(
     backend: Literal["local", "claude", "codex", "opencode"],
     provider: Literal["chatgpt"] | None,
     clock: "Clock",
+    isolation_options: dict | None = None,
 ) -> VerifyBackendResult:
+    """`isolation_options` は CLI 隔離の WorkerRunner の引数 (隔離の互換性自己試験が渡す)。
+    省略時は改善 mission と同じ判定 (有効化の定数が偽なら隔離なし) に従う。"""
     now = clock.now()
     nonce = secrets.token_hex(16)
 
@@ -220,6 +223,16 @@ def verify_backend(
                     f"source_snapshot_dir whose basename is 'source', "
                     f"got {echoed})")
 
+        if isolation_options is None:
+            from agentic_fx.core import improve_admission
+
+            choice = improve_admission.choose_for_mission(scoped_settings, root)
+            if choice.refusal is not None:
+                return VerifyBackendResult(
+                    ok=False, backend=backend, provider=effective_provider,
+                    fingerprint=None,
+                    detail=f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}")
+            isolation_options = choice.worker_options
         rag = Rag(scratch_root / "rag")
         runner = WorkerRunner(
             root=root, settings=scoped_settings, clock=clock, rag=rag,
@@ -227,7 +240,7 @@ def verify_backend(
             rpc_handlers=build_ledger_wrapped_rpc_handlers(
                 ledger=ctx.ledger, rpc_handlers=ctx.rpc_handlers,
                 staging_dir=ctx.staging_dir),
-            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind)
+            rpc_timeout_sec_by_kind=rpc_timeout_sec_by_kind, **isolation_options)
 
         mission = Mission(
             prompt=(
