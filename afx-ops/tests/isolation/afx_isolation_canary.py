@@ -544,6 +544,56 @@ def op_notify_runtime(p, iso):
     return {"rc": rc, "new_modules": new_modules, "after": after}
 
 
+def op_msg_raw(p, iso):
+    """UDS の socketpair で sendmsg / recvmsg を呼ぶ (引数の検査より前に seccomp が判定する)。"""
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        return raw("sendmsg", left.fileno(), 0, 0) + raw("recvmsg", right.fileno(), 0, 0)
+    finally:
+        left.close()
+        right.close()
+
+
+def op_listener_view(p, iso):
+    """保持した listener の属性 (SO_REUSEADDR、型、listen 中か、address、CLOEXEC)。"""
+    import fcntl
+    sock = iso.listener
+    return {"reuseaddr": sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0,
+            "type": sock.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE),
+            "acceptconn": sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN),
+            "address": list(sock.getsockname()),
+            "cloexec": bool(fcntl.fcntl(sock.fileno(), fcntl.F_GETFD) & fcntl.FD_CLOEXEC)}
+
+
+def op_web_runtime(p, iso):
+    """web の runtime を実 listener・実 WebClient (fake daemon) で回す。
+
+    accept を始めたら "SERVING" を出す。requests 本の接続が閉じたら止め、続けて after の
+    操作を同じ process で試す。exhaust なら accept を始めた直後に fd を使い切る (runtime は
+    戻らず、AcceptLoop の SystemExit で process が終わる)。結果は {"rc", "new_modules", "after"}。
+    """
+    from afx_ops.web import runtime
+
+    def serving() -> None:
+        if p.get("exhaust"):
+            _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (p.get("nofile", 128), hard))
+            held = []
+            try:
+                while True:
+                    held.append(os.dup(0))
+            except OSError:
+                pass
+        sys.stdout.write("SERVING\n")
+        sys.stdout.flush()
+
+    before = set(sys.modules)
+    rc = runtime.run(iso, on_serving=serving, stop_after=p.get("requests", 1))
+    new_modules = sorted(set(sys.modules) - before)
+    after = [OPS[step["op"]](step.get("params", {}), iso) for step in p.get("after", [])]
+    return {"rc": rc, "new_modules": new_modules, "after": after}
+
+
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
 
 

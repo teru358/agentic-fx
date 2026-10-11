@@ -14,6 +14,7 @@ from types import MappingProxyType
 from afx_ops.config import ConfigError, read_config
 from afx_ops.isolation import startup
 from afx_ops.notify import runtime as notify_runtime
+from afx_ops.web import runtime as web_runtime
 
 FEATURES = ("bot", "web", "notify")
 
@@ -31,7 +32,7 @@ def feature_not_implemented(isolated: startup.Isolated) -> int:
 
 RUNTIMES: Mapping[str, Callable[[startup.Isolated], int]] = MappingProxyType({
     "bot": feature_not_implemented,
-    "web": feature_not_implemented,
+    "web": web_runtime.run,
     "notify": notify_runtime.run,
 })
 

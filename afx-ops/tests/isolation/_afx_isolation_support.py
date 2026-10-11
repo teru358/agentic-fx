@@ -5,9 +5,12 @@ import json
 import os
 import platform
 import resource
+import ctypes
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -116,6 +119,32 @@ def run_canary(spec: dict, env: dict[str, str], *, pass_fds: tuple[int, ...] = (
     return CanaryResult(done.returncode, done.stdout, done.stderr)
 
 
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+
+
+def _syscall(number: int, *args: int) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(number, *[ctypes.c_long(arg) for arg in args])
+    if result < 0:
+        raise OSError(ctypes.get_errno(), "syscall")
+    return result
+
+
+def _pidfd_open(pid: int) -> int:
+    """標準の os に無い build でも pidfd を開く (x86_64 の syscall 番号)。"""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    return _syscall(_SYS_PIDFD_OPEN, pid, 0)
+
+
+def _pidfd_kill(pidfd: int) -> None:
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+    else:
+        _syscall(_SYS_PIDFD_SEND_SIGNAL, pidfd, int(signal.SIGKILL), 0, 0)
+
+
 class Interactive:
     """stdin で段を進める canary。止めるときは pid を指定して kill し、回収する。"""
 
@@ -123,24 +152,63 @@ class Interactive:
                  prefix: tuple[str, ...] = ()) -> None:
         self.proc = subprocess.Popen(canary_argv(spec, prefix=prefix), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True, env=env, preexec_fn=no_core)
+                                     text=True, env=env, preexec_fn=no_core,
+                                     start_new_session=True)
         self.lines: list[str] = []
+        self._pgid = self.proc.pid
 
     @property
     def pid(self) -> int:
         return self.proc.pid
 
-    def wait_line(self, prefix: str) -> str:
+    def wait_line(self, prefix: str, timeout: float = 60.0) -> str:
+        """prefix で始まる行を待つ。期限までに来なければ子を止めて TimeoutError にする。"""
         assert self.proc.stdout is not None
-        while True:
-            line = self.proc.stdout.readline()
-            if not line:
-                err = self.proc.stderr.read() if self.proc.stderr else ""
-                raise AssertionError(f"canary ended before {prefix!r}: {self.lines} {err}")
-            line = line.rstrip("\n")
-            self.lines.append(line)
-            if line.startswith(prefix):
-                return line
+        expired = threading.Event()
+        # 子は start_new_session で自分の group の leader なので、group id は子の pid。
+        # 起動時の値を使う (親が先に終わっても、stdout を握る子孫の group を指せる)
+        group = getattr(self, "_pgid", None)
+        # pidfd を握っている間は子の pid が再利用されない。group を先に撃ち、その後で直接の子を撃つ
+        # 既に回収された子 (returncode が確定) の pid は別の process のものかもしれないので開かない
+        pidfd = -1
+        if self.proc.returncode is None:
+            try:
+                pidfd = _pidfd_open(self.proc.pid)
+            except OSError:
+                pidfd = -1
+
+        def expire() -> None:
+            expired.set()
+            if group is not None:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except OSError:
+                    pass
+            if pidfd >= 0:
+                try:
+                    _pidfd_kill(pidfd)
+                except OSError:
+                    pass
+
+        timer = threading.Timer(timeout, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    if expired.is_set():
+                        raise TimeoutError(f"no {prefix!r} within {timeout}s: {self.lines}")
+                    err = self.proc.stderr.read() if self.proc.stderr else ""
+                    raise AssertionError(f"canary ended before {prefix!r}: {self.lines} {err}")
+                line = line.rstrip("\n")
+                self.lines.append(line)
+                if line.startswith(prefix):
+                    return line
+        finally:
+            timer.cancel()
+            if pidfd >= 0:
+                os.close(pidfd)
 
     def send(self, text: str = "go") -> None:
         assert self.proc.stdin is not None
@@ -154,6 +222,12 @@ class Interactive:
 
     def kill(self) -> None:
         if self.proc.poll() is None:
+            group = getattr(self, "_pgid", None)
+            if group is not None:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except OSError:
+                    pass
             os.kill(self.proc.pid, 9)
         try:
             self.proc.communicate(timeout=10)

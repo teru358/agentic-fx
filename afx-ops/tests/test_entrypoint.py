@@ -242,11 +242,12 @@ def test_web_startup_plan_carries_the_configured_port(home, monkeypatch):
     assert seen[0].web_port == 18080
 
 
-def test_notify_runtime_is_wired_and_the_others_stay_not_implemented():
+def test_notify_and_web_runtimes_are_wired_and_bot_stays_not_implemented():
     from afx_ops.notify import runtime as notify_runtime
+    from afx_ops.web import runtime as web_runtime
     assert cli.RUNTIMES["notify"] is notify_runtime.run
+    assert cli.RUNTIMES["web"] is web_runtime.run
     assert cli.RUNTIMES["bot"] is cli.feature_not_implemented
-    assert cli.RUNTIMES["web"] is cli.feature_not_implemented
 
 
 def test_importing_the_entrypoint_leaves_aiohttp_to_the_preload():
@@ -256,3 +257,38 @@ def test_importing_the_entrypoint_leaves_aiohttp_to_the_preload():
                           capture_output=True, text=True, timeout=30)
     assert done.returncode == 0, done.stderr
     assert done.stdout.strip() == "False"
+
+
+def _web_config(home):
+    config_dir = feature_dirs("web").config
+    config_dir.mkdir(parents=True, mode=0o700)
+    ops_toml = config_dir / "ops.toml"
+    ops_toml.write_text('instance_root = "/srv/afx"\nkey_dir = "/srv/keys"\nport = 18080\n',
+                        encoding="utf-8")
+    ops_toml.chmod(0o600)
+
+
+def test_web_startup_is_given_the_web_preload(home, monkeypatch):
+    _web_config(home)
+    seen = []
+    monkeypatch.setattr(cli.startup, "run",
+                        lambda plan, config, body, **kwargs: seen.append(kwargs["preload"]) or 0)
+    assert cli.main(["web"]) == 0
+    assert seen == [cli.PRELOADS["web"]]
+
+
+def test_probe_web_fails_when_the_configured_port_is_taken():
+    import socket
+    from types import SimpleNamespace
+
+    from afx_ops import probe
+
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        with pytest.raises(probe.ProbeError) as raised:
+            probe.probe_web(SimpleNamespace(port=holder.getsockname()[1]), {})
+        assert raised.value.reason == "probe_bind_failed"
+    finally:
+        holder.close()

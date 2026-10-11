@@ -29,6 +29,7 @@ import re
 import select
 import socket
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -218,6 +219,15 @@ class _Request:
                 raise ApiError("response_lost", token_sent=True)
             buffer += chunk
 
+    def abort(self) -> None:
+        """別 thread から、待っている送受信を打ち切る (fd は閉じず、持ち主の close に任せる)。"""
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def close(self) -> None:
         if self._sock is not None:
             self._sock.close()
@@ -319,6 +329,10 @@ class _Client:
     def __init__(self, endpoint: Endpoint, token: str) -> None:
         self._endpoint = endpoint
         self._token = token
+        self._inflight: dict[_Request, int] = {}
+        self._interrupted_threads: set[int] = set()
+        self._lock = threading.Lock()
+        self._interrupted = False
 
     @classmethod
     def from_token(cls, endpoint: Endpoint, token: bytes):
@@ -343,8 +357,38 @@ class _Client:
 
     def _send(self, payload: bytes) -> Reply:
         with _Request.open(self._endpoint) as request:
-            request.send(payload)
-            return _reply(*request.receive())
+            with self._lock:
+                ident = threading.get_ident()
+                self._inflight[request] = ident
+                interrupted = self._interrupted or ident in self._interrupted_threads
+            try:
+                if interrupted:
+                    request.abort()
+                request.send(payload)
+                return _reply(*request.receive())
+            finally:
+                with self._lock:
+                    self._inflight.pop(request, None)
+
+    def interrupt(self) -> None:
+        """実行中の要求の接続を切り、待っている thread を応答喪失で戻す。以後の要求も同様。"""
+        with self._lock:
+            self._interrupted = True
+            running = list(self._inflight)
+        for request in running:
+            request.abort()
+
+    def interrupt_thread(self, ident: int) -> None:
+        """その thread が実行中の要求 (これから開く要求も) だけを切る。解除は ``release_thread``。"""
+        with self._lock:
+            self._interrupted_threads.add(ident)
+            running = [request for request, owner in self._inflight.items() if owner == ident]
+        for request in running:
+            request.abort()
+
+    def release_thread(self, ident: int) -> None:
+        with self._lock:
+            self._interrupted_threads.discard(ident)
 
     def _get(self, path: str, **query) -> Reply:
         return self._call("GET", path, query={k: v for k, v in query.items() if v is not None})
