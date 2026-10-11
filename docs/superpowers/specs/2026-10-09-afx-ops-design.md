@@ -1,8 +1,8 @@
-# [afx-ops] operations surface の分離と自己隔離 v1.4
+# [afx-ops] operations surface の分離と自己隔離 v1.5
 
-版: v1.4
+版: v1.5
 
-日付: 2026-10-10
+日付: 2026-10-11
 
 対象チケット: ops-ui
 
@@ -79,15 +79,21 @@ bot は二つの流れを持つ。(1) 通知: event cursor (`events.read`) か�
 
 bot は pending 承認、親が記録した facts と agent claims を区別した判断材料、payload SHA-256、期限、決定状態を表示する。自由文を event から復元せず、API が許す承認詳細だけを出す。`message_content` intent は要求も使用もしない。
 
-投稿対応は `approval_id`、`payload_sha256`、`guild_id`、`channel_id`、`message_id`、`actor`、`display_generation` を永続化する。永続化に SQLite は使わない。隔離後の seccomp は `fcntl` の `F_SETLK` 系を EINVAL、`flock` を EPERM とし (§5.2、これは緩めない)、SQLite の既定ロックが動かないためである。投稿対応表と確認 record、event cursor は単一の JSON snapshot として bot の状態領域に置く。書込みは直列化し、一時 file へ書いて fsync し、rename して directory を fsync する。更新は rename の完了後にだけ次の外部操作 (daemon 呼出し、Discord への投稿・edit) へ進む。再起動時の adopt はこの snapshot から行う。投稿成功から snapshot 保存までで中断した場合は、Discord 上の自分の投稿を固定識別子で照合できたものだけ adopt し、できない場合だけ repost する。投稿識別子は message footer の `afx-approval:<approval_id>:<payload_sha256>` とし、`display_generation` を含めない。generation を含めると、再起動後の adopt で旧 generation の投稿が常に不一致になり、毎回 repost になるためである。照合は `approval_id`、digest、bot 自身が author であること、guild / channel の一致で行い、generation は snapshot だけが持つ。daemon 側で決着、期限切れ、無効化、取得不能になれば、message を冪等に更新して View を外す。Discord / API の一時障害は対応を残し、reconcile で再試行する。
+投稿対応は `approval_id`、`payload_sha256`、`guild_id`、`channel_id`、`message_id`、`actor`、`display_generation`、`edit_pending`、`repost_generation` を永続化する。永続化に SQLite は使わない。隔離後の seccomp は `fcntl` の `F_SETLK` 系を EINVAL、`flock` を EPERM とし (§5.2、これは緩めない)、SQLite の既定ロックが動かないためである。投稿対応表と確認 record、event cursor は schema v4 の単一 JSON snapshot として bot の状態領域に置く。書込みは直列化し、一時 file へ書いて fsync し、rename して directory を fsync する。更新は rename の完了後にだけ次の外部操作 (daemon 呼出し、Discord への投稿・edit) へ進む。壊れた snapshot は fail closed とする。
 
-primary View は `timeout=None` とし、全 component の `custom_id` は `afx:v1:<action>:<approval_id>` の形に固定する。`action` は `approve`、`reject`、`retry`、`claim`、`confirm`、`cancel` のいずれかとする。primary View のボタンは `approve` / `reject` / `retry`、本人だけに見える確認 (ephemeral) のボタンは `confirm` / `cancel` である。`claim` は `custom_id` 文法に予約する action で、最初のボタン押下が record に actor を結ぶ操作 (下記) の内部名である。nonce、secret、actor、表示 generation は `custom_id` に埋め込まず、確認状態から照合する。確認 record は `actor`、`approval_id`、`payload_sha256`、`action`、`expiry`、`nonce`、`guild_id`、`channel_id`、`message_id`、`display_generation`、状態を持つ。expiry は interaction token の 15 分より短い 10 分とする。状態は `fresh → claimed → in_flight → done | expired | invalidated` とし、各遷移は snapshot への条件付き更新 1 回 (上記の直列化した fsync + rename) で一回だけ起こす。
+repost は送信前に `repost_generation`（送信する次世代）を snapshot へ確定する。footer は `afx-approval:<approval_id>:<payload_sha256>:<display_generation>` とし、起動時の adopt はこの三要素、bot 自身の author、guild / channel の完全一致だけを history の直近 100 件から探す。history 走査は投稿後・保存前の crash 窓だけに使い、通常の adopt は snapshot の channel / message を直接取得する。一致がなければ repost する。approval 単位の Lock で表示更新と repost を排他し、送信時の世代と `repost_generation` の CAS が一致するときだけ message 対応と `display_generation` を commit する。送信中に終端へ遷移していたら、新 message は View なしの終端表示へ edit する。CAS 不一致後の終端 edit は 1 回だけ行う。
 
-承認は二段で確定する。(1) 利用者が primary View の `approve` / `reject` / `retry` を押すと、guild / channel / allowlist を確認した後、record を `fresh` から `claimed` へ原子的に遷移させて操作者 (`discord:<id>`) と action を record に結ぶ (claim)。このとき daemon は呼ばない。claim 済みの record に別の利用者が最初のボタンを押しても、record は変えず固定文言で拒否する。(2) bot は本人だけに見える確認 message (ephemeral) を返す。本人が `confirm` を押した場合だけ、`claimed` の nonce を `in_flight` へ原子的に遷移させて daemon を呼ぶ。`cancel` は claim を解いて `fresh` に戻す。claim も expiry (10 分) に含まれる。reject は reason を持たない (人間の reject reason は改善プロンプトに漏れるため。確定済み)。
+daemon 側で決着又は 404 となれば、message を冪等に更新して View を外す。表示 edit は起動時・adopt 時を含め `edit_pending` で通常の retry / backoff 経路へ入り、2 秒から倍々（最大 60 秒）で再試行する。成功した終端表示は snapshot から削除し、`EDIT_RETRY_LIMIT`（8 回）失敗した終端表示も固定 reason `edit_abandoned` を記録して削除する。Discord の `NotFound` は edit 成功ではない。非終端なら上記の repost、終端なら record 削除として扱う。
 
-全 interaction の callback は、安価な guild / channel / user 確認の後、API アクセスより前に 3 秒以内に `interaction.response.defer(ephemeral=True)` を呼ぶ。同期の `BotClient` は pidfd poll を含みブロックするので、event loop の handler や discord.py の callback から直接呼ばず、defer の後に worker thread (§5.2 で許す thread-only の `clone` の範囲) で呼び、結果を待って応答を更新する。defer 後、`custom_id` の action と確認 record の状態・action が一致すること、同じ actor と表示起点を再照合し、`confirm` では `claimed` の nonce を `in_flight` へ原子的に遷移させてから daemon を呼ぶ。競合再送、`confirm` / `cancel` を押した claim 者以外の user、別 guild / channel / message、旧 generation、期限切れ、使用済み nonce は record を invalidated とし決定を送らない。`custom_id` が形式不正、又は `approval_id` が未知で確認 record を一意に特定できない場合は、状態を変更せず拒否する。`approval_id` で確認 record を一意に特定できる action 不一致又は改変では、その record を原子的に `invalidated` とする。いずれの `custom_id` 拒否でも daemon に決定を送らない。決定前に allowlist を再照合し、承認詳細を再取得して digest が record と一致することを確認する。成功時だけ actor header を付けて決定を送り、作成された job の polling / cancel にも同じ header を付ける。応答喪失又は競合では成功表示をせず、正本を再読取して反映する。
+primary View は `timeout=None` とし、全 component の `custom_id` は `afx:v1:<action>:<approval_id>` の形に固定する。`action` は `approve`、`reject`、`retry`、`claim`、`confirm`、`cancel` のいずれかとする。primary View のボタンは `approve` / `reject` / `retry`、本人だけに見える確認 (ephemeral) のボタンは `confirm` / `cancel` である。`claim` は `custom_id` 文法に予約する action で、最初のボタン押下が record に actor を結ぶ操作 (下記) の内部名である。nonce、secret、actor、表示 generation は `custom_id` に埋め込まず、確認状態から照合する。確認 record は `actor`、`approval_id`、`payload_sha256`、`action`、`expiry`、`nonce`、`guild_id`、`channel_id`、`message_id`、`display_generation`、状態を持つ。expiry は interaction token の 15 分より短い 10 分とする。状態は `fresh → claimed → in_flight → done` の 4 つだけとし、bot の決定完了又は daemon が非 pending / 404 を返したときの真の終端は `done` とする。`expired` / `invalidated` は状態ではなく、claim を解き、`display_generation` を +1 し、`edit_pending` を立てて `fresh` へ戻す遷移である。各遷移は snapshot への条件付き更新 1 回 (上記の直列化した fsync + rename) で一回だけ起こす。
 
-bot 再起動時は gateway 接続前に既存 message の View を再登録して dispatch 経路を用意し、未終端 (`fresh` を除く `claimed` / `in_flight`) の全確認 record を snapshot 一回の書換えで `invalidated` とする。次に既存 message を「再確認が必要」に bot token で edit し、固定識別子を照合できた投稿を adopt し、それ以外だけを repost する。reconcile が新しい確認状態と View を作った後に gateway 接続する。10 分を越えた expiry 又は interaction token の失効後も、表示更新に interaction token は使わず bot token による message edit だけを使う。
+承認は二段で確定する。(1) 利用者が primary View の `approve` / `reject` / `retry` を押すと、guild / channel / allowlist を確認した後、record を `fresh` から `claimed` へ原子的に遷移させて操作者 (`discord:<id>`) と action を record に結ぶ (claim)。このとき daemon は呼ばない。claim 済みの record に別の利用者が最初のボタンを押しても、record は変えず固定文言で拒否する。(2) bot は本人だけに見える確認 message (ephemeral) を返す。本人が `confirm` を押した場合だけ、`claimed` の nonce を `in_flight` へ原子的に遷移させて daemon を呼ぶ。claim を解く契機は claim 者の `cancel` と `expire_due` による期限切れ（10 分）だけであり、いずれも `fresh` への遷移とする。claim 者以外の primary click / `confirm` / `cancel`、旧世代の表示、guild / channel 不一致、使用済み nonce は固定文言の ephemeral 応答だけを返し、record と世代を変えない。reject は reason を持たない (人間の reject reason は改善プロンプトに漏れるため。確定済み)。
+
+全 interaction の callback は、安価な guild / channel / user 確認の後、API アクセスより前に 3 秒以内に `interaction.response.defer(ephemeral=True)` を呼ぶ。同期の `BotClient` は pidfd poll を含みブロックするので、event loop の handler や discord.py の callback から直接呼ばず、defer の後に worker thread (§5.2 で許す thread-only の `clone` の範囲) で呼び、結果を待って応答を更新する。defer 後、`custom_id` の action と確認 record の状態・action が一致すること、同じ actor と表示起点を再照合し、`confirm` では `claimed` の nonce を `in_flight` へ原子的に遷移させてから daemon を呼ぶ。形式不正又は未知 ID は状態を変えず拒否する。いずれの拒否でも daemon に決定を送らない。決定前に allowlist を再照合し、承認詳細を再取得して digest が record と一致することを確認する。detail が 5xx / 408 / 429 / 読めない応答なら一時障害として record を変えず次周回に再照合する。digest 不一致と 404 以外の 4xx は `fresh` へ戻す。成功時だけ actor header を付けて決定を送り、作成された job の polling / cancel にも同じ header を付ける。応答喪失又は競合では成功表示をせず、正本を再読取して反映する。
+
+`in_flight` は決定直後に job ID を保存し、job ID がある record は job だけを poll する。poll 周回ごとに全 `in_flight` を再照合する。job ID が無く daemon が pending のままなら、決定応答の喪失として `fresh`（世代 +1）へ戻す。daemon は同じ approval の二重決定を 409 `already_decided` で拒む。job ID が無く非 pending 又は 404 なら `done`、job ID があり `queued` / `running` なら継続、job poll の 404 は `done`、その他の非 2xx は record を変えず再試行する。detail、job poll、決定 API の 429 / 503 は `Retry-After` を承認単位の process 内メモリ `next_poll_at` に写す。秒数は最大 300 秒、無ければ 10 秒とし、期限前の承認には poll / 投稿 / repost を行わない。再起動でこの先送りは解ける。
+
+bot 再起動時は gateway 接続前に既存 message の View を再登録して dispatch 経路を用意し、`claimed` と job ID の無い `in_flight` を snapshot 一回の書換えで世代を進めた `fresh` へ戻す。job ID のある `in_flight` は job の poll を継続する。次に既存 message の表示を通常の retry / backoff 経路で更新し、snapshot の message を直接 adopt する。投稿後・保存前の crash 窓だけ history 100 件の完全一致 footer で adopt し、それ以外だけを repost する。reconcile が新しい確認状態と View を作った後に gateway 接続する。View は作成時の世代を束縛し、click 時はその束縛値と record の現在値を照合する。10 分を越えた expiry 又は interaction token の失効後も、表示更新に interaction token は使わず bot token による message edit だけを使う。
 
 ### 3.3 web
 
@@ -99,9 +105,13 @@ web は初版では認証を持たず、127.0.0.1 限定・read-only の route �
 
 `aiohttp.web` の import は `mimetypes` が `/etc/mime.types` を開くため、隔離後に初めて import すると `EACCES` になる。web runtime module の import は隔離前に済ませ、Landlock 規則は追加しない。
 
+HEAD への error 応答は parser 層の 413 を含む全経路で本文を持たず、`Content-Length` は同じ GET error 表現の値とする。header 上限 8192 byte は wire で計測し、aiohttp が再構成した DTO も request line、各 `name:value\\r\\n`、末尾 CRLF の同じ勘定で検査する。
+
+切れた接続の daemon 呼出しは取り消す。未開始なら future を破棄し、実行中なら worker thread 単位で daemon との接続を切る。停止時に開いたままの接続も同じ取消し経路へ通す。`_connect` の取消し又は失敗は socket と接続枠を返す。停止時の drain は event loop を塞がずに待つ。
+
 ### 3.4 notify
 
-notify は event cursor から固定 schema の event を読み、event ID で重複を落としてから generic HTTPS webhook へ送る。成功した位置だけを機能固有の状態領域に保存するため、配送は at-least-once である。送信先には event code と許可された固定 fields だけを summary として送り、approval payload、agent claim、reject reason、鍵、自由文、内部例外を送らない。送信失敗は上限付き exponential retry と原因別警告抑制で扱う。
+notify は event cursor から固定 schema の event を読み、event ID で重複を落としてから generic HTTPS webhook へ送る。成功した位置だけを機能固有の状態領域に保存するため、配送は at-least-once である。送信先には event code と許可された固定 fields だけを summary として送り、approval payload、agent claim、reject reason、鍵、自由文、内部例外を送らない。送信失敗は最大 8 回の retry で扱う。待ちは 1、2、4、8、16、32、60 秒の exponential backoff とし、429 の読める `Retry-After`（秒又は HTTP-date）はこの待ちを短縮せず、最大 60 秒までの大きい方を使う。5xx と一時的な通信失敗は再試行し、retryable でない失敗又は上限到達は fail closed とする。同じ reason の warning は 60 秒より頻繁に出さない。
 
 ## 4. 鍵と principal
 
@@ -213,7 +223,7 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 
 疎通確認は本体 (`afx ops enable`) が `afx-ops probe <feature>` を subprocess で呼んで行う。本体と afx-ops は互いを import しない (O-1)。呼出しは afx-ops の絶対 path で行い、secret は先に feature の secret file に置いてから呼び、argv、env、stdin に渡さない。probe は secret file と `ops.toml` を自分で読む。戻りは終了コードと固定 reason だけで、secret や外部サービスの応答本文を返さない。
 
-probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）、未知 feature は rc 2 `unknown_feature`、bot / notify の未実装 probe は rc 69 `probe_not_implemented`、runtime 表で利用不能は rc 70 `runtime_unavailable`、`config_dir_missing` / `config_dir_invalid` / `config_invalid` / `secrets_failed` は rc 71（想定外は `startup_internal_error`）、web の bind 失敗は rc 73 `probe_bind_failed` とする。web probe は loopback に bind して直ちに close し、port 0 を `config_invalid` として拒否する。probe は非隔離で state dir を作らず、argv / env / stdin に secret を渡さない。
+probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）、未知 feature は rc 2 `unknown_feature`、未実装 probe は rc 69 `probe_not_implemented`、runtime 表で利用不能は rc 70 `runtime_unavailable` とする。rc 71 は `config_dir_missing` / `config_dir_invalid` / `config_invalid` / `secrets_failed` / `url_invalid` / `token_invalid`、及び想定外の `startup_internal_error` とする。rc 73 は web の `probe_bind_failed`、bot の `probe_unauthorized` / `probe_channel_unreachable` / `probe_guild_mismatch` / `probe_http_error` / `probe_response_invalid` / `probe_dns_failed` / `probe_connect_failed` / `probe_tls_failed` / `probe_timeout` / `probe_transport_failed`、notify の `probe_dns_failed` / `probe_connect_failed` / `probe_tls_failed` / `probe_timeout` / `probe_connection_lost` / `probe_redirect` / `probe_http_429` / `probe_http_4xx` / `probe_http_5xx` / `probe_response_invalid` / `probe_transport_failed` とする。web probe は loopback に bind して直ちに close し、port 0 を `config_invalid` として拒否する。probe は非隔離で state dir を作らず、argv / env / stdin に secret を渡さない。
 
 疎通に失敗したら、ウィザードは設定と secret を再質問できる (`--reconfigure` 相当)。誤った token や URL は、疎通に成功するまで確定せず (stage は `staged` のまま)、既存設定が揃っているという理由で再質問を省いて誤設定を固定しない。
 
@@ -248,7 +258,7 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |AC-5|afx-ops の実 UDS 接続は共有 server 認証に加えて、必須 `SO_PEERPIDFD`、自己 pid fdinfo による pid 照合、dev 一致、token 送信直前と要求中の pidfd poll を全て照合してから成功する。pidfd 不可、pid 不一致、pidfd `POLLIN`、dev 不一致、各一項目の偽装、`/proc/locks` 不可では token byte 数が 0 となる。pidfd が reply 完了又は例外まで開いたままで、要求 object が一回だけ close することを fd 監視で観測する|
 |AC-6|afx 再起動で socket / lock inode が変わった後、新 path を再認証できた場合だけ ops が復帰する。認証不能なら旧 process は非零終了し、新 process が最初から隔離される|
 |AC-7|各 feature の最終 BPF 番号表を検査し、未分類 / 重複を生成失敗にする。hostile canary が新規 bind、listen、ptrace、`process_vm_*`、`pidfd_getfd`、`/proc/<pid>/mem`、継承 fd、他鍵読取、web の AF_INET/AF_INET6 socket、`CLONE_NEW*` 又は `CLONE_PARENT` を含む clone、`unshare`、`setns` を拒否する。`clone3` は ENOSYS、`afx-ops-clone-thread-only-v1` の thread flags 完全一致の legacy `clone`、`PR_SET_DUMPABLE=0`、web の trace 固定の `accept4` 又は `accept`、bot / notify の TCP connect、AF_UNIX NSS、任意宛先・任意 port の UDP DNS、`sendto` / `recvfrom`、DNS cache miss、`futex` だけを許す。実 web accept loop、Discord gateway reconnect、webhook hostname 再解決を通し、accept syscall を実 trace と番号表で一致させる|
-|AC-8|未登録 user、確認前に除外された user、claim 済み record への別 user の最初のボタン、`confirm` / `cancel` を押した claim 者以外、`claimed` を経ない `confirm`、別 actor、別 guild / channel / message、旧 display generation、期限切れ、使用済み nonce、payload digest 変更、並行 confirm、改変 `custom_id`、`custom_id` action と record action の不一致の全てで daemon に決定が届かない。形式不正又は未知 ID は無変更で拒否し、`approval_id` が一意に record を特定できる改変又は action 不一致だけを原子的に invalidated とする。全 interaction は 3 秒以内に ephemeral defer し、daemon 遅延、15 分境界、ACK 後の daemon 失敗、起動直後の旧 message click を観測する。再起動後は View 登録、全旧確認の失効、「再確認が必要」への bot token edit、adopt / repost、gateway 接続の順を観測する|
+|AC-8|未登録 user、確認前に除外された user、claim 済み record への別 user の最初のボタン、`confirm` / `cancel` を押した claim 者以外、`claimed` を経ない `confirm`、別 actor、別 guild / channel / message、旧 display generation、使用済み nonce、payload digest 変更、並行 confirm、改変 `custom_id`、`custom_id` action と record action の不一致の全てで daemon に決定が届かない。claim を解けるのは claim 者の `cancel` と `expire_due` だけであり、他者操作、旧世代、guild / channel 不一致、使用済み nonce は record と世代を変えず固定文言で拒否する。状態は `fresh → claimed → in_flight → done` のみで、期限切れと無効化は世代を進めた `fresh` への遷移とする。全 interaction は 3 秒以内に ephemeral defer し、daemon 遅延、15 分境界、ACK 後の daemon 失敗、起動直後の旧 message click を観測する。再起動後は View 登録、claimed と job ID の無い in_flight の fresh 化、通常 retry / backoff による表示更新、adopt / repost、gateway 接続の順を観測する。job ID の無い in_flight の pending → fresh、非 pending / 404 → done、job ID のある running 継続、job poll 404 → done、その他の非 2xx の無変更再試行を観測する。429 / 503 の `Retry-After` により承認単位で poll / 投稿 / repost が最大 300 秒抑制されること、NotFound 時の非終端 repost と終端削除、終端 edit の成功又は 8 回失敗時の snapshot 削除も観測する。|
 |AC-9|`ops-bot` の正しい actor header は監査行と `(principal, actor)` job 所有に残り、決定作成と polling が同じ actor で成功する。ops-bot の決定 / polling で header なし、形式外、又は他 principal の header は v1.13 契約どおり拒否され、`decided_by` は principal のままである|
 |AC-10|web は隔離前の `127.0.0.1` listener だけで (認証なし、§12 裁定 1) 表示でき、隔離前の接続が handler に届かず隔離後に初めて処理される。実 trace は runtime が使う `accept4` 又は `accept` を一つに固定し、番号表はその syscall だけを許す。直接 HTTP、web 鍵、侵害を模した route のいずれからも変更 / 承認はできない|
 |AC-11|notify は実 event を generic HTTPS webhook へ送り、重複 event ID を識別できる。許可外 field、自由文、鍵が payload に無い|
@@ -267,9 +277,9 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |T4|UDS client と再認証|共有 server 認証 oracle、ops 固有 pidfd / dev admission、要求期間の pidfd 所有、lock holder 照合、偽 server 拒否、再起動時 fail closed を実 UDS で証明する|
 |T5|自己隔離|Landlock 規則、feature 別 seccomp 番号表、`clone3` ENOSYS、thread-only legacy `clone`、trace 固定 accept loop、canary、cross-process token 防御を実 process で証明する|
 |P|前提束|**実装済み（ops-p-b、main 投入前）**。依存 (`discord.py` / `aiohttp`) の一括追加、`ops.toml` schema と隔離前の読取り・固定 plan 照合、`cli.py` の feature → runtime 表、API 鍵の受け渡し (`Isolated` の field)、READY の時機 (server 認証後)、JSON snapshot の書込み部品、unit の依存変更 (`Requisite=`) を固定した。T6〜T9 の前提は揃った。|
-|T6|plain gate と bot|allowlist、二段の原子的確認 (claim と ephemeral confirm)、JSON snapshot の永続化、3 秒 defer と worker thread、action 付き persistent View、actor header、指定順の adopt / repost / reconcile / View 除去を実装・試験する|
-|T7|web|認証なしのローカル限定 (§12 裁定 1)、`ops.toml` の port、loopback pre-bind、自前 accept loop、read-only principal、書込み到達不能を確認する|
-|T8|notify|event cursor、重複許容、DNS を含む generic HTTPS webhook 配送を確認する|
+|T6|plain gate と bot|**実装済み（main 投入済み）**。allowlist、二段の原子的確認 (claim と ephemeral confirm)、JSON snapshot の永続化、3 秒 defer と worker thread、action 付き persistent View、actor header、adopt / repost / reconcile / View 除去を実装・試験した。|
+|T7|web|**実装済み（main 投入済み）**。認証なしのローカル限定 (§12 裁定 1)、`ops.toml` の port、loopback pre-bind、自前 accept loop、read-only principal、書込み到達不能を確認した。|
+|T8|notify|**実装済み（main 投入済み）**。event cursor、重複許容、DNS を含む generic HTTPS webhook 配送を確認した。|
 |T9|systemd と wizard|機能別 enable / disable の durable 遷移と crash 回復、readiness、全 off 無配置、最小質問と `afx-ops probe` による疎通確認・再質問を自動化する|
 
 順序は P → T8 (notify) → T7 (web) → T6 (bot) → T9 (ウィザード) とする。T7 と T8 は P の後なら並列にできる。T1、T3、T4、T5 と P が完了するまで、ops process を本番鍵で起動しない。
@@ -283,6 +293,7 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |非対応 filesystem|`data/` が btrfs、overlayfs、NFS 等で lock の dev が `/proc/locks` と一致しない環境では afx-ops を起動できない|
 |Linux kernel|`SO_PEERPIDFD` を持たない kernel 6.5 未満では ops は固定 reason で起動を拒否する|
 |DNS|bot / notify の DNS は AF_UNIX と、宛先 address・port を seccomp で判定しない UDP を許すため、任意宛先・任意 port への UDP 送信が可能であり、名前解決先と resolver 実装の信頼に依存する|
+|NETLINK|bot / notify は `getaddrinfo` の `AI_ADDRCONFIG` / 宛先整列のためだけに `socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE)` を許す。`bind` は全 profile で拒否する。seccomp は family / type / protocol で仕分けるため、NETLINK の宛先や内容までは判定しない。|
 |Discord / webhook|外部サービスの可用性、投稿削除、event の best-effort 生成により、表示又は通知が遅延・欠落・重複し得る。監査の正本は daemon に残る|
 |通知先の内容|固定 schema に限定しても、event の時刻・識別子・状態を外部送信することは送信先の信頼に依存する|
 |enroll 中の afx 起動|marker と flock により、Wants / Requires / 手動 start / `--no-block` のどれで afx が起動しても enroll 中に manifest を読まない。止められないのは、同 uid が marker を消す、unit を介さず binary を直接実行する場合 (既存の同 uid 残余と同じ)。enable が crash して marker が残ると afx は起動できないが、`afx ops status` が表示し、同じ enable の再実行が回収する|
@@ -292,6 +303,7 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |afx 側の障害の伝播|afx main の SIGKILL では、ops は afx が死んでいる窓の間 active のまま残る。その後 afx の自動再起動の restart job が `PartOf=` を伝播し、ops を stop → start する（この再起動で `NRestarts` は増えない）。この一時的な active 状態では ops が daemon の可用性を保証するものではない|
 |承認後の回復|誤承認後の plugin disable / rollback は既存の未整備事項のままであり、afx-ops は解決しない|
 |bot の永続状態|SQLite を使わないので、snapshot は単一 file の全体書換えである。rename の前後の crash では旧版か新版のどちらかが残る (部分書込みは残らない)。規模は承認件数に比例して小さく、書込み頻度は承認の操作に限る|
+|試験 helper の停止|`wait_line` は起動時に記録した process group を先に kill するが、`setsid` でその group を抜けた子孫は止められない。|
 |仮運用の afx の終了コード|仮運用の `afx.service` は `screen -Dm` 経由で起動するため終了コードを伝えず、`RestartPreventExitStatus=75` が効かない。恒久形の unit で有効になる|
 
 ## 12. 未決事項 (ユーザー裁定待ち)
@@ -308,7 +320,7 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 
 |日付|版|変更|理由|commit|
 |---|---|---|---|---|
-|2026-10-09|v1.0|C0 revision 0.4 (設計レビュー 4 周、最終周で収束) を公開 spec として清書|実装着手条件の固定 (未決 4 件はユーザー裁定待ち)|—|
+|2026-10-09|v1.0|C0 revision 0.4 を公開 spec として清書|実装着手条件の固定 (未決 4 件はユーザー裁定待ち)|—|
 |2026-10-09|v1.0|§12-1 web 認証をユーザー裁定で確定 (初版ローカル限定・認証なし、後で拡張)|ユーザー裁定|—|
 |2026-10-09|v1.0|§12-2〜4 をユーザー裁定で確定 (単一 guild・channel / notify は generic webhook で bot の backup / ops-bot の operator 操作は初版なし、将来の追加を principal 追加で考慮)|ユーザー裁定|—|
 |2026-10-09|v1.0|§3.2 に bot の通知の流れ (event → メンション付き投稿) を追加、notify を backup と明記|ユーザー再確認 (afx → ops-bot → Discord が主経路)|—|
@@ -316,3 +328,4 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |2026-10-10|v1.2|T3 / T4 / T5 の実装 (main 3873a99) で確定した小修正。§6.1 started は停止前の afx が active のときだけ起動、afx_before_stop の記録、terminal stage の実物照合、固定 reason 追加、§6.1.1 の is_stopped、§5.1 配置の検査、§5 の pidfd / lock / errno 分類、§3.3 の accept_exhausted、§11 に仮運用の終了コード残余、§12 に abort 操作の未決を追加|T3 / T4 / T5 の実装で確定した小修正||
 |2026-10-10|v1.3|前提束 P の裁定 8 件を反映。§3.1.1 に `ops.toml` を新設、§4 / §5.1 に API 鍵の隔離前読取りと `Isolated` での受渡し、§3.2 に JSON snapshot の永続化 (SQLite 不使用)・投稿識別子から generation を除外・二段承認 (claim / confirm / cancel)・worker thread、§6.2 の READY=1 を server 認証後へ、unit を `Requisite=` + `PartOf=` + `After=` へ変更 (伝播は実証後に AC-12 へ)、§7 を `afx-ops probe` 契約と再質問へ、§10 に前提束 P と順序、§3.3 / AC-10 / T7 の cookie 認証を初版認証なしに統一、drop-in 名を実装に合わせる|前提束 P の裁定 (ユーザー承認 2026-10-10)、T6〜T9 草案の検収で出た不一致の解消|—|
 |2026-10-10|v1.4|前提束 P の実装確定事項を反映。`/dev/urandom` の Landlock 許可、`key_dir` の二重境界検査と config fd 非継承、固定起動順と鍵 / probe の reason・rc 契約、aiohttp import 時機、systemd 259 の `Requisite=` / `Wants=` / `PartOf=` の実測、P 実装済み状態を明記|ops-p-b の実装・実測を spec へ反映||
+|2026-10-11|v1.5|bot の状態機械・snapshot v4・表示更新 / repost・承認単位 throttle、web の HEAD error / header 上限 / 接続取消し、notify retry、probe reason 語彙、T6〜T8 実装済み状態、NETLINK と試験 helper の残余を実装に合わせて更新|T6 bot、T7 web、T8 notify と前提束 P の main 投入済み実装との同期|(本 commit)|
