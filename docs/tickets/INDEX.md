@@ -46,6 +46,7 @@
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [deployed-plugin-has-no-disable-or-rollback](open/deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
+| [real-cli-selftest-should-exercise-tools-call](open/real-cli-selftest-should-exercise-tools-call.md) | 高 | 2026-10-11 | 実 CLI 自己試験に副作用のない tools/call を 1 回必須にする |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](open/baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
 | [candidates-converge-to-example-sma](open/candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
@@ -123,7 +124,6 @@
 | [improve-admission-hashes-cli-every-mission](open/improve-admission-hashes-cli-every-mission.md) | 低 | 2026-10-11 | 改善 mission の admission が毎回 CLI binary を hash し fingerprint … |
 | [ops-bot-display-residuals](open/ops-bot-display-residuals.md) | 低 | 2026-10-11 | ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、承認単位 Lock の表が増え… |
 | [ops-bot-initial-start-replays-all-events](open/ops-bot-initial-start-replays-all-events.md) | 低 | 2026-10-11 | ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する |
-| [real-cli-selftest-should-exercise-tools-call](open/real-cli-selftest-should-exercise-tools-call.md) | 低 | 2026-10-11 | 実 CLI 自己試験に副作用のない tools/call を 1 回必須にする |
 | [rpc-dispatcher-join-budget-test-flaky-under-load](open/rpc-dispatcher-join-budget-test-flaky-under-load.md) | 低 | 2026-10-11 | rpc dispatcher の join budget 試験が高負荷時に揺れる |
 | [verify-backend-isolated-via-service](open/verify-backend-isolated-via-service.md) | 低 | 2026-10-11 | 隔離付きの backend 疎通確認を service 経由 (ops API / afx ctl) で提供する |
 | [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |

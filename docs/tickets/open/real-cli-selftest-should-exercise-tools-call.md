@@ -2,14 +2,14 @@
 id: real-cli-selftest-should-exercise-tools-call
 title: 実 CLI 自己試験に副作用のない tools/call を 1 回必須にする
 status: 設計待ち
-priority: 低
+priority: 高
 opened: 2026-10-11
 closed: null
 related: [real-cli-selftest-opencode-does-not-stop]
 ---
 # [real-cli-selftest-should-exercise-tools-call] 実 CLI 自己試験に副作用のない tools/call を 1 回必須にする
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 高
 
 ## 現象
 
@@ -24,3 +24,4 @@ test_real_cli_selftest / verify_backend は prompt の往復・MCP initialize・
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-11: 優先: 高 — 2026-10-11 実機: 隔離下の実 improve mission 1065 (codex) で code-mode host の起動失敗により tools/call が全滅したが、自己試験 (initialize + tools/list) は合格して admitted=yes だった。自己試験が tools/call を 1 回含まないと、この種の故障は有効化後も admission を通る。
