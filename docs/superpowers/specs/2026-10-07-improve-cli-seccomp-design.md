@@ -514,7 +514,7 @@ canary と自己試験は判定を求めた呼出しの settings（backend）で
 47. codex の npm wrapper（shebang）を artifact に設定すると `cli_artifact_unsupported` となり、CLI が exec されないことを検証する。
 48. `source_isolation`、launcher 群、outer Landlock の AST 到達 source の各変更で aggregate が変わり、worker 側再計算と handshake aggregate の不一致では `fingerprint_mismatch` により launcher を起こさないことを検証する。supported fingerprint の登録値は `ISOLATION_ENABLED=true` で計算する。
 49. admission の同一 `(backend,fingerprint)` の待合せ、異なる fingerprint の並行、settings ごとの WorkerRunner、stop の cache 前・leader 前・各 probe 前・判定後の観測、完了時刻 cache、`refused` の一回終端、canary launch 拒否時の listener / pipe close を検証する。
-50. artifact size + headroom が `memory.max` を超える場合に cgroup 作成前の `artifact_exceeds_memory_max` になること、sealed memfd の page が swap 0 の mission cgroup に課金されること、FSIZE の worker / fork 後 child / launcher copy 後の値を検証する。
+50. artifact size + headroom が `memory.max` を超える場合に cgroup 作成前の `artifact_exceeds_memory_max` になること、sealed memfd の page が swap 0 の mission cgroup に課金されること、FSIZE の値を検証する: worker は soft 8 MiB / hard = artifact の大きさで起動し、launcher を fork した直後 (HELLO より前) に自分の hard を 8 MiB へ下げる (特権の無い process は hard を上げられないので子側で上げる形は取れない。未起動の経路は mission の終わりに下げ、下げた値は report の `worker_fsize` に残す)。launcher は copy 前だけ soft を hard へ上げ、copy 後に (8 MiB, 8 MiB) に固定する。
 51. `StdinRouter` の go / deadline / EOF の順序、deadline / EOF 後の繰返し `read_rpc()`、未起動 `close()` の BEFORE_HANDOFF 系列と deadline、worker exit code と `isolation_close_failed`、proxy 停止一回を検証する。
 52. 実 CLI selftest (`-m realbackend`) は backend ごとに claude=`haiku`、codex=`gpt-5.6-luna`、opencode=local の既定 model を使い、mission 上限を 600 秒（unit の `RuntimeMaxSec=900` の内側）とする。`cli_runner` の detail は stderr の末尾 3 行とする。
 
@@ -639,7 +639,7 @@ canary と自己試験は判定を求めた呼出しの settings（backend）で
 | proxy tunnel | claude 最大 8、codex 4、opencode 2 |
 | handoff | p50 0.056 ms、p99 0.21 ms、最大 17 ms |
 | cgroup cleanup | `cgroup.kill` から `populated 0` は 23〜33 ms、pids 到達時 5〜26 ms |
-| artifact memory headroom | `ARTIFACT_MEMORY_HEADROOM=64 MiB`。launcher copy 中の cgroup peak（shmem を除く）の実測値の 2 倍以上として固定し、artifact size との和で `memory.max` を事前検査する |
+| artifact memory headroom | `ARTIFACT_MEMORY_HEADROOM=16 MiB`。launcher copy 中の cgroup peak（shmem を除く）の実測最大 7237632 B (2026-10-11、python ELF + 160 MiB、tmpfs 上、3 回) の 2 倍を切り上げた値。artifact size との和で `memory.max` を事前検査し、境界ちょうどで OOM しないことを結合試験で確認する。disk 上の冷えた artifact の file page は未実測 (reclaimable) |
 | sealed memfd | 実 CLI の `/proc/self/exe` は `/memfd:afx-cli (deleted)`。起動と MCP 接続までを claude / codex / opencode の 3 種で実測し、mission 中の memfd 分は順に約 257 MiB / 294 MiB / 185 MiB が cgroup に乗る |
 | listener close | stop から CLOSED は 0.13 ms |
 | systemd stop | finite 2 秒 service が stop 開始から 2.18 秒で main・子・孫を SIGKILL |
