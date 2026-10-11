@@ -75,7 +75,7 @@
 | [reference-symbols-as-indicator-inputs](open/reference-symbols-as-indicator-inputs.md) | 中 | 2026-10-08 | 戦略 plugin に株価指数など参照 symbol の値を指標として渡す |
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
-| [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | repo root から full suite を回すと実 data/ を掴んで固まる |
+| [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
