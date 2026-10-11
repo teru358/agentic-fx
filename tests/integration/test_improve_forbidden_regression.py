@@ -166,7 +166,7 @@ _PROBE_SCRIPT = textwrap.dedent("""
     except Exception as e:
         results["list_data_dir"] = f"UNEXPECTED: {type(e).__name__}: {e}"
 
-    # ④ 書き込み可能パスが staging・workdir・/dev に閉じる
+    # ④ 書き込み可能パスが staging・workdir と /dev/null に閉じる
     for target, label in [
             (Path(sys.argv[4]) / "reports" / "x.md", "reports"),
             (Path(sys.argv[4]) / "config" / "x.yaml", "config"),
@@ -185,6 +185,29 @@ _PROBE_SCRIPT = textwrap.dedent("""
         results["write_staging"] = "ok"
     except Exception as e:
         results["write_staging"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
+
+    # /dev は /dev/null だけ書ける。/dev/shm への file 作成と他 device は拒否
+    try:
+        _fd = os.open("/dev/null", os.O_WRONLY)
+        os.write(_fd, b"x")
+        os.close(_fd)
+        results["write_dev_null"] = "ok"
+    except Exception as e:
+        results["write_dev_null"] = f"UNEXPECTED_FAILURE: {type(e).__name__}: {e}"
+    for target, label in [
+            (f"/dev/shm/afx-forbidden-probe-{os.getpid()}", "dev_shm"),
+            ("/dev/full", "dev_full")]:
+        try:
+            _fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                          if label == "dev_shm" else os.O_WRONLY, 0o600)
+            os.close(_fd)
+            if label == "dev_shm":
+                os.unlink(target)
+            results[f"write_{label}"] = "UNEXPECTED_SUCCESS"
+        except PermissionError:
+            results[f"write_{label}"] = "blocked"
+        except Exception as e:
+            results[f"write_{label}"] = f"UNEXPECTED: {type(e).__name__}: {e}"
 
     # staging_dir は workdir と同じく書き込み可能のはずだが、念のため確認
     # write_staging で確認する
@@ -250,6 +273,9 @@ def test_improve_worker_write_boundary_and_forbidden_tools(tmp_path):
     assert out["write_policy"] == "blocked"
     assert out["write_plugins_body"] == "blocked"
     assert out["write_staging"] == "ok"
+    assert out["write_dev_null"] == "ok"
+    assert out["write_dev_shm"] == "blocked"
+    assert out["write_dev_full"] == "blocked"
     assert out["forbidden_tools_present"] == "none"
 
 

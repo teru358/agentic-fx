@@ -1098,7 +1098,10 @@ def test_existing_restrict_to_api_is_unchanged():
     import inspect
     sig = inspect.signature(L.restrict_to)
     assert list(sig.parameters) == ["read_only_paths", "read_write_paths",
-                                    "execute_paths", "execute_file_paths"]
+                                    "execute_paths", "execute_file_paths",
+                                    "device_rules"]
+    # 既定は従来の handled のまま (改善 worker だけが明示して切り替える)
+    assert sig.parameters["device_rules"].default is False
     assert L._HANDLED_ACCESS_FS == V1_FS | (1 << 14)
     assert dataclasses.is_dataclass(L.RulesetPlan)
 

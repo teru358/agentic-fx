@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import sysconfig
 import textwrap
 import uuid
 from pathlib import Path
@@ -237,21 +238,31 @@ def test_bootstrap_improve_profile_grants_execute_on_venv(improve_worker_layout)
     assert "SHOULD_NOT_REACH" not in result.stdout
 
 
-def test_bootstrap_improve_profile_dev_is_read_write(improve_worker_layout):
-    """`/dev` が read_write に上がっている — `subprocess.DEVNULL` 相当の
-    `/dev/null` 書込オープンが通る (probe §5-③)。"""
+def test_bootstrap_improve_profile_allows_only_listed_dev_files(improve_worker_layout):
+    """`/dev` は個別 file 規則だけ — `subprocess.DEVNULL` 相当の `/dev/null`
+    書込オープンは通り、表に無い `/dev/tty` と `/dev/shm` は EACCES。"""
     l = improve_worker_layout
     script = """
-    import os
+    import errno, os
     fd = os.open("/dev/null", os.O_WRONLY)
     os.close(fd)
     print("DEVNULL_WRITABLE")
+    def probe(label, fn):
+        try:
+            fn()
+            print(label + "=ok")
+        except OSError as e:
+            print(label + "=" + errno.errorcode.get(e.errno, str(e.errno)))
+    probe("TTY", lambda: os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)))
+    probe("SHM", lambda: os.listdir("/dev/shm"))
     """
     result = _run_bootstrap_probe(
         script, staging_dir=l["staging_dir"], mission_id=l["mission_id"],
         source_snapshot_dir=l["source_snapshot_dir"], workdir=l["workdir"])
     assert result.returncode == 0, result.stderr
     assert "DEVNULL_WRITABLE" in result.stdout
+    assert "TTY=EACCES" in result.stdout, result.stdout
+    assert "SHM=EACCES" in result.stdout, result.stdout
 
 
 def test_bootstrap_improve_profile_staging_dir_is_writable(improve_worker_layout):
@@ -769,7 +780,12 @@ def _resolve_codex_native_bin() -> str:
 def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
                                read_only_paths: list[Path],
                                read_write_paths: list[Path] = (),
-                               env: dict[str, str] | None = None
+                               execute_file_paths: list[Path] = (),
+                               env: dict[str, str] | None = None,
+                               device_rules: bool = False,
+                               argv_tail: list[str] | None = None,
+                               stdin=None, as_mb: int = 4096,
+                               timeout: float = 15,
                                ) -> subprocess.CompletedProcess:
     """`<bin_path> --version` を、指定した exec closure だけを許可した
     Landlock 下の子プロセスで実行する。rlimit は probe 実測の本番相当形
@@ -779,22 +795,42 @@ def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
     無関係な理由で red になる (advisor 指摘)。呼び出し側は claude を
     測るときは必ず scratch `HOME`/`CLAUDE_CONFIG_DIR` を `env=` で渡し、
     その scratch dir を `read_write_paths`(または `read_only_paths`)に
-    含めること。"""
+    含めること。`device_rules=True` は改善 worker と同じ `/dev` の個別
+    file 規則 (と IOCTL_DEV) を掛ける。"""
+    device_kw = ", device_rules=True" if device_rules else ""
+    # 本番の worker は Landlock を掛けた後に `/dev/null` を開いて CLI の stdin
+    # に渡す。IOCTL_DEV は open した時点の domain で決まるので、ここでも掛けた
+    # 後に開き直し、その fd への TCGETS の結果を出力に残す。
+    reopen_stdin = textwrap.indent(textwrap.dedent("""
+        import errno, fcntl
+        _fd = os.open("/dev/null", os.O_RDONLY)
+        os.dup2(_fd, 0)
+        os.close(_fd)
+        try:
+            fcntl.ioctl(0, 0x5401, bytes(64))
+            print("STDIN_TCGETS=ok", flush=True)
+        except OSError as e:
+            print("STDIN_TCGETS=" + errno.errorcode.get(e.errno, str(e.errno)),
+                  flush=True)
+    """), " " * 8) if device_rules else ""
     script = textwrap.dedent(f"""
         import resource, sys
         sys.path.insert(0, {str(_REPO_ROOT / "src")!r})
         from pathlib import Path
         from agentic_fx.core import landlock
-        resource.setrlimit(resource.RLIMIT_AS, (4096*1024*1024,)*2)
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_AS, ({as_mb}*1024*1024,)*2)
         resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
         resource.setrlimit(resource.RLIMIT_FSIZE, (8*1024*1024,)*2)
         landlock.restrict_to(
             read_only_paths=[Path(p) for p in {[str(p) for p in read_only_paths]!r}],
             read_write_paths=[Path(p) for p in {[str(p) for p in read_write_paths]!r}],
-            execute_paths=[Path(p) for p in {[str(p) for p in execute_paths]!r}])
+            execute_paths=[Path(p) for p in {[str(p) for p in execute_paths]!r}],
+            execute_file_paths=[Path(p) for p in {[str(p) for p in execute_file_paths]!r}]{device_kw})
         import os
+{reopen_stdin}
         try:
-            os.execv({bin_path!r}, [{bin_path!r}, "--version"])
+            os.execv({bin_path!r}, [{bin_path!r}, *{argv_tail if argv_tail is not None else ["--version"]!r}])
         except PermissionError as e:
             print(f"EXEC_PERMISSION_ERROR errno={{e.errno}}")
             raise SystemExit(0)
@@ -802,7 +838,55 @@ def _run_version_under_closure(bin_path: str, *, execute_paths: list[Path],
     run_env = {"PATH": "/usr/bin:/bin"}
     run_env.update(env or {})
     return subprocess.run([sys.executable, "-c", script], env=run_env,
-                          capture_output=True, text=True, timeout=15)
+                          stdin=stdin, capture_output=True, text=True,
+                          timeout=timeout)
+
+
+def test_individual_dev_rules_allow_only_listed_devices_in_exec_closure():
+    """改善 worker と同じ device 規則を exec 後の Python 子で観測する。"""
+    probe = """
+import errno
+import os
+
+def check(name, path, flags):
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        result = errno.errorcode.get(exc.errno, str(exc.errno))
+    else:
+        os.close(fd)
+        result = "ok"
+    print(name + "=" + result, flush=True)
+
+for name, path in (("tty", "/dev/tty"), ("ptmx", "/dev/ptmx"),
+                   ("shm", "/dev/shm")):
+    check(name, path, os.O_RDONLY | os.O_NONBLOCK)
+for name in ("null", "urandom", "random", "zero"):
+    check(name, "/dev/" + name, os.O_RDONLY)
+check("stdout", "/dev/stdout", os.O_WRONLY)
+check("stderr", "/dev/stderr", os.O_WRONLY)
+"""
+    from agentic_fx.core import landlock
+
+    result = _run_version_under_closure(
+        sys.executable,
+        execute_paths=[Path(sys.executable).parent,
+                       Path(sys.executable).resolve().parent,
+                       Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
+                       Path(sysconfig.get_paths()["stdlib"]).resolve()],
+        execute_file_paths=landlock.interpreter_files_for([Path(sys.executable)]),
+        read_only_paths=[Path("/etc"), Path("/proc"), Path("/usr/lib")],
+        device_rules=True,
+        argv_tail=["-c", probe])
+    assert "EXEC_PERMISSION_ERROR" not in result.stdout
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = dict(line.split("=", 1) for line in result.stdout.splitlines())
+    assert {name: observed[name] for name in ("tty", "ptmx", "shm")} == {
+        "tty": "EACCES", "ptmx": "EACCES", "shm": "EACCES"}
+    assert {name: observed[name] for name in ("null", "urandom", "random", "zero")} == {
+        "null": "ok", "urandom": "ok", "random": "ok", "zero": "ok"}
+    assert {name: observed[name] for name in ("stdout", "stderr")} == {
+        "stdout": "ok", "stderr": "ok"}
 
 
 def test_drop_codex_bin_parent_denies_exec():
@@ -871,20 +955,17 @@ def test_usr_lib_and_bin_parent_together_allow_claude_exec(tmp_path):
     時の実測で確認できれば、`read_write_paths=[scratch]` は
     `read_only_paths` へ落としてよい — 実装者が実測して確定すること。
 
-    **(実装時の実測で追加、逸脱として申告)** `/dev` が allowlist に無いと
-    `claude --version` は `/dev/urandom` の open で `EACCES` になり、Bun
-    ランタイムが `SIGABRT` で panic する (`strace` で実測確認 —
-    `openat(AT_FDCWD, "/dev/urandom", O_RDONLY) = -1 EACCES`)。プラン記載の
-    コードブロックには `Path("/dev")` が無かった — 5-D の
-    `_bootstrap_improve_profile` が `/dev` を常に `read_write_paths` に
-    含めているのと同じ扱いをここでも行う。"""
+    `/dev/urandom` が開けないと `claude --version` は Bun ランタイムが
+    `SIGABRT` で panic する (`openat(AT_FDCWD, "/dev/urandom", O_RDONLY)
+    = -1 EACCES`)。`_bootstrap_improve_profile` と同じ `/dev` の個別 file
+    規則 (`device_rules=True`) をここでも掛ける。"""
     claude_bin = _skip_unless_cli_installed("claude")
     parent = Path(claude_bin).resolve().parent
     env, scratch = _claude_scratch_env(tmp_path)
     result = _run_version_under_closure(
         claude_bin, execute_paths=[parent, Path("/usr/lib"), Path("/usr/lib64")],
         read_only_paths=[Path("/etc"), Path("/proc")],
-        read_write_paths=[scratch, Path("/dev")], env=env)
+        read_write_paths=[scratch], env=env, device_rules=True)
     assert "EXEC_PERMISSION_ERROR" not in result.stdout
     assert result.returncode == 0, result.stderr
 

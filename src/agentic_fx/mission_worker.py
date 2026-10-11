@@ -343,11 +343,13 @@ def _bootstrap_improve_profile(
         + execute_dirs + execute_files,
         guarded_data_dir=_guarded_data_dir())
     try:
+        # `/dev` は directory で許さず、landlock 側の固定表の file 規則だけ
+        # (ABI 8 未満はここで起動拒否)
         landlock.restrict_to(
             read_only_paths=read_only,
-            read_write_paths=[workdir, staging_path, Path("/dev")]
-            + extra_rw_paths,
-            execute_paths=execute_dirs, execute_file_paths=execute_files)
+            read_write_paths=[workdir, staging_path] + extra_rw_paths,
+            execute_paths=execute_dirs, execute_file_paths=execute_files,
+            device_rules=True)
     except landlock.LandlockUnavailable as e:
         raise RuntimeError(
             f"Landlock restriction failed (syscall error): {e} "

@@ -216,7 +216,36 @@ def test_worker_cannot_list_the_logs_directory(tmp_path):
     assert "FAIL" not in result.stdout
 
 
-# --- 不変条件 2: 書込可能パスは staging/workdir/dev のみ --------------------
+# --- 不変条件 2: 書込可能パスは staging/workdir と /dev/null のみ -----------
+
+def test_invariant2_dev_is_writable_only_at_dev_null(tmp_path):
+    """`/dev` で書けるのは `/dev/null` だけ。`/dev/shm` への file 作成、
+    `/dev/full` の書込み open、`/dev` 自体の列挙は EACCES。"""
+    layout = _mk_repo_layout(tmp_path)
+    script = """
+    import os
+    fd = os.open('/dev/null', os.O_WRONLY); os.write(fd, b'x'); os.close(fd)
+    print('OK: /dev/null writable')
+    def _shm_create():
+        name = '/dev/shm/afx-boundary-probe-%d' % os.getpid()
+        fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        os.unlink(name)
+    _expect_eacces(_shm_create, '/dev/shm create EACCES', 'created a file in /dev/shm')
+    _expect_eacces(lambda: os.close(os.open('/dev/full', os.O_WRONLY)),
+                  '/dev/full EACCES', 'opened /dev/full for write')
+    _expect_eacces(lambda: os.listdir('/dev'), '/dev listdir EACCES', 'listed /dev')
+    """
+    result = _run_probe(script, staging_dir=layout["my_staging"],
+                        mission_id="m-001", source_snapshot_dir=layout["source_snapshot"],
+                        workdir=layout["workdir"])
+    assert result.returncode == 0, result.stderr
+    assert "OK: /dev/null writable" in result.stdout
+    assert "OK: /dev/shm create EACCES" in result.stdout
+    assert "OK: /dev/full EACCES" in result.stdout
+    assert "OK: /dev listdir EACCES" in result.stdout
+    assert "FAIL" not in result.stdout
+
 
 def test_invariant2_cannot_listdir_plugins_root(tmp_path):
     """`plugins/` 自体は worker から不可視 — 最強の単一 assertion

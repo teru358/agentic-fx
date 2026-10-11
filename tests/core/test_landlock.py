@@ -324,10 +324,10 @@ def test_execute_access_mask_is_self_sufficient(monkeypatch, tmp_path):
 
 
 def test_read_write_access_still_excludes_make_char_and_make_sym(monkeypatch, tmp_path):
-    """§2.2 の `/dev` rw 脅威分析はこの不在だけに乗っている
-    (`_READ_WRITE_ACCESS` に `MAKE_CHAR`/`MAKE_SYM` が無いことでデバイス
-    ノード・symlink の新規作成ができない)。5-D で `/dev` を read_write に
-    昇格させる前に、この不在を直接 pin しておく — `_ACCESS_FS_MAKE_CHAR`/
+    """rw 領域 (workdir・staging、gate pytest worker の `/dev`) にデバイス
+    ノード・symlink を新規作成できないのは `_READ_WRITE_ACCESS` に
+    `MAKE_CHAR`/`MAKE_SYM` が無いことだけに乗っている。この不在を
+    直接 pin しておく — `_ACCESS_FS_MAKE_CHAR`/
     `_ACCESS_FS_MAKE_SYM` を足す変異は既存の等価性 assert
     (`test_create_ruleset_is_handed_the_truncate_bit`) でも検出できるが、
     その等価性 assert 自体が定数と一緒に動く変異 (定数側に足す) では
@@ -739,3 +739,130 @@ def test_assert_allowlist_excludes_data_dir_rejects_relative_path_to_data_dir(
     with pytest.raises(RuntimeError, match="history data"):
         _assert_allowlist_excludes_data_dir(
             [Path("../data")], guarded_data_dir=data_dir)
+
+
+# --- 改善 worker の `/dev` 個別 file 規則 (`device_rules=True`) -------------
+
+def test_restrict_to_default_hands_the_plugin_handled_mask(monkeypatch, tmp_path):
+    """`device_rules` を指定しない呼び出し (gate pytest worker 等) は従来の
+    handled のまま — IOCTL_DEV を含めない (ABI 3〜4 の kernel でも動く)。"""
+    libc = _ScriptedLibc(syscall_results=[3, 4242, 0, 0])
+    _install(monkeypatch, libc)
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[], read_write_paths=[rw])
+    assert libc.syscall_args[1][1].handled_access_fs == 0x5FFF
+    assert libc.syscall_numbers == [444, 444, 445, 446]
+
+
+def test_restrict_to_device_rules_hands_ioctl_dev_and_file_rules(monkeypatch, tmp_path):
+    """`device_rules=True` は handled に IOCTL_DEV を足し、§5 の 4 file だけに
+    file 規則を張る。どの規則にも IOCTL_DEV と directory 専用 bit を入れない。"""
+    import agentic_fx.core.landlock as landlock_mod
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    ro = tmp_path / "ro"; ro.mkdir()
+    rw = tmp_path / "rw"; rw.mkdir()
+    restrict_to(read_only_paths=[ro], read_write_paths=[rw], device_rules=True)
+
+    assert libc.syscall_numbers == [444, 444, 445, 445, 445, 445, 445, 445, 446]
+    handled = libc.syscall_args[1][1].handled_access_fs
+    assert handled == 0x5FFF | (1 << 15)
+    device_attrs = [libc.syscall_args[i][3] for i in range(4, 8)]
+    assert [a.allowed_access for a in device_attrs] == [
+        (1 << 2) | (1 << 1) | (1 << 14),   # /dev/null
+        1 << 2, 1 << 2, 1 << 2]            # urandom, random, zero
+    for attr in device_attrs:
+        assert attr.allowed_access & ~handled == 0
+        assert not attr.allowed_access & landlock_mod._ACCESS_FS_IOCTL_DEV
+        assert not attr.allowed_access & landlock_mod._ACCESS_FS_READ_DIR
+    # 呼び出し側の rw 規則は従来どおり (IOCTL_DEV を与えない)
+    assert libc.syscall_args[3][3].allowed_access == landlock_mod._READ_WRITE_ACCESS
+
+
+def test_restrict_to_device_rules_refuses_abi_below_8(monkeypatch, tmp_path):
+    """改善 worker は ABI 8 未満で起動拒否する。`/dev` rw へ戻す fallback は
+    無く、ruleset も作らない。"""
+    for abi in (3, 5, 7):
+        libc = _ScriptedLibc(syscall_results=[abi])
+        _install(monkeypatch, libc)
+        with pytest.raises(LandlockUnavailable, match="landlock_abi_too_old"):
+            restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                        device_rules=True)
+        assert libc.syscall_numbers == [444]
+
+
+def test_restrict_to_device_rules_fails_closed_on_non_character_device(
+        monkeypatch, tmp_path):
+    """表の file が character device でなければ ruleset を作る前に拒否する。"""
+    import agentic_fx.core.landlock as landlock_mod
+    fake = tmp_path / "not-a-device"; fake.write_text("x")
+    monkeypatch.setattr(landlock_mod, "_DEVICE_FILE_RULES",
+                        ((fake, landlock_mod._ACCESS_FS_READ_FILE),))
+    libc = _ScriptedLibc(syscall_results=[8])
+    _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable, match="character device"):
+        restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                    device_rules=True)
+    assert libc.syscall_numbers == [444]
+
+
+def _open_fds() -> set[str]:
+    return set(os.listdir("/proc/self/fd"))
+
+
+def test_restrict_to_device_rules_fails_closed_when_device_rule_is_refused(
+        monkeypatch, tmp_path):
+    """kernel が device の file 規則を拒否したら、その規則を欠いた domain で
+    restrict_self に進まず `LandlockUnavailable` で止まる。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, -1])
+    _install(monkeypatch, libc)
+    with pytest.raises(LandlockUnavailable,
+                       match="landlock_add_rule failed for /dev/null"):
+        restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                    device_rules=True)
+    assert libc.syscall_numbers == [444, 444, 445, 445]
+    assert libc.prctl_args == []
+
+
+def test_restrict_to_device_rules_closes_device_fds_on_success(
+        monkeypatch, tmp_path):
+    """成功経路でも、規則を張るために開いた device の fd を全部閉じる
+    (worker と CLI に余計な fd を残さない)。"""
+    libc = _ScriptedLibc(syscall_results=[8, 4242, 0, 0, 0, 0, 0, 0])
+    _install(monkeypatch, libc)
+    before = _open_fds()
+    restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                device_rules=True)
+    assert _open_fds() == before
+
+
+def test_restrict_to_device_rules_closes_device_fds_when_ruleset_fails(
+        monkeypatch, tmp_path):
+    """ruleset を作れなかったときも、先に開いた device の fd を閉じる。"""
+    libc = _ScriptedLibc(syscall_results=[8, -1])
+    _install(monkeypatch, libc)
+    before = _open_fds()
+    with pytest.raises(LandlockUnavailable, match="landlock_create_ruleset"):
+        restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                    device_rules=True)
+    assert _open_fds() == before
+
+
+def test_restrict_to_device_rules_closes_earlier_fds_when_a_later_device_fails(
+        monkeypatch, tmp_path):
+    """表の途中の file が character device でなかったとき、それより前に
+    開いた device の fd を閉じてから止まる。"""
+    import agentic_fx.core.landlock as landlock_mod
+    fake = tmp_path / "not-a-device"; fake.write_text("x")
+    monkeypatch.setattr(landlock_mod, "_DEVICE_FILE_RULES", (
+        (Path("/dev/null"), landlock_mod._ACCESS_FS_READ_FILE),
+        (Path("/dev/zero"), landlock_mod._ACCESS_FS_READ_FILE),
+        (fake, landlock_mod._ACCESS_FS_READ_FILE)))
+    libc = _ScriptedLibc(syscall_results=[8])
+    _install(monkeypatch, libc)
+    before = _open_fds()
+    with pytest.raises(LandlockUnavailable, match="character device"):
+        restrict_to(read_only_paths=[], read_write_paths=[tmp_path],
+                    device_rules=True)
+    assert _open_fds() == before
+    assert libc.syscall_numbers == [444]

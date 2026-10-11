@@ -82,25 +82,14 @@ _HANDLED_ACCESS_FS = _ABI_V1_HANDLED_ACCESS_FS | _ACCESS_FS_TRUNCATE
 # - `_ACCESS_FS_REFER` (v2): handled に**含めない方が fail closed**。Landlock
 #   の仕様上、REFER を handled にしない場合は**ディレクトリ間の link/rename が
 #   一律拒否**される。含めて許可を与えると逆に穴になる。
-# - `_ACCESS_FS_IOCTL_DEV` (v5): デバイスファイルへの ioctl を制御する。本
-#   モジュールの allowlist にデバイスノードを含むディレクトリを渡す想定が無く
-#   (渡せばそれ自体が設計誤り)、デバイスファイルの open 自体が allowlist 外で
-#   拒否されるため、handled にしなくても `data/` 到達には寄与しない。
-#   **Task 18 で `/dev` を含むパスを allowlist に入れる場合はここを見直すこと。**
-#   → **見直し済み (プラン8 Task 18, 2026-08-09。レビュー 2 周目
-#   `/code-review` が「この申し送りが未処理のまま `/dev` が入った」と指摘した
-#   ことによる)**: improve profile は `/dev/urandom` のために `/dev` を
-#   ディレクトリ単位で read-only 許可する (単一ファイル指定は `restrict_to` が
-#   `O_PATH | O_DIRECTORY` で open するため不可 — ユーザー裁定でスコープ外)。
-#   したがって**デバイスファイルの read open は成立し、その ioctl は ruleset の
-#   外に残る**。`_ACCESS_FS_IOCTL_DEV` は ABI v5 の定義なので、handled に加える
-#   なら `_REQUIRED_ABI` を 3 → 5 に上げることになり、v3/v4 カーネルで improve
-#   profile が一律起動拒否になる (要求水準そのものの変更)。
-#   **判断: 現状維持。** 根拠 — ①`/dev` 許可は `data/` 到達に寄与しない
-#   (§4.6 の意味論は保たれる) ②`WorkerRunner` は `start_new_session=True` で
-#   子を起動するため制御端末を持たず `/dev/tty` は `ENXIO` で開けない (実測)
-#   ③具体的な escape 経路は特定されていない。
-#   **プラン 9 で improve に実ツールセットを入れる前に再評価すること。**
+# - `_ACCESS_FS_IOCTL_DEV` (v5): デバイスファイルへの ioctl を制御する。
+#   `_HANDLED_ACCESS_FS` (plugin worker と gate pytest worker が使う) には
+#   含めない — plugin worker は ABI 3 から動く必要があり、v5 の bit を足すと
+#   ABI 3〜4 の kernel で ruleset を作れなくなる。改善 worker の outer
+#   ruleset は別の mask `_IMPROVE_HANDLED_ACCESS_FS` で IOCTL_DEV を handled
+#   にし、どの device file にも与えない (下の `_DEVICE_FILE_RULES` 参照)。
+#   gate pytest worker は今も `/dev` を directory 単位の rw で許すため、
+#   そこでは device の open と ioctl が ruleset の外に残る。
 
 # 本モジュールが要求する最低 ABI。`TRUNCATE` (v3) を強制できない ABI 1/2 では
 # 完全性を守れないため、improve profile を通してはならない (設計書 §4.6
@@ -145,6 +134,43 @@ _EXECUTE_ACCESS = (
 # 意図的 — 「ディレクトリ単位の EXECUTE」と「ファイル単位の EXECUTE」という
 # セキュリティ上の差異を型 (mask) に残す。
 _EXECUTE_FILE_ACCESS = _ACCESS_FS_EXECUTE | _ACCESS_FS_READ_FILE
+
+# 改善 worker の outer ruleset の handled。plugin 用の mask に IOCTL_DEV を
+# 足す。IOCTL_DEV はどの規則にも与えないので、device への ioctl は Landlock が
+# 常に許す汎用 request (FIOCLEX 等) を除き EACCES になる。
+_IMPROVE_HANDLED_ACCESS_FS = _HANDLED_ACCESS_FS | _ACCESS_FS_IOCTL_DEV
+
+# 改善 worker が要求する最低 ABI。CLI 部分木の隔離 (scope・TSYNC 等) と揃えて
+# 全 backend で 8 とし、低い kernel では起動を拒否する (`/dev` を directory
+# 単位で許す形へ戻す fallback は作らない)。
+IMPROVE_MIN_ABI = 8
+
+# 改善 worker で開いてよい device file と、その file 規則の access。`/dev` を
+# directory 単位で許すと `/dev/tty`・`/dev/ptmx`・`/dev/shm` (POSIX shm)・
+# `/dev/mqueue` などの IPC 経路や他 device に届くため、必要な 4 file だけに
+# 絞る。`/dev/null` は stdin / stdout の差し替えと `O_TRUNC` 付き open に、
+# 乱数・zero は runtime (Bun 等) の初期化に要る。`/dev/fd/N` が指す pipe は
+# pipefs にあり Landlock の対象外なので規則を要しない。
+# file 規則に directory 専用の bit (READ_DIR・MAKE_*・REMOVE_*・REFER) を
+# 入れると kernel が EINVAL を返すので入れない。IOCTL_DEV も与えない。
+# 呼び出し側から表を差し替える経路は設けない (`restrict_to` は
+# `device_rules=True` で常にこの表を使う)。
+_DEVICE_FILE_RULES: tuple[tuple[Path, int], ...] = (
+    (Path("/dev/null"),
+     _ACCESS_FS_READ_FILE | _ACCESS_FS_WRITE_FILE | _ACCESS_FS_TRUNCATE),
+    (Path("/dev/urandom"), _ACCESS_FS_READ_FILE),
+    (Path("/dev/random"), _ACCESS_FS_READ_FILE),
+    (Path("/dev/zero"), _ACCESS_FS_READ_FILE),
+)
+
+# file 規則に与えてよい bit。これ以外が表に入っていたら import 時に落とす。
+_DEVICE_FILE_ALLOWED_BITS = (
+    _ACCESS_FS_READ_FILE | _ACCESS_FS_WRITE_FILE | _ACCESS_FS_TRUNCATE)
+for _dev_path, _dev_access in _DEVICE_FILE_RULES:
+    if _dev_access & ~_DEVICE_FILE_ALLOWED_BITS:
+        raise AssertionError(
+            f"device file rule for {_dev_path} carries a non-file bit")
+del _dev_path, _dev_access
 
 _PR_SET_NO_NEW_PRIVS = 38
 
@@ -246,10 +272,34 @@ def interpreter_files_for(exec_targets: Sequence[Path]) -> list[Path]:
     return out
 
 
+def _open_character_device(path: Path) -> int:
+    """`path` を `O_PATH|O_NOFOLLOW` で開き、character device なら fd を返す。
+
+    symlink は symlink 自身の fd になるので落ちる。regular file・directory・
+    存在しない path も `LandlockUnavailable` で fail closed。"""
+    try:
+        fd = os.open(str(path), os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise LandlockUnavailable(
+            f"device file rule: cannot open {path}: {exc}") from None
+    try:
+        is_character_device = _stat.S_ISCHR(os.fstat(fd).st_mode)
+    except OSError as exc:
+        os.close(fd)
+        raise LandlockUnavailable(
+            f"device file rule: cannot stat {path}: {exc}") from None
+    if not is_character_device:
+        os.close(fd)
+        raise LandlockUnavailable(
+            f"device file rule: {path} is not a character device")
+    return fd
+
+
 def restrict_to(*, read_only_paths: list[Path],
                 read_write_paths: list[Path],
                 execute_paths: Sequence[Path] = (),
-                execute_file_paths: Sequence[Path] = ()) -> None:
+                execute_file_paths: Sequence[Path] = (),
+                device_rules: bool = False) -> None:
     """呼び出しプロセスを Landlock で FS allowlist に制限する
     (**不可逆 — プロセス生涯にわたって有効**、以後の子プロセスにも継承
     される)。利用不能なら `LandlockUnavailable`。
@@ -265,21 +315,50 @@ def restrict_to(*, read_only_paths: list[Path],
     5-C 改訂, 2026-08-22, 裁定 A — カーネルはディレクトリ fd +
     EXECUTE|READ_FILE を黙って受理してしまうため、呼び出し側のミスを
     ここで fail closed にする)。
+
+    device_rules=True は改善 worker の outer ruleset の形にする: ABI
+    `IMPROVE_MIN_ABI` 以上を要求し (未満は `landlock_abi_too_old` で拒否)、
+    handled に IOCTL_DEV を足し、`_DEVICE_FILE_RULES` の file 規則を
+    character device を確かめてから張る。`/dev` の directory 規則は呼び出し
+    側が渡さない前提で、ここでは足さない。
     """
-    if not is_available():
-        raise LandlockUnavailable(
-            "Landlock is not available (non-x86_64, or kernel ABI < "
-            f"{_REQUIRED_ABI})")
+    if device_rules:
+        abi = landlock_abi()
+        if abi < IMPROVE_MIN_ABI:
+            raise LandlockUnavailable(
+                f"landlock_abi_too_old: kernel ABI {abi} < {IMPROVE_MIN_ABI} "
+                "required by the improve worker profile")
+        handled = _IMPROVE_HANDLED_ACCESS_FS
+    else:
+        if not is_available():
+            raise LandlockUnavailable(
+                "Landlock is not available (non-x86_64, or kernel ABI < "
+                f"{_REQUIRED_ABI})")
+        handled = _HANDLED_ACCESS_FS
+
+    # ruleset を作る前に全 device file を検査済み fd で開いておく
+    device_fds: list[tuple[Path, int, int]] = []
+    try:
+        if device_rules:
+            for dev_path, dev_access in _DEVICE_FILE_RULES:
+                device_fds.append(
+                    (dev_path, _open_character_device(dev_path), dev_access))
+    except BaseException:
+        for _p, fd, _a in device_fds:
+            os.close(fd)
+        raise
 
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
 
-    ruleset_attr = _RulesetAttr(handled_access_fs=_HANDLED_ACCESS_FS)
+    ruleset_attr = _RulesetAttr(handled_access_fs=handled)
     ruleset_fd = libc.syscall(
         ctypes.c_long(_SYS_LANDLOCK_CREATE_RULESET), ctypes.byref(ruleset_attr),
         ctypes.c_size_t(ctypes.sizeof(ruleset_attr)), ctypes.c_uint32(0))
     if ruleset_fd < 0:
         errno = ctypes.get_errno()
+        for _p, fd, _a in device_fds:
+            os.close(fd)
         raise LandlockUnavailable(
             f"landlock_create_ruleset failed: {os.strerror(errno)}")
 
@@ -313,6 +392,19 @@ def restrict_to(*, read_only_paths: list[Path],
             finally:
                 os.close(parent_fd)
 
+        for dev_path, dev_fd, dev_access in device_fds:
+            rule_attr = _PathBeneathAttr(allowed_access=dev_access,
+                                         parent_fd=dev_fd)
+            rc = libc.syscall(
+                ctypes.c_long(_SYS_LANDLOCK_ADD_RULE), ctypes.c_int(ruleset_fd),
+                ctypes.c_int(_LANDLOCK_RULE_PATH_BENEATH),
+                ctypes.byref(rule_attr), ctypes.c_uint32(0))
+            if rc != 0:
+                errno = ctypes.get_errno()
+                raise LandlockUnavailable(
+                    f"landlock_add_rule failed for {dev_path}: "
+                    f"{os.strerror(errno)}")
+
         if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
             errno = ctypes.get_errno()
             raise LandlockUnavailable(
@@ -325,6 +417,8 @@ def restrict_to(*, read_only_paths: list[Path],
             raise LandlockUnavailable(
                 f"landlock_restrict_self failed: {os.strerror(errno)}")
     finally:
+        for _p, fd, _a in device_fds:
+            os.close(fd)
         os.close(ruleset_fd)
 
 
