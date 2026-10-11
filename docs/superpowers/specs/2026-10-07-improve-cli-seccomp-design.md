@@ -1,8 +1,8 @@
-# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.7
+# [improve-cli-seccomp] 改善 mission の CLI 部分木の隔離 v1.8
 
-版: v1.7
+版: v1.8
 
-日付: 2026-10-10
+日付: 2026-10-11
 
 対象チケット: `sandbox-escape-via-user-daemons-unmeasured`
 
@@ -11,7 +11,7 @@
 ## 要点
 
 - 非信頼の CLI 部分木を、outer / nested Landlock、全 syscall 番号を分類する seccomp、mission cgroup、connect supervisor、CONNECT proxy、spool により隔離する。
-- `worker_proc` は WorkerRunner の direct child、`launcher_proc` は mission worker の direct child である。各 `Popen` を wait / reap するのは direct parent だけとする。
+- `worker_proc` は WorkerRunner の direct child、`launcher_proc` は mission worker の direct child である。各 `Popen` を wait / reap するのは direct parent だけとする。launcher は mission cgroup に JOINED した後で artifact を sealed memfd にコピーして exec する。
 - connect は seccomp user-notification で止め、worker の supervisor が検査済み socket の open file description を複製して代行する。外向き TCP は proxy と opencode 専用の `127.0.0.1:8080` に限る。
 - seccomp listener の handoff は、receiver へ所有権を移し、worker が参照を破棄した時点を handoff 完了とする。handoff 後に listener を close できるのは receiver thread だけである。
 - cleanup の全系列の正本は §4.2.3 とする。afx 本体が単一の absolute cleanup deadline を先に発行し、WorkerRunner は ACK に依存せず `worker_proc.wait()` で worker を reap する。
@@ -63,10 +63,10 @@ afx 本体 (unit の main PID、<unit>/supervisor/)
        └─ launcher_proc --> launcher --> CLI と全子孫
 ```
 
-1. afx 本体は unit delegation、topology、kernel 能力を admission で検査し、WorkerRunner が 128 bit 以上の mission nonce を worker に渡す。
-2. worker は cgroup を新設し、`pids.max`、`memory.max`、`memory.swap.max=0` を設定する。`cgroup.procs`、`cgroup.kill`、`cgroup.events` を CLOEXEC で保持する。
-3. worker は spool root、proxy listener、NETLINK_SOCK_DIAG socket を作り、`launcher_proc = Popen(...)` で launcher を起動する。worker は直後に自分の status 子端と backend execution artifact fd copy を閉じる。
-4. launcher は HELLO、JOINED、PREPARED、GO の protocol を完了して backend execution artifact を `execveat` する。codex の artifact は native ELF (`codex-rs`、static PIE musl) の fd とし、npm wrapper は実行 TCB に含めない。`CODEX_MANAGED_PACKAGE_ROOT` / `CODEX_MANAGED_BY_NPM` などの managed 環境変数は意図的に省略する契約とし、現行の正常系は未設定で完走する。PREPARED の listener fd を receiver に渡し、worker が参照を破棄した時点で handoff 完了となる。
+1. afx 本体は unit delegation、topology、kernel 能力を admission で検査する。WorkerRunner は cleanup protocol がある場合だけ 128 bit 以上の mission nonce を worker handshake に渡す（isolation は cleanup protocol を前提にするため、本番の isolation handshake には常に渡る）。
+2. worker は artifact size と定数の余裕の和が `memory.max` を超えないことを確認してから cgroup を新設し、`pids.max`、`memory.max`、`memory.swap.max=0` を設定する。`memory.high` は設定しない。`cgroup.procs`、`cgroup.kill`、`cgroup.events` を CLOEXEC で保持する。
+3. worker は spool root、proxy listener、NETLINK_SOCK_DIAG socket を作る。prepare は path fd の ELF と `(dev,ino,size,mtime)` を admission の値と照合するだけで、artifact 全量を読まない。`launcher_proc = Popen(...)` の直後、worker は status 子端と path artifact fd copy を閉じる。
+4. launcher は HELLO、JOINED、PREPARED、GO の protocol を完了する。JOINED 後に path artifact fd を sealed memfd へ全量コピーし、seal、SHA-256 の admission digest 照合、memfd の ELF 再検査、rlimit 固定を順に済ませ、memfd を `execveat` する。codex の artifact は native ELF (`codex-rs`、static PIE musl) とし、npm wrapper は実行 TCB に含めない。`CODEX_MANAGED_PACKAGE_ROOT` / `CODEX_MANAGED_BY_NPM` などの managed 環境変数は意図的に省略する契約とし、現行の正常系は未設定で完走する。PREPARED の listener fd を receiver に渡し、worker が参照を破棄した時点で handoff 完了となる。
 5. CLI の exec 後、supervisor は connect を代行し、dispatcher は spool を処理する。CLI env の proxy は `http://127.0.0.1:<port>`、opencode の llama-swap URL は `http://127.0.0.1:8080/v1` の literal とする。
 6. 終了時は WorkerRunner が cleanup より前に monotonic absolute deadline を発行する。正確な順序は §4.2.3 のみを正本とする。
 
@@ -92,7 +92,7 @@ worker から CLI への `killpg` は、親 Landlock domain から子 domain へ
 
 ALLOW は自 process に閉じる memory、thread、signal mask、時刻と id の取得、fd I/O、poll、eventfd、timerfd、inotify、自分の socket の recv、Landlock が判定する path 操作、path metadata の読取り、fork / vfork / 条件内 clone / exec、`setsid` / `setpgid`、nested Landlock が scope を制限する signal 系、`seccomp`、`landlock_*` に限る。
 
-`accept` は許可するが `listen` は拒否する。`memfd_create` と `execveat` は部分木内の任意 code 実行を前提として許可する。POSIX timer は許可しない。
+`accept` は許可するが `listen` は拒否する。`execveat` は launcher の sealed memfd exec のため許可する。`memfd_create` は launcher が seccomp 前に使うだけであり、CLI 部分木では EPERM とする。POSIX timer は許可しない。
 
 ### 3.3 条件つき syscall
 
@@ -136,6 +136,7 @@ ALLOW は自 process に閉じる memory、thread、signal mask、時刻と id �
 | credential | `capset`、`setuid`、`setgid`、`setreuid`、`setregid`、`setresuid`、`setresgid`、`setfsuid`、`setfsgid`、`setgroups` | EPERM |
 | scheduler | `sched_setscheduler`、`sched_setparam`、`sched_setaffinity`、`sched_setattr`、`setpriority`、`ioprio_set` | EPERM |
 | resource | `io_setup`、`io_destroy`、`io_submit`、`io_cancel`、`io_getevents`、`io_pgetevents`、`mlock`、`mlock2`、`mlockall` | EPERM |
+| executable memory | `memfd_create` | EPERM |
 | namespace / mount | `unshare`、`setns`、mount 系、新 mount API、`statmount`、`listmount`、`listns`、`chroot`、`pivot_root` | EPERM |
 | listener | `listen` (TCP と AF_UNIX の双方) | EPERM |
 | IPC | SysV IPC 12 個、POSIX mq 6 個 | EPERM |
@@ -151,7 +152,7 @@ ALLOW は自 process に閉じる memory、thread、signal mask、時刻と id �
 
 Landlock は O_PATH と metadata 読取りを拒否しないため、metadata の変更は path 形と fd 形の双方を seccomp で拒否する。共有 ro file を O_RDONLY で開いた fd に対する `fchmod`、`fchown`、`fsetxattr`、`fremovexattr`、`utimensat` も EPERM とする。workdir file も例外にしない。
 
-launcher は HELLO 前に effective / permitted / inheritable capability が全て 0、uid / gid / supplementary group が worker の期待値と一致することを検査する。AS、NOFILE、FSIZE、CORE、`RLIMIT_NICE`、`RLIMIT_RTPRIO`、`RLIMIT_RTTIME`、`RLIMIT_MEMLOCK`、`RLIMIT_MSGQUEUE` の hard limit を固定し、後者 5 個は `(0,0)` とする。`RLIMIT_SIGPENDING` は uid 全体に影響するため 0 にしない。process と memory の上限は cgroup に置く。
+launcher は HELLO 前に effective / permitted / inheritable capability が全て 0、uid / gid / supplementary group が worker の期待値と一致することを検査する。AS、NOFILE、FSIZE、CORE、`RLIMIT_NICE`、`RLIMIT_RTPRIO`、`RLIMIT_RTTIME`、`RLIMIT_MEMLOCK`、`RLIMIT_MSGQUEUE` の hard limit を固定し、後者 5 個は `(0,0)` とする。`RLIMIT_SIGPENDING` は uid 全体に影響するため 0 にしない。worker の FSIZE hard は 8 MiB のままとし、launcher spawn の fork 後の child だけが artifact size まで hard を上げる。launcher はコピー前に soft をその hard へ上げ、コピー後に `(8 MiB,8 MiB)` に固定する。process と memory の上限は cgroup に置く。
 
 ## 4. MCP と外向き通信
 
@@ -233,6 +234,10 @@ receiver が RECV した通知は、同じ lock で receiver-owned 集合に登�
 
 worker は deadline を受けて ACK を返すまで stop と cgroup 操作を開始しない。ACK 後に、deadline の 3 秒前に `os._exit` する独立 cleanup watchdog を始動する。WorkerRunner は ACK や cleanup 完了通知を待たず、`worker_proc.wait(timeout=cleanup_deadline - 2s - now)` を行う。timeout 時は worker を SIGKILL し、必ず `worker_proc.wait(timeout=cleanup_deadline - now)` を再実行する。reap 不可なら `worker_not_reaped` とし rmdir と次 mission を禁止する。
 
+`StdinRouter` は go と mission の終わり（deadline または parent EOF）の到着順を同じ lock で一度だけ記録する。deadline / EOF が先なら後から go が届いても `wait_go()` は False とする。`read_rpc()` は既に到着した reply を先に返すが、deadline 受領または parent EOF の後は以後の各呼出しに直ちに None を返す。
+
+router を起こした worker は main を抜ける例外から終了 code を決める。正常終了は 0、`SystemExit` はその code、`KeyboardInterrupt` は 130、その他は 1 とする。isolation の `close()` 失敗は stderr に `isolation_close_failed` を出し rc 1 とする。router の停止 reason も `sandbox_unavailable: <固定 reason>` の形にする。
+
 #### 4.2.3 cleanup 順序の正本
 
 すべての段に発行済み absolute cleanup deadline を適用する。`launcher_proc` を wait / reap するのは mission worker だけ、`worker_proc` を wait / reap するのは WorkerRunner だけである。
@@ -243,6 +248,7 @@ worker は deadline を受けて ACK を返すまで stop と cgroup 操作を�
 | handoff 後の receiver 異常 | receiver 自身が最外周で異常確定 → 新規 RECV / commit 禁止 → drain。空なら receiver の CLOSED / close、空でなければ STUCK。後続は該当行の順序 |
 | handoff 後の STUCK | STUCK 確定 → listener を開いたまま RECV / commit 禁止 → `cgroup.kill` → `populated 0` → worker の `launcher_proc.wait()` / reap → WorkerRunner の `worker_proc.wait()` / reap（worker exit で listener と複製が消滅）→ afx の保険 kill / 空確認 → rmdir |
 | handoff 前 setup 失敗 | worker が所有する未移譲 listener fd（存在する場合）と status 親端を close → `cgroup.kill` → `populated 0` → worker の `launcher_proc.wait()` / reap → WorkerRunner の `worker_proc.wait()` / reap → afx の保険 kill / 空確認 → rmdir |
+| 未起動 mission の `close()` | BEFORE_HANDOFF として未移譲 fd を close → `cgroup.kill` → `populated 0` → `launcher_proc.wait()` / reap → dispatcher stop → supervisor stop の系列を走らせる。全段は deadline 付きとし、期限内に終わらなければ `cleanup_deadline_exceeded` を記録する |
 | handoff 後 setup / runtime 失敗 | `GO` 送信失敗、`wait_exec` の `EXEC_FAILED` / order / malformed / timeout、`cli_exec_unproven`、`spool_flood` は receiver-owned STOPPING → drain → CLOSED、または STUCK の系列に入る。その後は該当する handoff 後の行に従う |
 
 全系列で dispatcher の停止は `populated 0` の後とする。handoff 前（JOINED 前）の kill は、launcher が mission cgroup に居ないため、`cgroup.kill` に加えて launcher pid への SIGKILL を行う。CLI 本体が先に終わり reap 済みの場合、reap の段は no-op として記録する。
@@ -252,6 +258,8 @@ EOF、cleanup ACK、`populated 0` は worker exit の証拠ではない。最初
 ### 4.3 CONNECT proxy
 
 proxy は worker thread 群に置き、outer Landlock 前に `127.0.0.1:ephemeral`、backlog 128 の listener を作る。CONNECT authority は backend 定数だけとし、claude は `api.anthropic.com`、codex は `chatgpt.com` と `ab.chatgpt.com`、opencode は空集合とする。telemetry と opencode の外向き host は許可しない。
+
+worker の起動順は SyncHandoff → listener の port を渡した ConnectSupervisor → ConnectProxy → start とし、`report.start_order` は `handoff → supervisor → proxy` とする。proxy の起動に失敗した場合は supervisor を stop・join・release してから失敗にする。proxy の停止は一度だけ記録する。
 
 host ごとに最初の `getaddrinfo(host,443,AF_UNSPEC,SOCK_STREAM)` を一度だけ行い、全 address が global であることを要求する。解決集合は mission 中固定する。loopback、RFC1918、CGNAT、link-local、ULA、multicast、unspecified、documentation、reserved、非 global を埋め込む mapped / compatible / 6to4 / NAT64 は拒否する。resolver は上限 4 thread、5 秒で 504、NXDOMAIN と不適格集合は 502 とする。各 address を最大 5 秒、全体 15 秒で順に試す。
 
@@ -370,24 +378,25 @@ CLI が回収しない zombie は mission の `pids.max` を消費する自己�
 
 ### 7.1 status protocol
 
-worker は `launcher_proc` の前に `SOCK_SEQPACKET` socketpair を作り、child end だけを `pass_fds` する。frame は magic `AFXL`、u16 version、u16 type、128 bit nonce、type 固定 fields とする。`recvmsg(MSG_CMSG_CLOEXEC)` の truncation、長さ、magic、version、nonce 不一致は malformed とする。ancillary は PREPARED の SCM_RIGHTS fd 一つだけとする。
+worker は `launcher_proc` の前に `SOCK_SEQPACKET` socketpair を作り、child end だけを `pass_fds` する。frame は magic `AFXL`、u16 version、u16 type、128 bit nonce、type 固定 fields とする。protocol v3 では PREPARED の `Prepared` 本体の外に、launcher が exec する sealed memfd の `(st_dev,st_ino)` を載せる。`recvmsg(MSG_CMSG_CLOEXEC)` の truncation、長さ、magic、version、nonce 不一致は malformed とする。ancillary は PREPARED の SCM_RIGHTS fd 一つだけとする。
 
 | launcher 段 | 動作 |
 |---|---|
 | L1–L3 | status CLOEXEC、PDEATHSIG / ppid、rlimit、seccomp 継承なし、credential を検査 |
 | L4 | HELLO{pid} を送る。JOINED を厳密に検査 |
+| L4a | JOINED 後、path artifact を memfd へ全量コピーし、`F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL` を付ける。SHA-256 を admission digest と照合し、memfd を ELF として再検査する。コピー前だけ `RLIMIT_FSIZE` soft を hard へ上げる |
 | L5 | subreaper、no_new_privs、nested Landlock TSYNC |
 | L6–L7 | seccomp install、listener 取得、seccomp=2 と no_new_privs=1 を自己検査 |
-| L8 | PREPARED と listener fd 一つを送る。送信成否によらず launcher copy を close |
+| L8 | PREPARED、exec する sealed memfd の `(st_dev,st_ino)`、listener fd 一つを送る。送信成否によらず launcher copy を close |
 | L8w | GO を厳密に検査 |
 | L1–L7 の失敗 | SETUP_FAILED{reason code, errno} を送って終了する。reason code は §7.2 の固定語に 1 対 1 で対応し、stderr や exit code を根拠にしない。frame type は HELLO / JOINED / PREPARED / GO / EXEC_FAILED / SETUP_FAILED の 6 種で、長さは type ごとに 1 通りに固定する |
-| L9 | `close_range(...,CLOEXEC)` 後、hash 済み backend execution artifact fd を `execveat`。codex は native ELF (`codex-rs`、static PIE musl) の fd とし、npm wrapper は実行 TCB に含めない。失敗は EXEC_FAILED |
+| L9 | `close_range(...,CLOEXEC)` 後、sealed memfd を `execveat`。codex は native ELF (`codex-rs`、static PIE musl) の fd とし、npm wrapper は実行 TCB に含めない。失敗は EXEC_FAILED |
 
 | worker state | 判定 |
 |---|---|
 | wait_hello | nonce と `launcher_proc.pid` が一致する HELLO を cgroup join して JOINED |
 | wait_prepared | profile / hash / ABI / flags と listener fd 一つを検査し、supervisor 起動後に GO |
-| wait_exec | EOF 後の `/proc/<pid>/exe` の `(st_dev, st_ino)` が、open 時に同じ backend execution artifact fd から保存した `(st_dev, st_ino)` と一致すれば `cli_started`、確認不能なら `cli_exec_unproven` |
+| wait_exec | EOF 後の `/proc/<pid>/exe` の `(st_dev, st_ino)` が PREPARED で得た sealed memfd の値と一致すれば `cli_started`、確認不能なら `cli_exec_unproven` |
 | 任意 state | order、malformed、deadline、EOF は固定 reason |
 
 handoff 前の `sandbox_setup_failed`、`attestation_*`、`launcher_died` は §4.2.3 の handoff 前系列に入る。GO 送信失敗、`wait_exec` の EXEC_FAILED / order / malformed / timeout、`cli_exec_unproven` は handoff 後系列に入る。
@@ -398,17 +407,18 @@ handoff 前の `sandbox_setup_failed`、`attestation_*`、`launcher_died` は §
 | status parent end | worker が started / unproven / failure の確定で close |
 | seccomp listener、handoff 前 | launcher が L8 で close。worker は未移譲 listener fd が存在すれば close |
 | seccomp listener、handoff 後 | receiver だけが close。PREPARED 不正など handoff 前は worker が受信 fd を close |
-| backend execution artifact fd | worker は Popen 直後、launcher は exec 時に close。codex は native ELF (`codex-rs`、static PIE musl) の fd であり、npm wrapper は実行 TCB に含めない |
+| path backend execution artifact fd | worker は Popen 直後、launcher は sealed memfd へのコピー後に close。codex は native ELF (`codex-rs`、static PIE musl) の fd であり、npm wrapper は実行 TCB に含めない |
+| sealed memfd | launcher が JOINED 後に作成し、copy / seal / digest / ELF 再検査後に `execveat` する。CLOEXEC により exec 時に close |
 | cgroup / spool / proxy / diag fd | launcher は持たず、worker が mission 終了まで保持 |
 
 ### 7.2 固定 reason
 
-worker は launcher 起動前、backend execution artifact を open した同じ fd で `fstat` と先頭 bytes の検査を行い、ELF magic、class、machine を検証する。non-ELF、shebang、別 arch の artifact は admission の固定 reason `cli_artifact_unsupported` とし、`attestation_exec_failed` まで進めない。この判定は L9 の前段、すなわち worker が fd を open した時点で行う。
+worker は launcher 起動前、backend execution artifact を open した同じ path fd で ELF magic、class、machine と `(dev,ino,size,mtime)` を検査する。worker はこの段で artifact 全量を読まず、hash 済み bytes を保持しない。non-ELF、shebang、別 arch の artifact は admission の固定 reason `cli_artifact_unsupported` とし、`attestation_exec_failed` まで進めない。admission 後に同じ inode を書き換えた場合も、launcher の sealed copy 後の digest 照合で `artifact_digest_mismatch` として exec しない。
 
 | 発生点 | reason / 分類 |
 |---|---|
-| admission | `arch_unsupported`、`landlock_abi_too_old`、`seccomp_unavailable`、`seccomp_user_notif_unavailable`、`seccomp_wait_killable_unavailable`、`pidfd_thread_unavailable`、`ptrace_scope_unsupported`、`cli_artifact_unsupported`、`cgroup_*`、`unit_stop_policy_unsupported`、`cgroup_create_failed`（mkdir・上限・fd open）、`cgroup_topology_unsupported`（自己位置）、`spool_create_failed`、`proxy_start_failed`、`runtime_fingerprint_selftest_failed`、`safety_canary_failed` は `sandbox_unavailable` |
-| setup | `inherited_seccomp_filter`、`credentials_unexpected`、`rlimit_failed`、`subreaper_failed`、Landlock / seccomp / self-check failure、`attestation_*`、`launcher_died`、`cgroup_join_failed` は `sandbox_unavailable` |
+| admission | `arch_unsupported`、`landlock_abi_too_old`、`seccomp_unavailable`、`seccomp_user_notif_unavailable`、`seccomp_wait_killable_unavailable`、`pidfd_thread_unavailable`、`ptrace_scope_unsupported`、`cli_artifact_unsupported`、`artifact_exceeds_memory_max`、`cgroup_*`、`unit_stop_policy_unsupported`、`cgroup_create_failed`（mkdir・上限・fd open）、`cgroup_topology_unsupported`（自己位置）、`spool_create_failed`、`proxy_start_failed`、`runtime_fingerprint_selftest_failed`、`safety_canary_failed` は `sandbox_unavailable` |
+| setup | `fingerprint_mismatch`、`inherited_seccomp_filter`、`credentials_unexpected`、`rlimit_failed`、`subreaper_failed`、Landlock / seccomp / self-check failure、`artifact_copy_failed`、`artifact_digest_mismatch`、`artifact_copy_unsupported`、`attestation_*`、`launcher_died`、`cgroup_join_failed` は `sandbox_unavailable`。SETUP reason code 12 / 13 / 14 は順に `artifact_copy_failed` / `artifact_digest_mismatch` / `artifact_copy_unsupported` |
 | runtime | `supervisor_died`、`supervisor_stalled`、`proxy_died` は `sandbox_unavailable`。`spool_flood` と `cli_exec_unproven` は `failed` |
 | proxy 接続判定 (接続単位) | `not_inet`、`pending_gone`、`stopping`、`relookup_changed`、`multiple_match`、`lookup_failed`、`no_match`、`malformed` は §4.3.1 の判定結果であり、接続を閉じて proxy の判定記録 (history / counts) に残す。mission の sandbox 状態は変えない |
 | 通知単位 | `supervisor_resource`（fd 枯渇等、または O_NONBLOCK の復元失敗）、`connect_timeout`（複製への connect が `CONNECT_WAIT_SEC` 内に確定しない、または ack 待ちの期限切れ）、`handler_start`（handler thread を起動できず receiver が EPERM を返す）は、その通知の EPERM の理由であり、supervisor は続行する（復元失敗は加えて `supervisor_died`） |
@@ -416,16 +426,20 @@ worker は launcher 起動前、backend execution artifact を open した同じ
 
 ## 8. fingerprint と admission
 
-fingerprint は profile、canonical seccomp hash、BPF byte hash と flags、nested / outer Landlock hash、egress constants、launcher source hash、supervisor / proxy / spool / cgroup / protocol / canary source hash、kernel capability、userspace、backend execution artifact fd の SHA-256 と `(dev,ino,size,mtime)` の正規化組、`launch_kind`、argv / env-policy の hash と aggregate SHA-256 とする。codex は native ELF fd の SHA-256 と metadata を含め、npm wrapper / script の hash は含めない。codex の `launch_kind=native_elf` とし、managed 環境変数を加えない env-policy を hash 対象にする。
+fingerprint は profile、canonical seccomp hash、BPF byte hash と flags、nested / outer Landlock hash、egress constants、launcher / protocol / supervisor / proxy / spool / cgroup / canary の source hash、`source_isolation`、kernel capability、userspace、backend execution artifact の SHA-256 と `(dev,ino,size,mtime)` の正規化組、`launch_kind`、argv / env-policy の hash と aggregate SHA-256 とする。codex は native ELF の SHA-256 と metadata を含め、npm wrapper / script の hash は含めない。codex の `launch_kind=native_elf` とし、managed 環境変数を加えない env-policy を hash 対象にする。
 
-worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同じ fd を hash して launcher に渡し `execveat(AT_EMPTY_PATH)` する。path を hash 後に再 open しない。対応済み集合は最終 profile の全自己試験前は空とする。
+`source_isolation` は `improve_isolation.py`、`improve_admission.py`、`mission_worker.py` の各 file 全体を hash する。launcher 群には `core/cli_artifact_copy.py` を含める。outer Landlock の source は `_bootstrap_improve_profile` から AST で辿る関数・class・定数、および `core/landlock.py` 全体とし、`_guarded_data_dir`、`_exec_closure_for`、`ExecClosure`、`cli_runner._TRANSCRIPT_DIR_DEFAULT` を含む。対応済み fingerprint の集合定数自体は hash しない。mission worker を丸ごと hash するため、trade 側の編集や `ISOLATION_ENABLED` の反転でも aggregate は変わる。supported fingerprint を登録する commit は `ISOLATION_ENABLED=true` の状態で計算することを運用規約とする。
+
+admission は path artifact を開いて digest と metadata を得る。worker の prepare は同じ path fd の ELF と `(dev,ino,size,mtime)` の照合だけを行い、launcher は JOINED 後に sealed memfd へ全量コピーして digest を照合し、その memfd を exec する。worker は隔離 mission の開始時に自分の source で fingerprint を再計算し、handshake の admission aggregate と一致しなければ `fingerprint_mismatch` で launcher を起こさない（fail closed）。この照合は admission した code と実際に動く worker + launcher を結び付ける。PREPARED の exec_identity（memfd の `st_dev` / `st_ino`）は launcher の申告であり、その真正性は launcher source が fingerprint に含まれることに依存する残余である。
+
+artifact size と launcher copy 用の定数余裕（実測した launcher copy 中 peak の 2 倍を根拠とする）との和が `memory.max` を超える場合、worker は cgroup を作る前に `artifact_exceeds_memory_max` で止める。memfd の page は mission cgroup に課金し、`memory.swap.max=0` の内側に置く。`memory.high` は throttle であって kill ではないため設定しない。`os.memfd_create` をまず使い、無い場合は arch 固定 syscall（x86_64 319、aarch64 279）を使い、他 arch は ENOSYS とする。`MFD_EXEC` を試し、EINVAL の場合は fallback する。
 
 集合外 fingerprint は次を順に通す。
 
 1. 安全性 canary: AF_UNIX 拒否、不許可 port、IPv4 / IPv6 bind 無し `listen` の EPERM、`CLONE_PARENT` の EPERM、外部 signal、`/dev/tty`、cgroup file、共有 ro fd metadata、subreaper、proxy 外部接続、順逆 port reuse、bucket collision、receiver close race を、実 launcher、実 user service、実 cgroup、実 supervisor、実 proxy で検査する。
 2. 互換性自己試験: 実 CLI、spool tool、schema、SIGSYS 0、終了後 cgroup empty を検査する。
 
-成功と恒久失敗は process 内 cache する。一時的 timeout、spawn、provider failure は cache せず `SELFTEST_RETRY_INTERVAL_SEC` 後に再試行する。CLI 自動更新の source host は許可しない。hash が変われば gate を再評価する。
+canary と自己試験は判定を求めた呼出しの settings（backend）で WorkerRunner を組む。kernel probe と判定 cache だけを lock で守り、同じ `(backend,fingerprint)` の要求は進行中の判定を待って二重実行しない。停止の確認は cache の前、leader 取得の前、各 probe の前、判定の後に行う。停止中は `service_stopping`（retryable、cache しない）を返し、停止の確認と cache 書込みは同じ lock 区間に置く。cache の時刻は判定の完了時刻とする。成功と恒久失敗は process 内 cache する。一時的 timeout、spawn、provider failure は cache せず `SELFTEST_RETRY_INTERVAL_SEC` 後に再試行する。拒否 (`refused`) は supervisor の pre-ready retry を受けず 1 回で終端する。canary が launch を拒否した場合は listener と pipe を閉じる。CLI 自動更新の source host は許可しない。hash が変われば gate を再評価する。
 
 ## 9. 不変条件
 
@@ -435,13 +449,13 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | IC-NET | §4.2 の段を満たす supervisor 代行、proxy の inode + tuple handoff、固定 global address 集合だけ。UDP、raw、netlink、直接 TFO、listener は不可 |
 | IC-SIG | nested Landlock scope が部分木外 signal と abstract UDS を拒否 |
 | IC-DEV | `/dev/shm`、PTY、tty、非許可 device と device ioctl に到達不能 |
-| IC-FD | backend execution artifact exec 時の fd は 0/1/2 だけ。status、backend execution artifact、cgroup fd は CLOEXEC。全 backend で実際に exec する artifact と同じ fd を hash・exec する |
+| IC-FD | backend execution artifact exec 時の fd は 0/1/2 だけ。status、path artifact、sealed memfd、cgroup fd は CLOEXEC。全 backend で launcher が sealed memfd の digest を admission digest と照合してから exec する |
 | IC-SPOOL | 同一 dir NOREPLACE、single claim、bounded validation、rescan 正本、worker ledger 正本 |
 | IC-LIFECYCLE | direct-parent wait / reap、receiver-only listener close、handoff 前後の §4.2.3 系列、STUCK、`worker_not_reaped` gate を守る |
 | IC-FINITE | forward progress する制御経路の下で、単一 absolute deadline、ACK 非依存 wait、SIGKILL 後再 wait、固定 reason を守る |
 | IC-CRED | launcher は zero capability と期待 credential を検査し、setter は拒否 |
 | IC-ATTEST | setup 判定は status protocol だけ。ancillary は PREPARED の fd 一つだけ |
-| IC-FP | 全 backend で実際に exec する artifact と同じ hash 済み fd を exec。集合外 fingerprint は canary と自己試験前に exec しない |
+| IC-FP | `source_isolation` を含む aggregate が worker 側の再計算と一致しなければ launcher を起こさない。集合外 fingerprint は canary と自己試験前に exec しない |
 | IC-NOKEY | 隔離を緩める設定 key を作らず、必要 capability / topology / unit policy 不足は fail closed |
 | IC-META | path / fd 形の全 metadata 変更を EPERM |
 | IC-WORKER | worker は seccomp / subreaper なし。worker から子への kill と cgroup kill は通り、supervisor / proxy fault は mission failure |
@@ -475,7 +489,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 22. protocol frame 異常、early / late setup failure fault injection、handoff 前 worker close、handoff 後 receiver-only close、direct-parent wait / reap を検証する。
 23. inherited filter、TSYNC、listener send、WAIT_KILLABLE、PIDFD_THREAD、Yama の fail closed を検証する。
 24. `pidfd_getfd`、memory copy、receiver stop の supervisor failure を検証する。
-25. 全 backend で実際に exec する artifact と同じ fd を hash・exec すること、artifact mutation、inode-fixed exec、canary、temporary retry、空の supported set を検証する。
+25. 全 backend で path artifact の metadata 照合、launcher 内 sealed memfd の digest 照合・ELF 再検査・exec、artifact mutation の `artifact_digest_mismatch`、protocol v3 の memfd exec_identity、canary、temporary retry、空の supported set を検証する。
 26. data evaluator と独立 BPF evaluator で全 nr、x32、ceiling、12 COND partition を一致させる。
 27. unclassified、duplicate、unknown header name が generator failure になる。
 28. seccomp、nested Landlock、supervisor allowlist、outer `/sys` rule の外した対照を置く。
@@ -498,6 +512,11 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 45. `pids.max` 到達時の zombie、`populated 0`、rmdir、次 subreaper、外部 process 非影響を検証する。
 46. disposable `Type=exec` / `NotifyAccess=none` service の stop が有限 timeout 後 cgroup 全体を SIGKILL し、unit fixture と admission 負例を検証する。
 47. codex の npm wrapper（shebang）を artifact に設定すると `cli_artifact_unsupported` となり、CLI が exec されないことを検証する。
+48. `source_isolation`、launcher 群、outer Landlock の AST 到達 source の各変更で aggregate が変わり、worker 側再計算と handshake aggregate の不一致では `fingerprint_mismatch` により launcher を起こさないことを検証する。supported fingerprint の登録値は `ISOLATION_ENABLED=true` で計算する。
+49. admission の同一 `(backend,fingerprint)` の待合せ、異なる fingerprint の並行、settings ごとの WorkerRunner、stop の cache 前・leader 前・各 probe 前・判定後の観測、完了時刻 cache、`refused` の一回終端、canary launch 拒否時の listener / pipe close を検証する。
+50. artifact size + headroom が `memory.max` を超える場合に cgroup 作成前の `artifact_exceeds_memory_max` になること、sealed memfd の page が swap 0 の mission cgroup に課金されること、FSIZE の worker / fork 後 child / launcher copy 後の値を検証する。
+51. `StdinRouter` の go / deadline / EOF の順序、deadline / EOF 後の繰返し `read_rpc()`、未起動 `close()` の BEFORE_HANDOFF 系列と deadline、worker exit code と `isolation_close_failed`、proxy 停止一回を検証する。
+52. 実 CLI selftest (`-m realbackend`) は backend ごとに claude=`haiku`、codex=`gpt-5.6-luna`、opencode=local の既定 model を使い、mission 上限を 600 秒（unit の `RuntimeMaxSec=900` の内側）とする。`cli_runner` の detail は stderr の末尾 3 行とする。
 
 ## 11. task 表と依存
 
@@ -548,8 +567,13 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 - cleanup watchdog は GIL 停止時 best-effort である。IC-FINITE は deadline 発行・監視・SIGKILL 配送を担う制御経路の forward progress を前提とする。
 - afx が停止したまま誰も unit を stop / restart しない間には終了上限がない。systemd の停止層は afx の hang を自動検出しない。`NotifyAccess=none` のため sd_notify と WatchdogSec は範囲外である。
 - 起動後の unit property 変更・reload は検出しない。§6.1 の運用前提に従う。
-- inode 固定は rename による差替えを防ぐが、同一 inode への in-place 書込み（npm 更新との同時実行を含む）は防がない。運用前提として稼働中に backend を更新せず、更新後は fingerprint を再評価する。
+- path artifact の inode 固定は rename による差替えを防ぎ、同一 inode への in-place 書込みは launcher の sealed copy 後の digest 照合で `artifact_digest_mismatch` にする。ただし更新との競合は mission を失敗させ得るため、運用前提として稼働中に backend を更新せず、更新後は fingerprint を再評価する。
 - `/proc/<pid>/exe` は観測時点の証明であり、CLI 自身が別 executable へ exec することは禁じない。その挙動は既存の seccomp / Landlock の範囲で許す。
+- `stop_event` は進行中の canary / 自己試験を止めない。待機中の同一 fingerprint 要求を解くだけである。
+- `setsid` で process group を抜けた子孫は、試験 helper の `wait_line` では止められない。
+- deadline 後の rpc client の例外文言は `parent closed the pipe while awaiting tool_rpc_result` のままとする。
+- 自分の exe path から資産を読む、または自分自身を再 exec する CLI は memfd exe で壊れ得る。現行の claude / codex / opencode は問題ない。
+- PREPARED の exec_identity は launcher 自身の申告である。worker と launcher の source を fingerprint で拘束して軽減するが、独立した kernel 証明にはしない。
 
 ### 12.1 readiness
 
@@ -579,7 +603,7 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | D-3 | opencode は `127.0.0.1:8080` だけ。外向き host は拒否し、正常回帰まで blocker |
 | D-4 | `/dev` は individual file rule と IOCTL_DEV |
 | D-5 | metadata 変更を path / fd 形とも拒否、読取りは残余 |
-| D-6 | 全 backend で実際に exec する artifact と同じ fd による fingerprint admission、inode-fixed exec、artifact hash、canary と selftest |
+| D-6 | path artifact の fingerprint admission、JOINED 後の sealed memfd copy・digest 照合・exec、worker の aggregate 再照合、canary と selftest |
 | D-7 | 全番号 explicit classification、未分類は generator failure |
 | D-8 | `pidfd_getfd` connect delegation と CONNECT proxy |
 | D-9 | delegated cgroup、`cgroup.kill`、pids / memory、absolute cleanup deadline |
@@ -615,6 +639,8 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 | proxy tunnel | claude 最大 8、codex 4、opencode 2 |
 | handoff | p50 0.056 ms、p99 0.21 ms、最大 17 ms |
 | cgroup cleanup | `cgroup.kill` から `populated 0` は 23〜33 ms、pids 到達時 5〜26 ms |
+| artifact memory headroom | `ARTIFACT_MEMORY_HEADROOM=64 MiB`。launcher copy 中の cgroup peak（shmem を除く）の実測値の 2 倍以上として固定し、artifact size との和で `memory.max` を事前検査する |
+| sealed memfd | 実 CLI の `/proc/self/exe` は `/memfd:afx-cli (deleted)`。起動と MCP 接続までを claude / codex / opencode の 3 種で実測し、mission 中の memfd 分は順に約 257 MiB / 294 MiB / 185 MiB が cgroup に乗る |
 | listener close | stop から CLOSED は 0.13 ms |
 | systemd stop | finite 2 秒 service が stop 開始から 2.18 秒で main・子・孫を SIGKILL |
 | CLI paths | claude / codex は `listen` と `CLONE_PARENT` EPERM、fd metadata deny 下で完走。opencode の最終 profile 正常完走は未達 |
@@ -632,3 +658,4 @@ worker は backend execution artifact を `O_RDONLY|O_CLOEXEC` で開き、同�
 |2026-10-10|v1.5|§4.2 段 1: RECV の ENOENT は通知単位の終了 (receiver 続行)、POLLHUP は drain → CLOSED と明記|T3d1 実装の裁定|—|
 |2026-10-10|v1.6|§4.2.1 段 11: blocking connect の一時 O_NONBLOCK・`CONNECT_WAIT_SEC` 0.75 秒・再 connect での確定・`connect_timeout`、libc 直呼び。§4.2.2: receiver の O_NONBLOCK、`HANDLER_SPAWN_MAX`、ack 期限、handoff の watchdog 先行起動。§4.2.3: dispatcher 停止は `populated 0` の後、handoff 前 kill は launcher pid へ SIGKILL。§4.3.1: IPv4-mapped の扱い。§7.2: `supervisor_resource` / `connect_timeout` / `handler_start`、`cgroup_create_failed` / `cgroup_topology_unsupported`。§10 受入 43、§12 残余、§12.1 R6、§11 T3d1|T3d1 実装の投入と T3d2 / T4d 裁定の反映|—|
 |2026-10-10|v1.7|§4.3.1: IPv4-mapped を `not_inet` で明示拒否 (client の idiag_family は AF_INET6、実測)。netlink 応答の送信元・nlmsg_pid・非 multi-part を seq 判定より先に検査し違反は `malformed`、seq 不一致は `discarded` として計数。再 lookup は lock の外、ack 直前に lock を取り直して `pending_gone`。stop 開始後は `stopping`。add_pending は常に token を返す。§7.2 に proxy 接続判定の理由を列挙。§12 に accept thread 同期 admission の可用性残余。§11 T4d を投入済みに|T4d 実装 (main `01f313f`) の結果を spec へ反映 (spec-v17 ブリーフ)|—|
+|2026-10-11|v1.8|§2–§3 / §7–§10: sealed memfd を launcher の JOINED 後にコピー・照合・exec する契約、protocol v3 の exec identity、FSIZE と memory.max の事前検査、fingerprint の `source_isolation` と worker 再照合、admission の停止・cache・settings 契約、worker / cleanup / router 契約、実 CLI selftest を反映。§12・§14 に残余と memfd 計測を追加|是正済み実装と確定事項への spec 同期|(本 commit)|
