@@ -13,8 +13,8 @@
 | 2 | ``unknown_feature`` (起動口が返す) |
 | 69 | ``probe_not_implemented`` |
 | 70 | ``runtime_unavailable`` (表の値を呼べない) |
-| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL。想定外の失敗は ``startup_internal_error``) |
-| 73 | ``probe_bind_failed`` (web) / ``probe_<原因>`` (notify の送信失敗。語は ``afx_ops.notify.probe.REASONS``) |
+| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL) / ``token_invalid`` (bot token の形。想定外の失敗は ``startup_internal_error``) |
+| 73 | ``probe_bind_failed`` (web) / ``probe_<原因>`` (notify の送信失敗・bot の到達失敗。語は ``afx_ops.notify.probe.REASONS`` / ``afx_ops.bot.probe.REASONS``) |
 """
 from __future__ import annotations
 
@@ -64,13 +64,21 @@ def probe_notify(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
     notify_probe.probe(config, secrets)
 
 
+def probe_bot(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
+    """bot token の identity と、設定の guild / channel への到達だけ (中身は bot.probe)。"""
+    # bot.probe はこの module の ProbeError を使うので、呼ぶときに読む (循環 import を避ける)
+    from afx_ops.bot import probe as bot_probe
+    bot_probe.probe(config, secrets)
+
+
 def probe_not_implemented(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
     """外向きの疎通確認がまだ無い機能。入力の検査までで止める。"""
     raise ProbeError("probe_not_implemented", RC_NOT_IMPLEMENTED)
 
 
 PROBES: Mapping[str, Callable[[OpsConfig, Mapping[str, bytes]], None]] = MappingProxyType({
-    "bot": probe_not_implemented,
+    # bot は token の identity と設定の guild / channel への到達 (interaction は確かめない)
+    "bot": probe_bot,
     # web は listener の bind だけを確かめる
     "web": probe_web,
     # notify は送信先の webhook へ probe body を 1 回送る
@@ -86,7 +94,10 @@ def _read_inputs(feature: str) -> tuple[OpsConfig, Mapping[str, bytes]]:
     finally:
         os.close(config.config_dir_fd)
     return OpsConfig(instance_root=config.instance_root, key_dir=config.key_dir, config_dir_fd=None,
-                     port=config.port, guild_id=config.guild_id, channel_id=config.channel_id), secrets
+                     port=config.port, guild_id=config.guild_id, channel_id=config.channel_id,
+                     allowlist_user_ids=config.allowlist_user_ids,
+                     mention_role_id=config.mention_role_id,
+                     mention_user_ids=config.mention_user_ids), secrets
 
 
 def main(feature: str) -> int:

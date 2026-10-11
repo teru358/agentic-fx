@@ -11,6 +11,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 
+from afx_ops import bot as bot_runtime
 from afx_ops.config import ConfigError, read_config
 from afx_ops.isolation import startup
 from afx_ops.notify import runtime as notify_runtime
@@ -31,7 +32,7 @@ def feature_not_implemented(isolated: startup.Isolated) -> int:
 
 
 RUNTIMES: Mapping[str, Callable[[startup.Isolated], int]] = MappingProxyType({
-    "bot": feature_not_implemented,
+    "bot": bot_runtime.run,
     "web": web_runtime.run,
     "notify": notify_runtime.run,
 })
@@ -39,6 +40,9 @@ RUNTIMES: Mapping[str, Callable[[startup.Isolated], int]] = MappingProxyType({
 
 def _preload_bot() -> None:
     import discord  # noqa: F401
+
+    # 業務処理の module も隔離前に読む (隔離後に新しい module を読み込まない)
+    import afx_ops.bot.runtime  # noqa: F401
 
 
 def _preload_web() -> None:

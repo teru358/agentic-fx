@@ -90,6 +90,8 @@ class Reply:
     status: int
     data: dict | None
     code: str | None
+    # Retry-After header の秒数 (整数の形だけ読む。無い・日付形式・不正は None)
+    retry_after: int | None = None
 
 
 class Actor:
@@ -190,7 +192,7 @@ class _Request:
         except OSError:
             raise ApiError("response_lost", token_sent=True) from None
 
-    def receive(self, *, timeout: float = HTTP_TIMEOUT) -> tuple[int, bytes]:
+    def receive(self, *, timeout: float = HTTP_TIMEOUT) -> tuple[int, bytes, int | None]:
         """応答を読む。相手の終了・期限・形式不正はすべて応答喪失。"""
         assert self._sock is not None and self._sent
         deadline = time.monotonic() + timeout
@@ -255,8 +257,8 @@ def _connect_failure(exc: OSError) -> str:
     return "socket_unusable"
 
 
-def _parse_response(buffer: bytes) -> tuple[int, bytes] | None:
-    """揃っていれば (status, body)。まだなら None。形式不正は応答喪失。"""
+def _parse_response(buffer: bytes) -> tuple[int, bytes, int | None] | None:
+    """揃っていれば (status, body, Retry-After の秒数)。まだなら None。形式不正は応答喪失。"""
     head, sep, rest = buffer.partition(b"\r\n\r\n")
     if not sep:
         if len(buffer) > 65536:
@@ -280,7 +282,9 @@ def _parse_response(buffer: bytes) -> tuple[int, bytes] | None:
         raise ApiError("response_lost", token_sent=True)
     if len(rest) < int(length):
         return None
-    return status, rest[:int(length)]
+    after = headers.get("retry-after")
+    seconds = int(after) if after is not None and re.fullmatch(r"[0-9]{1,6}", after) else None
+    return status, rest[:int(length)], seconds
 
 
 def _encode(method: str, target: str, token: str, body: bytes | None,
@@ -304,19 +308,19 @@ def _build(token: str, method: str, path: str, query: dict | None, body: dict | 
     return _encode(method, target, token, raw, actor)
 
 
-def _reply(status: int, body: bytes) -> Reply:
+def _reply(status: int, body: bytes, retry_after: int | None = None) -> Reply:
     try:
         payload = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         payload = None
     if not isinstance(payload, dict):
-        return Reply(status, None, "internal")
+        return Reply(status, None, "internal", retry_after)
     if payload.get("ok") is True:
         data = payload.get("data")
-        return Reply(status, data if isinstance(data, dict) else None, None)
+        return Reply(status, data if isinstance(data, dict) else None, None, retry_after)
     error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
     code = error.get("code")
-    return Reply(status, None, code if isinstance(code, str) else "internal")
+    return Reply(status, None, code if isinstance(code, str) else "internal", retry_after)
 
 
 # --------------------------------------------------------------- client

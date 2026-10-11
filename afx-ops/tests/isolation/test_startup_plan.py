@@ -193,7 +193,9 @@ def _calls(tree: ast.AST) -> list[tuple[int, str]]:
         # plan 検査・認証待ちの差し替え (試験だけが使う) は production の呼出しに現れない
         if isinstance(node, ast.Call):
             for k in node.keywords:
-                if k.arg in _SEAMS:
+                # discord.py の webhook send の wait= (投稿した message を返させる) は起動の
+                # 差し替え口と同名なだけなので、呼出し先が send のときだけ除く
+                if k.arg in _SEAMS and not (k.arg == "wait" and _callee(node) == "send"):
                     found.append((node.lineno, f"{k.arg}="))
         # `run(plan, body, **extra)` のような展開は中身を静的に確かめられないので、起動の
         # 入口 (run / isolate) への展開そのものを拒む
@@ -269,8 +271,19 @@ def test_production_code_never_builds_a_plan_outside_for_feature():
     allowed = _allowed_in_startup(startup_tree)
     bad = [(rel, line, name) for rel, line, name in _package_violations()
            if not (rel == "isolation/startup.py" and line in allowed and name != "_for_tests")
-           and rel != "api_client.py"]
+           and rel != "api_client.py"
+           and not (rel.startswith("gate/") and name in ("replace", "import replace"))]
     assert bad == []
+
+
+def test_gate_does_not_reach_the_startup_plan():
+    # gate は自分の値 object に dataclasses.replace を使う。起動 plan に届かないことを import で固定する
+    for path in sorted((PACKAGE / "gate").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            names = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
+                     else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
+            assert not any(name.startswith("afx_ops.isolation") for name in names), path.name
 
 
 def test_production_client_paths_do_not_call_test_key_or_token_seams():

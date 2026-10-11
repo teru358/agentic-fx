@@ -24,8 +24,12 @@ def _write_config(monkeypatch, tmp_path: Path, feature: str, text: str) -> Path:
 
 @pytest.mark.parametrize(("feature", "extra", "expected"), [
     ("web", "port = 8080\n", {"port": 8080}),
-    ("bot", "guild_id = 12345678901234567\nchannel_id = 12345678901234567890\n",
-     {"guild_id": 12345678901234567, "channel_id": 12345678901234567890}),
+    ("bot", "guild_id = 12345678901234567\nchannel_id = 12345678901234567890\n"
+     "allowlist_user_ids = [12345678901234567]\nmention_role_id = 12345678901234568\n"
+     "mention_user_ids = [12345678901234569]\n",
+     {"guild_id": 12345678901234567, "channel_id": 12345678901234567890,
+      "allowlist_user_ids": (12345678901234567,), "mention_role_id": 12345678901234568,
+      "mention_user_ids": (12345678901234569,)}),
     ("notify", "", {}),
 ])
 def test_reads_each_feature_schema(monkeypatch, tmp_path, feature, extra, expected):
@@ -135,9 +139,54 @@ instance_root = "/srv/afx"
 key_dir = "/srv/keys"
 guild_id = 1234567890123456
 channel_id = 12345678901234567
+allowlist_user_ids = []
+mention_role_id = 12345678901234567
+mention_user_ids = []
 ''')
     assert error.reason == "config_invalid"
     assert error.detail == "guild_id"
+
+
+@pytest.mark.parametrize(("key", "value"), [
+    ("allowlist_user_ids", "[12345678901234567, 12345678901234567]"),
+    ("allowlist_user_ids", "[true]"),
+    ("mention_role_id", "1234567890123456"),
+    ("mention_user_ids", "\"12345678901234567\""),
+])
+def test_rejects_invalid_bot_allowlist_or_mention_ids(monkeypatch, tmp_path, key, value):
+    bot_values = {
+        "allowlist_user_ids": "[]",
+        "mention_role_id": "12345678901234569",
+        "mention_user_ids": "[]",
+    }
+    bot_values[key] = value
+    error = _fails(monkeypatch, tmp_path, "bot", f'''\
+instance_root = "/srv/afx"
+key_dir = "/srv/keys"
+guild_id = 12345678901234567
+channel_id = 12345678901234568
+allowlist_user_ids = {bot_values["allowlist_user_ids"]}
+mention_role_id = {bot_values["mention_role_id"]}
+mention_user_ids = {bot_values["mention_user_ids"]}
+''')
+    assert error.reason == "config_invalid"
+    assert error.detail == key
+
+
+def test_bot_mention_role_is_optional_but_the_user_mentions_are_not(monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "bot", '''
+instance_root = "/srv/afx"
+key_dir = "/srv/keys"
+guild_id = 12345678901234567
+channel_id = 12345678901234568
+allowlist_user_ids = []
+mention_user_ids = []
+''')
+    config = read_config("bot")
+    try:
+        assert config.mention_role_id is None
+    finally:
+        os.close(config.config_dir_fd)
 
 
 def test_rejects_web_port_zero_in_production(monkeypatch, tmp_path):
@@ -382,6 +431,8 @@ instance_root = "/srv/afx"
 key_dir = "/srv/keys"
 guild_id = 12345678901234567
 channel_id = 100000000000000000000
+allowlist_user_ids = [12345678901234567]
+mention_user_ids = []
 ''')
     assert error.reason == "config_invalid"
     assert error.detail == "channel_id"
@@ -393,6 +444,8 @@ instance_root = "/srv/afx"
 key_dir = "/srv/keys"
 guild_id = "12345678901234567"
 channel_id = 12345678901234567890
+allowlist_user_ids = [12345678901234567]
+mention_user_ids = []
 ''')
     assert error.reason == "config_invalid"
     assert error.detail == "guild_id"

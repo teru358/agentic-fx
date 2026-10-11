@@ -22,10 +22,11 @@ REASON_CONFIG_INVALID = "config_invalid"
 
 _COMMON_KEYS = ("instance_root", "key_dir")
 _FEATURE_KEYS = MappingProxyType({
-    "bot": ("guild_id", "channel_id"),
+    "bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids"),
     "web": ("port",),
     "notify": (),
 })
+_OPTIONAL_FEATURE_KEYS = MappingProxyType({"bot": ("mention_role_id",), "web": (), "notify": ()})
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
 
@@ -46,6 +47,9 @@ class OpsConfig:
     port: int | None = None
     guild_id: int | None = None
     channel_id: int | None = None
+    allowlist_user_ids: tuple[int, ...] = ()
+    mention_role_id: int | None = None
+    mention_user_ids: tuple[int, ...] = ()
 
 
 def _read_toml(feature: str, *, preserve_config_dir_error: bool = False) -> tuple[dict[str, object], int]:
@@ -106,6 +110,15 @@ def _discord_id(value: object, key: str) -> int:
     if not 10 ** 16 <= number < 10 ** 20:
         raise ConfigError(key)
     return number
+
+
+def _discord_ids(value: object, key: str) -> tuple[int, ...]:
+    if type(value) is not list:
+        raise ConfigError(key)
+    ids = tuple(_discord_id(item, key) for item in value)
+    if len(ids) != len(set(ids)):
+        raise ConfigError(key)
+    return ids
 
 
 def _safe_detail_key(key: object) -> str:
@@ -215,8 +228,9 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
         raise ConfigError("feature")
     parsed, config_dir_fd = _read_toml(feature, preserve_config_dir_error=preserve_config_dir_error)
     try:
-        expected = _COMMON_KEYS + _FEATURE_KEYS[feature]
-        for key in expected:
+        required = _COMMON_KEYS + _FEATURE_KEYS[feature]
+        expected = required + _OPTIONAL_FEATURE_KEYS[feature]
+        for key in required:
             if key not in parsed:
                 raise ConfigError(key)
         for key in parsed:
@@ -238,7 +252,13 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
             return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                              config_dir_fd=config_dir_fd,
                              guild_id=_discord_id(parsed["guild_id"], "guild_id"),
-                             channel_id=_discord_id(parsed["channel_id"], "channel_id"))
+                             channel_id=_discord_id(parsed["channel_id"], "channel_id"),
+                             allowlist_user_ids=_discord_ids(parsed["allowlist_user_ids"],
+                                                              "allowlist_user_ids"),
+                             mention_role_id=(None if "mention_role_id" not in parsed else
+                                              _discord_id(parsed["mention_role_id"], "mention_role_id")),
+                             mention_user_ids=_discord_ids(parsed["mention_user_ids"],
+                                                           "mention_user_ids"))
         return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                          config_dir_fd=config_dir_fd)
     except BaseException:

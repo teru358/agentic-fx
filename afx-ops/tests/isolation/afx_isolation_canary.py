@@ -592,6 +592,46 @@ def op_web_runtime(p, iso):
     new_modules = sorted(set(sys.modules) - before)
     after = [OPS[step["op"]](step.get("params", {}), iso) for step in p.get("after", [])]
     return {"rc": rc, "new_modules": new_modules, "after": after}
+def op_bot_runtime(p, iso):
+    """bot の業務処理を loopback の偽 Discord (試験 CA、試験用の名前解決) へ向けて回す。
+
+    stdin に "stop" が来るか stdin が閉じると止める。exit_before_commit / exit_before_record が
+    真なら、event の投稿の後・cursor の確定の前 / 承認の投稿の後・対応の確定の前に落ちる
+    (kill は seccomp で拒否されるので exit)。結果は {"rc", "new_modules", "after"}。
+    """
+    import aiohttp
+
+    from afx_ops.bot import adapter as bot_adapter
+    from afx_ops.bot import runtime as bot_runtime
+    resolver = notify_seams.udp_resolver_factory(dns_port=p["dns_port"], port=p["port"])
+    context = notify_seams.test_ca_context(p["ca_pem"])
+
+    def connector():
+        return aiohttp.TCPConnector(ssl=context, resolver=resolver(), use_dns_cache=False,
+                                    limit=0)
+    stop = threading.Event()
+
+    def watch_stdin():
+        for line in sys.stdin:
+            if line.strip() == "stop":
+                break
+        stop.set()
+    threading.Thread(target=watch_stdin, daemon=True).start()
+    if p.get("exit_before_commit"):
+        bot_adapter.BotAdapter._commit_post = lambda *_args: os._exit(86)
+    if p.get("exit_before_record"):
+        bot_adapter.BotAdapter._commit_new_record = lambda *_args: os._exit(87)
+    offset = float(p.get("now_offset", 0))
+    sys.stdout.write("BOT-RUNNING\n")
+    sys.stdout.flush()
+    before = set(sys.modules)
+    rc = bot_runtime.run(iso, connector_factory=connector,
+                         api_base=f"https://{p['host']}/api/v10",
+                         gateway_url=f"wss://{p['host']}/gw", stop=stop,
+                         poll_interval=p.get("poll", 0.2), now=lambda: time.time() + offset)
+    new_modules = sorted(set(sys.modules) - before)
+    after = [OPS[step["op"]](step.get("params", {}), iso) for step in p.get("after", [])]
+    return {"rc": rc, "new_modules": new_modules, "after": after}
 
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
@@ -645,6 +685,9 @@ def _config(spec: dict) -> OpsConfig:
         extra["port"] = spec.get("web_port", 0)
     elif spec["feature"] == "bot":
         extra = {"guild_id": 123456789012345678, "channel_id": 223456789012345678}
+        # bot の allowlist・mention (ops.toml の読取りは test_config が受け持つ)
+        for key, value in spec.get("bot", {}).items():
+            extra[key] = tuple(value) if isinstance(value, list) else value
     # config_fd が真なら production と同じく検査済みの config dir の fd を渡す
     fd = (startup.open_config_dir(root / spec["feature"] / "config") if spec.get("config_fd")
           else None)

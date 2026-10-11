@@ -39,7 +39,8 @@ def _install(home: Path, feature: str, *, port: int | None = None, extra: str = 
     if feature == "web":
         text += f"port = {port if port is not None else _free_port()}\n"
     elif feature == "bot":
-        text += "guild_id = 123456789012345678\nchannel_id = 223456789012345678\n"
+        text += ("guild_id = 123456789012345678\nchannel_id = 223456789012345678\n"
+                 "allowlist_user_ids = []\nmention_user_ids = []\n")
     path = dirs.config / "ops.toml"
     path.write_text(text + extra, encoding="utf-8")
     path.chmod(0o600)
@@ -72,7 +73,8 @@ def _break(case: str, home: Path, feature: str) -> None:
 
 _CASES = {
     "ok_web": ("web", None, 0, None),
-    "not_implemented_bot": ("bot", None, 69, "probe_not_implemented"),
+    # 試験の secret は bot token の形でないので、bot は送信せず入力の失敗で止まる
+    "token_invalid_bot": ("bot", None, 71, "token_invalid"),
     # 試験の secret は URL でないので、notify は送信せず入力の失敗で止まる
     "url_invalid_notify": ("notify", None, 71, "url_invalid"),
     "config_dir_missing": ("bot", "config_dir_missing", 71, "config_dir_missing"),
@@ -164,7 +166,7 @@ def test_probe_creates_nothing_and_needs_neither_unit_nor_key_dir(feature, child
     before = sorted((str(p), p.stat().st_mtime_ns) for p in home.rglob("*"))
     # 通常の子 process (NoNewPrivs なし、unit の外)。key_dir は存在しない
     done = _probe(["probe", feature], child_env, home)
-    assert done.returncode == {"bot": 69, "web": 0, "notify": 71}[feature], done.stderr
+    assert done.returncode == {"bot": 71, "web": 0, "notify": 71}[feature], done.stderr
     assert sorted((str(p), p.stat().st_mtime_ns) for p in home.rglob("*")) == before
     assert not (home / ".local").exists()
 
@@ -216,8 +218,9 @@ def test_web_probe_never_accepts(tmp_path, child_env, home):
 def test_bot_and_notify_probes_make_no_network_calls(feature, tmp_path, child_env, home):
     _install(home, feature)
     done, lines = _trace(tmp_path, feature, "socket,connect,openat", child_env, home)
-    # notify は URL でない secret を入力の失敗として止める (名前解決にも進まない)
-    assert done.returncode == {"bot": 69, "notify": 71}[feature], done.stderr
+    # notify は URL でない secret、bot は token の形でない secret を入力の失敗として止める
+    # (名前解決にも進まない)
+    assert done.returncode == {"bot": 71, "notify": 71}[feature], done.stderr
     assert [line for line in lines if "AF_INET" in line] == []
     assert [line for line in lines if re.search(r"\bconnect\(", line)] == []
     # 観測が空振りでないこと: secret file は開いている

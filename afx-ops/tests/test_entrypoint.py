@@ -29,7 +29,9 @@ def _write_config(home, feature):
     if feature == "web":
         text += "port = 8080\n"
     elif feature == "bot":
-        text += "guild_id = 12345678901234567\nchannel_id = 12345678901234567\n"
+        text += ("guild_id = 12345678901234567\nchannel_id = 12345678901234567\n"
+                 "allowlist_user_ids = []\nmention_role_id = 12345678901234567\n"
+                 "mention_user_ids = []\n")
     path.write_text(text, encoding="utf-8")
     path.chmod(0o600)
     return path
@@ -242,12 +244,33 @@ def test_web_startup_plan_carries_the_configured_port(home, monkeypatch):
     assert seen[0].web_port == 18080
 
 
-def test_notify_and_web_runtimes_are_wired_and_bot_stays_not_implemented():
+def test_notify_bot_and_web_runtimes_are_wired():
+    from afx_ops import bot
     from afx_ops.notify import runtime as notify_runtime
     from afx_ops.web import runtime as web_runtime
     assert cli.RUNTIMES["notify"] is notify_runtime.run
     assert cli.RUNTIMES["web"] is web_runtime.run
-    assert cli.RUNTIMES["bot"] is cli.feature_not_implemented
+    assert cli.RUNTIMES["bot"] is bot.run
+
+
+def test_bot_entry_hands_the_isolated_object_to_the_runtime(monkeypatch):
+    from afx_ops import bot
+    from afx_ops.bot import runtime as bot_runtime
+    seen = []
+    monkeypatch.setattr(bot_runtime, "run", lambda isolated: seen.append(isolated) or 7)
+    marker = object()
+    assert bot.run(marker) == 7
+    assert seen == [marker]
+
+
+def test_bot_preload_imports_discord_and_the_bot_runtime_before_isolation():
+    # 隔離後の業務処理が新しい module を読まないよう、preload が runtime module まで読む
+    done = subprocess.run([sys.executable, "-I", "-c",
+                           "import sys, afx_ops.cli as c; c.PRELOADS['bot'](); "
+                           "print('discord' in sys.modules, 'afx_ops.bot.runtime' in sys.modules)"],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.split() == ["True", "True"]
 
 
 def test_importing_the_entrypoint_leaves_aiohttp_to_the_preload():
