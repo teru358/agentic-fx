@@ -115,13 +115,19 @@ def test_missing_or_unusable_notify_socket_is_a_check_failure(value, root, child
     assert not got.isolated and not got.token_sent
 
 
-def test_notify_fd_is_held_through_isolation_and_closed_after_ready(root, child_env, manager):
+@pytest.mark.parametrize("feature", FEATURES)
+def test_notify_fd_never_reaches_the_body_and_is_closed_after_ready(feature, root, child_env,
+                                                                    manager):
     env = {**child_env, "NOTIFY_SOCKET": manager.env_value}
-    got = run_canary(_spec(root, "web", "open_fds"), env)
+    got = run_canary(_spec(root, feature, "body_fds"), env)
     assert got.rc == 0, got.stderr[-2000:]
     assert manager.pending() == [b"READY=1"]
-    # body に残るのは 0/1/2 と listener だけ
-    assert len(got.result) == 4 and got.result[:3] == [0, 1, 2]
+    open_fds, kept, notify_write = got.result
+    # body に残るのは 0/1/2 と web の listener だけで、通知 fd は渡されない
+    assert open_fds == kept
+    assert len(kept) == (4 if feature == "web" else 3) and kept[:3] == [0, 1, 2]
+    # 旧い通知 fd の番号へは書けない (READY=1 の後に閉じている)
+    assert notify_write == [-1, 9]
 
 
 def test_send_ready_closes_the_notify_fd_even_when_the_send_fails():
@@ -137,3 +143,24 @@ def test_send_ready_closes_the_notify_fd_even_when_the_send_fails():
     with pytest.raises(OSError) as err:
         os.fstat(fd)
     assert err.value.errno == 9
+
+
+def test_connect_notify_closes_the_socket_when_the_connect_fails(monkeypatch, tmp_path):
+    import errno
+    from afx_ops.isolation import startup
+    created = []
+    real_socket = socket.socket
+
+    class _Refusing(real_socket):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+        def connect(self, address):
+            raise OSError(errno.ECONNREFUSED, "refused")
+
+    monkeypatch.setattr(startup.socket, "socket", _Refusing)
+    with pytest.raises(startup.StartupError) as info:
+        startup.connect_notify(str(tmp_path / "notify.sock"), required=True)
+    assert info.value.reason == "unit_notify_socket"
+    assert created[0].fileno() == -1

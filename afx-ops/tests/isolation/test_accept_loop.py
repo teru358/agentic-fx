@@ -10,6 +10,7 @@ import pytest
 
 from _afx_isolation_support import (
     Interactive,
+    layout_of,
     make_root,
     needs_landlock,
     needs_strace,
@@ -347,6 +348,44 @@ def test_connection_before_isolation_waits_until_self_check(tmp_path, child_env)
         if client is not None:
             client.close()
         web.kill()
+
+
+@needs_x86_64
+@needs_landlock
+def test_web_connection_during_authentication_wait_is_accepted_only_by_the_body(tmp_path,
+                                                                               child_env):
+    from _ops_harness import start, stop
+    root = make_root(tmp_path)
+    layout = layout_of(root)
+    port = _free_port()
+    web = Interactive(_spec(root, "serve", web_port=port,
+                            wait={"interval": 0.05, "limit": 20.0}), child_env)
+    client = None
+    daemon = None
+    try:
+        # 隔離と自己検査は済み、server 認証を待っている間に接続して送る
+        web.wait_line("WAITING")
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(b"waiting")
+        client.settimeout(0.5)
+        with pytest.raises(TimeoutError):
+            client.recv(64)
+        assert not any(line in ("ISOLATED", "ACCEPTED", "HANDLED") for line in web.lines)
+        daemon = start(layout)
+        client.settimeout(10)
+        assert client.recv(64) == b"handled:waiting"
+        done = web.finish()
+        assert done.rc == 0, done.stderr[-2000:]
+        lines = [line for line in done.stdout.splitlines()
+                 if line in ("CHECKED-NOHOLD", "WAITING", "ISOLATED", "SERVING", "ACCEPTED",
+                             "HANDLED")]
+        assert lines == ["CHECKED-NOHOLD", "WAITING", "ISOLATED", "SERVING", "ACCEPTED",
+                         "HANDLED"]
+    finally:
+        if client is not None:
+            client.close()
+        web.kill()
+        stop(daemon)
 
 
 @needs_x86_64

@@ -170,7 +170,8 @@ def main() -> int:
     def body() -> None:
         # 鍵は隔離の前に読み終える。
         holder["client"] = CLIENTS[spec["principal"]].from_key_files(
-            endpoint, key_file=Path(spec["key_file"]), ready_file=Path(spec["ready_file"]))
+            endpoint, key_file=Path(spec["key_file"]), ready_file=Path(spec["ready_file"]),
+            _for_tests=True)
         if spec.get("seccomp_no_pidfd"):
             if platform.machine() != "x86_64":
                 raise SystemExit("x86_64 only")

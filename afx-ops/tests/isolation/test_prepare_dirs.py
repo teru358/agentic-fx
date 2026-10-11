@@ -150,3 +150,20 @@ def test_dirs_owned_by_another_uid_stop(area):
     assert other.stat().st_uid != os.getuid()
     assert _reason(_plan(other, state)) == "config_dir_invalid"
     assert _reason(_plan(config, other)) == "state_dir_invalid"
+
+
+def test_prepare_dirs_keeps_the_config_dir_it_checked_when_the_path_is_replaced(tmp_path):
+    config = tmp_path / "config"
+    config.mkdir(mode=0o700)
+    plan = _plan(config, tmp_path / "state")
+    checked = startup.open_config_dir(config)
+    try:
+        config.rename(tmp_path / "moved")
+        config.mkdir(mode=0o700)
+        prepared = startup.prepare_dirs(plan, config_dir_fd=checked)
+        try:
+            assert os.fstat(prepared.config_fd).st_ino == os.fstat(checked).st_ino
+        finally:
+            prepared.close()
+    finally:
+        os.close(checked)

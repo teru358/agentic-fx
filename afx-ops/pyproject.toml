@@ -5,7 +5,10 @@ description = "agentic-fx の操作 API を使う付属機能 (bot / web / notif
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiohttp==3.13.3",
+    "discord.py==2.7.1",
+]
 
 [dependency-groups]
 dev = [

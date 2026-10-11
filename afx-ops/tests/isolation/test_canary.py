@@ -162,13 +162,13 @@ def test_canary_denied(feature, attack, root, child_env, sibling):
     op, params_of, expect_of = {**_ATTACKS, **_WEB_ONLY}[attack]
     others = [p for f, p in (("bot", "ops-bot"), ("web", "ops-web"), ("notify", "ops-notify"))
               if f != feature]
-    other_key = root / "keys" / f"{others[0]}.key"
+    other_key = root / "keys" / f"{others[0]}.token"
     own = {"bot": "ops-bot", "web": "ops-web", "notify": "ops-notify"}[feature]
     # 他 principal の鍵を CLOEXEC なしで開いて渡す (隔離の fd 閉鎖で閉じられること)
     leaked = os.open(other_key, os.O_RDONLY)
     try:
         ctx = {"sibling": sibling, "inherited_fd": leaked, "other_key": str(other_key),
-               "own_key": str(root / "keys" / f"{own}.key")}
+               "own_key": str(root / "keys" / f"{own}.token")}
         spec = _spec(root, feature, op, **params_of(ctx))
         got = run_canary(spec, child_env, pass_fds=(leaked,))
     finally:
@@ -192,7 +192,7 @@ _CONTROLS = [
                          ids=[f"{c[0]}-{c[1]}" for c in _CONTROLS])
 def test_canary_attacks_reach_the_kernel_without_the_layer(fault, op, params, expect, root,
                                                          child_env):
-    params = {k: (str(root / "keys" / "ops-web.key") if v == "OTHER_KEY" else v)
+    params = {k: (str(root / "keys" / "ops-web.token") if v == "OTHER_KEY" else v)
               for k, v in params.items()}
     spec = {**_spec(root, "bot", op, **params), "fault": fault}
     got = run_canary(spec, child_env)
@@ -209,7 +209,7 @@ def test_canary_attacks_reach_the_kernel_without_the_layer(fault, op, params, ex
 
 ALLOWED = (
     [(f, op) for f in FEATURES for op in ("clone3_enosys", "thread", "futex", "prctl_dumpable0",
-                                           "unix_connect", "proc_locks")]
+                                           "unix_connect", "proc_locks", "random")]
     + [(f, op) for f in ("bot", "notify")
        for op in ("tcp_connect", "udp_echo", "getaddrinfo", "getaddrinfo_addrconfig",
                   "tls_files")])
@@ -233,6 +233,8 @@ def test_canary_allowed(feature, op, root, child_env, servers, tmp_path):
     elif op == "proc_locks":
         spec, expect = _spec(root, feature, "read_file", path="/proc/locks"), \
             lambda r: r[0] >= 0 and r[1] == 0
+    elif op == "random":
+        spec, expect = _spec(root, feature, "random"), lambda r: r == [20, 0]
     elif op == "tcp_connect":
         echo = servers(socket.AF_INET, socket.SOCK_STREAM, ("127.0.0.1", 0))
         spec, expect = _spec(root, feature, "tcp_connect", port=echo.port,
@@ -321,8 +323,8 @@ def test_held_listener_cannot_be_rebound_or_used_outward(root, child_env, server
 @pytest.mark.parametrize("field", ["connect_ports", "check_unit", "require_notify", "config_dir",
                                    "state_dir", "secret_dir", "secret_files"])
 def test_a_widened_production_plan_stops_before_reading_keys(field, root, child_env):
-    key = root / "keys" / "ops-bot.key"
-    key.chmod(0)  # 鍵を読もうとすれば secrets_failed になる
+    key = root / "keys" / "ops-bot.token"
+    key.chmod(0)  # 鍵を読もうとすれば key_file_invalid になる
     got = run_canary({**_spec(root, "bot", "noop"), "plan": f"widen:{field}"},
                      {**child_env, "XDG_CONFIG_HOME": str(root / "xdg-config"),
                       "XDG_STATE_HOME": str(root / "xdg-state")})
@@ -460,8 +462,8 @@ def test_self_check_passes_without_faults(root, child_env):
 
 
 def test_missing_no_new_privs_stops_before_reading_keys(root, child_env):
-    # 鍵 file を読めない状態にしておき、鍵を読む前に止まること (secrets_failed にならない)
-    key = root / "keys" / "ops-bot.key"
+    # 鍵 file を読めない状態にしておき、鍵を読む前に止まること (key_file_invalid にならない)
+    key = root / "keys" / "ops-bot.token"
     key.chmod(0)
     got = run_canary({**_spec(root, "bot", "noop"), "nnp": False}, child_env)
     assert got.rc == 71
@@ -470,10 +472,10 @@ def test_missing_no_new_privs_stops_before_reading_keys(root, child_env):
 
 
 def test_unreadable_key_fails_closed(root, child_env):
-    (root / "keys" / "ops-bot.key").unlink()
+    (root / "keys" / "ops-bot.token").unlink()
     got = run_canary(_spec(root, "bot", "noop"), child_env)
     assert got.rc == 71
-    assert got.stderr.strip().splitlines()[-1] == "afx-ops: secrets_failed"
+    assert got.stderr.strip().splitlines()[-1] == "afx-ops: key_missing"
 
 
 def test_unit_check_rejects_a_non_unit_launch(root, child_env):
@@ -496,7 +498,7 @@ def test_isolated_peer_cannot_take_token_from_another_ops(root, child_env):
         os.close(fd)
         bot.send()
         bot.wait_line("HELD")
-        bot_key = str(root / "keys" / "ops-bot.key")
+        bot_key = str(root / "keys" / "ops-bot.token")
         attacks = {
             "bot_key": ("read_file", {"path": bot_key}, [-1, EACCES]),
             "bot_mem": ("open", {"path": f"/proc/{bot.pid}/mem"}, [-1, EACCES]),
@@ -540,8 +542,8 @@ def test_missing_state_dir_is_created_before_isolation(feature, root, child_env)
 @pytest.mark.parametrize("feature", FEATURES)
 def test_missing_config_dir_stops_before_reading_keys(feature, root, child_env):
     shutil.rmtree(root / feature / "config")
-    key = root / "keys" / f"{PRINCIPAL[feature]}.key"
-    key.chmod(0)  # 鍵を読もうとすれば secrets_failed になる
+    key = root / "keys" / f"{PRINCIPAL[feature]}.token"
+    key.chmod(0)  # 鍵を読もうとすれば key_file_invalid になる
     got = run_canary(_spec(root, feature, "noop"), child_env)
     assert got.rc == 71
     assert got.stderr.strip().splitlines() == ["afx-ops: config_dir_missing"]
@@ -552,8 +554,8 @@ def test_a_state_symlink_stops_before_reading_keys_and_isolation(root, child_env
     state = root / "bot" / "state"
     state.rmdir()
     state.symlink_to(root / "keys")
-    key = root / "keys" / "ops-bot.key"
-    key.chmod(0)  # 鍵を読もうとすれば secrets_failed になる
+    key = root / "keys" / "ops-bot.token"
+    key.chmod(0)  # 鍵を読もうとすれば key_file_invalid になる
     got = run_canary(_spec(root, "bot", "noop"), child_env)
     assert got.rc == 71
     assert got.stderr.strip().splitlines() == ["afx-ops: state_dir_invalid"]
@@ -572,13 +574,13 @@ def test_landlock_follows_the_checked_state_dir_not_a_later_swap(root, child_env
     # 検査の後で state を他 principal の鍵 dir への symlink に差し替えても、規則は検査した
     # dir (今は state.orig) に付いていて、差し替え先には書けない
     state = root / "bot" / "state"
+    before = sorted(p.name for p in (root / "keys").iterdir())
     got = run_canary({**_spec(root, "bot", "write_state", dir=str(state)),
                       "swap_after_prepare": {"path": str(state), "to": str(root / "keys")}},
                      child_env)
     assert got.rc == 0, got.stderr[-2000:]
     assert got.isolated and got.result == [-1, EACCES]
-    assert sorted(p.name for p in (root / "keys").iterdir()) == sorted(
-        f"{p}.key" for p in PRINCIPAL.values())
+    assert sorted(p.name for p in (root / "keys").iterdir()) == before
     got = run_canary({**_spec(root, "notify", "write_state",
                               dir=str(root / "notify" / "state.orig")),
                       "swap_after_prepare": {"path": str(root / "notify" / "state"),

@@ -7,14 +7,17 @@
    鍵を読む前に確かめ、`NOTIFY_SOCKET` へ connect する。
 1. config dir と state dir を親 dir から symlink を辿らずに開き、所有者・mode・種別を
    確かめる (config が無ければ鍵を読まずに止まる。state は無ければ 0700 で作る)。開いた
-   fd は Landlock の規則を付けるまで持つ。機能の secret を plan の secret dir から、plan が
-   固定した名前の file だけ読む (secret dir は Landlock の規則に入れない)。
-   web は loopback listener を pre-bind + listen して検査する (accept はしない)。
+   fd は Landlock の規則を付けるまで持つ。機能の固定 principal の API 鍵を、設定の key_dir
+   から manifest の state と digest を照合して読む。続けて機能の secret を plan の secret
+   dir から、plan が固定した名前の file だけ読む (鍵 dir と secret dir は Landlock の規則に
+   入れない)。web は loopback listener を pre-bind + listen して検査する (accept はしない)。
 2. 保持してよい fd (0/1/2、web の listener、sd_notify の fd、1 の領域の fd) 以外を全部閉じる。
 3. Landlock (領域の規則は 1 で検査した fd に付ける)。領域の fd を閉じる。
 4. 機能別 seccomp。
-5. `PR_SET_DUMPABLE=0` と自己検査。通ったら `READY=1` を送り、通知 fd を閉じる。
-6. 業務処理 (body) へ渡す。
+5. `PR_SET_DUMPABLE=0` と自己検査。
+6. server 認証 (`wait_ready`、鍵は送らない) が通ったら `READY=1` を送る。成否に依らず
+   通知 fd はここで閉じ、body へ渡さない。
+7. 業務処理 (body) へ渡す。
 
 どの段の失敗も固定 reason を stderr に 1 行出して非零終了し、READY=1 も送らず body も
 呼ばない (= token を送らない)。`/proc/self` は使わず、起動時の `os.getpid()` で解決した
@@ -23,6 +26,8 @@
 from __future__ import annotations
 
 import ctypes
+import contextlib
+import dataclasses
 import errno
 import glob
 import os
@@ -31,17 +36,24 @@ import stat
 import sys
 import sysconfig
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
+from typing import TYPE_CHECKING, TypeVar
 
 import afx_ops
+from afx_ops import keys
+from afx_ops.api_client import RC_UNREACHABLE, ApiError, Endpoint, wait_ready
 from afx_ops.isolation import bpf, landlock
 from afx_ops.isolation._libc import libc as _libc
 from afx_ops.isolation.accept_loop import ListenerError, prebind_listener
 from afx_ops.isolation.profiles import feature_filter
 from afx_ops.isolation.policy import PolicyBuildError
 
+if TYPE_CHECKING:
+    from afx_ops.config import OpsConfig
+
+RC_RUNTIME_IMPORT_FAILED = 70
 RC_ISOLATION_FAILED = 71
 
 REASONS = (
@@ -72,7 +84,16 @@ REASONS = (
     "config_dir_invalid",
     "state_dir_failed",
     "state_dir_invalid",
+    "runtime_import_failed",
 )
+
+
+def key_reason(code: str) -> str:
+    """鍵の読取り失敗の code を固定 reason にする (`key_` で始まらなければ前置する)。"""
+    return code if code.startswith("key_") else f"key_{code}"
+
+
+REASONS += tuple(dict.fromkeys(key_reason(code) for code in keys.CODES))
 
 # systemd (Type=notify) の通知先。abstract は先頭 '@'、pathname は絶対 path
 NOTIFY_ENV = "NOTIFY_SOCKET"
@@ -124,6 +145,14 @@ PLANS: Mapping[str, FeaturePlan] = MappingProxyType({
     "bot": FeaturePlan("bot", (443,), listener=False, secret_files=("discord.token",)),
     "web": FeaturePlan("web", (), listener=True, secret_files=()),
     "notify": FeaturePlan("notify", (443,), listener=False, secret_files=("webhook.url",)),
+})
+
+
+# 機能ごとに固定の principal。設定からは指せない (他 principal の鍵を読ませない)
+PRINCIPALS: Mapping[str, str] = MappingProxyType({
+    "bot": "ops-bot",
+    "web": "ops-web",
+    "notify": "ops-notify",
 })
 
 
@@ -202,14 +231,38 @@ def check_plan(plan: StartupPlan) -> None:
 
 @dataclass
 class Isolated:
-    """隔離が済んだ後に body へ渡すもの。"""
+    """隔離が済んだ後に body へ渡すもの。
+
+    secret と API 鍵は repr に出さない (ログや例外の文に載せない)。鍵 dir は隔離後の
+    Landlock の許可に無いので、鍵はここで受け取ったもの以外に読めない。
+    """
 
     feature: str
     pid: int
     proc_dir: str
-    secrets: Mapping[str, bytes]
+    secrets: Mapping[str, bytes] = field(repr=False)
     listener: socket.socket | None
     kept_fds: frozenset[int]
+    config: OpsConfig
+    endpoint: Endpoint
+    api_token: bytes = field(repr=False)
+    state_dir: Path
+
+
+def endpoint_for(instance_root: Path) -> Endpoint:
+    """本体の既定の配置 `<instance_root>/data/run/api.sock` と `<instance_root>/data/instance.lock`。"""
+    data = Path(instance_root) / "data"
+    return Endpoint(socket_path=data / "run" / "api.sock", lock_path=data / "instance.lock")
+
+
+_Client = TypeVar("_Client")
+
+
+def client_for(isolated: Isolated, client_cls: type[_Client]) -> _Client:
+    """機能の固定 principal の client だけを、受け取った鍵で作る。"""
+    if getattr(client_cls, "principal", None) != PRINCIPALS[isolated.feature]:
+        raise ValueError("client principal does not match the feature")
+    return client_cls.from_token(isolated.endpoint, isolated.api_token)
 
 
 # --- 純関数 (text の解釈) ------------------------------------------------------
@@ -328,6 +381,8 @@ def runtime_rules() -> list[landlock.PathRule]:
     dirs.add(os.path.realpath(os.path.dirname(afx_ops.__file__)))
     rules = [landlock.PathRule(d, landlock.RUNTIME) for d in sorted(dirs)]
     rules.append(landlock.PathRule(os.path.realpath(sys.executable), landlock.RUNTIME))
+    # os.urandom / secrets / uuid4 は隔離後に /dev/urandom を開く
+    rules.append(landlock.PathRule("/dev/urandom", landlock.ACCESS_FS_READ_FILE))
     return rules
 
 
@@ -438,6 +493,18 @@ class PreparedDirs:
         self.config_fd = self.state_fd = -1
 
 
+class _ConfigDirOwner:
+    """起動口から受け取った config dir fd を一度だけ閉じる。"""
+
+    def __init__(self, fd: int | None) -> None:
+        self._fd = fd
+
+    def close(self) -> None:
+        if self._fd is not None:
+            fd, self._fd = self._fd, None
+            os.close(fd)
+
+
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 
 
@@ -461,9 +528,10 @@ def _check_owned_dir(fd: int, reason: str, *, exact_mode: int | None) -> None:
         raise StartupError(reason, "writable by others")
 
 
-def _open_config_dir(path: Path) -> int:
+def open_config_dir(path: Path) -> int:
+    """設定 dir を親 fd から開き、設定を読む側と隔離準備側で同じ検査を使う。"""
     try:
-        parent = os.open(path.parent, _DIR_FLAGS)
+        parent = os.open(path.parent, _DIR_FLAGS | os.O_NOFOLLOW)
     except FileNotFoundError:
         raise StartupError("config_dir_missing", "parent") from None
     except OSError as exc:
@@ -515,7 +583,38 @@ def _open_state_dir(path: Path) -> int:
     return fd
 
 
-def prepare_dirs(plan: StartupPlan) -> PreparedDirs:
+def _duplicate_checked_config_dir(config_dir_fd: int) -> int:
+    try:
+        fd = os.dup(config_dir_fd)
+    except OSError as exc:
+        raise StartupError("config_dir_invalid", str(exc.errno)) from None
+    try:
+        _check_owned_dir(fd, "config_dir_invalid", exact_mode=None)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_secret_dir(path: Path) -> int:
+    try:
+        parent = os.open(path.parent, _DIR_FLAGS | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise StartupError("secrets_failed", f"dir {exc.errno}") from None
+    try:
+        fd = _open_leaf(parent, path.name, "secrets_failed")
+    finally:
+        os.close(parent)
+    try:
+        _check_owned_dir(fd, "secrets_failed", exact_mode=0o700)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def prepare_dirs(plan: StartupPlan, *, config_dir_fd: int | None = None,
+                 key_dir: Path | None = None) -> PreparedDirs:
     """config dir と state dir を検査して開く。鍵を読む前・隔離前に呼ぶ。
 
     どちらも親 dir の fd から `O_NOFOLLOW|O_DIRECTORY` で開き、fstat で自 uid の dir で
@@ -523,16 +622,52 @@ def prepare_dirs(plan: StartupPlan) -> PreparedDirs:
     利用者が置く設定の領域なので作らず (無いのは設置の誤り)、他者書込み不可を求める。
     state は機能自身が書く領域なので無ければ 0700 で作り、0700 ちょうどを求める。
     """
-    config_fd = _open_config_dir(plan.config_dir)
+    config_fd = (open_config_dir(plan.config_dir) if config_dir_fd is None
+                 else _duplicate_checked_config_dir(config_dir_fd))
     try:
         state_fd = _open_state_dir(plan.state_dir)
     except BaseException:
         os.close(config_fd)
         raise
+    if key_dir is not None:
+        # 領域の検査が通った直後、差し替えの余地が出る前に鍵 dir の境界を見る
+        # (以後に差し替わっても Landlock は検査済みの fd に従う)
+        from afx_ops.config import validate_key_dir
+        try:
+            checked_dir_fds = {"config_dir": config_fd, "state_dir": state_fd}
+            secret_fd = _open_secret_dir(plan.secret_dir) if plan.secret_files else -1
+            try:
+                if secret_fd >= 0:
+                    checked_dir_fds["secret_dir"] = secret_fd
+                validate_key_dir(key_dir, config_dir=plan.config_dir, state_dir=plan.state_dir,
+                                 secret_dir=plan.secret_dir, checked_dir_fds=checked_dir_fds)
+            finally:
+                if secret_fd >= 0:
+                    os.close(secret_fd)
+        except BaseException:
+            os.close(config_fd)
+            os.close(state_fd)
+            raise
     return PreparedDirs(config_fd=config_fd, state_fd=state_fd)
 
 
 _SECRET_MAX = 65536
+
+
+def read_api_token(feature: str, key_dir: Path) -> bytes:
+    """機能の固定 principal の鍵を、manifest の state と digest を照合して読む。隔離前に呼ぶ。
+
+    feature secret の reader は使わない (manifest の照合を欠くため)。失敗は `key_*` の固定
+    reason で、例外文に path や鍵を載せない。
+    """
+    principal = PRINCIPALS[feature]
+    key_dir = Path(key_dir)
+    try:
+        token = keys.read_token(principal, key_file=key_dir / keys.key_file_name(principal),
+                                ready_file=key_dir / keys.READY_NAME)
+    except keys.KeyReadError as exc:
+        raise StartupError(key_reason(exc.code)) from None
+    return token.encode("ascii")
 
 
 def read_secrets(plan: StartupPlan) -> Mapping[str, bytes]:
@@ -548,16 +683,8 @@ def read_secrets(plan: StartupPlan) -> Mapping[str, bytes]:
     for name in plan.secret_files:
         if not name or "/" in name or name in (".", ".."):
             raise StartupError("secrets_failed", "name")
+    dir_fd = _open_secret_dir(plan.secret_dir)
     try:
-        parent = os.open(plan.secret_dir.parent, _DIR_FLAGS)
-    except OSError as exc:
-        raise StartupError("secrets_failed", f"dir {exc.errno}") from None
-    try:
-        dir_fd = _open_leaf(parent, plan.secret_dir.name, "secrets_failed")
-    finally:
-        os.close(parent)
-    try:
-        _check_owned_dir(dir_fd, "secrets_failed", exact_mode=0o700)
         return MappingProxyType({name: _read_secret_file(dir_fd, name)
                                  for name in plan.secret_files})
     finally:
@@ -625,69 +752,121 @@ def send_ready(sock: socket.socket) -> None:
         sock.close()
 
 
-def isolate(plan: StartupPlan, *,
-            plan_check: Callable[[StartupPlan], None] = check_plan) -> Isolated:
-    """0〜5 段を順に行い、自己検査が通ったら READY=1 を送る。失敗は `StartupError`。"""
-    plan_check(plan)
-    pid = os.getpid()
-    proc = f"/proc/{pid}"
-    check_preconditions(plan, proc)
-    notify = connect_notify(os.environ.get(NOTIFY_ENV), required=plan.require_notify)
-    try:
-        compiled = feature_filter(plan.feature).compiled
-    except PolicyBuildError as exc:
-        raise StartupError("seccomp_table_invalid", str(exc)) from None
-    dirs = prepare_dirs(plan)
-    try:
-        secrets = read_secrets(plan)
-        listener = None
-        if PLANS[plan.feature].listener:
-            if plan.web_port is None:
-                # web の設定 (port の読み取り元) がまだ無い。それまでは起動口からの web は
-                # ここで固定 reason のまま止まる (意図した停止)
-                raise StartupError("listener_invalid", "no port source until web config")
-            try:
-                listener = prebind_listener(plan.web_port)
-            except (ListenerError, OSError) as exc:
-                raise StartupError("listener_invalid", str(exc)) from None
-        keep = {0, 1, 2}
-        if listener is not None:
-            keep.add(listener.fileno())
-        if notify is not None:
-            keep.add(notify.fileno())
-        # 領域の fd は Landlock の規則を付けるまで残し、付けたら閉じる (自己検査の対象外)
-        close_unlisted_fds(proc, keep | dirs.fds())
-        try:
-            filters_before = filter_count(proc)
-        except (OSError, ValueError) as exc:
-            raise StartupError("self_check_unreadable", type(exc).__name__) from None
-        apply_landlock(plan, proc, dirs)
-    finally:
-        dirs.close()
-    apply_seccomp(compiled)
-    set_dumpable_zero()
-    self_check(proc, filters_before=filters_before, keep=keep)
-    if notify is not None:
-        keep.discard(notify.fileno())
-        send_ready(notify)
-    return Isolated(feature=plan.feature, pid=pid, proc_dir=proc, secrets=secrets,
-                    listener=listener, kept_fds=frozenset(keep))
+def announce_ready(notify: socket.socket | None, endpoint: Endpoint, *,
+                   wait: Callable[[Endpoint], None] = wait_ready) -> None:
+    """server 認証が通ったときだけ `READY=1` を送る。通知 fd は成否に依らずここで閉じる。
 
-
-def run(plan: StartupPlan, body: Callable[[Isolated], int], *,
-        plan_check: Callable[[StartupPlan], None] = check_plan) -> int:
-    """隔離して自己検査が通ったときだけ body を呼ぶ。失敗は固定 reason で非零。
-
-    `plan_check` は試験だけが差し替える (unit の外・一時領域で起動するため)。production の
-    起動口は渡さず、設定からも変えられない。
+    認証の失敗 (`ApiError`) はそのまま上げる。READY=1 が届かなければ unit は active に
+    ならず、systemd の restart が新しい process で隔離からやり直す。
     """
     try:
-        isolated = isolate(plan, plan_check=plan_check)
+        wait(endpoint)
+    except BaseException:
+        if notify is not None:
+            notify.close()
+        raise
+    if notify is not None:
+        send_ready(notify)
+
+
+def isolate(plan: StartupPlan, config: OpsConfig, *,
+            plan_check: Callable[[StartupPlan], None] = check_plan,
+            release_config_dir: Callable[[], None] | None = None,
+            ) -> tuple[Isolated, socket.socket | None]:
+    """0〜5 段を順に行う。失敗は `StartupError`。
+
+    通知 fd は `Isolated` に入れず別に返す (body へ渡さず、READY=1 の後に閉じるため)。
+    """
+    with contextlib.ExitStack() as cleanup:
+        plan_check(plan)
+        pid = os.getpid()
+        proc = f"/proc/{pid}"
+        check_preconditions(plan, proc)
+        notify = connect_notify(os.environ.get(NOTIFY_ENV), required=plan.require_notify)
+        if notify is not None:
+            cleanup.callback(notify.close)
+        try:
+            compiled = feature_filter(plan.feature).compiled
+        except PolicyBuildError as exc:
+            raise StartupError("seccomp_table_invalid", str(exc)) from None
+        dirs = prepare_dirs(plan, config_dir_fd=config.config_dir_fd, key_dir=config.key_dir)
+        cleanup.callback(dirs.close)
+        if release_config_dir is not None:
+            release_config_dir()
+        try:
+            api_token = read_api_token(plan.feature, config.key_dir)
+            secrets = read_secrets(plan)
+            listener = None
+            if PLANS[plan.feature].listener:
+                if plan.web_port is None:
+                    raise StartupError("listener_invalid", "no port source until web config")
+                try:
+                    listener = prebind_listener(plan.web_port)
+                except (ListenerError, OSError) as exc:
+                    raise StartupError("listener_invalid", str(exc)) from None
+                cleanup.callback(listener.close)
+            keep = {0, 1, 2}
+            if listener is not None:
+                keep.add(listener.fileno())
+            if notify is not None:
+                keep.add(notify.fileno())
+            close_unlisted_fds(proc, keep | dirs.fds())
+            try:
+                filters_before = filter_count(proc)
+            except (OSError, ValueError) as exc:
+                raise StartupError("self_check_unreadable", type(exc).__name__) from None
+            apply_landlock(plan, proc, dirs)
+        finally:
+            dirs.close()
+        apply_seccomp(compiled)
+        set_dumpable_zero()
+        self_check(proc, filters_before=filters_before, keep=keep)
+        if notify is not None:
+            keep.discard(notify.fileno())
+        isolated = Isolated(feature=plan.feature, pid=pid, proc_dir=proc, secrets=secrets,
+                            listener=listener, kept_fds=frozenset(keep),
+                            config=dataclasses.replace(config, config_dir_fd=None),
+                            endpoint=endpoint_for(config.instance_root), api_token=api_token,
+                            state_dir=plan.state_dir)
+        cleanup.pop_all()
+        return isolated, notify
+
+
+def _no_preload() -> None:
+    return None
+
+
+def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *,
+        plan_check: Callable[[StartupPlan], None] = check_plan,
+        wait: Callable[[Endpoint], None] = wait_ready,
+        preload: Callable[[], None] = _no_preload) -> int:
+    """隔離して自己検査と server 認証が通ったときだけ body を呼ぶ。失敗は固定 reason で非零。
+
+    `plan_check` と `wait` は試験だけが差し替える (unit の外・一時領域・短い待ちで起動する
+    ため)。production の起動口は渡さず、設定からも変えられない。server 認証の失敗は要求経路
+    の失敗と同じ終了コード (`RC_UNREACHABLE`) で、process 内では再試行しない。
+    """
+    owner = _ConfigDirOwner(config.config_dir_fd)
+    try:
+        with contextlib.ExitStack() as cleanup:
+            cleanup.callback(owner.close)
+            try:
+                preload()
+            except Exception:
+                raise StartupError("runtime_import_failed") from None
+            isolated, notify = isolate(plan, config, plan_check=plan_check,
+                                      release_config_dir=owner.close)
+            announce_ready(notify, isolated.endpoint, wait=wait)
     except StartupError as exc:
         reason = exc.reason
-    except Exception:  # 想定外の失敗も traceback (path や値を含み得る) にせず固定語で閉じる
-        reason = "startup_internal_error"
+        rc = RC_RUNTIME_IMPORT_FAILED if reason == "runtime_import_failed" else RC_ISOLATION_FAILED
+    except ApiError as exc:
+        reason, rc = exc.reason, RC_UNREACHABLE
+    except Exception as exc:  # 想定外の失敗も traceback (path や値を含み得る) にせず固定語で閉じる
+        reason = "config_invalid" if getattr(exc, "reason", None) == "config_invalid" else \
+            "startup_internal_error"
+        rc = RC_ISOLATION_FAILED
     else:
         return body(isolated)
     print(f"afx-ops: {reason}", file=sys.stderr, flush=True)
-    return RC_ISOLATION_FAILED
+    return rc

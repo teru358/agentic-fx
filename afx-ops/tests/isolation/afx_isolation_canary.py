@@ -4,7 +4,14 @@ usage: python afx_isolation_canary.py '<json spec>'
 
 spec:
   feature: bot | web | notify
-  root: 一時領域 (<root>/<feature>/{config,state}、<root>/keys/<principal>.key)
+  root: 一時領域 (<root>/<feature>/{config,secret,state}、<root>/keys に実 manifest と
+        <principal>.token、<root>/root が instance root)。設定 (OpsConfig) は ops.toml を
+        読まずにこの配置から組み立てる (ops.toml の読取りは test_config が受け持つ)
+  key_dir / instance_root: 設定の key_dir / instance_root を差し替える
+  wait: 省略時は server 認証の待ちを即成功にする。{"interval": s, "limit": s} なら本物の
+         wait_ready で待ち、最初の待ちで "WAITING" を出す (自己検査の後には "CHECKED-NOHOLD")
+  trace: startup.<名前> の list。呼ばれるたびに "CALL <名前>" を出す
+  config_fd: 真なら設定に検査済みの config dir の fd を入れて渡す (起動口と同じ経路)
   op: 試す操作の名前 (下の OPS)
   params: 操作の引数
   nnp: 真なら隔離前に no_new_privs を立てる (unit の NoNewPrivileges=yes の代わり)
@@ -39,6 +46,7 @@ import resource
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -46,6 +54,8 @@ resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 # -I で起動されるので、試験用 plan の helper (同じ dir) は path を明示して読む
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _test_plans import check_feature_only, test_plan  # noqa: E402
+from afx_ops import api_client, cli  # noqa: E402
+from afx_ops.config import OpsConfig  # noqa: E402
 from afx_ops.isolation import startup  # noqa: E402
 from afx_ops.isolation.syscalls_x86_64 import SNAPSHOT_NUMBERS as NR  # noqa: E402
 
@@ -304,6 +314,14 @@ def op_tls_files(p, iso):
     return oserr(go)
 
 
+def op_random(p, iso):
+    def go():
+        import secrets
+        import uuid
+        return len(secrets.token_hex(8)) + uuid.uuid4().version
+    return oserr(go)
+
+
 def op_stat(p, iso):
     return oserr(lambda: os.stat(p["path"]) and None)
 
@@ -402,8 +420,88 @@ def op_open_fds(p, iso):
     return sorted(startup.open_fds(iso.proc_dir))
 
 
+def op_import_runtime(p, iso):
+    """隔離後に初めて機能の runtime library を import する (遅延 import が許可で通ること)。"""
+    import importlib
+    for name in p["modules"]:
+        importlib.import_module(name)
+    return [len(p["modules"]), 0]
+
+
+def op_snapshot_rounds(p, iso):
+    """隔離後の state dir で snapshot の書込み・読戻しを繰り返し、thread からも書く。"""
+    from afx_ops.snapshot import read_snapshot, write_snapshot
+    fd = os.open(iso.state_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for i in range(p.get("rounds", 200)):
+            write_snapshot(fd, "snapshot.json", {"version": 1, "n": i})
+            if read_snapshot(fd, "snapshot.json", 1)["n"] != i:
+                return [-1, i]
+        lock = threading.Lock()
+        errors = []
+
+        def writer(k):
+            for j in range(p.get("per_thread", 20)):
+                try:
+                    # 単一 writer の契約なので、thread からの書込みは呼出し側で直列化する
+                    with lock:
+                        write_snapshot(fd, "snapshot.json", {"version": 1, "n": k * 1000 + j})
+                        read_snapshot(fd, "snapshot.json", 1)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(type(exc).__name__)
+        threads = [threading.Thread(target=writer, args=(k,)) for k in range(p.get("threads", 4))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if errors:
+            return [-2, errors[0]]
+        return [read_snapshot(fd, "snapshot.json", 1)["version"],
+                sorted(os.listdir(fd))]
+    finally:
+        os.close(fd)
+
+
+def op_body_fds(p, iso):
+    """(body の open fd、Isolated.kept_fds、旧い通知 fd への書込みの結果)。"""
+    fds = sorted(startup.open_fds(iso.proc_dir))
+    return [fds, sorted(iso.kept_fds), op_notify_fd_write(p, iso)]
+
+
 def op_noop(p, iso):
     return [0, 0]
+
+
+def op_listdir(p, iso):
+    return oserr(lambda: len(os.listdir(p["path"])))
+
+
+def op_api_token(p, iso):
+    import hashlib
+    return [type(iso.api_token).__name__, hashlib.sha256(iso.api_token).hexdigest()]
+
+
+def op_config_view(p, iso):
+    return {"instance_root": str(iso.config.instance_root), "key_dir": str(iso.config.key_dir),
+            "socket_path": str(iso.endpoint.socket_path),
+            "lock_path": str(iso.endpoint.lock_path), "state_dir": str(iso.state_dir),
+            "config_dir_fd": iso.config.config_dir_fd}
+
+
+def op_repr_isolated(p, iso):
+    text = repr(iso) + str(iso)
+    sys.stderr.write(text + "\n")
+    return [len(text), 0, len(iso.api_token) == 64, len(iso.secrets) == 1]
+
+
+def op_client_status(p, iso):
+    client = startup.client_for(iso, {"bot": api_client.BotClient, "web": api_client.WebClient,
+                                      "notify": api_client.NotifyClient}[iso.feature])
+    try:
+        reply = client.status() if iso.feature == "web" else client.events()
+    except api_client.ApiError as exc:
+        return [-1, exc.reason]
+    return [reply.status, 0]
 
 
 OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
@@ -412,12 +510,11 @@ OPS = {name[3:]: fn for name, fn in globals().items() if name.startswith("op_")}
 def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
     """(plan, plan 検査)。production / widen は本番の検査、test は機能名だけの検査。
 
-    test の plan は secret dir を <root>/keys に向け、自分の principal の鍵 file だけを
-    読む名前にする (同じ dir に他 principal の鍵も置き、それを読まないことを見る)。
+    test の plan は領域を <root>/<feature>/ に向ける (secret は機能の固定の名前のまま)。
     """
     root = Path(spec["root"])
     feature = spec["feature"]
-    own_key = f"{PRINCIPAL[feature]}.key"
+    own_key = f"{PRINCIPAL[feature]}.token"
 
     plan_kind = spec.get("plan", "test")
     if plan_kind != "test":
@@ -443,11 +540,55 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
     ports = params.get("connect_ports")
     return test_plan(
         feature, config_dir=root / feature / "config", state_dir=root / feature / "state",
-        secret_dir=root / "keys", secret_files=(own_key,),
+        secret_dir=root / feature / "secret",
         web_port=spec.get("web_port", 0) if feature == "web" else None,
         connect_ports=tuple(ports) if ports is not None else None,
         check_unit=bool(spec.get("unit")),
         require_notify=bool(spec.get("require_notify"))), check_feature_only
+
+
+def _config(spec: dict) -> OpsConfig:
+    """配置から設定を組み立てる。config dir の fd は渡さず、隔離準備が plan の path から開く。"""
+    root = Path(spec["root"])
+    extra = {}
+    if spec["feature"] == "web":
+        extra["port"] = spec.get("web_port", 0)
+    elif spec["feature"] == "bot":
+        extra = {"guild_id": 123456789012345678, "channel_id": 223456789012345678}
+    # config_fd が真なら production と同じく検査済みの config dir の fd を渡す
+    fd = (startup.open_config_dir(root / spec["feature"] / "config") if spec.get("config_fd")
+          else None)
+    return OpsConfig(instance_root=Path(spec.get("instance_root", root / "root")),
+                     key_dir=Path(spec.get("key_dir", root / "keys")),
+                     config_dir_fd=fd, **extra)
+
+
+def _wait(spec: dict):
+    how = spec.get("wait")
+    if how is None:
+        return lambda endpoint: None
+    announced = []
+
+    def sleep(seconds: float) -> None:
+        if not announced:
+            announced.append(1)
+            sys.stdout.write("WAITING\n")
+            sys.stdout.flush()
+        time.sleep(seconds)
+
+    return lambda endpoint: api_client.wait_ready(endpoint, interval=how["interval"],
+                                                   limit=how["limit"], sleep=sleep)
+
+
+def _trace(names) -> None:
+    for name in names:
+        original = getattr(startup, name)
+
+        def traced(*args, _name=name, _original=original, **kwargs):
+            sys.stdout.write(f"CALL {_name}\n")
+            sys.stdout.flush()
+            return _original(*args, **kwargs)
+        setattr(startup, name, traced)
 
 
 def _inject(fault) -> None:
@@ -531,12 +672,21 @@ def main() -> int:
         swap = spec["swap_after_prepare"]
         original_prepare = startup.prepare_dirs
 
-        def prepare_then_swap(plan):
-            dirs = original_prepare(plan)
+        def prepare_then_swap(plan, **kwargs):
+            dirs = original_prepare(plan, **kwargs)
             os.rename(swap["path"], swap["path"] + ".orig")
             os.symlink(swap["to"], swap["path"])
             return dirs
         startup.prepare_dirs = prepare_then_swap
+    if spec.get("wait") is not None and not spec.get("hold_after_check"):
+        original_self_check = startup.self_check
+
+        def check_then_mark(proc, **kw):
+            original_self_check(proc, **kw)
+            sys.stdout.write("CHECKED-NOHOLD\n")
+            sys.stdout.flush()
+        startup.self_check = check_then_mark
+    _trace(spec.get("trace", ()))
     if spec.get("fault_self_check") == "off":
         startup.self_check = lambda proc, **kw: None
     if spec.get("wait_before"):
@@ -559,7 +709,8 @@ def main() -> int:
             sys.stdin.readline()
         return 0
 
-    return startup.run(plan, body, plan_check=plan_check)
+    return startup.run(plan, _config(spec), body, plan_check=plan_check, wait=_wait(spec),
+                       preload=cli.PRELOADS[spec["feature"]])
 
 
 if __name__ == "__main__":

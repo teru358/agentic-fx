@@ -495,7 +495,7 @@ def test_status_line_shows_target_unit_active_state_and_result(tmp_path, monkeyp
     setup.ready = lambda _feature: False
     with pytest.raises(SystemdError):
         setup.enable("bot")
-    # 実 manager では afx の停止で BindsTo により ops も止まる。偽物ではここで写す。
+    # 実 manager では afx の停止で PartOf により ops も止まる。偽物ではここで写す。
     systemd.active.discard(setup.paths.feature_unit("bot"))
     systemd.results[setup.paths.feature_unit("bot")] = "exit-code"
 

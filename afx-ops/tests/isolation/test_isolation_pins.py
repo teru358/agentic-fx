@@ -71,9 +71,19 @@ def _first_call_lines(func) -> dict[str, int]:
 def test_isolate_runs_the_stages_in_the_fixed_order():
     lines = _first_call_lines(startup.isolate)
     order = ["plan_check", "check_preconditions", "connect_notify", "feature_filter",
-             "prepare_dirs", "read_secrets", "prebind_listener", "close_unlisted_fds", "apply_landlock",
-             "apply_seccomp", "set_dumpable_zero", "self_check", "send_ready"]
+             "prepare_dirs", "read_api_token", "read_secrets", "prebind_listener",
+             "close_unlisted_fds", "apply_landlock", "apply_seccomp", "set_dumpable_zero",
+             "self_check"]
     assert [lines[name] for name in order] == sorted(lines[name] for name in order)
+    # READY=1 は isolate では送らない (server 認証の後に run が送る)
+    assert "send_ready" not in lines and "announce_ready" not in lines
+
+
+def test_run_announces_ready_between_isolation_and_body():
+    lines = _first_call_lines(startup.run)
+    order = ["isolate", "announce_ready", "body"]
+    assert [lines[name] for name in order] == sorted(lines[name] for name in order)
+    assert len({lines[name] for name in order}) == 3
 
 
 # --- 起動前 / 自己検査の判定 (偽の /proc/<pid> で各判定だけを見る) -------------------

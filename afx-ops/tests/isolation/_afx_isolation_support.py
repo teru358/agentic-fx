@@ -13,9 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from afx_ops.isolation import landlock
-
 HERE = Path(__file__).resolve().parent
+# 鍵 dir と fake daemon の部品は tests 直下にある
+if str(HERE.parent) not in sys.path:
+    sys.path.insert(0, str(HERE.parent))
+
+from _ops_harness import Layout, make_layout  # noqa: E402
+from afx_ops.isolation import landlock  # noqa: E402
 CANARY = HERE / "afx_isolation_canary.py"
 FEATURES = ("bot", "web", "notify")
 PRINCIPAL = {"bot": "ops-bot", "web": "ops-web", "notify": "ops-notify"}
@@ -34,9 +38,20 @@ def no_core() -> None:
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+# 機能の secret file と中身 (web は secret を持たない)。中身は repr・出力に出ないことの目印
+SECRET_FILES = {"bot": "discord.token", "notify": "webhook.url"}
+SECRET_TEXT = {"bot": "discord-secret-of-bot-7f3a", "notify": "https://hooks.invalid/secret-9c1e"}
+
+
 def make_root(base: Path) -> Path:
-    """機能ごとの設定・状態領域と、全 principal の鍵 file を置いた一時 root。"""
+    """機能ごとの設定・secret・状態領域、実 manifest の鍵 dir、instance root を置いた一時 root。
+
+    <root>/<feature>/{config,secret,state}、<root>/keys (全 principal が active)、
+    <root>/root (instance root、data/run は 0700)。
+    """
     root = base / "afx-root"
+    root.mkdir(parents=True)
+    make_layout(root)
     for feature in FEATURES:
         (root / feature / "config").mkdir(parents=True)
         # 起動は他者が書ける config・0700 でない state を拒むので、umask に依らず固定する
@@ -44,13 +59,21 @@ def make_root(base: Path) -> Path:
         (root / feature / "state").mkdir(parents=True)
         (root / feature / "state").chmod(0o700)
         (root / feature / "config" / "settings.txt").write_text(f"{feature}\n")
-    keys = root / "keys"
-    keys.mkdir(mode=0o700)
-    for principal in PRINCIPAL.values():
-        path = keys / f"{principal}.key"
-        path.write_text(f"secret-of-{principal}\n")
-        path.chmod(0o600)
+        secret = root / feature / "secret"
+        secret.mkdir(mode=0o700)
+        secret.chmod(0o700)
+        if feature in SECRET_FILES:
+            path = secret / SECRET_FILES[feature]
+            path.write_text(SECRET_TEXT[feature] + "\n")
+            path.chmod(0o600)
     return root
+
+
+def layout_of(root: Path) -> Layout:
+    """make_root の root に対応する fake daemon 用の配置。"""
+    data = root / "root" / "data"
+    return Layout(root, data, data / "run", data / "run" / "api.sock", data / "instance.lock",
+                  root / "keys", root / "record")
 
 
 def child_env(home: Path) -> dict[str, str]:

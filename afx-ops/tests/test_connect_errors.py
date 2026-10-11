@@ -71,7 +71,7 @@ def test_wait_ready_retries_a_transient_pidfd_failure(monkeypatch, tmp_path):
         def __exit__(self, *exc):
             return None
 
-    def fake_open(endpoint):
+    def fake_open(endpoint, *, timeout):
         outcome = outcomes.pop(0)
         if outcome is not None:
             raise outcome
@@ -174,3 +174,26 @@ def test_sendall_to_a_peer_that_never_reads_times_out(tmp_path):
     finally:
         for s in (sock, conn, server):
             s.close()
+
+
+def test_each_readiness_connection_is_cut_at_the_time_left(monkeypatch):
+    clock = [0.0]
+    cuts = []
+
+    def refused(endpoint, *, timeout=api_client.HTTP_TIMEOUT):
+        cuts.append(timeout)
+        raise ApiError("no_socket")
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(refused))
+    with pytest.raises(ApiError) as info:
+        api_client.wait_ready(None, limit=2.0, interval=0.25,
+                              sleep=lambda s: clock.__setitem__(0, clock[0] + s),
+                              now=lambda: clock[0])
+    assert info.value.reason == "readiness_timeout"
+    assert cuts and cuts[0] == 2.0
+    assert all(cut <= 2.0 for cut in cuts)
+
+
+def test_a_missing_socket_file_is_classified_as_no_socket():
+    import errno
+    assert api_client._connect_failure(OSError(errno.ENOENT, "missing")) == "no_socket"

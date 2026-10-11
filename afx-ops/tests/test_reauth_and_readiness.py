@@ -97,6 +97,32 @@ def test_readiness_defaults_are_pinned():
     assert params["limit"].default == api_client.READINESS_LIMIT
 
 
+def test_readiness_caps_each_connection_attempt_at_the_remaining_budget(monkeypatch, tmp_path):
+    clock = [0.0]
+    timeouts = []
+
+    class _Opened:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+    def fake_open(endpoint, *, timeout):
+        timeouts.append(timeout)
+        clock[0] += timeout
+        raise api_client.ApiError("refused")
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(fake_open))
+    with pytest.raises(api_client.ApiError, match="readiness_timeout"):
+        api_client.wait_ready(api_client.Endpoint(tmp_path / "socket", tmp_path / "lock"),
+                              interval=0.25, limit=30.0, sleep=lambda value: None,
+                              now=lambda: clock[0])
+
+    assert timeouts == [15.0, 15.0]
+    assert sum(timeouts) <= api_client.READINESS_LIMIT
+
+
 def test_readiness_waits_until_socket_appears_within_limit(tmp_path, child_env):
     layout = make_layout(tmp_path)
     steps = [{"op": "ready", "interval": 0.05, "limit": 10.0}, {"op": "call", "call": "status"}]

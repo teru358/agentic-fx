@@ -19,7 +19,8 @@ def test_install_units_renders_notify_template_and_aggregated_wants(tmp_path):
 
     template = paths.template_path.read_text()
     assert "Type=notify" in template
-    assert "BindsTo=afx-sample.service" in template
+    assert "Requisite=afx-sample.service" in template
+    assert "BindsTo" not in template
     assert "PartOf=afx-sample.service" in template
     assert "After=afx-sample.service" in template
     assert "Restart=on-failure" in template
@@ -474,3 +475,11 @@ def test_rendering_refuses_an_exec_string_systemd_would_split(tmp_path):
         install_units(UnitPaths(unit_dir=tmp_path / "units", ops_exec="/opt/afx/bin/afx-ops\nExecStartPre=/x"),
                       {"bot"})
     assert not (tmp_path / "units").exists()
+
+
+def test_stages_comments_no_longer_claim_bindsto():
+    # unit は Requisite= + PartOf= + After= で afx に結ぶ。段の説明が古い依存を前提にしない
+    import agentic_fx.ops_setup.stages as stages
+    test_stages = Path(__file__).with_name("test_stages.py")
+    assert "BindsTo" not in Path(stages.__file__).read_text(encoding="utf-8")
+    assert "BindsTo" not in test_stages.read_text(encoding="utf-8")

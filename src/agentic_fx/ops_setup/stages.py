@@ -502,8 +502,8 @@ class OpsSetup:
                 self._set_stage(state, "installed", artifacts=[str(self.paths.template_path), str(self.paths.dropin_path)],
                                 wants=sorted(active))
 
-            # afx が元々止まっていれば起こさない。ops は afx の Wants で引かれ BindsTo で縛られるので、
-            # ops だけを start しても afx が起きてしまう。ops は afx の次の起動で一緒に起きる。
+            # afx が元々止まっていれば起こさない。ops は afx の Wants で引かれ Requisite で afx の
+            # 稼働を前提にするので、ops だけを start しても失敗する。ops は afx の次の起動で一緒に起きる。
             running = self._afx_was_running(state)
             if state["stage"] == "installed" and not running:
                 self._set_stage(state, "started", ops_active=False)

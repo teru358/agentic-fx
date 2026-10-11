@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from afx_ops import cli
+from afx_ops.isolation.startup import feature_dirs
 
 SCRIPT = Path(sys.executable).parent / "afx-ops"
 
@@ -17,6 +19,20 @@ def _run(args, env, home):
     done = subprocess.run([str(SCRIPT), *args], capture_output=True, text=True, timeout=30,
                           env=env, cwd=home)
     return done
+
+
+def _write_config(home, feature):
+    path = feature_dirs(feature).config / "ops.toml"
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.parent.chmod(0o700)
+    text = 'instance_root = "/srv/afx"\nkey_dir = "/srv/keys"\n'
+    if feature == "web":
+        text += "port = 8080\n"
+    elif feature == "bot":
+        text += "guild_id = 12345678901234567\nchannel_id = 12345678901234567\n"
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def test_unknown_feature_exits_nonzero_with_fixed_reason(child_env, home):
@@ -30,21 +46,34 @@ def test_unknown_feature_exits_nonzero_with_fixed_reason(child_env, home):
 
 @pytest.mark.parametrize("feature", ["bot", "web", "notify"])
 def test_known_feature_outside_the_unit_stops_at_the_isolation_check(child_env, home, feature):
-    # 起動口は隔離の起動順を必ず通る。unit 外 (NoNewPrivs なし) は鍵を読む前に止まる
+    # 起動口は設定を隔離前に読み、固定の隔離順へ進む。
+    _write_config(home, feature)
     done = _run([feature], child_env, home)
     assert done.returncode == 71
     assert done.stderr.strip().splitlines() == ["afx-ops: unit_no_new_privs"]
     assert done.stdout == ""
-    # 鍵 dir・設定 dir・状態 dir・socket を作っていない (HOME が空のまま)
-    assert list(home.rglob("*")) == []
+    assert not (home / ".local").exists()
 
 
 def test_module_entry_gives_the_same_result(child_env, home):
+    _write_config(home, "web")
     done = subprocess.run([sys.executable, "-I", "-m", "afx_ops", "web"], capture_output=True,
                           text=True, timeout=30, env=child_env, cwd=home)
     assert done.returncode == 71
     assert done.stderr.strip().splitlines() == ["afx-ops: unit_no_new_privs"]
-    assert list(home.rglob("*")) == []
+    assert not (home / ".local").exists()
+
+
+def test_config_error_with_an_unprintable_key_stays_on_one_stderr_line(child_env, home):
+    path = _write_config(home, "notify")
+    with path.open("a", encoding="utf-8") as f:
+        f.write('"unprintable\\nkey" = "ignored"\n')
+
+    done = _run(["notify"], child_env, home)
+
+    assert done.returncode == 71
+    assert done.stderr.splitlines() == ["afx-ops: config_invalid (<invalid>)"]
+    assert done.stdout == ""
 
 
 def test_cli_enters_through_the_fixed_plan():
@@ -54,5 +83,160 @@ def test_cli_enters_through_the_fixed_plan():
     assert "_for_tests" not in attrs
 
 
-def test_cli_body_is_not_implemented_yet():
-    assert cli.not_implemented(None) == cli.RC_NOT_IMPLEMENTED
+def test_cli_closes_the_config_dir_fd_only_before_startup_owns_it():
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    closes = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name) and node.func.value.id == "os"
+              and node.func.attr == "close"]
+    assert len(closes) == 1
+
+
+def test_runtime_table_is_complete_and_immutable():
+    assert set(cli.RUNTIMES) == {"bot", "web", "notify"}
+    assert set(cli.PRELOADS) == {"bot", "web", "notify"}
+    with pytest.raises(TypeError):
+        cli.RUNTIMES["bot"] = cli.RUNTIMES["web"]  # type: ignore[index]
+    with pytest.raises(TypeError):
+        cli.PRELOADS["bot"] = cli.PRELOADS["web"]  # type: ignore[index]
+
+
+def test_cli_has_no_runtime_replacement_hook():
+    tree = ast.parse(Path(cli.__file__).read_text(encoding="utf-8"))
+    assert _runtime_replacements(tree, "RUNTIMES") == []
+    assert _runtime_replacements(tree, "PRELOADS") == []
+
+
+def _runtime_replacements(tree, table):
+    found = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            targets = node.targets
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == table:
+                initial_table = (isinstance(node, ast.AnnAssign)
+                                 and isinstance(node.value, ast.Call)
+                                 and isinstance(node.value.func, ast.Name)
+                                 and node.value.func.id == "MappingProxyType")
+                if not initial_table:
+                    found.append(table)
+            elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                  and target.value.id == table):
+                found.append(f"{table}[]")
+            elif (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Call)
+                  and isinstance(target.value.func, ast.Name)
+                  and target.value.func.id == "globals"):
+                found.append("globals")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "setattr" and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value == table):
+            found.append("setattr")
+    return found
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    ("RUNTIMES = replacement\n", "RUNTIMES"),
+    ("RUNTIMES['web'] = replacement\n", "RUNTIMES[]"),
+    ("globals()['RUNTIMES'] = replacement\n", "globals"),
+    ("setattr(cli, 'RUNTIMES', replacement)\n", "setattr"),
+    ("del RUNTIMES\n", "RUNTIMES"),
+])
+def test_runtime_pin_rejects_each_replacement_form(source, expected):
+    assert _runtime_replacements(ast.parse(source), "RUNTIMES") == [expected]
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    ("PRELOADS = replacement\n", "PRELOADS"),
+    ("PRELOADS['web'] = replacement\n", "PRELOADS[]"),
+    ("globals()['PRELOADS'] = replacement\n", "globals"),
+    ("setattr(cli, 'PRELOADS', replacement)\n", "setattr"),
+    ("del PRELOADS\n", "PRELOADS"),
+])
+def test_preload_pin_rejects_each_replacement_form(source, expected):
+    assert _runtime_replacements(ast.parse(source), "PRELOADS") == [expected]
+
+
+def test_runtime_import_failure_has_its_own_fixed_exit_status(tmp_path, capsys):
+    from afx_ops.config import OpsConfig
+    from afx_ops.isolation import startup
+
+    def failed_import():
+        raise ImportError("not available")
+
+    rc = startup.run(object(), OpsConfig(tmp_path, tmp_path, None), lambda isolated: 0,
+                     preload=failed_import)
+
+    assert rc == 70
+    assert capsys.readouterr().err == "afx-ops: runtime_import_failed\n"
+
+
+def test_runtime_import_failure_closes_the_config_fd(tmp_path):
+    from afx_ops.config import OpsConfig
+    from afx_ops.isolation import startup
+
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    rc = startup.run(object(), OpsConfig(tmp_path, tmp_path, fd), lambda isolated: 0,
+                     preload=lambda: (_ for _ in ()).throw(ImportError()))
+
+    assert rc == 70
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_runtime_base_exception_closes_the_config_fd(tmp_path):
+    from afx_ops.config import OpsConfig
+    from afx_ops.isolation import startup
+
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    with pytest.raises(KeyboardInterrupt):
+        startup.run(object(), OpsConfig(tmp_path, tmp_path, fd), lambda isolated: 0,
+                    preload=lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_config_dir_owner_does_not_close_a_reused_fd(tmp_path):
+    from afx_ops.isolation import startup
+
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    owner = startup._ConfigDirOwner(fd)
+    owner.close()
+    reused = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        assert reused == fd
+        owner.close()
+        os.fstat(reused)
+    finally:
+        os.close(reused)
+
+
+def test_cli_closes_config_when_plan_construction_fails(monkeypatch, tmp_path):
+    from afx_ops.config import OpsConfig
+
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    config = OpsConfig(tmp_path, tmp_path, fd)
+    monkeypatch.setattr(cli, "read_config", lambda _feature: config)
+    monkeypatch.setattr(cli.startup.StartupPlan, "for_feature",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError()))
+
+    assert cli.main(["notify"]) == 71
+    with pytest.raises(OSError):
+        os.fstat(fd)
+
+
+def test_web_startup_plan_carries_the_configured_port(home, monkeypatch):
+    config_dir = feature_dirs("web").config
+    config_dir.mkdir(parents=True, mode=0o700)
+    ops_toml = config_dir / "ops.toml"
+    ops_toml.write_text('instance_root = "/srv/afx"\nkey_dir = "/srv/keys"\nport = 18080\n',
+                        encoding="utf-8")
+    ops_toml.chmod(0o600)
+    seen = []
+    monkeypatch.setattr(cli.startup, "run", lambda plan, config, body, **kwargs: seen.append(plan) or 0)
+    assert cli.main(["web"]) == 0
+    assert seen[0].web_port == 18080

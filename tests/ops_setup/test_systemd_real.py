@@ -180,10 +180,12 @@ def test_enabled_unit_has_real_properties(env):
     result = env.setup().enable("bot")
 
     assert result.stage == "enabled"
-    props = _show(env.ops("bot"), "Type", "BindsTo", "PartOf", "After", "Restart", "RestartUSec",
-                  "StartLimitBurst", "StartLimitIntervalUSec", "ActiveState", "NoNewPrivileges")
+    props = _show(env.ops("bot"), "Type", "Requisite", "BindsTo", "PartOf", "After", "Restart",
+                  "RestartUSec", "StartLimitBurst", "StartLimitIntervalUSec", "ActiveState",
+                  "NoNewPrivileges")
     assert props["Type"] == "notify"
-    assert env.afx in props["BindsTo"].split()
+    assert env.afx in props["Requisite"].split()
+    assert props["BindsTo"] == ""
     assert env.afx in props["PartOf"].split()
     assert env.afx in props["After"].split()
     assert props["Restart"] == "on-failure"
@@ -378,6 +380,135 @@ def test_disable_resumes_after_crash_at_every_point(env, point):
     assert not env.paths.template_path.exists()
     assert not env.paths.dropin_path.exists()
     assert _show(env.ops("bot"), "ActiveState")["ActiveState"] == "inactive"
+
+
+_OPS_RUN = ("ActiveState", "SubState", "InvocationID", "MainPID", "NRestarts",
+            "ActiveEnterTimestampMonotonic")
+
+
+def test_ops_start_alone_fails_and_does_not_pull_in_afx(env):
+    env.setup().enable("bot")
+    assert _ctl("stop", env.afx).returncode == 0
+    assert _wait(lambda: _show(env.ops("bot"), "ActiveState")["ActiveState"] == "inactive")
+    assert _wait(lambda: _lock_free(env.root))
+
+    result = _ctl("start", env.ops("bot"))
+
+    assert result.returncode != 0
+    assert _show(env.afx, "ActiveState")["ActiveState"] == "inactive"
+    assert _show(env.ops("bot"), "ActiveState")["ActiveState"] not in {"active", "activating"}
+    assert _lock_free(env.root)
+
+
+def test_afx_start_pulls_in_ops_through_wants(env):
+    env.setup().enable("bot")
+    assert _ctl("stop", env.afx).returncode == 0
+    assert _wait(lambda: _show(env.ops("bot"), "ActiveState")["ActiveState"] == "inactive")
+
+    assert _ctl("start", env.afx).returncode == 0
+
+    assert _wait(lambda: _show(env.ops("bot"), "ActiveState")["ActiveState"] == "active")
+
+
+def test_afx_explicit_restart_restarts_ops(env):
+    env.setup().enable("bot")
+    before = _show(env.ops("bot"), *_OPS_RUN)
+    assert before["ActiveState"] == "active"
+
+    assert _ctl("restart", env.afx).returncode == 0
+
+    assert _wait(lambda: (lambda p: p["ActiveState"] == "active"
+                          and p["InvocationID"] != before["InvocationID"])(
+        _show(env.ops("bot"), *_OPS_RUN)))
+    after = _show(env.ops("bot"), *_OPS_RUN)
+    assert after["MainPID"] != before["MainPID"]
+
+
+# afx が crash しても、afx が死んでいる窓の間 ops は active のまま残る。afx が
+# Restart=on-failure で戻る時の restart job が PartOf= で ops に伝わり、ops は stop → start
+# される (InvocationID と MainPID が変わる)。ops 自身の自動再起動ではないので NRestarts は増えない。
+def test_afx_crash_leaves_ops_up_then_afx_restart_job_restarts_ops(env):
+    env.setup().enable("bot")
+    before = _show(env.ops("bot"), *_OPS_RUN)
+    afx_before = _show(env.afx, "NRestarts", "MainPID", "InvocationID")
+    assert before["ActiveState"] == "active"
+
+    assert _ctl("kill", "--kill-whom=main", "-s", "KILL", env.afx).returncode == 0
+
+    # afx が死んでいる窓 (RestartSec 中) に ops がまだ active であることを観測する
+    seen_up_while_afx_down = False
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        afx_now = _show(env.afx, "ActiveState", "NRestarts")
+        if afx_now["ActiveState"] != "active":
+            if _show(env.ops("bot"), "ActiveState", "InvocationID") == {
+                    "ActiveState": "active", "InvocationID": before["InvocationID"]}:
+                seen_up_while_afx_down = True
+        elif afx_now["NRestarts"] != afx_before["NRestarts"]:
+            break
+        time.sleep(0.05)
+    assert seen_up_while_afx_down
+    assert _show(env.afx, "NRestarts")["NRestarts"] != afx_before["NRestarts"]
+
+    # afx の restart job が伝播して ops が入れ替わる
+    assert _wait(lambda: (lambda p: p["ActiveState"] == "active"
+                          and p["InvocationID"] != before["InvocationID"])(
+        _show(env.ops("bot"), *_OPS_RUN)), seconds=20)
+    after = _show(env.ops("bot"), *_OPS_RUN)
+    assert after["MainPID"] not in (before["MainPID"], "0")
+    assert after["NRestarts"] == before["NRestarts"]
+
+
+_SLOW_OPS = """#!{python}
+import os, socket, time
+time.sleep({delay})
+addr = os.environ["NOTIFY_SOCKET"]
+if addr.startswith("@"):
+    addr = "\\0" + addr[1:]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.connect(addr)
+s.sendall(b"READY=1")
+s.close()
+time.sleep(600)
+"""
+
+_DYING_OPS = """#!{python}
+import sys
+sys.exit(1)
+"""
+
+
+def _replace_ops(env, text: str) -> None:
+    Path(env.paths.ops_exec).write_text(text.format(python=sys.executable, delay=2))
+
+
+def test_enable_start_returns_only_after_ops_sends_ready(env):
+    # ops は server 認証の後に READY=1 を送る。偽 ops は 2 秒待ってから送る
+    _replace_ops(env, _SLOW_OPS)
+    seen: dict[str, object] = {}
+
+    def hook(name: str) -> None:
+        if name == "before_start":
+            seen["before"] = time.monotonic()
+        elif name == "after_start":
+            seen["after"] = time.monotonic()
+            seen["ops"] = _show(env.ops("bot"), "ActiveState")["ActiveState"]
+
+    assert env.setup(hook).enable("bot").stage == "enabled"
+
+    assert seen["after"] - seen["before"] >= 2.0
+    assert seen["ops"] == "active"
+
+
+def test_enable_fails_at_started_when_ops_exits_before_ready(env):
+    from agentic_fx.ops_setup.systemd import SystemdError
+    _replace_ops(env, _DYING_OPS)
+
+    with pytest.raises(SystemdError):
+        env.setup().enable("bot")
+
+    assert read_stage(env.root, "bot")["stage"] == "installed"
+    assert _show(env.ops("bot"), "ActiveState")["ActiveState"] != "active"
 
 
 def test_afx_stop_takes_ops_down_and_start_pulls_it_back(env):

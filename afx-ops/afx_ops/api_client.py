@@ -132,15 +132,16 @@ class _Request:
     一回だけ閉じる (pidfd を閉じる箇所はここだけ)。
     """
 
-    def __init__(self, endpoint: Endpoint) -> None:
+    def __init__(self, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> None:
         self._endpoint = endpoint
+        self._timeout = timeout
         self._sock: socket.socket | None = None
         self._pidfd = -1
         self._sent = False
 
     @classmethod
-    def open(cls, endpoint: Endpoint) -> "_Request":
-        request = cls(endpoint)
+    def open(cls, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> "_Request":
+        request = cls(endpoint, timeout=timeout)
         try:
             request._connect_and_verify()
         except BaseException:
@@ -154,7 +155,7 @@ class _Request:
             server_auth.check_socket_path(ep.socket_path, uid=ep.uid)
             # connect・送信・受信のどれも HTTP_TIMEOUT で打ち切る (相手が accept / 読取りを
             # しなくなっても固まらない)
-            self._sock = server_auth.connect_unix(ep.socket_path, timeout=HTTP_TIMEOUT)
+            self._sock = server_auth.connect_unix(ep.socket_path, timeout=self._timeout)
         except SocketMissing:
             raise ApiError("no_socket") from None
         except ServerAuthError as err:
@@ -320,10 +321,17 @@ class _Client:
         self._token = token
 
     @classmethod
-    def from_key_files(cls, endpoint: Endpoint, *, key_file: Path, ready_file: Path):
+    def from_token(cls, endpoint: Endpoint, token: bytes):
+        return cls(endpoint, token.decode("ascii"))
+
+    @classmethod
+    def from_key_files(cls, endpoint: Endpoint, *, key_file: Path, ready_file: Path,
+                       _for_tests: bool = True):
         """鍵を読む (隔離の前に呼ぶ)。失敗は ``KeyReadError`` の固定 code。"""
-        return cls(endpoint, read_token(cls.principal, key_file=key_file,
-                                        ready_file=ready_file))
+        if _for_tests is not True:
+            raise ValueError("test seam disabled")
+        return cls.from_token(endpoint, read_token(cls.principal, key_file=key_file,
+                                                    ready_file=ready_file).encode("ascii"))
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(socket={str(self._endpoint.socket_path)!r})"
@@ -451,22 +459,26 @@ def _int_id(value: int) -> str:
 
 def wait_ready(endpoint: Endpoint, *, interval: float = READINESS_INTERVAL,
                limit: float = READINESS_LIMIT,
-               sleep: Callable[[float], None] = time.sleep) -> None:
+               sleep: Callable[[float], None] = time.sleep,
+               now: Callable[[], float] = time.monotonic) -> None:
     """UDS が現れ server 認証が成功するまで待つ。鍵は送らない。
 
     待つのは socket が無い・接続を拒否される・pidfd を一時的に作れない間だけで、
     socket を使えない (権限等) か認証に落ちたらその場で ``ApiError`` (固定 reason)。
     期限を過ぎたら ``readiness_timeout``。
     """
-    deadline = time.monotonic() + limit
+    deadline = now() + limit
     while True:
+        remaining = deadline - now()
+        if remaining <= 0:
+            raise ApiError("readiness_timeout")
         try:
-            with _Request.open(endpoint):
+            with _Request.open(endpoint, timeout=min(HTTP_TIMEOUT, remaining)):
                 return
         except ApiError as err:
             if err.reason not in _WAITABLE:
                 raise
-        if time.monotonic() + interval > deadline:
+        if now() + interval > deadline:
             raise ApiError("readiness_timeout")
         sleep(interval)
 

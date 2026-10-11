@@ -119,7 +119,7 @@ def test_decision_job_carries_the_actor_it_was_created_with(tmp_path):
     layout = make_layout(tmp_path)
     endpoint = api_client.Endpoint(layout.socket_path, layout.lock_path)
     client = BotClient.from_key_files(endpoint, key_file=layout.keys / "ops-bot.token",
-                                      ready_file=layout.keys / ".ready")
+                                      ready_file=layout.keys / ".ready", _for_tests=True)
     with daemon(layout, "answer_job"):
         decision = client.approve(Actor(ACTOR), 7, payload_sha256="a" * 64)
         assert decision.job == DecisionJob(JOB_ID, Actor(ACTOR))
@@ -137,7 +137,7 @@ def test_decision_job_carries_the_actor_it_was_created_with(tmp_path):
 def _offline_client(cls, tmp_path):
     """接続できない endpoint の client。接続前に止まるかどうかを reason で見分ける。"""
     endpoint = api_client.Endpoint(tmp_path / "none.sock", tmp_path / "none.lock")
-    return cls(endpoint, "token-0123456789")
+    return cls.from_token(endpoint, b"token-0123456789")
 
 
 def test_base_request_path_takes_no_actor(tmp_path):
@@ -205,3 +205,9 @@ def test_bot_client_rejects_a_fake_actor_before_connecting(tmp_path, value):
         with pytest.raises(ApiError) as info:
             call()
         assert info.value.reason == "invalid_actor"
+
+
+def test_key_file_loader_needs_the_test_seam_to_be_switched_on(tmp_path):
+    with pytest.raises(ValueError):
+        BotClient.from_key_files(None, key_file=tmp_path / "ops-bot.token",
+                                 ready_file=tmp_path / ".ready", _for_tests=False)

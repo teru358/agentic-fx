@@ -1,6 +1,6 @@
 [Unit]
 Description=agentic-fx operations process (%i)
-BindsTo=@AFX_UNIT@
+Requisite=@AFX_UNIT@
 PartOf=@AFX_UNIT@
 After=@AFX_UNIT@
 StartLimitIntervalSec=60s
