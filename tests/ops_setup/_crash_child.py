@@ -29,7 +29,9 @@ def main() -> None:
             # finally も flush も通らない死に方。lock fd の解放は kernel に任せる。
             os._exit(CRASH_STATUS)
 
-    OpsSetup(Path(spec["root"]), systemd=Systemd(), paths=paths, hook=hook).enable(spec["feature"])
+    OpsSetup(Path(spec["root"]), systemd=Systemd(), paths=paths, hook=hook,
+             config_check=lambda _root, _feature: True,
+             probe=lambda _exec, _feature: (0, "")).enable(spec["feature"])
     sys.exit(0)
 
 

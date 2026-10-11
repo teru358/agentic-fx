@@ -16,6 +16,8 @@ from agentic_fx.ops.keys import KeySetError, check_key_dir_usable, enroll, enrol
 from agentic_fx.store.enroll_marker import ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, enroll_marker_path
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 
+from .feature_config import collect
+from .probe import run_probe
 from .systemd import Systemd, SystemdError
 from .units import (OpsExecNotFound, UnitPaths, atomic_write, install_units, remove_durably,
                     resolve_ops_exec, uninstall_feature, units_match)
@@ -162,13 +164,21 @@ def _noop(_name: str) -> None:
     return
 
 
+def _config_complete(root: Path, feature: str) -> bool:
+    """feature 専用の config / secret が、起動時に読まれる規則で揃っているか。"""
+    return collect(root, feature).complete
+
+
 class OpsSetup:
     """stage file と実物を照合しながら一機能ずつ遷移する。"""
 
     def __init__(self, root: Path, *, systemd: SystemdPort | None = None,
                  paths: UnitPaths | None = None, ready: Callable[[str], bool] | None = None,
-                 hook: Hook = _noop) -> None:
+                 hook: Hook = _noop, config_check: Callable[[Path, str], bool] | None = None,
+                 probe: Callable[[str, str], tuple[int, str]] | None = None) -> None:
         self.root = Path(root)
+        self.config_check = _config_complete if config_check is None else config_check
+        self.probe = run_probe if probe is None else probe
         self.systemd = Systemd() if systemd is None else systemd
         self.paths = UnitPaths(Path.home() / ".config" / "systemd" / "user") if paths is None else paths
         self.ready = (lambda _feature: True) if ready is None else ready
@@ -280,6 +290,17 @@ class OpsSetup:
             detail = safe_text(" ".join(str(error).split()))
             self._failure(state, "ops_exec_not_found", detail)
             raise SystemdError("ops_exec_not_found", detail) from error
+
+    def _check_feature_inputs(self, feature: str, state: dict[str, Any]) -> None:
+        """staged の前提。feature 専用の入力が使え、疎通 probe が通ること。外部 artifact は作らない。"""
+        if not self.config_check(self.root, feature):
+            self._failure(state, "feature_config_invalid")
+            raise SystemdError("feature_config_invalid")
+        rc, word = self.probe(str(self.paths.ops_exec), feature)
+        if rc != 0:
+            reason = f"feature_probe_failed:{word}"
+            self._failure(state, reason)
+            raise SystemdError(reason)
 
     def _check_key_dir(self) -> None:
         # afx keys と同じ検査を、afx を止める前に通す。鍵 dir が使えないなら外部変更をしない。
@@ -457,6 +478,8 @@ class OpsSetup:
                 return StageResult(feature, "enable", _ENABLE_TERMINAL)
         lock = None
         try:
+            if state["stage"] == "staged":
+                self._check_feature_inputs(feature, state)
             if state["stage"] in {"staged", "stopped"}:
                 self._check_key_dir()
             if state["stage"] == "staged":

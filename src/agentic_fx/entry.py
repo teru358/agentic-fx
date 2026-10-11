@@ -58,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
         from agentic_fx.ops.keys import run_keys_command
         return run_keys_command(root, args.keys_action, getattr(args, "principal", None))
     if args.command == "ops":
+        if args.ops_action == "enable":
+            from agentic_fx.ops_setup.interactive import ConsoleIO, interactive_enable
+            return interactive_enable(root, args.feature, io=ConsoleIO())
         from agentic_fx.ops_setup.stages import run_ops_command
         return run_ops_command(root, args.ops_action, args.feature)
     if args.command in _BACKTEST_COMMANDS:

@@ -1,6 +1,6 @@
-# [afx-ops] operations surface の分離と自己隔離 v1.5
+# [afx-ops] operations surface の分離と自己隔離 v1.6
 
-版: v1.5
+版: v1.6
 
 日付: 2026-10-11
 
@@ -129,7 +129,7 @@ enroll は §2 の v1.13 manifest 遷移にだけ従い、online enroll は行�
 
 Landlock は pathname UDS への `connect` を仲介せず、path 指定の接続は Landlock 下でも通る。`lstat` / `stat` の metadata 読取りも Landlock の対象外である。このため、隔離後も socket path に connect し、既存の server 認証をその接続ごとに行う。保持した UDS 親 directory fd や instance lock fd、`openat` / `connectat` による接続は用いない。socket activation も採用しない。本体は ops を spawn せず、UDS server を本体自身が作る契約だからである。
 
-鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。`key_dir` は config / state / secret dir と同一又はその内側に置かず、`read_config` と `prepare_dirs` 前の隔離処理で realpath と directory 境界により二重に検査する。違反は `config_invalid` とする。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。配置の検査は次のとおりとする。config dir は 0755 または 0750 (他者書込み不可、group 書込みも不可)、state dir は 0700 で ops が隔離前に作る、secret dir は 0700、secret file は 0600 とし、secret は bot = `discord.token`、notify = `webhook.url`、web は持たない。既存 dir は親から `O_NOFOLLOW` で開いて fstat で検査し、symlink・他 uid・緩い mode は固定 reason `config_dir_invalid` / `state_dir_invalid` で隔離前に止まる。Landlock 規則は検査した fd から作る。
+鍵は隔離前に読み、隔離後の Landlock は鍵 directory へ許可を持たない。`key_dir` は config / state / secret dir と同一又はその内側に置かず、`read_config` と `prepare_dirs` 前の隔離処理で realpath と directory 境界により二重に検査する。違反は `config_invalid` とする。配置は `$XDG_CONFIG_HOME/agentic-fx/ops/<feature>/config/` (隔離後も読める設定) と `.../secret/` (隔離前にだけ読む鍵・secret)、状態は `$XDG_STATE_HOME/agentic-fx/ops/<feature>/` とする。principal の API 鍵は操作 API spec の配置のままである。配置の検査は次のとおりとする。config dir は owner 所有で group / other に書込み bit が無いこと (0700 / 0750 / 0755)、state dir は 0700 で ops が隔離前に作る、secret dir は 0700、secret file は 0600 とし、secret は bot = `discord.token`、notify = `webhook.url`、web は持たない。既存 dir は親から `O_NOFOLLOW` で開いて fstat で検査し、symlink・他 uid・緩い mode は固定 reason `config_dir_invalid` / `state_dir_invalid` で隔離前に止まる。Landlock 規則は検査した fd から作る。
 
 Landlock には自分の鍵・設定・状態、必要ランタイム、機能に必要な外向き通信だけを許す。全 feature の規則に `/dev/urandom` の `READ_FILE` を加える。隔離後の `os.urandom`、`secrets`、`uuid4` が `/dev/urandom` を再 open するためである。server 認証の `/proc` 規則は `/proc/locks` の leaf file に対する `READ_FILE` と、起動時に `os.getpid()` で解決した自己 `/proc/<ops-pid>` directory に対する `READ_FILE` と `READ_DIR` だけとする。`/proc/self` symlink は使わない。後者は `SO_PEERPIDFD` の fdinfo を読み pid を照合するためだけに使う。`/proc` 全体、他 pid の directory、`/proc/<peer-pid>/fd` は許可しない。同 uid の別 process の `environ` 等を侵害 process に読ませないためである。
 
@@ -213,13 +213,13 @@ ops 起動時は API が ready であると仮定しない。UDS が現れ、§5
 
 ## 7. 初回ウィザード
 
-初回起動は対話ウィザードを必須とする。任意段で「外から見る / 操作する手段を今設定しますか」を一問だけ尋ね、既定は「あとで」とする。全 off 又は「あとで」では ops unit と link を置かない。機能を選ぶ場合は §6.1 を通し、完了前に次を確認する。
+初回起動は対話ウィザードを必須とする。任意段で「外から見る / 操作する手段を今設定しますか」を一問だけ尋ね、既定は「あとで」とする。全 off 又は「あとで」では ops unit と link を置かない。機能を選ぶ場合は §6.1 を通し、完了前に次を確認する。初回ウィザード本体 (価格源・LLM・判断足・改善周期・常駐化の対話、チケット `first-run-setup`) は別束で、本 spec の T9 が実装するのは `afx ops enable <feature>` の対話層 (不足設定の最小質問 → probe → §6.1 の状態機械) と、§9 AC-12 / AC-14 の実証である。対話は CLI 層に置き、`staged` の検証 hook は非対話 (設定の固定 schema 検査と probe の再実行) に限る。既存設定が揃っていれば再質問せず、probe に失敗したときだけ再質問する。feature 専用の config は owner 所有で group / other に書込み bit が無いこと (0700 / 0750 / 0755)、secret dir は 0700、secret file は 0600 を厳密に要求し、満たさない手置きの資材は固定 reason で fail closed にして上書きしない。同時 enable は `data/ops/setup.lock` の非 blocking flock で拒む。
 
 |機能|最小質問|疎通確認 (probe)|
 |---|---|---|
 |bot|Discord 接続情報 (token)、単一 guild / channel、承認者 allowlist|bot identity で guild / channel に到達できる。interaction の成立 (allowlist user の受理、未登録 user の拒否、同じ actor header での job 読取り) は enable 時には確かめられず、T6 の自動試験が受け持つ|
 |web|loopback の port|その port を `127.0.0.1` で bind でき、変更 route が無い。認証はない (§12 裁定 1)|
-|notify|generic HTTPS webhook の URL (secret に置く) と event 種類|送信先へ到達できる。probe の送信が実運用 event と区別できる形は T8 で固定する|
+|notify|generic HTTPS webhook の URL (secret に置く) だけ (event の種類は固定 schema に無いので質問しない)|送信先へ到達できる。probe の送信が実運用 event と区別できる形は T8 で固定する|
 
 疎通確認は本体 (`afx ops enable`) が `afx-ops probe <feature>` を subprocess で呼んで行う。本体と afx-ops は互いを import しない (O-1)。呼出しは afx-ops の絶対 path で行い、secret は先に feature の secret file に置いてから呼び、argv、env、stdin に渡さない。probe は secret file と `ops.toml` を自分で読む。戻りは終了コードと固定 reason だけで、secret や外部サービスの応答本文を返さない。
 
@@ -305,6 +305,8 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |bot の永続状態|SQLite を使わないので、snapshot は単一 file の全体書換えである。rename の前後の crash では旧版か新版のどちらかが残る (部分書込みは残らない)。規模は承認件数に比例して小さく、書込み頻度は承認の操作に限る|
 |試験 helper の停止|`wait_line` は起動時に記録した process group を先に kill するが、`setsid` でその group を抜けた子孫は止められない。|
 |仮運用の afx の終了コード|仮運用の `afx.service` は `screen -Dm` 経由で起動するため終了コードを伝えず、`RestartPreventExitStatus=75` が効かない。恒久形の unit で有効になる|
+- AC-12 の使い捨て unit 統合試験は、本番の固定 unit 名と衝突しないよう cgroup の unit 名照合を試験時だけ外し、readiness の上限を 3 秒に短縮する。production では固定 unit 名の照合と 30 秒上限を維持する。したがって実 unit 名での cgroup 照合と、実時間 30 秒超過の systemd 統合観測は未実施で、既定値の静的確認と trace の記録で補う。
+
 
 ## 12. 未決事項 (ユーザー裁定待ち)
 
@@ -329,3 +331,4 @@ probe の戻り契約は、成功時 rc 0（stdout / stderr はともに空）�
 |2026-10-10|v1.3|前提束 P の裁定 8 件を反映。§3.1.1 に `ops.toml` を新設、§4 / §5.1 に API 鍵の隔離前読取りと `Isolated` での受渡し、§3.2 に JSON snapshot の永続化 (SQLite 不使用)・投稿識別子から generation を除外・二段承認 (claim / confirm / cancel)・worker thread、§6.2 の READY=1 を server 認証後へ、unit を `Requisite=` + `PartOf=` + `After=` へ変更 (伝播は実証後に AC-12 へ)、§7 を `afx-ops probe` 契約と再質問へ、§10 に前提束 P と順序、§3.3 / AC-10 / T7 の cookie 認証を初版認証なしに統一、drop-in 名を実装に合わせる|前提束 P の裁定 (ユーザー承認 2026-10-10)、T6〜T9 草案の検収で出た不一致の解消|—|
 |2026-10-10|v1.4|前提束 P の実装確定事項を反映。`/dev/urandom` の Landlock 許可、`key_dir` の二重境界検査と config fd 非継承、固定起動順と鍵 / probe の reason・rc 契約、aiohttp import 時機、systemd 259 の `Requisite=` / `Wants=` / `PartOf=` の実測、P 実装済み状態を明記|ops-p-b の実装・実測を spec へ反映||
 |2026-10-11|v1.5|bot の状態機械・snapshot v4・表示更新 / repost・承認単位 throttle、web の HEAD error / header 上限 / 接続取消し、notify retry、probe reason 語彙、T6〜T8 実装済み状態、NETLINK と試験 helper の残余を実装に合わせて更新|T6 bot、T7 web、T8 notify と前提束 P の main 投入済み実装との同期|(本 commit)|
+|2026-10-12|v1.6|§11: AC-12 統合試験の残余 (unit 名照合と 30 秒は production のみ)。§7: 初回ウィザード本体と T9 (`afx ops enable` の対話層) の境界、対話は CLI 層・`staged` hook は非対話、既存設定は再質問しない、config / secret の mode 規則 (secret は 0600 厳密)、setup.lock。notify の質問は URL だけ (event 種類は schema に無い)|T9 実装の裁定と codex 指摘 (spec 不一致 3 件) の反映|(本 commit)|

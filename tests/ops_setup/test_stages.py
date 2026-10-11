@@ -109,7 +109,8 @@ def _setup(tmp_path: Path) -> tuple[OpsSetup, FakeSystemd, Path]:
     systemd = FakeSystemd(paths)
     # 通常の enable は常駐中の afx に対して行う。
     systemd.active.add(paths.afx_unit)
-    return OpsSetup(root, systemd=systemd, paths=paths, ready=lambda _feature: True), systemd, home
+    return OpsSetup(root, systemd=systemd, paths=paths, ready=lambda _feature: True,
+                    config_check=lambda _root, _feature: True, probe=lambda _exec, _feature: (0, "")), systemd, home
 
 
 def _with_home(home: Path, monkeypatch) -> None:
@@ -1737,3 +1738,163 @@ def test_enable_does_not_warn_when_afx_keeps_75_from_restarting(tmp_path, monkey
 
     assert "warn" not in read_stage(setup.root, "bot")
     assert "warn=" not in setup.status_line("bot")
+
+
+# --- staged の入力検証 (feature 専用の config / secret と疎通 probe) ---
+
+_BOT_VALUES = {"guild_id": 10**16, "channel_id": 10**16 + 1, "allowlist_user_ids": [10**16 + 2],
+               "mention_user_ids": [10**16 + 2], "token": "secret-token-value"}
+
+
+def _checked_setup(tmp_path: Path, monkeypatch, probe_results=None):
+    """入力検査と probe を実物の経路に戻した OpsSetup。probe の実行は記録する。"""
+    from agentic_fx.ops_setup.stages import _config_complete
+    setup, systemd, home = _setup(tmp_path)
+    _with_home(home, monkeypatch)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    calls: list[tuple[str, str]] = []
+    results = list(probe_results or [])
+
+    def probe(ops_exec: str, feature: str) -> tuple[int, str]:
+        calls.append((ops_exec, feature))
+        return results.pop(0) if results else (0, "")
+
+    setup.config_check = _config_complete
+    setup.probe = probe
+    return setup, systemd, calls
+
+
+def _bot_base(tmp_path: Path) -> Path:
+    return tmp_path / "xdg" / "agentic-fx" / "ops" / "bot"
+
+
+def _break_missing_config(tmp_path: Path) -> None:
+    (_bot_base(tmp_path) / "config" / "ops.toml").unlink()
+
+
+def _break_other_instance(tmp_path: Path) -> None:
+    config = _bot_base(tmp_path) / "config" / "ops.toml"
+    config.write_text(config.read_text().replace(str(tmp_path / "instance"), str(tmp_path / "other")))
+
+
+def _break_toml(tmp_path: Path) -> None:
+    (_bot_base(tmp_path) / "config" / "ops.toml").write_text("guild_id = [\n")
+
+
+def _break_secret_missing(tmp_path: Path) -> None:
+    (_bot_base(tmp_path) / "secret" / "discord.token").unlink()
+
+
+def _break_secret_mode(tmp_path: Path) -> None:
+    (_bot_base(tmp_path) / "secret" / "discord.token").chmod(0o644)
+
+
+def _break_config_mode(tmp_path: Path) -> None:
+    (_bot_base(tmp_path) / "config" / "ops.toml").chmod(0o666)
+
+
+@pytest.mark.parametrize("break_it", [_break_missing_config, _break_other_instance, _break_toml,
+                                      _break_secret_missing, _break_secret_mode, _break_config_mode])
+def test_staged_stays_with_invalid_feature_config_and_creates_nothing(tmp_path, monkeypatch, break_it):
+    from agentic_fx.ops_setup.feature_config import write_inputs
+    setup, systemd, calls = _checked_setup(tmp_path, monkeypatch)
+    write_inputs(setup.root, "bot", dict(_BOT_VALUES))
+    break_it(tmp_path)
+    manifest = (key_dir(setup.root) / ".ready").read_bytes()
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == "feature_config_invalid"
+    saved = read_stage(setup.root, "bot")
+    assert saved["stage"] == "staged" and saved["failure"] == "feature_config_invalid"
+    assert calls == []
+    assert systemd.calls == []
+    assert not setup.paths.template_path.exists() and not setup.paths.dropin_path.exists()
+    assert not enroll_marker_path(setup.root).exists()
+    assert (key_dir(setup.root) / ".ready").read_bytes() == manifest
+    assert "secret-token-value" not in json.dumps(saved)
+
+
+@pytest.mark.parametrize(("rc", "word"), [(71, "token_invalid"), (73, "probe_bind_failed")])
+def test_staged_stays_when_probe_fails_then_the_same_enable_resumes(tmp_path, monkeypatch, rc, word):
+    from agentic_fx.ops_setup.feature_config import write_inputs
+    setup, systemd, calls = _checked_setup(tmp_path, monkeypatch, probe_results=[(rc, word)])
+    write_inputs(setup.root, "bot", dict(_BOT_VALUES))
+
+    with pytest.raises(SystemdError) as raised:
+        setup.enable("bot")
+
+    assert raised.value.reason == f"feature_probe_failed:{word}"
+    saved = read_stage(setup.root, "bot")
+    assert saved["stage"] == "staged" and saved["failure"] == f"feature_probe_failed:{word}"
+    assert len(calls) == 1 and calls[0][1] == "bot"
+    assert systemd.calls == []
+    assert not setup.paths.template_path.exists() and not enroll_marker_path(setup.root).exists()
+
+    assert setup.enable("bot").stage == "enabled"
+
+    assert len(calls) == 2
+    assert "failure" not in read_stage(setup.root, "bot")
+
+
+def test_staged_runs_probe_once_with_the_resolved_exec_and_passes(tmp_path, monkeypatch):
+    from agentic_fx.ops_setup.feature_config import write_inputs
+    setup, _systemd, calls = _checked_setup(tmp_path, monkeypatch)
+    write_inputs(setup.root, "bot", dict(_BOT_VALUES))
+
+    assert setup.enable("bot").stage == "enabled"
+    assert setup.enable("bot").stage == "enabled"
+
+    assert calls == [(str(setup.paths.ops_exec), "bot")]
+
+
+def test_probe_runner_keeps_only_fixed_reason_words(tmp_path):
+    from agentic_fx.ops_setup.probe import run_probe
+    script = tmp_path / "afx-ops"
+    script.write_text('#!/bin/sh\ncase "$2" in\n  bot) echo "afx-ops: config_invalid" >&2; exit 71;;\n'
+                      '  web) echo "boom /secret/path token=abc" >&2; exit 73;;\n  *) exit 0;;\nesac\n')
+    script.chmod(0o755)
+
+    assert run_probe(str(script), "bot") == (71, "config_invalid")
+    assert run_probe(str(script), "web") == (73, "feature_probe_unreadable")
+    assert run_probe(str(script), "notify")[0] == 0
+    assert run_probe(str(tmp_path / "missing"), "bot") == (70, "runtime_unavailable")
+
+
+def _assert_all_off(setup: OpsSetup, systemd: FakeSystemd) -> None:
+    unit_dir = setup.paths.unit_dir
+    assert not setup.paths.template_path.exists()
+    assert not setup.paths.dropin_path.exists()
+    assert not list(unit_dir.glob("afx-ops*"))
+    assert not [name for name in systemd.active if name.startswith(setup.paths.ops_prefix)]
+    assert setup._active_features() == set()
+
+
+def test_all_off_has_no_template_dropin_or_feature_unit(tmp_path, monkeypatch):
+    setup, systemd, home = _setup(tmp_path)
+    _with_home(home, monkeypatch)
+    # 新規 instance: enable を呼ばない (対話で「あとで」を選んだ場合も同じ)。
+    _assert_all_off(setup, systemd)
+    assert read_stage(setup.root, "bot", missing_ok=True) is None
+
+    # 検証で止まった enable も資材を残さない。
+    setup.config_check = lambda _root, _feature: False
+    with pytest.raises(SystemdError):
+        setup.enable("bot")
+    _assert_all_off(setup, systemd)
+    setup.config_check = lambda _root, _feature: True
+
+    # 最後の feature を disable した後。feature の鍵 (principal) は消さない。
+    setup.enable("bot")
+    setup.enable("web")
+    digest = _entry(setup.root, Principal.OPS_BOT)["sha256"]
+    setup.disable("bot")
+    assert setup.paths.template_path.exists()
+    setup.disable("web")
+    _assert_all_off(setup, systemd)
+    assert _entry(setup.root, Principal.OPS_BOT)["sha256"] == digest
+    # uninstall_feature を空の集合で呼んでも何も作らない。
+    from agentic_fx.ops_setup.units import uninstall_feature
+    uninstall_feature(setup.paths, set())
+    _assert_all_off(setup, systemd)

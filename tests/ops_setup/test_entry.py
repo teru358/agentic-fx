@@ -14,15 +14,15 @@ def test_ops_enable_dispatches_feature_without_starting_daemon(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     seen: list[str] = []
 
-    def enable(self, feature: str) -> StageResult:
+    def enable(root, feature: str, **_kwargs) -> int:
         seen.append(feature)
-        return StageResult(feature, "enable", "enabled")
+        return 0
 
-    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.enable", enable)
+    monkeypatch.setattr("agentic_fx.ops_setup.interactive.interactive_enable", enable)
 
     assert main(["ops", "enable", "bot"]) == 0
     assert seen == ["bot"]
-    assert "bot: enabled" in capsys.readouterr().out
+    assert capsys.readouterr().out == ""
     assert not (tmp_path / "data" / "instance.lock").exists()
 
 
@@ -50,7 +50,7 @@ def test_ops_status_reports_saved_operation_stage_and_failure(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("feature", ["bot", "web", "notify"])
-@pytest.mark.parametrize("action", ["enable", "disable"])
+@pytest.mark.parametrize("action", ["disable"])
 def test_ops_dispatches_each_feature_and_action(tmp_path, monkeypatch, capsys, feature, action):
     monkeypatch.chdir(tmp_path)
     seen: list[tuple[str, str]] = []
@@ -77,9 +77,9 @@ def test_ops_failure_prints_fixed_reason_and_exits_1(tmp_path, monkeypatch, caps
     def enable(self, feature: str) -> StageResult:
         raise error
 
-    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.enable", enable)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "enable", "bot"]) == 1
+    assert main(["ops", "disable", "bot"]) == 1
     captured = capsys.readouterr()
     assert captured.err == f"afx ops: {reason}\n"
     assert captured.out == ""
@@ -91,9 +91,9 @@ def test_ops_failure_prints_detail_after_the_fixed_reason(tmp_path, monkeypatch,
     def enable(self, feature: str) -> StageResult:
         raise SystemdError("start", "rc=5 stderr=Unit afx.service not found.")
 
-    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.enable", enable)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "enable", "bot"]) == 1
+    assert main(["ops", "disable", "bot"]) == 1
     assert capsys.readouterr().err == "afx ops: start (rc=5 stderr=Unit afx.service not found.)\n"
 
 
@@ -115,7 +115,7 @@ def test_ops_marker_rejection_prints_owner_and_recovery(tmp_path, monkeypatch, c
     def enable(self, feature: str) -> StageResult:
         raise InvalidState("marker_foreign", "path=/x feature=web")
 
-    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.enable", enable)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "enable", "bot"]) == 1
+    assert main(["ops", "disable", "bot"]) == 1
     assert capsys.readouterr().err == "afx ops: marker_foreign (path=/x feature=web)\n"

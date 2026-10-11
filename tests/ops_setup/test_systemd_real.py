@@ -114,7 +114,8 @@ class Env:
         return self.paths.feature_unit(feature)
 
     def setup(self, hook=lambda _name: None) -> OpsSetup:
-        return OpsSetup(self.root, systemd=Systemd(), paths=self.paths, hook=hook)
+        return OpsSetup(self.root, systemd=Systemd(), paths=self.paths, hook=hook,
+                        config_check=lambda _root, _feature: True, probe=lambda _exec, _feature: (0, ""))
 
     def slice(self) -> str:
         # template の instance は app-<template 名>.slice に入り、service を止めても slice は残る。
