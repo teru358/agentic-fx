@@ -1,9 +1,7 @@
 """改善 mission の CLI backend を隔離付きで起動してよいかの判断 (admission) を一か所に集める。
 
-隔離の経路に入るかは `ISOLATION_ENABLED` (code の定数) だけで決める。settings の key にはしない
-(隔離を緩める設定を作らない)。偽の間、afx は今までどおり隔離なしで改善 CLI を起動し、起動時の
-診断 (unit admission と kernel の probe を読むだけ) を技術ログに 1 行出す。afx の cgroup は
-動かさない。
+隔離の経路に入るかは `ISOLATION_ENABLED` (code の定数) だけで決める。これは有効で、settings の
+key にはしない (隔離を緩める設定を作らない)。
 
 真のとき、判定は次の順で、最初の不足を固定 reason (分類は `sandbox_unavailable`) で返す。
 
@@ -44,8 +42,8 @@ from agentic_fx.core import improve_fingerprint as F
 
 _log = logging.getLogger("agentic_fx.core.improve_admission")
 
-#: 隔離の経路を本番で使うか。最終の自己試験と運用の前提が揃うまで偽のまま置く
-ISOLATION_ENABLED = False
+#: 隔離の経路は有効。settings から無効化できない。
+ISOLATION_ENABLED = True
 
 #: 一時失敗の再試行の間隔 (canary と自己試験は数秒〜数分かかるので、mission ごとには試さない)
 SELFTEST_RETRY_INTERVAL_SEC = 60.0
@@ -148,6 +146,32 @@ def inspect_artifact(path: str) -> F.ArtifactIdentity:
         os.close(fd)
 
 
+def inspect_codex_package(path: str) -> F.CodexPackage:
+    """codex の host と package manifest を検査し、検査した fd の identity と manifest の hash を返す。"""
+    from agentic_fx.core import cli_launch as L
+    binary = Path(path)
+    host = binary.parent / "codex-code-mode-host"
+    manifest = binary.parent.parent / "codex-package.json"
+    try:
+        fd = L.open_cli_binary(str(host))
+    except OSError as e:
+        raise ValueError(f"host open: {e.strerror}") from None
+    try:
+        ident, why = L.inspect_cli_artifact(fd)
+        if ident is None:
+            raise ValueError(f"host: {why}")
+        host_identity = F.hash_artifact_fd(fd)
+        try:
+            manifest_bytes = manifest.read_bytes()
+        except OSError:
+            raise ValueError("package manifest missing") from None
+        return F.CodexPackage(host_identity, F._sha(manifest_bytes))
+    except OSError as e:
+        raise ValueError(f"host hash: {e}") from None
+    finally:
+        os.close(fd)
+
+
 class ImproveAdmission:
     """fingerprint ごとの判定を process 内で覚える。canary と自己試験は constructor で渡す。"""
 
@@ -189,9 +213,10 @@ class ImproveAdmission:
             return AdmissionDecision(False, reason, backend)
         try:
             artifact = inspect_artifact(artifact_path)
+            package = inspect_codex_package(artifact_path) if backend == "codex" else None
         except ValueError as e:
             return AdmissionDecision(False, REASON_ARTIFACT, backend, detail=str(e))
-        fp = F.compute_fingerprint(backend, artifact, kernel)
+        fp = F.compute_fingerprint(backend, artifact, kernel, codex_package=package)
         key = (backend, fp.aggregate)
         while True:
             # 停止の後は覚えた判定も返さず、canary・自己試験も始めない (停止の判定は覚えない)
@@ -413,10 +438,13 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
                 f"cgroup_gate={'open' if host.mission_allowed() else 'closed'}")
     adm = default_admission(root, stop_event=stop_event)
     choice = choose_for_mission(settings, root, enabled=True, host=host, admission=adm)
+    fingerprint = (choice.decision.fingerprint.aggregate
+                   if choice.decision is not None and choice.decision.fingerprint is not None
+                   else "none")
     if choice.refusal is None:
-        return f"improve isolation: enabled; backend={backend} admitted=yes"
+        return f"improve isolation: enabled; backend={backend} admitted=yes fingerprint={fingerprint}"
     return (f"improve isolation: enabled; backend={backend} admitted=no "
-            f"reason={choice.refusal}")
+            f"reason={choice.refusal} fingerprint={fingerprint}")
 
 
 __all__ = [

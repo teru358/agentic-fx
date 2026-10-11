@@ -23,12 +23,19 @@ import pytest
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.verify_backend import (
-    VerifyBackendGateError, VerifyBackendResult, verify_backend)
+    OPERATOR_SHELL_NO_ISOLATION, VerifyBackendGateError, VerifyBackendResult,
+    verify_backend as _verify_backend)
 from agentic_fx.runners.base import Mission, MissionResult
 
 NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
 
 _BEHAVIOR: dict[str, dict] = {"current": {}}
+
+
+def verify_backend(*args, **kwargs):
+    """既存の WorkerRunner 契約試験を運用者 shell の明示経路で実行する。"""
+    kwargs.setdefault("isolation_options", OPERATOR_SHELL_NO_ISOLATION)
+    return _verify_backend(*args, **kwargs)
 
 
 class _FakeVerifyWorkerRunner:
@@ -96,8 +103,77 @@ def _settings_with_codex_provider(provider: str):
 
 def _echo_ok(mission: Mission) -> MissionResult:
     nonce = mission.output_schema["properties"]["echo"]["const"]
-    return MissionResult(status="completed", output={"echo": nonce},
+    return MissionResult(status="completed", output={"echo": nonce, "count": 0},
                          transcript=[])
+
+
+def test_verify_backend_default_requires_admission_and_fails_closed_without_host(
+        tmp_path, monkeypatch):
+    """既定の verify は mission と同じ admission を通り、host が無ければ拒否する。"""
+    from agentic_fx.core import improve_admission
+
+    settings = _settings()
+    settings = settings.model_copy(update={"runner": settings.runner.model_copy(update={
+        "improve": settings.runner.improve.model_copy(update={"backend": "codex"})})})
+    monkeypatch.setattr(improve_admission, "current_host", lambda: None)
+
+    result = _verify_backend(tmp_path, settings, backend="codex", provider=None,
+                             clock=FixedClock(NOW))
+
+    assert result.ok is False
+    assert result.fingerprint is None
+    assert result.detail == "sandbox_unavailable: cgroup_topology_unsupported"
+
+
+@pytest.mark.parametrize("options", [{}, {"cleanup_protocol": object()}])
+def test_verify_backend_rejects_incomplete_isolation_options_before_runner(
+        tmp_path, monkeypatch, options):
+    """admission 外から渡した不完全な options で隔離を外せない。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+
+    with pytest.raises(ValueError, match="cleanup_protocol.*isolation"):
+        _verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                        clock=FixedClock(NOW), isolation_options=options)
+
+
+def test_verify_backend_sentinel_constructs_runner_without_isolation_options(
+        tmp_path, monkeypatch):
+    """運用者 shell の sentinel だけが隔離用の runner 引数を省略する。"""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+
+    result = _verify_backend(
+        tmp_path, _settings(), backend="local", provider=None, clock=FixedClock(NOW),
+        isolation_options=OPERATOR_SHELL_NO_ISOLATION)
+
+    assert result.ok is True
+    assert "cleanup_protocol" not in _FakeVerifyWorkerRunner.captured_kwargs
+    assert "isolation" not in _FakeVerifyWorkerRunner.captured_kwargs
+
+
+def test_verify_backend_accepts_complete_selftest_isolation_options(tmp_path, monkeypatch):
+    """自己試験が渡す完全な WorkerRunner options は隔離付きで通る。"""
+    from types import SimpleNamespace
+
+    from agentic_fx.core import improve_admission as IA
+    from agentic_fx.core import improve_fingerprint as F
+
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    _BEHAVIOR["current"] = {"result": _echo_ok}
+    decision = IA.AdmissionDecision(
+        True, None, "local", SimpleNamespace(aggregate="b" * 64),
+        F.ArtifactIdentity("a" * 64, 1, 2, 3, 4))
+    options = IA.worker_runner_options(decision, object())
+
+    result = _verify_backend(tmp_path, _settings(), backend="local", provider=None,
+                             clock=FixedClock(NOW), isolation_options=options)
+
+    assert result.ok is True
+    assert _FakeVerifyWorkerRunner.captured_kwargs["cleanup_protocol"] is options["cleanup_protocol"]
+    assert _FakeVerifyWorkerRunner.captured_kwargs["isolation"] is options["isolation"]
 
 
 def test_verify_backend_succeeds_on_nonce_roundtrip(tmp_path, monkeypatch):
@@ -240,7 +316,7 @@ def test_verify_backend_fails_closed_when_status_is_not_completed_but_output_is_
 
     def _not_completed_but_echoing(mission: Mission) -> MissionResult:
         nonce = mission.output_schema["properties"]["echo"]["const"]
-        return MissionResult(status=status, output={"echo": nonce},
+        return MissionResult(status=status, output={"echo": nonce, "count": 0},
                              transcript=[], reason="cli " + status)
     _BEHAVIOR["current"] = {"result": _not_completed_but_echoing}
 
@@ -255,7 +331,7 @@ def test_verify_backend_fails_closed_when_status_is_not_completed_but_output_is_
     assert f"status={status}" in result.detail
 
 
-def test_verify_backend_mission_is_a_one_shot_toolless_strict_probe(
+def test_verify_backend_mission_requires_the_staging_list_tool(
         tmp_path, monkeypatch):
     """F-V4/F-V5/F-V8 是正 (段0「観測点不在」): `_FakeVerifyWorkerRunner`
     は `mission` を nonce 読み出し以外に一切使わないため、
@@ -278,7 +354,7 @@ def test_verify_backend_mission_is_a_one_shot_toolless_strict_probe(
 
     m = captured["m"]
     assert (m.max_turns, m.tools, m.output_schema["additionalProperties"],
-            m.output_schema["required"]) == (1, [], False, ["echo"])
+            m.output_schema["required"]) == (4, ["list_staging"], False, ["echo", "count"])
 
 
 def test_verify_backend_fails_closed_when_handshake_never_reaches_ready(
@@ -678,6 +754,10 @@ def _mcp(kind="tools/list", tools=("web_search", "fetch_article")) -> dict:
         {"_mcp_observed": {"kind": kind, "tools": list(tools)}})}}
 
 
+def _mcp_call() -> dict:
+    return _mcp("tools/call", ("list_staging",))
+
+
 def _claude_text(text: str) -> dict:
     return _event({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
 
@@ -732,7 +812,8 @@ def test_stop_on_echo_succeeds_at_first_echo_even_if_cli_keeps_calling_tools(
         yield _event({"type": "step_start"})
         yield _mcp("initialize", ())
         yield _mcp()
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _mcp_call()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
         yield _event({"type": "step_finish", "part": {"reason": "tool-calls"}})
         for _ in range(1000):
             yield _event({"type": "tool_use", "part": {"tool": "afx_web_search"}})
@@ -741,7 +822,7 @@ def test_stop_on_echo_succeeds_at_first_echo_even_if_cli_keeps_calling_tools(
     result = _run_stop_on_echo(tmp_path)
 
     assert result.ok is True and result.fingerprint is not None
-    assert _BEHAVIOR["current"]["delivered"] == 4  # echo と MCP が揃った event で止まった
+    assert _BEHAVIOR["current"]["delivered"] == 5
 
 
 def test_stop_on_echo_does_not_count_the_prompt_or_wrong_nonce(tmp_path, monkeypatch):
@@ -765,15 +846,16 @@ def test_stop_on_echo_waits_for_mcp_when_echo_comes_first(tmp_path, monkeypatch)
     _watchers(monkeypatch)
 
     def events(nonce):
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
         yield _mcp("initialize", ())
         yield _mcp()
+        yield _mcp_call()
         for _ in range(100):
             yield _event({"type": "tool_use", "part": {"tool": "afx_web_search"}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     assert _run_stop_on_echo(tmp_path).ok is True
-    assert _BEHAVIOR["current"]["delivered"] == 3
+    assert _BEHAVIOR["current"]["delivered"] == 4
 
 
 def test_stop_on_echo_fails_without_tools_list(tmp_path, monkeypatch):
@@ -781,7 +863,7 @@ def test_stop_on_echo_fails_without_tools_list(tmp_path, monkeypatch):
     _watchers(monkeypatch)
 
     def events(nonce):
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     ok_output = MissionResult("completed", {"echo": "x"}, [])
     _BEHAVIOR["current"] = {"events": events, "final": ok_output}
@@ -796,7 +878,7 @@ def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
     def events(nonce):
         yield _mcp("initialize", ())
         yield _mcp(tools=())
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
@@ -809,7 +891,7 @@ def test_stop_on_echo_ignores_a_cli_printed_mcp_observation(tmp_path, monkeypatc
 
     def events(nonce):
         yield _event({"_mcp_observed": {"kind": "tools/list", "tools": ["afx_x"]}})
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
@@ -818,16 +900,16 @@ def test_stop_on_echo_ignores_a_cli_printed_mcp_observation(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("backend,event", [
     ("opencode", lambda n: {"type": "tool_result", "part": {"text": n}}),
-    ("opencode", lambda n: {"_resume_recovery": True, "stderr_tail": json.dumps({"echo": n})}),
-    ("opencode", lambda n: {"type": "reasoning", "part": {"text": json.dumps({"echo": n})}}),
+    ("opencode", lambda n: {"_resume_recovery": True, "stderr_tail": json.dumps({"echo": n, "count": 0})}),
+    ("opencode", lambda n: {"type": "reasoning", "part": {"text": json.dumps({"echo": n, "count": 0})}}),
     ("claude", lambda n: {"type": "user", "message": {"content": [
-        {"type": "tool_result", "content": json.dumps({"echo": n})}]}}),
+        {"type": "tool_result", "content": json.dumps({"echo": n, "count": 0})}]}}),
     ("claude", lambda n: {"type": "assistant", "message": {"content": [
-        {"type": "thinking", "thinking": json.dumps({"echo": n})}]}}),
+        {"type": "thinking", "thinking": json.dumps({"echo": n, "count": 0})}]}}),
     ("codex", lambda n: {"type": "item.completed", "item": {
-        "type": "command_execution", "aggregated_output": json.dumps({"echo": n})}}),
+        "type": "command_execution", "aggregated_output": json.dumps({"echo": n, "count": 0})}}),
     ("codex", lambda n: {"type": "item.completed", "item": {
-        "type": "reasoning", "text": json.dumps({"echo": n})}}),
+        "type": "reasoning", "text": json.dumps({"echo": n, "count": 0})}}),
 ])
 def test_stop_on_echo_ignores_nonce_json_outside_assistant_text(
         tmp_path, monkeypatch, backend, event):
@@ -846,15 +928,16 @@ def test_stop_on_echo_ignores_nonce_json_outside_assistant_text(
 def test_stop_on_echo_accepts_each_backends_assistant_text(tmp_path, monkeypatch):
     _watchers(monkeypatch)
     shapes = {
-        "opencode": lambda n: {"type": "text", "part": {"text": json.dumps({"echo": n})}},
-        "claude": lambda n: {"type": "result", "result": json.dumps({"echo": n})},
+        "opencode": lambda n: {"type": "text", "part": {"text": json.dumps({"echo": n, "count": 0})}},
+        "claude": lambda n: {"type": "result", "result": json.dumps({"echo": n, "count": 0})},
         "codex": lambda n: {"type": "item.completed", "item": {
-            "type": "agent_message", "text": json.dumps({"echo": n})}},
+            "type": "agent_message", "text": json.dumps({"echo": n, "count": 0})}},
     }
     for backend, shape in shapes.items():
         def events(nonce, shape=shape):
             yield _mcp("initialize", ())
             yield _mcp()
+            yield _mcp_call()
             yield _event(shape(nonce))
 
         _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
@@ -873,7 +956,7 @@ def test_stop_on_echo_requires_one_complete_code_fence(tmp_path, monkeypatch, wr
     def events(nonce):
         yield _mcp("initialize", ())
         yield _mcp()
-        yield _event({"type": "text", "part": {"text": wrap(json.dumps({"echo": nonce}))}})
+        yield _event({"type": "text", "part": {"text": wrap(json.dumps({"echo": nonce, "count": 0}))}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     assert _run_stop_on_echo(tmp_path).ok is False
@@ -885,8 +968,9 @@ def test_stop_on_echo_accepts_fenced_json_and_nested_claude_shape(tmp_path, monk
     def events(nonce):
         yield _mcp("initialize", ())
         yield _mcp()
+        yield _mcp_call()
         yield _event({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "```json\n" + json.dumps({"echo": nonce}) + "\n```"}]}})
+            {"type": "text", "text": "```json\n" + json.dumps({"echo": nonce, "count": 0}) + "\n```"}]}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     assert _run_stop_on_echo(tmp_path, backend="claude").ok is True
@@ -897,7 +981,7 @@ def test_without_stop_on_echo_the_normal_result_decides(tmp_path, monkeypatch):
     _watchers(monkeypatch)
 
     def events(nonce):
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     _BEHAVIOR["current"] = {"events": events,
                             "final": MissionResult("failed", None, [], reason="boom")}
@@ -942,7 +1026,7 @@ def test_stop_on_echo_timeout_without_echo_is_readable(tmp_path, monkeypatch):
 
     assert result.ok is False
     assert "status=timeout" in result.detail
-    assert "echo_reached=no mcp=none steps=2" in result.detail
+    assert "echo_reached=no mcp=none call=0 steps=2" in result.detail
 
 
 def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch):
@@ -954,7 +1038,8 @@ def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch
     def events(nonce):
         yield _mcp("initialize", ())
         yield _mcp()
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _mcp_call()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
@@ -967,11 +1052,28 @@ def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, m
 
     def events(nonce):
         yield _mcp()
-        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
     assert result.ok is False and "mcp=tools=2 (uninitialized)" in result.detail
+
+
+def test_stop_on_echo_summary_marks_uninitialized_only_when_initialize_was_not_seen(
+        tmp_path, monkeypatch):
+    """initialize と tools/list は届いて tools/call だけ無いときは (uninitialized) を付けない。"""
+    _watchers(monkeypatch)
+
+    def events(nonce):
+        yield _mcp("initialize", ())
+        yield _mcp()
+        yield _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
+
+    _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
+    result = _run_stop_on_echo(tmp_path)
+    assert result.ok is False
+    assert "mcp=tools=2 " in result.detail and "uninitialized" not in result.detail
+    assert "call=0" in result.detail
 
 
 class _FakeMono:
@@ -983,7 +1085,7 @@ class _FakeMono:
 
 
 def _echo_frame(nonce: str) -> dict:
-    return _event({"type": "text", "part": {"text": json.dumps({"echo": nonce})}})
+    return _event({"type": "text", "part": {"text": json.dumps({"echo": nonce, "count": 0})}})
 
 
 def test_echo_watch_grace_expires_when_tools_list_never_comes_after_echo():
@@ -1013,6 +1115,7 @@ def test_echo_watch_tools_list_within_grace_succeeds():
     watch.observe(_mcp("initialize", ()))
     clock.t = 59.0
     watch.observe(_mcp())
+    watch.observe(_mcp_call())
     assert watch.ok and stop.is_set()
     clock.t = 500.0
     assert watch.check_grace() is False and "grace_expired" not in watch.summary()
@@ -1046,6 +1149,7 @@ def test_echo_watch_success_summary_has_no_grace_expired_after_ok():
     watch.observe(_mcp("initialize", ()))
     clock.t = 59.9
     watch.observe(_mcp())
+    watch.observe(_mcp_call())
     clock.t = 60.0
     assert watch.check_grace() is False
     assert watch.ok and "grace_expired" not in watch.summary()

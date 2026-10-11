@@ -36,6 +36,34 @@ BASE_PY = os.path.realpath(sys.executable)
 MOUNT = "/sys/fs/cgroup"
 
 
+# --- codex の package 配置 (作り方は _codex_package) -----------------------------------
+
+import importlib.util as _ilu  # noqa: E402
+
+_spec = _ilu.spec_from_file_location("_codex_package", HERE.with_name("_codex_package.py"))
+_codex_package = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_codex_package)
+make_codex_package = _codex_package.make_codex_package
+
+_CODEX_CLI: list[str] = []
+
+
+def codex_cli() -> str:
+    """この process で共有する codex の package の `bin/codex` (process の終了で消える)。"""
+    if not _CODEX_CLI:
+        import atexit
+
+        path = make_codex_package()
+        atexit.register(shutil.rmtree, path.parent.parent, ignore_errors=True)
+        _CODEX_CLI.append(str(path))
+    return _CODEX_CLI[0]
+
+
+def cli_artifact(backend: str) -> str:
+    """backend の CLI 役の artifact (codex だけ package 配置、他は python の ELF)。"""
+    return codex_cli() if backend == "codex" else BASE_PY
+
+
 # --- worker 役 -------------------------------------------------------------------
 
 #: probe が受け取った argv / env などを書く file (worker 役の cwd = mission の workdir)
@@ -408,7 +436,7 @@ def leftover_cleanup(host, r: dict) -> None:
 
 def sc_e2e(r: dict, backend: str) -> None:
     host = start_host()
-    choice = admitted_options(host, backend, BASE_PY)
+    choice = admitted_options(host, backend, cli_artifact(backend))
     # 部分木の外の listener (supervisor が通さなければ connect は成功する)
     import socket
     outside = socket.socket()
@@ -417,7 +445,7 @@ def sc_e2e(r: dict, backend: str) -> None:
     cfg = {"connect": "proxy" if backend != "opencode" else outside.getsockname()[1],
            "hold": 0.3}
     try:
-        r["mission"] = run_mission(r, host=host, backend=backend, artifact=BASE_PY,
+        r["mission"] = run_mission(r, host=host, backend=backend, artifact=cli_artifact(backend),
                                    probe_cfg=cfg, options=choice.worker_options)
     finally:
         outside.close()
@@ -429,10 +457,10 @@ def sc_e2e(r: dict, backend: str) -> None:
 def sc_renamed(r: dict) -> None:
     """hash した inode が exec される (ready の後・go の前に path を別 file へ差し替える)。"""
     host = start_host()
-    d = Path(tempfile.mkdtemp(prefix="afx-artifact-"))
-    art = d / "cli"
-    shutil.copy2(BASE_PY, art)
-    other = d / "other"
+    d = make_codex_package(copy_cli=True).parent.parent
+    art = d / "bin" / "codex"
+    pad = d / "bin"
+    other = pad / "other"
     shutil.copy2(BASE_PY, other)
     with open(other, "ab") as f:
         f.write(b"\0" * 16)  # 内容の違う別 inode
@@ -458,9 +486,9 @@ def sc_in_place(r: dict) -> None:
     import hashlib
 
     host = start_host()
-    d = Path(tempfile.mkdtemp(prefix="afx-artifact-"))
-    art = d / "cli"
-    shutil.copy2(BASE_PY, art)
+    d = make_codex_package(copy_cli=True).parent.parent
+    art = d / "bin" / "codex"
+    pad = d / "bin"
     r["original_ino"] = os.stat(art).st_ino
     choice = admitted_options(host, "codex", str(art))
 
@@ -483,11 +511,11 @@ def sc_in_place(r: dict) -> None:
 def sc_changed(r: dict) -> None:
     """admission の後・worker の open の前に artifact が変わると、worker は exec しない。"""
     host = start_host()
-    d = Path(tempfile.mkdtemp(prefix="afx-artifact-"))
-    art = d / "cli"
-    shutil.copy2(BASE_PY, art)
+    d = make_codex_package(copy_cli=True).parent.parent
+    art = d / "bin" / "codex"
+    pad = d / "bin"
     choice = admitted_options(host, "codex", str(art))
-    other = d / "other"
+    other = pad / "other"
     shutil.copy2(BASE_PY, other)
     with open(other, "ab") as f:
         f.write(b"\0" * 16)
@@ -503,14 +531,14 @@ def sc_gate(r: dict) -> None:
     from agentic_fx.core import improve_admission as IA
 
     host = start_host()
-    choice = admitted_options(host, "codex", BASE_PY)
+    choice = admitted_options(host, "codex", codex_cli())
     real = choice.worker_options["cleanup_protocol"].on_reaped
-    r["first"] = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+    r["first"] = run_mission(r, host=host, backend="codex", artifact=codex_cli(),
                              probe_cfg={"hold": 0.1}, options=choice.worker_options,
                              hook_override=lambda n, _reaped, dl: real(n, False, dl))
     adm = IA.ImproveAdmission(canary=lambda c: IA.ProbeOutcome(True),
                               selftest=lambda c: IA.ProbeOutcome(True))
-    second = IA.choose_for_mission(make_settings("codex", BASE_PY), REPO, enabled=True,
+    second = IA.choose_for_mission(make_settings("codex", codex_cli()), REPO, enabled=True,
                                    host=host, admission=adm)
     r["second_refusal"] = second.refusal
     r["second_options"] = sorted(second.worker_options)
@@ -560,7 +588,7 @@ def admission_context(host, backend: str, artifact: str):
 
     ident = IA.inspect_artifact(artifact)
     kernel = F.probe_kernel()
-    fp = F.compute_fingerprint(backend, ident, kernel)
+    fp = F.compute_fingerprint(backend, ident, kernel, artifact_path=artifact)
     return IA.AdmissionContext(backend, artifact, ident, fp, host)
 
 
@@ -571,12 +599,12 @@ def sc_canary(r: dict, backend: str, flip: str | None = None, mismatch: bool = F
     host = start_host()
     fake_credentials()
     isolate_transcripts()
-    settings = make_settings(backend, BASE_PY)
-    ctx = admission_context(host, backend, BASE_PY)
+    settings = make_settings(backend, cli_artifact(backend))
+    ctx = admission_context(host, backend, cli_artifact(backend))
     if mismatch:
         # worker に渡す handshake の fingerprint を、別 backend の値 (正しい形で値だけ違う) にする
         other = "claude" if backend != "claude" else "codex"
-        wrong = admission_context(host, other, BASE_PY).fingerprint
+        wrong = admission_context(host, other, cli_artifact(other)).fingerprint
         assert wrong.aggregate != ctx.fingerprint.aggregate
         import dataclasses
         ctx = dataclasses.replace(ctx, fingerprint=wrong)
@@ -613,7 +641,7 @@ def sc_canary_blocks(r: dict, backend: str) -> None:
     host = start_host()
     fake_credentials()
     isolate_transcripts()
-    settings = make_settings(backend, BASE_PY)
+    settings = make_settings(backend, cli_artifact(backend))
     flipped = dict(C.EXPECTED)
     flipped["listen_ipv4_eperm"] = "ok"
     if backend == "opencode":
@@ -651,8 +679,8 @@ def sc_saturate(r: dict, kind: str, backend: str) -> None:
     missions: list = []
     if backend == "opencode":
         # proxy を持たない backend は、飽和させる slot も tunnel も無い (直接の宛先は 8080 だけ)
-        choice = admitted_options(host, backend, BASE_PY)
-        r["mission"] = run_mission(r, host=host, backend=backend, artifact=BASE_PY,
+        choice = admitted_options(host, backend, cli_artifact(backend))
+        r["mission"] = run_mission(r, host=host, backend=backend, artifact=cli_artifact(backend),
                                    probe_cfg={"inject": kind, "hold": 0.2},
                                    options=choice.worker_options)
         leftover_cleanup(host, r)
@@ -661,7 +689,7 @@ def sc_saturate(r: dict, kind: str, backend: str) -> None:
     def selftest(ctx):
         options = IA.worker_runner_options(
             IA.AdmissionDecision(True, None, ctx.backend, ctx.fingerprint, ctx.artifact), host)
-        m = run_mission(r, host=host, backend=backend, artifact=BASE_PY,
+        m = run_mission(r, host=host, backend=backend, artifact=cli_artifact(backend),
                         probe_cfg={"connect": "saturate", "inject": kind, "hold": 0.2},
                         options=options)
         missions.append(m)
@@ -669,10 +697,11 @@ def sc_saturate(r: dict, kind: str, backend: str) -> None:
         return IA.ProbeOutcome(ok, False, "" if ok else str(m["result"]["reason"])[:200])
 
     adm = IA.ImproveAdmission(canary=lambda c: IA.ProbeOutcome(True), selftest=selftest)
-    settings = make_settings(backend, BASE_PY)
+    settings = make_settings(backend, cli_artifact(backend))
     first = IA.choose_for_mission(settings, REPO, enabled=True, host=host, admission=adm)
     second = IA.choose_for_mission(settings, REPO, enabled=True, host=host, admission=adm)
-    r["first"] = {"refusal": first.refusal, "detail": first.decision.detail}
+    r["first"] = {"refusal": first.refusal, "detail": first.decision.detail,
+                  "aggregate": first.decision.fingerprint.aggregate}
     r["second"] = {"refusal": second.refusal, "same": second.decision is first.decision}
     r["selftest_runs"] = len(missions)
     r["mission"] = missions[0] if missions else None
@@ -702,8 +731,8 @@ def sc_real_selftest(r: dict, backend: str, artifact: str) -> None:
 def sc_early_fault(r: dict) -> None:
     """CLI を起こす前の障害: CLI 無しの mission も §4.2.3 の handoff 前系列で片付ける。"""
     host = start_host()
-    choice = admitted_options(host, "codex", BASE_PY)
-    r["mission"] = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+    choice = admitted_options(host, "codex", codex_cli())
+    r["mission"] = run_mission(r, host=host, backend="codex", artifact=codex_cli(),
                                probe_cfg={"inject": "fault_early", "hold": 0.1},
                                options=choice.worker_options)
     leftover_cleanup(host, r)
@@ -713,12 +742,12 @@ def sc_abort(r: dict) -> None:
     """afx が go を送らずに mission をやめる (on_ready の失敗)。worker は deadline を受けて
     go を待つのをやめ、CLI 無しの handoff 前系列で片付けてから終わる。"""
     host = start_host()
-    choice = admitted_options(host, "codex", BASE_PY)
+    choice = admitted_options(host, "codex", codex_cli())
 
     def refuse() -> None:
         raise RuntimeError("injected on_ready failure")
 
-    r["mission"] = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+    r["mission"] = run_mission(r, host=host, backend="codex", artifact=codex_cli(),
                                probe_cfg={"hold": 0.1}, options=choice.worker_options,
                                on_ready_extra=refuse)
     leftover_cleanup(host, r)
@@ -727,8 +756,8 @@ def sc_abort(r: dict) -> None:
 def sc_fault(r: dict) -> None:
     """supervisor の障害は CLI を止める契機で、mission は sandbox_unavailable で失敗する。"""
     host = start_host()
-    choice = admitted_options(host, "codex", BASE_PY)
-    r["mission"] = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+    choice = admitted_options(host, "codex", codex_cli())
+    r["mission"] = run_mission(r, host=host, backend="codex", artifact=codex_cli(),
                                probe_cfg={"inject": "fault", "hold": 20},
                                options=choice.worker_options)
     leftover_cleanup(host, r)
@@ -737,8 +766,8 @@ def sc_fault(r: dict) -> None:
 def sc_system_exit(r: dict) -> None:
     """router を起こした worker の main を SystemExit(3) が抜けると、worker の終了 code は 3。"""
     host = start_host()
-    choice = admitted_options(host, "codex", BASE_PY)
-    r["mission"] = run_mission(r, host=host, backend="codex", artifact=BASE_PY,
+    choice = admitted_options(host, "codex", codex_cli())
+    r["mission"] = run_mission(r, host=host, backend="codex", artifact=codex_cli(),
                                probe_cfg={"inject": "system_exit"},
                                options=choice.worker_options)
     leftover_cleanup(host, r)
@@ -748,18 +777,24 @@ def sc_system_exit(r: dict) -> None:
 PADDED_EXTRA_BYTES = 160 * 1024 * 1024
 
 
-def sc_memory(r: dict, memory_max: str) -> None:
+def sc_memory(r: dict, memory_max: str, backend: str = "codex") -> None:
     """python の ELF に 160 MiB を足した artifact を CLI 役にして、mission cgroup の
     memory.current と shmem を観測する。`memory_max` を渡すと mission cgroup の memory.max を
-    その値にする (`boundary` は artifact の大きさと launcher の見積りの和)。"""
+    その値にする (`boundary` は artifact の大きさと launcher の見積りの和)。`backend` が codex の
+    artifact は package 配置の `bin/codex` (path_fd で exec され、写しは作らない)、claude は
+    memfd に写される単体の ELF。"""
     host = start_host()
-    d = Path(tempfile.mkdtemp(prefix="afx-artifact-"))
-    art = d / "cli"
-    shutil.copy2(BASE_PY, art)
+    if backend == "codex":
+        d = make_codex_package(copy_cli=True).parent.parent
+        art = d / "bin" / "codex"
+    else:
+        d = Path(tempfile.mkdtemp(prefix="afx-artifact-"))
+        art = d / "cli"
+        shutil.copy2(BASE_PY, art)
     with open(art, "ab") as f:
         f.truncate(os.stat(art).st_size + PADDED_EXTRA_BYTES)
     r["artifact_size"] = os.stat(art).st_size
-    choice = admitted_options(host, "codex", str(art))
+    choice = admitted_options(host, backend, str(art))
     cfg = {"hold": 1.0}
     if memory_max == "boundary":
         # artifact と launcher の見積りの和が memory.max にちょうど等しい (判定は通る最大)
@@ -769,7 +804,7 @@ def sc_memory(r: dict, memory_max: str) -> None:
     if memory_max:
         cfg["inject"] = f"memory_max:{int(memory_max)}"
     try:
-        r["mission"] = run_mission(r, host=host, backend="codex", artifact=str(art),
+        r["mission"] = run_mission(r, host=host, backend=backend, artifact=str(art),
                                    probe_cfg=cfg, options=choice.worker_options)
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -778,6 +813,7 @@ def sc_memory(r: dict, memory_max: str) -> None:
 
 SCENARIOS = {
     "memory": lambda r, arg: sc_memory(r, arg),
+    "memory_memfd": lambda r, arg: sc_memory(r, arg, "claude"),
     "system_exit": lambda r, arg: sc_system_exit(r),
     "fault": lambda r, arg: sc_fault(r),
     "early_fault": lambda r, arg: sc_early_fault(r),

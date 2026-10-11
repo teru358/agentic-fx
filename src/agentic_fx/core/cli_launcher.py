@@ -8,9 +8,8 @@
   無いこと、capability が全部 0 で uid / gid / supplementary group が worker の期待値と
   一致すること
 - L4: HELLO{pid} を送り、JOINED を厳密に検査する
-- L4a: mission cgroup に入った後で、渡された fd の bytes を封印した memfd に写し (memfd の
-  page は mission cgroup に課金される)、SHA-256 を afx が admission で見た digest と照合し、
-  memfd を ELF として検査し直す。元の fd は閉じる
+- L4a: `native_elf` は mission cgroup に入った後で封印 memfd に写す。`path_fd` は
+  admission 済み fd の metadata・ELF・digest を再照合してその fd を exec する
 - L4b: rlimit の hard 固定 (RLIMIT_FSIZE が memfd への書込みに掛からないよう、写した後)
 - L5: subreaper、no_new_privs、nested Landlock (TSYNC)
 - L6〜L7: seccomp `improve-cli/1` を install して listener を得て、seccomp mode 2、
@@ -345,6 +344,28 @@ def _sealed_exec_artifact(src_fd: int, digest: str) -> int:
     return memfd
 
 
+def _path_fd_exec_artifact(src_fd: int, expected: dict, digest: str) -> int:
+    """admission 済みの path fd を開き直さずに再検査する。"""
+    try:
+        st = os.fstat(src_fd)
+        actual = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+        want = tuple(int(expected[k]) for k in ("dev", "ino", "size", "mtime_ns"))
+        if actual != want:
+            raise _SetupFailed("artifact_changed")
+        identity, _why = AC.inspect_cli_artifact(src_fd)
+        if identity is None:
+            raise _SetupFailed("artifact_copy_unsupported")
+        if AC.sha256_fd(src_fd) != digest:
+            raise _SetupFailed("artifact_changed")
+        return src_fd
+    except _SetupFailed:
+        os.close(src_fd)
+        raise
+    except OSError as e:
+        os.close(src_fd)
+        raise _SetupFailed("artifact_changed", e.errno or 0) from None
+
+
 def _execveat(cli_fd: int, argv, envp) -> int:
     """成功すれば戻らない。失敗の errno を返す。"""
     c_argv = (ctypes.c_char_p * (len(argv) + 1))(*[a.encode() if isinstance(a, str) else a
@@ -361,6 +382,7 @@ def _run(cfg: dict) -> None:
     status_fd = int(cfg["status_fd"])
     src_fd = int(cfg["cli_fd"])
     digest = str(cfg["artifact_sha256"])
+    launch_kind = str(cfg.get("launch_kind", "native_elf"))
     nonce = bytes.fromhex(cfg["nonce"])
     if len(nonce) != P.NONCE_LEN:
         raise _Abort("nonce")
@@ -398,7 +420,12 @@ def _run(cfg: dict) -> None:
         _expect(sock, nonce, P.JOINED)
 
         # L4a: mission cgroup に入った後で写す (memfd の page を mission cgroup に課金する)
-        cli_fd = _sealed_exec_artifact(src_fd, digest)
+        if launch_kind == "native_elf":
+            cli_fd = _sealed_exec_artifact(src_fd, digest)
+        elif launch_kind == "path_fd":
+            cli_fd = _path_fd_exec_artifact(src_fd, cfg["artifact_identity"], digest)
+        else:
+            raise _SetupFailed("artifact_copy_unsupported")
         st = os.fstat(cli_fd)
         exec_identity = (st.st_dev, st.st_ino)
         # L4b: RLIMIT_FSIZE は memfd への書込みにも掛かるので、写した後に固定する

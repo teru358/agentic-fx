@@ -1371,7 +1371,7 @@ class ImproveLoop:
         from agentic_fx.core import improve_admission
         from agentic_fx.runners.worker_runner import WorkerRunner
 
-        # CLI 隔離の判定 (有効化の定数が偽なら空の引数で、今までどおりの WorkerRunner)。
+        # CLI 隔離の判定。admission を通った runner には cleanup protocol と isolation field を渡す。
         # 判定を通らなければ CLI を起こさずに失敗する runner を返す (隔離なしに落とさない)
         choice = improve_admission.choose_for_mission(self._settings, self._root)
         if choice.refusal is not None:

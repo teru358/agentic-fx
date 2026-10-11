@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -17,7 +18,8 @@ PY = os.path.realpath(sys.executable)
 SPEC_COMPONENTS = (
     "profile", "seccomp_policy", "bpf", "nested_landlock", "outer_landlock", "egress",
     "source_launcher", "source_protocol", "source_supervisor", "source_proxy", "source_spool",
-    "source_cgroup", "source_canary", "source_isolation", "kernel", "userspace", "artifact", "launch_kind",
+    "source_cgroup", "source_canary", "source_isolation", "kernel", "userspace", "artifact", "host_artifact",
+    "package_manifest", "launch_kind",
     "argv_env_policy",
 )
 
@@ -65,7 +67,7 @@ SOURCE_MUTATIONS = {
     "source_proxy": "egress/inet_diag.py",
     "source_spool": "tools/mcp_shim.py",
     "source_cgroup": "core/cgroup_host.py",
-    "source_canary": "core/improve_canary.py",
+    "source_canary": "loops/verify_backend.py",
     "source_isolation": "core/improve_isolation.py",
     "outer_landlock": "core/landlock.py",
     "argv_env_policy": "runners/codex_runner.py",
@@ -88,7 +90,9 @@ def test_fingerprint_components_are_complete(name, tmp_path, monkeypatch):
     elif name == "artifact":
         art = dataclasses.replace(art, mtime_ns=art.mtime_ns + 1)
     elif name == "launch_kind":
-        monkeypatch.setattr(F, "LAUNCH_KIND_NATIVE_ELF", "script")
+        monkeypatch.setattr(F, "LAUNCH_KIND_PATH_FD", "script")
+    elif name in ("host_artifact", "package_manifest"):
+        pytest.skip("codex package fixture is covered by admission")
     elif name == "profile":
         from agentic_fx.core import seccomp_cli_policy
         monkeypatch.setattr(seccomp_cli_policy, "PROFILE_ID", "improve-cli/2")
@@ -111,6 +115,21 @@ def test_fingerprint_components_are_complete(name, tmp_path, monkeypatch):
     after = F.compute_fingerprint(backend, art, kernel, root=root, userspace=userspace)
     changed = [n for (n, h), (_, h2) in zip(base.components, after.components) if h != h2]
     assert changed == [name]
+    assert after.aggregate != base.aggregate
+
+
+def test_verify_backend_source_changes_canary_component_and_aggregate(tmp_path):
+    """自己試験の成功条件を変える backend は canary の再判定を強制する。"""
+    root = _src_copy(tmp_path)
+    art = _artifact(tmp_path)
+    base = F.compute_fingerprint("codex", art, KERNEL, root=root, userspace=USERSPACE)
+
+    _flip_byte(root / "loops" / "verify_backend.py")
+
+    after = F.compute_fingerprint("codex", art, KERNEL, root=root, userspace=USERSPACE)
+    changed = [name for (name, digest), (_, later) in zip(base.components, after.components)
+               if digest != later]
+    assert changed == ["source_canary"]
     assert after.aggregate != base.aggregate
 
 
@@ -149,6 +168,34 @@ def test_artifact_mutation_changes_fingerprint(tmp_path):
                                  userspace=USERSPACE).aggregate != fp2.aggregate
 
 
+def test_codex_package_artifacts_are_fingerprint_components(tmp_path):
+    package = tmp_path / "package"
+    bindir = package / "bin"
+    bindir.mkdir(parents=True)
+    binary = bindir / "codex"
+    host = bindir / "codex-code-mode-host"
+    binary.write_bytes(b"codex")
+    host.write_bytes(b"host-a")
+    manifest = package / "codex-package.json"
+    manifest.write_bytes(b'{"layoutVersion":1}')
+    fd = os.open(binary, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        artifact = F.hash_artifact_fd(fd)
+    finally:
+        os.close(fd)
+    before = F.component_values("codex", artifact, KERNEL, userspace=USERSPACE,
+                                artifact_path=str(binary))
+    host.write_bytes(b"host-b")
+    after_host = F.component_values("codex", artifact, KERNEL, userspace=USERSPACE,
+                                    artifact_path=str(binary))
+    manifest.write_bytes(b'{"layoutVersion":2}')
+    after_manifest = F.component_values("codex", artifact, KERNEL, userspace=USERSPACE,
+                                        artifact_path=str(binary))
+    assert before["launch_kind"] == F.LAUNCH_KIND_PATH_FD
+    assert before["host_artifact"] != after_host["host_artifact"]
+    assert after_host["package_manifest"] != after_manifest["package_manifest"]
+
+
 def test_hash_reads_the_fd_not_the_path(tmp_path):
     """hash は開いた fd の内容。path を別 file に rename で差し替えても hash は元の inode。"""
     p = tmp_path / "cli"
@@ -178,12 +225,13 @@ def test_artifact_identity_round_trip_and_validation():
             F.ArtifactIdentity.from_dict(bad)
 
 
-def test_supported_set_is_empty():
-    assert F.SUPPORTED_FINGERPRINTS == frozenset()
+def test_supported_set_is_a_literal_of_registered_aggregates():
     assert type(F.SUPPORTED_FINGERPRINTS) is frozenset
+    assert all(re.fullmatch(r"[0-9a-f]{64}", a) for a in F.SUPPORTED_FINGERPRINTS)
+    assert len(F.SUPPORTED_FINGERPRINTS) == 3
     # 公開 API に集合へ足す経路が無い (名前を列挙して固定する)
     assert sorted(F.__all__) == sorted([
-        "BACKENDS", "COMPONENTS", "EXCLUDED_ENV_PREFIXES", "LAUNCH_KIND_NATIVE_ELF",
+        "BACKENDS", "COMPONENTS", "EXCLUDED_ENV_PREFIXES", "LAUNCH_KIND_NATIVE_ELF", "LAUNCH_KIND_PATH_FD",
         "NO_PROXY_ENV_KEYS", "NO_PROXY_VALUE", "PROXY_ENV_KEYS", "SOURCE_GROUPS",
         "SOURCE_ROOT", "SUPPORTED_FINGERPRINTS", "ArtifactChanged", "ArtifactIdentity",
         "ImproveFingerprint", "KernelCapabilities", "argv_env_policy_form",
@@ -351,10 +399,11 @@ def test_fingerprint_module_is_not_hashed(tmp_path):
     before = F.source_digest("isolation", root)
     path = root / "core" / "improve_fingerprint.py"
     text = path.read_text(encoding="utf-8")
-    old = "SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset()"
-    assert text.count(old) == 1
-    path.write_text(text.replace(old, 'SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset({"a"})'),
-                    encoding="utf-8")
+    replaced, n = re.subn(r"SUPPORTED_FINGERPRINTS: frozenset\[str\] = frozenset\(\{.*?\}\)",
+                          'SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset({"a"})',
+                          text, count=1, flags=re.DOTALL)
+    assert n == 1 and replaced != text
+    path.write_text(replaced, encoding="utf-8")
     assert F.source_digest("isolation", root) == before
 
 

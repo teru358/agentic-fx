@@ -146,7 +146,7 @@ class IsolationSetupError(Exception):
         self.detail = detail
 
 
-def verify_fingerprint(spec: IsolationSpec) -> str:
+def verify_fingerprint(spec: IsolationSpec, *, artifact_path: str | None = None) -> str:
     """worker 自身の source と kernel・userspace で fingerprint を計算し直し、handshake の値
     (afx が admission で判定した aggregate) と照合する。返り値は計算した aggregate。
 
@@ -154,7 +154,8 @@ def verify_fingerprint(spec: IsolationSpec) -> str:
     metadata は開いた fd と、内容は launcher が写した memfd の digest と照合する)。違えば、
     計算できなければ `fingerprint_mismatch` (launcher も cgroup も起こさない)。"""
     try:
-        computed = F.compute_fingerprint(spec.backend, spec.artifact, F.probe_kernel()).aggregate
+        computed = F.compute_fingerprint(spec.backend, spec.artifact, F.probe_kernel(),
+                                         artifact_path=artifact_path).aggregate
     except Exception as e:  # noqa: BLE001  計算できなければ照合できたとはみなさない
         raise IsolationSetupError(REASON_FINGERPRINT_MISMATCH,
                                   f"compute: {type(e).__name__}") from None
@@ -328,7 +329,8 @@ class WorkerIsolation:
         from agentic_fx.egress import inet_diag
         from agentic_fx.egress import proxy as PX
 
-        computed = verify_fingerprint(spec)
+        computed = verify_fingerprint(
+            spec, artifact_path=(None if spec.kind == KIND_CANARY else bin_path))
         if spec.artifact.size + ARTIFACT_MEMORY_HEADROOM > MCG.MEMORY_MAX:
             # launcher は mission cgroup の中で artifact を memfd に写す (swap は 0)。収まらなければ
             # copy の途中で launcher が OOM kill されるので、起こす前に固定 reason で止める
@@ -566,6 +568,8 @@ class IsolatedLaunch:
                     deadline=time.monotonic() + SETUP_DEADLINE_SEC,
                     kill=MCG.launcher_kill(iso.cgroup), nonce=iso.nonce.raw, cwd=cwd,
                     artifact_sha256=iso.spec.artifact.sha256, stdin=stdin,
+                    artifact_identity=iso.spec.artifact,
+                    launch_kind=("path_fd" if iso.spec.backend == "codex" else "native_elf"),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     after_spawn=pin_worker_fsize)
             finally:

@@ -130,6 +130,7 @@ class McpShimDispatcher:
             self._note("tool_executed", str(name))
             result = self._registry.execute(name, params.get("arguments") or {},
                                             self._allowed)
+            observed.append(("tools/call", [str(name)]))
             # result は既に JSON 文字列 (execute の戻り値) — json.dumps で
             # 再エンコードすると二重エンコードになるため、そのまま入れる。
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {

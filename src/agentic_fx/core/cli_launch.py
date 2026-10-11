@@ -304,6 +304,8 @@ def launch_cli(
     credentials: ExpectedCredentials | None = None,
     cwd: str | None = None,
     artifact_sha256: str | None = None,
+    artifact_identity=None,
+    launch_kind: str = "native_elf",
     stdin=subprocess.DEVNULL,
     stdout=None,
     stderr=None,
@@ -366,6 +368,9 @@ def launch_cli(
         os.close(cli_fd)
         return LaunchResult(False, P.CLI_ARTIFACT_UNSUPPORTED, BEFORE_HANDOFF,
                             SANDBOX_UNAVAILABLE, None, True, why)
+    if artifact_identity is None:
+        from agentic_fx.core.improve_fingerprint import hash_artifact_fd
+        artifact_identity = hash_artifact_fd(cli_fd)
     try:
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     except OSError as e:
@@ -378,6 +383,7 @@ def launch_cli(
         "expected_ppid": os.getpid(), "uid": creds.uid, "gid": creds.gid,
         "groups": list(creds.groups), "backend": backend, "argv": list(argv),
         "artifact_sha256": artifact_sha256,
+        "artifact_identity": artifact_identity.as_dict(), "launch_kind": launch_kind,
     }
     try:
         proc = subprocess.Popen(

@@ -33,7 +33,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal, TypeAlias
 
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.worker_runner import WorkerRunner
@@ -45,6 +45,22 @@ if TYPE_CHECKING:
     from agentic_fx.core.contracts import Clock
 
 _log = logging.getLogger("agentic_fx.loops.verify_backend")
+
+
+WorkerIsolationOptions: TypeAlias = dict[str, object]
+
+
+class _OperatorShellNoIsolation:
+    """運用者 shell の非隔離実行を表す、比較専用の値。"""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "OPERATOR_SHELL_NO_ISOLATION"
+
+
+#: service 外の運用者 shell からの接続性確認だけが明示的に選ぶ、非隔離の runner 引数。
+OPERATOR_SHELL_NO_ISOLATION = _OperatorShellNoIsolation()
 
 
 class VerifyBackendGateError(Exception):
@@ -143,7 +159,8 @@ _FENCE = re.compile(r"\A```(?:json)?[ \t]*\n([^`]*?)\n?```\Z")
 
 
 def _is_echo_text(text: object, nonce: str) -> bool:
-    """文字列の全体が `{"echo": <nonce>}` だけ (完全な 1 つの code fence に収まる形は許す)。
+    """文字列の全体が `{"echo": <nonce>, "count": <整数>}` だけ (`count` は list_staging の
+    結果から数えた値で必須。完全な 1 つの code fence に収まる形は許す)。
     prompt の文章に埋まった nonce や、他のキーを足した JSON は一致と見ない。"""
     if not isinstance(text, str):
         return False
@@ -154,9 +171,14 @@ def _is_echo_text(text: object, nonce: str) -> bool:
     if not body.startswith("{"):
         return False
     try:
-        return json.loads(body) == {"echo": nonce}
+        parsed = json.loads(body)
     except ValueError:
         return False
+    if not isinstance(parsed, dict) or parsed.get("echo") != nonce:
+        return False
+    if set(parsed) != {"echo", "count"}:
+        return False
+    return type(parsed["count"]) is int
 
 
 def _assistant_texts(backend: str, event: dict) -> list[object]:
@@ -190,7 +212,7 @@ def _assistant_texts(backend: str, event: dict) -> list[object]:
 
 class _EchoWatch:
     """子が流す event を見て、(1) assistant の本文が echo と一致した、(2) worker の MCP が
-    `tools/list` に tool を 1 つ以上返した、の両方が揃った時点で `stop` を立てる。
+    `tools/list` に tool を 1 つ以上返し、list_staging を 1 回呼んだ時点で `stop` を立てる。
     どちらかが欠けたまま終わった場合に読めるよう、event 数・step 数・MCP の観測も持つ。"""
 
     def __init__(self, nonce: str, stop: threading.Event, backend: str, *,
@@ -211,11 +233,13 @@ class _EchoWatch:
         self.steps = 0
         self.initialized = False
         self.listed: list[str] | None = None
+        self.calls = 0
 
     # tools/list は server 側の名前 (web_search 等) を返す。`afx_` 付きは CLI 側の呼び名
     @property
     def mcp_ok(self) -> bool:
-        return self.initialized and self.listed is not None and len(self.listed) > 0
+        return (self.initialized and self.listed is not None and len(self.listed) > 0
+                and self.calls >= 1)
 
     @property
     def ok(self) -> bool:
@@ -256,6 +280,9 @@ class _EchoWatch:
                 elif observed.get("kind") == "tools/list" \
                         and isinstance(observed.get("tools"), list):
                     self.listed = [str(n) for n in observed["tools"]]
+                elif observed.get("kind") == "tools/call" \
+                        and "list_staging" in observed.get("tools", []):
+                    self.calls += 1
         if event.get("type") in _STEP_EVENT_TYPES:
             self.steps += 1
         if not self.seen and any(_is_echo_text(t, self._nonce)
@@ -278,13 +305,13 @@ class _EchoWatch:
 
     def _summary_locked(self) -> str:
         if self.listed is not None:
-            suffix = ("" if self.mcp_ok else
-                      " (empty)" if not self.listed else " (uninitialized)")
+            suffix = (" (empty)" if not self.listed else
+                      " (uninitialized)" if not self.initialized else "")
             mcp = f"tools={len(self.listed)}{suffix}"
         else:
             mcp = "init_only" if self.initialized else "none"
         grace = " grace_expired" if self.grace_expired else ""
-        return (f"echo_reached={'yes' if self.seen else 'no'} mcp={mcp} "
+        return (f"echo_reached={'yes' if self.seen else 'no'} mcp={mcp} call={self.calls} "
                 f"steps={self.steps} events={self.events}{grace}")
 
 
@@ -293,11 +320,13 @@ def verify_backend(
     backend: Literal["local", "claude", "codex", "opencode"],
     provider: Literal["chatgpt"] | None,
     clock: "Clock",
-    isolation_options: dict | None = None,
+    isolation_options: WorkerIsolationOptions | _OperatorShellNoIsolation | None = None,
     stop_on_echo: bool = False,
 ) -> VerifyBackendResult:
-    """`isolation_options` は CLI 隔離の WorkerRunner の引数 (隔離の互換性自己試験が渡す)。
-    省略時は改善 mission と同じ判定 (有効化の定数が偽なら隔離なし) に従う。
+    """`isolation_options` は CLI 隔離の WorkerRunner の引数。
+    省略時は改善 mission と同じ admission を通り、通らなければ
+    `sandbox_unavailable` を返す。運用者の CLI は
+    `OPERATOR_SHELL_NO_ISOLATION` で非隔離を明示する。
 
     `stop_on_echo` (隔離の互換性自己試験が立てる): assistant の本文の echo 一致と、MCP の
     `tools/list` が tool を 1 つ以上返した観測の両方が揃った時点を成功とし、mission は通常の停止経路 (stop_event) で終える。その後に CLI が tool を呼び続けても
@@ -397,6 +426,16 @@ def verify_backend(
                     fingerprint=None,
                     detail=f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}")
             isolation_options = choice.worker_options
+        elif isolation_options is OPERATOR_SHELL_NO_ISOLATION:
+            isolation_options = {}
+        elif isinstance(isolation_options, dict):
+            required = {"cleanup_protocol", "isolation"}
+            if not required <= isolation_options.keys():
+                raise ValueError(
+                    "isolation_options must contain cleanup_protocol and isolation")
+        else:
+            raise ValueError("isolation_options must be admission options or "
+                             "OPERATOR_SHELL_NO_ISOLATION")
         rag = Rag(scratch_root / "rag")
         stop = threading.Event()
         watch = _EchoWatch(nonce, stop, backend) if stop_on_echo else None
@@ -411,18 +450,19 @@ def verify_backend(
 
         mission = Mission(
             prompt=(
-                "You are a one-shot backend connectivity probe. Reply "
-                f'with exactly the JSON object {{"echo": "{nonce}"}} and '
-                "nothing else — do not create files, do not call any "
-                "tools."),
-            tools=[],
+                "You are a one-shot backend connectivity probe. Step 1: call the MCP tool "
+                "`list_staging` exactly once and count the entries it returns. Step 2: reply "
+                f'with exactly the JSON object {{"echo": "{nonce}", "count": <that number>}} '
+                "and nothing else. Do not call any other tool."),
+            tools=["list_staging"],
             output_schema={
-                "type": "object", "required": ["echo"],
+                "type": "object", "required": ["echo", "count"],
                 # "type" は必須 — ChatGPT backend は type 無しの property を
                 # 400 (Invalid schema for response_format) で拒否する (実機実測)
-                "properties": {"echo": {"type": "string", "const": nonce}},
+                "properties": {"echo": {"type": "string", "const": nonce},
+                               "count": {"type": "integer"}},
                 "additionalProperties": False},
-            max_turns=1,
+            max_turns=4,
             timeout_sec=scoped_settings.improve.mission_timeout_sec)
 
         grace_done = threading.Event()
@@ -447,7 +487,8 @@ def verify_backend(
         if not ready_frames:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="mission never reached ready (handshake failed)")
+                detail=("mission never reached ready (handshake failed): "
+                        f"status={result.status} reason={result.reason}"))
         progress = f" [{watch.summary()}]" if watch is not None else ""
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:

@@ -5,6 +5,7 @@ import dataclasses
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -48,10 +49,17 @@ def _admission(canary=None, selftest=None, kernel=KERNEL, **kw) -> IA.ImproveAdm
 
 
 def _elf(tmp_path: Path, name: str = "cli", extra: bytes = b"") -> Path:
-    p = tmp_path / name
+    package = tmp_path / "package"
+    bindir = package / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    p = bindir / name
     data = Path(PY).read_bytes()
     p.write_bytes(data + extra)
     p.chmod(0o755)
+    host = bindir / "codex-code-mode-host"
+    host.write_bytes(Path(PY).read_bytes())
+    host.chmod(0o755)
+    (package / "codex-package.json").write_text('{"layoutVersion":1}')
     return p
 
 
@@ -104,6 +112,60 @@ def test_wrapper_artifact_is_refused_at_admission(tmp_path):
     missing = _admission().admit(backend="codex", artifact_path=str(tmp_path / "nope"),
                                  host=Host())
     assert missing.reason == "cli_artifact_unsupported"
+
+
+def test_codex_package_host_is_required_at_admission(tmp_path):
+    path = _elf(tmp_path)
+    (path.parent / "codex-code-mode-host").unlink()
+    d = _admission().admit(backend="codex", artifact_path=str(path), host=Host())
+    assert (d.admitted, d.reason) == (False, "cli_artifact_unsupported")
+    assert "host open" in d.detail
+
+
+def test_codex_package_manifest_is_required_at_admission(tmp_path):
+    path = _elf(tmp_path)
+    (path.parent.parent / "codex-package.json").unlink()
+    canary, selftest = Probe(OK), Probe(OK)
+    d = _admission(canary, selftest).admit(backend="codex", artifact_path=str(path), host=Host())
+    assert (d.admitted, d.reason) == (False, "cli_artifact_unsupported")
+    assert "package manifest missing" in d.detail
+    assert canary.calls == 0 and selftest.calls == 0
+
+
+def test_codex_package_host_must_be_an_elf(tmp_path):
+    path = _elf(tmp_path)
+    host = path.parent / "codex-code-mode-host"
+    host.unlink()
+    host.write_text("#!/bin/sh\nexit 0\n")
+    host.chmod(0o755)
+    canary, selftest = Probe(OK), Probe(OK)
+    d = _admission(canary, selftest).admit(backend="codex", artifact_path=str(path), host=Host())
+    assert (d.admitted, d.reason) == (False, "cli_artifact_unsupported")
+    assert "host" in d.detail and "ELF" in d.detail
+    assert canary.calls == 0 and selftest.calls == 0
+
+
+def test_codex_package_identity_is_taken_from_the_inspected_host(tmp_path, monkeypatch):
+    """検査した後に host が別 inode に差し替わっても、aggregate は検査した host の値のまま。"""
+    path = _elf(tmp_path)
+    host = path.parent / "codex-code-mode-host"
+    artifact = IA.inspect_artifact(str(path))
+    before = F.compute_fingerprint("codex", artifact, KERNEL, artifact_path=str(path)).aggregate
+    real = IA.inspect_codex_package
+
+    def inspect_then_swap(p):
+        got = real(p)
+        replacement = host.with_name("replacement")
+        replacement.write_bytes(Path(PY).read_bytes() + b"\0swapped")
+        replacement.chmod(0o755)
+        os.rename(replacement, host)
+        return got
+
+    monkeypatch.setattr(IA, "inspect_codex_package", inspect_then_swap)
+    d = _admission().admit(backend="codex", artifact_path=str(path), host=Host())
+    after = F.compute_fingerprint("codex", artifact, KERNEL, artifact_path=str(path)).aggregate
+    assert after != before
+    assert d.admitted and d.fingerprint.aggregate == before
 
 
 def test_out_of_set_runs_canary_then_selftest_and_admits(tmp_path):
@@ -198,7 +260,7 @@ def test_failed_fingerprint_is_not_registered(tmp_path):
         d = adm.admit(backend="codex", artifact_path=path, host=Host())
         assert not d.admitted
         assert not adm.admit(backend="codex", artifact_path=path, host=Host()).admitted
-        assert F.SUPPORTED_FINGERPRINTS == frozenset()
+        assert d.fingerprint.aggregate not in F.SUPPORTED_FINGERPRINTS
         assert not F.is_supported(d.fingerprint)
 
 
@@ -239,7 +301,6 @@ def _settings(backend: str, artifact: Path):
 def test_choose_disabled_or_local_is_the_current_path(tmp_path):
     s = _settings("codex", _elf(tmp_path))
     boom = Probe()
-    assert IA.choose_for_mission(s, tmp_path) == IA.MissionChoice()
     assert IA.choose_for_mission(s, tmp_path, enabled=False, host=Host(),
                                  admission=_admission(boom)) == IA.MissionChoice()
     local = s.model_copy(update={"runner": s.runner.model_copy(update={
@@ -281,7 +342,7 @@ def test_cleanup_hook_rmdirs_or_closes_gate():
 
 
 def test_disabled_startup_reads_only(tmp_path):
-    """定数が偽の起動時は host を起こさず (afx の cgroup を動かさず)、読むだけの診断を返す。"""
+    """明示的に無効化した起動時は host を起こさず、読むだけの診断を返す。"""
     from agentic_fx.core import unit_admission as ua
 
     before = Path("/proc/self/cgroup").read_text()
@@ -293,15 +354,43 @@ def test_disabled_startup_reads_only(tmp_path):
         raise ua.AdmissionError("cgroup_delegation_missing", "screen wrapper")
 
     line = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
-                      host_factory=no_host, admit_unit=deny, kernel_probe=lambda: KERNEL)
+                      enabled=False, host_factory=no_host, admit_unit=deny,
+                      kernel_probe=lambda: KERNEL)
     assert line.startswith("improve isolation: disabled")
     assert "unit_admission=cgroup_delegation_missing" in line and "kernel=ok" in line
     assert Path("/proc/self/cgroup").read_text() == before
     assert IA.current_host() is None
     bad = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
-                     host_factory=no_host, admit_unit=lambda: None,
+                     enabled=False, host_factory=no_host, admit_unit=lambda: None,
                      kernel_probe=lambda: dataclasses.replace(KERNEL, landlock_abi=6))
     assert "unit_admission=ok" in bad and "kernel=landlock_abi_too_old" in bad
+
+
+@pytest.mark.parametrize(("choice", "expected"), [
+    (IA.MissionChoice(decision=IA.AdmissionDecision(
+        True, None, "codex", fingerprint=SimpleNamespace(aggregate="admitted-fingerprint"))),
+     "improve isolation: enabled; backend=codex admitted=yes fingerprint=admitted-fingerprint"),
+    (IA.MissionChoice(refusal="safety_canary_failed", decision=IA.AdmissionDecision(
+        False, "safety_canary_failed", "codex",
+        fingerprint=SimpleNamespace(aggregate="refused-fingerprint"))),
+     "improve isolation: enabled; backend=codex admitted=no reason=safety_canary_failed "
+     "fingerprint=refused-fingerprint"),
+    (IA.MissionChoice(refusal="cgroup_delegation_missing"),
+     "improve isolation: enabled; backend=codex admitted=no reason=cgroup_delegation_missing "
+     "fingerprint=none"),
+])
+def test_enabled_startup_reports_the_decision_fingerprint(tmp_path, monkeypatch, choice, expected):
+    """起動時の admission 行は判定済み aggregate、未作成なら none を末尾に出す。"""
+    class StartupHost(Host):
+        def start(self, *, deadline):
+            assert deadline == 0.0
+
+    monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(IA, "choose_for_mission", lambda *_args, **_kwargs: choice)
+    monkeypatch.setattr(IA, "_HOST", None)
+
+    assert IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
+                      enabled=True, host_factory=StartupHost) == expected
 
 
 def test_selftest_exception_is_a_failure(tmp_path):
@@ -319,7 +408,7 @@ def test_cache_key_separates_backends(tmp_path, monkeypatch):
     """aggregate が同じでも backend が違えば cache を共有せず、backend ごとに判定し直す。"""
     real = F.compute_fingerprint
     monkeypatch.setattr(F, "compute_fingerprint",
-                        lambda backend, artifact, kernel: real("codex", artifact, kernel))
+                        lambda backend, artifact, kernel, **kw: real("codex", artifact, kernel))
     selftest = Probe(IA.ProbeOutcome(False, detail="schema"), OK)
     adm = _admission(selftest=selftest)
     path = str(_elf(tmp_path))

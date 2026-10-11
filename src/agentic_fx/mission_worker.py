@@ -176,9 +176,12 @@ def _set_resource_limits(*, as_mb: int, nofile: int, fsize_mb: int,
 def _bootstrap_improve_profile(
     *, backend: str, mission_id: str, staging_dir: str,
     source_snapshot_dir: str, claude_bin: str | None, codex_bin: str | None,
-    opencode_bin: str | None = None,
+    opencode_bin: str | None = None, codex_host_required: bool = True,
 ) -> None:
     """improve worker profile の bootstrap (プラン8, 設計書 §4.6)。
+
+    `codex_host_required` が偽なのは canary (CLI 役が Python の ELF で、隣に
+    code-mode host を持たない) だけ。実 mission では host を exec 閉包に入れる。
 
     **⚠ CRITICAL: Landlock は不可逆。この関数を呼ぶプロセスの生涯全体が
     制限される。テストから呼ぶ場合は必ず `subprocess` を経由し、
@@ -266,7 +269,8 @@ def _bootstrap_improve_profile(
         # expanduser しないと後段の .resolve() が workdir 相対に化ける
         # (検収実測 2026-08-30: /tmp/afx-mission-*/~/.opencode/... で ENOENT)
         opencode_bin=(Path(opencode_bin).expanduser()
-                      if opencode_bin else None), venv_root=venv_root)
+                      if opencode_bin else None), venv_root=venv_root,
+        codex_host_required=codex_host_required)
     execute_dirs = list(closure.dirs)
     # `_exec_closure_for` の docstring どおり base_prefix は呼び出し側
     # (このモジュール) が合成する — venv の `sys.executable` が指す実体
@@ -281,6 +285,7 @@ def _bootstrap_improve_profile(
     # ラッパ等) は RuntimeError で fail closed — staging の uid/mode
     # 検証と同じ扱い。
     execute_files = landlock.interpreter_files_for(closure.targets)
+    execute_files += [f for f in closure.files if f not in execute_files]
 
     # 段A 是正 (2026-08-30): `CliRunner._save_transcript` の既定保存先
     # (`<repo>/logs/mission-transcripts/`) を rw allowlist に加え、improve
@@ -384,11 +389,14 @@ class ExecClosure(NamedTuple):
     側で行う (`_exec_closure_for` 自身は I/O をしない純関数のまま)。"""
     dirs: list[Path]
     targets: list[Path]
+    #: ディレクトリを介さずファイル単位で EXECUTE を与える実ファイル (`targets` の部分集合)
+    files: tuple[Path, ...] = ()
 
 
 def _exec_closure_for(backend: str, *, claude_bin: Path | None,
                       codex_bin: Path | None, venv_root: Path,
-                      opencode_bin: Path | None = None) -> ExecClosure:
+                      opencode_bin: Path | None = None,
+                      codex_host_required: bool = True) -> ExecClosure:
     """§2.2 の表。**local backend には EXECUTE をディレクトリ単位で `/usr/lib`
     に与えない** — 与えると `/usr/lib` 配下に実体を持つ実行ファイル
     (uutils coreutils 等) がすべて exec 可能になり、shell 遮断が無効化される
@@ -407,6 +415,7 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
     """
     dirs: list[Path] = [venv_root]                     # base_prefix は呼び出し側で合成
     targets: list[Path] = [Path(sys.executable).resolve()]
+    files: list[Path] = []
     if backend in ("claude", "codex", "opencode"):
         dirs.append(Path("/usr/bin"))
         if Path("/bin").is_dir() and not Path("/bin").is_symlink():
@@ -420,13 +429,21 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
         targets.append(real)
     if backend == "codex" and codex_bin is not None:
         real = codex_bin.resolve()
-        dirs.append(real.parent)
         targets.append(real)
+        if not codex_host_required:
+            dirs.append(real.parent)
+        else:
+            files.append(real)
+            host = real.parent / "codex-code-mode-host"
+            if not host.is_file():
+                raise RuntimeError("codex code-mode host is missing")
+            targets.append(host)
+            files.append(host.resolve())
     if backend == "opencode" and opencode_bin is not None:
         real = opencode_bin.resolve()
         dirs.append(real.parent)
         targets.append(real)
-    return ExecClosure(dirs=dirs, targets=targets)
+    return ExecClosure(dirs=dirs, targets=targets, files=tuple(files))
 
 
 class _RagRpcProxy:
@@ -679,7 +696,7 @@ def _start_mcp_dispatcher(
 
 def _mcp_observation_sender(protocol_out: Any, out_seq: SeqTracker | None,
                             ) -> Callable[[str, list[str]], None] | None:
-    """成功した MCP の initialize / tools/list を、worker 自身の event として親へ送る。
+    """成功した MCP 応答を、worker 自身の event として親へ送る。
 
     CLI の stdout の event は worker がもう一度包んで送るので、ここで送る 1 重の包みの event
     とは親で区別できる (CLI が同じ文字列を出しても観測にならない)。"""
@@ -887,6 +904,7 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
         worker_profile = handshake["worker_profile"]
         if worker_profile == "improve":
             improve_backend = settings_dict["runner"]["improve"]["backend"]
+            codex_host_required = True
             if improve_backend == "claude":
                 claude_bin = settings_dict["runner"]["claude"]["bin"]
                 codex_bin = None
@@ -916,7 +934,9 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                 if HANDSHAKE_NONCE_FIELD not in handshake:
                     raise ProtocolError(f"isolation requires {HANDSHAKE_NONCE_FIELD}")
                 if isolation_spec.kind == improve_isolation.KIND_CANARY:
-                    # canary の CLI 役は Python の ELF (試験 script を -c で渡す)
+                    # canary の CLI 役は Python の ELF (試験 script を -c で渡す)。
+                    # 隣に code-mode host は無いので、codex でも host を要求しない
+                    codex_host_required = False
                     canary_bin = os.path.realpath(sys.executable)
                     claude_bin = canary_bin if improve_backend == "claude" else None
                     codex_bin = canary_bin if improve_backend == "codex" else None
@@ -936,7 +956,7 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                 staging_dir=handshake["staging_dir"],
                 source_snapshot_dir=handshake["source_snapshot_dir"],
                 claude_bin=claude_bin, codex_bin=codex_bin,
-                opencode_bin=opencode_bin)
+                opencode_bin=opencode_bin, codex_host_required=codex_host_required)
             # 検収実測 (2026-08-30): opencode (bun/JSC) は `run` 時に巨大な
             # 仮想アドレス予約を行う (strace 実測: 8GB 一括 (gigacage)、
             # 16GB 制限下では 128GB 一括の arena 予約が ENOMEM → SIGABRT)。

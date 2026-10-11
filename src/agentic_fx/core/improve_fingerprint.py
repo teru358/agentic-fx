@@ -11,11 +11,13 @@
 | nested_landlock | nested ruleset の正規形の digest |
 | outer_landlock | outer 規則を組み立てる code (bootstrap から参照を辿った関数・定数と `landlock.py`) と役割の表 |
 | egress | egress 定数の digest |
-| source_* | launcher (artifact の copy を含む)・protocol・supervisor・proxy・spool・cgroup・canary・isolation の source file の bytes |
+| source_* | launcher (artifact の copy を含む)・protocol・supervisor・proxy・spool・cgroup・canary (自己試験の verify backend を含む)・isolation の source file の bytes |
 | kernel | Landlock ABI、seccomp の flag 可否、PIDFD_THREAD、Yama、INET_DIAG |
 | userspace | kernel release、machine、Python 実行系、libc |
-| artifact | 内容の SHA-256 と (dev, ino, size, mtime)。worker は `O_RDONLY|O_CLOEXEC` で開いた fd の (dev, ino, size, mtime) を照合し、launcher が mission cgroup の中でその bytes を封印した memfd に写して SHA-256 を照合し、memfd を exec する |
-| launch_kind | `native_elf` (3 backend とも ELF の fd を `execveat` する) |
+| artifact | 内容の SHA-256 と (dev, ino, size, mtime) |
+| host_artifact | codex の隣の code-mode host の artifact、他 backend は `none` |
+| package_manifest | codex package manifest の bytes hash、他 backend は `none` |
+| launch_kind | codex は `path_fd`、他 backend は `native_elf` |
 | argv_env_policy | CLI の argv / env を組む code と、隔離時に足す・除く env の方針 (値は入れない) |
 
 isolation の群は worker 側で隔離を組み立てる code (起動順・stdin の読み手・cleanup の
@@ -43,13 +45,26 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-#: 対応済み fingerprint (aggregate) の集合。空のまま置き、実行時に足す経路は作らない
-SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset()
+#: 対応済み fingerprint (aggregate) の集合。実行時に足す経路は作らない。登録値は afx 起動時の
+#: 技術ログ 1 行 (`improve isolation: enabled; backend=… admitted=yes fingerprint=…`) を写す。
+#: この module 自体は source hash の対象外なので、ここを足しても aggregate は変わらない。
+#: hash 対象 (source / artifact / userspace / kernel) のどれかが変わると集合外になり、admission は
+#: canary と自己試験をやり直す (登録は次の集合外 → 合格の後に更新する)。
+#: 2026-10-11 登録 (最終 E2E: 3 backend の実 improve mission が隔離下で完走):
+SUPPORTED_FINGERPRINTS: frozenset[str] = frozenset({
+    # codex (vendor native ELF 0.162.1、path_fd)
+    "0fe3a9f1a5dd0fc9f0c4bf27e45140d854b4d9e9235bd753f8e2bae24531626c",
+    # claude (2.1.296、native_elf)
+    "28fb9fa7d8626fd012374cb8920d7dd120cc774ce6ccca4d25d7ade61ceec23a",
+    # opencode (native_elf)
+    "ab20d92fbb2a18a66b772199283faa7652507a79bde78cf3519fdaf173971ab2",
+})
 
 #: `src/agentic_fx` (source hash の基準)
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
 LAUNCH_KIND_NATIVE_ELF = "native_elf"
+LAUNCH_KIND_PATH_FD = "path_fd"
 
 BACKENDS = ("claude", "codex", "opencode")
 
@@ -61,7 +76,7 @@ SOURCE_GROUPS: Mapping[str, tuple[str, ...]] = {
     "proxy": ("egress/*.py",),
     "spool": ("tools/mcp_spool.py", "tools/mcp_spool_client.py", "tools/mcp_shim.py"),
     "cgroup": ("core/mission_cgroup.py", "core/mission_cleanup.py", "core/cgroup_host.py"),
-    "canary": ("core/improve_canary.py",),
+    "canary": ("core/improve_canary.py", "loops/verify_backend.py"),
     "isolation": ("core/improve_isolation.py", "core/improve_admission.py", "mission_worker.py"),
 }
 
@@ -424,12 +439,33 @@ class ImproveFingerprint:
 
 COMPONENTS = ("profile", "seccomp_policy", "bpf", "nested_landlock", "outer_landlock", "egress",
               *(f"source_{g}" for g in SOURCE_GROUPS), "kernel", "userspace", "artifact",
-              "launch_kind", "argv_env_policy")
+              "host_artifact", "package_manifest", "launch_kind", "argv_env_policy")
+
+
+@dataclass(frozen=True)
+class CodexPackage:
+    """codex の host (検査した fd の identity) と package manifest の bytes hash。"""
+    host: ArtifactIdentity
+    manifest_sha: str
+
+
+def read_codex_package(artifact_path: str) -> CodexPackage:
+    """path から host と manifest を読む (検査済みの値を持たない側が自分で計算するときだけ使う)。"""
+    binary = Path(artifact_path)
+    host = binary.parent / "codex-code-mode-host"
+    manifest = binary.parent.parent / "codex-package.json"
+    fd = os.open(host, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        ident = hash_artifact_fd(fd)
+    finally:
+        os.close(fd)
+    return CodexPackage(ident, _sha(manifest.read_bytes()))
 
 
 def component_values(backend: str, artifact: ArtifactIdentity, kernel: KernelCapabilities,
                      *, root: Path | None = None,
-                     userspace: Mapping | None = None) -> dict[str, object]:
+                     userspace: Mapping | None = None, artifact_path: str | None = None,
+                     codex_package: CodexPackage | None = None) -> dict[str, object]:
     """各要素の正規形 (hash する前の値)。"""
     from agentic_fx.core import landlock_nested, seccomp_cli_bpf, seccomp_cli_policy
     from agentic_fx.egress import policy as egress_policy
@@ -448,7 +484,15 @@ def component_values(backend: str, artifact: ArtifactIdentity, kernel: KernelCap
     values["kernel"] = kernel.as_dict()
     values["userspace"] = dict(userspace) if userspace is not None else userspace_identity()
     values["artifact"] = artifact.as_dict()
-    values["launch_kind"] = LAUNCH_KIND_NATIVE_ELF
+    values["host_artifact"] = "none"
+    values["package_manifest"] = "none"
+    if backend == "codex":
+        if codex_package is None and artifact_path is not None:
+            codex_package = read_codex_package(artifact_path)
+        if codex_package is not None:
+            values["host_artifact"] = codex_package.host.as_dict()
+            values["package_manifest"] = codex_package.manifest_sha
+    values["launch_kind"] = LAUNCH_KIND_PATH_FD if backend == "codex" else LAUNCH_KIND_NATIVE_ELF
     values["argv_env_policy"] = argv_env_policy_form(backend, root)
     return values
 
@@ -463,20 +507,28 @@ def fingerprint_from_values(values: Mapping[str, object]) -> ImproveFingerprint:
     return _aggregate(tuple((name, _sha(_canon(values[name]))) for name in COMPONENTS))
 
 
-def with_artifact(fp: ImproveFingerprint, artifact: ArtifactIdentity) -> ImproveFingerprint:
+def with_artifact(fp: ImproveFingerprint, artifact: ArtifactIdentity, *,
+                  clear_codex_package: bool = False) -> ImproveFingerprint:
     """`fp` の artifact の要素だけを `artifact` に替えた fingerprint (他の要素は同じ値のまま)。
 
     canary は CLI 役に Python の ELF を使うので、worker に渡す fingerprint はこれで組む
     (worker は handshake の artifact で fingerprint を計算し直して照合する)。"""
     art = _sha(_canon(artifact.as_dict()))
-    return _aggregate(tuple((n, art if n == "artifact" else h) for n, h in fp.components))
+    none = _sha(_canon("none"))
+    return _aggregate(tuple((n, art if n == "artifact" else
+                             none if clear_codex_package and n in
+                             ("host_artifact", "package_manifest") else h)
+                            for n, h in fp.components))
 
 
 def compute_fingerprint(backend: str, artifact: ArtifactIdentity, kernel: KernelCapabilities,
                         *, root: Path | None = None,
-                        userspace: Mapping | None = None) -> ImproveFingerprint:
+                        userspace: Mapping | None = None,
+                        artifact_path: str | None = None,
+                        codex_package: CodexPackage | None = None) -> ImproveFingerprint:
     return fingerprint_from_values(
-        component_values(backend, artifact, kernel, root=root, userspace=userspace))
+        component_values(backend, artifact, kernel, root=root, userspace=userspace,
+                         artifact_path=artifact_path, codex_package=codex_package))
 
 
 def is_supported(fp: ImproveFingerprint,
@@ -485,7 +537,7 @@ def is_supported(fp: ImproveFingerprint,
 
 
 __all__ = [
-    "BACKENDS", "COMPONENTS", "EXCLUDED_ENV_PREFIXES", "LAUNCH_KIND_NATIVE_ELF",
+    "BACKENDS", "COMPONENTS", "EXCLUDED_ENV_PREFIXES", "LAUNCH_KIND_NATIVE_ELF", "LAUNCH_KIND_PATH_FD",
     "NO_PROXY_ENV_KEYS", "NO_PROXY_VALUE", "PROXY_ENV_KEYS", "SOURCE_GROUPS", "SOURCE_ROOT",
     "SUPPORTED_FINGERPRINTS", "ArtifactChanged", "ArtifactIdentity", "ImproveFingerprint",
     "KernelCapabilities", "argv_env_policy_form", "component_values", "compute_fingerprint",

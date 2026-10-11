@@ -77,6 +77,7 @@ SETUP_REASONS = {
     13: "artifact_digest_mismatch",
     # 写した bytes が x86_64 の 64 bit ELF (EXEC / DYN) でない
     14: "artifact_copy_unsupported",
+    15: "artifact_changed",
 }
 SETUP_REASON_CODES = {v: k for k, v in SETUP_REASONS.items()}
 

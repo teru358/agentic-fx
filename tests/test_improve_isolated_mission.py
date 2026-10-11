@@ -1,8 +1,4 @@
-"""改善 mission の CLI 隔離の配線 (admission → WorkerRunner → mission worker → launcher)。
-
-有効化の定数が偽の間 (既定) は、afx の改善 mission と trade mission は今までどおり隔離なしの
-経路で走る。隔離の経路は、この file の試験が関数引数・constructor 引数で有効にしたときだけ通る。
-"""
+"""改善 mission の CLI 隔離の配線 (admission → WorkerRunner → mission worker → launcher)。"""
 from __future__ import annotations
 
 import ast
@@ -52,50 +48,98 @@ def _run_context(tmp_path: Path):
         rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
 
 
-# --- 既定 (有効化の定数が偽) では現行の経路のまま ------------------------------------
+# --- 既定では隔離付き runner を組む --------------------------------------------------
 
-def test_isolation_disabled_keeps_current_paths(tmp_path, monkeypatch):
+def test_isolation_enabled_builds_isolated_runner(tmp_path, monkeypatch):
     from agentic_fx.core import improve_admission as IA
+    from agentic_fx.core import improve_fingerprint as F
+    from agentic_fx.core import improve_isolation as I
+    from agentic_fx.core import mission_cleanup as MC
+    from agentic_fx.runners.worker_runner import WorkerRunner
 
     # 有効化は code の定数で、settings の key ではない (隔離を緩める key を作らない)
-    assert IA.ISOLATION_ENABLED is False
+    assert IA.ISOLATION_ENABLED is True
     tree = ast.parse((SRC / "core" / "improve_admission.py").read_text())
     assigned = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
                 and any(getattr(t, "id", None) == "ISOLATION_ENABLED" for t in n.targets)]
     assert len(assigned) == 1 and isinstance(assigned[0].value, ast.Constant)
-    assert assigned[0].value.value is False
+    assert assigned[0].value.value is True
     example = EXAMPLE.read_text()
     assert re.search(r"isolat", example, re.IGNORECASE) is None
     config_src = (SRC / "config.py").read_text()
     assert "ISOLATION_ENABLED" not in config_src and "improve_admission" not in config_src
 
-    # improve loop の WorkerRunner は cleanup protocol も隔離 field も持たない
+    # admission はここでは走らせず、admitted choice を注入して runner の配線だけを見る。
+    artifact = F.ArtifactIdentity("a" * 64, 1, 2, 3, 4)
+    decision = IA.AdmissionDecision(True, None, "codex", fingerprint=SimpleNamespace(
+        aggregate="b" * 64), artifact=artifact)
+    options = IA.worker_runner_options(decision, SimpleNamespace(
+        cleanup_mission=lambda *_: None, report_worker_not_reaped=lambda: None))
+    monkeypatch.setattr(IA, "choose_for_mission",
+                        lambda *_args, **_kwargs: IA.MissionChoice(worker_options=options,
+                                                                     decision=decision))
+
     loop = _improve_loop(tmp_path)
     runner = loop._build_worker_runner(_run_context(tmp_path))
-    assert type(runner).__name__ == "WorkerRunner"
-    assert runner._cleanup is None
-    assert getattr(runner, "_isolation", None) is None
+    assert isinstance(runner, WorkerRunner)
+    assert isinstance(runner._cleanup, MC.CleanupProtocol)
+    assert isinstance(runner._isolation, dict)
+    assert I.parse_isolation_field(runner._isolation) == I.IsolationSpec(
+        "mission", "codex", artifact, "b" * 64)
 
-    # verify-backend の WorkerRunner も同じ
+
+def test_operator_shell_verify_runner_has_no_isolation_fields(tmp_path, monkeypatch):
     from agentic_fx.core.contracts import FixedClock
     from agentic_fx.loops import verify_backend as VB
     from agentic_fx.runners.base import MissionResult
 
-    seen: list[dict] = []
+    captured: dict = {}
 
-    class _Capture:
-        def __init__(self, **kwargs) -> None:
-            seen.append(kwargs)
+    class Runner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self._ready = kwargs["on_ready"]
+            self._context = kwargs["run_context"]
 
         def run(self, mission):
-            return MissionResult("failed", None, [], reason="captured")
+            self._ready({"run_context": {
+                "mission_id": str(self._context.mission_id),
+                "staging_dir": str(self._context.staging_dir),
+                "source_snapshot_dir": "/worker/source"}})
+            nonce = mission.output_schema["properties"]["echo"]["const"]
+            return MissionResult("completed", {"echo": nonce}, [])
 
-    monkeypatch.setattr(VB, "WorkerRunner", _Capture)
-    res = VB.verify_backend(tmp_path, _settings(), backend="codex", provider=None,
-                            clock=FixedClock(datetime(2026, 10, 11, tzinfo=timezone.utc)))
-    assert res.ok is False
-    assert len(seen) == 1
-    assert "cleanup_protocol" not in seen[0] and "isolation" not in seen[0]
+    monkeypatch.setattr(VB, "WorkerRunner", Runner)
+    result = VB.verify_backend(
+        tmp_path, _settings(), backend="local", provider=None,
+        clock=FixedClock(datetime(2026, 10, 11, tzinfo=timezone.utc)),
+        isolation_options=VB.OPERATOR_SHELL_NO_ISOLATION)
+
+    assert result.ok is True
+    assert "cleanup_protocol" not in captured
+    assert "isolation" not in captured
+
+
+def test_operator_shell_verify_cli_passes_no_isolation_constant(
+        tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from agentic_fx.backtest import cli
+    from agentic_fx.loops import verify_backend as VB
+
+    captured: dict = {}
+
+    def fake_verify(*_args, **kwargs):
+        captured.update(kwargs)
+        return VB.VerifyBackendResult(True, "local", None, "a" * 64, "ok")
+
+    monkeypatch.setattr(VB, "verify_backend", fake_verify)
+    rc = cli._improve_verify_backend(
+        None, _settings(), SimpleNamespace(backend="local", provider=None), tmp_path)
+
+    assert rc == 0
+    assert captured["isolation_options"] is VB.OPERATOR_SHELL_NO_ISOLATION
+    assert "隔離適合の合格ではない" in capsys.readouterr().out
 
 
 # --- disposable service の中の結合 (afx 役 → WorkerRunner → mission worker → launcher → probe) ---
@@ -189,9 +233,9 @@ def test_isolated_improve_mission_end_to_end(isolation_units):
 
 
 def test_hashed_fd_is_the_executed_fd(isolation_units):
-    """worker が開いた fd の bytes を launcher が封印した memfd に写して exec する。admission の後に
-    path を差し替えても、exec されるのは開いた inode の内容を写した memfd で、fingerprint は
-    差し替え前のまま。"""
+    """worker が開いた fd を launcher が検査して、その fd を exec する。admission の後に path を
+    別 file へ差し替えても、exec されるのは検査した (admission が見た) inode で、差し替えた
+    file ではない。fingerprint は差し替え前のまま。"""
     res = run_service(isolation_units, "renamed", "renamed")
     m = res["mission"]
     assert m["result"]["status"] == "completed", m
@@ -199,15 +243,15 @@ def test_hashed_fd_is_the_executed_fd(isolation_units):
     assert res["swapped_ino"] == res["other_ino"] != res["original_ino"]
     exe = m["report"]["exec_artifact"]
     assert probe["exe"] == [exe["dev"], exe["ino"]], (probe, exe)
-    assert exe["ino"] not in (res["original_ino"], res["other_ino"])
+    assert exe["ino"] == res["original_ino"] != res["other_ino"]
     assert m["report"]["artifact"] == res["admitted_artifact"]
     assert res["admitted_artifact"]["ino"] == res["original_ino"]
     _assert_clean_mission(m)
 
 
 def test_in_place_overwrite_after_hash_is_not_executed(isolation_units):
-    """admission の後に artifact を同じ inode のまま書き換えると、launcher が mission cgroup の
-    中で写した bytes の SHA-256 が admission の digest と合わず、CLI を exec しない。"""
+    """admission の後に artifact を同じ inode のまま書き換えると、launcher が exec 直前に行う
+    (dev, ino, size, mtime) の再検査が admission の値と合わず、CLI を exec しない。"""
     res = run_service(isolation_units, "in_place", "in_place")
     m = res["mission"]
     # 同じ inode の内容が変わった
@@ -215,9 +259,9 @@ def test_in_place_overwrite_after_hash_is_not_executed(isolation_units):
     assert res["after_sha256"] != res["admitted_artifact"]["sha256"]
     assert m["result"]["status"] == "failed", m
     assert m["result"]["reason"].startswith(
-        "sandbox_unavailable: artifact_digest_mismatch"), m["result"]
+        "sandbox_unavailable: artifact_changed"), m["result"]
     rep = m["report"]
-    assert rep["launched"] is True and rep["launch_reason"] == "artifact_digest_mismatch", rep
+    assert rep["launched"] is True and rep["launch_reason"] == "artifact_changed", rep
     assert rep["cli_pid"] is None and rep["exec_artifact"] is None, rep
     assert rep["cleanup"]["series"] == "before_handoff", rep
     assert m["report"]["artifact"] == res["admitted_artifact"]
@@ -226,8 +270,9 @@ def test_in_place_overwrite_after_hash_is_not_executed(isolation_units):
 
 def test_artifact_copy_is_charged_to_the_mission_cgroup(isolation_units):
     """launcher は mission cgroup に入った後で artifact を memfd に写すので、memfd の page
-    (shmem) は mission cgroup に課金され memory.max の内側に入る (artifact は 150 MiB 超)。"""
-    res = run_service(isolation_units, "memory", "memory")
+    (shmem) は mission cgroup に課金され memory.max の内側に入る (artifact は 150 MiB 超)。
+    memfd に写すのは単体の ELF を exec する backend (claude) で、codex は path_fd で写さない。"""
+    res = run_service(isolation_units, "memory", "memory_memfd:")
     m = res["mission"]
     assert m["result"]["status"] == "completed", m["result"]
     size = res["artifact_size"]
@@ -279,7 +324,7 @@ def test_artifact_larger_than_memory_max_is_refused_before_the_launcher(isolatio
     _assert_clean_mission(m)
 
 
-def test_memory_max_check_runs_before_any_resource(monkeypatch):
+def test_memory_max_check_runs_before_any_resource(monkeypatch, codex_cli_path):
     """memory.max の見積りは mission cgroup を作る前に行う (作った資源を片付ける経路を持たない)。
     収まる大きさなら次の段 (cgroup の作成) へ進む。"""
     from agentic_fx.core import cli_launcher
@@ -302,27 +347,40 @@ def test_memory_max_check_runs_before_any_resource(monkeypatch):
         # fingerprint は worker が計算し直す値と一致させる (照合の次の段を見る)
         artifact = dataclasses.replace(spec.artifact, size=size)
         return I.IsolationSpec(spec.kind, spec.backend, artifact, _admitted_fingerprint(
-            spec.backend, artifact))
+            spec.backend, artifact, codex_cli_path))
 
     with pytest.raises(I.IsolationSetupError) as ei:
-        I.WorkerIsolation.prepare(with_size(limit + 1), nonce, "/nonexistent")
+        I.WorkerIsolation.prepare(with_size(limit + 1), nonce, codex_cli_path)
     assert ei.value.reason == "artifact_exceeds_memory_max" and created == []
     with pytest.raises(I.IsolationSetupError) as ei:
-        I.WorkerIsolation.prepare(with_size(limit), nonce, "/nonexistent")
+        I.WorkerIsolation.prepare(with_size(limit), nonce, codex_cli_path)
     assert ei.value.reason == "cgroup_create_failed" and created == ["ab" * 16]
 
 
-def _admitted_fingerprint(backend: str, artifact) -> str:
+@pytest.fixture
+def codex_cli_path():
+    """codex の package 配置 (host と manifest つき) の `bin/codex`。"""
+    import shutil
+
+    from tests.core._codex_package import make_codex_package
+
+    cli = make_codex_package()
+    yield str(cli)
+    shutil.rmtree(cli.parent.parent, ignore_errors=True)
+
+
+def _admitted_fingerprint(backend: str, artifact, artifact_path: str | None = None) -> str:
     from agentic_fx.core import improve_fingerprint as F
 
-    return F.compute_fingerprint(backend, artifact, F.probe_kernel()).aggregate
+    return F.compute_fingerprint(backend, artifact, F.probe_kernel(),
+                                 artifact_path=artifact_path).aggregate
 
 
 def _flip(hex64: str) -> str:
     return ("0" if hex64[0] != "0" else "1") + hex64[1:]
 
 
-def test_worker_recomputes_the_fingerprint_before_any_resource(monkeypatch):
+def test_worker_recomputes_the_fingerprint_before_any_resource(monkeypatch, codex_cli_path):
     """worker は自分の source で fingerprint を計算し直し、handshake の値 (admission の aggregate)
     と 1 文字でも違えば `fingerprint_mismatch` で止める。capability・cgroup・launcher には進まない。
     一致すれば次の段 (capability の整理と cgroup の作成) へ進む。"""
@@ -345,18 +403,18 @@ def test_worker_recomputes_the_fingerprint_before_any_resource(monkeypatch):
     monkeypatch.setattr(MCG.MissionCgroup, "create", classmethod(create))
     monkeypatch.setattr(subprocess, "Popen", no_popen)
     spec = I.parse_isolation_field(_spec_field())
-    good = dataclasses.replace(spec, fingerprint=_admitted_fingerprint(spec.backend,
-                                                                       spec.artifact))
+    good = dataclasses.replace(spec, fingerprint=_admitted_fingerprint(
+        spec.backend, spec.artifact, codex_cli_path))
     bad = dataclasses.replace(good, fingerprint=_flip(good.fingerprint))
     nonce = SimpleNamespace(hex="ab" * 16)
 
     with pytest.raises(I.IsolationSetupError) as ei:
-        I.WorkerIsolation.prepare(bad, nonce, "/nonexistent")
+        I.WorkerIsolation.prepare(bad, nonce, codex_cli_path)
     assert ei.value.reason == "fingerprint_mismatch" and steps == []
     assert str(ei.value).startswith("sandbox_unavailable: fingerprint_mismatch")
-    assert I.verify_fingerprint(good) == good.fingerprint
+    assert I.verify_fingerprint(good, artifact_path=codex_cli_path) == good.fingerprint
     with pytest.raises(I.IsolationSetupError) as ei:
-        I.WorkerIsolation.prepare(good, nonce, "/nonexistent")
+        I.WorkerIsolation.prepare(good, nonce, codex_cli_path)
     assert ei.value.reason == "cgroup_create_failed" and steps == ["caps", "cgroup"]
 
 
@@ -611,13 +669,15 @@ def test_admission_failure_fails_closed(case, tmp_path, monkeypatch):
 
 
 def test_service_startup_keeps_afx_cgroup_while_disabled(tmp_path, monkeypatch, caplog):
-    """定数が偽の起動時の診断は host を起こさず (自己移動しない)、1 行だけ技術ログに出す。"""
+    """明示的に無効化した診断は host を起こさず、1 行だけ技術ログに出す。"""
     import logging
 
     from agentic_fx import service
     from agentic_fx.core import cgroup_host as ch
     from agentic_fx.core import improve_admission as IA
     from agentic_fx.core import unit_admission as ua
+
+    monkeypatch.setattr(IA, "ISOLATION_ENABLED", False)
 
     def forbidden(*a, **kw):
         raise AssertionError("must not touch the afx cgroup while disabled")

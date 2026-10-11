@@ -221,7 +221,7 @@ def _assert_worker_observed(observed: dict, backend: str) -> None:
 INDEPENDENT_SOURCES = {
     "source_launcher": ("core/cli_launcher.py", "core/cli_artifact_copy.py"),
     "source_supervisor": ("core/connect_supervisor.py",),
-    "source_canary": ("core/improve_canary.py",),
+    "source_canary": ("core/improve_canary.py", "loops/verify_backend.py"),
 }
 
 
@@ -359,7 +359,8 @@ def test_saturation_and_503_do_not_register(isolation_units, kind, backend):
     # 失敗は許可として覚えない・対応集合に入らない (2 回目は同じ失敗の判定を返す)
     assert res["second"] == {"refusal": "runtime_fingerprint_selftest_failed", "same": True}
     assert res["selftest_runs"] == 1
-    assert res["supported"] == []
+    # 失敗した fingerprint は対応集合に入らない (集合は登録値の literal のまま)
+    assert res["first"]["aggregate"] and res["first"]["aggregate"] not in res["supported"]
     assert res["mission"]["m_dirs_left"] == []
 
 

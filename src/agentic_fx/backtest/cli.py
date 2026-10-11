@@ -772,9 +772,14 @@ def _plugin_lock(conn, settings, args: argparse.Namespace, root: Path) -> int:
 def _improve_verify_backend(conn, settings, args: argparse.Namespace,
                             root: Path) -> int:
     from agentic_fx.core.contracts import SystemClock
-    from agentic_fx.loops.verify_backend import verify_backend
+    from agentic_fx.loops.verify_backend import (
+        OPERATOR_SHELL_NO_ISOLATION, verify_backend)
+    print("この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。"
+          "隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ "
+          "(`improve isolation: enabled; … fingerprint=`) を見る")
     result = verify_backend(root, settings, backend=args.backend,
-                           provider=args.provider, clock=SystemClock())
+                           provider=args.provider, clock=SystemClock(),
+                           isolation_options=OPERATOR_SHELL_NO_ISOLATION)
     if not result.ok:
         print(f"エラー: {result.detail}", file=sys.stderr)
         return 1

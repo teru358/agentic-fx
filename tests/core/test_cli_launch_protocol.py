@@ -153,7 +153,7 @@ def test_fixed_reason_words():
         7: "no_new_privs_failed", 8: "landlock_restrict_failed", 9: "seccomp_install_failed",
         10: "seccomp_self_check_failed", 11: "policy_compile_failed",
         12: "artifact_copy_failed", 13: "artifact_digest_mismatch",
-        14: "artifact_copy_unsupported"}
+        14: "artifact_copy_unsupported", 15: "artifact_changed"}
     assert (P.LAUNCHER_DIED, P.LAUNCHER_SPAWN_FAILED, P.CGROUP_JOIN_FAILED,
             P.RECEIVER_HANDOFF_FAILED, P.CLI_EXEC_UNPROVEN) == (
         "launcher_died", "launcher_spawn_failed", "cgroup_join_failed",

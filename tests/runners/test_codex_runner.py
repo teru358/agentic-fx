@@ -47,17 +47,16 @@ def _run_with_fake_env(runner, mission, behavior, monkeypatch):
     return runner.run(mission)
 
 
-def test_codex_argv_shape_pins_plugin_disable_flags(tmp_path):
+def test_codex_argv_shape_pins_disable_flags(tmp_path):
     """argv pin: `--disable plugins --disable remote_plugin
     --disable recommended_plugins` (probe §5-②: 落とすとカタログ取得で
     RLIMIT_FSIZE=8MB に当たり SIGXFSZ で即死する)。"""
     runner, workdir, _ = _runner(tmp_path)
     argv = runner._build_argv(_mission(), mcp_spool=workdir / "afx-spool" / "spool")
     disables = [argv[i + 1] for i, a in enumerate(argv) if a == "--disable"]
-    assert "plugins" in disables
-    assert "remote_plugin" in disables
-    assert "recommended_plugins" in disables
-    assert "apps" in disables
+    # code-mode host は tool 呼出しに要る (隔離は path_fd で実行ファイルの隣の host を見つける)
+    assert disables == ["plugins", "remote_plugin", "recommended_plugins", "apps"]
+    assert "code_mode_host" not in disables
 
 
 def test_codex_argv_shape_pins_bypass_and_ignore_user_config(tmp_path):

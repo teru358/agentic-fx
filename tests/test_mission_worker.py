@@ -71,16 +71,22 @@ def test_exec_closure_claude_includes_usr_bin_and_bin_parent(tmp_path):
     assert fake_claude.parent in closure.dirs
 
 
-def test_exec_closure_codex_includes_usr_bin_and_bin_parent(tmp_path):
+def test_exec_closure_codex_grants_the_two_binaries_as_files_not_their_directory(tmp_path):
     from agentic_fx.mission_worker import _exec_closure_for
     venv = tmp_path / "venv"; venv.mkdir()
     fake_codex = tmp_path / "vendor" / "codex"
     fake_codex.parent.mkdir(parents=True)
     fake_codex.write_text("")
+    host = fake_codex.parent / "codex-code-mode-host"
+    host.write_text("")
     closure = _exec_closure_for("codex", claude_bin=None, codex_bin=fake_codex,
                                venv_root=venv)
     assert Path("/usr/bin") in closure.dirs
-    assert fake_codex.parent in closure.dirs
+    assert fake_codex.parent not in closure.dirs
+    assert fake_codex.parent.resolve() not in closure.dirs
+    assert fake_codex.resolve() in closure.targets
+    assert host.resolve() in closure.targets
+    assert set(closure.files) == {fake_codex.resolve(), host.resolve()}
 
 
 def test_exec_closure_opencode_includes_cli_binary(tmp_path):
@@ -524,7 +530,7 @@ def test_bootstrap_improve_profile_fails_closed_when_exec_closure_dirs_reach_dat
         from agentic_fx.mission_worker import (
             ExecClosure, _guarded_data_dir)
 
-        def _fake_exec_closure_for(backend, *, claude_bin, codex_bin, venv_root):
+        def _fake_exec_closure_for(backend, *, claude_bin, codex_bin, venv_root, **_kw):
             return ExecClosure(dirs=[_guarded_data_dir().parent], targets=[])
 
         mission_worker._exec_closure_for = _fake_exec_closure_for

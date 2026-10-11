@@ -495,7 +495,8 @@ def run_canary(ctx, *, settings: Any, root: Path, expected: dict[str, str] | Non
     # worker は handshake の artifact (canary では Python の ELF) で fingerprint を計算し直して
     # 照合するので、artifact の要素だけを Python の ELF に替えた fingerprint を渡す
     decision = IA.AdmissionDecision(True, None, ctx.backend,
-                                    F.with_artifact(ctx.fingerprint, python), python)
+                                    F.with_artifact(ctx.fingerprint, python,
+                                                    clear_codex_package=True), python)
     options = IA.worker_runner_options(decision, host, kind=I.KIND_CANARY)
     scratch, rctx = _scratch_context(root)
     try:

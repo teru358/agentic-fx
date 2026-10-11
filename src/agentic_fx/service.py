@@ -1932,10 +1932,10 @@ def run_service(root: Path, *, daemon: bool = False,
     if warning:
         print(warning)
     print(build_splash(app))
-    # 診断は起動の同期経路から外す。admission の代表自己試験 (最大 120 秒) と
-    # journalctl (最大 5 秒) を同期で走らせると service_started と scheduler
+    # 診断は起動の同期経路から外す。admission の canary (90 秒) と自己試験
+    # mission (最大 600 秒) を同期で走らせると service_started と scheduler
     # (資金保護) の起動がそのぶん遅れる。別 daemon thread で走らせ、結果は
-    # 非同期にログへ出す。shutdown では bounded に join する (下の finally)
+    # 非同期にログへ出す。shutdown では 10 秒だけ join する (下の finally)
     diag_thread = threading.Thread(
         target=_log_plugin_sandbox_diagnostics, daemon=True, name="sandbox-diag")
     diag_thread.start()
