@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from agentic_fx.ops.keys import KeySetError, run_keys_command
-from agentic_fx.ops_setup.feature_config import InputError, collect, is_unsafe, write_inputs
+from agentic_fx.ops_setup.feature_config import InputError, collect, unsafe_reason, write_inputs
 from agentic_fx.ops_setup.probe import run_probe
 from agentic_fx.ops_setup.stages import OpsSetup
 from agentic_fx.ops_setup.units import resolve_ops_exec
@@ -131,8 +131,8 @@ def interactive_enable(root: Path, feature: str, *, io: IO, probe_runner: Callab
         return 1
     try:
         existing = collect(root, feature)
-        if is_unsafe(root, feature):
-            io.stderr("afx ops: feature_config_unsafe")
+        if reason := unsafe_reason(root, feature):
+            io.stderr(f"afx ops: feature_config_unsafe:{reason}")
             return 1
         if not existing.complete and not io.isatty():
             io.stderr("afx ops: setup_input_required")

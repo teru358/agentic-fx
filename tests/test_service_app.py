@@ -5388,6 +5388,97 @@ def _run_once(tmp_path):
         return run_service(tmp_path, daemon=True, _stop_event=stop_event)
 
 
+def test_run_service_waits_for_improve_host_before_starting_sandbox_diagnostics(
+        tmp_path, monkeypatch):
+    """A plugin diagnostic worker cannot enter the unit root before host adoption."""
+    from agentic_fx.core import improve_admission
+
+    entered_startup = threading.Event()
+    release_host = threading.Event()
+    sandbox_started = threading.Event()
+    host = object()
+    seen: dict[str, float | object | None] = {"host": None}
+
+    def startup(*_args, **_kwargs):
+        entered_startup.set()
+        assert release_host.wait(1)
+        seen["host"] = host
+        seen["host_at"] = time.monotonic()
+        return "improve isolation: enabled"
+
+    def sandbox_diag():
+        seen["sandbox_at"] = time.monotonic()
+        sandbox_started.set()
+
+    monkeypatch.setattr(improve_admission, "startup", startup)
+    monkeypatch.setattr(improve_admission, "current_host", lambda: seen["host"])
+    monkeypatch.setattr("agentic_fx.service._log_plugin_sandbox_diagnostics", sandbox_diag)
+
+    result: dict[str, int] = {}
+    service_thread = threading.Thread(
+        target=lambda: result.setdefault("code", _run_once(tmp_path)), daemon=True)
+    service_thread.start()
+
+    assert entered_startup.wait(1)
+    assert not sandbox_started.wait(0.1)
+    release_host.set()
+    service_thread.join(2)
+
+    assert not service_thread.is_alive()
+    assert result["code"] == 0
+    assert seen["sandbox_at"] >= seen["host_at"]
+
+
+def test_run_service_starts_sandbox_when_improve_startup_exits_without_host(
+        tmp_path, monkeypatch):
+    """Disabled isolation exits its diagnostic thread without creating a host."""
+    from agentic_fx.core import improve_admission
+
+    order: list[str] = []
+
+    def startup(*_args, **_kwargs):
+        order.append("startup")
+        return "improve isolation: disabled"
+
+    def sandbox_diag():
+        order.append("sandbox")
+
+    monkeypatch.setattr(improve_admission, "startup", startup)
+    monkeypatch.setattr(improve_admission, "current_host", lambda: None)
+    monkeypatch.setattr("agentic_fx.service._log_plugin_sandbox_diagnostics", sandbox_diag)
+
+    assert _run_once(tmp_path) == 0
+    assert order == ["startup", "sandbox"]
+
+
+def test_run_service_continues_after_improve_host_start_timeout(
+        tmp_path, monkeypatch):
+    """A stuck host startup delays plugin diagnostics for at most the bounded wait."""
+    from agentic_fx.core import improve_admission
+
+    release_startup = threading.Event()
+    sandbox_started = threading.Event()
+    warnings: list[str] = []
+
+    def startup(*_args, **_kwargs):
+        assert release_startup.wait(1)
+        return "improve isolation: enabled"
+
+    def sandbox_diag():
+        sandbox_started.set()
+        release_startup.set()
+
+    monkeypatch.setattr(improve_admission, "startup", startup)
+    monkeypatch.setattr(improve_admission, "current_host", lambda: None)
+    monkeypatch.setattr("agentic_fx.service._log_plugin_sandbox_diagnostics", sandbox_diag)
+    monkeypatch.setattr("agentic_fx.service._IMPROVE_HOST_START_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr("agentic_fx.service._log.warning", warnings.append)
+
+    assert _run_once(tmp_path) == 0
+    assert sandbox_started.is_set()
+    assert "improve isolation: host start did not finish within 10s; continuing" in warnings
+
+
 def test_run_service_logs_the_plugin_sandbox_admission_and_kernel_log_eagerly(
         tmp_path, monkeypatch, caplog):
     import logging

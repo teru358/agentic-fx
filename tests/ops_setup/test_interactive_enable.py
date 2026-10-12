@@ -150,7 +150,7 @@ def test_unsafe_existing_config_fails_closed_without_rewriting(tmp_path, xdg):
     io = FakeIO(answers=["9999"])
     rc, setup = run(tmp_path, "web", io)
     assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe"]
+    assert io.err == ["afx ops: feature_config_unsafe:config_file"]
     assert config.read_bytes() == before
 
 
@@ -164,7 +164,7 @@ def test_read_only_secret_fails_closed_without_prompt_or_enable(tmp_path, xdg):
     rc, setup = run(tmp_path, "bot", io)
 
     assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe"]
+    assert io.err == ["afx ops: feature_config_unsafe:secret_file"]
     assert io.asked == [] and io.secrets == []
     assert secret.read_bytes() == before
 
@@ -177,7 +177,7 @@ def test_unknown_config_key_fails_closed_without_rewriting(tmp_path, xdg):
     io = FakeIO()
     rc, setup = run(tmp_path, "web", io)
     assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe"]
+    assert io.err == ["afx ops: feature_config_unsafe:config_file"]
     assert config.read_bytes() == before
 
 
@@ -189,8 +189,47 @@ def test_broken_toml_fails_closed_without_rewriting(tmp_path, xdg):
     io = FakeIO(answers=["9999"])
     rc, setup = run(tmp_path, "web", io)
     assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe"]
+    assert io.err == ["afx ops: feature_config_unsafe:config_file"]
     assert config.read_bytes() == before
+
+
+def test_group_writable_feature_parents_are_complete_without_prompting(tmp_path, xdg):
+    write_inputs(tmp_path, "bot", BOT)
+    xdg.parent.chmod(0o775)
+    xdg.chmod(0o775)
+    io = FakeIO()
+
+    rc, setup = run(tmp_path, "bot", io)
+
+    assert rc == 0 and setup.enabled == ["bot"]
+    assert io.asked == [] and io.secrets == []
+
+
+def test_other_writable_feature_parent_has_fixed_unsafe_reason(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    xdg.chmod(0o777)
+    io = FakeIO()
+
+    rc, setup = run(tmp_path, "web", io)
+
+    assert rc == 1 and setup.enabled == []
+    assert io.err == ["afx ops: feature_config_unsafe:parent_dir"]
+    assert io.asked == [] and io.secrets == []
+
+
+def test_feature_symlink_has_fixed_unsafe_reason(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    feature = xdg / "web"
+    target = tmp_path / "target"
+    feature.rename(target)
+    feature.symlink_to(target, target_is_directory=True)
+    io = FakeIO()
+
+    rc, setup = run(tmp_path, "web", io)
+
+    assert rc == 1 and setup.enabled == []
+    assert io.err == ["afx ops: feature_config_unsafe:symlink"]
+    assert io.asked == [] and io.secrets == []
 
 
 def test_bot_retry_keeps_mentions_equal_to_reentered_allowlist(tmp_path, xdg):

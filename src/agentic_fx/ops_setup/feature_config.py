@@ -21,6 +21,12 @@ _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 class InputError(ValueError): pass
 
+
+class UnsafeConfigError(OSError):
+    def __init__(self, component: str):
+        super().__init__(f"unsafe {component}")
+        self.component = component
+
 @dataclass(frozen=True)
 class Inputs:
     values: dict[str, Any]
@@ -67,22 +73,36 @@ def validate(feature: str, values: dict[str, Any]) -> dict[str, Any]:
         return result
     raise ValueError("unknown_feature")
 
-def _owned_dir(fd: int, *, exact: int | None = None) -> None:
+def _owned_dir(fd: int, *, component: str, exact: int | None = None, other_writable: bool = False) -> None:
     st = os.fstat(fd); mode = stat.S_IMODE(st.st_mode)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or (exact is not None and mode != exact) or (exact is None and mode & 0o022): raise OSError("unsafe directory")
+    if not stat.S_ISDIR(st.st_mode): raise UnsafeConfigError(component)
+    if st.st_uid != os.getuid(): raise UnsafeConfigError("owner")
+    if exact is not None and mode != exact: raise UnsafeConfigError(component)
+    if exact is None and mode & (0o002 if other_writable else 0o022): raise UnsafeConfigError(component)
 
-def _open_child(parent_fd: int, name: str, *, create: bool = False, mode: int = 0o700, exact: int | None = None, readable: bool = False, checked: bool = True) -> int:
+
+def _is_symlink(parent_fd: int, name: str) -> bool:
+    try: return stat.S_ISLNK(os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode)
+    except OSError: return False
+
+
+def _open_child(parent_fd: int, name: str, *, create: bool = False, mode: int = 0o700, exact: int | None = None,
+                readable: bool = False, checked: bool = True, component: str = "parent_dir",
+                other_writable: bool = False) -> int:
     created = False
     if create:
         try: os.mkdir(name, mode, dir_fd=parent_fd); created = True
         except FileExistsError: pass
     flags = _DIR_FLAGS if not readable else os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open(name, flags, dir_fd=parent_fd)
+    try: fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP or _is_symlink(parent_fd, name): raise UnsafeConfigError("symlink") from error
+        raise
     try:
-        if checked: _owned_dir(fd, exact=exact)
+        if checked: _owned_dir(fd, component=component, exact=exact, other_writable=other_writable)
         if created:
             os.chmod(name, mode, dir_fd=parent_fd, follow_symlinks=False)
-            if checked: _owned_dir(fd, exact=exact)
+            if checked: _owned_dir(fd, component=component, exact=exact, other_writable=other_writable)
         return fd
     except BaseException:
         os.close(fd); raise
@@ -95,7 +115,7 @@ def _open_config_home(*, create: bool) -> int:
         for index, part in enumerate(path.parts[1:]):
             next_fd = _open_child(fd, part, create=create, checked=index == len(path.parts) - 2)
             os.close(fd); fd = next_fd
-        _owned_dir(fd)
+        _owned_dir(fd, component="parent_dir")
         return fd
     except BaseException:
         os.close(fd); raise
@@ -103,20 +123,27 @@ def _open_config_home(*, create: bool) -> int:
 def _open_feature(feature: str, *, create: bool = False) -> int:
     fd = _open_config_home(create=create)
     try:
-        for name, exact in (("agentic-fx", None), ("ops", None), (feature, 0o700)):
-            next_fd = _open_child(fd, name, create=create, exact=exact)
+        for name, exact, component, other_writable in (("agentic-fx", None, "parent_dir", True),
+                                                        ("ops", None, "parent_dir", True),
+                                                        (feature, 0o700, "feature_dir", False)):
+            next_fd = _open_child(fd, name, create=create, exact=exact, component=component,
+                                  other_writable=other_writable)
             os.close(fd); fd = next_fd
         return fd
     except BaseException:
         os.close(fd); raise
 
 def _read_regular(directory_fd: int, name: str, *, secret: bool = False) -> bytes:
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+    component = "secret_file" if secret else "config_file"
+    try: fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP or _is_symlink(directory_fd, name): raise UnsafeConfigError("symlink") from error
+        raise
     try:
         st = os.fstat(fd); mode = stat.S_IMODE(st.st_mode)
-        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
-                or (mode != 0o600 if secret else mode & 0o022)):
-            raise OSError("unsafe file")
+        if not stat.S_ISREG(st.st_mode): raise UnsafeConfigError(component)
+        if st.st_uid != os.getuid(): raise UnsafeConfigError("owner")
+        if (mode != 0o600 if secret else mode & 0o022): raise UnsafeConfigError(component)
         chunks = []
         while chunk := os.read(fd, 4096): chunks.append(chunk)
         return b"".join(chunks)
@@ -124,7 +151,7 @@ def _read_regular(directory_fd: int, name: str, *, secret: bool = False) -> byte
 
 def _parse_config(root: Path, feature: str) -> dict[str, Any]:
     base_fd = _open_feature(feature)
-    try: config_fd = _open_child(base_fd, "config", readable=True)
+    try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
     finally: os.close(base_fd)
     try: parsed = tomllib.loads(_read_regular(config_fd, "ops.toml").decode("utf-8"))
     finally: os.close(config_fd)
@@ -140,35 +167,44 @@ def _secret_present(feature: str) -> bool:
     name = _SECRET_NAME.get(feature)
     if name is None: return False
     base_fd = _open_feature(feature)
-    try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True)
+    try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
     finally: os.close(base_fd)
     try: _read_regular(secret_fd, name, secret=True); return True
     finally: os.close(secret_fd)
 
-def is_unsafe(root: Path, feature: str) -> bool:
+def unsafe_reason(root: Path, feature: str) -> str | None:
     try: base_fd = _open_feature(feature)
-    except FileNotFoundError: return False
-    except OSError: return True
+    except FileNotFoundError: return None
+    except UnsafeConfigError as error: return error.component
+    except OSError: return "parent_dir"
     try:
-        try: config_fd = _open_child(base_fd, "config", readable=True)
+        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
         except FileNotFoundError: config_fd = None
         if config_fd is not None:
             try:
                 try: _parse_config(root, feature)
                 except FileNotFoundError: pass
+                except UnsafeConfigError as error: return error.component
+                except (ValueError, UnicodeError, tomllib.TOMLDecodeError, InputError): return "config_file"
             finally: os.close(config_fd)
         secret = _SECRET_NAME.get(feature)
         if secret:
-            try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True)
+            try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
             except FileNotFoundError: secret_fd = None
             if secret_fd is not None:
                 try:
                     try: _read_regular(secret_fd, secret, secret=True)
                     except FileNotFoundError: pass
+                    except UnsafeConfigError as error: return error.component
                 finally: os.close(secret_fd)
-        return False
-    except (OSError, ValueError, UnicodeError, tomllib.TOMLDecodeError, InputError): return True
+        return None
+    except UnsafeConfigError as error: return error.component
+    except (OSError, ValueError, UnicodeError, tomllib.TOMLDecodeError, InputError): return "config_file"
     finally: os.close(base_fd)
+
+
+def is_unsafe(root: Path, feature: str) -> bool:
+    return unsafe_reason(root, feature) is not None
 
 def collect(root: Path, feature: str) -> Inputs:
     values: dict[str, Any] = {}
@@ -210,8 +246,8 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
     if is_unsafe(root, feature): raise OSError("unsafe existing configuration")
     base_fd = _open_feature(feature, create=True)
     try:
-        config_fd = _open_child(base_fd, "config", create=True, mode=0o755, readable=True)
-        secret_fd = _open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True)
+        config_fd = _open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
+        secret_fd = _open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir")
     finally: os.close(base_fd)
     config: dict[str, Any] = {"instance_root": str(Path(root).resolve()), "key_dir": str(key_dir(root))}
     if feature == "bot":

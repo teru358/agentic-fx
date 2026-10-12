@@ -678,6 +678,7 @@ def test_service_startup_keeps_afx_cgroup_while_disabled(tmp_path, monkeypatch, 
     from agentic_fx.core import unit_admission as ua
 
     monkeypatch.setattr(IA, "ISOLATION_ENABLED", False)
+    monkeypatch.setattr(IA, "_HOST", None)
 
     def forbidden(*a, **kw):
         raise AssertionError("must not touch the afx cgroup while disabled")

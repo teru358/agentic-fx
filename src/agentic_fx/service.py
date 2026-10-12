@@ -1866,6 +1866,8 @@ def _exit_code(app: App, scheduler_alive: bool,
 #: 起動時診断 thread の shutdown 時の join 上限。通常は即座に終わる。集合外で自己試験が
 #: 長引いても shutdown をこれ以上は待たせない (daemon thread なので process 終了で片付く)
 _SANDBOX_DIAG_JOIN_TIMEOUT_SEC = 10.0
+_IMPROVE_HOST_START_TIMEOUT_SEC = 10.0
+_IMPROVE_HOST_START_POLL_SEC = 0.05
 
 
 def _log_plugin_sandbox_diagnostics() -> None:
@@ -1906,6 +1908,19 @@ def _log_improve_isolation_diagnostics(settings: object, root: Path,
     _log.info("%s", line)
 
 
+def _wait_for_improve_host_start(isolation_thread: threading.Thread) -> None:
+    from agentic_fx.core import improve_admission
+
+    deadline = time.monotonic() + _IMPROVE_HOST_START_TIMEOUT_SEC
+    while (improve_admission.current_host() is None
+           and isolation_thread.is_alive()):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _log.warning("improve isolation: host start did not finish within 10s; continuing")
+            return
+        isolation_thread.join(timeout=min(_IMPROVE_HOST_START_POLL_SEC, remaining))
+
+
 def run_service(root: Path, *, daemon: bool = False,
                _stop_event: threading.Event | None = None) -> int:
     """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
@@ -1932,6 +1947,15 @@ def run_service(root: Path, *, daemon: bool = False,
     if warning:
         print(warning)
     print(build_splash(app))
+    # 改善 CLI の隔離: 有効化の定数が真なら mission cgroup host の起動と admission、偽なら
+    # 読むだけの診断を別 thread で行う。host の準備中に plugin 診断が worker を起こして
+    # unit root の topology を変えないよう、host が入るか thread が終わるまでだけ待つ。
+    isolation_thread = threading.Thread(
+        target=_log_improve_isolation_diagnostics, args=(settings, root, stop_event),
+        daemon=True,
+        name="improve-isolation-diag")
+    isolation_thread.start()
+    _wait_for_improve_host_start(isolation_thread)
     # 診断は起動の同期経路から外す。admission の canary (90 秒) と自己試験
     # mission (最大 600 秒) を同期で走らせると service_started と scheduler
     # (資金保護) の起動がそのぶん遅れる。別 daemon thread で走らせ、結果は
@@ -1939,13 +1963,6 @@ def run_service(root: Path, *, daemon: bool = False,
     diag_thread = threading.Thread(
         target=_log_plugin_sandbox_diagnostics, daemon=True, name="sandbox-diag")
     diag_thread.start()
-    # 改善 CLI の隔離: 有効化の定数が真なら mission cgroup host の起動と admission、偽なら
-    # 読むだけの診断。どちらも起動を遅らせないよう別 thread で行う
-    isolation_thread = threading.Thread(
-        target=_log_improve_isolation_diagnostics, args=(settings, root, stop_event),
-        daemon=True,
-        name="improve-isolation-diag")
-    isolation_thread.start()
     app.activity.write(Category.SYSTEM, "service_started",
                        f"daemon={daemon} "
                        f"decision_timeframe={settings.datafeed.decision_timeframe} "
