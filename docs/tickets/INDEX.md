@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 146 件。完了分は closed/。
+未完了: 148 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -41,7 +41,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (123)
+## 設計待ち (125)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -76,6 +76,7 @@
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
+| [pending-env-key-check-reads-process-env](open/pending-env-key-check-reads-process-env.md) | 中 | 2026-10-14 | 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」 |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage12-show-examples](open/wizard-stage12-show-examples.md) | 中 | 2026-10-14 | 段 12 の方針文と最初の課題に例文と書き方の案内を出す |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
@@ -137,6 +138,7 @@
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
+| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
 | [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
 | [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
