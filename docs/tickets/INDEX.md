@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 139 件。完了分は closed/。
+未完了: 140 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -41,7 +41,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (116)
+## 設計待ち (117)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -132,6 +132,7 @@
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
+| [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 低 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
