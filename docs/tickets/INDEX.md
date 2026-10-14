@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 138 件。完了分は closed/。
+未完了: 139 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -27,11 +27,12 @@
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
-## 裁定待ち (8)
+## 裁定待ち (9)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
+| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 | [improve-catchup-runs-at-startup](open/improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [gate-noop-followup](open/gate-noop-followup.md) | 低 |  | fact 行が選択され得る件は kind 必須化の追随が未観測 |
