@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 145 件。完了分は closed/。
+未完了: 146 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -41,7 +41,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (122)
+## 設計待ち (123)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -77,6 +77,7 @@
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
+| [wizard-stage12-show-examples](open/wizard-stage12-show-examples.md) | 中 | 2026-10-14 | 段 12 の方針文と最初の課題に例文と書き方の案内を出す |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [wizard-stage8-ask-daemon-not-api](open/wizard-stage8-ask-daemon-not-api.md) | 中 | 2026-10-14 | 段 8 は操作 API でなく「常駐サービスで運用するか」を問う |
 | [wizard-stage9-summary-in-user-terms](open/wizard-stage9-summary-in-user-terms.md) | 中 | 2026-10-14 | 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く |
