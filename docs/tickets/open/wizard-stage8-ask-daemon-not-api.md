@@ -1,0 +1,26 @@
+---
+id: wizard-stage8-ask-daemon-not-api
+title: 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
+status: 設計待ち
+priority: 中
+opened: 2026-10-14
+closed: null
+related: [first-run-setup, wizard-stage4-menu-per-role]
+---
+# [wizard-stage8-ask-daemon-not-api] 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
+
+**状態**: 設計待ち / **優先**: 中
+
+## 現象
+
+段 8 の説明 (UNIX ソケット・TCP では開かない・afx ctl・bot/web/notify が使えない…) は利用者の判断軸と合わず分かりにくい。利用者が決めたいのは「常駐 (daemon) で運用するか、手で起動する対話シェルで使うか」で、操作 API の有無はその結果。問いを「afx を常駐サービスとして動かしますか [Y/n]」に置き換え、Y → api.enabled true + 段 13 の unit 設置を前提 (段 13 は意思を再質問せず設置内容の確認だけ)、n → 対話シェル運用として api.enabled false・unit は置かず手動起動の案内。.env のキー確認はそのまま。spec §3 段 8 / 段 13 と §5 の書き込み先表の改訂を伴う。2026-10-14 stream-svr 受入 1 回目のユーザー指摘
+
+## 原因
+
+## 処置案・裁定
+
+## 修正内容
+
+## 経緯
+
+- 2026-10-14: 起票。
