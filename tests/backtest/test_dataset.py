@@ -3,7 +3,8 @@ from datetime import timedelta
 
 import pytest
 
-from agentic_fx.backtest.dataset import DatasetError, HistoryDataset
+from agentic_fx.backtest.dataset import (
+    DatasetError, HistoryDataset, HistorySourceUnconfiguredError)
 
 
 def test_history_dataset_validates_and_exposes_immutable_metadata():
@@ -29,3 +30,15 @@ def test_history_dataset_15m_width_and_as_dict():
     dataset = HistoryDataset("mt5", "15m")
     assert dataset.width == timedelta(minutes=15)
     assert dataset.as_dict() == {"source": "mt5", "base_interval": "15m"}
+
+
+def test_history_dataset_accepts_unconfigured_source_without_becoming_importable():
+    dataset = HistoryDataset("none", "5m")
+
+    assert dataset.as_dict() == {"source": "none", "base_interval": "5m"}
+    assert dataset.unconfigured is True
+    assert HistoryDataset("mt5", "5m").unconfigured is False
+    with pytest.raises(HistorySourceUnconfiguredError,
+                       match="^history_source_unconfigured$"):
+        dataset.require_configured()
+    HistoryDataset("mt5", "5m").require_configured()

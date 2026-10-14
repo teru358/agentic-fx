@@ -229,6 +229,20 @@ def test_compute_partition_hint_raises_when_wave_has_no_slots(loop_min, conn):
         loop_min._compute_partition_hint(conn, ("2026-W99", 0))
 
 
+def test_compute_partition_hint_rejects_a_consumed_period_without_slots(
+        loop_min, conn, clock):
+    """`expected=0` の消費印を全バックログ担当として fail-open しない。"""
+    settings = SimpleNamespace(
+        schedule=SimpleNamespace(improve="weekly", improve_at="Sat 03:00"),
+        display_timezone="UTC")
+    consumed = improve_waves.consume_scheduled_period(
+        conn, settings, now=clock.now())
+    assert consumed.inserted is True
+
+    with pytest.raises(RuntimeError, match="no wave slots"):
+        loop_min._compute_partition_hint(conn, (consumed.period_key, 0))
+
+
 def test_compute_partition_hint_raises_when_partition_would_be_empty(
         loop_min, conn, clock):
     """L-B13 裁定 (2026-08-28、束D検収 verified-local-round1.md §7):

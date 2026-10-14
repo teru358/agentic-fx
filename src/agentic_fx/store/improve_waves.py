@@ -3,11 +3,20 @@
 **この層が保証する範囲**: wave/slot の SQL レベル状態遷移 (CAS)。`go` の
 3-way プロトコル・実プロセス spawn は `core/improve_supervisor.py`
 (Task 9) の責務。
+
+`improve_waves` の行は 2 種類ある。通常の wave は `expected>=1` で slot を
+`expected` 件持つ。初期設定が書く消費印 (`consume_scheduled_period`) は
+`expected=0` で slot を 1 件も持たない。slot と wave を結合する・`expected`
+を除数に使う読み手は、消費印の行が存在しうることを前提に書くこと。
 """
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
+
+from agentic_fx.config import Settings
+from agentic_fx.core.scheduler import scheduled_period
 
 _TERMINAL_STATUSES = frozenset({"done", "failed"})
 
@@ -16,8 +25,10 @@ def create_wave_and_slots(conn: sqlite3.Connection, *, period_key: str,
                           now: datetime, expected: int,
                           commit: bool = True) -> bool:
     """1 つの短い tx で wave 行 + slot 行 (reserved, k=0..expected-1) を
-    作る。`expected=0` は何も書かない。戻り値は「この呼び出しが起動権を
-    得たか」(= period を消費したか)。"""
+    作る。`expected=0` はこの関数では何も書かず False を返す (消費印を
+    書くのは `consume_scheduled_period`)。戻り値は「この呼び出しが wave を
+    新規に作り起動権を得たか」。期に wave 行 (消費印を含む) が既にあれば
+    False。"""
     if expected == 0:
         return False
     now_iso = now.isoformat()
@@ -36,6 +47,28 @@ def create_wave_and_slots(conn: sqlite3.Connection, *, period_key: str,
     if commit:
         conn.commit()
     return True
+
+
+@dataclass(frozen=True)
+class ConsumedPeriod:
+    period_key: str
+    inserted: bool
+
+
+def consume_scheduled_period(conn: sqlite3.Connection, settings: Settings, *,
+                             now: datetime, commit: bool = True) -> ConsumedPeriod:
+    """`now` の予定期を、slot を作らずに消費済みにする (`expected=0` の行)。
+
+    期キーの算出と INSERT は同じ `now` で行う。`inserted` が True なら
+    この呼び出しが消費印を書いた。False は期に wave 行 (先行の消費印または
+    通常の wave) が既にあったことを表し、何も変えていない。"""
+    period_key = scheduled_period(settings, now).period_key
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO improve_waves (period_key, created_at, expected) "
+        "VALUES (?,?,0)", (period_key, now.isoformat()))
+    if commit:
+        conn.commit()
+    return ConsumedPeriod(period_key=period_key, inserted=cur.rowcount == 1)
 
 
 def list_slots(conn: sqlite3.Connection, *, period_key: str) -> list[dict]:

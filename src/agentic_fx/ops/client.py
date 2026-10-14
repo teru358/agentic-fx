@@ -24,6 +24,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TextIO
 
@@ -32,6 +33,8 @@ import httpx
 
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
+from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
+                                           parse_observed_at, render_pending_step)
 
 from . import keys
 from .contracts import Principal
@@ -586,6 +589,9 @@ def _num(value) -> str:
     return "-"
 
 
+_SETUP_SEVERITIES = frozenset({"info", "warn", "action"})
+
+
 def format_status(data: dict) -> str:
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
@@ -614,6 +620,33 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+    setup = data.get("setup")
+    record_state = setup.get("record_state") if isinstance(setup, dict) else None
+    if record_state == "unknown":
+        lines.append("未完の手順を確認できません")
+    if isinstance(setup, dict) and isinstance(setup.get("pending_steps"), list):
+        steps = []
+        for item in setup["pending_steps"][:32]:
+            if not isinstance(item, dict) or not isinstance(item.get("code"), str):
+                continue
+            code = item["code"] if is_ident(item["code"]) else "unknown"
+            severity = item.get("severity")
+            if not isinstance(severity, str) or severity not in _SETUP_SEVERITIES:
+                severity = "info"
+            raw_params = item.get("params") if isinstance(item.get("params"), dict) else {}
+            allowed = STEP_PARAMS.get(code, {})
+            params = {key: value for key, value in raw_params.items() if key in allowed}
+            observed_at = parse_observed_at(item.get("observed_at")) or datetime.now(timezone.utc)
+            try:
+                text = render_pending_step(PendingStep(code, severity, observed_at, params))
+            except Exception:  # noqa: BLE001 — a rendering fault must not break status
+                text = "手順を表示できません。afx を更新してください"
+            steps.append(text)
+        if record_state == "corrupt" and not any("確認記録が読めません" in step for step in steps):
+            lines.append("確認記録が読めません")
+        if steps:
+            lines.append(f"未完の手順 ({len(steps)} 件)")
+            lines.extend(f"- {step}" for step in steps)
     return "\n".join(lines)
 
 
@@ -967,12 +1000,12 @@ class Runner:
         return RC_OK
 
     def _op_backlog_add(self, idea: str, *, terminal) -> int:
-        from agentic_fx.commands import _normalize_idea_display
+        from agentic_fx.core.idea_check import normalize_idea_display
         reply = self._post("/v1/backlog", {"idea": idea}, idempotent=True)
         if reply.data is None:
             raise _fail(reply)
         bid = _ident(reply.data.get("id"))
-        display, removed = _normalize_idea_display(idea)
+        display, removed = normalize_idea_display(idea)
         text = f"backlog #{bid} を追加しました: 「{display_text(display, _TEXT_LIMIT)}」"
         if removed:
             text += f"\n表示できない文字を {removed} 個含みます"

@@ -17,8 +17,11 @@ from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools import signal_tools
 
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
-SETTINGS = load_settings(
+_EXAMPLE_SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+SETTINGS = _EXAMPLE_SETTINGS.model_copy(update={
+    "backtest": _EXAMPLE_SETTINGS.backtest.model_copy(
+        update={"eval_source": "dukascopy"})})
 
 
 def _conn(tmp_path):
@@ -395,3 +398,22 @@ def test_description_explains_each_status_and_forbids_reproposing_finished_rows(
                    "consumed (判断済み)",
                    "consumed / abandoned の行は再提案しない"):
         assert phrase in description
+
+
+def test_strategy_row_has_no_metrics_when_history_source_is_unconfigured(
+        tmp_path):
+    conn = _conn(tmp_path)
+    settings = SETTINGS.model_copy(deep=True)
+    settings.backtest.eval_source = "none"
+    sid = _add_signal(conn, hours_ago=1, kind="strategy",
+                      content_hash="strat_none")
+    assert sid is not None
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p.py", content_hash="strat_none",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy",
+        base_interval="1m", period=(NOW, NOW), metrics={"trades": 40, "pf": 1.3},
+        settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
+
+    out = _tool(conn, settings=settings).func(pair="USDJPY")
+
+    assert out[0]["in_sample_metrics"] is None

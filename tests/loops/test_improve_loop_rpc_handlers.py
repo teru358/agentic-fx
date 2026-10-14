@@ -1553,3 +1553,28 @@ def test_commit_sink_writes_scope_deps_and_result_of_each_evaluation(
         "mission=m-77 plugin=cand scope=holdout pair=EURUSD deps=3 "
         f"cpu_sec=4.25 cpu_source=parent_wait4 result={result} "
         "returncode=-9 signal=9"), line
+
+
+def test_run_backtest_handler_unconfigured_history_source_is_fixed_not_discovery(
+        loop_min, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    settings = loop_min._settings.model_copy(update={
+        "backtest": loop_min._settings.backtest.model_copy(
+            update={"eval_source": "none"})})
+    monkeypatch.setattr(loop_min, "_settings", settings)
+    ran = []
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.holdout.run_in_sample",
+        lambda *a, **kw: ran.append(1))
+    handlers = loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}), staging_dir=staging_dir)
+
+    result = handlers["run_backtest"]({"name": "myst", "pair": "USDJPY"})
+
+    assert result["started"] is False
+    assert result["error"] == "history_source_unconfigured"
+    assert "discovery" in result["hint"] and "do not report" in result["hint"]
+    assert "imported" not in result["hint"]
+    assert ran == []

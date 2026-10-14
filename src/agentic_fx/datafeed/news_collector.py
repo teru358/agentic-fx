@@ -35,7 +35,7 @@ __all__ = ["DEFAULT_SOURCES", "NewsCollector", "seed_default_sources"]
 # 抑止パターンを 1 箇所で更新できないと片側だけ古いままになる。
 
 
-def seed_default_sources(conn: sqlite3.Connection, now: datetime) -> int:
+def seed_default_sources(conn: sqlite3.Connection, now: datetime, *, commit: bool = True) -> int:
     """DEFAULT_SOURCES のうち未登録 (name/url いずれも未登録) の分だけ INSERT する。
 
     enabled=True, added_by="user" で登録する (素の clone でも即取り込み
@@ -63,7 +63,7 @@ def seed_default_sources(conn: sqlite3.Connection, now: datetime) -> int:
             continue
         news_sources.add(conn, name=s["name"], fetcher=s["fetcher"],
                          url=s["url"], added_by="user", now=now,
-                         enabled=True)
+                         enabled=True, commit=commit)
         existing_names.add(s["name"])
         existing_urls.add(s["url"])
         added += 1

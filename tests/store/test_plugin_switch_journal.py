@@ -145,3 +145,24 @@ def test_terminal_phase_constant_governs_open_and_non_terminal_queries(tmp_path)
         assert psj.list_non_terminal(c) == []
     finally:
         psj._TERMINAL_PHASES = original
+
+
+def test_list_non_terminal_ids_returns_only_requested_approval_ids(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    for approval_id in range(40):
+        psj.insert(c, kind="approve", approval_id=approval_id, name=f"n{approval_id}",
+                   old_kind="absent", old_target=None, temp_path="t", new_target="n",
+                   switch_required=True, actor="test", now=NOW)
+    assert psj.list_non_terminal_ids(c, 32) == list(range(39, 7, -1))
+
+
+def test_list_non_terminal_ids_dedupes_before_limit(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    for index in range(40):
+        for name in ("a", "b"):
+            psj.insert(c, kind="approve", approval_id=index // 2 if name == "a" else 100,
+                       name=f"{name}{index}", old_kind="absent", old_target=None,
+                       temp_path="t", new_target="n", switch_required=True,
+                       actor="test", now=NOW)
+    ids = psj.list_non_terminal_ids(c, 32)
+    assert ids == [100] + list(range(19, -1, -1))

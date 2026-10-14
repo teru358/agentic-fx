@@ -77,7 +77,9 @@ def test_placeholder():
 
 @pytest.fixture(scope="module")
 def settings():
-    return load_settings(_EXAMPLE)
+    base = load_settings(_EXAMPLE)
+    return base.model_copy(update={
+        "backtest": base.backtest.model_copy(update={"eval_source": "dukascopy"})})
 
 
 # [indicator-consumption-wiring] T4a Step 4-1a: プランのテスト片は
@@ -1141,3 +1143,41 @@ def test_both_corridors_call_outputs_required_violation():
         assert "outputs_required_violation(" in src, module.__name__
         # 手書きコピーが残っていない (条件式の再実装が復活したら赤)
         assert "outputs is None" not in src, module.__name__
+
+
+def _unconfigured_strategy_meta():
+    return PluginMeta(
+        name="sma_cross", kind="strategy", path=_SMA_CROSS_DIR,
+        params={}, timeframe="1h", pairs=("USDJPY",), max_bars=200,
+        content_hash=real_content_hash(_SMA_CROSS_DIR))
+
+
+def test_run_kind_gate_reports_unconfigured_history_source_by_discriminator(
+        tmp_path):
+    assert SETTINGS.backtest.eval_source == "none"
+    conn = _conn(tmp_path)
+    root = tmp_path / "plugins"
+    root.mkdir()
+
+    outcome = approval.run_kind_gate(
+        conn, _unconfigured_strategy_meta(), settings=SETTINGS, now=NOW,
+        inventory=_empty_inventory(root))
+
+    assert outcome.verdict_kind == "history_source_unconfigured"
+    assert outcome.evaluable is False
+    assert outcome.insufficient_trades_reason == ""
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+
+
+def test_validate_strategy_stops_on_unconfigured_history_source(tmp_path):
+    from agentic_fx.backtest.dataset import HistorySourceUnconfiguredError
+    conn = _conn(tmp_path)
+    built = []
+    with patch("agentic_fx.plugin.approval.strategy_adapter.build_intent_source",
+               side_effect=lambda *a, **k: built.append(1)):
+        with pytest.raises(HistorySourceUnconfiguredError,
+                           match="^history_source_unconfigured$"):
+            approval._validate_strategy(
+                conn, _unconfigured_strategy_meta(), settings=SETTINGS,
+                now=NOW, run_in_sample_fn=None, resolved=_EMPTY)
+    assert built == []

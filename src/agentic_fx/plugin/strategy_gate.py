@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentic_fx.backtest import holdout
+from agentic_fx.backtest.dataset import HISTORY_SOURCE_UNCONFIGURED_REASON
 from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin.loader import PluginMeta
@@ -58,6 +59,10 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # [indicator-consumption-wiring] §2.9(e): (scope, pair, cpu_sec|None)。
     # scope in {"in_sample", "holdout"}。
     cpu_samples: "tuple[tuple[str, str, float | None], ...]" = ()
+    # evaluable=False の理由の種別 (判別子)。呼び出し側は observation_reason の
+    # 文字列ではなくこの値で分岐する。
+    unevaluable_kind: Literal["insufficient_trades",
+                              "history_source_unconfigured"] = "insufficient_trades"
 
 
 def _floor_fail_items(
@@ -248,6 +253,12 @@ def evaluate_strategy_adoption_gate(
     無言で失われる (どちらの corridor も auto-commit に頼っていないため)。"""
     if kind != "strategy":
         return None
+    dataset = settings.backtest.dataset()
+    if dataset.unconfigured:
+        return StrategyGateVerdict(
+            evaluable=False,
+            observation_reason=HISTORY_SOURCE_UNCONFIGURED_REASON,
+            unevaluable_kind="history_source_unconfigured")
     # R-i3 追随 (プラン10 Task 11): `plugin/approval.py::run_kind_gate` は
     # 検証済みの `meta` (PluginMeta) だけを持って呼ぶ (switch.py の候補は
     # 直前に discover した鮮度の高い meta なので name/pairs/timeframe/
@@ -327,7 +338,6 @@ def evaluate_strategy_adoption_gate(
                          scope, pair, exc_info=True)
 
     cpu_samples: list[tuple[str, str, float | None]] = []
-    dataset = settings.backtest.dataset()
     per_pair = {}
     for pair in pairs:
         intent_source = strategy_adapter.build_intent_source(

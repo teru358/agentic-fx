@@ -210,7 +210,9 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
 
     呼び出し元 (CLI 等) は `run_replay` 実行後、必ず `close()` を呼ぶこと
     (try/finally — brief 明記。サンドボックスプロセスのリーク防止)。
-    `resolved` は必須 — 依存なしでも空 set を渡す。"""
+    `resolved` は必須 — 依存なしでも空 set を渡す。履歴源が未設定の dataset は
+    `HistorySourceUnconfiguredError` で拒否する。"""
+    dataset.require_configured()
     return PluginStrategyIntentSource(
         meta, conn=conn, pair=pair, dataset=dataset, settings=settings,
         resolved=resolved, session=session, decision_sink=decision_sink)

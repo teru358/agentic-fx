@@ -5,6 +5,7 @@ AC-5 / 15 / 27 (service 側) / 41 / 50 (起動順序)。実 build_app と run_se
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -19,10 +20,11 @@ import yaml
 from agentic_fx import service as service_mod
 from agentic_fx.ops import keys
 from agentic_fx.ops.api_server import ApiServer
-from agentic_fx.ops.contracts import Principal
+from agentic_fx.ops.contracts import OpsError, Principal, ShellCaller
 from agentic_fx.ops.service import OpsService
 from agentic_fx.plugin import switch
 from agentic_fx.runners.fake_runner import FakeRunner
+from agentic_fx.setup.pending_steps import PendingFacts, PendingStep
 from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import NOW, _init, _no_real_network
 
@@ -168,6 +170,7 @@ def test_ac50_failed_recovery_keeps_listener_closed_and_daemon_running(tmp_path,
 
 def test_api_disabled_by_default_warns_and_opens_nothing(tmp_path):
     _init(tmp_path)
+    _settings(tmp_path, enabled=False)
     app = _app(tmp_path)
     assert app.settings.api.enabled is False
     assert _run(tmp_path, app) == 0
@@ -175,6 +178,202 @@ def test_api_disabled_by_default_warns_and_opens_nothing(tmp_path):
     assert not _socket(tmp_path).exists()
     assert not keys.key_dir(tmp_path).exists()
     assert not app.health_latch.is_latched()
+
+
+def test_status_includes_safe_setup_schema_and_falls_back_when_collection_fails(
+        tmp_path, monkeypatch, caplog):
+    """Removing setup serialization or its fail-soft boundary breaks this contract."""
+    _init(tmp_path)
+    record_path = tmp_path / "data" / "state" / "setup.json"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    record_path.write_text('{"note":"https://secret.example/TOKEN=super-secret /tmp/private"}',
+                           encoding="utf-8")
+    app = _app(tmp_path)
+    secret = "https://secret.example/TOKEN=super-secret /tmp/private"
+    try:
+        assert secret not in json.dumps(app.ops.status(ShellCaller.SHELL), ensure_ascii=False)
+        monkeypatch.setattr(service_mod, "collect_pending_facts", lambda *_args, **_kwargs: PendingFacts(
+            record_state="ok", now=NOW,
+            extra_steps=[PendingStep("ops_incomplete", "action", NOW, {
+                "feature": secret, "stage": secret, "reason_code": secret,
+                "unexpected": secret,
+            })]))
+        payload = app.ops.status(ShellCaller.SHELL)
+        setup = payload["setup"]
+        assert setup["record_state"] == "ok"
+        assert len(setup["pending_steps"]) <= 32
+        step = next(item for item in setup["pending_steps"] if item["code"] == "ops_incomplete")
+        assert step["code"] == "ops_incomplete"
+        assert step["severity"] == "action"
+        assert step["observed_at"] == NOW.isoformat().replace("+00:00", "Z")
+        assert step["params"] == {"feature": "feature", "stage": "unknown", "reason_code": "unknown"}
+        encoded = json.dumps(payload, ensure_ascii=False)
+        assert secret not in encoded
+        assert '"api_' not in encoded
+        for principal in (Principal.OPERATOR, Principal.APPROVER,
+                          Principal.OPS_BOT, Principal.OPS_WEB):
+            assert app.ops.status(principal)["setup"] == setup
+        with pytest.raises(OpsError):
+            app.ops.status(Principal.OPS_NOTIFY)
+
+        monkeypatch.setattr(service_mod, "collect_pending_facts", lambda *_args, **_kwargs: PendingFacts(
+            record_state="ok", now=NOW,
+            extra_steps=[PendingStep("llm_unverified", "warn", NOW, {"target": "trade"})
+                         for _ in range(40)]))
+        assert len(app.ops.status(ShellCaller.SHELL)["setup"]["pending_steps"]) == 32
+
+        def unavailable(*_args, **_kwargs):
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(service_mod, "collect_pending_facts", unavailable)
+        parent = service_mod._log.parent
+        monkeypatch.setattr(parent, "propagate", True)
+        caplog.set_level("WARNING", logger=service_mod._log.name)
+        assert app.ops.status(ShellCaller.SHELL)["setup"] == {
+            "record_state": "unknown", "pending_steps": []}
+        assert "status setup facts unavailable: RuntimeError" in caplog.text
+        assert secret not in caplog.text
+        endpoint = app.ops.log(ShellCaller.SHELL)
+        assert secret not in "\n".join(endpoint["lines"])
+    finally:
+        app.close()
+
+
+def test_status_setup_collection_uses_its_readonly_connection(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    original_shell = app.conn_shell
+    seen = {}
+    try:
+        def collect(root, settings, conn, *, deployed_plugins, outage, clock, landlock_available,
+                    data_state):
+            seen["root"] = root
+            seen["settings"] = settings
+            seen["deployed_plugins"] = deployed_plugins
+            with pytest.raises(Exception):
+                conn.execute("CREATE TABLE status_must_not_write (value INTEGER)")
+            return PendingFacts(record_state="ok", now=NOW)
+
+        monkeypatch.setattr(service_mod, "collect_pending_facts", collect)
+        app.conn_shell = SimpleNamespace(execute=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("shared shell connection was used")))
+        assert app.ops.status(ShellCaller.SHELL)["setup"]["record_state"] == "ok"
+        assert seen["root"] == tmp_path
+        assert seen["settings"] is app.settings
+        assert list(seen["deployed_plugins"]) == []
+    finally:
+        app.conn_shell = original_shell
+        app.close()
+
+
+def test_status_setup_rereads_deployed_plugins_on_every_call(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    deployed = []
+    seen = []
+    (tmp_path / "plugins").mkdir(exist_ok=True)
+    try:
+        monkeypatch.setattr(
+            service_mod.plugin_loader, "approved_plugins",
+            lambda conn, plugins_dir, *, settings: SimpleNamespace(
+                inventory=SimpleNamespace(metas=tuple(deployed))))
+
+        def collect(root, settings, conn, *, deployed_plugins, **_kwargs):
+            seen.append([(m.name, m.kind) for m in deployed_plugins])
+            return PendingFacts(record_state="ok", now=NOW)
+
+        monkeypatch.setattr(service_mod, "collect_pending_facts", collect)
+        app.ops.status(ShellCaller.SHELL)
+        deployed.append(SimpleNamespace(name="late", kind="strategy"))
+        app.ops.status(ShellCaller.SHELL)
+        assert seen == [[], [("late", "strategy")]]
+    finally:
+        app.close()
+
+
+def test_landlock_probe_failure_does_not_break_status_or_add_a_step(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        def boom():
+            raise OSError("libc unavailable")
+
+        monkeypatch.setattr(service_mod.landlock, "is_available", boom)
+        setup = app.ops.status(ShellCaller.SHELL)["setup"]
+        assert setup["record_state"] != "unknown"
+        assert "landlock_unavailable" not in [s["code"] for s in setup["pending_steps"]]
+    finally:
+        app.close()
+
+
+def test_status_reads_the_outage_state_once_per_call(tmp_path):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    reads = []
+
+    class _Outage:
+        def state_from(self, conn):
+            reads.append(1)
+            return "ok"
+
+    try:
+        fn = app.ops._status_provider
+        cells = dict(zip(fn.__code__.co_freevars, fn.__closure__))
+        original = cells["outage"].cell_contents
+        cells["outage"].cell_contents = _Outage()
+        try:
+            app.ops.status(ShellCaller.SHELL)
+        finally:
+            cells["outage"].cell_contents = original
+        assert len(reads) == 1
+    finally:
+        app.close()
+
+
+def test_status_data_state_does_not_touch_the_scheduler_connection(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        expected = app.ops.status(ShellCaller.SHELL)["data"]["state"]
+        outage = app.outage
+        monkeypatch.setattr(type(outage), "state", property(
+            lambda self: (_ for _ in ()).throw(AssertionError("state used self.conn"))))
+        monkeypatch.setattr(outage, "conn", SimpleNamespace(
+            execute=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("outage.conn used"))))
+
+        class _Guard:
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, *_a, **_k):
+                raise AssertionError("conn_core used during status")
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monkeypatch.setattr(app, "conn_core", _Guard(app.conn_core))
+        assert app.ops.status(ShellCaller.SHELL)["data"]["state"] == expected
+    finally:
+        monkeypatch.undo()
+        app.close()
+
+
+def test_status_without_plugins_dir_emits_no_log_with_the_root_path(
+        tmp_path, monkeypatch, caplog):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        plugins = tmp_path / "plugins"
+        assert not plugins.exists()
+        loader_log = service_mod.plugin_loader._log
+        monkeypatch.setattr(loader_log.parent, "propagate", True)
+        monkeypatch.setattr(loader_log, "propagate", True)
+        caplog.set_level("DEBUG")
+        caplog.clear()
+        app.ops.status(ShellCaller.SHELL)
+        assert str(tmp_path) not in caplog.text
+    finally:
+        app.close()
 
 
 @pytest.mark.parametrize("value", [MagicMock(), 1, "true", "yes", None])

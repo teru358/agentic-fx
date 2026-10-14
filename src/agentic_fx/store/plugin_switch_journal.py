@@ -66,6 +66,13 @@ def list_non_terminal(conn: sqlite3.Connection) -> list[dict]:
         tuple(_TERMINAL_PHASES))]
 
 
+def list_non_terminal_ids(conn: sqlite3.Connection, limit: int) -> list[int]:
+    return [row[0] for row in conn.execute(
+        "SELECT DISTINCT approval_id FROM plugin_switch_journal WHERE phase NOT IN "
+        f"({_non_terminal_placeholders()}) ORDER BY approval_id DESC LIMIT ?",
+        (*_TERMINAL_PHASES, limit))]
+
+
 def set_temp_path(conn: sqlite3.Connection, op_id: int, temp_path: str) -> None:
     """確定した op_id から導出した temp_path で UPDATE する (Task 11 が追加)。
 

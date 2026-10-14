@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-import unicodedata
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.datafeed.outage import format_unprocessed_positions
@@ -45,12 +46,20 @@ _HELP = """コマンド一覧:
 (Phase 2 で追加: news / model / mode / autopilot)"""
 
 
-def _normalize_idea_display(text: str) -> tuple[str, int]:
-    """`improve add` の表示と警告判定用に文字列を正規化する。"""
-    step1 = text.replace("\n", " ")
-    kept = [ch for ch in step1 if not unicodedata.category(ch).startswith("C")]
-    removed = len(step1) - len(kept)
-    return "".join(kept).strip(), removed
+def append_policy_directive(policy_path: Path, activity: ActivityLog, text: str) -> None:
+    """policy/directives.md へ 1 行追記し、activity に policy_added を残す (shell と初期設定が共有)。"""
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    with policy_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n- {text}\n")
+    activity.write(Category.SYSTEM, "policy_added", text[:200])
+
+
+def add_backlog_idea(conn: sqlite3.Connection, activity: ActivityLog, text: str, now: datetime,
+                     *, via: str = "shell") -> int:
+    """バックログへ課題を足し、activity に backlog_added を残す (shell と初期設定が共有)。"""
+    bid = backlog.add(conn, idea=text, source="user", now=now)
+    activity.write(Category.IMPROVE, "backlog_added", f"#{bid} via {via}", ref_id=str(bid))
+    return bid
 
 
 
@@ -318,17 +327,13 @@ class Commands:
                 if self.ops_service is not None:
                     bid = self.ops_service.add_backlog(
                         ShellCaller.SHELL, uuid.uuid4().hex, text)["id"]
+                    self.activity.write(Category.IMPROVE, "backlog_added",
+                                        f"#{bid} via shell", ref_id=str(bid))
                 else:
-                    bid = backlog.add(self.conn, idea=text, source="user",
-                                      now=self.clock.now())
-                self.activity.write(Category.IMPROVE, "backlog_added",
-                                    f"#{bid} via shell", ref_id=str(bid))
-                display, removed = _normalize_idea_display(text)
+                    bid = add_backlog_idea(self.conn, self.activity, text, self.clock.now())
+                display, removed = normalize_idea_display(text)
                 reply = f"backlog #{bid} を追加しました: 「{display}」"
-                is_placeholder = ((display.startswith("<") and display.endswith(">"))
-                                  or (display.startswith("[") and display.endswith("]")))
-                is_too_short = len(display) < 4
-                if is_placeholder or is_too_short:
+                if idea_looks_unintended(display):
                     reply += ("\n⚠ 短い/プレースホルダのように見えます。意図した内容で"
                              "あることを確認してください (削除・訂正は "
                              f"`backlog reject {bid}` の上で `improve add` を"
@@ -411,11 +416,7 @@ class Commands:
                     return "policy に追記しました"
                 if self._policy_path is None:
                     return "policy directives の path が未配線です"
-                self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-                with self._policy_path.open("a", encoding="utf-8") as f:
-                    f.write(f"\n- {text}\n")
-                self.activity.write(Category.SYSTEM, "policy_added",
-                                    text[:200])
+                append_policy_directive(self._policy_path, self.activity, text)
                 return "policy に追記しました"
         except ApprovalNotFoundError:
             # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と

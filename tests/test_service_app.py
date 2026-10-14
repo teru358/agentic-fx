@@ -548,6 +548,156 @@ def test_splash_contains_key_fields(tmp_path):
     assert "qwen" in splash  # runner モデル名
 
 
+def test_splash_shows_only_missing_setup_record_for_existing_installation(tmp_path):
+    _init(tmp_path)
+    (tmp_path / "data" / "state" / "setup.json").unlink()
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert "初期設定の確認記録がありません" in splash
+    finally:
+        app.close()
+
+
+def test_splash_hides_collection_exception_details(tmp_path, monkeypatch, caplog):
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    secret = "https://secret.example/TOKEN=super-secret /tmp/private"
+    try:
+        monkeypatch.setattr("agentic_fx.service.collect_pending_facts",
+                            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)))
+        import agentic_fx.service as service_mod
+        monkeypatch.setattr(service_mod._log.parent, "propagate", True)
+        caplog.set_level("WARNING", logger=service_mod._log.name)
+        assert "未完の手順を算出できません" in build_splash(app)
+        assert "startup splash pending steps unavailable: RuntimeError" in caplog.text
+        assert secret not in caplog.text
+        assert secret not in (tmp_path / "logs" / "agentic.log").read_text(encoding="utf-8")
+    finally:
+        app.close()
+
+
+def _ok_setup_data(**updates):
+    data = {
+        "version": 1, "completed_at": "2026-10-12T00:00:00Z", "mode": "interactive",
+        "settings_schema_version": 1,
+        "price": {"result": "ok", "at": "2026-10-12T00:00:00Z", "reason_code": "ok"},
+        "llm_trade": {"result": "ok", "at": "2026-10-12T00:00:00Z", "reason_code": "ok"},
+        "llm_improve": {"result": "ok", "at": "2026-10-12T00:00:00Z", "reason_code": "ok"},
+        "bridge_plan": "connected", "history": {"source": "mt5"},
+        "indicators": {"installed": 9}, "unit": "installed",
+        "api": {"enabled": True, "result": "ok"}, "ops": {},
+        "isolation": {"admitted": "yes"}, "linger": {"state": "already_enabled"},
+        "start": {"result": "started"},
+    }
+    data.update(updates)
+    return data
+
+
+@contextmanager
+def _satisfied_app(tmp_path, monkeypatch, *, record=None, env=True, history=True, degraded=False,
+                   landlock=True):
+    """Every setup condition satisfied unless one is turned off by an argument."""
+    from agentic_fx.store.setup_record import SetupRecord, write_setup_record
+
+    _init(tmp_path)
+    if env:
+        monkeypatch.setenv("TWELVEDATA_API_KEY", "value")
+    else:
+        monkeypatch.delenv("TWELVEDATA_API_KEY", raising=False)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        app.settings.datafeed.primary = "twelvedata"
+        app.settings.backtest.eval_source = "mt5"
+        app.approved_plugins = [
+            SimpleNamespace(name=f"i{number}", kind="indicator") for number in range(9)
+        ] + [SimpleNamespace(name="strategy", kind="strategy")]
+        if history:
+            app.conn_shell.execute(
+                "INSERT INTO ohlcv_history (symbol, interval, bar_time, open, high, low, close, source) "
+                "VALUES ('USDJPY', ?, '2026-10-12T00:00:00+00:00', 1, 1, 1, 1, 'mt5')",
+                (app.settings.backtest.base_interval,))
+            app.conn_shell.commit()
+        write_setup_record(tmp_path, SetupRecord(record if record is not None else _ok_setup_data()))
+        monkeypatch.setattr(type(app.outage), "state",
+                            property(lambda _self: "degraded" if degraded else "ready"))
+        monkeypatch.setattr("agentic_fx.core.landlock.is_available", lambda: landlock)
+        yield app
+    finally:
+        app.close()
+
+
+def test_splash_has_no_setup_section_when_every_condition_is_satisfied(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        assert "未完の手順" not in build_splash(app)
+
+
+def test_splash_reports_missing_env_key(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch, env=False) as app:
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert ".env に TWELVEDATA_API_KEY がありません" in splash
+
+
+def test_splash_reports_zero_history(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch, history=False) as app:
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert "履歴がありません (USDJPY)" in splash
+
+
+def test_splash_reports_degraded_price_data(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch, degraded=True) as app:
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert "MT5 bridge はまだつながっていません" in splash
+
+
+def test_splash_reports_missing_landlock(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch, landlock=False) as app:
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert "この環境では改善ループ" in splash
+
+
+def test_splash_reports_stalled_approval_from_the_journal(tmp_path, monkeypatch):
+    from agentic_fx.store import plugin_switch_journal
+
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        done = plugin_switch_journal.insert(
+            app.conn_shell, kind="approve", approval_id=3, name="done", old_kind="absent",
+            old_target=None, temp_path="t0", new_target="n0", switch_required=True,
+            actor="test", now=NOW)
+        plugin_switch_journal.set_phase(app.conn_shell, done, "decided", now=NOW)
+        plugin_switch_journal.insert(
+            app.conn_shell, kind="approve", approval_id=7, name="stuck", old_kind="absent",
+            old_target=None, temp_path="t1", new_target="n1", switch_required=True,
+            actor="test", now=NOW)
+        splash = build_splash(app)
+        assert "未完の手順 (1 件)" in splash
+        assert "承認 #7 が途中で止まっています" in splash
+        assert "#3" not in splash
+
+
+def test_splash_with_corrupt_record_keeps_reporting_live_facts(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch, env=False) as app:
+        (tmp_path / "data" / "state" / "setup.json").write_text("{not json", encoding="utf-8")
+        splash = build_splash(app)
+        assert "未完の手順 (2 件)" in splash
+        assert "確認記録が読めません" in splash
+        assert ".env に TWELVEDATA_API_KEY がありません" in splash
+
+
+def test_splash_does_not_report_start_pending_while_the_service_is_running(tmp_path, monkeypatch):
+    pending = _ok_setup_data(start={"result": "pending", "at": "2026-10-12T00:00:00Z"})
+    with _satisfied_app(tmp_path, monkeypatch, record=pending) as app:
+        splash = build_splash(app)
+        assert "start_pending" not in splash
+        assert "サービスはまだ起動していません" not in splash
+        assert "未完の手順" not in splash
+
+
 def test_unfinished_reset_marker_is_shown_at_startup_and_in_splash(tmp_path):
     _init(tmp_path)
     marker = tmp_path / "data" / "state" / "app_state.json.reset-in-progress"
@@ -4097,28 +4247,60 @@ def _find_vendor_codex_bin() -> str | None:
     return str(candidates[0]) if candidates else None
 
 
-def test_build_app_rejects_when_runner_bin_not_resolvable(tmp_path, monkeypatch):
-    """①: `runner.improve.backend=claude` で `claude` が PATH 上に無く、
-    かつ絶対パスでもなければ起動拒否 (fail closed)。"""
+def _clean_initial_env(monkeypatch):
+    """検査⑤が実行環境自身の env に左右されないよう、初期 env を空にする。"""
+    import agentic_fx.service as service_mod
+
+    real = service_mod._check_service_initial_env_has_no_secrets
+    monkeypatch.setattr(
+        service_mod, "_check_service_initial_env_has_no_secrets",
+        lambda settings, **kw: real(settings, read_initial_env_names=lambda: {"HOME"}, **kw))
+
+
+def test_build_app_starts_when_improve_claude_bin_not_resolvable(tmp_path, monkeypatch):
+    """①: `claude` が PATH 上に無く絶対パスでもないのは warning (bin_not_found)。
+    起動は拒否せず、bin は未解決のまま (mission は実行時に fail closed で止まる)。"""
+    _clean_initial_env(monkeypatch)
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "claude", "model": "m"},
         "claude": {"bin": "afx-nonexistent-claude-binary"}})
     monkeypatch.setenv("PATH", "/nonexistent")
-    with pytest.raises(RuntimeError, match="claude"):
-        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    try:
+        assert app.settings.runner.claude.bin == "afx-nonexistent-claude-binary"
+    finally:
+        app.close()
 
 
-def test_build_app_rejects_when_trade_claude_bin_not_resolvable(tmp_path, monkeypatch):
+def test_build_app_checks_trade_claude_bin_too(tmp_path, monkeypatch):
     """Minor 14 の再発防止: `runner.trade.backend=claude` 構成でも
-    `_check_cli_backend` が呼ばれる (旧実装は improve しか見ておらず、
-    trade+claude は起動時検査が一切走らないまま Mission 実行時に落ちて
-    いた)。"""
+    `_check_cli_backend` が呼ばれる。bin が解決できないのは warning で、
+    呼ばれたことは WARNING ログで観測する。"""
+    import logging
+
+    _clean_initial_env(monkeypatch)
     root = _root_with_settings(tmp_path, runner={
         "trade": {"backend": "claude", "model": "m"},
         "claude": {"bin": "afx-nonexistent-claude-binary"}})
     monkeypatch.setenv("PATH", "/nonexistent")
-    with pytest.raises(RuntimeError, match="claude"):
-        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    logger = logging.getLogger("agentic_fx.service")
+    logger.addHandler(handler)
+    try:
+        app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    finally:
+        logger.removeHandler(handler)
+    try:
+        assert any("trade+claude" in r.getMessage() and "bin_not_found" in r.getMessage()
+                   for r in records)
+    finally:
+        app.close()
 
 
 def test_build_app_rejects_codex_node_wrapper(tmp_path):
@@ -4133,52 +4315,65 @@ def test_build_app_rejects_codex_node_wrapper(tmp_path):
         build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
 
 
-def test_build_app_rejects_when_version_check_fails(tmp_path):
-    """②: `<bin> --version` が非 0 で返れば起動拒否。ELF 要求 (①) と
-    独立に検証するため backend=claude (`require_elf=False`) を使う —
-    codex はバイナリが ELF でなければ①で先に拒否されるため②単体を
-    観測できない。"""
+def test_build_app_starts_when_version_check_fails(tmp_path, monkeypatch):
+    """②: `<bin> --version` が非 0 で返るのは warning (version_check_failed)。
+    起動は拒否しない。ELF 要求 (①) と独立に検証するため backend=claude
+    (`require_elf=False`) を使う — codex はバイナリが ELF でなければ①で先に
+    拒否されるため②単体を観測できない。"""
+    import logging
+    _clean_initial_env(monkeypatch)
     fake_bin = tmp_path / "fake-claude"
     fake_bin.write_text("#!/bin/sh\nexit 1\n")
     fake_bin.chmod(0o755)
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "claude", "model": "m"},
         "claude": {"bin": str(fake_bin)}})
-    with pytest.raises(RuntimeError, match="--version"):
-        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    logger = logging.getLogger("agentic_fx.service")
+    logger.addHandler(handler)
+    try:
+        app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    finally:
+        logger.removeHandler(handler)
+    try:
+        assert any("version_check_failed" in r.getMessage() for r in records)
+    finally:
+        app.close()
 
 
-def test_build_app_rejects_when_credentials_file_missing(tmp_path):
-    """③: claude/codex+chatgpt は認証ファイル必須 (codex+llama_swap は要求しない)。
-    codex+chatgpt を使うには①②を通す必要があるため vendor native codex を
-    使う (無ければ skip — 裁定 R5)。"""
+def test_build_app_starts_when_credentials_file_missing(tmp_path, monkeypatch):
+    """③: claude/codex+chatgpt の認証ファイル欠落は warning (credentials_missing)。
+    起動は拒否しない。codex+chatgpt を使うには①②を通す必要があるため vendor
+    native codex を使う (無ければ skip — 裁定 R5)。"""
     vendor_codex = _find_vendor_codex_bin()
     if vendor_codex is None:
         pytest.skip("vendor native codex バイナリが見つからない (裁定 R5)")
+    _clean_initial_env(monkeypatch)
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "codex", "model": "m"},
         "codex": {"bin": vendor_codex, "provider": "chatgpt",
                   "auth_file": str(tmp_path / "no-such-file.json")}})
-    with pytest.raises(RuntimeError, match="credentials|auth"):
-        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    app.close()
 
 
-def test_build_app_rejects_when_claude_credentials_file_missing(tmp_path):
-    """L-F18 是正 (verified-local-round1.md §1【3】): ③ の claude 脚。
-    既存 `test_build_app_rejects_when_credentials_file_missing` は
-    codex+chatgpt 構成のみを踏んでおり (docstring 自身が「codex+chatgpt
-    を使うには①②を通す必要があるため vendor native codex を使う」と
-    明言)、claude 側の `credentials_file` 欠落検査は既定スイートで
-    一度も踏まれていなかった。`sys.executable` は `--version` を受け付ける
-    ので①②を通す (`test_build_app_rejects_when_service_initial_env_has_secret_pattern`
-    と同じ手)。"""
+def test_build_app_starts_when_claude_credentials_file_missing(tmp_path, monkeypatch):
+    """③ の claude 脚。認証ファイル欠落は warning (credentials_missing) で、
+    起動は拒否しない。`sys.executable` は `--version` を受け付けるので①②を通す。"""
     import sys
+    _clean_initial_env(monkeypatch)
     root = _root_with_settings(tmp_path, runner={
         "improve": {"backend": "claude", "model": "m"},
         "claude": {"bin": sys.executable,
                   "credentials_file": str(tmp_path / "no-such-creds.json")}})
-    with pytest.raises(RuntimeError, match="credentials"):
-        build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    app = build_app(root, clock=FixedClock(NOW), embedding_fn=FakeEmbedding())
+    app.close()
 
 
 def test_build_app_opencode_does_not_require_credentials(
@@ -5552,3 +5747,136 @@ def test_sandbox_diagnostics_run_off_the_main_startup_thread(tmp_path, monkeypat
     assert _run_once(tmp_path) == 0
     assert seen.get("ident") is not None
     assert seen["ident"] != main_ident
+
+
+def test_check_llama_swap_output_is_byte_identical_for_each_branch(capsys):
+    with patch("httpx.get", side_effect=httpx.ConnectError("refused")), \
+         _forbidden_post("list failure"):
+        _check_llama_swap(_StubSettings())
+    assert capsys.readouterr().out == (
+        "警告: llama-swap のモデル一覧を取得できません (refused)。"
+        "取引判断 Mission は失敗として記録されます。\n")
+
+    client = _mock_client(lambda request: httpx.Response(200, json={"data": [{"id": "other-model"}]}))
+    with patch("httpx.get", client.get), _forbidden_post("model_missing"):
+        _check_llama_swap(_StubSettings())
+    assert capsys.readouterr().out == (
+        "警告: モデル 'qwen3.6-35b' が llama-swap の /models に存在しません。"
+        "alias 設定を確認してください (存在: ['other-model'])\n")
+
+
+def test_service_uses_the_real_catalogue_check_when_no_test_replaces_it():
+    import agentic_fx.service as service_mod
+    from agentic_fx.setup import checks
+
+    assert service_mod.check_llama_swap is checks.check_llama_swap
+    assert service_mod.check_cli_backend is checks.check_cli_backend
+
+
+def test_check_llama_swap_unexpected_payload_error_propagates():
+    client = _mock_client(lambda request: httpx.Response(200, json=[1, 2]))
+    with patch("httpx.get", client.get), _forbidden_post("payload"), \
+         pytest.raises(AttributeError):
+        _check_llama_swap(_StubSettings())
+
+
+def test_check_llama_swap_smoke_failure_output_is_byte_identical(capsys):
+    from agentic_fx.service import _check_llama_swap as check
+
+    client = _mock_client(lambda request: httpx.Response(
+        200, json={"data": [{"id": "qwen3.6-35b"}]}))
+    with patch("httpx.get", client.get), \
+         patch("httpx.post", side_effect=httpx.ReadTimeout("slow")):
+        check(_StubSettings())
+    assert capsys.readouterr().out == (
+        "警告: モデル 'qwen3.6-35b' の cold-load smoke に失敗しました (slow)。"
+        "初回 Mission が timeout する可能性があります。\n")
+
+
+def test_resolve_cli_bin_messages_and_order_are_byte_identical(tmp_path, monkeypatch):
+    from agentic_fx.service import _resolve_cli_bin
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    with pytest.raises(RuntimeError) as missing:
+        _resolve_cli_bin("afx-no-such-cli", require_elf=True)
+    assert str(missing.value) == (
+        "runner CLI bin 'afx-no-such-cli' not found on PATH nor an absolute path")
+
+    plain = tmp_path / "plain"
+    plain.write_text("#!/bin/sh\n")
+    plain.chmod(0o644)
+    with pytest.raises(RuntimeError) as not_exec:
+        _resolve_cli_bin(str(plain), require_elf=True)
+    assert str(not_exec.value) == f"runner CLI bin {plain.resolve()} is not an executable file"
+
+    script = tmp_path / "script"
+    script.write_text("#!/bin/sh\n")
+    script.chmod(0o755)
+    with pytest.raises(RuntimeError) as not_elf:
+        _resolve_cli_bin(str(script), require_elf=True)
+    assert str(not_elf.value) == (
+        f"runner.codex.bin {script.resolve()} is not an ELF binary (vendor "
+        "native required — node wrappers like 'codex.js' are "
+        "rejected; find the vendor bin under "
+        "'@openai/codex-linux-x64/vendor/.../bin/codex')")
+    assert _resolve_cli_bin(str(script), require_elf=False) == script.resolve()
+
+
+def test_splash_counts_environment_keys_and_treats_empty_values_as_absent(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        assert "未完の手順" not in build_splash(app)
+        monkeypatch.setenv("TWELVEDATA_API_KEY", "")
+        assert ".env に TWELVEDATA_API_KEY がありません" in build_splash(app)
+
+
+def test_splash_survives_unreadable_inputs_with_one_fixed_line(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        (tmp_path / ".env").write_bytes(b"\xff\xfe\x80")
+        monkeypatch.setattr("agentic_fx.service.collect_pending_facts",
+                            lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom secret")))
+        splash = build_splash(app)
+        assert "未完の手順を算出できません (afx check を実行してください)" in splash
+        assert "boom" not in splash and "secret" not in splash
+
+
+def test_splash_ignores_in_flight_switch_that_has_reached_a_terminal_phase(tmp_path, monkeypatch):
+    from agentic_fx.store import plugin_switch_journal
+
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        reverted = plugin_switch_journal.insert(
+            app.conn_shell, kind="approve", approval_id=5, name="r", old_kind="absent",
+            old_target=None, temp_path="t5", new_target="n5", switch_required=True,
+            actor="test", now=NOW)
+        plugin_switch_journal.set_phase(app.conn_shell, reverted, "reverted", now=NOW)
+        assert "#5" not in build_splash(app)
+
+
+def test_splash_reads_record_through_a_symlinked_data_directory(tmp_path):
+    from agentic_fx.store.setup_record import SetupRecord, write_setup_record
+
+    root = tmp_path / "root"
+    root.mkdir()
+    _init(root)
+    real_data = tmp_path / "elsewhere" / "deep" / "data"
+    real_data.parent.mkdir(parents=True)
+    (root / "data").rename(real_data)
+    (root / "data").symlink_to(real_data, target_is_directory=True)
+    app = build_app(root, runner=FakeRunner([]), clock=FixedClock(NOW))
+    try:
+        write_setup_record(root, SetupRecord(_ok_setup_data()))
+        splash = build_splash(app)
+        assert "確認記録がありません" not in splash
+        assert "確認記録が読めません" not in splash
+    finally:
+        app.close()
+
+
+def test_splash_without_history_source_reports_only_the_unconfigured_source(tmp_path, monkeypatch):
+    with _satisfied_app(tmp_path, monkeypatch) as app:
+        app.settings.backtest.eval_source = "none"
+        splash = build_splash(app)
+        assert "履歴源が設定されていません" in splash
+        assert "戦略の採用審査に使う履歴がありません" not in splash
+        assert "未完の手順 (1 件)" in splash

@@ -142,7 +142,8 @@ def build(conn: sqlite3.Connection, settings: Settings,
                 # pair を渡さないと多 pair strategy で他 pair の成績が
                 # 誤帰属される (latest_in_sample_metrics 側の docstring 参照)。
                 item["in_sample_metrics"] = (
-                    backtest_runs.latest_in_sample_metrics(
+                    None if dataset.unconfigured
+                    else backtest_runs.latest_in_sample_metrics(
                         conn, row["content_hash"], pair=row["pair"],
                         variant="candidate", source=dataset.source,
                         base_interval=dataset.base_interval))

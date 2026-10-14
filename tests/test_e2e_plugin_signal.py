@@ -71,6 +71,8 @@ def _install_settings(root: Path) -> None:
     (root / "config").mkdir()
     src = (_REPO_ROOT / "config" / "settings.yaml.example").read_text(
         encoding="utf-8")
+    assert 'eval_source: "none"' in src
+    src = src.replace('eval_source: "none"', 'eval_source: "dukascopy"', 1)
     (root / "config" / "settings.yaml.example").write_text(src)
     with patch("agentic_fx.service.PriceProvider") as pp, \
          patch("agentic_fx.service._check_llama_swap"):

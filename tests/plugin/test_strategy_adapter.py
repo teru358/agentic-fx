@@ -914,3 +914,14 @@ def test_close_that_raises_still_keeps_diagnostics_and_drops_the_session(
     assert (src.cpu_sec, src.worker_returncode, src.worker_signal) == (1.25, -9, 9)
     src.close()  # session 参照は消えている: 2 度目は何もしない
     assert closes == [1]
+
+
+def test_build_intent_source_rejects_unconfigured_history_source(tmp_path):
+    from agentic_fx.backtest.dataset import (
+        HistoryDataset, HistorySourceUnconfiguredError)
+    conn = _conn(tmp_path)
+    with pytest.raises(HistorySourceUnconfiguredError):
+        strategy_adapter.build_intent_source(
+            _meta(timeframe="1h"), conn=conn, pair="USDJPY",
+            dataset=HistoryDataset("none", "1m"), settings=SETTINGS,
+            resolved=ResolvedIndicatorSet.empty(tmp_path))

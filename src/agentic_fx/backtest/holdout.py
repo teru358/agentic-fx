@@ -173,6 +173,7 @@ def run_in_sample(settings: Settings, *, history_conn: sqlite3.Connection,
     含めない (§6 遮断 1)。months は ``settings.backtest.holdout_months``
     経由のみ (呼び出し側が境界を動かせる自由度を作らない)。
     """
+    dataset.require_configured()
     now_norm = _normalize_now(now, dataset.base_interval)
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     start = _oldest_bar_start(history_conn, symbol, dataset.source, dataset.base_interval)
@@ -209,6 +210,7 @@ def run_holdout_gate(settings: Settings, *, history_conn: sqlite3.Connection,
     API 形状までで、到達不能性の構造的成立はプラン 8/9 が担う
     (レビュー裁定 codex C1)。
     """
+    dataset.require_configured()
     now_norm = _normalize_now(now, dataset.base_interval)
     boundary = in_sample_until(now_norm, settings.backtest.holdout_months)
     return _run_scope(

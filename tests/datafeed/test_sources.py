@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from agentic_fx.datafeed.sources import (
-    INTERVAL_MIN, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_quote,
+    INTERVAL_MIN, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
     td_bars, td_quote, vendor_symbol, yf_bars, yf_quote,
 )
 
@@ -106,6 +106,15 @@ def test_mt5_quote_parses_bridge_response():
         q = mt5_quote("http://localhost:8812", "USDJPY")
     assert "quote" in g.call_args[0][0]
     assert q.bid == 148.49 and q.source == "mt5"
+
+
+def test_mt5_health_reads_connected_flag_only():
+    resp = MagicMock()
+    resp.json.return_value = {"mt5_connected": True, "detail": "private"}
+    resp.raise_for_status = MagicMock()
+    with patch("httpx.get", return_value=resp) as get:
+        assert mt5_health("http://localhost:8812") is True
+    assert get.call_args[0][0] == "http://localhost:8812/health"
 
 
 # --- 修正ラウンド 1: 指摘 3 (Critical の前提) ---

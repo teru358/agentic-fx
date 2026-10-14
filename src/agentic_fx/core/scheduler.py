@@ -5,6 +5,7 @@ import logging
 import re
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Callable
@@ -1406,8 +1407,8 @@ class Scheduler:
 
 _WEEKDAY_NAMES = {"Mon": 0, "Tue": 1, "Wed": 2, "Thu": 3, "Fri": 4,
                   "Sat": 5, "Sun": 6}
-_DAILY_AT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
-_WEEKLY_AT_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+DAILY_AT_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+WEEKLY_AT_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
                             r"([01]\d|2[0-3]):([0-5]\d)$")
 
 
@@ -1440,7 +1441,7 @@ def latest_scheduled_occurrence(
     tz = ZoneInfo(display_timezone)
     now_local = now.astimezone(tz)
     if cadence == "daily":
-        m = _DAILY_AT_RE.fullmatch(at)
+        m = DAILY_AT_RE.fullmatch(at)
         if not m:
             raise ValueError(f"invalid 'at' format for daily cadence: {at!r}")
         hh, mm = int(m.group(1)), int(m.group(2))
@@ -1450,7 +1451,7 @@ def latest_scheduled_occurrence(
             candidate = candidate - timedelta(days=1)
         return candidate
     if cadence == "weekly":
-        m = _WEEKLY_AT_RE.fullmatch(at)
+        m = WEEKLY_AT_RE.fullmatch(at)
         if not m:
             raise ValueError(f"invalid 'at' format for weekly cadence: {at!r}")
         weekday = _WEEKDAY_NAMES[m.group(1)]
@@ -1472,6 +1473,25 @@ def period_key_of(occurrence: datetime, *, cadence: str) -> str:
         iso = occurrence.isocalendar()
         return f"{iso.year}-W{iso.week:02d}"
     raise ValueError(f"unknown cadence: {cadence!r}")
+
+
+@dataclass(frozen=True)
+class ScheduledPeriod:
+    """改善の予定期。`occurrence` は表示 TZ の aware datetime。"""
+    occurrence: datetime
+    period_key: str
+
+
+def scheduled_period(settings: Settings, now: datetime) -> ScheduledPeriod:
+    """`now` 時点で最新の改善予定時刻とその期キーを 1 箇所で導く。
+    supervisor の起動判定と初期設定の消費印は必ずこれを通す。"""
+    s = settings.schedule
+    occurrence = latest_scheduled_occurrence(
+        now, cadence=s.improve, at=s.improve_at,
+        display_timezone=settings.display_timezone)
+    return ScheduledPeriod(
+        occurrence=occurrence,
+        period_key=period_key_of(occurrence, cadence=s.improve))
 
 
 def _fmt_bar(bar_time: datetime) -> str:

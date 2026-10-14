@@ -27,7 +27,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from agentic_fx.backtest.holdout import in_sample_until as _in_sample_until
-from agentic_fx.backtest.dataset import HistoryDataset
+from agentic_fx.backtest.dataset import (
+    HISTORY_SOURCE_UNCONFIGURED_REASON, HistoryDataset)
 from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.config import Settings
 from agentic_fx.core.market_hours import is_market_open
@@ -497,6 +498,8 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
     # から 1 回だけ確定し、_load_returns へ渡す (leaf の source 分解は
     # _corr_matrix_impl 等が dataset.source として行う)。
     dataset = settings.backtest.dataset()
+    if dataset.unconfigured:
+        return {"error": HISTORY_SOURCE_UNCONFIGURED_REASON}
     # F1 (最終レビュー opus I-1 是正) / C1 (codex 段階2/3 是正 1周目):
     # 境界算術は holdout.in_sample_until が単一所有する (UTC 正規化 + 分
     # 格子切り捨てを含む) — ここで holdout_boundary を直接呼ばない

@@ -440,3 +440,23 @@ def test_run_in_sample_without_record_fn_keeps_existing_behavior(
     count = hist.execute(
         "SELECT COUNT(*) c FROM backtest_runs").fetchone()["c"]
     assert count == 1
+
+
+@pytest.mark.parametrize("runner_name", ["run_in_sample", "run_holdout_gate"])
+def test_replay_entry_points_stop_on_unconfigured_history_source(
+        tmp_path, monkeypatch, runner_name):
+    from agentic_fx.backtest.dataset import (
+        HistoryDataset, HistorySourceUnconfiguredError)
+    hist = _conn(tmp_path)
+    calls = []
+    monkeypatch.setattr(holdout, "run_replay", _make_fake_replay(calls))
+
+    with pytest.raises(HistorySourceUnconfiguredError,
+                       match="^history_source_unconfigured$"):
+        getattr(holdout, runner_name)(
+            SETTINGS, history_conn=hist, symbol="USDJPY",
+            dataset=HistoryDataset("none", "1m"), intent_source=lambda b: None,
+            eval_timeframe="1h", plugin_ref="p", content_hash="h",
+            kind="strategy", now=WED + timedelta(days=120))
+
+    assert calls == []

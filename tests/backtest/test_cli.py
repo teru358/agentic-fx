@@ -83,6 +83,35 @@ def test_cli_history_import_calls_importer(tmp_path, monkeypatch):
     assert args[2].tzinfo is timezone.utc
 
 
+def test_cli_history_import_without_source_rejects_unconfigured_history(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch("agentic_fx.backtest.cli.import_dukascopy") as duka, \
+         patch("agentic_fx.backtest.cli.import_mt5") as mt5:
+        rc = main(["history", "import", "--symbol", "USDJPY",
+                   "--from", "2026-07-01", "--to", "2026-07-02"])
+
+    assert rc == 1
+    assert capsys.readouterr().err == (
+        "履歴源が設定されていません。--source を指定するか "
+        "settings.yaml の backtest.eval_source を設定してください\n")
+    duka.assert_not_called()
+    mt5.assert_not_called()
+
+
+def test_cli_history_import_does_not_offer_none_as_source(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["history", "import", "--source", "none", "--symbol", "USDJPY",
+              "--from", "2026-07-01", "--to", "2026-07-02"])
+
+    assert exc_info.value.code == 2
+
+
 def test_cli_history_import_mt5_dispatches_to_import_mt5(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)

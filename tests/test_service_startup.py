@@ -17,6 +17,7 @@ from agentic_fx.service import build_app, run_init, run_service
 from agentic_fx.store.enroll_marker import (
     EXIT_ENROLL_IN_PROGRESS, EnrollInProgress, enroll_marker_path,
 )
+from agentic_fx.store.setup_marker import EXIT_SETUP_IN_PROGRESS, setup_marker_path
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -49,6 +50,13 @@ def _place_marker(root: Path) -> Path:
     return path
 
 
+def _place_setup_marker(root: Path) -> Path:
+    path = setup_marker_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"broken content is still a marker")
+    return path
+
+
 def _sealed_key_dir(root: Path, home: Path, monkeypatch) -> Path:
     # 鍵 dir を誰も読めない権限にする。起動経路が manifest に触れれば例外になる。
     monkeypatch.setenv("HOME", str(home))
@@ -62,6 +70,7 @@ def test_exit_code_is_distinct_from_existing_service_codes():
     # 既存の終了コードは 0 / 1 / 2 (未初期化)。systemd の RestartPreventExitStatus で区別できる値にする。
     assert EXIT_ENROLL_IN_PROGRESS == 75
     assert EXIT_ENROLL_IN_PROGRESS not in {0, 1, 2}
+    assert EXIT_SETUP_IN_PROGRESS == 76
 
 
 def test_marker_path_sits_next_to_ops_stage_files(tmp_path):
@@ -80,6 +89,16 @@ def test_build_app_with_marker_refuses_before_touching_lock_or_keys(tmp_path, mo
         lock.assert_not_called()
     finally:
         directory.chmod(0o700)
+
+
+def test_build_app_with_setup_marker_refuses_before_touching_lock_or_keys(tmp_path, monkeypatch):
+    root = tmp_path / "instance"
+    _place_setup_marker(root)
+    with patch("agentic_fx.service.acquire_instance_lock") as lock:
+        from agentic_fx.store.setup_marker import SetupInProgress
+        with pytest.raises(SetupInProgress):
+            build_app(root)
+    lock.assert_not_called()
 
 
 def test_build_app_with_marker_and_held_flock_refuses_as_enroll_in_progress(tmp_path, monkeypatch):
@@ -135,6 +154,24 @@ def test_marker_placed_right_after_lock_is_acquired_releases_lock_and_refuses(tm
     acquire_instance_lock(root / "data").close()
 
 
+def test_setup_marker_placed_right_after_lock_releases_lock_and_refuses(tmp_path, monkeypatch):
+    root = tmp_path / "instance"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    import agentic_fx.service as service_module
+    real = service_module.acquire_instance_lock
+
+    def lock_then_place(data_dir):
+        handle = real(data_dir)
+        _place_setup_marker(root)
+        return handle
+
+    from agentic_fx.store.setup_marker import SetupInProgress
+    with patch("agentic_fx.service.acquire_instance_lock", side_effect=lock_then_place):
+        with pytest.raises(SetupInProgress):
+            service_module._acquire_lock_unless_enrolling(root)
+    acquire_instance_lock(root / "data").close()
+
+
 def test_without_marker_held_flock_keeps_the_existing_failure(tmp_path, monkeypatch):
     root = tmp_path / "instance"
     _init(root)
@@ -162,6 +199,44 @@ def test_run_service_with_marker_returns_75_and_writes_one_reason_line(tmp_path,
         directory.chmod(0o700)
     err = capsys.readouterr().err
     assert err.splitlines() == ["afx: enroll_in_progress"]
+
+
+@pytest.mark.parametrize("settings", [b"", b"not: [valid", b"schema_version: old\n"])
+def test_setup_marker_stops_before_initialization_env_or_settings(tmp_path, monkeypatch, capsys, settings):
+    root = tmp_path / "instance"
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "settings.yaml").write_bytes(settings)
+    _place_setup_marker(root)
+    calls: list[str] = []
+    monkeypatch.setattr("agentic_fx.service.ensure_initialized", lambda _root: calls.append("init"))
+    monkeypatch.setattr("agentic_fx.service.load_env_file", lambda _path: calls.append("env"))
+    monkeypatch.setattr("agentic_fx.service.load_settings", lambda _path: calls.append("settings"))
+
+    assert run_service(root, daemon=True) == EXIT_SETUP_IN_PROGRESS
+    assert calls == []
+    assert capsys.readouterr().err.splitlines() == ["afx: setup_in_progress"]
+
+
+def test_setup_marker_metadata_permission_error_stops_before_initialization_env_or_settings(
+        tmp_path, monkeypatch, capsys):
+    import agentic_fx.store.setup_marker as setup_marker
+
+    calls: list[str] = []
+    monkeypatch.setattr(setup_marker.os, "lstat", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr("agentic_fx.service.ensure_initialized", lambda _root: calls.append("init"))
+    monkeypatch.setattr("agentic_fx.service.load_env_file", lambda _path: calls.append("env"))
+    monkeypatch.setattr("agentic_fx.service.load_settings", lambda _path: calls.append("settings"))
+
+    assert run_service(tmp_path, daemon=True) == EXIT_SETUP_IN_PROGRESS
+    assert calls == []
+    assert capsys.readouterr().err.splitlines() == ["afx: setup_in_progress"]
+
+
+def test_enroll_marker_precedes_setup_marker(tmp_path, capsys):
+    _place_marker(tmp_path)
+    _place_setup_marker(tmp_path)
+    assert run_service(tmp_path, daemon=True) == EXIT_ENROLL_IN_PROGRESS
+    assert capsys.readouterr().err.splitlines() == ["afx: enroll_in_progress"]
 
 
 def test_real_afx_process_with_marker_exits_75_with_one_stderr_line(tmp_path):

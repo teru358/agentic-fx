@@ -1013,3 +1013,16 @@ def test_analyze_for_agent_returns_boundary_floored_to_5m_dataset_grid(tmp_path)
         persist=False)
 
     assert result["params"]["in_sample_until"] == "2026-05-01T00:00:00+00:00"
+
+
+def test_analyze_for_agent_unconfigured_history_source_returns_fixed_error(
+        tmp_path):
+    conn = _conn(tmp_path)
+    settings = _settings_watch_eurusd().model_copy(update={
+        "backtest": SETTINGS.backtest.model_copy(update={"eval_source": "none"})})
+
+    out = analyze_for_agent(
+        conn, settings, {"kind": "corr_matrix", "timeframe": "1h"}, now=NOW)
+
+    assert out == {"error": "history_source_unconfigured"}
+    assert conn.execute("SELECT COUNT(*) FROM analysis_runs").fetchone()[0] == 0

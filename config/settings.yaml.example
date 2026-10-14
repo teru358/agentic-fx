@@ -1,6 +1,7 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
-display_timezone: Asia/Tokyo  # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
-account_currency: JPY         # 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
+schema_version: 2  # [init] settings の版。`afx init` が移行する
+display_timezone: Asia/Tokyo  # [init] ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
+account_currency: JPY         # [init] 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
 
 pairs: [USDJPY]  # EURUSD 等クォート通貨が口座通貨と異なるペアは、口座通貨換算の実装 (為替レート取得) 後に有効化する
 
@@ -23,37 +24,37 @@ risk:
     EURUSD: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
 
 runner:
-  trade:   {backend: local, model: qwen3.6-35b-a3b_Q4}   # backend: local | claude (codex/opencode は拒否)
-  improve: {backend: local, model: qwen3-coder-30b-a3b-instruct}   # backend: local | claude | codex | opencode。ローカル LLM は opencode を使う (2026-08-30 裁定)、codex は chatgpt 専用
+  trade:   {backend: local, model: qwen3.6-35b-a3b_Q4}   # [init] 取引判断は local または claude
+  improve: {backend: local, model: qwen3-coder-30b-a3b-instruct}   # [init] 改善は local / opencode / claude / codex。ローカル LLM は opencode を使う (2026-08-30 裁定)、codex は chatgpt 専用
   claude:
-    bin: claude
-    credentials_file: ~/.claude/.credentials.json
+    bin: claude  # [init]
+    credentials_file: ~/.claude/.credentials.json  # [init]
   codex:
-    bin: /path/to/vendor/x86_64-unknown-linux-musl/bin/codex   # プレースホルダのまま (未設定) — codex backend を使うには実バイナリの絶対パスへ書き換えが必須。個人 settings.yaml でこの値を実パスに置き換えないと codex backend は起動できない
-    provider: chatgpt   # chatgpt のみ
-    auth_file: ~/.codex/auth.json
+    bin: /path/to/vendor/x86_64-unknown-linux-musl/bin/codex   # [init] プレースホルダのまま (未設定) — codex backend を使うには実バイナリの絶対パスへ書き換えが必須。個人 settings.yaml でこの値を実パスに置き換えないと codex backend は起動できない
+    provider: chatgpt   # [init] chatgpt のみ
+    auth_file: ~/.codex/auth.json  # [init]
   opencode:
-    bin: ~/.opencode/bin/opencode
-    context_limit: 0   # opencode backend を使うときは必ず llama-swap の --ctx-size (= ~/.config/opencode/opencode.jsonc の limit.context) と同じ値に書き換える。0 のままだと起動拒否。モデルを切り替えたら同時に更新
+    bin: ~/.opencode/bin/opencode  # [init]
+    context_limit: 0   # [init] opencode backend を使うときは必ず llama-swap の --ctx-size (= ~/.config/opencode/opencode.jsonc の limit.context) と同じ値に書き換える。0 のままだと起動拒否。モデルを切り替えたら同時に更新
   cli_terminate_grace_sec: 10.0
 
 backtest:                      # コア所有 (§6) — holdout_months の変更は人間レビュー必須
   holdout_months: 3
   initial_balance: 1000000
-  eval_source: "dukascopy"     # 評価用 history source。IMPORT_SOURCES のいずれか
-  base_interval: "1m"          # バックテスト基底足。1m/5m/15m。ライブの datafeed.intervals とは別軸
+  eval_source: "none"          # [init] 評価用 history source。MT5 bridge をつなげたら "mt5"
+  base_interval: "1m"          # [init] バックテスト基底足。1m/5m/15m。ライブの datafeed.intervals とは別軸
 
 llama_swap:
-  base_url: "http://localhost:8080/v1"
+  base_url: "http://localhost:8080/v1"  # [init]
   timeout_sec: 300
   max_turns: 16
 
 datafeed:
   # primary: yfinance   # 省略時は enabled が 1 個ならそれ。複数 source を enabled にするなら必須
   # fallbacks: []   # primary が不通のときだけ順に試す源。既定は無し (無言の切替をしない)
-  yfinance:   {enabled: true}
-  mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
-  twelvedata: {enabled: false}
+  yfinance:   {enabled: true}  # [init]
+  mt5:        {enabled: false, bridge_url: "http://localhost:8812"}  # [init]
+  twelvedata: {enabled: false}  # [init]
   freshness_max_min: 20       # これより古い quote/bar は不健全扱い
   closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
   outage:
@@ -62,7 +63,7 @@ datafeed:
     auto_resume_when_flat: true  # flat の episode は連続健全 tick で自動 ready。false だと人の `data resume` が要る
   conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
   intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
-  decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する
+  decision_timeframes: [1h]          # [init] 判断足は現在ちょうど1本。15分なら [15m] に変更する
   context_timeframes: []             # 参考足。発注判断の足ではない。判断足を含めない (表示のみ、強制ではない)。tool 呼出しごとに primary へ要求が出得る
   context_daily_call_budget: 1000    # market tool (get_ohlcv/get_indicators) の起動回数の 1 日 (UTC) あたり警告閾値 (観測ベース、代表的なフル稼働日の実測後に再調整)。超えると activity に WARNING を 1 回書くだけで拒否はしない。プロセス再起動で当日カウンタは 0 に戻る。null で警告無効
   watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
@@ -73,8 +74,8 @@ news:
   cleanup_hours: 48
 
 schedule:
-  improve: weekly             # weekly | daily
-  improve_at: "Sat 03:00"     # weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ)
+  improve: weekly             # [init] weekly | daily
+  improve_at: "Sat 03:00"     # [init] weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ)
 
 improve:
   parallel: 1
@@ -118,7 +119,7 @@ service:
                               # 名前の完全一致のみ (パターン不可)。値は見ない — 本当に秘密でないと自分で確認してから追加すること
 
 api:                          # 操作 API (同じマシンの UDS だけ。TCP listener は作らない)
-  enabled: false              # 改善 worker の seccomp が入るまで false (false でも daemon は起動し警告だけ)
+  enabled: true               # [init] 操作 API (UDS)。`afx ctl` と bot / web / notify の前提。false にすると daemon は起動するが外から操作できない
   socket_path: data/run/api.sock   # root からの相対 path (dir 0700 / socket 0600)
   max_connections: 4          # 同時接続。超えた接続は 503
   max_body_bytes: 65536       # 本文上限。超えたら 413
@@ -138,7 +139,7 @@ analysis:                      # コア所有 (§6 履歴分析)
   max_gap_pct: 5.0
 
 paper:
-  starting_balance: 1000000   # 学習モードの初期残高 (口座通貨建て)
+  starting_balance: 1000000   # [init] 学習モードの初期残高 (口座通貨建て)
 
 plugin:                        # plugin サンドボックス (プラン 7 Task 2)。省略可 (既定値でロード可能)
   sandbox_timeout_sec: 10       # 1 回の call() (indicator/signal/strategy 呼び出し) の待ち上限

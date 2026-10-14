@@ -23,7 +23,7 @@ from pathlib import Path
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.analysis import coverage_report, corr_matrix
-from agentic_fx.backtest.dataset import HistoryDataset
+from agentic_fx.backtest.dataset import UNCONFIGURED_SOURCE, HistoryDataset
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
@@ -68,7 +68,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     history_sub = history.add_subparsers(dest="history_command", required=True)
 
     imp = history_sub.add_parser("import", help="一括取り込み (進捗を件数で表示)")
-    imp.add_argument("--source", choices=["dukascopy", "mt5"], required=True)
+    imp.add_argument("--source", choices=["dukascopy", "mt5"])
     imp.add_argument("--symbol", required=True)
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
     imp.add_argument("--to", dest="to", type=_parse_date, required=True)
@@ -184,7 +184,16 @@ def _make_dukascopy_progress():
 
 
 def _history_import(conn, settings, args: argparse.Namespace) -> int:
-    if args.source == "dukascopy" and args.interval != "1m":
+    """一括取り込み。他の history / backtest サブコマンドと違い ``--source`` は
+    省略でき、省略時は ``backtest.eval_source`` を使う。それが未設定 (``none``) の
+    ときは取り込み元を推測せず rc=1 で止まる。"""
+    source = args.source if args.source is not None else settings.backtest.eval_source
+    if source == UNCONFIGURED_SOURCE:
+        print("履歴源が設定されていません。--source を指定するか "
+              "settings.yaml の backtest.eval_source を設定してください",
+              file=sys.stderr)
+        return 1
+    if source == "dukascopy" and args.interval != "1m":
         print("エラー: dukascopy import は interval=1m のみ対応しています",
               file=sys.stderr)
         return 2
@@ -198,7 +207,7 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
         print(f"エラー: --from/--to は {args.interval} 格子に整列が必要です",
               file=sys.stderr)
         return 2
-    if args.source == "dukascopy":
+    if source == "dukascopy":
         kw = {} if args.max_requests is None else {
             "max_requests": args.max_requests}
         result = import_dukascopy(conn, args.symbol, args.from_, args.to,

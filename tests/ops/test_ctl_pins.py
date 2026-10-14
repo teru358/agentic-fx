@@ -534,6 +534,126 @@ def test_status_fields_are_sanitized():
     assert "\x1b" not in text
 
 
+def test_status_renders_unknown_setup_code_with_fixed_text():
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "future_step", "severity": "info", "params": {"secret": "hidden"}},
+    ]}})
+    assert text.count("未知の手順 (code=future_step)。afx を更新してください") == 1
+    assert "hidden" not in text
+
+
+def test_status_treats_unknown_setup_severity_as_info(monkeypatch):
+    seen = []
+    original = client.render_pending_step
+    def render(step):
+        seen.append(step.severity)
+        if step.severity != "info":
+            raise AssertionError("unknown severity reached renderer")
+        return original(step)
+    monkeypatch.setattr(client, "render_pending_step", render)
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "no_strategy", "severity": "future", "params": {}},
+    ]}})
+    assert seen == ["info"]
+    assert "戦略がまだありません" in text
+
+
+def test_status_omits_unknown_setup_params_for_known_code(monkeypatch):
+    original = client.render_pending_step
+    def render(step):
+        assert "unknown" not in step.params
+        return original(step)
+    monkeypatch.setattr(client, "render_pending_step", render)
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "no_strategy", "severity": "info", "params": {"unknown": "ignored"}},
+    ]}})
+    assert "戦略がまだありません" in text
+    assert "ignored" not in text
+
+
+def test_status_tolerates_non_string_setup_fields():
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "no_strategy", "severity": ["future"], "params": {}},
+        {"code": "no_strategy", "severity": {"a": 1}, "params": ["x"]},
+        {"code": "approval_stalled", "severity": "action", "params": {"approval_id": ["1"]}},
+        {"code": ["bad"], "severity": "info", "params": {}},
+        {"code": "llm_unverified", "severity": "warn", "params": {"target": {"x": 1}, "reason_code": 5}},
+    ]}})
+    assert text.count("戦略がまだありません") == 2
+    assert "承認 #0 が途中で止まっています" in text
+
+
+def test_status_says_so_when_the_pending_steps_could_not_be_checked():
+    text = client.format_status({"setup": {"record_state": "unknown", "pending_steps": []}})
+    assert "未完の手順を確認できません" in text
+
+
+def test_status_says_so_when_the_setup_record_is_unreadable():
+    text = client.format_status({"setup": {"record_state": "corrupt", "pending_steps": []}})
+    assert "確認記録が読めません" in text
+
+
+def test_status_without_a_record_state_shows_no_notice():
+    text = client.format_status({"setup": {"pending_steps": []}})
+    assert "確認できません" not in text and "読めません" not in text
+
+
+def test_status_keeps_the_missing_record_step_text():
+    text = client.format_status({"setup": {"record_state": "missing", "pending_steps": [
+        {"code": "setup_record_missing", "severity": "action", "params": {}}]}})
+    assert "初期設定の確認記録がありません" in text
+
+
+def test_status_rejects_a_bool_where_a_number_is_expected():
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "approval_stalled", "severity": "action", "params": {"approval_id": True}}]}})
+    assert "承認 #0 " in text and "True" not in text
+
+
+def test_status_passes_the_server_observed_time_to_the_renderer(monkeypatch):
+    seen = []
+    original = client.render_pending_step
+    def render(step):
+        seen.append(step.observed_at)
+        return original(step)
+    monkeypatch.setattr(client, "render_pending_step", render)
+    client.format_status({"setup": {"pending_steps": [
+        {"code": "no_strategy", "severity": "info", "params": {},
+         "observed_at": "2026-01-02T03:04:05Z"},
+        {"code": "no_strategy", "severity": "info", "params": {}, "observed_at": "garbage"}]}})
+    assert seen[0].isoformat() == "2026-01-02T03:04:05+00:00"
+    assert seen[1].tzinfo is not None and seen[1].year >= 2026
+
+
+def test_status_falls_back_to_fixed_text_when_renderer_raises(monkeypatch):
+    def render(_step):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(client, "render_pending_step", render)
+    text = client.format_status({"setup": {"pending_steps": [
+        {"code": "no_strategy", "severity": "info", "params": {}},
+    ]}})
+    assert "手順を表示できません" in text
+    assert "boom" not in text
+
+
+def test_client_does_not_import_setup_persistence_layer():
+    import subprocess, sys
+    code = ("import sys, agentic_fx.ops.client; "
+            "bad = [m for m in ('agentic_fx.setup.checks', 'agentic_fx.store.setup_record', "
+            "'agentic_fx.setup.pending_steps') if m in sys.modules]; "
+            "print(bad); sys.exit(1 if bad else 0)")
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_status_omits_setup_section_when_setup_is_absent(monkeypatch):
+    def render(_step):
+        raise AssertionError("renderer must not run without setup")
+    monkeypatch.setattr(client, "render_pending_step", render)
+    text = client.format_status({"mode": "paper"})
+    assert "未完の手順" not in text
+
+
 def test_event_fields_are_sanitized():
     text = client.format_event({"id": f"{ESC}1", "ts": ESC, "code": f"{ESC}c", "ref": ESC,
                                 "fields": {f"{ESC}k": f"{ESC}v"}})

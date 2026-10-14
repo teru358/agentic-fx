@@ -11,8 +11,11 @@ from agentic_fx.store.db import connect, init_db
 
 H = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
 WED = H  # 2026-07-22 は水曜 — 市場オープン
-SETTINGS = load_settings(
+_EXAMPLE_SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+SETTINGS = _EXAMPLE_SETTINGS.model_copy(update={
+    "backtest": _EXAMPLE_SETTINGS.backtest.model_copy(
+        update={"eval_source": "dukascopy"})})
 DATASET_1M = HistoryDataset("dukascopy", "1m")
 
 

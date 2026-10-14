@@ -28,7 +28,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--daemon", action="store_true",
                         help="systemd 用 (コマンド受付なし)")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("init", help="初期設定 (非対話・冪等。既存 settings.yaml は上書きしない)")
+    init_parser = sub.add_parser("init", help="初期設定 (対話。`--non-interactive` で従来の非対話)")
+    init_parser.add_argument("--non-interactive", action="store_true",
+                             help="従来の非対話初期化を実行する")
+    init_parser.add_argument("--config", type=Path, metavar="FILE",
+                             help="settings.yaml として配置する検証済み設定ファイル")
+    check_parser = sub.add_parser("check", help="設定と実行環境の起動前検査 (読み取りのみ。fatal があると非 0)")
+    check_parser.add_argument("--json", action="store_true", dest="as_json",
+                              help="結果を JSON ({\"fatal\": [...], \"warning\": [...]}) で出す")
+    check_parser.add_argument("--unit-env", action="store_true", dest="unit_env",
+                              help="unit の最小環境で呼ばれたときの検査 (秘密らしい env を fatal に数える)")
     keys_parser = sub.add_parser("keys", help="操作 API の鍵管理 (サービス停止中だけ)")
     keys_sub = keys_parser.add_subparsers(dest="keys_action", required=True)
     keys_sub.add_parser("init", help="初回の鍵を作る (作成済みなら何もしない)")
@@ -52,7 +61,19 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path.cwd()
     if args.command == "init":
-        return service.run_init(root)
+        if not args.non_interactive:
+            from agentic_fx.setup import wizard
+            if args.config is not None:
+                print("`--config` は `--non-interactive` と一緒に指定してください", file=sys.stderr)
+                return 2
+            if not sys.stdin.isatty():
+                print(wizard.NON_TTY_MESSAGE, file=sys.stderr)
+                return 2
+            return wizard.run_wizard(root, wizard.ConsoleWizardIO())
+        return service.run_init(root, config_file=args.config)
+    if args.command == "check":
+        from agentic_fx.setup import preflight
+        return preflight.main(root, as_json=args.as_json, unit_env=args.unit_env)
     if args.command == "keys":
         # 鍵管理は .env を読まない (鍵を env に載せない・設定にも依存しない)。
         from agentic_fx.ops.keys import run_keys_command
@@ -60,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ops":
         if args.ops_action == "enable":
             from agentic_fx.ops_setup.interactive import ConsoleIO, interactive_enable
-            return interactive_enable(root, args.feature, io=ConsoleIO())
+            return interactive_enable(root, args.feature, io=ConsoleIO()).rc
         from agentic_fx.ops_setup.stages import run_ops_command
         return run_ops_command(root, args.ops_action, args.feature)
     if args.command in _BACKTEST_COMMANDS:

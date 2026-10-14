@@ -106,8 +106,10 @@ def _write_if_changed(path: Path, content: str) -> None:
     atomic_write(path, encoded, 0o644)
 
 
-def _syntax_problem(executable: str) -> str:
-    """ExecStart に引用なしで書けない path なら理由を返す。"""
+def _syntax_problem(executable: str, *, forbidden: str = "") -> str:
+    """ExecStart に引用なしで書けない path なら理由を返す。
+
+    `forbidden` はその書き場所だけで書けない文字 (PATH の区切りの ":" など)。"""
     if not os.path.isabs(executable):
         return "絶対 path でない"
     for char in executable:
@@ -115,7 +117,7 @@ def _syntax_problem(executable: str) -> str:
             return "空白・改行を含む"
         if char in _QUOTES:
             return "引用符を含む"
-        if char in "%$\\":
+        if char in "%$\\" or char in forbidden:
             return f"{char} を含む"
         if not char.isprintable():
             return "制御文字を含む"

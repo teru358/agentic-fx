@@ -1511,6 +1511,34 @@ def _fake_evaluable_gate(conn, meta, *, settings, now, record_fn=None, floor_mod
         candidate_metrics={"USDJPY": {"trades": 40, "pf": 1.2}})
 
 
+def test_full_gate_rejects_unconfigured_history_source_with_fixed_reason(
+        env, monkeypatch):
+    root, plugins_dir, conn, settings = env
+    candidate = plugins_dir / "_staging" / "1" / "st"
+    candidate.mkdir(parents=True)
+    (candidate / "plugin.py").write_text(
+        "def evaluate(df, indicators, signals, params):\n"
+        "    return {'action': 'hold', 'rationale': 'x'}\n")
+    (candidate / "config.yaml").write_text(
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n")
+    (candidate / "test_plugin.py").write_text(TEST_PY_OK)
+    monkeypatch.setattr("agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    from agentic_fx.plugin.approval import GateOutcome
+    monkeypatch.setattr(
+        "agentic_fx.plugin.approval.run_kind_gate",
+        lambda *args, **kwargs: GateOutcome(
+            metrics={}, evaluable=False,
+            verdict_kind="history_source_unconfigured",
+            gate_rows=kwargs["sink"]))
+
+    with pytest.raises(ValueError, match=(
+            r"^plugin 'st': 履歴源が設定されていません "
+            r"\(backtest\.eval_source を mt5 か対応履歴源にしてください\)$")):
+        switch._run_full_gate(
+            conn, candidate, name="st", settings=settings, now=NOW,
+            plugins_root=plugins_dir)
+
+
 def test_submit_candidate_strategy_payload_base_interval_follows_settings(
         env, monkeypatch):
     """A6 (v3 設計): submit_candidate の payload は strategy kind のとき

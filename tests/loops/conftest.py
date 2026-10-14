@@ -21,8 +21,12 @@ from agentic_fx.store import missions as missions_store
 from agentic_fx.store.db import connect, connect_readonly, init_db
 
 NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
-SETTINGS = load_settings(
+_EXAMPLE_SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+# 履歴を要する試験は評価用の履歴源を明示する (example の既定は未設定)。
+SETTINGS = _EXAMPLE_SETTINGS.model_copy(update={
+    "backtest": _EXAMPLE_SETTINGS.backtest.model_copy(
+        update={"eval_source": "dukascopy"})})
 
 
 class _FakeRag:

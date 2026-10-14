@@ -541,6 +541,10 @@ def test_g3_bless_candidate_warn_reaches_holdout_seam_via_real_evaluator(
     evaluator は既定 `enforce` になり in_sample で短絡、
     `run_holdout_gate` seam に到達しなくなる → killer。"""
     root, plugins_dir, conn, settings = env
+    settings = settings.model_copy(update={
+        "backtest": settings.backtest.model_copy(
+            update={"eval_source": "dukascopy"}),
+    })
     d = plugins_dir / "_human" / "st"
     _write_strategy_candidate(d)
     monkeypatch.setattr(

@@ -14,9 +14,10 @@ def test_ops_enable_dispatches_feature_without_starting_daemon(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     seen: list[str] = []
 
-    def enable(root, feature: str, **_kwargs) -> int:
+    def enable(root, feature: str, **_kwargs):
+        from agentic_fx.ops_setup.interactive import EnableResult
         seen.append(feature)
-        return 0
+        return EnableResult(0, "enabled", "ok")
 
     monkeypatch.setattr("agentic_fx.ops_setup.interactive.interactive_enable", enable)
 

@@ -1,0 +1,178 @@
+# agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
+schema_version: 1  # settings の版。`afx init` が移行する
+display_timezone: Asia/Tokyo  # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
+account_currency: JPY         # 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
+
+pairs: [USDJPY]  # EURUSD 等クォート通貨が口座通貨と異なるペアは、口座通貨換算の実装 (為替レート取得) 後に有効化する
+
+risk:
+  rr_min: 1.5                 # 最小リスク報酬比 (spread 込み)
+  risk_per_trade_pct: 0.5     # 1 取引リスク上限 (% of equity)
+  swing_risk_factor: 0.5      # horizon=swing のリスク率係数 (常時半減)
+  max_positions: 2            # 未約定指値も枠にカウント
+  max_total_risk_pct: 1.5     # 最大総エクスポージャー: 全ポジション + 未約定指値の予約リスク合算 (% of equity)
+  max_leverage: 10            # 必要証拠金ベースのレバレッジ上限
+  daily_loss_limit_pct: 1.0   # 日初エクイティ比
+  drawdown_kill_pct: 2.0      # HWM 比。kill switch 自体の無効化キーは存在しない
+  limit_deviation_pct: 0.5    # 指値の現値乖離上限
+  limit_expiry_max_h: 24
+  max_slippage_pct: 0.1
+  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)。この時刻以降の新規 swing 建て禁止
+  commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
+  pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
+    USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
+    EURUSD: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
+
+runner:
+  trade:   {backend: local, model: qwen3.6-35b-a3b_Q4}   # backend: local | claude (codex/opencode は拒否)
+  improve: {backend: local, model: qwen3-coder-30b-a3b-instruct}   # backend: local | claude | codex | opencode。ローカル LLM は opencode を使う (2026-08-30 裁定)、codex は chatgpt 専用
+  claude:
+    bin: claude
+    credentials_file: ~/.claude/.credentials.json
+  codex:
+    bin: /path/to/vendor/x86_64-unknown-linux-musl/bin/codex   # プレースホルダのまま (未設定) — codex backend を使うには実バイナリの絶対パスへ書き換えが必須。個人 settings.yaml でこの値を実パスに置き換えないと codex backend は起動できない
+    provider: chatgpt   # chatgpt のみ
+    auth_file: ~/.codex/auth.json
+  opencode:
+    bin: ~/.opencode/bin/opencode
+    context_limit: 0   # opencode backend を使うときは必ず llama-swap の --ctx-size (= ~/.config/opencode/opencode.jsonc の limit.context) と同じ値に書き換える。0 のままだと起動拒否。モデルを切り替えたら同時に更新
+  cli_terminate_grace_sec: 10.0
+
+backtest:                      # コア所有 (§6) — holdout_months の変更は人間レビュー必須
+  holdout_months: 3
+  initial_balance: 1000000
+  eval_source: "none"          # 評価用 history source。MT5 bridge をつなげたら "mt5"
+  base_interval: "1m"          # バックテスト基底足。1m/5m/15m。ライブの datafeed.intervals とは別軸
+
+llama_swap:
+  base_url: "http://localhost:8080/v1"
+  timeout_sec: 300
+  max_turns: 16
+
+datafeed:
+  # primary: yfinance   # 省略時は enabled が 1 個ならそれ。複数 source を enabled にするなら必須
+  # fallbacks: []   # primary が不通のときだけ順に試す源。既定は無し (無言の切替をしない)
+  yfinance:   {enabled: true}
+  mt5:        {enabled: false, bridge_url: "http://localhost:8812"}
+  twelvedata: {enabled: false}
+  freshness_max_min: 20       # これより古い quote/bar は不健全扱い
+  closed_bar_grace_sec: 30    # source 時刻の遅延・境界丸めを吸収する暫定猶予秒
+  outage:
+    flat_stall_max_sec: 1800     # 建玉も未約定指値も無いときの 1m 停滞を restricted (新規リスク停止) に留める最大秒。0 で無効 (即 degraded)
+    ready_confirm_ticks: 3       # restricted / degraded から ready に戻るのに必要な連続健全 tick 数 (1 以上)
+    auto_resume_when_flat: true  # flat の episode は連続健全 tick で自動 ready。false だと人の `data resume` が要る
+  conversion_skew_max_min: 5  # 換算レート (口座通貨換算) のクロス脚間・判断内スナップショットの時刻差許容。freshness_max_min より必ず小さいこと (同じ/大きいと skew 検証が発火しなくなる)
+  intervals: [1m, 5m, 15m, 1h, 4h]   # 取得・保持する足 (1m は必須: ペーパー約定判定が依存)
+  decision_timeframes: [1h]          # 判断足は現在ちょうど1本。15分なら [15m] に変更する
+  context_timeframes: []             # 参考足。発注判断の足ではない。判断足を含めない (表示のみ、強制ではない)。tool 呼出しごとに primary へ要求が出得る
+  context_daily_call_budget: 1000    # market tool (get_ohlcv/get_indicators) の起動回数の 1 日 (UTC) あたり警告閾値 (観測ベース、代表的なフル稼働日の実測後に再調整)。超えると activity に WARNING を 1 回書くだけで拒否はしない。プロセス再起動で当日カウンタは 0 に戻る。null で警告無効
+  watch_symbols: []           # 取引不可・分析専用 (§6)。pair enum には入れない
+  cache_retention_days: 30    # ohlcv_cache の保持期間 (日)。intervals の構成が要求する最小日数を下回ると起動拒否 (プラン9 Task16)
+  # retention: {yfinance: {1m: "2d", 1h: "30d"}}  # source ごとの保持。cache_retention_days とは併用不可
+
+news:
+  cleanup_hours: 48
+
+schedule:
+  improve: weekly             # weekly | daily
+  improve_at: "Sat 03:00"     # weekly は "<weekday> HH:MM"、daily は "HH:MM" (表示 TZ)
+
+improve:
+  parallel: 1
+  mission_max_turns: 200
+  mission_timeout_sec: 3600
+  llama_swap_verified: false
+  max_new_backlog_per_mission: 20
+  backtest_rpc_timeout_sec: 600
+  accept_drain_sec: 30
+  archive_max_bytes: 209715200   # plugins/_archive の保持上限 (bytes、既定 200MB)
+  archive_max_missions: 50       # plugins/_archive の保持上限 (mission 数)
+  tool_budget:                  # 改善 mission 1 回あたりの tool 予算
+    self_test_warn_after: 3     # 同一失敗の警告を返し始める連続回数
+    max_self_test_runs: 12      # self-test 実行回数の上限
+    max_self_tests_before_backtest: 3  # 成功 backtest 前の strategy self-test 総数
+    max_writes: 30              # staging 書き込み回数の上限
+    max_backtests_per_candidate: 6  # 候補ごとの backtest 呼び出し上限
+    max_tool_calls: 300         # 全 tool 呼び出し数 (Tier F の安全網)
+    max_refusal_streak: 10      # 同種の連続拒否で mission を中断
+  research:
+    max_searches: 20
+    max_fetches: 30
+    min_interval_sec: 2.0
+    max_per_host: 5
+    fetch_max_bytes: 2097152
+    user_agent: "agentic-fx/0.1 (+https://github.com/agentic-fx/agentic-fx)"
+  gate:
+    # plugin gate で要求する self-test (`test_*`) の最低本数。
+    min_test_functions: 3
+    # [floor-config] 収益性フロア (設計書 §6 T3)。採用判断の品質基準
+    # (risk.* の資金保護制約とは別物、緩めても実資金は動かない)。
+    min_pf: 1.0                     # in_sample/holdout の pf 下限 (pf が None = gross_loss 0 は PASS)
+    require_positive_avg_r: true    # avg_r <= 0.0 を不合格にするか
+    require_holdout_evaluable: false  # holdout evaluable=false を不合格にするか (既定: 標本不足は continue)
+
+logging:
+  level: INFO
+
+service:
+  secret_env_allowlist: []   # ⑤検査 (起動時、CLI backend のみ) が誤検知した exported env 変数の名前をここに書くと除外される。
+                              # 名前の完全一致のみ (パターン不可)。値は見ない — 本当に秘密でないと自分で確認してから追加すること
+
+api:                          # 操作 API (同じマシンの UDS だけ。TCP listener は作らない)
+  enabled: false              # 改善 worker の seccomp が入るまで false (false でも daemon は起動し警告だけ)
+  socket_path: data/run/api.sock   # root からの相対 path (dir 0700 / socket 0600)
+  max_connections: 4          # 同時接続。超えた接続は 503
+  max_body_bytes: 65536       # 本文上限。超えたら 413
+  request_deadline_sec: 5.0   # 受付から応答までの期限 (slowloris は 408)
+  ops_lock_wait_sec: 10.0     # ops lock 待ちの上限 (実効値は要求の残り時間以下)
+  decision_deadline_sec: 35.0 # 決定 job の期限 (35 以上)
+  plugin_lock_wait_sec: 30.0  # plugin flock 待ちの上限 (超えたら plugin_busy)
+  ask_deadline_sec: 900.0     # ask job の期限
+  improve_start_deadline_sec: 35.0  # 手動 improve の開始までの期限
+  shutdown_join_sec: 5.0      # 停止時に API / 決定 worker を待つ上限
+
+discord:
+  enabled: false              # webhook 通知 (URL は .env の DISCORD_WEBHOOK_URL)
+
+analysis:                      # コア所有 (§6 履歴分析)
+  max_watch_symbols: 10
+  max_gap_pct: 5.0
+
+paper:
+  starting_balance: 1000000   # 学習モードの初期残高 (口座通貨建て)
+
+plugin:                        # plugin サンドボックス (プラン 7 Task 2)。省略可 (既定値でロード可能)
+  sandbox_timeout_sec: 10       # 1 回の call() (indicator/signal/strategy 呼び出し) の待ち上限
+  sandbox_session_cpu_sec: 60   # RLIMIT_CPU: worker プロセス (1 セッション) 寿命の累積 CPU 秒数上限
+  sandbox_memory_mb: 512        # RLIMIT_AS: 仮想アドレス空間上限 (MiB)
+  sandbox_output_max_bytes: 1048576  # 1 応答行の生バイト数上限
+  sandbox_nofile: 128           # RLIMIT_NOFILE: worker が同時に開けるファイル記述子数の上限
+  sandbox_fsize_mb: 8           # RLIMIT_FSIZE (MiB): 1 ファイルあたりの書き込みサイズ上限。pytest サブプロセスにも流用
+  max_bars_limit: 1000          # plugin config.yaml の max_bars 上限。discover では照合しない — 承認 (submit/bless) と get_indicators (indicator 合成) で照合し、超過は拒否する
+  signal_requeue_max: 2          # signals の requeue 上限 (超えたら abandoned)
+  signal_lease_min: 15           # signals claim の lease 時間 (分。超過で reclaim_expired の回収対象)。mission の worker 上限 Cw + 60 秒より長くないと起動拒否 (既定 Cw 405 秒 → 8 分以上)
+  signal_freshness_bars: 2       # signals 鮮度ゲート: 宣言 timeframe の何バー分まで新鮮とみなすか
+  signal_min_interval_min: 10    # signal トリガー取引判断 Mission の最短起動間隔 (分)
+  signal_daily_max: 12           # signal トリガー取引判断 Mission の日次上限
+  signals_max_lookback_hours: 24 # get_signals ツールの since_hours 上限 (プラン 7 Task 9)
+  pytest_timeout_sec: 300        # submit/bless/改善ループ候補ゲートの pytest 実行タイムアウト (プラン10 Task 6)
+
+worker:                        # mission worker (プラン8) の resource limit・preemption・IPC 設定。省略可
+  child_as_mb: 4096             # RLIMIT_AS (MiB): 実測 VmPeak 1.65GB (32コア環境) の約2.4倍の余裕。多コア機では要再実測 (IM-9)
+  child_nofile: 128             # RLIMIT_NOFILE
+  child_fsize_mb: 8             # RLIMIT_FSIZE (MiB): 正常経路ではファイルを書かない前提の小さい上限
+  worker_grace_sec: 30          # runner soft deadline の外側マージン (壁時計監視)
+  worker_terminate_grace_sec: 10  # SIGTERM 後 SIGKILL までの猶予
+  worker_startup_timeout_sec: 30  # 子の import〜ready まで
+  transcript_max_bytes: 1048576   # Mission 累積 transcript 上限 (超過は truncate marker)
+  data_hook_timeout_sec: 30       # tick 内データ hooks の全ネットワーククライアント timeout 上限
+  rpc_timeout_sec: 15             # RAG RPC の親側応答待ち上限
+  shutdown_join_timeout_sec: 30   # 停止シーケンスの join 上限
+  snapshot_max_age_sec: 10        # commit-pre スナップショットの許容鮮度 (秒)。超過は発注拒否 (lock内再取得しない)
+  # dispatch_ceiling_sec:         # 未設定 = 自動導出 (worker 1 回の上限 Cw×4+10 に 60 を足す。既定 local 1690 / claude 1730)。明示するなら Cd 未満は起動拒否
+
+reflection:                    # reflection cycle の再試行ポリシー (プラン9 Task15)。省略可
+  max_attempts: 2               # 同一 order の reflection 再試行上限。到達で abandon (reflect retry <id> で復帰)
+
+alert:                         # 運用アラート (プラン9 Task17)。省略可
+  consecutive_gate_reject: 10   # risk gate の連続 rejection がこの本数に達したら一度だけ通知

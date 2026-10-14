@@ -67,6 +67,15 @@ class ApprovalOutcome:
             raise ValueError(f"unknown approval outcome: {self.outcome!r}")
 
 
+class GateCheckError(ValueError):
+    """Gate failure whose failed check is carried as a structured ``kind``
+    (``pytest`` or ``hash``); callers must not classify by message text."""
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 class PluginBusyError(RuntimeError):
     """ops 要求の deadline 内に plugin flock を取得できなかった。"""
 
@@ -1124,15 +1133,15 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
 
         gate_result = run_gate_pytest(candidate_dir, settings=settings)  # 手順 5
         if not gate_result.passed:
-            raise ValueError(
+            raise GateCheckError(
                 f"plugin {name!r}: test_plugin.py failed pytest gate "
-                f"(returncode={gate_result.returncode})")
+                f"(returncode={gate_result.returncode})", kind="pytest")
 
         after_content, after_artifact = hashes_of(candidate_dir)  # 手順 6
         if after_content != before_content or after_artifact != before_artifact:
-            raise ValueError(
+            raise GateCheckError(
                 f"plugin {name!r}: candidate content changed during gate "
-                "(hash mismatch) — refusing")
+                "(hash mismatch) — refusing", kind="hash")
 
         # round2 #2 是正 (2026-08-29、verified-round2.md #2): F1 の
         # max_bars_limit ゲートは `approval.submit_plugin` にしか付かず、
@@ -1176,6 +1185,11 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: strategy not evaluable "
             f"({outcome.insufficient_trades_reason})")
+    if outcome.verdict_kind == "history_source_unconfigured":
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(
+            f"plugin {name!r}: 履歴源が設定されていません "
+            "(backtest.eval_source を mt5 か対応履歴源にしてください)")
     if outcome.verdict_kind == "floor" and floor_mode == "enforce":
         _persist_human_gate_rows(conn, rows, mission_outcome="unprofitable", now=now)
         g = settings.improve.gate

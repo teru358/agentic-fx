@@ -1,5 +1,7 @@
 # afx を systemd user unit で常駐させる (仮運用、2026-09-26)
 
+これは screen 前提の仮運用です。`afx init` 導入後は [direct exec の user unit 運用](afx-service-direct-exec.md) を見てください。
+
 端末を開いたままにしなくても afx が動き続けるようにする。対話シェル (`afx>`) は screen セッションの中で
 生きているので、必要なときに attach してコマンドを打てる。恒久形は `[first-run-setup]` の対話ウィザードが
 unit を設置する想定で、本手順はそれまでの仮運用。

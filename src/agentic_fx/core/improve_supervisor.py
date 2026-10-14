@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.activity import Category
-from agentic_fx.core.scheduler import latest_scheduled_occurrence, period_key_of
+from agentic_fx.core.scheduler import scheduled_period
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
 
@@ -84,18 +84,15 @@ class ImproveSupervisor:
         # で activity/notifier には出ない)。ここで一度だけ activity へ
         # 1 行残してから re-raise する (呼び出し元の技術ログ記録は妨げない)。
         try:
-            occurrence = latest_scheduled_occurrence(
-                now, cadence=s.improve, at=s.improve_at,
-                display_timezone=self._settings.display_timezone)
+            period_key = scheduled_period(self._settings, now).period_key
         except Exception:
-            _log.exception("ImproveSupervisor.tick: latest_scheduled_occurrence "
+            _log.exception("ImproveSupervisor.tick: scheduled_period "
                            "failed for cadence=%r at=%r", s.improve, s.improve_at)
             if self._activity is not None:
                 self._activity.write(
                     Category.IMPROVE, "improve_tick_schedule_error",
                     f"cadence={s.improve} at={s.improve_at!r}")
             raise
-        period_key = period_key_of(occurrence, cadence=s.improve)
         conn = self._conn()
         owns = self._conn_for_test is None
         try:

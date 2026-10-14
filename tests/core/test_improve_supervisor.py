@@ -136,6 +136,85 @@ def test_improve_supervisor_tick_skips_process_expired_approvals_when_stopped(
     assert calls == []
 
 
+def test_tick_skips_consumed_period_then_starts_the_next_period(tmp_path, monkeypatch):
+    """初回設定の消費印がある期は起動せず、次の期では通常どおり起動する。"""
+    from agentic_fx.store import improve_waves
+
+    db_path = tmp_path / "agentic.db"
+    conn = db_mod.connect(db_path)
+    db_mod.init_db(conn)
+    settings = _fake_settings(parallel=1)
+    settings.display_timezone = "Asia/Tokyo"
+    first = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)  # 15:00 JST
+    next_period = datetime(2026, 10, 3, 1, 0, tzinfo=timezone.utc)  # 10:00 JST
+    improve_waves.consume_scheduled_period(conn, settings, now=first)
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=settings,
+                            clock=_FixedClock(first), db_path=db_path,
+                            stop_event=threading.Event())
+    sup._conn_for_test = conn
+    started: list[tuple[str, int]] = []
+    monkeypatch.setattr(sup, "_spawn_slot_thread",
+                        lambda period_key, k: started.append((period_key, k)))
+
+    sup.tick(first)
+    sup.tick(next_period)
+
+    assert started == [("2026-W40", 0)]
+
+
+def test_tick_without_consumption_mark_starts_current_period(tmp_path, monkeypatch):
+    """消費印が無い初回 tick は current period の mission を起動する。"""
+    db_path = tmp_path / "agentic.db"
+    conn = db_mod.connect(db_path)
+    db_mod.init_db(conn)
+    now = datetime(2026, 10, 2, 6, 0, tzinfo=timezone.utc)  # 15:00 JST
+    settings = _fake_settings(parallel=1)
+    settings.display_timezone = "Asia/Tokyo"
+    sup = ImproveSupervisor(capacity=1, root=tmp_path, settings=settings,
+                            clock=_FixedClock(now), db_path=db_path,
+                            stop_event=threading.Event())
+    sup._conn_for_test = conn
+    started: list[tuple[str, int]] = []
+    monkeypatch.setattr(sup, "_spawn_slot_thread",
+                        lambda period_key, k: started.append((period_key, k)))
+
+    sup.tick(now)
+
+    assert started == [("2026-W39", 0)]
+
+
+def test_running_slot_count_counts_only_running_slots_of_waves_with_slots(tmp_path):
+    """消費印の wave (slot 0 件) と、slot のある wave の reserved / done は数えず、
+    claimed / running の slot だけを 1 件ずつ数える。"""
+    from agentic_fx.store import improve_waves, missions
+
+    db_path = tmp_path / "agentic.db"
+    conn = db_mod.connect(db_path)
+    db_mod.init_db(conn)
+    settings = _fake_settings(parallel=3)
+    # NOW は Sat 03:00 UTC (W34)。1 週前の消費印と、現在期の 4 slot の wave。
+    improve_waves.consume_scheduled_period(
+        conn, settings, now=NOW - timedelta(days=7))
+    improve_waves.consume_scheduled_period(
+        conn, settings, now=NOW - timedelta(days=14))
+    improve_waves.create_wave_and_slots(
+        conn, period_key="2026-W34", now=NOW, expected=4)
+    for k in (0, 1, 2):
+        mission_id = missions.start(conn, "improve", "local", f"m-{k}", now=NOW)
+        improve_waves.claim_slot(
+            conn, period_key="2026-W34", k=k, mission_id=mission_id, now=NOW)
+    improve_waves.mark_running(conn, period_key="2026-W34", k=1, now=NOW)
+    improve_waves.mark_terminal(
+        conn, period_key="2026-W34", k=2, status="done", now=NOW)
+    sup = ImproveSupervisor(capacity=3, root=tmp_path, settings=settings,
+                            clock=_FixedClock(NOW), db_path=db_path,
+                            stop_event=threading.Event())
+    assert conn.execute("SELECT count(*) c FROM improve_waves").fetchone()["c"] == 3
+
+    # k=0 claimed, k=1 running, k=2 done, k=3 reserved
+    assert sup._running_slot_count(conn) == 2
+
+
 class _CommitFailureRunner:
     def __init__(self, result, *, call_on_ready=False, stop_event=None):
         self.result = result

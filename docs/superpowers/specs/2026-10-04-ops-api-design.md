@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.15
+# [ops-api] 操作 API と client 契約設計 v1.17
 
-版: v1.15
+版: v1.17
 
 日付: 2026-10-05
 
@@ -10,7 +10,7 @@
 
 ## 要点
 
-- API は agentic-fx daemon の同一プロセス内で動く有界な UDS HTTP server とし、全 endpoint を初回リリースから公開する。実装着手前に plugin worker 隔離を投入し、改善 mission worker の seccomp は実装の着手条件ではなく **運用上の有効化 (listener を開く) の条件** とし、seccomp 投入まで `api.enabled` の既定を false にする。機能を段階開放する実行時状態は持たない。
+- API は agentic-fx daemon の同一プロセス内で動く有界な UDS HTTP server とし、全 endpoint を初回リリースから公開する。実装着手前に plugin worker 隔離を投入し、改善 mission worker の seccomp は実装の着手条件ではなく運用上の条件としたが、改善 CLI 隔離 (admission) の有効化を受けて `api.enabled` の既定は **true** に改訂した (2026-10-12 裁定、§1.2)。機能を段階開放する実行時状態は持たない。
 - 認証は導入インスタンス固有の principal 鍵で行い、GET も用途別 scope で最小権限化する。承認、kill switch 解除とその回復確定、価格源復帰は approver に限る。発注、SL 変更、クローズ、資金保護の無効化、`autopilot on`、サービス停止は API に出さない。
 - 鍵は `~/.config/agentic-fx/api/<instance_id>/` に principal ごとの別ファイルで置く。`.ready` は鍵集合の commit marker とし、client は鍵を生成しない。
 - 承認画面は既存の `approval_facts` が親の受理・計測・状態遷移として記録した `parent_facts` と、agent の自己申告 `agent_claims` を分けて表示する。決定内容の digest を再照合し、`decided_by` は要求本文でなく認証 principal からサーバが記録する。
@@ -26,7 +26,7 @@
 
 ### 1.2 実装着手の条件
 
-**前提: plugin worker 隔離が main に投入されていること (2026-10-05 `afdfb81` で充足)。** sandbox から他デーモン経由の脱出は実測せず塞ぐ (チケット `sandbox-escape-via-user-daemons-unmeasured`、2026-10-04 ユーザー裁定 案 1): 改善 mission worker への seccomp 投入 (別設計 `improve-cli-seccomp`、plugin worker 隔離と同規模) は **実装の着手条件ではなく、運用上 listener を開く条件** とする (2026-10-05 ユーザー裁定 案 2: 最終的な結果が変わらないこと)。T1〜T5 は seccomp と並行して進め、seccomp 投入まで `api.enabled` の既定は false (daemon は警告のみ、§5)。seccomp 投入後に既定を true へ変える変更を seccomp 束の完了条件に含める。人手実測はチケット `escape-probe-manual-measurement` で別途扱う。
+**前提: plugin worker 隔離が main に投入されていること (2026-10-05 `afdfb81` で充足)。** sandbox から他デーモン経由の脱出は実測せず塞ぐ (チケット `sandbox-escape-via-user-daemons-unmeasured`、2026-10-04 ユーザー裁定 案 1): 改善 mission worker への seccomp 投入 (別設計 `improve-cli-seccomp`、plugin worker 隔離と同規模) は **実装の着手条件ではなく、運用上 listener を開く条件** とする (2026-10-05 ユーザー裁定 案 2: 最終的な結果が変わらないこと)。T1〜T5 は seccomp と並行して進めた。**2026-10-12 の裁定 (初期設定ウィザード設計 P16 / 段 8) で改訂**: 改善 CLI 隔離 (admission) が有効化済みなので `api.enabled` の既定は **true**。利用者が明示的に false にした daemon は listener を開かず警告のみ (§5)。隔離が `sandbox_unavailable` のときは improve が止まるだけで、API を開く条件にはしない。人手実測はチケット `escape-probe-manual-measurement` で別途扱う。
 
 trade worker の Landlock はこの前提に含めない。trade profile の `ClaudeRunner` の argv を `--tools StructuredOutput,ToolSearch` に pin し、LocalRunner の registry を読み取り専用に固定する。trade worker 自体の Landlock は別チケットとする。
 
@@ -134,7 +134,7 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 
 |#|現行コマンド|endpoint|permission|処理と二重実行防止|
 |---|---|---|---|---|
-|1|`status`|`GET /v1/status`|`status.read`|mode、autopilot、kill switch の latched / generation / latched_at と **`reconcile_required` (解除の途中で止まった marker の有無) および marker があるときの `requested_generation` / `started_at` / ファイル上のラッチ値**、残高、equity、orders、mission、health、data を構造化|
+|1|`status`|`GET /v1/status`|`status.read`|mode、autopilot、kill switch の latched / generation / latched_at と **`reconcile_required` (解除の途中で止まった marker の有無) および marker があるときの `requested_generation` / `started_at` / ファイル上のラッチ値**、残高、equity、orders、mission、health、data、`setup` を構造化する。`setup` は `{record_state: "ok" | "missing" | "corrupt" | "unknown", pending_steps: [{code, severity, observed_at, params}]}` で、最大 32 件。`severity` は `info` / `warn` / `action`、時刻は UTC ISO 8601、code と params key/value は first-run の固定語彙だけを使う。収集失敗時は status 自体を失敗にせず `{record_state: "unknown", pending_steps: []}` とする。|
 |2|`log [n]`|`GET /v1/log?n=`|`logs.read`|1〜500 行、後方 scan 4 MiB、1 行 2,000 文字|
 |3|`activity [n] [category]`|`GET /v1/activity?n=&category=`|`logs.read`|列挙 category、後方 scan 4 MiB、打切りを明示|
 |4|`approval <id>`|`GET /v1/approvals/{id}`|`approvals.detail`|親記録、自己申告、reason、`decided_by`、`asserted_actor`、archive、依存、holdout / in-sample、`payload_sha256`|
@@ -296,6 +296,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |I-33|起動時は既存 plugin 切替 journal の reconcile が先、ops の回復が後。決定の結果の正は `approval_requests` と切替 journal で、ops の回復はそれを追記するだけで決定を自動再実行せず、決められない要求だけを `outcome_unknown` にする|
 |I-34|`killswitch reconcile` は `local_guard` で UDS 限定とし、ラッチ中への確定だけを行う。解除側へは倒さず、資金保護を弱めない。status は `reconcile_required` を返す|
 |I-35|`reflect retry` は `Idempotency-Key` 必須かつ試行記録の識別子 (`attempts`、`last_attempt_at`) の一致を条件とし、不一致は 409 `attempt_changed` で無変更。後から積まれた試行記録を消さない|
+|I-36|status の `setup` 節には URL、例外文、path、秘密値、自由文を載せない。固定 code と許可された params だけを返し、未知 code / severity / params key を受けた client はそれぞれ未知手順表示 / info / 無視で前方互換に扱う|
 
 ## 11. 受入条件
 
@@ -359,6 +360,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |AC-55|停止中の `enroll` は未登録 principal だけを generation 1 / active にし、既存 principal の鍵、digest、generation、mtime を変えない。`enroll(active)` は無変更成功、`enroll(revoked)` は `invalid_state`。鍵 file fsync、鍵 rename、鍵 dir fsync、preparing manifest、ready manifest、各 dir fsync の前後に `os._exit` を注入し、同じ enroll だけが完結し、別 key command は `invalid_state`・無変更となる|
 |AC-56|§3.1 の `ops-bot` / `ops-web` / `ops-notify` の全 scope を表どおりに検査し、許可外 endpoint は 403、特に bot の `operate` / `local_guard`、web の変更、notify の event 以外は成功しない。`autopilot on`、発注、停止は全 principal で到達不能のままである|
 |AC-57|`X-Afx-Asserted-Actor` は ASCII `discord:` + 17〜20 桁 ID、最大 28 byte だけを受理し、空・空白・制御文字・非 ASCII・CR/LF・形式外と `ops-bot` 以外からの header は 400。`ops-bot` の決定作成と job polling は同じ actor で成功して `ops_requests` と job 所有に記録され、必須 header 無しは 400、有効だが actor 不一致の polling / queued cancel は 403、`decided_by` は常に `api:ops-bot` のままである|
+|AC-58|`GET /v1/status` は `status.read` だけで固定 schema の `setup` を返す。32 件を超えず、確認記録または観測値に混ぜた URL・例外文・path・秘密値・自由文は応答全体に現れない。`api_*` は現れず、収集例外でも 200 と `record_state=unknown` を返す。CLI は未知 code を更新案内、未知 severity を info、未知 params key を無視として表示し、古い server の setup 欠落時は節を表示しない。|
 
 ## 12. テスト方針
 
@@ -432,3 +434,5 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-09|v1.13|afx-ops spec v1.0 §2 の変更要求を反映。manifest v2 / enroll、新 principal の scope、`X-Afx-Asserted-Actor` と監査・job 所有契約、AC-54〜57 を追加|
 |2026-10-10|v1.14|§3.2 準備状態の検査は鍵集合全体 (別 principal の残骸の上でも別 command は invalid_state)|T1 実装で fail closed 側に揃えた裁定を文言化||
 |2026-10-10|v1.15|§12 に server 認証の oracle fixture (tests/ops/fixtures/server_auth_oracle.json) を記載|afx-ops T1 実装 (AC-13 の black-box oracle)||
+|2026-10-13|v1.16|status の `setup` 固定 schema、fail-soft の `unknown`、非開示不変条件、client 前方互換、受入条件を追加|first-run の未完手順を status.read のまま安全に提供するため||
+|2026-10-14|v1.17|§1.2 の `api.enabled` 既定を true に改訂 (seccomp 投入待ちの規範を撤回、2026-10-12 裁定 P16 / 段 8)|first-run T8 で example / ApiSettings / 運用文書の既定を true にしたため正本を揃えた||

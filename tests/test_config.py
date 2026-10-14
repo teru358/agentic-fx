@@ -42,6 +42,14 @@ def test_example_file_loads():
     assert s.datafeed.primary == "yfinance"
     # 既定の allowlist は空であるべき (検査⑤の守りを弱めない既定値)。
     assert s.service.secret_env_allowlist == []
+    assert s.schema_version == 2
+    assert s.api.enabled is True
+
+
+def test_schema_version_defaults_to_zero_for_existing_settings():
+    raw = load_settings(EXAMPLE).model_dump()
+    raw.pop("schema_version")
+    assert Settings.model_validate(raw).schema_version == 0
 
 
 def test_datafeed_outage_defaults_and_example_are_validated():
@@ -203,16 +211,23 @@ def test_fallback_accepted_when_enabled_and_distinct_from_primary(monkeypatch):
     assert s.datafeed.fallbacks == ["yfinance"]
 
 
-def test_backtest_settings_eval_source_defaults_to_dukascopy():
+def test_backtest_settings_omitted_eval_source_means_unconfigured():
     assert BacktestSettings(
-        holdout_months=1, initial_balance=1.0).eval_source == "dukascopy"
+        holdout_months=1, initial_balance=1.0).eval_source == "none"
 
 
 def test_backtest_settings_constructs_default_history_dataset():
     settings = BacktestSettings(holdout_months=1, initial_balance=1.0)
     assert settings.base_interval == "1m"
     assert settings.dataset().as_dict() == {
-        "source": "dukascopy", "base_interval": "1m"}
+        "source": "none", "base_interval": "1m"}
+
+
+def test_backtest_settings_accepts_unconfigured_history_source():
+    settings = BacktestSettings(
+        holdout_months=1, initial_balance=1.0, eval_source="none")
+
+    assert settings.dataset().unconfigured is True
 
 
 @pytest.mark.parametrize("field,value", [("eval_source", "bogus"),
@@ -720,17 +735,18 @@ def test_backtest_and_analysis_defaults():
     s = load_settings(EXAMPLE)
     assert s.backtest.holdout_months == 3
     assert s.backtest.initial_balance > 0
-    assert s.backtest.eval_source == "dukascopy"
+    assert s.backtest.eval_source == "none"
     assert s.datafeed.watch_symbols == []
     assert s.analysis.max_watch_symbols == 10
     assert s.analysis.max_gap_pct == 5.0
 
 
-def test_backtest_eval_source_accepts_import_source():
+@pytest.mark.parametrize("source", ["mt5", "none"])
+def test_backtest_eval_source_accepts_import_source_or_unconfigured_source(source):
     raw = load_settings(EXAMPLE).model_dump()
-    raw["backtest"]["eval_source"] = "mt5"
+    raw["backtest"]["eval_source"] = source
 
-    assert Settings.model_validate(raw).backtest.eval_source == "mt5"
+    assert Settings.model_validate(raw).backtest.eval_source == source
 
 
 @pytest.mark.parametrize("source", ["yfinance", "unknown"])
@@ -1111,3 +1127,11 @@ def test_context_timeframes_compared_with_decision_timeframe_when_constructed_di
     with pytest.raises(ValidationError,
                        match="context_timeframes must not include the decision timeframe"):
         DatafeedSettings.model_validate(datafeed)
+
+
+def test_settings_without_api_block_uses_enabled_default():
+    raw = load_settings(EXAMPLE).model_dump()
+    raw.pop("api")
+    s = Settings.model_validate(raw)
+    assert s.api.enabled is True
+    assert s.api.socket_path == "data/run/api.sock"

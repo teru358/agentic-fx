@@ -7,14 +7,18 @@ graceful shutdown を担う (Phase 1 プラン 5)。
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
+import re
 import shutil
 import signal
+import stat
 import sys
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,8 +27,9 @@ import jsonschema
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
-from agentic_fx.config import load_env_file, load_settings
+from agentic_fx.config import load_env_file, load_settings, load_settings_text
 from agentic_fx.core import mission_ceiling
+from agentic_fx.core import landlock
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
@@ -57,14 +62,28 @@ from agentic_fx.policy import Policy, directives_path
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
+from agentic_fx.setup.checks import (CheckReason, CheckResult, check_cli_backend,
+                                     check_llama_swap, cli_candidate, is_executable_file)
+from agentic_fx.setup.preflight import Finding, PreflightFailure, is_warning
+from agentic_fx.setup.settings_edit import atomic_write_settings
 from agentic_fx.store import approvals, missions, orders, signals, ohlcv
 from agentic_fx.store.db import connect, connect_readonly, init_db
 from agentic_fx.store.enroll_marker import (
     ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, EnrollInProgress, enroll_marker_present,
 )
+from agentic_fx.store.setup_marker import (
+    EXIT_SETUP_IN_PROGRESS, SETUP_IN_PROGRESS, SetupInProgress, format_setup_marker, remove_setup_marker,
+    setup_marker_present, write_setup_marker,
+)
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 from agentic_fx.store.rag import Rag
+from agentic_fx.store.setup_record import SetupRecord, read_setup_record, write_setup_record
+from agentic_fx.ops_setup.setup_lease import SetupLeaseBusy, acquire_setup_lease
+from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION, _schema_version
 from agentic_fx.store.state import StateStore
+from agentic_fx.setup.pending_facts import collect_pending_facts
+from agentic_fx.setup.pending_steps import pending_steps
+from agentic_fx.setup.pending_text import STEP_PARAMS, render_pending_step, sanitize_param
 from agentic_fx.tools import (
     plugin_loader, signal_tools,
 )
@@ -146,7 +165,16 @@ def _fetch_model_ctx(base: str, model: str, timeout: float) -> int | None:
     return n_ctx
 
 
-def _check_llama_swap(settings) -> None:
+def _check_llama_swap_result(settings, *, fetch=None) -> CheckResult:
+    """Return the catalogue check in its safe, recordable form."""
+    if fetch is None:
+        import httpx
+        fetch = httpx.get
+    return check_llama_swap(settings.llama_swap.base_url, settings.runner.trade.model,
+                            fetch=fetch, timeout=5)
+
+
+def _check_llama_swap(settings) -> CheckResult:
     """llama-swap 接続確認 (上書き 2、プラン 9 Task 5)。一覧取得不能 /
     モデル不在 / cold-load smoke 失敗の 3 種を区別して警告する。init から
     呼ばれる (失敗は警告のみ — 取引判断 Mission は実行時に fail closed で
@@ -164,22 +192,33 @@ def _check_llama_swap(settings) -> None:
     import httpx
     base = settings.llama_swap.base_url
     trade_model = settings.runner.trade.model
+    details: dict[str, object] = {}
 
-    try:
-        r = httpx.get(f"{base}/models", timeout=5)
-        r.raise_for_status()
-        ids = [m.get("id") for m in r.json().get("data", [])
-               if isinstance(m, dict)]
-    except (httpx.RequestError, httpx.HTTPStatusError,
-            ValueError, TypeError) as e:
-        print(f"警告: llama-swap のモデル一覧を取得できません ({e})。"
+    def fetch(url: str, *, timeout: float):
+        try:
+            response = httpx.get(url, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            details["ids"] = [m.get("id") for m in payload.get("data", [])
+                              if isinstance(m, dict)]
+            return response
+        except (httpx.RequestError, httpx.HTTPStatusError,
+                ValueError, TypeError) as error:
+            details["error"] = error
+            raise
+
+    result = _check_llama_swap_result(settings, fetch=fetch)
+    if result.reason_code is CheckReason.CONNECT_ERROR:
+        error = details.get("error", "unknown error")
+        print(f"警告: llama-swap のモデル一覧を取得できません ({error})。"
               "取引判断 Mission は失敗として記録されます。")
-        return
+        return result
 
-    if trade_model not in ids:
+    ids = details.get("ids", [])
+    if result.reason_code is CheckReason.MODEL_NOT_FOUND:
         print(f"警告: モデル '{trade_model}' が llama-swap の /models に存在しません。"
               f"alias 設定を確認してください (存在: {ids})")
-        return
+        return result
 
     order = _model_load_order(settings)
     if len(order) == 2:
@@ -199,7 +238,8 @@ def _check_llama_swap(settings) -> None:
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
         print(f"警告: モデル '{trade_model}' の cold-load smoke に失敗しました ({e})。"
               "初回 Mission が timeout する可能性があります。")
-        return
+        return CheckResult("llama_swap", "unverified", CheckReason.CONNECT_ERROR,
+                           datetime.now(timezone.utc))
 
     # trade は直前の smoke でロード済みなので hot
     trade_ctx = _fetch_model_ctx(base, trade_model, _PROPS_TIMEOUT_HOT)
@@ -207,6 +247,7 @@ def _check_llama_swap(settings) -> None:
         print(f"llama-swap OK (model '{trade_model}' loaded, ctx {trade_ctx})")
     else:
         print(f"llama-swap OK (model '{trade_model}' loaded)")
+    return result
 
 
 _SECRET_ENV_PATTERNS = ("_API_KEY", "TOKEN", "SECRET", "WEBHOOK",
@@ -220,20 +261,22 @@ def _resolve_cli_bin(bin_value: str, *, require_elf: bool) -> Path:
     # (検収実測 2026-08-30): which は "~" を展開しないため、まず展開する。
     # claude ("claude" = PATH 解決) / codex (絶対パス) には無影響。
     bin_value = str(Path(bin_value).expanduser())
-    resolved = shutil.which(bin_value) or (
-        bin_value if Path(bin_value).is_absolute() else None)
+    resolved = cli_candidate(bin_value, which=shutil.which)
     if resolved is None:
-        raise RuntimeError(
+        raise PreflightFailure(
+            "bin_not_found",
             f"runner CLI bin {bin_value!r} not found on PATH nor an "
             "absolute path")
     path = Path(resolved).resolve()
-    if not path.is_file() or not os.access(path, os.X_OK):
-        raise RuntimeError(f"runner CLI bin {path} is not an executable file")
+    if not is_executable_file(path):
+        raise PreflightFailure(
+            "bin_not_found", f"runner CLI bin {path} is not an executable file")
     if require_elf:
         with open(path, "rb") as f:
             magic = f.read(4)
         if magic != b"\x7fELF":
-            raise RuntimeError(
+            raise PreflightFailure(
+                "cli_not_elf",
                 f"runner.codex.bin {path} is not an ELF binary (vendor "
                 "native required — node wrappers like 'codex.js' are "
                 "rejected; find the vendor bin under "
@@ -249,16 +292,19 @@ def _check_cli_version(bin_path: Path) -> None:
                            capture_output=True, timeout=15,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
-        raise RuntimeError(f"runner CLI --version check failed: {e}") from e
+        raise PreflightFailure(
+            "version_check_failed", f"runner CLI --version check failed: {e}") from e
     if r.returncode != 0:
-        raise RuntimeError(
+        raise PreflightFailure(
+            "version_check_failed",
             f"runner CLI --version exited {r.returncode} for {bin_path}")
 
 
 def _check_credentials_file(path_str: str, *, label: str) -> None:
     path = Path(path_str).expanduser()
     if not path.is_file():
-        raise RuntimeError(
+        raise PreflightFailure(
+            "credentials_missing",
             f"{label} credentials file not found: {path} "
             "(run the CLI's login flow first)")
 
@@ -321,7 +367,8 @@ def _check_service_initial_env_has_no_secrets(
             "読める", sorted(excluded_by_allowlist))
     if matches:
         patterns_hit = sorted(set(matches.values()))
-        raise RuntimeError(
+        raise PreflightFailure(
+            "secret_env_present",
             f"{which}+{backend} backend refuses to start: service initial env "
             f"contains secret-like variable name(s) {list(matches)!r} — same-UID "
             "CLI worker can read this service's /proc/<pid>/environ "
@@ -331,7 +378,10 @@ def _check_service_initial_env_has_no_secrets(
             "service.secret_env_allowlist in settings.yaml.")
 
 
-def _check_cli_backend(settings, *, which: str):
+def _check_cli_backend(settings, *, which: str,
+                       findings: list[Finding] | None = None,
+                       verified: dict[str, list[PreflightFailure]] | None = None,
+                       check_secret_env: bool = True):
     """<!-- precheck 2026-08-22: T1-M14 --> CLI backend 起動時検査 ①②③⑤
     (設計書 §1.4)。`which` は `"trade"` か `"improve"` — `getattr(settings.runner,
     which)` で対象の `RunnerChoice` を選ぶ。backend=local の環境では一切
@@ -365,81 +415,238 @@ def _check_cli_backend(settings, *, which: str):
     共通 (backend=local を除く全 CLI backend) で 1 回だけ呼ぶ — 段 0 申し送り
     1: 旧実装は claude 分岐でしか呼んでいなかったが、improve worker は
     codex/opencode 分岐でも同 UID で `/proc/<pid>/environ`
-    を読めるため脅威モデルは同一。"""
+    を読めるため脅威モデルは同一。
+
+    **warning に分類される失敗** (bin が見つからない・認証ファイルが無い・`--version` が通らない) は起動を
+    拒否しない。`findings` に積み、WARNING を 1 行書く。bin を解決できていれば
+    その絶対パスは書き戻した settings を返す (認証・version が通らなくても同じ)。
+    解決できなかったときは settings をそのまま返し、mission は実行時に fail closed で
+    止まる。分類は `setup.preflight.is_warning` の 1 箇所。fatal は従来どおり例外。
+
+    `verified` を渡すと (backend, which) ごとの検査結果を共有する。同じ組を再び検査する
+    ときは前回の結果を使う。"""
     choice = getattr(settings.runner, which)
     backend = choice.backend
     if backend == "local":
         return settings
+    key = (backend, which)
+    if verified is not None and key in verified:
+        for failure in verified[key]:
+            _log.warning("%s+%s backend は未確認のまま起動します (%s): %s",
+                         which, backend, failure.code, failure)
+    else:
+        failures: list[PreflightFailure] = []
+        try:
+            settings, failures = _check_cli_backend_steps(settings, backend)
+        except PreflightFailure as exc:
+            if not is_warning(exc.code):
+                raise
+            failures = [exc]
+        for failure in failures:
+            if not is_warning(failure.code):
+                raise failure
+        for failure in failures:
+            _log.warning("%s+%s backend は未確認のまま起動します (%s): %s",
+                         which, backend, failure.code, failure)
+            if findings is not None:
+                findings.append(Finding(failure.code, str(failure)))
+        if verified is not None:
+            verified[key] = failures
+    if check_secret_env:
+        _check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)
+    return settings
+
+
+def _after_resolve(checks) -> list[PreflightFailure]:
+    """bin の解決後に行う検査を全て走らせ、失敗を全部集めて返す (投げない)。"""
+    failures: list[PreflightFailure] = []
+    for check in checks:
+        try:
+            check()
+        except PreflightFailure as exc:
+            failures.append(exc)
+    return failures
+
+
+def _check_cli_backend_steps(settings, backend: str):
+    """bin の解決 → 解決済み絶対パスの書き戻し → version / 認証ファイルの検査。
+
+    `(settings, failures)` を返す。bin が解決できなかった失敗と opencode 未検証は
+    そのまま投げる (書き戻すものが無い)。解決後の失敗は投げずに返すので、warning
+    でも絶対パスは書き戻した settings が呼び出し元に届く。"""
     if backend == "claude":
         bin_path = _resolve_cli_bin(settings.runner.claude.bin, require_elf=False)
-        _check_cli_version(bin_path)
-        _check_credentials_file(settings.runner.claude.credentials_file,
-                                label="claude")
+        credentials_file = settings.runner.claude.credentials_file
         settings = settings.model_copy(update={
             "runner": settings.runner.model_copy(update={
                 "claude": settings.runner.claude.model_copy(
                     update={"bin": str(bin_path)})})})
+        failures = _after_resolve((
+            lambda: _check_cli_version(bin_path),
+            lambda: _check_credentials_file(credentials_file, label="claude")))
     elif backend == "codex":
         bin_path = _resolve_cli_bin(settings.runner.codex.bin, require_elf=True)
-        _check_cli_version(bin_path)
-        if settings.runner.codex.provider == "chatgpt":
-            _check_credentials_file(settings.runner.codex.auth_file,
-                                    label="codex")
-            # T4 是正 (test-hygiene 設計書 2026-09-12、指揮者裁定): 旧
-            # `_check_codex_subscription_expiry` は撤去した — 実
-            # `~/.codex/auth.json` (codex CLI 0.150.1) のトップレベル
-            # キーは `auth_mode`/`OPENAI_API_KEY`/`tokens`/`last_refresh`
-            # のみで `chatgpt_subscription_active_until` は存在せず、
-            # 4 run 連続で「キーが無い」WARNING が空振りしていた
-            # (期限相当の情報がこのスキーマに無い)。期限切れは codex 自身
-            # が実行時に 401/usage limit で返すのに任せ、その応答を
-            # `cli_runner.CLI_STDERR_FATAL_PATTERNS` で検知する。
+        provider = settings.runner.codex.provider
+        auth_file = settings.runner.codex.auth_file
         settings = settings.model_copy(update={
             "runner": settings.runner.model_copy(update={
                 "codex": settings.runner.codex.model_copy(
                     update={"bin": str(bin_path)})})})
+        checks = [lambda: _check_cli_version(bin_path)]
+        if provider == "chatgpt":
+            # codex のサブスク期限は起動時に検査しない (認証ファイルに期限相当の
+            # キーが無い)。期限切れは codex 自身が実行時に 401 / usage limit で返すので、
+            # `cli_runner.CLI_STDERR_FATAL_PATTERNS` で検知する。
+            checks.append(lambda: _check_credentials_file(auth_file, label="codex"))
+        failures = _after_resolve(checks)
     elif backend == "opencode":
         if not settings.improve.llama_swap_verified:
-            raise RuntimeError(
+            raise PreflightFailure(
+                "opencode_unverified",
                 "runner.improve.backend='opencode' requires "
                 "improve.llama_swap_verified=true (set only after "
                 "`afx improve verify-backend --backend opencode` passes)")
         bin_path = _resolve_cli_bin(settings.runner.opencode.bin, require_elf=True)
-        _check_cli_version(bin_path)
         settings = settings.model_copy(update={"runner": settings.runner.model_copy(
             update={"opencode": settings.runner.opencode.model_copy(
                 update={"bin": str(bin_path)})})})
-    _check_service_initial_env_has_no_secrets(settings, which=which, backend=backend)
-    return settings
+        failures = _after_resolve((lambda: _check_cli_version(bin_path),))
+    else:
+        failures = []
+    return settings, failures
 
 
-def run_init(root: Path) -> int:
+def _record_check(result: CheckResult) -> dict[str, str]:
+    data = {"result": result.result, "at": result.at.isoformat()}
+    if result.reason_code is not None:
+        data["reason_code"] = result.reason_code.value
+    return data
+
+
+def _runner_check_result(settings, *, which: str) -> CheckResult:
+    choice = getattr(settings.runner, which)
+    if choice.backend == "local":
+        return check_llama_swap(settings.llama_swap.base_url, choice.model,
+                                fetch=__import__("httpx").get, timeout=5)
+    if choice.backend == "claude":
+        return check_cli_backend("claude", settings.runner.claude.bin,
+                                 settings.runner.claude.credentials_file)
+    if choice.backend == "codex":
+        credentials = (settings.runner.codex.auth_file
+                       if settings.runner.codex.provider == "chatgpt" else None)
+        return check_cli_backend("codex", settings.runner.codex.bin, credentials,
+                                 require_elf=True)
+    return check_cli_backend("opencode", settings.runner.opencode.bin, None,
+                             require_elf=True)
+
+
+def _non_interactive_record(settings, price: CheckResult, trade: CheckResult,
+                            improve: CheckResult) -> SetupRecord:
+    return SetupRecord({
+        "version": 1,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "mode": "non-interactive",
+        "settings_schema_version": settings.schema_version,
+        "price": _record_check(price),
+        "llm_trade": _record_check(trade),
+        "llm_improve": _record_check(improve),
+        "bridge_plan": "planned",
+        "history": {"source": settings.datafeed.primary},
+        "indicators": {"installed": 0},
+        "api": {"enabled": settings.api.enabled, "result": "unchecked"},
+        "ops": {},
+        "isolation": {"admitted": "unknown"},
+        "linger": {"state": "not_checked"},
+        "start": {"result": "skipped"},
+        "unit": "not_installed",
+    })
+
+
+class _NotRegularFile(Exception):
+    pass
+
+
+def _read_regular_file(path: Path) -> bytes:
+    """symlink を辿らず、通常ファイルだけを読む (FIFO 等で塞がらない)。"""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotRegularFile()
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(fd)
+
+
+def run_init(root: Path, *, config_file: Path | None = None) -> int:
+    root = Path(root).resolve()
     cfg_dir = root / "config"
     example = cfg_dir / "settings.yaml.example"
     target = cfg_dir / "settings.yaml"
-    if not example.exists():
+    if not root.is_dir() or not example.is_file():
         print(f"settings.yaml.example が見つかりません: {example}", file=sys.stderr)
+        return 2
+    if config_file is not None and target.exists():
+        print(f"settings.yaml は既に存在するため上書きしません: {target}", file=sys.stderr)
         return 1
-    if not target.exists():
-        shutil.copy(example, target)
-        print(f"作成: {target} (必要に応じて編集してください)")
-    settings = load_settings(target)  # 検証を兼ねる
+    source = Path(config_file) if config_file is not None else (target if target.exists() else example)
+    try:
+        if config_file is not None:
+            source_text = _read_regular_file(source).decode("utf-8")
+        else:
+            source_text = source.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError, _NotRegularFile):
+        print("設定ファイルを読めません: 通常ファイルのみ指定できます", file=sys.stderr)
+        return 1
+    version, reason = _schema_version(source_text)
+    if reason is not None:
+        print(reason, file=sys.stderr)
+        return 1
+    if version < CURRENT_SCHEMA_VERSION:
+        print("settings の版が古いため非対話では移行しません。`afx init` (対話) で移行します",
+              file=sys.stderr)
+        return 1
+    if version > CURRENT_SCHEMA_VERSION:
+        print("settings の版が新しすぎます。afx を更新してください", file=sys.stderr)
+        return 1
+    try:
+        settings = load_settings_text(source_text)
+    except Exception as error:
+        print(f"settings の検証に失敗しました: {error}", file=sys.stderr)
+        return 1
+    try:
+        lease = acquire_setup_lease(root)
+    except SetupLeaseBusy:
+        print("初期設定は別の操作が実行中のため開始できません。", file=sys.stderr)
+        return 2
+    try:
+        try:
+            lease.acquire_instance_lock()
+        except InstanceAlreadyRunning:
+            print("サービスが稼働中のため初期設定を開始できません。", file=sys.stderr)
+            return 2
+        write_setup_marker(root, format_setup_marker(
+            "commit", datetime.now(timezone.utc).isoformat(),
+            hashlib.sha256(source_text.encode("utf-8")).hexdigest()))
+        if not target.exists():
+            atomic_write_settings(target, source_text)
+            print(f"作成: {target} (必要に応じて編集してください)")
 
-    (root / "logs").mkdir(parents=True, exist_ok=True)
-    setup_technical_logging(root / "logs", settings.logging.level)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        setup_technical_logging(root / "logs", settings.logging.level)
 
     # init_db は既存 DB のスキーマが旧形式なら移行 (例: ohlcv v1→v2 の table
     # rebuild) を実行する。移行が必要な場合は init_db が自動で
     # agentic.db.bak-ohlcv-v2 を作ってから rebuild する (db._migrate_ohlcv_v2
     # 参照) が、サービスは停止した状態で実行すること (WAL 越しの同時書き込み
     # は想定していない)。
-    conn = connect(root / "data" / "agentic.db")
-    init_db(conn)
+        conn = connect(root / "data" / "agentic.db")
+        init_db(conn)
 
-    clock = SystemClock()
-    seeded = seed_default_sources(conn, clock.now())
-    if seeded:
-        print(f"基本ニュースソースを {seeded} 件登録しました")
+        clock = SystemClock()
+        seeded = seed_default_sources(conn, clock.now())
+        if seeded:
+            print(f"基本ニュースソースを {seeded} 件登録しました")
 
     # 価格ソースの接続確認。**DataUnhealthy は警告に留めて init は成功させる**
     # (オフライン環境でも初期化を完了できるようにする。データ不健全時に取引を
@@ -448,40 +655,53 @@ def run_init(root: Path) -> int:
     # 落とすと init が「常に成功する」だけのコマンドになり、確認の意味が
     # 無くなる。この確認は state 更新より前に置いてあるので、想定外の例外で
     # 落ちた場合は未初期化のまま残り、起動ガードが引き続き止める。
-    try:
-        source = PriceProvider(conn, settings, clock, readonly=True).healthcheck(
-            settings.pairs[0])   # pairs は空を config が弾く (min_length=1)
-    except DataUnhealthy as e:
+        try:
+            source_name = PriceProvider(conn, settings, clock, readonly=True).healthcheck(
+                settings.pairs[0])   # pairs は空を config が弾く (min_length=1)
+        except DataUnhealthy as e:
         # safe_error_text を再度通す (多層防御)。init の標準出力は人が見て
         # コピペする場所で、技術ログより秘密が漏れたときの帰結が重い
-        print(f"警告: 価格ソースに接続できません ({safe_error_text(e)})。"
-              "サービス起動後は fail closed で保護されます。")
-    else:
+            print(f"警告: 価格ソースに接続できません ({safe_error_text(e)})。"
+                  "サービス起動後は fail closed で保護されます。")
+            price_result = CheckResult("price", "unverified", CheckReason.CONNECT_ERROR,
+                                       datetime.now(timezone.utc))
+        else:
         # 確認したペアを明示する。config は複数ペアを許すが healthcheck は
         # 先頭 1 ペアしか見ないため、無限定の「OK」は 2 ペア目以降が壊れて
         # いても OK に見える (レビュー指摘 Minor-3)。
-        print(f"価格ソース OK ({settings.pairs[0]}, source={source})")
+            print(f"価格ソース OK ({settings.pairs[0]}, source={source_name})")
+            price_result = CheckResult("price", "ok", None, datetime.now(timezone.utc))
 
     # llama-swap 接続確認 (プラン 5 — 上書き 2)。失敗は警告のみ (init は成功させる)。
-    _check_llama_swap(settings)
+        llama_result = _check_llama_swap(settings)
+        if not isinstance(llama_result, CheckResult):
+            llama_result = CheckResult("llama_swap", "unverified", CheckReason.CONNECT_ERROR,
+                                       datetime.now(timezone.utc))
+        trade_result = _runner_check_result(settings, which="trade")
+        improve_result = _runner_check_result(settings, which="improve")
 
     # learning への切替はモード遷移ガード (§3) を通る mode コマンドのみ。
     # init はガードの迂回路にしない: trading 中は mode/autopilot に触れない。
-    store = _state_store(root)
-    if store.load().mode is Mode.TRADING:
-        state = store.update(initialized=True)
-        print("警告: 現在 trading モードです。init は mode/autopilot を変更しません "
-              "(切替は mode コマンドを使用)。")
-    else:
-        state = store.update(initialized=True, mode=Mode.LEARNING,
-                             autopilot=False)
+        write_setup_record(root, _non_interactive_record(settings, price_result,
+                                                          trade_result, improve_result))
+        store = _state_store(root)
+        if store.load().mode is Mode.TRADING:
+            state = store.update(initialized=True)
+            print("警告: 現在 trading モードです。init は mode/autopilot を変更しません "
+                  "(切替は mode コマンドを使用)。")
+        else:
+            state = store.update(initialized=True, mode=Mode.LEARNING,
+                                 autopilot=False)
 
-    ActivityLog(root / "logs" / "activity.log").write(
-        Category.SYSTEM, "init_completed",
-        f"pairs={settings.pairs} mode={state.mode.value} "
-        f"autopilot={'on' if state.autopilot else 'off'}")
-    print("初期化が完了しました。`uv run main.py` でサービスを起動できます。")
-    return 0
+        ActivityLog(root / "logs" / "activity.log").write(
+            Category.SYSTEM, "init_completed",
+            f"pairs={settings.pairs} mode={state.mode.value} "
+            f"autopilot={'on' if state.autopilot else 'off'}")
+        remove_setup_marker(root)
+        print("初期化が完了しました。`uv run main.py` でサービスを起動できます。")
+        return 0
+    finally:
+        lease.close()
 
 
 # ---- サービス本体配線 (プラン 5) -------------------------------------------
@@ -532,6 +752,8 @@ class App:
     # 起動時回復が済んだときだけ listener を開く。
     ops_recovered: bool = False
     api: object | None = None
+    # build_app が解決した root (起動時表示が記録を読むために使う)。
+    root: Path | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -586,7 +808,8 @@ def _validate_cache_retention(settings) -> None:
             except DataUnhealthy:
                 continue  # この source は interval を提供も導出もできない
             if needed > d.cache_retention_days:
-                raise RuntimeError(
+                raise PreflightFailure(
+                    "cache_retention_inconsistent",
                     f"datafeed.cache_retention_days={d.cache_retention_days} "
                     f"日は interval={interval!r} (source={source!r}) が要求 "
                     f"する {needed} 日を下回っています — "
@@ -602,16 +825,19 @@ def _validate_startup(settings) -> None:
     サイレントに Mission が全滅する事態を避ける。
     """
     if not settings.pairs:
-        raise RuntimeError("settings.pairs is empty — cannot start service")
+        raise PreflightFailure(
+            "pairs_empty", "settings.pairs が空です (pairs に通貨ペアを 1 つ以上指定してください)")
     schemas = (trade_intent_schema(settings.pairs), ANSWER_SCHEMA,
               reflection_cycle._SCHEMA)
     for schema in schemas:
         try:
             jsonschema.Draft202012Validator.check_schema(schema)
         except jsonschema.exceptions.SchemaError as e:
-            raise RuntimeError(f"invalid tool/output schema: {e}") from e
+            raise PreflightFailure(
+                "settings_invalid", f"invalid tool/output schema: {e}") from e
     if settings.datafeed.primary not in ohlcv.KNOWN_OHLCV_SOURCES:
-        raise RuntimeError(
+        raise PreflightFailure(
+            "datafeed_primary_unknown",
             f"settings.datafeed.primary={settings.datafeed.primary!r} "
             f"is not a known source (known: {sorted(ohlcv.KNOWN_OHLCV_SOURCES)})")
     _validate_cache_retention(settings)
@@ -645,7 +871,9 @@ def _startup_plugin_dispositions(settings, plugins, activity):
                 reason = (f"{requirement.consumer_id}: {requirement.reason}; "
                           f"source={source} interval={native} {detail}")
                 if disposition == "reject_startup":
-                    raise RuntimeError("core closed-bar requirement is structurally unavailable: " + reason)
+                    raise PreflightFailure(
+                        "plugin_retention_short",
+                        "core closed-bar requirement is structurally unavailable: " + reason)
                 disabled.add(requirement.consumer_id)
                 activity.write(Category.SYSTEM, "plugin_closed_bars_disabled",
                                f"{reason} (retention structurally unavailable)",
@@ -659,7 +887,9 @@ def _startup_plugin_dispositions(settings, plugins, activity):
                   f"required={requirement.required_closed_bars} "
                   f"capability_days={detail.capability if detail else None}")
         if disposition == "reject_startup":
-            raise RuntimeError(f"core closed-bar requirement is structurally unavailable: {reason}")
+            raise PreflightFailure(
+                "plugin_retention_short",
+                f"core closed-bar requirement is structurally unavailable: {reason}")
         disabled.add(requirement.consumer_id)
         activity.write(Category.SYSTEM, "plugin_closed_bars_disabled",
                        f"{reason} (structurally unavailable)",
@@ -702,7 +932,8 @@ def _check_mission_ceilings(settings, activity) -> None:
     width_sec = settings.datafeed.decision_timeframe_width.total_seconds()
     cw = mission_ceiling.worker_ceiling(settings)
     if cw.total >= width_sec:
-        raise RuntimeError(
+        raise PreflightFailure(
+            "mission_ceiling_violation",
             f"判断足 {timeframe} ({width_sec:.0f} 秒) に対し worker 1 回の上限 "
             f"Cw {cw.total:.0f} 秒 ({cw.breakdown_text()}) が足幅以上です。"
             "1 確定足に 1 回の判断が成立しません。判断足を 15m 以上にするか "
@@ -712,7 +943,8 @@ def _check_mission_ceilings(settings, activity) -> None:
     lease_threshold = cw.total + LEASE_COMMIT_MARGIN_SEC
     if lease_sec <= lease_threshold:
         suggested_min = int(lease_threshold // 60) + 1
-        raise RuntimeError(
+        raise PreflightFailure(
+            "mission_ceiling_violation",
             f"signal_lease_min {lease_min} 分 ({lease_sec} 秒) が mission の"
             f"上限 {cw.total:.0f} 秒 + commit-pre のネットワーク呼出し分の"
             f"余白 {LEASE_COMMIT_MARGIN_SEC:.0f} 秒 = {lease_threshold:.0f} "
@@ -721,7 +953,8 @@ def _check_mission_ceilings(settings, activity) -> None:
     cd = mission_ceiling.dispatch_ceiling_sec(settings)
     explicit = settings.worker.dispatch_ceiling_sec
     if explicit is not None and explicit < cd:
-        raise RuntimeError(
+        raise PreflightFailure(
+            "mission_ceiling_violation",
             f"worker.dispatch_ceiling_sec={explicit:g} は dispatch 全体の上限 "
             f"Cd {cd:.0f} 秒未満です。正常な dispatch の途中で watchdog が"
             f"サービスを止め得るため、{cd:.0f} 以上にするか未設定 (自動導出) に"
@@ -734,6 +967,71 @@ def _check_mission_ceilings(settings, activity) -> None:
             f"{mission_ceiling.REFLECTIONS_PER_DISPATCH}、Cw {cw.total:.0f} 秒) が"
             "足幅以上です。起動は続けます。見送り・合流は cron_mission_deferred / "
             "cron_mission_coalesced で確認できます")
+
+
+@dataclass
+class StartupContext:
+    """起動前検査の各段が共有する入出力。
+
+    `plugins` は承認済み plugin の一覧で、retention を満たせない任意 plugin は検査の中で
+    取り除かれる。`findings` には起動を止めない失敗が積まれる。`cli_ok` は検査を通った
+    CLI backend の `which`、`cli_verified` は (backend, which) ごとの失敗一覧の共有先。
+    `check_secret_env` が偽のとき、サービスの初期 env の検査 (秘密らしい変数名) を行わない。"""
+    activity: Any
+    plugins: list = field(default_factory=list)
+    findings: list[Finding] | None = None
+    cli_ok: set[str] = field(default_factory=set)
+    cli_verified: dict[tuple[str, str], list[PreflightFailure]] = field(default_factory=dict)
+    check_secret_env: bool = True
+
+
+def _startup_settings_valid(settings, ctx: StartupContext):
+    _validate_startup(settings)
+    return settings
+
+
+def _startup_plugin_retention(settings, ctx: StartupContext):
+    try:
+        ctx.plugins = _startup_plugin_dispositions(settings, ctx.plugins, ctx.activity)
+    except ValueError as exc:
+        raise PreflightFailure("settings_invalid", str(exc).splitlines()[0] if str(exc) else
+                               "retention の設定が不正です") from exc
+    return settings
+
+
+def _startup_mission_ceilings(settings, ctx: StartupContext):
+    _check_mission_ceilings(settings, ctx.activity)
+    return settings
+
+
+def _startup_cli_backend(which: str):
+    def check(settings, ctx: StartupContext):
+        settings = _check_cli_backend(settings, which=which, findings=ctx.findings,
+                                      verified=ctx.cli_verified,
+                                      check_secret_env=ctx.check_secret_env)
+        if getattr(settings.runner, which).backend != "local":
+            if not ctx.cli_verified.get((getattr(settings.runner, which).backend, which)):
+                ctx.cli_ok.add(which)
+        return settings
+    check.__name__ = f"_startup_cli_backend_{which}"
+    return check
+
+
+# サービスの起動前検査と `afx check` が同じ順で回す一覧。各段は (settings, ctx) を受けて
+# 解決済みの settings を返す。検査を足すときはここに足す。
+STARTUP_CHECKS: tuple = (
+    _startup_settings_valid,
+    _startup_plugin_retention,
+    _startup_mission_ceilings,
+    _startup_cli_backend("trade"),
+    _startup_cli_backend("improve"),
+)
+
+def run_startup_checks(settings, ctx: StartupContext):
+    """`STARTUP_CHECKS` を順に呼び、解決済みの settings を返す。"""
+    for check in STARTUP_CHECKS:
+        settings = check(settings, ctx)
+    return settings
 
 
 def _assert_tools_registered(registry: ToolRegistry, names: list[str]) -> None:
@@ -809,23 +1107,34 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
         resolved_by_identity=resolved_by_identity, activity=activity)
 
 
+def _raise_if_start_marker_present(root: Path) -> None:
+    """Refuse startup in the fixed priority order without reading marker contents."""
+    if enroll_marker_present(root):
+        raise EnrollInProgress(ENROLL_IN_PROGRESS)
+    if setup_marker_present(root):
+        raise SetupInProgress(SETUP_IN_PROGRESS)
+
+
 def _acquire_lock_unless_enrolling(root: Path):
-    """enable が鍵を enroll している間は manifest に触れる前に起動を断る。
+    """enroll または setup の handoff 中は manifest に触れる前に起動を断る。
 
     marker を flock より先に見る。確認と取得の間に enable が marker を置いて flock を
     握ることもあるので、取得の失敗時と成功直後にも marker を見直す。
     """
-    if enroll_marker_present(root):
-        raise EnrollInProgress(ENROLL_IN_PROGRESS)
+    _raise_if_start_marker_present(root)
     try:
         lock = acquire_instance_lock(root / "data")
     except InstanceAlreadyRunning:
-        if enroll_marker_present(root):
-            raise EnrollInProgress(ENROLL_IN_PROGRESS) from None
+        try:
+            _raise_if_start_marker_present(root)
+        except (EnrollInProgress, SetupInProgress):
+            raise
         raise
-    if enroll_marker_present(root):
+    try:
+        _raise_if_start_marker_present(root)
+    except (EnrollInProgress, SetupInProgress):
         lock.close()
-        raise EnrollInProgress(ENROLL_IN_PROGRESS)
+        raise
     return lock
 
 
@@ -863,6 +1172,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     カスタム PriceProvider を渡すこと (本 E2E テスト `tests/test_e2e_phase1.py`
     参照)。
     """
+    root = Path(root).resolve()
+    _raise_if_start_marker_present(root)
     supplied_provider = provider is not None
     clock = clock or SystemClock()
     stop_event = stop_event if stop_event is not None else threading.Event()
@@ -1047,7 +1358,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         inventory_result = plugin_loader.approved_plugins(
             conn_core, plugins_dir, settings=settings)
         approved = list(inventory_result.inventory.metas)
-        approved = _startup_plugin_dispositions(settings, approved, activity)
+        # 設定・plugin の retention・mission の上限・CLI backend の起動前検査。
+        # CLI の戻り値 (bin を解決済み絶対パスへ書き戻した settings) で差し替える。
+        # この後に構築する WorkerRunner/registry が絶対パスの settings を受け取る
+        # ようにするため、必ず WorkerRunner 構築より前に置く。
+        startup = StartupContext(activity, approved, [])
+        settings = run_startup_checks(settings, startup)
+        approved = startup.plugins
+        for finding in startup.findings or []:
+            activity.write(Category.SYSTEM, "startup_warning", finding.code)
         _warn_strategy_timeframe_mismatches(settings, approved)
 
         # プラン 7 Task 8: signal producer (承認済み signal/strategy plugin の
@@ -1063,14 +1382,6 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         registry = build_mission_registry(
             "trade", conn_core, settings, clock, rag, activity=activity,
             indicator_plugins=approved, provider=provider)
-        # 上書き 4/5: 配線ミスは起動時 RuntimeError で殺す (registry 組み立て後)
-        _validate_startup(settings)
-        _check_mission_ceilings(settings, activity)
-        # 段 0 F1 是正: 戻り値 (bin を解決済み絶対パスへ書き戻した settings)
-        # で差し替える。この後に構築する WorkerRunner/registry が絶対パスの
-        # settings を受け取るようにするため、必ず WorkerRunner 構築より前に置く。
-        settings = _check_cli_backend(settings, which="trade")
-        settings = _check_cli_backend(settings, which="improve")
         _assert_tools_registered(registry, _TRADE_TOOLS)
 
         owns_runner = runner is None
@@ -1371,7 +1682,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    health_latch=health_latch,
                    watchdog_heartbeat=watchdog_heartbeat,
                    fatal_reason=None, ingest=ingest, outage=outage,
-                   ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered)
+                   ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered,
+                   root=root)
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -1421,24 +1733,86 @@ def _api_limits(settings) -> ApiLimits:
                      request_deadline_seconds=api.request_deadline_sec)
 
 
+_STATUS_SETUP_CODES = frozenset({
+    "setup_record_missing", "llm_unverified", "opencode_unverified",
+    "bridge_not_connected", "env_key_missing", "indicators_missing", "no_strategy",
+    "history_missing", "history_source_unconfigured", "approval_stalled",
+    "landlock_unavailable", "yfinance_weekend_gap", "ops_incomplete", "ops_not_ready",
+    "isolation_not_admitted", "start_pending", "linger_off",
+})
+
+
+def _status_setup_value(kind: str, value, fallback):
+    return sanitize_param(kind, value, fallback)
+
+
+def _status_observed_at(value: datetime) -> str:
+    if not isinstance(value, datetime):
+        value = datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _serialize_status_setup(facts) -> dict:
+    record_state = facts.record_state if facts.record_state in {"ok", "missing", "corrupt"} else "unknown"
+    items = []
+    for step in pending_steps(facts, for_status=True):
+        if step.code not in _STATUS_SETUP_CODES:
+            continue
+        schema = STEP_PARAMS.get(step.code, {})
+        params = {key: _status_setup_value(kind, step.params.get(key), fallback)
+                  for key, (kind, fallback) in schema.items()}
+        items.append({"code": step.code,
+                      "severity": step.severity if step.severity in {"info", "warn", "action"} else "info",
+                      "observed_at": _status_observed_at(step.observed_at), "params": params})
+        if len(items) == 32:
+            break
+    return {"record_state": record_state, "pending_steps": items}
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
+    landlock_cache: list[bool] = []
+
+    def landlock_state() -> bool | None:
+        # 表示専用。最初の status で 1 回だけ算出し、失敗は不明 (None) として扱う。
+        if not landlock_cache:
+            try:
+                landlock_cache.append(bool(landlock.is_available()))
+            except Exception:  # noqa: BLE001
+                return None
+        return landlock_cache[0]
 
     def status_provider() -> dict:
-        # API thread から呼ばれる。core_lock も ops の接続も使わず、読み取り専用の
-        # 短命な接続で読む。
-        with status_lock:
-            conn = connect_readonly(db_path)
-            try:
+        # API thread から呼ばれる。core_lock も scheduler / ops の接続も使わず、
+        # 読み取り専用の短命な接続だけで読む (outage の状態もその接続で読む)。
+        conn = connect_readonly(db_path)
+        try:
+            with status_lock:
                 balance, equity = PaperBroker(conn, settings, clock).equity()
                 active = orders.list_by_status(conn, "open", "pending_fill",
                                                "protection_pending")
                 recent = missions.recent(conn, 1)
-            finally:
-                conn.close()
+                data_state = str(outage.state_from(conn))
+            try:
+                landlock_ok = landlock_state()
+                # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
+                deployed = () if not plugins_dir.is_dir() else plugin_loader.approved_plugins(
+                    conn, plugins_dir, settings=settings).inventory.metas
+                facts = collect_pending_facts(
+                    root, settings, conn, deployed_plugins=deployed,
+                    outage=outage, clock=clock, landlock_available=landlock_ok,
+                    data_state=data_state)
+                setup = _serialize_status_setup(facts)
+            except Exception as exc:  # noqa: BLE001 — optional setup guidance must not break status
+                _log.warning("status setup facts unavailable: %s", type(exc).__name__)
+                setup = {"record_state": "unknown", "pending_steps": []}
+        finally:
+            conn.close()
         mission = None
         if recent:
             mission = {"loop": recent[0]["loop"], "status": recent[0]["status"],
@@ -1447,7 +1821,7 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 "orders": {"active": len(active)}, "mission": mission,
                 "health": {"latched": health_latch.is_latched(),
                            "failures": len(health_latch.summary())},
-                "data": {"state": str(outage.state)}}
+                "data": {"state": data_state}, "setup": setup}
 
     def ask_submitter(question: str):
         submitted = supervisor.try_submit("ask", question=question)
@@ -1519,7 +1893,7 @@ def start_ops_api(app: App, root: Path) -> None:
         return
     # bool の True だけを有効とみなす (設定以外の値で鍵を作り listener を開かない)。
     if settings.api.enabled is not True:
-        # 改善 worker の seccomp が入るまでの既定。daemon の起動は拒否しない。
+        # 利用者が明示的に無効にした場合。daemon の起動は拒否しない。
         _log.warning("operations API is disabled (api.enabled=false); listener not opened")
         app.activity.write(Category.SYSTEM, "api_disabled",
                            "api.enabled=false のため操作 API の listener を開きません")
@@ -1585,6 +1959,24 @@ _RECONCILE_SPLASH_LINE = (
     "`killswitch reconcile` で確認\n")
 
 
+def _splash_setup_section(app: App) -> str:
+    """起動スプラッシュの「未完の手順」。算出に失敗しても起動は止めない。
+
+    splash は起動直後の表示なので、その時点で非終端の journal 行は中断したもの。
+    """
+    try:
+        setup_steps = pending_steps(collect_pending_facts(
+            app.root, app.settings, app.conn_shell,
+            deployed_plugins=app.approved_plugins, outage=app.outage, clock=app.clock))
+        if not setup_steps:
+            return ""
+        shown = "\n".join(f"- {render_pending_step(step)}" for step in setup_steps[:3])
+        return f"\n未完の手順 ({len(setup_steps)} 件)\n{shown}\n"
+    except Exception as exc:  # noqa: BLE001 — 表示だけの情報で起動を止めない
+        _log.warning("startup splash pending steps unavailable: %s", type(exc).__name__)
+        return "\n未完の手順を算出できません (afx check を実行してください)\n"
+
+
 def build_splash(app: App) -> str:
     """起動スプラッシュ。項目は最小でよい (運用しながら調整 — 設計書 §8)。
 
@@ -1594,6 +1986,7 @@ def build_splash(app: App) -> str:
     balance, equity = app.commands.broker.equity()  # conn_shell 側
     pending = len(approvals.pending(app.conn_shell))
     limits = len(orders.list_by_status(app.conn_shell, "pending_fill"))
+    setup_section = _splash_setup_section(app)
     return (
         "=== agentic-fx ===\n"
         f"mode: {s.mode.value} / autopilot: {'on' if s.autopilot else 'off'}"
@@ -1606,6 +1999,7 @@ def build_splash(app: App) -> str:
         f" DD kill {app.settings.risk.drawdown_kill_pct}%,"
         f" daily {app.settings.risk.daily_loss_limit_pct}%\n"
         f"残高: {balance:,.0f} / 承認待ち: {pending} / 未約定指値: {limits}\n"
+        f"{setup_section}"
         "コマンドは help を参照。stop で終了。")
 
 
@@ -1928,6 +2322,15 @@ def run_service(root: Path, *, daemon: bool = False,
     済みのイベントや、`.wait()` から `KeyboardInterrupt` を送出するカスタム
     実装を注入することで、実スリープ・実シグナルなしに shutdown 経路を検証
     できる。"""
+    root = Path(root).resolve()
+    try:
+        _raise_if_start_marker_present(root)
+    except EnrollInProgress:
+        print(f"afx: {ENROLL_IN_PROGRESS}", file=sys.stderr)
+        return EXIT_ENROLL_IN_PROGRESS
+    except SetupInProgress:
+        print(f"afx: {SETUP_IN_PROGRESS}", file=sys.stderr)
+        return EXIT_SETUP_IN_PROGRESS
     ensure_initialized(root)
     # 設定の検証は環境を変えないので、.env はここ (daemon 起動の top-level) で
     # 明示的に読む。build_app 以降の env 参照より前に置く。
@@ -1942,6 +2345,9 @@ def run_service(root: Path, *, daemon: bool = False,
         # systemd が RestartPreventExitStatus で再起動しないよう、専用の終了コードで返す。
         print(f"afx: {ENROLL_IN_PROGRESS}", file=sys.stderr)
         return EXIT_ENROLL_IN_PROGRESS
+    except SetupInProgress:
+        print(f"afx: {SETUP_IN_PROGRESS}", file=sys.stderr)
+        return EXIT_SETUP_IN_PROGRESS
 
     warning = Policy(directives_path(root)).size_warning()
     if warning:

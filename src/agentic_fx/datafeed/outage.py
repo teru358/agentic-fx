@@ -148,6 +148,15 @@ class OutageStateMachine:
             return "degraded"
         return self._load_row().get("state", "ready")
 
+    def state_from(self, conn) -> str:
+        """`state` と同じ値を、渡された接続だけで読む (`self.conn` には触れない)。
+
+        API thread の status など、scheduler の接続を跨げない読み手向け。
+        """
+        if self._observe_failed:
+            return "degraded"
+        return self._load_row(conn=conn).get("state", "ready")
+
     def status(self, *, conn=None) -> dict:
         """人間向け表示用のスナップショット。
 

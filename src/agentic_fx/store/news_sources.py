@@ -5,12 +5,14 @@ from datetime import datetime
 
 
 def add(conn: sqlite3.Connection, *, name: str, fetcher: str, url: str,
-        added_by: str, now: datetime, enabled: bool = False) -> int:
+        added_by: str, now: datetime, enabled: bool = False,
+        commit: bool = True) -> int:
     cur = conn.execute(
         "INSERT INTO news_sources (name, fetcher, url, enabled, added_by, created_at) "
         "VALUES (?,?,?,?,?,?)",
         (name, fetcher, url, int(enabled), added_by, now.isoformat()))
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 

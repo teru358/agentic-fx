@@ -30,6 +30,7 @@ _RENAME_NOREPLACE = 1
 
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import Category
+from agentic_fx.backtest.dataset import HISTORY_SOURCE_UNCONFIGURED_REASON
 from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # module-level で import する (関数内 import だと monkeypatch.setattr
     # ("agentic_fx.loops.improve_loop.holdout.run_in_sample", ...) が
@@ -1166,6 +1167,19 @@ class ImproveLoop:
                 conn = self._db_readonly_conn_factory()
                 captured: list[dict] = []
                 dataset = self._settings.backtest.dataset()
+                if dataset.unconfigured:
+                    # 履歴源そのものが未設定: import しても解決しないので
+                    # discovery にさせず、利用者の設定事項として固定文面で返す。
+                    return {
+                        "started": False,
+                        "error": HISTORY_SOURCE_UNCONFIGURED_REASON,
+                        "hint": ("The history source is not configured, so "
+                                 "run_backtest cannot run and importing data "
+                                 "does not resolve it. This is a setting for "
+                                 "the operator; do not report it as a "
+                                 "discovery. Continue without backtest "
+                                 "results."),
+                    }
                 intent_source = strategy_adapter.build_intent_source(
                     meta, conn=conn, pair=args["pair"], dataset=dataset,
                     settings=self._settings, resolved=resolved)

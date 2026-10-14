@@ -1,4 +1,7 @@
 from datetime import datetime, timezone
+import os
+import subprocess
+import sys
 from unittest.mock import patch
 
 import httpx
@@ -9,8 +12,12 @@ from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.entry import main as entry_main
 from agentic_fx.service import ensure_initialized, run_init
+from agentic_fx.setup.checks import CheckReason, CheckResult
+from agentic_fx.setup.settings_edit import atomic_write_settings
 from agentic_fx.store import news_sources
 from agentic_fx.store.db import connect
+from agentic_fx.store.setup_marker import setup_marker_present
+from agentic_fx.store.setup_record import read_setup_record
 from agentic_fx.store.state import StateStore
 
 
@@ -18,6 +25,13 @@ def _example(root):
     (root / "config").mkdir(parents=True)
     src = open("config/settings.yaml.example", encoding="utf-8").read()
     (root / "config" / "settings.yaml.example").write_text(src)
+
+
+def _tree_bytes(root):
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
 
 
 def _settings(root, **datafeed):
@@ -56,7 +70,10 @@ def mock_llama_swap_check():
     実待ちが混入するのを防ぐ。挙動そのものを検証するテストは
     tests/test_service_app.py 側に置く。
     """
-    with patch("agentic_fx.service._check_llama_swap") as mock:
+    result = CheckResult("llama_swap", "unverified", CheckReason.CONNECT_ERROR,
+                         datetime.now(timezone.utc))
+    with patch("agentic_fx.service._check_llama_swap") as mock, \
+         patch("agentic_fx.service.check_llama_swap", return_value=result):
         yield mock
 
 
@@ -123,7 +140,142 @@ def test_reinit_in_trading_keeps_mode(tmp_path):
 def test_entry_init_subcommand(tmp_path, monkeypatch):
     _example(tmp_path)
     monkeypatch.chdir(tmp_path)
-    assert entry_main(["init"]) == 0
+    assert entry_main(["init", "--non-interactive"]) == 0
+
+
+def test_entry_init_without_the_flag_refuses_when_stdin_is_not_a_terminal(
+        tmp_path, monkeypatch, capsys):
+    _example(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    assert entry_main(["init"]) == 2
+    err = capsys.readouterr().err
+    assert "--non-interactive" in err
+    assert not (tmp_path / "data").exists()
+
+
+def test_init_writes_a_valid_non_interactive_confirmation_record(tmp_path):
+    _example(tmp_path)
+    assert run_init(tmp_path) == 0
+    saved = read_setup_record(tmp_path)
+    assert saved.state == "ok"
+    assert saved.record.data["mode"] == "non-interactive"
+    assert saved.record.data["price"]["result"] == "ok"
+    assert saved.record.data["llm_trade"]["result"] == "unverified"
+    assert saved.record.data["llm_improve"]["result"] == "unverified"
+
+
+def test_init_removes_its_marker_after_a_successful_commit(tmp_path):
+    _example(tmp_path)
+    assert run_init(tmp_path) == 0
+    assert not setup_marker_present(tmp_path)
+
+
+def test_init_leaves_marker_when_a_commit_step_fails(tmp_path, monkeypatch):
+    _example(tmp_path)
+    monkeypatch.setattr("agentic_fx.service.init_db",
+                        lambda _conn: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        run_init(tmp_path)
+    assert setup_marker_present(tmp_path)
+
+
+def test_init_config_file_is_validated_and_installed_when_settings_are_absent(tmp_path):
+    _example(tmp_path)
+    source = tmp_path / "provided.yaml"
+    source.write_text((tmp_path / "config" / "settings.yaml.example").read_text(),
+                      encoding="utf-8")
+    assert run_init(tmp_path, config_file=source) == 0
+    assert (tmp_path / "config" / "settings.yaml").read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_init_installs_the_validated_config_snapshot_when_source_changes(tmp_path, monkeypatch):
+    _example(tmp_path)
+    source = tmp_path / "provided.yaml"
+    expected = (tmp_path / "config" / "settings.yaml.example").read_bytes()
+    source.write_bytes(expected)
+    real_write = atomic_write_settings
+
+    def write_after_source_changes(path, text):
+        source.write_text("schema_version: 0\n", encoding="utf-8")
+        real_write(path, text)
+
+    monkeypatch.setattr("agentic_fx.service.atomic_write_settings", write_after_source_changes)
+    assert run_init(tmp_path, config_file=source) == 0
+    assert (tmp_path / "config" / "settings.yaml").read_bytes() == expected
+
+
+def test_init_config_file_does_not_overwrite_existing_settings(tmp_path):
+    _example(tmp_path)
+    existing = tmp_path / "config" / "settings.yaml"
+    existing.write_text("keep\n", encoding="utf-8")
+    source = tmp_path / "provided.yaml"
+    source.write_text((tmp_path / "config" / "settings.yaml.example").read_text(),
+                      encoding="utf-8")
+    assert run_init(tmp_path, config_file=source) == 1
+    assert existing.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_init_config_file_must_pass_settings_validation(tmp_path):
+    _example(tmp_path)
+    source = tmp_path / "provided.yaml"
+    source.write_text("schema_version: 2\npairs: []\n", encoding="utf-8")
+    assert run_init(tmp_path, config_file=source) == 1
+    assert not (tmp_path / "config" / "settings.yaml").exists()
+
+
+def test_init_does_not_migrate_an_older_settings_schema(tmp_path, capsys):
+    _example(tmp_path)
+    target = tmp_path / "config" / "settings.yaml"
+    target.write_text((tmp_path / "config" / "settings.yaml.example").read_text().replace(
+        "schema_version: 2", "schema_version: 0"), encoding="utf-8")
+    before = target.read_text(encoding="utf-8")
+    assert run_init(tmp_path) == 1
+    assert target.read_text(encoding="utf-8") == before
+    assert "`afx init` (対話) で移行します" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("use_config", [False, True])
+def test_init_rejects_newer_schema_without_writing_files(tmp_path, capsys, use_config):
+    _example(tmp_path)
+    newer = (tmp_path / "config" / "settings.yaml.example").read_text(
+        encoding="utf-8").replace("schema_version: 2", "schema_version: 3")
+    if use_config:
+        source = tmp_path / "provided.yaml"
+        source.write_text(newer, encoding="utf-8")
+        args = {"config_file": source}
+    else:
+        (tmp_path / "config" / "settings.yaml").write_text(newer, encoding="utf-8")
+        args = {}
+    before = _tree_bytes(tmp_path)
+    assert run_init(tmp_path, **args) == 1
+    assert _tree_bytes(tmp_path) == before
+    assert "afx を更新してください" in capsys.readouterr().err
+
+
+def test_init_rejects_a_running_instance_without_committing_any_setup_files(tmp_path):
+    _example(tmp_path)
+    code = (
+        "from agentic_fx.store.instance_lock import acquire_instance_lock\n"
+        "from pathlib import Path\n"
+        "import sys\n"
+        "lock = acquire_instance_lock(Path(sys.argv[1]) / 'data')\n"
+        "print('ready', flush=True)\n"
+        "sys.stdin.read()\n"
+        "lock.close()\n"
+    )
+    child = subprocess.Popen([sys.executable, "-c", code, str(tmp_path)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             text=True)
+    try:
+        assert child.stdout.readline() == "ready\n"
+        assert run_init(tmp_path) == 2
+        assert not (tmp_path / "config" / "settings.yaml").exists()
+        assert not (tmp_path / "data" / "agentic.db").exists()
+        assert not setup_marker_present(tmp_path)
+    finally:
+        child.stdin.close()
+        assert child.wait(timeout=30) == 0
 
 
 def test_entry_default_requires_init(tmp_path, monkeypatch):
@@ -134,17 +286,55 @@ def test_entry_default_requires_init(tmp_path, monkeypatch):
     assert e.value.code == 2
 
 
-def test_init_without_example_returns_1(tmp_path, capsys):
-    """example が無いときの失敗経路 (戻り値 1) を固定する。
+def test_init_without_example_returns_2_without_creating_files(tmp_path, capsys):
+    """example が無いときの失敗経路 (戻り値 2) を固定する。
 
     変異テストで、この `return 1` を `return 0` にしても全テストが通って
     しまう (未ピン) ことが判明したため追加。
     """
-    (tmp_path / "config").mkdir(parents=True)
-    assert run_init(tmp_path) == 1
+    before = _tree_bytes(tmp_path)
+    assert run_init(tmp_path) == 2
+    assert _tree_bytes(tmp_path) == before
     assert "settings.yaml.example" in capsys.readouterr().err
     with pytest.raises(SystemExit):     # 初期化済みにはならない
         ensure_initialized(tmp_path)
+
+
+def test_init_in_an_empty_directory_creates_nothing(tmp_path):
+    before = _tree_bytes(tmp_path)
+    assert run_init(tmp_path) == 2
+    assert _tree_bytes(tmp_path) == before
+
+
+def test_init_records_independent_trade_and_improve_backend_checks(tmp_path):
+    _example(tmp_path)
+    source = tmp_path / "config" / "settings.yaml.example"
+    source.write_text(source.read_text(encoding="utf-8").replace(
+        "improve: {backend: local, model: qwen3-coder-30b-a3b-instruct}",
+        "improve: {backend: claude, model: improve-model}"), encoding="utf-8")
+    local_models = []
+    cli_backends = []
+
+    def check_local(_base_url, model, **_kwargs):
+        local_models.append(model)
+        return CheckResult("llama_swap", "ok", None, datetime.now(timezone.utc))
+
+    def check_cli(backend, *_args, **_kwargs):
+        cli_backends.append(backend)
+        return CheckResult("cli_backend", "unverified", CheckReason.BIN_NOT_FOUND,
+                           datetime.now(timezone.utc), {"backend": backend})
+
+    with patch("agentic_fx.service.check_llama_swap", check_local), \
+         patch("agentic_fx.service.check_cli_backend", check_cli):
+        assert run_init(tmp_path) == 0
+    saved = read_setup_record(tmp_path).record.data
+    assert local_models == ["qwen3.6-35b-a3b_Q4"]
+    assert cli_backends == ["claude"]
+    assert saved["llm_trade"]["result"] == "ok"
+    assert saved["llm_improve"] == {
+        "result": "unverified", "at": saved["llm_improve"]["at"],
+        "reason_code": "bin_not_found",
+    }
 
 
 # ---- Task 9: 基本ニュースソース投入 + 価格ソース接続確認 --------------------
@@ -386,3 +576,50 @@ def test_entry_tty_runs_interactive_and_silent(tmp_path, monkeypatch, capsys):
     seen = _run_entry(tmp_path, monkeypatch, [], isatty=True)
     assert seen == [False]
     assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_init_config_file_rejects_non_regular_source_without_side_effects(tmp_path, kind):
+    root = tmp_path / "root"
+    root.mkdir()
+    _example(root)
+    source = tmp_path / "source.yaml"
+    if kind == "symlink":
+        real = tmp_path / "real.yaml"
+        real.write_bytes((root / "config" / "settings.yaml.example").read_bytes())
+        source.symlink_to(real)
+    else:
+        os.mkfifo(source)
+
+    def names():
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+    before = (names(), _tree_bytes(root))
+    assert run_init(root, config_file=source) == 1
+    assert (names(), _tree_bytes(root)) == before
+
+
+def test_non_interactive_init_places_a_marker_that_names_the_settings_it_commits(tmp_path, monkeypatch):
+    import hashlib
+
+    from agentic_fx.store import setup_marker
+
+    _example(tmp_path)
+    seen = {}
+    real = setup_marker.remove_setup_marker
+
+    def remember(root, **kwargs):
+        seen["marker"] = setup_marker.read_setup_marker(root)
+        return real(root, **kwargs)
+
+    monkeypatch.setattr("agentic_fx.service.remove_setup_marker", remember)
+    assert run_init(tmp_path) == 0
+    expected = hashlib.sha256((tmp_path / "config" / "settings.yaml").read_bytes()).hexdigest()
+    assert seen["marker"].phase == "commit" and seen["marker"].settings_sha256 == expected
+    assert seen["marker"].started_at
+
+
+def test_non_interactive_init_records_that_linger_was_not_checked(tmp_path):
+    _example(tmp_path)
+    assert run_init(tmp_path) == 0
+    assert read_setup_record(tmp_path).record.data["linger"] == {"state": "not_checked"}

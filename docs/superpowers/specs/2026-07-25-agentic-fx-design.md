@@ -613,16 +613,16 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 
 ```
 uv run main.py                        # サービス起動 + スプラッシュ + コマンド受付 (TTY のとき)
-uv run main.py --daemon               # systemd 用: コマンド受付なし (非 TTY 時は自動でこちら)
-uv run main.py init                   # 設定ウィザード (唯一のウィザード。サービスは起動しない)
+uv run main.py --daemon               # user unit の direct exec 用: コマンド受付なし
+uv run afx init                       # 対話ウィザード（非対話は --non-interactive）
 uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サービス停止中の人間の明示操作。API には載せない)
 ```
 
 - 起動時**スプラッシュ**: mode (学習/取引)・発注方式 (手動/自動)・対象ペア・runner/モデル・risk gate 現行値・承認待ち件数・未約定指値・直近成績サマリを 1 画面表示。**項目構成は運用しながら調整する** (初期実装は最小でよい)
 - **コマンド受付 (対話シェル)**: プロンプトは常に静かで、ログを勝手に流さない。ログは `log` / `activity` コマンドで**必要なときに引く** (pull 型)
-- `stop` (または Ctrl-C) で **graceful shutdown**: スケジューラ停止 → 実行中 Mission の完了待ち (タイムアウト付き) → 終了。daemon モードの停止は `systemctl stop` の仕事
+- `stop` (または Ctrl-C) で **graceful shutdown**: スケジューラ停止 → 実行中 Mission の完了待ち (タイムアウト付き) → 終了。user unit は `afx init` が設置する direct exec で、停止は `systemctl --user stop afx` を使う
 - `[project.scripts]` に `afx` として同エントリを登録し、`uv run afx` でも起動可能にする
-- **起動ガード**: init 未完了なら通常起動・--daemon とも起動拒否 (systemd の Restart=always でも即終了を繰り返すだけで稼働しない)
+- **起動ガード**: ops の有効化途中は rc 75、init の確定途中は rc 76 で通常起動・--daemon とも起動拒否する（unit は再起動ループを避ける）
 
 ### 操作コマンド体系 (main.py 対話シェルと client.py で共通)
 
@@ -652,8 +652,8 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 
 ### 初期起動フロー (ウィザードは init だけ)
 
-1. **`uv run main.py init`** — 設定ウィザード (settings.yaml 生成、DB 初期化、稼働モードを学習で初期化、llama-swap / Discord / 価格ソースの接続確認)。価格ソースはデフォルト yfinance で、MT5 ブリッジ / Twelve Data は任意の追加設定 (未設定ならスキップ、§5)。完了までサービス起動を拒否。systemd unit 化はユーザーが明示的に行う (ドキュメントのみ提供)
-2. **`uv run main.py`** — サービス開始。組み込みデフォルト実装 (基本指標 + 基本ニュースソース) でそのまま稼働できる
+1. **`afx init`** — 対話ウィザード（非対話は `--non-interactive`）。settings.yaml の生成、DB 初期化、接続確認、direct exec の user unit 設置を案内する。詳細設計は [2026-10-12 の初期設定ウィザード設計](2026-10-12-first-run-wizard-design.md) を参照する。
+2. **`afx ctl status`** — 常駐サービスの状態確認と日常操作の入口。
 
 初期構築 (ニュースソース拡充・指標追加) は専用ウィザードを持たず、**通常チャネルで行う**: `news add` で取得対象を足す、`improve add "..."` でアイデアを投入して `improve` を手動起動する (runner は config / `model` コマンドで claude / local を選択、ClaudeRunner はサブスク認証で利用可能)。成果は通常の承認フローに乗る。
 
@@ -922,3 +922,9 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 - local ⇔ claude の自動フォールバック / エスカレーション
 - IFD 的な条件監視付き予約注文 (前身の構造的限界の原因。指値 + 期限で代替)
 - マルチアセット対応 (FX 2 ペアから始める)
+
+## 変更履歴
+
+| 日付 | 版 | 変更 | 理由 | commit |
+|---|---|---|---|---|
+| 2026-10-14 | 運用追補 | 初期設定ウィザード、direct exec user unit、起動ガードの運用記述を更新 | 初回設定の運用責任を明確化 | |

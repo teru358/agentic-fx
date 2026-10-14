@@ -36,6 +36,8 @@ def _configure_gate_mock(settings: MagicMock) -> MagicMock:
     settings.improve.gate.min_pf = 1.0
     settings.improve.gate.require_positive_avg_r = True
     settings.improve.gate.require_holdout_evaluable = False
+    settings.backtest.eval_source = "dukascopy"
+    settings.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
     return settings
 
 
@@ -100,6 +102,26 @@ def test_below_evaluable_min_trades_is_observation_not_rejected(monkeypatch):
         meta=_meta())
     assert verdict.evaluable is False
     assert verdict.observation_reason.startswith("insufficient_trades")
+
+
+def test_unconfigured_history_source_stops_before_any_backtest(monkeypatch):
+    settings = _configure_gate_mock(MagicMock())
+    settings.backtest.eval_source = "none"
+    settings.backtest.dataset.return_value = HistoryDataset("none", "1m")
+    build_source = MagicMock()
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
+        build_source)
+
+    verdict = evaluate_strategy_adoption_gate(
+        MagicMock(), name="myst", pairs=["USDJPY"], timeframe="1h",
+        resolved=_EMPTY, content_hash="h1", now=datetime(2026, 8, 22),
+        settings=settings, meta=_meta())
+
+    assert verdict.evaluable is False
+    assert verdict.observation_reason == "history_source_unconfigured"
+    assert verdict.unevaluable_kind == "history_source_unconfigured"
+    build_source.assert_not_called()
 
 
 def test_evaluable_min_trades_is_sum_across_pairs(monkeypatch):

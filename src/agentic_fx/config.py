@@ -391,14 +391,14 @@ class ScheduleSettings(_Strict):
     # `scheduler_thread` の `except Exception: _log.exception("tick failed")`
     # に飲まれる — activity にも notifier にも出ないまま改善ループが
     # 恒久沈黙する (取引レーンは影響を受けない)。`improve` の値に応じて
-    # 既存の `_DAILY_AT_RE`/`_WEEKLY_AT_RE` (scheduler.py — 正規表現を
+    # 既存の `DAILY_AT_RE`/`WEEKLY_AT_RE` (scheduler.py — 正規表現を
     # ここに複製しない) で照合する。`fullmatch` を使う (M1 是正と同じ
     # 末尾改行の穴を新設しない — `$` は MULTILINE 無しでも文字列末尾の
     # 直前の改行にマッチしうるため `.match`/`$` だけでは不十分)。
     @model_validator(mode="after")
     def _check_improve_at(self) -> "ScheduleSettings":
-        from agentic_fx.core.scheduler import _DAILY_AT_RE, _WEEKLY_AT_RE
-        rx = _DAILY_AT_RE if self.improve == "daily" else _WEEKLY_AT_RE
+        from agentic_fx.core.scheduler import DAILY_AT_RE, WEEKLY_AT_RE
+        rx = DAILY_AT_RE if self.improve == "daily" else WEEKLY_AT_RE
         if not rx.fullmatch(self.improve_at):
             raise ValueError(
                 f"invalid improve_at for cadence {self.improve!r}: "
@@ -417,10 +417,10 @@ class ServiceSettings(_Strict):
 class ApiSettings(_Strict):
     """操作 API (UDS)。TCP listener は作らない。
 
-    改善 worker の seccomp が入るまで既定は無効 (起動は拒否せず警告だけ)。
+    常駐運用の前提。無効でも起動は拒否せず警告だけ。
     ``host`` / ``port`` は旧版の設定ファイルを読めるように受け付けるだけで使わない。
     """
-    enabled: bool = False
+    enabled: bool = True
     socket_path: str = "data/run/api.sock"
     host: str | None = None
     port: int | None = None
@@ -439,7 +439,7 @@ class ApiSettings(_Strict):
 class BacktestSettings(_Strict):
     holdout_months: int = Field(ge=1)
     initial_balance: float = Field(gt=0)
-    eval_source: str = "dukascopy"
+    eval_source: str = "none"
     base_interval: str = "1m"
 
     @model_validator(mode="after")
@@ -556,6 +556,7 @@ class WorkerSettings(_Strict):
 
 
 class Settings(_Strict):
+    schema_version: int = 0
     # ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
     display_timezone: str = "UTC"
     # 利用者の基準通貨。損益・リスク・エクイティの表現に使う (取引可能ペアを
@@ -571,7 +572,7 @@ class Settings(_Strict):
     schedule: ScheduleSettings
     improve: ImproveSettings = Field(default_factory=ImproveSettings)
     logging: LoggingSettings
-    api: ApiSettings
+    api: ApiSettings = Field(default_factory=ApiSettings)
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     discord: DiscordSettings
     analysis: AnalysisSettings
@@ -767,8 +768,13 @@ def load_env_file(path: Path) -> None:
 def load_settings(path: Path) -> Settings:
     if not path.exists():
         raise ConfigError(f"settings file not found: {path}")
+    return load_settings_text(path.read_text(encoding="utf-8"))
+
+
+def load_settings_text(text: str) -> Settings:
+    """Validate settings already read from a stable source snapshot."""
     try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = yaml.safe_load(text) or {}
         return Settings.model_validate(raw)
     except ValidationError as e:
         raise ConfigError(str(e)) from e

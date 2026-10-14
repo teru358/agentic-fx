@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS ohlcv_history (
 """
 
 _IMPROVE_WAVES_DDL = """
+-- expected=0 は初期設定が書く消費印 (slot を 1 件も持たない)。通常の wave は
+-- expected>=1 で slot を expected 件持つ。
 CREATE TABLE IF NOT EXISTS improve_waves (
   period_key TEXT PRIMARY KEY,
   created_at TEXT NOT NULL,

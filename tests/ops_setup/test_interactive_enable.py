@@ -11,7 +11,9 @@ import pytest
 from agentic_fx.ops.keys import KeySetError
 from agentic_fx.ops_setup.feature_config import collect, write_inputs
 from agentic_fx.ops_setup.interactive import ConsoleIO, interactive_enable
+from agentic_fx.ops_setup.setup_lease import acquire_setup_lease
 from agentic_fx.ops_setup.stages import StageResult
+from agentic_fx.ops_setup.systemd import SystemdError
 
 TOKEN = "tok-SECRET-abc123.XYZ"
 WEBHOOK = "https://hooks.example.com/api/webhooks/987654/SECRET-PATH-xyz"
@@ -74,8 +76,162 @@ def xdg(tmp_path, monkeypatch):
 
 def run(root, feature, io, *, probe=lambda _f: (0, ""), setup=None, keys_init=lambda: 0):
     setup = setup or Setup()
-    rc = interactive_enable(root, feature, io=io, probe_runner=probe, setup_factory=lambda _r: setup, keys_init=keys_init)
-    return rc, setup
+    result = interactive_enable(root, feature, io=io, probe_runner=probe, setup_factory=lambda _r: setup, keys_init=keys_init)
+    return result.rc, setup
+
+
+def test_held_lease_runs_enable_without_reacquiring_setup_lock(tmp_path, xdg, monkeypatch):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    lease = acquire_setup_lease(tmp_path)
+    setup = Setup()
+    try:
+        monkeypatch.setattr("agentic_fx.ops_setup.interactive.acquire_setup_lock",
+                            lambda _root: (_ for _ in ()).throw(AssertionError("lock reacquired")))
+        result = interactive_enable(tmp_path, "web", io=FakeIO(), lease=lease,
+                                    probe_runner=lambda _feature: (0, ""),
+                                    setup_factory=lambda _root: setup)
+    finally:
+        lease.close()
+    assert result.rc == 0
+    assert result.stage == "enabled"
+    assert result.reason_code == "ok"
+    assert setup.enabled == ["web"]
+
+
+def test_wrong_or_closed_lease_is_rejected_before_io_or_enable(tmp_path, xdg):
+    (tmp_path / "other").mkdir()
+    wrong = acquire_setup_lease(tmp_path / "other")
+    closed = acquire_setup_lease(tmp_path)
+    closed.close()
+    try:
+        for lease in (wrong, closed):
+            io = FakeIO()
+            setup = Setup()
+            result = interactive_enable(tmp_path, "web", io=io, lease=lease,
+                                        setup_factory=lambda _root: setup)
+            assert (result.rc, result.stage, result.reason_code) == (1, "precheck", "setup_lease_invalid")
+            assert io.out == [] and io.err == [] and io.asked == [] and setup.enabled == []
+    finally:
+        wrong.close()
+
+
+def test_missing_configuration_without_ops_io_returns_structured_reason(tmp_path, xdg):
+    class NotATerminal:
+        def isatty(self): return False
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(sys, "stdin", NotATerminal())
+    try:
+        result = interactive_enable(tmp_path, "web")
+    finally:
+        monkeypatch.undo()
+    assert (result.rc, result.stage, result.reason_code) == (2, "config", "setup_input_required")
+
+
+def test_lease_without_io_collects_missing_values_from_terminal(tmp_path, xdg, monkeypatch):
+    class TerminalInput:
+        def __init__(self): self.lines = iter(["9000\n"])
+        def isatty(self): return True
+        def readline(self): return next(self.lines)
+
+    class TerminalOutput:
+        def isatty(self): return True
+        def write(self, _text): return 0
+        def flush(self): return None
+
+    monkeypatch.setattr(sys, "stdin", TerminalInput())
+    monkeypatch.setattr(sys, "stdout", TerminalOutput())
+    lease = acquire_setup_lease(tmp_path)
+    setup = Setup()
+    try:
+        result = interactive_enable(tmp_path, "web", lease=lease,
+                                    probe_runner=lambda _feature: (0, ""),
+                                    setup_factory=lambda _root: setup)
+    finally:
+        lease.close()
+    assert result.rc == 0
+    assert setup.enabled == ["web"]
+    assert collect(tmp_path, "web").values == {"port": 9000}
+
+
+def test_lease_without_io_on_non_terminal_does_not_ask(tmp_path, xdg, monkeypatch):
+    calls = []
+
+    class NotATerminal:
+        def isatty(self): return False
+        def readline(self):
+            calls.append("read")
+            return "9000\n"
+
+    monkeypatch.setattr(sys, "stdin", NotATerminal())
+    lease = acquire_setup_lease(tmp_path)
+    try:
+        result = interactive_enable(tmp_path, "web", lease=lease)
+    finally:
+        lease.close()
+    assert (result.rc, result.stage, result.reason_code) == (2, "config", "setup_input_required")
+    assert calls == []
+
+
+def test_probe_reason_is_structured_not_derived_from_output_text(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    first = interactive_enable(tmp_path, "web", io=FakeIO(tty=False),
+                               probe_runner=lambda _feature: (69, "config_invalid"))
+    second = interactive_enable(tmp_path, "web", io=FakeIO(tty=False),
+                                probe_runner=lambda _feature: (69, "changed diagnostic text"))
+    assert (first.rc, first.stage, first.reason_code) == (1, "probe", "config_invalid")
+    assert (second.rc, second.stage, second.reason_code) == (1, "probe", "feature_probe_unreadable")
+
+
+def test_enable_reason_code_does_not_depend_on_error_detail(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    results = []
+    for detail in ("first diagnostic", "different diagnostic"):
+        result = interactive_enable(tmp_path, "web", io=FakeIO(),
+                                    probe_runner=lambda _feature: (0, ""),
+                                    setup_factory=lambda _root, d=detail: Setup([SystemdError("start", d)]))
+        results.append((result.rc, result.stage, result.reason_code))
+    assert results == [(1, "enable", "start"), (1, "enable", "start")]
+
+
+def test_enable_reason_code_rejects_freeform_exception_reason(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+
+    class FreeformFailure(RuntimeError):
+        reason = "diagnostic containing a URL https://example.test/secret"
+
+    result = interactive_enable(tmp_path, "web", io=FakeIO(),
+                                probe_runner=lambda _feature: (0, ""),
+                                setup_factory=lambda _root: Setup([FreeformFailure()]))
+    assert (result.rc, result.stage, result.reason_code) == (1, "enable", "unknown")
+
+
+def test_lease_remains_flocked_during_enable(tmp_path, xdg):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    lease = acquire_setup_lease(tmp_path)
+    lock_path = tmp_path / "data" / "ops" / "setup.lock"
+
+    class CheckingSetup(Setup):
+        def enable(self, feature):
+            child = subprocess.run(
+                [sys.executable, "-c",
+                 "import errno,fcntl,sys; f=open(sys.argv[1], 'a+b');\n"
+                 "try: fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                 "except BlockingIOError as error: raise SystemExit(7 if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK) else 8)\n"
+                 "raise SystemExit(9)", str(lock_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            assert child.returncode == 7, child.stderr
+            return super().enable(feature)
+
+    setup = CheckingSetup()
+    try:
+        result = interactive_enable(tmp_path, "web", io=FakeIO(), lease=lease,
+                                    probe_runner=lambda _feature: (0, ""),
+                                    setup_factory=lambda _root: setup)
+    finally:
+        lease.close()
+    assert result.rc == 0 and setup.enabled == ["web"]
 
 
 def test_non_tty_missing_inputs_stops_without_prompt(tmp_path, xdg):
@@ -87,12 +243,16 @@ def test_non_tty_missing_inputs_stops_without_prompt(tmp_path, xdg):
     assert not xdg.exists()
 
 
-def test_console_io_requires_tty_stdout_too(monkeypatch):
+def test_console_io_requires_tty_stdin_and_stdout(monkeypatch):
     class Stream:
         def __init__(self, tty): self.tty = tty
         def isatty(self): return self.tty
     monkeypatch.setattr(sys, "stdin", Stream(True))
     monkeypatch.setattr(sys, "stdout", Stream(False))
+    assert not ConsoleIO().isatty()
+    monkeypatch.setattr(sys, "stdout", Stream(True))
+    assert ConsoleIO().isatty()
+    monkeypatch.setattr(sys, "stdin", Stream(False))
     assert not ConsoleIO().isatty()
 
 

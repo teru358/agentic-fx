@@ -186,6 +186,7 @@ def _validate_strategy(conn: sqlite3.Connection, meta: PluginMeta, *,
     plugin_ref = f"plugins/{meta.name}"
 
     dataset = settings.backtest.dataset()
+    dataset.require_configured()
     per_pair_metrics: dict[str, dict] = {}
     for pair in meta.pairs:
         intent_source = strategy_adapter.build_intent_source(
@@ -243,7 +244,8 @@ class GateOutcome:
     """
     metrics: dict
     evaluable: bool
-    verdict_kind: Literal["ok", "insufficient_trades", "floor",
+    verdict_kind: Literal["ok", "insufficient_trades",
+                          "history_source_unconfigured", "floor",
                           "indicator_unresolved"] = "ok"
     # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
     # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
@@ -360,10 +362,15 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
             # strategy_gate.evaluate_strategy_adoption_gate は既に
             # "insufficient_trades:<n>" の形で observation_reason を返す。
             reason = verdict.observation_reason if verdict is not None else ""
+            verdict_kind = (
+                verdict.unevaluable_kind if verdict is not None
+                else "insufficient_trades")
             return GateOutcome(
                 metrics={}, evaluable=False,
-                verdict_kind="insufficient_trades",
-                insufficient_trades_reason=reason, gate_rows=rows,
+                verdict_kind=verdict_kind,
+                insufficient_trades_reason=(
+                    reason if verdict_kind == "insufficient_trades" else ""),
+                gate_rows=rows,
                 resolved=resolved, cpu_samples=cpu_samples)
         if verdict.floor_reason:
             return GateOutcome(

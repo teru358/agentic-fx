@@ -104,6 +104,14 @@ def _mt5_headers() -> dict[str, str]:
     return {"X-Bridge-Api-Key": key} if key else {}
 
 
+def mt5_health(bridge_url: str, *, timeout: float = 10) -> bool:
+    """Return whether the bridge reports an attached MT5 terminal."""
+    response = httpx.get(f"{bridge_url.rstrip('/')}/health",
+                         headers=_mt5_headers(), timeout=timeout)
+    response.raise_for_status()
+    return response.json().get("mt5_connected") is True
+
+
 def mt5_quote(bridge_url: str, pair: str) -> Quote:
     # symbol はパスパラメータ (クエリではない — 実 bridge 仕様)
     sym = vendor_symbol(pair, "mt5")

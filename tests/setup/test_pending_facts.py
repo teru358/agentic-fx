@@ -1,0 +1,75 @@
+from agentic_fx.setup.pending_facts import collect_pending_facts
+from agentic_fx.store import plugin_switch_journal
+from agentic_fx.store.db import connect_readonly
+from tests.test_service_app import NOW, _init
+from tests.ops.test_service_api_wiring import _app
+
+
+def test_collection_limits_history_pairs_and_journal_ids(tmp_path, caplog, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        app.settings.backtest.eval_source = "mt5"
+        app.settings.pairs = [f"P{number:03d}" for number in range(50)]
+        for approval_id in range(100):
+            plugin_switch_journal.insert(
+                app.conn_shell, kind="approve", approval_id=approval_id, name=f"n{approval_id}",
+                old_kind="absent", old_target=None, temp_path="t", new_target="n",
+                switch_required=True, actor="test", now=NOW)
+        import logging
+        monkeypatch.setattr(logging.getLogger("agentic_fx"), "propagate", True)
+        caplog.set_level("INFO", logger="agentic_fx.setup.pending_facts")
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        statements = []
+        conn.set_trace_callback(statements.append)
+        try:
+            facts = collect_pending_facts(
+                tmp_path, app.settings, conn, deployed_plugins=app.approved_plugins,
+                outage=app.outage, clock=app.clock)
+        finally:
+            conn.close()
+        history_queries = [sql for sql in statements if "ohlcv_history" in sql]
+        assert len(history_queries) == 32
+        assert len(facts.history_counts) == 32
+        assert caplog.text.count("stalled approvals exceed") == 1
+        assert facts.approval_ids == tuple(range(99, 67, -1))
+    finally:
+        app.close()
+
+
+def test_supplied_landlock_availability_is_used_without_probing(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        def probe():
+            raise AssertionError("must not probe")
+        monkeypatch.setattr("agentic_fx.setup.pending_facts.landlock.is_available", probe)
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        try:
+            facts = collect_pending_facts(
+                tmp_path, app.settings, conn, deployed_plugins=app.approved_plugins,
+                outage=app.outage, clock=app.clock, landlock_available=False)
+        finally:
+            conn.close()
+        assert facts.landlock_available is False
+    finally:
+        app.close()
+
+
+def test_a_failing_landlock_probe_is_unknown_not_unavailable(tmp_path, monkeypatch):
+    from agentic_fx.setup import pending_facts as module
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        def boom():
+            raise OSError("no libc")
+        monkeypatch.setattr(module.landlock, "is_available", boom)
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        try:
+            facts = collect_pending_facts(tmp_path, app.settings, conn, deployed_plugins=(),
+                                          outage=app.outage, clock=app.clock)
+        finally:
+            conn.close()
+        assert facts.landlock_available is None
+    finally:
+        app.close()

@@ -1,4 +1,4 @@
-# [first-run-setup] 初期設定ウィザード 設計書 (v1.0)
+# [first-run-setup] 初期設定ウィザード 設計書 (v1.6)
 
 作成日: 2026-10-02 (v0.1)。v0.2 改訂: 2026-10-12。v0.3 改訂: 2026-10-12。v0.4 改訂: 2026-10-12。v0.5 改訂: 2026-10-12。対象 commit: main `f01f903` (+ 未追跡 `deploy/`)。v0.1 は `3b4213d` を対象にした。
 入力: `tmp/design-first-run/inventory.md` (現状の全数調査)、`tmp/design-first-run/wizard-flow-and-decisions.md` (叩き台・論点・**末尾の裁定記録**)、B-2 実測 `tmp/design-first-run/b2-measure/` (生ログ `run1.log` `run2.log`、本書 付録 A に要約)。
@@ -284,7 +284,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 設定 (YAML)・DB (SQLite)・状態 (JSON)・ログは別々のストレージで、1 つの transaction にはできない。そこで、途中で落ちても同じ `afx init` の再実行で収束する**回復可能な commit protocol** として確定する。順序は固定:
 
-1. **marker を置く**: `data/state/setup_in_progress` (`phase=commit`、開始時刻、新しい settings.yaml 全文の sha256) を、一時ファイルに書く → fsync → rename → 親 dir の fsync で置く。以後、サービスは起動時にこの marker を見て、専用の終了コード 76 (`setup_in_progress`。`afx ops enable` の enroll 中の 75 とは別) で即終了する (§4.3)。
+1. **marker を置く**: `data/state/setup_in_progress` (`phase=commit\nstarted_at=<UTC ISO>\nsettings_sha256=<新しい settings.yaml 全文の sha256 hex>\n`。handoff は `phase=handoff\nstarted_at=<UTC ISO>\n`。読む側は `store/setup_marker.py::read_setup_marker`) を、一時ファイルに書く → fsync → rename → 親 dir の fsync で置く。以後、サービスは起動時にこの marker を見て、専用の終了コード 76 (`setup_in_progress`。`afx ops enable` の enroll 中の 75 とは別) で即終了する (§4.3)。
 2. `config/settings.yaml`: 初回は example を写したものに回答を当てた全文、再実行は既存ファイルに回答を当てた全文 (版が古ければ migration も同じ全文に含める。§4.4) を、一時ファイルに書く → fsync → `os.replace` → 親 dir の fsync。再実行では置き換え前の内容を `config/settings.yaml.bak-<UTC時刻>` に残す。ただし marker の sha256 と既存ファイルが一致する (= 前回の続き) ときは bak を作り直さず、最初の bak を保つ。
 3. `logs/` と技術ログの設定。
 4. DB: `connect` + `init_db` (旧スキーマの移行を含む。lock 保持下なのでサービスと同時に走らない)。続けて**1 つの transaction (`BEGIN IMMEDIATE`) で**、基本ニュースソースの登録 (`seed_default_sources`、冪等) と期の消費印 (段 7 で「待つ」を選んだとき、`INSERT OR IGNORE`) を行う。失敗したら transaction は rollback され、次に進まない。`init_db` の移行が `agentic.db.bak-*` を作ってから rebuild する現行の挙動は変えない。
@@ -420,6 +420,12 @@ marker が壊れて読めないとき: 内容 (sha) が無いので「前回の�
 - **運用責任 (settings schema を変える変更の完了条件)**: example の schema (必須キーの追加・rename・削除・既定値の意味の変更) を変える変更は、**同じ変更の中で**次の 5 点を揃える。揃わない変更は完了にしない: (1) `schema_version` を上げる、(2) 前版からの migration を足す、(3) 変更前の example を旧 example fixture として保存する、(4) 旧 fixture から現行への移行で触らない行が byte 一致であることの test を足す、(5) 変更の理由を migration の docstring と変更履歴に書く。T1 と T8 の完了条件にする。example を変える手元の作業が migration を伴わないと、次の example 更新で既存利用者の再実行が止まるため。
 - 試験は、過去の各世代の example から作った settings.yaml を現行へ移行する形 (旧 example → 複数世代後) と、移行後に触らない行が byte 一致であること。
 
+#### migration の履歴
+
+| 版 | 日付 | 内容 | 理由 |
+|---|---|---|---|
+| v1 | 2026-10-12 | `schema_version` を導入し、v0 の unmarked settings を v1 へ移行する | 既存設定を再実行可能にし、以後の schema 変更を明示 migration で互換維持するため |
+
 ### 4.5 リセット (独立スクリプト `scripts/first-run-reset.sh`)
 
 目的: 実機受入を `git clone` からやり直せるよう、ウィザードとその周辺が**当 instance のために**置いたものを取り除き、clean clone と同じ状態に戻す。
@@ -444,13 +450,14 @@ marker が壊れて読めないとき: 内容 (sha) が無いので「前回の�
 2. **計画の作成** (何も消さない): 上の規則で、存在するものだけ種類別に全数を表示する。除外したもの (別 instance の資材など) は「触らない」として別枠に並べる。対象表示には次の一文を必ず添える: 「paper 取引履歴、注文、approval、改善 report、RAG、plugins を永久削除します (`data/`・`logs/`・`plugins/`)。復元できません」。`--dry-run` ならここで終わる。
 3. **確認 (二重)**: 全数を見せたうえで `reset` の打ち込みを求める (Enter では通らない)。稼働中 (下記) のときは、これとは別に `stop` の打ち込みを求める。linger を解除する計画があるときは、さらに別に `linger` の打ち込みを求める。非端末では `--yes` が無ければ何もせず rc=2、稼働中なら `--yes` に加えて `--stop-running`、linger の解除には `--include-linger` が要る (`--yes` だけでは停止も linger の解除もしない)。
 4. **稼働中の判定**: `afx.service` が当 instance のもので active、または当 instance の feature の `afx-ops@<feature>` が active、または `data/instance.lock` が保持されている。systemd が管理していない保持者 (手動起動) は止めず、「その端末で終了してください」で rc=2。続いて `data/ops/setup.lock` を非ブロッキングで取り、取れなければ別の `afx init` / `afx ops enable` が実行中なので rc=2。
-5. **取り除く順序** (固定。途中で落ちても再実行で収束する冪等な順序。**所有の証拠 (`afx.service`、`setup.json`) は最後まで残す**):
+5. **取り除く順序** (固定。途中で落ちても再実行で収束する冪等な順序。**所有の証拠 (`afx.service`、`setup.json`) は最後まで残す**。§5 の「リセット」列と同じ順):
    1. 当 instance の `afx-ops@<feature>` と `afx.service` を `stop` し、`disable` する。
-   2. unit のファイルを消す: `afx-ops@.service`、drop-in、**最後に** `afx.service` と `afx.service.bak-*`。`daemon-reload` と `reset-failed` を実行する。
-   3. linger: 上の規則で解除する計画のときだけ `loginctl disable-linger` を実行する (所有記録を読むのはここ。`data/` を消す前)。
-   4. `~/.config/agentic-fx/` の当 instance の分 (`api/<instance_id>/`、所有を確かめた feature) を消し、空になった親だけ `rmdir`。
-   5. repo 内の固定表。`data/` は最後 (`setup.json` の所有記録は linger の処理後に消える)。
-   6. `--include-env` のときだけ `.env`。
+   2. `~/.config/agentic-fx/` の当 instance の分 (所有を確かめた feature の config / secret、`api/<instance_id>/`) を消し、空になった親だけ `rmdir`。
+   3. unit のファイルを消す: `afx-ops@.service`、drop-in、**最後に** `afx.service` と `afx.service.bak-*`。`afx-ops@.service` か drop-in が消せなかったときは `afx.service` を所有の証拠として残し (再実行で続きを消す)、rc≠0。`daemon-reload` と `reset-failed` は primary unit が当 instance 所有のときだけ実行し、`reset-failed` の非 0 (unit が not loaded) は許容する。
+   4. repo 内の固定表 (`data/` と `.env` 以外)。
+   5. linger: 上の規則で解除する計画のときだけ `loginctl disable-linger` を実行する (所有記録を読むのはここ。`data/` を消す直前。他の kind に失敗があれば解除しない)。
+   6. `data/` (`setup.json` の所有記録は linger の処理後に消える。他の kind に失敗があれば残す)。
+   7. `--include-env` のときだけ `.env`。
 6. 終了時に「取り除いたもの」「触らなかったもの (別 instance の資材、`.env`、linger、`.venv/`)」を表示し、`git status --porcelain=v1 --ignored=matching` の結果を表示して、次は `afx init` と案内する。
 
 安全:
@@ -597,7 +604,7 @@ WantedBy=default.target
   - journal を読めない (`journalctl` が無い・権限): `journal_unavailable`。
   - 行の形式が不正: `journal_format_invalid`。
   - 有界時間内に行が出ない: `admission_line_timeout` (`unknown`。待ち続けず、確認コマンド `journalctl --user -u afx | grep 'improve isolation'` を案内して終える)。canary と自己試験は起動後に別 thread で走るので、行が出るまで数分かかることがある。
-  - backend が local のときの行 (`is not a CLI backend`) は admission の対象外として記録しない。
+  - backend が local のときの行 (`is not a CLI backend`) は admission の対象外。`isolation` は必須キーのままで、`{admitted: unknown, reason_code: not_cli_backend}` を記録する。
 - linger: 段 13 の手順 6 (a) で扱う (§3 段 13)。`Linger=no` のときだけ、確認つきでウィザードが `loginctl enable-linger $USER` を実行し、成功したら所有記録を確認記録に残す。利用者が断った、または実行に失敗した (環境によっては管理者権限が要る) ときは、「ログアウトすると afx も止まります。止めたくなければ `loginctl enable-linger $USER` を実行してください」と案内して続行し、未完の手順 (`linger_off`、情報) に出す。すでに `yes` のときは何も変えず所有も主張しない。仮運用文書は「前提: Linger=yes」(`docs/operations/afx-service-2026-09-26.md` 前提節)。
 
 ---
@@ -606,7 +613,7 @@ WantedBy=default.target
 
 ### 7.1 確認記録 `data/state/setup.json`
 
-- 内容: `version`、`completed_at` (段 10)、`mode` (`interactive` | `non-interactive`)、`settings_schema_version`、`price` / `llm_trade` / `llm_improve` の各 `{result: ok|failed|unverified|planned, at, reason_code}`、`bridge_plan` (`connected` | `planned` | `unused`)、`history` (`{source: mt5|none|…}`)、`unit` (`installed` | `not_installed`、`launch: direct`)、`start` (`{result: started|pending|skipped, at}`)、`api` (`{enabled: true|false, result: ok|failed|disabled|unchecked, at, reason_code}`。`result` は段 13 の起動後確認 (b) の結果で、サービスの成否とは別)、`ops` (feature ごとに `{result: enabled|failed|later, stage, at, reason_code, ready: ok|failed|unchecked}`。`failed` の `stage` と `reason_code` は `EnableResult` の値、`ready` は起動後確認 (c))、`isolation` (`{admitted: yes|no|unknown, at, reason_code}`。起動後確認の admission 行から)、`linger` (`{state: owned_by_wizard|already_enabled|declined|failed, at, reason_code}`。`owned_by_wizard` は、ウィザードが確認つきで `loginctl enable-linger` を実行し `Linger=yes` を再読込で確かめた場合だけ。リセットが解除してよい唯一の根拠で、手動で有効化された linger は `already_enabled` として所有を主張しない)。確認記録への追記は、サービスが読み取りだけで使えるよう、一時ファイル + fsync + rename + 親 dir の fsync の原子的な置換で行う。
+- 内容: `version`、`completed_at` (段 10)、`mode` (`interactive` | `non-interactive`)、`settings_schema_version`、`price` / `llm_trade` / `llm_improve` の各 `{result: ok|failed|unverified|planned, at, reason_code}`、`bridge_plan` (`connected` | `planned` | `unused`)、`history` (`{source: mt5|none|…}`)、`unit` (`installed` | `placed_not_reloaded` (unit は置いたが `daemon-reload` に失敗し有効化されていない) | `not_installed`、`launch: direct`)、`start` (`{result: started|pending|skipped, at}`)、`api` (`{enabled: true|false, result: ok|failed|disabled|unchecked, at, reason_code}`。`result` は段 13 の起動後確認 (b) の結果で、サービスの成否とは別)、`ops` (feature ごとに `{result: enabled|failed|later, stage, at, reason_code, ready: ok|failed|unchecked}`。`failed` の `stage` と `reason_code` は `EnableResult` の値、`ready` は起動後確認 (c))、`isolation` (必須。`{admitted: yes|no|unknown, at, reason_code}`。起動後確認の admission 行から。改善 backend が CLI でないときは `{admitted: unknown, reason_code: not_cli_backend}`)、`linger` (`{state: owned_by_wizard|already_enabled|declined|failed|not_checked, at, reason_code}`。`not_checked` は確定 1 の時点の値 (段 13 手順 6 で確認するまでの未実施)で、未完の手順 `linger_off` は `declined` / `failed` のときだけ出す。`owned_by_wizard` は、ウィザードが確認つきで `loginctl enable-linger` を実行し `Linger=yes` を再読込で確かめた場合だけ。リセットが解除してよい唯一の根拠で、手動で有効化された linger は `already_enabled` として所有を主張しない)。確認記録への追記は、サービスが読み取りだけで使えるよう、一時ファイル + fsync + rename + 親 dir の fsync の原子的な置換で行う。
 - 自由文・URL・例外文面は保存しない。失敗理由は固定の分類 (`connect_error` / `auth_required` / `server_time_unknown` / `terminal_disconnected` / `model_not_found` / `bin_not_found` / `credentials_missing` / …)。
 - 読めない・壊れている場合は `record_state: corrupt` (無ければ `missing`) として「確認記録が読めません。`afx init` を再実行してください」の 1 行にして、他の表示は続ける (fail-soft)。起動を止めない (記録は資金保護に関わらない)。
 
@@ -648,7 +655,7 @@ setup: {
 ```
 
 - `severity`: `info` | `warn` | `action`。`observed_at`: UTC の ISO 8601 (記録の時刻、またはその場の事実を読んだ時刻)。
-- `code` は固定の語彙 (列挙は schema で持つ): `setup_record_missing`、`llm_unverified`、`opencode_unverified`、`bridge_not_connected`、`env_key_missing`、`indicators_missing`、`no_strategy`、`history_missing`、`history_source_unconfigured`、`approval_stalled`、`landlock_unavailable`、`yfinance_weekend_gap`、`ops_incomplete`、`ops_not_ready`、`isolation_not_admitted`、`api_start_failed`、`start_pending`、`linger_off`。`params` は code ごとに固定のキーを持ち、値は列挙語・整数・`[a-z0-9_.-]{1,64}` の識別子・UTC の時刻だけ (例: `env_key_missing` は `{key}`、`ops_incomplete` は `{feature, stage, reason_code}`、`approval_stalled` は `{approval_id}`)。
+- `code` は固定の語彙 (列挙は schema で持つ): `setup_record_missing`、`llm_unverified`、`opencode_unverified`、`bridge_not_connected`、`env_key_missing`、`indicators_missing`、`no_strategy`、`history_missing`、`history_source_unconfigured`、`approval_stalled`、`landlock_unavailable`、`yfinance_weekend_gap`、`ops_incomplete`、`ops_not_ready`、`isolation_not_admitted`、`api_start_failed`、`api_disabled` (splash とウィザードの終了表示だけ。`afx ctl status` の列挙からは除く)、`start_pending`、`linger_off`。`params` は code ごとに固定のキーを持ち、値は列挙語・整数・`[a-z0-9_.-]{1,64}` の識別子・UTC の時刻だけ (例: `env_key_missing` は `{key}`、`ops_incomplete` は `{feature, stage, reason_code}`、`approval_stalled` は `{approval_id}`)。
 - **載せないもの**: URL、例外文、パス、モデルの自由名、秘密値、reason の自由文。理由は固定の `reason_code` で表す (`safe_error_text` の対象になる文字列は応答に入れない)。status.read は operator / approver / ops-bot / ops-web の全 principal が持つので、秘密や内部の詳細が漏れない形に限る。
 - **前方互換**: client は未知の `code` を、「未知の手順 (code=…)。afx を更新してください」の 1 行で表示し、`params` は表示せず、エラーにしない。未知の `severity` は `info` として扱う。未知のキーは無視する。
 - `record_state=missing` のときは `setup_record_missing` 1 件だけを出す (他の項目はその場の事実から算出できるものだけ)。`corrupt` は「確認記録が読めません」の 1 件に加え、その場の事実から算出できる項目を続ける。
@@ -935,3 +942,9 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 | 2026-10-12 | v0.4 | 設計の再点検の指摘を全て反映し、ユーザー裁定 3 件を入れた。(1) サービスの起動ガードを `run_service` の root 解決の直後 (`ensure_initialized`・`.env`・settings 読み込みより前) の 1 箇所に定義: 75 → 76 の順、marker の内容を読まず存在だけ (`ENOENT` 以外は fail closed)、`build_app` の lock 取得前後の再確認を残す、壊れた・新旧混在の settings でも 76 (§4.3、AC-27、IV-19)。(2) リセットの所有範囲: 操作 API の鍵は `api/<instance_id>/` の当 instance の分だけ、ops の feature は `ops.toml` の `instance_root` が当 root と一致するものだけ、unit は `WorkingDirectory=` が当 root と一致するものだけ。他は「触らない」と表示して除外、対象表示に取引履歴等の永久削除を明記 (§4.5、§5、AC-37・40、IV-26)。(3) 段 4 と受入手順書を local LLM 無しの主シナリオに: llama-swap が応答しなければ local を既定にせず明示選択、Node・Claude CLI・ログイン・`claude -p` の確認、Codex 分岐、別ホストの llama-swap、未導入・未ログインでも `bin_not_found` / `credentials_missing` で完了 (§3 段 4、§8.4、AC-41)。(4) settings schema を変える変更の完了条件 (version bump・migration・旧 fixture・byte 一致 test・理由。§4.4、T1・T8)。(5) journal の観測契約 (InvocationID と `_SYSTEMD_INVOCATION_ID` / `USER_INVOCATION_ID`、cursor の fallback。§6.4、AC-42、T7b の着手前提)。(6) linger: ウィザードが確認つきで有効化し所有記録を確認記録に残す、リセットは所有記録がある場合だけ解除し手動の linger は変更しない (§3 段 13、§4.5、§6.4、§7、IV-26、AC-39、U-12 解消)。(7) task 分割: T5 → T5a・T5b、T7 → T7a・T7b、T15 → T15a・T15b (§9)。(8) AC-36 の許可リストを repo 相対 path に固定。U-9 は実装・移行の受入条件に、U-10・U-11 は本文の扱いで確定。ユーザー裁定 (2026-10-12): リセットは独立スクリプト `scripts/first-run-reset.sh` を主にし、内蔵の `afx init --reset` は後回し (§10.3)、サブマシンには local LLM と MT5 が無いので本環境の bridge と llama-swap を SSH トンネルで見せる (受入手順書の「試験環境の都合」節、利用者向け本文には入れない)、1 回目の受入は人の手で、2 回目以降のリセット・再実行・診断収集は SSH 経由で自動化 (§8.4) | 設計の再点検の差し戻しと実機受入方針の裁定 | |
 | 2026-10-12 | v0.5 | 設計レビュー 3 周目の指摘を全て反映し、指揮者裁定 3 件を本文に入れた。(1) `afx check` を fatal (起動不能) と warning (LLM 未検証: `deferred_by_user`・未確認モデル・CLI 未導入 / 未認証・`user_declined_probe`) に分け、warning だけなら unit を設置して degraded で起動する (§3 段 4、§6.2、§6.4、AC-16・16a・41・43、T1・T2・T7a)。Claude 選択時はウィザードが消費確認を出し、同意なら trade 用 `claude -p` を 1 往復、同意しなければ `unverified/user_declined_probe` (AC-41a)。(2) リセットの所有判定の実装契約: bash は orchestration に限り、root の解決と `instance_id`・`setup.json` の JSON 読取り・`ops.toml` の canonical な `instance_root` 行の一致判定だけを `python3 -I` に任せる。API 鍵の base は常に `$HOME/.config`、ops の base は `${XDG_CONFIG_HOME:-$HOME/.config}`、安全に扱えない文字を含む root は計画前に拒否 (§4.5、AC-37、T15a)。(3) 自動化 driver のリセットを `--yes --stop-running --include-linger` に固定し、AC-39 に「1 回目所有 → 非端末 reset → 2 回目も同じ linger 状態」を追加 (§8.4)。(4) §9 の各 task に「所有する受入条件」を追加、共有ファイル (`entry.py`・`service.py`) は関数単位で責務を分け、T14 の所有ファイルに driver と診断収集の実ファイルを明記。(5) AC-36 を製品契約 (AC-36) と試験の clean 判定 (AC-36a: wizard 前の `git status --porcelain=v1 -z --ignored=matching` を baseline とする完全比較) に分離。(6) §10 を仕分け (ユーザー裁定が残る U-1・U-2・U-6 / 実測後 U-7 / 技術調査後 U-8 / 確定済みは 10.4 決定記録へ)、番号と併記の名前を付与。(7) §9 に実装順序案を追加 | 設計レビュー 3 周目と指揮者裁定 | |
 | 2026-10-12 | v1.0 | ユーザー承認。U-1 / U-2 / U-6 を推奨どおり確定し決定記録へ。docs/superpowers/specs に移す | 設計レビュー 3 周 (sol → terra → sol) 完了 | (本 commit) |
+| 2026-10-13 | v1.1 | §7.3 の固定語彙に `api_disabled` を追加 (§7.2 の「操作 API が無効」行に対応する code が列挙に無かった。status には出さない属性はそのまま) | 実装レビューで §7.2 と §7.3 の不整合を検出 | (本 commit) |
+| 2026-10-13 | v1.2 | §7.1 の確認記録 `unit` に `placed_not_reloaded` を追加 (unit は置いたが `daemon-reload` に失敗した状態を、`installed` とも `not_installed` とも区別して残す)。`afx check` の CLI `--version` 失敗は `version_check_failed` の warning とし起動を拒否しない | 実装レビューの指摘 | |
+| 2026-10-13 | v1.3 | §7.1 の `isolation` は必須キーのまま、改善 backend が CLI でないとき (local) は `{admitted: unknown, reason_code: not_cli_backend}` を記録する。reason の語彙に `not_cli_backend` を追加 | 実装レビューの指摘 | |
+| 2026-10-13 | v1.4 | 確認記録 `linger` に `not_checked` (確定 1 の時点の値) を追加し、`linger_off` は `declined` / `failed` のときだけ出す。marker の内容形式を固定 (`phase` / `started_at` / `settings_sha256` の `key=value` 行、handoff は sha 無し)。モデル一覧の取得を `setup/checks.py::list_llama_swap_models` に置く | ウィザード本体の実装で、段 10 の時点に書ける linger の値と marker の読み方が未定義だった | |
+| 2026-10-13 | v1.5 | §3 段 4: backend を選んだ後にモデルを選ぶ (claude は alias 固定表で既定 `sonnet`、codex は `codex app-server` の `model/list` で既定 `terra`、opencode は `opencode models` の一覧から必ず選ぶ、10 件超は絞り込み 1 問、一覧失敗は固定 reason `model_list_unavailable` で手入力)。runner は settings の `model` をそのまま `--model` に渡し既定を持たないため | ユーザー裁定 (2026-10-13) | (本 commit) |
+| 2026-10-14 | v1.6 | §4.5 step 5 の取り除く順序を §5 の「リセット」列と実装に揃える (config → unit (primary は最後、補助 unit の失敗時は残す) → repo → linger → `data/` → `.env`。`daemon-reload` / `reset-failed` は primary 所有時のみ、`reset-failed` の非 0 許容)。段 11 の標準指標は T6 の `run_indicator_stage` を既定で呼ぶ | T15b の閉鎖確認で §4.5 と §5 の順序が食い違っていたため。T5a と T6 の配線 | |

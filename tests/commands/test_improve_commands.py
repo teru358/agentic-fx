@@ -139,9 +139,9 @@ def test_improve_add_strips_terminal_control_sequences_from_reply(commands):
 
 def test_normalize_idea_display_converts_newline_to_space_before_removing_control_chars():
     """改行は制御文字として除く前に空白へ置換する。"""
-    from agentic_fx.commands import _normalize_idea_display
+    from agentic_fx.core.idea_check import normalize_idea_display
 
-    display, removed = _normalize_idea_display("1行目\n2行目")
+    display, removed = normalize_idea_display("1行目\n2行目")
     assert display == "1行目 2行目"
     assert removed == 0
 
@@ -162,9 +162,9 @@ def test_normalize_idea_display_strips_leading_and_trailing_whitespace():
     """前後の半角スペースと、間に挟んだゼロ幅文字 (C* カテゴリ) を同時に
     含む入力で、表示文字列に前後の空白が残らないことを見る (C* 除去とは
     独立した `.strip()` の効果)。"""
-    from agentic_fx.commands import _normalize_idea_display
+    from agentic_fx.core.idea_check import normalize_idea_display
 
-    display, removed = _normalize_idea_display("  \u200bhello world\u200b  ")
+    display, removed = normalize_idea_display("  \u200bhello world\u200b  ")
     assert display == "hello world"
     assert removed == 2
 
@@ -205,7 +205,7 @@ def test_improve_add_warns_exactly_at_length_boundary(commands):
 def test_improve_add_placeholder_detection_uses_normalized_display_not_raw_text(commands):
     """プレースホルダ判定は**正規化後**の `display` に対して行う。ゼロ幅
     スペース (U+200B、Cf) を `<`/`>` の外側に隣接させた入力
-    (`_normalize_idea_display` で除去後 `<test>` になる) は、正規化後の
+    (`normalize_idea_display` で除去後 `<test>` になる) は、正規化後の
     文字列を基準にすれば警告あり、正規化前の生テキストを基準にすると
     先頭がゼロ幅文字のため警告なしに分かれることを利用して確認する。"""
     cmds, conn, _ = commands

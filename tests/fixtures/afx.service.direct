@@ -1,0 +1,30 @@
+[Unit]
+Description=agentic-fx paper trader (daemon)
+After=network-online.target mt5-bridge.service
+Wants=network-online.target mt5-bridge.service
+
+[Service]
+Type=exec
+NotifyAccess=none
+# 改善 CLI 隔離の admission 条件 (seccomp spec §6.1)
+Delegate=pids memory
+WorkingDirectory=%h/project/agentic-fx
+ExecStart=%h/project/agentic-fx/.venv/bin/python main.py --daemon
+# SIGTERM で graceful 停止 (stop_event)。afx-stop.sh は不要
+SendSIGKILL=yes
+FinalKillSignal=SIGKILL
+TimeoutStopFailureMode=terminate
+TimeoutStopSec=630
+KillMode=control-group
+Restart=on-failure
+RestartSec=30
+# enroll 中の起動は reason enroll_in_progress / 終了コード 75。再起動で繰り返さない (spec §6.5)
+RestartPreventExitStatus=75
+StandardOutput=journal
+StandardError=journal
+Environment=LANG=ja_JP.UTF-8
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=%h/.nvm/versions/node/v24.18.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
