@@ -77,6 +77,7 @@
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
+| [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -133,7 +134,6 @@
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
-| [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 低 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
