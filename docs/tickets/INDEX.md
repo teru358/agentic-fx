@@ -10,7 +10,7 @@
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 
-## 実装待ち (12)
+## 実装待ち (13)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -23,6 +23,7 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 | [improve-add-fullwidth-placeholder](open/improve-add-fullwidth-placeholder.md) | 低 | 2026-09-27 | improve add で全角プレースホルダが警告されない |
+| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
@@ -41,7 +42,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (125)
+## 設計待ち (124)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -138,7 +139,6 @@
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
-| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
 | [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
 | [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |

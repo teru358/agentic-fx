@@ -1,7 +1,7 @@
 ---
 id: unit-placement-explain-missing-user-session
 title: unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す
-status: 設計待ち
+status: 実装待ち
 priority: 低
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup]
 ---
 # [unit-placement-explain-missing-user-session] unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象
 
@@ -24,3 +24,4 @@ su - <user> や sudo -u で起動した端末では logind のセッションが
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-14: 状態: 実装待ち — 原因確定 (2026-10-14 ユーザー申告): ウィザードは su でユーザーを切り替えた端末から起動していた。stream-svr で XDG_RUNTIME_DIR を外すと systemctl --user show-environment が「Failed to connect to bus」で失敗することを再現済み
