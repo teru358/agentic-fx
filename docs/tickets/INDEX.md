@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 143 件。完了分は closed/。
+未完了: 144 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -41,7 +41,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (120)
+## 設計待ち (121)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -79,6 +79,7 @@
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [wizard-stage8-ask-daemon-not-api](open/wizard-stage8-ask-daemon-not-api.md) | 中 | 2026-10-14 | 段 8 は操作 API でなく「常駐サービスで運用するか」を問う |
+| [wizard-stage9-summary-in-user-terms](open/wizard-stage9-summary-in-user-terms.md) | 中 | 2026-10-14 | 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
