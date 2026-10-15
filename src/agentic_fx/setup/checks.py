@@ -12,9 +12,12 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
+
 from typing import Any, Callable, Literal, Mapping
 
 import httpx
+
+from agentic_fx.core.cli_bin import resolve_cli_bin
 
 
 class CheckReason(StrEnum):
@@ -223,8 +226,8 @@ def check_bridge(base_url: str, pair: str, *, fetch: Callable[..., Any],
 
 def cli_candidate(bin_value: str, *, which: Callable[[str], str | None]) -> str | None:
     """Resolve a configured CLI name to a candidate path (PATH lookup or absolute)."""
-    expanded = str(Path(bin_value).expanduser())
-    return which(expanded) or (expanded if Path(expanded).is_absolute() else None)
+    resolved = resolve_cli_bin(bin_value, which=which)
+    return str(resolved) if resolved is not None else None
 
 
 def is_executable_file(path: Path) -> bool:

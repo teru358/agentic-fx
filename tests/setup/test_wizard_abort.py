@@ -170,6 +170,7 @@ def test_without_landlock_the_wizard_asks_to_continue_and_skips_improvement_ques
     assert run_wizard(root2, io2, deps2) == 0, io2.text
     assert io2.asked_with("改善の周期") == [] and io2.asked_with("最初の 1 本") == []
     assert "Landlock が使えません" in io2.text and "標準指標の導入は飛ばします" in io2.text
+    assert "改善の実往復の試験は、この kernel では隔離が使えないため行いません。" not in io2.text
 
 
 def test_a_missing_pytest_is_only_a_warning(tmp_path):

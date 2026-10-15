@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agentic_fx.runners import factory
 from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.factory import build_runner
 from agentic_fx.config import (Settings, RunnerChoice, RunnerSettings,
@@ -73,6 +74,29 @@ def test_build_runner_returns_claude_runner_for_claude_backend(tmp_path, monkeyp
     registry = ToolRegistry()
     runner = build_runner("improve", settings, registry, workdir=tmp_path)
     assert isinstance(runner, FakeClaudeRunner)
+
+
+def test_claude_name_not_found_does_not_resolve_against_workdir(tmp_path, monkeypatch):
+    from agentic_fx.setup import checks
+
+    settings = _settings_with_backend(improve_backend="claude")
+    settings.runner.claude = ClaudeCliSettings(bin="claude")
+    (tmp_path / "claude").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(checks.shutil, "which", lambda _: None)
+
+    with pytest.raises(RuntimeError, match=r"runner\.claude\.bin が見つかりません \(bin_not_found\)"):
+        build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
+
+
+@pytest.mark.parametrize("configured", ("./claude", "bin/claude"))
+def test_claude_relative_configured_path_is_rejected(tmp_path, monkeypatch, configured):
+    settings = _settings_with_backend(improve_backend="claude")
+    settings.runner.claude = ClaudeCliSettings(bin=configured)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="bin_not_found"):
+        build_runner("improve", settings, ToolRegistry(), workdir=tmp_path)
 
 
 # 段 0 是正 #12 (`verified-round1.md` 1-A): `test_build_runner_forwards_

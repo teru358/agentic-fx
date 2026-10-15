@@ -4136,7 +4136,7 @@ def test_improve_ready_ok_false_does_not_call_on_ready_or_send_go(
         child_out = os.fdopen(w, "wb")
         json.loads(child_in.readline())  # handshake (seq=1)
         write_frame(child_out, {"type": "ready", "seq": 1, "ok": False,
-                                "error": "bootstrap failed"})
+                                "error": "bootstrap failed", "reason": "bin_not_found"})
         # go フレームが (誤って) 送られてこないか、有限時間だけ確認する
         # (D29 是正と同じ規律: 変異下でも無限待ちにしない)。
         ready_fds, _, _ = select.select([child_in], [], [], _BACKSTOP_SEC)
@@ -4167,6 +4167,7 @@ def test_improve_ready_ok_false_does_not_call_on_ready_or_send_go(
     t.join(timeout=_BACKSTOP_SEC + 2.0)
 
     assert result.status == "failed"
+    assert result.reason == "runner.claude.bin が見つかりません (bin_not_found)"
     assert on_ready_calls == [], (
         "ready.ok=false なのに on_ready が呼ばれている — pre-ready 失敗が "
         "post-ready 失敗として誤分類される")

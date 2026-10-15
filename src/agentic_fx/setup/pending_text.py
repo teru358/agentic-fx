@@ -19,6 +19,7 @@ STEP_PARAMS: Mapping[str, Mapping[str, tuple[str, object]]] = {
                        "reason_code": ("ident", "unknown")},
     "ops_not_ready": {"feature": ("ident", "feature")},
     "isolation_not_admitted": {"reason_code": ("ident", "unknown")},
+    "improve_isolation_unavailable": {},
 }
 
 
@@ -92,6 +93,7 @@ def render_pending_step(step: PendingStep) -> str:
         "no_strategy": "戦略がまだありません。改善の承認を確認してください",
         "history_source_unconfigured": "履歴源が設定されていません。MT5 bridge 接続後に履歴源を設定してください",
         "landlock_unavailable": "この環境では改善ループと plugin の採用ができません",
+        "improve_isolation_unavailable": "この kernel では改善ループの隔離が使えません (Landlock ABI 8 以上、Linux 6.18 以降が必要)。kernel を更新してください",
         "yfinance_weekend_gap": "yfinance は週明けにしばらく停止します",
         "linger_off": "ログアウトすると afx も止まります。`loginctl enable-linger $USER` を実行してください",
         "start_pending": "サービスはまだ起動していません。`systemctl --user start afx`",

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from agentic_fx.setup.pending_text import PendingStep, render_pending_step
 from agentic_fx.store.setup_record import SetupRecord
+from agentic_fx.core.improve_admission import MIN_LANDLOCK_ABI
 
 
 MAX_PENDING_STEPS = 32
@@ -29,6 +30,7 @@ class PendingFacts:
     env_present_keys: frozenset[str] = frozenset()
     required_env_keys: tuple[str, ...] = ()
     landlock_available: bool | None = None
+    landlock_abi: int = 0
     service_active: bool | None = None
     data_state: str | None = None
     extra_steps: list[PendingStep] = field(default_factory=list)
@@ -82,6 +84,10 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
                 reason = result.get("reason_code", "unverified") if isinstance(result, Mapping) else "unverified"
                 steps.append(_step(facts, "llm_unverified", "warn",
                                    {"target": target, "reason_code": reason}, at=result))
+        landlock_result = _record_value(record, "landlock", {})
+        if (facts.landlock_available is not False
+                and 0 < facts.landlock_abi < MIN_LANDLOCK_ABI):
+            steps.append(_step(facts, "improve_isolation_unavailable", "warn", at=landlock_result))
     improve_backend = _get(facts.settings, "improve_backend", default=None)
     if improve_backend is None:
         improve_backend = _get(facts.settings, "runner", "improve", "backend", default=None)

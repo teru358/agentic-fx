@@ -21,8 +21,16 @@ def _landlock_now() -> bool | None:
         return None
 
 
+def _landlock_abi_now() -> int:
+    try:
+        return int(landlock.landlock_abi())
+    except Exception:  # noqa: BLE001 — display-only; unknown is not a step
+        return 0
+
+
 def collect_pending_facts(root, settings, conn: sqlite3.Connection, *, deployed_plugins,
                           outage, clock, landlock_available: object = _COMPUTE,
+                          landlock_abi: object = _COMPUTE,
                           data_state: str | None = None) -> PendingFacts:
     """Read the shared setup observations without probing external services."""
     setup_read = read_setup_record(root)
@@ -49,6 +57,7 @@ def collect_pending_facts(root, settings, conn: sqlite3.Connection, *, deployed_
         env_present_keys=env_present_keys, required_env_keys=required_env_keys,
         approval_ids=approval_ids, landlock_available=(_landlock_now() if landlock_available is _COMPUTE
                             else landlock_available),  # type: ignore[arg-type]
+        landlock_abi=(_landlock_abi_now() if landlock_abi is _COMPUTE else int(landlock_abi)),
         data_state=(data_state if data_state is not None
                     else (outage.state if outage is not None else None)),
         service_active=True, now=clock.now(),

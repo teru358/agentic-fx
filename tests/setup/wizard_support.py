@@ -244,7 +244,7 @@ def make_deps(tmp_path: Path, **overrides: Any) -> tuple[WizardDeps, Calls, Fetc
     values: dict[str, Any] = dict(
         fetch=fetch, run=run, which=lambda name: None, environ={}, now=lambda: NOW,
         clock=lambda: 0.0, sleep=lambda seconds: None, unit_dir=tmp_path / "units",
-        landlock_available=lambda: True, find_spec=lambda name: object(),
+        landlock_available=lambda: True, landlock_abi=lambda: 8, find_spec=lambda name: object(),
         local_timezone=lambda: "Asia/Tokyo", yf_quote=yf_quote,
         resolve_ops=lambda root: post_start.OpsPrecheck(True),
         place_unit=place_unit, enable=enable, enable_and_start=enable_and_start,

@@ -20,7 +20,52 @@ from agentic_fx.setup.checks import (
     check_llama_swap,
     check_pytest,
     probe_claude_trade,
+    resolve_cli_bin,
 )
+
+
+@pytest.mark.parametrize("configured", ("./claude", "bin/claude"))
+def test_resolve_cli_bin_rejects_relative_configured_paths(configured, tmp_path, monkeypatch):
+    executable = tmp_path / "claude"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+
+    assert resolve_cli_bin(configured) is None
+
+
+def test_resolve_cli_bin_treats_an_unknown_home_user_as_not_found():
+    assert resolve_cli_bin("~this-user-must-not-exist-afx/claude") is None
+
+
+def test_resolve_cli_bin_expands_home_before_judging_absoluteness(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert resolve_cli_bin("~/.local/bin/claude") == tmp_path / ".local" / "bin" / "claude"
+    assert resolve_cli_bin("~/bin/../claude", which=lambda _name: None) == tmp_path / "bin" / ".." / "claude"
+
+
+def test_resolve_cli_bin_rejects_a_relative_path_lookup_result(tmp_path, monkeypatch):
+    executable = tmp_path / "claude"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", ".")
+
+    assert resolve_cli_bin("claude") is None
+
+
+def test_resolve_cli_bin_returns_none_when_path_is_empty(monkeypatch):
+    monkeypatch.setenv("PATH", "")
+
+    assert resolve_cli_bin("claude") is None
+
+
+def test_resolve_cli_bin_preserves_an_absolute_path(tmp_path):
+    executable = tmp_path / "claude"
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    assert resolve_cli_bin(str(executable)) == executable
 
 
 class _Response:

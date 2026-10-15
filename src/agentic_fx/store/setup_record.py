@@ -14,7 +14,8 @@ from agentic_fx.setup.checks import CheckReason
 from agentic_fx.ops_setup.interactive import REASON_CODES as OPS_ENABLE_REASON_CODES
 
 _IDENT = re.compile(r"^[a-z0-9_.-]{1,64}$")
-_TOP_LEVEL = frozenset({"version", "completed_at", "mode", "settings_schema_version", "price", "llm_trade", "llm_improve", "bridge_plan", "history", "indicators", "api", "ops", "isolation", "linger", "start", "unit"})
+_TOP_LEVEL = frozenset({"version", "completed_at", "mode", "settings_schema_version", "price", "llm_trade", "llm_improve", "landlock", "bridge_plan", "history", "indicators", "api", "ops", "isolation", "linger", "start", "unit"})
+_REQUIRED_TOP_LEVEL = _TOP_LEVEL - {"landlock"}
 # 検査の語彙 (CheckReason) に、記録だけが持つ語を足したもの。
 _RECORD_ONLY_REASONS = frozenset({
     "ok", "unknown", "auth_failed", "socket_missing", "timeout", "not_ready",
@@ -65,9 +66,10 @@ def _safe_value(value: Any) -> bool:
     return _timestamp(value) or _reason(value) or bool(_IDENT.fullmatch(value))
 
 def _valid(data: object) -> bool:
-    if not isinstance(data, dict) or not (_TOP_LEVEL <= set(data) <= _TOP_LEVEL): return False
+    if not isinstance(data, dict) or not (_REQUIRED_TOP_LEVEL <= set(data) <= _TOP_LEVEL): return False
     if (not isinstance(data["version"], int) or isinstance(data["version"], bool) or data["version"] < 1 or not _timestamp(data["completed_at"]) or not _in(data["mode"], {"interactive", "non-interactive"}) or not isinstance(data["settings_schema_version"], int) or isinstance(data["settings_schema_version"], bool)): return False
     if not all(_result(data[name], {"ok", "failed", "unverified", "planned"}) for name in ("price", "llm_trade", "llm_improve")): return False
+    if "landlock" in data and not _result(data["landlock"], {"ok", "failed"}): return False
     if not _in(data["bridge_plan"], {"connected", "planned", "unused"}): return False
     if not _keys(data["history"], {"source"}, {"source"}) or not isinstance(data["history"]["source"], str) or not _IDENT.fullmatch(data["history"]["source"]): return False
     if not _keys(data["indicators"], {"installed"}, {"installed"}) or not isinstance(data["indicators"]["installed"], int) or isinstance(data["indicators"]["installed"], bool) or data["indicators"]["installed"] < 0: return False

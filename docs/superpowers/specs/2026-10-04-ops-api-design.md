@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.17
+# [ops-api] 操作 API と client 契約設計 v1.18
 
-版: v1.17
+版: v1.18
 
 日付: 2026-10-05
 
@@ -296,7 +296,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 |I-33|起動時は既存 plugin 切替 journal の reconcile が先、ops の回復が後。決定の結果の正は `approval_requests` と切替 journal で、ops の回復はそれを追記するだけで決定を自動再実行せず、決められない要求だけを `outcome_unknown` にする|
 |I-34|`killswitch reconcile` は `local_guard` で UDS 限定とし、ラッチ中への確定だけを行う。解除側へは倒さず、資金保護を弱めない。status は `reconcile_required` を返す|
 |I-35|`reflect retry` は `Idempotency-Key` 必須かつ試行記録の識別子 (`attempts`、`last_attempt_at`) の一致を条件とし、不一致は 409 `attempt_changed` で無変更。後から積まれた試行記録を消さない|
-|I-36|status の `setup` 節には URL、例外文、path、秘密値、自由文を載せない。固定 code と許可された params だけを返し、未知 code / severity / params key を受けた client はそれぞれ未知手順表示 / info / 無視で前方互換に扱う|
+|I-36|status の `setup` 節には URL、例外文、path、秘密値、自由文を載せない。固定 code (`setup_record_missing` `llm_unverified` `opencode_unverified` `bridge_not_connected` `env_key_missing` `indicators_missing` `no_strategy` `history_missing` `history_source_unconfigured` `approval_stalled` `landlock_unavailable` `improve_isolation_unavailable` `yfinance_weekend_gap` `ops_incomplete` `ops_not_ready` `isolation_not_admitted` `start_pending` `linger_off`。実装の `_STATUS_SETUP_CODES` と一致させる) と許可された params だけを返し、未知 code / severity / params key を受けた client はそれぞれ未知手順表示 / info / 無視で前方互換に扱う|
 
 ## 11. 受入条件
 
@@ -436,3 +436,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-10|v1.15|§12 に server 認証の oracle fixture (tests/ops/fixtures/server_auth_oracle.json) を記載|afx-ops T1 実装 (AC-13 の black-box oracle)||
 |2026-10-13|v1.16|status の `setup` 固定 schema、fail-soft の `unknown`、非開示不変条件、client 前方互換、受入条件を追加|first-run の未完手順を status.read のまま安全に提供するため||
 |2026-10-14|v1.17|§1.2 の `api.enabled` 既定を true に改訂 (seccomp 投入待ちの規範を撤回、2026-10-12 裁定 P16 / 段 8)|first-run T8 で example / ApiSettings / 運用文書の既定を true にしたため正本を揃えた||
+|2026-10-15|v1.18|I-36 に status.setup の固定 code を列挙 (`improve_isolation_unavailable` を追加。実装の `_STATUS_SETUP_CODES` と一致させる)|first-run fr-fix1 で新 code を足したため正本に列挙を置いた||
