@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 149 件。完了分は closed/。
+未完了: 150 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -42,13 +42,14 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (125)
+## 設計待ち (126)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [deployed-plugin-has-no-disable-or-rollback](open/deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
+| [wizard-check-improve-landlock-abi-upfront](open/wizard-check-improve-landlock-abi-upfront.md) | 高 | 2026-10-15 | 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う |
 | [wizard-write-absolute-cli-bin](open/wizard-write-absolute-cli-bin.md) | 高 | 2026-10-15 | ウィザードは claude の実体を which で見つけても runner.claude.bin を絶対パスに書かない |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](open/baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
