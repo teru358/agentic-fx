@@ -1,14 +1,13 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 152 件。完了分は closed/。
+未完了: 151 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (4)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
-| [reset-cannot-remove-readonly-plugin-versions](open/reset-cannot-remove-readonly-plugin-versions.md) | 高 | 2026-10-15 | リセットが読み取り専用の plugin 版 dir を消せず repo_plugins が失敗 |
 | [wizard-check-improve-landlock-abi-upfront](open/wizard-check-improve-landlock-abi-upfront.md) | 高 | 2026-10-15 | 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う |
 | [wizard-write-absolute-cli-bin](open/wizard-write-absolute-cli-bin.md) | 高 | 2026-10-15 | ウィザードは claude の実体を which で見つけても runner.claude.bin を絶対パスに書かない |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
