@@ -162,7 +162,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 失敗の文面 (例外の種類で分ける。文面は `safe_error_text` を通す):
   - 接続できない: 「MT5 bridge (http://localhost:8812) に接続できません。bridge が起動しているか、URL が正しいか確認してください。[r] 再試行 / [2] 『使う予定・未準備』として進む / [u] URL を入れ直す」
   - 401/403 (https か loopback で鍵を送ったのに拒否): 「bridge の API キーが一致しません。`.env` の MT5_BRIDGE_API_KEY を確かめてください (値はここでは入力しません)。[r] 再試行 / [2] / [u]」
-  - 平文 http (非 loopback) では鍵を送らない (v1.5)。`/health` が 200 で鍵の要る endpoint が 401 のときは失敗にせず `price: unverified`、reason `key_withheld_plain_http`、「bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。daemon は `.env` の鍵で接続します。」として次へ (再試行の問いは出さない。2026-10-15 裁定 (b)、v1.8)。daemon 側の未完手順 `bridge_not_connected` は記録が `planned` でも `data_state` が `ready` なら出さない。
+  - 平文 http (非 loopback) では鍵を送らない (v1.5)。`/health` が 200 で鍵の要る endpoint が 401 のときは失敗にせず `price: unverified`、reason `key_withheld_plain_http`、「bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。daemon は `.env` の鍵で接続します。」として次へ (再試行の問いは出さない。2026-10-15 裁定 (b)、v1.8)。daemon 側の未完手順 `bridge_not_connected` は記録が `planned` でも daemon の data_state が ready なら出さない。
   - 503: 「bridge は動いていますが、MT5 のサーバ時刻がまだ確定していません (bridge は確定するまで 503 を返します — `mt5_bridge/README.md` サーバ時刻オフセット節)。MT5 端末がログイン済みで、市場が開いているときに再試行してください。」
   - `mt5_connected: false`: 「bridge は動いていますが MT5 端末とつながっていません。端末のログイン・自動売買の許可を確認してください。」
 - 書く予定の値: `datafeed.mt5.enabled: true`、`bridge_url`、**他の源 (`yfinance`、`twelvedata`) は全部 `enabled: false`**。`datafeed.primary` は書かない (enabled が 1 個なら導出される — 付録 A で実測)。理由: outage 設計書 (`docs/superpowers/specs/2026-09-24-outage-stop-and-backfill-design.md` 要点 1(a)) が指摘した「yfinance を true のまま MT5 を有効にする設定ミス」をウィザード経由では起こさない。

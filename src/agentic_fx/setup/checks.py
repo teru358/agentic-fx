@@ -39,6 +39,7 @@ class CheckReason(StrEnum):
     TERMINAL_DISCONNECTED = "terminal_disconnected"
     USER_DECLINED_PROBE = "user_declined_probe"
     VERIFY_FAILED = "verify_failed"
+    KEY_WITHHELD_PLAIN_HTTP = "key_withheld_plain_http"
     VERSION_CHECK_FAILED = "version_check_failed"
 
 
