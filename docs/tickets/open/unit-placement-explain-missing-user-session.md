@@ -26,3 +26,4 @@ su - <user> や sudo -u で起動した端末では logind のセッションが
 - 2026-10-14: 起票。
 - 2026-10-14: 状態: 実装待ち — 原因確定 (2026-10-14 ユーザー申告): ウィザードは su でユーザーを切り替えた端末から起動していた。stream-svr で XDG_RUNTIME_DIR を外すと systemctl --user show-environment が「Failed to connect to bus」で失敗することを再現済み
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-15: 状態: 実装中 — 裁定 (2026-10-15): unit の記録は文字列のまま (reason_code は記録に写さない。文面と手順書で足りる)
