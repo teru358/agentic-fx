@@ -273,7 +273,7 @@ def snapshot(root: Path) -> dict[str, str]:
 LOCK_FILES = {"data/", "data/ops/", "data/instance.lock", "data/ops/setup.lock"}
 
 # 既定の回答だけで fresh な root を最後まで通す (価格源は bridge に接続済み、常駐化はしない)。
-FRESH_RULES = (("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みますか", "y"),
+FRESH_RULES = (("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みます", "y"),
                ("afx を常駐サービス", "n"))
 
 

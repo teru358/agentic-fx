@@ -321,6 +321,16 @@ def test_no_runtime_directory_explains_missing_user_session(tmp_path, settings):
     assert "su` ではなく" in result.message
 
 
+def test_no_runtime_directory_uses_the_actual_login_name_in_its_guidance(tmp_path, settings, monkeypatch):
+    root = make_repo(tmp_path)
+    monkeypatch.setattr("agentic_fx.setup.unit.getpass.getuser", lambda: "actual-user")
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=Calls(results={"systemctl --user": 1}), check_run=Calls(), env={"HOME": str(tmp_path)})
+
+    assert "actual-user" in result.message
+    assert "<user>" not in result.message
+
+
 def test_runtime_directory_keeps_generic_systemd_reason(tmp_path, settings):
     root = make_repo(tmp_path)
     run = Calls(results={"systemctl --user": 1})

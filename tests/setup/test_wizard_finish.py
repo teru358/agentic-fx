@@ -29,7 +29,7 @@ def record_of(root):
 
 
 def installed_rules(*extra):
-    return Rules(*extra, ("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みますか", "y"),
+    return Rules(*extra, ("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みます", "y"),
                  *UNIT_RULES)
 
 
@@ -423,7 +423,7 @@ def test_a_crash_inside_handoff_resumes_at_the_outside_access_question_without_t
     io = ScriptedWizardIO(responder=Rules(("外から見る手段を今", "y"), ("有効にする手段", "bot"),
                                           ("systemd のユーザーサービス", "y"), default=""))
     assert run_wizard(root, io, deps2) == 0, io.text
-    assert io.asked_with("価格源") == [] and io.asked_with("書き込みますか") == []
+    assert io.asked_with("価格源") == [] and io.asked_with("書き込みます") == []
     assert io.asked_with("systemd のユーザーサービス") == []
     assert markers_seen == ["handoff"]
     assert not setup_marker_present(root)

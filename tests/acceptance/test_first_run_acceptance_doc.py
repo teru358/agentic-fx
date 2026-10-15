@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 DOC = REPOSITORY / "docs" / "operations" / "first-run-acceptance.md"
 WIZARD = REPOSITORY / "src" / "agentic_fx" / "setup" / "wizard.py"
+INDICATORS = REPOSITORY / "src" / "agentic_fx" / "setup" / "indicators.py"
 
 
 def _doc() -> str:
@@ -39,6 +41,21 @@ def test_option_lines_and_question_labels_are_quoted_from_the_wizard() -> None:
     text = _doc()
     missing = [item for item in options + labels if item not in text]
     assert not missing, f"手順書がウィザードの選択肢・問いの文面を引用していない: {missing}"
+
+
+def test_indicator_messages_and_questions_are_quoted_from_the_implementation() -> None:
+    source = INDICATORS.read_text(encoding="utf-8")
+    literals = re.findall(r'io\.(?:stdout|ask)\("((?:[^"\\\\\n]|\\\\.)*)"', source)
+    assert literals, "指標選択の利用者向け文面を抽出できない"
+    text = _doc()
+    missing = [literal for literal in literals if literal not in text]
+    assert not missing, f"手順書が標準指標の文面を引用していない: {missing}"
+
+
+def test_deprecated_manual_start_command_is_absent_from_user_documents_and_source() -> None:
+    result = subprocess.run(["grep", "-rn", "uv run main.py", "src", "docs/operations", "README.md"],
+                            cwd=REPOSITORY, capture_output=True, text=True, check=False)
+    assert result.returncode == 1, result.stdout
 
 
 def test_cli_install_section_name_matches_the_pointer_the_wizard_prints() -> None:

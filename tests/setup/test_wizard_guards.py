@@ -94,19 +94,19 @@ def test_summary_hides_setting_keys_and_reopens_after_showing_the_diff(tmp_path)
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(
-        ("この内容で書き込みますか", ("d", "y"))))
+        ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 0, io.text
     summary, diff = io.text.split("settings.yaml の変更点", 1)
     assert "datafeed." not in summary and "確定 1" not in summary and "planned" not in summary
     assert "現在値 → 新しい値" in diff
-    assert len(io.asked_with("この内容で書き込みますか")) == 2
+    assert len(io.asked_with("この内容で書き込みます")) == 2
 
 
 def test_summary_decline_writes_no_setup_files(tmp_path):
     root = make_root(tmp_path)
     before = snapshot(root)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みますか", "n")))
+    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みます", "n")))
     assert run_wizard(root, io, deps) == 1, io.text
     after = snapshot(root)
     assert {key: value for key, value in after.items() if key in before} == before
@@ -239,7 +239,7 @@ def test_a_settings_file_changed_during_the_questions_stops_before_anything_is_w
     rules = fresh_responder()
 
     def responder(prompt):
-        if "書き込みますか" in prompt:
+        if "書き込みます" in prompt:
             path.write_text("display_timezone: UTC\n# edited elsewhere\n")
         return rules(prompt)
 

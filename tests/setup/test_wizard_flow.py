@@ -50,7 +50,7 @@ def test_questions_are_asked_in_the_designed_order(tmp_path):
     topics = ["読みました", "表示タイムゾーン (例", "口座通貨", "対象ペア", "初期残高", "価格源", "bridge の URL",
               "bridge 側で API キー", "LLM の構成", "取引判断のモデルの番号", "改善の backend",
               "改善のモデルの番号", "判断足", "backtest の基底足", "改善の周期", "改善の時刻", "最初の 1 本",
-              "afx を常駐サービス", "この内容で書き込みますか", "方針文", "最初の課題"]
+              "afx を常駐サービス", "この内容で書き込みます", "方針文", "最初の課題"]
     assert len(io.asked) == len(topics)
     for prompt, topic in zip(io.asked, topics):
         assert topic in prompt, (topic, prompt)
@@ -59,7 +59,7 @@ def test_questions_are_asked_in_the_designed_order(tmp_path):
 def test_the_price_source_has_no_default_and_is_not_skipped_by_enter(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=Rules(("価格源", ("", "", "1")), ("書き込みますか", "n")))
+    io = ScriptedWizardIO(responder=Rules(("価格源", ("", "", "1")), ("書き込みます", "n")))
     assert run_wizard(root, io, deps) == 1
     assert len(io.asked_with("価格源")) == 3
     assert "のどれかで答えてください" in io.text

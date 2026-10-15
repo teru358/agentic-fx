@@ -18,7 +18,7 @@
   {"expect": "改善の時刻", "send": "Sat 03:00", "comment": "段 7"},
   {"expect": "最初の 1 本", "send": "1", "comment": "段 7: 1 = 次の予定まで待つ"},
   {"expect": "afx を常駐サービス", "send": "y", "comment": "常駐サービスを使う"},
-  {"expect": "書き込みますか", "send": "y", "comment": "段 9 要約: 書き込みに同意 (段 10 の確定へ)"},
+  {"expect": "書き込みます", "send": "y", "comment": "段 9 要約: 書き込みに同意 (段 10 の確定へ)"},
   {"expect": "本を登録します", "send": "y", "comment": "段 11 標準指標を登録"},
   {"expect": "方針文: ", "send": "損失を小さく抑えることを最優先にする", "timeout": 3600, "comment": "段 12 方針文 (1 行)"},
   {"expect": "方針文: ", "send": "", "comment": "段 12: 方針文の入力を終える"},

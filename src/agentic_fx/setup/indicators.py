@@ -111,16 +111,17 @@ def ask_selection(io: IndicatorIO, rows: list[IndicatorRow]) -> list[str]:
         mark = "  (配備済み・既定で外れています)" if row.deployed else ""
         io.stdout(f"{index}. {row.name}: {row.summary}{mark}")
     default_chosen = [row.name for row in rows if not row.deployed]
-    answer = io.ask(f"標準指標 {len(default_chosen)} 本を登録します [Y/n] (e = 外す番号を選ぶ)", "Y")
-    normalized = (answer or "Y").strip().lower()
-    if normalized in ("", "y", "yes"):
-        return default_chosen
-    if normalized in ("n", "no"):
-        io.stdout("採用しませんでした。")
-        return []
-    if normalized != "e":
+    while True:
+        answer = io.ask(f"標準指標 {len(default_chosen)} 本を登録します [Y/n] (e = 外す番号を選ぶ)", "Y")
+        normalized = (answer or "Y").strip().lower()
+        if normalized in ("", "y", "yes"):
+            return default_chosen
+        if normalized in ("n", "no"):
+            io.stdout("採用しませんでした。")
+            return []
+        if normalized == "e":
+            break
         io.stdout("y、n、e のどれかで答えてください。")
-        return ask_selection(io, rows)
     toggled: set[int] = set()
     while True:
         answer = io.ask("外したい番号 (複数はカンマか空白、範囲は 2-4。配備済みの番号は採用に戻します。空 Enter = この一覧で進む)", "")

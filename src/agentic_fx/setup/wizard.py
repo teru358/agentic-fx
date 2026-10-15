@@ -87,7 +87,7 @@ _NOT_REPO_MESSAGE = ("ここは agentic-fx のリポジトリ直下ではあり�
 _SETUP_BUSY_MESSAGE = ("別の `afx init` または `afx ops enable` が実行中です。"
                        "終了してから再実行してください。設定・DB は変更していません。")
 _INSTANCE_BUSY_MESSAGE = ("別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから"
-                          "再実行してください (`uv run main.py` で手動起動しているなら、"
+                          "再実行してください (`uv run afx` で手動起動しているなら、"
                           "その端末で終了してください)。設定・DB は変更していません。")
 _ENROLL_MESSAGE = ("`afx ops enable <feature>` が途中で止まっています。同じコマンドを再実行して"
                    "完了させてください。その間 afx は起動できません。")
@@ -1766,7 +1766,10 @@ def _stage9(sess: _Session, st: _Start, a: Answers) -> _Plan:
                 sess.say(f"建玉・未約定が {count} 件あります。これらの項目を変える前に建玉を閉じることを勧めます。")
             sess.typed_yes("変えてよいときだけ")
     while True:
-        action = sess.choice("この内容で書き込みますか (d = settings.yaml の差分を見る)", ("y", "n", "d"), "n")
+        action = sess.ask("この内容で書き込みます [Y/n] (d = settings.yaml の差分を見る): ").lower() or "y"
+        if action not in ("y", "n", "d"):
+            sess.say("y / n / d のどれかで答えてください。")
+            continue
         if action == "y":
             break
         if action == "n":

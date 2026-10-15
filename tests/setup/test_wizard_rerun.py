@@ -106,7 +106,7 @@ def test_a_duplicate_key_stops_the_rerun_and_names_the_lines(tmp_path):
     snap = snapshot(root)
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", ""),
-                                                    ("この内容で書き込みますか", ("d", "y"))))
+                                                    ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 1
     assert "display_timezone が 2 回書かれています" in io.text and "行 3 と 179" in io.text
     assert {k: v for k, v in snapshot(root).items() if k in snap} == snap
@@ -116,7 +116,7 @@ def test_a_settings_file_newer_than_this_afx_is_never_modified(tmp_path):
     root, before = installed_root(tmp_path, mutate=lambda t: t.replace("schema_version: 2", "schema_version: 99"))
     snap = snapshot(root)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みますか", ("d", "y"))))
+    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 1
     assert "新しい版" in io.text
     assert {k: v for k, v in snapshot(root).items() if k in snap} == snap
@@ -145,7 +145,7 @@ def test_an_old_version_is_migrated_in_the_same_write_and_shown_in_the_summary(t
     root, before = installed_root(tmp_path, mutate=versionless)
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", ""),
-                                                    ("この内容で書き込みますか", ("d", "y"))))
+                                                    ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 0, io.text
     after = (root / "config" / "settings.yaml").read_text()
     assert after.startswith("schema_version: 2") or "\nschema_version: 2" in after

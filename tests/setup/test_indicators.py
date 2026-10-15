@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,6 +123,14 @@ def test_empty_standard_registration_answer_selects_all():
 
 def test_yes_selects_all_standard_indicators():
     assert ind.ask_selection(ScriptIO(["y"]), rows()) == NAMES
+
+
+def test_invalid_confirmation_answers_repeat_without_recursion_then_accept_yes():
+    io = ScriptIO(["maybe", "?", "y"])
+
+    assert ind.ask_selection(io, rows()) == NAMES
+    assert len(io.questions) == 3
+    assert inspect.getsource(ind.ask_selection).count("ask_selection(") == 1
 
 
 @pytest.mark.parametrize("answer,removed", [

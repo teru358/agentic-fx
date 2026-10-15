@@ -105,7 +105,7 @@ def _state_store(root: Path) -> StateStore:
 
 def ensure_initialized(root: Path) -> None:
     if not _state_store(root).load().initialized:
-        print("初期化が完了していません。先に `uv run main.py init` を実行してください。",
+        print("初期化が完了していません。先に `uv run afx init` を実行してください。",
               file=sys.stderr)
         raise SystemExit(2)
 
@@ -698,7 +698,7 @@ def run_init(root: Path, *, config_file: Path | None = None) -> int:
             f"pairs={settings.pairs} mode={state.mode.value} "
             f"autopilot={'on' if state.autopilot else 'off'}")
         remove_setup_marker(root)
-        print("初期化が完了しました。`uv run main.py` でサービスを起動できます。")
+        print("初期化が完了しました。`uv run afx` でサービスを起動できます。")
         return 0
     finally:
         lease.close()
