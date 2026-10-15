@@ -1,15 +1,15 @@
 ---
 id: wizard-check-improve-landlock-abi-upfront
 title: 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う
-status: 実装中
+status: 是正済
 priority: 高
 opened: 2026-10-15
-closed: null
+closed: 2026-10-15
 related: [first-run-setup, wizard-write-absolute-cli-bin]
 ---
 # [wizard-check-improve-landlock-abi-upfront] 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う
 
-**状態**: 実装中 / **優先**: 高
+**状態**: 是正済 / **優先**: 高
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [first-run-setup, wizard-write-absolute-cli-bin]
 
 ## 修正内容
 
+- 2026-10-15: 段 0 で landlock_abi() を MIN_LANDLOCK_ABI (8) と比べ、足りなければ表示して続行 (記録 landlock に reason landlock_abi_too_old)。未完手順 improve_isolation_unavailable は現在の ABI で判定し status API にも載る (ops-api v1.18 に列挙)。段 4 は claude/codex の実往復の問いを省略文に、段 7 に 1 行。README と手順書に kernel 要件 (Linux 6.18 以降 = ABI 8、確認コマンドと -1 の読み方)。spec v1.7
+
 ## 経緯
 
 - 2026-10-15: 起票。
 - 2026-10-15: 状態: 実装中 — 束 fr-fix1 (2026-10-15 ユーザー承認の設計: ブリーフ tmp/review-20261011-sc/fr-fix1-ab.md / fr-fix1-c.md)
+- 2026-10-15: 是正内容 — 段 0 で landlock_abi() を MIN_LANDLOCK_ABI (8) と比べ、足りなければ表示して続行 (記録 landlock に reason landlock_abi_too_old)。未完手順 improve_isolation_unavailable は現在の ABI で判定し status API にも載る (ops-api v1.18 に列挙)。段 4 は claude/codex の実往復の問いを省略文に、段 7 に 1 行。README と手順書に kernel 要件 (Linux 6.18 以降 = ABI 8、確認コマンドと -1 の読み方)。spec v1.7
