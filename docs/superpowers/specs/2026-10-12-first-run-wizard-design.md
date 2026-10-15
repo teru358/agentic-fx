@@ -1,4 +1,4 @@
-# [first-run-setup] 初期設定ウィザード 設計書 (v1.7)
+# [first-run-setup] 初期設定ウィザード 設計書 (v1.8)
 
 作成日: 2026-10-02 (v0.1)。v0.2 改訂: 2026-10-12。v0.3 改訂: 2026-10-12。v0.4 改訂: 2026-10-12。v0.5 改訂: 2026-10-12。対象 commit: main `f01f903` (+ 未追跡 `deploy/`)。v0.1 は `3b4213d` を対象にした。
 入力: `tmp/design-first-run/inventory.md` (現状の全数調査)、`tmp/design-first-run/wizard-flow-and-decisions.md` (叩き台・論点・**末尾の裁定記録**)、B-2 実測 `tmp/design-first-run/b2-measure/` (生ログ `run1.log` `run2.log`、本書 付録 A に要約)。
@@ -161,7 +161,8 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 成功: 「MT5 bridge OK: USDJPY bid=… ask=… (bridge の時刻 …、UTC で …)」。
 - 失敗の文面 (例外の種類で分ける。文面は `safe_error_text` を通す):
   - 接続できない: 「MT5 bridge (http://localhost:8812) に接続できません。bridge が起動しているか、URL が正しいか確認してください。[r] 再試行 / [2] 『使う予定・未準備』として進む / [u] URL を入れ直す」
-  - 401/403: 「bridge が API キーを要求しています。afx 側の `.env` に MT5_BRIDGE_API_KEY を書いてから再試行してください (値はここでは入力しません)。」
+  - 401/403 (https か loopback で鍵を送ったのに拒否): 「bridge の API キーが一致しません。`.env` の MT5_BRIDGE_API_KEY を確かめてください (値はここでは入力しません)。[r] 再試行 / [2] / [u]」
+  - 平文 http (非 loopback) では鍵を送らない (v1.5)。`/health` が 200 で鍵の要る endpoint が 401 のときは失敗にせず `price: unverified`、reason `key_withheld_plain_http`、「bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。daemon は `.env` の鍵で接続します。」として次へ (再試行の問いは出さない。2026-10-15 裁定 (b)、v1.8)。daemon 側の未完手順 `bridge_not_connected` は記録が `planned` でも `data_state` が `ready` なら出さない。
   - 503: 「bridge は動いていますが、MT5 のサーバ時刻がまだ確定していません (bridge は確定するまで 503 を返します — `mt5_bridge/README.md` サーバ時刻オフセット節)。MT5 端末がログイン済みで、市場が開いているときに再試行してください。」
   - `mt5_connected: false`: 「bridge は動いていますが MT5 端末とつながっていません。端末のログイン・自動売買の許可を確認してください。」
 - 書く予定の値: `datafeed.mt5.enabled: true`、`bridge_url`、**他の源 (`yfinance`、`twelvedata`) は全部 `enabled: false`**。`datafeed.primary` は書かない (enabled が 1 個なら導出される — 付録 A で実測)。理由: outage 設計書 (`docs/superpowers/specs/2026-09-24-outage-stop-and-backfill-design.md` 要点 1(a)) が指摘した「yfinance を true のまま MT5 を有効にする設定ミス」をウィザード経由では起こさない。
@@ -224,7 +225,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 ### 段 5: 判断足 (トレード足)
 
-- **尋ねること**: 判断足。選択肢は `15m` / `1h` (config のエラー文が勧める 2 値 `config.py:236-240`)。既知の足は `1m 5m 15m 30m 1h 4h 1d` (`datafeed/sources.py:16-17`) で 4h 以上は拒否されるが、`30m` は example の `intervals` に無く、判断足として使えるかは未確認なので選択肢に出さない。`1m`・`5m` は次の検査で落ちることを示すために選択肢には出し、選ぶと理由を表示する。
+- **尋ねること**: 判断足を番号で選ぶ (v1.8)。選べる足は既知の足 (`INTERVAL_MIN`) のうち、判断の上限より長く、かつ 240 分未満 (4h 以上は保存が 1h に正規化される派生専用で判断足にできない、`config._decision_timeframe_is_stored`) のもの = `15m` / `30m` / `1h` (既定 `1h`、再実行は現在値)。選べない足 (`1m` `5m` `4h` `1d`) も一覧に出して理由を添え、番号は振らない。手入力は無し。(旧: 選択肢は `15m` / `1h` (config のエラー文が勧める 2 値 `config.py:236-240`)。既知の足は `1m 5m 15m 30m 1h 4h 1d` (`datafeed/sources.py:16-17`) で 4h 以上は拒否されるが、`30m` は example の `intervals` に無く、判断足として使えるかは未確認なので選択肢に出さない。`1m`・`5m` は次の検査で落ちることを示すために選択肢には出し、選ぶと理由を表示する。
 - **既定**: `1h` (example)。理由: 1 回の判断の上限時間と余裕があり、LLM の呼び出し回数も抑えられる。
 - **検査**: 段 4 で選んだ backend と `llama_swap.timeout_sec` で worker 1 回の上限 (Cw) を `core/mission_ceiling` で計算し (`service.py:680-707` と同じ式。`_check_mission_ceilings` は activity を要るので純粋関数を直接使う — inventory §3.4)、判断足の幅以上なら「判断足 5m (300 秒) は、1 回の判断の上限 405 秒より短いため使えません。15m 以上を選ぶか、llama_swap.timeout_sec を下げてください」。`plugin.signal_lease_min` も同時に検算。
 - **再実行で変えるとき**: 「判断足を変えると、既に配備した strategy plugin の足 (config.yaml の timeframe) と食い違うことがあります。食い違うと signal が静かに効かなくなります (`service.py:658-668`、技術ログの WARNING のみ)。」配備済み strategy の足を一覧して食い違いを表示。cron cursor・保存済み判断の足タグへの影響は未確認 (inventory C-6)。
@@ -261,7 +262,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 ### 段 8: 操作 API と `.env` (B-13)
 
-- **尋ねること**: 「操作 API を有効にしますか [Y/n]」。
+- **尋ねること**: 「afx を常駐サービス (systemd user unit) として動かしますか [Y/n]」(v1.8。旧: 「操作 API を有効にしますか」)。利用者が決めるのは常駐か対話シェルかで、操作 API はその結果: Y → `api.enabled: true` + 段 13 で unit を置く (段 13 は常駐の意思を再質問せず設置内容の確認だけ)、n → `api.enabled: false` + 段 13 は unit を置かず「手動起動: `uv run afx`。常駐に切り替えるときは `afx init` を再実行」の案内だけ (記録 `unit: not_installed` / reason `declined`、`start: skipped`)。再実行の既定は現在値 (`api.enabled` と unit の有無)。
 - **表示**: 「操作 API は同じマシンの UNIX ソケット (`data/run/api.sock`) だけで受け付け、TCP では開きません。常駐 (daemon) で動かすときの承認・方針文の追加・改善の起動は `afx ctl` から行うので、有効にすることを勧めます。無効にすると `afx ctl` と、段 13 の bot / web / notify は使えません。また `afx ctl status` に未完の手順を出すこともできなくなり、案内は起動画面とこのウィザードの表示だけになります。」
 - **既定**: 有効 (`api.enabled: true`)。再実行は現在値。example の `api.enabled` 既定は T8 で `true` に変え、「seccomp が入るまで」のコメントを消す。それまでの example 由来の `false` は、この段が `true` に書き換える (P16)。鍵は service が起動時に補完する (`ops.keys.ensure_initialized`) ので、ウィザードは鍵を作らない。外から見る手段を選んだときだけ、`afx ops enable` が停止中に鍵を初期化する。
 - **通知の扱い**: Discord への通知・承認は段 13 の外から見る手段 (bot / notify) に一本化し、この段では尋ねない。旧設定 `discord.enabled` (`.env` の `DISCORD_WEBHOOK_URL` へ送る簡易通知、`core/notifier.py`、`service.py` が配線) は、ウィザードは尋ねず値も変えず、既定 `false` のままにする。この簡易通知の廃止は別チケット `legacy-discord-webhook-notify-removal` (優先度 低) で扱う。
@@ -276,10 +277,10 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 ### 段 9: 要約と最終確認
 
-- **表示**: settings.yaml の変更点 (キー: 現在値 → 新しい値。行単位の diff と同じもの。版が古ければ migration が挿入・変更する行も同じ表に出す)、確定 1 で作るもの (DB、状態、確認記録、期の消費印)、確定 2 で尋ねること (標準指標・方針文・最初の課題・常駐化と外から見る手段)、未確認の項目の一覧。
+- **表示** (v1.8): 利用者の言葉で要約する — 価格源 (源・URL・鍵の有無・検査結果を文で)、取引判断と改善 (backend とモデル)、判断足・backtest の基底足・履歴源、改善周期と次回と最初の 1 本、常駐 (段 8 の答え)、作るもの (settings.yaml、DB、状態、確認記録)、このあと尋ねること (標準指標、方針文と最初の課題、常駐化と外から見る手段)。設定キー名と内部語 (確定 1 / 確定 2、planned 等) は出さない。`d` で従来の「キー: 現在値 → 新しい値」(行単位の diff と同じ。版が古ければ migration が挿入・変更する行も同じ表に) を表示して問いに戻る。
 - **再実行で「注意が要る項目」を変えた場合** (inventory §8.2: `paper.starting_balance`・`account_currency`・`datafeed` の源・`decision_timeframes`・`backtest.*`): 項目ごとに帰結の 1 文を出し、`yes` の打ち込みを求める (Enter では通らない)。建玉・未約定があるときは「建玉が N 件あります。これらの項目を変える前に建玉を閉じることを勧めます」。
 - **検査**: 書き換え後の全体を G1〜G3 (付録 A) + 起動前検査のうち設定だけで決まるもの (cache retention `service.py:553-582`、mission ceiling `service.py:680-723`)。失敗は該当の段へ戻る。
-- **尋ねること**: 「書き込みますか [y/N]」。N なら何も書かずに終了 (lock を解放)。
+- **尋ねること**: 「この内容で書き込みます [Y/n] (d = settings.yaml の差分を見る)」(v1.8。旧: 「書き込みますか [y/N]」)。n なら何も書かずに終了 (lock を解放)。
 
 ### 段 10: 確定 1 (設定・DB・状態・記録)
 
@@ -302,7 +303,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 - Landlock が無ければ説明だけで飛ばす。改善隔離の ABI が足りないとき (段 0) は周期を尋ねたうえで「この kernel では改善は走りません」を 1 行添える。
 - **表示**: 9 本の一覧 (sma, ema, rsi, macd, bollinger, atr, adx, stochastic, ichimoku — `docs/examples/plugins/`)。各行に「何を計算するか」1 行と、既に同名が配備済みかどうか。「指標だけでは取引しません。改善ループが戦略を作るときの材料になります。」
-- **尋ねること**: 全部を採用候補にした一覧を見せ、外したい番号を入力させる (空 Enter = この一覧で進む)。続けて「この N 本を採用します。採用はあなたの確認として記録されます (decided_by=human_cli)。よろしいですか [y/N]」。**既定 N** (自動 yes にしない)。
+- **尋ねること** (v1.8): 一覧を見せて「標準指標 N 本を登録します [Y/n] (e = 外す番号を選ぶ)」の 1 問。既定 Y (人の確認は 1 問で記録される。`decided_by` の値は変えないが文面には出さない)。`e` で外す番号の入力に入る。再実行で全部配備済みなら「標準指標 N 本は配備済みです (変更なし)」の 1 行だけで問いも警告の繰り返しも出さない。一部だけ配備済みなら未配備の本数で問う。(旧: 外したい番号を入力させ、続けて「この N 本を採用します…(decided_by=human_cli)…[y/N]」既定 N)
 - 同名が配備済み: 既定で外す。「rsi は既に配備されています。新しい版へ切り替えると、rsi を使う strategy の固定が外れることがあります (手順書 `docs/operations/indicator-initial-set-deploy-2026-09-19.md` の (0))。」
 - **実行**: 1 本ずつ既存の bless 経路 (`plugin/switch.py` `bless_candidate`、`--from _human` と同じ候補置き場) を通す。gate (AST 検査・pytest・hash 照合)・journal・ledger を迂回しない。`plugins/` に直接コピーしない。進捗「3/9 macd: 審査中 (pytest、最長 300 秒)」。1 本の失敗は他に影響しない。
 - 失敗の文面: gate 前の失敗 = 「bollinger: 審査に通りませんでした (pytest 不合格)。何も配備されていません。後で `uv run afx plugin bless bollinger --from _human` でやり直せます。」/ gate 後に止まった = 「承認 #12 (macd) が途中で止まりました。サービス起動後に `afx ctl --as approver approval retry 12` を実行してください (端末での確認があります)。」(plugin の CLI に retry は無く、操作 API の `afx ctl` にある。未完の手順に出す)
@@ -310,6 +311,8 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 反映は次回起動時 (`service.py:1004`)。
 
 ### 段 12: 方針文と最初の課題 (B-10 b)
+
+- **案内** (v1.8): 各問いの前に用途 1 行 (方針文 = 取引判断と改善の全 mission に注入される運用者の方針、課題 = 改善ループが最初に取り組む 1 件) と例文 (方針 3 行、課題 1 件) を出し、「後から `afx ctl policy add` / `afx ctl improve add` で足せる、空 Enter で飛ばせる」を添える。`e` で例文をそのまま入力にする。例文は雛形であり、方針の実文言は利用者が決める (2026-09-12 の方針は変えない)。
 
 - **方針文**: 「取引判断と改善の両方に、あなたの方針として毎回渡されます (末尾 4000 字)。後から `afx ctl policy add <文>` で足せます。」自由文を 0〜数行受け付ける (空でよい)。**雛形・例文は出さない** (ticket `legacy-oc-example-leak`: 例文がそのまま実在化した前歴)。書き方は `policy add` と同じ `- <text>` の追記 (`commands.py:315-326`)。ファイルが無ければ作る。
 - **最初の課題**: 「改善ループに最初に考えてほしいこと (どんな戦略を作らせたいか) を自然文で書いてください。空でも構いません。」0〜数件。`store.backlog.add(source="user")` で入れる。プレースホルダ検査は `commands.py:41-57,248-256` と共通化して使う。
@@ -320,12 +323,12 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 順序は固定する。afx が停止している間に済ませ、起動は最後にする。ウィザードはこの段の最後まで setup.lock を保持する。
 
-1. **常駐化の有無**: 「systemd のユーザーサービスとして常駐させますか」。置かないなら「手で起動するには `uv run main.py` (端末では対話シェルが開きます)」と表示し、手順 2〜6 を飛ばして段 14 へ (外から見る手段は unit を前提にするので尋ねない)。
+1. **常駐化の有無**: 段 8 の答え (常駐 / 対話シェル) を使い、ここでは再質問しない (v1.8)。置かないなら「手で起動するには `uv run afx` (端末では対話シェルが開きます)。常駐に切り替えるときは `afx init` を再実行」と表示し、手順 2〜6 を飛ばして段 14 へ (外から見る手段は unit を前提にするので尋ねない)。`systemctl --user` が使えないときの reason は、`XDG_RUNTIME_DIR` が無ければ `user_session_missing` (「ユーザーセッションが見えません。`su` ではなく直接ログインして `afx init` を再実行」)、あれば `systemd_unavailable`。
 2. **unit の設置**: 内容を表示 → 置くか → `daemon-reload`。この時点では起動も `enable` もしない。setup.lock と instance.lock の両方を保持している。
 3. **外から見る手段**: 「外から見る / 操作する手段 (Discord bot / 読み取り専用 web / 通知) を今設定しますか」(既定 = あとで)。「あとで」なら手順 4・5 を飛ばして 6 へ。
 4. **引き渡し (handoff)**: (a) marker `data/state/setup_in_progress` を `phase=handoff` で置く (サービスの起動を 76 で塞ぐ)、(b) instance.lock を解放する、(c) setup.lock は保持したまま。この順序が崩れない限り、instance.lock の隙間に別の起動が入っても marker が止める。以後ウィザードは設定・DB・`app_state.json` を書かない (§4.2)。
 5. 選ばれた feature ごとに既存の `afx ops enable <feature>` と同じ処理を、**保持済みの setup lease を渡して**呼ぶ (§6.3)。質問 (token・guild・channel・承認者 allowlist、web の port、通知の webhook URL)、`afx-ops probe` による疎通確認、再質問、鍵の初期化、状態機械は enable 側が持ち、端末入力も enable 側が直接受ける。ウィザードは質問を足さず、値を受け取らず、戻り値 `EnableResult(rc, stage, reason_code)` だけを読む。afx は停止中なので enable は afx を起こさない。失敗しても完了は妨げず、確認記録に `ops.<feature>` の結果と reason を残し、`afx ops enable <feature>` の再実行を案内する。全 feature の処理が終わったら marker を消す (unlink → 親 dir の fsync)。
-6. **linger、有効化と起動**: (a) linger: `loginctl show-user $USER -p Linger` を読む。`no` なら「ログアウトすると afx も止まります。`loginctl enable-linger $USER` を実行しますか [y/N]」(既定 N)。`y` のときだけウィザードが実行し、成功を `Linger=yes` の再読込で確かめてから、確認記録の `linger` に所有記録 `{state: owned_by_wizard, at}` を原子的置換で残す (実行より後に記録するので、落ちても「記録の無い有効化」になるだけで、リセットは触らない側に倒れる)。実行に失敗した (管理者権限が要る環境など) ときは `{state: failed, reason_code}` を残し、手で実行する案内を出して続行する。断られたときは `{state: declined}` を残して続行する。最初から `yes` だったときは `{state: already_enabled}` で、ウィザードは何も変えず所有も主張しない。(b) `enable` (ログイン時に自動起動) と今すぐの `start` をそれぞれ確認する。`start` の直前に instance.lock を非ブロッキングで取って即解放し (別の afx が既に動いていないことの最終確認。取れなければ `start` せず理由を表示する)、`systemctl --user start` を呼ぶ。起動後の確認は §6.4 の 3 段階。確認が終わったら setup.lock を解放する。
+6. **linger、有効化と起動**: (a) linger: `loginctl show-user $USER -p Linger` を読む。`no` なら「ログアウトすると afx も止まります。`loginctl enable-linger $USER` を実行しますか [y/N]」(既定 N)。`y` のときだけウィザードが実行し、成功を `Linger=yes` の再読込で確かめてから、確認記録の `linger` に所有記録 `{state: owned_by_wizard, at}` を原子的置換で残す (実行より後に記録するので、落ちても「記録の無い有効化」になるだけで、リセットは触らない側に倒れる)。実行に失敗した (管理者権限が要る環境など) ときは `{state: failed, reason_code}` を残し、手で実行する案内を出して続行する。断られたときは `{state: declined}` を残して続行する (同文の案内は直後に繰り返さず、段 14 の未完手順 `linger_off` に 1 回だけ出す。v1.8)。最初から `yes` だったときは `{state: already_enabled}` で、ウィザードは何も変えず所有も主張しない。(b) `enable` (ログイン時に自動起動) と今すぐの `start` をそれぞれ確認する。`start` の直前に instance.lock を非ブロッキングで取って即解放し (別の afx が既に動いていないことの最終確認。取れなければ `start` せず理由を表示する)、`systemctl --user start` を呼ぶ。起動後の確認は §6.4 の 3 段階。確認が終わったら setup.lock を解放する。
 
 「あとで」のとき ops 用の unit と `Wants=` は置かれない (afx-ops spec §7、全 off は無配置)。
 
@@ -950,3 +953,4 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 | 2026-10-13 | v1.5 | §3 段 4: backend を選んだ後にモデルを選ぶ (claude は alias 固定表で既定 `sonnet`、codex は `codex app-server` の `model/list` で既定 `terra`、opencode は `opencode models` の一覧から必ず選ぶ、10 件超は絞り込み 1 問、一覧失敗は固定 reason `model_list_unavailable` で手入力)。runner は settings の `model` をそのまま `--model` に渡し既定を持たないため | ユーザー裁定 (2026-10-13) | (本 commit) |
 | 2026-10-14 | v1.6 | §4.5 step 5 の取り除く順序を §5 の「リセット」列と実装に揃える (config → unit (primary は最後、補助 unit の失敗時は残す) → repo → linger → `data/` → `.env`。`daemon-reload` / `reset-failed` は primary 所有時のみ、`reset-failed` の非 0 許容)。段 11 の標準指標は T6 の `run_indicator_stage` を既定で呼ぶ | T15b の閉鎖確認で §4.5 と §5 の順序が食い違っていたため。T5a と T6 の配線 | |
 | 2026-10-15 | v1.7 | 受入 2 回目 (stream-svr) の是正: 段 0 で改善隔離の Landlock ABI 8 要件を判定して先に言い、段 4 の実往復と段 7 に反映、記録 reason と未完手順 `improve_isolation_unavailable`。段 4 は claude の実体の絶対パスを `runner.claude.bin` に書く (裸の名前は mission 側で cwd 相対に解決しない)。§4.5 の repo 内削除は `chmod -R u+rwX` を先に行う。AC-36a の許可集合に `**/__pycache__/` と `tmp/` | チケット wizard-check-improve-landlock-abi-upfront / wizard-write-absolute-cli-bin / reset-cannot-remove-readonly-plugin-versions (いずれも実機で再現) | |
+| 2026-10-15 | v1.8 | 受入 1〜2 回目のウィザード対話の見直し: 段 3 は平文 http の鍵つき bridge を `key_withheld_plain_http` で unverified のまま進める (裁定 (b))、段 5 は 15m/30m/1h の番号選択 (選べない足は理由つき)、段 8 は「常駐サービスで動かすか」を問い API と unit をその結果に、段 9 は利用者の言葉の要約と `d` の差分、段 11 は 1 問 (再実行は 1 行)、段 12 は用途・例文・`e`、段 13 は再質問なし・linger 同文の重複なし・`uv run afx`・`user_session_missing`。未完手順の `.env` 判定は `.env` ファイルも見る、`bridge_not_connected` は data_state=ready で出さない | 受入のユーザー指摘 (チケット wizard-* 8 件 + pending-env-key-check-reads-process-env + unit-placement-explain-missing-user-session) | |
