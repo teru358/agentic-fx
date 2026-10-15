@@ -81,6 +81,15 @@ def test_old_landlock_abi_adds_a_distinct_improve_isolation_warning():
         "この kernel では改善ループの隔離が使えません (Landlock ABI 8 以上、Linux 6.18 以降が必要)。kernel を更新してください")
 
 
+def test_unavailable_landlock_suppresses_the_old_abi_warning():
+    record = _record(landlock={"result": "ok", "reason_code": "landlock_abi_too_old"})
+    steps = pending_steps(PendingFacts(record_state="ok", record=record, now=NOW,
+                                       landlock_available=False))
+
+    assert [step.code for step in steps if "landlock" in step.code or "isolation" in step.code] == [
+        "landlock_unavailable"]
+
+
 def _real_settings(**backtest):
     from pathlib import Path
     from agentic_fx.config import load_settings

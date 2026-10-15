@@ -83,6 +83,16 @@ def test_exec_closure_rejects_unresolved_claude_name_without_using_cwd(tmp_path,
                                          codex_bin=None, venv_root=venv)
 
 
+def test_exec_closure_rejects_a_relative_claude_path(tmp_path, monkeypatch):
+    from agentic_fx import mission_worker
+    venv = tmp_path / "venv"; venv.mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="bin_not_found"):
+        mission_worker._exec_closure_for("claude", claude_bin=Path("./claude"),
+                                         codex_bin=None, venv_root=venv)
+
+
 def test_exec_closure_codex_grants_the_two_binaries_as_files_not_their_directory(tmp_path):
     from agentic_fx.mission_worker import _exec_closure_for
     venv = tmp_path / "venv"; venv.mkdir()

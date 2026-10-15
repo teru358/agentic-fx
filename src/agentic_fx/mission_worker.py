@@ -89,6 +89,7 @@ from agentic_fx.runners import factory as runner_factory
 # **都度参照**する形に変える。
 from agentic_fx.runners import cli_runner
 from agentic_fx.runners.cli_runner import _normalize_reason
+from agentic_fx.core.cli_bin import resolve_cli_bin
 # A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
@@ -425,11 +426,9 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
             if p.exists():
                 dirs.append(p)
     if backend == "claude" and claude_bin is not None:
-        if not claude_bin.is_absolute():
-            resolved = shutil.which(str(claude_bin))
-            if resolved is None:
-                raise RuntimeError("bin_not_found")
-            claude_bin = Path(resolved)
+        claude_bin = resolve_cli_bin(str(claude_bin))
+        if claude_bin is None:
+            raise RuntimeError("bin_not_found")
         real = claude_bin.resolve()
         dirs.append(real.parent)
         targets.append(real)

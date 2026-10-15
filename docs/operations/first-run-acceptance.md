@@ -32,7 +32,7 @@
 | `uv` | Python と依存の管理。Python 3.13 は `uv sync` が用意します (ネットワークが要ります) | `uv --version` |
 | `git` | clone に使う | `git --version` |
 | Landlock | 標準指標の導入と改善ループに必要 (x86_64 かつ ABI 3 以上)。無くてもペーパー運用だけは設定できます。ウィザードの段 0 が判定して表示します | 段 0 の表示で分かります |
-| 改善ループの隔離 | Landlock ABI 8 以上 = Linux 6.18 以降。Ubuntu 22.04 / 24.04 の標準 kernel (6.8) は ABI 4 で不可、Ubuntu 26.04 LTS (7.0) は可 | `python3 -c 'import ctypes; print(ctypes.CDLL(None).syscall(444, None, 0, 1))'` (`landlock_create_ruleset(NULL,0,LANDLOCK_CREATE_RULESET_VERSION)` の戻り値) |
+| 改善ループの隔離 | Landlock ABI 8 以上 = Linux 6.18 以降。Ubuntu 22.04 / 24.04 の標準 kernel (6.8) は ABI 4 で不可、Ubuntu 26.04 LTS (7.0) は可 | `python3 -c 'import ctypes; print(ctypes.CDLL(None).syscall(444, None, 0, 1))'` (`landlock_create_ruleset(NULL,0,LANDLOCK_CREATE_RULESET_VERSION)` の戻り値)。`-1` は Landlock syscall 自体が使えず、隔離不可です。0 より大きい数が ABI です。 |
 
 clone 先は、ホームの下の任意のディレクトリです (例 `~/agentic-fx`)。パスに空白・改行・`:` などの特殊文字を入れないでください。unit に書けないため、段 13 で止まります。
 

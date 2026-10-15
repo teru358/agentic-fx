@@ -293,6 +293,7 @@ def test_function_source_hash_covers_the_whole_body(tmp_path):
 #: outer Landlock の規則を決める source (bootstrap から参照を辿って得る集合)。bootstrap が
 #: 新しい関数・定数を参照し始めたらこの表が合わなくなり、ここで落ちる
 OUTER_LANDLOCK_SOURCES = {
+    "core/cli_bin.py:resolve_cli_bin",
     "core/landlock.py",
     "mission_worker.py:_bootstrap_improve_profile",
     "mission_worker.py:_guarded_data_dir",

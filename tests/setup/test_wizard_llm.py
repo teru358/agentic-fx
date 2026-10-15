@@ -158,6 +158,20 @@ def test_old_landlock_abi_skips_the_improve_exchange_but_keeps_schedule_question
     assert _valid(record)
 
 
+def test_negative_landlock_abi_is_reported_as_zero_and_recorded_as_too_old(tmp_path, home):
+    root = make_root(tmp_path)
+    binary, kwargs = installed_claude(tmp_path, home)
+    deps, calls, fetch, run = make_deps(tmp_path, landlock_abi=lambda: -1, **kwargs)
+    fetch.models = {}
+    run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
+    io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert "Landlock ABI 0" in io.text
+    assert record_of(root)["landlock"]["reason_code"] == "landlock_abi_too_old"
+
+
 def test_agreeing_sends_exactly_one_claude_exchange_and_records_it(tmp_path, home):
     root = make_root(tmp_path)
     binary, kwargs = installed_claude(tmp_path, home)

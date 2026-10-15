@@ -745,7 +745,7 @@ def _safe_bool(fn: Callable[[], bool]) -> bool:
 def _safe_int(fn: Callable[[], int]) -> int:
     try:
         value = fn()
-        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
     except Exception:  # noqa: BLE001 — 検出に失敗したら使えない側に倒す
         return 0
 
@@ -1433,7 +1433,7 @@ def _stage4(sess: _Session, st: _Start, a: Answers) -> None:
 
 
 def _report_improve_isolation(sess: _Session, st: _Start) -> None:
-    if not st.improve_isolation_ok:
+    if st.landlock_ok and not st.improve_isolation_ok:
         sess.say("改善の実往復の試験は、この kernel では隔離が使えないため行いません。")
 
 
