@@ -36,7 +36,7 @@ from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import add_backlog_idea, append_policy_directive
 from agentic_fx.config import Settings, load_settings_text
-from agentic_fx.core import landlock
+from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.mission_ceiling import worker_ceiling
@@ -237,6 +237,7 @@ class WizardDeps:
     sleep: Callable[[float], None] = time.sleep
     unit_dir: Path | None = None
     landlock_available: Callable[[], bool] = landlock.is_available
+    landlock_abi: Callable[[], int] = landlock.landlock_abi
     find_spec: Callable[[str], Any] | None = None
     local_timezone: Callable[[], str | None] = _local_timezone_name
     yf_quote: Callable[[str], Any] = sources.yf_quote
@@ -454,6 +455,8 @@ class Answers:
     llama_base_url: str | None = None
     context_limit: int | None = None
     codex_bin: str | None = None
+    claude_bin: str | None = None
+    landlock: dict[str, str] = field(default_factory=dict)
     llm_trade: dict[str, str] = field(default_factory=dict)
     llm_improve: dict[str, str] = field(default_factory=dict)
     run_verify_improve: bool = False
@@ -500,6 +503,8 @@ def build_changes(raw: Mapping[str, Any], a: Answers) -> dict[str, Any]:
         put("runner.opencode.context_limit", a.context_limit)
     if a.codex_bin is not None:
         put("runner.codex.bin", a.codex_bin)
+    if a.claude_bin is not None:
+        put("runner.claude.bin", a.claude_bin)
     put("datafeed.decision_timeframes", [a.timeframe])
     if a.cadence is not None:
         put("schedule.improve", a.cadence)
@@ -540,6 +545,7 @@ def build_record(a: Answers, *, now_iso: str, previous: Mapping[str, Any] | None
         "price": a.price,
         "llm_trade": a.llm_trade,
         "llm_improve": a.llm_improve,
+        "landlock": a.landlock,
         "bridge_plan": a.bridge_plan,
         "history": {"source": a.eval_source},
         "api": {"enabled": a.api_enabled, "result": api_result},
@@ -584,6 +590,8 @@ class _Start:
     migrated: bool
     prior_marker: SetupMarker | None
     landlock_ok: bool
+    improve_isolation_ok: bool
+    landlock_record: dict[str, str]
 
 
 def _read_text(path: Path) -> str | None:
@@ -653,12 +661,23 @@ def _stage0(sess: _Session) -> _Start:
         sess.say(_ENROLL_MESSAGE)
         raise _Exit(RC_USAGE)
     landlock_ok = _safe_bool(deps.landlock_available)
+    abi = _safe_int(deps.landlock_abi)
+    improve_isolation_ok = landlock_ok and abi >= improve_admission.MIN_LANDLOCK_ABI
+    landlock_record = _plain_record(
+        "ok" if landlock_ok else "failed", sess.now_iso(),
+        "landlock_abi_too_old" if landlock_ok and not improve_isolation_ok
+        else ("ok" if landlock_ok else "sandbox_unavailable"))
     if not landlock_ok:
         sess.say("この環境では Landlock が使えません (x86_64 かつ ABI 3 以上が必要)。"
                  "標準指標の導入と改善ループは使えません。取引判断のペーパー運用だけ設定できます。")
         if not sess.yesno("続けますか", False):
             sess.say(_NOTHING_CHANGED)
             raise _Exit(RC_STOPPED)
+    elif not improve_isolation_ok:
+        sess.say(
+            f"この kernel (Landlock ABI {abi}) では改善ループの隔離が使えません "
+            f"(ABI {improve_admission.MIN_LANDLOCK_ABI} 以上、Linux 6.18 以降が必要)。"
+            "取引判断と標準指標は設定できます。改善は kernel を更新するまで止まります。")
     pytest_check = checks.check_pytest(**({"find_spec": deps.find_spec} if deps.find_spec else {}),
                                        now=deps.now)
     if pytest_check.result != "ok":
@@ -704,7 +723,8 @@ def _stage0(sess: _Session) -> _Start:
         else:
             sess.say("前回の引き渡しの記録が不完全です。最初からやり直します (印は残します)。")
             prior = None
-    return _Start(mode, base_text, base_settings, original, migrated, prior, landlock_ok)
+    return _Start(mode, base_text, base_settings, original, migrated, prior, landlock_ok,
+                  improve_isolation_ok, landlock_record)
 
 
 def _read_text_or_exit(sess: _Session, path: Path) -> str | None:
@@ -720,6 +740,14 @@ def _safe_bool(fn: Callable[[], bool]) -> bool:
         return bool(fn())
     except Exception:  # noqa: BLE001 — 検出に失敗したら使えない側に倒す
         return False
+
+
+def _safe_int(fn: Callable[[], int]) -> int:
+    try:
+        value = fn()
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    except Exception:  # noqa: BLE001 — 検出に失敗したら使えない側に倒す
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +778,7 @@ def _initial_answers(sess: _Session, st: _Start) -> Answers:
     return Answers(
         display_timezone=zone, account_currency=s.account_currency,
         pairs=list(s.pairs), starting_balance=balance, timeframe=s.datafeed.decision_timeframe,
-        api_enabled=s.api.enabled)
+        api_enabled=s.api.enabled, landlock=dict(st.landlock_record))
 
 
 def _stage1(sess: _Session, st: _Start) -> None:
@@ -1181,6 +1209,8 @@ def _choose_improve_backend(sess: _Session, st: _Start, a: Answers, url: str, pr
         a.improve_model = _choose_model(sess, "改善", CLAUDE_MODEL_ALIASES, "sonnet")
         a.llm_improve = _check_record(result)
         if result.result == "ok":
+            _record_claude_binary(sess, cfg.bin, a)
+        if result.result == "ok" and st.improve_isolation_ok:
             a.run_verify_improve = sess.yesno(
                 "改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。サブスクの枠を少し使います", False)
         return
@@ -1246,6 +1276,7 @@ def _claude_trade(sess: _Session, st: _Start, a: Answers) -> CheckResult:
     if result.result != "ok":
         a.llm_trade = _check_record(result)
         return result
+    _record_claude_binary(sess, cfg.bin, a)
     sess.say("取引判断用の `claude -p` が 1 往復できるかを試験できます。サブスクの枠を少し使います。")
     if sess.yesno("trade 用の `claude -p` を 1 往復で試験します。サブスクの枠を少し使います。送りますか", False):
         bin_path = checks.cli_candidate(str(Path(cfg.bin).expanduser()), which=deps.which) or cfg.bin
@@ -1255,6 +1286,16 @@ def _claude_trade(sess: _Session, st: _Start, a: Answers) -> CheckResult:
     else:
         a.llm_trade = _plain_record("unverified", sess.now_iso(), "user_declined_probe")
     return result
+
+
+def _record_claude_binary(sess: _Session, configured_bin: str, a: Answers) -> None:
+    configured = Path(configured_bin).expanduser()
+    if configured.is_absolute() and checks.is_executable_file(configured):
+        return
+    candidate = checks.cli_candidate(configured_bin, which=sess.deps.which)
+    if candidate is not None:
+        a.claude_bin = candidate
+        sess.say(f"claude の実体: {candidate}")
 
 
 def _ask_codex_bin(sess: _Session, current: str) -> str | None:
@@ -1300,7 +1341,7 @@ def _improve_cli(sess: _Session, st: _Start, a: Answers, backend: str,
     if not listed:
         a.llm_improve = _plain_record("unverified", sess.now_iso(), "model_list_unavailable")
     sess.say("1 回の改善 mission はサブスク枠を使います。")
-    if result.result == "ok":
+    if result.result == "ok" and st.improve_isolation_ok:
         a.run_verify_improve = sess.yesno(
             "改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。"
             "サブスクの枠を少し使います", False)
@@ -1370,6 +1411,7 @@ def _stage4(sess: _Session, st: _Start, a: Answers) -> None:
         try:
             if pick == "local":
                 _local_pair(sess, st, a, base_url, probe)
+                _report_improve_isolation(sess, st)
                 return
             if pick == "4":
                 raise _LaterChosen()
@@ -1379,12 +1421,20 @@ def _stage4(sess: _Session, st: _Start, a: Answers) -> None:
                 _claude_trade(sess, st, a)
                 _choose_improve_backend(sess, st, a, base_url, probe,
                                         default_backend="claude" if pick == "1" else "codex")
+                _report_improve_isolation(sess, st)
                 return
             if _stage4_remote(sess, st, a):
+                _report_improve_isolation(sess, st)
                 return
         except _LaterChosen:
             _apply_later(sess, a)
+            _report_improve_isolation(sess, st)
             return
+
+
+def _report_improve_isolation(sess: _Session, st: _Start) -> None:
+    if not st.improve_isolation_ok:
+        sess.say("改善の実往復の試験は、この kernel では隔離が使えないため行いません。")
 
 
 def _stage4_remote(sess: _Session, st: _Start, a: Answers) -> bool:
@@ -1532,6 +1582,8 @@ def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
         sess.say(f"直近の予定の期 ({current.period_key}) は消費済みにします。")
     if (a.improve_backend or st.base_settings.runner.improve.backend) in ("claude", "codex"):
         sess.say("1 回の改善 mission はサブスク枠を使います。")
+    if not st.improve_isolation_ok:
+        sess.say("この kernel では改善は走りません (段 0 の表示)。")
 
 
 def _stage8(sess: _Session, st: _Start, a: Answers) -> None:

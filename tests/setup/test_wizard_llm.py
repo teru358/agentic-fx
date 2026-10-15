@@ -4,7 +4,7 @@ import pytest
 
 from agentic_fx.config import load_settings_text
 from agentic_fx.setup.wizard import run_wizard
-from agentic_fx.store.setup_record import read_setup_record
+from agentic_fx.store.setup_record import _valid, read_setup_record
 
 from tests.setup.wizard_support import (
     ScriptedWizardIO, codex_model_list, fresh_responder, make_deps, make_executable, make_root,
@@ -105,6 +105,57 @@ def test_claude_for_both_runners_asks_before_spending_the_subscription(tmp_path,
     assert data["llm_improve"]["result"] == "ok"
     assert io.asked_with("trade 用の `claude -p`")[0].endswith("[y/N] ")
     assert "サブスク枠を使います" in io.text
+
+
+def test_claude_selection_records_the_path_found_on_path(tmp_path, home):
+    root = make_root(tmp_path)
+    binary, kwargs = installed_claude(tmp_path, home)
+    deps, calls, fetch, run = make_deps(tmp_path, **kwargs)
+    fetch.models = {}
+    run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
+    io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert settings_of(root).runner.claude.bin == str(binary)
+    assert f"claude の実体: {binary}" in io.text
+
+
+def test_claude_selection_keeps_an_existing_absolute_executable_path(tmp_path, home):
+    root = make_root(tmp_path)
+    binary, kwargs = installed_claude(tmp_path, home)
+    settings = (root / "config" / "settings.yaml.example").read_text()
+    (root / "config" / "settings.yaml.example").write_text(
+        settings.replace("bin: claude", f"bin: {binary}"), encoding="utf-8")
+    deps, calls, fetch, run = make_deps(tmp_path, **kwargs)
+    fetch.models = {}
+    run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
+    io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert "runner.claude.bin" not in io.text
+    assert f"claude の実体: {binary}" not in io.text
+
+
+def test_old_landlock_abi_skips_the_improve_exchange_but_keeps_schedule_questions(tmp_path, home):
+    root = make_root(tmp_path)
+    binary, kwargs = installed_claude(tmp_path, home)
+    deps, calls, fetch, run = make_deps(tmp_path, landlock_abi=lambda: 4, **kwargs)
+    fetch.models = {}
+    run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
+    io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert "この kernel (Landlock ABI 4) では改善ループの隔離が使えません" in io.text
+    assert io.asked_with("改善 backend の実往復") == []
+    assert io.asked_with("改善の周期 (weekly / daily)")
+    assert "この kernel では改善は走りません (段 0 の表示)。" in io.text
+    record = record_of(root)
+    assert record["landlock"]["result"] == "ok"
+    assert record["landlock"]["reason_code"] == "landlock_abi_too_old"
+    assert _valid(record)
 
 
 def test_agreeing_sends_exactly_one_claude_exchange_and_records_it(tmp_path, home):

@@ -5,6 +5,7 @@
 前提。"""
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 import threading
 from typing import Any, Callable, Literal
@@ -47,8 +48,14 @@ def build_runner(
                            after_tool_call=after_tool_call)
     if choice.backend == "claude":
         from agentic_fx.runners.claude_runner import ClaudeRunner
+        bin_path = Path(settings.runner.claude.bin)
+        if not bin_path.is_absolute():
+            resolved = shutil.which(str(bin_path))
+            if resolved is None:
+                raise RuntimeError("runner.claude.bin が見つかりません (bin_not_found)")
+            bin_path = Path(resolved)
         return ClaudeRunner(
-            bin_path=Path(settings.runner.claude.bin), model=choice.model,
+            bin_path=bin_path, model=choice.model,
             workdir=workdir, credentials_file_copied=True,
             allowed_tools=["mcp__afx__*"],
             cli_terminate_grace_sec=settings.runner.cli_terminate_grace_sec,

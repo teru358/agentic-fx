@@ -32,6 +32,7 @@
 | `uv` | Python と依存の管理。Python 3.13 は `uv sync` が用意します (ネットワークが要ります) | `uv --version` |
 | `git` | clone に使う | `git --version` |
 | Landlock | 標準指標の導入と改善ループに必要 (x86_64 かつ ABI 3 以上)。無くてもペーパー運用だけは設定できます。ウィザードの段 0 が判定して表示します | 段 0 の表示で分かります |
+| 改善ループの隔離 | Landlock ABI 8 以上 = Linux 6.18 以降。Ubuntu 22.04 / 24.04 の標準 kernel (6.8) は ABI 4 で不可、Ubuntu 26.04 LTS (7.0) は可 | `python3 -c 'import ctypes; print(ctypes.CDLL(None).syscall(444, None, 0, 1))'` (`landlock_create_ruleset(NULL,0,LANDLOCK_CREATE_RULESET_VERSION)` の戻り値) |
 
 clone 先は、ホームの下の任意のディレクトリです (例 `~/agentic-fx`)。パスに空白・改行・`:` などの特殊文字を入れないでください。unit に書けないため、段 13 で止まります。
 
@@ -167,6 +168,7 @@ Python 3.13 / linux
 - リポジトリの直下でないと「ここは agentic-fx のリポジトリ直下ではありません (config/settings.yaml.example が見つかりません)。clone したディレクトリで実行してください。」(rc=2、何も作りません)。
 - 別の `afx init` が動いていると「別の `afx init` または `afx ops enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」、別の agentic-fx が動いていると「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください …」(rc=2)。
 - Landlock が使えない環境では「この環境では Landlock が使えません (x86_64 かつ ABI 3 以上が必要)。標準指標の導入と改善ループは使えません。取引判断のペーパー運用だけ設定できます。」に続けて `続けますか [y/N] `。
+- Landlock ABI が 8 未満のときは「この kernel (Landlock ABI <ABI>) では改善ループの隔離が使えません (ABI 8 以上、Linux 6.18 以降が必要)。取引判断と標準指標は設定できます。改善は kernel を更新するまで止まります。」と表示して続行します。
 - pytest が無いと「plugin の採用審査 (gate) が pytest を使います。`uv sync` (dev 依存を含む既定) で入ります。」(警告、続行します)。
 - 前回の途中で止まった印があると「前回の初期設定が途中で止まっています。このまま続けて収束させます (サービスはこの印がある間、起動を拒否します)。」
 
@@ -237,6 +239,8 @@ LLM の構成:
 - llama-swap が応答するときは「llama-swap が応答しました (モデル N 件)。」と表示され、先頭に `  local. 取引判断に llama-swap を使う (Enter)` が加わり、それが既定になります。**応答しないとき (主シナリオ) は既定が出ません。** local は自動では選ばれません。
 - `1` / `2` を選ぶと、Node.js の確認 (見つからなければ「Node.js が見つかりません (bin_not_found)。claude / codex の導入に必要です。手順は … を見てください。」)、claude の確認が続きます。成功は `claude: 導入とログインを確認しました。`。失敗は次のとおりで、選択肢が出ます。
 
+  `claude` が PATH で見つかった場合は `claude の実体: <path>` と表示し、そのパスを settings に保存します。
+
   ```
   claude が見つかりません (bin_not_found)。導入手順は docs/operations/first-run-acceptance.md の『前提: CLI の導入』 を見てください。
   claude にログインしていません (credentials_missing)。端末で `claude` を起動してログインしてから再試行してください。ここでは入力しません。
@@ -273,6 +277,7 @@ LLM の構成:
   ```
 
   claude を選ぶと、claude の確認と `改善のモデル (番号 / m = 手入力) [1]: `、確認が成功したときだけ `改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。サブスクの枠を少し使います [y/N] ` を尋ねます。
+- 改善ループの隔離が使えない kernel では、この問いの代わりに「改善の実往復の試験は、この kernel では隔離が使えないため行いません。」と表示します。
 - codex を選ぶと、確認 (ELF の実体が必要) の後、見つからなければ `codex の実体の絶対パス (Enter = 後で settings.yaml に自分で書く): ` を尋ねます (絶対パスのみ。`/` で始まらないと「絶対パス (/ で始まる) で入力してください。相対パスや ~ は使えません。」)。モデルは `codex app-server` の一覧から選び (取れなければ `codex のモデル一覧を取得できませんでした (model_list_unavailable)。モデル名を手入力します。`)、既定は名前に `terra` を含むものです。
 - 取引判断のモデル名は `取引判断のモデル名`、改善のモデル名は `改善のモデル名` として尋ねます (手入力のとき。一覧から選ぶ場合は `<backend>のモデル名` / `<backend>のモデル (番号 / m = 手入力)` の形です)。
 - `3` (別ホストの llama-swap) は `認証を要しない llama-swap だけ扱えます。` と `llama-swap の URL [<現在の URL>]: ` を尋ねます。接続できない・認証を要する・一覧が空のときは固定の理由 (`connect_error` / `auth_unsupported` / `model_not_found`) の文を表示し、`[r] 構成の選び直し / [m] モデル名を手入力して未確認のまま進む / [4] 後で設定する [既定: r]: ` を尋ねます。
@@ -310,6 +315,7 @@ LLM の構成:
 - `1` を選ぶと「直近の予定の期 (<期>) は消費済みにします。」
 - 改善が claude / codex のときは「1 回の改善 mission はサブスク枠を使います。」
 - Landlock が使えない環境では「Landlock が使えないため、改善ループは動きません。ここでは何も尋ねません。」
+- 改善ループの隔離だけが使えない kernel では周期と時刻は従来どおり尋ね、最後に「この kernel では改善は走りません (段 0 の表示)。」と表示します。
 
 ### 段 8: 操作 API と .env
 

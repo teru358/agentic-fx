@@ -82,6 +82,10 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
                 reason = result.get("reason_code", "unverified") if isinstance(result, Mapping) else "unverified"
                 steps.append(_step(facts, "llm_unverified", "warn",
                                    {"target": target, "reason_code": reason}, at=result))
+        landlock_result = _record_value(record, "landlock", {})
+        if (isinstance(landlock_result, Mapping)
+                and landlock_result.get("reason_code") == "landlock_abi_too_old"):
+            steps.append(_step(facts, "improve_isolation_unavailable", "warn", at=landlock_result))
     improve_backend = _get(facts.settings, "improve_backend", default=None)
     if improve_backend is None:
         improve_backend = _get(facts.settings, "runner", "improve", "backend", default=None)

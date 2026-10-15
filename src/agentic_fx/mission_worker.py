@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import signal
 import sys
 import sysconfig
@@ -424,6 +425,11 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
             if p.exists():
                 dirs.append(p)
     if backend == "claude" and claude_bin is not None:
+        if not claude_bin.is_absolute():
+            resolved = shutil.which(str(claude_bin))
+            if resolved is None:
+                raise RuntimeError("bin_not_found")
+            claude_bin = Path(resolved)
         real = claude_bin.resolve()
         dirs.append(real.parent)
         targets.append(real)
@@ -1233,9 +1239,12 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                     frame["market_tool_calls"] = dict(market_tool_calls)
                 _send_frame(protocol_out, out_seq, frame)
             else:
-                _send_frame(protocol_out, out_seq, {
+                frame = {
                     "type": "ready", "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}"})
+                    "error": f"{type(exc).__name__}: {exc}"}
+                if str(exc) == "bin_not_found":
+                    frame["reason"] = "bin_not_found"
+                _send_frame(protocol_out, out_seq, frame)
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める
             pass
     except BaseException as exc:
