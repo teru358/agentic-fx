@@ -1,7 +1,7 @@
 ---
 id: reset-cannot-remove-readonly-plugin-versions
 title: リセットが読み取り専用の plugin 版 dir を消せず repo_plugins が失敗
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup]
 ---
 # [reset-cannot-remove-readonly-plugin-versions] リセットが読み取り専用の plugin 版 dir を消せず repo_plugins が失敗
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -24,3 +24,4 @@ plugin/version_store は採用した版を dir 0o500 / file 0o400 の不変ス�
 ## 経緯
 
 - 2026-10-15: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix1 (2026-10-15 ユーザー承認の設計: ブリーフ tmp/review-20261011-sc/fr-fix1-ab.md / fr-fix1-c.md)

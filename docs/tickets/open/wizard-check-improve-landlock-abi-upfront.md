@@ -1,7 +1,7 @@
 ---
 id: wizard-check-improve-landlock-abi-upfront
 title: 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-write-absolute-cli-bin]
 ---
 # [wizard-check-improve-landlock-abi-upfront] 段 0 で改善 worker の Landlock ABI 8 要件を判定し、満たさない kernel では先に言う
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [first-run-setup, wizard-write-absolute-cli-bin]
 ## 経緯
 
 - 2026-10-15: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix1 (2026-10-15 ユーザー承認の設計: ブリーフ tmp/review-20261011-sc/fr-fix1-ab.md / fr-fix1-c.md)

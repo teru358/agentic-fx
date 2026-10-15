@@ -1,7 +1,7 @@
 ---
 id: wizard-write-absolute-cli-bin
 title: ウィザードは claude の実体を which で見つけても runner.claude.bin を絶対パスに書かない
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 ---
 # [wizard-write-absolute-cli-bin] ウィザードは claude の実体を which で見つけても runner.claude.bin を絶対パスに書かない
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -24,3 +24,4 @@ example の既定は runner.claude.bin: claude (裸の名前)。段 4 の check_
 ## 経緯
 
 - 2026-10-15: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix1 (2026-10-15 ユーザー承認の設計: ブリーフ tmp/review-20261011-sc/fr-fix1-ab.md / fr-fix1-c.md)
