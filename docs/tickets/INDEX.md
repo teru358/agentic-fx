@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 151 件。完了分は closed/。
+未完了: 152 件。完了分は closed/。
 
 ## 実装中 (11)
 
@@ -49,7 +49,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (120)
+## 設計待ち (121)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -86,6 +86,7 @@
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
+| [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
 | [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
 | [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
