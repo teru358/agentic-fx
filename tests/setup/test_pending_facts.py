@@ -73,3 +73,39 @@ def test_a_failing_landlock_probe_is_unknown_not_unavailable(tmp_path, monkeypat
         assert facts.landlock_available is None
     finally:
         app.close()
+
+
+def test_env_key_presence_combines_dotenv_and_process_environment(tmp_path, monkeypatch):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        app.settings.datafeed.primary = "mt5"
+        monkeypatch.delenv("MT5_BRIDGE_API_KEY", raising=False)
+        (tmp_path / ".env").write_text("MT5_BRIDGE_API_KEY=not-read\n", encoding="utf-8")
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        try:
+            facts = collect_pending_facts(tmp_path, app.settings, conn, deployed_plugins=(),
+                                          outage=app.outage, clock=app.clock)
+        finally:
+            conn.close()
+        assert facts.env_present_keys == frozenset({"MT5_BRIDGE_API_KEY"})
+
+        (tmp_path / ".env").unlink()
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        try:
+            facts = collect_pending_facts(tmp_path, app.settings, conn, deployed_plugins=(),
+                                          outage=app.outage, clock=app.clock)
+        finally:
+            conn.close()
+        assert facts.env_present_keys == frozenset()
+
+        monkeypatch.setenv("MT5_BRIDGE_API_KEY", "present")
+        conn = connect_readonly(tmp_path / "data" / "agentic.db")
+        try:
+            facts = collect_pending_facts(tmp_path, app.settings, conn, deployed_plugins=(),
+                                          outage=app.outage, clock=app.clock)
+        finally:
+            conn.close()
+        assert facts.env_present_keys == frozenset({"MT5_BRIDGE_API_KEY"})
+    finally:
+        app.close()

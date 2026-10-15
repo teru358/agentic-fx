@@ -6,6 +6,7 @@ import os
 import sqlite3
 
 from agentic_fx.core import landlock
+from agentic_fx.setup.checks import present_env_keys
 from agentic_fx.setup.pending_steps import MAX_PENDING_STEPS, PendingFacts
 from agentic_fx.store import plugin_switch_journal
 from agentic_fx.store.setup_record import read_setup_record
@@ -46,7 +47,8 @@ def collect_pending_facts(root, settings, conn: sqlite3.Connection, *, deployed_
     required_env_keys = (() if settings.datafeed.primary == "yfinance" else
                          ("TWELVEDATA_API_KEY",) if settings.datafeed.primary == "twelvedata" else
                          ("MT5_BRIDGE_API_KEY",))
-    env_present_keys = frozenset(key for key in required_env_keys if os.environ.get(key))
+    env_names = present_env_keys(root / ".env", environ=os.environ)
+    env_present_keys = frozenset(key for key in required_env_keys if key in env_names)
     found_ids = plugin_switch_journal.list_non_terminal_ids(conn, MAX_PENDING_STEPS + 1)
     if len(found_ids) > MAX_PENDING_STEPS:
         _log.info("stalled approvals exceed %d; showing the newest", MAX_PENDING_STEPS)

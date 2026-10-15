@@ -313,6 +313,8 @@ def test_linger_is_changed_only_after_a_yes_and_only_when_it_is_off(tmp_path, st
     assert value["state"] == expected and value.get("reason_code") == reason
     assert (len(calls_linger) == 1) is (state == "Linger=no\n")
     assert run.matching("loginctl", "enable-linger") == []
+    if answer == "n":
+        assert io.text.count("ログアウトすると afx も止まります") == 1
 
 
 def test_linger_enabled_by_the_wizard_is_owned_only_after_the_state_is_read_back(tmp_path):
@@ -347,7 +349,7 @@ def test_declining_the_resident_service_shows_the_manual_start_and_skips_the_res
     deps, calls, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder())
     assert run_wizard(root, io, deps) == 0
-    assert "uv run main.py" in io.text
+    assert "uv run afx" in io.text
     assert calls.log == []
     assert io.asked_with("外から見る手段") == []
 

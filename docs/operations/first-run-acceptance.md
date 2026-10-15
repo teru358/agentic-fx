@@ -397,10 +397,11 @@ unit (afx.service) を設置しました。
 外から見る手段を今設定しますか (既定: あとで) [y/N] 
 ```
 
-- `n` (常駐させない) だと「手で起動するには `uv run main.py` を実行してください (端末では対話シェルが開きます)。」で段 13 を終えます。
+- `n` (常駐させない) だと「手で起動するには `uv run afx` を実行してください (端末では対話シェルが開きます)。」で段 13 を終えます。
 - unit の設置前に、unit と同じ環境で `afx check` を走らせます。fatal があると unit を置きません (理由を表示)。warning だけ (LLM 未検証など) なら `afx check の warning (unit は置きます): <コード>` と表示して置きます。
 - 設置済みの unit と内容が違うと差分を表示して `この内容で unit を置きますか [y/N] ` を尋ね、旧 unit は `afx.service.bak-<時刻>` に退避します。同じなら「unit は設置済みです (内容は同じです)。」
-- systemd が使えない環境では「systemd のユーザーサービスが使えません。手で起動するには `uv run main.py` を実行してください」で、unit は置かずに進みます。
+- systemd が使えず `XDG_RUNTIME_DIR` も無い環境では「systemd のユーザーセッションが見えません (XDG_RUNTIME_DIR が無い)。`su` ではなく <user> で直接ログインして `afx init` を再実行してください」で、unit は置かずに進みます。対象ユーザーで直接ログインして実行します (`su` は使いません)。
+- `XDG_RUNTIME_DIR` があるのに systemd が使えない環境では「systemd のユーザーサービスが使えません。手で起動するには `uv run afx` を実行してください」で、unit は置かずに進みます。
 - 外から見る手段に `y` を選ぶと `有効にする手段 (カンマ区切り。空 Enter = あとで): ` を尋ね、選んだものごとに `afx ops enable` の質問が続きます (token などは端末から直接入力し、この文書にも記録にも残りません)。
 - linger が `no` のときだけ次を尋ねます。
 
@@ -437,7 +438,7 @@ unit (afx.service) を設置しました。
 
 ```
 [段 14 次の一歩]
-起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run main.py`。
+起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。
 操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、`afx ctl improve add <案>`、`afx ctl policy add <文>`。
 改善候補の承認は二通り: Discord bot を有効にしたなら承認依頼で二段操作 (claim → confirm)、もう一つは `afx ctl --as approver approve <id>` (端末での確認あり)。
 ログ: logs/agentic.log、logs/activity.log、unit なら `journalctl --user -u afx`。

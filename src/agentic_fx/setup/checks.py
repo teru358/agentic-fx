@@ -37,6 +37,7 @@ class CheckReason(StrEnum):
     PYTEST_UNAVAILABLE = "pytest_unavailable"
     SERVER_TIME_UNKNOWN = "server_time_unknown"
     TERMINAL_DISCONNECTED = "terminal_disconnected"
+    USER_SESSION_MISSING = "user_session_missing"
     USER_DECLINED_PROBE = "user_declined_probe"
     VERIFY_FAILED = "verify_failed"
     KEY_WITHHELD_PLAIN_HTTP = "key_withheld_plain_http"
@@ -304,15 +305,21 @@ def _env_file_keys(lines: list[str]) -> set[str]:
     return names
 
 
-def check_env_keys(env_file: Path, keys: list[str], *, environ: dict[str, str] | None = None,
-                   now: Callable[[], datetime] | None = None) -> CheckResult:
-    """Determine required key presence without returning their values."""
+def present_env_keys(env_file: Path, *, environ: Mapping[str, str] | None = None) -> set[str]:
+    """Read only environment-variable names from the process and optional dotenv file."""
     names = {k for k, v in (environ or {}).items() if v}
     try:
         lines = env_file.read_text().splitlines()
     except FileNotFoundError:
         lines = []
     names |= _env_file_keys(lines)
+    return names
+
+
+def check_env_keys(env_file: Path, keys: list[str], *, environ: dict[str, str] | None = None,
+                   now: Callable[[], datetime] | None = None) -> CheckResult:
+    """Determine required key presence without returning their values."""
+    names = present_env_keys(env_file, environ=environ)
     missing = [key for key in keys if key not in names]
     if missing:
         return _result("env", "unverified", CheckReason.ENV_KEY_MISSING,

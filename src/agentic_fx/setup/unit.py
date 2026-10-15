@@ -281,7 +281,10 @@ class PlacementResult:
     notes: tuple[str, ...] = ()
 
 
-MANUAL_START_GUIDE = "systemd のユーザーサービスが使えません。手で起動するには `uv run main.py` を実行してください"
+MANUAL_START_GUIDE = "systemd のユーザーサービスが使えません。手で起動するには `uv run afx` を実行してください"
+_MISSING_USER_SESSION_GUIDE = (
+    "systemd のユーザーセッションが見えません (XDG_RUNTIME_DIR が無い)。"
+    "`su` ではなく <user> で直接ログインして `afx init` を再実行してください")
 
 
 def place_unit(root: Path, settings: Any, *, unit_dir: Path, confirm: Callable[[str], bool],
@@ -298,6 +301,9 @@ def place_unit(root: Path, settings: Any, *, unit_dir: Path, confirm: Callable[[
         return PlacementResult("check_failed", report.fatal[0],
                                "fatal: " + ", ".join(report.fatal), report)
     if not systemctl_available(run):
+        active_env = os.environ if env is None else env
+        if not active_env.get("XDG_RUNTIME_DIR"):
+            return PlacementResult("no_systemd", "user_session_missing", _MISSING_USER_SESSION_GUIDE, report)
         return PlacementResult("no_systemd", "systemd_unavailable", MANUAL_START_GUIDE, report)
     content = render_unit(values.root, values.python, values.path_dirs, values.lang,
                           values.bridge_unit_present)

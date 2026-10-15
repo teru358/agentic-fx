@@ -102,16 +102,25 @@ def _parse_numbers(text: str, count: int) -> set[int] | None:
 
 
 def ask_selection(io: IndicatorIO, rows: list[IndicatorRow]) -> list[str]:
-    """Show the list, read numbers to toggle, and ask for confirmation (default N)."""
+    """Show the list and accept all by default, with an optional exclusion menu."""
     io.stdout(_INTRO_TEXT)
+    if rows and all(row.deployed for row in rows):
+        io.stdout(f"標準指標 {len(rows)} 本は配備済みです (変更なし)")
+        return []
     for index, row in enumerate(rows, 1):
         mark = "  (配備済み・既定で外れています)" if row.deployed else ""
         io.stdout(f"{index}. {row.name}: {row.summary}{mark}")
-        if row.deployed:
-            io.stdout(
-                f"   {row.name} は既に配備されています。新しい版へ切り替えると、{row.name} を使う "
-                "strategy の固定が外れることがあります "
-                "(docs/operations/indicator-initial-set-deploy-2026-09-19.md の (0))。")
+    default_chosen = [row.name for row in rows if not row.deployed]
+    answer = io.ask(f"標準指標 {len(default_chosen)} 本を登録します [Y/n] (e = 外す番号を選ぶ)", "Y")
+    normalized = (answer or "Y").strip().lower()
+    if normalized in ("", "y", "yes"):
+        return default_chosen
+    if normalized in ("n", "no"):
+        io.stdout("採用しませんでした。")
+        return []
+    if normalized != "e":
+        io.stdout("y、n、e のどれかで答えてください。")
+        return ask_selection(io, rows)
     toggled: set[int] = set()
     while True:
         answer = io.ask("外したい番号 (複数はカンマか空白、範囲は 2-4。配備済みの番号は採用に戻します。空 Enter = この一覧で進む)", "")
@@ -124,12 +133,6 @@ def ask_selection(io: IndicatorIO, rows: list[IndicatorRow]) -> list[str]:
               if (index in toggled) == row.deployed]
     if not chosen:
         io.stdout("採用する指標がありません。")
-        return []
-    confirm = io.ask(
-        f"この {len(chosen)} 本を採用します。採用はあなたの確認として記録されます "
-        f"(decided_by={DECIDED_BY})。よろしいですか [y/N]", "N")
-    if (confirm or "N").strip().lower() not in ("y", "yes"):
-        io.stdout("採用しませんでした。")
         return []
     return chosen
 

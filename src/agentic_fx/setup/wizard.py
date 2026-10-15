@@ -35,7 +35,7 @@ from agentic_fx import service
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import add_backlog_idea, append_policy_directive
-from agentic_fx.config import Settings, load_settings_text
+from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
@@ -505,6 +505,9 @@ def build_changes(raw: Mapping[str, Any], a: Answers) -> dict[str, Any]:
         put("runner.codex.bin", a.codex_bin)
     if a.claude_bin is not None:
         put("runner.claude.bin", a.claude_bin)
+    intervals = _get_path(raw, "datafeed.intervals")
+    if isinstance(intervals, list) and a.timeframe not in intervals:
+        put("datafeed.intervals", [*intervals, a.timeframe])
     put("datafeed.decision_timeframes", [a.timeframe])
     if a.cadence is not None:
         put("schedule.improve", a.cadence)
@@ -1507,15 +1510,27 @@ def _stage5(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
     sess.say("[段 5 判断足] 判断を行う足です。")
     candidate = _candidate_settings(st, a)
-    keys = ("15m", "1h", "1m", "5m")
+    ceiling = worker_ceiling(candidate).total
+    keys = tuple(key for key, minutes in sources.INTERVAL_MIN.items()
+                 if minutes * 60 > ceiling and minutes < MAX_STORED_DECISION_INTERVAL_MIN)
     default = a.timeframe if a.timeframe in keys else "1h"
-    sess.say("  15m / 1h (推奨)。1m と 5m は選べますが、判断の上限時間より短いため使えません。")
+    for key, minutes in sources.INTERVAL_MIN.items():
+        if key in keys:
+            mark = " (推奨)" if key == "1h" else ""
+            sess.say(f"  {keys.index(key) + 1}. {key}{mark}")
+        elif minutes * 60 <= ceiling:
+            sess.say(f"  {key}: 判断の上限時間より短いため選べません")
+        else:
+            sess.say(f"  {key}: 保存が 1h に正規化される派生専用の足で判断足にできない")
     while True:
-        timeframe = sess.choice("判断足", keys, default, help_text=_HELP_STAGE[5])
-        problem = _timeframe_problem(candidate, timeframe)
-        if problem is None:
+        answer = sess.ask(f"判断足の番号 [既定: {keys.index(default) + 1}]: ", help_text=_HELP_STAGE[5])
+        if not answer:
+            timeframe = default
             break
-        sess.say(problem)
+        if answer.isdecimal() and 1 <= int(answer) <= len(keys):
+            timeframe = keys[int(answer) - 1]
+            break
+        sess.say(f"1〜{len(keys)} の番号で選んでください。")
     a.timeframe = timeframe
     if st.mode != "fresh" and timeframe != st.base_settings.datafeed.decision_timeframe:
         sess.say("判断足を変えると、配備済みの strategy plugin の足と食い違うと signal が静かに効かなくなります。")
@@ -2042,8 +2057,6 @@ def _linger_step(sess: _Session) -> None:
         value = {"state": result.state, "at": sess.now_iso()}
         if result.reason_code is not None:
             value["reason_code"] = result.reason_code
-        if result.state in ("declined", "failed"):
-            sess.say("ログアウトすると afx も止まります。止めたくなければ `loginctl enable-linger $USER` を実行してください。")
     _update_record(sess, linger=value)
 
 
@@ -2111,7 +2124,7 @@ def _stage13(sess: _Session, settings: Settings, *, resume_handoff: bool) -> Non
         unit_value = "installed"
     else:
         if not sess.yesno("systemd のユーザーサービスとして常駐させますか", True):
-            sess.say("手で起動するには `uv run main.py` を実行してください (端末では対話シェルが開きます)。")
+            sess.say("手で起動するには `uv run afx` を実行してください (端末では対話シェルが開きます)。")
             return
         unit_dir = deps.unit_dir or unit_module.default_unit_dir(deps.environ)
 
@@ -2186,7 +2199,7 @@ def _stage14(sess: _Session, settings: Settings) -> None:
     root = sess.root
     sess.say("")
     sess.say("[段 14 次の一歩]")
-    sess.say("起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run main.py`。")
+    sess.say("起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。")
     if settings.api.enabled:
         sess.say("操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、"
                  "`afx ctl improve add <案>`、`afx ctl policy add <文>`。")

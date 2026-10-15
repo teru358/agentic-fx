@@ -168,11 +168,24 @@ def test_a_multiline_value_that_cannot_be_edited_stops_without_writing(tmp_path)
 def test_a_decision_timeframe_that_cannot_hold_one_judgement_is_explained_and_asked_again(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("判断足", ("5m", "15m"))))
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", ("1m", "4h", "1"))))
     assert run_wizard(root, io, deps) == 0, io.text
-    assert "判断足 5m (300 秒) は、1 回の判断の上限 405 秒より短いため使えません" in io.text
+    assert "1m: 判断の上限時間より短いため選べません" in io.text
+    assert "4h: 保存が 1h に正規化される派生専用の足で判断足にできない" in io.text
+    assert "1〜3 の番号で選んでください。" in io.text
     settings = load_settings_text((root / "config" / "settings.yaml").read_text())
     assert settings.datafeed.decision_timeframes == ["15m"]
+
+
+def test_timeframe_menu_selects_thirty_minutes_by_number_and_lists_every_interval(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    settings = load_settings_text((root / "config" / "settings.yaml").read_text())
+    assert settings.datafeed.decision_timeframes == ["30m"]
+    for label in ("1m:", "5m:", "1. 15m", "2. 30m", "3. 1h (推奨)", "4h:", "1d:"):
+        assert label in io.text
 
 
 def _waves(root):
@@ -231,7 +244,7 @@ def test_changing_the_decision_timeframe_lists_strategies_whose_timeframe_no_lon
     meta = SimpleNamespace(name="breakout", kind="strategy", timeframe="1h")
     root = _first_run(tmp_path, deployed_plugins=lambda *_: (meta,))
     deps, *_ = make_deps(tmp_path, deployed_plugins=lambda *_: (meta,))
-    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "15m"), ("'yes' と打ち込", "yes")))
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "1"), ("'yes' と打ち込", "yes")))
     assert run_wizard(root, io, deps) == 0, io.text
     assert "食い違い: breakout (足 1h)" in io.text
     assert "signal が静かに効かなくなります" in io.text
