@@ -680,7 +680,7 @@ git status --porcelain --ignored
 uv run afx init
 ```
 
-期待: リセット後の `git status` は clean clone と同じ (`.venv/` と、`--include-env` を付けなかったときの `.env` が残るのは正常)。もう一度 `afx init` が同じ流れで通る。同じホームに別の instance (別の clone) の資材があれば、「触らない」と表示されて変更されない。
+期待: リセット後の `git status` は clean clone と同じです。ただし afx 稼働で生成され、残ることを許可する差分は `.venv/`、`afx-ops/.venv/`、`.pytest_cache/`、`.ruff_cache/`、`**/__pycache__/`、`tmp/`、および既定で残す `.env` です。もう一度 `afx init` が同じ流れで通る。同じホームに別の instance (別の clone) の資材があれば、「触らない」と表示されて変更されない。
 
 ### 6.10 環境差
 
