@@ -35,7 +35,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 ### 範囲
 
-- `afx init` (= `uv run main.py init`) の対話化。段ごとの接続試験と読める文面。
+- `afx init` (= `uv run afx init`) の対話化。段ごとの接続試験と読める文面。
 - `config/settings.yaml` の生成と、再実行時の部分書き換え。
 - DB 初期化・基本ニュースソース・状態ファイル (従来の init がやっていたこと)。
 - 確認記録 (どの項目を、いつ、どう確認したか) の保存と、`status`・起動画面での「未完の手順」表示。
@@ -117,7 +117,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - **表示**: 「agentic-fx の初期設定を始めます。途中でやめても、段 10 で確定するまでは何も書きません。」に続けて検査結果を 1 行ずつ。
 - **検査と文面**:
   - cwd に `config/settings.yaml.example` が無い → 「ここは agentic-fx のリポジトリ直下ではありません (config/settings.yaml.example が見つかりません)。clone したディレクトリで実行してください。」rc=2。**何も作らない** (P12)。
-  - 排他 (B-12、§4.2): 先に `data/ops/setup.lock` を非ブロッキングで取り、次に `data/instance.lock` を取る (この順序は固定)。setup.lock が取れなければ「別の `afx init` または `afx ops enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」rc=2。instance.lock (`store/instance_lock.py:24`) が取れなければ「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください (`uv run main.py` で手動起動しているなら、その端末で終了してください)。設定・DB は変更していません。」rc=2。取れた 2 つの lock は、§4.2 の引き渡しの規則に従ってウィザード終了まで保持する。注: lock を取るために `data/` と `data/ops/` ディレクトリが作られる (`instance_lock.py:33` の mkdir と、afx ops enable の setup.lock と同じ fd 相対・`O_NOFOLLOW` の作法)。これは集める層で唯一の書き込みで、中身は空の lock ファイル 2 つだけ。
+  - 排他 (B-12、§4.2): 先に `data/ops/setup.lock` を非ブロッキングで取り、次に `data/instance.lock` を取る (この順序は固定)。setup.lock が取れなければ「別の `afx init` または `afx ops enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」rc=2。instance.lock (`store/instance_lock.py:24`) が取れなければ「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください (`uv run afx` で手動起動しているなら、その端末で終了してください)。設定・DB は変更していません。」rc=2。取れた 2 つの lock は、§4.2 の引き渡しの規則に従ってウィザード終了まで保持する。注: lock を取るために `data/` と `data/ops/` ディレクトリが作られる (`instance_lock.py:33` の mkdir と、afx ops enable の setup.lock と同じ fd 相対・`O_NOFOLLOW` の作法)。これは集める層で唯一の書き込みで、中身は空の lock ファイル 2 つだけ。
   - 非 tty で `--non-interactive` 無し → 「対話が必要です (標準入力が端末ではありません)。自動構築では `afx init --non-interactive` を使ってください。」rc=2。
   - Landlock (`core/landlock.is_available()`) が偽 → 「この環境では Landlock が使えません (x86_64 かつ ABI 3 以上が必要)。標準指標の導入と改善ループは使えません。取引判断のペーパー運用だけ設定できます。続けますか [y/N]」。続けた場合、段 7・段 11 は説明だけ出して飛ばす。
   - Landlock は使えるが改善 worker の隔離が要求する ABI (`core/improve_admission.MIN_LANDLOCK_ABI` = 8、Linux 6.18 以降) に届かない (`core/landlock.landlock_abi()` < 8) → 「この kernel (Landlock ABI N) では改善ループの隔離が使えません (ABI 8 以上、Linux 6.18 以降が必要)。取引判断と標準指標は設定できます。改善は kernel を更新するまで止まります。」と表示して続行 (質問なし)。記録の `landlock` は `ok` のまま reason `landlock_abi_too_old` を添え、未完の手順に `improve_isolation_unavailable` を出す。段 4 の実往復 (`verify-backend`) の問いは出さず、段 7 は周期を尋ねたうえで「この kernel では改善は走りません」を 1 行添える (v1.7)。
@@ -335,7 +335,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 ### 段 14: 次の一歩
 
 - 表示:
-  - 起動のしかた: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run main.py`。
+  - 起動のしかた: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。
   - 操作は `afx ctl`: `afx ctl status` で稼働状態と未完の手順、`afx ctl approval list`、`afx ctl improve add <案>`、`afx ctl policy add <文>`。
   - 改善候補の承認は二通り。Discord bot を有効にしたなら、bot の承認依頼で二段操作 (claim → confirm)。もう一つは `afx ctl --as approver approve <id>` (approver 鍵、端末での確認あり)。
   - ログの場所: `logs/agentic.log`、`logs/activity.log`、unit なら `journalctl --user -u afx`。
@@ -569,7 +569,7 @@ WantedBy=default.target
    - **fatal** (起動不能。unit を置かない): settings の構文・型・必須キー欠落、mission ceiling 違反、cache retention の不整合、CLI backend の実行ファイル形式の誤り (例: codex が ELF でない)、検査⑤ (秘密 env の存在) など、サービスが起動できない条件。「unit の環境では … (PATH に {dir} がありません)」のように理由を出す。
    - **warning** (LLM 未検証。unit を置く): `deferred_by_user`、未確認モデル (`/models` が取れない・一覧に無い)、CLI の未導入 (`bin_not_found`)・未認証 (`credentials_missing`)、`user_declined_probe` など、LLM が使えるかが確かめられていないだけの条件。unit は設置し、起動後は data state / mission が degraded になり、未完の手順に項目が出続ける。warning は取引判断 mission が実行時に fail closed で止まることで守られる。
    - 結果は `{fatal: [...], warning: [...]}` と固定 code で返し、終了コードは fatal がある場合のみ非 0。warning だけなら 0 で、warning の一覧を表示する。
-3. `systemctl --user` が使えない (コンテナ・WSL の一部) 場合: unit を置かず、手動起動 (`uv run main.py`) の案内。
+3. `systemctl --user` が使えない (コンテナ・WSL の一部) 場合: unit を置かず、手動起動 (`uv run afx`) の案内。
 4. 既存の `afx.service`: 内容の差分を表示し、「置き換えますか [y/N]」。稼働中なら段 0 の lock で既に止まっている。既存が screen 時代の形 (`ExecStart` が `afx-start.sh`) なら、「対話シェル (`screen -r afx`) はなくなり、操作は `afx ctl` になります」と添える。
 5. `Delegate=pids memory` が user manager で実際に効くか (cgroup の委譲) は、置く前には確かめられない。起動後の admission の結果 (§6.4) で見る。
 
