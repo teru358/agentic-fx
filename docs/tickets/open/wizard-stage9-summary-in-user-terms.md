@@ -1,7 +1,7 @@
 ---
 id: wizard-stage9-summary-in-user-terms
 title: 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-stage8-ask-daemon-not-api]
 ---
 # [wizard-stage9-summary-in-user-terms] 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [first-run-setup, wizard-stage8-ask-daemon-not-api]
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)

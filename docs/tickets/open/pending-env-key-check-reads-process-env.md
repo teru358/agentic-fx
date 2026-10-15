@@ -1,7 +1,7 @@
 ---
 id: pending-env-key-check-reads-process-env
 title: 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup]
 ---
 # [pending-env-key-check-reads-process-env] 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -25,3 +25,4 @@ setup/pending_facts.collect_pending_facts は required_env_keys の有無を os.
 
 - 2026-10-14: 起票。
 - 2026-10-15: 優先: 中 — 受入 2 回目 (2026-10-15) で裏付け: ウィザード段 14 では「.env に鍵がありません」が出るが、daemon の afx ctl status では出ない (daemon は load_dotenv 済み)
+- 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)

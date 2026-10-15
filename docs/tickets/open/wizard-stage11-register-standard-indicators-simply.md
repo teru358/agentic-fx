@@ -1,7 +1,7 @@
 ---
 id: wizard-stage11-register-standard-indicators-simply
 title: 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に
-status: 設計待ち
+status: 実装中
 priority: 低
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 ---
 # [wizard-stage11-register-standard-indicators-simply] 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 実装中 / **優先**: 低
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 
 - 2026-10-14: 起票。
 - 2026-10-15: 優先: 低 — 再実行では 9 本すべてに「配備済み・既定で外れています」と 2 行の警告が 9 回繰り返され、最後に「採用する指標がありません」。再実行時は「標準指標 9 本は配備済みです (変更なし)」の 1 行で済ませ、切り替えたい人だけ e で一覧へ (2026-10-15 受入 2 回目)
+- 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)

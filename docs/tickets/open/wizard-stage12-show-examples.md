@@ -1,7 +1,7 @@
 ---
 id: wizard-stage12-show-examples
 title: 段 12 の方針文と最初の課題に例文と書き方の案内を出す
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 ---
 # [wizard-stage12-show-examples] 段 12 の方針文と最初の課題に例文と書き方の案内を出す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)

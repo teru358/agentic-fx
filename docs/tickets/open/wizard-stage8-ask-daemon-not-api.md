@@ -1,7 +1,7 @@
 ---
 id: wizard-stage8-ask-daemon-not-api
 title: 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-14
 closed: null
@@ -9,7 +9,7 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 ---
 # [wizard-stage8-ask-daemon-not-api] 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)

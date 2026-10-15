@@ -3,20 +3,28 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 149 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (11)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
+| [pending-env-key-check-reads-process-env](open/pending-env-key-check-reads-process-env.md) | 中 | 2026-10-14 | 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」 |
+| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
+| [wizard-stage12-show-examples](open/wizard-stage12-show-examples.md) | 中 | 2026-10-14 | 段 12 の方針文と最初の課題に例文と書き方の案内を出す |
+| [wizard-stage8-ask-daemon-not-api](open/wizard-stage8-ask-daemon-not-api.md) | 中 | 2026-10-14 | 段 8 は操作 API でなく「常駐サービスで運用するか」を問う |
+| [wizard-stage9-summary-in-user-terms](open/wizard-stage9-summary-in-user-terms.md) | 中 | 2026-10-14 | 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く |
+| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
+| [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
+| [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
+| [wizard-stage13-linger-prompt-duplicate](open/wizard-stage13-linger-prompt-duplicate.md) | 低 | 2026-10-15 | 段 13 の linger の案内が問いの直後に同文で繰り返される |
 
-## 実装待ち (14)
+## 実装待ち (12)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
-| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -24,7 +32,6 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 | [improve-add-fullwidth-placeholder](open/improve-add-fullwidth-placeholder.md) | 低 | 2026-09-27 | improve add で全角プレースホルダが警告されない |
-| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
@@ -42,7 +49,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (125)
+## 設計待ち (118)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -77,12 +84,8 @@
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
-| [pending-env-key-check-reads-process-env](open/pending-env-key-check-reads-process-env.md) | 中 | 2026-10-14 | 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」 |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
-| [wizard-stage12-show-examples](open/wizard-stage12-show-examples.md) | 中 | 2026-10-14 | 段 12 の方針文と最初の課題に例文と書き方の案内を出す |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
-| [wizard-stage8-ask-daemon-not-api](open/wizard-stage8-ask-daemon-not-api.md) | 中 | 2026-10-14 | 段 8 は操作 API でなく「常駐サービスで運用するか」を問う |
-| [wizard-stage9-summary-in-user-terms](open/wizard-stage9-summary-in-user-terms.md) | 中 | 2026-10-14 | 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -139,9 +142,6 @@
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
-| [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
-| [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
-| [wizard-stage13-linger-prompt-duplicate](open/wizard-stage13-linger-prompt-duplicate.md) | 低 | 2026-10-15 | 段 13 の linger の案内が問いの直後に同文で繰り返される |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
