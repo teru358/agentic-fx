@@ -270,6 +270,10 @@ remove_kind() {
         [[ ${target_kinds[index]} == "$kind" ]] || continue
         path=${target_paths[index]}
         [[ -L $path ]] && continue
+        case $kind in
+            repo_settings|repo_plugins|repo_logs|repo_data|repo_env)
+                if [[ -d $path ]]; then chmod -R u+rwX -- "$path" || true; fi ;;
+        esac
         rm -rf -- "$path" || status=1
     done
     return $status

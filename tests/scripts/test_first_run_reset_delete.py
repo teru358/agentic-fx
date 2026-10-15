@@ -159,6 +159,10 @@ def populated(reset_environment, tmp_path):
     (clone / ".venv" / "bin" / "python").write_text("interpreter\n")
     (clone / "afx-ops" / ".venv").mkdir(parents=True, exist_ok=True)
     (clone / "afx-ops" / ".venv" / "marker").write_text("ops venv\n")
+    (clone / "src" / "agentic_fx" / "__pycache__").mkdir(parents=True)
+    (clone / "src" / "agentic_fx" / "__pycache__" / "wizard.cpython-313.pyc").write_bytes(b"cache")
+    (clone / "tmp").mkdir()
+    (clone / "tmp" / "x").write_text("generated\n")
     return clone, env, script, fakes, foreign, baseline
 
 
@@ -285,7 +289,7 @@ def test_product_contract_removes_owned_state_and_keeps_everything_else(populate
 @pytest.mark.parametrize("include_env", [False, True])
 def test_git_status_returns_to_baseline_except_fixed_tool_entries(populated, tmp_path, include_env):
     clone, env, script, fakes, _, baseline = populated
-    allowed = (b"!! .env", b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/")
+    allowed = (b"!! .env", b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/", b"!! src/agentic_fx/__pycache__/", b"!! tmp/")
     populated_state = set(_git_baseline(clone).split(b"\0"))
     assert {b"!! data/", b"!! logs/", b"!! plugins/", b"!! config/settings.yaml"} <= populated_state
 
@@ -297,6 +301,25 @@ def test_git_status_returns_to_baseline_except_fixed_tool_entries(populated, tmp
     assert {entry for entry in after - before if not entry.startswith(allowed)} == set()
     assert before - after == set()
     assert (b"!! .env" in after) is not include_env
+
+
+def test_reset_removes_readonly_adopted_plugin_version_and_returns_to_baseline(populated, tmp_path):
+    clone, env, script, fakes, _, baseline = populated
+    version = clone / "plugins" / ".versions" / "ema" / "d34db33f"
+    version.mkdir(parents=True)
+    (version / "plugin.py").write_text("PLUGIN = 'ema'\n")
+    (version / "plugin.py").chmod(0o400)
+    version.chmod(0o500)
+
+    result = _reset(script, clone, env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not version.exists()
+    before = set(baseline.split(b"\0"))
+    after = set(_git_baseline(clone).split(b"\0"))
+    allowed = (b"!! .env", b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/", b"!! src/agentic_fx/__pycache__/", b"!! tmp/")
+    assert {entry for entry in after - before if not entry.startswith(allowed)} == set()
+    assert before - after == set()
 
 
 def test_only_owned_config_paths_change_and_foreign_assets_stay_identical(populated, tmp_path):
@@ -425,7 +448,7 @@ def test_repeated_populate_and_reset_cycles_return_to_the_same_state(populated, 
         assert len(fakes.lines("loginctl")) == cycle + 1
         before = _config_trees(env, tmp_path)
         extra = set(_git_baseline(clone).split(b"\0")) - set(baseline.split(b"\0"))
-        assert {entry for entry in extra if not entry.startswith((b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/"))} == set()
+        assert {entry for entry in extra if not entry.startswith((b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/", b"!! src/agentic_fx/__pycache__/", b"!! tmp/"))} == set()
         assert _config_trees(env, tmp_path) == before
         _populate_again(clone, env, tmp_path)
 
@@ -733,7 +756,7 @@ def test_each_failed_removal_converges_on_the_next_run(populated, tmp_path, kind
     assert all(path.exists() for path in foreign)
     before = set(baseline.split(b"\0"))
     after = set(_git_baseline(clone).split(b"\0"))
-    allowed = (b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/")
+    allowed = (b"!! .pytest_cache/", b"!! .ruff_cache/", b"!! .venv/", b"!! afx-ops/.venv/", b"!! src/agentic_fx/__pycache__/", b"!! tmp/")
     assert {entry for entry in after - before if not entry.startswith(allowed)} == set()
     assert before - after == set()
 
