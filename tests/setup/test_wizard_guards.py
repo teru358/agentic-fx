@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import pytest
 
 from agentic_fx import service
@@ -11,7 +12,7 @@ from agentic_fx.setup.wizard import run_wizard
 from tests.setup.test_wizard_models import claude_world, codex_world, home, record_of, settings_of  # noqa: F401
 from tests.setup.test_wizard_rerun import installed_root
 from tests.setup.wizard_support import (
-    LOCK_FILES, ScriptedWizardIO, codex_model_list, fresh_responder, make_deps, make_root, snapshot,
+    FakeResponse, LOCK_FILES, ScriptedWizardIO, codex_model_list, fresh_responder, make_deps, make_root, snapshot,
 )
 
 KEY = "KEYVALUE-1"
@@ -41,6 +42,86 @@ def test_the_bridge_key_is_never_sent_over_plain_http_to_another_host(tmp_path, 
     assert run_wizard(root, io, deps) == 0, io.text
     assert bridge_headers(fetch)[0] == {}
     assert "平文 http には鍵を送りません" in io.text
+
+
+def test_plain_http_auth_is_left_unverified_without_a_retry_question(tmp_path):
+    root = make_root(tmp_path)
+    calls = []
+    deps, _, default_fetch, _ = make_deps(tmp_path, environ={"MT5_BRIDGE_API_KEY": KEY})
+
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({}, 401)
+        return default_fetch(url, **kwargs)
+
+    deps = replace(deps, fetch=fetch)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "http://bridge.example:8812"), ("bridge 側で API キー", "1"),
+        ("[r] 再試行", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    price = record_of(root)["price"]
+    assert price["result"] == "unverified" and price["reason_code"] == "key_withheld_plain_http"
+    assert not io.asked_with("[r] 再試行")
+    assert "daemon は `.env` の鍵で接続します" in io.text
+    assert all(kwargs.get("headers") == {} for url, kwargs in calls if "bridge.example" in url)
+
+
+def test_https_auth_failure_keeps_the_retry_question(tmp_path):
+    root = make_root(tmp_path)
+    deps, _, default_fetch, _ = make_deps(tmp_path, environ={"MT5_BRIDGE_API_KEY": KEY})
+
+    def fetch(url, **kwargs):
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({}, 401)
+        return default_fetch(url, **kwargs)
+
+    deps = replace(deps, fetch=fetch)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "https://bridge.example:8812"), ("bridge 側で API キー", "1"),
+        ("[r] 再試行", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert record_of(root)["price"]["result"] == "planned"
+    assert io.asked_with("[r] 再試行")
+    assert "MT5_BRIDGE_API_KEY を確かめてください" in io.text
+
+
+def test_summary_hides_setting_keys_and_reopens_after_showing_the_diff(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("この内容で書き込みますか", ("d", "y"))))
+    assert run_wizard(root, io, deps) == 0, io.text
+    summary, diff = io.text.split("settings.yaml の変更点", 1)
+    assert "datafeed." not in summary and "確定 1" not in summary and "planned" not in summary
+    assert "現在値 → 新しい値" in diff
+    assert len(io.asked_with("この内容で書き込みますか")) == 2
+
+
+def test_summary_decline_writes_no_setup_files(tmp_path):
+    root = make_root(tmp_path)
+    before = snapshot(root)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みますか", "n")))
+    assert run_wizard(root, io, deps) == 1, io.text
+    after = snapshot(root)
+    assert {key: value for key, value in after.items() if key in before} == before
+    assert set(after) - set(before) <= LOCK_FILES
+
+
+def test_example_shortcut_adds_all_examples_to_policy_and_backlog(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("方針文", ("e", "")), ("最初の課題", ("e", ""))))
+    assert run_wizard(root, io, deps) == 0, io.text
+    log = (root / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert log.count("\tpolicy_added\t") == 3
+    assert log.count("\tbacklog_added\t") == 1
 
 
 @pytest.mark.parametrize("answer", ["2", "3", ""])

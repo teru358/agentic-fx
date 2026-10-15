@@ -97,8 +97,7 @@ _AFTER_COMMIT_STOP = ("ここまでの確定は残っています。続きは `a
 
 _PRICE_FAILURE_TEXT = {
     "connect_error": "MT5 bridge に接続できません。bridge が起動しているか、URL が正しいか確認してください。",
-    "auth_required": ("bridge が API キーを要求しています。afx 側の `.env` に MT5_BRIDGE_API_KEY を書いてから"
-                      "再試行してください (値はここでは入力しません)。"),
+    "auth_required": "鍵が一致しません。`.env` の MT5_BRIDGE_API_KEY を確かめてください。",
     "server_time_unknown": ("bridge は動いていますが、MT5 のサーバ時刻がまだ確定していません。"
                             "MT5 端末がログイン済みで、市場が開いているときに再試行してください。"),
     "bridge_not_connected": ("bridge は動いていますが MT5 端末とつながっていません。"
@@ -465,6 +464,7 @@ class Answers:
     improve_at: str | None = None
     wait_first: bool = False
     api_enabled: bool = True
+    daemon: bool = True
 
 
 _SOURCE_KEYS = ("yfinance", "mt5", "twelvedata")
@@ -778,10 +778,12 @@ def _initial_answers(sess: _Session, st: _Start) -> Answers:
             zone = guess
         except (ZoneInfoNotFoundError, ValueError, OSError):
             zone = "UTC"
+    unit_dir = sess.deps.unit_dir or unit_module.default_unit_dir(sess.deps.environ)
+    daemon = True if st.mode == "fresh" else (s.api.enabled or (unit_dir / "afx.service").is_file())
     return Answers(
         display_timezone=zone, account_currency=s.account_currency,
         pairs=list(s.pairs), starting_balance=balance, timeframe=s.datafeed.decision_timeframe,
-        api_enabled=s.api.enabled, landlock=dict(st.landlock_record))
+        api_enabled=s.api.enabled, daemon=daemon, landlock=dict(st.landlock_record))
 
 
 def _stage1(sess: _Session, st: _Start) -> None:
@@ -884,8 +886,7 @@ def _bridge_check(sess: _Session, a: Answers, url: str) -> CheckResult:
             if key:
                 headers["X-Bridge-Api-Key"] = key
         else:
-            sess.say("平文 http には鍵を送りません。鍵なしで /health を試します "
-                     "(認証を要する bridge は auth_required になります)。")
+            sess.say("平文 http には鍵を送りません。鍵なしで /health を試します。")
     return checks.check_bridge(url, a.pairs[0], fetch=sess.deps.fetch, headers=headers,
                                now=sess.deps.now)
 
@@ -943,6 +944,12 @@ def _stage3(sess: _Session, st: _Start, a: Answers) -> None:
             a.bridge_plan = "connected"
             return
         reason = result.reason_code.value if result.reason_code else "connect_error"
+        if (not _may_send_bridge_key(url) and reason == checks.CheckReason.AUTH_REQUIRED.value):
+            a.price = _plain_record("unverified", sess.now_iso(), checks.CheckReason.KEY_WITHHELD_PLAIN_HTTP.value)
+            a.bridge_plan = "connected"
+            sess.say("bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。"
+                     "daemon は `.env` の鍵で接続します。")
+            return
         sess.say(_PRICE_FAILURE_TEXT.get(reason, "接続できませんでした。"))
         action = sess.choice("[r] 再試行 / [2] 『使う予定・未準備』として進む / [u] URL を入れ直す",
                              ("r", "2", "u"), None)
@@ -1605,14 +1612,11 @@ def _stage7(sess: _Session, st: _Start, a: Answers) -> None:
 
 def _stage8(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
-    sess.say("[段 8 操作 API と .env]")
-    sess.say("操作 API は同じマシンの UNIX ソケット (data/run/api.sock) だけで受け付け、TCP では開きません。"
-             "常駐 (daemon) で動かすときの承認・方針文の追加・改善の起動は `afx ctl` から行うので、有効にすることを勧めます。")
-    sess.say("無効にすると `afx ctl` と、bot / web / notify は使えません。`afx ctl status` に未完の手順を出すこともできなくなり、"
-             "案内は起動画面とこのウィザードの表示だけになります。")
-    a.api_enabled = sess.yesno("操作 API を有効にしますか", a.api_enabled if st.mode != "fresh" else True)
-    if not a.api_enabled:
-        sess.say("操作 API を無効にしました。`afx ctl`・bot・web・notify は使えません。")
+    sess.say("[段 8 常駐サービスと .env]")
+    sess.say("常駐なら `afx ctl` と bot / web / notify で操作し、承認もそこから行います。")
+    sess.say("手動起動なら対話シェルで操作し、外からは見えません。")
+    a.daemon = sess.yesno("afx を常駐サービス (systemd user unit) として動かしますか", a.daemon)
+    a.api_enabled = a.daemon
     keys: list[str] = []
     if a.source == "twelvedata":
         keys.append("TWELVEDATA_API_KEY")
@@ -1685,6 +1689,30 @@ def _unverified_items(a: Answers) -> list[str]:
     return items
 
 
+def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, ...]:
+    key = "あり" if a.bridge_key == "yes" else "なし" if a.bridge_key == "no" else "不明"
+    price = "確認済み" if a.price.get("result") == "ok" else "bridge の接続は未確認"
+    source = (f"価格源: MT5 bridge（{a.bridge_url or 'URL 未設定'}、鍵 {key}、{price}）"
+              if a.source == "mt5" else f"価格源: {a.source}（{price}）")
+    trade = a.trade_backend or settings.runner.trade.backend
+    improve = a.improve_backend or settings.runner.improve.backend
+    trade_model = a.trade_model or settings.runner.trade.model
+    improve_model = a.improve_model or settings.runner.improve.model
+    cadence = a.cadence or settings.schedule.improve
+    at = a.improve_at or settings.schedule.improve_at
+    first = "次の予定まで待つ" if a.wait_first else "起動直後に 1 本走らせる"
+    resident = "常駐サービスとして動かす" if a.daemon else "手動起動で使う"
+    return (
+        source,
+        f"取引判断と改善: {trade}（{trade_model}）/ {improve}（{improve_model}）",
+        f"判断足: {a.timeframe}。backtest の基底足: {a.base_interval or settings.backtest.base_interval}、履歴源: {a.eval_source}",
+        f"改善: {cadence} {at}。次回: {_next_schedule_text(settings, now)}。最初の 1 本: {first}",
+        f"常駐: {resident}",
+        "作るもの: settings.yaml、DB、状態、確認記録。",
+        "このあと尋ねること: 標準指標、方針文と最初の課題、常駐化と外から見る手段。",
+    )
+
+
 def _stage9(sess: _Session, st: _Start, a: Answers) -> _Plan:
     raw = yaml.safe_load(st.base_text) or {}
     changes = build_changes(raw, a)
@@ -1719,26 +1747,10 @@ def _stage9(sess: _Session, st: _Start, a: Answers) -> _Plan:
         raise _Exit(RC_STOPPED) from None
 
     sess.say("")
-    sess.say("[段 9 要約] 書き込む内容")
-    if changes:
-        sess.say("settings.yaml の変更点 (キー: 現在値 → 新しい値):")
-        for key, new in changes.items():
-            sess.say(f"  {key}: {_fmt_value(_get_path(raw, key))} → {_fmt_value(new)}")
-    else:
-        sess.say("settings.yaml の変更点はありません。")
-    if st.migrated and st.original_text is not None:
-        sess.say("版の移行で挿入・変更する行:")
-        for line in difflib.unified_diff(st.original_text.splitlines(), st.base_text.splitlines(),
-                                         lineterm="", n=0):
-            if line[:1] in "+-" and not line.startswith(("+++", "---")):
-                sess.say(f"  {line}")
-    sess.say("確定 1 で作るもの: settings.yaml" + (" (置き換え前は .bak に残します)" if st.original_text else "")
-             + "、DB (data/agentic.db)、状態 (app_state.json)、確認記録 (setup.json)"
-             + ("、改善の期の消費印" if a.wait_first else "") + "。")
-    sess.say("確定 2 で尋ねること: 標準指標・方針文と最初の課題・常駐化と外から見る手段。")
-    unverified = _unverified_items(a)
-    if unverified:
-        sess.say("未確認の項目: " + "、".join(unverified))
+    sess.say("")
+    sess.say("[段 9 要約]")
+    for line in _summary_lines(a, new_settings, sess.now()):
+        sess.say(line)
     if st.mode != "fresh":
         sentences: list[str] = []
         for key in changes:
@@ -1753,9 +1765,25 @@ def _stage9(sess: _Session, st: _Start, a: Answers) -> _Plan:
             if count:
                 sess.say(f"建玉・未約定が {count} 件あります。これらの項目を変える前に建玉を閉じることを勧めます。")
             sess.typed_yes("変えてよいときだけ")
-    if not sess.yesno("書き込みますか", False):
-        sess.say("何も書かずに終了します。")
-        raise _Exit(RC_STOPPED)
+    while True:
+        action = sess.choice("この内容で書き込みますか (d = settings.yaml の差分を見る)", ("y", "n", "d"), "n")
+        if action == "y":
+            break
+        if action == "n":
+            sess.say("何も書かずに終了します。")
+            raise _Exit(RC_STOPPED)
+        if changes:
+            sess.say("settings.yaml の変更点 (キー: 現在値 → 新しい値):")
+            for key, new in changes.items():
+                sess.say(f"  {key}: {_fmt_value(_get_path(raw, key))} → {_fmt_value(new)}")
+        else:
+            sess.say("settings.yaml の変更点はありません。")
+        if st.migrated and st.original_text is not None:
+            sess.say("版の移行で挿入・変更する行:")
+            for line in difflib.unified_diff(st.original_text.splitlines(), st.base_text.splitlines(),
+                                             lineterm="", n=0):
+                if line[:1] in "+-" and not line.startswith(("+++", "---")):
+                    sess.say(f"  {line}")
     return _Plan(new_text, new_settings, changes)
 
 
@@ -1971,35 +1999,50 @@ def _backlog_count(root: Path) -> int | None:
         conn.close()
 
 
+_POLICY_EXAMPLES = (
+    "ペーパー運用。実資金の発注は行わない。",
+    "対象は USDJPY の 1 時間足。指標発表の前後 30 分は新規に入らない。",
+    "選別して勝つを優先し、取引回数より負けを減らす提案を評価する。",
+)
+_BACKLOG_EXAMPLE = "標準指標だけで組める 1 時間足の押し目買い戦略候補を 1 本作り、直近 3 ヶ月の履歴で PF と最大ドローダウンを測る"
+
+
 def _stage12(sess: _Session) -> None:
     sess.say("")
     sess.say("[段 12 方針文と最初の課題]")
     path = directives_path(sess.root)
     count = _backlog_count(sess.root)
     sess.say(f"既存の方針文: {_text_length(path)} 文字 / 改善課題: {count if count is not None else '不明'} 件")
-    sess.say("方針文は取引判断と改善の両方に毎回渡されます (末尾 4000 字)。後から `afx ctl policy add <文>` でも足せます。"
-             "1 行ずつ入力してください (空 Enter で終わり)。")
+    sess.say("方針文は取引判断と改善の全 mission に注入される運用者の方針です。")
+    for example in _POLICY_EXAMPLES:
+        sess.say(f"例: 「{example}」")
+    sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
     written = 0
     activity = ActivityLog(sess.root / "logs" / "activity.log")
     while True:
-        text = " ".join(sess.ask("方針文: ", allow_quit=False).split())
-        if not text:
+        raw = sess.ask("方針文: ", allow_quit=False)
+        entries = _POLICY_EXAMPLES if raw == "e" else (" ".join(raw.split()),)
+        if not entries[0]:
             break
-        try:
-            append_policy_directive(path, activity, text)
-            written += 1
-        except OSError as error:
-            sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
-            break
+        for text in entries:
+            try:
+                append_policy_directive(path, activity, text)
+                written += 1
+            except OSError as error:
+                sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
+                break
     sess.say(f"方針文を {written} 行書きました。")
-    sess.say("改善ループに最初に考えてほしいこと (どんな戦略を作らせたいか) を自然文で書いてください。"
-             "1 件ずつ入力してください (空 Enter で終わり)。")
+    sess.say("課題は改善ループが最初に取り組む 1 件です。")
+    sess.say(f"例: 「{_BACKLOG_EXAMPLE}」")
+    sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
     added = 0
     conn = None
     try:
         conn = connect(sess.root / "data" / "agentic.db")
         while True:
             raw = sess.ask("最初の課題: ", allow_quit=False)
+            if raw == "e":
+                raw = _BACKLOG_EXAMPLE
             display, _removed = normalize_idea_display(raw)
             if not display:
                 break
@@ -2113,19 +2156,20 @@ def _start_step(sess: _Session, settings: Settings, enabled_features: list[str],
     _update_record(sess, **values)
 
 
-def _stage13(sess: _Session, settings: Settings, *, resume_handoff: bool) -> None:
+def _stage13(sess: _Session, settings: Settings, *, resume_handoff: bool, daemon: bool = True) -> None:
     deps = sess.deps
     root = sess.root
     assert sess.lease is not None
     sess.say("")
     sess.say("[段 13 常駐化と外から見る手段]")
+    if not resume_handoff and not daemon:
+        sess.say("手動起動: `uv run afx`。常駐に切り替えるときは `afx init` を再実行してください。")
+        _update_record(sess, unit="not_installed", start=_plain_record("skipped", sess.now_iso(), "declined"))
+        return
     if resume_handoff:
         sess.say("前回は外から見る手段の設定の途中で止まりました。unit は設置済みです。手順 3 から続けます。")
         unit_value = "installed"
     else:
-        if not sess.yesno("systemd のユーザーサービスとして常駐させますか", True):
-            sess.say("手で起動するには `uv run afx` を実行してください (端末では対話シェルが開きます)。")
-            return
         unit_dir = deps.unit_dir or unit_module.default_unit_dir(deps.environ)
 
         def confirm_unit(text: str = "") -> bool:
@@ -2288,7 +2332,8 @@ def run_wizard(root: Path, io: WizardIO, deps: WizardDeps | None = None) -> int:
                 _verify_improve_backend(sess, answers)
             _stage11(sess, settings, sess.lease)
             _stage12(sess)
-            _stage13(sess, settings, resume_handoff=False)
+            _stage13(sess, settings, resume_handoff=False,
+                     daemon=answers.daemon if answers else settings.api.enabled)
             _stage14(sess, settings)
             return RC_OK
         except _Interrupted as stop:

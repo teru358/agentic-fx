@@ -345,8 +345,8 @@ def test_main_script_walks_every_question_stage_in_order() -> None:
     steps = json.loads((SCRIPTS / "main-claude.json").read_text(encoding="utf-8"))
     expects = [step["expect"] for step in steps]
     order = ["読みました", "表示タイムゾーン", "口座通貨", "対象ペア", "初期残高", "価格源", "LLM の構成",
-             "判断足", "改善の周期", "改善の時刻", "最初の 1 本", "操作 API を有効", "書き込みますか",
-             "方針文", "最初の課題", "常駐させますか", "起動しますか"]
+             "判断足", "改善の周期", "改善の時刻", "最初の 1 本", "afx を常駐サービス", "書き込みますか",
+             "方針文", "最初の課題", "起動しますか"]
     positions = []
     for needle in order:
         found = [i for i, text in enumerate(expects) if needle in text]

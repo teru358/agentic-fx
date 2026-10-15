@@ -23,7 +23,7 @@ _RECORD_ONLY_REASONS = frozenset({
     "landlock_abi_too_old", "sandbox_unavailable", "landlock_create_failed",
     "landlock_restrict_failed", "setup_lease_invalid", "disabled", "invocation_id",
     "cursor", "unit_enable_failed", "unit_start_failed", "service_not_active",
-    "instance_lock_busy", "enable_declined", "start_declined", "not_cli_backend"})
+    "instance_lock_busy", "enable_declined", "start_declined", "not_cli_backend", "declined"})
 REASON_CODES = frozenset(reason.value for reason in CheckReason) | _RECORD_ONLY_REASONS | OPS_ENABLE_REASON_CODES
 _COMPOSITE_REASON = re.compile(r"(?:feature_config_unsafe|feature_probe_failed):[a-z_]{1,32}\Z")
 

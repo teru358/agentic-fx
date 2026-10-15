@@ -79,6 +79,10 @@ class Rules:
         for fragment, queue in self.rules:
             if fragment in prompt:
                 return queue.pop(0) if len(queue) > 1 else queue[0]
+        if "afx を常駐サービス" in prompt:
+            for fragment, queue in self.rules:
+                if fragment == "systemd のユーザーサービス":
+                    return queue.pop(0) if len(queue) > 1 else queue[0]
         return self.default
 
 
@@ -270,11 +274,13 @@ LOCK_FILES = {"data/", "data/ops/", "data/instance.lock", "data/ops/setup.lock"}
 
 # 既定の回答だけで fresh な root を最後まで通す (価格源は bridge に接続済み、常駐化はしない)。
 FRESH_RULES = (("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みますか", "y"),
-               ("systemd のユーザーサービス", "n"))
+               ("afx を常駐サービス", "n"))
 
 
 def fresh_responder(*extra: tuple[str, str | tuple[str, ...]]) -> Rules:
-    return Rules(*extra, *FRESH_RULES)
+    translated = tuple(("afx を常駐サービス" if fragment == "systemd のユーザーサービス" else fragment, answer)
+                       for fragment, answer in extra)
+    return Rules(*translated, *FRESH_RULES)
 
 
 def codex_model_list(*ids: str, hidden: tuple[str, ...] = ()) -> str:

@@ -96,7 +96,8 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
         verified = _get(facts.settings, "improve", "llama_swap_verified", default=True)
     if improve_backend == "opencode" and verified is False:
         steps.append(_step(facts, "opencode_unverified", "action"))
-    if _record_value(record, "bridge_plan") == "planned" or facts.data_state == "degraded":
+    if ((_record_value(record, "bridge_plan") == "planned" and facts.data_state != "ready")
+            or facts.data_state == "degraded"):
         steps.append(_step(facts, "bridge_not_connected", "action"))
     for key in facts.required_env_keys:
         if key not in facts.env_present_keys:
