@@ -12,12 +12,13 @@
 | [wizard-write-absolute-cli-bin](open/wizard-write-absolute-cli-bin.md) | 高 | 2026-10-15 | ウィザードは claude の実体を which で見つけても runner.claude.bin を絶対パスに書かない |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 
-## 実装待ち (13)
+## 実装待ち (14)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
+| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -30,12 +31,11 @@
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
-## 裁定待ち (9)
+## 裁定待ち (8)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
-| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 | [improve-catchup-runs-at-startup](open/improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [gate-noop-followup](open/gate-noop-followup.md) | 低 |  | fact 行が選択され得る件は kind 必須化の追随が未観測 |
