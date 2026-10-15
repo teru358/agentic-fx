@@ -138,6 +138,28 @@ def test_claude_selection_keeps_an_existing_absolute_executable_path(tmp_path, h
     assert f"claude の実体: {binary}" not in io.text
 
 
+def test_claude_selection_expands_home_path_before_recording_it(tmp_path, home):
+    from agentic_fx.setup import checks
+
+    root = make_root(tmp_path)
+    binary = make_executable(home / "bin" / "claude")
+    login(home)
+    settings = (root / "config" / "settings.yaml.example").read_text()
+    (root / "config" / "settings.yaml.example").write_text(
+        settings.replace("bin: claude", "bin: ~/bin/claude"), encoding="utf-8")
+    deps, calls, fetch, run = make_deps(
+        tmp_path, which=lambda name: str(binary) if name == "~/bin/claude" else None)
+    assert checks.cli_candidate("~/bin/claude", which=deps.which) == str(binary)
+    fetch.models = {}
+    run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
+    io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert settings_of(root).runner.claude.bin == str(binary)
+    assert f"claude の実体: {binary}" in io.text
+
+
 def test_old_landlock_abi_skips_the_improve_exchange_but_keeps_schedule_questions(tmp_path, home):
     root = make_root(tmp_path)
     binary, kwargs = installed_claude(tmp_path, home)
@@ -150,6 +172,7 @@ def test_old_landlock_abi_skips_the_improve_exchange_but_keeps_schedule_question
 
     assert "この kernel (Landlock ABI 4) では改善ループの隔離が使えません" in io.text
     assert io.asked_with("改善 backend の実往復") == []
+    assert io.text.count("改善の実往復の試験は、この kernel では隔離が使えないため行いません。") == 1
     assert io.asked_with("改善の周期 (weekly / daily)")
     assert "この kernel では改善は走りません (段 0 の表示)。" in io.text
     record = record_of(root)

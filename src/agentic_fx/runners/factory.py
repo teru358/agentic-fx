@@ -10,7 +10,7 @@ import threading
 from typing import Any, Callable, Literal
 
 from agentic_fx.runners.base import AgentRunner
-from agentic_fx.core.cli_bin import resolve_cli_bin
+from agentic_fx.core.cli_bin import CliBinNotFound, resolve_cli_bin
 from agentic_fx.tools.registry import ToolRegistry
 
 
@@ -50,7 +50,7 @@ def build_runner(
         from agentic_fx.runners.claude_runner import ClaudeRunner
         bin_path = resolve_cli_bin(settings.runner.claude.bin)
         if bin_path is None:
-            raise RuntimeError("runner.claude.bin が見つかりません (bin_not_found)")
+            raise CliBinNotFound(settings.runner.claude.bin)
         return ClaudeRunner(
             bin_path=bin_path, model=choice.model,
             workdir=workdir, credentials_file_copied=True,

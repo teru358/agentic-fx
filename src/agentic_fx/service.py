@@ -1739,6 +1739,7 @@ _STATUS_SETUP_CODES = frozenset({
     "history_missing", "history_source_unconfigured", "approval_stalled",
     "landlock_unavailable", "yfinance_weekend_gap", "ops_incomplete", "ops_not_ready",
     "isolation_not_admitted", "start_pending", "linger_off",
+    "improve_isolation_unavailable",
 })
 
 

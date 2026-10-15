@@ -52,7 +52,6 @@ import json
 import logging
 import os
 import queue
-import shutil
 import signal
 import sys
 import sysconfig
@@ -89,7 +88,7 @@ from agentic_fx.runners import factory as runner_factory
 # **都度参照**する形に変える。
 from agentic_fx.runners import cli_runner
 from agentic_fx.runners.cli_runner import _normalize_reason
-from agentic_fx.core.cli_bin import resolve_cli_bin
+from agentic_fx.core.cli_bin import CliBinNotFound, resolve_cli_bin
 # A-4 検収是正 (2026-08-22, B1): McpShimDispatcher の module level import。
 # `_start_mcp_dispatcher` から使う。ToolRegistry も同様に module level へ
 # 上げる (`_build_improve_registry` の型注釈・既定実装で使うため — 従来
@@ -426,9 +425,7 @@ def _exec_closure_for(backend: str, *, claude_bin: Path | None,
             if p.exists():
                 dirs.append(p)
     if backend == "claude" and claude_bin is not None:
-        claude_bin = resolve_cli_bin(str(claude_bin))
-        if claude_bin is None:
-            raise RuntimeError("bin_not_found")
+        assert claude_bin.is_absolute(), "claude_bin must be absolute"
         real = claude_bin.resolve()
         dirs.append(real.parent)
         targets.append(real)
@@ -911,7 +908,8 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
             improve_backend = settings_dict["runner"]["improve"]["backend"]
             codex_host_required = True
             if improve_backend == "claude":
-                claude_bin = settings_dict["runner"]["claude"]["bin"]
+                configured_claude_bin = settings_dict["runner"]["claude"]["bin"]
+                claude_bin = None
                 codex_bin = None
                 # 検収是正 (2026-08-30): opencode_bin の代入漏れ — この分岐
                 # だけ未代入だと backend=claude が UnboundLocalError で死ぬ
@@ -946,6 +944,11 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                     claude_bin = canary_bin if improve_backend == "claude" else None
                     codex_bin = canary_bin if improve_backend == "codex" else None
                     opencode_bin = canary_bin if improve_backend == "opencode" else None
+            if improve_backend == "claude" and claude_bin is None:
+                claude_bin = resolve_cli_bin(configured_claude_bin)
+                if claude_bin is None:
+                    raise CliBinNotFound(configured_claude_bin)
+                settings_dict["runner"]["claude"]["bin"] = str(claude_bin)
             # MCP の spool root は Landlock を掛ける前に作り、dirfd を保持する。
             spool_root = _create_mcp_spool_root(Path.cwd())
             isolation = None
@@ -954,7 +957,7 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                                 "opencode": opencode_bin}[improve_backend]
                 # mission cgroup・artifact fd・proxy listener・NETLINK_SOCK_DIAG も Landlock の前
                 isolation = improve_isolation.WorkerIsolation.prepare(
-                    isolation_spec, _mission_nonce, str(Path(artifact_bin).expanduser()))
+                    isolation_spec, _mission_nonce, str(artifact_bin))
             _bootstrap_improve_profile(
                 backend=improve_backend,
                 mission_id=handshake["mission_id"],
@@ -1241,7 +1244,7 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                 frame = {
                     "type": "ready", "ok": False,
                     "error": f"{type(exc).__name__}: {exc}"}
-                if str(exc) == "bin_not_found":
+                if isinstance(exc, CliBinNotFound):
                     frame["reason"] = "bin_not_found"
                 _send_frame(protocol_out, out_seq, frame)
         except Exception:  # noqa: BLE001 — パイプが壊れていれば諦める

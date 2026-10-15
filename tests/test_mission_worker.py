@@ -78,7 +78,7 @@ def test_exec_closure_rejects_unresolved_claude_name_without_using_cwd(tmp_path,
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("shutil.which", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="bin_not_found"):
+    with pytest.raises(AssertionError, match="absolute"):
         mission_worker._exec_closure_for("claude", claude_bin=Path("claude"),
                                          codex_bin=None, venv_root=venv)
 
@@ -88,7 +88,7 @@ def test_exec_closure_rejects_a_relative_claude_path(tmp_path, monkeypatch):
     venv = tmp_path / "venv"; venv.mkdir()
     monkeypatch.setenv("PATH", str(tmp_path))
 
-    with pytest.raises(RuntimeError, match="bin_not_found"):
+    with pytest.raises(AssertionError, match="absolute"):
         mission_worker._exec_closure_for("claude", claude_bin=Path("./claude"),
                                          codex_bin=None, venv_root=venv)
 

@@ -10,6 +10,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 
+class CliBinNotFound(RuntimeError):
+    """A configured CLI binary could not be resolved to an absolute path."""
+
+    def __init__(self, configured: str) -> None:
+        self.configured = configured
+        super().__init__("runner.claude.bin が見つかりません (bin_not_found)")
+
+
 def resolve_cli_bin(value: str, *, which: Callable[[str], str | None] | None = None) -> Path | None:
     """Return an absolute configured CLI path, rejecting relative resolution.
 

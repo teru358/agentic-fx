@@ -674,9 +674,11 @@ class WorkerRunner(AgentRunner):
                     self._escalate_kill(proc, w)
                 else:
                     cleanup_state["trigger"] = MC.TRIGGER_WORKER_EXIT
-                return MissionResult(
-                    "failed", None, transcript,
-                    reason=f"child ready ok=false: {ready.get('error')}")
+                if ready.get("reason") == "bin_not_found":
+                    reason = "runner.claude.bin が見つかりません (bin_not_found)"
+                else:
+                    reason = f"child ready ok=false: {ready.get('error')}"
+                return MissionResult("failed", None, transcript, reason=reason)
 
             if self._on_ready is not None:
                 try:

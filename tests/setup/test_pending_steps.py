@@ -73,12 +73,25 @@ def test_all_pending_conditions_are_derived_from_injected_facts():
 
 def test_old_landlock_abi_adds_a_distinct_improve_isolation_warning():
     record = _record(landlock={"result": "ok", "reason_code": "landlock_abi_too_old"})
-    steps = pending_steps(PendingFacts(record_state="ok", record=record, now=NOW))
+    steps = pending_steps(PendingFacts(record_state="ok", record=record, now=NOW, landlock_abi=4))
 
     step = next(step for step in steps if step.code == "improve_isolation_unavailable")
     assert step.severity == "warn"
     assert render_pending_step(step) == (
         "この kernel では改善ループの隔離が使えません (Landlock ABI 8 以上、Linux 6.18 以降が必要)。kernel を更新してください")
+
+
+def test_improve_isolation_warning_uses_current_landlock_abi_not_recorded_reason():
+    old_record = _record(landlock={"result": "ok", "reason_code": "landlock_abi_too_old"})
+    current_record = _record(landlock={"result": "ok", "reason_code": "ok"})
+
+    old_codes = [step.code for step in pending_steps(PendingFacts(
+        record_state="ok", record=old_record, now=NOW, landlock_abi=8))]
+    current_codes = [step.code for step in pending_steps(PendingFacts(
+        record_state="ok", record=current_record, now=NOW, landlock_abi=4))]
+
+    assert "improve_isolation_unavailable" not in old_codes
+    assert "improve_isolation_unavailable" in current_codes
 
 
 def test_unavailable_landlock_suppresses_the_old_abi_warning():

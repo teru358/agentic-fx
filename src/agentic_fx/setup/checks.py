@@ -13,10 +13,11 @@ from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 
-from agentic_fx.core.cli_bin import resolve_cli_bin
 from typing import Any, Callable, Literal, Mapping
 
 import httpx
+
+from agentic_fx.core.cli_bin import resolve_cli_bin
 
 
 class CheckReason(StrEnum):

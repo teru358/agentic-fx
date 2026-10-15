@@ -4257,6 +4257,22 @@ def _clean_initial_env(monkeypatch):
         lambda settings, **kw: real(settings, read_initial_env_names=lambda: {"HOME"}, **kw))
 
 
+def test_status_serializes_improve_isolation_unavailable_for_current_abi():
+    from agentic_fx.service import _serialize_status_setup
+    from agentic_fx.setup.pending_steps import PendingFacts
+    from agentic_fx.store.setup_record import SetupRecord
+
+    status = _serialize_status_setup(PendingFacts(
+        record_state="ok",
+        record=SetupRecord({"landlock": {"reason_code": "ok"}}),
+        landlock_available=True,
+        landlock_abi=4,
+    ))
+
+    assert "improve_isolation_unavailable" in {
+        item["code"] for item in status["pending_steps"]}
+
+
 def test_build_app_starts_when_improve_claude_bin_not_resolvable(tmp_path, monkeypatch):
     """①: `claude` が PATH 上に無く絶対パスでもないのは warning (bin_not_found)。
     起動は拒否せず、bin は未解決のまま (mission は実行時に fail closed で止まる)。"""

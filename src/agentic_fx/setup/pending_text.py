@@ -19,6 +19,7 @@ STEP_PARAMS: Mapping[str, Mapping[str, tuple[str, object]]] = {
                        "reason_code": ("ident", "unknown")},
     "ops_not_ready": {"feature": ("ident", "feature")},
     "isolation_not_admitted": {"reason_code": ("ident", "unknown")},
+    "improve_isolation_unavailable": {},
 }
 
 

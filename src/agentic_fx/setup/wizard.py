@@ -1290,7 +1290,7 @@ def _claude_trade(sess: _Session, st: _Start, a: Answers) -> CheckResult:
 
 def _record_claude_binary(sess: _Session, configured_bin: str, a: Answers) -> None:
     configured = Path(configured_bin).expanduser()
-    if configured.is_absolute() and checks.is_executable_file(configured):
+    if configured_bin.startswith("/") and checks.is_executable_file(configured):
         return
     candidate = checks.cli_candidate(configured_bin, which=sess.deps.which)
     if candidate is not None:
@@ -1411,7 +1411,7 @@ def _stage4(sess: _Session, st: _Start, a: Answers) -> None:
         try:
             if pick == "local":
                 _local_pair(sess, st, a, base_url, probe)
-                _report_improve_isolation(sess, st)
+                _report_improve_isolation(sess, st, a)
                 return
             if pick == "4":
                 raise _LaterChosen()
@@ -1421,19 +1421,21 @@ def _stage4(sess: _Session, st: _Start, a: Answers) -> None:
                 _claude_trade(sess, st, a)
                 _choose_improve_backend(sess, st, a, base_url, probe,
                                         default_backend="claude" if pick == "1" else "codex")
-                _report_improve_isolation(sess, st)
+                _report_improve_isolation(sess, st, a)
                 return
             if _stage4_remote(sess, st, a):
-                _report_improve_isolation(sess, st)
+                _report_improve_isolation(sess, st, a)
                 return
         except _LaterChosen:
             _apply_later(sess, a)
-            _report_improve_isolation(sess, st)
+            _report_improve_isolation(sess, st, a)
             return
 
 
-def _report_improve_isolation(sess: _Session, st: _Start) -> None:
-    if st.landlock_ok and not st.improve_isolation_ok:
+def _report_improve_isolation(sess: _Session, st: _Start, a: Answers) -> None:
+    if (st.landlock_ok and not st.improve_isolation_ok
+            and a.improve_backend in {"claude", "codex"}
+            and isinstance(a.llm_improve, dict) and a.llm_improve.get("result") == "ok"):
         sess.say("改善の実往復の試験は、この kernel では隔離が使えないため行いません。")
 
 
