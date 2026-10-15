@@ -306,6 +306,14 @@ def test_no_systemd_gives_manual_start_guidance_and_places_nothing(tmp_path, set
     assert not (tmp_path / "u").exists()
 
 
+def test_missing_systemctl_is_not_reported_as_a_missing_user_session(tmp_path, settings):
+    root = make_repo(tmp_path)
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=Calls(results={"systemctl --user": 1}), check_run=Calls(),
+                        which=lambda name: None, env={"HOME": str(tmp_path)})
+    assert result.reason_code == "systemd_unavailable"
+
+
 def test_systemctl_available_is_false_when_the_user_manager_fails():
     assert systemctl_available(Calls(results={"systemctl --user": 1})) is False
     assert systemctl_available(Calls()) is True

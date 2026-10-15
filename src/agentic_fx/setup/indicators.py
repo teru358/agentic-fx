@@ -111,6 +111,7 @@ def ask_selection(io: IndicatorIO, rows: list[IndicatorRow]) -> list[str]:
         mark = "  (配備済み・既定で外れています)" if row.deployed else ""
         io.stdout(f"{index}. {row.name}: {row.summary}{mark}")
     default_chosen = [row.name for row in rows if not row.deployed]
+    io.stdout("登録はあなたの確認として記録されます")
     while True:
         answer = io.ask(f"標準指標 {len(default_chosen)} 本を登録します [Y/n] (e = 外す番号を選ぶ)", "Y")
         normalized = (answer or "Y").strip().lower()

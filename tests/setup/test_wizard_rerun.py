@@ -11,6 +11,7 @@ from agentic_fx.core.scheduler import scheduled_period
 from agentic_fx.setup.preflight import PreflightFailure
 from agentic_fx.setup.settings_edit import edit_settings
 from agentic_fx.setup.wizard import run_wizard
+from agentic_fx.setup import wizard
 from agentic_fx.store import orders
 from agentic_fx.store.db import connect
 
@@ -189,6 +190,27 @@ def test_timeframe_menu_selects_thirty_minutes_by_number_and_lists_every_interva
     assert settings.datafeed.decision_timeframes == ["30m"]
     for label in ("1m:", "5m:", "1. 15m", "2. 30m", "3. 1h (推奨)", "4h:", "1d:"):
         assert label in io.text
+
+
+def test_no_selectable_timeframe_returns_to_the_first_question(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    monkeypatch.setattr(wizard, "worker_ceiling", lambda settings: SimpleNamespace(total=3601))
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("段 2 からやり直す", "a")))
+    assert run_wizard(root, io, deps) == 1, io.text
+    assert "判断の上限時間 (3601 秒) が長すぎて選べる足がありません" in io.text
+
+
+def test_excluded_current_timeframe_uses_the_first_selectable_default(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    monkeypatch.setattr(wizard, "worker_ceiling", lambda settings: SimpleNamespace(total=1800))
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO([""])
+    settings = load_settings_text((root / "config" / "settings.yaml.example").read_text())
+    start = wizard._Start("fresh", "", settings, None, False, None, True, True, {})
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["USDJPY"], 1_000_000, timeframe="15m")
+    wizard._stage5(wizard._Session(root, io, deps), start, answers)
+    assert answers.timeframe == "1h"
 
 
 def _waves(root):

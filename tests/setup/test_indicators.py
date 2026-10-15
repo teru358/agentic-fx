@@ -125,6 +125,15 @@ def test_yes_selects_all_standard_indicators():
     assert ind.ask_selection(ScriptIO(["y"]), rows()) == NAMES
 
 
+def test_eof_does_not_adopt_the_default_selection():
+    class EofIO(ScriptIO):
+        def ask(self, prompt, default):
+            raise EOFError
+
+    with pytest.raises(EOFError):
+        ind.ask_selection(EofIO([]), rows())
+
+
 def test_invalid_confirmation_answers_repeat_without_recursion_then_accept_yes():
     io = ScriptIO(["maybe", "?", "y"])
 

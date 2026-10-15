@@ -949,6 +949,8 @@ def _stage3(sess: _Session, st: _Start, a: Answers) -> None:
             a.bridge_plan = "connected"
             sess.say("bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。"
                      "daemon は `.env` の鍵で接続します。")
+            if not _env_value(sess.root, sess.deps.environ, "MT5_BRIDGE_API_KEY"):
+                sess.say("`.env` に MT5_BRIDGE_API_KEY がありません。段 8 で確認します")
             return
         sess.say(_PRICE_FAILURE_TEXT.get(reason, "接続できませんでした。"))
         action = sess.choice("[r] 再試行 / [2] 『使う予定・未準備』として進む / [u] URL を入れ直す",
@@ -1485,15 +1487,6 @@ def _candidate_settings(st: _Start, a: Answers) -> Settings:
     return st.base_settings
 
 
-def _timeframe_problem(candidate: Settings, timeframe: str) -> str | None:
-    width = sources.INTERVAL_MIN[timeframe] * 60
-    ceiling = worker_ceiling(candidate).total
-    if ceiling >= width:
-        return (f"判断足 {timeframe} ({width:.0f} 秒) は、1 回の判断の上限 {ceiling:.0f} 秒より短いため使えません。"
-                "15m 以上を選ぶか、llama_swap.timeout_sec を下げてください。")
-    return None
-
-
 def _deployed_strategy_timeframes(sess: _Session) -> list[tuple[str, str | None]]:
     db_path = sess.root / "data" / "agentic.db"
     settings_path = sess.root / "config" / "settings.yaml"
@@ -1520,7 +1513,13 @@ def _stage5(sess: _Session, st: _Start, a: Answers) -> None:
     ceiling = worker_ceiling(candidate).total
     keys = tuple(key for key, minutes in sources.INTERVAL_MIN.items()
                  if minutes * 60 > ceiling and minutes < MAX_STORED_DECISION_INTERVAL_MIN)
-    default = a.timeframe if a.timeframe in keys else "1h"
+    if not keys:
+        sess.say(f"判断の上限時間 ({ceiling:.0f} 秒) が長すぎて選べる足がありません。"
+                 "`llama_swap.timeout_sec` を下げてから `afx init` を再実行してください")
+        if sess.choice("[r] 段 2 へ / [a] 中止", ("r", "a"), "a") == "r":
+            raise _Back(0)
+        raise _Exit(RC_STOPPED)
+    default = a.timeframe if a.timeframe in keys else keys[0]
     for key, minutes in sources.INTERVAL_MIN.items():
         if key in keys:
             mark = " (推奨)" if key == "1h" else ""
@@ -1679,19 +1678,10 @@ def _open_order_count(root: Path) -> int | None:
         conn.close()
 
 
-def _unverified_items(a: Answers) -> list[str]:
-    labels = (("価格源", a.price), ("取引判断の LLM", a.llm_trade), ("改善の LLM", a.llm_improve))
-    items = []
-    for label, record in labels:
-        if record.get("result") != "ok":
-            reason = record.get("reason_code")
-            items.append(f"{label}: {record.get('result', 'unverified')}" + (f" ({reason})" if reason else ""))
-    return items
-
-
 def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, ...]:
     key = "あり" if a.bridge_key == "yes" else "なし" if a.bridge_key == "no" else "不明"
-    price = "確認済み" if a.price.get("result") == "ok" else "bridge の接続は未確認"
+    price_ok = a.price.get("result") == "ok"
+    price = "確認済み" if price_ok else ("bridge の接続は未確認" if a.source == "mt5" else "価格の取得は未確認")
     source = (f"価格源: MT5 bridge（{a.bridge_url or 'URL 未設定'}、鍵 {key}、{price}）"
               if a.source == "mt5" else f"価格源: {a.source}（{price}）")
     trade = a.trade_backend or settings.runner.trade.backend
@@ -1702,6 +1692,15 @@ def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, 
     at = a.improve_at or settings.schedule.improve_at
     first = "次の予定まで待つ" if a.wait_first else "起動直後に 1 本走らせる"
     resident = "常駐サービスとして動かす" if a.daemon else "手動起動で使う"
+    unverified: list[str] = []
+    if not price_ok:
+        label = "bridge の接続" if a.source == "mt5" else "価格の取得"
+        reason = a.price.get("reason_code")
+        unverified.append(f"{label} は未確認です" + (f" ({reason})" if reason else ""))
+    for label, record in (("取引判断の LLM", a.llm_trade), ("改善の LLM", a.llm_improve)):
+        if record.get("result") != "ok":
+            reason = record.get("reason_code")
+            unverified.append(f"{label} は未確認です" + (f" ({reason})" if reason else ""))
     return (
         source,
         f"取引判断と改善: {trade}（{trade_model}）/ {improve}（{improve_model}）",
@@ -1710,6 +1709,7 @@ def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, 
         f"常駐: {resident}",
         "作るもの: settings.yaml、DB、状態、確認記録。",
         "このあと尋ねること: 標準指標、方針文と最初の課題、常駐化と外から見る手段。",
+        *unverified,
     )
 
 
@@ -2004,39 +2004,49 @@ def _backlog_count(root: Path) -> int | None:
 
 _POLICY_EXAMPLES = (
     "ペーパー運用。実資金の発注は行わない。",
-    "対象は USDJPY の 1 時間足。指標発表の前後 30 分は新規に入らない。",
+    "対象は {pair} の {timeframe} 足。指標発表の前後 30 分は新規に入らない。",
     "選別して勝つを優先し、取引回数より負けを減らす提案を評価する。",
 )
-_BACKLOG_EXAMPLE = "標準指標だけで組める 1 時間足の押し目買い戦略候補を 1 本作り、直近 3 ヶ月の履歴で PF と最大ドローダウンを測る"
+_BACKLOG_EXAMPLE = "標準指標だけで組める {timeframe} 足の押し目買い戦略候補を 1 本作り、直近 3 ヶ月の履歴で PF と最大ドローダウンを測る"
 
 
-def _stage12(sess: _Session) -> None:
+def _stage12(sess: _Session, a: Answers | None) -> None:
     sess.say("")
     sess.say("[段 12 方針文と最初の課題]")
     path = directives_path(sess.root)
     count = _backlog_count(sess.root)
     sess.say(f"既存の方針文: {_text_length(path)} 文字 / 改善課題: {count if count is not None else '不明'} 件")
     sess.say("方針文は取引判断と改善の全 mission に注入される運用者の方針です。")
-    for example in _POLICY_EXAMPLES:
+    if a is None:
+        settings = _load_settings((sess.root / "config" / "settings.yaml").read_text(encoding="utf-8"))
+        pair, timeframe = settings.pairs[0], settings.datafeed.decision_timeframe
+    else:
+        pair, timeframe = a.pairs[0], a.timeframe
+    examples = tuple(example.format(pair=pair, timeframe=timeframe) for example in _POLICY_EXAMPLES)
+    backlog_example = _BACKLOG_EXAMPLE.format(timeframe=timeframe)
+    for example in examples:
         sess.say(f"例: 「{example}」")
     sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
     written = 0
     activity = ActivityLog(sess.root / "logs" / "activity.log")
     while True:
         raw = sess.ask("方針文: ", allow_quit=False)
-        entries = _POLICY_EXAMPLES if raw == "e" else (" ".join(raw.split()),)
+        entries = examples if raw == "e" else (" ".join(raw.split()),)
         if not entries[0]:
             break
         for text in entries:
+            if text in (_read_text(path) or ""):
+                sess.say("方針文は追加済みです。")
+                continue
             try:
                 append_policy_directive(path, activity, text)
                 written += 1
             except OSError as error:
                 sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
-                break
+                return
     sess.say(f"方針文を {written} 行書きました。")
     sess.say("課題は改善ループが最初に取り組む 1 件です。")
-    sess.say(f"例: 「{_BACKLOG_EXAMPLE}」")
+    sess.say(f"例: 「{backlog_example}」")
     sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
     added = 0
     conn = None
@@ -2045,7 +2055,7 @@ def _stage12(sess: _Session) -> None:
         while True:
             raw = sess.ask("最初の課題: ", allow_quit=False)
             if raw == "e":
-                raw = _BACKLOG_EXAMPLE
+                raw = backlog_example
             display, _removed = normalize_idea_display(raw)
             if not display:
                 break
@@ -2054,6 +2064,10 @@ def _stage12(sess: _Session) -> None:
                 if not sess.yesno("このまま追加しますか", False):
                     continue
             try:
+                if conn.execute("SELECT 1 FROM improvement_backlog WHERE idea_norm=? LIMIT 1",
+                                (display.strip().lower(),)).fetchone() is not None:
+                    sess.say("課題は追加済みです。")
+                    continue
                 add_backlog_idea(conn, activity, display, sess.now(), via="init")
                 added += 1
             except (sqlite3.Error, OSError) as error:
@@ -2167,7 +2181,11 @@ def _stage13(sess: _Session, settings: Settings, *, resume_handoff: bool, daemon
     sess.say("[段 13 常駐化と外から見る手段]")
     if not resume_handoff and not daemon:
         sess.say("手動起動: `uv run afx`。常駐に切り替えるときは `afx init` を再実行してください。")
-        _update_record(sess, unit="not_installed", start=_plain_record("skipped", sess.now_iso(), "declined"))
+        unit_dir = deps.unit_dir or unit_module.default_unit_dir(deps.environ)
+        unit_value = "installed" if (unit_dir / "afx.service").is_file() else "not_installed"
+        if unit_value == "installed":
+            sess.say("既存の unit は残します。止めるには `systemctl --user disable --now afx`")
+        _update_record(sess, unit=unit_value, start=_plain_record("skipped", sess.now_iso(), "declined"))
         return
     if resume_handoff:
         sess.say("前回は外から見る手段の設定の途中で止まりました。unit は設置済みです。手順 3 から続けます。")
@@ -2334,7 +2352,7 @@ def run_wizard(root: Path, io: WizardIO, deps: WizardDeps | None = None) -> int:
                 settings = plan.new_settings
                 _verify_improve_backend(sess, answers)
             _stage11(sess, settings, sess.lease)
-            _stage12(sess)
+            _stage12(sess, answers)
             _stage13(sess, settings, resume_handoff=False,
                      daemon=answers.daemon if answers else settings.api.enabled)
             _stage14(sess, settings)
