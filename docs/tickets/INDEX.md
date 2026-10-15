@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 151 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -42,7 +42,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (126)
+## 設計待ち (127)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -143,6 +143,7 @@
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
 | [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
 | [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
+| [wizard-stage13-linger-prompt-duplicate](open/wizard-stage13-linger-prompt-duplicate.md) | 低 | 2026-10-15 | 段 13 の linger の案内が問いの直後に同文で繰り返される |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |

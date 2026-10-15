@@ -25,3 +25,4 @@ related: [first-run-setup]
 
 - 2026-10-14: 起票。
 - 2026-10-14: 状態: 裁定待ち — 受入 1 回目の回避は [2] で進む
+- 2026-10-15: 優先: 中 — 受入 2 回目 (2026-10-15): [2] planned で進めた後、daemon は .env の鍵で bridge を読み afx ctl status は data: ready なのに、未完手順には「MT5 bridge はまだつながっていません」が残る。pending_steps が記録の bridge_plan=planned だけを見て daemon の実観測 (data_state=ready) を見ていない。是正時は「record が planned でも data_state が ready なら出さない」を足す

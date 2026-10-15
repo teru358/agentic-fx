@@ -24,3 +24,4 @@ setup/pending_facts.collect_pending_facts は required_env_keys の有無を os.
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-15: 優先: 中 — 受入 2 回目 (2026-10-15) で裏付け: ウィザード段 14 では「.env に鍵がありません」が出るが、daemon の afx ctl status では出ない (daemon は load_dotenv 済み)
