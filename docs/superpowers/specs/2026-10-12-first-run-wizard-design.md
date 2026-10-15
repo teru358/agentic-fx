@@ -1,4 +1,4 @@
-# [first-run-setup] 初期設定ウィザード 設計書 (v1.6)
+# [first-run-setup] 初期設定ウィザード 設計書 (v1.7)
 
 作成日: 2026-10-02 (v0.1)。v0.2 改訂: 2026-10-12。v0.3 改訂: 2026-10-12。v0.4 改訂: 2026-10-12。v0.5 改訂: 2026-10-12。対象 commit: main `f01f903` (+ 未追跡 `deploy/`)。v0.1 は `3b4213d` を対象にした。
 入力: `tmp/design-first-run/inventory.md` (現状の全数調査)、`tmp/design-first-run/wizard-flow-and-decisions.md` (叩き台・論点・**末尾の裁定記録**)、B-2 実測 `tmp/design-first-run/b2-measure/` (生ログ `run1.log` `run2.log`、本書 付録 A に要約)。
@@ -120,6 +120,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
   - 排他 (B-12、§4.2): 先に `data/ops/setup.lock` を非ブロッキングで取り、次に `data/instance.lock` を取る (この順序は固定)。setup.lock が取れなければ「別の `afx init` または `afx ops enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」rc=2。instance.lock (`store/instance_lock.py:24`) が取れなければ「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください (`uv run main.py` で手動起動しているなら、その端末で終了してください)。設定・DB は変更していません。」rc=2。取れた 2 つの lock は、§4.2 の引き渡しの規則に従ってウィザード終了まで保持する。注: lock を取るために `data/` と `data/ops/` ディレクトリが作られる (`instance_lock.py:33` の mkdir と、afx ops enable の setup.lock と同じ fd 相対・`O_NOFOLLOW` の作法)。これは集める層で唯一の書き込みで、中身は空の lock ファイル 2 つだけ。
   - 非 tty で `--non-interactive` 無し → 「対話が必要です (標準入力が端末ではありません)。自動構築では `afx init --non-interactive` を使ってください。」rc=2。
   - Landlock (`core/landlock.is_available()`) が偽 → 「この環境では Landlock が使えません (x86_64 かつ ABI 3 以上が必要)。標準指標の導入と改善ループは使えません。取引判断のペーパー運用だけ設定できます。続けますか [y/N]」。続けた場合、段 7・段 11 は説明だけ出して飛ばす。
+  - Landlock は使えるが改善 worker の隔離が要求する ABI (`core/improve_admission.MIN_LANDLOCK_ABI` = 8、Linux 6.18 以降) に届かない (`core/landlock.landlock_abi()` < 8) → 「この kernel (Landlock ABI N) では改善ループの隔離が使えません (ABI 8 以上、Linux 6.18 以降が必要)。取引判断と標準指標は設定できます。改善は kernel を更新するまで止まります。」と表示して続行 (質問なし)。記録の `landlock` は `ok` のまま reason `landlock_abi_too_old` を添え、未完の手順に `improve_isolation_unavailable` を出す。段 4 の実往復 (`verify-backend`) の問いは出さず、段 7 は周期を尋ねたうえで「この kernel では改善は走りません」を 1 行添える (v1.7)。
   - pytest が import できない → 「plugin の採用審査 (gate) が pytest を使います。`uv sync` (dev 依存を含む既定) で入ります。」(警告、続行可。`uv sync --no-dev` で本当に落ちるかは未確認 — inventory C-9)
   - 未終端の `afx ops enable` (enroll 中の印 `data/ops/enroll_in_progress`、`store/enroll_marker.py`) → 「`afx ops enable <feature>` が途中で止まっています。同じコマンドを再実行して完了させてください。その間 afx は起動できません。」rc=2。印があるとサービスは終了コード 75 で即終了するので、先に進んでも段 13 の起動が成立しない。
   - 未終端の確定 (`data/state/setup_in_progress`、§4.3) → 「前回の初期設定が途中で止まっています。このまま続けて収束させます (サービスはこの印がある間、起動を拒否します)。」と表示して続行する (rc=2 で止めない。回復はこの再実行が担う)。印が壊れていて読めないときも同じ。再開地点の決め方は §4.3。
@@ -205,7 +206,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - **検査**:
   - local / opencode: llama-swap の URL を尋ね (既定 `http://localhost:8080/v1`、userinfo は拒否)、`GET {url}/models` の一覧を番号で選ばせる (**ロードはしない**: `/models` はロード不要、`/props` と chat はロードさせる — `service.py:98-112`)。一覧が取れなければモデル名を手入力にし、記録は `unverified`。
   - opencode の `context_limit`: 「llama-swap に問い合わせると、モデルがロードされ数十秒〜数分かかることがあります。問い合わせますか」で yes のときだけ `/props` (`service.py:117-140`) を読み、値を提案。no なら手入力。`improve.llama_swap_verified` は**ウィザードは true にしない** (人が `afx improve verify-backend --backend opencode` 合格後に手で書く現行の規律、`backtest/cli.py:773-775`)。未完の手順に残す。
-  - claude / codex: bin の解決 (`shutil.which` → 絶対パス)、`--version`、認証ファイルの**存在** (`service.py:210-259` の既存関数を候補値で呼ぶ)。認証ファイルは開かない・写さない。codex は ELF の絶対パスが要る (`service.py:210-235`) ので、見つからなければ「`runner.codex.bin` に codex の実体 (node のラッパーではない) の絶対パスを入れてください」。
+  - claude / codex: bin の解決 (`shutil.which` → 絶対パス)、`--version`、認証ファイルの**存在** (`service.py:210-259` の既存関数を候補値で呼ぶ)。認証ファイルは開かない・写さない。claude は `which` で見つかった絶対パス (symlink は辿らない) を `runner.claude.bin` に書く (example の既定 `claude` は裸の名前で、mission 側は裸の名前を cwd 相対に解決しないため。既に絶対パスの実行形式なら触らない。v1.7)。codex は ELF の絶対パスが要る (`service.py:210-235`) ので、見つからなければ「`runner.codex.bin` に codex の実体 (node のラッパーではない) の絶対パスを入れてください」。
   - 秘密 env (検査⑤ `service.py:277-327`): CLI backend を選んだとき、**ウィザード自身の環境**に `_API_KEY` 等を含む名前があれば「この端末の環境変数 FOO_TOKEN は CLI backend の起動を拒否させます (値は表示しません)。unset するか `.env` に移してください。unit から起動する場合は unit の環境で判定されます」(unit 側は §6 の `afx check` で判定)。
   - 実動作の確認: 運用者 shell の非隔離の `afx improve verify-backend --backend <名>` (内部の sentinel `OPERATOR_SHELL_NO_ISOLATION`、`backtest/cli.py` の `_improve_verify_backend`)。「1 回だけ LLM を実際に呼んで往復を確かめます。service の追加隔離 (seccomp / cgroup) なしの疎通確認で、隔離下で動くことの保証ではありません。claude / codex ではサブスク枠を少し使います。実行しますか [y/N]」。既定 N。結果は `llm_improve` に記録し、`ok` は疎通のみを意味する (CLI 自身も同じ断り書きを標準出力に出す)。
   - 隔離適合はウィザードでは試せない。service 起動時の admission (canary + 自己試験) が判定し、技術ログ (journal) の起動行 `improve isolation: enabled; backend=… admitted=yes|no [reason=…] fingerprint=…` に出る (`core/improve_admission.py`)。ウィザードは段 13 の起動後にこの行を探して見せ (§6.4)、見つからなければ「admission は起動後しばらくかかります。`journalctl --user -u afx | grep 'improve isolation'` で確認してください」と案内する。`admitted=no` の間、CLI backend (claude / codex / opencode) の改善 mission は隔離できないため止まる (`sandbox_unavailable` で fail closed)。backend が local のときの行は `is not a CLI backend` となり、admission の対象外。
@@ -219,7 +220,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
   7. **別ホストの llama-swap** (選択肢 3): URL を入れ、`GET {url}/models` を 1 回試す。成功 = モデル一覧から選ぶ。失敗 = 接続不可 (`connect_error`)、401/403 (`auth_unsupported`: 「この URL は認証を要求しています。ウィザードは認証つきの llama-swap に対応していません。認証不要の URL を使うか、後で設定してください」)、一覧が空 (`model_not_found`)。認証を要しない前提を表示する。URL に userinfo があれば拒否 (既存)。
   8. **未導入・未ログインでも完了する**: 上の 2〜3・6 で解決しなくても「後で設定する」または「未確認のまま進む」で段 9 に進め、記録に `bin_not_found` / `credentials_missing` が残り、未完の手順が手順書の節名つきで出し続ける。これらは `afx check` の warning なので unit は設置され、起動後は degraded と未完の手順を表示する (§6.2、§6.4)。unit の起動が CLI の不在で拒否されて再起動ループにならないよう、warning に分類した条件は service 側の起動前検査でも起動拒否にせず degraded にする (T7a。fatal / warning の分類は `afx check` と service で同じ関数を使う)。
 - **失敗時**: 「未確認のまま進む」を選べる (B-6 b)。記録は `llm_trade: unverified | failed`、`llm_improve: …`。
-- **書く予定の値**: `runner.trade.{backend,model}`、`runner.improve.{backend,model}`、`llama_swap.base_url`、選んだ backend の `runner.<backend>.*` だけ。使わない backend の値は触らない (`runner.codex` は使わなくてもキー必須でプレースホルダのまま検査をすり抜ける — inventory C-9。これは現状維持)。
+- **書く予定の値**: `runner.trade.{backend,model}`、`runner.improve.{backend,model}`、`llama_swap.base_url`、選んだ backend の `runner.<backend>.*` だけ (`runner.claude.bin` は上記の絶対パス)。使わない backend の値は触らない (`runner.codex` は使わなくてもキー必須でプレースホルダのまま検査をすり抜ける — inventory C-9。これは現状維持)。
 
 ### 段 5: 判断足 (トレード足)
 
@@ -299,7 +300,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 ### 段 11: 標準指標の採用 (B-9 a+c)
 
-- Landlock が無ければ説明だけで飛ばす。
+- Landlock が無ければ説明だけで飛ばす。改善隔離の ABI が足りないとき (段 0) は周期を尋ねたうえで「この kernel では改善は走りません」を 1 行添える。
 - **表示**: 9 本の一覧 (sma, ema, rsi, macd, bollinger, atr, adx, stochastic, ichimoku — `docs/examples/plugins/`)。各行に「何を計算するか」1 行と、既に同名が配備済みかどうか。「指標だけでは取引しません。改善ループが戦略を作るときの材料になります。」
 - **尋ねること**: 全部を採用候補にした一覧を見せ、外したい番号を入力させる (空 Enter = この一覧で進む)。続けて「この N 本を採用します。採用はあなたの確認として記録されます (decided_by=human_cli)。よろしいですか [y/N]」。**既定 N** (自動 yes にしない)。
 - 同名が配備済み: 既定で外す。「rsi は既に配備されています。新しい版へ切り替えると、rsi を使う strategy の固定が外れることがあります (手順書 `docs/operations/indicator-initial-set-deploy-2026-09-19.md` の (0))。」
@@ -454,7 +455,7 @@ marker が壊れて読めないとき: 内容 (sha) が無いので「前回の�
    1. 当 instance の `afx-ops@<feature>` と `afx.service` を `stop` し、`disable` する。
    2. `~/.config/agentic-fx/` の当 instance の分 (所有を確かめた feature の config / secret、`api/<instance_id>/`) を消し、空になった親だけ `rmdir`。
    3. unit のファイルを消す: `afx-ops@.service`、drop-in、**最後に** `afx.service` と `afx.service.bak-*`。`afx-ops@.service` か drop-in が消せなかったときは `afx.service` を所有の証拠として残し (再実行で続きを消す)、rc≠0。`daemon-reload` と `reset-failed` は primary unit が当 instance 所有のときだけ実行し、`reset-failed` の非 0 (unit が not loaded) は許容する。
-   4. repo 内の固定表 (`data/` と `.env` 以外)。
+   4. repo 内の固定表 (`data/` と `.env` 以外)。repo 内の削除は `rm -rf` の前に `chmod -R u+rwX` で書込権限を戻す (plugin の版は `plugins/.versions/<name>/<hash>/` に dir 0o500 / file 0o400 の不変スナップショットとして置かれ、そのままでは消せない。symlink は chmod も rm も辿らない。v1.7)。
    5. linger: 上の規則で解除する計画のときだけ `loginctl disable-linger` を実行する (所有記録を読むのはここ。`data/` を消す直前。他の kind に失敗があれば解除しない)。
    6. `data/` (`setup.json` の所有記録は linger の処理後に消える。他の kind に失敗があれば残す)。
    7. `--include-env` のときだけ `.env`。
@@ -465,7 +466,7 @@ marker が壊れて読めないとき: 内容 (sha) が無いので「前回の�
 - unit 以外の systemd 状態と、`~/.config` の `agentic-fx/` 以外には触れない。他 instance の鍵・feature の config・secret は不変。
 - このマシンのような稼働中の環境で打っても、手順 3 の確認を通さない限り何も消えない。試験は `tmp_path` の git clone、`HOME` と `XDG_CONFIG_HOME` を tmp に向けた環境、`PATH` 先頭に置いた fake の `systemctl` / `loginctl` だけで行い、実物の unit・鍵には触れない (conftest のガード対象)。
 - **リセットの製品契約** (AC-36): 必須の取り除き対象は、wizard / daemon が所有する設定・データ・unit・鍵に限る (上の規則)。それ以外 (Python / uv の通常の生成物の `__pycache__/`、`.venv/` など) を取り除くことは契約に含めない。
-- **試験の clean 判定** (AC-36a): 実 git clone の試験は、ウィザードの実行**前**の `git status --porcelain=v1 -z --ignored=matching` を baseline として保存し、reset 後の同じ出力と、NUL 区切りの repo 相対 path の集合で完全に比較する。reset が baseline に無い path として新たに残してよいのは固定の集合だけ (`.env` (`--include-env` を付けなかったとき)、`.pytest_cache/`、`.ruff_cache/`、`.venv/`、`afx-ops/.venv/`)。ディレクトリ単位で許可した path (`.venv/` など) は、その内部を検査の対象外とする。それ以外の新しい path が出れば失敗する。`PYTHONDONTWRITEBYTECODE=1` で `__pycache__/` を作らせない設定に頼った結果だけを「実機の clean clone と同じ」とは呼ばない (baseline との差分が、通常実行の生成物を reset の所有物と取り違えず、未知の新規 artifact は検出する)。
+- **試験の clean 判定** (AC-36a): 実 git clone の試験は、ウィザードの実行**前**の `git status --porcelain=v1 -z --ignored=matching` を baseline として保存し、reset 後の同じ出力と、NUL 区切りの repo 相対 path の集合で完全に比較する。reset が baseline に無い path として新たに残してよいのは固定の集合だけ (`.env` (`--include-env` を付けなかったとき)、`.pytest_cache/`、`.ruff_cache/`、`.venv/`、`afx-ops/.venv/`、`**/__pycache__/`、`tmp/`。後の 2 つは afx の通常稼働で増える無害な生成物で、reset の所有物ではない (2026-10-15 裁定))。ディレクトリ単位で許可した path (`.venv/` など) は、その内部を検査の対象外とする。それ以外の新しい path が出れば失敗する。`PYTHONDONTWRITEBYTECODE=1` で `__pycache__/` を作らせない設定に頼った結果だけを「実機の clean clone と同じ」とは呼ばない (baseline との差分が、通常実行の生成物を reset の所有物と取り違えず、未知の新規 artifact は検出する)。
 
 ---
 
@@ -948,3 +949,4 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 | 2026-10-13 | v1.4 | 確認記録 `linger` に `not_checked` (確定 1 の時点の値) を追加し、`linger_off` は `declined` / `failed` のときだけ出す。marker の内容形式を固定 (`phase` / `started_at` / `settings_sha256` の `key=value` 行、handoff は sha 無し)。モデル一覧の取得を `setup/checks.py::list_llama_swap_models` に置く | ウィザード本体の実装で、段 10 の時点に書ける linger の値と marker の読み方が未定義だった | |
 | 2026-10-13 | v1.5 | §3 段 4: backend を選んだ後にモデルを選ぶ (claude は alias 固定表で既定 `sonnet`、codex は `codex app-server` の `model/list` で既定 `terra`、opencode は `opencode models` の一覧から必ず選ぶ、10 件超は絞り込み 1 問、一覧失敗は固定 reason `model_list_unavailable` で手入力)。runner は settings の `model` をそのまま `--model` に渡し既定を持たないため | ユーザー裁定 (2026-10-13) | (本 commit) |
 | 2026-10-14 | v1.6 | §4.5 step 5 の取り除く順序を §5 の「リセット」列と実装に揃える (config → unit (primary は最後、補助 unit の失敗時は残す) → repo → linger → `data/` → `.env`。`daemon-reload` / `reset-failed` は primary 所有時のみ、`reset-failed` の非 0 許容)。段 11 の標準指標は T6 の `run_indicator_stage` を既定で呼ぶ | T15b の閉鎖確認で §4.5 と §5 の順序が食い違っていたため。T5a と T6 の配線 | |
+| 2026-10-15 | v1.7 | 受入 2 回目 (stream-svr) の是正: 段 0 で改善隔離の Landlock ABI 8 要件を判定して先に言い、段 4 の実往復と段 7 に反映、記録 reason と未完手順 `improve_isolation_unavailable`。段 4 は claude の実体の絶対パスを `runner.claude.bin` に書く (裸の名前は mission 側で cwd 相対に解決しない)。§4.5 の repo 内削除は `chmod -R u+rwX` を先に行う。AC-36a の許可集合に `**/__pycache__/` と `tmp/` | チケット wizard-check-improve-landlock-abi-upfront / wizard-write-absolute-cli-bin / reset-cannot-remove-readonly-plugin-versions (いずれも実機で再現) | |
