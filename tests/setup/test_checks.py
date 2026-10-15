@@ -34,6 +34,10 @@ def test_resolve_cli_bin_rejects_relative_configured_paths(configured, tmp_path,
     assert resolve_cli_bin(configured) is None
 
 
+def test_resolve_cli_bin_treats_an_unknown_home_user_as_not_found():
+    assert resolve_cli_bin("~this-user-must-not-exist-afx/claude") is None
+
+
 def test_resolve_cli_bin_expands_home_before_judging_absoluteness(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     assert resolve_cli_bin("~/.local/bin/claude") == tmp_path / ".local" / "bin" / "claude"

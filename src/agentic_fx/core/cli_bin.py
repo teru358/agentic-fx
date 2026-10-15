@@ -26,7 +26,10 @@ def resolve_cli_bin(value: str, *, which: Callable[[str], str | None] | None = N
     bare name goes through ``which`` and the result must itself be absolute
     (a relative ``PATH`` element would otherwise point into the cwd)."""
     lookup = shutil.which if which is None else which
-    configured = Path(value).expanduser()
+    try:
+        configured = Path(value).expanduser()
+    except RuntimeError:  # ``~unknown-user/...``: no home directory to expand into
+        return None
     if configured.is_absolute():
         return configured
     if "/" in value:
