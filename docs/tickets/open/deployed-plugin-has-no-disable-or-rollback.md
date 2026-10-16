@@ -28,3 +28,4 @@ related: [retire-symlink-deployed-plugin]
 ## 経緯
 
 - 2026-10-04: 起票。
+- 2026-10-16: 状態: 設計待ち — 2026-10-16 ユーザー承認で設計着手 (C0 を sonnet、tmp/design-plugin-rollback/C0.md)。retire-symlink-deployed-plugin を統合
