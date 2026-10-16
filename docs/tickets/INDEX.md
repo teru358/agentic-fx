@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 143 件。完了分は closed/。
+未完了: 144 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -40,7 +40,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (121)
+## 設計待ち (122)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -136,6 +136,7 @@
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
 | [bridge-expose-margin-mode](open/bridge-expose-margin-mode.md) | 低 | 2026-10-16 | bridge の /account に margin_mode (netting / hedging) を出す |
 | [per-strategy-virtual-books](open/per-strategy-virtual-books.md) | 低 | 2026-10-16 | 戦略ごとの実帳簿 (同一口座内の仮想分割、両建ては戦略間のみ) |
+| [wizard-script-conventions-and-selection-ui](open/wizard-script-conventions-and-selection-ui.md) | 低 | 2026-10-16 | ウィザード台本の表記規約と選択 UI (矢印選択・色) の整備 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
