@@ -31,7 +31,9 @@ def _signal_due_fn(conn, settings):
     def fn(now):
         if not orders.list_by_status(conn, "open", "pending_fill"):
             return False
-        if not signals.pending_exists(conn):
+        if not signals.pending_exists(
+                conn, now=now,
+                freshness_bars=settings.plugin.signal_freshness_bars):
             return False
         return missions.signals_rate_ok(conn, now, settings)
     return fn
@@ -160,6 +162,7 @@ def test_signal_daily_max_and_rollover_reset(tmp_path):
 
     # 翌取引日 (trading_day_start のロールオーバー後) はカウンタがリセットされる
     next_day = day_start + timedelta(days=1, hours=1)
+    _add_pending_signal(env, bar_ts=next_day - timedelta(hours=1))
     _baseline_cron(env, next_day)
     env.sched.tick(next_day)
     assert env.trade_reasons == ["signal"]

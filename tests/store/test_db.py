@@ -16,6 +16,7 @@ EXPECTED = {
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
+    "plugin_deploy_ops", "plugin_deploy_op_signals",
 }
 
 

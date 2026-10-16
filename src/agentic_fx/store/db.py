@@ -185,6 +185,80 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_switch_journal_open_name
   WHERE phase NOT IN ('decided', 'reverted');
 """
 
+_PLUGIN_DEPLOY_OPEN_PHASE_SQL = (
+    "phase='intent' OR (phase='needs_retry' AND fail_reason='syscall_failed')"
+)
+
+_PLUGIN_DEPLOY_OPS_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_deploy_ops (
+  op_id INTEGER PRIMARY KEY,
+  op_kind TEXT NOT NULL CHECK(op_kind IN
+    ('disable_symlink','rollback_symlink','retire_plain','revoke')),
+  name TEXT NOT NULL,
+  from_kind TEXT NOT NULL CHECK(from_kind IN ('symlink','plain','absent','none')),
+  to_kind TEXT NOT NULL CHECK(to_kind IN ('absent','symlink','retired','none')),
+  from_target TEXT, to_target TEXT, retired_path TEXT,
+  subject_content_hash TEXT, subject_artifact_hash TEXT,
+  target_content_hash TEXT, target_artifact_hash TEXT,
+  approval_id INTEGER,
+  revoke INTEGER NOT NULL CHECK(revoke IN (0,1)),
+  revoke_row_id INTEGER,
+  force INTEGER NOT NULL CHECK(force IN (0,1)),
+  phase TEXT NOT NULL CHECK(phase IN ('intent','done','needs_retry','foreign')),
+  fail_reason TEXT CHECK(fail_reason IN ('verify_failed','syscall_failed')),
+  notify_attempted INTEGER NOT NULL CHECK(notify_attempted IN (0,1)),
+  actor TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  CHECK(
+    (op_kind='disable_symlink' AND from_kind='symlink' AND to_kind='absent'
+     AND from_target IS NOT NULL AND to_target IS NULL AND retired_path IS NULL
+     AND subject_content_hash IS NOT NULL AND subject_artifact_hash IS NOT NULL
+     AND target_content_hash IS NULL AND target_artifact_hash IS NULL)
+    OR
+    (op_kind='rollback_symlink' AND to_kind='symlink' AND to_target IS NOT NULL
+     AND retired_path IS NULL AND target_content_hash IS NOT NULL
+     AND target_artifact_hash IS NOT NULL AND from_kind IN ('symlink','absent')
+     AND ((from_kind='symlink' AND from_target IS NOT NULL
+           AND subject_content_hash IS NOT NULL AND subject_artifact_hash IS NOT NULL)
+          OR (from_kind='absent' AND from_target IS NULL
+              AND subject_content_hash IS NULL AND subject_artifact_hash IS NULL
+              AND revoke=0)))
+    OR
+    (op_kind='retire_plain' AND from_kind='plain' AND to_kind='retired'
+     AND retired_path IS NOT NULL AND from_target IS NULL AND to_target IS NULL
+     AND target_content_hash IS NULL AND target_artifact_hash IS NULL AND revoke=0)
+    OR
+    (op_kind='revoke' AND from_kind='none' AND to_kind='none'
+     AND from_target IS NULL AND to_target IS NULL AND retired_path IS NULL
+     AND subject_content_hash IS NOT NULL AND subject_artifact_hash IS NOT NULL
+     AND target_content_hash IS NULL AND target_artifact_hash IS NULL
+     AND approval_id IS NOT NULL AND revoke=1 AND force=0 AND phase='done')
+  ),
+  CHECK((revoke=1) = (revoke_row_id IS NOT NULL)),
+  CHECK((phase='needs_retry') = (fail_reason IS NOT NULL)),
+  CHECK(fail_reason IS NULL OR fail_reason!='syscall_failed' OR op_kind!='revoke'),
+  CHECK(fail_reason IS NULL OR fail_reason!='verify_failed' OR op_kind='rollback_symlink'),
+  CHECK(revoke=0 OR approval_id IS NOT NULL),
+  CHECK(phase!='intent' OR notify_attempted=0)
+);
+"""
+
+_PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL = f"""
+CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_deploy_ops_open_name
+  ON plugin_deploy_ops(name)
+  WHERE {_PLUGIN_DEPLOY_OPEN_PHASE_SQL};
+"""
+
+_PLUGIN_DEPLOY_OP_SIGNALS_DDL = """
+CREATE TABLE IF NOT EXISTS plugin_deploy_op_signals (
+  op_id INTEGER NOT NULL,
+  signal_id INTEGER NOT NULL,
+  status_at_link TEXT NOT NULL CHECK(status_at_link IN ('pending','claimed')),
+  PRIMARY KEY(op_id, signal_id)
+);
+CREATE INDEX IF NOT EXISTS plugin_deploy_op_signals_signal_id
+  ON plugin_deploy_op_signals(signal_id);
+"""
+
 _IMPROVEMENT_RUNS_MISSION_ID_UNIQUE_DDL = """
 CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
   ON improvement_runs(mission_id)
@@ -320,7 +394,7 @@ CREATE TABLE IF NOT EXISTS candidate_archives (
   created_at TEXT NOT NULL,
   UNIQUE(mission_id, artifact_hash)
 );
-""" + _SIGNALS_V2_DDL + """
+""" + _SIGNALS_V2_DDL + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
 -- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
 -- 当たらず、autoindex のカバリングスキャンになる。定常状態では cutoff を
@@ -426,6 +500,7 @@ TABLE_NAMES = frozenset({
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
+    "plugin_deploy_ops", "plugin_deploy_op_signals",
 })
 
 

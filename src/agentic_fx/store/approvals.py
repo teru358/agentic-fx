@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class AlreadyDecidedError(Exception):
@@ -26,6 +26,50 @@ def create(conn: sqlite3.Connection, kind: str, payload: dict, now: datetime,
         "VALUES (?,?,?,?)",
         (kind, json.dumps(payload, ensure_ascii=False),
          expires_at.isoformat() if expires_at else None, now.isoformat()))
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
+                      now: datetime, actor: str = "human_cli",
+                      commit: bool = True) -> int | None:
+    """Append the rejection that revokes the latest approval for an identity."""
+    candidates: list[tuple[sqlite3.Row, dict]] = []
+    for row in conn.execute(
+            "SELECT * FROM approval_requests WHERE kind='plugin' "
+            "AND decided_at IS NOT NULL"):
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if payload.get("name") == name and payload.get("content_hash") == content_hash:
+            candidates.append((row, payload))
+    if not candidates:
+        raise ValueError(f"no approved plugin approval for {name!r} {content_hash!r}")
+    latest, latest_payload = max(
+        candidates, key=lambda pair: (pair[0]["decided_at"], pair[0]["id"]))
+    if latest["status"] == "rejected":
+        return None
+    approved = [(row, payload) for row, payload in candidates if row["status"] == "approved"]
+    if not approved:
+        raise ValueError(f"no approved plugin approval for {name!r} {content_hash!r}")
+    approval, payload = max(
+        approved, key=lambda pair: (pair[0]["decided_at"], pair[0]["id"]))
+    decided_at = max(now, datetime.fromisoformat(latest["decided_at"]) + timedelta(microseconds=1))
+    revoke_payload = {
+        "name": name,
+        "content_hash": content_hash,
+        "artifact_hash": payload.get("artifact_hash"),
+        "revokes_approval_id": approval["id"],
+    }
+    cur = conn.execute(
+        "INSERT INTO approval_requests "
+        "(kind,payload_json,status,reason,decided_by,decided_at,created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("plugin", json.dumps(revoke_payload, ensure_ascii=False), "rejected",
+         "revoked_by_operator", actor, decided_at.isoformat(), decided_at.isoformat()),
+    )
     if commit:
         conn.commit()
     return cur.lastrowid

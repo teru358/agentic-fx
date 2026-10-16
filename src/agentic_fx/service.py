@@ -1620,7 +1620,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             # ではなく、そもそも判断 Mission を起こす価値が薄い運用判断)。
             if not orders.list_by_status(conn_core, "open", "pending_fill"):
                 return False
-            if not signals.pending_exists(conn_core):
+            if not signals.pending_exists(
+                    conn_core, now=now,
+                    freshness_bars=settings.plugin.signal_freshness_bars):
                 return False
             return missions.signals_rate_ok(conn_core, now, settings)
 

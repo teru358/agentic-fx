@@ -106,7 +106,8 @@ def build(conn: sqlite3.Connection, settings: Settings,
                 f"pair must be one of {settings.pairs}: {pair!r}")
         clamped = _clamp_since_hours(since_hours, max_hours)
         since = clock.now() - timedelta(hours=clamped)
-        rows = signals.recent(conn, pair, since=since)
+        rows = signals.recent(conn, pair, since=since,
+                              exclude_deploy_linked=True)
         result: list[dict] = []
         for row in rows:
             try:
