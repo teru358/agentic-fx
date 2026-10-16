@@ -482,3 +482,120 @@ def test_live_history_journal_clock_regression_is_ordered_by_instant_and_strictl
         "absent", ".versions/alpha/two", ".versions/alpha/one", ".versions/alpha/three"]
     live_before_last = history[-2]["to"]
     assert live_before_last == ".versions/alpha/one"
+
+
+def test_set_phase_keeps_notify_attempted_unless_returning_to_intent(tmp_path):
+    conn = _conn(tmp_path)
+    op_id = _insert_direct(
+        conn, phase="needs_retry", fail_reason="syscall_failed")
+    assert deploy_ops.mark_notify_attempted(conn, op_id)
+    deploy_ops.set_phase(conn, op_id, "done", now=NOW)
+    assert deploy_ops.list_by_name(conn, "alpha")[0]["notify_attempted"] == 1
+
+    retry_id = _insert_direct(
+        conn, name="beta", phase="needs_retry", fail_reason="syscall_failed",
+        notify_attempted=1)
+    deploy_ops.set_phase(conn, retry_id, "intent", now=NOW)
+    row = deploy_ops.get_open_by_name(conn, "beta")
+    assert row["phase"] == "intent"
+    assert row["notify_attempted"] == 0
+
+
+def _decided_plugin_approval(conn, status, decided_at, created_at=NOW):
+    approval_id = approvals.create(
+        conn, "plugin", {"name": "alpha", "content_hash": "content-a",
+                         "artifact_hash": "artifact-a"}, created_at)
+    conn.execute(
+        "UPDATE approval_requests SET status=?, decided_at=?, decided_by='human' "
+        "WHERE id=?", (status, decided_at, approval_id))
+    conn.commit()
+    return approval_id
+
+
+def test_append_revocation_compares_decided_at_as_instants(tmp_path):
+    conn = _conn(tmp_path)
+    approved = _decided_plugin_approval(conn, "approved", "2026-10-16T12:00:01+00:00")
+    _decided_plugin_approval(conn, "rejected", "2026-10-16T21:00:00+09:00")
+    revoked = approvals.append_revocation(
+        conn, "alpha", "content-a", now=NOW + timedelta(seconds=10))
+    assert revoked is not None
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?", (revoked,)
+    ).fetchone()[0])
+    assert payload["revokes_approval_id"] == approved
+
+
+def test_append_revocation_orders_rows_with_and_without_microseconds(tmp_path):
+    conn = _conn(tmp_path)
+    _decided_plugin_approval(conn, "approved", "2026-10-16T12:00:00+00:00")
+    _decided_plugin_approval(conn, "rejected", "2026-10-16T12:00:00.000001+00:00")
+    assert approvals.append_revocation(conn, "alpha", "content-a", now=NOW) is None
+
+
+def test_append_revocation_rejects_naive_decided_at(tmp_path):
+    conn = _conn(tmp_path)
+    _decided_plugin_approval(conn, "approved", "2026-10-16T12:00:00")
+    with pytest.raises(ValueError, match="naive"):
+        approvals.append_revocation(conn, "alpha", "content-a", now=NOW)
+
+
+def _linked_claimed(conn, mission_id, *, link):
+    signal_id = signals.add(
+        conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h",
+        bar_ts=(NOW + timedelta(minutes=1 if link else 2)).isoformat(),
+        kind="signal", payload={}, now=NOW)
+    conn.execute(
+        "UPDATE signals SET status='claimed', claimed_by_mission_id=?, claimed_at=? "
+        "WHERE id=?", (mission_id, NOW.isoformat(), signal_id))
+    if link:
+        deploy_ops.link_signals(
+            conn, _insert_direct(conn, phase="done"), [(signal_id, "claimed")],
+            commit=False)
+    conn.commit()
+    return signal_id
+
+
+def _status(conn, signal_id):
+    return conn.execute("SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()[0]
+
+
+def test_requeue_abandons_linked_claimed_signal_and_keeps_unlinked_pending(tmp_path):
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked = _linked_claimed(conn, mission_id, link=True)
+    assert signals.requeue(conn, linked, now=NOW, max_requeue=3) == "abandoned"
+    assert _status(conn, linked) == "abandoned"
+    plain = _linked_claimed(conn, mission_id, link=False)
+    assert signals.requeue(conn, plain, now=NOW, max_requeue=3) == "pending"
+    assert _status(conn, plain) == "pending"
+
+
+def test_reclaim_expired_abandons_linked_claimed_signal_and_keeps_unlinked_pending(tmp_path):
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked = _linked_claimed(conn, mission_id, link=True)
+    plain = _linked_claimed(conn, mission_id, link=False)
+    statuses = signals.reclaim_expired(
+        conn, now=NOW + timedelta(hours=1), lease_min=10, max_requeue=3)
+    assert sorted(statuses) == ["abandoned", "pending"]
+    assert _status(conn, linked) == "abandoned"
+    assert _status(conn, plain) == "pending"
+
+
+def test_expire_stale_abandons_linked_pending_signal(tmp_path):
+    conn = _conn(tmp_path)
+    stale = signals.add(
+        conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h",
+        bar_ts=(NOW - timedelta(hours=5)).isoformat(), kind="signal", payload={}, now=NOW)
+    deploy_ops.link_signals(conn, _insert_direct(conn, phase="done"), [(stale, "pending")])
+    result = signals.expire_stale(conn, now=NOW, freshness_bars=1)
+    assert result.total == 1
+    assert _status(conn, stale) == "abandoned"
+
+
+def test_pending_exists_is_false_when_only_stale_pending_remains(tmp_path):
+    conn = _conn(tmp_path)
+    signals.add(
+        conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h",
+        bar_ts=(NOW - timedelta(hours=5)).isoformat(), kind="signal", payload={}, now=NOW)
+    assert signals.pending_exists(conn, now=NOW, freshness_bars=1) is False

@@ -185,7 +185,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_switch_journal_open_name
   WHERE phase NOT IN ('decided', 'reverted');
 """
 
-_PLUGIN_DEPLOY_OPEN_PHASE_SQL = (
+OPEN_PHASE_SQL = (
     "phase='intent' OR (phase='needs_retry' AND fail_reason='syscall_failed')"
 )
 
@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS plugin_deploy_ops (
 _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_deploy_ops_open_name
   ON plugin_deploy_ops(name)
-  WHERE {_PLUGIN_DEPLOY_OPEN_PHASE_SQL};
+  WHERE {OPEN_PHASE_SQL};
 """
 
 _PLUGIN_DEPLOY_OP_SIGNALS_DDL = """

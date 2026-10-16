@@ -5,9 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import Iterable, Mapping
 
-from agentic_fx.store.db import _PLUGIN_DEPLOY_OPEN_PHASE_SQL
-
-OPEN_PHASE_SQL = _PLUGIN_DEPLOY_OPEN_PHASE_SQL
+from agentic_fx.store.db import OPEN_PHASE_SQL
 
 
 def is_open(row: Mapping[str, object]) -> bool:
@@ -59,11 +57,15 @@ def insert_intent(
 def set_phase(conn: sqlite3.Connection, op_id: int, phase: str, *, now: datetime,
               fail_reason: str | None = None, notify_attempted: bool | None = None,
               commit: bool = True) -> bool:
-    row = conn.execute("SELECT name FROM plugin_deploy_ops WHERE op_id=?", (op_id,)).fetchone()
+    row = conn.execute(
+        "SELECT name, notify_attempted FROM plugin_deploy_ops WHERE op_id=?",
+        (op_id,)).fetchone()
     if row is None:
         return False
-    if notify_attempted is None:
-        notify_attempted = False if phase == "intent" else False
+    if phase == "intent":
+        notify_attempted = False
+    elif notify_attempted is None:
+        notify_attempted = bool(row["notify_attempted"])
     updated_at = _next_updated_at(conn, row["name"], now)
     cur = conn.execute(
         "UPDATE plugin_deploy_ops SET phase=?, fail_reason=?, notify_attempted=?, "

@@ -85,13 +85,19 @@ _DEPLOY_LINKED_ANTI_JOIN = (
 # requeue / reclaim_expired 共有の遷移式 (controller 解決 #6 逐語):
 # requeue_count >= max_requeue なら abandoned (増分なし)、
 # 未満なら pending + requeue_count+1。
+_DEPLOY_LINKED_EXISTS = (
+    "EXISTS (SELECT 1 FROM plugin_deploy_op_signals AS deploy_links "
+    "WHERE deploy_links.signal_id=signals.id)"
+)
+# deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
+# 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
 _REQUEUE_STATUS_EXPR = (
-    "CASE WHEN requeue_count >= :max_requeue THEN 'abandoned' "
-    "ELSE 'pending' END"
+    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
+    "THEN 'abandoned' ELSE 'pending' END"
 )
 _REQUEUE_COUNT_EXPR = (
-    "CASE WHEN requeue_count >= :max_requeue THEN requeue_count "
-    "ELSE requeue_count + 1 END"
+    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
+    "THEN requeue_count ELSE requeue_count + 1 END"
 )
 
 
