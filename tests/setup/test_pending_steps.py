@@ -71,6 +71,13 @@ def test_all_pending_conditions_are_derived_from_injected_facts():
     ]
 
 
+@pytest.mark.parametrize("data_state,expected", [("ready", False), ("degraded", True)])
+def test_a_planned_bridge_is_not_pending_when_the_daemon_is_ready(data_state, expected):
+    steps = pending_steps(PendingFacts(record_state="ok", record=_record(bridge_plan="planned"),
+                                       now=NOW, data_state=data_state))
+    assert ("bridge_not_connected" in [step.code for step in steps]) is expected
+
+
 def test_old_landlock_abi_adds_a_distinct_improve_isolation_warning():
     record = _record(landlock={"result": "ok", "reason_code": "landlock_abi_too_old"})
     steps = pending_steps(PendingFacts(record_state="ok", record=record, now=NOW, landlock_abi=4))

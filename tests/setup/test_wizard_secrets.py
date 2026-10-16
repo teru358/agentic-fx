@@ -116,21 +116,20 @@ def test_enabling_the_operation_api_changes_one_line_and_creates_no_key(tmp_path
     assert "  enabled: true" in example_text
     example_path.write_text(example_text.replace("  enabled: true", "  enabled: false", 1))
     deps, *_ = make_deps(tmp_path)
-    assert run_wizard(root, ScriptedWizardIO(responder=fresh_responder()), deps) == 0
+    assert run_wizard(root, ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "y"))), deps) == 0
     changes = _api_line_change(root)
     assert len(changes) == 1 and "true" in changes[0][1]
     assert not (home / ".config").exists()
     assert not (root / "data" / "run").exists()
 
 
-def test_disabling_the_operation_api_keeps_the_line_and_is_recorded_and_flagged_once_the_unit_exists(tmp_path):
+def test_declining_daemon_disables_the_operation_api_without_placing_a_unit(tmp_path):
     root = make_root(tmp_path)
-    deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("操作 API を有効", "n"), ("systemd のユーザーサービス", "y")))
+    deps, calls, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "n")))
     assert run_wizard(root, io, deps) == 0, io.text
     changes = _api_line_change(root)
     assert len(changes) == 1 and "false" in changes[0][1]
     data = read_setup_record(root).record.data
-    assert data["api"]["enabled"] is False and data["unit"] == "installed"
-    assert "操作 API が無効です。settings.yaml の api.enabled を true にして再起動してください" in io.text
-    assert "`afx ctl` と、bot / web / notify は使えません" in io.text
+    assert data["api"]["enabled"] is False and data["unit"] == "not_installed"
+    assert calls.place_unit == [] and "手動起動" in io.text

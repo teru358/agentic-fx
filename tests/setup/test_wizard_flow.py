@@ -31,7 +31,7 @@ def test_fresh_root_with_a_connected_bridge_completes_with_only_the_answered_lin
     assert settings.datafeed.mt5.enabled and not settings.datafeed.yfinance.enabled
     assert not settings.datafeed.twelvedata.enabled
     assert settings.backtest.eval_source == "mt5"
-    assert changed_keys(root) == {"yfinance", "mt5", "eval_source", "base_interval"}
+    assert changed_keys(root) == {"yfinance", "mt5", "eval_source", "base_interval", "enabled"}
     ensure_initialized(root)
     record = read_setup_record(root).record.data
     assert record["price"]["result"] == "ok" and record["bridge_plan"] == "connected"
@@ -43,14 +43,14 @@ def test_fresh_root_with_a_connected_bridge_completes_with_only_the_answered_lin
 def test_questions_are_asked_in_the_designed_order(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    answers = ["", "", "", "", "", "1", "", "", "", "", "", "", "", "", "", "", "", "", "y", "", "", "n"]
+    answers = ["", "", "", "", "", "1", "", "", "", "", "", "", "", "", "", "", "", "n", "y", "", ""]
     io = ScriptedWizardIO(answers)
     assert run_wizard(root, io, deps) == 0, io.text
     io.assert_consumed()
     topics = ["読みました", "表示タイムゾーン (例", "口座通貨", "対象ペア", "初期残高", "価格源", "bridge の URL",
               "bridge 側で API キー", "LLM の構成", "取引判断のモデルの番号", "改善の backend",
               "改善のモデルの番号", "判断足", "backtest の基底足", "改善の周期", "改善の時刻", "最初の 1 本",
-              "操作 API を有効", "書き込みますか", "方針文", "最初の課題", "systemd のユーザーサービス"]
+              "afx を常駐サービス", "この内容で書き込みます", "方針文", "最初の課題"]
     assert len(io.asked) == len(topics)
     for prompt, topic in zip(io.asked, topics):
         assert topic in prompt, (topic, prompt)
@@ -59,7 +59,7 @@ def test_questions_are_asked_in_the_designed_order(tmp_path):
 def test_the_price_source_has_no_default_and_is_not_skipped_by_enter(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=Rules(("価格源", ("", "", "1")), ("書き込みますか", "n")))
+    io = ScriptedWizardIO(responder=Rules(("価格源", ("", "", "1")), ("書き込みます", "n")))
     assert run_wizard(root, io, deps) == 1
     assert len(io.asked_with("価格源")) == 3
     assert "のどれかで答えてください" in io.text
@@ -138,7 +138,7 @@ def test_twelvedata_cannot_be_chosen_without_its_key_in_the_environment_or_env_f
 
 @pytest.mark.parametrize("health,status,expected", [
     ({"mt5_connected": False}, 200, "MT5 端末とつながっていません"),
-    ({}, 401, "API キーを要求"),
+    ({}, 401, "鍵が一致しません"),
     ({}, 500, "接続できません")])
 def test_bridge_failures_are_explained_and_can_fall_back_to_planned(tmp_path, health, status, expected):
     root = make_root(tmp_path)

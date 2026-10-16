@@ -48,7 +48,7 @@ def test_ctrl_c_eof_or_q_at_any_question_before_the_commit_leaves_only_lock_file
     deps, *_ = make_deps(tmp_path / "probe")
     probe = ScriptedWizardIO(responder=fresh_responder())
     assert run_wizard(probe_root, probe, deps) == 0
-    last = max(i for i, prompt in enumerate(probe.asked) if "書き込みますか" in prompt)
+    last = max(i for i, prompt in enumerate(probe.asked) if "書き込みます" in prompt)
     assert last > 15
     for index in range(last + 1):
         for kind, expected in (("ctrl-c", 130), ("eof", 1), ("q", 1)):
@@ -72,9 +72,28 @@ def test_declining_the_final_confirmation_writes_nothing(tmp_path):
     root = make_root(tmp_path)
     before = snapshot(root)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("書き込みますか", "n")))
+    io = ScriptedWizardIO(responder=fresh_responder(("書き込みます", "n")))
     assert run_wizard(root, io, deps) == 1
     only_locks_added(before, snapshot(root))
+
+
+def test_empty_final_confirmation_writes_the_settings(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("書き込みます", "")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert (root / "config" / "settings.yaml").is_file()
+
+
+def test_showing_the_final_diff_asks_for_confirmation_again(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("書き込みます", ("d", "n"))))
+
+    assert run_wizard(root, io, deps) == 1
+    assert len(io.asked_with("書き込みます")) == 2
+    assert "settings.yaml の変更点" in io.text
 
 
 def test_a_missing_example_stops_before_anything_is_created(tmp_path):
@@ -200,7 +219,7 @@ def test_declining_on_a_rerun_with_an_existing_database_leaves_every_file_untouc
     assert "data/agentic.db" in before
     deps2, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(
-        ("口座通貨", "USD"), ("'yes' と打ち込", "yes"), ("書き込みますか", "n")))
+        ("口座通貨", "USD"), ("'yes' と打ち込", "yes"), ("書き込みます", "n")))
     assert run_wizard(root, io, deps2) == 1
     assert "建玉・未約定" not in io.text and "何も書かずに終了します" in io.text
     after = snapshot(root)

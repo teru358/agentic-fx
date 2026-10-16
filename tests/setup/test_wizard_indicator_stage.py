@@ -64,3 +64,39 @@ def test_default_indicator_stage_skips_a_missing_database(tmp_path):
         tmp_path, object(), ScriptedWizardIO(), wizard.WizardDeps(), None, NOW)
 
     assert wizard.default_indicator_stage(context) == wizard.IndicatorOutcome(0)
+
+
+def _asking_stage(ctx):
+    wizard._IndicatorIOAdapter(ctx.io).ask("標準指標を登録します。よろしいですか [y/N]: ")
+    return wizard.IndicatorOutcome(1)
+
+
+def _run_interrupted_at_the_indicator_question(tmp_path, error):
+    from tests.setup.wizard_support import fresh_responder, make_deps, make_root
+
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path, indicator_stage=_asking_stage)
+    rules = fresh_responder()
+
+    def responder(prompt):
+        if "標準指標を登録します" in prompt:
+            raise error
+        return rules(prompt)
+
+    io = ScriptedWizardIO(responder=responder)
+    return wizard.run_wizard(root, io, deps), io, root
+
+
+def test_eof_at_the_indicator_question_stops_with_the_after_commit_guidance(tmp_path):
+    rc, io, root = _run_interrupted_at_the_indicator_question(tmp_path, EOFError())
+
+    assert rc == 1
+    assert "afx init" in io.out[-1] and "確定は残っています" in io.out[-1]
+    assert "Traceback" not in io.text
+
+
+def test_ctrl_c_at_the_indicator_question_stops_with_130(tmp_path):
+    rc, io, root = _run_interrupted_at_the_indicator_question(tmp_path, KeyboardInterrupt())
+
+    assert rc == 130
+    assert "確定は残っています" in io.out[-1]

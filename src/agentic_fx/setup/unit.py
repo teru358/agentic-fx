@@ -137,7 +137,10 @@ def detect_unit_values(root: Path, settings: Any, which: Callable[[str], str | N
     return UnitValues(root, python, tuple(dirs), lang, bridge, attributes)
 
 
-def systemctl_available(run: Callable[..., Any] = subprocess.run) -> bool:
+def systemctl_available(run: Callable[..., Any] = subprocess.run,
+                        which: Callable[[str], str | None] = shutil.which) -> bool:
+    if which("systemctl") is None:
+        return False
     try:
         completed = run(["systemctl", "--user", "show-environment"],
                         capture_output=True, text=True, timeout=15)
@@ -281,7 +284,17 @@ class PlacementResult:
     notes: tuple[str, ...] = ()
 
 
-MANUAL_START_GUIDE = "systemd のユーザーサービスが使えません。手で起動するには `uv run main.py` を実行してください"
+MANUAL_START_GUIDE = "systemd のユーザーサービスが使えません。手で起動するには `uv run afx` を実行してください"
+_MISSING_USER_SESSION_GUIDE = (
+    "systemd のユーザーセッションが見えません (XDG_RUNTIME_DIR が無い)。"
+    "`su` ではなく {user} で直接ログインして `afx init` を再実行してください")
+
+
+def _login_name(env: Mapping[str, str]) -> str:
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):
+        return env.get("USER") or "このユーザー"
 
 
 def place_unit(root: Path, settings: Any, *, unit_dir: Path, confirm: Callable[[str], bool],
@@ -297,7 +310,11 @@ def place_unit(root: Path, settings: Any, *, unit_dir: Path, confirm: Callable[[
     if report.fatal:
         return PlacementResult("check_failed", report.fatal[0],
                                "fatal: " + ", ".join(report.fatal), report)
-    if not systemctl_available(run):
+    if not systemctl_available(run, which):
+        active_env = os.environ if env is None else env
+        if which("systemctl") is not None and not active_env.get("XDG_RUNTIME_DIR"):
+            return PlacementResult("no_systemd", "user_session_missing",
+                                   _MISSING_USER_SESSION_GUIDE.format(user=_login_name(active_env)), report)
         return PlacementResult("no_systemd", "systemd_unavailable", MANUAL_START_GUIDE, report)
     content = render_unit(values.root, values.python, values.path_dirs, values.lang,
                           values.bridge_unit_present)

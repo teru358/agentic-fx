@@ -29,7 +29,7 @@ def record_of(root):
 
 
 def installed_rules(*extra):
-    return Rules(*extra, ("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みますか", "y"),
+    return Rules(*extra, ("価格源", "1"), ("方針文", ""), ("最初の課題", ""), ("書き込みます", "y"),
                  *UNIT_RULES)
 
 
@@ -261,22 +261,14 @@ def test_a_local_improve_backend_records_that_no_admission_applies(tmp_path):
 
 def test_a_disabled_operation_api_is_explained_in_the_closing_text_and_recorded(tmp_path):
     root = make_root(tmp_path)
-
-    def enable_and_start(root_, **kwargs):
-        assert kwargs["api_enabled"] is False
-        return post_start.StartOutcome("started", None, "2026-10-02T06:00:00+00:00", active="ok",
-                                       api_result="disabled", api_reason_code="disabled")
-
-    deps, *_ = make_deps(tmp_path, enable_and_start=enable_and_start)
-    io = ScriptedWizardIO(responder=fresh_responder(("操作 API を有効", "n"), ("systemd のユーザーサービス", "y")))
+    deps, calls, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "n")))
     assert run_wizard(root, io, deps) == 0, io.text
-    assert "案内はこの表示と起動画面だけ" in io.text
     data = record_of(root)
-    assert data["api"] == {"enabled": False, "result": "disabled", "at": data["api"]["at"],
-                           "reason_code": "disabled"}
+    assert data["api"]["enabled"] is False and calls.enable_and_start == []
     assert "api.enabled: false" in (root / "config" / "settings.yaml").read_text() or \
         "enabled: false" in (root / "config" / "settings.yaml").read_text()
-    assert "`afx ctl` は使えません" in io.text
+    assert "手動起動" in io.text
 
 
 def test_declining_the_start_is_recorded_and_shown_as_a_pending_step(tmp_path):
@@ -313,6 +305,8 @@ def test_linger_is_changed_only_after_a_yes_and_only_when_it_is_off(tmp_path, st
     assert value["state"] == expected and value.get("reason_code") == reason
     assert (len(calls_linger) == 1) is (state == "Linger=no\n")
     assert run.matching("loginctl", "enable-linger") == []
+    if answer == "n":
+        assert io.text.count("ログアウトすると afx も止まります") == 1
 
 
 def test_linger_enabled_by_the_wizard_is_owned_only_after_the_state_is_read_back(tmp_path):
@@ -347,9 +341,30 @@ def test_declining_the_resident_service_shows_the_manual_start_and_skips_the_res
     deps, calls, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder())
     assert run_wizard(root, io, deps) == 0
-    assert "uv run main.py" in io.text
+    assert "uv run afx" in io.text
     assert calls.log == []
     assert io.asked_with("外から見る手段") == []
+
+
+def test_declining_daemon_keeps_api_disabled_and_does_not_place_a_unit(tmp_path):
+    root = make_root(tmp_path)
+    deps, calls, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "n")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    data = record_of(root)
+    assert data["api"]["enabled"] is False
+    assert data["unit"] == "not_installed" and data["start"]["reason_code"] == "declined"
+    assert calls.log == []
+    assert "常駐に切り替えるときは `afx init` を再実行" in io.text
+
+
+def test_accepting_daemon_enables_api_and_places_a_unit(tmp_path):
+    root = make_root(tmp_path)
+    deps, calls, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "y")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert record_of(root)["api"]["enabled"] is True
+    assert calls.log[:1] == ["place_unit"]
 
 
 def test_the_confirmation_texts_for_enable_and_start_are_asked_separately(tmp_path):
@@ -408,7 +423,7 @@ def test_a_crash_inside_handoff_resumes_at_the_outside_access_question_without_t
     io = ScriptedWizardIO(responder=Rules(("外から見る手段を今", "y"), ("有効にする手段", "bot"),
                                           ("systemd のユーザーサービス", "y"), default=""))
     assert run_wizard(root, io, deps2) == 0, io.text
-    assert io.asked_with("価格源") == [] and io.asked_with("書き込みますか") == []
+    assert io.asked_with("価格源") == [] and io.asked_with("書き込みます") == []
     assert io.asked_with("systemd のユーザーサービス") == []
     assert markers_seen == ["handoff"]
     assert not setup_marker_present(root)

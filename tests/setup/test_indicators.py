@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,19 +111,35 @@ def test_nine_rows_fixed_order_and_deployed_flag():
     assert [r.name for r in result if r.deployed] == ["rsi"]
 
 
-def test_declining_confirmation_selects_nothing():
-    io = ScriptIO(["", "n"])
+def test_declining_standard_registration_selects_nothing():
+    io = ScriptIO(["n"])
     assert ind.ask_selection(io, rows()) == []
-    assert "[y/N]" in io.questions[-1] and "human_cli" in io.questions[-1]
+    assert "[Y/n]" in io.questions[-1] and "human_cli" not in io.questions[-1]
 
 
-def test_empty_confirmation_answer_means_no():
-    io = ScriptIO(["", ""])
-    assert ind.ask_selection(io, rows()) == []
+def test_empty_standard_registration_answer_selects_all():
+    assert ind.ask_selection(ScriptIO([""]), rows()) == NAMES
 
 
-def test_empty_selection_then_yes_selects_all():
-    assert ind.ask_selection(ScriptIO(["", "y"]), rows()) == NAMES
+def test_yes_selects_all_standard_indicators():
+    assert ind.ask_selection(ScriptIO(["y"]), rows()) == NAMES
+
+
+def test_eof_does_not_adopt_the_default_selection():
+    class EofIO(ScriptIO):
+        def ask(self, prompt, default):
+            raise EOFError
+
+    with pytest.raises(EOFError):
+        ind.ask_selection(EofIO([]), rows())
+
+
+def test_invalid_confirmation_answers_repeat_without_recursion_then_accept_yes():
+    io = ScriptIO(["maybe", "?", "y"])
+
+    assert ind.ask_selection(io, rows()) == NAMES
+    assert len(io.questions) == 3
+    assert inspect.getsource(ind.ask_selection).count("ask_selection(") == 1
 
 
 @pytest.mark.parametrize("answer,removed", [
@@ -130,31 +147,38 @@ def test_empty_selection_then_yes_selects_all():
     ("2-4", {"ema", "rsi", "macd"}),
 ])
 def test_exclusion_numbers_are_interpreted(answer, removed):
-    assert ind.ask_selection(ScriptIO([answer, "y"]), rows()) == [n for n in NAMES if n not in removed]
+    assert ind.ask_selection(ScriptIO(["e", answer]), rows()) == [n for n in NAMES if n not in removed]
 
 
 @pytest.mark.parametrize("bad", ["0", "10", "x", "3-2", "1,,x", "-1"])
 def test_out_of_range_or_garbage_asks_again(bad):
-    io = ScriptIO([bad, "2", "y"])
+    io = ScriptIO(["e", bad, "2"])
     assert ind.ask_selection(io, rows()) == [n for n in NAMES if n != "ema"]
     assert "1〜9" in io.text
 
 
 def test_deployed_is_excluded_by_default_and_warned():
-    io = ScriptIO(["", "y"])
+    io = ScriptIO(["y"])
     chosen = ind.ask_selection(io, rows({"rsi"}))
     assert "rsi" not in chosen and len(chosen) == 8
-    assert "既に配備されています" in io.text
-    assert "この 8 本を採用" in io.questions[-1]
+    assert "配備済み・既定で外れています" in io.text
+    assert "標準指標 8 本を登録" in io.questions[-1]
 
 
 def test_deployed_can_be_brought_back_by_number():
-    chosen = ind.ask_selection(ScriptIO(["3", "y"]), rows({"rsi"}))
+    chosen = ind.ask_selection(ScriptIO(["e", "3"]), rows({"rsi"}))
     assert "rsi" in chosen and len(chosen) == 9
 
 
+def test_everything_deployed_emits_one_line_without_a_question():
+    io = ScriptIO([])
+    assert ind.ask_selection(io, rows(NAMES)) == []
+    assert io.out == [ind._INTRO_TEXT, "標準指標 9 本は配備済みです (変更なし)"]
+    assert io.questions == []
+
+
 def test_everything_excluded_asks_no_confirmation():
-    io = ScriptIO(["1-9"])
+    io = ScriptIO(["e", "1-9"])
     assert ind.ask_selection(io, rows()) == []
 
 
@@ -397,7 +421,7 @@ def test_without_landlock_nothing_is_blessed_or_asked(root, conn):
 def test_stage_end_to_end_with_deployed_default_exclusion(root, conn):
     (root / "plugins" / "rsi").mkdir()
     spy = Spy()
-    out = ind.run_indicator_stage(ScriptIO(["1", "y"]), root, conn, settings=object(),
+    out = ind.run_indicator_stage(ScriptIO(["e", "1"]), root, conn, settings=object(),
                                   landlock_available=lambda: True, bless=spy, now=NOW)
     assert [c[0] for c in spy.calls] == ["ema", "macd", "bollinger", "atr", "adx", "stochastic", "ichimoku"]
     assert len(out) == 7
@@ -405,7 +429,7 @@ def test_stage_end_to_end_with_deployed_default_exclusion(root, conn):
 
 def test_stage_decline_blesses_nothing(root, conn):
     spy = Spy()
-    out = ind.run_indicator_stage(ScriptIO(["", "n"]), root, conn, settings=object(),
+    out = ind.run_indicator_stage(ScriptIO(["n"]), root, conn, settings=object(),
                                   landlock_available=lambda: True, bless=spy, now=NOW)
     assert out == [] and spy.calls == []
 

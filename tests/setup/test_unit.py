@@ -299,15 +299,53 @@ def test_no_systemd_gives_manual_start_guidance_and_places_nothing(tmp_path, set
     root = make_repo(tmp_path)
     run = Calls(results={"systemctl --user": FileNotFoundError("systemctl")})
     result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
-                        run=run, check_run=Calls(), env={"HOME": str(tmp_path)})
+                        run=run, check_run=Calls(),
+                        env={"HOME": str(tmp_path), "XDG_RUNTIME_DIR": "/run/user/1"})
     assert result.state == "no_systemd"
-    assert "uv run main.py" in result.message
+    assert "uv run afx" in result.message
     assert not (tmp_path / "u").exists()
+
+
+def test_missing_systemctl_is_not_reported_as_a_missing_user_session(tmp_path, settings):
+    root = make_repo(tmp_path)
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=Calls(results={"systemctl --user": 1}), check_run=Calls(),
+                        which=lambda name: None, env={"HOME": str(tmp_path)})
+    assert result.reason_code == "systemd_unavailable"
 
 
 def test_systemctl_available_is_false_when_the_user_manager_fails():
     assert systemctl_available(Calls(results={"systemctl --user": 1})) is False
     assert systemctl_available(Calls()) is True
+
+
+def test_no_runtime_directory_explains_missing_user_session(tmp_path, settings):
+    root = make_repo(tmp_path)
+    run = Calls(results={"systemctl --user": 1})
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=run, check_run=Calls(), env={"HOME": str(tmp_path)})
+    assert result.reason_code == "user_session_missing"
+    assert "XDG_RUNTIME_DIR が無い" in result.message
+    assert "su` ではなく" in result.message
+
+
+def test_no_runtime_directory_uses_the_actual_login_name_in_its_guidance(tmp_path, settings, monkeypatch):
+    root = make_repo(tmp_path)
+    monkeypatch.setattr("agentic_fx.setup.unit.getpass.getuser", lambda: "actual-user")
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=Calls(results={"systemctl --user": 1}), check_run=Calls(), env={"HOME": str(tmp_path)})
+
+    assert "actual-user" in result.message
+    assert "<user>" not in result.message
+
+
+def test_runtime_directory_keeps_generic_systemd_reason(tmp_path, settings):
+    root = make_repo(tmp_path)
+    run = Calls(results={"systemctl --user": 1})
+    result = place_unit(root, settings, unit_dir=tmp_path / "u", confirm=lambda d: True,
+                        run=run, check_run=Calls(),
+                        env={"HOME": str(tmp_path), "XDG_RUNTIME_DIR": "/run/user/1"})
+    assert result.reason_code == "systemd_unavailable"
 
 
 # --- 差分・退避 (AC-18) ---

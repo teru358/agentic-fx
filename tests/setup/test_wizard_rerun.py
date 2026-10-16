@@ -11,6 +11,7 @@ from agentic_fx.core.scheduler import scheduled_period
 from agentic_fx.setup.preflight import PreflightFailure
 from agentic_fx.setup.settings_edit import edit_settings
 from agentic_fx.setup.wizard import run_wizard
+from agentic_fx.setup import wizard
 from agentic_fx.store import orders
 from agentic_fx.store.db import connect
 
@@ -50,7 +51,8 @@ def test_answering_one_item_in_a_rerun_changes_exactly_that_line(tmp_path):
     assert run_wizard(root, io, deps) == 0, io.text
     after = (root / "config" / "settings.yaml").read_text()
     diff = line_diff(before, after)
-    assert len(diff) == 1 and diff[0][1].startswith("display_timezone: UTC")
+    assert len(diff) == 2 and diff[0][1].startswith("display_timezone: UTC")
+    assert any("enabled: false" in line for _, line in diff)
     assert diff[0][1].split("#", 1)[1] == diff[0][0].split("#", 1)[1]
     backups = sorted((root / "config").glob("settings.yaml.bak-*"))
     assert len(backups) == 1 and backups[0].read_text() == before
@@ -60,11 +62,11 @@ def test_answering_one_item_in_a_rerun_changes_exactly_that_line(tmp_path):
 def test_a_rerun_with_no_changes_writes_the_same_settings_and_no_backup(tmp_path):
     root, before = installed_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder())
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "")))
     assert run_wizard(root, io, deps) == 0, io.text
     assert (root / "config" / "settings.yaml").read_text() == before
     assert list((root / "config").glob("settings.yaml.bak-*")) == []
-    assert "settings.yaml の変更点はありません" in io.text
+    assert "[段 9 要約]" in io.text
 
 
 def test_changing_an_attention_item_needs_a_typed_yes(tmp_path):
@@ -104,7 +106,8 @@ def test_a_duplicate_key_stops_the_rerun_and_names_the_lines(tmp_path):
     root, before = installed_root(tmp_path, mutate=lambda text: text + "display_timezone: UTC\n")
     snap = snapshot(root)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder())
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", ""),
+                                                    ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 1
     assert "display_timezone が 2 回書かれています" in io.text and "行 3 と 179" in io.text
     assert {k: v for k, v in snapshot(root).items() if k in snap} == snap
@@ -114,7 +117,7 @@ def test_a_settings_file_newer_than_this_afx_is_never_modified(tmp_path):
     root, before = installed_root(tmp_path, mutate=lambda t: t.replace("schema_version: 2", "schema_version: 99"))
     snap = snapshot(root)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder())
+    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 1
     assert "新しい版" in io.text
     assert {k: v for k, v in snapshot(root).items() if k in snap} == snap
@@ -142,7 +145,8 @@ def test_an_old_version_is_migrated_in_the_same_write_and_shown_in_the_summary(t
 
     root, before = installed_root(tmp_path, mutate=versionless)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder())
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", ""),
+                                                    ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 0, io.text
     after = (root / "config" / "settings.yaml").read_text()
     assert after.startswith("schema_version: 2") or "\nschema_version: 2" in after
@@ -168,11 +172,45 @@ def test_a_multiline_value_that_cannot_be_edited_stops_without_writing(tmp_path)
 def test_a_decision_timeframe_that_cannot_hold_one_judgement_is_explained_and_asked_again(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder(("判断足", ("5m", "15m"))))
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", ("1m", "4h", "1"))))
     assert run_wizard(root, io, deps) == 0, io.text
-    assert "判断足 5m (300 秒) は、1 回の判断の上限 405 秒より短いため使えません" in io.text
+    assert "1m: 判断の上限時間より短いため選べません" in io.text
+    assert "4h: 保存が 1h に正規化される派生専用の足で判断足にできない" in io.text
+    assert "1〜3 の番号で選んでください。" in io.text
     settings = load_settings_text((root / "config" / "settings.yaml").read_text())
     assert settings.datafeed.decision_timeframes == ["15m"]
+
+
+def test_timeframe_menu_selects_thirty_minutes_by_number_and_lists_every_interval(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    settings = load_settings_text((root / "config" / "settings.yaml").read_text())
+    assert settings.datafeed.decision_timeframes == ["30m"]
+    for label in ("1m:", "5m:", "1. 15m", "2. 30m", "3. 1h (推奨)", "4h:", "1d:"):
+        assert label in io.text
+
+
+def test_no_selectable_timeframe_returns_to_the_first_question(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    monkeypatch.setattr(wizard, "worker_ceiling", lambda settings: SimpleNamespace(total=3601))
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("段 2 からやり直す", "a")))
+    assert run_wizard(root, io, deps) == 1, io.text
+    assert "判断の上限時間 (3601 秒) が長すぎて選べる足がありません" in io.text
+
+
+def test_excluded_current_timeframe_uses_the_first_selectable_default(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    monkeypatch.setattr(wizard, "worker_ceiling", lambda settings: SimpleNamespace(total=1800))
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO([""])
+    settings = load_settings_text((root / "config" / "settings.yaml.example").read_text())
+    start = wizard._Start("fresh", "", settings, None, False, None, True, True, {})
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["USDJPY"], 1_000_000, timeframe="15m")
+    wizard._stage5(wizard._Session(root, io, deps), start, answers)
+    assert answers.timeframe == "1h"
 
 
 def _waves(root):
@@ -231,7 +269,7 @@ def test_changing_the_decision_timeframe_lists_strategies_whose_timeframe_no_lon
     meta = SimpleNamespace(name="breakout", kind="strategy", timeframe="1h")
     root = _first_run(tmp_path, deployed_plugins=lambda *_: (meta,))
     deps, *_ = make_deps(tmp_path, deployed_plugins=lambda *_: (meta,))
-    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "15m"), ("'yes' と打ち込", "yes")))
+    io = ScriptedWizardIO(responder=fresh_responder(("判断足", "1"), ("'yes' と打ち込", "yes")))
     assert run_wizard(root, io, deps) == 0, io.text
     assert "食い違い: breakout (足 1h)" in io.text
     assert "signal が静かに効かなくなります" in io.text

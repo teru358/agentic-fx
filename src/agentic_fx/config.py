@@ -22,6 +22,7 @@ _log = logging.getLogger("agentic_fx.config")
 # (le=100、下記 RiskSettings) と役割が違う — le=100 は「equity>=0 の全域で
 # ラッチ可能」という穴塞ぎ (到達可能性の保証)、20 超 WARN は妥当性の可視化。
 _DRAWDOWN_KILL_PCT_WARN_THRESHOLD = 20
+MAX_STORED_DECISION_INTERVAL_MIN = 240
 
 
 class ConfigError(Exception):
@@ -232,7 +233,7 @@ class DatafeedSettings(_Strict):
         # 確定 watermark が永久に空になり cron が発火しない。換算はしない。
         from agentic_fx.datafeed.sources import INTERVAL_MIN
         timeframe = self.decision_timeframes[0]
-        if INTERVAL_MIN.get(timeframe, 0) >= 240:
+        if INTERVAL_MIN.get(timeframe, 0) >= MAX_STORED_DECISION_INTERVAL_MIN:
             raise ValueError(
                 f"decision_timeframes=[{timeframe}] は派生専用の足です "
                 "(保存は 1h に正規化されるため判断足の cron が発火しません)。"

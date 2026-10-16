@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import pytest
 
 from agentic_fx import service
@@ -11,7 +12,7 @@ from agentic_fx.setup.wizard import run_wizard
 from tests.setup.test_wizard_models import claude_world, codex_world, home, record_of, settings_of  # noqa: F401
 from tests.setup.test_wizard_rerun import installed_root
 from tests.setup.wizard_support import (
-    LOCK_FILES, ScriptedWizardIO, codex_model_list, fresh_responder, make_deps, make_root, snapshot,
+    FakeResponse, LOCK_FILES, ScriptedWizardIO, codex_model_list, fresh_responder, make_deps, make_root, snapshot,
 )
 
 KEY = "KEYVALUE-1"
@@ -41,6 +42,162 @@ def test_the_bridge_key_is_never_sent_over_plain_http_to_another_host(tmp_path, 
     assert run_wizard(root, io, deps) == 0, io.text
     assert bridge_headers(fetch)[0] == {}
     assert "平文 http には鍵を送りません" in io.text
+
+
+def test_plain_http_auth_is_left_unverified_without_a_retry_question(tmp_path):
+    root = make_root(tmp_path)
+    calls = []
+    deps, _, default_fetch, _ = make_deps(tmp_path, environ={"MT5_BRIDGE_API_KEY": KEY})
+
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({}, 401)
+        return default_fetch(url, **kwargs)
+
+    deps = replace(deps, fetch=fetch)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "http://bridge.example:8812"), ("bridge 側で API キー", "1"),
+        ("[r] 再試行", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    price = record_of(root)["price"]
+    assert price["result"] == "unverified" and price["reason_code"] == "key_withheld_plain_http"
+    assert not io.asked_with("[r] 再試行")
+    assert "daemon は `.env` の鍵で接続します" in io.text
+    assert all(kwargs.get("headers") == {} for url, kwargs in calls if "bridge.example" in url)
+
+
+def test_plain_http_auth_without_a_key_explains_where_to_add_it(tmp_path):
+    root = make_root(tmp_path)
+    deps, _, default_fetch, _ = make_deps(tmp_path)
+
+    def fetch(url, **kwargs):
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({}, 401)
+        return default_fetch(url, **kwargs)
+
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "http://bridge.example:8812"), ("bridge 側で API キー", "1")))
+    assert run_wizard(root, io, replace(deps, fetch=fetch)) == 0, io.text
+    assert ".env` に MT5_BRIDGE_API_KEY がありません。段 8 で確認します" in io.text
+
+
+def test_https_auth_failure_keeps_the_retry_question(tmp_path):
+    root = make_root(tmp_path)
+    deps, _, default_fetch, _ = make_deps(tmp_path, environ={"MT5_BRIDGE_API_KEY": KEY})
+
+    def fetch(url, **kwargs):
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({}, 401)
+        return default_fetch(url, **kwargs)
+
+    deps = replace(deps, fetch=fetch)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "https://bridge.example:8812"), ("bridge 側で API キー", "1"),
+        ("[r] 再試行", "2")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert record_of(root)["price"]["result"] == "planned"
+    assert io.asked_with("[r] 再試行")
+    assert "MT5_BRIDGE_API_KEY を確かめてください" in io.text
+
+
+def test_summary_hides_setting_keys_and_reopens_after_showing_the_diff(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("この内容で書き込みます", ("d", "y"))))
+    assert run_wizard(root, io, deps) == 0, io.text
+    summary, diff = io.text.split("settings.yaml の変更点", 1)
+    assert "datafeed." not in summary and "確定 1" not in summary and "planned" not in summary
+    assert "現在値 → 新しい値" in diff
+    assert len(io.asked_with("この内容で書き込みます")) == 2
+
+
+def test_summary_names_unverified_llm_and_the_correct_price_check(tmp_path):
+    settings = load_settings_text((make_root(tmp_path) / "config" / "settings.yaml.example").read_text())
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["USDJPY"], 1_000_000,
+                              source="yfinance", price={"result": "unverified", "reason_code": "network"},
+                              llm_trade={"result": "unverified", "reason_code": "model_list_unavailable"})
+    lines = wizard._summary_lines(answers, settings, __import__("tests.setup.wizard_support", fromlist=["NOW"]).NOW)
+    assert "価格源: yfinance（価格の取得は未確認）" in lines
+    assert "取引判断の LLM は未確認です (model_list_unavailable)" in lines
+
+
+@pytest.mark.parametrize("source, wanted", [
+    ("mt5", "価格源: MT5 bridge（URL 未設定、鍵 不明、bridge の接続は未確認）"),
+    ("twelvedata", "価格源: twelvedata（価格の取得は未確認）"),
+])
+def test_summary_describes_the_unverified_check_for_each_price_source(tmp_path, source, wanted):
+    settings = load_settings_text((make_root(tmp_path) / "config" / "settings.yaml.example").read_text())
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["USDJPY"], 1_000_000,
+                              source=source, price={"result": "failed", "reason_code": "network"})
+    assert wanted in wizard._summary_lines(answers, settings, __import__("tests.setup.wizard_support", fromlist=["NOW"]).NOW)
+
+
+def test_manual_choice_preserves_an_existing_unit_in_the_record(tmp_path):
+    root = make_root(tmp_path)
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    (unit_dir / "afx.service").write_text("[Service]\n")
+    deps, *_ = make_deps(tmp_path, unit_dir=unit_dir)
+    io = ScriptedWizardIO(responder=fresh_responder(("afx を常駐サービス", "n")))
+    assert run_wizard(root, io, deps) == 0, io.text
+    assert "既存の unit は残します。止めるには `systemctl --user disable --now afx`" in io.text
+    assert record_of(root)["unit"] == "installed"
+
+
+def test_summary_decline_writes_no_setup_files(tmp_path):
+    root = make_root(tmp_path)
+    before = snapshot(root)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みます", "n")))
+    assert run_wizard(root, io, deps) == 1, io.text
+    after = snapshot(root)
+    assert {key: value for key, value in after.items() if key in before} == before
+    assert set(after) - set(before) <= LOCK_FILES
+
+
+def test_example_shortcut_adds_all_examples_to_policy_and_backlog(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("方針文", ("e", "")), ("最初の課題", ("e", ""))))
+    assert run_wizard(root, io, deps) == 0, io.text
+    log = (root / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert log.count("\tpolicy_added\t") == 3
+    assert log.count("\tbacklog_added\t") == 1
+
+
+def test_example_shortcut_uses_answers_and_does_not_add_duplicates(tmp_path):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(["e", "e", "", ""])
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
+    wizard._stage12(wizard._Session(root, io, deps), answers)
+    policy = wizard.directives_path(root).read_text(encoding="utf-8")
+    assert policy.count("対象は EURUSD の 30m 足") == 1
+    assert "30m 足の押し目買い" in io.text and "追加済み" in io.text
+
+
+def test_example_write_failure_stops_the_policy_prompt(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO(["e", "should-not-be-asked"])
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
+
+    def fail(path, activity, text):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(wizard, "append_policy_directive", fail)
+    wizard._stage12(wizard._Session(root, io, deps), answers)
+    assert "書けませんでした" in io.text
+    assert io.asked == ["方針文: "]
 
 
 @pytest.mark.parametrize("answer", ["2", "3", ""])
@@ -158,7 +315,7 @@ def test_a_settings_file_changed_during_the_questions_stops_before_anything_is_w
     rules = fresh_responder()
 
     def responder(prompt):
-        if "書き込みますか" in prompt:
+        if "書き込みます" in prompt:
             path.write_text("display_timezone: UTC\n# edited elsewhere\n")
         return rules(prompt)
 
