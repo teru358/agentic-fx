@@ -1,15 +1,15 @@
 ---
 id: news-fetch-no-user-agent-yahoo-429
 title: ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す
-status: 設計待ち
+status: 見送り
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-16
 related: []
 ---
 # [news-fetch-no-user-agent-yahoo-429] ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 見送り / **優先**: 中
 
 ## 現象
 
@@ -28,3 +28,4 @@ news_collector は User-Agent を指定しておらず、既定の python-httpx 
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-16: 見送り理由 — news-source-cli-and-429-backoff に吸収 (UA を名乗る取得、Retry-After なしの 429 連続時のバックオフ、afx news による源の無効化)。2026-10-15 の実測では UA 付きでも 404 で源自体が止まっている

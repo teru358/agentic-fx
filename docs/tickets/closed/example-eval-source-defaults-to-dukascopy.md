@@ -1,15 +1,15 @@
 ---
 id: example-eval-source-defaults-to-dukascopy
 title: 設定例の履歴源の既定が dukascopy で大量取得を促す
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-16
 related: []
 ---
 # [example-eval-source-defaults-to-dukascopy] 設定例の履歴源の既定が dukascopy で大量取得を促す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,6 +23,9 @@ settings.yaml.example の backtest.eval_source が dukascopy。importer は 1 �
 
 ## 修正内容
 
+- 2026-10-16: first-run T13 で backtest.eval_source の example 既定を none に (model 既定も none)。MT5 を使う分岐はウィザードが mt5 を書く。main 2733093
+
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-16: 是正内容 — first-run T13 で backtest.eval_source の example 既定を none に (model 既定も none)。MT5 を使う分岐はウィザードが mt5 を書く。main 2733093

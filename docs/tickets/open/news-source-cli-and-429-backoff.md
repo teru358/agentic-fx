@@ -24,3 +24,4 @@ related: [news-source-route-omitted]
 ## 経緯
 
 - 2026-10-15: 起票。
+- 2026-10-16: 優先: 中 — 吸収: news-fetch-no-user-agent-yahoo-429 の「ニュース取得が User-Agent を付けない (python-httpx 既定)」も直す。収集器の取得に固定の UA (製品名/版 + repo URL) を付ける。yahoo は 2026-10-15 の実測で UA 付きでも 404 (源が止まった) なので UA だけでは直らない

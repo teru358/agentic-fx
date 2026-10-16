@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 152 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
 ## 実装中 (11)
 
@@ -49,7 +49,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (121)
+## 設計待ち (118)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -68,12 +68,9 @@
 | [signal-producer-catchup-requires-latest-tail](open/signal-producer-catchup-requires-latest-tail.md) | 中 | 2026-09-28 | producer は過去 bucket を順に評価 (`signal_producer.py:195`) しながら、毎… |
 | [trade-cron-hybrid-mode](open/trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
 | [trade-timeout-on-startup](open/trade-timeout-on-startup.md) | 中 | 2026-09-28 | 停止による打ち切りの trade mission が timeout と記録される |
-| [example-eval-source-defaults-to-dukascopy](open/example-eval-source-defaults-to-dukascopy.md) | 中 | 2026-10-02 | 設定例の履歴源の既定が dukascopy で大量取得を促す |
 | [full-suite-fd-over-1024-breaks-shell-tests](open/full-suite-fd-over-1024-breaks-shell-tests.md) | 中 | 2026-10-02 | 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる |
 | [gate-pytest-tail-stored-in-last-result](open/gate-pytest-tail-stored-in-last-result.md) | 中 | 2026-10-02 | gate の pytest 出力末尾が次回の改善 mission の材料になる |
 | [improve-handler-unexpected-exception-text-reaches-agent](open/improve-handler-unexpected-exception-text-reaches-agent.md) | 中 | 2026-10-02 | 改善 mission の handler で想定外例外の文面が agent に届く |
-| [news-fetch-no-user-agent-yahoo-429](open/news-fetch-no-user-agent-yahoo-429.md) | 中 | 2026-10-02 | ニュース取得が User-Agent を付けず Yahoo が毎回 429 を返す |
-| [repo-readme-empty](open/repo-readme-empty.md) | 中 | 2026-10-02 | README.md が 0 バイト |
 | [research-user-agent-claims-unverified-url](open/research-user-agent-claims-unverified-url.md) | 中 | 2026-10-02 | 研究用取得の User-Agent が実在未確認の URL を名乗る |
 | [settings-yaml-duplicate-key-silently-last-wins](open/settings-yaml-duplicate-key-silently-last-wins.md) | 中 | 2026-10-02 | settings.yaml の重複キーは黙って後の値が効く |
 | [backlog-status-update-is-two-step-and-races-selection](open/backlog-status-update-is-two-step-and-races-selection.md) | 中 | 2026-10-03 | backlog reject/reopen/note が SELECT 後の更新で選択と競合する |
