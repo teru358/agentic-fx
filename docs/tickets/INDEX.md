@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 144 件。完了分は closed/。
+未完了: 145 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -10,10 +10,11 @@
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 
-## 実装待ち (12)
+## 実装待ち (13)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [deployed-plugin-has-no-disable-or-rollback](open/deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
@@ -46,7 +47,6 @@
 |---|---|---|---|
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 高 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
-| [deployed-plugin-has-no-disable-or-rollback](open/deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](open/baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
 | [candidates-converge-to-example-sma](open/candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
@@ -136,6 +136,7 @@
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
 | [bridge-expose-margin-mode](open/bridge-expose-margin-mode.md) | 低 | 2026-10-16 | bridge の /account に margin_mode (netting / hedging) を出す |
 | [per-strategy-virtual-books](open/per-strategy-virtual-books.md) | 低 | 2026-10-16 | 戦略ごとの実帳簿 (同一口座内の仮想分割、両建ては戦略間のみ) |
+| [signal-maintenance-offload-worker](open/signal-maintenance-offload-worker.md) | 低 | 2026-10-16 | signal maintenance を tick から別 worker へ切り出す |
 | [wizard-script-conventions-and-selection-ui](open/wizard-script-conventions-and-selection-ui.md) | 低 | 2026-10-16 | ウィザード台本の表記規約と選択 UI (矢印選択・色) の整備 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
