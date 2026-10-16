@@ -1,15 +1,15 @@
 ---
 id: wizard-stage8-ask-daemon-not-api
 title: 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup, wizard-stage4-menu-per-role]
 ---
 # [wizard-stage8-ask-daemon-not-api] 段 8 は操作 API でなく「常駐サービスで運用するか」を問う
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 
 ## 修正内容
 
+- 2026-10-16: 段 8 は「afx を常駐サービスとして動かしますか [Y/n]」。Y → api.enabled true + 段 13 で unit (再質問なし)、n → api false + 手動起動の案内 (既存 unit は残す旨と止め方)。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 段 8 は「afx を常駐サービスとして動かしますか [Y/n]」。Y → api.enabled true + 段 13 で unit (再質問なし)、n → api false + 手動起動の案内 (既存 unit は残す旨と止め方)。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)

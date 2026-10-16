@@ -1,23 +1,14 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 149 件。完了分は closed/。
+未完了: 140 件。完了分は closed/。
 
-## 実装中 (11)
+## 実装中 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
 | [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
-| [pending-env-key-check-reads-process-env](open/pending-env-key-check-reads-process-env.md) | 中 | 2026-10-14 | 未完手順の .env キー判定が process 環境を見るためウィザードで常に「無い」 |
-| [wizard-bridge-check-plain-http-auth-required](open/wizard-bridge-check-plain-http-auth-required.md) | 中 | 2026-10-14 | ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required |
-| [wizard-stage12-show-examples](open/wizard-stage12-show-examples.md) | 中 | 2026-10-14 | 段 12 の方針文と最初の課題に例文と書き方の案内を出す |
-| [wizard-stage8-ask-daemon-not-api](open/wizard-stage8-ask-daemon-not-api.md) | 中 | 2026-10-14 | 段 8 は操作 API でなく「常駐サービスで運用するか」を問う |
-| [wizard-stage9-summary-in-user-terms](open/wizard-stage9-summary-in-user-terms.md) | 中 | 2026-10-14 | 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く |
-| [unit-placement-explain-missing-user-session](open/unit-placement-explain-missing-user-session.md) | 低 | 2026-10-14 | unit 設置で systemctl --user が使えない理由 (su でセッション無し) を文面に出す |
-| [wizard-stage11-register-standard-indicators-simply](open/wizard-stage11-register-standard-indicators-simply.md) | 低 | 2026-10-14 | 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に |
-| [wizard-stage5-timeframe-menu](open/wizard-stage5-timeframe-menu.md) | 低 | 2026-10-14 | 段 5 の判断足は対応する足の番号選択にする |
-| [wizard-stage13-linger-prompt-duplicate](open/wizard-stage13-linger-prompt-duplicate.md) | 低 | 2026-10-15 | 段 13 の linger の案内が問いの直後に同文で繰り返される |
 
 ## 実装待ち (12)
 

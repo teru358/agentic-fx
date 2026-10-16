@@ -1,15 +1,15 @@
 ---
 id: wizard-stage9-summary-in-user-terms
 title: 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup, wizard-stage8-ask-daemon-not-api]
 ---
 # [wizard-stage9-summary-in-user-terms] 段 9 の要約は設定キーでなく利用者の言葉で、差分は d で開く
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [first-run-setup, wizard-stage8-ask-daemon-not-api]
 
 ## 修正内容
 
+- 2026-10-16: 段 9 は利用者の言葉の要約 (未確認項目は文で)、既定 Y、d で settings.yaml の差分。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 段 9 は利用者の言葉の要約 (未確認項目は文で)、既定 Y、d で settings.yaml の差分。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)

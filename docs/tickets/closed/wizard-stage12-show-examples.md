@@ -1,15 +1,15 @@
 ---
 id: wizard-stage12-show-examples
 title: 段 12 の方針文と最初の課題に例文と書き方の案内を出す
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 ---
 # [wizard-stage12-show-examples] 段 12 の方針文と最初の課題に例文と書き方の案内を出す
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 
 ## 修正内容
 
+- 2026-10-16: 段 12 は用途 1 行 + 例文 (ペアと判断足を埋める) + 後から足せる旨、e で例文を入力 (重複追記なし)。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 段 12 は用途 1 行 + 例文 (ペアと判断足を埋める) + 後から足せる旨、e で例文を入力 (重複追記なし)。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)

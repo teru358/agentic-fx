@@ -1,15 +1,15 @@
 ---
 id: wizard-bridge-check-plain-http-auth-required
 title: ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup]
 ---
 # [wizard-bridge-check-plain-http-auth-required] ウィザードの bridge 検査は平文 http の鍵つき bridge で必ず auth_required
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,6 +21,8 @@ related: [first-run-setup]
 
 ## 修正内容
 
+- 2026-10-16: 裁定 (b): 平文 http (非 loopback) の鍵つき bridge は /health 200 + 401 で price: unverified + key_withheld_plain_http として進む (再試行の問いなし、.env に鍵が無ければ 1 行案内)。https / loopback の 401 は「鍵が一致しません」。pending の bridge_not_connected は data_state=ready なら出さない。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
@@ -28,3 +30,4 @@ related: [first-run-setup]
 - 2026-10-15: 優先: 中 — 受入 2 回目 (2026-10-15): [2] planned で進めた後、daemon は .env の鍵で bridge を読み afx ctl status は data: ready なのに、未完手順には「MT5 bridge はまだつながっていません」が残る。pending_steps が記録の bridge_plan=planned だけを見て daemon の実観測 (data_state=ready) を見ていない。是正時は「record が planned でも data_state が ready なら出さない」を足す
 - 2026-10-15: 状態: 実装待ち — 裁定 (2026-10-15 ユーザー): (b) 鍵は送らない。平文 http (非 loopback) で /health 200 + 鍵が要る endpoint が 401 のときは price: unverified (固定 reason: 新語 key_withheld_plain_http) で進め、文面は「平文 http には鍵を送らないため接続を検査できません。daemon は .env の鍵で接続します」。[r]/[2]/[u] の再試行誘導はやめる。daemon 側の未完手順 bridge_not_connected は data_state=ready なら出さない。束 fr-fix2 で
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 裁定 (b): 平文 http (非 loopback) の鍵つき bridge は /health 200 + 401 で price: unverified + key_withheld_plain_http として進む (再試行の問いなし、.env に鍵が無ければ 1 行案内)。https / loopback の 401 は「鍵が一致しません」。pending の bridge_not_connected は data_state=ready なら出さない。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)

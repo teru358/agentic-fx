@@ -1,15 +1,15 @@
 ---
 id: wizard-stage11-register-standard-indicators-simply
 title: 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に
-status: 実装中
+status: 是正済
 priority: 低
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 ---
 # [wizard-stage11-register-standard-indicators-simply] 段 11 は「標準指標 9 本を登録します [Y/n]」の 1 問に
 
-**状態**: 実装中 / **優先**: 低
+**状態**: 是正済 / **優先**: 低
 
 ## 現象
 
@@ -21,8 +21,11 @@ related: [first-run-setup, wizard-stage9-summary-in-user-terms]
 
 ## 修正内容
 
+- 2026-10-16: 段 11 は「標準指標 N 本を登録します [Y/n] (e = 外す番号を選ぶ)」の 1 問 (告知行つき)、全部配備済みなら 1 行、EOF は中断契約に乗る。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
 - 2026-10-15: 優先: 低 — 再実行では 9 本すべてに「配備済み・既定で外れています」と 2 行の警告が 9 回繰り返され、最後に「採用する指標がありません」。再実行時は「標準指標 9 本は配備済みです (変更なし)」の 1 行で済ませ、切り替えたい人だけ e で一覧へ (2026-10-15 受入 2 回目)
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 段 11 は「標準指標 N 本を登録します [Y/n] (e = 外す番号を選ぶ)」の 1 問 (告知行つき)、全部配備済みなら 1 行、EOF は中断契約に乗る。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)

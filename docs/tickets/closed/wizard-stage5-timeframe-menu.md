@@ -1,15 +1,15 @@
 ---
 id: wizard-stage5-timeframe-menu
 title: 段 5 の判断足は対応する足の番号選択にする
-status: 実装中
+status: 是正済
 priority: 低
 opened: 2026-10-14
-closed: null
+closed: 2026-10-16
 related: [first-run-setup, wizard-stage4-menu-per-role]
 ---
 # [wizard-stage5-timeframe-menu] 段 5 の判断足は対応する足の番号選択にする
 
-**状態**: 実装中 / **優先**: 低
+**状態**: 是正済 / **優先**: 低
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 
 ## 修正内容
 
+- 2026-10-16: 段 5 は選べる足 (15m / 30m / 1h、上限時間と 240 分未満から算出) の番号選択。選べない足は理由つき表示、候補が空なら timeout_sec の案内と段 2 への戻り。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
+
 ## 経緯
 
 - 2026-10-14: 起票。
 - 2026-10-15: 状態: 実装中 — 束 fr-fix2 (spec v1.8、ブリーフ tmp/review-20261011-sc/fr-fix2-1.md / fr-fix2-2.md)
+- 2026-10-16: 是正内容 — 段 5 は選べる足 (15m / 30m / 1h、上限時間と 240 分未満から算出) の番号選択。選べない足は理由つき表示、候補が空なら timeout_sec の案内と段 2 への戻り。main 42a1ded (fr-fix2、spec v1.8。codex r1 → /code-review high r2 → codex r3、是正 3 周)
