@@ -227,3 +227,258 @@ def test_abandon_pending_for_identities_links_pending_and_claimed(tmp_path):
     statuses = {row["id"]: row["status"] for row in conn.execute("SELECT id, status FROM signals")}
     assert statuses == {pending: "abandoned", claimed: "claimed"}
     assert deploy_ops.linked_signal_ids(conn, op_id) == {pending, claimed}
+
+
+def _retire_values(**changes):
+    values = {
+        "op_kind": "retire_plain", "from_kind": "plain", "to_kind": "retired",
+        "from_target": None, "retired_path": "_retired/alpha",
+    }
+    values.update(changes)
+    return values
+
+
+def _revoke_values(**changes):
+    values = {
+        "op_kind": "revoke", "from_kind": "none", "to_kind": "none",
+        "from_target": None, "revoke": 1, "revoke_row_id": 1, "force": 0,
+        "phase": "done",
+    }
+    values.update(changes)
+    return values
+
+
+def _rollback_absent_values(**changes):
+    return _rollback_changes(
+        from_kind="absent", from_target=None, subject_content_hash=None,
+        subject_artifact_hash=None, **changes)
+
+
+_BASES = {
+    "disable": {},
+    "rollback_symlink": _rollback_changes(),
+    "rollback_absent": _rollback_absent_values(),
+    "retire": _retire_values(),
+    "revoke": _revoke_values(),
+}
+
+
+@pytest.mark.parametrize("base", sorted(_BASES))
+def test_schema_accepts_each_valid_base_row(tmp_path, base):
+    conn = _conn(tmp_path)
+    _insert_direct(conn, **_BASES[base])
+
+
+@pytest.mark.parametrize("base,change", [
+    ("disable", {"from_kind": "plain"}),
+    ("disable", {"from_kind": "absent"}),
+    ("disable", {"to_kind": "symlink"}),
+    ("disable", {"from_target": None}),
+    ("disable", {"to_target": "x"}),
+    ("disable", {"retired_path": "x"}),
+    ("disable", {"subject_content_hash": None}),
+    ("disable", {"subject_artifact_hash": None}),
+    ("disable", {"target_content_hash": "x"}),
+    ("disable", {"target_artifact_hash": "x"}),
+    ("rollback_symlink", {"to_kind": "absent"}),
+    ("rollback_symlink", {"to_target": None}),
+    ("rollback_symlink", {"retired_path": "x"}),
+    ("rollback_symlink", {"target_content_hash": None}),
+    ("rollback_symlink", {"target_artifact_hash": None}),
+    ("rollback_symlink", {"from_kind": "plain"}),
+    ("rollback_symlink", {"from_target": None}),
+    ("rollback_symlink", {"subject_content_hash": None}),
+    ("rollback_symlink", {"subject_artifact_hash": None}),
+    ("rollback_absent", {"from_target": "x"}),
+    ("rollback_absent", {"subject_content_hash": "x"}),
+    ("rollback_absent", {"subject_artifact_hash": "x"}),
+    ("rollback_absent", {"revoke": 1, "revoke_row_id": 1}),
+    ("rollback_absent", {"retired_path": "x"}),
+    ("retire", {"from_kind": "symlink"}),
+    ("retire", {"to_kind": "absent"}),
+    ("retire", {"retired_path": None}),
+    ("retire", {"from_target": "x"}),
+    ("retire", {"to_target": "x"}),
+    ("retire", {"target_content_hash": "x"}),
+    ("retire", {"target_artifact_hash": "x"}),
+    ("retire", {"revoke": 1, "revoke_row_id": 1}),
+    ("revoke", {"from_kind": "symlink"}),
+    ("revoke", {"to_kind": "absent"}),
+    ("revoke", {"from_target": "x"}),
+    ("revoke", {"to_target": "x"}),
+    ("revoke", {"retired_path": "x"}),
+    ("revoke", {"subject_content_hash": None}),
+    ("revoke", {"subject_artifact_hash": None}),
+    ("revoke", {"target_content_hash": "x"}),
+    ("revoke", {"target_artifact_hash": "x"}),
+    ("revoke", {"approval_id": None}),
+    ("revoke", {"revoke": 0, "revoke_row_id": None}),
+    ("revoke", {"revoke_row_id": None}),
+    ("revoke", {"force": 1}),
+    ("revoke", {"phase": "intent"}),
+    ("disable", {"revoke": 0, "revoke_row_id": 1}),
+    ("disable", {"revoke": 1, "revoke_row_id": None}),
+    ("disable", {"revoke": 1, "revoke_row_id": 1, "approval_id": None}),
+    ("disable", {"phase": "needs_retry", "fail_reason": None}),
+    ("disable", {"phase": "done", "fail_reason": "syscall_failed"}),
+    ("disable", {"phase": "intent", "fail_reason": "verify_failed"}),
+    ("disable", {"phase": "needs_retry", "fail_reason": "verify_failed"}),
+    ("revoke", {"phase": "needs_retry", "fail_reason": "syscall_failed"}),
+    ("disable", {"notify_attempted": 1}),
+    ("disable", {"op_kind": "x"}),
+    ("disable", {"phase": "x"}),
+    ("disable", {"fail_reason": "x", "phase": "needs_retry"}),
+    ("disable", {"revoke": 2}),
+    ("disable", {"force": 2}),
+    ("disable", {"notify_attempted": 2}),
+    ("disable", {"from_kind": "x"}),
+    ("disable", {"to_kind": "x"}),
+    ("disable", {"op_kind": None}),
+    ("disable", {"name": None}),
+    ("disable", {"from_kind": None}),
+    ("disable", {"to_kind": None}),
+    ("disable", {"revoke": None}),
+    ("disable", {"force": None}),
+    ("disable", {"phase": None}),
+    ("disable", {"notify_attempted": None}),
+    ("disable", {"actor": None}),
+    ("disable", {"created_at": None}),
+    ("disable", {"updated_at": None}),
+])
+def test_schema_rejects_single_column_violation_from_valid_base(tmp_path, base, change):
+    conn = _conn(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_direct(conn, **{**_BASES[base], **change})
+
+
+def test_schema_rejects_returning_to_intent_with_notify_attempted(tmp_path):
+    conn = _conn(tmp_path)
+    op_id = _insert_direct(
+        conn, phase="needs_retry", fail_reason="syscall_failed", notify_attempted=1)
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE plugin_deploy_ops SET phase='intent', fail_reason=NULL WHERE op_id=?",
+            (op_id,))
+
+
+def test_deploy_op_signals_enforce_foreign_keys(tmp_path):
+    conn = _conn(tmp_path)
+    signal_id = signals.add(
+        conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h",
+        bar_ts=NOW.isoformat(), kind="signal", payload={}, now=NOW)
+    op_id = _insert_direct(conn, phase="done")
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO plugin_deploy_op_signals (op_id,signal_id,status_at_link) "
+            "VALUES (999,?, 'pending')", (signal_id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO plugin_deploy_op_signals (op_id,signal_id,status_at_link) "
+            "VALUES (?,999,'pending')", (op_id,))
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO plugin_deploy_op_signals (op_id,signal_id,status_at_link) "
+            "VALUES (999,999,'pending')")
+    conn.execute(
+        "INSERT INTO plugin_deploy_op_signals (op_id,signal_id,status_at_link) "
+        "VALUES (?,?,'pending')", (op_id, signal_id))
+
+
+def _approved_identity(conn):
+    approval_id = approvals.create(
+        conn, "plugin", {"name": "alpha", "content_hash": "content-a",
+                         "artifact_hash": "artifact-a"}, NOW)
+    approvals.apply_decision(conn, approval_id, "approved", decided_by="human", now=NOW)
+    return approval_id
+
+
+def _count_approvals(conn):
+    return conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+
+
+@pytest.mark.parametrize("closing_status", ["invalidated", "expired"])
+def test_append_revocation_ignores_statuses_the_loader_does_not_fold(tmp_path, closing_status):
+    conn = _conn(tmp_path)
+    approval_id = _approved_identity(conn)
+    revoked = approvals.append_revocation(
+        conn, "alpha", "content-a", now=NOW + timedelta(seconds=1))
+    assert revoked is not None
+    later = approvals.create(
+        conn, "plugin", {"name": "alpha", "content_hash": "content-a",
+                         "artifact_hash": "artifact-a"}, NOW + timedelta(seconds=2))
+    conn.execute(
+        "UPDATE approval_requests SET status=?, decided_at=?, decided_by='system' "
+        "WHERE id=?", (closing_status, (NOW + timedelta(seconds=5)).isoformat(), later))
+    conn.commit()
+    before = _count_approvals(conn)
+    assert approvals.append_revocation(
+        conn, "alpha", "content-a", now=NOW + timedelta(seconds=10)) is None
+    assert _count_approvals(conn) == before
+    assert approval_id != revoked
+
+
+def test_append_revocation_after_invalidated_only_identity_has_nothing_to_revoke(tmp_path):
+    conn = _conn(tmp_path)
+    approval_id = approvals.create(
+        conn, "plugin", {"name": "alpha", "content_hash": "content-a",
+                         "artifact_hash": "artifact-a"}, NOW)
+    conn.execute(
+        "UPDATE approval_requests SET status='invalidated', decided_at=?, "
+        "decided_by='system' WHERE id=?", (NOW.isoformat(), approval_id))
+    conn.commit()
+    with pytest.raises(ValueError, match="approved"):
+        approvals.append_revocation(conn, "alpha", "content-a", now=NOW)
+
+
+def _journal_decided(conn, name, target, at):
+    op_id = switch_journal.insert(
+        conn, kind="approve", approval_id=1, name=name, old_kind="absent",
+        old_target=None, temp_path=f"tmp-{target}", new_target=target,
+        switch_required=True, actor="human_cli", now=at)
+    switch_journal.set_phase(conn, op_id, "decided", now=at)
+    return op_id
+
+
+def _ops_done(conn, at, **changes):
+    return _insert_direct(
+        conn, phase="done", created_at=at.isoformat(), updated_at=at.isoformat(), **changes)
+
+
+def test_live_history_equal_instants_order_by_source_then_id_with_microsecond_fold(tmp_path):
+    conn = _conn(tmp_path)
+    journal_id = _journal_decided(conn, "alpha", ".versions/alpha/j", NOW)
+    first = _ops_done(conn, NOW)
+    second = _ops_done(conn, NOW, op_kind="rollback_symlink", to_kind="symlink",
+                       to_target=".versions/alpha/r", target_content_hash="c",
+                       target_artifact_hash="a")
+    history = deploy_ops.plugin_live_history(conn, "alpha")
+    assert [(e["source"], e["id"]) for e in history] == [
+        ("plugin_deploy_ops", first), ("plugin_deploy_ops", second),
+        ("plugin_switch_journal", journal_id)]
+    assert [e["effective_at"] for e in history] == [
+        NOW.isoformat(), (NOW + timedelta(microseconds=1)).isoformat(),
+        (NOW + timedelta(microseconds=2)).isoformat()]
+    assert [e["to"] for e in history] == ["absent", ".versions/alpha/r", ".versions/alpha/j"]
+    assert [e["from"] for e in history][1:] == [".versions/alpha/old", "absent"]
+
+
+def test_live_history_journal_clock_regression_is_ordered_by_instant_and_strictly_monotone(tmp_path):
+    conn = _conn(tmp_path)
+    later_clock = _journal_decided(conn, "alpha", ".versions/alpha/one", NOW + timedelta(seconds=10))
+    earlier_clock = _journal_decided(conn, "alpha", ".versions/alpha/two", NOW + timedelta(seconds=5))
+    tie = _ops_done(conn, NOW + timedelta(seconds=5))
+    third = _journal_decided(conn, "alpha", ".versions/alpha/three", NOW + timedelta(seconds=10))
+    assert later_clock < earlier_clock < third
+    history = deploy_ops.plugin_live_history(conn, "alpha")
+    assert [(e["source"], e["id"]) for e in history] == [
+        ("plugin_deploy_ops", tie), ("plugin_switch_journal", earlier_clock),
+        ("plugin_switch_journal", later_clock), ("plugin_switch_journal", third)]
+    effective = [datetime.fromisoformat(e["effective_at"]) for e in history]
+    assert all(a < b for a, b in zip(effective, effective[1:]))
+    assert effective == [
+        NOW + timedelta(seconds=5), NOW + timedelta(seconds=5, microseconds=1),
+        NOW + timedelta(seconds=10), NOW + timedelta(seconds=10, microseconds=1)]
+    assert [e["to"] for e in history] == [
+        "absent", ".versions/alpha/two", ".versions/alpha/one", ".versions/alpha/three"]
+    live_before_last = history[-2]["to"]
+    assert live_before_last == ".versions/alpha/one"

@@ -38,7 +38,7 @@ def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
     candidates: list[tuple[sqlite3.Row, dict]] = []
     for row in conn.execute(
             "SELECT * FROM approval_requests WHERE kind='plugin' "
-            "AND decided_at IS NOT NULL"):
+            "AND decided_at IS NOT NULL AND status IN ('approved','rejected')"):
         try:
             payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):

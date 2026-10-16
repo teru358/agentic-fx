@@ -250,8 +250,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_plugin_deploy_ops_open_name
 
 _PLUGIN_DEPLOY_OP_SIGNALS_DDL = """
 CREATE TABLE IF NOT EXISTS plugin_deploy_op_signals (
-  op_id INTEGER NOT NULL,
-  signal_id INTEGER NOT NULL,
+  op_id INTEGER NOT NULL REFERENCES plugin_deploy_ops(op_id),
+  signal_id INTEGER NOT NULL REFERENCES signals(id),
   status_at_link TEXT NOT NULL CHECK(status_at_link IN ('pending','claimed')),
   PRIMARY KEY(op_id, signal_id)
 );
