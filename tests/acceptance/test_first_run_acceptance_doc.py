@@ -43,6 +43,41 @@ def test_option_lines_and_question_labels_are_quoted_from_the_wizard() -> None:
     assert not missing, f"手順書がウィザードの選択肢・問いの文面を引用していない: {missing}"
 
 
+# 手順書に載せない文。ここに足すときは理由を添えること。
+_NOT_DOCUMENTED: frozenset[str] = frozenset()
+
+_SAY_CALL = re.compile(r'sess\.say\(\s*((?:f?"(?:[^"\\\n]|\\.)*"\s*)+)\)')
+_STRING_PART = re.compile(r'(f?)"((?:[^"\\\n]|\\.)*)"')
+
+
+def _plain_say_messages() -> list[str]:
+    source = WIZARD.read_text(encoding="utf-8")
+    messages: list[str] = []
+    for call in _SAY_CALL.findall(source):
+        parts = _STRING_PART.findall(call)
+        if any(prefix for prefix, _ in parts):
+            continue
+        text = "".join(chunk for _, chunk in parts)
+        if len(text) >= 8 and text not in _NOT_DOCUMENTED:
+            messages.append(text)
+    return messages
+
+
+def test_every_plain_say_message_is_quoted_from_the_wizard() -> None:
+    messages = _plain_say_messages()
+    assert len(messages) >= 80, len(messages)
+    text = _doc()
+    missing = [message for message in messages if message not in text]
+    assert not missing, f"手順書がウィザードの案内文を引用していない: {missing}"
+
+
+def test_unit_placement_branches_are_documented_with_their_recorded_reasons() -> None:
+    text = _doc()
+    for needle in ("systemd_unavailable", "user_session_missing", "systemctl --user disable --now afx",
+                   "MT5_BRIDGE_API_KEY がありません。段 8 で確認します"):
+        assert needle in text, needle
+
+
 def test_indicator_messages_and_questions_are_quoted_from_the_implementation() -> None:
     source = INDICATORS.read_text(encoding="utf-8")
     literals = re.findall(r'io\.(?:stdout|ask)\("((?:[^"\\\\\n]|\\\\.)*)"', source)

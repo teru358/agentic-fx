@@ -175,7 +175,10 @@ class _IndicatorIOAdapter:
 
     def ask(self, label: str, default: str | None = None) -> str | None:
         prompt = f"{label} [{default}]: " if default is not None else label
-        answer = self._io.ask(prompt)
+        try:
+            answer = self._io.ask(prompt)
+        except EOFError:
+            raise _Interrupted(RC_STOPPED) from None
         return answer or default
 
     def stdout(self, text: str) -> None:
