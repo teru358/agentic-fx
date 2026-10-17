@@ -9,7 +9,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.executor import snapshot_age_exceeded
 from agentic_fx.plugin import switch
 from agentic_fx.runners.base import MissionResult
-from agentic_fx.store import signals
+from agentic_fx.store import plugin_deploy_ops, signals
 
 from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
 
@@ -141,7 +141,7 @@ def _approve_strategy(conn):
 def test_open_gate_accepts_strategy_depending_on_plain_indicator(tmp_path):
     """plain の indicator は存在だけを見る (hash / 最新決定は照合しない)。"""
     from agentic_fx.loops.trade_loop import signal_source_active
-    from agentic_fx.plugin import signal_producer
+    from agentic_fx.plugin.source_state import source_state
     conn, _loop_obj, _, _ = _loop(tmp_path, [])
     root, resolved = _plain_indicator_world(tmp_path)
     live = type("Id", (), {"kind": "plain", "content_hash": "0" * 64,
@@ -153,19 +153,16 @@ def test_open_gate_accepts_strategy_depending_on_plain_indicator(tmp_path):
     def identity(_root, name):
         return strategy if name == "strategy" else live
 
-    with patch.object(signal_producer.plugin_deploy_ops, "live_identity", identity):
+    with patch.object(plugin_deploy_ops, "live_identity", identity):
         assert signal_source_active(
             conn, root, "strategy", "a" * 64, resolved) is True
-        assert signal_producer._live_source_reason(
-            conn, root, type("M", (), {"name": "strategy",
-                                       "content_hash": "a" * 64,
-                                       "artifact_hash": None})(),
-            resolved, {"strategy", "legacy_ind"}) is None
+        assert source_state(
+            conn, root, name="strategy", content_hash="a" * 64,
+            artifact_hash=None, indicators=resolved.items) is None
 
 
 def test_symlink_indicator_hash_mismatch_is_not_live(tmp_path):
     from agentic_fx.loops.trade_loop import signal_source_active
-    from agentic_fx.plugin import signal_producer
     conn, _loop_obj, _, _ = _loop(tmp_path, [])
     root, resolved = _plain_indicator_world(tmp_path)
     strategy = type("Id", (), {"kind": "plain", "content_hash": "a" * 64,
@@ -177,7 +174,7 @@ def test_symlink_indicator_hash_mismatch_is_not_live(tmp_path):
     def identity(_root, name):
         return strategy if name == "strategy" else linked
 
-    with patch.object(signal_producer.plugin_deploy_ops, "live_identity", identity):
+    with patch.object(plugin_deploy_ops, "live_identity", identity):
         assert signal_source_active(
             conn, root, "strategy", "a" * 64, resolved) is False
 
@@ -226,3 +223,83 @@ def test_hold_never_acquires_plugin_name_lock(tmp_path, monkeypatch):
 
     assert out["result"] == "hold"
     locks.assert_not_called()
+
+
+def test_source_lock_oserror_is_recorded_as_a_signal_rejection(tmp_path, monkeypatch):
+    """lock 取得の想定外の例外も intent と gate 拒否を残し、発注しない。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
+    sid = _add(conn)
+    loop._plugins_root = tmp_path / "plugins"
+
+    @contextmanager
+    def broken(*_args, **_kwargs):
+        raise OSError("lock file unavailable")
+        yield
+
+    monkeypatch.setattr(switch, "_plugin_locks", broken)
+    out = loop.run_once("signal")
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["signal_source_lock_error"]}
+    assert dict(_last_intent(conn)) == {
+        "gate_result": "rejected", "reject_reason": "signal_source_lock_error",
+        "reject_category": "signal",
+    }
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+    row = conn.execute(
+        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert dict(row) == {"status": "pending", "requeue_count": 1}
+
+
+def test_source_lock_value_error_is_also_fail_closed(tmp_path, monkeypatch):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
+    _add(conn)
+    loop._plugins_root = tmp_path / "plugins"
+
+    @contextmanager
+    def broken(*_args, **_kwargs):
+        raise ValueError("bad name")
+        yield
+
+    monkeypatch.setattr(switch, "_plugin_locks", broken)
+    out = loop.run_once("signal")
+
+    assert out["reasons"] == ["signal_source_lock_error"]
+    assert _last_intent(conn)["reject_reason"] == "signal_source_lock_error"
+
+
+def test_early_rejection_wins_over_stale_signal_and_inactive_source(
+        tmp_path, monkeypatch):
+    """origin 拒否などの early 結果は source ゲートで上書きしない。"""
+    import dataclasses
+    from agentic_fx.core.contracts import Origin
+    conn, loop, _, _ = _loop(tmp_path, [])
+    sid = _add(conn)
+    loop._plugins_root = tmp_path / "plugins"
+    monkeypatch.setattr(
+        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: False)
+    real = loop.executor.record_and_validate_intent
+
+    def foreign_origin(intent, mission_id):
+        return real(dataclasses.replace(intent, origin=Origin.ASK), mission_id)
+
+    loop.executor.record_and_validate_intent = foreign_origin
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            late = NOW + timedelta(hours=3)
+            loop.clock = FixedClock(late)
+            loop.executor.clock = FixedClock(late)
+            return MissionResult("completed", OPEN, [])
+
+    loop.runner = AdvancingRunner()
+    out = loop.run_once("signal")
+
+    assert out["reasons"] == ["origin rejected: only scheduler missions may trade"]
+    assert dict(_last_intent(conn)) == {
+        "gate_result": "rejected",
+        "reject_reason": "origin rejected: only scheduler missions may trade",
+        "reject_category": "origin",
+    }
+    assert conn.execute(
+        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0] != "abandoned"

@@ -1,6 +1,8 @@
 """Explicit, line-preserving migrations for settings schema versions."""
 from __future__ import annotations
 
+import re
+
 import yaml
 
 from agentic_fx.config import Settings
@@ -70,6 +72,9 @@ _PLUGIN_LOCK_LINE = ("plugin_lock_timeout_sec: 2      "
                      "# signal producer / OPEN の plugin name lock 待機上限 (秒)\n")
 
 
+_VERSION_TWO_LINE = re.compile(r"schema_version:[ \t]*2([ \t]+#.*)?\r?\n?")
+
+
 def _migrate_two_to_three(text: str) -> EditResult:
     """Bump the marker to v3 and add ``worker.plugin_lock_timeout_sec`` if absent.
 
@@ -77,7 +82,7 @@ def _migrate_two_to_three(text: str) -> EditResult:
     mapping the model default (2 seconds) applies, so only the marker changes.
     """
     lines = text.splitlines(keepends=True)
-    marker = next((i for i, line in enumerate(lines) if line.startswith("schema_version: 2")), None)
+    marker = next((i for i, line in enumerate(lines) if _VERSION_TWO_LINE.fullmatch(line)), None)
     if marker is None:
         return _failure("schema_version: 2 の行を見つけられません。手で編集してください。")
     lines[marker] = lines[marker].replace("schema_version: 2", "schema_version: 3", 1)
@@ -102,6 +107,8 @@ def _migrate_two_to_three(text: str) -> EditResult:
                     break
                 if lines[i].strip() and not lines[i].strip().startswith("#"):
                     last = i
+            if not lines[last].endswith("\n"):
+                lines[last] += "\n"
             lines.insert(last + 1, indent + _PLUGIN_LOCK_LINE)
     updated = "".join(lines)
     try:

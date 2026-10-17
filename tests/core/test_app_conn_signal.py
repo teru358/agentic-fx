@@ -4,9 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.service import App, _busy_resources_after_join, build_app
+from agentic_fx.service import (
+    App, _busy_resources_after_join, _scheduler_tick_once, build_app)
 from agentic_fx.store import plugin_deploy_ops, signals
 from agentic_fx.store.db import connect, init_db
 from tests.store.test_rag import FakeEmbedding
@@ -285,3 +288,53 @@ def test_pending_exists_excludes_stale_and_deploy_linked_rows(tmp_path):
 
     assert stale is not None and linked is not None
     assert not signals.pending_exists(conn, now=NOW, freshness_bars=2)
+
+
+def test_tick_runs_signal_maintenance_once_on_a_normal_tick(tmp_path):
+    app = _app(tmp_path)
+    calls = []
+    try:
+        app.scheduler.on_signal_maintenance = calls.append
+        _scheduler_tick_once(app)
+        assert calls == [NOW]
+    finally:
+        app.close()
+
+
+def test_tick_exception_still_runs_signal_maintenance_once(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    calls = []
+
+    def boom(_now):
+        raise RuntimeError("tick broke")
+
+    try:
+        app.scheduler.on_signal_maintenance = calls.append
+        monkeypatch.setattr(app.scheduler, "_trade_mission_due", boom)
+        with pytest.raises(RuntimeError, match="tick broke"):
+            _scheduler_tick_once(app)
+        assert calls == [NOW]
+    finally:
+        app.close()
+
+
+def test_tick_exception_does_not_run_signal_maintenance_after_stop(
+        tmp_path, monkeypatch):
+    import threading
+    app = _app(tmp_path)
+    calls = []
+    stop = threading.Event()
+    stop.set()
+
+    def boom(_now):
+        raise RuntimeError("tick broke")
+
+    try:
+        app.scheduler.on_signal_maintenance = calls.append
+        app.scheduler._stop_event = stop
+        monkeypatch.setattr(app.scheduler, "tick", boom)
+        with pytest.raises(RuntimeError):
+            _scheduler_tick_once(app)
+        assert calls == []
+    finally:
+        app.close()

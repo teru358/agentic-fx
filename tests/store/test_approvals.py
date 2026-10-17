@@ -369,3 +369,59 @@ def test_expire_due_skips_plugin_kind_pending_rows(tmp_path):
     row = c.execute("SELECT status FROM approval_requests WHERE id=?",
                     (aid,)).fetchone()
     assert row["status"] == "pending"
+
+
+def _decided_plugin_row(c, payload_json, status, decided_at, kind="plugin"):
+    c.execute(
+        "INSERT INTO approval_requests "
+        "(kind,payload_json,status,decided_by,decided_at,created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (kind, payload_json, status, "t", decided_at, decided_at))
+    c.commit()
+
+
+def _python_latest(c, name, content_hash):
+    import json
+    latest = None
+    for row in c.execute(
+            "SELECT id,status,payload_json,decided_at FROM approval_requests "
+            "WHERE kind='plugin' AND decided_at IS NOT NULL"):
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("name") != name or payload.get("content_hash") != content_hash:
+            continue
+        key = (row["decided_at"], row["id"])
+        if latest is None or key > latest[0]:
+            latest = (key, row["status"])
+    return None if latest is None else latest[1]
+
+
+def test_latest_decision_for_identity_matches_the_python_scan(tmp_path):
+    c = _conn(tmp_path)
+    t = NOW.isoformat()
+    later = (NOW + timedelta(seconds=5)).isoformat()
+    _decided_plugin_row(c, '{"name":"a","content_hash":"h"}', "approved", t)
+    _decided_plugin_row(c, '{"name":"a","content_hash":"h"}', "rejected", t)
+    _decided_plugin_row(c, '{"name":"b","content_hash":"h"}', "approved", later)
+    _decided_plugin_row(c, '{"name":"c","content_hash":"h"}', "rejected", t)
+    _decided_plugin_row(c, '{"name":"c","content_hash":"h"}', "approved", later)
+    _decided_plugin_row(c, '{"name":"c","content_hash":"h"}', "rejected", t)
+    _decided_plugin_row(c, '[1,2]', "approved", later)
+    _decided_plugin_row(c, '"a"', "approved", later)
+    _decided_plugin_row(c, 'not json', "approved", later)
+    _decided_plugin_row(c, '{"name":"a","content_hash":"h"}', "approved", later,
+                        kind="tech_plugin")
+    c.execute("INSERT INTO approval_requests (kind,payload_json,created_at) "
+              "VALUES ('plugin','{\"name\":\"a\",\"content_hash\":\"h\"}',?)", (t,))
+    c.commit()
+
+    for ident in [("a", "h"), ("b", "h"), ("c", "h"), ("a", "x"), ("zz", "h")]:
+        assert approvals.latest_decision_for_identity(c, *ident) == \
+            _python_latest(c, *ident), ident
+    assert approvals.latest_decision_for_identity(c, "a", "h") == "rejected"
+    assert approvals.latest_decision_for_identity(c, "c", "h") == "approved"
+    assert approvals.latest_decision_for_identity(c, "zz", "h") is None

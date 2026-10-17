@@ -306,11 +306,16 @@ class Scheduler:
         return self._stop_event is not None and self._stop_event.is_set()
 
     def _run_hooks(self, now: datetime) -> list[Callable[[], None]]:
-        """データ hooks (news/econ/signal maintenance) — try/finally で
-        構造的に全ての return パスおよび未捕捉例外経路でも必ず実行される
-        (設計書 §3.2, プラン 8 レビュー修正 F1)。市場閉鎖時・mark-to-market
-        失敗時・通常時のいずれでも hooks は毎 tick 走る (「hooks が週末しか
-        走らない」旧欠陥 = cross-plan 修正① の再発防止)。
+        """データ hooks (news/econ/signal maintenance) — tick の try/finally
+        から全ての return パスで呼ばれる (設計書 §3.2)。市場閉鎖時・
+        mark-to-market 失敗時・通常時のいずれでも hooks は毎 tick 走る
+        (「hooks が週末しか走らない」旧欠陥 = cross-plan 修正① の再発防止)。
+
+        news / econ / cache maintenance はここで実行する。signal maintenance
+        は core_lock の外で動かす必要があるため遅延 callable として返す。
+        tick が未捕捉例外で抜けるとその callable は呼び出し元へ渡らないので、
+        signal maintenance の実行は service 側 (`_scheduler_tick_once`) が
+        `run_signal_maintenance` で保証する。
 
         **注記 (BaseException 経路について)**: `finally` は
         `BaseException` (KeyboardInterrupt / SystemExit を含む) に対しても
@@ -337,10 +342,7 @@ class Scheduler:
         # signal maintenance (producer 評価 = signal 生成) だけを outage
         # gate する。news/econ/cache maintenance は継続 (価格源不通と無関係)。
         if self.on_signal_maintenance is not None:
-            hook = self.on_signal_maintenance
-            pending.append(
-                lambda hook=hook, now=now: self._run_data_hook(
-                    "signal_maintenance", lambda: hook(now)))
+            pending.append(lambda now=now: self.run_signal_maintenance(now))
         if self.on_cache_maintenance is not None:
             self._run_data_hook(
                 "cache_maintenance", lambda: self.on_cache_maintenance(now))
@@ -647,6 +649,15 @@ class Scheduler:
                          safe_error_text(e))
             return now
         return now if anchor is None else max(anchor, now)
+
+    def run_signal_maintenance(self, now: datetime) -> None:
+        """signal maintenance を fail-open で 1 回実行する。core_lock を握らずに
+        呼ぶこと。tick の遅延 callable と、tick が例外で抜けたときの
+        呼び出し元 (service) の両方がこの入口を使う。停止中は何もしない。"""
+        hook = self.on_signal_maintenance
+        if hook is None or self._stopping():
+            return
+        self._run_data_hook("signal_maintenance", lambda: hook(now))
 
     def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
         """ニュース / econ の収集フックを fail-open で呼ぶ。

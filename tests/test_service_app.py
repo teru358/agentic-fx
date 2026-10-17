@@ -960,7 +960,9 @@ def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
               _FakeStrategySession), \
-         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                         embedding_fn=FakeEmbedding())
@@ -1152,7 +1154,9 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
               _FakeStrategySession), \
-         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                         embedding_fn=FakeEmbedding())
@@ -1661,7 +1665,9 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
               _FakeSignalSession), \
-         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
@@ -1705,7 +1711,9 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
               _FailingSession), \
-         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())

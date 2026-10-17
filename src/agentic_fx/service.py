@@ -2078,6 +2078,7 @@ def _scheduler_tick_once(app: App) -> None:
                 _log.exception("failed to record ingest prepare failure")
     pending = []
     deferred: list = []
+    tick_error: Exception | None = None
     try:
         with app.core_lock:
             # commit → observe (resume 要求の判定を含む) → scheduler.tick()
@@ -2114,12 +2115,19 @@ def _scheduler_tick_once(app: App) -> None:
                         _log.exception("failed to record outage observe failure")
             with app.executor.defer_notifications() as deferred:
                 pending = app.scheduler.tick(now)
+    except Exception as exc:  # noqa: BLE001 — maintenance を走らせた後で再送出する
+        tick_error = exc
     finally:
         for text in deferred:
             try:
                 app.executor.notifier.send(text)
             except Exception:  # noqa: BLE001 — 通知失敗で tick/hook を止めない
                 _log.exception("deferred scheduler notification failed")
+    if tick_error is not None:
+        # tick が例外で抜けると遅延 callable は失われる。signal の接続修復を
+        # 含む maintenance は core_lock 解放後にここで 1 回だけ実行する。
+        app.scheduler.run_signal_maintenance(now)
+        raise tick_error
     for hook in pending:
         hook()
 

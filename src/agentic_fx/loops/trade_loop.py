@@ -43,7 +43,9 @@ from agentic_fx.store import alert_state
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import mission_decision_bars, missions, signals
 from agentic_fx.plugin import switch
-from agentic_fx.plugin.signal_producer import _live_source_reason
+from agentic_fx.plugin.deploy_ops import acquire_name_locks
+from agentic_fx.plugin.source_state import source_state
+from agentic_fx.store import plugin_deploy_ops
 from agentic_fx.core.timeutil import as_utc
 
 import logging
@@ -62,13 +64,14 @@ _CLAIMING_TRIGGERS = frozenset({"cron", "signal"})
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
                          resolved=None) -> bool:
     """Check a claimed OPEN signal's source while its name locks are held."""
-    from types import SimpleNamespace
-    return _live_source_reason(
-        conn, plugins_root,
-        SimpleNamespace(name=plugin, content_hash=content_hash,
-                        artifact_hash=None), resolved,
-        {plugin, *(item.plugin_name for item in getattr(resolved, "items", ()))}
-    ) is None
+    identity = plugin_deploy_ops.live_identity(plugins_root, plugin)
+    artifact_hash = (identity.artifact_hash
+                     if identity is not None and identity.kind == "symlink"
+                     else None)
+    return source_state(
+        conn, plugins_root, name=plugin, content_hash=content_hash,
+        artifact_hash=artifact_hash,
+        indicators=resolved.items if resolved is not None else None) is None
 
 
 def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
@@ -340,6 +343,7 @@ class TradeLoop:
             # ---- commit-core (core_lock 保持) ----
             source_lock = contextlib.ExitStack()
             source_lock_timeout = False
+            source_lock_error = False
             if (claimed is not None and intent.action is Action.OPEN
                     and self._plugins_root is not None):
                 resolved = self._resolved_by_identity.get(
@@ -348,14 +352,19 @@ class TradeLoop:
                 if resolved is not None:
                     source_names.update(item.plugin_name for item in resolved.items)
                 try:
-                    source_lock.enter_context(switch._plugin_locks(
+                    source_lock.enter_context(acquire_name_locks(
                         self._plugins_root, source_names,
-                        deadline=monotonic() + getattr(
-                            self.settings.worker, "plugin_lock_timeout_sec", 2.0)))
+                        deadline=monotonic()
+                        + self.settings.worker.plugin_lock_timeout_sec))
                 except switch.PluginBusyError:
                     source_lock.close()
                     source_lock = contextlib.ExitStack()
                     source_lock_timeout = True
+                except Exception:  # noqa: BLE001 — fail closed、intent は記録する
+                    _log.exception("signal source lock failed")
+                    source_lock.close()
+                    source_lock = contextlib.ExitStack()
+                    source_lock_error = True
             # **通知は commit-post まで遅延させる (Step 3.5)** — Notifier.send は
             # urlopen(timeout=10) の同期実行なので、ここで送ると core_lock を
             # 握ったまま最大 10 秒ブロックし SL/TP 監視が止まる。
@@ -368,9 +377,13 @@ class TradeLoop:
                         intent, mid)
                     consume_error = None
                     source_rejected = False
-                    if claimed is not None and intent.action is Action.OPEN:
+                    if (claimed is not None and intent.action is Action.OPEN
+                            and early is None):
                         gate_now = self.clock.now()
-                        if source_lock_timeout:
+                        if source_lock_error:
+                            source_rejected = True
+                            reason = "signal_source_lock_error"
+                        elif source_lock_timeout:
                             source_rejected = True
                             reason = "signal_source_lock_timeout"
                         else:

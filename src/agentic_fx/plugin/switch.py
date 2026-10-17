@@ -999,6 +999,11 @@ _plugin_lock_owner_guard = None
 
 
 def set_plugin_lock_owner_guard(guard) -> None:
+    """Test-only injection point: ``guard`` runs before every name-lock acquire.
+
+    Production code never installs one; tests use it to assert which thread
+    or context takes the plugin name locks.
+    """
     global _plugin_lock_owner_guard
     _plugin_lock_owner_guard = guard
 

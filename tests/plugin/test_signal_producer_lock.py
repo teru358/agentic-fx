@@ -1,6 +1,7 @@
 """Signal producer の name-lock 再検証を守る回帰テスト。"""
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,8 +54,8 @@ def test_insert_runs_only_while_name_lock_is_held(tmp_path, monkeypatch):
 
     monkeypatch.setattr(switch, "_plugin_locks", lock)
     monkeypatch.setattr(
-        "agentic_fx.plugin.signal_producer._live_source_reason",
-        lambda *_args: None,
+        "agentic_fx.plugin.signal_producer.source_state",
+        lambda *_args, **_kw: None,
     )
 
     assert producer._insert_while_live(
@@ -69,8 +70,8 @@ def test_revalidation_blocks_insert_after_lock_acquisition(tmp_path, monkeypatch
     conn = _conn(tmp_path)
     producer = SignalProducer()
     monkeypatch.setattr(
-        "agentic_fx.plugin.signal_producer._live_source_reason",
-        lambda *_args: "strategy_not_live",
+        "agentic_fx.plugin.signal_producer.source_state",
+        lambda *_args, **_kw: "strategy_not_live",
     )
 
     called = False
@@ -125,3 +126,81 @@ def test_source_state_activity_is_once_per_unchanged_reason():
         ("plugin_skipped_lock_timeout", "name=strategy reason=lock_timeout", "strategy"),
         ("plugin_skipped_not_live", "name=strategy reason=strategy_not_live", "strategy"),
     ]
+
+
+class _Activity:
+    def __init__(self):
+        self.events = []
+
+    def write(self, _category, event, summary, ref_id=None):
+        self.events.append((event, summary))
+
+
+def _evaluate(producer, conn, meta, now, plugins_root, sandbox, activity):
+    from tests.plugin.test_signal_producer import SOURCE, _resolved_by_identity
+    return producer.evaluate_due_plugins(
+        conn, plugins=[meta], now=now, source=SOURCE, sandbox_run=sandbox,
+        settings=SETTINGS, resolved_by_identity=_resolved_by_identity(meta),
+        activity=activity, plugins_root=plugins_root)
+
+
+def test_retired_plugin_is_skipped_before_the_worker_runs(tmp_path):
+    """live に無い plugin は評価 (worker 起動) の前に skip し、通知は 1 回。"""
+    from tests.plugin.test_signal_producer import H, _FakeSandbox, _seed_flat
+    from datetime import timedelta
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    sandbox = _FakeSandbox()
+    activity = _Activity()
+    producer = SignalProducer()
+    meta = _meta()
+
+    for seconds in (31, 45):
+        _evaluate(producer, conn, meta, H + timedelta(hours=1, seconds=seconds),
+                  root, sandbox, activity)
+
+    assert sandbox.calls == []
+    assert activity.events == [
+        ("plugin_skipped_not_live", "name=strategy reason=strategy_not_live")]
+
+
+def test_lock_timeout_notice_is_renewed_after_a_successful_insert(
+        tmp_path, monkeypatch):
+    from tests.plugin.test_signal_producer import H, _FakeSandbox, _seed_flat
+    from datetime import timedelta
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    state = {"busy": True}
+
+    @contextmanager
+    def lock(*_args, **_kwargs):
+        if state["busy"]:
+            raise switch.PluginBusyError("held")
+        yield
+
+    monkeypatch.setattr(switch, "_plugin_locks", lock)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.signal_producer.live_mismatch", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.signal_producer.source_state", lambda *_a, **_k: None)
+    sandbox = _FakeSandbox()
+    activity = _Activity()
+    producer = SignalProducer()
+    meta = dataclasses.replace(_meta(), kind="signal")
+    first = H + timedelta(hours=1, seconds=31)
+
+    _evaluate(producer, conn, meta, first, root, sandbox, activity)
+    _evaluate(producer, conn, meta, first, root, sandbox, activity)
+    assert len(activity.events) == 1
+    state["busy"] = False
+    _evaluate(producer, conn, meta, first, root, sandbox, activity)
+    state["busy"] = True
+    _evaluate(producer, conn, meta, first + timedelta(hours=1), root, sandbox,
+              activity)
+
+    assert [e[0] for e in activity.events] == [
+        "plugin_skipped_lock_timeout", "plugin_skipped_lock_timeout"]

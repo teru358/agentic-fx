@@ -2,7 +2,8 @@ from pathlib import Path
 
 import yaml
 
-from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION, _migrate_zero_to_one, migrate
+from agentic_fx.setup.settings_migrate import (
+    CURRENT_SCHEMA_VERSION, _migrate_two_to_three, _migrate_zero_to_one, migrate)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -150,6 +151,29 @@ def test_version_two_migration_without_a_worker_section_changes_only_the_marker(
 
     assert result.ok, result.reason
     assert result.text == old.replace("schema_version: 2", "schema_version: 3", 1)
+
+
+def test_version_two_migration_without_trailing_newline_keeps_lines_separate():
+    lines = (FIXTURES / "v2.yaml").read_text(encoding="utf-8").splitlines(keepends=True)
+    start = next(i for i, line in enumerate(lines) if line.startswith("worker:"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i][:1] not in (" ", "\t", "\n", "#"))
+    block = lines[start:end]
+    while block[-1].strip() == "" or block[-1].lstrip().startswith("#"):
+        block.pop()
+    old = ("".join(lines[:start] + lines[end:]) + "".join(block)).rstrip("\n")
+    assert not old.endswith("\n")
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text.endswith("\n" + PLUGIN_LOCK_LINE)
+    assert yaml.safe_load(result.text)["worker"]["plugin_lock_timeout_sec"] == 2
+
+
+def test_version_two_marker_does_not_match_a_longer_number():
+    result = _migrate_two_to_three("schema_version: 20\nworker:\n  x: 1\n")
+
+    assert not result.ok
 
 
 def test_version_three_is_a_noop():

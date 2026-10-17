@@ -48,7 +48,6 @@ tick で plugin×pair×bucket の数だけ worker サブプロセスを起動し
 from __future__ import annotations
 
 import logging
-import json
 from pathlib import Path
 from time import monotonic
 from datetime import datetime, timedelta
@@ -60,8 +59,8 @@ from agentic_fx.core import market_hours
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin import switch
-from agentic_fx.plugin.deploy_ops import require_no_open_deploy_ops
-from agentic_fx.store import plugin_deploy_ops
+from agentic_fx.plugin.deploy_ops import acquire_name_locks
+from agentic_fx.plugin.source_state import live_mismatch, source_state
 from agentic_fx.store import signals
 
 if TYPE_CHECKING:
@@ -272,6 +271,7 @@ class SignalProducer:
                 self._report_failure(meta, pair, b, e, activity)
                 break
             self._cursor[key] = b
+            self._source_notices.pop(key, None)
             # 成功したら、この plugin × pair の失敗の間引き状態は解除する。
             self._release_failures(meta.name, pair, hash_=meta.content_hash)
             b += width
@@ -331,6 +331,13 @@ class SignalProducer:
                          width: timedelta, source: str, call: _CallFn,
                          settings: "Settings", resolved=None,
                          plugins_root: Path | None = None) -> int:
+        if plugins_root is not None:
+            # worker を起動する前の安い検査。正しさは lock 内の再検証が担う。
+            reason = live_mismatch(
+                plugins_root, name=meta.name, content_hash=meta.content_hash,
+                artifact_hash=meta.artifact_hash)
+            if reason is not None:
+                raise _SourceNotLive(reason)
         bucket_end = bucket_start + width
         df = load_closed_frame(
             conn, pair, meta.timeframe, source, meta.max_bars, now,
@@ -410,10 +417,14 @@ class SignalProducer:
         names = {meta.name}
         if resolved is not None:
             names.update(item.plugin_name for item in resolved.items)
-        deadline = monotonic() + getattr(settings.worker, "plugin_lock_timeout_sec", 2.0)
+        deadline = monotonic() + settings.worker.plugin_lock_timeout_sec
         try:
-            with switch._plugin_locks(plugins_root, names, deadline=deadline):
-                reason = _live_source_reason(conn, plugins_root, meta, resolved, names)
+            with acquire_name_locks(plugins_root, names, deadline=deadline):
+                reason = source_state(
+                    conn, plugins_root, name=meta.name,
+                    content_hash=meta.content_hash,
+                    artifact_hash=meta.artifact_hash,
+                    indicators=resolved.items if resolved is not None else None)
                 if reason is not None:
                     raise _SourceNotLive(reason)
                 return insert()
@@ -428,52 +439,6 @@ class _SourceLockTimeout(Exception):
 class _SourceNotLive(Exception):
     def __init__(self, reason: str) -> None:
         self.reason = reason
-
-
-def _latest_decision_is_approved(conn, name: str, content_hash: str) -> bool:
-    latest = None
-    for row in conn.execute(
-            "SELECT id,status,payload_json,decided_at FROM approval_requests "
-            "WHERE kind='plugin' AND decided_at IS NOT NULL"):
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
-            continue
-        if payload.get("name") != name or payload.get("content_hash") != content_hash:
-            continue
-        key = (row["decided_at"], row["id"])
-        if latest is None or key > latest[0]:
-            latest = (key, row["status"])
-    return latest is not None and latest[1] == "approved"
-
-
-def _live_source_reason(conn, plugins_root: Path, meta: PluginMeta, resolved,
-                        names: set[str]) -> str | None:
-    identity = plugin_deploy_ops.live_identity(plugins_root, meta.name)
-    if identity is None or identity.content_hash != meta.content_hash:
-        return "strategy_not_live"
-    if (identity.kind == "symlink" and meta.artifact_hash is not None
-            and identity.artifact_hash != meta.artifact_hash):
-        return "strategy_not_live"
-    if not _latest_decision_is_approved(conn, meta.name, meta.content_hash):
-        return "strategy_not_approved"
-    if resolved is not None:
-        for item in resolved.items:
-            identity = plugin_deploy_ops.live_identity(plugins_root, item.plugin_name)
-            if identity is None:
-                return "indicator_not_live"
-            if identity.kind == "plain":
-                continue
-            if identity.content_hash != item.content_hash:
-                return "indicator_not_live"
-            if not _latest_decision_is_approved(
-                    conn, item.plugin_name, item.content_hash):
-                return "indicator_not_approved"
-    try:
-        require_no_open_deploy_ops(conn, names, operation="signal production")
-    except Exception:
-        return "open_deploy_op"
-    return None
 
 
 # 失敗通知の再通知間隔 (初回の次は 61・121… 回目)。内部定数。
