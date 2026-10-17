@@ -12,6 +12,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.plugin import loader, switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
+from agentic_fx.store import plugin_deploy_ops as deploy_ops_store
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
 
@@ -69,6 +70,24 @@ def test_retire_rejects_when_unresolved_journal_exists(env):
         switch_required=True, actor="human", now=NOW, commit=True)
     with pytest.raises(switch.UnresolvedJournalError):
         switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+
+
+def test_retire_rejects_when_open_deploy_op_exists(env):
+    """An open disable intent blocks legacy retirement until deploy reconciliation."""
+    tmp_path, plugins_dir, conn, settings = env
+    _write(plugins_dir / "sma")
+    deploy_ops_store.insert_intent(
+        conn, op_kind="retire_plain", name="sma", from_kind="plain",
+        to_kind="retired", from_target=None, to_target=None,
+        retired_path="_retired/sma-20260820T030000Z", subject_content_hash=None,
+        subject_artifact_hash=None, target_content_hash=None,
+        target_artifact_hash=None, approval_id=None, revoke=False,
+        revoke_row_id=None, force=False, actor="human_cli", now=NOW)
+
+    with pytest.raises(switch.OpenDeployOpError, match="op_id=1"):
+        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    assert issubclass(switch.OpenDeployOpError, switch.UnresolvedJournalError)
+    assert (plugins_dir / "sma").is_dir()
 
 
 def test_retire_rejects_when_live_is_a_symlink(env):

@@ -35,6 +35,7 @@ from agentic_fx.tools import plugin_loader as tools_plugin_loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
+from agentic_fx.plugin import deploy_ops as deploy_ops_common
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
@@ -1591,6 +1592,7 @@ def approve_candidate(
         dep_names = _dependency_names(candidate_dir_pre, name)
     except CandidateMissingError:
         dep_names = [name]
+    dep_names = sorted(set(dep_names) | _payload_indicator_names(payload_pre))
 
     with _plugin_locks(plugins_root, dep_names,
                        **_bounded_lock_kwargs(deadline, stop_event)):  # 0b
@@ -1598,12 +1600,16 @@ def approve_candidate(
             "SELECT * FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
         _check_in_lock(row, require_plugin_kind=require_plugin_kind,
                        expected_payload_sha256=expected_payload_sha256)
+        payload = json.loads(row["payload_json"])
+        config_deps = (_dependency_names(candidate_dir_pre, name)
+                       if candidate_dir_pre is not None else [name])
+        _reject_open_deploy_ops(
+            conn, set(config_deps) | _payload_indicator_names(payload),
+            operation="approval")
         if row["status"] != "pending":
             # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
             return ApprovalOutcome(outcome="already_decided", name=name,
                                   status=row["status"])
-        payload = json.loads(row["payload_json"])
-
         if _is_superseded(conn, row, payload):  # 0c
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1869,6 +1875,31 @@ class UnresolvedJournalError(Exception):
     """retire は未完 switch ジャーナルがあれば拒否する (§5.1)。"""
 
 
+class OpenDeployOpError(UnresolvedJournalError):
+    """A blocking deployment operation intersects this switch/retire request."""
+
+
+def _payload_indicator_names(payload: dict) -> set[str]:
+    """Read only canonical plugin names from an approval's persisted pins."""
+    refs = payload.get("indicator_deps")
+    if not isinstance(refs, dict):
+        return set()
+    return {
+        ref["plugin"] for ref in refs.values()
+        if isinstance(ref, dict) and isinstance(ref.get("plugin"), str)
+        and loader._PLUGIN_NAME_RE.fullmatch(ref["plugin"])
+    }
+
+
+def _reject_open_deploy_ops(conn: sqlite3.Connection, names: set[str], *,
+                            operation: str) -> None:
+    try:
+        deploy_ops_common.require_no_open_deploy_ops(
+            conn, names, operation=operation)
+    except deploy_ops_common.DeployOpBlockedError as exc:
+        raise OpenDeployOpError(str(exc)) from exc
+
+
 class LiveHashMismatchAfterSwitchError(RuntimeError):
     """切替後の live 版が、承認したハッシュと一致しない。"""
 
@@ -1927,6 +1958,7 @@ def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
                     f"plugin {name!r} has an unresolved switch journal "
                     f"(op_id={unresolved['op_id']}) — resolve it first "
                     "(reconcile or approval retry)")
+            _reject_open_deploy_ops(conn, {name}, operation="retire")
             live = root / name
             if not live.is_dir() or live.is_symlink():
                 raise ValueError(f"plugins/{name} is not a plain directory "
@@ -2133,6 +2165,7 @@ def bless_candidate(
                 f"(op_id={existing_journal['op_id']}, "
                 f"approval_id={existing_journal['approval_id']}) blocks "
                 f"bless — resolve it first (reconcile or approval retry)")
+        _reject_open_deploy_ops(conn, set(pre_deps), operation="bless")
 
         meta, content_hash, artifact_hash, outcome = _run_full_gate(
             conn, human_dir, name=name, settings=settings, now=now,

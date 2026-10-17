@@ -64,6 +64,30 @@ def main() -> None:
             Path(barrier_file + ".reject_result").write_text(type(exc).__name__)
         else:
             Path(barrier_file + ".reject_result").write_text("ok")
+    elif role == "deploy_lock":
+        # The parent holds this flock before spawning us.  Prove that fact with
+        # LOCK_NB before entering the real blocking helper; no timing assumption
+        # is used to claim that the lock is held.
+        lock_path = plugins_root / ".locks" / "sma.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            probe = open(lock_path, "a+")
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except BlockingIOError:
+                probe.close()
+                Path(barrier_file).write_text("holder_confirmed")
+                break
+            probe.close()
+            time.sleep(0.01)
+        else:
+            raise RuntimeError("holder was not observed")
+        from agentic_fx.plugin.deploy_ops import acquire_op_locks
+        with acquire_op_locks(
+                plugins_root, "sma", enumerate_dependents=lambda: {"adx"}):
+            Path(str(barrier_file) + ".deploy_result").write_text("acquired")
 
 
 if __name__ == "__main__":

@@ -2,8 +2,10 @@
 (プラン 10 Task 11g、§8.1-32、設計書 §5 変異リスト「flock を落とす」の killer)。"""
 from __future__ import annotations
 
+import fcntl
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,6 +16,30 @@ from agentic_fx.plugin import switch
 from agentic_fx.store import db as db_store
 
 NOW = datetime(2026, 8, 20, 3, 0, tzinfo=timezone.utc)
+
+
+def test_acquire_op_locks_waits_for_another_process_and_then_acquires(tmp_path):
+    """The shared deploy lock blocks behind a real holder, then takes all names."""
+    plugins_dir = tmp_path / "plugins"
+    lock_path = plugins_dir / ".locks" / "sma.lock"
+    lock_path.parent.mkdir(parents=True)
+    holder = open(lock_path, "a+")
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    barrier = tmp_path / "deploy_barrier"
+    worker = Path(__file__).parent / "_flock_worker.py"
+    process = subprocess.Popen(
+        [sys.executable, str(worker), str(tmp_path / "agentic.db"), str(plugins_dir),
+         "deploy_lock", "0", str(barrier)], stdin=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not barrier.exists():
+        time.sleep(0.01)
+    assert barrier.read_text() == "holder_confirmed"
+    assert not Path(str(barrier) + ".deploy_result").exists()
+    fcntl.flock(holder, fcntl.LOCK_UN)
+    holder.close()
+    process.wait(timeout=10)
+    assert process.returncode == 0
+    assert Path(str(barrier) + ".deploy_result").read_text() == "acquired"
 
 
 def _fake_pytest_ok(plugin_dir, *, settings):
