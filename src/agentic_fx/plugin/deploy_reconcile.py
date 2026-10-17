@@ -46,10 +46,23 @@ def _syscall_failed(conn, row, activity, *, now) -> ReconcileResult:
     return _set(conn, row, "needs_retry", activity, now=now, fail_reason="syscall_failed")
 
 
+def _readlink_or_none(live: Path) -> str | None:
+    try:
+        return os.readlink(live)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
 def _reconcile_disable(conn, plugins_root: Path, row: dict, activity, *, now) -> ReconcileResult:
     live = plugins_root / row["name"]
     if live.is_symlink():
-        if os.readlink(live) != row["from_target"]:
+        try:
+            raw = _readlink_or_none(live)
+        except OSError:
+            return _syscall_failed(conn, row, activity, now=now)
+        if raw is None:
+            return _set(conn, row, "done", activity, now=now)
+        if raw != row["from_target"]:
             return _set(conn, row, "foreign", activity, now=now)
         try:
             os.unlink(live)
@@ -79,13 +92,19 @@ def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settin
     live = plugins_root / name
     to_target = row["to_target"]
     if live.is_symlink():
-        raw = os.readlink(live)
-        if raw == to_target:
-            return _set(conn, row, "done", activity, now=now)
-        at_from = (row["from_kind"] == "symlink"
-                   and deploy_ops.live_matches_from(live, row["from_target"]))
-        if not at_from:
-            return _set(conn, row, "foreign", activity, now=now)
+        try:
+            raw = _readlink_or_none(live)
+        except OSError:
+            return _syscall_failed(conn, row, activity, now=now)
+        if raw is None:
+            at_from = False
+        else:
+            if raw == to_target:
+                return _set(conn, row, "done", activity, now=now)
+            at_from = (row["from_kind"] == "symlink"
+                       and deploy_ops.live_matches_from(live, row["from_target"]))
+            if not at_from:
+                return _set(conn, row, "foreign", activity, now=now)
     elif os.path.lexists(live):
         return _set(conn, row, "foreign", activity, now=now)
     else:

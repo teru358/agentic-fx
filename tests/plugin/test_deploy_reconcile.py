@@ -532,6 +532,48 @@ def _unlink_then_vanish(monkeypatch):
     monkeypatch.setattr(os, "unlink", vanish)
 
 
+def _readlink_then_vanish(monkeypatch):
+    real = os.readlink
+    first = True
+
+    def vanish(path, *args, **kwargs):
+        nonlocal first
+        if first:
+            first = False
+            os.unlink(path)
+            raise FileNotFoundError(errno.ENOENT, "gone")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "readlink", vanish)
+
+
+def test_a_disable_whose_live_vanishes_before_readlink_completes(world, monkeypatch):
+    a, b, c = world.three_generations()
+    op = world.intent("sma", op_kind="disable_symlink", from_ver=c)
+    monkeypatch.setattr(deploy_reconcile, "_row_dependents", lambda *args: {"sma"})
+    _readlink_then_vanish(monkeypatch)
+
+    results = _reconcile(world)
+
+    assert _state(world, op) == ("done", None)
+    assert [result.outcome for result in results] == ["done"]
+    assert "error" not in [result.outcome for result in results]
+
+
+def test_a_rollback_whose_live_vanishes_before_readlink_uses_absent_path(world, monkeypatch):
+    a, b, c = world.three_generations()
+    op = world.intent("sma", from_ver=c, to_ver=b)
+    monkeypatch.setattr(deploy_reconcile, "_row_dependents", lambda *args: {"sma"})
+    _readlink_then_vanish(monkeypatch)
+
+    results = _reconcile(world)
+
+    assert _state(world, op) == ("done", None)
+    assert os.readlink(world.root / "sma") == f".versions/sma/{b.name}"
+    assert [result.outcome for result in results] == ["done"]
+    assert "error" not in [result.outcome for result in results]
+
+
 def test_a_disable_whose_live_vanishes_before_the_unlink_is_done(world, monkeypatch):
     a, b, c = world.three_generations()
     op = world.intent("sma", op_kind="disable_symlink", from_ver=c)
