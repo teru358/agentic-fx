@@ -377,16 +377,19 @@ class TradeLoop:
                             _, fresh_until = signals.freshness_window(
                                 claimed["timeframe"], claimed["bar_ts"],
                                 self.settings.plugin.signal_freshness_bars)
-                            if gate_now > datetime.fromisoformat(fresh_until):
+                            signal_stale = gate_now > datetime.fromisoformat(
+                                fresh_until)
+                            snapshot_reason = (
+                                snapshot_age_exceeded(
+                                    open_snapshot, gate_now,
+                                    self.settings.worker.snapshot_max_age_sec)
+                                if open_snapshot is not None else None)
+                            if signal_stale:
                                 source_rejected = True
                                 reason = "signal stale"
                                 signals.abandon_claimed(self.conn, claimed["id"])
                                 consumed = True
-                            elif open_snapshot is not None and (
-                                    snapshot_reason := snapshot_age_exceeded(
-                                        open_snapshot, gate_now,
-                                        self.settings.worker.snapshot_max_age_sec)
-                                    ) is not None:
+                            elif snapshot_reason is not None:
                                 source_rejected = True
                                 reason = snapshot_reason
                             elif self._plugins_root is not None:

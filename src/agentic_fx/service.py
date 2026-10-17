@@ -755,6 +755,7 @@ class App:
     # build_app が解決した root (起動時表示が記録を読むために使う)。
     root: Path | None = None
     conn_signal: object | None = None
+    signal_connection_failures: int = 0
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -1203,6 +1204,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     instance_lock = _acquire_lock_unless_enrolling(root)
     # 失敗時に閉じるため、ops 層の資源は try の外で名前を用意しておく。
     conn_ops = None
+    conn_signal = None
     ops_service = None
 
     try:
@@ -1543,39 +1545,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 signal_max_id=row[0])
 
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
-        signal_connection_failures = 0
 
         def on_signal_maintenance(now: datetime) -> None:
-            nonlocal signal_connection_failures
-            conn = app.conn_signal
-            try:
-                if conn is None:
-                    raise RuntimeError("signal connection is unavailable")
-                if conn.in_transaction:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = connect(root / "data" / "agentic.db")
-                        app.conn_signal = conn
-                    if conn.in_transaction:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = connect(root / "data" / "agentic.db")
-                        app.conn_signal = conn
-            except Exception as exc:  # noqa: BLE001
-                signal_connection_failures += 1
-                health_latch.record_failure(
-                    "signal_conn_unavailable: " + safe_error_text(exc))
-                if signal_connection_failures >= 3:
-                    _record_fatal(app, stop_event, "signal connection unavailable")
+            if not _repair_signal_connection(app):
                 return
-            signal_connection_failures = 0
             # codex plan r2 束2 Critical: キーは `InventoryBuildResult.
             # resolved` と同じ `(name, content_hash)` のまま渡す —
             # `content_hash` だけへ潰すと、同一 content_hash・別名の 2
@@ -1591,11 +1564,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             except Exception:  # noqa: BLE001
                 _log.exception("signal maintenance failed")
             finally:
-                try:
-                    if app.conn_signal is not None and app.conn_signal.in_transaction:
-                        app.conn_signal.rollback()
-                except Exception:
-                    _log.exception("signal maintenance rollback failed")
+                _repair_signal_connection(app)
 
         requirement_registry = build_registry(settings, approved)
         retention_plan = ohlcv.build_retention_plan(
@@ -1758,6 +1727,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         if conn_ops is not None:
             try:
                 conn_ops.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if conn_signal is not None:
+            try:
+                conn_signal.close()
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -2200,6 +2174,44 @@ def _thread_has_died(thread_obj) -> bool:
     「ident が付いていて、かつ生きていない」= 本当に死んだ、と判定できる。
     """
     return getattr(thread_obj, "ident", 1) is not None and not thread_obj.is_alive()
+
+
+def _repair_signal_connection(app: App) -> bool:
+    """signal maintenance 専用接続を使える状態にする。使えれば True。
+
+    接続が無い、transaction が残り rollback できない、rollback 後も
+    transaction が残る、のいずれかなら旧接続を捨てて `connect()` で
+    作り直し `App.conn_signal` を差し替える。作り直しに失敗したら
+    `signal_conn_unavailable` を記録して False を返し、連続 3 回で fatal に乗せる。"""
+    conn = app.conn_signal
+    broken = conn is None
+    if conn is not None:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+                broken = bool(conn.in_transaction)
+        except Exception:  # noqa: BLE001
+            broken = True
+    if not broken:
+        app.signal_connection_failures = 0
+        return True
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        app.conn_signal = None
+    try:
+        app.conn_signal = connect(app.root / "data" / "agentic.db")
+    except Exception as exc:  # noqa: BLE001
+        app.signal_connection_failures += 1
+        app.health_latch.record_failure(
+            "signal_conn_unavailable: " + safe_error_text(exc))
+        if app.signal_connection_failures >= 3:
+            _record_fatal(app, app.stop_event, "signal connection unavailable")
+        return False
+    app.signal_connection_failures = 0
+    return True
 
 
 def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:

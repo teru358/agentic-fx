@@ -93,6 +93,95 @@ def test_signal_staleness_wins_over_snapshot_staleness(tmp_path):
     assert _last_intent(conn)["reject_category"] == "signal"
 
 
+def test_both_staleness_predicates_are_evaluated_then_signal_wins(tmp_path):
+    """両方 stale のとき両述語を評価し、優先順位は signal stale が先。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
+    sid = _add(conn)
+    real_gather = loop.executor.gather_open_snapshot
+
+    def gather_then_advance(*args, **kwargs):
+        snapshot = real_gather(*args, **kwargs)
+        late = NOW + timedelta(hours=3)
+        loop.clock = FixedClock(late)
+        loop.executor.clock = FixedClock(late)
+        return snapshot
+
+    loop.executor.gather_open_snapshot = gather_then_advance
+    with patch("agentic_fx.loops.trade_loop.snapshot_age_exceeded",
+               wraps=snapshot_age_exceeded) as spy:
+        out = loop.run_once("signal")
+
+    assert spy.call_count == 1
+    assert out["reasons"] == ["signal stale"]
+    row = conn.execute(
+        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert dict(row) == {"status": "abandoned", "requeue_count": 0}
+
+
+def _plain_indicator_world(tmp_path):
+    """plain の indicator ディレクトリだけが live にある plugins root。"""
+    from types import SimpleNamespace
+    root = tmp_path / "plugins"
+    (root / "legacy_ind").mkdir(parents=True)
+    resolved = SimpleNamespace(items=(SimpleNamespace(
+        plugin_name="legacy_ind", content_hash="f" * 64),))
+    return root, resolved
+
+
+def _approve_strategy(conn):
+    import json
+    conn.execute(
+        "INSERT INTO approval_requests (kind,status,payload_json,decided_at,"
+        "created_at) VALUES ('plugin','approved',?,?,?)",
+        (json.dumps({"name": "strategy", "content_hash": "a" * 64}),
+         NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+
+def test_open_gate_accepts_strategy_depending_on_plain_indicator(tmp_path):
+    """plain の indicator は存在だけを見る (hash / 最新決定は照合しない)。"""
+    from agentic_fx.loops.trade_loop import signal_source_active
+    from agentic_fx.plugin import signal_producer
+    conn, _loop_obj, _, _ = _loop(tmp_path, [])
+    root, resolved = _plain_indicator_world(tmp_path)
+    live = type("Id", (), {"kind": "plain", "content_hash": "0" * 64,
+                           "artifact_hash": None})
+    strategy = type("Id", (), {"kind": "plain", "content_hash": "a" * 64,
+                               "artifact_hash": None})
+    _approve_strategy(conn)
+
+    def identity(_root, name):
+        return strategy if name == "strategy" else live
+
+    with patch.object(signal_producer.plugin_deploy_ops, "live_identity", identity):
+        assert signal_source_active(
+            conn, root, "strategy", "a" * 64, resolved) is True
+        assert signal_producer._live_source_reason(
+            conn, root, type("M", (), {"name": "strategy",
+                                       "content_hash": "a" * 64,
+                                       "artifact_hash": None})(),
+            resolved, {"strategy", "legacy_ind"}) is None
+
+
+def test_symlink_indicator_hash_mismatch_is_not_live(tmp_path):
+    from agentic_fx.loops.trade_loop import signal_source_active
+    from agentic_fx.plugin import signal_producer
+    conn, _loop_obj, _, _ = _loop(tmp_path, [])
+    root, resolved = _plain_indicator_world(tmp_path)
+    strategy = type("Id", (), {"kind": "plain", "content_hash": "a" * 64,
+                               "artifact_hash": None})
+    linked = type("Id", (), {"kind": "symlink", "content_hash": "0" * 64,
+                             "artifact_hash": "x"})
+    _approve_strategy(conn)
+
+    def identity(_root, name):
+        return strategy if name == "strategy" else linked
+
+    with patch.object(signal_producer.plugin_deploy_ops, "live_identity", identity):
+        assert signal_source_active(
+            conn, root, "strategy", "a" * 64, resolved) is False
+
+
 def test_snapshot_age_helper_has_shared_strict_boundary(tmp_path):
     """OPEN gate と executor が同じ helper を使い、等号は許可する。"""
     conn, loop, _, _ = _loop(tmp_path, [])

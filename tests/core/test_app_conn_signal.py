@@ -82,6 +82,154 @@ def test_three_connection_failures_latch_then_stop(tmp_path, monkeypatch):
         app.close()
 
 
+def test_connection_failures_skip_without_progress_then_fatal(
+        tmp_path, monkeypatch):
+    """再生成失敗は skip (cursor 不進行・保守なし)、3 回目で fatal と stop。"""
+    app = _app(tmp_path)
+    app.conn_signal = None
+    connect_mock = MagicMock(side_effect=OSError("cannot connect"))
+    maintenance = MagicMock()
+    failures = []
+    fatal = []
+    try:
+        monkeypatch.setattr("agentic_fx.service.connect", connect_mock)
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            maintenance)
+        monkeypatch.setattr(app.health_latch, "record_failure", failures.append)
+        monkeypatch.setattr(
+            "agentic_fx.service._record_fatal",
+            lambda app_, stop, reason: (fatal.append(reason), stop.set()))
+        for expected in (1, 2):
+            app.scheduler.on_signal_maintenance(NOW)
+            assert connect_mock.call_count == expected
+            assert len(failures) == expected
+            assert fatal == [] and not app.stop_event.is_set()
+        app.scheduler.on_signal_maintenance(NOW)
+        assert connect_mock.call_count == 3
+        assert fatal == ["signal connection unavailable"]
+        assert app.stop_event.is_set()
+        assert all(f.startswith("signal_conn_unavailable:") for f in failures)
+        maintenance.assert_not_called()
+        assert app.conn_signal is None
+    finally:
+        app.close()
+
+
+def test_successful_reconnect_resets_failure_counter(tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    app.conn_signal = None
+    replacement = MagicMock(in_transaction=False)
+    fatal = []
+    try:
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            lambda **_kw: None)
+        monkeypatch.setattr("agentic_fx.service._record_fatal",
+                            lambda *_a: fatal.append(1))
+        monkeypatch.setattr("agentic_fx.service.connect",
+                            MagicMock(side_effect=OSError("down")))
+        app.scheduler.on_signal_maintenance(NOW)
+        app.scheduler.on_signal_maintenance(NOW)
+        assert app.signal_connection_failures == 2
+        monkeypatch.setattr("agentic_fx.service.connect", lambda _p: replacement)
+        app.scheduler.on_signal_maintenance(NOW)
+        assert app.signal_connection_failures == 0
+        assert app.conn_signal is replacement
+        assert fatal == []
+    finally:
+        app.conn_signal = None
+        app.close()
+
+
+def test_exit_rollback_failure_replaces_connection_without_reuse(
+        tmp_path, monkeypatch):
+    """出口の rollback 失敗: 旧接続を close し、connect で差し替え、再利用しない。"""
+    app = _app(tmp_path)
+    old = MagicMock(in_transaction=False)
+    replacement = MagicMock(in_transaction=False)
+    app.conn_signal = old
+    connect_mock = MagicMock(return_value=replacement)
+
+    def leave_transaction_open(**_kwargs):
+        old.in_transaction = True
+        old.rollback.side_effect = RuntimeError("rollback failed")
+
+    try:
+        monkeypatch.setattr("agentic_fx.service.connect", connect_mock)
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            leave_transaction_open)
+        app.scheduler.on_signal_maintenance(NOW)
+        assert old.close.called
+        assert connect_mock.call_count == 1
+        assert app.conn_signal is replacement
+
+        # 次 tick は新接続だけを使い、旧接続には触れない。
+        old.reset_mock()
+        received = []
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            lambda **kw: received.append(kw["conn"]))
+        app.scheduler.on_signal_maintenance(NOW)
+        assert received == [replacement]
+        assert connect_mock.call_count == 1
+        assert not old.method_calls
+    finally:
+        app.conn_signal = None
+        app.close()
+
+
+def test_exit_connect_failure_leaves_none_and_next_tick_retries(
+        tmp_path, monkeypatch):
+    app = _app(tmp_path)
+    old = MagicMock(in_transaction=False)
+    app.conn_signal = old
+    replacement = MagicMock(in_transaction=False)
+    connect_mock = MagicMock(side_effect=[OSError("down"), replacement])
+
+    def leave_transaction_open(**_kwargs):
+        old.in_transaction = True
+        old.rollback.side_effect = RuntimeError("rollback failed")
+
+    try:
+        monkeypatch.setattr("agentic_fx.service.connect", connect_mock)
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            leave_transaction_open)
+        app.scheduler.on_signal_maintenance(NOW)
+        assert app.conn_signal is None
+        assert app.signal_connection_failures == 1
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            lambda **_kw: None)
+        app.scheduler.on_signal_maintenance(NOW)
+        assert app.conn_signal is replacement
+        assert app.signal_connection_failures == 0
+    finally:
+        app.conn_signal = None
+        app.close()
+
+
+def test_build_app_failure_closes_signal_connection(tmp_path, monkeypatch):
+    """conn_signal 作成後の build_app 失敗で、その接続を close する。"""
+    _init(tmp_path)
+    created = []
+    real_connect = connect
+
+    def tracking_connect(path):
+        conn = real_connect(path)
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr("agentic_fx.service.connect", tracking_connect)
+    monkeypatch.setattr("agentic_fx.service.seed_default_sources",
+                        MagicMock(side_effect=RuntimeError("boom")))
+    import pytest
+    with pytest.raises(RuntimeError, match="boom"):
+        build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                  embedding_fn=FakeEmbedding())
+    assert len(created) >= 2
+    signal_conn = created[1]
+    import sqlite3
+    with pytest.raises(sqlite3.ProgrammingError):
+        signal_conn.execute("SELECT 1")
+
+
 def test_close_orders_signal_before_core_and_busy_skips_both(tmp_path):
     """残存 scheduler は core/signal の両接続を close してはならない。"""
     order = []

@@ -976,10 +976,24 @@ def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
         real_maintenance = app.scheduler.on_signal_maintenance
         real_signal_due = app.scheduler.signal_due_fn
 
+        producer_done = threading.Event()
+
         def maintenance_after_core_unlock(now):
             assert not app.core_lock._is_owned()
             events.append("maintenance")
             real_maintenance(now)
+            producer_done.set()
+
+        # mission の claim は、submit 後の producer INSERT が終わるまで待たせる。
+        # submit 時点の signal ID 上限が効いていなければ、tick 1 の mission が
+        # この INSERT 済み signal を claim してしまう。
+        real_run_once = app.trade_loop.run_once
+
+        def run_once_after_producer(*args, **kwargs):
+            assert producer_done.wait(timeout=5.0)
+            return real_run_once(*args, **kwargs)
+
+        app.trade_loop.run_once = run_once_after_producer
 
         def signal_due_on_next_decision(now):
             events.append("signal_due")

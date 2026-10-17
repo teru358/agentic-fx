@@ -462,7 +462,9 @@ def _live_source_reason(conn, plugins_root: Path, meta: PluginMeta, resolved,
             identity = plugin_deploy_ops.live_identity(plugins_root, item.plugin_name)
             if identity is None:
                 return "indicator_not_live"
-            if identity.kind == "symlink" and identity.content_hash != item.content_hash:
+            if identity.kind == "plain":
+                continue
+            if identity.content_hash != item.content_hash:
                 return "indicator_not_live"
             if not _latest_decision_is_approved(
                     conn, item.plugin_name, item.content_hash):
