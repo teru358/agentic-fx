@@ -165,7 +165,7 @@ def live_identity(plugins_root: Path, name: str) -> LiveIdentity | None:
     from agentic_fx.core import plugin_files
     from agentic_fx.plugin import loader
 
-    if not name or "/" in name or "\\" in name or name in (".", ".."):
+    if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
     live = Path(plugins_root) / name
     if live.is_symlink():
@@ -174,7 +174,11 @@ def live_identity(plugins_root: Path, name: str) -> LiveIdentity | None:
             target = os.readlink(live)
             if not loader.is_canonical_symlink_target(name, target):
                 return unknown
-            version_dir = Path(plugins_root) / target
+            version_dir = (Path(plugins_root) / target).resolve()
+            try:
+                version_dir.relative_to(Path(plugins_root).resolve())
+            except ValueError:
+                return unknown
             if not version_dir.is_dir():
                 return unknown
             content = loader.content_hash(version_dir)

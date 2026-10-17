@@ -144,6 +144,11 @@ _PLUGIN_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _SYMLINK_TARGET_RE_TMPL = r"^\.versions/{name}/[0-9a-f]{{64}}$"
 
 
+def is_canonical_plugin_name(name: str) -> bool:
+    """`name` が plugin 名の正規形 (`^[a-z][a-z0-9_]{0,63}$`) か。"""
+    return _PLUGIN_NAME_RE.fullmatch(name) is not None
+
+
 def is_canonical_symlink_target(name: str, target: str) -> bool:
     """`target` (`os.readlink` の生文字列) が `.versions/<name>/<64 hex>` の正規形か。"""
     pattern = re.compile(_SYMLINK_TARGET_RE_TMPL.format(name=re.escape(name)))

@@ -667,7 +667,30 @@ def test_live_identity_regular_file(tmp_path):
     assert deploy_ops.live_identity(tmp_path, "alpha") is None
 
 
-@pytest.mark.parametrize("name", ["a/b", "..", "../alpha"])
-def test_live_identity_rejects_path_in_name(tmp_path, name):
+@pytest.mark.parametrize("name", [
+    "a/b", "..", "../alpha", "Alpha", "_alpha", "a" * 65, "", ".", "a\\b"])
+def test_live_identity_rejects_noncanonical_name(tmp_path, name):
     with pytest.raises(ValueError):
         deploy_ops.live_identity(tmp_path, name)
+
+
+def test_live_identity_intermediate_symlink_escape(tmp_path):
+    root = tmp_path / "plugins"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    _li_write(outside / "alpha" / ("a" * 64))
+    (root / ".versions").symlink_to(outside)
+    (root / "alpha").symlink_to(f".versions/alpha/{'a' * 64}")
+    assert deploy_ops.live_identity(root, "alpha") == \
+        deploy_ops.LiveIdentity("symlink", None, None)
+
+
+def test_live_identity_inner_versions_symlink_allowed(tmp_path):
+    root = tmp_path / "plugins"
+    real = root / "real_versions"
+    vdir = _li_write(real / "alpha" / ("a" * 64))
+    (root / ".versions").symlink_to(real)
+    (root / "alpha").symlink_to(f".versions/alpha/{'a' * 64}")
+    content, artifact = _li_expected(vdir)
+    assert deploy_ops.live_identity(root, "alpha") == \
+        deploy_ops.LiveIdentity("symlink", content, artifact)
