@@ -149,6 +149,39 @@ def test_insert_and_set_phase_keep_updated_at_after_all_name_events(tmp_path):
     assert deploy_ops.list_by_name(conn, "alpha")[0]["phase"] == "done"
 
 
+def test_insert_done_revoke_satisfies_revoke_check_constraints(tmp_path):
+    conn = _conn(tmp_path)
+
+    op_id = deploy_ops.insert_done_revoke(
+        conn, name="alpha", subject_content_hash="content-old",
+        subject_artifact_hash="artifact-old", approval_id=7, revoke_row_id=8,
+        actor="human_cli", now=NOW)
+
+    row = conn.execute("SELECT * FROM plugin_deploy_ops WHERE op_id=?", (op_id,)).fetchone()
+    assert row["op_kind"] == "revoke"
+    assert row["from_kind"] == row["to_kind"] == "none"
+    assert row["phase"] == "done"
+    assert row["revoke"] == 1
+    assert row["force"] == row["notify_attempted"] == 0
+
+
+def test_insert_done_revoke_updated_at_is_monotonic_for_name(tmp_path):
+    conn = _conn(tmp_path)
+    first = deploy_ops.insert_done_revoke(
+        conn, name="alpha", subject_content_hash="content-old",
+        subject_artifact_hash="artifact-old", approval_id=7, revoke_row_id=8,
+        actor="human_cli", now=NOW)
+    second = deploy_ops.insert_done_revoke(
+        conn, name="alpha", subject_content_hash="content-new",
+        subject_artifact_hash="artifact-new", approval_id=9, revoke_row_id=10,
+        actor="human_cli", now=NOW)
+
+    rows = conn.execute(
+        "SELECT updated_at FROM plugin_deploy_ops WHERE op_id IN (?,?) ORDER BY op_id",
+        (first, second)).fetchall()
+    assert datetime.fromisoformat(rows[1]["updated_at"]) > datetime.fromisoformat(rows[0]["updated_at"])
+
+
 def test_live_history_merges_sources_and_normalizes_event_time(tmp_path):
     conn = _conn(tmp_path)
     switch_journal.insert(conn, kind="approve", approval_id=1, name="alpha",

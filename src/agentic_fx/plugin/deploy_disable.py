@@ -1,0 +1,236 @@
+"""Disable and revoke deployment operations; intentionally not a tools API."""
+from __future__ import annotations
+
+import os
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from agentic_fx.plugin import deploy_ops
+from agentic_fx.plugin.deploy_deps import DependentsReport, enumerate_dependents
+from agentic_fx.plugin import loader
+from agentic_fx.store import approvals as approvals_store
+from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store import signals as signals_store
+
+
+@dataclass(frozen=True)
+class DisableOutcome:
+    outcome: str
+    name: str
+    filesystem_switched: bool = False
+    runtime_deactivation: str | None = None
+    cascade_strategies: tuple[str, ...] = ()
+    dependents: tuple[tuple[str, str, str], ...] = ()
+    version_candidate: str | None = None
+    op_id: int | None = None
+
+
+@dataclass(frozen=True)
+class RevokeOutcome:
+    outcome: str
+    name: str
+    content_hash: str
+    op_id: int | None = None
+
+
+def _activity(activity):
+    return activity if activity is not None else _NullActivity()
+
+
+class _NullActivity:
+    def write(self, *args, **kwargs) -> None:
+        return None
+
+
+class _RevokeActivity:
+    def __init__(self, activity, content_hash: str) -> None:
+        self._activity = _activity(activity)
+        self._content_hash = content_hash
+
+    def write(self, category, event: str, summary: str) -> None:
+        self._activity.write(category, event, f"{summary} version={self._content_hash}")
+
+
+def _latest_disable_candidate(conn: sqlite3.Connection, name: str) -> str | None:
+    for row in reversed(deploy_store.list_by_name(conn, name)):
+        if row["op_kind"] == "disable_symlink" and row["phase"] == "done":
+            return row["subject_content_hash"]
+    return None
+
+
+def _approved_row(conn: sqlite3.Connection, name: str, content_hash: str) -> dict | None:
+    rows = []
+    import json
+    for row in conn.execute(
+            "SELECT * FROM approval_requests WHERE kind='plugin' "
+            "AND status='approved' AND decided_at IS NOT NULL "
+            "ORDER BY decided_at,id"):
+        try:
+            payload = json.loads(row["payload_json"])
+        except (ValueError, TypeError):
+            continue
+        if payload.get("name") == name and payload.get("content_hash") == content_hash:
+            rows.append(dict(row))
+    return rows[-1] if rows else None
+
+
+def _find_version_identity(plugins_root: Path, name: str, content_hash: str):
+    base = plugins_root / ".versions" / name
+    if not base.is_dir():
+        return None
+    for candidate in base.iterdir():
+        if not candidate.is_dir():
+            continue
+        try:
+            if loader.content_hash(candidate) != content_hash:
+                continue
+            artifact = loader.artifact_hash_bytes(
+                (candidate / "plugin.py").read_bytes(),
+                (candidate / "config.yaml").read_bytes(),
+                (candidate / "test_plugin.py").read_bytes())
+        except OSError:
+            continue
+        return candidate, artifact
+    return None
+
+
+def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, revoke: bool,
+                   force: bool, now: datetime, actor: str = "human_cli", settings,
+                   activity=None, deadline: float | None = None, stop_event=None,
+                   dry_run: bool = False) -> DisableOutcome:
+    """Journal-first unlink of a canonical live symlink."""
+    if not loader.is_canonical_plugin_name(name):
+        raise ValueError(f"invalid plugin name: {name!r}")
+
+    report_box: list[DependentsReport] = []
+
+    def dependents() -> set[str]:
+        report = enumerate_dependents(conn, plugins_root, name, settings=settings)
+        report_box[:] = [report]
+        return report.dependent_names
+
+    with deploy_ops.acquire_op_locks(plugins_root, name, enumerate_dependents=dependents,
+                                     deadline=deadline, stop_event=stop_event):
+        report = report_box[-1]
+        open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
+        live = deploy_store.live_identity(plugins_root, name)
+        live_path = plugins_root / name
+        if live is None:
+            if revoke:
+                return DisableOutcome("revoke_requires_version", name,
+                                      version_candidate=_latest_disable_candidate(conn, name))
+            return DisableOutcome("already_disabled", name)
+        if live.kind == "plain":
+            raise ValueError(f"plugins/{name} is a plain directory; use afx plugin retire")
+        raw_target = os.readlink(live_path)
+        if not loader.is_canonical_symlink_target(name, raw_target) or not live.content_hash or not live.artifact_hash:
+            raise ValueError(f"plugins/{name} is not a canonical verified symlink")
+        requested = deploy_ops.Signature("disable_symlink", name, live.content_hash,
+                                         live.artifact_hash, None, revoke, force)
+        if open_row is not None:
+            if dry_run:
+                if deploy_ops.row_signature(open_row) != requested:
+                    raise deploy_ops.SignatureMismatchError(
+                        f"open deploy op op_id={open_row['op_id']} has a different signature")
+                op_id = int(open_row["op_id"])
+            else:
+                op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
+        else:
+            op_id = None
+        if report.unresolvable and not force:
+            return DisableOutcome("dependents_blocked", name, dependents=report.unresolvable)
+        approved = _approved_row(conn, name, live.content_hash)
+        if revoke and approved is None:
+            raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
+        if dry_run:
+            return DisableOutcome("dry_run", name, cascade_strategies=tuple(sorted(report.dependent_names)),
+                                  dependents=report.unresolvable)
+        if op_id is None:
+            identities = [(name, live.content_hash)]
+            identities.extend((strategy, content) for strategy, content in _strategy_identities(
+                conn, report.dependent_names))
+            op_id = deploy_ops.record_intent(
+                conn, intent_row={
+                    "op_kind": "disable_symlink", "name": name, "from_kind": "symlink",
+                    "to_kind": "absent", "from_target": raw_target, "to_target": None,
+                    "retired_path": None, "subject_content_hash": live.content_hash,
+                    "subject_artifact_hash": live.artifact_hash, "target_content_hash": None,
+                    "target_artifact_hash": None, "approval_id": approved["id"] if approved else None,
+                    "force": force,
+                }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
+                cascade_identities=identities, now=now, actor=actor)
+        if not live_path.is_symlink():
+            deploy_store.set_phase(conn, op_id, "foreign", now=now)
+            row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
+            deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+            return DisableOutcome("foreign", name, op_id=op_id)
+        try:
+            os.unlink(live_path)
+        except OSError:
+            deploy_store.set_phase(conn, op_id, "needs_retry", now=now, fail_reason="syscall_failed")
+            row = deploy_store.get_open_by_name(conn, name)
+            deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+            return DisableOutcome("needs_retry", name, op_id=op_id)
+        deploy_store.set_phase(conn, op_id, "done", now=now)
+        row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
+        deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+        return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
+                              tuple(sorted(report.dependent_names)), op_id=op_id)
+
+
+def _strategy_identities(conn: sqlite3.Connection, names: set[str]):
+    import json
+    for name in sorted(names):
+        row = conn.execute(
+            "SELECT payload_json FROM approval_requests WHERE kind='plugin' AND status='approved' "
+            "AND decided_at IS NOT NULL ORDER BY decided_at DESC,id DESC").fetchall()
+        for candidate in row:
+            payload = json.loads(candidate["payload_json"])
+            if payload.get("name") == name and isinstance(payload.get("content_hash"), str):
+                yield name, payload["content_hash"]
+                break
+
+
+def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, content_hash: str,
+                   now: datetime, actor: str = "human_cli", activity=None,
+                   deadline: float | None = None, stop_event=None) -> RevokeOutcome:
+    """Revoke a non-live version and link its pending/claimed signals atomically."""
+    if not loader.is_canonical_plugin_name(name):
+        raise ValueError(f"invalid plugin name: {name!r}")
+    from agentic_fx.plugin import switch
+    with switch._plugin_locks(plugins_root, [name], deadline=deadline, stop_event=stop_event):
+        open_row = deploy_ops.check_can_start_op(conn, name, dependents=set())
+        if open_row is not None:
+            raise deploy_ops.DeployOpBlockedError(f"plugin {name!r} has open deploy op")
+        live = deploy_store.live_identity(plugins_root, name)
+        if live is not None and live.content_hash == content_hash:
+            raise ValueError("cannot revoke the current live version; disable it first")
+        found = _find_version_identity(plugins_root, name, content_hash)
+        if found is None:
+            raise ValueError(f"no version directory matches {name!r} {content_hash!r}")
+        _version, artifact_hash = found
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            revoke_row_id = approvals_store.append_revocation(
+                conn, name, content_hash, now=now, actor=actor, commit=False)
+            if revoke_row_id is None:
+                conn.rollback()
+                return RevokeOutcome("already_revoked", name, content_hash)
+            payload = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)).fetchone()
+            import json
+            approval_id = json.loads(payload["payload_json"])["revokes_approval_id"]
+            op_id = deploy_store.insert_done_revoke(
+                conn, name=name, subject_content_hash=content_hash,
+                subject_artifact_hash=artifact_hash, approval_id=approval_id,
+                revoke_row_id=revoke_row_id, now=now, actor=actor)
+            signals_store.abandon_pending_for_identities(
+                conn, [(name, content_hash)], op_id=op_id, now=now, commit=False)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
+        deploy_ops.try_notify(conn, row, _RevokeActivity(activity, content_hash), now=now)
+        return RevokeOutcome("revoked", name, content_hash, op_id)
