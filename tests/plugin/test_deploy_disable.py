@@ -528,3 +528,84 @@ def test_rejected_precheck_leaves_a_syscall_failed_open_op_untouched(tmp_path, m
     assert outcome.outcome == "dependents_blocked"
     assert row["phase"] == "needs_retry" and row["fail_reason"] == "syscall_failed"
     assert row["notify_attempted"] == 1
+
+
+def test_rerun_after_crash_before_notify_recovers_the_notification_once(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    live = _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_notify = deploy_disable.deploy_ops.try_notify
+
+    def crash(*args, **kwargs):
+        raise RuntimeError("crash")
+
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify", crash)
+    with pytest.raises(RuntimeError, match="crash"):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify", real_notify)
+    row = deploy_store.list_by_name(conn, "sma")[0]
+    assert row["phase"] == "done" and row["notify_attempted"] == 0
+    assert not os.path.lexists(live)
+
+    activity = _Activity()
+    again = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                          now=NOW, settings=SETTINGS, activity=activity)
+    assert again.outcome == "already_disabled"
+    assert again.notified_op_ids == (row["op_id"],)
+    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert deploy_store.list_by_name(conn, "sma")[0]["notify_attempted"] == 1
+
+    third = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                          now=NOW, settings=SETTINGS, activity=activity)
+    assert third.outcome == "already_disabled" and third.notified_op_ids == ()
+    assert len(activity.events) == 1
+
+
+def test_dry_run_does_not_recover_notifications(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_notify = deploy_disable.deploy_ops.try_notify
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify", real_notify)
+    activity = _Activity()
+    deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                  now=NOW, settings=SETTINGS, activity=activity, dry_run=True)
+    assert activity.events == []
+    assert deploy_store.list_by_name(conn, "sma")[0]["notify_attempted"] == 0
+
+
+def test_absent_live_with_other_kind_open_op_is_blocked_and_db_unchanged(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    _no_dependents(monkeypatch)
+    op_id = deploy_store.insert_intent(
+        conn, op_kind="rollback_symlink", name="sma", from_kind="absent",
+        to_kind="symlink", from_target=None, to_target=".versions/sma/" + "d" * 64,
+        retired_path=None, subject_content_hash=None, subject_artifact_hash=None,
+        target_content_hash="c" * 64, target_artifact_hash="d" * 64, approval_id=None,
+        revoke=False, revoke_row_id=None, force=False, actor="human_cli", now=NOW)
+    before = [dict(r) for r in conn.execute("SELECT * FROM plugin_deploy_ops")]
+    for revoke in (False, True):
+        with pytest.raises(deploy_disable.deploy_ops.DeployOpBlockedError,
+                           match=f"op_id={op_id}.*op_kind=rollback_symlink"):
+            deploy_disable.disable_plugin(conn, root, "sma", revoke=revoke, force=False,
+                                          now=NOW, settings=SETTINGS)
+    assert [dict(r) for r in conn.execute("SELECT * FROM plugin_deploy_ops")] == before

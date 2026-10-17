@@ -265,3 +265,40 @@ def test_revoke_without_recorded_artifact_hash_falls_back_to_directory_or_refuse
 
     assert outcome.outcome == "revoked"
     assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact
+
+
+def test_rerun_after_crash_before_notify_recovers_revoke_notification_once(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    old = _version(root, "sma", value="1.0")
+    current = _version(root, "sma", value="2.0")
+    old_content, _, _ = _approve(conn, "sma", old)
+    _approve(conn, "sma", current, now=NOW + timedelta(seconds=1))
+    (root / "sma").symlink_to(f".versions/sma/{current.name}")
+    real_notify = deploy_disable.deploy_ops.try_notify
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    with pytest.raises(RuntimeError, match="crash"):
+        deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify", real_notify)
+    row = deploy_store.list_by_name(conn, "sma")[0]
+    assert row["op_kind"] == "revoke" and row["notify_attempted"] == 0
+
+    events = []
+
+    class Act:
+        def write(self, category, event, summary):
+            events.append((event, summary))
+
+    again = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content,
+                                          now=NOW, activity=Act())
+    assert again.outcome == "already_revoked"
+    assert again.notified_op_ids == (row["op_id"],)
+    assert [e for e, _ in events] == ["plugin_deploy_op_done"]
+    assert deploy_store.list_by_name(conn, "sma")[0]["notify_attempted"] == 1
+    third = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content,
+                                          now=NOW, activity=Act())
+    assert third.outcome == "already_revoked" and third.notified_op_ids == ()
+    assert len(events) == 1

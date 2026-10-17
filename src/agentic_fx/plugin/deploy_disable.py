@@ -28,6 +28,7 @@ class DisableOutcome:
     dependents: tuple[tuple[str, str, str], ...] = ()
     version_candidate: str | None = None
     op_id: int | None = None
+    notified_op_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,22 @@ class RevokeOutcome:
     name: str
     content_hash: str
     op_id: int | None = None
+    notified_op_ids: tuple[int, ...] = ()
+
+
+def _recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime,
+                           revoke_hash: str | None = None) -> tuple[int, ...]:
+    """Attempt the notification of finished ops whose first attempt never happened."""
+    notified: list[int] = []
+    for row in reversed(deploy_store.list_by_name(conn, name)):
+        if row["notify_attempted"] or deploy_ops.activity_event(row) is None:
+            continue
+        if revoke_hash is not None and (
+                row["op_kind"] != "revoke" or row["subject_content_hash"] != revoke_hash):
+            continue
+        if deploy_ops.try_notify(conn, row, activity, now=now):
+            notified.append(int(row["op_id"]))
+    return tuple(notified)
 
 
 def _activity(activity):
@@ -124,6 +141,10 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
         live = deploy_store.live_identity(plugins_root, name)
         live_path = plugins_root / name
+        if open_row is not None and open_row["op_kind"] != "disable_symlink":
+            raise deploy_ops.DeployOpBlockedError(
+                f"plugin {name!r} has open deploy op op_id={open_row['op_id']} "
+                f"op_kind={open_row['op_kind']}")
         if (live is None and open_row is not None
                 and open_row["op_kind"] == "disable_symlink"):
             if bool(open_row["revoke"]) != revoke or bool(open_row["force"]) != force:
@@ -143,10 +164,13 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                                   tuple(sorted(report.dependent_names)), op_id=op_id)
         if live is None:
+            notified = (() if dry_run else _recover_notifications(
+                conn, name, _activity(activity), now=now))
             if revoke:
                 return DisableOutcome("revoke_requires_version", name,
-                                      version_candidate=_latest_disable_candidate(conn, name))
-            return DisableOutcome("already_disabled", name)
+                                      version_candidate=_latest_disable_candidate(conn, name),
+                                      notified_op_ids=notified)
+            return DisableOutcome("already_disabled", name, notified_op_ids=notified)
         if live.kind == "plain":
             raise ValueError(f"plugins/{name} is a plain directory; use afx plugin retire")
         raw_target = os.readlink(live_path)
@@ -226,7 +250,11 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
                 conn, name, content_hash, now=now, actor=actor, commit=False)
             if revoke_row_id is None:
                 conn.rollback()
-                return RevokeOutcome("already_revoked", name, content_hash)
+                notified = _recover_notifications(
+                    conn, name, _RevokeActivity(activity, content_hash), now=now,
+                    revoke_hash=content_hash)
+                return RevokeOutcome("already_revoked", name, content_hash,
+                                     notified_op_ids=notified)
             payload = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)).fetchone()
             revoke_payload = json.loads(payload["payload_json"])
             approval_id = revoke_payload["revokes_approval_id"]
