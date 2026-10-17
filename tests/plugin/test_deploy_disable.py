@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.plugin import deploy_disable
+from agentic_fx.plugin import deploy_ops
 from agentic_fx.plugin import loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
@@ -389,7 +390,7 @@ def test_cascade_uses_the_live_identity_of_each_dependent_strategy(tmp_path):
     gone = _version_with_kind(root, "g", "c" * 64, kind="strategy")
     _approve(conn, "g", gone)
 
-    identities = deploy_disable._cascade_identities(conn, root, {"s", "g", "missing"})
+    identities = deploy_ops.cascade_identities(conn, root, {"s", "g", "missing"})
 
     assert identities == [("s", old_content)]
     assert new_content != old_content
@@ -737,10 +738,10 @@ def test_cascade_skips_a_dependent_whose_live_version_decision_is_a_rejection(tm
     strategy = _version_with_kind(root, "s", "b" * 64, kind="strategy")
     content, _, _ = _approve(conn, "s", strategy)
     _link_live(root, "s", strategy)
-    assert deploy_disable._cascade_identities(conn, root, {"s"}) == [("s", content)]
+    assert deploy_ops.cascade_identities(conn, root, {"s"}) == [("s", content)]
     approvals_store.append_revocation(conn, "s", content, now=NOW + timedelta(seconds=1))
 
-    assert deploy_disable._cascade_identities(conn, root, {"s"}) == []
+    assert deploy_ops.cascade_identities(conn, root, {"s"}) == []
 
 
 def test_revoke_candidate_comes_only_from_finished_disable_ops(tmp_path, monkeypatch):

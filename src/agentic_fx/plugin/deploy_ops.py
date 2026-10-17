@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -261,3 +262,50 @@ def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity,
             op_row["op_id"], event, exc)
     deploy_store.mark_notify_attempted(conn, int(op_row["op_id"]))
     return True
+
+
+class NullActivity:
+    def write(self, *args, **kwargs) -> None:
+        return None
+
+
+def activity_or_null(activity):
+    return activity if activity is not None else NullActivity()
+
+
+def approved_row(conn: sqlite3.Connection, name: str, content_hash: str) -> dict | None:
+    """The latest decision of an identity when it is an approval, else None."""
+    row = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+    return row if row is not None and row["status"] == "approved" else None
+
+
+def cascade_identities(conn: sqlite3.Connection, plugins_root: Path,
+                       names: set[str]) -> list[tuple[str, str]]:
+    """Live, approved (name, content_hash) identities among ``names``."""
+    identities: list[tuple[str, str]] = []
+    for strategy in sorted(names):
+        live = deploy_store.live_identity(plugins_root, strategy)
+        if live is None or live.content_hash is None:
+            continue
+        decision = approvals_store.latest_decision_for_identity(
+            conn, strategy, live.content_hash)
+        if decision is None or decision["status"] != "approved":
+            continue
+        identities.append((strategy, live.content_hash))
+    return identities
+
+
+def live_matches_from(live_path: Path, from_target: str | None) -> bool:
+    """Whether ``live_path`` is still exactly the state an op recorded as its source.
+
+    ``from_target`` is the raw symlink target, or ``None`` when the source state
+    was an absent live.
+    """
+    if from_target is None:
+        return not os.path.lexists(live_path)
+    if not live_path.is_symlink():
+        return False
+    try:
+        return os.readlink(live_path) == from_target
+    except OSError:
+        return False
