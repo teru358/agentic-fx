@@ -28,3 +28,4 @@ afx-ops gate/render.py render_event が『allowlist 検証を通った code と 
 ## 経緯
 
 - 2026-10-17: 起票。
+- 2026-10-17: ユーザー裁定 — 改善通知は週 1 発火なので急がない (優先 中のまま)。plugin deploy ops (T2〜T8) の後に 2 件同じ束で設計 (C0 → sol → 承認)。
