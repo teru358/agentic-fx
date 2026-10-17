@@ -1601,15 +1601,24 @@ def approve_candidate(
         _check_in_lock(row, require_plugin_kind=require_plugin_kind,
                        expected_payload_sha256=expected_payload_sha256)
         payload = json.loads(row["payload_json"])
+        if row["status"] != "pending":
+            # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
+            return ApprovalOutcome(outcome="already_decided", name=name,
+                                  status=row["status"])
+        if candidate_dir_pre is None:
+            try:
+                resolve_candidate_dir(
+                    plugins_root, candidate_origin=candidate_origin_pre,
+                    candidate_path=candidate_path_pre, name=name)
+            except CandidateMissingError:
+                pass
+            else:
+                raise ValueError("candidate_changed")
         config_deps = (_dependency_names(candidate_dir_pre, name)
                        if candidate_dir_pre is not None else [name])
         if not (set(config_deps) | _payload_indicator_names(payload)) <= set(dep_names):
             raise ValueError("candidate_changed")
         _reject_open_deploy_ops(conn, set(dep_names), operation="approval")
-        if row["status"] != "pending":
-            # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
-            return ApprovalOutcome(outcome="already_decided", name=name,
-                                  status=row["status"])
         if _is_superseded(conn, row, payload):  # 0c
             conn.execute("BEGIN IMMEDIATE")
             try:

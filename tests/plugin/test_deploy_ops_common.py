@@ -435,3 +435,66 @@ def test_approve_rejects_when_config_dependency_grows_while_waiting_for_lock(
     assert locked_names == [("first_dep", "strategy")]
     assert conn.execute(
         "SELECT status FROM approval_requests WHERE id=?", (approval_id,)).fetchone()[0] == "pending"
+
+
+@pytest.mark.parametrize("entry", ["approve_candidate", "retry_approval"])
+def test_decided_approval_returns_already_decided_despite_open_deploy_op(
+        tmp_path, conn, entry):
+    """A finished approval is reported as decided, not blocked by a later op."""
+    plugins_root = tmp_path / "plugins"
+    candidate = plugins_root / "_staging" / "1" / "strategy"
+    _strategy_candidate(candidate, plugin="indicator")
+    approval_id = approvals_store.create(
+        conn, "plugin", {
+            "name": "strategy", "candidate_origin": "staging",
+            "candidate_path": "plugins/_staging/1/strategy",
+        }, NOW)
+    conn.execute("UPDATE approval_requests SET status='approved' WHERE id=?",
+                 (approval_id,))
+    conn.commit()
+    _open_disable(conn, "strategy")
+
+    outcome = getattr(switch, entry)(
+        conn, approval_id, decided_by="human", now=NOW,
+        plugins_root=plugins_root, settings=_settings())
+
+    assert outcome.outcome == "already_decided"
+
+
+def test_approve_rejects_candidate_that_appears_while_waiting_for_lock(
+        tmp_path, conn, monkeypatch):
+    """A candidate absent when the lock set was chosen must not be approved unlocked."""
+    plugins_root = tmp_path / "plugins"
+    candidate = plugins_root / "_staging" / "1" / "strategy"
+    approval_id = approvals_store.create(
+        conn, "plugin", {
+            "name": "strategy", "candidate_origin": "staging",
+            "candidate_path": "plugins/_staging/1/strategy",
+        }, NOW)
+    real_locks = switch._plugin_locks
+    locked_names: list[tuple[str, ...]] = []
+
+    @contextlib.contextmanager
+    def appearing_locks(root, names, **kwargs):
+        locked_names.append(tuple(sorted(names)))
+        with real_locks(root, names, **kwargs):
+            _strategy_candidate(candidate, plugin="late_dep")
+            yield
+
+    monkeypatch.setattr(switch, "_plugin_locks", appearing_locks)
+    with pytest.raises(ValueError, match="candidate_changed"):
+        switch.approve_candidate(
+            conn, approval_id, decided_by="human", now=NOW,
+            plugins_root=plugins_root, settings=_settings())
+    assert locked_names == [("strategy",)]
+
+
+def test_try_notify_logs_activity_failure_and_still_marks_attempted(conn, caplog):
+    op_id = _intent(conn)
+    deploy_store.set_phase(conn, op_id, "needs_retry", now=NOW,
+                           fail_reason="syscall_failed")
+    row = deploy_store.get_open_by_name(conn, "sma")
+    with caplog.at_level("WARNING"):
+        assert deploy_ops.try_notify(conn, row, _Activity(raises=True), now=NOW)
+    assert f"op_id={op_id}" in caplog.text
+    assert deploy_store.get_open_by_name(conn, "sma")["notify_attempted"] == 1

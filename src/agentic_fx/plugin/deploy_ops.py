@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -223,7 +224,11 @@ def activity_event(op_row: Mapping[str, object]) -> str | None:
 
 def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity, *,
                now: datetime) -> bool:
-    """Attempt at-most-one notification claim for a notification-window row."""
+    """Attempt a notification for a notification-window row.
+
+    Delivery is not guaranteed exactly-once (spec section 7.0); only the fact
+    that an activity write was attempted is recorded.
+    """
     event = activity_event(op_row)
     if event is None or bool(op_row["notify_attempted"]):
         return False
@@ -233,7 +238,9 @@ def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity,
             f"op_id={op_row['op_id']} op_kind={op_row['op_kind']} "
             f"name={op_row['name']} phase={op_row['phase']}",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "deploy op notify failed op_id=%s event=%s: %r",
+            op_row["op_id"], event, exc)
     deploy_store.mark_notify_attempted(conn, int(op_row["op_id"]))
     return True

@@ -244,9 +244,12 @@ def _classify_failure(io: IndicatorIO, conn: sqlite3.Connection, name: str, cand
         return AdoptOutcome(name, "error", None, "adopt_error", type(error).__name__)
     if has_journal:
         io.stdout(_stalled_text(name, found))
-        code = ("unresolved_journal"
-                if isinstance(error, plugin_switch.UnresolvedJournalError)
-                else "switch_incomplete")
+        if isinstance(error, plugin_switch.OpenDeployOpError):
+            code = "open_deploy_op"
+        elif isinstance(error, plugin_switch.UnresolvedJournalError):
+            code = "unresolved_journal"
+        else:
+            code = "switch_incomplete"
         return AdoptOutcome(name, "stalled", found, code)
     if _is_gate_failure(error):
         shutil.rmtree(candidate, ignore_errors=True)
