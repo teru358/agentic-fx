@@ -1,14 +1,13 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 147 件。完了分は closed/。
+未完了: 148 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
-| [first-run-setup](open/first-run-setup.md) | 中 | 2026-09-17 | 初回起動の対話設定と service 設置が無い |
 
 ## 実装待ち (13)
 
@@ -41,7 +40,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (124)
+## 設計待ち (126)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -80,6 +79,7 @@
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [approval-notice-lacks-change-content](open/approval-notice-lacks-change-content.md) | 中 | 2026-10-17 | 改善承認の通知に変更内容が無い (何がどう変わるか読めない) |
 | [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
+| [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [live-signal-eval-blocks-protection-tick](open/live-signal-eval-blocks-protection-tick.md) | 中 |  | 失敗する plugin の signal 計算が毎 tick 10〜30 秒 lock を保持する |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -140,6 +140,7 @@
 | [per-strategy-virtual-books](open/per-strategy-virtual-books.md) | 低 | 2026-10-16 | 戦略ごとの実帳簿 (同一口座内の仮想分割、両建ては戦略間のみ) |
 | [signal-maintenance-offload-worker](open/signal-maintenance-offload-worker.md) | 低 | 2026-10-16 | signal maintenance を tick から別 worker へ切り出す |
 | [wizard-script-conventions-and-selection-ui](open/wizard-script-conventions-and-selection-ui.md) | 低 | 2026-10-16 | ウィザード台本の表記規約と選択 UI (矢印選択・色) の整備 |
+| [tests-leak-tmp-dirs-outside-basetemp](open/tests-leak-tmp-dirs-outside-basetemp.md) | 低 | 2026-10-17 | 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外) |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |

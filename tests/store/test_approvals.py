@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -400,7 +401,7 @@ def _python_latest(c, name, content_hash):
     return None if latest is None else latest[1]
 
 
-def test_latest_decision_for_identity_matches_the_python_scan(tmp_path):
+def test_latest_decision_status_matches_the_python_scan(tmp_path):
     c = _conn(tmp_path)
     t = NOW.isoformat()
     later = (NOW + timedelta(seconds=5)).isoformat()
@@ -420,8 +421,85 @@ def test_latest_decision_for_identity_matches_the_python_scan(tmp_path):
     c.commit()
 
     for ident in [("a", "h"), ("b", "h"), ("c", "h"), ("a", "x"), ("zz", "h")]:
-        assert approvals.latest_decision_for_identity(c, *ident) == \
+        assert approvals.latest_decision_status(c, *ident) == \
             _python_latest(c, *ident), ident
-    assert approvals.latest_decision_for_identity(c, "a", "h") == "rejected"
-    assert approvals.latest_decision_for_identity(c, "c", "h") == "approved"
-    assert approvals.latest_decision_for_identity(c, "zz", "h") is None
+    assert approvals.latest_decision_status(c, "a", "h") == "rejected"
+    assert approvals.latest_decision_status(c, "c", "h") == "approved"
+    assert approvals.latest_decision_status(c, "zz", "h") is None
+def test_latest_decision_for_identity_picks_latest_decided_and_skips_foreign_payloads(tmp_path):
+    conn = _conn(tmp_path)
+    for index, status in enumerate(("approved", "rejected", "approved")):
+        approval_id = approvals.create(
+            conn, "plugin", {"name": "p", "content_hash": "h"}, NOW)
+        approvals.apply_decision(conn, approval_id, status, decided_by="human",
+                                 now=NOW + timedelta(seconds=index))
+    other = approvals.create(conn, "plugin", {"name": "p", "content_hash": "other"}, NOW)
+    approvals.apply_decision(conn, other, "approved", decided_by="human",
+                             now=NOW + timedelta(seconds=9))
+    conn.execute(
+        "INSERT INTO approval_requests (kind,payload_json,status,decided_at,created_at) "
+        "VALUES ('plugin','[]','approved',?,?)", (NOW.isoformat(), NOW.isoformat()))
+    conn.execute(
+        "INSERT INTO approval_requests (kind,payload_json,status,decided_at,created_at) "
+        "VALUES ('plugin','not json','approved',?,?)", (NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    row = approvals.latest_decision_for_identity(conn, "p", "h")
+
+    assert row["status"] == "approved" and row["id"] == 3
+    assert approvals.latest_decision_for_identity(conn, "p", "none") is None
+
+
+def _decide(conn, payload, status, decided_at, *, created=NOW):
+    approval_id = approvals.create(conn, "plugin", payload, created)
+    approvals.apply_decision(conn, approval_id, status, decided_by="human", now=decided_at)
+    return approval_id
+
+
+def test_simultaneous_decisions_resolve_to_the_larger_id(tmp_path):
+    conn = _conn(tmp_path)
+    identity = {"name": "p", "content_hash": "h"}
+    _decide(conn, identity, "approved", NOW)
+    later_id = _decide(conn, identity, "rejected", NOW)
+
+    row = approvals.latest_decision_for_identity(conn, "p", "h")
+
+    assert row["id"] == later_id and row["status"] == "rejected"
+
+
+def test_append_revocation_treats_the_larger_id_of_simultaneous_decisions_as_latest(tmp_path):
+    conn = _conn(tmp_path)
+    identity = {"name": "p", "content_hash": "h"}
+    _decide(conn, identity, "approved", NOW)
+    _decide(conn, identity, "rejected", NOW)
+
+    assert approvals.append_revocation(conn, "p", "h", now=NOW) is None
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 2
+
+
+def test_append_revocation_links_the_latest_approved_row(tmp_path):
+    conn = _conn(tmp_path)
+    _decide(conn, {"name": "p", "content_hash": "h", "artifact_hash": "old"},
+            "approved", NOW)
+    newest = _decide(conn, {"name": "p", "content_hash": "h", "artifact_hash": "new"},
+                     "approved", NOW + timedelta(seconds=5))
+    _decide(conn, {"name": "p", "content_hash": "h", "artifact_hash": "mid"},
+            "approved", NOW + timedelta(seconds=2))
+
+    revoke_id = approvals.append_revocation(conn, "p", "h", now=NOW + timedelta(seconds=9))
+
+    payload = json.loads(conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?", (revoke_id,)).fetchone()[0])
+    assert payload["revokes_approval_id"] == newest
+    assert payload["artifact_hash"] == "new"
+
+
+def test_latest_decision_for_identity_ignores_other_plugins_with_the_same_content_hash(tmp_path):
+    conn = _conn(tmp_path)
+    mine = _decide(conn, {"name": "p", "content_hash": "h"}, "approved", NOW)
+    _decide(conn, {"name": "q", "content_hash": "h"}, "rejected", NOW + timedelta(seconds=5))
+
+    row = approvals.latest_decision_for_identity(conn, "p", "h")
+
+    assert row["id"] == mine and row["status"] == "approved"
+    assert approvals.latest_decision_for_identity(conn, "r", "h") is None

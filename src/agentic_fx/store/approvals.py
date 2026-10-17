@@ -31,7 +31,7 @@ def create(conn: sqlite3.Connection, kind: str, payload: dict, now: datetime,
     return cur.lastrowid
 
 
-def latest_decision_for_identity(conn: sqlite3.Connection, name: str,
+def latest_decision_status(conn: sqlite3.Connection, name: str,
                                  content_hash: str) -> str | None:
     """Status of the most recently decided plugin approval for an identity.
 
@@ -54,6 +54,8 @@ def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
                       now: datetime, actor: str = "human_cli",
                       commit: bool = True) -> int | None:
     """Append the rejection that revokes the latest approval for an identity."""
+def _identity_decisions(conn: sqlite3.Connection, name: str,
+                        content_hash: str) -> list[tuple[sqlite3.Row, dict, datetime]]:
     candidates: list[tuple[sqlite3.Row, dict, datetime]] = []
     for row in conn.execute(
             "SELECT * FROM approval_requests WHERE kind='plugin' "
@@ -62,12 +64,32 @@ def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
             payload = json.loads(row["payload_json"])
         except (TypeError, ValueError):
             continue
+        if not isinstance(payload, dict):
+            continue
         if payload.get("name") == name and payload.get("content_hash") == content_hash:
             decided = datetime.fromisoformat(row["decided_at"])
             if decided.tzinfo is None or decided.utcoffset() is None:
                 raise ValueError(
                     f"approval {row['id']} decided_at is naive; tz-aware datetime required")
             candidates.append((row, payload, decided))
+    return candidates
+
+
+def latest_decision_for_identity(conn: sqlite3.Connection, name: str,
+                                 content_hash: str) -> dict | None:
+    """Return the most recent approved or rejected plugin decision for an identity."""
+    candidates = _identity_decisions(conn, name, content_hash)
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda item: (item[2], item[0]["id"]))
+    return dict(latest[0])
+
+
+def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
+                      now: datetime, actor: str = "human_cli",
+                      commit: bool = True) -> int | None:
+    """Append the rejection that revokes the latest approval for an identity."""
+    candidates = _identity_decisions(conn, name, content_hash)
     if not candidates:
         raise ValueError(f"no approved plugin approval for {name!r} {content_hash!r}")
     latest, _, latest_decided = max(

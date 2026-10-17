@@ -39,7 +39,7 @@ def source_state(conn, plugins_root: Path, *, name: str, content_hash: str,
                            artifact_hash=artifact_hash)
     if reason is not None:
         return reason
-    if approvals_store.latest_decision_for_identity(
+    if approvals_store.latest_decision_status(
             conn, name, content_hash) != "approved":
         return "strategy_not_approved"
     for item in items:
@@ -50,7 +50,7 @@ def source_state(conn, plugins_root: Path, *, name: str, content_hash: str,
             continue
         if identity.content_hash != item.content_hash:
             return "indicator_not_live"
-        if approvals_store.latest_decision_for_identity(
+        if approvals_store.latest_decision_status(
                 conn, item.plugin_name, item.content_hash) != "approved":
             return "indicator_not_approved"
     try:
