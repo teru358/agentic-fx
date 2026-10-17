@@ -57,6 +57,27 @@ def insert_intent(
     return cur.lastrowid
 
 
+def insert_done_revoke(
+        conn: sqlite3.Connection, *, name: str, subject_content_hash: str,
+        subject_artifact_hash: str, approval_id: int, revoke_row_id: int,
+        actor: str, now: datetime, commit: bool = False) -> int:
+    """Record the durable completed half of a version revocation."""
+    updated_at = _next_updated_at(conn, name, now)
+    cur = conn.execute(
+        "INSERT INTO plugin_deploy_ops (op_kind,name,from_kind,to_kind,from_target,"
+        "to_target,retired_path,subject_content_hash,subject_artifact_hash,"
+        "target_content_hash,target_artifact_hash,approval_id,revoke,revoke_row_id,"
+        "force,phase,fail_reason,notify_attempted,actor,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("revoke", name, "none", "none", None, None, None, subject_content_hash,
+         subject_artifact_hash, None, None, approval_id, 1, revoke_row_id, 0,
+         "done", None, 0, actor, now.isoformat(), updated_at.isoformat()),
+    )
+    if commit:
+        conn.commit()
+    return int(cur.lastrowid)
+
+
 def set_phase(conn: sqlite3.Connection, op_id: int, phase: str, *, now: datetime,
               fail_reason: str | None = None, notify_attempted: bool | None = None,
               commit: bool = True) -> bool:
@@ -84,6 +105,11 @@ def get_open_by_name(conn: sqlite3.Connection, name: str) -> dict | None:
     row = conn.execute(
         "SELECT * FROM plugin_deploy_ops WHERE name=? AND (" + OPEN_PHASE_SQL + ") "
         "ORDER BY op_id DESC LIMIT 1", (name,)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def get_by_id(conn: sqlite3.Connection, op_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM plugin_deploy_ops WHERE op_id=?", (op_id,)).fetchone()
     return dict(row) if row is not None else None
 
 
