@@ -241,8 +241,8 @@ class MissionSupervisor:
 
     def _dispatch(self, kind: str, kwargs: dict) -> object:
         if kind == "trade":
-            extra = ({"decision_bars": kwargs["decision_bars"]}
-                     if "decision_bars" in kwargs else {})
+            extra = {key: value for key, value in kwargs.items()
+                     if key != "trigger"}
             trade_result = self._trade_fn(kwargs["trigger"], **extra)
             reflection_count = self._reflection_fn()
             return {"trade": trade_result,

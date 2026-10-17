@@ -899,13 +899,8 @@ class _ToolCallingFakeRunner(FakeRunner):
         return super().run(mission)
 
 
-def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
-    """判断足 15m・strategy 1h: 14:00:30 の `_scheduler_tick_once` (本番の 1
-    tick 全体) で、実 approved plugin (kind=strategy) が bucket 13:00 を評価
-    して signal を作り、同じ tick の cron mission がそれを claim して hold
-    で consume する。14:03:30 には signal 起動の条件 (pending) が残らず、
-    14:15:30 の cron mission は実際に `get_signals` ツールを呼び、mission
-    内から consumed を観測する。"""
+def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
+    """producer は core_lock 解放後に INSERT し、次 tick が消費する。"""
     from pathlib import Path as _Path
 
     from agentic_fx.core.accounting import record_snapshot
@@ -913,7 +908,6 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
     from agentic_fx.plugin.resolve import (
         ApprovedInventory, InventoryBuildResult, ResolvedIndicatorSet,
     )
-    from agentic_fx.store import orders as orders_store
 
     t_cron = datetime(2026, 9, 24, 14, 0, 30, tzinfo=timezone.utc)
     bucket = datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc)
@@ -965,7 +959,9 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeStrategySession):
+              _FakeStrategySession), \
+         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                         embedding_fn=FakeEmbedding())
         fake = _ToolCallingFakeRunner(
@@ -974,6 +970,30 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
             registry=app.registry, pair="USDJPY")
         app.trade_loop.runner = fake
         app.scheduler.on_improve_tick = None
+        app.scheduler._mark_to_market = lambda now: True
+        app.scheduler._process_limit_fills = lambda now: set()
+        events = []
+        real_maintenance = app.scheduler.on_signal_maintenance
+        real_signal_due = app.scheduler.signal_due_fn
+
+        def maintenance_after_core_unlock(now):
+            assert not app.core_lock._is_owned()
+            events.append("maintenance")
+            real_maintenance(now)
+
+        def signal_due_on_next_decision(now):
+            events.append("signal_due")
+            return real_signal_due(now)
+
+        app.scheduler.on_signal_maintenance = maintenance_after_core_unlock
+        app.scheduler.signal_due_fn = signal_due_on_next_decision
+        real_trade_mission = app.scheduler.on_trade_mission
+
+        def trade_mission_with_order(*args, **kwargs):
+            events.append("trade_mission")
+            return real_trade_mission(*args, **kwargs)
+
+        app.scheduler.on_trade_mission = trade_mission_with_order
         # このテストの関心は producer/claim/get_signals ツールの配線であり、
         # 価格取得・outage 状態機械は対象外 (それぞれ専用テストで検証済み —
         # test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery
@@ -995,10 +1015,11 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
                 ("USDJPY", interval, bar_time.isoformat(),
                  148.0, 148.1, 147.9, 148.0, 1.0, "yfinance"))
         app.conn_core.commit()
+        assert app.conn_core.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
 
         app.supervisor.start()
         try:
-            assert _tick_once_and_wait(app) == 1
+            assert _tick_once_and_wait(app) == 1, events
             sid = app.conn_core.execute(
                 "SELECT id FROM signals WHERE pair='USDJPY' AND bar_ts=?",
                 (bucket.isoformat(),)).fetchone()["id"]
@@ -1009,31 +1030,25 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
             row = app.conn_core.execute(
                 "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
                 (sid,)).fetchone()
-            assert dict(row) == {"status": "consumed",
-                                 "claimed_by_mission_id": mission["id"]}
-            assert "## この判断で扱う signal" in fake.missions[0].prompt
-            # 1 本目の mission も get_signals を呼んでいる (claim 直後・
-            # consume 前の状態を観測)。
-            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
-                (sid, "claimed")]
-
-            # 建玉 (PENDING_FILL) がある状態で、signal 起動の条件を満たすのは
-            # pending の signal だけ — それが残っていない。
-            orders_store.insert(
-                app.conn_core, pair="USDJPY", direction="long",
-                entry_type="limit", horizon="day", status="pending_fill",
-                now=t_cron, quantity=0.1, requested_price=147.5)
-            t_signal = datetime(2026, 9, 24, 14, 3, 30, tzinfo=timezone.utc)
-            clock.current = t_signal
-            assert app.scheduler.signal_due_fn(t_signal) is False
+            assert dict(row) == {"status": "pending", "claimed_by_mission_id": None}, events
+            assert events == ["trade_mission", "maintenance"]
 
             t_next = datetime(2026, 9, 24, 14, 15, 30, tzinfo=timezone.utc)
             clock.current = t_next
-            assert _tick_once_and_wait(app) == 1
-            # 2 本目の mission が実際に get_signals ツールを呼び、mission の
-            # 内側から consumed を観測する (テスト直呼びではない)。
+            events.clear()
+            assert _tick_once_and_wait(app) == 1, events
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            assert dict(row) == {"status": "consumed",
+                                 "claimed_by_mission_id": app.conn_core.execute(
+                                     "SELECT id FROM missions WHERE loop='trade' "
+                                     "ORDER BY id DESC LIMIT 1").fetchone()["id"]}
+            assert events == ["trade_mission", "maintenance"]
+            assert "## この判断で扱う signal" in fake.missions[-1].prompt
             assert [(r["id"], r["status"]) for r in fake.tool_observations[-1]] == [
-                (sid, "consumed")]
+                (sid, "claimed")]
+
         finally:
             app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
             app.close()

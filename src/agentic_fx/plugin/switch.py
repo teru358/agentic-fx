@@ -985,12 +985,22 @@ def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
     - **名前昇順**: 逆順で取る呼び出し元が現れても deadlock しないよう
       順序を 1 箇所に固定する (P2')。
     """
+    if _plugin_lock_owner_guard is not None:
+        _plugin_lock_owner_guard()
     with contextlib.ExitStack() as stack:
         bounded = _bounded_lock_kwargs(deadline, stop_event)
         for name in sorted(set(names)):
             # 2 個目以降で期限切れになっても、ExitStack が取得済みの lock を解放する。
             stack.enter_context(_plugin_lock(plugins_root, name, **bounded))
         yield
+
+
+_plugin_lock_owner_guard = None
+
+
+def set_plugin_lock_owner_guard(guard) -> None:
+    global _plugin_lock_owner_guard
+    _plugin_lock_owner_guard = guard
 
 
 def _bounded_lock_kwargs(deadline: float | None, stop_event) -> dict:

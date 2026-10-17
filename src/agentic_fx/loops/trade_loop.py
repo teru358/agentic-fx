@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import contextlib
+from pathlib import Path
+from time import monotonic
 from collections.abc import Mapping
 from datetime import datetime
 
@@ -23,7 +26,7 @@ from agentic_fx.core import market_hours
 from agentic_fx.core.contracts import (
     Action, Clock, IntentParseError, Origin, OrderStatus as S, TradeIntent,
 )
-from agentic_fx.core.executor import Executor
+from agentic_fx.core.executor import Executor, snapshot_age_exceeded
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
@@ -39,6 +42,8 @@ from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import mission_decision_bars, missions, signals
+from agentic_fx.plugin import switch
+from agentic_fx.plugin.signal_producer import _live_source_reason
 from agentic_fx.core.timeutil import as_utc
 
 import logging
@@ -52,6 +57,18 @@ _TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
 
 # 最古の pending signal を 1 件 claim する trigger (判断足の cron と signal 起動)。
 _CLAIMING_TRIGGERS = frozenset({"cron", "signal"})
+
+
+def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
+                         resolved=None) -> bool:
+    """Check a claimed OPEN signal's source while its name locks are held."""
+    from types import SimpleNamespace
+    return _live_source_reason(
+        conn, plugins_root,
+        SimpleNamespace(name=plugin, content_hash=content_hash,
+                        artifact_hash=None), resolved,
+        {plugin, *(item.plugin_name for item in getattr(resolved, "items", ()))}
+    ) is None
 
 
 def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
@@ -78,7 +95,9 @@ class TradeLoop:
                  activity: ActivityLog, notifier: Notifier,
                  clock: Clock, core_lock: threading.RLock,
                  conn_supervisor: sqlite3.Connection,
-                 watch: MissionWatch | None = None) -> None:
+                 watch: MissionWatch | None = None,
+                 plugins_root: Path | None = None,
+                 resolved_by_identity=None) -> None:
         self.conn = conn
         self.runner = runner
         self.settings = settings
@@ -91,15 +110,18 @@ class TradeLoop:
         self.clock = clock
         self._core_lock = core_lock
         self._conn_supervisor = conn_supervisor
+        self._plugins_root = plugins_root
+        self._resolved_by_identity = resolved_by_identity or {}
         self.watch = watch if watch is not None else MissionWatch()
         self._market_tool_daily: dict = {}
 
     # ---- 公開 API (never-raise サービス境界) -----------------------------------
 
     def run_once(self, trigger: str = "cron",
-                 decision_bars: Mapping[tuple[str, str], datetime] | None = None) -> dict | None:
+                 decision_bars: Mapping[tuple[str, str], datetime] | None = None,
+                 signal_max_id: int | None = None) -> dict | None:
         try:
-            return self._run_once_impl(trigger, decision_bars)
+            return self._run_once_impl(trigger, decision_bars, signal_max_id)
         except Exception:  # noqa: BLE001 — サービス境界: 周期を殺さない
             _log.exception("trade mission service boundary failed")
             self._safe_report_boundary_failure("trade")
@@ -116,7 +138,8 @@ class TradeLoop:
     # ---- 実装本体 ---------------------------------------------------
 
     def _run_once_impl(self, trigger: str = "cron",
-                       decision_bars: Mapping[tuple[str, str], datetime] | None = None) -> dict | None:
+                       decision_bars: Mapping[tuple[str, str], datetime] | None = None,
+                       signal_max_id: int | None = None) -> dict | None:
         """取引判断 Mission 1 回分 (プラン8 五相再構成 — 設計書 §3.1)。
 
         prepare (lock 保持) → run (lock 非保持) → commit-pre (lock 非保持:
@@ -192,9 +215,14 @@ class TradeLoop:
                     # signal 起動で claim できなければ LLM を起こさず skipped、
                     # cron は signal なしで判断を続ける。
                     try:
-                        claimed = signals.claim_oldest(
-                            self.conn, mission_id=mid, now=now,
-                            freshness_bars=self.settings.plugin.signal_freshness_bars)
+                        claim_kwargs = {
+                            "mission_id": mid,
+                            "now": now,
+                            "freshness_bars": self.settings.plugin.signal_freshness_bars,
+                        }
+                        if signal_max_id is not None:
+                            claim_kwargs["max_id"] = signal_max_id
+                        claimed = signals.claim_oldest(self.conn, **claim_kwargs)
                         if claimed is None and trigger == "signal":
                             missions.finish(self.conn, mid, "skipped", None, [], now)
                             finalized = True
@@ -310,10 +338,28 @@ class TradeLoop:
                     snapshot_error = e
 
             # ---- commit-core (core_lock 保持) ----
+            source_lock = contextlib.ExitStack()
+            source_lock_timeout = False
+            if (claimed is not None and intent.action is Action.OPEN
+                    and self._plugins_root is not None):
+                resolved = self._resolved_by_identity.get(
+                    (claimed["plugin"], claimed["content_hash"]))
+                source_names = {claimed["plugin"]}
+                if resolved is not None:
+                    source_names.update(item.plugin_name for item in resolved.items)
+                try:
+                    source_lock.enter_context(switch._plugin_locks(
+                        self._plugins_root, source_names,
+                        deadline=monotonic() + getattr(
+                            self.settings.worker, "plugin_lock_timeout_sec", 2.0)))
+                except switch.PluginBusyError:
+                    source_lock.close()
+                    source_lock = contextlib.ExitStack()
+                    source_lock_timeout = True
             # **通知は commit-post まで遅延させる (Step 3.5)** — Notifier.send は
             # urlopen(timeout=10) の同期実行なので、ここで送ると core_lock を
             # 握ったまま最大 10 秒ブロックし SL/TP 監視が止まる。
-            with self._core_lock, \
+            with source_lock, self._core_lock, \
                     self.executor.defer_notifications() as deferred:
                 try:
                     # intent は執行前に必ず記録し、以降の拒否理由を iid に
@@ -321,13 +367,53 @@ class TradeLoop:
                     iid, early = self.executor.record_and_validate_intent(
                         intent, mid)
                     consume_error = None
+                    source_rejected = False
+                    if claimed is not None and intent.action is Action.OPEN:
+                        gate_now = self.clock.now()
+                        if source_lock_timeout:
+                            source_rejected = True
+                            reason = "signal_source_lock_timeout"
+                        else:
+                            _, fresh_until = signals.freshness_window(
+                                claimed["timeframe"], claimed["bar_ts"],
+                                self.settings.plugin.signal_freshness_bars)
+                            if gate_now > datetime.fromisoformat(fresh_until):
+                                source_rejected = True
+                                reason = "signal stale"
+                                signals.abandon_claimed(self.conn, claimed["id"])
+                                consumed = True
+                            elif open_snapshot is not None and (
+                                    snapshot_reason := snapshot_age_exceeded(
+                                        open_snapshot, gate_now,
+                                        self.settings.worker.snapshot_max_age_sec)
+                                    ) is not None:
+                                source_rejected = True
+                                reason = snapshot_reason
+                            elif self._plugins_root is not None:
+                                resolved = self._resolved_by_identity.get(
+                                    (claimed["plugin"], claimed["content_hash"]))
+                                if not signal_source_active(
+                                        self.conn, self._plugins_root,
+                                        claimed["plugin"], claimed["content_hash"],
+                                        resolved):
+                                    source_rejected = True
+                                    reason = "signal_source_inactive"
+                                    signals.abandon_claimed(self.conn, claimed["id"])
+                                    consumed = True
+                        if source_rejected:
+                            intents_store.set_gate_result(
+                                self.conn, iid, accepted=False, reject_reason=reason,
+                                reject_category=("execution" if reason.startswith("execution")
+                                                 else "signal"))
+                            self.activity.write(Category.TRADE, "gate_rejected", reason,
+                                                ref_id=str(iid))
                     if (claimed is not None
                             and intent.action is Action.OPEN
                             and self.executor.state_fn() != "ready"):
                         # consume せずに止める。finally の後始末で、鮮度が
                         # 切れていれば pending に戻さず abandoned にする。
                         stopped_by_data_state = True
-                    if (claimed is not None and not (
+                    if (claimed is not None and not source_rejected and not (
                             intent.action is Action.OPEN
                             and self.executor.state_fn() != "ready")):
                         # ⑥consume/requeue の確定規則: パース成功の時点で
@@ -347,7 +433,10 @@ class TradeLoop:
                             consume_error = e
                         else:
                             consumed = True
-                    if consume_error is not None:
+                    if source_rejected:
+                        out = {"result": "rejected", "order_id": None,
+                               "reasons": [reason]}
+                    elif consume_error is not None:
                         reason = ("signal not claimed by this mission: "
                                   + safe_error_text(consume_error))
                         intents_store.set_gate_result(

@@ -76,6 +76,7 @@ class Env:
         self.econ_calls = 0
         self._news_fn = news_fn
         self._econ_fn = econ_fn
+        self._state_fn = state_fn
         self.base = base
         clock = FixedClock(base)
         self.executor = Executor(
@@ -121,6 +122,8 @@ class Env:
             self._econ_fn()
 
     def _signal_maintenance(self, now):
+        if self._state_fn is not None and self._state_fn() != "ready":
+            return
         self.signal_maintenance_calls += 1
         if self._on_signal_maintenance is not None:
             self._on_signal_maintenance(now)
@@ -3077,17 +3080,23 @@ def test_state_gate_blocks_new_limit_fill_but_not_existing_sl_exit(tmp_path):
 
 
 def test_signal_maintenance_gated_but_news_and_econ_continue(tmp_path):
-    """degraded 中は `on_signal_maintenance` だけを止める。
-    news/econ は継続する。"""
+    """保守 wrapper は常に遅延し、実保守だけが ready で実行される。
+
+    news/econ は tick 内で継続する。"""
     state = {"v": "degraded"}
     env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"],
              on_signal_maintenance=lambda now: None)
-    env.sched.tick(WED)
+    pending = env.sched.tick(WED)
     assert env.signal_maintenance_calls == 0
     assert env.news_calls == 1
     assert env.econ_calls == 1
+    assert len(pending) == 1
+    pending[0]()
+    assert env.signal_maintenance_calls == 0
     state["v"] = "ready"
-    env.sched.tick(WED + timedelta(minutes=1))
+    pending = env.sched.tick(WED + timedelta(minutes=1))
+    assert len(pending) == 1
+    pending[0]()
     assert env.signal_maintenance_calls == 1
 
 
