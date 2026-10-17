@@ -599,3 +599,75 @@ def test_pending_exists_is_false_when_only_stale_pending_remains(tmp_path):
         conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h",
         bar_ts=(NOW - timedelta(hours=5)).isoformat(), kind="signal", payload={}, now=NOW)
     assert signals.pending_exists(conn, now=NOW, freshness_bars=1) is False
+
+
+_LI_PLUGIN = "def compute(df, params):\n    return {'v': 1.0}\n"
+_LI_CONFIG = "kind: indicator\n"
+_LI_TEST = "def test_x():\n    pass\n"
+
+
+def _li_write(d, *, files=("plugin.py", "config.yaml", "test_plugin.py")):
+    d.mkdir(parents=True, exist_ok=True)
+    contents = {"plugin.py": _LI_PLUGIN, "config.yaml": _LI_CONFIG,
+                "test_plugin.py": _LI_TEST}
+    for f in files:
+        (d / f).write_text(contents[f])
+    return d
+
+
+def _li_expected(d):
+    from agentic_fx.plugin import loader
+    return (loader.content_hash(d), loader.artifact_hash_bytes(
+        (d / "plugin.py").read_bytes(), (d / "config.yaml").read_bytes(),
+        (d / "test_plugin.py").read_bytes()))
+
+
+def test_live_identity_absent(tmp_path):
+    assert deploy_ops.live_identity(tmp_path, "alpha") is None
+
+
+def test_live_identity_symlink_uses_real_hashes_not_dir_name(tmp_path):
+    vdir = _li_write(tmp_path / ".versions" / "alpha" / ("a" * 64))
+    (tmp_path / "alpha").symlink_to(f".versions/alpha/{'a' * 64}")
+    content, artifact = _li_expected(vdir)
+    assert artifact != "a" * 64
+    got = deploy_ops.live_identity(tmp_path, "alpha")
+    assert got == deploy_ops.LiveIdentity("symlink", content, artifact)
+
+
+def test_live_identity_dangling_symlink(tmp_path):
+    (tmp_path / "alpha").symlink_to(f".versions/alpha/{'b' * 64}")
+    assert deploy_ops.live_identity(tmp_path, "alpha") == \
+        deploy_ops.LiveIdentity("symlink", None, None)
+
+
+@pytest.mark.parametrize("target", ["../x", "/etc", f".versions/beta/{'c' * 64}"])
+def test_live_identity_noncanonical_symlink_target(tmp_path, target):
+    (tmp_path / "x").mkdir()
+    _li_write(tmp_path / ".versions" / "beta" / ("c" * 64))
+    (tmp_path / "alpha").symlink_to(target)
+    assert deploy_ops.live_identity(tmp_path, "alpha") == \
+        deploy_ops.LiveIdentity("symlink", None, None)
+
+
+def test_live_identity_plain_dir(tmp_path):
+    d = _li_write(tmp_path / "alpha")
+    got = deploy_ops.live_identity(tmp_path, "alpha")
+    assert got == deploy_ops.LiveIdentity("plain", _li_expected(d)[0], None)
+
+
+def test_live_identity_plain_missing_required_file(tmp_path):
+    _li_write(tmp_path / "alpha", files=("plugin.py", "config.yaml"))
+    assert deploy_ops.live_identity(tmp_path, "alpha") == \
+        deploy_ops.LiveIdentity("plain", None, None)
+
+
+def test_live_identity_regular_file(tmp_path):
+    (tmp_path / "alpha").write_text("x")
+    assert deploy_ops.live_identity(tmp_path, "alpha") is None
+
+
+@pytest.mark.parametrize("name", ["a/b", "..", "../alpha"])
+def test_live_identity_rejects_path_in_name(tmp_path, name):
+    with pytest.raises(ValueError):
+        deploy_ops.live_identity(tmp_path, name)

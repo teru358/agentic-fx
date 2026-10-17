@@ -1,8 +1,11 @@
 """Durable records for plugin deployment operations."""
 from __future__ import annotations
 
+import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Iterable, Mapping
 
 from agentic_fx.store.db import OPEN_PHASE_SQL
@@ -148,3 +151,41 @@ def plugin_live_history(conn: sqlite3.Connection, name: str) -> list[dict]:
         event["effective_at"] = effective.isoformat()
         previous = effective
     return events
+
+
+@dataclass(frozen=True)
+class LiveIdentity:
+    kind: str
+    content_hash: str | None
+    artifact_hash: str | None
+
+
+def live_identity(plugins_root: Path, name: str) -> LiveIdentity | None:
+    """Return the on-disk identity of `plugins_root/name` without touching the DB."""
+    from agentic_fx.core import plugin_files
+    from agentic_fx.plugin import loader
+
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise ValueError(f"invalid plugin name: {name!r}")
+    live = Path(plugins_root) / name
+    if live.is_symlink():
+        unknown = LiveIdentity("symlink", None, None)
+        try:
+            target = os.readlink(live)
+            if not loader.is_canonical_symlink_target(name, target):
+                return unknown
+            version_dir = Path(plugins_root) / target
+            if not version_dir.is_dir():
+                return unknown
+            content = loader.content_hash(version_dir)
+            artifact = loader.artifact_hash_bytes(
+                (version_dir / "plugin.py").read_bytes(),
+                (version_dir / "config.yaml").read_bytes(),
+                (version_dir / "test_plugin.py").read_bytes())
+        except (OSError, plugin_files.PluginFileTooLarge):
+            return unknown
+        return LiveIdentity("symlink", content, artifact)
+    if live.is_dir():
+        meta, _ = loader.discover_one_with_reason(live, name)
+        return LiveIdentity("plain", meta.content_hash if meta else None, None)
+    return None
