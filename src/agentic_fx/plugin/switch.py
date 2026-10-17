@@ -1603,9 +1603,9 @@ def approve_candidate(
         payload = json.loads(row["payload_json"])
         config_deps = (_dependency_names(candidate_dir_pre, name)
                        if candidate_dir_pre is not None else [name])
-        _reject_open_deploy_ops(
-            conn, set(config_deps) | _payload_indicator_names(payload),
-            operation="approval")
+        if not (set(config_deps) | _payload_indicator_names(payload)) <= set(dep_names):
+            raise ValueError("candidate_changed")
+        _reject_open_deploy_ops(conn, set(dep_names), operation="approval")
         if row["status"] != "pending":
             # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
             return ApprovalOutcome(outcome="already_decided", name=name,
@@ -1887,7 +1887,7 @@ def _payload_indicator_names(payload: dict) -> set[str]:
     return {
         ref["plugin"] for ref in refs.values()
         if isinstance(ref, dict) and isinstance(ref.get("plugin"), str)
-        and loader._PLUGIN_NAME_RE.fullmatch(ref["plugin"])
+        and loader.is_canonical_plugin_name(ref["plugin"])
     }
 
 

@@ -100,28 +100,36 @@ def test_match_or_reject_rejects_matching_signature_when_live_is_neither_end(con
 
 
 def test_acquire_op_locks_releases_and_retries_when_dependents_expand(tmp_path, monkeypatch):
-    """A dependency added under the provisional lock makes the helper retry."""
+    """Each growing snapshot releases its flocks and the third stable one is kept."""
     from agentic_fx.plugin import switch
 
-    acquired: list[tuple[str, ...]] = []
-    released: list[tuple[str, ...]] = []
+    real_locks = switch._plugin_locks
+    events: list[tuple[str, tuple[str, ...]]] = []
 
     @contextlib.contextmanager
-    def fake_locks(root, names, **kwargs):
+    def spy_locks(root, names, **kwargs):
         ordered = tuple(sorted(set(names)))
-        acquired.append(ordered)
-        try:
-            yield
-        finally:
-            released.append(ordered)
+        with real_locks(root, names, **kwargs):
+            events.append(("acquire", ordered))
+            try:
+                yield
+            finally:
+                events.append(("release", ordered))
 
-    values = iter(({"a"}, {"a", "b"}, {"a", "b"}, {"a", "b"}))
-    monkeypatch.setattr(switch, "_plugin_locks", fake_locks)
+    values = iter(({"a"}, {"a", "b"}, {"a", "b"}, {"a", "b", "c"},
+                   {"a", "b", "c"}, {"a", "b", "c"}))
+    monkeypatch.setattr(switch, "_plugin_locks", spy_locks)
+    plugins_root = tmp_path / "plugins"
+    plugins_root.mkdir()
     with deploy_ops.acquire_op_locks(
-            tmp_path / "plugins", "s", enumerate_dependents=lambda: next(values)) as locked:
-        assert locked == {"s", "a", "b"}
-    assert acquired == [("a", "s"), ("a", "b", "s")]
-    assert released == acquired
+            plugins_root, "s", enumerate_dependents=lambda: next(values)) as locked:
+        assert locked == {"s", "a", "b", "c"}
+        assert events[-1] == ("acquire", ("a", "b", "c", "s"))
+    assert events == [
+        ("acquire", ("a", "s")), ("release", ("a", "s")),
+        ("acquire", ("a", "b", "s")), ("release", ("a", "b", "s")),
+        ("acquire", ("a", "b", "c", "s")), ("release", ("a", "b", "c", "s")),
+    ]
 
 
 def test_acquire_op_locks_refuses_after_three_expanding_snapshots(tmp_path, monkeypatch):
@@ -230,6 +238,46 @@ def test_record_intent_rolls_back_every_table_when_signal_linking_fails(conn, mo
     assert conn.execute("SELECT status FROM signals").fetchone()[0] == "pending"
 
 
+def test_record_intent_with_revoke_rolls_back_every_row_when_signal_linking_fails(
+        conn, monkeypatch):
+    """A revoking intent leaves no rejected row, op row, link, or signal change."""
+    approval_id = approvals_store.create(
+        conn, "plugin", {"name": "sma", "content_hash": "content-a",
+                           "artifact_hash": "artifact-a"}, NOW)
+    approvals_store.apply_decision(conn, approval_id, "approved", decided_by="h", now=NOW)
+    signals_store.add(
+        conn, plugin="sma", content_hash="content-a", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
+        payload={"direction": "long"}, now=NOW)
+    before_approvals = [tuple(r) for r in conn.execute(
+        "SELECT id,status FROM approval_requests ORDER BY id")]
+
+    def fail_link(*args, **kwargs):
+        raise sqlite3.OperationalError("link failed")
+
+    monkeypatch.setattr(deploy_ops.signals_store, "abandon_pending_for_identities", fail_link)
+    with pytest.raises(sqlite3.OperationalError, match="link failed"):
+        deploy_ops.record_intent(
+            conn,
+            intent_row={
+                "op_kind": "disable_symlink", "name": "sma", "from_kind": "symlink",
+                "to_kind": "absent", "from_target": ".versions/sma/artifact-a",
+                "to_target": None, "retired_path": None,
+                "subject_content_hash": "content-a", "subject_artifact_hash": "artifact-a",
+                "target_content_hash": None, "target_artifact_hash": None,
+                "approval_id": None, "force": False,
+            },
+            revoke=deploy_ops.RevokeSpec("sma", "content-a"),
+            cascade_identities=[("sma", "content-a")],
+            now=NOW, actor="human_cli")
+    assert not conn.in_transaction
+    assert [tuple(r) for r in conn.execute(
+        "SELECT id,status FROM approval_requests ORDER BY id")] == before_approvals
+    assert conn.execute("SELECT COUNT(*) FROM plugin_deploy_ops").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM plugin_deploy_op_signals").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM signals").fetchone()[0] == "pending"
+
+
 class _Activity:
     def __init__(self, raises=False):
         self.calls = []
@@ -330,3 +378,60 @@ def test_bless_rejects_open_deploy_op_from_config_dependency(tmp_path, conn):
         switch.bless_candidate(
             conn, name="strategy", human_dir=candidate, settings=settings,
             now=NOW, decided_by="human")
+
+
+def _settings():
+    return load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+
+def test_approve_rejects_open_deploy_op_from_config_only_dependency(tmp_path, conn):
+    """A config-derived indicator is checked even when the payload pins none."""
+    plugins_root = tmp_path / "plugins"
+    candidate = plugins_root / "_staging" / "1" / "strategy"
+    _strategy_candidate(candidate, plugin="config_dep")
+    approval_id = approvals_store.create(
+        conn, "plugin", {
+            "name": "strategy", "candidate_origin": "staging",
+            "candidate_path": "plugins/_staging/1/strategy",
+        }, NOW)
+    _open_disable(conn, "config_dep")
+
+    with pytest.raises(switch.OpenDeployOpError, match="config_dep.*op_id=1"):
+        switch.approve_candidate(
+            conn, approval_id, decided_by="human", now=NOW,
+            plugins_root=plugins_root, settings=_settings())
+
+
+def test_approve_rejects_when_config_dependency_grows_while_waiting_for_lock(
+        tmp_path, conn, monkeypatch):
+    """A dependency added after the lock set was chosen is refused, not checked."""
+    plugins_root = tmp_path / "plugins"
+    candidate = plugins_root / "_staging" / "1" / "strategy"
+    _strategy_candidate(candidate, plugin="first_dep")
+    approval_id = approvals_store.create(
+        conn, "plugin", {
+            "name": "strategy", "candidate_origin": "staging",
+            "candidate_path": "plugins/_staging/1/strategy",
+        }, NOW)
+    _open_disable(conn, "late_dep")
+    real_locks = switch._plugin_locks
+    locked_names: list[tuple[str, ...]] = []
+
+    @contextlib.contextmanager
+    def growing_locks(root, names, **kwargs):
+        locked_names.append(tuple(sorted(names)))
+        with real_locks(root, names, **kwargs):
+            (candidate / "config.yaml").write_text(
+                "kind: strategy\nindicators:\n  signal:\n    plugin: first_dep\n"
+                "  extra:\n    plugin: late_dep\n")
+            yield
+
+    monkeypatch.setattr(switch, "_plugin_locks", growing_locks)
+    with pytest.raises(ValueError, match="candidate_changed"):
+        switch.approve_candidate(
+            conn, approval_id, decided_by="human", now=NOW,
+            plugins_root=plugins_root, settings=_settings())
+    assert locked_names == [("first_dep", "strategy")]
+    assert conn.execute(
+        "SELECT status FROM approval_requests WHERE id=?", (approval_id,)).fetchone()[0] == "pending"
