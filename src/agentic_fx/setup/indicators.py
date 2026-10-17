@@ -207,6 +207,12 @@ def _stalled_text(name: str, approval_id: int | None) -> str:
             "(端末での確認があります)。")
 
 
+def _open_deploy_op_text(name: str, error: Exception) -> str:
+    return (f"{name}: 配備操作が未完のため中断しました ({error})。"
+            f"候補は plugins/_human/{name} に残っています。daemon の起動時 reconcile を待つか、"
+            "同じ指定で CLI を再実行してから `afx init` の採用をやり直してください。")
+
+
 def _legacy_text(name: str) -> str:
     return (f"{name} は旧形式で配備済みです。切り替えは手順書 (0) を参照してください "
             f"({_DEPLOY_DOC})。")
@@ -233,6 +239,9 @@ def _announce_interrupt(io: IndicatorIO, conn: sqlite3.Connection, name: str) ->
 
 def _classify_failure(io: IndicatorIO, conn: sqlite3.Connection, name: str, candidate: Path,
                       error: Exception, before_pending: set[int]) -> AdoptOutcome:
+    if isinstance(error, plugin_switch.OpenDeployOpError):
+        io.stdout(_open_deploy_op_text(name, error))
+        return AdoptOutcome(name, "stalled", None, "open_deploy_op")
     try:
         has_journal, found = _open_journal_approval(conn, name)
         if not has_journal:
@@ -244,9 +253,10 @@ def _classify_failure(io: IndicatorIO, conn: sqlite3.Connection, name: str, cand
         return AdoptOutcome(name, "error", None, "adopt_error", type(error).__name__)
     if has_journal:
         io.stdout(_stalled_text(name, found))
-        code = ("unresolved_journal"
-                if isinstance(error, plugin_switch.UnresolvedJournalError)
-                else "switch_incomplete")
+        if isinstance(error, plugin_switch.UnresolvedJournalError):
+            code = "unresolved_journal"
+        else:
+            code = "switch_incomplete"
         return AdoptOutcome(name, "stalled", found, code)
     if _is_gate_failure(error):
         shutil.rmtree(candidate, ignore_errors=True)

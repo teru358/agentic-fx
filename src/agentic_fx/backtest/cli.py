@@ -544,6 +544,10 @@ _UNRESOLVED_JOURNAL_RECOVERY_HINT = (
     "  収束手順: サービスの対話シェルで `approval list` → "
     "`approval retry <approval_id>`")
 
+_OPEN_DEPLOY_OP_RECOVERY_HINT = (
+    "  配備操作が未完です (op_id は上記)。daemon の起動時 reconcile を待つか、"
+    "同じ指定で CLI を再実行してください。別の操作はその op が閉じた後に行ってください。")
+
 _HISTORY_GIT_RECOVERY_HINT = (
     "  次の一手: 表示された原因を確認してください "
     "(初期化先・権限・git 実行環境・履歴 repo "
@@ -631,6 +635,9 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
             conn, name=args.name, human_dir=human_dir, settings=settings,
             now=datetime.now(timezone.utc), decided_by="human_cli",
             on_floor_warning=_warn, activity=activity)
+    except plugin_switch.OpenDeployOpError as e:
+        print(f"エラー: {e}\n{_OPEN_DEPLOY_OP_RECOVERY_HINT}", file=sys.stderr)
+        return 1
     except plugin_switch.UnresolvedJournalError as e:
         # [switch-ops-hardening] T6: `UnresolvedJournalError` は `Exception`
         # 直系なので `(ValueError, SandboxError)` にも外側の包括 catch にも
@@ -675,6 +682,9 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
         plugin_switch.retire_plugin(
             conn, plugins_dir, args.name, now=datetime.now(timezone.utc),
             activity=activity)
+    except plugin_switch.OpenDeployOpError as e:
+        print(f"エラー: {e}\n{_OPEN_DEPLOY_OP_RECOVERY_HINT}", file=sys.stderr)
+        return 1
     except plugin_switch.UnresolvedJournalError as e:
         # [switch-ops-hardening] T12 (設計書 §3.4 / R12): 同じ原因
         # (未終端の切替ジャーナル) には `_plugin_bless` と同じ案内を出す。

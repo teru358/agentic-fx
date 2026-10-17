@@ -1968,3 +1968,48 @@ def test_plugin_retire_value_error_is_rc1_without_next_step(
         "(retire only applies to legacy plain live)"
     assert "approval list" not in err
     assert "approval retry" not in err
+
+
+def _open_deploy_op_error():
+    from agentic_fx.plugin import switch as _switch
+    return _switch.OpenDeployOpError(
+        "plugin 'sma' has open deploy op op_id=7 blocking bless")
+
+
+def _assert_deploy_op_hint(capsys):
+    captured = capsys.readouterr()
+    assert "op_id=7" in captured.err
+    assert "配備操作が未完です" in captured.err
+    assert "approval retry" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_plugin_bless_open_deploy_op_has_deploy_op_hint(tmp_path, monkeypatch, capsys):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise _open_deploy_op_error()
+
+    monkeypatch.setattr(_switch, "bless_candidate", _boom)
+    rc = _cli._plugin_bless(
+        None, None, _argparse.Namespace(name="sma", from_kind="_human"), tmp_path)
+    assert rc == 1
+    _assert_deploy_op_hint(capsys)
+
+
+def test_plugin_retire_open_deploy_op_has_deploy_op_hint(tmp_path, monkeypatch, capsys):
+    import argparse as _argparse
+
+    from agentic_fx.backtest import cli as _cli
+    from agentic_fx.plugin import switch as _switch
+
+    def _boom(*args, **kwargs):
+        raise _open_deploy_op_error()
+
+    monkeypatch.setattr(_switch, "retire_plugin", _boom)
+    rc = _cli._plugin_retire(None, None, _argparse.Namespace(name="sma"), tmp_path)
+    assert rc == 1
+    _assert_deploy_op_hint(capsys)

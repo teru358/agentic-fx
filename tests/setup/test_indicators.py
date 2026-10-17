@@ -337,6 +337,19 @@ def test_stalled_after_gate_prints_retry_instruction(root, conn):
             "`afx ctl --as approver approval retry 12` を実行してください (端末での確認があります)。") in io.text
 
 
+def test_open_deploy_op_without_journal_has_its_own_code_and_text(root, conn):
+    err = plugin_switch.OpenDeployOpError("plugin 'macd' has open deploy op op_id=3 blocking bless")
+    io = ScriptIO([])
+    out = ind.adopt(io, root, conn, ["macd"], settings=object(),
+                    bless=Spy({"macd": err}), now=NOW)
+    assert [(o.result, o.approval_id, o.reason_code) for o in out] == [
+        ("stalled", None, "open_deploy_op")]
+    assert "macd: 配備操作が未完のため中断しました" in io.text
+    assert "op_id=3" in io.text
+    assert "plugins/_human/macd" in io.text
+    assert "approval retry" not in io.text
+
+
 def test_approval_id_comes_from_the_journal_not_the_error_text(root, conn):
     open_journal(conn, "macd", 12)
     err = HistoryGitError("record failed approval_id=999")
