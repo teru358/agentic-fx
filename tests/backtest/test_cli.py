@@ -2004,12 +2004,12 @@ def test_plugin_retire_open_deploy_op_has_deploy_op_hint(tmp_path, monkeypatch, 
     import argparse as _argparse
 
     from agentic_fx.backtest import cli as _cli
-    from agentic_fx.plugin import switch as _switch
+    from agentic_fx.plugin import deploy_retire as _retire
 
     def _boom(*args, **kwargs):
         raise _open_deploy_op_error()
 
-    monkeypatch.setattr(_switch, "retire_plugin", _boom)
+    monkeypatch.setattr(_retire, "retire_plugin", _boom)
     rc = _cli._plugin_retire(None, None, _argparse.Namespace(name="sma"), tmp_path)
     assert rc == 1
     _assert_deploy_op_hint(capsys)

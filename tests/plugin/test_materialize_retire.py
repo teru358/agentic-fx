@@ -9,7 +9,7 @@ import pytest
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import load_settings
-from agentic_fx.plugin import loader, switch
+from agentic_fx.plugin import deploy_retire, loader, switch
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import db as db_store
 from agentic_fx.store import plugin_deploy_ops as deploy_ops_store
@@ -26,6 +26,11 @@ def _write(dirpath: Path) -> None:
     (dirpath / "plugin.py").write_text(INDICATOR_PY)
     (dirpath / "config.yaml").write_text(CONFIG_YAML)
     (dirpath / "test_plugin.py").write_text(TEST_PY_OK)
+
+
+def _retire(conn, plugins_dir, settings, name="sma", *, activity=None):
+    return deploy_retire.retire_plugin(
+        conn, plugins_dir, name, force=False, now=NOW, settings=settings, activity=activity)
 
 
 @pytest.fixture
@@ -69,13 +74,13 @@ def test_retire_rejects_when_unresolved_journal_exists(env):
         new_target=f".versions/sma/{'b' * 64}",
         switch_required=True, actor="human", now=NOW, commit=True)
     with pytest.raises(switch.UnresolvedJournalError):
-        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+        _retire(conn, plugins_dir, settings)
 
 
-def test_retire_rejects_when_open_deploy_op_exists(env):
-    """An open disable intent blocks legacy retirement until deploy reconciliation."""
+def test_retire_takes_over_matching_open_plain_retire(env):
     tmp_path, plugins_dir, conn, settings = env
     _write(plugins_dir / "sma")
+    (plugins_dir / "_retired").mkdir()
     deploy_ops_store.insert_intent(
         conn, op_kind="retire_plain", name="sma", from_kind="plain",
         to_kind="retired", from_target=None, to_target=None,
@@ -84,10 +89,8 @@ def test_retire_rejects_when_open_deploy_op_exists(env):
         target_artifact_hash=None, approval_id=None, revoke=False,
         revoke_row_id=None, force=False, actor="human_cli", now=NOW)
 
-    with pytest.raises(switch.OpenDeployOpError, match="op_id=1"):
-        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
-    assert issubclass(switch.OpenDeployOpError, switch.UnresolvedJournalError)
-    assert (plugins_dir / "sma").is_dir()
+    outcome = _retire(conn, plugins_dir, settings)
+    assert outcome.outcome == "done" and outcome.op_id == 1
 
 
 def test_retire_rejects_when_live_is_a_symlink(env):
@@ -104,7 +107,7 @@ def test_retire_rejects_when_live_is_a_symlink(env):
     live.symlink_to(f".versions/sma/{'a' * 64}")
 
     with pytest.raises(ValueError, match="not a plain directory"):
-        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+        _retire(conn, plugins_dir, settings)
 
     assert live.is_symlink()
     assert live.readlink().as_posix() == f".versions/sma/{'a' * 64}"
@@ -115,7 +118,7 @@ def test_retire_renames_plain_dir_to_retired_with_timestamp(env):
     tmp_path, plugins_dir, conn, settings = env
     _write(plugins_dir / "sma")
 
-    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    _retire(conn, plugins_dir, settings)
 
     assert not (plugins_dir / "sma").exists()
     retired = list((plugins_dir / "_retired").iterdir())
@@ -128,7 +131,7 @@ def test_retire_does_not_delete_content(env):
     """killer: retire が dir を削除する変異を殺す (§5 変異リスト逐語)。"""
     tmp_path, plugins_dir, conn, settings = env
     _write(plugins_dir / "sma")
-    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    _retire(conn, plugins_dir, settings)
     retired_dir = next((plugins_dir / "_retired").iterdir())
     assert (retired_dir / "config.yaml").exists()
     assert (retired_dir / "test_plugin.py").exists()
@@ -143,7 +146,7 @@ def test_retire_writes_plugin_retired_activity(env):
     _write(plugins_dir / "sma")
     activity = ActivityLog(tmp_path / "logs" / "activity.log")
 
-    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW, activity=activity)
+    _retire(conn, plugins_dir, settings, activity=activity)
 
     lines = (tmp_path / "logs" / "activity.log").read_text().splitlines()
     assert len(lines) == 1
@@ -151,8 +154,7 @@ def test_retire_writes_plugin_retired_activity(env):
     assert category == Category.APPROVAL.value
     assert event == "plugin_retired"
     assert "name=sma" in summary
-    retired_dir = next((plugins_dir / "_retired").iterdir())
-    assert f"retired_path={retired_dir}" in summary
+    assert "op_id=1" in summary
 
 
 def test_retire_without_activity_arg_still_succeeds(env):
@@ -160,7 +162,7 @@ def test_retire_without_activity_arg_still_succeeds(env):
     (テスト等) が activity を渡さなくても retire は成立する。"""
     tmp_path, plugins_dir, conn, settings = env
     _write(plugins_dir / "sma")
-    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    _retire(conn, plugins_dir, settings)
     assert not (plugins_dir / "sma").exists()
 
 
@@ -188,7 +190,7 @@ def test_retire_plugin_takes_plugin_flock_and_blocks_until_released(env):
 
     def _run_retire():
         started.set()
-        switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+        _retire(conn, plugins_dir, settings)
         finished.set()
 
     t = threading.Thread(target=_run_retire)
@@ -244,7 +246,7 @@ def test_legacy_plain_e2e_pending_retire_retry_completes_switch(env, monkeypatch
     meta_mid = next(m for m in loader.discover(plugins_dir) if m.name == "sma")
     assert meta_mid.path == plugins_dir / "sma"
 
-    switch.retire_plugin(conn, plugins_dir, "sma", now=NOW)
+    _retire(conn, plugins_dir, settings)
 
     # retire 直後: PluginMeta.path (旧プロセスがメモリに保持している値) は
     # まだ 'plugins/sma' という文字列のままだが、そのパスは物理的に

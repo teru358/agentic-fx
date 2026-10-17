@@ -57,7 +57,7 @@ def test_disable_with_live_at_from_unlinks_and_completes(world):
     assert not os.path.lexists(world.root / "sma") and c.is_dir()
     assert _state(world, op) == ("done", None) and _row(world, op)["notify_attempted"] == 1
     assert [r.outcome for r in results] == ["done"]
-    assert [e for _, e, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert [e for _, e, _ in activity.events] == ["plugin_disabled"]
 
 
 def test_disable_unlink_failure_stays_open_without_touching_live(world, monkeypatch):
@@ -436,7 +436,7 @@ def test_a_finished_op_whose_notification_was_never_attempted_is_notified_once(w
     assert sorted(r.op_id for r in first) == [missed, failed]
     assert all(r.outcome == "notified" for r in first) and second == []
     assert [e for _, e, _ in activity.events] == [
-        "plugin_deploy_op_done", "plugin_deploy_op_needs_retry"]
+        "plugin_disabled", "plugin_deploy_op_needs_retry"]
     assert _row(world, missed)["notify_attempted"] == 1
     assert _row(world, done)["notify_attempted"] == 1
 

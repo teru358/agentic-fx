@@ -195,7 +195,7 @@ def test_disable_preserves_version_and_approval_and_emits_done_activity(tmp_path
     assert json.loads(approvals[0]["payload_json"])["content_hash"] == content
     row = deploy_store.list_by_name(conn, "sma")[0]
     assert row["phase"] == "done" and row["notify_attempted"] == 1
-    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert [event for _, event, _ in activity.events] == ["plugin_disabled"]
 
 
 def test_second_disable_is_idempotent_and_revoke_requires_last_disabled_version(tmp_path, monkeypatch):
@@ -334,7 +334,7 @@ def test_retry_reopens_only_same_signature_and_notifies_after_success(tmp_path, 
     assert second.outcome == "disabled" and not os.path.lexists(live)
     assert len(rows) == 1 and rows[0]["phase"] == "done" and rows[0]["notify_attempted"] == 1
     assert [event for _, event, _ in activity.events] == [
-        "plugin_deploy_op_needs_retry", "plugin_deploy_op_done"]
+        "plugin_deploy_op_needs_retry", "plugin_disabled"]
 
 
 def test_foreign_replacement_before_unlink_is_closed_without_touching_directory(tmp_path, monkeypatch):
@@ -450,7 +450,7 @@ def test_disable_completes_after_crash_between_unlink_and_done(tmp_path, monkeyp
     rows = deploy_store.list_by_name(conn, "sma")
     assert outcome.outcome == "disabled" and outcome.op_id == rows[0]["op_id"]
     assert len(rows) == 1 and rows[0]["phase"] == "done"
-    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert [event for _, event, _ in activity.events] == ["plugin_disabled"]
 
 
 def test_disable_crash_recovery_rejects_a_different_revoke_or_force_request(tmp_path, monkeypatch):
@@ -559,7 +559,7 @@ def test_rerun_after_crash_before_notify_recovers_the_notification_once(tmp_path
                                           now=NOW, settings=SETTINGS, activity=activity)
     assert again.outcome == "already_disabled"
     assert again.notified_op_ids == (row["op_id"],)
-    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert [event for _, event, _ in activity.events] == ["plugin_disabled"]
     assert deploy_store.list_by_name(conn, "sma")[0]["notify_attempted"] == 1
 
     third = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,

@@ -38,6 +38,7 @@ from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin import strategy_adapter
 from agentic_fx.plugin import strategy_gate
 from agentic_fx.plugin import switch as plugin_switch
+from agentic_fx.plugin import deploy_retire
 from agentic_fx.plugin import resolve as plugin_resolve
 from agentic_fx.plugin.resolve import (
     IndicatorResolutionError, resolve_indicator_deps,
@@ -153,6 +154,8 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
         "retire", help="legacy plain live plugin を plugins/_retired/ へ退避する"
                        " (flock、未完ジャーナルは拒否)")
     retire_parser.add_argument("name")
+    retire_parser.add_argument("--force", action="store_true")
+    retire_parser.add_argument("--dry-run", action="store_true")
 
     improve = sub.add_parser("improve", help="改善ループ操作 (CLI 専用)")
     improve_sub = improve.add_subparsers(dest="improve_command", required=True)
@@ -679,10 +682,12 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     plugins_dir = root / "plugins"
     activity = ActivityLog(root / "logs" / "activity.log")
     try:
-        plugin_switch.retire_plugin(
-            conn, plugins_dir, args.name, now=datetime.now(timezone.utc),
-            activity=activity)
-    except plugin_switch.OpenDeployOpError as e:
+        outcome = deploy_retire.retire_plugin(
+            conn, plugins_dir, args.name, force=getattr(args, "force", False),
+            now=datetime.now(timezone.utc), settings=settings, activity=activity,
+            dry_run=getattr(args, "dry_run", False))
+    except (deploy_retire.deploy_ops.DeployOpBlockedError,
+            plugin_switch.OpenDeployOpError) as e:
         print(f"エラー: {e}\n{_OPEN_DEPLOY_OP_RECOVERY_HINT}", file=sys.stderr)
         return 1
     except plugin_switch.UnresolvedJournalError as e:
@@ -695,7 +700,7 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     except (ValueError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-    print(f"plugin {args.name!r} を retire しました")
+    print(f"plugin {args.name!r} を retire しました ({outcome.outcome})")
     return 0
 
 

@@ -401,3 +401,20 @@ def abandon_pending_for_identities(
         f"AND ({predicates})", params)
     if commit:
         conn.commit()
+
+
+def abandon_pending_for_name(conn: sqlite3.Connection, name: str, *, op_id: int,
+                             now: datetime, commit: bool = True) -> None:
+    rows = conn.execute(
+        "SELECT id, status FROM signals WHERE plugin=? AND status IN ('pending','claimed')",
+        (name,),
+    ).fetchall()
+    conn.executemany(
+        "INSERT OR IGNORE INTO plugin_deploy_op_signals "
+        "(op_id,signal_id,status_at_link) VALUES (?,?,?)",
+        ((op_id, row["id"], row["status"]) for row in rows),
+    )
+    conn.execute(
+        "UPDATE signals SET status='abandoned' WHERE plugin=? AND status='pending'", (name,))
+    if commit:
+        conn.commit()

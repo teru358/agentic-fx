@@ -180,7 +180,7 @@ def require_no_open_deploy_ops(conn: sqlite3.Connection, names: set[str], *,
 def record_intent(conn: sqlite3.Connection, *, intent_row: dict,
                   revoke: RevokeSpec | None,
                   cascade_identities: list[tuple[str, str]], now: datetime,
-                  actor: str) -> int:
+                  actor: str, after_insert: Callable[[int], None] | None = None) -> int:
     """Atomically persist a restrictive deploy intent and its signal effects."""
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -203,6 +203,8 @@ def record_intent(conn: sqlite3.Connection, *, intent_row: dict,
                       revoke_row_id=revoke_row_id, actor=actor, now=now,
                       commit=False)
         op_id = deploy_store.insert_intent(conn, **values)
+        if after_insert is not None:
+            after_insert(op_id)
         signals_store.abandon_pending_for_identities(
             conn, cascade_identities, op_id=op_id, now=now, commit=False)
         conn.commit()
@@ -215,6 +217,10 @@ def record_intent(conn: sqlite3.Connection, *, intent_row: dict,
 def activity_event(op_row: Mapping[str, object]) -> str | None:
     """Map a terminal deployment-op state to its single activity event name."""
     if op_row["phase"] == "done":
+        if op_row["op_kind"] == "disable_symlink":
+            return "plugin_disabled"
+        if op_row["op_kind"] == "retire_plain":
+            return "plugin_retired"
         return "plugin_deploy_op_done"
     if op_row["phase"] == "needs_retry":
         return "plugin_deploy_op_needs_retry"

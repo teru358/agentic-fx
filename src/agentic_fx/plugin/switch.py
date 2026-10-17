@@ -1945,44 +1945,6 @@ def materialize_plugin(root: Path, name: str) -> Path:
     return dest
 
 
-# precheck 2026-08-22 wave2: T11-B2
-def retire_plugin(conn: sqlite3.Connection, root: Path, name: str, *,
-                  now: datetime, activity: "ActivityLog | None" = None) -> None:
-    """統合裁定 R-i5 で骨格 Interfaces 節が `conn` 必須へ更新済み
-    (未完ジャーナルの確認に DB 接続が要るため)。
-
-    検収 B2 是正: 設計書 §5.1 手順 0 / §5.1-1 は `plugin retire` に
-    activity `plugin_retired` を要求する。旧稿はコメントのみで未実装
-    だった (呼び出し元に activity インスタンスを渡す形へ拡張)。"""
-    lock_path = root / ".locks" / f"{name}.lock"
-    lock_path.parent.mkdir(exist_ok=True)
-    with open(lock_path, "w") as lockf:
-        fcntl.flock(lockf, fcntl.LOCK_EX)
-        try:
-            # B-2: 現物名は `get_open_by_name` (単一行 dict | None を返す —
-            # 非実在の `list_non_terminal_for_name` からの置換)
-            unresolved = journal_store.get_open_by_name(conn, name)
-            if unresolved is not None:
-                raise UnresolvedJournalError(
-                    f"plugin {name!r} has an unresolved switch journal "
-                    f"(op_id={unresolved['op_id']}) — resolve it first "
-                    "(reconcile or approval retry)")
-            _reject_open_deploy_ops(conn, {name}, operation="retire")
-            live = root / name
-            if not live.is_dir() or live.is_symlink():
-                raise ValueError(f"plugins/{name} is not a plain directory "
-                                 "(retire only applies to legacy plain live)")
-            ts = now.strftime("%Y%m%dT%H%M%SZ")
-            dest = root / "_retired" / f"{name}-{ts}"
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(live, dest)
-            if activity is not None:
-                activity.write(Category.APPROVAL, "plugin_retired",
-                               f"name={name} retired_path={dest}")
-        finally:
-            fcntl.flock(lockf, fcntl.LOCK_UN)
-
-
 # precheck 2026-08-22 wave2: T11-B1
 def retry_approval(conn: sqlite3.Connection, approval_id: int, *,
                    decided_by: str, now: datetime, plugins_root: Path,
