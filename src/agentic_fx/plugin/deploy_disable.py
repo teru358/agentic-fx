@@ -55,18 +55,9 @@ def _recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now
     return tuple(notified)
 
 
-def _activity(activity):
-    return activity if activity is not None else _NullActivity()
-
-
-class _NullActivity:
-    def write(self, *args, **kwargs) -> None:
-        return None
-
-
 class _RevokeActivity:
     def __init__(self, activity, content_hash: str) -> None:
-        self._activity = _activity(activity)
+        self._activity = deploy_ops.activity_or_null(activity)
         self._content_hash = content_hash
 
     def write(self, category, event: str, summary: str) -> None:
@@ -78,26 +69,6 @@ def _latest_disable_candidate(conn: sqlite3.Connection, name: str) -> str | None
         if row["op_kind"] == "disable_symlink" and row["phase"] == "done":
             return row["subject_content_hash"]
     return None
-
-
-def _approved_row(conn: sqlite3.Connection, name: str, content_hash: str) -> dict | None:
-    row = approvals_store.latest_decision_for_identity(conn, name, content_hash)
-    return row if row is not None and row["status"] == "approved" else None
-
-
-def _cascade_identities(conn: sqlite3.Connection, plugins_root: Path,
-                        names: set[str]) -> list[tuple[str, str]]:
-    identities: list[tuple[str, str]] = []
-    for strategy in sorted(names):
-        live = deploy_store.live_identity(plugins_root, strategy)
-        if live is None or live.content_hash is None:
-            continue
-        decision = approvals_store.latest_decision_for_identity(
-            conn, strategy, live.content_hash)
-        if decision is None or decision["status"] != "approved":
-            continue
-        identities.append((strategy, live.content_hash))
-    return identities
 
 
 def _find_version_identity(plugins_root: Path, name: str, content_hash: str):
@@ -160,12 +131,12 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
                                       cascade_strategies=tuple(sorted(report.dependent_names)))
             deploy_store.set_phase(conn, op_id, "done", now=now)
             done_row = deploy_store.get_by_id(conn, op_id)
-            deploy_ops.try_notify(conn, done_row, _activity(activity), now=now)
+            deploy_ops.try_notify(conn, done_row, deploy_ops.activity_or_null(activity), now=now)
             return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                                   tuple(sorted(report.dependent_names)), op_id=op_id)
         if live is None:
             notified = (() if dry_run else _recover_notifications(
-                conn, name, _activity(activity), now=now))
+                conn, name, deploy_ops.activity_or_null(activity), now=now))
             if revoke:
                 return DisableOutcome("revoke_requires_version", name,
                                       version_candidate=_latest_disable_candidate(conn, name),
@@ -187,7 +158,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             op_id = None
         if report.unresolvable and not force:
             return DisableOutcome("dependents_blocked", name, dependents=report.unresolvable)
-        approved = _approved_row(conn, name, live.content_hash)
+        approved = deploy_ops.approved_row(conn, name, live.content_hash)
         takeover = open_row is not None and bool(open_row["revoke"])
         if revoke and approved is None and not takeover:
             raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
@@ -198,7 +169,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
         if op_id is None:
             identities = [(name, live.content_hash)]
-            identities.extend(_cascade_identities(conn, plugins_root, report.dependent_names))
+            identities.extend(deploy_ops.cascade_identities(conn, plugins_root, report.dependent_names))
             op_id = deploy_ops.record_intent(
                 conn, intent_row={
                     "op_kind": "disable_symlink", "name": name, "from_kind": "symlink",
@@ -209,21 +180,21 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
                     "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
                 cascade_identities=identities, now=now, actor=actor)
-        if not live_path.is_symlink():
+        if not deploy_ops.live_matches_from(live_path, raw_target):
             deploy_store.set_phase(conn, op_id, "foreign", now=now)
             row = deploy_store.get_by_id(conn, op_id)
-            deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+            deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
             return DisableOutcome("foreign", name, op_id=op_id)
         try:
             os.unlink(live_path)
         except OSError:
             deploy_store.set_phase(conn, op_id, "needs_retry", now=now, fail_reason="syscall_failed")
             row = deploy_store.get_open_by_name(conn, name)
-            deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+            deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
             return DisableOutcome("needs_retry", name, op_id=op_id)
         deploy_store.set_phase(conn, op_id, "done", now=now)
         row = deploy_store.get_by_id(conn, op_id)
-        deploy_ops.try_notify(conn, row, _activity(activity), now=now)
+        deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
         return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                               tuple(sorted(report.dependent_names)), op_id=op_id)
 
