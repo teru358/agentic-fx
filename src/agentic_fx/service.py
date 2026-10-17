@@ -55,7 +55,7 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
-from agentic_fx.plugin import switch
+from agentic_fx.plugin import deploy_reconcile, switch
 from agentic_fx.plugin.sandbox import reap_orphans, startup_diagnostics
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy, directives_path
@@ -1320,7 +1320,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         plugins_dir = root / "plugins"
 
-        # プラン 10 Task 11f: 起動時 reconcile (journal-first) → 孤児掃除
+        # 起動時 deploy reconcile → switch journal reconcile → 孤児掃除
         # (sweep-last) → 期限切れ承認処理 (B-7: 裁定1の唯一の呼び出し元)。
         # `missions.recover_interrupted` (上記) より後・`approved_plugins()`
         # (直後) より前に配線する — reconcile 未実行のまま approved_plugins
@@ -1334,8 +1334,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # (毎起動で再現し、人間が該当ジャーナル行を手で片付けるまで恒久的に
         # 続く欠陥)。§5.1-1 の収束規則は「どちらでもない → ERROR で人間待ち」
         # を行ごとの規則として書いており、reconcile 自身の per-row 分離
-        # (switch.py 側で実施済み) と対で、3 呼び出しも互いに独立させる —
-        # 呼び出し順序 (reconcile → sweep → expire) 自体は変えない。
+        # (switch.py 側で実施済み) と対で、各呼び出しも互いに独立させる。
+        try:
+            deploy_reconcile.reconcile_deploy_ops(
+                conn_core, plugins_dir, now=clock.now(), settings=settings,
+                activity=activity,
+                lock_timeout_sec=settings.worker.reconcile_lock_timeout_sec,
+                stop_event=stop_event)
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_deploy_reconcile_failed",
+                           safe_error_text(exc))
         try:
             switch.reconcile_switch_journals(
                 conn_core, plugins_root=plugins_dir, now=clock.now(),

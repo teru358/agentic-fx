@@ -70,6 +70,8 @@ def _migrate_one_to_two(text: str) -> EditResult:
 
 _PLUGIN_LOCK_LINE = ("plugin_lock_timeout_sec: 2      "
                      "# signal producer / OPEN の plugin name lock 待機上限 (秒)\n")
+_RECONCILE_LOCK_LINE = ("reconcile_lock_timeout_sec: 30  "
+                        "# 起動時 deploy reconcile の plugin name lock 待機上限 (秒)\n")
 
 
 _VERSION_TWO_LINE = re.compile(r"schema_version:[ \t]*2([ \t]+#.*)?\r?\n?")
@@ -88,7 +90,8 @@ def _migrate_two_to_three(text: str) -> EditResult:
     lines[marker] = lines[marker].replace("schema_version: 2", "schema_version: 3", 1)
     raw = yaml.safe_load(text) or {}
     worker = raw.get("worker")
-    if isinstance(worker, dict) and "plugin_lock_timeout_sec" not in worker:
+    if isinstance(worker, dict) and ("plugin_lock_timeout_sec" not in worker
+                                     or "reconcile_lock_timeout_sec" not in worker):
         head = next((i for i, line in enumerate(lines) if line.startswith("worker:")), None)
         child = None
         if head is not None:
@@ -109,7 +112,12 @@ def _migrate_two_to_three(text: str) -> EditResult:
                     last = i
             if not lines[last].endswith("\n"):
                 lines[last] += "\n"
-            lines.insert(last + 1, indent + _PLUGIN_LOCK_LINE)
+            additions = []
+            if "plugin_lock_timeout_sec" not in worker:
+                additions.append(indent + _PLUGIN_LOCK_LINE)
+            if "reconcile_lock_timeout_sec" not in worker:
+                additions.append(indent + _RECONCILE_LOCK_LINE)
+            lines[last + 1:last + 1] = additions
     updated = "".join(lines)
     try:
         Settings.model_validate(yaml.safe_load(updated) or {})

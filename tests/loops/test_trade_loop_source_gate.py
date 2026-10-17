@@ -9,7 +9,7 @@ from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.executor import snapshot_age_exceeded
 from agentic_fx.plugin import switch
 from agentic_fx.runners.base import MissionResult
-from agentic_fx.store import plugin_deploy_ops, signals
+from agentic_fx.store import orders, plugin_deploy_ops, signals
 
 from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
 
@@ -223,6 +223,27 @@ def test_hold_never_acquires_plugin_name_lock(tmp_path, monkeypatch):
 
     assert out["result"] == "hold"
     locks.assert_not_called()
+
+
+def test_close_and_cancel_never_acquire_plugin_name_lock(tmp_path):
+    """Only OPEN has a source gate; closing paths remain available during deploy work."""
+    conn, loop, runner, _ = _loop(tmp_path, [])
+    open_id = orders.insert(
+        conn, pair="USDJPY", direction="long", entry_type="market", horizon="day",
+        status="open", now=NOW, quantity=0.1, avg_fill_price=148.5)
+    pending_id = orders.insert(
+        conn, pair="USDJPY", direction="long", entry_type="limit", horizon="day",
+        status="pending_fill", now=NOW, quantity=0.1, remaining_quantity=0.1,
+        requested_price=148.2, stop_loss=147.8, take_profit=149.0, expires_at=None)
+    for action, order_id, expected in (("close", open_id, "closed"),
+                                       ("cancel", pending_id, "cancelled")):
+        runner._results = [MissionResult(
+            "completed", {"action": action, "order_id": order_id,
+                          "reasoning": "risk reduction"}, [])]
+        with patch("agentic_fx.loops.trade_loop.switch._plugin_locks") as locks:
+            loop.run_once("cron")
+        locks.assert_not_called()
+        assert orders.get(conn, order_id)["status"] == expected
 
 
 def test_source_lock_oserror_is_recorded_as_a_signal_rejection(tmp_path, monkeypatch):

@@ -550,6 +550,7 @@ class WorkerSettings(_Strict):
     # — 設計書 §3.1)。
     snapshot_max_age_sec: float = Field(gt=0, default=10.0)
     plugin_lock_timeout_sec: float = Field(gt=0, default=2.0)
+    reconcile_lock_timeout_sec: float = Field(gt=0, default=30.0)
     # watchdog と停止時 join 予算が共有する dispatch 上限 (秒)。未設定なら
     # Cd (trade 1 + reflection 最大 3 の worker 上限 + 余白) + 60 を自動導出する。
     # 明示する場合は Cd 未満だと起動拒否 (正常な dispatch の途中で watchdog が

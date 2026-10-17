@@ -11,6 +11,8 @@ EXAMPLE = ROOT / "config" / "settings.yaml.example"
 FIXTURES = ROOT / "tests" / "fixtures" / "settings_examples"
 PLUGIN_LOCK_LINE = ("  plugin_lock_timeout_sec: 2      "
                     "# signal producer / OPEN の plugin name lock 待機上限 (秒)\n")
+RECONCILE_LOCK_LINE = ("  reconcile_lock_timeout_sec: 30  "
+                       "# 起動時 deploy reconcile の plugin name lock 待機上限 (秒)\n")
 
 
 def test_version_zero_migration_inserts_only_schema_version_line():
@@ -20,7 +22,7 @@ def test_version_zero_migration_inserts_only_schema_version_line():
 
     assert result.ok
     assert result.text is not None
-    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(
+    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(RECONCILE_LOCK_LINE, "", 1).replace(
         "schema_version: 3  # settings の版。`afx init` が移行する\n", "",
     ) == old
 
@@ -78,11 +80,11 @@ def test_every_schema_fixture_exists_and_migrates_without_changing_existing_line
         assert result.ok, result.reason
         assert result.text is not None
         if fixture.name == "v0.yaml":
-            assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(
+            assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(RECONCILE_LOCK_LINE, "", 1).replace(
                 "schema_version: 3  # settings の版。`afx init` が移行する\n", "",
             ) == original
         elif fixture.name == "v1.yaml":
-            assert result.text.replace(PLUGIN_LOCK_LINE, "", 1) == original.replace(
+            assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(RECONCILE_LOCK_LINE, "", 1) == original.replace(
                 "schema_version: 1", "schema_version: 3", 1)
         elif fixture.name == "v2.yaml":
             assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
@@ -104,7 +106,7 @@ def test_version_one_migration_changes_only_the_schema_version_line():
 
     assert result.ok
     assert result.text is not None
-    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(
+    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(RECONCILE_LOCK_LINE, "", 1).replace(
         "schema_version: 3", "schema_version: 1", 1) == old
     assert "enabled: false              # 改善 worker" in result.text
 
@@ -117,7 +119,7 @@ def test_version_zero_migrates_through_version_one_to_version_two():
     assert result.ok
     expected = (FIXTURES / "v1.yaml").read_text(encoding="utf-8").replace(
         "schema_version: 1", "schema_version: 3", 1)
-    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1) == expected
+    assert result.text.replace(PLUGIN_LOCK_LINE, "", 1).replace(RECONCILE_LOCK_LINE, "", 1) == expected
     assert PLUGIN_LOCK_LINE in result.text
 
 
@@ -138,7 +140,8 @@ def test_version_two_migration_keeps_an_existing_lock_timeout_value():
     result = migrate(old)
 
     assert result.ok
-    assert result.text == old.replace("schema_version: 2", "schema_version: 3", 1)
+    assert result.text == old.replace("schema_version: 2", "schema_version: 3", 1).replace(
+        "(lock内再取得しない)\n", "(lock内再取得しない)\n" + RECONCILE_LOCK_LINE, 1)
 
 
 def test_version_two_migration_without_a_worker_section_changes_only_the_marker():
@@ -166,8 +169,9 @@ def test_version_two_migration_without_trailing_newline_keeps_lines_separate():
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text.endswith("\n" + PLUGIN_LOCK_LINE)
+    assert result.text.endswith("\n" + PLUGIN_LOCK_LINE + RECONCILE_LOCK_LINE)
     assert yaml.safe_load(result.text)["worker"]["plugin_lock_timeout_sec"] == 2
+    assert yaml.safe_load(result.text)["worker"]["reconcile_lock_timeout_sec"] == 30
 
 
 def test_version_two_marker_does_not_match_a_longer_number():

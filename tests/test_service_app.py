@@ -5114,6 +5114,62 @@ def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_o
         assert call_names == ["reconcile", "sweep", "expire", "approved"]
 
 
+def test_service_startup_reconciles_deploy_ops_before_switch_journals(tmp_path):
+    """Deploy-op recovery precedes switch-journal recovery in the startup path."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile, switch
+
+    _init(tmp_path)
+    calls = mock.MagicMock()
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops") as deploy, \
+         mock.patch.object(switch, "reconcile_switch_journals") as journal:
+        calls.attach_mock(deploy, "deploy")
+        calls.attach_mock(journal, "journal")
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert [call[0] for call in calls.mock_calls[:2]] == ["deploy", "journal"]
+        deploy.assert_called_once()
+    finally:
+        app.close()
+
+
+def test_service_startup_passes_reconcile_lock_timeout_setting(tmp_path):
+    """The startup-only timeout is passed to durable deploy reconciliation."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile
+
+    _init(tmp_path)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings_path.write_text(settings_path.read_text(encoding="utf-8").replace(
+        "  reconcile_lock_timeout_sec: 30", "  reconcile_lock_timeout_sec: 17"),
+        encoding="utf-8")
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops") as reconcile:
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert reconcile.call_args.kwargs["lock_timeout_sec"] == 17
+    finally:
+        app.close()
+
+
+def test_service_startup_deploy_reconcile_failure_is_recorded_and_nonfatal(tmp_path):
+    """A deploy reconcile exception is isolated and visible in the activity log."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile
+
+    _init(tmp_path)
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops",
+                           side_effect=RuntimeError("deploy boom")):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert any("plugin_deploy_reconcile_failed" in line
+                   for line in app.activity.tail(50))
+    finally:
+        app.close()
+
+
 # --- [indicator-consumption-wiring] T3 Step 3-2 (F2) ------------------------
 
 def test_service_startup_excludes_pin_broken_strategy_from_producer(tmp_path):
