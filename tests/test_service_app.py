@@ -1137,11 +1137,14 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeStrategySession):
+              _FakeStrategySession), \
+         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                         embedding_fn=FakeEmbedding())
         fake = _ToolCallingFakeRunner(
-            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
+            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
+             MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
             registry=app.registry, pair="USDJPY")
         app.trade_loop.runner = fake
         app.scheduler.on_improve_tick = None
@@ -1181,9 +1184,30 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
             row = app.conn_core.execute(
                 "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
                 (sid,)).fetchone()
+            assert dict(row) == {"status": "pending",
+                                 "claimed_by_mission_id": None}
+            assert "## この判断で扱う signal" not in fake.missions[0].prompt
+            # hook は Mission の実行中に完了しうるので、ツール検索には pending
+            # 行が見えてもよい。ただしこの Mission が claim した行ではない。
+            assert all(row["status"] == "pending"
+                       for row in fake.tool_observations[0])
+
+            # producer は core_lock 解放後の hook で INSERT する。次の判定
+            # tick は既に取り込んだ足だけを使えばよいので、ingest の追加取得を
+            # 外して source health とは独立に claim 契約だけを確認する。
+            app.ingest = None
+            app.scheduler.signal_due_fn = lambda _now: True
+            clock.current = t_cron + timedelta(minutes=15)
+            assert _tick_once_and_wait(app) == 1
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            mission = app.conn_core.execute(
+                "SELECT id FROM missions WHERE loop='trade' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
             assert dict(row) == {"status": "consumed",
                                  "claimed_by_mission_id": mission["id"]}
-            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
+            assert [(r["id"], r["status"]) for r in fake.tool_observations[-1]] == [
                 (sid, "claimed")]
         finally:
             app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
@@ -1221,7 +1245,9 @@ def test_signal_not_taken_by_any_mission_is_abandoned_only_after_fresh_until(tmp
                     datetime(2026, 9, 24, 15, 0, 30, tzinfo=timezone.utc)):
             clock.current = now
             with _no_real_network(), app.core_lock:
-                app.scheduler.tick(now)
+                pending = app.scheduler.tick(now)
+            for hook in pending:
+                hook()
             statuses.append(app.conn_core.execute(
                 "SELECT status FROM signals WHERE id=?", (sid,)
             ).fetchone()["status"])
@@ -1620,7 +1646,9 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeSignalSession):
+              _FakeSignalSession), \
+         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -1629,7 +1657,10 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
                 NOW - timedelta(hours=51), 51 * 60 + 1)
         with _no_real_network(), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                pending = app.scheduler.tick(NOW)
+            for hook in pending:
+                hook()
 
     count = app.conn_core.execute(
         "SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -1659,7 +1690,9 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FailingSession):
+              _FailingSession), \
+         patch("agentic_fx.plugin.signal_producer._live_source_reason",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -1668,7 +1701,10 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
                 NOW - timedelta(hours=51), 51 * 60 + 1)
         with _no_real_network(), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                pending = app.scheduler.tick(NOW)
+            for hook in pending:
+                hook()
 
     text = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     lines = [l for l in text.splitlines() if "\tplugin_eval_failed\t" in l]
@@ -3086,13 +3122,15 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     def spy_run_signal_maintenance(*, conn, signal_producer, approved,
-                                  settings, now, resolved_by_identity, activity):
+                                      settings, now, resolved_by_identity, activity,
+                                      plugins_root):
         calls.append({
             "conn": conn is not None,
             "signal_producer": signal_producer is not None,
             "approved": approved is not None,
             "settings": settings is not None,
             "activity": activity is not None,
+            "plugins_root": plugins_root is not None,
             "now": now is not None,
             "now_value": now
         })
@@ -3102,6 +3140,7 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
 
     # scheduler の callback を通じて on_signal_maintenance を呼ぶ
     test_now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    app.scheduler.state_fn = lambda: "ready"
     app.scheduler.on_signal_maintenance(test_now)
 
     # callback が呼ばれたことと、全引数が渡されたことを確認
@@ -3112,6 +3151,7 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     assert call["approved"] is True, "approved should be passed"
     assert call["settings"] is True, "settings should be passed"
     assert call["activity"] is True, "activity should be passed"
+    assert call["plugins_root"] is True, "plugins_root should be passed"
     assert call["now"] is True, "now should be passed"
     assert call["now_value"] == test_now, "now value should match"
 
@@ -3431,7 +3471,7 @@ def test_a_tick_whose_observe_failed_stops_new_risk_but_keeps_protection(
     _scheduler_tick_once(app)
 
     assert app.outage.state == "degraded"
-    assert calls == {"mission": 0, "fills": 0, "exits": 1, "maintenance": 0}
+    assert calls == {"mission": 0, "fills": 0, "exits": 1, "maintenance": 1}
     events = [c.args[1] for c in app.activity.write.call_args_list]
     assert events.count("outage_observe_failed") == 1
 
@@ -3450,7 +3490,7 @@ def test_the_next_tick_whose_observe_succeeds_returns_to_the_normal_decision(
     _scheduler_tick_once(app)
 
     assert app.outage.state == "ready"
-    assert calls["mission"] == 1 and calls["maintenance"] == 1 and calls["fills"] == 1
+    assert calls["mission"] == 1 and calls["maintenance"] == 2 and calls["fills"] == 1
 
 
 def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):
