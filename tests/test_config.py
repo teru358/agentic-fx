@@ -42,7 +42,7 @@ def test_example_file_loads():
     assert s.datafeed.primary == "yfinance"
     # 既定の allowlist は空であるべき (検査⑤の守りを弱めない既定値)。
     assert s.service.secret_env_allowlist == []
-    assert s.schema_version == 2
+    assert s.schema_version == 3
     assert s.api.enabled is True
 
 
