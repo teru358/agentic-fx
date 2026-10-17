@@ -118,18 +118,6 @@ def test_disable_unlinks_live_symlink_and_records_done_op(tmp_path, monkeypatch)
     assert row["notify_attempted"] == 1
 
 
-def test_strategy_identities_select_each_named_latest_approval(tmp_path):
-    conn = db_store.connect(tmp_path / "agentic.db")
-    db_store.init_db(conn)
-    for name, content in (("first", "first-content"), ("second", "second-content")):
-        approval_id = approvals_store.create(
-            conn, "plugin", {"name": name, "content_hash": content}, NOW)
-        approvals_store.apply_decision(conn, approval_id, "approved", decided_by="human", now=NOW)
-
-    assert list(deploy_disable._strategy_identities(conn, {"first", "second"})) == [
-        ("first", "first-content"), ("second", "second-content")]
-
-
 def test_disable_returns_retry_outcome_when_unlink_fails(tmp_path, monkeypatch):
     conn = db_store.connect(tmp_path / "agentic.db")
     db_store.init_db(conn)
@@ -380,3 +368,163 @@ def test_foreign_replacement_before_unlink_is_closed_without_touching_directory(
     row = deploy_store.list_by_name(conn, "sma")[0]
     assert row["phase"] == "foreign" and row["notify_attempted"] == 1
     assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_foreign"]
+
+
+def _no_dependents(monkeypatch):
+    monkeypatch.setattr(deploy_disable, "enumerate_dependents",
+                        lambda *a, **k: deploy_disable.DependentsReport())
+
+
+def test_cascade_uses_the_live_identity_of_each_dependent_strategy(tmp_path):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    old = _version_with_kind(root, "s", "a" * 64, kind="strategy")
+    new = _version_with_kind(root, "s", "b" * 64, kind="strategy",
+                             indicator="a")
+    old_content, _, _ = _approve(conn, "s", old)
+    new_content, _, _ = _approve(conn, "s", new, now=NOW + timedelta(seconds=1))
+    _link_live(root, "s", old)
+    gone = _version_with_kind(root, "g", "c" * 64, kind="strategy")
+    _approve(conn, "g", gone)
+
+    identities = deploy_disable._cascade_identities(conn, root, {"s", "g", "missing"})
+
+    assert identities == [("s", old_content)]
+    assert new_content != old_content
+
+
+def test_disable_force_cascade_abandons_live_version_pending_not_newer_approved(tmp_path):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    indicator = _version_with_kind(root, "a", "a" * 64, kind="indicator")
+    live_strategy = _version_with_kind(root, "s", "b" * 64, kind="strategy", indicator="a")
+    newer = _version_with_kind(root, "s", "c" * 64, kind="strategy")
+    _approve(conn, "a", indicator)
+    live_content, _, _ = _approve(conn, "s", live_strategy)
+    newer_content, _, _ = _approve(conn, "s", newer, now=NOW + timedelta(seconds=1))
+    _link_live(root, "a", indicator)
+    _link_live(root, "s", live_strategy)
+    live_pending = _signal(conn, "s", live_content)
+    newer_pending = _signal(conn, "s", newer_content)
+
+    outcome = deploy_disable.disable_plugin(conn, root, "a", revoke=False, force=True,
+                                            now=NOW, settings=SETTINGS)
+
+    assert outcome.outcome == "disabled" and outcome.cascade_strategies == ("s",)
+    statuses = dict(conn.execute("SELECT id,status FROM signals").fetchall())
+    assert statuses == {live_pending: "abandoned", newer_pending: "pending"}
+
+
+def test_disable_completes_after_crash_between_unlink_and_done(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    live = _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_set_phase = deploy_store.set_phase
+
+    def crash_on_done(c, op_id, phase, **kwargs):
+        if phase == "done":
+            raise RuntimeError("crash")
+        return real_set_phase(c, op_id, phase, **kwargs)
+
+    monkeypatch.setattr(deploy_store, "set_phase", crash_on_done)
+    with pytest.raises(RuntimeError, match="crash"):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_store, "set_phase", real_set_phase)
+    assert not os.path.lexists(live)
+
+    activity = _Activity()
+    outcome = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                            now=NOW, settings=SETTINGS, activity=activity)
+
+    rows = deploy_store.list_by_name(conn, "sma")
+    assert outcome.outcome == "disabled" and outcome.op_id == rows[0]["op_id"]
+    assert len(rows) == 1 and rows[0]["phase"] == "done"
+    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+
+
+def test_disable_crash_recovery_rejects_a_different_revoke_or_force_request(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_set_phase = deploy_store.set_phase
+    monkeypatch.setattr(deploy_store, "set_phase", lambda c, op_id, phase, **kw: (
+        (_ for _ in ()).throw(RuntimeError("crash")) if phase == "done"
+        else real_set_phase(c, op_id, phase, **kw)))
+    with pytest.raises(RuntimeError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_store, "set_phase", real_set_phase)
+
+    with pytest.raises(deploy_disable.deploy_ops.SignatureMismatchError, match="revoke --version"):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                      now=NOW, settings=SETTINGS)
+    with pytest.raises(deploy_disable.deploy_ops.SignatureMismatchError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=True,
+                                      now=NOW, settings=SETTINGS)
+    assert deploy_store.list_by_name(conn, "sma")[0]["phase"] == "intent"
+
+
+def test_disable_crash_recovery_completes_a_revoke_request(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_set_phase = deploy_store.set_phase
+    monkeypatch.setattr(deploy_store, "set_phase", lambda c, op_id, phase, **kw: (
+        (_ for _ in ()).throw(RuntimeError("crash")) if phase == "done"
+        else real_set_phase(c, op_id, phase, **kw)))
+    with pytest.raises(RuntimeError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                      now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_store, "set_phase", real_set_phase)
+
+    outcome = deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                            now=NOW, settings=SETTINGS)
+
+    assert outcome.outcome == "disabled"
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 1
+
+
+def test_rejected_precheck_leaves_a_syscall_failed_open_op_untouched(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    monkeypatch.setattr(deploy_disable.os, "unlink",
+                        lambda _path: (_ for _ in ()).throw(OSError("blocked")))
+    first = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                          now=NOW, settings=SETTINGS, activity=_Activity())
+    assert first.outcome == "needs_retry"
+    monkeypatch.setattr(deploy_disable, "enumerate_dependents", lambda *a, **k: (
+        deploy_disable.DependentsReport(unresolvable=(("s", "fast", "not_found"),))))
+
+    outcome = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                            now=NOW, settings=SETTINGS)
+
+    row = deploy_store.list_by_name(conn, "sma")[0]
+    assert outcome.outcome == "dependents_blocked"
+    assert row["phase"] == "needs_retry" and row["fail_reason"] == "syscall_failed"
+    assert row["notify_attempted"] == 1

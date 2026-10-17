@@ -369,3 +369,27 @@ def test_expire_due_skips_plugin_kind_pending_rows(tmp_path):
     row = c.execute("SELECT status FROM approval_requests WHERE id=?",
                     (aid,)).fetchone()
     assert row["status"] == "pending"
+
+
+def test_latest_decision_for_identity_picks_latest_decided_and_skips_foreign_payloads(tmp_path):
+    conn = _conn(tmp_path)
+    for index, status in enumerate(("approved", "rejected", "approved")):
+        approval_id = approvals.create(
+            conn, "plugin", {"name": "p", "content_hash": "h"}, NOW)
+        approvals.apply_decision(conn, approval_id, status, decided_by="human",
+                                 now=NOW + timedelta(seconds=index))
+    other = approvals.create(conn, "plugin", {"name": "p", "content_hash": "other"}, NOW)
+    approvals.apply_decision(conn, other, "approved", decided_by="human",
+                             now=NOW + timedelta(seconds=9))
+    conn.execute(
+        "INSERT INTO approval_requests (kind,payload_json,status,decided_at,created_at) "
+        "VALUES ('plugin','[]','approved',?,?)", (NOW.isoformat(), NOW.isoformat()))
+    conn.execute(
+        "INSERT INTO approval_requests (kind,payload_json,status,decided_at,created_at) "
+        "VALUES ('plugin','not json','approved',?,?)", (NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+
+    row = approvals.latest_decision_for_identity(conn, "p", "h")
+
+    assert row["status"] == "approved" and row["id"] == 3
+    assert approvals.latest_decision_for_identity(conn, "p", "none") is None

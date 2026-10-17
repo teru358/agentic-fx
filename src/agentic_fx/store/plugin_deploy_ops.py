@@ -108,6 +108,11 @@ def get_open_by_name(conn: sqlite3.Connection, name: str) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def get_by_id(conn: sqlite3.Connection, op_id: int) -> dict | None:
+    row = conn.execute("SELECT * FROM plugin_deploy_ops WHERE op_id=?", (op_id,)).fetchone()
+    return dict(row) if row is not None else None
+
+
 def list_by_name(conn: sqlite3.Connection, name: str) -> list[dict]:
     return [dict(row) for row in conn.execute(
         "SELECT * FROM plugin_deploy_ops WHERE name=? ORDER BY op_id", (name,))]

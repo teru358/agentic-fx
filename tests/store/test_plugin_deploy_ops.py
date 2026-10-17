@@ -727,3 +727,11 @@ def test_live_identity_inner_versions_symlink_allowed(tmp_path):
     content, artifact = _li_expected(vdir)
     assert deploy_ops.live_identity(root, "alpha") == \
         deploy_ops.LiveIdentity("symlink", content, artifact)
+
+
+def test_get_by_id_returns_the_row_or_none(tmp_path):
+    conn = _conn(tmp_path)
+    op_id = _insert_intent(conn)
+
+    assert deploy_ops.get_by_id(conn, op_id)["op_id"] == op_id
+    assert deploy_ops.get_by_id(conn, op_id + 100) is None

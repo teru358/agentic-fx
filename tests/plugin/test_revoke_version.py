@@ -195,3 +195,73 @@ def test_revocation_excludes_loader_until_bless_restores_identity(tmp_path, monk
         (human / "plugin.py", human / "config.yaml", human / "test_plugin.py"))) == artifact
     admitted = plugin_loader.approved_plugins(conn, root, settings=SETTINGS).inventory.metas
     assert tuple(meta.name for meta in admitted) == ("sma",)
+
+
+def _prepare_old_and_live(tmp_path):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    old = _version(root, "sma", value="1.0")
+    current = _version(root, "sma", value="2.0")
+    old_content, old_artifact, _ = _approve(conn, "sma", old)
+    _approve(conn, "sma", current, now=NOW + timedelta(seconds=1))
+    (root / "sma").symlink_to(f".versions/sma/{current.name}")
+    return conn, root, old, old_content, old_artifact
+
+
+def test_revoke_records_the_approved_artifact_hash_even_if_the_directory_changed(tmp_path):
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    (old / "config.yaml").write_text("kind: indicator\noutputs: [value, extra]\n")
+
+    outcome = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+
+    assert outcome.outcome == "revoked"
+    assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact
+
+
+def test_revoke_warns_when_the_directory_artifact_differs_from_the_approval(tmp_path):
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    (old / "test_plugin.py").write_text("def test_plugin():\n    assert True\n")
+    events = []
+
+    class Activity:
+        def write(self, category, event, summary):
+            events.append(event)
+
+    outcome = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content,
+                                            now=NOW, activity=Activity())
+
+    assert outcome.outcome == "revoked"
+    assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact
+    assert events.count("plugin_version_dir_mismatch") == 1
+
+
+def test_revoke_proceeds_without_a_version_directory(tmp_path):
+    import shutil
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    shutil.rmtree(old)
+
+    outcome = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+
+    assert outcome.outcome == "revoked"
+    assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact
+
+
+def test_revoke_without_recorded_artifact_hash_falls_back_to_directory_or_refuses(tmp_path):
+    import shutil
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=1",
+                 (json.dumps({"name": "sma", "content_hash": old_content}),))
+    conn.commit()
+    shutil.copytree(old, tmp_path / "keep")
+    shutil.rmtree(old)
+    with pytest.raises(ValueError, match="artifact hash"):
+        deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 0
+    shutil.copytree(tmp_path / "keep", old)
+
+    outcome = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+
+    assert outcome.outcome == "revoked"
+    assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact

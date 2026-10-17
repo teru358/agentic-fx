@@ -1,12 +1,15 @@
 """Disable and revoke deployment operations; intentionally not a tools API."""
 from __future__ import annotations
 
+import json
+import logging
 import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from agentic_fx.activity import Category
 from agentic_fx.plugin import deploy_ops
 from agentic_fx.plugin.deploy_deps import DependentsReport, enumerate_dependents
 from agentic_fx.plugin import loader
@@ -61,19 +64,23 @@ def _latest_disable_candidate(conn: sqlite3.Connection, name: str) -> str | None
 
 
 def _approved_row(conn: sqlite3.Connection, name: str, content_hash: str) -> dict | None:
-    rows = []
-    import json
-    for row in conn.execute(
-            "SELECT * FROM approval_requests WHERE kind='plugin' "
-            "AND status='approved' AND decided_at IS NOT NULL "
-            "ORDER BY decided_at,id"):
-        try:
-            payload = json.loads(row["payload_json"])
-        except (ValueError, TypeError):
+    row = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+    return row if row is not None and row["status"] == "approved" else None
+
+
+def _cascade_identities(conn: sqlite3.Connection, plugins_root: Path,
+                        names: set[str]) -> list[tuple[str, str]]:
+    identities: list[tuple[str, str]] = []
+    for strategy in sorted(names):
+        live = deploy_store.live_identity(plugins_root, strategy)
+        if live is None or live.content_hash is None:
             continue
-        if payload.get("name") == name and payload.get("content_hash") == content_hash:
-            rows.append(dict(row))
-    return rows[-1] if rows else None
+        decision = approvals_store.latest_decision_for_identity(
+            conn, strategy, live.content_hash)
+        if decision is None or decision["status"] != "approved":
+            continue
+        identities.append((strategy, live.content_hash))
+    return identities
 
 
 def _find_version_identity(plugins_root: Path, name: str, content_hash: str):
@@ -117,6 +124,24 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
         live = deploy_store.live_identity(plugins_root, name)
         live_path = plugins_root / name
+        if (live is None and open_row is not None
+                and open_row["op_kind"] == "disable_symlink"):
+            if bool(open_row["revoke"]) != revoke or bool(open_row["force"]) != force:
+                hint = ("; use `afx plugin revoke --version` to revoke a version"
+                        if revoke and not open_row["revoke"] else "")
+                raise deploy_ops.SignatureMismatchError(
+                    f"open deploy op op_id={open_row['op_id']} was recorded with "
+                    f"revoke={bool(open_row['revoke'])} force={bool(open_row['force'])}, "
+                    f"requested revoke={revoke} force={force}{hint}")
+            op_id = int(open_row["op_id"])
+            if dry_run:
+                return DisableOutcome("dry_run", name, op_id=op_id,
+                                      cascade_strategies=tuple(sorted(report.dependent_names)))
+            deploy_store.set_phase(conn, op_id, "done", now=now)
+            done_row = deploy_store.get_by_id(conn, op_id)
+            deploy_ops.try_notify(conn, done_row, _activity(activity), now=now)
+            return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
+                                  tuple(sorted(report.dependent_names)), op_id=op_id)
         if live is None:
             if revoke:
                 return DisableOutcome("revoke_requires_version", name,
@@ -130,13 +155,10 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         requested = deploy_ops.Signature("disable_symlink", name, live.content_hash,
                                          live.artifact_hash, None, revoke, force)
         if open_row is not None:
-            if dry_run:
-                if deploy_ops.row_signature(open_row) != requested:
-                    raise deploy_ops.SignatureMismatchError(
-                        f"open deploy op op_id={open_row['op_id']} has a different signature")
-                op_id = int(open_row["op_id"])
-            else:
-                op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
+            if deploy_ops.row_signature(open_row) != requested:
+                raise deploy_ops.SignatureMismatchError(
+                    f"open deploy op op_id={open_row['op_id']} has a different signature")
+            op_id = int(open_row["op_id"])
         else:
             op_id = None
         if report.unresolvable and not force:
@@ -147,10 +169,11 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         if dry_run:
             return DisableOutcome("dry_run", name, cascade_strategies=tuple(sorted(report.dependent_names)),
                                   dependents=report.unresolvable)
+        if open_row is not None:
+            op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
         if op_id is None:
             identities = [(name, live.content_hash)]
-            identities.extend((strategy, content) for strategy, content in _strategy_identities(
-                conn, report.dependent_names))
+            identities.extend(_cascade_identities(conn, plugins_root, report.dependent_names))
             op_id = deploy_ops.record_intent(
                 conn, intent_row={
                     "op_kind": "disable_symlink", "name": name, "from_kind": "symlink",
@@ -163,7 +186,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
                 cascade_identities=identities, now=now, actor=actor)
         if not live_path.is_symlink():
             deploy_store.set_phase(conn, op_id, "foreign", now=now)
-            row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
+            row = deploy_store.get_by_id(conn, op_id)
             deploy_ops.try_notify(conn, row, _activity(activity), now=now)
             return DisableOutcome("foreign", name, op_id=op_id)
         try:
@@ -174,23 +197,10 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             deploy_ops.try_notify(conn, row, _activity(activity), now=now)
             return DisableOutcome("needs_retry", name, op_id=op_id)
         deploy_store.set_phase(conn, op_id, "done", now=now)
-        row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
+        row = deploy_store.get_by_id(conn, op_id)
         deploy_ops.try_notify(conn, row, _activity(activity), now=now)
         return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                               tuple(sorted(report.dependent_names)), op_id=op_id)
-
-
-def _strategy_identities(conn: sqlite3.Connection, names: set[str]):
-    import json
-    for name in sorted(names):
-        row = conn.execute(
-            "SELECT payload_json FROM approval_requests WHERE kind='plugin' AND status='approved' "
-            "AND decided_at IS NOT NULL ORDER BY decided_at DESC,id DESC").fetchall()
-        for candidate in row:
-            payload = json.loads(candidate["payload_json"])
-            if payload.get("name") == name and isinstance(payload.get("content_hash"), str):
-                yield name, payload["content_hash"]
-                break
 
 
 def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, content_hash: str,
@@ -208,9 +218,8 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
         if live is not None and live.content_hash == content_hash:
             raise ValueError("cannot revoke the current live version; disable it first")
         found = _find_version_identity(plugins_root, name, content_hash)
-        if found is None:
-            raise ValueError(f"no version directory matches {name!r} {content_hash!r}")
-        _version, artifact_hash = found
+        dir_artifact = found[1] if found is not None else None
+        mismatch_artifact: str | None = None
         try:
             conn.execute("BEGIN IMMEDIATE")
             revoke_row_id = approvals_store.append_revocation(
@@ -219,8 +228,17 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
                 conn.rollback()
                 return RevokeOutcome("already_revoked", name, content_hash)
             payload = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)).fetchone()
-            import json
-            approval_id = json.loads(payload["payload_json"])["revokes_approval_id"]
+            revoke_payload = json.loads(payload["payload_json"])
+            approval_id = revoke_payload["revokes_approval_id"]
+            artifact_hash = revoke_payload.get("artifact_hash")
+            if not isinstance(artifact_hash, str) or not artifact_hash:
+                if dir_artifact is None:
+                    raise ValueError(
+                        f"cannot determine the artifact hash of {name!r} {content_hash!r}: "
+                        "the approval records none and no version directory matches")
+                artifact_hash = dir_artifact
+            elif dir_artifact is not None and dir_artifact != artifact_hash:
+                mismatch_artifact = dir_artifact
             op_id = deploy_store.insert_done_revoke(
                 conn, name=name, subject_content_hash=content_hash,
                 subject_artifact_hash=artifact_hash, approval_id=approval_id,
@@ -231,6 +249,16 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
         except BaseException:
             conn.rollback()
             raise
-        row = next(row for row in deploy_store.list_by_name(conn, name) if row["op_id"] == op_id)
-        deploy_ops.try_notify(conn, row, _RevokeActivity(activity, content_hash), now=now)
+        row = deploy_store.get_by_id(conn, op_id)
+        revoke_activity = _RevokeActivity(activity, content_hash)
+        if mismatch_artifact is not None:
+            try:
+                revoke_activity.write(
+                    Category.APPROVAL, "plugin_version_dir_mismatch",
+                    f"name={name} dir_artifact={mismatch_artifact} "
+                    f"approved_artifact={artifact_hash}")
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "version dir mismatch notice failed name=%s: %r", name, exc)
+        deploy_ops.try_notify(conn, row, revoke_activity, now=now)
         return RevokeOutcome("revoked", name, content_hash, op_id)

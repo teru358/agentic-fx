@@ -32,9 +32,11 @@ def _pending_pins(conn: sqlite3.Connection, name: str) -> tuple[tuple[str, str],
             "WHERE kind='plugin' AND status='pending'"):
         try:
             payload = json.loads(row["payload_json"])
-            refs = payload.get("indicator_deps", {})
         except (TypeError, ValueError):
             continue
+        if not isinstance(payload, dict):
+            continue
+        refs = payload.get("indicator_deps", {})
         if isinstance(refs, dict):
             for alias, ref in refs.items():
                 if isinstance(alias, str) and isinstance(ref, dict) and ref.get("plugin") == name:
