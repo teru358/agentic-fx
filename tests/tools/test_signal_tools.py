@@ -12,7 +12,7 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
-from agentic_fx.store import backtest_runs, signals
+from agentic_fx.store import backtest_runs, plugin_deploy_ops, signals
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools import signal_tools
 
@@ -149,6 +149,21 @@ def test_signal_row_has_no_metrics_or_note_keys(tmp_path):
     assert len(out) == 1
     assert "in_sample_metrics" not in out[0]
     assert "note" not in out[0]
+
+
+def test_deploy_linked_signal_is_hidden_from_tool_output(tmp_path):
+    conn = _conn(tmp_path)
+    signal_id = _add_signal(conn, hours_ago=1, content_hash="linked")
+    op_id = plugin_deploy_ops.insert_intent(
+        conn, op_kind="disable_symlink", name="sig1", from_kind="symlink",
+        to_kind="absent", from_target=".versions/sig1/a", to_target=None,
+        retired_path=None, subject_content_hash="linked",
+        subject_artifact_hash="artifact", target_content_hash=None,
+        target_artifact_hash=None, approval_id=1, revoke=False,
+        revoke_row_id=None, force=False, actor="human_cli", now=NOW)
+    plugin_deploy_ops.set_phase(conn, op_id, "done", now=NOW)
+    plugin_deploy_ops.link_signals(conn, op_id, [(signal_id, "pending")])
+    assert _tool(conn).func(pair="USDJPY") == []
 
 
 # ---- ⑤bool 拒否 --------------------------------------------------------------

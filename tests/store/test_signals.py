@@ -522,9 +522,9 @@ def test_add_rejects_timeframe_outside_plugin_timeframes(tmp_path):
 # ---------------------------------------------------------------------
 def test_pending_exists(tmp_path):
     conn = _conn(tmp_path)
-    assert signals.pending_exists(conn) is False
+    assert signals.pending_exists(conn, now=NOW, freshness_bars=1) is False
     _add(conn, bar_ts=NOW)
-    assert signals.pending_exists(conn) is True
+    assert signals.pending_exists(conn, now=NOW, freshness_bars=1) is True
 
 
 def test_recent_filters_by_pair_and_bar_ts_since(tmp_path):

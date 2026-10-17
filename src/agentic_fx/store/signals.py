@@ -77,16 +77,27 @@ _FRESH_CONDITION = f"datetime(bar_ts) >= {_CUTOFF_EXPR}"
 _STALE_CONDITION = (
     f"({_TF_MINUTES_CASE} IS NULL OR datetime(bar_ts) < {_CUTOFF_EXPR})")
 
+_DEPLOY_LINKED_ANTI_JOIN = (
+    "NOT EXISTS (SELECT 1 FROM plugin_deploy_op_signals AS deploy_links "
+    "WHERE deploy_links.signal_id=signals.id)"
+)
+
 # requeue / reclaim_expired 共有の遷移式 (controller 解決 #6 逐語):
 # requeue_count >= max_requeue なら abandoned (増分なし)、
 # 未満なら pending + requeue_count+1。
+_DEPLOY_LINKED_EXISTS = (
+    "EXISTS (SELECT 1 FROM plugin_deploy_op_signals AS deploy_links "
+    "WHERE deploy_links.signal_id=signals.id)"
+)
+# deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
+# 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
 _REQUEUE_STATUS_EXPR = (
-    "CASE WHEN requeue_count >= :max_requeue THEN 'abandoned' "
-    "ELSE 'pending' END"
+    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
+    "THEN 'abandoned' ELSE 'pending' END"
 )
 _REQUEUE_COUNT_EXPR = (
-    "CASE WHEN requeue_count >= :max_requeue THEN requeue_count "
-    "ELSE requeue_count + 1 END"
+    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
+    "THEN requeue_count ELSE requeue_count + 1 END"
 )
 
 
@@ -208,15 +219,12 @@ def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
     """
     _require_aware(now, "now")
     params: dict = {"mission_id": mission_id, "now": now.isoformat()}
-    freshness_clause = ""
-    if freshness_bars is not None:
-        params["freshness_bars"] = freshness_bars
-        freshness_clause = f" AND {_FRESH_CONDITION}"
+    claimable = _claimable_where(freshness_bars, params)
     cur = conn.execute(
         "UPDATE signals SET status='claimed', "
         "claimed_by_mission_id=:mission_id, claimed_at=:now "
-        "WHERE id IN (SELECT id FROM signals WHERE status='pending'"
-        f"{freshness_clause}"
+        "WHERE id IN (SELECT id FROM signals WHERE "
+        f"{claimable}"
         " ORDER BY datetime(bar_ts) ASC, id ASC LIMIT 1) "
         "RETURNING *",
         params)
@@ -336,14 +344,26 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
     return [r["status"] for r in rows]
 
 
-def pending_exists(conn: sqlite3.Connection) -> bool:
+def _claimable_where(freshness_bars: int | None, params: dict) -> str:
+    freshness_clause = ""
+    if freshness_bars is not None:
+        params["freshness_bars"] = freshness_bars
+        freshness_clause = f" AND {_FRESH_CONDITION}"
+    return f"status='pending'{freshness_clause} AND {_DEPLOY_LINKED_ANTI_JOIN}"
+
+
+def pending_exists(conn: sqlite3.Connection, *, now: datetime,
+                   freshness_bars: int | None) -> bool:
+    _require_aware(now, "now")
+    params: dict = {"now": now.isoformat()}
     row = conn.execute(
-        "SELECT 1 FROM signals WHERE status='pending' LIMIT 1").fetchone()
+        "SELECT 1 FROM signals WHERE "
+        f"{_claimable_where(freshness_bars, params)} LIMIT 1", params).fetchone()
     return row is not None
 
 
-def recent(conn: sqlite3.Connection, pair: str, *,
-           since: datetime) -> list[dict]:
+def recent(conn: sqlite3.Connection, pair: str, *, since: datetime,
+           exclude_deploy_linked: bool = False) -> list[dict]:
     """pair 一致かつ bar_ts が since 以降の signal を返す (状態は問わない)。
 
     bar_ts を時間軸にする — claim の順序付け・鮮度・失効判定はすべて
@@ -353,8 +373,31 @@ def recent(conn: sqlite3.Connection, pair: str, *,
     設計書 §5/§8 で取引判断 loop 専用、最大 lookback を持つ想定)。
     """
     _require_aware(since, "since")
+    linked_clause = f" AND {_DEPLOY_LINKED_ANTI_JOIN}" if exclude_deploy_linked else ""
     rows = conn.execute(
         "SELECT * FROM signals WHERE pair=? AND datetime(bar_ts) >= "
-        "datetime(?) ORDER BY datetime(bar_ts), id",
+        f"datetime(?){linked_clause} ORDER BY datetime(bar_ts), id",
         (pair, since.isoformat())).fetchall()
     return [dict(r) for r in rows]
+
+
+def abandon_pending_for_identities(
+        conn: sqlite3.Connection, identities: list[tuple[str, str]], *, op_id: int,
+        now: datetime, commit: bool = True) -> None:
+    if not identities:
+        return
+    predicates = " OR ".join("(plugin=? AND content_hash=?)" for _ in identities)
+    params = tuple(value for identity in identities for value in identity)
+    rows = conn.execute(
+        "SELECT id, status FROM signals WHERE status IN ('pending','claimed') "
+        f"AND ({predicates})", params).fetchall()
+    conn.executemany(
+        "INSERT OR IGNORE INTO plugin_deploy_op_signals "
+        "(op_id,signal_id,status_at_link) VALUES (?,?,?)",
+        ((op_id, row["id"], row["status"]) for row in rows),
+    )
+    conn.execute(
+        "UPDATE signals SET status='abandoned' WHERE status='pending' "
+        f"AND ({predicates})", params)
+    if commit:
+        conn.commit()
