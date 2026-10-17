@@ -188,7 +188,8 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         if report.unresolvable and not force:
             return DisableOutcome("dependents_blocked", name, dependents=report.unresolvable)
         approved = _approved_row(conn, name, live.content_hash)
-        if revoke and approved is None:
+        takeover = open_row is not None and bool(open_row["revoke"])
+        if revoke and approved is None and not takeover:
             raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
         if dry_run:
             return DisableOutcome("dry_run", name, cascade_strategies=tuple(sorted(report.dependent_names)),

@@ -302,3 +302,80 @@ def test_rerun_after_crash_before_notify_recovers_revoke_notification_once(tmp_p
                                           now=NOW, activity=Act())
     assert third.outcome == "already_revoked" and third.notified_op_ids == ()
     assert len(events) == 1
+
+
+def test_already_revoked_without_pending_notifications_leaves_no_open_transaction(tmp_path):
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    assert deploy_disable.revoke_version(
+        conn, root, "sma", content_hash=old_content, now=NOW).outcome == "revoked"
+
+    again = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+
+    assert again.outcome == "already_revoked" and again.notified_op_ids == ()
+    assert conn.in_transaction is False
+
+
+def test_already_revoked_notifies_only_the_revoke_row_of_the_same_version(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    first = _version(root, "sma", value="1.0")
+    second = _version(root, "sma", value="2.0")
+    current = _version(root, "sma", value="3.0")
+    first_content, _, _ = _approve(conn, "sma", first)
+    second_content, _, _ = _approve(conn, "sma", second, now=NOW + timedelta(seconds=1))
+    _approve(conn, "sma", current, now=NOW + timedelta(seconds=2))
+    (root / "sma").symlink_to(f".versions/sma/{current.name}")
+    real_notify = deploy_disable.deploy_ops.try_notify
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+    for content in (first_content, second_content):
+        with pytest.raises(RuntimeError, match="crash"):
+            deploy_disable.revoke_version(conn, root, "sma", content_hash=content, now=NOW)
+    monkeypatch.setattr(deploy_disable.deploy_ops, "try_notify", real_notify)
+    disable_op = deploy_store.insert_intent(
+        conn, op_kind="disable_symlink", name="sma", from_kind="symlink", to_kind="absent",
+        from_target=f".versions/sma/{current.name}", to_target=None, retired_path=None,
+        subject_content_hash="c" * 64, subject_artifact_hash="d" * 64,
+        target_content_hash=None, target_artifact_hash=None, approval_id=None,
+        revoke=False, revoke_row_id=None, force=False, actor="human_cli", now=NOW)
+    deploy_store.set_phase(conn, disable_op, "done", now=NOW)
+    rows = {(r["op_kind"], r["subject_content_hash"]): r for r in deploy_store.list_by_name(conn, "sma")}
+    wanted = rows[("revoke", first_content)]["op_id"]
+    events = []
+
+    class Act:
+        def write(self, category, event, summary):
+            events.append(event)
+
+    again = deploy_disable.revoke_version(conn, root, "sma", content_hash=first_content,
+                                          now=NOW, activity=Act())
+
+    assert again.outcome == "already_revoked"
+    assert again.notified_op_ids == (wanted,)
+    assert events == ["plugin_deploy_op_done"]
+    attempted = {r["op_id"]: r["notify_attempted"] for r in deploy_store.list_by_name(conn, "sma")}
+    assert attempted == {wanted: 1,
+                         rows[("revoke", second_content)]["op_id"]: 0,
+                         disable_op: 0}
+
+
+def test_revoke_with_a_non_string_recorded_artifact_hash_uses_the_directory(tmp_path):
+    import shutil
+    conn, root, old, old_content, old_artifact = _prepare_old_and_live(tmp_path)
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=1",
+                 (json.dumps({"name": "sma", "content_hash": old_content,
+                              "artifact_hash": 12345}),))
+    conn.commit()
+    shutil.copytree(old, tmp_path / "keep")
+    shutil.rmtree(old)
+    with pytest.raises(ValueError, match="artifact hash"):
+        deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+    assert deploy_store.list_by_name(conn, "sma") == []
+    shutil.copytree(tmp_path / "keep", old)
+
+    outcome = deploy_disable.revoke_version(conn, root, "sma", content_hash=old_content, now=NOW)
+
+    assert outcome.outcome == "revoked"
+    assert deploy_store.list_by_name(conn, "sma")[0]["subject_artifact_hash"] == old_artifact

@@ -609,3 +609,176 @@ def test_absent_live_with_other_kind_open_op_is_blocked_and_db_unchanged(tmp_pat
             deploy_disable.disable_plugin(conn, root, "sma", revoke=revoke, force=False,
                                           now=NOW, settings=SETTINGS)
     assert [dict(r) for r in conn.execute("SELECT * FROM plugin_deploy_ops")] == before
+
+
+def test_revoke_retry_after_syscall_failure_takes_over_the_open_op(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    live = _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    real_unlink = deploy_disable.os.unlink
+    monkeypatch.setattr(deploy_disable.os, "unlink",
+                        lambda _path: (_ for _ in ()).throw(OSError("blocked")))
+    first = deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                          now=NOW, settings=SETTINGS)
+    assert first.outcome == "needs_retry"
+    rejected = conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0]
+    assert rejected == 1
+    monkeypatch.setattr(deploy_disable.os, "unlink", real_unlink)
+
+    second = deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                           now=NOW, settings=SETTINGS)
+
+    rows = deploy_store.list_by_name(conn, "sma")
+    assert second.outcome == "disabled" and not os.path.lexists(live)
+    assert len(rows) == 1 and rows[0]["phase"] == "done"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == rejected
+
+
+def _open_intent(conn, version: Path, *, name="sma", revoke=False, force=False,
+                 live_absent=False) -> int:
+    target = f".versions/{name}/{version.name}"
+    content = loader.content_hash(version)
+    artifact = loader.artifact_hash_bytes(*(p.read_bytes() for p in
+        (version / "plugin.py", version / "config.yaml", version / "test_plugin.py")))
+    return deploy_store.insert_intent(
+        conn, op_kind="disable_symlink", name=name, from_kind="symlink", to_kind="absent",
+        from_target=target, to_target=None, retired_path=None, subject_content_hash=content,
+        subject_artifact_hash=artifact, target_content_hash=None, target_artifact_hash=None,
+        approval_id=None, revoke=revoke, revoke_row_id=None, force=force,
+        actor="human_cli", now=NOW)
+
+
+def test_dry_run_with_absent_live_leaves_an_open_disable_op_untouched(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    op_id = _open_intent(conn, version)
+    _no_dependents(monkeypatch)
+    activity = _Activity()
+
+    outcome = deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                            now=NOW, settings=SETTINGS, activity=activity,
+                                            dry_run=True)
+
+    assert outcome.outcome == "dry_run" and outcome.op_id == op_id
+    row = deploy_store.list_by_name(conn, "sma")[0]
+    assert row["phase"] == "intent" and row["notify_attempted"] == 0
+    assert activity.events == []
+
+
+def _mismatched_open_op(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _open_intent(conn, version, force=True)
+    return conn, root
+
+
+def test_signature_mismatch_is_raised_before_the_dry_run_return(tmp_path, monkeypatch):
+    conn, root = _mismatched_open_op(tmp_path, monkeypatch)
+    _no_dependents(monkeypatch)
+
+    with pytest.raises(deploy_disable.deploy_ops.SignatureMismatchError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS, dry_run=True)
+
+    assert deploy_store.list_by_name(conn, "sma")[0]["phase"] == "intent"
+
+
+def test_signature_mismatch_is_raised_before_the_dependents_block(tmp_path, monkeypatch):
+    conn, root = _mismatched_open_op(tmp_path, monkeypatch)
+    monkeypatch.setattr(deploy_disable, "enumerate_dependents", lambda *a, **k: (
+        deploy_disable.DependentsReport(unresolvable=(("s", "fast", "not_found"),))))
+
+    with pytest.raises(deploy_disable.deploy_ops.SignatureMismatchError):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
+
+    assert deploy_store.list_by_name(conn, "sma")[0]["phase"] == "intent"
+
+
+def test_revoke_disable_is_refused_when_the_latest_decision_is_a_rejection(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    content, _, _ = _approve(conn, "sma", version)
+    live = _link_live(root, "sma", version)
+    approvals_store.append_revocation(conn, "sma", content, now=NOW + timedelta(seconds=1))
+    _no_dependents(monkeypatch)
+
+    with pytest.raises(ValueError, match="no approved version"):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                      now=NOW, settings=SETTINGS)
+
+    assert live.is_symlink()
+    assert deploy_store.list_by_name(conn, "sma") == []
+
+
+def test_cascade_skips_a_dependent_whose_live_version_decision_is_a_rejection(tmp_path):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    strategy = _version_with_kind(root, "s", "b" * 64, kind="strategy")
+    content, _, _ = _approve(conn, "s", strategy)
+    _link_live(root, "s", strategy)
+    assert deploy_disable._cascade_identities(conn, root, {"s"}) == [("s", content)]
+    approvals_store.append_revocation(conn, "s", content, now=NOW + timedelta(seconds=1))
+
+    assert deploy_disable._cascade_identities(conn, root, {"s"}) == []
+
+
+def test_revoke_candidate_comes_only_from_finished_disable_ops(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    root.mkdir()
+    version = _version_with_kind(root, "sma", "a" * 64, kind="indicator")
+    content, _, _ = _approve(conn, "sma", version)
+    _link_live(root, "sma", version)
+    _no_dependents(monkeypatch)
+    deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                  now=NOW, settings=SETTINGS)
+    other = deploy_store.insert_intent(
+        conn, op_kind="rollback_symlink", name="sma", from_kind="symlink",
+        to_kind="symlink", from_target=".versions/sma/" + "b" * 64,
+        to_target=".versions/sma/" + "d" * 64,
+        retired_path=None, subject_content_hash="f" * 64, subject_artifact_hash="e" * 64,
+        target_content_hash="c" * 64, target_artifact_hash="d" * 64, approval_id=None,
+        revoke=False, revoke_row_id=None, force=False, actor="human_cli", now=NOW)
+    deploy_store.set_phase(conn, other, "done", now=NOW)
+    assert deploy_store.list_by_name(conn, "sma")[-1]["op_kind"] == "rollback_symlink"
+
+    outcome = deploy_disable.disable_plugin(conn, root, "sma", revoke=True, force=False,
+                                            now=NOW, settings=SETTINGS)
+
+    assert outcome.outcome == "revoke_requires_version"
+    assert outcome.version_candidate == content
+
+
+def test_plain_directory_is_refused_with_a_hint_to_retire(tmp_path, monkeypatch):
+    conn = db_store.connect(tmp_path / "agentic.db")
+    db_store.init_db(conn)
+    root = tmp_path / "plugins"
+    (root / "sma").mkdir(parents=True)
+    (root / "sma" / "plugin.py").write_text("x")
+    _no_dependents(monkeypatch)
+
+    with pytest.raises(ValueError, match="retire"):
+        deploy_disable.disable_plugin(conn, root, "sma", revoke=False, force=False,
+                                      now=NOW, settings=SETTINGS)
