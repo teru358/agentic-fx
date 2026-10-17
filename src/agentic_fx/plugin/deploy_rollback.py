@@ -1,7 +1,11 @@
-"""Rollback deployment operation; intentionally not a tools API."""
+"""Rollback deployment operation; intentionally not a tools API.
+
+The design calls for reusing switch / loader internals (the atomic symlink swap,
+version directory hash check, plugin discovery and approved-hash lookup) so that
+rollback verifies exactly what a normal switch would.
+"""
 from __future__ import annotations
 
-import json
 import os
 import re
 import sqlite3
@@ -12,7 +16,6 @@ from pathlib import Path
 from agentic_fx.plugin import deploy_ops
 from agentic_fx.plugin import loader
 from agentic_fx.plugin.deploy_deps import DependentsReport, enumerate_dependents
-from agentic_fx.plugin.deploy_disable import _activity, _approved_row, _cascade_identities
 from agentic_fx.plugin.resolve import IndicatorResolutionError, resolve_indicator_deps
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import signals as signals_store
@@ -27,7 +30,6 @@ class RollbackTarget:
     name: str
     to_target: str
     artifact_hash: str
-    defaulted: bool
 
 
 @dataclass(frozen=True)
@@ -41,9 +43,13 @@ class VerifiedTarget:
     to_target: str
     content_hash: str
     artifact_hash: str
-    kind: str
-    meta: loader.PluginMeta
     dependents: DependentsReport
+
+
+@dataclass(frozen=True)
+class VerificationFailure:
+    reasons: tuple[str, ...]
+    dependents: DependentsReport | None = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +70,7 @@ def _version_target(name: str, artifact_hash: str) -> str:
     return f".versions/{name}/{artifact_hash}"
 
 
-def _discover_dir(version_dir: Path, name: str) -> loader.PluginMeta | None:
+def discover_version_dir(version_dir: Path, name: str) -> loader.PluginMeta | None:
     try:
         return loader._discover_one(version_dir, name)
     except (OSError, ValueError):
@@ -95,7 +101,7 @@ def _resolve_prefix(plugins_root: Path, name: str, prefix: str) -> RollbackTarge
         return RollbackRefusal(
             "target_ambiguous",
             f"--to {prefix!r} matches several versions of {name!r}: " + ", ".join(matches))
-    return RollbackTarget(name, _version_target(name, matches[0]), matches[0], False)
+    return RollbackTarget(name, _version_target(name, matches[0]), matches[0])
 
 
 def resolve_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: str, *,
@@ -127,7 +133,7 @@ def resolve_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: 
                 "there is no earlier version to return to; use afx plugin disable")
         if not isinstance(previous, str) or not loader.is_canonical_symlink_target(name, previous):
             return RollbackRefusal("target_required", "previous version is unknown; --to is required")
-        return RollbackTarget(name, previous, previous.rsplit("/", 1)[-1], True)
+        return RollbackTarget(name, previous, previous.rsplit("/", 1)[-1])
     return RollbackRefusal(
         "target_required",
         "the latest live change is not an approval of the live version; --to is required")
@@ -137,91 +143,96 @@ def current_deployed_kind(conn: sqlite3.Connection, plugins_root: Path, name: st
     """Kind of the deployed version; for an absent live, of the last version taken out."""
     raw = _live_raw_target(plugins_root, name)
     if raw is not None and loader.is_canonical_symlink_target(name, raw):
-        meta = _discover_dir(plugins_root / raw, name)
+        meta = discover_version_dir(plugins_root / raw, name)
         return meta.kind if meta is not None else None
-    if (plugins_root / name).exists() or os.path.lexists(plugins_root / name):
+    if os.path.lexists(plugins_root / name):
         return None
     for row in reversed(deploy_store.list_by_name(conn, name)):
+        if row["op_kind"] == "revoke" or not deploy_store.is_closed(row):
+            continue
         closed_out = (row["phase"] == "done" and row["op_kind"] in ("disable_symlink", "rollback_symlink")) or (
             row["phase"] == "needs_retry" and row["fail_reason"] == "verify_failed")
-        artifact = row["subject_artifact_hash"]
-        if closed_out and artifact and row["from_kind"] == "symlink":
-            meta = _discover_dir(plugins_root / ".versions" / name / artifact, name)
-            return meta.kind if meta is not None else None
+        if not closed_out:
+            return None
+        if row["from_kind"] == "symlink":
+            artifact = row["subject_artifact_hash"]
+        elif row["op_kind"] == "rollback_symlink":
+            artifact = row["target_artifact_hash"]
+        else:
+            return None
+        if not artifact:
+            return None
+        meta = discover_version_dir(plugins_root / ".versions" / name / artifact, name)
+        return meta.kind if meta is not None else None
     return None
 
 
 def _approved_content_hash(conn: sqlite3.Connection, name: str, artifact_hash: str) -> str | None:
     approved = tools_plugin_loader._approved_hashes_by_name(conn).get(name, set())
-    recorded: set[str] = set()
-    for row in conn.execute(
-            "SELECT payload_json FROM approval_requests "
-            "WHERE kind='plugin' AND status IN ('approved','rejected')"):
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
-            continue
-        if (isinstance(payload, dict) and payload.get("name") == name
-                and payload.get("artifact_hash") == artifact_hash
-                and isinstance(payload.get("content_hash"), str)):
-            recorded.add(payload["content_hash"])
+    recorded = {
+        row[0] for row in conn.execute(
+            "SELECT CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.content_hash') END "
+            "FROM approval_requests WHERE kind='plugin' AND status IN ('approved','rejected') "
+            "AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END = ? "
+            "AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.artifact_hash') END = ?",
+            (name, artifact_hash))
+        if isinstance(row[0], str)}
     admitted = sorted(recorded & set(approved))
     return admitted[0] if admitted else None
 
 
-def _verify(conn: sqlite3.Connection, plugins_root: Path, name: str, target_hash: str, *,
-            settings, force: bool, current_kind: str | None
-            ) -> tuple[VerifiedTarget | None, list[str], DependentsReport | None]:
+def verify_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: str,
+                           target_hash: str, *, settings, force: bool,
+                           current_kind: str | None,
+                           report: DependentsReport | None = None
+                           ) -> VerifiedTarget | VerificationFailure:
+    """Validate a rollback target; every check must pass, with the lock held.
+
+    ``report`` is the dependents report already computed for this target under the
+    lock; when omitted it is computed here.
+    """
     from agentic_fx.plugin import switch
 
     version_dir = plugins_root / ".versions" / name / target_hash
     if not _DIR_NAME_RE.fullmatch(target_hash) or version_dir.is_symlink() or not version_dir.is_dir():
-        return None, [f"target version directory .versions/{name}/{target_hash} does not exist"], None
-    reasons: list[str] = []
+        return VerificationFailure(
+            (f"target version directory .versions/{name}/{target_hash} does not exist",))
     content = _approved_content_hash(conn, name, target_hash)
     if content is None:
-        reasons.append(f"version {target_hash} has no approved decision (never approved or revoked)")
-    elif not switch._version_dir_hashes_ok(
+        return VerificationFailure(
+            (f"version {target_hash} has no approved decision (never approved or revoked)",))
+    if not switch._version_dir_hashes_ok(
             version_dir, content_hash=content, artifact_hash=target_hash):
-        reasons.append(f"version {target_hash} directory does not match its approved hashes")
-    if reasons:
-        return None, reasons, None
-    meta = _discover_dir(version_dir, name)
+        return VerificationFailure(
+            (f"version {target_hash} directory does not match its approved hashes",))
+    meta = discover_version_dir(version_dir, name)
     if meta is None:
-        return None, [f"version {target_hash} is rejected by the plugin loader"], None
+        return VerificationFailure((f"version {target_hash} is rejected by the plugin loader",))
     if current_kind is None:
-        return None, ["the kind of the currently deployed version could not be determined"], None
+        return VerificationFailure(
+            ("the kind of the currently deployed version could not be determined",))
     if meta.kind != current_kind:
-        return None, [f"target kind {meta.kind!r} differs from deployed kind {current_kind!r}"], None
+        return VerificationFailure(
+            (f"target kind {meta.kind!r} differs from deployed kind {current_kind!r}",))
     if meta.kind == "strategy":
         result = tools_plugin_loader.approved_plugins(conn, plugins_root, settings=settings)
         try:
             resolve_indicator_deps(meta, result.inventory, settings=settings, pin_mode="require")
         except IndicatorResolutionError as exc:
-            return None, [f"target strategy dependency {exc.alias or '-'}: {exc.reason}"], None
-    report = enumerate_dependents(conn, plugins_root, name, settings=settings,
-                                  replacement_meta=meta)
+            return VerificationFailure(
+                (f"target strategy dependency {exc.alias or '-'}: {exc.reason}",))
+    if report is None:
+        report = enumerate_dependents(conn, plugins_root, name, settings=settings,
+                                      replacement_meta=meta)
     if report.unresolvable and not force:
         listing = ", ".join(f"{s}:{a}:{r}" for s, a, r in report.unresolvable)
-        return None, [f"dependents_unresolvable: {listing}"], report
-    verified = VerifiedTarget(_version_target(name, target_hash), content, target_hash,
-                              meta.kind, meta, report)
-    return verified, [], report
-
-
-def verify_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: str,
-                           target_hash: str, *, settings, force: bool,
-                           current_kind: str | None) -> VerifiedTarget | list[str]:
-    """Validate a rollback target; every check must pass, with the lock held."""
-    verified, reasons, _report = _verify(
-        conn, plugins_root, name, target_hash, settings=settings, force=force,
-        current_kind=current_kind)
-    return verified if verified is not None else reasons
+        return VerificationFailure((f"dependents_unresolvable: {listing}",), report)
+    return VerifiedTarget(_version_target(name, target_hash), content, target_hash, report)
 
 
 def dependents_with_target(conn: sqlite3.Connection, plugins_root: Path, name: str,
                            target_dir: Path | None, *, settings) -> DependentsReport:
-    meta = _discover_dir(target_dir, name) if target_dir is not None else None
+    meta = discover_version_dir(target_dir, name) if target_dir is not None else None
     return enumerate_dependents(conn, plugins_root, name, settings=settings,
                                 replacement_meta=meta)
 
@@ -229,7 +240,7 @@ def dependents_with_target(conn: sqlite3.Connection, plugins_root: Path, name: s
 def supplement_cascade(conn: sqlite3.Connection, plugins_root: Path, op_id: int,
                        dependents: set[str], *, now: datetime) -> None:
     """Idempotently restrict dependents that became unresolvable after the intent."""
-    identities = _cascade_identities(conn, plugins_root, dependents)
+    identities = deploy_ops.cascade_identities(conn, plugins_root, dependents)
     if not identities:
         return
     conn.execute("BEGIN IMMEDIATE")
@@ -252,7 +263,7 @@ def swap_to_target(plugins_root: Path, name: str, op_id: int, to_target: str) ->
 def _finish(conn: sqlite3.Connection, op_id: int, phase: str, activity, *, now: datetime,
             fail_reason: str | None = None) -> None:
     deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason)
-    deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), _activity(activity), now=now)
+    deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), deploy_ops.activity_or_null(activity), now=now)
 
 
 def _success(name: str, op_id: int, to_target: str, cascade: set[str]) -> RollbackOutcome:
@@ -268,19 +279,19 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
 
-    report_box: list[DependentsReport] = []
+    box: list[tuple[RollbackTarget | RollbackRefusal, DependentsReport]] = []
 
     def dependents() -> set[str]:
         target = resolve_rollback_target(conn, plugins_root, name, to=to)
         target_dir = (plugins_root / ".versions" / name / target.artifact_hash
                       if isinstance(target, RollbackTarget) else None)
         report = dependents_with_target(conn, plugins_root, name, target_dir, settings=settings)
-        report_box[:] = [report]
+        box[:] = [(target, report)]
         return report.dependent_names
 
     with deploy_ops.acquire_op_locks(plugins_root, name, enumerate_dependents=dependents,
                                      deadline=deadline, stop_event=stop_event):
-        report = report_box[-1]
+        target, report = box[-1]
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
         if open_row is not None and open_row["op_kind"] != "rollback_symlink":
             raise deploy_ops.DeployOpBlockedError(
@@ -315,26 +326,27 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             _finish(conn, op_id, "done", activity, now=now)
             return _success(name, op_id, to_target, report.dependent_names)
 
-        target = resolve_rollback_target(conn, plugins_root, name, to=to)
         if isinstance(target, RollbackRefusal):
             return RollbackOutcome("refused", name, reasons=(target.reason,),
                                    refusal_code=target.code)
         if revoke and live is None:
             raise ValueError(
                 "cannot revoke with no live version; use afx plugin revoke --version")
-        approved = _approved_row(conn, name, live.content_hash) if live is not None else None
+        approved = deploy_ops.approved_row(conn, name, live.content_hash) if live is not None else None
         revoke_already_recorded = open_row is not None and bool(open_row["revoke"])
         if revoke and approved is None and not revoke_already_recorded:
             raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
-        verified, reasons, vreport = _verify(
+        verified = verify_rollback_target(
             conn, plugins_root, name, target.artifact_hash, settings=settings, force=force,
-            current_kind=current_deployed_kind(conn, plugins_root, name))
-        if verified is None:
-            if vreport is not None and vreport.unresolvable:
-                return RollbackOutcome("dependents_blocked", name, dependents=vreport.unresolvable,
-                                       reasons=tuple(reasons), refusal_code="dependents_unresolvable",
+            current_kind=current_deployed_kind(conn, plugins_root, name), report=report)
+        if isinstance(verified, VerificationFailure):
+            if verified.dependents is not None and verified.dependents.unresolvable:
+                return RollbackOutcome("dependents_blocked", name,
+                                       dependents=verified.dependents.unresolvable,
+                                       reasons=verified.reasons,
+                                       refusal_code="dependents_unresolvable",
                                        to_target=target.to_target)
-            return RollbackOutcome("refused", name, reasons=tuple(reasons),
+            return RollbackOutcome("refused", name, reasons=verified.reasons,
                                    refusal_code="target_verification_failed",
                                    to_target=target.to_target)
         cascade = verified.dependents.dependent_names
@@ -351,7 +363,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 supplement_cascade(conn, plugins_root, op_id, cascade, now=now)
         else:
             identities = [(name, live.content_hash)] if live is not None else []
-            identities.extend(_cascade_identities(conn, plugins_root, cascade))
+            identities.extend(deploy_ops.cascade_identities(conn, plugins_root, cascade))
             op_id = deploy_ops.record_intent(
                 conn, intent_row={
                     "op_kind": "rollback_symlink", "name": name,
@@ -365,8 +377,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     "approval_id": approved["id"] if approved else None, "force": force,
                 }, revoke=deploy_ops.RevokeSpec(name, live.content_hash) if revoke else None,
                 cascade_identities=identities, now=now, actor=actor)
-        intact = live_path.is_symlink() if live is not None else not os.path.lexists(live_path)
-        if not intact:
+        if not deploy_ops.live_matches_from(live_path, raw_target):
             _finish(conn, op_id, "foreign", activity, now=now)
             return RollbackOutcome("foreign", name, op_id=op_id)
         try:

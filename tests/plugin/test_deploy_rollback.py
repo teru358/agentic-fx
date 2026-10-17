@@ -40,7 +40,6 @@ def test_default_target_is_the_previous_version_after_an_approval(world):
 
     assert isinstance(target, deploy_rollback.RollbackTarget)
     assert target.to_target == f".versions/sma/{b.name}"
-    assert target.defaulted is True
 
 
 def test_default_target_is_refused_after_a_rollback_and_to_is_required(world):
@@ -53,7 +52,7 @@ def test_default_target_is_refused_after_a_rollback_and_to_is_required(world):
     assert isinstance(refusal, deploy_rollback.RollbackRefusal)
     assert refusal.code == "target_required"
     target = _resolve(world, to=a.name[:12])
-    assert target.to_target == f".versions/sma/{a.name}" and target.defaulted is False
+    assert target.to_target == f".versions/sma/{a.name}"
 
 
 def test_default_target_is_refused_after_a_disable(world):
@@ -125,6 +124,10 @@ def test_to_prefix_must_match_exactly_one_version_directory(world):
 
 # ---- target verification (AC-9, IV-8) ----
 
+def _failed(result):
+    return isinstance(result, deploy_rollback.VerificationFailure)
+
+
 def _verify(world, target, *, force=False, current_kind="indicator", name="sma"):
     return deploy_rollback.verify_rollback_target(
         world.conn, world.root, name, target.name, settings=SETTINGS, force=force,
@@ -138,7 +141,7 @@ def test_a_verified_target_carries_its_approved_identity(world):
 
     assert isinstance(verified, deploy_rollback.VerifiedTarget)
     assert verified.content_hash == world.content(b) and verified.artifact_hash == b.name
-    assert verified.to_target == f".versions/sma/{b.name}" and verified.kind == "indicator"
+    assert verified.to_target == f".versions/sma/{b.name}"
 
 
 def test_one_byte_change_in_the_target_directory_is_refused_and_nothing_changes(world):
@@ -150,7 +153,7 @@ def test_one_byte_change_in_the_target_directory_is_refused_and_nothing_changes(
     reasons = _verify(world, b)
     outcome = _rollback(world)
 
-    assert isinstance(reasons, list) and "does not match" in reasons[0]
+    assert _failed(reasons) and "does not match" in reasons.reasons[0]
     assert outcome.outcome == "refused" and outcome.refusal_code == "target_verification_failed"
     assert world.snapshot("sma") == before
 
@@ -163,8 +166,8 @@ def test_revoked_and_unapproved_versions_are_refused(world):
     revoked = _verify(world, b)
     never = _verify(world, unapproved)
 
-    assert isinstance(revoked, list) and "no approved decision" in revoked[0]
-    assert isinstance(never, list) and "no approved decision" in never[0]
+    assert _failed(revoked) and "no approved decision" in revoked.reasons[0]
+    assert _failed(never) and "no approved decision" in never.reasons[0]
     assert _rollback(world).outcome == "refused"
 
 
@@ -176,7 +179,7 @@ def test_a_missing_target_directory_is_refused(world):
         world.conn, world.root, "sma", ghost.name, settings=SETTINGS, force=False,
         current_kind="indicator")
 
-    assert isinstance(reasons, list) and "does not exist" in reasons[0]
+    assert _failed(reasons) and "does not exist" in reasons.reasons[0]
 
 
 def test_a_target_of_another_kind_than_the_deployment_is_refused(world):
@@ -186,7 +189,7 @@ def test_a_target_of_another_kind_than_the_deployment_is_refused(world):
 
     reasons = _verify(world, strategy)
 
-    assert isinstance(reasons, list) and "kind" in reasons[0]
+    assert _failed(reasons) and "kind" in reasons.reasons[0]
 
 
 def _strategy_world(world):
@@ -211,8 +214,8 @@ def test_a_target_strategy_with_unresolvable_own_dependencies_is_refused_even_wi
     forced = _verify(world, s2, current_kind="strategy", force=True, name="strat")
     outcome = _rollback(world, name="strat", to=s2.name, force=True)
 
-    assert isinstance(plain, list) and "pin_mismatch" in plain[0]
-    assert isinstance(forced, list) and "pin_mismatch" in forced[0]
+    assert _failed(plain) and "pin_mismatch" in plain.reasons[0]
+    assert _failed(forced) and "pin_mismatch" in forced.reasons[0]
     assert outcome.outcome == "refused"
     assert os.readlink(world.root / "strat") == f".versions/strat/{s1.name}"
 
@@ -234,7 +237,7 @@ def test_dependents_that_would_break_block_the_rollback_unless_forced(world):
     assert blocked.dependents == (("strat", "fast", "pin_mismatch"),)
     assert world.snapshot("ind") == before
     plain = _verify(world, b, name="ind")
-    assert isinstance(plain, list) and "dependents_unresolvable" in plain[0]
+    assert _failed(plain) and "dependents_unresolvable" in plain.reasons[0]
     forced = _verify(world, b, name="ind", force=True)
     assert forced.dependents.dependent_names == {"strat"}
 
@@ -458,3 +461,94 @@ def test_another_open_op_kind_blocks_a_rollback(world):
         _rollback(world)
 
     assert world.snapshot("sma") == before
+
+
+# ---- live re-check, call budget, kind of an absent live ----
+
+def _swap_live_after_intent(monkeypatch, world, *, to_version):
+    real = deploy_ops.record_intent
+
+    def wrapped(*args, **kwargs):
+        op_id = real(*args, **kwargs)
+        live = world.root / "sma"
+        if live.is_symlink():
+            live.unlink()
+        live.symlink_to(f".versions/sma/{to_version.name}")
+        return op_id
+
+    monkeypatch.setattr(deploy_ops, "record_intent", wrapped)
+
+
+def test_a_live_symlink_replaced_by_another_canonical_one_after_the_intent_is_foreign(
+        world, monkeypatch):
+    a, b, c = world.three_generations()
+    _swap_live_after_intent(monkeypatch, world, to_version=a)
+
+    outcome = _rollback(world, to=b.name)
+
+    assert outcome.outcome == "foreign" and outcome.filesystem_switched is False
+    assert os.readlink(world.root / "sma") == f".versions/sma/{a.name}"
+    assert deploy_store.list_by_name(world.conn, "sma")[0]["phase"] == "foreign"
+    assert not [p for p in world.root.iterdir() if ".link-" in p.name]
+
+
+def test_a_live_that_appears_after_an_absent_intent_is_foreign(world, monkeypatch):
+    a, b, c = world.three_generations()
+    world.intent("sma", op_kind="disable_symlink", from_ver=c, phase="done", minute=10)
+    (world.root / "sma").unlink()
+    _swap_live_after_intent(monkeypatch, world, to_version=a)
+
+    outcome = _rollback(world, to=b.name)
+
+    assert outcome.outcome == "foreign"
+    assert os.readlink(world.root / "sma") == f".versions/sma/{a.name}"
+
+
+def test_one_rollback_enumerates_the_approved_inventory_at_most_twice(world, monkeypatch):
+    from agentic_fx.tools import plugin_loader as tools_plugin_loader
+
+    a, b, c = world.three_generations()
+    calls = []
+    real = tools_plugin_loader.approved_plugins
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tools_plugin_loader, "approved_plugins", spy)
+
+    outcome = _rollback(world)
+
+    assert outcome.outcome == "rolled_back"
+    assert len(calls) <= 2
+
+
+def test_a_malformed_approval_payload_does_not_hide_a_valid_decision(world):
+    a, b, c = world.three_generations()
+    from agentic_fx.store import approvals as approvals_store
+    junk = approvals_store.create(world.conn, "plugin", {"name": "sma"}, at(40))
+    approvals_store.apply_decision(world.conn, junk, "approved", decided_by="human", now=at(40))
+    world.conn.execute("UPDATE approval_requests SET payload_json='{bad' WHERE id=?", (junk,))
+    world.conn.commit()
+
+    verified = _verify(world, b)
+
+    assert isinstance(verified, deploy_rollback.VerifiedTarget)
+
+
+def test_kind_of_an_absent_live_comes_from_the_target_of_a_failed_rollback_from_absent(world):
+    a, b, c = world.three_generations()
+    (world.root / "sma").unlink()
+    world.intent("sma", from_ver=None, to_ver=b, phase="needs_retry",
+                 fail_reason="verify_failed", minute=10)
+
+    assert deploy_rollback.current_deployed_kind(world.conn, world.root, "sma") == "indicator"
+
+
+def test_kind_of_an_absent_live_does_not_look_past_the_latest_closed_op(world):
+    a, b, c = world.three_generations()
+    world.intent("sma", op_kind="disable_symlink", from_ver=c, phase="done", minute=10)
+    (world.root / "sma").unlink()
+    world.intent("sma", from_ver=None, to_ver=b, phase="foreign", minute=20)
+
+    assert deploy_rollback.current_deployed_kind(world.conn, world.root, "sma") is None

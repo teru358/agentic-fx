@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_fx.plugin import deploy_reconcile
+from agentic_fx.plugin import deploy_reconcile, switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import plugin_switch_journal as journal_store
 from agentic_fx.store import signals as signals_store
@@ -475,3 +475,82 @@ def test_the_new_modules_are_not_reachable_from_tools_or_ops():
             if "deploy_rollback" in text or "deploy_reconcile" in text:
                 hits.append(str(path))
     assert hits == []
+
+
+# ---- journals of dependents, lock deadline, vanishing live ----
+
+def test_an_open_switch_journal_of_a_dependent_leaves_the_op_untouched(world):
+    a, b, c = world.three_generations("ind")
+    strat = world.version("strat", "s", kind="strategy", indicator="ind",
+                          pin=world.content(c))
+    world.deploy("strat", strat, None, 5)
+    op = world.intent("ind", from_ver=c, to_ver=b, force=True)
+    journal = world.journal("strat", "approve", None, strat, 20)
+    journal_store.set_phase(world.conn, journal, "switched", now=at(21))
+    activity = Activity()
+
+    results = _reconcile(world, activity)
+
+    assert [r.outcome for r in results] == ["conflict"]
+    assert os.readlink(world.root / "ind") == f".versions/ind/{c.name}"
+    assert _state(world, op) == ("intent", None)
+    assert [e for _, e, _ in activity.events] == ["plugin_deploy_op_conflict"]
+
+
+def test_a_name_lock_held_elsewhere_skips_only_that_op(world):
+    a, b, c = world.three_generations()
+    x = world.version("other", "x")
+    world.deploy("other", x, None, 6)
+    x2 = world.version("other", "x2")
+    world.deploy("other", x2, x, 7)
+    busy = world.intent("sma", from_ver=c, to_ver=b)
+    free = world.intent("other", from_ver=x2, to_ver=x)
+    activity = Activity()
+
+    with switch._plugin_lock(world.root, "sma"):
+        results = deploy_reconcile.reconcile_deploy_ops(
+            world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity,
+            lock_timeout_sec=0.2)
+
+    assert {r.name: r.outcome for r in results} == {"sma": "lock_timeout", "other": "done"}
+    assert _state(world, busy) == ("intent", None)
+    assert _state(world, free) == ("done", None)
+    assert os.readlink(world.root / "sma") == f".versions/sma/{c.name}"
+    assert "plugin_deploy_op_lock_timeout" in [e for _, e, _ in activity.events]
+
+    again = _reconcile(world)
+    assert [r.outcome for r in again] == ["done"] and _state(world, busy) == ("done", None)
+
+
+def _unlink_then_vanish(monkeypatch):
+    real = os.unlink
+
+    def vanish(path, *args, **kwargs):
+        real(path, *args, **kwargs)
+        raise FileNotFoundError(errno.ENOENT, "gone")
+
+    monkeypatch.setattr(os, "unlink", vanish)
+
+
+def test_a_disable_whose_live_vanishes_before_the_unlink_is_done(world, monkeypatch):
+    a, b, c = world.three_generations()
+    op = world.intent("sma", op_kind="disable_symlink", from_ver=c)
+    _unlink_then_vanish(monkeypatch)
+
+    _reconcile(world)
+
+    assert _state(world, op) == ("done", None)
+
+
+def test_a_rollback_source_that_vanishes_before_the_unlink_still_closes_as_verify_failed(
+        world, monkeypatch):
+    a, b, c = world.three_generations()
+    op = world.intent("sma", from_ver=c, to_ver=b)
+    plugin = b / "plugin.py"
+    plugin.write_text(plugin.read_text() + " ")
+    _unlink_then_vanish(monkeypatch)
+
+    _reconcile(world)
+
+    assert _state(world, op) == ("needs_retry", "verify_failed")
+    assert not os.path.lexists(world.root / "sma")
