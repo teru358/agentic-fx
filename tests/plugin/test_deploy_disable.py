@@ -738,10 +738,10 @@ def test_cascade_skips_a_dependent_whose_live_version_decision_is_a_rejection(tm
     strategy = _version_with_kind(root, "s", "b" * 64, kind="strategy")
     content, _, _ = _approve(conn, "s", strategy)
     _link_live(root, "s", strategy)
-    assert deploy_disable._cascade_identities(conn, root, {"s"}) == [("s", content)]
+    assert deploy_ops.cascade_identities(conn, root, {"s"}) == [("s", content)]
     approvals_store.append_revocation(conn, "s", content, now=NOW + timedelta(seconds=1))
 
-    assert deploy_disable._cascade_identities(conn, root, {"s"}) == []
+    assert deploy_ops.cascade_identities(conn, root, {"s"}) == []
 
 
 def test_revoke_candidate_comes_only_from_finished_disable_ops(tmp_path, monkeypatch):
