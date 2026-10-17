@@ -75,6 +75,22 @@ def test_signal_claim_set_trigger_prompt_injection_and_consume(tmp_path):
     assert row["status"] == "consumed"  # パース成功時点で確定
 
 
+def test_signal_claim_respects_submit_time_signal_id_upper_bound(tmp_path):
+    """A trade submitted before a producer insert cannot claim that later signal."""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"action": "hold", "reasoning": "ok"}, [])])
+    eligible = _add_signal(conn, bar_ts=NOW - timedelta(hours=2))
+    later = _add_signal(conn, bar_ts=NOW - timedelta(hours=1))
+
+    out = loop.run_once("signal", signal_max_id=eligible)
+
+    assert out is not None and out["result"] == "hold"
+    assert conn.execute(
+        "SELECT status FROM signals WHERE id=?", (eligible,)).fetchone()[0] == "consumed"
+    assert conn.execute(
+        "SELECT status FROM signals WHERE id=?", (later,)).fetchone()[0] == "pending"
+
+
 def test_claimed_open_signal_is_requeued_without_consuming_when_restricted(tmp_path):
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"action": "open", "pair": "USDJPY", "direction": "long",

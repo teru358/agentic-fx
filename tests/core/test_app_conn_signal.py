@@ -118,6 +118,28 @@ def test_connection_failures_skip_without_progress_then_fatal(
         app.close()
 
 
+@pytest.mark.parametrize("state", ["degraded", "halted"])
+def test_nonready_state_still_repairs_signal_connection_without_maintenance(
+        tmp_path, monkeypatch, state):
+    """The delayed wrapper remains active outside ready, but does not evaluate plugins."""
+    app = _app(tmp_path)
+    app.conn_signal = None
+    maintenance = MagicMock()
+    try:
+        monkeypatch.setattr("agentic_fx.service.connect",
+                            MagicMock(side_effect=OSError("database busy")))
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            maintenance)
+        app.scheduler.state_fn = lambda: state
+
+        app.scheduler.on_signal_maintenance(NOW)
+
+        assert app.signal_connection_failures == 1
+        maintenance.assert_not_called()
+    finally:
+        app.close()
+
+
 def test_successful_reconnect_resets_failure_counter(tmp_path, monkeypatch):
     app = _app(tmp_path)
     app.conn_signal = None

@@ -503,3 +503,25 @@ def test_latest_decision_for_identity_ignores_other_plugins_with_the_same_conten
 
     assert row["id"] == mine and row["status"] == "approved"
     assert approvals.latest_decision_for_identity(conn, "r", "h") is None
+
+
+def test_latest_decision_apis_agree_on_plugin_decision_ordering(tmp_path):
+    """The SQL status lookup and row lookup select the same plugin decision."""
+    conn = _conn(tmp_path)
+    stamp = NOW.isoformat()
+    _decided_plugin_row(
+        conn, '{"name":"strategy","content_hash":"hash"}',
+        "approved", stamp)
+    _decided_plugin_row(conn, '["not", "an object"]', "rejected", stamp)
+    _decided_plugin_row(
+        conn, '{"name":"other","content_hash":"hash"}',
+        "rejected", (NOW + timedelta(seconds=1)).isoformat())
+    _decided_plugin_row(
+        conn, '{"name":"strategy","content_hash":"hash"}',
+        "rejected", stamp)
+
+    row = approvals.latest_decision_for_identity(conn, "strategy", "hash")
+
+    assert row is not None
+    assert row["status"] == "rejected"
+    assert approvals.latest_decision_status(conn, "strategy", "hash") == row["status"]
