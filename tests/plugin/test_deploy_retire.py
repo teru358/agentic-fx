@@ -140,7 +140,7 @@ def test_plain_retire_rename_failure_reopens_with_same_signature_and_completes(w
     assert done.outcome == "done" and done.op_id == failed.op_id
 
 
-def test_plain_retry_rejects_a_replaced_directory_with_a_different_identity(world, monkeypatch):
+def test_plain_retry_closes_foreign_when_the_directory_was_replaced(world, monkeypatch):
     original = world.version("sma", "original")
     replacement = world.version("sma", "replacement")
     os.rename(original, world.root / "sma")
@@ -153,12 +153,54 @@ def test_plain_retry_rejects_a_replaced_directory_with_a_different_identity(worl
     os.rename(world.root / "sma", world.root / "old-sma")
     os.rename(replacement, world.root / "sma")
 
-    with pytest.raises(deploy_ops.SignatureMismatchError):
-        deploy_retire.retire_plugin(
-            world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+    result = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
 
     row = deploy_store.get_by_id(world.conn, failed.op_id)
-    assert row["phase"] == "needs_retry" and (world.root / "sma").is_dir()
+    assert result.outcome == "foreign" and row["phase"] == "foreign"
+    assert (world.root / "sma").is_dir()
+    assert not (world.root / row["retired_path"]).exists()
+
+
+def test_plain_retire_force_abandons_pending_signals_of_dependent_strategies(world):
+    indicator = world.version("sma", "plain")
+    os.rename(indicator, world.root / "sma")
+    strategy = world.version("strat", "strategy", kind="strategy", indicator="sma",
+                             pin="a" * 64)
+    world.deploy("strat", strategy, None, 1)
+    strategy_content = world.content(strategy)
+    strategy_signal = world.signal("strat", strategy_content)
+
+    done = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=True, now=NOW, settings=SETTINGS)
+
+    assert done.outcome == "done" and done.cascade_strategies == ("strat",)
+    assert world.conn.execute(
+        "SELECT status FROM signals WHERE id=?", (strategy_signal,)).fetchone()[0] == "abandoned"
+    assert world.conn.execute(
+        "SELECT status_at_link FROM plugin_deploy_op_signals WHERE op_id=? AND signal_id=?",
+        (done.op_id, strategy_signal)).fetchone()[0] == "pending"
+
+
+def test_already_retired_dry_run_does_not_recover_notifications(world):
+    plain = world.version("sma", "plain")
+    os.rename(plain, world.root / "sma")
+    activity = Activity()
+    result = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS,
+        activity=activity)
+    world.conn.execute("UPDATE plugin_deploy_ops SET notify_attempted=0")
+    world.conn.commit()
+    activity.events.clear()
+    before = world.snapshot("sma")
+
+    dry = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS,
+        activity=activity, dry_run=True)
+
+    assert dry.outcome == "already_retired" and dry.notified_op_ids == ()
+    assert activity.events == [] and world.snapshot("sma") == before
+    assert result.op_id is not None
 
 
 def test_plain_retire_dry_run_changes_neither_database_nor_filesystem(world):

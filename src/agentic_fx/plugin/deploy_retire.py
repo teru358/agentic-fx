@@ -52,20 +52,9 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
     live_path = Path(plugins_root) / name
-    journal = journal_store.get_open_by_name(conn, name)
-    if journal is not None:
-        from agentic_fx.plugin import switch
-        raise switch.UnresolvedJournalError(
-            f"plugin {name!r} has an unresolved switch journal "
-            f"(op_id={journal['op_id']}) — resolve it first "
-            "(reconcile or approval retry)")
     open_before_lock = deploy_store.get_open_by_name(conn, name)
     if live_path.is_symlink() and (open_before_lock is None
                                    or open_before_lock["op_kind"] != "retire_plain"):
-        live = deploy_store.live_identity(plugins_root, name)
-        if live is None or not live.content_hash or not live.artifact_hash:
-            raise ValueError(f"plugins/{name} is not a plain directory "
-                             "(retire only applies to legacy plain live)")
         return deploy_disable.disable_plugin(
             conn, plugins_root, name, revoke=False, force=force, now=now, actor=actor,
             settings=settings, activity=activity, deadline=deadline, stop_event=stop_event,
@@ -115,21 +104,24 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 row = deploy_store.get_by_id(conn, op_id)
                 deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
-            requested = deploy_ops.Signature(
-                "retire_plain", name, subject_content_hash, None, None, False, force)
-            if deploy_ops.row_signature(open_row) != requested:
+            if bool(open_row["force"]) != force:
                 raise deploy_ops.SignatureMismatchError(
-                    f"open deploy op op_id={open_row['op_id']} has a different signature")
+                    f"open deploy op op_id={open_row['op_id']} was recorded with "
+                    f"force={bool(open_row['force'])}, requested force={force}")
+            recorded_hash = open_row["subject_content_hash"]
+            requested = deploy_ops.Signature(
+                "retire_plain", name, recorded_hash, None, None, False, force)
             op_id = deploy_ops.match_or_reject(
-                open_row, requested, live_identity,
+                open_row, requested,
+                deploy_store.LiveIdentity("plain", recorded_hash, None),
                 conn=conn, now=now)
         else:
             if not live_plain:
                 if os.path.lexists(live_path):
                     raise ValueError(f"plugins/{name} is not a plain directory "
                                      "(retire only applies to legacy plain live)")
-                notified = _recover_notifications(
-                    conn, name, deploy_ops.activity_or_null(activity), now=now)
+                notified = (() if dry_run else _recover_notifications(
+                    conn, name, deploy_ops.activity_or_null(activity), now=now))
                 return RetireOutcome("already_retired", name, notified_op_ids=notified)
             if report.unresolvable and not force:
                 return RetireOutcome("dependents_blocked", name, dependents=report.unresolvable)
@@ -148,8 +140,10 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                     raise FileExistsError(f"retired destination already exists: {retired_path}")
                 deploy_store.set_retired_path(conn, op_id, retired_path, commit=False)
                 signals_store.abandon_pending_for_name(
-                    conn, name, op_id=op_id, now=now, commit=False)
+                    conn, name, op_id=op_id, commit=False)
 
+            cascade = deploy_ops.cascade_identities(
+                conn, plugins_root, report.dependent_names)
             op_id = deploy_ops.record_intent(
                 conn, intent_row={
                     "op_kind": "retire_plain", "name": name, "from_kind": "plain",
@@ -158,7 +152,7 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                     "subject_content_hash": subject_content_hash,
                     "subject_artifact_hash": None, "target_content_hash": None,
                     "target_artifact_hash": None, "approval_id": None, "force": force,
-                }, revoke=None, cascade_identities=[], now=now, actor=actor,
+                }, revoke=None, cascade_identities=cascade, now=now, actor=actor,
                 after_insert=assign_destination)
             retired_path = str(deploy_store.get_by_id(conn, op_id)["retired_path"])
 

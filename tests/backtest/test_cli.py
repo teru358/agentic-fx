@@ -1964,8 +1964,7 @@ def test_plugin_retire_value_error_is_rc1_without_next_step(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert err.strip() == "エラー: plugins/sma is not a plain directory " \
-        "(retire only applies to legacy plain live)"
+    assert err.strip() == "エラー: plugins/sma is not a canonical verified symlink"
     assert "approval list" not in err
     assert "approval retry" not in err
 
@@ -2013,3 +2012,76 @@ def test_plugin_retire_open_deploy_op_has_deploy_op_hint(tmp_path, monkeypatch, 
     rc = _cli._plugin_retire(None, None, _argparse.Namespace(name="sma"), tmp_path)
     assert rc == 1
     _assert_deploy_op_hint(capsys)
+
+
+def _retire_plain_root(tmp_path, monkeypatch):
+    root = _cli_root_for_plugin_commands(tmp_path)
+    monkeypatch.chdir(root)
+    return root
+
+
+def test_plugin_retire_dependents_blocked_is_rc1_with_dependents(
+        tmp_path, monkeypatch, capsys):
+    from agentic_fx.plugin import deploy_retire as _retire
+
+    root = _retire_plain_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        _retire, "retire_plugin",
+        lambda *a, **k: _retire.RetireOutcome(
+            "dependents_blocked", "sma", dependents=(("strat", "fast", "unpinned"),)))
+
+    rc = main(["plugin", "retire", "sma"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "dependents_blocked" in captured.err and "strat" in captured.err
+    assert "retire しました" not in captured.out
+    assert root.exists()
+
+
+def test_plugin_retire_needs_retry_is_rc1_with_fail_reason(
+        tmp_path, monkeypatch, capsys):
+    from agentic_fx.plugin import deploy_retire as _retire
+    from agentic_fx.store import plugin_deploy_ops as _store
+
+    root = _retire_plain_root(tmp_path, monkeypatch)
+    conn = connect(root / "data" / "agentic.db")
+    try:
+        op_id = _store.insert_intent(
+            conn, op_kind="retire_plain", name="sma", from_kind="plain",
+            to_kind="retired", from_target=None, to_target=None,
+            retired_path="_retired/sma-x-1", subject_content_hash=None,
+            subject_artifact_hash=None, target_content_hash=None,
+            target_artifact_hash=None, approval_id=None, force=False, revoke=False,
+            revoke_row_id=None, actor="human_cli",
+            now=datetime(2026, 10, 16, tzinfo=timezone.utc), commit=True)
+        _store.set_phase(conn, op_id, "needs_retry",
+                         now=datetime(2026, 10, 16, tzinfo=timezone.utc),
+                         fail_reason="syscall_failed")
+    finally:
+        conn.close()
+    monkeypatch.setattr(
+        _retire, "retire_plugin",
+        lambda *a, **k: _retire.RetireOutcome(
+            "needs_retry", "sma", op_id, "_retired/sma-x-1"))
+
+    rc = main(["plugin", "retire", "sma"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "needs_retry" in err and "syscall_failed" in err and "_retired/sma-x-1" in err
+
+
+def test_plugin_retire_dry_run_is_rc0_and_does_not_claim_retired(
+        tmp_path, monkeypatch, capsys):
+    from agentic_fx.plugin import deploy_retire as _retire
+
+    _retire_plain_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        _retire, "retire_plugin",
+        lambda *a, **k: _retire.RetireOutcome("dry_run", "sma", cascade_strategies=("s",)))
+
+    rc = main(["plugin", "retire", "sma", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert rc == 0 and "dry-run" in out and "retire しました" not in out

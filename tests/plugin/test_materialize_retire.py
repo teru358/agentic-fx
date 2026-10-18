@@ -107,7 +107,7 @@ def test_retire_rejects_when_live_is_a_symlink(env):
     live = plugins_dir / "sma"
     live.symlink_to(f".versions/sma/{'a' * 64}")
 
-    with pytest.raises(ValueError, match="not a plain directory"):
+    with pytest.raises(ValueError, match="not a canonical verified symlink"):
         _retire(conn, plugins_dir, settings)
 
     assert live.is_symlink()
