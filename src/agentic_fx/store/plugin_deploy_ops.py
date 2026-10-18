@@ -230,3 +230,61 @@ def live_identity(plugins_root: Path, name: str) -> LiveIdentity | None:
         meta, _ = loader.discover_one_with_reason(live, name)
         return LiveIdentity("plain", meta.content_hash if meta else None, None)
     return None
+
+
+ATTENTION_WINDOW = timedelta(hours=24)
+
+
+def list_open(conn: sqlite3.Connection) -> list[dict]:
+    """Every deploy op that still blocks its plugin name, oldest first."""
+    return [dict(row) for row in conn.execute(
+        "SELECT * FROM plugin_deploy_ops WHERE " + OPEN_PHASE_SQL + " ORDER BY op_id")]
+
+
+def list_attention(conn: sqlite3.Connection, *, now: datetime,
+                   window: timedelta = ATTENTION_WINDOW) -> list[dict]:
+    """Closed ops an operator should look at: a verification failure or a foreign live.
+
+    A row stays listed while its notification is still owed, and for ``window`` after
+    its last change otherwise.
+    """
+    rows = conn.execute(
+        "SELECT * FROM plugin_deploy_ops WHERE phase='foreign' "
+        "OR (phase='needs_retry' AND fail_reason='verify_failed') ORDER BY op_id")
+    since = now - window
+    result = []
+    for row in rows:
+        if not row["notify_attempted"] or datetime.fromisoformat(row["updated_at"]) >= since:
+            result.append(dict(row))
+    return result
+
+
+def status_summary(conn: sqlite3.Connection, *, now: datetime) -> dict:
+    """The deploy-op state shown by status: blocking ops and ops needing attention."""
+    def brief(row: dict) -> dict:
+        return {"op_id": row["op_id"], "name": row["name"], "op_kind": row["op_kind"],
+                "phase": row["phase"], "fail_reason": row["fail_reason"],
+                "updated_at": row["updated_at"]}
+    return {"open": [brief(row) for row in list_open(conn)],
+            "attention": [brief(row) for row in list_attention(conn, now=now)]}
+
+
+def count_open_readonly(db_path: Path) -> int | None:
+    """Blocking deploy ops in the database file, without creating or changing it.
+
+    ``None`` when the file is missing or cannot be read as a database.
+    """
+    if not Path(db_path).is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM plugin_deploy_ops WHERE " + OPEN_PHASE_SQL).fetchone()
+        return int(row[0])
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()

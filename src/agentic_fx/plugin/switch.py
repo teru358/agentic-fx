@@ -949,6 +949,7 @@ def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None
         if deadline is None and stop_event is None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         else:
+            announced = False
             while True:
                 if stop_event is not None and stop_event.is_set():
                     raise PluginBusyError("plugin lock cancelled")
@@ -956,6 +957,9 @@ def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
+                    if not announced and _plugin_lock_wait_notice is not None:
+                        announced = True
+                        _plugin_lock_wait_notice()
                     if deadline is not None and monotonic() >= deadline:
                         raise PluginBusyError("plugin lock deadline exceeded")
                     remaining = 0.1 if deadline is None else max(0.0, deadline - monotonic())
@@ -1000,6 +1004,16 @@ def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
 
 
 _plugin_lock_owner_guard = None
+_plugin_lock_wait_notice = None
+
+
+def set_plugin_lock_wait_notice(notice) -> None:
+    """Install (or clear with ``None``) a callback run once per lock that is found held.
+
+    The CLI uses it to tell the operator that it is waiting for another process.
+    """
+    global _plugin_lock_wait_notice
+    _plugin_lock_wait_notice = notice
 
 
 def set_plugin_lock_owner_guard(guard) -> None:

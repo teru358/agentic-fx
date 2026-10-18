@@ -1964,7 +1964,8 @@ def test_plugin_retire_value_error_is_rc1_without_next_step(
 
     assert rc == 1
     err = capsys.readouterr().err
-    assert err.strip() == "エラー: plugins/sma is not a canonical verified symlink"
+    assert err.strip() == (
+        "エラー: plugins/sma is not a canonical verified symlink (code=invalid_request)")
     assert "approval list" not in err
     assert "approval retry" not in err
 

@@ -517,6 +517,33 @@ def test_live_history_journal_clock_regression_is_ordered_by_instant_and_strictl
     assert live_before_last == ".versions/alpha/one"
 
 
+def _ops_done_via_store(conn, at):
+    values = {key: value for key, value in _disable_values().items()
+              if key not in ("phase", "created_at", "updated_at", "fail_reason",
+                             "notify_attempted", "actor")}
+    op_id = deploy_ops.insert_intent(conn, actor="human_cli", now=at, **values)
+    deploy_ops.set_phase(conn, op_id, "done", now=at)
+    return op_id
+
+
+def test_deploy_op_written_after_a_journal_clock_regression_still_sorts_after_the_journal(tmp_path):
+    conn = _conn(tmp_path)
+    journal_at = NOW + timedelta(seconds=30)
+    journal_id = _journal_decided(conn, "alpha", ".versions/alpha/j", journal_at)
+    first = _ops_done_via_store(conn, NOW)
+    second = _ops_done_via_store(conn, NOW)
+
+    assert datetime.fromisoformat(deploy_ops.get_by_id(conn, first)["updated_at"]) > journal_at
+    history = deploy_ops.plugin_live_history(conn, "alpha")
+    assert [(e["source"], e["id"]) for e in history] == [
+        ("plugin_switch_journal", journal_id), ("plugin_deploy_ops", first),
+        ("plugin_deploy_ops", second)]
+    raw = [datetime.fromisoformat(e["at"]) for e in history]
+    assert raw == sorted(raw) and len(set(raw)) == 3
+    effective = [datetime.fromisoformat(e["effective_at"]) for e in history]
+    assert all(a < b for a, b in zip(effective, effective[1:]))
+
+
 def test_set_phase_keeps_notify_attempted_unless_returning_to_intent(tmp_path):
     conn = _conn(tmp_path)
     op_id = _insert_direct(

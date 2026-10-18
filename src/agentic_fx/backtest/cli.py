@@ -28,12 +28,11 @@ from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
     ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
+from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_env_file, load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
-from agentic_fx.plugin import deploy_ops
-from agentic_fx.plugin import deploy_retire
 from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
@@ -46,7 +45,6 @@ from agentic_fx.plugin.resolve import (
 )
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
-from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
@@ -158,6 +156,37 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     retire_parser.add_argument("name")
     retire_parser.add_argument("--force", action="store_true")
     retire_parser.add_argument("--dry-run", action="store_true")
+    retire_parser.add_argument("--yes", action="store_true", help="確認を省略する")
+    disable_parser = plugin_sub.add_parser(
+        "disable", help="symlink 配備の live を外す (退避はしない。--revoke で外す版を却下)")
+    disable_parser.add_argument("name")
+    disable_parser.add_argument("--revoke", action="store_true",
+                                help="外す版の承認を取り消す (rejected を追記)")
+    disable_parser.add_argument("--force", action="store_true",
+                                help="依存 strategy を止めてでも続行する")
+    disable_parser.add_argument("--dry-run", action="store_true")
+    disable_parser.add_argument("--yes", action="store_true", help="確認を省略する")
+    rollback_parser = plugin_sub.add_parser(
+        "rollback", help="live を以前の版へ戻す (反映は daemon の再起動後)")
+    rollback_parser.add_argument("name")
+    rollback_parser.add_argument("--to", default=None, metavar="HASH",
+                                 help="戻り先の版 (前方一致可。省略時は直前の版)")
+    rollback_parser.add_argument("--revoke", action="store_true",
+                                 help="外す版の承認を取り消す")
+    rollback_parser.add_argument("--force", action="store_true",
+                                 help="依存 strategy を止めてでも続行する")
+    rollback_parser.add_argument("--dry-run", action="store_true")
+    rollback_parser.add_argument("--yes", action="store_true", help="確認を省略する")
+    revoke_parser = plugin_sub.add_parser(
+        "revoke", help="live ではない版の承認を取り消す (FS は変えない)")
+    revoke_parser.add_argument("name")
+    revoke_parser.add_argument("--version", required=True, metavar="HASH",
+                               help="取り消す版の content hash (`versions` の content=。前方一致可)")
+    revoke_parser.add_argument("--dry-run", action="store_true")
+    revoke_parser.add_argument("--yes", action="store_true", help="確認を省略する")
+    versions_parser = plugin_sub.add_parser(
+        "versions", help="版・経歴・未完の配備操作を表示する (読み取り専用)")
+    versions_parser.add_argument("name")
 
     improve = sub.add_parser("improve", help="改善ループ操作 (CLI 専用)")
     improve_sub = improve.add_subparsers(dest="improve_command", required=True)
@@ -541,17 +570,8 @@ _BLESS_NO_FROM_ERROR = (
     "'afx plugin materialize <name>' で候補を書き出し、編集してから "
     "'afx plugin bless --from _human <name>' を実行してください。")
 
-# [switch-ops-hardening] T6 / T12: `UnresolvedJournalError` の収束手順案内。
-# `_plugin_bless` / `_plugin_retire` の両方の except ハンドラから参照する
-# (元メッセージの `op_id=` / `approval_id=` は呼び出し元ごとに異なるので
-# ここには含めない — 案内文の2行のみ共有)。
-_UNRESOLVED_JOURNAL_RECOVERY_HINT = (
-    "  収束手順: サービスの対話シェルで `approval list` → "
-    "`approval retry <approval_id>`")
-
-_OPEN_DEPLOY_OP_RECOVERY_HINT = (
-    "  配備操作が未完です (op_id は上記)。daemon の起動時 reconcile を待つか、"
-    "同じ指定で CLI を再実行してください。別の操作はその op が閉じた後に行ってください。")
+_UNRESOLVED_JOURNAL_RECOVERY_HINT = plugin_deploy_cli.UNRESOLVED_JOURNAL_RECOVERY_HINT
+_OPEN_DEPLOY_OP_RECOVERY_HINT = plugin_deploy_cli.OPEN_DEPLOY_OP_RECOVERY_HINT
 
 _HISTORY_GIT_RECOVERY_HINT = (
     "  次の一手: 表示された原因を確認してください "
@@ -681,58 +701,23 @@ def _plugin_materialize(conn, settings, args: argparse.Namespace, root: Path) ->
 
 
 def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    plugins_dir = root / "plugins"
-    activity = ActivityLog(root / "logs" / "activity.log")
-    try:
-        outcome = deploy_retire.retire_plugin(
-            conn, plugins_dir, args.name, force=getattr(args, "force", False),
-            now=datetime.now(timezone.utc), settings=settings, activity=activity,
-            dry_run=getattr(args, "dry_run", False))
-    except (deploy_ops.DeployOpBlockedError,
-            plugin_switch.OpenDeployOpError) as e:
-        print(f"エラー: {e}\n{_OPEN_DEPLOY_OP_RECOVERY_HINT}", file=sys.stderr)
-        return 1
-    except plugin_switch.UnresolvedJournalError as e:
-        # [switch-ops-hardening] T12 (設計書 §3.4 / R12): 同じ原因
-        # (未終端の切替ジャーナル) には `_plugin_bless` と同じ案内を出す。
-        # `retire_plugin` の例外文言は `op_id=` のみで `approval_id=` を
-        # 含まないので、**第一手が `approval list` であることに意味がある**。
-        print(f"エラー: {e}\n{_UNRESOLVED_JOURNAL_RECOVERY_HINT}", file=sys.stderr)
-        return 1
-    except (ValueError, OSError) as e:
-        print(f"エラー: {e}", file=sys.stderr)
-        return 1
-    return _report_retire_outcome(conn, args.name, outcome)
+    return plugin_deploy_cli.plugin_retire(conn, settings, args, root)
 
 
-def _report_retire_outcome(conn, name: str, outcome) -> int:
-    kind = outcome.outcome
-    if kind == "dry_run":
-        cascade = ", ".join(outcome.cascade_strategies) or "なし"
-        print(f"dry-run: plugin {name!r} を退避する予定 (cascade: {cascade})")
-        return 0
-    if kind in ("done", "already_retired", "disabled", "already_disabled"):
-        print(f"plugin {name!r} を retire しました ({kind})")
-        return 0
-    detail = [f"plugin {name!r} の retire は完了していません ({kind})"]
-    if kind == "dependents_blocked":
-        detail.append("依存する plugin: " + ", ".join(
-            f"{dep[0]} ({dep[2]})" for dep in outcome.dependents)
-            + " (--force で続行できます)")
-    reason = getattr(outcome, "reason", None)
-    if reason:
-        detail.append(reason)
-    retired_path = getattr(outcome, "retired_path", None)
-    if retired_path:
-        detail.append(f"退避先: {retired_path}")
-    op_id = getattr(outcome, "op_id", None)
-    if op_id is not None:
-        detail.append(f"op_id={op_id}")
-        row = deploy_store.get_by_id(conn, op_id) if conn is not None else None
-        if row is not None and row["fail_reason"]:
-            detail.append(f"fail_reason={row['fail_reason']}")
-    print("エラー: " + " / ".join(detail), file=sys.stderr)
-    return 1
+def _plugin_disable(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    return plugin_deploy_cli.plugin_disable(conn, settings, args, root)
+
+
+def _plugin_rollback(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    return plugin_deploy_cli.plugin_rollback(conn, settings, args, root)
+
+
+def _plugin_revoke(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    return plugin_deploy_cli.plugin_revoke(conn, settings, args, root)
+
+
+def _plugin_versions(conn, settings, args: argparse.Namespace, root: Path) -> int:
+    return plugin_deploy_cli.plugin_versions(conn, settings, args, root)
 
 
 _LOCK_NO_FROM_ERROR = (
@@ -882,6 +867,14 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                     return _plugin_retire(conn, settings, args, root)
                 if args.plugin_command == "bless":
                     return _plugin_bless(conn, settings, args, root)
+                if args.plugin_command == "disable":
+                    return _plugin_disable(conn, settings, args, root)
+                if args.plugin_command == "rollback":
+                    return _plugin_rollback(conn, settings, args, root)
+                if args.plugin_command == "revoke":
+                    return _plugin_revoke(conn, settings, args, root)
+                if args.plugin_command == "versions":
+                    return _plugin_versions(conn, settings, args, root)
                 raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
             if args.command == "improve":
                 return _improve_verify_backend(conn, settings, args, root)

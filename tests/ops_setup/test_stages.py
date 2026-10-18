@@ -1898,3 +1898,47 @@ def test_all_off_has_no_template_dropin_or_feature_unit(tmp_path, monkeypatch):
     from agentic_fx.ops_setup.units import uninstall_feature
     uninstall_feature(setup.paths, set())
     _assert_all_off(setup, systemd)
+
+
+def _open_deploy_op_db(root: Path) -> None:
+    from datetime import datetime, timezone
+
+    from agentic_fx.store import db as db_store
+    from agentic_fx.store import plugin_deploy_ops as deploy_store
+
+    conn = db_store.connect(root / "data" / "agentic.db")
+    db_store.init_db(conn)
+    deploy_store.insert_intent(
+        conn, op_kind="disable_symlink", name="sma", from_kind="symlink", to_kind="absent",
+        from_target=f".versions/sma/{'a' * 64}", to_target=None, retired_path=None,
+        subject_content_hash="c" * 64, subject_artifact_hash="a" * 64,
+        target_content_hash=None, target_artifact_hash=None, approval_id=None,
+        revoke=False, revoke_row_id=None, force=False, actor="human_cli",
+        now=datetime(2026, 10, 18, tzinfo=timezone.utc))
+    conn.close()
+
+
+def test_ops_status_adds_a_line_only_while_a_deploy_op_is_open(tmp_path, monkeypatch, capsys):
+    from agentic_fx.ops_setup import stages
+
+    setup, _systemd, home = _setup(tmp_path)
+    _with_home(home, monkeypatch)
+    assert stages.run_ops_command(setup.root, "status", "bot") == 0
+    assert "配備操作" not in capsys.readouterr().out
+
+    _open_deploy_op_db(setup.root)
+
+    assert stages.run_ops_command(setup.root, "status", "bot") == 0
+    assert "配備操作が未完了: 1 件 (afx plugin versions <name>)" in capsys.readouterr().out
+
+
+def test_ops_status_stays_quiet_when_the_database_cannot_be_read(tmp_path, monkeypatch, capsys):
+    from agentic_fx.ops_setup import stages
+
+    setup, _systemd, home = _setup(tmp_path)
+    _with_home(home, monkeypatch)
+    (setup.root / "data").mkdir()
+    (setup.root / "data" / "agentic.db").write_bytes(b"not a database" * 100)
+
+    assert stages.run_ops_command(setup.root, "status", "bot") == 0
+    assert "配備操作" not in capsys.readouterr().out

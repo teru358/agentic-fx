@@ -13,6 +13,7 @@ from typing import Any, Protocol
 from agentic_fx._safe_error import safe_text
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import KeySetError, check_key_dir_usable, enroll, enrolled_key_matches, key_dir
+from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.enroll_marker import ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, enroll_marker_path
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 
@@ -711,6 +712,9 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
         return 1
     if action == "status":
         print(line)
+        open_ops = deploy_store.count_open_readonly(root / "data" / "agentic.db")
+        if open_ops:
+            print(f"配備操作が未完了: {open_ops} 件 (afx plugin versions <name>)")
     else:
         print(f"{feature}: {result.stage}")
     return 0

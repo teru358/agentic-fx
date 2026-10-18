@@ -184,7 +184,8 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
 
 def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, content_hash: str,
                    now: datetime, actor: str = "human_cli", activity=None,
-                   deadline: float | None = None, stop_event=None) -> RevokeOutcome:
+                   deadline: float | None = None, stop_event=None,
+                   dry_run: bool = False) -> RevokeOutcome:
     """Revoke a non-live version and link its pending/claimed signals atomically."""
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
@@ -196,6 +197,13 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
         live = deploy_store.live_identity(plugins_root, name)
         if live is not None and live.content_hash == content_hash:
             raise ValueError("cannot revoke the current live version; disable it first")
+        if dry_run:
+            decision = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+            if decision is None:
+                raise ValueError(f"no approved plugin approval for {name!r} {content_hash!r}")
+            if decision["status"] == "rejected":
+                return RevokeOutcome("already_revoked", name, content_hash)
+            return RevokeOutcome("dry_run", name, content_hash)
         found = _find_version_identity(plugins_root, name, content_hash)
         dir_artifact = found[1] if found is not None else None
         mismatch_artifact: str | None = None
