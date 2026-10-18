@@ -444,6 +444,12 @@ def pytest_runtest_logreport(report):
         _SKIPPED_REPORTS.append(report.nodeid)
 
 
+def pytest_collectreport(report):
+    # module-level `pytest.skip(allow_module_level=True)` は収集段階で出る。
+    if report.skipped and not hasattr(report, "wasxfail"):
+        _SKIPPED_REPORTS.append(report.nodeid)
+
+
 _SKIPPED_REPORTS: list[str] = []
 
 
@@ -453,4 +459,5 @@ def pytest_sessionfinish(session, exitstatus):
     print(f"\n--fail-on-skip: {len(set(_SKIPPED_REPORTS))} test(s) were skipped:")
     for nodeid in sorted(set(_SKIPPED_REPORTS)):
         print(f"  {nodeid}")
-    session.exitstatus = 1
+    if exitstatus == 0:
+        session.exitstatus = 1

@@ -9,6 +9,7 @@ worker は production と同じ bootstrap 経路 (`_bootstrap_improve_profile`) 
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -70,12 +71,17 @@ _PRELUDE = textwrap.dedent("""
 """)
 
 
-def _cli_snippet(root: Path, argv: list[str]) -> str:
+_ENTRYPOINTS = ("console_script", "module")
+
+
+def _cli_snippet(root: Path, argv: list[str], only: str | None = None) -> str:
+    wanted = [only] if only else list(_ENTRYPOINTS)
     return textwrap.dedent(f"""
         entrypoints = {{
             'console_script': [{str(_AFX)!r}],
             'module': [sys.executable, '-m', 'agentic_fx.entry'],
         }}
+        entrypoints = {{k: v for k, v in entrypoints.items() if k in {wanted!r}}}
         env = {{'PATH': '/usr/bin:/bin', 'HOME': {str(root)!r},
                'PYTHONPATH': {str(_REPO_SRC)!r}}}
         for label, prefix in entrypoints.items():
@@ -101,8 +107,14 @@ def _db_snippet(root: Path) -> str:
             conn.execute({insert!r})
             conn.commit()
             record('insert', ['wrote'])
-        except (sqlite3.Error, OSError) as exc:
-            record('insert', ['denied', type(exc).__name__])
+        except sqlite3.OperationalError as exc:
+            try:
+                open({str(db)!r}, 'rb').close()
+                record('insert', ['unexpected', str(exc)])
+            except OSError as probe:
+                record('insert', ['denied', probe.errno, str(exc)])
+        except OSError as exc:
+            record('insert', ['denied', exc.errno, str(exc)])
     """)
 
 
@@ -139,15 +151,15 @@ def _fs_snippet(root: Path, versions: dict) -> str:
     """)
 
 
-def _actions(root: Path, versions: dict) -> dict[str, str]:
+def _actions(root: Path, versions: dict, only: str | None = None) -> dict[str, str]:
     yes = ["--yes"]
     return {
-        "cli_disable": _cli_snippet(root, ["plugin", "disable", "sma", *yes]),
+        "cli_disable": _cli_snippet(root, ["plugin", "disable", "sma", *yes], only),
         "cli_rollback": _cli_snippet(
-            root, ["plugin", "rollback", "sma", "--to", versions["b_dir"][:12], *yes]),
-        "cli_retire": _cli_snippet(root, ["plugin", "retire", "legacy", *yes]),
+            root, ["plugin", "rollback", "sma", "--to", versions["b_dir"][:12], *yes], only),
+        "cli_retire": _cli_snippet(root, ["plugin", "retire", "legacy", *yes], only),
         "cli_revoke": _cli_snippet(
-            root, ["plugin", "revoke", "sma", "--version", versions["a"][:12], *yes]),
+            root, ["plugin", "revoke", "sma", "--version", versions["a"][:12], *yes], only),
         "db_insert": _db_snippet(root),
         "fs_mutation": _fs_snippet(root, versions),
     }
@@ -165,18 +177,23 @@ def _results(stdout: str) -> dict[str, list]:
 @pytest.mark.parametrize("action", [
     "cli_disable", "cli_rollback", "cli_retire", "cli_revoke", "db_insert", "fs_mutation"])
 def test_isolated_worker_cannot_change_deploy_state(tmp_path, action):
-    control_root = tmp_path / "control"
-    control_world, control_versions = _build_world(control_root)
-    control_before = _tree_state(control_root)
-    control = subprocess.run(
-        [sys.executable, "-c", _PRELUDE + _actions(control_root, control_versions)[action]],
-        capture_output=True, text=True, timeout=120)
-    assert control.returncode == 0, control.stderr
-    if action.startswith("cli_"):
-        assert all(outcome[:2] == ["rc", 0] for outcome in _results(control.stdout).values()), (
-            control.stdout)
-    assert _tree_state(control_root) != control_before, (
-        f"the {action} control did not change anything outside isolation: {control.stdout}")
+    # 隔離なしの対照。CLI は経路ごとに別の root で回し、互いの状態変更に依存させない。
+    for entry in (_ENTRYPOINTS if action.startswith("cli_") else (None,)):
+        control_root = tmp_path / f"control-{entry or 'single'}"
+        _, control_versions = _build_world(control_root)
+        control_before = _tree_state(control_root)
+        control = subprocess.run(
+            [sys.executable, "-c",
+             _PRELUDE + _actions(control_root, control_versions, entry)[action]],
+            capture_output=True, text=True, timeout=120)
+        assert control.returncode == 0, control.stderr
+        if entry:
+            results = _results(control.stdout)
+            assert list(results) == [entry], control.stdout
+            assert results[entry][:2] == ["rc", 0], control.stdout
+        assert _tree_state(control_root) != control_before, (
+            f"the {action} control ({entry}) did not change anything outside isolation: "
+            f"{control.stdout}")
 
     root = tmp_path / "deploy"
     _, versions = _build_world(root)
@@ -194,6 +211,9 @@ def test_isolated_worker_cannot_change_deploy_state(tmp_path, action):
     for label, outcome in outcomes.items():
         if outcome[0] == "rc":
             assert outcome[1] != 0, (label, outcome)
-            assert outcome[2], f"{label} failed for a reason other than EACCES"
+            assert outcome[2], f"{label} failed for a reason other than PermissionError"
         else:
             assert outcome[0] in {"oserror", "denied"}, (label, outcome)
+            assert outcome[1] in {errno.EACCES, errno.EPERM}, (label, outcome)
+            if label == "insert":
+                assert outcome[2] == "unable to open database file", (label, outcome)

@@ -126,3 +126,44 @@ def test_real_config_signature_detects_creation_and_change(tmp_path):
     changed = _tree_signature(target)
     assert absent is None and created is not None
     assert len({absent, created, changed}) == 3
+
+
+def _run_inner_pytest(tmp_path, files: dict[str, str], *args: str):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "conftest.py").write_text(
+        "from tests.conftest import (pytest_addoption, pytest_collectreport,\n"
+        "                            pytest_runtest_logreport, pytest_sessionfinish)\n")
+    for name, body in files.items():
+        (inner / name).write_text(body)
+    env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(repo), "HOME": str(tmp_path)}
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--rootdir", str(inner), "-c", "/dev/null", *args],
+        cwd=inner, env=env, capture_output=True, text=True, timeout=120)
+
+
+_PASSING = "def test_ok():\n    assert True\n"
+_MODULE_SKIP = "import pytest\npytest.skip('no env', allow_module_level=True)\n"
+
+
+def test_fail_on_skip_counts_a_module_level_skip(tmp_path):
+    proc = _run_inner_pytest(
+        tmp_path, {"test_a.py": _PASSING, "test_b.py": _MODULE_SKIP}, "--fail-on-skip")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "test_b.py" in proc.stdout
+
+
+def test_module_level_skip_is_green_without_the_option(tmp_path):
+    proc = _run_inner_pytest(tmp_path, {"test_a.py": _PASSING, "test_b.py": _MODULE_SKIP})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_fail_on_skip_keeps_a_non_zero_exit_status(tmp_path):
+    proc = _run_inner_pytest(tmp_path, {"test_b.py": _MODULE_SKIP}, "--fail-on-skip")
+    assert proc.returncode == 5, proc.stdout + proc.stderr
