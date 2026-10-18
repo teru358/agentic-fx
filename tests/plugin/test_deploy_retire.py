@@ -133,6 +133,10 @@ def test_plain_retire_rename_failure_reopens_with_same_signature_and_completes(w
     with pytest.raises(deploy_ops.SignatureMismatchError):
         deploy_retire.retire_plugin(
             world.conn, world.root, "sma", force=True, now=NOW, settings=SETTINGS)
+    with pytest.raises(deploy_ops.SignatureMismatchError):
+        deploy_retire.retire_plugin(
+            world.conn, world.root, "sma", force=True, now=NOW, settings=SETTINGS,
+            dry_run=True)
 
     monkeypatch.setattr(deploy_retire.deploy_reconcile, "rename_plain_dir", real_rename)
     done = deploy_retire.retire_plugin(

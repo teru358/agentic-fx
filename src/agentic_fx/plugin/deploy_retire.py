@@ -90,6 +90,10 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
             op_id = int(open_row["op_id"])
             retired_path = str(open_row["retired_path"])
             retired = Path(plugins_root) / retired_path
+            if bool(open_row["force"]) != force:
+                raise deploy_ops.SignatureMismatchError(
+                    f"open deploy op op_id={open_row['op_id']} was recorded with "
+                    f"force={bool(open_row['force'])}, requested force={force}")
             if dry_run:
                 return RetireOutcome("dry_run", name, op_id, retired_path,
                                      cascade_strategies=tuple(sorted(report.dependent_names)),
@@ -104,10 +108,6 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 row = deploy_store.get_by_id(conn, op_id)
                 deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
-            if bool(open_row["force"]) != force:
-                raise deploy_ops.SignatureMismatchError(
-                    f"open deploy op op_id={open_row['op_id']} was recorded with "
-                    f"force={bool(open_row['force'])}, requested force={force}")
             recorded_hash = open_row["subject_content_hash"]
             requested = deploy_ops.Signature(
                 "retire_plain", name, recorded_hash, None, None, False, force)
