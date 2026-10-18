@@ -85,7 +85,7 @@ def crash_inside_record_intent(monkeypatch, stage: str) -> None:
     seams = {
         "after_revocation": (deploy_ops.approvals_store, "append_revocation"),
         "after_insert": (deploy_store, "insert_intent"),
-        "after_hook": (deploy_ops.signals_store, "abandon_pending_for_identities"),
+        "after_hook": (deploy_ops.signals_store, "abandon_pending_for_name"),
         "after_cascade": (deploy_ops.signals_store, "abandon_pending_for_identities"),
     }
     if stage not in seams:
@@ -157,3 +157,51 @@ def assert_state(world, op_id: int, *, phase: str, fail_reason: str | None = Non
         assert live_path.is_symlink() and os.readlink(live_path) == live[1]
     if retired is not None:
         assert (world.root / row["retired_path"]).exists() is retired
+
+
+def db_effects(world) -> tuple:
+    """Every table a deployment operation can touch, rows compared whole."""
+    def rows(sql: str) -> list[tuple]:
+        return [tuple(r) for r in world.conn.execute(sql)]
+
+    return (
+        rows("SELECT * FROM plugin_deploy_ops ORDER BY op_id"),
+        rows("SELECT id,status,requeue_count FROM signals ORDER BY id"),
+        rows("SELECT id,status FROM approval_requests ORDER BY id"),
+        rows("SELECT * FROM plugin_deploy_op_signals ORDER BY op_id,signal_id"),
+    )
+
+
+def op_count(world, name: str = "sma") -> int:
+    return len(deploy_store.list_by_name(world.conn, name))
+
+
+def reconcile(world, settings, *, now, activity=None):
+    return deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=now, settings=settings, activity=activity)
+
+
+class Scene:
+    """Signals and approvals around a disable of indicator ``sma``."""
+
+    def __init__(self, world, *, revoke: bool, cascade: bool) -> None:
+        self.revoke = revoke
+        self.cascade = cascade
+        self.a, self.b, self.c = world.three_generations()
+        self.content = world.content(self.c)
+        self.signals = [world.signal("sma", self.content),
+                        world.signal("sma", self.content, claimed=True)]
+        if cascade:
+            strategy = world.version("strat", "strategy", kind="strategy", indicator="sma")
+            world.deploy("strat", strategy, None, 4)
+            strategy_content = world.content(strategy)
+            self.signals += [world.signal("strat", strategy_content),
+                             world.signal("strat", strategy_content, claimed=True)]
+
+    @property
+    def force(self) -> bool:
+        return self.cascade
+
+
+SCENES = [(False, False), (True, False), (False, True), (True, True)]
+SCENE_IDS = ["plain", "revoke", "cascade", "revoke-and-cascade"]
