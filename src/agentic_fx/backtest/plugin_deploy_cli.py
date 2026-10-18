@@ -8,13 +8,17 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import functools
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog
 from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_rollback
 from agentic_fx.plugin import deploy_versions
@@ -290,13 +294,32 @@ def report_exception(exc: BaseException) -> Report | None:
         return _failure(
             f"他の操作が {LOCK_WAIT_SECONDS:g} 秒以内に完了しませんでした。何も変更していません",
             "lock_timeout", "  少し待ってから再実行してください。")
+    if isinstance(exc, deploy_ops.StateChangedError):
+        return _failure("予告時と状態が変わりました。何も変更していません", "state_changed",
+                        "  もう一度実行して予告を確認してください。")
     if isinstance(exc, deploy_ops.DependentsChangedError):
         return _failure(str(exc), "dependents_changed", "  何も変更していません。再実行してください。")
     if isinstance(exc, ValueError):
         return _failure(str(exc), "invalid_request")
     if isinstance(exc, OSError):
         return _failure(str(exc), "os_error")
+    if isinstance(exc, sqlite3.Error):
+        return _failure(safe_error_text(exc), "db_error")
     return None
+
+
+def guarded(command):
+    """Wrap one subcommand so that no exception leaves without a code and a one-line text."""
+    @functools.wraps(command)
+    def run(*args, **kwargs) -> int:
+        try:
+            return command(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — every failure is reported with a code
+            report = report_exception(exc)
+            if report is None:
+                report = _failure(safe_error_text(exc), "internal_error")
+            return _emit(report)
+    return run
 
 
 def _isatty() -> bool:
@@ -320,26 +343,27 @@ def _lock_wait_notice(enabled: bool):
     def notice() -> None:
         print(f"他の操作の完了を待っています (最大 {LOCK_WAIT_SECONDS:g} 秒)", file=sys.stderr)
 
-    plugin_switch.set_plugin_lock_wait_notice(notice)
-    try:
+    with plugin_switch.lock_wait_notice(notice):
         yield
-    finally:
-        plugin_switch.set_plugin_lock_wait_notice(None)
 
 
-def run_op(conn, *, call, render, preview_lines=None, args) -> int:
+def run_op(conn, *, call, render, preview_lines=None, args, recover=None) -> int:
     """Run one deploy op with its confirmation flow.
 
-    ``call(dry_run, deadline)`` performs the op; ``render(outcome)`` turns an outcome
-    into a report. The preview shown before asking comes from a real ``dry_run=True``
-    call, so the question and the action cannot disagree.
+    ``call(dry_run, deadline, expect)`` performs the op; ``render(outcome)`` turns an
+    outcome into a report. The preview shown before asking comes from a real
+    ``dry_run=True`` call, so the question and the action cannot disagree, and the
+    real run receives the state the preview showed so it can refuse, changing nothing,
+    if that state moved while the operator was deciding. A no-op preview never reaches
+    the real run unless ``--yes`` was given; ``recover(outcome)`` only re-sends missed
+    notifications for it (``None`` when the state moved).
     """
     dry_run = bool(getattr(args, "dry_run", False))
     yes = bool(getattr(args, "yes", False))
     tty = _isatty()
 
-    def attempt(flag: bool):
-        return call(flag, time.monotonic() + LOCK_WAIT_SECONDS)
+    def attempt(flag: bool, expect=None):
+        return call(flag, time.monotonic() + LOCK_WAIT_SECONDS, expect)
 
     try:
         with _lock_wait_notice(tty):
@@ -350,9 +374,13 @@ def run_op(conn, *, call, render, preview_lines=None, args) -> int:
                 return _emit(render(outcome))
             if not yes:
                 preview = attempt(True)
+                if preview.outcome in NOOP_OUTCOMES:
+                    notified = recover(preview) if recover is not None else ()
+                    if notified is None:
+                        raise deploy_ops.StateChangedError("state changed after the preview")
+                    return _emit(render(dataclasses.replace(preview, notified_op_ids=notified)))
                 if preview.outcome != "dry_run":
-                    outcome = attempt(False) if preview.outcome in NOOP_OUTCOMES else preview
-                    return _emit(render(outcome))
+                    return _emit(render(preview))
                 lines = (preview_lines(preview) if preview_lines is not None
                          else render(preview).out)
                 for line in lines:
@@ -363,6 +391,7 @@ def run_op(conn, *, call, render, preview_lines=None, args) -> int:
                         "confirmation_required"))
                 if not _confirm():
                     return _emit(_failure("中止しました。何も変更していません", "aborted"))
+                return _emit(render(attempt(False, getattr(preview, "expectation", None))))
             return _emit(render(attempt(False)))
     except Exception as exc:  # noqa: BLE001 — mapped to a coded report below
         report = report_exception(exc)
@@ -392,33 +421,45 @@ def _common(root: Path):
     return plugins_dir, ActivityLog(root / "logs" / "activity.log")
 
 
+def _recover_noop(conn, plugins_dir, name, activity):
+    def recover(outcome):
+        return deploy_ops.recover_noop_notifications(
+            conn, plugins_dir, name, activity, now=datetime.now(timezone.utc),
+            expect=outcome.expectation,
+            deadline=time.monotonic() + LOCK_WAIT_SECONDS)
+    return recover
+
+
+@guarded
 def plugin_disable(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
     revoke = bool(getattr(args, "revoke", False))
 
-    def call(dry_run: bool, deadline: float):
+    def call(dry_run: bool, deadline: float, expect):
         return deploy_disable.disable_plugin(
             conn, plugins_dir, args.name, revoke=revoke, force=bool(getattr(args, "force", False)),
             now=datetime.now(timezone.utc), settings=settings, activity=activity,
-            deadline=deadline, dry_run=dry_run)
+            deadline=deadline, dry_run=dry_run, expect=expect)
 
     return run_op(
-        conn, call=call, args=args,
+        conn, call=call, args=args, recover=_recover_noop(conn, plugins_dir, args.name, activity),
         render=lambda outcome: render_disable(outcome, conn, args.name, revoke=revoke),
         preview_lines=lambda outcome: preview_disable(
             outcome, args.name, revoke=revoke,
             live_hash=_live_hash(plugins_dir, args.name) if revoke else None))
 
 
+@guarded
 def plugin_rollback(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
     revoke = bool(getattr(args, "revoke", False))
 
-    def call(dry_run: bool, deadline: float):
+    def call(dry_run: bool, deadline: float, expect):
         return deploy_rollback.rollback_plugin(
             conn, plugins_dir, args.name, to=getattr(args, "to", None), revoke=revoke,
             force=bool(getattr(args, "force", False)), now=datetime.now(timezone.utc),
-            settings=settings, activity=activity, deadline=deadline, dry_run=dry_run)
+            settings=settings, activity=activity, deadline=deadline, dry_run=dry_run,
+            expect=expect)
 
     return run_op(
         conn, call=call, args=args,
@@ -428,14 +469,15 @@ def plugin_rollback(conn, settings, args, root: Path) -> int:
             live_hash=_live_hash(plugins_dir, args.name) if revoke else None))
 
 
+@guarded
 def plugin_retire(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
 
-    def call(dry_run: bool, deadline: float):
+    def call(dry_run: bool, deadline: float, expect):
         return deploy_retire.retire_plugin(
             conn, plugins_dir, args.name, force=bool(getattr(args, "force", False)),
             now=datetime.now(timezone.utc), settings=settings, activity=activity,
-            deadline=deadline, dry_run=dry_run)
+            deadline=deadline, dry_run=dry_run, expect=expect)
 
     def preview(outcome):
         if isinstance(outcome, deploy_disable.DisableOutcome):
@@ -443,9 +485,11 @@ def plugin_retire(conn, settings, args, root: Path) -> int:
         return preview_retire(outcome, args.name)
 
     return run_op(conn, call=call, args=args, preview_lines=preview,
+                  recover=_recover_noop(conn, plugins_dir, args.name, activity),
                   render=lambda outcome: render_retire(outcome, conn, args.name))
 
 
+@guarded
 def plugin_revoke(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
     content_hash = args.version
@@ -466,22 +510,37 @@ def plugin_revoke(conn, settings, args, root: Path) -> int:
                 "  " + ", ".join(matches)))
         content_hash = matches[0]
 
-    def call(dry_run: bool, deadline: float):
+    def call(dry_run: bool, deadline: float, expect):
         return deploy_disable.revoke_version(
             conn, plugins_dir, args.name, content_hash=content_hash,
             now=datetime.now(timezone.utc), activity=activity, deadline=deadline,
-            dry_run=dry_run)
+            dry_run=dry_run, expect=expect)
 
-    return run_op(conn, call=call, args=args,
+    def recover(outcome):
+        return deploy_disable.recover_revoke_notifications(
+            conn, plugins_dir, args.name, content_hash, activity,
+            now=datetime.now(timezone.utc), expect=outcome.expectation,
+            deadline=time.monotonic() + LOCK_WAIT_SECONDS)
+
+    return run_op(conn, call=call, args=args, recover=recover,
                   render=lambda outcome: render_revoke(outcome, args.name, content_hash))
 
 
-def plugin_versions(conn, settings, args, root: Path) -> int:
+@guarded
+def plugin_versions(settings, args, root: Path) -> int:
+    """Show one plugin's versions without taking a lock or writing anything."""
+    conn = deploy_store.open_readonly(root / "data" / "agentic.db")
+    if conn is None:
+        return _emit(_failure(
+            "データベースがまだ初期化されていません。何も変更していません", "db_missing",
+            "  先に `afx init` を実行してください。"))
     try:
         data = deploy_versions.collect_versions(
             conn, root / "plugins", args.name, settings=settings)
     except ValueError as exc:
         return _emit(_failure(str(exc), "invalid_request"))
+    finally:
+        conn.close()
     for line in deploy_versions.render_versions(data):
         print(line)
     return RC_OK

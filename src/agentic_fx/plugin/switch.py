@@ -1007,13 +1007,26 @@ _plugin_lock_owner_guard = None
 _plugin_lock_wait_notice = None
 
 
-def set_plugin_lock_wait_notice(notice) -> None:
+def set_plugin_lock_wait_notice(notice):
     """Install (or clear with ``None``) a callback run once per lock that is found held.
 
     The CLI uses it to tell the operator that it is waiting for another process.
+    Returns the callback that was installed before, so a caller can put it back.
     """
     global _plugin_lock_wait_notice
+    previous = _plugin_lock_wait_notice
     _plugin_lock_wait_notice = notice
+    return previous
+
+
+@contextlib.contextmanager
+def lock_wait_notice(notice):
+    """Run the block with ``notice`` installed, then restore whatever was there before."""
+    previous = set_plugin_lock_wait_notice(notice)
+    try:
+        yield
+    finally:
+        set_plugin_lock_wait_notice(previous)
 
 
 def set_plugin_lock_owner_guard(guard) -> None:

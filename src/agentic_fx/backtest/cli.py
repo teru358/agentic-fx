@@ -716,8 +716,8 @@ def _plugin_revoke(conn, settings, args: argparse.Namespace, root: Path) -> int:
     return plugin_deploy_cli.plugin_revoke(conn, settings, args, root)
 
 
-def _plugin_versions(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_versions(conn, settings, args, root)
+def _plugin_versions(settings, args: argparse.Namespace, root: Path) -> int:
+    return plugin_deploy_cli.plugin_versions(settings, args, root)
 
 
 _LOCK_NO_FROM_ERROR = (
@@ -845,6 +845,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     # SystemExit (ensure_initialized 由来) は Exception ではないのでここを
     # 経由せず素通りする。DB 接続・初期化も catch 対象に含める (codex I-2)。
     try:
+        if args.command == "plugin" and args.plugin_command == "versions":
+            return _plugin_versions(settings, args, root)
         conn = connect(root / "data" / "agentic.db")
         init_db(conn)
         try:
@@ -873,8 +875,6 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                     return _plugin_rollback(conn, settings, args, root)
                 if args.plugin_command == "revoke":
                     return _plugin_revoke(conn, settings, args, root)
-                if args.plugin_command == "versions":
-                    return _plugin_versions(conn, settings, args, root)
                 raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
             if args.command == "improve":
                 return _improve_verify_backend(conn, settings, args, root)

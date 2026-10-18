@@ -233,32 +233,24 @@ phase でも確認 (no-op)** になる。`foreign` (live が第三者に触ら�
 既に配備済みの `rsi_indicator` / `rsi_wilder` を退役させてよい。これは
 **人間の判断であり、本手順 (=配備) の完了条件ではない**。
 
-**ただし現時点では、symlink 配備された plugin を退役させる CLI 経路が存在しない**
-(設計書 v1.3b §1 非スコープ、`[retire-symlink-deployed-plugin]` として起票済み)。
+`afx plugin retire <名前>` は live の種類で動作が分かれる。
 
-`afx plugin retire <名前>` は名前 1 個だけを引数に取るが、**「legacy plain live」
-— つまり `plugins/<名前>` が (symlink ではなく) 普通のディレクトリである場合に
-しか使えない**。bless で配備したものは `.versions/` への symlink になっているため、
-`retire` は次で拒否する:
+- `plugins/<名前>` が **symlink** (bless / approve で配備したもの): `afx plugin disable`
+  と同じ状態機械で live の symlink を外す。版ディレクトリ (`.versions/`) と承認は残る。
+- `plugins/<名前>` が **普通のディレクトリ** (legacy plain live): `plugins/_retired/`
+  配下へ退避する。
 
-```
-ValueError: plugins/<名前> is not a plain directory (retire only applies to
-legacy plain live)
-```
+どちらも **依存を検査する**。外すと解決できなくなる strategy / plugin があれば
+`dependents_blocked` で拒否し、依存を表示する。`--force` を付けると、その strategy を
+止めたうえで続行できる。`retire` / `disable` / `rollback` / `revoke` は共通して、
+端末では実行前に予告 (cascade する strategy など) を表示して `y/N` を確認する。
+非対話の実行では `--yes` が必要で、`--dry-run` は予告だけを表示して何も変更しない。
+予告を見たあと実行までの間に live や依存の状態が変わった場合は、何も変更せず
+`state_changed` で拒否する (もう一度実行して予告を確認する)。
 
-(`switch.py:1627-1629`)。未終端の journal がある場合も `UnresolvedJournalError`
-で拒否する (`switch.py:1621-1625`)。
-
-**したがって `rsi_indicator` / `rsi_wilder` が bless / approve で配備されている
-場合、退役はできない — 新 `rsi` と併存させること。**
-
-**`retire` は依存 strategy を一切検査しない** (`switch.py:1605-1638` の
-`retire_plugin` 全体にその検査コードが無い)。退役させた indicator を pin して
-いる strategy は、次の `approved_plugins()` の第 2 相で `not_found` になり
-**黙って inventory から外れる** (pin 破れ)。**人間が退役前に必ず確認すること。**
-確認手段は対話シェルの `afx> approval <id>` の詳細表示に出る
-`dependent_pinned_here` / `dependent_pinned_elsewhere` の 2 欄
-(`commands.py:394-400`)。
+**依存する strategy が無いことは、予告の表示で確認すること。** 外した indicator を
+pin していた strategy は止まる (`--force` 時) か、拒否される。現状の依存は
+`afx plugin versions <名前>` の「依存 strategy」節でも確認できる。
 
 **example 側の `docs/examples/plugins/rsi_indicator` は残す** — example 戦略
 `rsi_pullback` が依存しており、改善ループの `_examples` スナップショットと

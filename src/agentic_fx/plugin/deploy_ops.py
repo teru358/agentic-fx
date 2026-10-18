@@ -12,7 +12,8 @@ import json
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
+from os import readlink as _readlink
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Mapping
@@ -34,6 +35,94 @@ class DeployOpBlockedError(RuntimeError):
 
 class SignatureMismatchError(DeployOpBlockedError):
     """A retry cannot safely inherit the existing immutable operation intent."""
+
+
+class StateChangedError(RuntimeError):
+    """The state shown to the operator before confirmation no longer holds."""
+
+
+@dataclass(frozen=True)
+class Expectation:
+    """What an operator was shown before confirming; re-checked under the lock.
+
+    ``live_*`` / ``content_hash`` / ``artifact_hash`` describe the live entry,
+    ``to_target`` the rollback destination, ``cascade`` the strategies that would
+    be restricted, ``decision`` the latest approval decision of a revoke subject
+    and ``open_op_id`` the open deploy op that would be inherited.
+    """
+    live_kind: str | None = None
+    live_target: str | None = None
+    content_hash: str | None = None
+    artifact_hash: str | None = None
+    to_target: str | None = None
+    cascade: tuple[str, ...] = ()
+    decision: tuple[int, str] | None = None
+    open_op_id: int | None = None
+
+    def same_live(self, other: "Expectation") -> bool:
+        return (self.live_kind, self.live_target, self.content_hash, self.artifact_hash) == (
+            other.live_kind, other.live_target, other.content_hash, other.artifact_hash)
+
+
+_UNREAD = object()
+
+
+def observe_live(plugins_root: Path, name: str, identity=_UNREAD) -> Expectation:
+    """The live entry of ``name`` as an ``Expectation`` (live fields only).
+
+    ``identity`` is the already-read ``live_identity`` result, when the caller has one.
+    """
+    live_path = Path(plugins_root) / name
+    target = None
+    if live_path.is_symlink():
+        kind = "symlink"
+        try:
+            target = _readlink(live_path)
+        except OSError:
+            target = None
+    elif live_path.is_dir():
+        kind = "plain"
+    elif os.path.lexists(live_path):
+        kind = "other"
+    else:
+        kind = "absent"
+    if identity is _UNREAD:
+        identity = deploy_store.live_identity(plugins_root, name)
+    return Expectation(
+        live_kind=kind, live_target=target,
+        content_hash=identity.content_hash if identity is not None else None,
+        artifact_hash=identity.artifact_hash if identity is not None else None)
+
+
+def observe(plugins_root: Path, name: str, *, open_row: Mapping[str, object] | None,
+            cascade, to_target: str | None = None, identity=_UNREAD) -> Expectation:
+    """``observe_live`` plus the plan-level facts an operation depends on."""
+    return replace(
+        observe_live(plugins_root, name, identity), to_target=to_target,
+        cascade=tuple(sorted(cascade)),
+        open_op_id=int(open_row["op_id"]) if open_row is not None else None)
+
+
+def require_expectation(expect: Expectation | None, observed: Expectation) -> None:
+    """Refuse, before any change, when the state differs from what was previewed."""
+    if expect is not None and expect != observed:
+        raise StateChangedError(
+            f"state changed after the preview: expected {expect!r}, found {observed!r}")
+
+
+def recover_noop_notifications(conn: sqlite3.Connection, plugins_root: Path, name: str,
+                               activity, *, now: datetime, expect: Expectation | None,
+                               deadline: float | None = None) -> tuple[int, ...] | None:
+    """Attempt missed notifications for a no-op, only while the live entry is as previewed.
+
+    Returns ``None`` (and does nothing) when the live entry changed since the preview.
+    """
+    from agentic_fx.plugin import switch
+
+    with switch._plugin_locks(plugins_root, [name], deadline=deadline):
+        if expect is not None and not observe_live(plugins_root, name).same_live(expect):
+            return None
+        return recover_notifications(conn, name, activity_or_null(activity), now=now)
 
 
 @dataclass(frozen=True)

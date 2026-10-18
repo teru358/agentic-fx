@@ -269,16 +269,29 @@ def status_summary(conn: sqlite3.Connection, *, now: datetime) -> dict:
             "attention": [brief(row) for row in list_attention(conn, now=now)]}
 
 
+def open_readonly(db_path: Path) -> sqlite3.Connection | None:
+    """Open the database file read-only, or ``None`` when the file does not exist.
+
+    Never creates the file, switches the journal mode or runs a migration.
+    Raises ``sqlite3.Error`` when the file cannot be opened as a database.
+    """
+    if not Path(db_path).is_file():
+        return None
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def count_open_readonly(db_path: Path) -> int | None:
     """Blocking deploy ops in the database file, without creating or changing it.
 
     ``None`` when the file is missing or cannot be read as a database.
     """
-    if not Path(db_path).is_file():
-        return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn = open_readonly(db_path)
     except sqlite3.Error:
+        return None
+    if conn is None:
         return None
     try:
         row = conn.execute(

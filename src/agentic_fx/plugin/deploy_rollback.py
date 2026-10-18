@@ -66,6 +66,7 @@ class RollbackOutcome:
     op_id: int | None = None
     notified_op_ids: tuple[int, ...] = ()
     live_removed: bool = False
+    expectation: deploy_ops.Expectation | None = None
 
 
 def _version_target(name: str, artifact_hash: str) -> str:
@@ -336,8 +337,13 @@ def close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open
 def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, to: str | None,
                     revoke: bool, force: bool, now: datetime, actor: str = "human_cli",
                     settings, activity=None, deadline: float | None = None, stop_event=None,
-                    dry_run: bool = False) -> RollbackOutcome:
-    """Journal-first replacement of a canonical live symlink by an earlier version."""
+                    dry_run: bool = False,
+                    expect: deploy_ops.Expectation | None = None) -> RollbackOutcome:
+    """Journal-first replacement of a canonical live symlink by an earlier version.
+
+    ``expect`` is the state a preview showed; a real run refuses with
+    ``StateChangedError``, changing nothing, when the state under the lock differs.
+    """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
 
@@ -364,6 +370,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 f"op_kind={open_row['op_kind']}")
         live = deploy_store.live_identity(plugins_root, name)
         live_path = plugins_root / name
+        observed = deploy_ops.observe(
+            plugins_root, name, open_row=open_row, cascade=report.dependent_names,
+            identity=live, to_target=target.to_target if isinstance(target, RollbackTarget) else None)
+        if not dry_run:
+            deploy_ops.require_expectation(expect, observed)
         if live is not None and live.kind == "plain":
             raise ValueError(f"plugins/{name} is a plain directory; use afx plugin retire")
         raw_target = None
@@ -391,7 +402,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                         "signature than the requested rollback — wait for reconcile "
                         "or restart the daemon")
                 return RollbackOutcome("dry_run", name, to_target=to_target,
-                                       op_id=int(open_row["op_id"]))
+                                       op_id=int(open_row["op_id"]), expectation=observed)
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
             _finish(conn, op_id, "done", activity, now=now)
             return _success(name, op_id, to_target, report.dependent_names)
@@ -451,7 +462,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
         if dry_run:
             return RollbackOutcome("dry_run", name, cascade_strategies=tuple(sorted(cascade)),
                                    dependents=verified.dependents.unresolvable,
-                                   to_target=verified.to_target)
+                                   to_target=verified.to_target, expectation=observed)
         requested = _requested_signature(
             name, open_row, live, verified.to_target, revoke, force, lost_source)
         if open_row is not None:

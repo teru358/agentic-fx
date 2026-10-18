@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from agentic_fx.plugin import loader
+from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
 _DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -33,43 +34,30 @@ def _live_section(plugins_root: Path, name: str) -> dict:
     return {"kind": "absent", "target": None, "content_hash": None, "artifact_hash": None}
 
 
-def _decisions(conn: sqlite3.Connection, name: str) -> dict[str, dict]:
-    """Per content hash: the latest approved / rejected decisions of this plugin."""
-    result: dict[str, dict] = {}
-    rows = conn.execute(
-        "SELECT * FROM approval_requests WHERE kind='plugin' AND decided_at IS NOT NULL "
-        "AND status IN ('approved','rejected') ORDER BY decided_at, id")
-    for row in rows:
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
-            continue
-        if (not isinstance(payload, dict) or payload.get("name") != name
-                or not isinstance(payload.get("content_hash"), str)):
-            continue
-        entry = result.setdefault(payload["content_hash"], {})
-        decision = {"approval_id": row["id"], "status": row["status"],
-                    "decided_at": row["decided_at"], "decided_by": row["decided_by"],
-                    "artifact_hash": payload.get("artifact_hash"),
-                    "reason": row["reason"]}
-        entry["latest"] = decision
-        if row["status"] == "approved":
-            entry["approved"] = decision
-    return result
+def _approved_artifact(approved: dict | None) -> str | None:
+    if approved is None:
+        return None
+    try:
+        payload = json.loads(approved["payload_json"])
+    except (TypeError, ValueError):
+        return None
+    artifact = payload.get("artifact_hash") if isinstance(payload, dict) else None
+    return artifact if isinstance(artifact, str) else None
 
 
-def _version_row(directory: Path,
-                 decisions: dict[str, dict], live_artifact: str | None) -> dict:
+def _version_row(conn: sqlite3.Connection, name: str, directory: Path,
+                 live_artifact: str | None) -> dict:
     from agentic_fx.plugin import switch
 
     try:
         content = loader.content_hash(directory)
     except OSError:
         content = None
-    entry = decisions.get(content or "", {})
-    approved = entry.get("approved")
-    latest = entry.get("latest")
-    expected_artifact = (approved["artifact_hash"] if approved else None) or directory.name
+    latest = approved = None
+    if content is not None:
+        latest = approvals_store.latest_decision_for_identity(conn, name, content)
+        approved = approvals_store.latest_approved_for_identity(conn, name, content)
+    expected_artifact = _approved_artifact(approved) or directory.name
     return {
         "artifact_hash": directory.name, "content_hash": content,
         "decision": latest["status"] if latest else None,
@@ -97,13 +85,12 @@ def collect_versions(conn: sqlite3.Connection, plugins_root: Path, name: str, *,
         raise ValueError(f"invalid plugin name: {name!r}")
     plugins_root = Path(plugins_root)
     live = _live_section(plugins_root, name)
-    decisions = _decisions(conn, name)
     base = plugins_root / ".versions" / name
     versions = []
     if base.is_dir():
         for entry in sorted(base.iterdir()):
             if entry.is_dir() and _DIR_NAME_RE.fullmatch(entry.name):
-                versions.append(_version_row(entry, decisions, live["artifact_hash"]))
+                versions.append(_version_row(conn, name, entry, live["artifact_hash"]))
     versions.sort(key=lambda v: (not v["is_live"], v["decided_at"] is None,
                                  _negate(v["decided_at"]), v["artifact_hash"]))
     rows = deploy_store.list_by_name(conn, name)

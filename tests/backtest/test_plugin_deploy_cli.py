@@ -6,6 +6,7 @@ outcome → (rc, code, 文言の要点) の一覧表、確認の流れ、完了�
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,6 +181,27 @@ OUTCOME_TABLE = [
      1, "invalid_request", ["cannot revoke the current live version"]),
     (["retire", "sma"], deploy_retire, "retire_plugin", OSError("permission denied"),
      1, "os_error", ["permission denied"]),
+    (["disable", "sma"], deploy_disable, "disable_plugin",
+     sqlite3.OperationalError("database is locked"),
+     1, "db_error", ["database is locked"]),
+    (["rollback", "sma"], deploy_rollback, "rollback_plugin",
+     RuntimeError("unexpected breakage"),
+     1, "internal_error", ["RuntimeError", "unexpected breakage"]),
+    (["revoke", "sma", "--version", HASH], deploy_disable, "revoke_version",
+     deploy_ops.StateChangedError("live changed"),
+     1, "state_changed", ["もう一度実行して予告を確認してください", "何も変更していません"]),
+    # dry_run の outcome (確認を飛ばす経路でも表に載せる)
+    (["disable", "sma"], deploy_disable, "disable_plugin",
+     _disable("dry_run", cascade_strategies=("strat",)),
+     0, None, ["dry-run:", "cascade する strategy: strat"]),
+    (["rollback", "sma"], deploy_rollback, "rollback_plugin",
+     _rollback("dry_run", to_target=TARGET),
+     0, None, ["dry-run:", "b" * 12]),
+    (["retire", "sma"], deploy_retire, "retire_plugin",
+     _retire("dry_run", retired_path="_retired/sma-x-1"),
+     0, None, ["dry-run:", "_retired/sma-x-1"]),
+    (["revoke", "sma", "--version", HASH], deploy_disable, "revoke_version",
+     _revoke("dry_run"), 0, None, ["dry-run:", HASH]),
 ]
 
 
@@ -426,6 +448,141 @@ def test_a_stuck_syscall_failure_is_reported_as_open_and_resumes_on_rerun(
     assert deploy_store.get_open_by_name(world.conn, "sma") is None
 
 
+# ---- 予告と本実行の間の状態変化 -------------------------------------------
+
+def _change_while_prompting(monkeypatch, action, answer: str = "y") -> dict:
+    """Answer the prompt, but first run ``action`` as if another process acted meanwhile."""
+    seen: dict = {}
+    monkeypatch.setattr(plugin_deploy_cli, "_isatty", lambda: True)
+
+    def ask(_prompt=""):
+        action()
+        seen["after_change"] = True
+        return answer
+
+    monkeypatch.setattr("builtins.input", ask)
+    return seen
+
+
+def _assert_refused_as_state_changed(rc, err, world, expected_snapshot):
+    assert rc == 1
+    assert err.splitlines()[0].endswith("(code=state_changed)")
+    assert "もう一度実行して予告を確認してください" in err
+    assert world.snapshot("sma") == expected_snapshot
+
+
+def test_disable_with_revoke_does_not_touch_a_version_swapped_in_after_the_preview(
+        world, monkeypatch, capsys):
+    _a, b, c = world.three_generations()
+    snapshots: dict = {}
+
+    def swap():
+        world.link("sma", b)
+        snapshots["after"] = world.snapshot("sma")
+
+    _change_while_prompting(monkeypatch, swap)
+
+    rc, out, err = _run(capsys, "disable", "sma", "--revoke")
+
+    assert "版 " + world.content(c) in out
+    _assert_refused_as_state_changed(rc, err, world, snapshots["after"])
+    assert _link_target(world) == world.target("sma", b)
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 0
+
+
+def test_rollback_does_not_run_when_the_live_version_moved_after_the_preview(
+        world, monkeypatch, capsys):
+    a, b, c = world.three_generations()
+    snapshots: dict = {}
+
+    def swap():
+        world.link("sma", b)
+        snapshots["after"] = world.snapshot("sma")
+
+    _change_while_prompting(monkeypatch, swap)
+
+    rc, _out, err = _run(capsys, "rollback", "sma", "--to", a.name[:12])
+
+    _assert_refused_as_state_changed(rc, err, world, snapshots["after"])
+    assert _link_target(world) == world.target("sma", b)
+
+
+def test_retire_does_not_run_when_the_plain_directory_changed_after_the_preview(
+        world, monkeypatch, capsys):
+    shutil.copytree(world.version("old", "p"), world.root / "old")
+    snapshots: dict = {}
+
+    def edit():
+        (world.root / "old" / "plugin.py").write_text("# edited meanwhile\n")
+        snapshots["after"] = world.snapshot("old")
+
+    _change_while_prompting(monkeypatch, edit)
+
+    rc, _out, err = _run(capsys, "retire", "old")
+
+    assert rc == 1 and err.splitlines()[0].endswith("(code=state_changed)")
+    assert world.snapshot("old") == snapshots["after"]
+    assert (world.root / "old").is_dir()
+
+
+def test_revoke_does_not_run_when_the_latest_decision_changed_after_the_preview(
+        world, monkeypatch, capsys):
+    from agentic_fx.store import approvals as approvals_store
+
+    a, _b, _c = world.three_generations()
+    snapshots: dict = {}
+
+    def revoke_elsewhere():
+        approvals_store.append_revocation(world.conn, "sma", world.content(a), now=at(30))
+        snapshots["after"] = world.snapshot("sma")
+
+    _change_while_prompting(monkeypatch, revoke_elsewhere)
+
+    rc, _out, err = _run(capsys, "revoke", "sma", "--version", world.content(a))
+
+    _assert_refused_as_state_changed(rc, err, world, snapshots["after"])
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 1
+
+
+def test_a_noop_preview_never_reaches_the_real_run_without_yes(world, monkeypatch, capsys):
+    _a, _b, c = world.three_generations()
+    _run(capsys, "disable", "sma", "--yes")
+    real = deploy_disable.disable_plugin
+    calls: list[bool] = []
+
+    def preview_then_live_appears(*args, **kwargs):
+        calls.append(kwargs["dry_run"])
+        outcome = real(*args, **kwargs)
+        if kwargs["dry_run"]:
+            world.link("sma", c)
+        return outcome
+
+    monkeypatch.setattr(deploy_disable, "disable_plugin", preview_then_live_appears)
+
+    rc, _out, err = _run(capsys, "disable", "sma")
+
+    assert calls == [True]
+    assert rc == 1 and err.splitlines()[0].endswith("(code=state_changed)")
+    assert _link_target(world) == world.target("sma", c)
+    assert deploy_store.get_open_by_name(world.conn, "sma") is None
+    assert len(deploy_store.list_by_name(world.conn, "sma")) == 1
+
+
+def test_a_noop_without_yes_still_resends_a_missed_notification(world, capsys):
+    _a, _b, c = world.three_generations()
+    (world.root / "sma").unlink()
+    op_id = world.intent("sma", op_kind="disable_symlink", phase="done", from_ver=c, minute=10)
+
+    rc, out, err = _run(capsys, "disable", "sma")
+
+    assert rc == 0 and err == ""
+    assert "既に disable 済み" in out
+    assert f"op_id={op_id}" in out
+    assert deploy_store.get_by_id(world.conn, op_id)["notify_attempted"] == 1
+
+
 # ---- lock 待ち ----------------------------------------------------------
 
 def _run_in_thread(argv, capsys_box):
@@ -599,6 +756,87 @@ def test_versions_reads_without_the_name_lock_and_writes_nothing(world, capsys, 
         holder.release()
     assert box["rc"] == 0
     assert world.snapshot("sma") == before
+
+
+def _tree(base: Path):
+    return sorted((str(path.relative_to(base)), path.stat().st_size if path.is_file() else -1)
+                  for path in base.rglob("*"))
+
+
+def _bare_root(base: Path) -> Path:
+    (base / "config").mkdir(parents=True)
+    shutil.copy(REPO_ROOT / "config" / "settings.yaml.example",
+                base / "config" / "settings.yaml")
+    (base / "data" / "state").mkdir(parents=True)
+    StateStore(base / "data" / "state" / "app_state.json").update(initialized=True)
+    return base
+
+
+def test_versions_on_a_root_without_a_database_creates_nothing_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    base = _bare_root(tmp_path / "bare")
+    monkeypatch.chdir(base)
+    before = _tree(base)
+
+    rc, _out, err = _run(capsys, "versions", "sma")
+
+    assert rc == 1
+    assert err.splitlines()[0].endswith("(code=db_missing)")
+    assert "初期化" in err
+    assert _tree(base) == before
+    assert not (base / "data" / "agentic.db").exists()
+    assert not (base / "plugins").exists()
+
+
+def test_versions_on_an_existing_database_leaves_every_file_untouched(world, capsys):
+    _versions_scenario(world)
+    before = _tree(world.base)
+    db_bytes = world.db_path.read_bytes()
+
+    rc, _out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    assert _tree(world.base) == before
+    assert world.db_path.read_bytes() == db_bytes
+
+
+def test_versions_opens_the_database_read_only(world, monkeypatch, capsys):
+    import sqlite3
+
+    _versions_scenario(world)
+    opened: list[str] = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        opened.append(str(database))
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+
+    rc, _out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    assert opened and all("mode=ro" in target for target in opened), opened
+
+
+def test_versions_takes_the_latest_decision_from_the_approvals_store(world, monkeypatch, capsys):
+    from agentic_fx.store import approvals as approvals_store
+
+    a, _b, c = _versions_scenario(world)
+    asked: list[str] = []
+    real = approvals_store.latest_decision_for_identity
+
+    def spy(conn, name, content_hash):
+        asked.append(content_hash)
+        return real(conn, name, content_hash)
+
+    monkeypatch.setattr(approvals_store, "latest_decision_for_identity", spy)
+
+    rc, out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    assert {world.content(a), world.content(c)} <= set(asked)
+    assert "決定=rejected" in out
 
 
 def test_versions_rejects_an_invalid_plugin_name_with_a_code(world, capsys):
