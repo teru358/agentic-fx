@@ -8,14 +8,16 @@ import sys
 import time
 from pathlib import Path
 
+from agentic_fx.plugin.switch import plugin_lock_path
+
 
 def main() -> None:
     root, prefix = Path(sys.argv[1]), sys.argv[2]
-    lock_dir = root / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
     handles = []
     for name in sorted(sys.argv[3:]):
-        handle = open(lock_dir / f"{name}.lock", "a+")
+        path = plugin_lock_path(root, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")
         fcntl.flock(handle, fcntl.LOCK_EX)
         handles.append(handle)
     Path(prefix + ".held").write_text("held")

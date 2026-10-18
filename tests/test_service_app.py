@@ -31,6 +31,7 @@ from agentic_fx.service import (
 )
 from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
+from tests.core._lock_helpers import TrackedRLock
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
@@ -965,7 +966,8 @@ def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
          patch("agentic_fx.plugin.signal_producer.live_mismatch",
               return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
-                        embedding_fn=FakeEmbedding())
+                        embedding_fn=FakeEmbedding(),
+                        core_lock_factory=TrackedRLock)
         fake = _ToolCallingFakeRunner(
             [MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
              MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
@@ -981,7 +983,7 @@ def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
         producer_done = threading.Event()
 
         def maintenance_after_core_unlock(now):
-            assert not app.core_lock._is_owned()
+            assert not app.core_lock.owned_by_current_thread()
             events.append("maintenance")
             real_maintenance(now)
             producer_done.set()

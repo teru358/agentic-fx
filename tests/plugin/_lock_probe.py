@@ -8,14 +8,16 @@ import json
 import sys
 from pathlib import Path
 
+from agentic_fx.plugin.switch import plugin_lock_path
+
 
 def main() -> None:
     root = Path(sys.argv[1])
-    lock_dir = root / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
     result = {}
     for name in sys.argv[2:]:
-        handle = open(lock_dir / f"{name}.lock", "a+")
+        path = plugin_lock_path(root, name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+")
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

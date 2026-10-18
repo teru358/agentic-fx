@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin.switch import plugin_lock_path
 from agentic_fx.plugin.resolve import ResolvedIndicator, ResolvedIndicatorSet
 from tests.plugin.deploy_world import World
 from tests.plugin.test_signal_producer import H, SETTINGS, SOURCE, _seed_flat
@@ -37,9 +38,9 @@ def probe_other_process(root: Path, names) -> dict[str, bool]:
 
 
 def lock_is_free(root: Path, name: str) -> bool:
-    lock_dir = root / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    handle = open(lock_dir / f"{name}.lock", "a+")
+    path = plugin_lock_path(root, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

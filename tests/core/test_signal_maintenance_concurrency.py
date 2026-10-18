@@ -17,6 +17,7 @@ from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import _scheduler_tick_once, build_app
 from agentic_fx.store import signals
 from agentic_fx.store.db import connect
+from tests.core._lock_helpers import TrackedRLock
 from tests.plugin._conc_support import Activity
 from tests.plugin.test_signal_producer import H, _seed_flat
 from tests.store.test_rag import FakeEmbedding
@@ -29,7 +30,7 @@ TICK = H + timedelta(hours=1, seconds=31)
 def _app(tmp_path):
     _init(tmp_path)
     return build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
-                     embedding_fn=FakeEmbedding())
+                     embedding_fn=FakeEmbedding(), core_lock_factory=TrackedRLock)
 
 
 def _add_signal(conn, plugin: str) -> int | None:
@@ -54,7 +55,7 @@ def test_another_thread_can_take_core_lock_while_maintenance_runs(
     seen = {}
 
     def blocked_maintenance(**kwargs):
-        seen["owns_core_lock"] = app.core_lock._is_owned()
+        seen["owns_core_lock"] = app.core_lock.owned_by_current_thread()
         seen["conn"] = kwargs["conn"]
         inside.set()
         assert proceed.wait(30)
@@ -67,10 +68,8 @@ def test_another_thread_can_take_core_lock_while_maintenance_runs(
         taken = []
 
         def other_thread():
-            got = app.core_lock.acquire(timeout=1)
-            taken.append(got)
-            if got:
-                app.core_lock.release()
+            with app.core_lock:
+                taken.append(True)
 
         contender = threading.Thread(target=other_thread)
         contender.start()

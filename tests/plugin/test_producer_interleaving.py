@@ -3,6 +3,7 @@ deadline expiry and the interleavings with ``disable_plugin``."""
 from __future__ import annotations
 
 import shutil
+import time
 from datetime import timedelta
 
 import pytest
@@ -18,10 +19,11 @@ from tests.plugin.test_signal_producer import H, SETTINGS, SOURCE, _open_result
 
 @pytest.fixture
 def expired_deadline(monkeypatch):
-    """The producer's deadline clock reads 0.0, so its deadline is already in
-    the past of the real monotonic clock the lock loop compares against: a lock
-    that is busy on the first non-blocking try times out without waiting."""
-    monkeypatch.setattr(sp, "monotonic", lambda: 0.0)
+    """The producer's deadline clock reads far behind the real monotonic clock the
+    lock loop compares against, whatever the host uptime: a lock that is busy on
+    the first non-blocking try times out without waiting."""
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(sp, "monotonic", lambda: real_monotonic() - 1e6)
 
 
 @pytest.fixture

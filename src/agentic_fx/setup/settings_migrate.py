@@ -71,17 +71,19 @@ def _migrate_one_to_two(text: str) -> EditResult:
 _PLUGIN_LOCK_LINE = ("plugin_lock_timeout_sec: 2      "
                      "# signal producer / OPEN の plugin name lock 待機上限 (秒)\n")
 _RECONCILE_LOCK_LINE = ("reconcile_lock_timeout_sec: 30  "
-                        "# 起動時 deploy reconcile の plugin name lock 待機上限 (秒)\n")
+                        "# 起動時 deploy reconcile 全体の plugin name lock 待機上限 (秒)\n")
 
 
 _VERSION_TWO_LINE = re.compile(r"schema_version:[ \t]*2([ \t]+#.*)?\r?\n?")
 
 
 def _migrate_two_to_three(text: str) -> EditResult:
-    """Bump the marker to v3 and add ``worker.plugin_lock_timeout_sec`` if absent.
+    """Bump the marker to v3 and add the worker lock timeouts that are absent.
 
-    An existing value is never touched. When ``worker`` is absent or not a block
-    mapping the model default (2 seconds) applies, so only the marker changes.
+    ``worker.plugin_lock_timeout_sec`` and ``worker.reconcile_lock_timeout_sec`` are
+    each appended only when missing; an existing value is never touched. When
+    ``worker`` is absent or not a block mapping the model defaults apply, so only
+    the marker changes.
     """
     lines = text.splitlines(keepends=True)
     marker = next((i for i, line in enumerate(lines) if _VERSION_TWO_LINE.fullmatch(line)), None)

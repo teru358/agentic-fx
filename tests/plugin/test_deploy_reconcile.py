@@ -522,6 +522,39 @@ def test_a_name_lock_held_elsewhere_skips_only_that_op(world):
     assert [r.outcome for r in again] == ["done"] and _state(world, busy) == ("done", None)
 
 
+def test_the_lock_wait_budget_is_one_deadline_shared_by_every_op(world, monkeypatch):
+    a, b, c = world.three_generations()
+    x = world.version("other", "x")
+    world.deploy("other", x, None, 6)
+    x2 = world.version("other", "x2")
+    world.deploy("other", x2, x, 7)
+    world.intent("sma", from_ver=c, to_ver=b)
+    world.intent("other", from_ver=x2, to_ver=x)
+    deadlines = []
+    real_acquire = deploy_reconcile.deploy_ops.acquire_op_locks
+
+    def spy(*args, **kwargs):
+        deadlines.append(kwargs["deadline"])
+        return real_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(deploy_reconcile.deploy_ops, "acquire_op_locks", spy)
+    readings = iter([-1e6, -2e6, -3e6, -4e6])
+    calls = []
+
+    def clock():
+        calls.append(1)
+        return next(readings)
+
+    with switch._plugin_lock(world.root, "sma"), switch._plugin_lock(world.root, "other"):
+        results = deploy_reconcile.reconcile_deploy_ops(
+            world.conn, world.root, now=NOW, settings=SETTINGS, activity=Activity(),
+            lock_timeout_sec=30.0, monotonic=clock)
+
+    assert [r.outcome for r in results] == ["lock_timeout", "lock_timeout"]
+    assert len(calls) == 1
+    assert deadlines == [-1e6 + 30.0, -1e6 + 30.0]
+
+
 def _unlink_then_vanish(monkeypatch):
     real = os.unlink
 
