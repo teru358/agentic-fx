@@ -201,5 +201,3 @@ class ConcWorld(World):
 
     def total(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
-
-
