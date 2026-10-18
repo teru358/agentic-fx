@@ -108,7 +108,7 @@ class World:
                fail_reason: str | None = None, from_ver: Path | None = None,
                to_ver: Path | None = None, force: bool = False, revoke: bool = False,
                minute: int = 10, retired_path: str | None = None, from_plain: bool = False,
-               notify: bool = False) -> int:
+               notify: bool = False, subject_content_hash: str | None = None) -> int:
         row = dict(op_kind=op_kind, name=name, retired_path=retired_path,
                    approval_id=None, revoke=False, revoke_row_id=None, force=force,
                    actor="human_cli", now=at(minute), commit=True)
@@ -130,7 +130,7 @@ class World:
         else:
             row.update(
                 from_kind="plain", to_kind="retired", from_target=None, to_target=None,
-                subject_content_hash=None, subject_artifact_hash=None,
+                subject_content_hash=subject_content_hash, subject_artifact_hash=None,
                 target_content_hash=None, target_artifact_hash=None)
         op_id = deploy_store.insert_intent(self.conn, **row)
         if phase != "intent":

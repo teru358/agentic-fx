@@ -102,6 +102,24 @@ def test_disable_with_a_foreign_live_is_closed_without_touching_it(world, kind):
     assert _state(world, op) == ("foreign", None) and not deploy_store.is_open(_row(world, op))
 
 
+def test_reconcile_retire_closes_replaced_plain_identity_as_foreign_without_renaming(world):
+    original = world.version("sma", "original")
+    replacement = world.version("sma", "replacement")
+    original_content = world.content(original)
+    os.rename(original, world.root / "sma")
+    op = world.intent(
+        "sma", op_kind="retire_plain", retired_path="_retired/sma-crash-1",
+        subject_content_hash=original_content)
+    os.rename(world.root / "sma", world.root / "old-sma")
+    os.rename(replacement, world.root / "sma")
+
+    results = _reconcile(world)
+
+    assert results[0].outcome == "foreign" and _state(world, op) == ("foreign", None)
+    assert (world.root / "sma").is_dir()
+    assert not (world.root / "_retired" / "sma-crash-1").exists()
+
+
 # ---- 6.2 rollback_symlink ----
 
 def test_rollback_with_live_at_to_target_completes_without_verifying(world):

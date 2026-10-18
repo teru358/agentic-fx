@@ -84,7 +84,8 @@ def test_retire_takes_over_matching_open_plain_retire(env):
     deploy_ops_store.insert_intent(
         conn, op_kind="retire_plain", name="sma", from_kind="plain",
         to_kind="retired", from_target=None, to_target=None,
-        retired_path="_retired/sma-20260820T030000Z", subject_content_hash=None,
+        retired_path="_retired/sma-20260820T030000Z",
+        subject_content_hash=loader.content_hash(plugins_dir / "sma"),
         subject_artifact_hash=None, target_content_hash=None,
         target_artifact_hash=None, approval_id=None, revoke=False,
         revoke_row_id=None, force=False, actor="human_cli", now=NOW)

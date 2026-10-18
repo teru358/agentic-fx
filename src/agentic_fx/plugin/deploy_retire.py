@@ -90,14 +90,13 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 "(reconcile or approval retry)")
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
         live_plain = _plain(live_path)
+        live_identity = deploy_store.live_identity(plugins_root, name) if live_plain else None
+        subject_content_hash = (
+            live_identity.content_hash if live_identity is not None else None)
         if open_row is not None and open_row["op_kind"] != "retire_plain":
             raise deploy_ops.DeployOpBlockedError(
                 f"plugin {name!r} has open deploy op op_id={open_row['op_id']} "
                 f"op_kind={open_row['op_kind']}")
-        requested = deploy_ops.Signature("retire_plain", name, None, None, None, False, force)
-        if open_row is not None and deploy_ops.row_signature(open_row) != requested:
-            raise deploy_ops.SignatureMismatchError(
-                f"open deploy op op_id={open_row['op_id']} has a different signature")
         if open_row is not None:
             op_id = int(open_row["op_id"])
             retired_path = str(open_row["retired_path"])
@@ -116,8 +115,13 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 row = deploy_store.get_by_id(conn, op_id)
                 deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
+            requested = deploy_ops.Signature(
+                "retire_plain", name, subject_content_hash, None, None, False, force)
+            if deploy_ops.row_signature(open_row) != requested:
+                raise deploy_ops.SignatureMismatchError(
+                    f"open deploy op op_id={open_row['op_id']} has a different signature")
             op_id = deploy_ops.match_or_reject(
-                open_row, requested, deploy_store.LiveIdentity("plain", None, None),
+                open_row, requested, live_identity,
                 conn=conn, now=now)
         else:
             if not live_plain:
@@ -150,7 +154,8 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 conn, intent_row={
                     "op_kind": "retire_plain", "name": name, "from_kind": "plain",
                     "to_kind": "retired", "from_target": None, "to_target": None,
-                    "retired_path": "_retired/.pending", "subject_content_hash": None,
+                    "retired_path": "_retired/.pending",
+                    "subject_content_hash": subject_content_hash,
                     "subject_artifact_hash": None, "target_content_hash": None,
                     "target_artifact_hash": None, "approval_id": None, "force": force,
                 }, revoke=None, cascade_identities=[], now=now, actor=actor,
@@ -158,7 +163,12 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
             retired_path = str(deploy_store.get_by_id(conn, op_id)["retired_path"])
 
         retired = Path(plugins_root) / retired_path
-        if not _plain(live_path) or os.path.lexists(retired):
+        current_identity = deploy_store.live_identity(plugins_root, name)
+        recorded_identity = deploy_store.get_by_id(conn, op_id)["subject_content_hash"]
+        if (not _plain(live_path) or os.path.lexists(retired)
+                or (recorded_identity is not None and (
+                    current_identity is None
+                    or current_identity.content_hash != recorded_identity))):
             deploy_store.set_phase(conn, op_id, "foreign", now=now)
             row = deploy_store.get_by_id(conn, op_id)
             deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)

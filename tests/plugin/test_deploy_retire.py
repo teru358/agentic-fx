@@ -34,6 +34,9 @@ def test_plain_retire_moves_directory_records_relative_destination_and_notifies(
     assert not os.path.lexists(world.root / "sma")
     row = deploy_store.get_by_id(world.conn, result.op_id)
     assert row["op_kind"] == "retire_plain"
+    assert row["from_kind"] == "plain" and row["to_kind"] == "retired"
+    assert row["subject_content_hash"] == world.content(world.root / row["retired_path"])
+    assert row["subject_artifact_hash"] is None
     assert row["retired_path"] == result.retired_path
     assert str(result.op_id) in row["retired_path"]
     assert (world.root / row["retired_path"] / "plugin.py").is_file()
@@ -50,8 +53,11 @@ def test_plain_retire_moves_directory_records_relative_destination_and_notifies(
 
 def test_plain_retire_blocks_dependents_without_force_and_cascades_with_force(world):
     indicator = world.version("sma", "plain")
+    indicator_content = world.content(indicator)
     os.rename(indicator, world.root / "sma")
-    strategy = world.version("strat", "strategy", kind="strategy", indicator="sma")
+    strategy = world.version("strat", "strategy", kind="strategy", indicator="sma",
+                             pin="a" * 64)
+    assert "a" * 64 != indicator_content
     world.deploy("strat", strategy, None, 1)
     signal_id = world.signal("sma", "unknown")
 
@@ -63,6 +69,19 @@ def test_plain_retire_blocks_dependents_without_force_and_cascades_with_force(wo
         world.conn, world.root, "sma", force=True, now=NOW, settings=SETTINGS)
     assert done.outcome == "done" and done.cascade_strategies == ("strat",)
     assert world.conn.execute("SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()[0] == "abandoned"
+
+
+def test_plain_retire_records_null_identity_when_discovery_fails_and_completes(world):
+    plain = world.version("sma", "broken")
+    os.rename(plain, world.root / "sma")
+    (world.root / "sma" / "config.yaml").write_text("kind: [not valid\n")
+
+    result = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+
+    row = deploy_store.get_by_id(world.conn, result.op_id)
+    assert result.outcome == "done" and row["subject_content_hash"] is None
+    assert (world.root / row["retired_path"]).is_dir()
 
 
 def test_plain_retire_rejects_cross_device_before_recording(world, monkeypatch):
@@ -119,6 +138,27 @@ def test_plain_retire_rename_failure_reopens_with_same_signature_and_completes(w
     done = deploy_retire.retire_plugin(
         world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
     assert done.outcome == "done" and done.op_id == failed.op_id
+
+
+def test_plain_retry_rejects_a_replaced_directory_with_a_different_identity(world, monkeypatch):
+    original = world.version("sma", "original")
+    replacement = world.version("sma", "replacement")
+    os.rename(original, world.root / "sma")
+    real_rename = deploy_retire.deploy_reconcile.rename_plain_dir
+    monkeypatch.setattr(deploy_retire.deploy_reconcile, "rename_plain_dir",
+                        lambda *args: (_ for _ in ()).throw(OSError("injected")))
+    failed = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_retire.deploy_reconcile, "rename_plain_dir", real_rename)
+    os.rename(world.root / "sma", world.root / "old-sma")
+    os.rename(replacement, world.root / "sma")
+
+    with pytest.raises(deploy_ops.SignatureMismatchError):
+        deploy_retire.retire_plugin(
+            world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+
+    row = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert row["phase"] == "needs_retry" and (world.root / "sma").is_dir()
 
 
 def test_plain_retire_dry_run_changes_neither_database_nor_filesystem(world):

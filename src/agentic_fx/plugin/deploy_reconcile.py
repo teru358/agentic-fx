@@ -139,6 +139,11 @@ def _reconcile_retire(conn, plugins_root: Path, row: dict, activity, *, now) -> 
     if live.is_symlink():
         return _set(conn, row, "foreign", activity, now=now)
     if live.is_dir():
+        current_identity = deploy_store.live_identity(plugins_root, row["name"])
+        if (row["subject_content_hash"] is not None and (
+                current_identity is None
+                or current_identity.content_hash != row["subject_content_hash"])):
+            return _set(conn, row, "foreign", activity, now=now)
         if os.path.lexists(retired):
             return _set(conn, row, "foreign", activity, now=now)
         try:
