@@ -500,10 +500,7 @@ def test_a_revoke_committed_before_its_notice_is_noticed_once_by_either_route(wo
 
 @pytest.mark.parametrize("route", [
     "reconcile",
-    pytest.param("cli", marks=pytest.mark.xfail(strict=True, reason=(
-        "disable_plugin checks unresolvable dependents before taking over the open op, so a "
-        "dependent added after an unforced intent returns dependents_blocked and --force is "
-        "refused as a signature mismatch until the next reconcile"))),
+    "cli",
 ])
 def test_a_dependent_added_after_an_unforced_intent_does_not_stop_the_disable(
         world, monkeypatch, route):

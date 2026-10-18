@@ -38,7 +38,11 @@ def rename_plain_dir(live: Path, retired: Path) -> None:
 def _set(conn: sqlite3.Connection, row: dict, phase: str, activity, *, now: datetime,
          fail_reason: str | None = None) -> ReconcileResult:
     op_id = int(row["op_id"])
-    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason)
+    leaves_syscall_failure = (row["phase"] == "needs_retry"
+                              and row["fail_reason"] == "syscall_failed"
+                              and phase != "needs_retry")
+    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason,
+                           notify_attempted=False if leaves_syscall_failure else None)
     deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), deploy_ops.activity_or_null(activity), now=now)
     return ReconcileResult(row["name"], op_id, row["op_kind"], phase, fail_reason)
 

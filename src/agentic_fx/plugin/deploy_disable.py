@@ -156,7 +156,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             op_id = int(open_row["op_id"])
         else:
             op_id = None
-        if report.unresolvable and not force:
+        if open_row is None and report.unresolvable and not force:
             return DisableOutcome("dependents_blocked", name, dependents=report.unresolvable)
         approved = deploy_ops.approved_row(conn, name, live.content_hash)
         takeover = open_row is not None and bool(open_row["revoke"])

@@ -505,7 +505,7 @@ def test_disable_crash_recovery_completes_a_revoke_request(tmp_path, monkeypatch
     assert conn.execute("SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 1
 
 
-def test_rejected_precheck_leaves_a_syscall_failed_open_op_untouched(tmp_path, monkeypatch):
+def test_a_dependent_added_after_a_failed_unforced_disable_does_not_block_its_retry(tmp_path, monkeypatch):
     conn = db_store.connect(tmp_path / "agentic.db")
     db_store.init_db(conn)
     root = tmp_path / "plugins"
@@ -526,9 +526,10 @@ def test_rejected_precheck_leaves_a_syscall_failed_open_op_untouched(tmp_path, m
                                             now=NOW, settings=SETTINGS)
 
     row = deploy_store.list_by_name(conn, "sma")[0]
-    assert outcome.outcome == "dependents_blocked"
+    assert outcome.outcome == "needs_retry" and outcome.op_id == first.op_id
     assert row["phase"] == "needs_retry" and row["fail_reason"] == "syscall_failed"
     assert row["notify_attempted"] == 1
+    assert len(deploy_store.list_by_name(conn, "sma")) == 1
 
 
 def test_rerun_after_crash_before_notify_recovers_the_notification_once(tmp_path, monkeypatch):

@@ -125,7 +125,8 @@ def test_reconcile_skips_an_already_claimed_terminal_deploy_notification(world, 
     results = deploy_reconcile.reconcile_deploy_ops(
         world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
 
-    assert len(activity.events) == 1
+    left_the_failure = any(result.outcome in ("done", "foreign") for result in results)
+    assert len(activity.events) == (2 if left_the_failure else 1)
     assert all(result.outcome != "notified" for result in results)
 
 
@@ -272,3 +273,70 @@ def test_a_cli_rerun_of_a_failed_operation_notices_the_failure_once(
     assert deploy_store.get_by_id(world.conn, row["op_id"])["notify_attempted"] == 1
     assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_needs_retry"]
     assert op_count(world) == 1
+
+
+def _open_disable(world):
+    _a, _b, c = world.three_generations()
+    return world.intent("sma", op_kind="disable_symlink", from_ver=c)
+
+
+def _open_rollback(world):
+    _a, b, c = world.three_generations()
+    return world.intent("sma", op_kind="rollback_symlink", from_ver=c, to_ver=b)
+
+
+def _open_retire(world):
+    os.rename(world.version("sma", "plain"), world.root / "sma")
+    (world.root / "_retired").mkdir(exist_ok=True)
+    return world.intent("sma", op_kind="retire_plain", retired_path="_retired/sma-1")
+
+
+OPEN_OPS = {"disable": (_open_disable, "unlink"), "rollback": (_open_rollback, "rename"),
+            "retire": (_open_retire, "rename")}
+
+
+def _fail_in_reconcile(monkeypatch, world, syscall, **kwargs):
+    live = world.root / "sma"
+    return fail_syscall(monkeypatch, syscall, path_pred=lambda path: (
+        path == live or path.name.startswith(".sma.link-d")), **kwargs)
+
+
+@pytest.mark.parametrize("kind", OPEN_OPS)
+def test_reconcile_notices_the_completion_of_an_operation_it_had_noticed_failing(
+        world, monkeypatch, kind):
+    open_op, syscall = OPEN_OPS[kind]
+    op_id = open_op(world)
+    _fail_in_reconcile(monkeypatch, world, syscall, times=1)
+    activity = Activity()
+
+    failed = deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+    assert [(r.outcome, r.fail_reason) for r in failed] == [("needs_retry", "syscall_failed")]
+    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_needs_retry"]
+
+    healed = deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert [r.outcome for r in healed] == ["done"] and row["phase"] == "done"
+    assert row["notify_attempted"] == 1
+    assert [event for _, event, _ in activity.events] == [
+        "plugin_deploy_op_needs_retry", deploy_ops.activity_event(row)]
+
+
+@pytest.mark.parametrize("kind", OPEN_OPS)
+def test_reconcile_does_not_repeat_the_failure_notice_while_the_failure_continues(
+        world, monkeypatch, kind):
+    open_op, syscall = OPEN_OPS[kind]
+    op_id = open_op(world)
+    _fail_in_reconcile(monkeypatch, world, syscall)
+    activity = Activity()
+
+    for _ in range(2):
+        deploy_reconcile.reconcile_deploy_ops(
+            world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert (row["phase"], row["fail_reason"], row["notify_attempted"]) == (
+        "needs_retry", "syscall_failed", 1)
+    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_needs_retry"]
