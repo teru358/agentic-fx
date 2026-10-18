@@ -13,3 +13,25 @@ jobs:
           python-version: "3.13"
       - run: uv sync --dev
       - run: uv run pytest -v
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --dev
+      - name: Measure the kernel Landlock ABI
+        id: abi
+        run: |
+          abi=$(uv run python -c "from agentic_fx.core.landlock import landlock_abi; print(landlock_abi())")
+          echo "abi=${abi}" >> "$GITHUB_OUTPUT"
+          if [ "${abi}" -ge 8 ]; then
+            echo "Landlock ABI ${abi}: running the real isolation tests" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice::kernel の Landlock ABI が不足 (測定値 ${abi}、必要 8 以上): 実隔離テストは実行しません"
+            echo "kernel の Landlock ABI が不足 (測定値 ${abi}、必要 8 以上): 実隔離テストは実行していません。release の受入は ABI 8 の実機で手順書どおり行います。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Real isolation tests (a skip fails the job)
+        if: fromJSON(steps.abi.outputs.abi) >= 8
+        run: uv run pytest tests/integration tests/core/test_improve_canary.py -p no:cacheprovider -rs --fail-on-skip
