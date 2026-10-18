@@ -103,6 +103,14 @@ def observe(plugins_root: Path, name: str, *, open_row: Mapping[str, object] | N
         open_op_id=int(open_row["op_id"]) if open_row is not None else None)
 
 
+def with_revoke_decision(conn: sqlite3.Connection, name: str, observed: Expectation) -> Expectation:
+    """``observed`` plus the latest approval decision of its live version (what a revoke acts on)."""
+    if observed.content_hash is None:
+        return observed
+    decision = approvals_store.latest_decision_for_identity(conn, name, observed.content_hash)
+    return replace(observed, decision=(int(decision["id"]), str(decision["status"])) if decision else None)
+
+
 def require_expectation(expect: Expectation | None, observed: Expectation) -> None:
     """Refuse, before any change, when the state differs from what was previewed."""
     if expect is not None and expect != observed:

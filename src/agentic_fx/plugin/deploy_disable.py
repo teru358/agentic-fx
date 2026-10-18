@@ -133,6 +133,8 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         live_path = plugins_root / name
         observed = deploy_ops.observe(plugins_root, name, open_row=open_row,
                                       cascade=report.dependent_names, identity=live)
+        if revoke:
+            observed = deploy_ops.with_revoke_decision(conn, name, observed)
         if not dry_run:
             deploy_ops.require_expectation(expect, observed)
         if open_row is not None and open_row["op_kind"] != "disable_symlink":

@@ -546,6 +546,44 @@ def test_revoke_does_not_run_when_the_latest_decision_changed_after_the_preview(
         "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 1
 
 
+def test_disable_with_revoke_refuses_when_the_live_version_was_blessed_again_after_the_preview(
+        world, monkeypatch, capsys):
+    _a, _b, c = world.three_generations()
+    snapshots: dict = {}
+
+    def bless_again():
+        world.approve("sma", c, minute=40)
+        snapshots["after"] = world.snapshot("sma")
+
+    _change_while_prompting(monkeypatch, bless_again)
+
+    rc, _out, err = _run(capsys, "disable", "sma", "--revoke")
+
+    _assert_refused_as_state_changed(rc, err, world, snapshots["after"])
+    assert _link_target(world) == world.target("sma", c)
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 0
+
+
+def test_rollback_with_revoke_refuses_when_the_live_version_was_blessed_again_after_the_preview(
+        world, monkeypatch, capsys):
+    a, _b, c = world.three_generations()
+    snapshots: dict = {}
+
+    def bless_again():
+        world.approve("sma", c, minute=40)
+        snapshots["after"] = world.snapshot("sma")
+
+    _change_while_prompting(monkeypatch, bless_again)
+
+    rc, _out, err = _run(capsys, "rollback", "sma", "--to", a.name[:12], "--revoke")
+
+    _assert_refused_as_state_changed(rc, err, world, snapshots["after"])
+    assert _link_target(world) == world.target("sma", c)
+    assert world.conn.execute(
+        "SELECT COUNT(*) FROM approval_requests WHERE status='rejected'").fetchone()[0] == 0
+
+
 def test_a_noop_preview_never_reaches_the_real_run_without_yes(world, monkeypatch, capsys):
     _a, _b, c = world.three_generations()
     _run(capsys, "disable", "sma", "--yes")
@@ -798,6 +836,27 @@ def test_versions_on_an_existing_database_leaves_every_file_untouched(world, cap
     assert rc == 0
     assert _tree(world.base) == before
     assert world.db_path.read_bytes() == db_bytes
+
+
+def test_versions_does_not_recreate_a_missing_state_lock_file(world, capsys):
+    _versions_scenario(world)
+    lock = world.base / "data" / "state" / "app_state.json.lock"
+    if lock.exists():
+        lock.unlink()
+    before = _tree_without_wal_shm(world.base / "data")
+
+    rc, _out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    assert not lock.exists()
+    assert _tree_without_wal_shm(world.base / "data") == before
+
+
+def _tree_without_wal_shm(base: Path):
+    """File list under ``base``; the SQLite ``-shm`` / ``-wal`` companions a read-only
+    reader of a WAL database may place next to it are not app state and are excluded."""
+    return [entry for entry in _tree(base)
+            if not entry[0].endswith(("-shm", "-wal"))]
 
 
 def test_versions_opens_the_database_read_only(world, monkeypatch, capsys):

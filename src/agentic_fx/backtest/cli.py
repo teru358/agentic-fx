@@ -815,7 +815,11 @@ def _improve_verify_backend(conn, settings, args: argparse.Namespace,
 
 
 def dispatch(args: argparse.Namespace, root: Path) -> int:
-    ensure_initialized(root)
+    # `plugin versions` は何も書かない読み取り専用の表示なので、state ファイルの
+    # lock を作りうる初期化確認を通さない (DB が無ければ自身で案内して終わる)。
+    read_only_view = args.command == "plugin" and args.plugin_command == "versions"
+    if not read_only_view:
+        ensure_initialized(root)
     # 設定の検証は環境を変えないので、.env はこの CLI の入口で明示的に読む。
     load_env_file(root / ".env")
     settings = load_settings(root / "config" / "settings.yaml")
@@ -825,7 +829,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     # SystemExit (ensure_initialized 由来) は Exception ではないのでここを
     # 経由せず素通りする。DB 接続・初期化も catch 対象に含める (codex I-2)。
     try:
-        if args.command == "plugin" and args.plugin_command == "versions":
+        if read_only_view:
             return plugin_deploy_cli.plugin_versions(settings, args, root)
         conn = connect(root / "data" / "agentic.db")
         init_db(conn)

@@ -416,6 +416,8 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
         observed = deploy_ops.observe(
             plugins_root, name, open_row=open_row, cascade=report.dependent_names,
             identity=live, to_target=target.to_target if isinstance(target, RollbackTarget) else None)
+        if revoke:
+            observed = deploy_ops.with_revoke_decision(conn, name, observed)
         if not dry_run:
             deploy_ops.require_expectation(expect, observed)
         if live is not None and live.kind == "plain":
