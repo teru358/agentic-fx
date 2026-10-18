@@ -240,6 +240,29 @@ def test_a_rollback_whose_target_no_longer_verifies_after_a_crash_closes_as_veri
         "SELECT status FROM signals WHERE id=?", (scene.signals[0],)).fetchone()[0] == "abandoned"
 
 
+def test_a_cli_rerun_that_removes_the_live_source_after_a_failed_verification_says_so(
+        world, monkeypatch, scene):
+    _crash_with_open_intent(world, monkeypatch, scene)
+    _tamper(scene.b)
+
+    result = scene.run()
+
+    assert result.outcome == "verify_failed" and result.live_removed is True
+    assert not os.path.lexists(_live(world))
+
+
+def test_a_cli_rerun_from_an_absent_live_that_fails_verification_removed_nothing(
+        world, monkeypatch):
+    scene = _absent_live_scene(world)
+    crash_after_intent_commit(monkeypatch)
+    crashed(world, scene.run)
+    _tamper(scene.b)
+
+    result = scene.run()
+
+    assert result.outcome == "verify_failed" and result.live_removed is False
+
+
 def test_a_failed_verification_without_an_open_operation_is_refused_and_records_nothing(
         world, scene):
     _tamper(scene.b)
@@ -547,7 +570,7 @@ def test_closing_a_failed_verification_leaves_a_live_that_is_not_the_source_alon
     open_row = deploy_store.get_open_by_name(world.conn, "sma")
     failure = deploy_rollback.VerificationFailure(("target no longer verifies",))
 
-    outcome = deploy_rollback._close_failed_verification(
+    outcome = deploy_rollback.close_failed_verification(
         world.conn, world.root, open_row, op_id, failure, None, now=NOW)
 
     assert outcome.outcome == "foreign" and outcome.op_id == op_id
@@ -793,7 +816,7 @@ def test_a_persistent_source_unlink_failure_after_a_failed_verification_stays_sy
 
     row = deploy_store.get_by_id(world.conn, op_id)
     assert row["notify_attempted"] == 1
-    assert [e for _, e, _ in activity.events] == needs_retry * (failures + (how == "cli"))
+    assert [e for _, e, _ in activity.events] == needs_retry * (failures + 1)
     assert _op_signal_links(world) == links
     assert _signal_statuses(world) == statuses
     assert (row["phase"], row["fail_reason"]) == ("needs_retry", "verify_failed")

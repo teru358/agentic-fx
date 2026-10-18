@@ -54,6 +54,30 @@ def test_rerun_after_rollback_notification_crash_recovers_the_notification_once(
     assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
 
 
+def test_already_live_does_not_announce_an_older_rollback_to_the_same_target(world, monkeypatch):
+    a, b, _c = world.three_generations()
+    real_notify = deploy_rollback.deploy_ops.try_notify
+    monkeypatch.setattr(
+        deploy_rollback.deploy_ops, "try_notify",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError, match="crash"):
+        _rollback(world, to=b.name)
+    monkeypatch.setattr(deploy_rollback.deploy_ops, "try_notify", real_notify)
+    stale = deploy_store.list_by_name(world.conn, "sma")[-1]
+    assert stale["notify_attempted"] == 0
+    _rollback(world, to=a.name)
+    world.link("sma", b)
+    activity = Activity()
+
+    rerun = _rollback(world, to=b.name, activity=activity)
+
+    assert rerun.outcome == "refused" and rerun.refusal_code == "already_live"
+    assert rerun.notified_op_ids == ()
+    assert activity.events == []
+    assert deploy_store.get_by_id(world.conn, stale["op_id"])["notify_attempted"] == 0
+
+
 # ---- target decision (AC-7, AC-8) ----
 
 def test_default_target_is_the_previous_version_after_an_approval(world):

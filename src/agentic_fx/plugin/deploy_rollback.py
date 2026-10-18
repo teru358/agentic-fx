@@ -65,6 +65,7 @@ class RollbackOutcome:
     to_target: str | None = None
     op_id: int | None = None
     notified_op_ids: tuple[int, ...] = ()
+    live_removed: bool = False
 
 
 def _version_target(name: str, artifact_hash: str) -> str:
@@ -263,8 +264,8 @@ def swap_to_target(plugins_root: Path, name: str, op_id: int, to_target: str) ->
 
 def _finish(conn: sqlite3.Connection, op_id: int, phase: str, activity, *, now: datetime,
             fail_reason: str | None = None) -> None:
-    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason)
-    deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), deploy_ops.activity_or_null(activity), now=now)
+    deploy_ops.settle_op(conn, deploy_store.get_by_id(conn, op_id), phase, activity,
+                         now=now, fail_reason=fail_reason)
 
 
 def _success(name: str, op_id: int, to_target: str, cascade: set[str]) -> RollbackOutcome:
@@ -292,16 +293,18 @@ def _match_identity(open_row, live, lost_source: bool):
     return live
 
 
-def _close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open_row,
-                               op_id: int, failure: VerificationFailure, activity, *,
-                               now: datetime) -> RollbackOutcome:
-    """Close an inherited op whose target no longer verifies, as the startup pass would."""
+def close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open_row,
+                              op_id: int, failure: VerificationFailure, activity, *,
+                              now: datetime) -> RollbackOutcome:
+    """Close an open op whose target no longer verifies (shared by a rerun and the startup pass)."""
     name = open_row["name"]
     live_path = plugins_root / name
+    live_removed = False
     if (open_row["from_kind"] == "symlink"
             and deploy_ops.live_matches_from(live_path, open_row["from_target"])):
         try:
             os.unlink(live_path)
+            live_removed = True
         except FileNotFoundError:
             pass
         except OSError:
@@ -312,7 +315,8 @@ def _close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, ope
         return RollbackOutcome("foreign", name, op_id=op_id)
     _finish(conn, op_id, "needs_retry", activity, now=now, fail_reason="verify_failed")
     return RollbackOutcome("verify_failed", name, reasons=failure.reasons,
-                           refusal_code="target_verification_failed", op_id=op_id)
+                           refusal_code="target_verification_failed", op_id=op_id,
+                           live_removed=live_removed)
 
 
 def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, to: str | None,
@@ -379,12 +383,16 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             notified = ()
             if (not dry_run and raw_target is not None
                     and target.code in {"already_live", "target_required"}):
-                notified = deploy_ops.recover_notifications(
-                    conn, name, deploy_ops.activity_or_null(activity), now=now,
-                    include=lambda row: (
-                        row["op_kind"] == "rollback_symlink"
-                        and row["to_target"] == raw_target),
-                )
+                latest_closed = max(
+                    (row for row in deploy_store.list_by_name(conn, name)
+                     if deploy_store.is_closed(row)),
+                    key=lambda row: int(row["op_id"]), default=None)
+                if (latest_closed is not None
+                        and latest_closed["op_kind"] == "rollback_symlink"
+                        and latest_closed["to_target"] == raw_target):
+                    notified = deploy_ops.recover_notifications(
+                        conn, name, deploy_ops.activity_or_null(activity), now=now,
+                        include=lambda row: row["op_id"] == latest_closed["op_id"])
             return RollbackOutcome("refused", name, reasons=(target.reason,),
                                    refusal_code=target.code, notified_op_ids=notified)
         lost_source = (open_row is not None and live is None
@@ -411,7 +419,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                     open_row, _requested_signature(name, open_row, live, target.to_target,
                                                    revoke, force, lost_source),
                     _match_identity(open_row, live, lost_source), conn=conn, now=now)
-                return _close_failed_verification(
+                return close_failed_verification(
                     conn, plugins_root, open_row, op_id, verified, activity, now=now)
             if verified.dependents is not None and verified.dependents.unresolvable:
                 return RollbackOutcome("dependents_blocked", name,

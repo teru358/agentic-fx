@@ -176,6 +176,20 @@ def test_a_failed_verification_unlinks_the_source_and_closes_as_verify_failed(wo
     assert history[-1]["kind"] == "rollback_symlink" and history[-1]["to"] == "absent"
 
 
+def test_a_recorded_target_that_differs_from_the_verified_version_closes_as_verify_failed(world):
+    a, b, c = world.three_generations()
+    op = world.intent("sma", from_ver=c, to_ver=b)
+    world.conn.execute(
+        "UPDATE plugin_deploy_ops SET to_target=? WHERE op_id=?", (f".versions/sma/{a.name}", op))
+    world.conn.commit()
+
+    results = _reconcile(world)
+
+    assert not os.path.lexists(world.root / "sma")
+    assert _state(world, op) == ("needs_retry", "verify_failed")
+    assert [r.outcome for r in results] == ["needs_retry"]
+
+
 def test_source_unlink_failure_after_failed_verification_stays_open(world, monkeypatch):
     a, b, c = world.three_generations()
     op = world.intent("sma", from_ver=c, to_ver=b)

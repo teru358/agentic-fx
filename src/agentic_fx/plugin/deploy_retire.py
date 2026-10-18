@@ -34,17 +34,6 @@ def _retired_path(name: str, now: datetime, op_id: int) -> str:
     return f"_retired/{name}-{now.strftime('%Y%m%dT%H%M%SZ')}-{op_id}"
 
 
-def _recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime
-                           ) -> tuple[int, ...]:
-    notified: list[int] = []
-    for row in reversed(deploy_store.list_by_name(conn, name)):
-        if row["notify_attempted"] or deploy_ops.activity_event(row) is None:
-            continue
-        if deploy_ops.try_notify(conn, row, activity, now=now):
-            notified.append(int(row["op_id"]))
-    return tuple(notified)
-
-
 def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, force: bool,
                   now: datetime, actor: str = "human_cli", settings, activity=None,
                   deadline: float | None = None, stop_event=None,
@@ -95,6 +84,15 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 raise deploy_ops.SignatureMismatchError(
                     f"open deploy op op_id={open_row['op_id']} was recorded with "
                     f"force={bool(open_row['force'])}, requested force={force}")
+            recorded_hash = open_row["subject_content_hash"]
+            if (live_plain and os.path.lexists(retired) and recorded_hash is not None
+                    and live_identity is not None
+                    and live_identity.content_hash == recorded_hash):
+                return RetireOutcome(
+                    "refused", name, op_id, retired_path,
+                    reason=(f"open retire op_id={op_id} cannot use existing "
+                            f"destination {retired_path}"),
+                )
             if dry_run:
                 return RetireOutcome("dry_run", name, op_id, retired_path,
                                      cascade_strategies=tuple(sorted(report.dependent_names)),
@@ -109,15 +107,6 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 row = deploy_store.get_by_id(conn, op_id)
                 deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
-            recorded_hash = open_row["subject_content_hash"]
-            if (os.path.lexists(retired) and recorded_hash is not None
-                    and live_identity is not None
-                    and live_identity.content_hash == recorded_hash):
-                return RetireOutcome(
-                    "refused", name, op_id, retired_path,
-                    reason=(f"open retire op_id={op_id} cannot use existing "
-                            f"destination {retired_path}"),
-                )
             requested = deploy_ops.Signature(
                 "retire_plain", name, recorded_hash, None, None, False, force)
             op_id = deploy_ops.match_or_reject(
@@ -129,7 +118,7 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 if os.path.lexists(live_path):
                     raise ValueError(f"plugins/{name} is not a plain directory "
                                      "(retire only applies to legacy plain live)")
-                notified = (() if dry_run else _recover_notifications(
+                notified = (() if dry_run else deploy_ops.recover_notifications(
                     conn, name, deploy_ops.activity_or_null(activity), now=now))
                 return RetireOutcome("already_retired", name, notified_op_ids=notified)
             if report.unresolvable and not force:

@@ -275,6 +275,22 @@ def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity,
     return True
 
 
+def settle_op(conn: sqlite3.Connection, op_row: Mapping[str, object], phase: str, activity, *,
+              now: datetime, fail_reason: str | None = None) -> None:
+    """Move an op to ``phase`` and attempt its notification.
+
+    Leaving the ``needs_retry`` / ``syscall_failed`` state for any other state is a
+    new verdict, so its notification is owed again.
+    """
+    leaves_syscall_failure = (
+        op_row["phase"] == "needs_retry" and op_row["fail_reason"] == "syscall_failed"
+        and not (phase == "needs_retry" and fail_reason == "syscall_failed"))
+    op_id = int(op_row["op_id"])
+    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason,
+                           notify_attempted=False if leaves_syscall_failure else None)
+    try_notify(conn, deploy_store.get_by_id(conn, op_id), activity_or_null(activity), now=now)
+
+
 def recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime,
                           include: Callable[[Mapping[str, object]], bool] | None = None
                           ) -> tuple[int, ...]:

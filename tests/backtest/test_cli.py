@@ -2072,6 +2072,23 @@ def test_plugin_retire_needs_retry_is_rc1_with_fail_reason(
     assert "needs_retry" in err and "syscall_failed" in err and "_retired/sma-x-1" in err
 
 
+def test_plugin_retire_refused_prints_the_reason_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    from agentic_fx.plugin import deploy_retire as _retire
+
+    _retire_plain_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        _retire, "retire_plugin",
+        lambda *a, **k: _retire.RetireOutcome(
+            "refused", "sma", reason="cannot use existing destination _retired/sma-x-1"))
+
+    rc = main(["plugin", "retire", "sma"])
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "refused" in err and "cannot use existing destination _retired/sma-x-1" in err
+
+
 def test_plugin_retire_dry_run_is_rc0_and_does_not_claim_retired(
         tmp_path, monkeypatch, capsys):
     from agentic_fx.plugin import deploy_retire as _retire

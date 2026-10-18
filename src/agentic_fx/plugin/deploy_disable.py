@@ -40,21 +40,6 @@ class RevokeOutcome:
     notified_op_ids: tuple[int, ...] = ()
 
 
-def _recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime,
-                           revoke_hash: str | None = None) -> tuple[int, ...]:
-    """Attempt the notification of finished ops whose first attempt never happened."""
-    notified: list[int] = []
-    for row in reversed(deploy_store.list_by_name(conn, name)):
-        if row["notify_attempted"] or deploy_ops.activity_event(row) is None:
-            continue
-        if revoke_hash is not None and (
-                row["op_kind"] != "revoke" or row["subject_content_hash"] != revoke_hash):
-            continue
-        if deploy_ops.try_notify(conn, row, activity, now=now):
-            notified.append(int(row["op_id"]))
-    return tuple(notified)
-
-
 class _RevokeActivity:
     def __init__(self, activity, content_hash: str) -> None:
         self._activity = deploy_ops.activity_or_null(activity)
@@ -135,7 +120,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                                   tuple(sorted(report.dependent_names)), op_id=op_id)
         if live is None:
-            notified = (() if dry_run else _recover_notifications(
+            notified = (() if dry_run else deploy_ops.recover_notifications(
                 conn, name, deploy_ops.activity_or_null(activity), now=now))
             if revoke:
                 return DisableOutcome("revoke_requires_version", name,
@@ -222,9 +207,10 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
                 conn, name, content_hash, now=now, actor=actor, commit=False)
             if revoke_row_id is None:
                 conn.rollback()
-                notified = _recover_notifications(
+                notified = deploy_ops.recover_notifications(
                     conn, name, _RevokeActivity(activity, content_hash), now=now,
-                    revoke_hash=content_hash)
+                    include=lambda row: (row["op_kind"] == "revoke"
+                                         and row["subject_content_hash"] == content_hash))
                 return RevokeOutcome("already_revoked", name, content_hash,
                                      notified_op_ids=notified)
             payload = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?", (revoke_row_id,)).fetchone()
