@@ -1,7 +1,7 @@
 ---
 id: deployed-plugin-has-no-disable-or-rollback
 title: 配備済み plugin を止める・前の版に戻す操作が無い
-status: 実装待ち
+status: 実装中
 priority: 高
 opened: 2026-10-04
 closed: null
@@ -9,7 +9,7 @@ related: [retire-symlink-deployed-plugin]
 ---
 # [deployed-plugin-has-no-disable-or-rollback] 配備済み plugin を止める・前の版に戻す操作が無い
 
-**状態**: 実装待ち / **優先**: 高
+**状態**: 実装中 / **優先**: 高
 
 ## 現象
 
@@ -35,3 +35,4 @@ related: [retire-symlink-deployed-plugin]
 - 2026-10-17: T2 (共通手順 + CLI 引き継ぎ部品、approve / bless / retry / retire 入口の open op 拒否) を main に merge (`05ef241`)。codex r1 High 1 / M 2 / L 1 → /code-review 10 件 (採用 5、却下 5 は spec §2.2 / §2.1 / §6.4 と `_plugin_lock` の sink で理由付き) → codex r3 Medium 1 (setup の分類到達性) → 是正 3 本。判定 plugin / store / tools / setup / backtest 3410、loops / core 2851 緑。次は T3 (disable + revoke) と T6 (遅延化 + conn_signal + OPEN lock) を並行。
 - 2026-10-17: T3 (disable + 依存列挙 + --force cascade + revoke_version、store に insert_done_revoke / get_by_id / latest_decision_for_identity) を main に merge (`2a51c74`)。codex 実装 (test 追補は上限直前) → /code-review 10 件 (採用 8、却下 #4 = IV-16) → codex r2 High 1 / M 2 (採用 2) → codex r3 閉鎖可。判定 plugin / store / tools 2378、loops / core / setup / backtest 3916 緑。ローカル LLM 3 本は走行中 (結果は後追い)。
 - 2026-10-18: T4a (rollback: 戻り先決定 + IV-8 検証 1〜5 + temp symlink / atomic swap、reconcile: disable / rollback / retire_plain の各行 + 通知回収 + 両方非終端 conflict) を main に merge。/code-review 10 件 (採用 9、却下 #4 = artifact_hash は content_hash の上位集合) → 是正 → codex r2 High 1 (is_symlink 後 readlink 前の live 消失で FNF 漏れ) → 是正 + 変異確認で閉鎖。判定 plugin / store / tools 2471 緑。申し送り: T4b fault seam 一覧・T5 `_retired/` 前提・T6 reconcile 配線順と settings 値・T7 refusal_code 9 種 (`tmp/review-20261016-pdo/t4a-r2-out.md`)。
+- 2026-10-18: 状態: 実装中 — T6 (scheduler 遅延化 + 専用接続 conn_signal + producer の lock 内再検証 + OPEN の source lock / 2 述語の鮮度 + lock 順序計装 + 起動時 deploy reconcile の配線 + settings v3 の worker.plugin_lock_timeout_sec / reconcile_lock_timeout_sec) を main に merge (0724a46)。codex 実装 3 回 → r1 High 2 / M 3 / L 1 → /code-review 9 件 (採用 8 + #9 部分) → codex r3 閉鎖 (実装) → 配線 + AC-34 / 22 (codex) → AC-19 / 20 / 21 の競合 test 10 本 (sonnet、実装欠陥 0) → /code-review 8 件 (採用 6、却下 2 = ActivityLog.write は非送出契約 / v3 は本 branch 導入) → codex r5 閉鎖可 → ローカル LLM 3 本 (21 走、実装欠陥 0、変異生存 8 → pin 8 本)。判定 plugin / store / tools / backtest 2944、core / service_app / setup 2788、loops 931 緑。申し送り: T4b (deadline 超過 op の次回収束、producer の fault seam)、T7 (versions で open のまま残る op の表示、signal_max_id 契約)、T8 (reconcile_lock_timeout_sec = 起動 1 回全体の予算、schema v3、latest_decision_status)。本番 settings は v2 のまま (afx init 再実行で v3 へ、既定値で動作に支障なし)

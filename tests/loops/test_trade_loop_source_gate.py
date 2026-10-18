@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from agentic_fx.core.contracts import FixedClock
@@ -324,3 +324,104 @@ def test_early_rejection_wins_over_stale_signal_and_inactive_source(
     }
     assert conn.execute(
         "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0] != "abandoned"
+
+
+def test_source_name_lock_is_held_until_open_from_snapshot_returns(
+        tmp_path, monkeypatch):
+    """lock が解放された後に発注すると、deploy 操作と OPEN が交錯する。"""
+    from tests.plugin._conc_support import lock_is_free
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
+    _add(conn)
+    loop._plugins_root = tmp_path / "plugins"
+    monkeypatch.setattr(
+        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
+    real = loop.executor.open_from_snapshot
+    seen = []
+
+    def spy(*args, **kwargs):
+        seen.append(lock_is_free(loop._plugins_root, "strategy"))
+        return real(*args, **kwargs)
+
+    loop.executor.open_from_snapshot = spy
+    loop.run_once("signal")
+
+    assert seen == [False]
+    assert lock_is_free(loop._plugins_root, "strategy") is True
+
+
+def _fresh_until():
+    _, fresh_until = signals.freshness_window(
+        "1h", NOW.isoformat(), SETTINGS.plugin.signal_freshness_bars)
+    return datetime.fromisoformat(fresh_until)
+
+
+def _run_with_clock_at(tmp_path, monkeypatch, moment):
+    conn, loop, _, _ = _loop(tmp_path, [])
+    sid = _add(conn)
+    monkeypatch.setattr(
+        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
+
+    class AdvancingRunner:
+        def run(self, _mission):
+            loop.clock = FixedClock(moment)
+            loop.executor.clock = FixedClock(moment)
+            return MissionResult("completed", OPEN, [])
+
+    loop.runner = AdvancingRunner()
+    out = loop.run_once("signal")
+    status = conn.execute(
+        "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()[0]
+    return out, status
+
+
+def test_signal_is_still_fresh_exactly_at_fresh_until(tmp_path, monkeypatch):
+    out, status = _run_with_clock_at(tmp_path, monkeypatch, _fresh_until())
+
+    assert "signal stale" not in out["reasons"]
+    assert status != "abandoned"
+
+
+def test_signal_is_stale_one_microsecond_after_fresh_until(tmp_path, monkeypatch):
+    out, status = _run_with_clock_at(
+        tmp_path, monkeypatch, _fresh_until() + timedelta(microseconds=1))
+
+    assert out["reasons"] == ["signal stale"]
+    assert status == "abandoned"
+
+
+def test_signal_and_snapshot_staleness_share_one_clock_reading(
+        tmp_path, monkeypatch):
+    """gate の 2 述語は同じ now で評価する (clock が進んでも食い違わない)。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", OPEN, [])])
+    _add(conn)
+    monkeypatch.setattr(
+        "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: True)
+    readings = []
+
+    class TickingClock:
+        def now(self):
+            value = NOW + timedelta(microseconds=len(readings) + 1)
+            readings.append(value)
+            return value
+
+    loop.clock = TickingClock()
+    at_signal_check = []
+    real_window = signals.freshness_window
+
+    def window(*args, **kwargs):
+        at_signal_check.append(readings[-1])
+        return real_window(*args, **kwargs)
+
+    monkeypatch.setattr(signals, "freshness_window", window)
+    snapshot_nows = []
+
+    def spy(snapshot, now, max_age):
+        snapshot_nows.append((now, at_signal_check[-1]))
+        return snapshot_age_exceeded(snapshot, now, max_age)
+
+    monkeypatch.setattr("agentic_fx.loops.trade_loop.snapshot_age_exceeded", spy)
+    loop.run_once("signal")
+
+    assert len(snapshot_nows) == 1
+    snapshot_now, signal_now = snapshot_nows[0]
+    assert snapshot_now == signal_now

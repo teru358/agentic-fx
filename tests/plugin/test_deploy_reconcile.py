@@ -540,6 +540,30 @@ def test_a_name_lock_held_elsewhere_skips_only_that_op(world):
     assert [r.outcome for r in again] == ["done"] and _state(world, busy) == ("done", None)
 
 
+def test_an_unexpected_error_in_one_op_does_not_stop_the_next(world, monkeypatch):
+    a, b, c = world.three_generations()
+    x = world.version("other", "x")
+    world.deploy("other", x, None, 6)
+    x2 = world.version("other", "x2")
+    world.deploy("other", x2, x, 7)
+    broken = world.intent("other", from_ver=x2, to_ver=x)
+    healthy = world.intent("sma", from_ver=c, to_ver=b)
+    real = deploy_reconcile._reconcile_one
+
+    def flaky(conn, root, row, **kwargs):
+        if row["name"] == "other":
+            raise RuntimeError("injected")
+        return real(conn, root, row, **kwargs)
+
+    monkeypatch.setattr(deploy_reconcile, "_reconcile_one", flaky)
+    results = _reconcile(world)
+
+    assert [(r.name, r.outcome) for r in results] == [
+        ("other", "error"), ("sma", "done")]
+    assert _state(world, broken) == ("intent", None)
+    assert _state(world, healthy) == ("done", None)
+
+
 def test_the_lock_wait_budget_is_one_deadline_shared_by_every_op(world, monkeypatch):
     a, b, c = world.three_generations()
     x = world.version("other", "x")

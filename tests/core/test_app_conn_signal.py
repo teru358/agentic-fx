@@ -140,6 +140,31 @@ def test_nonready_state_still_repairs_signal_connection_without_maintenance(
         app.close()
 
 
+@pytest.mark.parametrize("state,expected_calls", [
+    ("ready", 1), ("degraded", 0), ("halted", 0)])
+def test_maintenance_runs_only_when_ready_after_a_successful_repair(
+        tmp_path, monkeypatch, state, expected_calls):
+    """Repair succeeds in every state; only ready proceeds to evaluate plugins."""
+    app = _app(tmp_path)
+    app.conn_signal = None
+    replacement = MagicMock(in_transaction=False)
+    received = []
+    try:
+        monkeypatch.setattr("agentic_fx.service.connect", lambda _p: replacement)
+        monkeypatch.setattr("agentic_fx.service._run_signal_maintenance",
+                            lambda **kw: received.append(kw["conn"]))
+        app.scheduler.state_fn = lambda: state
+
+        app.scheduler.on_signal_maintenance(NOW)
+
+        assert app.conn_signal is replacement
+        assert app.signal_connection_failures == 0
+        assert received == [replacement] * expected_calls
+    finally:
+        app.conn_signal = None
+        app.close()
+
+
 def test_successful_reconnect_resets_failure_counter(tmp_path, monkeypatch):
     app = _app(tmp_path)
     app.conn_signal = None
