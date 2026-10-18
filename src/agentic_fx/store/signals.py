@@ -385,16 +385,11 @@ def recent(conn: sqlite3.Connection, pair: str, *, since: datetime,
     return [dict(r) for r in rows]
 
 
-def abandon_pending_for_identities(
-        conn: sqlite3.Connection, identities: list[tuple[str, str]], *, op_id: int,
-        now: datetime, commit: bool = True) -> None:
-    if not identities:
-        return
-    predicates = " OR ".join("(plugin=? AND content_hash=?)" for _ in identities)
-    params = tuple(value for identity in identities for value in identity)
+def _abandon_pending_where(conn: sqlite3.Connection, predicate: str, params: tuple,
+                           *, op_id: int, commit: bool) -> None:
     rows = conn.execute(
         "SELECT id, status FROM signals WHERE status IN ('pending','claimed') "
-        f"AND ({predicates})", params).fetchall()
+        f"AND ({predicate})", params).fetchall()
     conn.executemany(
         "INSERT OR IGNORE INTO plugin_deploy_op_signals "
         "(op_id,signal_id,status_at_link) VALUES (?,?,?)",
@@ -402,6 +397,21 @@ def abandon_pending_for_identities(
     )
     conn.execute(
         "UPDATE signals SET status='abandoned' WHERE status='pending' "
-        f"AND ({predicates})", params)
+        f"AND ({predicate})", params)
     if commit:
         conn.commit()
+
+
+def abandon_pending_for_identities(
+        conn: sqlite3.Connection, identities: list[tuple[str, str]], *, op_id: int,
+        now: datetime, commit: bool = True) -> None:
+    if not identities:
+        return
+    predicate = " OR ".join("(plugin=? AND content_hash=?)" for _ in identities)
+    params = tuple(value for identity in identities for value in identity)
+    _abandon_pending_where(conn, predicate, params, op_id=op_id, commit=commit)
+
+
+def abandon_pending_for_name(conn: sqlite3.Connection, name: str, *, op_id: int,
+                             commit: bool = True) -> None:
+    _abandon_pending_where(conn, "plugin=?", (name,), op_id=op_id, commit=commit)

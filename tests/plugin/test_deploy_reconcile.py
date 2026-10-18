@@ -57,7 +57,7 @@ def test_disable_with_live_at_from_unlinks_and_completes(world):
     assert not os.path.lexists(world.root / "sma") and c.is_dir()
     assert _state(world, op) == ("done", None) and _row(world, op)["notify_attempted"] == 1
     assert [r.outcome for r in results] == ["done"]
-    assert [e for _, e, _ in activity.events] == ["plugin_deploy_op_done"]
+    assert [e for _, e, _ in activity.events] == ["plugin_disabled"]
 
 
 def test_disable_unlink_failure_stays_open_without_touching_live(world, monkeypatch):
@@ -100,6 +100,24 @@ def test_disable_with_a_foreign_live_is_closed_without_touching_it(world, kind):
 
     assert world.snapshot("sma")[0] == before
     assert _state(world, op) == ("foreign", None) and not deploy_store.is_open(_row(world, op))
+
+
+def test_reconcile_retire_closes_replaced_plain_identity_as_foreign_without_renaming(world):
+    original = world.version("sma", "original")
+    replacement = world.version("sma", "replacement")
+    original_content = world.content(original)
+    os.rename(original, world.root / "sma")
+    op = world.intent(
+        "sma", op_kind="retire_plain", retired_path="_retired/sma-crash-1",
+        subject_content_hash=original_content)
+    os.rename(world.root / "sma", world.root / "old-sma")
+    os.rename(replacement, world.root / "sma")
+
+    results = _reconcile(world)
+
+    assert results[0].outcome == "foreign" and _state(world, op) == ("foreign", None)
+    assert (world.root / "sma").is_dir()
+    assert not (world.root / "_retired" / "sma-crash-1").exists()
 
 
 # ---- 6.2 rollback_symlink ----
@@ -436,7 +454,7 @@ def test_a_finished_op_whose_notification_was_never_attempted_is_notified_once(w
     assert sorted(r.op_id for r in first) == [missed, failed]
     assert all(r.outcome == "notified" for r in first) and second == []
     assert [e for _, e, _ in activity.events] == [
-        "plugin_deploy_op_done", "plugin_deploy_op_needs_retry"]
+        "plugin_disabled", "plugin_deploy_op_needs_retry"]
     assert _row(world, missed)["notify_attempted"] == 1
     assert _row(world, done)["notify_attempted"] == 1
 

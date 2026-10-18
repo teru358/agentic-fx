@@ -238,6 +238,34 @@ def test_record_intent_rolls_back_every_table_when_signal_linking_fails(conn, mo
     assert conn.execute("SELECT status FROM signals").fetchone()[0] == "pending"
 
 
+def test_record_intent_rolls_back_when_after_insert_fails(conn):
+    """A destination-update failure leaves neither intent nor signal effects."""
+    signal_id = signals_store.add(
+        conn, plugin="sma", content_hash="content-a", pair="USDJPY",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
+        payload={"direction": "long"}, now=NOW)
+
+    def fail_after_insert(op_id):
+        raise RuntimeError(f"destination failed for {op_id}")
+
+    with pytest.raises(RuntimeError, match="destination failed"):
+        deploy_ops.record_intent(
+            conn,
+            intent_row={
+                "op_kind": "retire_plain", "name": "sma", "from_kind": "plain",
+                "to_kind": "retired", "from_target": None, "to_target": None,
+                "retired_path": "_retired/.pending", "subject_content_hash": "content-a",
+                "subject_artifact_hash": None, "target_content_hash": None,
+                "target_artifact_hash": None, "approval_id": None, "force": False,
+            },
+            revoke=None, cascade_identities=[("sma", "content-a")], now=NOW,
+            actor="human_cli", after_insert=fail_after_insert)
+
+    assert conn.execute("SELECT COUNT(*) FROM plugin_deploy_ops").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM plugin_deploy_op_signals").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()[0] == "pending"
+
+
 def test_record_intent_with_revoke_rolls_back_every_row_when_signal_linking_fails(
         conn, monkeypatch):
     """A revoking intent leaves no rejected row, op row, link, or signal change."""

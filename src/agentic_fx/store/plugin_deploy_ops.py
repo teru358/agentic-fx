@@ -78,6 +78,17 @@ def insert_done_revoke(
     return int(cur.lastrowid)
 
 
+def set_retired_path(conn: sqlite3.Connection, op_id: int, retired_path: str, *,
+                     commit: bool = True) -> bool:
+    cur = conn.execute(
+        "UPDATE plugin_deploy_ops SET retired_path=? WHERE op_id=?",
+        (retired_path, op_id),
+    )
+    if commit:
+        conn.commit()
+    return cur.rowcount == 1
+
+
 def set_phase(conn: sqlite3.Connection, op_id: int, phase: str, *, now: datetime,
               fail_reason: str | None = None, notify_attempted: bool | None = None,
               commit: bool = True) -> bool:

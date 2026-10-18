@@ -32,6 +32,8 @@ from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import load_env_file, load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
+from agentic_fx.plugin import deploy_ops
+from agentic_fx.plugin import deploy_retire
 from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin import sandbox as plugin_sandbox
@@ -44,6 +46,7 @@ from agentic_fx.plugin.resolve import (
 )
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
+from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
@@ -153,6 +156,8 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
         "retire", help="legacy plain live plugin を plugins/_retired/ へ退避する"
                        " (flock、未完ジャーナルは拒否)")
     retire_parser.add_argument("name")
+    retire_parser.add_argument("--force", action="store_true")
+    retire_parser.add_argument("--dry-run", action="store_true")
 
     improve = sub.add_parser("improve", help="改善ループ操作 (CLI 専用)")
     improve_sub = improve.add_subparsers(dest="improve_command", required=True)
@@ -679,10 +684,12 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     plugins_dir = root / "plugins"
     activity = ActivityLog(root / "logs" / "activity.log")
     try:
-        plugin_switch.retire_plugin(
-            conn, plugins_dir, args.name, now=datetime.now(timezone.utc),
-            activity=activity)
-    except plugin_switch.OpenDeployOpError as e:
+        outcome = deploy_retire.retire_plugin(
+            conn, plugins_dir, args.name, force=getattr(args, "force", False),
+            now=datetime.now(timezone.utc), settings=settings, activity=activity,
+            dry_run=getattr(args, "dry_run", False))
+    except (deploy_ops.DeployOpBlockedError,
+            plugin_switch.OpenDeployOpError) as e:
         print(f"エラー: {e}\n{_OPEN_DEPLOY_OP_RECOVERY_HINT}", file=sys.stderr)
         return 1
     except plugin_switch.UnresolvedJournalError as e:
@@ -695,8 +702,34 @@ def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
     except (ValueError, OSError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-    print(f"plugin {args.name!r} を retire しました")
-    return 0
+    return _report_retire_outcome(conn, args.name, outcome)
+
+
+def _report_retire_outcome(conn, name: str, outcome) -> int:
+    kind = outcome.outcome
+    if kind == "dry_run":
+        cascade = ", ".join(outcome.cascade_strategies) or "なし"
+        print(f"dry-run: plugin {name!r} を退避する予定 (cascade: {cascade})")
+        return 0
+    if kind in ("done", "already_retired", "disabled", "already_disabled"):
+        print(f"plugin {name!r} を retire しました ({kind})")
+        return 0
+    detail = [f"plugin {name!r} の retire は完了していません ({kind})"]
+    if kind == "dependents_blocked":
+        detail.append("依存する plugin: " + ", ".join(
+            f"{dep[0]} ({dep[2]})" for dep in outcome.dependents)
+            + " (--force で続行できます)")
+    retired_path = getattr(outcome, "retired_path", None)
+    if retired_path:
+        detail.append(f"退避先: {retired_path}")
+    op_id = getattr(outcome, "op_id", None)
+    if op_id is not None:
+        detail.append(f"op_id={op_id}")
+        row = deploy_store.get_by_id(conn, op_id) if conn is not None else None
+        if row is not None and row["fail_reason"]:
+            detail.append(f"fail_reason={row['fail_reason']}")
+    print("エラー: " + " / ".join(detail), file=sys.stderr)
+    return 1
 
 
 _LOCK_NO_FROM_ERROR = (
