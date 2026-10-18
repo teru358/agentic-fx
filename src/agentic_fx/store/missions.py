@@ -145,11 +145,13 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
         if running_ids:
             placeholders = ",".join("?" * len(running_ids))
             claimed_rows = conn.execute(
-                "SELECT id, requeue_count FROM signals WHERE status='claimed' "
+                "SELECT id, requeue_count, EXISTS (SELECT 1 FROM plugin_deploy_op_signals "
+                "AS deploy_links WHERE deploy_links.signal_id=signals.id) AS deploy_linked "
+                "FROM signals WHERE status='claimed' "
                 f"AND claimed_by_mission_id IN ({placeholders})",
                 running_ids).fetchall()
             for row in claimed_rows:
-                if row["requeue_count"] >= max_requeue:
+                if row["requeue_count"] >= max_requeue or row["deploy_linked"]:
                     conn.execute(
                         "UPDATE signals SET status='abandoned', "
                         "claimed_by_mission_id=NULL, claimed_at=NULL "

@@ -447,13 +447,11 @@ def test_a_rerun_that_drops_an_original_revoke_is_rejected(world, monkeypatch):
 def test_a_refused_precheck_does_not_touch_an_open_op(world, monkeypatch):
     a, b, c = world.three_generations()
     op = _failed_open_op(world, monkeypatch)
-    plugin = b / "plugin.py"
-    plugin.write_text(plugin.read_text() + " ")
     before = world.snapshot("sma")
 
-    outcome = _rollback(world)
+    outcome = _rollback(world, to="ffff")
 
-    assert outcome.outcome == "refused"
+    assert outcome.outcome == "refused" and outcome.refusal_code == "target_not_found"
     assert world.snapshot("sma") == before
     reread = deploy_store.get_by_id(world.conn, op["op_id"])
     assert (reread["phase"], reread["fail_reason"]) == ("needs_retry", "syscall_failed")

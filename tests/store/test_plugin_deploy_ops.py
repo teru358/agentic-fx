@@ -615,16 +615,16 @@ def test_reclaim_expired_abandons_linked_claimed_signal_and_keeps_unlinked_pendi
     assert _status(conn, plain) == "pending"
 
 
-def test_startup_recovery_leaves_linked_signal_unclaimable_after_requeue(tmp_path):
-    """A deploy-linked signal recovered from an interrupted mission stays hidden."""
+def test_startup_recovery_abandons_a_linked_signal_so_it_cannot_be_claimed(tmp_path):
+    """A deploy-linked claim of an interrupted mission is terminalized, never hidden as pending."""
     conn = _conn(tmp_path)
     mission_id = missions.start(conn, "trade", "local", "model", NOW)
     linked = _linked_claimed(conn, mission_id, link=True)
 
     result = missions.recover_interrupted(conn, now=NOW, max_requeue=3)
 
-    assert result["signals_requeued"] == 1
-    assert _status(conn, linked) == "pending"
+    assert (result["signals_requeued"], result["signals_abandoned"]) == (0, 1)
+    assert _status(conn, linked) == "abandoned"
     next_mission = missions.start(conn, "trade", "local", "model", NOW)
     assert signals.claim_oldest(
         conn, mission_id=next_mission, now=NOW, freshness_bars=2) is None
