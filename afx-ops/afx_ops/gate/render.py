@@ -103,8 +103,9 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
     lines = [f"approval={record.approval_id}", f"kind={kind}", f"facts={facts_text}",
              f"claims={claims}", f"digest={record.payload_sha256[:8]}",
              f"expires={expiry}", f"decision={decision}", f"claimed={claimed}"]
-    if data.get("reason") == "revoked_by_operator":
-        lines.append("reason=revoked_by_operator")
+    reason = _word(data.get("reason"))
+    if decision == "rejected" and reason is not None:
+        lines.append(f"reason={reason}")
     return "\n".join(lines)
 
 
