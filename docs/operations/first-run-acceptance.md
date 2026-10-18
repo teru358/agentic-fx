@@ -135,7 +135,13 @@ uv run afx init
    journalctl --user -u afx | grep 'improve isolation'   # 改善 backend の隔離適合 (admission) の行
    ```
 
-4. 詰まったら、「7. 詰まったときに貼る情報」を集めてから、`scripts/first-run-reset.sh` で最初に戻せます。
+4. release の受入では、Landlock ABI 8 以上の実機 (Linux 6.18 以降) で実隔離の integration を 1 回通します。skip が 1 件でもあれば不合格です。
+
+   ```
+   uv run pytest tests/integration tests/core/test_improve_canary.py -p no:cacheprovider -rs --fail-on-skip
+   ```
+
+5. 詰まったら、「7. 詰まったときに貼る情報」を集めてから、`scripts/first-run-reset.sh` で最初に戻せます。
 
    ```
    scripts/first-run-reset.sh --dry-run    # 何が消えるかを見るだけ
