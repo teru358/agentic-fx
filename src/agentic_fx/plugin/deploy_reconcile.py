@@ -37,10 +37,8 @@ def rename_plain_dir(live: Path, retired: Path) -> None:
 
 def _set(conn: sqlite3.Connection, row: dict, phase: str, activity, *, now: datetime,
          fail_reason: str | None = None) -> ReconcileResult:
-    op_id = int(row["op_id"])
-    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason)
-    deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), deploy_ops.activity_or_null(activity), now=now)
-    return ReconcileResult(row["name"], op_id, row["op_kind"], phase, fail_reason)
+    deploy_ops.settle_op(conn, row, phase, activity, now=now, fail_reason=fail_reason)
+    return ReconcileResult(row["name"], int(row["op_id"]), row["op_kind"], phase, fail_reason)
 
 
 def _syscall_failed(conn, row, activity, *, now) -> ReconcileResult:
@@ -97,9 +95,7 @@ def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settin
             raw = _readlink_or_none(live)
         except OSError:
             return _syscall_failed(conn, row, activity, now=now)
-        if raw is None:
-            at_from = False
-        else:
+        if raw is not None:
             if raw == to_target:
                 return _set(conn, row, "done", activity, now=now)
             at_from = (row["from_kind"] == "symlink"
@@ -108,22 +104,27 @@ def _reconcile_rollback(conn, plugins_root: Path, row: dict, activity, *, settin
                 return _set(conn, row, "foreign", activity, now=now)
     elif os.path.lexists(live):
         return _set(conn, row, "foreign", activity, now=now)
-    else:
-        at_from = False
     force = bool(row["force"])
     verified = deploy_rollback.verify_rollback_target(
         conn, plugins_root, name, row["target_artifact_hash"], settings=settings, force=force,
         current_kind=_subject_kind(conn, plugins_root, row))
-    if (isinstance(verified, deploy_rollback.VerificationFailure)
-            or verified.to_target != to_target):
-        if at_from:
-            try:
-                os.unlink(live)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                return _syscall_failed(conn, row, activity, now=now)
-        return _set(conn, row, "needs_retry", activity, now=now, fail_reason="verify_failed")
+    if isinstance(verified, deploy_rollback.VerificationFailure):
+        failure = verified
+    elif verified.to_target != to_target:
+        failure = deploy_rollback.VerificationFailure(
+            (f"verified target {verified.to_target} differs from the recorded {to_target}",))
+    else:
+        failure = None
+    if failure is not None:
+        closed = deploy_rollback.close_failed_verification(
+            conn, plugins_root, row, int(row["op_id"]), failure, activity, now=now)
+        if closed.outcome == "needs_retry":
+            return ReconcileResult(name, int(row["op_id"]), row["op_kind"],
+                                   "needs_retry", "syscall_failed")
+        if closed.outcome == "foreign":
+            return ReconcileResult(name, int(row["op_id"]), row["op_kind"], "foreign")
+        return ReconcileResult(name, int(row["op_id"]), row["op_kind"],
+                               "needs_retry", "verify_failed")
     if force:
         deploy_rollback.supplement_cascade(
             conn, plugins_root, int(row["op_id"]), verified.dependents.dependent_names, now=now)

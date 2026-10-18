@@ -64,6 +64,8 @@ class RollbackOutcome:
     refusal_code: str | None = None
     to_target: str | None = None
     op_id: int | None = None
+    notified_op_ids: tuple[int, ...] = ()
+    live_removed: bool = False
 
 
 def _version_target(name: str, artifact_hash: str) -> str:
@@ -137,6 +139,20 @@ def resolve_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: 
     return RollbackRefusal(
         "target_required",
         "the latest live change is not an approval of the live version; --to is required")
+
+
+def _recorded_default_target(conn: sqlite3.Connection, plugins_root: Path, name: str
+                             ) -> RollbackTarget | None:
+    """The destination of an open rollback of ``name``, usable when no live version remains."""
+    if os.path.lexists(plugins_root / name):
+        return None
+    open_row = deploy_store.get_open_by_name(conn, name)
+    if open_row is None or open_row["op_kind"] != "rollback_symlink":
+        return None
+    recorded = open_row["to_target"]
+    if not isinstance(recorded, str) or not loader.is_canonical_symlink_target(name, recorded):
+        return None
+    return RollbackTarget(name, recorded, recorded.rsplit("/", 1)[-1])
 
 
 def current_deployed_kind(conn: sqlite3.Connection, plugins_root: Path, name: str) -> str | None:
@@ -262,13 +278,59 @@ def swap_to_target(plugins_root: Path, name: str, op_id: int, to_target: str) ->
 
 def _finish(conn: sqlite3.Connection, op_id: int, phase: str, activity, *, now: datetime,
             fail_reason: str | None = None) -> None:
-    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason)
-    deploy_ops.try_notify(conn, deploy_store.get_by_id(conn, op_id), deploy_ops.activity_or_null(activity), now=now)
+    deploy_ops.settle_op(conn, deploy_store.get_by_id(conn, op_id), phase, activity,
+                         now=now, fail_reason=fail_reason)
 
 
 def _success(name: str, op_id: int, to_target: str, cascade: set[str]) -> RollbackOutcome:
     return RollbackOutcome("rolled_back", name, True, "pending_restart",
                            tuple(sorted(cascade)), to_target=to_target, op_id=op_id)
+
+
+def _requested_signature(name: str, open_row, live, to_target: str, revoke: bool,
+                         force: bool, lost_source: bool) -> deploy_ops.Signature:
+    """Signature of a rerun; with the source link already gone it comes from the recorded op."""
+    if live is not None:
+        content, artifact = live.content_hash, live.artifact_hash
+    elif lost_source:
+        content, artifact = open_row["subject_content_hash"], open_row["subject_artifact_hash"]
+    else:
+        content = artifact = None
+    return deploy_ops.Signature(
+        "rollback_symlink", name, content, artifact, to_target, revoke, force)
+
+
+def _match_identity(open_row, live, lost_source: bool):
+    """The live identity a rerun is matched under; a vanished source counts as the recorded one."""
+    if live is None and lost_source:
+        return deploy_ops._from_identity(open_row)
+    return live
+
+
+def close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open_row,
+                              op_id: int, failure: VerificationFailure, activity, *,
+                              now: datetime) -> RollbackOutcome:
+    """Close an open op whose target no longer verifies (shared by a rerun and the startup pass)."""
+    name = open_row["name"]
+    live_path = plugins_root / name
+    live_removed = False
+    if (open_row["from_kind"] == "symlink"
+            and deploy_ops.live_matches_from(live_path, open_row["from_target"])):
+        try:
+            os.unlink(live_path)
+            live_removed = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _finish(conn, op_id, "needs_retry", activity, now=now, fail_reason="syscall_failed")
+            return RollbackOutcome("needs_retry", name, op_id=op_id, reasons=failure.reasons)
+    elif os.path.lexists(live_path):
+        _finish(conn, op_id, "foreign", activity, now=now)
+        return RollbackOutcome("foreign", name, op_id=op_id)
+    _finish(conn, op_id, "needs_retry", activity, now=now, fail_reason="verify_failed")
+    return RollbackOutcome("verify_failed", name, reasons=failure.reasons,
+                           refusal_code="target_verification_failed", op_id=op_id,
+                           live_removed=live_removed)
 
 
 def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, to: str | None,
@@ -283,6 +345,9 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
 
     def dependents() -> set[str]:
         target = resolve_rollback_target(conn, plugins_root, name, to=to)
+        if (to is None and isinstance(target, RollbackRefusal)
+                and target.code == "target_required"):
+            target = _recorded_default_target(conn, plugins_root, name) or target
         target_dir = (plugins_root / ".versions" / name / target.artifact_hash
                       if isinstance(target, RollbackTarget) else None)
         report = dependents_with_target(conn, plugins_root, name, target_dir, settings=settings)
@@ -320,6 +385,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 "rollback_symlink", name, open_row["subject_content_hash"],
                 open_row["subject_artifact_hash"], to_target, revoke, force)
             if dry_run:
+                if not deploy_ops.signature_matches(open_row, requested):
+                    raise deploy_ops.SignatureMismatchError(
+                        f"open deploy op op_id={open_row['op_id']} has a different "
+                        "signature than the requested rollback — wait for reconcile "
+                        "or restart the daemon")
                 return RollbackOutcome("dry_run", name, to_target=to_target,
                                        op_id=int(open_row["op_id"]))
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
@@ -327,19 +397,47 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             return _success(name, op_id, to_target, report.dependent_names)
 
         if isinstance(target, RollbackRefusal):
+            notified = ()
+            if (not dry_run and raw_target is not None
+                    and target.code in {"already_live", "target_required"}):
+                latest_closed = max(
+                    (row for row in deploy_store.list_by_name(conn, name)
+                     if deploy_store.is_closed(row)),
+                    key=lambda row: int(row["op_id"]), default=None)
+                if (latest_closed is not None
+                        and latest_closed["op_kind"] == "rollback_symlink"
+                        and latest_closed["to_target"] == raw_target):
+                    notified = deploy_ops.recover_notifications(
+                        conn, name, deploy_ops.activity_or_null(activity), now=now,
+                        include=lambda row: row["op_id"] == latest_closed["op_id"])
             return RollbackOutcome("refused", name, reasons=(target.reason,),
-                                   refusal_code=target.code)
-        if revoke and live is None:
+                                   refusal_code=target.code, notified_op_ids=notified)
+        lost_source = (open_row is not None and live is None
+                       and open_row["from_kind"] == "symlink"
+                       and not os.path.lexists(live_path))
+        if revoke and live is None and not (open_row is not None and open_row["revoke"]):
             raise ValueError(
                 "cannot revoke with no live version; use afx plugin revoke --version")
         approved = deploy_ops.approved_row(conn, name, live.content_hash) if live is not None else None
         revoke_already_recorded = open_row is not None and bool(open_row["revoke"])
         if revoke and approved is None and not revoke_already_recorded:
             raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
+        current_kind = current_deployed_kind(conn, plugins_root, name)
+        if open_row is not None and open_row["from_kind"] == "symlink":
+            recorded = discover_version_dir(
+                plugins_root / ".versions" / name / open_row["subject_artifact_hash"], name)
+            current_kind = recorded.kind if recorded is not None else current_kind
         verified = verify_rollback_target(
             conn, plugins_root, name, target.artifact_hash, settings=settings, force=force,
-            current_kind=current_deployed_kind(conn, plugins_root, name), report=report)
+            current_kind=current_kind, report=report)
         if isinstance(verified, VerificationFailure):
+            if open_row is not None and not dry_run:
+                op_id = deploy_ops.match_or_reject(
+                    open_row, _requested_signature(name, open_row, live, target.to_target,
+                                                   revoke, force, lost_source),
+                    _match_identity(open_row, live, lost_source), conn=conn, now=now)
+                return close_failed_verification(
+                    conn, plugins_root, open_row, op_id, verified, activity, now=now)
             if verified.dependents is not None and verified.dependents.unresolvable:
                 return RollbackOutcome("dependents_blocked", name,
                                        dependents=verified.dependents.unresolvable,
@@ -354,11 +452,12 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             return RollbackOutcome("dry_run", name, cascade_strategies=tuple(sorted(cascade)),
                                    dependents=verified.dependents.unresolvable,
                                    to_target=verified.to_target)
-        requested = deploy_ops.Signature(
-            "rollback_symlink", name, live.content_hash if live else None,
-            live.artifact_hash if live else None, verified.to_target, revoke, force)
+        requested = _requested_signature(
+            name, open_row, live, verified.to_target, revoke, force, lost_source)
         if open_row is not None:
-            op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
+            op_id = deploy_ops.match_or_reject(
+                open_row, requested, _match_identity(open_row, live, lost_source),
+                conn=conn, now=now)
             if force:
                 supplement_cascade(conn, plugins_root, op_id, cascade, now=now)
         else:

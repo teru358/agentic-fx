@@ -95,6 +95,11 @@ def _to_identity(row: Mapping[str, object]) -> deploy_store.LiveIdentity | None:
     return None
 
 
+def signature_matches(open_row: Mapping[str, object], requested: Signature) -> bool:
+    """Whether every immutable field of the open op equals the requested signature."""
+    return row_signature(open_row) == requested
+
+
 def match_or_reject(open_row: Mapping[str, object], requested: Signature,
                     live_identity: deploy_store.LiveIdentity | None, *,
                     conn: sqlite3.Connection | None = None,
@@ -106,7 +111,7 @@ def match_or_reject(open_row: Mapping[str, object], requested: Signature,
     either the recorded pre-operation or post-operation identity.
     """
     existing = row_signature(open_row)
-    if existing != requested:
+    if not signature_matches(open_row, requested):
         raise SignatureMismatchError(
             f"open deploy op op_id={open_row['op_id']} has signature "
             f"({_signature_text(existing)}); requested "
@@ -268,6 +273,37 @@ def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity,
             op_row["op_id"], event, exc)
     deploy_store.mark_notify_attempted(conn, int(op_row["op_id"]))
     return True
+
+
+def settle_op(conn: sqlite3.Connection, op_row: Mapping[str, object], phase: str, activity, *,
+              now: datetime, fail_reason: str | None = None) -> None:
+    """Move an op to ``phase`` and attempt its notification.
+
+    Leaving the ``needs_retry`` / ``syscall_failed`` state for any other state is a
+    new verdict, so its notification is owed again.
+    """
+    leaves_syscall_failure = (
+        op_row["phase"] == "needs_retry" and op_row["fail_reason"] == "syscall_failed"
+        and not (phase == "needs_retry" and fail_reason == "syscall_failed"))
+    op_id = int(op_row["op_id"])
+    deploy_store.set_phase(conn, op_id, phase, now=now, fail_reason=fail_reason,
+                           notify_attempted=False if leaves_syscall_failure else None)
+    try_notify(conn, deploy_store.get_by_id(conn, op_id), activity_or_null(activity), now=now)
+
+
+def recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime,
+                          include: Callable[[Mapping[str, object]], bool] | None = None
+                          ) -> tuple[int, ...]:
+    """Attempt missed notifications for completed operations on one plugin name."""
+    notified: list[int] = []
+    for row in reversed(deploy_store.list_by_name(conn, name)):
+        if include is not None and not include(row):
+            continue
+        if row["notify_attempted"] or activity_event(row) is None:
+            continue
+        if try_notify(conn, row, activity, now=now):
+            notified.append(int(row["op_id"]))
+    return tuple(notified)
 
 
 class NullActivity:

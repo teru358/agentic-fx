@@ -144,6 +144,52 @@ def test_plain_retire_rename_failure_reopens_with_same_signature_and_completes(w
     assert done.outcome == "done" and done.op_id == failed.op_id
 
 
+def test_plain_retry_refuses_a_destination_collision_without_closing_the_open_op(world, monkeypatch):
+    plain = world.version("sma", "plain")
+    os.rename(plain, world.root / "sma")
+    real_rename = deploy_retire.deploy_reconcile.rename_plain_dir
+    monkeypatch.setattr(
+        deploy_retire.deploy_reconcile, "rename_plain_dir",
+        lambda *args: (_ for _ in ()).throw(OSError("injected")),
+    )
+    failed = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_retire.deploy_reconcile, "rename_plain_dir", real_rename)
+    row = deploy_store.get_by_id(world.conn, failed.op_id)
+    (world.root / row["retired_path"]).mkdir(parents=True)
+
+    result = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+
+    reread = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert result.outcome == "refused"
+    assert str(failed.op_id) in result.reason and row["retired_path"] in result.reason
+    assert (reread["phase"], reread["fail_reason"]) == ("needs_retry", "syscall_failed")
+    assert (world.root / "sma").is_dir()
+
+
+def test_plain_retry_dry_run_refuses_a_destination_collision_like_a_real_run(world, monkeypatch):
+    plain = world.version("sma", "plain")
+    os.rename(plain, world.root / "sma")
+    real_rename = deploy_retire.deploy_reconcile.rename_plain_dir
+    monkeypatch.setattr(
+        deploy_retire.deploy_reconcile, "rename_plain_dir",
+        lambda *args: (_ for _ in ()).throw(OSError("injected")),
+    )
+    failed = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+    monkeypatch.setattr(deploy_retire.deploy_reconcile, "rename_plain_dir", real_rename)
+    row = deploy_store.get_by_id(world.conn, failed.op_id)
+    (world.root / row["retired_path"]).mkdir(parents=True)
+
+    result = deploy_retire.retire_plugin(
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS, dry_run=True)
+
+    reread = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert result.outcome == "refused" and row["retired_path"] in result.reason
+    assert (reread["phase"], reread["fail_reason"]) == ("needs_retry", "syscall_failed")
+
+
 def test_plain_retry_closes_foreign_when_the_directory_was_replaced(world, monkeypatch):
     original = world.version("sma", "original")
     replacement = world.version("sma", "replacement")

@@ -28,7 +28,8 @@ class Activity:
 
 class World:
     def __init__(self, tmp_path: Path):
-        self.conn = db_store.connect(tmp_path / "agentic.db")
+        self.db_path = tmp_path / "agentic.db"
+        self.conn = db_store.connect(self.db_path)
         db_store.init_db(self.conn)
         self.root = tmp_path / "plugins"
         self.root.mkdir()

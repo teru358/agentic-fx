@@ -719,6 +719,9 @@ def _report_retire_outcome(conn, name: str, outcome) -> int:
         detail.append("依存する plugin: " + ", ".join(
             f"{dep[0]} ({dep[2]})" for dep in outcome.dependents)
             + " (--force で続行できます)")
+    reason = getattr(outcome, "reason", None)
+    if reason:
+        detail.append(reason)
     retired_path = getattr(outcome, "retired_path", None)
     if retired_path:
         detail.append(f"退避先: {retired_path}")

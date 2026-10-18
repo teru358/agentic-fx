@@ -24,7 +24,7 @@ def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
 def finish(conn: sqlite3.Connection, mission_id: int, status: str,
            output: dict | None, transcript: list, now: datetime,
            *, commit: bool = True) -> bool:
-    """missions 行を終端状態へ CAS 更新する (設計書 §4.7 codex C-4)。
+    """missions 行を終端状態へ CAS 更新する (設計書 §4.7)。
 
     `WHERE status='running'` を満たさない (= 既に終端済み) 場合は影響行数
     0 のまま何もしない — 無条件 UPDATE による「後勝ち上書き」を構造的に
@@ -108,7 +108,7 @@ def finish_improve_mission(
 
 def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                         max_requeue: int) -> dict:
-    """起動時回収 (設計書 §4.8 codex C-5): 前回停止時に `running` のまま
+    """起動時回収 (設計書 §4.8): 前回停止時に `running` のまま
     残った missions 行を `'interrupted'` へ終端し、それらを claim して
     いた `claimed` signals を**同一トランザクション**で requeue (上限
     超過は abandoned) する。
@@ -120,7 +120,7 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
 
     `'interrupted'` は DB 回収専用の状態値であり `MissionResult.status`
     の 4 値契約 (`runners/base.py:40`) には現れない — status 表示・集計
-    はこの区別を明記すること (codex M-1)。
+    はこの区別を明記すること。
 
     signals の requeue/abandon 判定は `signals.py` の
     `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則 (現在の
@@ -145,11 +145,13 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
         if running_ids:
             placeholders = ",".join("?" * len(running_ids))
             claimed_rows = conn.execute(
-                "SELECT id, requeue_count FROM signals WHERE status='claimed' "
+                "SELECT id, requeue_count, EXISTS (SELECT 1 FROM plugin_deploy_op_signals "
+                "AS deploy_links WHERE deploy_links.signal_id=signals.id) AS deploy_linked "
+                "FROM signals WHERE status='claimed' "
                 f"AND claimed_by_mission_id IN ({placeholders})",
                 running_ids).fetchall()
             for row in claimed_rows:
-                if row["requeue_count"] >= max_requeue:
+                if row["requeue_count"] >= max_requeue or row["deploy_linked"]:
                     conn.execute(
                         "UPDATE signals SET status='abandoned', "
                         "claimed_by_mission_id=NULL, claimed_at=NULL "
@@ -246,7 +248,7 @@ def loop_of(conn: sqlite3.Connection, mission_id: int) -> str | None:
     ために使う (設計書 §5)。origin は呼び出し側が渡す enum 値に過ぎず、
     任意の内部コードが Origin.SCHEDULER を構成できてしまうため、origin 検証
     だけでは「scheduler が起動した取引判断 Mission だけ」という性質を担保
-    できない (codex レビュー 4)。
+    できない。
     """
     row = conn.execute(
         "SELECT loop FROM missions WHERE id=?", (mission_id,)).fetchone()
