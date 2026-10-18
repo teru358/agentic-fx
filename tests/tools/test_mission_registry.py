@@ -221,6 +221,32 @@ def test_build_mission_registry_improve_has_research_and_staging_and_rpc_tools(t
             "run_backtest", "analyze_corr"} <= names
 
 
+def test_build_mission_registry_improve_exposes_only_the_approved_tool_sets(tmp_path):
+    from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    staging_dir = tmp_path / "staging"
+    source_snapshot_dir = tmp_path / "source"
+    staging_dir.mkdir()
+    source_snapshot_dir.mkdir()
+
+    registry = build_mission_registry(
+        "improve", conn, SETTINGS, _clock(), rag, activity=activity,
+        staging_dir=staging_dir, source_snapshot_dir=source_snapshot_dir,
+        ledger=ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        rpc_handlers={"run_backtest": lambda a: {}, "analyze_corr": lambda a: {}})
+    research = frozenset({"web_search", "fetch_article"})
+    staging = frozenset({"list_staging", "read_staging_file", "write_staging_file",
+                         "read_plugin_source", "list_examples", "read_example_plugin",
+                         "run_plugin_tests", "list_deployed_plugins", "lock_staging_deps"})
+    rpc = frozenset({"run_backtest", "analyze_corr"})
+    assert (len(research), len(staging), len(rpc)) == (2, 9, 2)
+    assert frozenset(registry.names()) == research | staging | rpc
+
+
 def test_improve_registry_counts_rejected_tool_calls(tmp_path):
     from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 

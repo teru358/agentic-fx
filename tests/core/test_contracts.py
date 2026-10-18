@@ -114,6 +114,11 @@ def test_order_status_has_all_states():
             "rejected", "expired", "invalidated"} == names
 
 
+def test_trade_action_values_are_exactly_the_supported_operations():
+    assert frozenset(action.value for action in Action) == frozenset({
+        "open", "close", "cancel", "hold"})
+
+
 def test_fixed_clock():
     dt = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
     assert FixedClock(dt).now() == dt

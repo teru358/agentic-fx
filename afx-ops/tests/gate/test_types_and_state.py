@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+from typing import get_args
 
 import pytest
 
 from afx_ops.gate.state import ApprovalRecord, BotState, StateError, advance_event, load, save
-from afx_ops.gate.types import CustomIdError, decode_custom_id, encode_custom_id
+from afx_ops.gate.types import Action, CustomIdError, _ACTIONS, decode_custom_id, encode_custom_id
 
 
 def _record(**changes):
@@ -24,6 +25,14 @@ def test_custom_id_is_a_complete_four_part_grammar():
                   "afx:v2:claim:7", "afx:v1:claim:-7"):
         with pytest.raises(CustomIdError):
             decode_custom_id(value)
+
+
+def test_custom_id_actions_are_exactly_the_supported_component_actions():
+    assert _ACTIONS == frozenset({"approve", "claim", "confirm", "cancel", "reject", "retry"})
+
+
+def test_decision_actions_are_exactly_the_supported_decisions():
+    assert frozenset(get_args(Action)) == frozenset({"approve", "reject", "retry"})
 
 
 def test_snapshot_round_trip_and_event_cursor_have_no_delivered_id_list(tmp_path):
