@@ -32,6 +32,16 @@ def _disable(world, **kwargs):
         settings=SETTINGS, **kwargs)
 
 
+def test_a_crash_before_disable_intent_recording_leaves_no_durable_effect(world, monkeypatch):
+    world.three_generations()
+    before = world.snapshot("sma")
+    crash_at(monkeypatch, deploy_ops, "record_intent")
+
+    crashed(world, _disable, world)
+
+    assert world.snapshot("sma") == before
+
+
 def test_a_crash_after_the_disable_intent_commit_is_completed_by_reconcile(world, monkeypatch):
     _a, _b, c = world.three_generations()
     crash_after_intent_commit(monkeypatch)
@@ -56,6 +66,40 @@ def test_a_crash_after_disable_unlink_is_completed_by_reconcile(world, monkeypat
     assert row is not None
     assert deploy_store.get_by_id(world.conn, row["op_id"])["phase"] == "done"
     assert not os.path.lexists(world.root / "sma")
+
+
+def test_a_reconcile_crash_before_disable_unlink_is_retried_on_the_next_start(world, monkeypatch):
+    """A process death, unlike an ordinary syscall error, escapes this reconcile pass."""
+    _a, _b, c = world.three_generations()
+    crash_after_intent_commit(monkeypatch)
+    crashed(world, _disable, world)
+    live = world.root / "sma"
+    fail_syscall(monkeypatch, "unlink", path_pred=lambda path: path == live, crash=True, times=1)
+
+    with pytest.raises(BaseException):
+        deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
+    from tests.plugin._crash import restart
+    restart(world)
+
+    deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
+    row = deploy_store.list_by_name(world.conn, "sma")[0]
+    assert row["phase"] == "done" and c.is_dir() and not os.path.lexists(live)
+
+
+def test_a_reconcile_crash_after_disable_unlink_is_completed_on_the_next_start(world, monkeypatch):
+    world.three_generations()
+    crash_after_intent_commit(monkeypatch)
+    crashed(world, _disable, world)
+    crash_before_set_phase(monkeypatch, "done")
+
+    with pytest.raises(BaseException):
+        deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
+    from tests.plugin._crash import restart
+    restart(world)
+
+    deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
+    row = deploy_store.list_by_name(world.conn, "sma")[0]
+    assert row["phase"] == "done" and not os.path.lexists(world.root / "sma")
 
 
 @pytest.mark.parametrize("stage", ["after_insert", "after_cascade"])

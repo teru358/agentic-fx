@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from agentic_fx.plugin import deploy_ops, deploy_reconcile
+from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_reconcile
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from tests.plugin._crash import (
     CrashPoint,
@@ -31,19 +31,33 @@ def _closed_op(world, kind: str, phase: str) -> int:
     if kind == "rollback_symlink":
         return world.intent("sma", op_kind=kind, from_ver=c, to_ver=b, phase=phase,
                             fail_reason="verify_failed" if phase == "needs_retry" else None)
+    if kind == "revoke":
+        old = world.version("sma", "old")
+        current = world.version("sma", "current")
+        world.approve("sma", old, 1)
+        world.deploy("sma", current, None, 2)
+        outcome = deploy_disable.revoke_version(
+            world.conn, world.root, "sma", content_hash=world.content(old), now=NOW)
+        world.conn.execute(
+            "UPDATE plugin_deploy_ops SET notify_attempted=0 WHERE op_id=?", (outcome.op_id,))
+        world.conn.commit()
+        return outcome.op_id
     return world.intent("sma", op_kind=kind, retired_path="_retired/sma-1",
                         phase=phase, fail_reason="syscall_failed" if phase == "needs_retry" else None)
 
 
+NOTIFY_CASES = [
+    ("disable_symlink", "done"), ("disable_symlink", "needs_retry"),
+    ("disable_symlink", "foreign"), ("rollback_symlink", "done"),
+    ("rollback_symlink", "needs_retry"), ("rollback_symlink", "foreign"),
+    ("retire_plain", "done"), ("retire_plain", "needs_retry"),
+    ("retire_plain", "foreign"), ("revoke", "done"),
+]
+
+
 @pytest.mark.parametrize(
     ("kind", "phase"),
-    [
-        ("disable_symlink", "done"), ("disable_symlink", "needs_retry"),
-        ("disable_symlink", "foreign"), ("rollback_symlink", "done"),
-        ("rollback_symlink", "needs_retry"), ("rollback_symlink", "foreign"),
-        ("retire_plain", "done"), ("retire_plain", "needs_retry"),
-        ("retire_plain", "foreign"),
-    ],
+    NOTIFY_CASES,
 )
 def test_reconcile_recovers_a_notification_interrupted_before_the_write(world, monkeypatch, kind, phase):
     op_id = _closed_op(world, kind, phase)
@@ -63,9 +77,9 @@ def test_reconcile_recovers_a_notification_interrupted_before_the_write(world, m
     assert len(activity.events) == 1
 
 
-@pytest.mark.parametrize("kind", ["disable_symlink", "rollback_symlink", "retire_plain"])
-def test_reconcile_retries_after_activity_was_written_but_before_its_claim(world, monkeypatch, kind):
-    op_id = _closed_op(world, kind, "done")
+@pytest.mark.parametrize(("kind", "phase"), NOTIFY_CASES)
+def test_reconcile_retries_after_activity_was_written_but_before_its_claim(world, monkeypatch, kind, phase):
+    op_id = _closed_op(world, kind, phase)
     activity = Activity()
     crash_after_activity(monkeypatch)
     crashed(
@@ -78,6 +92,34 @@ def test_reconcile_retries_after_activity_was_written_but_before_its_claim(world
 
     assert deploy_store.get_by_id(world.conn, op_id)["notify_attempted"] == 1
     assert len(activity.events) == 2
+
+
+@pytest.mark.parametrize(("kind", "phase"), NOTIFY_CASES)
+def test_activity_write_exception_still_claims_each_terminal_deploy_notification(world, kind, phase):
+    op_id = _closed_op(world, kind, phase)
+
+    class BrokenActivity:
+        def write(self, *_args):
+            raise RuntimeError("activity backend unavailable")
+
+    assert deploy_ops.try_notify(
+        world.conn, deploy_store.get_by_id(world.conn, op_id), BrokenActivity(), now=NOW)
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert row["phase"] == phase and row["notify_attempted"] == 1
+
+
+@pytest.mark.parametrize(("kind", "phase"), NOTIFY_CASES)
+def test_reconcile_skips_an_already_claimed_terminal_deploy_notification(world, kind, phase):
+    op_id = _closed_op(world, kind, phase)
+    activity = Activity()
+    assert deploy_ops.try_notify(
+        world.conn, deploy_store.get_by_id(world.conn, op_id), activity, now=NOW)
+
+    results = deploy_reconcile.reconcile_deploy_ops(
+        world.conn, world.root, now=NOW, settings=SETTINGS, activity=activity)
+
+    assert len(activity.events) == 1
+    assert all(result.outcome != "notified" for result in results)
 
 
 def test_a_base_exception_from_activity_keeps_the_notification_unclaimed_until_next_start(world, monkeypatch):
