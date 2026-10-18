@@ -31,6 +31,29 @@ def _rollback(world, name="sma", **kwargs):
         world.conn, world.root, name, now=NOW, settings=SETTINGS, **kwargs)
 
 
+def test_rerun_after_rollback_notification_crash_recovers_the_notification_once(world, monkeypatch):
+    """A completed rollback remains a no-op while claiming its missed notice."""
+    _a, b, _c = world.three_generations()
+    real_notify = deploy_rollback.deploy_ops.try_notify
+    monkeypatch.setattr(
+        deploy_rollback.deploy_ops, "try_notify",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("crash")),
+    )
+    with pytest.raises(RuntimeError, match="crash"):
+        _rollback(world, to=b.name)
+    monkeypatch.setattr(deploy_rollback.deploy_ops, "try_notify", real_notify)
+
+    row = deploy_store.list_by_name(world.conn, "sma")[-1]
+    assert row["phase"] == "done" and row["notify_attempted"] == 0
+    activity = Activity()
+
+    rerun = _rollback(world, to=b.name, activity=activity)
+
+    assert rerun.outcome == "refused" and rerun.refusal_code == "already_live"
+    assert rerun.notified_op_ids == (row["op_id"],)
+    assert [event for _, event, _ in activity.events] == ["plugin_deploy_op_done"]
+
+
 # ---- target decision (AC-7, AC-8) ----
 
 def test_default_target_is_the_previous_version_after_an_approval(world):

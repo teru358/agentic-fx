@@ -23,6 +23,7 @@ class RetireOutcome:
     notified_op_ids: tuple[int, ...] = ()
     cascade_strategies: tuple[str, ...] = ()
     dependents: tuple[tuple[str, str, str], ...] = ()
+    reason: str | None = None
 
 
 def _plain(path: Path) -> bool:
@@ -109,6 +110,14 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
             recorded_hash = open_row["subject_content_hash"]
+            if (os.path.lexists(retired) and recorded_hash is not None
+                    and live_identity is not None
+                    and live_identity.content_hash == recorded_hash):
+                return RetireOutcome(
+                    "refused", name, op_id, retired_path,
+                    reason=(f"open retire op_id={op_id} cannot use existing "
+                            f"destination {retired_path}"),
+                )
             requested = deploy_ops.Signature(
                 "retire_plain", name, recorded_hash, None, None, False, force)
             op_id = deploy_ops.match_or_reject(

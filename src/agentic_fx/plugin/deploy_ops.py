@@ -270,6 +270,21 @@ def try_notify(conn: sqlite3.Connection, op_row: Mapping[str, object], activity,
     return True
 
 
+def recover_notifications(conn: sqlite3.Connection, name: str, activity, *, now: datetime,
+                          include: Callable[[Mapping[str, object]], bool] | None = None
+                          ) -> tuple[int, ...]:
+    """Attempt missed notifications for completed operations on one plugin name."""
+    notified: list[int] = []
+    for row in reversed(deploy_store.list_by_name(conn, name)):
+        if include is not None and not include(row):
+            continue
+        if row["notify_attempted"] or activity_event(row) is None:
+            continue
+        if try_notify(conn, row, activity, now=now):
+            notified.append(int(row["op_id"]))
+    return tuple(notified)
+
+
 class NullActivity:
     def write(self, *args, **kwargs) -> None:
         return None

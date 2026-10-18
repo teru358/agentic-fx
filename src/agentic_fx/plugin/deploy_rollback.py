@@ -64,6 +64,7 @@ class RollbackOutcome:
     refusal_code: str | None = None
     to_target: str | None = None
     op_id: int | None = None
+    notified_op_ids: tuple[int, ...] = ()
 
 
 def _version_target(name: str, artifact_hash: str) -> str:
@@ -327,8 +328,17 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             return _success(name, op_id, to_target, report.dependent_names)
 
         if isinstance(target, RollbackRefusal):
+            notified = ()
+            if (not dry_run and raw_target is not None
+                    and target.code in {"already_live", "target_required"}):
+                notified = deploy_ops.recover_notifications(
+                    conn, name, deploy_ops.activity_or_null(activity), now=now,
+                    include=lambda row: (
+                        row["op_kind"] == "rollback_symlink"
+                        and row["to_target"] == raw_target),
+                )
             return RollbackOutcome("refused", name, reasons=(target.reason,),
-                                   refusal_code=target.code)
+                                   refusal_code=target.code, notified_op_ids=notified)
         if revoke and live is None:
             raise ValueError(
                 "cannot revoke with no live version; use afx plugin revoke --version")
