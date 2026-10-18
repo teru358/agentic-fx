@@ -864,3 +864,119 @@ def test_a_failing_activity_write_does_not_undo_a_completed_operation(world, mon
     assert row["op_kind"] == "rollback_symlink"
     assert row["phase"] == "done" and row["notify_attempted"] == 1
     assert "runtime_activation=pending_restart" in out
+
+
+# ---- rollback の no-op / 入力 / 表示の堅さ -------------------------------------
+
+def test_a_rollback_to_the_live_version_without_yes_resends_a_missed_notification(world, capsys):
+    _a, b, c = world.three_generations()
+    world.link("sma", b)
+    op_id = world.intent("sma", op_kind="rollback_symlink", phase="done", from_ver=c,
+                         to_ver=b, minute=10)
+
+    rc, out, err = _run(capsys, "rollback", "sma", "--to", b.name[:12])
+
+    assert rc == 0 and err == ""
+    assert f"op_id={op_id}" in out
+    assert deploy_store.get_by_id(world.conn, op_id)["notify_attempted"] == 1
+
+
+def test_revoke_rejects_a_version_prefix_that_is_empty_short_or_not_lowercase_hex(world, capsys):
+    a, _b, _c = world.three_generations()
+    before = world.snapshot("sma")
+
+    for bad in ("", "a", world.content(a)[:11], "XYZXYZXYZXYZ", world.content(a)[:12].upper()):
+        rc, _out, err = _run(capsys, "revoke", "sma", "--version", bad, "--yes")
+        assert rc == 1 and err.splitlines()[0].endswith("(code=bad_target)"), bad
+
+    assert world.snapshot("sma") == before
+
+
+def test_revoke_accepts_a_twelve_character_lowercase_hex_prefix(world, capsys):
+    a, _b, _c = world.three_generations()
+
+    rc, _out, err = _run(capsys, "revoke", "sma", "--version", world.content(a)[:12], "--yes")
+
+    assert rc == 0 and err == ""
+
+
+def test_ctrl_c_at_the_prompt_aborts_with_a_code(world, monkeypatch, capsys):
+    world.three_generations()
+    before = world.snapshot("sma")
+    monkeypatch.setattr(plugin_deploy_cli, "_isatty", lambda: True)
+
+    def interrupted(_prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupted)
+
+    rc, _out, err = _run(capsys, "disable", "sma")
+
+    assert rc == 1 and err.splitlines()[0].endswith("(code=aborted)")
+    assert world.snapshot("sma") == before
+
+
+def test_the_preview_does_not_call_an_unreadable_symlink_a_plain_directory(
+        world, monkeypatch):
+    world.three_generations()
+
+    def unreadable(_path):
+        raise OSError("denied")
+
+    monkeypatch.setattr(plugin_deploy_cli.os, "readlink", unreadable)
+
+    assert plugin_deploy_cli._live_text(world.root, "sma") == "symlink (読めない)"
+
+
+def test_versions_shows_a_regular_file_live_as_other_not_absent(world, capsys):
+    (world.root / "odd").write_text("not a plugin\n")
+
+    rc, out, _err = _run(capsys, "versions", "odd")
+
+    assert rc == 0
+    live = out.split("-- live --")[1].split("-- 版")[0]
+    assert "other" in live and "不在" not in live
+
+
+def test_versions_keeps_going_when_one_version_directory_cannot_be_read(
+        world, monkeypatch, capsys):
+    a, b, c = world.three_generations()
+    from agentic_fx.plugin import loader
+
+    real = loader.content_hash
+
+    def hash_or_fail(directory, *args, **kwargs):
+        if Path(directory).name == a.name:
+            raise ValueError("unreadable")
+        return real(directory, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "content_hash", hash_or_fail)
+
+    rc, out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    broken = next(line for line in out.splitlines() if line.strip().startswith(a.name[:12]))
+    assert "整合: 読めない (ValueError)" in broken
+    for good in (b, c):
+        line = next(line for line in out.splitlines() if line.strip().lstrip("*").strip()
+                    .startswith(good.name[:12]))
+        assert "版dir=整合" in line
+
+
+def test_versions_hashes_each_version_directory_once(world, monkeypatch, capsys):
+    a, b, _c = world.three_generations()
+    from agentic_fx.plugin import loader
+
+    real = loader.content_hash
+    seen: list[str] = []
+
+    def counting(directory, *args, **kwargs):
+        seen.append(Path(directory).name)
+        return real(directory, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "content_hash", counting)
+
+    rc, _out, _err = _run(capsys, "versions", "sma")
+
+    assert rc == 0
+    assert seen.count(a.name) == 1 and seen.count(b.name) == 1

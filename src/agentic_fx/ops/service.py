@@ -510,13 +510,14 @@ class OpsService:
         return data
 
     def _deploy_ops_status(self, deadline: float) -> dict | None:
-        """Blocking deploy ops and ops needing attention; ``None`` when unreadable."""
+        """Blocking deploy ops and ops needing attention, or an ``unavailable`` marker."""
         try:
             with self._ops_lane(deadline):
                 return deploy_store.status_summary(self._conn, now=self._wall_clock())
-        except (OpsError, sqlite3.Error, ValueError) as exc:
+        except (OpsError, sqlite3.Error) as exc:
             _log.warning("status plugin_deploy_ops unavailable: %s", type(exc).__name__)
-            return None
+            reason = exc.code.value if isinstance(exc, OpsError) else "database_error"
+            return {"unavailable": True, "reason": reason}
 
     def log(self, principal: Caller, limit: int = 20) -> dict:
         _authorize(principal, "log")

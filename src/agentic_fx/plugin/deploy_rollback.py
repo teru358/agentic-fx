@@ -90,9 +90,21 @@ def _live_raw_target(plugins_root: Path, name: str) -> str | None:
         return None
 
 
+def prefix_refusal(prefix: str, *, option: str = "--to",
+                   min_length: int = 1) -> RollbackRefusal | None:
+    """Refuse a version prefix that is not lowercase hex of at least ``min_length``."""
+    if not _HASH_PREFIX_RE.fullmatch(prefix) or len(prefix) < min_length:
+        return RollbackRefusal(
+            "bad_target",
+            f"{option} {prefix!r} is not a lowercase hex prefix of at least {min_length} characters"
+            if min_length > 1 else f"{option} {prefix!r} is not a lowercase hex prefix")
+    return None
+
+
 def _resolve_prefix(plugins_root: Path, name: str, prefix: str) -> RollbackTarget | RollbackRefusal:
-    if not _HASH_PREFIX_RE.fullmatch(prefix):
-        return RollbackRefusal("bad_target", f"--to {prefix!r} is not a lowercase hex prefix")
+    refusal = prefix_refusal(prefix)
+    if refusal is not None:
+        return refusal
     base = plugins_root / ".versions" / name
     matches: list[str] = []
     if base.is_dir():
@@ -334,6 +346,37 @@ def close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open
                            live_removed=live_removed)
 
 
+def _recover_latest_rollback(conn: sqlite3.Connection, name: str, live_target: str,
+                             activity, *, now: datetime) -> tuple[int, ...]:
+    """Re-send the missed notification of the latest closed rollback that put ``live_target`` live."""
+    latest_closed = max(
+        (row for row in deploy_store.list_by_name(conn, name) if deploy_store.is_closed(row)),
+        key=lambda row: int(row["op_id"]), default=None)
+    if (latest_closed is None or latest_closed["op_kind"] != "rollback_symlink"
+            or latest_closed["to_target"] != live_target):
+        return ()
+    return deploy_ops.recover_notifications(
+        conn, name, deploy_ops.activity_or_null(activity), now=now,
+        include=lambda row: row["op_id"] == latest_closed["op_id"])
+
+
+def recover_already_live_notifications(
+        conn: sqlite3.Connection, plugins_root: Path, name: str, activity, *, now: datetime,
+        expect: deploy_ops.Expectation | None,
+        deadline: float | None = None) -> tuple[int, ...] | None:
+    """Re-send the missed notification of an already-live rollback, only while the live entry
+    is as previewed. Returns ``None`` (and does nothing) when it changed since the preview."""
+    from agentic_fx.plugin import switch
+
+    with switch._plugin_locks(plugins_root, [name], deadline=deadline):
+        if expect is not None and not deploy_ops.observe_live(plugins_root, name).same_live(expect):
+            return None
+        live_target = _live_raw_target(plugins_root, name)
+        if live_target is None:
+            return ()
+        return _recover_latest_rollback(conn, name, live_target, activity, now=now)
+
+
 def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, to: str | None,
                     revoke: bool, force: bool, now: datetime, actor: str = "human_cli",
                     settings, activity=None, deadline: float | None = None, stop_event=None,
@@ -411,18 +454,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             notified = ()
             if (not dry_run and raw_target is not None
                     and target.code in {"already_live", "target_required"}):
-                latest_closed = max(
-                    (row for row in deploy_store.list_by_name(conn, name)
-                     if deploy_store.is_closed(row)),
-                    key=lambda row: int(row["op_id"]), default=None)
-                if (latest_closed is not None
-                        and latest_closed["op_kind"] == "rollback_symlink"
-                        and latest_closed["to_target"] == raw_target):
-                    notified = deploy_ops.recover_notifications(
-                        conn, name, deploy_ops.activity_or_null(activity), now=now,
-                        include=lambda row: row["op_id"] == latest_closed["op_id"])
+                notified = _recover_latest_rollback(
+                    conn, name, raw_target, activity, now=now)
             return RollbackOutcome("refused", name, reasons=(target.reason,),
-                                   refusal_code=target.code, notified_op_ids=notified)
+                                   refusal_code=target.code, notified_op_ids=notified,
+                                   expectation=observed)
         lost_source = (open_row is not None and live is None
                        and open_row["from_kind"] == "symlink"
                        and not os.path.lexists(live_path))

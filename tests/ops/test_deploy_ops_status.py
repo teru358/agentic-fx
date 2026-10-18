@@ -99,3 +99,37 @@ def test_ctl_status_sanitises_control_characters_in_a_plugin_name():
          "phase": "intent", "fail_reason": None}], "attention": []}})
 
     assert "\x1b" not in text
+
+
+import pytest  # noqa: E402
+
+from agentic_fx.ops.contracts import ErrorCode, OpsError  # noqa: E402
+
+
+@pytest.mark.parametrize("code", [ErrorCode.DATABASE_BUSY, ErrorCode.REQUEST_TIMEOUT])
+def test_status_marks_deploy_ops_unavailable_when_they_cannot_be_read(ops_env, monkeypatch, code):
+    service = ops_env.service()
+
+    def lane(_deadline):
+        raise OpsError(code)
+
+    monkeypatch.setattr(service, "_ops_lane", lane)
+
+    section = service.status(OPERATOR)["plugin_deploy_ops"]
+
+    assert section == {"unavailable": True, "reason": code.value}
+    text = client.format_status({"plugin_deploy_ops": section})
+    assert f"配備操作の状態を読めませんでした ({code.value})" in text
+    assert "未完" not in text
+
+
+def test_status_does_not_swallow_a_value_error_from_the_deploy_ops_query(ops_env, monkeypatch):
+    service = ops_env.service()
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("bad row")
+
+    monkeypatch.setattr(deploy_store, "status_summary", broken)
+
+    with pytest.raises(ValueError):
+        service.status(OPERATOR)

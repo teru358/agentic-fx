@@ -666,7 +666,7 @@ def _plugin_bless(conn, settings, args: argparse.Namespace, root: Path) -> int:
     except plugin_switch.UnresolvedJournalError as e:
         # [switch-ops-hardening] T6: `UnresolvedJournalError` は `Exception`
         # 直系なので `(ValueError, SandboxError)` にも外側の包括 catch にも
-        # 掛からず traceback になっていた。`_plugin_retire` (同ファイル) と
+        # 掛からず traceback になっていた。`plugin_deploy_cli.plugin_retire` と
         # 同じ作法 (rc=1 + `エラー: `) に揃え、**次の 1 手**を添える。
         # 元メッセージの `op_id=` / `approval_id=` は runbook と既存テストが
         # 依存しているので必ず含める。
@@ -698,26 +698,6 @@ def _plugin_materialize(conn, settings, args: argparse.Namespace, root: Path) ->
         return 1
     print(f"materialize: {dest}")
     return 0
-
-
-def _plugin_retire(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_retire(conn, settings, args, root)
-
-
-def _plugin_disable(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_disable(conn, settings, args, root)
-
-
-def _plugin_rollback(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_rollback(conn, settings, args, root)
-
-
-def _plugin_revoke(conn, settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_revoke(conn, settings, args, root)
-
-
-def _plugin_versions(settings, args: argparse.Namespace, root: Path) -> int:
-    return plugin_deploy_cli.plugin_versions(settings, args, root)
 
 
 _LOCK_NO_FROM_ERROR = (
@@ -846,7 +826,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     # 経由せず素通りする。DB 接続・初期化も catch 対象に含める (codex I-2)。
     try:
         if args.command == "plugin" and args.plugin_command == "versions":
-            return _plugin_versions(settings, args, root)
+            return plugin_deploy_cli.plugin_versions(settings, args, root)
         conn = connect(root / "data" / "agentic.db")
         init_db(conn)
         try:
@@ -866,15 +846,15 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                 if args.plugin_command == "lock":
                     return _plugin_lock(conn, settings, args, root)
                 if args.plugin_command == "retire":
-                    return _plugin_retire(conn, settings, args, root)
+                    return plugin_deploy_cli.plugin_retire(conn, settings, args, root)
                 if args.plugin_command == "bless":
                     return _plugin_bless(conn, settings, args, root)
                 if args.plugin_command == "disable":
-                    return _plugin_disable(conn, settings, args, root)
+                    return plugin_deploy_cli.plugin_disable(conn, settings, args, root)
                 if args.plugin_command == "rollback":
-                    return _plugin_rollback(conn, settings, args, root)
+                    return plugin_deploy_cli.plugin_rollback(conn, settings, args, root)
                 if args.plugin_command == "revoke":
-                    return _plugin_revoke(conn, settings, args, root)
+                    return plugin_deploy_cli.plugin_revoke(conn, settings, args, root)
                 raise ValueError(f"unknown plugin subcommand: {args.plugin_command!r}")
             if args.command == "improve":
                 return _improve_verify_backend(conn, settings, args, root)

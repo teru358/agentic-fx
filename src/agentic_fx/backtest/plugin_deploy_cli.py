@@ -48,6 +48,12 @@ RETRY_HINT = "  同じコマンドを再実行すると未完の op を引き継
 NOOP_OUTCOMES = frozenset({"already_disabled", "already_retired", "already_revoked"})
 
 
+def is_noop(outcome) -> bool:
+    """An outcome that changes nothing and only has missed notifications left to re-send."""
+    return outcome.outcome in NOOP_OUTCOMES or (
+        outcome.outcome == "refused" and getattr(outcome, "refusal_code", None) == "already_live")
+
+
 @dataclass
 class Report:
     rc: int
@@ -329,7 +335,7 @@ def _isatty() -> bool:
 def _confirm() -> bool:
     try:
         answer = input("続行しますか? [y/N] ")
-    except EOFError:
+    except (EOFError, KeyboardInterrupt):
         return False
     return answer.strip().lower() in ("y", "yes")
 
@@ -374,7 +380,7 @@ def run_op(conn, *, call, render, preview_lines=None, args, recover=None) -> int
                 return _emit(render(outcome))
             if not yes:
                 preview = attempt(True)
-                if preview.outcome in NOOP_OUTCOMES:
+                if is_noop(preview):
                     notified = recover(preview) if recover is not None else ()
                     if notified is None:
                         raise deploy_ops.StateChangedError("state changed after the preview")
@@ -403,8 +409,10 @@ def run_op(conn, *, call, render, preview_lines=None, args, recover=None) -> int
 def _live_text(plugins_root: Path, name: str) -> str:
     live = plugins_root / name
     if live.is_symlink():
-        with contextlib.suppress(OSError):
+        try:
             return _short(os.readlink(live))
+        except OSError:
+            return "symlink (読めない)"
     return "不在" if not os.path.lexists(live) else "plain"
 
 
@@ -461,8 +469,13 @@ def plugin_rollback(conn, settings, args, root: Path) -> int:
             settings=settings, activity=activity, deadline=deadline, dry_run=dry_run,
             expect=expect)
 
+    def recover(outcome):
+        return deploy_rollback.recover_already_live_notifications(
+            conn, plugins_dir, args.name, activity, now=datetime.now(timezone.utc),
+            expect=outcome.expectation, deadline=time.monotonic() + LOCK_WAIT_SECONDS)
+
     return run_op(
-        conn, call=call, args=args,
+        conn, call=call, args=args, recover=recover,
         render=lambda outcome: render_rollback(outcome, conn, args.name, revoke=revoke),
         preview_lines=lambda outcome: preview_rollback(
             outcome, args.name, revoke=revoke, live_text=_live_text(plugins_dir, args.name),
@@ -493,6 +506,10 @@ def plugin_retire(conn, settings, args, root: Path) -> int:
 def plugin_revoke(conn, settings, args, root: Path) -> int:
     plugins_dir, activity = _common(root)
     content_hash = args.version
+    refusal = deploy_rollback.prefix_refusal(
+        content_hash, option="--version", min_length=deploy_versions.MIN_PREFIX)
+    if refusal is not None:
+        return _emit(_failure(refusal.reason, refusal.code))
     if len(content_hash) < 64:
         try:
             data = deploy_versions.collect_versions(conn, plugins_dir, args.name)

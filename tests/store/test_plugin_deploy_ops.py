@@ -793,3 +793,19 @@ def test_get_by_id_returns_the_row_or_none(tmp_path):
 
     assert deploy_ops.get_by_id(conn, op_id)["op_id"] == op_id
     assert deploy_ops.get_by_id(conn, op_id + 100) is None
+
+
+@pytest.mark.parametrize("directory", ["fx#1", "a?b", "p%41"])
+def test_a_database_under_a_path_with_uri_special_characters_opens_read_only(tmp_path, directory):
+    base = tmp_path / directory
+    base.mkdir()
+    db_path = base / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+
+    ro = deploy_ops.open_readonly(db_path)
+
+    assert ro is not None
+    ro.close()
+    assert deploy_ops.count_open_readonly(db_path) == 0

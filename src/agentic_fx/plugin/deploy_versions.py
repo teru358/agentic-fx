@@ -2,36 +2,22 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sqlite3
 from pathlib import Path
 
-from agentic_fx.plugin import loader
+from agentic_fx.plugin import deploy_ops, loader
 from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
 _DIR_NAME_RE = re.compile(r"^[0-9a-f]{64}$")
-_MIN_PREFIX = 12
+MIN_PREFIX = 12
 
 
 def _live_section(plugins_root: Path, name: str) -> dict:
-    live_path = plugins_root / name
-    if live_path.is_symlink():
-        try:
-            target = os.readlink(live_path)
-        except OSError:
-            target = None
-        identity = deploy_store.live_identity(plugins_root, name)
-        return {"kind": "symlink", "target": target,
-                "content_hash": identity.content_hash if identity else None,
-                "artifact_hash": identity.artifact_hash if identity else None}
-    if live_path.is_dir():
-        identity = deploy_store.live_identity(plugins_root, name)
-        return {"kind": "plain", "target": None,
-                "content_hash": identity.content_hash if identity else None,
-                "artifact_hash": None}
-    return {"kind": "absent", "target": None, "content_hash": None, "artifact_hash": None}
+    observed = deploy_ops.observe_live(plugins_root, name)
+    return {"kind": observed.live_kind, "target": observed.live_target,
+            "content_hash": observed.content_hash, "artifact_hash": observed.artifact_hash}
 
 
 def _approved_artifact(approved: dict | None) -> str | None:
@@ -49,10 +35,14 @@ def _version_row(conn: sqlite3.Connection, name: str, directory: Path,
                  live_artifact: str | None) -> dict:
     from agentic_fx.plugin import switch
 
+    actual = None
+    dir_error = None
     try:
-        content = loader.content_hash(directory)
-    except OSError:
+        actual = switch._read_version_dir_hashes(directory)
+        content = actual[0]
+    except (OSError, ValueError) as exc:
         content = None
+        dir_error = type(exc).__name__
     latest = approved = None
     if content is not None:
         latest = approvals_store.latest_decision_for_identity(conn, name, content)
@@ -65,8 +55,9 @@ def _version_row(conn: sqlite3.Connection, name: str, directory: Path,
         "decided_by": latest["decided_by"] if latest else None,
         "approved_at": approved["decided_at"] if approved else None,
         "approved_by": approved["decided_by"] if approved else None,
-        "dir_ok": switch._version_dir_hashes_ok(
-            directory, content_hash=content, artifact_hash=expected_artifact),
+        "dir_ok": actual is not None and switch._version_dir_hashes_ok(
+            directory, content_hash=content, artifact_hash=expected_artifact, actual=actual),
+        "dir_error": dir_error,
         "is_live": live_artifact == directory.name,
     }
 
@@ -126,7 +117,7 @@ def _negate(text: str | None) -> tuple:
 def _short(value: str | None, others: list[str]) -> str:
     if not value:
         return "-"
-    for width in range(_MIN_PREFIX, len(value) + 1):
+    for width in range(MIN_PREFIX, len(value) + 1):
         prefix = value[:width]
         if sum(1 for other in others if other.startswith(prefix)) <= 1:
             return prefix
@@ -146,6 +137,8 @@ def render_versions(data: dict) -> list[str]:
         lines.append(f"symlink -> {live['target']} (version {shown})")
     elif live["kind"] == "plain":
         lines.append("plain directory (legacy; `afx plugin retire` で退避できます)")
+    elif live["kind"] == "other":
+        lines.append("other (symlink でも directory でもない実体です)")
     else:
         lines.append("不在")
     lines.append("-- 版 (先頭 = `rollback --to` に使う版、content = `revoke --version` に使う識別) --")
@@ -161,7 +154,10 @@ def render_versions(data: dict) -> list[str]:
             parts.append(f"承認={version['approved_at']} by {version['approved_by']}")
         if version["decision"] == "rejected":
             parts.append(f"却下={version['decided_at']} by {version['decided_by']}")
-        parts.append("版dir=" + ("整合" if version["dir_ok"] else "不整合"))
+        if version.get("dir_error"):
+            parts.append(f"版dir=整合: 読めない ({version['dir_error']})")
+        else:
+            parts.append("版dir=" + ("整合" if version["dir_ok"] else "不整合"))
         lines.append("  ".join(parts))
     lines.append("-- 経歴 (live の変遷) --")
     if not data["history"]:

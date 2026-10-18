@@ -604,6 +604,8 @@ def _deploy_ops_lines(section) -> list[str]:
     """Open deploy ops and ops needing attention; nothing when there are none."""
     if not isinstance(section, dict):
         return []
+    if section.get("unavailable") is True:
+        return [f"配備操作の状態を読めませんでした ({display_text(section.get('reason'))})"]
     lines = []
     for key, label in (("open", "配備操作が未完"), ("attention", "配備操作に要注意")):
         rows = [row for row in section.get(key) or [] if isinstance(row, dict)]
