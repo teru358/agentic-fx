@@ -3,12 +3,15 @@ AC-23: autopilot 中は GET / reject / ask / jobs / killswitch reconcile だけ�
 from __future__ import annotations
 
 import concurrent.futures
+import json
 
 import pytest
 
 from agentic_fx.ops import ErrorCode, OpsError
 from agentic_fx.ops.contracts import ShellCaller
 from agentic_fx.store import backlog
+from agentic_fx.store import approvals as approvals_store
+from agentic_fx.ops import client
 
 from .conftest import APPROVER, OPERATOR, digest_of, wait_job
 
@@ -100,6 +103,28 @@ def test_ac23_reads_reject_ask_jobs_and_reconcile_pass_under_autopilot(ops_env):
     with pytest.raises(OpsError) as raised:
         service.reconcile_kill_switch(APPROVER)
     assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_approval_detail_and_client_renderer_describe_a_revocation_without_candidate_fields(ops_env):
+    approval_id = approvals_store.create(
+        ops_env.conn, "plugin", {"name": "sma", "content_hash": "a" * 64,
+                                   "artifact_hash": "b" * 64}, ops_env.wall())
+    approvals_store.apply_decision(
+        ops_env.conn, approval_id, "approved", decided_by="operator", now=ops_env.wall())
+    revoke_id = approvals_store.append_revocation(
+        ops_env.conn, "sma", "a" * 64, now=ops_env.wall(), actor="operator")
+    row = ops_env.conn.execute(
+        "SELECT payload_json,reason,status FROM approval_requests WHERE id=?", (revoke_id,)).fetchone()
+    assert row["status"] == "rejected" and row["reason"] == "revoked_by_operator"
+    assert json.loads(row["payload_json"]) == {
+        "name": "sma", "content_hash": "a" * 64, "artifact_hash": "b" * 64,
+        "revokes_approval_id": approval_id}
+
+    detail = ops_env.service().approval_detail(OPERATOR, revoke_id)
+
+    assert detail["status"] == "rejected"
+    assert detail["reason"] == "revoked_by_operator"
+    assert "revoked_by_operator" in client.format_approval_detail(detail)
 
 
 def test_ac23_shell_is_not_restricted_by_autopilot(ops_env):

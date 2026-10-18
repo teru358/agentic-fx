@@ -29,6 +29,11 @@ def _build(tmp_path):
     return {t.name: t for t in tools}, staging_dir, source_dir
 
 
+def test_allowed_relative_paths_are_exactly_the_candidate_file_set():
+    assert improve_staging_tools._ALLOWED_REL == frozenset({
+        "plugin.py", "config.yaml", "test_plugin.py"})
+
+
 def test_write_then_read_staging_file_roundtrips(tmp_path):
     tools, staging_dir, _ = _build(tmp_path)
     out = tools["write_staging_file"].func(

@@ -46,6 +46,15 @@ def test_approval_renderer_shows_only_server_allowed_fields_and_never_claim_bodi
         assert forbidden not in content
 
 
+def test_approval_renderer_marks_a_revoked_approval_without_candidate_fields():
+    content = render_approval(_record(), {
+        "kind": "plugin", "status": "rejected", "reason": "revoked_by_operator",
+        "parent_facts": None, "agent_claims": None,
+    })
+    assert "decision=rejected" in content
+    assert "reason=revoked_by_operator" in content
+
+
 def test_approval_renderer_reprojects_only_the_allowlisted_parent_fact_fields():
     detail = {
         "kind": "plugin", "status": "pending",
