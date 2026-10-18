@@ -30,7 +30,7 @@ from agentic_fx.backtest.mt5_import import (
     ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
-from agentic_fx.config import load_env_file, load_settings
+from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin.history_git import HistoryGitError
@@ -822,7 +822,12 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
         ensure_initialized(root)
     # 設定の検証は環境を変えないので、.env はこの CLI の入口で明示的に読む。
     load_env_file(root / ".env")
-    settings = load_settings(root / "config" / "settings.yaml")
+    try:
+        settings = load_settings(root / "config" / "settings.yaml")
+    except ConfigError as e:
+        if not read_only_view:
+            raise
+        return plugin_deploy_cli.report_config_error(e)
 
     # Fix Round 1 F6 (sonnet I-3): 統一エラー境界。人間向け CLI なので生の
     # traceback を出さない — 診断メッセージを stderr に出して rc=1 とする。

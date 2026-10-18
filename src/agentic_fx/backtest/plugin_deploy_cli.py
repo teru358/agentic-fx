@@ -544,6 +544,12 @@ def plugin_revoke(conn, settings, args, root: Path) -> int:
 
 
 @guarded
+def report_config_error(exc: Exception) -> int:
+    """Refuse with a coded one-line error when the settings cannot be read."""
+    summary = (str(exc).strip().splitlines() or ["不明"])[0]
+    return _emit(_failure(f"設定を読めません: {summary}", "config_error"))
+
+
 def plugin_versions(settings, args, root: Path) -> int:
     """Show one plugin's versions without taking a lock or writing anything."""
     conn = deploy_store.open_readonly(root / "data" / "agentic.db")

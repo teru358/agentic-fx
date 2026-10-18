@@ -826,6 +826,29 @@ def test_versions_on_a_root_without_a_database_creates_nothing_and_says_so(
     assert not (base / "plugins").exists()
 
 
+@pytest.mark.parametrize("content", [None, "a: [unclosed\n  b: : :\n"])
+def test_versions_refuses_missing_or_invalid_settings_with_a_code(
+        tmp_path, monkeypatch, capsys, content):
+    base = _bare_root(tmp_path / "bare")
+    settings = base / "config" / "settings.yaml"
+    if content is None:
+        settings.unlink()
+    else:
+        settings.write_text(content, encoding="utf-8")
+    monkeypatch.chdir(base)
+    before = _tree(base)
+
+    rc, out, err = _run(capsys, "versions", "sma")
+
+    assert rc == 1
+    assert out == ""
+    assert len(err.splitlines()) == 1
+    assert err.startswith("エラー: 設定を読めません: ")
+    assert err.rstrip().endswith("(code=config_error)")
+    assert "Traceback" not in err
+    assert _tree(base) == before
+
+
 def test_versions_on_an_existing_database_leaves_every_file_untouched(world, capsys):
     _versions_scenario(world)
     before = _tree(world.base)
@@ -839,6 +862,8 @@ def test_versions_on_an_existing_database_leaves_every_file_untouched(world, cap
 
 
 def test_versions_does_not_recreate_a_missing_state_lock_file(world, capsys):
+    """The contract is that the database, its schema and every file the app owns stay
+    unchanged. The ``-wal`` / ``-shm`` files SQLite places for a reader are outside it."""
     _versions_scenario(world)
     lock = world.base / "data" / "state" / "app_state.json.lock"
     if lock.exists():
@@ -853,8 +878,9 @@ def test_versions_does_not_recreate_a_missing_state_lock_file(world, capsys):
 
 
 def _tree_without_wal_shm(base: Path):
-    """File list under ``base``; the SQLite ``-shm`` / ``-wal`` companions a read-only
-    reader of a WAL database may place next to it are not app state and are excluded."""
+    """File list under ``base`` without the SQLite ``-shm`` / ``-wal`` files. Those are
+    placed by SQLite for a reader of a WAL database, not by the app, and are excluded
+    from the no-change contract (database, schema and app-owned files are not)."""
     return [entry for entry in _tree(base)
             if not entry[0].endswith(("-shm", "-wal"))]
 
