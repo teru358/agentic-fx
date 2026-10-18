@@ -949,6 +949,7 @@ def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None
         if deadline is None and stop_event is None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         else:
+            announced = False
             while True:
                 if stop_event is not None and stop_event.is_set():
                     raise PluginBusyError("plugin lock cancelled")
@@ -956,6 +957,9 @@ def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     break
                 except BlockingIOError:
+                    if not announced and _plugin_lock_wait_notice is not None:
+                        announced = True
+                        _plugin_lock_wait_notice()
                     if deadline is not None and monotonic() >= deadline:
                         raise PluginBusyError("plugin lock deadline exceeded")
                     remaining = 0.1 if deadline is None else max(0.0, deadline - monotonic())
@@ -1000,6 +1004,29 @@ def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
 
 
 _plugin_lock_owner_guard = None
+_plugin_lock_wait_notice = None
+
+
+def set_plugin_lock_wait_notice(notice):
+    """Install (or clear with ``None``) a callback run once per lock that is found held.
+
+    The CLI uses it to tell the operator that it is waiting for another process.
+    Returns the callback that was installed before, so a caller can put it back.
+    """
+    global _plugin_lock_wait_notice
+    previous = _plugin_lock_wait_notice
+    _plugin_lock_wait_notice = notice
+    return previous
+
+
+@contextlib.contextmanager
+def lock_wait_notice(notice):
+    """Run the block with ``notice`` installed, then restore whatever was there before."""
+    previous = set_plugin_lock_wait_notice(notice)
+    try:
+        yield
+    finally:
+        set_plugin_lock_wait_notice(previous)
 
 
 def set_plugin_lock_owner_guard(guard) -> None:
@@ -1455,31 +1482,39 @@ def _advance_to_decided(
     return True
 
 
+def _read_version_dir_hashes(version_dir: Path) -> tuple[str, str]:
+    """版ディレクトリの実体から `(content_hash, artifact_hash)` を計算する。"""
+    # `loader.content_hash` (モジュール属性参照) を直接呼ぶ — 旧稿の
+    # `_advance_to_decided` が `loader.content_hash(resolved_after)` を
+    # 直呼びしていたのと同じ経路にする (`test_approve_upgrade_
+    # reverifies_content_hash_after_switch` が `monkeypatch.setattr(
+    # "agentic_fx.plugin.switch.loader.content_hash", ...)` でこの
+    # 経路を差し替える契約を持つ — `gate_pytest.hashes_of` 内部の
+    # `_content_hash` は import 時に束縛済みでこの monkeypatch の対象
+    # にならない)。
+    actual_content = loader.content_hash(version_dir)
+    plugin_py = (version_dir / "plugin.py").read_bytes()
+    config_yaml = (version_dir / "config.yaml").read_bytes()
+    test_plugin = (version_dir / "test_plugin.py").read_bytes()
+    return actual_content, loader.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
+
+
 def _version_dir_hashes_ok(version_dir: Path, *, content_hash: str | None,
-                          artifact_hash: str | None) -> bool:
+                          artifact_hash: str | None,
+                          actual: tuple[str, str] | None = None) -> bool:
     """確定-7: 版ディレクトリの内容が期待する `(content_hash, artifact_hash)`
     と一致し、かつディレクトリ名自体も `artifact_hash` と一致することを
     確認する (in-place 編集の検出 — §2.3・§7.1-37)。
     `_reverify_switched_journal` (resume 経路) と `_advance_to_decided`
     (fresh approve 経路) の切替後再照合が同じ規則を共有する
     (確定-7: 旧稿は fresh 経路が content_hash 1 値しか見ておらず、
-    resume 経路だけが artifact_hash 2 値 + dir 名照合を持つ非対称だった)。"""
+    resume 経路だけが artifact_hash 2 値 + dir 名照合を持つ非対称だった)。
+    `actual` は呼び出し側が既に計算した実体の hash で、渡せば再計算しない。"""
     if not version_dir.is_dir():
         return False
     try:
-        # `loader.content_hash` (モジュール属性参照) を直接呼ぶ — 旧稿の
-        # `_advance_to_decided` が `loader.content_hash(resolved_after)` を
-        # 直呼びしていたのと同じ経路にする (`test_approve_upgrade_
-        # reverifies_content_hash_after_switch` が `monkeypatch.setattr(
-        # "agentic_fx.plugin.switch.loader.content_hash", ...)` でこの
-        # 経路を差し替える契約を持つ — `gate_pytest.hashes_of` 内部の
-        # `_content_hash` は import 時に束縛済みでこの monkeypatch の対象
-        # にならない)。
-        actual_content = loader.content_hash(version_dir)
-        plugin_py = (version_dir / "plugin.py").read_bytes()
-        config_yaml = (version_dir / "config.yaml").read_bytes()
-        test_plugin = (version_dir / "test_plugin.py").read_bytes()
-        actual_artifact = loader.artifact_hash_bytes(plugin_py, config_yaml, test_plugin)
+        actual_content, actual_artifact = (
+            actual if actual is not None else _read_version_dir_hashes(version_dir))
     except OSError:
         return False
     return (actual_content == content_hash and actual_artifact == artifact_hash

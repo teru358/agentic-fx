@@ -31,6 +31,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from agentic_fx.store import plugin_deploy_ops as deploy_store
+
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
@@ -502,7 +504,20 @@ class OpsService:
                 raise OpsError(code) from None
             data.update({"mode": state.mode.value, "autopilot": state.autopilot,
                          "kill_switch": kill_switch})
+        deploy_ops = self._deploy_ops_status(deadline)
+        if deploy_ops is not None:
+            data["plugin_deploy_ops"] = deploy_ops
         return data
+
+    def _deploy_ops_status(self, deadline: float) -> dict | None:
+        """Blocking deploy ops and ops needing attention, or an ``unavailable`` marker."""
+        try:
+            with self._ops_lane(deadline):
+                return deploy_store.status_summary(self._conn, now=self._wall_clock())
+        except (OpsError, sqlite3.Error) as exc:
+            _log.warning("status plugin_deploy_ops unavailable: %s", type(exc).__name__)
+            reason = exc.code.value if isinstance(exc, OpsError) else "database_error"
+            return {"unavailable": True, "reason": reason}
 
     def log(self, principal: Caller, limit: int = 20) -> dict:
         _authorize(principal, "log")

@@ -29,6 +29,7 @@ class DisableOutcome:
     version_candidate: str | None = None
     op_id: int | None = None
     notified_op_ids: tuple[int, ...] = ()
+    expectation: deploy_ops.Expectation | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class RevokeOutcome:
     content_hash: str
     op_id: int | None = None
     notified_op_ids: tuple[int, ...] = ()
+    expectation: deploy_ops.Expectation | None = None
 
 
 class _RevokeActivity:
@@ -54,6 +56,33 @@ def _latest_disable_candidate(conn: sqlite3.Connection, name: str) -> str | None
         if row["op_kind"] == "disable_symlink" and row["phase"] == "done":
             return row["subject_content_hash"]
     return None
+
+
+def revoke_expectation(conn: sqlite3.Connection, name: str,
+                       content_hash: str) -> deploy_ops.Expectation:
+    """The latest approval decision of a version, as the state a revoke depends on."""
+    decision = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+    return deploy_ops.Expectation(
+        decision=(int(decision["id"]), str(decision["status"])) if decision else None)
+
+
+def recover_revoke_notifications(conn: sqlite3.Connection, plugins_root: Path, name: str,
+                                 content_hash: str, activity, *, now: datetime,
+                                 expect: deploy_ops.Expectation | None,
+                                 deadline: float | None = None) -> tuple[int, ...] | None:
+    """Attempt missed revoke notifications while the version's decision is as previewed.
+
+    Returns ``None`` (and does nothing) when the decision changed since the preview.
+    """
+    from agentic_fx.plugin import switch
+
+    with switch._plugin_locks(plugins_root, [name], deadline=deadline):
+        if expect is not None and revoke_expectation(conn, name, content_hash) != expect:
+            return None
+        return deploy_ops.recover_notifications(
+            conn, name, _RevokeActivity(activity, content_hash), now=now,
+            include=lambda row: (row["op_kind"] == "revoke"
+                                 and row["subject_content_hash"] == content_hash))
 
 
 def _find_version_identity(plugins_root: Path, name: str, content_hash: str):
@@ -79,8 +108,13 @@ def _find_version_identity(plugins_root: Path, name: str, content_hash: str):
 def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, revoke: bool,
                    force: bool, now: datetime, actor: str = "human_cli", settings,
                    activity=None, deadline: float | None = None, stop_event=None,
-                   dry_run: bool = False) -> DisableOutcome:
-    """Journal-first unlink of a canonical live symlink."""
+                   dry_run: bool = False,
+                   expect: deploy_ops.Expectation | None = None) -> DisableOutcome:
+    """Journal-first unlink of a canonical live symlink.
+
+    ``expect`` is the state a preview showed; a real run refuses with
+    ``StateChangedError``, changing nothing, when the state under the lock differs.
+    """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
 
@@ -97,6 +131,12 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
         live = deploy_store.live_identity(plugins_root, name)
         live_path = plugins_root / name
+        observed = deploy_ops.observe(plugins_root, name, open_row=open_row,
+                                      cascade=report.dependent_names, identity=live)
+        if revoke:
+            observed = deploy_ops.with_revoke_decision(conn, name, observed)
+        if not dry_run:
+            deploy_ops.require_expectation(expect, observed)
         if open_row is not None and open_row["op_kind"] != "disable_symlink":
             raise deploy_ops.DeployOpBlockedError(
                 f"plugin {name!r} has open deploy op op_id={open_row['op_id']} "
@@ -113,7 +153,8 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             op_id = int(open_row["op_id"])
             if dry_run:
                 return DisableOutcome("dry_run", name, op_id=op_id,
-                                      cascade_strategies=tuple(sorted(report.dependent_names)))
+                                      cascade_strategies=tuple(sorted(report.dependent_names)),
+                                      expectation=observed)
             deploy_ops.settle_op(conn, open_row, "done", activity, now=now)
             return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                                   tuple(sorted(report.dependent_names)), op_id=op_id)
@@ -124,7 +165,8 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
                 return DisableOutcome("revoke_requires_version", name,
                                       version_candidate=_latest_disable_candidate(conn, name),
                                       notified_op_ids=notified)
-            return DisableOutcome("already_disabled", name, notified_op_ids=notified)
+            return DisableOutcome("already_disabled", name, notified_op_ids=notified,
+                                  expectation=observed)
         if live.kind == "plain":
             raise ValueError(f"plugins/{name} is a plain directory; use afx plugin retire")
         raw_target = os.readlink(live_path)
@@ -147,7 +189,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             raise ValueError(f"no approved version for {name!r} {live.content_hash!r}")
         if dry_run:
             return DisableOutcome("dry_run", name, cascade_strategies=tuple(sorted(report.dependent_names)),
-                                  dependents=report.unresolvable)
+                                  dependents=report.unresolvable, expectation=observed)
         if open_row is not None:
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
         if op_id is None:
@@ -184,8 +226,14 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
 
 def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, content_hash: str,
                    now: datetime, actor: str = "human_cli", activity=None,
-                   deadline: float | None = None, stop_event=None) -> RevokeOutcome:
-    """Revoke a non-live version and link its pending/claimed signals atomically."""
+                   deadline: float | None = None, stop_event=None,
+                   dry_run: bool = False,
+                   expect: deploy_ops.Expectation | None = None) -> RevokeOutcome:
+    """Revoke a non-live version and link its pending/claimed signals atomically.
+
+    ``expect`` is the state a preview showed; a real run refuses with
+    ``StateChangedError`` when the latest decision of the version changed since.
+    """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
     from agentic_fx.plugin import switch
@@ -193,9 +241,20 @@ def revoke_version(conn: sqlite3.Connection, plugins_root: Path, name: str, *, c
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=set())
         if open_row is not None:
             raise deploy_ops.DeployOpBlockedError(f"plugin {name!r} has open deploy op")
+        observed = revoke_expectation(conn, name, content_hash)
+        if not dry_run:
+            deploy_ops.require_expectation(expect, observed)
         live = deploy_store.live_identity(plugins_root, name)
         if live is not None and live.content_hash == content_hash:
             raise ValueError("cannot revoke the current live version; disable it first")
+        if dry_run:
+            decision = approvals_store.latest_decision_for_identity(conn, name, content_hash)
+            if decision is None:
+                raise ValueError(f"no approved plugin approval for {name!r} {content_hash!r}")
+            if decision["status"] == "rejected":
+                return RevokeOutcome("already_revoked", name, content_hash,
+                                     expectation=observed)
+            return RevokeOutcome("dry_run", name, content_hash, expectation=observed)
         found = _find_version_identity(plugins_root, name, content_hash)
         dir_artifact = found[1] if found is not None else None
         mismatch_artifact: str | None = None

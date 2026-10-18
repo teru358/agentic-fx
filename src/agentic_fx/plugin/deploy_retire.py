@@ -24,6 +24,7 @@ class RetireOutcome:
     cascade_strategies: tuple[str, ...] = ()
     dependents: tuple[tuple[str, str, str], ...] = ()
     reason: str | None = None
+    expectation: deploy_ops.Expectation | None = None
 
 
 def _plain(path: Path) -> bool:
@@ -37,8 +38,14 @@ def _retired_path(name: str, now: datetime, op_id: int) -> str:
 def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, force: bool,
                   now: datetime, actor: str = "human_cli", settings, activity=None,
                   deadline: float | None = None, stop_event=None,
-                  dry_run: bool = False) -> RetireOutcome | deploy_disable.DisableOutcome:
-    """Retire a plain live directory, or run the disable state machine for symlinks."""
+                  dry_run: bool = False,
+                  expect: deploy_ops.Expectation | None = None
+                  ) -> RetireOutcome | deploy_disable.DisableOutcome:
+    """Retire a plain live directory, or run the disable state machine for symlinks.
+
+    ``expect`` is the state a preview showed; a real run refuses with
+    ``StateChangedError``, changing nothing, when the state under the lock differs.
+    """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
     live_path = Path(plugins_root) / name
@@ -48,7 +55,7 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
         return deploy_disable.disable_plugin(
             conn, plugins_root, name, revoke=False, force=force, now=now, actor=actor,
             settings=settings, activity=activity, deadline=deadline, stop_event=stop_event,
-            dry_run=dry_run)
+            dry_run=dry_run, expect=expect)
 
     report_box: list[DependentsReport] = []
 
@@ -68,6 +75,10 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                 f"(op_id={journal['op_id']}) — resolve it first "
                 "(reconcile or approval retry)")
         open_row = deploy_ops.check_can_start_op(conn, name, dependents=report.dependent_names)
+        observed = deploy_ops.observe(plugins_root, name, open_row=open_row,
+                                      cascade=report.dependent_names)
+        if not dry_run:
+            deploy_ops.require_expectation(expect, observed)
         live_plain = _plain(live_path)
         live_identity = deploy_store.live_identity(plugins_root, name) if live_plain else None
         subject_content_hash = (
@@ -96,7 +107,7 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
             if dry_run:
                 return RetireOutcome("dry_run", name, op_id, retired_path,
                                      cascade_strategies=tuple(sorted(report.dependent_names)),
-                                     dependents=report.unresolvable)
+                                     dependents=report.unresolvable, expectation=observed)
             if not live_plain:
                 if not os.path.lexists(live_path) and retired.exists():
                     deploy_ops.settle_op(conn, open_row, "done", activity, now=now)
@@ -116,13 +127,14 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                                      "(retire only applies to legacy plain live)")
                 notified = (() if dry_run else deploy_ops.recover_notifications(
                     conn, name, deploy_ops.activity_or_null(activity), now=now))
-                return RetireOutcome("already_retired", name, notified_op_ids=notified)
+                return RetireOutcome("already_retired", name, notified_op_ids=notified,
+                                     expectation=observed)
             if report.unresolvable and not force:
                 return RetireOutcome("dependents_blocked", name, dependents=report.unresolvable)
             if dry_run:
                 return RetireOutcome("dry_run", name,
                                      cascade_strategies=tuple(sorted(report.dependent_names)),
-                                     dependents=report.unresolvable)
+                                     dependents=report.unresolvable, expectation=observed)
             retired_root = Path(plugins_root) / "_retired"
             retired_root.mkdir(exist_ok=True)
             if os.stat(plugins_root).st_dev != os.stat(retired_root).st_dev:

@@ -592,6 +592,30 @@ def _num(value) -> str:
 _SETUP_SEVERITIES = frozenset({"info", "warn", "action"})
 
 
+def _deploy_op_text(row: dict) -> str:
+    phase = display_text(row.get("phase"))
+    if row.get("fail_reason"):
+        phase += "/" + display_text(row.get("fail_reason"))
+    return (f"{display_text(row.get('name'))} {display_text(row.get('op_kind'))} {phase} "
+            f"op_id={_ident(row.get('op_id'))}")
+
+
+def _deploy_ops_lines(section) -> list[str]:
+    """Open deploy ops and ops needing attention; nothing when there are none."""
+    if not isinstance(section, dict):
+        return []
+    if section.get("unavailable") is True:
+        return [f"配備操作の状態を読めませんでした ({display_text(section.get('reason'))})"]
+    lines = []
+    for key, label in (("open", "配備操作が未完"), ("attention", "配備操作に要注意")):
+        rows = [row for row in section.get(key) or [] if isinstance(row, dict)]
+        if rows:
+            shown = "; ".join(_deploy_op_text(row) for row in rows[:5])
+            more = f" ほか {len(rows) - 5} 件" if len(rows) > 5 else ""
+            lines.append(f"{label}: {len(rows)} 件 ({shown}{more}) — `afx plugin versions <name>`")
+    return lines
+
+
 def format_status(data: dict) -> str:
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
@@ -620,6 +644,7 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+    lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     setup = data.get("setup")
     record_state = setup.get("record_state") if isinstance(setup, dict) else None
     if record_state == "unknown":

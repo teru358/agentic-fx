@@ -85,6 +85,16 @@ def latest_decision_for_identity(conn: sqlite3.Connection, name: str,
     return dict(latest[0])
 
 
+def latest_approved_for_identity(conn: sqlite3.Connection, name: str,
+                                 content_hash: str) -> dict | None:
+    """Return the most recent approval (status ``approved``) of an identity, if any."""
+    approved = [item for item in _identity_decisions(conn, name, content_hash)
+                if item[0]["status"] == "approved"]
+    if not approved:
+        return None
+    return dict(max(approved, key=lambda item: (item[2], item[0]["id"]))[0])
+
+
 def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
                       now: datetime, actor: str = "human_cli",
                       commit: bool = True) -> int | None:

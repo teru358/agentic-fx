@@ -66,6 +66,7 @@ class RollbackOutcome:
     op_id: int | None = None
     notified_op_ids: tuple[int, ...] = ()
     live_removed: bool = False
+    expectation: deploy_ops.Expectation | None = None
 
 
 def _version_target(name: str, artifact_hash: str) -> str:
@@ -89,9 +90,21 @@ def _live_raw_target(plugins_root: Path, name: str) -> str | None:
         return None
 
 
+def prefix_refusal(prefix: str, *, option: str = "--to",
+                   min_length: int = 1) -> RollbackRefusal | None:
+    """Refuse a version prefix that is not lowercase hex of at least ``min_length``."""
+    if not _HASH_PREFIX_RE.fullmatch(prefix) or len(prefix) < min_length:
+        return RollbackRefusal(
+            "bad_target",
+            f"{option} {prefix!r} is not a lowercase hex prefix of at least {min_length} characters"
+            if min_length > 1 else f"{option} {prefix!r} is not a lowercase hex prefix")
+    return None
+
+
 def _resolve_prefix(plugins_root: Path, name: str, prefix: str) -> RollbackTarget | RollbackRefusal:
-    if not _HASH_PREFIX_RE.fullmatch(prefix):
-        return RollbackRefusal("bad_target", f"--to {prefix!r} is not a lowercase hex prefix")
+    refusal = prefix_refusal(prefix)
+    if refusal is not None:
+        return refusal
     base = plugins_root / ".versions" / name
     matches: list[str] = []
     if base.is_dir():
@@ -333,11 +346,47 @@ def close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, open
                            live_removed=live_removed)
 
 
+def _recover_latest_rollback(conn: sqlite3.Connection, name: str, live_target: str,
+                             activity, *, now: datetime) -> tuple[int, ...]:
+    """Re-send the missed notification of the latest closed rollback that put ``live_target`` live."""
+    latest_closed = max(
+        (row for row in deploy_store.list_by_name(conn, name) if deploy_store.is_closed(row)),
+        key=lambda row: int(row["op_id"]), default=None)
+    if (latest_closed is None or latest_closed["op_kind"] != "rollback_symlink"
+            or latest_closed["to_target"] != live_target):
+        return ()
+    return deploy_ops.recover_notifications(
+        conn, name, deploy_ops.activity_or_null(activity), now=now,
+        include=lambda row: row["op_id"] == latest_closed["op_id"])
+
+
+def recover_already_live_notifications(
+        conn: sqlite3.Connection, plugins_root: Path, name: str, activity, *, now: datetime,
+        expect: deploy_ops.Expectation | None,
+        deadline: float | None = None) -> tuple[int, ...] | None:
+    """Re-send the missed notification of an already-live rollback, only while the live entry
+    is as previewed. Returns ``None`` (and does nothing) when it changed since the preview."""
+    from agentic_fx.plugin import switch
+
+    with switch._plugin_locks(plugins_root, [name], deadline=deadline):
+        if expect is not None and not deploy_ops.observe_live(plugins_root, name).same_live(expect):
+            return None
+        live_target = _live_raw_target(plugins_root, name)
+        if live_target is None:
+            return ()
+        return _recover_latest_rollback(conn, name, live_target, activity, now=now)
+
+
 def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, to: str | None,
                     revoke: bool, force: bool, now: datetime, actor: str = "human_cli",
                     settings, activity=None, deadline: float | None = None, stop_event=None,
-                    dry_run: bool = False) -> RollbackOutcome:
-    """Journal-first replacement of a canonical live symlink by an earlier version."""
+                    dry_run: bool = False,
+                    expect: deploy_ops.Expectation | None = None) -> RollbackOutcome:
+    """Journal-first replacement of a canonical live symlink by an earlier version.
+
+    ``expect`` is the state a preview showed; a real run refuses with
+    ``StateChangedError``, changing nothing, when the state under the lock differs.
+    """
     if not loader.is_canonical_plugin_name(name):
         raise ValueError(f"invalid plugin name: {name!r}")
 
@@ -364,6 +413,13 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 f"op_kind={open_row['op_kind']}")
         live = deploy_store.live_identity(plugins_root, name)
         live_path = plugins_root / name
+        observed = deploy_ops.observe(
+            plugins_root, name, open_row=open_row, cascade=report.dependent_names,
+            identity=live, to_target=target.to_target if isinstance(target, RollbackTarget) else None)
+        if revoke:
+            observed = deploy_ops.with_revoke_decision(conn, name, observed)
+        if not dry_run:
+            deploy_ops.require_expectation(expect, observed)
         if live is not None and live.kind == "plain":
             raise ValueError(f"plugins/{name} is a plain directory; use afx plugin retire")
         raw_target = None
@@ -391,7 +447,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                         "signature than the requested rollback — wait for reconcile "
                         "or restart the daemon")
                 return RollbackOutcome("dry_run", name, to_target=to_target,
-                                       op_id=int(open_row["op_id"]))
+                                       op_id=int(open_row["op_id"]), expectation=observed)
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
             _finish(conn, op_id, "done", activity, now=now)
             return _success(name, op_id, to_target, report.dependent_names)
@@ -400,18 +456,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             notified = ()
             if (not dry_run and raw_target is not None
                     and target.code in {"already_live", "target_required"}):
-                latest_closed = max(
-                    (row for row in deploy_store.list_by_name(conn, name)
-                     if deploy_store.is_closed(row)),
-                    key=lambda row: int(row["op_id"]), default=None)
-                if (latest_closed is not None
-                        and latest_closed["op_kind"] == "rollback_symlink"
-                        and latest_closed["to_target"] == raw_target):
-                    notified = deploy_ops.recover_notifications(
-                        conn, name, deploy_ops.activity_or_null(activity), now=now,
-                        include=lambda row: row["op_id"] == latest_closed["op_id"])
+                notified = _recover_latest_rollback(
+                    conn, name, raw_target, activity, now=now)
             return RollbackOutcome("refused", name, reasons=(target.reason,),
-                                   refusal_code=target.code, notified_op_ids=notified)
+                                   refusal_code=target.code, notified_op_ids=notified,
+                                   expectation=observed)
         lost_source = (open_row is not None and live is None
                        and open_row["from_kind"] == "symlink"
                        and not os.path.lexists(live_path))
@@ -451,7 +500,7 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
         if dry_run:
             return RollbackOutcome("dry_run", name, cascade_strategies=tuple(sorted(cascade)),
                                    dependents=verified.dependents.unresolvable,
-                                   to_target=verified.to_target)
+                                   to_target=verified.to_target, expectation=observed)
         requested = _requested_signature(
             name, open_row, live, verified.to_target, revoke, force, lost_source)
         if open_row is not None:
