@@ -1,14 +1,16 @@
 """Explicit, line-preserving migrations for settings schema versions."""
 from __future__ import annotations
 
+import re
+
 import yaml
 
 from agentic_fx.config import Settings
 from agentic_fx.setup.settings_edit import EditResult, find_duplicate_keys
 
 
-CURRENT_SCHEMA_VERSION = 2
-_SCHEMA_LINE = "schema_version: 2  # [init] settings の版。`afx init` が移行する\n"
+CURRENT_SCHEMA_VERSION = 3
+_SCHEMA_LINE = "schema_version: 3  # [init] settings の版。`afx init` が移行する\n"
 _V1_SCHEMA_LINE = "schema_version: 1  # settings の版。`afx init` が移行する\n"
 
 
@@ -66,6 +68,66 @@ def _migrate_one_to_two(text: str) -> EditResult:
     return _failure("schema_version: 1 の行を見つけられません。手で編集してください。")
 
 
+_PLUGIN_LOCK_LINE = ("plugin_lock_timeout_sec: 2      "
+                     "# signal producer / OPEN の plugin name lock 待機上限 (秒)\n")
+_RECONCILE_LOCK_LINE = ("reconcile_lock_timeout_sec: 30  "
+                        "# 起動時 deploy reconcile 全体の plugin name lock 待機上限 (秒)\n")
+
+
+_VERSION_TWO_LINE = re.compile(r"schema_version:[ \t]*2([ \t]+#.*)?\r?\n?")
+
+
+def _migrate_two_to_three(text: str) -> EditResult:
+    """Bump the marker to v3 and add the worker lock timeouts that are absent.
+
+    ``worker.plugin_lock_timeout_sec`` and ``worker.reconcile_lock_timeout_sec`` are
+    each appended only when missing; an existing value is never touched. When
+    ``worker`` is absent or not a block mapping the model defaults apply, so only
+    the marker changes.
+    """
+    lines = text.splitlines(keepends=True)
+    marker = next((i for i, line in enumerate(lines) if _VERSION_TWO_LINE.fullmatch(line)), None)
+    if marker is None:
+        return _failure("schema_version: 2 の行を見つけられません。手で編集してください。")
+    lines[marker] = lines[marker].replace("schema_version: 2", "schema_version: 3", 1)
+    raw = yaml.safe_load(text) or {}
+    worker = raw.get("worker")
+    if isinstance(worker, dict) and ("plugin_lock_timeout_sec" not in worker
+                                     or "reconcile_lock_timeout_sec" not in worker):
+        head = next((i for i, line in enumerate(lines) if line.startswith("worker:")), None)
+        child = None
+        if head is not None:
+            for i in range(head + 1, len(lines)):
+                stripped = lines[i].strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if lines[i][0] in " \t":
+                    child = i
+                break
+        if child is not None:
+            indent = lines[child][:len(lines[child]) - len(lines[child].lstrip())]
+            last = child
+            for i in range(child, len(lines)):
+                if lines[i].strip() and not lines[i].startswith(indent):
+                    break
+                if lines[i].strip() and not lines[i].strip().startswith("#"):
+                    last = i
+            if not lines[last].endswith("\n"):
+                lines[last] += "\n"
+            additions = []
+            if "plugin_lock_timeout_sec" not in worker:
+                additions.append(indent + _PLUGIN_LOCK_LINE)
+            if "reconcile_lock_timeout_sec" not in worker:
+                additions.append(indent + _RECONCILE_LOCK_LINE)
+            lines[last + 1:last + 1] = additions
+    updated = "".join(lines)
+    try:
+        Settings.model_validate(yaml.safe_load(updated) or {})
+    except Exception as error:
+        return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
+    return EditResult(ok=True, text=updated)
+
+
 def migrate(text: str) -> EditResult:
     """Migrate a settings document only through the explicitly listed versions."""
     duplicates = find_duplicate_keys(text)
@@ -83,6 +145,8 @@ def migrate(text: str) -> EditResult:
             result = _migrate_zero_to_one(text)
         elif version == 1:
             result = _migrate_one_to_two(text)
+        elif version == 2:
+            result = _migrate_two_to_three(text)
         else:
             return _failure("この settings の移行経路がありません。手で編集してください。")
         if not result.ok or result.text is None:

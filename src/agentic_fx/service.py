@@ -55,7 +55,7 @@ from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
 from agentic_fx.loops.trade_loop import _TRADE_TOOLS, TradeLoop
-from agentic_fx.plugin import switch
+from agentic_fx.plugin import deploy_reconcile, switch
 from agentic_fx.plugin.sandbox import reap_orphans, startup_diagnostics
 from agentic_fx.plugin.signal_producer import SignalProducer
 from agentic_fx.policy import Policy, directives_path
@@ -754,6 +754,8 @@ class App:
     api: object | None = None
     # build_app が解決した root (起動時表示が記録を読むために使う)。
     root: Path | None = None
+    conn_signal: object | None = None
+    signal_connection_failures: int = 0
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -765,6 +767,8 @@ class App:
             ("conn_ops", lambda: self.conn_ops.close()
              if self.conn_ops is not None else None),
             ("conn_supervisor", self.conn_supervisor.close),
+            ("conn_signal", lambda: self.conn_signal.close()
+             if self.conn_signal is not None else None),
             ("conn_core", self.conn_core.close),
             ("conn_shell", self.conn_shell.close),
             ("instance_lock", self.instance_lock.close),
@@ -1068,7 +1072,8 @@ class _SupervisorAsk:
 
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
-                            now: datetime, resolved_by_identity, activity=None) -> None:
+                            now: datetime, resolved_by_identity, activity=None,
+                            plugins_root=None) -> None:
     """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
     関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
     する)。
@@ -1104,7 +1109,8 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
     signal_producer.evaluate_due_plugins(
         conn=conn, plugins=approved, now=now,
         source=source, settings=settings,
-        resolved_by_identity=resolved_by_identity, activity=activity)
+        resolved_by_identity=resolved_by_identity, activity=activity,
+        plugins_root=plugins_root)
 
 
 def _raise_if_start_marker_present(root: Path) -> None:
@@ -1142,7 +1148,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
               clock: Clock | None = None, quote_fn=None, spec_fn=None,
               bars_fn=None, embedding_fn=None,
               provider: PriceProvider | None = None,
-              stop_event: threading.Event | None = None) -> App:
+              stop_event: threading.Event | None = None,
+              core_lock_factory=threading.RLock) -> App:
     """全部品を配線して `App` を返す。
 
     quote_fn / spec_fn / bars_fn / embedding_fn は E2E テストの注入点 (None なら
@@ -1197,6 +1204,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     instance_lock = _acquire_lock_unless_enrolling(root)
     # 失敗時に閉じるため、ops 層の資源は try の外で名前を用意しておく。
     conn_ops = None
+    conn_signal = None
     ops_service = None
 
     try:
@@ -1207,6 +1215,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 "新規 OPEN は止まる。`killswitch reconcile` で確認")
         conn_core = connect(root / "data" / "agentic.db")
         init_db(conn_core)
+        conn_signal = connect(root / "data" / "agentic.db")
         seeded = seed_default_sources(conn_core, clock.now())
         if seeded:
             activity.write(Category.NEWS, "sources_seeded",
@@ -1311,7 +1320,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         plugins_dir = root / "plugins"
 
-        # プラン 10 Task 11f: 起動時 reconcile (journal-first) → 孤児掃除
+        # 起動時 deploy reconcile → switch journal reconcile → 孤児掃除
         # (sweep-last) → 期限切れ承認処理 (B-7: 裁定1の唯一の呼び出し元)。
         # `missions.recover_interrupted` (上記) より後・`approved_plugins()`
         # (直後) より前に配線する — reconcile 未実行のまま approved_plugins
@@ -1325,8 +1334,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # (毎起動で再現し、人間が該当ジャーナル行を手で片付けるまで恒久的に
         # 続く欠陥)。§5.1-1 の収束規則は「どちらでもない → ERROR で人間待ち」
         # を行ごとの規則として書いており、reconcile 自身の per-row 分離
-        # (switch.py 側で実施済み) と対で、3 呼び出しも互いに独立させる —
-        # 呼び出し順序 (reconcile → sweep → expire) 自体は変えない。
+        # (switch.py 側で実施済み) と対で、各呼び出しも互いに独立させる。
+        try:
+            deploy_reconcile.reconcile_deploy_ops(
+                conn_core, plugins_dir, now=clock.now(), settings=settings,
+                activity=activity,
+                lock_timeout_sec=settings.worker.reconcile_lock_timeout_sec,
+                stop_event=stop_event)
+        except Exception as exc:
+            activity.write(Category.APPROVAL, "plugin_deploy_reconcile_failed",
+                           safe_error_text(exc))
         try:
             switch.reconcile_switch_journals(
                 conn_core, plugins_root=plugins_dir, now=clock.now(),
@@ -1399,7 +1416,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 上書き 3: MissionWatch は 1 インスタンスを trade_loop / reflection に共有注入
         mission_watch = MissionWatch()
 
-        core_lock = threading.RLock()
+        core_lock = core_lock_factory()
 
         # プラン 8 (Task 15, レビュー反映1回目 裁定書 F-6/CR-5): TradeLoop の
         # provider は healthcheck 専用 (lock 外で呼ばれる) — 書込可能な
@@ -1441,18 +1458,21 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                                econ=econ, policy=policy, activity=activity,
                                notifier=notifier, clock=clock,
                                core_lock=core_lock, conn_supervisor=conn_supervisor,
-                               watch=mission_watch)
+                               watch=mission_watch, plugins_root=plugins_dir,
+                               resolved_by_identity=dict(inventory_result.resolved))
         reflection = ReflectionCycle(conn=conn_core, runner=runner, rag=rag,
                                      settings=settings, activity=activity,
                                      clock=clock, core_lock=core_lock,
                                      watch=mission_watch)
 
-        def _trade_fn(trigger: str, decision_bars=None):
+        def _trade_fn(trigger: str, decision_bars=None, signal_max_id=None):
             # プラン 8 (Task 15): TradeLoop 自身が prepare/commit-core で
             # core_lock を保持する五相構造になったため、ここでは lock を
             # 掴まない (二重取得は RLock で技術的には安全だが、run 相の
             # 間ずっと lock を保持したままになり Task 15 の目的を無効化する)。
-            return trade_loop.run_once(trigger, decision_bars=decision_bars)
+            return trade_loop.run_once(
+                trigger, decision_bars=decision_bars,
+                signal_max_id=signal_max_id)
 
         def _reflection_fn():
             # プラン 8 (Task 16): ReflectionCycle 自身が prepare/commit-core で
@@ -1527,21 +1547,32 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             # trigger は scheduler._trade_mission_due() が返した起動理由。
             # decision_bars はその tick に前進した (pair, 判断足) の確定足。
             # 受理/拒否と拒否理由をそのまま scheduler へ返す。
-            return supervisor.try_submit("trade", trigger=trigger,
-                                         decision_bars=decision_bars)
+            row = conn_core.execute("SELECT COALESCE(MAX(id), 0) FROM signals").fetchone()
+            return supervisor.try_submit(
+                "trade", trigger=trigger, decision_bars=decision_bars,
+                signal_max_id=row[0])
 
         # プラン 7 Task 8: signal 起動の判定・保守処理を Scheduler へ配線する。
+
         def on_signal_maintenance(now: datetime) -> None:
+            if not _repair_signal_connection(app):
+                return
             # codex plan r2 束2 Critical: キーは `InventoryBuildResult.
             # resolved` と同じ `(name, content_hash)` のまま渡す —
             # `content_hash` だけへ潰すと、同一 content_hash・別名の 2
             # strategy が存在するとき、どちらか一方の `ResolvedIndicatorSet`
             # が失われる。
-            _run_signal_maintenance(
-                conn=conn_core, signal_producer=signal_producer,
-                approved=approved, settings=settings, now=now,
-                resolved_by_identity=dict(inventory_result.resolved),
-                activity=activity)
+            try:
+                if scheduler.state_fn() == "ready":
+                    _run_signal_maintenance(
+                        conn=app.conn_signal, signal_producer=signal_producer,
+                        approved=approved, settings=settings, now=now,
+                        resolved_by_identity=dict(inventory_result.resolved),
+                        activity=activity, plugins_root=plugins_dir)
+            except Exception:  # noqa: BLE001
+                _log.exception("signal maintenance failed")
+            finally:
+                _repair_signal_connection(app)
 
         requirement_registry = build_registry(settings, approved)
         retention_plan = ohlcv.build_retention_plan(
@@ -1669,7 +1700,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage)
         commands.use_ops_service(ops_service)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
-        return App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
+        app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
                    collector=collector, rag=rag, trade_loop=trade_loop,
@@ -1685,7 +1716,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    watchdog_heartbeat=watchdog_heartbeat,
                    fatal_reason=None, ingest=ingest, outage=outage,
                    ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered,
-                   root=root)
+                   root=root, conn_signal=conn_signal)
+        return app
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
         # `instance_lock.close()` だと close 自身が送出した例外が伝播し、
@@ -1703,6 +1735,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         if conn_ops is not None:
             try:
                 conn_ops.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if conn_signal is not None:
+            try:
+                conn_signal.close()
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -2049,6 +2086,7 @@ def _scheduler_tick_once(app: App) -> None:
                 _log.exception("failed to record ingest prepare failure")
     pending = []
     deferred: list = []
+    tick_error: Exception | None = None
     try:
         with app.core_lock:
             # commit → observe (resume 要求の判定を含む) → scheduler.tick()
@@ -2085,12 +2123,19 @@ def _scheduler_tick_once(app: App) -> None:
                         _log.exception("failed to record outage observe failure")
             with app.executor.defer_notifications() as deferred:
                 pending = app.scheduler.tick(now)
+    except Exception as exc:  # noqa: BLE001 — maintenance を走らせた後で再送出する
+        tick_error = exc
     finally:
         for text in deferred:
             try:
                 app.executor.notifier.send(text)
             except Exception:  # noqa: BLE001 — 通知失敗で tick/hook を止めない
                 _log.exception("deferred scheduler notification failed")
+    if tick_error is not None:
+        # tick が例外で抜けると遅延 callable は失われる。signal の接続修復を
+        # 含む maintenance は core_lock 解放後にここで 1 回だけ実行する。
+        app.scheduler.run_signal_maintenance(now)
+        raise tick_error
     for hook in pending:
         hook()
 
@@ -2145,6 +2190,44 @@ def _thread_has_died(thread_obj) -> bool:
     「ident が付いていて、かつ生きていない」= 本当に死んだ、と判定できる。
     """
     return getattr(thread_obj, "ident", 1) is not None and not thread_obj.is_alive()
+
+
+def _repair_signal_connection(app: App) -> bool:
+    """signal maintenance 専用接続を使える状態にする。使えれば True。
+
+    接続が無い、transaction が残り rollback できない、rollback 後も
+    transaction が残る、のいずれかなら旧接続を捨てて `connect()` で
+    作り直し `App.conn_signal` を差し替える。作り直しに失敗したら
+    `signal_conn_unavailable` を記録して False を返し、連続 3 回で fatal に乗せる。"""
+    conn = app.conn_signal
+    broken = conn is None
+    if conn is not None:
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+                broken = bool(conn.in_transaction)
+        except Exception:  # noqa: BLE001
+            broken = True
+    if not broken:
+        app.signal_connection_failures = 0
+        return True
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        app.conn_signal = None
+    try:
+        app.conn_signal = connect(app.root / "data" / "agentic.db")
+    except Exception as exc:  # noqa: BLE001
+        app.signal_connection_failures += 1
+        app.health_latch.record_failure(
+            "signal_conn_unavailable: " + safe_error_text(exc))
+        if app.signal_connection_failures >= 3:
+            _record_fatal(app, app.stop_event, "signal connection unavailable")
+        return False
+    app.signal_connection_failures = 0
+    return True
 
 
 def _record_fatal(app: App, stop_event: threading.Event, reason: str) -> None:
@@ -2227,6 +2310,7 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
     busy: set[str] = set()
     if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
         busy.add("conn_core")
+        busy.add("conn_signal")
         # レビュー2周目 codex Critical: `instance_lock` は単なる close 対象
         # ではなく**残存 App 全体の単一起動所有権**を表す。残存スレッドが
         # 旧 App の DB/broker/runner を使っているのに flock を解放すると、

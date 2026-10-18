@@ -615,6 +615,37 @@ def test_reclaim_expired_abandons_linked_claimed_signal_and_keeps_unlinked_pendi
     assert _status(conn, plain) == "pending"
 
 
+def test_startup_recovery_leaves_linked_signal_unclaimable_after_requeue(tmp_path):
+    """A deploy-linked signal recovered from an interrupted mission stays hidden."""
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked = _linked_claimed(conn, mission_id, link=True)
+
+    result = missions.recover_interrupted(conn, now=NOW, max_requeue=3)
+
+    assert result["signals_requeued"] == 1
+    assert _status(conn, linked) == "pending"
+    next_mission = missions.start(conn, "trade", "local", "model", NOW)
+    assert signals.claim_oldest(
+        conn, mission_id=next_mission, now=NOW, freshness_bars=2) is None
+
+
+def test_lease_recovery_linked_signal_cannot_be_claimed_again(tmp_path):
+    """Lease expiry terminalizes a deploy-linked claim before another mission sees it."""
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked = _linked_claimed(conn, mission_id, link=True)
+
+    statuses = signals.reclaim_expired(
+        conn, now=NOW + timedelta(hours=1), lease_min=10, max_requeue=3)
+
+    assert statuses == ["abandoned"]
+    assert _status(conn, linked) == "abandoned"
+    next_mission = missions.start(conn, "trade", "local", "model", NOW)
+    assert signals.claim_oldest(
+        conn, mission_id=next_mission, now=NOW, freshness_bars=2) is None
+
+
 def test_expire_stale_abandons_linked_pending_signal(tmp_path):
     conn = _conn(tmp_path)
     stale = signals.add(

@@ -209,7 +209,8 @@ def add(conn: sqlite3.Connection, *, plugin: str, content_hash: str,
 
 
 def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
-                  now: datetime, freshness_bars: int | None) -> dict | None:
+                  now: datetime, freshness_bars: int | None,
+                  max_id: int | None = None) -> dict | None:
     """bar_ts 最古の pending 1 行を原子的に claimed へ遷移して返す。
 
     ``freshness_bars=None`` は鮮度ゲートそのものを WHERE から外す
@@ -220,6 +221,9 @@ def claim_oldest(conn: sqlite3.Connection, *, mission_id: int,
     _require_aware(now, "now")
     params: dict = {"mission_id": mission_id, "now": now.isoformat()}
     claimable = _claimable_where(freshness_bars, params)
+    if max_id is not None:
+        params["max_id"] = max_id
+        claimable += " AND id <= :max_id"
     cur = conn.execute(
         "UPDATE signals SET status='claimed', "
         "claimed_by_mission_id=:mission_id, claimed_at=:now "

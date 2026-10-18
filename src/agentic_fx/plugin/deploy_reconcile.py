@@ -5,6 +5,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -167,13 +168,13 @@ def _row_dependents(conn, plugins_root: Path, row: dict, settings) -> set[str]:
 
 
 def _reconcile_one(conn, plugins_root: Path, row: dict, *, now, settings, activity,
-                   lock_timeout_sec: float, stop_event) -> ReconcileResult | None:
+                   deadline: float, stop_event) -> ReconcileResult | None:
     name = row["name"]
     try:
         with deploy_ops.acquire_op_locks(
                 plugins_root, name,
                 enumerate_dependents=lambda: _row_dependents(conn, plugins_root, row, settings),
-                deadline=time.monotonic() + lock_timeout_sec,
+                deadline=deadline,
                 stop_event=stop_event) as locked:
             current = deploy_store.get_by_id(conn, int(row["op_id"]))
             if current is None or not deploy_store.is_open(current):
@@ -202,12 +203,15 @@ def _reconcile_one(conn, plugins_root: Path, row: dict, *, now, settings, activi
 
 def reconcile_deploy_ops(conn: sqlite3.Connection, plugins_root: Path, *, now: datetime,
                          settings, activity=None, lock_timeout_sec: float = 30.0,
-                         stop_event=None) -> list[ReconcileResult]:
+                         stop_event=None,
+                         monotonic: Callable[[], float] = time.monotonic) -> list[ReconcileResult]:
     """Close every blocking/open deploy op once, then recover missed notifications.
 
-    An op whose plugin locks are not acquired within ``lock_timeout_sec`` is skipped
-    and left open for the next start.
+    ``lock_timeout_sec`` is the lock-wait budget for the whole pass: the deadline is
+    fixed once on entry, so an op whose plugin locks are not acquired by then is
+    skipped and left open for the next start.
     """
+    deadline = monotonic() + lock_timeout_sec
     results: list[ReconcileResult] = []
     open_rows = [dict(r) for r in conn.execute(
         f"SELECT * FROM plugin_deploy_ops WHERE {OPEN_PHASE_SQL} ORDER BY name, op_id")]
@@ -215,7 +219,7 @@ def reconcile_deploy_ops(conn: sqlite3.Connection, plugins_root: Path, *, now: d
         try:
             result = _reconcile_one(conn, plugins_root, row, now=now, settings=settings,
                                     activity=activity,
-                                    lock_timeout_sec=lock_timeout_sec, stop_event=stop_event)
+                                    deadline=deadline, stop_event=stop_event)
         except Exception as exc:
             _log.warning("deploy op reconcile failed op_id=%s name=%s: %r",
                          row["op_id"], row["name"], exc)

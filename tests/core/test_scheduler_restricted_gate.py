@@ -60,13 +60,17 @@ def test_restricted_blocks_signal_maintenance_but_not_news_and_econ(tmp_path):
     state = {"v": "restricted"}
     env = Env(tmp_path, seed_cron_bar=False, state_fn=lambda: state["v"],
               on_signal_maintenance=lambda now: None)
-    env.sched.tick(WED)
+    pending = env.sched.tick(WED)
+    for hook in pending:
+        hook()
 
     assert env.signal_maintenance_calls == 0
     assert env.news_calls == 1
     assert env.econ_calls == 1
     state["v"] = "ready"
-    env.sched.tick(WED + timedelta(minutes=1))
+    pending = env.sched.tick(WED + timedelta(minutes=1))
+    for hook in pending:
+        hook()
     assert env.signal_maintenance_calls == 1
 
 
@@ -95,13 +99,17 @@ def test_stale_pending_signal_is_abandoned_by_the_first_maintenance_after_restri
         bar_ts=bar_ts.isoformat(), kind="signal",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"}, now=bar_ts)
 
-    env.sched.tick(WED)
+    pending = env.sched.tick(WED)
+    for hook in pending:
+        hook()
     assert env.signal_maintenance_calls == 0
     assert env.conn.execute("SELECT status FROM signals WHERE id=?",
                             (sid,)).fetchone()[0] == "pending"
 
     state["v"] = "ready"
-    env.sched.tick(WED + timedelta(minutes=1))
+    pending = env.sched.tick(WED + timedelta(minutes=1))
+    for hook in pending:
+        hook()
     assert env.signal_maintenance_calls == 1
     assert env.conn.execute("SELECT status FROM signals WHERE id=?",
                             (sid,)).fetchone()[0] == "abandoned"

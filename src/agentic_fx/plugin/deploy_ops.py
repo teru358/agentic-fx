@@ -126,6 +126,23 @@ def match_or_reject(open_row: Mapping[str, object], requested: Signature,
 
 
 @contextlib.contextmanager
+def acquire_name_locks(plugins_root: Path, names, *,
+                       deadline: float | None = None, stop_event=None):
+    """Hold the plugin name locks for ``names`` (sorted, deduplicated).
+
+    Raises ``switch.PluginBusyError`` when ``deadline`` passes first. Not
+    reentrant for a name this process already holds.
+    """
+    from agentic_fx.plugin import switch
+
+    kwargs = {"deadline": deadline}
+    if stop_event is not None:
+        kwargs["stop_event"] = stop_event
+    with switch._plugin_locks(plugins_root, names, **kwargs):
+        yield
+
+
+@contextlib.contextmanager
 def acquire_op_locks(plugins_root: Path, name: str, *,
                      enumerate_dependents: Callable[[], set[str]],
                      deadline: float | None = None, stop_event=None,

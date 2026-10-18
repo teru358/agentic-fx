@@ -28,7 +28,9 @@ def test_hooks_run_even_when_market_closed(tmp_path):
     env.sched.on_econ_cycle = lambda: econ_calls.append(1)
     env.sched.on_signal_maintenance = lambda now: maint_calls.append(now)
 
-    env.sched.tick(SAT)  # 市場閉鎖 (土曜)
+    pending = env.sched.tick(SAT)  # 市場閉鎖 (土曜)
+    for hook in pending:
+        hook()
 
     assert news_calls == [1]
     assert econ_calls == [1]
@@ -139,9 +141,10 @@ def test_hooks_run_even_when_process_exits_raises(tmp_path):
     with pytest.raises(RuntimeError, match="simulated _process_exits failure"):
         env.sched.tick(WED)
 
-    # しかし hooks は実行される
+    # 同期 hooks は実行される。signal hook は遅延 callable なので、tick が
+    # 例外で戻らないこの経路では呼び出し元へ渡らない。
     assert "news" in hooks_called
-    assert "signal" in hooks_called
+    assert "signal" not in hooks_called
 
 
 def test_hooks_run_even_when_early_code_raises(tmp_path):
@@ -174,8 +177,10 @@ def test_hooks_run_exactly_once_per_tick(tmp_path):
     env.sched.on_signal_maintenance = lambda now: signal_calls.append(now)
 
     # 複数 tick を実行
-    env.sched.tick(WED)
-    env.sched.tick(WED + timedelta(minutes=1))
+    for hook in env.sched.tick(WED):
+        hook()
+    for hook in env.sched.tick(WED + timedelta(minutes=1)):
+        hook()
 
     # それぞれ厳密に 1 回ずつ呼ばれたはず
     assert len(signal_calls) == 2

@@ -920,6 +920,11 @@ def _drop_staging_candidate(plugins_root: Path, payload: dict, *,
 # 承認 3 経路 (P1 submit / P2 approve / P3 bless) — §5.1
 # ============================================================
 
+def plugin_lock_path(plugins_root: Path, name: str) -> Path:
+    """The flock file that serialises operations on plugin ``name``."""
+    return plugins_root / ".locks" / f"{name}.lock"
+
+
 @contextlib.contextmanager
 def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None,
                  stop_event=None, monotonic: Callable[[], float] = time.monotonic):
@@ -937,9 +942,8 @@ def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None
     # 語彙を揃える。
     if not (isinstance(name, str) and loader._PLUGIN_NAME_RE.fullmatch(name)):
         raise ValueError(f"invalid plugin name for lock: {name!r}")
-    lock_dir = plugins_root / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / f"{name}.lock"
+    lock_path = plugin_lock_path(plugins_root, name)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+")
     try:
         if deadline is None and stop_event is None:
@@ -985,12 +989,27 @@ def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
     - **名前昇順**: 逆順で取る呼び出し元が現れても deadlock しないよう
       順序を 1 箇所に固定する (P2')。
     """
+    if _plugin_lock_owner_guard is not None:
+        _plugin_lock_owner_guard()
     with contextlib.ExitStack() as stack:
         bounded = _bounded_lock_kwargs(deadline, stop_event)
         for name in sorted(set(names)):
             # 2 個目以降で期限切れになっても、ExitStack が取得済みの lock を解放する。
             stack.enter_context(_plugin_lock(plugins_root, name, **bounded))
         yield
+
+
+_plugin_lock_owner_guard = None
+
+
+def set_plugin_lock_owner_guard(guard) -> None:
+    """Test-only injection point: ``guard`` runs before every name-lock acquire.
+
+    Production code never installs one; tests use it to assert which thread
+    or context takes the plugin name locks.
+    """
+    global _plugin_lock_owner_guard
+    _plugin_lock_owner_guard = guard
 
 
 def _bounded_lock_kwargs(deadline: float | None, stop_event) -> dict:
@@ -2064,7 +2083,7 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                     f"approval_id={row['id']}: plugin payload に name が "
                     "無く契約違反のため expire を実行せず pending 留置")
             continue
-        lock_path = plugins_root / ".locks" / f"{name}.lock"
+        lock_path = plugin_lock_path(plugins_root, name)
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as lockf:
             fcntl.flock(lockf, fcntl.LOCK_EX)

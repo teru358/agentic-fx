@@ -31,6 +31,29 @@ def create(conn: sqlite3.Connection, kind: str, payload: dict, now: datetime,
     return cur.lastrowid
 
 
+def latest_decision_status(conn: sqlite3.Connection, name: str,
+                                 content_hash: str) -> str | None:
+    """Status of the most recently decided plugin approval for an identity.
+
+    Ordered by ``(decided_at, id)``; rows whose payload is not a JSON object
+    carrying matching ``name`` and ``content_hash`` are ignored.
+    """
+    row = conn.execute(
+        "SELECT status FROM approval_requests "
+        "WHERE kind='plugin' AND decided_at IS NOT NULL "
+        "AND CASE WHEN json_valid(payload_json) "
+        "THEN json_extract(payload_json,'$.name') END = ? "
+        "AND CASE WHEN json_valid(payload_json) "
+        "THEN json_extract(payload_json,'$.content_hash') END = ? "
+        "ORDER BY decided_at DESC, id DESC LIMIT 1",
+        (name, content_hash)).fetchone()
+    return None if row is None else row["status"]
+
+
+def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
+                      now: datetime, actor: str = "human_cli",
+                      commit: bool = True) -> int | None:
+    """Append the rejection that revokes the latest approval for an identity."""
 def _identity_decisions(conn: sqlite3.Connection, name: str,
                         content_hash: str) -> list[tuple[sqlite3.Row, dict, datetime]]:
     candidates: list[tuple[sqlite3.Row, dict, datetime]] = []
