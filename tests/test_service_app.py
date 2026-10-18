@@ -31,6 +31,7 @@ from agentic_fx.service import (
 )
 from agentic_fx.store import news_sources
 from agentic_fx.tools import market_tools
+from tests.core._lock_helpers import TrackedRLock
 from tests.store.test_rag import FakeEmbedding
 
 NOW = datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)
@@ -899,13 +900,8 @@ class _ToolCallingFakeRunner(FakeRunner):
         return super().run(mission)
 
 
-def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
-    """判断足 15m・strategy 1h: 14:00:30 の `_scheduler_tick_once` (本番の 1
-    tick 全体) で、実 approved plugin (kind=strategy) が bucket 13:00 を評価
-    して signal を作り、同じ tick の cron mission がそれを claim して hold
-    で consume する。14:03:30 には signal 起動の条件 (pending) が残らず、
-    14:15:30 の cron mission は実際に `get_signals` ツールを呼び、mission
-    内から consumed を観測する。"""
+def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
+    """producer は core_lock 解放後に INSERT し、次 tick が消費する。"""
     from pathlib import Path as _Path
 
     from agentic_fx.core.accounting import record_snapshot
@@ -913,7 +909,6 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
     from agentic_fx.plugin.resolve import (
         ApprovedInventory, InventoryBuildResult, ResolvedIndicatorSet,
     )
-    from agentic_fx.store import orders as orders_store
 
     t_cron = datetime(2026, 9, 24, 14, 0, 30, tzinfo=timezone.utc)
     bucket = datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc)
@@ -965,15 +960,58 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeStrategySession):
+              _FakeStrategySession), \
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
-                        embedding_fn=FakeEmbedding())
+                        embedding_fn=FakeEmbedding(),
+                        core_lock_factory=TrackedRLock)
         fake = _ToolCallingFakeRunner(
             [MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
              MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
             registry=app.registry, pair="USDJPY")
         app.trade_loop.runner = fake
         app.scheduler.on_improve_tick = None
+        app.scheduler._mark_to_market = lambda now: True
+        app.scheduler._process_limit_fills = lambda now: set()
+        events = []
+        real_maintenance = app.scheduler.on_signal_maintenance
+        real_signal_due = app.scheduler.signal_due_fn
+
+        producer_done = threading.Event()
+
+        def maintenance_after_core_unlock(now):
+            assert not app.core_lock.owned_by_current_thread()
+            events.append("maintenance")
+            real_maintenance(now)
+            producer_done.set()
+
+        # mission の claim は、submit 後の producer INSERT が終わるまで待たせる。
+        # submit 時点の signal ID 上限が効いていなければ、tick 1 の mission が
+        # この INSERT 済み signal を claim してしまう。
+        real_run_once = app.trade_loop.run_once
+
+        def run_once_after_producer(*args, **kwargs):
+            assert producer_done.wait(timeout=5.0)
+            return real_run_once(*args, **kwargs)
+
+        app.trade_loop.run_once = run_once_after_producer
+
+        def signal_due_on_next_decision(now):
+            events.append("signal_due")
+            return real_signal_due(now)
+
+        app.scheduler.on_signal_maintenance = maintenance_after_core_unlock
+        app.scheduler.signal_due_fn = signal_due_on_next_decision
+        real_trade_mission = app.scheduler.on_trade_mission
+
+        def trade_mission_with_order(*args, **kwargs):
+            events.append("trade_mission")
+            return real_trade_mission(*args, **kwargs)
+
+        app.scheduler.on_trade_mission = trade_mission_with_order
         # このテストの関心は producer/claim/get_signals ツールの配線であり、
         # 価格取得・outage 状態機械は対象外 (それぞれ専用テストで検証済み —
         # test_outage_lifecycle_stop_gate_awaiting_resume_and_manual_recovery
@@ -995,10 +1033,11 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
                 ("USDJPY", interval, bar_time.isoformat(),
                  148.0, 148.1, 147.9, 148.0, 1.0, "yfinance"))
         app.conn_core.commit()
+        assert app.conn_core.execute("SELECT COUNT(*) FROM signals").fetchone()[0] == 0
 
         app.supervisor.start()
         try:
-            assert _tick_once_and_wait(app) == 1
+            assert _tick_once_and_wait(app) == 1, events
             sid = app.conn_core.execute(
                 "SELECT id FROM signals WHERE pair='USDJPY' AND bar_ts=?",
                 (bucket.isoformat(),)).fetchone()["id"]
@@ -1009,31 +1048,25 @@ def test_cron_mission_subscribes_to_strategy_signal_of_the_same_tick(tmp_path):
             row = app.conn_core.execute(
                 "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
                 (sid,)).fetchone()
-            assert dict(row) == {"status": "consumed",
-                                 "claimed_by_mission_id": mission["id"]}
-            assert "## この判断で扱う signal" in fake.missions[0].prompt
-            # 1 本目の mission も get_signals を呼んでいる (claim 直後・
-            # consume 前の状態を観測)。
-            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
-                (sid, "claimed")]
-
-            # 建玉 (PENDING_FILL) がある状態で、signal 起動の条件を満たすのは
-            # pending の signal だけ — それが残っていない。
-            orders_store.insert(
-                app.conn_core, pair="USDJPY", direction="long",
-                entry_type="limit", horizon="day", status="pending_fill",
-                now=t_cron, quantity=0.1, requested_price=147.5)
-            t_signal = datetime(2026, 9, 24, 14, 3, 30, tzinfo=timezone.utc)
-            clock.current = t_signal
-            assert app.scheduler.signal_due_fn(t_signal) is False
+            assert dict(row) == {"status": "pending", "claimed_by_mission_id": None}, events
+            assert events == ["trade_mission", "maintenance"]
 
             t_next = datetime(2026, 9, 24, 14, 15, 30, tzinfo=timezone.utc)
             clock.current = t_next
-            assert _tick_once_and_wait(app) == 1
-            # 2 本目の mission が実際に get_signals ツールを呼び、mission の
-            # 内側から consumed を観測する (テスト直呼びではない)。
+            events.clear()
+            assert _tick_once_and_wait(app) == 1, events
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            assert dict(row) == {"status": "consumed",
+                                 "claimed_by_mission_id": app.conn_core.execute(
+                                     "SELECT id FROM missions WHERE loop='trade' "
+                                     "ORDER BY id DESC LIMIT 1").fetchone()["id"]}
+            assert events == ["trade_mission", "maintenance"]
+            assert "## この判断で扱う signal" in fake.missions[-1].prompt
             assert [(r["id"], r["status"]) for r in fake.tool_observations[-1]] == [
-                (sid, "consumed")]
+                (sid, "claimed")]
+
         finally:
             app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
             app.close()
@@ -1122,11 +1155,16 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeStrategySession):
+              _FakeStrategySession), \
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=clock,
                         embedding_fn=FakeEmbedding())
         fake = _ToolCallingFakeRunner(
-            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
+            [MissionResult("completed", {"action": "hold", "reasoning": "w"}, []),
+             MissionResult("completed", {"action": "hold", "reasoning": "w"}, [])],
             registry=app.registry, pair="USDJPY")
         app.trade_loop.runner = fake
         app.scheduler.on_improve_tick = None
@@ -1166,9 +1204,30 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
             row = app.conn_core.execute(
                 "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
                 (sid,)).fetchone()
+            assert dict(row) == {"status": "pending",
+                                 "claimed_by_mission_id": None}
+            assert "## この判断で扱う signal" not in fake.missions[0].prompt
+            # hook は Mission の実行中に完了しうるので、ツール検索には pending
+            # 行が見えてもよい。ただしこの Mission が claim した行ではない。
+            assert all(row["status"] == "pending"
+                       for row in fake.tool_observations[0])
+
+            # producer は core_lock 解放後の hook で INSERT する。次の判定
+            # tick は既に取り込んだ足だけを使えばよいので、ingest の追加取得を
+            # 外して source health とは独立に claim 契約だけを確認する。
+            app.ingest = None
+            app.scheduler.signal_due_fn = lambda _now: True
+            clock.current = t_cron + timedelta(minutes=15)
+            assert _tick_once_and_wait(app) == 1
+            row = app.conn_core.execute(
+                "SELECT status, claimed_by_mission_id FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            mission = app.conn_core.execute(
+                "SELECT id FROM missions WHERE loop='trade' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
             assert dict(row) == {"status": "consumed",
                                  "claimed_by_mission_id": mission["id"]}
-            assert [(r["id"], r["status"]) for r in fake.tool_observations[0]] == [
+            assert [(r["id"], r["status"]) for r in fake.tool_observations[-1]] == [
                 (sid, "claimed")]
         finally:
             app.supervisor.shutdown(drain_exc=RuntimeError("test shutdown"))
@@ -1206,7 +1265,9 @@ def test_signal_not_taken_by_any_mission_is_abandoned_only_after_fresh_until(tmp
                     datetime(2026, 9, 24, 15, 0, 30, tzinfo=timezone.utc)):
             clock.current = now
             with _no_real_network(), app.core_lock:
-                app.scheduler.tick(now)
+                pending = app.scheduler.tick(now)
+            for hook in pending:
+                hook()
             statuses.append(app.conn_core.execute(
                 "SELECT status FROM signals WHERE id=?", (sid,)
             ).fetchone()["status"])
@@ -1605,7 +1666,11 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FakeSignalSession):
+              _FakeSignalSession), \
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -1614,7 +1679,10 @@ def test_f1a_signal_maintenance_wiring_inserts_rows_via_real_tick(tmp_path):
                 NOW - timedelta(hours=51), 51 * 60 + 1)
         with _no_real_network(), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                pending = app.scheduler.tick(NOW)
+            for hook in pending:
+                hook()
 
     count = app.conn_core.execute(
         "SELECT COUNT(*) c FROM signals").fetchone()["c"]
@@ -1644,7 +1712,11 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
     with patch("agentic_fx.service.plugin_loader.approved_plugins",
               return_value=inventory_result), \
          patch("agentic_fx.plugin.signal_producer.plugin_sandbox.PluginSession",
-              _FailingSession):
+              _FailingSession), \
+         patch("agentic_fx.plugin.signal_producer.source_state",
+              return_value=None), \
+         patch("agentic_fx.plugin.signal_producer.live_mismatch",
+              return_value=None):
         app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                         embedding_fn=FakeEmbedding())
         record_snapshot(app.conn_core, now=NOW, balance=1_000_000,
@@ -1653,7 +1725,10 @@ def test_live_plugin_failure_reaches_the_production_activity_log(tmp_path):
                 NOW - timedelta(hours=51), 51 * 60 + 1)
         with _no_real_network(), \
              patch.object(app.provider, "healthcheck", return_value="yfinance"):
-            app.scheduler.tick(NOW)
+            with app.core_lock:
+                pending = app.scheduler.tick(NOW)
+            for hook in pending:
+                hook()
 
     text = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
     lines = [l for l in text.splitlines() if "\tplugin_eval_failed\t" in l]
@@ -3071,13 +3146,15 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     calls: list[dict] = []
 
     def spy_run_signal_maintenance(*, conn, signal_producer, approved,
-                                  settings, now, resolved_by_identity, activity):
+                                      settings, now, resolved_by_identity, activity,
+                                      plugins_root):
         calls.append({
             "conn": conn is not None,
             "signal_producer": signal_producer is not None,
             "approved": approved is not None,
             "settings": settings is not None,
             "activity": activity is not None,
+            "plugins_root": plugins_root is not None,
             "now": now is not None,
             "now_value": now
         })
@@ -3087,6 +3164,7 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
 
     # scheduler の callback を通じて on_signal_maintenance を呼ぶ
     test_now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    app.scheduler.state_fn = lambda: "ready"
     app.scheduler.on_signal_maintenance(test_now)
 
     # callback が呼ばれたことと、全引数が渡されたことを確認
@@ -3097,6 +3175,7 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
     assert call["approved"] is True, "approved should be passed"
     assert call["settings"] is True, "settings should be passed"
     assert call["activity"] is True, "activity should be passed"
+    assert call["plugins_root"] is True, "plugins_root should be passed"
     assert call["now"] is True, "now should be passed"
     assert call["now_value"] == test_now, "now value should match"
 
@@ -3416,7 +3495,7 @@ def test_a_tick_whose_observe_failed_stops_new_risk_but_keeps_protection(
     _scheduler_tick_once(app)
 
     assert app.outage.state == "degraded"
-    assert calls == {"mission": 0, "fills": 0, "exits": 1, "maintenance": 0}
+    assert calls == {"mission": 0, "fills": 0, "exits": 1, "maintenance": 1}
     events = [c.args[1] for c in app.activity.write.call_args_list]
     assert events.count("outage_observe_failed") == 1
 
@@ -3435,7 +3514,7 @@ def test_the_next_tick_whose_observe_succeeds_returns_to_the_normal_decision(
     _scheduler_tick_once(app)
 
     assert app.outage.state == "ready"
-    assert calls["mission"] == 1 and calls["maintenance"] == 1 and calls["fills"] == 1
+    assert calls["mission"] == 1 and calls["maintenance"] == 2 and calls["fills"] == 1
 
 
 def test_scheduler_tick_defers_close_notification_until_after_core_lock(tmp_path):
@@ -5035,6 +5114,62 @@ def test_service_startup_calls_reconcile_sweep_expire_then_approved_plugins_in_o
                   embedding_fn=FakeEmbedding())
         call_names = [c[0] for c in manager.mock_calls]
         assert call_names == ["reconcile", "sweep", "expire", "approved"]
+
+
+def test_service_startup_reconciles_deploy_ops_before_switch_journals(tmp_path):
+    """Deploy-op recovery precedes switch-journal recovery in the startup path."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile, switch
+
+    _init(tmp_path)
+    calls = mock.MagicMock()
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops") as deploy, \
+         mock.patch.object(switch, "reconcile_switch_journals") as journal:
+        calls.attach_mock(deploy, "deploy")
+        calls.attach_mock(journal, "journal")
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert [call[0] for call in calls.mock_calls[:2]] == ["deploy", "journal"]
+        deploy.assert_called_once()
+    finally:
+        app.close()
+
+
+def test_service_startup_passes_reconcile_lock_timeout_setting(tmp_path):
+    """The startup-only timeout is passed to durable deploy reconciliation."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile
+
+    _init(tmp_path)
+    settings_path = tmp_path / "config" / "settings.yaml"
+    settings_path.write_text(settings_path.read_text(encoding="utf-8").replace(
+        "  reconcile_lock_timeout_sec: 30", "  reconcile_lock_timeout_sec: 17"),
+        encoding="utf-8")
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops") as reconcile:
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert reconcile.call_args.kwargs["lock_timeout_sec"] == 17
+    finally:
+        app.close()
+
+
+def test_service_startup_deploy_reconcile_failure_is_recorded_and_nonfatal(tmp_path):
+    """A deploy reconcile exception is isolated and visible in the activity log."""
+    import unittest.mock as mock
+    from agentic_fx.plugin import deploy_reconcile
+
+    _init(tmp_path)
+    with mock.patch.object(deploy_reconcile, "reconcile_deploy_ops",
+                           side_effect=RuntimeError("deploy boom")):
+        app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                        embedding_fn=FakeEmbedding())
+    try:
+        assert any("plugin_deploy_reconcile_failed" in line
+                   for line in app.activity.tail(50))
+    finally:
+        app.close()
 
 
 # --- [indicator-consumption-wiring] T3 Step 3-2 (F2) ------------------------

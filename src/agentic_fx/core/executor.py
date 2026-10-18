@@ -82,6 +82,16 @@ class ExecutionSnapshot:
     captured_at: datetime
 
 
+def snapshot_age_exceeded(snapshot: ExecutionSnapshot, now: datetime,
+                          max_age_sec: float) -> str | None:
+    age_sec = (now - snapshot.captured_at).total_seconds()
+    if age_sec <= max_age_sec:
+        return None
+    return (f"execution snapshot is stale ({age_sec:.1f}s > "
+            f"{max_age_sec}s) — rejecting rather than re-fetching while holding "
+            "core_lock (設計書 §3.1)")
+
+
 class SnapshotCoverageError(Exception):
     """commit-core 開始時点の exposure がスナップショットでカバーされて
     いない (設計書 §12 申し送り① N4-2 — commit-pre と commit-core の間に
@@ -763,12 +773,9 @@ class Executor:
         rejected = self._reject_if_data_not_ready(iid)
         if rejected is not None:
             return rejected
-        age_sec = (now - snapshot.captured_at).total_seconds()
-        if age_sec > max_snapshot_age_sec:
-            reasons = [
-                f"execution snapshot is stale ({age_sec:.1f}s > "
-                f"{max_snapshot_age_sec}s) — rejecting rather than "
-                "re-fetching while holding core_lock (設計書 §3.1)"]
+        stale_reason = snapshot_age_exceeded(snapshot, now, max_snapshot_age_sec)
+        if stale_reason is not None:
+            reasons = [stale_reason]
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason=reasons[0],
                                           reject_category="execution")

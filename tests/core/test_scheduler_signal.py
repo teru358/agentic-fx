@@ -183,14 +183,18 @@ def test_on_signal_maintenance_runs_even_when_closed_and_fails_open(tmp_path):
     env = Env(tmp_path)
     env.sched.on_signal_maintenance = maint
 
-    env.sched.tick(SAT)  # 閉場中も呼ばれる (プラン 8 で変更)
+    pending = env.sched.tick(SAT)
+    assert len(pending) == 1
+    assert calls == []
+    pending[0]()
     assert len(calls) == 1
     assert calls[0] == SAT
 
     oid = env.place_limit(price=148.20, sl=147.80, tp=149.00)
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED, 148.30, 148.35, 148.15,
                              148.25, 100)
-    env.sched.tick(WED + timedelta(minutes=1))  # 開場中も呼ばれる
+    pending = env.sched.tick(WED + timedelta(minutes=1))
+    pending[0]()
     assert len(calls) == 2
     # 例外が資金保護 (約定処理) を止めていないこと
     assert orders.get(env.conn, oid)["status"] == "open"
@@ -225,11 +229,13 @@ def test_stale_pending_signal_is_abandoned_before_due_check(tmp_path):
     env.sched.on_signal_maintenance = on_signal_maintenance
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
 
-    env.sched.tick(WED)  # maintenance (stale 掃除) → 同 tick 内の due 判定
+    pending = env.sched.tick(WED)
+    assert env.trade_reasons == []  # fresh predicate excludes it before cleanup
+    pending[0]()
     row = env.conn.execute(
         "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
     assert row["status"] == "abandoned"
-    assert env.trade_reasons == []  # pending が無くなったので signal 起動しない
+    assert env.trade_reasons == []
 
 
 # ---------------------------------------------------------------------

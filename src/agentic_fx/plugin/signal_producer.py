@@ -48,6 +48,8 @@ tick で plugin×pair×bucket の数だけ worker サブプロセスを起動し
 from __future__ import annotations
 
 import logging
+from pathlib import Path
+from time import monotonic
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Callable
 
@@ -56,6 +58,9 @@ from agentic_fx.activity import Category
 from agentic_fx.core import market_hours
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.plugin import switch
+from agentic_fx.plugin.deploy_ops import acquire_name_locks
+from agentic_fx.plugin.source_state import live_mismatch, source_state
 from agentic_fx.store import signals
 
 if TYPE_CHECKING:
@@ -94,6 +99,7 @@ class SignalProducer:
         self._failure_notices: dict[
             tuple[str, str, str, datetime, str], int] = {}
         self._paused = False
+        self._source_notices: dict[tuple[str, str, str], str] = {}
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
@@ -101,7 +107,7 @@ class SignalProducer:
                              settings: "Settings",
                              resolved_by_identity: (
                                  "dict[tuple[str, str], ResolvedIndicatorSet]"),
-                             activity=None,
+                             activity=None, plugins_root: Path | None = None,
                              ) -> int:
         """承認済み signal/strategy plugin のうち評価期限が来たバケットを
         評価し、新規挿入した signals 行の総数を返す。
@@ -191,7 +197,9 @@ class SignalProducer:
             for meta, pair in work:
                 inserted += self._evaluate_one(
                     conn, meta, pair, now=now, source=source, call=_call,
-                    settings=settings, activity=activity)
+                    settings=settings, activity=activity,
+                    resolved=resolved_by_identity.get((meta.name, meta.content_hash)),
+                    plugins_root=plugins_root)
         finally:
             # 1 本の close の失敗で後続の session の後始末を飛ばさない
             for session in sessions.values():
@@ -203,7 +211,8 @@ class SignalProducer:
 
     def _evaluate_one(self, conn: "sqlite3.Connection", meta: PluginMeta,
                       pair: str, *, now: datetime, source: str,
-                      call: _CallFn, settings: "Settings", activity=None) -> int:
+                      call: _CallFn, settings: "Settings", activity=None,
+                      resolved=None, plugins_root: Path | None = None) -> int:
         """1 plugin × 1 pair 分の catch-up 評価。古いバケットから順に評価し、
         失敗したバケットの手前で打ち切る (cursor はそこまでしか進めない)。
         """
@@ -231,7 +240,14 @@ class SignalProducer:
             try:
                 inserted += self._evaluate_bucket(
                     conn, meta, pair, b, now=now, width=width, source=source,
-                    call=call, settings=settings)
+                    call=call, settings=settings, resolved=resolved,
+                    plugins_root=plugins_root)
+            except _SourceLockTimeout:
+                self._report_source_state(meta, pair, "lock_timeout", activity)
+                break
+            except _SourceNotLive as e:
+                self._report_source_state(meta, pair, e.reason, activity)
+                break
             except _InsufficientClosedBars as e:
                 shortage = (meta.name, pair, source, meta.timeframe)
                 if shortage not in self._insufficient_closed:
@@ -255,10 +271,22 @@ class SignalProducer:
                 self._report_failure(meta, pair, b, e, activity)
                 break
             self._cursor[key] = b
+            self._source_notices.pop(key, None)
             # 成功したら、この plugin × pair の失敗の間引き状態は解除する。
             self._release_failures(meta.name, pair, hash_=meta.content_hash)
             b += width
         return inserted
+
+    def _report_source_state(self, meta: PluginMeta, pair: str, reason: str,
+                             activity) -> None:
+        key = (meta.name, meta.content_hash, pair)
+        if self._source_notices.get(key) == reason:
+            return
+        self._source_notices[key] = reason
+        event = ("plugin_skipped_lock_timeout" if reason == "lock_timeout"
+                 else "plugin_skipped_not_live")
+        _write_activity(activity, event,
+                        "name=%s reason=%s" % (meta.name, reason), meta.name)
 
     def _release_failures(self, name: str, pair: str, *,
                           hash_: str | None = None,
@@ -301,7 +329,15 @@ class SignalProducer:
     def _evaluate_bucket(self, conn: "sqlite3.Connection", meta: PluginMeta,
                          pair: str, bucket_start: datetime, *, now: datetime,
                          width: timedelta, source: str, call: _CallFn,
-                         settings: "Settings") -> int:
+                         settings: "Settings", resolved=None,
+                         plugins_root: Path | None = None) -> int:
+        if plugins_root is not None:
+            # worker を起動する前の安い検査。正しさは lock 内の再検証が担う。
+            reason = live_mismatch(
+                plugins_root, name=meta.name, content_hash=meta.content_hash,
+                artifact_hash=meta.artifact_hash)
+            if reason is not None:
+                raise _SourceNotLive(reason)
         bucket_end = bucket_start + width
         df = load_closed_frame(
             conn, pair, meta.timeframe, source, meta.max_bars, now,
@@ -338,39 +374,71 @@ class SignalProducer:
                       "bars_origin": f"{source}:{native_interval}"}
         if meta.kind == "signal":
             result = call(meta, {"df": df, "params": meta.params})
-            inserted = 0
-            for i, sig in enumerate(result["signals"]):
-                row_id = signals.add(
-                    conn, plugin=meta.name, content_hash=meta.content_hash,
-                    pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
-                    kind="signal", payload={**sig, **provenance}, now=now)
-                if row_id is not None:
-                    inserted += 1
-                elif i > 0:
-                    # fix round 1 F4 (codex): UNIQUE (plugin, content_hash,
-                    # pair, timeframe, bar_ts) は同一バケットで 1 出力しか
-                    # 保持できない — DDL は §12 逐語のため変更しない
-                    # (plan 由来の構造的制約として最終レビューに送る)。
-                    # 2 出力目以降が dedupe で音もなく消えることだけは
-                    # observability を確保する (i==0 は「本物の重複」との
-                    # 区別がつかないため対象外)。
-                    _log.warning(
-                        "plugin %s (%s): signal[%d] at bar_ts=%s was "
-                        "dropped by the (plugin, content_hash, pair, "
-                        "timeframe, bar_ts) UNIQUE constraint — only the "
-                        "first signal per bucket is stored",
-                        meta.name, pair, i, bar_ts)
-            return inserted
+            def insert() -> int:
+                inserted = 0
+                for i, sig in enumerate(result["signals"]):
+                    row_id = signals.add(
+                        conn, plugin=meta.name, content_hash=meta.content_hash,
+                        pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
+                        kind="signal", payload={**sig, **provenance}, now=now)
+                    if row_id is not None:
+                        inserted += 1
+                    elif i > 0:
+                        # UNIQUE (plugin, content_hash, pair, timeframe, bar_ts)
+                        # は同一バケットで 1 出力しか保持できない。2 出力目以降が
+                        # dedupe で音もなく消えることはログに残す。
+                        _log.warning(
+                            "plugin %s (%s): signal[%d] at bar_ts=%s was "
+                            "dropped by the (plugin, content_hash, pair, "
+                            "timeframe, bar_ts) UNIQUE constraint — only the "
+                            "first signal per bucket is stored",
+                            meta.name, pair, i, bar_ts)
+                return inserted
+            return self._insert_while_live(
+                conn, meta, resolved, plugins_root, settings, insert)
 
         # strategy: action="open" のみ保存 ("hold" は非保存)
         result = call(meta, {"df": df, "params": meta.params})
         if result.get("action") != "open":
             return 0
-        row_id = signals.add(
-            conn, plugin=meta.name, content_hash=meta.content_hash,
-            pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
-            kind="strategy", payload={**result, **provenance}, now=now)
-        return 1 if row_id is not None else 0
+        def insert_strategy() -> int:
+            row_id = signals.add(
+                conn, plugin=meta.name, content_hash=meta.content_hash,
+                pair=pair, timeframe=meta.timeframe, bar_ts=bar_ts,
+                kind="strategy", payload={**result, **provenance}, now=now)
+            return 1 if row_id is not None else 0
+        return self._insert_while_live(
+            conn, meta, resolved, plugins_root, settings, insert_strategy)
+
+    def _insert_while_live(self, conn, meta: PluginMeta, resolved,
+                           plugins_root: Path | None, settings, insert) -> int:
+        if plugins_root is None:
+            return insert()
+        names = {meta.name}
+        if resolved is not None:
+            names.update(item.plugin_name for item in resolved.items)
+        deadline = monotonic() + settings.worker.plugin_lock_timeout_sec
+        try:
+            with acquire_name_locks(plugins_root, names, deadline=deadline):
+                reason = source_state(
+                    conn, plugins_root, name=meta.name,
+                    content_hash=meta.content_hash,
+                    artifact_hash=meta.artifact_hash,
+                    indicators=resolved.items if resolved is not None else None)
+                if reason is not None:
+                    raise _SourceNotLive(reason)
+                return insert()
+        except switch.PluginBusyError as exc:
+            raise _SourceLockTimeout() from exc
+
+
+class _SourceLockTimeout(Exception):
+    pass
+
+
+class _SourceNotLive(Exception):
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
 
 
 # 失敗通知の再通知間隔 (初回の次は 61・121… 回目)。内部定数。

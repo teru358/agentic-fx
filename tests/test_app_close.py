@@ -5,7 +5,7 @@ from agentic_fx.service import App
 
 
 def _app():
-    values = dict(conn_core=MagicMock(), conn_shell=MagicMock(), settings=None,
+    values = dict(conn_core=MagicMock(), conn_signal=MagicMock(), conn_shell=MagicMock(), settings=None,
                   state=None, activity=None, broker=None, executor=None,
                   provider=None, econ=None, collector=None, rag=MagicMock(),
                   trade_loop=None, reflection=None, scheduler=None, commands=None,
@@ -19,10 +19,11 @@ def _app():
 
 def test_close_skips_connections_still_in_use():
     app = _app()
-    skipped = app.close(busy_resources=frozenset({"conn_core", "conn_supervisor"}))
-    assert skipped == ["conn_supervisor", "conn_core"]
+    skipped = app.close(busy_resources=frozenset({"conn_core", "conn_signal", "conn_supervisor"}))
+    assert skipped == ["conn_supervisor", "conn_signal", "conn_core"]
     app.conn_supervisor.close.assert_not_called()
     app.conn_core.close.assert_not_called()
+    app.conn_signal.close.assert_not_called()
     app.conn_shell.close.assert_called_once()
     app.instance_lock.close.assert_called_once()
 
@@ -32,6 +33,7 @@ def test_close_failure_isolated_per_resource():
     app.rag.close.side_effect = OSError("broken")
     assert app.close() == []
     app.conn_supervisor.close.assert_called_once()
+    app.conn_signal.close.assert_called_once()
     app.conn_core.close.assert_called_once()
     app.conn_shell.close.assert_called_once()
     app.instance_lock.close.assert_called_once()
