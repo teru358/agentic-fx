@@ -13,3 +13,46 @@ jobs:
           python-version: "3.13"
       - run: uv sync --dev
       - run: uv run pytest -v
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --dev
+      - name: Measure the kernel Landlock ABI
+        id: abi
+        run: |
+          abi=$(uv run python -c "from agentic_fx.core.landlock import landlock_abi; print(landlock_abi())")
+          need=$(uv run python -c "from agentic_fx.core.landlock import IMPROVE_MIN_ABI; print(IMPROVE_MIN_ABI)")
+          echo "abi=${abi}" >> "$GITHUB_OUTPUT"
+          echo "need=${need}" >> "$GITHUB_OUTPUT"
+          if [ "${abi}" -ge "${need}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Landlock ABI ${abi}: running the real isolation tests" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::kernel の Landlock ABI が不足 (測定値 ${abi}、必要 ${need} 以上): 実隔離テストは実行しません"
+            echo "kernel の Landlock ABI が不足 (測定値 ${abi}、必要 ${need} 以上): 実隔離テストは実行していません。release の受入は ABI ${need} 以上の実機で手順書どおり行います。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Real isolation tests that need only the ABI (a skip fails the job)
+        if: steps.abi.outputs.ready == 'true'
+        run: >-
+          uv run pytest
+          tests/integration/test_improve_worker_deploy_boundary.py
+          tests/integration/test_improve_worker_permission_boundary.py
+          tests/integration/test_improve_forbidden_regression.py
+          --deselect tests/integration/test_improve_worker_permission_boundary.py::test_invariant4_real_claude_home_is_unreachable
+          -p no:cacheprovider -rs --fail-on-skip
+      - name: Environment-dependent isolation tests (skips are reported, not failed)
+        if: steps.abi.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest \
+            "tests/integration/test_improve_worker_permission_boundary.py::test_invariant4_real_claude_home_is_unreachable" \
+            tests/integration/test_improve_inventory_view_real_worker.py \
+            tests/core/test_improve_canary.py \
+            -p no:cacheprovider -rs 2>&1 | tee env-isolation.log
+          { echo "Environment-dependent isolation tests (skip reasons):"; grep '^SKIPPED' env-isolation.log || echo "none skipped"; } >> "$GITHUB_STEP_SUMMARY"

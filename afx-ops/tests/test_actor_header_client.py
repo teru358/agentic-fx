@@ -63,6 +63,14 @@ def test_web_and_notify_clients_have_no_way_to_attach_an_actor():
         assert hasattr(BotClient, name)
 
 
+def test_bot_client_direct_public_methods_are_exactly_the_supported_api():
+    methods = frozenset(
+        name for name, member in BotClient.__dict__.items()
+        if not name.startswith("_") and inspect.isfunction(member))
+    assert methods == frozenset({
+        "events", "approvals", "approval", "approve", "reject", "retry", "poll", "cancel"})
+
+
 MALFORMED = {
     "16_digits": "discord:1234567890123456",
     "21_digits": "discord:123456789012345678901",

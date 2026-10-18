@@ -1,15 +1,15 @@
 ---
 id: deployed-plugin-has-no-disable-or-rollback
 title: 配備済み plugin を止める・前の版に戻す操作が無い
-status: 実装中
+status: 是正済
 priority: 高
 opened: 2026-10-04
-closed: null
+closed: 2026-10-18
 related: [retire-symlink-deployed-plugin]
 ---
 # [deployed-plugin-has-no-disable-or-rollback] 配備済み plugin を止める・前の版に戻す操作が無い
 
-**状態**: 実装中 / **優先**: 高
+**状態**: 是正済 / **優先**: 高
 
 ## 現象
 
@@ -25,6 +25,8 @@ related: [retire-symlink-deployed-plugin]
 
 ## 修正内容
 
+- 2026-10-18: T8 完了で pdo 全 task (T1〜T8) を main に merge。spec を v1.1 に (実装と crash matrix で確定した事項: settings v3、plain identity、signal_max_id、linked signal の abandoned 終端、終端判定と再通知、Expectation と state_changed、rc と refusal code の 5 群、status の契約、AC-27 の CI 条件、AC-30 の契約)。運用文書 ops-api の §7 を承認済み plugin の回収手順に置換し、鍵漏洩手順は停止中に回収する順序へ。遮断の集合を完全一致で固定 (improve tools 13 / 候補ファイル 3 / Action 4 / bot action 6+3 / BotClient 8。API 24 と TABLE_NAMES 32 は既存)、revoke 行の approval 詳細が候補の列なしで描画でき bot に reason を表示。実隔離 worker から deploy CLI 起動・DB 直書き・plugins 改変が全部拒否 (EACCES / EPERM) され外の状態が不変であることを 6 経路 + 正の対照で測り、CI に Landlock ABI を測る isolation job (ABI が IMPROVE_MIN_ABI 以上なら ABI だけが前提の test を skip 禁止で実行、環境依存の test は skip 理由を出す、未満は neutral)。本機の実隔離は 61 passed / 0 skipped。レビュー: codex sol (docs、High 3 採用)、/code-review high (6 件全採用)。codex の閉鎖確認は枠切れのため merge 後に差分で実施予定。残作業 (チケット外): 本番の afx init 再実行 (settings v2→v3) と再起動、disable / rollback の実機 1 回。後続は別チケット 4 件 (deploy-cli-config-error-traceback、rollback-foreign-temp-link-sweep、disable-dependent-change-error-notice、plugin-lock-wait-notice-on-wait-argument)。
+
 ## 経緯
 
 - 2026-10-04: 起票。
@@ -39,3 +41,4 @@ related: [retire-symlink-deployed-plugin]
 - 2026-10-18: 状態: 実装中 — T5 (retire 統合: symlink は disable_plugin(revoke=False) をそのまま呼ぶ、plain は retire_plain 状態機械 = name lock + config.yaml 名での依存確認 + st_dev 検査 + op_id を含む退避先を intent の tx 内で記録 + discover した content_hash を intent / 署名に記録し FS 直前と reconcile で照合 + 名前単位と依存 identity の pending 放棄 + rename 失敗は needs_retry + 署名一致の再実行で引き継ぎ。旧 switch.retire_plugin と自前 flock を廃止、CLI に --force / --dry-run、非成功 outcome は rc 1) を main に merge。codex 実装 → codex r1 High 1 (plain identity 未記録) / Low 2 → /code-review 10 件 (採用 8、却下 #5 = spec §2.1 の NULL 規定 / #7 = os.stat は mount・symlink 先の st_dev) → codex r3 Medium 1 (dry-run の force 不一致) → 是正。判定 (T6 結合 tree) plugin / store / tools / backtest 2963、core / service_app / setup / loops 3719 緑。申し送り: T4b (after_insert の各永続化境界の P 系 seam)、T7 (RetireOutcome → rc / 文言 / refusal_code)、T8 (plain identity の記録・名前単位 cascade を spec に明文化)。次は T4b (crash matrix 全点統合、下書き tmp/review-20261016-pdo/t4b-brief-draft.md)
 - 2026-10-18: 状態: 実装中 — T4b 完了 (crash matrix 全点統合)。spec §7 の N1〜N5 / D1〜D12 / R1〜R19 / P1〜P12 / revoke / S1〜S7 / G1〜G7 を実 FS + 実 SQLite の fault injection (関数境界の CrashPoint、unlink / rename / symlink の失敗注入、process 死の再現) で網羅し、変異 M1〜M9 は全部対応 test が落ちる。実測で見つかった現物の欠陥を是正: rollback の CLI 再実行 (検証失敗の終端化、source 消失後の署名、既定 target の open 行からの解決、live が戻り先のときの dry-run 署名順序、foreign な live の誤終端)、disable の open 行引き継ぎを依存検査より先に、retire の退避先衝突は dry-run 含め拒否、syscall_failed から抜ける全遷移で通知をやり直す (settle_op)、終端化と通知回収を reconcile と CLI で共有、起動時回収で付随表に結ばれた claimed は abandoned で終端。裁定: linked signal は spec の pending でなく abandoned 終端を正とし T8 で spec を直す。残り T7 (CLI の rc / 文言 / 表示: verify_failed + live_removed、retire の refused 理由、open op の versions 表示) と T8 (spec 追記: sweep ④ と rollback temp、R4 / D11 / 6.4 の通知文言、G4a / G5 の abandoned、recover_interrupted の付随表参照)。
 - 2026-10-18: 状態: 実装中 — T7 完了 (CLI 面)。afx plugin disable / rollback / revoke / versions を配線 (retire は既存)。TTY では dry-run の実呼び出しから予告を作って y/N、--yes で省略、非 TTY で --yes 無しは本実行しない。予告の前提 (live の種類と先、subject identity、戻り先、cascade 集合、--revoke の最新承認決定) を本実行が lock 内で再照合し、違えば state_changed で何も変えず拒否 (人間の入力待ちの間 lock を握らない)。rc は 0 = 完了 / no-op / dry-run、1 = 拒否・失敗・needs_retry、2 = --revoke で live 不在のとき revoke --version へ誘導、のみ。非 0 は stderr 1 行目に code=<refusal_code> を付け、全 outcome と例外 (db_error / internal_error / config_error / lock_timeout / aborted / confirmation_required など) の rc と code を 1 つの test で全数 pin。完了表示は disable = filesystem_switched=yes runtime_deactivation=effective_on_next_signal_insert、rollback = filesystem_switched=yes runtime_activation=pending_restart (「rollback 完了」だけの表示は禁止)。name lock は最大 30 秒待つ (別 process の flock で実測)。versions は読み取り専用接続 (mode=ro) で name lock も初期化確認も通さず、DB 本体・schema・app のファイルを作らない (SQLite の -wal / -shm は契約の除外)。afx ctl status に plugin_deploy_ops 節 (open / attention / 読めないときは unavailable)、afx ops status <feature> に未完 op が 1 件以上のときだけ 1 行。revoke --version は content hash の前方一致 (12 桁以上の小文字 hex)、rollback --to は版 dir の hash (最小長なし)。レビュー: codex r1 (Critical 1 = 予告と本実行の競合) → /code-review high 10 件 (採用 9) → codex 閉鎖 r3 (Critical 1 = --revoke の決定が前提に無い) → r4 (High 1 = 設定不在の traceback) → 是正。残り T8 (spec 追記・運用文書・遮断の完全集合 test・実隔離 integration)。
+- 2026-10-18: 是正内容 — T8 完了で pdo 全 task (T1〜T8) を main に merge。spec を v1.1 に (実装と crash matrix で確定した事項: settings v3、plain identity、signal_max_id、linked signal の abandoned 終端、終端判定と再通知、Expectation と state_changed、rc と refusal code の 5 群、status の契約、AC-27 の CI 条件、AC-30 の契約)。運用文書 ops-api の §7 を承認済み plugin の回収手順に置換し、鍵漏洩手順は停止中に回収する順序へ。遮断の集合を完全一致で固定 (improve tools 13 / 候補ファイル 3 / Action 4 / bot action 6+3 / BotClient 8。API 24 と TABLE_NAMES 32 は既存)、revoke 行の approval 詳細が候補の列なしで描画でき bot に reason を表示。実隔離 worker から deploy CLI 起動・DB 直書き・plugins 改変が全部拒否 (EACCES / EPERM) され外の状態が不変であることを 6 経路 + 正の対照で測り、CI に Landlock ABI を測る isolation job (ABI が IMPROVE_MIN_ABI 以上なら ABI だけが前提の test を skip 禁止で実行、環境依存の test は skip 理由を出す、未満は neutral)。本機の実隔離は 61 passed / 0 skipped。レビュー: codex sol (docs、High 3 採用)、/code-review high (6 件全採用)。codex の閉鎖確認は枠切れのため merge 後に差分で実施予定。残作業 (チケット外): 本番の afx init 再実行 (settings v2→v3) と再起動、disable / rollback の実機 1 回。後続は別チケット 4 件 (deploy-cli-config-error-traceback、rollback-foreign-temp-link-sweep、disable-dependent-change-error-notice、plugin-lock-wait-notice-on-wait-argument)。

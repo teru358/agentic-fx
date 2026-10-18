@@ -1,4 +1,4 @@
-# [switch-ops-hardening] 設計書 v1.9
+# [switch-ops-hardening] 設計書 v1.10
 
 束: plugin 承認・切替回廊の**収束の穴と、人間から見える状態の穴**を塞ぐ。
 起票済み 3 件 — `[retry-switched-approves-without-deploy]` / `[cli-bless-unresolved-journal]`
@@ -9,7 +9,7 @@
 規則そのものを新しくはしない。調査記録は `tmp/design-switch-ops/survey.md`、設計案 v0.1 は
 `tmp/design-switch-ops/design.md` (2026-09-19 ユーザー承認済)。
 
-配備済み plugin の disable / rollback / retire / revoke の normative な状態機械は、[plugin deploy ops 設計書 v1.0](2026-10-16-plugin-deploy-ops-design.md) を正本とする。本書はその詳細を複製しない。特に同書 IV-13 / IV-14 は、本書の不変条件を増やさず、同書 IV-18（全体 lock 順序）および IV-20（接続分離）と併せて参照する。
+配備済み plugin の disable / rollback / retire / revoke の normative な状態機械は、[plugin deploy ops 設計書 v1.1](2026-10-16-plugin-deploy-ops-design.md) を正本とする。本書はその詳細を複製しない。特に同書 IV-13 / IV-14 は、本書の不変条件を増やさず、同書 IV-18（全体 lock 順序）および IV-20（接続分離）と併せて参照する。
 
 ## 0. 位置づけとユーザー裁定 (2026-09-19、設計 v0.1 承認済)
 
@@ -1161,9 +1161,9 @@ phase は従来どおり `preparing → versioned → recorded → switched → 
 | **reconcile: pin 破れの `_revert_one`** | `switch.py:295` (`_revert_under_lock` 呼び出し) | **本束で追加** | — | **直す** (lock + 行 + 分類) |
 | **reconcile: `not_switched` の `_revert_one`** | `switch.py:318` (`_revert_under_lock` 呼び出し) | **本束で追加** | — | **直す** (lock + 行 + 分類) |
 | `process_expired_approvals` | `switch.py:1920-1944` (per-row lock ブロック) | 生 `flock` (同じパス、`:1922-1923`) | はい (lock 内で `get_open_by_name` `:1925` と status を再確認 `:1930-1936`) | 直さない (現状の事実として記録) |
-| `rollback_plugin` (live symlink を `_atomic_symlink_swap` で置換) | plugin deploy ops spec v1.0 | `_plugin_locks` | はい | 同 spec の `rollback_symlink` 契約に従う |
-| `disable_plugin` (live symlink を `unlink`) | plugin deploy ops spec v1.0 | `_plugin_locks` | はい | 同 spec の `disable_symlink` 契約に従う |
-| `retire_plugin` (plain live を `_retired/` へ `rename`) | plugin deploy ops spec v1.0 | `_plugin_locks` | はい | 同 spec の `retire_plain` 契約に従う。symlink は `disable_symlink` に委譲する |
+| `rollback_plugin` (live symlink を `_atomic_symlink_swap` で置換) | plugin deploy ops spec v1.1 | `_plugin_locks` | はい | 同 spec の `rollback_symlink` 契約に従う |
+| `disable_plugin` (live symlink を `unlink`) | plugin deploy ops spec v1.1 | `_plugin_locks` | はい | 同 spec の `disable_symlink` 契約に従う |
+| `retire_plugin` (plain live を `_retired/` へ `rename`) | plugin deploy ops spec v1.1 | `_plugin_locks` | はい | 同 spec の `retire_plain` 契約に従う。symlink は `disable_symlink` に委譲する |
 | `materialize_plugin` (live を**読む**だけ、書き換えない) | `switch.py:1750-1775` | 無し | — | 直さない (書き換えないので IV-6 の対象外) |
 
 **行番号照合 (旧 → 新、v1.6a)**: T4 (§3.3.2/§3.3.3) の実装で reconcile の 3 箇所は生の `_revert_one` から
@@ -1450,6 +1450,7 @@ v1.7 の T11 / T12 に限定した設計レビュー。一次トリアージは
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-18 | v1.10 | plugin deploy ops 設計書への参照を v1.1 に更新 | 参照更新のみ | |
 | 2026-10-16 | v1.9 | plugin deploy ops spec を normative reference とし、R6 と live 書換え全経路表を disable / rollback / `retire_plain` 契約へ接続 | deployed plugin の disable / rollback / retire / revoke を統合するため | |
 | 2026-09-20 | v1.8c | **2 周目やり直し `/code-review high` r2b (`tmp/review-20260920-soh/r2b/code-review.md`、5 件) の処置を記録**: **#1・#2 = 既知**、ticket **[cli-bless-runtime-error-traceback]** の範囲 (本束では対処しない) / **#5 = R14 の意図どおりの設計** (誤検知ではなく仕様確認) / **#3・#4 を採用**し `b126dd2` で是正済み — **#3**: `bless_candidate` の `switch_required=0` 枝 (`_advance_to_decided` が `False` を返したとき) の `RuntimeError` 文言が `after switch` (切替後) と言っていたのは事実と不一致 (`switch_live` を一度も呼んでいない) だったので「版 dir の content_hash mismatch」に訂正 (`content_hash mismatch` 部分文字列の既存 pin (AC-19d) は維持、`switch_required=1` 側の文言・pin は無改変) / **#4**: `cli.py` の `_plugin_bless` / `_plugin_retire` に重複していた収束手順案内2行を `_UNRESOLVED_JOURNAL_RECOVERY_HINT` 定数へ切り出し。**加えて codex sol r2b の設計レビューは C0/I0/M0** (確定なし)。§3.7.3 に文言の決めを追記 (この行) / 本是正の pin (`tests/plugin/test_switch_ops_hardening.py::test_ac19d_*` への assert 追加) と `_UNRESOLVED_JOURNAL_RECOVERY_HINT` 直上コメントの `T6`→`T6 / T12` 訂正は本 commit と同時に別 commit で追加 | ユーザー裁定 (**#3・#4 は維持**) を受けた記録是正。是正コード自体は `b126dd2` (別セッションによる先行実装、TDD・変異確認なしのため本束で pin と手戻し確認を補完) | `b126dd2` |
 | 2026-09-20 | v1.8b | **T11 (`4df5207`) / T13 (`cd792f5`) 実装時の実測で判明した設計記述の誤りを訂正** (docs のみ、実装は変更なし): **(1)** §3.7.1 / §0 R14 — `history_git.record_version` は switch_required に関係なく毎回、版 dir の実ファイルを候補の `(content_hash, artifact_hash)` と独立に照合しており (`history_git.py:135-138` / `:161-172`)、「`switch_required=0` は無検証で approved」は過大。**R14 (`_version_dir_hashes_ok`) が実際に塞ぐのは `record_version` の照合後〜`_finalize_decision` 前の TOCTOU の窓**だけ (多層防御として実装は残す) / **(2)** AC-19d — CLI は `_plugin_bless` の except が `RuntimeError` を捕らないため **traceback が出る** (rc=1 ではない)。訂正した観測は `bless_candidate` への直接呼び出しに絞り、CLI の rc=1 化は ticket **[cli-bless-runtime-error-traceback]** へ切り出し (本束の範囲外) / **(3)** AC-19e — 版 dir を直さずに `approval retry` すると `still_pending(reverify_failed)` にはならず、`_advance_to_decided` の switch_required=0 分岐に到達する前に `record_version` 自身が `HistoryGitError` を送出して残余行は非終端のまま残る。解除は「版 dir を直してから retry」または `reject` の 2 つ / **(4)** T11 変異表 (実装プラン T11-M11/M12) の killer を実測に合わせ訂正: M11 (3 つ組→`old_kind` のみ) の killer は `test_ac16c8_*` のみ、M12 (→`old_target` のみ) の killer は `test_ac16c6_*` のみ (プランが書いていた `test_ac16c1_*`/`test_ac16c2_*` は実測では red にならなかった)。M6 (`_close_own_unfinished_journal_if_any` の `conn.commit()` 削除) は T11 の再開判定経路では直後の `begin_switch_journal(commit=True)` に吸収されて等価、M9 (`bool()` を落とす) は sqlite の int 0/1 と Python の bool 比較が等価なため等価 — いずれも実測 (フルスイート + `-k ac16c`/`ac9d`) で確認 / **(5)** activity イベント `switch_resume_precondition_changed` の実フィールドを `stored=(…) now=(…) stored_switch_required=… recomputed=…` (`switch.py:1731-1738`) に訂正 (§3.2 本文・AC-16c-4)。**設計判断・実装は 1 つも変えない** (docs 訂正のみ) | 実装プラン T11/T13 の担当による着手前検証・実測報告 (worktree `tmp/wt/soh` HEAD `cd792f5` で全項目を現物照合)。M11/M12/M6/M9 は `tests/plugin/test_switch_ops_hardening.py -k ac16c` / `-k ac9d` を実際に走らせて再確認 | — |

@@ -1,11 +1,11 @@
 # 配備済み plugin の deploy ops 設計書
 
-**版:** v1.0
+**版:** v1.1
 **対象:** `deployed-plugin-has-no-disable-or-rollback`。symlink retire を統合し、`live-signal-eval-blocks-protection-tick` の `core_lock` 保持部分を部分解消する。
 
 ## 0. 目的、範囲、決定
 
-配備済み plugin に、人間が実行する disable / rollback / retire / revoke と読み取り専用 versions を加える。正本は `plugin_deploy_ops` であり、既存の switch journal は置き換えない。詳細な既存 switch 操作の安全化は [switch-ops-hardening v1.9](2026-09-19-switch-ops-hardening-design.md)、操作 API の境界は [ops-api design](2026-10-04-ops-api-design.md) を参照する。
+配備済み plugin に、人間が実行する disable / rollback / retire / revoke と読み取り専用 versions を加える。正本は `plugin_deploy_ops` であり、既存の switch journal は置き換えない。詳細な既存 switch 操作の安全化は [switch-ops-hardening v1.10](2026-09-19-switch-ops-hardening-design.md)、操作 API の境界は [ops-api design](2026-10-04-ops-api-design.md) を参照する。
 
 | 項目 | 決定 |
 |---|---|
@@ -33,7 +33,7 @@
 
 ### 2.1 `plugin_deploy_ops` (新規表)
 
-切替ジャーナルと同じ規律 (journal-first、name flock 内、reconcile で閉じる) で動く別表。既存ジャーナルの消費者は変えない。**この表が配備操作の状態の正本**で、`afx ctl status` / `afx status` / `versions` はここから読む (activity ログは読まない)。
+切替ジャーナルと同じ規律 (journal-first、name flock 内、reconcile で閉じる) で動く別表。既存ジャーナルの消費者は変えない。**この表が配備操作の状態の正本**で、`afx ctl status` の `plugin_deploy_ops` 節、`afx ops status <feature>`、`versions` はここから読む (activity ログは読まない)。
 
 | 列 | 内容 |
 |---|---|
@@ -45,7 +45,7 @@
 | `from_target` | from が symlink のとき readlink の生文字列。それ以外 NULL |
 | `to_target` | rollback の戻り先 `.versions/<name>/<hash>`。それ以外 NULL |
 | `retired_path` | retire_plain の退避先 (`_retired/<name>-<ts>-<op_id>`)。それ以外 NULL |
-| `subject_content_hash` / `subject_artifact_hash` | 外される版 (revoke では revoke する版) の identity (symlink は版 dir から、plain は discover から。plain で得られなければ NULL) |
+| `subject_content_hash` / `subject_artifact_hash` | 外される版 (revoke では revoke する版) の identity (symlink は版 dir から、plain は discover から記録する。plain で得られなければ NULL) |
 | `target_content_hash` / `target_artifact_hash` | rollback の戻り先の identity。それ以外 NULL |
 | `approval_id` | 外される版の最新 approved 行の id (nullable。`revoke=1` の行と `op_kind=revoke` では NOT NULL) |
 | `revoke` | NOT NULL, CHECK IN (0, 1)。同 transaction で `rejected` 行を追記したか |
@@ -64,25 +64,26 @@
 | `rollback_symlink` | `to_kind='symlink'` AND `to_target IS NOT NULL` AND `target_*` が NOT NULL AND `retired_path IS NULL` AND `from_kind IN ('symlink','absent')`。`from_kind='symlink'` ⇔ `from_target` / `subject_*` が NOT NULL。`from_kind='absent'` なら `revoke=0` |
 | `retire_plain` | `from_kind='plain'` AND `to_kind='retired'` AND `retired_path IS NOT NULL` AND `from_target` / `to_target` / `target_*` が NULL AND `revoke=0` |
 | `revoke` | `from_kind='none'` AND `to_kind='none'` AND `from_target` / `to_target` / `retired_path` / `target_*` が NULL AND `subject_*` と `approval_id` が NOT NULL AND `revoke=1` AND `force=0` AND `phase='done'` |
-| 共通 | `revoke=1` ⇔ `revoke_row_id IS NOT NULL`。`phase='needs_retry'` ⇔ `fail_reason IS NOT NULL`。`fail_reason='syscall_failed'` は `op_kind != 'revoke'`。`fail_reason='verify_failed'` は `op_kind='rollback_symlink'` に限る。`revoke=1` ⇒ `approval_id IS NOT NULL`。`phase='intent'` ⇒ `notify_attempted=0` (`syscall_failed` から `intent` に戻す遷移は `notify_attempted` を 0 に戻す) |
+| 共通 | `revoke=1` ⇔ `revoke_row_id IS NOT NULL`。`phase='needs_retry'` ⇔ `fail_reason IS NOT NULL`。`fail_reason='syscall_failed'` は `op_kind != 'revoke'`。`fail_reason='verify_failed'` は `op_kind='rollback_symlink'` に限る。`revoke=1` ⇒ `approval_id IS NOT NULL`。`phase='intent'` ⇒ `notify_attempted=0`。`needs_retry/syscall_failed` から同じ `syscall_failed` 以外 (`done` / `foreign` / `verify_failed` / `intent` を含む) へ遷移するときは、通知を再試行できるよう `notify_attempted` を 0 に戻す。`intent` への巻き戻しは再実行の取り込み (`match_or_reject`)、終端 phase への遷移は終端判定 (`settle_op`) が行う |
 
 - **immutable intent 署名**: `intent` 作成後に変わらない列の組 = (`op_kind`, `name`, 対象 identity = `subject_*`, `to_target`, `revoke`, `force`)。CLI 再実行の引き継ぎ判定に使う (§6.4)。署名列は phase 遷移以外で UPDATE しない。
 - **共通述語 (この 1 組だけを使う)**:
   - `blocking/open` = `phase='intent'` OR (`phase='needs_retry'` AND `fail_reason='syscall_failed'`)。制限が未完で、live が「外すと決めた版」のままのこともある。
   - `closed` = `phase='done'` OR `phase='foreign'` OR (`phase='needs_retry'` AND `fail_reason='verify_failed'`)。
   - `syscall_failed` は「同署名の再実行を待つ安定した状態」で、op の終端とは呼ばない (`phase` が `needs_retry` でも op は閉じていない)。「終端」と書くのは `closed` の 3 通りだけ。通知窓 (§7.0) の対象は `phase` が `done` / `needs_retry` (両 fail_reason) / `foreign` の行で「通知対象 phase」と呼ぶ。
-  - 使う箇所 (全て同じ定義を呼び、複製しない): 部分 UNIQUE、producer の再検証 (§5.1)、OPEN ゲート (§5.2)、approve / bless / retry の入口と交差 name 検査 (§2.2)、deploy op 開始の検査 (§3 の 3)、reconcile の対象選択 (§6)、CLI 再実行の取り込み (§6.4)、`versions` / `afx ctl status` の表示 (blocking/open と closed を分けて出す)。実装は store 層に SQL 断片 `OPEN_PHASE_SQL` と Python 関数 `is_open(row)` を 1 組置き、全消費者がそれを呼ぶ (T1)。以降の表で単に「open」と略す箇所はすべて `blocking/open` を指す。
+  - 使う箇所 (全て同じ定義を呼び、複製しない): 部分 UNIQUE、producer の再検証 (§5.1)、OPEN ゲート (§5.2)、approve / bless / retry の入口と交差 name 検査 (§2.2)、deploy op 開始の検査 (§3 の 3)、reconcile の対象選択 (§6)、CLI 再実行の取り込み (§6.4)、`versions` の表示 (blocking/open と closed を分けて出す) と `afx ctl status` の表示 (`open` = blocking/open、`attention` = `needs_retry/verify_failed` と、注意が要る `foreign`、読めないときは `unavailable`。`done` 全件は載せない)。実装は store 層に SQL 断片 `OPEN_PHASE_SQL` と Python 関数 `is_open(row)` を 1 組置き、全消費者がそれを呼ぶ。以降の表で単に「open」と略す箇所はすべて `blocking/open` を指す。
 - **name ごとに blocking/open は高々 1 本**: `CREATE UNIQUE INDEX ... ON plugin_deploy_ops(name) WHERE phase='intent' OR (phase='needs_retry' AND fail_reason='syscall_failed')` (`OPEN_PHASE_SQL` と同じ式)。blocking/open の間は producer の再検証・OPEN のゲート・approve / bless / retry・他の deploy op がその name を扱わない (§2.2, §5)。
 - `needs_retry`: 完了できずに止まった状態。`fail_reason` で 2 種に分ける。
   - `verify_failed`: 制限は完了した。rollback の戻り先が再検証に落ちて前進できず、source を unlink 済みで live は不在 (disable と同じ安全側)。**closed (blocking/open ではない)**。人間は原因を直して新規の `rollback --to` か `disable` を打つ。
   - `syscall_failed`: FS の syscall (unlink / rename / symlink swap 等、EACCES・EXDEV など) が失敗して制限が**未完**。live は旧版のままのこともある。**blocking/open のまま**で、producer の見送りと OPEN のゲートは続く。権限・mount を直してから**同署名の CLI を明示再実行**すると続きから完遂する (reconcile も起動ごとに 1 回試みる)。全 op_kind (revoke を除く) に適用する。
   - 遷移時に activity ERROR `plugin_deploy_op_needs_retry` を出す。
 - `foreign`: 第三者が live を触った。reconcile は live に触れず ERROR を出して閉じる。name のロックは解放される。制限の DB 効果は残る。回復は種類別の手順 (§10 の 3c) で、専用コマンドは足さない。
-- 新規表のため専用 migration は不要（`_SCHEMA` の `CREATE TABLE IF NOT EXISTS` で既存 DB に追加する）。表名を `TABLE_NAMES` に足す (現物 30 表 → 32 表)。
+- 新規表のため DB 専用 migration は不要（`_SCHEMA` の `CREATE TABLE IF NOT EXISTS` で既存 DB に追加する）。表名を `TABLE_NAMES` に足す (現物 30 表 → 32 表)。ただし settings は schema v3 へ移行し、v2 から `worker.plugin_lock_timeout_sec=2` と `worker.reconcile_lock_timeout_sec=30` を補う。既存値は保持し、`worker` 節が無い、又は mapping でない場合は schema marker だけを v3 にする。
 
 付随表 `plugin_deploy_op_signals(op_id, signal_id, status_at_link, PRIMARY KEY(op_id, signal_id))` と `CREATE INDEX plugin_deploy_op_signals_signal_id ON plugin_deploy_op_signals(signal_id)`。`status_at_link` は CHECK IN (`pending`, `claimed`)。`op_id` は `plugin_deploy_ops` の行 (revoke 単独は `op_kind=revoke` の行) に結ぶ。
 
 - 意図の記録 transaction で、対象 identity に属する **pending と claimed の両方**を記録する。**signals の status を変えるのは pending (→ `abandoned`) だけ**で、claimed は status を触らない (今 LLM に注入されている最中の可能性があるため。止めるのは §5.2 のゲート)。
+- `retire_plain` は intent に plain の content hash を記録し、CLI 再実行と reconcile を含む FS 操作の直前に discover を再実行して記録値と比較する。不一致なら rename せず `foreign` に閉じる。記録 hash が NULL (discover 不能) の plain は identity 比較を行わず、plugin 名で退役する。identity を discover できない壊れた legacy こそ retire が要る場面であり、NULL を foreign に倒すと退役できなくなるため。cascade は元々 plugin 名単位なので影響しない。
 - 用途: `get_signals` / `claim_oldest` / `pending_exists` の除外 (§5.3)、監査。signals 表の CHECK を作り直さずに「配備操作で放棄・無効化された」ことを区別できる。
 - **ゲートで拒否した claimed の結び先**: 意図の記録時に claimed として記録済みの signal は、既に `op_id` を持つ (そのまま)。付随表に無い signal (op に由来しない無効化、例: `foreign` 後の第三者の変更) がゲートで拒否された場合は付随表に追記せず、`trade_intents.gate_result` (`signal_source_inactive`) を正本とし、`get_signals` での見え方は通常の abandoned と同じ。結び先を捏造しない。
 
@@ -94,7 +95,7 @@
 
 ### 2.3 revoke の追記行 (`approval_requests`)
 
-承認行は UPDATE しない。管理対象は `(name, content_hash)` の最新決定で決まるので、同 key に後から `rejected` 行が入れば loader 側のコード変更なしで除外される。
+承認行は UPDATE しない。管理対象は `(name, content_hash)` の最新決定で決まるので、同 key に後から `rejected` 行が入れば loader 側のコード変更なしで除外される。最新決定の正本は `approvals` store の latest-decision helper 群 (`latest_decision_status` / `latest_decision_for_identity` / `latest_approved_for_identity`) であり、`versions`、revoke、rollback、source gate などの呼び出し側は規則を複製しない。
 
 | 列 | 値 |
 |---|---|
@@ -109,7 +110,7 @@
 
 | 項目 | 規則 |
 |---|---|
-| 対象版 | `(name, content_hash)`。`artifact_hash` は同 key の最新 approved 行の payload から取る。`--version` で渡された 64 hex は、版 dir 名 (artifact_hash) と content_hash のどちらでもよく、一意に決まらなければ拒否 |
+| 対象版 | `(name, content_hash)`。`artifact_hash` は同 key の最新 approved 行の payload から取る。`--version` は content hash の小文字 hex 前方一致だけを受け付け、12 桁以上かつ一意に決まらなければ拒否する。版 dir 名 (artifact hash) は受け付けない |
 | 元 approval id | 同 key の最新 approved 行の id。最新決定が既に `rejected` なら何も追記せず rc=0 (冪等) |
 | 現 live の版 | `revoke` 単独操作では**拒否** (producer が走り続けるため)。`disable --revoke` / `rollback --revoke` で外す操作と同時に行う |
 
@@ -136,6 +137,10 @@
 
 1. 人間が repo root で打つ。権限は「その shell の uid が DB と plugins dir に書けること」(bless と同じ)。approver 鍵は使わない。TTY があれば結果の予告を見せて y/N、`--yes` で省略。`--dry-run` は予告まで。
 2. 依存 strategy を仮列挙 (§4)、**対象名 + 依存名を名前昇順で `_plugin_locks` で取得**する。lock 内で再列挙し、集合が仮列挙の部分集合でなければ lock を放して再試行 (3 回で拒否)。flock は非再入なので、内部から `approve_candidate` 等を呼ばない。
+
+予告は `Expectation` を返す。本実行は lock 取得後、intent の記録と FS 操作の前に、live の種類と `readlink` の生文字列、subject identity、`to_target`、cascade 集合、open op id、`--revoke` の subject に対する最新承認決定 (`approval_id`, `status`) を再照合する。1 つでも変われば `state_changed` として無変更で終了する。人間が y/N を選ぶ間は lock を保持しない。daemon を止めないためである。
+
+`--dry-run` も foreign と退避先衝突を含め本実行と同じ refusal を返す。予告だけが通ることはない。各操作の lock 待ちは 30 秒、TTY では待機を通知し、timeout は `lock_timeout`（rc 1）とする。予告と本実行がともに lock を取るため、合計待機は最大およそ 60 秒である。
 3. lock 内で検査する。1 つでも落ちたら何も変えずに終了する (fail closed)。
 4. **意図の記録**を 1 transaction で commit する (lock 内): `plugin_deploy_ops` に `phase=intent`、`--revoke` の `rejected` 行、cascade の pending `abandoned` 化と、`plugin_deploy_op_signals` への pending / claimed の記録。これらは制限する向きの効果だけで、FS より先に確定してよい (IV-10)。
 5. FS を動かす。
@@ -165,14 +170,14 @@ FS: `is_symlink()` を再確認して `unlink` (dir は触らない)。完了表
 戻り先の検証 (すべて lock の内側。1 つでも落ちたら変更なし。IV-8):
 
 1. 戻り先 `.versions/<name>/<hash>` が実在し、dir 名が正規形。
-2. その版の最新決定が approved (`_approved_hashes_by_name` を**そのまま呼ぶ**。規則を複製しない)。revoke 済み・未承認は拒否。
+2. その版の最新決定が approved (`approvals` store の latest-decision helper 群を呼び、規則を複製しない)。revoke 済み・未承認は拒否。
 3. `_version_dir_hashes_ok(dir, content_hash, artifact_hash)` (`switch.py`) が真。
 4. `loader._discover_one(dir, name)` が non-None で、kind が現配備と同じ (live 不在のときは直近の done op の subject と同じ kind)。
 5. 依存の検算 (§4.2): 戻り先を置いた状態で、(a) **戻り先自身が strategy なら自分の依存が現 inventory で `resolve_indicator_deps(..., pin_mode="require")` により解決できる**、(b) 依存 strategy が `require` で解決できる。(a) の不成立は `--force` でも許さない (`--force` は「他 strategy を止める許可」であり、戻り先自身の依存不整合は対象外)。(b) の解決不能は列挙し、`--force` が無ければ拒否。
 
 意図の記録: `op_kind=rollback_symlink, from_kind=<symlink|absent>, to_kind=symlink, to_target, target identity`。subject は外される版 (live 不在から始めるときは subject なし)。`--revoke` の対象は**外される版 (subject)**。live 不在のときの `--revoke` は拒否し、`revoke --version` を使わせる。
 
-FS: temp symlink `.{name}.link-d{op_id}` を作り `_atomic_symlink_swap`。残骸は sweep ④ (`.*.link-*`) の掃除対象で無害。完了表示は `filesystem_switched=yes runtime_activation=pending_restart`。`rollback 完了` とだけ表示することを禁止する (AC で pin)。
+FS: temp symlink `.{name}.link-d{op_id}` を作り `_atomic_symlink_swap`。完了表示は `filesystem_switched=yes runtime_activation=pending_restart`。`rollback 完了` とだけ表示することを禁止する (AC で pin)。
 
 ### 3.3 retire `afx plugin retire <name> [--force] [--yes] [--dry-run]`
 
@@ -183,16 +188,16 @@ FS: temp symlink `.{name}.link-d{op_id}` を作り `_atomic_symlink_swap`。残�
 | 処理 | §3.1 の disable_symlink と**同じ状態機械** (`op_kind=disable_symlink`、`--revoke` なし) | `op_kind=retire_plain` (§6.3)。`os.rename(plugins/<name>, _retired/<name>-<ts>-<op_id>)` |
 | 退避 | しない (unlink)。from_target を記録するだけ | 退避先を `retired_path` に記録。`_retired/` は plugins と同一 FS であることを意図の記録前に `st_dev` で確認 |
 | 依存確認 | あり | あり (旧実装には無かった)。**plain の依存は config.yaml が参照する indicator 名で判定し、hash は照合しない**（`ResolvedIndicatorSet` に `artifact_hash` がなく、plain に版 dir もないため） |
-| cascade | subject の identity で | plain は identity が信頼できないので、plugin 名の pending signal を全て放棄 |
+| cascade | subject の identity で | plain は identity の値にかかわらず plugin 名単位で pending signal を全て放棄 |
 | lock | `_plugin_locks` (旧 `retire` の自前 flock は廃止) | 同左 |
 
 `afx plugin disable` は symlink 専用の明示的な名前として残す。`retire` が symlink に当たったら委譲ではなく disable と同じ関数を呼ぶ。activity は既存名 `plugin_retired` を plain で維持し、symlink は `plugin_disabled`。open の disable intent に対する symlink `retire` の再実行は、署名 (§2.1) が一致する (revoke=0、force 同値) ときだけ引き継ぎ、それ以外は拒否 (§6.4)。
 
 ### 3.4 `versions` `afx plugin versions <name>`
 
-読み取り専用 (lock を取らない)。表示: live の版 (symlink の先 / plain / 不在)、`.versions/<name>/` 配下の版ごとの承認時刻・承認者・最新決定 (approved / rejected)・版 dir の整合 (`_version_dir_hashes_ok`)、§2.4 の経歴、open / `needs_retry` / `foreign` の deploy op (`plugin_deploy_ops` から)、依存 strategy。rollback の `--to` 候補をここから選ぶ。
+読み取り専用 (name lock を取らず、DB の行・schema・app が持つファイルを作らず変更しない。SQLite が reader のために置く `-wal` / `-shm` はこの契約の除外)。表示: live の版 (symlink の先 / plain / 不在)、`.versions/<name>/` 配下の版ごとの承認時刻・承認者・最新決定 (approved / rejected)・版 dir の整合 (`_version_dir_hashes_ok`)、§2.4 の経歴、open / `needs_retry` / `foreign` の deploy op (`plugin_deploy_ops` から)、依存 strategy。rollback の `--to` 候補をここから選ぶ。
 
-### 3.5 revoke `afx plugin revoke <name> --version <hash> [--yes]`
+### 3.5 revoke `afx plugin revoke <name> --version <content-hash-先頭一致> [--yes]`
 
 FS は触らない DB 操作。name lock を取り (approve / bless / disable との直列化)、**1 transaction** で次を行う。
 
@@ -210,6 +215,18 @@ FS は触らない DB 操作。name lock を取り (approve / bless / disable �
 - activity `plugin_revoked name=… version=…` は通知試行 (§7.0)。DB への追記が正で、activity の成否は問わない (`afx plugin versions` が rejected を表示する)。
 
 disable / rollback の `--revoke` は、subject の revoke を意図の記録 transaction に含めるだけの糖衣 (`revoke_row_id` を op 行に持つ)。live 不在のときは受け付けず `revoke --version` を案内する。
+
+### 3.6 CLI outcome と refusal code
+
+outcome は rc と code と文言の組に 1 対 1 で対応し、stderr の 1 行目は `エラー: …(code=<code>)`、次の安全な操作を続ける。`test_every_outcome_maps_to_one_rc_code_and_message` (outcome の表を parametrize で全数固定) と個別 test で次のとおり固定する。
+
+| 群 | rc | code | 内容 | 固定する test |
+|---|---|---|---|---|
+| 完了・no-op・dry-run | 0 | なし (stderr は空) | 各 op の完了、`already_disabled` / `already_retired` / `already_revoked`、rollback の `already_live` (refusal だが rc 0)、全 op の `dry_run` | `test_every_outcome_maps_to_one_rc_code_and_message`。完了表示は `test_rollback_success_never_reports_a_bare_completion`、予告は `test_dry_run_shows_the_plan_and_changes_nothing`、no-op は `test_a_noop_needs_no_confirmation` |
+| usage | 2 | `revoke_requires_version` | live 不在の `--revoke`。`revoke --version` を案内する | 上の全数 test と `test_disable_revoke_without_a_live_points_to_revoke_with_rc_2` |
+| 業務拒否 | 1 | `dependents_blocked`, `dependents_unresolvable`, `foreign`, `needs_retry`, `retire_refused`, `target_verification_failed`, `bad_target`, `target_not_found`, `target_ambiguous`, `target_required`, `no_rollback_target`, `live_is_plain`, `signature_mismatch`, `deploy_op_blocked`, `unresolved_journal`, `lock_timeout`, `dependents_changed`, `invalid_request`, `state_changed` | 状態や入力が操作を許さない。rollback の source unlink 後に戻り先の検証が落ちた表示は `target_verification_failed` と `live_removed` を併記する。`retire_refused` は具体的な理由を載せる | 上の全数 test。個別に `test_revoke_of_the_live_version_is_refused_with_a_code` (`invalid_request`)、`test_revoke_prefix_that_matches_no_version_is_refused` (`target_not_found`)、`test_revoke_rejects_a_version_prefix_that_is_empty_short_or_not_lowercase_hex` (`bad_target`)、`test_a_rerun_with_a_different_signature_shows_the_op_and_the_wait_hint` (`signature_mismatch`)、`test_a_lock_held_past_the_deadline_is_a_lock_timeout_that_changes_nothing` (`lock_timeout`)、`test_versions_rejects_an_invalid_plugin_name_with_a_code` (`invalid_request`)。`state_changed` は予告後に前提が動いた各 test (`test_rollback_does_not_run_when_the_live_version_moved_after_the_preview` ほか) |
+| 対話結果 | 1 | `confirmation_required`, `aborted` | 端末も `--yes` も無い、または確認で拒否・EOF・Ctrl-C。何も変えない | `test_without_a_terminal_or_yes_nothing_changes_and_confirmation_is_required`、`test_declining_the_terminal_prompt_aborts_without_changes`、`test_eof_at_the_prompt_is_a_refusal`、`test_ctrl_c_at_the_prompt_aborts_with_a_code`、`test_revoke_asks_first_and_records_the_version_only_after_yes` (revoke の `confirmation_required`) |
+| OS / DB / 内部 / 設定エラー | 1 | `os_error`, `db_error`, `internal_error`, `config_error`, `db_missing` | OS の失敗、SQLite のエラー、想定外の例外、設定ファイルの不在・不正、DB 未初期化。`versions` は設定や DB が無いとき何も作らない | `os_error` / `db_error` / `internal_error` は全数 test。`config_error` は `test_versions_refuses_missing_or_invalid_settings_with_a_code`、`db_missing` は `test_versions_on_a_root_without_a_database_creates_nothing_and_says_so` |
 
 ## 4. 依存 strategy の列挙と cascade
 
@@ -323,7 +340,7 @@ snapshot stale 時に **requeue** (abandon でない) とする理由 (signal �
 | `recent(exclude_deploy_linked=True)` | anti-join だけを追加。status・鮮度は足さない。鮮度切れで abandoned になった行の見え方は変わらない |
 
 - `tools/signal_tools.py` の `get_signals` は `recent(exclude_deploy_linked=True)` を使い、`plugin_deploy_op_signals` に id がある行 (pending / claimed どちらで記録された行も) を LLM 入力から落とす。
-- `claim_oldest` は付随表にある signal を claim しない (anti-join、`signal_id` index を使う)。claimed のまま finally で pending に戻った linked signal が再 claim されるのを防ぐ。
+- `claim_oldest` は付随表にある signal を claim しない (anti-join、`signal_id` index を使う)。linked signal は requeue、lease 回収、起動時 `recover_interrupted` のいずれでも `abandoned` で終端し、pending に戻さない。pending に戻すと anti-join により永久に不可視なゾンビ行になるためである。
 - **linked な pending だけ、または stale な pending だけが残っているときは signal mission を起動しない** (claim 不能な signal で scheduler が毎 tick mission を起動し続けるのを防ぐ、AC-23)。
 - `signals.recent()` / `claim_oldest` / `pending_exists` の呼び出し元 (`service.py` の `signal_due_fn` を含む) と差し替え箇所は task 6 で全数 grep する。
 
@@ -336,6 +353,10 @@ snapshot stale 時に **requeue** (abandon でない) とする理由 (signal �
 | trade LLM の indicator 参照 | 次の mission から新 live を見る。producer とは再起動まで食い違う (許容) |
 | CLI が待つ時間 | producer の lock 区間は短く、CLI の待ちは通常数十 ms。OPEN 中は発注確定まで待つ。deadline 超過時は CLI がエラーで終わり、変更なし |
 | scheduler の保護経路 | name lock を取らない。signal maintenance は `core_lock` の外で、専用接続 `conn_signal` を使う (`conn_core` を共有しない)。OPEN の name lock 待ちは `core_lock` を持たない |
+
+### 5.5 `signal_max_id` による mission 境界
+
+trade mission の submit 時に `core_lock` の下で `COALESCE(MAX(id), 0)` を採取し、その mission の `claim_oldest(max_id=...)` に渡す。`0` は claim 不可、`None` は上限なしの直接呼出し経路を表す。採取後に producer が INSERT した signal は次の mission まで claim されない。既存 id の signal が requeue された場合は、後続 mission の上限に含まれるときだけ再 claim 対象になる。
 
 
 
@@ -365,13 +386,14 @@ reconcile (起動時、name ごとに lock 内) は deploy ops を切替ジャ�
 | source の `unlink` (検証失敗時の非 active 化) が失敗 | live は `from` のまま (source は active)。ERROR。open が残るので producer・OPEN は止まり続ける | `needs_retry` (`syscall_failed`) |
 | 上記以外 | live に触らない。ERROR | `foreign` |
 
-stale な temp symlink (`.{name}.link-d{op_id}`) は reconcile が作り直す前に unlink する。
+再試行対象の stale temp symlink (`.{name}.link-d{op_id}`) は reconcile が作り直す前に unlink する。foreign で終端した temp は無害で保全対象ではない。
 
 ### 6.3 retire_plain
 
 | 観測 | reconcile の動作 | 結果 |
 |---|---|---|
-| live が plain dir・`retired_path` 不在 | `os.rename(live, retired_path)` | `done` |
+| live が plain dir・`retired_path` 不在 | FS 操作直前に discover を再実行し、intent の plain content hash が非 NULL なら一致する場合だけ `os.rename(live, retired_path)`。記録 hash が NULL なら比較せず plugin 名で `os.rename` する | `done` |
+| live が plain dir・intent の content hash (非 NULL) と不一致 | rename しない。activity ERROR | `foreign` |
 | live 不在・`retired_path` 実在 | — | `done` |
 | live 実在かつ `retired_path` 実在 (衝突) | 触らない。ERROR | `foreign` |
 | live 不在かつ `retired_path` 不在 (消失) | ERROR | `foreign` |
@@ -380,9 +402,9 @@ stale な temp symlink (`.{name}.link-d{op_id}`) は reconcile が作り直す�
 
 ### 6.4 共通
 
-- 通知対象 phase (`done` / `needs_retry` の両 fail_reason / `foreign`) への遷移の後に reconcile / CLI が activity を試み (`ActivityLog.write` は失敗を握る、既存契約)、`notify_attempted=1` にする。**配送保証は無い**。activity の欠落や重複は状態の正本 (`plugin_deploy_ops`) に影響しない。通知窓の crash は全通知対象 phase に共通で、§7.0 の 1 表で扱う。**通知対象 phase かつ `notify_attempted=0` の行は、startup reconcile と CLI 再実行 (状態としては no-op) の双方が通知を試みる**。
+- 通知対象 phase (`done` / `needs_retry` の両 fail_reason / `foreign`) への遷移の後に reconcile / CLI が activity を試み (`ActivityLog.write` は失敗を握る、既存契約)、`notify_attempted=1` にする。**配送保証は無い**。activity の欠落や重複は状態の正本 (`plugin_deploy_ops`) に影響しない。`needs_retry/syscall_failed` から同じ `syscall_failed` 以外の phase / reason へ遷移すると `notify_attempted=0` に戻り、その遷移ごとに再通知を負う (`intent` への巻き戻しは再実行の取り込み `match_or_reject`、終端 phase への遷移と再通知は終端判定 `settle_op` が担う)。同じ `syscall_failed` が継続する間は初回通知だけである。通知窓の crash は全通知対象 phase に共通で、§7.0 の 1 表で扱う。**通知対象 phase かつ `notify_attempted=0` の行は、startup reconcile と CLI 再実行 (状態としては no-op) の双方が通知を試みる**。
 - reconcile 自身は各ステップを idempotent に書く。中断すると、§7 の「直前の状態」に戻るだけで、悪化しない。
-- **CLI の再実行の取り込み**: 同 name・同 `op_kind` の `blocking/open` な op が存在し、**immutable intent 署名 (§2.1: 対象 identity、`to_target`、`revoke`、`force`) が再実行の指定と一致**し、live が from / to のいずれかなら、CLI は新規 op を作らず open op を引き継いで完遂する (検査 3 を再実施。`syscall_failed` の場合は `intent` に戻して続きから。このとき `notify_attempted` を 0 に戻し、完遂後にまた通知を試みる)。**署名が不一致なら拒否**し、open op の `op_id` と署名の値を表示して、reconcile を待つか daemon を再起動するよう案内する (別の `--to` で打ち直すのは、open op が終端化された後の新規 op)。別 op_kind の open op があれば同じく拒否。`--revoke` / `--force` / `--to` を再実行で付け足すことはできない。revoke を足したいなら `revoke --version`。
+- **CLI の再実行の取り込み**: 同 name・同 `op_kind` の `blocking/open` な op が存在し、**immutable intent 署名 (§2.1: 対象 identity、`to_target`、`revoke`、`force`) が再実行の指定と一致**し、live が from / to のいずれかなら、CLI は新規 op を作らず open op を引き継いで完遂する。open rollback の再実行で `--to` を省略した場合は、署名比較前に open 行の `to_target` を補って比較する。異なる `--to` は拒否する。(検査 3 を再実施。`syscall_failed` の場合は `intent` に戻して続きから。このとき `notify_attempted` を 0 に戻し、完遂後にまた通知を試みる)。**署名が不一致なら拒否**し、open op の `op_id` と署名の値を表示して、同じ command を再実行するか daemon を再起動して reconcile するよう案内する。別の `--to` で打ち直すのは、open op が終端化された後の新規 op。別 op_kind の open op があれば同じく拒否。`--revoke` / `--force` を再実行で付け足すことはできない。revoke を足したいなら `revoke --version`。
 
 ## 7. crash matrix
 
@@ -419,7 +441,7 @@ revoke 単独 (`done` を作成と同時に commit) も N1〜N5 に従う。
 | D8 | 第三者が D3〜D4 の間に live を別 symlink へ | intent | live = 別 | 検証で落ちる | live 不触、ERROR → foreign | 取り込まず拒否 (foreign が閉じた後は通常の検査) |
 | D9 | `unlink` が EACCES 等で失敗 (CLI 内、または reconcile 内) | `needs_retry/syscall_failed` (open のまま) | live = from | 見送り (open op) | 起動ごとに 1 回再試行。失敗が続けば `syscall_failed` のまま ERROR | 権限等を直した後、署名一致の CLI 再実行で `intent` に戻して unlink → done。失敗中の CLI は rc≠0 |
 | D10 | D3 の後、再実行の指定が署名と不一致 (`--revoke` / `--force` の付け足し) | intent | live = from | 見送り | unlink → done | 拒否、open op の `op_id` と署名を表示。reconcile 後は新規 op として通常検査 |
-| D11 | D3〜D4 の間に別 indicator の live が変わる (依存変化) | intent | live = from | 見送り | disable は依存に影響されず unlink → done。dependent が新たに解決不能なら次回起動で `not_found` になる旨を ERROR 表示 | 同左 |
+| D11 | D3〜D4 の間に別 indicator の live が変わる (依存変化) | intent | live = from | 見送り | disable は依存に影響されず unlink → done | 同左 |
 | D12 | D9 の後、修復せず daemon を再起動 | `needs_retry/syscall_failed` | live = from | 見送り (producer は INSERT しない。claimed は付随表で隠れる) | unlink を試み、成功すれば done、失敗なら同状態のまま | 同 D9 |
 
 ### 7.2 rollback_symlink (revoke の対象は外される版。target の再検証失敗でも revoke は戻さない)
@@ -429,13 +451,13 @@ revoke 単独 (`done` を作成と同時に commit) も N1〜N5 に従う。
 | R1 | intent INSERT 前 | 不変 | live = from | 通常 | なし | 最初から |
 | R2 | transaction 中 | 全て rollback | live = from | 通常 | なし | R1 と同じ |
 | R3 | commit 後・temp 作成前 | intent + (revoke) + cascade + 付随表 | live = from (または不在) | 見送り | 再列挙・昇順 lock → 検証 1〜5 を再実行、ok なら temp 作成 + swap → done、落ちたら source unlink → `needs_retry` | 署名一致なら引き継いで同じ検証、ok なら完遂 |
-| R4 | temp 作成後・rename 前 | 同 R3 | live = from、temp 残存 | 見送り | stale temp を unlink してから R3 と同じ | 同左 (stale temp は sweep ④ でも消える) |
+| R4 | temp 作成後・rename 前 | 同 R3 | live = from、temp 残存 | 見送り | 再試行対象の stale temp を作り直す前に unlink してから R3 と同じ | 同左 |
 | R5 | rename 後・done commit 前 | intent のまま | live = to | 見送り (open op)。to は `approved` に無く評価されない | live == to → done | 引き継いで done |
 | R6 | done commit 後 | done | live = to | 評価されない | §7.0 の N1〜N5 | §7.0 の N1〜N5 |
 | R7 | reconcile が R3/R4 内で中断 | R3 と同じ | temp 残存または live = from | 同左 | 次回起動で R3/R4 の処理 | 同左 |
 | R8 | reconcile が rename 後・done 前に中断 | R5 と同じ | live = to | — | 次回起動で R5 | 同左 |
-| R9 | reconcile が `needs_retry` 化の unlink 後・phase 更新前に中断 (`from_kind=symlink`、live 不在、`intent`) | intent | live 不在 | 見送り | §6.2 の専用行: 検証 1〜5 を再実行し、落ちれば `needs_retry/verify_failed` (live 不在のまま、event を出す)、通れば swap → `done`。`foreign` にはならない | 署名一致なら引き継ぎ再検証。**別の `--to` は署名不一致で拒否され、`needs_retry` への終端化後に新規 op として打ち直す** |
-| R10 | from_kind=absent で R3 | intent (`--revoke` は受け付けない) | live 不在 | 見送り | 検証 ok → link → done / 落ち → `needs_retry` (unlink 不要、read model の event は作らない) | 同左 |
+| R9 | reconcile が `needs_retry` 化の unlink 後・phase 更新前に中断 (`from_kind=symlink`、live 不在、`intent`) | intent | live 不在 | 見送り | §6.2 の専用行: 検証 1〜5 を再実行し、落ちれば `needs_retry/verify_failed` (live 不在のまま、event を出す)、通れば swap → `done`。`foreign` にはならない | `--to` 省略なら open 行の `to_target` で再検証し、別の `--to` は署名不一致で拒否。終端化後は新規 op として打ち直す |
+| R10 | from_kind=absent で R3 | intent (`--revoke` は受け付けない) | live 不在 | 見送り | 検証 ok → link → done / 落ち → `needs_retry` (unlink 不要、read model の event は作らない) | `--to` 省略なら open 行の `to_target` を使う |
 | R11 | 戻り先の版 dir が R3〜R4 の間に 1 byte 改変 | intent | live = from | 見送り | 検証 3 が落ち → source unlink → `needs_retry` | `--to` を別の版にして新規 op |
 | R12 | 第三者が live を別 symlink へ | intent | live = 別 | — | 触らず ERROR → foreign | 取り込まず拒否 |
 | R13 | intent 後に戻り先 strategy の依存 indicator の live が変わる (依存変化) | intent | live = from | 見送り | 5(a) が落ち → source unlink → `needs_retry` (`force` でも許さない) | 新規 op |
@@ -444,7 +466,7 @@ revoke 単独 (`done` を作成と同時に commit) も N1〜N5 に従う。
 | R16 | swap の syscall (temp 作成・`rename`) が EACCES / EXDEV 等で失敗 | `needs_retry/syscall_failed` (open のまま) | live = from、temp 残存 | 見送り | 起動ごとに 1 回再試行。失敗が続けば同状態のまま ERROR | 修復後、署名一致の CLI 再実行で続きから (検証 1〜5 を再実行) |
 | R17 | `needs_retry/verify_failed` 遷移後 | needs_retry (verify_failed、closed) | live 不在 | — | §7.0 の N1〜N5 | §7.0 の N1〜N5 |
 | R18 | 検証失敗 → source の `unlink` 自体が EACCES 等で失敗 | `needs_retry/syscall_failed` (open のまま。`verify_failed` にはしない: source がまだ live だから) | live = from (active のまま) | 見送り (open op なので producer は INSERT しない、OPEN はゲートで拒否) | 起動ごとに 1 回、検証から再実行して unlink を再試行 | 修復後、署名一致の CLI 再実行 → 検証 → 再び落ちれば unlink → `needs_retry/verify_failed` |
-| R19 | 第三者 (または手作業) が R3〜R4 の間に source の symlink を unlink (`from_kind=symlink`、live 不在、`intent`) | intent | live 不在 | 見送り | R9 と同じ専用行。区別せず検証 1〜5 → 通れば swap → `done` / 落ちれば `needs_retry/verify_failed` (commit 済み intent の範囲でのみ完遂) | 署名一致なら引き継いで同じ検証 |
+| R19 | 第三者 (または手作業) が R3〜R4 の間に source の symlink を unlink (`from_kind=symlink`、live 不在、`intent`) | intent | live 不在 | 見送り | R9 と同じ専用行。区別せず検証 1〜5 → 通れば swap → `done` / 落ちれば `needs_retry/verify_failed` (commit 済み intent の範囲でのみ完遂) | `--to` 省略なら open 行の `to_target` で、署名一致として同じ検証 |
 
 ### 7.3 retire_plain (revoke は付けない。cascade は plugin 名の pending 全て)
 
@@ -458,10 +480,10 @@ revoke 単独 (`done` を作成と同時に commit) も N1〜N5 に従う。
 | P6 | reconcile が rename 前に中断 | P3 | P3 | — | 次回 P3 | 同左 |
 | P7 | reconcile が rename 後・done 前に中断 | P4 | P4 | — | 次回 P4 | 同左 |
 | P8 | 退避先が既に実在 (意図の記録の前) | 不変 | 変更なし | 通常 | なし | 拒否 (op_id を含む名前なので通常起きない。起きるなら第三者のファイル) |
-| P9 | P3 の間に退避先が第三者に作られた | intent | live 実在 + `retired_path` 実在 | — | 触らず ERROR → foreign | 取り込まず拒否 |
+| P9 | P3 の間に退避先が第三者に作られた | intent | live 実在 + `retired_path` 実在 | — | 触らず ERROR → foreign | 取り込まず拒否。dry-run も同じ refusal |
 | P10 | `st_dev` 検査の後に `rename` が EXDEV / EACCES で失敗 (plain rename 失敗) | `needs_retry/syscall_failed` (open のまま。cascade 済み) | live = plain | open op で見送り | 起動ごとに 1 回再試行。失敗が続けば同状態のまま ERROR | 修復後、署名一致の CLI 再実行で続きから。`st_dev` 検査で通常の EXDEV は意図の記録前に拒否される |
 | P11 | 意図の記録後に plain の依存 indicator が変わる (依存変化) | intent | live = plain | 見送り | retire は依存に影響されず rename → done | 同左 |
-| P12 | P10 の後、退避先が第三者に作られた状態で再試行 | `needs_retry/syscall_failed` | live 実在 + `retired_path` 実在 | — | 触らず ERROR → foreign | 取り込まず拒否 |
+| P12 | P10 の後、退避先が第三者に作られた状態で再試行 | `needs_retry/syscall_failed` | live 実在 + `retired_path` 実在 | — | 触らず ERROR → foreign | 取り込まず拒否。dry-run も同じ refusal |
 
 ### 7.4 revoke 単独
 
@@ -486,9 +508,9 @@ revoke 単独 (`done` を作成と同時に commit) も N1〜N5 に従う。
 | G1 | name lock 取得待ち中に CLI が intent を commit して完了 | lock 取得後に `signal_source_active` が落ちる → `signal_source_inactive` 拒否、claimed は abandoned |
 | G2 | ゲート通過後・`open_from_snapshot` 中に CLI が disable を試みる | CLI の lock 取得は発注確定まで待つ。発注は通り、その後 disable が完了する |
 | G3 | lock deadline 超過 | `signal_source_lock_timeout` で建てない。consume しない |
-| G4a | daemon が OPEN 中、**consume 前** (signal は claimed) に crash、対応する running mission がある | lock は process 死で解放。intent は記録済みで既存の reconcile 規則に従う (本設計は変更しない)。起動時の `missions.recover_interrupted()` (`service.py`, `missions.py`) が running の mission とその claimed を同一 transaction で処理する。claimed signal は上限未満なら pending に復帰 (requeue)、`requeue_count >= max_requeue` に到達済みなら abandoned になる (現物 `missions.py`)。付随表に結ばれた signal は復帰後も `claim_oldest` が取らず `pending_exists` も真にならない (signal mission を起動しない、AC-23 case a) |
+| G4a | daemon が OPEN 中、**consume 前** (signal は claimed) に crash、対応する running mission がある | lock は process 死で解放。intent は記録済みで既存の reconcile 規則に従う。起動時の `missions.recover_interrupted()` (`service.py`, `missions.py`) は running mission とその claimed を同一 transaction で処理する。linked signal は上限や `requeue_count` にかかわらず `abandoned` で終端する。付随表に結ばれた signal は `claim_oldest` が取らず `pending_exists` も真にならない (signal mission を起動しない、AC-23 case a) |
 | G4b | daemon が OPEN 中、**consume 後** (`open_from_snapshot` の実行中、signal は consumed) に crash | signal は既に consumed で `recover_interrupted` の対象外 (戻すのは `status='claimed'` だけ)。pending には戻らず consumed のまま維持する。以後は既存の intent / order 回復だけに委ね、本設計は変更しない |
-| G5 | 対応する mission が無い claimed (mission 回収の対象外) | 起動時 1 回の `reclaim_expired` (`service.py`) または maintenance の `reclaim_expired` が lease 切れで pending に戻す。linked なら同様に取られず mission を起動しない (AC-23 case b) |
+| G5 | 対応する mission が無い claimed (mission 回収の対象外) | 起動時 1 回の `reclaim_expired` (`service.py`) または maintenance の `reclaim_expired` は lease 切れの linked signal を `abandoned` で終端する。mission を起動しない (AC-23 case b) |
 | G6a | claim 後、障害または lock 待ちで claim 元 signal の `bar_ts` 鮮度が切れる (`conn_signal` 再生成失敗中を含む) | `core_lock` 内、consume の前に共有述語 (注入 clock) が検出し、OPEN を gate 拒否 (consume せず、建てない)。signal は abandoned (鮮度切れ)、requeue しない (時間が戻らないため) |
 | G6 | name lock / `core_lock` の待ちで commit-pre の snapshot が期限切れ | `core_lock` 内、consume の前に共通 helper が検出し、consume せず gate 拒否 (executor と同じ理由・category)。claimed は finally の `requeue` で pending に戻る (現物 `missions.py` 145 に合わせ、上限未満なら pending、`requeue_count >= max_requeue` に到達済みなら abandoned)。建てない。helper の拒否が consume 後の第二判定で起きた場合は consumed のまま (requeue しない) |
 | G7 | OPEN が name lock を取ったまま `core_lock` を待っている間に scheduler tick が走る | tick は name lock を取らないので止まらない (SL/TP・kill switch 継続)。tick が終われば OPEN が `core_lock` を得る |
@@ -535,7 +557,7 @@ live を書き換える全経路の表 (既存 spec §4 末尾) に、`rollback`
 - **API の pin**: `ops/api_server.py` の `ENDPOINTS` (24 本、`ops/service.py` の `build_routes` から作る `ROUTES`) の `(method, path, handler, scope)` 完全集合と、`jobs` / `events` の action enum を frozenset で固定する。deploy ops を指す route / action が無いこと。
 - **bot の pin**: bot に command 表は無い。`afx-ops/afx_ops/gate/types.py` の component custom-id の action 集合 `{approve, claim, confirm, cancel, reject, retry}` と、`gate/state.py` の決定 action 集合 `{approve, reject, retry}` を完全集合で pin する。`BotClient` は **`afx-ops/afx_ops/api_client.py` のクラス本体に直接定義された公開メソッド集合 `{events, approvals, approval, approve, reject, retry, poll, cancel}` (8 本。継承した `from_token`・`interrupt` 等は対象外)** を完全集合で pin し、対応する API path 集合 (events、approvals の一覧 / 詳細、approve / reject / retry、job の取得 / cancel の 8 系統) も固定する。disable / rollback / retire / revoke を含まない。
 - **表名の pin**: `store/db.py` の `TABLE_NAMES` は現物 30 表で、本設計で `plugin_deploy_ops` と `plugin_deploy_op_signals` が加わり 32 表になる。表名集合の完全一致 test を更新する。`Action` は `{OPEN, CLOSE, CANCEL, HOLD}` の 4 値のまま (本設計は action を足さない)。
-- **実隔離 worker での拒否 integration test**: Landlock + seccomp 下の改善 worker を実起動し (既存 `core/improve_canary.py` の実 worker → 隔離 CLI 経路を使う)、(a) `afx plugin disable` の subprocess 起動、(b) DB への書込、(c) `plugins/<name>` の unlink / rename / `plugins/.versions` の書換え、がすべて拒否される。fingerprint 非依存の形 (実行ファイルの照合に依存しない起動経路) で書く。ABI 8 を要する部分は skip 規約に従うが、**release CI の対応 kernel job では skip を禁止**する (skip だけで恒真化させない)。
+- **実隔離 worker での拒否 integration test**: Landlock + seccomp 下の改善 worker を実起動し (既存 `core/improve_canary.py` の実 worker → 隔離 CLI 経路を使う)、(a) `afx plugin disable` の subprocess 起動、(b) DB への書込、(c) `plugins/<name>` の unlink / rename / `plugins/.versions` の書換え、がすべて拒否される。fingerprint 非依存の形 (実行ファイルの照合に依存しない起動経路) で書く。CI は `isolation` job を追加し、先頭で kernel の Landlock ABI を測る。ABI 8 以上なら実隔離 integration を実行し、skip があれば fail とする。ABI 8 未満なら「kernel 不足」を明示して job を neutral にする。release の受入は ABI 8 の実機で手順書どおり手で実行する。
 - 新しい文字列を `approval_requests.reason` / `improvement_backlog.last_result` に自由記述で書かない (固定文言のみ)。activity も固定書式 (自由記述なし)。
 - 外向きリクエスト・新しい sink・新しい入力経路は増えない。
 - fail closed: 検査が 1 つでも落ちたら FS も DB も変えない。意図の記録後の crash は §6 が収束させる。
@@ -543,14 +565,14 @@ live を書き換える全経路の表 (既存 spec §4 末尾) に、`rollback`
 
 ## 10. 鍵漏れ・誤承認の回復手順 (運用文書に書く 1 節)
 
-`docs/operations/ops-api-2026-10-09.md` §7「承認後の回復手段は未整備」を置き換える。同 §6 (鍵を止める手順) の続きとして、鍵を止めた後に plugin を回収する。
+`docs/operations/ops-api-2026-10-09.md` §7 を置き換える。同 §6 (鍵を止める手順) の続きとして、鍵を止めた後に plugin を回収する。
 
 1. 前提: §6 の手順 1〜2 まで済ませる (daemon 停止、鍵の rotate / revoke)。停止中は資金保護を kill switch の latch に任せたまま、plugin だけを直す。
 2. `afx plugin versions <name>` で、現在の版・各版の承認時刻・承認者 (`decided_by`)・revoke の有無・経歴・open / `needs_retry` / `foreign` の op を見る。疑わしい承認の時刻帯は鍵の漏洩時刻から割り出す。
 3. 誤承認・漏洩鍵で承認された版がある name ごとに:
    - 前の版に戻せる: `afx plugin rollback <name> --to <hash> --revoke` (経歴に rollback / disable を挟むと `--to` 必須)。戻り先は `--dry-run` で確認する。
    - 前の版が無い、または疑わしい: `afx plugin disable <name> --revoke`。
-   - 既に revoke なしで外してある: `afx plugin revoke <name> --version <hash>`。
+   - 既に revoke なしで外してある: `afx plugin revoke <name> --version <content-hash-先頭一致>`（小文字 hex 12 桁以上）。
    - indicator なら依存 strategy が列挙される。意図して外すなら `--force` (依存 strategy の signal は止まり、pending は放棄される)。そうでなければ strategy 側を先に処置する。
    - legacy plain 配備は `afx plugin retire <name>` (disable / rollback の対象外)。
 3b. open の op が残っているとき (`versions` / `afx ctl status` が示す): `needs_retry/syscall_failed` は権限・mount・ディスクの原因を直してから**同じ署名のコマンドを再実行**する (`--revoke` / `--force` / `--to` を変えない)。`needs_retry/verify_failed` は live が不在になっているので、原因を直した上で新規の `rollback --to` か `disable` を打つ。
@@ -559,11 +581,11 @@ live を書き換える全経路の表 (既存 spec §4 末尾) に、`rollback`
 | foreign の live | 手順 |
 |---|---|
 | 別 symlink、または不在 | 版 dir の整合 (`versions` の整合欄) と承認を確認し、検証済みの版を `afx plugin bless` / 承認経路 (`approve`) で入れ直す。承認されていない版は先に承認する |
-| plain dir (現物の approve / bless は `legacy_plain_present` で保留に留め上書きしない) | 内容を保全 (コピーを `data/` 外へ) し、中身を確認したうえで `afx plugin retire <name>` で退避してから、bless / approve する |
+| plain dir (現物の approve / bless は `legacy_plain_present` で保留に留め上書きしない) | 外部データを保全し、中身を確認したうえで必ず `afx plugin retire <name>` を経てから、bless / approve する |
 | 不明・改変された版 (symlink の先が承認と合わない、版 dir の hash 不一致、出所不明の plain) | daemon を停止し、`plugins/` と `.versions/` を保全してから処置する。稼働中に触らない |
-4. 完了表示に `runtime_activation=pending_restart` が出たら、daemon の起動で戻り先が有効になる。
+4. rollback 後の戻り先は daemon を再起動するまで反映されない。完了表示に `runtime_activation=pending_restart` が出たら、daemon の起動で有効になる。
 5. 版 dir は消えない。調査したいときは `plugins/.versions/<name>/<hash>/` を読み取り専用のまま保全する (コピー先は `data/` 外)。**容量の観測** (`du` で `.versions` 総量を月次に確認)、**保全** (revoke した版は削除せず、必要なら tar で `data/` 外へ退避)、**手動削除するとき** (削除前に `afx plugin versions <name>` で当該版が live でも rollback 候補でもないことを確認し、削除後に再度 `versions` で整合表示が崩れていないことを確認する) を手順に書く。削除は人間が手で行う。
-6. daemon を起動し、`afx ctl --as operator whoami`、`afx plugin versions <name>` の live と op の状態が意図どおりであること、`afx ctl status` に open / `needs_retry` / `foreign` が残っていないことを確かめる。activity (`plugin_disabled` / `plugin_rolled_back`) は通知試行なので、欠けていても状態が正であれば問題としない。
+6. daemon を起動し、`afx ctl --as operator whoami`、`afx plugin versions <name>` の live と op の状態が意図どおりであることを確かめる。`afx ctl status` の `plugin_deploy_ops` 節は `open` / `attention`、読めないときは `unavailable` を示す。`afx ops status <feature>` は未完 op が 1 件以上のときだけ 1 行を示す。activity (`plugin_disabled` / `plugin_rolled_back`) は通知試行なので、欠けていても状態が正であれば問題としない。
 7. 稼働中に誤承認に気付いたとき: 停止せず `afx plugin disable <name>` を打てる。次の signal INSERT から止まる (pending は放棄され、claimed は LLM から隠れ、OPEN は発注確定まで待ってゲートで止まる)。ただし新しい配備や rollback 先の有効化は再起動が要る。鍵漏れのときは必ず §6 の停止手順を先に行う。
 
 ## 11. 受入条件
@@ -574,7 +596,7 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 |---|---|---|
 | AC-1 | symlink 配備の disable 後、`plugins/<name>` が存在せず `.versions/<name>/<hash>` は残り、承認行は 1 行も UPDATE されていない (`--revoke` なしのとき追記も無い) | FS と `approval_requests` の before/after |
 | AC-2 | disable が `plugin_deploy_ops` に `intent` → `done`、`notify_attempted=1`。activity `plugin_disabled` は **1 行以上** (重複許容、`notify_attempted=1` を伴う)。revoke 単独も同じ (`op_kind=revoke` の `done` 行、`notify_attempted=1`) | DB / log / status 出力 |
-| AC-3 | **activity の書込失敗を注入**しても op は `done`、`notify_attempted=1`、`afx ctl status` / `afx status` が `plugin_deploy_ops` から状態を返す。通知窓は §7.0 の N1〜N5 を disable / rollback / retire / revoke / needs_retry / foreign の全通知対象 phase で踏む | 書込失敗の注入、状態出力 |
+| AC-3 | **activity の書込失敗を注入**しても op は `done`、`notify_attempted=1`、`afx ctl status` の `plugin_deploy_ops` 節と `afx ops status <feature>` が `plugin_deploy_ops` から状態を返す。通知窓は §7.0 の N1〜N5 を disable / rollback / retire / revoke / needs_retry / foreign の全通知対象 phase で踏む | 書込失敗の注入、状態出力 |
 | AC-4 | disable を 2 度打っても 2 度目は rc=0 で何も変わらない。`--revoke` 付きの 2 度目は rc=2 で `revoke --version` を案内 | rc と行数 |
 | AC-5 | **直接 plugin**: 依存 strategy のない signal plugin の disable 後、pending は abandoned、`get_signals` に出ず、producer は INSERT しない | DB / tool 出力 |
 | AC-6 | **依存 strategy**: indicator A の disable は `--force` 無しで拒否され、strategy 名・alias・理由が出る。FS・DB 不変。`--force` 付きなら A の disable と S の pending の cascade abandoned が同一 tx で commit され、S の producer は INSERT を止める (S の symlink は残る) | rc, stderr, DB, producer |
@@ -587,21 +609,21 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 | AC-13 | cascade: subject と、`--force` で解決不能になる依存 strategy の pending だけが abandoned。claimed の status と他 plugin の signal は不変。`plugin_deploy_op_signals` に pending と claimed の id が `status_at_link` つきで残り、`signal_id` index が存在する | before/after |
 | AC-14 | **決定的な固定 fixture** で、切替ジャーナルが非終端の name (対象 + 全 dependent 名) に deploy ops は拒否、deploy ops が open の name に approve / bless / retire / retry_approval は拒否。**交差 name ケース**: indicator A の disable intent が open のとき、A に依存する strategy S の approve / bless / retry も拒否。逆に S の open switch journal がある間の A の disable も拒否。open の disable intent に対する同署名の `retire` は拒否ではなく引き継ぎ (別 op_kind・署名不一致は拒否) | 双方向 + 交差 + 署名 |
 | AC-15 | 配備操作の crash 注入 (D / R / P / N): §7.0 N1〜N5、§7.1 D1〜D12、§7.2 R1〜R19、§7.3 P1〜P12、§7.4 の各点で、reconcile 後と CLI 再実行後に表どおりの最終状態へ収束する (revoke 有無で DB 効果の全体が all-or-nothing)。**永続 syscall 失敗** (D9 / R16 / R18 / P10、`unlink` / `rename` / `symlink` の失敗注入) は `needs_retry/syscall_failed` (blocking/open) に収束し、producer が INSERT せず OPEN がゲートで拒否する。修復後の同署名の CLI 再実行 (署名不一致は拒否) で続きから完遂する。**R9 / R19** (`from_kind=symlink` + live 不在 + `intent`) は再検証の成否で `done` / `needs_retry/verify_failed` に収束し、`foreign` にならない。IV-15 の収束先と一致する | 全点を実 FS + 実 SQLite で |
-| AC-16 | producer / commit-core の crash 注入 (S / G): §7.5 S1〜S7、§7.6 G1〜G7 の各点で表どおりの結果になる。G4a (consume 前の crash、`recover_interrupted` による mission 回収。上限未満なら pending、到達済みなら abandoned) と G4b (consume 後の crash、consumed 維持で pending に戻らず既存の intent / order 回復のみ) と G5 (対応 mission が無い claimed の lease 回収) は別 case で観測し、G4a / G5 の linked signal は再 claim されず mission を起動しない。G6 は stale な snapshot が consume されず、claimed が requeue されることを観測する。**G6a は stale な claim 元 signal が consume されず abandoned になることを観測し、snapshot と signal が同時 stale の case では signal stale を優先して abandoned になることを観測する。**G4a と G4b は両境界を別 case で観測する | 実 SQLite + barrier |
+| AC-16 | producer / commit-core の crash 注入 (S / G): §7.5 S1〜S7、§7.6 G1〜G7 の各点で表どおりの結果になる。G4a (`recover_interrupted`) と G5 (対応 mission が無い claimed の lease 回収) では linked signal が `abandoned` で終端し、`requeue_count` を増やさず、再 claim も mission 起動もしない。G4b (consume 後の crash) は consumed を維持し、pending に戻らず既存の intent / order 回復だけに委ねる。G6 は stale な snapshot が consume されず、claimed が requeue されることを観測する。**G6a は stale な claim 元 signal が consume されず abandoned になることを観測し、snapshot と signal が同時 stale の case では signal stale を優先して abandoned になることを観測する。**G4a と G4b は両境界を別 case で観測する | 実 SQLite + barrier |
 | AC-17 | plain retire: 従来どおり `_retired/` へ退避し、依存確認 (config.yaml の名前判定、hash 照合なし)・記録・plugin 名の pending 放棄が付く。退避先は op_id を含み衝突しない。EXDEV は意図の記録前に拒否。crash 点は AC-15 の P 系 | FS / DB |
 | AC-18 | symlink の retire は disable_symlink と同じ結果 (`op_kind=disable_symlink`) | DB |
 | AC-19 | producer interleaving (barrier 付き multi-process test): 評価完了の直後・lock 取得の直前に disable を完走させると、INSERT されない。disable の意図の記録の直前に INSERT を完了させると、cascade が拾う。どちらの順でも disable 後に pending が残らない | multi-process test (既存 `tests/plugin/_flock_worker.py` 型) |
 | AC-20 | 依存 indicator の interleaving: S の評価中に A を `--force` で disable すると、S の INSERT は再検証で落ちる。legacy plain の indicator に依存する正当な strategy は、indicator が live の間は INSERT が通る (hash 非照合) | multi-process test |
 | AC-21 | signal maintenance は `core_lock` を保持しない (遅延 callable)。producer の lock 区間は評価を含まない。**barrier と注入した monotonic clock** で、(a) 評価中に別 process が name lock を取れる、(b) lock 取得 deadline 超過時は INSERT 見送り・cursor 不進行・次 tick で再評価、(c) activity が状態変化ごとに 1 回、を直接検査する (実時間待ちに依存しない)。signal maintenance の実行中に別 thread が `core_lock` を取れる。**専用接続**: 遅延 callable が使う接続は `App.conn_signal` で、`conn_core` と別の Connection である (同一性の比較)。maintenance の実行中に Mission thread が `core_lock` を取って `conn_core` で transaction を実行しても接続共有がなく、互いの transaction を commit / rollback しない。**busy policy は 2 case に分ける**: (1) `busy_timeout` 内の競合は両接続が独立に commit する、(2) `conn_core` が `BEGIN IMMEDIATE` を timeout 超過まで保持した場合、signal 側は固定分類で失敗し、rollback 済み (`in_transaction == False`)・cursor 不進行・部分書込みなし・次 tick で回復する。rollback 不能な接続の破棄・再生成を注入で観測する。**再生成失敗**: 1〜2 回目は maintenance の skip・`signal_conn_unavailable` の latch 記録 (status の `health` に出る)・cursor 不進行・部分書込みなしで、その間も SL/TP と drawdown kill switch は継続し、OPEN は既存ゲート (`signal_source_active` と鮮度) のまま、次 tick で再生成を再試行する。成功で連続回数が 0 に戻り latch の記録は残る。**tick 契約**: 接続修復 wrapper は state が ready / degraded / halted のいずれでも毎 tick 積まれて再生成と連続失敗 counter が進み、実 maintenance だけが ready のときに限り走る (degraded の tick で再生成が試され、実 maintenance は呼ばれないことを注入 state で観測する)。**接続の交換**: 交換後の呼出しは新しい `App.conn_signal` を使い、旧接続を再利用しない (旧接続の使用を検出する guard で pin)。**claimed signal の鮮度**: 障害前に claim 済み → 再生成失敗中に claim 元 signal の `bar_ts` 鮮度が切れる → OPEN 拒否 + signal は abandoned (requeue されない、注入 clock で試験)。3 回目の失敗で `_record_fatal` + `stop_event.set` が呼ばれ、復旧は再起動である。**guarded-connection test**: `conn_core` を「`core_lock` を保持した thread だけが使える」guard (tracked RLock の owner で判定) で包み、`conn_signal` も別の guard で包む。`conn_core` を callable に渡す変異は guard 違反で必ず失敗する。`App.close()` が `conn_signal` を `conn_core` より前に閉じ、scheduler 残存時は busy として閉じない | barrier + 注入 clock + guarded connection |
 | AC-22 | commit-core: (a) claim 済み signal の元 plugin が disable / revoke / rollback で無効になった後の OPEN intent は `signal_source_inactive` で拒否され、claimed は abandoned。(b) **barrier 付き interleaving test**: ゲート通過直後に CLI の disable を競合させると、disable は `open_from_snapshot` の戻りまで待つ。disable が先に完了していれば OPEN は拒否される。(c) lock deadline 超過は `signal_source_lock_timeout` で建てず consume もしない。**signal 鮮度 (consume 前の 2 述語の 2 つ目)**: claim 元 signal の `bar_ts` 鮮度が切れていれば共有述語 (`claim_oldest` / `pending_exists` と同一、注入 clock) が consume の前に検出し、OPEN を拒否して signal を abandoned (鮮度切れ) にする。requeue しない。**snapshot と signal が同時 stale の case は、同じ 1 回の注入 `now` で両方を評価し、signal stale を優先して abandoned にする。** signal が fresh のときだけ snapshot stale の requeue を適用する。境界は共有述語どおりで、`datetime.now()` を使う変異は失敗する。**name lock / `core_lock` の待ちで snapshot が stale になったとき**、共通 helper が consume の前に検出し、consume せず gate 拒否 (executor と同じ理由・category)、claimed は `requeue` で pending に戻る (`requeue_count >= max_requeue` なら abandoned、未満なら pending)。helper は `open_from_snapshot` 内の判定と同じ純関数 `(snapshot, now, max_age_sec)` であることを関数の同一性と同じ境界値 (`age_sec == max_age_sec` は通り `>` で拒否) の test で pin し、**注入 clock (`self.clock.now()`) で試験する** (`datetime.now()` を使う変異は失敗する)。**第二判定 case**: 第一判定を通ったあと consume 後に executor 側の判定が拒否すると signal は consumed のまま (requeue されない)。**requeue 境界**: `max_requeue=0` (初回の拒否で abandoned、総 LLM 投入 1 回) と `max_requeue=2` (投入 3 回目の後に abandoned) で、現在の `requeue_count >= max_requeue` の規則どおりに pending / abandoned になる。(d) **CLOSE / CANCEL / HOLD は lock も拒否も受けず**、scheduler の SL/TP・drawdown kill switch 経路が name lock を取らないことを既存回帰 test で pin する。(e) **lock 順序は「一定時間で終了」でなく event 順序で観測する (barrier + tracked RLock)**: 共有の `core_lock` に owner を記録する tracked RLock を使い、実 `Scheduler` と OPEN で次の順を barrier で記録して assert する。1. OPEN が name lock を取得して `core_lock` 待ちに入る / 2. scheduler が `core_lock` を取得して SL/TP 処理地点を通過 / 3. scheduler が `core_lock` を解放 / 4. OPEN が `core_lock` を取得 / 5. 遅延 hook が `core_lock` を持たない状態で name 待ちに入る。SL/TP の完了と `_scheduler_tick_once` 全体の完了 (遅延 hook の同期実行を含む) は別の event として区別する。OPEN の保持範囲が commit-pre 完了後から `open_from_snapshot` の戻りまでであることも確認する | trade loop test、multi-process barrier、実 `Scheduler` + `_scheduler_tick_once`、tracked RLock |
-| AC-23 | `get_signals` / `claim_oldest` / `pending_exists`: `plugin_deploy_op_signals` の行 (pending / claimed どちら由来も) は LLM に出ず claim もされない。**linked な pending だけが残るとき、および stale な pending だけが残るときも `pending_exists` は偽**で、signal mission を起動しない (遅延化で `expire_stale` より先に `signal_due_fn` が走る順序を再現して観測する)。除外 anti-join は 1 つの SQL 断片を共有し、`claim_oldest` / `pending_exists` は status・鮮度もその断片で共有する (条件の複製が無いこと)。`recent(exclude_deploy_linked=True)` は anti-join だけを足し、鮮度切れの abandoned・consumed の見え方は変わらない。付随表に無い gate 拒否 signal は通常の abandoned として見える。lease 切れで pending に戻った linked signal は再 claim されず mission も起動しない。起動時回収は case a (`recover_interrupted` による pending 復帰) と case b (対応 mission が無い claimed の `reclaim_expired`) を別に観測する | tool 出力の before/after、scheduler の起動判定 |
-| AC-24 | 他 process が name flock を保持している間、CLI は待つ (非ブロックで失敗しない)。lock を放すと完了する。依存名の lock も名前昇順 | multi-process test |
+| AC-23 | `get_signals` / `claim_oldest` / `pending_exists`: `plugin_deploy_op_signals` の行 (pending / claimed どちら由来も) は LLM に出ず claim もされない。**linked な pending だけが残るとき、および stale な pending だけが残るときも `pending_exists` は偽**で、signal mission を起動しない (遅延化で `expire_stale` より先に `signal_due_fn` が走る順序を再現して観測する)。除外 anti-join は 1 つの SQL 断片を共有し、`claim_oldest` / `pending_exists` は status・鮮度もその断片で共有する (条件の複製が無いこと)。`recent(exclude_deploy_linked=True)` は anti-join だけを足し、鮮度切れの abandoned・consumed の見え方は変わらない。付随表に無い gate 拒否 signal は通常の abandoned として見える。linked claimed は `recover_interrupted` と `reclaim_expired` のどちらでも `abandoned` で終端し、pending に戻らず mission を起動しない | tool 出力の before/after、scheduler の起動判定 |
+| AC-24 | 他 process が name flock を保持している間、CLI は 30 秒待つ (TTY では待機を通知し、timeout は `lock_timeout` / rc 1)。lock を放すと完了する。依存名の lock も名前昇順。予告と本実行は別々に lock を取る | multi-process test |
 | AC-25 | read model: 時計が逆行しても `updated_at` (deploy ops) と読み取りの実効時刻は単調。journal と deploy ops を跨ぐ並びが期待どおり。journal 側の逆行は触らずに吸収され、吸収しきれない場合は live 不一致で `--to` 必須に倒れる | 固定時刻 fixture |
 | AC-26 | 遮断: improve tool 13 本の完全集合、`_ALLOWED_REL` の 3 本、API の `ROUTES` (24 endpoint) / action 完全集合、bot の custom-id action 集合 (6) と決定 action 集合 (3)、**`BotClient` のクラス本体に直接定義された公開メソッド集合 `{events, approvals, approval, approve, reject, retry, poll, cancel}` (継承属性は対象外)**、API path 集合、`TABLE_NAMES` (現物 30 表 + 本設計の 2 表 = 32)、`Action` 4 値がそれぞれ固定集合と一致し、deploy ops を含まない | 完全一致 test |
-| AC-27 | 実隔離 worker (実 canary 経路、fingerprint 非依存の形) から CLI 起動・DB 書込・`plugins/` への書換えが拒否される。release CI の対応 kernel job では skip 禁止 | integration |
+| AC-27 | 実隔離 worker (実 canary 経路、fingerprint 非依存の形) から CLI 起動・DB 書込・`plugins/` への書換えが拒否される。CI の `isolation` job は先頭で Landlock ABI を測り、ABI 8 以上なら実隔離 integration を実行し skip があれば fail、ABI 8 未満なら「kernel 不足」を明示して neutral とする。release の受入は ABI 8 の実機で手順書どおり手で実行する | integration |
 | AC-28 | `approval <id>` 詳細表示が revoke 行 (`candidate_*` なし) で例外にならない | 表示 test |
 | AC-29 | 運用文書 §7 が §10 の手順に置き換わり、文中に「未整備」が残らない | grep |
-| AC-30 | `versions` が live・各版の承認 / revoke・整合・経歴・open / needs_retry / foreign の op を出す。lock を取らない | 出力 test |
+| AC-30 | `versions` が live・各版の承認 / revoke・整合・経歴・open / needs_retry / foreign の op を出す。name lock を取らず、DB の行・schema・app が持つファイルを作らず変更しない（SQLite reader の `-wal` / `-shm` は除外） | 出力 test |
 | AC-31 | CLI 再実行の取り込み: 署名一致 (対象 identity・`to_target`・`revoke`・`force`) のときだけ open op を引き継ぎ、不一致は拒否して open op の `op_id` と署名を表示する。拒否時に FS・DB は不変 | 一致 / 各列の不一致 case |
 | AC-32 | rollback の reconcile: 意図の記録後に戻り先 strategy の依存 indicator の live を変えると、`force=1` でも `needs_retry` になる (5(a))。新たに解決不能になった dependent があれば、FS の前に cascade と付随表が補完される | 注入 fixture |
 | AC-33 | open 判定: `needs_retry/syscall_failed` の間は producer が INSERT せず OPEN のゲートが拒否し、approve / bless / retry と他の deploy op がその name を扱わない。`needs_retry/verify_failed` は blocking/open ではない。述語の定義は store 層の 1 組で、部分 UNIQUE・producer・OPEN・approve / bless / retry・deploy-op 開始・reconcile・status 表示の各消費者について `syscall_failed` の行で同じ判定を観測する。部分 UNIQUE が `intent` と `syscall_failed` を同時に 2 本持てないこと | 直 INSERT と操作の両方 |
@@ -609,12 +631,14 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 | AC-35 | cross-column CHECK: §2.1 の表の各行に対し、op_kind と食い違う列の組 (disable に `to_target` あり、rollback に `to_target` なし、retire に `retired_path` なし、revoke に `revoke_row_id` なし / `phase != done`、`fail_reason` と `phase` の不一致、`from_kind='absent'` の rollback に `revoke=1`、`fail_reason='verify_failed'` で `op_kind != 'rollback_symlink'`、`revoke=1` で `approval_id IS NULL`、`phase='intent'` で `notify_attempted=1` 等) の INSERT / UPDATE が全て拒否される。`syscall_failed` から `intent` に戻す UPDATE は `notify_attempted=0` を伴わないと拒否される | 直 INSERT の CHECK 違反 case 列挙 |
 | AC-36 | runbook (§10 3b / 3c) に open op の再実行と foreign の 3 種類 (symlink・不在 / plain / 不明・改変) の手順があり、文中に「専用コマンドは無い」と、plain の場合は `retire` を経ることが書かれている | grep |
 
+AC-23 の観測には §5.5 の `signal_max_id` も含める。submit 時点の上限、`0` と `None`、requeue 済み既存 id の後続 mission での再 claim、採取後の producer INSERT が次 mission まで待つことを固定する。
+
 ## 12. 変更ファイル一覧
 
 | ファイル | 変更 |
 |---|---|
 | `docs/superpowers/specs/2026-10-16-plugin-deploy-ops-design.md` (新規) | 本稿の清書。正本 |
-| `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` | v1.9: 新 spec への normative reference、R6 の「retire は別束」の付け替え、live 書換え全経路表 (rollback (`_atomic_symlink_swap`) と disable (`unlink`) の 2 行を追加し、既存 retire 行を新しい `retire_plain` の `rename` 契約へ置換)、IV-13 / IV-14 は新 spec の IV-18・IV-20 と併せて参照し複製しない、変更履歴 1 行。詳細状態機械は載せない |
+| `docs/superpowers/specs/2026-09-19-switch-ops-hardening-design.md` | v1.10: 本設計 v1.1 への参照更新。詳細状態機械は複製しない |
 | `store/db.py` | `plugin_deploy_ops` / `plugin_deploy_op_signals` の DDL (`_SCHEMA`)、`plugin_deploy_op_signals_signal_id` index、`TABLE_NAMES` に追加 |
 | `store/plugin_deploy_ops.py` (新規) | 行 CRUD、blocking/open の共通述語 (`OPEN_PHASE_SQL` / `is_open`)、read model (`plugin_live_history`)、`live_identity` |
 | `store/signals.py` | `abandon_pending_for_identities`、deploy-linked 除外 anti-join 断片、`claim_oldest` / `pending_exists` と claimed signal への再適用で共有する signal 鮮度述語、`claim_oldest` / `pending_exists` の「claim 可能」断片 (status・鮮度・anti-join、`pending_exists` に `now` / `freshness_bars` を追加)、`recent(exclude_deploy_linked=)` (anti-join のみ) |
@@ -627,6 +651,7 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 | `core/executor.py` | `open_from_snapshot` 内の snapshot 鮮度判定を共通 helper に抜き出す (判定・理由文字列・category は不変) |
 | `tools/signal_tools.py` | `get_signals` の除外 (§5.3) |
 | `backtest/cli.py` | `disable` / `rollback` / `revoke` / `versions` の parser と dispatch、`retire` の更新 |
+| `config.py` / `setup/settings_migrate.py` / `config/settings.yaml.example` | settings schema v3 と、`worker.plugin_lock_timeout_sec=2`、`worker.reconcile_lock_timeout_sec=30` の v2→v3 移行 |
 | `docs/operations/ops-api-2026-10-09.md` | §7 の置き換え (§10) |
 | `docs/superpowers/specs/2026-10-04-ops-api-design.md` | §1.4 の「範囲外」注記に本設計への参照を 1 行 |
 
@@ -645,8 +670,8 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 | T6 scheduler 遅延化 + 専用接続 + producer lock + OPEN lock + ゲート | **`core/scheduler.py` と `service.py` で signal maintenance を遅延 callable に**、**`App.conn_signal` の生成・shutdown 順・busy 判定・毎 tick の接続修復 wrapper による再生成と失敗時の `signal_conn_unavailable` 記録 / tick skip / 連続 3 回での fatal 経路**、producer の lock 内再検証 + INSERT (lock timeout の専用結果、cursor 不進行)、`get_signals` / `claim_oldest` / `pending_exists` の共有除外、trade loop の source lock (commit-pre 完了後) + `signal_source_active`、consume 前の 2 述語を同じ 1 回の注入 `now` で評価する順序 (共有 signal 鮮度述語を claimed に再適用し stale は abandoned、signal fresh 時だけ executor と共有する snapshot helper で stale を requeue)、lock を `open_from_snapshot` の戻りまで保持、CLOSE / CANCEL / HOLD と SL/TP / kill switch 経路の非依存、lock 順序の計装 (AC-34) | AC-19〜23, 34。barrier 付き multi-process test、**実 `Scheduler` と OPEN の event 順序 test (AC-22 (e))**、注入 monotonic clock、**guarded-connection test と再生成失敗 1〜2 / 3 回の注入 (AC-21)**。signal の引数追加と `recent` / `claim_oldest` / `pending_exists` の差し替え箇所、`on_signal_maintenance` の呼び出し元を全数 grep。変異: `conn_core` を callable に渡す / shared signal freshness を claimed へ再適用しない / helper を consume の後ろに移す / `pending_exists` から鮮度を外す / OPEN の name lock を `core_lock` の後に取る、がそれぞれ落ちる | L |
 | T5 retire 統合 | symlink = disable_symlink への委譲、plain の `retire_plain` 状態機械、`_plugin_locks` 化、依存確認、`st_dev` 検査 | AC-17, 18 の正常系・拒否系 (退避先衝突 / EXDEV / symlink に変わった live)。crash 点は T4b の P 系を呼ぶだけ | M |
 | T4b crash matrix 全点統合 | §7.0 の N1〜N5、§7.1〜7.6 の D / R / P / S / G 全点を、T3 / T4a / T5 / T6 の実装の上で実 FS + 実 SQLite の fault injection (関数境界の例外 + `rename` / `unlink` / `symlink` の失敗注入) で網羅する | AC-3, 15, 16, 33 の収束側。変異: unlink を reconcile から外すと D3 が落ちる / `abandoned` に閉じる旧挙動に戻すと IV-15 が落ちる / 5(a) を `force` で免除すると AC-32 が落ちる / `syscall_failed` を blocking/open から外すと AC-33 が落ちる / `from_kind=symlink` + live 不在の行を `foreign` に落とすと R9 / R19 が落ちる / G6 snapshot または **G6a signal / 同時 stale** の consume 前検査を外すと対応 case が落ちる。規模が大きいので D / N / P と R / S / G の 2 束に分けて実行してよい | XL |
-| T7 CLI + versions | 5 コマンドの parser・確認 (TTY / `--yes` / `--force` / `--dry-run`)、rc と stderr の文言 pin、`versions`、仮列挙 → 再列挙のリトライ、`afx ctl status` / `afx status` への op 状態表示 (blocking/open と closed を分ける) | AC-24, 25, 30。CLI の rc / 文言を pin。rollback 完了表示 | M |
-| T8 文書 + 遮断 | 独立 spec の清書、既存 spec v1.9、運用文書 §7 置換 (§10 の 3b / 3c を含む)、遮断の完全集合 test (improve 13 本 / `_ALLOWED_REL` / API 24 endpoint / bot の 2 集合 / `BotClient` 直接定義 8 メソッド / `TABLE_NAMES` 32)、実隔離 worker integration (release CI の対応 kernel job で skip 禁止) | AC-26〜29, 36。spec と実装の番号 (IV / AC) の突き合わせ。integration は実 kernel を触る。Landlock ABI の skip 規約に従う | L |
+| T7 CLI + versions | 5 コマンドの parser・確認 (TTY / `--yes` / `--force` / `--dry-run`)、rc と stderr の文言 pin、`versions`、仮列挙 → 再列挙のリトライ、`afx ctl status` / `afx ops status <feature>` への op 状態表示 (`open` と `attention`、読めないときは `unavailable`) | AC-24, 25, 30。CLI の rc / 文言を pin。rollback 完了表示 | M |
+| T8 文書 + 遮断 | 独立 spec の清書、既存 spec v1.10、運用文書 §7 置換 (§10 の 3b / 3c を含む)、遮断の完全集合 test (improve 13 本 / `_ALLOWED_REL` / API 24 endpoint / bot の 2 集合 / `BotClient` 直接定義 8 メソッド / `TABLE_NAMES` 32)、実隔離 worker integration (CI の `isolation` job が kernel の Landlock ABI を測り、ABI 8 以上なら skip があれば fail、ABI 8 未満なら「kernel 不足」を明示して neutral。release の受入は ABI 8 の実機で手順書どおり手で実行する。AC-27) | AC-26〜29, 36。spec と実装の番号 (IV / AC) の突き合わせ。integration は実 kernel を触る。Landlock ABI の skip 規約に従う | L |
 
 
 
@@ -663,6 +688,9 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 | 接続 | signal maintenance は `conn_signal` だけを使い、`conn_core` を渡さない。 |
 | 述語 | `blocking/open` と `closed` は §2.1 の一組の定義だけを全消費者が使う。 |
 | stale snapshot | lock 待ちで stale になった claimed signal は consume せず requeue する。ただし同時に signal stale なら signal stale を優先して abandoned にする。 |
+| 後続（低） | foreign で終端した rollback temp symlink を sweep ④の対象にするかは、別途判断する。指揮者が後続の作業項目を起票する。 |
+| 後続（低） | 依存変化後の起動時エラー表示を追加する。 |
+| 後続 | lock API を変更する機会に、process-global callback を `on_wait` 引数へ置き換える。 |
 
 `live-signal-eval-blocks-protection-tick` は、signal 計算が `core_lock` を保持する部分のみ部分解消する。signal maintenance の別 worker 化、at-most-one / coalescing、失敗 plugin の backoff、tick 時間上限、shutdown を `signal-maintenance-offload-worker` に分離する。
 
@@ -670,4 +698,5 @@ AC は表の 1 行を 1 本と数え、枝番を持たない通し番号 AC-1〜
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-18 | v1.1 | 実装済みの deploy 操作、状態遷移、status、隔離受入、運用手順 (手順の順序を含む) を正本化 | T1〜T7 の実装と crash matrix の実測で確定した事項の追記 | |
 | 2026-10-16 | v1.0 | disable / rollback / retire / revoke の正本仕様を確定 | チケット `deployed-plugin-has-no-disable-or-rollback` | |

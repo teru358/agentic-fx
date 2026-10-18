@@ -135,7 +135,21 @@ uv run afx init
    journalctl --user -u afx | grep 'improve isolation'   # 改善 backend の隔離適合 (admission) の行
    ```
 
-4. 詰まったら、「7. 詰まったときに貼る情報」を集めてから、`scripts/first-run-reset.sh` で最初に戻せます。
+4. release の受入では、Landlock ABI 8 以上の実機 (Linux 6.18 以降) で実隔離の integration を 2 段で通します。
+
+   ABI だけが前提の集合は、skip が 1 件でもあれば不合格です。
+
+   ```
+   uv run pytest tests/integration/test_improve_worker_deploy_boundary.py tests/integration/test_improve_worker_permission_boundary.py tests/integration/test_improve_forbidden_regression.py --deselect tests/integration/test_improve_worker_permission_boundary.py::test_invariant4_real_claude_home_is_unreachable -p no:cacheprovider -rs --fail-on-skip
+   ```
+
+   環境依存の集合 (`~/.claude` の有無、systemd user manager / XDG_RUNTIME_DIR / cgroup 委任) は skip しても不合格にしません。`-rs` に出る skip の理由を読み、本機で回せない理由があれば受入記録に書きます。
+
+   ```
+   uv run pytest "tests/integration/test_improve_worker_permission_boundary.py::test_invariant4_real_claude_home_is_unreachable" tests/integration/test_improve_inventory_view_real_worker.py tests/core/test_improve_canary.py -p no:cacheprovider -rs
+   ```
+
+5. 詰まったら、「7. 詰まったときに貼る情報」を集めてから、`scripts/first-run-reset.sh` で最初に戻せます。
 
    ```
    scripts/first-run-reset.sh --dry-run    # 何が消えるかを見るだけ

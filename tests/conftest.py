@@ -429,3 +429,35 @@ def _message(base_url: str) -> str:
             f"している (llama_swap.base_url={base_url!r})。到達不能アドレス "
             "(例 http://127.0.0.1:1/v1) に差し替えるか、build_app に runner= "
             "で fake を注入すること。")
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--fail-on-skip", action="store_true", default=False,
+        help="skip された test が 1 件でもあれば session を失敗で終える "
+             "(実 kernel 隔離の job で、条件未達の skip を緑と数えないため)")
+
+
+def pytest_runtest_logreport(report):
+    # report には config が無いので、session 終了時に数える対象は module 変数に集める。
+    if report.skipped and not hasattr(report, "wasxfail"):
+        _SKIPPED_REPORTS.append(report.nodeid)
+
+
+def pytest_collectreport(report):
+    # module-level `pytest.skip(allow_module_level=True)` は収集段階で出る。
+    if report.skipped and not hasattr(report, "wasxfail"):
+        _SKIPPED_REPORTS.append(report.nodeid)
+
+
+_SKIPPED_REPORTS: list[str] = []
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not session.config.getoption("--fail-on-skip") or not _SKIPPED_REPORTS:
+        return
+    print(f"\n--fail-on-skip: {len(set(_SKIPPED_REPORTS))} test(s) were skipped:")
+    for nodeid in sorted(set(_SKIPPED_REPORTS)):
+        print(f"  {nodeid}")
+    if exitstatus == 0:
+        session.exitstatus = 1

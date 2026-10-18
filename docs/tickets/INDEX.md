@@ -1,14 +1,13 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 147 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
-| [deployed-plugin-has-no-disable-or-rollback](open/deployed-plugin-has-no-disable-or-rollback.md) | 高 | 2026-10-04 | 配備済み plugin を止める・前の版に戻す操作が無い |
 
 ## 実装待ち (12)
 
@@ -40,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (125)
+## 設計待ち (128)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -51,7 +50,6 @@
 | [candidates-converge-to-example-sma](open/candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [improve-targeted-run](open/improve-targeted-run.md) | 中 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
-| [retire-symlink-deployed-plugin](open/retire-symlink-deployed-plugin.md) | 中 | 2026-09-19 | afx plugin retire が symlink 配備の指標を退役できない |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
 | [db-healthcheck-continuous-session-freshness](open/db-healthcheck-continuous-session-freshness.md) | 中 | 2026-09-28 | `service.py:1243` `db_healthcheck` の鮮度式 `bar start + 2×幅 + … |
 | [live-storage-source-mapping-scattered](open/live-storage-source-mapping-scattered.md) | 中 | 2026-09-28 | primary → ライブ保存名 (`mt5` → `mt5-live`) の写像が 8 箇所に散在 (service… |
@@ -80,6 +78,7 @@
 | [approval-notice-lacks-change-content](open/approval-notice-lacks-change-content.md) | 中 | 2026-10-17 | 改善承認の通知に変更内容が無い (何がどう変わるか読めない) |
 | [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
 | [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
+| [deploy-cli-config-error-traceback](open/deploy-cli-config-error-traceback.md) | 中 | 2026-10-18 | afx の subcommand は設定不在・不正 YAML で traceback を出す |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
@@ -140,6 +139,9 @@
 | [signal-maintenance-offload-worker](open/signal-maintenance-offload-worker.md) | 低 | 2026-10-16 | signal maintenance を tick から別 worker へ切り出す |
 | [wizard-script-conventions-and-selection-ui](open/wizard-script-conventions-and-selection-ui.md) | 低 | 2026-10-16 | ウィザード台本の表記規約と選択 UI (矢印選択・色) の整備 |
 | [tests-leak-tmp-dirs-outside-basetemp](open/tests-leak-tmp-dirs-outside-basetemp.md) | 低 | 2026-10-17 | 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外) |
+| [disable-dependent-change-error-notice](open/disable-dependent-change-error-notice.md) | 低 | 2026-10-18 | disable 後に依存 strategy が解決不能になる旨の表示が無い |
+| [plugin-lock-wait-notice-on-wait-argument](open/plugin-lock-wait-notice-on-wait-argument.md) | 低 | 2026-10-18 | plugin lock の待機通知を on_wait 引数に置き換える |
+| [rollback-foreign-temp-link-sweep](open/rollback-foreign-temp-link-sweep.md) | 低 | 2026-10-18 | foreign で終端した rollback の temp symlink を sweep の対象にする |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |

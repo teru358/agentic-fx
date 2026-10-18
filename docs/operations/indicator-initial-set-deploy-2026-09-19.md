@@ -229,6 +229,8 @@ phase でも確認 (no-op)** になる。`foreign` (live が第三者に触ら�
 
 ## 任意の後片付け
 
+配備済み plugin の disable / rollback / retire / revoke と、誤承認後の回収は [承認済み plugin の回収手順 (ops-api 運用文書 §7)](ops-api-2026-10-09.md#7-承認済み-plugin-の回収) に従う。
+
 新 `rsi` を配備したあと、**依存する strategy が無いことを確認したうえで**、
 既に配備済みの `rsi_indicator` / `rsi_wilder` を退役させてよい。これは
 **人間の判断であり、本手順 (=配備) の完了条件ではない**。
