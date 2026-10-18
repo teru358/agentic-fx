@@ -64,8 +64,12 @@ pytestmark = pytest.mark.skipif(
 
 # precheck 2026-08-23 wave3: RW7 — Step 12-5 のための定数と helper 関数
 _RW7_NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
-_RW7_SETTINGS = load_settings(
+_RW7_EXAMPLE_SETTINGS = load_settings(
     Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+# 履歴源は example の既定 (未設定) に依存させず、テストが種を撒く source を明示する
+_RW7_SETTINGS = _RW7_EXAMPLE_SETTINGS.model_copy(update={
+    "backtest": _RW7_EXAMPLE_SETTINGS.backtest.model_copy(
+        update={"eval_source": "dukascopy"})})
 # `_ANALYSIS_ROW_KEYS`/`_BACKTEST_ROW_KEYS` (10.10節) が読む形と同じ
 # save_kwargs (`holdout.run_in_sample` の record_fn 契約、7-D)
 _RW7_SAVE_KWARGS = dict(
