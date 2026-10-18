@@ -33,9 +33,9 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-def _retire(world):
+def _retire(world, **kwargs):
     return deploy_retire.retire_plugin(
-        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS)
+        world.conn, world.root, "sma", force=False, now=NOW, settings=SETTINGS, **kwargs)
 
 
 def test_a_crash_before_plain_retire_intent_recording_leaves_no_durable_effect(world, monkeypatch):
@@ -335,3 +335,46 @@ def test_a_dependency_change_after_the_plain_retire_intent_does_not_stop_it(
         assert result.outcome == "done"
     assert deploy_store.get_by_id(world.conn, op["op_id"])["phase"] == "done"
     assert (world.root / op["retired_path"]).is_dir()
+
+
+def _failed_rename(world, monkeypatch, activity):
+    _plain_scene(world, False)
+    live = world.root / "sma"
+    heal = fail_syscall(monkeypatch, "rename", path_pred=lambda path: path == live)
+    failed = _retire(world, activity=activity)
+    assert failed.outcome == "needs_retry"
+    heal()
+    return failed, deploy_store.get_by_id(world.conn, failed.op_id)
+
+
+def test_a_failed_retire_whose_directory_was_moved_outside_is_completed_and_noticed_again(
+        world, monkeypatch):
+    activity = Activity()
+    failed, row = _failed_rename(world, monkeypatch, activity)
+    (world.root / "_retired").mkdir(exist_ok=True)
+    os.rename(world.root / "sma", world.root / row["retired_path"])
+
+    done = _retire(world, activity=activity)
+
+    after = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert done.outcome == "done" and done.op_id == failed.op_id
+    assert (after["phase"], after["fail_reason"], after["notify_attempted"]) == ("done", None, 1)
+    assert [event for _, event, _ in activity.events][0] == "plugin_deploy_op_needs_retry"
+    assert len(activity.events) == 2
+    assert activity.events[-1][1] != "plugin_deploy_op_needs_retry"
+
+
+def test_a_failed_retire_whose_live_was_replaced_outside_is_closed_foreign_and_noticed_again(
+        world, monkeypatch):
+    activity = Activity()
+    failed, _row = _failed_rename(world, monkeypatch, activity)
+    os.rename(world.root / "sma", world.root / "old-sma")
+    (world.root / "sma").symlink_to("old-sma")
+
+    result = _retire(world, activity=activity)
+
+    after = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert result.outcome == "foreign" and result.op_id == failed.op_id
+    assert (after["phase"], after["notify_attempted"]) == ("foreign", 1)
+    assert len(activity.events) == 2
+    assert activity.events[-1][1] != "plugin_deploy_op_needs_retry"

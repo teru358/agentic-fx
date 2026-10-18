@@ -114,9 +114,7 @@ def disable_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, r
             if dry_run:
                 return DisableOutcome("dry_run", name, op_id=op_id,
                                       cascade_strategies=tuple(sorted(report.dependent_names)))
-            deploy_store.set_phase(conn, op_id, "done", now=now)
-            done_row = deploy_store.get_by_id(conn, op_id)
-            deploy_ops.try_notify(conn, done_row, deploy_ops.activity_or_null(activity), now=now)
+            deploy_ops.settle_op(conn, open_row, "done", activity, now=now)
             return DisableOutcome("disabled", name, True, "effective_on_next_signal_insert",
                                   tuple(sorted(report.dependent_names)), op_id=op_id)
         if live is None:

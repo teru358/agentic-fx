@@ -99,13 +99,9 @@ def retire_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, fo
                                      dependents=report.unresolvable)
             if not live_plain:
                 if not os.path.lexists(live_path) and retired.exists():
-                    deploy_store.set_phase(conn, op_id, "done", now=now)
-                    row = deploy_store.get_by_id(conn, op_id)
-                    deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
+                    deploy_ops.settle_op(conn, open_row, "done", activity, now=now)
                     return RetireOutcome("done", name, op_id, retired_path)
-                deploy_store.set_phase(conn, op_id, "foreign", now=now)
-                row = deploy_store.get_by_id(conn, op_id)
-                deploy_ops.try_notify(conn, row, deploy_ops.activity_or_null(activity), now=now)
+                deploy_ops.settle_op(conn, open_row, "foreign", activity, now=now)
                 return RetireOutcome("foreign", name, op_id, retired_path)
             requested = deploy_ops.Signature(
                 "retire_plain", name, recorded_hash, None, None, False, force)

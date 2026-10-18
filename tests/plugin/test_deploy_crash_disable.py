@@ -518,3 +518,22 @@ def test_a_dependent_added_after_an_unforced_intent_does_not_stop_the_disable(
         assert result.outcome == "disabled"
     assert deploy_store.get_by_id(world.conn, op["op_id"])["phase"] == "done"
     assert not os.path.lexists(_live(world))
+
+
+def test_a_failed_disable_whose_live_vanished_outside_is_completed_and_noticed_again(world, monkeypatch):
+    world.three_generations()
+    live = _live(world)
+    heal = fail_syscall(monkeypatch, "unlink", path_pred=lambda path: path == live)
+    activity = Activity()
+    failed = _disable(world, activity=activity)
+    assert failed.outcome == "needs_retry"
+    heal()
+    os.unlink(live)
+
+    done = _disable(world, activity=activity)
+
+    row = deploy_store.get_by_id(world.conn, failed.op_id)
+    assert done.outcome == "disabled" and done.op_id == failed.op_id
+    assert (row["phase"], row["fail_reason"], row["notify_attempted"]) == ("done", None, 1)
+    assert [event for _, event, _ in activity.events] == [
+        "plugin_deploy_op_needs_retry", "plugin_disabled"]

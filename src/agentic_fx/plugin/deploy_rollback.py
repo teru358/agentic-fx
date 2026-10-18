@@ -141,6 +141,20 @@ def resolve_rollback_target(conn: sqlite3.Connection, plugins_root: Path, name: 
         "the latest live change is not an approval of the live version; --to is required")
 
 
+def _recorded_default_target(conn: sqlite3.Connection, plugins_root: Path, name: str
+                             ) -> RollbackTarget | None:
+    """The destination of an open rollback of ``name``, usable when no live version remains."""
+    if os.path.lexists(plugins_root / name):
+        return None
+    open_row = deploy_store.get_open_by_name(conn, name)
+    if open_row is None or open_row["op_kind"] != "rollback_symlink":
+        return None
+    recorded = open_row["to_target"]
+    if not isinstance(recorded, str) or not loader.is_canonical_symlink_target(name, recorded):
+        return None
+    return RollbackTarget(name, recorded, recorded.rsplit("/", 1)[-1])
+
+
 def current_deployed_kind(conn: sqlite3.Connection, plugins_root: Path, name: str) -> str | None:
     """Kind of the deployed version; for an absent live, of the last version taken out."""
     raw = _live_raw_target(plugins_root, name)
@@ -331,6 +345,9 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
 
     def dependents() -> set[str]:
         target = resolve_rollback_target(conn, plugins_root, name, to=to)
+        if (to is None and isinstance(target, RollbackRefusal)
+                and target.code == "target_required"):
+            target = _recorded_default_target(conn, plugins_root, name) or target
         target_dir = (plugins_root / ".versions" / name / target.artifact_hash
                       if isinstance(target, RollbackTarget) else None)
         report = dependents_with_target(conn, plugins_root, name, target_dir, settings=settings)

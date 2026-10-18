@@ -442,6 +442,79 @@ def test_a_source_link_removed_by_hand_after_the_intent_is_not_foreign(
         assert not os.path.lexists(_live(world))
 
 
+# ---- a default-target rerun after the source link is gone ----
+
+def _default_target_scene(world, monkeypatch):
+    scene = RollbackScene(world, revoke=False, cascade=False)
+    crash_after_intent_commit(monkeypatch)
+    crashed(world, lambda: scene.run(to=None))
+    row = deploy_store.get_open_by_name(world.conn, "sma")
+    assert row is not None and row["phase"] == "intent"
+    assert row["to_target"] == _link(scene.b)[1]
+    return scene, int(row["op_id"])
+
+
+def _lose_the_source(world, monkeypatch, scene, how):
+    if how == "removed_by_hand":
+        _live(world).unlink()
+    else:
+        _tamper(scene.b)
+        crash_before_set_phase(monkeypatch, "needs_retry")
+        with pytest.raises(CrashPoint):
+            _reconcile(world)
+        restart(world)
+    assert not os.path.lexists(_live(world))
+
+
+@pytest.mark.parametrize("how", ["removed_by_hand", "reconcile_crash"])
+@pytest.mark.parametrize("repaired", [True, False])
+def test_a_default_target_rerun_after_the_source_link_is_gone_converges_by_verification(
+        world, monkeypatch, how, repaired):
+    scene, op_id = _default_target_scene(world, monkeypatch)
+    _lose_the_source(world, monkeypatch, scene, how)
+    if repaired and how == "reconcile_crash":
+        _repair(scene.b)
+    if not repaired and how == "removed_by_hand":
+        _tamper(scene.b)
+
+    outcome = _rollback(world)
+
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert op_count(world) == 1
+    if repaired:
+        assert outcome.outcome == "rolled_back"
+        assert (row["phase"], row["fail_reason"]) == ("done", None)
+        assert os.readlink(_live(world)) == _link(scene.b)[1]
+    else:
+        assert outcome.outcome == "verify_failed"
+        assert (row["phase"], row["fail_reason"]) == ("needs_retry", "verify_failed")
+        assert not os.path.lexists(_live(world))
+
+
+def test_a_default_target_rerun_with_another_version_after_the_source_link_is_gone_is_rejected(
+        world, monkeypatch):
+    scene, op_id = _default_target_scene(world, monkeypatch)
+    _lose_the_source(world, monkeypatch, scene, "removed_by_hand")
+    before = (world.snapshot("sma"), db_effects(world))
+
+    with pytest.raises(deploy_ops.SignatureMismatchError, match=str(op_id)):
+        _rollback(world, to=scene.a.name)
+
+    assert (world.snapshot("sma"), db_effects(world)) == before
+
+
+def test_a_default_target_rollback_with_no_live_and_no_open_operation_needs_a_target(world):
+    _absent_live_scene(world)
+    ops = op_count(world)
+
+    outcome = _rollback(world)
+
+    assert outcome.outcome == "refused"
+    assert outcome.refusal_code == "target_required"
+    assert op_count(world) == ops
+    assert not os.path.lexists(_live(world))
+
+
 # ---- rollback from an absent live ----
 
 def _absent_live_scene(world):
