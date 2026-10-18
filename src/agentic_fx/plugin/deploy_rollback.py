@@ -307,6 +307,9 @@ def _close_failed_verification(conn: sqlite3.Connection, plugins_root: Path, ope
         except OSError:
             _finish(conn, op_id, "needs_retry", activity, now=now, fail_reason="syscall_failed")
             return RollbackOutcome("needs_retry", name, op_id=op_id, reasons=failure.reasons)
+    elif os.path.lexists(live_path):
+        _finish(conn, op_id, "foreign", activity, now=now)
+        return RollbackOutcome("foreign", name, op_id=op_id)
     _finish(conn, op_id, "needs_retry", activity, now=now, fail_reason="verify_failed")
     return RollbackOutcome("verify_failed", name, reasons=failure.reasons,
                            refusal_code="target_verification_failed", op_id=op_id)
@@ -361,6 +364,11 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
                 "rollback_symlink", name, open_row["subject_content_hash"],
                 open_row["subject_artifact_hash"], to_target, revoke, force)
             if dry_run:
+                if not deploy_ops.signature_matches(open_row, requested):
+                    raise deploy_ops.SignatureMismatchError(
+                        f"open deploy op op_id={open_row['op_id']} has a different "
+                        "signature than the requested rollback — wait for reconcile "
+                        "or restart the daemon")
                 return RollbackOutcome("dry_run", name, to_target=to_target,
                                        op_id=int(open_row["op_id"]))
             op_id = deploy_ops.match_or_reject(open_row, requested, live, conn=conn, now=now)
@@ -380,7 +388,8 @@ def rollback_plugin(conn: sqlite3.Connection, plugins_root: Path, name: str, *, 
             return RollbackOutcome("refused", name, reasons=(target.reason,),
                                    refusal_code=target.code, notified_op_ids=notified)
         lost_source = (open_row is not None and live is None
-                       and open_row["from_kind"] == "symlink")
+                       and open_row["from_kind"] == "symlink"
+                       and not os.path.lexists(live_path))
         if revoke and live is None and not (open_row is not None and open_row["revoke"]):
             raise ValueError(
                 "cannot revoke with no live version; use afx plugin revoke --version")

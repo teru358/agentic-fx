@@ -7,6 +7,7 @@ import pytest
 from agentic_fx.plugin import deploy_ops, deploy_reconcile, deploy_retire
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from tests.plugin._crash import (
+    CrashPoint,
     crash_at,
     crash_after_intent_commit,
     crash_after_rename_plain,
@@ -84,7 +85,7 @@ def test_a_reconcile_crash_before_plain_retire_rename_is_retried_on_the_next_sta
     crashed(world, _retire, world)
     crash_before_rename_plain(monkeypatch)
 
-    with pytest.raises(BaseException):
+    with pytest.raises(CrashPoint):
         deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
     restart(world)
 
@@ -100,7 +101,7 @@ def test_a_reconcile_crash_after_plain_retire_rename_is_completed_on_the_next_st
     crashed(world, _retire, world)
     crash_after_rename_plain(monkeypatch)
 
-    with pytest.raises(BaseException):
+    with pytest.raises(CrashPoint):
         deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
     restart(world)
 

@@ -95,6 +95,11 @@ def _to_identity(row: Mapping[str, object]) -> deploy_store.LiveIdentity | None:
     return None
 
 
+def signature_matches(open_row: Mapping[str, object], requested: Signature) -> bool:
+    """Whether every immutable field of the open op equals the requested signature."""
+    return row_signature(open_row) == requested
+
+
 def match_or_reject(open_row: Mapping[str, object], requested: Signature,
                     live_identity: deploy_store.LiveIdentity | None, *,
                     conn: sqlite3.Connection | None = None,
@@ -106,7 +111,7 @@ def match_or_reject(open_row: Mapping[str, object], requested: Signature,
     either the recorded pre-operation or post-operation identity.
     """
     existing = row_signature(open_row)
-    if existing != requested:
+    if not signature_matches(open_row, requested):
         raise SignatureMismatchError(
             f"open deploy op op_id={open_row['op_id']} has signature "
             f"({_signature_text(existing)}); requested "

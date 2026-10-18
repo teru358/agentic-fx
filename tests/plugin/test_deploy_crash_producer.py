@@ -179,6 +179,7 @@ def test_a_crash_during_the_evaluation_callable_leaves_the_core_lock_free_and_th
         contender = threading.Thread(target=other_thread)
         contender.start()
         contender.join(timeout=10)
+        assert not contender.is_alive()
         assert taken == [True]
         assert not app.core_lock.owned_by_current_thread()
         app.conn_signal.close()

@@ -355,12 +355,15 @@ def test_a_crash_after_the_consume_keeps_the_signal_consumed_at_the_next_start(
     conn.commit()
     conn.close()
     conn = connect(tmp_path / "t.db")
+    links = "SELECT * FROM plugin_deploy_op_signals ORDER BY op_id, signal_id"
+    links_before = [tuple(r) for r in conn.execute(links)]
 
     result = missions.recover_interrupted(conn, now=NOW, max_requeue=2)
 
     assert result["missions_recovered"] == 1
     assert conn.execute(
         "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "interrupted"
+    assert [tuple(r) for r in conn.execute(links)] == links_before == []
     assert _status(conn, sid) == {"status": "consumed", "requeue_count": 0}
     assert signals.pending_exists(conn, now=NOW, freshness_bars=None) is False
 

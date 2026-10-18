@@ -8,6 +8,7 @@ from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_reconcile
 from agentic_fx.plugin.source_state import source_state
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from tests.plugin._crash import (
+    CrashPoint,
     SCENE_IDS,
     SCENES,
     Scene,
@@ -85,7 +86,7 @@ def test_a_reconcile_crash_before_disable_unlink_is_retried_on_the_next_start(wo
     live = world.root / "sma"
     fail_syscall(monkeypatch, "unlink", path_pred=lambda path: path == live, crash=True, times=1)
 
-    with pytest.raises(BaseException):
+    with pytest.raises(CrashPoint):
         deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
     restart(world)
 
@@ -100,7 +101,7 @@ def test_a_reconcile_crash_after_disable_unlink_is_completed_on_the_next_start(w
     crashed(world, _disable, world)
     crash_before_set_phase(monkeypatch, "done")
 
-    with pytest.raises(BaseException):
+    with pytest.raises(CrashPoint):
         deploy_reconcile.reconcile_deploy_ops(world.conn, world.root, now=NOW, settings=SETTINGS)
     restart(world)
 

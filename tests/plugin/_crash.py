@@ -34,10 +34,12 @@ def crash_at(monkeypatch, obj, attr: str, *, when: str = "before", nth: int = 1,
         should_crash = selected and calls == nth and not fired
         if should_crash and when == "before":
             fired = True
+            monkeypatch.setattr(obj, attr, original)
             raise CrashPoint(attr)
         result = original(*args, **kwargs)
         if should_crash and when == "after":
             fired = True
+            monkeypatch.setattr(obj, attr, original)
             raise CrashPoint(attr)
         return result
 

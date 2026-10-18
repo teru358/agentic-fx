@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime
 
 import pytest
 
@@ -262,4 +263,13 @@ def test_a_failed_syscall_adds_no_live_event_to_the_read_model(
     events = [e for e in deploy_store.plugin_live_history(world.conn, "sma")
               if e["source"] == "plugin_deploy_ops"]
 
-    assert len(events) == (0 if blocking else 1)
+    if blocking:
+        assert events == []
+        return
+    assert len(events) == 1
+    assert (events[0]["kind"], events[0]["from"], events[0]["to"]) == (
+        "rollback_symlink" if reason == "verify_failed" else "disable_symlink",
+        world.target("sma", versions[2]), "absent")
+    stamped = datetime.fromisoformat(events[0]["at"])
+    assert at(10) <= stamped < at(11)
+    assert datetime.fromisoformat(events[0]["effective_at"]) >= stamped

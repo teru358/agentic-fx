@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from agentic_fx.plugin import deploy_ops, deploy_reconcile, deploy_rollback, switch
+from agentic_fx.plugin import deploy_ops, deploy_reconcile, deploy_rollback
 from agentic_fx.plugin.source_state import source_state
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from tests.plugin._conc_support import Holder
@@ -69,6 +69,15 @@ def _link(version, name="sma"):
 
 def _temp_links(world):
     return [p.name for p in world.root.iterdir() if ".link-" in p.name]
+
+
+def _op_signal_links(world):
+    return [tuple(r) for r in world.conn.execute(
+        "SELECT * FROM plugin_deploy_op_signals ORDER BY op_id, signal_id")]
+
+
+def _signal_statuses(world):
+    return {sid: status for sid, status in world.conn.execute("SELECT id,status FROM signals")}
 
 
 def _only_op(world, name="sma"):
@@ -261,23 +270,6 @@ def test_a_crash_between_the_temp_link_and_its_rename_leaves_no_residue_once_com
     _converge(world, how, scene)
 
     _assert_rolled_back(world, scene, op_id)
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "sweep_orphans keeps any temp link whose resolved target is a gc root; a rollback temp "
-    "points at an approved version, so it is never removed there (reconcile removes it)"))
-def test_the_startup_sweep_removes_a_temp_link_left_by_a_crash_before_the_rename(
-        world, monkeypatch):
-    scene = RollbackScene(world, revoke=False, cascade=False)
-    _temp_then_crash_before_rename(monkeypatch, world)
-    crashed(world, scene.run)
-    assert _temp_links(world)
-    row = deploy_store.get_open_by_name(world.conn, "sma")
-    deploy_store.set_phase(world.conn, int(row["op_id"]), "foreign", now=NOW)
-
-    switch.sweep_orphans(world.conn, plugins_root=world.root, now=NOW)
-
-    assert not _temp_links(world)
 
 
 @pytest.mark.parametrize("how", ["reconcile", "cli"])
@@ -510,6 +502,64 @@ def test_a_third_party_link_after_the_crash_is_foreign_and_a_rerun_is_rejected(
     assert os.readlink(_live(world)) == _link(scene.a)[1]
 
 
+@pytest.mark.parametrize("replacement", ["file", "dir"])
+def test_a_non_link_put_in_place_of_the_source_is_never_closed_as_a_failed_verification(
+        world, monkeypatch, replacement):
+    scene = RollbackScene(world, revoke=False, cascade=False)
+    op_id = _crash_with_open_intent(world, monkeypatch, scene)
+    _live(world).unlink()
+    if replacement == "file":
+        _live(world).write_text("third party")
+    else:
+        _live(world).mkdir()
+        (_live(world) / "keep.txt").write_text("third party")
+    _tamper(scene.b)
+    before = (world.snapshot("sma"), db_effects(world))
+
+    refusal = (deploy_ops.SignatureMismatchError if replacement == "file" else ValueError)
+    with pytest.raises(refusal):
+        scene.run()
+    assert (world.snapshot("sma"), db_effects(world)) == before
+    assert deploy_store.get_open_by_name(world.conn, "sma") is not None
+
+    _reconcile(world)
+
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert (row["phase"], row["fail_reason"]) == ("foreign", None)
+    assert os.path.lexists(_live(world)) and not _live(world).is_symlink()
+    assert (_live(world).read_text() == "third party" if replacement == "file"
+            else (_live(world) / "keep.txt").read_text() == "third party")
+
+
+@pytest.mark.parametrize("replacement", ["file", "dir", "other_link"])
+def test_closing_a_failed_verification_leaves_a_live_that_is_not_the_source_alone_and_is_foreign(
+        world, monkeypatch, replacement):
+    scene = RollbackScene(world, revoke=False, cascade=False)
+    op_id = _crash_with_open_intent(world, monkeypatch, scene)
+    _live(world).unlink()
+    if replacement == "file":
+        _live(world).write_text("third party")
+    elif replacement == "dir":
+        _live(world).mkdir()
+    else:
+        _live(world).symlink_to(_link(scene.a)[1])
+    _tamper(scene.b)
+    open_row = deploy_store.get_open_by_name(world.conn, "sma")
+    failure = deploy_rollback.VerificationFailure(("target no longer verifies",))
+
+    outcome = deploy_rollback._close_failed_verification(
+        world.conn, world.root, open_row, op_id, failure, None, now=NOW)
+
+    assert outcome.outcome == "foreign" and outcome.op_id == op_id
+    row = deploy_store.get_by_id(world.conn, op_id)
+    assert (row["phase"], row["fail_reason"]) == ("foreign", None)
+    assert os.path.lexists(_live(world))
+    if replacement == "other_link":
+        assert os.readlink(_live(world)) == _link(scene.a)[1]
+    else:
+        assert not _live(world).is_symlink()
+
+
 # ---- the dependency of the target strategy changes ----
 
 def _strategy_scene(world):
@@ -586,6 +636,38 @@ def test_a_rerun_with_another_signature_after_a_crash_is_rejected_and_the_reconc
     _assert_rolled_back(world, scene, op_id)
 
 
+@pytest.mark.parametrize("changed", ["to", "revoke", "force"])
+def test_a_dry_run_after_the_swap_rejects_another_signature_and_changes_nothing(
+        world, monkeypatch, changed):
+    scene = RollbackScene(world, revoke=False, cascade=False)
+    crash_before_set_phase(monkeypatch, "done")
+    crashed(world, scene.run)
+    op_id = int(deploy_store.get_open_by_name(world.conn, "sma")["op_id"])
+    assert os.readlink(_live(world)) == _link(scene.b)[1]
+    before = (world.snapshot("sma"), db_effects(world))
+    override = {"to": {"to": scene.a.name}, "revoke": {"revoke": True},
+                "force": {"force": True}}[changed]
+
+    with pytest.raises(deploy_ops.SignatureMismatchError, match=str(op_id)):
+        scene.run(dry_run=True, **override)
+
+    assert (world.snapshot("sma"), db_effects(world)) == before
+
+
+def test_a_dry_run_after_the_swap_with_the_same_signature_reports_the_open_operation(
+        world, monkeypatch):
+    scene = RollbackScene(world, revoke=False, cascade=False)
+    crash_before_set_phase(monkeypatch, "done")
+    crashed(world, scene.run)
+    op_id = int(deploy_store.get_open_by_name(world.conn, "sma")["op_id"])
+    before = (world.snapshot("sma"), db_effects(world))
+
+    outcome = scene.run(dry_run=True)
+
+    assert outcome.outcome == "dry_run" and outcome.op_id == op_id
+    assert (world.snapshot("sma"), db_effects(world)) == before
+
+
 # ---- persistent syscall failures ----
 
 def _fail_swap(monkeypatch, world, variant):
@@ -601,6 +683,8 @@ def _fail_swap(monkeypatch, world, variant):
 def test_a_persistent_swap_failure_keeps_the_operation_open_until_it_is_healed(
         world, monkeypatch, scene, variant, how):
     op_id = _crash_with_open_intent(world, monkeypatch, scene)
+    links = _op_signal_links(world)
+    assert links
     heal = _fail_swap(monkeypatch, world, variant)
     activity = Activity()
 
@@ -618,6 +702,13 @@ def test_a_persistent_swap_failure_keeps_the_operation_open_until_it_is_healed(
     assert _source_state(world, scene.c) == (
         "strategy_not_approved" if scene.revoke else "open_deploy_op")
     assert [e for _, e, _ in activity.events] == ["plugin_deploy_op_needs_retry"]
+    if variant == "symlink":
+        assert _temp_links(world) == []
+    else:
+        assert _temp_links(world) in ([], [f".sma.link-d{op_id}"])
+    assert _op_signal_links(world) == links
+    statuses = _signal_statuses(world)
+    assert (statuses[scene.signals[0]], statuses[scene.signals[1]]) == ("abandoned", "claimed")
 
     heal()
     _converge(world, how, scene, activity)
@@ -672,10 +763,14 @@ def test_a_persistent_source_unlink_failure_after_a_failed_verification_stays_sy
     scene = RollbackScene(world, revoke=False, cascade=False)
     op_id = _crash_with_open_intent(world, monkeypatch, scene)
     _tamper(scene.b)
+    links = _op_signal_links(world)
+    statuses = _signal_statuses(world)
+    assert links
     heal = _fail_source_unlink(monkeypatch, world)
+    activity = Activity()
 
-    first = _reconcile(world)
-    second = _converge(world, how, scene)
+    first = _reconcile(world, activity)
+    second = _converge(world, how, scene, activity)
 
     assert [r.outcome for r in first if r.outcome != "notified"] == ["needs_retry"]
     if how == "reconcile":
@@ -688,11 +783,19 @@ def test_a_persistent_source_unlink_failure_after_a_failed_verification_stays_sy
     assert deploy_store.get_open_by_name(world.conn, "sma") is not None
     assert _source_state(world, scene.c) == (
         "strategy_not_approved" if scene.revoke else "open_deploy_op")
+    assert row["notify_attempted"] == 1
+    needs_retry = ["plugin_deploy_op_needs_retry"]
+    failures = 1 if how == "reconcile" else 2
+    assert [e for _, e, _ in activity.events] == needs_retry * failures
 
     heal()
-    _converge(world, how, scene)
+    _converge(world, how, scene, activity)
 
     row = deploy_store.get_by_id(world.conn, op_id)
+    assert row["notify_attempted"] == 1
+    assert [e for _, e, _ in activity.events] == needs_retry * (failures + (how == "cli"))
+    assert _op_signal_links(world) == links
+    assert _signal_statuses(world) == statuses
     assert (row["phase"], row["fail_reason"]) == ("needs_retry", "verify_failed")
     assert not os.path.lexists(_live(world))
     assert op_count(world) == 1
