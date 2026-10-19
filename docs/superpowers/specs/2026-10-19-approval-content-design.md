@@ -1,6 +1,6 @@
 # 承認の中身を見せる設計書
 
-**版:** v1.4 (ユーザー承認済み、実装可)
+**版:** v1.5 (ユーザー承認済み、実装可)
 **対象:** `approval-notice-lacks-change-content` と `bot-event-notices-are-raw-log-lines` の 2 チケットを 1 つの spec で扱う。実装束は 2 つに分ける (§10)。
 **位置づけ:** ユーザー裁定 4 問 (§8.1) を反映した確定版。この版から実装に入る。
 
@@ -16,7 +16,7 @@
 |---|---|
 | 要約の置き場 | Discord = 要約のみ。diff 全文 = 既存 web の承認 #N ページ。CLI = 既存の `afx ctl approval <id>` に要約が出る (`--diff` は作らない、§11)。 |
 | 材料 | 新しい表・列は作らない。変更内容は**読み出しのたびに版 dir から safe opener で安全に読んで計算し、保存しない** (§2)。 |
-| 出力境界 | 表示する全ての値は共通の redactor を通す。検出できないものは全文を伏せる (fail-closed、§7.1)。上限は用途別に 3 種の名前で分け、値は §2.7 の 1 表に集約する。 |
+| 出力境界 | 表示する全ての値は共通の redactor を通す。検出できないものは全文を伏せる (fail-closed、§7.1)。redactor が保証するのは、正規化後の各表示値に**字面として現れる**絶対パス、URL、hostname、IP、credential、token、口座数字の伏せ字である。Python の評価や定数畳み込みは行わず、複数行・複数リテラル・f-string 式・`chr()`・bytes・各種 encoding から再構成できる値は **diff に限り保証対象外**とし、単一利用者の loopback 運用における残余リスクとしてユーザーが受容した (§7.1、§8.1)。自由文 (summary / rationale / config 値 / parent_facts / reason / CLI) は従来どおり全保証である。上限は用途別に 3 種の名前で分け、値は §2.7 の 1 表に集約する。 |
 | API | `approval_detail` に `change` 要約を足し、diff 本文は daemon の別 endpoint (`GET /v1/approvals/{id}/change`) で返す。公開 web は既存の 1 ページに統合する。`payload_sha256` の契約 (payload 不変) は変えない (§5)。 |
 | 責務の分離 | daemon = 安全な読み取り・hash 検証・redaction・表示形式に依存しない構造化 diff。表示形式ごとの escape と最終上限は web / Discord / CLI がそれぞれ持つ (§4.3、§5)。 |
 | 自己申告 | agent の summary は Discord と web の両方に出す (§8.1 問 1)。「agent の申告 (未検証)」の見出しを分け、事実欄と混ぜない。`selection_rationale` は web のみ。 |
@@ -302,6 +302,16 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 
 そこで、次の 1 つの共通 redactor を、Discord・web・CLI の全ての表示に掛ける。
 
+**保証の範囲 (ユーザー裁定 (C)、2026-10-19)。** redactor が保証するのは、正規化後の各表示値に**字面として現れる**絶対パス、URL、hostname、IP、credential、token、口座数字の伏せ字である。Python の評価や定数畳み込みは行わない。自由文 (summary / rationale / config 値 / parent_facts / reason / CLI) は全保証。**diff だけ**が「字面」に限定される。
+
+**保証対象外の形 (diff のみ)。** 次のように、字面には現れず、評価や復号をして初めて値になる形は伏せない。
+- 複数行・複数リテラルに分割した値 (`"ev" "il.xyz"`、`a = "ev"; b = a + "il.xyz"`、行をまたぐ連結)。
+- f-string の式で組み立てる値 (`f"{a}{b}"`)。
+- `chr()` / `bytes` / `bytearray` / `bytes.fromhex` / `str.join` などで組み立てる値。
+- base64・hex・rot13・zlib など各種 encoding を復号して得られる値。
+- 定数畳み込みや変数の経由 (別の名前・別の関数・別のファイルに置いた断片)。
+
+
 - 検出対象: 絶対パス、URL・裸の hostname・IP、credential の代入 (`token=` `key=` `password=` `secret=` 等)、高エントロピーの token、口座らしい数字列。
 - 順序: **入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → 表示形式の escape (§3.2、§4.3) → 表示上限**。この順を崩さない (除去の前に redact すると、表示面が後で制御文字を消したときに分断された秘密が復元される。escape の後に redact すると検出を逃す、表示上限を先に掛けると完成本文が超える)。除去は redactor が検出の前に行い、出力も除去済みの文字列を基に作る。改行とタブは表示面が扱うため残し、CR は除去する。80 字・300 字・2000 字・64 KiB はすべて escape 後の表示上限である。
 - 裸の hostname (`evil.xyz` のように scheme も `host=` の文脈もないもの) は、`.` でつながる語の最後の label が TLD (IANA の一覧の ASCII の TLD と、`local` / `internal` / `test` など特殊用途の名前を `change_limits.py` に同梱) か、どれかの label が `xn--` で始まる語を伏せる。全角の句点類 (U+3002 / U+FF0E / U+FF61) は `.` に、U+FF0F は `/` に、U+FF20 は `@` に NFKC の前に寄せる。`%XX` の decode は固定点まで (上限 3 回) 掛け、どの段で検出されても値全体を伏せる (3 回で終わらないものも伏せる)。plugin のファイル名 (`plugin.py` など) 自体は hostname としない。自由文では `foo.py` や `README.md` のように TLD と同じ拡張子の語も伏せる (明示の受容判断。誤検出より漏れを嫌う)。
@@ -322,6 +332,7 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 7. 秘密: plugin コードは検査済みで環境変数やファイルを読めず、`config.yaml` に鍵や口座は入らない前提だが、`params` の任意 key と任意の文字列を許すため、これに頼らず §7.1 の redactor を必ず通す。
 8. **運用前提 (§8.1 問 3):** 認証なしの loopback web で取引ロジック (diff 全文) が同じホストの他の利用者から読める。redactor は秘密を伏せるが、戦略は見える。リポジトリが保証するのは loopback bind までで、単一利用者のホストであることは運用前提であり、ユーザーが受容した。この前提は運用文書 `docs/operations/ops-api-2026-10-09.md` に T1 で追記する。
 9. 既存の未是正経路として、gate の pytest 末尾が `last_result` に入るものがある。本設計はこれに触れず、新しい書き込みを足さない。
+10. **diff の伏せ字は字面限定 (残余リスク、裁定 (C)):** 字面に現れない再構成可能な値 (§7.1 の保証対象外の形) は diff で伏せない。受容の根拠は次の 3 つである。(a) 改善 agent の入力に実ホスト名・秘密が無い (settings の bridge URL、webhook、API 鍵、鍵 path は prompt にも tool 応答にも渡らない、AC-32)。(b) plugin は外部に触れない (隔離 sandbox で network・環境変数・鍵に届かない)。(c) 閲覧者は単一利用者の loopback である。したがって agent が diff に実ホスト名や秘密を再構成して書き込む動機も材料も無い。**前提が崩れる条件:** 多利用者ホスト (loopback web を他の利用者が読める)、または agent の入力に実ホスト名・秘密が入る変更 (例: prompt や tool 応答に bridge URL・鍵 path・webhook を足す)。どちらかが起きるなら、この受容をやり直し、diff の伏せ字を評価ベースに強めるか web を無効にする。
 
 ## 8. 裁定の記録
 
@@ -386,7 +397,7 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 | AC-19 | 決定者の名前・principal 名が通知にも終端 edit にも出ない | 描画結果 |
 | AC-20 | 全 event 通知の本文が許可された値だけから組まれ、自由文を含まない | event 変種ごとの描画 |
 | AC-21 | ボタンと `footer` が従来と同じ | 既存 pin test |
-| AC-22a | 敵対 fixture (絶対パス・host・IP・token・口座らしい数字列・コードフェンス・メンション・入れ子 config) が API の `change`・web の全節・CLI 出力のどれからも漏れない。判定不能なファイルはそのファイルだけ全文を伏せて `redacted` の固定文になり、他のファイルの diff は出る | 敵対 fixture と API / web / CLI の検査 (T1) |
+| AC-22a | 字面に現れる敵対 fixture (絶対パス・host・IP・token・口座らしい数字列・コードフェンス・メンション・入れ子 config) が API の `change`・web の全節・CLI 出力のどれからも漏れない。判定不能なファイルはそのファイルだけ全文を伏せて `redacted` の固定文になり、他のファイルの diff は出る。文字列分割・`chr()`・bytes・encoding などの再構成 fixture は AC に入れない (§7.1 の保証対象外) | 敵対 fixture と API / web / CLI の検査 (T1) |
 | AC-22b | 同じ敵対 fixture が Discord の承認投稿 (summary・params の key と value) から漏れない | 描画結果 (T2) |
 | AC-23a | 順序の境界 fixture (API・web・CLI): escape で文字数が増える記号 (`&` `<` など) を表示上限ちょうどの手前まで並べ、**末尾に redaction 対象 (token など) を置く**。redaction → escape → 表示上限の順なら token は伏せられ上限内に収まる。順序が逆なら token が出るか上限を超える。params の 80 字と web budget のそれぞれに fixture を置く | 境界 fixture の出力に対する assert (T1) |
 | AC-23b | 同じ順序の境界 fixture を Discord の 300 字 (summary) と 2000 字 (完成本文) に置く | 境界 fixture の出力に対する assert (T2) |
@@ -399,6 +410,7 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 | AC-30 | 終端時の edit (§3.4): 承認 / 却下 / 失効のそれぞれで、本文の要約 (見出し・params 差分・成績) が保持され、状態名と決定時刻が出て、View (ボタン) が除去される。決定者の名前は出ない。決定結果が取れないときだけ「Approval is no longer active.」の 1 行になる | 終端 edit の描画と component の検査 |
 | AC-31a | reason code の対応 (API・web・CLI): §5 の表の `unavailable` / `hash_mismatch` / `too_large` / `unsafe_source` / `redacted` が、表のとおりの固定文だけを出し、自由文を足さない。§5 の粒度表の各行 (change 全体 / ファイル / 値) が、表のとおりの単位で出る | code ごとの描画と粒度ごとの検査 (T1) |
 | AC-31b | reason code の対応 (Discord): `detail_unavailable` / `legacy_payload` が固定文だけを出し、自由文を足さない | code ごとの描画 (T2) |
+| AC-32 | 改善 agent への入力に実ホスト名・秘密が含まれない (§7.1 の diff の受容の前提)。settings 由来の値 (`mt5_bridge` の host / port、Discord webhook の host と token、API 鍵、`~/.config/agentic-fx` の鍵 path) を一意の canary にし、入力側 (settings・環境変数・鍵ファイル) に存在することを先に assert したうえで、改善 mission のプロンプト全文と生成した context、research / staging 群の代表 tool の応答と tool schema に canary が現れない。既知の例外は staging の絶対パス (`plugins/_staging/...`、意図して渡している) で、canary は staging の外に置く | プロンプト文字列と tool 出力の検査 (`tests/loops/test_improve_input_no_host_secrets.py`) |
 
 ## 10. 変更ファイルと task 表
 
@@ -422,7 +434,7 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 
 | task | 範囲 | test 完成形の要点 | 規模 |
 |---|---|---|---|
-| T1 API + CLI + web | 運用文書 `docs/operations/ops-api-2026-10-09.md` への前提 1 行の追記 (単一利用者ホスト、§7.2 の 8)、safe opener (root と component の契約、baseline target の完全一致)、coherent read、redactor、変更要約の計算、`approval_detail.change`、新 endpoint (構造化 diff)、CLI の formatter、web の節と diff と escape と budget (48 KiB の配分手順)、spec の追記 | AC-1〜6、12〜16、22a、23a、24〜29、31a。合成 2 版 dir (中間 symlink を含む)、現行形の匿名化 payload fixture、境界値 (L-1 / L / L+1)、web の byte 上限の pin、敵対 fixture、canary、negative test | L |
+| T1 API + CLI + web | 運用文書 `docs/operations/ops-api-2026-10-09.md` への前提 1 行の追記 (単一利用者ホスト、§7.2 の 8)、safe opener (root と component の契約、baseline target の完全一致)、coherent read、redactor、変更要約の計算、`approval_detail.change`、新 endpoint (構造化 diff)、CLI の formatter、web の節と diff と escape と budget (48 KiB の配分手順)、spec の追記 | AC-1〜6、12〜16、22a、23a、24〜29、31a、32。合成 2 版 dir (中間 symlink を含む)、現行形の匿名化 payload fixture、境界値 (L-1 / L / L+1)、web の byte 上限の pin、敵対 fixture、canary、negative test | L |
 | T2 承認投稿 | `render_approval` の書き換え、escape、最終 2000 字 hard check、代替経路 (2 行)、終端 edit、pin の書き換え (§3.3) | AC-7〜11、21、22b、23b、30、31b。敵対 fixture と長文 fixture、順序の境界 fixture | M |
 | T3 event 通知 (別束) | 種別 template (名前なし、配備成功後の文言)、plugin 名の補完、既定の絞り込みと設定 | AC-17〜20。state の schema は変えないので旧 fixture はそのまま | S〜M |
 
@@ -440,6 +452,7 @@ T1 → T2 を 1 束 (T2 は T1 の safe な change モデルと API に依存)�
 - **決定者 (actor) の表示:** 必要になったら別設計 (安定 ID、メンションにならない表示、state v4 → v5 の migration、event 消費までの terminal tombstone と期限 GC、重複 event の冪等性)。
 - **baseline の束縛を閉じる案:** diff の digest を payload に足す、または承認操作に view token を必須にする。`payload_sha256` とボタンの契約が変わるので、v0.4 の残余リスク (§2.5) を運用で見たうえで別途判断する。
 - **holdout を Discord に出す設定:** 作らない (§8.1 問 2)。出したくなったときは別設計で、設定 key・config schema・pin test を伴う。
+- **diff の伏せ字を字面から評価ベースへ:** 受容 (§7.2 の 10) の前提 (単一利用者の loopback、改善 agent の入力に実ホスト名・秘密が無い、AC-32) が崩れたときの別設計。多利用者ホストにする、または agent の入力にホスト名を入れる変更を入れるときは、先にこの受容を見直す。
 - **単一利用者ホストの前提:** 戦略コードが loopback web で同じホストの他ユーザーから読める点は受容済み (§8.1 問 3)。多利用者ホストにするなら認可の設計が先に要る。
 
 ## 12. 変更履歴
@@ -456,3 +469,4 @@ T1 → T2 を 1 束 (T2 は T1 の safe な change モデルと API に依存)�
 | 2026-10-19 | v1.2 | 処理順を 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → escape → 表示上限 に訂正 (§2.2、§3.2、§4.3、§7.1)。redactor が検出の前に制御文字を除き、出力も除去済みの文字列から作る | NUL・ゼロ幅・孤立サロゲート・CR を値に挟むと検出を逃し、表示面の除去で伏せていない秘密が復元されることを実測 | |
 | 2026-10-19 | v1.3 | 行単位 diff の計算量を `DIFF_MAX_CELLS` で打ち切る (§2.7)。日付・時刻を口座の数字列の検出から除き、hostname は主要 TLD・文脈 (URL・email・host=) ・3 label 以上の `.local` に限り、添字のスライスを IPv6 とみなさない (redactor)。params の flatten は key の和集合の先頭 64 件を両側に当てる。`/change` の応答が上限を超えるときは diff → claims → params 項目 → 理由だけの順に落として必ず上限以下にする。web と CLI は型の外れた変更内容を固定文 1 行に倒す | /code-review high の指摘 8 件の是正 | |
 | 2026-10-19 | v1.4 | hostname の検出を入力の種類で分ける (自由文は全 TLD で全体、Python ソースは文字列・コメントのみで、tokenize / 構文の失敗は全行自由文)。TLD は IANA の一覧を同梱、`xn--` の label は無条件。decode は固定点まで (上限 3 回)、全角の句点類・スラッシュ・アットを NFKC の前に寄せる。口座らしい key の値は日付の形でも伏せる (§7.1)。`approval_detail` の change は diff を作らないことを test で pin | 閉鎖確認の指摘 3 件 (主要 TLD だけ裸で伏せる設計の回避、日付の無条件通過、diff の二重計算) の是正 | |
+| 2026-10-19 | v1.5 | redactor の保証を「正規化後の各表示値に字面として現れる値」に限定 (ユーザー裁定 (C))。diff に限り、複数行・複数リテラル・f-string 式・`chr()`・bytes・encoding から再構成できる値は保証対象外 (§0、§7.1)。受容の根拠と前提が崩れる条件を追記 (§7.2 の 10、§11)。AC-22a を字面に現れる fixture に限定し、新 AC-32 (改善 agent への入力に実ホスト名・秘密が無い、canary test) を追加 (§9、§10.2) | redactor の検出で Critical が 3 周続いた。評価ベースの検出は部品として成立しないため、前提 (単一利用者の loopback、agent の入力に実ホスト名・秘密が無い) を pin して残余を受容 | |
