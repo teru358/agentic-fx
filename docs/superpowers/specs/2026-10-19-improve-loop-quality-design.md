@@ -100,7 +100,7 @@
 1. 提出する候補 (`gate_verdict.artifact_hash`) の行を、承認依頼を作る**直前**に必ず作る。同じ `(mission_id, artifact_hash)` の行が既にあれば (台帳の `INSERT OR IGNORE` が返す既存 id) それを再利用し、無ければ新しい行を作る。新しい行の snapshot は run_backtest と同じ手順 (tmp に書いて rename) で staging から作る。snapshot が作れなければ `archive_path` NULL の行にして `archive_failed` を activity に残す (行そのものは必ず作る)。新しい行の `metrics_json` は `{}`、`pair` は strategy なら config の先頭 pair、indicator なら NULL (成績は gate の行が別に持つ。新列に成績を持たない原則は変えない)。
 2. 承認 payload に、その行の `id` を `candidate_archive_id` として入れる (`_finalize_success` の tx 内、`approval_payload = dict(approval_payload)` に `analysis_run_ids` を足す箇所と同じ位置、`improve_loop.py:2443`)。作成時に確定し、以後変えない。
 3. 提出に至らない終端でも、判定した候補 (§2.2 の全終端写像表で「最終行あり」の終端) は同じ規則で行を作り、outcome を `settle` する。snapshot は作らない (`archive_path` NULL)。
-4. `apply_decision` と `append_revocation` は、payload の `candidate_archive_id` で行を引く。ID が無い旧 payload は、後述の旧行の照合規則 (`resolve`) で引く。
+4. `apply_decision` と `append_revocation` は、payload の `candidate_archive_id` で行を引く。有効な ID を持つ payload では ID が正で、その行が無ければ別の行へ結ばない (決定のみ commit)。ID が無い旧 payload だけ、後述の旧行の照合規則 (`resolve`) で引く。
 
 **更新の規則。**
 
