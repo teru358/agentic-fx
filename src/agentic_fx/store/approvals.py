@@ -2,8 +2,36 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
+
+_log = logging.getLogger("agentic_fx.store.approvals")
+
+# 決定 status → 候補台帳の分類
+_DECISION_OUTCOME = {
+    "approved": "approved", "rejected": "rejected_by_human",
+    "expired": "expired", "invalidated": "invalidated"}
+
+
+def _settle_archive(conn: sqlite3.Connection, payload: object, *,
+                    expected_from: str, outcome: str, approval_id: int) -> None:
+    """承認 payload の指す台帳の行を同じ tx 内で更新する。
+
+    行が無い、または現在値が `expected_from` でないときは更新を skip して
+    warning を残す。決定そのものは台帳の都合で失敗させない。"""
+    from agentic_fx.store import candidate_archives as archives_mod
+
+    archive_id = archives_mod.resolve(conn, payload)
+    if archive_id is None:
+        _log.warning("approval %s: no candidate archive row to settle (%s)",
+                     approval_id, outcome)
+        return
+    if not archives_mod.settle(conn, archive_id, outcome,
+                               expected_from=expected_from):
+        _log.warning(
+            "approval %s: candidate archive %s is not %s; skip %s",
+            approval_id, archive_id, expected_from, outcome)
 
 
 class AlreadyDecidedError(Exception):
@@ -117,13 +145,23 @@ def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
         "artifact_hash": payload.get("artifact_hash"),
         "revokes_approval_id": approval["id"],
     }
-    cur = conn.execute(
-        "INSERT INTO approval_requests "
-        "(kind,payload_json,status,reason,decided_by,decided_at,created_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        ("plugin", json.dumps(revoke_payload, ensure_ascii=False), "rejected",
-         "revoked_by_operator", actor, decided_at.isoformat(), decided_at.isoformat()),
-    )
+    try:
+        cur = conn.execute(
+            "INSERT INTO approval_requests "
+            "(kind,payload_json,status,reason,decided_by,decided_at,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            ("plugin", json.dumps(revoke_payload, ensure_ascii=False), "rejected",
+             "revoked_by_operator", actor, decided_at.isoformat(),
+             decided_at.isoformat()),
+        )
+        # 撤回の対象に指された承認の行だけを revoked にする。同じ版の古い
+        # 承認の行は決定時の事実のまま残す。
+        _settle_archive(conn, payload, expected_from="approved",
+                        outcome="revoked", approval_id=approval["id"])
+    except BaseException:
+        if commit:
+            conn.rollback()
+        raise
     if commit:
         conn.commit()
     return cur.lastrowid
@@ -191,24 +229,35 @@ def apply_decision(
         if exists is None:
             raise ApprovalNotFoundError(f"approval {approval_id} not found")
         raise AlreadyDecidedError(f"approval {approval_id} is not pending")
-    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
-                       (approval_id,)).fetchone()
     try:
-        payload = json.loads(row["payload_json"]) if row is not None else {}
-    except (TypeError, ValueError):
-        # I4 是正で §5.5 migration がこの API を経由するようになった
-        # ため、legacy 行の壊れた payload_json (json.loads 失敗) も
-        # fail-safe に扱う必要がある — db.py の legacy migration と
-        # 同じ流儀 (payload = {} フォールバック、backlog_id=None → no-op)。
-        payload = {}
-    backlog_id = payload.get("backlog_id")
-    outcome = status  # m13: 旧 `status if status in (...) else status` は恒真式だったため簡約
-    from agentic_fx.store import backlog as backlog_mod
-    backlog_mod.apply_approval_outcome(
-        conn, backlog_id=backlog_id, outcome=outcome,
-        reason=(str(approval_id) if status == "approved"
-               else (reason or "")),
-        now=now, commit=False)
+        row = conn.execute(
+            "SELECT kind, payload_json FROM approval_requests WHERE id=?",
+            (approval_id,)).fetchone()
+        try:
+            payload = json.loads(row["payload_json"]) if row is not None else {}
+        except (TypeError, ValueError):
+            # I4 是正で §5.5 migration がこの API を経由するようになった
+            # ため、legacy 行の壊れた payload_json (json.loads 失敗) も
+            # fail-safe に扱う必要がある — db.py の legacy migration と
+            # 同じ流儀 (payload = {} フォールバック、backlog_id=None → no-op)。
+            payload = {}
+        backlog_id = payload.get("backlog_id")
+        outcome = status  # m13: 旧 `status if status in (...) else status` は恒真式だったため簡約
+        from agentic_fx.store import backlog as backlog_mod
+        backlog_mod.apply_approval_outcome(
+            conn, backlog_id=backlog_id, outcome=outcome,
+            reason=(str(approval_id) if status == "approved"
+                    else (reason or "")),
+            now=now, commit=False)
+        # 承認の CAS が成立した同じ tx で、提出した候補の台帳の行も進める。
+        if row is not None and row["kind"] == "plugin":
+            _settle_archive(conn, payload, expected_from="pending",
+                            outcome=_DECISION_OUTCOME[status],
+                            approval_id=approval_id)
+    except BaseException:
+        if commit:
+            conn.rollback()
+        raise
     # switch ジャーナルの 'decided' 化は approve のときのみ、Task 11 が
     # plugin/switch.py から呼ぶ拡張点 (ここでは何もしない — 申し送り⑤)。
     if commit:

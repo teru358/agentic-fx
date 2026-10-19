@@ -199,7 +199,7 @@ def test_ac14_outcome_class_writers_are_pinned_by_scan():
                             key=lambda s: s[1] - s[0])[2]
                 callers.add((path.relative_to(SRC).as_posix(), owner))
     assert {c[1] for c in callers} <= {
-        "apply_decision", "append_revocation", "_settle_candidate_in_tx"}
+        "_settle_archive", "_settle_candidate_in_tx"}
     assert {c[0] for c in callers} <= {
         "store/approvals.py", "loops/improve_loop.py"}
 
