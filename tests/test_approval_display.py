@@ -684,3 +684,10 @@ def test_a_short_value_that_already_ends_with_the_suffix_is_not_doubled():
     value = "x" * (approval_facts.CLAIM_DISPLAY_LIMIT - 3) + suffix
     assert approval_facts.display_text(
         value, approval_facts.CLAIM_DISPLAY_LIMIT) == value
+
+
+def test_redacted_value_shows_no_secret_after_display_text_removes_controls():
+    from agentic_fx.loops.approval_facts import display_text
+    from agentic_fx.ops import redactor
+    for raw in ("sk-ab\x00cdefghijklmnopq123", "10.0.0.\x001", "/h​ome/bob"):
+        assert display_text(redactor.redact_value(raw)) == "[redacted]"

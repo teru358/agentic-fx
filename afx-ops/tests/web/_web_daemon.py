@@ -3,7 +3,8 @@
 usage: _web_daemon.py <socket_path> <lock_dir> <script_json> <record_file>
 
 要求ごとに script_json を読み直す: {"<path>": data, ...}。path は `/v1/status` 等で、
-`/v1/approvals/<id>` は `/v1/approvals/{id}` の鍵で引く。鍵に無い path は 404 の error。
+`/v1/approvals/<id>` は `/v1/approvals/{id}`、`/v1/approvals/<id>/change` は
+`/v1/approvals/{id}/change` の鍵で引く。鍵に無い path は 404 の error。
 `"_delay"` があればその秒数だけ待ってから答える。
 
 要求ごとに method、target、header 名 (小文字)、actor header の有無、body の長さ、
@@ -23,6 +24,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 _DETAIL = re.compile(r"/v1/approvals/[0-9]+\Z")
+_CHANGE = re.compile(r"/v1/approvals/[0-9]+/change\Z")
 
 
 def _reply(status: int, body: dict) -> bytes:
@@ -66,7 +68,11 @@ def _answer(data: bytes, script: Path, record: Path) -> bytes:
     conf = json.loads(script.read_text(encoding="utf-8"))
     if conf.get("_delay"):
         time.sleep(conf["_delay"])
-    key = "/v1/approvals/{id}" if _DETAIL.fullmatch(path) else path
+    key = path
+    if _DETAIL.fullmatch(path):
+        key = "/v1/approvals/{id}"
+    elif _CHANGE.fullmatch(path):
+        key = "/v1/approvals/{id}/change"
     if method != b"GET" or key not in conf or key.startswith("_"):
         return _reply(404, {"ok": False, "error": {"code": "not_found"}})
     return _reply(200, {"ok": True, "data": conf[key]})

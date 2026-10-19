@@ -36,7 +36,7 @@ from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
-from . import keys
+from . import change_limits, keys, redactor
 from .contracts import Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
@@ -704,6 +704,86 @@ def format_approval_list(data: dict) -> str:
     return "\n".join(lines)
 
 
+_HASH_HEAD = re.compile(r"[0-9a-f]{64}")
+
+
+def _safe_cell(value, limit: int) -> str:
+    """表示する非信頼の値。redaction → 制御文字の除去 → 表示上限、の順で 1 行にする。"""
+    if not isinstance(value, str):
+        return "-"
+    text = display_text(redactor.redact_value(value), 1 << 20)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _safe_text(value, limit: int) -> str:
+    """既存の表示整形 (`display_text`) に redaction を前置したもの。"""
+    return display_text(redactor.redact_value(value) if isinstance(value, str) else value, limit)
+
+
+def _hash_head(value) -> str:
+    return value[:12] if isinstance(value, str) and _HASH_HEAD.fullmatch(value) else "-"
+
+
+def _reason_text(code) -> str:
+    return change_limits.REASON_TEXT.get(code, change_limits.REASON_TEXT[change_limits.UNSAFE_SOURCE])
+
+
+INVALID_CHANGE_TEXT = "変更内容を表示できません"
+
+
+def _change_is_well_formed(change: dict) -> bool:
+    """daemon の応答が約束の型か。外れた応答 (版の食い違い・不具合) は固定文に倒す。"""
+    reason = change.get("reason")
+    if not isinstance(change.get("classification"), str):
+        return False
+    if reason is not None and not isinstance(reason, str):
+        return False
+    params = change.get("params")
+    if params is None:
+        return True
+    return isinstance(params, dict) and isinstance(params.get("items", []), list)
+
+
+def format_change_lines(change) -> list[str]:
+    """承認の変更要約 (diff は出さない)。固定文以外の自由文は redactor を通した値だけ。"""
+    if not isinstance(change, dict):
+        return []
+    if not _change_is_well_formed(change):
+        return ["-- 変更内容 --", INVALID_CHANGE_TEXT]
+    cls = change.get("classification")
+    label = change_limits.CLASS_LABELS.get(cls, change_limits.CLASS_LABELS[change_limits.CLASS_UNKNOWN])
+    name = change.get("name")
+    name = name if isinstance(name, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", name) else "-"
+    kind = change.get("kind") if change.get("kind") in change_limits.PLUGIN_KINDS else "-"
+    lines = ["-- 変更内容 --",
+             f"plugin: {name} ({kind}) 分類: {label}"
+             + (" (前版なし)" if cls == change_limits.CLASS_NEW else ""),
+             f"候補: {_hash_head(change.get('candidate_hash'))} "
+             f"比較対象: {_hash_head(change.get('baseline_hash'))} "
+             f"計算時刻: {_safe_cell(change.get('computed_at'), 40)}"]
+    params = change.get("params") if isinstance(change.get("params"), dict) else {}
+    items = [i for i in params.get("items") or [] if isinstance(i, dict)]
+    if items:
+        lines.append("params の差分:")
+        for item in items[:change_limits.PARAMS_DIFF_MAX]:
+            old, new = item.get("old"), item.get("new")
+            lines.append(
+                f"  {_safe_cell(item.get('key'), change_limits.PARAM_VALUE_CHARS)}: "
+                f"{'(なし)' if old is None else _safe_cell(old, change_limits.PARAM_VALUE_CHARS)}"
+                f" → {'(なし)' if new is None else _safe_cell(new, change_limits.PARAM_VALUE_CHARS)}")
+    extra = [("ほか", params.get("omitted")), ("形に合わない key", params.get("invalid_keys")),
+             ("比較していない key", params.get("flatten_omitted"))]
+    for label_, count in extra:
+        if type(count) is int and count > 0:
+            lines.append(f"  ({label_} {count} 件)")
+    if params.get("reason") == change_limits.REDACTED_CODE:
+        lines.append(_reason_text(change_limits.REDACTED_CODE))
+    reason = change.get("reason")
+    if reason is not None:
+        lines.append(_reason_text(reason))
+    return lines
+
+
 def format_approval_detail(data: dict) -> str:
     # in_sample / holdout の行は対話シェルの承認詳細と同じ renderer を使う。
     from agentic_fx.commands import Commands
@@ -711,11 +791,12 @@ def format_approval_detail(data: dict) -> str:
              f"status={display_text(data.get('status'))}"]
     lines += Commands._metrics_lines("in_sample", data.get("in_sample"))
     lines += Commands._metrics_lines("holdout", data.get("holdout"))
+    lines += format_change_lines(data.get("change"))
     facts = data.get("facts_lines")
     if isinstance(facts, list):
-        lines += [display_text(line, approval_facts.CLAIM_DISPLAY_LIMIT) for line in facts]
+        lines += [_safe_text(line, approval_facts.CLAIM_DISPLAY_LIMIT) for line in facts]
     lines.append(
-        f"reason={display_text(data.get('reason'), approval_facts.CLAIM_DISPLAY_LIMIT)} "
+        f"reason={_safe_text(data.get('reason'), approval_facts.CLAIM_DISPLAY_LIMIT)} "
         f"decided_by={display_text(data.get('decided_by'))} "
         f"decided_at={display_text(data.get('decided_at'))}")
     lines.append(f"payload_sha256={display_text(data.get('payload_sha256'))}")

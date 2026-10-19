@@ -460,6 +460,10 @@ class WebClient(_Client):
     def approval(self, approval_id: int) -> Reply:
         return self._get(f"/v1/approvals/{_int_id(approval_id)}")
 
+    def approval_change(self, approval_id: int) -> Reply:
+        """承認の変更内容 (構造化 diff と申告)。bot は呼ばない。"""
+        return self._get(f"/v1/approvals/{_int_id(approval_id)}/change")
+
     def log(self, *, n: int = 100) -> Reply:
         return self._get("/v1/log", n=n)
 
