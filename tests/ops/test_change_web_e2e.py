@@ -175,3 +175,31 @@ def test_ac14_bot_never_calls_the_change_endpoint():
         for source in path.rglob("*.py"):
             text = source.read_text(encoding="utf-8")
             assert "approval_change" not in text and "/change" not in text, source.name
+
+
+CONTROL_SPLIT_SECRETS = ("sk-ab‍cdefghijklmnopq123", "10.0.0.​1", "/h‍ome/bob")
+
+
+def test_control_characters_do_not_hide_secrets_from_the_web_page(ops_env):
+    code = "".join(f"v{i} = {s!r}\n" for i, s in enumerate(CONTROL_SPLIT_SECRETS))
+    approval_id, _, _ = _scenario(
+        ops_env, code, OLD_CFG + "# c\n",
+        agent_claims={"summary": "at " + " ".join(CONTROL_SPLIT_SECRETS),
+                      "selection_rationale": "see " + CONTROL_SPLIT_SECRETS[0]})
+    page = _page(ops_env, approval_id)
+    for secret in CONTROL_SPLIT_SECRETS:
+        joined = secret.replace("‍", "").replace("​", "")
+        assert joined not in page and secret not in page, secret
+    assert "sk-abcdefghijklmnopq123" not in page and "10.0.0.1" not in page
+    assert "/home/bob" not in page and L.REDACTED in page
+
+
+def test_control_characters_do_not_hide_secrets_from_the_cli_change_lines():
+    from agentic_fx.ops.client import format_change_lines
+    change = {"classification": "updated", "name": "sma_cross", "kind": "strategy",
+              "params": {"items": [{"key": "where", "old": CONTROL_SPLIT_SECRETS[0],
+                                    "new": CONTROL_SPLIT_SECRETS[1] + " " + CONTROL_SPLIT_SECRETS[2]}]}}
+    text = "\n".join(format_change_lines(change))
+    assert "sk-abcdefghijklmnopq123" not in text and "10.0.0.1" not in text
+    assert "/home/bob" not in text
+    assert "where: [redacted] → [redacted] [redacted]" in text

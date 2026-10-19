@@ -29,3 +29,17 @@ def test_whole_detected_span_is_replaced(text, expected):
 ])
 def test_just_below_the_thresholds_is_left_alone(text):
     assert R.redact(text) == text
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("sk-ab\x00cdefghijklmnopq123", "[redacted]"),
+    ("10.0.0.\x001", "[redacted]"),
+    ("/h​ome/bob", "[redacted]"),
+    ("sk-abcdefgh‍ijklmnopq123", "[redacted]"),
+    ("sk-abcdefgh\ud800ijklmnopq123", "[redacted]"),
+    ("host 10.0.0.\r1 end", "host [redacted] end"),
+    ("a\x00b​c\n\td", "abc\n\td"),
+])
+def test_control_characters_cannot_split_a_secret_and_are_removed_from_output(text, expected):
+    assert R.redact(text) == expected
+    assert R.redact_value(text) == expected

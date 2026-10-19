@@ -1,6 +1,6 @@
 # 承認の中身を見せる設計書
 
-**版:** v1.0 (ユーザー承認済み、実装可)
+**版:** v1.2 (ユーザー承認済み、実装可)
 **対象:** `approval-notice-lacks-change-content` と `bot-event-notices-are-raw-log-lines` の 2 チケットを 1 つの spec で扱う。実装束は 2 つに分ける (§10)。
 **位置づけ:** ユーザー裁定 4 問 (§8.1) を反映した確定版。この版から実装に入る。
 
@@ -71,7 +71,7 @@
 
 ### 2.2 読み出し時に計算するもの
 
-値の処理順は常に **入力読み取り上限 → redaction (対象上限を超える値は全文を伏せる) → 表示形式の escape → 表示上限** とする (§7.1)。下表の「80 字」などはすべて最後の表示上限であり、escape 後に数える。
+値の処理順は常に **入力読み取り上限 → Cc/Cf/Cs 除去 → redaction (対象上限を超える値は全文を伏せる) → 表示形式の escape → 表示上限** とする (§7.1)。下表の「80 字」などはすべて最後の表示上限であり、escape 後に数える。
 
 | 計算 | 規則 |
 |---|---|
@@ -177,7 +177,7 @@ T1 の root と component の契約 (現物の配置に一致する):
 
 ### 3.2 無害化と上限
 
-最終出力の順序は常に **redaction → 表示形式の escape → 表示上限** とする (§2.2、§7.1)。
+最終出力の順序は常に **Cc/Cf/Cs 除去 → redaction → 表示形式の escape → 表示上限** とする (§2.2、§7.1)。
 
 - すべての非信頼値 (申告、params の key・value、plugin 名以外の文字列) を、まず共通の redactor に通す (1 値 8 KiB を超えるものは全文を伏せる)。
 - 申告は既存の表示用整形 (制御文字・書式文字の除去、改行を空白へ、連続空白の圧縮) を通したあと、Discord の escape を掛け、最後に 300 字 (escape 後) で「…」切りにする。
@@ -214,7 +214,7 @@ T1 の root と component の契約 (現物の配置に一致する):
 
 - 形式は色なしの unified diff を `<pre>` に入れる。根拠: 固定 CSS と JS なしの方針で、色を付けると CSS が変わり CSP の hash と pin 2 か所の更新が要る。daemon が返すのは構造化された hunk (ファイルごとの行の文字列、HTML escape はしない) で、unified diff の見た目への整形は web が行う。
 - **責務の分担:** daemon の `/change` は、safe read、hash 検証、redaction、表示形式に依存しない構造化 diff、API 自身の応答上限 (512 KiB) までを受け持つ。web は、Unicode の Cc / Cf / Cs の除去 (改行だけ正規化して保持)、`html.escape`、他の節を含むページ全体の budget を受け持つ。Discord と CLI は、それぞれの表示形式の escape と最終上限を受け持つ。escape は表示面でちょうど 1 回だけ掛かるので、二重 escape は起きない。
-- web の値の処理順は、(daemon で redaction 済み) → Cc / Cf / Cs の除去 → `html.escape` → 表示上限、とする。
+- web の値の処理順は、(daemon で Cc / Cf / Cs の除去と redaction 済み) → 表示面での Cc / Cf / Cs の除去 (改行の正規化。冪等) → `html.escape` → 表示上限、とする。
 - 上限は **`html.escape` 後の UTF-8 byte 数**で共有 budget を持つ。raw の文字数で制限すると `&` や `<` の膨張で破れるため、diff 合計 48 KiB 以下 (見出し・省略印を含む。3 ファイルへの配分は §2.7 の手順)、他の節 (骨格含む) 15 KiB 以下の規則でページ全体を 64 KiB 未満に収める。超えた分は末尾を「…(N 行省略)」にする。既存の renderer はページが 64 KiB を超えるとページ全体を「Output clipped」に差し替えるので、**ページ完成後の byte 数が 64 KiB 未満**であることを AC にする。
 - 新規は全文を「追加」(`+` 行) として同じ budget で出す。
 - 入力ファイルの読み取り上限超過は change 全体を `too_large`、非 UTF-8・検出不能のファイルはそのファイルだけ `redacted` (他のファイルの diff は出す)、単一値の 8 KiB 超過はその値だけ `[redacted]`。粒度と code の対応は §5 の粒度表のとおり。
@@ -302,7 +302,7 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 そこで、次の 1 つの共通 redactor を、Discord・web・CLI の全ての表示に掛ける。
 
 - 検出対象: 絶対パス、URL・裸の hostname・IP、credential の代入 (`token=` `key=` `password=` `secret=` 等)、高エントロピーの token、口座らしい数字列。
-- 順序: **redaction → 表示形式の escape (§3.2、§4.3) → 表示上限**。この順を崩さない (escape の後に redact すると検出を逃す、表示上限を先に掛けると完成本文が超える)。80 字・300 字・2000 字・64 KiB はすべて escape 後の表示上限である。
+- 順序: **入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → 表示形式の escape (§3.2、§4.3) → 表示上限**。この順を崩さない (除去の前に redact すると、表示面が後で制御文字を消したときに分断された秘密が復元される。escape の後に redact すると検出を逃す、表示上限を先に掛けると完成本文が超える)。除去は redactor が検出の前に行い、出力も除去済みの文字列を基に作る。改行とタブは表示面が扱うため残し、CR は除去する。80 字・300 字・2000 字・64 KiB はすべて escape 後の表示上限である。
 - redactor に渡す 1 値には redaction 対象上限 (§2.7、8 KiB) がある。超える値は**切らずに**全文を伏せる (切ると token が境界で割れて検出を逃すため)。
 - fail-closed: 判定不能なファイル (検出が確信できない、非 UTF-8) は**そのファイルの全文**を伏せ、reason code `redacted` (「機微情報の可能性があるためローカルで確認してください」) を表示する。他のファイルは出す。部分的に出して誤魔化さない。入力ファイルの読み取り上限超過は redaction ではなく `too_large` (change 全体)、単一値の 8 KiB 超過はその値だけ `[redacted]` (§5 の粒度表)。
 - 検出に失敗した値は伏せる側に倒す。
@@ -449,3 +449,4 @@ T1 → T2 を 1 束 (T2 は T1 の safe な change モデルと API に依存)�
 | 2026-10-19 | v0.5 | safe opener の契約に human origin (`plugins/_human` / `[name]`) を追加 (§1、§2.4、AC-24、§10.1)。AC-1 の申告 summary を無条件に (API は常に返す、Discord だけ §8.1 問 1 に依存) | codex sol 4 周目 (閉鎖確認) の Low 2 件 | |
 | 2026-10-19 | v1.0 | ユーザー裁定 4 問 (問 1 summary を Discord に出す、問 2 holdout は web のみで設定 key なし、問 3 loopback の受容、問 5 event 既定は決定 + 失敗系のみ) の反映。§8 を裁定の記録に変え、条件分岐を決定後の文に書き換え (先頭、§0、§3.1、§3.3、§4.2、§4.4、§7.2、§8、§9 AC-7 / AC-12、§10、§11)。運用文書への前提追記を T1 に追加 | ユーザー裁定 | |
 | 2026-10-19 | v1.1 | T1 の実装で決めた細部を追記: `/change` の応答は `{id, change, claims, diff}`、diff は file ごとに `{path, status (added / changed / unchanged / redacted), reason, hunks[{header, lines}], omitted_lines}` (§5)。web の diff で hunk header も 1 行として数える (§2.7)。タブは空白 4 つにして表示 (§4.3)。展開上限を超えた項目の件数 `flatten_omitted` を params に載せる。pending 以外で配備ジャーナルが無い候補 (却下・失効など) の比較対象は `unknown` (§2.2) | T1 実装 | |
+| 2026-10-19 | v1.2 | 処理順を 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → escape → 表示上限 に訂正 (§2.2、§3.2、§4.3、§7.1)。redactor が検出の前に制御文字を除き、出力も除去済みの文字列から作る | NUL・ゼロ幅・孤立サロゲート・CR を値に挟むと検出を逃し、表示面の除去で伏せていない秘密が復元されることを実測 | |

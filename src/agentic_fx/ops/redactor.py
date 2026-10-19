@@ -4,8 +4,12 @@
 文字列・コメント、およびそれらから作る diff の全行) である。検出対象は絶対パス、URL・
 裸の hostname・IP、credential の代入、高エントロピーの token、口座らしい数字列。
 
-順序は 入力読み取り上限 → redaction → 表示形式の escape → 表示上限 とする。この部品は
-redaction だけを受け持ち、escape と表示上限は表示面が後から掛ける。
+順序は 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → 表示形式の escape → 表示上限
+とする。この部品は除去と redaction を受け持ち、escape と表示上限は表示面が後から掛ける。
+表示面は Cc・Cf・Cs を消すので、検出をその前に掛けると消えた後に繋がる秘密を取り逃がす。
+そのため検出は除去済みの文字列に掛け、出力も除去済みの文字列を基に作る。改行とタブは
+表示面が行の区切り・字下げとして扱うので残す (CR は表示面で改行に正規化されるが、
+単独の CR で語を割る回避を防ぐため除去する)。
 
 fail-closed: 1 値の大きさが redaction 対象上限を超えるときは、切らずに全文を伏せる
 (切ると token が境界で割れて検出を逃すため)。判定できないファイル (非 UTF-8、NUL を
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import Counter
 
 from .change_limits import (ACCOUNT_MIN_DIGITS, MAX_REDACT_VALUE_BYTES, REDACTED,
@@ -51,6 +56,8 @@ _TOKEN = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_=-]{%d,}(?![A-Za-z0-9+/_
                     % TOKEN_MIN_LENGTH)
 _ACCOUNT_RUN = re.compile(r"(?<![\w.])\d{%d,}(?![\w.])" % ACCOUNT_MIN_DIGITS)
 _ACCOUNT_GROUPS = re.compile(r"(?<![\w.])\d{2,12}(?:[- ]\d{2,12}){2,}(?![\w.])")
+_STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+_KEPT_CONTROLS = frozenset({"\n", "\t"})
 _PEM = re.compile(rb"-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE|PGP)[A-Z ]*-----")
 
 
@@ -85,8 +92,15 @@ def is_credential_key(key: str) -> bool:
     return _CRED_KEY.search(key) is not None
 
 
+def strip_controls(text: str) -> str:
+    """Cc・Cf・Cs (NUL・ゼロ幅・孤立サロゲートなど) を除く。改行とタブだけは残す。"""
+    return "".join(ch for ch in text
+                   if ch in _KEPT_CONTROLS or unicodedata.category(ch) not in _STRIPPED_CATEGORIES)
+
+
 def redact(text: str) -> str:
-    """検出した部分を ``[redacted]`` に置き換える。"""
+    """制御文字を除いた上で、検出した部分を ``[redacted]`` に置き換える。"""
+    text = strip_controls(text)
     text = _URL.sub(REDACTED, text)
     text = _BEARER.sub(REDACTED, text)
     text = _CRED.sub(lambda m: m.group(1) + REDACTED, text)
