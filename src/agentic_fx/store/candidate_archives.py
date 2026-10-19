@@ -182,9 +182,10 @@ def settle(conn: sqlite3.Connection, archive_id: int, outcome: str, *,
 def resolve(conn: sqlite3.Connection, payload: Any) -> int | None:
     """承認 payload から台帳の行 id を引く。
 
-    (1) `candidate_archive_id` (存在する行のみ)、(2) `(mission_id,
-    artifact_hash)` の完全一致、(3) `(mission_id, content_hash)` で
-    ちょうど 1 行のときだけ採用。曖昧な行を結ばない。"""
+    (1) `candidate_archive_id` が有効な整数ならそれが正で、行が無ければ
+    None (別の行へ結ばない)。id を持たない旧 payload だけ、(2) `(mission_id,
+    artifact_hash)` の完全一致、(3) `(mission_id, content_hash)` でちょうど
+    1 行のときに限り採用する。曖昧な行を結ばない。"""
     if not isinstance(payload, dict):
         return None
     candidate_id = payload.get("candidate_archive_id")
@@ -192,8 +193,7 @@ def resolve(conn: sqlite3.Connection, payload: Any) -> int | None:
         row = conn.execute(
             "SELECT id FROM candidate_archives WHERE id=?",
             (candidate_id,)).fetchone()
-        if row is not None:
-            return row["id"]
+        return None if row is None else row["id"]
     mission_id = payload.get("mission_id")
     if not isinstance(mission_id, int) or isinstance(mission_id, bool):
         return None

@@ -241,3 +241,50 @@ def test_ac21_commit_false_failure_does_not_commit_for_caller(tmp_path,
     assert _outcome(conn, archive_id) == "approved"  # 呼び出し元の rollback で戻る
     assert conn.execute("SELECT COUNT(*) FROM approval_requests WHERE "
                         "status='rejected'").fetchone()[0] == 0
+
+
+# --- 参照先の行が消えた承認 -------------------------------------------------
+
+def _dangling_world(conn, *, status):
+    """提出行 (消す) と、同じ artifact / content を持つ旧い行 (pending)。"""
+    older = _row(conn, artifact="A1", content="C1")
+    archives.settle(conn, older, "pending", commit=True)
+    submitted = _row(conn, artifact="A-final", content="C1")
+    approval_id = approvals.create(
+        conn, kind="plugin", payload={
+            "name": "rsi_v2", "content_hash": "C1", "artifact_hash": "A1",
+            "mission_id": 3, "candidate_archive_id": submitted},
+        now=NOW, commit=True)
+    conn.execute("DELETE FROM candidate_archives WHERE id=?", (submitted,))
+    conn.commit()
+    return older, approval_id
+
+
+def test_ac15_deleted_submitted_row_does_not_fall_back_to_another_row(
+        tmp_path, caplog):
+    conn = _db(tmp_path)
+    older, approval_id = _dangling_world(conn, status="pending")
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.store.approvals"):
+        approvals.apply_decision(conn, approval_id, "approved", decided_by="t",
+                                 now=NOW)
+    assert conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                        (approval_id,)).fetchone()[0] == "approved"
+    assert _outcome(conn, older) == "pending"
+    assert any("no candidate archive row" in r.message for r in caplog.records)
+
+
+def test_ac21_deleted_submitted_row_does_not_revoke_another_row(
+        tmp_path, caplog):
+    conn = _db(tmp_path)
+    older, approval_id = _dangling_world(conn, status="pending")
+    approvals.apply_decision(conn, approval_id, "approved", decided_by="t",
+                             now=NOW)
+    conn.execute("UPDATE candidate_archives SET outcome_class='approved' "
+                 "WHERE id=?", (older,))
+    conn.commit()
+    with caplog.at_level(logging.WARNING, logger="agentic_fx.store.approvals"):
+        revoke_id = approvals.append_revocation(
+            conn, "rsi_v2", "C1", now=NOW + timedelta(hours=1))
+    assert revoke_id is not None
+    assert _outcome(conn, older) == "approved"
+    assert any("no candidate archive row" in r.message for r in caplog.records)

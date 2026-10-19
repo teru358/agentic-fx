@@ -189,19 +189,36 @@ def test_ac14_outcome_class_writers_are_pinned_by_scan():
         if path.name == "candidate_archives.py":
             continue
         text = path.read_text(encoding="utf-8")
-        if not re.search(r"candidate_archives(_mod|_store)?\.settle\(|"
-                         r"archives_mod\.settle\(", text):
+        if not re.search(r"\barchives\w*\.settle\(", text):
             continue
         spans = _function_spans(path)
         for number, line in enumerate(text.splitlines(), 1):
-            if re.search(r"\.settle\(", line) and "archives" in line:
+            if re.search(r"\barchives\w*\.settle\(", line):
                 owner = min((s for s in spans if s[0] <= number <= s[1]),
                             key=lambda s: s[1] - s[0])[2]
                 callers.add((path.relative_to(SRC).as_posix(), owner))
-    assert {c[1] for c in callers} <= {
-        "_settle_archive", "_settle_candidate_in_tx"}
-    assert {c[0] for c in callers} <= {
-        "store/approvals.py", "loops/improve_loop.py"}
+    assert {c for c in callers} == {
+        ("store/approvals.py", "_settle_archive"),
+        ("loops/improve_loop.py", "_settle_candidate_in_tx"),
+        ("loops/improve_loop.py", "_finalize_success"),
+    }
+
+
+def test_ac14_settle_archive_callers_are_the_two_decision_operations():
+    path = SRC / "store" / "approvals.py"
+    spans = _function_spans(path)
+    owners: set[str] = set()
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if "_settle_archive(" in line and "def _settle_archive" not in line:
+            owners.add(min((s for s in spans if s[0] <= number <= s[1]),
+                           key=lambda s: s[1] - s[0])[2])
+    assert owners == {"apply_decision", "append_revocation"}
+
+
+def test_approvals_defines_each_function_once():
+    tree = ast.parse((SRC / "store" / "approvals.py").read_text(encoding="utf-8"))
+    names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+    assert len(names) == len(set(names))
 
 
 # --- pair NULL / schema ----------------------------------------------------
@@ -404,6 +421,9 @@ def test_resolve_priority_and_ambiguity(tmp_path):
     assert archives.resolve(conn, {"mission_id": 3, "artifact_hash": "zz",
                                    "content_hash": "c"}) is None
     assert archives.resolve(conn, {"candidate_archive_id": 999}) is None
+    # id を持つ payload は id が正。行が消えていても hash で別行へ結ばない
+    assert archives.resolve(conn, {"candidate_archive_id": 999, "mission_id": 3,
+                                   "artifact_hash": "a1"}) is None
     assert archives.resolve(conn, None) is None
 
 

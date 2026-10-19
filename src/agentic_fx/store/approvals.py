@@ -78,10 +78,6 @@ def latest_decision_status(conn: sqlite3.Connection, name: str,
     return None if row is None else row["status"]
 
 
-def append_revocation(conn: sqlite3.Connection, name: str, content_hash: str, *,
-                      now: datetime, actor: str = "human_cli",
-                      commit: bool = True) -> int | None:
-    """Append the rejection that revokes the latest approval for an identity."""
 def _identity_decisions(conn: sqlite3.Connection, name: str,
                         content_hash: str) -> list[tuple[sqlite3.Row, dict, datetime]]:
     candidates: list[tuple[sqlite3.Row, dict, datetime]] = []
