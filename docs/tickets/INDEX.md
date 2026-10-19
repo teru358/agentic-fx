@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 151 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -39,7 +39,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (129)
+## 設計待ち (130)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -143,6 +143,7 @@
 | [disable-dependent-change-error-notice](open/disable-dependent-change-error-notice.md) | 低 | 2026-10-18 | disable 後に依存 strategy が解決不能になる旨の表示が無い |
 | [plugin-lock-wait-notice-on-wait-argument](open/plugin-lock-wait-notice-on-wait-argument.md) | 低 | 2026-10-18 | plugin lock の待機通知を on_wait 引数に置き換える |
 | [rollback-foreign-temp-link-sweep](open/rollback-foreign-temp-link-sweep.md) | 低 | 2026-10-18 | foreign で終端した rollback の temp symlink を sweep の対象にする |
+| [isolated-worker-probe-lacks-bless](open/isolated-worker-probe-lacks-bless.md) | 低 | 2026-10-19 | 実隔離 worker の deploy 境界 probe に plugin bless が無い |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backlog-dup](open/backlog-dup.md) | 低 |  | backlog に実質同じ案が重複して溜まる |
