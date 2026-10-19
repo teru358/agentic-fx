@@ -1,7 +1,7 @@
 ---
 id: bot-event-notices-are-raw-log-lines
 title: bot の通知が event の k=v 行そのままで人が読めない
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-17
 closed: null
@@ -9,7 +9,7 @@ related: [approval-notice-lacks-change-content, ops-bot-display-residuals]
 ---
 # [bot-event-notices-are-raw-log-lines] bot の通知が event の k=v 行そのままで人が読めない
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -30,3 +30,4 @@ afx-ops gate/render.py render_event が『allowlist 検証を通った code と 
 - 2026-10-17: 起票。
 - 2026-10-17: ユーザー裁定 — 改善通知は週 1 発火なので急がない (優先 中のまま)。plugin deploy ops (T2〜T8) の後に 2 件同じ束で設計 (C0 → sol → 承認)。
 - 2026-10-17 22:49: ユーザー裁定 — 道筋 2 番目 (pdo 完走の直後)。Discord は要約、diff 全文は既存の読み取り専用 web に 1 ページ足す形で、2 チケット同じ束で C0。
+- 2026-10-19: 状態: 実装待ち — 設計 docs/superpowers/specs/2026-10-19-approval-content-design.md v1.0 の T3 (event 通知、名前なし) として実装する。T1/T2 と独立

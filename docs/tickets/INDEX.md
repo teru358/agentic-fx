@@ -3,18 +3,20 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 151 件。完了分は closed/。
 
-## 実装中 (1)
+## 実装中 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
+| [approval-notice-lacks-change-content](open/approval-notice-lacks-change-content.md) | 中 | 2026-10-17 | 改善承認の通知に変更内容が無い (何がどう変わるか読めない) |
 
-## 実装待ち (12)
+## 実装待ち (13)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
+| [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -39,7 +41,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (130)
+## 設計待ち (128)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -75,8 +77,6 @@
 | [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
 | [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
-| [approval-notice-lacks-change-content](open/approval-notice-lacks-change-content.md) | 中 | 2026-10-17 | 改善承認の通知に変更内容が無い (何がどう変わるか読めない) |
-| [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
 | [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
 | [deploy-cli-config-error-traceback](open/deploy-cli-config-error-traceback.md) | 中 | 2026-10-18 | afx の subcommand は設定不在・不正 YAML で traceback を出す |
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
