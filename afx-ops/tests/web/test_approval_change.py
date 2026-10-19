@@ -432,3 +432,42 @@ def test_the_displayed_constants_mirror_the_daemon_definitions():
     block = source.split("CLASS_LABELS = {")[1].split("}")[0]
     assert re.findall(r'"([^"]+)"', block) == [render.CLASS_LABELS[k] for k in
                                                ("new", "updated", "same", "unknown")]
+
+
+# ---------------------------------------------------------------- 配分の一回化と型の防御
+
+def test_page_plans_the_diff_exactly_once(monkeypatch):
+    calls = []
+    original = render.plan_diff
+
+    def counting(diff):
+        calls.append(1)
+        return original(diff)
+
+    monkeypatch.setattr(render, "plan_diff", counting)
+    built = compose(make_change_data())
+    assert len(calls) == 1
+    assert len(built.plans) == 3
+
+
+@pytest.mark.parametrize("field,value", [("classification", []), ("classification", {}),
+                                         ("reason", {}), ("reason", []),
+                                         ("params", {"items": "x"}), ("params", [])])
+def test_malformed_change_fields_degrade_to_one_fixed_line(field, value):
+    change = make_change(**{field: value})
+    body = page_of(Client(change_data=make_change_data(change=change))).decode()
+    assert render.INVALID_CHANGE_TEXT in body
+    assert "変更 diff" not in body
+
+
+def test_malformed_summary_in_detail_is_ignored_when_the_change_endpoint_is_valid():
+    detail = dict(DETAIL, change={"classification": []})
+    text = page_of(Client(detail=detail, change_data=make_change_data())).decode()
+    assert render.INVALID_CHANGE_TEXT not in text and "変更 diff" in text
+
+
+def test_a_degraded_diff_file_says_the_computation_was_skipped():
+    entry = file_entry("plugin.py", ["-a", "+b"])
+    entry["diff_degraded"] = "too_many_lines"
+    text = render.compose_approval_page(DETAIL, make_change(), make_change_data([entry])).page.decode()
+    assert render.DIFF_DEGRADED_TEXT in text

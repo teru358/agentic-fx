@@ -161,6 +161,17 @@ def render_approvals(data: Mapping[str, object]) -> bytes:
     return _page("Pending approvals", body)
 
 
+def _change_is_well_formed(change: Mapping[str, object]) -> bool:
+    """daemon の応答が約束の型か。外れた応答 (版の食い違い・不具合) はページごと固定文に倒す。"""
+    classification, reason = change.get("classification"), change.get("reason")
+    if type(classification) is not str or (reason is not None and type(reason) is not str):
+        return False
+    params = change.get("params")
+    if params is None:
+        return True
+    return type(params) is dict and type(params.get("items", [])) is list
+
+
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
     """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
     change = data.get("change") if type(data.get("change")) is dict else None
@@ -170,7 +181,12 @@ def render_approval(data: Mapping[str, object], change_data: Mapping[str, object
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
                 + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>")
         return _page("Approval", body)
-    return compose_approval_page(data, change, change_data if type(change_data) is dict else None).page
+    if not _change_is_well_formed(change):
+        body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
+                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>")
+        return _page("Approval", body)
+    return compose_approval_page(
+        data, change, change_data if type(change_data) is dict else None).page
 
 
 # ---------------------------------------------------------------- 承認の変更内容
@@ -184,6 +200,8 @@ REASON_TEXT = {
     "unsafe_source": "内容を検証できません",
     "redacted": "機微情報の可能性があるためローカルで確認してください",
 }
+INVALID_CHANGE_TEXT = "変更内容を表示できません"
+DIFF_DEGRADED_TEXT = "差分の計算を省略 (行数が多いため)"
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _DIFF_FILES = ("plugin.py", "config.yaml", "test_plugin.py")
@@ -380,6 +398,8 @@ class FilePlan:
         self.head = f"<h3>{html.escape(self.path)}</h3>"
         self.tail = ""
         if self.kind == "pre":
+            if entry.get("diff_degraded") == "too_many_lines":
+                self.head += "<p>" + DIFF_DEGRADED_TEXT + "</p>"
             self.head += "<pre>"
             self.tail = "</pre>"
         elif self.kind == "unchanged":
@@ -437,10 +457,10 @@ def plan_diff(diff: object) -> list[FilePlan]:
     return plans
 
 
-def _diff_section(diff: object) -> tuple[str, int]:
+def _diff_section(diff: object) -> tuple[str, int, list[FilePlan]]:
     plans = plan_diff(diff)
     body = "".join(plan.html for plan in plans)
-    return body, _bytes(body)
+    return body, _bytes(body), plans
 
 
 class ApprovalPage:
@@ -462,8 +482,7 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     summary = claims.get("summary", change.get("summary"))
     rationale = claims.get("selection_rationale")
     if change_data is not None and "diff" in change_data:
-        diff_body, diff_bytes = _diff_section(change_data.get("diff"))
-        plans = plan_diff(change_data.get("diff"))
+        diff_body, diff_bytes, plans = _diff_section(change_data.get("diff"))
     else:
         diff_body = "<p>" + REASON_TEXT["unavailable"] + "</p>"
         diff_bytes, plans = _bytes(diff_body), []

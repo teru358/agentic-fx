@@ -171,7 +171,8 @@ def _invoke(match: RouteMatch, query: dict[str, str], client):
         if query:
             raise _Reject(400)
         reply = client.approval(match.values["id"])
-        return reply, functools.partial(render.render_approval, change_data=_change_of(client, match.values["id"], reply))
+        change_data = _change_of(client, match.values["id"], reply)
+        return reply, functools.partial(render.render_approval, change_data=change_data)
     if method == "log":
         return client.log(n=_positive(query, "n", maximum=500, default=100)), render.render_log
     if method == "activity":
