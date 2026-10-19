@@ -1,6 +1,6 @@
-# [ops-api] 操作 API と client 契約設計 v1.18
+# [ops-api] 操作 API と client 契約設計 v1.19
 
-版: v1.18
+版: v1.19
 
 日付: 2026-10-05
 
@@ -112,7 +112,7 @@ server が鍵から確定した主体を `authenticated_principal`、外部主�
 
 ### 3.3 承認の表示と決定
 
-承認詳細は既存の `approval_facts` が保存した `parent_facts` と `agent_claims` を分離して表示する。親が受理・計測・状態遷移として記録した値だけを判断材料の親欄に置き、agent の自由文を事実扱いしない。全表示文字列は既存 sanitizer で Cc / Cf を除去し、1 行化と長さ上限を適用する。
+承認詳細は既存の `approval_facts` が保存した `parent_facts` と `agent_claims` を分離して表示する。親が受理・計測・状態遷移として記録した値だけを判断材料の親欄に置き、agent の自由文を事実扱いしない。申告 (`agent_claims` の `summary` / `selection_rationale`) は「agent の申告 (未検証)」の見出しを分けて表示し、事実欄 (成績・差分) と混ぜない。全表示文字列は既存 sanitizer で Cc / Cf を除去し、1 行化と長さ上限を適用する。
 
 approve と retry は表示した `payload_json` の SHA-256 を必須とし、受理時と plugin flock 内の再読時に照合する。決定は `kind='plugin'` に限り、未知 kind と `live_trade` は受理時と job 実行時の両方で fail closed にする。`decided_by` は server が `authenticated_principal` から生成する。`ops-bot` の決定作成は有効な `X-Afx-Asserted-Actor` を必須とし、その actor を監査行と job 所有へ保存する。
 
@@ -156,12 +156,13 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |18|`policy add <text>`|`POST /v1/policy`|operate|冪等 key。既存 `directives_path(root)` 配線を ops 層で再利用|
 |19|`stop`|**廃止: endpoint に載せない**|—|systemd の SIGTERM を使う|
 |-|`help`|client 内|—|server へ送らない|
+|新|—|`GET /v1/approvals/{id}/change`|`approvals.detail`|承認の変更内容。3 ファイルの構造化 diff (redaction 済み・escape なし・応答上限 512 KiB)、変更要約、申告。web だけが読み、bot は呼ばない。内容が取れないときは 200 で固定 reason code。計算は読み出し時で、どこにも保存しない (承認の中身を見せる設計 §5)|
 |新|—|`GET /v1/whoami`|`status.read`|`authenticated_principal`、`asserted_actor`、scopes|
 |新|—|`GET /v1/jobs/{id}`|`jobs.own`|所有者の組が一致する job の状態と結果。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`POST /v1/jobs/{id}/cancel`|`jobs.own`|所有者の組が一致する queued だけ cancelled、running は 409。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`GET /v1/events?after=&limit=`|`events.read`|DB cursor 後の通知用投影。limit 1〜500、長い待受はしない|
 
-実装する endpoint は 24 本で、内訳は変更系 15 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy、jobs cancel) と読取 9 本 (status、log、activity、approval 詳細、approval 一覧、reflection 試行記録、whoami、job get、events) である。このうち冪等 key 必須は 5 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
+実装する endpoint は 25 本で、内訳は変更系 15 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy、jobs cancel) と読取 10 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、reflection 試行記録、whoami、job get、events) である。このうち冪等 key 必須は 5 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
 
 ### 4.3 event 契約
 
@@ -302,7 +303,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 
 |ID|観測できる条件|
 |---|---|
-|AC-1|実 UDS で 24 endpoint を全数実行し、期待する HTTP / error code を得る|
+|AC-1|実 UDS で 25 endpoint を全数実行し、期待する HTTP / error code を得る|
 |AC-2|鍵なし / 不一致は 401、operator の decide / local_guard は 403、approver は成功する|
 |AC-3|service 子 process は正しい鍵でも本文読取前に 403、activity と notifier に記録。二重 fork は既知の限界として通る再現 test を持つ|
 |AC-3b|接続直後に peer が exit し pidfd が `Pid:-1`、または pid 不一致なら 403|
@@ -437,3 +438,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-13|v1.16|status の `setup` 固定 schema、fail-soft の `unknown`、非開示不変条件、client 前方互換、受入条件を追加|first-run の未完手順を status.read のまま安全に提供するため||
 |2026-10-14|v1.17|§1.2 の `api.enabled` 既定を true に改訂 (seccomp 投入待ちの規範を撤回、2026-10-12 裁定 P16 / 段 8)|first-run T8 で example / ApiSettings / 運用文書の既定を true にしたため正本を揃えた||
 |2026-10-15|v1.18|I-36 に status.setup の固定 code を列挙 (`improve_isolation_unavailable` を追加。実装の `_STATUS_SETUP_CODES` と一致させる)|first-run fr-fix1 で新 code を足したため正本に列挙を置いた||
+|2026-10-19|v1.19|§3.3 に申告の見出し分離を追記し、`GET /v1/approvals/{id}/change` を足した (endpoint 25 本)。`approval_detail` に `change` 要約を足す|承認の中身を見せる設計 v1.0 (T1)|
