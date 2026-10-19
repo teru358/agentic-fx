@@ -76,6 +76,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("log", "GET /v1/log", Scope.LOGS_READ, False),
     Endpoint("activity", "GET /v1/activity", Scope.LOGS_READ, False),
     Endpoint("approval_detail", "GET /v1/approvals/{id}", Scope.APPROVALS_DETAIL, False),
+    Endpoint("approval_change", "GET /v1/approvals/{id}/change", Scope.APPROVALS_DETAIL, False),
     Endpoint("approval_list", "GET /v1/approvals", Scope.APPROVALS_LIST, False),
     Endpoint("reflection_status", "GET /v1/reflections/{order_id}", Scope.STATUS_READ, False),
     Endpoint("whoami", "GET /v1/whoami", Scope.STATUS_READ, False),
@@ -580,6 +581,7 @@ class OpsService:
             row = self._conn.execute(
                 "SELECT kind,status,payload_json,reason,decided_by,decided_at "
                 "FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
+            journals = self._decided_journals(approval_id)
         if row is None:
             raise OpsError(ErrorCode.NOT_FOUND)
         from agentic_fx.loops import approval_facts
@@ -591,8 +593,10 @@ class OpsService:
             payload = None
         if not isinstance(payload, dict):
             raise OpsError(ErrorCode.INVALID_STATE)
+        change = self._change_of(approval_id, row["status"], payload, journals,
+                                 include_diff=False).summary
         return {"id": approval_id, "kind": display_text(row["kind"]),
-                "status": row["status"],
+                "status": row["status"], "change": change,
                 "parent_facts": payload.get("parent_facts"),
                 "agent_claims": payload.get("agent_claims"),
                 "facts_lines": approval_facts.render_facts_lines(payload),
@@ -602,6 +606,51 @@ class OpsService:
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
                 "decided_by": row["decided_by"], "decided_at": row["decided_at"],
                 "asserted_actor": None}
+
+    def _decided_journals(self, approval_id: int) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT op_id,old_kind,old_target,phase FROM plugin_switch_journal "
+            "WHERE approval_id=? AND phase='decided' ORDER BY op_id",
+            (approval_id,)).fetchall()]
+
+    def _change_of(self, approval_id: int, status: str, payload: dict,
+                   journals: list[dict], *, include_diff: bool):
+        """変更要約は読み出しのたびに計算し、どこにも保存しない。失敗は固定の reason code に
+        落とし、例外の本文・path をログにも応答にも出さない。"""
+        from . import change as change_mod
+        from .change_limits import UNSAFE_SOURCE
+        now = self._wall_clock().isoformat()
+        try:
+            return change_mod.compute_change(
+                status=status, payload=payload, journal_rows=journals,
+                plugins_root=self._plugins_root, now=now, include_diff=include_diff)
+        except Exception:  # noqa: BLE001 — 本文を出さず固定 code にする
+            _log.error("approval change computation failed")
+            summary = change_mod.failure_summary(payload, now, UNSAFE_SOURCE)
+            diff = {"files": [], "omitted_lines": 0} if include_diff else None
+            return change_mod.ChangeResult(summary, diff)
+
+    def approval_change(self, principal: Caller, approval_id: int, *,
+                        deadline: float | None = None) -> dict:
+        _authorize(principal, "approval_change")
+        with self._ops_lane(self._deadline(deadline)):
+            row = self._conn.execute(
+                "SELECT status,payload_json FROM approval_requests WHERE id=?",
+                (approval_id,)).fetchone()
+            journals = self._decided_journals(approval_id)
+        if row is None:
+            raise OpsError(ErrorCode.NOT_FOUND)
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, RecursionError):
+            payload = None
+        if not isinstance(payload, dict):
+            raise OpsError(ErrorCode.INVALID_STATE)
+        from . import change as change_mod
+        result = self._change_of(approval_id, row["status"], payload, journals,
+                                 include_diff=True)
+        return {"id": approval_id, "change": result.summary,
+                "claims": change_mod.claims_of(payload), "diff": result.diff}
 
     def events_after(self, principal: Caller, *, after: int, limit: int,
                      deadline: float | None = None) -> dict:
