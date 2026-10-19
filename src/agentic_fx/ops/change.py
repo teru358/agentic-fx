@@ -282,44 +282,54 @@ def _file_diff(path: str, old: bytes | None, new: bytes) -> dict:
             "hunks": hunks, "omitted_lines": 0}
 
 
-def _item_bytes(text: str) -> int:
-    return len(text.encode("utf-8", "surrogatepass")) + 1
+def _serialized_bytes(response: dict) -> int:
+    """応答全体を JSON にした byte 数。非 ASCII を ``\\uXXXX`` に escape する側 (最大 6 倍)
+    で数えるので、実際の送出形式がどちらでも上限を超えない。"""
+    return len(json.dumps(response).encode())
 
 
-def apply_diff_budget(files: list[dict], budget: int = L.API_DIFF_BYTES) -> int:
-    """全ファイルの hunk を先頭から数え、budget を超える行を末尾から省略して件数を載せる。
-    省略した行の合計を返す。"""
-    used = 0
-    exhausted = False
-    total_omitted = 0
-    for entry in files:
-        kept: list[dict] = []
-        omitted = 0
-        for hunk in entry["hunks"]:
-            if exhausted:
-                omitted += len(hunk["lines"])
-                continue
-            cost = _item_bytes(hunk["header"])
-            if used + cost > budget:
-                exhausted = True
-                omitted += len(hunk["lines"])
-                continue
-            used += cost
-            lines: list[str] = []
-            for index, line in enumerate(hunk["lines"]):
-                cost = _item_bytes(line)
-                if used + cost > budget:
-                    exhausted = True
-                    omitted += len(hunk["lines"]) - index
-                    break
-                used += cost
-                lines.append(line)
-            if lines or not hunk["lines"]:
-                kept.append({"header": hunk["header"], "lines": lines})
-        entry["hunks"] = kept
-        entry["omitted_lines"] = omitted
-        total_omitted += omitted
-    return total_omitted
+def fit_response_to_bytes(response: dict, limit: int | None = None) -> int:
+    """応答全体の JSON byte 数が ``limit`` 以下になるよう、diff の末尾の行を省略して
+    ``omitted_lines`` に載せる。残す行数を、応答全体を実際に直列化した大きさで二分探索して
+    決める (構造の overhead と escape の増幅を見積もらない)。省略した行の合計を返す。"""
+    limit = L.API_DIFF_BYTES if limit is None else limit
+    diff = response["diff"]
+    originals = [(entry, entry["hunks"]) for entry in diff["files"]]
+    total = sum(1 + len(hunk["lines"]) for _, hunks in originals for hunk in hunks)
+
+    def apply(keep: int) -> int:
+        omitted_total = 0
+        for entry, hunks in originals:
+            kept: list[dict] = []
+            omitted = 0
+            for hunk in hunks:
+                lines = hunk["lines"]
+                if keep <= 0:
+                    omitted += len(lines)
+                    continue
+                keep -= 1
+                shown = min(keep, len(lines))
+                keep -= shown
+                omitted += len(lines) - shown
+                if shown or not lines:
+                    kept.append({"header": hunk["header"], "lines": lines[:shown]})
+            entry["hunks"] = kept
+            entry["omitted_lines"] = omitted
+            omitted_total += omitted
+        diff["omitted_lines"] = omitted_total
+        return omitted_total
+
+    if apply(total) == 0 and _serialized_bytes(response) <= limit:
+        return 0
+    low, high = 0, total
+    while low < high:
+        middle = (low + high + 1) // 2
+        apply(middle)
+        if _serialized_bytes(response) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return apply(low)
 
 
 # ---------------------------------------------------------------- 成績と申告
@@ -432,5 +442,4 @@ def compute_change(*, status: str, payload: dict, journal_rows: list[dict],
                 diff["files"].append(_file_diff(
                     path, getattr(old, attr) if old is not None else None,
                     getattr(candidate, attr)))
-            diff["omitted_lines"] = apply_diff_budget(diff["files"])
     return ChangeResult(summary, diff)

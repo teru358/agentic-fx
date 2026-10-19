@@ -95,3 +95,13 @@ def test_web_never_shows_the_evasion(ops_env, case):
                                   "# \u30b3\u30e1\u30f3\u30c8 period: 14"])
 def test_plain_non_ascii_labels_are_not_over_redacted(text):
     assert R.redact_value(text) == text
+
+
+@pytest.mark.parametrize("unit", ["日", "a日", "日.", "日=", "日/", "%41",
+                                  "а_", "xа://"])
+def test_redaction_time_stays_linear_on_a_value_at_the_target_limit(unit):
+    import time
+    value = unit * (L.MAX_REDACT_VALUE_BYTES // len(unit.encode()))
+    start = time.perf_counter()
+    R.redact_value(value)
+    assert time.perf_counter() - start < 2.0

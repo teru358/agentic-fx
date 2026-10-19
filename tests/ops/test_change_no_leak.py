@@ -119,8 +119,10 @@ def test_ac16_generated_improve_prompt_carries_no_change_summary_or_claims(ops_e
 
     approval_id, _, c = _scenario(ops_env, "ac16")
     service = ops_env.service()
-    service.approval_change(OPERATOR, approval_id)
-    service.approval_detail(OPERATOR, approval_id)
+    shown = json.dumps(service.approval_change(OPERATOR, approval_id)) \
+        + json.dumps(service.approval_detail(OPERATOR, approval_id))
+    for name in ("plugin", "config", "summary", "rationale", "metric"):
+        assert c[name] in shown, name  # 表示側に実在するので、下の非流入が意味を持つ
     ctx_data = build_improve_context(
         ops_env.conn, settings=ops_env.settings, now=datetime(2026, 10, 5),
         root=ops_env.root, allowed_backlog_ids=None, inventory_view={"plugins": []})

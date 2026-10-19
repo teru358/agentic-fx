@@ -545,30 +545,29 @@ def test_ac14_new_candidate_is_all_added_lines(ops_env):
     assert files["plugin.py"]["hunks"][0]["header"] == f"@@ -0,0 +1,{len(lines)} @@"
 
 
-def _counted(files):
-    return sum(len(h["header"].encode()) + 1 + sum(len(x.encode()) + 1 for x in h["lines"])
-               for f in files for h in f["hunks"])
+def _size(body):
+    return len(json.dumps(body).encode())
 
 
-def _fake_files(sizes):
+def _fake_response(sizes):
     files = []
     for index, size in enumerate(sizes):
         files.append({"path": f"f{index}", "status": "added", "reason": None,
                       "hunks": [{"header": "@@ -0,0 +1,3 @@",
                                  "lines": ["+" + "a" * size for _ in range(3)]}],
                       "omitted_lines": 0})
-    return files
+    return {"id": 1, "change": {}, "claims": {}, "diff": {"files": files, "omitted_lines": 0}}
 
 
 @pytest.mark.parametrize("delta", [-1, 0, 1])
 def test_ac14_api_diff_budget_boundary_is_applied_by_line(delta):
-    files = _fake_files([100, 100, 100])
-    full = _counted(files)
-    budget = full + delta
-    omitted = change_mod.apply_diff_budget(files, budget)
-    assert _counted(files) <= budget
+    response = _fake_response([100, 100, 100])
+    full = _size(response)
+    omitted = change_mod.fit_response_to_bytes(response, full + delta)
+    assert _size(response) <= full + delta
+    files = response["diff"]["files"]
     if delta >= 0:
-        assert omitted == 0 and _counted(files) == full
+        assert omitted == 0 and _size(response) == full
     else:
         assert omitted == 1
         assert files[-1]["omitted_lines"] == 1 and len(files[-1]["hunks"][0]["lines"]) == 2
@@ -580,11 +579,36 @@ def test_ac14_api_diff_budget_uses_the_512_kib_constant_end_to_end(ops_env):
     digest = make_staging(ops_env.plugins_root, 7, NAME, plugin_py=big, config=big, test=big)
     approval_id = insert_approval(ops_env, approval_payload(NAME, digest=digest))
     body = _change(ops_env, approval_id)
-    assert _counted(body["diff"]["files"]) <= L.API_DIFF_BYTES
+    assert _size(body) <= L.API_DIFF_BYTES
     assert body["diff"]["omitted_lines"] > 0
     assert sum(f["omitted_lines"] for f in body["diff"]["files"]) == body["diff"]["omitted_lines"]
     first = body["diff"]["files"][0]
     assert first["omitted_lines"] == 0 and body["diff"]["files"][-1]["omitted_lines"] > 0
+
+
+@pytest.mark.parametrize("char", ["\u65e5", "\U0001f600", "\x01", '"', "\\"])
+def test_ac14_whole_response_stays_within_the_limit_for_escape_heavy_content(ops_env, char):
+    body = ("# " + char * 600 + "\n") * 100  # 1 行ごとに JSON で最大約 6 倍に増える
+    digest = make_staging(ops_env.plugins_root, 7, NAME, plugin_py=body,
+                          config=CONFIG, test=TEST_PY)
+    approval_id = insert_approval(ops_env, approval_payload(NAME, digest=digest))
+    result = _change(ops_env, approval_id)
+    assert _size(result) <= L.API_DIFF_BYTES
+
+
+def test_ac14_whole_response_boundary_is_exact_at_the_limit(ops_env, monkeypatch):
+    text = "".join(f"# \u65e5\u672c{i} line\n" for i in range(40))
+    digest = make_staging(ops_env.plugins_root, 7, NAME, plugin_py=text,
+                          config=CONFIG, test=TEST_PY)
+    approval_id = insert_approval(ops_env, approval_payload(NAME, digest=digest))
+    monkeypatch.setattr(L, "API_DIFF_BYTES", 10 ** 7)
+    full = _size(_change(ops_env, approval_id))
+    assert _change(ops_env, approval_id)["diff"]["omitted_lines"] == 0
+    for delta, omitted in ((1, False), (0, False), (-1, True)):
+        monkeypatch.setattr(L, "API_DIFF_BYTES", full + delta)
+        body = _change(ops_env, approval_id)
+        assert _size(body) <= full + delta
+        assert (body["diff"]["omitted_lines"] > 0) is omitted
 
 
 # ---------------------------------------------------------------- AC-22a / 23a (API)

@@ -63,13 +63,13 @@ _ACCOUNT_GROUPS = re.compile(r"(?<![\w.])\d{2,12}(?:[- ]\d{2,12}){2,}(?![\w.])")
 _STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _KEPT_CONTROLS = frozenset({"\n", "\t"})
 _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
-_NON_ASCII_SCHEME = re.compile(r"[^\s/]*[^\x00-\x7f][^\s/]*://")
+_SCHEME_TOKEN = re.compile(r"(?<![^\s/])([^\s/]+)://")
 _UNI_HOST = re.compile(
     r"(?i)(?<![\w.-])(?:[\w-]+\.)+"
     r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
     r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
     r"corp|intranet|test|example|invalid)(?![\w-])")
-_NON_ASCII_KEY = re.compile(r"([\w.-]*[^\x00-\x7f][\w.-]*)[\"']?\s*[:=]")
+_KEY_TOKEN = re.compile(r"(?<![\w.-])([\w.-]+)[\"']?\s*[:=]")
 _CRED_WORDS = tuple(sorted({
     first + sep + second
     for first, second in (("api", "key"), ("access", "key"), ("secret", "key"),
@@ -140,11 +140,12 @@ def _fuzzy_credential_key(key: str) -> bool:
 def _non_ascii_residue(text: str) -> bool:
     """正規化後も ASCII 外の文字が、credential の key・URL の scheme・hostname の位置に
     残っているか (検出は ASCII 前提なので、残れば伏せる側に倒す)。"""
-    if _NON_ASCII_SCHEME.search(text) is not None:
+    if any(not match.group(1).isascii() for match in _SCHEME_TOKEN.finditer(text)):
         return True
     if any(not match.group(0).isascii() for match in _UNI_HOST.finditer(text)):
         return True
-    return any(_fuzzy_credential_key(match.group(1)) for match in _NON_ASCII_KEY.finditer(text))
+    return any(not match.group(1).isascii() and _fuzzy_credential_key(match.group(1))
+               for match in _KEY_TOKEN.finditer(text))
 
 
 def _scan(text: str) -> str:

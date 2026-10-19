@@ -2,6 +2,7 @@
 派生物を plugins 配下に置かないこと、CLI の表示上限。"""
 from __future__ import annotations
 
+import json
 import os
 
 import pytest
@@ -15,7 +16,6 @@ from ._change_fixtures import (approval_payload, insert_approval, make_live, mak
 from .conftest import OPERATOR
 
 HEADER = "@@ -1 +1 @@"
-HEADER_COST = len(HEADER) + 1
 
 
 def _entry(*hunks):
@@ -24,28 +24,48 @@ def _entry(*hunks):
             "omitted_lines": 0}
 
 
-@pytest.mark.parametrize("budget, kept", [(HEADER_COST - 1, 0), (HEADER_COST, 1)])
-def test_diff_budget_counts_a_hunk_header_at_its_exact_size(budget, kept):
-    entry = _entry([])
-    C.apply_diff_budget([entry], budget)
-    assert len(entry["hunks"]) == kept
+def _response(*entries):
+    return {"id": 1, "change": {}, "claims": {},
+            "diff": {"files": list(entries), "omitted_lines": 0}}
 
 
-@pytest.mark.parametrize("budget, kept", [(2 * HEADER_COST - 1, 1), (2 * HEADER_COST, 2)])
-def test_diff_budget_carries_header_cost_from_one_hunk_to_the_next(budget, kept):
-    entry = _entry([], [])
-    C.apply_diff_budget([entry], budget)
-    assert len(entry["hunks"]) == kept
+def _size(response):
+    return len(json.dumps(response).encode())
 
 
-def test_diff_budget_is_counted_in_utf8_bytes():
-    line = "+日本語"
-    cost = len(line.encode()) + 1
-    fits, short = _entry([line]), _entry([line])
-    assert C.apply_diff_budget([fits], HEADER_COST + cost) == 0
-    assert fits["hunks"][0]["lines"] == [line]
-    assert C.apply_diff_budget([short], HEADER_COST + cost - 1) == 1
-    assert short["hunks"] == []
+def _full_size(*entries):
+    return _size(_response(*entries))
+
+
+@pytest.mark.parametrize("delta, kept", [(-1, 0), (0, 1)])
+def test_diff_budget_counts_a_hunk_header_by_the_serialized_response(delta, kept):
+    skeleton = _full_size(_entry())
+    with_header = _full_size(_entry([]))
+    response = _response(_entry([]))
+    C.fit_response_to_bytes(response, with_header + delta)
+    assert len(response["diff"]["files"][0]["hunks"]) == kept
+    assert _size(response) <= max(with_header + delta, skeleton)
+
+
+@pytest.mark.parametrize("delta, kept", [(-1, 1), (0, 2)])
+def test_diff_budget_carries_header_cost_from_one_hunk_to_the_next(delta, kept):
+    limit = _full_size(_entry([], [])) + delta
+    response = _response(_entry([], []))
+    C.fit_response_to_bytes(response, limit)
+    assert len(response["diff"]["files"][0]["hunks"]) == kept
+    assert _size(response) <= limit
+
+
+@pytest.mark.parametrize("text", ["+日本語", "+\U0001f600" * 3, "+\u00e9" * 10])
+def test_diff_budget_counts_non_ascii_at_its_escaped_json_size(text):
+    full = _full_size(_entry([text]))
+    fits, short = _response(_entry([text])), _response(_entry([text]))
+    assert C.fit_response_to_bytes(fits, full) == 0
+    assert fits["diff"]["files"][0]["hunks"][0]["lines"] == [text]
+    assert C.fit_response_to_bytes(short, full - 1) == 1
+    assert short["diff"]["files"][0]["hunks"] == []
+    assert short["diff"]["omitted_lines"] == 1 and short["diff"]["files"][0]["omitted_lines"] == 1
+    assert _size(short) <= full - 1
 
 
 def _lines(count):

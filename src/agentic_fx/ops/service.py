@@ -649,8 +649,10 @@ class OpsService:
         from . import change as change_mod
         result = self._change_of(approval_id, row["status"], payload, journals,
                                  include_diff=True)
-        return {"id": approval_id, "change": result.summary,
-                "claims": change_mod.claims_of(payload), "diff": result.diff}
+        response = {"id": approval_id, "change": result.summary,
+                    "claims": change_mod.claims_of(payload), "diff": result.diff}
+        change_mod.fit_response_to_bytes(response)
+        return response
 
     def events_after(self, principal: Caller, *, after: int, limit: int,
                      deadline: float | None = None) -> dict:
