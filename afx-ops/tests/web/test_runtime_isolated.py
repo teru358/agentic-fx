@@ -44,8 +44,12 @@ APPROVALS = {"approvals": [{"id": 7, "kind": "plugin", "name": "ema_cross",
 DETAIL = {"id": 7, "kind": "plugin", "status": "pending", "payload_sha256": "cd" * 32}
 LOG = {"lines": ["tick ok", "order none"]}
 ACTIVITY = {"lines": ["NEWS 1", "TRADE 2"]}
+CHANGE = {"id": 7, "change": {"classification": "new", "name": "ema_cross", "kind": "strategy",
+                              "candidate_hash": "ef" * 32, "params": {"items": []}},
+          "claims": {"summary": "one", "selection_rationale": "two"},
+          "diff": {"files": [], "omitted_lines": 0}}
 ROUTES = {"/v1/status": STATUS, "/v1/approvals": APPROVALS, "/v1/approvals/{id}": DETAIL,
-          "/v1/log": LOG, "/v1/activity": ACTIVITY}
+          "/v1/approvals/{id}/change": CHANGE, "/v1/log": LOG, "/v1/activity": ACTIVITY}
 
 
 class WebDaemon:
@@ -187,7 +191,10 @@ def test_each_route_answers_get_and_head_with_the_web_principal_only(root, daemo
         assert {k: v for k, v in h_headers.items() if k != "date"} == \
             {k: v for k, v in headers.items() if k != "date"}
     seen = daemon.requests()
-    assert [r["target"] for r in seen] == [target for _, target, _ in READS] * 2
+    # 承認 #N は本体の後に変更内容 endpoint を 1 回読む
+    targets = [t for _, t, _ in READS]
+    targets.insert(targets.index("/v1/approvals/7") + 1, "/v1/approvals/7/change")
+    assert [r["target"] for r in seen] == targets * 2
     for request in seen:
         assert request["method"] == "GET" and request["body"] == 0 and not request["actor"]
         # web の鍵だけで読む (他 principal の鍵も actor も載らない)
