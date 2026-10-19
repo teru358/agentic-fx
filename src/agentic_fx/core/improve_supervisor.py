@@ -132,7 +132,17 @@ class ImproveSupervisor:
                 on_prepared(ctx.mission_id)
             except Exception:  # noqa: BLE001
                 _log.exception("on_prepared callback failed")
-        result = runner.run(mission)
+        # runner.run() 自体が例外を投げる窓: 補償しないと mission / run が
+        # 非終端のまま残るため、定期 slot と同じく補償してから re-raise する。
+        try:
+            result = runner.run(mission)
+        except BaseException:
+            _log.exception(
+                "improve runner.run raised for manual mission_id=%s — "
+                "compensating", ctx.mission_id)
+            self._improve_loop.compensate_launch_failure(
+                ctx=ctx, now=self._clock.now())
+            raise
         try:
             self._improve_loop.commit(
                 mission=mission, ctx=ctx, result=result, now=self._clock.now())

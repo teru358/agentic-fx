@@ -91,10 +91,15 @@ def insert(conn: sqlite3.Connection, *, mission_id: int, name: str,
     return archive_id
 
 
-def list_by_mission(conn: sqlite3.Connection, mission_id: int) -> list[dict]:
+def list_by_mission(conn: sqlite3.Connection, mission_id: int, *,
+                    evaluated_only: bool = False) -> list[dict]:
+    """Mission の行を id 順で返す。`evaluated_only` は backtest の成績を持つ
+    行だけに絞る (提出直前に作る最終 artifact の行は成績を持たない)。"""
+    query = "SELECT * FROM candidate_archives WHERE mission_id=?"
+    if evaluated_only:
+        query += " AND metrics_json != '{}'"
     return [_decode(row) for row in conn.execute(
-        "SELECT * FROM candidate_archives WHERE mission_id=? ORDER BY id",
-        (mission_id,))]
+        query + " ORDER BY id", (mission_id,))]
 
 
 def clear_path(conn: sqlite3.Connection, archive_id: int, *,

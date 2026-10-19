@@ -300,10 +300,30 @@ def _empty_inventory_result(plugins_root: Path):
 
 @dataclass(frozen=True)
 class _PluginGateVerdict:  # 新規命名
+    """plugin gate の判定。`content_hash` / `artifact_hash` は終端に至った
+    時点の staging の bytes の hash (最終 artifact)。pytest の実行後に抜ける
+    全ての return は、候補自身の self-test が staging を書き換えていても
+    最終 bytes を表すよう、return の直前に取り直した値を持つ。取り直せなかった
+    ときと、hash を取る前に抜ける snapshot 検査の不合格は None。
+    `failure_kind` は不合格の種別 (`noop_copy` か `gate_failed`)。"""
     passed: bool
     reason: str = ""
     content_hash: str | None = None
     artifact_hash: str | None = None
+    failure_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class _FinalCandidate:
+    """候補台帳の最終 artifact の行を作るための材料。staging を消す前に
+    親が staging の bytes から作る。"""
+    name: str
+    content_hash: str
+    artifact_hash: str
+    pair: str | None
+    logic_hash: str | None
+    family_key: str | None
+    candidate_dir: Path | None
 
 
 @dataclass(frozen=True)
@@ -1642,17 +1662,34 @@ class ImproveLoop:
 
         content_hash_before, artifact_hash_before = hashes_of(plugin_dir)
 
+        def _failed_before_pytest(reason: str,
+                                  kind: str = "gate_failed") -> _PluginGateVerdict:
+            # pytest の実行前は staging が変わっていないので、取った hash が
+            # そのまま最終 artifact を表す。
+            return _PluginGateVerdict(
+                passed=False, reason=reason,
+                content_hash=content_hash_before,
+                artifact_hash=artifact_hash_before, failure_kind=kind)
+
+        def _failed_after_pytest(reason: str) -> _PluginGateVerdict:
+            # pytest の実行後は候補自身の self-test が staging を書き換えて
+            # いる場合があるため、return の直前に取り直す。
+            content_hash_final, artifact_hash_final = self._final_hashes(
+                plugin_dir)
+            return _PluginGateVerdict(
+                passed=False, reason=reason, content_hash=content_hash_final,
+                artifact_hash=artifact_hash_final, failure_kind="gate_failed")
+
         try:
             check_source(plugin_dir / "plugin.py")
             check_source(plugin_dir / "test_plugin.py",
                         extra_allowed=frozenset({"pytest", "plugin"}))
         except SandboxError as exc:
-            return _PluginGateVerdict(passed=False, reason=str(exc))
+            return _failed_before_pytest(str(exc))
 
         meta, reason = plugin_loader.discover_one_with_reason(plugin_dir, name)
         if meta is None:
-            return _PluginGateVerdict(
-                passed=False, reason=f"loader_rejected: {reason}")
+            return _failed_before_pytest(f"loader_rejected: {reason}")
 
         try:
             noop_copy = find_noop_copy(
@@ -1661,25 +1698,24 @@ class ImproveLoop:
                 inventory=(inventory if inventory is not None
                           else _empty_inventory_result(self._root / "plugins")))
         except SyntaxError:
-            return _PluginGateVerdict(passed=False, reason="plugin.py syntax error")
+            return _failed_before_pytest("plugin.py syntax error")
         if noop_copy is not None:
-            return _PluginGateVerdict(
-                passed=False, reason=f"noop_copy_of:{noop_copy}")
+            return _failed_before_pytest(
+                f"noop_copy_of:{noop_copy}", kind="noop_copy")
 
         test_count = count_self_test_functions(plugin_dir / "test_plugin.py")
         minimum = self._settings.improve.gate.min_test_functions
         if test_count == 0:
-            return _PluginGateVerdict(passed=False, reason="self_test_missing")
+            return _failed_before_pytest("self_test_missing")
 
         try:
             result = run_gate_pytest(plugin_dir, settings=self._settings)
         except RuntimeError as exc:
             # M7: Landlock 不可 (run_gate_pytest の fail-closed RuntimeError,
             # 設計書 §4.2-3d) は commit() 全体を例外で抜けさせず gate 不合格に倒す
-            return _PluginGateVerdict(passed=False, reason=str(exc))
+            return _failed_after_pytest(str(exc))
         if not result.passed:
-            return _PluginGateVerdict(
-                passed=False, reason=f"pytest failed: {result.stdout_tail}")
+            return _failed_after_pytest(f"pytest failed: {result.stdout_tail}")
 
         # 1 周目 I1: AST の事前カウントは名前規則の近似でしかない (pytest が
         # 収集しない class 内でも数える等の水増しが可能)。真の下限は pytest の
@@ -1698,21 +1734,32 @@ class ImproveLoop:
         match = re.search(r"(?:^|, )(\d+) passed\b", summary or "")
         collected_count = int(match.group(1)) if match is not None else 0
         if collected_count < minimum:
-            return _PluginGateVerdict(
-                passed=False,
-                reason=(f"self_test_too_thin_collected:{collected_count}"
-                        f"<{minimum}"))
+            return _failed_after_pytest(
+                f"self_test_too_thin_collected:{collected_count}<{minimum}")
 
-        content_hash_after, artifact_hash_after = hashes_of(plugin_dir)
-        if (content_hash_after != content_hash_before
+        content_hash_after, artifact_hash_after = self._final_hashes(plugin_dir)
+        if (content_hash_after is None
+                or content_hash_after != content_hash_before
                 or artifact_hash_after != artifact_hash_before):
             return _PluginGateVerdict(
-                passed=False, reason="hash changed after pytest execution "
-                                     "(candidate was mutated by its own test)")
+                passed=False,
+                reason=("hash changed after pytest execution "
+                        "(candidate was mutated by its own test)"),
+                content_hash=content_hash_after,
+                artifact_hash=artifact_hash_after, failure_kind="gate_failed")
 
         return _PluginGateVerdict(
             passed=True, content_hash=content_hash_before,
             artifact_hash=artifact_hash_before)
+
+    @staticmethod
+    def _final_hashes(plugin_dir: Path) -> tuple[str | None, str | None]:
+        """staging の現在の bytes の (content_hash, artifact_hash)。ファイルが
+        消されたなどで取れないときは (None, None)。"""
+        try:
+            return hashes_of(plugin_dir)
+        except (OSError, ValueError):
+            return None, None
 
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, resolved, kind="strategy",
@@ -2035,7 +2082,8 @@ class ImproveLoop:
         のみで終端を止めない (ブリーフ「テスト」節)。"""
         from agentic_fx.store import candidate_archives as candidate_archives_store
         try:
-            return candidate_archives_store.list_by_mission(conn, mission_id)
+            return candidate_archives_store.list_by_mission(
+                conn, mission_id, evaluated_only=True)
         except Exception as exc:
             if self._activity is not None:
                 self._activity.write(
@@ -2120,7 +2168,8 @@ class ImproveLoop:
         (ブリーフ「変更点」3・「テスト」節)。"""
         from agentic_fx.store import candidate_archives as candidate_archives_store
         try:
-            rows = candidate_archives_store.list_by_mission(conn, ctx.mission_id)
+            rows = candidate_archives_store.list_by_mission(
+                conn, ctx.mission_id, evaluated_only=True)
             if not rows:
                 return
             self._append_archive_index(ctx, status=status, rows=rows, now=now)
@@ -2208,13 +2257,160 @@ class ImproveLoop:
                         reason=f"{type(exc).__name__}:{str(exc)[:300]}")
                     continue
             relative_path = final_path.relative_to(self._root).as_posix()
+            from agentic_fx.plugin.logic_identity import identity_of_dir
+            logic_hash, family_key = identity_of_dir(
+                final_path, name=entry["params"]["name"])
             candidate_archives.insert(
                 conn, mission_id=ctx.mission_id,
                 name=entry["params"]["name"],
                 content_hash=summary["content_hash"],
                 artifact_hash=artifact_hash, archive_path=relative_path,
                 pair=summary["pair"], metrics=summary["metrics"], now=now,
+                logic_hash=logic_hash, family_key=family_key,
                 commit=False)
+
+    def _final_candidate(self, candidate_dir: Path, *, name: str,
+                         content_hash: str | None,
+                         artifact_hash: str | None) -> _FinalCandidate | None:
+        """終端に至った時点の staging の bytes から最終 artifact の材料を作る。
+        hash が取れていない (最終 bytes を確定できない) ときは None。
+        staging を消す前に呼ぶ。"""
+        if not content_hash or not artifact_hash:
+            return None
+        from agentic_fx.plugin.logic_identity import identity_of_dir
+        logic_hash, family_key = identity_of_dir(candidate_dir, name=name)
+        pair = None
+        try:
+            config = yaml.safe_load(
+                (candidate_dir / "config.yaml").read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            config = None
+        if isinstance(config, dict) and config.get("kind") == "strategy":
+            pairs = config.get("pairs")
+            if isinstance(pairs, list) and pairs:
+                pair = str(pairs[0])
+        return _FinalCandidate(
+            name=name, content_hash=content_hash, artifact_hash=artifact_hash,
+            pair=pair, logic_hash=logic_hash, family_key=family_key,
+            candidate_dir=candidate_dir)
+
+    def _snapshot_final_archive(self, candidate: _FinalCandidate, *,
+                                mission_id: int, now) -> str | None:
+        """run_backtest と同じ手順 (tmp に書いて rename) で、staging の最終
+        bytes から archive を作る。作れなければ None (activity に残す)。"""
+        from agentic_fx.plugin.version_store import (
+            _fsync_dir, _write_ro_file, artifact_hash_bytes,
+        )
+        final_path = (self._root / "plugins" / "_archive" / str(mission_id)
+                      / candidate.artifact_hash)
+        archive_tmp = final_path.parent / (
+            f".tmp-{candidate.artifact_hash}-{uuid.uuid4()}")
+        try:
+            if candidate.candidate_dir is None:
+                raise ValueError("no_candidate_dir")
+            plugin_py = (candidate.candidate_dir / "plugin.py").read_bytes()
+            config_yaml = (candidate.candidate_dir / "config.yaml").read_bytes()
+            test_plugin = (candidate.candidate_dir
+                           / "test_plugin.py").read_bytes()
+            if artifact_hash_bytes(plugin_py, config_yaml,
+                                   test_plugin) != candidate.artifact_hash:
+                raise ValueError("staging_changed")
+            if final_path.is_dir() and not final_path.is_symlink():
+                return final_path.relative_to(self._root).as_posix()
+            archive_tmp.mkdir(parents=True, mode=0o700)
+            _write_ro_file(archive_tmp / "plugin.py", plugin_py)
+            _write_ro_file(archive_tmp / "config.yaml", config_yaml)
+            _write_ro_file(archive_tmp / "test_plugin.py", test_plugin)
+            _write_ro_file(
+                archive_tmp / "meta.json", json.dumps({
+                    "name": candidate.name,
+                    "content_hash": candidate.content_hash,
+                    "artifact_hash": candidate.artifact_hash,
+                    "pair": candidate.pair, "metrics": {},
+                    "created_at": now.isoformat(),
+                }, sort_keys=True).encode())
+            _fsync_dir(archive_tmp)
+            os.chmod(archive_tmp, 0o500)
+            _fsync_dir(archive_tmp.parent)
+            os.rename(archive_tmp, final_path)
+            _fsync_dir(final_path.parent)
+        except Exception as exc:
+            if archive_tmp.exists():
+                self._remove_archive_tmp(archive_tmp)
+            self._archive_failed(
+                mission_id=mission_id, artifact_hash=candidate.artifact_hash,
+                reason=f"{type(exc).__name__}:{str(exc)[:300]}")
+            return None
+        return final_path.relative_to(self._root).as_posix()
+
+    def _ensure_final_archive_row(self, conn, *, mission_id: int,
+                                  candidate: _FinalCandidate, now,
+                                  snapshot: bool) -> int:
+        """最終 artifact の行を返す。同じ `(mission_id, artifact_hash)` の行が
+        あれば再利用し、無ければ作る。snapshot は提出する候補だけが作る。"""
+        from agentic_fx.store import candidate_archives as archives_store
+        existing = conn.execute(
+            "SELECT id FROM candidate_archives WHERE mission_id=? "
+            "AND artifact_hash=?",
+            (mission_id, candidate.artifact_hash)).fetchone()
+        if existing is not None:
+            return existing["id"]
+        archive_path = (self._snapshot_final_archive(
+            candidate, mission_id=mission_id, now=now) if snapshot else None)
+        return archives_store.insert(
+            conn, mission_id=mission_id, name=candidate.name,
+            content_hash=candidate.content_hash,
+            artifact_hash=candidate.artifact_hash, archive_path=archive_path,
+            pair=candidate.pair, metrics={}, now=now,
+            logic_hash=candidate.logic_hash, family_key=candidate.family_key,
+            commit=False)
+
+    def _settle_candidate_in_tx(self, conn, *, ctx,
+                                candidate: _FinalCandidate | None,
+                                outcome: str, now) -> int | None:
+        """提出に至らない終端で、判定した候補の行を作って outcome を確定する。
+        終端 tx の中で呼ぶ。記録に失敗しても mission の裁定は落とさず、
+        activity に残して行を作らない。"""
+        from agentic_fx.store import candidate_archives as archives_store
+        if candidate is None:
+            return None
+        conn.execute("SAVEPOINT candidate_settle")
+        try:
+            archive_id = self._ensure_final_archive_row(
+                conn, mission_id=ctx.mission_id, candidate=candidate, now=now,
+                snapshot=False)
+            if not archives_store.settle(conn, archive_id, outcome):
+                _log.warning(
+                    "candidate archive %s was not not_submitted; skip %s",
+                    archive_id, outcome)
+            conn.execute("RELEASE candidate_settle")
+            return archive_id
+        except Exception as exc:
+            conn.execute("ROLLBACK TO candidate_settle")
+            conn.execute("RELEASE candidate_settle")
+            if self._activity is not None:
+                self._activity.write(
+                    Category.IMPROVE, "candidate_settle_failed",
+                    f"mission={ctx.mission_id} reason="
+                    f"{type(exc).__name__}:{str(exc)[:300]}")
+            return None
+
+    def _submitted_candidate(self, ctx, payload: dict) -> _FinalCandidate:
+        """承認 payload の候補から最終 artifact の材料を作る。staging が
+        読めれば仮説族などを bytes から計算し、読めなければ hash だけで作る。"""
+        name = payload["name"]
+        candidate = None
+        if ctx is not None and getattr(ctx, "staging_dir", None) is not None:
+            candidate = self._final_candidate(
+                ctx.staging_dir / name, name=name,
+                content_hash=payload["content_hash"],
+                artifact_hash=payload["artifact_hash"])
+        if candidate is None:
+            candidate = _FinalCandidate(
+                name=name, content_hash=payload["content_hash"],
+                artifact_hash=payload["artifact_hash"], pair=None,
+                logic_hash=None, family_key=None, candidate_dir=None)
+        return candidate
 
     def _persist_ledger_in_tx(self, conn, *, ctx, now,
                               mission_outcome: str) -> list[int] | None:
@@ -2442,6 +2638,20 @@ class ImproveLoop:
                     mission_outcome="approval")
                 approval_payload = dict(approval_payload)
                 approval_payload["analysis_run_ids"] = analysis_run_ids
+                # 提出する候補の行を承認依頼の直前に必ず作り、不変の id を
+                # payload に入れる (作成後は変えない)。
+                from agentic_fx.store import candidate_archives as archives_store
+                submitted = self._submitted_candidate(
+                    ctx, approval_payload)
+                candidate_archive_id = self._ensure_final_archive_row(
+                    conn, mission_id=mission_id, candidate=submitted,
+                    now=now, snapshot=True)
+                if not archives_store.settle(
+                        conn, candidate_archive_id, "pending"):
+                    _log.warning(
+                        "candidate archive %s was not not_submitted; "
+                        "skip pending", candidate_archive_id)
+                approval_payload["candidate_archive_id"] = candidate_archive_id
                 accepted = accepted_entries(ledger_entries)
                 approval_payload["analysis_call_count"] = sum(
                     1 for e in accepted if e["kind"] == "analyze_corr")
@@ -2655,11 +2865,18 @@ class ImproveLoop:
                     # `commit()` の `ctx` は常に実 `ImproveRunContext`
                     # (`_inventory_for_gate` フォールバックは撤去)。
                     inventory=ctx.inventory)
+                # 最終 artifact の材料は staging を消す前に作る。
+                final_candidate = self._final_candidate(
+                    candidate_dir, name=artifact["name"],
+                    content_hash=gate_verdict.content_hash,
+                    artifact_hash=gate_verdict.artifact_hash)
                 if not gate_verdict.passed:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason=f"gate_failed:{gate_verdict.reason}", now=now,
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls, candidate=final_candidate,
+                        candidate_outcome=(
+                            gate_verdict.failure_kind or "gate_failed"))
                     return
 
                 from agentic_fx.plugin import approval
@@ -2670,7 +2887,9 @@ class ImproveLoop:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason="gate_failed:loader_rejected", now=now,
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="gate_failed")
                     return
                 try:
                     approval.assert_max_bars_within_limit(
@@ -2679,7 +2898,9 @@ class ImproveLoop:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason=f"gate_failed:max_bars_limit:{exc}", now=now,
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="gate_failed")
                     return
 
                 kind = candidate_meta.kind
@@ -2687,7 +2908,9 @@ class ImproveLoop:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason=f"gate_failed:kind_unsupported:{kind}", now=now,
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="gate_failed")
                     return
                 # [indicator-consumption-wiring] U4a: kind=indicator の
                 # `outputs` 宣言は新規承認で必須。固定文言のみ
@@ -2699,7 +2922,9 @@ class ImproveLoop:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason="outputs_required", now=now,
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="gate_failed")
                     return
                 if kind == "strategy":
                     # [indicator-consumption-wiring] §2.8: 解決は commit
@@ -2718,6 +2943,8 @@ class ImproveLoop:
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason="indicator_unresolved", now=now,
                             tool_calls=tool_calls,
+                            candidate=final_candidate,
+                            candidate_outcome="gate_failed",
                             activity_extra=(f" alias={exc.alias or '-'} "
                                             f"cause={exc.reason}"))
                         return
@@ -2754,7 +2981,9 @@ class ImproveLoop:
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=("gate_failed:backtest_data_unavailable:"
                                     f"{exc}"), now=now,
-                            gate_rows=tuple(gate_rows), tool_calls=tool_calls)
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls,
+                            candidate=final_candidate,
+                            candidate_outcome="gate_failed")
                         return
                     # `backtest_cpu` は gate が評価 1 回ごとに `evaluation_sink`
                     # へ渡し、そこで書く (失敗で例外が伝播する評価でも
@@ -2763,7 +2992,12 @@ class ImproveLoop:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
                             reason=strategy_verdict.observation_reason, now=now,
-                            gate_rows=tuple(gate_rows), tool_calls=tool_calls)
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls,
+                            candidate=final_candidate,
+                            candidate_outcome=(
+                                "insufficient_trades"
+                                if strategy_verdict.unevaluable_kind
+                                == "insufficient_trades" else "gate_failed"))
                         return
                     # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書
                     # §3 T1-b): 収益性フロア不合格の再ルート。`reason` は
@@ -2790,7 +3024,9 @@ class ImproveLoop:
                             reason="unprofitable", now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             mission_outcome="unprofitable",
-                            report_detail=report_detail)
+                            report_detail=report_detail,
+                            candidate=final_candidate,
+                            candidate_outcome="unprofitable")
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -2876,7 +3112,9 @@ class ImproveLoop:
                                 f"pair={demotion.pair}"),
                         },
                         now=now, gate_rows=tuple(gate_rows),
-                        tool_calls=tool_calls)
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="duplicate_metrics")
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -2955,7 +3193,10 @@ class ImproveLoop:
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
                                         report_path, artifact, now,
                                         gate_rows=(),
-                                        tool_calls: int | None = None) -> None:
+                                        tool_calls: int | None = None,
+                                        candidate: _FinalCandidate | None = None,
+                                        candidate_outcome: str = "gate_failed",
+                                        ) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
 
         /code-review 2 周目 CR3 是正 (2026-09-12): `gate_rows` (既定 ()) —
@@ -2999,6 +3240,9 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now, mission_id=ctx.mission_id,
                 mission_outcome=outcome)
+            self._settle_candidate_in_tx(
+                conn, ctx=ctx, candidate=candidate,
+                outcome=candidate_outcome, now=now)
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="completed",
@@ -3392,7 +3636,9 @@ class ImproveLoop:
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
                               report_detail: str = "",
-                              activity_extra: str = "") -> None:
+                              activity_extra: str = "",
+                              candidate: _FinalCandidate | None = None,
+                              candidate_outcome: str = "gate_failed") -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -3477,6 +3723,9 @@ class ImproveLoop:
                 self._persist_gate_rows(
                     conn, gate_rows=gate_rows, now=now,
                     mission_id=ctx.mission_id, mission_outcome="report_failed")
+                self._settle_candidate_in_tx(
+                    conn, ctx=ctx, candidate=candidate,
+                    outcome=candidate_outcome, now=now)
                 missions_store.finish_improve_mission(
                     conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                     slot_key=ctx.slot_key, mission_status="completed",
@@ -3510,6 +3759,9 @@ class ImproveLoop:
             self._persist_gate_rows(
                 conn, gate_rows=gate_rows, now=now,
                 mission_id=ctx.mission_id, mission_outcome=outcome)
+            self._settle_candidate_in_tx(
+                conn, ctx=ctx, candidate=candidate,
+                outcome=candidate_outcome, now=now)
             # [unprofitable-note-hygiene] 設計書 v2.0 §2-2/§3: フロア不合格
             # (`mission_outcome=="unprofitable"`) のときだけ、この mission
             # が起票した全行 (`origin_mission_id=ctx.mission_id` — INSERT
