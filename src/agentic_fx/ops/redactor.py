@@ -195,15 +195,18 @@ def _scan_digits(text: str) -> str:
 _ACCOUNT_KEY_WORDS = ("account", "acct", "iban", "card", "口座", "customer", "client_id", "login",
                       "user_id", "number")
 _ACCOUNT_KEY_NO = re.compile(r"(?:(?<![A-Za-z])[Nn][Oo]|[a-z]No)(?![a-z])")
-_KEY_BEFORE_VALUE = re.compile(r"([\w.-]+)[\"']?\s*[:=]\s*[\"']?$")
+_KEY_BEFORE_VALUE = re.compile(r"((?:[\w.-]+[ \t]+){0,3}[\w.-]+)[\"']?\s*[:=]\s*[\"']?$")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_KEY_SEPARATORS = re.compile(r"[\s-]+")
 _ACCOUNT_CONTEXT_WINDOW = 80
 
 
 def is_account_key(key: str) -> bool:
-    """口座らしい key か (その値は日付の形でも伏せる)。``no`` は語として現れるときだけ。"""
-    lowered = key.lower()
-    return (any(word in lowered for word in _ACCOUNT_KEY_WORDS)
-            or _ACCOUNT_KEY_NO.search(key) is not None)
+    """口座らしい key か (その値は日付の形でも伏せる)。空白・``-``・camelCase で区切られた
+    複数語の key も、``_`` でつないだ形で見る。``no`` は語として現れるときだけ。"""
+    joined = _KEY_SEPARATORS.sub("_", _CAMEL_BOUNDARY.sub("_", key))
+    return any(any(word in form.lower() for word in _ACCOUNT_KEY_WORDS)
+               or _ACCOUNT_KEY_NO.search(form) is not None for form in (key, joined))
 
 
 def _is_account_context(before: str) -> bool:

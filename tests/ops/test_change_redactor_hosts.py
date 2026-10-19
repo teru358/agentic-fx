@@ -233,6 +233,41 @@ def test_dates_without_an_account_like_key_stay(text):
     assert R.redact(text) == text
 
 
+MULTI_WORD_KEYS = ["customer id: 2026-10-19", "client id: 2026-10-19", "clientId=2026-10-19",
+                   "customer-id: 2026-10-19", "Client_ID = 2026-10-19"]
+
+
+@pytest.mark.parametrize("text", MULTI_WORD_KEYS)
+def test_dates_after_multi_word_account_keys_are_redacted(text):
+    assert "2026-10-19" not in R.redact(text)
+
+
+def test_a_multi_word_key_without_an_account_word_keeps_its_date():
+    assert R.redact("note id: 2026-10-19") == "note id: 2026-10-19"
+
+
+@pytest.mark.parametrize("text", MULTI_WORD_KEYS)
+def test_multi_word_account_key_date_in_a_plugin_comment_is_redacted(ops_env, text):
+    approval_id, _, _ = _scenario(ops_env, f"x = 2  # {text}\n", CFG)
+    assert "2026-10-19" not in json.dumps(ops_env.service().approval_change(OPERATOR, approval_id))
+
+
+@pytest.mark.parametrize("key", ["customer id", "client id", "clientId", "customer-id"])
+def test_multi_word_account_key_in_a_config_is_redacted(ops_env, key):
+    approval_id, _, _ = _scenario(ops_env, "x = 2\n", CFG + f"  {key}: 2026-10-19\n")
+    body = ops_env.service().approval_change(OPERATOR, approval_id)
+    assert "2026-10-19" not in json.dumps(body)
+
+
+def test_decode_runs_to_a_fixed_point_not_a_single_round(monkeypatch):
+    safe = "rate 100%2525"  # 2 段で "%" に落ち着く安全な値。1 段で打ち切ると % が残って伏せてしまう
+    assert R.redact(safe) == safe
+    assert "evil" not in R.redact("evil%252Exyz")  # 2 段目で host が現れる
+    assert "evil" not in R.redact("rate 100%2525 evil%252Exyz")
+    monkeypatch.setattr(R, "_MAX_DECODE_ROUNDS", 1)
+    assert R.redact(safe) == L.REDACTED
+
+
 def test_params_value_of_an_account_like_key_is_redacted_even_as_a_date(ops_env):
     approval_id, _, _ = _scenario(ops_env, "x = 2\n", CFG + "  account_no: 2026-10-19\n")
     body = ops_env.service().approval_change(OPERATOR, approval_id)
