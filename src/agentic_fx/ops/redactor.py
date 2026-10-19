@@ -4,10 +4,13 @@
 文字列・コメント、およびそれらから作る diff の全行) である。検出対象は絶対パス、URL・
 裸の hostname・IP、credential の代入、高エントロピーの token、口座らしい数字列。
 
-順序は 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → 表示形式の escape → 表示上限
-とする。この部品は除去と redaction を受け持ち、escape と表示上限は表示面が後から掛ける。
+順序は 入力読み取り上限 → Cc/Cf/Cs 除去 → NFKC 正規化 → redaction → 表示形式の escape →
+表示上限とする。この部品は除去と redaction を受け持ち、escape と表示上限は表示面が後から掛ける。
 表示面は Cc・Cf・Cs を消すので、検出をその前に掛けると消えた後に繋がる秘密を取り逃がす。
-そのため検出は除去済みの文字列に掛け、出力も除去済みの文字列を基に作る。改行とタブは
+そのため検出は除去・正規化済みの文字列に掛け、出力もその文字列を基に作る (全角の
+``ａｐｉ＿ｋｅｙ`` などは正規化で ASCII になる)。``%XX`` を 1 回だけ decode した複製にも検出を
+掛け、どちらかで検出されたら値全体を伏せる (decode 結果は表示に使わない)。正規化後も
+ASCII 外の文字が credential の key・URL の scheme・hostname の位置に残る値も全体を伏せる。改行とタブは
 表示面が行の区切り・字下げとして扱うので残す (CR は表示面で改行に正規化されるが、
 単独の CR で語を割る回避を防ぐため除去する)。
 
@@ -21,6 +24,7 @@ from __future__ import annotations
 import math
 import re
 import unicodedata
+import urllib.parse
 from collections import Counter
 
 from .change_limits import (ACCOUNT_MIN_DIGITS, MAX_REDACT_VALUE_BYTES, REDACTED,
@@ -58,6 +62,20 @@ _ACCOUNT_RUN = re.compile(r"(?<![\w.])\d{%d,}(?![\w.])" % ACCOUNT_MIN_DIGITS)
 _ACCOUNT_GROUPS = re.compile(r"(?<![\w.])\d{2,12}(?:[- ]\d{2,12}){2,}(?![\w.])")
 _STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _KEPT_CONTROLS = frozenset({"\n", "\t"})
+_PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
+_NON_ASCII_SCHEME = re.compile(r"[^\s/]*[^\x00-\x7f][^\s/]*://")
+_UNI_HOST = re.compile(
+    r"(?i)(?<![\w.-])(?:[\w-]+\.)+"
+    r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
+    r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
+    r"corp|intranet|test|example|invalid)(?![\w-])")
+_NON_ASCII_KEY = re.compile(r"([\w.-]*[^\x00-\x7f][\w.-]*)[\"']?\s*[:=]")
+_CRED_WORDS = tuple(sorted({
+    first + sep + second
+    for first, second in (("api", "key"), ("access", "key"), ("secret", "key"),
+                          ("private", "key"), ("auth", "token"))
+    for sep in ("_", "-", "")} | {"apikey", "token", "password", "passwd", "pwd", "secret",
+                                  "credential", "credentials", "key"}, key=len, reverse=True))
 _PEM = re.compile(rb"-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE|PGP)[A-Z ]*-----")
 
 
@@ -98,9 +116,38 @@ def strip_controls(text: str) -> str:
                    if ch in _KEPT_CONTROLS or unicodedata.category(ch) not in _STRIPPED_CATEGORIES)
 
 
-def redact(text: str) -> str:
-    """制御文字を除いた上で、検出した部分を ``[redacted]`` に置き換える。"""
-    text = strip_controls(text)
+def _normalize(text: str) -> str:
+    return strip_controls(unicodedata.normalize("NFKC", strip_controls(text)))
+
+
+def _fuzzy_credential_key(key: str) -> bool:
+    """ASCII 外の文字を任意の 1 字とみなして、credential 名で終わる key か。"""
+    for candidate in (key, key[:-1] if key[-1:] in ("s", "S") else key):
+        for word in _CRED_WORDS:
+            size = len(word)
+            if len(candidate) < size:
+                continue
+            start = len(candidate) - size
+            if start and candidate[start - 1] not in "_.-":
+                continue
+            pairs = list(zip(candidate[start:], word))
+            if (all(ord(ch) > 127 or ch.lower() == expected for ch, expected in pairs)
+                    and any(ch.lower() == expected for ch, expected in pairs)):
+                return True
+    return False
+
+
+def _non_ascii_residue(text: str) -> bool:
+    """正規化後も ASCII 外の文字が、credential の key・URL の scheme・hostname の位置に
+    残っているか (検出は ASCII 前提なので、残れば伏せる側に倒す)。"""
+    if _NON_ASCII_SCHEME.search(text) is not None:
+        return True
+    if any(not match.group(0).isascii() for match in _UNI_HOST.finditer(text)):
+        return True
+    return any(_fuzzy_credential_key(match.group(1)) for match in _NON_ASCII_KEY.finditer(text))
+
+
+def _scan(text: str) -> str:
     text = _URL.sub(REDACTED, text)
     text = _BEARER.sub(REDACTED, text)
     text = _CRED.sub(lambda m: m.group(1) + REDACTED, text)
@@ -116,6 +163,21 @@ def redact(text: str) -> str:
     text = _ACCOUNT_GROUPS.sub(_account_groups_sub, text)
     text = _ACCOUNT_RUN.sub(REDACTED, text)
     return text
+
+
+def redact(text: str) -> str:
+    """制御文字の除去と NFKC 正規化をした上で、検出した部分を ``[redacted]`` に置き換える。
+    ``%XX`` を decode した複製か、ASCII 外の残留で検出されたら値全体を伏せる。"""
+    text = _normalize(text)
+    out = _scan(text)
+    if _non_ascii_residue(out):
+        return REDACTED
+    if _PERCENT.search(text) is not None:
+        decoded = _normalize(urllib.parse.unquote(text, errors="replace"))
+        decoded_out = _scan(decoded)
+        if decoded_out != decoded or _non_ascii_residue(decoded_out):
+            return REDACTED
+    return out
 
 
 def redact_value(value: object) -> str:
