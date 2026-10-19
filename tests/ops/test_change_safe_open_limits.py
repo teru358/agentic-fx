@@ -182,3 +182,25 @@ def test_each_read_is_clamped_to_what_is_left_of_the_limit_plus_one(tmp_path, mo
     for n in seen[:1 + L.MAX_FILE_BYTES // so._CHUNK]:
         assert n <= L.MAX_FILE_BYTES - total + 1
         total += min(n, so._CHUNK)
+
+
+def _open_fd_count():
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.parametrize("opener", ["dir", "plugins"])
+def test_an_opened_directory_that_fstat_reports_as_not_a_directory_is_refused_and_closed(
+        tmp_path, monkeypatch, opener):
+    (tmp_path / "sub").mkdir()
+    monkeypatch.setattr(so.stat, "S_ISDIR", lambda mode: False)
+    parent = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    before = _open_fd_count()
+    try:
+        if opener == "dir":
+            code = _code(lambda: so._open_dir(parent, "sub"))
+        else:
+            code = _code(lambda: so._open_plugins_dir(tmp_path))
+        assert code == L.UNSAFE_SOURCE
+        assert _open_fd_count() == before
+    finally:
+        os.close(parent)
