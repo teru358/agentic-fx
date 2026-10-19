@@ -728,10 +728,28 @@ def _reason_text(code) -> str:
     return change_limits.REASON_TEXT.get(code, change_limits.REASON_TEXT[change_limits.UNSAFE_SOURCE])
 
 
+INVALID_CHANGE_TEXT = "変更内容を表示できません"
+
+
+def _change_is_well_formed(change: dict) -> bool:
+    """daemon の応答が約束の型か。外れた応答 (版の食い違い・不具合) は固定文に倒す。"""
+    reason = change.get("reason")
+    if not isinstance(change.get("classification"), str):
+        return False
+    if reason is not None and not isinstance(reason, str):
+        return False
+    params = change.get("params")
+    if params is None:
+        return True
+    return isinstance(params, dict) and isinstance(params.get("items", []), list)
+
+
 def format_change_lines(change) -> list[str]:
     """承認の変更要約 (diff は出さない)。固定文以外の自由文は redactor を通した値だけ。"""
     if not isinstance(change, dict):
         return []
+    if not _change_is_well_formed(change):
+        return ["-- 変更内容 --", INVALID_CHANGE_TEXT]
     cls = change.get("classification")
     label = change_limits.CLASS_LABELS.get(cls, change_limits.CLASS_LABELS[change_limits.CLASS_UNKNOWN])
     name = change.get("name")

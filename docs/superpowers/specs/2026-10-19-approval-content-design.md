@@ -127,7 +127,8 @@ T1 の root と component の契約 (現物の配置に一致する):
 |---|---|---|
 | 1 ファイルの読み取り上限 | 256 KiB | 読まず `too_large` (change 全体。§5) |
 | flatten の最大深さ | 4 | 超えた入れ子は 1 つの項目の件数に数える |
-| flatten の最大項目数 | 64 | 超えた分は件数だけ |
+| flatten の最大項目数 | 64 | 旧・新の key の和集合を key 順に並べた先頭 64 件を両側に当て、超えた分は「比較していない key」の件数にする |
+| 行単位 diff の計算量 `DIFF_MAX_CELLS` | 旧の行数 x 新の行数 = 4,000,000 (2000 x 2000) | 行ごとの比較を省いて全行削除 + 全行追加の 1 hunk にし、file に `diff_degraded: too_many_lines` を付ける。web は「差分の計算を省略 (行数が多いため)」を出す。1 側 20000 行 (`DIFF_MAX_LINES`) を超える file も同じ |
 | API 応答の上限 (diff 本文の合計) | 512 KiB | hunk を行単位で末尾から省略し「…(N 行省略)」の件数を構造に載せる |
 
 **redaction 対象上限 (redactor に渡す 1 値の byte):**
@@ -450,3 +451,4 @@ T1 → T2 を 1 束 (T2 は T1 の safe な change モデルと API に依存)�
 | 2026-10-19 | v1.0 | ユーザー裁定 4 問 (問 1 summary を Discord に出す、問 2 holdout は web のみで設定 key なし、問 3 loopback の受容、問 5 event 既定は決定 + 失敗系のみ) の反映。§8 を裁定の記録に変え、条件分岐を決定後の文に書き換え (先頭、§0、§3.1、§3.3、§4.2、§4.4、§7.2、§8、§9 AC-7 / AC-12、§10、§11)。運用文書への前提追記を T1 に追加 | ユーザー裁定 | |
 | 2026-10-19 | v1.1 | T1 の実装で決めた細部を追記: `/change` の応答は `{id, change, claims, diff}`、diff は file ごとに `{path, status (added / changed / unchanged / redacted), reason, hunks[{header, lines}], omitted_lines}` (§5)。web の diff で hunk header も 1 行として数える (§2.7)。タブは空白 4 つにして表示 (§4.3)。展開上限を超えた項目の件数 `flatten_omitted` を params に載せる。pending 以外で配備ジャーナルが無い候補 (却下・失効など) の比較対象は `unknown` (§2.2) | T1 実装 | |
 | 2026-10-19 | v1.2 | 処理順を 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → escape → 表示上限 に訂正 (§2.2、§3.2、§4.3、§7.1)。redactor が検出の前に制御文字を除き、出力も除去済みの文字列から作る | NUL・ゼロ幅・孤立サロゲート・CR を値に挟むと検出を逃し、表示面の除去で伏せていない秘密が復元されることを実測 | |
+| 2026-10-19 | v1.3 | 行単位 diff の計算量を `DIFF_MAX_CELLS` で打ち切る (§2.7)。日付・時刻を口座の数字列の検出から除き、hostname は主要 TLD・文脈 (URL・email・host=) ・3 label 以上の `.local` に限り、添字のスライスを IPv6 とみなさない (redactor)。params の flatten は key の和集合の先頭 64 件を両側に当てる。`/change` の応答が上限を超えるときは diff → claims → params 項目 → 理由だけの順に落として必ず上限以下にする。web と CLI は型の外れた変更内容を固定文 1 行に倒す | /code-review high の指摘 8 件の是正 | |

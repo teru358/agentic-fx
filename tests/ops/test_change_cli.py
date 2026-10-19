@@ -131,3 +131,16 @@ def test_ac26_cli_prints_exactly_one_label_per_classification():
             "classification": cls, "params": {"items": []}}})
         assert f"分類: {label}" in text
         assert "同一版・変更なし" not in text
+
+
+@pytest.mark.parametrize("change", [
+    {"classification": []}, {"classification": "updated", "reason": {}},
+    {"classification": {}, "reason": []}, {"classification": "updated", "params": {"items": "x"}},
+    {"classification": "updated", "params": []},
+])
+def test_malformed_change_from_the_daemon_degrades_to_one_fixed_line(change):
+    lines = client.format_change_lines(change)
+    assert lines == ["-- 変更内容 --", client.INVALID_CHANGE_TEXT]
+    text = client.format_approval_detail({"id": 1, "kind": "plugin", "status": "pending",
+                                          "change": change})
+    assert client.INVALID_CHANGE_TEXT in text
