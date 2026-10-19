@@ -132,11 +132,17 @@ def _open_dir(parent_fd: int, name: str) -> int:
 
 def _open_plugins_dir(plugins_root: Path) -> int:
     try:
-        fd = os.open(os.fspath(plugins_root), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fd = os.open(os.fspath(plugins_root), _DIR_FLAGS)
     except FileNotFoundError:
         raise SourceError(UNAVAILABLE) from None
     except OSError:
         raise SourceError(UNSAFE_SOURCE) from None
+    try:
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise SourceError(UNSAFE_SOURCE)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -156,7 +162,7 @@ def _read_file(dir_fd: int, filename: str) -> bytes:
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(fd, _CHUNK)
+            chunk = os.read(fd, min(_CHUNK, MAX_FILE_BYTES - total + 1))
             if not chunk:
                 break
             total += len(chunk)

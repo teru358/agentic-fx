@@ -125,3 +125,60 @@ def test_every_directory_fd_is_closed_after_success_and_after_each_failure(tmp_p
     assert _open_fds() == before
     assert so.inspect_live(root, "sma").kind == "absent"
     assert _open_fds() == before
+
+
+def test_a_symlinked_plugins_root_is_refused(tmp_path):
+    real = tmp_path / "real"
+    digest = make_version(real, "sma")
+    link = tmp_path / "plugins"
+    os.symlink(real, link)
+    assert _code(lambda: so.read_source(link, so.version_source("sma", digest), digest)) \
+        == L.UNSAFE_SOURCE
+    assert _code(lambda: so.inspect_live(link, "sma")) == L.UNSAFE_SOURCE
+
+
+def test_a_plugins_root_that_is_a_regular_file_is_refused(tmp_path):
+    root = tmp_path / "plugins"
+    root.write_bytes(b"")
+    assert _code(lambda: so.read_source(root, so.version_source("sma", "0" * 64), "0" * 64)) \
+        == L.UNSAFE_SOURCE
+
+
+def test_no_read_asks_for_more_than_one_byte_past_the_limit_even_when_data_never_ends(
+        tmp_path, monkeypatch):
+    root = tmp_path / "plugins"
+    digest = _version_with_plugin(root, "sma", 1024)
+    _lie_about_size(monkeypatch)
+    real = os.read
+    requested = []
+    served = []
+
+    def endless(fd, n):
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            requested.append(n)
+            served.append(n)
+            return b"x" * n
+        return real(fd, n)
+    monkeypatch.setattr(so.os, "read", endless)
+    assert _code(lambda: so.read_source(root, so.version_source("sma", digest), digest)) \
+        == L.TOO_LARGE
+    assert sum(served) == L.MAX_FILE_BYTES + 1
+    assert max(requested) <= so._CHUNK
+
+
+def test_each_read_is_clamped_to_what_is_left_of_the_limit_plus_one(tmp_path, monkeypatch):
+    root = tmp_path / "plugins"
+    digest = _version_with_plugin(root, "sma", L.MAX_FILE_BYTES)
+    _lie_about_size(monkeypatch)
+    real = os.read
+    seen = []
+
+    def spy(fd, n):
+        seen.append(n)
+        return real(fd, n)
+    monkeypatch.setattr(so.os, "read", spy)
+    so.read_source(root, so.version_source("sma", digest), digest)
+    total = 0
+    for n in seen[:1 + L.MAX_FILE_BYTES // so._CHUNK]:
+        assert n <= L.MAX_FILE_BYTES - total + 1
+        total += min(n, so._CHUNK)
