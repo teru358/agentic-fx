@@ -1,7 +1,7 @@
 ---
 id: improve-objective-filtered-signal-quality
 title: 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に)
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-07
 closed: null
@@ -9,7 +9,7 @@ related: [improve-daily-params-weekly-algorithm]
 ---
 # [improve-objective-filtered-signal-quality] 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に)
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-daily-params-weekly-algorithm]
 ## 経緯
 
 - 2026-10-07: 起票。
+- 2026-10-19: 状態: 実装中 — 設計 docs/superpowers/specs/2026-10-19-improve-loop-quality-design.md v1.0 をユーザー承認 (2026-10-19)。IQ-T0 (台帳 schema) から着手

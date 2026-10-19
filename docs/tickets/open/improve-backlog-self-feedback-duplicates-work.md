@@ -1,7 +1,7 @@
 ---
 id: improve-backlog-self-feedback-duplicates-work
 title: 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-10
 closed: null
@@ -9,7 +9,7 @@ related: [improve-objective-filtered-signal-quality]
 ---
 # [improve-backlog-self-feedback-duplicates-work] 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ mission 1061 (2026-10-10 08:00 JST) が bb_ema_breakout を候補化した後、
 ## 経緯
 
 - 2026-10-10: 起票。
+- 2026-10-19: 状態: 実装中 — 設計 docs/superpowers/specs/2026-10-19-improve-loop-quality-design.md v1.0 をユーザー承認 (2026-10-19)。IQ-T0 (台帳 schema) から着手

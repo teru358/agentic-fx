@@ -3,11 +3,13 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 151 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (4)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
+| [improve-objective-filtered-signal-quality](open/improve-objective-filtered-signal-quality.md) | 中 | 2026-10-07 | 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に) |
+| [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [approval-notice-lacks-change-content](open/approval-notice-lacks-change-content.md) | 中 | 2026-10-17 | 改善承認の通知に変更内容が無い (何がどう変わるか読めない) |
 
 ## 実装待ち (13)
@@ -41,7 +43,7 @@
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 | [archive-index-naming](open/archive-index-naming.md) | 未設定 | 2026-09-12 | `plugins/_archive/INDEX.md` は approval 終端を載せず GC も更新しないので目録… |
 
-## 設計待ち (128)
+## 設計待ち (126)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -66,9 +68,7 @@
 | [backlog-status-update-is-two-step-and-races-selection](open/backlog-status-update-is-two-step-and-races-selection.md) | 中 | 2026-10-03 | backlog reject/reopen/note が SELECT 後の更新で選択と競合する |
 | [improve-daily-params-weekly-algorithm](open/improve-daily-params-weekly-algorithm.md) | 中 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
 | [manual-improve-runs-synchronously-on-caller-thread](open/manual-improve-runs-synchronously-on-caller-thread.md) | 中 | 2026-10-03 | 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する |
-| [improve-objective-filtered-signal-quality](open/improve-objective-filtered-signal-quality.md) | 中 | 2026-10-07 | 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に) |
 | [reference-symbols-as-indicator-inputs](open/reference-symbols-as-indicator-inputs.md) | 中 | 2026-10-08 | 戦略 plugin に株価指数など参照 symbol の値を指標として渡す |
-| [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
