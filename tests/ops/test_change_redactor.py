@@ -89,3 +89,32 @@ def test_decodable_file_is_text():
                                            ("period", False), ("monkey", False)])
 def test_credential_key_names(key, expected):
     assert R.is_credential_key(key) is expected
+
+
+@pytest.mark.parametrize("text", [
+    "from 2026-10-01 to 2026-10-19", "at 2026-10-19T12:34:56Z", "at 2026-10-19T12:34:56+09:00",
+    "at 2026-10-19T12:34", "2026/10/19", "ran 12:34:56 ok", "2026-10-19 12:34:56 start",
+])
+def test_iso_dates_and_times_are_not_taken_for_account_numbers(text):
+    assert R.redact(text) == text
+
+
+@pytest.mark.parametrize("text", ["12345678", "1234-5678-9012", "20261019", "id 1234 5678 9012"])
+def test_digit_runs_without_a_date_shape_are_still_redacted(text):
+    assert L.REDACTED in R.redact(text)
+
+
+@pytest.mark.parametrize("text", [
+    "logger.info('x')", "self.local = 1", "a[1::2]", "os.path.join(a, b)", "self.app.test(1)",
+    "x = obj.home", "if df.in_range: pass", "log.int(3)",
+])
+def test_attribute_access_and_slices_are_not_taken_for_hosts(text):
+    assert R.redact(text) == text
+
+
+@pytest.mark.parametrize("text", [
+    "db.internal", "user@mail.info", "host=api.test", "server: 'x.local'", "connect api.example.com",
+    "printer.office.local", "fe80::1", "[::1]", "x = [2001:db8::1]",
+])
+def test_hostnames_in_host_contexts_are_redacted(text):
+    assert L.REDACTED in R.redact(text)

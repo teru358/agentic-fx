@@ -39,11 +39,21 @@ _CRED = re.compile(
     r"(?i)(?<![A-Za-z0-9])((?:[A-Za-z0-9]+[_.-])*" + _CRED_NAME + r"[\"']?\s*[:=]\s*)"
     r"(\"[^\"\n]*\"|'[^'\n]*'|[^\s,;)}\]]+)")
 _CRED_KEY = re.compile(r"(?i)(?:^|[_.-])" + _CRED_NAME + r"$")
-_EMAIL_HOST = re.compile(
-    r"(?i)(?<![\w.-])(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+"
-    r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
-    r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
-    r"corp|intranet|test|example|invalid)(?![\w-])")
+_HOST_LABELS = r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)"
+_ANY_TLD = (r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
+            r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
+            r"corp|intranet|test|example|invalid)")
+# 文脈なしで hostname とみなす TLD。info / test / app / in / me / co / home / int / local などの
+# 一般語は ``obj.info`` のような属性アクセスと区別できないので文脈 (URL・email・host= など)
+# が要る。直後が ``(`` なら呼び出しとして除く。
+_HOST_BARE = re.compile(
+    r"(?i)(?<![\w.-])" + _HOST_LABELS + r"+(?:com|net|org|io|jp|dev|cloud|ai|internal|corp|lan)"
+    r"(?![\w(-])")
+_HOST_LOCAL_BARE = re.compile(
+    r"(?i)(?<![\w.-])" + _HOST_LABELS + r"{2,}local(?![\w(-])")
+_HOST_CONTEXT = re.compile(
+    r"(?i)(@|\b(?:host(?:name)?|server|addr(?:ess)?|domain|endpoint)\s*[:=]\s*[\"']?)"
+    + _HOST_LABELS + r"+" + _ANY_TLD + r"(?![\w-])")
 _LOCALHOST = re.compile(r"(?i)(?<![\w.-])localhost(?![\w-])")
 _IPV4 = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])")
 _IPV6 = re.compile(
@@ -60,6 +70,12 @@ _TOKEN = re.compile(r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_=-]{%d,}(?![A-Za-z0-9+/_
                     % TOKEN_MIN_LENGTH)
 _ACCOUNT_RUN = re.compile(r"(?<![\w.])\d{%d,}(?![\w.])" % ACCOUNT_MIN_DIGITS)
 _ACCOUNT_GROUPS = re.compile(r"(?<![\w.])\d{2,12}(?:[- ]\d{2,12}){2,}(?![\w.])")
+# 口座の数字列の検出から除く日付と時刻 (ISO 8601 の日付・日時、``YYYY/MM/DD``、``HH:MM:SS``)
+_DATE_TIME = re.compile(
+    r"(?<![\w.:-])(?:\d{4}[-/](?:0[1-9]|1[0-2])[-/](?:0[1-9]|[12]\d|3[01])"
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+    r"|\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?![\w:-])")
+_SUBSCRIPT_BRACKET = re.compile(r"[\w)\]]\[$")
 _STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _KEPT_CONTROLS = frozenset({"\n", "\t"})
 _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
@@ -98,6 +114,13 @@ def _is_token(text: str) -> bool:
 
 def _token_sub(match: re.Match) -> str:
     return REDACTED if _is_token(match.group(0)) else match.group(0)
+
+
+def _ipv6_sub(match: re.Match) -> str:
+    """``a[1::2]`` のような添字のスライスは IPv6 とみなさない。"""
+    if _SUBSCRIPT_BRACKET.search(match.string[max(0, match.start() - 2):match.start()]):
+        return match.group(0)
+    return REDACTED
 
 
 def _account_groups_sub(match: re.Match) -> str:
@@ -153,17 +176,34 @@ def _scan(text: str) -> str:
     text = _BEARER.sub(REDACTED, text)
     text = _CRED.sub(lambda m: m.group(1) + REDACTED, text)
     text = _PREFIXED_TOKEN.sub(REDACTED, text)
-    text = _EMAIL_HOST.sub(REDACTED, text)
+    text = _HOST_CONTEXT.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _HOST_BARE.sub(REDACTED, text)
+    text = _HOST_LOCAL_BARE.sub(REDACTED, text)
     text = _LOCALHOST.sub(REDACTED, text)
     text = _IPV4.sub(REDACTED, text)
-    text = _IPV6.sub(REDACTED, text)
+    text = _IPV6.sub(lambda m: _ipv6_sub(m), text)
     text = _WIN_PATH.sub(REDACTED, text)
     text = _HOME_PATH.sub(REDACTED, text)
     text = _UNIX_PATH.sub(REDACTED, text)
     text = _TOKEN.sub(_token_sub, text)
+    return _outside_dates(text, _scan_digits)
+
+
+def _scan_digits(text: str) -> str:
     text = _ACCOUNT_GROUPS.sub(_account_groups_sub, text)
-    text = _ACCOUNT_RUN.sub(REDACTED, text)
-    return text
+    return _ACCOUNT_RUN.sub(REDACTED, text)
+
+
+def _outside_dates(text: str, scan) -> str:
+    """日付・時刻の区間を除いた残りだけに ``scan`` を掛ける。"""
+    out: list[str] = []
+    position = 0
+    for match in _DATE_TIME.finditer(text):
+        out.append(scan(text[position:match.start()]))
+        out.append(match.group(0))
+        position = match.end()
+    out.append(scan(text[position:]))
+    return "".join(out)
 
 
 def redact(text: str) -> str:
