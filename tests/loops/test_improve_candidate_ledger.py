@@ -594,6 +594,32 @@ def test_ac23_e16_finalize_success_exception(improve_env):
         (ctx.mission_id,)).fetchone()[0] == "failed"
 
 
+def test_ac23_e15_settle_cas_failure_persists_no_approval(improve_env):
+    """提出する行が not_submitted でなければ pending へ進められない。承認を
+    書かずに Tx-2 全体を戻し、失敗の終端に落とす。"""
+    app, root = improve_env
+    original = ImproveLoop._ensure_final_archive_row
+
+    def already_decided(self, conn, **kwargs):
+        archive_id = original(self, conn, **kwargs)
+        conn.execute("UPDATE candidate_archives SET outcome_class="
+                     "'gate_failed' WHERE id=?", (archive_id,))
+        return archive_id
+
+    loop, ctx, seeded = _run(
+        app, root, _plugin_artifact("cand", kind="strategy"),
+        files=_strategy(), in_sample=_fake_in_sample_metrics(40),
+        holdout_fn=_fake_holdout_metrics(),
+        extra=[patch.object(ImproveLoop, "_ensure_final_archive_row",
+                            already_decided)])
+    conn = app.conn_core
+    assert conn.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (ctx.mission_id,)).fetchone()[0] == "failed"
+    _expect_rows(conn, ctx, seeded, None)
+
+
 def test_ac23_e17_commit_exception_then_compensation(improve_env):
     app, root = improve_env
     conn = app.conn_core

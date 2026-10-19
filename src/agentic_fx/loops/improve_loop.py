@@ -2648,9 +2648,9 @@ class ImproveLoop:
                     now=now, snapshot=True)
                 if not archives_store.settle(
                         conn, candidate_archive_id, "pending"):
-                    _log.warning(
-                        "candidate archive %s was not not_submitted; "
-                        "skip pending", candidate_archive_id)
+                    raise RuntimeError(
+                        f"candidate archive {candidate_archive_id} was not "
+                        "not_submitted; cannot submit")
                 approval_payload["candidate_archive_id"] = candidate_archive_id
                 accepted = accepted_entries(ledger_entries)
                 approval_payload["analysis_call_count"] = sum(
