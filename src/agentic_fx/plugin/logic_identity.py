@@ -14,6 +14,9 @@ from typing import Any
 
 import yaml
 
+# hash の算法の版。規則を変えたら上げ、保存済みの hash は migration が
+# 接頭辞の違う行を再計算する。
+LOGIC_HASH_PREFIX = "v1:"
 _DOCSTRING_NODES = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 # 値が説明文であって判定に効かない keyword 引数 / dict キー
 _NON_SEMANTIC_KEYS = frozenset({"rationale", "reason", "description", "note"})
@@ -36,6 +39,16 @@ class _Normalizer(ast.NodeTransformer):
         if isinstance(value, bool):
             return node
         if isinstance(value, (int, float, complex)):
+            return ast.Constant(value=0)
+        return node
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+        self.generic_visit(node)
+        operand = node.operand
+        if (isinstance(node.op, (ast.USub, ast.UAdd))
+                and isinstance(operand, ast.Constant)
+                and isinstance(operand.value, (int, float, complex))
+                and not isinstance(operand.value, bool)):
             return ast.Constant(value=0)
         return node
 
@@ -98,7 +111,8 @@ def logic_hash_of(plugin_py: str, config_yaml: str) -> str | None:
              "indicators": _indicator_plugins(config)}
     payload = ast.dump(tree, include_attributes=False) + "\0" + json.dumps(
         shape, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return LOGIC_HASH_PREFIX + hashlib.sha256(
+        payload.encode("utf-8")).hexdigest()
 
 
 def family_key_of(config_yaml: str, *, name: str) -> str | None:

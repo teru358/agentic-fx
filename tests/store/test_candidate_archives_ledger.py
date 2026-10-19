@@ -391,7 +391,7 @@ def test_ac19_legacy_logic_hash_and_family_key_backfilled_or_null(tmp_path):
     migrated = connect(path)
     init_db(migrated, root=root)
     rows = _by_artifact(migrated)
-    assert rows["h1"]["logic_hash"] and len(rows["h1"]["logic_hash"]) == 64
+    assert rows["h1"]["logic_hash"].startswith("v1:")
     assert rows["h1"]["family_key"] is None      # indicator 依存の無い戦略
     assert rows["h2"]["family_key"] == "indicator:rsi_indicator@1h"
     assert rows["broken"]["logic_hash"] is None  # parse 不能は NULL
@@ -399,6 +399,21 @@ def test_ac19_legacy_logic_hash_and_family_key_backfilled_or_null(tmp_path):
     again = {k: dict(v) for k, v in rows.items()}
     init_db(migrated, root=root)
     assert {k: dict(v) for k, v in _by_artifact(migrated).items()} == again
+
+
+def test_stored_hash_of_an_older_algorithm_version_is_recomputed(tmp_path):
+    root, path, *_ = _legacy_fixture(tmp_path)
+    migrated = connect(path)
+    init_db(migrated, root=root)
+    current = _by_artifact(migrated)["h1"]["logic_hash"]
+    assert current.startswith("v1:")
+    migrated.execute("UPDATE candidate_archives SET logic_hash=? WHERE "
+                     "artifact_hash='h1'", ("0" * 64,))
+    migrated.commit()
+    init_db(migrated)  # root なしでは触らない
+    assert _by_artifact(migrated)["h1"]["logic_hash"] == "0" * 64
+    init_db(migrated, root=root)
+    assert _by_artifact(migrated)["h1"]["logic_hash"] == current
 
 
 def test_ac19_without_root_hashes_stay_null_until_root_given(tmp_path):

@@ -1641,19 +1641,23 @@ def _rebuild_candidate_archives(conn: sqlite3.Connection) -> None:
 
 def _backfill_candidate_archive_identity(conn: sqlite3.Connection, *,
                                          root: Path) -> None:
-    from agentic_fx.plugin.logic_identity import identity_of_dir
+    from agentic_fx.plugin.logic_identity import (
+        LOGIC_HASH_PREFIX, identity_of_dir)
 
     rows = conn.execute(
-        "SELECT id, name, archive_path FROM candidate_archives "
-        "WHERE logic_hash IS NULL AND family_key IS NULL "
-        "AND archive_path IS NOT NULL").fetchall()
+        "SELECT id, name, archive_path, logic_hash FROM candidate_archives "
+        "WHERE archive_path IS NOT NULL AND ("
+        "(logic_hash IS NULL AND family_key IS NULL) "
+        "OR (logic_hash IS NOT NULL AND substr(logic_hash, 1, ?) != ?))",
+        (len(LOGIC_HASH_PREFIX), LOGIC_HASH_PREFIX)).fetchall()
     for row in rows:
         target = root / row["archive_path"]
         if target.is_symlink() or not target.is_dir():
             continue
         logic, family = identity_of_dir(target, name=row["name"])
-        if logic is None and family is None:
-            continue
+        if logic is None:
+            if family is None or row["logic_hash"] is not None:
+                continue
         conn.execute(
             "UPDATE candidate_archives SET logic_hash=?, family_key=? "
             "WHERE id=?", (logic, family, row["id"]))

@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agentic_fx.plugin.logic_identity import (
-    family_key_of, identity_of_dir, logic_hash_of)
+    LOGIC_HASH_PREFIX, family_key_of, identity_of_dir, logic_hash_of)
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "docs" / "examples" / "plugins"
 CONFIG = "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nparams: {x: 1}\n"
@@ -22,6 +22,29 @@ def test_numeric_literals_docstrings_and_rationale_do_not_change_the_hash():
     changed = BASE.replace("100", "150").replace("30", "45").replace(
         "説明", "別の説明").replace('"above"', '"さらに別の理由"')
     assert logic_hash_of(BASE, CONFIG) == logic_hash_of(changed, CONFIG)
+
+
+def test_signed_numeric_literals_are_dropped_like_unsigned_ones():
+    negative = BASE.replace("> 100", "> -1").replace('"sl": 30', '"sl": -30')
+    positive = BASE.replace("> 100", "> 2").replace('"sl": 30', '"sl": +7')
+    assert logic_hash_of(negative, CONFIG) == logic_hash_of(positive, CONFIG)
+    assert logic_hash_of(negative, CONFIG) == logic_hash_of(BASE, CONFIG)
+
+
+def test_description_and_note_strings_do_not_change_the_hash():
+    with_text = BASE.replace(
+        '"rationale": "above"',
+        '"rationale": "above", "description": "d1", "note": "n1"')
+    other_text = BASE.replace(
+        '"rationale": "above"',
+        '"rationale": "above", "description": "d2", "note": "n2"')
+    assert logic_hash_of(with_text, CONFIG) == logic_hash_of(other_text, CONFIG)
+
+
+def test_hash_carries_the_algorithm_version_prefix():
+    value = logic_hash_of(BASE, CONFIG)
+    assert value.startswith(LOGIC_HASH_PREFIX) and LOGIC_HASH_PREFIX == "v1:"
+    assert len(value) == len(LOGIC_HASH_PREFIX) + 64
 
 
 def test_decisive_strings_and_structure_change_the_hash():

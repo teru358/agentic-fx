@@ -166,7 +166,7 @@ def test_ac22_i_rewritten_selftest_creates_new_row_and_payload_points_to_it(
     assert extra["pair"] == "USDJPY"
     assert extra["archive_path"] is not None
     assert (root / extra["archive_path"] / "plugin.py").is_file()
-    assert extra["logic_hash"] and len(extra["logic_hash"]) == 64
+    assert extra["logic_hash"].startswith("v1:")
     assert extra["family_key"] is None  # indicator 依存の無い戦略
 
 
