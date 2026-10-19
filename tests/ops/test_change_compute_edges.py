@@ -83,12 +83,13 @@ def test_hunk_context_is_three_lines_each_side():
 
 def test_files_at_the_diff_line_limit_are_diffed_and_one_line_over_is_replaced_whole():
     old = _lines(L.DIFF_MAX_LINES)
-    new = list(old)
-    new[100] = "changed"
-    (small,) = C._hunks(old, new)
-    assert len(small["lines"]) == 2 * L.DIFF_CONTEXT + 2
+    new = old[:100]
+    new[50] = "changed"
+    small = C._hunks(old, new)
+    assert any(" line 49" in hunk["lines"] for hunk in small)
+    assert sum(len(hunk["lines"]) for hunk in small) < len(old) + len(new)
     (whole,) = C._hunks(old + ["tail"], new + ["tail"])
-    assert len(whole["lines"]) == 2 * (L.DIFF_MAX_LINES + 1)
+    assert len(whole["lines"]) == len(old) + 1 + len(new) + 1
 
 
 def test_one_oversized_side_is_enough_to_replace_the_whole_file():

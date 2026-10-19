@@ -754,7 +754,7 @@ def format_change_lines(change) -> list[str]:
                 f"{'(なし)' if old is None else _safe_cell(old, change_limits.PARAM_VALUE_CHARS)}"
                 f" → {'(なし)' if new is None else _safe_cell(new, change_limits.PARAM_VALUE_CHARS)}")
     extra = [("ほか", params.get("omitted")), ("形に合わない key", params.get("invalid_keys")),
-             ("展開の上限を超えた項目", params.get("flatten_omitted"))]
+             ("比較していない key", params.get("flatten_omitted"))]
     for label_, count in extra:
         if type(count) is int and count > 0:
             lines.append(f"  ({label_} {count} 件)")

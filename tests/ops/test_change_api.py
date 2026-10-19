@@ -303,19 +303,20 @@ def test_ac5_flatten_item_count_boundary(ops_env, delta, omitted):
                                         new_cfg=_many(count, 2))
     params = _detail(ops_env, approval_id)["change"]["params"]
     assert len(params["items"]) == min(count, L.FLATTEN_MAX_ITEMS)
-    # 旧・新の両側で超えた分が件数になる
-    assert params["flatten_omitted"] == 2 * omitted
+    # 旧・新の key の和集合のうち、上限を超えた分が件数になる
+    assert params["flatten_omitted"] == omitted
 
 
 @pytest.mark.parametrize("added,shown,omitted", [(31, 63, 0), (32, 64, 0), (33, 64, 1)])
 def test_ac5_params_diff_count_boundary(ops_env, added, shown, omitted):
+    # 比較する key は旧・新の和集合の先頭 64 件。超えた分は flatten_omitted に数える
     # 旧 32 項目が消え、新が added 項目増える: 差分は 32 + added 件 (63 / 64 / 65)
     old = "kind: strategy\nparams:\n" + "".join(f"  a{i:03d}: 1\n" for i in range(32))
     new = "kind: strategy\nparams:\n" + "".join(f"  b{i:03d}: 1\n" for i in range(added))
     assert 32 + added in (L.PARAMS_DIFF_MAX - 1, L.PARAMS_DIFF_MAX, L.PARAMS_DIFF_MAX + 1)
     approval_id, _, _ = _pending_update(ops_env, old_cfg=old, new_cfg=new)
     params = _detail(ops_env, approval_id)["change"]["params"]
-    assert len(params["items"]) == shown and params["omitted"] == omitted
+    assert len(params["items"]) == shown and params["flatten_omitted"] == omitted
 
 
 @pytest.mark.parametrize("delta", [-1, 0, 1])

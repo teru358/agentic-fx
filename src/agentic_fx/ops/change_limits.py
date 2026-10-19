@@ -17,6 +17,9 @@ FLATTEN_MAX_ITEMS = 64
 API_DIFF_BYTES = 512 * KIB
 # 行単位の差分計算を掛ける 1 ファイルの行数の上限。超えるファイルは全置換の 1 hunk にする
 DIFF_MAX_LINES = 20000
+# 行単位の差分計算の計算量 (旧の行数 x 新の行数) の上限。超えるファイルは全置換にする
+DIFF_MAX_CELLS = 4_000_000
+DIFF_DEGRADED_TOO_MANY_LINES = "too_many_lines"
 DIFF_CONTEXT = 3
 
 # ---- redaction 対象上限

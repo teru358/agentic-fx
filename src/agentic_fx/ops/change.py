@@ -11,6 +11,7 @@ import difflib
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -135,14 +136,15 @@ def _scalar_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def _flatten(value: object, prefix: str, depth: int, out: dict, counter: list) -> None:
+def _flatten(value: object, prefix: str, depth: int, out: dict, counter: list,
+             limit: int = L.FLATTEN_MAX_ITEMS) -> None:
     """入れ子を ``a.b.c`` の key へ決定的に展開する。最大深さを超えた入れ子は 1 つの項目に
     まとめ、最大項目数を超えた分は ``counter[0]`` に件数だけ積む。"""
     if type(value) is dict and depth < L.FLATTEN_MAX_DEPTH and value:
         for key in sorted(value, key=str):
-            _flatten(value[key], f"{prefix}.{key}", depth + 1, out, counter)
+            _flatten(value[key], f"{prefix}.{key}", depth + 1, out, counter, limit)
         return
-    if len(out) >= L.FLATTEN_MAX_ITEMS:
+    if len(out) >= limit:
         counter[0] += 1
         return
     out[prefix] = _scalar_text(value)
@@ -166,11 +168,12 @@ def _config_sections(config: object) -> dict:
     return sections
 
 
-def _flatten_config(config: object) -> tuple[dict, int]:
+def _flatten_config(config: object, limit: int = L.FLATTEN_MAX_ITEMS) -> tuple[dict, int]:
     out: dict = {}
     counter = [0]
     for prefix, value in _config_sections(config).items():
-        _flatten(value, prefix, 0 if type(value) is dict else L.FLATTEN_MAX_DEPTH, out, counter)
+        _flatten(value, prefix, 0 if type(value) is dict else L.FLATTEN_MAX_DEPTH, out, counter,
+                 limit)
     return out, counter[0]
 
 
@@ -204,10 +207,13 @@ def _params_diff(old_data: bytes | None, new_data: bytes) -> dict:
     if old_config is _NO_VALUE or new_config is _NO_VALUE:
         result["reason"] = L.REDACTED_CODE
         return result
-    old_flat, old_omitted = _flatten_config(old_config)
-    new_flat, new_omitted = _flatten_config(new_config)
-    result["flatten_omitted"] = old_omitted + new_omitted
-    for key in sorted(set(old_flat) | set(new_flat)):
+    # 旧・新の key の和集合を並べて先頭だけを両側に当てる (片側だけ切ると、同じ key が
+    # 一方では「なし」に見える)
+    old_flat, _ = _flatten_config(old_config, sys.maxsize)
+    new_flat, _ = _flatten_config(new_config, sys.maxsize)
+    union = sorted(set(old_flat) | set(new_flat))
+    result["flatten_omitted"] = max(0, len(union) - L.FLATTEN_MAX_ITEMS)
+    for key in union[:L.FLATTEN_MAX_ITEMS]:
         before, after = old_flat.get(key), new_flat.get(key)
         if before == after:
             continue
@@ -244,8 +250,14 @@ def _redact_line(line: str) -> str:
     return redactor.redact_value(line)
 
 
+def _diff_degraded(old: list[str], new: list[str]) -> bool:
+    """差分の計算を省いて全置換にするか (行数が多く、二次の計算量になるとき)。"""
+    return (len(old) > L.DIFF_MAX_LINES or len(new) > L.DIFF_MAX_LINES
+            or len(old) * len(new) > L.DIFF_MAX_CELLS)
+
+
 def _hunks(old: list[str], new: list[str]) -> list[dict]:
-    if len(old) > L.DIFF_MAX_LINES or len(new) > L.DIFF_MAX_LINES:
+    if _diff_degraded(old, new):
         groups = [[("replace", 0, len(old), 0, len(new))]] if old or new else []
     else:
         matcher = difflib.SequenceMatcher(None, old, new, autojunk=False)
@@ -277,9 +289,12 @@ def _file_diff(path: str, old: bytes | None, new: bytes) -> dict:
     if old is not None and old == new:
         return {"path": path, "status": "unchanged", "reason": None, "hunks": [],
                 "omitted_lines": 0}
-    hunks = _hunks(_lines_of(old_text), _lines_of(new_text))
-    return {"path": path, "status": "added" if old is None else "changed", "reason": None,
-            "hunks": hunks, "omitted_lines": 0}
+    old_lines, new_lines = _lines_of(old_text), _lines_of(new_text)
+    entry = {"path": path, "status": "added" if old is None else "changed", "reason": None,
+             "hunks": _hunks(old_lines, new_lines), "omitted_lines": 0}
+    if _diff_degraded(old_lines, new_lines):
+        entry["diff_degraded"] = L.DIFF_DEGRADED_TOO_MANY_LINES
+    return entry
 
 
 def _serialized_bytes(response: dict) -> int:
@@ -329,7 +344,29 @@ def fit_response_to_bytes(response: dict, limit: int | None = None) -> int:
             low = middle
         else:
             high = middle - 1
-    return apply(low)
+    omitted_total = apply(low)
+    if _serialized_bytes(response) > limit:
+        _shrink_to_reason_only(response, limit)
+    return omitted_total
+
+
+def _shrink_to_reason_only(response: dict, limit: int) -> None:
+    """diff の行を全て省いても ``limit`` を超えるとき、diff の file 一覧、申告、params の
+    項目の順に落とす。それでも超えるなら理由だけの応答にして、必ず ``limit`` 以下にする。"""
+    diff = response["diff"]
+    diff["files"] = []
+    steps = (lambda: response.update(claims={}),
+             lambda: response["change"].get("params", {}).update(items=[])
+             if isinstance(response["change"].get("params"), dict) else None)
+    for step in (None, *steps):
+        if step is not None:
+            step()
+        if _serialized_bytes(response) <= limit:
+            return
+    change = response["change"]
+    response["change"] = {"classification": change.get("classification"),
+                          "reason": L.TOO_LARGE}
+    response["claims"] = {}
 
 
 # ---------------------------------------------------------------- 成績と申告

@@ -278,7 +278,7 @@ def _params_rows(change: Mapping[str, object]) -> tuple[list[str], str]:
         rows.append(f"<dt>{_cut(item.get('key'), VALUE_CHARS)}</dt><dd>{old_text} → {new_text}</dd>")
     notes = []
     for label, key in (("ほか", "omitted"), ("形に合わない key", "invalid_keys"),
-                       ("展開の上限を超えた項目", "flatten_omitted")):
+                       ("比較していない key", "flatten_omitted")):
         count = params.get(key)
         if type(count) is int and count > 0:
             notes.append(f"<p>{label} {count} 件</p>")
