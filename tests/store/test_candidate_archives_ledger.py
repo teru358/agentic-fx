@@ -410,6 +410,62 @@ def test_ac19_without_root_hashes_stay_null_until_root_given(tmp_path):
     assert _by_artifact(migrated)["h1"]["logic_hash"] is not None
 
 
+def _drop_check(conn):
+    """列の形は同じまま CHECK だけ無い台帳にする (行は保つ)。"""
+    ddl = conn.execute("SELECT sql FROM sqlite_master WHERE "
+                       "name='candidate_archives'").fetchone()[0]
+    stripped = re.sub(r"CHECK \(outcome_class IN \([^)]*\)\)", "", ddl)
+    assert stripped != ddl
+    conn.execute("ALTER TABLE candidate_archives RENAME TO ca_old")
+    conn.execute(stripped)
+    conn.execute("INSERT INTO candidate_archives SELECT * FROM ca_old")
+    conn.execute("DROP TABLE ca_old")
+    conn.commit()
+
+
+def test_migration_rebuilds_when_only_the_check_clause_is_missing(tmp_path):
+    conn = _conn(tmp_path)
+    archive_id = _insert(conn)
+    _drop_check(conn)
+    conn.execute("UPDATE candidate_archives SET outcome_class='bogus'")
+    conn.execute("UPDATE candidate_archives SET outcome_class='unprofitable'")
+    conn.commit()
+    path = tmp_path / "ledger.db"
+    conn.close()
+    migrated = connect(path)
+    init_db(migrated)
+    ddl = migrated.execute("SELECT sql FROM sqlite_master WHERE "
+                           "name='candidate_archives'").fetchone()[0]
+    for value in OUTCOMES:
+        assert f"'{value}'" in ddl
+    with pytest.raises(sqlite3.IntegrityError):
+        migrated.execute("UPDATE candidate_archives SET outcome_class='bogus'")
+    assert _outcome(migrated, archive_id) == "unprofitable"
+
+
+def test_backfill_never_overwrites_a_row_that_already_has_a_value(tmp_path):
+    conn = _conn(tmp_path)
+    kept = _insert(conn, artifact_hash="kept", content_hash="ck")
+    fresh = _insert(conn, artifact_hash="fresh", content_hash="cf")
+    conn.execute("UPDATE candidate_archives SET outcome_class='unprofitable' "
+                 "WHERE id=?", (kept,))
+    for artifact, content, status in (("kept", "ck", "approved"),
+                                      ("fresh", "cf", "rejected")):
+        conn.execute(
+            "INSERT INTO approval_requests (kind,payload_json,status,reason,"
+            "decided_by,decided_at,created_at) VALUES ('plugin',?,?,NULL,"
+            "'h',?,?)", (json.dumps({"mission_id": 3, "artifact_hash": artifact,
+                                     "content_hash": content}), status,
+                         NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+    _drop_check(conn)
+    conn.close()
+    migrated = connect(tmp_path / "ledger.db")
+    init_db(migrated)
+    assert _outcome(migrated, kept) == "unprofitable"
+    assert _outcome(migrated, fresh) == "rejected_by_human"
+
+
 def test_resolve_priority_and_ambiguity(tmp_path):
     conn = _conn(tmp_path)
     first = _insert(conn, artifact_hash="a1", content_hash="c")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1568,13 +1569,25 @@ def _candidate_archives_shape(conn: sqlite3.Connection) -> list[tuple]:
             for r in conn.execute("PRAGMA table_info(candidate_archives)")]
 
 
+def _outcome_check_values(conn: sqlite3.Connection) -> frozenset[str]:
+    """表の DDL にある `outcome_class IN (...)` の許容値。CHECK が無ければ空。"""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                       "AND name='candidate_archives'").fetchone()
+    match = re.search(r"CHECK\s*\(\s*outcome_class\s+IN\s*\(([^)]*)\)",
+                      row["sql"] if row is not None else "")
+    if match is None:
+        return frozenset()
+    return frozenset(re.findall(r"'([^']*)'", match.group(1)))
+
+
 def _migrate_candidate_archives(conn: sqlite3.Connection, *,
                                 root: Path | None) -> None:
     """候補台帳を現行の形 (4 列追加と `pair` の NULL 許可) にする。
 
-    `PRAGMA table_info` が正準の形と食い違うときだけ table rebuild
-    (新表 CREATE → コピー → 旧表 DROP → RENAME) を行い、同じ tx で旧行の
-    `outcome_class` を承認との照合で埋める。既存列の値は変えない。
+    `PRAGMA table_info` か `outcome_class` の CHECK 句が正準と食い違うときだけ table rebuild
+    (新表 CREATE → コピー → 旧表 DROP → RENAME) を行い、同じ tx で
+    `not_submitted` のままの行の `outcome_class` を承認との照合で埋める。
+    既存列の値と、既に値のある行は変えない。
     `logic_hash` / `family_key` は rebuild と別に、NULL の行へ archive の
     現物から埋める (root がある起動のたびに残りだけ試す)。"""
     probe = sqlite3.connect(":memory:")
@@ -1582,9 +1595,11 @@ def _migrate_candidate_archives(conn: sqlite3.Connection, *,
         probe.row_factory = sqlite3.Row
         probe.executescript(_CANDIDATE_ARCHIVES_DDL)
         canonical = _candidate_archives_shape(probe)
+        canonical_check = _outcome_check_values(probe)
     finally:
         probe.close()
-    if _candidate_archives_shape(conn) != canonical:
+    if (_candidate_archives_shape(conn) != canonical
+            or _outcome_check_values(conn) != canonical_check):
         _rebuild_candidate_archives(conn)
     if root is not None:
         _backfill_candidate_archive_identity(conn, root=root)
