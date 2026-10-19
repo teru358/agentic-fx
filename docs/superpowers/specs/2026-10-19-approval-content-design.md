@@ -1,6 +1,6 @@
 # 承認の中身を見せる設計書
 
-**版:** v1.2 (ユーザー承認済み、実装可)
+**版:** v1.4 (ユーザー承認済み、実装可)
 **対象:** `approval-notice-lacks-change-content` と `bot-event-notices-are-raw-log-lines` の 2 チケットを 1 つの spec で扱う。実装束は 2 つに分ける (§10)。
 **位置づけ:** ユーザー裁定 4 問 (§8.1) を反映した確定版。この版から実装に入る。
 
@@ -304,6 +304,9 @@ event の `decided_by` は API の principal 名 (`api:ops-bot` など) で、�
 
 - 検出対象: 絶対パス、URL・裸の hostname・IP、credential の代入 (`token=` `key=` `password=` `secret=` 等)、高エントロピーの token、口座らしい数字列。
 - 順序: **入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → 表示形式の escape (§3.2、§4.3) → 表示上限**。この順を崩さない (除去の前に redact すると、表示面が後で制御文字を消したときに分断された秘密が復元される。escape の後に redact すると検出を逃す、表示上限を先に掛けると完成本文が超える)。除去は redactor が検出の前に行い、出力も除去済みの文字列を基に作る。改行とタブは表示面が扱うため残し、CR は除去する。80 字・300 字・2000 字・64 KiB はすべて escape 後の表示上限である。
+- 裸の hostname (`evil.xyz` のように scheme も `host=` の文脈もないもの) は、`.` でつながる語の最後の label が TLD (IANA の一覧の ASCII の TLD と、`local` / `internal` / `test` など特殊用途の名前を `change_limits.py` に同梱) か、どれかの label が `xn--` で始まる語を伏せる。全角の句点類 (U+3002 / U+FF0E / U+FF61) は `.` に、U+FF0F は `/` に、U+FF20 は `@` に NFKC の前に寄せる。`%XX` の decode は固定点まで (上限 3 回) 掛け、どの段で検出されても値全体を伏せる (3 回で終わらないものも伏せる)。plugin のファイル名 (`plugin.py` など) 自体は hostname としない。自由文では `foo.py` や `README.md` のように TLD と同じ拡張子の語も伏せる (明示の受容判断。誤検出より漏れを嫌う)。
+- **検出の範囲は入力の種類で分ける**。自由文 (config.yaml の key と value、summary、rationale、parent_facts、reason、diff の Python 以外のファイル) は全体が対象。Python ソース (diff の `plugin.py` と `test_plugin.py`) は、ファイル全文を `tokenize` して求めた文字列リテラルとコメントの範囲にかかる語だけが対象で、識別子の連なり (`logger.info`、`self.local`) は hostname としない。f-string は全体を文字列として扱う。構文として読めない (`ast.parse` か `tokenize` が失敗する) ファイルは全行を自由文として扱う。URL・IP・credential・token・パスの検出は Python ソースでも全行に掛ける。
+- **口座らしい文脈の日付**: 口座の数字列の検出から ISO 日付・時刻を除く例外は、`account` / `acct` / `iban` / `card` / `口座` / `customer` / `client_id` / `login` / `user_id` / `number` を含む key、または語としての `no` で終わる key の値 (`=` か `:` の直後) には効かない。裸の `2026-10-19` や `from 2026-10-01 to 2026-10-19` は日付として残し、`account=2026-10-19` は日付の形でも伏せる (明示の受容判断。日付表示と口座番号の隠蔽は両立しないので、key が口座らしいときは隠蔽を優先する)。params の値も同じ key 規則で見る。
 - redactor に渡す 1 値には redaction 対象上限 (§2.7、8 KiB) がある。超える値は**切らずに**全文を伏せる (切ると token が境界で割れて検出を逃すため)。
 - fail-closed: 判定不能なファイル (検出が確信できない、非 UTF-8) は**そのファイルの全文**を伏せ、reason code `redacted` (「機微情報の可能性があるためローカルで確認してください」) を表示する。他のファイルは出す。部分的に出して誤魔化さない。入力ファイルの読み取り上限超過は redaction ではなく `too_large` (change 全体)、単一値の 8 KiB 超過はその値だけ `[redacted]` (§5 の粒度表)。
 - 検出に失敗した値は伏せる側に倒す。
@@ -452,3 +455,4 @@ T1 → T2 を 1 束 (T2 は T1 の safe な change モデルと API に依存)�
 | 2026-10-19 | v1.1 | T1 の実装で決めた細部を追記: `/change` の応答は `{id, change, claims, diff}`、diff は file ごとに `{path, status (added / changed / unchanged / redacted), reason, hunks[{header, lines}], omitted_lines}` (§5)。web の diff で hunk header も 1 行として数える (§2.7)。タブは空白 4 つにして表示 (§4.3)。展開上限を超えた項目の件数 `flatten_omitted` を params に載せる。pending 以外で配備ジャーナルが無い候補 (却下・失効など) の比較対象は `unknown` (§2.2) | T1 実装 | |
 | 2026-10-19 | v1.2 | 処理順を 入力読み取り上限 → Cc/Cf/Cs 除去 → redaction → escape → 表示上限 に訂正 (§2.2、§3.2、§4.3、§7.1)。redactor が検出の前に制御文字を除き、出力も除去済みの文字列から作る | NUL・ゼロ幅・孤立サロゲート・CR を値に挟むと検出を逃し、表示面の除去で伏せていない秘密が復元されることを実測 | |
 | 2026-10-19 | v1.3 | 行単位 diff の計算量を `DIFF_MAX_CELLS` で打ち切る (§2.7)。日付・時刻を口座の数字列の検出から除き、hostname は主要 TLD・文脈 (URL・email・host=) ・3 label 以上の `.local` に限り、添字のスライスを IPv6 とみなさない (redactor)。params の flatten は key の和集合の先頭 64 件を両側に当てる。`/change` の応答が上限を超えるときは diff → claims → params 項目 → 理由だけの順に落として必ず上限以下にする。web と CLI は型の外れた変更内容を固定文 1 行に倒す | /code-review high の指摘 8 件の是正 | |
+| 2026-10-19 | v1.4 | hostname の検出を入力の種類で分ける (自由文は全 TLD で全体、Python ソースは文字列・コメントのみで、tokenize / 構文の失敗は全行自由文)。TLD は IANA の一覧を同梱、`xn--` の label は無条件。decode は固定点まで (上限 3 回)、全角の句点類・スラッシュ・アットを NFKC の前に寄せる。口座らしい key の値は日付の形でも伏せる (§7.1)。`approval_detail` の change は diff を作らないことを test で pin | 閉鎖確認の指摘 3 件 (主要 TLD だけ裸で伏せる設計の回避、日付の無条件通過、diff の二重計算) の是正 | |

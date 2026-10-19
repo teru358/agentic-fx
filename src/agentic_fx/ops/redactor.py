@@ -9,8 +9,14 @@
 表示面は Cc・Cf・Cs を消すので、検出をその前に掛けると消えた後に繋がる秘密を取り逃がす。
 そのため検出は除去・正規化済みの文字列に掛け、出力もその文字列を基に作る (全角の
 ``ａｐｉ＿ｋｅｙ`` などは正規化で ASCII になる)。``%XX`` を 1 回だけ decode した複製にも検出を
-掛け、どちらかで検出されたら値全体を伏せる (decode 結果は表示に使わない)。正規化後も
-ASCII 外の文字が credential の key・URL の scheme・hostname の位置に残る値も全体を伏せる。改行とタブは
+掛け (固定点まで、上限 3 回)、どの段で検出されても値全体を伏せる (decode 結果は表示に使わない)。
+正規化後も ASCII 外の文字が credential の key・URL の scheme の位置に残る値も全体を伏せる。
+
+裸の hostname (``evil.xyz`` のように scheme も host= の文脈もないもの) は、最後の label が
+TLD (IANA の一覧と特殊用途の名前) か、どれかの label が ``xn--`` で始まる語を伏せる。検出の範囲は
+入力の種類で分ける。自由文 (config・申告・理由など) は全体が対象。Python ソースの行は
+``python_text_spans`` が求めた文字列リテラルとコメントの範囲だけが対象で、識別子の連なり
+(``logger.info``) は hostname とみなさない。構文として読めないファイルは全行を自由文として扱う。改行とタブは
 表示面が行の区切り・字下げとして扱うので残す (CR は表示面で改行に正規化されるが、
 単独の CR で語を割る回避を防ぐため除去する)。
 
@@ -21,14 +27,17 @@ fail-closed: 1 値の大きさが redaction 対象上限を超えるときは、
 """
 from __future__ import annotations
 
+import ast
+import io
 import math
 import re
+import tokenize
 import unicodedata
 import urllib.parse
 from collections import Counter
 
-from .change_limits import (ACCOUNT_MIN_DIGITS, MAX_REDACT_VALUE_BYTES, REDACTED,
-                            TOKEN_MIN_ENTROPY, TOKEN_MIN_ENTROPY_NO_DIGIT,
+from .change_limits import (ACCOUNT_MIN_DIGITS, HOST_TLDS, MAX_REDACT_VALUE_BYTES, PLUGIN_FILES,
+                            REDACTED, TOKEN_MIN_ENTROPY, TOKEN_MIN_ENTROPY_NO_DIGIT,
                             TOKEN_MIN_LENGTH)
 
 _URL = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://\S+|\bwww\.[^\s'\"<>]+")
@@ -43,14 +52,6 @@ _HOST_LABELS = r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)"
 _ANY_TLD = (r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
             r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
             r"corp|intranet|test|example|invalid)")
-# 文脈なしで hostname とみなす TLD。info / test / app / in / me / co / home / int / local などの
-# 一般語は ``obj.info`` のような属性アクセスと区別できないので文脈 (URL・email・host= など)
-# が要る。直後が ``(`` なら呼び出しとして除く。
-_HOST_BARE = re.compile(
-    r"(?i)(?<![\w.-])" + _HOST_LABELS + r"+(?:com|net|org|io|jp|dev|cloud|ai|internal|corp|lan)"
-    r"(?![\w(-])")
-_HOST_LOCAL_BARE = re.compile(
-    r"(?i)(?<![\w.-])" + _HOST_LABELS + r"{2,}local(?![\w(-])")
 _HOST_CONTEXT = re.compile(
     r"(?i)(@|\b(?:host(?:name)?|server|addr(?:ess)?|domain|endpoint)\s*[:=]\s*[\"']?)"
     + _HOST_LABELS + r"+" + _ANY_TLD + r"(?![\w-])")
@@ -80,11 +81,6 @@ _STRIPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
 _KEPT_CONTROLS = frozenset({"\n", "\t"})
 _PERCENT = re.compile(r"%[0-9A-Fa-f]{2}")
 _SCHEME_TOKEN = re.compile(r"(?<![^\s/])([^\s/]+)://")
-_UNI_HOST = re.compile(
-    r"(?i)(?<![\w.-])(?:[\w-]+\.)+"
-    r"(?:com|net|org|io|jp|co|dev|app|cloud|info|biz|edu|gov|mil|int|xyz|online|site|"
-    r"tech|ai|me|us|uk|de|fr|cn|ru|kr|in|au|ca|eu|local|localdomain|lan|internal|home|"
-    r"corp|intranet|test|example|invalid)(?![\w-])")
 _KEY_TOKEN = re.compile(r"(?<![\w.-])([\w.-]+)[\"']?\s*[:=]")
 _CRED_WORDS = tuple(sorted({
     first + sep + second
@@ -139,8 +135,14 @@ def strip_controls(text: str) -> str:
                    if ch in _KEPT_CONTROLS or unicodedata.category(ch) not in _STRIPPED_CATEGORIES)
 
 
+_SEPARATORS = str.maketrans({"\u3002": ".", "\uff0e": ".", "\uff61": ".", "\uff0f": "/",
+                             "\uff20": "@"})
+
+
 def _normalize(text: str) -> str:
-    return strip_controls(unicodedata.normalize("NFKC", strip_controls(text)))
+    """NFKC の前に、NFKC が変換しない (または別の字にする) 区切りを ASCII に寄せる。"""
+    return strip_controls(unicodedata.normalize(
+        "NFKC", strip_controls(text).translate(_SEPARATORS)))
 
 
 def _fuzzy_credential_key(key: str) -> bool:
@@ -161,11 +163,9 @@ def _fuzzy_credential_key(key: str) -> bool:
 
 
 def _non_ascii_residue(text: str) -> bool:
-    """正規化後も ASCII 外の文字が、credential の key・URL の scheme・hostname の位置に
-    残っているか (検出は ASCII 前提なので、残れば伏せる側に倒す)。"""
+    """正規化後も ASCII 外の文字が、credential の key・URL の scheme の位置に残っているか
+    (検出は ASCII 前提なので、残れば伏せる側に倒す。hostname は ``_hosts`` が label ごとに見る)。"""
     if any(not match.group(1).isascii() for match in _SCHEME_TOKEN.finditer(text)):
-        return True
-    if any(not match.group(0).isascii() for match in _UNI_HOST.finditer(text)):
         return True
     return any(not match.group(1).isascii() and _fuzzy_credential_key(match.group(1))
                for match in _KEY_TOKEN.finditer(text))
@@ -177,8 +177,6 @@ def _scan(text: str) -> str:
     text = _CRED.sub(lambda m: m.group(1) + REDACTED, text)
     text = _PREFIXED_TOKEN.sub(REDACTED, text)
     text = _HOST_CONTEXT.sub(lambda m: m.group(1) + REDACTED, text)
-    text = _HOST_BARE.sub(REDACTED, text)
-    text = _HOST_LOCAL_BARE.sub(REDACTED, text)
     text = _LOCALHOST.sub(REDACTED, text)
     text = _IPV4.sub(REDACTED, text)
     text = _IPV6.sub(lambda m: _ipv6_sub(m), text)
@@ -194,11 +192,33 @@ def _scan_digits(text: str) -> str:
     return _ACCOUNT_RUN.sub(REDACTED, text)
 
 
+_ACCOUNT_KEY_WORDS = ("account", "acct", "iban", "card", "口座", "customer", "client_id", "login",
+                      "user_id", "number")
+_ACCOUNT_KEY_NO = re.compile(r"(?:(?<![A-Za-z])[Nn][Oo]|[a-z]No)(?![a-z])")
+_KEY_BEFORE_VALUE = re.compile(r"([\w.-]+)[\"']?\s*[:=]\s*[\"']?$")
+_ACCOUNT_CONTEXT_WINDOW = 80
+
+
+def is_account_key(key: str) -> bool:
+    """口座らしい key か (その値は日付の形でも伏せる)。``no`` は語として現れるときだけ。"""
+    lowered = key.lower()
+    return (any(word in lowered for word in _ACCOUNT_KEY_WORDS)
+            or _ACCOUNT_KEY_NO.search(key) is not None)
+
+
+def _is_account_context(before: str) -> bool:
+    match = _KEY_BEFORE_VALUE.search(before[-_ACCOUNT_CONTEXT_WINDOW:])
+    return match is not None and is_account_key(match.group(1))
+
+
 def _outside_dates(text: str, scan) -> str:
-    """日付・時刻の区間を除いた残りだけに ``scan`` を掛ける。"""
+    """日付・時刻の区間を除いた残りだけに ``scan`` を掛ける。口座らしい key の直後の日付は
+    除かない。"""
     out: list[str] = []
     position = 0
     for match in _DATE_TIME.finditer(text):
+        if _is_account_context(text[:match.start()]):
+            continue
         out.append(scan(text[position:match.start()]))
         out.append(match.group(0))
         position = match.end()
@@ -206,30 +226,135 @@ def _outside_dates(text: str, scan) -> str:
     return "".join(out)
 
 
-def redact(text: str) -> str:
+_CHAIN = re.compile(r"(?<![\w-])[\w-]+(?:\.[\w-]+)+")
+_ASCII_LEAD = re.compile(r"[A-Za-z0-9_-]*")
+_PLUGIN_FILE_NAMES = frozenset(name.lower() for name in PLUGIN_FILES)
+_MAX_DECODE_ROUNDS = 3
+
+
+def _is_host_chain(chain: str) -> bool:
+    if chain.lower() in _PLUGIN_FILE_NAMES or chain[:4].lower() == "www.":
+        return False  # ``www.`` で始まる語は URL の検出が末尾の path まで含めて伏せる
+    labels = chain.split(".")
+    if any(label[:4].lower() == "xn--" for label in labels):
+        return True
+    return any(_ASCII_LEAD.match(label).group(0).lower() in HOST_TLDS for label in labels[1:])
+
+
+def _hosts(text: str, mask: bytearray | None) -> str:
+    """``.`` でつながる語のうち hostname とみなすものを伏せる。``mask`` があれば、対象の範囲
+    (文字列・コメント) に 1 字でもかかる語だけ。"""
+    def sub(match: re.Match) -> str:
+        if mask is not None and not any(mask[match.start():match.end()]):
+            return match.group(0)
+        return REDACTED if _is_host_chain(match.group(0)) else match.group(0)
+    return _CHAIN.sub(sub, text)
+
+
+def _segments(text: str, spans) -> list[tuple[str, bool]]:
+    """``text`` を (部分, hostname の検出対象か) に分ける。``spans`` が None なら全体が対象。"""
+    if spans is None:
+        return [(text, True)]
+    segments: list[tuple[str, bool]] = []
+    position = 0
+    for start, end in sorted(spans):
+        start, end = max(start, position), min(end, len(text))
+        if start >= end:
+            continue
+        if start > position:
+            segments.append((text[position:start], False))
+        segments.append((text[start:end], True))
+        position = end
+    if position < len(text):
+        segments.append((text[position:], False))
+    return segments or [("", True)]
+
+
+def _scan_segments(segments: list[tuple[str, bool]]) -> str | None:
+    """検出して伏せた文字列。値全体を伏せるべきなら None。"""
+    text = "".join(part for part, _ in segments)
+    mask = None
+    if not all(zone for _, zone in segments):
+        mask = bytearray(b"".join((b"\x01" if zone else b"\x00") * len(part)
+                                  for part, zone in segments))
+    out = _scan(_hosts(text, mask))
+    return None if _non_ascii_residue(out) else out
+
+
+def _has_percent(segments: list[tuple[str, bool]]) -> bool:
+    return any(zone and _PERCENT.search(part) is not None for part, zone in segments)
+
+
+def redact(text: str, spans=None) -> str:
     """制御文字の除去と NFKC 正規化をした上で、検出した部分を ``[redacted]`` に置き換える。
-    ``%XX`` を decode した複製か、ASCII 外の残留で検出されたら値全体を伏せる。"""
-    text = _normalize(text)
-    out = _scan(text)
-    if _non_ascii_residue(out):
+    ``%XX`` を decode した複製 (固定点まで、上限 3 回) か、ASCII 外の残留で検出されたら
+    値全体を伏せる。``spans`` は Python ソースの 1 行のうち文字列・コメントの桁範囲で、
+    指定すると裸の hostname の検出はその範囲だけに掛ける。"""
+    segments = [(_normalize(part), zone) for part, zone in _segments(text, spans)]
+    out = _scan_segments(segments)
+    if out is None:
         return REDACTED
-    if _PERCENT.search(text) is not None:
-        decoded = _normalize(urllib.parse.unquote(text, errors="replace"))
-        decoded_out = _scan(decoded)
-        if decoded_out != decoded or _non_ascii_residue(decoded_out):
+    for _ in range(_MAX_DECODE_ROUNDS):
+        if not _has_percent(segments):
+            return out
+        segments = [(_normalize(urllib.parse.unquote(part, errors="replace")) if zone else part,
+                     zone) for part, zone in segments]
+        scanned = _scan_segments(segments)
+        if scanned is None or scanned != "".join(part for part, _ in segments):
             return REDACTED
-    return out
+    return REDACTED if _has_percent(segments) else out
 
 
-def redact_value(value: object) -> str:
+_ODD_LINE_CHARS = re.compile("[\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+_FSTRING_START = getattr(tokenize, "FSTRING_START", None)
+_FSTRING_END = getattr(tokenize, "FSTRING_END", None)
+
+
+def python_text_spans(source: str) -> list[list[tuple[int, int]]] | None:
+    """Python ソース全文のうち、文字列リテラルとコメントの桁範囲を行ごとに返す (行は ``\\n``
+    区切り、桁は文字単位)。構文として読めない、または行の数え方が tokenize と食い違いうる
+    ソースは None (呼び出し側が全行を自由文として扱う)。"""
+    if _ODD_LINE_CHARS.search(source) is not None:
+        return None
+    lines = source.split("\n")
+    spans: list[list[tuple[int, int]]] = [[] for _ in lines]
+
+    def add(start: tuple[int, int], end: tuple[int, int]) -> None:
+        for row in range(start[0], end[0] + 1):
+            first = start[1] if row == start[0] else 0
+            last = end[1] if row == end[0] else len(lines[row - 1])
+            spans[row - 1].append((first, last))
+
+    try:
+        ast.parse(source)
+        depth, opened = 0, (0, 0)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.ERRORTOKEN:
+                return None
+            if token.type == _FSTRING_START:
+                if depth == 0:
+                    opened = token.start
+                depth += 1
+            elif token.type == _FSTRING_END:
+                depth -= 1
+                if depth == 0:
+                    add(opened, token.end)
+            elif depth == 0 and token.type in (tokenize.STRING, tokenize.COMMENT):
+                add(token.start, token.end)
+    except Exception:  # noqa: BLE001 — 読めないソースは全行を自由文として扱う
+        return None
+    return spans
+
+
+def redact_value(value: object, spans=None) -> str:
     """1 値の redaction。文字列でない値・対象上限 (8 KiB) を超える値・処理に失敗した値は
-    切らずに全文を伏せる。"""
+    切らずに全文を伏せる。``spans`` は ``redact`` と同じ。"""
     if type(value) is not str:
         return REDACTED
     try:
         if len(value.encode("utf-8", "surrogatepass")) > MAX_REDACT_VALUE_BYTES:
             return REDACTED
-        return redact(value)
+        return redact(value, spans)
     except Exception:  # noqa: BLE001 — 検出に失敗した値は伏せる側に倒す
         return REDACTED
 

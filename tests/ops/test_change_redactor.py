@@ -104,12 +104,19 @@ def test_digit_runs_without_a_date_shape_are_still_redacted(text):
     assert L.REDACTED in R.redact(text)
 
 
+@pytest.mark.parametrize("text", ["a[1::2]", "os.path.join(a, b)", "if df.in_range: pass"])
+def test_attribute_access_and_slices_are_not_taken_for_hosts_in_free_text(text):
+    assert R.redact(text) == text
+
+
 @pytest.mark.parametrize("text", [
     "logger.info('x')", "self.local = 1", "a[1::2]", "os.path.join(a, b)", "self.app.test(1)",
     "x = obj.home", "if df.in_range: pass", "log.int(3)",
 ])
-def test_attribute_access_and_slices_are_not_taken_for_hosts(text):
-    assert R.redact(text) == text
+def test_attribute_access_and_slices_in_python_code_are_not_taken_for_hosts(text):
+    spans = R.python_text_spans(text + "\n")
+    assert spans is not None
+    assert R.redact(text, spans[0]) == text
 
 
 @pytest.mark.parametrize("text", [

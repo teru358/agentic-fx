@@ -193,8 +193,12 @@ def _parse_config(data: bytes) -> object:
 def _param_value(key: str, text: str | None) -> str | None:
     if text is None:
         return None
-    if redactor.is_credential_key(key.rsplit(".", 1)[-1]):
+    leaf = key.rsplit(".", 1)[-1]
+    if redactor.is_credential_key(leaf):
         return L.REDACTED
+    if redactor.is_account_key(leaf):
+        shown = redactor.redact_value(f"{leaf}={text}")
+        return shown[len(leaf) + 1:] if shown.startswith(f"{leaf}=") else L.REDACTED
     return redactor.redact_value(text)
 
 
@@ -246,8 +250,14 @@ def _hunk_header(a_start: int, a_len: int, b_start: int, b_len: int) -> str:
     return f"@@ -{span(a_start, a_len)} +{span(b_start, b_len)} @@"
 
 
-def _redact_line(line: str) -> str:
-    return redactor.redact_value(line)
+def _redact_line(line: str, spans: list | None = None) -> str:
+    return redactor.redact_value(line, spans)
+
+
+def _line_spans(path: str, text: str) -> list | None:
+    """Python ソースの行ごとの文字列・コメントの桁範囲。他のファイルと読めないソースは None
+    (全行を自由文として扱う)。"""
+    return redactor.python_text_spans(text) if path.endswith(".py") else None
 
 
 def _diff_degraded(old: list[str], new: list[str]) -> bool:
@@ -256,7 +266,12 @@ def _diff_degraded(old: list[str], new: list[str]) -> bool:
             or len(old) * len(new) > L.DIFF_MAX_CELLS)
 
 
-def _hunks(old: list[str], new: list[str]) -> list[dict]:
+def _spans_at(spans: list | None, index: int) -> list | None:
+    return None if spans is None or index >= len(spans) else spans[index]
+
+
+def _hunks(old: list[str], new: list[str], old_spans: list | None = None,
+           new_spans: list | None = None) -> list[dict]:
     if _diff_degraded(old, new):
         groups = [[("replace", 0, len(old), 0, len(new))]] if old or new else []
     else:
@@ -268,12 +283,15 @@ def _hunks(old: list[str], new: list[str]) -> list[dict]:
         lines: list[str] = []
         for tag, i1, i2, j1, j2 in group:
             if tag == "equal":
-                lines += [" " + _redact_line(line) for line in old[i1:i2]]
+                lines += [" " + _redact_line(old[i], _spans_at(old_spans, i))
+                          for i in range(i1, i2)]
                 continue
             if tag in ("replace", "delete"):
-                lines += ["-" + _redact_line(line) for line in old[i1:i2]]
+                lines += ["-" + _redact_line(old[i], _spans_at(old_spans, i))
+                          for i in range(i1, i2)]
             if tag in ("replace", "insert"):
-                lines += ["+" + _redact_line(line) for line in new[j1:j2]]
+                lines += ["+" + _redact_line(new[j], _spans_at(new_spans, j))
+                          for j in range(j1, j2)]
         a_len, b_len = last[2] - first[1], last[4] - first[3]
         hunks.append({"header": _hunk_header(first[1] + 1, a_len, first[3] + 1, b_len),
                       "lines": lines})
@@ -291,7 +309,8 @@ def _file_diff(path: str, old: bytes | None, new: bytes) -> dict:
                 "omitted_lines": 0}
     old_lines, new_lines = _lines_of(old_text), _lines_of(new_text)
     entry = {"path": path, "status": "added" if old is None else "changed", "reason": None,
-             "hunks": _hunks(old_lines, new_lines), "omitted_lines": 0}
+             "hunks": _hunks(old_lines, new_lines, _line_spans(path, old_text),
+                             _line_spans(path, new_text)), "omitted_lines": 0}
     if _diff_degraded(old_lines, new_lines):
         entry["diff_degraded"] = L.DIFF_DEGRADED_TOO_MANY_LINES
     return entry
