@@ -405,3 +405,25 @@ def test_resolve_priority_and_ambiguity(tmp_path):
                                    "content_hash": "c"}) is None
     assert archives.resolve(conn, {"candidate_archive_id": 999}) is None
     assert archives.resolve(conn, None) is None
+
+
+def test_legacy_pending_approval_migration_runs_after_the_ledger_rebuild(
+        tmp_path):
+    """旧形式の台帳と旧 payload の pending 承認を持つ DB でも、起動時の
+    migration 同士が衝突せず、旧 payload は invalidated になる。"""
+    conn, path = _legacy_db(tmp_path)
+    _old_row(conn, 1, "h1", "c1")
+    legacy_id = _approval(conn, "pending", {"name": "old"}, decided=False)
+    linked_id = _approval(conn, "pending", {
+        "name": "n", "content_hash": "c1", "artifact_hash": "h1",
+        "kind": "indicator", "mission_id": 1,
+        "candidate_path": "p", "candidate_origin": "staging"}, decided=False)
+    conn.commit()
+    conn.close()
+    migrated = connect(path)
+    init_db(migrated)
+    statuses = dict(migrated.execute(
+        "SELECT id, status FROM approval_requests").fetchall())
+    assert statuses[legacy_id] == "invalidated"
+    assert statuses[linked_id] == "pending"
+    assert _by_artifact(migrated)["h1"]["outcome_class"] == "pending"
