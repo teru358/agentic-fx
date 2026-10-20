@@ -182,6 +182,12 @@ class _Loop:
         _say(self._out, f"warning {reason}")
 
 
+def _check_watermark(readable: list[dict], high: int) -> None:
+    """watermark が読める event の最大 id より小さい応答は不正。cursor が後ろに戻り過去の event が配送される。"""
+    if readable and high < max(item["id"] for item in readable):
+        raise _Failure("events_invalid")
+
+
 def _page(reply) -> tuple[list[dict], int, bool]:
     """events 応答の形を確かめ、(id 順の event、high watermark、id が読めない event があったか) を返す。
 
@@ -199,6 +205,8 @@ def _page(reply) -> tuple[list[dict], int, bool]:
     for event in events:
         # 形の検査は送信直前の encode_event が行う。並べ替えに要る id だけ先に確かめる
         if type(event) is not dict or type(event.get("id")) is not int or event["id"] <= 0:
+            _check_watermark(readable, high)
             return sorted(readable, key=lambda item: item["id"]), high, True
         readable.append(event)
+    _check_watermark(readable, high)
     return sorted(readable, key=lambda item: item["id"]), high, False

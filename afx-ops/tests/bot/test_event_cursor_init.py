@@ -251,3 +251,30 @@ def test_ac25_an_unreadable_event_in_the_skipped_history_does_not_block_the_star
     proc.poll()
     assert proc.channel.sent == []
     assert load(proc.fd).event_cursor_initialized is True
+
+
+def test_a_first_page_whose_watermark_is_below_its_event_ids_starts_nothing(process):
+    client = _Events(_page([_health(100)], 50), _page([_health(100)], 100),
+                     {"events": [], "high_watermark": 100})
+    proc = process(client)
+    proc.start()
+    with pytest.raises(BotFailure, match="events_invalid"):
+        proc.poll()
+    assert proc.channel.sent == []
+    assert proc.snapshot()["event_cursor_initialized"] is False
+    proc.poll()
+    proc.poll()
+    assert proc.channel.sent == []
+    state = load(proc.fd)
+    assert (state.cursor, state.high_watermark, state.event_cursor_initialized) == (100, 100, True)
+
+
+def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(process):
+    client = _Events(_page(_history()), _page([_health(200)], 150))
+    proc = process(client)
+    proc.start()
+    proc.poll()
+    before = load(proc.fd)
+    with pytest.raises(BotFailure, match="events_invalid"):
+        proc.poll()
+    assert proc.channel.sent == [] and load(proc.fd) == before

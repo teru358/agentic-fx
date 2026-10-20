@@ -265,7 +265,7 @@ def test_transient_failure_then_success_commits(state_dir):
 def test_high_watermark_regression_stops_without_touching_the_snapshot(state_dir):
     _seed(state_dir, 4, 9)
     before = (state_dir / "notify.snapshot").read_bytes()
-    client = FakeClient([{"events": [_event(10)], "high_watermark": 8}])
+    client = FakeClient([{"events": [_event(8)], "high_watermark": 8}])
     send = FakeSend()
     rc, err = _run(state_dir, client, send)
     assert rc == runtime.RC_NOTIFY_FAILED
@@ -545,3 +545,25 @@ def test_ac25_a_v2_snapshot_migrates_to_true_and_continues_from_its_cursor(fresh
     assert client.calls[0][0] == 3
     assert _raw_snapshot(fresh_dir) == {"version": 3, "cursor": 5, "high_watermark": 5,
                                         "event_cursor_initialized": True}
+
+
+def test_a_first_page_whose_watermark_is_below_its_event_ids_saves_nothing_and_delivers_nothing(
+        fresh_dir):
+    send = FakeSend()
+    rc, err = _run(fresh_dir, FakeClient([{"events": [_event(100)], "high_watermark": 50}]), send)
+    assert (rc, err) == (1, "afx-ops: events_invalid\n")
+    assert send.bodies == [] and not (fresh_dir / "notify.snapshot").exists()
+    client = FakeClient([{"events": [_event(100)], "high_watermark": 100},
+                         {"events": [], "high_watermark": 100}])
+    rc, _ = _run(fresh_dir, client, send, polls=2)
+    assert rc == 0 and send.bodies == []
+    assert _state(fresh_dir) == NotifyState(cursor=100, high_watermark=100,
+                                            event_cursor_initialized=True)
+
+
+def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(state_dir):
+    before = _state(state_dir)
+    send = FakeSend()
+    rc, err = _run(state_dir, FakeClient([{"events": [_event(200)], "high_watermark": 150}]), send)
+    assert (rc, err) == (1, "afx-ops: events_invalid\n")
+    assert send.bodies == [] and _state(state_dir) == before

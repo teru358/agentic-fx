@@ -284,7 +284,7 @@ def test_high_watermark_regression_against_the_saved_cursor(root, pki, daemon, s
     first = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert first.result["rc"] == 0, first.stderr[-3000:]
     saved = (root / "notify" / "state" / "notify.snapshot").read_bytes()
-    daemon.set([event(3)], high_watermark=1)
+    daemon.set([event(1)], high_watermark=1)
     got = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert got.result["rc"] == 1
     assert _stderr_lines(got) == ["afx-ops: high_watermark_regressed"]
