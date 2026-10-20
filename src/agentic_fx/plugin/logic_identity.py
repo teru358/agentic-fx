@@ -96,32 +96,58 @@ def _indicator_plugins(config: dict) -> list[str]:
     return sorted(names)
 
 
-def logic_hash_of(plugin_py: str, config_yaml: str) -> str | None:
-    """数値リテラル・docstring・非意味的な文字列を落とした AST 構造 hash。"""
-    try:
-        tree = ast.parse(plugin_py)
-        config = yaml.safe_load(config_yaml)
-    except (SyntaxError, ValueError, yaml.YAMLError):
-        return None
+# 正規化と dump は AST の深さに比例して再帰する。上限を超える候補は
+# 例外にせず計算不能 (None) として扱う。
+_MAX_AST_DEPTH = 200
+
+
+def _ast_depth_exceeds(tree: ast.AST, limit: int) -> bool:
+    """再帰を使わずに AST の深さが limit を超えるかを調べる。"""
+    stack = [(tree, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > limit:
+            return True
+        for child in ast.iter_child_nodes(node):
+            stack.append((child, depth + 1))
+    return False
+
+
+def _logic_hash(plugin_py: str, config: Any) -> str | None:
     if not isinstance(config, dict):
         return None
-    _strip_docstrings(tree)
-    tree = ast.fix_missing_locations(_Normalizer().visit(tree))
-    shape = {"keys": _config_shape(config),
-             "indicators": _indicator_plugins(config)}
-    payload = ast.dump(tree, include_attributes=False) + "\0" + json.dumps(
-        shape, sort_keys=True, ensure_ascii=False)
+    try:
+        tree = ast.parse(plugin_py)
+        if _ast_depth_exceeds(tree, _MAX_AST_DEPTH):
+            return None
+        _strip_docstrings(tree)
+        tree = ast.fix_missing_locations(_Normalizer().visit(tree))
+        shape = {"keys": _config_shape(config),
+                 "indicators": _indicator_plugins(config)}
+        payload = ast.dump(tree, include_attributes=False) + "\0" + json.dumps(
+            shape, sort_keys=True, ensure_ascii=False)
+    except Exception:
+        # SyntaxError / ValueError / RecursionError / MemoryError を含む、
+        # 計算できない全ての失敗は「比較対象から外す」に畳む。
+        return None
     return LOGIC_HASH_PREFIX + hashlib.sha256(
         payload.encode("utf-8")).hexdigest()
 
 
-def family_key_of(config_yaml: str, *, name: str) -> str | None:
-    """仮説族 key。strategy は indicator 集合 + 足 + pair 集合、indicator は
-    plugin 名 + 足 (pair は持たない)。依存 indicator が空の strategy は None。"""
+def _parse_config(config_yaml: str) -> Any:
     try:
-        config = yaml.safe_load(config_yaml)
-    except yaml.YAMLError:
+        return yaml.safe_load(config_yaml)
+    except Exception:
         return None
+
+
+def logic_hash_of(plugin_py: str, config_yaml: str) -> str | None:
+    """数値リテラル・docstring・非意味的な文字列を落とした AST 構造 hash。
+    計算できないとき (parse 不能・深すぎる・資源不足) は None。"""
+    return _logic_hash(plugin_py, _parse_config(config_yaml))
+
+
+def _family_key(config: Any, *, name: str) -> str | None:
     if not isinstance(config, dict):
         return None
     kind = config.get("kind")
@@ -138,14 +164,29 @@ def family_key_of(config_yaml: str, *, name: str) -> str | None:
     return (f"strategy:{','.join(plugins)}@{timeframe}@{','.join(pair_list)}")
 
 
-def identity_of_dir(plugin_dir: Path, *, name: str
-                    ) -> tuple[str | None, str | None]:
-    """`plugin.py` / `config.yaml` のあるディレクトリから (logic_hash,
-    family_key) を作る。読めない・parse できないものは None。"""
+def family_key_of(config_yaml: str, *, name: str) -> str | None:
+    """仮説族 key。strategy は indicator 集合 + 足 + pair 集合、indicator は
+    plugin 名 + 足 (pair は持たない)。依存 indicator が空の strategy は None。"""
+    return _family_key(_parse_config(config_yaml), name=name)
+
+
+def read_identity(plugin_dir: Path, *, name: str
+                  ) -> tuple[str | None, str | None, dict | None]:
+    """`plugin.py` / `config.yaml` を 1 回ずつ読み、(logic_hash, family_key,
+    parse 済みの config) を返す。読めない・parse できないものは None。"""
     try:
         plugin_py = (plugin_dir / "plugin.py").read_text(encoding="utf-8")
         config_yaml = (plugin_dir / "config.yaml").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return None, None
-    return logic_hash_of(plugin_py, config_yaml), family_key_of(
-        config_yaml, name=name)
+        return None, None, None
+    config = _parse_config(config_yaml)
+    return (_logic_hash(plugin_py, config), _family_key(config, name=name),
+            config if isinstance(config, dict) else None)
+
+
+def identity_of_dir(plugin_dir: Path, *, name: str
+                    ) -> tuple[str | None, str | None]:
+    """`plugin.py` / `config.yaml` のあるディレクトリから (logic_hash,
+    family_key) を作る。読めない・parse できないものは None。"""
+    logic_hash, family_key, _ = read_identity(plugin_dir, name=name)
+    return logic_hash, family_key
