@@ -494,6 +494,11 @@ def test_ac18_the_candidates_own_identity_failure_is_rejected_before_the_tx(
     row = _expect_rows(conn, ctx, seeded, "gate_failed")
     assert row["quality_flags"] == []
     assert _approval_count(conn) == 0
+    # agent 面は原因を示さない固定の理由語だけ。原因は activity にだけ残る。
+    result = _last_result(conn)
+    assert result == "gate_failed:unverified"
+    assert "identity" not in result
+    assert "candidate_identity_unavailable" in _activity(root)
 
 
 def test_ac18_the_in_tx_check_also_rejects_a_candidate_without_identity(

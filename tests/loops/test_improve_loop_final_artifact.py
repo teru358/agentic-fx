@@ -32,7 +32,7 @@ def test_candidate_without_computable_identity_is_gate_failed(improve_env):
     last = app.conn_core.execute(
         "SELECT last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
     ).fetchone()[0]
-    assert last == "gate_failed:identity_unavailable"
+    assert last == "gate_failed:unverified"
 
 
 def test_submission_reads_the_candidate_identity_once_outside_the_tx(

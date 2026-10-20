@@ -3113,7 +3113,8 @@ class ImproveLoop:
                         and final_candidate.logic_hash is None):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="gate_failed:identity_unavailable", now=now,
+                        reason="gate_failed:unverified", now=now,
+                        activity_extra=" cause=candidate_identity_unavailable",
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed")
