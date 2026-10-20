@@ -1,7 +1,7 @@
 ---
 id: ops-bot-initial-start-replays-all-events
 title: ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する
-status: 設計待ち
+status: 実装待ち
 priority: 低
 opened: 2026-10-11
 closed: null
@@ -9,7 +9,7 @@ related: [ops-bot-display-residuals]
 ---
 # [ops-bot-initial-start-replays-all-events] ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 実装待ち / **優先**: 低
 
 ## 現象
 
@@ -24,3 +24,4 @@ afx-ops@bot の初回起動 (2026-10-11 17:23) で event stream を cursor 0 か
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-20: 状態: 実装待ち — 取引通知 spec (2026-10-20-trade-notices-design.md) の T0 として是正する: snapshot に event_cursor_initialized を持ち初回は high watermark から

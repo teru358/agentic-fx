@@ -1,7 +1,7 @@
 ---
 id: trade-order-and-close-notices
 title: 発注内容と決済情報を Discord に通知する
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-20
 closed: null
@@ -9,7 +9,7 @@ related: [bot-event-notices-are-raw-log-lines, approval-notice-lacks-change-cont
 ---
 # [trade-order-and-close-notices] 発注内容と決済情報を Discord に通知する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [bot-event-notices-are-raw-log-lines, approval-notice-lacks-change-cont
 ## 経緯
 
 - 2026-10-20: 起票。
+- 2026-10-20: 状態: 実装待ち — 設計 docs/superpowers/specs/2026-10-20-trade-notices-design.md v1.0 をユーザー承認 (2026-10-20)。T0 → T1 (afx-ops) → T2 (daemon)
