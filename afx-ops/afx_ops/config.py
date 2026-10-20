@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from afx_ops.trade_events import NOTICE_KINDS
 from afx_ops.isolation.startup import (
     StartupError,
     dns_tls_rules,
@@ -32,7 +33,7 @@ _OPTIONAL_FEATURE_KEYS = MappingProxyType({
     "notify": ("deliver_trade_events",),
 })
 # 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
-TRADE_NOTICES = ("all", "results", "fills_closes", "off")
+TRADE_NOTICES = tuple(NOTICE_KINDS)
 TRADE_AMOUNTS = ("absolute", "relative")
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 

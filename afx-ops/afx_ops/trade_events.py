@@ -23,6 +23,25 @@ CLOSE_FIELDS = frozenset({"pair", "side", "qty", "entry_price", "close_price", "
 
 ORDER_STATES = frozenset({"placed", "filled", "rejected", "cancelled", "expired"})
 
+# bot の `trade_notices` ごとに投稿する種類 (発注 event は state、決済は "closed")
+CLOSED_KIND = "closed"
+NOTICE_KINDS: Mapping[str, frozenset[str]] = MappingProxyType({
+    "all": frozenset({*ORDER_STATES, CLOSED_KIND}),
+    "results": frozenset({"filled", "rejected", CLOSED_KIND}),
+    "fills_closes": frozenset({"filled", CLOSED_KIND}),
+    "off": frozenset(),
+})
+
+
+def notice_kind(payload: Mapping[str, object]) -> str | None:
+    """取引 event の種類 (発注は state、決済は "closed")。取引 event でなければ None。"""
+    if payload["code"] == ORDER_CODE:
+        return payload["state"]
+    if payload["code"] == CLOSE_CODE:
+        return CLOSED_KIND
+    return None
+
+
 # order:<orders.id>。regex の後に整数化して範囲を見る (0 と 2^63 以上を通さない)
 REF_PATTERN = re.compile(r"order:[0-9]{1,19}\Z")
 MAX_ORDER_ID = 2 ** 63 - 1

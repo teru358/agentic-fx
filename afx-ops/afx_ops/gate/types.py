@@ -82,6 +82,8 @@ class EventPlan:
     event_id: int
     content: str
     mentions: tuple[str, ...]
+    # false の投稿は設定済みの mention を付けず、allowed_mentions も none にする
+    allow_mentions: bool = True
 
 
 @dataclass(frozen=True, slots=True)
