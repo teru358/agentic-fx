@@ -95,8 +95,13 @@ def write_snapshot(dir_fd: int, name: str, obj: Any) -> None:
                 pass
 
 
-def read_snapshot(dir_fd: int, name: str, schema_version: int) -> dict[str, Any] | None:
-    """正本 snapshot だけを読み、schema version が一致した object を返す。"""
+def read_snapshot(dir_fd: int, name: str, schema_version: int, *,
+                  older: tuple[int, ...] = ()) -> dict[str, Any] | None:
+    """正本 snapshot だけを読み、schema version が一致した object を返す。
+
+    `older` に挙げた旧版も受け入れる (呼び側が version を見て明示的に migrate する)。
+    それ以外の版は拒否する。
+    """
     name = _checked_name(name)
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
@@ -122,6 +127,6 @@ def read_snapshot(dir_fd: int, name: str, schema_version: int) -> dict[str, Any]
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise SnapshotError() from None
     if (type(obj) is not dict or type(obj.get("version")) is not type(schema_version)
-            or obj["version"] != schema_version):
+            or (obj["version"] != schema_version and obj["version"] not in older)):
         raise SnapshotError()
     return obj

@@ -7,7 +7,9 @@ from dataclasses import dataclass, replace
 from afx_ops.snapshot import SnapshotError, read_snapshot, write_snapshot
 
 SNAPSHOT_NAME = "bot.snapshot"
-SNAPSHOT_VERSION = 4
+SNAPSHOT_VERSION = 5
+# 直前の版。flag を持たないので、読むときに明示的に migrate する
+PREVIOUS_VERSION = 4
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _ACTOR = re.compile(r"discord:[0-9]{17,20}\Z")
 _JOB = re.compile(r"[0-9a-f]{32}\Z")
@@ -87,10 +89,14 @@ class BotState:
     cursor: int
     high_watermark: int
     approvals: tuple[ApprovalRecord, ...]
+    # false の間は cursor と high watermark に意味が無く、event を配送しない。最初の正常な
+    # /events 応答で cursor と同じ保存で true になる。snapshot の不在と保存済みの cursor=0 を分ける
+    event_cursor_initialized: bool = False
 
     def __post_init__(self) -> None:
         if (type(self.cursor) is not int or self.cursor < 0 or type(self.high_watermark) is not int
-                or self.high_watermark < self.cursor):
+                or self.high_watermark < self.cursor
+                or type(self.event_cursor_initialized) is not bool):
             raise StateError()
         ids = [record.approval_id for record in self.approvals]
         messages = [record.message_id for record in self.approvals]
@@ -130,7 +136,8 @@ class BotState:
 
 
 def advance_event(state: BotState, event_id: int, *, high_watermark: int | None = None) -> BotState:
-    if not isinstance(state, BotState) or type(event_id) is not int or event_id <= state.cursor:
+    if (not isinstance(state, BotState) or not state.event_cursor_initialized
+            or type(event_id) is not int or event_id <= state.cursor):
         raise StateError()
     high = event_id if high_watermark is None else high_watermark
     if type(high) is not int or high < event_id or high < state.high_watermark:
@@ -146,6 +153,15 @@ def observe_high(state: BotState, high_watermark: int) -> BotState:
     return replace(state, high_watermark=max(state.high_watermark, high_watermark))
 
 
+def initialize_event_cursor(state: BotState, high_watermark: int) -> BotState:
+    """最初の正常な応答の末尾を cursor にして flag を立てる (呼び側は 1 回の保存で確定する)。"""
+    if (not isinstance(state, BotState) or state.event_cursor_initialized
+            or type(high_watermark) is not int or high_watermark < 0):
+        raise StateError()
+    return replace(state, cursor=high_watermark, high_watermark=high_watermark,
+                   event_cursor_initialized=True)
+
+
 def _record_object(record: ApprovalRecord) -> dict[str, object]:
     return {"approval_id": record.approval_id, "message_id": record.message_id,
             "guild_id": record.guild_id, "channel_id": record.channel_id,
@@ -157,8 +173,26 @@ def _record_object(record: ApprovalRecord) -> dict[str, object]:
             "repost_generation": record.repost_generation}
 
 
+_KEYS_V4 = {"version", "cursor", "high_watermark", "approvals"}
+
+
+def migrate_v4(obj: object) -> dict[str, object]:
+    """v4 の object を v5 の object にする。
+
+    cursor か high watermark が正なら配送実績があるので true (続きから)。0 と 0 は、まだ一度も
+    正常な page を受けていない形と区別できない (v4 は初回 poll の前にも保存する) ので false にする。
+    """
+    if (type(obj) is not dict or set(obj) != _KEYS_V4 or obj["version"] != PREVIOUS_VERSION
+            or type(obj["cursor"]) is not int or type(obj["high_watermark"]) is not int):
+        raise StateError()
+    delivered = obj["cursor"] > 0 or obj["high_watermark"] > 0
+    return {**obj, "version": SNAPSHOT_VERSION, "event_cursor_initialized": delivered}
+
+
 def _from_object(obj: object) -> BotState:
-    if type(obj) is not dict or set(obj) != {"version", "cursor", "high_watermark", "approvals"}:
+    if type(obj) is dict and obj.get("version") == PREVIOUS_VERSION:
+        obj = migrate_v4(obj)
+    if type(obj) is not dict or set(obj) != {*_KEYS_V4, "event_cursor_initialized"}:
         raise StateError()
     if obj["version"] != SNAPSHOT_VERSION or type(obj["approvals"]) is not list:
         raise StateError()
@@ -168,14 +202,15 @@ def _from_object(obj: object) -> BotState:
     try:
         records = tuple(ApprovalRecord(**item) if type(item) is dict and set(item) == keys
                         else (_ for _ in ()).throw(StateError()) for item in obj["approvals"])
-        return BotState(cursor=obj["cursor"], high_watermark=obj["high_watermark"], approvals=records)
+        return BotState(cursor=obj["cursor"], high_watermark=obj["high_watermark"], approvals=records,
+                        event_cursor_initialized=obj["event_cursor_initialized"])
     except (TypeError, StateError):
         raise StateError() from None
 
 
 def load(dir_fd: int) -> BotState:
     try:
-        obj = read_snapshot(dir_fd, SNAPSHOT_NAME, SNAPSHOT_VERSION)
+        obj = read_snapshot(dir_fd, SNAPSHOT_NAME, SNAPSHOT_VERSION, older=(PREVIOUS_VERSION,))
     except SnapshotError:
         raise StateError() from None
     return BotState.empty() if obj is None else _from_object(obj)
@@ -186,6 +221,7 @@ def save(dir_fd: int, state: BotState) -> None:
         raise StateError()
     obj = {"version": SNAPSHOT_VERSION, "cursor": state.cursor,
            "high_watermark": state.high_watermark,
+           "event_cursor_initialized": state.event_cursor_initialized,
            "approvals": [_record_object(record) for record in state.approvals]}
     try:
         write_snapshot(dir_fd, SNAPSHOT_NAME, obj)

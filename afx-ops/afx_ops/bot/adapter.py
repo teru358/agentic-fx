@@ -649,6 +649,9 @@ class BotAdapter:
         await self._sync_views()
 
     async def deliver_events(self) -> None:
+        if not self.gate.state.event_cursor_initialized:
+            await self._start_event_cursor()
+            return
         reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
                                                            limit=EVENTS_LIMIT))
         events, high, unreadable = _page(reply)
@@ -678,6 +681,19 @@ class BotAdapter:
                 await self._settle(approval_id)
         if unreadable:
             raise BotFailure("payload_invalid")
+
+    async def _start_event_cursor(self) -> None:
+        """最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める。"""
+        reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
+                                                           limit=EVENTS_LIMIT))
+        _, high, _ = _page(reply)
+        await self._run(self._initialize_cursor, high)
+
+    def _initialize_cursor(self, high: int) -> None:
+        try:
+            self.gate.initialize_event_cursor(high)
+        except StateError:
+            raise BotFailure("bot_state_invalid") from None
 
     def _observe_high(self, high: int) -> None:
         self._regression_guard(high)
