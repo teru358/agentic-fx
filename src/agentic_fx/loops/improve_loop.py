@@ -2642,8 +2642,9 @@ class ImproveLoop:
 
     def _load_quality_population(self, ctx
                                  ) -> "improve_quality.FilePopulation":
-        """配備済みと example の比較対象。配備済み (安定した pin を持たない strategy も含む) は mission 開始時の
-        inventory、example は mission に渡した読み取り専用 snapshot から作る。"""
+        """配備済みと example の比較対象。配備済みは mission 開始時の
+        inventory の第 1 相 (pin が古い strategy も含む)、example は mission に
+        渡した読み取り専用 snapshot から作る。"""
         return improve_quality.FilePopulation(
             deployed=improve_quality.load_deployed(
                 ctx.inventory.phase1_metas),
