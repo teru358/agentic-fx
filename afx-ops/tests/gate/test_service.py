@@ -158,6 +158,7 @@ def test_response_loss_never_reports_success_or_marks_done():
 
 def test_event_is_committed_only_after_the_adapter_reports_success():
     service = _service(_record())
+    service.state = replace(service.state, event_cursor_initialized=True)
     event = {"id": 4, "ts": "2026-10-11T00:00:00+00:00", "code": "service_health_changed",
              "ref": "instance", "fields": {"component_code": "api", "health_code": "ok"}}
     plan = service.plan_event(event)

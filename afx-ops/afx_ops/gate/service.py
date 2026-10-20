@@ -11,7 +11,8 @@ from typing import Callable
 from afx_ops.api_client import Actor, Decision, DecisionJob, Reply
 
 from .render import confirm_view, render_event
-from .state import ApprovalRecord, BotState, advance_event, load, observe_high, save
+from .state import (ApprovalRecord, BotState, advance_event, initialize_event_cursor, load,
+                    observe_high, save)
 from .types import DecisionPlan, EventPlan, GateResult, Interaction, decode_custom_id
 
 CLAIM_SECONDS = 10 * 60
@@ -105,6 +106,11 @@ class GateService:
         with self._lock:
             self._update_state(advance_event(self._read_state(), event_id,
                                              high_watermark=high_watermark))
+
+    def initialize_event_cursor(self, high_watermark: int) -> None:
+        """cursor と flag を同じ 1 回の保存で確定する。"""
+        with self._lock:
+            self._update_state(initialize_event_cursor(self._read_state(), high_watermark))
 
     def observe_high_watermark(self, high_watermark: int) -> None:
         with self._lock:
