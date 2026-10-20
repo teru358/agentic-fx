@@ -1,6 +1,6 @@
 # 改善ループの質 設計書
 
-**版:** v1.0 (ユーザー承認済み、実装可)
+**版:** v1.1 (ユーザー承認済み、実装可)
 **対象:** 改善ループの質の 4 点 (A 自己書き戻しの遮断、B 重複の定義と質検査の強化、C 目標の定義と伝え方、D 床の戻し方) を 1 つの spec で扱う。チケット `improve-backlog-self-feedback-duplicates-work` / `candidates-converge-to-example-sma` / `improve-objective-filtered-signal-quality` を本 spec で閉じる (最後のものは目標の縮小版まで。測定基盤は §11)。
 **位置づけ:** ユーザー承認済み (2026-10-19、§8.1 に 7 問の決定を記録)。実装に入ってよい。B の `family_redirect` 有効化は別 spec `2026-10-19-approval-content-design.md` (v1.0 実装可、着手済み) の §10.2 の T1 (API + CLI + web) と T2 (Discord 承認投稿) の完了を条件にする (§2.3)。この 2 つは本 spec の task と区別するため、以下 `AC-T1` / `AC-T2` と書く。本 spec の task は `IQ-T0`〜`IQ-T3` (§10)。
 
@@ -89,7 +89,7 @@
 | `duplicate_metrics` | (a) の成績完全一致で降格 | 同上 |
 | `family_redirect` | (c) で降格 (`family_redirect` の有効化後のみ) | 同上 |
 
-**許される遷移は 13 本だけ**: `not_submitted` → {`pending`, `unprofitable`, `insufficient_trades`, `gate_failed`, `noop_copy`, `duplicate_logic`, `duplicate_metrics`, `family_redirect`} (8 本、終端 tx の `settle`)、`pending` → {`approved`, `rejected_by_human`, `expired`, `invalidated`} (4 本、`apply_decision`)、`approved` → `revoked` (1 本、`append_revocation`)。それ以外の組 (自己遷移を含む 196 組中の 183 組) は書き込み API が拒否する。`outcome_class` を UPDATE する箇所は、migration (DDL 時の旧行の埋め) を除き、この 3 関数 (`candidate_archives.settle`、`approvals.apply_decision`、`approvals.append_revocation`) だけに限る (AC-14 で全数 pin)。
+**許される遷移は 13 本だけ**: `not_submitted` → {`pending`, `unprofitable`, `insufficient_trades`, `gate_failed`, `noop_copy`, `duplicate_logic`, `duplicate_metrics`, `family_redirect`} (8 本、終端 tx の `settle`)、`pending` → {`approved`, `rejected_by_human`, `expired`, `invalidated`} (4 本、`apply_decision`)、`approved` → `revoked` (1 本、`append_revocation`)。それ以外の組 (自己遷移を含む 196 組中の 183 組) は書き込み API が拒否する。`outcome_class` を UPDATE する SQL の所在は、`candidate_archives.settle` と migration の照合 (`backfill_outcome_from_approvals`、`not_submitted` のままの行だけを更新する) の 2 か所に限る。`settle` の呼び出し元は 3 か所 (承認の決定と撤回の経路 = `apply_decision` / `append_revocation` が呼ぶ `approvals._settle_archive`、提出に至らない終端の `_settle_candidate_in_tx`、提出の `_finalize_success`) に限る (AC-14 で 2 つの集合を別々に等号で pin)。
 
 **検出属性。** `family_detected` は outcome ではない。(c) が配備済みの別名の同族を検出したとき、`family_redirect` の有効化前は降格せず提出を続け、`quality_flags` に `family_detected` を足す。提出後に `pending` → `approved` と進んでもフラグは残る。有効化後に降格するときは、outcome が `family_redirect` になり、フラグは足さない (outcome がそのことを示す)。§3.2 の指標と AC-11 はこの列を見る。
 
@@ -100,7 +100,7 @@
 1. 提出する候補 (`gate_verdict.artifact_hash`) の行を、承認依頼を作る**直前**に必ず作る。同じ `(mission_id, artifact_hash)` の行が既にあれば (台帳の `INSERT OR IGNORE` が返す既存 id) それを再利用し、無ければ新しい行を作る。新しい行の snapshot は run_backtest と同じ手順 (tmp に書いて rename) で staging から作る。snapshot が作れなければ `archive_path` NULL の行にして `archive_failed` を activity に残す (行そのものは必ず作る)。新しい行の `metrics_json` は `{}`、`pair` は strategy なら config の先頭 pair、indicator なら NULL (成績は gate の行が別に持つ。新列に成績を持たない原則は変えない)。
 2. 承認 payload に、その行の `id` を `candidate_archive_id` として入れる (`_finalize_success` の tx 内、`approval_payload = dict(approval_payload)` に `analysis_run_ids` を足す箇所と同じ位置、`improve_loop.py:2443`)。作成時に確定し、以後変えない。
 3. 提出に至らない終端でも、判定した候補 (§2.2 の全終端写像表で「最終行あり」の終端) は同じ規則で行を作り、outcome を `settle` する。snapshot は作らない (`archive_path` NULL)。
-4. `apply_decision` と `append_revocation` は、payload の `candidate_archive_id` で行を引く。ID が無い旧 payload は、後述の旧行の照合規則 (`resolve`) で引く。
+4. `apply_decision` と `append_revocation` は、payload の `candidate_archive_id` で行を引く。有効な ID を持つ payload では ID が正で、その行が無ければ別の行へ結ばない (決定のみ commit)。ID が無い旧 payload だけ、後述の旧行の照合規則 (`resolve`) で引く。
 
 **更新の規則。**
 
@@ -174,7 +174,7 @@ E1〜E6、E13、E16、E17、E18a〜E18c は最終行を持たず、その missio
 - #21 と #22 (SMA クロス系): **両方とも `config.yaml` で `sma` 依存を宣言している** (`plugins/_archive/85/395e.../config.yaml:7-17`、`plugins/_archive/86/7323.../config.yaml:7-17`)。仮説族は両方 `{sma}, 1h, USDJPY` で一致し、**捕まえるのは (c)**。数値リテラルだけを落とした AST hash は、rationale 文字列が違うため**一致しない** (`c7246962080d...` / `d6d9e64ef65...`)。
 - `docs/examples/plugins/sma_cross` は `indicators:` を持たず自前計算する (`config.yaml:1-10`)。この型は `family_key` が NULL で (c) は効かない。rationale の変更や無害な AST 変更で hash も避けられるため、**穴が残る** (後述)。
 
-**ロジック hash の正規化規則。** `plugin/noop_gate.py:13` の `normalized_plugin_ast` (docstring を落とした AST) を拡張し、次を落とす。(1) 数値リテラル、(2) docstring、(3) 非意味的な文字列、すなわち rationale / reason に当たる keyword 引数・dict 値の文字列リテラル (f-string を含む)。列名など判定に効く文字列は残す。規則を適用した後の #21 / #22 の hash が一致するかは IQ-T2 で実測して fixture に固定する。一致しなくても #21 / #22 は (c) で捕まる。
+**ロジック hash の正規化規則。** `plugin/noop_gate.py:13` の `normalized_plugin_ast` (docstring を落とした AST) を拡張し、次を落とす。(1) 数値リテラル、(2) docstring、(3) 非意味的な文字列、すなわち rationale / reason / description / note に当たる keyword 引数・dict 値の文字列リテラル (f-string を含む。description / note は表示用の文言で、判定の分岐に使われない)。符号付きの数値 (`-1`、`+2`) も数値リテラルとして落とす。hash には算法の版の接頭辞 (`v1:`) を付け、規則を変えたら版を上げる。migration は接頭辞が現行版でない保存済みの hash を、archive の現物から再計算する。列名など判定に効く文字列は残す。規則を適用した後の #21 / #22 の hash が一致するかは IQ-T2 で実測して fixture に固定する。一致しなくても #21 / #22 は (c) で捕まる。
 
 **既知の未解決穴。** indicator を使わない自前計算の戦略 (`sma_cross` 型) は、(c) が効かず、(b) も文構造を変えれば避けられる。本 spec はこの穴を塞がない。§11 の後続条件 (発火時刻の Jaccard、または自前計算の戦略への構造的な近さの判定) に置き、prompt の「配備済みの仮説族の一覧」にも出さない (族が無いため)。
 
@@ -392,7 +392,7 @@ E1〜E6、E13、E16、E17、E18a〜E18c は最終行を持たず、その missio
 | 13b | **canary、履歴の節**。candidate 単位の履歴の節は採らないので、prompt に履歴の節の見出しが無いことと、`improve_context.py` が `candidate_archives` を import しないことを pin する。履歴の節を後続で採る変更は、この pin を赤にする | 不在 pin |
 | 13c | **canary、activity の agent 投影**。improve の mission registry (`tools/mission_registry.py:80-107`) が登録する tool は research / staging / rpc の 3 群だけで、activity を読む tool が無い。この tool 名の集合を allowlist として pin し、improve 用の context (`improve_context.py`) が `activity` を import していないことを走査で pin する。agent 投影を新設する変更は、この pin を赤にする | registry の allowlist pin、import 走査 |
 | 13d | **canary、降格の通知**。(b)(a) と、有効化後の (c) の降格を実際に 1 件ずつ発生させ、それぞれ `improvement_backlog.last_result` が 1 件書かれたことを assert する。その `last_result` が固定の許容集合 {`observation:duplicate`、`observation:family_redirect:<配備済みの戦略名>`、`observation:not_submitted`} のどれかと完全一致し、他候補の hash、pair、成績、canary を含まないことを assert する。activity の `quality_demoted` には詳細が残ることも assert する (詳細は運用者向け) | 通知の生成 + 完全一致 |
-| 14 | `outcome_class` の遷移 (§2.2) を、14 × 14 = 196 組の全部で観測する。許される 13 組 (`not_submitted` → 8 値、`pending` → 4 値、`approved` → `revoked`) は書き込み API が成功し、残りの 183 組は拒否される (自己遷移を含む)。CHECK 句が 14 値を持ち、集合外の値の挿入が制約違反になる。`outcome_class` を UPDATE する箇所が (migration を除き) `settle` / `apply_decision` / `append_revocation` の 3 関数だけであることを `src/` の走査で pin する。`quality_flags` は許容 2 要素以外の書き込みが拒否される | 全組の parametrize、制約違反、書き手の走査 |
+| 14 | `outcome_class` の遷移 (§2.2) を、14 × 14 = 196 組の全部で観測する。許される 13 組 (`not_submitted` → 8 値、`pending` → 4 値、`approved` → `revoked`) は書き込み API が成功し、残りの 183 組は拒否される (自己遷移を含む)。CHECK 句が 14 値を持ち、集合外の値の挿入が制約違反になる。`outcome_class` を UPDATE する SQL の所在が `settle` と migration の照合の 2 か所だけ、`settle` の呼び出し元が上記 3 か所だけ (`_settle_archive` の呼び出し元は `apply_decision` / `append_revocation` だけ) であることを、それぞれ `src/` の走査で等号により pin する。`quality_flags` は許容 2 要素以外の書き込みが拒否される | 全組の parametrize、制約違反、書き手の走査 |
 | 15 | `apply_decision` が決定と archive 更新を同じ tx で行う。(i) 提出した行 (`candidate_archive_id`) だけが更新され、同じ mission の他の行は変わらない、(ii) **self-test を書き換えて提出した候補** (run_backtest 時の `artifact_hash` と提出時の `artifact_hash` が異なる fixture) でも `candidate_archive_id` の行が更新される、(iii) CAS が失敗したときは更新しない、(iv) 行が無い・`pending` でないときは approval の決定は commit され、archive の更新だけが skip されて `warning` が残る、(v) 4 つの決定 (承認・却下・期限切れ・無効化) のそれぞれ、(vi) 途中の失敗で approval だけが更新された状態が残らない (例外注入)。旧 payload (`candidate_archive_id` なし) は `resolve` で引かれる | tx 境界、行の限定、例外注入 |
 | 16 | prompt の文字列 pin。描画した prompt に次の文字列が**含まれない**: 「全体収益」「PF 最大化」「標本不足」「標本 (取引数)」「評価可能」「30 trades」「holdout」「holdout_not_evaluable」「必ず実質的な変更を含めること」「試したパラメータと得られた pf」「avg_r を具体的に」「明確にパラメータを変え」「パラメータ・フィルタ・エントリ条件を」「変えて `run_backtest` をやり直し」「試したパラメータ群」「`unprofitable`」。次の文字列が**含まれる**: §0 の目的文 (逐語)、「理由非公開。同一候補を再提出しない」、`not_submitted`。floor 文は床の値 (`pf >= ...`) を含み、holdout の条件は含まない | 固定文字列の pin |
 | 17 | 床の snapshot (`profitability_floor`) が承認 payload に新値で入る | payload |
@@ -462,3 +462,4 @@ IQ-T1 と IQ-T2 はどちらも IQ-T0 の API (`settle`、`resolve`、遷移表)
 | 2026-10-19 | v0.4 | 最終 artifact を「終端に至った時点の staging の bytes」と定義し、pytest 実行後の全 return の直前に再 hash する規則に (E8、実行位置表、AC-22(v))。`candidate_archives.pair` を nullable にし (IQ-T0 の table rebuild)、候補の identity を `(mission_id, artifact_hash)`、仮説族の key を kind ごとに (AC-22 に indicator fixture)。手動 mission の launch 失敗を `compensate_launch_failure` の下に置き、E18 を E18a〜E18c に分けて AC-23 に両 corridor。§8.1 を主要 4 問 + 3 問の 7 問に整理し、旧問 2(i)(ii)、8、9、10 を §8.2 の固定事項へ | codex sol 3 周目の High 3 件と問 4 | |
 | 2026-10-19 | v0.5 | `pair` の NULL 許可の migration を現物 (`init_db()` の冪等 shape migration、DB に `schema_version` 無し) に合わせ、全数 grep の結果 (NULL で壊れる reader なし、変更は 4 箇所) を §2.2 に記録。問 3 を §0 の目的文と一意に対応させ、問 2 との依存を明記 | codex sol 4 周目 (閉鎖確認) の Low 2 件 | |
 | 2026-10-19 | v1.0 | ユーザー裁定 7 問を記録し (§8 を「裁定の記録」に、§8.1 を決定の表に)、条件分岐の文を決定後の文に書き換え。問 6 = 保存済み backtest の読み取り専用の再評価と人間の個別の keep / disable の明示決定を IQ-T3 の手順 0 として §2.5 に追加 (AC-25)。問 7 = 統計的合否を必須の不変条件と方向性指標の 2 層に改め、「新規候補」の定義と観測開始条件を §3.2 に固定 (AC-26)。§0、§10、§11 の参照を同期 | ユーザー裁定 (2026-10-19) と第二意見 | |
+| 2026-10-19 | v1.1 | `outcome_class` の書き手を「3 関数」から「UPDATE の SQL は `settle` と migration の照合の 2 か所、`settle` の呼び出し元は 3 か所」に改め、AC-14 の pin を等号に (§2.2、AC-14)。ロジック hash の規則に符号付き数値、`description` / `note` を加え、算法の版の接頭辞 (`v1:`) と保存済み hash の再計算を追加 (§2.3)。`resolve` は `candidate_archive_id` を持つ payload ではその id を正とし、行が無ければ結ばない。migration の shape 判定に CHECK 句を加え、照合は `not_submitted` の行だけを更新 | IQ-T0 の実装レビュー 1 周目 | |

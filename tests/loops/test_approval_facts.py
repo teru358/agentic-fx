@@ -381,7 +381,7 @@ def test_finalize_success_stores_facts_in_the_approval_payload(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None,
         approval_payload={"name": "x", "kind": "indicator",
-                          "content_hash": SUBMITTED,
+                          "content_hash": SUBMITTED, "artifact_hash": "a-sub",
                           "selection_rationale": "意図", "summary": "概要"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
     payload = _stored_payload(conn)
@@ -415,7 +415,8 @@ def test_finalize_success_without_buildable_facts_still_creates_approval(
     ctx = _ctx(tmp_path, mission_id, run_id, [broken])
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
     payload = _stored_payload(conn)
     assert payload["facts_version"] == 1 and payload["parent_facts"] is None
@@ -445,7 +446,7 @@ def test_finalize_success_stores_accepted_backtest_trials(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None,
         approval_payload={"name": "x", "kind": "strategy",
-                          "content_hash": SUBMITTED},
+                          "content_hash": SUBMITTED, "artifact_hash": "a-sub"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
     assert _stored_payload(conn)["parent_facts"]["trials"] == [{
         "n": 1, "content_hash8": "1a2b3c4d", "same_hash_as_submitted": True,
@@ -560,7 +561,7 @@ def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None,
         approval_payload={"name": "x", "kind": "strategy",
-                          "content_hash": SUBMITTED, "eval_timeframe": "1h",
+                          "content_hash": SUBMITTED, "artifact_hash": "a-sub", "eval_timeframe": "1h",
                           "selection_rationale": "意図です",
                           "summary": "概要です"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
@@ -589,7 +590,7 @@ def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
 
 
 _FINALIZE_PAYLOAD = {"name": "x", "kind": "strategy",
-                     "content_hash": SUBMITTED}
+                     "content_hash": SUBMITTED, "artifact_hash": "a-sub"}
 
 
 def _finalize_with_ledger(loop_min, conn, clock, tmp_path, entries):

@@ -450,7 +450,8 @@ def test_finalize_success_writes_index_row_for_approval(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     text = _index_path(loop_min).read_text()
@@ -472,7 +473,8 @@ def test_finalize_success_index_row_matches_other_terminal_columns(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     text = _index_path(loop_min).read_text()
@@ -496,7 +498,8 @@ def test_finalize_success_index_header_notes_it_is_a_terminal_log(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     text = _index_path(loop_min).read_text()
@@ -529,7 +532,8 @@ def test_finalize_success_writes_no_approval_index_row_when_mark_persisted_raise
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     index_path = _index_path(loop_min)
@@ -547,7 +551,8 @@ def test_finalize_success_does_not_write_index_row_with_zero_candidates(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     assert not _index_path(loop_min).exists()
@@ -567,7 +572,8 @@ def test_finalize_success_index_row_not_duplicated_on_direct_call_without_ctx(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ledger.entries()))
 
     text = _index_path(loop_min).read_text()

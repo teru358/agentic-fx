@@ -368,7 +368,8 @@ def test_finalize_success_persists_outcome_approval(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     row = conn.execute(
@@ -399,7 +400,8 @@ def test_finalize_success_payload_counts_exclude_error_entries(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     import json as _json
@@ -739,7 +741,8 @@ def test_finalize_success_begin_failure_still_runs_compensation(
 
     loop_min._finalize_success(
         _FlakyBegin(conn), mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
     assert conn.execute(
         "SELECT status FROM missions WHERE id=?",
@@ -769,7 +772,8 @@ def test_finalize_success_fails_tx2_when_ledger_persistence_fails(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
 
     assert conn.execute(

@@ -641,7 +641,7 @@ def run_init(root: Path, *, config_file: Path | None = None) -> int:
     # 参照) が、サービスは停止した状態で実行すること (WAL 越しの同時書き込み
     # は想定していない)。
         conn = connect(root / "data" / "agentic.db")
-        init_db(conn)
+        init_db(conn, root=root)
 
         clock = SystemClock()
         seeded = seed_default_sources(conn, clock.now())
@@ -1214,7 +1214,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 "kill switch の状態が不確定 (解除が途中で止まった印あり)。"
                 "新規 OPEN は止まる。`killswitch reconcile` で確認")
         conn_core = connect(root / "data" / "agentic.db")
-        init_db(conn_core)
+        init_db(conn_core, root=root)
         conn_signal = connect(root / "data" / "agentic.db")
         seeded = seed_default_sources(conn_core, clock.now())
         if seeded:
