@@ -34,7 +34,7 @@ from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
 from afx_ops.gate.render import footer as gate_footer
-from afx_ops.gate.render import primary_view, render_approval
+from afx_ops.gate.render import primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
@@ -400,7 +400,7 @@ class BotAdapter:
         try:
             return await self._channel.send(
                 content, embed=discord.Embed().set_footer(text=effect.footer), view=view,
-                allowed_mentions=self._allowed_mentions())
+                allowed_mentions=discord.AllowedMentions.none())
         except (discord.HTTPException, OSError, asyncio.TimeoutError):
             view.stop()
             return None
@@ -552,8 +552,8 @@ class BotAdapter:
         if failures >= EDIT_RETRY_LIMIT or now < not_before:
             return
         if record.state in _TERMINAL:
-            outcome = await self._edit(record.message_id, content=gate_reconcile.NO_LONGER_ACTIVE,
-                                       view=None)
+            outcome = await self._edit(record.message_id,
+                                       content=await self._terminal_content(record), view=None)
             if outcome == "gone":
                 # 外す View を載せた表示が既に無い
                 outcome = "ok"
@@ -587,6 +587,16 @@ class BotAdapter:
                 if route.approval_id == record.approval_id:
                     self._unregister(message_id)
         await self._run(self._edit_done, record)
+
+    async def _terminal_content(self, record: ApprovalRecord) -> str:
+        """終端の投稿に残す文面。決定結果を正本から読み直して要約と状態を残し、読めなければ固定の
+        代替文にする (View の取り外しは文面の取得に依存させない)。"""
+        try:
+            reply = await self._run(self.client.approval, record.approval_id)
+        except Exception:  # noqa: BLE001 — 取得の失敗は代替文に倒す
+            return gate_reconcile.NO_LONGER_ACTIVE
+        data = getattr(reply, "data", None) if getattr(reply, "status", None) == 200 else None
+        return render_terminal(record, data) or gate_reconcile.NO_LONGER_ACTIVE
 
     def _edit_done(self, record: ApprovalRecord) -> None:
         self.gate.edit_done(record.approval_id, generation=record.display_generation,

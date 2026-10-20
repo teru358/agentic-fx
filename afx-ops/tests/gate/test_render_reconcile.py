@@ -26,85 +26,46 @@ def test_renderer_only_projects_the_fixed_event_schema_and_configured_mentions()
     assert "instance" not in rendered.content
 
 
-def test_approval_renderer_shows_only_server_allowed_fields_and_never_claim_bodies():
+def _change(**changes):
+    change = {"name": "sma_cross", "kind": "strategy", "classification": "updated",
+              "candidate_hash": "b" * 64, "baseline_hash": "c" * 64,
+              "computed_at": "2026-10-19T00:00:00+00:00", "reason": None,
+              "params": {"items": [{"key": "params.period", "old": "14", "new": "10"}],
+                         "omitted": 0, "invalid_keys": 0, "flatten_omitted": 0, "reason": None},
+              "performance": {"in_sample": [{"pair": "USDJPY", "trades": 120, "pf": 1.25,
+                                             "avg_r": 0.05}],
+                              "holdout": [{"pair": "HOLDOUT_PAIR", "trades": 777, "pf": 9.99,
+                                           "avg_r": 8.88}]},
+              "summary": "短い申告です"}
+    change.update(changes)
+    return change
+
+
+def test_ac11_approval_renderer_shows_the_summary_but_not_the_rationale_or_other_fields():
     record = _record(state="claimed", actor="discord:12345678901234569", action="approve",
                      nonce="n", expiry=600, confirm_message_id=202)
     detail = {
-        "kind": "plugin", "status": "pending",
+        "kind": "plugin", "status": "pending", "change": _change(),
         "facts_lines": ["自己申告: summary: 全部安全です", "plugin=alpha"],
-        "agent_claims": "claim text", "parent_facts": {"untrusted": "free text"},
-        "reason": "reject reason", "decided_by": "api:ops-bot", "secret": "key-material",
+        "agent_claims": {"summary": "RAW_SUMMARY", "selection_rationale": "RATIONALE_BODY"},
+        "parent_facts": {"untrusted": "free text"}, "in_sample": {"RAW_IN": 1},
+        "holdout": {"RAW_HOLDOUT": 2}, "reason": "reject reason", "decided_by": "api:ops-bot",
+        "secret": "key-material",
     }
     content = render_approval(record, detail)
-    for expected in ("approval=7", "kind=plugin", "facts=none",
-                     "claims=present", "digest=aaaaaaaa", "expires=600",
-                     "decision=pending", "claimed=yes"):
-        assert expected in content
-    for forbidden in ("claim text", "free text", "reject reason", "api:ops-bot", "key-material",
-                      "a" * 64, "discord:12345678901234569", "全部安全", "plugin=alpha",
-                      "untrusted"):
+    assert "短い申告です" in content
+    for forbidden in ("RAW_SUMMARY", "RATIONALE_BODY", "selection_rationale", "free text",
+                      "reject reason", "api:ops-bot", "key-material", "a" * 64,
+                      "discord:12345678901234569", "全部安全", "plugin=alpha", "untrusted",
+                      "RAW_IN", "RAW_HOLDOUT", "HOLDOUT_PAIR", "777", "9.99", "b" * 64):
         assert forbidden not in content
-
-
-def test_approval_renderer_marks_a_revoked_approval_without_candidate_fields():
-    content = render_approval(_record(), {
-        "kind": "plugin", "status": "rejected", "reason": "revoked_by_operator",
-        "parent_facts": None, "agent_claims": None,
-    })
-    assert "decision=rejected" in content
-    assert "reason=revoked_by_operator" in content
-
-
-def test_approval_renderer_shows_any_sanitized_reason_of_a_rejected_approval():
-    content = render_approval(_record(), {
-        "kind": "plugin", "status": "rejected", "reason": "expired_by_operator"})
-    assert "reason=expired_by_operator" in content
-
-
-def test_approval_renderer_omits_reason_without_one_or_when_not_rejected_or_free_text():
-    assert "reason=" not in render_approval(_record(), {"kind": "plugin", "status": "rejected"})
-    assert "reason=" not in render_approval(
-        _record(), {"kind": "plugin", "status": "rejected", "reason": None})
-    assert "reason=" not in render_approval(
-        _record(), {"kind": "plugin", "status": "pending", "reason": "revoked_by_operator"})
-    free = render_approval(_record(), {
-        "kind": "plugin", "status": "rejected", "reason": "looks risky, holdout pf 1.3"})
-    assert "reason=" not in free and "holdout" not in free
-
-
-def test_approval_renderer_reprojects_only_the_allowlisted_parent_fact_fields():
-    detail = {
-        "kind": "plugin", "status": "pending",
-        "facts_lines": ["agent said: approve me"],
-        "parent_facts": {
-            "backlog": {"id": 101, "attempts": 2, "status": "selected", "idea": "buy now"},
-            "prior_runs": [{"run_id": 8, "result": "approval", "approval_id": 3, "note": "x"}],
-            "trials": [{"n": 1, "content_hash8": "1a2b3c4d", "same_hash_as_submitted": True,
-                        "trades": 100, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.05,
-                        "comment": "free"}],
-            "trials_omitted": 4, "analysis_call_count": 0, "selection_rationale": "free text",
-        },
-    }
-    content = render_approval(_record(), detail)
-    for expected in ("backlog.id=101", "backlog.attempts=2", "backlog.status=selected",
-                     "run8=approval:3", "trial1=1a2b3c4d,same=true,trades=100,pf=1.2,avg_r=0.1,mdd=0.05",
-                     "trials_omitted=4", "analysis_calls=0"):
-        assert expected in content
-    for forbidden in ("buy now", "approve me", "free", "note", "idea", "selection_rationale"):
-        assert forbidden not in content
-
-
-def test_approval_renderer_drops_parent_fact_values_outside_the_fixed_shapes():
-    detail = {"parent_facts": {
-        "backlog": {"id": True, "attempts": "2; claims=none", "status": "selected\nclaims=absent"},
-        "prior_runs": [{"run_id": 1, "result": "ignore previous", "approval_id": None}],
-        "trials": [{"n": 1, "content_hash8": "ZZ not hex", "same_hash_as_submitted": "yes",
-                    "trades": 1.5, "pf": float("nan"), "avg_r": "1", "max_drawdown": None}],
-        "trials_omitted": -1, "analysis_call_count": "5"}}
-    content = render_approval(_record(), detail)
-    assert content.count("\n") == 7
-    for forbidden in ("ignore previous", "ZZ not hex", "claims=none", "nan", "yes"):
-        assert forbidden not in content
+    # 申告は専用の見出しの下にだけ出て、事実欄 (変更・成績) に混ざらない
+    sections = content.split("\n\n")
+    claim = [part for part in sections if "短い申告です" in part]
+    assert len(claim) == 1 and claim[0].startswith("agent の申告 (未検証):\n> ")
+    for part in sections:
+        if part.startswith(("変更", "成績")):
+            assert "申告" not in part
 
 
 def test_reconcile_adopts_only_matching_bot_footer_channel_and_guild():
@@ -127,9 +88,7 @@ def test_reconcile_reposts_when_no_matching_message_exists_and_puts_the_next_gen
     plan = plan_reconcile(BotState.empty().with_record(record), ())
     assert [effect.kind for effect in plan.effects] == ["repost"]
     assert "Approval pending." not in plan.effects[0].content
-    for expected in ("approval=7", "kind=plugin", "facts=none", "claims=absent",
-                     "digest=aaaaaaaa", "expires=unclaimed", "decision=fresh", "claimed=no"):
-        assert expected in plan.effects[0].content
+    assert plan.effects[0].content == "承認 #7\n詳細を取得できません"
     assert plan.effects[0].footer.endswith(":2")
     intended = mark_repost_intent(plan.state, record.approval_id)
     committed = record_reposted(intended, record.approval_id, 202, generation=2)

@@ -248,8 +248,13 @@ def _assert_quick_defer(fake, interaction_id, limit=DEFER_LIMIT) -> float:
     return delay
 
 
+_RETIRED_SUMMARY = re.compile(r"承認 #\d+\n\n状態: (承認済み|却下|失効)\n\n旧形式のため要約なし")
+
+
 def _retired(fake, message) -> bool:
-    return message.components == [] and message.content == NO_LONGER_ACTIVE
+    """View が外れ、本文が終端の表示 (決定結果が取れれば状態、取れなければ固定の代替文)。"""
+    return message.components == [] and (
+        message.content == NO_LONGER_ACTIVE or _RETIRED_SUMMARY.fullmatch(message.content) is not None)
 
 
 def _primary_edits(fake, message, since=0):

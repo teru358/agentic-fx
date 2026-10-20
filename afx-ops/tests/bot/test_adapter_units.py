@@ -171,15 +171,15 @@ def test_an_empty_events_page_still_records_the_high_watermark_and_a_rollback_st
         os.close(fd)
 
 
-def test_the_posted_approval_shows_the_detail_facts_the_adapter_fetched():
+def test_the_posted_approval_shows_the_change_summary_the_adapter_fetched():
     reply = Reply(200, {"status": "pending", "payload_sha256": "a" * 64,
-                        "facts_lines": ["agent says: ok"],
-                        "parent_facts": {"backlog": {"id": 101, "attempts": 1,
-                                                     "status": "selected"}}}, None)
+                        "change": {"name": "sma_cross", "kind": "strategy",
+                                   "classification": "new", "params": {"items": []},
+                                   "performance": {"in_sample": [], "holdout": []},
+                                   "summary": "申告"}}, None)
     content = _post_effect(_record(), reply).content
-    assert "facts=backlog.id=101; backlog.attempts=1; backlog.status=selected" in content
-    assert "agent says" not in content
-    assert "facts=none" in _post_effect(_record(), None).content
+    assert "承認 #7 / 戦略 sma\\_cross (新規)" in content and "変更: 前版なし" in content
+    assert _post_effect(_record(), None).content == "承認 #7\n詳細を取得できません"
 
 
 def test_an_approval_ref_with_non_ascii_digits_is_not_an_approval_id():

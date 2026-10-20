@@ -579,7 +579,7 @@ class OpsService:
         _authorize(principal, "approval_detail")
         with self._ops_lane(self._deadline(deadline)):
             row = self._conn.execute(
-                "SELECT kind,status,payload_json,reason,decided_by,decided_at "
+                "SELECT kind,status,payload_json,reason,decided_by,decided_at,expires_at "
                 "FROM approval_requests WHERE id=?", (approval_id,)).fetchone()
             journals = self._decided_journals(approval_id)
         if row is None:
@@ -605,6 +605,7 @@ class OpsService:
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
                 "decided_by": row["decided_by"], "decided_at": row["decided_at"],
+                "expires_at": row["expires_at"],
                 "asserted_actor": None}
 
     def _decided_journals(self, approval_id: int) -> list[dict]:
