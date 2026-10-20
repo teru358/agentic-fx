@@ -9,8 +9,8 @@ from agentic_fx.config import Settings
 from agentic_fx.setup.settings_edit import EditResult, find_duplicate_keys
 
 
-CURRENT_SCHEMA_VERSION = 3
-_SCHEMA_LINE = "schema_version: 3  # [init] settings の版。`afx init` が移行する\n"
+CURRENT_SCHEMA_VERSION = 4
+_SCHEMA_LINE = "schema_version: 4  # [init] settings の版。`afx init` が移行する\n"
 _V1_SCHEMA_LINE = "schema_version: 1  # settings の版。`afx init` が移行する\n"
 
 
@@ -128,6 +128,28 @@ def _migrate_two_to_three(text: str) -> EditResult:
     return EditResult(ok=True, text=updated)
 
 
+_VERSION_THREE_LINE = re.compile(r"schema_version:[ \t]*3([ \t]+#.*)?\r?\n?")
+
+
+def _migrate_three_to_four(text: str) -> EditResult:
+    """Bump the marker to v4 only.
+
+    ``notify.trade_events`` is optional and defaults to true, so an older file keeps its
+    meaning without a new section; only the marker line changes.
+    """
+    lines = text.splitlines(keepends=True)
+    marker = next((i for i, line in enumerate(lines) if _VERSION_THREE_LINE.fullmatch(line)), None)
+    if marker is None:
+        return _failure("schema_version: 3 の行を見つけられません。手で編集してください。")
+    lines[marker] = lines[marker].replace("schema_version: 3", "schema_version: 4", 1)
+    updated = "".join(lines)
+    try:
+        Settings.model_validate(yaml.safe_load(updated) or {})
+    except Exception as error:
+        return _failure(f"移行後の型検証に失敗しました: {error}。手で編集してください。")
+    return EditResult(ok=True, text=updated)
+
+
 def migrate(text: str) -> EditResult:
     """Migrate a settings document only through the explicitly listed versions."""
     duplicates = find_duplicate_keys(text)
@@ -147,6 +169,8 @@ def migrate(text: str) -> EditResult:
             result = _migrate_one_to_two(text)
         elif version == 2:
             result = _migrate_two_to_three(text)
+        elif version == 3:
+            result = _migrate_three_to_four(text)
         else:
             return _failure("この settings の移行経路がありません。手で編集してください。")
         if not result.ok or result.text is None:
