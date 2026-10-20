@@ -211,3 +211,34 @@ def test_revocation_only_reaches_rows_the_same_backfill_approved(tmp_path):
     assert migrated.execute(
         "SELECT outcome_class FROM candidate_archives WHERE id=?",
         (archive_id,)).fetchone()[0] == "approved"
+
+
+def test_a_second_connection_with_a_stale_decision_neither_rebuilds_nor_backs_up(
+        tmp_path, monkeypatch):
+    """2 接続が同時に旧形を見て rebuild に入っても、ロック取得後の再確認で
+    後続は何もしない。backup も backfill も 1 回だけ。"""
+    legacy, path = _legacy(tmp_path)
+    _old_row(legacy, 1, "h1", "c1")
+    legacy.commit()
+    legacy.close()
+    first = connect(path)
+    second = connect(path)
+    backfills = []
+    real = archives.backfill_outcome_from_approvals
+
+    def counting(conn):
+        backfills.append(1)
+        return real(conn)
+
+    monkeypatch.setattr(archives, "backfill_outcome_from_approvals", counting)
+    db_mod._migrate_candidate_archives(first, root=None)
+    first.execute("UPDATE candidate_archives SET outcome_class='revoked'")
+    first.commit()
+    db_mod._rebuild_candidate_archives(second)
+    assert backfills == [1]
+    assert first.execute("SELECT outcome_class FROM candidate_archives"
+                         ).fetchone()[0] == "revoked"
+    backups = [p for p in tmp_path.iterdir()
+               if ".bak-candidate-archives" in p.name]
+    assert len(backups) == 1
+    assert not second.in_transaction

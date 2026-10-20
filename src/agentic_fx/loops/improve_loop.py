@@ -1101,7 +1101,7 @@ class ImproveLoop:
         from agentic_fx.plugin import loader as plugin_loader
         from agentic_fx.plugin import strategy_adapter
         from agentic_fx.plugin.version_store import (
-            _fsync_dir, _write_ro_file, artifact_hash_bytes, content_hash_bytes,
+            artifact_hash_bytes, content_hash_bytes,
         )
 
         def run_backtest_handler(args: dict) -> dict:
@@ -1328,22 +1328,14 @@ class ImproveLoop:
                            staging_dir.name /
                            f".tmp-{artifact_hash}-{uuid.uuid4()}")
             try:
-                archive_tmp.mkdir(parents=True, mode=0o700)
-                _write_ro_file(archive_tmp / "plugin.py", plugin_py)
-                _write_ro_file(archive_tmp / "config.yaml", config_yaml)
-                _write_ro_file(archive_tmp / "test_plugin.py", test_plugin)
-                metadata = {
-                    "name": meta.name, "content_hash": meta.content_hash,
-                    "artifact_hash": artifact_hash, "pair": args["pair"],
-                    "metrics": save_kwargs["metrics"],
-                    "created_at": self._clock.now().isoformat(),
-                }
-                _write_ro_file(
-                    archive_tmp / "meta.json",
-                    json.dumps(metadata, sort_keys=True).encode())
-                _fsync_dir(archive_tmp)
-                os.chmod(archive_tmp, 0o500)
-                _fsync_dir(archive_tmp.parent)
+                self._write_archive_tmp(
+                    archive_tmp, plugin_py=plugin_py, config_yaml=config_yaml,
+                    test_plugin=test_plugin, metadata={
+                        "name": meta.name, "content_hash": meta.content_hash,
+                        "artifact_hash": artifact_hash, "pair": args["pair"],
+                        "metrics": save_kwargs["metrics"],
+                        "created_at": self._clock.now().isoformat(),
+                    })
             except Exception as exc:
                 _log.exception("archive snapshot failed for %r", args.get("name"))
                 self._activity.write(
@@ -2181,6 +2173,38 @@ class ImproveLoop:
                     f"{type(exc).__name__}:{str(exc)[:300]}")
 
     @staticmethod
+    def _write_archive_tmp(archive_tmp: Path, *, plugin_py: bytes,
+                           config_yaml: bytes, test_plugin: bytes,
+                           metadata: dict) -> None:
+        """archive の中身を tmp ディレクトリに書き、読み取り専用にして
+        fsync する。run_backtest の archive と最終 artifact の archive が
+        同じ手順を使う。公開 (rename) は呼び出し側が行う。"""
+        from agentic_fx.plugin.version_store import _fsync_dir, _write_ro_file
+        archive_tmp.mkdir(parents=True, mode=0o700)
+        _write_ro_file(archive_tmp / "plugin.py", plugin_py)
+        _write_ro_file(archive_tmp / "config.yaml", config_yaml)
+        _write_ro_file(archive_tmp / "test_plugin.py", test_plugin)
+        _write_ro_file(archive_tmp / "meta.json",
+                       json.dumps(metadata, sort_keys=True).encode())
+        _fsync_dir(archive_tmp)
+        os.chmod(archive_tmp, 0o500)
+        _fsync_dir(archive_tmp.parent)
+
+    @staticmethod
+    def _verify_archive_dir(path: Path, artifact_hash: str) -> None:
+        """公開済みの archive が通常のディレクトリで、3 ファイルから再計算した
+        artifact_hash が一致することを確かめる。外れたら ValueError / OSError。"""
+        from agentic_fx.plugin.version_store import artifact_hash_bytes
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError("final_not_regular_directory")
+        actual = artifact_hash_bytes(
+            (path / "plugin.py").read_bytes(),
+            (path / "config.yaml").read_bytes(),
+            (path / "test_plugin.py").read_bytes())
+        if actual != artifact_hash:
+            raise ValueError(f"hash_mismatch:{actual}")
+
+    @staticmethod
     def _remove_archive_tmp(path: Path) -> None:
         import shutil
         from agentic_fx.plugin.version_store import chmod_tree_writable
@@ -2189,7 +2213,7 @@ class ImproveLoop:
 
     def _publish_archives(self, conn, *, ctx, now,
                           mission_outcome: str) -> None:
-        from agentic_fx.plugin.version_store import artifact_hash_bytes, _fsync_dir
+        from agentic_fx.plugin.version_store import _fsync_dir
         from agentic_fx.store import candidate_archives
 
         for entry in accepted_entries(ctx.ledger.entries()):
@@ -2242,14 +2266,7 @@ class ImproveLoop:
                             continue
             if not published:
                 try:
-                    if final_path.is_symlink() or not final_path.is_dir():
-                        raise ValueError("final_not_regular_directory")
-                    actual = artifact_hash_bytes(
-                        (final_path / "plugin.py").read_bytes(),
-                        (final_path / "config.yaml").read_bytes(),
-                        (final_path / "test_plugin.py").read_bytes())
-                    if actual != artifact_hash:
-                        raise ValueError(f"hash_mismatch:{actual}")
+                    self._verify_archive_dir(final_path, artifact_hash)
                     published = True
                 except (OSError, ValueError) as exc:
                     self._archive_failed(
@@ -2293,12 +2310,17 @@ class ImproveLoop:
     def _snapshot_final_archive(self, candidate: _FinalCandidate, *,
                                 mission_id: int, now) -> str | None:
         """run_backtest と同じ手順 (tmp に書いて rename) で、staging の最終
-        bytes から archive を作る。作れなければ None (activity に残す)。"""
+        bytes から archive を作る。作れなければ None (activity に残す)。
+        書き込み tx の外で呼ぶ。後で tx が rollback すると行の無い dir が
+        残るが、孤立 dir は既存の sweep が回収する。
+        同名の dir が既にあるときは中身の hash を再計算し、一致するものだけを
+        採用する。一致しないものは `.stale-*` に退避して作り直す。"""
         from agentic_fx.plugin.version_store import (
-            _fsync_dir, _write_ro_file, artifact_hash_bytes,
+            _fsync_dir, artifact_hash_bytes,
         )
         final_path = (self._root / "plugins" / "_archive" / str(mission_id)
                       / candidate.artifact_hash)
+        relative = final_path.relative_to(self._root).as_posix()
         archive_tmp = final_path.parent / (
             f".tmp-{candidate.artifact_hash}-{uuid.uuid4()}")
         try:
@@ -2311,23 +2333,22 @@ class ImproveLoop:
             if artifact_hash_bytes(plugin_py, config_yaml,
                                    test_plugin) != candidate.artifact_hash:
                 raise ValueError("staging_changed")
-            if final_path.is_dir() and not final_path.is_symlink():
-                return final_path.relative_to(self._root).as_posix()
-            archive_tmp.mkdir(parents=True, mode=0o700)
-            _write_ro_file(archive_tmp / "plugin.py", plugin_py)
-            _write_ro_file(archive_tmp / "config.yaml", config_yaml)
-            _write_ro_file(archive_tmp / "test_plugin.py", test_plugin)
-            _write_ro_file(
-                archive_tmp / "meta.json", json.dumps({
+            if os.path.lexists(final_path):
+                try:
+                    self._verify_archive_dir(final_path, candidate.artifact_hash)
+                    return relative
+                except (OSError, ValueError):
+                    os.rename(final_path, final_path.parent / (
+                        f".stale-{candidate.artifact_hash}-{uuid.uuid4()}"))
+            self._write_archive_tmp(
+                archive_tmp, plugin_py=plugin_py, config_yaml=config_yaml,
+                test_plugin=test_plugin, metadata={
                     "name": candidate.name,
                     "content_hash": candidate.content_hash,
                     "artifact_hash": candidate.artifact_hash,
                     "pair": candidate.pair, "metrics": {},
                     "created_at": now.isoformat(),
-                }, sort_keys=True).encode())
-            _fsync_dir(archive_tmp)
-            os.chmod(archive_tmp, 0o500)
-            _fsync_dir(archive_tmp.parent)
+                })
             os.rename(archive_tmp, final_path)
             _fsync_dir(final_path.parent)
         except Exception as exc:
@@ -2337,13 +2358,21 @@ class ImproveLoop:
                 mission_id=mission_id, artifact_hash=candidate.artifact_hash,
                 reason=f"{type(exc).__name__}:{str(exc)[:300]}")
             return None
-        return final_path.relative_to(self._root).as_posix()
+        return relative
+
+    def _final_archive_row_exists(self, conn, *, mission_id: int,
+                                  artifact_hash: str) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM candidate_archives WHERE mission_id=? "
+            "AND artifact_hash=?", (mission_id, artifact_hash)
+        ).fetchone() is not None
 
     def _ensure_final_archive_row(self, conn, *, mission_id: int,
                                   candidate: _FinalCandidate, now,
-                                  snapshot: bool) -> int:
+                                  archive_path: str | None = None) -> int:
         """最終 artifact の行を返す。同じ `(mission_id, artifact_hash)` の行が
-        あれば再利用し、無ければ作る。snapshot は提出する候補だけが作る。"""
+        あれば再利用し、無ければ作る。archive_path は提出する候補だけが、
+        tx の外で作った archive の相対パスを渡す。tx の中はファイルを触らない。"""
         from agentic_fx.store import candidate_archives as archives_store
         existing = conn.execute(
             "SELECT id FROM candidate_archives WHERE mission_id=? "
@@ -2351,8 +2380,6 @@ class ImproveLoop:
             (mission_id, candidate.artifact_hash)).fetchone()
         if existing is not None:
             return existing["id"]
-        archive_path = (self._snapshot_final_archive(
-            candidate, mission_id=mission_id, now=now) if snapshot else None)
         return archives_store.insert(
             conn, mission_id=mission_id, name=candidate.name,
             content_hash=candidate.content_hash,
@@ -2373,8 +2400,7 @@ class ImproveLoop:
         conn.execute("SAVEPOINT candidate_settle")
         try:
             archive_id = self._ensure_final_archive_row(
-                conn, mission_id=ctx.mission_id, candidate=candidate, now=now,
-                snapshot=False)
+                conn, mission_id=ctx.mission_id, candidate=candidate, now=now)
             if not archives_store.settle(conn, archive_id, outcome):
                 _log.warning(
                     "candidate archive %s was not not_submitted; skip %s",
@@ -2589,6 +2615,17 @@ class ImproveLoop:
         else:
             persist_ctx = ctx
         try:
+            # 提出する候補の archive は書き込み tx の前に作る (tx の中でファイルを
+            # 触らない)。tx が rollback すると行の無い dir が残るが、孤立 dir は
+            # 既存の sweep が回収する。
+            submitted = self._submitted_candidate(
+                approval_payload, final_candidate)
+            submitted_archive_path = None
+            if not self._final_archive_row_exists(
+                    conn, mission_id=mission_id,
+                    artifact_hash=submitted.artifact_hash):
+                submitted_archive_path = self._snapshot_final_archive(
+                    submitted, mission_id=mission_id, now=now)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査は
@@ -2635,11 +2672,9 @@ class ImproveLoop:
                 # 提出する候補の行を承認依頼の直前に必ず作り、不変の id を
                 # payload に入れる (作成後は変えない)。
                 from agentic_fx.store import candidate_archives as archives_store
-                submitted = self._submitted_candidate(
-                    approval_payload, final_candidate)
                 candidate_archive_id = self._ensure_final_archive_row(
                     conn, mission_id=mission_id, candidate=submitted,
-                    now=now, snapshot=True)
+                    now=now, archive_path=submitted_archive_path)
                 if not archives_store.settle(
                         conn, candidate_archive_id, "pending"):
                     raise RuntimeError(

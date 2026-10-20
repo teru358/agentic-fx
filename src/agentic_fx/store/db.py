@@ -620,10 +620,13 @@ def _values_match(a: float | None, b: float | None) -> bool:
 values_match = _values_match
 
 
-def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
+def _backup_before_migration(conn: sqlite3.Connection, suffix: str, *,
+                             from_new_connection: bool = False) -> None:
     """移行が必要と判定された時だけ、移行前スナップショットを取る。
     `suffix` は移行の種類ごとに別ファイルにするための識別子
-    (Task 16: v1→v2 移行と v2→split 移行を別バックアップにする)。"""
+    (Task 16: v1→v2 移行と v2→split 移行を別バックアップにする)。
+    `from_new_connection` は、呼び出し側が書き込み tx を持っている間に
+    取るとき用で、別接続から (tx 前の確定済みの状態を) 読んで写す。"""
     main = next((r for r in conn.execute("PRAGMA database_list")
                 if r["name"] == "main"), None)
     db_file = main["file"] if main is not None else ""
@@ -635,10 +638,13 @@ def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         bak_path = src_path.with_name(src_path.name + suffix + "." + timestamp)
     bak_conn = sqlite3.connect(bak_path)
+    source = sqlite3.connect(src_path) if from_new_connection else conn
     try:
-        conn.backup(bak_conn)
+        source.backup(bak_conn)
     finally:
         bak_conn.close()
+        if from_new_connection:
+            source.close()
     _log.warning("ohlcv 移行前のバックアップを作成しました: %s", bak_path)
 
 
@@ -1580,6 +1586,19 @@ def _outcome_check_values(conn: sqlite3.Connection) -> frozenset[str]:
     return frozenset(re.findall(r"'([^']*)'", match.group(1)))
 
 
+def _candidate_archives_is_canonical(conn: sqlite3.Connection) -> bool:
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.row_factory = sqlite3.Row
+        probe.executescript(_CANDIDATE_ARCHIVES_DDL)
+        canonical = _candidate_archives_shape(probe)
+        canonical_check = _outcome_check_values(probe)
+    finally:
+        probe.close()
+    return (_candidate_archives_shape(conn) == canonical
+            and _outcome_check_values(conn) == canonical_check)
+
+
 def _migrate_candidate_archives(conn: sqlite3.Connection, *,
                                 root: Path | None) -> None:
     """候補台帳を現行の形 (4 列追加と `pair` の NULL 許可) にする。
@@ -1590,32 +1609,30 @@ def _migrate_candidate_archives(conn: sqlite3.Connection, *,
     既存列の値と、既に値のある行は変えない。
     `logic_hash` / `family_key` は rebuild と別に、NULL の行へ archive の
     現物から埋める (root がある起動のたびに残りだけ試す)。"""
-    probe = sqlite3.connect(":memory:")
-    try:
-        probe.row_factory = sqlite3.Row
-        probe.executescript(_CANDIDATE_ARCHIVES_DDL)
-        canonical = _candidate_archives_shape(probe)
-        canonical_check = _outcome_check_values(probe)
-    finally:
-        probe.close()
-    if (_candidate_archives_shape(conn) != canonical
-            or _outcome_check_values(conn) != canonical_check):
+    if not _candidate_archives_is_canonical(conn):
         _rebuild_candidate_archives(conn)
     if root is not None:
         _backfill_candidate_archive_identity(conn, root=root)
 
 
 def _rebuild_candidate_archives(conn: sqlite3.Connection) -> None:
+    """書き込みロックを取ってから形を再確認し、既に正準なら何もしない
+    (並行する起動が先に移行を終えていることがある)。backup もロックの
+    中で取り、実際に rebuild する 1 回だけにする。"""
     from agentic_fx.store import candidate_archives as archives_mod
 
-    _backup_before_migration(conn, ".bak-candidate-archives")
-    old_columns = {r["name"] for r in conn.execute(
-        "PRAGMA table_info(candidate_archives)")}
-    carried = [c for c in _CANDIDATE_ARCHIVES_COLUMNS if c in old_columns]
-    column_list = ",".join(carried)
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if _candidate_archives_is_canonical(conn):
+            conn.commit()
+            return
+        _backup_before_migration(
+            conn, ".bak-candidate-archives", from_new_connection=True)
+        old_columns = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(candidate_archives)")}
+        carried = [c for c in _CANDIDATE_ARCHIVES_COLUMNS if c in old_columns]
+        column_list = ",".join(carried)
         seq = conn.execute(
             "SELECT seq FROM sqlite_sequence WHERE name='candidate_archives'"
         ).fetchone()
