@@ -210,6 +210,11 @@ _STATE_OF = {"pending_fill": "placed", "open": "filled", "rejected": "rejected",
              "cancelled": "cancelled", "expired": "expired"}
 
 
+def has_event(to_status: str) -> bool:
+    """この遷移先に event があるか (途中状態は無い)。"""
+    return to_status == "closed" or to_status in _STATE_OF
+
+
 def build_event(row: Mapping[str, object], to_status: str, *, trigger: object,
                 state_mode: str | None, ccy: str,
                 mode: str = "paper") -> tuple[str, str, dict] | None:
@@ -217,7 +222,7 @@ def build_event(row: Mapping[str, object], to_status: str, *, trigger: object,
 
     読む列は §2.4 の一覧だけ。値が grammar を通らないときは InvalidValue。
     """
-    if to_status != "closed" and to_status not in _STATE_OF:
+    if not has_event(to_status):
         return None
     ref = f"order:{row['id']}"
     origin = origin_code(trigger)

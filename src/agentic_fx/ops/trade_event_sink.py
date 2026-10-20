@@ -21,6 +21,7 @@ from pathlib import Path
 
 from agentic_fx.store.db import connect
 
+from . import trade_events
 from .events import EventSchemaError, validate_fields
 
 _log = logging.getLogger(__name__)
@@ -202,3 +203,42 @@ class TradeEventSink:
             except Exception:  # noqa: BLE001
                 pass
             self._conn = None
+
+
+class TradeEventEmitter:
+    """`transitions.observe` に渡す observer。遷移後の行から event を作って sink に渡す。
+
+    読むのは遷移後の行と `missions.trigger` の 1 回だけ。flock もファイル I/O もしない
+    (`state_mode` は service が起動時に読んだ値をメモリで受け取る)。
+    """
+
+    _ORIGIN_SQL = ("SELECT m.trigger FROM trade_intents i JOIN missions m "
+                   "ON m.id=i.mission_id WHERE i.id=?")
+
+    def __init__(self, conn: sqlite3.Connection, sink: TradeEventSink, *,
+                 state_mode: str | None, ccy: str, mode: str = "paper") -> None:
+        self._conn, self._sink = conn, sink
+        self._state_mode, self._ccy, self._mode = state_mode, ccy, mode
+
+    def _trigger(self, row: dict) -> object:
+        intent_id = row.get("intent_id")
+        if intent_id is None:
+            return None
+        found = self._conn.execute(self._ORIGIN_SQL, (intent_id,)).fetchone()
+        return None if found is None else found[0]
+
+    def __call__(self, row: dict, from_status: str, to_status: str) -> None:
+        try:
+            if not trade_events.has_event(to_status):
+                return
+            built = trade_events.build_event(
+                row, to_status, trigger=self._trigger(row), state_mode=self._state_mode,
+                ccy=self._ccy, mode=self._mode)
+        except trade_events.InvalidValue:
+            self._sink.record_drop("invalid_value_drop")
+            return
+        except Exception:  # noqa: BLE001 — 通知は注文処理を止めない
+            self._sink.record_drop("observer_error")
+            return
+        if built is not None:
+            self._sink.submit(*built)
