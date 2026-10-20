@@ -9,6 +9,7 @@ improvement_backlog、ユーザー方針 = Policy.tail、参照 = RunContext
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,9 +47,33 @@ def family_redirect_last_result(deployed_name: str) -> str:
     return f"{_FAMILY_REDIRECT_PREFIX}{deployed_name}"
 
 
+_FIXED_LAST_RESULTS = frozenset({
+    NOT_SUBMITTED_LAST_RESULT, DUPLICATE_LAST_RESULT, "rejected_by_human",
+    "expired", "invalidated", "commit_failed", "interrupted", "reported",
+    "human_rejected", "human_noted", "human_reopened"})
+_FIXED_LAST_RESULT_PATTERNS = (
+    re.compile(r"observation:family_redirect:[a-z][a-z0-9_]{0,63}"),
+    re.compile(r"gate_failed:noop_copy_of:[a-z][a-z0-9_]{0,63}"),
+    re.compile(r"approval_pending:[0-9]{1,18}"),
+    re.compile(r"unsupported_in_plan10:risk_gate"),
+)
+# 自由文が続きうる語頭。語頭だけを残し、後ろは渡さない。
+_LAST_RESULT_TAGS = frozenset({
+    "gate_failed", "report_failed", "mission_failed", "report", "approved",
+    "observation", "unsupported_in_plan10", "approval_pending"})
+UNCLASSIFIED_LAST_RESULT = "unclassified"
+# 失敗 mission の system note が持つ診断行。呼び出し回数だけを残し、
+# 理由・最良候補の成績・archive 位置は渡さない。
+_MISSION_DIAGNOSTIC = re.compile(
+    r"mission #[0-9]+ status=[a-z_]+ reason=\S* "
+    r"run_backtest=([0-9]{1,6}) analyze_corr=([0-9]{1,6})(?: |$)")
+
+
 def project_last_result(value: str | None) -> str | None:
-    """履歴に出す `last_result` を agent 面の固定語彙へ写す。新しい書き込みは
-    最初から固定文言だが、移行前に保存された値も出口で畳む。"""
+    """agent 面に出す `last_result` を固定語彙だけに絞る (fail-closed)。
+
+    移行前の値は区別を畳み、固定表現に一致しない値は語頭だけ、語頭も
+    不明なら `unclassified` を返す。数値・自由文・成績は一切通さない。"""
     if value is None:
         return None
     if (value in _LEGACY_NOT_SUBMITTED_EXACT
@@ -56,7 +81,16 @@ def project_last_result(value: str | None) -> str | None:
         return NOT_SUBMITTED_LAST_RESULT
     if value.startswith(_LEGACY_DUPLICATE):
         return DUPLICATE_LAST_RESULT
-    return value
+    diag = _MISSION_DIAGNOSTIC.match(value)
+    if diag is not None:
+        return (f"mission_diagnostic run_backtest={diag.group(1)} "
+                f"analyze_corr={diag.group(2)}")
+    base = value.split(" ", 1)[0]
+    if base in _FIXED_LAST_RESULTS or any(
+            p.fullmatch(base) for p in _FIXED_LAST_RESULT_PATTERNS):
+        return base
+    tag = base.split(":", 1)[0]
+    return tag if tag in _LAST_RESULT_TAGS else UNCLASSIFIED_LAST_RESULT
 
 
 def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
@@ -192,7 +226,8 @@ def _backlog_section(conn: "sqlite3.Connection",
     items = []
     for row in backlog_mod.list_open(conn):
         item = {"id": row["id"], "idea": row["idea"], "status": row["status"],
-                "attempts": row["attempts"], "last_result": row["last_result"],
+                "attempts": row["attempts"],
+                "last_result": project_last_result(row["last_result"]),
                 "origin_outcome": row["origin_outcome"]}
         if allowed_backlog_ids is not None:
             item["assigned"] = row["id"] in allowed_backlog_ids
@@ -200,7 +235,8 @@ def _backlog_section(conn: "sqlite3.Connection",
     all_notes = list(reversed(backlog_mod.list_notes(conn)))
     notes = [
         {"id": row["id"], "idea": row["idea"], "status": row["status"],
-         "attempts": row["attempts"], "last_result": row["last_result"],
+         "attempts": row["attempts"],
+         "last_result": project_last_result(row["last_result"]),
          "origin_outcome": row["origin_outcome"]}
         for row in all_notes[:20]
     ]

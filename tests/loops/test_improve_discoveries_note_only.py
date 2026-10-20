@@ -200,3 +200,46 @@ def test_ac3_no_agent_path_writes_open_status_by_update():
     src = (SRC / "loops" / "improve_loop.py").read_text(encoding="utf-8")
     assert "SET status='open'" not in src
     assert "promoted_from_note" not in src
+
+
+@pytest.mark.parametrize("status", ["open", "observation", "note", "done"])
+def test_selected_idea_without_id_never_takes_an_existing_row(
+        loop_and_ctx_with_open_backlog, status):
+    """id 無しの同文指定は、既存行を status に関わらず選べない。"""
+    loop, ctx, conn, _ = loop_and_ctx_with_open_backlog
+    conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm) "
+        "VALUES ('Same Text','agent',?,?,?, 'same text')",
+        (status, NOW.isoformat(), NOW.isoformat()))
+    conn.commit()
+    out = _output([], None)
+    out["selected"] = {"backlog_id": None, "idea": "  SAME text "}
+
+    outcome = loop._select_and_bind(conn, out, ctx, now=NOW)
+
+    assert outcome.won is False and outcome.backlog_id is None
+    row = conn.execute(
+        "SELECT status,attempts FROM improvement_backlog "
+        "WHERE idea_norm='same text'").fetchone()
+    assert row["status"] == status and row["attempts"] == 0
+    assert conn.execute(
+        "SELECT count(*) c FROM improvement_backlog WHERE idea_norm='same text'"
+    ).fetchone()["c"] == 1
+
+
+def test_selected_idea_without_id_cannot_take_row_outside_partition(
+        loop_and_ctx_with_open_backlog):
+    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
+    other = conn.execute(
+        "SELECT idea FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()["idea"]
+    out = _output([], None)
+    out["selected"] = {"backlog_id": None, "idea": other}
+
+    outcome = loop._select_and_bind(conn, out, ctx, now=NOW)
+
+    assert outcome.won is False
+    assert conn.execute(
+        "SELECT status FROM improvement_backlog WHERE id=?",
+        (backlog_id,)).fetchone()["status"] == "open"

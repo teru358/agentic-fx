@@ -1604,11 +1604,15 @@ class ImproveLoop:
                     return _SelectionOutcome(won=False, backlog_id=None)
                 # discoveries にも既存 backlog にも無い新規 idea の選択は、
                 # INSERT してから同じ tx で選ぶ。空文字は選択なし扱い
-                # (fail closed)。同文の行が既にあればその行を使い、status は
-                # 変えない (note は選択できず敗者になる)。
-                backlog_id, _selected_action = self._upsert_backlog_idea(
+                # (fail closed)。同文の行が既にあれば status を問わず敗者:
+                # 既存の課題を選ぶには backlog_id が必要で、id 無しの
+                # 同文指定で open / observation の行を横取りさせない。
+                backlog_id, selected_action = self._upsert_backlog_idea(
                     conn, selected_idea, selected.get("source", "agent"),
                     as_task=True, now=now, mission_id=ctx.mission_id)
+                if selected_action != "inserted":
+                    conn.commit()
+                    return _SelectionOutcome(won=False, backlog_id=None)
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)

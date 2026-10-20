@@ -399,3 +399,23 @@ def test_ac24_unprofitable_and_insufficient_both_write_not_submitted_origin(
         "SELECT DISTINCT origin_outcome FROM improvement_backlog "
         "WHERE origin_outcome IS NOT NULL")}
     assert stored == {"not_submitted"}
+
+
+def test_backlog_last_result_canaries_are_absent_from_context_and_prompt(
+        conn, tmp_path):
+    values = {"gate_failed:holdout_pf=0.7391 trades=4242": "open_like",
+              "insufficient_trades:7777": "note_like"}
+    for i, value in enumerate(values):
+        backlog_id = backlog_store.add(conn, f"canary backlog {i}", "user", NOW)
+        backlog_store.set_status(
+            conn, backlog_id, "observation" if i == 0 else "note", NOW,
+            last_result=value)
+    stored = " ".join(r["last_result"] for r in conn.execute(
+        "SELECT last_result FROM improvement_backlog"))
+    assert "0.7391" in stored and "7777" in stored
+
+    rendered, ctx_data = _render(conn, _strict_settings(), tmp_path)
+
+    for text in (json.dumps(ctx_data), rendered):
+        for token in ("0.7391", "4242", "7777"):
+            assert token not in text

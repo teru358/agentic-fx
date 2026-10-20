@@ -368,15 +368,15 @@ def test_n2_approval_outcome_leaves_origin_outcome_null(
 # 最初の起票者のまま保つ (書き換えない)
 # ---------------------------------------------------------------------------
 
-def test_n3_selected_existing_task_reuses_without_rewriting_origin(
+def test_n3_selected_existing_task_by_idea_alone_loses_without_rewriting_origin(
         loop_and_ctx_with_open_backlog):
     """discoveries 側の重複は `_upsert_backlog_idea` より前の `continue`
     で除外されるため existing 戻り値を実際には通らない。ここでは
     `selected.backlog_id` を省略し `selected.idea` を既存 task の idea と
     一致させ、`_upsert_backlog_idea(...) -> "existing"` を実際に通す経路
-    (`_select_and_bind` の `selected` 分岐) を pin する。既存行の
-    `origin_mission_id` (この場合 NULL — `backlog_store.add` は書かない)
-    がこの mission の id へ書き換わらないことを確認する。"""
+    (`_select_and_bind` の `selected` 分岐) を pin する。id 無しの同文指定
+    は既存行を選べず敗者になり、既存行の `origin_mission_id` (この場合
+    NULL — `backlog_store.add` は書かない) も status も変わらない。"""
     loop, ctx, conn, _backlog_id = loop_and_ctx_with_open_backlog
     existing_id = backlog_store.add(conn, "already known idea", "user", _NOW)
 
@@ -388,9 +388,10 @@ def test_n3_selected_existing_task_reuses_without_rewriting_origin(
 
     outcome = loop._select_and_bind(conn, output, ctx, now=_NOW)
 
-    assert outcome.backlog_id == existing_id
+    assert outcome.won is False and outcome.backlog_id is None
     row = _row_by_id(conn, existing_id)
     assert row["origin_mission_id"] is None
+    assert row["status"] == "open"
 
 
 # ---------------------------------------------------------------------------

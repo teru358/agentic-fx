@@ -2,6 +2,9 @@
 集計されることを節ごとに検証する。"""
 from __future__ import annotations
 
+import json
+
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -74,7 +77,7 @@ def test_backlog_section_includes_attempts_and_trial_count(tmp_path):
                                 allowed_backlog_ids=None)
     item = next(i for i in ctx["backlog"]["items"] if i["id"] == bid)
     assert item["attempts"] == 1
-    assert item["last_result"] == "insufficient_trades:5"
+    assert item["last_result"] == "observation:not_submitted"
 
 
 def test_user_policy_section_is_tail_4000_chars(tmp_path):
@@ -195,3 +198,52 @@ def test_context_never_carries_the_human_logs(tmp_path):
     for needle in (marker, "agentic.log", "activity.log", "59.97",
                    "parent_wait4", "stderr_tail"):
         assert needle not in text, needle
+
+
+_BACKLOG_CANARIES = (
+    "insufficient_trades:7777", "gate_failed:holdout_pf=0.7391 trades=4242",
+    "observation:evaluable_false_canary", "report_failed:pf 1.2345 leaked",
+    "mission_failed:holdout 0.8812", "weird free text 5551")
+
+
+def test_backlog_last_result_is_projected_in_items_and_notes(tmp_path):
+    from agentic_fx.loops.improve_context import project_last_result
+    c = connect(tmp_path / "t.db"); init_db(c)
+    ids = []
+    for i, value in enumerate(_BACKLOG_CANARIES):
+        bid = backlog.add(c, f"canary idea {i}", "user", NOW)
+        status = "note" if i % 2 else "observation"
+        backlog.set_status(c, bid, status, NOW, last_result=value)
+        ids.append(bid)
+    stored = [r["last_result"] for r in c.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id")]
+    assert stored == list(_BACKLOG_CANARIES)
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    rows = ctx["backlog"]["items"] + ctx["backlog"]["notes"]
+    assert rows
+    blob = json.dumps(ctx["backlog"])
+    for token in ("7777", "0.7391", "4242", "evaluable_false_canary",
+                  "1.2345", "0.8812", "5551", "free text"):
+        assert token not in blob
+    for row in rows:
+        assert row["last_result"] == project_last_result(
+            _BACKLOG_CANARIES[ids.index(row["id"])])
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("gate_failed:holdout_pf=0.7391", "gate_failed"),
+    ("report_failed:pf 1.2345", "report_failed"),
+    ("observation:something 12", "observation"),
+    ("totally unknown 99", "unclassified"),
+    ("human_noted best=x@abc pf=1.31 dd=0.2 archive=/p", "human_noted"),
+    ("gate_failed:noop_copy_of:sma_cross", "gate_failed:noop_copy_of:sma_cross"),
+    ("approval_pending:12", "approval_pending:12"),
+    ("rejected_by_human", "rejected_by_human"),
+    ("mission #3 status=failed reason=tool_budget_abort:x run_backtest=2 "
+     "analyze_corr=0 best=n@abcd1234 pf=1.31 dd=0.2 archive=/p",
+     "mission_diagnostic run_backtest=2 analyze_corr=0"),
+])
+def test_project_last_result_is_fail_closed(value, expected):
+    from agentic_fx.loops.improve_context import project_last_result
+    assert project_last_result(value) == expected
