@@ -2645,11 +2645,9 @@ class ImproveLoop:
         """配備済みと example の比較対象。配備済みは mission 開始時の
         inventory の第 1 相 (pin が古い strategy も含む)、example は mission に
         渡した読み取り専用 snapshot から作る。"""
-        return improve_quality.FilePopulation(
-            deployed=improve_quality.load_deployed(
-                ctx.inventory.phase1_metas),
-            examples=improve_quality.load_examples(
-                ctx.source_snapshot_dir / "_examples"))
+        return improve_quality.load_file_population(
+            ctx.inventory.phase1_metas,
+            ctx.source_snapshot_dir / "_examples")
 
     def _check_candidate_quality(
             self, conn, approval_payload: dict, *,
@@ -2690,8 +2688,27 @@ class ImproveLoop:
                 return self._quality_rejection(
                     "gate_failed",
                     detail="comparison_base_unavailable")
-            populations = (file_population.deployed, file_population.examples,
-                           archive)
+            if file_population.unavailable is not None:
+                self._write_quality_activity(
+                    "quality_check_unavailable",
+                    f"mission={mission_id} "
+                    f"reason={file_population.unavailable}")
+                return self._quality_rejection(
+                    "gate_failed", detail="comparison_base_unavailable")
+            try:
+                deployed, unavailable = improve_quality.deployed_from_db(
+                    conn, file_population.deployed,
+                    plugins_root=self._root / "plugins")
+            except sqlite3.Error as exc:
+                deployed, unavailable = None, (
+                    f"deploy_state_read_failed:{type(exc).__name__}")
+            if unavailable is not None:
+                self._write_quality_activity(
+                    "quality_check_unavailable",
+                    f"mission={mission_id} reason={unavailable}")
+                return self._quality_rejection(
+                    "gate_failed", detail="comparison_base_unavailable")
+            populations = (deployed, file_population.examples, archive)
             for population in populations:
                 for skipped in population.skipped:
                     self._write_quality_activity(
@@ -2714,7 +2731,7 @@ class ImproveLoop:
             same_family = improve_quality.find_same_family(
                 name=candidate.name, kind=approval_payload.get("kind"),
                 family_key=candidate.family_key,
-                deployed=file_population.deployed)
+                deployed=deployed)
             if same_family is not None:
                 flags = ("family_detected",)
         metrics_dup = self._check_duplicate_metrics_for_approval(

@@ -72,11 +72,13 @@ def _artifact(name, idea=None):
 
 
 def _run_strategy(app, root, name, *, py=PY_X, metrics=METRICS_1,
-                  holdout=HOLDOUT, extra=(), seed=False, idea=None):
+                  holdout=HOLDOUT, extra=(), seed=False, idea=None,
+                  before_commit=None):
     return _run(
         app, root, _artifact(name, idea),
         files=_files(name, py), in_sample=_fake_in_sample_full_metrics(metrics),
-        holdout_fn=_fake_holdout_full_metrics(holdout), extra=extra, seed=seed)
+        holdout_fn=_fake_holdout_full_metrics(holdout), extra=extra, seed=seed,
+        before_commit=before_commit)
 
 
 def _decided_row(conn, *, name, logic_hash, outcome, mission_id=OTHER_MISSION,
@@ -624,3 +626,126 @@ def test_duplicate_metrics_details_never_reach_the_agent_surface(improve_env):
     log = _activity(root)
     assert "quality_demoted" in log
     assert f"duplicate_metrics_of:{approved_hash}" in log
+
+
+# --- 配備切替との順序 (配備済みの母集団は tx の中で DB から確定する) -----------
+
+def _record_disable(conn, name):
+    """配備の無効化を DB に完了済みで記録する (配備切替の journal と同じ DB)。"""
+    from agentic_fx.store import plugin_deploy_ops as deploy_ops
+    op_id = deploy_ops.insert_intent(
+        conn, op_kind="disable_symlink", name=name, from_kind="symlink",
+        to_kind="absent", from_target=f".versions/{name}/{'a' * 64}",
+        to_target=None, retired_path=None, subject_content_hash="c" * 64,
+        subject_artifact_hash="a" * 64, target_content_hash=None,
+        target_artifact_hash=None, approval_id=None, revoke=False,
+        revoke_row_id=None, force=False, actor="t", now=NOW)
+    assert deploy_ops.set_phase(conn, op_id, "done", now=NOW)
+    return op_id
+
+
+def _record_deploy(conn, root, name, *, py, config=_PASSING_STRATEGY_CONFIG):
+    """版ディレクトリを置き、承認の配備切替が完了した記録を DB に残す。"""
+    from agentic_fx.store import plugin_switch_journal as journal
+    target = f".versions/{name}/{'b' * 64}"
+    version_dir = root / "plugins" / target
+    version_dir.mkdir(parents=True)
+    (version_dir / "plugin.py").write_text(py)
+    (version_dir / "config.yaml").write_text(config)
+    op_id = journal.insert(
+        conn, kind="approve", approval_id=1, name=name, old_kind="absent",
+        old_target=None, temp_path="tmp", new_target=target,
+        switch_required=True, actor="t", now=NOW)
+    assert journal.set_phase(conn, op_id, "decided", now=NOW)
+    return op_id
+
+
+def test_a_disable_between_prepare_and_the_tx_removes_the_same_name_exception(
+        improve_env):
+    """mission 開始時は配備されていた同名が、書き込みロックを取る前に無効化
+    された。配備済みの同名ではないので、承認済みの同名行は更新として扱われず
+    duplicate_logic で拒否される。"""
+    app, root = improve_env
+    conn = app.conn_core
+    _decided_row(conn, name="cand", logic_hash=_hash_of(PY_X),
+                 outcome="approved")
+    deployed = _deployed("cand", logic_hash=_hash_of(PY_X), family=FAMILY)
+    loop, ctx, seeded = _run_strategy(
+        app, root, "cand",
+        extra=[_population_patch(deployed=[deployed])],
+        before_commit=lambda loop, ctx: _record_disable(conn, "cand"))
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+    assert _approval_count(conn) == 0
+
+
+def test_the_same_name_exception_holds_while_the_name_stays_deployed(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    _decided_row(conn, name="cand", logic_hash=_hash_of(PY_X),
+                 outcome="approved")
+    deployed = _deployed("cand", logic_hash=_hash_of(PY_X), family=FAMILY)
+    loop, ctx, seeded = _run_strategy(
+        app, root, "cand", extra=[_population_patch(deployed=[deployed])])
+    _expect_rows(conn, ctx, seeded, "pending")
+
+
+def test_a_deploy_between_prepare_and_the_tx_rejects_a_same_logic_candidate(
+        improve_env):
+    """mission 開始後に別名で配備された同ロジックを、tx の中で見て拒否する。"""
+    app, root = improve_env
+    conn = app.conn_core
+    loop, ctx, seeded = _run_strategy(
+        app, root, "cand", extra=[_population_patch()],
+        before_commit=lambda loop, ctx: _record_deploy(
+            conn, root, "other", py=PY_X))
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+    assert "matched=deployed:other" in _activity(root)
+
+
+def test_a_deploy_operation_still_in_flight_makes_the_check_unavailable(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    from agentic_fx.store import plugin_deploy_ops as deploy_ops
+
+    def open_op(loop, ctx):
+        deploy_ops.insert_intent(
+            conn, op_kind="disable_symlink", name="alpha", from_kind="symlink",
+            to_kind="absent", from_target=f".versions/alpha/{'a' * 64}",
+            to_target=None, retired_path=None, subject_content_hash="c" * 64,
+            subject_artifact_hash="a" * 64, target_content_hash=None,
+            target_artifact_hash=None, approval_id=None, revoke=False,
+            revoke_row_id=None, force=False, actor="t", now=NOW)
+
+    loop, ctx, seeded = _run_strategy(
+        app, root, "cand", extra=[_population_patch()], before_commit=open_op)
+    _expect_rows(conn, ctx, seeded, "gate_failed")
+    assert _approval_count(conn) == 0
+    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert "quality_check_unavailable" in _activity(root)
+
+
+# --- 母集団の読込失敗 ---------------------------------------------------------
+
+def test_a_file_population_read_failure_is_gate_failed_and_reported(
+        improve_env):
+    """example の列挙が OSError で失敗しても、最終 tx で gate_failed を確定
+    し、固定文言と activity を残す。"""
+    app, root = improve_env
+    conn = app.conn_core
+    real_load_examples = quality.load_examples
+
+    def unreadable(examples_dir):
+        def broken(self):
+            raise PermissionError(13, "denied")
+        with patch.object(Path, "iterdir", broken):
+            return real_load_examples(examples_dir)
+
+    with patch.object(quality, "load_examples", unreadable):
+        loop, ctx, seeded = _run_strategy(app, root, "cand")
+    _expect_rows(conn, ctx, seeded, "gate_failed")
+    assert _approval_count(conn) == 0
+    assert _last_result(conn) == f"observation:{NOTICE}"
+    log = _activity(root)
+    assert "quality_check_unavailable" in log and "PermissionError" in log

@@ -270,3 +270,107 @@ def test_examples_population_reads_every_example_directory():
     assert population.skipped == []
     assert quality.load_examples(None).attempted == 0
     assert quality.load_examples(EXAMPLES / "missing").attempted == 0
+
+
+# --- 配備済み母集団を DB から確定する ----------------------------------------
+
+def _decided_deploy(conn, root, name, source: Path, *, version="b"):
+    from agentic_fx.store import plugin_switch_journal as journal
+    import shutil
+    target = f".versions/{name}/{version * 64}"
+    shutil.copytree(source, root / target)
+    op_id = journal.insert(
+        conn, kind="approve", approval_id=1, name=name, old_kind="absent",
+        old_target=None, temp_path="t", new_target=target,
+        switch_required=True, actor="t", now=NOW)
+    assert journal.set_phase(conn, op_id, "decided", now=NOW)
+
+
+def _closed_deploy_op(conn, *, op_kind, name, to_target=None, retired=None):
+    from agentic_fx.store import plugin_deploy_ops as ops
+    kwargs = dict(
+        op_kind=op_kind, name=name, from_kind="symlink",
+        to_kind={"disable_symlink": "absent", "rollback_symlink": "symlink"}[
+            op_kind],
+        from_target=f".versions/{name}/{'a' * 64}", to_target=to_target,
+        retired_path=retired, subject_content_hash="c" * 64,
+        subject_artifact_hash="a" * 64,
+        target_content_hash="d" * 64 if to_target else None,
+        target_artifact_hash="e" * 64 if to_target else None,
+        approval_id=None, revoke=False, revoke_row_id=None, force=False,
+        actor="t", now=NOW)
+    op_id = ops.insert_intent(conn, **kwargs)
+    assert ops.set_phase(conn, op_id, "done", now=NOW)
+
+
+def test_names_without_a_deploy_record_keep_the_starting_population(
+        conn, tmp_path):
+    base = _population(_entry("deployed", "manual", "v1:" + "1" * 64))
+    population, why = quality.deployed_from_db(
+        conn, base, plugins_root=tmp_path)
+    assert why is None
+    assert [e.name for e in population.entries] == ["manual"]
+
+
+def test_a_recorded_approval_defines_the_live_identity_over_the_starting_one(
+        conn, tmp_path):
+    _decided_deploy(conn, tmp_path, "alpha", SMA_A)
+    base = _population(_entry("deployed", "alpha", "v1:" + "1" * 64))
+    population, why = quality.deployed_from_db(
+        conn, base, plugins_root=tmp_path)
+    assert why is None
+    assert [(e.name, e.logic_hash) for e in population.entries] == [
+        ("alpha", _hash_of(SMA_A))]
+
+
+def test_a_disable_removes_the_name_and_a_rollback_restores_a_version(
+        conn, tmp_path):
+    _decided_deploy(conn, tmp_path, "alpha", SMA_A)
+    _closed_deploy_op(conn, op_kind="disable_symlink", name="alpha")
+    population, _ = quality.deployed_from_db(
+        conn, _population(), plugins_root=tmp_path)
+    assert population.entries == []
+    import shutil
+    shutil.copytree(RSI_A, tmp_path / ".versions" / "alpha" / ("c" * 64))
+    _closed_deploy_op(conn, op_kind="rollback_symlink", name="alpha",
+                      to_target=f".versions/alpha/{'c' * 64}")
+    population, _ = quality.deployed_from_db(
+        conn, _population(), plugins_root=tmp_path)
+    assert [e.logic_hash for e in population.entries] == [_hash_of(RSI_A)]
+
+
+def test_an_open_switch_or_deploy_operation_makes_the_population_unavailable(
+        conn, tmp_path):
+    from agentic_fx.store import plugin_switch_journal as journal
+    journal.insert(
+        conn, kind="approve", approval_id=1, name="alpha", old_kind="absent",
+        old_target=None, temp_path="t", new_target=".versions/alpha/x",
+        switch_required=True, actor="t", now=NOW)
+    population, why = quality.deployed_from_db(
+        conn, _population(), plugins_root=tmp_path)
+    assert why == "deploy_operation_in_flight" and population.entries == []
+
+
+def test_a_recorded_version_that_cannot_be_read_is_skipped_not_empty(
+        conn, tmp_path):
+    from agentic_fx.store import plugin_switch_journal as journal
+    op_id = journal.insert(
+        conn, kind="approve", approval_id=1, name="alpha", old_kind="absent",
+        old_target=None, temp_path="t", new_target=".versions/alpha/missing",
+        switch_required=True, actor="t", now=NOW)
+    journal.set_phase(conn, op_id, "decided", now=NOW)
+    population, why = quality.deployed_from_db(
+        conn, _population(), plugins_root=tmp_path)
+    assert why is None
+    assert population.skipped == ["deployed:alpha"] and population.attempted == 1
+    assert quality.base_unavailable(population)
+
+
+def test_load_file_population_turns_a_read_failure_into_unavailable(tmp_path):
+    examples = tmp_path / "ex"
+    examples.mkdir()
+    from unittest.mock import patch
+    with patch.object(Path, "iterdir", side_effect=PermissionError(13, "x")):
+        result = quality.load_file_population([], examples)
+    assert result.unavailable == "file_population_read_failed:PermissionError"
+    assert result.deployed.entries == [] and result.examples.entries == []

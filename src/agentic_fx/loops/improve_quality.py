@@ -14,6 +14,8 @@ from typing import Iterable
 
 from agentic_fx.plugin.logic_identity import (
     LOGIC_HASH_PREFIX, identity_of_dir, read_identity)
+from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store.db import OPEN_PHASE_SQL
 
 # 質検査で降格・拒否した候補について、agent 面に出す唯一の文言。
 # 理由・他候補の名前や hash・成績は含めない。
@@ -51,9 +53,13 @@ class Population:
 
 @dataclass(frozen=True)
 class FilePopulation:
-    """配備済みと example (ファイルから作る側)。tx の外で組み立てる。"""
+    """配備済みの出発点と example (ファイルから作る側)。tx の外で組み立てる。
+    配備済みは、配備切替の記録が無い plugin の分だけがここから使われ、
+    記録のある plugin は tx の中で `deployed_from_db` が確定する。
+    `unavailable` は組み立て自体が失敗したときの理由 (空でなければ比較不能)。"""
     deployed: Population
     examples: Population
+    unavailable: str | None = None
 
 
 def load_deployed(metas: Iterable) -> Population:
@@ -68,6 +74,19 @@ def load_deployed(metas: Iterable) -> Population:
         population.entries.append(IdentityEntry(
             "deployed", meta.name, meta.kind, logic_hash, family_key))
     return population
+
+
+def load_file_population(metas: Iterable, examples_dir: Path | None
+                         ) -> FilePopulation:
+    """ファイルの読込が失敗しても例外にせず、`unavailable` に理由を残す
+    (比較できないものを「母集団が空」と取り違えない)。"""
+    try:
+        return FilePopulation(
+            deployed=load_deployed(metas), examples=load_examples(examples_dir))
+    except Exception as exc:
+        return FilePopulation(
+            deployed=Population(), examples=Population(),
+            unavailable=f"file_population_read_failed:{type(exc).__name__}")
 
 
 def load_examples(examples_dir: Path | None) -> Population:
@@ -111,6 +130,68 @@ def load_archive(conn: sqlite3.Connection, *, mission_id: int) -> Population:
             "archive", row["name"], None, value, row["family_key"],
             row["outcome_class"]))
     return population
+
+
+def _in_flight_deploy_ops(conn: sqlite3.Connection) -> list[str]:
+    names = [row[0] for row in conn.execute(
+        "SELECT name FROM plugin_switch_journal "
+        "WHERE phase NOT IN ('decided', 'reverted')")]
+    names += [row[0] for row in conn.execute(
+        "SELECT name FROM plugin_deploy_ops WHERE " + OPEN_PHASE_SQL)]
+    return sorted(set(names))
+
+
+def _history_names(conn: sqlite3.Connection) -> list[str]:
+    names = {row[0] for row in conn.execute(
+        "SELECT name FROM plugin_switch_journal "
+        "WHERE phase='decided' AND switch_required=1")}
+    names |= {row[0] for row in conn.execute(
+        "SELECT name FROM plugin_deploy_ops WHERE "
+        "(phase='done' AND op_kind IN "
+        "('disable_symlink','rollback_symlink','retire_plain')) "
+        "OR (phase='needs_retry' AND fail_reason='verify_failed' "
+        "AND from_kind='symlink')")}
+    return sorted(names)
+
+
+def deployed_from_db(conn: sqlite3.Connection, base: Population, *,
+                     plugins_root: Path) -> tuple[Population, str | None]:
+    """tx の中で現在の配備済み母集団を確定する。配備の切替 (承認・無効化・
+    rollback・退避) は DB に記録されるので、その最後の記録が今の配備を決める。
+    記録のある plugin は、記録が指す不変の版ディレクトリから identity を作る。
+    記録の無い plugin (人が直接置いたもの) だけ、mission 開始時の `base` を使う。
+    切替が途中 (未完了の記録がある) なら今の配備を一意に決められないので、
+    第 2 戻り値に理由を返す。"""
+    in_flight = _in_flight_deploy_ops(conn)
+    if in_flight:
+        return Population(), "deploy_operation_in_flight"
+    names = set(_history_names(conn))
+    population = Population()
+    for entry in base.entries:
+        if entry.name not in names:
+            population.entries.append(entry)
+            population.attempted += 1
+    for skipped in base.skipped:
+        if skipped.split(":", 1)[-1] not in names:
+            population.skipped.append(skipped)
+            population.attempted += 1
+    for name in sorted(names):
+        events = deploy_store.plugin_live_history(conn, name)
+        if not events:
+            continue
+        last = events[-1]
+        if last["to"] == "absent" or last["kind"] == "retire_plain":
+            continue
+        population.attempted += 1
+        logic_hash, family_key, config = read_identity(
+            plugins_root / last["to"], name=name)
+        if logic_hash is None:
+            population.skipped.append(f"deployed:{name}")
+            continue
+        kind = config.get("kind") if isinstance(config, dict) else None
+        population.entries.append(IdentityEntry(
+            "deployed", name, kind, logic_hash, family_key))
+    return population, None
 
 
 def base_unavailable(*populations: Population) -> bool:
