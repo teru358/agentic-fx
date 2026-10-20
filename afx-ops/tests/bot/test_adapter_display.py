@@ -525,10 +525,9 @@ def test_ac30_the_terminal_edit_keeps_the_summary_adds_the_state_and_removes_the
 
 @pytest.mark.parametrize("client", [
     _DecidedClient(Reply(404, None, "not_found")),
-    _DecidedClient(Reply(503, None, "unavailable")),
     _DecidedClient(Reply(200, _decided("pending"), None)),
     _DecidedClient(Reply(200, _decided("invalidated"), None)),
-    _DecidedClient(error=OSError("daemon down")),
+    _DecidedClient(Reply(200, _decided(["x"]), None)),
 ])
 def test_ac30_without_a_readable_result_the_view_is_still_removed_with_the_fixed_sentence(
         harness, client):
@@ -633,7 +632,109 @@ def test_a_non_200_reply_never_contributes_its_data_to_a_post_or_a_terminal_edit
         _record(), Reply(503, _decided("pending"), "unavailable"))
     assert adapter_post.content == "承認 #7\n詳細を取得できません"
     adapter, channel, _ = harness(_record(state="done", edit_pending=True))
-    adapter.client = _DecidedClient(Reply(503, _decided("approved"), "unavailable"))
+    adapter.client = _DecidedClient(Reply(404, _decided("approved"), "not_found"))
     asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
     assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
              "allowed_mentions": _NO_MENTIONS})]
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(503, _decided("approved"), "unavailable"))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert channel.edits == []
+
+
+class _SequenceClient(_DecidedClient):
+    """approval の応答を順に返す (最後の値を繰り返す)。"""
+
+    def __init__(self, replies) -> None:
+        super().__init__()
+        self.replies = list(replies)
+
+    def approval(self, approval_id: int) -> Reply:
+        self.calls.append(approval_id)
+        reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+@pytest.mark.parametrize("first", [Reply(429, None, "rate_limited"), Reply(503, None, "unavailable"),
+                                   OSError("daemon down")])
+def test_a_transient_failure_reading_the_result_retries_instead_of_settling_on_the_fixed_sentence(
+        harness, first):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    adapter.client = _SequenceClient([first, Reply(200, _decided("approved"), None)])
+
+    async def go():
+        await adapter._update_display(adapter.gate.state.record(7))
+        assert channel.edits == []
+        assert adapter.gate.state.record(7) is not None
+        clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+        await adapter._update_display(adapter.gate.state.record(7))
+
+    asyncio.run(go())
+    assert len(channel.edits) == 1
+    content = channel.edits[0][1]["content"]
+    assert "状態: 承認済み" in content and "params.period: 14 → 10" in content
+    assert adapter.gate.state.record(7) is None
+
+
+def test_a_transient_failure_that_never_clears_stops_at_the_retry_limit_without_the_fixed_sentence(
+        harness):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    adapter.client = _SequenceClient([Reply(503, None, "unavailable")])
+
+    async def go():
+        for _ in range(adapter_module.EDIT_RETRY_LIMIT):
+            clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+            await adapter._update_display(adapter.gate.state.record(7))
+
+    asyncio.run(go())
+    assert channel.edits == [] and adapter.gate.state.record(7) is None
+
+
+def test_a_non_str_state_in_the_result_still_removes_the_view_with_the_fixed_sentence(harness):
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(200, _decided(["x"]), None))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
+
+
+def test_a_renderer_failure_does_not_stop_the_view_from_being_removed(harness, monkeypatch):
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(200, _decided("approved"), None))
+
+    def boom(*args):
+        raise TypeError("unhashable")
+    monkeypatch.setattr(adapter_module, "render_terminal", boom)
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert channel.edits[0][1]["view"] is None
+    assert channel.edits[0][1]["content"] == "Approval is no longer active."
+
+
+def test_failing_terminal_edits_reuse_the_text_read_once(harness):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    client = _DecidedClient(Reply(200, _decided("approved"), None))
+    adapter.client = client
+    channel.edit_outcomes[101] = ["fail", "fail"]
+
+    async def go():
+        for _ in range(3):
+            clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+            await adapter._update_display(adapter.gate.state.record(7))
+
+    asyncio.run(go())
+    assert len(channel.edits) == 3 and client.calls == [7]
+    assert len({kwargs["content"] for _, kwargs in channel.edits}) == 1
+    assert adapter.gate.state.record(7) is None
+
+
+def test_a_pending_post_deleted_before_a_restart_is_reposted_with_summary_performance_and_deadline(
+        harness):
+    adapter, channel, _ = harness(_record())
+    detail = _decided("pending", expires_at="2026-10-26T00:00:00+00:00")
+    adapter.client = _DecidedClient(Reply(200, detail, None))
+    asyncio.run(adapter.reconcile_startup())
+    content = channel.sent[0]["content"]
+    assert "params.period: 14 → 10" in content and "USDJPY" in content
+    assert "短い申告です" in content and "期限: 2026-10-26 00:00 UTC" in content
