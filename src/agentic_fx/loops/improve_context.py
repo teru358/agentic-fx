@@ -23,6 +23,41 @@ if TYPE_CHECKING:
 
 _PLUGIN_NAME_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 
+# agent 面に出す非提出・降格の分類は固定の 3 語に限る。収益性・取引数・
+# 比較不能の区別、他候補の hash / pair / 成績は渡さない。
+NOT_SUBMITTED_LAST_RESULT = "observation:not_submitted"
+DUPLICATE_LAST_RESULT = "observation:duplicate"
+_FAMILY_REDIRECT_PREFIX = "observation:family_redirect:"
+# `origin` 列に `not_submitted` を出す `origin_outcome` の値 (`unprofitable` は
+# 移行前に書かれた旧値で、同じ語に畳む)。
+NOT_SUBMITTED_ORIGINS = frozenset({"not_submitted", "unprofitable"})
+
+# 移行前に書かれた `last_result` のうち、区別を漏らすもの (前方一致)。
+_LEGACY_NOT_SUBMITTED_EXACT = frozenset({
+    "unprofitable", "observation:unprofitable", "history_source_unconfigured"})
+_LEGACY_NOT_SUBMITTED_PREFIX = (
+    "insufficient_trades:", "observation:insufficient_trades:",
+    "gate_failed:backtest_data_unavailable")
+_LEGACY_DUPLICATE = ("duplicate_metrics_of:", "observation:duplicate_metrics_of:")
+
+
+def family_redirect_last_result(deployed_name: str) -> str:
+    """配備済みの同族へ誘導する降格の固定文言 (名前だけ。優劣は含まない)。"""
+    return f"{_FAMILY_REDIRECT_PREFIX}{deployed_name}"
+
+
+def project_last_result(value: str | None) -> str | None:
+    """履歴に出す `last_result` を agent 面の固定語彙へ写す。新しい書き込みは
+    最初から固定文言だが、移行前に保存された値も出口で畳む。"""
+    if value is None:
+        return None
+    if (value in _LEGACY_NOT_SUBMITTED_EXACT
+            or value.startswith(_LEGACY_NOT_SUBMITTED_PREFIX)):
+        return NOT_SUBMITTED_LAST_RESULT
+    if value.startswith(_LEGACY_DUPLICATE):
+        return DUPLICATE_LAST_RESULT
+    return value
+
 
 def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
     # precheck 2026-08-22: T8-m7 -- 未使用の `timezone` import / `since_30`
@@ -75,12 +110,48 @@ def _improvement_history(conn: "sqlite3.Connection") -> dict:
         "ib.idea, ib.attempts, ib.last_result "
         "FROM improvement_runs ir LEFT JOIN improvement_backlog ib "
         "ON ib.id = ir.backlog_id ORDER BY ir.id DESC LIMIT 50").fetchall()
-    return {"recent_runs": [dict(r) for r in rows]}
+    runs = [dict(r) for r in rows]
+    for r in runs:
+        r["last_result"] = project_last_result(r["last_result"])
+    return {"recent_runs": runs}
+
+
+def deployed_families(metas: "list[Any]") -> list[dict]:
+    """配備済み plugin の仮説族 (名前と構成だけ。成績は含まない)。
+
+    strategy は依存 indicator の組・足・pair、indicator は名前と足。"""
+    out = []
+    for m in metas:
+        out.append({
+            "name": m.name, "kind": m.kind,
+            "timeframe": m.timeframe,
+            "pairs": list(m.pairs) if m.kind == "strategy" else [],
+            "indicators": (sorted({r.plugin for r in m.indicators})
+                           if m.kind == "strategy" else [])})
+    return sorted(out, key=lambda f: (f["kind"], f["name"]))
+
+
+def deployed_families_text(families: list[dict]) -> str:
+    """prompt に差し込む仮説族の一覧。名前と構成のみで、成績は含まない。"""
+    if not families:
+        return "(なし)"
+    lines = []
+    for f in families:
+        timeframe = f["timeframe"] or "-"
+        if f["kind"] == "strategy":
+            indicators = ", ".join(f["indicators"]) or "(なし)"
+            pairs = ", ".join(f["pairs"]) or "-"
+            lines.append(f"- {f['name']} (strategy): indicators=[{indicators}], "
+                         f"timeframe={timeframe}, pairs={pairs}")
+        else:
+            lines.append(f"- {f['name']} (indicator): timeframe={timeframe}")
+    return "\n".join(lines)
 
 
 def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
                        root: Path, *,
-                       inventory_view: dict | None = None) -> dict:
+                       inventory_view: dict | None = None,
+                       inventory_metas: "list[Any] | None" = None) -> dict:
     """[indicator-consumption-wiring] §2.9(a): prompt の
     `current_inventory.approved_plugins` は **mission の inventory view**
     から作る (prepare 後に live `plugins/` を差し替えても不変、P3)。
@@ -98,6 +169,8 @@ def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
     else:
         plugins = approved_plugins(conn, root / "plugins",
                                    settings=settings).inventory.metas
+        if inventory_metas is None:
+            inventory_metas = list(plugins)
         plugin_summaries = [
             {"name": p.name, "kind": p.kind, "pairs": list(p.pairs),
              "params": p.params,
@@ -106,6 +179,7 @@ def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
     sources = news_sources.list_all(conn)
     return {
         "approved_plugins": plugin_summaries,
+        "deployed_families": deployed_families(inventory_metas or []),
         "news_sources": [{"name": s["name"], "enabled": s["enabled"]}
                          for s in sources],
         "risk_gate": settings.risk.model_dump(),
@@ -153,12 +227,14 @@ def build_improve_context(
         conn: "sqlite3.Connection", *, settings: "Settings", now: datetime,
         root: Path,
         allowed_backlog_ids: "frozenset[int] | None",
-        inventory_view: dict | None = None) -> dict[str, Any]:
+        inventory_view: dict | None = None,
+        inventory_metas: "list[Any] | None" = None) -> dict[str, Any]:
     return {
         "performance_report": _performance_report(conn, now),
         "improvement_history": _improvement_history(conn),
         "current_inventory": _current_inventory(
-            conn, settings, root, inventory_view=inventory_view),
+            conn, settings, root, inventory_view=inventory_view,
+            inventory_metas=inventory_metas),
         "backlog": _backlog_section(conn, allowed_backlog_ids),
         "user_policy": _user_policy_section(root),
         "references": _references_section(),

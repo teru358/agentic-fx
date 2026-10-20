@@ -180,10 +180,10 @@ def test_n1_in_sample_floor_annotates_inserted_note_and_task(
         holdout_metrics=None)
 
     task_row = _idea_row(conn, "次は fast=12/slow=28 を試す")
-    assert task_row["origin_outcome"] == "unprofitable"
+    assert task_row["origin_outcome"] == "not_submitted"
     assert task_row["origin_mission_id"] == mission_id
     note_row = _idea_row(conn, "fast=10/slow=30 は提出条件を満たした")
-    assert note_row["origin_outcome"] == "unprofitable"
+    assert note_row["origin_outcome"] == "not_submitted"
     assert note_row["origin_mission_id"] == mission_id
 
 
@@ -195,10 +195,10 @@ def test_n1_holdout_floor_annotates_inserted_note_and_task(
         holdout_metrics={"USDJPY": _floor_metrics(0.5)})
 
     task_row = _idea_row(conn, "次は fast=12/slow=28 を試す")
-    assert task_row["origin_outcome"] == "unprofitable"
+    assert task_row["origin_outcome"] == "not_submitted"
     assert task_row["origin_mission_id"] == mission_id
     note_row = _idea_row(conn, "fast=10/slow=30 は提出条件を満たした")
-    assert note_row["origin_outcome"] == "unprofitable"
+    assert note_row["origin_outcome"] == "not_submitted"
     assert note_row["origin_mission_id"] == mission_id
 
 
@@ -216,7 +216,7 @@ def test_n2_default_gate_failed_outcome_leaves_origin_outcome_null(
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     note_id, _ = loop_min._upsert_backlog_idea(
-        conn, "insufficient trades note", "agent", "fact", _NOW,
+        conn, "insufficient trades note", "agent", as_task=False, now=_NOW,
         mission_id=mission_id)
     conn.commit()
     ctx = _mk_ctx(mission_id, run_id, staging_dir, tmp_path / "source",
@@ -239,7 +239,7 @@ def test_n2_report_failed_branch_leaves_origin_outcome_null(
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     note_id, _ = loop_min._upsert_backlog_idea(
-        conn, "report write failure note", "agent", "fact", _NOW,
+        conn, "report write failure note", "agent", as_task=False, now=_NOW,
         mission_id=mission_id)
     conn.commit()
     ctx = _mk_ctx(mission_id, run_id, staging_dir, tmp_path / "source",
@@ -250,7 +250,8 @@ def test_n2_report_failed_branch_leaves_origin_outcome_null(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable", now=_NOW,
-        mission_outcome="unprofitable")
+        mission_outcome="unprofitable",
+        not_submitted=True)
 
     row = _row_by_id(conn, note_id)
     assert row["origin_outcome"] is None
@@ -392,63 +393,31 @@ def test_n3_selected_existing_task_reuses_without_rewriting_origin(
     assert row["origin_mission_id"] is None
 
 
-def test_n3_promoted_note_to_task_keeps_original_origin_mission_id(
-        loop_and_ctx_with_open_backlog):
-    """既存 note を `kind=task` の discovery が昇格 (`promoted`) させる
-    経路も `origin_mission_id` を書き換えない (最初の起票者のまま)。"""
-    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
-    other_mission_id = ctx.mission_id + 999
-    conn.execute(
-        "INSERT INTO improvement_backlog (idea, source, status, created_at, "
-        "updated_at, idea_norm, origin_mission_id) VALUES "
-        "('pre-existing note','agent','note',?,?,?,?)",
-        (_NOW.isoformat(), _NOW.isoformat(), "pre-existing note",
-         other_mission_id))
-    note_id = conn.execute(
-        "SELECT id FROM improvement_backlog WHERE idea='pre-existing note'"
-        ).fetchone()["id"]
-    conn.commit()
-
-    output = {
-        "discoveries": [
-            {"idea": "pre-existing note", "source": "agent", "evidence": "e",
-             "kind": "task"},
-        ],
-        "selected": {"backlog_id": backlog_id, "idea": "x"},
-        "artifact": {"type": "observation", "reason": "x"},
-        "selection_rationale": "x"}
-
-    loop._select_and_bind(conn, output, ctx, now=_NOW)
-
-    row = _row_by_id(conn, note_id)
-    assert row["status"] == "open"  # promoted
-    assert row["origin_mission_id"] == other_mission_id  # 書き換わらない
-
-
 # ---------------------------------------------------------------------------
 # N3': 同一 _select_and_bind 内で note を INSERT → 同 idea の task で
 # 自己昇格 → フロア不合格 → その行の origin_outcome == 'unprofitable'
 # (v1.x で消えた経路、code-review #1)
 # ---------------------------------------------------------------------------
 
-def test_n3prime_same_tx_self_promotion_still_gets_annotated(
+def test_n3prime_same_idea_twice_in_one_output_is_one_annotated_note(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch):
     mission_id, _run_id, _backlog_id = mission_and_run_fixture
     _commit_unprofitable_mission(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch,
         holdout_metrics=None,
         extra_discoveries=[
-            {"idea": "dup idea self promotes", "source": "agent",
+            {"idea": "dup idea once", "source": "agent",
              "evidence": "e", "kind": "fact"},
-            {"idea": "dup idea self promotes", "source": "agent",
+            {"idea": "dup idea once", "source": "agent",
              "evidence": "e", "kind": "task"},
         ])
 
-    row = _idea_row(conn, "dup idea self promotes")
-    assert row["status"] == "open"  # 昇格どおり
-    assert row["last_result"] == "promoted_from_note"  # 昇格時の定数のまま
-    assert row["origin_mission_id"] == mission_id  # 最初の INSERT (note) の系譜
-    assert row["origin_outcome"] == "unprofitable"  # このミッション自身の終端で付く
+    rows = conn.execute(
+        "SELECT status,last_result,origin_mission_id,origin_outcome "
+        "FROM improvement_backlog WHERE idea_norm='dup idea once'").fetchall()
+    assert [dict(r) for r in rows] == [{
+        "status": "note", "last_result": None,
+        "origin_mission_id": mission_id, "origin_outcome": "not_submitted"}]
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +436,7 @@ def test_n4_rollback_in_same_tx_undoes_origin_outcome(
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     note_id, _ = loop_min._upsert_backlog_idea(
-        conn, "rollback candidate note", "agent", "fact", _NOW,
+        conn, "rollback candidate note", "agent", as_task=False, now=_NOW,
         mission_id=mission_id)
     conn.commit()
     ctx = _mk_ctx(mission_id, run_id, staging_dir, tmp_path / "source",
@@ -483,7 +452,8 @@ def test_n4_rollback_in_same_tx_undoes_origin_outcome(
     with pytest.raises(RuntimeError):
         loop_min._finalize_gate_failed(
             conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
-            now=_NOW, mission_outcome="unprofitable")
+            now=_NOW, mission_outcome="unprofitable",
+            not_submitted=True)
 
     row = _row_by_id(conn, note_id)
     assert row["origin_outcome"] is None
@@ -503,9 +473,9 @@ def test_n5_origin_annotation_does_not_touch_idea_idea_norm_status_or_last_resul
     task_row = _idea_row(conn, "次は fast=12/slow=28 を試す")
     assert task_row["idea"] == "次は fast=12/slow=28 を試す"
     assert task_row["idea_norm"] == "次は fast=12/slow=28 を試す".strip().lower()
-    assert task_row["status"] == "open"  # kind=task の既定 status のまま
+    assert task_row["status"] == "note"  # discoveries は kind を問わず note
     assert task_row["last_result"] is None  # 専用列方式: last_result は不変
-    assert task_row["origin_outcome"] == "unprofitable"
+    assert task_row["origin_outcome"] == "not_submitted"
 
     note_row = _idea_row(conn, "fast=10/slow=30 は提出条件を満たした")
     assert note_row["idea"] == "fast=10/slow=30 は提出条件を満たした"
@@ -513,7 +483,7 @@ def test_n5_origin_annotation_does_not_touch_idea_idea_norm_status_or_last_resul
             == "fast=10/slow=30 は提出条件を満たした".strip().lower())
     assert note_row["status"] == "note"  # kind=fact の既定 status のまま
     assert note_row["last_result"] is None
-    assert note_row["origin_outcome"] == "unprofitable"
+    assert note_row["origin_outcome"] == "not_submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +526,7 @@ def _sample_ctx_data_with_origin():
             {"id": 4, "idea": "clean note", "status": "note", "attempts": 0,
              "last_result": None, "origin_outcome": None},
             {"id": 5, "idea": "flagged note", "status": "note", "attempts": 0,
-             "last_result": None, "origin_outcome": "unprofitable"},
+             "last_result": None, "origin_outcome": "not_submitted"},
             # おとり (notes 側): 別語彙 (`promoted_from_note`)。
             {"id": 7, "idea": "other machine note", "status": "note",
              "attempts": 0, "last_result": "promoted_from_note",
@@ -596,12 +566,12 @@ def test_n6_backlog_table_has_origin_column_flagging_only_annotated_rows(
     assert "| 2 | clean item |" in selectable
     assert "| 3 | flagged item |" in selectable
     assert _origin_cell(selectable, 2) == ""
-    assert _origin_cell(selectable, 3) == "unprofitable"
+    assert _origin_cell(selectable, 3) == "not_submitted"
     # id=6 はおとり (last_result=='unprofitable' だが origin_outcome は NULL)
     assert _origin_cell(selectable, 6) == ""
     # notes 表: id=4 (clean) は空欄、id=5 (flagged) は unprofitable
     assert _origin_cell(notes, 4) == ""
-    assert _origin_cell(notes, 5) == "unprofitable"
+    assert _origin_cell(notes, 5) == "not_submitted"
     # id=7 はおとり (別語彙の last_result、origin_outcome は NULL)
     assert _origin_cell(notes, 7) == ""
 
@@ -610,9 +580,9 @@ def test_n7_discipline_5_appears_verbatim_and_holdout_pin_stays_green(
         tmp_path):
     text = _render(tmp_path)
 
-    assert ("`origin` 列が `unprofitable` の課題・note は、その mission の"
-           "候補が収益性フロアで落ちたときに書かれたものです。") in text
-    assert "同じ指標・同じパラメータの候補を再提出しないでください。" in text
+    assert ("`not_submitted` の課題・note は、その mission の候補が"
+            "提出されなかったことを示します。") in text
+    assert "理由非公開。同一候補を再提出しない。" in text
     # 既存遮断 pin (F5-2 系): holdout の数値・段名は prompt に出ない。
     assert "holdout" not in text
 
@@ -641,11 +611,10 @@ def test_s5_discipline_5_full_block_and_renumbering(tmp_path):
     text = _render(tmp_path)
 
     assert (
-        "5. **`origin` 列が `unprofitable` の課題・note は、その mission の"
-        "候補が収益性フロアで落ちたときに書かれたものです。**\n"
-        "   同じ指標・同じパラメータの候補を再提出しないでください。"
-        "試すなら明確にパラメータを変え、その理由を `selection_rationale` に"
-        "書いてください。\n") in text
+        "5. **`not_submitted` の課題・note は、その mission の候補が"
+        "提出されなかったことを示します。**\n"
+        "   理由非公開。同一候補を再提出しない。再挑戦は別の仮説として"
+        "扱ってください。\n") in text
     assert "6. 出力は必ず下の「最終出力」の形式" in text
 
 
@@ -667,7 +636,7 @@ def test_s2_build_improve_context_carries_note_origin_outcome_to_column(
     flagged = backlog_store.upsert_system_note(
         c, idea="flagged wired note", last_result="human_noted", now=_NOW)
     c.execute(
-        "UPDATE improvement_backlog SET origin_outcome='unprofitable' "
+        "UPDATE improvement_backlog SET origin_outcome='not_submitted' "
         "WHERE id=?", (flagged,))
     clean = backlog_store.upsert_system_note(
         c, idea="clean wired note", last_result="human_noted", now=_NOW)
@@ -683,7 +652,7 @@ def test_s2_build_improve_context_carries_note_origin_outcome_to_column(
                                       tmp_path / "source"))
     c.close()
 
-    assert _origin_cell(text, flagged) == "unprofitable"
+    assert _origin_cell(text, flagged) == "not_submitted"
     assert _origin_cell(text, clean) == ""
 
 
@@ -698,7 +667,7 @@ def test_n8_annotated_row_origin_outcome_persists_after_later_termination(
         loop_full, conn, mission_and_run_fixture, tmp_path, monkeypatch,
         holdout_metrics=None)
     annotated_id = _idea_row(conn, "次は fast=12/slow=28 を試す")["id"]
-    assert _row_by_id(conn, annotated_id)["origin_outcome"] == "unprofitable"
+    assert _row_by_id(conn, annotated_id)["origin_outcome"] == "not_submitted"
 
     # 別 mission がこの行を選び、標本不足で終端する。
     mission_id2 = missions_store.start(
@@ -717,7 +686,7 @@ def test_n8_annotated_row_origin_outcome_persists_after_later_termination(
 
     row = _row_by_id(conn, annotated_id)
     assert row["last_result"] == "insufficient_trades:2"
-    assert row["origin_outcome"] == "unprofitable"  # 別列なので消えない
+    assert row["origin_outcome"] == "not_submitted"  # 別列なので消えない
 
 
 # ---------------------------------------------------------------------------
@@ -729,7 +698,7 @@ def test_n9_out_of_order_termination_and_origin_annotation_coexist(
         loop_full, conn, mission_and_run_fixture, tmp_path):
     mission_id_a, run_id_a, _ = mission_and_run_fixture
     note_id, _ = loop_full._upsert_backlog_idea(
-        conn, "concurrent note idea", "agent", "fact", _NOW,
+        conn, "concurrent note idea", "agent", as_task=False, now=_NOW,
         mission_id=mission_id_a)
     conn.commit()
 
@@ -758,12 +727,13 @@ def test_n9_out_of_order_termination_and_origin_annotation_coexist(
                     tmp_path / "source_a", frozen=True)
     loop_full._finalize_gate_failed(
         conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=_NOW,
-        mission_outcome="unprofitable")
+        mission_outcome="unprofitable",
+        not_submitted=True)
 
     row = _row_by_id(conn, note_id)
     # 別列なので B の終端値は潰れない。A の系譜注記も両立して付く。
     assert row["last_result"] == "insufficient_trades:2"
-    assert row["origin_outcome"] == "unprofitable"
+    assert row["origin_outcome"] == "not_submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -804,8 +774,8 @@ def test_n11_selected_row_is_its_own_origin_row(
 
     row = _idea_row(conn, "brand new self-origin idea")
     assert row["origin_mission_id"] == mission_id
-    assert row["last_result"] == "unprofitable"  # 終端理由 (backlog_transition)
-    assert row["origin_outcome"] == "unprofitable"  # 系譜注記 (別列)
+    assert row["last_result"] == "observation:not_submitted"  # 終端理由 (backlog_transition)
+    assert row["origin_outcome"] == "not_submitted"  # 系譜注記 (別列)
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +798,7 @@ def test_n12_unrelated_discovery_is_also_annotated_accepted_tradeoff(
         ])
 
     row = _idea_row(conn, "完全に無関係な改善案")
-    assert row["origin_outcome"] == "unprofitable"
+    assert row["origin_outcome"] == "not_submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -848,12 +818,12 @@ def test_s6_origin_update_does_not_annotate_other_missions_rows(
     (設計書 §2-2「この mission が起票した全行」)。"""
     mission_id_a, run_id_a, _backlog_id = mission_and_run_fixture
     row_a, _ = loop_full._upsert_backlog_idea(
-        conn, "mission A idea", "agent", "fact", _NOW, mission_id=mission_id_a)
+        conn, "mission A idea", "agent", as_task=False, now=_NOW, mission_id=mission_id_a)
 
     mission_id_b = missions_store.start(
         conn, "improve", "codex", "gpt-5", _NOW, commit=True)
     row_b, _ = loop_full._upsert_backlog_idea(
-        conn, "mission B idea", "agent", "fact", _NOW, mission_id=mission_id_b)
+        conn, "mission B idea", "agent", as_task=False, now=_NOW, mission_id=mission_id_b)
     # 起票者が誰でもない過去行 (§2-8 遡及しない) も置く。
     legacy = backlog_store.upsert_system_note(
         conn, idea="legacy row without origin", last_result=None, now=_NOW)
@@ -865,9 +835,10 @@ def test_s6_origin_update_does_not_annotate_other_missions_rows(
                     frozen=True)
     loop_full._finalize_gate_failed(
         conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=_NOW,
-        mission_outcome="unprofitable")
+        mission_outcome="unprofitable",
+        not_submitted=True)
 
-    assert _row_by_id(conn, row_a)["origin_outcome"] == "unprofitable"
+    assert _row_by_id(conn, row_a)["origin_outcome"] == "not_submitted"
     assert _row_by_id(conn, row_b)["origin_outcome"] is None
     assert _row_by_id(conn, row_b)["origin_mission_id"] == mission_id_b
     assert _row_by_id(conn, legacy)["origin_outcome"] is None
@@ -956,7 +927,7 @@ def test_s8_build_improve_context_carries_item_origin_outcome_to_column(
     c.close()
 
     selectable = text.split("## 既知の事実", 1)[0]
-    assert _origin_cell(selectable, flagged) == "unprofitable"
+    assert _origin_cell(selectable, flagged) == "not_submitted"
     assert _origin_cell(selectable, clean) == ""
 
 
@@ -980,7 +951,7 @@ class _FailingOriginUpdateConn:
         self._conn = conn
 
     def execute(self, sql, *args, **kwargs):
-        if "origin_outcome='unprofitable'" in sql:
+        if "origin_outcome='not_submitted'" in sql:
             raise sqlite3.OperationalError("simulated fault on origin UPDATE")
         return self._conn.execute(sql, *args, **kwargs)
 
@@ -999,7 +970,7 @@ def test_l1_origin_update_failure_rolls_back_the_whole_terminal(
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     note_id, _ = loop_min._upsert_backlog_idea(
-        conn, "atomic origin note", "agent", "fact", _NOW,
+        conn, "atomic origin note", "agent", as_task=False, now=_NOW,
         mission_id=mission_id)
     conn.commit()
     ctx = _mk_ctx(mission_id, run_id, staging_dir, tmp_path / "source",
@@ -1008,7 +979,8 @@ def test_l1_origin_update_failure_rolls_back_the_whole_terminal(
     with pytest.raises(sqlite3.OperationalError):
         loop_min._finalize_gate_failed(
             _FailingOriginUpdateConn(conn), ctx=ctx, backlog_id=backlog_id,
-            reason="unprofitable", now=_NOW, mission_outcome="unprofitable")
+            reason="unprofitable", now=_NOW, mission_outcome="unprofitable",
+            not_submitted=True)
 
     assert _row_by_id(conn, note_id)["origin_outcome"] is None
     mission_status = conn.execute(

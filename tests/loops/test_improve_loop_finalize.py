@@ -276,10 +276,8 @@ def test_commit_strategy_missing_history_becomes_gate_failed(
     assert run_row["result"] == "report"
     assert run_row["finished_at"] is not None
     assert backlog_row["status"] == "observation"
-    assert backlog_row["last_result"] == (
-        "gate_failed:backtest_data_unavailable:no 1m history for "
-        "symbol='EURUSD' source='dukascopy' "
-        "(cannot determine in-sample start)")
+    # 比較不能の理由は agent 面に出さない (詳細は activity とレポート)
+    assert backlog_row["last_result"] == "observation:not_submitted"
     activity = (tmp_path / "activity.log").read_text()
     assert "gate_failed" in activity
     assert (
@@ -537,8 +535,7 @@ def test_commit_real_strategy_gate_missing_history_becomes_gate_failed(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
         (backlog_id,)).fetchone()
     assert backlog_row["status"] == "observation"
-    assert backlog_row["last_result"].startswith(
-        "gate_failed:backtest_data_unavailable:")
+    assert backlog_row["last_result"] == "observation:not_submitted"
 
 
 def test_commit_strategy_other_valueerror_still_propagates(

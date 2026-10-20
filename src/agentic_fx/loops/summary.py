@@ -119,7 +119,7 @@ IMPROVE_OUTPUT_SCHEMA: dict = {
                     "idea": {"type": "string"},
                     "source": {"type": "string", "enum": ["agent", "research"]},
                     "evidence": {"type": "string"},
-                    "kind": {"type": "string", "enum": ["task", "fact"]},
+                    "kind": {"type": "string", "enum": ["task", "fact", "idea"]},
                 },
             },
         },
