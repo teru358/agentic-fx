@@ -26,7 +26,14 @@ _FEATURE_KEYS = MappingProxyType({
     "web": ("port",),
     "notify": (),
 })
-_OPTIONAL_FEATURE_KEYS = MappingProxyType({"bot": ("mention_role_id",), "web": (), "notify": ()})
+_OPTIONAL_FEATURE_KEYS = MappingProxyType({
+    "bot": ("mention_role_id", "trade_notices", "trade_amounts"),
+    "web": (),
+    "notify": ("deliver_trade_events",),
+})
+# 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
+TRADE_NOTICES = ("all", "results", "fills_closes", "off")
+TRADE_AMOUNTS = ("absolute", "relative")
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
 
@@ -50,6 +57,9 @@ class OpsConfig:
     allowlist_user_ids: tuple[int, ...] = ()
     mention_role_id: int | None = None
     mention_user_ids: tuple[int, ...] = ()
+    trade_notices: str = "all"
+    trade_amounts: str = "absolute"
+    deliver_trade_events: bool = False
 
 
 def _read_toml(feature: str, *, preserve_config_dir_error: bool = False) -> tuple[dict[str, object], int]:
@@ -119,6 +129,23 @@ def _discord_ids(value: object, key: str) -> tuple[int, ...]:
     if len(ids) != len(set(ids)):
         raise ConfigError(key)
     return ids
+
+
+def _choice(parsed: Mapping[str, object], key: str, choices: tuple[str, ...], default: str) -> str:
+    if key not in parsed:
+        return default
+    value = parsed[key]
+    if type(value) is not str or value not in choices:
+        raise ConfigError(key)
+    return value
+
+
+def _boolean(parsed: Mapping[str, object], key: str, default: bool) -> bool:
+    if key not in parsed:
+        return default
+    if type(parsed[key]) is not bool:
+        raise ConfigError(key)
+    return parsed[key]
 
 
 def _safe_detail_key(key: object) -> str:
@@ -258,9 +285,13 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
                              mention_role_id=(None if "mention_role_id" not in parsed else
                                               _discord_id(parsed["mention_role_id"], "mention_role_id")),
                              mention_user_ids=_discord_ids(parsed["mention_user_ids"],
-                                                           "mention_user_ids"))
+                                                           "mention_user_ids"),
+                             trade_notices=_choice(parsed, "trade_notices", TRADE_NOTICES, "all"),
+                             trade_amounts=_choice(parsed, "trade_amounts", TRADE_AMOUNTS,
+                                                   "absolute"))
         return OpsConfig(instance_root=instance_root, key_dir=key_dir,
-                         config_dir_fd=config_dir_fd)
+                         config_dir_fd=config_dir_fd,
+                         deliver_trade_events=_boolean(parsed, "deliver_trade_events", False))
     except BaseException:
         os.close(config_dir_fd)
         raise

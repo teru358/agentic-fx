@@ -251,3 +251,46 @@ def test_probe_input_reading_leaves_no_descriptor_open(home):
     before = set(os.listdir("/proc/self/fd"))
     probe._read_inputs("web")
     assert set(os.listdir("/proc/self/fd")) == before
+
+
+@pytest.mark.parametrize(("feature", "extra", "rc", "reason"), [
+    ("bot", 'trade_notices = "results"\ntrade_amounts = "relative"\n', 71, "token_invalid"),
+    ("notify", "deliver_trade_events = true\n", 71, "url_invalid"),
+    ("bot", 'trade_notices = "everything"\n', 71, "config_invalid"),
+    ("bot", 'trade_amounts = 1\n', 71, "config_invalid"),
+    ("notify", 'deliver_trade_events = "yes"\n', 71, "config_invalid"),
+])
+def test_ac23_probe_accepts_the_trade_keys_and_rejects_invalid_values(
+        feature, extra, rc, reason, child_env, home):
+    _install(home, feature, extra=extra)
+    done = _probe(["probe", feature], child_env, home)
+    assert (done.returncode, done.stderr) == (rc, f"afx-ops: {reason}\n")
+
+
+@pytest.mark.parametrize(("feature", "extra", "expected"), [
+    ("bot", 'trade_notices = "off"\ntrade_amounts = "relative"\n',
+     {"trade_notices": "off", "trade_amounts": "relative"}),
+    ("bot", "", {"trade_notices": "all", "trade_amounts": "absolute"}),
+    ("notify", "deliver_trade_events = true\n", {"deliver_trade_events": True}),
+    ("notify", "", {"deliver_trade_events": False}),
+])
+def test_ac24_the_probe_input_reader_carries_the_trade_values(
+        feature, extra, expected, home, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+    dirs = feature_dirs(feature)
+    dirs.config.mkdir(parents=True, mode=0o700)
+    text = f'instance_root = "{home}/root"\nkey_dir = "{home}/keys"\n'
+    if feature == "bot":
+        text += ("guild_id = 123456789012345678\nchannel_id = 223456789012345678\n"
+                 "allowlist_user_ids = []\nmention_user_ids = []\n")
+    (dirs.config / "ops.toml").write_text(text + extra, encoding="utf-8")
+    (dirs.config / "ops.toml").chmod(0o600)
+    dirs.secret.mkdir(mode=0o700)
+    for name in probe.SECRET_FILES.get(feature, ()):
+        (dirs.secret / name).write_text("x\n")
+        (dirs.secret / name).chmod(0o600)
+
+    config, _secrets = probe._read_inputs(feature)
+
+    for key, value in expected.items():
+        assert getattr(config, key) == value
