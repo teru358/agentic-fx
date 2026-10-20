@@ -1,6 +1,7 @@
 """有界 HTTP 入力を read-only DTO 表示へ写す transport 非依存 adapter。"""
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
@@ -142,6 +143,22 @@ def _positive(query: dict[str, str], name: str, *, maximum: int, default: int) -
     return number
 
 
+def _change_of(client, approval_id: int, detail) -> dict | None:
+    """承認 #N に足す変更内容。取れなくても (古い daemon、通信失敗) 本体のページは出す。"""
+    if getattr(detail, "status", None) != 200 or type(getattr(detail, "data", None)) is not dict:
+        return None
+    fetch = getattr(client, "approval_change", None)
+    if fetch is None:
+        return None
+    try:
+        reply = fetch(approval_id)
+    except Exception:  # noqa: BLE001 — 変更内容が取れないだけでページ全体を失敗させない
+        return None
+    if getattr(reply, "status", None) != 200 or type(getattr(reply, "data", None)) is not dict:
+        return None
+    return reply.data
+
+
 def _invoke(match: RouteMatch, query: dict[str, str], client):
     method = match.route.client_method
     if method == "status":
@@ -153,7 +170,9 @@ def _invoke(match: RouteMatch, query: dict[str, str], client):
     if method == "approval":
         if query:
             raise _Reject(400)
-        return client.approval(match.values["id"]), render.render_approval
+        reply = client.approval(match.values["id"])
+        change_data = _change_of(client, match.values["id"], reply)
+        return reply, functools.partial(render.render_approval, change_data=change_data)
     if method == "log":
         return client.log(n=_positive(query, "n", maximum=500, default=100)), render.render_log
     if method == "activity":
