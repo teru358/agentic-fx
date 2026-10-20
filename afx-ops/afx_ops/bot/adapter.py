@@ -555,8 +555,10 @@ class BotAdapter:
             failures, not_before = 0, 0.0
         if failures >= EDIT_RETRY_LIMIT or now < not_before:
             return
+        read_failed = False
         if record.state in _TERMINAL:
             content = await self._terminal_content(record)
+            read_failed = content is None
             if content is None:
                 # 正本の一時障害: 固定文で確定せず、次の周回で読み直す
                 outcome = "failed"
@@ -580,6 +582,12 @@ class BotAdapter:
         if outcome != "ok":
             # route は残し、次の周回で backoff の後に再試行する
             failures += 1
+            if record.state in _TERMINAL and failures >= EDIT_RETRY_LIMIT and read_failed:
+                # 正本を読めないままでも View は外す: 固定文の edit を成功するまで改めて試す
+                self._terminal_text[record.approval_id] = gate_reconcile.NO_LONGER_ACTIVE
+                self._edit_retry[record.approval_id] = (target, 0, 0.0)
+                await self._update_display_locked(record)
+                return
             if record.state in _TERMINAL and failures >= EDIT_RETRY_LIMIT:
                 self._edit_retry.pop(record.approval_id, None)
                 self._terminal_text.pop(record.approval_id, None)

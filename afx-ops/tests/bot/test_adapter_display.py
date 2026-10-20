@@ -678,7 +678,7 @@ def test_a_transient_failure_reading_the_result_retries_instead_of_settling_on_t
     assert adapter.gate.state.record(7) is None
 
 
-def test_a_transient_failure_that_never_clears_stops_at_the_retry_limit_without_the_fixed_sentence(
+def test_ac30_a_persistent_503_still_removes_the_view_with_the_fixed_sentence_after_the_limit(
         harness):
     adapter, channel, clock = harness(_record(state="done", edit_pending=True))
     adapter.client = _SequenceClient([Reply(503, None, "unavailable")])
@@ -687,9 +687,72 @@ def test_a_transient_failure_that_never_clears_stops_at_the_retry_limit_without_
         for _ in range(adapter_module.EDIT_RETRY_LIMIT):
             clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
             await adapter._update_display(adapter.gate.state.record(7))
+            if channel.edits:
+                break
 
     asyncio.run(go())
-    assert channel.edits == [] and adapter.gate.state.record(7) is None
+    assert len(channel.edits) == 1
+    assert channel.edits[0][1]["content"] == "Approval is no longer active."
+    assert channel.edits[0][1]["view"] is None
+    assert adapter.gate.state.record(7) is None
+    assert adapter._edit_retry == {}
+
+
+def test_ac30_an_exception_from_the_result_read_still_removes_the_view_after_the_limit(harness):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    adapter.client = _SequenceClient([OSError("daemon down")])
+
+    async def go():
+        for _ in range(adapter_module.EDIT_RETRY_LIMIT + 2):
+            clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+            record = adapter.gate.state.record(7)
+            if record is not None:
+                await adapter._update_display(record)
+
+    asyncio.run(go())
+    assert [kw["view"] for _, kw in channel.edits] == [None]
+    assert adapter.gate.state.record(7) is None
+
+
+def test_the_fixed_sentence_edit_is_retried_until_it_succeeds_and_only_then_the_record_goes(harness):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    adapter.client = _SequenceClient([Reply(503, None, "unavailable")])
+    channel.edit_outcomes[101] = ["fail", "fail"]
+
+    async def go():
+        for _ in range(adapter_module.EDIT_RETRY_LIMIT + 2):
+            clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+            record = adapter.gate.state.record(7)
+            if record is None:
+                break
+            await adapter._update_display(record)
+            if len(channel.edits) < 3:
+                assert adapter.gate.state.record(7) is not None
+
+    asyncio.run(go())
+    assert len(channel.edits) == 3
+    assert {kw["content"] for _, kw in channel.edits} == {"Approval is no longer active."}
+    assert all(kw["view"] is None for _, kw in channel.edits)
+    assert adapter.gate.state.record(7) is None
+
+
+def test_a_fixed_sentence_edit_that_keeps_failing_is_abandoned_at_the_retry_limit(harness):
+    adapter, channel, clock = harness(_record(state="done", edit_pending=True))
+    adapter.client = _SequenceClient([Reply(503, None, "unavailable")])
+    channel.edit_outcomes[101] = ["fail"] * 100
+
+    async def go():
+        for _ in range(adapter_module.EDIT_RETRY_LIMIT * 2 + 3):
+            clock[0] += adapter_module.EDIT_BACKOFF_MAX_SECONDS + 1
+            record = adapter.gate.state.record(7)
+            if record is None:
+                break
+            await adapter._update_display(record)
+
+    asyncio.run(go())
+    assert len(channel.edits) == adapter_module.EDIT_RETRY_LIMIT
+    assert adapter.gate.state.record(7) is None
+    assert adapter._edit_retry == {}
 
 
 def test_a_non_str_state_in_the_result_still_removes_the_view_with_the_fixed_sentence(harness):
@@ -738,3 +801,15 @@ def test_a_pending_post_deleted_before_a_restart_is_reposted_with_summary_perfor
     content = channel.sent[0]["content"]
     assert "params.period: 14 → 10" in content and "USDJPY" in content
     assert "短い申告です" in content and "期限: 2026-10-26 00:00 UTC" in content
+
+
+def test_the_repost_summary_comes_from_the_fetched_detail_not_from_the_record(harness, monkeypatch):
+    adapter, channel, _ = harness(_record())
+    adapter.client = _DecidedClient(Reply(200, _decided("pending",
+                                    expires_at="2026-10-26T00:00:00+00:00"), None))
+    original = adapter_module._post_effect
+    monkeypatch.setattr(adapter_module, "_post_effect",
+                        lambda record, detail=None: original(record, None))
+    asyncio.run(adapter.reconcile_startup())
+    content = channel.sent[0]["content"]
+    assert "params.period: 14 → 10" not in content and "期限: 2026-10-26" not in content
