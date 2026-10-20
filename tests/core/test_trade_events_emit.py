@@ -479,3 +479,58 @@ def test_ac19_sink_only_writes_ops_events():
                   if isinstance(n, ast.Constant) and isinstance(n.value, str)
                   and n.value.lstrip().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP"))]
     assert statements and all("ops_events" in text for text in statements), statements
+
+
+def test_filled_price_is_the_fill_price_not_the_requested_price(rig):
+    oid = rig.limit()["order_id"]
+    rig.env.conn.execute("UPDATE orders SET requested_price=148.2 WHERE id=?", (oid,))
+    transitions.transition(rig.env.conn, oid, S.PROTECTION_PENDING, WED,
+                           avg_fill_price=148.15, filled_at=WED.isoformat())
+    transitions.transition(rig.env.conn, oid, S.OPEN, WED)
+    placed, filled = rig.events()
+    assert placed["fields"]["price"] == "148.2" and filled["fields"]["price"] == "148.15"
+
+
+def test_r_multiple_exact_values(rig):
+    cases = [("long", 148.0, 147.8, 148.4, "2.00"), ("short", 148.0, 148.2, 147.6, "2.00"),
+             ("short", 148.0, 148.2, 148.2, "-1.00"), ("long", 148.0, 147.5, 147.5, "-1.00")]
+    for side, entry, sl, close, expected in cases:
+        oid = _closing_order(rig.env, direction=side, avg_fill_price=entry, stop_loss=sl)
+        transitions.transition(rig.env.conn, oid, S.CLOSED, WED, close_price=close,
+                               realized_pnl=1.0, closed_at=WED.isoformat())
+    got = [e["fields"]["pnl_r"] for e in rig.events()]
+    assert got == [c[4] for c in cases]
+
+
+def test_commit_stalled_sink_delays_but_does_not_fail_the_next_core_write(tmp_path):
+    """sink が INSERT の後・commit の前で止まっている間、core の書き込みはその分だけ待つ
+    (受容した残余リスク)。待ちが busy_timeout に達しなければ失敗せず、注文処理は完了する。"""
+    import threading
+    sink = TradeEventSink(tmp_path / "t.db", wall_clock=lambda: WED)
+    stalled = threading.Event()
+    release = threading.Event()
+
+    def slow_insert(ts, code, ref, fields):
+        import json as _json
+        conn = sink.connection
+        conn.execute("INSERT INTO ops_events(ts,code,ref,fields_json) VALUES (?,?,?,?)",
+                     (ts, code, ref, _json.dumps(fields)))
+        stalled.set()
+        release.wait(10)
+        conn.commit()
+
+    sink._insert = slow_insert
+    rig = Rig(tmp_path, sink=sink, start=True)
+    oid = _closing_order(rig.env)
+    transitions.transition(rig.env.conn, oid, S.CLOSED, WED, close_price=148.5,
+                           realized_pnl=1.0, close_reason="tp", closed_at=WED.isoformat())
+    assert stalled.wait(5)
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    started = time.monotonic()
+    other = _closing_order(rig.env)  # sink が lock を持つ間の core の書き込み
+    waited = time.monotonic() - started
+    timer.join()
+    assert orders.get(rig.env.conn, other)["status"] == "closing"
+    assert 0.1 < waited < 4.0
+    rig.close()
