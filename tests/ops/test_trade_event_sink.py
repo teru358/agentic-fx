@@ -113,6 +113,40 @@ def test_ac14_busy_db_drops_immediately_without_waiting(db_path):
     assert sink.counters()["db_error_drop"] == 0
 
 
+def test_busy_retry_lets_the_worker_wait_without_ever_blocking_the_submitter(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=5.0)
+    sink.start()
+    try:
+        started = time.monotonic()
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert time.monotonic() - started < 0.5  # 投入側は待たない
+        time.sleep(0.15)
+        assert sink.counters()["db_busy_drop"] == 0
+        holder.rollback()  # lock を放す
+        assert wait_until(lambda: len(rows(db_path, "order_state_changed")) == 1)
+    finally:
+        sink.stop()
+        holder.close()
+    assert sink.counters()["db_busy_drop"] == 0
+
+
+def test_busy_retry_gives_up_after_its_budget(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=0.1)
+    sink.start()
+    try:
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert wait_until(lambda: sink.counters()["db_busy_drop"] == 1)
+    finally:
+        holder.rollback()
+        sink.stop()
+        holder.close()
+    assert rows(db_path, "order_state_changed") == []
+
+
 def test_ac14_submit_does_not_wait_for_a_stalled_worker(db_path):
     release = threading.Event()
     sink = make(db_path, queue_max=10)

@@ -1,6 +1,6 @@
 # [ops-api] 操作 API と client 契約設計 v1.19
 
-版: v1.19
+版: v1.20
 
 日付: 2026-10-05
 
@@ -176,6 +176,10 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |`guard_state_changed`|instance id|`guard_kind`、`state`、`generation`|
 |`service_health_changed`|instance id|`component_code`、`health_code`|
 |`event_stream_health`|instance id|`failure_count`、`first_failed_at`、`last_failed_at`|
+|`order_state_changed`|`order:<orders.id>` (1〜2^63-1)|`state`、`pair`、`side`、`entry_type`、`qty`、`price`、`sl`、`tp`、`origin_code`、`mode`、`state_mode`、`reason_code` (12 個、全て必須)|
+|`position_closed`|`order:<orders.id>`|`pair`、`side`、`qty`、`entry_price`、`close_price`、`pnl`、`ccy`、`pnl_r`、`held_sec`、`reason_code`、`origin_code`、`mode`、`state_mode` (13 個、全て必須)|
+
+取引 event の 2 code は値の書式が固定で、価格・数量・損益・R は canonical な 10 進文字列 (float を持たない)、`held_sec` は整数、`origin_code` は `cron` か `signal:<plugin>`、`reason_code` は注文では取消のときだけ値を持つ。grammar に合わない値は event を作らず捨てる (None に置き換えない)。書式と意味の正本は取引通知の設計書 (`2026-10-20-trade-notices-design.md` §3)。daemon は `transitions.transition` の commit の後に observer で作り、専用接続の別 thread で `ops_events` に書く。busy や queue 溢れでは待たずに捨て、理由別の件数を `afx ctl status` に出す。
 
 各 code は上表以外の field を拒否する。notification-safe summary は code と上表の値だけから client が生成し、DB に自由文を持たない。holdout / in-sample の数値、agent の自己申告文、reject reason、ask / policy / backlog の本文、鍵、内部例外、その他の自由文は event に入れない。
 
@@ -439,3 +443,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-14|v1.17|§1.2 の `api.enabled` 既定を true に改訂 (seccomp 投入待ちの規範を撤回、2026-10-12 裁定 P16 / 段 8)|first-run T8 で example / ApiSettings / 運用文書の既定を true にしたため正本を揃えた||
 |2026-10-15|v1.18|I-36 に status.setup の固定 code を列挙 (`improve_isolation_unavailable` を追加。実装の `_STATUS_SETUP_CODES` と一致させる)|first-run fr-fix1 で新 code を足したため正本に列挙を置いた||
 |2026-10-19|v1.19|§3.3 に申告の見出し分離を追記し、`GET /v1/approvals/{id}/change` を足した (endpoint 25 本)。`approval_detail` に `change` 要約を足す|承認の中身を見せる設計 v1.0 (T1)|
+|2026-10-20|v1.20|§4.3 の event 表に `order_state_changed` / `position_closed` を追加し、daemon の `events.poll` は high watermark と行の取得を 1 つの読み取り tx にした|取引通知の設計書 v1.0 (T2)||

@@ -33,12 +33,17 @@ RECOVERY_SEC = 60.0
 WARNING_INTERVAL_SEC = 60.0
 _BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _POLL_SEC = 1.0
+_BUSY_RETRY_STEP_SEC = 0.005
 
 
 class TradeEventSink:
     def __init__(self, db_path: Path, *, wall_clock: Callable[[], datetime],
                  monotonic: Callable[[], float] = time.monotonic, queue_max: int = 1000,
-                 join_timeout: float = 5.0, recovery_sec: float = RECOVERY_SEC) -> None:
+                 join_timeout: float = 5.0, recovery_sec: float = RECOVERY_SEC,
+                 busy_retry_sec: float = 0.0) -> None:
+        # busy_retry_sec は worker thread だけが busy を待つ上限 (既定 0 = 待たずに捨てる)。
+        # core の接続は待たされない。busy は INSERT の前に起きるので、再試行で重複は生じない。
+        self._busy_retry_sec = busy_retry_sec
         self._db_path, self._wall_clock, self._monotonic = db_path, wall_clock, monotonic
         self._queue: queue.Queue = queue.Queue(maxsize=queue_max)
         self._join_timeout, self._recovery_sec = join_timeout, recovery_sec
@@ -140,15 +145,23 @@ class TradeEventSink:
         except EventSchemaError:
             self.record_drop("invalid_value_drop")
             return
-        try:
-            self._insert(ts, code, ref, fields)
-        except sqlite3.Error as exc:
-            self._rollback()
-            busy = getattr(exc, "sqlite_errorcode", None) in _BUSY_CODES
-            self.record_drop("db_busy_drop" if busy else "db_error_drop")
-        except Exception:  # noqa: BLE001
-            self._rollback()
-            self.record_drop("db_error_drop")
+        give_up = time.monotonic() + self._busy_retry_sec
+        while True:
+            try:
+                self._insert(ts, code, ref, fields)
+                return
+            except sqlite3.Error as exc:
+                self._rollback()
+                busy = getattr(exc, "sqlite_errorcode", None) in _BUSY_CODES
+                if busy and time.monotonic() < give_up and not self._abandon.is_set():
+                    time.sleep(_BUSY_RETRY_STEP_SEC)
+                    continue
+                self.record_drop("db_busy_drop" if busy else "db_error_drop")
+                return
+            except Exception:  # noqa: BLE001
+                self._rollback()
+                self.record_drop("db_error_drop")
+                return
 
     def _insert(self, ts: str, code: str, ref: str, fields: dict) -> None:
         conn = self.connection
