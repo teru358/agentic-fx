@@ -133,9 +133,20 @@ class EventStore:
         if type(after) is not int or after < 0 or type(limit) is not int \
                 or not 1 <= limit <= MAX_POLL_LIMIT:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
-        high = self._conn.execute("SELECT COALESCE(MAX(id),0) AS id FROM ops_events").fetchone()["id"]
-        rows = self._conn.execute(
-            "SELECT * FROM ops_events WHERE id>? ORDER BY id LIMIT ?", (after, limit)).fetchall()
+        # high watermark と行の取得を 1 つの読み取り tx にまとめる。別接続の commit が間に入っても、
+        # 返す行が high watermark を超えない (超えると cursor 規律が正常時に巻き戻りと誤判定する)。
+        own_tx = not self._conn.in_transaction
+        if own_tx:
+            self._conn.execute("BEGIN")
+        try:
+            high = self._conn.execute(
+                "SELECT COALESCE(MAX(id),0) AS id FROM ops_events").fetchone()["id"]
+            rows = self._conn.execute(
+                "SELECT * FROM ops_events WHERE id>? ORDER BY id LIMIT ?",
+                (after, limit)).fetchall()
+        finally:
+            if own_tx:
+                self._conn.rollback()
         return EventPage([{"id": row["id"], "ts": row["ts"], "code": row["code"],
                            "ref": row["ref"], "fields": json.loads(row["fields_json"])}
                           for row in rows], int(high))

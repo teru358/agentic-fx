@@ -123,3 +123,46 @@ def test_ac2_origin_code_grammar():
     for bad in ("Signal:x", "signal:", "signal:Bad", "cron ", "signal:" + "a" * 64):
         with pytest.raises(EventSchemaError):
             validate_fields("position_closed", {**CLOSE, "origin_code": bad}, "order:1")
+
+
+def test_poll_reads_high_watermark_and_rows_in_one_snapshot(tmp_path):
+    """MAX(id) と行の取得の間に別接続が commit しても、返す行は high watermark を超えない。"""
+    from datetime import datetime, timezone
+
+    from agentic_fx.store.db import connect, init_db
+
+    path = tmp_path / "t.db"
+    conn = connect(path)
+    init_db(conn)
+    writer = connect(path)
+    wall = lambda: datetime(2026, 10, 20, tzinfo=timezone.utc)  # noqa: E731
+    store = ev.EventStore(writer, wall_clock=wall)
+    for _ in range(3):
+        store.emit("service_health_changed", "instance",
+                   {"component_code": "x", "health_code": "ok"})
+
+    class Interleave:
+        def __init__(self, real):
+            self._real, self.armed = real, True
+
+        def execute(self, sql, *args):
+            result = self._real.execute(sql, *args)
+            if self.armed and "MAX(id)" in sql:
+                self.armed = False
+                ev.EventStore(connect(path), wall_clock=wall).emit(
+                    "service_health_changed", "instance",
+                    {"component_code": "x", "health_code": "degraded"})
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    reader = ev.EventStore(Interleave(conn), wall_clock=wall)
+    page = reader.poll(after=0, limit=100)
+    assert [e["id"] for e in page.events] == [1, 2, 3]
+    assert page.high_watermark == 3
+    assert all(e["id"] <= page.high_watermark for e in page.events)
+    # 次の poll は取りこぼさない
+    again = reader.poll(after=3, limit=100)
+    assert [e["id"] for e in again.events] == [4] and again.high_watermark == 4
+    assert not conn.in_transaction
