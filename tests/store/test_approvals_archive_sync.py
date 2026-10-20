@@ -227,6 +227,25 @@ def test_ac21_failure_leaves_no_revocation_row(tmp_path, monkeypatch):
     assert _outcome(other, archive_id) == "approved"
 
 
+def test_ac21_failure_closes_the_transaction_so_a_later_commit_cannot_keep_it(
+        tmp_path, monkeypatch):
+    conn = _db(tmp_path)
+    archive_id = _row(conn)
+    _approved(conn, archive_id, decided_at=NOW)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(approvals, "_settle_archive", boom)
+    with pytest.raises(RuntimeError):
+        approvals.append_revocation(conn, "rsi_v2", "C1",
+                                    now=NOW + timedelta(hours=1))
+    assert not conn.in_transaction
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM approval_requests WHERE "
+                        "status='rejected'").fetchone()[0] == 0
+
+
 def test_ac21_commit_false_failure_does_not_commit_for_caller(tmp_path,
                                                               monkeypatch):
     conn = _db(tmp_path)
