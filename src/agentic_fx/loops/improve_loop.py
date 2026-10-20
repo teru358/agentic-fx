@@ -2204,7 +2204,7 @@ class ImproveLoop:
         except AttributeError:
             raise OSError(errno.ENOSYS, "renameat2_unavailable",
                           str(dst)) from None
-        renameat2.restype = ctypes.c_long
+        renameat2.restype = ctypes.c_int
         renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                               ctypes.c_char_p, ctypes.c_uint]
         ctypes.set_errno(0)
@@ -2216,6 +2216,20 @@ class ImproveLoop:
         if err == errno.EEXIST:
             raise FileExistsError(err, os.strerror(err), str(dst))
         raise OSError(err, os.strerror(err), str(dst))
+
+    @staticmethod
+    def _set_aside_stale(final_path: Path, artifact_hash: str) -> Path:
+        """壊れた先着を `.stale-<hash>-<uuid>` へ置換せずに退避する。名前が
+        衝突したら新しい uuid で最大 3 回。全部衝突したら FileExistsError。"""
+        for _ in range(3):
+            aside = final_path.parent / f".stale-{artifact_hash}-{uuid.uuid4()}"
+            try:
+                ImproveLoop._publish_dir_noreplace(final_path, aside)
+                return aside
+            except FileExistsError:
+                continue
+        raise FileExistsError(errno.EEXIST, "stale_name_collision",
+                              str(final_path))
 
     @staticmethod
     def _verify_archive_dir(path: Path, artifact_hash: str) -> None:
@@ -2369,8 +2383,7 @@ class ImproveLoop:
                     self._verify_archive_dir(final_path, candidate.artifact_hash)
                     return relative, False
                 except (OSError, ValueError):
-                    os.rename(final_path, final_path.parent / (
-                        f".stale-{candidate.artifact_hash}-{uuid.uuid4()}"))
+                    self._set_aside_stale(final_path, candidate.artifact_hash)
             self._write_archive_tmp(
                 archive_tmp, plugin_py=plugin_py, config_yaml=config_yaml,
                 test_plugin=test_plugin, metadata={
@@ -2394,9 +2407,8 @@ class ImproveLoop:
                     except (OSError, ValueError):
                         if attempt == 2:
                             raise
-                        os.rename(final_path, final_path.parent / (
-                            f".stale-{candidate.artifact_hash}-"
-                            f"{uuid.uuid4()}"))
+                        self._set_aside_stale(
+                            final_path, candidate.artifact_hash)
                         continue
                     self._remove_archive_tmp(archive_tmp)
                     return relative, False

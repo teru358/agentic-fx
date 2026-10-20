@@ -434,3 +434,76 @@ def test_snapshot_reports_creation_when_nobody_else_published(
     relative, created = loop._snapshot_final_archive(
         candidate, mission_id=7, now=NOW)
     assert created is True and relative is not None
+
+
+def _uuid_sequence(values):
+    import uuid
+    it = iter(values)
+    last = [None]
+
+    def fake():
+        try:
+            last[0] = next(it)
+        except StopIteration:
+            pass
+        return uuid.UUID(int=last[0])
+
+    return fake
+
+
+@pytest.mark.parametrize("kind", ["file", "empty_dir"])
+def test_stale_aside_name_collision_is_not_replaced(
+        improve_env, tmp_path, kind):
+    """退避先の名前に先客 (ファイル・空 dir) がいても置換せず、別名で退避する。"""
+    import uuid
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    final_path.mkdir(parents=True)
+    (final_path / "plugin.py").write_text("partial\n")
+    taken = final_path.parent / (
+        f".stale-{candidate.artifact_hash}-{uuid.UUID(int=2)}")
+    if kind == "file":
+        taken.write_text("occupant")
+    else:
+        taken.mkdir()
+    with patch("agentic_fx.loops.improve_loop.uuid.uuid4",
+               _uuid_sequence([1, 2, 3, 4])):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert relative is not None and created is True
+    assert _verified(final_path, candidate.artifact_hash)
+    if kind == "file":
+        assert taken.read_text() == "occupant"
+    else:
+        assert taken.is_dir() and list(taken.iterdir()) == []
+    stale = [p for p in final_path.parent.iterdir()
+             if p.name.startswith(".stale-")]
+    assert len(stale) == 2
+
+
+def test_stale_aside_gives_up_after_three_collisions(improve_env, tmp_path):
+    import uuid
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    final_path.mkdir(parents=True)
+    (final_path / "plugin.py").write_text("partial\n")
+    taken = final_path.parent / (
+        f".stale-{candidate.artifact_hash}-{uuid.UUID(int=2)}")
+    taken.write_text("occupant")
+    with patch("agentic_fx.loops.improve_loop.uuid.uuid4",
+               _uuid_sequence([1, 2])):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert (relative, created) == (None, False)
+    assert taken.read_text() == "occupant"
+    assert (final_path / "plugin.py").read_text() == "partial\n"
+
+
+def test_final_archive_paths_never_call_a_replacing_rename():
+    import inspect
+    assert "os.rename(" not in inspect.getsource(
+        ImproveLoop._snapshot_final_archive)
+    assert "os.rename(" not in inspect.getsource(
+        ImproveLoop._publish_archives)
+    assert "os.rename(" not in inspect.getsource(
+        ImproveLoop._set_aside_stale)
