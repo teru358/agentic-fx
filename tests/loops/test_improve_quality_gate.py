@@ -598,3 +598,24 @@ def test_demotion_details_never_reach_the_agent_surface(improve_env):
     assert "secret_past_name" not in result and past_hash not in result
     log = _activity(root)
     assert "quality_demoted" in log and "secret_past_name" in log
+
+
+def test_duplicate_metrics_details_never_reach_the_agent_surface(improve_env):
+    """成績一致の降格も固定文言だけ。一致した版の hash と pair は activity
+    にだけ残る。"""
+    app, root = improve_env
+    conn = app.conn_core
+    _run_strategy(app, root, "conv_a", py=PY_X)
+    approved_hash = conn.execute(
+        "SELECT content_hash FROM backtest_runs "
+        "WHERE scope='in_sample' AND variant='candidate' "
+        "ORDER BY id LIMIT 1").fetchone()[0]
+    loop, ctx, seeded = _run_strategy(app, root, "conv_b", py=PY_Y)
+    _expect_rows(conn, ctx, seeded, "duplicate_metrics")
+    result = _last_result(conn)
+    assert result == f"observation:{NOTICE}"
+    assert approved_hash not in result
+    assert "pair=" not in result and "duplicate_metrics_of" not in result
+    log = _activity(root)
+    assert "quality_demoted" in log
+    assert f"duplicate_metrics_of:{approved_hash}" in log

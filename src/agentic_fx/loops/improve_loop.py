@@ -2723,8 +2723,8 @@ class ImproveLoop:
         if metrics_dup is not None:
             detail = (f"duplicate_metrics_of:{metrics_dup.content_hash} "
                       f"pair={metrics_dup.pair}")
-            return _QualityVerdict(
-                outcome="duplicate_metrics", reason=detail, detail=detail)
+            return self._quality_rejection(
+                "duplicate_metrics", detail=detail)
         return _QualityVerdict(flags=flags)
 
     @staticmethod
