@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import discord
 
-from afx_ops.events_page import parse_page
+from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
@@ -656,6 +656,8 @@ class BotAdapter:
         self._regression_guard(high)
         if not self.gate.state.event_cursor_initialized:
             # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            if unreadable:
+                print(f"afx-ops bot: {unreadable_notice(events, unreadable)}", file=sys.stderr)
             await self._run(self._initialize_cursor, high)
             return
         if high > self.gate.state.high_watermark:

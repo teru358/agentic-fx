@@ -29,3 +29,9 @@ def parse_page(reply, failure: Callable[[str], Exception]) -> tuple[list[dict], 
     if readable:
         high = max(high, readable[-1]["id"])
     return readable, high, len(events) - len(readable)
+
+
+def unreadable_notice(events: list[dict], unreadable: int) -> str:
+    """初回 page で配送せず捨てる、id が読めない event 以降の件数と、読めた event の id の範囲。"""
+    ids = f"{events[0]['id']}-{events[-1]['id']}" if events else "none"
+    return f"initial_page_unreadable skipped={unreadable} readable_ids={ids}"

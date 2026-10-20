@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
-from afx_ops.events_page import parse_page
+from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
 from afx_ops.isolation.startup import client_for
 from afx_ops.notify import transport
@@ -135,6 +135,8 @@ class _Loop:
             raise _Failure("high_watermark_regressed")
         if not state.event_cursor_initialized:
             # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            if unreadable:
+                self._warn(unreadable_notice(events, unreadable))
             return self._save(dir_fd, initialize_event_cursor(state, high)), len(events), 0
         # 新しい watermark は最初の配送確定と同じ置換で保存する (失敗時に snapshot を動かさない)
         state = observe_high(state, high)

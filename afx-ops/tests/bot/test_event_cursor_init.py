@@ -326,3 +326,21 @@ def test_the_regression_check_runs_before_the_uninitialised_branch(process):
     with pytest.raises(BotFailure, match="high_watermark_regressed"):
         proc.poll()
     assert proc.adapter.gate.state.cursor == 100
+
+
+def test_unreadable_events_dropped_from_the_first_page_are_logged_with_count_and_id_range(
+        process, capsys):
+    page = {"events": [_health(1), _health(2), {"id": "x"}, _health(9)], "high_watermark": 2}
+    proc = process(_Events(page))
+    proc.start()
+    proc.poll()
+    assert capsys.readouterr().err == (
+        "afx-ops bot: initial_page_unreadable skipped=2 readable_ids=1-2\n")
+    assert load(proc.fd).event_cursor_initialized is True
+
+
+def test_a_first_page_without_unreadable_events_logs_nothing(process, capsys):
+    proc = process(_Events(_page(_history())))
+    proc.start()
+    proc.poll()
+    assert capsys.readouterr().err == ""

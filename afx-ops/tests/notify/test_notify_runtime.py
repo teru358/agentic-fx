@@ -605,3 +605,17 @@ def test_the_regression_check_runs_before_the_uninitialised_branch(fresh_dir):
     finally:
         os.close(fd)
     assert not (fresh_dir / "notify.snapshot").exists()
+
+
+def test_unreadable_events_dropped_from_the_first_page_are_logged_with_count_and_id_range(fresh_dir):
+    page = {"events": [_event(1), _event(2), {"id": "x"}, _event(9)], "high_watermark": 2}
+    rc, err = _run(fresh_dir, FakeClient([page]), FakeSend())
+    assert rc == 0
+    assert err == "afx-ops: warning initial_page_unreadable skipped=2 readable_ids=1-2\n"
+    assert _state(fresh_dir).event_cursor_initialized is True
+
+
+def test_a_first_page_without_unreadable_events_logs_nothing(fresh_dir):
+    rc, err = _run(fresh_dir, FakeClient([{"events": [_event(1), _event(2)], "high_watermark": 2}]),
+                   FakeSend())
+    assert (rc, err) == (0, "")
