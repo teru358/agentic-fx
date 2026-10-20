@@ -17,7 +17,8 @@ from afx_ops.api_client import ApiError, Reply
 from afx_ops.notify import runtime
 from afx_ops.notify.delivery import DeliveryError
 from afx_ops.notify.retry import MAX_ATTEMPTS, retry_delays
-from afx_ops.notify.state import NotifyState, advance_delivery, load, observe_high, save
+from afx_ops.notify.state import (NotifyState, advance_delivery, initialize_event_cursor, load,
+                                  observe_high, save)
 
 URL = b"https://hooks.example.test/afx/9f2c"
 
@@ -90,7 +91,7 @@ def _state(path: Path) -> NotifyState:
 
 
 def _seed(path: Path, *ids: int, high: int = 0) -> None:
-    state = NotifyState.empty()
+    state = initialize_event_cursor(NotifyState.empty(), 0)
     for event_id in ids:
         state = advance_delivery(state, event_id)
     if high:
@@ -103,10 +104,22 @@ def _seed(path: Path, *ids: int, high: int = 0) -> None:
 
 
 @pytest.fixture
-def state_dir(tmp_path) -> Path:
+def fresh_dir(tmp_path) -> Path:
+    """snapshot がまだ無い state dir。"""
     path = tmp_path / "state"
     path.mkdir(mode=0o700)
     return path
+
+
+@pytest.fixture
+def state_dir(fresh_dir) -> Path:
+    """event cursor の初期化が済んだ (cursor 0 から読む) state dir。"""
+    fd = _dir_fd(fresh_dir)
+    try:
+        save(fd, initialize_event_cursor(NotifyState.empty(), 0))
+    finally:
+        os.close(fd)
+    return fresh_dir
 
 
 def _run(state_dir, client, send, *, url=URL, sleeps=None, polls=1, err=None):
@@ -130,7 +143,7 @@ def test_two_xx_delivers_each_event_once_and_commits_the_cursor(state_dir):
     rc, err = _run(state_dir, client, send)
     assert (rc, err) == (0, "")
     assert send.ids == [1, 2]
-    assert _state(state_dir) == NotifyState(cursor=2, high_watermark=2)
+    assert _state(state_dir) == NotifyState(cursor=2, high_watermark=2, event_cursor_initialized=True)
     assert client.calls[0] == (0, runtime.EVENTS_LIMIT) and runtime.EVENTS_LIMIT == 500
 
 
@@ -222,7 +235,7 @@ def test_non_two_xx_keeps_cursor_and_stops_before_the_next_event(state_dir, stat
     assert rc == runtime.RC_NOTIFY_FAILED != 0
     assert err.splitlines()[-1] == f"afx-ops: {reason}"
     assert send.ids == [2] * attempts
-    assert _state(state_dir) == NotifyState(cursor=1, high_watermark=1)
+    assert _state(state_dir) == NotifyState(cursor=1, high_watermark=1, event_cursor_initialized=True)
     assert sleeps == list(retry_delays()[:attempts - 1])
 
 
@@ -439,3 +452,96 @@ def test_a_429_with_retry_after_waits_that_long_before_resending(state_dir):
     assert err == "afx-ops: warning http_429\n"
     assert sleeps[0] == 30.0
     assert _state(state_dir).cursor == 1
+
+
+# ---------------------------------------------------------------- 初回 cursor (AC-25)
+
+
+def _raw_snapshot(path: Path) -> dict:
+    return json.loads((path / "notify.snapshot").read_text(encoding="ascii"))
+
+
+def _history() -> list[dict]:
+    approve = _event(1, code="approval_state_changed", ref="approval:3", fields={
+        "state": "approved", "decision_code": "approve", "decided_by": "operator"})
+    improve = _event(2, code="job_state_changed", ref="job:" + "0123456789abcdef" * 2, fields={
+        "job_kind": "improve", "state": "done", "result_code": "ok"})
+    trade = _event(4, code="order_state_changed", ref="order:1", fields={"state": "filled"})
+    return [approve, improve, _event(3), trade, _event(5)]
+
+
+def test_ac25_a_mixed_history_without_a_snapshot_posts_nothing_and_starts_at_the_end(fresh_dir):
+    client = FakeClient([{"events": _history(), "high_watermark": 5}])
+    send = FakeSend()
+    rc, err = _run(fresh_dir, client, send)
+    assert (rc, err) == (0, "")
+    assert send.bodies == []
+    assert _state(fresh_dir) == NotifyState(cursor=5, high_watermark=5,
+                                            event_cursor_initialized=True)
+    assert _raw_snapshot(fresh_dir)["event_cursor_initialized"] is True
+
+
+def test_ac25_an_event_after_the_start_is_delivered(fresh_dir):
+    client = FakeClient([{"events": _history(), "high_watermark": 5},
+                         {"events": [_event(6)], "high_watermark": 6}])
+    send = FakeSend()
+    rc, _ = _run(fresh_dir, client, send, polls=2)
+    assert rc == 0 and send.ids == [6]
+    assert [after for after, _ in client.calls] == [0, 5]
+    assert _state(fresh_dir).cursor == 6
+
+
+def test_ac25_an_empty_history_still_starts_and_a_saved_zero_is_not_absence(fresh_dir):
+    client = FakeClient([{"events": [], "high_watermark": 0},
+                         {"events": [_event(1)], "high_watermark": 1}])
+    send = FakeSend()
+    rc, _ = _run(fresh_dir, client, send, polls=2)
+    assert rc == 0 and send.ids == [1]
+    assert _state(fresh_dir).cursor == 1
+
+
+def test_ac25_a_failed_first_poll_keeps_the_flag_false_and_the_next_start_skips_history(fresh_dir):
+    fd = _dir_fd(fresh_dir)
+    try:
+        save(fd, NotifyState.empty())
+    finally:
+        os.close(fd)
+    rc, err = _run(fresh_dir, FakeClient([ApiError("unreachable")]), FakeSend())
+    assert rc != 0
+    assert _raw_snapshot(fresh_dir)["event_cursor_initialized"] is False
+    send = FakeSend()
+    rc, _ = _run(fresh_dir, FakeClient([{"events": _history(), "high_watermark": 5}]), send)
+    assert rc == 0 and send.bodies == []
+    assert _state(fresh_dir).event_cursor_initialized is True
+
+
+def test_ac25_a_malformed_first_page_fails_without_starting(fresh_dir):
+    rc, err = _run(fresh_dir, FakeClient([Reply(200, {"events": "x", "high_watermark": 1}, None)]),
+                   FakeSend())
+    assert (rc, err) == (1, "afx-ops: events_invalid\n")
+    assert not (fresh_dir / "notify.snapshot").exists()
+
+
+def test_ac25_the_start_is_one_snapshot_replacement(fresh_dir, monkeypatch):
+    writes = []
+    real = runtime.save
+
+    def spy(dir_fd, state):
+        real(dir_fd, state)
+        writes.append((state.cursor, state.high_watermark, state.event_cursor_initialized))
+
+    monkeypatch.setattr(runtime, "save", spy)
+    _run(fresh_dir, FakeClient([{"events": _history(), "high_watermark": 5}]), FakeSend())
+    assert writes == [(5, 5, True)]
+
+
+def test_ac25_a_v2_snapshot_migrates_to_true_and_continues_from_its_cursor(fresh_dir):
+    (fresh_dir / "notify.snapshot").write_text(
+        '{"cursor": 3, "high_watermark": 3, "version": 2}', encoding="ascii")
+    client = FakeClient([{"events": [_event(4), _event(5)], "high_watermark": 5}])
+    send = FakeSend()
+    rc, _ = _run(fresh_dir, client, send)
+    assert rc == 0 and send.ids == [4, 5]
+    assert client.calls[0][0] == 3
+    assert _raw_snapshot(fresh_dir) == {"version": 3, "cursor": 5, "high_watermark": 5,
+                                        "event_cursor_initialized": True}

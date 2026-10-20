@@ -28,7 +28,8 @@ from afx_ops.notify import transport
 from afx_ops.notify.delivery import DeliveryError, encode_json_object, validate_webhook_url
 from afx_ops.notify.payload import PayloadError, encode_event
 from afx_ops.notify.retry import RetryError, WarningThrottle, retry
-from afx_ops.notify.state import StateError, advance_delivery, load, observe_high, save
+from afx_ops.notify.state import (StateError, advance_delivery, initialize_event_cursor, load,
+                                  observe_high, save)
 
 SECRET_NAME = "webhook.url"
 EVENTS_LIMIT = 500
@@ -127,6 +128,9 @@ class _Loop:
     def _poll_once(self, client, target, dir_fd, state):
         reply = client.events(after=state.cursor, limit=EVENTS_LIMIT)
         events, high, unreadable = _page(reply)
+        if not state.event_cursor_initialized:
+            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            return self._save(dir_fd, initialize_event_cursor(state, high)), len(events), 0
         saved_high = state.high_watermark
         # 保存済みの最大 watermark (cursor 以上) より後退した値は DB の巻き戻り等の異常。何も確定しない
         if high < state.high_watermark:
