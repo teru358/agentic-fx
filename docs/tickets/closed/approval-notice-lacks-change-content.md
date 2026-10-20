@@ -1,15 +1,15 @@
 ---
 id: approval-notice-lacks-change-content
 title: 改善承認の通知に変更内容が無い (何がどう変わるか読めない)
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-17
-closed: null
+closed: 2026-10-20
 related: [ops-ui, bot-readonly-slash-commands]
 ---
 # [approval-notice-lacks-change-content] 改善承認の通知に変更内容が無い (何がどう変わるか読めない)
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -25,9 +25,12 @@ ops-api spec §3.2 は『自由文を event から復元せず API が許す承�
 
 ## 修正内容
 
+- 2026-10-20: spec 2026-10-19-approval-content-design.md v1.6 の T1 (API + CLI + web、merge 85d4776) と T2 (Discord 承認投稿) で是正。承認投稿に plugin 名・新規/更新・params 差分・成績 (in-sample)・agent の申告 (未検証、300 字)・期限と web への案内が載り、web の承認ページで 3 ファイルの diff を読める。T3 (event 通知) は bot-event-notices-are-raw-log-lines で別途
+
 ## 経緯
 
 - 2026-10-17: 起票。
 - 2026-10-17: ユーザー裁定 — 改善通知は週 1 発火なので急がない (優先 中のまま)。plugin deploy ops (T2〜T8) の後に 2 件同じ束で設計 (C0 → sol → 承認)。
 - 2026-10-17 22:49: ユーザー裁定 — 道筋 2 番目 (pdo 完走の直後)。Discord は要約、diff 全文は既存の読み取り専用 web に 1 ページ足す形で、2 チケット同じ束で C0。
 - 2026-10-19: 状態: 実装中 — 設計 docs/superpowers/specs/2026-10-19-approval-content-design.md v1.0 をユーザー承認 (2026-10-19)。T1 (API + CLI + web) 着手
+- 2026-10-20: 是正内容 — spec 2026-10-19-approval-content-design.md v1.6 の T1 (API + CLI + web、merge 85d4776) と T2 (Discord 承認投稿) で是正。承認投稿に plugin 名・新規/更新・params 差分・成績 (in-sample)・agent の申告 (未検証、300 字)・期限と web への案内が載り、web の承認ページで 3 ファイルの diff を読める。T3 (event 通知) は bot-event-notices-are-raw-log-lines で別途
