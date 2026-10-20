@@ -196,7 +196,7 @@ def test_archive_is_made_before_the_tx_and_removed_on_rollback(improve_env):
         app, root, _plugin_artifact("cand"), files=_indicator(),
         extra=[patch.object(ImproveLoop, "_snapshot_final_archive", spy),
                patch("agentic_fx.store.candidate_archives.settle",
-                     lambda conn, archive_id, outcome: False)])
+                     lambda conn, archive_id, outcome, **kw: False)])
     assert write_lock_free == [True]
     archive_root = root / "plugins" / "_archive" / str(ctx.mission_id)
     finals = [p for p in archive_root.iterdir() if not p.name.startswith(".")]
@@ -253,7 +253,8 @@ def test_duplicate_metrics_demotion_leaves_no_orphan_archive_dir(improve_env):
     for name in ("conv_a", "conv_b"):
         runs.append(_run(
             app, root, _plugin_artifact(name, kind="strategy"),
-            files=(name, f'"""{name}"""\n' + _PASSING_STRATEGY_PY,
+            files=(name, f'"""{name}"""\n' + _PASSING_STRATEGY_PY
+                   + f'\n_VARIANT = "{name}"\n',
                    _PASSING_STRATEGY_CONFIG, _PASSING_STRATEGY_TEST),
             in_sample=_fake_in_sample_full_metrics(metrics),
             holdout_fn=_fake_holdout_full_metrics(hold)))
@@ -283,7 +284,7 @@ def test_rollback_keeps_an_archive_dir_that_already_existed(improve_env):
         app, root, _plugin_artifact("cand"), files=_indicator(),
         before_commit=make_existing,
         extra=[patch("agentic_fx.store.candidate_archives.settle",
-                     lambda conn, archive_id, outcome: False)])
+                     lambda conn, archive_id, outcome, **kw: False)])
     finals = _finals(root, ctx.mission_id)
     assert [p.name for p in finals] == pre
 

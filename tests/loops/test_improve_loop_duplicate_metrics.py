@@ -71,7 +71,8 @@ def evaluate(df, indicators, signals, params):
 _STRATEGY_PY_VARIANT_B = '''
 """variant B — 別コードだが成績は一致させる"""
 def evaluate(df, indicators, signals, params):
-    return {"action": "hold", "rationale": "variant b always holds"}
+    reason = "variant b always holds"
+    return {"action": "hold", "rationale": reason}
 '''
 
 _CONVERGED_METRICS = {
