@@ -2277,15 +2277,11 @@ class ImproveLoop:
         staging を消す前に呼ぶ。"""
         if not content_hash or not artifact_hash:
             return None
-        from agentic_fx.plugin.logic_identity import identity_of_dir
-        logic_hash, family_key = identity_of_dir(candidate_dir, name=name)
+        from agentic_fx.plugin.logic_identity import read_identity
+        logic_hash, family_key, config = read_identity(
+            candidate_dir, name=name)
         pair = None
-        try:
-            config = yaml.safe_load(
-                (candidate_dir / "config.yaml").read_text(encoding="utf-8"))
-        except (OSError, ValueError, yaml.YAMLError):
-            config = None
-        if isinstance(config, dict) and config.get("kind") == "strategy":
+        if config is not None and config.get("kind") == "strategy":
             pairs = config.get("pairs")
             if isinstance(pairs, list) and pairs:
                 pair = str(pairs[0])
@@ -2395,22 +2391,19 @@ class ImproveLoop:
                     f"{type(exc).__name__}:{str(exc)[:300]}")
             return None
 
-    def _submitted_candidate(self, ctx, payload: dict) -> _FinalCandidate:
-        """承認 payload の候補から最終 artifact の材料を作る。staging が
-        読めれば仮説族などを bytes から計算し、読めなければ hash だけで作る。"""
-        name = payload["name"]
-        candidate = None
-        if ctx is not None and getattr(ctx, "staging_dir", None) is not None:
-            candidate = self._final_candidate(
-                ctx.staging_dir / name, name=name,
-                content_hash=payload["content_hash"],
-                artifact_hash=payload["artifact_hash"])
-        if candidate is None:
-            candidate = _FinalCandidate(
-                name=name, content_hash=payload["content_hash"],
-                artifact_hash=payload["artifact_hash"], pair=None,
-                logic_hash=None, family_key=None, candidate_dir=None)
-        return candidate
+    @staticmethod
+    def _submitted_candidate(payload: dict,
+                             final_candidate: "_FinalCandidate | None"
+                             ) -> _FinalCandidate:
+        """承認 tx に入れる最終 artifact の材料。commit が gate 判定の直後に
+        作った材料をそのまま使い、tx の中では staging を読まない。材料が
+        無い (最終 hash が取れなかった) ときは payload の hash だけで作る。"""
+        if final_candidate is not None:
+            return final_candidate
+        return _FinalCandidate(
+            name=payload["name"], content_hash=payload["content_hash"],
+            artifact_hash=payload["artifact_hash"], pair=None,
+            logic_hash=None, family_key=None, candidate_dir=None)
 
     def _persist_ledger_in_tx(self, conn, *, ctx, now,
                               mission_outcome: str) -> list[int] | None:
@@ -2565,6 +2558,7 @@ class ImproveLoop:
                           slot_key, approval_payload, now,
                           ledger_entries=(), gate_rows=(), ctx=None,
                           tool_calls: int | None = None,
+                          final_candidate: "_FinalCandidate | None" = None,
                           ) -> _DuplicateDemotion | None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。
 
@@ -2642,7 +2636,7 @@ class ImproveLoop:
                 # payload に入れる (作成後は変えない)。
                 from agentic_fx.store import candidate_archives as archives_store
                 submitted = self._submitted_candidate(
-                    ctx, approval_payload)
+                    approval_payload, final_candidate)
                 candidate_archive_id = self._ensure_final_archive_row(
                     conn, mission_id=mission_id, candidate=submitted,
                     now=now, snapshot=True)
@@ -3093,7 +3087,7 @@ class ImproveLoop:
                     approval_payload=approval_payload, now=now,
                     ledger_entries=tuple(ctx.ledger.entries()),
                     gate_rows=tuple(gate_rows), ctx=ctx,
-                    tool_calls=tool_calls)
+                    tool_calls=tool_calls, final_candidate=final_candidate)
                 if demotion is not None:
                     # CR1 是正: `_finalize_success` が質検査ヒットを検出し
                     # 内側 tx を rollback 済み (何も永続化していない) —
