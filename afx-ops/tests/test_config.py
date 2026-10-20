@@ -479,3 +479,63 @@ key_dir = "/srv/keys"
         read_config("notify")
 
     assert info.value.reason == "config_invalid"
+
+
+_BASE = 'instance_root = "/srv/afx"\nkey_dir = "/srv/keys"\n'
+_BOT = ("guild_id = 12345678901234567\nchannel_id = 12345678901234568\n"
+        "allowlist_user_ids = [12345678901234567]\nmention_user_ids = []\n")
+
+
+def _read_closing(feature: str):
+    config = read_config(feature)
+    os.close(config.config_dir_fd)
+    return config
+
+
+def test_ac23_old_ops_toml_without_the_trade_keys_gets_the_defaults(monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT)
+    config = _read_closing("bot")
+    assert (config.trade_notices, config.trade_amounts) == ("all", "absolute")
+    _write_config(monkeypatch, tmp_path / "n", "notify", _BASE)
+    assert _read_closing("notify").deliver_trade_events is False
+
+
+@pytest.mark.parametrize("notices", ["all", "results", "fills_closes", "off"])
+@pytest.mark.parametrize("amounts", ["absolute", "relative"])
+def test_ac23_bot_reads_trade_notices_and_trade_amounts(monkeypatch, tmp_path, notices, amounts):
+    _write_config(monkeypatch, tmp_path, "bot",
+                  _BASE + _BOT + f'trade_notices = "{notices}"\ntrade_amounts = "{amounts}"\n')
+    config = _read_closing("bot")
+    assert (config.trade_notices, config.trade_amounts) == (notices, amounts)
+
+
+@pytest.mark.parametrize("line", ['trade_notices = "ALL"', 'trade_notices = ""',
+                                  'trade_notices = true', 'trade_notices = 1',
+                                  'trade_notices = ["all"]', 'trade_amounts = "abs"',
+                                  'trade_amounts = 1', 'trade_amounts = false',
+                                  'deliver_trade_events = true'])
+def test_ac23_bot_rejects_invalid_values_and_notify_only_keys(monkeypatch, tmp_path, line):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + line + "\n")
+    with pytest.raises(ConfigError):
+        read_config("bot")
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_ac23_notify_reads_deliver_trade_events(monkeypatch, tmp_path, value, expected):
+    _write_config(monkeypatch, tmp_path, "notify", _BASE + f"deliver_trade_events = {value}\n")
+    assert _read_closing("notify").deliver_trade_events is expected
+
+
+@pytest.mark.parametrize("line", ['deliver_trade_events = "true"', "deliver_trade_events = 1",
+                                  "deliver_trade_events = 0", 'trade_notices = "all"',
+                                  'trade_amounts = "absolute"'])
+def test_ac23_notify_rejects_invalid_values_and_bot_only_keys(monkeypatch, tmp_path, line):
+    _write_config(monkeypatch, tmp_path, "notify", _BASE + line + "\n")
+    with pytest.raises(ConfigError):
+        read_config("notify")
+
+
+def test_ac23_web_rejects_the_trade_keys(monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "web", _BASE + 'port = 8080\ntrade_notices = "all"\n')
+    with pytest.raises(ConfigError):
+        read_config("web")

@@ -97,7 +97,9 @@ def _read_inputs(feature: str) -> tuple[OpsConfig, Mapping[str, bytes]]:
                      port=config.port, guild_id=config.guild_id, channel_id=config.channel_id,
                      allowlist_user_ids=config.allowlist_user_ids,
                      mention_role_id=config.mention_role_id,
-                     mention_user_ids=config.mention_user_ids), secrets
+                     mention_user_ids=config.mention_user_ids,
+                     trade_notices=config.trade_notices, trade_amounts=config.trade_amounts,
+                     deliver_trade_events=config.deliver_trade_events), secrets
 
 
 def main(feature: str) -> int:

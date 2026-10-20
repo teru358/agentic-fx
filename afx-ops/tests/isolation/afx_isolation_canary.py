@@ -688,6 +688,8 @@ def _config(spec: dict) -> OpsConfig:
         # bot の allowlist・mention (ops.toml の読取りは test_config が受け持つ)
         for key, value in spec.get("bot", {}).items():
             extra[key] = tuple(value) if isinstance(value, list) else value
+    elif spec["feature"] == "notify":
+        extra = dict(spec.get("notify", {}))
     # config_fd が真なら production と同じく検査済みの config dir の fd を渡す
     fd = (startup.open_config_dir(root / spec["feature"] / "config") if spec.get("config_fd")
           else None)

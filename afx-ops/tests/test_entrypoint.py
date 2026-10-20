@@ -315,3 +315,36 @@ def test_probe_web_fails_when_the_configured_port_is_taken():
         assert raised.value.reason == "probe_bind_failed"
     finally:
         holder.close()
+
+
+@pytest.mark.parametrize(("feature", "extra", "expected"), [
+    ("bot", 'trade_notices = "fills_closes"\ntrade_amounts = "relative"\n',
+     {"trade_notices": "fills_closes", "trade_amounts": "relative"}),
+    ("notify", "deliver_trade_events = true\n", {"deliver_trade_events": True}),
+])
+def test_ac24_trade_settings_are_read_before_isolation_and_handed_to_the_run(
+        feature, extra, expected, home, monkeypatch):
+    path = _write_config(home, feature)
+    path.write_text(path.read_text(encoding="utf-8") + extra, encoding="utf-8")
+    seen = []
+    monkeypatch.setattr(cli.startup, "run",
+                        lambda plan, config, body, **kwargs: seen.append(config) or 0)
+
+    assert cli.main([feature]) == 0
+
+    try:
+        for key, value in expected.items():
+            assert getattr(seen[0], key) == value
+    finally:
+        os.close(seen[0].config_dir_fd)
+
+
+def test_ac24_isolated_runtimes_do_not_read_the_config_again():
+    import inspect
+
+    from afx_ops.bot import adapter, runtime as bot_runtime
+    from afx_ops.notify import runtime as notify_runtime
+
+    for module in (adapter, bot_runtime, notify_runtime):
+        source = inspect.getsource(module)
+        assert "read_config" not in source and "ops.toml" not in source

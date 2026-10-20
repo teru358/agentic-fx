@@ -9,6 +9,8 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
+from afx_ops import trade_events
+
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9_.:+\-]{0,64}\Z")
 _TIMESTAMP = re.compile(r"[A-Za-z0-9_.:+\-]{1,64}\Z")
 
@@ -19,6 +21,8 @@ ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
+    trade_events.ORDER_CODE: trade_events.ORDER_FIELDS,
+    trade_events.CLOSE_CODE: trade_events.CLOSE_FIELDS,
 })
 # 外へ出さない field。event にあっても無くてもよい
 _OPTIONAL_FIELDS = frozenset({"decided_by"})
@@ -29,6 +33,8 @@ _REF = MappingProxyType({
     "guard_state_changed": re.compile(r"instance\Z"),
     "service_health_changed": re.compile(r"instance\Z"),
     "event_stream_health": re.compile(r"instance\Z"),
+    trade_events.ORDER_CODE: trade_events.REF_PATTERN,
+    trade_events.CLOSE_CODE: trade_events.REF_PATTERN,
 })
 
 
@@ -51,6 +57,14 @@ def _fields_match(code: str, fields: dict) -> bool:
     return allowed - _OPTIONAL_FIELDS <= set(fields) <= allowed
 
 
+def _event_valid(code: str, ref: str, fields: dict) -> bool:
+    if code in trade_events.TRADE_CODES:
+        # 取引 event は field ごとの grammar と canonical で見る。範囲は ref も整数で確かめる
+        return trade_events.valid_ref(ref) and trade_events.valid_fields(code, fields)
+    return (_fields_match(code, fields)
+            and all(_safe_value(value) for value in fields.values()))
+
+
 def encode_event(event: object) -> dict[str, object]:
     """event を webhook 用の object にする。任意 text と未知 field は渡さない。"""
     if type(event) is not dict or set(event) != {"id", "ts", "code", "ref", "fields"}:
@@ -61,8 +75,7 @@ def encode_event(event: object) -> dict[str, object]:
             or _TIMESTAMP.fullmatch(ts) is None or type(code) is not str
             or code not in ALLOWED_FIELDS or type(ref) is not str
             or _REF[code].fullmatch(ref) is None or type(fields) is not dict
-            or not _fields_match(code, fields) or not all(_safe_value(value)
-                                                               for value in fields.values())):
+            or not _event_valid(code, ref, fields)):
         raise PayloadError()
     payload: dict[str, object] = {"event_id": event_id, "ts": ts, "code": code, "ref": ref}
     payload.update({key: value for key, value in fields.items() if key not in _OPTIONAL_FIELDS})
