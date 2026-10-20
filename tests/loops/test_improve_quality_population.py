@@ -229,13 +229,19 @@ def test_ac20_iii_a_rejected_family_is_not_detected(conn):
     _row(conn, mission_id=1, name="rejected_one", logic_hash="v1:" + "a" * 64,
          outcome="rejected_by_human", family_key=_family_of(RSI_A))
     archive = quality.load_archive(conn, mission_id=2)
+    assert archive.entries[0].family_key == _family_of(RSI_A)
     assert quality.find_same_family(
         name="new", kind="strategy", family_key=_family_of(RSI_B),
         deployed=quality.Population()) is None
-    # 台帳の行を deployed 側へ渡しても、source が deployed でなければ数えない
+    # 台帳由来の行は kind と族が一致していても、source が deployed でなければ
+    # 配備済みの族として数えない
+    same_kind = quality.Population(entries=[
+        quality.IdentityEntry(
+            "archive", "rejected_one", "strategy", "v1:" + "a" * 64,
+            _family_of(RSI_A), "rejected_by_human")])
     assert quality.find_same_family(
         name="new", kind="strategy", family_key=_family_of(RSI_B),
-        deployed=archive) is None
+        deployed=same_kind) is None
 
 
 def test_ac11_family_is_compared_within_the_same_kind_only():

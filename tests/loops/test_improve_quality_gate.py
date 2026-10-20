@@ -749,3 +749,112 @@ def test_a_file_population_read_failure_is_gate_failed_and_reported(
     assert _last_result(conn) == f"observation:{NOTICE}"
     log = _activity(root)
     assert "quality_check_unavailable" in log and "PermissionError" in log
+
+
+# --- 実配線 (母集団・identity・検出属性を差し替えずに通す) --------------------
+
+def test_family_detection_runs_through_the_real_population_and_settle(
+        improve_env):
+    """配備済み plugin を実ファイルで置き、`phase1_metas` → 母集団 →
+    `identity_of_dir` → `settle(add_flags)` を差し替えずに通す。構造の違う
+    候補が同じ仮説族として検出属性を持って提出される。"""
+    from tests.fixtures import indicator_wiring as fx
+    from agentic_fx.plugin.logic_identity import family_key_of
+    app, root = improve_env
+    conn = app.conn_core
+    plugins_root = root / "plugins"
+    fx.write_indicator(plugins_root, "rsi")
+    pin = fx.deploy_approved(conn, plugins_root, ["rsi"], now=NOW)["rsi"]
+    config = (_PASSING_STRATEGY_CONFIG
+              + f"indicators:\n  rsi:\n    plugin: rsi\n"
+                f"    params: {{period: 14}}\n    pin: {pin}\n")
+    alpha = plugins_root / "alpha"
+    alpha.mkdir(parents=True)
+    (alpha / "plugin.py").write_text(PY_Y)
+    (alpha / "config.yaml").write_text(config)
+    (alpha / "test_plugin.py").write_text(_PASSING_STRATEGY_TEST)
+    fx.deploy_approved(conn, plugins_root, ["alpha"], now=NOW)
+    output = _artifact("cand")
+    loop, ctx, seeded = _run(
+        app, root, output, files=("cand", PY_X, config,
+                                  _PASSING_STRATEGY_TEST),
+        in_sample=_fake_in_sample_full_metrics(METRICS_1),
+        holdout_fn=_fake_holdout_full_metrics(HOLDOUT), seed=False)
+    row = _expect_rows(conn, ctx, seeded, "pending")
+    assert row["quality_flags"] == ["family_detected"]
+    assert row["family_key"] == family_key_of(config, name="cand")
+    assert row["family_key"] == "strategy:rsi@1h@USDJPY"
+    assert _payload(conn)["candidate_archive_id"] == row["id"]
+
+
+def test_concurrent_same_logic_candidates_only_one_reaches_approval(
+        improve_env):
+    """別 slot (別スレッド・別接続) で、成績が違うので段 M には掛からないが
+    ロジックは同じ 2 本が同時に最終化されても、先に書き込みロックを取った
+    側の pending 行を後の側が読み、後の側は duplicate_logic になる。段 L が
+    書き込みロックの外で行われると 2 本とも通る。"""
+    import threading
+    from agentic_fx.runners.base import MissionResult
+    from tests.loops.test_improve_e2e import (
+        FakeImproveWorkerRunner, _write_staging_plugin)
+    from tests.loops.test_improve_loop_duplicate_metrics import _make_loop
+
+    app, root = improve_env
+    conn = app.conn_core
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    names = ("race_a", "race_b")
+    metrics = {"race_a": METRICS_1, "race_b": METRICS_2}
+    results = {
+        name: MissionResult(status="completed", output=_artifact(name),
+                            transcript=[])
+        for name in names}
+
+    def runner_factory(**kw):
+        return FakeImproveWorkerRunner(
+            result=results[threading.current_thread().name], **kw)
+
+    def in_sample(settings, *, history_conn, record_fn, **kwargs):
+        return _fake_in_sample_full_metrics(
+            metrics[threading.current_thread().name])(
+                settings, history_conn=history_conn, record_fn=record_fn,
+                **kwargs)
+
+    original = ImproveLoop._finalize_success
+
+    def synced(self, *a, **kw):
+        barrier.wait(timeout=10)
+        return original(self, *a, **kw)
+
+    def work(name):
+        try:
+            loop = _make_loop(app, root)
+            mission, ctx, worker = loop.prepare(slot_key=None, now=NOW)
+            _write_staging_plugin(
+                ctx.staging_dir, name, PY_X, _PASSING_STRATEGY_CONFIG,
+                _PASSING_STRATEGY_TEST)
+            loop.commit(mission=mission, ctx=ctx, result=worker.run(mission),
+                        now=NOW)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=work, args=(n,), name=n)
+               for n in names]
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               runner_factory), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_in_sample",
+               in_sample), \
+         patch("agentic_fx.loops.improve_loop.holdout.run_holdout_gate",
+               _fake_holdout_full_metrics(HOLDOUT)), \
+         patch.object(ImproveLoop, "_finalize_success", synced):
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    assert errors == [], f"thread(s) raised: {errors!r}"
+    assert _approval_count(conn) == 1
+    outcomes = sorted(r[0] for r in conn.execute(
+        "SELECT outcome_class FROM candidate_archives "
+        "WHERE name IN ('race_a', 'race_b') AND outcome_class != "
+        "'not_submitted'"))
+    assert outcomes == ["duplicate_logic", "pending"]

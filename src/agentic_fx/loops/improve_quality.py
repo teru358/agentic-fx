@@ -232,7 +232,7 @@ def find_same_family(*, name: str, kind: str | None, family_key: str | None,
     if family_key is None:
         return None
     for entry in deployed.entries:
-        if (entry.kind == kind and entry.name != name
-                and entry.family_key == family_key):
+        if (entry.source == "deployed" and entry.kind == kind
+                and entry.name != name and entry.family_key == family_key):
             return entry
     return None
