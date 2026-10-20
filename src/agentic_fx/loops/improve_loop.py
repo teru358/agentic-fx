@@ -2191,6 +2191,33 @@ class ImproveLoop:
         _fsync_dir(archive_tmp.parent)
 
     @staticmethod
+    def _publish_dir_noreplace(src: Path, dst: Path) -> None:
+        """`renameat2(RENAME_NOREPLACE)` で src を dst へ原子的に公開する。
+        dst に何かがあれば (空 dir・ファイル・symlink・非空 dir のいずれも)
+        `FileExistsError`。renameat2 が使えない環境は `OSError(ENOSYS)` で
+        失敗させ、置換する rename へは落とさない。"""
+        if not sys.platform.startswith("linux"):
+            raise OSError(errno.ENOSYS, "renameat2_unavailable", str(dst))
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError:
+            raise OSError(errno.ENOSYS, "renameat2_unavailable",
+                          str(dst)) from None
+        renameat2.restype = ctypes.c_long
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                              ctypes.c_char_p, ctypes.c_uint]
+        ctypes.set_errno(0)
+        rc = renameat2(_AT_FDCWD, os.fsencode(str(src)), _AT_FDCWD,
+                       os.fsencode(str(dst)), _RENAME_NOREPLACE)
+        if rc == 0:
+            return
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise FileExistsError(err, os.strerror(err), str(dst))
+        raise OSError(err, os.strerror(err), str(dst))
+
+    @staticmethod
     def _verify_archive_dir(path: Path, artifact_hash: str) -> None:
         """公開済みの archive が通常のディレクトリで、3 ファイルから再計算した
         artifact_hash が一致することを確かめる。外れたら ValueError / OSError。"""
@@ -2253,16 +2280,10 @@ class ImproveLoop:
             published = False
             if tmp_path.exists():
                 final_path.parent.mkdir(parents=True, exist_ok=True)
-                # sonnet 3 周目 Minor (2026-09-11): os.rename は宛先が
-                # 既存の空ディレクトリだと例外なしで成功し (先着を消費して
-                # 置換してしまう)、EEXIST/ENOTEMPTY 経路の先着扱い
-                # (hash 再検証) をバイパスする。rename 直前に final_path を
-                # mkdir して既存判定を正規化する: FileExistsError なら
-                # 既存扱い (tmp 削除 → 下の hash 再検証へ)。mkdir が成功
-                # したら自分が作った空 dir を rmdir してから rename する
-                # (空 dir を残したまま rename すると同じ問題が再現する)。
                 try:
-                    final_path.mkdir()
+                    self._publish_dir_noreplace(tmp_path, final_path)
+                    _fsync_dir(final_path.parent)
+                    published = True
                 except FileExistsError:
                     self._remove_archive_tmp(tmp_path)
                 except OSError as exc:
@@ -2271,22 +2292,6 @@ class ImproveLoop:
                         artifact_hash=artifact_hash,
                         reason=f"{type(exc).__name__}:{str(exc)[:300]}")
                     continue
-                else:
-                    final_path.rmdir()
-                    try:
-                        os.rename(tmp_path, final_path)
-                        _fsync_dir(final_path.parent)
-                        published = True
-                    except OSError as exc:
-                        if isinstance(exc, FileExistsError) or exc.errno in (
-                                errno.EEXIST, errno.ENOTEMPTY):
-                            self._remove_archive_tmp(tmp_path)
-                        else:
-                            self._archive_failed(
-                                mission_id=ctx.mission_id,
-                                artifact_hash=artifact_hash,
-                                reason=f"{type(exc).__name__}:{str(exc)[:300]}")
-                            continue
             if not published:
                 try:
                     self._verify_archive_dir(final_path, artifact_hash)
@@ -2375,14 +2380,26 @@ class ImproveLoop:
                     "pair": candidate.pair, "metrics": {},
                     "created_at": now.isoformat(),
                 })
-            try:
-                os.rename(archive_tmp, final_path)
-            except OSError:
-                # 別の実行者が先に同じ宛先を作った。自分の tmp は捨て、
-                # 先着の中身が正しければそれを再利用する (所有はしない)。
-                self._remove_archive_tmp(archive_tmp)
-                self._verify_archive_dir(final_path, candidate.artifact_hash)
-                return relative, False
+            for attempt in (1, 2):
+                try:
+                    self._publish_dir_noreplace(archive_tmp, final_path)
+                    break
+                except FileExistsError:
+                    # 別の実行者が先に宛先へ何かを置いた。正当な archive なら
+                    # 自分の tmp は捨てて再利用する (所有はしない)。壊れた
+                    # 先着は退避して、もう一度だけ公開を試みる。
+                    try:
+                        self._verify_archive_dir(
+                            final_path, candidate.artifact_hash)
+                    except (OSError, ValueError):
+                        if attempt == 2:
+                            raise
+                        os.rename(final_path, final_path.parent / (
+                            f".stale-{candidate.artifact_hash}-"
+                            f"{uuid.uuid4()}"))
+                        continue
+                    self._remove_archive_tmp(archive_tmp)
+                    return relative, False
             _fsync_dir(final_path.parent)
         except Exception as exc:
             if archive_tmp.exists():

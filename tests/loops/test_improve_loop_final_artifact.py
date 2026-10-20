@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from agentic_fx.loops.improve_loop import ImproveLoop
 
 from tests.loops.test_improve_candidate_ledger import (
@@ -305,34 +307,124 @@ def test_orphan_cleanup_refuses_paths_outside_the_archive_root(
     assert link.is_symlink()
 
 
+def _race_before_publish(final_path, make):
+    """公開 helper の最初の呼び出しの直前に、別の実行者が宛先へ `make` を行う。"""
+    real = ImproveLoop._publish_dir_noreplace
+    ran = []
+
+    def racing(src, dst):
+        if str(dst) == str(final_path) and not ran:
+            ran.append(True)
+            make(src, dst)
+        return real(src, dst)
+
+    return racing, ran
+
+
 def test_snapshot_does_not_claim_a_dir_a_racer_published_before_the_rename(
         improve_env, tmp_path):
-    """最後の rename の直前に別の実行者が同じ宛先へ正当な archive を作ると、
+    """公開の直前に別の実行者が同じ宛先へ正当な archive を作ると、
     呼び出しは作成者として扱われず、降格時の削除で他者の dir が残る。"""
-    import os
     import shutil
     from tests.loops.test_improve_e2e import NOW
     loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
-    real_rename = os.rename
-    racer_ran = []
-
-    def racing_rename(src, dst, *args, **kwargs):
-        if (str(dst) == str(final_path) and not racer_ran
-                and os.path.basename(str(src)).startswith(".tmp-")):
-            racer_ran.append(True)
-            shutil.copytree(src, dst)
-        return real_rename(src, dst, *args, **kwargs)
-
-    with patch("agentic_fx.loops.improve_loop.os.rename", racing_rename):
+    racing, ran = _race_before_publish(
+        final_path, lambda src, dst: shutil.copytree(src, dst))
+    with patch.object(ImproveLoop, "_publish_dir_noreplace",
+                      staticmethod(racing)):
         relative, created = loop._snapshot_final_archive(
             candidate, mission_id=7, now=NOW)
-    assert racer_ran == [True]
+    assert ran == [True]
     assert relative is not None and created is False
     assert _verified(final_path, candidate.artifact_hash)
     loop._remove_created_archive(relative if created else None)
     assert final_path.is_dir()
     assert not [p for p in final_path.parent.iterdir()
                 if p.name.startswith(".tmp-")]
+
+
+def test_snapshot_does_not_replace_an_empty_dir_a_racer_placed(
+        improve_env, tmp_path):
+    """宛先に他者の空 dir があっても rename で置換せず、壊れた先着として
+    退避してから作り直す。退避した空 dir は残る。"""
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    racing, ran = _race_before_publish(
+        final_path, lambda src, dst: dst.mkdir())
+    with patch.object(ImproveLoop, "_publish_dir_noreplace",
+                      staticmethod(racing)):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert ran == [True]
+    assert relative is not None and created is True
+    assert _verified(final_path, candidate.artifact_hash)
+    stale = [p for p in final_path.parent.iterdir()
+             if p.name.startswith(".stale-")]
+    assert len(stale) == 1 and stale[0].is_dir()
+    assert list(stale[0].iterdir()) == []
+    assert not [p for p in final_path.parent.iterdir()
+                if p.name.startswith(".tmp-")]
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink"])
+def test_snapshot_moves_aside_a_file_or_symlink_a_racer_placed(
+        improve_env, tmp_path, kind):
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+
+    def make(src, dst):
+        if kind == "file":
+            dst.write_text("junk")
+        else:
+            dst.symlink_to(outside)
+
+    racing, ran = _race_before_publish(final_path, make)
+    with patch.object(ImproveLoop, "_publish_dir_noreplace",
+                      staticmethod(racing)):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert ran == [True]
+    assert relative is not None and created is True
+    assert _verified(final_path, candidate.artifact_hash)
+    assert (outside / "keep").read_text() == "x"
+    stale = [p for p in final_path.parent.iterdir()
+             if p.name.startswith(".stale-")]
+    assert len(stale) == 1
+
+
+def test_snapshot_fails_closed_when_renameat2_is_unavailable(
+        improve_env, tmp_path):
+    from tests.loops.test_improve_e2e import NOW
+
+    class _NoRenameat2:
+        def __init__(self, *a, **k):
+            pass
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    with patch("agentic_fx.loops.improve_loop.ctypes.CDLL", _NoRenameat2):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert (relative, created) == (None, False)
+    assert not final_path.exists()
+    assert not [p for p in final_path.parent.iterdir()
+                if p.name.startswith(".tmp-")]
+
+
+def test_publish_archives_goes_through_the_noreplace_helper(
+        improve_env, tmp_path):
+    import inspect
+    src = inspect.getsource(ImproveLoop._publish_archives)
+    assert "_publish_dir_noreplace" in src
+    assert "os.rename" not in src
+    src = inspect.getsource(ImproveLoop._snapshot_final_archive)
+    assert "_publish_dir_noreplace" in src
+    assert "os.rename(archive_tmp" not in src
 
 
 def test_snapshot_reports_creation_when_nobody_else_published(
