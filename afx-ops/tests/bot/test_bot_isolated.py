@@ -481,7 +481,8 @@ def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash
     assert got.rc == 86, got.stderr[-2000:]
     assert len(fake.channel_posts(CHANNEL)) == 1
     snap = _snapshot(root)
-    assert (snap["cursor"], snap["high_watermark"]) == (0, 1)
+    # watermark は cursor と同じ置換で確定するので、確定前に止まれば両方とも動かない
+    assert (snap["cursor"], snap["high_watermark"]) == (0, 0)
     # 投稿の後・cursor の確定の前に止まった event は、再起動後にもう一度投稿する (at-least-once)
     daemon.set(approvals=_pending(7))
     bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon)

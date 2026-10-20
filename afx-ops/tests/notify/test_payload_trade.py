@@ -120,7 +120,7 @@ def test_ac21_a_value_over_64_chars_is_rejected():
     with pytest.raises(PayloadError):
         encode_event(_order(origin_code="signal:" + "a" * 64))
     with pytest.raises(PayloadError):
-        encode_event(_order(reason_code="a" * 33))
+        encode_event(_order(state="cancelled", reason_code="a" * 33))
 
 
 @pytest.mark.parametrize("origin", ["@everyone", "<@123>", "signal:RSI", "signal:", "cron ",
@@ -144,11 +144,12 @@ def test_ac22_origin_code_with_cron_and_a_plugin_name_pass():
     ("reason_code", "Llm Cancel"), ("reason_code", "<@1>")])
 def test_ac21_values_outside_the_enumerations_or_safe_forms_are_rejected(name, value):
     with pytest.raises(PayloadError):
-        encode_event(_order(**{name: value}))
+        encode_event(_order(**{"state": "cancelled", **{name: value}}))
 
 
 def test_ac21_an_unknown_reason_code_in_the_safe_form_is_carried_through():
-    assert encode_event(_order(reason_code="brand_new"))["reason_code"] == "brand_new"
+    assert (encode_event(_order(state="cancelled", reason_code="brand_new"))["reason_code"]
+            == "brand_new")
     assert encode_event(_close(reason_code="brand_new"))["reason_code"] == "brand_new"
 
 
@@ -209,3 +210,15 @@ def test_ac3_a_value_that_formats_to_zero_is_not_accepted():
     assert _producer_price(4e-9) == "0"
     with pytest.raises(PayloadError):
         encode_event(_order(price="0"))
+
+
+@pytest.mark.parametrize("state", ["placed", "filled", "rejected", "expired"])
+def test_ac21_an_order_reason_code_is_accepted_only_for_a_cancelled_order(state):
+    assert encode_event(_order(state=state))["reason_code"] is None
+    with pytest.raises(PayloadError):
+        encode_event(_order(state=state, reason_code="llm_cancel"))
+
+
+def test_ac21_a_cancelled_order_carries_a_safe_reason_or_none():
+    assert encode_event(_order(state="cancelled", reason_code=None))["reason_code"] is None
+    assert encode_event(_order(state="cancelled", reason_code="llm_cancel"))["reason_code"] == "llm_cancel"

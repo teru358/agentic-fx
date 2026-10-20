@@ -664,9 +664,8 @@ class BotAdapter:
                 print(f"afx-ops bot: {unreadable_notice(events, unreadable)}", file=sys.stderr)
             await self._run(self._initialize_cursor, high)
             return
-        if high > self.gate.state.high_watermark:
-            # event を投稿しない周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
-            await self._run(self._observe_high, high)
+        # 新しい watermark は最初の確定 (投稿・既知の skip) と同じ置換で保存する
+        progressed = False
         for event in events:
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
@@ -682,6 +681,7 @@ class BotAdapter:
             if isinstance(plan, SkipKnown):
                 # 設定で出さない既知の event は、投稿せずに cursor と high watermark を進める
                 await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
+                progressed = True
                 continue
             content = " ".join((*plan.mentions, plan.content))
             allowed = (self._allowed_mentions() if plan.allow_mentions
@@ -692,11 +692,15 @@ class BotAdapter:
                 # 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
                 return
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
+            progressed = True
             approval_id = _approval_id_of(event)
             if approval_id is not None:
                 await self._settle(approval_id)
         if unreadable:
             raise BotFailure("payload_invalid")
+        if not progressed and high > self.gate.state.high_watermark:
+            # 確定する event が無い周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
+            await self._run(self._observe_high, high)
 
     def _initialize_cursor(self, high: int) -> None:
         try:

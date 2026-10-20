@@ -152,5 +152,8 @@ def valid_ref(ref: object) -> bool:
 def valid_fields(code: str, fields: object) -> bool:
     """field 集合の完全一致と、各値の grammar・範囲・canonical を全て満たすか。"""
     checks = FIELD_CHECKS[code]
-    return (type(fields) is dict and set(fields) == set(checks)
-            and all(check(fields[name]) for name, check in checks.items()))
+    if not (type(fields) is dict and set(fields) == set(checks)
+            and all(check(fields[name]) for name, check in checks.items())):
+        return False
+    # 注文の reason_code は取消のときだけ安全語を持てる。他の状態では必ず None
+    return code != ORDER_CODE or fields["state"] == "cancelled" or fields["reason_code"] is None

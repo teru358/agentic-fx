@@ -183,6 +183,32 @@ def test_ac23_skip_known_advances_cursor_and_high_watermark_in_one_save(make_bot
     assert (bot.state().cursor, bot.state().high_watermark) == (2, 9)
 
 
+def test_a_posted_event_page_saves_once_with_cursor_and_high_together(make_bot, monkeypatch):
+    bot = make_bot(_page([_order(1, "placed")], high=9))
+    saves: list[tuple[int, int]] = []
+    from afx_ops.gate import state as gate_state
+    real = gate_state.save
+
+    def spy(fd, state):
+        saves.append((state.cursor, state.high_watermark))
+        real(fd, state)
+
+    monkeypatch.setattr(gate_state, "save", spy)
+
+    bot.poll()
+
+    assert len(bot.texts) == 1
+    assert saves == [(1, 9)]
+
+
+def test_a_page_without_new_events_still_records_the_high_watermark(make_bot):
+    bot = make_bot(_page([], high=9))
+
+    bot.poll()
+
+    assert (bot.state().cursor, bot.state().high_watermark) == (0, 9)
+
+
 def test_ac23_a_skipped_event_does_not_block_the_posts_after_it(make_bot):
     bot = make_bot(_page([_order(1, "placed"), _health(2), _order(3, "expired"), _health(4)]),
                    trade_notices="off")
