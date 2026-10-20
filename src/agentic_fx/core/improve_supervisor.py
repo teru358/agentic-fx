@@ -134,14 +134,22 @@ class ImproveSupervisor:
                 _log.exception("on_prepared callback failed")
         # runner.run() 自体が例外を投げる窓: 補償しないと mission / run が
         # 非終端のまま残るため、定期 slot と同じく補償してから re-raise する。
+        # shutdown 系 (KeyboardInterrupt / SystemExit) では補償を新しく始めない。
+        # 補償自身が失敗しても、呼び出し元には元の例外を見せる (補償の失敗は
+        # log に残す)。
         try:
             result = runner.run(mission)
-        except BaseException:
+        except Exception:
             _log.exception(
                 "improve runner.run raised for manual mission_id=%s — "
                 "compensating", ctx.mission_id)
-            self._improve_loop.compensate_launch_failure(
-                ctx=ctx, now=self._clock.now())
+            try:
+                self._improve_loop.compensate_launch_failure(
+                    ctx=ctx, now=self._clock.now())
+            except Exception:
+                _log.exception(
+                    "launch compensation failed for manual mission_id=%s",
+                    ctx.mission_id)
             raise
         try:
             self._improve_loop.commit(
@@ -150,9 +158,14 @@ class ImproveSupervisor:
             _log.exception(
                 "improve commit raised for manual mission_id=%s — "
                 "compensating", ctx.mission_id)
-            self._improve_loop.compensate_commit_failure(
-                ctx=ctx, now=self._clock.now(), exc=exc,
-                slot_terminalize=True)
+            try:
+                self._improve_loop.compensate_commit_failure(
+                    ctx=ctx, now=self._clock.now(), exc=exc,
+                    slot_terminalize=True)
+            except Exception:
+                _log.exception(
+                    "commit compensation failed for manual mission_id=%s",
+                    ctx.mission_id)
             raise
         return ctx.mission_id
 
