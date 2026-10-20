@@ -131,7 +131,8 @@ def test_snapshot_builds_a_fresh_archive_over_an_incomplete_same_name_dir(
     loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
     final_path.mkdir(parents=True)
     (final_path / "plugin.py").write_text("partial\n")
-    relative = loop._snapshot_final_archive(candidate, mission_id=7, now=NOW)
+    relative, _ = loop._snapshot_final_archive(
+        candidate, mission_id=7, now=NOW)
     assert relative is not None
     assert _verified(final_path, candidate.artifact_hash)
     stale = [p for p in final_path.parent.iterdir()
@@ -146,7 +147,8 @@ def test_snapshot_builds_a_fresh_archive_over_a_different_content_dir(
     final_path.mkdir(parents=True)
     for name in ("plugin.py", "config.yaml", "test_plugin.py"):
         (final_path / name).write_text("other\n")
-    relative = loop._snapshot_final_archive(candidate, mission_id=7, now=NOW)
+    relative, _ = loop._snapshot_final_archive(
+        candidate, mission_id=7, now=NOW)
     assert relative is not None
     assert _verified(final_path, candidate.artifact_hash)
     assert (final_path / "meta.json").is_file()
@@ -156,10 +158,11 @@ def test_snapshot_reuses_a_valid_same_name_dir(improve_env, tmp_path):
     from tests.loops.test_improve_e2e import NOW
     loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
     assert loop._snapshot_final_archive(
-        candidate, mission_id=7, now=NOW) is not None
+        candidate, mission_id=7, now=NOW) == (
+            final_path.relative_to(loop._root).as_posix(), True)
     inode = final_path.stat().st_ino
     assert loop._snapshot_final_archive(
-        candidate, mission_id=7, now=NOW) is not None
+        candidate, mission_id=7, now=NOW)[1] is False
     assert final_path.stat().st_ino == inode
     assert not [p for p in final_path.parent.iterdir()
                 if p.name.startswith(".stale-")]
@@ -271,7 +274,7 @@ def test_rollback_keeps_an_archive_dir_that_already_existed(improve_env):
             directory, name="cand", content_hash=content_hash,
             artifact_hash=artifact_hash)
         assert loop._snapshot_final_archive(
-            candidate, mission_id=ctx.mission_id, now=NOW) is not None
+            candidate, mission_id=ctx.mission_id, now=NOW)[0] is not None
         pre.append(artifact_hash)
 
     loop, ctx, seeded = _run(
@@ -300,3 +303,42 @@ def test_orphan_cleanup_refuses_paths_outside_the_archive_root(
     loop._remove_created_archive("plugins/_archive/9/h")
     assert (outside / "keep").exists()
     assert link.is_symlink()
+
+
+def test_snapshot_does_not_claim_a_dir_a_racer_published_before_the_rename(
+        improve_env, tmp_path):
+    """最後の rename の直前に別の実行者が同じ宛先へ正当な archive を作ると、
+    呼び出しは作成者として扱われず、降格時の削除で他者の dir が残る。"""
+    import os
+    import shutil
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    real_rename = os.rename
+    racer_ran = []
+
+    def racing_rename(src, dst, *args, **kwargs):
+        if (str(dst) == str(final_path) and not racer_ran
+                and os.path.basename(str(src)).startswith(".tmp-")):
+            racer_ran.append(True)
+            shutil.copytree(src, dst)
+        return real_rename(src, dst, *args, **kwargs)
+
+    with patch("agentic_fx.loops.improve_loop.os.rename", racing_rename):
+        relative, created = loop._snapshot_final_archive(
+            candidate, mission_id=7, now=NOW)
+    assert racer_ran == [True]
+    assert relative is not None and created is False
+    assert _verified(final_path, candidate.artifact_hash)
+    loop._remove_created_archive(relative if created else None)
+    assert final_path.is_dir()
+    assert not [p for p in final_path.parent.iterdir()
+                if p.name.startswith(".tmp-")]
+
+
+def test_snapshot_reports_creation_when_nobody_else_published(
+        improve_env, tmp_path):
+    from tests.loops.test_improve_e2e import NOW
+    loop, candidate, final_path = _snapshot_setup(improve_env, tmp_path)
+    relative, created = loop._snapshot_final_archive(
+        candidate, mission_id=7, now=NOW)
+    assert created is True and relative is not None

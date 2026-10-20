@@ -2331,11 +2331,14 @@ class ImproveLoop:
             candidate_dir=candidate_dir)
 
     def _snapshot_final_archive(self, candidate: _FinalCandidate, *,
-                                mission_id: int, now) -> str | None:
+                                mission_id: int,
+                                now) -> "tuple[str | None, bool]":
         """run_backtest と同じ手順 (tmp に書いて rename) で、staging の最終
-        bytes から archive を作る。作れなければ None (activity に残す)。
+        bytes から archive を作る。戻り値は (相対パス, この呼び出しが作ったか)。
+        作れなければ (None, False) で activity に残す。作成の事実は最後の
+        rename が成功したかどうかだけで決め、事前の存在確認には頼らない。
         書き込み tx の外で呼ぶ。呼び出し側が、後で降格・rollback したときに
-        新規作成した dir を `_remove_created_archive` で消す。
+        作成した dir だけを `_remove_created_archive` で消す。
         同名の dir が既にあるときは中身の hash を再計算し、一致するものだけを
         採用する。一致しないものは `.stale-*` に退避して作り直す。"""
         from agentic_fx.plugin.version_store import (
@@ -2359,7 +2362,7 @@ class ImproveLoop:
             if os.path.lexists(final_path):
                 try:
                     self._verify_archive_dir(final_path, candidate.artifact_hash)
-                    return relative
+                    return relative, False
                 except (OSError, ValueError):
                     os.rename(final_path, final_path.parent / (
                         f".stale-{candidate.artifact_hash}-{uuid.uuid4()}"))
@@ -2372,7 +2375,14 @@ class ImproveLoop:
                     "pair": candidate.pair, "metrics": {},
                     "created_at": now.isoformat(),
                 })
-            os.rename(archive_tmp, final_path)
+            try:
+                os.rename(archive_tmp, final_path)
+            except OSError:
+                # 別の実行者が先に同じ宛先を作った。自分の tmp は捨て、
+                # 先着の中身が正しければそれを再利用する (所有はしない)。
+                self._remove_archive_tmp(archive_tmp)
+                self._verify_archive_dir(final_path, candidate.artifact_hash)
+                return relative, False
             _fsync_dir(final_path.parent)
         except Exception as exc:
             if archive_tmp.exists():
@@ -2380,8 +2390,8 @@ class ImproveLoop:
             self._archive_failed(
                 mission_id=mission_id, artifact_hash=candidate.artifact_hash,
                 reason=f"{type(exc).__name__}:{str(exc)[:300]}")
-            return None
-        return relative
+            return None, False
+        return relative, True
 
     def _final_archive_row_exists(self, conn, *, mission_id: int,
                                   artifact_hash: str) -> bool:
@@ -2648,12 +2658,9 @@ class ImproveLoop:
             if not self._final_archive_row_exists(
                     conn, mission_id=mission_id,
                     artifact_hash=submitted.artifact_hash):
-                existed = os.path.lexists(
-                    self._root / "plugins" / "_archive" / str(mission_id)
-                    / submitted.artifact_hash)
-                submitted_archive_path = self._snapshot_final_archive(
+                submitted_archive_path, created = self._snapshot_final_archive(
                     submitted, mission_id=mission_id, now=now)
-                if submitted_archive_path is not None and not existed:
+                if submitted_archive_path is not None and created:
                     created_archive_path = submitted_archive_path
             try:
                 conn.execute("BEGIN IMMEDIATE")
