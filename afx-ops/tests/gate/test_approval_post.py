@@ -482,3 +482,59 @@ def test_the_final_hard_cap_cuts_even_when_only_undroppable_paragraphs_remain(mo
     text = render_approval(_record(), _detail())
     assert len(text) == 40
     assert len(render_terminal(_record(state="done"), _terminal("approved"))) == 40
+
+
+@pytest.mark.parametrize("bad", [["x"], {"a": 1}, 7, None])
+def test_render_terminal_with_a_non_str_state_gives_none_instead_of_raising(bad):
+    assert render_terminal(_record(), _detail(status=bad)) is None
+
+
+@pytest.mark.parametrize("bad", [["x"], {"a": 1}, 7])
+def test_render_terminal_with_a_non_str_decided_at_omits_the_time(bad):
+    rendered = render_terminal(_record(), _detail(status="approved", decided_at=bad))
+    assert "状態: 承認済み" in rendered and "状態: 承認済み (" not in rendered
+
+
+@pytest.mark.parametrize("field", ["reason", "kind", "classification"])
+@pytest.mark.parametrize("bad", [["x"], {"a": 1}])
+def test_render_approval_with_a_non_str_reason_kind_or_classification_gives_the_two_line_fallback(
+        field, bad):
+    content = render_approval(_record(), _detail(_change(**{field: bad})))
+    assert content == "承認 #7\n" + REASON_TEXT["legacy_payload"]
+
+
+@pytest.mark.parametrize("value", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"])
+def test_a_time_that_overflows_utc_conversion_is_shown_as_absent(value):
+    assert "期限: なし" in render_approval(_record(), _detail(expires_at=value))
+    terminal = render_terminal(_record(), _detail(status="approved", decided_at=value))
+    assert "状態: 承認済み" in terminal and "(" not in terminal.split("\n\n")[1]
+
+
+def test_when_only_unremovable_paragraphs_remain_the_cut_cuts_the_heading_and_keeps_the_guide(
+        monkeypatch):
+    name = "a_" * 31 + "b"
+    for limit in range(120, 175):
+        monkeypatch.setattr(render, "BODY_CHARS", limit)
+        content = render_approval(_record(), _detail(_change(name=name)))
+        assert len(content) <= limit
+        assert "`afx ctl approval 7`" in content
+        heading = content.split("\n\n")[0].rstrip("…")
+        assert not re.search(r"(?<!\\)(?:\\\\)*\\\Z", heading)
+
+
+def test_the_cut_heading_is_marked_and_the_terminal_text_keeps_status_and_guide(monkeypatch):
+    name = "a_" * 31 + "b"
+    monkeypatch.setattr(render, "BODY_CHARS", 130)
+    content = render_terminal(_record(), _detail(_change(name=name), status="approved"))
+    assert len(content) <= 130 and "…" in content.split("\n\n")[0]
+    assert "状態: 承認済み" in content and "`afx ctl approval 7`" in content
+
+
+@pytest.mark.parametrize("key", ["-# x", "1. x", "+ x", "# x", "- x", "10) x", "> x"])
+def test_a_params_key_cannot_start_a_markdown_block(key):
+    change = _change(params={"items": [_item(key=key)], "omitted": 0, "invalid_keys": 0,
+                             "flatten_omitted": 0, "reason": None})
+    section = [s for s in _sections(render_approval(_record(), _detail(change)))
+               if s.startswith("変更:")][0]
+    row = section.split("\n")[1]
+    assert not re.match(r"\s*(?:-#|[-+*#>]|\d+[.)])(?:\s|$)", row)

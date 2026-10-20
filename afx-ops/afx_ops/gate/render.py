@@ -109,18 +109,40 @@ def _moment(value: object) -> str | None:
         return None
     if parsed.tzinfo is None:
         return parsed.strftime("%Y-%m-%d %H:%M")
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (ValueError, OverflowError):
+        return None
+
+
+def _hashable_str(value: object) -> bool:
+    return type(value) is str
 
 
 def _heading(approval_id: int, change: object) -> str:
     head = f"承認 #{approval_id}"
     if type(change) is not dict:
         return head
-    kind = KIND_LABELS.get(change.get("kind"), "plugin")
+    kind = KIND_LABELS.get(change.get("kind"), "plugin") if _hashable_str(change.get("kind")) else "plugin"
     name = change.get("name")
     name = escape_discord(name) if type(name) is str and _NAME.fullmatch(name) else "(名前不明)"
-    label = CLASS_LABELS.get(change.get("classification"), CLASS_LABELS["unknown"])
+    classification = change.get("classification")
+    label = CLASS_LABELS.get(classification, CLASS_LABELS["unknown"]) if _hashable_str(
+        classification) else CLASS_LABELS["unknown"]
     return f"{head} / {kind} {name} ({label})"
+
+
+_LIST_MARK = re.compile(r"(?:([-+])|(\d+)([.)]))(?=\s|\Z)")
+
+
+def _defuse_line_start(text: str) -> str:
+    """行頭の箇条書き・番号リストの記法 (``- `` ``+`` ``1. ``) を成立させない (記号の前に \\ を置く)。"""
+    found = _LIST_MARK.match(text)
+    if found is None:
+        return text
+    if found.group(1):
+        return "\\" + text
+    return found.group(2) + "\\" + text[len(found.group(2)):]
 
 
 def _params_paragraph(change: dict) -> str | None:
@@ -137,7 +159,8 @@ def _params_paragraph(change: dict) -> str | None:
         old, new = item.get("old"), item.get("new")
         old_text = "(なし)" if old is None else cut_escaped(old, PARAM_VALUE_CHARS)
         new_text = "(なし)" if new is None else cut_escaped(new, PARAM_VALUE_CHARS)
-        lines.append(f"{cut_escaped(item.get('key'), PARAM_VALUE_CHARS)}: {old_text} → {new_text}")
+        key = cut_escaped(item.get("key"), PARAM_VALUE_CHARS)
+        lines.append(f"{_defuse_line_start(key)}: {old_text} → {new_text}")
     extra = max(0, len(items) - PARAM_ROWS)
     omitted = params.get("omitted")
     extra += omitted if type(omitted) is int and 0 < omitted < 10 ** 9 else 0
@@ -189,11 +212,43 @@ def _assemble(parts: list[tuple[str, int]]) -> str:
     while True:
         body = "\n\n".join([text for text, _ in kept] + ([OMITTED_NOTE] if dropped else []))
         droppable = [i for i, (_, rank) in enumerate(kept) if rank > 0]
-        if len(body) <= BODY_CHARS or not droppable:
-            return body[:BODY_CHARS]
+        if len(body) <= BODY_CHARS:
+            return body
+        if not droppable:
+            return _cut_heading(kept, dropped)
         # 同順位は後ろから落とす
         kept.pop(max(droppable, key=lambda i: (kept[i][1], i)))
         dropped = True
+
+
+def _escape_units(text: str) -> list[str]:
+    """escape 済みの文字列を、escape の単位 (``\\*`` や ``@ ``) を割らない断片に分ける。"""
+    units: list[str] = []
+    i = 0
+    while i < len(text):
+        step = 2 if text[i] in "\\@" and i + 1 < len(text) else 1
+        units.append(text[i:i + step])
+        i += step
+    return units
+
+
+def _cut_heading(kept: list[tuple[str, int]], dropped: bool) -> str:
+    """残せる段落だけで上限を超えるとき: 操作案内など見出し以外は残し、見出しを escape の単位で切る。"""
+    rest = "".join("\n\n" + text for text, _ in kept[1:]) + ("\n\n" + OMITTED_NOTE if dropped else "")
+    budget = BODY_CHARS - len(rest) - len(_MARK)
+    if budget < 0:
+        rest = "".join("\n\n" + text for text, _ in kept[1:])
+        budget = BODY_CHARS - len(rest) - len(_MARK)
+    if budget < 0:
+        return rest.lstrip("\n")[-BODY_CHARS:]
+    head: list[str] = []
+    used = 0
+    for unit in _escape_units(kept[0][0]):
+        if used + len(unit) > budget:
+            break
+        head.append(unit)
+        used += len(unit)
+    return "".join(head) + _MARK + rest
 
 
 def _detail_parts(detail: object) -> tuple[dict | None, str | None]:
@@ -220,6 +275,11 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
         return _fallback(record.approval_id, code)
     change = data["change"]
     reason = change.get("reason")
+    if reason is not None and type(reason) is not str:
+        return _fallback(record.approval_id, "legacy_payload")
+    if any(type(change.get(key)) is not str for key in ("kind", "classification")
+           if change.get(key) is not None):
+        return _fallback(record.approval_id, "legacy_payload")
     expires = _moment(data.get("expires_at"))
     parts = [(_heading(record.approval_id, change), 0)]
     if reason is not None:
@@ -249,7 +309,8 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
     data, code = _detail_parts(detail)
     if data is None:
         return None
-    label = STATUS_LABELS.get(data.get("status"))
+    state = data.get("status")
+    label = STATUS_LABELS.get(state) if type(state) is str else None
     if label is None:
         return None
     decided = _moment(data.get("decided_at"))
