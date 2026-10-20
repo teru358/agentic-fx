@@ -327,3 +327,155 @@ def test_ac30_the_terminal_post_applies_the_same_escape_and_limit():
     content = render_terminal(_record(state="done"), _terminal("approved") | {"change": hostile})
     assert "@everyone" not in content and f"<@{USER}>" not in content
     assert "状態: 承認済み" in content and len(content) <= 2000
+
+
+def _claim_line(summary):
+    content = render_approval(_record(), _detail(_change(summary=summary)))
+    return [s for s in _sections(content) if s.startswith("agent の申告")][0].split("\n")[1]
+
+
+@pytest.mark.parametrize("ch", list("\\*_~|`>#[]()<:/"))
+def test_ac8_every_markup_character_gets_its_own_backslash(ch):
+    assert escape_discord(f"a{ch}b") == f"a\\{ch}b"
+    assert cut_escaped(f"a{ch}b", 100) == f"a\\{ch}b"
+    assert _claim_line(f"a{ch}b") == f"> a\\{ch}b"
+
+
+def test_ac8_a_link_and_a_heading_and_an_emoji_notation_are_not_formed():
+    line = _claim_line("[click](https://evil.test) # big :emoji: <t:1:R>")
+    assert "](" not in line and "# " not in line.replace("\\# ", "")
+    assert line == "> \\[click\\]\\(https\\:\\/\\/evil.test\\) \\# big \\:emoji\\: \\<t\\:1\\:R\\>"
+
+
+def test_the_value_cleaning_applies_to_every_text_entry_point():
+    assert escape_discord("a \t b\n\x00c\r\nd") == "a b c d"
+    assert cut_escaped("a   b\t\nc", 100) == "a b c"
+    for entry in (escape_discord, lambda v: cut_escaped(v, 100)):
+        for value in (5, None, 1.5, ["a"], {"a": 1}, b"x"):
+            assert entry(value) == ""
+    pair = {"pair": "AB\nC\x00D\u200bE", "trades": 1, "pf": 1.0, "avg_r": 0.0}
+    content = render_approval(_record(), _detail(_change(
+        performance={"in_sample": [pair], "holdout": []})))
+    assert "AB CDE / trades 1" in content and "\x00" not in content and "\u200b" not in content
+
+
+@pytest.mark.parametrize("name,shown", [("sma_cross", "sma\\_cross"), ("a" * 64, "a" * 64),
+                                         ("a" * 65, "(名前不明)"), ("Sma", "(名前不明)"),
+                                         ("9abc", "(名前不明)"), ("a-b", "(名前不明)"),
+                                         ("a b", "(名前不明)"), ("", "(名前不明)"),
+                                         (7, "(名前不明)"), ("ab\n", "(名前不明)")])
+def test_ac7_the_plugin_name_is_shown_only_when_it_is_a_lowercase_identifier(name, shown):
+    content = render_approval(_record(), _detail(_change(name=name)))
+    assert content.startswith(f"承認 #7 / 戦略 {shown} (更新)\n\n")
+
+
+@pytest.mark.parametrize("kind,shown", [("strategy", "戦略"), ("indicator", "指標"),
+                                         ("signal", "シグナル"), ("<@1>", "plugin"),
+                                         (None, "plugin"), ("Strategy", "plugin")])
+def test_ac7_an_unknown_kind_is_shown_as_plugin_never_as_its_raw_value(kind, shown):
+    content = render_approval(_record(), _detail(_change(kind=kind)))
+    assert content.startswith(f"承認 #7 / {shown} sma")
+    assert "<@1>" not in content
+
+
+def test_ac7_only_the_allowlisted_fields_reach_the_post():
+    extras = {"host": "canary-host.example.test", "path": "/srv/canary/abs", "url": "https://x.test/a",
+              "selection_rationale": "RATIONALE_X", "agent_claims": {"summary": "CLAIM_X"},
+              "candidate_text": "CAND_X", "holdout": [{"pair": "HOLD_X"}], "decided_by": "api:bot"}
+    plain = render_approval(_record(), _detail())
+    noisy = render_approval(_record(), _detail(_change(**extras), **extras))
+    assert noisy == plain
+    terminal_plain = render_terminal(_record(state="done"), _terminal("approved"))
+    terminal_noisy = render_terminal(_record(state="done"), _terminal(
+        "approved", change=_change(**extras), **extras))
+    assert terminal_noisy == terminal_plain
+
+
+def test_ac7_performance_rows_are_capped_at_four_with_the_remainder_counted():
+    def rows(count):
+        return [{"pair": f"P{i}", "trades": i, "pf": 1.0, "avg_r": 0.0} for i in range(count)]
+
+    def section(count):
+        content = render_approval(_record(), _detail(_change(
+            performance={"in_sample": rows(count), "holdout": []})))
+        return [s for s in _sections(content) if s.startswith("成績")][0].split("\n")[1:]
+    assert len(section(3)) == 3
+    assert [r.split(" / ")[0] for r in section(4)] == ["P0", "P1", "P2", "P3"]
+    five = section(5)
+    assert [r.split(" / ")[0] for r in five] == ["P0", "P1", "P2", "P3", "ほか 1 件"]
+    assert section(9)[-1] == "ほか 5 件"
+
+
+def test_ac7_the_params_remainder_counts_only_a_sane_omitted_value():
+    def last_row(omitted, count=2):
+        items = [_item(f"params.k{i}", "1", "2") for i in range(count)]
+        change = _change(params={"items": items, "omitted": omitted, "invalid_keys": 0,
+                                 "flatten_omitted": 0, "reason": None})
+        section = [s for s in _sections(render_approval(_record(), _detail(change)))
+                   if s.startswith("変更:")][0]
+        return section.split("\n")[-1]
+    assert last_row(3) == "ほか 3 件"
+    for odd in (0, -1, 10 ** 9, 10 ** 12, True, "5", None, 2.0):
+        assert last_row(odd).startswith("params.k1"), odd
+
+
+def test_ac7_the_redacted_params_notice_is_shown_with_its_fixed_sentence():
+    change = _change(params={"items": [_item()], "omitted": 0, "invalid_keys": 0,
+                             "flatten_omitted": 0, "reason": "redacted"})
+    section = [s for s in _sections(render_approval(_record(), _detail(change)))
+               if s.startswith("変更:")][0]
+    assert section.split("\n")[-1] == REASON_TEXT["redacted"]
+
+
+@pytest.mark.parametrize("value,shown", [(True, "-"), (False, "-"), (float("nan"), "-"),
+                                          (float("inf"), "-"), (None, "-"), ("5", "-"),
+                                          (3, "3"), (1.23456, "1.235"), (0.0, "0")])
+def test_ac7_a_performance_number_is_shown_only_when_it_is_a_finite_number(value, shown):
+    row = {"pair": "USDJPY", "trades": value, "pf": value, "avg_r": value}
+    content = render_approval(_record(), _detail(_change(
+        performance={"in_sample": [row], "holdout": []})))
+    assert f"USDJPY / trades {shown} / PF {shown} / avg R {shown}" in content
+
+
+@pytest.mark.parametrize("raw,shown", [
+    ("2026-10-26T09:00:00+09:00", "期限: 2026-10-26 00:00 UTC"),
+    ("2026-10-26T00:00:00Z", "期限: 2026-10-26 00:00 UTC"),
+    ("2026-10-26T00:00:00", "期限: 2026-10-26 00:00"),
+    ("2026-10-26T00:00:00." + "1" * 60 + "+00:00", "期限: なし"),
+    ("", "期限: なし"), (5, "期限: なし"), (None, "期限: なし")])
+def test_ac7_the_deadline_is_a_utc_minute_when_it_has_a_zone_and_unreadable_values_are_none(
+        raw, shown):
+    content = render_approval(_record(), _detail(expires_at=raw))
+    assert shown in _sections(content)
+
+
+def test_ac9_the_omission_note_counts_toward_the_2000_character_limit(monkeypatch):
+    def base_length(rows, first, last):
+        items = [_item(f"params.{'k' * 40}{i}", "*" * (first if i == 0 else 40), "_" * 40)
+                 for i in range(rows - 1)]
+        items.append(_item("params.last", "a", "b" * last))
+        change = _change(params={"items": items, "omitted": 0, "invalid_keys": 0,
+                                 "flatten_omitted": 0, "reason": None}, summary="")
+        return change, len(render_approval(_record(), _detail(change)))
+
+    found = {}
+    for rows in range(2, 11):
+        for first in range(0, 81):
+            for last in (0, 20, 40, 60, 80):
+                change, length = base_length(rows, first, last)
+                if length not in found and 1986 <= length <= 2000:
+                    found[length] = change
+    # 期限 + 変更 + 成績 + 見出し + 操作案内だけで 1986 〜 2000 字に届く構成が複数ある
+    assert len(found) >= 6, sorted(found)
+    for length, change in found.items():
+        change = dict(change, summary="a claim that does not fit")
+        text = render_approval(_record(), _detail(change))
+        assert len(text) <= 2000, length
+        assert text.endswith(OMITTED_NOTE) and "agent の申告" not in text
+
+
+def test_the_final_hard_cap_cuts_even_when_only_undroppable_paragraphs_remain(monkeypatch):
+    monkeypatch.setattr(render, "BODY_CHARS", 40)
+    text = render_approval(_record(), _detail())
+    assert len(text) == 40
+    assert len(render_terminal(_record(state="done"), _terminal("approved"))) == 40

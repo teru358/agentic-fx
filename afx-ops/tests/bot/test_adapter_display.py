@@ -626,3 +626,14 @@ def test_every_post_and_edit_route_sends_no_mentions_and_no_unlisted_values(harn
     assert len(bodies) == 1 and len(mentions) == 1
     assert all(m.to_dict() == {"parse": []} for m in mentions)
     _assert_clean(bodies, tmp_path)
+
+
+def test_a_non_200_reply_never_contributes_its_data_to_a_post_or_a_terminal_edit(harness):
+    adapter_post = adapter_module._post_effect(
+        _record(), Reply(503, _decided("pending"), "unavailable"))
+    assert adapter_post.content == "承認 #7\n詳細を取得できません"
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(503, _decided("approved"), "unavailable"))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
