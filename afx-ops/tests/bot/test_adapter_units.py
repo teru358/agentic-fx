@@ -20,6 +20,19 @@ SETTINGS = BotSettings(guild_id=12345678901234567, channel_id=12345678901234568,
                        mention_role_id=None, mention_user_ids=())
 
 
+class _NoMentions:
+    """edit に渡った allowed_mentions が mention を一切許さないことを == で表す。"""
+
+    def __eq__(self, other):
+        return isinstance(other, discord.AllowedMentions) and other.to_dict() == {"parse": []}
+
+    __hash__ = None
+
+
+_NO_MENTIONS = _NoMentions()
+
+
+
 def _record(**changes):
     values = dict(approval_id=7, message_id=101, guild_id=SETTINGS.guild_id,
                   channel_id=SETTINGS.channel_id, payload_sha256="a" * 64,
@@ -171,15 +184,15 @@ def test_an_empty_events_page_still_records_the_high_watermark_and_a_rollback_st
         os.close(fd)
 
 
-def test_the_posted_approval_shows_the_detail_facts_the_adapter_fetched():
+def test_the_posted_approval_shows_the_change_summary_the_adapter_fetched():
     reply = Reply(200, {"status": "pending", "payload_sha256": "a" * 64,
-                        "facts_lines": ["agent says: ok"],
-                        "parent_facts": {"backlog": {"id": 101, "attempts": 1,
-                                                     "status": "selected"}}}, None)
+                        "change": {"name": "sma_cross", "kind": "strategy",
+                                   "classification": "new", "params": {"items": []},
+                                   "performance": {"in_sample": [], "holdout": []},
+                                   "summary": "申告"}}, None)
     content = _post_effect(_record(), reply).content
-    assert "facts=backlog.id=101; backlog.attempts=1; backlog.status=selected" in content
-    assert "agent says" not in content
-    assert "facts=none" in _post_effect(_record(), None).content
+    assert "承認 #7 / 戦略 sma\\_cross (新規)" in content and "変更: 前版なし" in content
+    assert _post_effect(_record(), None).content == "承認 #7\n詳細を取得できません"
 
 
 def test_an_approval_ref_with_non_ascii_digits_is_not_an_approval_id():
@@ -467,7 +480,8 @@ def test_a_failed_view_removal_is_kept_and_retried_after_the_backoff(tmp_path):
 
     try:
         asyncio.run(scenario())
-        assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None})]
+        assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
         assert 101 not in adapter._routes
     finally:
         adapter.close()
@@ -499,7 +513,8 @@ def test_a_refresh_edit_that_gave_up_does_not_block_the_later_terminal_edit(tmp_
 
     try:
         asyncio.run(scenario())
-        assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None})]
+        assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
         assert load(fd).approvals == ()
     finally:
         adapter.close()

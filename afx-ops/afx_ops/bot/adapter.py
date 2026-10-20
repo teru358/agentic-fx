@@ -34,7 +34,7 @@ from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
 from afx_ops.gate.render import footer as gate_footer
-from afx_ops.gate.render import primary_view, render_approval
+from afx_ops.gate.render import primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
@@ -151,6 +151,8 @@ class BotAdapter:
         self._routes: dict[int, _Route] = {}
         # approval_id → (表示 (世代, 状態), 失敗回数, 次に試してよい時刻)。表示が変われば数え直す
         self._edit_retry: dict[int, tuple[tuple[int, str], int, float]] = {}
+        # 終端 edit の再試行の間、一度読んだ文面を使い回す (終端処理ごとに正本を読むのは 1 回)
+        self._terminal_text: dict[int, str] = {}
         # approval_id → 次に正本へ問合せてよい時刻。429 / 503 の後だけ載る
         self._next_poll_at: dict[int, float] = {}
         # approval_id → 表示更新と出し直しを排他する lock (footer の世代と record の世代を揃える)
@@ -384,6 +386,8 @@ class BotAdapter:
 
         gone は edit の成功ではない。呼び出し側が、終端なら表示の削除済み、pending なら再投稿として扱う。
         """
+        if "content" in kwargs:
+            kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
         try:
             await self._channel.get_partial_message(message_id).edit(**kwargs)
         except discord.NotFound:
@@ -400,7 +404,7 @@ class BotAdapter:
         try:
             return await self._channel.send(
                 content, embed=discord.Embed().set_footer(text=effect.footer), view=view,
-                allowed_mentions=self._allowed_mentions())
+                allowed_mentions=discord.AllowedMentions.none())
         except (discord.HTTPException, OSError, asyncio.TimeoutError):
             view.stop()
             return None
@@ -551,9 +555,15 @@ class BotAdapter:
             failures, not_before = 0, 0.0
         if failures >= EDIT_RETRY_LIMIT or now < not_before:
             return
+        read_failed = False
         if record.state in _TERMINAL:
-            outcome = await self._edit(record.message_id, content=gate_reconcile.NO_LONGER_ACTIVE,
-                                       view=None)
+            content = await self._terminal_content(record)
+            read_failed = content is None
+            if content is None:
+                # 正本の一時障害: 固定文で確定せず、次の周回で読み直す
+                outcome = "failed"
+            else:
+                outcome = await self._edit(record.message_id, content=content, view=None)
             if outcome == "gone":
                 # 外す View を載せた表示が既に無い
                 outcome = "ok"
@@ -572,8 +582,15 @@ class BotAdapter:
         if outcome != "ok":
             # route は残し、次の周回で backoff の後に再試行する
             failures += 1
+            if record.state in _TERMINAL and failures >= EDIT_RETRY_LIMIT and read_failed:
+                # 正本を読めないままでも View は外す: 固定文の edit を成功するまで改めて試す
+                self._terminal_text[record.approval_id] = gate_reconcile.NO_LONGER_ACTIVE
+                self._edit_retry[record.approval_id] = (target, 0, 0.0)
+                await self._update_display_locked(record)
+                return
             if record.state in _TERMINAL and failures >= EDIT_RETRY_LIMIT:
                 self._edit_retry.pop(record.approval_id, None)
+                self._terminal_text.pop(record.approval_id, None)
                 if await self._run(lambda: self.gate.abandon_edit(
                         record.approval_id, generation=record.display_generation)):
                     print("afx-ops bot: edit_abandoned", file=sys.stderr)
@@ -582,11 +599,40 @@ class BotAdapter:
             self._edit_retry[record.approval_id] = (target, failures, now + delay)
             return
         self._edit_retry.pop(record.approval_id, None)
+        self._terminal_text.pop(record.approval_id, None)
         if record.state in _TERMINAL:
             for message_id, route in list(self._routes.items()):
                 if route.approval_id == record.approval_id:
                     self._unregister(message_id)
         await self._run(self._edit_done, record)
+
+    async def _terminal_content(self, record: ApprovalRecord) -> str | None:
+        """終端の投稿に残す文面。決定結果を正本から読み直して要約と状態を残す。
+
+        正本が 404、又は 200 でも終端の結果でないときは固定の代替文にする (View の取り外しは文面の
+        取得に依存させない)。429 / 503 / 例外などの一時障害は None を返し、呼び出し側が再試行に回す。
+        読めた文面は終端処理が終わるまで使い回す。
+        """
+        cached = self._terminal_text.get(record.approval_id)
+        if cached is not None:
+            return cached
+        try:
+            reply = await self._run(self.client.approval, record.approval_id)
+        except Exception:  # noqa: BLE001 — 取得の失敗は再試行に回す
+            return None
+        status = getattr(reply, "status", None)
+        if status == 200:
+            try:
+                text = render_terminal(record, getattr(reply, "data", None))
+            except Exception:  # noqa: BLE001 — 文面を作れなくても View は外す
+                text = None
+            text = text or gate_reconcile.NO_LONGER_ACTIVE
+        elif status == 404:
+            text = gate_reconcile.NO_LONGER_ACTIVE
+        else:
+            return None
+        self._terminal_text[record.approval_id] = text
+        return text
 
     def _edit_done(self, record: ApprovalRecord) -> None:
         self.gate.edit_done(record.approval_id, generation=record.display_generation,
