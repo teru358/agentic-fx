@@ -1,7 +1,7 @@
 """notify の cursor と high watermark を snapshot 一枚に保存する。"""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from afx_ops.snapshot import SnapshotError, read_snapshot, write_snapshot
 
@@ -101,8 +101,8 @@ def advance_delivery(state: NotifyState, event_id: int) -> NotifyState:
     event_id = _event_id(event_id)
     if event_id <= state.cursor:
         raise StateError()
-    return replace(state, cursor=event_id,
-                   high_watermark=max(state.high_watermark, event_id))
+    return NotifyState(cursor=event_id, high_watermark=max(state.high_watermark, event_id),
+                       event_cursor_initialized=True)
 
 
 def observe_high(state: NotifyState, high: int) -> NotifyState:
@@ -111,7 +111,8 @@ def observe_high(state: NotifyState, high: int) -> NotifyState:
         raise StateError()
     if high <= state.high_watermark:
         return state
-    return replace(state, high_watermark=high)
+    return NotifyState(cursor=state.cursor, high_watermark=high,
+                       event_cursor_initialized=state.event_cursor_initialized)
 
 
 def initialize_event_cursor(state: NotifyState, high: int) -> NotifyState:
