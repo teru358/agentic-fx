@@ -150,6 +150,7 @@ class ImproveSupervisor:
                 _log.exception(
                     "launch compensation failed for manual mission_id=%s",
                     ctx.mission_id)
+                self._record_compensation_failed(ctx.mission_id, "launch")
             raise
         try:
             self._improve_loop.commit(
@@ -166,8 +167,21 @@ class ImproveSupervisor:
                 _log.exception(
                     "commit compensation failed for manual mission_id=%s",
                     ctx.mission_id)
+                self._record_compensation_failed(ctx.mission_id, "commit")
             raise
         return ctx.mission_id
+
+    def _record_compensation_failed(self, mission_id, phase: str) -> None:
+        """補償の失敗を activity に残す。記録に失敗しても何も送出しない
+        (呼び出し元は元の例外を上げ直す)。"""
+        if self._activity is None:
+            return
+        try:
+            self._activity.write(
+                Category.IMPROVE, "compensation_failed",
+                f"mission_id={mission_id} phase={phase}")
+        except Exception:  # noqa: BLE001
+            _log.exception("compensation_failed record failed")
 
     def shutdown(self) -> None:
         self._stop_event.set()

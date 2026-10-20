@@ -11,8 +11,8 @@ from tests.loops.test_improve_candidate_ledger import (
     _run, improve_env)
 
 
-def test_deep_expression_candidate_does_not_fail_the_mission(improve_env):
-    """ロジック hash を計算できない候補は、hash なしの行として通常の終端に進む。"""
+def test_candidate_without_computable_identity_is_gate_failed(improve_env):
+    """ロジック hash を計算できない候補は承認に進めず、gate_failed で終端する。"""
     app, root = improve_env
     deep = "_deep = " + " + ".join(["1"] * 3000) + "\n"
     loop, ctx, seeded = _run(
@@ -23,8 +23,14 @@ def test_deep_expression_candidate_does_not_fail_the_mission(improve_env):
         "SELECT status FROM missions WHERE id=?", (ctx.mission_id,)
     ).fetchone()[0]
     assert status == "completed"
-    extra = _expect_rows(app.conn_core, ctx, seeded, "pending")
+    assert app.conn_core.execute(
+        "SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+    extra = _expect_rows(app.conn_core, ctx, seeded, "gate_failed")
     assert extra["logic_hash"] is None
+    last = app.conn_core.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    assert last == "gate_failed:identity_unavailable"
 
 
 def test_submission_reads_the_candidate_identity_once_outside_the_tx(
@@ -159,9 +165,9 @@ def test_snapshot_reuses_a_valid_same_name_dir(improve_env, tmp_path):
                 if p.name.startswith(".stale-")]
 
 
-def test_archive_is_made_before_the_tx_and_survives_a_rollback(improve_env):
-    """archive の作成は書き込み tx の外。tx が rollback しても dir は残り
-    (孤立 dir は既存の sweep が回収する)、台帳の行は残らない。"""
+def test_archive_is_made_before_the_tx_and_removed_on_rollback(improve_env):
+    """archive の作成は書き込み tx の外。tx が rollback したら、この呼び出しが
+    作った dir は消え、台帳の行も残らない。"""
     import sqlite3
     from agentic_fx.store.db import connect
     app, root = improve_env
@@ -189,7 +195,7 @@ def test_archive_is_made_before_the_tx_and_survives_a_rollback(improve_env):
     assert write_lock_free == [True]
     archive_root = root / "plugins" / "_archive" / str(ctx.mission_id)
     finals = [p for p in archive_root.iterdir() if not p.name.startswith(".")]
-    assert len(finals) == 1
+    assert finals == []
     rows = app.conn_core.execute(
         "SELECT id FROM candidate_archives WHERE mission_id=? AND "
         "archive_path IS NOT NULL", (ctx.mission_id,)).fetchall()
@@ -218,3 +224,79 @@ def test_snapshot_goes_through_the_shared_tmp_writer(improve_env, tmp_path):
     with patch.object(ImproveLoop, "_write_archive_tmp", spy):
         loop._snapshot_final_archive(candidate, mission_id=7, now=NOW)
     assert calls == [1]
+
+
+def _finals(root, mission_id):
+    archive_root = root / "plugins" / "_archive" / str(mission_id)
+    if not archive_root.exists():
+        return []
+    return [p for p in archive_root.iterdir() if not p.name.startswith(".")]
+
+
+def test_duplicate_metrics_demotion_leaves_no_orphan_archive_dir(improve_env):
+    app, root = improve_env
+    metrics = {"trades": 194, "pf": 1.4981, "win_rate": 0.487, "avg_r": 0.188,
+               "max_drawdown": 0.0373, "total_pnl": 100.0}
+    hold = {"trades": 53, "pf": 1.1, "win_rate": 0.3, "avg_r": 0.037,
+            "max_drawdown": 0.0392, "total_pnl": 10.0}
+    from tests.loops.test_improve_candidate_ledger import (
+        _PASSING_STRATEGY_CONFIG, _PASSING_STRATEGY_PY,
+        _PASSING_STRATEGY_TEST)
+    from tests.loops.test_improve_loop_duplicate_metrics import (
+        _fake_holdout_full_metrics, _fake_in_sample_full_metrics)
+    runs = []
+    for name in ("conv_a", "conv_b"):
+        runs.append(_run(
+            app, root, _plugin_artifact(name, kind="strategy"),
+            files=(name, f'"""{name}"""\n' + _PASSING_STRATEGY_PY,
+                   _PASSING_STRATEGY_CONFIG, _PASSING_STRATEGY_TEST),
+            in_sample=_fake_in_sample_full_metrics(metrics),
+            holdout_fn=_fake_holdout_full_metrics(hold)))
+    (_, ctx_a, _), (_, ctx_b, seeded_b) = runs
+    _expect_rows(app.conn_core, ctx_b, seeded_b, "duplicate_metrics")
+    assert len(_finals(root, ctx_a.mission_id)) == 1
+    assert _finals(root, ctx_b.mission_id) == []
+
+
+def test_rollback_keeps_an_archive_dir_that_already_existed(improve_env):
+    from agentic_fx.plugin.gate_pytest import hashes_of
+    app, root = improve_env
+    from tests.loops.test_improve_e2e import NOW
+    pre = []
+
+    def make_existing(loop, ctx):
+        directory = ctx.staging_dir / "cand"
+        content_hash, artifact_hash = hashes_of(directory)
+        candidate = loop._final_candidate(
+            directory, name="cand", content_hash=content_hash,
+            artifact_hash=artifact_hash)
+        assert loop._snapshot_final_archive(
+            candidate, mission_id=ctx.mission_id, now=NOW) is not None
+        pre.append(artifact_hash)
+
+    loop, ctx, seeded = _run(
+        app, root, _plugin_artifact("cand"), files=_indicator(),
+        before_commit=make_existing,
+        extra=[patch("agentic_fx.store.candidate_archives.settle",
+                     lambda conn, archive_id, outcome: False)])
+    finals = _finals(root, ctx.mission_id)
+    assert [p.name for p in finals] == pre
+
+
+def test_orphan_cleanup_refuses_paths_outside_the_archive_root(
+        improve_env, tmp_path):
+    app, root = improve_env
+    from tests.loops.test_improve_candidate_ledger import _loop
+    loop = _loop(app, root)
+    outside = tmp_path / "victim"
+    outside.mkdir()
+    (outside / "keep").write_text("x")
+    loop._remove_created_archive(str(outside))
+    assert (outside / "keep").exists()
+    archive_dir = root / "plugins" / "_archive" / "9"
+    archive_dir.mkdir(parents=True)
+    link = archive_dir / "h"
+    link.symlink_to(outside)
+    loop._remove_created_archive("plugins/_archive/9/h")
+    assert (outside / "keep").exists()
+    assert link.is_symlink()

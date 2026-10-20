@@ -2211,6 +2211,29 @@ class ImproveLoop:
         chmod_tree_writable(path)
         shutil.rmtree(path, ignore_errors=True)
 
+    def _remove_created_archive(self, relative: "str | None") -> None:
+        """この呼び出しが新規に作った提出 archive dir を消す。
+        `plugins/_archive/<mission>/<hash>` の形の、symlink でない実 dir だけ。"""
+        if not relative:
+            return
+        import shutil
+        from agentic_fx.plugin.version_store import chmod_tree_writable
+        try:
+            archive_root = (self._root / "plugins" / "_archive").resolve()
+            target = self._root / relative
+            if os.path.islink(target) or not target.is_dir():
+                return
+            if os.path.islink(target.parent):
+                return
+            resolved = target.resolve()
+            if resolved.parent.parent != archive_root:
+                return
+            chmod_tree_writable(resolved)
+            shutil.rmtree(resolved, ignore_errors=True)
+        except OSError:
+            _log.warning("created archive cleanup failed: %s", relative,
+                         exc_info=True)
+
     def _publish_archives(self, conn, *, ctx, now,
                           mission_outcome: str) -> None:
         from agentic_fx.plugin.version_store import _fsync_dir
@@ -2311,8 +2334,8 @@ class ImproveLoop:
                                 mission_id: int, now) -> str | None:
         """run_backtest と同じ手順 (tmp に書いて rename) で、staging の最終
         bytes から archive を作る。作れなければ None (activity に残す)。
-        書き込み tx の外で呼ぶ。後で tx が rollback すると行の無い dir が
-        残るが、孤立 dir は既存の sweep が回収する。
+        書き込み tx の外で呼ぶ。呼び出し側が、後で降格・rollback したときに
+        新規作成した dir を `_remove_created_archive` で消す。
         同名の dir が既にあるときは中身の hash を再計算し、一致するものだけを
         採用する。一致しないものは `.stale-*` に退避して作り直す。"""
         from agentic_fx.plugin.version_store import (
@@ -2616,17 +2639,27 @@ class ImproveLoop:
             persist_ctx = ctx
         try:
             # 提出する候補の archive は書き込み tx の前に作る (tx の中でファイルを
-            # 触らない)。tx が rollback すると行の無い dir が残るが、孤立 dir は
-            # 既存の sweep が回収する。
+            # 触らない)。この呼び出しが新規に作った dir だけを覚えておき、
+            # 質検査で降格したとき・tx が戻ったときに消す (既存の dir は触らない)。
             submitted = self._submitted_candidate(
                 approval_payload, final_candidate)
             submitted_archive_path = None
+            created_archive_path = None
             if not self._final_archive_row_exists(
                     conn, mission_id=mission_id,
                     artifact_hash=submitted.artifact_hash):
+                existed = os.path.lexists(
+                    self._root / "plugins" / "_archive" / str(mission_id)
+                    / submitted.artifact_hash)
                 submitted_archive_path = self._snapshot_final_archive(
                     submitted, mission_id=mission_id, now=now)
-            conn.execute("BEGIN IMMEDIATE")
+                if submitted_archive_path is not None and not existed:
+                    created_archive_path = submitted_archive_path
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except BaseException:
+                self._remove_created_archive(created_archive_path)
+                raise
             try:
                 # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査は
                 # `_persist_ledger_in_tx` (→ `_publish_archives` が
@@ -2655,6 +2688,7 @@ class ImproveLoop:
                     staging_dir=(ctx.staging_dir if ctx is not None else None))
                 if demotion is not None:
                     conn.rollback()
+                    self._remove_created_archive(created_archive_path)
                     return demotion
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
@@ -2719,6 +2753,7 @@ class ImproveLoop:
                 conn.commit()
             except BaseException:
                 conn.rollback()
+                self._remove_created_archive(created_archive_path)
                 raise
             # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
             # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
@@ -2916,6 +2951,15 @@ class ImproveLoop:
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         reason="gate_failed:loader_rejected", now=now,
+                        tool_calls=tool_calls,
+                        candidate=final_candidate,
+                        candidate_outcome="gate_failed")
+                    return
+                if (final_candidate is not None
+                        and final_candidate.logic_hash is None):
+                    self._finalize_gate_failed(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        reason="gate_failed:identity_unavailable", now=now,
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed")
