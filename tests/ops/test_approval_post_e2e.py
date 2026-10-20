@@ -69,7 +69,7 @@ def test_ac23b_the_summary_is_redacted_then_escaped_then_cut_at_300(ops_env):
     assert claim(140) == "> " + "\\*" * 140 + " " + redacted
     assert claim(143) == "> " + "\\*" * 143 + " " + redacted
     assert claim(144) == "> " + "\\*" * 144 + " \\[redacted…"
-    assert claim(160) == "> " + "\\*" * 150 + "…"
+    assert claim(160) == "> " + "\\*" * 149 + "…"
 
 
 def test_ac23b_a_token_at_the_end_of_a_near_limit_body_never_appears(ops_env):

@@ -384,6 +384,8 @@ class BotAdapter:
 
         gone は edit の成功ではない。呼び出し側が、終端なら表示の削除済み、pending なら再投稿として扱う。
         """
+        if "content" in kwargs:
+            kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
         try:
             await self._channel.get_partial_message(message_id).edit(**kwargs)
         except discord.NotFound:

@@ -24,6 +24,19 @@ SETTINGS = BotSettings(guild_id=GUILD, channel_id=CHANNEL, mention_role_id=None,
 DIGEST = "a" * 64
 
 
+class _NoMentions:
+    """edit に渡った allowed_mentions が mention を一切許さないことを == で表す。"""
+
+    def __eq__(self, other):
+        return isinstance(other, discord.AllowedMentions) and other.to_dict() == {"parse": []}
+
+    __hash__ = None
+
+
+_NO_MENTIONS = _NoMentions()
+
+
+
 def _record(**changes):
     values = dict(approval_id=7, message_id=101, guild_id=GUILD, channel_id=CHANNEL,
                   payload_sha256=DIGEST, display_generation=1, state="fresh")
@@ -217,7 +230,8 @@ def test_a_post_that_became_terminal_while_the_repost_was_sending_is_shown_as_te
         await adapter._update_display(adapter.gate.state.record(7))
 
     asyncio.run(go())
-    shown = {"content": "Approval is no longer active.", "view": None}
+    shown = {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS}
     assert [edit for edit in channel.edits if edit[0] == 901] == [(901, shown), (901, shown)]
     assert adapter.gate.state.record(7) is None
 
@@ -268,7 +282,8 @@ def test_a_repost_whose_intent_changed_while_sending_is_not_committed_and_its_po
     record = adapter.gate.state.record(7)
     assert (record.message_id, record.display_generation) == (101, 1)
     assert 901 not in adapter._routes
-    assert channel.edits == [(901, {"content": "Approval is no longer active.", "view": None})]
+    assert channel.edits == [(901, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
 
 
 def test_a_failed_repost_of_a_deleted_post_is_retried_with_backoff(harness):
@@ -520,5 +535,94 @@ def test_ac30_without_a_readable_result_the_view_is_still_removed_with_the_fixed
     adapter, channel, _ = harness(_record(state="done", edit_pending=True))
     adapter.client = client
     asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
-    assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None})]
+    assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None,
+             "allowed_mentions": _NO_MENTIONS})]
     assert adapter.gate.state.record(7) is None
+
+
+CANARIES = ("HOLDOUT_CANARY_PAIR", "31337.5", "RATIONALE_CANARY_ZX81", "canary-host.example.test",
+            "/srv/canary/abs/path", "https://canary-url.example.test/x")
+
+
+def _canary_detail(status="pending"):
+    detail = _decided(status)
+    detail["change"]["performance"]["holdout"] = [
+        {"pair": "HOLDOUT_CANARY_PAIR", "trades": 99, "pf": 31337.5, "avg_r": 1.0}]
+    detail["change"]["selection_rationale"] = "RATIONALE_CANARY_ZX81"
+    detail["change"]["agent_claims"] = {"selection_rationale": "RATIONALE_CANARY_ZX81"}
+    detail["host"] = "canary-host.example.test"
+    detail["path"] = "/srv/canary/abs/path"
+    detail["url"] = "https://canary-url.example.test/x"
+    return detail
+
+
+class _CanaryClient(_Client):
+    def __init__(self, detail) -> None:
+        super().__init__()
+        self.detail = detail
+
+    def approval(self, approval_id: int) -> Reply:
+        return Reply(200, self.detail, None)
+
+
+def _snapshot_text(tmp_path) -> str:
+    names = sorted(os.listdir(tmp_path))
+    assert "bot.snapshot" in names
+    return "\n".join((tmp_path / name).read_text(errors="replace") for name in names
+                     if (tmp_path / name).is_file())
+
+
+def _assert_clean(bodies, tmp_path):
+    for body in bodies:
+        assert body
+        for canary in CANARIES:
+            assert canary not in body
+    state = _snapshot_text(tmp_path)
+    for canary in CANARIES + ("短い申告です", "params.period", '"change"', "claims"):
+        assert canary not in state
+
+
+def _path_first_post(adapter, channel):
+    channel.history_items = []
+    adapter.client = _CanaryClient(_canary_detail("pending"))
+    asyncio.run(adapter._post_pending(7))
+    return [s["content"] for s in channel.sent], [s["allowed_mentions"] for s in channel.sent]
+
+
+def _path_repost(adapter, channel):
+    adapter.client = _CanaryClient(_canary_detail("pending"))
+    channel.edit_outcomes[101] = ["gone"]
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    return ([s["content"] for s in channel.sent], [s["allowed_mentions"] for s in channel.sent])
+
+
+def _path_terminal_edit(adapter, channel):
+    adapter.client = _CanaryClient(_canary_detail("approved"))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    return ([k["content"] for _, k in channel.edits],
+            [k["allowed_mentions"] for _, k in channel.edits if "allowed_mentions" in k])
+
+
+_PATHS = {
+    "first_post": (_path_first_post, None),
+    "repost": (_path_repost, _record(display_generation=2, edit_pending=True)),
+    "terminal_edit": (_path_terminal_edit, _record(state="done", edit_pending=True)),
+}
+
+
+@pytest.mark.parametrize("path", sorted(_PATHS))
+def test_every_post_and_edit_route_sends_no_mentions_and_no_unlisted_values(harness, tmp_path, path):
+    run, record = _PATHS[path]
+    adapter, channel, _ = harness(_record() if record is None else record)
+    if record is None:
+        adapter.gate.state = BotState.empty()
+    adapter.settings = BotSettings(guild_id=GUILD, channel_id=CHANNEL, mention_role_id=ROLE,
+                                   mention_user_ids=(USER,))
+    # 入力側に canary があること (画面に出ないのは入力が無いからではない)
+    source = repr(_canary_detail())
+    for canary in CANARIES:
+        assert canary in source
+    bodies, mentions = run(adapter, channel)
+    assert len(bodies) == 1 and len(mentions) == 1
+    assert all(m.to_dict() == {"parse": []} for m in mentions)
+    _assert_clean(bodies, tmp_path)

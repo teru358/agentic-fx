@@ -140,10 +140,27 @@ def test_ac8_summary_is_cut_after_escaping_at_300_characters_without_splitting_a
     # 1 文字 = 2 文字に増える記号: escape 後 299 / 300 / 301
     assert claim_line("*" * 149 + "a") == "> " + "\\*" * 149 + "a"
     assert claim_line("*" * 150) == "> " + "\\*" * 150
-    assert claim_line("*" * 150 + "a") == "> " + "\\*" * 150 + "…"
+    assert claim_line("*" * 150 + "a") == "> " + "\\*" * 149 + "…"
     # 301 字目で切るとき、escape の単位 (\*) の途中では切らない
     assert claim_line("a" + "*" * 150) == "> a" + "\\*" * 149 + "…"
-    assert len(cut_escaped("*" * 400, 300)) == 301
+    assert len(cut_escaped("*" * 400, 300)) == 299
+
+
+@pytest.mark.parametrize("raw,limit", [("a", 300), ("*", 150), ("a*", 150), ("@", 100), ("x", 5)])
+def test_cut_escaped_never_exceeds_its_limit_including_the_ellipsis(raw, limit):
+    unit = len(escape_discord(raw))
+    for count in range(limit // unit - 2, limit // unit + 3):
+        text = raw * count
+        full = escape_discord(text)
+        result = cut_escaped(text, limit)
+        assert len(result) <= limit
+        if len(full) <= limit:
+            assert result == full
+        else:
+            assert result.endswith("…") and full.startswith(result[:-1])
+    # 境界: 上限ちょうどは切らず、1 字超えたら「…」込みで上限に収める
+    assert cut_escaped("a" * limit, limit) == "a" * limit
+    assert cut_escaped("a" * (limit + 1), limit) == "a" * (limit - 1) + "…"
 
 
 def test_ac9_the_final_body_is_at_most_2000_chars_and_drops_whole_paragraphs_from_the_back(monkeypatch):

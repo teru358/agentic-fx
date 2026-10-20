@@ -77,16 +77,18 @@ def escape_discord(value: object) -> str:
 
 def cut_escaped(value: object, limit: int) -> str:
     """整形 → escape → 表示上限の順。上限は escape 後の文字数で、escape の単位 (``\\*`` など)
-    の途中では切らない。切ったときは末尾に「…」を付ける。"""
+    の途中では切らない。切ったときは末尾に「…」を付け、全体で limit を超えない。"""
+    pieces = [_ESCAPES.get(ch, ch) for ch in _clean_inline(value)]
+    if sum(len(p) for p in pieces) <= limit:
+        return "".join(pieces)
     out: list[str] = []
     used = 0
-    for ch in _clean_inline(value):
-        piece = _ESCAPES.get(ch, ch)
-        if used + len(piece) > limit:
-            return "".join(out) + _MARK
+    for piece in pieces:
+        if used + len(piece) > limit - len(_MARK):
+            break
         out.append(piece)
         used += len(piece)
-    return "".join(out)
+    return "".join(out) + _MARK
 
 
 def _number(value: object) -> str | None:
