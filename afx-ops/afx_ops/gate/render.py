@@ -57,7 +57,7 @@ _REMOVED = frozenset({"Cc", "Cf", "Cs"})
 # Discord の markdown と記法を無効化する単位。@ は後ろに空白を足し (mention 記法を成立させない)、
 # 他は直前に \ を置く。< は <@ <# <:> <t:> など山括弧で始まる記法全般を壊す
 _ESCAPES = {"@": "@ "}
-_ESCAPES.update({ch: "\\" + ch for ch in "\\*_~|`>#[]()<:"})
+_ESCAPES.update({ch: "\\" + ch for ch in "\\*_~|`>#[]()<:/"})
 
 
 def _clean_inline(value: object) -> str:
@@ -175,20 +175,22 @@ def _guide(approval_id: int) -> str:
     return f"詳細: web の承認 #{approval_id} / `afx ctl approval {approval_id}`"
 
 
-def _assemble(heading: str, head_extra: list[str], optional: list[str]) -> str:
-    """段落 (空行区切り) を組み、完成本文が BODY_CHARS を超えるうちは後ろの任意段落から落とす。
+def _assemble(parts: list[tuple[str, int]]) -> str:
+    """段落 (空行区切り、表示順) を組み、完成本文が BODY_CHARS を超えるうちは優先度の低い段落を
+    1 つずつ落とす。``parts`` の数値は残す優先度 (0 = 常に残す、大きいほど先に落とす)。
 
-    ``head_extra`` は常に残す段落 (見出しと同格)、``optional`` は優先順の高い順。
-    escape で長さが増えるので、上限は完成した本文に対して最後に掛ける。
+    escape で長さが増えるので、上限は完成した本文に対して最後に掛ける。落としたときは末尾に
+    省略の印を足す (印も上限に含める)。
     """
-    kept = list(optional)
+    kept = list(parts)
     dropped = False
     while True:
-        paragraphs = [heading, *head_extra, *kept] + ([OMITTED_NOTE] if dropped else [])
-        body = "\n\n".join(paragraphs)
-        if len(body) <= BODY_CHARS or not kept:
+        body = "\n\n".join([text for text, _ in kept] + ([OMITTED_NOTE] if dropped else []))
+        droppable = [i for i, (_, rank) in enumerate(kept) if rank > 0]
+        if len(body) <= BODY_CHARS or not droppable:
             return body[:BODY_CHARS]
-        kept.pop()
+        # 同順位は後ろから落とす
+        kept.pop(max(droppable, key=lambda i: (kept[i][1], i)))
         dropped = True
 
 
@@ -215,18 +217,25 @@ def render_approval(record: ApprovalRecord, detail: object | None = None) -> str
     if code is not None:
         return _fallback(record.approval_id, code)
     change = data["change"]
-    heading = _heading(record.approval_id, change)
     reason = change.get("reason")
-    reason_line = REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]) if reason is not None else None
     expires = _moment(data.get("expires_at"))
-    deadline = f"期限: {expires}" if expires is not None else "期限: なし"
-    optional = [deadline]
-    for paragraph in (_params_paragraph(change), _performance_paragraph(change),
-                      _claim_paragraph(change)):
+    parts = [(_heading(record.approval_id, change), 0)]
+    if reason is not None:
+        parts.append((REASON_TEXT.get(reason, REASON_TEXT["unsafe_source"]), 0))
+    parts += _summary_parts(change)
+    parts.append((f"期限: {expires}" if expires is not None else "期限: なし", 1))
+    parts.append((_guide(record.approval_id), 0))
+    return _assemble(parts)
+
+
+def _summary_parts(change: dict) -> list[tuple[str, int]]:
+    """変更・成績・申告の段落 (残す優先度は 変更 > 成績 > 申告)。"""
+    parts: list[tuple[str, int]] = []
+    for paragraph, rank in ((_params_paragraph(change), 2), (_performance_paragraph(change), 3),
+                            (_claim_paragraph(change), 4)):
         if paragraph is not None:
-            optional.append(paragraph)
-    extra = [reason_line] if reason_line is not None else []
-    return _assemble(heading, extra + [_guide(record.approval_id)], optional)
+            parts.append((paragraph, rank))
+    return parts
 
 
 def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None:
@@ -246,13 +255,10 @@ def render_terminal(record: ApprovalRecord, detail: object | None) -> str | None
     if code is not None:
         return f"承認 #{record.approval_id}\n\n{status_line}\n\n{REASON_TEXT[code]}"
     change = data["change"]
-    optional = []
-    for paragraph in (_params_paragraph(change), _performance_paragraph(change),
-                      _claim_paragraph(change)):
-        if paragraph is not None:
-            optional.append(paragraph)
-    return _assemble(_heading(record.approval_id, change),
-                     [status_line, _guide(record.approval_id)], optional)
+    parts = [(_heading(record.approval_id, change), 0), (status_line, 0)]
+    parts += _summary_parts(change)
+    parts.append((_guide(record.approval_id), 0))
+    return _assemble(parts)
 
 
 def primary_view(record: ApprovalRecord) -> ViewModel:

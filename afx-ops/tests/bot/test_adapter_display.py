@@ -438,3 +438,87 @@ def test_a_terminal_record_whose_edit_keeps_failing_is_dropped_at_the_retry_limi
     assert adapter.gate.state.record(7) is None
     assert adapter.gate._read_state().record(7) is None
     assert adapter._edit_retry == {}
+
+
+ROLE = 12345678901234569
+USER = 12345678901234570
+
+
+def test_an_approval_post_never_pings_the_configured_role_or_users_even_with_their_notation(harness):
+    adapter, channel, _ = harness(_record())
+    adapter.settings = BotSettings(guild_id=GUILD, channel_id=CHANNEL, mention_role_id=ROLE,
+                                   mention_user_ids=(USER,))
+    hostile = {"status": "pending", "payload_sha256": DIGEST, "change": {
+        "name": "sma_cross", "kind": "strategy", "classification": "new",
+        "params": {"items": []}, "performance": {"in_sample": []},
+        "summary": f"<@&{ROLE}> <@{USER}> @everyone"}}
+
+    class Client(_Client):
+        def approval(self, approval_id):
+            return Reply(200, hostile, None)
+    adapter.client = Client()
+    channel.edit_outcomes[101] = ["gone"]
+
+    asyncio.run(adapter._repost(adapter.gate.state.record(7)))
+    sent = channel.sent[0]
+    assert sent["allowed_mentions"].to_dict() == {"parse": []}
+    assert f"<@&{ROLE}>" not in sent["content"] and f"<@{USER}>" not in sent["content"]
+    assert "@everyone" not in sent["content"]
+
+
+class _DecidedClient(_Client):
+    def __init__(self, reply=None, error=None) -> None:
+        super().__init__()
+        self.reply, self.error, self.calls = reply, error, []
+
+    def approval(self, approval_id: int) -> Reply:
+        self.calls.append(approval_id)
+        if self.error is not None:
+            raise self.error
+        return self.reply
+
+
+def _decided(status="approved", **fields):
+    detail = {"status": status, "payload_sha256": DIGEST, "decided_by": "api:ops-bot",
+              "decided_at": "2026-10-19T14:16:00+00:00",
+              "change": {"name": "sma_cross", "kind": "strategy", "classification": "updated",
+                         "params": {"items": [{"key": "params.period", "old": "14", "new": "10"}]},
+                         "performance": {"in_sample": [{"pair": "USDJPY", "trades": 120, "pf": 1.25,
+                                                        "avg_r": 0.05}]},
+                         "summary": "短い申告です"}}
+    detail.update(fields)
+    return detail
+
+
+@pytest.mark.parametrize("status,label", [("approved", "承認済み"), ("rejected", "却下"),
+                                           ("expired", "失効")])
+def test_ac30_the_terminal_edit_keeps_the_summary_adds_the_state_and_removes_the_view(
+        harness, status, label):
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = _DecidedClient(Reply(200, _decided(status), None))
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert len(channel.edits) == 1
+    message_id, kwargs = channel.edits[0]
+    assert message_id == 101 and kwargs["view"] is None
+    content = kwargs["content"]
+    assert f"状態: {label} (2026-10-19 14:16 UTC)" in content
+    assert "承認 #7 / 戦略 sma\\_cross (更新)" in content and "params.period: 14 → 10" in content
+    assert "USDJPY" in content and "短い申告です" in content
+    assert "ops-bot" not in content and "api:" not in content
+    assert adapter.gate.state.record(7) is None
+
+
+@pytest.mark.parametrize("client", [
+    _DecidedClient(Reply(404, None, "not_found")),
+    _DecidedClient(Reply(503, None, "unavailable")),
+    _DecidedClient(Reply(200, _decided("pending"), None)),
+    _DecidedClient(Reply(200, _decided("invalidated"), None)),
+    _DecidedClient(error=OSError("daemon down")),
+])
+def test_ac30_without_a_readable_result_the_view_is_still_removed_with_the_fixed_sentence(
+        harness, client):
+    adapter, channel, _ = harness(_record(state="done", edit_pending=True))
+    adapter.client = client
+    asyncio.run(adapter._update_display(adapter.gate.state.record(7)))
+    assert channel.edits == [(101, {"content": "Approval is no longer active.", "view": None})]
+    assert adapter.gate.state.record(7) is None
