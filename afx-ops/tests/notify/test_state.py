@@ -119,12 +119,30 @@ def test_ac25_v2_migrates_to_true_byte_for_byte(tmp_path):
         os.close(fd)
 
 
-def test_ac25_a_v2_snapshot_at_zero_zero_is_also_true(tmp_path):
-    # notify は最初の取得の前に保存しないので、v2 は常に配送の実績の上にある
-    (tmp_path / "notify.snapshot").write_bytes(b'{"cursor": 0, "high_watermark": 0, "version": 2}')
+@pytest.mark.parametrize("high", [0, 30])
+def test_a_v2_snapshot_without_a_delivered_cursor_is_not_started_and_loses_the_watermark(
+        tmp_path, high):
+    # v2 は event を配送しなくても watermark だけを保存し得る。cursor が 0 のままなら未配送
+    (tmp_path / "notify.snapshot").write_bytes(
+        b'{"cursor": 0, "high_watermark": %d, "version": 2}' % high)
     fd = _open_dir(tmp_path)
     try:
-        assert load(fd).event_cursor_initialized is True
+        assert load(fd) == NotifyState(cursor=0, high_watermark=0, event_cursor_initialized=False)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("cursor, high", [(100, 100), (0, 5), (3, 7)])
+def test_a_state_that_is_not_started_must_have_cursor_and_watermark_zero(tmp_path, cursor, high):
+    with pytest.raises(StateError):
+        NotifyState(cursor=cursor, high_watermark=high, event_cursor_initialized=False)
+    (tmp_path / "notify.snapshot").write_bytes(
+        b'{"cursor": %d, "event_cursor_initialized": false, "high_watermark": %d, "version": 3}'
+        % (cursor, high))
+    fd = _open_dir(tmp_path)
+    try:
+        with pytest.raises(StateError):
+            load(fd)
     finally:
         os.close(fd)
 

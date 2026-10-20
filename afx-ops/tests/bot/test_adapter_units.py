@@ -208,7 +208,8 @@ def test_an_approval_ref_with_non_ascii_digits_is_not_an_approval_id():
 
 def test_a_rewound_watermark_or_cursor_in_a_commit_is_a_fixed_reason(tmp_path):
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    gate = GateService(BotState(cursor=5, high_watermark=9, approvals=()),
+    gate = GateService(BotState(cursor=5, high_watermark=9, approvals=(),
+                              event_cursor_initialized=True),
                        guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id)
     adapter = _adapter(gate, _Client(), dir_fd=fd)
     try:

@@ -96,7 +96,9 @@ class BotState:
     def __post_init__(self) -> None:
         if (type(self.cursor) is not int or self.cursor < 0 or type(self.high_watermark) is not int
                 or self.high_watermark < self.cursor
-                or type(self.event_cursor_initialized) is not bool):
+                or type(self.event_cursor_initialized) is not bool
+                or (not self.event_cursor_initialized
+                    and (self.cursor != 0 or self.high_watermark != 0))):
             raise StateError()
         ids = [record.approval_id for record in self.approvals]
         messages = [record.message_id for record in self.approvals]
@@ -179,13 +181,16 @@ _KEYS_V4 = {"version", "cursor", "high_watermark", "approvals"}
 def migrate_v4(obj: object) -> dict[str, object]:
     """v4 の object を v5 の object にする。
 
-    cursor か high watermark が正なら配送実績があるので true (続きから)。0 と 0 は、まだ一度も
-    正常な page を受けていない形と区別できない (v4 は初回 poll の前にも保存する) ので false にする。
+    配送実績は cursor が正のときだけ (true、続きから)。v4 は event を投稿しない周回でも high watermark
+    だけを進めて保存するので、cursor が 0 なら watermark が正でも未配送 (false) とし、false の
+    不変条件 (cursor も watermark も 0) に合わせて watermark を捨てる。最初の正常な page の末尾から始まる。
     """
     if (type(obj) is not dict or set(obj) != _KEYS_V4 or obj["version"] != PREVIOUS_VERSION
             or type(obj["cursor"]) is not int or type(obj["high_watermark"]) is not int):
         raise StateError()
-    delivered = obj["cursor"] > 0 or obj["high_watermark"] > 0
+    delivered = obj["cursor"] > 0
+    if not delivered:
+        obj = {**obj, "cursor": 0, "high_watermark": 0}
     return {**obj, "version": SNAPSHOT_VERSION, "event_cursor_initialized": delivered}
 
 

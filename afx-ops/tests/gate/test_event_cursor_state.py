@@ -51,7 +51,6 @@ def test_ac25_saving_an_empty_state_writes_flag_false_in_v5(tmp_path, fd):
 
 @pytest.mark.parametrize("cursor, high, approvals, flag", [
     (3, 5, _RECORD, "true"),
-    (0, 4, "", "true"),
     (2, 2, "", "true"),
     (0, 0, "", "false"),
     (0, 0, _RECORD, "false"),
@@ -108,7 +107,7 @@ def test_ac25_a_cursor_cannot_advance_before_the_start():
     assert observe_high(initialize_event_cursor(BotState.empty(), 2), 5).event_cursor_initialized
 
 
-@pytest.mark.parametrize("cursor, high", [(1, 1), (0, 1), (1, 2)])
+@pytest.mark.parametrize("cursor, high", [(1, 1), (1, 2)])
 def test_ac25_the_smallest_delivery_footprints_migrate_to_true(cursor, high):
     obj = {"version": 4, "cursor": cursor, "high_watermark": high, "approvals": []}
     assert migrate_v4(obj)["event_cursor_initialized"] is True
@@ -131,3 +130,25 @@ def test_ac25_advance_and_observe_never_move_the_cursor_or_watermark_backwards()
     with pytest.raises(StateError):
         observe_high(started, 8)
     assert observe_high(started, 9).high_watermark == 9
+
+
+@pytest.mark.parametrize("high", [1, 40])
+def test_a_v4_snapshot_with_a_watermark_but_no_cursor_is_not_delivered_and_loses_the_watermark(
+        tmp_path, fd, high):
+    # v4 は event を配送しない周回でも watermark だけを進めて保存する。cursor が 0 のままなら未配送
+    obj = {"version": 4, "cursor": 0, "high_watermark": high, "approvals": []}
+    migrated = migrate_v4(obj)
+    assert migrated["event_cursor_initialized"] is False
+    assert (migrated["cursor"], migrated["high_watermark"]) == (0, 0)
+    (tmp_path / "bot.snapshot").write_bytes(_v4(0, high, ""))
+    state = load(fd)
+    assert (state.cursor, state.high_watermark, state.event_cursor_initialized) == (0, 0, False)
+
+
+@pytest.mark.parametrize("cursor, high", [(100, 100), (0, 5), (3, 7)])
+def test_a_state_that_is_not_started_must_have_cursor_and_watermark_zero(tmp_path, fd, cursor, high):
+    with pytest.raises(StateError):
+        BotState(cursor=cursor, high_watermark=high, approvals=())
+    (tmp_path / "bot.snapshot").write_bytes(_v5(cursor, high, "", "false"))
+    with pytest.raises(StateError):
+        load(fd)

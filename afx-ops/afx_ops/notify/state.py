@@ -46,6 +46,8 @@ class NotifyState:
             raise StateError()
         if type(self.event_cursor_initialized) is not bool:
             raise StateError()
+        if not self.event_cursor_initialized and (self.cursor != 0 or self.high_watermark != 0):
+            raise StateError()
 
 
 def _as_object(state: NotifyState) -> dict[str, object]:
@@ -58,10 +60,18 @@ _KEYS_V2 = {"version", "cursor", "high_watermark"}
 
 
 def migrate_v2(obj: object) -> dict[str, object]:
-    """v2 の object を v3 の object にする。v2 は最初の取得の前に保存しないので、配送実績の上にある (true)。"""
+    """v2 の object を v3 の object にする。
+
+    配送実績は cursor が正のときだけ (true)。v2 は配送しなくても watermark だけを保存し得るので、
+    cursor が 0 なら未配送 (false) とし、false の不変条件 (cursor も watermark も 0) に合わせて
+    watermark を捨てる。
+    """
     if type(obj) is not dict or set(obj) != _KEYS_V2 or obj["version"] != PREVIOUS_VERSION:
         raise StateError()
-    return {**obj, "version": SNAPSHOT_VERSION, "event_cursor_initialized": True}
+    delivered = type(obj["cursor"]) is int and obj["cursor"] > 0
+    if not delivered:
+        obj = {**obj, "cursor": 0, "high_watermark": 0}
+    return {**obj, "version": SNAPSHOT_VERSION, "event_cursor_initialized": delivered}
 
 
 def _from_object(obj: object) -> NotifyState:
