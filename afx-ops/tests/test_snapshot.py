@@ -167,3 +167,22 @@ def test_the_temp_file_is_synced_before_the_rename_and_the_directory_after(tmp_p
     finally:
         os.close(dir_fd)
     assert events == ["file", "replace", "dir"]
+
+
+def test_only_the_listed_older_versions_are_read_besides_the_current_one(tmp_path):
+    dir_fd = _open_dir(tmp_path)
+    try:
+        write_snapshot(dir_fd, "state.json", {"version": 3})
+        with pytest.raises(SnapshotError):
+            read_snapshot(dir_fd, "state.json", 5, older=(4,))
+        with pytest.raises(SnapshotError):
+            read_snapshot(dir_fd, "state.json", 5)
+        write_snapshot(dir_fd, "state.json", {"version": 4})
+        assert read_snapshot(dir_fd, "state.json", 5, older=(4,)) == {"version": 4}
+        with pytest.raises(SnapshotError):
+            read_snapshot(dir_fd, "state.json", 5)
+        write_snapshot(dir_fd, "state.json", {"version": 6})
+        with pytest.raises(SnapshotError):
+            read_snapshot(dir_fd, "state.json", 5, older=(4,))
+    finally:
+        os.close(dir_fd)

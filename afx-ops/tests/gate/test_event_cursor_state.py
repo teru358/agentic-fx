@@ -6,7 +6,7 @@ import os
 import pytest
 
 from afx_ops.gate.state import (BotState, StateError, advance_event, initialize_event_cursor,
-                                load, observe_high, save)
+                                load, migrate_v4, observe_high, save)
 
 _RECORD = ('{"action": null, "actor": null, "approval_id": 7, "channel_id": 12345678901234568, '
            '"confirm_message_id": null, "display_generation": 1, "edit_pending": false, '
@@ -106,3 +106,28 @@ def test_ac25_a_cursor_cannot_advance_before_the_start():
     with pytest.raises(StateError):
         advance_event(BotState.empty(), 1)
     assert observe_high(initialize_event_cursor(BotState.empty(), 2), 5).event_cursor_initialized
+
+
+@pytest.mark.parametrize("cursor, high", [(1, 1), (0, 1), (1, 2)])
+def test_ac25_the_smallest_delivery_footprints_migrate_to_true(cursor, high):
+    obj = {"version": 4, "cursor": cursor, "high_watermark": high, "approvals": []}
+    assert migrate_v4(obj)["event_cursor_initialized"] is True
+
+
+@pytest.mark.parametrize("version", [3, 5, 6, "4", None])
+def test_ac25_migrate_v4_accepts_only_a_v4_object(version):
+    obj = {"version": version, "cursor": 1, "high_watermark": 1, "approvals": []}
+    with pytest.raises(StateError):
+        migrate_v4(obj)
+
+
+def test_ac25_advance_and_observe_never_move_the_cursor_or_watermark_backwards():
+    started = advance_event(initialize_event_cursor(BotState.empty(), 5), 6, high_watermark=9)
+    for event_id, high in ((6, 9), (5, 9)):
+        with pytest.raises(StateError):
+            advance_event(started, event_id, high_watermark=high)
+    with pytest.raises(StateError):
+        advance_event(started, 7, high_watermark=8)
+    with pytest.raises(StateError):
+        observe_high(started, 8)
+    assert observe_high(started, 9).high_watermark == 9

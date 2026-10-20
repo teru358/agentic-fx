@@ -278,3 +278,46 @@ def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(p
     with pytest.raises(BotFailure, match="events_invalid"):
         proc.poll()
     assert proc.channel.sent == [] and load(proc.fd) == before
+
+
+_BAD_PAGES = {
+    "watermark one below the last id": _page([_health(10)], 9),
+    "watermark below an id before an unreadable event": {
+        "events": [_health(10), {"id": "x"}], "high_watermark": 9},
+    "no watermark": {"events": []},
+    "negative watermark": {"events": [], "high_watermark": -1},
+    "boolean watermark": {"events": [], "high_watermark": True},
+}
+
+
+@pytest.mark.parametrize("name", list(_BAD_PAGES))
+def test_a_malformed_first_page_starts_nothing(process, name):
+    proc = process(_Events(_BAD_PAGES[name]))
+    proc.start()
+    with pytest.raises(BotFailure, match="events_invalid"):
+        proc.poll()
+    assert proc.channel.sent == []
+    assert proc.snapshot()["event_cursor_initialized"] is False
+
+
+@pytest.mark.parametrize("name", list(_BAD_PAGES))
+def test_a_malformed_page_after_the_start_changes_nothing(process, name):
+    proc = process(_Events(_page([_health(1)]), _BAD_PAGES[name]))
+    proc.start()
+    proc.poll()
+    before = proc.snapshot()
+    with pytest.raises(BotFailure, match="events_invalid"):
+        proc.poll()
+    assert proc.channel.sent == [] and proc.snapshot() == before
+
+
+def test_a_page_without_events_still_persists_a_higher_watermark_and_a_later_rollback_stops(process):
+    proc = process(_Events(_page([_health(1)]), {"events": [], "high_watermark": 9},
+                           {"events": [], "high_watermark": 4}))
+    proc.start()
+    proc.poll()
+    proc.poll()
+    assert proc.snapshot()["high_watermark"] == 9 and proc.snapshot()["cursor"] == 1
+    with pytest.raises(BotFailure, match="high_watermark_regressed"):
+        proc.poll()
+    assert proc.snapshot()["high_watermark"] == 9

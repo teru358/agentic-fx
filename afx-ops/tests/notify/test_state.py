@@ -6,7 +6,7 @@ import os
 import pytest
 
 from afx_ops.notify.state import (NotifyState, StateError, advance_delivery,
-                                  initialize_event_cursor, load, observe_high, save)
+                                  initialize_event_cursor, load, migrate_v2, observe_high, save)
 
 
 _STARTED = NotifyState(cursor=0, high_watermark=0, event_cursor_initialized=True)
@@ -154,3 +154,17 @@ def test_ac25_the_start_sets_cursor_high_and_flag_together_once_and_gates_delive
         advance_delivery(NotifyState.empty(), 1)
     assert observe_high(started, 20).event_cursor_initialized is True
     assert advance_delivery(started, 10).event_cursor_initialized is True
+
+
+def test_ac25_migrate_v2_accepts_only_a_v2_object():
+    for version in (1, 3, 4, "2", None):
+        with pytest.raises(StateError):
+            migrate_v2({"version": version, "cursor": 1, "high_watermark": 1})
+
+
+def test_ac25_a_delivery_never_repeats_an_id_and_the_watermark_never_falls():
+    state = advance_delivery(initialize_event_cursor(NotifyState.empty(), 5), 6)
+    with pytest.raises(StateError):
+        advance_delivery(state, 6)
+    with pytest.raises(StateError):
+        advance_delivery(state, 5)

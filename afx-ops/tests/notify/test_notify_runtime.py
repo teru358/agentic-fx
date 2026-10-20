@@ -567,3 +567,30 @@ def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(s
     rc, err = _run(state_dir, FakeClient([{"events": [_event(200)], "high_watermark": 150}]), send)
     assert (rc, err) == (1, "afx-ops: events_invalid\n")
     assert send.bodies == [] and _state(state_dir) == before
+
+
+_BAD_PAGES = {
+    "one below": {"events": [_event(10)], "high_watermark": 9},
+    "below an id before an unreadable event": {
+        "events": [_event(10), {"id": "x"}], "high_watermark": 9},
+    "no watermark": {"events": []},
+    "negative": {"events": [], "high_watermark": -1},
+    "boolean": {"events": [], "high_watermark": True},
+}
+
+
+@pytest.mark.parametrize("name", list(_BAD_PAGES))
+def test_a_malformed_first_page_saves_and_delivers_nothing(fresh_dir, name):
+    send = FakeSend()
+    rc, err = _run(fresh_dir, FakeClient([_BAD_PAGES[name]]), send)
+    assert (rc, err) == (1, "afx-ops: events_invalid\n")
+    assert send.bodies == [] and not (fresh_dir / "notify.snapshot").exists()
+
+
+@pytest.mark.parametrize("name", list(_BAD_PAGES))
+def test_a_malformed_page_after_the_start_changes_nothing(state_dir, name):
+    before = _state(state_dir)
+    send = FakeSend()
+    rc, err = _run(state_dir, FakeClient([_BAD_PAGES[name]]), send)
+    assert (rc, err) == (1, "afx-ops: events_invalid\n")
+    assert send.bodies == [] and _state(state_dir) == before
