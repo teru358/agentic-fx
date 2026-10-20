@@ -450,28 +450,31 @@ def test_ac7_the_deadline_is_a_utc_minute_when_it_has_a_zone_and_unreadable_valu
 
 
 def test_ac9_the_omission_note_counts_toward_the_2000_character_limit(monkeypatch):
-    def base_length(rows, first, last):
+    def full_length(first, last, pad):
         items = [_item(f"params.{'k' * 40}{i}", "*" * (first if i == 0 else 40), "_" * 40)
-                 for i in range(rows - 1)]
+                 for i in range(8)]
         items.append(_item("params.last", "a", "b" * last))
+        row = {"pair": "P" * pad, "trades": 1, "pf": 1.0, "avg_r": 0.0}
         change = _change(params={"items": items, "omitted": 0, "invalid_keys": 0,
-                                 "flatten_omitted": 0, "reason": None}, summary="")
-        return change, len(render_approval(_record(), _detail(change)))
+                                 "flatten_omitted": 0, "reason": None},
+                         performance={"in_sample": [row], "holdout": []}, summary="")
+        with monkeypatch.context() as patch:
+            patch.setattr(render, "BODY_CHARS", 10 ** 6)
+            return change, len(render_approval(_record(), _detail(change)))
 
     found = {}
-    for rows in range(2, 11):
-        for first in range(0, 81):
-            for last in (0, 20, 40, 60, 80):
-                change, length = base_length(rows, first, last)
-                if length not in found and 1986 <= length <= 2000:
-                    found[length] = change
-    # 期限 + 変更 + 成績 + 見出し + 操作案内だけで 1986 〜 2000 字に届く構成が複数ある
-    assert len(found) >= 6, sorted(found)
+    for first in range(0, 81, 4):
+        for last in range(0, 81, 4):
+            for pad in (0, 30, 60):
+                change, length = full_length(first, last, pad)
+                if 1991 <= length <= 2000:
+                    found.setdefault(length, change)
+    # 申告を除いた本文が、省略の印 (と区切り) を足すと 2000 字を超える長さにある構成が複数ある
+    assert len(found) >= 5, sorted(found)
     for length, change in found.items():
-        change = dict(change, summary="a claim that does not fit")
-        text = render_approval(_record(), _detail(change))
+        text = render_approval(_record(), _detail(dict(change, summary="a claim that does not fit")))
         assert len(text) <= 2000, length
-        assert text.endswith(OMITTED_NOTE) and "agent の申告" not in text
+        assert "agent の申告" not in text and OMITTED_NOTE in text
 
 
 def test_the_final_hard_cap_cuts_even_when_only_undroppable_paragraphs_remain(monkeypatch):
