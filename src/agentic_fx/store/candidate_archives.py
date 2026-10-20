@@ -227,6 +227,7 @@ def backfill_outcome_from_approvals(conn: sqlite3.Connection) -> None:
     unlinked_missions: set[int] = set()
     revocations: list[dict] = []
     approved_here: set[int] = set()
+    latest_outcome: dict[int, str] = {}
     for approval in approvals:
         try:
             payload = json.loads(approval["payload_json"])
@@ -246,11 +247,15 @@ def backfill_outcome_from_approvals(conn: sqlite3.Connection) -> None:
                 unlinked_missions.add(mission_id)
             continue
         if outcome is not None:
-            moved = conn.execute(
-                "UPDATE candidate_archives SET outcome_class=? WHERE id=? "
-                "AND outcome_class='not_submitted'", (outcome, archive_id))
-            if outcome == "approved" and moved.rowcount == 1:
-                approved_here.add(archive_id)
+            # id 昇順に処理するので、同じ行に解決される承認が複数あるときは
+            # 最新 (id 最大) の承認が残る。
+            latest_outcome[archive_id] = outcome
+    for archive_id, outcome in latest_outcome.items():
+        moved = conn.execute(
+            "UPDATE candidate_archives SET outcome_class=? WHERE id=? "
+            "AND outcome_class='not_submitted'", (outcome, archive_id))
+        if outcome == "approved" and moved.rowcount == 1:
+            approved_here.add(archive_id)
     for revocation in revocations:
         target = decoded.get(revocation.get("revokes_approval_id"))
         archive_id = resolve(conn, target)

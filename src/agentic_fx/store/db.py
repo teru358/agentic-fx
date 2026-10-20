@@ -1667,9 +1667,17 @@ def _backfill_candidate_archive_identity(conn: sqlite3.Connection, *,
         "(logic_hash IS NULL AND family_key IS NULL) "
         "OR (logic_hash IS NOT NULL AND substr(logic_hash, 1, ?) != ?))",
         (len(LOGIC_HASH_PREFIX), LOGIC_HASH_PREFIX)).fetchall()
+    resolved_root = root.resolve()
     for row in rows:
-        target = root / row["archive_path"]
+        relative = Path(row["archive_path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        target = root / relative
         if target.is_symlink() or not target.is_dir():
+            continue
+        try:
+            target.resolve().relative_to(resolved_root)
+        except ValueError:
             continue
         logic, family = identity_of_dir(target, name=row["name"])
         if logic is None:
