@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
+from . import trade_events
 from .contracts import ErrorCode, OpsError
 
 FIELDS = {
@@ -22,6 +23,7 @@ FIELDS = {
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
+    **trade_events.FIELDS,
 }
 
 # 値は code・識別子・時刻・数だけ。空白や非 ASCII を含む自由文は入れられない。
@@ -36,6 +38,8 @@ _REF = {
     "guard_state_changed": re.compile(r"instance"),
     "service_health_changed": re.compile(r"instance"),
     "event_stream_health": re.compile(r"instance"),
+    trade_events.ORDER_CODE: trade_events.REF_PATTERN,
+    trade_events.CLOSE_CODE: trade_events.REF_PATTERN,
 }
 
 
@@ -48,6 +52,12 @@ def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
         raise EventSchemaError(code)
     if ref is not None and (not isinstance(ref, str) or _REF[code].fullmatch(ref) is None):
         raise EventSchemaError(code)
+    if code in trade_events.TRADE_CODES:
+        # 取引 event は field ごとの grammar と canonical、ref の整数範囲まで見る
+        if not trade_events.valid_fields(code, fields) or (
+                ref is not None and not trade_events.valid_ref(ref)):
+            raise EventSchemaError(code)
+        return
     for value in fields.values():
         if value is None or (isinstance(value, int) and not isinstance(value, bool)):
             continue
