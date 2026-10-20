@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -265,6 +266,39 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_improvement_runs_mission_id
   WHERE mission_id IS NOT NULL;
 """
 
+# 候補台帳。`pair` は属性なので NULL を許す (indicator 候補は pair を持たない)。
+# 既存 DB では table rebuild が要るため、DDL を `_migrate_candidate_archives`
+# からも再利用できるよう定数として切り出す。追加列は末尾に置く。
+_CANDIDATE_ARCHIVES_OUTCOMES = (
+    "not_submitted", "pending", "approved", "rejected_by_human", "expired",
+    "invalidated", "revoked", "unprofitable", "insufficient_trades",
+    "gate_failed", "noop_copy", "duplicate_logic", "duplicate_metrics",
+    "family_redirect")
+_CANDIDATE_ARCHIVES_COLUMNS = (
+    "id", "mission_id", "name", "content_hash", "artifact_hash",
+    "archive_path", "pair", "metrics_json", "created_at", "logic_hash",
+    "family_key", "outcome_class", "quality_flags")
+_CANDIDATE_ARCHIVES_DDL = """
+CREATE TABLE IF NOT EXISTS candidate_archives (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mission_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  artifact_hash TEXT NOT NULL,
+  archive_path TEXT,
+  pair TEXT,
+  metrics_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  logic_hash TEXT,
+  family_key TEXT,
+  outcome_class TEXT NOT NULL DEFAULT 'not_submitted'
+    CHECK (outcome_class IN (""" + ",".join(
+        f"'{v}'" for v in _CANDIDATE_ARCHIVES_OUTCOMES) + """)),
+  quality_flags TEXT NOT NULL DEFAULT '[]',
+  UNIQUE(mission_id, artifact_hash)
+);
+"""
+
 _SCHEMA = _OHLCV_CACHE_DDL + _OHLCV_HISTORY_DDL + """
 CREATE TABLE IF NOT EXISTS data_migrations (
   name TEXT PRIMARY KEY, applied_at TEXT NOT NULL
@@ -382,18 +416,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
   params_json TEXT NOT NULL, trial_count INTEGER NOT NULL,
   source TEXT NOT NULL, created_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS candidate_archives (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  mission_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-  content_hash TEXT NOT NULL,
-  artifact_hash TEXT NOT NULL,
-  archive_path TEXT,
-  pair TEXT NOT NULL,
-  metrics_json TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  UNIQUE(mission_id, artifact_hash)
-);
+""" + _CANDIDATE_ARCHIVES_DDL + """
 """ + _SIGNALS_V2_DDL + _PLUGIN_DEPLOY_OPS_DDL + _PLUGIN_DEPLOY_OPS_OPEN_UNIQUE_DDL + _PLUGIN_DEPLOY_OP_SIGNALS_DDL + """
 -- プラン 9 束 C (codex 指摘の裏取り): prune_cache (store/ohlcv.py) の
 -- `WHERE bar_time < ?` は PK (symbol, interval, bar_time, source) の先頭列に
@@ -597,10 +620,13 @@ def _values_match(a: float | None, b: float | None) -> bool:
 values_match = _values_match
 
 
-def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
+def _backup_before_migration(conn: sqlite3.Connection, suffix: str, *,
+                             from_new_connection: bool = False) -> None:
     """移行が必要と判定された時だけ、移行前スナップショットを取る。
     `suffix` は移行の種類ごとに別ファイルにするための識別子
-    (Task 16: v1→v2 移行と v2→split 移行を別バックアップにする)。"""
+    (Task 16: v1→v2 移行と v2→split 移行を別バックアップにする)。
+    `from_new_connection` は、呼び出し側が書き込み tx を持っている間に
+    取るとき用で、別接続から (tx 前の確定済みの状態を) 読んで写す。"""
     main = next((r for r in conn.execute("PRAGMA database_list")
                 if r["name"] == "main"), None)
     db_file = main["file"] if main is not None else ""
@@ -612,10 +638,13 @@ def _backup_before_migration(conn: sqlite3.Connection, suffix: str) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         bak_path = src_path.with_name(src_path.name + suffix + "." + timestamp)
     bak_conn = sqlite3.connect(bak_path)
+    source = sqlite3.connect(src_path) if from_new_connection else conn
     try:
-        conn.backup(bak_conn)
+        source.backup(bak_conn)
     finally:
         bak_conn.close()
+        if from_new_connection:
+            source.close()
     _log.warning("ohlcv 移行前のバックアップを作成しました: %s", bak_path)
 
 
@@ -1461,7 +1490,12 @@ def _migrate_legacy_plugin_approval_payloads(conn: sqlite3.Connection) -> None:
              if not payload.get(k)])
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
+    """スキーマを作り、旧形式なら移行する。
+
+    `root` は旧候補台帳の archive (`<root>/plugins/_archive/...`) から
+    `logic_hash` / `family_key` を再計算するために使う。省略時は再計算せず
+    NULL のままにする (次に root つきで呼ばれたときに埋める)。"""
     conn.executescript(_SCHEMA)
     conn.executescript(_OPS_SCHEMA)
     if _ohlcv_legacy_exists(conn):
@@ -1501,8 +1535,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "backtest_runs", "ref_plugin_ref", "ref_plugin_ref TEXT")
     _ensure_column(conn, "backtest_runs", "ref_content_hash", "ref_content_hash TEXT")
     _migrate_backtest_runs_outcome(conn)
-    # candidate_archives は _SCHEMA (CREATE TABLE IF NOT EXISTS) だけで作る —
-    # 新規表なので migration 経路は不要 (旧 DB でも _SCHEMA が先に流れる)。
+    # 旧形式の candidate_archives は、承認の決定が台帳の列を更新する前
+    # (`_migrate_legacy_plugin_approval_payloads` が `apply_decision` を呼ぶ)
+    # に新形式へ移す。
+    _migrate_candidate_archives(conn, root=root)
     _migrate_legacy_plugin_approval_payloads(conn)   # §5.5 (8-C 節)
     # --- プラン 10 Task 8 ここまで ---
     # round2 #8 是正 (2026-08-29、verified-round2.md #8): 重複検出を Python
@@ -1531,6 +1567,125 @@ def init_db(conn: sqlite3.Connection) -> None:
     _ensure_column(
         conn, "datafeed_outage_state", "restricted_deadline_at",
         "restricted_deadline_at TEXT")
+    conn.commit()
+
+
+def _candidate_archives_shape(conn: sqlite3.Connection) -> list[tuple]:
+    return [(r["name"], r["type"].upper(), r["notnull"], r["dflt_value"], r["pk"])
+            for r in conn.execute("PRAGMA table_info(candidate_archives)")]
+
+
+def _outcome_check_values(conn: sqlite3.Connection) -> frozenset[str]:
+    """表の DDL にある `outcome_class IN (...)` の許容値。CHECK が無ければ空。"""
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                       "AND name='candidate_archives'").fetchone()
+    match = re.search(r"CHECK\s*\(\s*outcome_class\s+IN\s*\(([^)]*)\)",
+                      row["sql"] if row is not None else "")
+    if match is None:
+        return frozenset()
+    return frozenset(re.findall(r"'([^']*)'", match.group(1)))
+
+
+def _candidate_archives_is_canonical(conn: sqlite3.Connection) -> bool:
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.row_factory = sqlite3.Row
+        probe.executescript(_CANDIDATE_ARCHIVES_DDL)
+        canonical = _candidate_archives_shape(probe)
+        canonical_check = _outcome_check_values(probe)
+    finally:
+        probe.close()
+    return (_candidate_archives_shape(conn) == canonical
+            and _outcome_check_values(conn) == canonical_check)
+
+
+def _migrate_candidate_archives(conn: sqlite3.Connection, *,
+                                root: Path | None) -> None:
+    """候補台帳を現行の形 (4 列追加と `pair` の NULL 許可) にする。
+
+    `PRAGMA table_info` か `outcome_class` の CHECK 句が正準と食い違うときだけ table rebuild
+    (新表 CREATE → コピー → 旧表 DROP → RENAME) を行い、同じ tx で
+    `not_submitted` のままの行の `outcome_class` を承認との照合で埋める。
+    既存列の値と、既に値のある行は変えない。
+    `logic_hash` / `family_key` は rebuild と別に、NULL の行へ archive の
+    現物から埋める (root がある起動のたびに残りだけ試す)。"""
+    if not _candidate_archives_is_canonical(conn):
+        _rebuild_candidate_archives(conn)
+    if root is not None:
+        _backfill_candidate_archive_identity(conn, root=root)
+
+
+def _rebuild_candidate_archives(conn: sqlite3.Connection) -> None:
+    """書き込みロックを取ってから形を再確認し、既に正準なら何もしない
+    (並行する起動が先に移行を終えていることがある)。backup もロックの
+    中で取り、実際に rebuild する 1 回だけにする。"""
+    from agentic_fx.store import candidate_archives as archives_mod
+
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _candidate_archives_is_canonical(conn):
+            conn.commit()
+            return
+        _backup_before_migration(
+            conn, ".bak-candidate-archives", from_new_connection=True)
+        old_columns = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(candidate_archives)")}
+        carried = [c for c in _CANDIDATE_ARCHIVES_COLUMNS if c in old_columns]
+        column_list = ",".join(carried)
+        seq = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='candidate_archives'"
+        ).fetchone()
+        conn.execute("DROP TABLE IF EXISTS candidate_archives_new")
+        conn.execute(_CANDIDATE_ARCHIVES_DDL.replace(
+            "candidate_archives (", "candidate_archives_new (", 1))
+        conn.execute(
+            f"INSERT INTO candidate_archives_new ({column_list}) "
+            f"SELECT {column_list} FROM candidate_archives")
+        conn.execute("DROP TABLE candidate_archives")
+        conn.execute(
+            "ALTER TABLE candidate_archives_new RENAME TO candidate_archives")
+        if seq is not None:
+            conn.execute(
+                "UPDATE sqlite_sequence SET seq=? WHERE name='candidate_archives'",
+                (seq["seq"],))
+        archives_mod.backfill_outcome_from_approvals(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _backfill_candidate_archive_identity(conn: sqlite3.Connection, *,
+                                         root: Path) -> None:
+    from agentic_fx.plugin.logic_identity import (
+        LOGIC_HASH_PREFIX, identity_of_dir)
+
+    rows = conn.execute(
+        "SELECT id, name, archive_path, logic_hash FROM candidate_archives "
+        "WHERE archive_path IS NOT NULL AND ("
+        "(logic_hash IS NULL AND family_key IS NULL) "
+        "OR (logic_hash IS NOT NULL AND substr(logic_hash, 1, ?) != ?))",
+        (len(LOGIC_HASH_PREFIX), LOGIC_HASH_PREFIX)).fetchall()
+    resolved_root = root.resolve()
+    for row in rows:
+        relative = Path(row["archive_path"])
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        target = root / relative
+        if target.is_symlink() or not target.is_dir():
+            continue
+        try:
+            target.resolve().relative_to(resolved_root)
+        except ValueError:
+            continue
+        logic, family = identity_of_dir(target, name=row["name"])
+        if logic is None:
+            if family is None or row["logic_hash"] is not None:
+                continue
+        conn.execute(
+            "UPDATE candidate_archives SET logic_hash=?, family_key=? "
+            "WHERE id=?", (logic, family, row["id"]))
     conn.commit()
 
 

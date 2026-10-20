@@ -132,7 +132,26 @@ class ImproveSupervisor:
                 on_prepared(ctx.mission_id)
             except Exception:  # noqa: BLE001
                 _log.exception("on_prepared callback failed")
-        result = runner.run(mission)
+        # runner.run() 自体が例外を投げる窓: 補償しないと mission / run が
+        # 非終端のまま残るため、定期 slot と同じく補償してから re-raise する。
+        # shutdown 系 (KeyboardInterrupt / SystemExit) では補償を新しく始めない。
+        # 補償自身が失敗しても、呼び出し元には元の例外を見せる (補償の失敗は
+        # log に残す)。
+        try:
+            result = runner.run(mission)
+        except Exception:
+            _log.exception(
+                "improve runner.run raised for manual mission_id=%s — "
+                "compensating", ctx.mission_id)
+            try:
+                self._improve_loop.compensate_launch_failure(
+                    ctx=ctx, now=self._clock.now())
+            except Exception:
+                _log.exception(
+                    "launch compensation failed for manual mission_id=%s",
+                    ctx.mission_id)
+                self._record_compensation_failed(ctx.mission_id, "launch")
+            raise
         try:
             self._improve_loop.commit(
                 mission=mission, ctx=ctx, result=result, now=self._clock.now())
@@ -140,11 +159,29 @@ class ImproveSupervisor:
             _log.exception(
                 "improve commit raised for manual mission_id=%s — "
                 "compensating", ctx.mission_id)
-            self._improve_loop.compensate_commit_failure(
-                ctx=ctx, now=self._clock.now(), exc=exc,
-                slot_terminalize=True)
+            try:
+                self._improve_loop.compensate_commit_failure(
+                    ctx=ctx, now=self._clock.now(), exc=exc,
+                    slot_terminalize=True)
+            except Exception:
+                _log.exception(
+                    "commit compensation failed for manual mission_id=%s",
+                    ctx.mission_id)
+                self._record_compensation_failed(ctx.mission_id, "commit")
             raise
         return ctx.mission_id
+
+    def _record_compensation_failed(self, mission_id, phase: str) -> None:
+        """補償の失敗を activity に残す。記録に失敗しても何も送出しない
+        (呼び出し元は元の例外を上げ直す)。"""
+        if self._activity is None:
+            return
+        try:
+            self._activity.write(
+                Category.IMPROVE, "compensation_failed",
+                f"mission_id={mission_id} phase={phase}")
+        except Exception:  # noqa: BLE001
+            _log.exception("compensation_failed record failed")
 
     def shutdown(self) -> None:
         self._stop_event.set()

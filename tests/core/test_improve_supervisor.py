@@ -308,3 +308,113 @@ def test_launch_slot_pre_ready_path_compensates_commit_exception_and_reraises(
     assert len(loop.compensations) == 1
     assert loop.compensations[0]["ctx"] is ctx
     assert loop.compensations[0]["slot_terminalize"] is False
+
+
+class _RunFailureRunner:
+    def __init__(self, exc):
+        self.exc = exc
+        self.on_ready = None
+
+    def run(self, mission):
+        raise self.exc
+
+
+class _LaunchCompensationLoop(_CommitFailureLoop):
+    def __init__(self, ctx, runner, *, compensation_error=None):
+        super().__init__(ctx, runner)
+        self.compensation_error = compensation_error
+
+    def compensate_launch_failure(self, **kwargs):
+        self.compensations.append(kwargs)
+        if self.compensation_error is not None:
+            raise self.compensation_error
+
+    def compensate_commit_failure(self, **kwargs):
+        super().compensate_commit_failure(**kwargs)
+        if self.compensation_error is not None:
+            raise self.compensation_error
+
+
+def test_submit_manual_shows_the_original_error_when_launch_compensation_fails(
+        tmp_path):
+    loop = _LaunchCompensationLoop(
+        SimpleNamespace(mission_id=101),
+        _RunFailureRunner(ValueError("runner failed")),
+        compensation_error=OSError("db locked"))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    with pytest.raises(ValueError, match="runner failed"):
+        sup.submit_manual()
+    assert len(loop.compensations) == 1
+
+
+def test_submit_manual_shows_the_original_error_when_commit_compensation_fails(
+        tmp_path):
+    loop = _LaunchCompensationLoop(
+        SimpleNamespace(mission_id=101),
+        _CommitFailureRunner(type("Result", (), {"status": "completed"})()),
+        compensation_error=OSError("db locked"))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    with pytest.raises(RuntimeError, match="boom"):
+        sup.submit_manual()
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt, SystemExit])
+def test_submit_manual_does_not_start_compensation_on_shutdown_signals(
+        tmp_path, exc):
+    loop = _LaunchCompensationLoop(
+        SimpleNamespace(mission_id=101), _RunFailureRunner(exc()))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    with pytest.raises(exc):
+        sup.submit_manual()
+    assert loop.compensations == []
+
+
+class _RecordingActivity:
+    def __init__(self, *, fail=False):
+        self.rows = []
+        self.fail = fail
+
+    def write(self, category, event, detail="", *args):
+        if self.fail:
+            raise OSError("activity down")
+        self.rows.append((event, detail))
+
+
+@pytest.mark.parametrize("runner_factory,error", [
+    (lambda: _RunFailureRunner(ValueError("runner failed")), ValueError),
+    (lambda: _CommitFailureRunner(type("Result", (), {"status": "completed"})()),
+     RuntimeError),
+])
+def test_submit_manual_records_a_failed_compensation(
+        tmp_path, runner_factory, error):
+    loop = _LaunchCompensationLoop(
+        SimpleNamespace(mission_id=101), runner_factory(),
+        compensation_error=OSError("db locked"))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    sup._activity = _RecordingActivity()
+    with pytest.raises(error):
+        sup.submit_manual()
+    events = [e for e, _ in sup._activity.rows]
+    assert events == ["compensation_failed"]
+    assert "mission_id=101" in sup._activity.rows[0][1]
+
+
+@pytest.mark.parametrize("runner_factory,error", [
+    (lambda: _RunFailureRunner(ValueError("runner failed")), ValueError),
+    (lambda: _CommitFailureRunner(type("Result", (), {"status": "completed"})()),
+     RuntimeError),
+])
+def test_failed_compensation_record_failure_keeps_the_original_error(
+        tmp_path, runner_factory, error):
+    loop = _LaunchCompensationLoop(
+        SimpleNamespace(mission_id=101), runner_factory(),
+        compensation_error=OSError("db locked"))
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = loop
+    sup._activity = _RecordingActivity(fail=True)
+    with pytest.raises(error):
+        sup.submit_manual()

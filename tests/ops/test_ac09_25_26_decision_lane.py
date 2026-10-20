@@ -113,6 +113,10 @@ def test_ac25_job_completes_without_polling_and_duplicate_is_in_progress(ops_env
     while ops_env.approval(approval_id)["status"] == "pending" and time.monotonic() < deadline:
         time.sleep(0.02)
     assert ops_env.approval(approval_id)["status"] == "rejected"
+    # 承認の決定が commit されてから job が done になるまでは別の step。
+    while (service.jobs.lookup(reply["job_id"]).state.value != "done"
+           and time.monotonic() < deadline):
+        time.sleep(0.02)
     assert service.jobs.lookup(reply["job_id"]).state.value == "done"
 
 

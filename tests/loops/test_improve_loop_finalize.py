@@ -697,7 +697,8 @@ def test_finalize_success_tx2_internal_seams_run_ledger_then_gate_then_approval_
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=datetime(2026, 8, 22))
 
     assert call_order == [
@@ -761,7 +762,8 @@ def test_finalize_success_persists_ledger_and_gate_rows_in_tx2(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy",
+                          "content_hash": "c-myst", "artifact_hash": "a-myst"},
         now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         ledger_entries=ledger_entries, gate_rows=gate_rows)
 
@@ -804,6 +806,7 @@ def test_finalize_success_overwrites_payload_analysis_run_ids_with_real_ids(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None,
         approval_payload={"name": "myind", "kind": "indicator",
+                          "content_hash": "c-myind", "artifact_hash": "a-myind",
                           "analysis_run_ids": []},
         now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         ledger_entries=ledger_entries)
@@ -1743,7 +1746,8 @@ def test_finalize_success_writes_mission_id_on_ledger_and_gate_rows(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=now, ledger_entries=ledger_entries, gate_rows=gate_rows)
 
     an_row = conn.execute(
@@ -1765,7 +1769,8 @@ def test_finalize_success_writes_tool_calls_on_approval_requested(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "x", "kind": "indicator"},
+        slot_key=None, approval_payload={"name": "x", "kind": "indicator",
+                          "content_hash": "c-x", "artifact_hash": "a-x"},
         now=now, tool_calls=9)
 
     line = next(line for line in (loop_min._root / "activity.log")
@@ -1857,7 +1862,8 @@ def test_compensation_failure_does_not_propagate_to_caller(
     # 例外なく戻ることそのものが pin (送出されればテストは失敗する)。
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy",
+                          "content_hash": "c-myst", "artifact_hash": "a-myst"},
         now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     activity_text = (tmp_path / "activity.log").read_text()
@@ -1885,7 +1891,8 @@ def test_compensate_tx2_failure_actually_writes_failed_mission_and_observation(
 
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
-        slot_key=None, approval_payload={"name": "myst", "kind": "strategy"},
+        slot_key=None, approval_payload={"name": "myst", "kind": "strategy",
+                          "content_hash": "c-myst", "artifact_hash": "a-myst"},
         now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     mission = conn.execute(
@@ -1937,7 +1944,8 @@ def test_approval_activity_is_written_only_after_successful_commit(
     loop_min._finalize_success(
         _CommitFailingConnection(conn), mission_id=mission_id, run_id=run_id,
         backlog_id=backlog_id, slot_key=None,
-        approval_payload={"name": "myst", "kind": "indicator"},
+        approval_payload={"name": "myst", "kind": "indicator",
+                          "content_hash": "c-myst", "artifact_hash": "a-myst"},
         now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     text = ((tmp_path / "activity.log").read_text()
             if (tmp_path / "activity.log").exists() else "")
