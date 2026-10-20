@@ -253,37 +253,32 @@ def test_ac25_an_unreadable_event_in_the_skipped_history_does_not_block_the_star
     assert load(proc.fd).event_cursor_initialized is True
 
 
-def test_a_first_page_whose_watermark_is_below_its_event_ids_starts_nothing(process):
+def test_a_first_page_whose_watermark_is_below_its_event_ids_starts_at_the_largest_id(process):
     client = _Events(_page([_health(100)], 50), _page([_health(100)], 100),
                      {"events": [], "high_watermark": 100})
     proc = process(client)
     proc.start()
-    with pytest.raises(BotFailure, match="events_invalid"):
-        proc.poll()
-    assert proc.channel.sent == []
-    assert proc.snapshot()["event_cursor_initialized"] is False
-    proc.poll()
     proc.poll()
     assert proc.channel.sent == []
     state = load(proc.fd)
     assert (state.cursor, state.high_watermark, state.event_cursor_initialized) == (100, 100, True)
+    proc.poll()
+    assert client.afters == [0, 100]
+    assert proc.channel.sent == []
 
 
-def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(process):
+def test_an_initialized_page_whose_watermark_is_below_its_event_ids_posts_and_advances(process):
     client = _Events(_page(_history()), _page([_health(200)], 150))
     proc = process(client)
     proc.start()
     proc.poll()
-    before = load(proc.fd)
-    with pytest.raises(BotFailure, match="events_invalid"):
-        proc.poll()
-    assert proc.channel.sent == [] and load(proc.fd) == before
+    proc.poll()
+    assert len(proc.channel.sent) == 1
+    state = load(proc.fd)
+    assert (state.cursor, state.high_watermark) == (200, 200)
 
 
 _BAD_PAGES = {
-    "watermark one below the last id": _page([_health(10)], 9),
-    "watermark below an id before an unreadable event": {
-        "events": [_health(10), {"id": "x"}], "high_watermark": 9},
     "no watermark": {"events": []},
     "negative watermark": {"events": [], "high_watermark": -1},
     "boolean watermark": {"events": [], "high_watermark": True},
@@ -321,3 +316,13 @@ def test_a_page_without_events_still_persists_a_higher_watermark_and_a_later_rol
     with pytest.raises(BotFailure, match="high_watermark_regressed"):
         proc.poll()
     assert proc.snapshot()["high_watermark"] == 9
+
+
+def test_the_regression_check_runs_before_the_uninitialised_branch(process):
+    # 矛盾した state は load が拒否するので、ここでは作為的に作って検査の順序だけを見る
+    proc = process(_Events({"events": [], "high_watermark": 50}))
+    for name, value in (("cursor", 100), ("high_watermark", 100)):
+        object.__setattr__(proc.adapter.gate.state, name, value)
+    with pytest.raises(BotFailure, match="high_watermark_regressed"):
+        proc.poll()
+    assert proc.adapter.gate.state.cursor == 100

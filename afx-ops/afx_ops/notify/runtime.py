@@ -22,6 +22,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
+from afx_ops.events_page import parse_page
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
 from afx_ops.isolation.startup import client_for
 from afx_ops.notify import transport
@@ -128,13 +129,13 @@ class _Loop:
     def _poll_once(self, client, target, dir_fd, state):
         reply = client.events(after=state.cursor, limit=EVENTS_LIMIT)
         events, high, unreadable = _page(reply)
-        if not state.event_cursor_initialized:
-            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
-            return self._save(dir_fd, initialize_event_cursor(state, high)), len(events), 0
         saved_high = state.high_watermark
         # 保存済みの最大 watermark (cursor 以上) より後退した値は DB の巻き戻り等の異常。何も確定しない
         if high < state.high_watermark:
             raise _Failure("high_watermark_regressed")
+        if not state.event_cursor_initialized:
+            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            return self._save(dir_fd, initialize_event_cursor(state, high)), len(events), 0
         # 新しい watermark は最初の配送確定と同じ置換で保存する (失敗時に snapshot を動かさない)
         state = observe_high(state, high)
         delivered = 0
@@ -182,31 +183,5 @@ class _Loop:
         _say(self._out, f"warning {reason}")
 
 
-def _check_watermark(readable: list[dict], high: int) -> None:
-    """watermark が読める event の最大 id より小さい応答は不正。cursor が後ろに戻り過去の event が配送される。"""
-    if readable and high < max(item["id"] for item in readable):
-        raise _Failure("events_invalid")
-
-
-def _page(reply) -> tuple[list[dict], int, bool]:
-    """events 応答の形を確かめ、(id 順の event、high watermark、id が読めない event があったか) を返す。
-
-    id が読めない event に page の中で最初に当たったところで打ち切る (それ以降は並べ替えの根拠が
-    ない)。その前の event は送れるので捨てない。
-    """
-    data = getattr(reply, "data", None)
-    if (getattr(reply, "status", None) != 200 or getattr(reply, "code", "x") is not None
-            or type(data) is not dict):
-        raise _Failure("events_invalid")
-    events, high = data.get("events"), data.get("high_watermark")
-    if type(events) is not list or type(high) is not int or high < 0:
-        raise _Failure("events_invalid")
-    readable = []
-    for event in events:
-        # 形の検査は送信直前の encode_event が行う。並べ替えに要る id だけ先に確かめる
-        if type(event) is not dict or type(event.get("id")) is not int or event["id"] <= 0:
-            _check_watermark(readable, high)
-            return sorted(readable, key=lambda item: item["id"]), high, True
-        readable.append(event)
-    _check_watermark(readable, high)
-    return sorted(readable, key=lambda item: item["id"]), high, False
+def _page(reply) -> tuple[list[dict], int, int]:
+    return parse_page(reply, _Failure)

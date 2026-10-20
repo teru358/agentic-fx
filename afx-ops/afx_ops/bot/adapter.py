@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 import discord
 
+from afx_ops.events_page import parse_page
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
@@ -649,14 +650,14 @@ class BotAdapter:
         await self._sync_views()
 
     async def deliver_events(self) -> None:
-        if not self.gate.state.event_cursor_initialized:
-            await self._start_event_cursor()
-            return
         reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
                                                            limit=EVENTS_LIMIT))
         events, high, unreadable = _page(reply)
-        if high < self.gate.state.high_watermark:
-            raise BotFailure("high_watermark_regressed")
+        self._regression_guard(high)
+        if not self.gate.state.event_cursor_initialized:
+            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            await self._run(self._initialize_cursor, high)
+            return
         if high > self.gate.state.high_watermark:
             # event を投稿しない周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
             await self._run(self._observe_high, high)
@@ -681,13 +682,6 @@ class BotAdapter:
                 await self._settle(approval_id)
         if unreadable:
             raise BotFailure("payload_invalid")
-
-    async def _start_event_cursor(self) -> None:
-        """最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める。"""
-        reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
-                                                           limit=EVENTS_LIMIT))
-        _, high, _ = _page(reply)
-        await self._run(self._initialize_cursor, high)
 
     def _initialize_cursor(self, high: int) -> None:
         try:
@@ -813,29 +807,8 @@ class BotAdapter:
         return None
 
 
-def _check_watermark(readable: list[dict], high: int) -> None:
-    """watermark が読める event の最大 id より小さい応答は不正。cursor が後ろに戻り過去の event が配送される。"""
-    if readable and high < max(item["id"] for item in readable):
-        raise BotFailure("events_invalid")
-
-
-def _page(reply) -> tuple[list[dict], int, bool]:
-    """events 応答の形を確かめ、(id 順の event、high watermark、id が読めない event があったか)。"""
-    data = getattr(reply, "data", None)
-    if (getattr(reply, "status", None) != 200 or getattr(reply, "code", "x") is not None
-            or type(data) is not dict):
-        raise BotFailure("events_invalid")
-    events, high = data.get("events"), data.get("high_watermark")
-    if type(events) is not list or type(high) is not int or high < 0:
-        raise BotFailure("events_invalid")
-    readable = []
-    for event in events:
-        if type(event) is not dict or type(event.get("id")) is not int or event["id"] <= 0:
-            _check_watermark(readable, high)
-            return sorted(readable, key=lambda item: item["id"]), high, True
-        readable.append(event)
-    _check_watermark(readable, high)
-    return sorted(readable, key=lambda item: item["id"]), high, False
+def _page(reply) -> tuple[list[dict], int, int]:
+    return parse_page(reply, BotFailure)
 
 
 def open_state_dir(path: os.PathLike) -> int:

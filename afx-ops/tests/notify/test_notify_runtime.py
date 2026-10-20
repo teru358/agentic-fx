@@ -547,32 +547,28 @@ def test_ac25_a_v2_snapshot_migrates_to_true_and_continues_from_its_cursor(fresh
                                         "event_cursor_initialized": True}
 
 
-def test_a_first_page_whose_watermark_is_below_its_event_ids_saves_nothing_and_delivers_nothing(
-        fresh_dir):
+def test_a_first_page_whose_watermark_is_below_its_event_ids_starts_at_the_largest_id(fresh_dir):
     send = FakeSend()
-    rc, err = _run(fresh_dir, FakeClient([{"events": [_event(100)], "high_watermark": 50}]), send)
-    assert (rc, err) == (1, "afx-ops: events_invalid\n")
-    assert send.bodies == [] and not (fresh_dir / "notify.snapshot").exists()
-    client = FakeClient([{"events": [_event(100)], "high_watermark": 100},
-                         {"events": [], "high_watermark": 100}])
-    rc, _ = _run(fresh_dir, client, send, polls=2)
-    assert rc == 0 and send.bodies == []
+    client = FakeClient([{"events": [_event(100)], "high_watermark": 50},
+                         {"events": [_event(100)], "high_watermark": 100}])
+    rc, err = _run(fresh_dir, client, send, polls=2)
+    assert (rc, err) == (0, "")
+    assert send.bodies == []
+    assert client.calls[1][0] == 100
     assert _state(fresh_dir) == NotifyState(cursor=100, high_watermark=100,
                                             event_cursor_initialized=True)
 
 
-def test_an_initialized_page_whose_watermark_is_below_its_event_ids_is_invalid(state_dir):
-    before = _state(state_dir)
+def test_an_initialized_page_whose_watermark_is_below_its_event_ids_delivers_and_advances(state_dir):
     send = FakeSend()
     rc, err = _run(state_dir, FakeClient([{"events": [_event(200)], "high_watermark": 150}]), send)
-    assert (rc, err) == (1, "afx-ops: events_invalid\n")
-    assert send.bodies == [] and _state(state_dir) == before
+    assert (rc, err) == (0, "")
+    assert send.ids == [200]
+    assert _state(state_dir) == NotifyState(cursor=200, high_watermark=200,
+                                            event_cursor_initialized=True)
 
 
 _BAD_PAGES = {
-    "one below": {"events": [_event(10)], "high_watermark": 9},
-    "below an id before an unreadable event": {
-        "events": [_event(10), {"id": "x"}], "high_watermark": 9},
     "no watermark": {"events": []},
     "negative": {"events": [], "high_watermark": -1},
     "boolean": {"events": [], "high_watermark": True},
@@ -594,3 +590,18 @@ def test_a_malformed_page_after_the_start_changes_nothing(state_dir, name):
     rc, err = _run(state_dir, FakeClient([_BAD_PAGES[name]]), send)
     assert (rc, err) == (1, "afx-ops: events_invalid\n")
     assert send.bodies == [] and _state(state_dir) == before
+
+
+def test_the_regression_check_runs_before_the_uninitialised_branch(fresh_dir):
+    state = NotifyState.empty()
+    object.__setattr__(state, "cursor", 100)
+    object.__setattr__(state, "high_watermark", 100)
+    loop = runtime._Loop(_Iso(fresh_dir, {}), client=None, send=FakeSend(), sleep=lambda _s: None,
+                         monotonic=lambda: 0.0, out=io.StringIO())
+    fd = _dir_fd(fresh_dir)
+    try:
+        with pytest.raises(runtime._Failure, match="high_watermark_regressed"):
+            loop._poll_once(FakeClient([{"events": [], "high_watermark": 50}]), None, fd, state)
+    finally:
+        os.close(fd)
+    assert not (fresh_dir / "notify.snapshot").exists()
