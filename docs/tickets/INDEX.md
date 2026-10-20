@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 151 件。完了分は closed/。
+未完了: 150 件。完了分は closed/。
 
 ## 実装中 (3)
 
@@ -11,7 +11,7 @@
 | [improve-objective-filtered-signal-quality](open/improve-objective-filtered-signal-quality.md) | 中 | 2026-10-07 | 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に) |
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 
-## 実装待ち (15)
+## 実装待ち (14)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -26,7 +26,6 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 | [improve-add-fullwidth-placeholder](open/improve-add-fullwidth-placeholder.md) | 低 | 2026-09-27 | improve add で全角プレースホルダが警告されない |
-| [ops-bot-initial-start-replays-all-events](open/ops-bot-initial-start-replays-all-events.md) | 低 | 2026-10-11 | ops bot が初回起動で daemon の全 event 履歴をチャンネルに投稿する |
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |

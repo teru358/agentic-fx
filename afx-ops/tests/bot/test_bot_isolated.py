@@ -138,6 +138,15 @@ def _snapshot(root) -> dict | None:
     return json.loads(path.read_text()) if path.exists() else None
 
 
+def _seed_started(root) -> None:
+    """event cursor の初期化が済んだ (cursor 0 から読み始める) snapshot を置く。"""
+    path = root / "bot" / "state" / "bot.snapshot"
+    path.write_text(json.dumps({"version": 5, "cursor": 0, "high_watermark": 0,
+                                "event_cursor_initialized": True, "approvals": []},
+                               sort_keys=True))
+    path.chmod(0o600)
+
+
 def _record(root, approval_id) -> dict:
     return next(r for r in _snapshot(root)["approvals"] if r["approval_id"] == approval_id)
 
@@ -465,6 +474,7 @@ def test_crash_after_posting_an_approval_adopts_the_post_instead_of_reposting(
 def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash(
         root, pki, daemon, discord_fake, dns, child_env, bots):
     fake = discord_fake
+    _seed_started(root)
     daemon.set(events=[event(1)])
     crashed = _start(bots, root, pki, fake, dns, child_env, exit_before_commit=True)
     got = crashed.wait_exit()
@@ -494,6 +504,23 @@ def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash
     # decided_by は投稿に写さない
     assert all("operator" not in (c.body or {}).get("content", "")
                for c in fake.channel_posts(CHANNEL))
+    bot.stop()
+
+
+def test_ac25_a_first_start_over_an_existing_history_posts_nothing_and_then_follows_new_events(
+        root, pki, daemon, discord_fake, dns, child_env, bots):
+    fake = discord_fake
+    daemon.set(events=[event(1), event(2), event(3, code="approval_state_changed",
+                                                 approval_id=9, state="approved")])
+    bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon)
+    wait_for(lambda: (_snapshot(root) or {}).get("event_cursor_initialized") is True)
+    snap = _snapshot(root)
+    assert (snap["version"], snap["cursor"], snap["high_watermark"]) == (5, 3, 3)
+    assert fake.channel_posts(CHANNEL) == []
+    daemon.set(events=[event(1), event(2), event(3, code="approval_state_changed",
+                                                 approval_id=9, state="approved"), event(4)])
+    wait_for(lambda: _snapshot(root)["cursor"] == 4)
+    assert len(fake.channel_posts(CHANNEL)) == 1
     bot.stop()
 
 

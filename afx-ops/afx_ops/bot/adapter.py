@@ -30,6 +30,7 @@ from dataclasses import dataclass
 
 import discord
 
+from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
@@ -652,8 +653,13 @@ class BotAdapter:
         reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
                                                            limit=EVENTS_LIMIT))
         events, high, unreadable = _page(reply)
-        if high < self.gate.state.high_watermark:
-            raise BotFailure("high_watermark_regressed")
+        self._regression_guard(high)
+        if not self.gate.state.event_cursor_initialized:
+            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            if unreadable:
+                print(f"afx-ops bot: {unreadable_notice(events, unreadable)}", file=sys.stderr)
+            await self._run(self._initialize_cursor, high)
+            return
         if high > self.gate.state.high_watermark:
             # event を投稿しない周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
             await self._run(self._observe_high, high)
@@ -678,6 +684,12 @@ class BotAdapter:
                 await self._settle(approval_id)
         if unreadable:
             raise BotFailure("payload_invalid")
+
+    def _initialize_cursor(self, high: int) -> None:
+        try:
+            self.gate.initialize_event_cursor(high)
+        except StateError:
+            raise BotFailure("bot_state_invalid") from None
 
     def _observe_high(self, high: int) -> None:
         self._regression_guard(high)
@@ -797,21 +809,8 @@ class BotAdapter:
         return None
 
 
-def _page(reply) -> tuple[list[dict], int, bool]:
-    """events 応答の形を確かめ、(id 順の event、high watermark、id が読めない event があったか)。"""
-    data = getattr(reply, "data", None)
-    if (getattr(reply, "status", None) != 200 or getattr(reply, "code", "x") is not None
-            or type(data) is not dict):
-        raise BotFailure("events_invalid")
-    events, high = data.get("events"), data.get("high_watermark")
-    if type(events) is not list or type(high) is not int or high < 0:
-        raise BotFailure("events_invalid")
-    readable = []
-    for event in events:
-        if type(event) is not dict or type(event.get("id")) is not int or event["id"] <= 0:
-            return sorted(readable, key=lambda item: item["id"]), high, True
-        readable.append(event)
-    return sorted(readable, key=lambda item: item["id"]), high, False
+def _page(reply) -> tuple[list[dict], int, int]:
+    return parse_page(reply, BotFailure)
 
 
 def open_state_dir(path: os.PathLike) -> int:
