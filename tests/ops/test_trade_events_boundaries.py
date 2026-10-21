@@ -73,6 +73,15 @@ def test_close_event_without_stop_loss_keeps_the_event_with_r_none():
     assert fields["pnl_r"] is None and fields["pnl"] == "50.00"
 
 
+def test_close_event_with_overflowing_r_keeps_the_event_with_r_none():
+    # risk が極小の決済は R が grammar の上限を超える。pnl と他の field は保ったまま R だけ None
+    code, ref, fields = build("closed", stop_loss=148.2499999)
+    assert code == "position_closed" and ref == "order:7"
+    assert fields["pnl_r"] is None and fields["pnl"] == "50.00"
+    assert fields["entry_price"] == "148.25" and fields["close_price"] == "148.75"
+    assert trade_events.valid_fields(code, fields)
+
+
 def test_close_event_qty_is_the_quantity_not_a_price():
     fields = build("closed")[2]
     assert fields["qty"] == "0.1"

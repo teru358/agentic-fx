@@ -199,6 +199,14 @@ def held_seconds(filled_at: object, closed_at: object) -> int | None:
     return max(0, int(delta.total_seconds()))
 
 
+def _pnl_r_text(row: Mapping[str, object]) -> str | None:
+    """R 倍数の書式。grammar に収まらない (桁あふれ等) ときは R だけを None にする。"""
+    try:
+        return format_r(_r_multiple(row))
+    except InvalidValue:
+        return None
+
+
 def _r_multiple(row: Mapping[str, object]) -> float | None:
     entry, close, stop = row["avg_fill_price"], row["close_price"], row["stop_loss"]
     if None in (entry, close, stop) or row["direction"] not in ("long", "short"):
@@ -238,7 +246,7 @@ def build_event(row: Mapping[str, object], to_status: str, *, trigger: object,
             "entry_price": format_price(row["avg_fill_price"]),
             "close_price": format_price(row["close_price"]),
             "pnl": format_money(row["realized_pnl"]), "ccy": ccy,
-            "pnl_r": format_r(_r_multiple(row)),
+            "pnl_r": _pnl_r_text(row),
             "held_sec": held_seconds(row["filled_at"], row["closed_at"]),
             "reason_code": row["close_reason"], "origin_code": origin,
             "mode": mode, "state_mode": state_mode,
