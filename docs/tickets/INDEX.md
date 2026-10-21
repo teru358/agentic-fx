@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
 ## 実装中 (3)
 
@@ -11,14 +11,13 @@
 | [improve-objective-filtered-signal-quality](open/improve-objective-filtered-signal-quality.md) | 中 | 2026-10-07 | 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に) |
 | [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 
-## 実装待ち (14)
+## 実装待ち (13)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
-| [trade-order-and-close-notices](open/trade-order-and-close-notices.md) | 中 | 2026-10-20 | 発注内容と決済情報を Discord に通知する |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
