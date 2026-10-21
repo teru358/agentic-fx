@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentic_fx.ops.trade_event_sink import COUNTERS, TradeEventSink
+from agentic_fx.ops import trade_event_sink as sink_mod
+from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, COUNTERS, TradeEventSink
 from agentic_fx.store.db import connect, init_db
 
 WALL = datetime(2026, 10, 20, 0, 0, tzinfo=timezone.utc)
@@ -339,3 +340,122 @@ def test_health_event_failure_does_not_count_as_drop(db_path):
         assert sink.counters() == before
     finally:
         sink.stop()
+
+
+def test_busy_retry_default_budget_is_one_second_and_service_passes_it():
+    import inspect
+
+    from agentic_fx import service
+    assert BUSY_RETRY_SEC == 1.0
+    assert "busy_retry_sec=BUSY_RETRY_SEC" in inspect.getsource(service._start_trade_events)
+
+
+def test_backoff_starts_at_5ms_caps_at_50ms_with_20pct_jitter():
+    class Rng:
+        def __init__(self, v):
+            self.v = v
+
+        def uniform(self, a, b):
+            assert (a, b) == (-0.2, 0.2)
+            return self.v * 0.2
+
+    for v in (-1, 0, 1):
+        got = [sink_mod.backoff_sec(n, Rng(v)) for n in range(12)]
+        base = [0.005, 0.01, 0.02, 0.04] + [0.05] * 8
+        for g, b in zip(got, base):
+            assert g == pytest.approx(b * (1 + 0.2 * v))
+    # 実乱数でも範囲内
+    for n in range(12):
+        base = min(0.005 * 2 ** n, 0.05)
+        for _ in range(50):
+            assert base * 0.8 <= sink_mod.backoff_sec(n) <= base * 1.2
+
+
+def test_busy_retry_uses_the_backoff_not_a_fixed_step(db_path, monkeypatch):
+    delays = []
+    monkeypatch.setattr(sink_mod, "backoff_sec", lambda n, rng=None: delays.append(n) or 0.001)
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=0.1)
+    sink.start()
+    try:
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert wait_until(lambda: sink.counters()["db_busy_drop"] == 1)
+    finally:
+        holder.rollback()
+        sink.stop()
+        holder.close()
+    assert delays[:4] == [0, 1, 2, 3]
+
+
+def test_busy_retry_is_bounded_by_the_deadline_even_with_long_backoff(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=0.3)
+    sink.start()
+    try:
+        started = time.monotonic()
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert wait_until(lambda: sink.counters()["db_busy_drop"] == 1)
+        assert time.monotonic() - started < 0.3 + 0.2
+    finally:
+        holder.rollback()
+        sink.stop()
+        holder.close()
+
+
+def test_stop_request_ends_the_busy_wait_as_shutdown_drop(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=30.0, join_timeout=5.0)
+    sink.start()
+    try:
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        time.sleep(0.15)
+        started = time.monotonic()
+        sink.stop()
+        assert time.monotonic() - started < 2.0
+    finally:
+        holder.rollback()
+        holder.close()
+    counters = sink.counters()
+    assert counters["shutdown_drop"] == 1
+    assert counters["db_busy_drop"] == 0
+    assert rows(db_path, "order_state_changed") == []
+
+
+def test_ac14a_released_within_deadline_saves_exactly_one(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=BUSY_RETRY_SEC)
+    sink.start()
+    try:
+        started = time.monotonic()
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert time.monotonic() - started < 0.2
+        time.sleep(0.3)
+        holder.rollback()
+        assert wait_until(lambda: len(rows(db_path, "order_state_changed")) == 1)
+        time.sleep(0.2)
+    finally:
+        sink.stop()
+        holder.close()
+    assert len(rows(db_path, "order_state_changed")) == 1
+    assert sink.counters()["db_busy_drop"] == 0
+
+
+def test_ac14a_past_deadline_counts_one_busy_drop_without_duplicates(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=0.2)
+    sink.start()
+    try:
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        assert wait_until(lambda: sink.counters()["db_busy_drop"] == 1)
+        holder.rollback()
+        time.sleep(0.3)
+    finally:
+        sink.stop()
+        holder.close()
+    assert sink.counters()["db_busy_drop"] == 1
+    assert rows(db_path, "order_state_changed") == []

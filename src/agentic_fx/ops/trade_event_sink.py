@@ -1,8 +1,9 @@
 """取引 event の sink。専用の接続と書き込み thread を持ち、`ops_events` に 1 件ずつ書く。
 
 注文処理を待たせないための部品である:
-- 接続は `busy_timeout=0`。DB が busy なら待たずにその event を捨てる。
-- 1 件ごとに INSERT とその commit だけを行う短い tx にする。失敗しても再試行せず捨てる。
+- 接続は `busy_timeout=0`。INSERT が busy (BUSY / LOCKED) のときだけ、sink thread 内で
+  短い backoff を挟んで最大 `BUSY_RETRY_SEC` 秒再試行し、期限を超えたら捨てる。
+- 1 件ごとに INSERT とその commit だけを行う短い tx にする。busy 以外の失敗は再試行せず捨てる。
 - queue は有限。溢れたら捨てる。
 - 捨てた event は理由別に数え、warning (理由別にスロットル) と health 状態に出す。
 sink 自身が壊れているときに health event を確実に保存することは約束しない。
@@ -12,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import random
 import sqlite3
 import threading
 import time
@@ -33,7 +35,16 @@ RECOVERY_SEC = 60.0
 WARNING_INTERVAL_SEC = 60.0
 _BUSY_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 _POLL_SEC = 1.0
-_BUSY_RETRY_STEP_SEC = 0.005
+BUSY_RETRY_SEC = 1.0
+_BACKOFF_START_SEC = 0.005
+_BACKOFF_CAP_SEC = 0.05
+_BACKOFF_JITTER = 0.2
+
+
+def backoff_sec(attempt: int, rng=random) -> float:
+    """busy 再試行の待ち時間。5 ms 開始、指数で 50 ms 上限、±20% の jitter。"""
+    base = min(_BACKOFF_START_SEC * 2 ** min(attempt, 16), _BACKOFF_CAP_SEC)
+    return base * (1 + rng.uniform(-_BACKOFF_JITTER, _BACKOFF_JITTER))
 
 
 class TradeEventSink:
@@ -41,7 +52,7 @@ class TradeEventSink:
                  monotonic: Callable[[], float] = time.monotonic, queue_max: int = 1000,
                  join_timeout: float = 5.0, recovery_sec: float = RECOVERY_SEC,
                  busy_retry_sec: float = 0.0) -> None:
-        # busy_retry_sec は worker thread だけが busy を待つ上限 (既定 0 = 待たずに捨てる)。
+        # busy_retry_sec は worker thread だけが busy を待つ上限 (0 = 待たずに捨てる)。
         # core の接続は待たされない。busy は INSERT の前に起きるので、再試行で重複は生じない。
         self._busy_retry_sec = busy_retry_sec
         self._db_path, self._wall_clock, self._monotonic = db_path, wall_clock, monotonic
@@ -146,6 +157,7 @@ class TradeEventSink:
             self.record_drop("invalid_value_drop")
             return
         give_up = time.monotonic() + self._busy_retry_sec
+        attempt = 0
         while True:
             try:
                 self._insert(ts, code, ref, fields)
@@ -153,8 +165,13 @@ class TradeEventSink:
             except sqlite3.Error as exc:
                 self._rollback()
                 busy = getattr(exc, "sqlite_errorcode", None) in _BUSY_CODES
-                if busy and time.monotonic() < give_up and not self._abandon.is_set():
-                    time.sleep(_BUSY_RETRY_STEP_SEC)
+                if busy and time.monotonic() < give_up:
+                    delay = min(backoff_sec(attempt), max(give_up - time.monotonic(), 0.0))
+                    attempt += 1
+                    if self._stopping.is_set() or self._stopping.wait(delay) \
+                            or self._abandon.is_set():
+                        self.record_drop("shutdown_drop")
+                        return
                     continue
                 self.record_drop("db_busy_drop" if busy else "db_error_drop")
                 return

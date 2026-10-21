@@ -1,6 +1,6 @@
 # 発注・決済の通知 設計書
 
-**版:** v1.0 (ユーザー承認済み、実装可)
+**版:** v1.1 (v1.0 はユーザー承認済み。v1.1 は sink の busy 再試行の技術改訂、§12)
 **対象:** チケット `trade-order-and-close-notices` (ユーザー要望 2026-10-20「発注内容と決済情報を通知してほしい」)。
 **材料:** 現状調査 `tmp/design-trade-notices/survey.md` (file:line つき)。以下の「調査 §n」はその節。
 **関連チケット:** `trade-order-and-close-notices` (本設計で実装)、`ops-bot-initial-start-replays-all-events` (T0 で閉じる)。
@@ -182,7 +182,7 @@ orders 行が無い gate 拒否は event にならない (非目標)。
    - daemon の emitter には settings の enable flag `notify.trade_events` (既定 true) を置く。false のとき `service.py` は observer も sink も起こさず、取引 event は一切出ない。これを止めることが「emitter を止める」と同値で、rollback の手段になる (§10.3)。`improve` 節と同じ流儀の optional key で、`config/settings.yaml.example` と同期する。
 3. observer は `(row, from_status, to_status)` から §3 の event を作り、sink の queue に非同期で渡す。作る関数は純粋で、DB を読むのは `missions.trigger` の 1 回だけ。**observer は flock もファイル I/O も一切しない。** transition は core_lock を保持したまま observer を呼ぶので、state ファイルの共有 flock を取る `StateStore.load()` を呼ぶと、state の writer が lock を持つ間は注文遷移全体が無期限に待つ。`state_mode` は service が**起動時に 1 回** state から読んだ値をメモリに持ち、それを observer に渡す (読めなかったときは None)。現物では稼働中に mode を変える経路は無い。将来 mode を変える経路ができたら、永続化が成功した後に同じメモリの値を更新する。`transition` の引数は増やさない (呼び出しが 25 か所以上あり、バックテストにも波及するため)。
 4. observer の中で起きた例外は握りつぶして warning を 1 行出し、`observer_error` に数える。transition の戻り値と DB の状態は変わらない。
-5. sink は専用の接続と書き込み thread を 1 本持つ。接続は `connect(db)` の後に **`PRAGMA busy_timeout=0`** を設定する。1 件ごとに、INSERT とその commit だけを行う短い tx にする (他の文を挟まない)。DB が busy なら待たずにその event を捨てて `db_busy_drop` に数える。DB の失敗 (busy を含む) は **再試行せず捨てる** (event に一意キーが無く、再試行は重複規則を要するため)。
+5. sink は専用の接続と書き込み thread を 1 本持つ。接続は `connect(db)` の後に **`PRAGMA busy_timeout=0`** を設定する。1 件ごとに、INSERT とその commit だけを行う短い tx にする (他の文を挟まない)。INSERT が `SQLITE_BUSY` / `SQLITE_LOCKED` の場合に限り、sink thread 内で短い backoff (5 ms 開始、指数で 50 ms 上限、±20% jitter) を挟み、単調時計で最大 1 秒まで再試行する。各待機の前後で停止要求を確認し、停止要求なら即 `shutdown_drop` に数える。期限を超えたら event を捨てて `db_busy_drop` に数える。observer と queue 投入は待たない。busy は INSERT より前に起きるので、再試行で重複は生じない。その他の DB の失敗は **再試行せず捨てる** (`db_error_drop`)。
 6. queue は有限 (1000)。溢れたら捨てて `queue_drop` に数える (注文処理を待たせない)。
 7. 欠落の記録:
    - 理由別の counter: `queue_drop`、`observer_error`、`db_busy_drop`、`db_error_drop`、`invalid_value_drop` (§3.3 で作らなかった event)、`worker_death`、`shutdown_drop`。
@@ -210,7 +210,7 @@ core_lock を保持したまま別接続に INSERT すると待ち得る。sink 
 
 ### 4.5 残余リスク (受容するもの)
 
-- **同一 DB の完全非干渉は保証できない。** `orders` と `ops_events` は同じ SQLite (WAL) で、書き込み tx は 1 本しか持てない。sink は `busy_timeout=0` なので **sink が lock を待つことは無く**、busy なら捨てて逃げる。一方 core の書き込みは `busy_timeout=5000` のままなので、sink が INSERT 後・commit 前の短い間に lock を持っている間だけ、core がその時間だけ待ち得る。待ちの上限は sink の「INSERT + commit」1 件の所要時間で、5 秒に達するのは sink の commit が 5 秒止まったときだけである。この所要時間は **未実測**で、T2 で実測する (本機の WAL で INSERT + commit の p99 を計り、設計書に記録する)。**「sink が先に write lock を持つと core が待つ」ことは受容する残余リスクであり、受入条件にはしない** (同一 SQLite の writer lock 下では満たせないため。AC-14 は sink が待たないことと、observer / queue 投入が sink を待たないことに限る)。完全非干渉が必要になったら event 専用 DB に分離する (§11)。
+- **同一 DB の完全非干渉は保証できない。** `orders` と `ops_events` は同じ SQLite (WAL) で、書き込み tx は 1 本しか持てない。sink は `busy_timeout=0` なので SQLite の中で lock を待たず、INSERT が busy なら rollback して lock を放してから、sink thread 内で backoff (最大 1 秒) して再試行する。再試行中の sink は write lock を保持しないが、lock 解放後に sink が獲得する頻度が増えるため、core commit の待機頻度と tail latency は増え得る。一方 core の書き込みは `busy_timeout=5000` のままなので、sink が INSERT 後・commit 前の短い間に lock を持っている間だけ、core がその時間だけ待ち得る。待ちの上限は sink の「INSERT + commit」1 件の所要時間で、5 秒に達するのは sink の commit が 5 秒止まったときだけである。再試行あり (1 秒) / なし (0 秒) を同じ人工負荷 (遷移 150 回、各遷移の直後に core が 2 ms の小 commit を 6 回続ける、遷移の間隔 2 ms / 20 ms。および queue に 150 件を先に積み core が間を置かず 900 回 commit する「sink が次の event でも再獲得する」固定 fixture) で比べた A/B では、core の commit 所要時間は p50 約 2.07 ms、p99.9 は最大 3.2 ms、最大 3.2 ms で再試行の有無による tail の悪化は見られず (固定 2 ms の保持時間を含む)、event の保存率は再試行なしで 0〜2% に対し、あり (1 秒) で 99.3〜100% だった。実運用相当の tick 密度、1 秒を超える writer、queue の長時間滞留は未検証の残余リスクである。queue 容量 1000 は「ピーク取引 event / 秒 × 1 秒 + 通常 backlog」を満たす (遷移 150 件の burst で最大深度 150、再試行 1 秒の head-of-line でも超過分は `queue_drop` に数える)。**「sink が先に write lock を持つと core が待つ」ことは受容する残余リスクであり、受入条件にはしない** (同一 SQLite の writer lock 下では満たせないため。AC-14 は sink が待たないことと、observer / queue 投入が sink を待たないことに限る)。完全非干渉が必要になったら event 専用 DB に分離する (§11)。
 - **欠落は回復できない。** process crash、queue の中身、observer の登録前の遷移、sink の drop は、orders の最終状態からは分かるが、placed → filled などの遷移履歴は復元できない。既存の同期的な `emit_best_effort` より欠落の窓は広い。counter と warning ログと health 状態 (§4.2) で気づけるようにするが、crash 時の queue 内の event は数えられない。正は orders 表である。
 - **配送は at-least-once。** 投稿の成功後・cursor 保存前に bot / notify が落ちると、同じ event を再投稿する。webhook は `event_id` で受信側が重複を排除できる。Discord の文面には安定した識別子が無く、重複して見える (許容する)。
 
@@ -364,7 +364,7 @@ channel と受け手が誰かはリポジトリから確認できず、利用者
 - **rollback:** daemon の emitter (`notify.trade_events`) を止めてから afx-ops を戻す。`trade_notices` は表示の絞り込みで、rollback の手段ではない (§10.3)。
 - **R の定義:** 価格ベースで commission とスプレッドを含めない。行だけから計算でき、換算レート待ちにならない。
 - **唯一の観測点:** `transitions.transition`。呼び出し側に足す案は取りこぼす (§4.3)。登録は接続ごとで、登録の呼び出しは service の 1 か所だけ。
-- **sink を別 thread にし、待たずに捨てる:** core_lock の中で別接続へ INSERT しない。sink は `busy_timeout=0`、queue が溢れたら捨てる。DB の失敗は再試行しない。
+- **sink を別 thread にし、待たずに捨てる:** core_lock の中で別接続へ INSERT しない。sink は `busy_timeout=0`、queue が溢れたら捨てる。busy だけは sink thread 内で最大 1 秒再試行し、その他の DB の失敗は再試行しない。
 - **クラッシュ時の取りこぼし:** queue の中身は永続化しない。生成は best-effort という既存の契約の範囲 (ops-api spec §4.3)。ただし drop は理由別に数え、health で見える (§4.2)。正は orders 表。
 - **不正な event は全体を投稿しない:** 既存の fail-closed に合わせる (§5.2)。
 - **版ずれの対策:** afx-ops を先に配って実プロセスの版を確認する運用で足りる (§10.3)。daemon 側の版検知は作らない。
@@ -414,7 +414,7 @@ channel と受け手が誰かはリポジトリから確認できず、利用者
 - AC-11: observer が例外を投げても、transition の戻り値、orders の行、続く SL/TP 監視の処理が変わらず、`observer_error` が増える (observer を例外を投げるものに差し替える変異で確認)。
 - AC-12: sink の INSERT が失敗しても (`ops_events` を壊した接続で)、注文処理は失敗せず、`db_error_drop` が増え、event は再試行されず、プロセス内の health 状態が degraded になる。
 - AC-13: sink の queue が溢れても transition は待たされず、`queue_drop` が増える (queue を 1 にして 2 件目を投入し、時間で pin せず挙動で確かめる)。
-- AC-14: 別接続が write lock を保持している状態で、(a) sink は他の writer を待たず、`busy_timeout=0` で即座に `db_busy_drop` に数えて event を捨てる。(b) observer と queue への投入は sink の完了を待たない (sink を止めても transition が戻る)。sink の接続が `busy_timeout=0` であること自体を pin し、5000 に戻す変異で赤になる。INSERT と commit の間に他の文を挟む変異でも赤になる。**「sink が先に write lock を持つと core が待つ」は AC にしない**: §4.5 の残余リスクとして受容し、T2 で INSERT + commit の所要時間を実測して記録する。
+- AC-14: 別接続が write lock を保持している状態で、(a) 別接続が write lock を保持していても observer / queue 投入は直ちに戻り、sink は `busy_timeout=0` のまま worker 内だけで最大 1 秒再試行する。期限内に解放されれば event が正確に 1 件保存され、期限超過なら `db_busy_drop` が 1 増え、重複しないことを確認する。(b) observer と queue への投入は sink の完了を待たない (sink を止めても transition が戻る)。sink の接続が `busy_timeout=0` であること自体を pin し、5000 に戻す変異で赤になる。INSERT と commit の間に他の文を挟む変異でも赤になる。**「sink が先に write lock を持つと core が待つ」は AC にしない**: §4.5 の残余リスクとして受容し、T2 で INSERT + commit の所要時間を実測して記録する。
 - AC-15: 停止時に queue の残りが `ops_events` に書かれる。排出が 5 秒で終わらないときは残りを `shutdown_drop` に数えて停止が完了する。worker を殺した場合は `worker_death` が立つ。
 - AC-15b: 各 drop の理由が counter (7 種) と warning ログに出て、プロセス内の health 状態が degraded になる。直近 60 秒 (単調時計。fake clock で pin) に drop が無ければ ok に戻り、再 degraded / ok の通知は状態が変わったときだけ 1 回出る (drop が続く間に繰り返さない)。`service_health_changed` (`component_code=trade_event_sink`) は保存できたときの補助通知で、保存できない状況で出ることを要求しない。`afx ctl status` に counter の件数が載る (status の応答と formatter の fixture)。この component 状態は既存の `HealthLatch` と別で、`HealthLatch` の挙動は変わらない。event stream の既存の `event_stream_health` の field は変わらない。
 
@@ -502,3 +502,4 @@ rollback は逆順で、**必ず daemon の emitter を止めてから afx-ops �
 | 2026-10-20 | v0.5 | bot v4 `{0,0}` snapshot の migration 方針 (false、問 1 が全履歴なら true) と旧版の明示的な読み取り経路、AC-25 に upgrade fixture。問 1 を二択 (今から / 全履歴) に | codex sol 4 周目 (閉鎖確認) の Medium 1 + Low 1 | |
 | 2026-10-20 | v1.0 | ユーザー裁定 5 問を反映して清書。§8.1 を決定の記録に (問 1 今から、問 2 設定で切り替え・既定 `absolute`、問 3 notify は既定 OFF の opt-in、問 4 全部が既定、問 5 mention なし)。bot 用 `ops.toml` に `trade_amounts`、notify 用 `ops.toml` に `trade_events` を足し、`trade_notices` に `results` を足して `fills_closes` を filled と決済だけに改めた。条件分岐の記述を決定後の文に書き換え、v4 `{0,0}` の migration を旧版の記述 (§8.3 (c)、AC-25、§10.1) と整合させた。関連チケットを §0 に追記。AC-20 / 23 / 24 の範囲で追記 | ユーザー裁定 (2026-10-20) | |
 | 2026-10-20 | v1.0a | notify 用 key を `deliver_trade_events` に改名 (settings の `notify.trade_events` との衝突回避)、T0 が配備前提なので暫定既定を削除、`fills_closes` = filled + 決済 (rejected は `results` 側) | 清書時の指揮者判断 | |
+| 2026-10-21 | v1.1 | sink の busy 再試行を最大 1 秒 (backoff 5〜50 ms、±20% jitter、停止要求で中断) に改訂し、既定で有効にした (§4.2、§4.5、AC-14(a))。core 側の待ちの増加は §4.5 の残余リスクとして A/B 実測を付けて記録 | T2 の実測で、再試行なしは lock 競合で 26〜50% の event を既知のまま捨てるため。外部契約 (best-effort、発注は sink に同期しない) は不変の技術改訂 | |

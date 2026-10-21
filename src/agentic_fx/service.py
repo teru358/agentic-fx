@@ -51,7 +51,7 @@ from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.service import OpsLimits, OpsService
-from agentic_fx.ops.trade_event_sink import TradeEventEmitter, TradeEventSink
+from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
 from agentic_fx.loops import reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
@@ -997,7 +997,8 @@ def _start_trade_events(root: Path, conn_core, settings, state, clock):
     scheduler / supervisor / ops listener の起動前に呼ぶ。失敗した場合は呼び出し側が
     daemon を起動しない。
     """
-    sink = TradeEventSink(root / "data" / "agentic.db", wall_clock=clock.now)
+    sink = TradeEventSink(root / "data" / "agentic.db", wall_clock=clock.now,
+                          busy_retry_sec=BUSY_RETRY_SEC)
     sink.start()
     try:
         emitter = TradeEventEmitter(conn_core, sink, state_mode=_read_state_mode(state),
