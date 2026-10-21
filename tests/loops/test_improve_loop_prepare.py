@@ -462,12 +462,13 @@ def test_prompt_tells_agent_not_to_write_counts_in_approval_free_text(tmp_path):
     assert "承認画面" in approval_part
     assert "成績を書かず" in approval_part
     assert "試行回数" in approval_part
-    # observation の reason には成績を具体的に書く要求が残る。
-    assert "pf / avg_r を具体的に書いて" in reason_part
-    # 規律 3 (observation に試したパラメータと成績を書く要求) も残る。
+    # observation の reason には、試した仮説と確認できた事実を書く。
+    # 成績値は backlog の自由文に書かない。
+    assert "試した仮説と確認できた事実" in reason_part
+    assert "成績値は書かないでください" in reason_part
     rules = " ".join(text.split("## 最終出力")[0].split())
-    assert "observation` として理由を残し" in rules
-    assert "得られた pf / avg_r を具体的に" in rules
+    assert "試した仮説と確認できた事実" in rules
+    assert "成績値は backlog の自由文に書かないでください" in rules
 
 
 def test_render_improve_mission_prompt_fails_closed_on_missing_key(tmp_path):

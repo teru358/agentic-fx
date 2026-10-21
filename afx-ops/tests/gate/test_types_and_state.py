@@ -5,7 +5,8 @@ from typing import get_args
 
 import pytest
 
-from afx_ops.gate.state import ApprovalRecord, BotState, StateError, advance_event, load, save
+from afx_ops.gate.state import (ApprovalRecord, BotState, StateError, advance_event,
+                                initialize_event_cursor, load, save)
 from afx_ops.gate.types import Action, CustomIdError, _ACTIONS, decode_custom_id, encode_custom_id
 
 
@@ -38,7 +39,8 @@ def test_decision_actions_are_exactly_the_supported_decisions():
 def test_snapshot_round_trip_and_event_cursor_have_no_delivered_id_list(tmp_path):
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        state = advance_event(BotState.empty().with_record(_record()), 3)
+        started = initialize_event_cursor(BotState.empty().with_record(_record()), 0)
+        state = advance_event(started, 3)
         save(fd, state)
         assert load(fd) == state
         raw = (tmp_path / "bot.snapshot").read_text(encoding="ascii")

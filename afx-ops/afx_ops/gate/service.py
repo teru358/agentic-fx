@@ -9,9 +9,13 @@ from dataclasses import replace
 from typing import Callable
 
 from afx_ops.api_client import Actor, Decision, DecisionJob, Reply
+from afx_ops.event_outcome import SkipKnown, decide
+from afx_ops.trade_events import NOTICE_KINDS, notice_kind
 
 from .render import confirm_view, render_event
-from .state import ApprovalRecord, BotState, advance_event, load, observe_high, save
+from .trade_render import render_trade
+from .state import (ApprovalRecord, BotState, advance_event, initialize_event_cursor, load,
+                    observe_high, save)
 from .types import DecisionPlan, EventPlan, GateResult, Interaction, decode_custom_id
 
 CLAIM_SECONDS = 10 * 60
@@ -93,18 +97,45 @@ class GateService:
             self.persist()
 
     def plan_event(self, event: object, *, mention_role_id: int | None = None,
-                   mention_user_ids: tuple[int, ...] = ()) -> EventPlan | None:
+                   mention_user_ids: tuple[int, ...] = (), trade_notices: str = "all",
+                   trade_amounts: str = "absolute") -> EventPlan | SkipKnown | None:
+        """event の扱い。None は cursor 以下 (すでに確定済み)、`SkipKnown` は検証を通ったが
+        設定で出さない event、`EventPlan` は投稿する event。完全検証 (`PayloadError`) が先。"""
+        kinds = NOTICE_KINDS[trade_notices]
+
+        def wants(payload: dict) -> bool:
+            kind = notice_kind(payload)
+            return kind is None or kind in kinds
+
+        outcome = decide(event, wants)
+        event_id = event["id"]
+        if event_id <= self._read_state().cursor:
+            return None
+        if isinstance(outcome, SkipKnown):
+            return outcome
+        if notice_kind(outcome.payload) is not None:
+            # 取引通知は固定 template で、設定済みの mention を付けない
+            return EventPlan(event_id, render_trade(outcome.payload, amounts=trade_amounts), (),
+                             allow_mentions=False)
         rendered = render_event(event, mention_role_id=mention_role_id,
                                 mention_user_ids=mention_user_ids)
-        event_id = event["id"] if type(event) is dict else None
-        if type(event_id) is not int or event_id <= self._read_state().cursor:
-            return None
         return EventPlan(event_id, rendered.content, rendered.mentions)
 
     def commit_event(self, event_id: int, *, high_watermark: int) -> None:
         with self._lock:
             self._update_state(advance_event(self._read_state(), event_id,
                                              high_watermark=high_watermark))
+
+    def commit_skip(self, event_id: int, *, high_watermark: int) -> None:
+        """配信しない既知の event を確定する (cursor と high watermark を同じ 1 回の保存で進める)。"""
+        with self._lock:
+            self._update_state(advance_event(self._read_state(), event_id,
+                                             high_watermark=high_watermark))
+
+    def initialize_event_cursor(self, high_watermark: int) -> None:
+        """cursor と flag を同じ 1 回の保存で確定する。"""
+        with self._lock:
+            self._update_state(initialize_event_cursor(self._read_state(), high_watermark))
 
     def observe_high_watermark(self, high_watermark: int) -> None:
         with self._lock:

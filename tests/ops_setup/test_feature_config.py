@@ -4,7 +4,7 @@ import os
 import stat
 from pathlib import Path
 
-from agentic_fx.ops_setup.feature_config import collect, write_inputs
+from agentic_fx.ops_setup.feature_config import collect, unsafe_reason, write_inputs
 
 
 def test_bot_write_creates_checked_files_with_expected_modes(tmp_path, monkeypatch):
@@ -197,3 +197,95 @@ def test_atomic_write_retries_short_writes(tmp_path, xdg, monkeypatch):
 def test_redact_hides_secret_and_url_path():
     assert redact("bot", "tok") == "<redacted>"
     assert redact("notify", "https://hooks.example.com/api/SECRET") == "hooks.example.com"
+
+
+def _hand_edit(xdg, feature: str, extra: str) -> Path:
+    path = xdg / feature / "config" / "ops.toml"
+    path.write_text(path.read_text() + extra)
+    return path
+
+
+def test_trade_keys_added_by_hand_are_kept_when_the_inputs_are_collected_and_rewritten(
+        tmp_path, xdg):
+    write_inputs(tmp_path, "bot", BOT)
+    path = _hand_edit(xdg, "bot", 'trade_notices = "results"\ntrade_amounts = "relative"\n')
+
+    found = collect(tmp_path, "bot")
+
+    assert found.complete
+    assert (found.values["trade_notices"], found.values["trade_amounts"]) == ("results",
+                                                                              "relative")
+    write_inputs(tmp_path, "bot", found.values | {"allowlist_user_ids": [10**16 + 3],
+                                                   "mention_user_ids": [10**16 + 3]})
+    text = path.read_text()
+    assert 'trade_notices = "results"' in text and 'trade_amounts = "relative"' in text
+    assert f"allowlist_user_ids = [{10**16 + 3}]" in text
+
+
+def test_notify_trade_key_is_written_as_a_toml_boolean_and_survives_a_rewrite(tmp_path, xdg):
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/x"})
+    path = _hand_edit(xdg, "notify", "deliver_trade_events = true\n")
+
+    found = collect(tmp_path, "notify")
+    assert found.values["deliver_trade_events"] is True
+    write_inputs(tmp_path, "notify", found.values | {"webhook_url": "https://h.example.com/y"})
+
+    assert "deliver_trade_events = true\n" in path.read_text()
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/y",
+                                       "deliver_trade_events": False})
+    assert "deliver_trade_events = false\n" in path.read_text()
+
+
+def test_old_inputs_without_the_trade_keys_are_complete_and_stay_without_them(tmp_path, xdg):
+    write_inputs(tmp_path, "bot", BOT)
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/x"})
+
+    for feature in ("bot", "notify"):
+        found = collect(tmp_path, feature)
+        assert found.complete
+        assert not {"trade_notices", "trade_amounts", "deliver_trade_events"} & set(found.values)
+    assert "trade_" not in (xdg / "bot" / "config" / "ops.toml").read_text()
+    assert "trade_" not in (xdg / "notify" / "config" / "ops.toml").read_text()
+
+
+@pytest.mark.parametrize("feature,extra", [
+    ("bot", 'trade_notices = "everything"\n'), ("bot", "trade_notices = true\n"),
+    ("bot", 'trade_amounts = "abs"\n'), ("bot", "deliver_trade_events = true\n"),
+    ("notify", 'deliver_trade_events = "yes"\n'), ("notify", "deliver_trade_events = 1\n"),
+    ("notify", 'trade_notices = "all"\n'),
+])
+def test_invalid_trade_keys_in_an_existing_config_make_the_inputs_unusable(
+        tmp_path, xdg, feature, extra):
+    write_inputs(tmp_path, feature, BOT if feature == "bot"
+                 else {"webhook_url": "https://h.example.com/x"})
+    _hand_edit(xdg, feature, extra)
+
+    assert unsafe_reason(tmp_path, feature) == "config_file"
+
+
+@pytest.mark.parametrize("feature,values", [
+    ("bot", BOT | {"trade_notices": "everything"}), ("bot", BOT | {"trade_notices": 1}),
+    ("bot", BOT | {"trade_amounts": "abs"}), ("bot", BOT | {"trade_amounts": True}),
+    ("notify", {"webhook_url": "https://h.example.com/x", "deliver_trade_events": 1}),
+    ("notify", {"webhook_url": "https://h.example.com/x", "deliver_trade_events": "true"}),
+])
+def test_validate_rejects_invalid_trade_values(feature, values):
+    with pytest.raises(InputError):
+        validate(feature, values)
+
+
+def test_the_accepted_trade_notice_values_match_afx_ops():
+    import ast
+
+    from agentic_fx.ops_setup.feature_config import TRADE_AMOUNTS, TRADE_NOTICES
+
+    root = Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops"
+    tree = ast.parse((root / "trade_events.py").read_text(encoding="utf-8"))
+    notices = next(node.value for node in tree.body if isinstance(node, ast.AnnAssign)
+                   and node.target.id == "NOTICE_KINDS")
+    keys = tuple(k.value for k in notices.args[0].keys)
+    assert TRADE_NOTICES == keys
+    config = ast.parse((root / "config.py").read_text(encoding="utf-8"))
+    amounts = next(node.value for node in config.body if isinstance(node, ast.Assign)
+                   and getattr(node.targets[0], "id", None) == "TRADE_AMOUNTS")
+    assert TRADE_AMOUNTS == tuple(e.value for e in amounts.elts)

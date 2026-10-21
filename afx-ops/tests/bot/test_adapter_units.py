@@ -41,6 +41,10 @@ def _record(**changes):
     return ApprovalRecord(**values)
 
 
+# event cursor の初期化が済んだ空の状態
+_STARTED = BotState(cursor=0, high_watermark=0, approvals=(), event_cursor_initialized=True)
+
+
 class _Gate:
     def __init__(self, state: BotState) -> None:
         self.state = state
@@ -104,7 +108,7 @@ def test_an_event_naming_a_still_pending_approval_leaves_its_record_active(tmp_p
 
 
 def test_an_unreadable_event_is_a_payload_failure_and_never_a_silent_skip(tmp_path):
-    gate = _Gate(BotState.empty())
+    gate = _Gate(_STARTED)
     client = _Client(events=Reply(200, {"events": [{"id": "x"}], "high_watermark": 1}, None))
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     adapter = _adapter(gate, client, dir_fd=fd)
@@ -204,7 +208,8 @@ def test_an_approval_ref_with_non_ascii_digits_is_not_an_approval_id():
 
 def test_a_rewound_watermark_or_cursor_in_a_commit_is_a_fixed_reason(tmp_path):
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    gate = GateService(BotState(cursor=5, high_watermark=9, approvals=()),
+    gate = GateService(BotState(cursor=5, high_watermark=9, approvals=(),
+                              event_cursor_initialized=True),
                        guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id)
     adapter = _adapter(gate, _Client(), dir_fd=fd)
     try:
@@ -524,7 +529,7 @@ def test_a_refresh_edit_that_gave_up_does_not_block_the_later_terminal_edit(tmp_
 def test_every_poll_round_reconciles_each_in_flight_record_even_when_it_is_still_listed(tmp_path):
     lost = _record(state="in_flight", actor="discord:12345678901234569", action="approve",
                    nonce="n", expiry=600)
-    gate = _Gate(BotState.empty().with_record(lost))
+    gate = _Gate(_STARTED.with_record(lost))
     client = _Client(events=Reply(200, {"events": [], "high_watermark": 0}, None),
                      approvals=Reply(200, {"approvals": [{"id": 7}]}, None))
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)

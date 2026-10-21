@@ -177,21 +177,15 @@ def test_second_candidate_with_matching_metrics_becomes_observation(
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    # agent 面 (last_result) は固定文言だけで、一致した版の hash も pair も
+    # agent 面 (last_result) は固定語彙だけで、一致した版の hash も pair も
     # 出ない。詳細は activity にだけ残る。
-    from agentic_fx.loops.improve_quality import QUALITY_NOTICE
-    assert backlog_row[1] == f"observation:{QUALITY_NOTICE}"
+    from agentic_fx.loops.improve_context import DUPLICATE_LAST_RESULT
+    assert backlog_row[1] == DUPLICATE_LAST_RESULT
     assert content_hash_a not in backlog_row[1]
     assert "pair=" not in backlog_row[1]
     activity_text = (root / "logs" / "activity.log").read_text(
         encoding="utf-8")
     assert f"duplicate_metrics_of:{content_hash_a}" in activity_text
-
-    # T-A 検証節 pin: system note の文面に具体パラメータ (fast=/slow= 等)
-    # を出さない — note に埋め込まれるのは content_hash のみで、候補の
-    # plugin.py 由来のパラメータ文字列は現れない。
-    assert "variant b" not in backlog_row[1]
-    assert "params" not in backlog_row[1]
 
 
 def test_candidate_with_different_metrics_still_reaches_approval(

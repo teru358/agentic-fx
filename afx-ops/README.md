@@ -18,6 +18,10 @@ key_dir = "/home/me/.config/agentic-fx/ops-keys"  # 全機能。principal の鍵
 port = 8765                                 # web のみ (1〜65535)
 guild_id = 123456789012345678               # bot のみ
 channel_id = 223456789012345678             # bot のみ
+# 以下は任意 (無ければ既定値)
+trade_notices = "all"        # bot のみ: all | results | fills_closes | off。取引通知の種類
+trade_amounts = "absolute"   # bot のみ: absolute | relative。relative は数量と損益の絶対額を出さない
+deliver_trade_events = false # notify のみ: 取引 event を webhook に配送するか (既定 false)
 ```
 
 - UDS は `<instance_root>/data/run/api.sock`、lock は `<instance_root>/data/instance.lock` に固定

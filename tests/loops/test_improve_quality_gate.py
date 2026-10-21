@@ -39,7 +39,8 @@ from tests.loops.test_improve_loop_duplicate_metrics import (
     _fake_in_sample_full_metrics,
 )
 
-NOTICE = quality.QUALITY_NOTICE
+from agentic_fx.loops.improve_context import (  # noqa: E402
+    DUPLICATE_LAST_RESULT, NOT_SUBMITTED_LAST_RESULT)
 OTHER_MISSION = 9001
 
 METRICS_1 = {"trades": 194, "pf": 1.4981, "win_rate": 0.487, "avg_r": 0.188,
@@ -215,7 +216,7 @@ def test_ac8_iii_ac12_logic_match_with_a_past_candidate_is_rejected_whatever_the
     row = _expect_rows(conn, ctx, seeded, "duplicate_logic")
     assert row["archive_path"] is None and row["quality_flags"] == []
     assert _approval_count(conn) == 0
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == DUPLICATE_LAST_RESULT
 
 
 def test_ac8_iii_logic_match_with_an_example_is_rejected(improve_env):
@@ -229,7 +230,7 @@ def test_ac8_iii_logic_match_with_an_example_is_rejected(improve_env):
     (example / "config.yaml").write_text(_PASSING_STRATEGY_CONFIG)
     loop, ctx, seeded = _run_strategy(app, root, "cand")
     _expect_rows(conn, ctx, seeded, "duplicate_logic")
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == DUPLICATE_LAST_RESULT
 
 
 def test_ac8_iii_logic_match_with_a_deployed_other_name_is_rejected(improve_env):
@@ -523,7 +524,7 @@ def test_ac18_the_in_tx_check_also_rejects_a_candidate_without_identity(
         file_population=quality.FilePopulation(
             deployed=quality.Population(), examples=quality.Population()))
     assert verdict.outcome == "gate_failed"
-    assert verdict.reason == NOTICE
+    assert verdict.reason == "not_submitted"
 
 
 def test_ac18_one_corrupted_row_is_skipped_with_a_warning_and_others_compared(
@@ -563,7 +564,7 @@ def test_ac18_when_no_comparison_row_is_usable_the_candidate_is_gate_failed_and_
     loop, ctx, seeded = _run_strategy(app, root, "cand")
     _expect_rows(conn, ctx, seeded, "gate_failed")
     assert _approval_count(conn) == 0
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == NOT_SUBMITTED_LAST_RESULT
     assert "quality_check_unavailable" in _activity(root)
 
 
@@ -600,7 +601,7 @@ def test_demotion_details_never_reach_the_agent_surface(improve_env):
                  outcome="rejected_by_human")
     loop, ctx, seeded = _run_strategy(app, root, "cand")
     result = _last_result(conn)
-    assert result == f"observation:{NOTICE}"
+    assert result == DUPLICATE_LAST_RESULT
     assert "secret_past_name" not in result and past_hash not in result
     log = _activity(root)
     assert "quality_demoted" in log and "secret_past_name" in log
@@ -619,7 +620,7 @@ def test_duplicate_metrics_details_never_reach_the_agent_surface(improve_env):
     loop, ctx, seeded = _run_strategy(app, root, "conv_b", py=PY_Y)
     _expect_rows(conn, ctx, seeded, "duplicate_metrics")
     result = _last_result(conn)
-    assert result == f"observation:{NOTICE}"
+    assert result == DUPLICATE_LAST_RESULT
     assert approved_hash not in result
     assert "pair=" not in result and "duplicate_metrics_of" not in result
     log = _activity(root)
@@ -782,7 +783,7 @@ def test_a_deploy_operation_still_in_flight_makes_the_check_unavailable(
         app, root, "cand", before_commit=open_op)
     _expect_rows(conn, ctx, seeded, "gate_failed")
     assert _approval_count(conn) == 0
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == NOT_SUBMITTED_LAST_RESULT
     assert "quality_check_unavailable" in _activity(root)
 
 
@@ -868,7 +869,7 @@ def test_a_deploy_lock_held_past_the_timeout_makes_the_check_unavailable(
     threads[0].join(10)
     _expect_rows(conn, ctx, seeded, "gate_failed")
     assert _approval_count(conn) == 0
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == NOT_SUBMITTED_LAST_RESULT
     log = _activity(root)
     assert "quality_check_unavailable" in log
     assert "deploy_guard_unavailable" in log
@@ -978,7 +979,7 @@ def test_a_file_population_read_failure_is_gate_failed_and_reported(
         loop, ctx, seeded = _run_strategy(app, root, "cand")
     _expect_rows(conn, ctx, seeded, "gate_failed")
     assert _approval_count(conn) == 0
-    assert _last_result(conn) == f"observation:{NOTICE}"
+    assert _last_result(conn) == NOT_SUBMITTED_LAST_RESULT
     log = _activity(root)
     assert "quality_check_unavailable" in log and "PermissionError" in log
 

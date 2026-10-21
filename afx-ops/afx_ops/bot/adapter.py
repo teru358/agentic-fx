@@ -30,6 +30,8 @@ from dataclasses import dataclass
 
 import discord
 
+from afx_ops.event_outcome import SkipKnown
+from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
@@ -72,6 +74,9 @@ class BotSettings:
     channel_id: int
     mention_role_id: int | None
     mention_user_ids: tuple[int, ...]
+    # 取引通知の出し方。隔離の前に検査済みの設定の値で、runtime では読み直さない
+    trade_notices: str = "all"
+    trade_amounts: str = "absolute"
 
 
 @dataclass(frozen=True)
@@ -652,32 +657,56 @@ class BotAdapter:
         reply = await self._run(lambda: self.client.events(after=self.gate.state.cursor,
                                                            limit=EVENTS_LIMIT))
         events, high, unreadable = _page(reply)
-        if high < self.gate.state.high_watermark:
-            raise BotFailure("high_watermark_regressed")
-        if high > self.gate.state.high_watermark:
-            # event を投稿しない周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
-            await self._run(self._observe_high, high)
+        self._regression_guard(high)
+        if not self.gate.state.event_cursor_initialized:
+            # 最初の正常な応答の時点を開始とし、その page は配送せず末尾から読み始める
+            if unreadable:
+                print(f"afx-ops bot: {unreadable_notice(events, unreadable)}", file=sys.stderr)
+            await self._run(self._initialize_cursor, high)
+            return
+        # 新しい watermark は最初の確定 (投稿・既知の skip) と同じ置換で保存する
+        progressed = False
         for event in events:
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
                     e, mention_role_id=self.settings.mention_role_id,
-                    mention_user_ids=self.settings.mention_user_ids))
+                    mention_user_ids=self.settings.mention_user_ids,
+                    trade_notices=self.settings.trade_notices,
+                    trade_amounts=self.settings.trade_amounts))
             except Exception:
                 raise BotFailure("payload_invalid") from None
             if plan is None:
+                # cursor 以下 (確定済み)
+                continue
+            if isinstance(plan, SkipKnown):
+                # 設定で出さない既知の event は、投稿せずに cursor と high watermark を進める
+                await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
+                progressed = True
                 continue
             content = " ".join((*plan.mentions, plan.content))
+            allowed = (self._allowed_mentions() if plan.allow_mentions
+                       else discord.AllowedMentions.none())
             try:
-                await self._channel.send(content, allowed_mentions=self._allowed_mentions())
+                await self._channel.send(content, allowed_mentions=allowed)
             except (discord.HTTPException, OSError, asyncio.TimeoutError):
                 # 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
                 return
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
+            progressed = True
             approval_id = _approval_id_of(event)
             if approval_id is not None:
                 await self._settle(approval_id)
         if unreadable:
             raise BotFailure("payload_invalid")
+        if not progressed and high > self.gate.state.high_watermark:
+            # 確定する event が無い周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
+            await self._run(self._observe_high, high)
+
+    def _initialize_cursor(self, high: int) -> None:
+        try:
+            self.gate.initialize_event_cursor(high)
+        except StateError:
+            raise BotFailure("bot_state_invalid") from None
 
     def _observe_high(self, high: int) -> None:
         self._regression_guard(high)
@@ -691,6 +720,14 @@ class BotAdapter:
         self._regression_guard(high)
         try:
             self.gate.commit_event(event_id, high_watermark=high)
+        except StateError:
+            raise BotFailure("bot_state_invalid") from None
+
+    def _commit_skip(self, event_id: int, high: int) -> None:
+        """配信しない既知の event の確定 (投稿の成功を待たない)。"""
+        self._regression_guard(high)
+        try:
+            self.gate.commit_skip(event_id, high_watermark=high)
         except StateError:
             raise BotFailure("bot_state_invalid") from None
 
@@ -797,21 +834,8 @@ class BotAdapter:
         return None
 
 
-def _page(reply) -> tuple[list[dict], int, bool]:
-    """events 応答の形を確かめ、(id 順の event、high watermark、id が読めない event があったか)。"""
-    data = getattr(reply, "data", None)
-    if (getattr(reply, "status", None) != 200 or getattr(reply, "code", "x") is not None
-            or type(data) is not dict):
-        raise BotFailure("events_invalid")
-    events, high = data.get("events"), data.get("high_watermark")
-    if type(events) is not list or type(high) is not int or high < 0:
-        raise BotFailure("events_invalid")
-    readable = []
-    for event in events:
-        if type(event) is not dict or type(event.get("id")) is not int or event["id"] <= 0:
-            return sorted(readable, key=lambda item: item["id"]), high, True
-        readable.append(event)
-    return sorted(readable, key=lambda item: item["id"]), high, False
+def _page(reply) -> tuple[list[dict], int, int]:
+    return parse_page(reply, BotFailure)
 
 
 def open_state_dir(path: os.PathLike) -> int:

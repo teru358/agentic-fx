@@ -53,12 +53,18 @@ def pki(tmp_path_factory):
     return make_pki(tmp_path_factory.mktemp("pki"))
 
 
+_STARTED = {"version": 3, "cursor": 0, "high_watermark": 0, "event_cursor_initialized": True}
+
+
 @pytest.fixture
 def root(tmp_path) -> Path:
     root = make_root(tmp_path)
     url = root / "notify" / "secret" / "webhook.url"
     url.write_text(f"https://{HOST}/afx/{SECRET_MARK}")
     url.chmod(0o600)
+    # event cursor の初期化が済んだ (cursor 0 から読む) snapshot
+    (root / "notify" / "state" / "notify.snapshot").write_text(json.dumps(_STARTED))
+    (root / "notify" / "state" / "notify.snapshot").chmod(0o600)
     return root
 
 
@@ -129,8 +135,35 @@ def test_isolated_child_posts_real_events_over_verified_tls(root, pki, daemon, s
     # 1 送信 1 接続 (使い回さない)、送信ごとに名前を引く (DNS cache を持たない)
     assert len(hook.connections) == 2
     assert dns.queries == [HOST, HOST]
-    assert _snapshot(root) == {"version": 2, "cursor": 2, "high_watermark": 2}
+    assert _snapshot(root) == {"version": 3, "cursor": 2, "high_watermark": 2,
+                                "event_cursor_initialized": True}
     assert [r["after"] for r in daemon.requests()][:2] == [0, 2]
+    _assert_no_secret(got)
+
+
+def _trade_order(event_id: int) -> dict:
+    return {"id": event_id, "ts": "2026-10-11T00:00:00+00:00", "code": "order_state_changed",
+            "ref": "order:12",
+            "fields": {"state": "filled", "pair": "USDJPY", "side": "long",
+                       "entry_type": "market", "qty": "0.1", "price": "150.123", "sl": "149.8",
+                       "tp": None, "origin_code": "cron", "mode": "paper", "state_mode": None,
+                       "reason_code": None}}
+
+
+@pytest.mark.parametrize("enabled,sent_ids", [(None, [1, 3]), (False, [1, 3]), (True, [1, 2, 3])])
+def test_ac24_deliver_trade_events_read_before_isolation_applies_in_the_isolated_child(
+        root, pki, daemon, servers, child_env, enabled, sent_ids):
+    hook = _webhook(servers, pki)
+    dns = servers(Dns(["127.0.0.1"]))
+    daemon.set([event(1), _trade_order(2), event(3)])
+    spec = _spec(root, pki, hook, dns=dns)
+    if enabled is not None:
+        spec["notify"] = {"deliver_trade_events": enabled}
+    got = run_canary(spec, child_env)
+    assert got.rc == 0, got.stderr[-3000:]
+    assert [r.json()["event_id"] for r in hook.requests] == sent_ids
+    assert _snapshot(root) == {"version": 3, "cursor": 3, "high_watermark": 3,
+                                "event_cursor_initialized": True}
     _assert_no_secret(got)
 
 
@@ -201,7 +234,7 @@ def test_crash_after_two_xx_resends_the_same_id_but_a_duplicate_fetch_does_not(
     crashed = run_canary(_spec(root, pki, hook, dns=dns, crash_after_2xx=True), child_env)
     assert crashed.rc == 86, crashed.stderr[-3000:]
     assert [r.status for r in hook.requests] == [200]
-    assert _snapshot(root) is None
+    assert _snapshot(root) == _STARTED
     # 再起動: 同じ cursor から読み直して同じ event_id をもう一度送る
     again = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert again.result["rc"] == 0, again.stderr[-3000:]
@@ -221,7 +254,8 @@ def test_duplicate_fetch_alone_is_delivered_once(root, pki, daemon, servers, chi
     got = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert got.result["rc"] == 0, got.stderr[-3000:]
     assert [r.json()["event_id"] for r in hook.requests] == [1, 2]
-    assert _snapshot(root) == {"version": 2, "cursor": 2, "high_watermark": 2}
+    assert _snapshot(root) == {"version": 3, "cursor": 2, "high_watermark": 2,
+                                "event_cursor_initialized": True}
 
 
 # (webhook の leaf、status 列、期待の要求数、接続数、warning、最後の reason)
@@ -254,7 +288,7 @@ def test_delivery_failures_keep_the_cursor_and_stop_before_the_next_event(
     assert len(hook.requests) == requests
     assert len(hook.connections) == connections
     assert all(r.json()["event_id"] == 1 for r in hook.requests)
-    assert _snapshot(root) is None
+    assert _snapshot(root) == _STARTED
     _assert_no_secret(got)
 
 
@@ -276,7 +310,7 @@ def test_high_watermark_regression_against_the_saved_cursor(root, pki, daemon, s
     first = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert first.result["rc"] == 0, first.stderr[-3000:]
     saved = (root / "notify" / "state" / "notify.snapshot").read_bytes()
-    daemon.set([event(3)], high_watermark=1)
+    daemon.set([event(1)], high_watermark=1)
     got = run_canary(_spec(root, pki, hook, dns=dns), child_env)
     assert got.result["rc"] == 1
     assert _stderr_lines(got) == ["afx-ops: high_watermark_regressed"]
@@ -316,7 +350,7 @@ def test_resolv_conf_replaced_by_rename_fails_closed(root, pki, daemon, servers,
     # 置き換わった inode は規則の外で読めない。成功する代替経路で送ってもいない
     assert got.result["after"] == [[-1, EACCES]]
     assert dns.queries == [] and hook.connections == []
-    assert _snapshot(root) is None
+    assert _snapshot(root) == _STARTED
 
 
 def test_resolv_conf_rule_reads_the_file_while_it_is_unchanged(root, pki, daemon, servers,

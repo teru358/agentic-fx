@@ -94,11 +94,11 @@ def dns():
 class Bot:
     """隔離済み bot の 1 回の起動。"""
 
-    def __init__(self, root, pki, fake, dns, env, prefix=(), **params) -> None:
+    def __init__(self, root, pki, fake, dns, env, prefix=(), bot_config=None, **params) -> None:
         spec = {"feature": "bot", "root": str(root), "op": "bot_runtime",
                 "wait": {"interval": 0.05, "limit": 10},
                 "bot": {"allowlist_user_ids": [USER_A, USER_B], "mention_role_id": ROLE,
-                        "mention_user_ids": [USER_A]},
+                        "mention_user_ids": [USER_A], **(bot_config or {})},
                 "params": {"ca_pem": pki.ca_pem, "port": fake.port, "dns_port": dns.port,
                            "host": HOST, "connect_ports": [fake.port], **params}}
         self.proc = Interactive(spec, env, prefix=prefix)
@@ -136,6 +136,15 @@ def _start(bots, *args, **params) -> Bot:
 def _snapshot(root) -> dict | None:
     path = root / "bot" / "state" / "bot.snapshot"
     return json.loads(path.read_text()) if path.exists() else None
+
+
+def _seed_started(root) -> None:
+    """event cursor の初期化が済んだ (cursor 0 から読み始める) snapshot を置く。"""
+    path = root / "bot" / "state" / "bot.snapshot"
+    path.write_text(json.dumps({"version": 5, "cursor": 0, "high_watermark": 0,
+                                "event_cursor_initialized": True, "approvals": []},
+                               sort_keys=True))
+    path.chmod(0o600)
 
 
 def _record(root, approval_id) -> dict:
@@ -465,13 +474,15 @@ def test_crash_after_posting_an_approval_adopts_the_post_instead_of_reposting(
 def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash(
         root, pki, daemon, discord_fake, dns, child_env, bots):
     fake = discord_fake
+    _seed_started(root)
     daemon.set(events=[event(1)])
     crashed = _start(bots, root, pki, fake, dns, child_env, exit_before_commit=True)
     got = crashed.wait_exit()
     assert got.rc == 86, got.stderr[-2000:]
     assert len(fake.channel_posts(CHANNEL)) == 1
     snap = _snapshot(root)
-    assert (snap["cursor"], snap["high_watermark"]) == (0, 1)
+    # watermark は cursor と同じ置換で確定するので、確定前に止まれば両方とも動かない
+    assert (snap["cursor"], snap["high_watermark"]) == (0, 0)
     # 投稿の後・cursor の確定の前に止まった event は、再起動後にもう一度投稿する (at-least-once)
     daemon.set(approvals=_pending(7))
     bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon)
@@ -494,6 +505,64 @@ def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash
     # decided_by は投稿に写さない
     assert all("operator" not in (c.body or {}).get("content", "")
                for c in fake.channel_posts(CHANNEL))
+    bot.stop()
+
+
+def test_ac25_a_first_start_over_an_existing_history_posts_nothing_and_then_follows_new_events(
+        root, pki, daemon, discord_fake, dns, child_env, bots):
+    fake = discord_fake
+    daemon.set(events=[event(1), event(2), event(3, code="approval_state_changed",
+                                                 approval_id=9, state="approved")])
+    bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon)
+    wait_for(lambda: (_snapshot(root) or {}).get("event_cursor_initialized") is True)
+    snap = _snapshot(root)
+    assert (snap["version"], snap["cursor"], snap["high_watermark"]) == (5, 3, 3)
+    assert fake.channel_posts(CHANNEL) == []
+    daemon.set(events=[event(1), event(2), event(3, code="approval_state_changed",
+                                                 approval_id=9, state="approved"), event(4)])
+    wait_for(lambda: _snapshot(root)["cursor"] == 4)
+    assert len(fake.channel_posts(CHANNEL)) == 1
+    bot.stop()
+
+
+def _trade_order(event_id: int, state: str) -> dict:
+    return {"id": event_id, "ts": "2026-10-20T00:00:00+00:00", "code": "order_state_changed",
+            "ref": "order:12",
+            "fields": {"state": state, "pair": "USDJPY", "side": "long", "entry_type": "limit",
+                       "qty": "0.1", "price": "150.123", "sl": "149.8", "tp": "150.9",
+                       "origin_code": "cron", "mode": "paper", "state_mode": None,
+                       "reason_code": None}}
+
+
+def _trade_close(event_id: int) -> dict:
+    return {"id": event_id, "ts": "2026-10-20T00:00:00+00:00", "code": "position_closed",
+            "ref": "order:12",
+            "fields": {"pair": "USDJPY", "side": "long", "qty": "0.1", "entry_price": "150.123",
+                       "close_price": "150.9", "pnl": "7770.00", "ccy": "JPY", "pnl_r": "2.40",
+                       "held_sec": 11520, "reason_code": "tp", "origin_code": "cron",
+                       "mode": "paper", "state_mode": None}}
+
+
+def test_ac24_trade_settings_read_before_isolation_apply_in_the_isolated_bot(
+        root, pki, daemon, discord_fake, dns, child_env, bots):
+    fake = discord_fake
+    _seed_started(root)
+    daemon.set(events=[_trade_order(1, "placed"), _trade_order(2, "filled"), _trade_close(3),
+                       event(4)])
+    bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon,
+                       bot_config={"trade_notices": "results", "trade_amounts": "relative"})
+    wait_for(lambda: _snapshot(root)["cursor"] == 4)
+    posts = [c for c in fake.channel_posts(CHANNEL) if not c.body.get("embeds")]
+    contents = [c.body["content"] for c in posts]
+    assert len(contents) == 3
+    assert contents[0].startswith("[ペーパー] 約定しました #12 USDJPY 買い")
+    assert contents[1].startswith("[ペーパー] 決済しました #12 USDJPY 買い (利確到達)")
+    assert "lot" not in contents[0] + contents[1] and "7,770" not in contents[1]
+    # 取引通知は設定済みの mention を付けない。承認以外の既存の event は従来どおり付ける
+    for post in posts[:2]:
+        assert post.body["allowed_mentions"] == {"parse": []}
+        assert "<@" not in post.body["content"]
+    assert posts[2].body["allowed_mentions"] == {"parse": [], "roles": [ROLE], "users": [USER_A]}
     bot.stop()
 
 

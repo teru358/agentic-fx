@@ -16,7 +16,12 @@ from agentic_fx.ops.keys import key_dir
 _SECRET_NAME = {"bot": "discord.token", "notify": "webhook.url"}
 _FIELDS = {"bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids", "token"), "web": ("port",), "notify": ("webhook_url",)}
 _COMMON = ("instance_root", "key_dir")
-_OPTIONAL = {"bot": ("mention_role_id",), "web": (), "notify": ()}
+_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts"), "web": (),
+             "notify": ("deliver_trade_events",)}
+# 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
+_TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts"), "web": (), "notify": ("deliver_trade_events",)}
+TRADE_NOTICES = ("all", "results", "fills_closes", "off")
+TRADE_AMOUNTS = ("absolute", "relative")
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 class InputError(ValueError): pass
@@ -50,6 +55,19 @@ def _discord_ids(value: object, name: str) -> list[int]:
     if len(result) != len(set(result)): raise InputError(name)
     return result
 
+def _trade_options(feature: str, values: dict[str, Any]) -> dict[str, Any]:
+    """値が渡された取引通知の optional key だけを検査して返す (無いものは既定値に任せる)。"""
+    result: dict[str, Any] = {}
+    for name in _TRADE_KEYS[feature]:
+        if name not in values: continue
+        value = values[name]
+        if name == "deliver_trade_events":
+            if type(value) is not bool: raise InputError(name)
+        elif type(value) is not str or value not in (TRADE_NOTICES if name == "trade_notices" else TRADE_AMOUNTS):
+            raise InputError(name)
+        result[name] = value
+    return result
+
 def validate(feature: str, values: dict[str, Any]) -> dict[str, Any]:
     if feature == "web":
         port = values.get("port")
@@ -62,7 +80,7 @@ def validate(feature: str, values: dict[str, Any]) -> dict[str, Any]:
             valid = p and p.scheme == "https" and p.hostname and p.username is None and p.password is None and not p.fragment and p.port in (None, 443)
         except ValueError: valid = False
         if not valid: raise InputError("webhook_url")
-        return {"webhook_url": url}
+        return {"webhook_url": url} | _trade_options("notify", values)
     if feature == "bot":
         token = values.get("token")
         if not isinstance(token, str) or not token: raise InputError("token")
@@ -70,7 +88,7 @@ def validate(feature: str, values: dict[str, Any]) -> dict[str, Any]:
         mention = values.get("mention_user_ids", allow)
         result = {"guild_id": _discord_id(values.get("guild_id"), "guild_id"), "channel_id": _discord_id(values.get("channel_id"), "channel_id"), "allowlist_user_ids": allow, "mention_user_ids": _discord_ids(mention, "mention_user_ids"), "token": token}
         if values.get("mention_role_id") is not None: result["mention_role_id"] = _discord_id(values["mention_role_id"], "mention_role_id")
-        return result
+        return result | _trade_options("bot", values)
     raise ValueError("unknown_feature")
 
 def _owned_dir(fd: int, *, component: str, exact: int | None = None, other_writable: bool = False) -> None:
@@ -160,8 +178,10 @@ def _parse_config(root: Path, feature: str) -> dict[str, Any]:
     if any(name not in parsed for name in required) or any(name not in set(required + _OPTIONAL[feature]) for name in parsed): raise ValueError("invalid schema")
     if parsed.get("instance_root") != str(Path(root).resolve()) or parsed.get("key_dir") != str(key_dir(root)): raise ValueError("wrong instance")
     public = {name: parsed[name] for name in _FIELDS[feature] if name in parsed}
-    if feature != "notify": validate(feature, public | ({"token": "present"} if feature == "bot" else {}))
-    return public
+    options = {name: parsed[name] for name in _TRADE_KEYS[feature] if name in parsed}
+    if feature != "notify": validate(feature, public | options | ({"token": "present"} if feature == "bot" else {}))
+    else: _trade_options(feature, options)
+    return public | options
 
 def _secret_present(feature: str) -> bool:
     name = _SECRET_NAME.get(feature)
@@ -216,6 +236,7 @@ def collect(root: Path, feature: str) -> Inputs:
     return Inputs(values, tuple(name for name in _FIELDS[feature] if name not in values))
 
 def _toml_value(value: Any) -> str:
+    if isinstance(value, bool): return "true" if value else "false"
     if isinstance(value, int): return str(value)
     if isinstance(value, list): return "[" + ", ".join(str(item) for item in value) + "]"
     if isinstance(value, str): return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -254,6 +275,7 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
         config.update({name: values[name] for name in ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids")})
         if "mention_role_id" in values: config["mention_role_id"] = values["mention_role_id"]
     elif feature == "web": config["port"] = values["port"]
+    config.update({name: values[name] for name in _TRADE_KEYS[feature] if name in values})
     try:
         _atomic(config_fd, "ops.toml", "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode(), 0o644)
         if feature == "bot" and values["token"] != "present": _atomic(secret_fd, _SECRET_NAME[feature], values["token"].encode(), 0o600, secret=True)

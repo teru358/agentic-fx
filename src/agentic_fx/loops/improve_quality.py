@@ -18,10 +18,6 @@ from agentic_fx.plugin.logic_identity import LOGIC_HASH_PREFIX, read_identity
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.db import OPEN_PHASE_SQL
 
-# 質検査で降格・拒否した候補について、agent 面に出す唯一の文言。
-# 理由・他候補の名前や hash・成績は含めない。
-QUALITY_NOTICE = "理由非公開。同一候補を再提出しない"
-
 # 配備ガード (全 plugin 共通の flock) を排他で取るときの待ち上限 (秒)。
 # 超えたら比較できないものとして gate_failed にする。
 DEPLOY_GUARD_TIMEOUT_S = 30.0
