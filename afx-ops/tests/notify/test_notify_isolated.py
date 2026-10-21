@@ -141,6 +141,32 @@ def test_isolated_child_posts_real_events_over_verified_tls(root, pki, daemon, s
     _assert_no_secret(got)
 
 
+def _trade_order(event_id: int) -> dict:
+    return {"id": event_id, "ts": "2026-10-11T00:00:00+00:00", "code": "order_state_changed",
+            "ref": "order:12",
+            "fields": {"state": "filled", "pair": "USDJPY", "side": "long",
+                       "entry_type": "market", "qty": "0.1", "price": "150.123", "sl": "149.8",
+                       "tp": None, "origin_code": "cron", "mode": "paper", "state_mode": None,
+                       "reason_code": None}}
+
+
+@pytest.mark.parametrize("enabled,sent_ids", [(None, [1, 3]), (False, [1, 3]), (True, [1, 2, 3])])
+def test_ac24_deliver_trade_events_read_before_isolation_applies_in_the_isolated_child(
+        root, pki, daemon, servers, child_env, enabled, sent_ids):
+    hook = _webhook(servers, pki)
+    dns = servers(Dns(["127.0.0.1"]))
+    daemon.set([event(1), _trade_order(2), event(3)])
+    spec = _spec(root, pki, hook, dns=dns)
+    if enabled is not None:
+        spec["notify"] = {"deliver_trade_events": enabled}
+    got = run_canary(spec, child_env)
+    assert got.rc == 0, got.stderr[-3000:]
+    assert [r.json()["event_id"] for r in hook.requests] == sent_ids
+    assert _snapshot(root) == {"version": 3, "cursor": 3, "high_watermark": 3,
+                                "event_cursor_initialized": True}
+    _assert_no_secret(got)
+
+
 def _set_url(root, host: str) -> None:
     (root / "notify" / "secret" / "webhook.url").write_text(f"https://{host}/afx/{SECRET_MARK}")
 

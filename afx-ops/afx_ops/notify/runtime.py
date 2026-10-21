@@ -22,12 +22,13 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
+from afx_ops.event_outcome import Post, SkipKnown, decide, is_trade
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
 from afx_ops.isolation.startup import client_for
 from afx_ops.notify import transport
 from afx_ops.notify.delivery import DeliveryError, encode_json_object, validate_webhook_url
-from afx_ops.notify.payload import PayloadError, encode_event
+from afx_ops.notify.payload import PayloadError
 from afx_ops.notify.retry import RetryError, WarningThrottle, retry
 from afx_ops.notify.state import (StateError, advance_delivery, initialize_event_cursor, load,
                                   observe_high, save)
@@ -93,6 +94,11 @@ class _Loop:
         self._out = out
         # 同じ原因の warning は event をまたいで間引く
         self._throttle = WarningThrottle()
+        # 取引 event を配送するか。隔離の前に検査済みの設定の値で、runtime では読み直さない
+        config = getattr(isolated, "config", None)
+        self._deliver_trade_events = getattr(config, "deliver_trade_events", False) is True
+        # 直近の取得で進んだ件数 (配送と配送なしの確定の合計)
+        self._progressed = 0
 
     def run(self, stop: Callable[[int], bool] | None) -> None:
         try:
@@ -114,7 +120,7 @@ class _Loop:
                     return
                 # 続きを急いで読むのは、満杯の page から実際に配送できたときだけ。進捗のない
                 # 満杯 page (API の異常) で tight loop にならないよう待つ
-                if not (fetched >= EVENTS_LIMIT and delivered > 0):
+                if not (fetched >= EVENTS_LIMIT and self._progressed > 0):
                     self._sleep(POLL_INTERVAL)
         finally:
             os.close(dir_fd)
@@ -141,23 +147,35 @@ class _Loop:
         # 新しい watermark は最初の配送確定と同じ置換で保存する (失敗時に snapshot を動かさない)
         state = observe_high(state, high)
         delivered = 0
+        skipped = 0
         for event in events:
             if event["id"] <= state.cursor:
                 # 配送済み (cursor 以下)。送らない
                 continue
             try:
-                body = encode_json_object(encode_event(event))
+                outcome = decide(event, self._wants)
+                if isinstance(outcome, Post):
+                    body = encode_json_object(outcome.payload)
             except (PayloadError, DeliveryError):
                 raise _Failure("payload_invalid") from None
+            if isinstance(outcome, SkipKnown):
+                # 既知だが配送しない event。送らずに cursor と watermark を同じ保存で進める
+                state = self._save(dir_fd, advance_delivery(state, outcome.event_id))
+                skipped += 1
+                continue
             self._deliver(target, body)
             state = self._save(dir_fd, advance_delivery(state, event["id"]))
             delivered += 1
+        self._progressed = delivered + skipped
         if unreadable:
             # id が読めない event より前の正常分は配送済み。ここで止まり、その event は飛ばさない
             raise _Failure("payload_invalid")
-        if not delivered and state.high_watermark != saved_high:
+        if not (delivered or skipped) and state.high_watermark != saved_high:
             state = self._save(dir_fd, state)
         return state, len(events), delivered
+
+    def _wants(self, payload: dict) -> bool:
+        return self._deliver_trade_events or not is_trade(payload)
 
     @staticmethod
     def _save(dir_fd, state):

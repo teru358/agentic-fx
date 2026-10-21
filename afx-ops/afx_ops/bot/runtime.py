@@ -132,7 +132,9 @@ async def _main(isolated, token: str, client, dir_fd: int, *, connector_factory,
     config = isolated.config
     settings = BotSettings(guild_id=config.guild_id, channel_id=config.channel_id,
                            mention_role_id=config.mention_role_id,
-                           mention_user_ids=tuple(config.mention_user_ids))
+                           mention_user_ids=tuple(config.mention_user_ids),
+                           trade_notices=config.trade_notices,
+                           trade_amounts=config.trade_amounts)
     gate = GateService(BotState.empty(), guild_id=config.guild_id, channel_id=config.channel_id,
                        allowlist_user_ids=tuple(config.allowlist_user_ids), client=client)
     connector = connector_factory() if connector_factory is not None else None
