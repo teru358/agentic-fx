@@ -232,8 +232,8 @@ def test_ac15_stop_is_bounded_and_counts_shutdown_drop(db_path):
     started = time.monotonic()
     sink.stop()
     assert time.monotonic() - started < 3.0
-    # 1 件は INSERT 中 (worker が持つ)、残りの 5 件が捨てられる
-    assert sink.counters()["shutdown_drop"] == 5
+    # worker が抱えた 1 件も、保存されたか分からないので数える
+    assert sink.counters()["shutdown_drop"] == 6
     release.set()
 
 

@@ -1,4 +1,4 @@
-# [ops-api] 操作 API と client 契約設計 v1.19
+# [ops-api] 操作 API と client 契約設計 v1.20
 
 版: v1.20
 

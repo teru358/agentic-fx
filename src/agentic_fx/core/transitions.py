@@ -1,7 +1,7 @@
 """orders 状態遷移規則 — 設計書 §12 の遷移図を機械可読化。store は無検証 CRUD のまま。"""
 from __future__ import annotations
 
-import logging
+import itertools
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -11,7 +11,29 @@ from agentic_fx.core.contracts import OrderStatus as S
 from agentic_fx.store import orders
 
 
-_log = logging.getLogger(__name__)
+class LockFreeCounter:
+    """加算側が lock も I/O も待たない counter。`incr()` は `next()` 1 回 (GIL 下で不可分)。
+
+    読み取り側は自分の読み取りで進んだ分を差し引く。読む thread 同士だけが内部 lock で直列になる。
+    """
+
+    def __init__(self) -> None:
+        self._count = itertools.count()
+        self._reads = 0
+        self._read_lock = threading.Lock()
+
+    def incr(self) -> None:
+        next(self._count)
+
+    def value(self) -> int:
+        with self._read_lock:
+            seen = next(self._count) - self._reads
+            self._reads += 1
+            return seen
+
+
+# observer が例外を投げた回数。transition は数えるだけで、記録や通知は読み手が行う。
+observer_failures = LockFreeCounter()
 
 
 class IllegalTransition(Exception):
@@ -113,6 +135,6 @@ def transition(conn: sqlite3.Connection, order_id: int, to: S,
     if observer is not None and new is not None:
         try:
             observer(dict(new), cur.value, to.value)
-        except Exception:  # noqa: BLE001 — 通知は注文処理を止めない
-            _log.warning("transition observer failed", exc_info=False)
+        except Exception:  # noqa: BLE001 — 通知は注文処理を止めない。数えるだけ
+            observer_failures.incr()
     return new

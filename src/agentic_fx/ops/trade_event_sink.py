@@ -5,7 +5,8 @@
   短い backoff を挟んで最大 `BUSY_RETRY_SEC` 秒再試行し、期限を超えたら捨てる。
 - 1 件ごとに INSERT とその commit だけを行う短い tx にする。busy 以外の失敗は再試行せず捨てる。
 - queue は有限。溢れたら捨てる。
-- 捨てた event は理由別に数え、warning (理由別にスロットル) と health 状態に出す。
+- 捨てた event は理由別に数え、warning (理由別にスロットル) と health 状態に出す。observer 側の
+  drop は lock も logging も使わない counter に足すだけで、集計と warning は sink 側が行う。
 sink 自身が壊れているときに health event を確実に保存することは約束しない。
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
+from agentic_fx.core import transitions
 from agentic_fx.store.db import connect
 
 from . import trade_events
@@ -60,6 +62,13 @@ class TradeEventSink:
         self._join_timeout, self._recovery_sec = join_timeout, recovery_sec
         self._lock = threading.Lock()
         self._counters = dict.fromkeys(COUNTERS, 0)
+        # observer 側の drop。加算は lock も I/O も待たない。集計 (_absorb) は読み手が行う。
+        self._observed = {r: transitions.LockFreeCounter() for r in COUNTERS}
+        self._observed_seen = dict.fromkeys(COUNTERS, 0)
+        self._failure_base = transitions.observer_failures.value()
+        self._pending_warn: list[tuple[str, int]] = []
+        self._inflight = False
+        self._closed = threading.Event()
         self._last_drop: float | None = None
         self._last_warned: dict[str, float] = {}
         self._notified = "ok"
@@ -73,7 +82,40 @@ class TradeEventSink:
 
     def counters(self) -> dict[str, int]:
         with self._lock:
+            self._absorb()
             return dict(self._counters)
+
+    def note_drop(self, reason: str, count: int = 1) -> None:
+        """observer 側の drop の記録。lock も logging も使わない (集計と warning は sink 側)。"""
+        counter = self._observed[reason]
+        for _ in range(count):
+            counter.incr()
+
+    def _absorb(self) -> None:
+        """observer 側の counter を集計へ取り込む。`_lock` を持って呼ぶ。warning は保留する。"""
+        now = None
+        for reason in COUNTERS:
+            seen = self._observed[reason].value()
+            if reason == "observer_error":
+                seen += transitions.observer_failures.value() - self._failure_base
+            delta = seen - self._observed_seen[reason]
+            if delta <= 0:
+                continue
+            if now is None:
+                now = self._monotonic()
+            self._observed_seen[reason] = seen
+            self._counters[reason] += delta
+            self._last_drop = now
+            if now - self._last_warned.get(reason, -WARNING_INTERVAL_SEC) >= WARNING_INTERVAL_SEC:
+                self._last_warned[reason] = now
+                self._pending_warn.append((reason, self._counters[reason]))
+
+    def _flush_warnings(self) -> None:
+        with self._lock:
+            self._absorb()
+            pending, self._pending_warn = self._pending_warn, []
+        for reason, total in pending:
+            _log.warning("trade_event drop: %s (累計 %d)", reason, total)
 
     def record_drop(self, reason: str, count: int = 1) -> None:
         if reason not in self._counters:
@@ -93,6 +135,7 @@ class TradeEventSink:
     def health(self) -> str:
         """直近 `recovery_sec` 秒 (単調時計) に drop が無ければ ok。"""
         with self._lock:
+            self._absorb()
             last = self._last_drop
         if last is None or self._monotonic() - last >= self._recovery_sec:
             return "ok"
@@ -111,16 +154,20 @@ class TradeEventSink:
     def submit(self, code: str, ref: str, fields: dict) -> None:
         """queue に渡すだけで待たない。呼び出し側 (observer) には例外を出さない。"""
         if self._stopping.is_set():
-            self.record_drop("shutdown_drop")
+            self.note_drop("shutdown_drop")
             return
         if self._dead:
-            self.record_drop("queue_drop")
+            self.note_drop("queue_drop")
             return
         item = (self._wall_clock().isoformat(), code, ref, fields)
         try:
             self._queue.put_nowait(item)
         except queue.Full:
-            self.record_drop("queue_drop")
+            self.note_drop("queue_drop")
+            return
+        if self._closed.is_set():
+            # stop の排出の後に入った item。拾った側が数えるので二重にならない。
+            self._drain_count()
 
     # ---- worker -------------------------------------------------------------
 
@@ -140,7 +187,12 @@ class TradeEventSink:
                 except queue.Empty:
                     item = None
                 if item is not None:
-                    self._write(item)
+                    self._inflight = True
+                    try:
+                        self._write(item)
+                    finally:
+                        self._inflight = False
+                self._flush_warnings()
                 self.poll_health()
                 if item is None and self._stopping.is_set() and self._queue.empty():
                     return
@@ -148,6 +200,13 @@ class TradeEventSink:
             self._dead = True
             self.record_drop("worker_death")
             _log.exception("trade event sink worker died")
+        finally:
+            if self._abandon.is_set() and self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._conn = None
 
     def _write(self, item: tuple) -> None:
         ts, code, ref, fields = item
@@ -171,6 +230,9 @@ class TradeEventSink:
                     if self._stopping.is_set() or self._stopping.wait(delay) \
                             or self._abandon.is_set():
                         self.record_drop("shutdown_drop")
+                        return
+                    if time.monotonic() >= give_up:
+                        self.record_drop("db_busy_drop")
                         return
                     continue
                 self.record_drop("db_busy_drop" if busy else "db_error_drop")
@@ -218,6 +280,19 @@ class TradeEventSink:
             thread.join(self._join_timeout)
             if thread.is_alive():
                 self._abandon.set()
+                if self._inflight:
+                    self.record_drop("shutdown_drop")  # worker が抱えたまま。保存されたかは分からない
+        self._closed.set()
+        self._drain_count()
+        if thread is not None and not thread.is_alive() and self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
+
+
+    def _drain_count(self) -> None:
         remaining = 0
         while True:
             try:
@@ -226,13 +301,7 @@ class TradeEventSink:
                 break
             remaining += item is not None
         if remaining:
-            self.record_drop("shutdown_drop", remaining)
-        if thread is not None and not thread.is_alive() and self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = None
+            self.note_drop("shutdown_drop", remaining)
 
 
 class TradeEventEmitter:
@@ -265,10 +334,10 @@ class TradeEventEmitter:
                 row, to_status, trigger=self._trigger(row), state_mode=self._state_mode,
                 ccy=self._ccy, mode=self._mode)
         except trade_events.InvalidValue:
-            self._sink.record_drop("invalid_value_drop")
+            self._sink.note_drop("invalid_value_drop")
             return
         except Exception:  # noqa: BLE001 — 通知は注文処理を止めない
-            self._sink.record_drop("observer_error")
+            self._sink.note_drop("observer_error")
             return
         if built is not None:
             self._sink.submit(*built)
