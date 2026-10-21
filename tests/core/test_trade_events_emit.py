@@ -534,3 +534,31 @@ def test_commit_stalled_sink_delays_but_does_not_fail_the_next_core_write(tmp_pa
     assert orders.get(rig.env.conn, other)["status"] == "closing"
     assert 0.1 < waited < 4.0
     rig.close()
+
+
+def test_orders_status_is_written_only_by_transition_at_pinned_call_sites():
+    """production の `transitions.transition(...)` の構文上の呼出箇所 (式の数) を全数 pin する。
+
+    共有 helper の複数 caller を展開した実行経路の数ではない。orders.status を書く
+    `update_fields` / `UPDATE orders` は transitions.py の 1 か所だけであること。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
+    calls: dict[str, int] = {}
+    writers: list[str] = []
+    for path in sorted(src.rglob("*.py")):
+        rel = path.relative_to(src).as_posix()
+        text = path.read_text()
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in (
+                    "transitions.transition", "transition"):
+                if rel != "core/transitions.py":
+                    calls[rel] = calls.get(rel, 0) + 1
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("update_fields"):
+                writers.append(rel)
+        if re.search(r"UPDATE\s+orders\b", text, re.IGNORECASE):
+            writers.append(rel + ":sql")
+    assert calls == {"core/executor.py": 15, "core/scheduler.py": 11}
+    assert sorted(writers) == ["core/transitions.py", "store/orders.py:sql"]
