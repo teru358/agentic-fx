@@ -31,6 +31,17 @@ def test_ac1_a_realistic_event_validates():
     validate_fields("position_closed", CLOSE, "order:12")
 
 
+def test_trade_event_requires_a_valid_ref_none_is_rejected():
+    for code, fields in (("order_state_changed", ORDER), ("position_closed", CLOSE)):
+        with pytest.raises(EventSchemaError):
+            validate_fields(code, fields, None)
+        with pytest.raises(EventSchemaError):
+            validate_fields(code, fields)
+    # trade 以外の code は従来どおり ref 省略可
+    validate_fields("service_health_changed",
+                    {"component_code": "x", "health_code": "ok"}, None)
+
+
 @pytest.mark.parametrize("code,base", [("order_state_changed", ORDER), ("position_closed", CLOSE)])
 def test_ac1_missing_extra_float_and_free_text_are_rejected(code, base):
     missing = dict(base)

@@ -50,14 +50,13 @@ class EventSchemaError(ValueError):
 def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
     if code not in FIELDS or set(fields) != FIELDS[code]:
         raise EventSchemaError(code)
-    if ref is not None and (not isinstance(ref, str) or _REF[code].fullmatch(ref) is None):
-        raise EventSchemaError(code)
     if code in trade_events.TRADE_CODES:
-        # 取引 event は field ごとの grammar と canonical、ref の整数範囲まで見る
-        if not trade_events.valid_fields(code, fields) or (
-                ref is not None and not trade_events.valid_ref(ref)):
+        # 取引 event は ref 必須。field ごとの grammar と canonical、ref の整数範囲まで見る
+        if not trade_events.valid_ref(ref) or not trade_events.valid_fields(code, fields):
             raise EventSchemaError(code)
         return
+    if ref is not None and (not isinstance(ref, str) or _REF[code].fullmatch(ref) is None):
+        raise EventSchemaError(code)
     for value in fields.values():
         if value is None or (isinstance(value, int) and not isinstance(value, bool)):
             continue
