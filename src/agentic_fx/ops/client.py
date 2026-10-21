@@ -40,6 +40,7 @@ from . import change_limits, keys, redactor
 from .contracts import Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
+from .trade_events import DROP_REASONS
 
 RC_OK = 0
 RC_FAILED = 1
@@ -644,6 +645,10 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+    trade_events = data.get("trade_events")
+    if isinstance(trade_events, dict):
+        lines.append("取引 event の欠落: " + " ".join(
+            f"{name}={_num(trade_events.get(name))}" for name in DROP_REASONS))
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     setup = data.get("setup")
     record_state = setup.get("record_state") if isinstance(setup, dict) else None

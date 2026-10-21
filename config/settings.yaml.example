@@ -1,5 +1,5 @@
 # agentic-fx 設定 (このファイルを settings.yaml にコピーして編集。新キー追加時は両方を同期)
-schema_version: 3  # [init] settings の版。`afx init` が移行する
+schema_version: 4  # [init] settings の版。`afx init` が移行する
 display_timezone: Asia/Tokyo  # [init] ログ・status 表示に使う (保存は常に UTC、市場境界は NY 固定で変更不可)
 account_currency: JPY         # [init] 利用者の基準通貨。損益・リスクの表現と換算に使う。取引可能ペアを制限するものではない (設計書 §5)。実取引では MT5 口座通貨が真で、起動時に照合する
 
@@ -178,3 +178,6 @@ reflection:                    # reflection cycle の再試行ポリシー (プ�
 
 alert:                         # 運用アラート (プラン9 Task17)。省略可
   consecutive_gate_reject: 10   # risk gate の連続 rejection がこの本数に達したら一度だけ通知
+
+notify:                        # 取引 event の発行。省略可 (省略時は発行する)
+  trade_events: true            # false にすると daemon は order_state_changed / position_closed を一切出さない (rollback 用。bot / notify 側の表示設定ではない)

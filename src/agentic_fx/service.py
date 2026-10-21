@@ -30,6 +30,7 @@ from agentic_fx.commands import Commands
 from agentic_fx.config import load_env_file, load_settings, load_settings_text
 from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
+from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
@@ -50,6 +51,7 @@ from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.service import OpsLimits, OpsService
+from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
 from agentic_fx.loops import reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
@@ -756,10 +758,18 @@ class App:
     root: Path | None = None
     conn_signal: object | None = None
     signal_connection_failures: int = 0
+    # 取引 event の observer 登録と書き込み thread (settings の notify.trade_events が真のときだけ)。
+    trade_event_sink: object | None = None
+    trade_event_token: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
         resources = [
+            # scheduler と supervisor は止まっている。observer を外してから sink を止める。
+            ("trade_event_observer", lambda: transitions.unobserve(self.trade_event_token)
+             if self.trade_event_token is not None else None),
+            ("trade_event_sink", lambda: self.trade_event_sink.stop()
+             if self.trade_event_sink is not None else None),
             ("runner", lambda: self.runner.close()
              if self.owns_runner and hasattr(self.runner, "close") else None),
             ("rag", self.rag.close),
@@ -971,6 +981,33 @@ def _check_mission_ceilings(settings, activity) -> None:
             f"{mission_ceiling.REFLECTIONS_PER_DISPATCH}、Cw {cw.total:.0f} 秒) が"
             "足幅以上です。起動は続けます。見送り・合流は cron_mission_deferred / "
             "cron_mission_coalesced で確認できます")
+
+
+def _read_state_mode(state) -> str | None:
+    """起動時に 1 回だけ運転状態を読む。以降 observer はこの値をメモリで使う。"""
+    try:
+        return state.load().mode.value
+    except Exception:  # noqa: BLE001 — 読めなければ event の state_mode は None
+        return None
+
+
+def _start_trade_events(root: Path, conn_core, settings, state, clock):
+    """sink を起こし、conn_core に observer を登録する (登録はここ 1 か所だけ)。
+
+    scheduler / supervisor / ops listener の起動前に呼ぶ。失敗した場合は呼び出し側が
+    daemon を起動しない。
+    """
+    sink = TradeEventSink(root / "data" / "agentic.db", wall_clock=clock.now,
+                          busy_retry_sec=BUSY_RETRY_SEC)
+    sink.start()
+    try:
+        emitter = TradeEventEmitter(conn_core, sink, state_mode=_read_state_mode(state),
+                                    ccy=settings.account_currency)
+        token = transitions.observe(conn_core, emitter)
+    except BaseException:
+        sink.stop()
+        raise
+    return sink, token
 
 
 @dataclass
@@ -1206,6 +1243,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     conn_ops = None
     conn_signal = None
     ops_service = None
+    trade_sink = None
+    trade_token = None
 
     try:
         if state.reconcile_marker() is not None:
@@ -1216,6 +1255,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         conn_core = connect(root / "data" / "agentic.db")
         init_db(conn_core, root=root)
         conn_signal = connect(root / "data" / "agentic.db")
+        if settings.notify.trade_events is True:
+            # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
+            trade_sink, trade_token = _start_trade_events(root, conn_core, settings, state, clock)
         seeded = seed_default_sources(conn_core, clock.now())
         if seeded:
             activity.write(Category.NEWS, "sources_seeded",
@@ -1697,7 +1739,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
-            improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage)
+            improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
+            trade_event_sink=trade_sink)
         commands.use_ops_service(ops_service)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
@@ -1716,7 +1759,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    watchdog_heartbeat=watchdog_heartbeat,
                    fatal_reason=None, ingest=ingest, outage=outage,
                    ops=ops_service, conn_ops=conn_ops, ops_recovered=ops_recovered,
-                   root=root, conn_signal=conn_signal)
+                   root=root, conn_signal=conn_signal,
+                   trade_event_sink=trade_sink, trade_event_token=trade_token)
         return app
     except BaseException:
         # 2 周目レビュー (sonnet Minor / KAT-Coder Critical): 素の
@@ -1730,6 +1774,16 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         if ops_service is not None:
             try:
                 ops_service.shutdown(join_timeout=0.0)
+            except Exception:  # noqa: BLE001
+                pass
+        if trade_token is not None:
+            try:
+                transitions.unobserve(trade_token)
+            except Exception:  # noqa: BLE001
+                pass
+        if trade_sink is not None:
+            try:
+                trade_sink.stop()
             except Exception:  # noqa: BLE001
                 pass
         if conn_ops is not None:
@@ -1813,7 +1867,7 @@ def _serialize_status_setup(facts) -> dict:
 
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
-                       outage) -> OpsService:
+                       outage, trade_event_sink=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -1857,11 +1911,15 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         if recent:
             mission = {"loop": recent[0]["loop"], "status": recent[0]["status"],
                        "started_at": recent[0]["started_at"]}
-        return {"balance": balance, "equity": equity,
-                "orders": {"active": len(active)}, "mission": mission,
-                "health": {"latched": health_latch.is_latched(),
-                           "failures": len(health_latch.summary())},
-                "data": {"state": data_state}, "setup": setup}
+        status = {"balance": balance, "equity": equity,
+                  "orders": {"active": len(active)}, "mission": mission,
+                  "health": {"latched": health_latch.is_latched(),
+                             "failures": len(health_latch.summary())},
+                  "data": {"state": data_state}, "setup": setup}
+        if trade_event_sink is not None:
+            # 理由別の件数だけ。理由の文言や event の中身は載せない
+            status["trade_events"] = trade_event_sink.counters()
+        return status
 
     def ask_submitter(question: str):
         submitted = supervisor.try_submit("ask", question=question)
@@ -2311,6 +2369,9 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
     if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
         busy.add("conn_core")
         busy.add("conn_signal")
+        # 残った thread が遷移を起こし得る間は observer と sink を外さない (event を無記録にしない)。
+        busy.add("trade_event_observer")
+        busy.add("trade_event_sink")
         # レビュー2周目 codex Critical: `instance_lock` は単なる close 対象
         # ではなく**残存 App 全体の単一起動所有権**を表す。残存スレッドが
         # 旧 App の DB/broker/runner を使っているのに flock を解放すると、

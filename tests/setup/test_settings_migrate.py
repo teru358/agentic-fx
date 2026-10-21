@@ -27,7 +27,7 @@ def test_version_zero_migration_inserts_only_schema_version_line():
     assert result.ok
     assert result.text is not None
     assert without_lock_lines(result.text).replace(
-        "schema_version: 3  # settings の版。`afx init` が移行する\n", "",
+        "schema_version: 4  # settings の版。`afx init` が移行する\n", "",
     ) == old
 
 
@@ -36,7 +36,7 @@ def test_version_zero_migration_inserts_the_exact_line_before_display_timezone()
     result = migrate(old)
     assert result.ok
     assert result.text is not None
-    assert result.text.index("schema_version: 3  # settings の版。`afx init` が移行する\n") < \
+    assert result.text.index("schema_version: 4  # settings の版。`afx init` が移行する\n") < \
         result.text.index("display_timezone: Asia/Tokyo")
 
 
@@ -53,7 +53,7 @@ def test_version_zero_to_one_migration_remains_available_for_the_chain():
 
 
 def test_newer_schema_is_left_unchanged_with_update_guidance():
-    text = EXAMPLE.read_text(encoding="utf-8").replace("schema_version: 3", "schema_version: 4")
+    text = EXAMPLE.read_text(encoding="utf-8").replace("schema_version: 4", "schema_version: 5")
 
     result = migrate(text)
 
@@ -85,14 +85,17 @@ def test_every_schema_fixture_exists_and_migrates_without_changing_existing_line
         assert result.text is not None
         if fixture.name == "v0.yaml":
             assert without_lock_lines(result.text).replace(
-                "schema_version: 3  # settings の版。`afx init` が移行する\n", "",
+                "schema_version: 4  # settings の版。`afx init` が移行する\n", "",
             ) == original
         elif fixture.name == "v1.yaml":
             assert without_lock_lines(result.text) == original.replace(
-                "schema_version: 1", "schema_version: 3", 1)
+                "schema_version: 1", "schema_version: 4", 1)
         elif fixture.name == "v2.yaml":
-            assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+            assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace(
+                "schema_version: 3", "schema_version: 4", 1)
         elif fixture.name == "v3.yaml":
+            assert result.text == original.replace("schema_version: 3", "schema_version: 4", 1)
+        elif fixture.name == "v4.yaml":
             assert result.text == original
 
 
@@ -111,7 +114,7 @@ def test_version_one_migration_changes_only_the_schema_version_line():
     assert result.ok
     assert result.text is not None
     assert without_lock_lines(result.text).replace(
-        "schema_version: 3", "schema_version: 1", 1) == old
+        "schema_version: 4", "schema_version: 1", 1) == old
     assert "enabled: false              # 改善 worker" in result.text
 
 
@@ -122,7 +125,7 @@ def test_version_zero_migrates_through_version_one_to_version_two():
 
     assert result.ok
     expected = (FIXTURES / "v1.yaml").read_text(encoding="utf-8").replace(
-        "schema_version: 1", "schema_version: 3", 1)
+        "schema_version: 1", "schema_version: 4", 1)
     assert without_lock_lines(result.text) == expected
     assert PLUGIN_LOCK_LINE in result.text
 
@@ -133,8 +136,9 @@ def test_version_two_migrates_to_the_current_example_by_adding_the_lock_timeout(
     result = migrate(old)
 
     assert result.ok
-    assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
-    assert yaml.safe_load(result.text)["schema_version"] == 3
+    assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace(
+        "schema_version: 3", "schema_version: 4", 1)
+    assert yaml.safe_load(result.text)["schema_version"] == 4
 
 
 def test_version_two_migration_keeps_an_existing_lock_timeout_value():
@@ -144,7 +148,7 @@ def test_version_two_migration_keeps_an_existing_lock_timeout_value():
     result = migrate(old)
 
     assert result.ok
-    assert result.text == old.replace("schema_version: 2", "schema_version: 3", 1).replace(
+    assert result.text == old.replace("schema_version: 2", "schema_version: 4", 1).replace(
         "(lock内再取得しない)\n", "(lock内再取得しない)\n" + RECONCILE_LOCK_LINE, 1)
 
 
@@ -157,7 +161,7 @@ def test_version_two_migration_without_a_worker_section_changes_only_the_marker(
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text == old.replace("schema_version: 2", "schema_version: 3", 1)
+    assert result.text == old.replace("schema_version: 2", "schema_version: 4", 1)
 
 
 def test_version_two_migration_without_trailing_newline_keeps_lines_separate():
@@ -184,10 +188,115 @@ def test_version_two_marker_does_not_match_a_longer_number():
     assert not result.ok
 
 
-def test_version_three_is_a_noop():
-    current = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+def test_version_four_is_a_noop():
+    current = (FIXTURES / "v4.yaml").read_text(encoding="utf-8")
 
     result = migrate(current)
 
     assert result.ok
     assert result.text == current
+
+
+def test_ac26_version_three_migrates_by_changing_only_the_marker():
+    old = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+    assert "notify:" not in result.text
+    # 節が無くても既定 true で読める
+    from agentic_fx.config import Settings
+    assert Settings.model_validate(yaml.safe_load(result.text)).notify.trade_events is True
+
+
+def test_ac26_old_yaml_without_notify_section_reads_with_default_true():
+    from agentic_fx.config import Settings
+    for name in ("v0", "v1", "v2", "v3"):
+        raw = yaml.safe_load((FIXTURES / f"{name}.yaml").read_text(encoding="utf-8"))
+        assert "notify" not in raw
+        assert Settings.model_validate(raw).notify.trade_events is True
+
+
+def test_ac26_example_is_v4_and_validates_with_notify_section():
+    from agentic_fx.config import Settings
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 4 and raw["notify"] == {"trade_events": True}
+    assert Settings.model_validate(raw).notify.trade_events is True
+
+
+def test_ac26_notify_trade_events_must_be_a_real_boolean():
+    import pytest
+    from pydantic import ValidationError
+    from agentic_fx.config import Settings
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    for bad in ("yes", "false", 1, 0, None):
+        raw["notify"] = {"trade_events": bad}
+        with pytest.raises(ValidationError):
+            Settings.model_validate(raw)
+    raw["notify"] = {"trade_events": False, "extra": 1}
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_version_three_migration_keeps_crlf_line_endings_byte_for_byte():
+    old = (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace("\n", "\r\n")
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+
+
+def test_version_three_migration_rejects_an_invalid_notify_value():
+    old = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+    assert old.endswith("\n")
+
+    result = migrate(old + 'notify:\n  trade_events: "yes"\n')
+
+    assert not result.ok
+
+
+def test_version_three_marker_without_a_comment_migrates_under_crlf():
+    import re
+    old = re.sub(r"schema_version: 3[^\n]*\n", "schema_version: 3\n",
+                 (FIXTURES / "v3.yaml").read_text(encoding="utf-8"), count=1)
+    old = old.replace("\n", "\r\n")
+    assert "schema_version: 3\r\n" in old
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+
+
+def _variants(version: int):
+    return ("schema_version:  %d\n" % version, "schema_version:   %d  # 版の注記\n" % version)
+
+
+def test_version_three_marker_with_odd_spacing_is_really_rewritten():
+    base = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+    import re
+    for line in _variants(3):
+        old = re.sub(r"schema_version: 3[^\n]*\n", lambda m: line, base, count=1)
+        assert line in old
+
+        result = migrate(old)
+
+        assert result.ok, result.reason
+        assert yaml.safe_load(result.text)["schema_version"] == 4
+        assert result.text == old.replace(line, line.replace("3", "4", 1), 1)
+
+
+def test_version_two_marker_with_odd_spacing_is_really_rewritten():
+    base = (FIXTURES / "v2.yaml").read_text(encoding="utf-8")
+    import re
+    for line in _variants(2):
+        old = re.sub(r"schema_version: 2[^\n]*\n", lambda m: line, base, count=1)
+        assert line in old
+
+        result = _migrate_two_to_three(old)
+
+        assert result.ok, result.reason
+        assert yaml.safe_load(result.text)["schema_version"] == 3
+        assert line.replace("2", "3", 1) in result.text

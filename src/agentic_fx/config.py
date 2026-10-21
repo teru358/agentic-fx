@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from dotenv import load_dotenv
 from pydantic import (
-    BaseModel, ConfigDict, Field, ValidationError, field_validator,
+    BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator,
     model_validator,
 )
 
@@ -304,6 +304,11 @@ class AlertSettings(_Strict):
     consecutive_gate_reject: int = Field(ge=1, default=10)
 
 
+class NotifySettings(_Strict):
+    """取引 event の発行。false にすると daemon は取引 event を一切出さない。"""
+    trade_events: StrictBool = True
+
+
 class NewsSettings(_Strict):
     cleanup_hours: int = Field(gt=0)
 
@@ -584,6 +589,7 @@ class Settings(_Strict):
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
     reflection: ReflectionSettings = Field(default_factory=ReflectionSettings)
     alert: AlertSettings = Field(default_factory=AlertSettings)
+    notify: NotifySettings = Field(default_factory=NotifySettings)
 
     @model_validator(mode="before")
     @classmethod

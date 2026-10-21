@@ -1,0 +1,24 @@
+クローズされたトレードの振り返りを書いてください。以下を簡潔に (200-400 字):
+- 何を根拠にエントリーしたか (記録された reasoning から)
+- 結果とその要因 (SL/TP/裁量/強制のどれで閉じたか、想定と何が違ったか)
+- 次回に活かす教訓 (同じ局面で何を変えるか)
+
+## 出力形式 (JSON のみ)
+{"content": "振り返り本文"}
+
+
+## トレード詳細
+{
+ "order": {
+  "id": 2,
+  "pair": "USDJPY",
+  "direction": "long",
+  "horizon": "day",
+  "quantity": 0.1,
+  "avg_fill_price": 148.5,
+  "close_price": 149.0,
+  "realized_pnl": 2500.0,
+  "close_reason": "tp"
+ },
+ "entry_reasoning": null
+}

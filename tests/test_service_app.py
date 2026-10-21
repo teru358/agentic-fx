@@ -128,6 +128,17 @@ def test_busy_resources_include_core_and_lock_when_only_improve_is_busy():
     assert _busy_resources_after_join(False, False, False) == frozenset()
 
 
+def test_trade_event_observer_and_sink_stay_while_any_worker_remains():
+    """残った thread が遷移を起こし得る間は observer も sink も外さない (event を無記録にしない)。"""
+    from agentic_fx.service import _busy_resources_after_join
+
+    for args in ((True, False, False), (False, True, False), (False, False, True)):
+        busy = _busy_resources_after_join(*args)
+        assert {"trade_event_observer", "trade_event_sink"} <= busy, args
+    assert not {"trade_event_observer", "trade_event_sink"} & _busy_resources_after_join(
+        False, False, False)
+
+
 def _init(tmp_path):
     (tmp_path / "config").mkdir()
     src = open("config/settings.yaml.example", encoding="utf-8").read()

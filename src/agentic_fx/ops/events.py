@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
+from . import trade_events
 from .contracts import ErrorCode, OpsError
 
 FIELDS = {
@@ -22,6 +23,7 @@ FIELDS = {
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
+    **trade_events.FIELDS,
 }
 
 # 値は code・識別子・時刻・数だけ。空白や非 ASCII を含む自由文は入れられない。
@@ -36,6 +38,8 @@ _REF = {
     "guard_state_changed": re.compile(r"instance"),
     "service_health_changed": re.compile(r"instance"),
     "event_stream_health": re.compile(r"instance"),
+    trade_events.ORDER_CODE: trade_events.REF_PATTERN,
+    trade_events.CLOSE_CODE: trade_events.REF_PATTERN,
 }
 
 
@@ -46,6 +50,11 @@ class EventSchemaError(ValueError):
 def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
     if code not in FIELDS or set(fields) != FIELDS[code]:
         raise EventSchemaError(code)
+    if code in trade_events.TRADE_CODES:
+        # 取引 event は ref 必須。field ごとの grammar と canonical、ref の整数範囲まで見る
+        if not trade_events.valid_ref(ref) or not trade_events.valid_fields(code, fields):
+            raise EventSchemaError(code)
+        return
     if ref is not None and (not isinstance(ref, str) or _REF[code].fullmatch(ref) is None):
         raise EventSchemaError(code)
     for value in fields.values():
@@ -123,9 +132,20 @@ class EventStore:
         if type(after) is not int or after < 0 or type(limit) is not int \
                 or not 1 <= limit <= MAX_POLL_LIMIT:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
-        high = self._conn.execute("SELECT COALESCE(MAX(id),0) AS id FROM ops_events").fetchone()["id"]
-        rows = self._conn.execute(
-            "SELECT * FROM ops_events WHERE id>? ORDER BY id LIMIT ?", (after, limit)).fetchall()
+        # high watermark と行の取得を 1 つの読み取り tx にまとめる。別接続の commit が間に入っても、
+        # 返す行が high watermark を超えない (超えると cursor 規律が正常時に巻き戻りと誤判定する)。
+        own_tx = not self._conn.in_transaction
+        if own_tx:
+            self._conn.execute("BEGIN")
+        try:
+            high = self._conn.execute(
+                "SELECT COALESCE(MAX(id),0) AS id FROM ops_events").fetchone()["id"]
+            rows = self._conn.execute(
+                "SELECT * FROM ops_events WHERE id>? ORDER BY id LIMIT ?",
+                (after, limit)).fetchall()
+        finally:
+            if own_tx:
+                self._conn.rollback()
         return EventPage([{"id": row["id"], "ts": row["ts"], "code": row["code"],
                            "ref": row["ref"], "fields": json.loads(row["fields_json"])}
                           for row in rows], int(high))
