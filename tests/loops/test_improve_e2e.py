@@ -862,7 +862,7 @@ def test_strategy_below_evaluable_min_trades_becomes_observation(improve_env):
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    assert backlog_row[1].startswith("insufficient_trades:")
+    assert backlog_row[1] == "observation:not_submitted"  # 取引数の語は出さない
     persisted = conn.execute(
         "SELECT mission_id, scope FROM backtest_runs WHERE mission_id=?",
         (ctx.mission_id,),
@@ -1358,7 +1358,7 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    assert backlog_row[1] == "unprofitable"  # 固定文言・完全一致
+    assert backlog_row[1] == "observation:not_submitted"  # 固定文言・完全一致
 
     run_row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=? "
@@ -1471,7 +1471,7 @@ def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
         "SELECT id, status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row["status"] == "observation"
-    assert backlog_row["last_result"] == "unprofitable"
+    assert backlog_row["last_result"] == "observation:not_submitted"
 
     # F4-2: observation は list_open に残る (R8、次回再挑戦できる)。
     from agentic_fx.store import backlog as backlog_store
@@ -1629,7 +1629,7 @@ def test_floor_report_detail_holdout_fail_two_pairs_full_metrics(improve_env):
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    assert backlog_row[1] == "unprofitable"
+    assert backlog_row[1] == "observation:not_submitted"
 
     report_files = list((root / "data" / "improve_reports").glob(
         f"improve-*-{ctx.mission_id}.md"))

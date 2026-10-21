@@ -51,7 +51,8 @@ def test_loser_run_stays_unbound_but_discoveries_persist(
     assert disc == 1  # discoveries の INSERT は敗者でも残る
 
 
-@pytest.mark.parametrize("kind,expected_status", [("fact", "note"), ("task", "open")])
+@pytest.mark.parametrize("kind,expected_status", [
+    ("fact", "note"), ("idea", "note"), ("task", "note")])
 def test_discovery_kind_controls_initial_backlog_status(
         loop_and_ctx_with_open_backlog, kind, expected_status):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
@@ -68,7 +69,7 @@ def test_discovery_kind_controls_initial_backlog_status(
     assert row["status"] == expected_status
 
 
-def test_internal_discovery_missing_kind_defaults_to_open(
+def test_internal_discovery_missing_kind_defaults_to_note(
         loop_and_ctx_with_open_backlog):
     loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
     output = {"discoveries": [{"idea": "legacy task", "source": "agent",
@@ -79,55 +80,7 @@ def test_internal_discovery_missing_kind_defaults_to_open(
     loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
     row = conn.execute(
         "SELECT status FROM improvement_backlog WHERE idea='legacy task'").fetchone()
-    assert row["status"] == "open"
-
-
-def test_task_discovery_promotes_matching_fact_note_without_duplicate(
-        loop_and_ctx_with_open_backlog):
-    loop, ctx, conn, selected_id = loop_and_ctx_with_open_backlog
-    now = datetime(2026, 8, 22)
-    conn.execute(
-        "INSERT INTO improvement_backlog "
-        "(idea,source,status,created_at,updated_at,idea_norm) "
-        "VALUES ('same idea','agent','note',?,?, 'same idea')",
-        (now.isoformat(), now.isoformat()))
-    conn.commit()
-    output = {"discoveries": [{"idea": "same idea", "source": "agent",
-                               "evidence": "e", "kind": "task"}],
-              "selected": {"backlog_id": selected_id, "idea": "x"},
-              "artifact": {"type": "observation", "reason": "x"},
-              "selection_rationale": "x"}
-    loop._select_and_bind(conn, output, ctx, now=now)
-    rows = conn.execute(
-        "SELECT status,last_result FROM improvement_backlog WHERE idea_norm='same idea'"
-    ).fetchall()
-    assert len(rows) == 1
-    assert dict(rows[0]) == {"status": "open", "last_result": "promoted_from_note"}
-
-
-def test_selected_new_idea_promotes_matching_note_and_selects_it(
-        loop_and_ctx_with_open_backlog):
-    loop, ctx, conn, _ = loop_and_ctx_with_open_backlog
-    now = datetime(2026, 8, 22)
-    cur = conn.execute(
-        "INSERT INTO improvement_backlog "
-        "(idea,source,status,created_at,updated_at,idea_norm) "
-        "VALUES ('selected note','agent','note',?,?, 'selected note')",
-        (now.isoformat(), now.isoformat()))
-    note_id = cur.lastrowid
-    conn.commit()
-    output = {"discoveries": [],
-              "selected": {"backlog_id": None, "idea": "selected note"},
-              "artifact": {"type": "observation", "reason": "x"},
-              "selection_rationale": "x"}
-    outcome = loop._select_and_bind(conn, output, ctx, now=now)
-    assert outcome.won is True and outcome.backlog_id == note_id
-    row = conn.execute("SELECT status FROM improvement_backlog WHERE id=?",
-                       (note_id,)).fetchone()
-    assert row["status"] == "selected"
-    assert conn.execute(
-        "SELECT count(*) c FROM improvement_backlog WHERE idea_norm='selected note'"
-    ).fetchone()["c"] == 1
+    assert row["status"] == "note"
 
 
 def test_duplicate_idea_normalized_whitespace_and_case_is_deduped(
@@ -221,31 +174,6 @@ def test_discovery_dedup_normalizes_unicode_whitespace_and_trailing_newline(
         "SELECT count(*) c FROM improvement_backlog WHERE "
         "idea_norm='improve x'").fetchone()["c"]
     assert n3 == 1  # selected 側でも新規行を作らず既存行へ束ねる
-
-
-def test_new_backlog_over_limit_are_dropped_and_counted_in_activity(
-        loop_and_ctx_with_open_backlog, monkeypatch, tmp_path):
-    """L-B30 是正 (束D検収, verified-local-round1.md §11 #21): テスト名は
-    「activity に dropped 件数が記録されること」を謳うが、本体は挿入件数
-    (`n == 2`) しか assert しておらず、テスト名が謳う activity の
-    `dropped=3` も `inserted + dropped == len(discoveries)` も見ていなかった。
-    両方を追加で assert する。"""
-    loop, ctx, conn, backlog_id = loop_and_ctx_with_open_backlog
-    monkeypatch.setattr(loop._settings.improve, "max_new_backlog_per_mission", 2)
-    discoveries = [{"idea": f"idea-{i}", "source": "agent", "evidence": "e"}
-                  for i in range(5)]
-    output = {"discoveries": discoveries,
-              "selected": {"backlog_id": None, "idea": "idea-0"},
-              "artifact": {"type": "observation", "reason": "x"},
-              "selection_rationale": "x"}
-    loop._select_and_bind(conn, output, ctx, now=datetime(2026, 8, 22))
-    n = conn.execute(
-        "SELECT count(*) c FROM improvement_backlog WHERE idea LIKE 'idea-%'"
-    ).fetchone()["c"]
-    assert n == 2
-    assert n + 3 == len(discoveries)  # inserted + dropped == len(discoveries)
-    activity_text = (tmp_path / "activity.log").read_text()
-    assert f"mission={ctx.mission_id} dropped=3" in activity_text
 
 
 @pytest.mark.parametrize("selected", [

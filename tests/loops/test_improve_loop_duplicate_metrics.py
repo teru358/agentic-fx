@@ -71,7 +71,8 @@ def evaluate(df, indicators, signals, params):
 _STRATEGY_PY_VARIANT_B = '''
 """variant B — 別コードだが成績は一致させる"""
 def evaluate(df, indicators, signals, params):
-    return {"action": "hold", "rationale": "variant b always holds"}
+    reason = "variant b always holds"
+    return {"action": "hold", "rationale": reason}
 '''
 
 _CONVERGED_METRICS = {
@@ -176,13 +177,15 @@ def test_second_candidate_with_matching_metrics_becomes_observation(
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    assert f"duplicate_metrics_of:{content_hash_a}" in backlog_row[1]
-
-    # T-A 検証節 pin: system note の文面に具体パラメータ (fast=/slow= 等)
-    # を出さない — note に埋め込まれるのは content_hash のみで、候補の
-    # plugin.py 由来のパラメータ文字列は現れない。
-    assert "variant b" not in backlog_row[1]
-    assert "params" not in backlog_row[1]
+    # agent 面 (last_result) は固定語彙だけで、一致した版の hash も pair も
+    # 出ない。詳細は activity にだけ残る。
+    from agentic_fx.loops.improve_context import DUPLICATE_LAST_RESULT
+    assert backlog_row[1] == DUPLICATE_LAST_RESULT
+    assert content_hash_a not in backlog_row[1]
+    assert "pair=" not in backlog_row[1]
+    activity_text = (root / "logs" / "activity.log").read_text(
+        encoding="utf-8")
+    assert f"duplicate_metrics_of:{content_hash_a}" in activity_text
 
 
 def test_candidate_with_different_metrics_still_reaches_approval(

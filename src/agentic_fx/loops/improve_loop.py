@@ -2,6 +2,7 @@
 (設計書 §4、プラン §8.1-6/11/16/23/24/40/42/43)。"""
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -12,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -36,9 +38,12 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # ("agentic_fx.loops.improve_loop.holdout.run_in_sample", ...) が
     # 属性未定義で ImportError になり、足しても sys.modules から取り直す
     # ため効かない)
-from agentic_fx.loops.improve_context import build_improve_context
+from agentic_fx.loops.improve_context import (
+    NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
+    deployed_families_text)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
+from agentic_fx.loops import improve_quality
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import is_tool_budget_abort
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
@@ -338,6 +343,18 @@ class _DuplicateDemotion:
     pair: str
 
 
+@dataclass(frozen=True)
+class _QualityVerdict:
+    """質検査 (段 L・F・M) の結果。`outcome` が None なら通過で、`flags` は
+    提出する行に足す検出属性。降格・拒否のときは `outcome` が候補の最終
+    分類で、`reason` だけが agent 面 (backlog の last_result) に出る。
+    `detail` は運用者向けの activity にだけ書く。"""
+    outcome: str | None = None
+    flags: tuple[str, ...] = ()
+    reason: str = ""
+    detail: str = ""
+
+
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
                       test_plugin: bytes) -> str:
     h = hashlib.sha256()
@@ -438,6 +455,9 @@ def build_inventory_view(result: "InventoryBuildResult") -> dict:
             for r in result.rejected_strategies],
     }
 
+
+# discoveries として受け付ける入力件数の上限。超過分は落として activity に残す。
+_MAX_DISCOVERIES_PER_MISSION = 5
 
 # Task 12 Step3: `_prepare_report_if_applicable` が OSError を捕まえて
 # その場で Mission を終端させたことを `commit()` に伝えるための sentinel
@@ -564,7 +584,8 @@ class ImproveLoop:
             ctx_data = build_improve_context(
                 conn, settings=self._settings, now=now, root=self._root,
                 allowed_backlog_ids=allowed_ids,
-                inventory_view=ctx.inventory_view)
+                inventory_view=ctx.inventory_view,
+                inventory_metas=list(inventory_result.inventory.metas))
             prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
             # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
             # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
@@ -802,12 +823,10 @@ class ImproveLoop:
                 f"{_cell(r.get('last_result'))} |" for r in rows)
 
         def _backlog_table(items: list[dict]) -> str:
-            # [unprofitable-note-hygiene] 設計書 v2.0 §2-3: `origin` 列。
-            # 専用列 `origin_outcome` が `'unprofitable'` の行だけ
-            # `unprofitable` を出す — 他行は空文字。`last_result` には
-            # 一切触れない (`origin_outcome` は他の書き手が触らない
-            # 専用列なので、判定は完全一致でも部分一致でもなく単純な
-            # 値比較で足りる)。
+            # `origin` 列は、起票した mission の候補が提出されなかった行だけ
+            # `not_submitted` を出す (他行は空文字)。理由 (収益性・取引数・
+            # 比較不能) の区別は渡さない。移行前に書かれた旧値も同じ語に畳む。
+            # `last_result` には触れない。
             if not items:
                 return "(バックログなし)"
             header = ("| id | idea | status | attempts | assigned | "
@@ -816,7 +835,7 @@ class ImproveLoop:
                 f"| {_cell(i.get('id'))} | {_cell(i.get('idea'))} | "
                 f"{_cell(i.get('status'))} | {_cell(i.get('attempts'))} | "
                 f"{_cell(i.get('assigned', ''))} | "
-                f"{'unprofitable' if i.get('origin_outcome') == 'unprofitable' else ''} |"
+                f"{'not_submitted' if i.get('origin_outcome') in NOT_SUBMITTED_ORIGINS else ''} |"
                 for i in items)
 
         # [indicator-consumption-wiring] T5a Step 5-1c (P1'): pin 破れで
@@ -867,6 +886,8 @@ class ImproveLoop:
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
             "pin_broken_strategies": pin_broken_line,
+            "deployed_families": deployed_families_text(
+                inv.get("deployed_families", [])),
             "backlog_table": (
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])
@@ -912,14 +933,11 @@ class ImproveLoop:
         g = self._settings.improve.gate
         condition = _strategy_gate_floor_rule_text(g, audience="agent")
         return (
-            f"**{condition} の候補は提出しても承認申請になりません**"
-            "(親の決定論ゲートが `unprofitable` として observation に"
-            "落とします)。予算内でパラメータ・フィルタ・エントリ条件を"
-            f"変えて `run_backtest` をやり直し、`pf >= {g.min_pf}`"
+            f"**{condition} の候補は提出しても承認申請になりません**。"
+            f"`pf >= {g.min_pf}`"
             + (f" かつ `avg_r > 0`" if g.require_positive_avg_r else "")
-            + "を満たした候補だけを提出してください。予算を使い切っても"
-            "満たせなければ**提出せず** `observation` として、試した"
-            "パラメータ群とそれぞれの pf / avg_r を理由に書いてください。")
+            + " を満たさない候補は提出しないでください。予算内で満たせなければ"
+            "**提出せず** `observation` として、試した仮説を理由に書いてください。")
 
     def _compute_partition_hint(self, conn, slot_key) -> frozenset[int] | None:
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
@@ -1534,34 +1552,24 @@ class ImproveLoop:
 
         return _InspectionVerdict(ok=True)
 
-    def _upsert_backlog_idea(self, conn, idea: str, source: str, kind: str,
-                             now: datetime, *,
+    def _upsert_backlog_idea(self, conn, idea: str, source: str, *,
+                             as_task: bool, now: datetime,
                              mission_id: int | None = None) -> tuple[int, str]:
-        """Insert, reuse, or promote one normalized backlog idea.
+        """正規化した idea の行を再利用するか、無ければ 1 行 INSERT する。
 
-        [unprofitable-note-hygiene] 設計書 v2.0 §3: v1.1 以前の挙動に
-        戻す (昇格は無条件 `promoted_from_note`。`last_result` の CAS 相当
-        分岐は撤回 — 系譜は専用列 `origin_mission_id`/`origin_outcome` が
-        持つため、この関数はもう `last_result` を読む必要がない)。
-        `mission_id` は新規 INSERT (`"inserted"`) のときだけ
-        `origin_mission_id` へ書く — 既存行の再利用 (`existing`/
-        `promoted`) は最初の起票者のまま変えない (§2-1)。"""
+        `as_task=False` (discoveries) は note を作るだけで、選択対象の
+        open 行は作らない。`as_task=True` は `selected.idea` の新規課題で、
+        その mission が直ちに選択する 1 行だけを open で作る。既存行は
+        status に関わらず再利用するだけで、note や done を open に戻さない
+        (昇格は人間の操作だけ)。`mission_id` は新規 INSERT のときだけ
+        `origin_mission_id` へ書く。既存行の再利用は最初の起票者のまま。"""
         idea_norm = idea.strip().lower()
         row = conn.execute(
             "SELECT id,status FROM improvement_backlog "
             "WHERE idea_norm=? ORDER BY id LIMIT 1", (idea_norm,)).fetchone()
         if row is not None:
-            if row["status"] == "note" and kind == "task":
-                conn.execute(
-                    "UPDATE improvement_backlog SET status='open', "
-                    "last_result='promoted_from_note', updated_at=? WHERE id=?",
-                    (now.isoformat(), row["id"]))
-                if self._activity is not None:
-                    self._activity.write(Category.IMPROVE, "backlog_promoted",
-                                         f"#{row['id']} from note", str(row["id"]))
-                return row["id"], "promoted"
             return row["id"], "existing"
-        status = "note" if kind == "fact" else "open"
+        status = "open" if as_task else "note"
         cur = conn.execute(
             "INSERT INTO improvement_backlog "
             "(idea,source,status,created_at,updated_at,idea_norm,"
@@ -1575,61 +1583,51 @@ class ImproveLoop:
                          *, now: datetime) -> _SelectionOutcome:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            limit = self._settings.improve.max_new_backlog_per_mission
-            inserted = 0  # precheck 2026-08-22 wave2: T10-M10 — 上限は挿入件数
-                          # で数える (enumerate インデックスは重複 skip の分だけ
-                          # ずれる)
-            dropped = 0
-
-            def _norm(idea: str) -> str:
-                # round2 #8 是正 (2026-08-29、verified-round2.md #8): 正規化
-                # は Python 側のこの 1 箇所に閉じる。SQL 側は INSERT 時に
-                # ここで作った正規形を `idea_norm` 列へ書き、以降の重複検出
-                # は `idea_norm=?` の等値比較のみで行う (SQL の
-                # lower(trim(idea)) は SQLite 既定で ASCII 空白の trim・
-                # ASCII のみの lower のため、`'improve X\n'`/`'IMPROVE Ä'`
-                # のような idea で Python 側正規形と食い違い、重複行が
-                # 生まれていた — probe 実測)。
-                return idea.strip().lower()
-
-            for d in output.get("discoveries", []):
-                idea_norm = _norm(d["idea"])
+            # 正規化は Python 側の `idea.strip().lower()` に閉じる。重複検出は
+            # `idea_norm=?` の等値比較のみ (SQLite の lower/trim は ASCII のみ
+            # で Python 側の正規形と食い違うため)。
+            # discoveries は note (fact / idea) しか作らない。入力件数の
+            # 上限を超えた分は重複かどうかを見ずに落とし、件数だけ残す。
+            discoveries = output.get("discoveries", [])
+            selected = output.get("selected", {})
+            # `selected.idea` で新規に選ぶ課題と同文の発見は、note を先に
+            # 作ると選択対象の open 行にならなくなるので note にしない。
+            selected_norm = (
+                selected.get("idea", "").strip().lower()
+                if selected.get("backlog_id") is None else None)
+            dropped = max(0, len(discoveries) - _MAX_DISCOVERIES_PER_MISSION)
+            for d in discoveries[:_MAX_DISCOVERIES_PER_MISSION]:
                 dup = conn.execute(
-                    "SELECT id,status FROM improvement_backlog WHERE "
-                    "idea_norm=?", (idea_norm,)).fetchone()
-                if dup is not None and not (
-                        dup["status"] == "note" and d.get("kind", "task") == "task"):
+                    "SELECT id FROM improvement_backlog WHERE idea_norm=?",
+                    (d["idea"].strip().lower(),)).fetchone()
+                if dup is not None or (
+                        d["idea"].strip().lower() == selected_norm):
                     continue
-                if inserted >= limit:
-                    if dup is None:
-                        dropped += 1
-                        continue
-                _row_id, action = self._upsert_backlog_idea(
-                    conn, d["idea"], d.get("source", "agent"),
-                    d.get("kind", "task"), now, mission_id=ctx.mission_id)
-                inserted += action == "inserted"
+                self._upsert_backlog_idea(
+                    conn, d["idea"], d.get("source", "agent"), as_task=False,
+                    now=now, mission_id=ctx.mission_id)
             if dropped:
                 self._activity.write(
                     Category.IMPROVE, "backlog_limit_exceeded",
                     f"mission={ctx.mission_id} dropped={dropped}")
 
-            selected = output.get("selected", {})
             backlog_id = selected.get("backlog_id")
             if backlog_id is None:
                 selected_idea = selected.get("idea", "")
                 if not selected_idea.strip():
                     conn.commit()
                     return _SelectionOutcome(won=False, backlog_id=None)
-                # precheck 2026-08-22 wave2: T10-B5 — discoveries にも既存
-                # backlog にも無い「新規 idea を選択」は INSERT してから選ぶ
-                # (test_new_idea_selected_creates_and_binds_in_same_tx)。空文字
-                # は上で選択なし扱い (fail closed)。2 周目 CR4: 同文の行が
-                # 既にあれば INSERT せずその行を使い、note なら task として
-                # open に昇格する (`_upsert_backlog_idea`)。`selected` の新規
-                # idea は選んだ本人が task と判断したもの → kind=task 固定。
-                backlog_id, _selected_action = self._upsert_backlog_idea(
+                # discoveries にも既存 backlog にも無い新規 idea の選択は、
+                # INSERT してから同じ tx で選ぶ。空文字は選択なし扱い
+                # (fail closed)。同文の行が既にあれば status を問わず敗者:
+                # 既存の課題を選ぶには backlog_id が必要で、id 無しの
+                # 同文指定で open / observation の行を横取りさせない。
+                backlog_id, selected_action = self._upsert_backlog_idea(
                     conn, selected_idea, selected.get("source", "agent"),
-                    "task", now, mission_id=ctx.mission_id)
+                    as_task=True, now=now, mission_id=ctx.mission_id)
+                if selected_action != "inserted":
+                    conn.commit()
+                    return _SelectionOutcome(won=False, backlog_id=None)
 
             won = backlog_store.select_for_mission(
                 conn, backlog_id, now=now, commit=False)
@@ -2627,6 +2625,130 @@ class ImproveLoop:
                 return _DuplicateDemotion(content_hash=duplicate_of, pair=pair)
         return None
 
+    def _load_quality_population(self, ctx
+                                 ) -> "improve_quality.FilePopulation":
+        """配備済みと example の比較対象。配備済みは配備ガードを排他で持った
+        いまの `plugins/` の live の状態、example は mission に渡した読み取り
+        専用 snapshot から作る。"""
+        return improve_quality.load_file_population(
+            self._root / "plugins", ctx.source_snapshot_dir / "_examples")
+
+    def _check_candidate_quality(
+            self, conn, approval_payload: dict, *,
+            candidate: _FinalCandidate, mission_id: int,
+            file_population: "improve_quality.FilePopulation | None",
+            inventory: "InventoryBuildResult", staging_dir: Path,
+            ) -> _QualityVerdict:
+        """`_finalize_success` の `BEGIN IMMEDIATE` の内側で、段 L
+        (`logic_hash` 一致) → 段 F (仮説族一致) → 段 M (成績完全一致) の順に
+        質検査を行う。並行 slot の check-then-insert の競合は、この tx の
+        書き込みロックで直列化して閉じる。
+
+        - 段 L: 別名の配備済み・example・却下済み・降格済みなどと一致したら
+          `duplicate_logic`。配備済みの同名旧版との一致は更新として通す。
+        - 段 F: 配備済みの別名と仮説族が一致したら `family_detected` を検出
+          属性として返すだけで、降格はしない。
+        - 失敗の 3 分類: 候補自身の identity が計算できない → `gate_failed`、
+          比較対象 1 行の破損 → warning を残してその行だけ外す、比較基盤が
+          全部使えない → `gate_failed`。
+
+        比較対象のファイル群が無い呼び出し (単体の直接呼び出し) では段 L・F を
+        行わず、段 M だけを行う。比較対象があるのに候補の staging が無いときは
+        質検査の不能として `gate_failed` にする。"""
+        flags: tuple[str, ...] = ()
+        if file_population is not None:
+            if candidate.candidate_dir is None:
+                return self._quality_unavailable(
+                    mission_id, "candidate_dir_missing")
+            if candidate.logic_hash is None:
+                return self._quality_rejection(
+                    "gate_failed",
+                    detail=f"candidate_identity_unavailable "
+                           f"name={candidate.name}")
+            try:
+                archive = improve_quality.load_archive(
+                    conn, mission_id=mission_id)
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                return self._quality_unavailable(
+                    mission_id, f"archive_read_failed:{type(exc).__name__}")
+            if file_population.unavailable is not None:
+                return self._quality_unavailable(
+                    mission_id, file_population.unavailable)
+            try:
+                deployed, drift, unavailable = (
+                    improve_quality.deployed_from_live(conn, file_population))
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                deployed, drift, unavailable = None, [], (
+                    f"deploy_state_read_failed:{type(exc).__name__}")
+            if unavailable is not None:
+                return self._quality_unavailable(mission_id, unavailable)
+            if drift is None:
+                self._write_quality_activity(
+                    "quality_population_drift_unreadable",
+                    f"mission={mission_id}", mission_id)
+            for drifted in drift or ():
+                self._write_quality_activity(
+                    "quality_population_drift",
+                    f"mission={mission_id} name={drifted}", mission_id)
+            populations = (deployed, file_population.examples, archive)
+            for population in populations:
+                for skipped in population.skipped:
+                    self._write_quality_activity(
+                        "quality_row_skipped",
+                        f"mission={mission_id} row={skipped}", mission_id)
+            if improve_quality.base_unavailable(*populations):
+                return self._quality_unavailable(
+                    mission_id, "no_usable_comparison_row")
+            duplicate = improve_quality.find_duplicate_logic(
+                name=candidate.name, logic_hash=candidate.logic_hash,
+                populations=populations)
+            if duplicate is not None:
+                return self._quality_rejection(
+                    "duplicate_logic",
+                    detail=f"matched={duplicate.source}:{duplicate.name}")
+            same_family = improve_quality.find_same_family(
+                name=candidate.name, kind=approval_payload.get("kind"),
+                family_key=candidate.family_key,
+                deployed=deployed)
+            if same_family is not None:
+                flags = ("family_detected",)
+        metrics_dup = self._check_duplicate_metrics_for_approval(
+            conn, approval_payload, inventory=inventory,
+            staging_dir=staging_dir)
+        if metrics_dup is not None:
+            detail = (f"duplicate_metrics_of:{metrics_dup.content_hash} "
+                      f"pair={metrics_dup.pair}")
+            return self._quality_rejection(
+                "duplicate_metrics", detail=detail)
+        return _QualityVerdict(flags=flags)
+
+    @staticmethod
+    def _quality_rejection(outcome: str, *, detail: str) -> _QualityVerdict:
+        """agent 面の `reason` は固定語彙だけ。同一ロジック・同一成績は
+        `duplicate`、同一性や比較の根拠が作れなかったときは
+        `not_submitted`。"""
+        if outcome in ("duplicate_logic", "duplicate_metrics"):
+            reason = "duplicate"
+        else:
+            reason = "not_submitted"
+        return _QualityVerdict(outcome=outcome, reason=reason, detail=detail)
+
+    def _quality_unavailable(self, mission_id: int,
+                             reason: str) -> _QualityVerdict:
+        """比較の根拠が作れなかった: 原因は activity にだけ残し、agent 面には
+        固定語彙の `gate_failed` を返す。"""
+        self._write_quality_activity(
+            "quality_check_unavailable",
+            f"mission={mission_id} reason={reason}", mission_id)
+        return self._quality_rejection(
+            "gate_failed", detail="comparison_base_unavailable")
+
+    def _write_quality_activity(self, event: str, summary: str,
+                                mission_id: int) -> None:
+        if self._activity is not None:
+            self._activity.write(
+                Category.IMPROVE, event, summary, str(mission_id))
+
     def _deployed_dir_for(self, name, *, inventory) -> "Path | None":
         """`inventory.phase1_metas` のうち同名 strategy の `meta.path`。
         見つからなければ `None`。"""
@@ -2647,13 +2769,17 @@ class ImproveLoop:
                           ledger_entries=(), gate_rows=(), ctx=None,
                           tool_calls: int | None = None,
                           final_candidate: "_FinalCandidate | None" = None,
-                          ) -> _DuplicateDemotion | None:
+                          file_quality: bool = True,
+                          ) -> _QualityVerdict | None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。
 
-        戻り値: 質検査 (CR1) が既承認候補との一致を検出したときは
-        `_DuplicateDemotion` を返す (この場合、内側 tx は既に rollback 済み
+        戻り値: 質検査 (段 L・F・M) が候補を降格・拒否したときは
+        `_QualityVerdict` を返す (この場合、内側 tx は既に rollback 済み
         — 呼び出し元 `commit()` が observation 経路へ再ルートする)。通常の
-        approval 終端では `None` を返す。"""
+        approval 終端では `None` を返す。
+
+        `file_quality=False` は配備済み・example のファイルを比較対象にしない
+        単体テスト用の明示指定 (段 M だけを行う)。実 run は常に True。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
 
@@ -2661,6 +2787,7 @@ class ImproveLoop:
         # 例外 (ロック競合) を出すと外側 except の `_compensate_tx2_failure(
         # ctx=persist_ctx)` が UnboundLocalError になり補償が静かに飛ぶ
         # (ローカル T3 1 周目 申し送り、2026-09-10)。
+        guard_stack = contextlib.ExitStack()
         if ctx is None:
             class _EntriesView:
                 def entries(self):
@@ -2691,6 +2818,24 @@ class ImproveLoop:
                     submitted, mission_id=mission_id, now=now)
                 if submitted_archive_path is not None and created:
                     created_archive_path = submitted_archive_path
+            # 配備済み・example の比較対象は、書き込みロックを持つ前にファイル
+            # から組み立てる (tx の中ではファイルを触らない)。
+            # 母集団の確定から最終行の commit まで、配備操作と排他になる
+            # (取得順はガード → DB。配備操作側も同じ順)。
+            file_population = None
+            if ctx is not None and file_quality:
+                from agentic_fx.plugin import switch as plugin_switch
+                try:
+                    guard_stack.enter_context(plugin_switch.deploy_guard(
+                        self._root / "plugins", exclusive=True,
+                        deadline=time.monotonic()
+                        + improve_quality.DEPLOY_GUARD_TIMEOUT_S))
+                except (plugin_switch.PluginBusyError, OSError) as exc:
+                    self._remove_created_archive(created_archive_path)
+                    return self._quality_unavailable(
+                        mission_id,
+                        f"deploy_guard_unavailable:{type(exc).__name__}")
+                file_population = self._load_quality_population(ctx)
             try:
                 conn.execute("BEGIN IMMEDIATE")
             except BaseException:
@@ -2716,16 +2861,18 @@ class ImproveLoop:
                 # (`_finalize_success` を単体で呼ぶ既存テストが `ctx` を
                 # 省略する) — その場合だけ空 inventory を作る
                 # (`_empty_inventory_result`、`staging_dir=None` でも安全)。
-                demotion = self._check_duplicate_metrics_for_approval(
-                    conn, approval_payload,
+                verdict = self._check_candidate_quality(
+                    conn, approval_payload, candidate=submitted,
+                    mission_id=mission_id,
+                    file_population=file_population,
                     inventory=(ctx.inventory if ctx is not None
                               else _empty_inventory_result(
                                   self._root / "plugins")),
                     staging_dir=(ctx.staging_dir if ctx is not None else None))
-                if demotion is not None:
+                if verdict.outcome is not None:
                     conn.rollback()
                     self._remove_created_archive(created_archive_path)
-                    return demotion
+                    return verdict
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
                 # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
@@ -2746,7 +2893,8 @@ class ImproveLoop:
                     conn, mission_id=mission_id, candidate=submitted,
                     now=now, archive_path=submitted_archive_path)
                 if not archives_store.settle(
-                        conn, candidate_archive_id, "pending"):
+                        conn, candidate_archive_id, "pending",
+                        add_flags=verdict.flags):
                     raise RuntimeError(
                         f"candidate archive {candidate_archive_id} was not "
                         "not_submitted; cannot submit")
@@ -2791,6 +2939,9 @@ class ImproveLoop:
                 conn.rollback()
                 self._remove_created_archive(created_archive_path)
                 raise
+            # 母集団に依存するのは commit までで、以降の処理は別 slot を
+            # 待たせないよう排他ガードを先に放す。
+            guard_stack.close()
             # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
             # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
             # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
@@ -2844,6 +2995,8 @@ class ImproveLoop:
                     f"mission_id={mission_id} run_id={run_id}")
                 if ctx is not None:
                     ctx.ledger.mark_discarded()
+        finally:
+            guard_stack.close()
 
     def commit(self, *, mission, ctx, result, now,
               slot_terminalize: bool = True) -> None:
@@ -2995,7 +3148,8 @@ class ImproveLoop:
                         and final_candidate.logic_hash is None):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="gate_failed:identity_unavailable", now=now,
+                        reason="gate_failed:unverified", now=now,
+                        activity_extra=" cause=candidate_identity_unavailable",
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed")
@@ -3092,7 +3246,8 @@ class ImproveLoop:
                                     f"{exc}"), now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             candidate=final_candidate,
-                            candidate_outcome="gate_failed")
+                            candidate_outcome="gate_failed",
+                            not_submitted=True)
                         return
                     # `backtest_cpu` は gate が評価 1 回ごとに `evaluation_sink`
                     # へ渡し、そこで書く (失敗で例外が伝播する評価でも
@@ -3106,13 +3261,15 @@ class ImproveLoop:
                             candidate_outcome=(
                                 "insufficient_trades"
                                 if strategy_verdict.unevaluable_kind
-                                == "insufficient_trades" else "gate_failed"))
+                                == "insufficient_trades" else "gate_failed"),
+                            not_submitted=True)
                         return
                     # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書
                     # §3 T1-b): 収益性フロア不合格の再ルート。`reason` は
-                    # 固定文言 `unprofitable` (last_result にそのまま流れる
-                    # — 遮断 8 の 1 bit 例外)。`report_detail` は親専有
-                    # レポートにのみ渡り、activity/last_result には流れない。
+                    # activity とレポート用の内部ラベルで、agent 面の
+                    # `last_result` は `not_submitted=True` で中立な固定文言に
+                    # なる。`report_detail` は親専有レポートにのみ渡り、
+                    # activity/last_result には流れない。
                     if strategy_verdict.floor_reason:
                         # [profitability-floor-fix] G2 (2026-09-13): holdout
                         # 段の per-pair 成績は `StrategyGateVerdict.
@@ -3135,7 +3292,8 @@ class ImproveLoop:
                             mission_outcome="unprofitable",
                             report_detail=report_detail,
                             candidate=final_candidate,
-                            candidate_outcome="unprofitable")
+                            candidate_outcome="unprofitable",
+                            not_submitted=True)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -3204,26 +3362,27 @@ class ImproveLoop:
                     gate_rows=tuple(gate_rows), ctx=ctx,
                     tool_calls=tool_calls, final_candidate=final_candidate)
                 if demotion is not None:
-                    # CR1 是正: `_finalize_success` が質検査ヒットを検出し
-                    # 内側 tx を rollback 済み (何も永続化していない) —
-                    # observation 経路へ再ルートする。CR3: 全 pair 分の
-                    # gate 行 (in_sample/holdout とも) を
-                    # mission_outcome='observation' で残す — 一致した pair
-                    # は reason に埋め込む (どの pair が降格を引いたかを
-                    # 人間が追跡できるようにする)。
+                    # `_finalize_success` が質検査で降格・拒否を決め、内側 tx を
+                    # rollback 済み (何も永続化していない) — observation 経路へ
+                    # 再ルートする。全 pair 分の gate 行 (in_sample/holdout とも)
+                    # を mission_outcome='observation' で残す。降格の細部は
+                    # activity にだけ書き、backlog の last_result には
+                    # `demotion.reason` だけが出る。
+                    self._write_quality_activity(
+                        "quality_demoted",
+                        f"mission={ctx.mission_id} outcome={demotion.outcome} "
+                        f"{demotion.detail}", ctx.mission_id)
                     self._finalize_report_or_observation(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         report_path=None,
                         artifact={
                             "type": "observation",
-                            "reason": (
-                                f"duplicate_metrics_of:{demotion.content_hash} "
-                                f"pair={demotion.pair}"),
+                            "reason": demotion.reason,
                         },
                         now=now, gate_rows=tuple(gate_rows),
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="duplicate_metrics")
+                        candidate_outcome=demotion.outcome)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -3747,7 +3906,8 @@ class ImproveLoop:
                               report_detail: str = "",
                               activity_extra: str = "",
                               candidate: _FinalCandidate | None = None,
-                              candidate_outcome: str = "gate_failed") -> None:
+                              candidate_outcome: str = "gate_failed",
+                              not_submitted: bool = False) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -3758,6 +3918,12 @@ class ImproveLoop:
         にだけ足す補足 (`alias=<alias> cause=<reason>`)。**`last_result` /
         `report_detail` には絶対に流さない** — `reason` (固定文言) だけが
         `improvement_backlog.last_result` へ行く (遮断 8)。
+
+        `not_submitted=True` は、収益性・取引数不足・比較不能のように
+        agent に理由を区別して渡さない非提出。backlog の `last_result` は
+        中立な固定文言 `observation:not_submitted` になり (`reason` は
+        activity と人間向けレポートにだけ残る)、この mission が起票した行の
+        `origin_outcome` も `not_submitted` になる。
 
         [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b、
         codex I6): `mission_outcome` は正常分岐 (report 作成成功) の
@@ -3883,9 +4049,9 @@ class ImproveLoop:
             # が失敗すればこの UPDATE も一緒に rollback する。当該 mission
             # の選択行 (`backlog_id`) 自身が起票行でも、`origin_outcome`
             # と `last_result` は別列なので衝突しない (N11)。
-            if mission_outcome == "unprofitable":
+            if not_submitted:
                 conn.execute(
-                    "UPDATE improvement_backlog SET origin_outcome='unprofitable' "
+                    "UPDATE improvement_backlog SET origin_outcome='not_submitted' "
                     "WHERE origin_mission_id=?", (ctx.mission_id,))
             missions_store.finish_improve_mission(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
@@ -3894,7 +4060,8 @@ class ImproveLoop:
                 report_path=str(final_path), report_state="prepared",
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
-                     "last_result": reason}
+                     "last_result": (NOT_SUBMITTED_LAST_RESULT
+                                     if not_submitted else reason)}
                     if backlog_id is not None else None),
                 commit=False)
             conn.commit()

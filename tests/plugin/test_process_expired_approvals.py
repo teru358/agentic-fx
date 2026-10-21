@@ -176,3 +176,30 @@ def test_expired_non_plugin_kind_uses_direct_expire_due_path(env):
     row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
                        (approval_id,)).fetchone()
     assert row["status"] == "expired"
+
+
+@pytest.mark.parametrize("bad_name", ["../evil", "Bad Name", 7])
+def test_expired_plugin_pending_with_an_invalid_name_becomes_expired(
+        env, bad_name):
+    """名前が不正な承認は配備操作が発生しないので、期限到来で expired になる
+    (永久に pending のままにしない)。理由は専用の event 名で activity に残し、
+    欠落とは区別する。"""
+    from agentic_fx.activity import ActivityLog
+    tmp_path, plugins_dir, conn = env
+    approval_id = approvals_store.create(
+        conn, kind="plugin",
+        payload={"name": bad_name, "content_hash": "h1", "artifact_hash": "a1",
+                 "candidate_origin": "staging"},
+        now=PAST, expires_at=PAST)
+    log_path = tmp_path / "logs" / "activity.log"
+    activity = ActivityLog(log_path)
+
+    switch.process_expired_approvals(
+        conn, plugins_root=plugins_dir, now=NOW, activity=activity)
+
+    row = conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    assert row["status"] == "expired"
+    text = log_path.read_text()
+    assert "expire_skipped_invalid_name" in text
+    assert "expire_skipped_payload_missing_name" not in text

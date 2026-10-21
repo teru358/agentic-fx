@@ -1,0 +1,21 @@
+kind: strategy
+timeframe: 1h
+pairs:
+- USDJPY
+exit_mode: levels
+max_bars: 400
+indicators:
+  fast_sma:
+    plugin: sma
+    params:
+      period: 10
+    pin: 7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2
+  slow_sma:
+    plugin: sma
+    params:
+      period: 30
+    pin: 7d120613932bd6971e771efa6d8a1968347b1b9ac184d7347992f6a695b74bd2
+params:
+  stop_loss_pips: 30
+  take_profit_pips: 60
+  pip_size: 0.01
