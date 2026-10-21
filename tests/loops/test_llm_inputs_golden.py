@@ -41,7 +41,7 @@ def _build(tmp_path: Path, *, observed: bool):
     sink = token = None
     if observed:
         from agentic_fx.ops.trade_event_sink import TradeEventEmitter, TradeEventSink
-        sink = TradeEventSink(tmp_path / "t.db", wall_clock=lambda: NOW)  # 書き込みは停止時にまとめて
+        sink = TradeEventSink(tmp_path / "t.db", wall_clock=lambda: NOW)
         token = transitions.observe(conn, TradeEventEmitter(
             conn, sink, state_mode="learning", ccy="JPY"))
     base = dict(horizon="day", now=NOW)
@@ -83,6 +83,12 @@ def _finish(sink, token):
 
 def _inputs(tmp_path: Path, *, observed: bool) -> dict[str, bytes]:
     conn, sink, token, closed_id = _build(tmp_path, observed=observed)
+    if observed:
+        # event を ops_events に永続化し終えた状態で LLM 入力を作る
+        _finish(sink, token)
+        sink = token = None
+        stored = conn.execute("SELECT COUNT(*) FROM ops_events").fetchone()[0]
+        assert stored == 5
     try:
         report = json.dumps(_performance_report(conn, NOW), sort_keys=True,
                             ensure_ascii=False, separators=(",", ":"))
@@ -97,6 +103,7 @@ def _inputs(tmp_path: Path, *, observed: bool) -> dict[str, bytes]:
                                 core_lock=threading.RLock())
         cycle.run_pending(max_items=1)
         prompt = runner.missions[0].prompt
+        assert runner.missions[0].tools == []
     finally:
         _finish(sink, token)
         conn.close()
