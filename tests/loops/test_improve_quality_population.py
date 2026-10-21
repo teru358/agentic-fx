@@ -206,6 +206,18 @@ def test_ac18_an_unreadable_deployed_dir_is_skipped_and_reported(tmp_path):
     assert population.skipped == ["deployed:ghost"]
 
 
+def test_ac18_an_unreadable_deployed_entry_makes_the_population_unavailable(
+        tmp_path, conn):
+    """配備済みの行を 1 つでも読めなければ、ほかに読める行があっても検査は
+    不能 (archive や example の壊れた行は 1 行 skip のまま)。"""
+    root = _live_root(tmp_path, rsi_bb=RSI_A)
+    (root / "ghost").symlink_to(f".versions/ghost/{'b' * 64}")
+    file_population = quality.load_file_population(root, None)
+    assert [e.name for e in file_population.deployed.entries] == ["rsi_bb"]
+    _, _, unavailable = quality.deployed_from_live(conn, file_population)
+    assert unavailable == "deployed_unreadable:ghost"
+
+
 def test_ac18_base_unavailable_only_when_something_was_attempted_and_nothing_usable(
         tmp_path):
     root = tmp_path / "plugins"

@@ -764,6 +764,28 @@ def test_a_recorded_plugin_without_drift_leaves_no_drift_activity(
     assert "quality_population_drift" not in _activity(root)
 
 
+def test_an_unreadable_live_deployed_entry_fails_the_whole_check_closed(
+        improve_env):
+    """版 dir が欠けた配備済みの名前と同ロジックの別名候補を、読めなかった
+    ことで素通しにしない。ほかに読める行 (example) があっても検査は不能。"""
+    import shutil
+    app, root = improve_env
+    conn = app.conn_core
+    example = root / "docs" / "examples" / "plugins" / "hold_example"
+    example.mkdir(parents=True)
+    (example / "plugin.py").write_text(PY_Z)
+    (example / "config.yaml").write_text(_PASSING_STRATEGY_CONFIG)
+    _record_deploy(conn, root, "old_name", py=PY_X)
+    shutil.rmtree((root / "plugins" / "old_name").resolve())
+    loop, ctx, seeded = _run_strategy(app, root, "new_name")
+    _expect_rows(conn, ctx, seeded, "gate_failed")
+    assert _approval_count(conn) == 0
+    assert _last_result(conn) == NOT_SUBMITTED_LAST_RESULT
+    assert ("quality_check_unavailable\tmission="
+            in _activity(root))
+    assert "reason=deployed_unreadable:old_name" in _activity(root)
+
+
 def test_a_deploy_operation_still_in_flight_makes_the_check_unavailable(
         improve_env):
     app, root = improve_env

@@ -220,6 +220,12 @@ def deployed_from_live(conn: sqlite3.Connection, file_population: FilePopulation
     in_flight = _in_flight_deploy_ops(conn)
     if in_flight:
         return Population(), [], "deploy_operation_in_flight"
+    unreadable = [row.split(":", 1)[1]
+                  for row in file_population.deployed.skipped]
+    if unreadable:
+        # 配備済みは同名の更新と別名の重複判定の根拠。読めない entry を外した
+        # まま続けると、その名前と同ロジックの別名候補を素通しにする。
+        return Population(), [], f"deployed_unreadable:{unreadable[0]}"
     drift: list[str] = []
     live_state = file_population.live_state
     if live_state is not None:
