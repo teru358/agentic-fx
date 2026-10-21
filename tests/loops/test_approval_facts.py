@@ -383,7 +383,7 @@ def test_finalize_success_stores_facts_in_the_approval_payload(
         approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": SUBMITTED, "artifact_hash": "a-sub",
                           "selection_rationale": "意図", "summary": "概要"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     payload = _stored_payload(conn)
     assert payload["facts_version"] == 1
     facts = payload["parent_facts"]
@@ -417,7 +417,7 @@ def test_finalize_success_without_buildable_facts_still_creates_approval(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     payload = _stored_payload(conn)
     assert payload["facts_version"] == 1 and payload["parent_facts"] is None
     assert payload["facts_error"] == "collection_failed"
@@ -447,7 +447,7 @@ def test_finalize_success_stores_accepted_backtest_trials(
         slot_key=None,
         approval_payload={"name": "x", "kind": "strategy",
                           "content_hash": SUBMITTED, "artifact_hash": "a-sub"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     assert _stored_payload(conn)["parent_facts"]["trials"] == [{
         "n": 1, "content_hash8": "1a2b3c4d", "same_hash_as_submitted": True,
         "trades": 100, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.05}]
@@ -564,7 +564,7 @@ def test_payload_saved_by_finalize_success_is_shown_by_the_approval_command(
                           "content_hash": SUBMITTED, "artifact_hash": "a-sub", "eval_timeframe": "1h",
                           "selection_rationale": "意図です",
                           "summary": "概要です"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     approval_id = conn.execute(
         "SELECT id FROM approval_requests ORDER BY id DESC LIMIT 1"
     ).fetchone()["id"]
@@ -600,7 +600,7 @@ def _finalize_with_ledger(loop_min, conn, clock, tmp_path, entries):
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None,
         approval_payload={**_FINALIZE_PAYLOAD, "selection_rationale": "意図"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     return mission_id
 
 
@@ -647,7 +647,7 @@ def _finalize_with_failing_collection(loop_min, conn, clock, tmp_path,
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload=dict(_FINALIZE_PAYLOAD), now=NOW,
-        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     return mission_id
 
 
@@ -688,7 +688,7 @@ def test_the_facts_of_the_current_run_exclude_that_run_and_count_its_backtests(
     loop_min._finalize_success(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload=dict(_FINALIZE_PAYLOAD), now=NOW,
-        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     facts = _stored_payload(conn)["parent_facts"]
     ids = [r["run_id"] for r in facts["prior_runs"]]
     assert run_id not in ids

@@ -451,12 +451,12 @@ def test_reconcile_resolution_holds_the_dependency_locks(tmp_path, monkeypatch):
     「解決できた」と判断して live に未解決 strategy を残し得る (§2.4)。"""
     acquired: list[str] = []
     import contextlib as _ctx
-    real = plugin_switch._plugin_lock
+    real = plugin_switch._plugin_name_lock
 
     @_ctx.contextmanager
-    def _spy(root, name):
+    def _spy(root, name, **kw):
         acquired.append(name)
-        with real(root, name):
+        with real(root, name, **kw):
             yield
 
     conn, plugins_root, activity = _reconcile_env(tmp_path)
@@ -468,7 +468,7 @@ def test_reconcile_resolution_holds_the_dependency_locks(tmp_path, monkeypatch):
         pins={"rsi": hashes["rsi"]}, now=fx.NOW)
     _bump_indicator_version(conn, plugins_root, "rsi", now=fx.NOW)
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _spy)
     plugin_switch.reconcile_switch_journals(
         conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
         activity=activity)
@@ -506,11 +506,11 @@ def test_indicator_unresolved_stale_row_does_not_report_reverted(tmp_path, monke
     import contextlib as _ctx
     from agentic_fx.store import db as db_store
     from agentic_fx.store import plugin_switch_journal as journal_store
-    real_lock = plugin_switch._plugin_lock
+    real_lock = plugin_switch._plugin_name_lock
     seen = {"n": 0}
 
     @_ctx.contextmanager
-    def _seam(root, name):
+    def _seam(root, name, **kw):
         if name == "rsi_pullback":
             seen["n"] += 1
             if seen["n"] == 2:
@@ -524,10 +524,10 @@ def test_indicator_unresolved_stale_row_does_not_report_reverted(tmp_path, monke
                     c2.commit()
                 finally:
                     c2.close()
-        with real_lock(root, name):
+        with real_lock(root, name, **kw):
             yield
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _seam)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _seam)
     plugin_switch.reconcile_switch_journals(
         conn, plugins_root=plugins_root, now=fx.NOW, settings=SETTINGS,
         activity=activity)

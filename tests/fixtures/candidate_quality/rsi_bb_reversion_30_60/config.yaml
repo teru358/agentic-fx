@@ -1,0 +1,20 @@
+kind: strategy
+timeframe: 1h
+pairs:
+- USDJPY
+exit_mode: levels
+max_bars: 400
+indicators:
+  bb:
+    plugin: bollinger
+    params:
+      period: 200
+      num_std: 2.0
+  rsi:
+    plugin: rsi
+    params:
+      period: 6
+params:
+  stop_loss_pips: 30
+  take_profit_pips: 60
+  pip_size: 0.01

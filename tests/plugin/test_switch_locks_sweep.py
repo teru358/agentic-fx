@@ -103,13 +103,14 @@ def test_sweep_orphans_keeps_lock_held_with_shared_lock_even_without_pending_app
         fh.close()
 
 
-def test_sweep_orphans_does_nothing_when_locks_dir_absent(env):
+def test_sweep_orphans_leaves_only_the_deploy_guard_when_locks_dir_absent(env):
     tmp_path, plugins_dir, conn = env
     assert not (plugins_dir / ".locks").exists()
 
     switch.sweep_orphans(conn, plugins_root=plugins_dir, now=NOW)
 
-    assert not (plugins_dir / ".locks").exists()
+    assert [p.name for p in (plugins_dir / ".locks").iterdir()] == [
+        switch.deploy_guard_path(plugins_dir).name]
 
 
 def test_sweep_orphans_ignores_non_lock_entries_in_locks_dir(env):

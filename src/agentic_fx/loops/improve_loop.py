@@ -2,6 +2,7 @@
 (設計書 §4、プラン §8.1-6/11/16/23/24/40/42/43)。"""
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -12,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -41,6 +43,7 @@ from agentic_fx.loops.improve_context import (
     deployed_families_text)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
+from agentic_fx.loops import improve_quality
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import is_tool_budget_abort
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
@@ -338,6 +341,18 @@ class _DuplicateDemotion:
     受け取り、`_finalize_report_or_observation` へルーティングする。"""
     content_hash: str
     pair: str
+
+
+@dataclass(frozen=True)
+class _QualityVerdict:
+    """質検査 (段 L・F・M) の結果。`outcome` が None なら通過で、`flags` は
+    提出する行に足す検出属性。降格・拒否のときは `outcome` が候補の最終
+    分類で、`reason` だけが agent 面 (backlog の last_result) に出る。
+    `detail` は運用者向けの activity にだけ書く。"""
+    outcome: str | None = None
+    flags: tuple[str, ...] = ()
+    reason: str = ""
+    detail: str = ""
 
 
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
@@ -2610,6 +2625,130 @@ class ImproveLoop:
                 return _DuplicateDemotion(content_hash=duplicate_of, pair=pair)
         return None
 
+    def _load_quality_population(self, ctx
+                                 ) -> "improve_quality.FilePopulation":
+        """配備済みと example の比較対象。配備済みは配備ガードを排他で持った
+        いまの `plugins/` の live の状態、example は mission に渡した読み取り
+        専用 snapshot から作る。"""
+        return improve_quality.load_file_population(
+            self._root / "plugins", ctx.source_snapshot_dir / "_examples")
+
+    def _check_candidate_quality(
+            self, conn, approval_payload: dict, *,
+            candidate: _FinalCandidate, mission_id: int,
+            file_population: "improve_quality.FilePopulation | None",
+            inventory: "InventoryBuildResult", staging_dir: Path,
+            ) -> _QualityVerdict:
+        """`_finalize_success` の `BEGIN IMMEDIATE` の内側で、段 L
+        (`logic_hash` 一致) → 段 F (仮説族一致) → 段 M (成績完全一致) の順に
+        質検査を行う。並行 slot の check-then-insert の競合は、この tx の
+        書き込みロックで直列化して閉じる。
+
+        - 段 L: 別名の配備済み・example・却下済み・降格済みなどと一致したら
+          `duplicate_logic`。配備済みの同名旧版との一致は更新として通す。
+        - 段 F: 配備済みの別名と仮説族が一致したら `family_detected` を検出
+          属性として返すだけで、降格はしない。
+        - 失敗の 3 分類: 候補自身の identity が計算できない → `gate_failed`、
+          比較対象 1 行の破損 → warning を残してその行だけ外す、比較基盤が
+          全部使えない → `gate_failed`。
+
+        比較対象のファイル群が無い呼び出し (単体の直接呼び出し) では段 L・F を
+        行わず、段 M だけを行う。比較対象があるのに候補の staging が無いときは
+        質検査の不能として `gate_failed` にする。"""
+        flags: tuple[str, ...] = ()
+        if file_population is not None:
+            if candidate.candidate_dir is None:
+                return self._quality_unavailable(
+                    mission_id, "candidate_dir_missing")
+            if candidate.logic_hash is None:
+                return self._quality_rejection(
+                    "gate_failed",
+                    detail=f"candidate_identity_unavailable "
+                           f"name={candidate.name}")
+            try:
+                archive = improve_quality.load_archive(
+                    conn, mission_id=mission_id)
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                return self._quality_unavailable(
+                    mission_id, f"archive_read_failed:{type(exc).__name__}")
+            if file_population.unavailable is not None:
+                return self._quality_unavailable(
+                    mission_id, file_population.unavailable)
+            try:
+                deployed, drift, unavailable = (
+                    improve_quality.deployed_from_live(conn, file_population))
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                deployed, drift, unavailable = None, [], (
+                    f"deploy_state_read_failed:{type(exc).__name__}")
+            if unavailable is not None:
+                return self._quality_unavailable(mission_id, unavailable)
+            if drift is None:
+                self._write_quality_activity(
+                    "quality_population_drift_unreadable",
+                    f"mission={mission_id}", mission_id)
+            for drifted in drift or ():
+                self._write_quality_activity(
+                    "quality_population_drift",
+                    f"mission={mission_id} name={drifted}", mission_id)
+            populations = (deployed, file_population.examples, archive)
+            for population in populations:
+                for skipped in population.skipped:
+                    self._write_quality_activity(
+                        "quality_row_skipped",
+                        f"mission={mission_id} row={skipped}", mission_id)
+            if improve_quality.base_unavailable(*populations):
+                return self._quality_unavailable(
+                    mission_id, "no_usable_comparison_row")
+            duplicate = improve_quality.find_duplicate_logic(
+                name=candidate.name, logic_hash=candidate.logic_hash,
+                populations=populations)
+            if duplicate is not None:
+                return self._quality_rejection(
+                    "duplicate_logic",
+                    detail=f"matched={duplicate.source}:{duplicate.name}")
+            same_family = improve_quality.find_same_family(
+                name=candidate.name, kind=approval_payload.get("kind"),
+                family_key=candidate.family_key,
+                deployed=deployed)
+            if same_family is not None:
+                flags = ("family_detected",)
+        metrics_dup = self._check_duplicate_metrics_for_approval(
+            conn, approval_payload, inventory=inventory,
+            staging_dir=staging_dir)
+        if metrics_dup is not None:
+            detail = (f"duplicate_metrics_of:{metrics_dup.content_hash} "
+                      f"pair={metrics_dup.pair}")
+            return self._quality_rejection(
+                "duplicate_metrics", detail=detail)
+        return _QualityVerdict(flags=flags)
+
+    @staticmethod
+    def _quality_rejection(outcome: str, *, detail: str) -> _QualityVerdict:
+        """agent 面の `reason` は固定語彙だけ。同一ロジック・同一成績は
+        `duplicate`、同一性や比較の根拠が作れなかったときは
+        `not_submitted`。"""
+        if outcome in ("duplicate_logic", "duplicate_metrics"):
+            reason = "duplicate"
+        else:
+            reason = "not_submitted"
+        return _QualityVerdict(outcome=outcome, reason=reason, detail=detail)
+
+    def _quality_unavailable(self, mission_id: int,
+                             reason: str) -> _QualityVerdict:
+        """比較の根拠が作れなかった: 原因は activity にだけ残し、agent 面には
+        固定語彙の `gate_failed` を返す。"""
+        self._write_quality_activity(
+            "quality_check_unavailable",
+            f"mission={mission_id} reason={reason}", mission_id)
+        return self._quality_rejection(
+            "gate_failed", detail="comparison_base_unavailable")
+
+    def _write_quality_activity(self, event: str, summary: str,
+                                mission_id: int) -> None:
+        if self._activity is not None:
+            self._activity.write(
+                Category.IMPROVE, event, summary, str(mission_id))
+
     def _deployed_dir_for(self, name, *, inventory) -> "Path | None":
         """`inventory.phase1_metas` のうち同名 strategy の `meta.path`。
         見つからなければ `None`。"""
@@ -2630,13 +2769,17 @@ class ImproveLoop:
                           ledger_entries=(), gate_rows=(), ctx=None,
                           tool_calls: int | None = None,
                           final_candidate: "_FinalCandidate | None" = None,
-                          ) -> _DuplicateDemotion | None:
+                          file_quality: bool = True,
+                          ) -> _QualityVerdict | None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。
 
-        戻り値: 質検査 (CR1) が既承認候補との一致を検出したときは
-        `_DuplicateDemotion` を返す (この場合、内側 tx は既に rollback 済み
+        戻り値: 質検査 (段 L・F・M) が候補を降格・拒否したときは
+        `_QualityVerdict` を返す (この場合、内側 tx は既に rollback 済み
         — 呼び出し元 `commit()` が observation 経路へ再ルートする)。通常の
-        approval 終端では `None` を返す。"""
+        approval 終端では `None` を返す。
+
+        `file_quality=False` は配備済み・example のファイルを比較対象にしない
+        単体テスト用の明示指定 (段 M だけを行う)。実 run は常に True。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
 
@@ -2644,6 +2787,7 @@ class ImproveLoop:
         # 例外 (ロック競合) を出すと外側 except の `_compensate_tx2_failure(
         # ctx=persist_ctx)` が UnboundLocalError になり補償が静かに飛ぶ
         # (ローカル T3 1 周目 申し送り、2026-09-10)。
+        guard_stack = contextlib.ExitStack()
         if ctx is None:
             class _EntriesView:
                 def entries(self):
@@ -2674,6 +2818,24 @@ class ImproveLoop:
                     submitted, mission_id=mission_id, now=now)
                 if submitted_archive_path is not None and created:
                     created_archive_path = submitted_archive_path
+            # 配備済み・example の比較対象は、書き込みロックを持つ前にファイル
+            # から組み立てる (tx の中ではファイルを触らない)。
+            # 母集団の確定から最終行の commit まで、配備操作と排他になる
+            # (取得順はガード → DB。配備操作側も同じ順)。
+            file_population = None
+            if ctx is not None and file_quality:
+                from agentic_fx.plugin import switch as plugin_switch
+                try:
+                    guard_stack.enter_context(plugin_switch.deploy_guard(
+                        self._root / "plugins", exclusive=True,
+                        deadline=time.monotonic()
+                        + improve_quality.DEPLOY_GUARD_TIMEOUT_S))
+                except (plugin_switch.PluginBusyError, OSError) as exc:
+                    self._remove_created_archive(created_archive_path)
+                    return self._quality_unavailable(
+                        mission_id,
+                        f"deploy_guard_unavailable:{type(exc).__name__}")
+                file_population = self._load_quality_population(ctx)
             try:
                 conn.execute("BEGIN IMMEDIATE")
             except BaseException:
@@ -2699,16 +2861,18 @@ class ImproveLoop:
                 # (`_finalize_success` を単体で呼ぶ既存テストが `ctx` を
                 # 省略する) — その場合だけ空 inventory を作る
                 # (`_empty_inventory_result`、`staging_dir=None` でも安全)。
-                demotion = self._check_duplicate_metrics_for_approval(
-                    conn, approval_payload,
+                verdict = self._check_candidate_quality(
+                    conn, approval_payload, candidate=submitted,
+                    mission_id=mission_id,
+                    file_population=file_population,
                     inventory=(ctx.inventory if ctx is not None
                               else _empty_inventory_result(
                                   self._root / "plugins")),
                     staging_dir=(ctx.staging_dir if ctx is not None else None))
-                if demotion is not None:
+                if verdict.outcome is not None:
                     conn.rollback()
                     self._remove_created_archive(created_archive_path)
-                    return demotion
+                    return verdict
                 # precheck 2026-08-23 wave3: RW4 — mission_id (= ctx.mission_id、
                 # commit() が渡すローカル引数) を台帳/親ゲート両方の永続化へ
                 # 転送する。Task 12 の `WHERE mission_id=?` assert が読む列。
@@ -2729,7 +2893,8 @@ class ImproveLoop:
                     conn, mission_id=mission_id, candidate=submitted,
                     now=now, archive_path=submitted_archive_path)
                 if not archives_store.settle(
-                        conn, candidate_archive_id, "pending"):
+                        conn, candidate_archive_id, "pending",
+                        add_flags=verdict.flags):
                     raise RuntimeError(
                         f"candidate archive {candidate_archive_id} was not "
                         "not_submitted; cannot submit")
@@ -2774,6 +2939,9 @@ class ImproveLoop:
                 conn.rollback()
                 self._remove_created_archive(created_archive_path)
                 raise
+            # 母集団に依存するのは commit までで、以降の処理は別 slot を
+            # 待たせないよう排他ガードを先に放す。
+            guard_stack.close()
             # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
             # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
             # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
@@ -2827,6 +2995,8 @@ class ImproveLoop:
                     f"mission_id={mission_id} run_id={run_id}")
                 if ctx is not None:
                     ctx.ledger.mark_discarded()
+        finally:
+            guard_stack.close()
 
     def commit(self, *, mission, ctx, result, now,
               slot_terminalize: bool = True) -> None:
@@ -2978,7 +3148,8 @@ class ImproveLoop:
                         and final_candidate.logic_hash is None):
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="gate_failed:identity_unavailable", now=now,
+                        reason="gate_failed:unverified", now=now,
+                        activity_extra=" cause=candidate_identity_unavailable",
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed")
@@ -3191,32 +3362,27 @@ class ImproveLoop:
                     gate_rows=tuple(gate_rows), ctx=ctx,
                     tool_calls=tool_calls, final_candidate=final_candidate)
                 if demotion is not None:
-                    # CR1 是正: `_finalize_success` が質検査ヒットを検出し
-                    # 内側 tx を rollback 済み (何も永続化していない) —
-                    # observation 経路へ再ルートする。CR3: 全 pair 分の
-                    # gate 行 (in_sample/holdout とも) を
-                    # mission_outcome='observation' で残す — 一致した pair
-                    # は reason に埋め込む (どの pair が降格を引いたかを
-                    # 人間が追跡できるようにする)。
+                    # `_finalize_success` が質検査で降格・拒否を決め、内側 tx を
+                    # rollback 済み (何も永続化していない) — observation 経路へ
+                    # 再ルートする。全 pair 分の gate 行 (in_sample/holdout とも)
+                    # を mission_outcome='observation' で残す。降格の細部は
+                    # activity にだけ書き、backlog の last_result には
+                    # `demotion.reason` だけが出る。
+                    self._write_quality_activity(
+                        "quality_demoted",
+                        f"mission={ctx.mission_id} outcome={demotion.outcome} "
+                        f"{demotion.detail}", ctx.mission_id)
                     self._finalize_report_or_observation(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         report_path=None,
                         artifact={
                             "type": "observation",
-                            "reason": "duplicate",
+                            "reason": demotion.reason,
                         },
                         now=now, gate_rows=tuple(gate_rows),
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="duplicate_metrics")
-                    # 降格の詳細 (一致した候補の hash と pair) は運用者向けの
-                    # activity にだけ残す。agent 面の `last_result` は固定文言。
-                    if self._activity is not None:
-                        self._activity.write(
-                            Category.IMPROVE, "quality_demoted",
-                            f"mission={ctx.mission_id} kind=duplicate_metrics "
-                            f"content_hash={demotion.content_hash} "
-                            f"pair={demotion.pair}", str(ctx.mission_id))
+                        candidate_outcome=demotion.outcome)
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,

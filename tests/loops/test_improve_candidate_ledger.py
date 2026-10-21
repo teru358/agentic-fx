@@ -565,7 +565,8 @@ def test_ac23_e14_e15_duplicate_metrics_demotion_and_submission(improve_env):
     assert _payload(conn)["candidate_archive_id"] == first["id"]
     loop, ctx_b, seeded_b = _run(
         app, root, _plugin_artifact("conv_b", kind="strategy"),
-        files=("conv_b", '"""b"""\n' + _PASSING_STRATEGY_PY,
+        files=("conv_b", '"""b"""\n' + _PASSING_STRATEGY_PY
+               + '\n_VARIANT = "b"\n',
                _PASSING_STRATEGY_CONFIG, _PASSING_STRATEGY_TEST),
         in_sample=_fake_in_sample_full_metrics(metrics),
         holdout_fn=_fake_holdout_full_metrics(hold))

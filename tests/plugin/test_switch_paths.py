@@ -1775,15 +1775,15 @@ def test_plugin_locks_acquires_sorted_unique_names(tmp_path, monkeypatch):
     名前昇順 (順序 pin — 逆順で取っても deadlock しない)。"""
     acquired = []
     import contextlib as _ctx
-    real = plugin_switch._plugin_lock
+    real = plugin_switch._plugin_name_lock
 
     @_ctx.contextmanager
-    def _spy(root, name):
+    def _spy(root, name, **kw):
         acquired.append(name)
-        with real(root, name):
+        with real(root, name, **kw):
             yield
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _spy)
     root = tmp_path / "plugins"
     root.mkdir()
     with plugin_switch._plugin_locks(root, ["s", "rsi", "rsi", "adx"]):
@@ -1797,15 +1797,15 @@ def test_plugin_lock_order_for_approve_candidate_is_sorted_unique(
     重複なし**であることを spy で pin する (順序が崩れる変異を検出)。"""
     acquired: list[str] = []
     import contextlib as _ctx
-    real = plugin_switch._plugin_lock
+    real = plugin_switch._plugin_name_lock
 
     @_ctx.contextmanager
-    def _spy(root, name):
+    def _spy(root, name, **kw):
         acquired.append(name)
-        with real(root, name):
+        with real(root, name, **kw):
             yield
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _spy)
     conn, plugins_root = _switch_env(tmp_path)
     _install_gate_double(monkeypatch)
     fx.write_indicator(plugins_root, "rsi")
@@ -1835,15 +1835,15 @@ def test_submit_candidate_locks_the_whole_dependency_set(tmp_path, monkeypatch):
     窓が開く (§2.3 の lock 集合契約)。"""
     acquired: list[str] = []
     import contextlib as _ctx
-    real = plugin_switch._plugin_lock
+    real = plugin_switch._plugin_name_lock
 
     @_ctx.contextmanager
-    def _spy(root, name):
+    def _spy(root, name, **kw):
         acquired.append(name)
-        with real(root, name):
+        with real(root, name, **kw):
             yield
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _spy)
     conn, plugins_root = _switch_env(tmp_path)
     _install_gate_double(monkeypatch)
     fx.write_indicator(plugins_root, "rsi")
@@ -1867,15 +1867,15 @@ def test_bless_candidate_locks_the_whole_dependency_set(tmp_path, monkeypatch):
     への変異が生存した。"""
     acquired: list[str] = []
     import contextlib as _ctx
-    real = plugin_switch._plugin_lock
+    real = plugin_switch._plugin_name_lock
 
     @_ctx.contextmanager
-    def _spy(root, name):
+    def _spy(root, name, **kw):
         acquired.append(name)
-        with real(root, name):
+        with real(root, name, **kw):
             yield
 
-    monkeypatch.setattr(plugin_switch, "_plugin_lock", _spy)
+    monkeypatch.setattr(plugin_switch, "_plugin_name_lock", _spy)
     conn, plugins_root = _switch_env(tmp_path)
     _install_gate_double(monkeypatch)
     fx.write_indicator(plugins_root, "rsi")
@@ -2194,7 +2194,7 @@ def test_plugin_lock_refuses_names_outside_the_plugin_name_grammar(tmp_path):
     with plugin_switch._plugin_lock(plugins_root, "rsi_indicator"):
         pass
     assert sorted(p.name for p in (plugins_root / ".locks").iterdir()) == [
-        "rsi_indicator.lock"]
+        ".deploy-population.guard", "rsi_indicator.lock"]
 
 
 def test_unparseable_candidate_config_is_rejected_by_the_gate_not_the_lock_set(
