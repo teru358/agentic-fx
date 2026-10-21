@@ -74,7 +74,7 @@ _RECONCILE_LOCK_LINE = ("reconcile_lock_timeout_sec: 30  "
                         "# 起動時 deploy reconcile 全体の plugin name lock 待機上限 (秒)\n")
 
 
-_VERSION_TWO_LINE = re.compile(r"schema_version:[ \t]*2([ \t]+#.*)?\r?\n?")
+_VERSION_TWO_LINE = re.compile(r"(schema_version:[ \t]*)2(([ \t]+#.*)?\r?\n?)")
 
 
 def _migrate_two_to_three(text: str) -> EditResult:
@@ -89,7 +89,9 @@ def _migrate_two_to_three(text: str) -> EditResult:
     marker = next((i for i, line in enumerate(lines) if _VERSION_TWO_LINE.fullmatch(line)), None)
     if marker is None:
         return _failure("schema_version: 2 の行を見つけられません。手で編集してください。")
-    lines[marker] = lines[marker].replace("schema_version: 2", "schema_version: 3", 1)
+    lines[marker], replaced = _VERSION_TWO_LINE.subn(r"\g<1>3\g<2>", lines[marker], count=1)
+    if replaced != 1:
+        return _failure("schema_version: 2 の行を書き換えられませんでした。手で編集してください。")
     raw = yaml.safe_load(text) or {}
     worker = raw.get("worker")
     if isinstance(worker, dict) and ("plugin_lock_timeout_sec" not in worker
@@ -128,7 +130,7 @@ def _migrate_two_to_three(text: str) -> EditResult:
     return EditResult(ok=True, text=updated)
 
 
-_VERSION_THREE_LINE = re.compile(r"schema_version:[ \t]*3([ \t]+#.*)?\r?\n?")
+_VERSION_THREE_LINE = re.compile(r"(schema_version:[ \t]*)3(([ \t]+#.*)?\r?\n?)")
 
 
 def _migrate_three_to_four(text: str) -> EditResult:
@@ -141,7 +143,9 @@ def _migrate_three_to_four(text: str) -> EditResult:
     marker = next((i for i, line in enumerate(lines) if _VERSION_THREE_LINE.fullmatch(line)), None)
     if marker is None:
         return _failure("schema_version: 3 の行を見つけられません。手で編集してください。")
-    lines[marker] = lines[marker].replace("schema_version: 3", "schema_version: 4", 1)
+    lines[marker], replaced = _VERSION_THREE_LINE.subn(r"\g<1>4\g<2>", lines[marker], count=1)
+    if replaced != 1:
+        return _failure("schema_version: 3 の行を書き換えられませんでした。手で編集してください。")
     updated = "".join(lines)
     try:
         Settings.model_validate(yaml.safe_load(updated) or {})

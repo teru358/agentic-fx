@@ -268,3 +268,35 @@ def test_version_three_marker_without_a_comment_migrates_under_crlf():
 
     assert result.ok, result.reason
     assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+
+
+def _variants(version: int):
+    return ("schema_version:  %d\n" % version, "schema_version:   %d  # 版の注記\n" % version)
+
+
+def test_version_three_marker_with_odd_spacing_is_really_rewritten():
+    base = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+    import re
+    for line in _variants(3):
+        old = re.sub(r"schema_version: 3[^\n]*\n", lambda m: line, base, count=1)
+        assert line in old
+
+        result = migrate(old)
+
+        assert result.ok, result.reason
+        assert yaml.safe_load(result.text)["schema_version"] == 4
+        assert result.text == old.replace(line, line.replace("3", "4", 1), 1)
+
+
+def test_version_two_marker_with_odd_spacing_is_really_rewritten():
+    base = (FIXTURES / "v2.yaml").read_text(encoding="utf-8")
+    import re
+    for line in _variants(2):
+        old = re.sub(r"schema_version: 2[^\n]*\n", lambda m: line, base, count=1)
+        assert line in old
+
+        result = _migrate_two_to_three(old)
+
+        assert result.ok, result.reason
+        assert yaml.safe_load(result.text)["schema_version"] == 3
+        assert line.replace("2", "3", 1) in result.text
