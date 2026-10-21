@@ -408,9 +408,8 @@ def test_ac10_relock_resubmission_passes_l_and_f_by_the_ordinary_rule_and_m_keep
                "content_hash": "c" * 64, "eval_source": "dukascopy",
                "base_interval": "5m",
                "in_sample": {"USDJPY": {"trades": 40, "pf": 1.5, "avg_r": 0.2}}}
-    file_population = quality.FilePopulation(
-        deployed=quality.load_deployed(inventory.phase1_metas),
-        examples=quality.Population())
+    file_population = quality.load_file_population(plugins_root, None)
+    assert file_population.unavailable is None
     callers = []
     import agentic_fx.loops.improve_loop as improve_loop_module
     real = improve_loop_module.is_relock_transition
@@ -628,14 +627,14 @@ def test_duplicate_metrics_details_never_reach_the_agent_surface(improve_env):
     assert f"duplicate_metrics_of:{approved_hash}" in log
 
 
-# --- 配備切替との順序 (配備済みの母集団は tx の中で DB から確定する) -----------
+# --- 配備切替との順序 (配備済みの母集団は lock 下の live のファイルが正) -------
 
 def _record_disable(conn, name):
     """配備の無効化を DB に完了済みで記録する (配備切替の journal と同じ DB)。"""
     from agentic_fx.store import plugin_deploy_ops as deploy_ops
     op_id = deploy_ops.insert_intent(
         conn, op_kind="disable_symlink", name=name, from_kind="symlink",
-        to_kind="absent", from_target=f".versions/{name}/{'a' * 64}",
+        to_kind="absent", from_target=f".versions/{name}/{'b' * 64}",
         to_target=None, retired_path=None, subject_content_hash="c" * 64,
         subject_artifact_hash="a" * 64, target_content_hash=None,
         target_artifact_hash=None, approval_id=None, revoke=False,
@@ -644,20 +643,41 @@ def _record_disable(conn, name):
     return op_id
 
 
-def _record_deploy(conn, root, name, *, py, config=_PASSING_STRATEGY_CONFIG):
-    """版ディレクトリを置き、承認の配備切替が完了した記録を DB に残す。"""
-    from agentic_fx.store import plugin_switch_journal as journal
-    target = f".versions/{name}/{'b' * 64}"
+def _place_link(root, name, *, py, config=_PASSING_STRATEGY_CONFIG,
+                version="b"):
+    """版 dir を置いて live を symlink にする (DB には触れない)。"""
+    target = f".versions/{name}/{version * 64}"
     version_dir = root / "plugins" / target
     version_dir.mkdir(parents=True)
     (version_dir / "plugin.py").write_text(py)
     (version_dir / "config.yaml").write_text(config)
+    (root / "plugins" / name).symlink_to(target)
+    return target
+
+
+def _place_plain(root, name, *, py, config=_PASSING_STRATEGY_CONFIG):
+    """人が live に直接 plain dir を置く。"""
+    live = root / "plugins" / name
+    live.mkdir(parents=True)
+    (live / "plugin.py").write_text(py)
+    (live / "config.yaml").write_text(config)
+
+
+def _record_deploy(conn, root, name, *, py, config=_PASSING_STRATEGY_CONFIG):
+    """版ディレクトリと live の symlink を置き、承認の配備切替が完了した記録を
+    DB に残す。"""
+    from agentic_fx.store import plugin_switch_journal as journal
+    target = _place_link(root, name, py=py, config=config)
     op_id = journal.insert(
         conn, kind="approve", approval_id=1, name=name, old_kind="absent",
         old_target=None, temp_path="tmp", new_target=target,
         switch_required=True, actor="t", now=NOW)
     assert journal.set_phase(conn, op_id, "decided", now=NOW)
     return op_id
+
+
+def _remove_live(root, name):
+    (root / "plugins" / name).unlink()
 
 
 def test_a_disable_between_prepare_and_the_tx_removes_the_same_name_exception(
@@ -669,11 +689,14 @@ def test_a_disable_between_prepare_and_the_tx_removes_the_same_name_exception(
     conn = app.conn_core
     _decided_row(conn, name="cand", logic_hash=_hash_of(PY_X),
                  outcome="approved")
-    deployed = _deployed("cand", logic_hash=_hash_of(PY_X), family=FAMILY)
+    _record_deploy(conn, root, "cand", py=PY_X)
+
+    def disable(loop, ctx):
+        _remove_live(root, "cand")
+        _record_disable(conn, "cand")
+
     loop, ctx, seeded = _run_strategy(
-        app, root, "cand",
-        extra=[_population_patch(deployed=[deployed])],
-        before_commit=lambda loop, ctx: _record_disable(conn, "cand"))
+        app, root, "cand", before_commit=disable)
     _expect_rows(conn, ctx, seeded, "duplicate_logic")
     assert _approval_count(conn) == 0
 
@@ -684,23 +707,60 @@ def test_the_same_name_exception_holds_while_the_name_stays_deployed(
     conn = app.conn_core
     _decided_row(conn, name="cand", logic_hash=_hash_of(PY_X),
                  outcome="approved")
-    deployed = _deployed("cand", logic_hash=_hash_of(PY_X), family=FAMILY)
-    loop, ctx, seeded = _run_strategy(
-        app, root, "cand", extra=[_population_patch(deployed=[deployed])])
+    _record_deploy(conn, root, "cand", py=PY_X)
+    loop, ctx, seeded = _run_strategy(app, root, "cand")
     _expect_rows(conn, ctx, seeded, "pending")
 
 
 def test_a_deploy_between_prepare_and_the_tx_rejects_a_same_logic_candidate(
         improve_env):
-    """mission 開始後に別名で配備された同ロジックを、tx の中で見て拒否する。"""
+    """mission 開始後に別名で配備された同ロジックを、lock 下の live で見て拒否する。"""
     app, root = improve_env
     conn = app.conn_core
     loop, ctx, seeded = _run_strategy(
-        app, root, "cand", extra=[_population_patch()],
-        before_commit=lambda loop, ctx: _record_deploy(
+        app, root, "cand", before_commit=lambda loop, ctx: _record_deploy(
             conn, root, "other", py=PY_X))
     _expect_rows(conn, ctx, seeded, "duplicate_logic")
     assert "matched=deployed:other" in _activity(root)
+
+
+def test_a_plugin_placed_by_hand_after_a_disable_still_counts_in_the_population(
+        improve_env):
+    """disable の記録 (absent) の後に人が同名を直接置いた。実在するので別名の
+    同ロジック候補は duplicate_logic になり、食い違いは activity に残る。"""
+    app, root = improve_env
+    conn = app.conn_core
+    _record_deploy(conn, root, "other", py=PY_X)
+    _remove_live(root, "other")
+    _record_disable(conn, "other")
+    _place_plain(root, "other", py=PY_X)
+    loop, ctx, seeded = _run_strategy(app, root, "cand")
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+    log = _activity(root)
+    assert "matched=deployed:other" in log
+    assert "quality_population_drift" in log and "name=other" in log
+
+
+def test_a_recorded_plugin_replaced_by_hand_is_compared_by_its_new_version(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    _record_deploy(conn, root, "other", py=PY_Y)
+    _remove_live(root, "other")
+    _place_plain(root, "other", py=PY_X)
+    loop, ctx, seeded = _run_strategy(app, root, "cand")
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+    assert "quality_population_drift" in _activity(root)
+
+
+def test_a_recorded_plugin_without_drift_leaves_no_drift_activity(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    _record_deploy(conn, root, "other", py=PY_Y)
+    loop, ctx, seeded = _run_strategy(app, root, "cand")
+    _expect_rows(conn, ctx, seeded, "pending")
+    assert "quality_population_drift" not in _activity(root)
 
 
 def test_a_deploy_operation_still_in_flight_makes_the_check_unavailable(
@@ -719,11 +779,183 @@ def test_a_deploy_operation_still_in_flight_makes_the_check_unavailable(
             revoke_row_id=None, force=False, actor="t", now=NOW)
 
     loop, ctx, seeded = _run_strategy(
-        app, root, "cand", extra=[_population_patch()], before_commit=open_op)
+        app, root, "cand", before_commit=open_op)
     _expect_rows(conn, ctx, seeded, "gate_failed")
     assert _approval_count(conn) == 0
     assert _last_result(conn) == f"observation:{NOTICE}"
     assert "quality_check_unavailable" in _activity(root)
+
+
+# --- 配備ガード (配備操作と母集団の確定は排他) --------------------------------
+
+def _hold_deploy_lock(root, *, held, release, then=None):
+    """配備操作の代役。plugin lock (= 共有の配備ガード) を取ったまま `release`
+    が立つまで保持し、`then` を lock の中で実行してから放す。別 thread で動かす。"""
+    import threading
+    from agentic_fx.plugin import switch
+
+    def run():
+        with switch._plugin_lock(root / "plugins", "other"):
+            held.set()
+            release.wait(30)
+            if then is not None:
+                then()
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread
+
+
+def test_the_quality_check_waits_for_a_running_deploy_and_sees_its_result(
+        improve_env):
+    """配備操作が lock を保持している間、質検査はガードの取得で待つ。配備が
+    済んだ後の live (別名の同ロジック) を見て duplicate_logic になる。"""
+    import threading
+    import time as _time
+    from agentic_fx.plugin import switch
+    app, root = improve_env
+    conn = app.conn_core
+    held, release = threading.Event(), threading.Event()
+    threads = []
+    waited = {}
+    real = switch.deploy_guard
+
+    def timed_guard(*a, **kw):
+        if kw.get("exclusive"):
+            waited["start"] = _time.monotonic()
+            threading.Timer(0.5, release.set).start()
+        return real(*a, **kw)
+
+    def start(loop, ctx):
+        threads.append(_hold_deploy_lock(
+            root, held=held, release=release,
+            then=lambda: _place_link(root, "other", py=PY_X)))
+        assert held.wait(5)
+
+    def stamp(self, ctx):
+        waited["entered"] = _time.monotonic()
+        return real_load(self, ctx)
+
+    real_load = ImproveLoop._load_quality_population
+    with patch.object(switch, "deploy_guard", timed_guard), \
+            patch.object(ImproveLoop, "_load_quality_population", stamp):
+        loop, ctx, seeded = _run_strategy(
+            app, root, "cand", before_commit=start)
+    threads[0].join(10)
+    assert waited["entered"] - waited["start"] >= 0.4
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+    assert "matched=deployed:other" in _activity(root)
+
+
+def test_a_deploy_lock_held_past_the_timeout_makes_the_check_unavailable(
+        improve_env, monkeypatch):
+    import threading
+    app, root = improve_env
+    conn = app.conn_core
+    monkeypatch.setattr(quality, "DEPLOY_GUARD_TIMEOUT_S", 0.3)
+    held, release = threading.Event(), threading.Event()
+    threads = []
+
+    def start(loop, ctx):
+        threads.append(_hold_deploy_lock(root, held=held, release=release))
+        assert held.wait(5)
+
+    try:
+        loop, ctx, seeded = _run_strategy(
+            app, root, "cand", before_commit=start)
+    finally:
+        release.set()
+    threads[0].join(10)
+    _expect_rows(conn, ctx, seeded, "gate_failed")
+    assert _approval_count(conn) == 0
+    assert _last_result(conn) == f"observation:{NOTICE}"
+    log = _activity(root)
+    assert "quality_check_unavailable" in log
+    assert "deploy_guard_unavailable" in log
+
+
+def test_a_deploy_started_during_the_quality_check_waits_until_it_ends(
+        improve_env):
+    """質検査が母集団を確定してから tx を閉じるまでの間に始まった配備操作は、
+    その間は lock を取れず、質検査の後に完了する。"""
+    import threading
+    import time as _time
+    from agentic_fx.plugin import switch
+    app, root = improve_env
+    conn = app.conn_core
+    seen = {}
+    thread_box = []
+    real = ImproveLoop._load_quality_population
+
+    def load_then_start_deploy(self, ctx):
+        population = real(self, ctx)
+
+        def deploy():
+            with switch._plugin_lock(root / "plugins", "other"):
+                _place_link(root, "other", py=PY_X)
+
+        thread = threading.Thread(target=deploy)
+        thread.start()
+        thread_box.append(thread)
+        _time.sleep(0.5)
+        seen["placed_during_check"] = (root / "plugins" / "other").exists()
+        return population
+
+    with patch.object(ImproveLoop, "_load_quality_population",
+                      load_then_start_deploy):
+        loop, ctx, seeded = _run_strategy(app, root, "cand")
+    thread_box[0].join(10)
+    assert seen["placed_during_check"] is False
+    _expect_rows(conn, ctx, seeded, "pending")
+    assert (root / "plugins" / "other").is_symlink()
+
+
+def test_the_deploy_guard_is_taken_before_begin_and_released_after_the_tx(
+        improve_env):
+    """取得順は ガード → BEGIN IMMEDIATE、放すのは COMMIT の後 (配備操作側の
+    ガード → plugin lock → DB と同じ向き)。"""
+    from agentic_fx.plugin import switch
+    app, root = improve_env
+    events: list[str] = []
+    real = switch.deploy_guard
+
+    class Spy:
+        def __init__(self, *a, **kw):
+            self._cm = real(*a, **kw)
+            self._exclusive = kw.get("exclusive")
+
+        def __enter__(self):
+            self._cm.__enter__()
+            events.append(f"guard_enter:{self._exclusive}")
+
+        def __exit__(self, *exc):
+            events.append("guard_exit")
+            return self._cm.__exit__(*exc)
+
+    def trace(statement):
+        head = statement.strip().upper()
+        if head.startswith("BEGIN") or head.startswith("COMMIT"):
+            events.append(head.split()[0] + (
+                " IMMEDIATE" if "IMMEDIATE" in head else ""))
+
+    original = ImproveLoop._finalize_success
+
+    def traced(self, conn_, *a, **kw):
+        conn_.set_trace_callback(trace)
+        try:
+            return original(self, conn_, *a, **kw)
+        finally:
+            conn_.set_trace_callback(None)
+
+    with patch.object(switch, "deploy_guard", Spy), \
+            patch.object(ImproveLoop, "_finalize_success", traced):
+        _run_strategy(app, root, "cand")
+    first_guard = events.index("guard_enter:True")
+    assert "BEGIN IMMEDIATE" not in events[:first_guard]
+    begin = events.index("BEGIN IMMEDIATE", first_guard)
+    assert first_guard < begin
+    last_commit = max(i for i, e in enumerate(events) if e == "COMMIT")
+    assert events.index("guard_exit", first_guard) > last_commit
 
 
 # --- 母集団の読込失敗 ---------------------------------------------------------

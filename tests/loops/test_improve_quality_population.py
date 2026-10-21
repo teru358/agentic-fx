@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -30,8 +29,29 @@ def conn(tmp_path):
     db.close()
 
 
-def _meta(path: Path, name: str, kind: str = "strategy"):
-    return SimpleNamespace(path=path, name=name, kind=kind)
+def _live_root(tmp_path: Path, **plain: Path) -> Path:
+    """名前 → 元ディレクトリの plain dir を置いた plugins root。"""
+    import shutil
+    root = tmp_path / "plugins"
+    root.mkdir(exist_ok=True)
+    for name, source in plain.items():
+        shutil.copytree(source, root / name)
+    return root
+
+
+def _link_live(root: Path, name: str, source: Path, *, version="b") -> str:
+    """版 dir を置いて live を正規形の symlink にする。symlink の指す先を返す。"""
+    import shutil
+    target = f".versions/{name}/{version * 64}"
+    shutil.copytree(source, root / target)
+    (root / name).symlink_to(target)
+    return target
+
+
+def _deployed_of(tmp_path: Path, name: str, source: Path) -> quality.Population:
+    base = tmp_path / f"live_{name}"
+    base.mkdir(exist_ok=True)
+    return quality.load_live_deployed(_live_root(base, **{name: source}))[0]
 
 
 def _row(conn, *, mission_id, name, logic_hash, outcome, family_key=None):
@@ -177,23 +197,25 @@ def test_ac18_a_corrupted_archive_row_is_skipped_and_reported(conn):
 
 
 def test_ac18_an_unreadable_deployed_dir_is_skipped_and_reported(tmp_path):
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    population = quality.load_deployed([
-        _meta(empty, "ghost"), _meta(RSI_A, "rsi_bb")])
+    root = _live_root(tmp_path, rsi_bb=RSI_A)
+    ghost = root / "ghost"
+    ghost.mkdir()
+    (ghost / "plugin.py").write_text("x = 1\n")
+    population, _ = quality.load_live_deployed(root)
     assert [e.name for e in population.entries] == ["rsi_bb"]
     assert population.skipped == ["deployed:ghost"]
 
 
 def test_ac18_base_unavailable_only_when_something_was_attempted_and_nothing_usable(
         tmp_path):
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    nothing_usable = quality.load_deployed([_meta(empty, "ghost")])
+    root = tmp_path / "plugins"
+    root.mkdir()
+    (root / "ghost").symlink_to(f".versions/ghost/{'b' * 64}")
+    nothing_usable, _ = quality.load_live_deployed(root)
     assert quality.base_unavailable(nothing_usable)
     assert not quality.base_unavailable(quality.Population())
     assert not quality.base_unavailable(
-        nothing_usable, quality.load_deployed([_meta(RSI_A, "rsi_bb")]))
+        nothing_usable, _deployed_of(tmp_path, "rsi_bb", RSI_A))
 
 
 def test_ac18_database_read_failure_propagates(conn):
@@ -209,16 +231,16 @@ def _family_of(path):
     return identity_of_dir(path, name="x")[1]
 
 
-def test_ac11_ac20_iii_family_of_a_deployed_other_name_is_detected():
+def test_ac11_ac20_iii_family_of_a_deployed_other_name_is_detected(tmp_path):
     family = _family_of(RSI_B)
-    deployed = quality.load_deployed([_meta(RSI_A, "rsi_bb_reversion")])
+    deployed = _deployed_of(tmp_path, "rsi_bb_reversion", RSI_A)
     hit = quality.find_same_family(
         name="rsi6_bb200", kind="strategy", family_key=family, deployed=deployed)
     assert hit is not None and hit.name == "rsi_bb_reversion"
 
 
-def test_ac11_same_name_is_an_update_not_a_family_hit():
-    deployed = quality.load_deployed([_meta(RSI_A, "rsi_bb_reversion")])
+def test_ac11_same_name_is_an_update_not_a_family_hit(tmp_path):
+    deployed = _deployed_of(tmp_path, "rsi_bb_reversion", RSI_A)
     assert quality.find_same_family(
         name="rsi_bb_reversion", kind="strategy", family_key=_family_of(RSI_B),
         deployed=deployed) is None
@@ -253,16 +275,17 @@ def test_ac11_family_is_compared_within_the_same_kind_only():
         family_key="strategy:bollinger,rsi@1h@USDJPY", deployed=deployed) is None
 
 
-def test_example_without_a_family_never_matches():
-    deployed = quality.load_deployed([_meta(EXAMPLES / "sma_cross", "sma_cross")])
+def test_example_without_a_family_never_matches(tmp_path):
+    deployed = _deployed_of(tmp_path, "sma_cross", EXAMPLES / "sma_cross")
     assert quality.find_same_family(
         name="x", kind="strategy", family_key=None, deployed=deployed) is None
 
 
 # --- 実ファイル: 母集団の読み込み -------------------------------------------
 
-def test_deployed_population_carries_hash_family_and_kind_from_real_files():
-    population = quality.load_deployed([_meta(SMA_A, "sma_cross_10_30")])
+def test_deployed_population_carries_hash_family_and_kind_from_real_files(
+        tmp_path):
+    population = _deployed_of(tmp_path, "sma_cross_10_30", SMA_A)
     (entry,) = population.entries
     assert entry.source == "deployed" and entry.kind == "strategy"
     assert entry.family_key == "strategy:sma@1h@USDJPY"
@@ -278,18 +301,18 @@ def test_examples_population_reads_every_example_directory():
     assert quality.load_examples(EXAMPLES / "missing").attempted == 0
 
 
-# --- 配備済み母集団を DB から確定する ----------------------------------------
+# --- 配備済み母集団は live のファイルの状態が正 -------------------------------
 
 def _decided_deploy(conn, root, name, source: Path, *, version="b"):
+    """版 dir と live の symlink を置き、承認の切替が完了した記録を残す。"""
     from agentic_fx.store import plugin_switch_journal as journal
-    import shutil
-    target = f".versions/{name}/{version * 64}"
-    shutil.copytree(source, root / target)
+    target = _link_live(root, name, source, version=version)
     op_id = journal.insert(
         conn, kind="approve", approval_id=1, name=name, old_kind="absent",
         old_target=None, temp_path="t", new_target=target,
         switch_required=True, actor="t", now=NOW)
     assert journal.set_phase(conn, op_id, "decided", now=NOW)
+    return target
 
 
 def _closed_deploy_op(conn, *, op_kind, name, to_target=None, retired=None):
@@ -309,40 +332,90 @@ def _closed_deploy_op(conn, *, op_kind, name, to_target=None, retired=None):
     assert ops.set_phase(conn, op_id, "done", now=NOW)
 
 
-def test_names_without_a_deploy_record_keep_the_starting_population(
-        conn, tmp_path):
-    base = _population(_entry("deployed", "manual", "v1:" + "1" * 64))
-    population, why = quality.deployed_from_db(
-        conn, base, plugins_root=tmp_path)
-    assert why is None
-    assert [e.name for e in population.entries] == ["manual"]
+def _population_of(conn, root):
+    file_population = quality.load_file_population(root, None)
+    assert file_population.unavailable is None
+    return quality.deployed_from_live(conn, file_population)
 
 
-def test_a_recorded_approval_defines_the_live_identity_over_the_starting_one(
-        conn, tmp_path):
-    _decided_deploy(conn, tmp_path, "alpha", SMA_A)
-    base = _population(_entry("deployed", "alpha", "v1:" + "1" * 64))
-    population, why = quality.deployed_from_db(
-        conn, base, plugins_root=tmp_path)
-    assert why is None
+def test_live_symlink_is_read_through_its_version_directory(tmp_path):
+    root = tmp_path / "plugins"
+    root.mkdir()
+    _link_live(root, "alpha", SMA_A)
+    population, state = quality.load_live_deployed(root)
     assert [(e.name, e.logic_hash) for e in population.entries] == [
         ("alpha", _hash_of(SMA_A))]
+    assert state == {"alpha": f".versions/alpha/{'b' * 64}"}
 
 
-def test_a_disable_removes_the_name_and_a_rollback_restores_a_version(
+def test_a_symlink_outside_the_canonical_form_makes_the_live_state_unreadable(
+        tmp_path):
+    root = tmp_path / "plugins"
+    root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (root / "alpha").symlink_to(outside)
+    with pytest.raises(quality.LiveStateUnreadable):
+        quality.load_live_deployed(root)
+    result = quality.load_file_population(root, None)
+    assert result.unavailable == (
+        "file_population_read_failed:LiveStateUnreadable")
+
+
+def test_a_directly_placed_plugin_after_a_disable_stays_in_the_population(
         conn, tmp_path):
-    _decided_deploy(conn, tmp_path, "alpha", SMA_A)
+    """disable の記録 (absent) の後に人が同名を直接置いても、live が正。
+    食い違いは人の直接操作として報告される。"""
+    root = _live_root(tmp_path)
+    _decided_deploy(conn, root, "alpha", SMA_A)
     _closed_deploy_op(conn, op_kind="disable_symlink", name="alpha")
-    population, _ = quality.deployed_from_db(
-        conn, _population(), plugins_root=tmp_path)
-    assert population.entries == []
+    (root / "alpha").unlink()
     import shutil
-    shutil.copytree(RSI_A, tmp_path / ".versions" / "alpha" / ("c" * 64))
-    _closed_deploy_op(conn, op_kind="rollback_symlink", name="alpha",
-                      to_target=f".versions/alpha/{'c' * 64}")
-    population, _ = quality.deployed_from_db(
-        conn, _population(), plugins_root=tmp_path)
+    shutil.copytree(RSI_A, root / "alpha")
+    population, drift, why = _population_of(conn, root)
+    assert why is None and drift == ["alpha"]
     assert [e.logic_hash for e in population.entries] == [_hash_of(RSI_A)]
+
+
+def test_a_recorded_plugin_replaced_by_hand_is_read_as_its_new_version(
+        conn, tmp_path):
+    root = _live_root(tmp_path)
+    _decided_deploy(conn, root, "alpha", SMA_A)
+    (root / "alpha").unlink()
+    import shutil
+    shutil.copytree(RSI_A, root / "alpha")
+    population, drift, _ = _population_of(conn, root)
+    assert drift == ["alpha"]
+    assert [e.logic_hash for e in population.entries] == [_hash_of(RSI_A)]
+
+
+def test_a_live_state_that_matches_the_records_reports_no_drift(
+        conn, tmp_path):
+    root = _live_root(tmp_path)
+    _decided_deploy(conn, root, "alpha", SMA_A)
+    _decided_deploy(conn, root, "beta", RSI_A)
+    (root / "beta").unlink()
+    _closed_deploy_op(conn, op_kind="disable_symlink", name="beta")
+    population, drift, why = _population_of(conn, root)
+    assert why is None and drift == []
+    assert [e.name for e in population.entries] == ["alpha"]
+
+
+def test_a_plugin_removed_by_hand_is_reported_as_drift_and_absent(
+        conn, tmp_path):
+    root = _live_root(tmp_path)
+    _decided_deploy(conn, root, "alpha", SMA_A)
+    (root / "alpha").unlink()
+    population, drift, _ = _population_of(conn, root)
+    assert drift == ["alpha"] and population.entries == []
+
+
+def test_names_without_a_deploy_record_are_read_from_live_without_drift(
+        conn, tmp_path):
+    root = _live_root(tmp_path, manual=SMA_A)
+    population, drift, why = _population_of(conn, root)
+    assert why is None and drift == []
+    assert [e.name for e in population.entries] == ["manual"]
 
 
 def test_an_open_switch_or_deploy_operation_makes_the_population_unavailable(
@@ -352,24 +425,8 @@ def test_an_open_switch_or_deploy_operation_makes_the_population_unavailable(
         conn, kind="approve", approval_id=1, name="alpha", old_kind="absent",
         old_target=None, temp_path="t", new_target=".versions/alpha/x",
         switch_required=True, actor="t", now=NOW)
-    population, why = quality.deployed_from_db(
-        conn, _population(), plugins_root=tmp_path)
+    population, drift, why = _population_of(conn, _live_root(tmp_path))
     assert why == "deploy_operation_in_flight" and population.entries == []
-
-
-def test_a_recorded_version_that_cannot_be_read_is_skipped_not_empty(
-        conn, tmp_path):
-    from agentic_fx.store import plugin_switch_journal as journal
-    op_id = journal.insert(
-        conn, kind="approve", approval_id=1, name="alpha", old_kind="absent",
-        old_target=None, temp_path="t", new_target=".versions/alpha/missing",
-        switch_required=True, actor="t", now=NOW)
-    journal.set_phase(conn, op_id, "decided", now=NOW)
-    population, why = quality.deployed_from_db(
-        conn, _population(), plugins_root=tmp_path)
-    assert why is None
-    assert population.skipped == ["deployed:alpha"] and population.attempted == 1
-    assert quality.base_unavailable(population)
 
 
 def test_load_file_population_turns_a_read_failure_into_unavailable(tmp_path):
@@ -377,6 +434,6 @@ def test_load_file_population_turns_a_read_failure_into_unavailable(tmp_path):
     examples.mkdir()
     from unittest.mock import patch
     with patch.object(Path, "iterdir", side_effect=PermissionError(13, "x")):
-        result = quality.load_file_population([], examples)
+        result = quality.load_file_population(tmp_path / 'plugins', examples)
     assert result.unavailable == "file_population_read_failed:PermissionError"
     assert result.deployed.entries == [] and result.examples.entries == []

@@ -925,9 +925,68 @@ def plugin_lock_path(plugins_root: Path, name: str) -> Path:
     return plugins_root / ".locks" / f"{name}.lock"
 
 
+def deploy_guard_path(plugins_root: Path) -> Path:
+    """配備操作と質検査の母集団確定を排他にする全 plugin 共通の flock ファイル。
+    名前が `.lock` で終わらないので、起動時の lock 回収の対象にならない。"""
+    return plugins_root / ".locks" / ".deploy-population.guard"
+
+
+@contextlib.contextmanager
+def deploy_guard(plugins_root: Path, *, exclusive: bool,
+                 deadline: float | None = None, stop_event=None,
+                 monotonic: Callable[[], float] = time.monotonic):
+    """全 plugin 共通の配備ガード。配備操作 (approve / disable / rollback /
+    retire / revoke / 切替の巻き戻し) は plugin ごとの lock の前に共有で取り、
+    質検査は母集団の確定から tx の終わりまで排他で取る。共有同士は互いを
+    待たせないので配備操作どうしは直列化されず、質検査の間だけ配備が止まる。
+    取得順は常に「ガード → plugin lock → DB」。"""
+    path = deploy_guard_path(plugins_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    fh = open(path, "a+")
+    try:
+        if deadline is None and stop_event is None:
+            fcntl.flock(fh, mode)
+        else:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise PluginBusyError("deploy guard cancelled")
+                try:
+                    fcntl.flock(fh, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if deadline is not None and monotonic() >= deadline:
+                        raise PluginBusyError("deploy guard deadline exceeded")
+                    remaining = (0.1 if deadline is None
+                                 else max(0.0, deadline - monotonic()))
+                    time.sleep(min(0.1, remaining))
+        yield
+    finally:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 @contextlib.contextmanager
 def _plugin_lock(plugins_root: Path, name: str, *, deadline: float | None = None,
                  stop_event=None, monotonic: Callable[[], float] = time.monotonic):
+    """配備ガードを共有で取ってから plugin ごとの lock を取る。不正な名前は
+    ガードのファイルも作る前に拒否する。"""
+    if not (isinstance(name, str) and loader._PLUGIN_NAME_RE.fullmatch(name)):
+        raise ValueError(f"invalid plugin name for lock: {name!r}")
+    with deploy_guard(plugins_root, exclusive=False, deadline=deadline,
+                      stop_event=stop_event, monotonic=monotonic):
+        with _plugin_name_lock(plugins_root, name, deadline=deadline,
+                               stop_event=stop_event, monotonic=monotonic):
+            yield
+
+
+@contextlib.contextmanager
+def _plugin_name_lock(plugins_root: Path, name: str, *,
+                      deadline: float | None = None,
+                      stop_event=None,
+                      monotonic: Callable[[], float] = time.monotonic):
     """`plugins/.locks/<name>.lock` を blocking `flock(LOCK_EX)` で取る
     (§5.1 手順 1・11g の multi-process 期待どおり、`LOCK_NB` は使わない —
     reject/approve の競合は待ち合わせで解決する)。"""

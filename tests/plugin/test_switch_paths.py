@@ -2194,7 +2194,7 @@ def test_plugin_lock_refuses_names_outside_the_plugin_name_grammar(tmp_path):
     with plugin_switch._plugin_lock(plugins_root, "rsi_indicator"):
         pass
     assert sorted(p.name for p in (plugins_root / ".locks").iterdir()) == [
-        "rsi_indicator.lock"]
+        ".deploy-population.guard", "rsi_indicator.lock"]
 
 
 def test_unparseable_candidate_config_is_rejected_by_the_gate_not_the_lock_set(

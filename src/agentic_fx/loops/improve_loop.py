@@ -2,6 +2,7 @@
 (設計書 §4、プラン §8.1-6/11/16/23/24/40/42/43)。"""
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -12,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -2642,12 +2644,11 @@ class ImproveLoop:
 
     def _load_quality_population(self, ctx
                                  ) -> "improve_quality.FilePopulation":
-        """配備済みと example の比較対象。配備済みは mission 開始時の
-        inventory の第 1 相 (pin が古い strategy も含む)、example は mission に
-        渡した読み取り専用 snapshot から作る。"""
+        """配備済みと example の比較対象。配備済みは配備ガードを排他で持った
+        いまの `plugins/` の live の状態、example は mission に渡した読み取り
+        専用 snapshot から作る。"""
         return improve_quality.load_file_population(
-            ctx.inventory.phase1_metas,
-            ctx.source_snapshot_dir / "_examples")
+            self._root / "plugins", ctx.source_snapshot_dir / "_examples")
 
     def _check_candidate_quality(
             self, conn, approval_payload: dict, *,
@@ -2696,11 +2697,10 @@ class ImproveLoop:
                 return self._quality_rejection(
                     "gate_failed", detail="comparison_base_unavailable")
             try:
-                deployed, unavailable = improve_quality.deployed_from_db(
-                    conn, file_population.deployed,
-                    plugins_root=self._root / "plugins")
+                deployed, drift, unavailable = (
+                    improve_quality.deployed_from_live(conn, file_population))
             except sqlite3.Error as exc:
-                deployed, unavailable = None, (
+                deployed, drift, unavailable = None, [], (
                     f"deploy_state_read_failed:{type(exc).__name__}")
             if unavailable is not None:
                 self._write_quality_activity(
@@ -2708,6 +2708,10 @@ class ImproveLoop:
                     f"mission={mission_id} reason={unavailable}")
                 return self._quality_rejection(
                     "gate_failed", detail="comparison_base_unavailable")
+            for drifted in drift:
+                self._write_quality_activity(
+                    "quality_population_drift",
+                    f"mission={mission_id} name={drifted}")
             populations = (deployed, file_population.examples, archive)
             for population in populations:
                 for skipped in population.skipped:
@@ -2788,6 +2792,7 @@ class ImproveLoop:
         # 例外 (ロック競合) を出すと外側 except の `_compensate_tx2_failure(
         # ctx=persist_ctx)` が UnboundLocalError になり補償が静かに飛ぶ
         # (ローカル T3 1 周目 申し送り、2026-09-10)。
+        guard_stack = contextlib.ExitStack()
         if ctx is None:
             class _EntriesView:
                 def entries(self):
@@ -2820,9 +2825,26 @@ class ImproveLoop:
                     created_archive_path = submitted_archive_path
             # 配備済み・example の比較対象は、書き込みロックを持つ前にファイル
             # から組み立てる (tx の中ではファイルを触らない)。
-            file_population = (
-                self._load_quality_population(ctx) if ctx is not None
-                else None)
+            # 母集団の確定から tx の終わりまで、配備操作と排他になる (取得順は
+            # ガード → DB。配備操作側も同じ順)。
+            file_population = None
+            if ctx is not None:
+                from agentic_fx.plugin import switch as plugin_switch
+                try:
+                    guard_stack.enter_context(plugin_switch.deploy_guard(
+                        self._root / "plugins", exclusive=True,
+                        deadline=time.monotonic()
+                        + improve_quality.DEPLOY_GUARD_TIMEOUT_S))
+                except (plugin_switch.PluginBusyError, OSError) as exc:
+                    self._remove_created_archive(created_archive_path)
+                    self._write_quality_activity(
+                        "quality_check_unavailable",
+                        f"mission={mission_id} "
+                        f"reason=deploy_guard_unavailable:"
+                        f"{type(exc).__name__}")
+                    return self._quality_rejection(
+                        "gate_failed", detail="comparison_base_unavailable")
+                file_population = self._load_quality_population(ctx)
             try:
                 conn.execute("BEGIN IMMEDIATE")
             except BaseException:
@@ -2979,6 +3001,8 @@ class ImproveLoop:
                     f"mission_id={mission_id} run_id={run_id}")
                 if ctx is not None:
                     ctx.ledger.mark_discarded()
+        finally:
+            guard_stack.close()
 
     def commit(self, *, mission, ctx, result, now,
               slot_terminalize: bool = True) -> None:

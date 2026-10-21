@@ -6,20 +6,25 @@
 (呼び出し側が結果を記録する)。"""
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from agentic_fx.plugin.logic_identity import (
-    LOGIC_HASH_PREFIX, identity_of_dir, read_identity)
+from agentic_fx.plugin import loader
+from agentic_fx.plugin.logic_identity import LOGIC_HASH_PREFIX, read_identity
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.db import OPEN_PHASE_SQL
 
 # 質検査で降格・拒否した候補について、agent 面に出す唯一の文言。
 # 理由・他候補の名前や hash・成績は含めない。
 QUALITY_NOTICE = "理由非公開。同一候補を再提出しない"
+
+# 配備ガード (全 plugin 共通の flock) を排他で取るときの待ち上限 (秒)。
+# 超えたら比較できないものとして gate_failed にする。
+DEPLOY_GUARD_TIMEOUT_S = 30.0
 
 # 台帳の行のうち、ロジック等価の比較対象にする outcome。人間の判断を受けた、
 # または質検査で降格した候補に限る。同じ候補の途中の反復 (not_submitted)
@@ -53,36 +58,80 @@ class Population:
 
 @dataclass(frozen=True)
 class FilePopulation:
-    """配備済みの出発点と example (ファイルから作る側)。tx の外で組み立てる。
-    配備済みは、配備切替の記録が無い plugin の分だけがここから使われ、
-    記録のある plugin は tx の中で `deployed_from_db` が確定する。
+    """配備済みと example (ファイルから作る側)。配備ガードを排他で持った状態で
+    組み立てる。配備済みは `plugins/` の live の状態そのもの。
+    `live_state` は名前ごとの live の姿 (symlink の指す先の文字列 / "plain")。
     `unavailable` は組み立て自体が失敗したときの理由 (空でなければ比較不能)。"""
     deployed: Population
     examples: Population
     unavailable: str | None = None
+    live_state: dict | None = None
 
 
-def load_deployed(metas: Iterable) -> Population:
+class LiveStateUnreadable(Exception):
+    """live の plugin entry を安全に読めない (正規形でない symlink など)。"""
+
+
+def load_live_deployed(plugins_root: Path) -> tuple[Population, dict]:
+    """`plugins/` の live entry を全部読む。symlink は
+    `.versions/<name>/<64hex>` の正規形だけを受け、指す版 dir から identity を
+    作る。plain dir はその dir から作る。正規形でない・root の外へ出る
+    symlink は読めないものとして例外にする。plugin.py を読めない entry は
+    1 行だけ外して skipped に残す。"""
     population = Population()
-    for meta in metas:
-        population.attempted += 1
-        logic_hash, family_key = identity_of_dir(
-            Path(meta.path), name=meta.name)
-        if logic_hash is None:
-            population.skipped.append(f"deployed:{meta.name}")
+    state: dict[str, str] = {}
+    if not plugins_root.is_dir():
+        return population, state
+    root_resolved = plugins_root.resolve()
+    for item in sorted(plugins_root.iterdir(), key=lambda p: p.name):
+        name = item.name
+        if name.startswith(".") or not loader.is_canonical_plugin_name(name):
             continue
+        if item.is_symlink():
+            target = os.readlink(item)
+            if not loader.is_canonical_symlink_target(name, target):
+                raise LiveStateUnreadable(f"live_symlink_not_canonical:{name}")
+            directory = plugins_root / target
+            try:
+                directory.resolve().relative_to(root_resolved)
+            except ValueError:
+                raise LiveStateUnreadable(
+                    f"live_symlink_escapes_root:{name}") from None
+            state[name] = target
+        elif item.is_dir():
+            directory = item
+            state[name] = "plain"
+        else:
+            continue
+        if item.is_symlink() and not directory.is_dir():
+            population.attempted += 1
+            population.skipped.append(f"deployed:{name}")
+            continue
+        if not (directory / "plugin.py").is_file():
+            if item.is_symlink():
+                population.attempted += 1
+                population.skipped.append(f"deployed:{name}")
+            continue
+        population.attempted += 1
+        logic_hash, family_key, config = read_identity(directory, name=name)
+        if logic_hash is None:
+            population.skipped.append(f"deployed:{name}")
+            continue
+        kind = config.get("kind") if isinstance(config, dict) else None
         population.entries.append(IdentityEntry(
-            "deployed", meta.name, meta.kind, logic_hash, family_key))
-    return population
+            "deployed", name, kind, logic_hash, family_key))
+    return population, state
 
 
-def load_file_population(metas: Iterable, examples_dir: Path | None
+def load_file_population(plugins_root: Path, examples_dir: Path | None
                          ) -> FilePopulation:
     """ファイルの読込が失敗しても例外にせず、`unavailable` に理由を残す
     (比較できないものを「母集団が空」と取り違えない)。"""
     try:
+        deployed, state = load_live_deployed(plugins_root)
         return FilePopulation(
-            deployed=load_deployed(metas), examples=load_examples(examples_dir))
+            deployed=deployed, examples=load_examples(examples_dir),
+            live_state=state)
     except Exception as exc:
         return FilePopulation(
             deployed=Population(), examples=Population(),
@@ -141,7 +190,10 @@ def _in_flight_deploy_ops(conn: sqlite3.Connection) -> list[str]:
     return sorted(set(names))
 
 
-def _history_names(conn: sqlite3.Connection) -> list[str]:
+def _recorded_live(conn: sqlite3.Connection) -> dict[str, str]:
+    """配備の記録 (切替 journal と配備操作) が最後に残した live の姿を、名前ごとに
+    返す。"absent" か symlink の指す先。記録の順序が曖昧でも、使うのは人の
+    直接操作の検知 (activity) だけで、母集団の判定には使わない。"""
     names = {row[0] for row in conn.execute(
         "SELECT name FROM plugin_switch_journal "
         "WHERE phase='decided' AND switch_required=1")}
@@ -151,47 +203,34 @@ def _history_names(conn: sqlite3.Connection) -> list[str]:
         "('disable_symlink','rollback_symlink','retire_plain')) "
         "OR (phase='needs_retry' AND fail_reason='verify_failed' "
         "AND from_kind='symlink')")}
-    return sorted(names)
-
-
-def deployed_from_db(conn: sqlite3.Connection, base: Population, *,
-                     plugins_root: Path) -> tuple[Population, str | None]:
-    """tx の中で現在の配備済み母集団を確定する。配備の切替 (承認・無効化・
-    rollback・退避) は DB に記録されるので、その最後の記録が今の配備を決める。
-    記録のある plugin は、記録が指す不変の版ディレクトリから identity を作る。
-    記録の無い plugin (人が直接置いたもの) だけ、mission 開始時の `base` を使う。
-    切替が途中 (未完了の記録がある) なら今の配備を一意に決められないので、
-    第 2 戻り値に理由を返す。"""
-    in_flight = _in_flight_deploy_ops(conn)
-    if in_flight:
-        return Population(), "deploy_operation_in_flight"
-    names = set(_history_names(conn))
-    population = Population()
-    for entry in base.entries:
-        if entry.name not in names:
-            population.entries.append(entry)
-            population.attempted += 1
-    for skipped in base.skipped:
-        if skipped.split(":", 1)[-1] not in names:
-            population.skipped.append(skipped)
-            population.attempted += 1
+    recorded: dict[str, str] = {}
     for name in sorted(names):
         events = deploy_store.plugin_live_history(conn, name)
         if not events:
             continue
         last = events[-1]
-        if last["to"] == "absent" or last["kind"] == "retire_plain":
-            continue
-        population.attempted += 1
-        logic_hash, family_key, config = read_identity(
-            plugins_root / last["to"], name=name)
-        if logic_hash is None:
-            population.skipped.append(f"deployed:{name}")
-            continue
-        kind = config.get("kind") if isinstance(config, dict) else None
-        population.entries.append(IdentityEntry(
-            "deployed", name, kind, logic_hash, family_key))
-    return population, None
+        recorded[name] = ("absent" if last["to"] == "absent"
+                          or last["kind"] == "retire_plain" else last["to"])
+    return recorded
+
+
+def deployed_from_live(conn: sqlite3.Connection, file_population: FilePopulation
+                       ) -> tuple[Population, list[str], str | None]:
+    """配備ガードを排他で持ったまま、tx の中で配備済み母集団を確定する。
+    母集団の正は live のファイルの状態で、DB の履歴からは復元しない。
+    切替が途中 (未完了の記録がある) なら第 3 戻り値に理由を返す。DB の最後の
+    記録と live が食い違う名前は人の直接操作として第 2 戻り値に返す
+    (母集団は live のまま採用する)。"""
+    in_flight = _in_flight_deploy_ops(conn)
+    if in_flight:
+        return Population(), [], "deploy_operation_in_flight"
+    drift: list[str] = []
+    live_state = file_population.live_state
+    if live_state is not None:
+        for name, expected in _recorded_live(conn).items():
+            if live_state.get(name, "absent") != expected:
+                drift.append(name)
+    return file_population.deployed, drift, None
 
 
 def base_unavailable(*populations: Population) -> bool:
