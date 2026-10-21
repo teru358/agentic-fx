@@ -297,7 +297,7 @@ def test_ac13d_fixed_vocabulary_covers_every_agent_facing_demotion():
     ("observation:duplicate_metrics_of:abc123 pair=USDJPY",
      DUPLICATE_LAST_RESULT),
     ("rejected_by_human", "rejected_by_human"),
-    ("gate_failed:noop_copy_of:x", "gate_failed:noop_copy_of:x"),
+    ("gate_failed:noop_copy_of:x", "gate_failed:noop_copy"),
     (None, None),
 ])
 def test_ac13d_legacy_last_results_are_projected_on_the_way_out(
@@ -419,3 +419,35 @@ def test_backlog_last_result_canaries_are_absent_from_context_and_prompt(
     for text in (json.dumps(ctx_data), rendered):
         for token in ("0.7391", "4242", "7777"):
             assert token not in text
+
+
+_DYNAMIC_SUFFIX_VALUES = (
+    ("approval_pending:4719", "approval_pending", "4719"),
+    ("observation:family_redirect:" + "q" * 20 + "famcanary9" + "z" * 33,
+     "observation:family_redirect", "famcanary9"),
+    ("gate_failed:noop_copy_of:" + "ab12" * 10, "gate_failed:noop_copy",
+     "ab12ab12"),
+    ("gate_failed:noop_copy_of:plugincanary_rsi_pullback",
+     "gate_failed:noop_copy", "plugincanary"),
+)
+
+
+def test_dynamic_suffixes_of_last_result_never_reach_context_or_prompt(
+        conn, tmp_path):
+    """承認番号・候補名・hash の suffix は、投影後の文脈にも prompt にも残らない。"""
+    for i, (value, _, _) in enumerate(_DYNAMIC_SUFFIX_VALUES):
+        backlog_id = backlog_store.add(conn, f"dyn idea {i}", "user", NOW)
+        backlog_store.set_status(conn, backlog_id, "observation", NOW,
+                                 last_result=value)
+        improve_runs_store.start(conn, backlog_id, NOW)
+    stored = [r[0] for r in conn.execute(
+        "SELECT last_result FROM improvement_backlog ORDER BY id")]
+    assert stored == [v for v, _, _ in _DYNAMIC_SUFFIX_VALUES]
+
+    rendered, ctx_data = _render(conn, _strict_settings(), tmp_path)
+    blob = json.dumps(ctx_data, default=str, ensure_ascii=False)
+    for _, folded, needle in _DYNAMIC_SUFFIX_VALUES:
+        assert folded in blob and folded in rendered
+        assert needle not in blob, needle
+        assert needle not in rendered, needle
+    assert "4719" not in blob and "4719" not in rendered

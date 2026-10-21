@@ -51,12 +51,15 @@ _FIXED_LAST_RESULTS = frozenset({
     NOT_SUBMITTED_LAST_RESULT, DUPLICATE_LAST_RESULT, "rejected_by_human",
     "expired", "invalidated", "commit_failed", "interrupted", "reported",
     "human_rejected", "human_noted", "human_reopened"})
-_FIXED_LAST_RESULT_PATTERNS = (
-    re.compile(r"observation:family_redirect:[a-z][a-z0-9_]{0,63}"),
-    re.compile(r"gate_failed:noop_copy_of:[a-z][a-z0-9_]{0,63}"),
-    re.compile(r"approval_pending:[0-9]{1,18}"),
-    re.compile(r"unsupported_in_plan10:risk_gate"),
+# 動的な suffix (承認番号・候補名・hash) を持つ値は、suffix を落として
+# この固定の語頭へ畳む。完全一致以外は通さない。
+_FOLDED_LAST_RESULT_PREFIXES = (
+    ("observation:family_redirect:", "observation:family_redirect"),
+    ("gate_failed:noop_copy_of:", "gate_failed:noop_copy"),
+    ("approval_pending:", "approval_pending"),
 )
+_FIXED_LAST_RESULTS = _FIXED_LAST_RESULTS | {
+    "unsupported_in_plan10:risk_gate"}
 # 自由文が続きうる語頭。語頭だけを残し、後ろは渡さない。
 _LAST_RESULT_TAGS = frozenset({
     "gate_failed", "report_failed", "mission_failed", "report", "approved",
@@ -86,9 +89,11 @@ def project_last_result(value: str | None) -> str | None:
         return (f"mission_diagnostic run_backtest={diag.group(1)} "
                 f"analyze_corr={diag.group(2)}")
     base = value.split(" ", 1)[0]
-    if base in _FIXED_LAST_RESULTS or any(
-            p.fullmatch(base) for p in _FIXED_LAST_RESULT_PATTERNS):
+    if base in _FIXED_LAST_RESULTS:
         return base
+    for prefix, folded in _FOLDED_LAST_RESULT_PREFIXES:
+        if base.startswith(prefix):
+            return folded
     tag = base.split(":", 1)[0]
     return tag if tag in _LAST_RESULT_TAGS else UNCLASSIFIED_LAST_RESULT
 
