@@ -38,7 +38,8 @@ def db_path(tmp_path):
 
 
 def make(db_path, **kw):
-    kw.setdefault("monotonic", Mono())
+    # busy の期限は注入した時計で測る。待つ test は進む時計を使う
+    kw.setdefault("monotonic", time.monotonic if kw.get("busy_retry_sec") else Mono())
     return TradeEventSink(db_path, wall_clock=lambda: WALL, **kw)
 
 
@@ -404,7 +405,7 @@ def test_busy_retry_is_bounded_by_the_deadline_even_with_long_backoff(db_path):
         holder.close()
 
 
-def test_stop_request_ends_the_busy_wait_as_shutdown_drop(db_path):
+def test_stop_request_keeps_retrying_busy_and_saves_when_released_within_the_budget(db_path):
     holder = connect(db_path)
     holder.execute("BEGIN IMMEDIATE")
     sink = make(db_path, busy_retry_sec=30.0, join_timeout=5.0)
@@ -412,14 +413,38 @@ def test_stop_request_ends_the_busy_wait_as_shutdown_drop(db_path):
     try:
         sink.submit("order_state_changed", "order:1", dict(FIELDS))
         time.sleep(0.15)
+        stopper = threading.Thread(target=sink.stop)
+        stopper.start()
+        time.sleep(0.2)
+        assert stopper.is_alive()  # 停止要求後も再試行を続けている
+        holder.rollback()
+        stopper.join(5)
+        assert not stopper.is_alive()
+    finally:
+        holder.close()
+    counters = sink.counters()
+    assert counters["shutdown_drop"] == 0 and counters["db_busy_drop"] == 0
+    assert len(rows(db_path, "order_state_changed")) == 1
+
+
+def test_busy_wait_is_abandoned_only_when_the_join_timeout_is_reached(db_path):
+    holder = connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    sink = make(db_path, busy_retry_sec=30.0, join_timeout=0.5)
+    sink.start()
+    try:
+        sink.submit("order_state_changed", "order:1", dict(FIELDS))
+        time.sleep(0.15)
         started = time.monotonic()
         sink.stop()
-        assert time.monotonic() - started < 2.0
+        elapsed = time.monotonic() - started
+        assert 0.4 <= elapsed < 3.0
+        assert wait_until(lambda: not sink._thread.is_alive())
     finally:
         holder.rollback()
         holder.close()
     counters = sink.counters()
-    assert counters["shutdown_drop"] == 1
+    assert counters["shutdown_drop"] == 1  # 二重に数えない
     assert counters["db_busy_drop"] == 0
     assert rows(db_path, "order_state_changed") == []
 

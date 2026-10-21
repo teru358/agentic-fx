@@ -119,7 +119,8 @@ def db_path(tmp_path):
 
 
 def make(db_path, **kw):
-    kw.setdefault("monotonic", Mono())
+    # busy の期限は注入した時計で測る。待つ test は進む時計を使う
+    kw.setdefault("monotonic", time.monotonic if kw.get("busy_retry_sec") else Mono())
     return TradeEventSink(db_path, wall_clock=lambda: WALL, **kw)
 
 
@@ -177,6 +178,77 @@ def test_locked_is_retried_like_busy(db_path):
     assert conn.execute("SELECT COUNT(*) FROM ops_events WHERE code='order_state_changed'"
                         ).fetchone()[0] == 1
     conn.close()
+
+
+@pytest.mark.parametrize("code", [261, 517, 262], ids=["busy_recovery", "busy_snapshot",
+                                                         "locked_sharedcache"])
+def test_extended_busy_codes_are_retried_like_busy(db_path, code):
+    assert code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    sink = make(db_path, busy_retry_sec=5.0)
+    sink._conn = connect(db_path)
+    real = sink._insert
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise sqlite_error(code, "database is busy")
+        return real(*a, **k)
+
+    sink._insert = flaky
+    sink._write((WALL.isoformat(), "order_state_changed", "order:1", dict(ORDER_FIELDS)))
+    assert len(calls) == 3
+    counters = sink.counters()
+    assert counters["db_busy_drop"] == 0 and counters["db_error_drop"] == 0
+    sink._conn.close()
+
+
+def test_extended_non_busy_code_is_still_an_error_without_retry(db_path):
+    sink = make(db_path, busy_retry_sec=5.0)
+    sink._conn = connect(db_path)
+    calls = []
+
+    def failing(*a, **k):
+        calls.append(1)
+        raise sqlite_error(sqlite3.SQLITE_IOERR_READ, "disk I/O error")
+
+    sink._insert = failing
+    sink._write((WALL.isoformat(), "order_state_changed", "order:1", dict(ORDER_FIELDS)))
+    assert len(calls) == 1
+    assert sink.counters()["db_error_drop"] == 1 and sink.counters()["db_busy_drop"] == 0
+    sink._conn.close()
+
+
+class Ticking:
+    """呼ぶたびに進む偽の単調時計。実時間は進めない。"""
+
+    def __init__(self, step):
+        self.t, self.step, self.calls = 1000.0, step, 0
+
+    def __call__(self):
+        self.calls += 1
+        self.t += self.step
+        return self.t
+
+
+def test_busy_deadline_is_measured_by_the_injected_monotonic_clock(db_path, monkeypatch):
+    monkeypatch.setattr(sink_mod, "backoff_sec", lambda attempt, rng=None: 0.0)
+    clock = Ticking(step=0.4)
+    sink = make(db_path, busy_retry_sec=1.0, monotonic=clock)
+    sink._conn = connect(db_path)
+    calls = []
+
+    def busy(*a, **k):
+        calls.append(1)
+        raise sqlite_error(sqlite3.SQLITE_BUSY, "database is locked")
+
+    sink._insert = busy
+    started = time.monotonic()
+    sink._write((WALL.isoformat(), "order_state_changed", "order:1", dict(ORDER_FIELDS)))
+    assert time.monotonic() - started < 0.5  # 実時間の 1 秒を待たない
+    assert sink.counters()["db_busy_drop"] == 1
+    assert 1 <= len(calls) <= 4
+    sink._conn.close()
 
 
 def test_non_busy_sqlite_error_is_dropped_without_retry(db_path):
