@@ -182,7 +182,7 @@ orders 行が無い gate 拒否は event にならない (非目標)。
    - daemon の emitter には settings の enable flag `notify.trade_events` (既定 true) を置く。false のとき `service.py` は observer も sink も起こさず、取引 event は一切出ない。これを止めることが「emitter を止める」と同値で、rollback の手段になる (§10.3)。`improve` 節と同じ流儀の optional key で、`config/settings.yaml.example` と同期する。
 3. observer は `(row, from_status, to_status)` から §3 の event を作り、sink の queue に非同期で渡す。作る関数は純粋で、DB を読むのは `missions.trigger` の 1 回だけ。**observer は flock もファイル I/O も一切しない。** transition は core_lock を保持したまま observer を呼ぶので、state ファイルの共有 flock を取る `StateStore.load()` を呼ぶと、state の writer が lock を持つ間は注文遷移全体が無期限に待つ。`state_mode` は service が**起動時に 1 回** state から読んだ値をメモリに持ち、それを observer に渡す (読めなかったときは None)。現物では稼働中に mode を変える経路は無い。将来 mode を変える経路ができたら、永続化が成功した後に同じメモリの値を更新する。`transition` の引数は増やさない (呼び出しが 25 か所以上あり、バックテストにも波及するため)。
 4. observer の中で起きた例外は握りつぶして warning を 1 行出し、`observer_error` に数える。transition の戻り値と DB の状態は変わらない。
-5. sink は専用の接続と書き込み thread を 1 本持つ。接続は `connect(db)` の後に **`PRAGMA busy_timeout=0`** を設定する。1 件ごとに、INSERT とその commit だけを行う短い tx にする (他の文を挟まない)。INSERT が `SQLITE_BUSY` / `SQLITE_LOCKED` の場合に限り、sink thread 内で短い backoff (5 ms 開始、指数で 50 ms 上限、±20% jitter) を挟み、単調時計で最大 1 秒まで再試行する。各待機の前後で停止要求を確認し、停止要求なら即 `shutdown_drop` に数える。期限を超えたら event を捨てて `db_busy_drop` に数える。observer と queue 投入は待たない。busy は INSERT より前に起きるので、再試行で重複は生じない。その他の DB の失敗は **再試行せず捨てる** (`db_error_drop`)。
+5. sink は専用の接続と書き込み thread を 1 本持つ。接続は `connect(db)` の後に **`PRAGMA busy_timeout=0`** を設定する。1 件ごとに、INSERT とその commit だけを行う短い tx にする (他の文を挟まない)。INSERT が `SQLITE_BUSY` / `SQLITE_LOCKED` の場合に限り、sink thread 内で短い backoff (5 ms 開始、指数で 50 ms 上限、±20% jitter) を挟み、単調時計で最大 1 秒まで再試行する。停止要求の後も join の期限 (項 8) までは再試行を続け、期限で放棄した 1 件は `shutdown_drop` に数える。期限を超えたら event を捨てて `db_busy_drop` に数える。observer と queue 投入は待たない。busy は INSERT より前に起きるので、再試行で重複は生じない。その他の DB の失敗は **再試行せず捨てる** (`db_error_drop`)。
 6. queue は有限 (1000)。溢れたら捨てて `queue_drop` に数える (注文処理を待たせない)。
 7. 欠落の記録:
    - 理由別の counter: `queue_drop`、`observer_error`、`db_busy_drop`、`db_error_drop`、`invalid_value_drop` (§3.3 で作らなかった event)、`worker_death`、`shutdown_drop`。
@@ -192,7 +192,7 @@ orders 行が無い gate 拒否は event にならない (非目標)。
    - **回復の規則。** 直近 60 秒 (単調時計) に drop が 1 件も無ければ `ok` とみなす。再 degraded と ok の通知は、状態が変わったときだけ 1 回出し、drop が続いている間に繰り返さない。
    - この component 状態は、既存の `HealthLatch` (process の生存中は回復しない) とは**別物**として持つ。`HealthLatch` を流用せず、既存の latch の意味は変えない。
    - 既存の `service_health_changed` は schema にあるが emit 箇所が無かった (§11)。本件はこの code を使う最初の emit 箇所になる。
-8. worker は daemon thread 任せにせず、service が所有する資源とする。停止時は queue を排出し、最大 5 秒で join する。排出が終わらなければ残りを `shutdown_drop` に数えて停止を続ける。worker が死んだら `worker_death` を立て、以降の event は `queue_drop` に数える (自動再起動はしない)。
+8. worker は daemon thread 任せにせず、service が所有する資源とする。停止時は queue を排出し、最大 5 秒で join する。排出が終わらなければ残りを `shutdown_drop` に数えて停止を続ける。期限の時点で worker が書込み中の 1 件は保存を確かめられないので `shutdown_drop` に数え、worker 側と二重には数えない。直後に commit が終わっていることがあるため、`shutdown_drop` は「保存を確認できなかった件数」の上限であり、過少には数えない。worker が死んだら `worker_death` を立て、以降の event は `queue_drop` に数える (自動再起動はしない)。
 
 core_lock を保持したまま別接続に INSERT すると待ち得る。sink を別 thread にするのは、`defer_notifications` が lock の外で送る理由 (`executor.py:240-283`) と同じ考えである。
 
@@ -503,3 +503,4 @@ rollback は逆順で、**必ず daemon の emitter を止めてから afx-ops �
 | 2026-10-20 | v1.0 | ユーザー裁定 5 問を反映して清書。§8.1 を決定の記録に (問 1 今から、問 2 設定で切り替え・既定 `absolute`、問 3 notify は既定 OFF の opt-in、問 4 全部が既定、問 5 mention なし)。bot 用 `ops.toml` に `trade_amounts`、notify 用 `ops.toml` に `trade_events` を足し、`trade_notices` に `results` を足して `fills_closes` を filled と決済だけに改めた。条件分岐の記述を決定後の文に書き換え、v4 `{0,0}` の migration を旧版の記述 (§8.3 (c)、AC-25、§10.1) と整合させた。関連チケットを §0 に追記。AC-20 / 23 / 24 の範囲で追記 | ユーザー裁定 (2026-10-20) | |
 | 2026-10-20 | v1.0a | notify 用 key を `deliver_trade_events` に改名 (settings の `notify.trade_events` との衝突回避)、T0 が配備前提なので暫定既定を削除、`fills_closes` = filled + 決済 (rejected は `results` 側) | 清書時の指揮者判断 | |
 | 2026-10-21 | v1.1 | sink の busy 再試行を最大 1 秒 (backoff 5〜50 ms、±20% jitter、停止要求で中断) に改訂し、既定で有効にした (§4.2、§4.5、AC-14(a))。core 側の待ちの増加は §4.5 の残余リスクとして A/B 実測を付けて記録 | T2 の実測で、再試行なしは lock 競合で 26〜50% の event を既知のまま捨てるため。外部契約 (best-effort、発注は sink に同期しない) は不変の技術改訂 | |
+| 2026-10-21 | v1.1a | 停止要求の後も join の期限までは busy 再試行を続ける (v1.1 の「停止要求で中断」を改める)。期限で放棄した書込み中の 1 件は `shutdown_drop` に 1 回だけ数え、この counter は「保存を確認できなかった件数」の上限と定義 (§4.2 項 5・8) | 停止直前の event を不要に捨てないため。commit の完了と放棄の判定は原子的にできないので、過少でなく過大に数える側に倒す | |

@@ -293,7 +293,12 @@ class TradeEventSink:
     # ---- 停止 ---------------------------------------------------------------
 
     def stop(self) -> None:
-        """queue を排出して最大 `join_timeout` 秒で止める。残りは shutdown_drop に数える。"""
+        """queue を排出して最大 `join_timeout` 秒で止める。残りは shutdown_drop に数える。
+
+        時間切れの時点で worker が抱えている 1 件は、保存を確かめられないので shutdown_drop に
+        数える。その直後に worker の commit が終わっていることがあり、この counter は
+        「保存を確認できなかった件数」の上限として読む (取りこぼしを過少に数えない側に倒す)。
+        """
         self._stopping.set()
         thread = self._thread
         if thread is not None:
