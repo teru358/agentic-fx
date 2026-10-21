@@ -2369,6 +2369,9 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
     if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
         busy.add("conn_core")
         busy.add("conn_signal")
+        # 残った thread が遷移を起こし得る間は observer と sink を外さない (event を無記録にしない)。
+        busy.add("trade_event_observer")
+        busy.add("trade_event_sink")
         # レビュー2周目 codex Critical: `instance_lock` は単なる close 対象
         # ではなく**残存 App 全体の単一起動所有権**を表す。残存スレッドが
         # 旧 App の DB/broker/runner を使っているのに flock を解放すると、

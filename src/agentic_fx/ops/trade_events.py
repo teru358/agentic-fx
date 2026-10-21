@@ -185,12 +185,17 @@ def origin_code(trigger: object) -> str | None:
 
 
 def held_seconds(filled_at: object, closed_at: object) -> int | None:
-    if not isinstance(filled_at, str) or not isinstance(closed_at, str):
+    """保有秒。どちらかが NULL なら None。NULL でないのに読めない値は InvalidValue。"""
+    if filled_at is None or closed_at is None:
         return None
+    if type(filled_at) is not str or type(closed_at) is not str:
+        raise InvalidValue("held_sec")
     try:
         delta = datetime.fromisoformat(closed_at) - datetime.fromisoformat(filled_at)
-    except (ValueError, TypeError):
-        return None
+    except ValueError:
+        raise InvalidValue("held_sec") from None
+    except TypeError:
+        return None  # naive と aware の混在は比べられない
     return max(0, int(delta.total_seconds()))
 
 

@@ -56,6 +56,17 @@ def test_held_seconds_floors_fractions_and_ignores_naive_aware_mix():
                                      "2026-10-20T00:00:59+00:00") is None
 
 
+def test_unparsable_non_null_timestamp_is_an_invalid_value_not_none():
+    for bad in ("not-a-time", 123, b"2026-10-20T00:00:00+00:00"):
+        with pytest.raises(trade_events.InvalidValue):
+            build("closed", filled_at=bad)
+        with pytest.raises(trade_events.InvalidValue):
+            build("closed", closed_at=bad)
+    # NULL は従来どおり held_sec None のまま event を作る
+    assert build("closed", filled_at=None)[2]["held_sec"] is None
+    assert build("closed", closed_at=None)[2]["held_sec"] is None
+
+
 def test_close_event_without_stop_loss_keeps_the_event_with_r_none():
     code, ref, fields = build("closed", stop_loss=None)
     assert code == "position_closed" and ref == "order:7"
