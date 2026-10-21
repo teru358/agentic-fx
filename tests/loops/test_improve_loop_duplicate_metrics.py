@@ -176,13 +176,10 @@ def test_second_candidate_with_matching_metrics_becomes_observation(
         "SELECT status, last_result FROM improvement_backlog "
         "ORDER BY id DESC LIMIT 1").fetchone()
     assert backlog_row[0] == "observation"
-    assert f"duplicate_metrics_of:{content_hash_a}" in backlog_row[1]
-
-    # T-A 検証節 pin: system note の文面に具体パラメータ (fast=/slow= 等)
-    # を出さない — note に埋め込まれるのは content_hash のみで、候補の
-    # plugin.py 由来のパラメータ文字列は現れない。
-    assert "variant b" not in backlog_row[1]
-    assert "params" not in backlog_row[1]
+    # agent 面の `last_result` は固定文言だけ。一致した候補の hash や
+    # パラメータは入らない (詳細は activity の `quality_demoted`)。
+    assert backlog_row[1] == "observation:duplicate"
+    assert content_hash_a not in backlog_row[1]
 
 
 def test_candidate_with_different_metrics_still_reaches_approval(
