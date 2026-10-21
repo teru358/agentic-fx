@@ -243,6 +243,22 @@ def test_ac15b_status_carries_the_seven_counters_only(tmp_path):
         app.close()
 
 
+def test_drop_reason_names_live_in_one_place_and_status_shows_every_sink_counter(tmp_path):
+    from agentic_fx.ops import trade_events
+    assert COUNTERS is trade_events.DROP_REASONS
+    assert client.DROP_REASONS is trade_events.DROP_REASONS
+    sink = TradeEventSink(tmp_path / "t.db", wall_clock=lambda: datetime(2026, 10, 20),
+                          monotonic=lambda: 1000.0)
+    for reason in sink.counters():
+        sink.record_drop(reason)
+    text = client.format_status({"trade_events": sink.counters()})
+    line = next(line for line in text.splitlines() if line.startswith("取引 event"))
+    assert set(sink.counters()) == set(trade_events.DROP_REASONS)
+    assert [part.split("=")[0] for part in line.split(": ", 1)[1].split()] == list(
+        trade_events.DROP_REASONS)
+    assert all(part.endswith("=1") for part in line.split(": ", 1)[1].split())
+
+
 def test_ac15b_format_status_shows_counts_and_nothing_else():
     counters = {**dict.fromkeys(COUNTERS, 0), "queue_drop": 3, "db_busy_drop": 12}
     text = client.format_status({"trade_events": counters})

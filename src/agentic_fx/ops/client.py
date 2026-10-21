@@ -40,6 +40,7 @@ from . import change_limits, keys, redactor
 from .contracts import Principal
 from .events import EventCursor, EventPage
 from .tail import ACTIVITY_CATEGORIES
+from .trade_events import DROP_REASONS
 
 RC_OK = 0
 RC_FAILED = 1
@@ -616,11 +617,6 @@ def _deploy_ops_lines(section) -> list[str]:
     return lines
 
 
-# daemon の sink が数える欠落の理由 (sink 側の `COUNTERS` と同じ順。名前は固定で、文言は載せない)
-_TRADE_EVENT_COUNTERS = ("queue_drop", "observer_error", "db_busy_drop", "db_error_drop",
-                         "invalid_value_drop", "worker_death", "shutdown_drop")
-
-
 def format_status(data: dict) -> str:
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
@@ -652,7 +648,7 @@ def format_status(data: dict) -> str:
     trade_events = data.get("trade_events")
     if isinstance(trade_events, dict):
         lines.append("取引 event の欠落: " + " ".join(
-            f"{name}={_num(trade_events.get(name))}" for name in _TRADE_EVENT_COUNTERS))
+            f"{name}={_num(trade_events.get(name))}" for name in DROP_REASONS))
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     setup = data.get("setup")
     record_state = setup.get("record_state") if isinstance(setup, dict) else None

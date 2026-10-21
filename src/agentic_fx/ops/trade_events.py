@@ -19,6 +19,10 @@ ORDER_CODE = "order_state_changed"
 CLOSE_CODE = "position_closed"
 TRADE_CODES = frozenset({ORDER_CODE, CLOSE_CODE})
 
+# sink が数える欠落の理由。`afx ctl status` の表示もこの並びを使う (名前は固定で文言は載せない)。
+DROP_REASONS = ("queue_drop", "observer_error", "db_busy_drop", "db_error_drop",
+                "invalid_value_drop", "worker_death", "shutdown_drop")
+
 ORDER_FIELDS = frozenset({"state", "pair", "side", "entry_type", "qty", "price", "sl", "tp",
                           "origin_code", "mode", "state_mode", "reason_code"})
 CLOSE_FIELDS = frozenset({"pair", "side", "qty", "entry_price", "close_price", "pnl", "ccy",

@@ -31,8 +31,7 @@ from .events import EventSchemaError, validate_fields
 
 _log = logging.getLogger(__name__)
 
-COUNTERS = ("queue_drop", "observer_error", "db_busy_drop", "db_error_drop",
-            "invalid_value_drop", "worker_death", "shutdown_drop")
+COUNTERS = trade_events.DROP_REASONS
 COMPONENT_CODE = "trade_event_sink"
 RECOVERY_SEC = 60.0
 WARNING_INTERVAL_SEC = 60.0
