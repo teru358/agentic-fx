@@ -437,7 +437,10 @@ def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime
                   archive_max_bytes: int | None = None,
                   archive_max_missions: int | None = None) -> None:
     """版 dir などを消す掃除も配備操作の一つなので、配備ガードを共有で取った
-    内側で行う (質検査が母集団を確定している間は待つ)。"""
+    内側で行う (質検査が母集団を確定している間は待つ)。plugins/ が無ければ
+    掃除する物も無いので何も作らない。"""
+    if not plugins_root.is_dir():
+        return
     with deploy_guard(plugins_root, exclusive=False):
         _sweep_orphans_locked(
             conn, plugins_root=plugins_root, now=now, activity=activity,

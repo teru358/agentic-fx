@@ -183,3 +183,10 @@ def test_plugin_locks_reject_an_invalid_name_before_creating_the_guard(
         with switch._plugin_locks(root, ["alpha", "../evil"]):
             pass
     assert not switch.deploy_guard_path(root).exists()
+
+
+def test_sweep_orphans_creates_nothing_when_plugins_root_is_absent(tmp_path):
+    _, conn = _env(tmp_path)
+    root = tmp_path / "no_plugins"
+    switch.sweep_orphans(conn, plugins_root=root, now=_NOW)
+    assert not root.exists()
