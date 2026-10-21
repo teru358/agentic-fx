@@ -432,11 +432,25 @@ def _archive_dir_size(path: Path) -> int:
     return total
 
 
-# precheck 2026-08-22 wave2: T11-B2
 def sweep_orphans(conn: sqlite3.Connection, *, plugins_root: Path, now: datetime,
                   activity: "ActivityLog | None" = None,
                   archive_max_bytes: int | None = None,
                   archive_max_missions: int | None = None) -> None:
+    """版 dir などを消す掃除も配備操作の一つなので、配備ガードを共有で取った
+    内側で行う (質検査が母集団を確定している間は待つ)。"""
+    with deploy_guard(plugins_root, exclusive=False):
+        _sweep_orphans_locked(
+            conn, plugins_root=plugins_root, now=now, activity=activity,
+            archive_max_bytes=archive_max_bytes,
+            archive_max_missions=archive_max_missions)
+
+
+# precheck 2026-08-22 wave2: T11-B2
+def _sweep_orphans_locked(
+        conn: sqlite3.Connection, *, plugins_root: Path, now: datetime,
+        activity: "ActivityLog | None" = None,
+        archive_max_bytes: int | None = None,
+        archive_max_missions: int | None = None) -> None:
     """§5.3 起動時 reconcile ①〜⑦ (journal-first の後に呼ぶこと)。B-2 是正:
     activity 記録は journal_store 層 (非実在の `record_activity_error`) では
     なく、呼び出し元であるこの関数が直接 `activity.write` する (層違反の
@@ -1054,11 +1068,20 @@ def _plugin_locks(plugins_root: Path, names, *, deadline: float | None = None,
     """
     if _plugin_lock_owner_guard is not None:
         _plugin_lock_owner_guard()
+    ordered = sorted(set(names))
+    for name in ordered:
+        if not (isinstance(name, str)
+                and loader._PLUGIN_NAME_RE.fullmatch(name)):
+            raise ValueError(f"invalid plugin name for lock: {name!r}")
     with contextlib.ExitStack() as stack:
         bounded = _bounded_lock_kwargs(deadline, stop_event)
-        for name in sorted(set(names)):
+        # 配備ガードは名前の数によらず共有で 1 回だけ取り、その内側で名前 lock を
+        # 昇順に取る。
+        stack.enter_context(deploy_guard(plugins_root, exclusive=False,
+                                         **bounded))
+        for name in ordered:
             # 2 個目以降で期限切れになっても、ExitStack が取得済みの lock を解放する。
-            stack.enter_context(_plugin_lock(plugins_root, name, **bounded))
+            stack.enter_context(_plugin_name_lock(plugins_root, name, **bounded))
         yield
 
 
@@ -2177,31 +2200,33 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                     f"approval_id={row['id']}: plugin payload に name が "
                     "無く契約違反のため expire を実行せず pending 留置")
             continue
-        lock_path = plugin_lock_path(plugins_root, name)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "w") as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            try:
-                if journal_store.get_open_by_name(conn, name) is not None:  # B-2: 現物名
-                    # 未完ジャーナルあり → 今回はスキップ、次回再試行
-                    continue
-                # 他プロセスが flock 待ちの間に既に決定済みかもしれない
-                # (二重呼び出し・並行 approve など) — 再確認してから決定する
-                current = conn.execute(
-                    "SELECT status, expires_at FROM approval_requests WHERE id=?",
-                    (row["id"],)).fetchone()
-                if current is None or current["status"] != "pending":
-                    continue
-                if current["expires_at"] is None or current["expires_at"] >= now.isoformat():
-                    continue  # 期限が (並行更新等で) もはや到来していない
-                approvals_store.apply_decision(
-                    conn, row["id"], status="expired", decided_by="system",
-                    now=now, reason="expired", commit=True)
-                # I1 是正: 終端決定 (expired) の tx 直後に staging 候補を
-                # 削除する (§5.1 手順 3)。
-                _drop_staging_candidate(plugins_root, payload, activity=activity)
-            finally:
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+        if not (isinstance(name, str) and loader._PLUGIN_NAME_RE.fullmatch(name)):
+            if activity is not None:
+                activity.write(
+                    Category.APPROVAL,
+                    "expire_skipped_payload_missing_name",
+                    f"approval_id={row['id']}: plugin payload の name が "
+                    "不正で expire を実行せず pending 留置")
+            continue
+        with _plugin_lock(plugins_root, name):
+            if journal_store.get_open_by_name(conn, name) is not None:  # B-2: 現物名
+                # 未完ジャーナルあり → 今回はスキップ、次回再試行
+                continue
+            # 他プロセスが flock 待ちの間に既に決定済みかもしれない
+            # (二重呼び出し・並行 approve など) — 再確認してから決定する
+            current = conn.execute(
+                "SELECT status, expires_at FROM approval_requests WHERE id=?",
+                (row["id"],)).fetchone()
+            if current is None or current["status"] != "pending":
+                continue
+            if current["expires_at"] is None or current["expires_at"] >= now.isoformat():
+                continue  # 期限が (並行更新等で) もはや到来していない
+            approvals_store.apply_decision(
+                conn, row["id"], status="expired", decided_by="system",
+                now=now, reason="expired", commit=True)
+            # I1 是正: 終端決定 (expired) の tx 直後に staging 候補を
+            # 削除する (§5.1 手順 3)。
+            _drop_staging_candidate(plugins_root, payload, activity=activity)
 
 
 def bless_candidate(
