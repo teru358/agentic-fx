@@ -211,12 +211,13 @@ def _recorded_live(conn: sqlite3.Connection) -> dict[str, str]:
 
 
 def deployed_from_live(conn: sqlite3.Connection, file_population: FilePopulation
-                       ) -> tuple[Population, list[str], str | None]:
+                       ) -> tuple[Population, list[str] | None, str | None]:
     """配備ガードを排他で持ったまま、tx の中で配備済み母集団を確定する。
     母集団の正は live のファイルの状態で、DB の履歴からは復元しない。
     切替が途中 (未完了の記録がある) なら第 3 戻り値に理由を返す。DB の最後の
     記録と live が食い違う名前は人の直接操作として第 2 戻り値に返す
-    (母集団は live のまま採用する)。"""
+    (母集団は live のまま採用する)。記録が読めず食い違いを調べられないときは
+    第 2 戻り値が `None`。"""
     in_flight = _in_flight_deploy_ops(conn)
     if in_flight:
         return Population(), [], "deploy_operation_in_flight"
@@ -229,7 +230,12 @@ def deployed_from_live(conn: sqlite3.Connection, file_population: FilePopulation
     drift: list[str] = []
     live_state = file_population.live_state
     if live_state is not None:
-        for name, expected in _recorded_live(conn).items():
+        try:
+            recorded = _recorded_live(conn)
+        except (ValueError, KeyError, TypeError):
+            # 検出は助言的: 記録が読めなければ drift 検出だけを諦める。
+            return file_population.deployed, None, None
+        for name, expected in recorded.items():
             if live_state.get(name, "absent") != expected:
                 drift.append(name)
     return file_population.deployed, drift, None

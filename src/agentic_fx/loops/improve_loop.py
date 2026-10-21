@@ -2652,10 +2652,14 @@ class ImproveLoop:
           比較対象 1 行の破損 → warning を残してその行だけ外す、比較基盤が
           全部使えない → `gate_failed`。
 
-        候補の staging が無い・比較対象のファイル群が無い呼び出し (単体の
-        直接呼び出し) では段 L・F を行わず、段 M だけを行う。"""
+        比較対象のファイル群が無い呼び出し (単体の直接呼び出し) では段 L・F を
+        行わず、段 M だけを行う。比較対象があるのに候補の staging が無いときは
+        質検査の不能として `gate_failed` にする。"""
         flags: tuple[str, ...] = ()
-        if file_population is not None and candidate.candidate_dir is not None:
+        if file_population is not None:
+            if candidate.candidate_dir is None:
+                return self._quality_unavailable(
+                    mission_id, "candidate_dir_missing")
             if candidate.logic_hash is None:
                 return self._quality_rejection(
                     "gate_failed",
@@ -2664,50 +2668,37 @@ class ImproveLoop:
             try:
                 archive = improve_quality.load_archive(
                     conn, mission_id=mission_id)
-            except sqlite3.Error as exc:
-                self._write_quality_activity(
-                    "quality_check_unavailable",
-                    f"mission={mission_id} reason=archive_read_failed:"
-                    f"{type(exc).__name__}")
-                return self._quality_rejection(
-                    "gate_failed",
-                    detail="comparison_base_unavailable")
+            except (sqlite3.Error, ValueError, OSError) as exc:
+                return self._quality_unavailable(
+                    mission_id, f"archive_read_failed:{type(exc).__name__}")
             if file_population.unavailable is not None:
-                self._write_quality_activity(
-                    "quality_check_unavailable",
-                    f"mission={mission_id} "
-                    f"reason={file_population.unavailable}")
-                return self._quality_rejection(
-                    "gate_failed", detail="comparison_base_unavailable")
+                return self._quality_unavailable(
+                    mission_id, file_population.unavailable)
             try:
                 deployed, drift, unavailable = (
                     improve_quality.deployed_from_live(conn, file_population))
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, ValueError, OSError) as exc:
                 deployed, drift, unavailable = None, [], (
                     f"deploy_state_read_failed:{type(exc).__name__}")
             if unavailable is not None:
+                return self._quality_unavailable(mission_id, unavailable)
+            if drift is None:
                 self._write_quality_activity(
-                    "quality_check_unavailable",
-                    f"mission={mission_id} reason={unavailable}")
-                return self._quality_rejection(
-                    "gate_failed", detail="comparison_base_unavailable")
-            for drifted in drift:
+                    "quality_population_drift_unreadable",
+                    f"mission={mission_id}", mission_id)
+            for drifted in drift or ():
                 self._write_quality_activity(
                     "quality_population_drift",
-                    f"mission={mission_id} name={drifted}")
+                    f"mission={mission_id} name={drifted}", mission_id)
             populations = (deployed, file_population.examples, archive)
             for population in populations:
                 for skipped in population.skipped:
                     self._write_quality_activity(
                         "quality_row_skipped",
-                        f"mission={mission_id} row={skipped}")
+                        f"mission={mission_id} row={skipped}", mission_id)
             if improve_quality.base_unavailable(*populations):
-                self._write_quality_activity(
-                    "quality_check_unavailable",
-                    f"mission={mission_id} reason=no_usable_comparison_row")
-                return self._quality_rejection(
-                    "gate_failed",
-                    detail="comparison_base_unavailable")
+                return self._quality_unavailable(
+                    mission_id, "no_usable_comparison_row")
             duplicate = improve_quality.find_duplicate_logic(
                 name=candidate.name, logic_hash=candidate.logic_hash,
                 populations=populations)
@@ -2732,22 +2723,31 @@ class ImproveLoop:
         return _QualityVerdict(flags=flags)
 
     @staticmethod
-    def _quality_rejection(outcome: str, *, detail: str,
-                           redirect_to: str | None = None) -> _QualityVerdict:
+    def _quality_rejection(outcome: str, *, detail: str) -> _QualityVerdict:
         """agent 面の `reason` は固定語彙だけ。同一ロジック・同一成績は
         `duplicate`、同一性や比較の根拠が作れなかったときは
-        `not_submitted`、仮説族の誘導は `family_redirect:<配備名>`。"""
-        if outcome == "family_redirect":
-            reason = f"family_redirect:{redirect_to}"
-        elif outcome in ("duplicate_logic", "duplicate_metrics"):
+        `not_submitted`。"""
+        if outcome in ("duplicate_logic", "duplicate_metrics"):
             reason = "duplicate"
         else:
             reason = "not_submitted"
         return _QualityVerdict(outcome=outcome, reason=reason, detail=detail)
 
-    def _write_quality_activity(self, event: str, summary: str) -> None:
+    def _quality_unavailable(self, mission_id: int,
+                             reason: str) -> _QualityVerdict:
+        """比較の根拠が作れなかった: 原因は activity にだけ残し、agent 面には
+        固定語彙の `gate_failed` を返す。"""
+        self._write_quality_activity(
+            "quality_check_unavailable",
+            f"mission={mission_id} reason={reason}", mission_id)
+        return self._quality_rejection(
+            "gate_failed", detail="comparison_base_unavailable")
+
+    def _write_quality_activity(self, event: str, summary: str,
+                                mission_id: int) -> None:
         if self._activity is not None:
-            self._activity.write(Category.IMPROVE, event, summary)
+            self._activity.write(
+                Category.IMPROVE, event, summary, str(mission_id))
 
     def _deployed_dir_for(self, name, *, inventory) -> "Path | None":
         """`inventory.phase1_metas` のうち同名 strategy の `meta.path`。
@@ -2769,13 +2769,17 @@ class ImproveLoop:
                           ledger_entries=(), gate_rows=(), ctx=None,
                           tool_calls: int | None = None,
                           final_candidate: "_FinalCandidate | None" = None,
+                          file_quality: bool = True,
                           ) -> _QualityVerdict | None:
         """10.10 Step 3: Tx-2 本体 (台帳→gate→approval→finish)。
 
         戻り値: 質検査 (段 L・F・M) が候補を降格・拒否したときは
         `_QualityVerdict` を返す (この場合、内側 tx は既に rollback 済み
         — 呼び出し元 `commit()` が observation 経路へ再ルートする)。通常の
-        approval 終端では `None` を返す。"""
+        approval 終端では `None` を返す。
+
+        `file_quality=False` は配備済み・example のファイルを比較対象にしない
+        単体テスト用の明示指定 (段 M だけを行う)。実 run は常に True。"""
         from agentic_fx.store import approvals as approvals_store
         from agentic_fx.store import missions as missions_store
 
@@ -2816,10 +2820,10 @@ class ImproveLoop:
                     created_archive_path = submitted_archive_path
             # 配備済み・example の比較対象は、書き込みロックを持つ前にファイル
             # から組み立てる (tx の中ではファイルを触らない)。
-            # 母集団の確定から tx の終わりまで、配備操作と排他になる (取得順は
-            # ガード → DB。配備操作側も同じ順)。
+            # 母集団の確定から最終行の commit まで、配備操作と排他になる
+            # (取得順はガード → DB。配備操作側も同じ順)。
             file_population = None
-            if ctx is not None:
+            if ctx is not None and file_quality:
                 from agentic_fx.plugin import switch as plugin_switch
                 try:
                     guard_stack.enter_context(plugin_switch.deploy_guard(
@@ -2828,13 +2832,9 @@ class ImproveLoop:
                         + improve_quality.DEPLOY_GUARD_TIMEOUT_S))
                 except (plugin_switch.PluginBusyError, OSError) as exc:
                     self._remove_created_archive(created_archive_path)
-                    self._write_quality_activity(
-                        "quality_check_unavailable",
-                        f"mission={mission_id} "
-                        f"reason=deploy_guard_unavailable:"
-                        f"{type(exc).__name__}")
-                    return self._quality_rejection(
-                        "gate_failed", detail="comparison_base_unavailable")
+                    return self._quality_unavailable(
+                        mission_id,
+                        f"deploy_guard_unavailable:{type(exc).__name__}")
                 file_population = self._load_quality_population(ctx)
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2939,6 +2939,9 @@ class ImproveLoop:
                 conn.rollback()
                 self._remove_created_archive(created_archive_path)
                 raise
+            # 母集団に依存するのは commit までで、以降の処理は別 slot を
+            # 待たせないよう排他ガードを先に放す。
+            guard_stack.close()
             # 成功系 activity は commit 成功後に書く (1 周目 F2、3 モデル
             # 一致): tx 前に書くと rollback しても「成功」が activity に残る。
             # 失敗系が tx 前に書くのは痕跡を残す意図で、成功系とは逆。
@@ -3368,7 +3371,7 @@ class ImproveLoop:
                     self._write_quality_activity(
                         "quality_demoted",
                         f"mission={ctx.mission_id} outcome={demotion.outcome} "
-                        f"{demotion.detail}")
+                        f"{demotion.detail}", ctx.mission_id)
                     self._finalize_report_or_observation(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
                         report_path=None,

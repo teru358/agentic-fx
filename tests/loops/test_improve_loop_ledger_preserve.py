@@ -370,7 +370,7 @@ def test_finalize_success_persists_outcome_approval(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
@@ -402,7 +402,7 @@ def test_finalize_success_payload_counts_exclude_error_entries(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     import json as _json
     row = conn.execute(
@@ -743,7 +743,7 @@ def test_finalize_success_begin_failure_still_runs_compensation(
         _FlakyBegin(conn), mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
     assert conn.execute(
         "SELECT status FROM missions WHERE id=?",
         (mission_id,)).fetchone()["status"] == "failed", (
@@ -774,7 +774,7 @@ def test_finalize_success_fails_tx2_when_ledger_persistence_fails(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     assert conn.execute(
         "SELECT count(*) FROM approval_requests").fetchone()[0] == 0, (

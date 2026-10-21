@@ -1113,3 +1113,139 @@ def test_concurrent_same_logic_candidates_only_one_reaches_approval(
         "WHERE name IN ('race_a', 'race_b') AND outcome_class != "
         "'not_submitted'"))
     assert outcomes == ["duplicate_logic", "pending"]
+
+
+# --- 質検査の失敗の扱いと排他ガードの範囲 -------------------------------------
+
+def _activity_lines(root, event):
+    return [line.split("\t") for line in _activity(root).splitlines()
+            if f"\t{event}\t" in line]
+
+
+def test_a_real_run_without_a_candidate_dir_is_gate_failed_not_skipped(
+        improve_env):
+    """比較対象のファイル群がある実 run で候補の staging が無いなら、段 L・F を
+    飛ばして通さず、質検査は不能として降格する。"""
+    app, root = improve_env
+    conn = app.conn_core
+    from agentic_fx.loops.improve_loop import _FinalCandidate
+    loop = ImproveLoop(
+        root=root, settings=app.settings, clock=app.clock,
+        db_write_conn_factory=lambda: conn,
+        db_readonly_conn_factory=lambda: conn,
+        activity=app.activity, rag=app.rag)
+    candidate = _FinalCandidate(
+        name="cand", content_hash="c" * 64, artifact_hash="d" * 64,
+        pair="USDJPY", logic_hash=_hash_of(PY_X), family_key=None,
+        candidate_dir=None)
+    verdict = loop._check_candidate_quality(
+        conn, {"kind": "strategy", "name": "cand"}, candidate=candidate,
+        mission_id=77, inventory=None, staging_dir=None,
+        file_population=quality.FilePopulation(
+            deployed=quality.Population(), examples=quality.Population()))
+    assert verdict.outcome == "gate_failed"
+    assert verdict.reason == "not_submitted"
+    lines = _activity_lines(root, "quality_check_unavailable")
+    assert lines and "reason=candidate_dir_missing" in lines[-1][3]
+    assert lines[-1][4] == "77"
+
+
+def test_quality_activities_carry_the_mission_id_as_ref_id(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    bad = _decided_row(conn, name="broken", logic_hash="garbage",
+                       outcome="rejected_by_human")
+    _record_deploy(conn, root, "other", py=PY_Y)
+    _remove_live(root, "other")
+    _place_plain(root, "other", py=PY_Z)
+    loop, ctx, seeded = _run_strategy(app, root, "cand")
+    for event in ("quality_row_skipped", "quality_population_drift"):
+        lines = _activity_lines(root, event)
+        assert lines, event
+        assert all(line[4] == str(ctx.mission_id) for line in lines), event
+
+    def broken(conn_, *, mission_id):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with patch.object(quality, "load_archive", broken):
+        loop, ctx, seeded = _run_strategy(app, root, "cand2", py=PY_Y)
+    lines = _activity_lines(root, "quality_check_unavailable")
+    assert lines and lines[-1][4] == str(ctx.mission_id)
+
+
+def test_a_deploy_guard_failure_activity_carries_the_mission_id(
+        improve_env, monkeypatch):
+    import threading
+    app, root = improve_env
+    monkeypatch.setattr(quality, "DEPLOY_GUARD_TIMEOUT_S", 0.3)
+    held, release = threading.Event(), threading.Event()
+    threads = []
+
+    def start(loop, ctx):
+        threads.append(_hold_deploy_lock(root, held=held, release=release))
+        assert held.wait(5)
+
+    try:
+        loop, ctx, seeded = _run_strategy(
+            app, root, "cand", before_commit=start)
+    finally:
+        release.set()
+    threads[0].join(10)
+    lines = _activity_lines(root, "quality_check_unavailable")
+    assert lines and lines[-1][4] == str(ctx.mission_id)
+
+
+def test_an_unreadable_drift_record_gives_up_only_drift_detection(
+        improve_env):
+    """配備の記録の時刻が壊れていても、drift 検出だけを諦めて質検査は続く。
+    例外は tx の外へ逃げず、mission は failed にならない。"""
+    from agentic_fx.store import plugin_deploy_ops as deploy_store
+    app, root = improve_env
+    conn = app.conn_core
+    _record_deploy(conn, root, "other", py=PY_Y)
+
+    def broken(conn_, name):
+        raise ValueError("Invalid isoformat string: 'garbage'")
+
+    with patch.object(deploy_store, "plugin_live_history", broken):
+        loop, ctx, seeded = _run_strategy(app, root, "cand")
+    _expect_rows(conn, ctx, seeded, "pending")
+    lines = _activity_lines(root, "quality_population_drift_unreadable")
+    assert lines and lines[-1][4] == str(ctx.mission_id)
+
+
+def test_the_unavailable_helper_is_the_only_place_that_writes_that_event():
+    import inspect
+    from agentic_fx.loops import improve_loop
+    source = inspect.getsource(improve_loop.ImproveLoop)
+    assert source.count('"quality_check_unavailable"') == 1
+
+
+def test_the_deploy_guard_is_released_before_the_post_commit_work(
+        improve_env):
+    """commit 後の処理 (台帳の確定など) は母集団に依存しないので、その間は
+    別 slot が排他ガードを取れる。"""
+    from agentic_fx.plugin import switch
+    app, root = improve_env
+    seen = {}
+    original = ImproveLoop._settle_ledger_after_commit
+
+    def probe(self, *a, **kw):
+        try:
+            with switch.deploy_guard(
+                    root / "plugins", exclusive=True,
+                    deadline=__import__("time").monotonic() + 0.5):
+                seen["acquired"] = True
+        except (switch.PluginBusyError, OSError):
+            seen["acquired"] = False
+        return original(self, *a, **kw)
+
+    with patch.object(ImproveLoop, "_settle_ledger_after_commit", probe):
+        loop, ctx, seeded = _run_strategy(app, root, "cand")
+    assert seen == {"acquired": True}
+
+
+def test_family_redirect_is_not_produced_by_the_quality_check():
+    import inspect
+    assert "redirect_to" not in inspect.signature(
+        ImproveLoop._quality_rejection).parameters

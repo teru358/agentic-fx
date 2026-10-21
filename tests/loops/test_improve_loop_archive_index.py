@@ -452,7 +452,7 @@ def test_finalize_success_writes_index_row_for_approval(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     text = _index_path(loop_min).read_text()
     assert f"mission {mission_id}" in text
@@ -475,7 +475,7 @@ def test_finalize_success_index_row_matches_other_terminal_columns(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     text = _index_path(loop_min).read_text()
     assert text.count("| date | mission | status | candidates | best | "
@@ -500,7 +500,7 @@ def test_finalize_success_index_header_notes_it_is_a_terminal_log(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     text = _index_path(loop_min).read_text()
     assert "終端ログ (GC 非対象)。承認可否の目録ではない。" in text
@@ -534,7 +534,7 @@ def test_finalize_success_writes_no_approval_index_row_when_mark_persisted_raise
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     index_path = _index_path(loop_min)
     text = index_path.read_text() if index_path.exists() else ""
@@ -553,7 +553,7 @@ def test_finalize_success_does_not_write_index_row_with_zero_candidates(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx)
+        now=NOW, ledger_entries=tuple(ctx.ledger.entries()), ctx=ctx, file_quality=False)
 
     assert not _index_path(loop_min).exists()
 
@@ -574,7 +574,7 @@ def test_finalize_success_index_row_not_duplicated_on_direct_call_without_ctx(
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=NOW, ledger_entries=tuple(ledger.entries()))
+        now=NOW, ledger_entries=tuple(ledger.entries()), file_quality=False)
 
     text = _index_path(loop_min).read_text()
     assert f"mission {mission_id}" in text

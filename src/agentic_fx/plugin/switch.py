@@ -2204,12 +2204,17 @@ def process_expired_approvals(conn: sqlite3.Connection, *, plugins_root: Path,
                     "無く契約違反のため expire を実行せず pending 留置")
             continue
         if not (isinstance(name, str) and loader._PLUGIN_NAME_RE.fullmatch(name)):
+            # 名前が不正なので配備操作は発生しない: lock は取らず、
+            # pending のまま残さず期限到来で expired にする。
+            approvals_store.apply_decision(
+                conn, row["id"], status="expired", decided_by="system",
+                now=now, reason="expired", commit=True)
             if activity is not None:
                 activity.write(
                     Category.APPROVAL,
-                    "expire_skipped_payload_missing_name",
+                    "expire_skipped_invalid_name",
                     f"approval_id={row['id']}: plugin payload の name が "
-                    "不正で expire を実行せず pending 留置")
+                    "不正で、配備操作なしに expired にした")
             continue
         with _plugin_lock(plugins_root, name):
             if journal_store.get_open_by_name(conn, name) is not None:  # B-2: 現物名
