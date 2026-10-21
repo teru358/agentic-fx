@@ -131,3 +131,34 @@ def test_slow_observer_is_the_only_cost_registry_lookup_is_thread_safe(db):
     # 全員が解除し終えた後は、もう一度登録できる
     token_box.append(observe(conn, lambda *a: None))
     unobserve(token_box[0])
+
+
+def test_observer_gets_a_copy_so_it_cannot_alter_the_returned_row(db):
+    conn, oid, _ = db
+    seen = []
+
+    def meddle(row, frm, to):
+        seen.append(row)
+        row["status"] = "tampered"
+
+    token = observe(conn, meddle)
+    try:
+        result = transition(conn, oid, S.SUBMITTED, NOW)
+    finally:
+        unobserve(token)
+    assert seen[0] is not result
+    assert result["status"] == S.SUBMITTED.value
+
+
+def test_a_stale_token_does_not_release_a_later_registration(db):
+    conn, oid, _ = db
+    stale = observe(conn, lambda *a: None)
+    unobserve(stale)
+    calls = []
+    live = observe(conn, lambda *a: calls.append(a))
+    try:
+        unobserve(stale)
+        transition(conn, oid, S.SUBMITTED, NOW)
+    finally:
+        unobserve(live)
+    assert len(calls) == 1

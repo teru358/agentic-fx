@@ -237,3 +237,34 @@ def test_ac26_notify_trade_events_must_be_a_real_boolean():
     raw["notify"] = {"trade_events": False, "extra": 1}
     with pytest.raises(ValidationError):
         Settings.model_validate(raw)
+
+
+def test_version_three_migration_keeps_crlf_line_endings_byte_for_byte():
+    old = (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace("\n", "\r\n")
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+
+
+def test_version_three_migration_rejects_an_invalid_notify_value():
+    old = (FIXTURES / "v3.yaml").read_text(encoding="utf-8")
+    assert old.endswith("\n")
+
+    result = migrate(old + 'notify:\n  trade_events: "yes"\n')
+
+    assert not result.ok
+
+
+def test_version_three_marker_without_a_comment_migrates_under_crlf():
+    import re
+    old = re.sub(r"schema_version: 3[^\n]*\n", "schema_version: 3\n",
+                 (FIXTURES / "v3.yaml").read_text(encoding="utf-8"), count=1)
+    old = old.replace("\n", "\r\n")
+    assert "schema_version: 3\r\n" in old
+
+    result = migrate(old)
+
+    assert result.ok, result.reason
+    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)

@@ -252,3 +252,49 @@ def test_ac15b_format_status_shows_counts_and_nothing_else():
     assert "取引 event" not in client.format_status({})
     hostile = client.format_status({"trade_events": {"queue_drop": "\x1b[31mred", "x": "y"}})
     assert "\x1b" not in hostile and "queue_drop=-" in hostile
+
+
+def test_start_trade_events_uses_the_configured_account_currency(tmp_path):
+    from types import SimpleNamespace
+    (tmp_path / "data").mkdir()
+    conn = connect(tmp_path / "data" / "agentic.db")
+    from agentic_fx.store.db import init_db
+    init_db(conn)
+    state = SimpleNamespace(load=lambda: SimpleNamespace(mode=Mode.LEARNING))
+    sink, token = service._start_trade_events(
+        tmp_path, conn, SimpleNamespace(account_currency="USD"), state, FixedClock(NOW))
+    try:
+        emitter = transitions._REGISTRY.get(conn)
+        assert isinstance(emitter, TradeEventEmitter)
+        assert emitter._ccy == "USD"
+    finally:
+        transitions.unobserve(token)
+        sink.stop()
+        conn.close()
+
+
+def test_close_without_trade_events_does_not_try_to_release_an_observer(tmp_path, monkeypatch):
+    _init(tmp_path)
+    _set_notify(tmp_path, {"trade_events": False})
+    app = _app(tmp_path)
+    released = []
+    monkeypatch.setattr(transitions, "unobserve", lambda token: released.append(token))
+    app.close()
+    assert released == []
+
+
+def test_build_failure_releases_the_observer_on_the_core_connection(tmp_path, monkeypatch):
+    _init(tmp_path)
+    captured = {}
+    real_start = service._start_trade_events
+
+    def spy(root, conn_core, *a, **k):
+        captured["conn"] = conn_core
+        return real_start(root, conn_core, *a, **k)
+
+    monkeypatch.setattr(service, "_start_trade_events", spy)
+    monkeypatch.setattr(service, "_build_ops_service",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ops build failed")))
+    with pytest.raises(RuntimeError):
+        _app(tmp_path)
+    assert transitions._REGISTRY.get(captured["conn"]) is None
