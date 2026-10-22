@@ -1,15 +1,15 @@
 ---
 id: improve-objective-filtered-signal-quality
 title: 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に)
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-07
-closed: null
+closed: 2026-10-22
 related: [improve-daily-params-weekly-algorithm]
 ---
 # [improve-objective-filtered-signal-quality] 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に)
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [improve-daily-params-weekly-algorithm]
 
 ## 修正内容
 
+- 2026-10-22: チケットの骨子 (3) と目標の縮小版を spec 2026-10-19-improve-loop-quality-design (C 目標の定義、D 床の戻し方) で実装。prompt の目的節は「配備済みと異なる市場仮説を根拠と再現手順が明確な候補として 1 本ずつ増やす、収益指標は床としてのみ」(IQ-T1)、holdout 数値や標本不足の語は agent 面に出さず not_submitted に畳む。床は 2026-10-22 に本番で 1.0 / require_positive_avg_r / require_holdout_evaluable の一組で戻し (IQ-T3、手順書 docs/operations/improve-floor-revert.md)、承認済みは読み取り専用の再評価で個別に裁定 (#21 disable、#24 期限付き keep、#25 disable、#23 対象外)。drawdown / 連敗は根拠データ不足で床に足さない (§8.2)。骨子 (1) 根拠タグ・強度の契約と (2) 選別後の期待値の台帳は測定基盤として strategy-attribution-and-shadow-evaluation に引き継ぐ。PF < 1 の許容はその計測後の再裁定
+
 ## 経緯
 
 - 2026-10-07: 起票。
 - 2026-10-19: 状態: 実装中 — 設計 docs/superpowers/specs/2026-10-19-improve-loop-quality-design.md v1.0 をユーザー承認 (2026-10-19)。IQ-T0 (台帳 schema) から着手
+- 2026-10-22: 是正内容 — チケットの骨子 (3) と目標の縮小版を spec 2026-10-19-improve-loop-quality-design (C 目標の定義、D 床の戻し方) で実装。prompt の目的節は「配備済みと異なる市場仮説を根拠と再現手順が明確な候補として 1 本ずつ増やす、収益指標は床としてのみ」(IQ-T1)、holdout 数値や標本不足の語は agent 面に出さず not_submitted に畳む。床は 2026-10-22 に本番で 1.0 / require_positive_avg_r / require_holdout_evaluable の一組で戻し (IQ-T3、手順書 docs/operations/improve-floor-revert.md)、承認済みは読み取り専用の再評価で個別に裁定 (#21 disable、#24 期限付き keep、#25 disable、#23 対象外)。drawdown / 連敗は根拠データ不足で床に足さない (§8.2)。骨子 (1) 根拠タグ・強度の契約と (2) 選別後の期待値の台帳は測定基盤として strategy-attribution-and-shadow-evaluation に引き継ぐ。PF < 1 の許容はその計測後の再裁定

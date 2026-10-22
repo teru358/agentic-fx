@@ -1,15 +1,13 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 152 件。完了分は closed/。
+未完了: 150 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
-| [improve-objective-filtered-signal-quality](open/improve-objective-filtered-signal-quality.md) | 中 | 2026-10-07 | 改善ループの目標を「選別可能な勝ち筋シグナル」に寄せる (PF ≥ 1.0 を床に) |
-| [improve-backlog-self-feedback-duplicates-work](open/improve-backlog-self-feedback-duplicates-work.md) | 中 | 2026-10-10 | 改善 mission が自分の成果報告を backlog に書き戻し、次回に同じ戦略を再実装する |
 
 ## 実装待ち (13)
 
@@ -50,7 +48,6 @@
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](open/baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
-| [candidates-converge-to-example-sma](open/candidates-converge-to-example-sma.md) | 中 | 2026-09-12 | codex #74 / ornith #75 / muse #76 の提出候補は content_hash が異なるだ… |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [improve-targeted-run](open/improve-targeted-run.md) | 中 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -144,6 +141,7 @@
 | [rollback-foreign-temp-link-sweep](open/rollback-foreign-temp-link-sweep.md) | 低 | 2026-10-18 | foreign で終端した rollback の temp symlink を sweep の対象にする |
 | [isolated-worker-probe-lacks-bless](open/isolated-worker-probe-lacks-bless.md) | 低 | 2026-10-19 | 実隔離 worker の deploy 境界 probe に plugin bless が無い |
 | [ctl-status-shows-active-gate-floor](open/ctl-status-shows-active-gate-floor.md) | 低 | 2026-10-22 | afx ctl status に稼働中の収益性フロア 3 値を出す |
+| [improve-duplicate-self-computed-strategies](open/improve-duplicate-self-computed-strategies.md) | 低 | 2026-10-22 | 自前計算の戦略 (sma_cross 型) は重複判定を構造変更で避けられる |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 低 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
