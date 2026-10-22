@@ -21,7 +21,7 @@ from tests.loops.test_improve_candidate_ledger import (
 
 LOGIC_CANARY = "v1:logiccanary7f3a91d2"
 FAMILY_CANARY = "indicator:familycanary_c2e84b@1h"
-OUTCOME_CANARY = "family_redirect"
+OUTCOME_CANARY = "duplicate_metrics"
 FLAG_CANARY = "legacy_unlinked"
 CANARIES = {
     "logic_hash": LOGIC_CANARY, "family_key": FAMILY_CANARY,
