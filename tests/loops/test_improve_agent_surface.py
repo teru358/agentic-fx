@@ -17,6 +17,8 @@ from agentic_fx.loops.improve_context import (
     DUPLICATE_LAST_RESULT, NOT_SUBMITTED_LAST_RESULT, build_improve_context,
     family_redirect_last_result, project_last_result)
 from agentic_fx.loops.improve_loop import ImproveLoop
+from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
+from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.plugin.strategy_gate import StrategyGateVerdict
 from agentic_fx.store import approvals
 from agentic_fx.store import backlog as backlog_store
@@ -289,6 +291,27 @@ def test_ac13d_fixed_vocabulary_covers_every_agent_facing_demotion():
             == "observation:family_redirect:sma_cross")
 
 
+def test_agent_observation_cannot_persist_quality_redirect_prefix(
+        loop_min, conn, mission_and_run_fixture, tmp_path):
+    mission_id, run_id, backlog_id = mission_and_run_fixture
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={})
+    ledger.freeze()
+    staging = tmp_path / "plugins" / "_staging" / str(mission_id)
+    staging.mkdir(parents=True)
+    ctx = ImproveRunContext(
+        mission_id=mission_id, run_id=run_id, staging_dir=staging,
+        source_snapshot_dir=staging / "source", allowed_backlog_ids=None,
+        slot_key=None, ledger=ledger, rpc_handlers={})
+    loop_min._finalize_report_or_observation(
+        conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
+        artifact={"type": "observation", "reason": "family_redirect:abc_123"},
+        now=NOW)
+    value = conn.execute(
+        "SELECT last_result FROM improvement_backlog WHERE id=?", (backlog_id,)
+    ).fetchone()[0]
+    assert value == NOT_SUBMITTED_LAST_RESULT
+
+
 @pytest.mark.parametrize("legacy,expected", [
     ("unprofitable", NOT_SUBMITTED_LAST_RESULT),
     ("insufficient_trades:12", NOT_SUBMITTED_LAST_RESULT),
@@ -423,8 +446,8 @@ def test_backlog_last_result_canaries_are_absent_from_context_and_prompt(
 
 _DYNAMIC_SUFFIX_VALUES = (
     ("approval_pending:4719", "approval_pending", "4719"),
-    ("observation:family_redirect:" + "q" * 20 + "famcanary9" + "z" * 33,
-     "observation:family_redirect", "famcanary9"),
+    ("observation:family_redirect:Bad-Name",
+     "observation:family_redirect", "Bad-Name"),
     ("gate_failed:noop_copy_of:" + "ab12" * 10, "gate_failed:noop_copy",
      "ab12ab12"),
     ("gate_failed:noop_copy_of:plugincanary_rsi_pullback",

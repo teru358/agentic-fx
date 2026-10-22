@@ -39,6 +39,7 @@ FORBIDDEN = (
 REQUIRED = (
     "理由非公開。同一候補を再提出しない",
     "not_submitted",
+    "`observation:family_redirect:<name>` は、配備済みの `<name>` と同じ仮説族です。新しい名前ではなく `<name>` の更新として出し直してください。",
 )
 
 
