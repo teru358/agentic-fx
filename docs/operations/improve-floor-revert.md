@@ -37,11 +37,15 @@ require_holdout_evaluable: true
 ```diff
  improve:
    gate:
-     min_pf: 1.0
-     require_positive_avg_r: true
+-    min_pf: 0.0
+-    require_positive_avg_r: false
 -    require_holdout_evaluable: false
++    min_pf: 1.0
++    require_positive_avg_r: true
 +    require_holdout_evaluable: true
 ```
+
+変更前の値は環境により異なります (床を無効化した観測中なら上の形)。行末の観測中コメントも一緒に外します。
 
 ## 2. 設定を検証する
 
