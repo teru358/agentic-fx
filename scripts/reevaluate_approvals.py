@@ -36,27 +36,45 @@ def _number(value: object) -> bool:
     return type(value) in (int, float)
 
 
-def _metrics(value: object) -> dict | None:
+def _metric(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    trades, pf, avg_r = raw.get("trades"), raw.get("pf"), raw.get("avg_r")
+    if type(trades) is not int or trades < 0:
+        return None
+    if pf is not None and not _number(pf):
+        return None
+    if avg_r is not None and not _number(avg_r):
+        return None
+    evaluable = raw.get("evaluable")
+    if evaluable is not None and type(evaluable) is not bool:
+        return None
+    return {
+        "trades": trades,
+        "pf": pf,
+        "avg_r": avg_r,
+        "evaluable": trades >= MIN_TRADES if evaluable is None else evaluable,
+    }
+
+
+def _metrics(value: object, *, in_sample_pairs: object = ()) -> dict | None:
+    """Normalize pair-keyed and single-pair flat saved metrics for the gate."""
     if not isinstance(value, dict) or not value:
         return None
-    result: dict = {}
-    for pair, raw in value.items():
-        if not isinstance(pair, str) or not isinstance(raw, dict):
-            return None
-        trades, pf, avg_r = raw.get("trades"), raw.get("pf"), raw.get("avg_r")
-        if type(trades) is not int or trades < 0:
-            return None
-        if pf is not None and not _number(pf):
-            return None
-        if avg_r is not None and not _number(avg_r):
-            return None
-        result[pair] = {
-            "trades": trades,
-            "pf": pf,
-            "avg_r": avg_r,
-            "evaluable": trades >= MIN_TRADES,
-        }
-    return result
+    if all(isinstance(raw, dict) for raw in value.values()):
+        result: dict = {}
+        for pair, raw in value.items():
+            metric = _metric(raw)
+            if not isinstance(pair, str) or metric is None:
+                return None
+            result[pair] = metric
+        return result
+    metric = _metric(value)
+    if metric is None:
+        return None
+    pairs = tuple(in_sample_pairs) if isinstance(in_sample_pairs, dict) else ()
+    pair = pairs[0] if len(pairs) == 1 else "*"
+    return {pair: metric}
 
 
 def _value(metrics: dict, key: str) -> str:
@@ -127,7 +145,7 @@ def render(conn: sqlite3.Connection, ids: list[int] | None) -> list[str]:
         if not isinstance(payload, dict):
             payload = {}
         in_sample = _metrics(payload.get("in_sample"))
-        holdout = _metrics(payload.get("holdout"))
+        holdout = _metrics(payload.get("holdout"), in_sample_pairs=in_sample)
         if in_sample is None or holdout is None:
             output.append(f"{row['id']} | {_strategy(payload)} | - | - | 評価不能 (値なし)")
             continue

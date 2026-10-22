@@ -51,6 +51,23 @@ def _database(tmp_path: Path) -> Path:
     return path
 
 
+def _real_shape_database(tmp_path: Path) -> Path:
+    path = tmp_path / "real-shape-approvals.db"
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE approval_requests (
+        id INTEGER PRIMARY KEY, kind TEXT NOT NULL, payload_json TEXT NOT NULL,
+        status TEXT NOT NULL, created_at TEXT NOT NULL)""")
+    conn.executemany(
+        "INSERT INTO approval_requests(id, kind, payload_json, status, created_at) "
+        "VALUES (?, 'plugin', ?, 'approved', '2026-10-05T00:00:00+00:00')",
+        [(approval_id, json.dumps(payload, ensure_ascii=False))
+         for approval_id, payload in _FIXTURE.reevaluation_real_payloads().items()],
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
 def _run(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--db", str(path), *args],
@@ -67,6 +84,27 @@ def test_prints_saved_fixture_shape_under_fixed_floor(tmp_path: Path):
     assert "21" in lines[1] and "passing@cccccccccccc" in lines[1] and "合格" in lines[1]
     assert "24" in lines[2] and "PF 不足" in lines[2]
     assert "25" in lines[3] and "holdout 評価不能" in lines[3]
+
+
+def test_prints_real_flat_holdout_shape_under_fixed_floor(tmp_path: Path):
+    """平坦 holdout を捨てる変異を殺す: #21/#24/#25 の実保存形状。"""
+    completed = _run(_real_shape_database(tmp_path), "--ids", "21,24,25")
+
+    assert completed.returncode == 0
+    lines = completed.stdout.splitlines()
+    assert len(lines) == 4
+    assert lines[1] == (
+        "21 | real-21@cccccccccccc | pf=USDJPY:1.4440572139303938 / "
+        "avg_r=USDJPY:0.18095898178667616 | pf=USDJPY:0.7624153836938286 / "
+        "trades=USDJPY:48 | PF 不足")
+    assert lines[2] == (
+        "24 | real-24@cccccccccccc | pf=USDJPY:1.0699268738574357 / "
+        "avg_r=USDJPY:0.04121428459537167 | pf=USDJPY:3.3747323340475135 / "
+        "trades=USDJPY:4 | holdout 評価不能")
+    assert lines[3] == (
+        "25 | real-25@cccccccccccc | pf=USDJPY:1.1193967065100916 / "
+        "avg_r=USDJPY:0.0622021839480993 | pf=USDJPY:4.617164898746958 / "
+        "trades=USDJPY:4 | holdout 評価不能")
 
 
 def test_missing_saved_values_are_reported_without_failure(tmp_path: Path):

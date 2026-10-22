@@ -126,6 +126,62 @@ def approval_payload(name="sma_cross", kind="strategy", digest="", origin="stagi
     return payload
 
 
+def reevaluation_real_payloads() -> dict[int, dict]:
+    """実 DB の承認 #21/#24/#25 と同じ metrics 形状の再評価 fixture。"""
+    profitability_floor = {
+        "min_pf": 0.0,
+        "require_positive_avg_r": False,
+        "require_holdout_evaluable": False,
+    }
+    rows = {
+        21: (
+            {"USDJPY": {"trades": 201, "pf": 1.4440572139303938,
+                        "win_rate": 0.48258706467661694,
+                        "avg_r": 0.18095898178667616,
+                        "max_drawdown": 0.03763163337640746,
+                        "total_pnl": 178511.00000001668, "evaluable": True,
+                        "fallback_spread_used": True, "kill_switch_latches": 3}},
+            {"trades": 48, "pf": 0.7624153836938286,
+             "win_rate": 0.2916666666666667, "avg_r": -0.08701456478852544,
+             "max_drawdown": 0.03714922190184371,
+             "total_pnl": -19829.99999999368, "evaluable": True,
+             "fallback_spread_used": True, "kill_switch_latches": 1},
+        ),
+        24: (
+            {"USDJPY": {"trades": 39, "pf": 1.0699268738574357,
+                        "win_rate": 0.38461538461538464,
+                        "avg_r": 0.04121428459537167,
+                        "max_drawdown": 0.03863468624116506,
+                        "total_pnl": 6885.0000000029595, "evaluable": True,
+                        "fallback_spread_used": True, "kill_switch_latches": 2}},
+            {"trades": 4, "pf": 3.3747323340475135, "win_rate": 0.5,
+             "avg_r": 0.36286513956898164,
+             "max_drawdown": 0.0028019999999997674,
+             "total_pnl": 6654.0000000007085, "evaluable": False,
+             "fallback_spread_used": True, "kill_switch_latches": 0},
+        ),
+        25: (
+            {"USDJPY": {"trades": 42, "pf": 1.1193967065100916,
+                        "win_rate": 0.42857142857142855,
+                        "avg_r": 0.0622021839480993,
+                        "max_drawdown": 0.03383091704391002,
+                        "total_pnl": 11637.000000005683, "evaluable": True,
+                        "fallback_spread_used": True, "kill_switch_latches": 3}},
+            {"trades": 4, "pf": 4.617164898746958, "win_rate": 0.5,
+             "avg_r": 0.3957554266316588,
+             "max_drawdown": 0.0020739999999998837,
+             "total_pnl": 7502.00000000072, "evaluable": False,
+             "fallback_spread_used": True, "kill_switch_latches": 0},
+        ),
+    }
+    return {
+        approval_id: approval_payload(
+            name=f"real-{approval_id}", in_sample=in_sample,
+            holdout=holdout, profitability_floor=profitability_floor)
+        for approval_id, (in_sample, holdout) in rows.items()
+    }
+
+
 def insert_approval(env, payload: dict, status: str = "pending", reason=None) -> int:
     cur = env.conn.execute(
         "INSERT INTO approval_requests(kind,payload_json,status,reason,created_at) "
