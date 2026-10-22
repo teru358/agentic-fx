@@ -84,6 +84,11 @@ def project_last_result(value: str | None) -> str | None:
         return NOT_SUBMITTED_LAST_RESULT
     if value.startswith(_LEGACY_DUPLICATE):
         return DUPLICATE_LAST_RESULT
+    if value.startswith(_FAMILY_REDIRECT_PREFIX):
+        deployed_name = value[len(_FAMILY_REDIRECT_PREFIX):]
+        if re.fullmatch(_PLUGIN_NAME_PATTERN, deployed_name):
+            return value
+        return "observation:family_redirect"
     diag = _MISSION_DIAGNOSTIC.match(value)
     if diag is not None:
         return (f"mission_diagnostic run_backtest={diag.group(1)} "

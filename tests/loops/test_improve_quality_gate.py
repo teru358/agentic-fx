@@ -40,7 +40,8 @@ from tests.loops.test_improve_loop_duplicate_metrics import (
 )
 
 from agentic_fx.loops.improve_context import (  # noqa: E402
-    DUPLICATE_LAST_RESULT, NOT_SUBMITTED_LAST_RESULT)
+    DUPLICATE_LAST_RESULT, NOT_SUBMITTED_LAST_RESULT,
+    family_redirect_last_result)
 OTHER_MISSION = 9001
 
 METRICS_1 = {"trades": 194, "pf": 1.4981, "win_rate": 0.487, "avg_r": 0.188,
@@ -58,8 +59,6 @@ PY_X = _PASSING_STRATEGY_PY
 PY_Y = _PASSING_STRATEGY_PY + '\n_VARIANT = "y"\n'
 PY_Z = _PASSING_STRATEGY_PY + '\n_VARIANT = "z"\n_OTHER = 1\n'
 FAMILY = "strategy:bollinger,rsi@1h@USDJPY"
-
-
 def _files(name, py=PY_X, config=_PASSING_STRATEGY_CONFIG):
     return (name, py, config, _PASSING_STRATEGY_TEST)
 
@@ -442,7 +441,7 @@ def test_ac10_relock_resubmission_passes_l_and_f_by_the_ordinary_rule_and_m_keep
 
 # --- AC-11 仮説族 ------------------------------------------------------------
 
-def test_ac11_family_of_a_deployed_other_name_is_flagged_and_still_submitted(
+def test_family_of_a_deployed_other_name_is_redirected_without_submission(
         improve_env):
     app, root = improve_env
     conn = app.conn_core
@@ -450,16 +449,30 @@ def test_ac11_family_of_a_deployed_other_name_is_flagged_and_still_submitted(
     loop, ctx, seeded = _run_strategy(
         app, root, "cand",
         extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
+    row = _expect_rows(conn, ctx, seeded, "family_redirect")
+    assert row["quality_flags"] == []
+    assert _approval_count(conn) == 0
+    results = conn.execute(
+        "SELECT last_result FROM improvement_backlog "
+        "WHERE last_result IS NOT NULL").fetchall()
+    assert [result[0] for result in results] == [
+        family_redirect_last_result("alpha")]
+    activity = _activity(root)
+    assert "quality_demoted" in activity
+    assert "matched=deployed:alpha" in activity
+    assert f"family_key={FAMILY}" in activity
+
+
+def test_same_name_family_is_submitted_as_an_update(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    deployed = _deployed("alpha", family=FAMILY)
+    loop, ctx, seeded = _run_strategy(
+        app, root, "alpha",
+        extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
     row = _expect_rows(conn, ctx, seeded, "pending")
-    assert row["quality_flags"] == ["family_detected"]
-    approval_id = conn.execute(
-        "SELECT id FROM approval_requests").fetchone()[0]
-    assert _payload(conn)["candidate_archive_id"] == row["id"]
-    approvals_store.apply_decision(
-        conn, approval_id, status="approved", decided_by="t", now=NOW)
-    decided = archives.get(conn, row["id"])
-    assert decided["outcome_class"] == "approved"
-    assert decided["quality_flags"] == ["family_detected"]
+    assert row["quality_flags"] == []
+    assert _approval_count(conn) == 1
 
 
 def test_ac11_a_rejected_family_is_not_detected(improve_env):
@@ -1008,11 +1021,11 @@ def test_a_file_population_read_failure_is_gate_failed_and_reported(
 
 # --- 実配線 (母集団・identity・検出属性を差し替えずに通す) --------------------
 
-def test_family_detection_runs_through_the_real_population_and_settle(
+def test_family_redirect_runs_through_the_real_population_and_settle(
         improve_env):
     """配備済み plugin を実ファイルで置き、`phase1_metas` → 母集団 →
     `identity_of_dir` → `settle(add_flags)` を差し替えずに通す。構造の違う
-    候補が同じ仮説族として検出属性を持って提出される。"""
+    候補が同じ仮説族として降格される。"""
     from tests.fixtures import indicator_wiring as fx
     from agentic_fx.plugin.logic_identity import family_key_of
     app, root = improve_env
@@ -1029,17 +1042,19 @@ def test_family_detection_runs_through_the_real_population_and_settle(
     (alpha / "config.yaml").write_text(config)
     (alpha / "test_plugin.py").write_text(_PASSING_STRATEGY_TEST)
     fx.deploy_approved(conn, plugins_root, ["alpha"], now=NOW)
+    approval_count_before = _approval_count(conn)
     output = _artifact("cand")
     loop, ctx, seeded = _run(
         app, root, output, files=("cand", PY_X, config,
                                   _PASSING_STRATEGY_TEST),
         in_sample=_fake_in_sample_full_metrics(METRICS_1),
         holdout_fn=_fake_holdout_full_metrics(HOLDOUT), seed=False)
-    row = _expect_rows(conn, ctx, seeded, "pending")
-    assert row["quality_flags"] == ["family_detected"]
+    row = _expect_rows(conn, ctx, seeded, "family_redirect")
+    assert row["quality_flags"] == []
     assert row["family_key"] == family_key_of(config, name="cand")
     assert row["family_key"] == "strategy:rsi@1h@USDJPY"
-    assert _payload(conn)["candidate_archive_id"] == row["id"]
+    assert _approval_count(conn) == approval_count_before
+    assert _last_result(conn) == family_redirect_last_result("alpha")
 
 
 def test_concurrent_same_logic_candidates_only_one_reaches_approval(
@@ -1243,9 +1258,3 @@ def test_the_deploy_guard_is_released_before_the_post_commit_work(
     with patch.object(ImproveLoop, "_settle_ledger_after_commit", probe):
         loop, ctx, seeded = _run_strategy(app, root, "cand")
     assert seen == {"acquired": True}
-
-
-def test_family_redirect_is_not_produced_by_the_quality_check():
-    import inspect
-    assert "redirect_to" not in inspect.signature(
-        ImproveLoop._quality_rejection).parameters

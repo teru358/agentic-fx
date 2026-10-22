@@ -40,7 +40,7 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # ため効かない)
 from agentic_fx.loops.improve_context import (
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
-    deployed_families_text)
+    deployed_families_text, family_redirect_last_result)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -2646,8 +2646,8 @@ class ImproveLoop:
 
         - 段 L: 別名の配備済み・example・却下済み・降格済みなどと一致したら
           `duplicate_logic`。配備済みの同名旧版との一致は更新として通す。
-        - 段 F: 配備済みの別名と仮説族が一致したら `family_detected` を検出
-          属性として返すだけで、降格はしない。
+        - 段 F: 配備済みの別名と仮説族が一致したら `family_redirect` で
+          既存名の更新へ誘導する。同名は更新として通す。
         - 失敗の 3 分類: 候補自身の identity が計算できない → `gate_failed`、
           比較対象 1 行の破損 → warning を残してその行だけ外す、比較基盤が
           全部使えない → `gate_failed`。
@@ -2711,7 +2711,12 @@ class ImproveLoop:
                 family_key=candidate.family_key,
                 deployed=deployed)
             if same_family is not None:
-                flags = ("family_detected",)
+                return self._quality_rejection(
+                    "family_redirect",
+                    detail=(f"matched={same_family.source}:{same_family.name} "
+                            f"family_key={candidate.family_key}"),
+                    reason=family_redirect_last_result(
+                        same_family.name).removeprefix("observation:"))
         metrics_dup = self._check_duplicate_metrics_for_approval(
             conn, approval_payload, inventory=inventory,
             staging_dir=staging_dir)
@@ -2723,14 +2728,16 @@ class ImproveLoop:
         return _QualityVerdict(flags=flags)
 
     @staticmethod
-    def _quality_rejection(outcome: str, *, detail: str) -> _QualityVerdict:
+    def _quality_rejection(outcome: str, *, detail: str,
+                           reason: str | None = None) -> _QualityVerdict:
         """agent 面の `reason` は固定語彙だけ。同一ロジック・同一成績は
         `duplicate`、同一性や比較の根拠が作れなかったときは
         `not_submitted`。"""
-        if outcome in ("duplicate_logic", "duplicate_metrics"):
-            reason = "duplicate"
-        else:
-            reason = "not_submitted"
+        if reason is None:
+            if outcome in ("duplicate_logic", "duplicate_metrics"):
+                reason = "duplicate"
+            else:
+                reason = "not_submitted"
         return _QualityVerdict(outcome=outcome, reason=reason, detail=detail)
 
     def _quality_unavailable(self, mission_id: int,

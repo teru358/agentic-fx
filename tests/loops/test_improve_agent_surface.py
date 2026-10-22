@@ -423,8 +423,8 @@ def test_backlog_last_result_canaries_are_absent_from_context_and_prompt(
 
 _DYNAMIC_SUFFIX_VALUES = (
     ("approval_pending:4719", "approval_pending", "4719"),
-    ("observation:family_redirect:" + "q" * 20 + "famcanary9" + "z" * 33,
-     "observation:family_redirect", "famcanary9"),
+    ("observation:family_redirect:Bad-Name",
+     "observation:family_redirect", "Bad-Name"),
     ("gate_failed:noop_copy_of:" + "ab12" * 10, "gate_failed:noop_copy",
      "ab12ab12"),
     ("gate_failed:noop_copy_of:plugincanary_rsi_pullback",
