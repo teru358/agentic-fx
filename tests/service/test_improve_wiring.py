@@ -134,15 +134,18 @@ def test_run_service_calls_improve_supervisor_shutdown_and_join(tmp_path):
         assert exit_code == 0
 
 
-def test_scheduler_tick_returns_empty_list_when_on_improve_tick_is_none(tmp_path):
-    """`on_improve_tick` が None のとき `Scheduler.tick()` の戻り値は常に
-    空リスト (Scheduler 自体の契約 — Task 12 配線後も保たれる)。"""
+def test_scheduler_tick_returns_signal_hook_but_not_improve_hook_when_improve_is_none(tmp_path):
+    """improve hook がなくても、別責務の signal maintenance は遅延実行される。"""
     _init(tmp_path)
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW))
     try:
+        signal_ticks = []
+        app.scheduler.on_signal_maintenance = signal_ticks.append
         app.scheduler.on_improve_tick = None
         pending = app.scheduler.tick(NOW)
-        assert pending == []
+        assert len(pending) == 1
+        pending[0]()
+        assert signal_ticks == [NOW]
     finally:
         app.close()
 

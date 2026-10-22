@@ -174,7 +174,7 @@ def test_init_removes_its_marker_after_a_successful_commit(tmp_path):
 def test_init_leaves_marker_when_a_commit_step_fails(tmp_path, monkeypatch):
     _example(tmp_path)
     monkeypatch.setattr("agentic_fx.service.init_db",
-                        lambda _conn: (_ for _ in ()).throw(RuntimeError("stop")))
+                        lambda _conn, *, root: (_ for _ in ()).throw(RuntimeError("stop")))
     with pytest.raises(RuntimeError, match="stop"):
         run_init(tmp_path)
     assert setup_marker_present(tmp_path)
