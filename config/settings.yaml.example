@@ -109,6 +109,7 @@ improve:
     # (risk.* の資金保護制約とは別物、緩めても実資金は動かない)。
     min_pf: 1.0                     # in_sample/holdout の pf 下限 (pf が None = gross_loss 0 は PASS)
     require_positive_avg_r: true    # avg_r <= 0.0 を不合格にするか
+    # 本機の運用では true にする。手順は docs/operations/improve-floor-revert.md を参照する。
     require_holdout_evaluable: false  # holdout evaluable=false を不合格にするか (既定: 標本不足は continue)
 
 logging:
