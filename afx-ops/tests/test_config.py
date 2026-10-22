@@ -495,7 +495,7 @@ def _read_closing(feature: str):
 def test_ac23_old_ops_toml_without_the_trade_keys_gets_the_defaults(monkeypatch, tmp_path):
     _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT)
     config = _read_closing("bot")
-    assert (config.trade_notices, config.trade_amounts) == ("all", "absolute")
+    assert (config.trade_notices, config.trade_amounts, config.ops_notices) == ("all", "absolute", "default")
     _write_config(monkeypatch, tmp_path / "n", "notify", _BASE)
     assert _read_closing("notify").deliver_trade_events is False
 
@@ -509,10 +509,17 @@ def test_ac23_bot_reads_trade_notices_and_trade_amounts(monkeypatch, tmp_path, n
     assert (config.trade_notices, config.trade_amounts) == (notices, amounts)
 
 
+@pytest.mark.parametrize("notices", ["default", "all"])
+def test_ac18_bot_reads_ops_notices(monkeypatch, tmp_path, notices):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + f'ops_notices = "{notices}"\n')
+    assert _read_closing("bot").ops_notices == notices
+
+
 @pytest.mark.parametrize("line", ['trade_notices = "ALL"', 'trade_notices = ""',
                                   'trade_notices = true', 'trade_notices = 1',
                                   'trade_notices = ["all"]', 'trade_amounts = "abs"',
                                   'trade_amounts = 1', 'trade_amounts = false',
+                                  'ops_notices = "everything"', 'ops_notices = 1',
                                   'deliver_trade_events = true'])
 def test_ac23_bot_rejects_invalid_values_and_notify_only_keys(monkeypatch, tmp_path, line):
     _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + line + "\n")

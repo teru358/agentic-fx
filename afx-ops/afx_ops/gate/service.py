@@ -98,14 +98,22 @@ class GateService:
 
     def plan_event(self, event: object, *, mention_role_id: int | None = None,
                    mention_user_ids: tuple[int, ...] = (), trade_notices: str = "all",
-                   trade_amounts: str = "absolute") -> EventPlan | SkipKnown | None:
+                   trade_amounts: str = "absolute", ops_notices: str = "default",
+                   plugin_name: str | None = None) -> EventPlan | SkipKnown | None:
         """event の扱い。None は cursor 以下 (すでに確定済み)、`SkipKnown` は検証を通ったが
         設定で出さない event、`EventPlan` は投稿する event。完全検証 (`PayloadError`) が先。"""
         kinds = NOTICE_KINDS[trade_notices]
 
         def wants(payload: dict) -> bool:
             kind = notice_kind(payload)
-            return kind is None or kind in kinds
+            if kind is not None:
+                return kind in kinds
+            if ops_notices == "all":
+                return True
+            if payload["code"] in {"approval_state_changed", "guard_state_changed", "service_health_changed"}:
+                return True
+            return payload["code"] == "job_state_changed" and payload["state"] in {
+                "failed", "cancelled", "shutdown"}
 
         outcome = decide(event, wants)
         event_id = event["id"]
@@ -117,8 +125,14 @@ class GateService:
             # 取引通知は固定 template で、設定済みの mention を付けない
             return EventPlan(event_id, render_trade(outcome.payload, amounts=trade_amounts), (),
                              allow_mentions=False)
+        approval_id = None
+        if outcome.payload["code"] == "job_state_changed" and outcome.payload["state"] == "failed":
+            job_id = outcome.payload["ref"].split(":", 1)[1]
+            approval_id = next((record.approval_id for record in self._read_state().approvals
+                                if record.state == "in_flight" and record.job_id == job_id), None)
         rendered = render_event(event, mention_role_id=mention_role_id,
-                                mention_user_ids=mention_user_ids)
+                                mention_user_ids=mention_user_ids, plugin_name=plugin_name,
+                                approval_id=approval_id)
         return EventPlan(event_id, rendered.content, rendered.mentions)
 
     def commit_event(self, event_id: int, *, high_watermark: int) -> None:

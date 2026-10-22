@@ -22,7 +22,7 @@ def test_renderer_only_projects_the_fixed_event_schema_and_configured_mentions()
                             mention_role_id=12345678901234569,
                             mention_user_ids=(12345678901234570,))
     assert rendered.mentions == ("<@&12345678901234569>", "<@12345678901234570>")
-    assert "service_health_changed" in rendered.content
+    assert rendered.content == "api の健全性が ok になりました。"
     assert "instance" not in rendered.content
 
 

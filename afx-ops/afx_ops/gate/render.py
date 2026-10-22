@@ -339,13 +339,50 @@ def confirm_view(record: ApprovalRecord) -> ViewModel:
     ), ephemeral=True)
 
 
+def _event_text(payload: dict[str, object], plugin_name: str | None,
+                approval_id: int | None) -> str:
+    code = payload["code"]
+    if code == "approval_state_changed":
+        approval = payload["ref"].split(":", 1)[1]
+        name = escape_discord(plugin_name) if type(plugin_name) is str and _NAME.fullmatch(plugin_name) else None
+        subject = f"承認 #{approval}" + (f" (戦略 {name})" if name is not None else "")
+        state = payload["state"]
+        if state == "approved":
+            return f"{subject} が承認・配備されました。"
+        if state == "rejected":
+            return f"{subject} が却下されました。"
+        return f"承認 #{approval} の状態が変わりました ({escape_discord(state)})。"
+    if code == "job_state_changed":
+        state = payload["state"]
+        labels = {"failed": "失敗しました", "cancelled": "取り消されました", "shutdown": "停止で中断しました",
+                  "done": "完了しました", "queued": "受け付けられました", "running": "実行中です"}
+        reason = payload["result_code"]
+        suffix = "" if reason is None else f" (理由 code: {escape_discord(reason)})"
+        if approval_id is not None and state == "failed":
+            return f"承認 #{approval_id} の配備ジョブが失敗しました{suffix}。"
+        return f"ジョブ {escape_discord(payload['job_kind'])} が{labels.get(state, '状態が変わりました')}{suffix if state in {'failed', 'cancelled', 'shutdown'} else ''}。"
+    if code == "guard_state_changed":
+        guard, state = payload["guard_kind"], payload["state"]
+        generation = payload["generation"]
+        if guard == "kill_switch" and state in {"latched", "released"}:
+            text = "kill switch が作動しました" if state == "latched" else "kill switch が解除されました"
+            return text + (f" (世代 {escape_discord(str(generation))})" if generation is not None else "") + "。"
+        if guard == "data_feed" and state == "resume_requested":
+            return "データ取得の再開を要求しました。"
+        return f"ガード {escape_discord(guard)} の状態が {escape_discord(state)} になりました。"
+    if code == "service_health_changed":
+        return f"{escape_discord(payload['component_code'])} の健全性が {escape_discord(payload['health_code'])} になりました。"
+    if code == "ops_request_terminal":
+        return f"操作 {escape_discord(payload['endpoint_code'])} が終了しました (結果 code: {escape_discord(payload['result_code'])})。"
+    return f"イベント {escape_discord(code)} が記録されました。"
+
+
 def render_event(event: object, *, mention_role_id: int | None = None,
-                 mention_user_ids: tuple[int, ...] = ()) -> RenderedEvent:
-    """notify と同じ allowlist 検証を通った code と fields だけを写す。"""
+                 mention_user_ids: tuple[int, ...] = (), plugin_name: str | None = None,
+                 approval_id: int | None = None) -> RenderedEvent:
+    """完全検証済み event を固定 template の 1 行通知にする。"""
     payload = encode_event(event)
-    fields = tuple(f"{key}={payload[key]}" for key in sorted(payload)
-                   if key not in {"event_id", "ts", "code", "ref"})
-    text = payload["code"] + (": " + ", ".join(fields) if fields else "")
+    text = _event_text(payload, plugin_name, approval_id)
     mentions: list[str] = []
     if type(mention_role_id) is int:
         mentions.append(f"<@&{mention_role_id}>")

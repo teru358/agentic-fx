@@ -35,7 +35,7 @@ from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
-from afx_ops.gate.render import footer as gate_footer
+from afx_ops.gate.render import _NAME, footer as gate_footer
 from afx_ops.gate.render import primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
@@ -77,6 +77,7 @@ class BotSettings:
     # 取引通知の出し方。隔離の前に検査済みの設定の値で、runtime では読み直さない
     trade_notices: str = "all"
     trade_amounts: str = "absolute"
+    ops_notices: str = "default"
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,13 @@ def _approval_id_of(event: dict) -> int | None:
         return None
     matched = _APPROVAL_REF.fullmatch(ref)
     return int(matched.group(1)) if matched is not None else None
+
+
+def _plugin_name(reply: object) -> str | None:
+    data = getattr(reply, "data", None)
+    change = data.get("change") if type(data) is dict else None
+    name = change.get("name") if type(change) is dict else None
+    return name if type(name) is str and _NAME.fullmatch(name) else None
 
 
 class BotAdapter:
@@ -667,12 +675,20 @@ class BotAdapter:
         # 新しい watermark は最初の確定 (投稿・既知の skip) と同じ置換で保存する
         progressed = False
         for event in events:
+            plugin_name = None
+            approval_id = _approval_id_of(event)
+            if approval_id is not None:
+                try:
+                    plugin_name = _plugin_name(await self._run(self.client.approval, approval_id))
+                except Exception:
+                    plugin_name = None
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
                     e, mention_role_id=self.settings.mention_role_id,
                     mention_user_ids=self.settings.mention_user_ids,
                     trade_notices=self.settings.trade_notices,
-                    trade_amounts=self.settings.trade_amounts))
+                    trade_amounts=self.settings.trade_amounts,
+                    ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
             except Exception:
                 raise BotFailure("payload_invalid") from None
             if plan is None:
@@ -693,7 +709,6 @@ class BotAdapter:
                 return
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
             progressed = True
-            approval_id = _approval_id_of(event)
             if approval_id is not None:
                 await self._settle(approval_id)
         if unreadable:

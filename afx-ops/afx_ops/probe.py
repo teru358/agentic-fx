@@ -99,6 +99,7 @@ def _read_inputs(feature: str) -> tuple[OpsConfig, Mapping[str, bytes]]:
                      mention_role_id=config.mention_role_id,
                      mention_user_ids=config.mention_user_ids,
                      trade_notices=config.trade_notices, trade_amounts=config.trade_amounts,
+                     ops_notices=config.ops_notices,
                      deliver_trade_events=config.deliver_trade_events), secrets
 
 
