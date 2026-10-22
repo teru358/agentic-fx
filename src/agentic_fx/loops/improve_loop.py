@@ -40,7 +40,7 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # ため効かない)
 from agentic_fx.loops.improve_context import (
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
-    deployed_families_text, family_redirect_last_result)
+    deployed_families_text, family_redirect_last_result, family_redirect_reason)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -345,13 +345,13 @@ class _DuplicateDemotion:
 
 @dataclass(frozen=True)
 class _QualityVerdict:
-    """質検査 (段 L・F・M) の結果。`outcome` が None なら通過で、`flags` は
-    提出する行に足す検出属性。降格・拒否のときは `outcome` が候補の最終
-    分類で、`reason` だけが agent 面 (backlog の last_result) に出る。
-    `detail` は運用者向けの activity にだけ書く。"""
+    """質検査 (段 L・F・M) の結果。`outcome` が None なら通過。
+    降格・拒否の `reason` は固定語彙で、配備済み名への誘導だけが名前を
+    持つ。`detail` は運用者向けの activity にだけ書く。"""
     outcome: str | None = None
     flags: tuple[str, ...] = ()
     reason: str = ""
+    last_result: str | None = None
     detail: str = ""
 
 
@@ -2655,7 +2655,6 @@ class ImproveLoop:
         比較対象のファイル群が無い呼び出し (単体の直接呼び出し) では段 L・F を
         行わず、段 M だけを行う。比較対象があるのに候補の staging が無いときは
         質検査の不能として `gate_failed` にする。"""
-        flags: tuple[str, ...] = ()
         if file_population is not None:
             if candidate.candidate_dir is None:
                 return self._quality_unavailable(
@@ -2715,8 +2714,8 @@ class ImproveLoop:
                     "family_redirect",
                     detail=(f"matched={same_family.source}:{same_family.name} "
                             f"family_key={candidate.family_key}"),
-                    reason=family_redirect_last_result(
-                        same_family.name).removeprefix("observation:"))
+                    reason=family_redirect_reason(same_family.name),
+                    last_result=family_redirect_last_result(same_family.name))
         metrics_dup = self._check_duplicate_metrics_for_approval(
             conn, approval_payload, inventory=inventory,
             staging_dir=staging_dir)
@@ -2725,20 +2724,22 @@ class ImproveLoop:
                       f"pair={metrics_dup.pair}")
             return self._quality_rejection(
                 "duplicate_metrics", detail=detail)
-        return _QualityVerdict(flags=flags)
+        return _QualityVerdict()
 
     @staticmethod
     def _quality_rejection(outcome: str, *, detail: str,
-                           reason: str | None = None) -> _QualityVerdict:
-        """agent 面の `reason` は固定語彙だけ。同一ロジック・同一成績は
-        `duplicate`、同一性や比較の根拠が作れなかったときは
-        `not_submitted`。"""
+                           reason: str | None = None,
+                           last_result: str | None = None) -> _QualityVerdict:
+        """agent 面の reason は固定語彙だけで、配備済み名への誘導だけが
+        名前を持つ。"""
         if reason is None:
             if outcome in ("duplicate_logic", "duplicate_metrics"):
                 reason = "duplicate"
             else:
                 reason = "not_submitted"
-        return _QualityVerdict(outcome=outcome, reason=reason, detail=detail)
+        return _QualityVerdict(
+            outcome=outcome, reason=reason, last_result=last_result,
+            detail=detail)
 
     def _quality_unavailable(self, mission_id: int,
                              reason: str) -> _QualityVerdict:
@@ -3389,7 +3390,9 @@ class ImproveLoop:
                         now=now, gate_rows=tuple(gate_rows),
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome=demotion.outcome)
+                        candidate_outcome=demotion.outcome,
+                        quality_last_result=(demotion.last_result
+                                             or f"observation:{demotion.reason}"))
             else:
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -3471,6 +3474,7 @@ class ImproveLoop:
                                         tool_calls: int | None = None,
                                         candidate: _FinalCandidate | None = None,
                                         candidate_outcome: str = "gate_failed",
+                                        quality_last_result: str | None = None,
                                         ) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
 
@@ -3497,10 +3501,15 @@ class ImproveLoop:
         素の文字列である `reason` には型名の無い `safe_text` を使う —
         どちらも同じ `_URL_RE`/`_SECRET_RE` 抑止を共有する)。"""
         from agentic_fx.store import missions as missions_store
-        if report_path is None and artifact.get("type") == "observation":
+        if quality_last_result is not None:
+            observation_last_result = quality_last_result
+        elif report_path is None and artifact.get("type") == "observation":
             from agentic_fx._safe_error import safe_text
-            observation_last_result = (
-                f"observation:{safe_text(str(artifact.get('reason', '')))}")
+            observation_reason = safe_text(str(artifact.get("reason", "")))
+            if observation_reason.startswith(("family_redirect:", "duplicate")):
+                observation_last_result = NOT_SUBMITTED_LAST_RESULT
+            else:
+                observation_last_result = f"observation:{observation_reason}"
         else:
             # D-15 是正: 設計書 §4.3 状態表の逐語は
             # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`

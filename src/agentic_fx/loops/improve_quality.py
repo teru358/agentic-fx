@@ -263,6 +263,9 @@ def find_duplicate_logic(*, name: str, logic_hash: str,
         for entry in population.entries:
             if entry.logic_hash != logic_hash:
                 continue
+            if (entry.source == "archive" and entry.outcome == "family_redirect"
+                    and name in deployed_names):
+                continue
             if entry.name == name and name in deployed_names and (
                     entry.source == "deployed"
                     or (entry.source == "archive"

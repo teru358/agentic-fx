@@ -59,6 +59,8 @@ PY_X = _PASSING_STRATEGY_PY
 PY_Y = _PASSING_STRATEGY_PY + '\n_VARIANT = "y"\n'
 PY_Z = _PASSING_STRATEGY_PY + '\n_VARIANT = "z"\n_OTHER = 1\n'
 FAMILY = "strategy:bollinger,rsi@1h@USDJPY"
+
+
 def _files(name, py=PY_X, config=_PASSING_STRATEGY_CONFIG):
     return (name, py, config, _PASSING_STRATEGY_TEST)
 
@@ -473,6 +475,26 @@ def test_same_name_family_is_submitted_as_an_update(improve_env):
     row = _expect_rows(conn, ctx, seeded, "pending")
     assert row["quality_flags"] == []
     assert _approval_count(conn) == 1
+
+
+def test_family_redirect_allows_the_deployed_name_but_not_another_alias(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    deployed = _deployed("alpha", logic_hash=_hash_of(PY_Y), family=FAMILY)
+    _run_strategy(
+        app, root, "cand", py=PY_X,
+        extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
+
+    _run_strategy(
+        app, root, "alpha", py=PY_X,
+        extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
+    assert _approval_count(conn) == 1
+
+    loop, ctx, seeded = _run_strategy(
+        app, root, "cand2", py=PY_X,
+        extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
 
 
 def test_ac11_a_rejected_family_is_not_detected(improve_env):

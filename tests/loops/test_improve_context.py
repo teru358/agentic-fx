@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -240,7 +241,7 @@ def test_backlog_last_result_is_projected_in_items_and_notes(tmp_path):
     ("gate_failed:noop_copy_of:sma_cross", "gate_failed:noop_copy"),
     ("approval_pending:12", "approval_pending"),
     ("observation:family_redirect:sma_cross_10_30",
-     "observation:family_redirect:sma_cross_10_30"),
+     "observation:family_redirect"),
     ("observation:family_redirect:Bad-Name", "observation:family_redirect"),
     ("observation:family_redirect:a b", "observation:family_redirect"),
     ("observation:family_redirect:x:y", "observation:family_redirect"),
@@ -256,3 +257,36 @@ def test_backlog_last_result_is_projected_in_items_and_notes(tmp_path):
 def test_project_last_result_is_fail_closed(value, expected):
     from agentic_fx.loops.improve_context import project_last_result
     assert project_last_result(value) == expected
+
+
+def test_project_last_result_keeps_family_redirect_only_for_deployed_name():
+    from agentic_fx.loops.improve_context import project_last_result
+    assert project_last_result(
+        "observation:family_redirect:alpha", deployed_names={"alpha"}
+    ) == "observation:family_redirect:alpha"
+    assert project_last_result(
+        "observation:family_redirect:abc_123", deployed_names={"alpha"}
+    ) == "observation:family_redirect"
+
+
+def test_context_projects_named_redirects_against_its_deployed_families(
+        tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    alpha = backlog.add(c, "alpha update", "user", NOW)
+    other = backlog.add(c, "forged redirect", "user", NOW)
+    for backlog_id, result in (
+            (alpha, "observation:family_redirect:alpha"),
+            (other, "observation:family_redirect:abc_123")):
+        backlog.set_status(c, backlog_id, "observation", NOW,
+                           last_result=result)
+    meta = SimpleNamespace(
+        name="alpha", kind="indicator", timeframe="1h", pairs=(),
+        indicators=())
+    ctx = build_improve_context(
+        c, settings=SETTINGS, now=NOW, root=tmp_path,
+        allowed_backlog_ids=None, inventory_metas=[meta])
+    results = {row["id"]: row["last_result"] for row in ctx["backlog"]["items"]}
+    assert results == {
+        alpha: "observation:family_redirect:alpha",
+        other: "observation:family_redirect",
+    }

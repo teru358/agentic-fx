@@ -24,6 +24,7 @@
 してください。**1 回の失敗・却下・非提出で課題を悪いと決めつけないこと。**
 `not_submitted` は、その mission の候補が提出されなかったことだけを示します。
 理由非公開。同一候補を再提出しないでください。
+`observation:family_redirect:<name>` は、配備済みの `<name>` と同じ仮説族です。新しい名前ではなく `<name>` の更新として出し直してください。
 
 {improvement_history_table}
 

@@ -44,7 +44,12 @@ _LEGACY_DUPLICATE = ("duplicate_metrics_of:", "observation:duplicate_metrics_of:
 
 def family_redirect_last_result(deployed_name: str) -> str:
     """配備済みの同族へ誘導する降格の固定文言 (名前だけ。優劣は含まない)。"""
-    return f"{_FAMILY_REDIRECT_PREFIX}{deployed_name}"
+    return f"observation:{family_redirect_reason(deployed_name)}"
+
+
+def family_redirect_reason(deployed_name: str) -> str:
+    """配備済みの同族へ誘導する、品質検査専用の reason。"""
+    return f"family_redirect:{deployed_name}"
 
 
 _FIXED_LAST_RESULTS = frozenset({
@@ -72,7 +77,9 @@ _MISSION_DIAGNOSTIC = re.compile(
     r"run_backtest=([0-9]{1,6}) analyze_corr=([0-9]{1,6})(?: |$)")
 
 
-def project_last_result(value: str | None) -> str | None:
+def project_last_result(value: str | None, *,
+                        deployed_names: frozenset[str] | set[str] = frozenset()
+                        ) -> str | None:
     """agent 面に出す `last_result` を固定語彙だけに絞る (fail-closed)。
 
     移行前の値は区別を畳み、固定表現に一致しない値は語頭だけ、語頭も
@@ -86,7 +93,8 @@ def project_last_result(value: str | None) -> str | None:
         return DUPLICATE_LAST_RESULT
     if value.startswith(_FAMILY_REDIRECT_PREFIX):
         deployed_name = value[len(_FAMILY_REDIRECT_PREFIX):]
-        if re.fullmatch(_PLUGIN_NAME_PATTERN, deployed_name):
+        if (re.fullmatch(_PLUGIN_NAME_PATTERN, deployed_name)
+                and deployed_name in deployed_names):
             return value
         return "observation:family_redirect"
     diag = _MISSION_DIAGNOSTIC.match(value)
@@ -148,7 +156,8 @@ def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
     }
 
 
-def _improvement_history(conn: "sqlite3.Connection") -> dict:
+def _improvement_history(conn: "sqlite3.Connection", *,
+                         deployed_names: frozenset[str] = frozenset()) -> dict:
     rows = conn.execute(
         "SELECT ir.id, ir.backlog_id, ir.result, ir.started_at, ir.finished_at, "
         "ib.idea, ib.attempts, ib.last_result "
@@ -156,7 +165,8 @@ def _improvement_history(conn: "sqlite3.Connection") -> dict:
         "ON ib.id = ir.backlog_id ORDER BY ir.id DESC LIMIT 50").fetchall()
     runs = [dict(r) for r in rows]
     for r in runs:
-        r["last_result"] = project_last_result(r["last_result"])
+        r["last_result"] = project_last_result(
+            r["last_result"], deployed_names=deployed_names)
     return {"recent_runs": runs}
 
 
@@ -231,13 +241,15 @@ def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
 
 
 def _backlog_section(conn: "sqlite3.Connection",
-                     allowed_backlog_ids: "frozenset[int] | None") -> dict:
+                     allowed_backlog_ids: "frozenset[int] | None", *,
+                     deployed_names: frozenset[str]) -> dict:
     from agentic_fx.store import backlog as backlog_mod
     items = []
     for row in backlog_mod.list_open(conn):
         item = {"id": row["id"], "idea": row["idea"], "status": row["status"],
                 "attempts": row["attempts"],
-                "last_result": project_last_result(row["last_result"]),
+                "last_result": project_last_result(
+                    row["last_result"], deployed_names=deployed_names),
                 "origin_outcome": row["origin_outcome"]}
         if allowed_backlog_ids is not None:
             item["assigned"] = row["id"] in allowed_backlog_ids
@@ -246,7 +258,8 @@ def _backlog_section(conn: "sqlite3.Connection",
     notes = [
         {"id": row["id"], "idea": row["idea"], "status": row["status"],
          "attempts": row["attempts"],
-         "last_result": project_last_result(row["last_result"]),
+         "last_result": project_last_result(
+             row["last_result"], deployed_names=deployed_names),
          "origin_outcome": row["origin_outcome"]}
         for row in all_notes[:20]
     ]
@@ -275,13 +288,18 @@ def build_improve_context(
         allowed_backlog_ids: "frozenset[int] | None",
         inventory_view: dict | None = None,
         inventory_metas: "list[Any] | None" = None) -> dict[str, Any]:
+    current_inventory = _current_inventory(
+        conn, settings, root, inventory_view=inventory_view,
+        inventory_metas=inventory_metas)
+    deployed_names = frozenset(
+        family["name"] for family in current_inventory["deployed_families"])
     return {
         "performance_report": _performance_report(conn, now),
-        "improvement_history": _improvement_history(conn),
-        "current_inventory": _current_inventory(
-            conn, settings, root, inventory_view=inventory_view,
-            inventory_metas=inventory_metas),
-        "backlog": _backlog_section(conn, allowed_backlog_ids),
+        "improvement_history": _improvement_history(
+            conn, deployed_names=deployed_names),
+        "current_inventory": current_inventory,
+        "backlog": _backlog_section(
+            conn, allowed_backlog_ids, deployed_names=deployed_names),
         "user_policy": _user_policy_section(root),
         "references": _references_section(),
     }
