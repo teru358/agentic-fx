@@ -53,6 +53,7 @@ EDIT_BACKOFF_MAX_SECONDS = 60.0
 # 無ければ既定
 THROTTLE_DEFAULT_SECONDS = 10.0
 THROTTLE_MAX_SECONDS = 300.0
+NAME_LOOKUP_TIMEOUT_SECONDS = 3.0
 _TERMINAL = frozenset({"done"})
 # event の ref は daemon の固定形。int() が受ける Unicode 数字や先頭 0 は承認 ID とみなさない
 _APPROVAL_REF = re.compile(r"approval:([1-9][0-9]{0,17})\Z")
@@ -676,12 +677,17 @@ class BotAdapter:
         progressed = False
         for event in events:
             plugin_name = None
+            detail = None
             approval_id = _approval_id_of(event)
             if approval_id is not None:
                 try:
-                    plugin_name = _plugin_name(await self._run(self.client.approval, approval_id))
+                    detail = await self._run(
+                        lambda: self.client.approval(approval_id, timeout=NAME_LOOKUP_TIMEOUT_SECONDS))
                 except Exception:
-                    plugin_name = None
+                    pass
+                else:
+                    self._observe(approval_id, detail)
+                    plugin_name = _plugin_name(detail)
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
                     e, mention_role_id=self.settings.mention_role_id,
@@ -710,7 +716,7 @@ class BotAdapter:
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
             progressed = True
             if approval_id is not None:
-                await self._settle(approval_id)
+                await self._settle(approval_id, detail=detail)
         if unreadable:
             raise BotFailure("payload_invalid")
         if not progressed and high > self.gate.state.high_watermark:
@@ -750,7 +756,7 @@ class BotAdapter:
         if high < self.gate.state.high_watermark:
             raise BotFailure("high_watermark_regressed")
 
-    async def _settle(self, approval_id: int) -> None:
+    async def _settle(self, approval_id: int, *, detail=None) -> None:
         """正本が pending でなくなった承認の record を終端にし、投稿から View を外す。"""
         record = self.gate.state.record(approval_id)
         if record is None or record.state in _TERMINAL:
@@ -762,8 +768,9 @@ class BotAdapter:
             return
         if not self._poll_due(approval_id):
             return
-        detail = await self._run(self.client.approval, approval_id)
-        self._observe(approval_id, detail)
+        if detail is None:
+            detail = await self._run(self.client.approval, approval_id)
+            self._observe(approval_id, detail)
         status = _detail_status(detail)
         if status is None or status == "pending":
             return

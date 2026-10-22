@@ -18,7 +18,8 @@ def _event(code: str, fields: dict, *, ref: str = "instance") -> dict:
     ("approved", "sma_cross", r"承認 #25 (戦略 sma\_cross) が承認・配備されました。"),
     ("approved", None, "承認 #25 が承認・配備されました。"),
     ("rejected", "sma_cross", r"承認 #25 (戦略 sma\_cross) が却下されました。"),
-    ("expired", "sma_cross", "承認 #25 の状態が変わりました (expired)。"),
+    ("expired", "sma_cross", r"承認 #25 (戦略 sma\_cross) は期限切れになりました。"),
+    ("expired", None, "承認 #25 は期限切れになりました。"),
 ])
 def test_ac17_approval_event_has_a_fixed_human_sentence(state, name, expected):
     rendered = render_event(_event("approval_state_changed", {
@@ -28,6 +29,20 @@ def test_ac17_approval_event_has_a_fixed_human_sentence(state, name, expected):
     assert "=" not in rendered.content
     assert "配備ジョブを開始" not in rendered.content
     assert "api:ops-bot" not in rendered.content
+
+
+def test_event_generation_omits_values_wider_than_the_approval_reference_limit():
+    event = lambda generation: _event("guard_state_changed", {
+        "guard_kind": "kill_switch", "state": "latched", "generation": generation})
+    assert render_event(event(int("9" * 18))).content == "kill switch が作動しました (世代 " + "9" * 18 + ")。"
+    assert render_event(event(int("9" * 19))).content == "kill switch が作動しました。"
+
+
+def test_event_body_falls_back_to_a_fixed_sentence_when_a_valid_integer_overflows_discord():
+    rendered = render_event(_event("guard_state_changed", {
+        "guard_kind": "kill_switch", "state": "latched", "generation": int("9" * 2100)}))
+    assert rendered.content == "イベント guard_state_changed が記録されました。"
+    assert len(rendered.content) <= 2000
 
 
 @pytest.mark.parametrize(("code", "fields", "expected"), [

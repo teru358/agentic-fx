@@ -340,7 +340,7 @@ def confirm_view(record: ApprovalRecord) -> ViewModel:
 
 
 def _event_text(payload: dict[str, object], plugin_name: str | None,
-                approval_id: int | None) -> str:
+                approval_id: int | None, *, integer_limit: int | None = 18) -> str:
     code = payload["code"]
     if code == "approval_state_changed":
         approval = payload["ref"].split(":", 1)[1]
@@ -351,6 +351,8 @@ def _event_text(payload: dict[str, object], plugin_name: str | None,
             return f"{subject} が承認・配備されました。"
         if state == "rejected":
             return f"{subject} が却下されました。"
+        if state == "expired":
+            return f"{subject} は期限切れになりました。"
         return f"承認 #{approval} の状態が変わりました ({escape_discord(state)})。"
     if code == "job_state_changed":
         state = payload["state"]
@@ -366,7 +368,8 @@ def _event_text(payload: dict[str, object], plugin_name: str | None,
         generation = payload["generation"]
         if guard == "kill_switch" and state in {"latched", "released"}:
             text = "kill switch が作動しました" if state == "latched" else "kill switch が解除されました"
-            return text + (f" (世代 {escape_discord(str(generation))})" if generation is not None else "") + "。"
+            shown_generation = _event_integer(generation, limit=integer_limit)
+            return text + (f" (世代 {shown_generation})" if shown_generation is not None else "") + "。"
         if guard == "data_feed" and state == "resume_requested":
             return "データ取得の再開を要求しました。"
         return f"ガード {escape_discord(guard)} の状態が {escape_discord(state)} になりました。"
@@ -377,12 +380,28 @@ def _event_text(payload: dict[str, object], plugin_name: str | None,
     return f"イベント {escape_discord(code)} が記録されました。"
 
 
+def _event_integer(value: object, *, limit: int | None) -> str | None:
+    if type(value) is not int or isinstance(value, bool):
+        return None
+    try:
+        text = str(value)
+    except ValueError:
+        return None
+    if re.fullmatch(r"[0-9]+", text) is None:
+        return None
+    return text if limit is None or len(text) <= limit else None
+
+
 def render_event(event: object, *, mention_role_id: int | None = None,
                  mention_user_ids: tuple[int, ...] = (), plugin_name: str | None = None,
                  approval_id: int | None = None) -> RenderedEvent:
     """完全検証済み event を固定 template の 1 行通知にする。"""
     payload = encode_event(event)
-    text = _event_text(payload, plugin_name, approval_id)
+    text = _event_text(payload, plugin_name, approval_id, integer_limit=None)
+    if len(text) > BODY_CHARS:
+        text = f"イベント {payload['code']} が記録されました。"
+    else:
+        text = _event_text(payload, plugin_name, approval_id)
     mentions: list[str] = []
     if type(mention_role_id) is int:
         mentions.append(f"<@&{mention_role_id}>")

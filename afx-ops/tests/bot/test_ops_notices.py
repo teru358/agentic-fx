@@ -25,12 +25,14 @@ class _Client:
         self.events_reply = Reply(200, {"events": events, "high_watermark": len(events)}, None)
         self.detail = detail
         self.approval_calls = 0
+        self.approval_timeouts = []
 
     def events(self, *, after, limit):
         return self.events_reply
 
-    def approval(self, approval_id):
+    def approval(self, approval_id, *, timeout=None):
         self.approval_calls += 1
+        self.approval_timeouts.append(timeout)
         return self.detail
 
     def approvals(self, *, limit):
@@ -76,6 +78,7 @@ def test_ac18_default_filters_known_events_and_advances_cursor(tmp_path, ops_not
         assert len(channel.sent) == count
         assert (load(fd).cursor, load(fd).high_watermark) == (6, 6)
         assert client.approval_calls == 1
+        assert client.approval_timeouts == [3.0]
     finally:
         adapter.close(); os.close(fd)
 
@@ -138,6 +141,7 @@ def test_the_posted_approval_sentence_carries_the_escaped_strategy_name(tmp_path
         asyncio.run(_deliver(adapter))
         assert channel.sent == [r"承認 #8 (戦略 sma\_cross) が承認・配備されました。"]
         assert client.approval_calls == 1
+        assert client.approval_timeouts == [3.0]
     finally:
         adapter.close(); os.close(fd)
 
@@ -146,7 +150,7 @@ def test_the_posted_approval_sentence_carries_the_escaped_strategy_name(tmp_path
 def test_a_failing_name_lookup_still_posts_the_sentence_without_a_name(tmp_path, failure):
     client = _Client([_approved()])
 
-    def broken(approval_id):
+    def broken(approval_id, *, timeout=None):
         raise failure
 
     client.approval = broken
@@ -186,13 +190,16 @@ def test_an_approval_event_is_settled_after_its_post_and_only_then(tmp_path):
     adapter, channel, fd = _adapter(tmp_path, client)
     settled = []
 
-    async def settle(approval_id):
-        settled.append((approval_id, list(channel.sent)))
+    async def settle(approval_id, *, detail=None):
+        settled.append((approval_id, list(channel.sent), detail))
 
     adapter._settle = settle
     try:
         asyncio.run(_deliver(adapter))
-        assert settled == [(8, ["承認 #8 (戦略 sma\\_cross) が承認・配備されました。"])]
+        assert [(approval_id, sent) for approval_id, sent, _ in settled] == [
+            (8, ["承認 #8 (戦略 sma\\_cross) が承認・配備されました。"])]
+        assert settled[0][2] is client.detail
+        assert client.approval_calls == 1
     finally:
         adapter.close(); os.close(fd)
 

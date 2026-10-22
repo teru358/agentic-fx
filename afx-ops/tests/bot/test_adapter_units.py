@@ -68,7 +68,7 @@ class _Client:
         self._events = events
         self._approvals = approvals
 
-    def approval(self, approval_id: int) -> Reply:
+    def approval(self, approval_id: int, *, timeout=None) -> Reply:
         return self._detail
 
     def events(self, *, after: int, limit: int) -> Reply:
@@ -102,6 +102,81 @@ def test_an_event_naming_a_still_pending_approval_leaves_its_record_active(tmp_p
     try:
         asyncio.run(adapter._settle(7))
         assert gate.state.approvals[0].state == "fresh"
+    finally:
+        adapter.close()
+        os.close(fd)
+
+
+class _EventClient(_Client):
+    def __init__(self, detail, events) -> None:
+        super().__init__(detail=detail, events=events)
+        self.approval_calls = 0
+        self.timeouts = []
+
+    def approval(self, approval_id: int, *, timeout=None) -> Reply:
+        self.approval_calls += 1
+        self.timeouts.append(timeout)
+        if isinstance(self._detail, Exception):
+            raise self._detail
+        return self._detail
+
+
+class _EventDiscord:
+    def __init__(self, sent) -> None:
+        self.sent = sent
+
+    def get_partial_messageable(self, channel_id, *, guild_id):
+        owner = self
+
+        class _Channel:
+            async def send(self, content, **kwargs):
+                owner.sent.append(content)
+        return _Channel()
+
+
+def test_event_name_timeout_posts_without_a_name_and_uses_the_short_deadline(tmp_path):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+    client = _EventClient(TimeoutError(), Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED, guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id,
+                       state_dir_fd=fd)
+    sent = []
+    adapter = _adapter(gate, client, dir_fd=fd)
+    adapter.discord = _EventDiscord(sent)
+    async def direct(fn, *args):
+        return fn(*args)
+    adapter._run = direct
+    try:
+        asyncio.run(adapter.deliver_events())
+        assert client.timeouts == [3.0]
+        assert sent == ["承認 #7 が承認・配備されました。"]
+    finally:
+        adapter.close()
+        os.close(fd)
+
+
+@pytest.mark.parametrize(("reply", "expected_calls", "terminal"), [
+    (Reply(429, None, "rate", 300), 1, False),
+    (Reply(200, {"status": "approved", "payload_sha256": "a" * 64}, None), 1, True),
+])
+def test_event_name_lookup_is_observed_and_reused_by_settle(tmp_path, reply, expected_calls, terminal):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+    client = _EventClient(reply, Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED.with_record(_record()), guild_id=SETTINGS.guild_id,
+                       channel_id=SETTINGS.channel_id, state_dir_fd=fd)
+    adapter = _adapter(gate, client, dir_fd=fd)
+    async def direct(fn, *args):
+        return fn(*args)
+    adapter._run = direct
+    adapter.discord = _EventDiscord([])
+    adapter._sync_views = lambda: asyncio.sleep(0)
+    try:
+        asyncio.run(adapter.deliver_events())
+        assert client.approval_calls == expected_calls
+        assert (gate.state.record(7).state == "done") is terminal
     finally:
         adapter.close()
         os.close(fd)

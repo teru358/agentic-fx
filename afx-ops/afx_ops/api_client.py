@@ -355,12 +355,13 @@ class _Client:
         return f"{type(self).__name__}(socket={str(self._endpoint.socket_path)!r})"
 
     def _call(self, method: str, path: str, *, query: dict | None = None,
-              body: dict | None = None) -> Reply:
+              body: dict | None = None, timeout: float | None = None) -> Reply:
         """actor header を付けない要求。actor を付けられるのは ``BotClient`` だけ。"""
-        return self._send(_build(self._token, method, path, query, body, None))
+        return self._send(_build(self._token, method, path, query, body, None), timeout=timeout)
 
-    def _send(self, payload: bytes) -> Reply:
-        with _Request.open(self._endpoint) as request:
+    def _send(self, payload: bytes, *, timeout: float | None = None) -> Reply:
+        request_timeout = HTTP_TIMEOUT if timeout is None else timeout
+        with _Request.open(self._endpoint, timeout=request_timeout) as request:
             with self._lock:
                 ident = threading.get_ident()
                 self._inflight[request] = ident
@@ -369,7 +370,7 @@ class _Client:
                 if interrupted:
                     request.abort()
                 request.send(payload)
-                return _reply(*request.receive())
+                return _reply(*request.receive(timeout=request_timeout))
             finally:
                 with self._lock:
                     self._inflight.pop(request, None)
@@ -394,8 +395,9 @@ class _Client:
         with self._lock:
             self._interrupted_threads.discard(ident)
 
-    def _get(self, path: str, **query) -> Reply:
-        return self._call("GET", path, query={k: v for k, v in query.items() if v is not None})
+    def _get(self, path: str, *, timeout: float | None = None, **query) -> Reply:
+        return self._call("GET", path, query={k: v for k, v in query.items() if v is not None},
+                          timeout=timeout)
 
 
 class BotClient(_Client):
@@ -409,8 +411,8 @@ class BotClient(_Client):
     def approvals(self, *, limit: int = 20) -> Reply:
         return self._get("/v1/approvals", status="pending", limit=limit)
 
-    def approval(self, approval_id: int) -> Reply:
-        return self._get(f"/v1/approvals/{_int_id(approval_id)}")
+    def approval(self, approval_id: int, *, timeout: float | None = None) -> Reply:
+        return self._get(f"/v1/approvals/{_int_id(approval_id)}", timeout=timeout)
 
     def approve(self, actor: Actor, approval_id: int, *, payload_sha256: str) -> "Decision":
         return self._decide(actor, "approve", approval_id, {"payload_sha256": payload_sha256})
