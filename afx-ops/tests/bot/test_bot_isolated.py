@@ -571,6 +571,23 @@ def test_ac24_trade_settings_read_before_isolation_apply_in_the_isolated_bot(
     bot.stop()
 
 
+def test_ops_notices_all_read_before_isolation_posts_the_events_the_default_hides(
+        root, pki, daemon, discord_fake, dns, child_env, bots):
+    fake = discord_fake
+    _seed_started(root)
+    done = {"id": 1, "ts": "2026-10-20T00:00:00+00:00", "code": "job_state_changed",
+            "ref": "job:" + "a" * 32,
+            "fields": {"job_kind": "ask", "state": "done", "result_code": "ok"}}
+    daemon.set(events=[done, _service_health(2)])
+    bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon,
+                       bot_config={"ops_notices": "all"})
+    wait_for(lambda: _snapshot(root)["cursor"] == 2)
+    contents = [c.body["content"] for c in fake.channel_posts(CHANNEL) if not c.body.get("embeds")]
+    assert contents == [f"<@&{ROLE}> <@{USER_A}> ジョブ ask が完了しました。",
+                        f"<@&{ROLE}> <@{USER_A}> api の健全性が ok になりました。"]
+    bot.stop()
+
+
 def test_gateway_drop_resumes_and_interactions_still_defer(root, pki, daemon, discord_fake, dns,
                                                            child_env, bots):
     fake = discord_fake

@@ -55,3 +55,67 @@ def test_ac20_event_templates_only_show_the_allowed_values(code, fields, expecte
 
 def test_ac20_discord_syntax_is_escaped_in_permitted_template_values():
     assert escape_discord("<@&1> **x** @here") == r"\<@ &1\> \*\*x\*\* @ here"
+
+
+@pytest.mark.parametrize(("code", "fields", "expected"), [
+    ("job_state_changed", {"job_kind": "a_b", "state": "failed", "result_code": "r_c"},
+     r"ジョブ a\_b が失敗しました (理由 code: r\_c)。"),
+    ("job_state_changed", {"job_kind": "a_b", "state": "cancelled", "result_code": "r_c"},
+     r"ジョブ a\_b が取り消されました (理由 code: r\_c)。"),
+    ("job_state_changed", {"job_kind": "a_b", "state": "shutdown", "result_code": "r_c"},
+     r"ジョブ a\_b が停止で中断しました (理由 code: r\_c)。"),
+    ("job_state_changed", {"job_kind": "approve", "state": "cancelled", "result_code": None},
+     "ジョブ approve が取り消されました。"),
+    ("job_state_changed", {"job_kind": "approve", "state": "queued", "result_code": "ok"},
+     "ジョブ approve が受け付けられました。"),
+    ("job_state_changed", {"job_kind": "approve", "state": "running", "result_code": "ok"},
+     "ジョブ approve が実行中です。"),
+    ("job_state_changed", {"job_kind": "approve", "state": "paused", "result_code": "ok"},
+     "ジョブ approve が状態が変わりました。"),
+    ("guard_state_changed", {"guard_kind": "g_k", "state": "s_t", "generation": 2},
+     r"ガード g\_k の状態が s\_t になりました。"),
+    ("guard_state_changed", {"guard_kind": "kill_switch", "state": "released", "generation": 4},
+     "kill switch が解除されました (世代 4)。"),
+    ("guard_state_changed", {"guard_kind": "kill_switch", "state": "released", "generation": None},
+     "kill switch が解除されました。"),
+    ("guard_state_changed", {"guard_kind": "kill_switch", "state": "latched", "generation": None},
+     "kill switch が作動しました。"),
+    ("guard_state_changed", {"guard_kind": "kill_switch", "state": "resume_requested", "generation": 1},
+     "ガード kill\\_switch の状態が resume\\_requested になりました。"),
+    ("guard_state_changed", {"guard_kind": "data_feed", "state": "latched", "generation": 1},
+     "ガード data\\_feed の状態が latched になりました。"),
+    ("service_health_changed", {"component_code": "a_b", "health_code": "d_e"},
+     r"a\_b の健全性が d\_e になりました。"),
+    ("ops_request_terminal", {"endpoint_code": "e_p", "result_code": "r_c",
+                              "authenticated_principal": "api:ops-bot"},
+     r"操作 e\_p が終了しました (結果 code: r\_c)。"),
+])
+def test_event_templates_escape_every_value_and_pick_the_right_branch(code, fields, expected):
+    assert render_event(_event(code, fields)).content == expected
+
+
+def test_approval_state_outside_the_known_pair_is_escaped_in_the_fallback_sentence():
+    rendered = render_event(_event("approval_state_changed", {
+        "state": "e_x", "decision_code": "approve", "decided_by": "api:ops-bot"}),
+                            plugin_name="sma_cross")
+    assert rendered.content == r"承認 #25 の状態が変わりました (e\_x)。"
+
+
+@pytest.mark.parametrize("name", ["../x", "@everyone", "with space", "", "A", 3])
+def test_a_plugin_name_outside_the_name_grammar_is_never_written(name):
+    rendered = render_event(_event("approval_state_changed", {
+        "state": "approved", "decision_code": "approve"}), plugin_name=name)
+    assert rendered.content == "承認 #25 が承認・配備されました。"
+
+
+@pytest.mark.parametrize(("state", "result_code", "expected"), [
+    ("failed", "unavailable", "承認 #7 の配備ジョブが失敗しました (理由 code: unavailable)。"),
+    ("failed", None, "承認 #7 の配備ジョブが失敗しました。"),
+    ("cancelled", "unavailable", "ジョブ approve が取り消されました (理由 code: unavailable)。"),
+    ("shutdown", "unavailable", "ジョブ approve が停止で中断しました (理由 code: unavailable)。"),
+    ("done", "ok", "ジョブ approve が完了しました。"),
+])
+def test_a_deploy_job_failure_names_its_approval_only_when_one_is_given(state, result_code, expected):
+    rendered = render_event(_event("job_state_changed", {
+        "job_kind": "approve", "state": state, "result_code": result_code}), approval_id=7)
+    assert rendered.content == expected

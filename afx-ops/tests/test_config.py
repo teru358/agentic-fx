@@ -520,6 +520,8 @@ def test_ac18_bot_reads_ops_notices(monkeypatch, tmp_path, notices):
                                   'trade_notices = ["all"]', 'trade_amounts = "abs"',
                                   'trade_amounts = 1', 'trade_amounts = false',
                                   'ops_notices = "everything"', 'ops_notices = 1',
+                                  'ops_notices = "none"', 'ops_notices = "ALL"', 'ops_notices = ""',
+                                  'ops_notices = true',
                                   'deliver_trade_events = true'])
 def test_ac23_bot_rejects_invalid_values_and_notify_only_keys(monkeypatch, tmp_path, line):
     _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + line + "\n")
@@ -546,3 +548,8 @@ def test_ac23_web_rejects_the_trade_keys(monkeypatch, tmp_path):
     _write_config(monkeypatch, tmp_path, "web", _BASE + 'port = 8080\ntrade_notices = "all"\n')
     with pytest.raises(ConfigError):
         read_config("web")
+
+
+def test_the_ops_notices_default_holds_for_features_that_do_not_read_it(monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "notify", _BASE)
+    assert _read_closing("notify").ops_notices == "default"
