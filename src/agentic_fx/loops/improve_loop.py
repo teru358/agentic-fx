@@ -2699,7 +2699,8 @@ class ImproveLoop:
                 return self._quality_unavailable(
                     mission_id, "no_usable_comparison_row")
             duplicate = improve_quality.find_duplicate_logic(
-                name=candidate.name, logic_hash=candidate.logic_hash,
+                name=candidate.name, kind=approval_payload.get("kind"),
+                logic_hash=candidate.logic_hash,
                 populations=populations)
             if duplicate is not None:
                 return self._quality_rejection(

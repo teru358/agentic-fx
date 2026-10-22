@@ -497,6 +497,39 @@ def test_family_redirect_allows_the_deployed_name_but_not_another_alias(
     _expect_rows(conn, ctx, seeded, "duplicate_logic")
 
 
+def test_family_redirect_archive_for_another_deployed_family_is_a_duplicate(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    deployed = [
+        _deployed("alpha", logic_hash=_hash_of(PY_Y), family=FAMILY),
+        _deployed("beta", logic_hash=_hash_of(PY_Z),
+                  family="strategy:ema@1h@USDJPY"),
+    ]
+    _run_strategy(
+        app, root, "cand", py=PY_X,
+        extra=[_population_patch(deployed=deployed), _family_patch(FAMILY)])
+
+    loop, ctx, seeded = _run_strategy(
+        app, root, "beta", py=PY_X,
+        extra=[_population_patch(deployed=deployed),
+               _family_patch("strategy:ema@1h@USDJPY")])
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+
+
+def test_family_redirect_archive_without_a_family_is_a_duplicate(improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    _decided_row(conn, name="cand", logic_hash=_hash_of(PY_X),
+                 outcome="family_redirect")
+    deployed = _deployed("beta", logic_hash=_hash_of(PY_Y), family=FAMILY)
+
+    loop, ctx, seeded = _run_strategy(
+        app, root, "beta", py=PY_X,
+        extra=[_population_patch(deployed=[deployed]), _family_patch(FAMILY)])
+    _expect_rows(conn, ctx, seeded, "duplicate_logic")
+
+
 def test_ac11_a_rejected_family_is_not_detected(improve_env):
     app, root = improve_env
     conn = app.conn_core

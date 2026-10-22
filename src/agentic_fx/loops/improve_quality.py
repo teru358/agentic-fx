@@ -249,22 +249,26 @@ def base_unavailable(*populations: Population) -> bool:
     return attempted > 0 and usable == 0
 
 
-def find_duplicate_logic(*, name: str, logic_hash: str,
+def find_duplicate_logic(*, name: str, kind: str | None = None, logic_hash: str,
                          populations: Iterable[Population]
                          ) -> IdentityEntry | None:
     """別名の配備済み・example・却下済み・降格済みなどとロジックが一致する
     最初の行。配備済みの同名旧版 (と、その版として承認された台帳の行) との
     一致は更新なので数えない。"""
     populations = list(populations)
-    deployed_names = {
-        entry.name for population in populations
-        for entry in population.entries if entry.source == "deployed"}
+    deployed_entries = [
+        entry for population in populations for entry in population.entries
+        if entry.source == "deployed"]
+    deployed_names = {entry.name for entry in deployed_entries}
     for population in populations:
         for entry in population.entries:
             if entry.logic_hash != logic_hash:
                 continue
             if (entry.source == "archive" and entry.outcome == "family_redirect"
-                    and name in deployed_names):
+                    and entry.family_key is not None and any(
+                        deployed.name == name and deployed.kind == kind
+                        and deployed.family_key == entry.family_key
+                        for deployed in deployed_entries)):
                 continue
             if entry.name == name and name in deployed_names and (
                     entry.source == "deployed"
