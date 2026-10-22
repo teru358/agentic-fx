@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from afx_ops.api_client import Reply
+from afx_ops.api_client import ApiError, Reply
 from afx_ops.bot.adapter import BotAdapter, BotSettings, _plugin_name
 from afx_ops.event_outcome import SkipKnown
 from afx_ops.gate.service import GateService
@@ -146,7 +146,7 @@ def test_the_posted_approval_sentence_carries_the_escaped_strategy_name(tmp_path
         adapter.close(); os.close(fd)
 
 
-@pytest.mark.parametrize("failure", [RuntimeError("down"), OSError("down"), KeyError("x")])
+@pytest.mark.parametrize("failure", [ApiError("down"), TimeoutError(), OSError("down")])
 def test_a_failing_name_lookup_still_posts_the_sentence_without_a_name(tmp_path, failure):
     client = _Client([_approved()])
 
@@ -184,7 +184,7 @@ def test_a_failed_post_leaves_the_cursor_and_the_next_round_resends(tmp_path):
         adapter.close(); os.close(fd)
 
 
-def test_an_approval_event_is_settled_after_its_post_and_only_then(tmp_path):
+def test_an_approval_event_is_settled_after_its_post_without_an_unknown_detail(tmp_path):
     client = _Client([_approved(), event(2, "service_health_changed",
                                          {"component_code": "api", "health_code": "ok"}, "instance")])
     adapter, channel, fd = _adapter(tmp_path, client)
@@ -198,7 +198,7 @@ def test_an_approval_event_is_settled_after_its_post_and_only_then(tmp_path):
         asyncio.run(_deliver(adapter))
         assert [(approval_id, sent) for approval_id, sent, _ in settled] == [
             (8, ["承認 #8 (戦略 sma\\_cross) が承認・配備されました。"])]
-        assert settled[0][2] is client.detail
+        assert settled[0][2] is None
         assert client.approval_calls == 1
     finally:
         adapter.close(); os.close(fd)

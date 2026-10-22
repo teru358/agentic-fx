@@ -35,8 +35,9 @@ from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
-from afx_ops.gate.render import _NAME, footer as gate_footer
-from afx_ops.gate.render import primary_view, render_approval, render_terminal
+from afx_ops.api_client import ApiError
+from afx_ops.gate.render import footer as gate_footer
+from afx_ops.gate.render import plugin_name_or_none, primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
@@ -148,7 +149,13 @@ def _plugin_name(reply: object) -> str | None:
     data = getattr(reply, "data", None)
     change = data.get("change") if type(data) is dict else None
     name = change.get("name") if type(change) is dict else None
-    return name if type(name) is str and _NAME.fullmatch(name) else None
+    return plugin_name_or_none(name)
+
+
+def _event_content(plan) -> str:
+    """Discord の 2000 字制限に合わせ、必要なら通知 mention だけを外す。"""
+    content = " ".join((*plan.mentions, plan.content))
+    return plan.content if len(content) > 2000 else content
 
 
 class BotAdapter:
@@ -676,18 +683,9 @@ class BotAdapter:
         # 新しい watermark は最初の確定 (投稿・既知の skip) と同じ置換で保存する
         progressed = False
         for event in events:
-            plugin_name = None
             detail = None
+            plugin_name = None
             approval_id = _approval_id_of(event)
-            if approval_id is not None:
-                try:
-                    detail = await self._run(
-                        lambda: self.client.approval(approval_id, timeout=NAME_LOOKUP_TIMEOUT_SECONDS))
-                except Exception:
-                    pass
-                else:
-                    self._observe(approval_id, detail)
-                    plugin_name = _plugin_name(detail)
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
                     e, mention_role_id=self.settings.mention_role_id,
@@ -705,7 +703,23 @@ class BotAdapter:
                 await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
                 progressed = True
                 continue
-            content = " ".join((*plan.mentions, plan.content))
+            if (approval_id is not None and event["fields"].get("state") in {"approved", "rejected", "expired"}
+                    and self._poll_due(approval_id)):
+                try:
+                    detail = await self._run(
+                        lambda: self.client.approval(approval_id, timeout=NAME_LOOKUP_TIMEOUT_SECONDS))
+                except (ApiError, TimeoutError, OSError):
+                    pass
+                else:
+                    self._observe(approval_id, detail)
+                    plugin_name = _plugin_name(detail)
+                    plan = await self._run(lambda e=event: self.gate.plan_event(
+                        e, mention_role_id=self.settings.mention_role_id,
+                        mention_user_ids=self.settings.mention_user_ids,
+                        trade_notices=self.settings.trade_notices,
+                        trade_amounts=self.settings.trade_amounts,
+                        ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
+            content = _event_content(plan)
             allowed = (self._allowed_mentions() if plan.allow_mentions
                        else discord.AllowedMentions.none())
             try:
@@ -716,7 +730,7 @@ class BotAdapter:
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
             progressed = True
             if approval_id is not None:
-                await self._settle(approval_id, detail=detail)
+                await self._settle(approval_id, detail=detail if _detail_status(detail) not in {None, "pending"} else None)
         if unreadable:
             raise BotFailure("payload_invalid")
         if not progressed and high > self.gate.state.high_watermark:

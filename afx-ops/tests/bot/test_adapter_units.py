@@ -8,13 +8,14 @@ from types import SimpleNamespace
 import discord
 import pytest
 
-from afx_ops.api_client import Reply
-from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, _post_effect
+from afx_ops.api_client import ApiError, Reply
+from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, _event_content, _post_effect
 from afx_ops.bot.views import GateView
 from afx_ops.gate.render import primary_view
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, BotState, load, observe_high
 from afx_ops.gate.types import GateResult
+from afx_ops.gate.types import EventPlan
 
 SETTINGS = BotSettings(guild_id=12345678901234567, channel_id=12345678901234568,
                        mention_role_id=None, mention_user_ids=())
@@ -156,6 +157,85 @@ def test_event_name_timeout_posts_without_a_name_and_uses_the_short_deadline(tmp
         os.close(fd)
 
 
+def test_event_content_drops_mentions_when_their_addition_exceeds_discord_limit():
+    plan = EventPlan(1, "x" * 1990, ("<@&10000000000000000000>",))
+    assert _event_content(plan) == plan.content
+
+
+@pytest.mark.parametrize("state", ["pending", "paused"])
+def test_event_name_lookup_is_skipped_until_a_terminal_approval_plan_is_known(tmp_path, state):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": state, "decision_code": "approve"}}
+    client = _EventClient(Reply(200, {"change": {"name": "sma_cross"}}, None),
+                          Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED, guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id,
+                       state_dir_fd=fd)
+    adapter = _adapter(gate, client, dir_fd=fd)
+    adapter.discord = _EventDiscord([])
+    async def direct(fn, *args): return fn(*args)
+    adapter._run = direct
+    try:
+        asyncio.run(adapter.deliver_events())
+        assert client.approval_calls == 0
+    finally:
+        adapter.close(); os.close(fd)
+
+
+def test_event_name_lookup_respects_an_existing_poll_deferral(tmp_path):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+    client = _EventClient(Reply(200, {"change": {"name": "sma_cross"}}, None),
+                          Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED, guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id,
+                       state_dir_fd=fd)
+    adapter = _adapter(gate, client, dir_fd=fd,)
+    adapter.discord = _EventDiscord([])
+    adapter._defer(7, 300)
+    async def direct(fn, *args): return fn(*args)
+    adapter._run = direct
+    try:
+        asyncio.run(adapter.deliver_events())
+        assert client.approval_calls == 0
+    finally:
+        adapter.close(); os.close(fd)
+
+
+@pytest.mark.parametrize("failure", [ApiError("timeout"), TimeoutError(), OSError("down")])
+def test_recoverable_event_name_errors_keep_the_unnamed_post(tmp_path, failure):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+    client = _EventClient(failure, Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED, guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id,
+                       state_dir_fd=fd)
+    adapter = _adapter(gate, client, dir_fd=fd); adapter.discord = _EventDiscord([])
+    async def direct(fn, *args): return fn(*args)
+    adapter._run = direct
+    try:
+        asyncio.run(adapter.deliver_events())
+    finally:
+        adapter.close(); os.close(fd)
+
+
+def test_unexpected_event_name_error_propagates(tmp_path):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+    client = _EventClient(RuntimeError("stop"), Reply(200, {"events": [event], "high_watermark": 1}, None))
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    gate = GateService(_STARTED, guild_id=SETTINGS.guild_id, channel_id=SETTINGS.channel_id,
+                       state_dir_fd=fd)
+    adapter = _adapter(gate, client, dir_fd=fd); adapter.discord = _EventDiscord([])
+    async def direct(fn, *args): return fn(*args)
+    adapter._run = direct
+    try:
+        with pytest.raises(RuntimeError, match="stop"):
+            asyncio.run(adapter.deliver_events())
+    finally:
+        adapter.close(); os.close(fd)
+
+
 @pytest.mark.parametrize(("reply", "expected_calls", "terminal"), [
     (Reply(429, None, "rate", 300), 1, False),
     (Reply(200, {"status": "approved", "payload_sha256": "a" * 64}, None), 1, True),
@@ -180,6 +260,38 @@ def test_event_name_lookup_is_observed_and_reused_by_settle(tmp_path, reply, exp
     finally:
         adapter.close()
         os.close(fd)
+
+
+def test_pending_event_detail_is_refetched_while_terminal_event_detail_is_reused(tmp_path):
+    event = {"id": 1, "ts": "2026-10-22T00:00:00+00:00", "code": "approval_state_changed",
+             "ref": "approval:7", "fields": {"state": "approved", "decision_code": "approve"}}
+
+    class Client(_EventClient):
+        def __init__(self, details):
+            super().__init__(details[0], Reply(200, {"events": [event], "high_watermark": 1}, None))
+            self.details = iter(details)
+        def approval(self, approval_id, *, timeout=None):
+            self.approval_calls += 1
+            self.timeouts.append(timeout)
+            return next(self.details)
+
+    for details, calls in (([Reply(200, {"status": "pending"}, None),
+                            Reply(200, {"status": "approved"}, None)], 2),
+                           ([Reply(200, {"status": "approved"}, None)], 1)):
+        case_dir = tmp_path / str(calls)
+        case_dir.mkdir()
+        fd = os.open(case_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        gate = GateService(_STARTED.with_record(_record()), guild_id=SETTINGS.guild_id,
+                           channel_id=SETTINGS.channel_id, state_dir_fd=fd)
+        client = Client(details)
+        adapter = _adapter(gate, client, dir_fd=fd); adapter.discord = _EventDiscord([])
+        async def direct(fn, *args): return fn(*args)
+        adapter._run = direct; adapter._sync_views = lambda: asyncio.sleep(0)
+        try:
+            asyncio.run(adapter.deliver_events())
+            assert client.approval_calls == calls
+        finally:
+            adapter.close(); os.close(fd)
 
 
 def test_an_unreadable_event_is_a_payload_failure_and_never_a_silent_skip(tmp_path):

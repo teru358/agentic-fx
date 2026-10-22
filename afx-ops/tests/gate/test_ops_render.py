@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from afx_ops.gate.render import escape_discord, render_event
+from afx_ops.gate.render import OPS_EVENT_SPECS, escape_discord, render_event
+from afx_ops.notify.payload import ALLOWED_FIELDS
+from afx_ops.trade_events import TRADE_CODES
 
 
 TS = "2026-10-22T00:00:00+00:00"
@@ -38,10 +40,10 @@ def test_event_generation_omits_values_wider_than_the_approval_reference_limit()
     assert render_event(event(int("9" * 19))).content == "kill switch が作動しました。"
 
 
-def test_event_body_falls_back_to_a_fixed_sentence_when_a_valid_integer_overflows_discord():
+def test_event_body_uses_the_limited_generation_sentence_without_a_second_fallback():
     rendered = render_event(_event("guard_state_changed", {
         "guard_kind": "kill_switch", "state": "latched", "generation": int("9" * 2100)}))
-    assert rendered.content == "イベント guard_state_changed が記録されました。"
+    assert rendered.content == "kill switch が作動しました。"
     assert len(rendered.content) <= 2000
 
 
@@ -70,6 +72,29 @@ def test_ac20_event_templates_only_show_the_allowed_values(code, fields, expecte
 
 def test_ac20_discord_syntax_is_escaped_in_permitted_template_values():
     assert escape_discord("<@&1> **x** @here") == r"\<@ &1\> \*\*x\*\* @ here"
+
+
+def test_event_templates_omit_invalid_fields_and_use_the_generic_sentence_without_a_subject():
+    cases = [
+        ("job_state_changed", {"job_kind": None, "state": "done", "result_code": "ok"}),
+        ("guard_state_changed", {"guard_kind": None, "state": "latched", "generation": 1}),
+        ("service_health_changed", {"component_code": None, "health_code": "ok"}),
+        ("ops_request_terminal", {"endpoint_code": "approve", "result_code": None,
+                                  "authenticated_principal": "api:ops-bot"}),
+    ]
+    for code, fields in cases:
+        content = render_event(_event(code, fields)).content
+        assert "  " not in content and "(結果 code: )" not in content
+        if code != "ops_request_terminal":
+            assert content == f"イベント {escape_discord(code)} が記録されました。"
+        else:
+            assert content == "操作 approve が終了しました。"
+
+
+def test_ops_event_table_matches_the_daemon_non_trade_event_schema():
+    assert set(OPS_EVENT_SPECS) == set(ALLOWED_FIELDS) - set(TRADE_CODES)
+
+
 
 
 @pytest.mark.parametrize(("code", "fields", "expected"), [

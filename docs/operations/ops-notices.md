@@ -4,7 +4,7 @@ bot の `ops.toml` では、任意 key `ops_notices` で ops event 通知を選�
 
 | key | 値 | 既定 | 意味 |
 |---|---|---|---|
-| `ops_notices` | `default` / `all` | `default` | `default` は承認状態、guard、サービス健全性、および失敗・取消・停止の job だけを投稿します。`all` は job の完了・受付・実行中、操作要求の終了、event stream health も投稿します。投稿しない既知 event も cursor は進みます。 |
+| `ops_notices` | `default` / `all` | `default` | `default` は承認状態、guard、サービス健全性、および失敗・取消・停止の job だけを投稿します。`all` は job の完了・受付・実行中、操作要求の終了、event stream health も投稿します。event stream health は汎用の「イベント … が記録されました。」という文面です。投稿しない既知 event も cursor は進みます。 |
 
 ```toml
 ops_notices = "all"

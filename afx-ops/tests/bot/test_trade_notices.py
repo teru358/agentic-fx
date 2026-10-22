@@ -69,7 +69,7 @@ class _Events:
     def approvals(self, *, limit: int) -> Reply:
         return Reply(200, {"approvals": []}, None)
 
-    def approval(self, approval_id: int):
+    def approval(self, approval_id: int, *, timeout=None):
         return Reply(200, {"status": "pending"}, None)
 
 

@@ -12,7 +12,7 @@ from afx_ops.api_client import Actor, Decision, DecisionJob, Reply
 from afx_ops.event_outcome import SkipKnown, decide
 from afx_ops.trade_events import NOTICE_KINDS, notice_kind
 
-from .render import confirm_view, render_event
+from .render import confirm_view, render_event, wants_ops_event
 from .trade_render import render_trade
 from .state import (ApprovalRecord, BotState, advance_event, initialize_event_cursor, load,
                     observe_high, save)
@@ -108,12 +108,7 @@ class GateService:
             kind = notice_kind(payload)
             if kind is not None:
                 return kind in kinds
-            if ops_notices == "all":
-                return True
-            if payload["code"] in {"approval_state_changed", "guard_state_changed", "service_health_changed"}:
-                return True
-            return payload["code"] == "job_state_changed" and payload["state"] in {
-                "failed", "cancelled", "shutdown"}
+            return wants_ops_event(payload, ops_notices)
 
         outcome = decide(event, wants)
         event_id = event["id"]
