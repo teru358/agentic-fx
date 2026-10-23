@@ -1,6 +1,6 @@
 # 同梱 web の公開範囲設計
 
-**版:** v0.6
+**版:** v0.7
 **対象:** チケット `web-lan-access-bind-allow-auth`
 **位置づけ:** afx-ops spec v1.6 の web 公開範囲を置き換える amendment spec である。
 
@@ -23,7 +23,9 @@
 | 認証 | `auth = "none" | "basic"` とする。`basic` は固定ユーザー名 `afx` と secret `web.password` を使う。 |
 | 拒否順 | `allow → 有界 parse → Host → auth → route / daemon` とする。 |
 | 既存の安全境界 | GET / HEAD の読み取り専用 route、`ops-web` principal、隔離後の新規 INET socket 拒否を維持する。 |
-| 初版の設定変更 | 稼働中の再設定は行わない。`afx ops disable web` の後に `afx ops enable web --ask` を実行し、全項目を再質問する。 |
+| 設定変更 | 有効化済みの web の設定変更は `afx ops web reconfigure` (別名 `reconf`) で行う。afx、鍵、enable の stage には触れず、ops-web だけを止めて新しい設定で起動し直す (§5.4)。 |
+| enable 時の既存設定 | `afx ops web enable` は既存設定が揃っていても要約 1 行を表示する。対話では「このまま / 変更する」を 1 問だけ聞き、非対話では要約の表示だけとする (§5.2)。 |
+| command の形 | `afx ops <feature> <verb>` とする。web は `afx ops web enable`、`afx ops web disable`、`afx ops web reconfigure`、`afx ops web status` である。`reconf` は `reconfigure` の別名である。 |
 | 実装の分割 | T1 は bind、allow、Host、probe、config、writer に加え、`auth = "none"` の secret dir / 未知 entry / 残骸 password 検査を実装する。T2 は `auth = "basic"` の password 読取りと比較、rate limit、ウィザード、無制限 LAN、status、運用文書を実装する。 |
 
 T1 / T2 の完了境界は次のとおりである。T1 の完了に T2 のウィザード観測を要求しない。
@@ -46,6 +48,10 @@ T1 / T2 の完了境界は次のとおりである。T1 の完了に T2 のウ�
 - reverse proxy と proxy header。
 - firewall の設定と検証。
 - cookie session、login route、logout route。
+
+本 spec は command を新形 `afx ops <feature> <verb>` だけで書く。
+旧形 `afx ops enable web`、`afx ops disable web`、`afx ops status web` を 1 版だけ案内つきの別名として残し、次版で削除する扱いは、CLI 整理 spec `docs/superpowers/specs/2026-10-23-cli-surface-design.md` の項目 (7) (廃止名の shim) に委ねる。
+bot と notify の command も同じ形とし、その移行も同 spec に委ねる。
 
 ## 1. 用語
 
@@ -422,11 +428,11 @@ probe は password の正否をネットワーク経由で試さない。
 
 ### 5.2 enable / 対話ウィザード
 
-初版の設定変更は `afx ops disable web` → `afx ops enable web --ask` の 2 command に固定する。disable 後の enable は後述の前処理を終えてから既存の enable 契約どおり新しい `staged` から始まり、principal が enroll 済みでも afx を停止して再起動するため、ペーパー運用は数十秒停止し得る。「enroll 済みなら止めない」fast-path は本 spec の目標に含めない。
+有効化済みの web の設定変更は §5.4 の `afx ops web reconfigure` で行う。`afx ops web disable` → `afx ops web enable --ask` の 2 command も引き続き使える。disable 後の enable は後述の前処理を終えてから既存の enable 契約どおり新しい `staged` から始まり、principal が enroll 済みでも afx を停止して再起動するため、ペーパー運用は数十秒停止し得る。「enroll 済みなら止めない」fast-path は本 spec の目標に含めない。
 
-`afx ops enable web` は `--ask`、`--non-interactive`、`--config-file <path>`、`--password-file <path>`、`--secret-action remove|keep|install|absent` を受け付ける。`--non-interactive` は stdin / stdout の TTY 判定より常に優先する。
+`afx ops web enable` は `--ask`、`--non-interactive`、`--config-file <path>`、`--password-file <path>`、`--secret-action remove|keep|install|absent` を受け付ける。`--non-interactive` は stdin / stdout の TTY 判定より常に優先する。
 
-`--ask` は未設定又は terminal `disable/disabled` から始める新規 enable だけで受理し、既存値があれば全項目の既定値として表示しつつ、port、公開範囲、bind、allow、auth、必要な secret 操作を省略せず再質問する。terminal `enable/enabled` での `--ask` は config、secret、stage、unit を一切変更せず rc 1、固定 reason `already_enabled` とし、先に `afx ops disable web` を実行する固定案内を出す。未終端 enable / disable 中は従来どおり rc 1、固定 reason `invalid_state` で無変更とする。
+`--ask` は未設定又は terminal `disable/disabled` から始める新規 enable だけで受理し、既存値があれば全項目の既定値として表示しつつ、port、公開範囲、bind、allow、auth、必要な secret 操作を省略せず再質問する。terminal `enable/enabled` での `--ask` は config、secret、stage、unit を一切変更せず rc 1、固定 reason `already_enabled` とし、固定案内 `設定の変更は afx ops web reconfigure` を出す。未終端 enable / disable 中は従来どおり rc 1、固定 reason `invalid_state` で無変更とする。
 
 CLI の許容組み合わせを次に固定する。表外の組み合わせ、同じ option の重複、値を欠く option は rc 2 `setup_input_required` で、config / secret / stage を書かない。
 
@@ -435,21 +441,28 @@ CLI の許容組み合わせを次に固定する。表外の組み合わせ、�
 | 初回の対話 enable | なし | 完全な既存設定。無ければ不足項目だけを質問する。 | `--config-file`、`--password-file`、`--secret-action` |
 | `--ask` | TTY | 既存値を既定として全項目を質問する。 | `--non-interactive`、`--config-file`、`--password-file`、`--secret-action` |
 | 初回の非対話 enable | `--non-interactive --config-file <path> --secret-action <value>` | 下表が要求するときだけ `--password-file <path>` | `--ask` |
+| 対話 reconfigure (§5.4) | TTY | 既存値を既定として全項目を質問する。 | `--ask`、`--config-file`、`--password-file`、`--secret-action` |
+| 非対話 reconfigure (§5.4) | `--non-interactive --config-file <path> --secret-action <value>` | 下表が要求するときだけ `--password-file <path>` | `--ask` |
 
 上表の option grammar を通過した後の入口は、stage、TTY、flag の組で次に固定する。stage の判定を TTY の判定より先に行う。「TTY 有」は stdin と stdout の両方が TTY である状態を表す。「完全な設定」は既存の `ops.toml` と secret が §2 の grammar と組み合わせを満たし、質問なしで前処理へ進める状態を表す。
+reconfigure の列の flag は §5.4 の flag を表す。reconfigure の `--ask` は上表の option grammar で rc 2 `setup_input_required` となり入口表へ到達しないため、該当欄を「—」とする。
 
-| stage | TTY | flag | 結果 |
-|---|---|---|---|
-| 未設定又は terminal `disable/disabled` | 有 | 無し | 完全な設定なら質問せずに前処理へ進む。不足があれば不足項目だけを質問する。 |
-| 未設定又は terminal `disable/disabled` | 無 | 無し | 完全な設定なら質問せずに前処理へ進む (既存契約)。不足があれば rc 2 `setup_input_required` で無変更とする。 |
-| 未設定又は terminal `disable/disabled` | 有 | `--ask` | 既存値を既定として全項目を質問する。 |
-| 未設定又は terminal `disable/disabled` | 無 | `--ask` | rc 2 `setup_input_required` で無変更とする。 |
-| 未設定又は terminal `disable/disabled` | 有 / 無 | `--non-interactive` | 入力 file と action だけで前処理へ進む。TTY は見ない。 |
-| 未終端 enable | 有 / 無 | 無し | 既存の `staged` から状態機械を再開する。config と secret は書かない。 |
-| 未終端 enable | 有 / 無 | `--ask` 又は `--non-interactive` | rc 1 `invalid_state` で無変更とする。 |
-| 未終端 disable | 有 / 無 | 任意 | rc 1 `invalid_state` で無変更とする (既存契約)。 |
-| terminal `enable/enabled` | 有 / 無 | 無し | 既存契約どおり無変更で終わる。 |
-| terminal `enable/enabled` | 有 / 無 | `--ask` 又は `--non-interactive` | rc 1 `already_enabled` で無変更とし、先に `afx ops disable web` を実行する固定案内を出す。 |
+| stage | TTY | flag | `afx ops web enable` | `afx ops web reconfigure` |
+|---|---|---|---|---|
+| 未設定又は terminal `disable/disabled` | 有 | 無し | 完全な設定なら要約 1 行を表示し、「このまま / 変更する」を 1 問だけ聞く。「このまま」は前処理へ進み、「変更する」は `--ask` と同じ全項目を質問する。不足があれば要約を出さず、不足項目だけを質問する。 | rc 1 `not_enabled` で無変更とする。 |
+| 未設定又は terminal `disable/disabled` | 無 | 無し | 完全な設定なら要約 1 行だけを表示し、質問せずに前処理へ進む。不足があれば rc 2 `setup_input_required` で無変更とする。 | rc 1 `not_enabled` で無変更とする。 |
+| 未設定又は terminal `disable/disabled` | 有 | `--ask` | 既存値を既定として全項目を質問する。 | — |
+| 未設定又は terminal `disable/disabled` | 無 | `--ask` | rc 2 `setup_input_required` で無変更とする。 | — |
+| 未設定又は terminal `disable/disabled` | 有 / 無 | `--non-interactive` | 入力 file と action だけで前処理へ進み、目標設定の要約 1 行だけを表示する。TTY は見ない。 | rc 1 `not_enabled` で無変更とする。 |
+| 未終端 enable | 有 / 無 | 無し | 既存の `staged` から状態機械を再開する。config と secret は書かない。 | rc 1 `invalid_state` で無変更とする。 |
+| 未終端 enable | 有 / 無 | `--ask` | rc 1 `invalid_state` で無変更とする。 | — |
+| 未終端 enable | 有 / 無 | `--non-interactive` | rc 1 `invalid_state` で無変更とする。 | rc 1 `invalid_state` で無変更とする。 |
+| 未終端 disable | 有 / 無 | 無し又は `--non-interactive` | rc 1 `invalid_state` で無変更とする (既存契約)。 | rc 1 `invalid_state` で無変更とする。 |
+| 未終端 disable | 有 / 無 | `--ask` | rc 1 `invalid_state` で無変更とする (既存契約)。 | — |
+| terminal `enable/enabled` | 有 | 無し | 既存契約どおり無変更で終わる。 | §5.4 の入口照合を通った後、既存値を既定として全項目を質問する。 |
+| terminal `enable/enabled` | 無 | 無し | 既存契約どおり無変更で終わる。 | rc 2 `setup_input_required` で無変更とする。 |
+| terminal `enable/enabled` | 有 / 無 | `--ask` | rc 1 `already_enabled` で無変更とし、固定案内 `設定の変更は afx ops web reconfigure` を出す。 | — |
+| terminal `enable/enabled` | 有 / 無 | `--non-interactive` | rc 1 `already_enabled` で無変更とし、固定案内 `設定の変更は afx ops web reconfigure` を出す。 | §5.4 の入口照合を通った後、入力 file と action だけで進む。TTY は見ない。 |
 
 非対話入力は現在値から目標を推測しない。`--config-file` は目標 `ops.toml` 全文であり、§2 の grammar と組み合わせを満たさなければならない。`--secret-action` の許容組み合わせは次のとおりである。
 
@@ -469,14 +482,28 @@ CLI の許容組み合わせを次に固定する。表外の組み合わせ、�
 
 対話時の質問順は次に固定する。
 
-1. port を尋ねる。
-2. 「自機のみ」又は「LAN」を尋ねる。既定は「自機のみ」とする。
-3. LAN なら待受 address を候補から選ばせる。
-4. LAN なら誰が見られるかを尋ねる。
-5. 必要なら allow の IPv4 / CIDR を入力させる。
-6. 必要なら password を生成するか利用者が決めるかを尋ねる。目標が `auth = "basic"` で安全な既存 `web.password` がある場合は、既存 password の再利用 (表示しない)、再生成、利用者入力の 3 択を明示選択させる。
-7. 目標が `auth = "none"` で安全な既存 `web.password` がある場合は `secret_action=remove` を提示し、利用者が `none` を明示的に再選択した場合だけ削除する。
-8. 後述の前処理 (a) secret、(b) config の順に live へ atomic 保存し、probe を実行する。probe が成功した後に初めて (c) enable の `staged` record を作る。
+1. enable で既存の設定が完全な場合は、最初に要約 1 行を表示し、「このまま (既定) / 変更する」を 1 問だけ聞く。「このまま」は 2〜8 を飛ばして 9 へ進む。「変更する」は `--ask` と同じく既存値を既定として 2〜8 を全て質問する。設定が完全でない場合は要約を出さず 2 へ進む。reconfigure はこの 1 問を出さず、常に 2〜8 を全て質問する。
+2. port を尋ねる。
+3. 「自機のみ」又は「LAN」を尋ねる。既定は「自機のみ」とする。
+4. LAN なら待受 address を候補から選ばせる。
+5. LAN なら誰が見られるかを尋ねる。
+6. 必要なら allow の IPv4 / CIDR を入力させる。
+7. 必要なら password を生成するか利用者が決めるかを尋ねる。目標が `auth = "basic"` で安全な既存 `web.password` がある場合は、既存 password の再利用 (表示しない)、再生成、利用者入力の 3 択を明示選択させる。
+8. 目標が `auth = "none"` で安全な既存 `web.password` がある場合は `secret_action=remove` を提示し、利用者が `none` を明示的に再選択した場合だけ削除する。
+9. 後述の前処理 (a) secret、(b) config の順に live へ atomic 保存し、probe を実行する。enable では probe が成功した後に初めて (c) enable の `staged` record を作る。reconfigure は (c) を行わず、§5.4 の手順に従う。
+
+要約は次の固定形の 1 行とする。
+
+```text
+web: 待受 <bind>:<port> / 公開 <範囲> / 認証 <none|basic>
+```
+
+`<範囲>` は loopback bind かつ allow 省略なら `自機のみ`、`0.0.0.0/0` 以外の allow なら `許可 IP <N> 件` (N は allow の要素数)、`allow = ["0.0.0.0/0"]` なら `到達できる全 IPv4` とする。
+例は `web: 待受 192.168.1.10:8788 / 公開 許可 IP 3 件 / 認証 basic` である。
+要約に allow の個別要素、password の値、secret の有無と path を出さない。
+1 問の固定文は `この設定で有効化します。[1] このまま (既定) [2] 変更する` とする。
+空回答は「このまま」とする。EOF 又は明示取消しは何も書かずに rc 1 `setup_aborted` とする。
+非対話 (TTY 無・flag 無しの完全な設定と `--non-interactive`) は要約 1 行を表示するだけで質問しない。`--non-interactive` の要約は `--config-file` の目標設定から作る。
 
 LAN の候補列挙は §5.1 の `afx-ops interfaces` bounded subprocess だけを使い、その afx-ops 内部の共通実装 (bounded `ip -j addr show up`) が返す global と link の非 loopback unicast IPv4 を候補にする。本体から `afx_ops.interfaces` を import しない。
 候補は `(scope の順 global, link, ifindex, address)` で安定 sort する。
@@ -498,7 +525,7 @@ LAN の候補列挙は §5.1 の `afx-ops interfaces` bounded subprocess だけ�
 生成 password は CSPRNG の random 16 byte を padding なし base64url にする。端末へ表示するのは、前処理 (a) で live の `web.password` への rename と directory fsync が完了した後の 1 回だけとする。再実行では再表示しない。再実行時は既存 password の再利用か再生成かを利用者が明示選択する。ログ、stage、ウィザードの記録へ残さない。利用者が自分で password を決める選択肢も用意する。
 `web.password` は同じ directory 内の一時 file へ mode `0600` で書き、file fsync、atomic rename、directory fsync の順で保存する。`ops.toml` も同じ directory の一時 file への完全な write、file fsync、atomic rename、directory fsync で保存する。一時 file 名は現行 writer と同じ `.<name>.<32 hex>.tmp` の形とする (`src/agentic_fx/ops_setup/feature_config.py:252`)。
 
-初回 enable は完全な既存設定と secret の組み合わせが probe に成功するなら候補 UI も再質問も行わない。`--ask` だけが全項目を再質問する。
+初回 enable は既存設定と secret の組み合わせが完全なら候補 UI を出さず、要約と 1 問だけを出す。「変更する」と `--ask` だけが全項目を再質問する。
 `auth = "none"` と安全な残骸 `web.password` の組み合わせは自動削除も自動 basic 化もしない。対話では auth の選択へ戻し、利用者が `none` と remove を明示した場合だけ unlink → secret directory fsync を行う。EOF、取消し、又は明示選択なしでは何も削除しない。
 
 probe 失敗時の再質問は次に固定し、無関係な値を再質問しない。
@@ -534,9 +561,9 @@ enable の前処理は状態機械の外で完結させ、`staged` を作る前�
 | (a) の rename 後、directory fsync 又は表示の前 | 新 secret 又は旧 secret と、旧 config。生成 password は表示されていない。 | 次行の「(a) 後 (b) 前」と同じとする。password を見ていない利用者は再実行時の明示選択で再生成するか、`--ask` で再生成する。 |
 | (a) 後 (b) 前、`none → basic` | `auth = "none"` と安全な `web.password` の組であり、production と probe は `secret_unexpected`。 | 対話の再実行は auth を再質問し、none を維持して明示 remove するか、basic を再選択して既存 password の再利用 (再表示しない)、再生成、利用者入力のどれかを明示選択させる。非対話は同じ `--config-file`、`--secret-action install`、`--password-file` で再実行でき、live の安全な secret は install の受理条件を満たす。 |
 | (a) 後 (b) 前、`basic → none` | `auth = "basic"` と secret 無しの組であり、production と probe は `secret_missing`。 | 対話の再実行は不足項目として auth と secret を質問する。非対話は現在値から推測しないため、利用者が live の状態に合う `--secret-action absent` を明示して再実行する。 |
-| (a) 後 (b) 前、password 置換又は `none + 安全な残骸 → none` | 旧 config と新しい secret 状態の組は整合する。 | 完全な設定として再質問せずに進み得る。置換した password を見ていない場合は `--ask` で再生成する。 |
+| (a) 後 (b) 前、password 置換又は `none + 安全な残骸 → none` | 旧 config と新しい secret 状態の組は整合する。 | 完全な設定として要約と 1 問 (「このまま」) を経て進み得る。置換した password を見ていない場合は「変更する」又は `--ask` で再生成する。 |
 | (b) の rename 前 | 新しい secret 状態と旧 config。config の一時 file が残り得る。 | (0) が一時 file を除去し、上記「(a) 後 (b) 前」の該当行と同じとする。 |
-| (b) 後 (c) 前 | 完全な目標の config と secret。 | flag 無しの再実行は完全な設定として再質問せず、probe → (c) へ進む。生成 password は再表示しない。 |
+| (b) 後 (c) 前 | 完全な目標の config と secret。 | flag 無しの再実行は完全な設定として要約を表示し、対話では 1 問の「このまま」を経て probe → (c) へ進む。生成 password は再表示しない。 |
 | (c) 後 | 未終端 enable の `staged`。 | flag 無しの enable だけが既存の状態機械を再開する。`--ask` と `--non-interactive` は `invalid_state` で無変更とする。 |
 
 `--password-file` の内容は (a) で書き切るため、再実行は path を再 open しない。非対話の再実行では利用者が同じ又は新しい入力 file を明示的に渡す。
@@ -544,7 +571,7 @@ unsafe な手置き secret は (0) の一時 file 以外を自動修復しない
 
 ### 5.3 status
 
-`afx ops status web` は既存の stage / unit 行に続けて公開範囲を 1 行だけ出す。
+`afx ops web status` は既存の stage / unit 行に続けて公開範囲を 1 行だけ出す。
 検証済み設定を読める場合の形式は `web-access: bind=<IPv4>:<port> allow=<restricted|unrestricted|loopback-default> auth=<none|basic>` に固定する。
 `restricted` は `0.0.0.0/0` 以外の allow がある状態、`unrestricted` は明示値 `0.0.0.0/0`、`loopback-default` は loopback bind かつ allow 省略を表す。
 この行に allow の個別 IP、password、secret の存在又は path を出さない。
@@ -559,6 +586,83 @@ unsafe な手置き secret は (0) の一時 file 以外を自動修復しない
 | terminal `enable/enabled` かつ設定が正常 | 上記の `bind=... allow=... auth=...` 形式 |
 
 未終端 enable / disable の既存 stage / unit 表示は旧契約を維持する。公開範囲行は live config を安全に検証できる場合だけ通常形式にし、検証できなければ unavailable 形式にする。
+
+### 5.4 reconfigure
+
+`afx ops web reconfigure` は有効化済みの web の設定を変える。
+`afx ops web reconf` は同じ command の別名であり、option、入口、出力、rc、systemd の呼出し列、file の書込み列が全て同じである。
+reconfigure が書き換えるのは web の `ops.toml` と `web.password` だけであり、unit の操作は ops-web の unit への stop と start だけである。
+afx の unit には stop、start、restart、`ensure_active` を一切送らない。
+鍵 dir、enable の stage file、enroll marker には書かない。afx の instance flock は取得しない。
+reconfigure は durable な段を作らない。途中で止まった場合は、同じ reconfigure の再実行だけで完結する。
+
+option は次の 2 形だけを受け付ける。
+
+- 対話: flag 無し。stdin と stdout の両方が TTY でなければならない。完全な既存設定でも §5.2 の質問 2〜8 を全て質問し、要約の 1 問は出さない。既存値は §2.3 第 1 層の grammar を通る key だけを既定値として表示する。
+- 非対話: `--non-interactive --config-file <path> --secret-action <value>`、必要なときだけ `--password-file <path>`。input file の open 規則、`--secret-action` の組み合わせ表、目標を現在値から推測しない規則は §5.2 の enable と同じとする。
+
+`--ask`、表外の組み合わせ、同じ option の重複、値を欠く option は rc 2 `setup_input_required` で無変更とする。
+
+入口は次の順に判定し、各段の失敗では何も書かない。
+
+1. option grammar を検査する。
+2. 既存の setup lock (`data/ops/setup.lock`) を取得し、reconfigure の終了まで保持する。取得できなければ rc 1 `setup_busy` とする。これにより enable、disable、別の reconfigure と交互に進まない。
+3. stage を読む。stage 不在又は terminal `disable/disabled` は rc 1 `not_enabled`、未終端 enable / disable は rc 1 `invalid_state` とする。terminal `enable/enabled` だけが次へ進む。
+4. 入口照合を読み取りだけで行う。照合項目は、principal `ops-web` の鍵が manifest と一致すること、enroll marker が無いこと、unit 資材が有効 feature の集合と一致し、ops-web の unit の `LoadState` が `loaded` で、afx の `Wants` に ops-web の unit が含まれることの 3 点である。鍵の不一致は既存の固定 reason `principal_key_mismatch`、他の不一致は rc 1 `invalid_state` とし、固定案内 `afx ops web enable で状態を回復してから再実行する` を出す。manager に問い合わせられない場合は既存の systemd の固定 reason で止まる。いずれの場合も stage file へ failure を記録せず、`installed` への巻戻しも行わない。
+5. flag 無しで TTY 無なら rc 2 `setup_input_required` とする。
+
+入口照合に ops-web の unit の `ActiveState` は含めない。
+reconfigure 自身の手順 (1) が ops-web を止めるため、途中で止まった reconfigure の再実行を拒まないためである。
+enable の実物照合 (afx が動いていて ops-web が止まっていれば `installed` へ戻す) は reconfigure では使わない。
+
+入口を通った後の手順は次に固定する。
+
+1. 前処理 (0): §5.2 の (0) と同じく、writer の一時 file 名に完全一致する実効 uid 所有の regular file だけを除去する。
+2. 目標を集める。対話は §5.2 の質問 2〜8 を行い、非対話は input file と action を検査する。既存 secret dir / file が不安全なら、ops-web を止める前に `secret_invalid` で無変更停止する。
+3. 手順 (1): ops-web の unit に stop を送り、`is_stopped` で停止を確かめる。止まったと確かめられなければ rc 1 `ops_still_active` とし、secret と config を書かない。
+4. 手順 (2): §5.2 の前処理 (a) secret → (b) config を同じ atomic 手順で行う。生成 password の表示は (a) の directory fsync の完了後に 1 回だけとする。
+5. 手順 (3): §5.1 の probe を実行する。対話の失敗は §5.2 の再質問表に従い、変わった項目だけ (a) と (b) をやり直す。probe は最大 3 回とし、3 回目の失敗は最後の固定 reason を rc 1 で返す。EOF 又は明示取消しは以後書かずに rc 1 `setup_aborted` とする。非対話は再質問しないため probe は 1 回で、失敗は固定 reason を rc 1 で返す。
+6. 手順 (4): probe 成功後に afx の `ActiveState` をその時点で観測する。`active`、`activating`、`reloading` のいずれかなら ops-web の unit に start を送り、`is_active` と既存の READY 判定 (server 認証後) を確かめる。成功なら stdout に `web: reconfigured` を出して rc 0 とする。afx がそれ以外の状態なら start を送らず、stdout に `web: reconfigured ops=starts_with_afx` を出して rc 0 とする。この場合は次回の afx 起動時に `Wants=` で新しい設定の ops-web が起動する。
+
+手順 (3) の失敗では ops-web に start を送らない。
+旧 config と旧 secret へも書き戻さない。
+書き戻すには旧設定の写しを別に持つ必要があり、live の設定と並ぶ 2 個目の正本になるためである。
+失敗時の stderr は `afx ops: <固定 reason>` に固定案内 `afx ops web reconfigure を再実行する` を添える。
+
+手順 (4) の start 失敗は既存の systemd の固定 reason、READY 未達は `ops_not_ready` とし、いずれも rc 1 とする。
+このとき afx を止めず、ops-web にも stop を送らず、stage file を変えない。ops-web は unit の `Restart=on-failure` に委ねる。
+enable の `checked` 失敗時の処理 (afx の停止と `installed` への巻戻し) は使わない。
+
+reconfigure が送ってよい systemd の呼出しは次の集合に固定する。
+
+| 呼出し | 対象 |
+|---|---|
+| `show(ActiveState)`、`show(Wants)` | afx の unit |
+| `show(LoadState)` | ops-web の unit |
+| `daemon_reload` | 入口照合の資材確認 |
+| `stop`、`is_stopped` | ops-web の unit |
+| `start`、`is_active` | ops-web の unit |
+
+途中で無認証の公開が起こらないことは、前処理の順序で保証する。
+手順 (1) から (3) の間、ops-web は止まっている。
+(a) → (b) の順により、中間の組は §5.2 の crash 点表のとおり `secret_unexpected` 又は `secret_missing` となり、production と probe はどちらも fail closed となる。
+rollback は作らない。
+
+各点で crash した場合の live の状態と再実行の動作は次に固定する。
+
+| crash 点 | live の状態 | 再実行の動作 |
+|---|---|---|
+| 手順 (1) の前 | 変更なし。ops-web は元の状態のまま。 | 最初から実行する。 |
+| 手順 (1) 後 (2) 前 | 旧 config と旧 secret。ops-web は停止。 | `afx ops web reconfigure` を再実行する。入口照合は ops-web の停止を拒まない。 |
+| 手順 (2) の各点 | §5.2 の crash 点表の (0) から (b) までの行と同じ。ops-web は停止。 | reconfigure を再実行する。対話は全項目を質問し、`secret_unexpected` / `secret_missing` の組も §5.2 の auth と secret の明示選択で解く。非対話は同じ入力、又は live の secret 状態に合う `--secret-action` で再実行する。生成 password は再表示しない。 |
+| 手順 (2) 後 (4) 前 | 目標の config と secret。ops-web は停止。 | reconfigure を再実行する。afx の次回起動でも新しい設定の ops-web が起動する。 |
+| 手順 (4) の start 後 | 目標の config と secret。ops-web は起動中又は失敗。 | 再実行は不要である。再実行した場合は手順 (1) から行う。 |
+
+reconfigure の途中状態は flag 無しの `afx ops web enable` では直らない。
+回復は reconfigure の再実行で行う。
+
+status に reconfigure 中の表示は作らない。
+reconfigure 中は stage が `enable/enabled` のままで、ops-web の unit は inactive として表示される。
 
 ## 6. 旧 spec の置換
 
@@ -575,11 +679,12 @@ unsafe な手置き secret は (0) の一時 file 以外を自動修復しない
 | §3.3 web | loopback 固定・認証なしを、検証済み bind、allow、Host、任意 Basic 認証へ置き換える。 | §1〜§4 |
 | 旧 §5.1 行 132、web secret | 「web は secret を持たない」を、「web は auth に応じて `web.password` を隔離前だけ読む。secret dir は Landlock 規則へ加えない」に置き換える。 | §2.2、§4 |
 | §5 自己隔離 | loopback pre-bind を設定 address の pre-bind に置き換える。隔離後の新規 INET socket 拒否は維持する。 | §4 |
-| §6.1 enable | `staged` より前に完結する web 設定・secret・probe の前処理、`--ask` の全項目再質問、status の公開範囲表示を追加する。既存の `enable / disable` stage、enabled 実物照合、disable 後の fresh enable で afx を停止・再起動する契約は維持する。 | §5 |
+| §6.1 enable | `staged` より前に完結する web 設定・secret・probe の前処理、既存設定の要約と 1 問、`--ask` の全項目再質問、status の公開範囲表示を追加する。afx と enable の stage に触れない `afx ops web reconfigure` を追加する。既存の `enable / disable` stage、enabled 実物照合、disable 後の fresh enable で afx を停止・再起動する契約は維持する。 | §5 |
+| command の表記 | `afx ops enable <feature>` 等の表記を `afx ops <feature> <verb>` へ置き換える。旧形の案内つき別名は CLI 整理 spec の項目 (7) で扱う。 | §0 |
 | §7 初回ウィザード | web の最小質問と loopback probe を、公開範囲質問、`secret_action=remove` の明示導線、`afx-ops interfaces`、新 probe へ置き換える。 | §5 |
 | §8 O-11 | 「認証済み loopback read-only」を「設定済み公開範囲の allow / Host / auth を通った read-only」に置き換える。 | §3、§7 |
 | 行 226、§7 probe rc | web の config / interface / secret reason を rc 71 に、実 bind failure を rc 73 に追加し、固定 reason の優先順位を本 spec の決定木へ置き換える。 | §2.4、§5.1 |
-| §9 AC-10 | `127.0.0.1` 固定・認証なしの観測を、本 spec の AC-1〜36、AC-39〜40 へ置き換える。 | §9 |
+| §9 AC-10 | `127.0.0.1` 固定・認証なしの観測を、本 spec の AC-1〜36、AC-39〜48 へ置き換える。 | §9 |
 | 行 281、§10 T7 | 実装済みの「認証なしのローカル限定」を、本 spec の T1 / T2 で段階的に置き換える。 | §10.2 |
 | §11 残余リスク | web の port 衝突だけでなく LAN 公開の残余を追加する。 | §12 |
 | §12 裁定 1 | 2026-10-09 の「初版は 127.0.0.1・認証なし」を、2026-10-23 のユーザー裁定で置き換える。 | §0、§8 |
@@ -614,7 +719,9 @@ IP、Host、Authorization、decoded credential、secret bytes を例外へ連結
 | 4 | auth の表現 | secret の有無でなく `auth = "none" | "basic"` を明示する。 | 残骸 file による意図しない有効化又は無効化を防ぐ。 |
 | 5 | 非 loopback の allow | 必須にする。無制限は `0.0.0.0/0` の明示値にする。 | 省略ミスと機密性の明示放棄を区別する。 |
 | 6 | T1 単独公開 | localhost 又は非空 allow 付き LAN に限定する。無制限 LAN と `auth = "basic"` は T2 まで拒否する。 | 明示選択、警告、rate limit、secret lifecycle が揃う前に広く公開しない。 |
-| 7 | 稼働中の再設定 | 初版から外し、設定変更は `afx ops disable web` → `afx ops enable web --ask` の 2 command とする。durable live reconfigure は後続チケット `web-live-reconfigure` へ延期する。 | 2〜4 周目で同じ部品が連続して High となり、実装規模が 1 束分増え、本来の LAN 閲覧目的に対して重いため。 |
+| 7 | 稼働中の再設定 | 初版から外し、設定変更は `afx ops web disable` → `afx ops web enable --ask` の 2 command とする。durable live reconfigure は後続チケット `web-live-reconfigure` へ延期する。#8 で置き換えた。 | 2〜4 周目で同じ部品が連続して High となり、実装規模が 1 束分増え、本来の LAN 閲覧目的に対して重いため。 |
+| 8 | enable 時の既存設定と有効化済みの設定変更 (裁定 C'、2026-10-23 22:12) | enable は既存設定が揃っていても要約 (待受先、公開範囲、認証の有無) を表示し、対話では「このまま / 変更する」を 1 問だけ聞く。「変更する」は `--ask` と同じ全項目の再質問とし、非対話は要約の表示だけとする。有効化済みの設定変更は、afx、鍵、enable の stage に触れない `afx ops web reconfigure` で行う。 | enable しておけば web は afx と共に自動起動するため、設定を切り替えるのは再 enable 時か任意の再設定時に限られる。afx に触れない限定なら、v0.2〜v0.4 で High となった論点 (目標設定の durable な復元、afx 停止中の完了、enable の記録との入口の結合) は構造的に消える。durable な段を持たず、afx を起動も停止もせず、入口照合は読み取りだけだからである。 |
+| 9 | command の階層 (2026-10-23 22:12) | `afx ops <feature> <verb>` とする。web は `afx ops web enable`、`disable`、`reconfigure`、`status` とし、`reconf` は `reconfigure` の別名とする。bot と notify も同じ形とする。旧形は 1 版だけ案内つきの別名として残し、次版で削除する。 | 機能ごとに操作をまとめる。移行は CLI 整理 spec の廃止名 shim (項目 (7)) と同じ流儀で行う。 |
 
 ### 8.2 閉じた確認事項 (決定と根拠)
 
@@ -671,13 +778,13 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-21 | 各試行の lookup 前に global と全送信元 queue を prune し、送信元 queue 長が 5、global が 100、実 IPv4 map が 100 entry を超えない。100 個の異なる送信元が各 1 回失敗して global が満杯になった後、101 個目の送信元は lookup / allocation されず、新 entry を作らない。期限切れ entry は次の lookup 前に回収でき、overflow bucket は存在しない。 | 99 / 100 / 101 送信元、59.999 / 60.000 / 60.001 秒、queue 長、map / 状態 object / allocation 数。 |
 | AC-22 | allow、Host、auth、rate limit の各失敗で daemon 呼出しが 0 回になる。成功した GET / HEAD だけが既存 read-only method を呼ぶ。protocol / adapter / renderer の内部例外は 500、daemon transport 例外、timeout、非 200、code 付き又は schema 不正 response は 502 に固定する。 | 404、POST の 405、500、502 と fake daemon の method 別回数。 |
 | AC-23 | journal、例外、probe、status、activity、event に IP、Host、Authorization、username、password、secret canary が無い。daemon activity と event の件数も増えない。 | 各出力と保存先の個別 canary 検査。 |
-| AC-24 | §5.2 の入口表 (stage {未設定, terminal disabled, 未終端 enable, 未終端 disable, terminal enabled} × TTY {有, 無} × flag {無し, `--ask`, `--non-interactive`}) の全組が表どおりの結果になる。未設定 / disabled で TTY 有・flag 無しの完全な既存設定は候補 UI も再質問も行わず、TTY 無・flag 無しの完全な設定は質問なしで実行し、不足があれば `setup_input_required` で無変更とする。`--ask` は TTY 有の未設定 / disabled で全項目を既存値付きで聞き、TTY 無では `setup_input_required` とする。未終端 enable は flag 無しだけが再開し、`--ask` / `--non-interactive` は `invalid_state`、enabled の `--ask` / `--non-interactive` は `already_enabled` で無変更とする。`probe_bind_failed` は port → bind を再質問し、この run の password byte 違反は再質問、不安全な既存 secret は `secret_invalid` で無変更停止する。非対話は `--config-file`、`--password-file`、`--secret-action` の表どおりとし、symlink、owner / type、config の mode `0644` accept / `0664` reject / `0666` reject、password の mode `0600` 以外 (`0664` / `0666` を含む) の reject、config の 0 / 1 / 65536 / 65537 byte、password payload の 15 reject / 16 accept / 128 accept / 129 reject、16〜128 byte + 末尾 LF 1 個の accept (raw 129 byte は 128 byte + LF の場合だけ accept)、CRLF / LF 2 個の reject、読取り中の path 差替えを固定結果にする。 | 入口表の全組の rc / reason / 質問列、TTY / flag 排他、port 占有 transcript、unsafe 既存 secret transcript、file mode と grammar の境界、unlink / fsync、writer / stage 呼出し回数。 |
+| AC-24 | §5.2 の入口表の `afx ops web enable` 列 (stage {未設定, terminal disabled, 未終端 enable, 未終端 disable, terminal enabled} × TTY {有, 無} × flag {無し, `--ask`, `--non-interactive`}) の全組が表どおりの結果になる。未設定 / disabled で TTY 有・flag 無しの完全な既存設定は候補 UI を出さず、§5.2 の固定形の要約 1 行と固定文 `この設定で有効化します。[1] このまま (既定) [2] 変更する` の 1 問だけを出す。「このまま」と空回答は前処理へ進み、「変更する」は `--ask` と同じ全項目を既存値付きで質問し、EOF / 取消しは `setup_aborted` で無変更とする。TTY 無・flag 無しの完全な設定と `--non-interactive` は要約 1 行だけを出して質問せずに実行し、不足があれば要約を出さず `setup_input_required` で無変更とする。要約の `公開` は `自機のみ`、`許可 IP <N> 件`、`到達できる全 IPv4` のどれかで、allow の個別要素と password を含まない。`--ask` は TTY 有の未設定 / disabled で全項目を既存値付きで聞き、TTY 無では `setup_input_required` とする。未終端 enable は flag 無しだけが再開し、`--ask` / `--non-interactive` は `invalid_state`、enabled の `--ask` / `--non-interactive` は `already_enabled` と固定案内 `設定の変更は afx ops web reconfigure` で無変更とする。`probe_bind_failed` は port → bind を再質問し、この run の password byte 違反は再質問、不安全な既存 secret は `secret_invalid` で無変更停止する。非対話は `--config-file`、`--password-file`、`--secret-action` の表どおりとし、symlink、owner / type、config の mode `0644` accept / `0664` reject / `0666` reject、password の mode `0600` 以外 (`0664` / `0666` を含む) の reject、config の 0 / 1 / 65536 / 65537 byte、password payload の 15 reject / 16 accept / 128 accept / 129 reject、16〜128 byte + 末尾 LF 1 個の accept (raw 129 byte は 128 byte + LF の場合だけ accept)、CRLF / LF 2 個の reject、読取り中の path 差替えを固定結果にする。 | 入口表の全組の rc / reason / 質問列、要約行の全文 (公開 3 種 × 認証 2 種) と allow 要素・password の canary 不在、1 問の「このまま」/ 空回答 / 「変更する」/ EOF の transcript、TTY / flag 排他、port 占有 transcript、unsafe 既存 secret transcript、file mode と grammar の境界、unlink / fsync、writer / stage 呼出し回数。 |
 | AC-25 | `afx_ops.interfaces` の 1 実装が bounded `ip -j addr show up` を固定絶対 path 候補、argv 配列 `(<ip>, "-j", "addr", "show", "up")`、shell なし、stdin 閉、env `LC_ALL=C`、timeout 5 秒、stdout 65536 byte 上限で 1 回だけ実行し、probe / production は package 内呼出し、`afx-ops interfaces` command も同じ fixture を共用する。`ip` 不在、timeout、stdout 上限超過、非 0 rc、signal 終了、UTF-8 / JSON 不正、必須 key の欠落・型違反、`prefixlen` の範囲外を全て `interface_lookup_failed` とし、部分結果と手入力 fallback を使わない。未知 key と `family` が `inet` 以外の要素は無視する。1 interface に primary と secondary の IPv4 がある場合は両方を候補にし、address 範囲から scope を分類し、loopback を除き、安定 sort と重複除去を行う。子 process は全経路で回収され、pipe fd を残さない。T1 は package、command、probe、production の一致までとし、T2 で本体 wizard の `afx-ops interfaces` 10 秒 timeout、import pin、IO transcript を追加する。 | T1 の subprocess spy (argv、env、cwd、stdin)、fake `ip` による 4.999 / 5.000 / 5.001 秒と 65535 / 65536 / 65537 byte の境界、rc / signal / 不正 JSON / schema fixture、secondary address fixture、子 process 回収と fd snapshot、4 入口の同一結果。T2 の import pin、bounded command、IO transcript。 |
 | AC-26 | unrestricted の選択肢と警告が §5.2 の固定文であり、明示確認の後だけ `allow = ["0.0.0.0/0"]` を書く。未確認、EOF、取消しでは書かず、EOF / 取消しは rc 1 `setup_aborted` になる。限定 allow の空回答は再質問する。 | IO transcript と ops.toml。 |
 | AC-27 | 生成 password が random 16 byte の padding なし base64url であり、§5.2 の前処理 (a) で live の `web.password` の rename と directory fsync が完了した後に 1 回だけ表示される。(a) の完了前の crash では表示されない。再実行、probe、status、stage、ログに現れず、再実行は再表示せず、既存 password の再利用か再生成かを利用者に明示選択させる。 | deterministic RNG fixture、22 byte grammar、(a) の rename / directory fsync と表示の順序 spy、再実行 transcript、出力 canary。 |
-| AC-28 | enable の前処理が (0) 一時 file 除去 → (a) secret → (b) config → probe → (c) `staged` の順に進み、`staged` の作成前に material を確定する。staging file と追加 phase は存在しない。live config と secret の atomic write は crash 前後に旧版又は新版の完全な file だけを残す。§5.2 の crash 点表の各点で、live の状態と production / probe の reason (`secret_unexpected` / `secret_missing` / 許可) と再実行の動作が表どおりになる。(a) 後 (b) 前の `none → basic` は再実行で none + remove 又は basic + 既存再利用 / 再生成 / 入力の明示選択となり、生成 password を再表示しない。(b) 後 (c) 前は flag 無しの再実行が再質問せずに `staged` を作る。(0) は writer の一時 file 名に完全一致する実効 uid 所有の regular file だけを除去し、symlink / 他 uid / 非 regular の同名 entry では `secret_invalid` / `config_dir_invalid` で無変更停止する。非対話 input file は symlink、owner / type、config の mode `0644` accept / `0664` reject / `0666` reject、config size 上限、password の 15 / 16 / 128 / 129 byte、LF / CRLF、読取り中差替えの契約を守り、`--password-file` の path を stage と記録へ残さない。 | (0) の unlink / dir fsync、(a) の一時 file 作成 / file fsync / rename / dir fsync / unlink、表示、(b) の一時 file 作成 / file fsync / rename / dir fsync、probe、(c) の stage 書込みの各前後 fault injection と再実行 transcript、mode、file grammar 境界、production / probe reason。 |
+| AC-28 | enable の前処理が (0) 一時 file 除去 → (a) secret → (b) config → probe → (c) `staged` の順に進み、`staged` の作成前に material を確定する。staging file と追加 phase は存在しない。live config と secret の atomic write は crash 前後に旧版又は新版の完全な file だけを残す。§5.2 の crash 点表の各点で、live の状態と production / probe の reason (`secret_unexpected` / `secret_missing` / 許可) と再実行の動作が表どおりになる。(a) 後 (b) 前の `none → basic` は再実行で none + remove 又は basic + 既存再利用 / 再生成 / 入力の明示選択となり、生成 password を再表示しない。(b) 後 (c) 前は flag 無しの再実行が要約を表示し、対話では 1 問の「このまま」だけで `staged` を作る。(0) は writer の一時 file 名に完全一致する実効 uid 所有の regular file だけを除去し、symlink / 他 uid / 非 regular の同名 entry では `secret_invalid` / `config_dir_invalid` で無変更停止する。非対話 input file は symlink、owner / type、config の mode `0644` accept / `0664` reject / `0666` reject、config size 上限、password の 15 / 16 / 128 / 129 byte、LF / CRLF、読取り中差替えの契約を守り、`--password-file` の path を stage と記録へ残さない。 | (0) の unlink / dir fsync、(a) の一時 file 作成 / file fsync / rename / dir fsync / unlink、表示、(b) の一時 file 作成 / file fsync / rename / dir fsync、probe、(c) の stage 書込みの各前後 fault injection と再実行 transcript、mode、file grammar 境界、production / probe reason。 |
 | AC-29 | `feature_config.py` の writer が port、bind、allow、auth を書き、再読取りで scalar 型、list 順序、値を保持する。単一 IPv4 allow の `/32` 意味も保持する。 | write → collect → write → read の round-trip。 |
-| AC-30 | `afx ops status web` が正常な enabled で固定形式の公開範囲 1 行を出し、限定 allow の個別 IP と password を出さない。未設定 disabled、不正 config、config dir 又は `ops.toml` の不安全 (symlink、他 uid、directory、mode `0664` / `0666`) では `web-access: unavailable reason=<固定 reason>` を出し、設定値や path を出さない。 | 未設定 disabled / `not_configured`、TOML 不正 / `config_invalid`、unsafe / `config_dir_invalid`、localhost / restricted / unrestricted / basic enabled の出力全文。 |
+| AC-30 | `afx ops web status` が正常な enabled で固定形式の公開範囲 1 行を出し、限定 allow の個別 IP と password を出さない。未設定 disabled、不正 config、config dir 又は `ops.toml` の不安全 (symlink、他 uid、directory、mode `0664` / `0666`) では `web-access: unavailable reason=<固定 reason>` を出し、設定値や path を出さない。 | 未設定 disabled / `not_configured`、TOML 不正 / `config_invalid`、unsafe / `config_dir_invalid`、localhost / restricted / unrestricted / basic enabled の出力全文。 |
 | AC-31 | T1 単独版は localhost 又は非空の限定 allow 付き LAN だけを起動する。singleton `0.0.0.0/0` と `auth = "basic"` は優先順位どおり `unrestricted_not_supported` / `auth_not_supported`、`0.0.0.0/0` と他 network の混在は先に `config_invalid` で拒否し、production と probe が同じ固定 reason / rc 71 を返す。 | T1 artifact の production 起動と probe、mixed-unrestricted の順序違いの直積。 |
 | AC-32 | `0.0.0.0` bind、IPv6 bind / allow、proxy header による peer 上書き、新しい変更 route が存在しない。 | schema、route 一覧、`_Slot` の peer 判定入力の pin。 |
 | AC-33 | T1 / T2 の `FeaturePlan` の許可 secret 名は常に `{"web.password"}` で、必須集合は検証済み auth だけから決まる。T1 の none でも dir 不在を許可し、存在時は検査済み dir fd から残骸と未知 entry を判定する。 | T1 / T2 plan object、openat spy、auth / dir / entry 直積。 |
@@ -686,6 +793,14 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-36 | 隔離の fd 自己検査時点の保持 fd は `{0,1,2,listener,notify}` だけで、secret dir / password / config / interface 列挙の pipe fd が無く、interface 列挙の `ip` 子 process は回収済みである。READY 後は notify も閉じる。 | `/proc/self/fd`、子 process 一覧、syscall trace の phase 別 snapshot。 |
 | AC-39 | request line / header / body の malformed と上限境界が既存契約の 400 / 413 になり、Host / auth より先に止まる。405 は POST 等で観測する。HEAD は実際に到達する 400 / 401 / 404 / 413 / 429 / 500 / 502 について body 0 と GET と同じ Content-Length を検査する。protocol 内部例外は 500、daemon / backend 障害は 502 にする。 | 各 parser 上限の L-1 / L / L+1、POST 405、到達可能な全 HEAD status、daemon 回数。 |
 | AC-40 | 下記の有限な mutation ID を 1 個ずつ有効にし、対応 AC が少なくとも 1 個失敗する。T1 完了時は T1 集合だけ、T2 完了時は T1 + T2 集合を実行する。 | mutation ID、対応 AC、意図した failure の CI 記録。 |
+| AC-41 | §5.2 の入口表の `afx ops web reconfigure` 列の全組 (stage 5 値 × TTY {有, 無} × flag {無し, `--ask`, `--non-interactive`}) が表どおりになり、`--ask` は option grammar で rc 2 `setup_input_required` になる。setup lock を他の操作が保持中なら `setup_busy` で無変更となる。terminal enabled の入口照合は鍵不一致、marker 有り、unit 資材不一致、`LoadState` 不一致、`Wants` 欠落、manager 問合せ失敗のそれぞれで `principal_key_mismatch` / `invalid_state` / systemd の固定 reason となり、固定案内を出して無変更とする。照合が成り立つ terminal enabled は、afx の `ActiveState` {active, inactive, failed} × ops-web の `ActiveState` {active, inactive, failed} の全組で入口を通る。 | 全組の rc / reason / stderr 全文、stage file の byte 一致、FakeSystemd の呼出し列。 |
+| AC-42 | reconfigure の全経路 (成功、afx inactive、各入口拒否、probe 失敗 3 回、EOF、`ops_still_active`、start 失敗、READY 未達、各 crash 点の再実行) で、systemd の呼出しが §5.4 の許可集合だけからなる。afx の unit への stop、start、restart、`ensure_active` は 0 回で、instance flock の取得も 0 回である。 | FakeSystemd の呼出し列の全文、instance lock の spy。 |
+| AC-43 | reconfigure の前後と各 crash 点で、鍵 dir の全 file、enable の stage file、enroll marker の有無と内容が byte 一致で変わらない。 | 前後の byte snapshot と fault injection 後の snapshot。 |
+| AC-44 | reconfigure が入口 → (0) → 目標の収集 → 手順 (1) stop と `is_stopped` → 手順 (2) の (a) secret と (b) config → 手順 (3) probe → 手順 (4) の順に進む。停止を確かめる前に secret と config を書かず、`is_stopped` が偽なら `ops_still_active` で何も書かない。不安全な既存 secret は ops-web を止める前に `secret_invalid` で止まる。§5.4 の crash 点表の各点で live の状態、production / probe の reason、再実行の結果が表どおりになり、手順 (1) 後の crash は reconfigure の再実行で完了する。生成 password は (a) の後に 1 回だけ表示され、再実行で再表示されない。 | 各呼出しの前後の fault injection、writer / systemd の呼出し順、再実行 transcript、production / probe reason。 |
+| AC-45 | 手順 (3) の probe 失敗で ops-web に start を送らず、旧 config と旧 secret を書き戻さない (live は最後に書いた目標のまま)。対話は §5.2 の再質問表どおり最大 3 回で、3 回目は最後の固定 reason、EOF / 取消しは `setup_aborted` になる。非対話は probe 1 回で固定 reason を返す。stderr は固定 reason と固定案内 `afx ops web reconfigure を再実行する` だけである。 | probe fault、live file の内容、start 呼出し回数、stderr 全文。 |
+| AC-46 | 手順 (4) で、その時点の afx が `active` / `activating` / `reloading` なら ops-web に start を送り、`is_active` と READY を確かめて `web: reconfigured` / rc 0 となる。`inactive` / `failed` なら start を 0 回とし、`web: reconfigured ops=starts_with_afx` / rc 0 となる。READY 未達は `ops_not_ready` / rc 1、start 失敗は systemd の固定 reason / rc 1 とし、どちらも afx と ops-web へ stop を送らず stage file を変えない。 | afx の `ActiveState` 5 値、start / stop 回数、stdout / stderr 全文、stage file の byte 一致。 |
+| AC-47 | 対話 reconfigure は完全な既存設定でも全項目を既存値付きで質問し、要約の 1 問を出さない。grammar 違反の key は既定値に使わない。非対話 reconfigure の option の組み合わせ、`--config-file` / `--password-file` の open 規則と境界、`--secret-action` の表は enable と同じ固定結果になる。 | AC-24 と共用の境界 fixture、質問 transcript、rc / reason。 |
+| AC-48 | 同じ入力に対して `afx ops web reconf` と `afx ops web reconfigure` の rc、stdout、stderr、systemd の呼出し列、file の書込み列が一致する。 | 2 command の実行記録の対照。 |
 
 AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だけを行い、複数条件を同時に変えない。
 
@@ -739,6 +854,14 @@ AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だ
 | T2 | `M-T2-HEAD-429` | HEAD 429 の Content-Length を 0 にする。 | AC-20、AC-39 |
 | T2 | `M-T2-HEAD-500` | HEAD 500 の Content-Length を 0 にする。 | AC-39 |
 | T2 | `M-T2-HEAD-502` | HEAD 502 の Content-Length を 0 にする。 | AC-39 |
+| T2 | `M-T2-ENABLE-NO-SUMMARY` | 完全な既存設定の対話 enable で要約と 1 問を出さずに前処理へ進む。 | AC-24 |
+| T2 | `M-T2-RECONF-AFX-STOP` | READY 未達時に enable の `checked` 失敗処理を流用して afx を止める。 | AC-42、AC-46 |
+| T2 | `M-T2-RECONF-KEYS-WRITE` | 入口で principal を再 enroll して鍵 dir に書く。 | AC-43 |
+| T2 | `M-T2-RECONF-STAGE-WRITE` | 入口照合に enable の実物照合を使い、`installed` への巻戻しと `stage_mismatch` を stage file に書く。 | AC-41、AC-43 |
+| T2 | `M-T2-RECONF-REQUIRE-OPS-ACTIVE` | 入口照合で ops-web の unit の active を要求する。 | AC-41、AC-44 |
+| T2 | `M-T2-RECONF-START-WHEN-INACTIVE` | afx が inactive でも ops-web に start を送る。 | AC-46 |
+| T2 | `M-T2-RECONF-ROLLBACK-OLD-CONFIG` | probe 失敗時に旧 config と旧 secret を書き戻す。 | AC-45 |
+| T2 | `M-T2-RECONF-SKIP-STOP` | 手順 (1) の stop と停止確認を省いて手順 (2) へ進む。 | AC-44 |
 
 ## 10. 変更ファイルと task 表
 
@@ -753,18 +876,19 @@ AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だ
 | seccomp | `afx-ops/afx_ops/isolation/profiles.py` | 緩和せず、現行の AF_INET / AF_INET6 拒否と accept4 だけを pin する。 |
 | HTTP | `afx-ops/afx_ops/web/{runtime,request,headers}.py` | allow 配線、Host、Basic、rate limit、401 / 429 / HEAD、固定 counter / journal を追加する。 |
 | probe | `afx-ops/afx_ops/probe.py` | 共通 interface 列挙を呼び、allow、auth / secret、実 bind / listen / getsockname を検査する。 |
-| CLI | `src/agentic_fx/cli.py` | `afx ops enable` に `--ask`、`--non-interactive`、`--config-file`、`--password-file`、`--secret-action` を追加する。 |
-| wizard / writer | `src/agentic_fx/ops_setup/{interactive,feature_config}.py` と bounded subprocess helper | `afx-ops interfaces` 経由の候補列挙、不足質問と `--ask` の全項目質問、none 残骸の明示 remove、非対話 file grammar、atomic secret / config、round-trip を追加する。本体から afx_ops を import しない。 |
+| CLI | `src/agentic_fx/cli.py` | command を `afx ops <feature> <verb>` の階層にし、`afx ops web enable` に `--ask`、`--non-interactive`、`--config-file`、`--password-file`、`--secret-action` を追加する。`afx ops web reconfigure` と別名 `reconf` を追加する。旧形の案内つき別名は CLI 整理 spec の項目 (7) で扱う。 |
+| wizard / writer | `src/agentic_fx/ops_setup/{interactive,feature_config}.py` と bounded subprocess helper | `afx-ops interfaces` 経由の候補列挙、既存設定の要約と 1 問、不足質問と `--ask` / reconfigure の全項目質問、none 残骸の明示 remove、非対話 file grammar、atomic secret / config、round-trip を追加する。本体から afx_ops を import しない。 |
 | stage / status | `src/agentic_fx/ops_setup/stages.py` | 既存 enable の `staged` より前に完結する config / secret 前処理 ((0) 一時 file 除去、(a) secret、(b) config、probe、(c) `staged`) と crash 点ごとの再実行動作を追加し、`--ask` の入口状態、公開範囲と unavailable の固定 status を実装する。 |
+| reconfigure | `src/agentic_fx/ops_setup/reconfigure.py` (新規) | §5.4 の読み取りだけの入口照合、enable と共用の前処理 (0)、(a)、(b) と probe、ops-web だけの stop / start / READY 確認を実装する。stage file、鍵、marker、instance flock に触れない。 |
 | test | `afx-ops/tests/{isolation,web}/`、`afx-ops/tests/test_{config,probe}.py`、`tests/ops_setup/` | §9 の T1 / T2 観測点、境界値、実 process を追加する。 |
-| 運用文書 | afx-ops の運用文書 | 平文 HTTP、到達範囲、password を含む設定変更の disable → enable `--ask` 手順、停止時間、残余リスクを記載する。 |
+| 運用文書 | afx-ops の運用文書 | 平文 HTTP、到達範囲、password を含む設定変更の `afx ops web reconfigure` 手順 (ops-web だけの短時間停止)、disable → enable `--ask` との違いと afx の停止時間、残余リスクを記載する。 |
 
 ### 10.2 task 表
 
 | task | 範囲 | test 完成形の要点 | 規模 |
 |---|---|---|---|
 | T1 bind + allow | config と writer (`ops.toml` の filesystem 安全性を含む)、bounded `ip -j` interface 列挙と `afx-ops interfaces` command、設定 address の pre-bind / getsockname、accept 直後の allow、全 bind の Host 検査、probe、seccomp pin、`auth=none` の secret dir / 未知 entry / 残骸 password 検査と固定許可 secret 名を実装する。単独公開は localhost 又は非空の限定 allow 付き LAN に限る。 | AC-1〜AC-13 の T1 / none 部分、AC-25 の package / command / probe / production の一致、AC-29、AC-31〜AC-33、AC-35、AC-36、AC-39 の T1 部分、AC-40 の T1 集合。T2 の Basic、rate limit、wizard UI / transcript、`M-T2-IFACE-DIVERGE`、`--ask`、非対話 secret 導線、status、運用文書は完了条件に含めない。 | M |
-| T2 auth + 運用導線 | `auth=basic` の password 読取り / 比較、100 entry 上限の rate limit、本体から `afx-ops interfaces` を呼ぶウィザード、`--ask`、非対話 file / secret action、残骸の明示 remove、`staged` 前に完結する enable 前処理と crash 点ごとの再実行、無制限 LAN の解禁、status、運用文書を実装する。T1 の none 残骸検査は維持する。 | AC-1 / AC-25 の wizard 観測、AC-12 の T2 / basic 部分、AC-14〜AC-30、AC-34、AC-39 の追加部分、AC-40 の T1 + T2 集合。Authorization の全失敗形、rate limit、bounded discovery、config / secret 前処理の crash recovery、canary、password 一度表示を含む。 | M |
+| T2 auth + 運用導線 | `auth=basic` の password 読取り / 比較、100 entry 上限の rate limit、本体から `afx-ops interfaces` を呼ぶウィザード、`--ask`、非対話 file / secret action、残骸の明示 remove、`staged` 前に完結する enable 前処理と crash 点ごとの再実行、既存設定の要約と 1 問、afx に触れない `afx ops web reconfigure` (別名 `reconf`)、無制限 LAN の解禁、status、運用文書を実装する。T1 の none 残骸検査は維持する。 | AC-1 / AC-25 の wizard 観測、AC-12 の T2 / basic 部分、AC-14〜AC-30、AC-34、AC-39 の追加部分、AC-41〜AC-48、AC-40 の T1 + T2 集合。Authorization の全失敗形、rate limit、bounded discovery、config / secret 前処理の crash recovery、reconfigure の afx 不接触と crash 点、canary、password 一度表示を含む。 | M |
 
 T1 は T2 より先に統合できる。
 T1 の LAN 公開は allow-only の限定公開であり、無制限公開ではない。
@@ -772,7 +896,6 @@ T2 は T1 の allow と Host の境界を緩めない。
 
 ## 11. 後続と非目標
 
-- 稼働中の再設定 (durable live reconfigure)。後続チケット名は `web-live-reconfigure` と仮置きする。
 - enroll 済みの disable → enable で afx 停止を省く fast-path。
 - TLS 終端と証明書の生成又は更新。
 - IPv6 の bind、allow、rate-limit key。
@@ -786,11 +909,15 @@ T2 は T1 の allow と Host の境界を緩めない。
 - 認証失敗を daemon の監査記録へ保存する機能。
 - rate-limit 状態の process 間永続化。
 
+durable な段つきの稼働中再設定 (仮置きの後続チケット `web-live-reconfigure`) は、§5.4 の afx に触れない reconfigure により不要になったため後続に置かない。
+
 ## 12. 残余リスク
 
 | 点 | 利用者責任として残ること |
 |---|---|
-| 設定変更の停止 | 初版の設定変更は `afx ops disable web` → `afx ops enable web --ask` の 2 command で行う。enable は現行契約どおり afx を停止して再起動するため、ペーパー運用が数十秒停止し得る。enroll 済み fast-path は非目標である。 |
+| 設定変更の停止 | `afx ops web reconfigure` の間は ops-web が止まり、web が数秒から十数秒見えない。afx は止まらない。`afx ops web disable` → `afx ops web enable --ask` を使う場合は、enable が現行契約どおり afx を停止して再起動するため、ペーパー運用が数十秒停止し得る。enroll 済み fast-path は非目標である。 |
+| reconfigure 中の afx 起動 | reconfigure 中に afx が起動又は再起動すると、`Wants=` で ops-web がその時点の live 設定で起動し得る。production は probe と同じ決定木を使うため、中間の組は fail closed となり、完全な組は目標の設定そのものである。起動した ops-web が port を持つと probe は `probe_bind_failed` となり、再実行が手順 (1) で止めてからやり直す。 |
+| reconfigure 途中の enable | 途中で止まった reconfigure の後に flag 無しの `afx ops web enable` を実行すると、afx が動いていれば既存の実物照合が `installed` へ戻して ops-web を起動し、設定が中間の組なら `ops_not_ready` となって既存契約どおり afx も止める。回復の正しい手順は reconfigure の再実行であり、reconfigure の失敗時の固定案内もそれだけを示す。 |
 | 平文 HTTP / 能動的 LAN 中間者 | 同じ経路を観測又は改変できる者は Basic credential と表示内容を盗聴・改変できる。ARP spoofing 等の能動的中間者も防げず、Basic は暗号化でも server 認証でもない。 |
 | IP allowlist | IP spoofing、ARP spoofing、DHCP の払い出し変更、NAT により、端末の人間又は機器 identity を保証できない。 |
 | 到達範囲 | allow 内の侵害済み端末は到達できる。unrestricted では、LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が戦略の diff を読めます。host firewall、router、container、cloud network の実効範囲を製品は検証しない。 |
@@ -817,3 +944,4 @@ T2 は T1 の allow と Host の境界を緩めない。
 | 2026-10-23 | v0.4 | mixed-unrestricted の拒否、表だけで完結する reason oracle、`afx-ops interfaces` subprocess 契約、停止中 afx の reconfigure、100 entry rate map、初回残骸削除導線、HEAD 413、accept journal、ioctl skip、旧 spec secret 置換、再起動 reset リスク、1 変異 1 ID を確定した。 | 設計レビュー 3 周目 sol、High 3 / Medium 7 / Low 1 を全採用し、2 周目の未閉鎖 4 件 (#1、#2、#5、#8) を閉鎖。 | — |
 | 2026-10-23 | v0.5 | 稼働中の reconfigure を初版から外し、disable → enable `--ask`、非対話 input grammar、enable 前処理 recovery、accept syscall 64 試行上限、T1 / T2 観測境界、2 層 reason oracle、unavailable status を確定した。 | ユーザー裁定 案 C (2026-10-23)、設計レビュー 4 周目 sol High 3 / Medium 4 全採用、3 周目未閉鎖 #6 閉鎖。 | — |
 | 2026-10-23 | v0.6 | enable 前処理を `staged` の前に完結させ (secret → config → probe → `staged`、crash 点ごとの再実行と一時 file 除去)、生成 password の表示を (a) の後 1 回に定義し、G2 を `ops.toml` の filesystem 安全性まで広げて `config_dir_invalid` に統一し、interface 列挙を bounded `ip -j addr show up` に変え (iproute2 前提)、`--config-file` の group / other writable を拒否し、enable の入口表を追加し、AC-37 / AC-38 の行を除去し、port 競合と iproute2 依存を残余リスクに加えた。 | 設計レビュー 5 周目 sol、High 1 / Medium 3 / Low 3 全採用。 | — |
+| 2026-10-23 | v0.7 | command を `afx ops <feature> <verb>` (web は enable / disable / reconfigure / status、`reconf` は別名) に改め、旧形の別名を CLI 整理 spec (7) に委ねた。enable で既存設定の要約 1 行と「このまま / 変更する」の 1 問を出すようにした (非対話は要約だけ)。afx、鍵、enable の stage に触れない `afx ops web reconfigure` (§5.4: 読み取りだけの入口照合、setup lock、ops-web だけの stop / start、rollback なし、crash 点表) を T2 に加え、入口表に reconfigure 列、AC-41〜AC-48 と mutation 8 個、§8.1 の #8 / #9、§12 の 2 行を加え、§11 の稼働中再設定を外した。 | ユーザー裁定 C' とコマンド階層 (2026-10-23 22:12)。 | — |
