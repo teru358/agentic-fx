@@ -411,6 +411,7 @@ def test_holdout_and_analysis_ids_never_come_from_agent_output(tmp_path):
 
     forged_payload = {
         "name": "x", "kind": "indicator",
+        "content_hash": "c-x", "artifact_hash": "a-x",
         # agent が自己申告した偽の analysis_run_ids/回数/trial_count —
         # `_finalize_success` はこれを無視して台帳由来の実値で上書きする
         # 契約 (10.10 節)。
@@ -469,4 +470,5 @@ def test_rendered_output_example_has_no_copyable_concrete_values():
     for key in ('"discoveries"', '"selected"', '"artifact"',
                 '"selection_rationale"'):
         assert key in block
-    assert re.search(r'"kind": "task"', block)
+    assert re.search(r'"kind": "idea"', block)
+    assert not re.search(r'"kind": "task"', block)
