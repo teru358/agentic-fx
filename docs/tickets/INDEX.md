@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -9,13 +9,12 @@
 |---|---|---|---|
 | [sandbox-escape-via-user-daemons-unmeasured](open/sandbox-escape-via-user-daemons-unmeasured.md) | 高 | 2026-10-03 | 改善 agent の檻からの脱出 (D-Bus / screen 経由) を測らずに塞ぐ |
 
-## 実装待ち (13)
+## 実装待ち (12)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
-| [bot-event-notices-are-raw-log-lines](open/bot-event-notices-are-raw-log-lines.md) | 中 | 2026-10-17 | bot の通知が event の k=v 行そのままで人が読めない |
 | [legacy-2026-08-22-a-4](open/legacy-2026-08-22-a-4.md) | 低 | 2026-08-22 | codex の MCP protocolVersion 実測値が allowlist に未登録 |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
