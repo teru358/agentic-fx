@@ -1,6 +1,6 @@
 # afx / afx ctl コマンド面整理設計書
 
-**版:** v0.4 (policy の照合・移行・読取 API と明示 reconcile、alias 期限、help の正本、argv shim の前置き flag)
+**版:** v0.5 (policy の安全な照合・移行・読取 API と明示 reconcile、alias 期限、help の正本、argv shim の前置き flag)
 
 **対象:** `cli-surface-principle-and-reorg`
 
@@ -143,7 +143,7 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 
 `ops` の旧形と `reconf` も同じ argv shim で扱う。以下の「先頭語」「2 語目」「3 語目」は head からの位置を指す。先頭語が `ops` で 2 語目が `enable` / `disable` / `status` なら旧形である。3 語目が `bot` / `web` / `notify` なら 2 語目と 3 語目を入れ替え、案内を stderr に出してから通常の parse へ進む。3 語目が無い、または不正なら案内だけを出して rc=2 で終える。先頭語が `ops` で 3 語目が `reconf` なら `reconfigure` へ書き換え、案内は出さない。argparse には新形の parser だけを登録する。このため旧形と `reconf` は choices にも通常 help の一覧にも現れない。`reconf` は `afx ops --help` の `reconfigure` 行の説明文 `(別名 reconf)` にだけ書く。
 
-`improve` の廃止 compatibility record と `ops` 旧形の期限つき互換別名 record は、どちらも `deprecated_since="0.2.0"`、`remove_in="0.3.0"` を持つ。「1 版だけ残し、次版で削除」という裁定を、どちらについても次の minor release と読む。対話 shell の `1.0.0` は §8.2-1 の別件であり、この 2 record とは関係しない。実行中 package version が `remove_in` 以上なら record が残っている test を失敗させ、期限超過の shim を自動検出する。
+`improve` の廃止 compatibility record と `ops` 旧形の期限つき互換別名 record は、どちらも `deprecated_since="0.2.0"`、`remove_in="0.3.0"` を持つ。「1 版だけ残し、次版で削除」という裁定を、どちらについても次の minor release と読む。対話 shell の `1.0.0` は §8.2-1 の別件であり、この 2 record とは関係しない。version の比較は `.` 区切りの各成分を整数にした tuple の辞書順比較とし、`packaging` には依存しない。実行中 package version が `remove_in` 以上なら record が残っている test を失敗させ、期限超過の shim を自動検出する。
 
 `deprecated_since="0.2.0"` を事実にするため、I1 で `pyproject.toml` の `version` を `0.1.0` から `0.2.0` へ上げる (`pyproject.toml:3`)。`importlib.metadata.version("agentic-fx")` が各 record の `deprecated_since` 以上であることも test で pin する。
 
@@ -175,7 +175,7 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 |---|---|
 | `group`, `group_order` | 7 群の enum と固定順 |
 | `lane` | `local` / `ctl` |
-| `command`, `usage` | 正式名と引数を含む表示文字列 |
+| `command`, `usage`, `shell_usage` | `usage` は常に `afx ctl status` のような完全形の正式表示文字列。shell に出す裸 token は別 field の `shell_usage` に置く |
 | `label` | `read` / `change`。`confirm` と `approver` は独立 bool |
 | `scope` | `Scope` の値と同じ文字列 (`"status.read"` 等) または `None`。enum は import しない |
 | `endpoint_code` | `ENDPOINTS` の key と同じ文字列または `None`。照合は test だけで行う |
@@ -206,11 +206,11 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 
 `epilog` は `RawDescriptionHelpFormatter` で改行を固定する。option (`add_argument`) の `help=` は引数定義と一体なので metadata へ移さず、各 parser の定義に残す。parser とメタデータの全件一致を test で保証する。
 
-正本が 1 つであることも test で検査する。`entry.py`、`backtest/cli.py`、`ops/client.py`、`commands.py` の AST を読み、(1) `ArgumentParser()` と `add_parser()` の `help` / `description` / `epilog` keyword に str literal (f-string を含む) が無いこと、(2) metadata の各 record の `summary`、`usage`、`condition` と群名の文字列が、この 4 file の str 定数のどれとも完全一致しないこと、を確かめる。`prog` と option の `help=` は対象外である。全文 golden は出力を固定するが、同じ文言が 2 か所に書かれることは防がないので、この検査を別に置く。
+正本が 1 つであることも test で検査する。`entry.py`、`backtest/cli.py`、`ops/client.py`、`commands.py` の AST を読み、(1) `ArgumentParser()` と `add_parser()` の `help` / `description` / `epilog` keyword に str literal (f-string を含む) が無いこと、(2) metadata の各 record の `summary`、`condition`、群名、および空白を含む `usage` が、この 4 file の str 定数のどれとも完全一致しないこと、を確かめる。`usage` は常に完全形なので空白を含む。shell の裸 token は `shell_usage` に分け、検査 (2) の対象外とする。`prog` と option の `help=` は対象外である。全文 golden は出力を固定するが、同じ文言が 2 か所に書かれることは防がないので、この検査を別に置く。
 
 ### 3.2 `afx --help` の全文 golden
 
-formatter の幅を 100 に固定し、stdout 全体を次の byte 列と一致させる。左レーンの親 command にもラベルを付け、副作用が下位操作ごとに異なる場合は `[下位操作ごと]` とする。ラベルは positional 一覧にだけ付け、末尾の「用途」表には左右どちらの列にも付けない。各 `afx <sub> --help` では葉操作ごとに `[読取]` / `[変更]` / `[確認]` と condition を出す。全角を 2 桁、`—` を 1 桁で数えて、どの行も 100 桁以内に収める。
+formatter の幅を 100 に固定し、stdout 全体を次の byte 列と一致させる。本節以降のすべての help golden test は formatter に `color=False` を明示し、実行前に `FORCE_COLOR`、`NO_COLOR` など色に関わる環境変数を消す。左レーンの親 command にもラベルを付け、副作用が下位操作ごとに異なる場合は `[下位操作ごと]` とする。ラベルは positional 一覧にだけ付け、末尾の「用途」表には左右どちらの列にも付けない。各 `afx <sub> --help` では葉操作ごとに `[読取]` / `[変更]` / `[確認]` と condition を出す。全角を 2 桁、`—` を 1 桁で数えて、どの行も 100 桁以内に収める。
 
 ```text
 usage: afx [-h] [--daemon] {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin} ...
@@ -459,9 +459,9 @@ live directory 不在は `source live: missing`、DB 不在は pending / journal
 | `backlog_list` | `GET /v1/backlog` | `guidance.read` | false | — | — |
 | `policy_show` | `GET /v1/policy` | `guidance.read` | false | — | — |
 | `policy_remove` | `POST /v1/policy/{id}/remove` | `operate` | true | true | true |
-| `policy_reconcile` | `POST /v1/policy/reconcile` | `operate` | true | true | true |
+| `policy_reconcile` | `POST /v1/policy/reconcile` | `operate` | true | true | false |
 
-`api_server.py` は現在 GET / POST だけを受ける (`api_server.py:283-286`)。remove と reconcile も既存の idempotency と監査の枠へ載せるため POST とする。endpoint 総数は B1 で 26、B2b で 29 になる (§3.4)。
+`api_server.py` は現在 GET / POST だけを受ける (`api_server.py:283-286`)。remove と reconcile も既存の idempotency と監査の枠へ載せるため POST とする。endpoint 総数は B1 で 26、B2b で 29 になる (§3.4)。`policy_reconcile` の `autopilot_restricted` は false とする。DB を変えず投影を DB 正本へ合わせるだけであり、autopilot 中にも修復経路を残すためである。
 
 読取は新 scope `guidance.read` とする。backlog の idea / last_result と policy directive は利用者の自由文であり、`logs.read` の流用はしない。`PRINCIPAL_SCOPES` は operator / approver にだけ `guidance.read` を追加し、ops-web / ops-bot / ops-notify には与えない。endpoint ごとの特例 deny ではなく scope 照合で一貫して拒否する。`tests/ops/test_scope_enforcement.py::test_scope_table_matches_the_spec`、`::test_every_endpoint_admits_exactly_the_principals_holding_its_scope`、`tests/ops/test_ac56_57_ops_principals.py::test_ac56_authorization_table_matches_the_spec_for_every_principal`、`::test_ac56_every_route_is_allowed_only_by_the_spec_scope` の principal × scope pin を更新する。bot、web、notify の UI / route も追加しない。
 
@@ -493,11 +493,11 @@ store に `list_items(conn, *, all_statuses: bool, limit: int) -> tuple[list[dic
 
 #### 5.3.1 marker の認識と投影
 
-marker は行全体の一致でだけ認識する。開始は `^<!-- afx:managed-policy id=([1-9][0-9]*) -->$`、終了は `^<!-- /afx:managed-policy id=([1-9][0-9]*) -->$` である。開始行、directive 1 行、同じ ID の終了行の連続 3 行だけが managed block である。
+file は `\n` だけで行へ分割する。各行の照合用 view では末尾の `\r` を高々 1 つだけ外すが、外側と unmanaged の保存は元の byte 列のままとする。marker はこの照合用 view の行全体の一致でだけ認識する。開始は `^<!-- afx:managed-policy id=([1-9][0-9]*) -->$`、終了は `^<!-- /afx:managed-policy id=([1-9][0-9]*) -->$` である。開始行、directive 1 行、同じ ID の終了行の連続 3 行だけが managed block である。したがって CRLF file の正しい block も認識・照合できる。
 
 directive 行は `_render_directive()` (`ops/service.py:231-232`) の結果であり、空白と改行を 1 つの空白へつぶして必ず `- ` で始まる。このため directive 本文が marker 行になることはない。`policy add "x <!-- /afx:managed-policy id=3 -->"` のような文面でも block の境界は壊れない。
 
-marker 外の手書き行、旧 shell の legacy 行、対にならない marker、ID が食い違う marker は byte 列のまま保持し、unmanaged かつ `removable=false` と表示する。移行 (§5.3.2) の 1 回を除き、DB と同じ文面が marker 外にあっても管理行に吸収しない。同じ ID の block が複数あれば全部を managed と認識する。下の照合で `duplicate` の stale になり、再生成で 1 つに戻る。
+marker 外の手書き行、旧 shell の legacy 行、対にならない marker、ID が食い違う marker は byte 列のまま保持し、unmanaged かつ `removable=false` と表示する。開始または終了 marker の正規表現に一致するが認識済み managed block に属さない行が 1 つでもあれば、その file は `malformed` の stale である。この marker は所有者を確定できないため、reconcile は削除も replace も行わない。移行 (§5.3.2) の 1 回を除き、DB と同じ文面が marker 外にあっても管理行に吸収しない。同じ ID の block が複数あれば全部を managed と認識する。下の照合で `duplicate` の stale になり、再生成で 1 つに戻る。
 
 再生成は認識済み managed block を全て除いた外側の byte 列をそのまま保持する。外側が空でなく `\n` で終わらないときだけ `\n` を 1 つ足す。その後ろ、つまり file の末尾に、DB の `id ASC` で managed block を並べる。末尾に置くのは現行の再生成と同じである (`ops/service.py:725-737`)。書込みは同一 directory の temp file を fsync 後に replace する。
 
@@ -507,12 +507,13 @@ marker 外の手書き行、旧 shell の legacy 行、対にならない marker
 - 実際の列は、file の managed block を file 内の出現順に読んだ `[(id, directive 行)]` である。
 - 2 つの列が長さ、各要素、順序まで一致するときだけ `ok` とする。それ以外は `stale` とする。
 
-stale の理由は次の固定語で返す。当てはまるものを全て、この表の順で返す。
+stale の理由は次の固定語 8 つで返す。当てはまるものを全て、この表の順で返す。ただし `unreadable` は file 内容を安全に観測できないため単独で返し、`unmanaged=[]` とする。
 
 | 理由 | 条件 |
 |---|---|
 | `migration_pending` | `data_migrations` に `policy_directives_managed_v1` が無い |
 | `unreadable` | file が存在するが読めない。file 不在は空 file として照合する |
+| `malformed` | marker の正規表現に一致するが、認識済み managed block に属さない行がある |
 | `missing` | DB の id の block が file に無い |
 | `orphan` | file の block の id が DB に無い |
 | `duplicate` | 同じ id の block が file に 2 つ以上ある |
@@ -528,7 +529,7 @@ managed block と marker 外の行の相対位置は照合に含めない。再�
 | `insert_policy(conn, text, *, request_id, now) -> int` | `ops_policies` へ 1 行 insert して commit し、整数 `id` を返す |
 | `regenerate_policy_file(conn, path) -> None` | DB 全行から上の規則で file を書き直す |
 | `inspect_policy_file(conn, path) -> ProjectionStatus` | DB と file を読んで上の照合を行い、`ProjectionStatus(status: "ok" \| "stale", reasons: tuple[str, ...])` を返す。file、DB、`data_migrations` のどれにも書かない |
-| `reconcile_policy_file(conn, path) -> bool` | §5.3.2 の移行を先に行い、その後 `inspect_policy_file()` が `stale` のときだけ再生成する。移行か再生成で file を replace したら True、`ok` なら file に触れず False を返す |
+| `reconcile_policy_file(conn, path) -> bool` | §5.3.2 の移行を先に行い、その後 `inspect_policy_file()` が `unreadable` / `malformed` 以外の `stale` のときだけ再生成する。これら 2 理由では専用例外で停止し、file を replace しない。`changed` は replace 前後の byte 列が異なるときだけ true とし、同一 byte の書き直しはしない。`ok` なら file に触れず false を返す |
 
 `ops_policies.request_id` は `NOT NULL UNIQUE` である (`store/db.py:509-514`)。API と shell は既存どおり accepted request の id を入れる。初回設定は `uuid4().hex` を入れる。`policy add` の応答 `{"id": <request_id>}` は変えない (`ops/service.py:715`)。削除キーの整数 `id` は `policy show` で知る。
 
@@ -536,19 +537,20 @@ managed block と marker 外の行の相対位置は照合に含めない。再�
 
 v0.1 までの再生成は marker なしの `- <directive>` 行を書いた (`ops/service.py:725-737`)。この旧形式をそのまま新規則で読むと、同じ文面が marker 外と managed block の両方に入り、Mission へ 2 回注入される。`policy remove` も marker 外の行を消せない。これを避けるため、次の移行を 1 回だけ行う。
 
+0. file が `unreadable`、または `malformed` marker を含むときは移行を始めず、専用例外で停止する。file 内容と migration record は変えない。
 1. `data_migrations` に `policy_directives_managed_v1` があれば何もしない。2 回目以降は ID marker だけで判定する。
 2. file に managed block が 1 つでもあれば、行の採用はせず `data_migrations` に記録だけする。
-3. managed block が 1 つも無いとき (= 旧形式、または file 不在) だけ、DB 全行の `_render_directive()` の集合を作る。この集合に一致する marker 外の行は、何行あっても全て legacy-owned として外側から除く。現行 `_regenerate_policy()` が `owned = set(rendered)` で除外している行と同じである (`ops/service.py:725-737`)。
-4. 外側の残りを byte 保存し、DB の行ごとに 1 つずつ (`id ASC`) managed block を末尾に並べた file を temp → fsync → replace で書く。一致する行が無かった DB 行も block にする。旧規則の再生成もそれらを書いていたので、注入内容は変わらない。
+3. managed block が 1 つも無いとき (= 旧形式、または file 不在) だけ、`\n` で分割し、照合時だけ末尾の `\r` を 1 つ外して、DB 全行の `_render_directive()` の集合を作る。この集合に一致する marker 外の行は、何行あっても全て legacy-owned として外側から除く。現行 `_regenerate_policy()` が `owned = set(rendered)` で除外している行と同じである (`ops/service.py:725-737`)。
+4. 外側の残りを byte 保存し、DB の行ごとに 1 つずつ (`id ASC`) managed block を末尾に並べた候補 byte 列を作る。一致する行が無かった DB 行も block にする。旧規則の再生成もそれらを書いていたので、注入内容は変わらない。file 不在かつ DB 0 行では file / directory を作らず、候補を書かない。既存 file でも候補 byte 列が同じなら replace しない。
 5. file の replace が済んでから、`data_migrations(name, applied_at)` を insert して commit する。
 
-file を書いた後で記録の前に crash しても、次回は手順 2 に当たり、記録だけして終わる。DB が 0 行で file も変わらない場合は、何度やり直しても同じ結果になる。旧規則も集合に一致する行を全て除き、DB 行ごとに 1 行を書き直していた (`ops/service.py:730-737`)。このため移行後に注入される directive の種類と回数 (DB の行数と同じ) は、旧規則の次の再生成と同じである。たとえば DB に A が 1 行、旧 file に `- A` が 2 行あれば、移行後の A は block 1 つだけになり、注入は 1 回である。DB に B が 2 行、旧 file に `- B` が 1 行あれば、block は 2 つで、注入は 2 回である。
+file を書いた後で記録の前に crash しても、次回は手順 2 に当たり、記録だけして終わる。file 不在かつ DB 0 行では記録だけを残し、file / directory は作らない。DB が 0 行で既存 file も変わらない場合も、replace せず記録だけを残す。旧規則も集合に一致する行を全て除き、DB 行ごとに 1 行を書き直していた (`ops/service.py:730-737`)。このため移行後に注入される directive の種類と回数 (DB の行数と同じ) は、旧規則の次の再生成と同じである。たとえば DB に A が 1 行、旧 file に `- A` が 2 行あれば、移行後の A は block 1 つだけになり、注入は 1 回である。DB に B が 2 行、旧 file に `- B` が 1 行あれば、block は 2 つで、注入は 2 回である。
 
 DB 行の無い旧 shell / 旧初回設定の行 (`commands.py:49-54` の `\n- text\n`) は採用せず、unmanaged で残る。
 
 #### 5.3.3 Mission への注入
 
-`Policy.tail()` (`policy.py:16-22`) は file 全体から §5.3.1 の marker 行に一致する行を除き、その結果の末尾 4000 文字を返す。directive 行は残る。`Policy.size_warning()` も同じ marker 除去後の文字数で判定する。marker は注入予算を消費せず、切り口に marker の断片が来ることもない。
+`Policy.tail()` (`policy.py:16-22`) は file 全体を `\n` で分割し、§5.3.1 と同じく照合時だけ末尾の `\r` を 1 つ外して marker 行を除き、その結果の末尾 4000 文字を返す。directive 行は残る。`Policy.size_warning()` も同じ marker 除去後の文字数で判定する。marker は注入予算を消費せず、切り口に marker の断片が来ることもない。
 
 #### 5.3.4 初回設定と shell が書く方針文
 
@@ -568,7 +570,7 @@ shell の `policy add` は `ops_service` がある通常経路では既存どお
 {"managed":[{"id":3,"created_at":"2026-10-23T00:00:00+00:00","directive":"..."}],"unmanaged":[{"line":1,"directive":"...","removable":false}],"limit":200,"has_more":false,"projection":{"status":"ok","reasons":[]}}
 ```
 
-`managed` は DB の `ops_policies` 行である。stale でも file の block ではなく DB の行を出す。`unmanaged` は現在の file の marker 外の手書き / legacy 行と不正 marker であり、常に `removable=false` と表示する。移行後の同文判定は行わず、同一文の managed block と手書き行を ID marker で区別する。これらは `policy remove` では削除できない。
+`managed` は DB の `ops_policies` 行である。stale でも file の block ではなく DB の行を出す。`unmanaged` は現在の file の marker 外の手書き / legacy 行と不正 marker であり、常に `removable=false` と表示する。ただし file が `unreadable` のときは内容を推測せず空配列とする。移行後の同文判定は行わず、同一文の managed block と手書き行を ID marker で区別する。これらは `policy remove` では削除できない。
 
 上限 `POLICY_SHOW_LIMIT=200` は managed と unmanaged の合計へ掛ける。managed は `id ASC`、unmanaged は file 順である。managed を先に budget へ入れる。残りへ unmanaged を入れる。超過時は `has_more=true` とする。directive は 4000 字の保存上限を保ち、CLI 表示だけ 200 字へ畳む。
 
@@ -582,7 +584,7 @@ CLI は次の形を固定する。
 投影: ok
 ```
 
-片方が 0 件でも見出しと `  0 件` を出す。stale のときは最後の行を `投影: stale (<理由>)。Mission に入る方針が DB と一致していません。afx ctl policy reconcile で DB に合わせられます。` とする。`<理由>` は §5.3.1 の固定語を表の順に `, ` で結ぶ。stale でも rc は 0 である。
+片方が 0 件でも見出しと `  0 件` を出す。stale のときは最後の行を `投影: stale (<理由>)。Mission に入る方針が DB と一致していません。afx ctl policy reconcile で DB に合わせられます。` とする。ただし `malformed` を含むときは固定文を `投影: stale (<理由>)。marker を手修正してから afx ctl policy reconcile を実行してください。` とし、自動修復を案内しない。`<理由>` は §5.3.1 の固定語を表の順に `, ` で結ぶ。stale でも rc は 0 である。
 
 ### 5.4 `policy remove <id>`
 
@@ -601,6 +603,8 @@ remove は既存の accepted → 終端の機構だけで書く。新しい jour
 
 手順 4 の commit の後で手順 5 が例外になったら、成功とも失敗とも報告しない。action は専用の内部例外 `PolicyProjectionUnknown` を送出する。`_mutate` の except 節はこの例外だけを、code=`outcome_unknown`、state=`outcome_unknown` の終端行にして書き、`OpsError(OUTCOME_UNKNOWN)` を送出する。現行の `_terminal()` は state を渡さないので (`ops/service.py:412-423`)、`AuditStore.terminal()` の既存の `state` 引数 (`ops/audit.py:123-135`) へ通す keyword を足す。state を渡さないと phase は `failed` になる。activity はこの場合残さない。
 
+投影層は、replace 後の migration record commit が不明になったとき `MigrationRecordUnknown`、`unreadable` / `malformed` で安全に reconcile できないとき `ProjectionReconcileBlocked` という独自例外を送出する。投影層自身は `outcome_unknown` を作らない。`policy_reconcile` endpoint だけが、`MigrationRecordUnknown` と、replace 後の応答用 `inspect_policy_file()` の例外を `PolicyProjectionUnknown` へ写し `outcome_unknown` にする。add / remove の action 先頭 reconcile はこれらを含む投影例外を既存の `failed` (`internal`) として終え、DB 変更へ進まない。
+
 手順 1 の後、終端行の前に crash した要求は、起動時の既存 `recover_after_journal()` が `outcome_unknown` にする (`ops/service.py:1383-1404`)。投影の収束は §5.4.1 の起動時 reconcile と明示 reconcile が受け持つ。API の終端と投影の回復は分かれており、回復後も同じ key の結果を成功へ書き換えない。
 
 `policy add` も同じ非原子性を持つ。現行は INSERT → commit → 再生成 → activity の順で (`ops/service.py:705-715`)、再生成の失敗は `failed (internal)` になる。DB には行が残るので、失敗と応答したのに次の再生成で policy が効く。add も commit 後の再生成失敗を `PolicyProjectionUnknown` で `outcome_unknown` にし、activity `policy_added` は成功時だけ残す。
@@ -611,22 +615,22 @@ add と同じ `operate`、idempotency key、autopilot 制限を使う (`ops/serv
 
 `reconcile_policy_file()` は次の 3 か所で呼ぶ。`policy show` では呼ばない (§5.3.5)。
 
-- 起動時。`_recover_ops` の `SELECT 1 FROM ops_policies LIMIT 1` のゲートを外し、DB の行数によらず呼ぶ (最上位の `src/agentic_fx/service.py:1954-1959`)。移行 (§5.3.2) を先に行い、その後で §5.3.1 の列を照合する。これで最後の 1 件を remove した直後の crash でも、DB 0 行に対して block が残り続けることがない。
-- 変更系 2 endpoint (`policy` add と `policy_remove`) の action の先頭。ops lane の中で呼ぶ。crash ではない replace 失敗の後に利用者が別 key で再実行したとき、`not_found` を返す前に投影が収束する。daemon の再起動を待たない。
+- 起動時。`_recover_ops` の `SELECT 1 FROM ops_policies LIMIT 1` のゲートを外し、DB の行数によらず呼ぶ (最上位の `src/agentic_fx/service.py:1954-1959`)。移行 (§5.3.2) を先に行い、その後で §5.3.1 の列を照合する。これで最後の 1 件を remove した直後の crash でも、DB 0 行に対して block が残り続けることがない。reconcile の例外は固定 activity `SYSTEM policy_reconcile_failed` と技術ログへ残すが、listener の起動を妨げない。致命として listener を開かないのは `recover_after_journal()` 自体の失敗だけである。
+- 変更系 2 endpoint (`policy` add と `policy_remove`) の action の先頭。ops lane の中で呼ぶ。crash ではない replace 失敗の後に利用者が別 key で再実行したとき、`not_found` を返す前に投影が収束する。daemon の再起動を待たない。ここで `changed=true` なら、後続の DB 操作と独立した副作用として固定 activity `SYSTEM policy_reconciled` を残す。したがって投影を直した後に対象なしで `not_found` になっても、この activity は残る。
 - 明示操作 `policy_reconcile` (§5.4.2)。
 
-先頭の reconcile が例外になったら、DB を変える前なので既存どおり `failed` (`internal`) で終える。
+先頭の reconcile が例外になったら、DB を変える前なので既存どおり `failed` (`internal`) で終える。とくに `unreadable` / `malformed` は replace せず、この経路と明示 reconcile endpoint のいずれも `failed` (`internal`) で終える。
 
 #### 5.4.2 `policy reconcile`
 
-`afx ctl policy reconcile` は、投影 file を DB 正本へ今すぐ合わせる明示操作である。`policy show` が `stale` を示したとき、daemon の再起動や別の policy 変更を待たずに直すために使う。route は `POST /v1/policy/reconcile`、scope は `operate`、ラベルは `[変更]`、`mutating=true` である。add / remove と同じ idempotency key、autopilot 制限、`_mutate` の accepted → 終端で監査する。引数は取らず、余分な引数は client が API 接続前に rc=2 とする。request body は `{}` である。
+`afx ctl policy reconcile` は、投影 file を DB 正本へ今すぐ合わせる明示操作である。`policy show` が `stale` を示したとき、daemon の再起動や別の policy 変更を待たずに直すために使う。route は `POST /v1/policy/reconcile`、scope は `operate`、ラベルは `[変更]`、`mutating=true` である。add / remove と同じ idempotency key と `_mutate` の accepted → 終端で監査するが、§5.1 の理由により autopilot 制限はしない。引数は取らず、余分な引数は client が API 接続前に rc=2 とする。request body は `{}` である。
 
 1. `_mutate` が accepted を commit する。
 2. `reconcile_policy_file()` を呼ぶ。
-3. 応答 `{"changed":<bool>,"projection":{"status":"ok","reasons":[]}}` を返す。`changed` は移行か再生成で file を replace したとき true である。`projection` は reconcile 後の `inspect_policy_file()` の結果である。
+3. 応答 `{"changed":<bool>,"projection":{"status":"ok","reasons":[]}}` を返す。`changed` は移行か再生成で replace 前後の byte 列が異なったときだけ true である。`projection` は reconcile 後の `inspect_policy_file()` の結果である。
 4. `changed=true` のときだけ固定 activity `SYSTEM policy_reconciled` を残す。`_mutate` が `succeeded` の終端行を書く。
 
-`ops_policies` は変えない。file の replace より前に失敗したら、file も DB も変わっていないので `failed` (`internal`) で終える。移行で file を replace した後に `data_migrations` の commit が失敗したら、file は変わったが記録は無いので `PolicyProjectionUnknown` で `outcome_unknown` にする。次の reconcile は §5.3.2 の手順 2 に当たり、記録だけして終わる。同じ key の再送は既存の replay で保存済みの結果を返す。
+`ops_policies` は変えない。file の replace より前に失敗したら、file も DB も変わっていないので `failed` (`internal`) で終える。`unreadable` / `malformed` は replace せずこの扱いにする。移行で file を replace した後に `data_migrations` の commit が失敗したら、投影層の `MigrationRecordUnknown` を endpoint が `PolicyProjectionUnknown` へ写し、`outcome_unknown` にする。replace 後の応答用 `inspect_policy_file()` が例外になった場合も file は変わり得るため同じ `outcome_unknown` にする。次の reconcile は §5.3.2 の手順 2 に当たり、記録だけして終わる。同じ key の再送は既存の replay で保存済みの結果を返す。
 
 CLI は成功時に `policy reconcile: changed` または `policy reconcile: unchanged` の 1 行を stdout に出す。
 
@@ -827,17 +831,17 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-3 | argparse の全正式 local command (`ops` は機能 → 動詞の 2 段)、ctl `parse()` の全正式語順、`exposed=True` の surface record が一対一である。`exposed` なら `implemented`、planned なら非 exposed、alias / compatibility record は通常 parser と独立である。`import agentic_fx.cli_surface` 後の `sys.modules` にある `agentic_fx` 配下は `agentic_fx` と `agentic_fx.cli_surface` だけである | 独立 expected table と集合比較、子 process の `sys.modules` |
 | AC-4 | B1 の完了時に endpoint 26 本、B2b の完了時に 29 本で、`_ENDPOINT_COUNT`、routing test の個数 pin 2 か所、独立 `_EXPECTED_TABLE` が一致し、listener が起動する。I1 で API record の endpoint code / scope / mutating の文字列が `ENDPOINTS` と一致する。I1 まで新 record は help 非表示 | `ops/api_server.py:274-281` と routing test 2 か所、surface ↔ `ENDPOINTS` 照合、help snapshot |
 | AC-5 | `[確認]` と `_CONFIRM_OPS`、`[approver]` と `_APPROVER_OPS` が一致する。`jobs cancel` は確認あり / approver なし | metadata と client 定数の集合比較 |
-| AC-6 | argv shim は先頭語が `improve` の argv (`afx improve`、`afx improve --help`、`afx improve verify-backend …`) すべてで固定文を stderr に 1 回出し、rc=2、backend 接続・DB 作成・settings 書換えが 0 回である。`--daemon` の前置きが 0 個 / 1 個 / 2 個 (`afx --daemon improve --help`、`afx --daemon --daemon improve verify-backend …`) のどれでも同じ結果で、argparse の `invalid choice` にならない。`--dae improve` は現行どおり usage error である。`deprecated_since=0.2.0`、`remove_in=0.3.0` で、package version を 0.3.0 へ変異させると期限 pin が失敗する。`importlib.metadata.version("agentic-fx")` は各 compatibility record の `deprecated_since` 以上であり、`pyproject.toml` は `0.2.0` である | shim spy、tmp dir、version monkeypatch、installed metadata |
+| AC-6 | argv shim は先頭語が `improve` の argv (`afx improve`、`afx improve --help`、`afx improve verify-backend …`) すべてで固定文を stderr に 1 回出し、rc=2、backend 接続・DB 作成・settings 書換えが 0 回である。`--daemon` の前置きが 0 個 / 1 個 / 2 個 (`afx --daemon improve --help`、`afx --daemon --daemon improve verify-backend …`) のどれでも同じ結果で、argparse の `invalid choice` にならない。`--dae improve` は現行どおり usage error である。`deprecated_since=0.2.0`、`remove_in=0.3.0` で、整数 tuple 比較による package version を 0.3.0 へ変異させると期限 pin が失敗する。`importlib.metadata.version("agentic-fx")` は各 compatibility record の `deprecated_since` 以上であり、`pyproject.toml` は `0.2.0` である | shim spy、tmp dir、version monkeypatch、installed metadata |
 | AC-7 | `afx ctl improve add x` と `afx ctl backlog add x` が同じ `Op("backlog_add", ["x"])`、同じ endpoint、同じ認可、同じ idempotency payload、同じ送信 body、同じ成功 / 失敗 rc になる。差は `Op.via_alias` (`"improve add"` と `None`) だけで、旧名だけ固定案内を stderr に出す。`via_alias` は送信 body と idempotency payload に現れない | parse と fake API の送信記録 |
 | AC-8 | `check` は外部接続 0 回で読み取り専用を保つ。`check backend` は §4.2 の非隔離 / 課金警告を stdout へ byte 一致で出し、`OPERATOR_SHELL_NO_ISOLATION` sentinel で指定 backend へ 1 往復し、DB を作らない。backend / provider の不正値は送信前 rc=2。親の `--json` / `--unit-env` と `backend` の併用は §4.2 の固定文を stderr に出して送信前 rc=2。FS before / after の比較範囲は `root` 配下に限る (`verify_backend` はシステムの tmp に作業場を作って消すため。`loops/verify_backend.py:371,532`) | fake backend、sentinel spy、stdout / stderr、root 配下の FS before/after |
 | AC-9 | `plugin list` は §4.7 の source status、列、name / kind 順、live + pending + open rollback の併記 (12 文字以上の hash prefix)、壊れた plugin、重複名、missing / unavailable を固定表示する。`--kind` の unknown 扱いも一意で、不在 DB / directory を作らない。sidecar の無い DB では tree 全体が byte 一致し、sidecar のある DB では `data/agentic.db-wal` / `-shm` 以外が byte 一致する | source 直積 fixture、stdout golden、FS before/after、sidecar 有無の直積 |
 | AC-10 | `backlog list` 既定は active 4 status だけを `updated_at DESC,id DESC` で返す。`--all` は status で絞らず、`done` / `rejected` と未知の status 値 (fixture では `archived`) も返す。0 件の固定文を出す | API JSON と CLI stdout |
 | AC-11 | backlog limit `L=500` に 499 / 500 / 501 を渡す。499 / 500 は受理し、501 は API 接続前 rc=2。DB に 99 / 100 / 101 件の fixture を置き、既定 100 と `has_more` を検査する | parse、SQL query count、応答 |
 | AC-12 | API の idea / last_result は UTF-8 `L=4096` byte の 4095 / 4096 / 4097 で文字を壊さず固定印と truncated bool を返す。CLI の `L=200` 文字も 199 / 200 / 201 で切れ、改行と制御文字が 1 行を偽装しない | API JSON と stdout |
-| AC-13 | `policy show` が ID marker 付き managed block と marker 外の `removable=false` を区別する。同一文の managed / 手書き行、legacy 行、対にならない marker、ID の食い違う marker、同じ ID の重複 block を取り違えない。`policy add "x <!-- /afx:managed-policy id=3 -->"` は block の境界を壊さない。照合は DB `id=3, A` と `id=5, B` の canonical 列に対し、(i) id=3 の block を 2 つにする、(ii) id=3 の block の directive 行だけを `- C` に改変する、(iii) 2 つの block の順を入れ替える、の 3 変異でそれぞれ `stale` と理由 `duplicate` / `content` / `order` を返す。`missing`、`orphan`、`migration_pending`、`unreadable` も各 1 fixture で返す。`reconcile_policy_file()` はどの stale からも canonical の byte 列へ再生成し、ok の file には触れない。照合を ID 集合の比較へ戻す変異で (i)〜(iii) がすべて落ちる | 合成 DB と directives file、`inspect_policy_file()` の戻り値、file の byte 比較 |
+| AC-13 | `policy show` が ID marker 付き managed block と marker 外の `removable=false` を区別する。同一文の managed / 手書き行、legacy 行、対にならない marker、ID の食い違う marker、同じ ID の重複 block を取り違えない。marker の形で認識済み block に属さない行は `malformed` stale となり、show は固定の手修正案内を出す。`policy add "x <!-- /afx:managed-policy id=3 -->"` は block の境界を壊さない。照合は DB `id=3, A` と `id=5, B` の canonical 列に対し、(i) id=3 の block を 2 つにする、(ii) id=3 の block の directive 行だけを `- C` に改変する、(iii) 2 つの block の順を入れ替える、の 3 変異でそれぞれ `stale` と理由 `duplicate` / `content` / `order` を返す。`missing`、`orphan`、`migration_pending`、`unreadable`、`malformed` も各 1 fixture で返す。`unreadable` の show は `unmanaged=[]` と `stale (unreadable)` を返す。`reconcile_policy_file()` は `unreadable` / `malformed` を除く stale からだけ canonical の byte 列へ再生成し、ok の file には触れない。照合を ID 集合の比較へ戻す変異で (i)〜(iii) がすべて落ちる | 合成 DB と directives file、`inspect_policy_file()` の戻り値、file の byte 比較 |
 | AC-14 | policy 合計上限 `L=200` について 199 / 200 / 201 件を入れ、順序、件数、`has_more` を検査する。directive 表示 `L=200` 字も 199 / 200 / 201 で検査する | API JSON と CLI stdout |
 | AC-15 | `policy remove <id>` は該当 DB row だけを消し、DB の全 row から ID marker 付き block を file 末尾に再生成し、marker 外の手書き / legacy / 不正 marker を byte 保存し、成功時だけ固定 activity を 1 件残す。`ops_requests` の phase は `accepted` と `succeeded` の 2 行だけで、CHECK 制約の 4 値以外を書かない | DB / file / audit / activity の before-after |
-| AC-16 | (a) remove の同一 idempotency key 再送は保存済みの応答を返す。(b) DELETE commit 後の file replace 例外は、`ops_requests` に phase=`outcome_unknown` の終端行を書き、`outcome_unknown` を応答する。(c) DELETE commit 後・replace 前の hard crash を fault injection し、再起動で `recover_after_journal()` がその要求を `outcome_unknown` にし、file が DB 正本へ収束する。(d) managed が 1 件だけの状態でその 1 件を remove し、同じ位置で crash しても、再起動後の file に block が残らない (DB 0 行でも reconcile が走る)。(e) (b) の後に別 key で同じ ID を remove すると、`not_found` を返す前に file が収束する。daemon は再起動しない。(f) 別 key で削除済みの正の整数 ID を送ると、API は `not_found` を返し、DB / file / activity は変わらない。`0`、負数、非数値 (`abc`、`1.5`、空文字) は client の parse で API 接続前に rc=2 となり、鍵の読込と接続は 0 回である。(g) (b) の後の file に AC-13 の (i)〜(iii) の変異を重ねても、別 key の remove の先頭 reconcile で canonical 列へ収束する | replace fault、crash child、再起動 recovery、API と client parse |
+| AC-16 | (a) remove の同一 idempotency key 再送は保存済みの応答を返す。(b) DELETE commit 後の file replace 例外は、`ops_requests` に phase=`outcome_unknown` の終端行を書き、`outcome_unknown` を応答する。(c) DELETE commit 後・replace 前の hard crash を fault injection し、再起動で `recover_after_journal()` がその要求を `outcome_unknown` にし、file が DB 正本へ収束する。(d) managed が 1 件だけの状態でその 1 件を remove し、同じ位置で crash しても、再起動後の file に block が残らない (DB 0 行でも reconcile が走る)。(e) (b) の後に別 key で同じ ID を remove すると、`not_found` を返す前に file が収束し、先頭 reconcile が直した場合の `policy_reconciled` activity は残る。daemon は再起動しない。(f) 別 key で削除済みの正の整数 ID を送ると、API は `not_found` を返し、先頭 reconcile が unchanged なら DB / file / activity は変わらない。`0`、負数、非数値 (`abc`、`1.5`、空文字) は client の parse で API 接続前に rc=2 となり、鍵の読込と接続は 0 回である。(g) (b) の後の file に AC-13 の (i)〜(iii) の変異を重ねても、別 key の remove の先頭 reconcile で canonical 列へ収束する。(h) 起動時 reconcile が例外でも `SYSTEM policy_reconcile_failed` と技術ログを残して listener は開き、`recover_after_journal()` の失敗だけが listener を妨げる | replace fault、crash child、再起動 recovery、listener、API と client parse |
 | AC-17 | principal × scope / 新 endpoint が §5.5 と一致する。`guidance.read` は operator / approver だけが持ち、ops-web / ops-bot / ops-notify は backlog / policy 自由文を取得できない。remove と reconcile も operator / approver だけが通る | principal × scope × endpoint の直積 test |
 | AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 5 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
 | AC-19 | `instance: free` で setup=`ok / missing / corrupt`、settings=`ok / missing / invalid`、主要 file 不在を固定語で出す。どの source が不良でも残りの collector と pending steps を表示する | source 直積 fixture |
@@ -853,18 +857,18 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-29 | 空 root、主要 file 不在、settings 破損、DB 不在、鍵不在、DB sidecar 有り / 無しの locked / free / unknown すべてで、実行前後の tree が同一である。例外は sidecar 有りのときの `data/agentic.db-wal` と `data/agentic.db-shm` だけで、`data/agentic.db` は byte 一致する。sidecar 無しの DB では sidecar が作られない | recursive tree manifest と byte compare |
 | AC-30 | instance lock 不在 / unreadable は `instance: unknown`、state reader 0 回となり、locked / free / unknown すべてで「観測時点」固定文を出す | lock fault injection、stdout snapshot、spy |
 | AC-31 | `afx status` が state / DB を読んでいる最中 (reader に待ちを差し込む) に、別 thread の `acquire_instance_lock(root / "data")` が成功する。`afx status` の全実行中に instance lock を保持する時間は probe の 1 回だけである | lock holder thread と並行させた test、flock 呼出しの記録 |
-| AC-32 | marker の無い旧形式 `directives.md` と `ops_policies` の fixture から起動すると、file が期待 byte 列と一致し、`data_migrations` に `policy_directives_managed_v1` が 1 行入る。fixture は DB と file で重複数を変える。DB は `A` が 1 行と `B` が 2 行、file は `- A` が 2 行、`- B` が 1 行、手書き行 `- C`、DB 行の無い shell 由来の `- D` である。移行後の file は `- C` と `- D` を元の byte で残し、`- A` / `- B` の marker 外の行は 1 行も残さず、block を A 1 つ、B 2 つ持つ。Mission の注入文には A が 1 回、B が 2 回、C と D が 1 回ずつ現れる。移行後に A の行を `policy remove` すると、A は注入文から消え、B の 2 回は変わらない。file replace 後・記録前の crash からの再実行と 2 回目の起動は file を変えない | 旧 fixture → byte 一致、`Policy.tail()` の出力、crash child |
+| AC-32 | marker の無い旧形式 `directives.md` と `ops_policies` の fixture から起動すると、file が期待 byte 列と一致し、`data_migrations` に `policy_directives_managed_v1` が 1 行入る。fixture は DB と file で重複数を変える。DB は `A` が 1 行と `B` が 2 行、file は `- A` が 2 行、`- B` が 1 行、手書き行 `- C`、DB 行の無い shell 由来の `- D`、CRLF の手書き行 `- E\r\n` を各 1 行含む。移行後の file は `- C`、`- D`、CRLF 行を元の byte で残し、`- A` / `- B` の marker 外の行は 1 行も残さず、block を A 1 つ、B 2 つ持つ。Mission の注入文には A が 1 回、B が 2 回、C と D が 1 回ずつ現れる。別 fixture で ID の食い違う marker `<!-- /afx:managed-policy id=5 -->` を 1 行置くと `malformed` stale となり、移行・replace をせず byte と migration record が不変である。移行後に A の行を `policy remove` すると、A は注入文から消え、B の 2 回は変わらない。file replace 後・記録前の crash からの再実行と 2 回目の起動は file を変えない。file 不在かつ DB 0 行では migration record だけを残し、file / directory を作らない | 旧 fixture → byte 一致、CRLF / malformed fixture、`Policy.tail()` の出力、crash child |
 | AC-33 | `Policy.tail()` と `size_warning()` は marker 行を除いた文で計算する。marker を含む file で末尾 4000 文字に marker の断片が入らない。`L=4000` について marker 除去後 3999 / 4000 / 4001 文字の file を検査する | `Policy` の unit test |
 | AC-34 | 初回設定の段 12 で入れた方針文 (例文 `e` を含む) は `ops_policies` の行と managed block になり、`policy show` で `managed` に出て `policy remove` で消せる。DB insert 前の失敗と commit 後の file 反映失敗はそれぞれ §5.3.4 の固定文を出す。shell の `ops_service is None` 経路も同じ managed 形式で書く | wizard の段 12 test、fault injection、shell fallback test |
-| AC-35 | `policy add` で INSERT commit 後の file replace 例外は phase=`outcome_unknown` の終端行と `outcome_unknown` 応答になり、activity `policy_added` を残さない。同じ key の再送は `outcome_unknown`、次の add / remove / reconcile または再起動で file が DB へ収束する。その間の `policy show` は file を変えずに `stale` を返す | replace fault、audit / activity の before-after |
+| AC-35 | `policy add` で INSERT commit 後の file replace 例外は phase=`outcome_unknown` の終端行と `outcome_unknown` 応答になり、activity `policy_added` を残さない。同じ key の再送は `outcome_unknown`、次の add / remove / reconcile または再起動で file が DB へ収束する。その間の `policy show` は file を変えずに `stale` を返す。add / remove の先頭 reconcile で `MigrationRecordUnknown`、`unreadable`、`malformed` が起きたときは DB を変えず `failed` (`internal`) で終え、`outcome_unknown` へ写さない | replace fault、audit / activity の before-after |
 | AC-36 | `afx ops <feature> <enable\|disable\|status>` と旧形 `afx ops <verb> <feature>` が、3 機能 × 3 動詞 × `--daemon` 前置き 0 / 1 / 2 個のすべてで同じ dispatch (`interactive_enable(root, feature)` / `run_ops_command(root, verb, feature)`) を同じ引数で 1 回呼び、同じ rc を返す | entry の dispatch spy |
 | AC-37 | 旧形は §2.2 の固定文を stderr に 1 回だけ出し、新形は何も出さない。旧形で機能名が無い / 不正なときは案内を出して rc=2、dispatch 0 回である。どちらも `--daemon` 前置き 0 / 1 / 2 個で同じ結果になり、書換えは head からの位置で行われ、前置きの `--daemon` は残る (parse 後の `daemon` 属性が書換え前の argv と同じ)。旧形 record は `deprecated_since=0.2.0`、`remove_in=0.3.0` で、package version を 0.3.0 へ変異させると期限 pin が失敗する | stderr、dispatch spy、version monkeypatch |
 | AC-38 | web で `afx ops web reconf` と `afx ops web reconfigure` が同じ `run_ops_reconfigure(root, "web")` を 1 回呼び、同じ rc を返し、stderr に案内を出さない。`--daemon` 前置き 0 / 1 / 2 個でも同じである。bot と notify では `reconf` と `reconfigure` の両方が argparse の usage error (rc=2) で、handler 0 回である | entry の dispatch spy (handler は stub) |
-| AC-39 | `afx ops --help`、`afx ops web --help`、`afx ops bot --help`、`afx ops notify --help` の stdout 全体が §3.2.1 の 4 つの golden と byte 一致する。`reconfigure` は web の choices と一覧、`afx ops --help` の `afx ops web reconfigure` 行にだけ出る。bot / notify の record は `implemented=False, exposed=False` である。どの usage の choices にも `enable` / `disable` / `status` が機能の位置に出ず、`reconf` も出ない。全行が 100 桁以内である | stdout 全文 golden、record の値 |
+| AC-39 | `afx ops --help`、`afx ops web --help`、`afx ops bot --help`、`afx ops notify --help` の stdout 全体が §3.2.1 の 4 つの golden と byte 一致する。golden は `color=False` を渡し、`FORCE_COLOR`、`NO_COLOR` 等を除いた環境で実行する。`reconfigure` は web の choices と一覧、`afx ops --help` の `afx ops web reconfigure` 行にだけ出る。bot / notify の record は `implemented=False, exposed=False` である。どの usage の choices にも `enable` / `disable` / `status` が機能の位置に出ず、`reconf` も出ない。全行が 100 桁以内である | stdout 全文 golden、record の値 |
 | AC-40 | 追跡文書 (§7.2 の doc test (d)) と製品の文言 (`setup/`、`ops_setup/` の利用者向け文字列) に `afx ops (enable\|disable\|status) <feature>` の旧形が 0 件である。`first-run-acceptance.md` と ops-api 文書には新形が出る | `test_first_run_acceptance_doc.py`、`src/` の文字列 grep pin |
 | AC-41 | `policy show` は純粋な読取である。ok / stale (`missing`、`orphan`、`duplicate`、`content`、`order`、`migration_pending`) の各 fixture で、実行前後の directives file、`ops_policies`、`data_migrations`、`ops_requests`、`ops_idempotency`、activity log が byte 一致する。応答の `projection` は §5.3.1 の固定語を表の順で返し、CLI は §5.3.5 の固定行を出して rc=0 である。show の中で `reconcile_policy_file()` を呼ぶ変異で落ちる | file / DB / activity の before-after、reconcile spy |
-| AC-42 | `policy reconcile` は stale の file を canonical の byte 列へ直して `changed=true` と固定 activity 1 件を返し、ok の file では file に触れず `changed=false` で activity を残さない。`ops_requests` は `accepted` と `succeeded` の 2 行で、同じ key の再送は保存済みの応答を返す。replace 前の失敗は `failed` (`internal`)、移行の replace 後・記録前の失敗は `outcome_unknown` になる。引数付きの `afx ctl policy reconcile x` は接続前に rc=2 である | DB / file / audit / activity の before-after、fault injection、client parse |
-| AC-43 | §3.1 の help の正本の検査が通る。`entry.py`、`backtest/cli.py`、`ops/client.py`、`commands.py` の `ArgumentParser()` / `add_parser()` の `help` / `description` / `epilog` に str literal が無く、metadata の `summary` / `usage` / `condition` / 群名と完全一致する str 定数がこの 4 file に無い。metadata の summary を 1 つ変えると `afx --help` などの golden がその分だけ変わる | AST 検査、metadata 変異と golden の差分 |
+| AC-42 | `policy reconcile` は `unreadable` / `malformed` 以外の stale の file を canonical の byte 列へ直して `changed=true` と固定 activity 1 件を返し、ok の file では file に触れず `changed=false` で activity を残さない。`unreadable` fixture (mode `000`) は endpoint が `failed` (`internal`) となり、file の inode と mode が不変である。`ops_requests` は成功時に `accepted` と `succeeded` の 2 行で、同じ key の再送は保存済みの応答を返す。replace 前の失敗は `failed` (`internal`)、移行の replace 後・記録前、または replace 後の応答用 inspect 失敗は `outcome_unknown` になる。引数付きの `afx ctl policy reconcile x` は接続前に rc=2 である | DB / file / audit / activity の before-after、inode / mode、fault injection、client parse |
+| AC-43 | §3.1 の help の正本の検査が通る。metadata の `usage` は常に完全形で shell の裸 token は `shell_usage` に置く。`entry.py`、`backtest/cli.py`、`ops/client.py`、`commands.py` の `ArgumentParser()` / `add_parser()` の `help` / `description` / `epilog` に str literal が無く、metadata の `summary` / `condition` / 群名、および空白を含む `usage` と完全一致する str 定数がこの 4 file に無い。metadata の summary を 1 つ変えると `afx --help` などの golden がその分だけ変わる | AST 検査、metadata 変異と golden の差分 |
 
 ## 10. 変更ファイルと task 表
 
@@ -876,8 +880,8 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | 最上位 CLI | `src/agentic_fx/entry.py`, `src/agentic_fx/backtest/cli.py`, plugin 表示 module | help epilog、`check backend`、`improve` / `ops` 旧形 / `reconf` の argv shim、`ops <feature> <verb>` の parser、`plugin list`、`status` 配線 |
 | offline status | `src/agentic_fx/status.py` (新規), `setup/pending_facts.py`, `store/db.py`, `store/plugin_deploy_ops.py` | instance lock の probe、読取専用 state reader、read-only collector、固定 renderer、`service_active` 引数と `settings` / `conn` の `None` 許容、`connect_observer_readonly`、`count_open_readonly(opener=)` |
 | ctl | `src/agentic_fx/ops/client.py` | 生成 help、正式名 / alias parse、list / show / remove / reconcile formatter |
-| API | `ops/contracts.py`, `ops/service.py`, `ops/api_server.py`, 最上位 `service.py` | endpoint 4 本、service method、route 26 → 29 本、`_terminal` の state 引数、`_recover_ops` の無条件 reconcile |
-| store / policy | `store/backlog.py`, `src/agentic_fx/policy_projection.py` (新規), `src/agentic_fx/policy.py` | bounded list、policy の投影・列の照合 (`inspect_policy_file`)・移行・reconcile、marker を除いた注入 |
+| API | `ops/contracts.py`, `ops/service.py`, `ops/api_server.py`, 最上位 `service.py` | endpoint 4 本、service method、route 26 → 29 本、`_terminal` の state 引数、失敗を記録して listener を妨げない `_recover_ops` の無条件 reconcile |
+| store / policy | `store/backlog.py`, `src/agentic_fx/policy_projection.py` (新規), `src/agentic_fx/policy.py` | bounded list、policy の投影・列の照合 (`inspect_policy_file`)・安全に停止する移行 / reconcile、CRLF marker を除いた注入 |
 | shell | `src/agentic_fx/commands.py` | `_HELP` 生成、backlog 正式名、policy fallback の managed 化。新 surface は足さない |
 | wizard / setup | `src/agentic_fx/setup/wizard.py`, `setup/pending_text.py`, `ops_setup/stages.py`, `ops_setup/interactive.py` | 新 argv と案内文、段 12 の managed 化、`afx ops` 新形の文言 |
 | package | `pyproject.toml` | `version` を `0.2.0` へ |
@@ -892,8 +896,8 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 |---|---|---|---|---|---|
 | S1 metadata schema (非公開) | なし | `cli_surface.py` の field / renderer interface、`guidance.read` | keep: `tests/ops/test_ctl_pins.py::test_client_does_not_import_setup_persistence_layer`。update: `tests/ops/test_scope_enforcement.py::{test_scope_table_matches_the_spec,test_every_endpoint_admits_exactly_the_principals_holding_its_scope}`、`tests/ops/test_ac56_57_ops_principals.py::{test_ac56_authorization_table_matches_the_spec_for_every_principal,test_ac56_every_route_is_allowed_only_by_the_spec_scope}` | new: exposed ⇒ implemented、planned ⇒ hidden、compatibility version 期限、classified=false shell record、`cli_surface` の import 閉包 | AC-5、27 |
 | B1 backlog API / parse | S1 | 正式 add / alias (`Op.via_alias`)、bounded list、`guidance.read`、個数 pin 25 → 26 | update: `tests/ops/test_ac01_02_43_api_routing.py::{test_ac1_all_24_endpoints_over_real_uds,test_ac1_routes_and_endpoints_match_the_independent_table_exactly}` (26 本)、`tests/ops/test_ctl_operations.py::test_backlog_add_and_transition`、`tests/ops/test_ctl_pins.py::test_backlog_idea_echo_is_sanitized`、`::test_backlog_idea_echo_counts_the_removed_characters` | new: list order / limit / 4,096-byte truncation / 全 status / alias equivalence / principal 直積。record はまだ `exposed=False` | AC-4 (26 本)、7、10〜12、17 (backlog 分) |
-| B2a policy 投影・移行 | S1 | `policy_projection.py` (`_render_directive` の移設、`insert_policy`、`regenerate_policy_file`、`inspect_policy_file`、`reconcile_policy_file`)、ID marker と §5.3.1 の列照合、旧形式の移行、`Policy.tail()` / `size_warning()` の marker 除去、`OpsService._regenerate_policy` の置換、`_recover_ops` の無条件 reconcile。endpoint は足さない | 判定 (投影の byte 形式に依存すれば update、部分一致だけなら keep。着手前に grep で確定): `tests/test_policy.py` の全 9 node、`tests/ops/test_ac48_50_crash_recovery.py::test_ac35_policy_crash_regenerates_one_line_from_records`、`tests/ops/test_ac35_52_idempotency.py::test_ac35_policy_file_is_regenerated_and_hand_written_lines_survive`、`tests/ops/test_ctl_operations.py::test_policy_add_writes_the_directive`、`tests/ops/test_service_api_wiring.py::{test_ac41_api_policy_through_build_app_and_listener_then_clean_stop,test_startup_rebuilds_the_policy_file_from_its_records}` | new: 同文 managed / handmade、不正 marker、偽造 marker、照合の 3 変異 (重複 block、本文改変、順序入替) と残りの stale 理由、ID 集合比較へ戻す変異、旧形式 fixture (重複数の違う DB / file) の byte 一致、移行の記録前 crash、DB 0 行での起動時 reconcile | AC-13、32、33 |
-| B2b policy API・audit | B1, B2a | `policy_show` (純粋読取と `projection`)、`policy_remove`、`policy_reconcile`、add / remove の action 先頭の reconcile、`_terminal` の state 引数、add / remove / reconcile の `PolicyProjectionUnknown` → `outcome_unknown`、`guidance.read`、client の parse と formatter、個数 pin 26 → 29 | update: routing test 2 node (29 本)、§5.1 の principal × scope pin 4 node (S1 で `guidance.read` を足した表へ `policy_reconcile` を加える) | new: show の before-after 不変、reconcile の changed / unchanged、commit 後・replace 前 crash、最後の 1 件の crash、別 key 再実行の収束、add / remove の `outcome_unknown`、remove の id parse 境界、principal 直積 | AC-4 (29 本)、14〜17、35、41、42 |
+| B2a policy 投影・移行 | S1 | `policy_projection.py` (`_render_directive` の移設、`insert_policy`、`regenerate_policy_file`、`inspect_policy_file`、`reconcile_policy_file`)、ID marker と §5.3.1 の列照合、CRLF、`unreadable` / `malformed` の安全な停止、旧形式の移行、`Policy.tail()` / `size_warning()` の marker 除去、`OpsService._regenerate_policy` の置換、失敗を記録して listener を開く `_recover_ops` の無条件 reconcile。endpoint は足さない | 判定 (投影の byte 形式に依存すれば update、部分一致だけなら keep。着手前に grep で確定): `tests/test_policy.py` の全 9 node、`tests/ops/test_ac48_50_crash_recovery.py::test_ac35_policy_crash_regenerates_one_line_from_records`、`tests/ops/test_ac35_52_idempotency.py::test_ac35_policy_file_is_regenerated_and_hand_written_lines_survive`、`tests/ops/test_ctl_operations.py::test_policy_add_writes_the_directive`、`tests/ops/test_service_api_wiring.py::{test_ac41_api_policy_through_build_app_and_listener_then_clean_stop,test_startup_rebuilds_the_policy_file_from_its_records}` | new: 同文 managed / handmade、不正 marker、偽造 marker、照合の 3 変異 (重複 block、本文改変、順序入替) と残りの stale 理由、ID 集合比較へ戻す変異、旧形式 fixture (重複数の違う DB / file) の byte 一致、CRLF / malformed / unreadable、移行の記録前 crash、DB 0 行での起動時 reconcile | AC-13、32、33 |
+| B2b policy API・audit | B1, B2a | `policy_show` (純粋読取と `projection`)、`policy_remove`、autopilot 中も使える `policy_reconcile`、add / remove の action 先頭の reconcile、`_terminal` の state 引数、endpoint のみが `MigrationRecordUnknown` / replace 後 inspect 例外を `PolicyProjectionUnknown` → `outcome_unknown` へ写す、`guidance.read`、client の parse と formatter、個数 pin 26 → 29 | update: routing test 2 node (29 本)、§5.1 の principal × scope pin 4 node (S1 で `guidance.read` を足した表へ `policy_reconcile` を加える) | new: show の before-after 不変、reconcile の changed / unchanged、commit 後・replace 前 crash、最後の 1 件の crash、別 key 再実行の収束、add / remove の先頭 reconcile は `failed`、unreadable inode / mode 不変、remove の id parse 境界、principal 直積 | AC-4 (29 本)、14〜17、35、41、42 |
 | B2c policy の wizard・shell 統合 | B2a | 段 12 の `insert_policy` → `reconcile_policy_file` と 2 種の失敗文、shell の `ops_service is None` fallback の managed 化、`append_policy_directive` の削除 | keep: `tests/commands/test_improve_commands.py::test_policy_add_appends_to_directives_file`。判定 (B2a と同じ基準): `tests/setup/test_wizard_finish.py::{test_policy_lines_and_first_ideas_are_written_one_at_a_time,test_existing_policy_size_and_backlog_count_are_shown_before_asking}`、`tests/setup/test_wizard_guards.py::{test_example_shortcut_adds_all_examples_to_policy_and_backlog,test_example_write_failure_stops_the_policy_prompt,test_policy_and_first_ideas_leave_the_same_activity_lines_as_the_shell}` | new: 段 12 の insert 前失敗 / commit 後の file 失敗、shell fallback の managed 形式 | AC-34 |
 | A1 local check / plugin / ops | S1 | argv shim (`improve` 先頭語、`ops` 旧形、`reconf`)、`ops <feature> <verb>` の parser と dispatch、`check backend` と親 option の併用拒否、`plugin list` と観測用 DB 接続、現行 `ops enable` の状態機械 | update: `tests/ops_setup/test_entry.py::{test_ops_enable_dispatches_feature_without_starting_daemon,test_ops_status_reports_saved_operation_stage_and_failure,test_ops_failure_prints_fixed_reason_and_exits_1,test_ops_failure_prints_detail_after_the_fixed_reason,test_ops_marker_rejection_prints_owner_and_recovery,test_ops_status_without_systemctl_reports_unknown_unit}` (argv を新形へ)、`tests/backtest/test_cli.py::{test_cli_improve_verify_backend_routes_to_verify_backend,test_cli_improve_verify_backend_routes_opencode_through_to_verify_backend,test_cli_verify_backend_prints_enable_guidance_for_opencode,test_cli_verify_backend_prints_detail_and_fingerprint_on_success,test_cli_improve_verify_backend_returns_1_when_verification_fails,test_cli_verify_backend_reports_ready_mismatch_as_rc1_not_traceback,test_cli_improve_verify_backend_requires_backend_argument}`、`tests/setup/test_wizard_llm.py::{test_opencode_needs_a_context_limit_and_is_never_marked_verified,test_the_improve_exchange_runs_as_a_child_command_after_the_commit}`、`tests/setup/test_wizard_guards.py::test_a_failed_improve_exchange_is_verify_failed_not_a_connection_error`。keep: `tests/ops_setup/test_stages.py::{test_enable_orders_marker_stop_confirm_lock_enroll_unlock_and_marker_removal,test_enable_with_afx_stopped_beforehand_does_not_start_it,test_enable_crash_at_each_point_resumes_and_clears_marker}` | new: shim 期限、非隔離 / 課金 stdout、sentinel spy、plugin view model 直積、sidecar 直積、稼働中 enable を rc=1 へする mutation killer、新旧 `ops` の dispatch 同一性、`reconf` | AC-3、6 (shim 分)、8、9、28、36〜38 |
 | A2 offline status | S1 | instance lock の probe と即時解放、`locked-by` と `next`、読取専用 state reader、観測用 DB 接続、source 独立 collector、renderer | keep: `tests/setup/test_pending_facts.py::{test_collection_limits_history_pairs_and_journal_ids,test_supplied_landlock_availability_is_used_without_probing,test_a_failing_landlock_probe_is_unknown_not_unavailable,test_env_key_presence_combines_dotenv_and_process_environment}` | new: default `service_active=True` / explicit False / None と AC-18〜24 / 29〜31 の lock、marker、鍵無し、source fault、tree zero-write 直積、lock 保持者との並行 | AC-18〜24、29〜31 |
@@ -950,7 +954,7 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 ## 12. 残余リスク
 
 - 対話 shell は API 認証を通らない。`ShellCaller.SHELL` の監査は残るが、利用者向けの「2 レーン」と実行境界が完全には一致しない。
-- policy 投影は DB commit と file replace を同一 transaction にできない。既存の accepted → 終端、`outcome_unknown`、起動時、add / remove の先頭、明示操作 `policy reconcile` の reconcile で収束させるが、replace 失敗や crash の直後から次の reconcile までは旧投影が Mission に注入され得る。`policy show` はこのずれを `stale` として示すだけで、直さない。
+- policy 投影は DB commit と file replace を同一 transaction にできない。既存の accepted → 終端、`outcome_unknown`、起動時、add / remove の先頭、明示操作 `policy reconcile` の reconcile で repairable な stale を収束させるが、replace 失敗や crash の直後から次の reconcile までは旧投影が Mission に注入され得る。`unreadable` / `malformed` は自動上書きせず手修正を要する。`policy show` はこのずれを `stale` として示すだけで、直さない。
 - offline status は複数 file / DB の同時 snapshot ではない。daemon 不在でも観測中に人間の別 CLI が変更すれば、節間で時刻がずれる。表示は診断用で、取引判断の正本にしない。
 - instance lock が不在 / unreadable の環境では `instance: unknown` になる。unknown 時は state 詳細を読まず、他 source も「観測時点」の診断としてのみ出す。
 - instance lock の probe は shared lock を 1 回取って直ちに解放するが、その瞬間に重なった `LOCK_EX|LOCK_NB` の取得 (daemon 起動、`afx keys`、`afx init` 等) は失敗し得る。窓は flock の system call 2 回の間に限られる。daemon は `Restart=on-failure` で再試行され (`setup/unit.py:47`)、他の操作は利用者が再実行する。
@@ -966,3 +970,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-23 | v0.2 | 設計レビュー 1 周目の 11 件、AC-1 / 3 / 4 / 6 / 8 / 9 / 12 / 13 / 15〜21 / 24〜30、依存順、test node 表を反映 | 設計レビュー 1 周目 sol、High 5 / Medium 6 全採用、§8.2-2 を技術決定で閉鎖 | |
 | 2026-10-23 | v0.3 | policy を既存 audit の accepted → 終端で表し新 phase を廃止、旧形式 `directives.md` の 1 回限りの移行、marker の行全体一致と注入時の除去、段 12 と shell fallback の managed 化、起動時と endpoint 先頭の無条件 reconcile、add / remove の `outcome_unknown`。offline status を instance lock の probe と即時解放、`instance: locked/free/unknown` と `locked-by`、`app_state.json.lock` の読取専用 reader、WAL sidecar の有無で `immutable=1` / `mode=ro` を選ぶ観測用 DB 接続に変更。metadata を ops package 外の `cli_surface.py` へ移設、個数 pin を B1 で 26・B2 で 28、B1 → B2 の直列化、version を 0.2.0 へ上げる task、L1〜L9 の細部。裁定 (7) の `afx ops <feature> <verb>` 階層、`reconf` 別名、旧形の期限つき互換別名、`afx ops` help golden、文書と製品文言の置換。AC-1 / 3 / 4 / 6〜10 / 13 / 15 / 16 / 18 / 19 / 21 / 29 / 30 を更新、AC-31〜40 を新設 | 設計レビュー 2 周目 opus、High 4 / Medium 9 / Low 9 全採用 + ユーザー裁定 (7) | |
 | 2026-10-24 | v0.4 | `improve` の `remove_in` を `0.3.0` に統一。投影の照合を ID 集合から `[(id, directive)]` の順序付き列 (出現数込み) と canonical 列の完全一致へ変更し、stale の固定理由 7 語を新設。旧形式の移行を集合一致の全行除去 + DB 行ごとの block 再構成に変更。`policy show` を純粋読取にして `projection` を返し、明示操作 `policy reconcile` (`POST /v1/policy/reconcile`、`operate`、`[変更]`) を新設、endpoint 29 本。bot / notify の `reconfigure` を `implemented=False, exposed=False` に固定し、`afx ops` の 4 golden を確定。help 文言を全て metadata accessor から渡し、literal 重複の AST 検査を追加。argv shim を `--daemon` 前置き後の head に適用。doc pin の正式名を 9 つにし、`backlog list` と `policy remove` の制約文を pin。`collect_pending_facts` の `settings` / `conn` の `None` 許容、AC-16(f) の逐語化、client の import pin の範囲の明記、B2 を B2a / B2b / B2c に分割、I1 の web-lan merge 依存。AC-4 / 6 / 13 / 16 / 17 / 23 / 26 / 32 / 35〜39 を更新、AC-41〜43 を新設 | 設計レビュー 3 周目 sol、High 4 / Medium 4 / Low 4 全採用と前版の未閉鎖 3 点 | |
+| 2026-10-24 | v0.5 | `unreadable` / `malformed` を自動上書きしない stale とし、CRLF 照合、手修正案内、起動時 reconcile の fail-open、投影例外の endpoint 境界、byte 基準の `changed`、DB 0 行・file 不在の記録のみ移行、reconcile の autopilot 許可を固定。help の完全形 `usage` / `shell_usage` 分離、整数 tuple の version 比較、色を消した golden を追加し、AC-6 / 13 / 16 / 32 / 35 / 39 / 42 / 43 を更新 | 4 周目の指摘 | |
