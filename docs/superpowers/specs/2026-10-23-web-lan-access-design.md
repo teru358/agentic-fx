@@ -594,7 +594,7 @@ afx が稼働中でない場合と ops-web が active の場合は設定検査�
 `restricted` は `0.0.0.0/0` 以外の allow がある状態、`unrestricted` は明示値 `0.0.0.0/0`、`loopback-default` は loopback bind かつ allow 省略を表す。
 この行に allow の個別 IP、password、secret の存在又は path を出さない。
 
-設定を安全に解釈できない場合は `web-access: unavailable reason=<固定 reason>` とし、bind、port、allow、auth、path を一切出さない。reason は、`ops.toml` が無い場合の `not_configured` と、§5.2 と同じ共有 reader が §2.3 の G 層と C1〜C7 表で返す最終 reason 1 個 (§2.4 の集合、`config_dir_invalid`、`config_invalid`、`allow_required`、`secret_invalid`、`secret_missing`、`secret_unexpected` などの config / secret 系) に限る。status は probe をしないので、§2.4 の bind / listen 系 (`bind_failed`、`interface_lookup_failed` など) と `startup_internal_error` を出さない。status が secret を見るのは reader と同じ存在と安全性の検査だけであり、password の値を読まず、表示もしない。
+設定を安全に解釈できない場合は `web-access: unavailable reason=<固定 reason>` とし、bind、port、allow、auth、path を一切出さない。reason は、`ops.toml` が無い場合の `not_configured` と、§5.2 と同じ共有 reader が §2.3 の G 層と C1〜C7 表で返す最終 reason 1 個 (§2.4 の集合、`config_dir_invalid`、`config_invalid`、`allow_required`、`secret_invalid`、`secret_missing`、`secret_unexpected` などの config / secret 系) に限る。status は §5.2 末尾の設定検査と同じく、非 loopback の局所性を §5.1 の `afx-ops interfaces` で判定する (`interface_lookup_failed`、`bind_not_local` を出し得る) が、port の bind と listen はしないので、§2.4 の `probe_bind_failed`、`listener_invalid`、`accept_*` と `startup_internal_error` を出さない。status が secret を見るのは reader と同じ存在と安全性の検査だけであり、password の値を読まず、表示もしない。
 
 | 状態 | status 行 |
 |---|---|
