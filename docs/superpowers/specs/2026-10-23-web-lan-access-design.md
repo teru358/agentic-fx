@@ -1,6 +1,6 @@
 # 同梱 web の公開範囲設計
 
-**版:** v0.3
+**版:** v0.4
 **対象:** チケット `web-lan-access-bind-allow-auth`
 **位置づけ:** afx-ops spec v1.6 の web 公開範囲を置き換える amendment spec である。
 
@@ -68,7 +68,7 @@ web feature 固有の `ops.toml` は既存の `port` に加えて、同じ top-l
 |---|---|---|
 | `port` | integer、既存 key | production では `1..65535` とする。`0` は引き続き拒否する。 |
 | `bind` | string、既定 `127.0.0.1` | 十進 dotted-quad の数値 IPv4 だけを許す。hostname、IPv6、IPv4-mapped IPv6、`0.0.0.0`、余分な空白、先頭ゼロを含む表記を拒否する。非 loopback は本機の up 状態の interface に実在する unicast address だけを許し、scope は `global` 又は `link` とする。 |
-| `allow` | string の list、loopback では省略可 | 各要素は canonical な数値 IPv4 又は canonical な IPv4 CIDR とする。単一 IPv4 は内部で `/32` として扱う。host bit を持つ CIDR、空文字、空 list、重複 network、IPv6、IPv4-mapped IPv6、余分な空白を拒否する。非 loopback では key 自体を必須にする。無制限は唯一 `0.0.0.0/0` の明示値で表す。 |
+| `allow` | string の list、loopback では省略可 | 各要素は canonical な数値 IPv4 又は canonical な IPv4 CIDR とする。単一 IPv4 は内部で `/32` として扱う。host bit を持つ CIDR、空文字、空 list、重複 network、IPv6、IPv4-mapped IPv6、余分な空白を拒否する。`0.0.0.0/0` は singleton list `allow = ["0.0.0.0/0"]` の場合だけ受理し、他の network と混在する list は `config_invalid` で拒否する。非 loopback では key 自体を必須にする。無制限はこの singleton の明示値だけで表す。 |
 | `auth` | string、既定 `none` | `none` 又は `basic` だけを許す。大文字小文字の別表記は許さない。 |
 
 `bind` と CIDR は `ipaddress.IPv4Address` / `IPv4Network(..., strict=True)` と再文字列化した結果が入力と一致する形を canonical とする。
@@ -105,30 +105,33 @@ space、tab、改行、他の C0 / DEL、非 ASCII、16 byte 未満、128 byte �
 
 ### 2.3 組み合わせの妥当性
 
-この表は §2.4 の決定木そのものであり、上から順に評価して最初に一致した 1 行だけを最終結果とする。
-軸は `artifact ∈ {T1,T2}`、`bind ∈ {loopback,非 loopback}`、`allow ∈ {省略,空,限定,unrestricted}`、`auth ∈ {none,basic}`、`secret ∈ {無し,安全,不安全}` である。
+この表は §2.4 の決定木そのものであり、上から順に評価して最初に一致した 1 行だけを最終結果とする。表外の override は設けない。
+軸は `artifact ∈ {T1,T2}`、`bind ∈ {loopback,nonloop-local,nonloop-absent,lookup-failed}`、`allow ∈ {省略,空,限定,unrestricted,mixed-unrestricted}`、`auth ∈ {none,basic}`、`secret ∈ {無し,安全,不安全}` である。
+`nonloop-local` は列挙に成功して bind が存在する状態、`nonloop-absent` は列挙に成功して bind が存在しない状態、`lookup-failed` は §5.1 の列挙規則で局所性を決定できない状態を表す。
+`unrestricted` は `0.0.0.0/0` だけの singleton、`mixed-unrestricted` は `0.0.0.0/0` と他 network が混在する grammar 違反を表す。
 `secret = 無し` は secret dir 不在又は安全な空 dir、`安全` は安全な dir に grammar を満たす `web.password` が 1 個だけある状態、`不安全` は dir 自体、password 又は未知 entry のいずれかが安全性検査に違反する状態を表す。
-`任意` と集合表記を含む行はその軸の全値を被覆する。先行行を除外して読むため行同士は重ならず、上記 2 × 2 × 4 × 2 × 3 の全直積は必ずただ 1 個の結果へ到達する。
-非 loopback の interface 列挙失敗 / address 不在は、この表の capability 判定後、secret 判定前に §2.4 の `interface_lookup_failed` / `bind_not_local` へ分岐する。
+`任意` と集合表記を含む行はその軸の全値を被覆する。先行行を除外して読むため行同士は重ならず、上記 2 × 4 × 5 × 2 × 3 の全直積は必ずただ 1 個の最終結果へ到達する。
 
 | 段 | artifact | bind | allow | auth | secret | 最終結果 |
 |---:|---|---|---|---|---|---|
-| 1 | 任意 | 任意 | 空 | 任意 | 任意 | `config_invalid` |
-| 2 | 任意 | 非 loopback | 省略 | 任意 | 任意 | `allow_required` |
+| 1 | 任意 | 任意 | 空又は mixed-unrestricted | 任意 | 任意 | `config_invalid` |
+| 2 | 任意 | nonloop-local / nonloop-absent / lookup-failed | 省略 | 任意 | 任意 | `allow_required` |
 | 3 | T1 | 任意 | unrestricted | 任意 | 任意 | `unrestricted_not_supported` |
 | 4 | T1 | 任意 | 省略又は限定 | `basic` | 任意 | `auth_not_supported` |
-| 5 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 不安全 | `secret_invalid` |
-| 5 | T1 / T2 | 非 loopback | 限定、T2 では unrestricted も含む | `none` | 不安全 | `secret_invalid` |
-| 5 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 不安全 | `secret_invalid` |
-| 5 | T2 | 非 loopback | 限定又は unrestricted | `basic` | 不安全 | `secret_invalid` |
-| 6 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 無し | `secret_missing` |
-| 6 | T2 | 非 loopback | 限定又は unrestricted | `basic` | 無し | `secret_missing` |
-| 6 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 安全 | `secret_unexpected` |
-| 6 | T1 / T2 | 非 loopback | 限定、T2 では unrestricted も含む | `none` | 安全 | `secret_unexpected` |
-| 7 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 無し | 許可 |
-| 7 | T1 / T2 | 非 loopback | 限定、T2 では unrestricted も含む | `none` | 無し | 許可 |
-| 7 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 安全 | 許可 |
-| 7 | T2 | 非 loopback | 限定又は unrestricted | `basic` | 安全 | 許可 |
+| 5 | 任意 | lookup-failed | 限定又は unrestricted | 任意 | 任意 | `interface_lookup_failed` |
+| 6 | 任意 | nonloop-absent | 限定又は unrestricted | 任意 | 任意 | `bind_not_local` |
+| 7 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 不安全 | `secret_invalid` |
+| 7 | T1 / T2 | nonloop-local | 限定、T2 では unrestricted も含む | `none` | 不安全 | `secret_invalid` |
+| 7 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 不安全 | `secret_invalid` |
+| 7 | T2 | nonloop-local | 限定又は unrestricted | `basic` | 不安全 | `secret_invalid` |
+| 8 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 無し | `secret_missing` |
+| 8 | T2 | nonloop-local | 限定又は unrestricted | `basic` | 無し | `secret_missing` |
+| 8 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 安全 | `secret_unexpected` |
+| 8 | T1 / T2 | nonloop-local | 限定、T2 では unrestricted も含む | `none` | 安全 | `secret_unexpected` |
+| 9 | T1 / T2 | loopback | 省略又は限定、T2 では unrestricted も含む | `none` | 無し | 許可 |
+| 9 | T1 / T2 | nonloop-local | 限定、T2 では unrestricted も含む | `none` | 無し | 許可 |
+| 9 | T2 | loopback | 省略、限定又は unrestricted | `basic` | 安全 | 許可 |
+| 9 | T2 | nonloop-local | 限定又は unrestricted | `basic` | 安全 | 許可 |
 
 AC-12 の期待値 fixture は、手書きで reason を重ねず、この表の軸と先行一致規則から機械生成する。
 
@@ -145,11 +148,11 @@ auth は allow の代わりではない。
 
 | reason | rc | 条件 |
 |---|---:|---|
-| `config_invalid` | 71 | TOML、型、未知 key、`port`、`bind`、`allow`、`auth` の grammar が不正である。 |
+| `config_invalid` | 71 | TOML、型、未知 key、`port`、`bind`、`allow`、`auth` の grammar が不正である。`0.0.0.0/0` と他 network の混在を含む。 |
 | `allow_required` | 71 | 非 loopback で `allow` key が無い。 |
 | `unrestricted_not_supported` | 71 | T1 単独版で `allow = ["0.0.0.0/0"]` を使おうとした。 |
 | `auth_not_supported` | 71 | T1 単独版で `auth = "basic"` を使おうとした。 |
-| `interface_lookup_failed` | 71 | §5.1 の stdlib interface 列挙で `if_nameindex()` 又はいずれかの ioctl に失敗し、bind の局所性を判定できない。 |
+| `interface_lookup_failed` | 71 | §5.1 の stdlib interface 列挙で `if_nameindex()`、flags 取得、address 取得の想定外 errno、又は address 取得済み interface の netmask 取得 / 検査に失敗し、bind の局所性を判定できない。IPv4 未設定を表す固定 errno は失敗に含めない。 |
 | `bind_not_local` | 71 | 数値 IPv4 としては正しい非 loopback bind が、本機の up 状態の interface の global / link unicast IPv4 に存在しない。 |
 | `secret_invalid` | 71 | 存在する secret dir 又は `web.password` の owner、mode、型、symlink、size、byte grammar、open / read 検査に失敗したか、許可外の secret 名が存在する。 |
 | `secret_missing` | 71 | `auth = "basic"` だが安全な `web.password` が無い。secret dir 不在も含む。 |
@@ -263,20 +266,19 @@ process 全体の上限は 100 回である。
 最古の失敗から 60.000 秒以上経過した時点で、その失敗を窓から除く。
 成功しても窓内の失敗履歴を消さない。
 
-各試行では送信元表を lookup する前に、global queue、全実 IPv4 entry、overflow bucket の期限切れ時刻を prune し、空になった実 IPv4 entry を回収する。
-通常の送信元 queue と overflow queue の保持長はそれぞれ最大 5、global queue は最大 100 とする。
+各試行では送信元表を lookup する前に、global queue と全実 IPv4 entry の期限切れ時刻を prune し、空になった実 IPv4 entry を回収する。
+各送信元 queue の保持長は最大 5、global queue は最大 100 とする。
 429 にした試行はどの queue にも加えない。
-global queue が既に上限なら送信元 entry の lookup / allocation より先に 429 とし、新しい entry を作らない。この分岐では既存 entry 又は overflow bucket も評価しない。
+global queue が既に上限なら送信元 entry の lookup / allocation より先に 429 とし、新しい entry を作らない。この分岐では既存 entry も評価しない。
 
 429 は整数秒の `Retry-After` を持つ。
 global 先行 429 の値は global queue の最古の失敗が期限切れになるまでの秒数だけから計算する。
-global が満杯でない場合の送信元 429 は、その送信元 entry 又は overflow bucket の最古の失敗が期限切れになるまでの秒数だけから計算する。
+global が満杯でない場合の送信元 429 は、その送信元 entry の最古の失敗が期限切れになるまでの秒数だけから計算する。
 いずれも切り上げた整数で、最小 1、最大 60 とする。同じ送信元の窓も同時に超過していても、global 先行分岐では送信元側との最大値を取らない。
 
-送信元表は実 IPv4 ごとに最大 1024 entry とする。
-表が満杯の間に現れた未登録の送信元は、全て 1 個の overflow bucket を共有する。
-overflow bucket は rate limit 上「1 送信元相当」であり、そこへ写像された全 IPv4 が同じ 5 件の queue と Retry-After を共有する。
-各 entry と overflow bucket は 60 秒窓の失敗時刻だけを持つ。
+送信元表は実 IPv4 ごとに最大 100 entry とし、overflow bucket は設けない。
+各 entry は 60 秒窓の失敗時刻だけを持つ。
+entry を作るのは認証比較後に失敗を global queue へ追加する経路だけであるため、非空 entry 数は global queue の失敗数以下となり、100 を超えない。global が満杯なら前段で返すため、101 個目の entry を作らない。
 失敗時刻が全て期限切れになった実 IPv4 entry は削除できる。
 表の entry 数、各送信元の保持数、全体の保持数は固定上限を超えない。
 
@@ -292,13 +294,28 @@ web principal は引き続き読み取り専用である。
 method 不許可の 405 は POST 等の GET / HEAD 以外で観測する。HEAD 自体は許可 method なので 405 へは到達しない。
 protocol、request adapter、route dispatch 又は renderer 自身の想定外例外は 500 とする。
 daemon client の transport 例外 / timeout、daemon の非 200 reply、code 付き reply、又は期待 schema でない backend reply は 502 とする。
-この境界より前に確定した 400 / 401 / 404 / 429 は内部例外へ読み替えない。
-HEAD で到達し得る error status は 400 / 401 / 404 / 429 / 500 / 502 とし、いずれも同条件の GET と同じ Content-Length、body 0 とする。
+この境界より前に確定した 400 / 401 / 404 / 413 / 429 は内部例外へ読み替えない。
+HEAD で到達し得る error status は 400 / 401 / 404 / 413 / 429 / 500 / 502 とし、いずれも同条件の GET と同じ Content-Length、body 0 とする。
 
-process 内 counter は `web_peer_rejected_total`、`web_peer_lookup_failed_total`、`web_auth_failed_total`、`web_auth_limited_total` の 4 個に固定する。
-journal へ出す文は `afx-ops: web_peer_rejected`、`afx-ops: web_peer_lookup_failed`、`afx-ops: web_auth_failed`、`afx-ops: web_auth_limited` の 4 種だけとする。
-journal は期間ごとの集約又は固定上限の bounded sampling とし、allow 外 flood、lookup failure、認証失敗の件数に比例して無制限に書かない。
-journal 文には IP、port、Host、Authorization、username、password、secret、回数、例外文を足さない。
+peer / auth の security event counter と journal は次の 4 種だけに固定する。
+
+| counter | journal 文 |
+|---|---|
+| `web_peer_rejected_total` | `afx-ops: web_peer_rejected` |
+| `web_peer_lookup_failed_total` | `afx-ops: web_peer_lookup_failed` |
+| `web_auth_failed_total` | `afx-ops: web_auth_failed` |
+| `web_auth_limited_total` | `afx-ops: web_auth_limited` |
+
+この 4 種の journal は各種につき process lifetime の先頭 10 件だけを出し、11 件目以後は counter だけを増やす。
+accept loop の運用 event は security event と別に、次の集合へ固定する。
+
+| counter | 増分 | journal 文と sampling |
+|---|---|---|
+| `accept_resource_error_total` | `EMFILE` / `ENFILE` ごとに 1 | `afx-ops: accept_backoff`。連続 episode の先頭だけ、かつ process lifetime で最大 10 行。errno は付けない。 |
+| `accept_callback_failed_total` | runtime callback の例外ごとに 1 | `afx-ops: accept_callback_failed`。process lifetime の先頭 10 件だけ。例外型・例外文は付けない。 |
+| `accept_exhausted_total` | 連続 200 回到達時に 1 | `afx-ops: accept_exhausted` を sampling 枠と独立にちょうど 1 行出して rc 72 で終了する。 |
+
+全 journal 文に IP、port、Host、Authorization、username、password、secret、回数、errno、例外型、例外文を足さない。
 aiohttp の access log は引き続き無効にする (`afx-ops/afx_ops/web/runtime.py:54`)。
 
 ## 4. 隔離との関係
@@ -335,14 +352,24 @@ stdout は成功時も失敗時も空とする。
 stderr は失敗時に `afx-ops: <固定 reason>` の 1 行だけとする。
 secret、設定値、IP、CIDR、path、例外文を出さない。
 
-interface 列挙は Linux 前提の stdlib だけの 1 実装を、対話ウィザードの候補、probe、production 起動時の局所性検査で共用する。
-`socket.if_nameindex()` の各 interface について一時的な `AF_INET/SOCK_DGRAM|SOCK_CLOEXEC` socket から `fcntl.ioctl()` の `SIOCGIFFLAGS`、`SIOCGIFADDR`、`SIOCGIFNETMASK` を呼び、`IFF_UP` の IPv4 address と netmask を得る。
+interface 列挙は Linux 前提の stdlib だけの 1 実装を `afx-ops/afx_ops/interfaces.py` に置き、probe、production 起動時の局所性検査、`afx-ops interfaces` が共用する。本体ウィザードは package を直接 import せず、後述の bounded subprocess 契約だけを通じて同じ結果を使う。
+`socket.if_nameindex()` の各 interface について一時的な `AF_INET/SOCK_DGRAM|SOCK_CLOEXEC` socket から最初に `fcntl.ioctl(SIOCGIFFLAGS)` を呼ぶ。flags 取得失敗は列挙失敗、`IFF_UP` でない interface は address を問い合わせず skip とする。
+up interface には `SIOCGIFADDR` を行う。IPv4 未設定だけを表す errno は `EADDRNOTAVAIL` と `EAFNOSUPPORT` に固定して skip し、それ以外の errno (`ENODEV` を含む) は列挙失敗とする。実装と試験はこの集合を同じ定数から使い、集合を暗黙に広げない。
+address を取得できた interface だけに `SIOCGIFNETMASK` を行う。その失敗、想定外 errno、又は netmask 検査失敗は列挙失敗とする。
 各 ioctl buffer と interface 名の長さを固定し、列挙 socket は結果を固定した直後に閉じ、隔離へ持ち込まない。
-`if_nameindex()` 又はいずれかの必要 ioctl が失敗した場合は、部分結果を使わず固定 reason `interface_lookup_failed` で停止する。外部 command、netlink の別実装、手入力 fallback は使わない。
+`if_nameindex()` 又は上記で列挙失敗とした操作が失敗した場合は、部分結果を使わず固定 reason `interface_lookup_failed` で停止する。外部 command、netlink の別実装、手入力 fallback は使わない。
 
 scope は kernel の文字列に依存せず address 範囲から判定する。`169.254.0.0/16` は `link`、`127.0.0.0/8` は `loopback`、それ以外の unicast IPv4 は `global` とし、multicast、unspecified、broadcast は候補にしない。
 netmask は連続した canonical mask であることを検査し、不正なら列挙失敗とする。
 候補は `(scope の順 global, link, ifindex, address)` で安定 sort し、重複 address は最小 ifindex の 1 件に正規化する。
+
+`afx-ops interfaces` は本体と afx-ops の独立 package 境界を保つ列挙専用 command とする。絶対 path の executable を使い、argv はちょうど `(<resolved-afx-ops>, "interfaces")`、stdin は閉じ、secret を argv、env、stdin に渡さず、config / state / secret dir を読まず書かない。5 秒で timeout し、stdout は 65536 byte を上限として超過時点で打ち切る。成功契約は rc 0、stderr 空、stdout が UTF-8 の改行 1 個で終わる次の versioned JSON object 1 個である。
+
+```json
+{"interfaces":[{"address":"192.168.1.10","ifindex":2,"scope":"global"}],"version":1}
+```
+
+top-level key は `interfaces` と `version` だけ、entry key は `address`、`ifindex`、`scope` だけとする。`version` は整数 1、`ifindex` は 1 以上の整数、`address` は canonical な非 loopback unicast IPv4、`scope` は `global` 又は `link` とし、entry は前記の安定 sort 済みで address 重複を許さない。列挙失敗時は rc 71、stdout 空、stderr `afx-ops: interface_lookup_failed\n` だけとする。本体は nonzero rc、signal、timeout、stdout 上限超過、stderr 契約違反、UTF-8 / JSON / schema / sort 違反を全て固定 reason `interface_lookup_failed` に写像し、子 process の出力や例外文を追加しない。この subprocess は probe と同じ有界呼出し helper を使う。
 
 probe は §2.4 の決定木と同じ順序で次を検査する。
 
@@ -367,8 +394,9 @@ probe は password の正否をネットワーク経由で試さない。
 非対話の `--reconfigure` は完全な目標 `ops.toml` を指す `--target-config <path>` を必須とし、現在値から目標を推測しない。目標が basic で安全な既存 password を保持しない場合は、別の明示 password input file も必須とする。いずれかが無ければ何も書かず rc 2 `setup_input_required` とする。
 
 既存 stage schema の operation に `reconfigure` を追加する。
-有限な stage 列は `prepared → secret-staged → stopped → secret-committed → config-committed → probed → started → ready` とし、`ready` の事後処理だけが stage を既存の `operation = enable, stage = enabled` へ置き換える。
-reconfigure stage は `current_config_digest`、`target_config_digest`、`secret_action = keep|install|remove|absent`、`material_committed` boolean と、secret を含まない固定 field だけを持つ。`material_committed` は最初の live secret rename / unlink + directory fsync、又は secret が no-op なら live config rename + directory fsync の完了後にだけ true にする。
+有限な stage 列は `prepared → secret-staged → stopped → secret-committed → config-committed → probed → started → ready` とする。active 経路は `ready` の事後処理、inactive 経路は `probed` の事後処理だけが stage を既存の `operation = enable, stage = enabled` へ置き換える。
+reconfigure 開始時に terminal `enable/enabled` record の全 field を基底 snapshot `enable_record` object として reconfigure stage file へ durable 保存し、最初の外部変更より前に afx と ops-web の `ActiveState` をそれぞれ reconfigure 固有の `reconfigure_afx_before_stop`、`reconfigure_ops_before_stop` に一度だけ記録する。`enable_record` は現行 terminal schema で再検証し、再開時に上書きせず、内部の既存 `afx_before_stop` と reconfigure 固有 field を混同しない。
+reconfigure stage は `current_config_digest`、`target_config_digest`、`secret_action = keep|install|remove|absent`、`material_committed` boolean、`reconfigure_afx_before_stop`、`reconfigure_ops_before_stop`、`enable_record` と、secret を含まない固定 field だけを持つ。`material_committed` は最初の live secret rename / unlink + directory fsync、又は secret が no-op なら live config rename + directory fsync の完了後にだけ true にする。
 crash が live 変更と stage 更新の間に入った場合は、`secret_action`、secret staging / live file の有無、live config digest を照合して commit 済みを先に検出し、`material_committed = true` を durable にしてから再開する。実物が commit 済みなら古い false を根拠に rollback しない。
 目標 `ops.toml` 全文は secret を含まない mode `0600` の durable staging file に書き、file fsync、atomic rename、親 directory fsync を済ませてから `prepared` を記録する。各再開時に staging file の SHA-256 が `target_config_digest` と一致することを検査する。
 live `ops.toml` の更新時は staging file 自体を消費せず、そこから同一 directory の一時 file を作って fsync、atomic rename、directory fsync する。これにより config rename 後に crash しても目標全文を digest からではなく staging file から再利用できる。
@@ -385,11 +413,15 @@ live `ops.toml` の更新時は staging file 自体を消費せず、そこか�
 | `stopped` | inactive / failed | 旧 | 目標、digest 一致 | 旧状態 | 最初の live material 変更を行う。`remove` は unlink + dir fsync、`install` は secret staging の atomic rename + dir fsync、`keep/absent` は現状態を検査し、`secret-committed` にする。 |
 | `secret-committed` | inactive / failed | 旧、又は crash が rename 後なら目標 | 目標、digest 一致 | 目標 auth に必要な状態 | live config が旧なら staging 全文を atomic 保存する。既に目標 digest なら再保存せず、directory fsync を確認して `config-committed` にする。 |
 | `config-committed` | inactive / failed | 目標 | 目標、digest 一致 | 目標 auth に必要な状態 | 共通 validator と probe を実行する。失敗はこの stage と停止状態を保ち、次回同じ reconfigure が forward recovery する。 |
-| `probed` | inactive / failed | 目標 | 目標、digest 一致 | 目標 auth に必要な状態 | `ops-web` を起動する。 |
+| `probed` | inactive / failed | 目標 | 目標、digest 一致 | 目標 auth に必要な状態 | `reconfigure_afx_before_stop` が active / activating / reloading なら `ops-web` を起動して `started` へ進む。afx がそれ以外なら ops-web を起動せず terminal record を finalize する。 |
 | `started` | active / activating | 目標 | 目標、digest 一致 | 目標 auth に必要な状態 | server 認証と `READY=1` を確認する。失敗時は unit を停止して `probed` に戻し、forward recovery する。 |
-| `ready` | active | 目標 | 目標、digest 一致又は cleanup 済み | 目標 auth に必要な状態 | staging file を unlink + directory fsync し、stage を `enable/enabled` へ atomic 保存する。cleanup 後の crash は live config digest と ready unit を照合して finalize する。 |
+| `ready` | active | 目標 | 目標、digest 一致又は cleanup 済み | 目標 auth に必要な状態 | staging file を unlink + directory fsync し、stage を `enable/enabled` へ atomic 保存する。cleanup 後の crash は live config digest と ready unit を照合して finalize する。active 経路だけがこの stage を通る。 |
 
-stage 名にかかわらず `material_committed = false` で live secret / live config の最初の material 変更より前に失敗した場合は rollback を必須とする。staging file と secret staging を unlink + 各 directory fsync し、変更前に active だった unit を旧設定で再起動して ready を確認し、最後に stage を `enable/enabled` へ戻す。rollback 自体に失敗した場合は reconfigure stage と固定 failure を残して unit を停止し、enabled と表示しない。
+afx が開始時に inactive / failed なら、`probed` の事後条件を確認した後も afx と ops-web を起動しない。staging file を unlink + directory fsync して直接 `enable/enabled` を atomic 保存し、terminal record は `ops_active = false` のまま status の `ops=starts_with_afx` と既存 `Wants=` を維持する。次回 afx 起動時に既存の `Wants=` で ops-web が起動する。
+afx が開始時に active / activating / reloading だった場合だけ `probed → started → ready` で ops-web を start し、server 認証と `READY=1` を要求して `ops_active = true` で finalize する。
+どちらの finalize も基底の terminal record から `principal`、`registered`、`artifacts`、`wants`、`afx_before_stop`、`committed` と未知でない既存 schema field を保持し、reconfigure 固有 field と failure だけを除去する。`principal`、`artifacts`、`wants` を空値で再生成してはならない。
+
+stage 名にかかわらず `material_committed = false` で live secret / live config の最初の material 変更より前に失敗した場合は rollback を必須とする。staging file と secret staging を unlink + 各 directory fsync し、`reconfigure_ops_before_stop` が active / activating / reloading で、かつ `reconfigure_afx_before_stop` も active / activating / reloading の場合だけ旧設定で ops-web を再起動して ready を確認する。開始時に afx が inactive なら afx / ops を起動せず、`ops_active=false` / `ops=starts_with_afx` の terminal record へ戻す。rollback 自体に失敗した場合は reconfigure stage と固定 failure を残して unit を停止し、enabled と表示しない。
 最初の live secret rename / unlink 又は live config rename のいずれかを directory fsync した後は rollback せず、上表の目標へだけ forward recovery する。
 
 `basic → none` と `none + 安全な残骸 → none` は password unlink、secret directory fsync、目標 config 保存の順とする。unlink 後、config 保存前の crash は旧 config に対して `secret_missing` 又は `secret_unexpected` になり得るが、production は停止したまま stage と staging fileから none へ再開する。
@@ -406,12 +438,13 @@ stage 名にかかわらず `material_committed = false` で live secret / live 
 4. LAN なら誰が見られるかを尋ねる。
 5. 必要なら allow の IPv4 / CIDR を入力させる。
 6. 必要なら password を生成するか利用者が決めるかを尋ねる。
-7. 設定と secret を atomic に保存して probe を実行する。
+7. 目標が `auth = "none"` で安全な既存 `web.password` がある場合は、`secret_action=remove` を提示し、利用者が `none` を明示的に再選択した場合だけ削除する。
+8. 設定と secret を atomic に保存して probe を実行する。
 
-LAN の候補列挙は §5.1 の stdlib 共通実装だけを使い、global と link の非 loopback unicast IPv4 を候補にする。
+LAN の候補列挙は §5.1 の `afx-ops interfaces` bounded subprocess だけを使い、その afx-ops 内部の stdlib 共通実装が返す global と link の非 loopback unicast IPv4 を候補にする。本体から `afx_ops.interfaces` を import しない。
 候補は `(scope の順 global, link, ifindex, address)` で安定 sort する。
 1 候補ならそれを既定値にし、複数候補なら利用者の明示選択を必須にする。
-候補が無ければ `bind_not_local`、`if_nameindex()` 又は ioctl が失敗したら `interface_lookup_failed` で停止する。対話 / 非対話とも手入力 fallback は設けない。
+候補が無ければ `bind_not_local`、列挙 command が固定失敗を返すか bounded subprocess 契約に違反したら `interface_lookup_failed` で停止する。対話 / 非対話とも手入力 fallback は設けない。
 非対話の初回 enable では、既存設定が grammar と組み合わせを満たして完全なら候補 UI を実行せず、probe 内で同じ列挙実装を使う。不足なら file を一切書かず rc 2 `setup_input_required` とする。
 
 「誰が見られるか」の選択肢は次の 4 個に固定する。
@@ -438,11 +471,12 @@ LAN の候補列挙は §5.1 の stdlib 共通実装だけを使い、global と
 
 初回 enable は、既存設定が grammar と組み合わせの検査を満たし、probe が成功するなら再質問しない。`--reconfigure` はこの無再質問規則の例外である。
 既存 secret の内容を表示しない。
+初回 enable で `auth = "none"` と安全な残骸 `web.password` が組み合わさる場合、自動削除も自動 basic 化もしない。対話では auth の選択へ戻し、利用者が `none` を再選択して `secret_action=remove` を明示した場合だけ `web.password` を unlink して secret directory を fsync する。EOF、取消し、又は明示選択なしでは何も削除しない。非対話では明示 `secret_action=remove` 入力が無ければ何も変更せず `setup_input_required` とする。
 初回 enable では probe が失敗した場合だけ、回復可能な固定 reason に対応する必要項目を再質問する。reconfigure は live material 変更前に目標候補を同じ validator で検査して修正させ、`prepared` 後は目標を変更しない。
 `config_invalid` / `allow_required` は該当設定、`bind_not_local` / `probe_bind_failed` は列挙済み候補からの bind 再選択、`secret_missing` / `secret_invalid` / `secret_unexpected` は auth と secret だけを対象にし、無関係な値を再質問しない。
 `interface_lookup_failed` は同じ列挙実装を再試行又は手入力で迂回せず、その試行を直ちに終了する。
 初回 enable の probe と、reconfigure の material 変更前の目標検査は初回を含め最大 3 回とする。
-3 回目も失敗した場合は最後の固定 reason を返し、初回 enable は `staged` とする。reconfigure の `config-committed` 以後に probe が失敗した場合は同じ目標のまま該当 `operation = reconfigure` stage と停止状態を保持し、次回は forward recovery だけを行う。
+3 回目も失敗した場合は最後の固定 reason を返す。初回 enable は設定と利用者が明示した secret 操作を durable 保存済みだが、probe は stage を作らないため enable stage は未作成のままとする。reconfigure の `config-committed` 以後に probe が失敗した場合は同じ目標のまま該当 `operation = reconfigure` stage と停止状態を保持し、次回は forward recovery だけを行う。
 
 allow 入力の空回答は再質問し、unrestricted 又は取消しと解釈しない。
 全質問で EOF 又は明示取消しを受けた場合は以後書き込まず rc 1 `setup_aborted` とする。
@@ -465,6 +499,7 @@ allow 入力の空回答は再質問し、unrestricted 又は取消しと解釈�
 `stopped`、`secret-committed`、`config-committed`、`probed` の unit は `inactive` 又は `failed` でなければ stage mismatch として停止する。
 probe / restart 失敗時も reconfigure stage と固定 failure を表示し、公開範囲 1 行は live config ではなく digest 検証済みの目標 staging config から表示する。
 通常の `operation = enable, stage = enabled` だけを enabled と表示する。停止中は `unit=inactive` 又は `unit=failed` をそのまま表示し、旧設定が enabled であるかのように見せない。
+reconfigure を inactive 経路で完了した terminal record は既存形式どおり `enable enabled unit=inactive result=success afx_before_enable=<保存値> ops=starts_with_afx` と表示する。
 
 ## 6. 旧 spec の置換
 
@@ -473,14 +508,16 @@ probe / restart 失敗時も reconfigure stage と固定 failure を表示し、
 
 | 旧 spec の箇所 | 置換内容 | 本 spec |
 |---|---|---|
+| 行 13、51、224、独立 package / subprocess | **維持する。**本体と afx-ops は互いの package を import せず、絶対 path の `afx-ops probe ...` と `afx-ops interfaces` という bounded subprocess 契約だけで結合する。 | §5.1 |
 | 行 17、要点 | 「web は loopback の read-only 表示」を、設定済み bind / allow / auth の read-only 表示へ置き換える。web が承認権限を持たない点は維持する。 | §0、§3 |
 | 行 33、§1.2 境界 | `ops-web` が扱う「UI 認証 secret」を、`auth = "basic"` のときだけ必須な `web.password` として具体化する。 | §2.2、§4 |
 | 行 36、§1.2 主体 | 「localhost の利用者」を「設定した待受アドレスへ到達し、allow / Host / auth を通った利用者」に置き換える。 | §1、§3 |
 | §3.1.1 `ops.toml` | web の `port` に `bind`、`allow`、`auth` を追加する。 | §2 |
 | §3.3 web | loopback 固定・認証なしを、検証済み bind、allow、Host、任意 Basic 認証へ置き換える。 | §1〜§4 |
+| 旧 §5.1 行 132、web secret | 「web は secret を持たない」を、「web は auth に応じて `web.password` を隔離前だけ読む。secret dir は Landlock 規則へ加えない」に置き換える。 | §2.2、§4 |
 | §5 自己隔離 | loopback pre-bind を設定 address の pre-bind に置き換える。隔離後の新規 INET socket 拒否は維持する。 | §4 |
 | §6.1 enable | staged の web 設定・secret・probe 検査、status の公開範囲表示、`operation = reconfigure` と有限 stage 列を追加する。既存の `enable / disable` stage と enabled 実物照合は維持し、明示 reconfigure だけは enabled no-op を迂回する。 | §5 |
-| §7 初回ウィザード | web の最小質問と loopback probe を、4 段の公開範囲質問と新 probe へ置き換える。 | §5 |
+| §7 初回ウィザード | web の最小質問と loopback probe を、公開範囲質問、`secret_action=remove` の明示導線、`afx-ops interfaces`、新 probe へ置き換える。 | §5 |
 | §8 O-11 | 「認証済み loopback read-only」を「設定済み公開範囲の allow / Host / auth を通った read-only」に置き換える。 | §3、§7 |
 | 行 226、§7 probe rc | web の config / interface / secret reason を rc 71 に、実 bind failure を rc 73 に追加し、固定 reason の優先順位を本 spec の決定木へ置き換える。 | §2.4、§5.1 |
 | §9 AC-10 | `127.0.0.1` 固定・認証なしの観測を、本 spec の AC-1〜AC-40 へ置き換える。 | §9 |
@@ -527,7 +564,7 @@ IP、Host、Authorization、decoded credential、secret bytes を例外へ連結
 | 2 | password は 16〜128 byte の visible ASCII とし `:` を許す。空白、改行、非 ASCII は拒否する。生成値は random 16 byte の padding なし base64url とし、decoded credential は 132 byte 上限、正解 `b"afx:" + password` 全体との固定長 hash 比較にする。 | 最低 128 bit の生成 entropy、明確な file grammar、有界 parse、可変長比較の回避を同時に満たす。 |
 | 3 | 待受候補は up interface に実在する unicast IPv4 の scope `global` / `link` を許す。scope は address 範囲で決め、列挙できない場合の手入力 fallback は設けない。 | probe / production と同じ候補集合に限定し、選べたのに起動不能となる導線を作らない。 |
 | 4 | Authorization は `Basic` + 1 SP + RFC 4648 標準 Base64 の canonical token だけを許し、tab、2 SP、外側 OWS、余分 padding、非 canonical pad bit を拒否する。 | 認証 header の受理範囲を parser の寛容さや実装差から独立させる。 |
-| 5 | interface 列挙は Linux の `socket.if_nameindex()` と `fcntl.ioctl()` (`SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK`) による stdlib の 1 実装を候補、probe、production で共用する。 | 外部 command 依存と異なる列挙結果を排除し、局所性判定を 1 つの権威的実装にする。 |
+| 5 | interface 列挙は Linux の `socket.if_nameindex()` と `fcntl.ioctl()` (`SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK`) による afx-ops 内の 1 実装を使う。probe / production は package 内で共用し、本体 wizard は `afx-ops interfaces` bounded subprocess だけで利用する。 | 外部 command への意味依存と異なる列挙結果を排除しつつ、本体と afx-ops が互いを import しない独立 package 原則を保つ。 |
 
 残りの確認事項はない。
 
@@ -553,7 +590,7 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 |---|---|---|
 | AC-1 | `bind` の省略、`127.0.0.1`、up interface の global / link unicast IPv4 を受理する。hostname、先頭ゼロ、空白付き、`0.0.0.0`、IPv6、IPv4-mapped IPv6、interface に無い IPv4 を拒否する。stdlib 共通列挙の `if_nameindex()` / 各 ioctl 失敗と、列挙成功後の不在を区別し、scope を address 範囲から判定する。 | config / wizard / probe / production の同じ列挙 fixture、rc 71 と `interface_lookup_failed` / `bind_not_local`。 |
 | AC-2 | 指定した非 loopback IPv4 と port に実 bind + listen し、`getsockname()` が両方に完全一致する。別 address 又は別 port の listener を `listener_invalid` にする。 | 実 listener の `getsockname()` と起動 rc。 |
-| AC-3 | allow の単一 IPv4、canonical CIDR、`0.0.0.0/0` を受理する。非 canonical CIDR、空 list、重複、IPv6、IPv4-mapped IPv6、空白付き、host bit 付き CIDR を拒否する。 | config reader と writer の再読取り。 |
+| AC-3 | allow の単一 IPv4、canonical CIDR、singleton `allow = ["0.0.0.0/0"]` を受理する。非 canonical CIDR、空 list、重複、IPv6、IPv4-mapped IPv6、空白付き、host bit 付き CIDR、`0.0.0.0/0` と他 network の混在を `config_invalid` で拒否する。 | config reader と writer の再読取り、混在 list の順序違い。 |
 | AC-4 | 非 loopback で allow key が無いと `allow_required` になる。loopback では allow 省略、限定 allow、`0.0.0.0/0` がそれぞれ契約どおり動く。 | 起動 rc と固定 reason。 |
 | AC-5 | allow 外の接続と `getpeername()` 失敗は要求受信 0 byte、接続枠 0、protocol 生成 0、daemon 呼出し 0 で黙って close する。callback は canonical peer IPv4 を渡し、`_Slot`、auth、rate limit がその不変値だけを使う。 | instrument した reader、slot、protocol factory、peer source、fake daemon の回数。 |
 | AC-6 | allow 内の接続だけが接続枠と protocol へ到達する。loopback allow 省略は `127.0.0.0/8` となる。allow 外の接続を 16 本以上張っても許可接続の 16 枠を消費しない。 | 実 accepted fd と slot 数の L-1 / L / L+1。 |
@@ -562,7 +599,7 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-9 | 隔離前に接続して backlog に入れた connection が隔離前に handler、protocol、daemon へ届かず、隔離と READY 後にだけ処理される。 | phase ごとの callback 回数。 |
 | AC-10 | LAN bind 後も隔離 process の新規 AF_INET / AF_INET6 socket、bind、listen が拒否される。trace 固定の `accept4` だけで実要求が通る。 | 実 seccomp process と syscall trace。 |
 | AC-11 | probe が bind、stdlib 共通 interface 列挙、allow、auth、secret、実 bind / listen、`getsockname()` を決定木順に検査する。成功と全失敗で state dir、stage file、listener 残骸を作らず、起動と probe の 1〜6 は同じ reason になる。 | probe 前後の filesystem / fd snapshot、rc、stdout / stderr、production との対照表。 |
-| AC-12 | §2.3 の artifact / bind / allow / auth / secret の全直積を表から機械生成し、config、probe、production が各 fixture で同じ最終 reason 1 個だけを返す。T1 の `auth=none` も完了条件にし、複合不正は表の最初の行だけを返す。 | 生成 fixture 数と被覆証明、表の行 ID、3 入口の reason 対照。 |
+| AC-12 | §2.3 の artifact / bind 4 値 / allow 5 値 / auth / secret の全直積を表だけから機械生成し、config、probe、production が各 fixture で同じ最終 reason 1 個だけを返す。T1 の `auth=none`、mixed-unrestricted、lookup-failed / nonloop-absent も完了条件にし、複合不正は表の最初の行だけを返す。表外 override は fixture generator に持たない。 | 生成 fixture 数と被覆証明、表の行 ID、3 入口の reason 対照。 |
 | AC-13 | T1 / T2 とも `auth = "none"` は secret dir 不在を許可する。安全な残骸を `secret_unexpected`、symlink、未知 entry を含む unsafe な状態を `secret_invalid` で拒否し、secret の存在だけでは auth が有効にならない。 | T1 / T2 artifact の probe と production の rc 71 と固定 reason。 |
 | AC-14 | username `afx` と正しい password だけが通る。別 username と正しい password、`afx` と誤 password は同じ失敗になる。 | 200 / 401 と daemon 呼出し 1 / 0。 |
 | AC-15 | Authorization の欠落、重複、scheme 違い、区切り無し、tab、2 SP、前後 OWS、壊れた Base64、URL-safe alphabet、余分 padding、非 canonical pad bit、username 違い、password 違い、decoded 132 byte 超が同じ 401、同じ `WWW-Authenticate: Basic realm="afx"`、同じ固定 journal 文になる。canonical token だけが decode 後の再 encode と一致して通る。 | raw field-value、status、header、body、counter、journal。 |
@@ -571,60 +608,79 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-18 | 同じ送信元の失敗 4 / 5 / 6 回目が 401 / 401 / 429 になる。60 秒境界で古い失敗が契約どおり外れる。窓内 429 は比較と daemon 呼出しが 0 回で、queue に加わらない。 | fake clock、status、compare 回数、daemon 回数、queue 長。 |
 | AC-19 | 全体の失敗 99 / 100 / 101 回目が 401 / 401 / 429 になる。異なる送信元でも全体窓を共有し、global 先行 429 は送信元 entry の lookup / allocation と per-source 評価を行わない。 | fake clock、全体 counter、送信元表の lookup / allocation 回数。 |
 | AC-20 | 429 が 1..60 の Retry-After を持つ。global と送信元が同時に満杯で、global の残り 1 秒、送信元の残り 50 秒なら global だけから `1` を返す。global が空いている送信元 429 は送信元だけから計算する。HEAD の本文は空で GET と同じ Content-Length を持つ。 | 両窓の直積、窓境界の GET / HEAD 応答。 |
-| AC-21 | 各試行の lookup 前に全 queue を prune し、通常 / overflow queue 長が 5、global が 100 を超えない。送信元表は 1024 entry を超えず、1025 個目以降は「1 送信元相当」の overflow bucket と queue を共有する。期限切れ entry は lookup 前に回収でき、global 先行時は entry を割り当てない。 | 1023 / 1024 / 1025 送信元、59.999 / 60.000 / 60.001 秒、queue 長、状態 object / allocation 数。 |
+| AC-21 | 各試行の lookup 前に global と全送信元 queue を prune し、送信元 queue 長が 5、global が 100、実 IPv4 map が 100 entry を超えない。100 個の異なる送信元が各 1 回失敗して global が満杯になった後、101 個目の送信元は lookup / allocation されず、新 entry を作らない。期限切れ entry は次の lookup 前に回収でき、overflow bucket は存在しない。 | 99 / 100 / 101 送信元、59.999 / 60.000 / 60.001 秒、queue 長、map / 状態 object / allocation 数。 |
 | AC-22 | allow、Host、auth、rate limit の各失敗で daemon 呼出しが 0 回になる。成功した GET / HEAD だけが既存 read-only method を呼ぶ。protocol / adapter / renderer の内部例外は 500、daemon transport 例外、timeout、非 200、code 付き又は schema 不正 response は 502 に固定する。 | 404、POST の 405、500、502 と fake daemon の method 別回数。 |
 | AC-23 | journal、例外、probe、status、activity、event に IP、Host、Authorization、username、password、secret canary が無い。daemon activity と event の件数も増えない。 | 各出力と保存先の個別 canary 検査。 |
-| AC-24 | 初回 enable の完全な既存設定は候補 UI も再質問も行わず、不足設定だけを順に聞く。`--reconfigure` は完全でも目標値を再質問する。明示 `--non-interactive` は TTY より優先し、reconfigure では完全な `--target-config`、必要なら password input file を要求する。不足時は何も書かず rc 2 `setup_input_required` になる。 | IO fake の質問列、通常 / reconfigure、TTY 直積、target file、writer 呼出し回数。 |
-| AC-25 | `socket.if_nameindex()` と `fcntl.ioctl()` の `SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK` だけを候補、probe、production で共用する。address 範囲から global / link / loopback を分類し、候補を `(scope, ifindex, address)` で安定 sort する。いずれかの ioctl 失敗は部分結果と手入力を使わず `interface_lookup_failed`、候補 0 は `bind_not_local` になる。 | syscall / ioctl spy、範囲境界、候補数、3 入口の同一 fixture、IO transcript。 |
+| AC-24 | 初回 enable の完全な既存設定は候補 UI も再質問も行わず、不足設定だけを順に聞く。ただし `auth=none` と安全な残骸には none の再選択による明示 `secret_action=remove` を要求し、unlink + directory fsync の後だけ進む。3 回の probe 失敗後は設定を保存済みでも enable stage が存在しない。`--reconfigure` は完全でも目標値を再質問する。明示 `--non-interactive` は TTY より優先し、reconfigure では完全な `--target-config`、必要なら password input file を要求する。不足時は何も書かず rc 2 `setup_input_required` になる。 | IO fake の質問列、通常 / reconfigure、TTY 直積、target file、unlink / fsync、stage 不在、writer 呼出し回数。 |
+| AC-25 | `afx_ops.interfaces` の 1 実装が `socket.if_nameindex()` と `fcntl.ioctl()` の `SIOCGIFFLAGS` / `SIOCGIFADDR` / `SIOCGIFNETMASK` だけを使い、wizard は `afx-ops interfaces` subprocess 経由、probe / production は package 内呼出しで同じ fixture を共用する。本体から `afx_ops` を import しない。flags 失敗は列挙失敗、down interface は skip、up だが IPv4 を持たず固定 errno を返す interface は skip、address 取得後の netmask 失敗と想定外 errno は `interface_lookup_failed` とする。IPv6-only / up、down、対象 IPv4 ありの混在でも対象を返す。address 範囲から global / link / loopback を分類し `(scope, ifindex, address)` で安定 sort する。command の JSON schema、65536 byte 上限、5 秒 timeout、rc / stderr 違反を本体が固定 reason に写像し、候補 0 は `bind_not_local` になる。 | syscall / ioctl spy、errno 集合、混在 fixture、schema / stdout / timeout 境界、3 入口の同一結果、import pin、IO transcript。 |
 | AC-26 | unrestricted の選択肢と警告が §5.2 の固定文であり、明示確認の後だけ `allow = ["0.0.0.0/0"]` を書く。未確認、EOF、取消しでは書かず、EOF / 取消しは rc 1 `setup_aborted` になる。限定 allow の空回答は再質問する。 | IO transcript と ops.toml。 |
 | AC-27 | 生成 password が random 16 byte の padding なし base64url であり、初回だけ表示され、再実行、probe、status、stage、ログに現れない。 | deterministic RNG fixture、22 byte grammar、出力 canary。 |
 | AC-28 | live config、目標 config staging、secret の atomic write が crash 前後に旧版又は新版の完全な file だけを残す。目標 staging は全文と digest が一致し、`web.password` と secret staging は常に mode `0600` である。 | rename / fsync fault injection、digest、mode、directory durability。 |
 | AC-29 | `feature_config.py` の writer が port、bind、allow、auth を書き、再読取りで scalar 型、list 順序、値を保持する。単一 IPv4 allow の `/32` 意味も保持する。 | write → collect → write → read の round-trip。 |
 | AC-30 | `afx ops status web` が固定形式の公開範囲 1 行を出し、限定 allow の個別 IP と password を出さない。reconfigure 中は `reconfigure <stage>` と実 unit 状態を出して `enabled` と表示せず、停止 stage は inactive / failed、公開範囲は検証済み staging config を表示する。 | localhost、restricted、unrestricted、basic、全 reconfigure stage の出力全文。 |
-| AC-31 | T1 単独版は localhost 又は非空の限定 allow 付き LAN だけを起動する。`0.0.0.0/0` と `auth = "basic"` は優先順位どおり `unrestricted_not_supported` / `auth_not_supported` で拒否し、production と probe が同じ固定 reason / rc 71 を返す。 | T1 artifact の production 起動と probe の直積。 |
+| AC-31 | T1 単独版は localhost 又は非空の限定 allow 付き LAN だけを起動する。singleton `0.0.0.0/0` と `auth = "basic"` は優先順位どおり `unrestricted_not_supported` / `auth_not_supported`、`0.0.0.0/0` と他 network の混在は先に `config_invalid` で拒否し、production と probe が同じ固定 reason / rc 71 を返す。 | T1 artifact の production 起動と probe、mixed-unrestricted の順序違いの直積。 |
 | AC-32 | `0.0.0.0` bind、IPv6 bind / allow、proxy header による peer 上書き、新しい変更 route が存在しない。 | schema、route 一覧、`_Slot` の peer 判定入力の pin。 |
 | AC-33 | T1 / T2 の `FeaturePlan` の許可 secret 名は常に `{"web.password"}` で、必須集合は検証済み auth だけから決まる。T1 の none でも dir 不在を許可し、存在時は検査済み dir fd から残骸と未知 entry を判定する。 | T1 / T2 plan object、openat spy、auth / dir / entry 直積。 |
 | AC-34 | 手入力 password は 16〜128 byte の visible ASCII (`:` を含む) だけを受理し、space、改行、非 ASCII と境界外を `secret_invalid` にする。Basic は `b"afx:" + password` 全体を hash し、password 中の `:` を正しく認証する。 | 15 / 16 / 128 / 129 byte、文字 class、複数 colon、digest 入力 spy。 |
-| AC-35 | readiness 1 回の accept は 64 以下で残りを次 tick に譲る。`EMFILE` / `ENFILE` は reader 解除後 50 ms backoff、連続 200 回で listener close、`accept_exhausted`、rc 72 になる。accept syscall が 1 本成功すれば allow / callback 結果にかかわらず連続回数を reset する。64 本目成功の reset、次 tick の EMFILE、reader 解除、timer だけによる resume の順を固定する。 | 63 / 64 / 65 境界 × EMFILE、実 listener flood、fake loop の reader / timer / tick 順、counter、listener、rc、journal。 |
+| AC-35 | readiness 1 回の accept は 64 以下で残りを次 tick に譲る。`EMFILE` / `ENFILE` は reader 解除後 50 ms backoff、連続 200 回で listener close、`accept_exhausted`、rc 72 になる。accept syscall が 1 本成功すれば allow / callback 結果にかかわらず連続回数を reset する。64 本目成功の reset、次 tick の EMFILE、reader 解除、timer だけによる resume の順を固定する。accept 3 counter は全 event を数え、backoff は episode 先頭かつ最大 10 行、callback failure は最大 10 行、exhausted はちょうど 1 行で、固定文以外を出さない。 | 63 / 64 / 65 境界 × EMFILE、実 listener flood、fake loop の reader / timer / tick 順、counter、10 / 11 件 sampling、listener、rc、journal 全文。 |
 | AC-36 | 隔離の fd 自己検査時点の保持 fd は `{0,1,2,listener,notify}` だけで、secret dir / password / config / interface 列挙 socket fd が無い。READY 後は notify も閉じる。 | `/proc/self/fd` と syscall trace の phase 別 snapshot。 |
-| AC-37 | `operation = reconfigure` の有限 stage が schema で検証され、目標 `ops.toml` 全文を durable staging file と digest で保持する。`basic → none` と `none + 安全な残骸 → none` は停止、password unlink、dir fsync、config 保存の順で、material 変更前の全失敗は rollback、以後は forward recovery する。 | 全 stage × 各 syscall 前後の fault injection、staging 全文 / digest、stage / unit / status / fsync 順。 |
-| AC-38 | `none → basic` は停止、secret atomic 保存、dir fsync、staging 全文から config 保存の順で進む。各 stage が unit、live / staged config、secret の事後条件を照合する。unsafe な手置き secret は `secret_invalid` で無変更とし、material 変更前は必ず rollback、以後は password を再生成せず forward recovery する。 | 全 stage × fault injection、canary、mode、digest、unit / status / recovery 文。 |
-| AC-39 | request line / header / body の malformed と上限境界が既存契約の 400 / 413 になり、Host / auth より先に止まる。405 は POST 等で観測する。HEAD は実際に到達する 400 / 401 / 404 / 429 / 500 / 502 だけについて body 0 と GET と同じ Content-Length を検査する。protocol 内部例外は 500、daemon / backend 障害は 502 にする。 | 各 parser 上限の L-1 / L / L+1、POST 405、到達可能な全 HEAD status、daemon 回数。 |
+| AC-37 | `operation = reconfigure` の有限 stage が schema で検証され、目標 `ops.toml` 全文、元の terminal `enable_record`、`reconfigure_afx_before_stop` / `reconfigure_ops_before_stop` を durable に保持する。`basic → none` と `none + 安全な残骸 → none` は停止、password unlink、dir fsync、config 保存の順で、material 変更前の全失敗は rollback、以後は forward recovery する。開始時に afx が inactive なら probe 後も afx / ops を起動せず、`ops_active=false` / `ops=starts_with_afx` で terminal へ戻る。 | afx / ops の active-state 直積、全 stage × 各 syscall 前後の fault injection、staging 全文 / digest、stage / unit / status / fsync 順。 |
+| AC-38 | `none → basic` は停止、secret atomic 保存、dir fsync、staging 全文から config 保存の順で進む。各 stage が unit、live / staged config、secret の事後条件を照合する。afx が開始時に active だった場合だけ start → server 認証 → READY を要求する。両 finalize 経路の `enable/enabled` record は元の `principal` / `registered` / `artifacts` / `wants` / `afx_before_stop` / `committed` を保持し、active 経路は `ops_active=true`、inactive 経路は `ops_active=false` にする。unsafe な手置き secret は `secret_invalid` で無変更とし、material 変更前は必ず rollback、以後は password を再生成せず forward recovery する。 | 全 stage × fault injection、active / inactive finalize record 全文、canary、mode、digest、unit / status / recovery 文。 |
+| AC-39 | request line / header / body の malformed と上限境界が既存契約の 400 / 413 になり、Host / auth より先に止まる。405 は POST 等で観測する。HEAD は実際に到達する 400 / 401 / 404 / 413 / 429 / 500 / 502 について body 0 と GET と同じ Content-Length を検査する。protocol 内部例外は 500、daemon / backend 障害は 502 にする。 | 各 parser 上限の L-1 / L / L+1、POST 405、到達可能な全 HEAD status、daemon 回数。 |
 | AC-40 | 下記の有限な mutation ID を 1 個ずつ有効にし、対応 AC が少なくとも 1 個失敗する。T1 完了時は T1 集合だけ、T2 完了時は T1 + T2 集合を実行する。 | mutation ID、対応 AC、意図した failure の CI 記録。 |
 
 AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だけを行い、複数条件を同時に変えない。
 
 | 集合 | mutation ID | 反転する条件 | 検出する AC |
 |---|---|---|---|
-| T1 | `M-T1-BIND-CANON` | 非 canonical / 非 local bind を受理する。 | AC-1、AC-2 |
-| T1 | `M-T1-IFACE-DIVERGE` | wizard、probe、production の 1 入口だけ別の interface 列挙結果を使う。 | AC-1、AC-11、AC-25 |
+| T1 | `M-T1-BIND-CANON` | 先頭ゼロ付き bind を受理する。 | AC-1 |
+| T1 | `M-T1-BIND-LOCAL` | 列挙成功後に存在しない bind を受理する。 | AC-1、AC-12 |
+| T1 | `M-T1-IFACE-DIVERGE` | wizard だけ権威的列挙と異なる候補を使う。 | AC-1、AC-11、AC-25 |
 | T1 | `M-T1-ALLOW-MISSING` | 非 loopback の allow 省略を通す。 | AC-4、AC-31 |
-| T1 | `M-T1-CAPABILITY` | T1 で unrestricted 又は basic を通す。 | AC-12、AC-31 |
+| T1 | `M-T1-ALLOW-UNRESTRICTED-MIX` | `0.0.0.0/0` と限定 network の混在を限定 allow として通す。 | AC-3、AC-12、AC-31 |
+| T1 | `M-T1-CAP-UNRESTRICTED` | T1 で singleton unrestricted を通す。 | AC-12、AC-31 |
+| T1 | `M-T1-CAP-BASIC` | T1 で basic を通す。 | AC-12、AC-31 |
 | T1 | `M-T1-NONE-RESIDUE` | `auth=none` の安全な password 残骸を無視する。 | AC-12、AC-13、AC-33 |
 | T1 | `M-T1-UNKNOWN-SECRET` | 許可外 secret entry を通す。 | AC-13、AC-33 |
-| T1 | `M-T1-ALLOW-LATE` | allow 判定を slot / protocol 生成後へ移す。 | AC-5、AC-6 |
-| T1 | `M-T1-PEER-HEADER` | rate key / allow source を accepted peer 以外から再導出する。 | AC-5、AC-32 |
-| T1 | `M-T1-HOST` | Host 欠落、重複又は値違いの 1 つを通す。 | AC-7、AC-8 |
-| T1 | `M-T1-PRE-READY-ACCEPT` | 隔離 / READY 前に backlog を処理する。 | AC-9 |
-| T1 | `M-T1-SECCOMP-INET` | 隔離後の新規 INET socket を許す。 | AC-10、AC-32 |
-| T1 | `M-T1-LISTENER-CHECK` | `getsockname()` の address 又は port 不一致を見逃す。 | AC-2、AC-11 |
+| T1 | `M-T1-ALLOW-LATE` | allow 判定を slot 生成後へ移す。 | AC-5、AC-6 |
+| T1 | `M-T1-ALLOW-PEER-HEADER` | allow source を accepted peer でなく proxy header から導出する。 | AC-5、AC-32 |
+| T1 | `M-T1-HOST-MISSING` | Host 欠落を通す。 | AC-7、AC-8 |
+| T1 | `M-T1-HOST-DUPLICATE` | Host 重複を通す。 | AC-7、AC-8 |
+| T1 | `M-T1-HOST-MISMATCH` | 設定 bind と異なる Host を通す。 | AC-7、AC-8 |
+| T1 | `M-T1-PRE-READY-ACCEPT` | READY 前に backlog を処理する。 | AC-9 |
+| T1 | `M-T1-SECCOMP-INET` | 隔離後の新規 AF_INET socket を許す。 | AC-10、AC-32 |
+| T1 | `M-T1-LISTENER-ADDRESS` | `getsockname()` の address 不一致を見逃す。 | AC-2、AC-11 |
+| T1 | `M-T1-LISTENER-PORT` | `getsockname()` の port 不一致を見逃す。 | AC-2、AC-11 |
 | T1 | `M-T1-ACCEPT-64` | readiness 1 回で 65 本目を accept する。 | AC-35 |
 | T1 | `M-T1-EMFILE-RESET` | accept syscall 成功後も EMFILE 連続回数を reset しない。 | AC-35 |
-| T1 | `M-T1-SECRET-FD` | secret / interface 列挙 fd を隔離へ残す。 | AC-36 |
-| T1 | `M-T1-STATUS-500-502` | protocol 内部例外と backend 障害の status を交換する。 | AC-22、AC-39 |
-| T2 | `M-T2-BASIC-GRAMMAR` | 2 SP、tab、外側 OWS又は非 canonical Base64 の 1 つを通す。 | AC-15 |
+| T1 | `M-T1-SECRET-FD` | secret fd を隔離へ残す。 | AC-36 |
+| T1 | `M-T1-INTERFACE-FD` | interface 列挙 socket fd を隔離へ残す。 | AC-36 |
+| T1 | `M-T1-STATUS-500-502` | protocol 内部例外を 502 にする。 | AC-22、AC-39 |
+| T2 | `M-T2-BASIC-2SP` | Basic と token 間の 2 SP を受理する。 | AC-15 |
+| T2 | `M-T2-BASIC-TAB` | Basic と token 間の tab を受理する。 | AC-15 |
+| T2 | `M-T2-BASIC-OWS` | token 後方の OWS を受理する。 | AC-15 |
+| T2 | `M-T2-BASIC-BASE64` | URL-safe Base64 alphabet を受理する。 | AC-15 |
 | T2 | `M-T2-COMPARE-LENGTH` | credential を可変長のまま比較する。 | AC-16、AC-34 |
 | T2 | `M-T2-SOURCE-LIMIT` | 送信元 6 回目を 401 にする。 | AC-18 |
 | T2 | `M-T2-GLOBAL-LIMIT` | global 101 回目を 401 にする。 | AC-19 |
-| T2 | `M-T2-GLOBAL-RETRY` | global 先行 429 で per-source を評価し大きい Retry-After を返す。 | AC-19、AC-20 |
-| T2 | `M-T2-OVERFLOW` | 1025 個目の source に独立 entry を割り当てる。 | AC-21 |
-| T2 | `M-T2-SECRET-OUTPUT` | password 又は Authorization をいずれかの出力へ含める。 | AC-23、AC-27、AC-30 |
+| T2 | `M-T2-GLOBAL-RETRY` | global 先行 429 で per-source の Retry-After を使う。 | AC-19、AC-20 |
+| T2 | `M-T2-RATE-PEER-HEADER` | rate key を accepted peer でなく proxy header から導出する。 | AC-5、AC-18、AC-32 |
+| T2 | `M-T2-MAP-101` | global 満杯時に 101 個目の source entry を割り当てる。 | AC-19、AC-21 |
+| T2 | `M-T2-PASSWORD-OUTPUT` | password を status へ含める。 | AC-23、AC-27、AC-30 |
+| T2 | `M-T2-AUTHORIZATION-OUTPUT` | Authorization を journal へ含める。 | AC-23 |
 | T2 | `M-T2-UNRESTRICTED-CONFIRM` | 明示確認なしで unrestricted を保存する。 | AC-26 |
-| T2 | `M-T2-RECONFIG-STAGING` | reconfigure stage に digest だけを残し、目標 config 全文を durable 保存しない。 | AC-28、AC-37、AC-38 |
-| T2 | `M-T2-RECONFIG-ROLLBACK` | material 変更前の失敗で rollback せず停止状態を残す。 | AC-37、AC-38 |
-| T2 | `M-T2-NONE-RESIDUE-REMOVE` | `none + 安全な残骸 → none` で unlink 又は directory fsync を省く。 | AC-13、AC-37 |
+| T2 | `M-T2-RECONFIG-STAGING` | 目標 config 全文を durable 保存せず digest だけを残す。 | AC-28、AC-37、AC-38 |
+| T2 | `M-T2-RECONFIG-ROLLBACK` | material 変更前の失敗で rollback しない。 | AC-37、AC-38 |
+| T2 | `M-T2-NONE-RESIDUE-UNLINK` | `none + 安全な残骸 → none` で unlink を省く。 | AC-13、AC-24、AC-37 |
+| T2 | `M-T2-NONE-RESIDUE-FSYNC` | 残骸 unlink 後の directory fsync を省く。 | AC-24、AC-28、AC-37 |
 | T2 | `M-T2-RECONFIG-STATUS` | reconfigure の停止 stage を enabled と表示する。 | AC-30、AC-37 |
-| T2 | `M-T2-HEAD` | 401 / 429 / 500 / 502 の HEAD に body を付けるか Content-Length を 0 にする。 | AC-17、AC-20、AC-39 |
+| T2 | `M-T2-RECONFIG-INACTIVE-START` | 開始時に afx が inactive でも ops-web を start する。 | AC-37、AC-38 |
+| T2 | `M-T2-RECONFIG-FINAL-RECORD` | finalize 時に元の `wants` を空 list へ置換する。 | AC-38 |
+| T2 | `M-T2-HEAD-401` | HEAD 401 の Content-Length を 0 にする。 | AC-17、AC-39 |
+| T2 | `M-T2-HEAD-413` | HEAD 413 の Content-Length を 0 にする。 | AC-39 |
+| T2 | `M-T2-HEAD-429` | HEAD 429 の Content-Length を 0 にする。 | AC-20、AC-39 |
+| T2 | `M-T2-HEAD-500` | HEAD 500 の Content-Length を 0 にする。 | AC-39 |
+| T2 | `M-T2-HEAD-502` | HEAD 502 の Content-Length を 0 にする。 | AC-39 |
 
 ## 10. 変更ファイルと task 表
 
@@ -633,15 +689,15 @@ AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だ
 | 領域 | ファイル | 変更 |
 |---|---|---|
 | 設定 | `afx-ops/afx_ops/config.py` | bind、allow、auth の grammar、組み合わせ、固定 reason を追加する。 |
-| interface | `afx-ops/afx_ops/interfaces.py` | stdlib / ioctl の権威的な列挙を 1 実装だけ置き、wizard、probe、production から import する。 |
+| interface | `afx-ops/afx_ops/interfaces.py`、`afx-ops/afx_ops/cli.py` | stdlib / ioctl の権威的な列挙を 1 実装だけ置き、afx-ops 内の probe / production と `afx-ops interfaces` から共用する。固定 JSON schema と bounded command を追加する。 |
 | pre-bind / allow | `afx-ops/afx_ops/isolation/accept_loop.py` | 設定 address の bind と listener 検査、accept 直後の peer allow を追加する。 |
 | secret / 起動 | `afx-ops/afx_ops/isolation/startup.py` | T1 で none の secret dir / 未知 entry / 残骸検査、T2 で basic の `web.password` 読取り、設定 bind の pre-bind を追加する。 |
 | seccomp | `afx-ops/afx_ops/isolation/profiles.py` | 緩和せず、現行の AF_INET / AF_INET6 拒否と accept4 だけを pin する。 |
 | HTTP | `afx-ops/afx_ops/web/{runtime,request,headers}.py` | allow 配線、Host、Basic、rate limit、401 / 429 / HEAD、固定 counter / journal を追加する。 |
 | probe | `afx-ops/afx_ops/probe.py` | 共通 interface 列挙を呼び、allow、auth / secret、実 bind / listen / getsockname を検査する。 |
 | CLI | `src/agentic_fx/cli.py` | `afx ops enable` に `--non-interactive`、`--reconfigure` を追加する。 |
-| wizard / writer | `src/agentic_fx/ops_setup/{interactive,feature_config}.py` | `afx_ops.interfaces` の候補列挙、質問、atomic secret、目標 config staging、round-trip、通常 enable の無再質問と reconfigure の再質問を追加する。 |
-| stage / status | `src/agentic_fx/ops_setup/stages.py` | `operation = reconfigure` と有限 stage、durable recovery、公開範囲と進行中 / 停止状態の固定表示を追加する。 |
+| wizard / writer | `src/agentic_fx/ops_setup/{interactive,feature_config}.py` と bounded subprocess helper | `afx-ops interfaces` 経由の候補列挙、質問、初回 none 残骸の明示 remove、atomic secret、目標 config staging、round-trip、通常 enable の無再質問と reconfigure の再質問を追加する。本体から afx_ops を import しない。 |
+| stage / status | `src/agentic_fx/ops_setup/stages.py` | `operation = reconfigure` と有限 stage、開始時 afx / ops 状態と旧 terminal record の durable 保存、active / inactive 分岐、公開範囲と進行中 / 停止状態の固定表示を追加する。 |
 | test | `afx-ops/tests/{isolation,web}/`、`afx-ops/tests/test_{config,probe}.py`、`tests/ops_setup/` | §9 の T1 / T2 観測点、境界値、実 process を追加する。 |
 | 運用文書 | afx-ops の運用文書 | 平文 HTTP、到達範囲、password の reconfigure 手順、残余リスクを記載する。 |
 
@@ -649,8 +705,8 @@ AC-40 の mutation 集合は次に固定する。各 mutation は表の反転だ
 
 | task | 範囲 | test 完成形の要点 | 規模 |
 |---|---|---|---|
-| T1 bind + allow | config と writer、stdlib interface 列挙、設定 address の pre-bind / getsockname、accept 直後の allow、全 bind の Host 検査、probe、seccomp pin、`auth=none` の secret dir / 未知 entry / 残骸 password 検査と固定許可 secret 名を実装する。単独公開は localhost 又は非空の限定 allow 付き LAN に限る。`0.0.0.0/0` と `auth = "basic"` はそれぞれ `unrestricted_not_supported` / `auth_not_supported` で拒否する。 | AC-1〜AC-13 の T1 / none 部分、AC-29、AC-31〜AC-33、AC-35、AC-36、AC-39 の 400 / 404 / 405 / 500 / 502 部分、AC-40 の T1 集合。allow 外の受信 0、fairness、EMFILE、protocol 0、daemon 0、残骸 secret、実 bind、実 seccomp を含む。T2 の Basic、rate limit、wizard、reconfigure の完成は要求しない。 | M |
-| T2 auth + 運用導線 | `auth=basic` の password 読取り / 比較、rate limit、ウィザード、durable reconfigure、無制限 LAN の解禁、status、運用文書を実装する。T1 の none 残骸検査は維持する。 | AC-12 の T2 / basic 部分、AC-14〜AC-28、AC-30、AC-34、AC-37〜AC-39 の追加 status、AC-40 の T1 + T2 集合。Authorization の全失敗形、401 / 429 / HEAD、rate limit、stdlib discovery、crash recovery、canary、password 一度表示を含む。 | M |
+| T1 bind + allow | config と writer、stdlib interface 列挙と `afx-ops interfaces` 契約、設定 address の pre-bind / getsockname、accept 直後の allow、全 bind の Host 検査、probe、seccomp pin、`auth=none` の secret dir / 未知 entry / 残骸 password 検査と固定許可 secret 名を実装する。単独公開は localhost 又は非空の限定 allow 付き LAN に限る。singleton `0.0.0.0/0` は `unrestricted_not_supported`、mixed-unrestricted は `config_invalid`、`auth = "basic"` は `auth_not_supported` で拒否する。 | AC-1〜AC-13 の T1 / none 部分、AC-25 の列挙 command、AC-29、AC-31〜AC-33、AC-35、AC-36、AC-39 の 400 / 404 / 413 / 405 / 500 / 502 部分、AC-40 の T1 集合。allow 外の受信 0、fairness、EMFILE、accept journal、protocol 0、daemon 0、残骸 secret、実 bind、実 seccomp を含む。T2 の Basic、rate limit、wizard、reconfigure の完成は要求しない。 | M |
+| T2 auth + 運用導線 | `auth=basic` の password 読取り / 比較、100 entry 上限の rate limit、本体から `afx-ops interfaces` を呼ぶウィザード、初回残骸の明示 remove、active / inactive を保存する durable reconfigure、無制限 LAN の解禁、status、運用文書を実装する。T1 の none 残骸検査は維持する。 | AC-12 の T2 / basic 部分、AC-14〜AC-28、AC-30、AC-34、AC-37〜AC-39 の追加 status、AC-40 の T1 + T2 集合。Authorization の全失敗形、401 / 413 / 429 / HEAD、rate limit、bounded discovery、停止中 afx の reconfigure、crash recovery、canary、password 一度表示を含む。 | M |
 
 T1 は T2 より先に統合できる。
 T1 の LAN 公開は allow-only の限定公開であり、無制限公開ではない。
@@ -668,6 +724,7 @@ T2 は T1 の allow と Host の境界を緩めない。
 - hostname 又は mDNS 名での bind と Host 許可。
 - allow の DNS 名、interface 名、動的 group。
 - 認証失敗を daemon の監査記録へ保存する機能。
+- rate-limit 状態の process 間永続化。
 
 ## 12. 残余リスク
 
@@ -679,8 +736,8 @@ T2 は T1 の allow と Host の境界を緩めない。
 | allow 外洪水 | 64 accept / tick と早期 close で公平性と資源消費を有界化するが、回線、kernel backlog、CPU を飽和させる DoS は防げない。 |
 | slowloris | 接続枠 16 と 30 秒 timeout は被害を制限するが、allow 内 source が枠を占有して一時的に正規要求を妨げられる。 |
 | global rate limit | 分散又は共有 source の失敗により global 100 件窓へ達すると、正しい利用者も最大 60 秒 lockout される。 |
-| overflow bucket | 1024 entry 超の source は 1 送信元相当の bucket を共有するため、ある source の失敗が別 source を 429 にする巻き添えがある。 |
 | 分散総当たり | 送信元別 / global の固定窓は試行速度を制限するが、時間を空けた攻撃、複数 process / host、credential の別経路漏えいを防がない。 |
+| rate-limit の再起動 reset | rate-limit は process 内状態であり、通常再起動や `accept_exhausted` 後の systemd 再起動で履歴が消える。永続化は今回の非目標であり、再起動後は新しい送信元別 5 回 / global 100 回の窓が始まる。 |
 | 生成 password の初回表示 | 生成値は一度だけ表示するため、その時点の画面共有、端末 scrollback、肩越しの観察から漏えいし得る。製品は端末側の記録を消去できない。 |
 | Host 検査 | DNS rebinding や誤転送への defense-in-depth であり、network reachability、allow、auth、TLS の代替ではない。 |
 | Basic logout | browser が credential を保持するため、確実な logout 操作を提供できない。browser を閉じても保持が続く場合がある。 |
@@ -694,3 +751,4 @@ T2 は T1 の allow と Host の境界を緩めない。
 | 2026-10-23 | v0.1 | C0 下書きを新規作成。bind、allow、auth、接続順、隔離、probe、ウィザード、AC、T1 / T2 を定義した。 | チケットのユーザー裁定と第二意見 2 回目の是正 3 点を amendment spec に固定するため。 | — |
 | 2026-10-23 | v0.2 | 固定 reason 決定木、FeaturePlan / secret fd、durable reconfigure、Host / password / bind scope、accept fairness、rate-limit queue、discovery / 非対話契約、旧 spec 置換、AC-1〜AC-40、残余リスクを確定した。 | 設計レビュー 1 周目 sol、High 5 / Medium 8 を全採用。 | — |
 | 2026-10-23 | v0.3 | 一意な組み合わせ表、目標 config 全文を使う reconfigure recovery、T1 の none secret 検査、EMFILE 契約、stdlib interface 列挙、global 先行 Retry-After、Host / Basic wire grammar、観測可能な status / mutation 集合を確定した。 | 設計レビュー 2 周目 sol、High 3 / Medium 5 を全採用し、1 周目の未閉鎖 7 件 (#1、#3、#5、#7、#8、#10、#12) を閉鎖。 | — |
+| 2026-10-23 | v0.4 | mixed-unrestricted の拒否、表だけで完結する reason oracle、`afx-ops interfaces` subprocess 契約、停止中 afx の reconfigure、100 entry rate map、初回残骸削除導線、HEAD 413、accept journal、ioctl skip、旧 spec secret 置換、再起動 reset リスク、1 変異 1 ID を確定した。 | 設計レビュー 3 周目 sol、High 3 / Medium 7 / Low 1 を全採用し、2 周目の未閉鎖 4 件 (#1、#2、#5、#8) を閉鎖。 | — |
