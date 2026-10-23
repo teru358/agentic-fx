@@ -1,7 +1,7 @@
 ---
 id: web-lan-access-bind-allow-auth
 title: 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定)
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-23
 closed: null
@@ -9,7 +9,7 @@ related: [ops-ui, web-ui-charts-equity-indicators]
 ---
 # [web-lan-access-bind-allow-auth] 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定)
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -19,9 +19,12 @@ related: [ops-ui, web-ui-charts-equity-indicators]
 
 ## 処置案・裁定
 
+正本は設計書 `docs/superpowers/specs/2026-10-23-web-lan-access-design.md` (v0.9、2026-10-24 収束)。task 表は同 §10.2。
+
 ## 修正内容
 
 ## 経緯
 
 - 2026-10-23: 起票。
 - 2026-10-23: 状態: 設計待ち — C0 を sol に下書きさせ、sol レビュー → ユーザー確認の順
+- 2026-10-24: 状態: 実装待ち — 設計書 docs/superpowers/specs/2026-10-23-web-lan-access-design.md v0.9 で収束 (設計レビュー 6 周 + 差分閉鎖確認 3 周、ユーザー裁定 C' = enable 時の要約 + 1 問、afx に触れない reconfigure は T2、コマンド階層 afx ops <feature> <verb>、reconfigure + 別名 reconf)。T1 (bind + allow + Host + probe + 残骸検査、afx-ops と ops_setup writer) → T2 (auth + rate limit + ウィザード + reconfigure) の順で実装
