@@ -3,12 +3,13 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 128 件。完了分は closed/。
 
-## 実装待ち (12)
+## 実装待ち (13)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
+| [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
 | [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -31,7 +32,7 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (110)
+## 設計待ち (109)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -58,7 +59,6 @@
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
-| [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
 | [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
