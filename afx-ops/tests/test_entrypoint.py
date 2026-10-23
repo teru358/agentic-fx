@@ -320,6 +320,7 @@ def test_probe_web_fails_when_the_configured_port_is_taken():
 @pytest.mark.parametrize(("feature", "extra", "expected"), [
     ("bot", 'trade_notices = "fills_closes"\ntrade_amounts = "relative"\n',
      {"trade_notices": "fills_closes", "trade_amounts": "relative"}),
+    ("bot", 'ops_notices = "all"\n', {"ops_notices": "all"}),
     ("notify", "deliver_trade_events = true\n", {"deliver_trade_events": True}),
 ])
 def test_ac24_trade_settings_are_read_before_isolation_and_handed_to_the_run(

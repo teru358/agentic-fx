@@ -289,3 +289,15 @@ def test_the_accepted_trade_notice_values_match_afx_ops():
     amounts = next(node.value for node in config.body if isinstance(node, ast.Assign)
                    and getattr(node.targets[0], "id", None) == "TRADE_AMOUNTS")
     assert TRADE_AMOUNTS == tuple(e.value for e in amounts.elts)
+
+
+def test_bot_ops_notices_survives_a_writer_round_trip_and_rejects_other_values(tmp_path, xdg):
+    values = BOT | {"ops_notices": "all"}
+    write_inputs(tmp_path, "bot", values)
+
+    assert collect(tmp_path, "bot").values["ops_notices"] == "all"
+    write_inputs(tmp_path, "bot", collect(tmp_path, "bot").values | {"token": "t"})
+    assert 'ops_notices = "all"' in (xdg / "bot" / "config" / "ops.toml").read_text()
+    for invalid in ("everything", "ALL", 1, True, None):
+        with pytest.raises(InputError):
+            validate("bot", BOT | {"ops_notices": invalid})

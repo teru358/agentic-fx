@@ -16,12 +16,13 @@ from agentic_fx.ops.keys import key_dir
 _SECRET_NAME = {"bot": "discord.token", "notify": "webhook.url"}
 _FIELDS = {"bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids", "token"), "web": ("port",), "notify": ("webhook_url",)}
 _COMMON = ("instance_root", "key_dir")
-_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts"), "web": (),
+_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"), "web": (),
              "notify": ("deliver_trade_events",)}
 # 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
-_TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts"), "web": (), "notify": ("deliver_trade_events",)}
+_TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices"), "web": (), "notify": ("deliver_trade_events",)}
 TRADE_NOTICES = ("all", "results", "fills_closes", "off")
 TRADE_AMOUNTS = ("absolute", "relative")
+OPS_NOTICES = ("default", "all")
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 class InputError(ValueError): pass
@@ -63,7 +64,9 @@ def _trade_options(feature: str, values: dict[str, Any]) -> dict[str, Any]:
         value = values[name]
         if name == "deliver_trade_events":
             if type(value) is not bool: raise InputError(name)
-        elif type(value) is not str or value not in (TRADE_NOTICES if name == "trade_notices" else TRADE_AMOUNTS):
+        elif type(value) is not str or value not in {"trade_notices": TRADE_NOTICES,
+                                                       "trade_amounts": TRADE_AMOUNTS,
+                                                       "ops_notices": OPS_NOTICES}[name]:
             raise InputError(name)
         result[name] = value
     return result

@@ -30,6 +30,7 @@ def footer_identity(approval_id: int, payload_sha256: str) -> str:
 
 
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9_.:+\-]{0,64}\Z")
 
 # 表示面の上限と固定文。daemon 側の定義 (change_limits) と値を揃える (afx-ops は本体を import しない)
 SUMMARY_CHARS = 300
@@ -73,6 +74,11 @@ def escape_discord(value: object) -> str:
     """非信頼値を Discord の本文に置ける形にする (整形、mention 記法・markdown・コードフェンス・
     URL の autolink の無効化)。文字は足すだけで、ゼロ幅文字は使わない。"""
     return "".join(_ESCAPES.get(ch, ch) for ch in _clean_inline(value))
+
+
+def plugin_name_or_none(value: object) -> str | None:
+    """plugin 名として安全に表示できる値だけを返す。"""
+    return value if type(value) is str and _NAME.fullmatch(value) else None
 
 
 def cut_escaped(value: object, limit: int) -> str:
@@ -339,13 +345,88 @@ def confirm_view(record: ApprovalRecord) -> ViewModel:
     ), ephemeral=True)
 
 
+def _event_value(value: object) -> str | None:
+    return value if type(value) is str and _SAFE_EVENT_VALUE.fullmatch(value) else None
+
+
+def _generic_event(payload: dict[str, object], *_args, **_kwargs) -> str:
+    return f"イベント {escape_discord(payload['code'])} が記録されました。"
+
+
+def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
+                         approval_id: int | None, *, integer_limit: int = 18) -> str:
+    code = payload["code"]
+    if code == "approval_state_changed":
+        approval, state = payload["ref"].split(":", 1)[1], _event_value(payload.get("state"))
+        name = plugin_name_or_none(plugin_name)
+        subject = f"承認 #{approval}" + (f" (戦略 {escape_discord(name)})" if name else "")
+        endings = {"approved": "が承認・配備されました", "rejected": "が却下されました", "expired": "は期限切れになりました"}
+        return f"{subject} {endings[state]}。" if state in endings else f"承認 #{approval} の状態が変わりました" + (f" ({escape_discord(state)})" if state else "") + "。"
+    if code == "job_state_changed":
+        kind, state, reason = (_event_value(payload.get(key)) for key in ("job_kind", "state", "result_code"))
+        if kind is None: return _generic_event(payload)
+        labels = {"failed": "失敗しました", "cancelled": "取り消されました", "shutdown": "停止で中断しました", "done": "完了しました", "queued": "受け付けられました", "running": "実行中です"}
+        suffix = f" (理由 code: {escape_discord(reason)})" if reason else ""
+        if approval_id is not None and state == "failed": return f"承認 #{approval_id} の配備ジョブが失敗しました{suffix}。"
+        return f"ジョブ {escape_discord(kind)} が{labels.get(state, '状態が変わりました')}{suffix if state in {'failed', 'cancelled', 'shutdown'} else ''}。"
+    if code == "guard_state_changed":
+        guard, state = _event_value(payload.get("guard_kind")), _event_value(payload.get("state"))
+        if guard is None or state is None: return _generic_event(payload)
+        if guard == "kill_switch" and state in {"latched", "released"}:
+            text, generation = ("kill switch が作動しました" if state == "latched" else "kill switch が解除されました"), _event_integer(payload.get("generation"), limit=integer_limit)
+            return text + (f" (世代 {generation})" if generation is not None else "") + "。"
+        if guard == "data_feed" and state == "resume_requested": return "データ取得の再開を要求しました。"
+        return f"ガード {escape_discord(guard)} の状態が {escape_discord(state)} になりました。"
+    if code == "service_health_changed":
+        component, health = _event_value(payload.get("component_code")), _event_value(payload.get("health_code"))
+        return _generic_event(payload) if component is None or health is None else f"{escape_discord(component)} の健全性が {escape_discord(health)} になりました。"
+    if code == "ops_request_terminal":
+        endpoint, result = _event_value(payload.get("endpoint_code")), _event_value(payload.get("result_code"))
+        return _generic_event(payload) if endpoint is None else f"操作 {escape_discord(endpoint)} が終了しました" + (f" (結果 code: {escape_discord(result)})" if result else "") + "。"
+    return _generic_event(payload)
+
+
+OPS_EVENT_SPECS = {
+    "approval_state_changed": (True, _event_text_for_code),
+    "job_state_changed": (lambda payload: payload.get("state") in {"failed", "cancelled", "shutdown"}, _event_text_for_code),
+    "guard_state_changed": (True, _event_text_for_code),
+    "service_health_changed": (True, _event_text_for_code),
+    "ops_request_terminal": (False, _event_text_for_code),
+    "event_stream_health": (False, _event_text_for_code),
+}
+
+
+def wants_ops_event(payload: dict[str, object], ops_notices: str) -> bool:
+    default, _template = OPS_EVENT_SPECS[payload["code"]]
+    return ops_notices == "all" or (default(payload) if callable(default) else default)
+
+
+def _event_text(payload: dict[str, object], plugin_name: str | None,
+                approval_id: int | None, *, integer_limit: int = 18) -> str:
+    _default, template = OPS_EVENT_SPECS[payload["code"]]
+    return template(payload, plugin_name, approval_id, integer_limit=integer_limit)
+
+
+def _event_integer(value: object, *, limit: int) -> str | None:
+    if type(value) is not int or isinstance(value, bool):
+        return None
+    try:
+        text = str(value)
+    except ValueError:
+        return None
+    if re.fullmatch(r"[0-9]+", text) is None:
+        return None
+    return text if len(text) <= limit else None
+
+
 def render_event(event: object, *, mention_role_id: int | None = None,
-                 mention_user_ids: tuple[int, ...] = ()) -> RenderedEvent:
-    """notify と同じ allowlist 検証を通った code と fields だけを写す。"""
+                 mention_user_ids: tuple[int, ...] = (), plugin_name: str | None = None,
+                 approval_id: int | None = None) -> RenderedEvent:
+    """完全検証済み event を固定 template の 1 行通知にする。"""
     payload = encode_event(event)
-    fields = tuple(f"{key}={payload[key]}" for key in sorted(payload)
-                   if key not in {"event_id", "ts", "code", "ref"})
-    text = payload["code"] + (": " + ", ".join(fields) if fields else "")
+    text = _event_text(payload, plugin_name, approval_id)
+    if len(text) > BODY_CHARS:
+        text = _generic_event(payload)
     mentions: list[str] = []
     if type(mention_role_id) is int:
         mentions.append(f"<@&{mention_role_id}>")

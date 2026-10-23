@@ -69,7 +69,7 @@ class _Events:
     def approvals(self, *, limit: int) -> Reply:
         return Reply(200, {"approvals": []}, None)
 
-    def approval(self, approval_id: int):
+    def approval(self, approval_id: int, *, timeout=None):
         return Reply(200, {"status": "pending"}, None)
 
 
@@ -215,7 +215,7 @@ def test_ac23_a_skipped_event_does_not_block_the_posts_after_it(make_bot):
 
     bot.poll()
 
-    assert [t.split(":")[0] for t in bot.texts] == ["service_health_changed"] * 2
+    assert [t.splitlines()[0] for t in bot.texts] == ["api の健全性が ok になりました。"] * 2
     assert bot.state().cursor == 4
 
 
@@ -273,7 +273,7 @@ def test_ac23_approval_events_are_unaffected_by_trade_notices(make_bot):
         bot = make_bot(_page([_order(1, "placed"), approval]), trade_notices=setting,
                        mention_role_id=ROLE, mention_user_ids=(USER,))
         bot.poll()
-        approvals = [text for text in bot.texts if "approval_state_changed" in text]
+        approvals = [text for text in bot.texts if "が承認・配備されました" in text]
         assert len(approvals) == 1
         # 承認側の event は従来どおり設定済みの mention を付ける
         assert approvals[0].startswith(f"<@&{ROLE}> <@{USER}> ")

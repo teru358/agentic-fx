@@ -148,7 +148,7 @@ def test_ac25_an_event_after_the_start_is_posted(process):
     proc.poll()
     proc.poll()
     assert client.afters == [0, 5]
-    assert len(proc.channel.sent) == 1 and proc.channel.sent[0].startswith("service_health_changed")
+    assert len(proc.channel.sent) == 1 and proc.channel.sent[0].startswith("api の健全性が")
     assert load(proc.fd).cursor == 6
 
 

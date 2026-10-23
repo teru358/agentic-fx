@@ -475,7 +475,7 @@ def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash
         root, pki, daemon, discord_fake, dns, child_env, bots):
     fake = discord_fake
     _seed_started(root)
-    daemon.set(events=[event(1)])
+    daemon.set(events=[_service_health(1)])
     crashed = _start(bots, root, pki, fake, dns, child_env, exit_before_commit=True)
     got = crashed.wait_exit()
     assert got.rc == 86, got.stderr[-2000:]
@@ -490,13 +490,12 @@ def test_events_are_posted_with_configured_mentions_at_least_once_across_a_crash
     posts = [c for c in fake.channel_posts(CHANNEL) if not c.body.get("embeds")]
     assert len(posts) == 2
     for post in posts:
-        assert post.body["content"] == (f"<@&{ROLE}> <@{USER_A}> job_state_changed: "
-                                        "job_kind=ask, result_code=ok, state=done")
+        assert post.body["content"] == f"<@&{ROLE}> <@{USER_A}> api の健全性が ok になりました。"
         assert post.body["allowed_mentions"] == {"parse": [], "roles": [ROLE],
                                                  "users": [USER_A]}
     # 承認の決着 event: 正本を読み直し、pending でなければ record を終端にして View を外す
     message = _posts(fake, 7)[7]
-    daemon.set(events=[event(1), event(2, code="approval_state_changed", approval_id=7,
+    daemon.set(events=[_service_health(1), event(2, code="approval_state_changed", approval_id=7,
                                        state="approved")],
                approvals={"7": {"status": "approved", "payload_sha256": DIGEST_7}})
     wait_for(lambda: _snapshot(root)["cursor"] == 2)
@@ -519,7 +518,7 @@ def test_ac25_a_first_start_over_an_existing_history_posts_nothing_and_then_foll
     assert (snap["version"], snap["cursor"], snap["high_watermark"]) == (5, 3, 3)
     assert fake.channel_posts(CHANNEL) == []
     daemon.set(events=[event(1), event(2), event(3, code="approval_state_changed",
-                                                 approval_id=9, state="approved"), event(4)])
+                                                 approval_id=9, state="approved"), _service_health(4)])
     wait_for(lambda: _snapshot(root)["cursor"] == 4)
     assert len(fake.channel_posts(CHANNEL)) == 1
     bot.stop()
@@ -543,12 +542,17 @@ def _trade_close(event_id: int) -> dict:
                        "mode": "paper", "state_mode": None}}
 
 
+def _service_health(event_id: int) -> dict:
+    return {"id": event_id, "ts": "2026-10-20T00:00:00+00:00", "code": "service_health_changed",
+            "ref": "instance", "fields": {"component_code": "api", "health_code": "ok"}}
+
+
 def test_ac24_trade_settings_read_before_isolation_apply_in_the_isolated_bot(
         root, pki, daemon, discord_fake, dns, child_env, bots):
     fake = discord_fake
     _seed_started(root)
     daemon.set(events=[_trade_order(1, "placed"), _trade_order(2, "filled"), _trade_close(3),
-                       event(4)])
+                       _service_health(4)])
     bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon,
                        bot_config={"trade_notices": "results", "trade_amounts": "relative"})
     wait_for(lambda: _snapshot(root)["cursor"] == 4)
@@ -562,7 +566,25 @@ def test_ac24_trade_settings_read_before_isolation_apply_in_the_isolated_bot(
     for post in posts[:2]:
         assert post.body["allowed_mentions"] == {"parse": []}
         assert "<@" not in post.body["content"]
+    assert posts[2].body["content"] == f"<@&{ROLE}> <@{USER_A}> api の健全性が ok になりました。"
     assert posts[2].body["allowed_mentions"] == {"parse": [], "roles": [ROLE], "users": [USER_A]}
+    bot.stop()
+
+
+def test_ops_notices_all_read_before_isolation_posts_the_events_the_default_hides(
+        root, pki, daemon, discord_fake, dns, child_env, bots):
+    fake = discord_fake
+    _seed_started(root)
+    done = {"id": 1, "ts": "2026-10-20T00:00:00+00:00", "code": "job_state_changed",
+            "ref": "job:" + "a" * 32,
+            "fields": {"job_kind": "ask", "state": "done", "result_code": "ok"}}
+    daemon.set(events=[done, _service_health(2)])
+    bot = _start_ready(bots, root, pki, fake, dns, child_env, daemon,
+                       bot_config={"ops_notices": "all"})
+    wait_for(lambda: _snapshot(root)["cursor"] == 2)
+    contents = [c.body["content"] for c in fake.channel_posts(CHANNEL) if not c.body.get("embeds")]
+    assert contents == [f"<@&{ROLE}> <@{USER_A}> ジョブ ask が完了しました。",
+                        f"<@&{ROLE}> <@{USER_A}> api の健全性が ok になりました。"]
     bot.stop()
 
 

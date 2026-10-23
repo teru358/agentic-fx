@@ -271,6 +271,8 @@ def test_ac23_probe_accepts_the_trade_keys_and_rejects_invalid_values(
     ("bot", 'trade_notices = "off"\ntrade_amounts = "relative"\n',
      {"trade_notices": "off", "trade_amounts": "relative"}),
     ("bot", "", {"trade_notices": "all", "trade_amounts": "absolute"}),
+    ("bot", 'ops_notices = "all"\n', {"ops_notices": "all"}),
+    ("bot", "", {"ops_notices": "default"}),
     ("notify", "deliver_trade_events = true\n", {"deliver_trade_events": True}),
     ("notify", "", {"deliver_trade_events": False}),
 ])

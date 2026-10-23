@@ -35,8 +35,9 @@ from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
+from afx_ops.api_client import ApiError
 from afx_ops.gate.render import footer as gate_footer
-from afx_ops.gate.render import primary_view, render_approval, render_terminal
+from afx_ops.gate.render import plugin_name_or_none, primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
@@ -53,6 +54,7 @@ EDIT_BACKOFF_MAX_SECONDS = 60.0
 # 無ければ既定
 THROTTLE_DEFAULT_SECONDS = 10.0
 THROTTLE_MAX_SECONDS = 300.0
+NAME_LOOKUP_TIMEOUT_SECONDS = 3.0
 _TERMINAL = frozenset({"done"})
 # event の ref は daemon の固定形。int() が受ける Unicode 数字や先頭 0 は承認 ID とみなさない
 _APPROVAL_REF = re.compile(r"approval:([1-9][0-9]{0,17})\Z")
@@ -77,6 +79,7 @@ class BotSettings:
     # 取引通知の出し方。隔離の前に検査済みの設定の値で、runtime では読み直さない
     trade_notices: str = "all"
     trade_amounts: str = "absolute"
+    ops_notices: str = "default"
 
 
 @dataclass(frozen=True)
@@ -140,6 +143,19 @@ def _approval_id_of(event: dict) -> int | None:
         return None
     matched = _APPROVAL_REF.fullmatch(ref)
     return int(matched.group(1)) if matched is not None else None
+
+
+def _plugin_name(reply: object) -> str | None:
+    data = getattr(reply, "data", None)
+    change = data.get("change") if type(data) is dict else None
+    name = change.get("name") if type(change) is dict else None
+    return plugin_name_or_none(name)
+
+
+def _event_content(plan) -> str:
+    """Discord の 2000 字制限に合わせ、必要なら通知 mention だけを外す。"""
+    content = " ".join((*plan.mentions, plan.content))
+    return plan.content if len(content) > 2000 else content
 
 
 class BotAdapter:
@@ -667,12 +683,16 @@ class BotAdapter:
         # 新しい watermark は最初の確定 (投稿・既知の skip) と同じ置換で保存する
         progressed = False
         for event in events:
+            detail = None
+            plugin_name = None
+            approval_id = _approval_id_of(event)
             try:
                 plan = await self._run(lambda e=event: self.gate.plan_event(
                     e, mention_role_id=self.settings.mention_role_id,
                     mention_user_ids=self.settings.mention_user_ids,
                     trade_notices=self.settings.trade_notices,
-                    trade_amounts=self.settings.trade_amounts))
+                    trade_amounts=self.settings.trade_amounts,
+                    ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
             except Exception:
                 raise BotFailure("payload_invalid") from None
             if plan is None:
@@ -683,7 +703,23 @@ class BotAdapter:
                 await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
                 progressed = True
                 continue
-            content = " ".join((*plan.mentions, plan.content))
+            if (approval_id is not None and event["fields"].get("state") in {"approved", "rejected", "expired"}
+                    and self._poll_due(approval_id)):
+                try:
+                    detail = await self._run(
+                        lambda: self.client.approval(approval_id, timeout=NAME_LOOKUP_TIMEOUT_SECONDS))
+                except (ApiError, TimeoutError, OSError):
+                    pass
+                else:
+                    self._observe(approval_id, detail)
+                    plugin_name = _plugin_name(detail)
+                    plan = await self._run(lambda e=event: self.gate.plan_event(
+                        e, mention_role_id=self.settings.mention_role_id,
+                        mention_user_ids=self.settings.mention_user_ids,
+                        trade_notices=self.settings.trade_notices,
+                        trade_amounts=self.settings.trade_amounts,
+                        ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
+            content = _event_content(plan)
             allowed = (self._allowed_mentions() if plan.allow_mentions
                        else discord.AllowedMentions.none())
             try:
@@ -693,9 +729,8 @@ class BotAdapter:
                 return
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
             progressed = True
-            approval_id = _approval_id_of(event)
             if approval_id is not None:
-                await self._settle(approval_id)
+                await self._settle(approval_id, detail=detail if _detail_status(detail) not in {None, "pending"} else None)
         if unreadable:
             raise BotFailure("payload_invalid")
         if not progressed and high > self.gate.state.high_watermark:
@@ -735,7 +770,7 @@ class BotAdapter:
         if high < self.gate.state.high_watermark:
             raise BotFailure("high_watermark_regressed")
 
-    async def _settle(self, approval_id: int) -> None:
+    async def _settle(self, approval_id: int, *, detail=None) -> None:
         """正本が pending でなくなった承認の record を終端にし、投稿から View を外す。"""
         record = self.gate.state.record(approval_id)
         if record is None or record.state in _TERMINAL:
@@ -747,8 +782,9 @@ class BotAdapter:
             return
         if not self._poll_due(approval_id):
             return
-        detail = await self._run(self.client.approval, approval_id)
-        self._observe(approval_id, detail)
+        if detail is None:
+            detail = await self._run(self.client.approval, approval_id)
+            self._observe(approval_id, detail)
         status = _detail_status(detail)
         if status is None or status == "pending":
             return

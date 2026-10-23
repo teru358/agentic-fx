@@ -71,6 +71,16 @@ def test_bot_client_direct_public_methods_are_exactly_the_supported_api():
         "events", "approvals", "approval", "approve", "reject", "retry", "poll", "cancel"})
 
 
+def test_bot_approval_passes_an_explicit_timeout_without_changing_the_default(tmp_path, monkeypatch):
+    client = _offline_client(BotClient, tmp_path)
+    seen = []
+    monkeypatch.setattr(client, "_get", lambda path, **query: seen.append((path, query)))
+    client.approval(7, timeout=3.0)
+    client.approval(8)
+    assert seen == [("/v1/approvals/7", {"timeout": 3.0}),
+                    ("/v1/approvals/8", {"timeout": None})]
+
+
 MALFORMED = {
     "16_digits": "discord:1234567890123456",
     "21_digits": "discord:123456789012345678901",
