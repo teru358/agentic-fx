@@ -506,7 +506,7 @@ web: 待受 <bind>:<port> / 公開 <範囲> / 認証 <none|basic>
 `<範囲>` は bind が loopback なら allow にかかわらず `自機のみ` とする。
 非 loopback では、`0.0.0.0/0` 以外の allow なら `許可範囲 <N> 件`、`allow = ["0.0.0.0/0"]` なら `到達できる全 IPv4` とする。N は allow の要素数であり、単一 IPv4 も CIDR も 1 件と数える。
 例は `web: 待受 192.168.1.10:8788 / 公開 許可範囲 3 件 / 認証 basic` である。
-要約 1 行は stderr へ出す。stdout は既存の `web: <stage>` と §5.4 の `web: reconfigured` の契約だけに使い、先頭語 `web:` が同じ要約と混ざらないようにする。
+要約 1 行だけを stderr に固定する。1 問の確認 prompt と §5.2 の質問 2〜8 の表示は既存の `ConsoleIO.ask()` の出力先 (stdout) を変えない。stdout に機械可読の契約を持つのは既存の `web: <stage>` と §5.4 の `web: reconfigured` の 2 行だけであり、先頭語 `web:` で始まる要約を stdout に出さないことで、この 2 行と混ざらないようにする。prompt の文は `web:` で始めない。
 要約に allow の個別要素、password の値、secret の有無と path を出さない。
 1 問の固定文は `この設定で有効化します。[1] このまま (既定) [2] 変更する` とする。
 空回答は「このまま」とする。EOF 又は明示取消しは何も書かずに rc 1 `setup_aborted` とする。
@@ -594,14 +594,17 @@ afx が稼働中でない場合と ops-web が active の場合は設定検査�
 `restricted` は `0.0.0.0/0` 以外の allow がある状態、`unrestricted` は明示値 `0.0.0.0/0`、`loopback-default` は loopback bind かつ allow 省略を表す。
 この行に allow の個別 IP、password、secret の存在又は path を出さない。
 
-設定を安全に解釈できない場合は `web-access: unavailable reason=<固定 reason>` とし、bind、port、allow、auth、path を一切出さない。固定 reason は次に限定する。
+設定を安全に解釈できない場合は `web-access: unavailable reason=<固定 reason>` とし、bind、port、allow、auth、path を一切出さない。reason は、`ops.toml` が無い場合の `not_configured` と、§5.2 と同じ共有 reader が §2.3 の G 層と C1〜C7 表で返す最終 reason 1 個 (§2.4 の集合、`config_dir_invalid`、`config_invalid`、`allow_required`、`secret_invalid`、`secret_missing`、`secret_unexpected` などの config / secret 系) に限る。status は probe をしないので、§2.4 の bind / listen 系 (`bind_failed`、`interface_lookup_failed` など) と `startup_internal_error` を出さない。status が secret を見るのは reader と同じ存在と安全性の検査だけであり、password の値を読まず、表示もしない。
 
 | 状態 | status 行 |
 |---|---|
 | stage 不在又は terminal `disable/disabled` で `ops.toml` も無い | `web-access: unavailable reason=not_configured` |
-| config dir は安全だが TOML 又は key grammar が不正 | `web-access: unavailable reason=config_invalid` |
-| config dir 又は `ops.toml` の owner、mode、symlink、型が不安全 | `web-access: unavailable reason=config_dir_invalid` |
-| terminal `enable/enabled` かつ設定が正常 | 上記の `bind=... allow=... auth=...` 形式 |
+| config dir は安全だが TOML 又は key grammar が不正 (G1、G3〜G7) | `web-access: unavailable reason=config_invalid` 等、G 層の最終 reason |
+| config dir 又は `ops.toml` の owner、mode、symlink、型が不安全 (G2) | `web-access: unavailable reason=config_dir_invalid` |
+| grammar は通るが組が不正 (C1〜C7、例: 非 loopback で allow 欠落、`auth = "basic"` で安全な password 無し) | `web-access: unavailable reason=allow_required` / `secret_missing` 等、C 表の最終 reason |
+| terminal `enable/enabled` かつ設定が正常 (C8) | 上記の `bind=... allow=... auth=...` 形式 |
+
+reason の集合と優先順は AC-12 の 4 入口対照で status も同じ fixture から検証する。status の reason は reader の結果をそのまま出すので、status 固有の reason 名や status 専用の分岐を持たない。
 
 未終端 enable / disable の既存 stage / unit 表示は旧契約を維持する。公開範囲行は live config を安全に検証できる場合だけ通常形式にし、検証できなければ unavailable 形式にする。
 
@@ -822,7 +825,7 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-27 | 生成 password が random 16 byte の padding なし base64url であり、§5.2 の前処理 (a) で live の `web.password` の rename と directory fsync が完了した後に 1 回だけ表示される。(a) の完了前の crash では表示されない。再実行、probe、status、stage、ログに現れず、再実行は再表示せず、既存 password の再利用か再生成かを利用者に明示選択させる。 | deterministic RNG fixture、22 byte grammar、(a) の rename / directory fsync と表示の順序 spy、再実行 transcript、出力 canary。 |
 | AC-28 | enable の前処理が (0) 一時 file 除去 → (a) secret → (b) config → probe → (c) `staged` の順に進み、`staged` の作成前に material を確定する。staging file と追加 phase は存在しない。live config と secret の atomic write は crash 前後に旧版又は新版の完全な file だけを残す。§5.2 の crash 点表の各点で、live の状態と production / probe の reason (`secret_unexpected` / `secret_missing` / 許可) と再実行の動作が表どおりになる。(a) 後 (b) 前の `none → basic` は再実行で none + remove 又は basic + 既存再利用 / 再生成 / 入力の明示選択となり、生成 password を再表示しない。(b) 後 (c) 前は flag 無しの再実行が要約を表示し、対話では 1 問の「このまま」だけで `staged` を作る。(0) は writer の一時 file 名に完全一致する実効 uid 所有の regular file だけを除去し、symlink / 他 uid / 非 regular の同名 entry では `secret_invalid` / `config_dir_invalid` で無変更停止する。非対話 input file は symlink、owner / type、config の mode `0644` accept / `0664` reject / `0666` reject、config size 上限、password の 15 / 16 / 128 / 129 byte、LF / CRLF、読取り中差替えの契約を守り、`--password-file` の path を stage と記録へ残さない。 | (0) の unlink / dir fsync、(a) の一時 file 作成 / file fsync / rename / dir fsync / unlink、表示、(b) の一時 file 作成 / file fsync / rename / dir fsync、probe、(c) の stage 書込みの各前後 fault injection と再実行 transcript、mode、file grammar 境界、production / probe reason。 |
 | AC-29 | `feature_config.py` の writer が port、bind、allow、auth を書き、再読取りで scalar 型、list 順序、値を保持する。単一 IPv4 allow の `/32` 意味も保持する。 | write → collect → write → read の round-trip。 |
-| AC-30 | `afx ops web status` が正常な enabled で固定形式の公開範囲 1 行を出し、限定 allow の個別 IP と password を出さない。未設定 disabled、不正 config、config dir 又は `ops.toml` の不安全 (symlink、他 uid、directory、mode `0664` / `0666`) では `web-access: unavailable reason=<固定 reason>` を出し、設定値や path を出さない。 | 未設定 disabled / `not_configured`、TOML 不正 / `config_invalid`、unsafe / `config_dir_invalid`、localhost / restricted / unrestricted / basic enabled の出力全文。 |
+| AC-30 | `afx ops web status` が正常な enabled で固定形式の公開範囲 1 行を出し、限定 allow の個別 IP と password を出さない。未設定 disabled、不正 config、config dir 又は `ops.toml` の不安全 (symlink、他 uid、directory、mode `0664` / `0666`)、組の不正 (非 loopback で allow 欠落、`auth = "basic"` で password 無し) では `web-access: unavailable reason=<固定 reason>` を出し、設定値や path を出さない。reason は共有 reader の最終 reason と一致する。 | 未設定 disabled / `not_configured`、TOML 不正 / `config_invalid`、unsafe / `config_dir_invalid`、allow 欠落 / `allow_required`、password 無し / `secret_missing`、localhost / restricted / unrestricted / basic enabled の出力全文。 |
 | AC-31 | T1 単独版は localhost 又は非空の限定 allow 付き LAN だけを起動する。singleton `0.0.0.0/0` と `auth = "basic"` は優先順位どおり `unrestricted_not_supported` / `auth_not_supported`、`0.0.0.0/0` と他 network の混在は先に `config_invalid` で拒否し、production と probe が同じ固定 reason / rc 71 を返す。 | T1 artifact の production 起動と probe、mixed-unrestricted の順序違いの直積。 |
 | AC-32 | `0.0.0.0` bind、IPv6 bind / allow、proxy header による peer 上書き、新しい変更 route が存在しない。 | schema、route 一覧、`_Slot` の peer 判定入力の pin。 |
 | AC-33 | T1 / T2 の `FeaturePlan` の許可 secret 名は常に `{"web.password"}` で、必須集合は検証済み auth だけから決まる。T1 の none でも dir 不在を許可し、存在時は検査済み dir fd から残骸と未知 entry を判定する。 | T1 / T2 plan object、openat spy、auth / dir / entry 直積。 |
@@ -993,3 +996,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-23 | v0.6 | enable 前処理を `staged` の前に完結させ (secret → config → probe → `staged`、crash 点ごとの再実行と一時 file 除去)、生成 password の表示を (a) の後 1 回に定義し、G2 を `ops.toml` の filesystem 安全性まで広げて `config_dir_invalid` に統一し、interface 列挙を bounded `ip -j addr show up` に変え (iproute2 前提)、`--config-file` の group / other writable を拒否し、enable の入口表を追加し、AC-37 / AC-38 の行を除去し、port 競合と iproute2 依存を残余リスクに加えた。 | 設計レビュー 5 周目 sol、High 1 / Medium 3 / Low 3 全採用。 | — |
 | 2026-10-23 | v0.7 | command を `afx ops <feature> <verb>` (web は enable / disable / reconfigure / status、`reconf` は別名) に改め、旧形の別名を CLI 整理 spec (7) に委ねた。enable で既存設定の要約 1 行と「このまま / 変更する」の 1 問を出すようにした (非対話は要約だけ)。afx、鍵、enable の stage に触れない `afx ops web reconfigure` (§5.4: 読み取りだけの入口照合、setup lock、ops-web だけの stop / start、rollback なし、crash 点表) を T2 に加え、入口表に reconfigure 列、AC-41〜AC-48 と mutation 8 個、§8.1 の #8 / #9、§12 の 2 行を加え、§11 の稼働中再設定を外した。 | ユーザー裁定 C' とコマンド階層 (2026-10-23 22:12)。 | — |
 | 2026-10-23 | v0.8 | reconfigure の手順 (3) の各 probe の前と手順 (4) の start の前に ops-web を止め直し (手順 (4) は stop → `is_stopped` → `reset-failed` → start)、start 失敗時に afx を観測し直すようにした。`afx ops <feature> disable` にも setup lock を取らせた。terminal enabled の enable で stage を probe より先に判定し、`installed` へ戻す前に副作用の無い設定検査を加えた (AC-49)。`ops.toml` の writer 所有の共通 key (`instance_root`、`key_dir`) を §2.1 と G3a / G3b に加え、`--config-file` を web の 4 key に限った。AC-12 に本体 reader を 4 入口目として加えた。入口照合を daemon_reload なし (file 比較と `NeedDaemonReload`) にし、`resolve_ops_exec`、他 feature の未終端操作と marker、鍵の状態ごとの reason と案内を定めた。要約を `許可範囲 <N> 件`、loopback は `自機のみ`、stderr 出力に改めた。§10.1 の CLI を `entry.py` に直し、merge 順を §10.2 に書いた。mutation 4 個を加え、§12 の「reconfigure 途中の enable」行を削除した。 | 設計レビュー 6 周目 opus、High 1 / Medium 3 / 吸収可 6 を全採用。収束: 残りは差分の閉鎖確認 1 本。 | — |
+| 2026-10-24 | v0.9 | §5.3 の status reason を「`not_configured` + 共有 reader が返す G 層 / C1〜C7 の最終 reason」に広げ、`secret_missing` / `allow_required` を含む表と AC-30 の観測点を追加した。§5.2 の要約の出力先を「要約だけ stderr、prompt は既存 `ConsoleIO` の stdout のまま」に狭めた。 | 差分閉鎖確認 (codex terra) の Medium 1 (§5.3 の限定列挙が AC-12 の 4 入口同一 reason と矛盾) と Low 1 (stdout 契約が対話 prompt と衝突) | |
