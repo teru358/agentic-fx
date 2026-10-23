@@ -2,14 +2,14 @@
 id: improve-new-candidate-metric-reference-set-freeze
 title: 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する
 status: 設計待ち
-priority: 低
+priority: 中
 opened: 2026-10-22
 closed: null
 related: [improve-objective-filtered-signal-quality]
 ---
 # [improve-new-candidate-metric-reference-set-freeze] 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-objective-filtered-signal-quality]
 ## 経緯
 
 - 2026-10-22: 起票。
+- 2026-10-23: 優先: 中 — 2026-10-23 棚卸し: 10/24 の改善周から方向性指標の観測を始めるため中へ

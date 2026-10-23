@@ -1,17 +1,17 @@
 ---
 id: legacy-e2e-egress
 title: codex 子プロセスが apps 無効でも chatgpt.com に接続する
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: 2026-08-30
-closed: null
+closed: 2026-10-23
 related: []
 backfilled: true
 source_section: 未完了
 ---
 # [legacy-e2e-egress]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 見送り / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +21,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: codex 子プロセスが apps 無効でも chatgpt.com に接続する — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): --disable apps でも ×1 接続が残る (2026-08-30 実測)、停止手段の調査待ち。 根拠: codex_runner.py:63 で --disable apps は指定済みだが、chatgpt.com への TCP 443 が出る件は strace 実測のみで再確認が要る。停止手段の調査が決め手。
+- 2026-10-23: 見送り理由 — 前提の llama_swap 経路が無く、codex は chatgpt 専用に固定された

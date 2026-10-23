@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 低
 opened: 2026-10-13
 closed: null
-related: []
+related: [ops-ac25-decision-lane-test-race]
 ---
 # [ops-decision-lane-ac25-timing-flake] tests/ops の ac25 が負荷下で timing flake
 
@@ -29,3 +29,4 @@ job 完了を固定 sleep で待っている。CPU 負荷で完了が遅れる�
 
 - 2026-10-13: 起票。
 - 2026-10-15: 優先: 低 — 2026-10-15: 単独実行 (pytest <file>::test_ac25…) では worktree でも main でも毎回失敗 (0.4 秒で)、tests/ops 全体の束では通る → timing でなく順序依存 (前の test が作る状態に依存)。単独で赤・束で緑は組で二分して特定する (メモリ monkeypatch-over-autouse-patch-leaks-mock と同型の疑い)
+- 2026-10-23: 関連: [ops-ac25-decision-lane-test-race] — 重複チケット ops-ac25-decision-lane-test-race を本件に統合 (2026-10-23 棚卸し)

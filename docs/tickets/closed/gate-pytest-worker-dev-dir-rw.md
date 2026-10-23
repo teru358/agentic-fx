@@ -1,15 +1,15 @@
 ---
 id: gate-pytest-worker-dev-dir-rw
 title: gate pytest worker が /dev をディレクトリ単位 read_write で許している
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: 2026-10-09
-closed: null
+closed: 2026-10-23
 related: [sandbox-escape-via-user-daemons-unmeasured]
 ---
 # [gate-pytest-worker-dev-dir-rw] gate pytest worker が /dev をディレクトリ単位 read_write で許している
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 見送り / **優先**: 低
 
 ## 現象
 
@@ -24,3 +24,4 @@ plugin/gate_pytest_worker.py の Landlock 規則は /dev 全体を read_write �
 ## 経緯
 
 - 2026-10-09: 起票。
+- 2026-10-23: 見送り理由 — gate-pytest-dev-writable-and-ldso-exec (高) と同じ対象。そちらに統合

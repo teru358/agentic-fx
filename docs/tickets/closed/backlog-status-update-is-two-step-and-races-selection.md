@@ -1,15 +1,15 @@
 ---
 id: backlog-status-update-is-two-step-and-races-selection
 title: backlog reject/reopen/note が SELECT 後の更新で選択と競合する
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-10-03
-closed: null
+closed: 2026-10-23
 related: []
 ---
 # [backlog-status-update-is-two-step-and-races-selection] backlog reject/reopen/note が SELECT 後の更新で選択と競合する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,6 +23,9 @@ commands.py:263-276 は状態を SELECT してから set_status する 2 段。�
 
 ## 修正内容
 
+- 2026-10-23: store/backlog.py transition() が条件付き UPDATE (SELECT 後の更新ではない) になり、選択との競合が構造的に消えた
+
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-23: 是正内容 — store/backlog.py transition() が条件付き UPDATE (SELECT 後の更新ではない) になり、選択との競合が構造的に消えた

@@ -2,14 +2,14 @@
 id: tracked-files-contain-author-home-path
 title: 追跡ファイルに作者のホームの絶対パスが残る
 status: 設計待ち
-priority: 低
+priority: 中
 opened: 2026-10-02
 closed: null
 related: []
 ---
 # [tracked-files-contain-author-home-path] 追跡ファイルに作者のホームの絶対パスが残る
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 中
 
 ## 現象
 
@@ -26,3 +26,4 @@ related: []
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-23: 優先: 中 — 2026-10-23 棚卸し: 追跡ファイルに /home/<user> が 6 件。公開前に要掃除なので中へ

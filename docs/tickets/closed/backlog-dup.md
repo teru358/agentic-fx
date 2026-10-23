@@ -1,17 +1,17 @@
 ---
 id: backlog-dup
 title: backlog に実質同じ案が重複して溜まる
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: null
-closed: null
+closed: 2026-10-23
 related: [backlog-dedup-miss]
 backfilled: true
 source_section: 未完了
 ---
 # [backlog-dup]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 見送り / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +21,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: backlog に実質同じ案が重複して溜まる — 仕分け (2026-10-02、現物で成立を確認): 重複検出は未設計、discoveries 由来の #12/#13 などが重複。 根拠: store/backlog.py:23 と improve_loop.py:1404 の idea_norm は strip().lower() のみで表記揺れを吸収しない。
+- 2026-10-23: 見送り理由 — 重複の発生経路だった discoveries 由来の open 行が IQ-T1 で廃止された。残る構造的重複は candidates-converge-to-example-sma (是正済) と improve-duplicate-self-computed-strategies で扱う

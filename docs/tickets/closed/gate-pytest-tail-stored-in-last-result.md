@@ -1,15 +1,15 @@
 ---
 id: gate-pytest-tail-stored-in-last-result
 title: gate の pytest 出力末尾が次回の改善 mission の材料になる
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-23
 related: []
 ---
 # [gate-pytest-tail-stored-in-last-result] gate の pytest 出力末尾が次回の改善 mission の材料になる
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -25,6 +25,9 @@ _finalize_gate_failed が gate_failed:pytest failed: {stdout_tail} と str(exc) 
 
 ## 修正内容
 
+- 2026-10-23: IQ-T1 の improve_context.py project_last_result が last_result を固定語彙に畳むため、pytest 出力の末尾は agent に届かない (DB には原文が残るが agent 面には出ない)
+
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-23: 是正内容 — IQ-T1 の improve_context.py project_last_result が last_result を固定語彙に畳むため、pytest 出力の末尾は agent に届かない (DB には原文が残るが agent 面には出ない)

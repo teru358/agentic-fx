@@ -1,15 +1,15 @@
 ---
 id: full-suite-fd-over-1024-breaks-shell-tests
 title: 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-10-02
-closed: null
+closed: 2026-10-23
 related: [supervisor-cleanup-test-leaks-36-fds]
 ---
 # [full-suite-fd-over-1024-breaks-shell-tests] 全体テストで fd が 1024 を超え shell 系 10 件と init 1 件が落ちる
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -25,8 +25,11 @@ shell 系: 長い実行でテストが fd を閉じずに溜め、番号が 1024
 
 ## 修正内容
 
+- 2026-10-23: shell 系 10 件は 10/03 の poll 化で解消。残りは supervisor-cleanup-test-leaks-36-fds と test-init-offline-unreachable-bridge-flake に分割済み
+
 ## 経緯
 
 - 2026-10-02: 起票。
 - 2026-10-03: 関連: [supervisor-cleanup-test-leaks-36-fds] — 2026-10-03: shell 系は shell.py の select.poll 化で解消 (fd 1100 超での pin テスト追加)。残は init 系 (実 bridge :8812 依存、test-init-offline-unreachable-bridge-flake) と fd 増加の元 (supervisor-cleanup-test-leaks-36-fds)。
 - 2026-10-03: 関連: [supervisor-cleanup-test-leaks-36-fds] — 2026-10-03: shell 系は shell.py の select.poll 化で解消 (fd 1100 超での pin テスト追加)。残は init 系 (実 bridge :8812 依存、test-init-offline-unreachable-bridge-flake) と fd 増加の元 (supervisor-cleanup-test-leaks-36-fds)。
+- 2026-10-23: 是正内容 — shell 系 10 件は 10/03 の poll 化で解消。残りは supervisor-cleanup-test-leaks-36-fds と test-init-offline-unreachable-bridge-flake に分割済み

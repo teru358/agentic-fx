@@ -1,15 +1,15 @@
 ---
 id: manual-improve-runs-synchronously-on-caller-thread
 title: 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する
-status: 設計待ち
+status: 是正済
 priority: 中
 opened: 2026-10-03
-closed: null
+closed: 2026-10-23
 related: []
 ---
 # [manual-improve-runs-synchronously-on-caller-thread] 手動 improve が呼び出し元のスレッドで mission 全体を同期実行する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,6 +23,9 @@ ImproveSupervisor.submit_manual (core/improve_supervisor.py:117-143) は mission
 
 ## 修正内容
 
+- 2026-10-23: ops/service.py の improve が job 化され (同時 1 本)、呼び出し元スレッドで mission を回さない
+
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-23: 是正内容 — ops/service.py の improve が job 化され (同時 1 本)、呼び出し元スレッドで mission を回さない

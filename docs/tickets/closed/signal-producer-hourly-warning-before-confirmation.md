@@ -1,16 +1,16 @@
 ---
 id: signal-producer-hourly-warning-before-confirmation
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: 2026-09-29
-closed: null
+closed: 2026-10-23
 related: []
 backfilled: true
 source_section: 未完了
 ---
 # [signal-producer-hourly-warning-before-confirmation]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 見送り / **優先**: 低
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +19,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-23: 見送り理由 — signal-producer-evaluates-before-bar-arrives と同じ原因 (確定前評価)。そちらに統合

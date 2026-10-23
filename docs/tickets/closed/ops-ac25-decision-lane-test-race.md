@@ -1,15 +1,15 @@
 ---
 id: ops-ac25-decision-lane-test-race
 title: ops ac25 決定レーン試験が順序窓で不安定
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: 2026-10-10
-closed: null
+closed: 2026-10-23
 related: []
 ---
 # [ops-ac25-decision-lane-test-race] ops ac25 決定レーン試験が順序窓で不安定
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 見送り / **優先**: 低
 
 ## 現象
 
@@ -24,3 +24,4 @@ tests/ops/test_ac09_25_26_decision_lane.py::test_ac25_job_completes_without_poll
 ## 経緯
 
 - 2026-10-10: 起票。
+- 2026-10-23: 見送り理由 — ops-decision-lane-ac25-timing-flake と重複。そちらに統合

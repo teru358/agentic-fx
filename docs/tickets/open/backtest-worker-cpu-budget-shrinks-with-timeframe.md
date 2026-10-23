@@ -1,7 +1,7 @@
 ---
 id: backtest-worker-cpu-budget-shrinks-with-timeframe
 status: 設計待ち
-priority: 高
+priority: 中
 opened: 2026-09-20
 closed: null
 related: [product-vision-grown-by-its-user]
@@ -10,7 +10,7 @@ source_section: 未完了
 ---
 # [backtest-worker-cpu-budget-shrinks-with-timeframe]
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 設計待ち / **優先**: 中
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +19,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-23: 優先: 中 — 2026-10-23 棚卸し: 症状は cpu_limit 分類で読め、暫定値 120 で運用中。高 → 中
