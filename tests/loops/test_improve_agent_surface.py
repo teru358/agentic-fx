@@ -175,7 +175,8 @@ def test_ac13b_family_section_reads_only_the_narrow_surface(conn, tmp_path):
     assert set(archives.family_attempt_projection(conn)[0]) == {
         "family_key", "outcome_class", "created_at"}
     section = ctx_data["improvement_history"]["family_attempts"]
-    assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted"}
+    assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted",
+                          "invalid_name_count"}
     for row in section["rows"]:
         assert set(row) == {
             "family_key", "attempts", "outcomes", "last_attempt_month",

@@ -887,9 +887,8 @@ class ImproveLoop:
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
             "pin_broken_strategies": pin_broken_line,
-            "family_attempts": render_family_attempts(hist.get(
-                "family_attempts",
-                {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0})),
+            "family_attempts": render_family_attempts(
+                hist["family_attempts"]),
             "backlog_table": (
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])

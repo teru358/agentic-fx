@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 from agentic_fx.plugin.logic_identity import (
@@ -179,12 +180,11 @@ PublicOutcome = Literal[
     "not_submitted", "duplicate", "pending", "approved",
     "rejected_by_human", "expired", "invalidated", "revoked",
     "unclassified"]
-PUBLIC_OUTCOMES: tuple[str, ...] = (
-    "not_submitted", "duplicate", "pending", "approved", "rejected_by_human",
-    "expired", "invalidated", "revoked", "unclassified")
+# 公開語彙の正本は `PublicOutcome` 1 つ。表示順は宣言順。
+PUBLIC_OUTCOMES: tuple[str, ...] = get_args(PublicOutcome)
 # 保存値 -> 公開値。表に無い値は `unclassified` (fail-closed)。3 内部状態
 # (unprofitable / insufficient_trades / gate_failed) は同じ語に畳む。
-_OUTCOME_PROJECTION: dict[str, str] = {
+_OUTCOME_PROJECTION: dict[str, PublicOutcome] = {
     "not_submitted": "not_submitted", "unprofitable": "not_submitted",
     "insufficient_trades": "not_submitted", "gate_failed": "not_submitted",
     "noop_copy": "not_submitted", "family_redirect": "not_submitted",
@@ -192,7 +192,7 @@ _OUTCOME_PROJECTION: dict[str, str] = {
     "pending": "pending", "approved": "approved",
     "rejected_by_human": "rejected_by_human", "expired": "expired",
     "invalidated": "invalidated", "revoked": "revoked"}
-UNCLASSIFIED_OUTCOME = "unclassified"
+UNCLASSIFIED_OUTCOME: PublicOutcome = "unclassified"
 
 UNKNOWN_FAMILY_LABEL = "族不明"
 UNDEPLOYED_DEPENDENCY_LABEL = "未配備指標"
@@ -203,15 +203,33 @@ _FAMILY_SECTION_HEADING = "## 仮説族の試行状況"
 _FAMILY_PLACEHOLDER = "{family_attempts}"
 
 
-def family_section_fixed_bytes() -> int:
-    """prompt template の族別節のうち、動的な表を除く固定部分 (見出し・
-    基準文面・改行) の byte 数。節全体の上限から差し引く。"""
-    template = (Path(__file__).resolve().parent / "prompts"
-                / "improve_mission.md").read_text()
-    start = template.index(_FAMILY_SECTION_HEADING)
+_TEMPLATE_PATH = (Path(__file__).resolve().parent / "prompts"
+                  / "improve_mission.md")
+
+
+@lru_cache(maxsize=1)
+def _mission_template() -> str:
+    return _TEMPLATE_PATH.read_text()
+
+
+def family_section_fixed_bytes_of(template: str) -> int:
+    """template の族別節のうち、動的な表を除く固定部分 (見出し・基準文面・
+    改行) の byte 数。節の開始見出し、`{family_attempts}`、次の節見出しの
+    すべてが揃わなければ ValueError。"""
+    start = template.find(_FAMILY_SECTION_HEADING)
+    if start == -1:
+        raise ValueError("族別節の見出しが template に無い")
     end = template.find("\n## ", start + 1)
-    body = template[start:end if end != -1 else len(template)]
+    if end == -1:
+        raise ValueError("族別節の次の見出しが template に無い")
+    body = template[start:end]
+    if _FAMILY_PLACEHOLDER not in body:
+        raise ValueError("族別節に差し込み位置が無い")
     return len(body.replace(_FAMILY_PLACEHOLDER, "").encode("utf-8"))
+
+
+def family_section_fixed_bytes() -> int:
+    return family_section_fixed_bytes_of(_mission_template())
 
 
 class FamilyAttemptSummary(TypedDict):
@@ -235,9 +253,10 @@ class FamilyAttemptSection(TypedDict):
     rows: list[FamilyAttemptSummary]
     unkeyed_deployed: list[UnkeyedDeployedSummary]
     entries_omitted: int
+    invalid_name_count: int
 
 
-def project_outcome(raw: object) -> str:
+def project_outcome(raw: object) -> PublicOutcome:
     """台帳の `outcome_class` を公開語彙の 1 語に投影する。"""
     if not isinstance(raw, str):
         return UNCLASSIFIED_OUTCOME
@@ -358,6 +377,8 @@ def render_family_attempts(section: FamilyAttemptSection) -> str:
                       + "\n".join(_family_row_line(r) for r in other_rows))
     if section["entries_omitted"]:
         blocks.append(f"他 {section['entries_omitted']} 件を省略")
+    if section["invalid_name_count"]:
+        blocks.append(f"規則外の配備名 {section['invalid_name_count']} 件")
     return "\n\n".join(blocks) if blocks else "(なし)"
 
 
@@ -420,7 +441,7 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
         + [("row", r) for r in undeployed_rows])
     unknown_row = (_summary(UNKNOWN_FAMILY_LABEL, unknown, [])
                    if unknown["attempts"] else None)
-    total = len(ordered) + (1 if unknown_row else 0) + skipped
+    total = len(ordered) + (1 if unknown_row else 0)
 
     def _assemble(picked: list[tuple[str, Any]]) -> FamilyAttemptSection:
         rows = [item for tag, item in picked if tag == "row"]
@@ -430,7 +451,8 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
         return {"rows": rows,
                 "unkeyed_deployed": [item for tag, item in picked
                                      if tag == "unkeyed"],
-                "entries_omitted": total - shown}
+                "entries_omitted": total - shown,
+                "invalid_name_count": skipped}
 
     budget = FAMILY_SECTION_MAX_BYTES - family_section_fixed_bytes()
     picked: list[tuple[str, Any]] = []
@@ -461,23 +483,6 @@ def deployed_families(metas: "list[Any]") -> list[dict]:
     return sorted(out, key=lambda f: (f["kind"], f["name"]))
 
 
-def deployed_families_text(families: list[dict]) -> str:
-    """prompt に差し込む仮説族の一覧。名前と構成のみで、成績は含まない。"""
-    if not families:
-        return "(なし)"
-    lines = []
-    for f in families:
-        timeframe = f["timeframe"] or "-"
-        if f["kind"] == "strategy":
-            indicators = ", ".join(f["indicators"]) or "(なし)"
-            pairs = ", ".join(f["pairs"]) or "-"
-            lines.append(f"- {f['name']} (strategy): indicators=[{indicators}], "
-                         f"timeframe={timeframe}, pairs={pairs}")
-        else:
-            lines.append(f"- {f['name']} (indicator): timeframe={timeframe}")
-    return "\n".join(lines)
-
-
 def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
                        root: Path, *,
                        inventory_view: dict | None = None,
@@ -496,20 +501,26 @@ def _current_inventory(conn: "sqlite3.Connection", settings: "Settings",
              "params": p["params"], "outputs": p["outputs"],
              "content_hash": p["content_hash"]}
             for p in inventory_view["plugins"]]
+        plugins = None
     else:
         plugins = approved_plugins(conn, root / "plugins",
                                    settings=settings).inventory.metas
-        if inventory_metas is None:
-            inventory_metas = list(plugins)
         plugin_summaries = [
             {"name": p.name, "kind": p.kind, "pairs": list(p.pairs),
              "params": p.params,
              "outputs": (list(p.outputs) if p.outputs is not None else None),
              "content_hash": p.content_hash} for p in plugins]
+    if inventory_metas is None:
+        # 配備済み族の源。view の plugin には足と依存が無いので、metas が
+        # 渡されない経路は承認済み plugin から作る。
+        inventory_metas = list(
+            plugins if plugins is not None
+            else approved_plugins(conn, root / "plugins",
+                                  settings=settings).inventory.metas)
     sources = news_sources.list_all(conn)
     return {
         "approved_plugins": plugin_summaries,
-        "deployed_families": deployed_families(inventory_metas or []),
+        "deployed_families": deployed_families(inventory_metas),
         "news_sources": [{"name": s["name"], "enabled": s["enabled"]}
                          for s in sources],
         "risk_gate": settings.risk.model_dump(),

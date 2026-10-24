@@ -8,7 +8,7 @@ import pytest
 
 from agentic_fx.config import load_settings
 from agentic_fx.loops.improve_context import (
-    build_improve_context, deployed_families, deployed_families_text)
+    build_improve_context, deployed_families, render_family_attempts)
 from agentic_fx.loops.improve_loop import ImproveLoop
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.plugin.loader import IndicatorRef, PluginMeta
@@ -163,7 +163,10 @@ def test_deployed_families_list_names_and_composition_only(tmp_path):
 
 
 def test_deployed_families_empty_is_explicit():
-    assert deployed_families_text(deployed_families([])) == "(なし)"
+    empty = {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0,
+             "invalid_name_count": 0}
+    assert deployed_families([]) == []
+    assert render_family_attempts(empty) == "(なし)"
 
 
 # --- AC-17 -----------------------------------------------------------------

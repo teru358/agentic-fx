@@ -17,6 +17,7 @@ from typing import Any, Collection, Iterable
 import yaml
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.plugin.loader import _PLUGIN_NAME_RE
 
 # hash の算法の版。規則を変えたら上げ、保存済みの hash は migration が
 # 接頭辞の違う行を再計算する。
@@ -153,17 +154,18 @@ def logic_hash_of(plugin_py: str, config_yaml: str) -> str | None:
 
 DEFAULT_FAMILY_TIMEFRAME = "1h"
 FAMILY_KEY_MAX_BYTES = 512
-_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _PAIR_RE = re.compile(r"[A-Z]{6}")
 
 
 def family_key_from_parts(kind: Any, name: str, timeframe: Any,
                           pairs: Iterable[Any],
                           indicator_names: Iterable[Any]) -> str | None:
-    """仮説族 key を作る唯一の関数。値は検査せず、保存値と byte 互換に作る。
+    """仮説族 key を作る唯一の関数。値は検査せずに作る。
 
     indicator は名前 + 足、strategy は依存 indicator 名の集合 + 足 + pair 集合
-    (依存が空なら None)。timeframe が None のときは `1h`。集合は
+    (依存が空なら None)。timeframe が None のときは `1h`。明示的な `timeframe: null` の
+    indicator だけは旧実装の `@None` から `@1h` に値が変わる (現データに
+    該当行は 0)。集合は
     `sorted(set(str(x)))` を `,` で結ぶので、宣言順や重複は key に影響しない。"""
     tf = DEFAULT_FAMILY_TIMEFRAME if timeframe is None else str(timeframe)
     if kind == "indicator":
@@ -188,7 +190,7 @@ def _family_key(config: Any, *, name: str) -> str | None:
 
 def is_plain_name(value: Any) -> bool:
     """plugin 名の字句文法。"""
-    return isinstance(value, str) and _NAME_RE.fullmatch(value) is not None
+    return isinstance(value, str) and _PLUGIN_NAME_RE.fullmatch(value) is not None
 
 
 def is_plain_pair(value: Any, allowed_pairs: Collection[str]) -> bool:

@@ -522,7 +522,8 @@ def test_ac8_metric_canaries_never_reach_context_or_prompt(conn, tmp_path):
 def test_ac8_family_rows_have_exactly_the_public_keys(conn, tmp_path):
     _plant(conn, "indicator:rsi@1h")
     section = _section(conn, tmp_path, metas=[_meta("rsi", "indicator")])
-    assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted"}
+    assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted",
+                          "invalid_name_count"}
     for row in section["rows"]:
         assert set(row) == {"family_key", "attempts", "outcomes",
                             "last_attempt_month", "deployed",
@@ -646,3 +647,100 @@ def test_prompt_places_the_family_section_between_history_and_inventory(
             < text.index("## 現行構成"))
     assert "## 配備済みの仮説族" not in text
     assert "{family_attempts}" not in text
+
+
+# --- 公開語彙、名前文法、template 境界、配備源 -----------------------------------
+
+def test_public_outcome_vocabulary_has_one_source():
+    from typing import get_args
+    from agentic_fx.loops.improve_context import (
+        _OUTCOME_PROJECTION, UNCLASSIFIED_OUTCOME, PublicOutcome)
+    assert PUBLIC_OUTCOMES == get_args(PublicOutcome)
+    assert set(_OUTCOME_PROJECTION.values()) <= set(PUBLIC_OUTCOMES)
+    assert UNCLASSIFIED_OUTCOME in PUBLIC_OUTCOMES
+    assert project_outcome("no-such-outcome") == UNCLASSIFIED_OUTCOME
+
+
+def test_plugin_name_grammar_is_the_loader_object():
+    from agentic_fx.plugin import loader, logic_identity
+    assert logic_identity._PLUGIN_NAME_RE is loader._PLUGIN_NAME_RE
+    assert not hasattr(logic_identity, "_NAME_RE")
+    assert logic_identity.is_plain_name("a" * 64)
+    assert not logic_identity.is_plain_name("a" * 65)
+    assert not logic_identity.is_plain_name("rsi\n")
+
+
+def test_family_key_from_parts_documents_the_null_timeframe_change():
+    from agentic_fx.plugin import logic_identity
+    key = logic_identity.family_key_from_parts("indicator", "x", None, [], [])
+    assert key == "indicator:x@1h"
+    assert "byte 互換" not in (logic_identity.family_key_from_parts.__doc__
+                              or "")
+
+
+def test_family_section_fixed_bytes_matches_the_template_and_is_cached():
+    template = improve_context._mission_template()
+    assert improve_context._mission_template() is template
+    start = template.index("## 仮説族の試行状況")
+    end = template.index("\n## ", start + 1)
+    expected = len(template[start:end].replace(
+        "{family_attempts}", "").encode("utf-8"))
+    assert improve_context.family_section_fixed_bytes() == expected
+    assert improve_context.family_section_fixed_bytes_of(template) == expected
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda t: t.replace("## 仮説族の試行状況", "## 仮説族の状況"),
+    lambda t: t.replace("{family_attempts}", ""),
+    lambda t: t.split("\n## 現行構成")[0],
+])
+def test_family_section_boundaries_must_all_be_found(mutate):
+    template = improve_context._mission_template()
+    mutated = mutate(template)
+    assert mutated != template
+    with pytest.raises(ValueError):
+        improve_context.family_section_fixed_bytes_of(mutated)
+
+
+def test_render_mission_prompt_requires_the_family_attempts_key(
+        conn, tmp_path):
+    ctx_data = _context(conn, tmp_path)
+    del ctx_data["improvement_history"]["family_attempts"]
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = _settings()
+    with pytest.raises(KeyError):
+        loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx(tmp_path))
+
+
+class _Plugins:
+    def __init__(self, metas):
+        self.inventory = type("Inv", (), {"metas": tuple(metas)})()
+
+
+@pytest.mark.parametrize("with_view", [True, False])
+def test_deployed_indicators_survive_when_inventory_metas_is_omitted(
+        conn, tmp_path, monkeypatch, with_view):
+    metas = [_meta("rsi", "indicator")]
+    monkeypatch.setattr(improve_context, "approved_plugins",
+                        lambda *a, **k: _Plugins(metas))
+    _plant(conn, "indicator:rsi@1h")
+    kwargs = ({"inventory_view": {"plugins": [], "pin_broken_strategies": []}}
+              if with_view else {})
+    ctx = build_improve_context(
+        conn, settings=_settings(), now=NOW, root=tmp_path,
+        allowed_backlog_ids=None, **kwargs)
+    rows = _rows(ctx["improvement_history"]["family_attempts"])
+    assert rows["indicator:rsi@1h"]["deployed"] == "yes"
+    assert "indicator (未配備) @1h" not in rows
+
+
+def test_invalid_deployed_names_are_counted_apart_from_budget_omission(
+        conn, tmp_path):
+    metas = [_meta("rsi", "indicator"), _meta("Bad-Name", "indicator")]
+    section = _section(conn, tmp_path, metas=metas)
+    assert section["entries_omitted"] == 0
+    assert section["invalid_name_count"] == 1
+    text = render_family_attempts(section)
+    assert "規則外の配備名 1 件" in text
+    assert "件を省略" not in text
+    assert "Bad-Name" not in text

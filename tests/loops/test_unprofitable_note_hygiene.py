@@ -506,7 +506,9 @@ def _sample_ctx_data_with_origin():
             "window_days": [30, 90], "win_rate": 0.5, "profit_factor": 1.2,
             "by_pair": {"USDJPY": 0.4}, "by_hour": {"9": 0.3},
             "reject_breakdown": {"spread": 2}, "hold_rate": 0.1},
-        "improvement_history": {"recent_runs": []},
+        "improvement_history": {
+            "family_attempts": {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0, "invalid_name_count": 0}, 
+            "recent_runs": []},
         "current_inventory": {
             "approved_plugins": [], "news_sources": [],
             "risk_gate": {"max_positions": 3}},
