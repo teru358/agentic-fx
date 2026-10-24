@@ -87,7 +87,7 @@ EXPECTED = (
     ('analyze corr', G.RESEARCH, "LOCAL", 'afx analyze corr …', None, "CHANGE", False, False, None, None, False, None),
     ('ctl ask', G.GUIDANCE, "CTL", 'afx ctl ask <question>', 'ask <質問>', "CHANGE", False, False, 'operate', 'ask', True, None),
     ('ctl improve', G.GUIDANCE, "CTL", 'afx ctl improve', 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
-    ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'backlog add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
+    ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'improve add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
     ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit N]', None, "READ", False, False, 'guidance.read', 'backlog_list', True, None),
     ('ctl backlog reject', G.GUIDANCE, "CTL", 'afx ctl backlog reject <id>', 'backlog reject <id>', "CHANGE", False, False, 'operate', 'backlog_reject', True, None),
     ('ctl backlog reopen', G.GUIDANCE, "CTL", 'afx ctl backlog reopen <id>', 'backlog reopen <id>', "CHANGE", False, False, 'operate', 'backlog_reopen', True, None),
@@ -112,8 +112,8 @@ EXPECTED = (
     ('ctl approve', G.PLUGIN, "CTL", 'afx ctl approve <id>', 'approve <id>', "CHANGE", True, True, 'decide', 'approve', True, None),
     ('ctl reject', G.PLUGIN, "CTL", 'afx ctl reject <id> [reason]', 'reject <id> [理由]', "CHANGE", True, True, 'decide', 'reject', True, None),
     ('ctl approval retry', G.PLUGIN, "CTL", 'afx ctl approval retry <id>', 'approval retry <id>', "CHANGE", True, True, 'decide', 'retry', True, None),
-    ('ctl killswitch reset', G.RECOVERY, "CTL", 'afx ctl killswitch reset', 'killswitch reset', "READ", False, False, 'status.read', 'killswitch_reset', True, None),
-    ('ctl killswitch reset generation', G.RECOVERY, "CTL", 'afx ctl killswitch reset <generation>', 'killswitch reset <世代>', "CHANGE", True, True, 'local_guard', 'killswitch_reset', True, None),
+    ('ctl killswitch reset', G.RECOVERY, "CTL", 'afx ctl killswitch reset', 'killswitch reset', "READ", False, False, 'status.read', 'status', True, None),
+    ('ctl killswitch reset', G.RECOVERY, "CTL", 'afx ctl killswitch reset <generation>', 'killswitch reset <世代>', "CHANGE", True, True, 'local_guard', 'killswitch_reset', True, None),
     ('ctl killswitch reconcile', G.RECOVERY, "CTL", 'afx ctl killswitch reconcile [confirm]', 'killswitch reconcile [confirm]', "CHANGE", True, True, 'local_guard', 'killswitch_reconcile', True, None),
     ('ctl data resume', G.RECOVERY, "CTL", 'afx ctl data resume [--acknowledge]', 'data resume [--acknowledge]', "CHANGE", True, True, 'local_guard', 'data_resume', True, None),
     ('stop', None, "CTL", 'afx stop', 'stop', "CHANGE", False, False, None, None, False, None),
@@ -167,13 +167,52 @@ def test_record_summaries_carry_the_table_notes():
 def test_endpoint_codes_and_scopes_agree_with_the_service_table():
     from agentic_fx.ops.service import ENDPOINTS
 
-    codes = [record.endpoint_code for record in cli_surface.COMMANDS if record.endpoint_code]
     for record in cli_surface.COMMANDS:
         code = record.endpoint_code
-        if code is None or codes.count(code) != 1 or code not in ENDPOINTS:
+        if code is None:
+            assert record.scope is None, record.usage
             continue
-        assert ENDPOINTS[code].scope.value == record.scope, record.command
-        assert ENDPOINTS[code].mutating == record.mutating, record.command
+        if code not in ENDPOINTS:
+            assert not record.implemented, record.usage  # endpoint arrives with its record
+            continue
+        assert ENDPOINTS[code].scope.value == record.scope, record.usage
+        assert ENDPOINTS[code].mutating == record.mutating, record.usage
+
+
+def test_killswitch_read_and_change_forms_share_one_parser_node():
+    reset = [r for r in cli_surface.COMMANDS if r.command == "ctl killswitch reset"]
+    assert [(r.usage, r.label.name, r.endpoint_code) for r in reset] == [
+        ("afx ctl killswitch reset", "READ", "status"),
+        ("afx ctl killswitch reset <generation>", "CHANGE", "killswitch_reset")]
+    assert not any("generation" in r.command for r in cli_surface.COMMANDS)
+    r = _renderer()
+    assert r.parser_help("ctl killswitch reset") == (
+        "[下位操作ごと] kill switch の世代を表示する / kill switch を解除する")
+    assert r.leaf_help("afx ctl killswitch reset") == "[読取] kill switch の世代を表示する"
+    assert r.leaf_help("afx ctl killswitch reset <generation>") == (
+        "[変更] [確認] [approver] kill switch を解除する")
+    epilog = r.render_epilog("ctl killswitch")
+    assert epilog.count("afx ctl killswitch reset  ") == 1
+    assert epilog.count("afx ctl killswitch reset <generation>  ") == 1
+
+
+def test_every_node_with_children_has_parser_help():
+    r = _renderer()
+    nodes = set()
+    for record in _all_exposed():
+        if record.planned:
+            continue
+        paths = ([f"ops {f} {record.command.split(' ', 1)[1]}" for f in ("bot", "web", "notify")]
+                 if record.command in cli_surface._OPS_GENERIC else [record.command])
+        for path in paths:
+            words = path.split(" ")
+            nodes.update(" ".join(words[:size]) for size in range(1, len(words)))
+    assert {"ctl jobs", "ctl backlog", "ctl policy", "ctl approval", "ctl killswitch",
+            "ctl data", "ctl reflect", "ops web"} <= nodes
+    for node in sorted(nodes):
+        assert r.parser_help(node), node
+        assert r.parser_description(node), node
+        assert r.render_epilog(node), node
 
 
 def test_alias_and_compatibility_text_is_pinned():
@@ -202,11 +241,15 @@ def test_alias_and_compatibility_text_is_pinned():
         "この形は 0.3.0 で削除します。")
 
 
-def test_alias_names_on_records_match_alias_records():
-    parser_aliases = {a.parser_alias for a in cli_surface.ALIASES}
-    for record in cli_surface.COMMANDS:
-        assert set(record.aliases) <= parser_aliases, record.command
-    assert {alias for record in cli_surface.COMMANDS for alias in record.aliases} == parser_aliases
+def test_record_aliases_are_derived_from_the_alias_table_uniquely():
+    keys = [(a.canonical_usage, a.parser_alias) for a in cli_surface.ALIASES]
+    assert len(set(keys)) == len(keys)
+    for alias in cli_surface.ALIASES:
+        owners = [r for r in cli_surface.COMMANDS if r.usage == alias.canonical_usage]
+        assert len(owners) == 1, alias.canonical_usage
+        assert alias.parser_alias in owners[0].aliases
+    assert sorted(alias for r in cli_surface.COMMANDS for alias in r.aliases) == sorted(
+        a.parser_alias for a in cli_surface.ALIASES)
 
 
 @pytest.mark.parametrize("mutation", [
@@ -242,7 +285,7 @@ def test_package_version_is_below_every_removal_and_checked_by_the_validator():
     assert removals == {"0.3.0", "1.0.0"}
     for removal in removals:
         assert cli_surface.version_tuple(current) < cli_surface.version_tuple(removal)
-    with pytest.raises(ValueError, match="expired compatibility record: afx stop"):
+    with pytest.raises(ValueError, match="expired compatibility record: shell"):
         cli_surface.validate_compatibility_versions("1.0.0", compatibility=())
 
 
@@ -255,18 +298,31 @@ def test_package_version_reaches_every_deprecated_since():
     assert all(current >= cli_surface.version_tuple(value) for value in since)
 
 
-def test_shell_record_owns_the_removal_release():
+def test_shell_lifecycle_has_one_owner():
     stop = _record("stop")
-    assert (stop.deprecated_since, stop.remove_in) == ("0.2.0", "1.0.0")
+    assert (stop.deprecated_since, stop.remove_in) == (
+        cli_surface.SHELL_LIFECYCLE.deprecated_since, cli_surface.SHELL_LIFECYCLE.remove_in)
     assert cli_surface.RENDERER.render_shell_help() == ""
     text = _renderer().render_shell_help()
     assert text.splitlines()[-1] == (
         "廃止予定: 対話 shell は 0.2.0 で deprecated。1.0.0 で削除予定。afx ctl を使用してください。")
     assert "  stop  daemon を graceful shutdown する" in text.splitlines()
-    moved = tuple(dataclasses.replace(r, remove_in="2.0.0") if r.command == "stop" else r
-                  for r in _all_exposed())
-    assert "2.0.0 で削除予定" in cli_surface.SurfaceRenderer(moved).render_shell_help()
-    assert "1.0.0" not in cli_surface.SurfaceRenderer(moved).render_shell_help()
+    moved = cli_surface.ShellLifecycle("0.2.0", "2.0.0")
+    shifted = cli_surface.SurfaceRenderer(_all_exposed(), shell_lifecycle=moved).render_shell_help()
+    assert "2.0.0 で削除予定" in shifted and "1.0.0" not in shifted
+    without_stop = tuple(r for r in _all_exposed() if r.command != "stop")
+    assert cli_surface.SurfaceRenderer(without_stop).render_shell_help().splitlines()[-1] == (
+        text.splitlines()[-1])
+    with pytest.raises(ValueError, match="expired compatibility record: shell"):
+        cli_surface.validate_compatibility_versions(
+            "2.0.0", compatibility=(), commands=(), shell_lifecycle=cli_surface.SHELL_LIFECYCLE)
+    cli_surface.validate_compatibility_versions(
+        "1.5.0", compatibility=(), commands=(), shell_lifecycle=moved)
+
+
+@pytest.mark.xfail(strict=True, reason="the shell accepts only `improve add` until the shell parser takes `backlog add`")
+def test_shell_advertises_the_canonical_backlog_add_form():
+    assert _record("ctl backlog add").shell_usage == "backlog add <idea>"
 
 
 def test_hidden_records_render_nothing():
@@ -348,3 +404,44 @@ def test_ctl_help_lists_each_group_and_each_ctl_record_once():
         assert text.count(record.usage.removeprefix("afx ctl ") + "\n") + (
             text.endswith(record.usage.removeprefix("afx ctl "))) >= 1, record.usage
     assert "afx stop" not in text
+
+
+@pytest.mark.parametrize("value", ["0.2.0rc1", "0.2.0.dev3", "0.2.0.post1", "0.2.0a2", "0.2.0b1.dev4"])
+def test_version_tuple_ignores_pre_dev_and_post_suffixes(value):
+    assert cli_surface.version_tuple(value) == (0, 2, 0)
+    cli_surface.validate_compatibility_versions(value)
+
+
+@pytest.mark.parametrize("value", ["", "x", "0..2", "0.2.", "rc1", "0.2.0-", "０.2"])
+def test_version_tuple_rejects_malformed_values(value):
+    with pytest.raises(ValueError):
+        cli_surface.version_tuple(value)
+
+
+def test_release_candidate_of_a_removal_release_is_expired():
+    with pytest.raises(ValueError, match="expired compatibility record"):
+        cli_surface.validate_compatibility_versions("0.3.0rc1")
+
+
+def test_ctl_help_keeps_the_placeholder_for_groups_without_ctl_records():
+    lines = _renderer().render_ctl_help().splitlines()
+    for group in (G.MARKET, G.RESEARCH):
+        assert lines[lines.index(f"{group.value}:") + 1] == "  —"
+    for group in (G.OBSERVE, G.GUIDANCE, G.PLUGIN, G.RECOVERY):
+        assert lines[lines.index(f"{group.value}:") + 1] != "  —"
+
+
+def test_renderer_validates_once_and_lookups_do_not_rescan(monkeypatch):
+    calls = []
+    real = cli_surface._validate_records
+    monkeypatch.setattr(cli_surface, "_validate_records",
+                        lambda records: (calls.append(1), real(records))[1])
+    renderer = cli_surface.SurfaceRenderer(_all_exposed())
+    assert len(calls) == 1
+    for command in ("ops", "ctl", "ctl killswitch", "ctl policy add"):
+        renderer.parser_help(command)
+        renderer.parser_description(command)
+        renderer.render_epilog(command)
+    renderer.render_ctl_help()
+    renderer.render_shell_help()
+    assert len(calls) == 1

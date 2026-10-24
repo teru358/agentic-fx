@@ -1,7 +1,8 @@
 """Pure command classification data used by future CLI help renderers."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 
@@ -71,12 +72,21 @@ class CompatibilityRecord:
     rejects: bool = False
 
 
+_VERSION = re.compile(
+    r"(?P<release>\d+(?:\.\d+)*)(?:\.?(?:a|b|c|rc|alpha|beta|pre|preview|dev|post)\d*)*",
+    re.ASCII)
+
+
 def version_tuple(value: str) -> tuple[int, ...]:
-    """Parse a dotted release version without importing a packaging library."""
-    pieces = value.split(".")
-    if not pieces or any(not piece.isascii() or not piece.isdecimal() for piece in pieces):
+    """Parse the numeric release of a version without importing a packaging library.
+
+    Pre-release, dev and post-release suffixes are accepted and ignored, so a
+    release candidate compares as its final release.
+    """
+    match = _VERSION.fullmatch(value)
+    if match is None:
         raise ValueError(f"invalid version: {value!r}")
-    return tuple(int(piece) for piece in pieces)
+    return tuple(int(piece) for piece in match["release"].split("."))
 
 
 def _record(group: Group | None, lane: Lane, command: str, usage: str, label: Label,
@@ -115,7 +125,18 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
     )
 
 
-COMMANDS: tuple[CommandRecord, ...] = (
+@dataclass(frozen=True, slots=True)
+class ShellLifecycle:
+    """Release window of the interactive shell, which owns its own deprecation."""
+
+    deprecated_since: str
+    remove_in: str
+
+
+SHELL_LIFECYCLE = ShellLifecycle(deprecated_since="0.2.0", remove_in="1.0.0")
+
+
+_BASE_COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.SETUP, Lane.LOCAL, "init", "afx init [--non-interactive] [--config FILE]",
             Label.CHANGE, "初期設定を行う", "entry.py", shell_usage=None),
     _record(Group.SETUP, Lane.LOCAL, "check", "afx check [--json] [--unit-env]", Label.READ,
@@ -137,11 +158,11 @@ COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.SETUP, Lane.LOCAL, "ops disable", "afx ops <bot|web|notify> disable", Label.CHANGE,
             "機能を無効化する", "entry.py", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops web reconfigure", "afx ops web reconfigure", Label.CHANGE,
-            "afx に触れずに設定を変える", "ops_setup", aliases=("reconf",), implemented=False),
+            "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops bot reconfigure", "afx ops bot reconfigure", Label.CHANGE,
-            "afx に触れずに設定を変える", "ops_setup", aliases=("reconf",), implemented=False),
+            "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops notify reconfigure", "afx ops notify reconfigure", Label.CHANGE,
-            "afx に触れずに設定を変える", "ops_setup", aliases=("reconf",), implemented=False),
+            "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops status", "afx ops <bot|web|notify> status", Label.READ,
             "機能の状態を表示する", "entry.py", implemented=False),
     _record(Group.SETUP, Lane.CTL, "ctl whoami", "afx ctl whoami", Label.READ,
@@ -191,8 +212,7 @@ COMMANDS: tuple[CommandRecord, ...] = (
             "improve one-shot を実行する", "ops/client.py", shell_usage="improve", shell=True,
             scope="operate", endpoint_code="improve", daemon_required=True),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog add", "afx ctl backlog add <idea>", Label.CHANGE,
-            "バックログへ課題を追加する", "ops/client.py", shell_usage="backlog add <idea>", shell=True,
-            aliases=("improve add",),
+            "バックログへ課題を追加する", "ops/client.py", shell_usage="improve add <idea>", shell=True,
             scope="operate", endpoint_code="backlog_add", daemon_required=True, implemented=False),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog list",
             "afx ctl backlog list [--all] [--limit N]", Label.READ,
@@ -245,11 +265,9 @@ COMMANDS: tuple[CommandRecord, ...] = (
             Label.READ, "plugin を一覧表示する", "backtest/cli.py", implemented=False),
     _record(Group.PLUGIN, Lane.CTL, "ctl approval list", "afx ctl approval list [n]", Label.READ,
             "承認待ちを表示する", "ops/client.py", shell_usage="approval list [n]", shell=True,
-            aliases=("approvals list",),
             scope="approvals.list", endpoint_code="approval_list", daemon_required=True),
     _record(Group.PLUGIN, Lane.CTL, "ctl approval show", "afx ctl approval show <id>", Label.READ,
             "承認申請の詳細を表示する", "ops/client.py", shell_usage="approval show <id>", shell=True,
-            aliases=("approvals show", "approval <id>"),
             scope="approvals.detail", endpoint_code="approval_detail", daemon_required=True),
     _record(Group.PLUGIN, Lane.CTL, "ctl approve", "afx ctl approve <id>", Label.CHANGE,
             "承認申請を承認する", "ops/client.py", shell_usage="approve <id>", shell=True,
@@ -259,13 +277,12 @@ COMMANDS: tuple[CommandRecord, ...] = (
             confirm=True, approver=True, scope="decide", endpoint_code="reject", daemon_required=True),
     _record(Group.PLUGIN, Lane.CTL, "ctl approval retry", "afx ctl approval retry <id>", Label.CHANGE,
             "承認手順を再試行する", "ops/client.py", shell_usage="approval retry <id>", shell=True,
-            aliases=("retry <id>",),
             confirm=True, approver=True, scope="decide", endpoint_code="retry", daemon_required=True),
 
     _record(Group.RECOVERY, Lane.CTL, "ctl killswitch reset", "afx ctl killswitch reset", Label.READ,
             "kill switch の世代を表示する", "ops/client.py", shell_usage="killswitch reset", shell=True,
-            scope="status.read", endpoint_code="killswitch_reset", daemon_required=True),
-    _record(Group.RECOVERY, Lane.CTL, "ctl killswitch reset generation",
+            scope="status.read", endpoint_code="status", daemon_required=True),
+    _record(Group.RECOVERY, Lane.CTL, "ctl killswitch reset",
             "afx ctl killswitch reset <generation>", Label.CHANGE, "kill switch を解除する",
             "ops/client.py", shell_usage="killswitch reset <世代>", shell=True, confirm=True,
             approver=True, scope="local_guard", endpoint_code="killswitch_reset", daemon_required=True),
@@ -280,7 +297,8 @@ COMMANDS: tuple[CommandRecord, ...] = (
 
     _record(None, Lane.CTL, "stop", "afx stop", Label.CHANGE, "daemon を graceful shutdown する",
             "commands.py", shell_usage="stop", shell=True, classified=False,
-            deprecated_since="0.2.0", remove_in="1.0.0"),
+            deprecated_since=SHELL_LIFECYCLE.deprecated_since,
+            remove_in=SHELL_LIFECYCLE.remove_in),
 )
 
 
@@ -294,6 +312,17 @@ ALIASES: tuple[AliasRecord, ...] = (
     AliasRecord("afx ctl approval <id>", "afx ctl approval show <id>", "approval <id>"),
     AliasRecord("afx ctl retry <id>", "afx ctl approval retry <id>", "retry <id>"),
 )
+
+
+def _with_aliases(records: tuple[CommandRecord, ...],
+                  aliases: tuple[AliasRecord, ...]) -> tuple[CommandRecord, ...]:
+    """Fill each record's parser aliases from the single alias table."""
+    return tuple(replace(record, aliases=tuple(
+        alias.parser_alias for alias in aliases if alias.canonical_usage == record.usage))
+        for record in records)
+
+
+COMMANDS: tuple[CommandRecord, ...] = _with_aliases(_BASE_COMMANDS, ALIASES)
 
 
 COMPATIBILITY_RECORDS: tuple[CompatibilityRecord, ...] = (
@@ -320,11 +349,15 @@ COMPATIBILITY_RECORDS: tuple[CompatibilityRecord, ...] = (
 def validate_compatibility_versions(
         package_version: str,
         compatibility: tuple[CompatibilityRecord, ...] | None = None,
-        commands: tuple[CommandRecord, ...] | None = None) -> None:
+        commands: tuple[CommandRecord, ...] | None = None,
+        shell_lifecycle: ShellLifecycle | None = None) -> None:
     """Reject metadata that survives past its promised removal release."""
     current = version_tuple(package_version)
     compatibility = COMPATIBILITY_RECORDS if compatibility is None else compatibility
     commands = COMMANDS if commands is None else commands
+    shell_lifecycle = SHELL_LIFECYCLE if shell_lifecycle is None else shell_lifecycle
+    if current >= version_tuple(shell_lifecycle.remove_in):
+        raise ValueError("expired compatibility record: shell")
     for record in compatibility:
         if current >= version_tuple(record.remove_in):
             raise ValueError(f"expired compatibility record: {record.usage}")
@@ -334,6 +367,9 @@ def validate_compatibility_versions(
 
 
 def _validate_records(records: tuple[CommandRecord, ...]) -> None:
+    usages = [record.usage for record in records]
+    if len(set(usages)) != len(usages):
+        raise ValueError("duplicate record usage")
     for record in records:
         if record.exposed and not record.implemented:
             raise ValueError(f"exposed record is not implemented: {record.usage}")
@@ -349,8 +385,6 @@ def _validate_records(records: tuple[CommandRecord, ...]) -> None:
                 and version_tuple(record.deprecated_since) >= version_tuple(record.remove_in)):
             raise ValueError(f"lifecycle is not ordered: {record.usage}")
 
-
-_validate_records(COMMANDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +404,13 @@ PARENTS: tuple[ParentRecord, ...] = (
     ParentRecord("ops web", "web 表示 (ops-web)", labeled=False),
     ParentRecord("ops notify", "通知 (ops-notify)", labeled=False),
     ParentRecord("ctl", "稼働中の daemon を操作 API で操作する", labeled=False),
+    ParentRecord("ctl jobs", "ジョブの参照と取消"),
+    ParentRecord("ctl backlog", "改善バックログの操作"),
+    ParentRecord("ctl policy", "ユーザー方針 (directives) の操作"),
+    ParentRecord("ctl reflect", "反省処理の操作"),
+    ParentRecord("ctl approval", "承認申請の表示と再試行"),
+    ParentRecord("ctl killswitch", "kill switch の表示・解除・状態確定"),
+    ParentRecord("ctl data", "価格源の復旧操作"),
     ParentRecord("history", "履歴データ操作"),
     ParentRecord("backtest", "バックテスト"),
     ParentRecord("analyze", "履歴分析"),
@@ -405,31 +446,43 @@ class SurfaceRenderer:
 
     def __init__(self, records: tuple[CommandRecord, ...] = COMMANDS,
                  parents: tuple[ParentRecord, ...] = PARENTS,
-                 compatibility: tuple[CompatibilityRecord, ...] = COMPATIBILITY_RECORDS) -> None:
+                 compatibility: tuple[CompatibilityRecord, ...] = COMPATIBILITY_RECORDS,
+                 shell_lifecycle: ShellLifecycle = SHELL_LIFECYCLE) -> None:
         _validate_records(records)
         self._records = records
         self._parents = {parent.command: parent for parent in parents}
         self._compatibility = compatibility
+        self._shell_lifecycle = shell_lifecycle
+        self._visible = tuple(record for record in records
+                              if record.exposed and not record.planned)
+        by_path: dict[str, list[CommandRecord]] = {}
+        by_usage: dict[str, CommandRecord] = {}
+        children: dict[str, list[CommandRecord]] = {}
+        for record in self._visible:
+            by_usage.setdefault(record.usage, record)
+            for path in _expand(record):
+                by_path.setdefault(path, []).append(record)
+                words = path.split(" ")
+                for size in range(1, len(words)):
+                    siblings = children.setdefault(" ".join(words[:size]), [])
+                    if not any(record is seen for seen in siblings):
+                        siblings.append(record)
+        self._by_path = {path: tuple(found) for path, found in by_path.items()}
+        self._by_usage = by_usage
+        self._children_of = {path: tuple(found) for path, found in children.items()}
 
-    def _visible(self) -> tuple[CommandRecord, ...]:
-        return tuple(record for record in self._records
-                     if record.exposed and not record.planned)
-
-    def _entries(self) -> tuple[tuple[str, CommandRecord], ...]:
-        return tuple((path, record) for record in self._visible() for path in _expand(record))
+    def _exacts(self, command: str) -> tuple[CommandRecord, ...]:
+        """Records answering to one parser node; a read and a change form can share it."""
+        if command in self._by_usage:
+            return (self._by_usage[command],)
+        return self._by_path.get(command, ())
 
     def _exact(self, command: str) -> CommandRecord | None:
-        for path, record in self._entries():
-            if command in (path, record.usage):
-                return record
-        return None
+        found = self._exacts(command)
+        return found[0] if found else None
 
     def _children(self, command: str) -> tuple[CommandRecord, ...]:
-        found: list[CommandRecord] = []
-        for path, record in self._entries():
-            if path.startswith(command + " ") and not any(record is seen for seen in found):
-                found.append(record)
-        return tuple(found)
+        return self._children_of.get(command, ())
 
     def top_description(self) -> str:
         return "agentic-fx"
@@ -445,28 +498,30 @@ class SurfaceRenderer:
 
     def parser_help(self, command: str) -> str | None:
         children = self._children(command)
+        exacts = self._exacts(command)
         if children:
             parent = self._parents.get(command)
-            exact = self._exact(command)
-            summary = parent.summary if parent else (exact.summary if exact else None)
+            summary = parent.summary if parent else (exacts[0].summary if exacts else None)
             if summary is None:
                 return None
             if parent is not None and not parent.labeled:
                 return summary
-            family = children if exact is None else (exact, *children)
-            return f"{self._parent_label(family)} {summary}"
-        exact = self._exact(command)
-        return f"{_labels(exact)} {exact.summary}" if exact else None
+            return f"{self._parent_label((*exacts, *children))} {summary}"
+        if len(exacts) > 1:
+            return f"{self._parent_label(exacts)} " + " / ".join(r.summary for r in exacts)
+        return f"{_labels(exacts[0])} {exacts[0].summary}" if exacts else None
 
     def parser_description(self, command: str) -> str | None:
-        if self._children(command):
+        children = self._children(command)
+        exacts = self._exacts(command)
+        if children:
             parent = self._parents.get(command)
-            exact = self._exact(command)
             if parent is not None:
                 return parent.summary
-            return exact.summary if exact else None
-        exact = self._exact(command)
-        return exact.summary if exact else None
+            return exacts[0].summary if exacts else None
+        if len(exacts) > 1:
+            return " / ".join(r.summary for r in exacts)
+        return exacts[0].summary if exacts else None
 
     def leaf_help(self, command: str) -> str | None:
         record = self._exact(command)
@@ -494,7 +549,7 @@ class SurfaceRenderer:
     def render_ctl_help(self) -> str:
         lines = ["usage: afx ctl [--as operator|approver] <操作>", ""]
         for group in Group:
-            records = tuple(record for record in self._visible()
+            records = tuple(record for record in self._visible
                             if record.lane is Lane.CTL and record.group is group)
             lines.append(f"{group.value}:")
             lines.extend(f"  {_labels(record)} {record.usage.removeprefix('afx ctl ')}"
@@ -505,17 +560,15 @@ class SurfaceRenderer:
         return "\n".join(lines).rstrip()
 
     def render_shell_help(self) -> str:
-        records = tuple(record for record in self._visible()
+        records = tuple(record for record in self._visible
                         if record.shell and record.shell_usage is not None)
         if not records:
             return ""
         lines = ["コマンド一覧:"]
         lines.extend(f"  {record.shell_usage}  {record.summary}" for record in records)
-        lifecycle = next((record for record in self._records
-                          if record.shell and record.remove_in is not None), None)
-        if lifecycle is not None:
-            lines.append(f"廃止予定: 対話 shell は {lifecycle.deprecated_since} で deprecated。"
-                         f"{lifecycle.remove_in} で削除予定。afx ctl を使用してください。")
+        lifecycle = self._shell_lifecycle
+        lines.append(f"廃止予定: 対話 shell は {lifecycle.deprecated_since} で deprecated。"
+                     f"{lifecycle.remove_in} で削除予定。afx ctl を使用してください。")
         return "\n".join(lines)
 
 
