@@ -24,7 +24,7 @@ from afx_ops.config import ConfigError, read_config
 from afx_ops.isolation import startup
 
 ROWS = matrix.rows()
-EXPECTED = {row["id"]: row.get("expected_t2", row["expected"]) for row in ROWS}
+EXPECTED = {row["id"]: row["expected"] for row in ROWS}
 ABSENT = "192.168.77.5"
 OTHER = "192.168.1.99"
 
@@ -148,10 +148,7 @@ def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
     assert {EXPECTED[row["id"]] for row in c} == {
         None, "allow_required", "interface_lookup_failed", "bind_not_local", "secret_invalid",
         "secret_missing", "secret_unexpected"}
-    # 本体の reader が読む `expected` は、限定公開だけを通す版の期待
-    assert {row["expected"] for row in c} == {
-        None, "allow_required", "unrestricted_not_supported", "auth_not_supported",
-        "interface_lookup_failed", "bind_not_local", "secret_invalid", "secret_unexpected"}
+    assert all("expected_t2" not in row for row in ROWS)
     # 必須 fixture
     for needed in ("G5-bind-leading-space", "G7-auth-capital", "G3b-unknown-key",
                    "G4-port-bool", "G6-allow-ipv6", "G6-allow-empty-list",
@@ -165,7 +162,7 @@ def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
 def test_each_row_has_exactly_one_expected_final_result():
     for row in ROWS:
         assert EXPECTED[row["id"]] is None or isinstance(EXPECTED[row["id"]], str)
-        assert ("expected_t2" in row) == (row["group"] == "C")
+        assert "expected_t2" not in row
     # 表の先行行が後続行に勝つ: 非 loopback の allow 省略は C1 が先
     for row in ROWS:
         if row["group"] == "C" and row["bind"] != "loopback" and row["allow"] == "omitted":

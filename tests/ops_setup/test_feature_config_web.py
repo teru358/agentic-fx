@@ -2,7 +2,7 @@
 
 reader の最終 reason は afx-ops の起動 / probe と同じ決定木で、期待値は
 `afx-ops/tests/fixtures/web_access_matrix.json` (afx-ops の試験が仕様の 2 表から機械生成する)
-を共有する。
+の `expected` 1 列を、afx-ops の 3 入口と共有する。
 """
 from __future__ import annotations
 
@@ -258,41 +258,11 @@ def _build(row, root: Path, xdg: Path, monkeypatch) -> None:
             (xdg / "secret" / "stray").write_text("x")
 
 
-# 共有 fixture は afx-ops 側の版の表で生成される。unrestricted / basic を拒む版の行 (期待値が
-# `unrestricted_not_supported` / `auth_not_supported`) は、本体 reader には当てはまらない。
-# 本体 reader は両方を許す版なので、その行だけを C 表 (C1, C4〜C8) から直接導く。
-_WITHOUT_CAPABILITY_GATES = {"unrestricted_not_supported", "auth_not_supported"}
-
-
-def _c_table(row) -> str | None:
-    """C1・C4〜C8 を行の順に書き下したもの (unrestricted / basic を許す版)。"""
-    bind, allow, auth, secret = row["bind"], row["allow"], row["auth"], row["secret"]
-    if bind != "loopback" and allow == "omitted":
-        return "allow_required"
-    if bind == "failed":
-        return "interface_lookup_failed"
-    if bind == "absent":
-        return "bind_not_local"
-    if secret == "unsafe":
-        return "secret_invalid"
-    if auth == "basic" and secret in ("none", "empty_dir"):
-        return "secret_missing"
-    if auth == "none" and secret == "safe":
-        return "secret_unexpected"
-    return None
-
-
 @pytest.mark.parametrize("row", _rows(), ids=[row["id"] for row in _rows()])
 def test_the_body_reader_returns_the_same_final_reason_as_afx_ops(row, root, xdg, monkeypatch):
     _build(row, root, xdg, monkeypatch)
     got = web_access_reason(root, interfaces=_lookup_for(row["interfaces"], LAN))
-    if row["expected"] in _WITHOUT_CAPABILITY_GATES:
-        assert row["group"] == "C"
-        assert got == _c_table(row)
-    else:
-        assert got == row["expected"]
-        if row["group"] == "C":
-            assert _c_table(row) == row["expected"]
+    assert got == row["expected"]
 
 
 def test_the_two_capability_gates_are_open_in_the_body_reader(root, xdg):

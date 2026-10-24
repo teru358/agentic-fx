@@ -58,8 +58,10 @@ def _wait(endpoint) -> None:
 
 
 config = read_config("web")
-plan = dataclasses.replace(startup.StartupPlan.for_feature("web", web_port=config.port),
-                           check_unit=False)
+plan = dataclasses.replace(
+    startup.StartupPlan.for_feature("web", web_port=config.port, web_bind=config.web_bind,
+                                    web_auth=config.auth),
+    check_unit=False)
 status = startup.run(plan, config, cli.RUNTIMES["web"], plan_check=lambda _plan: None,
                      wait=_wait, preload=cli.PRELOADS["web"])
 (state / "ops_exit").write_text(str(status))
