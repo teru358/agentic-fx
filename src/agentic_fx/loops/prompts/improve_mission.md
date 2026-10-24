@@ -28,19 +28,18 @@
 
 {improvement_history_table}
 
+## 仮説族の試行状況
+
+この表は候補の順位表でも、成績表でもありません。`attempts=0` の族を機械的に順番に消費せず、配備済みとの違い、すでに試した族の広がりと反復回数、今回の根拠と検証可能性を合わせて仮説を選んでください。1 回の非提出・却下を族全体の否定とみなさず、同じ族を再試行するなら前回と異なる仮説上の理由を説明してください。`indicator (未配備) @<足>` は配備されていない indicator 候補を足ごとにまとめた行で、`未配備指標` は配備されていない indicator への依存を表します。`族不明` は一つの族ではなく、族へ帰属できない候補 (依存 indicator を持たない strategy、記録の欠けた旧行、key の形が規則に合わない行) の件数です。`deployed=yes` の族は別名の新規候補にせず、表示された配備名の更新として扱ってください。
+
+{family_attempts}
+
 ## 現行構成
 
 - 組み込み・承認済み plugin: {approved_plugins}
 - ニュースソース: {news_sources}
 - 現在の risk gate 設定: {risk_gate_summary}
 - {pin_broken_strategies}
-
-## 配備済みの仮説族
-
-名前と構成 (indicator の組・足・pair) だけを示します。同じ構成の別名は新しい
-仮説として数えません。param の調整は同名の更新として扱われます。
-
-{deployed_families}
 
 ## バックログと既知の事実
 
@@ -114,6 +113,13 @@
    「依存 indicator の warmup + 自分の lookback」を覆う値を宣言してください。
    **無い指標は自前計算せず**、`不足指標: <名前と定義>` として
    `discoveries` に起票してください。
+8. **`get_signals` は取引判断 loop 専用で、この改善 mission では利用できません。**
+   配備済み strategy の直近 signal の方向・status・payload は、仮説の選択や
+   候補評価の材料にしないでください。この不在は設計上の制約なので、課題・
+   note・discovery として記録せず、候補自体は許可された `run_backtest` と
+   self-test で検証してください。過去の note にある signal 照合や
+   `get_signals` 相当の tool の要望は、この制約によって解消済みです。
+   それに従って tool を探したり、同じ要望を再記録したりしないでください。
 
 ## 最終出力
 

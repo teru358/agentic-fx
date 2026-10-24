@@ -102,6 +102,19 @@ def list_by_mission(conn: sqlite3.Connection, mission_id: int, *,
         query + " ORDER BY id", (mission_id,))]
 
 
+FAMILY_ATTEMPT_COLUMNS = ("family_key", "outcome_class", "created_at")
+
+
+def family_attempt_projection(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """仮説族ごとの試行履歴の材料。`family_key` / `outcome_class` /
+    `created_at` の 3 列だけを id 順で返し、成績・名前・hash・path・pair・
+    flags は process へ持ち込まない。"""
+    cursor = conn.execute(
+        "SELECT family_key, outcome_class, created_at "
+        "FROM candidate_archives ORDER BY id")
+    return [dict(zip(FAMILY_ATTEMPT_COLUMNS, row)) for row in cursor.fetchall()]
+
+
 def clear_path(conn: sqlite3.Connection, archive_id: int, *,
                commit: bool = False) -> None:
     conn.execute(
