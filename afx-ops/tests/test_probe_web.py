@@ -190,7 +190,6 @@ def test_a_busy_port_is_probe_bind_failed_rc_73(home, capsys, host):
 def test_a_getsockname_that_differs_from_the_setting_is_probe_bind_failed(home, capsys,
                                                                           monkeypatch):
     """M-T1-LISTENER-ADDRESS / M-T1-LISTENER-PORT: 不一致を見逃す変異は落ちる。"""
-    import shutil
     _install()
     for lie in (("127.0.0.9", None), ("127.0.0.1", 1)):
         shim = types.SimpleNamespace(**vars(socket))
@@ -204,9 +203,7 @@ def test_a_getsockname_that_differs_from_the_setting_is_probe_bind_failed(home, 
         with monkeypatch.context() as scoped:
             scoped.setattr(accept_loop, "socket", shim)
             assert _run(capsys) == (73, "", "afx-ops: probe_bind_failed\n")
-    config_dir = _DIRS["web"].config
-    assert config_dir.is_relative_to(home)
-    shutil.rmtree(config_dir)
+    assert _DIRS["web"].config.is_relative_to(home)
 
 
 def test_check_listener_compares_both_the_address_and_the_port():

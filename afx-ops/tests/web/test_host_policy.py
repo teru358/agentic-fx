@@ -190,19 +190,45 @@ def test_an_unexpected_renderer_exception_is_500_not_502(method, monkeypatch):
 
 
 @pytest.mark.parametrize("method", ["GET", "HEAD"])
-@pytest.mark.parametrize("data", [{}, {"mode": 3}, {"mode": ["x"], "positions": None}])
-def test_a_dict_reply_the_renderer_cannot_draw_is_502(method, data, monkeypatch):
-    def reject(payload):
-        return payload["required"]["inner"]
-
-    monkeypatch.setattr(render, "render_status", reject)
-
+@pytest.mark.parametrize("data", [{"mode": 3}, {"mode": ["x"]}, {"jobs": "x"}])
+def test_a_dict_reply_of_the_wrong_shape_is_502(method, data):
     class Odd:
         def status(self):
             return Reply(200, data, None)
 
     response = handle_request(Request(method, "/", {}), Odd())
     assert response.status == 502
+    assert (response.body == b"") is (method == "HEAD")
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize(("path", "client_method", "data"), [
+    ("/approvals", "approvals", {}),
+    ("/approvals", "approvals", {"approvals": [1]}),
+    ("/approvals", "approvals", {"approvals": [], "open_journals": "x"}),
+    ("/approvals/7", "approval", {"id": "7"}),
+    ("/logs", "log", {"lines": "x"}),
+    ("/activity", "activity", {"lines": {"a": 1}}),
+])
+def test_every_route_checks_the_reply_shape_before_rendering(method, path, client_method, data):
+    class Odd:
+        def __getattr__(self, name):
+            if name != client_method:
+                raise AttributeError(name)
+            return lambda *args, **kwargs: Reply(200, data, None)
+
+    response = handle_request(Request(method, path, {}), Odd())
+    assert response.status == 502
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+def test_a_well_formed_reply_whose_renderer_raises_value_error_is_500(method, monkeypatch):
+    def explode(data):
+        raise ValueError("renderer bug")
+
+    monkeypatch.setattr(render, "render_status", explode)
+    response = handle_request(Request(method, "/", {}), Daemon())
+    assert response.status == 500
     assert (response.body == b"") is (method == "HEAD")
 
 

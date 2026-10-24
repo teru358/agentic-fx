@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import errno
 import os
-import shutil
 import socket
 import subprocess
 import threading
@@ -541,7 +540,7 @@ def test_missing_state_dir_is_created_before_isolation(feature, root, child_env)
 
 @pytest.mark.parametrize("feature", FEATURES)
 def test_missing_config_dir_stops_before_reading_keys(feature, root, child_env):
-    shutil.rmtree(root / feature / "config")
+    (root / feature / "config").rename(root / feature / "config-moved")
     key = root / "keys" / f"{PRINCIPAL[feature]}.token"
     key.chmod(0)  # 鍵を読もうとすれば key_file_invalid になる
     got = run_canary(_spec(root, feature, "noop"), child_env)

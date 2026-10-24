@@ -474,8 +474,7 @@ def _serve_scenario(allow, sources: list[str], *, settle: float = 0.4, extra=Non
                 await extra(port, peers)
             await asyncio.sleep(settle)
             return {"slots": len(slots), "live": len(service.slots), "protocols": len(protocols),
-                    "refused": service.refused, "rejected": acceptor.web_peer_rejected_total,
-                    "peers": [slot.peer for slot in service.slots]}
+                    "refused": service.refused, "rejected": acceptor.web_peer_rejected_total}
         finally:
             runtime._Slot = original_slot
             acceptor.detach(loop)
@@ -498,10 +497,9 @@ def test_connections_outside_allow_create_no_slot_no_protocol_and_no_daemon_call
     assert result["rejected"] == 20 and client.calls == []
 
 
-def test_the_peer_stored_in_the_slot_is_the_accepted_peer_address():
+def test_a_connection_inside_allow_gets_one_slot_and_one_protocol():
     result, _client = _serve_scenario(ONLY_127_1, ["127.0.0.1"])
     assert result["slots"] == 1 and result["protocols"] == 1
-    assert result["peers"] == ["127.0.0.1"]
 
 
 @pytest.mark.parametrize(("allowed", "refused"), [(15, 0), (16, 0), (17, 1)])
@@ -529,7 +527,7 @@ def test_the_slot_and_runtime_have_no_proxy_header_source_for_the_peer():
     source = open(runtime.__file__, encoding="utf-8").read().lower()
     for word in ("x-forwarded-for", "forwarded", "x-real-ip"):
         assert word not in source
-    assert "peer" in runtime._Slot.__slots__
+    assert "peer" not in runtime._Slot.__slots__
 
 
 def test_a_pending_connection_from_outside_allow_is_closed_with_no_bytes():

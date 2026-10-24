@@ -112,11 +112,9 @@ class _Slot:
     接続が閉じたとき (切断・期限・abort) は `on_release` を呼ぶ。
     """
 
-    __slots__ = ("transport", "deadline", "on_release", "calls", "peer")
+    __slots__ = ("transport", "deadline", "on_release", "calls")
 
-    def __init__(self, on_release: Callable[["_Slot"], None], peer: str) -> None:
-        # allow の判定は accept_loop が済ませた値。以後の送信元判定 (rate limit など) はこの値を使う
-        self.peer = peer
+    def __init__(self, on_release: Callable[["_Slot"], None]) -> None:
         self.transport: asyncio.BaseTransport | None = None
         self.deadline: asyncio.TimerHandle | None = None
         self.on_release = on_release
@@ -332,12 +330,13 @@ class _Service:
                 if call.ident is not None and interrupt is not None:
                     interrupt(call.ident)
 
-    def accept(self, conn, peer: str) -> None:
+    def accept(self, conn, _peer: str) -> None:
+        # 送信元の判定は accept_loop の allow 照合で完了している
         if len(self.slots) >= MAX_CONNECTIONS:
             self.refused += 1
             conn.close()
             return
-        slot = _Slot(self.released, peer)
+        slot = _Slot(self.released)
         self.slots.add(slot)
         task = self._loop.create_task(self._connect(conn, slot))
         self.tasks.add(task)

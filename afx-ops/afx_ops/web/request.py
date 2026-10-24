@@ -42,7 +42,6 @@ class _Reject(Exception):
 
 
 # renderer が reply の形の不一致で落ちたときの例外型
-_SCHEMA_ERRORS = (KeyError, TypeError, AttributeError, IndexError, ValueError)
 
 
 class _Upstream(Exception):
@@ -193,6 +192,32 @@ def _change_of(client, approval_id: int, detail) -> dict | None:
     return reply.data
 
 
+def _list_of(value: object, element: type) -> bool:
+    return type(value) is list and all(type(item) is element for item in value)
+
+
+def _check_reply_shape(route: str, data: dict) -> None:
+    """renderer を呼ぶ前に、reply が route ごとの期待の形かを見る。外れていれば `_Upstream` (502)。
+
+    ここを通った reply で renderer が投げた例外は、adapter 自身の欠陥として 500 になる。
+    """
+    if route == "status":
+        valid = type(data.get("mode", "")) is str and type(data.get("jobs", [])) is list
+    elif route == "approvals":
+        valid = (_list_of(data.get("approvals"), dict)
+                 and ("open_journals" not in data or _list_of(data["open_journals"], dict)))
+    elif route == "approval":
+        valid = type(data.get("id")) is int and type(data.get("change", {})) in (dict, type(None))
+    elif route == "log":
+        valid = type(data.get("lines", [])) is list and type(data.get("log", [])) is list
+    elif route == "activity":
+        valid = type(data.get("lines", [])) is list
+    else:
+        valid = False
+    if not valid:
+        raise _Upstream
+
+
 def _call(function, *args, **kwargs):
     """daemon への呼出し。transport 例外・timeout は `_Upstream` (502) にする。"""
     try:
@@ -303,12 +328,8 @@ def handle_request(request: Request | bytes, client, *,
         reply, renderer = _invoke(match, request.query, client)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
             return _error(502, head=head)
-        try:
-            body = renderer(reply.data)
-        except _SCHEMA_ERRORS:
-            # reply は dict でも必須 key の欠落・型違いで描画できない: 期待 schema でない reply。
-            # それ以外の例外 (renderer 自身の欠陥) は下の 500
-            raise _Upstream from None
+        _check_reply_shape(match.route.client_method, reply.data)
+        body = renderer(reply.data)
         return _response(200, body, head=head)
     except _Reject as reject:
         return _error(reject.status, head=head)

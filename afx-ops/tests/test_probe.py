@@ -60,7 +60,7 @@ def _probe(args, env, home, *, prefix=(), stdin=subprocess.DEVNULL):
 def _break(case: str, home: Path, feature: str) -> None:
     dirs = feature_dirs(feature)
     if case == "config_dir_missing":
-        shutil.rmtree(dirs.config)
+        dirs.config.rename(dirs.config.with_name("config-moved"))
     elif case == "config_dir_invalid":
         dirs.config.chmod(0o777)
     elif case == "config_invalid":
