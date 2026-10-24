@@ -321,7 +321,7 @@ class OpsSetup:
                 # 鍵 dir 自体の問題は enroll / 鍵 dir 検査が固定 reason で止める。
                 return False
             detail = (f"code={error.code} 回復: afx を止めて afx keys rotate {principal.value}"
-                      f" を実行し、afx ops enable {feature} を再実行する")
+                      f" を実行し、afx ops {feature} enable を再実行する")
             self._failure(state, "principal_key_mismatch", detail)
             raise InvalidState("principal_key_mismatch", detail) from None
 
@@ -408,7 +408,7 @@ class OpsSetup:
             raise InvalidState("marker_corrupt", f"path={path} 回復: 中身を確かめて marker を手で削除する")
         if owner != feature:
             raise InvalidState("marker_foreign", f"path={path} feature={owner} 回復: "
-                               f"afx ops enable {owner} を再実行するか、marker を手で削除する")
+                               f"afx ops {owner} enable を再実行するか、marker を手で削除する")
 
     def _place_marker(self, feature: str) -> None:
         # 既に在る自機能の marker は書き換えない (開始時刻は最初の enable のまま)。

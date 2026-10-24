@@ -345,7 +345,7 @@ def test_opencode_needs_a_context_limit_and_is_never_marked_verified(tmp_path, h
     assert settings.runner.improve.backend == "opencode" and settings.runner.opencode.context_limit == 16384
     assert settings.improve.llama_swap_verified is False
     assert fetch.urls("/props") == []
-    assert "verify-backend --backend opencode" in io.text
+    assert "check backend --backend opencode" in io.text
 
 
 def test_the_context_limit_is_read_from_llama_swap_only_when_asked(tmp_path, home):
@@ -367,7 +367,7 @@ def test_the_improve_exchange_runs_as_a_child_command_after_the_commit(tmp_path,
     deps, calls, fetch, run = make_deps(tmp_path, **kwargs)
     fetch.models = {}
     run.on("node", "--version", stdout="v22\n").on(str(binary), "--version", stdout="1.0\n")
-    run.on(__import__("sys").executable, "main.py", "improve", "verify-backend", "--backend", "claude", returncode=returncode,
+    run.on(__import__("sys").executable, "main.py", "check", "backend", "--backend", "claude", returncode=returncode,
            stdout="anything: ok\n")
     io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1"), ("改善 backend の実往復", "y")))
     assert run_wizard(root, io, deps) == 0, io.text

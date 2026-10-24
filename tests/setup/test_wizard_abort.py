@@ -136,7 +136,7 @@ def test_another_setup_operation_stops_the_wizard_before_it_touches_the_instance
     with holding(root, "setup"):
         io = ScriptedWizardIO(responder=fresh_responder())
         assert run_wizard(root, io, deps) == 2
-    assert "別の `afx init` または `afx ops enable` が実行中です" in io.text
+    assert "別の `afx init` または `afx ops <feature> enable` が実行中です" in io.text
     assert "before_instance_lock_acquire" not in hooks
     assert not (root / "config" / "settings.yaml").exists()
 
@@ -159,7 +159,7 @@ def test_an_unfinished_ops_enable_stops_the_wizard(tmp_path):
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder())
     assert run_wizard(root, io, deps) == 2
-    assert "afx ops enable <feature>" in io.text and "途中で止まっています" in io.text
+    assert "afx ops <feature> enable" in io.text and "途中で止まっています" in io.text
     assert not (root / "config" / "settings.yaml").exists()
 
 
@@ -172,7 +172,7 @@ def test_both_markers_report_the_ops_enable_first(tmp_path):
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder())
     assert run_wizard(root, io, deps) == 2
-    assert "afx ops enable" in io.text and "前回の初期設定" not in io.text
+    assert "afx ops <feature> enable" in io.text and "前回の初期設定" not in io.text
 
 
 def test_without_landlock_the_wizard_asks_to_continue_and_skips_improvement_questions(tmp_path):

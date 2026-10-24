@@ -180,7 +180,7 @@ Python 3.13 / linux
 
 - 再実行のときは「初めての設定です。」の代わりに「再実行です。現在の値を既定として表示します。」。
 - リポジトリの直下でないと「ここは agentic-fx のリポジトリ直下ではありません (config/settings.yaml.example が見つかりません)。clone したディレクトリで実行してください。」(rc=2、何も作りません)。
-- 別の `afx init` が動いていると「別の `afx init` または `afx ops enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」、別の agentic-fx が動いていると「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください …」(rc=2)。
+- 別の `afx init` が動いていると「別の `afx init` または `afx ops <feature> enable` が実行中です。終了してから再実行してください。設定・DB は変更していません。」、別の agentic-fx が動いていると「別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから再実行してください …」(rc=2)。
 - Landlock が使えない環境では「この環境では Landlock が使えません (x86_64 かつ ABI 3 以上が必要)。標準指標の導入と改善ループは使えません。取引判断のペーパー運用だけ設定できます。」に続けて `続けますか [y/N] `。
 - Landlock ABI が 8 未満のときは「この kernel (Landlock ABI <ABI>) では改善ループの隔離が使えません (ABI 8 以上、Linux 6.18 以降が必要)。取引判断と標準指標は設定できます。改善は kernel を更新するまで止まります。」と表示して続行します。
 - pytest が無いと「plugin の採用審査 (gate) が pytest を使います。`uv sync` (dev 依存を含む既定) で入ります。」(警告、続行します)。
@@ -318,7 +318,7 @@ LLM の構成:
   改善の backend [既定: 3]: 
   ```
 
-  claude を選ぶと、claude の確認と `改善のモデル (番号 / m = 手入力) [1]: `、確認が成功したときだけ `改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。サブスクの枠を少し使います [y/N] ` を尋ねます。
+  claude を選ぶと、claude の確認と `改善のモデル (番号 / m = 手入力) [1]: `、確認が成功したときだけ `改善 backend の実往復 (`afx check backend`) を確定の後に試験しますか。サブスクの枠を少し使います [y/N] ` を尋ねます。
 - 改善ループの隔離が使えない kernel では、この問いの代わりに「改善の実往復の試験は、この kernel では隔離が使えないため行いません。」と表示します。
 - codex を選ぶと、確認 (ELF の実体が必要) の後、見つからなければ `codex の実体の絶対パス (Enter = 後で settings.yaml に自分で書く): ` を尋ねます (絶対パスのみ。`/` で始まらないと「絶対パス (/ で始まる) で入力してください。相対パスや ~ は使えません。」)。モデルは `codex app-server` の一覧から選び (取れなければ `codex のモデル一覧を取得できませんでした (model_list_unavailable)。モデル名を手入力します。`)、既定は名前に `terra` を含むものです。
 - 取引判断のモデル名は `取引判断のモデル名`、改善のモデル名は `改善のモデル名` として尋ねます (手入力のとき。一覧から選ぶ場合は `<backend>のモデル名` / `<backend>のモデル (番号 / m = 手入力)` の形です)。
@@ -336,7 +336,7 @@ opencode のモデル一覧を取得できませんでした (model_list_unavail
 モデル一覧を取得できませんでした。モデル名を手入力します (未確認のまま記録します)。
 opencode の context_limit は llama-swap の --ctx-size と同じ値にします。
 取得できませんでした。手入力してください。
-improve.llama_swap_verified はここでは true にしません。`afx improve verify-backend --backend opencode` に合格してから手で書いてください。
+improve.llama_swap_verified はここでは true にしません。`afx check backend --backend opencode` に合格してから手で書いてください。
 現在の値と同じです。変更なしで進みます。
 ```
 
@@ -405,7 +405,7 @@ improve.llama_swap_verified はここでは true にしません。`afx improve 
 手動起動なら対話シェルで操作し、外からは見えません。
 afx を常駐サービス (systemd user unit) として動かしますか [Y/n]
 .env に必要なキーはありません。
-.env は作りません (.gitignore で除外済みです)。Discord の token と通知の webhook URL は `afx ops enable` が feature 専用の secret file に置きます。
+.env は作りません (.gitignore で除外済みです)。Discord の token と通知の webhook URL は `afx ops <feature> enable` が feature 専用の secret file に置きます。
 ```
 
 必要なキーがある構成 (Twelve Data、bridge の API キー) では `.env に必要なキー: TWELVEDATA_API_KEY (なし)` のように、あり / なしだけを表示します (値は表示しません)。
@@ -523,7 +523,7 @@ settings.yaml の変更点はありません。
 [段 13 常駐化と外から見る手段]
 （段 8 で常駐を選んだ場合、unit の内容を表示して確認します。）
 unit (afx.service) を設置しました。
-外から見る / 操作する手段: bot (Discord bot) / web (読み取り専用 web) / notify (通知)。質問 (token・port・webhook URL など) は `afx ops enable` 側が端末から直接受けます。
+外から見る / 操作する手段: bot (Discord bot) / web (読み取り専用 web) / notify (通知)。質問 (token・port・webhook URL など) は `afx ops <feature> enable` 側が端末から直接受けます。
 外から見る手段を今設定しますか (既定: あとで) [y/N] 
 ```
 
@@ -620,7 +620,7 @@ unit を置けていないため、有効化・起動は行いません。起動
 | 4 | `trade 用の `claude -p` を 1 往復で試験します。…送りますか` | `y` | `claude -p の試験: 成功` |
 | 4 | `改善の backend` | `3` | `claude: 導入とログインを確認しました。` |
 | 4 | `改善のモデル (番号 / m = 手入力)` | Enter (sonnet) | |
-| 4 | `改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか` | `n` | |
+| 4 | `改善 backend の実往復 (`afx check backend`) を確定の後に試験しますか` | `n` | |
 | 5 | `判断足` | `1h` | |
 | 7 | `改善の周期` | `weekly` | |
 | 7 | `改善の時刻` | `Sat 03:00` | 直近の予定と次回の日時 |

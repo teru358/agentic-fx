@@ -87,7 +87,7 @@ def render_pending_step(step: PendingStep) -> str:
 
     messages = {
         "setup_record_missing": "確認記録が読めません。`afx init` を再実行してください" if p.get("state") == "corrupt" else "初期設定の確認記録がありません。`afx init` を再実行してください",
-        "opencode_unverified": "`afx improve verify-backend --backend opencode` を実行してください",
+        "opencode_unverified": "`afx check backend --backend opencode` を実行してください",
         "bridge_not_connected": "MT5 bridge はまだつながっていません。接続後に `afx init` を再実行してください",
         "indicators_missing": f"標準指標 {number(p.get('total', 9))} 本中 {number(p.get('installed', 0))} 本が未導入です。`afx init` を再実行してください",
         "no_strategy": "戦略がまだありません。改善の承認を確認してください",
@@ -114,10 +114,10 @@ def render_pending_step(step: PendingStep) -> str:
         return f"承認 #{number(p.get('approval_id'))} が途中で止まっています。`afx ctl --as approver approval retry {number(p.get('approval_id'))}`"
     if step.code == "ops_incomplete":
         feature = ident(p.get("feature"), "feature")
-        return f"{feature} の有効化が途中です ({ident(p.get('reason_code'), 'unknown')})。`afx ops enable {feature}` を再実行してください"
+        return f"{feature} の有効化が途中です ({ident(p.get('reason_code'), 'unknown')})。`afx ops {feature} enable` を再実行してください"
     if step.code == "ops_not_ready":
         feature = ident(p.get("feature"), "feature")
-        return f"{feature} は有効化済みですが ready を確認できていません。`afx ops status {feature}`"
+        return f"{feature} は有効化済みですが ready を確認できていません。`afx ops {feature} status`"
     if step.code == "isolation_not_admitted":
         return f"改善の CLI backend は隔離の適合検査を通っていません ({ident(p.get('reason_code'), 'unknown')})"
     if step.code == "api_disabled":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -543,6 +544,37 @@ def connect(db_path: Path, *, check_same_thread: bool = False) -> sqlite3.Connec
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def connect_observer_readonly(db_path: Path) -> sqlite3.Connection:
+    """観測専用 (`afx status` / `afx plugin list`) の読み取り接続。
+
+    `-wal` と `-shm` のどちらも無い (lstat で確認) DB は `immutable=1` で開く。
+    sidecar を作らず、主 DB file も書かない。どちらか一方でもあれば daemon の
+    WAL が残っているので `mode=ro` で開く (sidecar だけが変わりうる)。
+    `db_path` が無ければ `FileNotFoundError`。DB の作成・journal_mode の変更・
+    migration は行わない。
+    """
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old (>= 3.35 required)")
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"connect_observer_readonly requires an existing DB: {path}")
+    resolved = path.resolve()
+    has_sidecar = False
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.lstat(f"{resolved}{suffix}")
+        except FileNotFoundError:
+            continue
+        has_sidecar = True
+    mode = "mode=ro" if has_sidecar else "mode=ro&immutable=1"
+    uri = f"file:{quote(str(resolved), safe='/')}?{mode}"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                           isolation_level=None, timeout=1.0)
+    conn.row_factory = sqlite3.Row
     return conn
 
 

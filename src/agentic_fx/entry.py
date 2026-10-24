@@ -2,14 +2,53 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import sys
 from pathlib import Path
 
 from agentic_fx import service
 from agentic_fx.backtest import cli as backtest_cli
+from agentic_fx.cli_surface import COMPATIBILITY_RECORDS, version_tuple
 from agentic_fx.ops.contracts import Principal
 
-_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "improve")
+_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
+
+
+def _compatibility_active(record) -> bool:
+    """期限前なら真。version を引けない環境 (未 install) は期限判定不能として有効のまま。"""
+    try:
+        current = importlib.metadata.version("agentic-fx")
+    except importlib.metadata.PackageNotFoundError:
+        return True
+    return version_tuple(current) < version_tuple(record.remove_in)
+
+
+def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
+    """Normalize local compatibility spellings before argparse sees them."""
+    if args_list[head:head + 1] == ["ctl"]:
+        return args_list, None
+    improve, ops = COMPATIBILITY_RECORDS
+    if args_list[head:head + 1] == ["improve"] and _compatibility_active(improve):
+        print(improve.message, file=sys.stderr)
+        return args_list, 2
+    if args_list[head:head + 1] != ["ops"]:
+        return args_list, None
+    verb = args_list[head + 1] if len(args_list) > head + 1 else None
+    if verb in {"enable", "disable", "status"} and _compatibility_active(ops):
+        feature = args_list[head + 2] if len(args_list) > head + 2 else None
+        display_feature = feature if feature in {"bot", "web", "notify"} else "<bot|web|notify>"
+        message = ops.message.replace("<verb>", verb).replace("<feature>", display_feature)
+        if feature not in {"bot", "web", "notify"}:
+            print(message, file=sys.stderr)
+            return args_list, 2
+        normalized = args_list[:head + 1] + [feature, verb] + args_list[head + 3:]
+        print(message, file=sys.stderr)
+        return normalized, None
+    if args_list[head + 1:head + 2] == ["web"] and args_list[head + 2:head + 3] == ["reconf"]:
+        normalized = list(args_list)
+        normalized[head + 2] = "reconfigure"
+        return normalized, None
+    return args_list, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
     head = 0
     while args_list[head:head + 1] == ["--daemon"]:
         head += 1
+    args_list, shim_rc = _shim_argv(args_list, head)
+    if shim_rc is not None:
+        return shim_rc
     if args_list[head:head + 1] == ["ctl"]:
         # client は .env も設定の dotenv も読まない。--as を含む残りの引数は client が読む。
         from agentic_fx.ops.client import main as ctl_main
@@ -38,6 +80,11 @@ def main(argv: list[str] | None = None) -> int:
                               help="結果を JSON ({\"fatal\": [...], \"warning\": [...]}) で出す")
     check_parser.add_argument("--unit-env", action="store_true", dest="unit_env",
                               help="unit の最小環境で呼ばれたときの検査 (秘密らしい env を fatal に数える)")
+    check_sub = check_parser.add_subparsers(dest="check_action")
+    backend_parser = check_sub.add_parser("backend", help="backend への接続を検査する")
+    backend_parser.add_argument("--backend", choices=("local", "claude", "codex", "opencode"),
+                                required=True)
+    backend_parser.add_argument("--provider", choices=("chatgpt",), default=None)
     keys_parser = sub.add_parser("keys", help="操作 API の鍵管理 (サービス停止中だけ)")
     keys_sub = keys_parser.add_subparsers(dest="keys_action", required=True)
     keys_sub.add_parser("init", help="初回の鍵を作る (作成済みなら何もしない)")
@@ -47,12 +94,17 @@ def main(argv: list[str] | None = None) -> int:
         p = keys_sub.add_parser(action, help=text)
         p.add_argument("principal", choices=tuple(member.value for member in Principal))
     ops_parser = sub.add_parser("ops", help="外部 operations 機能の有効化・無効化・状態表示")
-    ops_sub = ops_parser.add_subparsers(dest="ops_action", required=True)
-    for action, text in (("enable", "機能を停止中に有効化する"),
-                         ("disable", "機能を停止せずに無効化する"),
-                         ("status", "機能の durable stage を表示する")):
-        p = ops_sub.add_parser(action, help=text)
-        p.add_argument("feature", choices=("bot", "web", "notify"))
+    ops_sub = ops_parser.add_subparsers(dest="feature", required=True)
+    for feature in ("bot", "web", "notify"):
+        feature_parser = ops_sub.add_parser(feature, help=f"{feature} の操作")
+        feature_sub = feature_parser.add_subparsers(dest="ops_action", required=True)
+        for action, text in (("enable", "機能を停止中に有効化する"),
+                             ("disable", "機能を停止せずに無効化する"),
+                             ("status", "機能の durable stage を表示する")):
+            feature_sub.add_parser(action, help=text)
+        if feature == "web":
+            feature_sub.add_parser("reconfigure",
+                                   help="web の設定を変更する (現在は未実装)")
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")
@@ -72,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
             return wizard.run_wizard(root, wizard.ConsoleWizardIO())
         return service.run_init(root, config_file=args.config)
     if args.command == "check":
+        if args.check_action == "backend":
+            if args.as_json or args.unit_env:
+                print("`--json` / `--unit-env` は `afx check backend` と併用できません。", file=sys.stderr)
+                return 2
+            return backtest_cli.verify_backend_command(root, args)
         from agentic_fx.setup import preflight
         return preflight.main(root, as_json=args.as_json, unit_env=args.unit_env)
     if args.command == "keys":
@@ -79,6 +136,9 @@ def main(argv: list[str] | None = None) -> int:
         from agentic_fx.ops.keys import run_keys_command
         return run_keys_command(root, args.keys_action, getattr(args, "principal", None))
     if args.command == "ops":
+        if args.ops_action == "reconfigure":
+            from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
+            return run_ops_reconfigure(root, args.feature)
         if args.ops_action == "enable":
             from agentic_fx.ops_setup.interactive import ConsoleIO, interactive_enable
             return interactive_enable(root, args.feature, io=ConsoleIO()).rc

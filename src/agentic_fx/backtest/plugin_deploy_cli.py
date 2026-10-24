@@ -10,7 +10,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -24,8 +26,12 @@ from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_
 from agentic_fx.plugin import deploy_versions
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store.db import connect_observer_readonly
 
 LOCK_WAIT_SECONDS = 30.0
+
+_PLUGIN_KINDS = frozenset({"indicator", "strategy"})
+_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{12,}")
 
 RC_OK = 0
 RC_FAILED = 1
@@ -46,6 +52,170 @@ SIGNATURE_MISMATCH_HINT = (
 RETRY_HINT = "  同じコマンドを再実行すると未完の op を引き継いで続きから完遂します。"
 
 NOOP_OUTCOMES = frozenset({"already_disabled", "already_retired", "already_revoked"})
+
+
+def _plugin_hash_prefixes(values: set[str]) -> dict[str, str]:
+    """Return stable, collision-free display prefixes of at least 12 characters."""
+    result: dict[str, str] = {}
+    for value in sorted(values):
+        width = min(12, len(value))
+        while width < len(value) and sum(other.startswith(value[:width]) for other in values) > 1:
+            width += 1
+        result[value] = value[:width]
+    return result
+
+
+def _plugin_list_print(sources: dict[str, str], rows: dict[tuple[str, str], dict]) -> None:
+    hashes = {value for row in rows.values() for field in ("live", "pending")
+              for value in row[field] if value}
+    hashes.update(value.rsplit(":", 1)[-1] for row in rows.values()
+                  for value in row["open_ops"] if value.rsplit(":", 1)[-1] != "-")
+    prefixes = _plugin_hash_prefixes(hashes)
+    rendered = []
+    for (name, kind), row in rows.items():
+        open_ops = ",".join(
+            f"{value.rsplit(':', 1)[0]}:{prefixes.get(value.rsplit(':', 1)[-1], value.rsplit(':', 1)[-1])}"
+            for value in sorted(row["open_ops"])) or "-"
+        rendered.append((name, kind, ",".join(prefixes[v] for v in sorted(row["live"])) or "-",
+                         ",".join(prefixes[v] for v in sorted(row["pending"])) or "-",
+                         open_ops,
+                         ",".join(sorted(row["issues"])) or "-"))
+    order = {"indicator": 0, "strategy": 1, "unknown": 2}
+    rendered.sort(key=lambda item: (item[0], order[item[1]]))
+    for source in ("live", "pending", "journal"):
+        print(f"source {source}: {sources[source]}")
+    headers = ("NAME", "KIND", "LIVE", "PENDING", "OPEN_OP", "ISSUES")
+    widths = [len(header) for header in headers]
+    for row in rendered:
+        for index, value in enumerate(row):
+            widths[index] = max(widths[index], len(value))
+    print("  ".join(header.ljust(width) for header, width in zip(headers, widths)).rstrip())
+    for row in rendered:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+
+
+def plugin_list(root: Path, *, kind: str | None = None) -> int:
+    """Render the independent live, approval and deployment read model."""
+    sources = {"live": "ok", "pending": "ok", "journal": "ok"}
+    rows: dict[tuple[str, str], dict] = {}
+
+    def item(name: str, item_kind: str) -> dict:
+        normalized_kind = item_kind if item_kind in {"indicator", "strategy"} else "unknown"
+        return rows.setdefault((name, normalized_kind), {
+            "live": [], "pending": [], "open_ops": [], "issues": set(),
+        })
+
+    def known_kind(name: str, proposed: str) -> str:
+        if proposed in {"indicator", "strategy"}:
+            return proposed
+        known = {row_kind for row_name, row_kind in rows if row_name == name
+                 and row_kind in {"indicator", "strategy"}}
+        return next(iter(known)) if len(known) == 1 else "unknown"
+
+    plugins_root = root / "plugins"
+    if not plugins_root.exists():
+        sources["live"] = "missing"
+    elif not plugins_root.is_dir():
+        sources["live"] = "unavailable"
+    else:
+        try:
+            from agentic_fx.plugin import loader
+            entries = sorted(entry for entry in plugins_root.iterdir()
+                             if not entry.name.startswith((".", "_")))
+        except OSError:
+            entries = []
+            sources["live"] = "unavailable"
+        for entry in entries:
+            # 診断コマンドなので 1 件の壊れた plugin で一覧を止めない。
+            try:
+                if not (entry.is_dir() or entry.is_symlink()):
+                    continue
+                meta, _reason = loader.discover_one_with_reason(entry, entry.name)
+                if meta is None:
+                    raise ValueError("invalid manifest")
+                live_item = item(meta.name, meta.kind)
+                live_item["live"].append(meta.content_hash)
+            except Exception:
+                item(entry.name, "unknown")["issues"].add("broken:invalid_manifest")
+
+    db_path = root / "data" / "agentic.db"
+    conn = None
+    if not db_path.is_file():
+        sources["pending"] = sources["journal"] = "missing"
+    else:
+        try:
+            conn = connect_observer_readonly(db_path)
+        except (sqlite3.Error, OSError):
+            sources["pending"] = sources["journal"] = "unavailable"
+        if conn is not None:
+            try:
+                live_kinds: dict[str, set[str]] = {}
+                for (live_name, live_kind), live_row in rows.items():
+                    if live_row["live"] and live_kind in _PLUGIN_KINDS:
+                        live_kinds.setdefault(live_name, set()).add(live_kind)
+                pending_rows = conn.execute(
+                    "SELECT id,payload_json FROM approval_requests "
+                    "WHERE kind='plugin' AND status='pending' ORDER BY id").fetchall()
+                for pending in pending_rows:
+                    try:
+                        payload = json.loads(pending["payload_json"])
+                        name, content = payload["name"], payload["content_hash"]
+                        if (not isinstance(name, str) or not isinstance(content, str)
+                                or not _HASH_PATTERN.fullmatch(content)):
+                            raise ValueError
+                        proposed = payload.get("kind")
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        item(f"invalid-pending-{pending['id']}", "unknown")["issues"].add(
+                            "broken:invalid_pending")
+                        continue
+                    live_set = live_kinds.get(name, set())
+                    if not isinstance(proposed, str) or proposed not in _PLUGIN_KINDS:
+                        placed = next(iter(live_set)) if len(live_set) == 1 else "unknown"
+                        issue = "kind_missing"
+                    else:
+                        placed = proposed
+                        issue = "kind_mismatch" if live_set and proposed not in live_set else None
+                    row = item(name, placed)
+                    row["pending"].append(content)
+                    if issue:
+                        row["issues"].add(issue)
+            except sqlite3.Error:
+                sources["pending"] = "unavailable"
+            try:
+                deploy_rows = conn.execute(
+                    "SELECT op_id,op_kind,name,subject_content_hash,target_content_hash "
+                    "FROM plugin_deploy_ops WHERE " + deploy_store.OPEN_PHASE_SQL + " ORDER BY op_id").fetchall()
+                for operation in deploy_rows:
+                    target = operation["target_content_hash"] or operation["subject_content_hash"] or "-"
+                    verb = operation["op_kind"].removesuffix("_symlink")
+                    item(operation["name"], known_kind(operation["name"], "unknown"))["open_ops"].append(
+                        f"{operation['op_id']}:{verb}:{target}")
+                switch_rows = conn.execute(
+                    "SELECT op_id,kind,name,new_target FROM plugin_switch_journal "
+                    "WHERE phase NOT IN ('decided','reverted') ORDER BY op_id").fetchall()
+                for operation in switch_rows:
+                    target = str(operation["new_target"]).rsplit("/", 1)[-1]
+                    item(operation["name"], known_kind(operation["name"], "unknown"))["open_ops"].append(
+                        f"{operation['op_id']}:{operation['kind']}:{target}")
+            except sqlite3.Error:
+                sources["journal"] = "unavailable"
+            finally:
+                conn.close()
+
+    for row in rows.values():
+        for field, issue in (("live", "duplicate_live"), ("pending", "duplicate_pending"),
+                             ("open_ops", "duplicate_open_op")):
+            if field == "open_ops":
+                duplicated = len(row[field]) > 1
+            else:
+                duplicated = len(row[field]) != len(set(row[field]))
+            if duplicated:
+                row["issues"].add(issue)
+    if kind is not None:
+        rows = {key: row for key, row in rows.items() if key[1] == kind}
+    _plugin_list_print(sources, rows)
+    return 1 if ("unavailable" in sources.values()
+                 or any(row["issues"] for row in rows.values())) else 0
 
 
 def is_noop(outcome) -> bool:
