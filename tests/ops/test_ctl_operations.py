@@ -116,7 +116,8 @@ def test_backlog_list_uses_updated_at_then_id_and_shows_last_result(ctl_api):
     env.conn.commit()
     rc, out, err = run_ctl(env.root, ["backlog", "list", "--limit", "1"])
     assert rc == 0, err
-    assert out.splitlines() == ["#2 note system 2026-01-03T00:00:00+00:00 newer", "  result"]
+    assert out.splitlines() == ["#2 note system 2026-01-03T00:00:00+00:00 newer", "  result",
+                                "… 他にもあります (--limit N で増やすか --all)"]
 
 
 def test_backlog_list_empty_and_limit_boundaries(ctl_api):

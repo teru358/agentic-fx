@@ -125,7 +125,8 @@ _BACKLOG_TRUNCATION = "…[truncated]"
 
 def _precut(value: object) -> tuple[object, bool]:
     """Cut an oversized string to the redactor's input bound on a character boundary,
-    backing up to the last whitespace so a token is never split."""
+    backing up to the last whitespace so a token is never split. Without any
+    whitespace nothing of the text is kept."""
     if type(value) is not str:
         return value, False
     raw = value.encode("utf-8", "surrogatepass")
@@ -134,9 +135,9 @@ def _precut(value: object) -> tuple[object, bool]:
     kept = raw[:redactor.MAX_REDACT_VALUE_BYTES].decode("utf-8", "ignore")
     for index in range(len(kept) - 1, -1, -1):
         if kept[index].isspace():
-            kept = kept[:index]
-            break
-    return kept, True
+            return kept[:index], True
+    # 空白が無いと最後の token が途中で切れているかを判別できないので、本文は見せない。
+    return "", True
 
 
 def _backlog_text(value: object) -> tuple[str | None, bool]:

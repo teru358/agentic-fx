@@ -263,8 +263,24 @@ def test_backlog_precut_backs_up_to_whitespace_before_a_token_at_the_boundary():
     cut, precut = service._precut(text)
     assert precut is True and cut == "a" * 8180
     spaceless, flag = service._precut("b" * 9000)
-    assert flag is True and spaceless == "b" * 8192
+    assert flag is True and spaceless == ""
     assert service._precut("c" * 8192) == ("c" * 8192, False)
+
+
+def test_backlog_text_never_shows_a_fragment_of_a_split_token():
+    from agentic_fx.ops import service
+    piece = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    secret = "sk-abcdefghijklmnop"
+    value = ":".join([piece] * 248) + ":" + secret
+    assert len(value.encode()) > service.redactor.MAX_REDACT_VALUE_BYTES
+    text, truncated = service._backlog_text(value)
+    assert truncated is True and text == service._BACKLOG_TRUNCATION
+    assert "sk-" not in text and "abcde" not in text
+    spaced = " ".join([piece] * 248) + " " + secret
+    text, truncated = service._backlog_text(spaced)
+    assert truncated is True and "sk-" not in text and secret[3:8] not in text
+    assert text.endswith(service._BACKLOG_TRUNCATION)
+    assert len(text.encode()) <= service._BACKLOG_TEXT_LIMIT
 
 
 @pytest.mark.parametrize("last_result", [None, ""])
