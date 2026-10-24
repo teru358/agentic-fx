@@ -220,3 +220,90 @@ def test_alias_message_comes_from_the_surface_table_and_stays_off_stdout(tmp_pat
     client.Runner(_StubApi(tmp_path, [_ok({"id": 1})]), stdin=io.StringIO(), stdout=io.StringIO(),
                   stderr=quiet).run(client.parse(["backlog", "add", "x"]))
     assert quiet.getvalue() == ""
+
+
+def test_backlog_list_parse_rejects_repeated_limit_before_sending(tmp_path):
+    with pytest.raises(client.ClientError) as err:
+        client.parse(["backlog", "list", "--limit", "1", "--limit", "2"])
+    assert err.value.rc == client.RC_USAGE
+
+
+@pytest.mark.parametrize("size", [8192, 8193, 20000])
+@pytest.mark.parametrize("column", ["last_result", "idea"])
+def test_backlog_list_precut_keeps_the_head_of_oversized_text(ops_env, size, column):
+    text = "head " + "word " * (size // 5)
+    text = text[:size]
+    if column == "idea":
+        _insert(ops_env, idea=text, last_result=None)
+    else:
+        _insert(ops_env, idea="short", last_result=text)
+    item = ops_env.service().list_backlog(Principal.OPERATOR)["items"][0]
+    value = item[column]
+    assert value.startswith("head word") and "[REDACTED]" not in value
+    assert len(value.encode("utf-8")) <= 4096
+    assert item[f"{column}_truncated"] is True and value.endswith("…[truncated]")
+
+
+def test_backlog_list_system_source_idea_is_precut_not_fully_redacted(ops_env):
+    ops_env.conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm,last_result) VALUES (?,?,?,?,?,?,?)",
+        ("head " + "yy " * 7000, "system", "open", "2026-10-05T00:00:00+00:00",
+         "2026-10-05T00:00:00+00:00", "n", None))
+    ops_env.conn.commit()
+    item = ops_env.service().list_backlog(Principal.OPERATOR)["items"][0]
+    assert item["idea"].startswith("head ") and item["idea_truncated"] is True
+    assert "[REDACTED]" not in item["idea"]
+
+
+def test_backlog_precut_backs_up_to_whitespace_before_a_token_at_the_boundary():
+    from agentic_fx.ops import service
+    token = "api_key=" + "z" * 40
+    text = "a" * 8180 + " " + token
+    cut, precut = service._precut(text)
+    assert precut is True and cut == "a" * 8180
+    spaceless, flag = service._precut("b" * 9000)
+    assert flag is True and spaceless == "b" * 8192
+    assert service._precut("c" * 8192) == ("c" * 8192, False)
+
+
+@pytest.mark.parametrize("last_result", [None, ""])
+def test_backlog_list_cli_prints_no_second_line_for_empty_last_result(tmp_path, last_result):
+    item = {"id": 1, "status": "open", "source": "user", "updated_at": "now", "idea": "i",
+            "idea_truncated": False, "last_result": last_result, "last_result_truncated": False}
+    out = io.StringIO()
+    client.Runner(_StubApi(tmp_path, [_ok({"items": [item], "limit": 100, "has_more": False})]),
+                  stdin=io.StringIO(), stdout=out).run(client.parse(["backlog", "list"]))
+    assert len(out.getvalue().splitlines()) == 1
+
+
+@pytest.mark.parametrize("has_more,shown", [(True, True), (False, False), ("missing", False),
+                                            ("true", False), (1, False)])
+def test_backlog_list_cli_has_more_fixed_line(tmp_path, has_more, shown):
+    item = {"id": 1, "status": "open", "source": "user", "updated_at": "now", "idea": "i",
+            "idea_truncated": False, "last_result": None, "last_result_truncated": False}
+    data = {"items": [item], "limit": 100}
+    if has_more != "missing":
+        data["has_more"] = has_more
+    out = io.StringIO()
+    client.Runner(_StubApi(tmp_path, [_ok(data)]), stdin=io.StringIO(), stdout=out).run(
+        client.parse(["backlog", "list"]))
+    lines = out.getvalue().splitlines()
+    assert len(lines) == (2 if shown else 1)
+    if shown:
+        assert lines[-1] == "… 他にもあります (--limit N で増やすか --all)"
+
+
+def test_backlog_list_cli_zero_rows_prints_only_the_count_line(tmp_path):
+    out = io.StringIO()
+    client.Runner(_StubApi(tmp_path, [_ok({"items": [], "limit": 100, "has_more": True})]),
+                  stdin=io.StringIO(), stdout=out).run(client.parse(["backlog", "list"]))
+    assert out.getvalue() == "backlog: 0 件\n"
+
+
+def test_unknown_via_alias_warns_without_traceback(tmp_path):
+    op = client.Op("help", [], via_alias="no such alias")
+    err, out = io.StringIO(), io.StringIO()
+    assert client.Runner(_StubApi(tmp_path, []), stdin=io.StringIO(), stdout=out,
+                         stderr=err).run(op) == client.RC_OK
+    assert "`afx ctl no such alias` は旧名です。`afx ctl help` で正式名を確かめてください。" in err.getvalue()

@@ -123,14 +123,31 @@ _BACKLOG_TEXT_LIMIT = 4096
 _BACKLOG_TRUNCATION = "…[truncated]"
 
 
+def _precut(value: object) -> tuple[object, bool]:
+    """Cut an oversized string to the redactor's input bound on a character boundary,
+    backing up to the last whitespace so a token is never split."""
+    if type(value) is not str:
+        return value, False
+    raw = value.encode("utf-8", "surrogatepass")
+    if len(raw) <= redactor.MAX_REDACT_VALUE_BYTES:
+        return value, False
+    kept = raw[:redactor.MAX_REDACT_VALUE_BYTES].decode("utf-8", "ignore")
+    for index in range(len(kept) - 1, -1, -1):
+        if kept[index].isspace():
+            kept = kept[:index]
+            break
+    return kept, True
+
+
 def _backlog_text(value: object) -> tuple[str | None, bool]:
     """Redact and bound user guidance before it crosses the API boundary."""
     if value is None:
         return None, False
+    value, precut = _precut(value)
     text = redactor.redact_value(value)
     text = " ".join(text.split())
     encoded = text.encode("utf-8")
-    if len(encoded) <= _BACKLOG_TEXT_LIMIT:
+    if len(encoded) <= _BACKLOG_TEXT_LIMIT and not precut:
         return text, False
     suffix = _BACKLOG_TRUNCATION.encode("utf-8")
     kept = encoded[:_BACKLOG_TEXT_LIMIT - len(suffix)].decode("utf-8", "ignore")

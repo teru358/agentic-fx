@@ -985,13 +985,14 @@ def _parse_events(args: list[str]) -> list:
 
 
 def _parse_backlog_list(args: list[str]) -> list:
-    all_statuses, limit = False, 100
+    all_statuses, limit, seen_limit = False, 100, False
     rest = list(args)
     while rest:
         flag = rest.pop(0)
         if flag == "--all" and not all_statuses:
             all_statuses = True
-        elif flag == "--limit" and rest:
+        elif flag == "--limit" and rest and not seen_limit:
+            seen_limit = True
             limit = _int_arg(rest.pop(0))
         else:
             raise ClientError(RC_USAGE, USAGE)
@@ -1019,10 +1020,14 @@ class Runner:
     def run(self, op: Op) -> int:
         if op.via_alias is not None:
             from agentic_fx.cli_surface import ALIASES
-            alias = next(item for item in ALIASES if item.parser_alias == op.via_alias)
-            old = f"afx ctl {alias.parser_alias}"
-            canonical = alias.canonical_usage.split(" <", 1)[0]
-            self.warn(f"`{old}` は旧名です。`{canonical}` を使ってください。")
+            by_alias = {item.parser_alias: item for item in ALIASES}
+            alias = by_alias.get(op.via_alias)
+            old = f"afx ctl {op.via_alias}"
+            if alias is None:
+                self.warn(f"`{old}` は旧名です。`afx ctl help` で正式名を確かめてください。")
+            else:
+                canonical = alias.canonical_usage.split(" <", 1)[0]
+                self.warn(f"`{old}` は旧名です。`{canonical}` を使ってください。")
         if op.name == "help":
             self.say(USAGE)
             return RC_OK
@@ -1173,8 +1178,10 @@ class Runner:
             self.say(f"#{_ident(row.get('id'))} {_safe_cell(row.get('status'), 200)} "
                      f"{_safe_cell(row.get('source'), 200)} {_safe_cell(row.get('updated_at'), 200)} "
                      f"{_backlog_display(row.get('idea'))}")
-            if row.get("last_result") is not None:
+            if row.get("last_result") not in (None, ""):
                 self.say("  " + _backlog_display(row.get("last_result")))
+        if data.get("has_more") is True:
+            self.say("… 他にもあります (--limit N で増やすか --all)")
         return RC_OK
 
     def _op_backlog_transition(self, action: str, bid: int, *, terminal) -> int:

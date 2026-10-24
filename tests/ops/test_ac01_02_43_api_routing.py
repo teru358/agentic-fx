@@ -67,7 +67,7 @@ def _calls(api, env):
     ]
 
 
-def test_ac1_all_24_endpoints_over_real_uds(api):
+def test_ac1_all_26_endpoints_over_real_uds(api):
     from agentic_fx.ops.api_server import _match
     client = api.client(Principal.APPROVER)
     seen = set()
