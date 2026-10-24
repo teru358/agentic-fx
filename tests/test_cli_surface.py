@@ -87,7 +87,7 @@ EXPECTED = (
     ('analyze corr', G.RESEARCH, "LOCAL", 'afx analyze corr …', None, "CHANGE", False, False, None, None, False, None),
     ('ctl ask', G.GUIDANCE, "CTL", 'afx ctl ask <question>', 'ask <質問>', "CHANGE", False, False, 'operate', 'ask', True, None),
     ('ctl improve', G.GUIDANCE, "CTL", 'afx ctl improve', 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
-    ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'improve add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
+    ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'backlog add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
     ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit N]', None, "READ", False, False, 'guidance.read', 'backlog_list', True, None),
     ('ctl backlog reject', G.GUIDANCE, "CTL", 'afx ctl backlog reject <id>', 'backlog reject <id>', "CHANGE", False, False, 'operate', 'backlog_reject', True, None),
     ('ctl backlog reopen', G.GUIDANCE, "CTL", 'afx ctl backlog reopen <id>', 'backlog reopen <id>', "CHANGE", False, False, 'operate', 'backlog_reopen', True, None),
@@ -320,9 +320,17 @@ def test_shell_lifecycle_has_one_owner():
         "1.5.0", compatibility=(), commands=(), shell_lifecycle=moved)
 
 
-@pytest.mark.xfail(strict=True, reason="the shell accepts only `improve add` until the shell parser takes `backlog add`")
 def test_shell_advertises_the_canonical_backlog_add_form():
     assert _record("ctl backlog add").shell_usage == "backlog add <idea>"
+
+
+@pytest.mark.xfail(strict=True, reason="the ctl parser takes `backlog add` only once the canonical parser lands")
+def test_the_ctl_parser_accepts_the_advertised_backlog_add_form():
+    """metadata が広告する shell 形を、実際の parser が受理するまで赤のまま
+    置き、受理した時点で strict に失敗して pin の更新を強制する。"""
+    from agentic_fx.ops.client import parse
+    op = parse(["backlog", "add", "x"])
+    assert op.name == "backlog_add"
 
 
 def test_hidden_records_render_nothing():

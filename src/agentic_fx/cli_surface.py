@@ -212,7 +212,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "improve one-shot を実行する", "ops/client.py", shell_usage="improve", shell=True,
             scope="operate", endpoint_code="improve", daemon_required=True),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog add", "afx ctl backlog add <idea>", Label.CHANGE,
-            "バックログへ課題を追加する", "ops/client.py", shell_usage="improve add <idea>", shell=True,
+            "バックログへ課題を追加する", "ops/client.py", shell_usage="backlog add <idea>", shell=True,
             scope="operate", endpoint_code="backlog_add", daemon_required=True, implemented=False),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog list",
             "afx ctl backlog list [--all] [--limit N]", Label.READ,
