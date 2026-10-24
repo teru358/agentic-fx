@@ -15,7 +15,6 @@ from afx_ops.config import ConfigError, read_config
 from afx_ops.interfaces import Candidate, InterfaceLookupError
 from afx_ops.isolation import accept_loop, startup
 from afx_ops.isolation.accept_loop import ListenerError, check_listener, prebind_listener
-from afx_ops.isolation.startup import feature_dirs
 
 SCRIPT = Path(sys.executable).parent / "afx-ops"
 LAN = "192.168.1.10"
@@ -27,8 +26,18 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+_DIRS: dict[str, object] = {}
+
+
+@pytest.fixture(autouse=True)
+def _web_dirs(ops_dirs):
+    _DIRS["web"] = ops_dirs("web")
+    yield
+    _DIRS.clear()
+
+
 def _install(extra: str = "", *, port: int | None = None, raw: str | None = None) -> Path:
-    dirs = feature_dirs("web")
+    dirs = _DIRS["web"]
     dirs.config.mkdir(parents=True, mode=0o700)
     dirs.config.chmod(0o700)
     text = ('instance_root = "/srv/afx-probe"\nkey_dir = "/srv/afx-probe-keys"\n'
@@ -40,7 +49,7 @@ def _install(extra: str = "", *, port: int | None = None, raw: str | None = None
 
 
 def _secret_dir(*, mode: int = 0o700) -> Path:
-    path = feature_dirs("web").secret
+    path = _DIRS["web"].secret
     path.mkdir(parents=True, mode=mode, exist_ok=True)
     path.chmod(mode)
     return path
@@ -160,7 +169,7 @@ def test_secret_residue_is_secret_unexpected_and_nothing_is_removed(home, capsys
 def test_a_missing_secret_dir_is_allowed_and_is_not_created(home, capsys):
     _install()
     assert _run(capsys)[0] == 0
-    assert not feature_dirs("web").secret.exists()
+    assert not _DIRS["web"].secret.exists()
 
 
 # --- 実 bind -----------------------------------------------------------------------
@@ -195,8 +204,9 @@ def test_a_getsockname_that_differs_from_the_setting_is_probe_bind_failed(home, 
         with monkeypatch.context() as scoped:
             scoped.setattr(accept_loop, "socket", shim)
             assert _run(capsys) == (73, "", "afx-ops: probe_bind_failed\n")
-    assert feature_dirs("web").config.is_relative_to(home)
-    shutil.rmtree(feature_dirs("web").config)
+    config_dir = _DIRS["web"].config
+    assert config_dir.is_relative_to(home)
+    shutil.rmtree(config_dir)
 
 
 def test_check_listener_compares_both_the_address_and_the_port():

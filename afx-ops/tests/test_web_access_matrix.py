@@ -22,7 +22,6 @@ from _afx_isolation_support import make_root, needs_landlock, needs_x86_64, run_
 from afx_ops import interfaces, probe
 from afx_ops.config import ConfigError, read_config
 from afx_ops.isolation import startup
-from afx_ops.isolation.startup import feature_dirs
 
 ROWS = matrix.rows()
 ABSENT = "192.168.77.5"
@@ -62,9 +61,8 @@ def _fake_ip(directory: Path, row: dict, local: str) -> tuple[str, Path]:
     return str(script), marker
 
 
-def _build(row: dict, *, root: str, keys: str, port: int, local: str) -> None:
+def _build(dirs, row: dict, *, root: str, keys: str, port: int, local: str) -> None:
     """row が表す ops.toml・config dir・secret dir を XDG の領域に置く。"""
-    dirs = feature_dirs("web")
     if row.get("config_dir") == "missing":
         return
     dirs.config.mkdir(parents=True, mode=0o700)
@@ -100,10 +98,10 @@ def _build(row: dict, *, root: str, keys: str, port: int, local: str) -> None:
             (dirs.secret / "stray").write_text("x")
 
 
-def _as_other_uid(monkeypatch, row: dict) -> None:
+def _as_other_uid(monkeypatch, dirs, row: dict) -> None:
     if row.get("ops_toml") != "other_uid":
         return
-    inode = (feature_dirs("web").config / "ops.toml").stat().st_ino
+    inode = (dirs.config / "ops.toml").stat().st_ino
     real = os.fstat
 
     def foreign(fd):
@@ -195,10 +193,10 @@ def _config_reason(monkeypatch, row, local, tmp_path) -> str | None:
 
 @pytest.mark.parametrize("row", [r for r in ROWS if not r.get("body_only")], ids=_ids(
     [r for r in ROWS if not r.get("body_only")]))
-def test_config_entry_reason(row, home, monkeypatch, tmp_path, local_address):
-    _build(row, root="/srv/afx-matrix", keys="/srv/afx-matrix-keys", port=_free_port(),
+def test_config_entry_reason(row, home, ops_dirs, monkeypatch, tmp_path, local_address):
+    _build(ops_dirs("web"), row, root="/srv/afx-matrix", keys="/srv/afx-matrix-keys", port=_free_port(),
            local=local_address)
-    _as_other_uid(monkeypatch, row)
+    _as_other_uid(monkeypatch, ops_dirs("web"), row)
     assert _config_reason(monkeypatch, row, local_address, tmp_path) == row["expected"]
 
 
@@ -206,10 +204,10 @@ def test_config_entry_reason(row, home, monkeypatch, tmp_path, local_address):
 
 @pytest.mark.parametrize("row", [r for r in ROWS if not r.get("body_only")], ids=_ids(
     [r for r in ROWS if not r.get("body_only")]))
-def test_probe_entry_reason(row, home, monkeypatch, tmp_path, capsys, local_address):
-    _build(row, root="/srv/afx-matrix", keys="/srv/afx-matrix-keys", port=_free_port(),
+def test_probe_entry_reason(row, home, ops_dirs, monkeypatch, tmp_path, capsys, local_address):
+    _build(ops_dirs("web"), row, root="/srv/afx-matrix", keys="/srv/afx-matrix-keys", port=_free_port(),
            local=local_address)
-    _as_other_uid(monkeypatch, row)
+    _as_other_uid(monkeypatch, ops_dirs("web"), row)
     script, marker = _fake_ip(tmp_path, row, local_address)
     monkeypatch.setattr(interfaces, "IP_CANDIDATES", (script,))
     rc = probe.main("web")
@@ -226,19 +224,18 @@ def test_probe_entry_reason(row, home, monkeypatch, tmp_path, capsys, local_addr
 
 @needs_x86_64
 @needs_landlock
-@pytest.mark.parametrize("row", [r for r in ROWS if not r.get("body_only")
-                                 and r.get("ops_toml") != "other_uid"],
-                         ids=_ids([r for r in ROWS if not r.get("body_only")
-                                   and r.get("ops_toml") != "other_uid"]))
-def test_production_entry_reason(row, home, tmp_path, local_address):
+@pytest.mark.parametrize("row", [r for r in ROWS if not r.get("body_only")],
+                         ids=_ids([r for r in ROWS if not r.get("body_only")]))
+def test_production_entry_reason(row, home, ops_dirs, tmp_path, local_address):
     base = make_root(tmp_path / "iso")
-    _build(row, root=str(base / "root"), keys=str(base / "keys"), port=_free_port(),
+    _build(ops_dirs("web"), row, root=str(base / "root"), keys=str(base / "keys"), port=_free_port(),
            local=local_address)
     script, marker = _fake_ip(tmp_path, row, local_address)
     env = {"PATH": os.environ.get("PATH", ""), "HOME": str(home),
            "XDG_CONFIG_HOME": str(home / ".config"), "XDG_STATE_HOME": str(home / ".state")}
     got = run_canary({"feature": "web", "root": str(base), "toml": True, "dirs": "xdg",
-                      "op": "config_view", "params": {}, "fake_ip": script}, env)
+                      "op": "config_view", "params": {}, "fake_ip": script,
+                      "foreign_owner": row.get("ops_toml") == "other_uid"}, env)
     _check_called(row, marker)
     if row["expected"] is None:
         assert got.rc == 0 and got.isolated, got.stderr[-1500:]

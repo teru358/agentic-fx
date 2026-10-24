@@ -99,6 +99,11 @@ class OpsConfig:
         return (LOOPBACK_NETWORK,) if self.allow is None else self.allow
 
 
+# ops.toml の所有者として期待する uid。試験が差し替えて他 uid の file を再現する場所で、
+# production は差し替えない (既定は実効 process の uid)。
+_expected_owner_uid = os.getuid
+
+
 def _read_toml(feature: str, *, preserve_config_dir_error: bool = False) -> tuple[dict[str, object], int]:
     web = feature == "web"
     try:
@@ -121,7 +126,7 @@ def _read_toml(feature: str, *, preserve_config_dir_error: bool = False) -> tupl
             raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID) from None
         try:
             st = os.fstat(fd)
-            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != _expected_owner_uid()
                     or stat.S_IMODE(st.st_mode) & 0o022):
                 raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID)
             chunks = []

@@ -205,10 +205,10 @@ def test_crash_after_two_xx_before_commit_resends_the_same_id(state_dir, monkeyp
 
     def crash(_fd, _state):
         raise Crash()
-    monkeypatch.setattr(runtime, "save", crash)
-    with pytest.raises(Crash):
-        _run(state_dir, client, send)
-    monkeypatch.undo()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(runtime, "save", crash)
+        with pytest.raises(Crash):
+            _run(state_dir, client, send)
     assert _state(state_dir).cursor == 0
     # 再起動: 同じ cursor から読み直し、同じ event_id をもう一度送る (at-least-once)
     again = FakeClient([{"events": [_event(1)], "high_watermark": 1}])

@@ -238,6 +238,34 @@ def test_timeout_boundary_at_five_seconds(tmp_path, monkeypatch, now, ok):
     assert _no_children()
 
 
+def test_select_never_waits_past_the_remaining_time(tmp_path, monkeypatch):
+    path = _fake_ip(tmp_path, "exec sleep 30")
+    seen: list[float] = []
+    real = interfaces.select.select
+
+    def spy(r, w, x, timeout):
+        seen.append(timeout)
+        return real(r, w, x, timeout)
+
+    monkeypatch.setattr(interfaces.select, "select", spy)
+    readings = iter([0.0, 0.199])
+    monkeypatch.setattr(interfaces.time, "monotonic", lambda: next(readings, 1.0))
+    with pytest.raises(InterfaceLookupError):
+        _list(path, timeout=0.2)
+    assert len(seen) == 1 and seen[0] == pytest.approx(0.001, abs=1e-9)
+
+
+def test_a_silent_child_is_killed_right_at_the_deadline(tmp_path):
+    import time
+    path = _fake_ip(tmp_path, "exec sleep 30")
+    started = time.monotonic()
+    with pytest.raises(InterfaceLookupError):
+        _list(path)
+    elapsed = time.monotonic() - started
+    assert 5.00 <= elapsed <= 5.02, elapsed
+    assert _no_children()
+
+
 def test_a_run_that_never_ends_is_killed_and_reaped(tmp_path):
     pid_file = tmp_path / "pid"
     path = _fake_ip(tmp_path, f"echo $$ > '{pid_file}'; exec sleep 30")

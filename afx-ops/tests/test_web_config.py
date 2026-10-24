@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from afx_ops.config import WEB_UNRESTRICTED, ConfigError, OpsConfig, read_config
-from afx_ops.isolation.startup import feature_dirs
 
 BASE = 'instance_root = "/srv/afx"\nkey_dir = "/srv/keys"\n'
 NET = ipaddress.IPv4Network
@@ -17,7 +16,7 @@ NET = ipaddress.IPv4Network
 
 def _install(monkeypatch, tmp_path: Path, text: str, *, mode: int = 0o600) -> Path:
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    path = feature_dirs("web").config / "ops.toml"
+    path = tmp_path / "cfg" / "agentic-fx" / "ops" / "web" / "config" / "ops.toml"
     path.parent.mkdir(parents=True, mode=0o700)
     path.write_text(text, encoding="utf-8")
     path.chmod(mode)
@@ -220,7 +219,7 @@ def test_an_ops_toml_owned_by_another_uid_is_config_dir_invalid(monkeypatch, tmp
 
 def test_other_features_keep_their_existing_reasons_for_an_unsafe_ops_toml(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
-    path = feature_dirs("notify").config / "ops.toml"
+    path = tmp_path / "cfg" / "agentic-fx" / "ops" / "notify" / "config" / "ops.toml"
     path.parent.mkdir(parents=True, mode=0o700)
     path.write_text(BASE, encoding="utf-8")
     path.chmod(0o666)
@@ -234,3 +233,8 @@ def test_web_config_errors_are_printed_as_a_fixed_reason_only(monkeypatch, tmp_p
     _install(monkeypatch, tmp_path, BASE + 'port = 8080\nbind = "not-an-ip"\n')
     assert cli.main(["web"]) == 71
     assert capsys.readouterr().err == "afx-ops: config_invalid\n"
+
+
+def test_the_ops_toml_owner_check_defaults_to_the_effective_uid():
+    from afx_ops import config
+    assert config._expected_owner_uid is os.getuid

@@ -35,6 +35,8 @@ spec:
          p.orig へ退け、p を q への symlink に置き換える (検査と規則の間の差し替え)
   toml: 真なら web の設定を起動口と同じ `read_config` で XDG の ops.toml から読み、その
          port / bind / auth で plan を作る (設定の違反は起動口と同じ固定 reason で止まる)
+  foreign_owner: 真なら ops.toml の所有者として期待する uid を実 uid と別の値にする
+         (他 uid の file を実 process で作れないための再現)
   fake_ip: interface 列挙に使う実行 file の path を差し替える
   resolv_conf: 名前解決の規則に使う resolv.conf の path を差し替える (実 /etc/resolv.conf を
          書き換えずに、rename 置換で規則の外れた inode を作る試験のため)
@@ -853,6 +855,9 @@ def main() -> int:
         sys.stdin.readline()
     if spec.get("resolv_conf"):
         startup.RESOLV_CONF = spec["resolv_conf"]
+    if spec.get("foreign_owner"):
+        from afx_ops import config as ops_config
+        ops_config._expected_owner_uid = lambda: os.getuid() + 1
     if spec.get("fake_ip"):
         from afx_ops import interfaces
         interfaces.IP_CANDIDATES = (spec["fake_ip"],)

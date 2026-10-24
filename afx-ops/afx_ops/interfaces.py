@@ -80,9 +80,10 @@ def _run_bounded(executable: str, timeout: float) -> bytes:
         chunks: list[bytes] = []
         size = 0
         while True:
-            if time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 raise InterfaceLookupError
-            ready, _w, _x = select.select([fd], [], [], _SLICE)
+            ready, _w, _x = select.select([fd], [], [], min(_SLICE, remaining))
             if not ready:
                 continue
             chunk = os.read(fd, _READ)
