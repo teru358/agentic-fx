@@ -127,7 +127,7 @@ password は 8〜32 byte の visible ASCII (`0x21..0x7e`) とし、`:` を許可
 space、tab、改行、他の C0 / DEL、非 ASCII、8 byte 未満、32 byte 超を拒否する。
 生成値は CSPRNG の random 16 byte を padding なし base64url で表した 22 byte とする。
 
-T2 以前に作成された 33〜128 byte の `web.password` は T3 後には `secret_invalid` となる。`afx ops web reconfigure` は不安全な既存 secret で無変更停止するため、回復は `--non-interactive --secret-action install --password-file <path>` を用いるか、停止中に `web.password` を手で削除してから reconfigure で再設定する。所有者、mode、型、symlink、byte grammar 又は size が不安全な既存 secret は自動修復しない。
+T2 以前に作成された 33〜128 byte の `web.password` は T3 後には `secret_invalid` となる。`afx ops web reconfigure` は対話・非対話とも不安全な既存 secret (size 違反を含む) で無変更停止し、`--secret-action install` でも置き換えない。回復手順は 1 つだけ: 停止している間に `web.password` を手で削除し、その後 reconfigure (対話なら再設定、非対話なら `--secret-action install --password-file <path>`) で 8〜32 byte の password を入れる。所有者、mode、型、symlink、byte grammar 又は size が不安全な既存 secret は自動修復しない。
 
 ### 2.3 grammar と組み合わせの妥当性
 
@@ -1002,7 +1002,7 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 分散総当たり | 送信元別 / global の固定窓は試行速度を制限するが、時間を空けた攻撃、複数 process / host、credential の別経路漏えいを防がない。 |
 | rate-limit の再起動 reset | rate-limit は process 内状態であり、通常再起動や `accept_exhausted` 後の systemd 再起動で履歴が消える。永続化は今回の非目標であり、再起動後は新しい送信元別 5 回 / global 100 回の窓が始まる。 |
 | 生成 password の初回表示 | 生成値は一度だけ表示するため、その時点の画面共有、端末 scrollback、肩越しの観察から漏えいし得る。製品は端末側の記録を消去できない。 |
-| 旧 password の移行 | T2 で許容した 33〜128 byte の `web.password` は T3 後に `secret_invalid` となる。reconfigure は不安全 secret で停止するため、停止中に `web.password` を削除してから再設定するか、`--non-interactive --secret-action install --password-file <path>` で 8〜32 byte の password を install して回復する。 |
+| 旧 password の移行 | T2 で許容した 33〜128 byte の `web.password` は T3 後に `secret_invalid` となる。reconfigure は対話・非対話とも不安全 secret で停止する (install でも置き換えない) ため、回復は停止中に `web.password` を削除してから reconfigure で再設定する 1 経路に限る。運用文書 §10 に手順を書く。 |
 | 本体と afx-ops の版ずれ | `resolve_ops_exec` は PATH 上の afx-ops を優先する。必ず同じ checkout の afx-ops を使う。新しい本体と旧 afx-ops の組では、`user` を未知 key として拒む `config_invalid`、又は旧 interface JSON v1 を拒む `interface_lookup_failed` が出る。いずれも fail closed であり、両方を同じ版へそろえて回復する。 |
 | Host 検査 | DNS rebinding や誤転送への defense-in-depth であり、network reachability、allow、auth、TLS の代替ではない。 |
 | Basic logout | browser が credential を保持するため、確実な logout 操作を提供できない。browser を閉じても保持が続く場合がある。 |
@@ -1032,3 +1032,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.9e | §3.3 の header 無し 401 を「rate limit 中でなければ」に限定 (§3.4 と実装に合わせる)。 | T2a 差分再確認 (codex terra) の Low | |
 | 2026-10-24 | v0.10 | 実機確認後のウィザードを、待受 address の説明と interface 名、角括弧内の初期値、アクセス制限の 4 択へ改めた。`user` key と動的 Basic credential、status の user 表示、password の 8〜32 byte・空 Enter 生成・手入力確認、`--password-file` 境界、AC / mutation / T3 を追加した。 | ユーザー実機確認の指摘と裁定。 | `eaec85e` |
 | 2026-10-24 | v0.11 | 安全な既存 Basic password の維持 / 再設定、対話・非対話の対応、生成 password と要約の username 表示、`re.fullmatch` と writer 規則、interface JSON v2 / password 境界の両 package 同時更新、旧 password と版ずれの回復、AC / mutation / 運用文書 pin を追加した。 | v0.10 レビューとユーザー裁定 (2026-10-24 18:06)。 | — |
+| 2026-10-24 | v0.11a | 旧 password (33〜128 byte) の回復手順を「停止中に削除してから reconfigure」の 1 経路に統一 (§5.2 の非対話表と矛盾していた install 直接経路を除去)。 | v0.11 差分閉鎖確認 (codex terra) の Medium | |
