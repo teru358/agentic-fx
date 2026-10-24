@@ -169,16 +169,16 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
                             "broken:invalid_pending")
                         continue
                     live_set = live_kinds.get(name, set())
-                    mismatch = proposed not in _PLUGIN_KINDS or (
-                        bool(live_set) and proposed not in live_set)
-                    if not mismatch:
-                        placed = proposed
-                    else:
+                    if proposed not in _PLUGIN_KINDS:
                         placed = next(iter(live_set)) if len(live_set) == 1 else "unknown"
+                        issue = "kind_missing"
+                    else:
+                        placed = proposed
+                        issue = "kind_mismatch" if live_set and proposed not in live_set else None
                     row = item(name, placed)
                     row["pending"].append(content)
-                    if mismatch:
-                        row["issues"].add("kind_mismatch")
+                    if issue:
+                        row["issues"].add(issue)
             except sqlite3.Error:
                 sources["pending"] = "unavailable"
             try:

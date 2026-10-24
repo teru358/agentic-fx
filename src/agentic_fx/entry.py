@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             feature_sub.add_parser(action, help=text)
         if feature == "web":
             feature_sub.add_parser("reconfigure",
-                                   help="web の設定を変更する (web-lan T2 で実装、現在は未実装)")
+                                   help="web の設定を変更する (現在は未実装)")
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")

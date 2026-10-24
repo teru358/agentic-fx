@@ -336,7 +336,7 @@ opencode のモデル一覧を取得できませんでした (model_list_unavail
 モデル一覧を取得できませんでした。モデル名を手入力します (未確認のまま記録します)。
 opencode の context_limit は llama-swap の --ctx-size と同じ値にします。
 取得できませんでした。手入力してください。
-improve.llama_swap_verified はここでは true にしません。`afx improve verify-backend --backend opencode` に合格してから手で書いてください。
+improve.llama_swap_verified はここでは true にしません。`afx check backend --backend opencode` に合格してから手で書いてください。
 現在の値と同じです。変更なしで進みます。
 ```
 
@@ -405,7 +405,7 @@ improve.llama_swap_verified はここでは true にしません。`afx improve 
 手動起動なら対話シェルで操作し、外からは見えません。
 afx を常駐サービス (systemd user unit) として動かしますか [Y/n]
 .env に必要なキーはありません。
-.env は作りません (.gitignore で除外済みです)。Discord の token と通知の webhook URL は `afx ops enable` が feature 専用の secret file に置きます。
+.env は作りません (.gitignore で除外済みです)。Discord の token と通知の webhook URL は `afx ops <feature> enable` が feature 専用の secret file に置きます。
 ```
 
 必要なキーがある構成 (Twelve Data、bridge の API キー) では `.env に必要なキー: TWELVEDATA_API_KEY (なし)` のように、あり / なしだけを表示します (値は表示しません)。
@@ -523,7 +523,7 @@ settings.yaml の変更点はありません。
 [段 13 常駐化と外から見る手段]
 （段 8 で常駐を選んだ場合、unit の内容を表示して確認します。）
 unit (afx.service) を設置しました。
-外から見る / 操作する手段: bot (Discord bot) / web (読み取り専用 web) / notify (通知)。質問 (token・port・webhook URL など) は `afx ops enable` 側が端末から直接受けます。
+外から見る / 操作する手段: bot (Discord bot) / web (読み取り専用 web) / notify (通知)。質問 (token・port・webhook URL など) は `afx ops <feature> enable` 側が端末から直接受けます。
 外から見る手段を今設定しますか (既定: あとで) [y/N] 
 ```
 

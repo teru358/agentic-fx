@@ -308,7 +308,7 @@ def test_the_help_marks_the_web_reconfigure_stub_as_unimplemented(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["ops", "web", "--help"])
     assert exc.value.code == 0
-    assert "web-lan T2 で実装、現在は未実装" in capsys.readouterr().out
+    assert "(現在は未実装)" in capsys.readouterr().out
 
 
 def test_expired_ops_legacy_shape_is_left_to_argparse(tmp_path, monkeypatch, capsys):
@@ -387,3 +387,32 @@ def test_enable_with_a_running_daemon_and_no_keys_stops_with_rc1_before_keys_ini
     assert keys_init == []
     assert captured.err.startswith("afx ops: afx_running_keys_not_initialized")
     assert captured.err.count("\n") == 1
+
+
+def test_enable_with_a_running_daemon_completes_with_rc0(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from agentic_fx.ops_setup.feature_config import write_inputs
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    write_inputs(tmp_path, "web", {"port": 8788})
+    keys_init: list[tuple] = []
+    enabled: list[str] = []
+    monkeypatch.setattr("agentic_fx.ops_setup.interactive.resolve_ops_exec",
+                        lambda paths: SimpleNamespace(ops_exec="/bin/true"))
+    monkeypatch.setattr("agentic_fx.ops_setup.interactive.run_probe", lambda *_args: (0, "ok"))
+    monkeypatch.setattr("agentic_fx.ops_setup.interactive.run_keys_command",
+                        lambda *args: keys_init.append(args) or 0)
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.enable",
+                        lambda self, feature: enabled.append(feature) or SimpleNamespace(stage="enabled"))
+    monkeypatch.setattr("agentic_fx.ops_setup.systemd.Systemd.show",
+                        lambda self, unit, *props: {"ActiveState": "active"})
+
+    assert main(["ops", "web", "enable"]) == 0
+
+    captured = capsys.readouterr()
+    assert enabled == ["web"] and keys_init == []
+    assert captured.out == "web: enabled\n"
+    assert "afx_running_keys_not_initialized" not in captured.err

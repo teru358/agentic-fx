@@ -141,7 +141,7 @@
 
 argv shim はすべて、現行 `entry.main()` と同じ方法で command head を決めてから適用する (`entry.py:19-25`)。先頭から連続する完全一致の `--daemon` を何個でも読み飛ばし、その次の位置を head とする。`improve` / `ops` の判定、`ops` の 2 語目と 3 語目の入替え、`reconf` の書換えは、すべて head からの相対位置で行う。head より前の `--daemon` は消さずにそのまま残す。head が `ctl` なら従来どおり client へ渡し、shim は何もしない。`--dae` のような略記は読み飛ばさず、現行どおり argparse の usage error にする。したがって `afx --daemon improve --help` は `afx improve --help` と同じ固定案内と rc=2 になり、`afx --daemon ops enable web` は `afx --daemon ops web enable` へ書き換わる。書換え後の扱いは、現行の `afx --daemon ops enable web` と同じである。
 
-`ops` の旧形と `reconf` も同じ argv shim で扱う。以下の「先頭語」「2 語目」「3 語目」は head からの位置を指す。先頭語が `ops` で 2 語目が `enable` / `disable` / `status` なら旧形である。3 語目が `bot` / `web` / `notify` なら 2 語目と 3 語目を入れ替え、案内を stderr に出してから通常の parse へ進む。3 語目が無い、または不正なら案内だけを出して rc=2 で終える。先頭語が `ops` で 3 語目が `reconf` なら `reconfigure` へ書き換え、案内は出さない。argparse には新形の parser だけを登録する。このため旧形と `reconf` は choices にも通常 help の一覧にも現れない。`reconf` は `afx ops --help` の `reconfigure` 行の説明文 `(別名 reconf)` にだけ書く。
+`ops` の旧形と `reconf` も同じ argv shim で扱う。以下の「先頭語」「2 語目」「3 語目」は head からの位置を指す。先頭語が `ops` で 2 語目が `enable` / `disable` / `status` なら旧形である。3 語目が `bot` / `web` / `notify` なら 2 語目と 3 語目を入れ替え、案内を stderr に出してから通常の parse へ進む。3 語目が無い、または不正なら案内だけを出して rc=2 で終える。先頭語が `ops` で 2 語目が `web` かつ 3 語目が `reconf` のときだけ `reconfigure` へ書き換え、案内は出さない。bot / notify の `reconf` は書き換えず、打った綴りのまま argparse の usage error (rc=2) にする。argparse には新形の parser だけを登録する。このため旧形と `reconf` は choices にも通常 help の一覧にも現れない。`reconf` は `afx ops --help` の `reconfigure` 行の説明文 `(別名 reconf)` にだけ書く。
 
 `improve` の廃止 compatibility record と `ops` 旧形の期限つき互換別名 record は、どちらも `deprecated_since="0.2.0"`、`remove_in="0.3.0"` を持つ。「1 版だけ残し、次版で削除」という裁定を、どちらについても次の minor release と読む。対話 shell の `1.0.0` は §8.2-1 の別件であり、この 2 record とは関係しない。version の比較は `.` 区切りの各成分を整数にした tuple の辞書順比較とし、`packaging` には依存しない。実行中 package version が `remove_in` 以上なら record が残っている test を失敗させ、期限超過の shim を自動検出する。
 
@@ -435,7 +435,7 @@ PluginListView(
 )
 ```
 
-1 行は `(name, kind)` 1 組とする。`version` は immutable な content hash (表示は一意な最短 12 文字以上の prefix、衝突時は full hash) である。下の固定例も 12 文字の prefix で書く。同じ name の indicator と strategy は別行にし、name 昇順、kind は `indicator` → `strategy` → `unknown` の順とする。同じ source 内の重複 name / version は上書きせずすべて保存し、version → approval id / operation id の順に並べ、`issues` に `duplicate_live`、`duplicate_pending` または `duplicate_open_op` を追加する。manifest を読めない plugin も落とさず `kind=unknown`、`issues=[broken:<fixed-reason>]` で出す。`--kind` 指定時は指定 kind の行だけを出し、unknown 行は出さないが source status は常に出す。
+1 行は `(name, kind)` 1 組とする。`version` は immutable な content hash (表示は一意な最短 12 文字以上の prefix、衝突時は full hash) である。下の固定例も 12 文字の prefix で書く。同じ name の indicator と strategy は別行にし、name 昇順、kind は `indicator` → `strategy` → `unknown` の順とする。同じ source 内の重複 name / version は上書きせずすべて保存し、version → approval id / operation id の順に並べ、`issues` に `duplicate_live`、`duplicate_pending` または `duplicate_open_op` を追加する。manifest を読めない plugin も落とさず `kind=unknown`、`issues=[broken:<fixed-reason>]` で出す。`--kind` 指定時は指定 kind の行だけを出し、unknown 行は出さないが source status は常に出す。終了コードは表示した行から算出し、`--kind` で隠した行の issue は数えない。
 
 stdout は source status 3 行と固定列 `NAME KIND LIVE PENDING OPEN_OP ISSUES` からなる。各列は見出しと値の最大幅まで空白で埋め、列の間は空白 2 つ、行末の空白は削る。配列は `,` で結合し、空は `-` とする。live `3f9a1c2b7d4e` + pending `8b0e6d5a2c91` + 未完 rollback を同時に持つ固定例は次とする。
 
@@ -974,3 +974,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5a | AC-13 / AC-32 に ID の食い違う終了 marker 3 行と CRLF の managed block 全体の fixture を逐語で追加。golden test は `color=False` を渡さず環境変数の除去だけにする (3.13 の argparse は `color` を受けない)。`unreadable` の show は手修正の固定文を出す。 | 閉鎖確認 (codex sol) の Medium 2 / Low 1 | |
 | 2026-10-24 | v0.5b | golden test は非 TTY capture + 3.14 以上だけ `color=False`。再生成する managed block の行終端は常に LF、外側の byte は保持 (CRLF block → `missing` の golden を追加)。 | 差分再確認 (codex terra) の Medium 2 | |
 | 2026-10-24 | v0.5c | §8.2-1 対話 shell の寿命をユーザー裁定で確定 (0.2.0 deprecated 表示、1.0.0 で削除)。 | ユーザー承認 | |
+| 2026-10-24 | v0.5d | §2.2 に `reconf` の書換えは web だけと明記。§4.7 に終了コードは表示した行から算出すると明記。 | 閉鎖確認 (opus) の Low 2 / Low 6 | |
