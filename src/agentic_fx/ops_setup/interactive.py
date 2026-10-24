@@ -30,6 +30,7 @@ from agentic_fx.ops_setup.web_wizard import FULL, ONE_QUESTION, RETRY_STEPS, STO
 class IO(Protocol):
     def isatty(self) -> bool: ...
     def ask(self, label: str, default: str | None = None) -> str | None: ...
+    def ask_raw(self, label: str, default: str | None = None) -> str | None: ...
     def ask_secret(self, label: str) -> str: ...
     def stdout(self, text: str) -> None: ...
     def stderr(self, text: str) -> None: ...
@@ -42,6 +43,12 @@ class ConsoleIO:
     def ask(self, label: str, default: str | None = None) -> str | None:
         suffix = f" [{default}]" if default is not None else ""
         answer = input(f"{label}{suffix}: ").strip()
+        return answer or default
+
+    def ask_raw(self, label: str, default: str | None = None) -> str | None:
+        """前後の空白を取り除かずに返す。空の行だけが default になる。"""
+        suffix = f" [{default}]" if default is not None else ""
+        answer = input(f"{label}{suffix}: ")
         return answer or default
 
     def ask_secret(self, label: str) -> str:

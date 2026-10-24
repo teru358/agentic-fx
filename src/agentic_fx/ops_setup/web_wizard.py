@@ -66,6 +66,7 @@ def choice_text(label: str, options: Sequence[str]) -> str:
 class IO(Protocol):
     def isatty(self) -> bool: ...
     def ask(self, label: str, default: str | None = None) -> str | None: ...
+    def ask_raw(self, label: str, default: str | None = None) -> str | None: ...
     def ask_secret(self, label: str) -> str: ...
     def stdout(self, text: str) -> None: ...
     def stderr(self, text: str) -> None: ...
@@ -93,9 +94,7 @@ class Session:
         text = choice_text(label, options)
         while True:
             answer = self.io.ask(text, str(default) if default is not None else None)
-            if answer is None or answer == "":
-                pass
-            elif answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
+            if answer and answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
                 return int(answer)
             self._invalid()
 
@@ -157,7 +156,7 @@ class Session:
                 raise WebSetupError("setup_aborted")
 
         while True:
-            answer = self.io.ask(USER_LABEL, current_user) or ""
+            answer = self.io.ask_raw(USER_LABEL, current_user) or ""
             if USER_PATTERN.fullmatch(answer) is not None:
                 user = answer
                 break
@@ -212,10 +211,10 @@ class Session:
                     user, plan = self._ask_credentials(user)
                 cur["user"] = user
             else:
-                cur.pop("user", None)
                 plan = self._ask_secret(new_auth, live)
                 if plan is None:
                     continue
+                cur.pop("user", None)
             cur["allow"], cur["auth"] = chosen, new_auth
             return plan
 
@@ -277,7 +276,7 @@ class Session:
     # --- 前処理と probe の周回 -------------------------------------------------------------
 
     def converge(self, values: dict[str, Any], plan: SecretPlan, *, interactive: bool,
-                 show_password: Callable[[str], None],
+                 show_password: Callable[[str, str], None],
                  reason_code: Callable[[object], str]) -> tuple[int, str] | None:
         """(a) secret → (b) config → probe を、成功するか打ち切るまで繰り返す。成功は None、失敗は (rc, reason)。
 

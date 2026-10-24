@@ -57,6 +57,9 @@ class ScriptIO:
         value = self.answers.pop(0)
         return value or default
 
+    def ask_raw(self, label, default=None):
+        return self.ask(label, default)
+
     def ask_secret(self, label):
         if self.eof_after is not None and self._consumed() >= self.eof_after:
             self.log.append(("secret", label))

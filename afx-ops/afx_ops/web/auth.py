@@ -22,9 +22,10 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from afx_ops.config import WEB_USER_DEFAULT, WEB_USER_PATTERN
 from afx_ops.isolation.accept_loop import Journal
 
-DEFAULT_USER = "afx"
+DEFAULT_USER = WEB_USER_DEFAULT
 REALM_HEADER = 'Basic realm="afx"'
 WINDOW_SECONDS = 60.0
 SOURCE_LIMIT = 5
@@ -81,7 +82,7 @@ class BasicAuthenticator:
                  journal: Journal | None = None) -> None:
         if type(password) is not bytes or not password:
             raise ValueError("password")
-        if type(user) is not str or not user or not user.isascii() or ":" in user:
+        if type(user) is not str or WEB_USER_PATTERN.fullmatch(user) is None:
             raise ValueError("user")
         self._password = bytes(password)
         self._prefix = user.encode("ascii") + b":"

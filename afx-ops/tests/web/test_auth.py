@@ -201,6 +201,22 @@ def test_an_unusable_user_is_refused_at_construction(user):
         auth.BasicAuthenticator(PASSWORD, user=user)
 
 
+@pytest.mark.parametrize("user", ["Afx", "ops:web", "afx\n", "afx ", " afx", "1afx", "_afx", "-afx", "a" * 33, "afx.web"])
+def test_a_user_outside_the_username_grammar_is_refused_at_construction(user):
+    with pytest.raises(ValueError):
+        auth.BasicAuthenticator(PASSWORD, user=user)
+
+
+@pytest.mark.parametrize("user", ["a", "afx", "a" * 32, "a-b_c9"])
+def test_a_user_inside_the_username_grammar_is_accepted_at_construction(user):
+    auth.BasicAuthenticator(PASSWORD, user=user)
+
+
+def test_the_default_user_is_the_configuration_default():
+    from afx_ops.config import WEB_USER_DEFAULT
+    assert auth.DEFAULT_USER == WEB_USER_DEFAULT
+
+
 def test_failures_do_not_change_the_log_line_or_the_counter_by_form(authenticator, capsys):
     outcomes = {authenticator.authenticate([] if v is None else [v], f"10.0.0.{i}").outcome
                 for i, v in enumerate(_failure_values())}

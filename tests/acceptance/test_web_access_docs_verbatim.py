@@ -104,6 +104,13 @@ def test_the_acceptance_document_names_the_user_display_and_the_old_password_rec
     assert "web が止まっている間に `web.password` を手で削除" in text
 
 
+@pytest.mark.parametrize("name", sorted(DOCS))
+def test_the_old_password_recovery_guidance_is_quoted_verbatim(name: str) -> None:
+    assert web_setup.OLD_PASSWORD_RECOVERY in _text(DOCS[name])
+    for verb in ("enable", "reconfigure"):
+        assert web_setup.OLD_PASSWORD_RECOVERY in web_setup.SECRET_GUIDANCE_TEMPLATE.format(verb=verb)
+
+
 def test_exposure_words_are_quoted_in_the_ops_api_document() -> None:
     text = _text(OPS_API)
     assert all(word in text for word in _exposures())

@@ -15,6 +15,7 @@ import re
 import select
 import shlex
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from dataclasses import dataclass
 from agentic_fx.ops_setup.feature_config import LOOPBACK, InterfaceLookupFailed
 
 VERSION = 2
+STALE_VERSION = 1
+STALE_VERSION_DETAIL = "afx-ops interfaces の出力版が古い (本体と afx-ops を同じ checkout で更新する)"
 TIMEOUT = 10.0
 MAX_STDOUT = 65536
 _MAX_STDERR = 4096
@@ -30,6 +33,10 @@ _SLICE = 0.05
 _SCOPE_ORDER = {"global": 0, "link": 1}
 _LINK_LOCAL = ipaddress.IPv4Network("169.254.0.0/16")
 _BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+class StaleInterfaceVersion(InterfaceLookupFailed):
+    """出力が旧版 (version 1) の形だった。理由は `interface_lookup_failed` のまま。"""
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,8 @@ def parse(raw: bytes) -> tuple[Candidate, ...]:
         raise InterfaceLookupFailed from None
     if type(document) is not dict or set(document) != {"interfaces", "version"}:
         raise InterfaceLookupFailed
+    if type(document["version"]) is int and document["version"] == STALE_VERSION:
+        raise StaleInterfaceVersion
     if type(document["version"]) is not int or document["version"] != VERSION or type(document["interfaces"]) is not list:
         raise InterfaceLookupFailed
     found: list[Candidate] = []
@@ -155,7 +164,12 @@ def list_interfaces(ops_exec: str, *, timeout: float = TIMEOUT) -> tuple[Candida
         argv = [*shlex.split(ops_exec), "interfaces"]
     except ValueError:
         raise InterfaceLookupFailed from None
-    return parse(_run_bounded(argv, timeout=timeout))
+    raw = _run_bounded(argv, timeout=timeout)
+    try:
+        return parse(raw)
+    except StaleInterfaceVersion:
+        print(f"afx ops: {STALE_VERSION_DETAIL}", file=sys.stderr)
+        raise
 
 
 def provider(resolve_exec: Callable[[], str]) -> Callable[[], Sequence[Candidate]]:

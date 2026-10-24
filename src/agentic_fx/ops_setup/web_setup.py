@@ -39,7 +39,9 @@ from agentic_fx.ops_setup.feature_config import (
 )
 
 PASSWORD_NAME = "web.password"
-SECRET_GUIDANCE_TEMPLATE = "secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ {verb} を再実行する"
+OLD_PASSWORD_RECOVERY = "旧版の 33 文字以上の password は、停止中に web.password を削除してから afx ops web reconfigure を再実行する"
+SECRET_GUIDANCE_TEMPLATE = ("secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ {verb} を再実行する。"
+                            + OLD_PASSWORD_RECOVERY)
 SECRET_ACTIONS = ("remove", "keep", "install", "absent")
 CONFIG_FILE_MAX = 65536
 _TEMP_PASSWORD = re.compile(r"\.web\.password\.[0-9a-f]{32}\.tmp\Z")

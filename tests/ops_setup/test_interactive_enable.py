@@ -46,6 +46,9 @@ class FakeIO:
         self.asked.append(label)
         return value or default
 
+    def ask_raw(self, label, default=None):
+        return self.ask(label, default)
+
     def ask_secret(self, label):
         value = self._next(label)
         self.secrets.append(label)

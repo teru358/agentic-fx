@@ -242,3 +242,23 @@ def test_the_json_ifname_is_kept_as_is_and_only_the_display_escapes_it(tmp_path)
 ])
 def test_the_display_name_replaces_every_character_outside_the_safe_class(raw, shown):
     assert interfaces.display_name(raw) == shown
+
+
+def test_a_version_1_listing_adds_the_fixed_stale_version_detail_and_keeps_the_reason(tmp_path, capsys):
+    ops = _emit(tmp_path, _text({**GOOD, "version": 1}))
+    with pytest.raises(InterfaceLookupFailed):
+        list_interfaces(ops)
+    assert capsys.readouterr().err == f"afx ops: {interfaces.STALE_VERSION_DETAIL}\n"
+
+
+@pytest.mark.parametrize("version", [0, 3, "1", None])
+def test_any_other_wrong_version_adds_no_detail(tmp_path, capsys, version):
+    ops = _emit(tmp_path, _text({**GOOD, "version": version}))
+    with pytest.raises(InterfaceLookupFailed):
+        list_interfaces(ops)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_current_listing_adds_no_detail(tmp_path, capsys):
+    list_interfaces(_emit(tmp_path, _text(GOOD)))
+    assert capsys.readouterr().err == ""

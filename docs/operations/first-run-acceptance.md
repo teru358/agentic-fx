@@ -868,7 +868,7 @@ systemctl --user show afx -p ActiveEnterTimestampMonotonic   # reconfigure の�
 - 「到達できる全 IPv4」を選ぶと「LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が戦略の diff を読めます」と表示され、`yes` と入力しない限り何も書かれない。
 - 許可されていない端末からの接続は応答なしで切られる。`auth = "basic"` なら認証なしの要求は 401。
 - 生成した password は有効化の画面に `ユーザー名: <user>` を添えて 1 回だけ出て、再実行・`status`・ログには出ない。password は 8〜32 文字で、手入力は `もう一度:` で確認される。ユーザー名・パスワードの文法違反と不一致の合計が 3 回目になると `setup_aborted` で何も書かれない。
-- 以前の版で作った 33 文字以上の password は `secret_invalid` で止まる。web が止まっている間に `web.password` を手で削除してから `afx ops web reconfigure` を実行する (対話なら「再設定」)。
+- 以前の版で作った 33 文字以上の password は `secret_invalid` で止まる。web が止まっている間に `web.password` を手で削除してから `afx ops web reconfigure` を実行する (対話なら「再設定」)。止まるときの案内文は `旧版の 33 文字以上の password は、停止中に web.password を削除してから afx ops web reconfigure を再実行する` である。
 - Basic 認証の設定が既にあるとき、`reconfigure` はアクセス制限で Basic 認証を選ぶ直後に `現在の Basic 認証を [1] 維持する [2] 再設定する` を尋ねる。維持はユーザー名とパスワードを変えず、表示もしない。
 - `reconfigure` の前後で afx の `ActiveEnterTimestampMonotonic` が変わらず、`afx-ops@web` だけが再起動する。終わりに `web: reconfigured` (afx が止まっていたときは `web: reconfigured ops=starts_with_afx`) と出る。
 - 途中で中断した場合、設定と password の組が一時的に食い違って web が起動しない状態になる (`web-access: unavailable reason=secret_unexpected` 又は `secret_missing`)。`afx ops web reconfigure` の再実行で直る。`afx ops web enable` では直らず、afx も止めない。

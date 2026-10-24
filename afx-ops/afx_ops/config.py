@@ -46,7 +46,7 @@ WEB_LOOPBACK = LOOPBACK
 WEB_UNRESTRICTED = UNRESTRICTED_NETWORK
 WEB_AUTHS = ("none", "basic")
 WEB_USER_DEFAULT = "afx"
-_WEB_USER = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+WEB_USER_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 class ConfigError(Exception):
@@ -348,7 +348,7 @@ def _web_auth(value: object) -> str:
 
 def _web_user(value: object) -> str:
     """Basic 認証のユーザー名。英小文字で始まる 1〜32 byte の ASCII (`re.fullmatch`)。"""
-    if type(value) is not str or _WEB_USER.fullmatch(value) is None:
+    if type(value) is not str or WEB_USER_PATTERN.fullmatch(value) is None:
         raise ConfigError("user")
     return value
 
