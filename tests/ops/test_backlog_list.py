@@ -122,3 +122,101 @@ def test_backlog_add_alias_is_display_only_and_does_not_change_the_request(tmp_p
     assert "afx ctl improve add" in alias_err.getvalue()
 
 
+
+
+def test_backlog_list_parse_defaults_and_all_flag():
+    assert client.parse(["backlog", "list"]).args == [False, 100]
+    assert client.parse(["backlog", "list", "--all"]).args == [True, 100]
+    assert client.parse(["backlog", "list", "--limit", "7", "--all"]).args == [True, 7]
+
+
+@pytest.mark.parametrize("limit,ok", [("0", False), ("1", True), ("499", True), ("500", True),
+                                      ("501", False), ("x", False)])
+def test_backlog_list_parse_limit_boundaries(limit, ok):
+    tokens = ["backlog", "list", "--limit", limit]
+    if ok:
+        assert client.parse(tokens).args == [False, int(limit)]
+    else:
+        with pytest.raises(client.ClientError):
+            client.parse(tokens)
+
+
+@pytest.mark.parametrize("tokens", [["backlog", "list", "--all", "--all"],
+                                    ["backlog", "list", "--limit"],
+                                    ["backlog", "list", "extra"]])
+def test_backlog_list_parse_rejects_malformed_flags(tokens):
+    with pytest.raises(client.ClientError):
+        client.parse(tokens)
+
+
+@pytest.mark.parametrize("tokens,expected", [
+    (["backlog", "list"], {"all": "false", "limit": 100}),
+    (["backlog", "list", "--all", "--limit", "500"], {"all": "true", "limit": 500}),
+])
+def test_backlog_list_cli_sends_the_query_to_the_api(tmp_path, tokens, expected):
+    api = _StubApi(tmp_path, [_ok({"items": [], "limit": 100, "has_more": False})])
+    client.Runner(api, stdin=io.StringIO(), stdout=io.StringIO()).run(client.parse(tokens))
+    assert api.sent == [("GET", "/v1/backlog", None, expected, False)]
+
+
+@pytest.mark.parametrize("limit", [0, 501, True, "5"])
+def test_backlog_list_service_rejects_out_of_range_limits(ops_env, limit):
+    with pytest.raises(OpsError) as caught:
+        ops_env.service().list_backlog(Principal.OPERATOR, limit=limit)
+    assert caught.value.code is ErrorCode.INVALID_ARGUMENT
+
+
+@pytest.mark.parametrize("rows,limit,count,has_more", [(499, 499, 499, False), (500, 499, 499, True),
+                                                       (500, 500, 500, False), (501, 500, 500, True)])
+def test_backlog_list_service_limit_and_has_more_at_the_boundaries(ops_env, rows, limit, count, has_more):
+    ops_env.conn.executemany(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm) VALUES (?,?,?,?,?,?)",
+        [(str(i), "user", "open", "2026-10-05T00:00:00+00:00", "2026-10-05T00:00:00+00:00", str(i))
+         for i in range(rows)])
+    ops_env.conn.commit()
+    data = ops_env.service().list_backlog(Principal.OPERATOR, limit=limit)
+    assert (len(data["items"]), data["has_more"], data["limit"]) == (count, has_more, limit)
+    ids = [item["id"] for item in data["items"]]
+    assert ids == sorted(ids, reverse=True)
+
+
+def test_backlog_list_service_issues_one_select_for_the_page(ops_env):
+    _insert(ops_env, idea="a")
+    statements = []
+    ops_env.conn.set_trace_callback(statements.append)
+    try:
+        ops_env.service().list_backlog(Principal.OPERATOR, limit=5)
+    finally:
+        ops_env.conn.set_trace_callback(None)
+    selects = [s for s in statements if "improvement_backlog" in s]
+    assert len(selects) == 1 and "LIMIT 6" in selects[0]
+
+
+def test_backlog_list_collapses_every_control_character_into_one_line(ops_env):
+    _insert(ops_env, idea="a\r\nb\tc\x00d\x1b[2Je f\x85g")
+    item = ops_env.service().list_backlog(Principal.OPERATOR)["items"][0]
+    assert len(item["idea"].splitlines()) == 1
+    assert not any(ord(ch) < 32 or 0x7F <= ord(ch) < 0xA0 for ch in item["idea"])
+
+
+def test_backlog_list_truncation_applies_after_redaction(ops_env):
+    _insert(ops_env, idea="x" * 5000 + " api_key=secret-value")
+    item = ops_env.service().list_backlog(Principal.OPERATOR)["items"][0]
+    assert item["idea_truncated"] is True and "secret-value" not in item["idea"]
+    assert len(item["idea"].encode("utf-8")) <= 4096
+
+
+def test_alias_message_comes_from_the_surface_table_and_stays_off_stdout(tmp_path):
+    from agentic_fx.cli_surface import ALIASES
+    alias = next(a for a in ALIASES if a.parser_alias == "improve add")
+    err, out = io.StringIO(), io.StringIO()
+    api = _StubApi(tmp_path, [_ok({"id": 1})])
+    client.Runner(api, stdin=io.StringIO(), stdout=out, stderr=err).run(
+        client.parse(["improve", "add", "x"]))
+    assert alias.canonical_usage.split(" <", 1)[0] in err.getvalue()
+    assert "旧名" not in out.getvalue()
+    quiet = io.StringIO()
+    client.Runner(_StubApi(tmp_path, [_ok({"id": 1})]), stdin=io.StringIO(), stdout=io.StringIO(),
+                  stderr=quiet).run(client.parse(["backlog", "add", "x"]))
+    assert quiet.getvalue() == ""
