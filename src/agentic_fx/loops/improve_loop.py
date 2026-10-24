@@ -39,6 +39,7 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # 属性未定義で ImportError になり、足しても sys.modules から取り直す
     # ため効かない)
 from agentic_fx.loops.improve_context import (
+    mission_template,
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
     family_redirect_last_result, family_redirect_reason,
     render_family_attempts)
@@ -907,9 +908,7 @@ class ImproveLoop:
             # にゲートと説明が食い違う)。
             "profitability_floor_rule": self._floor_rule_text(),
         }
-        template_path = (Path(__file__).resolve().parent / "prompts"
-                         / "improve_mission.md")
-        rendered = template_path.read_text().format(**render_map)
+        rendered = mission_template().format(**render_map)
         # [indicator-consumption-wiring] T5a Step 5-1c: テスト専用の観測面
         # (`tests/loops/test_improve_loop_source_snapshot.py::
         # test_prompt_shows_the_number_of_pin_broken_strategies`)。本番挙動

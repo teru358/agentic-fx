@@ -312,7 +312,7 @@ def _sample_ctx_data():
             "by_pair": {"USDJPY": 0.4}, "by_hour": {"9": 0.3},
             "reject_breakdown": {"spread": 2}, "hold_rate": 0.1},
         "improvement_history": {
-            "family_attempts": {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0, "invalid_name_count": 0}, 
+            "family_attempts": {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0, "invalid_name_count": 0},
             "recent_runs": [
             {"id": 1, "backlog_id": 2, "idea": "x", "result": "approved",
              "attempts": 1, "last_result": None}]},

@@ -208,8 +208,13 @@ _TEMPLATE_PATH = (Path(__file__).resolve().parent / "prompts"
 
 
 @lru_cache(maxsize=1)
-def _mission_template() -> str:
+def mission_template() -> str:
+    """改善 mission の prompt template。process 内で 1 回だけ読み、族別節の
+    固定 byte 数の計算と prompt の描画が同じ文字列を使う。"""
     return _TEMPLATE_PATH.read_text()
+
+
+_mission_template = mission_template
 
 
 def family_section_fixed_bytes_of(template: str) -> int:
