@@ -92,7 +92,17 @@ class BasicAuthenticator:
         return "BasicAuthenticator()"
 
     def authenticate(self, values: list[str], peer: str) -> Decision:
-        """Authorization の wire の値の list と accepted peer の IPv4 から判定する。"""
+        """Authorization の wire の値の list と accepted peer の IPv4 から判定する。
+
+        Authorization が 1 本も無い要求は challenge として 401 を返し、失敗には数えない。
+        journal は lock の外で書く。
+        """
+        event, decision = self._decide(values, peer)
+        if event is not None:
+            self._journal.sampled(event)
+        return decision
+
+    def _decide(self, values: list[str], peer: str) -> tuple[str | None, Decision]:
         with self._lock:
             now = self._clock()
             self._prune(now)
@@ -101,24 +111,24 @@ class BasicAuthenticator:
             queue = self._sources.get(peer)
             if queue is not None and len(queue) >= SOURCE_LIMIT:
                 return self._limited(queue[0], now)
+            if not values:
+                return None, Decision(UNAUTHORIZED)
             credential = _credential(values)
             expected = hashlib.sha256(b"afx:" + self._password).digest()
             presented = hashlib.sha256(_DUMMY if credential is None else credential).digest()
             matched = hmac.compare_digest(expected, presented)
             if matched and credential is not None:
-                return Decision(OK)
+                return None, Decision(OK)
             self._global.append(now)
             if queue is None:
                 queue = self._sources[peer] = deque()
             queue.append(now)
             self.web_auth_failed_total += 1
-            self._journal.sampled("web_auth_failed")
-            return Decision(UNAUTHORIZED)
+            return "web_auth_failed", Decision(UNAUTHORIZED)
 
-    def _limited(self, oldest: float, now: float) -> Decision:
+    def _limited(self, oldest: float, now: float) -> tuple[str, Decision]:
         self.web_auth_limited_total += 1
-        self._journal.sampled("web_auth_limited")
-        return Decision(LIMITED, _retry_after(oldest, now))
+        return "web_auth_limited", Decision(LIMITED, _retry_after(oldest, now))
 
     def _prune(self, now: float) -> None:
         while self._global and now - self._global[0] >= WINDOW_SECONDS:

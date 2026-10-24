@@ -146,7 +146,7 @@ def test_the_401_carries_the_challenge_and_the_fixed_body():
 def test_the_sixth_failure_is_429_for_get_and_head_with_the_same_length(capfd):
     server = Server(8, auth.BasicAuthenticator(PASSWORD))
     try:
-        codes = [status_of(server.ask(None)) for _ in range(5)]
+        codes = [status_of(server.ask(b" Basic " + WRONG.encode())) for _ in range(5)]
         get = server.ask(b" Basic " + TOKEN.encode())
         head = server.ask(b" Basic " + TOKEN.encode(), method=b"HEAD")
         again = server.ask(b" Basic " + TOKEN.encode())
@@ -184,7 +184,8 @@ def test_the_rate_limit_key_is_the_accepted_socket_peer():
     """M-T2-PEER-FROM-SOCKET: 送信元ごとの窓は accept した socket の peer で分かれる。"""
     server = Server(8, auth.BasicAuthenticator(PASSWORD))
     try:
-        failures = [status_of(server.ask(None, source="127.0.0.2")) for _ in range(5)]
+        failures = [status_of(server.ask(b" Basic " + WRONG.encode(), source="127.0.0.2"))
+                    for _ in range(5)]
         limited = status_of(server.ask(b" Basic " + TOKEN.encode(), source="127.0.0.2"))
         other = status_of(server.ask(b" Basic " + TOKEN.encode(), source="127.0.0.1"))
         spoofed = status_of(server.ask(None, source="127.0.0.3"))
@@ -192,3 +193,45 @@ def test_the_rate_limit_key_is_the_accepted_socket_peer():
         server.finish()
     assert failures == [401] * 5
     assert (limited, other, spoofed) == (429, 200, 401)
+
+
+def test_the_authorization_of_one_header_block_is_taken_once_per_connection():
+    """2 本目の要求は 1 本目の header block を再利用できず、資格情報なしとして扱われる。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    seen: list[list[str]] = []
+
+    async def run() -> None:
+        service = runtime._Service.__new__(runtime._Service)
+        service.slots = set()
+        service.calls = set()
+        slot = runtime._Slot(lambda _slot: None, "127.0.0.1")
+        service.slots.add(slot)
+        service._loop = asyncio.get_running_loop()
+        service._executor = ThreadPoolExecutor(max_workers=1)
+        service._response = lambda status, headers, body: status
+
+        def fake_run(_call, _raw, _peer, authorization):
+            seen.append(authorization)
+            return SimpleNamespace(status=200, headers={}, body=b"")
+
+        service._run = fake_run
+
+        async def raw(_request):
+            return b""
+
+        original = runtime._raw_request
+        runtime._raw_request = raw
+        try:
+            protocol = SimpleNamespace(
+                _slot=slot, wire_head=b"GET / HTTP/1.1\r\nAuthorization: Basic abc\r\n")
+            request = SimpleNamespace(protocol=protocol)
+            await service.handle(request)
+            await service.handle(request)
+        finally:
+            runtime._raw_request = original
+            service._executor.shutdown()
+
+    asyncio.run(run())
+    assert seen == [["Basic abc"], []]

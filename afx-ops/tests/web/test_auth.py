@@ -161,12 +161,13 @@ def test_failures_do_not_change_the_log_line_or_the_counter_by_form(authenticato
     assert outcomes == {auth.UNAUTHORIZED}
     lines = capsys.readouterr().err.splitlines()
     assert set(lines) == {"afx-ops: web_auth_failed"}
-    assert authenticator.web_auth_failed_total == len(_failure_values())
+    # Authorization が無い形だけは失敗に数えない
+    assert authenticator.web_auth_failed_total == len(_failure_values()) - 1
 
 
 # --- AC-16 / AC-34: 比較は 32 byte 対 32 byte を 1 回 --------------------------------------
 
-@pytest.mark.parametrize("value", [GOOD, BAD, None, "Basic !!", "Bearer x", basic(b"x" * 200)])
+@pytest.mark.parametrize("value", [GOOD, BAD, "Basic !!", "Bearer x", basic(b"x" * 200)])
 def test_each_attempt_compares_two_32_byte_digests_exactly_once(authenticator, digests, value):
     compares, _hashed = digests
     authenticator.authenticate([] if value is None else [value], PEER)
@@ -416,6 +417,36 @@ def test_concurrent_attempts_never_exceed_the_source_limit(authenticator):
 
 
 # --- 記録 ----------------------------------------------------------------------------------------
+
+def test_requests_without_authorization_never_exhaust_the_window(authenticator):
+    for _ in range(10):
+        assert authenticator.authenticate([], PEER).outcome == auth.UNAUTHORIZED
+    assert authenticator.web_auth_failed_total == 0 and authenticator._sources == {}
+    assert authenticator.authenticate([GOOD], PEER).outcome == auth.OK
+
+
+def test_requests_without_authorization_are_still_refused_while_limited(authenticator):
+    for _ in range(auth.SOURCE_LIMIT):
+        authenticator.authenticate([BAD], PEER)
+    assert authenticator.authenticate([], PEER).outcome == auth.LIMITED
+
+
+def test_a_journal_that_raises_does_not_hold_the_lock(clock):
+    class Broken:
+        def sampled(self, _event):
+            raise OSError("log closed")
+
+    a = auth.BasicAuthenticator(PASSWORD, clock=clock, journal=Broken())
+    for _ in range(auth.SOURCE_LIMIT):
+        try:
+            a.authenticate([BAD], PEER)
+        except OSError:
+            pass
+    with pytest.raises(OSError):
+        a.authenticate([BAD], PEER)  # limited: journal raises after the lock is released
+    assert a._lock.acquire(blocking=False)
+    a._lock.release()
+
 
 def test_counters_and_fixed_journal_lines_only(authenticator, capsys):
     for _ in range(7):

@@ -240,6 +240,51 @@ def test_the_probe_reads_the_same_password_and_reports_missing_and_invalid(home,
     assert capsys.readouterr() == ("", "")
 
 
+def test_an_fstat_error_on_the_secret_dir_is_secret_invalid(tmp_path, monkeypatch):
+    directory = _secret_dir(tmp_path)
+    _password(directory)
+    inode, real = directory.stat().st_ino, os.fstat
+
+    def failing(fd):
+        st = real(fd)
+        if stat.S_ISDIR(st.st_mode) and st.st_ino == inode:
+            raise OSError(5, "injected")
+        return st
+
+    before = _fds()
+    monkeypatch.setattr(os, "fstat", failing)
+    assert (_check(tmp_path), _read(tmp_path)) == ("secret_invalid", "secret_invalid")
+    assert _fds() <= before
+
+
+def test_an_fstat_error_on_the_secret_dir_is_rc_71_secret_invalid_in_the_probe(
+        home, ops_dirs, capsys, monkeypatch):
+    dirs = ops_dirs("web")
+    dirs.config.mkdir(parents=True, mode=0o700)
+    dirs.config.chmod(0o700)
+    with socket.socket() as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        port = probe_socket.getsockname()[1]
+    toml = dirs.config / "ops.toml"
+    toml.write_text('instance_root = "/srv/afx-probe"\nkey_dir = "/srv/afx-probe-keys"\n'
+                    f'port = {port}\nauth = "basic"\n', encoding="utf-8")
+    toml.chmod(0o600)
+    dirs.secret.mkdir(parents=True, mode=0o700)
+    dirs.secret.chmod(0o700)
+    _password(dirs.secret)
+    inode, real = dirs.secret.stat().st_ino, os.fstat
+
+    def failing(fd):
+        st = real(fd)
+        if stat.S_ISDIR(st.st_mode) and st.st_ino == inode:
+            raise OSError(5, "injected")
+        return st
+
+    monkeypatch.setattr(os, "fstat", failing)
+    assert probe.main("web") == 71
+    assert capsys.readouterr().err == "afx-ops: secret_invalid\n"
+
+
 def test_a_password_that_vanishes_after_scandir_counts_as_absent(tmp_path, monkeypatch):
     """scandir で見えた `web.password` が open の前に消えたら「無し」。`auth = "none"` では
     許可側に倒れ、`secret_missing` を名乗らない。"""

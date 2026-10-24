@@ -306,6 +306,7 @@ process 全体の上限は 100 回である。
 同じ窓の 6 回目又は全体の 101 回目からは、認証比較をせず 429 を返す。
 最古の失敗から 60.000 秒以上経過した時点で、その失敗を窓から除く。
 成功しても窓内の失敗履歴を消さない。
+Authorization が 1 本も無い要求は 401 と `WWW-Authenticate` を返すが、失敗には数えない (ブラウザの最初の challenge や監視 curl で正規の利用者が締め出されないため)。窓が既に上限なら、その要求にも 429 を返す。Authorization がある要求の形の誤り (壊れた形、重複、誤った password) は数える。
 
 各試行では送信元表を lookup する前に、global queue と全実 IPv4 entry の期限切れ時刻を prune し、空になった実 IPv4 entry を回収する。
 各送信元 queue の保持長は最大 5、global queue は最大 100 とする。
@@ -1001,3 +1002,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.9 | status は stage を先に読み、未設定 / disabled は reader を呼ばず `not_configured`、それ以外は共有 reader の最終 reason (G1 は `config_dir_missing`、`ops.toml` 不在は `config_invalid`)。AC-12 の fixture は stage を terminal enabled に固定。 | 差分再確認 (codex terra) の Medium 1 (G1 の `config_dir_missing` と `not_configured` の適用条件が不定) | |
 | 2026-10-24 | v0.9a | accept の接続単位の errno 集合 (`EPROTO` / `ENETDOWN` / `ENOPROTOOPT` / `EHOSTDOWN` / `ENONET` / `EHOSTUNREACH` / `EOPNOTSUPP` / `ENETUNREACH` と `ENOBUFS` / `ENOMEM`、`ECONNABORTED` と同扱い) を §3.1 / §2.4 / AC-35 に追加し、`accept_failed` の rc を 72 から専用の 74 に分け、renderer が reply の形の不一致 (上記 5 例外型) で落ちる場合を 502 と明記した。 | /code-review high の指摘 (一過性 errno での全 web 停止、`accept_failed` と `accept_exhausted` の rc 共用) | |
 | 2026-10-24 | v0.9b | §2.2 の `web.password` を「一度だけ読む」から「検査と読取りで 2 回開いてよい (同じ検査)」に。 | T2a 実装レビュー (opus) の L-2 | |
+| 2026-10-24 | v0.9c | §3.4 に、Authorization が無い要求は 401 を返すが rate limit の失敗に数えないことを追記した。 | T2a /code-review high の指摘 | |

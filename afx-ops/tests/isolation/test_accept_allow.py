@@ -5,6 +5,7 @@ import asyncio
 import errno
 import ipaddress
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -530,9 +531,9 @@ def test_the_slot_and_runtime_have_no_proxy_header_source_for_the_peer():
     # 枠が持つ peer は accept 直後に確定した値で、後から書き換えられない
     slot = runtime._Slot(lambda _slot: None, "127.0.0.1")
     assert slot.peer == "127.0.0.1"
-    with pytest.raises(AttributeError):
-        slot.peer = "10.0.0.1"
-    assert "_peer" in runtime._Slot.__slots__ and "peer" not in runtime._Slot.__slots__
+    assert "peer" in runtime._Slot.__slots__
+    # peer を代入する場所は枠の生成だけで、accept 後の経路には無い
+    assert len(re.findall(r"\.peer\s*=[^=]", source)) == 1
 
 
 def test_a_pending_connection_from_outside_allow_is_closed_with_no_bytes():

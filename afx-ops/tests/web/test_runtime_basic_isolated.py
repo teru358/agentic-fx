@@ -73,7 +73,8 @@ def test_basic_authenticates_in_the_isolated_process_and_failures_never_reach_th
     assert done.stdout.count(PASSWORD.decode()) == 0
     for text in (done.stdout, done.stderr):
         assert PASSWORD.decode() not in text and TOKEN.decode() not in text
-    assert done.stderr.splitlines() == ["afx-ops: web_auth_failed"] * 4
+    # Authorization が無い要求は 401 だが失敗には数えない。数えるのは WRONG の 1 本だけ
+    assert done.stderr.splitlines() == ["afx-ops: web_auth_failed"]
 
 
 def test_the_sixth_failure_is_429_and_a_correct_password_is_refused_while_limited(

@@ -91,8 +91,6 @@ REASONS = (
     "startup_internal_error",
     "body_failed",
     "allow_required",
-    "unrestricted_not_supported",
-    "auth_not_supported",
     "interface_lookup_failed",
     "bind_not_local",
     "secret_invalid",
@@ -714,6 +712,9 @@ def _open_web_secret_dir(secret_dir: Path) -> int | None:
         os.close(parent)
     try:
         _check_owned_dir(dir_fd, "secret_invalid", exact_mode=0o700)
+    except OSError:
+        os.close(dir_fd)
+        raise StartupError("secret_invalid") from None
     except BaseException:
         os.close(dir_fd)
         raise
@@ -754,7 +755,7 @@ def inspect_web_secret(secret_dir: Path) -> bool:
         try:
             _read_web_password(dir_fd)
         except StartupError as exc:
-            if str(exc) == "secret_missing":
+            if exc.reason == "secret_missing":
                 # scandir の後に消えた。「無し」として扱い、basic の欠落は呼び出し側が判定する。
                 return False
             raise
@@ -794,8 +795,8 @@ def check_web_access(plan: StartupPlan, config: OpsConfig, *,
     """web の公開範囲の組み合わせを固定の順序で検査する。最初に外れた 1 reason だけを返す。
 
     allow の必須 → 非 loopback bind が up の interface に実在すること → secret dir の安全性
-    → auth に対する secret の欠落 / 余剰。production の起動と `afx-ops probe web` が同じ関数を使う。loopback は
-    interface を列挙しない。
+    → auth に対する secret の欠落 / 余剰。production の起動と `afx-ops probe web` が
+    同じ関数を使う。loopback は interface を列挙しない。
     """
     loopback = config.web_loopback
     if not loopback and config.allow is None:

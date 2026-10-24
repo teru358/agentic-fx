@@ -117,19 +117,14 @@ class _Slot:
     接続が閉じたとき (切断・期限・abort) は `on_release` を呼ぶ。
     """
 
-    __slots__ = ("transport", "deadline", "on_release", "calls", "_peer")
+    __slots__ = ("transport", "deadline", "on_release", "calls", "peer")
 
     def __init__(self, on_release: Callable[["_Slot"], None], peer: str) -> None:
-        self._peer = peer
+        self.peer = peer
         self.transport: asyncio.BaseTransport | None = None
         self.deadline: asyncio.TimerHandle | None = None
         self.on_release = on_release
         self.calls: set[_Call] = set()
-
-    @property
-    def peer(self) -> str:
-        """accept 直後に確定した peer の IPv4。認証と rate limit はこの値だけを使う。"""
-        return self._peer
 
     def close(self) -> None:
         if self.deadline is not None:
@@ -303,7 +298,10 @@ class _Service:
         call = _Call()
         if slot not in self.slots:
             return self._response(*_closed_reply())
-        authorization = wire_authorization_values(request.protocol.wire_head)
+        protocol = request.protocol
+        authorization = wire_authorization_values(protocol.wire_head)
+        # 認証の根拠はこの要求の header block だけ。2 本目以降は取り出せず 401 になる
+        protocol.wire_head = b""
         call.future = self._executor.submit(self._run, call, raw, slot.peer, authorization)
         slot.calls.add(call)
         self.calls.add(call.future)

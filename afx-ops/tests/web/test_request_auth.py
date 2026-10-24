@@ -186,7 +186,7 @@ def test_an_authenticated_daemon_failure_is_still_502(authenticator):
 
 def _limit(authenticator, peer=PEER):
     for _ in range(auth.SOURCE_LIMIT):
-        call(wire(None), Client(), authenticator, peer=peer)
+        call(wire(b" Basic " + WRONG.encode()), Client(), authenticator, peer=peer)
 
 
 def test_429_has_retry_after_and_never_touches_the_daemon(authenticator, clock):
@@ -200,6 +200,16 @@ def test_429_has_retry_after_and_never_touches_the_daemon(authenticator, clock):
     assert client.calls == []
 
 
+def test_requests_without_authorization_are_401_and_never_exhaust_the_window(authenticator):
+    client = Client()
+    for _ in range(10):
+        response = call(wire(None), client, authenticator)
+        assert response.status == 401
+        assert response.headers["WWW-Authenticate"] == auth.REALM_HEADER
+    assert call(wire(OK), client, authenticator).status == 200
+    assert authenticator.web_auth_failed_total == 0
+
+
 def test_429_for_one_source_leaves_another_source_alone(authenticator):
     _limit(authenticator)
     assert call(wire(OK), Client(), authenticator, peer="10.5.5.5").status == 200
@@ -209,8 +219,9 @@ def test_rate_key_is_the_accepted_peer_not_a_header(authenticator):
     """M-T2-RATE-PEER-HEADER: 送信元を proxy header から導出する変異は落ちる。"""
     for index in range(auth.SOURCE_LIMIT):
         extra = f"X-Forwarded-For: 10.9.9.{index}\r\nForwarded: for=10.8.8.{index}\r\n".encode()
-        call(wire(None, extra=extra), Client(), authenticator)
-    response = call(wire(None, extra=b"X-Forwarded-For: 10.1.1.1\r\n"), Client(), authenticator)
+        call(wire(b" Basic " + WRONG.encode(), extra=extra), Client(), authenticator)
+    response = call(wire(b" Basic " + WRONG.encode(), extra=b"X-Forwarded-For: 10.1.1.1\r\n"),
+                    Client(), authenticator)
     assert response.status == 429
     assert len(authenticator._sources) == 1
 
