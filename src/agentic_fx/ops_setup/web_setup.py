@@ -21,6 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from agentic_fx.ops_setup.feature_config import (
+    DEFAULT_USER,
+    PASSWORD_MAX,
+    PASSWORD_MIN,
     UNRESTRICTED,
     InputError,
     InterfaceLookupFailed,
@@ -39,7 +42,6 @@ PASSWORD_NAME = "web.password"
 SECRET_GUIDANCE_TEMPLATE = "secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ {verb} を再実行する"
 SECRET_ACTIONS = ("remove", "keep", "install", "absent")
 CONFIG_FILE_MAX = 65536
-PASSWORD_MIN, PASSWORD_MAX = 16, 128
 _TEMP_PASSWORD = re.compile(r"\.web\.password\.[0-9a-f]{32}\.tmp\Z")
 _TEMP_CONFIG = re.compile(r"\.ops\.toml\.[0-9a-f]{32}\.tmp\Z")
 Hook = Callable[[str], None]
@@ -92,11 +94,16 @@ def options_problem(options: WebOptions, *, reconfigure: bool) -> str | None:
 # --- password -------------------------------------------------------------------------------
 
 def check_password(value: bytes | str) -> str:
-    """visible ASCII 16〜128 byte (`:` 可)。満たさなければ `secret_invalid`。"""
+    """visible ASCII 8〜32 byte (`:` 可)。満たさなければ `secret_invalid`。"""
     raw = value.encode("utf-8", "surrogateescape") if isinstance(value, str) else value
     if not PASSWORD_MIN <= len(raw) <= PASSWORD_MAX or any(not 0x21 <= byte <= 0x7E for byte in raw):
         raise WebSetupError("secret_invalid")
     return raw.decode("ascii")
+
+
+def generated_password_line(user: str, password: str) -> str:
+    """生成した password の表示行。ユーザー名を添える (表示は 1 回だけ)。"""
+    return f"ユーザー名: {user} / 生成した password (この表示は 1 回だけです): {password}"
 
 
 def generate_password(token_bytes: Callable[[int], bytes] = secrets.token_bytes) -> str:
@@ -149,7 +156,7 @@ def read_config_file(path: str, *, after_open: Hook | None = None) -> dict[str, 
 
 
 def read_password_file(path: str, *, after_open: Hook | None = None) -> str:
-    """`--password-file`: 実効 uid 所有の regular file、mode 0600 ちょうど。末尾 LF 1 個だけ許す。"""
+    """`--password-file`: 実効 uid 所有の regular file、mode 0600 ちょうど。8〜32 byte、末尾 LF 1 個だけ許す。"""
     data = _read_bounded(path, limit=PASSWORD_MAX + 2, reason="secret_invalid", rc=1,
                          accept_mode=lambda mode: mode == 0o600,
                          size_ok=lambda size: PASSWORD_MIN <= size <= PASSWORD_MAX + 1, after_open=after_open)
@@ -159,8 +166,8 @@ def read_password_file(path: str, *, after_open: Hook | None = None) -> str:
 
 
 def target_from_config_file(parsed: dict[str, Any]) -> dict[str, Any]:
-    """目標の web 4 key を検査して返す。共通 key・未知 key・文法違反・allow の欠落は `setup_input_invalid`。"""
-    if any(name not in ("port", "bind", "allow", "auth") for name in parsed):
+    """目標の web 5 key (port・bind・allow・auth・user) を検査して返す。共通 key・未知 key・文法違反・allow の欠落は `setup_input_invalid`。"""
+    if any(name not in ("port", "bind", "allow", "auth", "user") for name in parsed):
         raise WebSetupError("setup_input_invalid", 2)
     try:
         values = validate("web", parsed)
@@ -317,14 +324,14 @@ def apply_secret(root: Path, plan: SecretPlan, *, hook: Hook | None = None) -> N
 
 
 def apply_target(root: Path, values: dict[str, Any], plan: SecretPlan, *, hook: Hook | None = None,
-                 show_password: Callable[[str], None] | None = None, clean: bool = True) -> None:
+                 show_password: Callable[[str, str], None] | None = None, clean: bool = True) -> None:
     """前処理の (0) → (a) → (b)。生成した password の表示は (a) の dir fsync の完了後に 1 回だけ。"""
     emit = hook if hook is not None else (lambda _name: None)
     if clean:
         cleanup_temporaries(root, hook=hook)
     apply_secret(root, plan, hook=hook)
     if plan.generated and plan.password is not None and show_password is not None:
-        show_password(plan.password)
+        show_password(plan.password, values.get("user", DEFAULT_USER))
         emit("secret_displayed")
     emit("secret_applied")
     try:
@@ -349,9 +356,11 @@ def exposure(values: dict[str, Any]) -> str:
 
 
 def summary_line(values: dict[str, Any]) -> str:
-    """`web: 待受 <bind>:<port> / 公開 <範囲> / 認証 <none|basic>`。allow の個別要素と secret は含まない。"""
+    """`web: 待受 <bind>:<port> / 公開 <範囲> / 認証 none` 又は `認証 basic (<user>)`。allow の個別要素と secret は含まない。"""
     bind = values.get("bind", "127.0.0.1")
-    return f"web: 待受 {bind}:{values['port']} / 公開 {exposure(values)} / 認証 {auth_of(values)}"
+    auth = auth_of(values)
+    shown = f"basic ({values.get('user', DEFAULT_USER)})" if auth == "basic" else auth
+    return f"web: 待受 {bind}:{values['port']} / 公開 {exposure(values)} / 認証 {shown}"
 
 
 def access_line(root: Path, saved_stage: dict[str, Any] | None, *,
@@ -373,12 +382,14 @@ def access_line(root: Path, saved_stage: dict[str, Any] | None, *,
         kind = "unrestricted"
     else:
         kind = "restricted"
-    return f"web-access: bind={values.get('bind', '127.0.0.1')}:{values['port']} allow={kind} auth={auth_of(values)}"
+    auth = auth_of(values)
+    shown = f"basic user={values.get('user', DEFAULT_USER)}" if auth == "basic" else auth
+    return f"web-access: bind={values.get('bind', '127.0.0.1')}:{values['port']} allow={kind} auth={shown}"
 
 
 __all__ = [
     "SECRET_ACTIONS", "PASSWORD_NAME", "SecretPlan", "WebOptions", "WebSetupError", "access_line",
     "apply_secret", "apply_target", "auth_of", "check_password", "cleanup_temporaries", "exposure",
-    "generate_password", "is_loopback", "options_problem", "plan_for_input", "read_config_file",
+    "generate_password", "generated_password_line", "is_loopback", "options_problem", "plan_for_input", "read_config_file",
     "read_password_file", "summary_line", "target_from_config_file", "web_secret_state",
 ]

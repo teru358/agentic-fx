@@ -23,8 +23,8 @@ from agentic_fx.ops_setup.stages import (InvalidState, OpsSetup, _ENABLE_TERMINA
                                          _KEY_MISMATCH_CODES, read_marker, read_stage)
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import OpsExecNotFound, resolve_ops_exec, units_match
-from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WebOptions, WebSetupError, cleanup_temporaries, options_problem,
-                                            plan_for_input, read_config_file, read_password_file,
+from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WebOptions, WebSetupError, cleanup_temporaries,
+                                            generated_password_line, options_problem, plan_for_input, read_config_file, read_password_file,
                                             target_from_config_file)
 from agentic_fx.ops_setup.web_wizard import FULL, Session
 
@@ -200,8 +200,8 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
                 raise Refusal("ops_still_active")
             emit("ops_stopped")
 
-            def show_password(password: str) -> None:
-                io.stdout(f"生成した password (この表示は 1 回だけです): {password}")
+            def show_password(password: str, user: str) -> None:
+                io.stdout(generated_password_line(user, password))
 
             failure = session.converge(values, plan, interactive=interactive, show_password=show_password,
                                        reason_code=_probe_reason_code)

@@ -238,3 +238,30 @@ def test_web_config_errors_are_printed_as_a_fixed_reason_only(monkeypatch, tmp_p
 def test_the_ops_toml_owner_check_defaults_to_the_effective_uid():
     from afx_ops import config
     assert config._expected_owner_uid is os.getuid
+
+
+# --- user (AC-12 G8 / AC-34) -----------------------------------------------------------------
+
+def test_the_user_defaults_to_afx_when_the_key_is_omitted(monkeypatch, tmp_path):
+    assert _read(monkeypatch, tmp_path, "port = 8080\nauth = \"basic\"\n").user == "afx"
+
+
+@pytest.mark.parametrize("user", ["afx", "a", "ops-web_1", "a" * 32, "x0", "a-", "a_"])
+def test_user_accepts_the_documented_grammar(monkeypatch, tmp_path, user):
+    config = _read(monkeypatch, tmp_path, f'port = 8080\nauth = "basic"\nuser = "{user}"\n')
+    assert config.user == user
+
+
+@pytest.mark.parametrize("value", [
+    '"Afx"', '"AFX"', '"afx:user"', '"afx\\n"', '"afx\\r"', '"afx "', '" afx"', '""', '"1afx"',
+    '"-afx"', '"_afx"', f'"{"a" * 33}"', '"afx\\u00e9"',
+    '"afx.b"', '"afx@b"', "1", "true", '["afx"]', '"afx\\u0000"',
+])
+def test_user_outside_the_grammar_is_config_invalid(monkeypatch, tmp_path, value):
+    """大文字・`:`・改行を含む user の受理は落ちる。"""
+    assert _reason(monkeypatch, tmp_path,
+                   f'port = 8080\nauth = "basic"\nuser = {value}\n') == "config_invalid"
+
+
+def test_the_user_is_validated_even_when_auth_is_none(monkeypatch, tmp_path):
+    assert _reason(monkeypatch, tmp_path, 'port = 8080\nuser = "Afx"\n') == "config_invalid"

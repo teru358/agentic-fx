@@ -22,6 +22,7 @@ from agentic_fx.ops_setup.web_setup import (
     cleanup_temporaries,
     exposure,
     generate_password,
+    generated_password_line,
     options_problem,
     plan_for_input,
     read_config_file,
@@ -185,6 +186,9 @@ def test_config_file_that_grows_while_being_read_is_refused(tmp_path):
     {}, {"port": 0}, {"port": 8788, "bind": LAN}, {"port": 8788, "bind": "localhost"},
     {"port": 8788, "auth": "Basic"}, {"port": 8788, "allow": []},
     {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8", "0.0.0.0/0"]},
+    {"port": 8788, "auth": "basic", "user": "Afx"}, {"port": 8788, "auth": "basic", "user": "afx:u"},
+    {"port": 8788, "auth": "basic", "user": "afx\n"}, {"port": 8788, "auth": "basic", "user": ""},
+    {"port": 8788, "auth": "basic", "user": "a" * 33}, {"port": 8788, "auth": "basic", "user": 1},
 ])
 def test_target_from_config_file_rejects_what_is_not_a_valid_target(parsed):
     with pytest.raises(WebSetupError) as raised:
@@ -197,6 +201,8 @@ def test_target_from_config_file_rejects_what_is_not_a_valid_target(parsed):
     {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "basic"},
     {"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"]},
     {"port": 8788, "allow": ["0.0.0.0/0"], "auth": "basic"},
+    {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "basic", "user": "ops-web"},
+    {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "basic", "user": "a" * 32},
 ])
 def test_target_from_config_file_accepts_valid_targets(parsed):
     assert target_from_config_file(parsed) == parsed
@@ -205,12 +211,14 @@ def test_target_from_config_file_accepts_valid_targets(parsed):
 # --- --password-file ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("raw, ok", [
-    (b"A" * 15, False), (b"A" * 16, True), (b"A" * 128, True), (b"A" * 129, False),
-    (b"A" * 16 + b"\n", True), (b"A" * 128 + b"\n", True), (b"A" * 129 + b"\n", False),
-    (b"A" * 15 + b"\n", False), (b"A" * 16 + b"\r\n", False), (b"A" * 16 + b"\n\n", False),
+    (b"A" * 7, False), (b"A" * 8, True), (b"A" * 32, True), (b"A" * 33, False),
+    (b"A" * 8 + b"\n", True), (b"A" * 32 + b"\n", True), (b"A" * 33 + b"\n", False),
+    (b"A" * 7 + b"\n", False), (b"A" * 8 + b"\r\n", False), (b"A" * 8 + b"\n\n", False),
+    (b"A" * 32 + b"\r\n", False), (b"A" * 32 + b"\n\n", False),
     (b"AAAAAAAA\nAAAAAAAA", False), (b"AAAAAAAA AAAAAAAA", False), (b"AAAAAAAA\tAAAAAAAA", False),
     (b"AAAAAAAA:AAAAAAAA", True), ("パスワードパスワードパスワード".encode(), False),
-    (b"A" * 16 + b"\x7f", False), (b"A" * 16 + b"\x00", False),
+    (b"A" * 16, True), (b"A" * 128, False),
+    (b"A" * 8 + b"\x7f", False), (b"A" * 8 + b"\x00", False),
 ])
 def test_password_file_grammar_boundary(tmp_path, raw, ok):
     path = _file(tmp_path / "p", raw, 0o600)
@@ -280,9 +288,10 @@ def test_generated_passwords_use_the_csprng_and_differ():
     assert generate_password() != generate_password()
 
 
-@pytest.mark.parametrize("value, ok", [("A" * 15, False), ("A" * 16, True), ("A" * 128, True),
-                                       ("A" * 129, False), ("a:b" * 6, True), ("a b" * 6, False),
-                                       ("é" * 16, False), ("A" * 15 + "\n", False)])
+@pytest.mark.parametrize("value, ok", [("A" * 7, False), ("A" * 8, True), ("A" * 32, True),
+                                       ("A" * 33, False), ("a:b" * 6, True), ("a b" * 6, False),
+                                       ("é" * 8, False), ("A" * 7 + "\n", False), ("A" * 8 + "\n", False),
+                                       ("", False), ("A" * 16, True), ("A" * 128, False)])
 def test_password_grammar(value, ok):
     if ok:
         assert check_password(value) == value
@@ -434,21 +443,33 @@ def test_generated_password_is_shown_once_after_the_directory_sync_and_before_th
     events: list[str] = []
     shown: list[str] = []
 
-    def show(value):
+    def show(value, user):
         events.append("shown")
-        shown.append(value)
+        shown.append((user, value))
 
     apply_target(root, {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"},
                  SecretPlan("install", PW, generated=True), hook=events.append, show_password=show)
-    assert shown == [PW]
+    assert shown == [("afx", PW)]
     assert events.index("secret_dir_synced") < events.index("shown") < events.index("config_tmp_created")
 
 
 def test_a_typed_password_is_never_shown(root, xdg):
     shown: list[str] = []
     apply_target(root, {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"},
-                 SecretPlan("install", PW), show_password=shown.append)
+                 SecretPlan("install", PW), show_password=lambda *args: shown.append(args))
     assert shown == []
+
+
+def test_the_shown_user_is_the_configured_user(root, xdg):
+    shown: list[tuple[str, str]] = []
+    apply_target(root, {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic", "user": "ops-web"},
+                 SecretPlan("install", PW, generated=True), show_password=lambda pw, user: shown.append((user, pw)))
+    assert shown == [("ops-web", PW)]
+
+
+def test_the_generated_password_line_names_the_user_and_the_password_once():
+    assert generated_password_line("ops-web", PW) == (
+        f"ユーザー名: ops-web / 生成した password (この表示は 1 回だけです): {PW}")
 
 
 def test_remove_unlinks_then_syncs_the_directory(root, xdg):
@@ -514,19 +535,22 @@ def test_apply_target_leaves_no_fd_open_on_failure(root, xdg):
 
 @pytest.mark.parametrize("values, text", [
     ({"port": 8788}, "web: 待受 127.0.0.1:8788 / 公開 自機のみ / 認証 none"),
-    ({"port": 8788, "auth": "basic"}, "web: 待受 127.0.0.1:8788 / 公開 自機のみ / 認証 basic"),
+    ({"port": 8788, "auth": "basic"}, "web: 待受 127.0.0.1:8788 / 公開 自機のみ / 認証 basic (afx)"),
+    ({"port": 8788, "auth": "basic", "user": "ops-web"},
+     "web: 待受 127.0.0.1:8788 / 公開 自機のみ / 認証 basic (ops-web)"),
+    ({"port": 8788, "auth": "none", "user": "ops-web"}, "web: 待受 127.0.0.1:8788 / 公開 自機のみ / 認証 none"),
     ({"port": 9000, "bind": "127.0.0.1", "allow": ["0.0.0.0/0"], "auth": "none"},
      "web: 待受 127.0.0.1:9000 / 公開 自機のみ / 認証 none"),
     ({"port": 9000, "bind": "127.0.0.2", "allow": ["10.0.0.0/8"], "auth": "basic"},
-     "web: 待受 127.0.0.2:9000 / 公開 自機のみ / 認証 basic"),
+     "web: 待受 127.0.0.2:9000 / 公開 自機のみ / 認証 basic (afx)"),
     ({"port": 8788, "bind": LAN, "allow": ["10.0.0.1", "192.168.1.0/24", "172.16.0.0/12"], "auth": "basic"},
-     f"web: 待受 {LAN}:8788 / 公開 許可範囲 3 件 / 認証 basic"),
+     f"web: 待受 {LAN}:8788 / 公開 許可範囲 3 件 / 認証 basic (afx)"),
     ({"port": 8788, "bind": LAN, "allow": ["10.0.0.1"], "auth": "none"},
      f"web: 待受 {LAN}:8788 / 公開 許可範囲 1 件 / 認証 none"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "none"},
      f"web: 待受 {LAN}:8788 / 公開 到達できる全 IPv4 / 認証 none"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "basic"},
-     f"web: 待受 {LAN}:8788 / 公開 到達できる全 IPv4 / 認証 basic"),
+     f"web: 待受 {LAN}:8788 / 公開 到達できる全 IPv4 / 認証 basic (afx)"),
 ])
 def test_summary_line_forms(values, text):
     assert summary_line(values) == text
@@ -575,8 +599,25 @@ def test_access_line_basic_with_a_password_never_shows_the_password(root, xdg):
     apply_target(root, {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"},
                  SecretPlan("install", PW))
     got = access_line(root, _stage(), interfaces=lambda: [LAN])
-    assert got == f"web-access: bind={LAN}:8788 allow=restricted auth=basic"
+    assert got == f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"
     assert PW not in got
+
+
+def test_access_line_basic_shows_the_configured_user_and_the_default(root, xdg):
+    apply_target(root, {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "basic",
+                        "user": "ops-web"}, SecretPlan("install", PW))
+    assert access_line(root, _stage(), interfaces=lambda: [LAN]) == \
+        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web"
+    text = (xdg / "config" / "ops.toml").read_text().replace('user = "ops-web"\n', "")
+    (xdg / "config" / "ops.toml").write_text(text)
+    assert access_line(root, _stage(), interfaces=lambda: [LAN]) == \
+        f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"
+
+
+def test_access_line_none_never_shows_a_user(root, xdg):
+    apply_target(root, {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"], "auth": "none", "user": "ops"},
+                 SecretPlan("absent"))
+    assert "user" not in access_line(root, _stage(), interfaces=lambda: [LAN])
 
 
 def test_access_line_unavailable_reasons_follow_the_shared_reader(root, xdg):

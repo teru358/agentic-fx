@@ -1,7 +1,7 @@
 """HTTP Basic 認証と認証失敗の rate limit。
 
-username は固定の `afx`、secret は `web.password`。比較は `b"afx:" + password` 全体と
-decoded credential 全体をそれぞれ SHA-256 にした 32 byte 同士を `hmac.compare_digest` で
+username は設定の `user` (省略時 `afx`)、secret は `web.password`。比較は
+`b"<user>:" + password` 全体と decoded credential 全体をそれぞれ SHA-256 にした 32 byte 同士を `hmac.compare_digest` で
 ちょうど 1 回行う (rate limit 中を除く)。欠落・重複・scheme 違い・壊れた Base64・上限超過は
 固定の dummy 入力の digest を比較し、失敗の形が外から区別できないようにする。
 
@@ -24,13 +24,14 @@ from dataclasses import dataclass
 
 from afx_ops.isolation.accept_loop import Journal
 
-USERNAME = b"afx"
+DEFAULT_USER = "afx"
 REALM_HEADER = 'Basic realm="afx"'
 WINDOW_SECONDS = 60.0
 SOURCE_LIMIT = 5
 GLOBAL_LIMIT = 100
-MAX_TOKEN_BYTES = 176
-MAX_CREDENTIAL_BYTES = 132
+# user 32 byte + ":" + password 32 byte = 65 byte、その標準 Base64 (padding あり) は 88 byte
+MAX_CREDENTIAL_BYTES = 65
+MAX_TOKEN_BYTES = 88
 _DUMMY = b"\x00dummy-credential-for-uniform-failure"
 
 OK = "ok"
@@ -75,11 +76,15 @@ def _credential(values: list[str]) -> bytes | None:
 class BasicAuthenticator:
     """認証と rate limit を 1 つの lock の下で行う。worker thread から共有される。"""
 
-    def __init__(self, password: bytes, *, clock: Callable[[], float] = time.monotonic,
+    def __init__(self, password: bytes, *, user: str = DEFAULT_USER,
+                 clock: Callable[[], float] = time.monotonic,
                  journal: Journal | None = None) -> None:
         if type(password) is not bytes or not password:
             raise ValueError("password")
+        if type(user) is not str or not user or not user.isascii() or ":" in user:
+            raise ValueError("user")
         self._password = bytes(password)
+        self._prefix = user.encode("ascii") + b":"
         self._clock = clock
         self._journal = journal if journal is not None else Journal()
         self._lock = threading.Lock()
@@ -114,7 +119,7 @@ class BasicAuthenticator:
             if not values:
                 return None, Decision(UNAUTHORIZED)
             credential = _credential(values)
-            expected = hashlib.sha256(b"afx:" + self._password).digest()
+            expected = hashlib.sha256(self._prefix + self._password).digest()
             presented = hashlib.sha256(_DUMMY if credential is None else credential).digest()
             matched = hmac.compare_digest(expected, presented)
             if matched and credential is not None:

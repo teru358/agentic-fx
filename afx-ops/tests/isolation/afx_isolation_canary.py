@@ -37,6 +37,7 @@ spec:
          port / bind / auth で plan を作る (設定の違反は起動口と同じ固定 reason で止まる)
   web_auth: web の auth (none | basic)。basic は plan の必須 secret が `web.password` になり、
          設定の auth も basic になる (secret dir に安全な password を置く)
+  web_user: Basic 認証のユーザー名 (省略時は設定の既定 `afx`)
   foreign_owner: 真なら ops.toml の所有者として期待する uid を実 uid と別の値にする
          (他 uid の file を実 process で作れないための再現)
   fake_ip: interface 列挙に使う実行 file の path を差し替える
@@ -711,6 +712,8 @@ def _config(spec: dict) -> OpsConfig:
             extra["bind"] = spec["web_bind"]
         if "web_auth" in spec:
             extra["auth"] = spec["web_auth"]
+        if "web_user" in spec:
+            extra["user"] = spec["web_user"]
         if "web_allow" in spec:
             import ipaddress
             extra["allow"] = tuple(ipaddress.IPv4Network(item) for item in spec["web_allow"])

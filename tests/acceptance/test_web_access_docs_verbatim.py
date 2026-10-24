@@ -24,7 +24,9 @@ def _status_lines() -> dict[str, str]:
     stage = {"operation": "enable", "stage": "enabled"}
     lines = {}
     cases = {
-        "restricted": {"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "basic"},
+        "restricted": {"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "basic",
+                       "user": "afx"},
+        "restricted-none": {"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "none"},
         "unrestricted": {"port": 8788, "bind": "192.0.2.10", "allow": ["0.0.0.0/0"], "auth": "none"},
         "loopback-default": {"port": 8788},
     }
@@ -35,12 +37,17 @@ def _status_lines() -> dict[str, str]:
     return lines
 
 
-def _summary_template() -> str:
-    line = web_setup.summary_line({"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "basic"})
+def _summary_templates() -> list[str]:
     exposure = web_setup.exposure({"bind": "192.0.2.10", "allow": ["10.0.0.0/8"]})
     assert exposure == "許可範囲 1 件"
-    return (line.replace("192.0.2.10", "<bind>").replace("8788", "<port>")
-            .replace(exposure, "<範囲>").replace("basic", "<none|basic>"))
+    templates = []
+    for values in ({"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "none"},
+                   {"port": 8788, "bind": "192.0.2.10", "allow": ["10.0.0.0/8"], "auth": "basic",
+                    "user": "ops-web"}):
+        line = web_setup.summary_line(values)
+        templates.append(line.replace("192.0.2.10", "<bind>").replace("8788", "<port>")
+                         .replace(exposure, "<範囲>").replace("ops-web", "<user>"))
+    return templates
 
 
 def _exposures() -> list[str]:
@@ -51,9 +58,11 @@ def _exposures() -> list[str]:
 
 
 def test_the_literals_taken_from_the_implementation_are_the_expected_shapes() -> None:
-    assert _summary_template() == "web: 待受 <bind>:<port> / 公開 <範囲> / 認証 <none|basic>"
+    assert _summary_templates() == ["web: 待受 <bind>:<port> / 公開 <範囲> / 認証 none",
+                                    "web: 待受 <bind>:<port> / 公開 <範囲> / 認証 basic (<user>)"]
     assert _exposures() == ["自機のみ", "到達できる全 IPv4", "許可範囲 <N> 件"]
-    assert _status_lines()["restricted"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=basic"
+    assert _status_lines()["restricted"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=basic user=afx"
+    assert _status_lines()["restricted-none"] == "web-access: bind=192.0.2.10:8788 allow=restricted auth=none"
     assert web_setup.access_line(Path("/nonexistent"), None) == "web-access: unavailable reason=not_configured"
 
 
@@ -62,8 +71,37 @@ def test_wizard_question_warning_and_summary_are_quoted_verbatim(name: str) -> N
     text = _text(DOCS[name])
     assert web_wizard.ONE_QUESTION in text
     assert web_wizard.UNRESTRICTED_WARNING in text
-    assert _summary_template() in text
+    assert all(template in text for template in _summary_templates())
     assert "`yes`" in text
+    assert "既定" not in web_wizard.ONE_QUESTION
+
+
+def _question_texts() -> list[str]:
+    return [
+        web_wizard.BIND_EXPLANATION,
+        web_wizard.choice_text(web_wizard.ACCESS_LABEL, web_wizard.ACCESS_OPTIONS),
+        web_wizard.choice_text(web_wizard.KEEP_LABEL, web_wizard.KEEP_OPTIONS),
+        web_wizard.USER_LABEL + " [afx]:",
+        web_wizard.PASSWORD_LABEL + ":",
+        web_wizard.CONFIRM_LABEL + ":",
+        web_setup.generated_password_line("<user>", "<password>"),
+    ]
+
+
+def test_the_basic_user_and_password_questions_are_quoted_in_the_ops_api_document() -> None:
+    text = _text(OPS_API)
+    for question in _question_texts():
+        assert question in text, question
+    assert "8〜32" in text and "33 文字以上" in text
+    assert "web が止まっている間に `web.password` を手で削除" in text
+
+
+def test_the_acceptance_document_names_the_user_display_and_the_old_password_recovery() -> None:
+    text = _text(ACCEPTANCE)
+    assert web_wizard.BIND_EXPLANATION in text
+    assert web_wizard.choice_text(web_wizard.KEEP_LABEL, web_wizard.KEEP_OPTIONS) in text
+    assert "`ユーザー名: <user>`" in text
+    assert "web が止まっている間に `web.password` を手で削除" in text
 
 
 def test_exposure_words_are_quoted_in_the_ops_api_document() -> None:
@@ -79,13 +117,14 @@ def test_status_line_format_is_quoted_verbatim(name: str) -> None:
     assert unavailable + "<固定 reason>" in text
     assert web_setup.access_line(Path("/nonexistent"), None).startswith(unavailable)
     if name == "ops-api":
-        assert lines["restricted"] in text
-        assert all(f"`{kind}`" in text for kind in lines)
+        assert lines["restricted"] in text and lines["restricted-none"] in text
+        assert all(f"`{kind}`" in text for kind in ("restricted", "unrestricted", "loopback-default"))
     else:
-        template = lines["restricted"].replace("192.0.2.10", "<bind>").replace("8788", "<port>")
-        template = template.replace("allow=restricted", "allow=<restricted|unrestricted|loopback-default>")
-        template = template.replace("auth=basic", "auth=<none|basic>")
-        assert template in text
+        for key in ("restricted", "restricted-none"):
+            template = lines[key].replace("192.0.2.10", "<bind>").replace("8788", "<port>")
+            template = template.replace("allow=restricted", "allow=<restricted|unrestricted|loopback-default>")
+            template = template.replace("user=afx", "user=<user>")
+            assert template in text
 
 
 def _reconfigure_outputs() -> list[str]:

@@ -97,8 +97,8 @@ def world(tmp_path, monkeypatch) -> World:
     return built
 
 
-def _write_basic(world: World, port: int) -> None:
-    apply_target(world.root, {"port": port, "auth": "basic"}, SecretPlan("install", PASSWORD))
+def _write_basic(world: World, port: int, user: str = "afx") -> None:
+    apply_target(world.root, {"port": port, "auth": "basic", "user": user}, SecretPlan("install", PASSWORD))
 
 
 # --- (a) probe --------------------------------------------------------------------------------
@@ -124,6 +124,31 @@ def test_probe_and_body_reader_give_the_same_reason_for_a_broken_password(world,
     assert web_access_reason(world.root) == reason
 
 
+@pytest.mark.parametrize(("size", "accepted"), [(7, False), (8, True), (32, True), (33, False)])
+def test_probe_and_body_reader_agree_on_the_password_size_boundary(world, size, accepted):
+    _write_basic(world, _free_port())
+    world.password_path().write_bytes(b"p" * size)
+    world.password_path().chmod(0o600)
+    want = None if accepted else "secret_invalid"
+    assert world.probe() == ((0, "") if accepted else (71, "afx-ops: secret_invalid\n"))
+    assert web_access_reason(world.root) == want
+
+
+@pytest.mark.parametrize("user", ["afx", "a", "ops-web_1", "a" * 32])
+def test_probe_accepts_the_users_the_writer_writes(world, user):
+    _write_basic(world, _free_port(), user)
+    assert world.probe() == (0, "")
+    assert web_access_reason(world.root) is None
+
+
+def test_probe_rejects_a_user_outside_the_grammar_like_the_body_reader(world):
+    _write_basic(world, _free_port())
+    config = world.web / "config" / "ops.toml"
+    config.write_text(config.read_text().replace('user = "afx"', 'user = "Afx"'))
+    assert world.probe() == (71, "afx-ops: config_invalid\n")
+    assert web_access_reason(world.root) == "config_invalid"
+
+
 def test_probe_rejects_a_password_left_behind_when_auth_is_none(world):
     _write_basic(world, _free_port())
     apply_target(world.root, {"port": _free_port()}, SecretPlan("keep"))
@@ -138,11 +163,12 @@ def test_interfaces_contract_is_accepted_by_the_body_parser(world):
     assert done.returncode == 0 and done.stderr == b""
     assert done.stdout.endswith(b"\n") and done.stdout.count(b"\n") == 1
     document = json.loads(done.stdout)
-    assert isinstance(document, dict) and "version" in document
+    assert isinstance(document, dict) and document["version"] == 2
+    assert all(set(entry) == {"address", "ifindex", "ifname", "scope"} for entry in document["interfaces"])
     parsed = interface_listing.parse(done.stdout)
     assert tuple(parsed) == tuple(interface_listing.list_interfaces(world.ops_exec))
     for candidate in parsed:
-        assert candidate.scope in ("global", "link")
+        assert candidate.scope in ("global", "link") and candidate.ifname
 
 
 # --- (c) ops-web を実 process で起動して Basic 認証を通す ----------------------------------------
@@ -162,8 +188,8 @@ def _request(port: int, token: str | None) -> tuple[int, dict[str, str], bytes]:
     return int(lines[0].split(" ")[1]), headers, body
 
 
-def _token(password: str) -> str:
-    return base64.b64encode(f"afx:{password}".encode()).decode()
+def _token(password: str, user: str = "afx") -> str:
+    return base64.b64encode(f"{user}:{password}".encode()).decode()
 
 
 def _stop(process: subprocess.Popen) -> None:
@@ -185,13 +211,14 @@ def _wait_for(predicate, *, seconds: float = 60.0) -> bool:
     return predicate()
 
 
+@pytest.mark.parametrize("user", ["afx", "ops-web"])
 def test_real_ops_web_serves_basic_auth_over_loopback_with_ready_and_the_sixth_failure_is_429(
-        world, tmp_path):
+        world, tmp_path, user):
     port = _free_port()
     keys = key_dir(world.root)
     initialize(keys, root=world.root)
     enroll(keys, Principal.OPS_WEB)
-    _write_basic(world, port)
+    _write_basic(world, port, user)
     assert world.probe() == (0, "")
 
     (world.root / "afx_mode.json").write_text(json.dumps(
@@ -230,13 +257,18 @@ def test_real_ops_web_serves_basic_auth_over_loopback_with_ready_and_the_sixth_f
                 assert web.poll() is None, "ops-web が READY の前に終了した"
         assert ready, "READY=1 が届かない"
 
-        good = _token(PASSWORD)
-        wrong = _token(WRONG)
+        good = _token(PASSWORD, user)
+        wrong = _token(WRONG, user)
         status, _headers, body = _request(port, good)
         assert status == 200 and PASSWORD.encode() not in body
         status, headers, _ = _request(port, None)
         assert status == 401 and headers["www-authenticate"] == 'Basic realm="afx"'
-        assert [_request(port, wrong)[0] for _ in range(5)] == [401] * 5
+        failures = 5
+        if user != "afx":
+            # 設定した user 以外 (既定の afx を含む) は正しい password でも通らない
+            assert _request(port, _token(PASSWORD, "afx"))[0] == 401
+            failures = 4
+        assert [_request(port, wrong)[0] for _ in range(failures)] == [401] * failures
         status, headers, _ = _request(port, wrong)
         assert status == 429 and 1 <= int(headers["retry-after"]) <= 60
         assert _request(port, good)[0] == 429
@@ -259,7 +291,7 @@ def test_non_interactive_enable_runs_the_real_probe_before_leaving_staged(world,
     initialize(key_dir(world.root), root=world.root)
     port = _free_port()
     config_file = tmp_path / "target.toml"
-    config_file.write_text(f'port = {port}\nauth = "basic"\n')
+    config_file.write_text(f'port = {port}\nauth = "basic"\nuser = "ops-web"\n')
     config_file.chmod(0o600)
     password_file = tmp_path / "pw"
     password_file.write_text(PASSWORD)
@@ -301,5 +333,7 @@ def test_non_interactive_enable_runs_the_real_probe_before_leaving_staged(world,
     assert at_stopped == [("staged", 2)]
     assert world.password_path().read_bytes() == PASSWORD.encode()
     assert (world.web / "config" / "ops.toml").read_text().count('auth = "basic"') == 1
+    assert (world.web / "config" / "ops.toml").read_text().count('user = "ops-web"') == 1
+    assert io.err == [f"web: 待受 127.0.0.1:{port} / 公開 自機のみ / 認証 basic (ops-web)"]
     assert PASSWORD not in io.text()
     assert web_access_reason(world.root) is None

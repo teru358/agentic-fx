@@ -78,7 +78,7 @@ def run(isolated, *, client=None, on_serving: Callable[[], None] | None = None,
     if client is None:
         client = client_for(isolated, WebClient)
     config = isolated.config
-    authenticator = (BasicAuthenticator(isolated.secrets[WEB_PASSWORD])
+    authenticator = (BasicAuthenticator(isolated.secrets[WEB_PASSWORD], user=config.user)
                      if config.auth == "basic" else None)
     asyncio.run(_serve(_aiohttp_parts(), isolated.listener, client, on_serving, stop_after,
                        allow=config.web_allow_networks(),

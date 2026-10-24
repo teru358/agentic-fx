@@ -107,7 +107,7 @@ def test_a_tty_rerun_after_none_to_basic_asks_the_auth_again_and_never_reshows_a
     apply_target(root, START_NONE, SecretPlan("absent"))
     assert _crash(root, point, _toml(tmp_path, START_BASIC), "install", _password(tmp_path, NEW, "pw")) == 70
     assert _reason(root) == "secret_unexpected"
-    io = ScriptIO(answers=["2", ""])      # パスワード認証を選び、既存 password を再利用 (表示しない)
+    io = ScriptIO(answers=["2", "1"])      # Basic 認証を選び、既存 password を維持する (表示しない)
     run = run_enable(root, io, candidates=ONE_CANDIDATE)
     assert run.rc == 0 and _password_state(xdg) == NEW
     assert NEW not in io.text()
@@ -155,7 +155,7 @@ def test_a_tty_rerun_after_basic_to_none_asks_the_auth_and_secret_again(root, xd
     apply_target(root, START_BASIC, SecretPlan("install", OLD))
     assert _crash(root, point, _toml(tmp_path, START_NONE), "remove", None) == 70
     assert _reason(root) == "secret_missing"
-    io = ScriptIO(answers=["1", ""])      # 許可 IP だけ、allow は既存値 (既定) を使う
+    io = ScriptIO(answers=["1", ""])      # 許可 IP だけ、allow は既存値 の値を使う
     run = run_enable(root, io, candidates=ONE_CANDIDATE)
     assert run.rc == 0 and _reason(root) is None and _password_state(xdg) is None
 
@@ -189,7 +189,7 @@ def test_after_the_config_is_written_and_before_the_stage_a_non_tty_rerun_prints
     io = ScriptIO(tty=False)
     run = run_enable(root, io, candidates=ONE_CANDIDATE)
     assert run.rc == 0 and run.setup.enabled == ["web"] and io.asked == []
-    assert io.err == [f"web: 待受 {LAN}:8788 / 公開 許可範囲 1 件 / 認証 basic"]
+    assert io.err == [f"web: 待受 {LAN}:8788 / 公開 許可範囲 1 件 / 認証 basic (afx)"]
 
 
 def test_the_death_never_leaves_a_partial_live_file(root, xdg, tmp_path):

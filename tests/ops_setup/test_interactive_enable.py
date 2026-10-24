@@ -21,7 +21,7 @@ G, C, U = 10**16 + 1, 10**16 + 2, 10**16 + 3
 
 BOT = {"guild_id": G, "channel_id": C, "allowlist_user_ids": [U], "mention_user_ids": [U], "token": TOKEN}
 VALUES = {"bot": BOT, "web": {"port": 8788}, "notify": {"webhook_url": WEBHOOK}}
-SCOPE_Q = "公開範囲 [1] 自機のみ (既定) [2] LAN"
+SCOPE_Q = "公開範囲 [1] 自機のみ [2] LAN"
 
 
 @dataclass

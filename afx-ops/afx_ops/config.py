@@ -32,7 +32,7 @@ _FEATURE_KEYS = MappingProxyType({
 })
 _OPTIONAL_FEATURE_KEYS = MappingProxyType({
     "bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
-    "web": ("bind", "allow", "auth"),
+    "web": ("bind", "allow", "auth", "user"),
     "notify": ("deliver_trade_events",),
 })
 # 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
@@ -45,6 +45,8 @@ _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 WEB_LOOPBACK = LOOPBACK
 WEB_UNRESTRICTED = UNRESTRICTED_NETWORK
 WEB_AUTHS = ("none", "basic")
+WEB_USER_DEFAULT = "afx"
+_WEB_USER = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 class ConfigError(Exception):
@@ -79,6 +81,7 @@ class OpsConfig:
     bind: str | None = None
     allow: tuple[ipaddress.IPv4Network, ...] | None = None
     auth: str = "none"
+    user: str = WEB_USER_DEFAULT
 
     def without_config_dir_fd(self) -> "OpsConfig":
         """config dir の fd の所有を手放した写し (fd は閉じない)。"""
@@ -343,6 +346,13 @@ def _web_auth(value: object) -> str:
     return value
 
 
+def _web_user(value: object) -> str:
+    """Basic 認証のユーザー名。英小文字で始まる 1〜32 byte の ASCII (`re.fullmatch`)。"""
+    if type(value) is not str or _WEB_USER.fullmatch(value) is None:
+        raise ConfigError("user")
+    return value
+
+
 def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> OpsConfig:
     """固定 schema の設定を、検査済み config dir の fd と共に読む。"""
     if feature not in _FEATURE_KEYS:
@@ -372,7 +382,8 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
                 port=port,
                 bind=_web_bind(parsed["bind"]) if "bind" in parsed else None,
                 allow=_web_allow(parsed["allow"]) if "allow" in parsed else None,
-                auth=_web_auth(parsed["auth"]) if "auth" in parsed else "none")
+                auth=_web_auth(parsed["auth"]) if "auth" in parsed else "none",
+                user=_web_user(parsed["user"]) if "user" in parsed else WEB_USER_DEFAULT)
         if feature == "bot":
             return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                              config_dir_fd=config_dir_fd,

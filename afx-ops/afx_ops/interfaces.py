@@ -53,6 +53,7 @@ class Candidate:
     address: str
     ifindex: int
     scope: str
+    ifname: str
 
 
 def _resolve_ip(candidates: Sequence[str]) -> str:
@@ -146,7 +147,9 @@ def parse_ip_json(raw: bytes) -> tuple[Candidate, ...]:
         if type(entry) is not dict:
             raise InterfaceLookupError
         ifindex, infos = entry.get("ifindex"), entry.get("addr_info")
-        if not _is_int(ifindex) or ifindex < 1 or type(infos) is not list:
+        ifname = entry.get("ifname")
+        if (not _is_int(ifindex) or ifindex < 1 or type(infos) is not list
+                or type(ifname) is not str or not ifname):
             raise InterfaceLookupError
         for info in infos:
             if type(info) is not dict:
@@ -167,7 +170,7 @@ def parse_ip_json(raw: bytes) -> tuple[Candidate, ...]:
                 continue
             current = found.get(local)
             if current is None or ifindex < current.ifindex:
-                found[local] = Candidate(local, ifindex, scope)
+                found[local] = Candidate(local, ifindex, scope, ifname)
     return tuple(sorted(found.values(),
                         key=sort_key))
 
@@ -185,6 +188,6 @@ def list_interfaces(*, candidates: Sequence[str] | None = None,
 
 def render_json(found: Sequence[Candidate]) -> str:
     """`afx-ops interfaces` の成功出力 (UTF-8、末尾に改行 1 個)。"""
-    document = {"interfaces": [{"address": c.address, "ifindex": c.ifindex, "scope": c.scope}
-                               for c in found], "version": 1}
+    document = {"interfaces": [{"address": c.address, "ifindex": c.ifindex, "ifname": c.ifname,
+                                "scope": c.scope} for c in found], "version": 2}
     return json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n"

@@ -22,7 +22,7 @@ from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_stage
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import resolve_ops_exec
 from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, SecretPlan, WebOptions, WebSetupError, cleanup_temporaries,
-                                            options_problem, plan_for_input, read_config_file,
+                                            generated_password_line, options_problem, plan_for_input, read_config_file,
                                             read_password_file, summary_line, target_from_config_file)
 from agentic_fx.ops_setup.web_wizard import FULL, ONE_QUESTION, RETRY_STEPS, STOP_REASONS, Session
 
@@ -200,8 +200,8 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
         addresses = lambda: [item.address for item in candidates()]  # noqa: E731
         session = Session(root, io, lambda: probe_runner("web"), candidates, hook=hook, token_bytes=token_bytes)
 
-        def show_password(password: str) -> None:
-            io.stdout(f"生成した password (この表示は 1 回だけです): {password}")
+        def show_password(password: str, user: str) -> None:
+            io.stdout(generated_password_line(user, password))
 
         if options.non_interactive:
             parsed = read_config_file(options.config_file or "")

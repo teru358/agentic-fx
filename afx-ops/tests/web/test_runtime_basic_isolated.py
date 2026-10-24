@@ -77,6 +77,18 @@ def test_basic_authenticates_in_the_isolated_process_and_failures_never_reach_th
     assert done.stderr.splitlines() == ["afx-ops: web_auth_failed"]
 
 
+def test_a_configured_user_authenticates_and_the_default_afx_does_not(root, daemon, child_env):
+    install_password(root)
+    port = free_port()
+    custom = base64.b64encode(b"ops-web:" + PASSWORD)
+    raws = [authed(custom), authed(TOKEN), authed(base64.b64encode(b"ops-web:" + PASSWORD + b"x"))]
+    replies, done = talk(raws, root, port, child_env, web_user="ops-web")
+    assert_finished(done)
+    assert [parse(reply)[0] for reply in replies] == [200, 401, 401]
+    assert [r["target"] for r in daemon.requests()] == ["/v1/status"]
+    assert done.stderr.splitlines() == ["afx-ops: web_auth_failed"] * 2
+
+
 def test_the_sixth_failure_is_429_and_a_correct_password_is_refused_while_limited(
         root, daemon, child_env):
     install_password(root)

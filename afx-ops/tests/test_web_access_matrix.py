@@ -1,4 +1,4 @@
-"""AC-12: G1〜G7 と C1〜C8 の全 fixture で、3 入口 (config・probe・production) が同じ reason を返す。
+"""AC-12: G1〜G8 と C1〜C8 の全 fixture で、3 入口 (config・probe・production) が同じ reason を返す。
 
 fixture は `_web_access_matrix` が仕様の 2 表から機械生成し (期待値は実装を呼ばずに書き下す)、
 本体の reader の試験 (`tests/ops_setup/test_web_access_matrix.py`) も同じ JSON を読む。
@@ -54,7 +54,7 @@ def _fake_ip(directory: Path, row: dict, local: str) -> tuple[str, Path]:
     else:
         # 1 interface に primary と secondary の 2 address。本機の address は secondary 側に置く
         addresses = {"local": [OTHER, local], "absent": [OTHER], "na": [OTHER]}[state]
-        document = json.dumps([{"ifindex": 2, "addr_info": [
+        document = json.dumps([{"ifindex": 2, "ifname": "enp6s0", "addr_info": [
             {"family": "inet", "local": address, "prefixlen": 24} for address in addresses]}])
         body = f"echo called >> '{marker}'\ncat <<'EOF'\n{document}\nEOF"
     script.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
@@ -91,9 +91,9 @@ def _build(dirs, row: dict, *, root: str, keys: str, port: int, local: str) -> N
     if secret != "none":
         dirs.secret.mkdir(mode=0o700)
         dirs.secret.chmod(0o700)
-        if secret in ("safe", "unsafe"):
+        if secret in ("safe", "unsafe", "payload"):
             password = dirs.secret / "web.password"
-            password.write_bytes(b"A" * 22)
+            password.write_bytes(b"A" * row.get("secret_bytes", 22))
             password.chmod(0o600)
         if secret == "unsafe":
             (dirs.secret / "stray").write_text("x")
@@ -138,7 +138,7 @@ def test_the_checked_in_fixture_is_the_generated_one():
 def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
     ids = _ids(ROWS)
     assert len(ids) == len(set(ids))
-    for prefix in ("G1", "G2", "G3-", "G3a", "G3b", "G4", "G5", "G6", "G7"):
+    for prefix in ("G1", "G2", "G3-", "G3a", "G3b", "G4", "G5", "G6", "G7", "G8", "S-password"):
         assert any(i.startswith(prefix) for i in ids), prefix
     c = [row for row in ROWS if row["group"] == "C"]
     assert len(c) == 4 * 3 * 2 * 4
@@ -155,8 +155,31 @@ def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
                    "G6-allow-mixed-unrestricted", "G2-ops-toml-symlink", "G2-ops-toml-other-uid",
                    "G2-ops-toml-directory", "G2-ops-toml-mode-0644-accepted",
                    "G2-ops-toml-mode-0664", "G2-ops-toml-mode-0666", "G1-config-dir-missing",
-                   "G3a-instance-root-missing", "G3a-key-dir-relative", "G3a-other-instance"):
+                   "G3a-instance-root-missing", "G3a-key-dir-relative", "G3a-other-instance",
+                   "G8-user-upper", "G8-user-colon", "G8-user-newline", "G8-user-empty",
+                   "G8-user-33-bytes", "G8-user-32-bytes-accepted",
+                   "S-password-7-basic", "S-password-8-basic", "S-password-32-basic",
+                   "S-password-33-basic", "S-password-7-none", "S-password-8-none",
+                   "S-password-32-none", "S-password-33-none"):
         assert needed in ids, needed
+
+
+def test_the_user_and_password_boundary_rows_follow_the_spec_table():
+    by_id = {row["id"]: row for row in ROWS}
+    # G8: 大文字・`:`・改行を含む値は config_invalid、文法内の値は許可
+    for name in ("upper", "colon", "newline", "empty", "33-bytes", "digit-first"):
+        assert by_id[f"G8-user-{name}"]["expected"] == "config_invalid"
+    import tomllib
+    text = by_id["G8-user-newline"]["text"].replace("{ROOT}", "/r").replace("{KEYS}", "/k").replace("{PORT}", "1")
+    assert tomllib.loads(text)["user"] == "afx\n"
+    for name in ("afx", "one-byte", "32-bytes", "mixed"):
+        assert by_id[f"G8-user-{name}-accepted"]["expected"] is None
+    # password: 7 / 8 / 32 / 33 byte は unsafe / safe / safe / unsafe
+    for size, basic, none in ((7, "secret_invalid", "secret_invalid"), (8, None, "secret_unexpected"),
+                              (32, None, "secret_unexpected"), (33, "secret_invalid", "secret_invalid")):
+        assert by_id[f"S-password-{size}-basic"]["expected"] == basic
+        assert by_id[f"S-password-{size}-none"]["expected"] == none
+        assert by_id[f"S-password-{size}-basic"]["secret_bytes"] == size
 
 
 def test_each_row_has_exactly_one_expected_final_result():

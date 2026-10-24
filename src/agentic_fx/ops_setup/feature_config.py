@@ -4,6 +4,7 @@ from __future__ import annotations
 import errno
 import ipaddress
 import os
+import re
 import secrets
 import stat
 import tomllib
@@ -18,8 +19,12 @@ from agentic_fx.ops.keys import key_dir
 _SECRET_NAME = {"bot": "discord.token", "notify": "webhook.url"}
 _FIELDS = {"bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids", "token"), "web": ("port",), "notify": ("webhook_url",)}
 _COMMON = ("instance_root", "key_dir")
-# web の公開範囲の key。port と違って省略でき、省略は「自機のみ・allow 無し・認証無し」を表す
-_WEB_ACCESS = ("bind", "allow", "auth")
+# web の公開範囲の key。port と違って省略でき、省略は「自機のみ・allow 無し・認証無し・ユーザー名 afx」を表す
+_WEB_ACCESS = ("bind", "allow", "auth", "user")
+DEFAULT_USER = "afx"
+USER_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+# web.password の size (byte)。起動側の検査と同じ範囲
+PASSWORD_MIN, PASSWORD_MAX = 8, 32
 _OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
              "web": _WEB_ACCESS, "notify": ("deliver_trade_events",)}
 UNRESTRICTED = "0.0.0.0/0"
@@ -118,14 +123,27 @@ def _web_auth(value: object) -> str:
     return value
 
 
+def _web_user(value: object) -> str:
+    """Basic 認証のユーザー名。英小文字で始まる 1〜32 byte の ASCII (`re.fullmatch`)。"""
+    if type(value) is not str or USER_PATTERN.fullmatch(value) is None: raise InputError("user")
+    return value
+
+
 def _web_values(values: dict[str, Any]) -> dict[str, Any]:
-    """web の 4 key (port・bind・allow・auth) の単独の文法。bind / allow / auth は省略できる。"""
+    """web の 5 key (port・bind・allow・auth・user) の単独の文法。bind / allow / auth / user は省略できる。"""
     if any(name in values for name in _COMMON): raise InputError("common_key")
     port = values.get("port")
     if type(port) is not int or not 1 <= port <= 65535: raise InputError("port")
     result: dict[str, Any] = {"port": port}
-    for name, check in (("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth)):
+    for name, check in (("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth), ("user", _web_user)):
         if name in values: result[name] = check(values[name])
+    return result
+
+
+def web_written_values(values: dict[str, Any]) -> dict[str, Any]:
+    """writer が ops.toml に書く web の key。user は auth が basic のときだけ書き、値が既定でも省略しない。"""
+    result = {name: values[name] for name in ("port", "bind", "allow", "auth") if name in values}
+    if values.get("auth") == "basic": result["user"] = values.get("user", DEFAULT_USER)
     return result
 
 
@@ -311,8 +329,8 @@ def _web_password_state(secret_fd: int) -> str:
     except OSError: return "unsafe"
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600 or not 16 <= st.st_size <= 128: return "unsafe"
-        data = os.read(fd, 130)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600 or not PASSWORD_MIN <= st.st_size <= PASSWORD_MAX: return "unsafe"
+        data = os.read(fd, PASSWORD_MAX + 2)
     except OSError: return "unsafe"
     finally: os.close(fd)
     if len(data) != st.st_size or any(not 0x21 <= byte <= 0x7E for byte in data): return "unsafe"
@@ -344,7 +362,7 @@ def _web_parsed(root: Path, config_fd: int) -> dict[str, Any] | str:
 
 @dataclass(frozen=True)
 class WebAccess:
-    """web の設定の判定。reason が None なら許可で、values は検査済みの port / bind / allow / auth。"""
+    """web の設定の判定。reason が None なら許可で、values は検査済みの port / bind / allow / auth と、basic のときの user。"""
     reason: str | None
     values: dict[str, Any]
 
@@ -380,7 +398,10 @@ def web_access_check(root: Path, *, interfaces: Callable[[], Iterable[str]] | No
         if state == "unsafe": return WebAccess("secret_invalid", {})
         if auth == "basic" and state == "absent": return WebAccess("secret_missing", {})
         if auth == "none" and state == "safe": return WebAccess("secret_unexpected", {})
-        return WebAccess(None, {name: parsed[name] for name in ("port", *_WEB_ACCESS) if name in parsed})
+        found = {name: parsed[name] for name in ("port", *_WEB_ACCESS) if name in parsed}
+        if auth == "basic": found["user"] = parsed.get("user", DEFAULT_USER)
+        else: found.pop("user", None)
+        return WebAccess(None, found)
     finally: os.close(base_fd)
 
 
@@ -399,7 +420,7 @@ def web_secret_state(root: Path) -> str:
 
 
 def web_defaults(root: Path) -> dict[str, Any]:
-    """live の ops.toml のうち、単独の文法を通る port / bind / allow / auth だけ。質問の既定値に使う。
+    """live の ops.toml のうち、単独の文法を通る port / bind / allow / auth / user だけ。質問の既定値に使う。
 
     読めない・安全でない・別 instance の file は空。値の組み合わせは見ない。
     """
@@ -415,7 +436,8 @@ def web_defaults(root: Path) -> dict[str, Any]:
     try: parsed = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeError, tomllib.TOMLDecodeError): return {}
     result: dict[str, Any] = {}
-    for name, check in (("port", None), ("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth)):
+    for name, check in (("port", None), ("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth),
+                        ("user", _web_user)):
         if name not in parsed: continue
         try:
             if check is None:
@@ -472,7 +494,7 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
     if feature == "bot":
         config.update({name: values[name] for name in ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids")})
         if "mention_role_id" in values: config["mention_role_id"] = values["mention_role_id"]
-    elif feature == "web": config.update({name: values[name] for name in ("port", *_WEB_ACCESS) if name in values})
+    elif feature == "web": config.update(web_written_values(values))
     config.update({name: values[name] for name in _TRADE_KEYS[feature] if name in values})
     try:
         atomic(config_fd, "ops.toml", "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode(), 0o644)
@@ -482,7 +504,7 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
 
 def _web_config_text(root: Path, values: dict[str, Any]) -> bytes:
     config: dict[str, Any] = {"instance_root": str(Path(root).resolve()), "key_dir": str(key_dir(root))}
-    config.update({name: values[name] for name in ("port", *_WEB_ACCESS) if name in values})
+    config.update(web_written_values(values))
     return "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode()
 
 
