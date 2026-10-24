@@ -560,7 +560,9 @@ DB 行の無い旧 shell / 旧初回設定の行 (`commands.py:49-54` の `\n- t
 
 shell の `policy add` は `ops_service` がある通常経路では既存どおり `add_policy` を呼ぶ (`commands.py:414-416`)。`ops_service is None` の fallback (`commands.py:417-420`) も `append_policy_directive` をやめ、`self.conn` に対して同じ `insert_policy` → `reconcile_policy_file` を呼ぶ。`append_policy_directive` は呼び出し元が無くなるので削除する。 shell fallback の失敗表示も段 12 と同じ 2 分割とし、insert 前の失敗は `policy を書けませんでした (<理由>)`、commit 後の file 反映失敗は `policy は記録しましたが policy/directives.md へ反映できませんでした (<理由>)。afx の次回起動時に反映されます。` を返す。成功時の `policy に追記しました` と activity の `policy_added` (先頭 200 字) は変えない。
 
-段 12 と shell fallback は同じ書込み手順 (insert → commit → `reconcile_policy_file` → activity `policy_added`) を共有し、`request_id` は `uuid4().hex` を使う (`ops_policies.request_id` は `NOT NULL UNIQUE` で、`ops_requests` への外部キーではない)。activity は file 反映まで成功したときだけ書く。段 12 は DB 接続を段の先頭で 1 回開き、方針文と最初の課題の両方で使う。
+段 12 と shell fallback は同じ書込み手順を共有する。順序は API の `add_policy` (§5.4 末尾) と同じく、(1) 先頭で `reconcile_policy_file` (投影の不整合をここで直す。unreadable / malformed はここで止まり、行を足さない)、(2) 本文の検査 (空でない、4000 字以下。API と同じ上限)、(3) `insert_policy` (INSERT + commit、`request_id` は `uuid4().hex`。`ops_policies.request_id` は `NOT NULL UNIQUE` で、`ops_requests` への外部キーではない)、(4) `reconcile_policy_file` で file へ反映、(5) activity `policy_added` の順である。(1)〜(3) の失敗は「insert 前の失敗」、(4) の失敗は「commit 後の file 反映失敗」として上の 2 文に写す。(5) の失敗は file が反映済みなので第 2 文にせず、そのまま伝播させる (段 12 は `警告: 方針文を書けませんでした (<理由>)。` に写す)。`insert_policy` は commit が失敗したら rollback してから例外を出し、長命の接続に未確定の INSERT を残さない。
+
+段 12 の重複判定は file 本文の部分一致に加えて `ops_policies.directive` の完全一致も見る (commit 後の file 反映失敗の直後に同じ文を入れ直しても行を二重にしない)。段 12 は DB 接続を段の先頭で 1 回開き、方針文と最初の課題の両方で使う。接続を開けないときは `警告: データベースを開けませんでした (<理由>)。方針文と最初の課題はあとから afx ctl policy add / afx ctl backlog add で足せます。` と出して段 12 を終える (他の段は続く)。
 
 #### 5.3.5 `policy show` の応答と表示
 
@@ -986,3 +988,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5i | §5.3.3 の marker 除去を「認識済み block の marker 行だけ、行終端は保存、公開 helper を共有」に明確化。 | B2a codex r1 の P1 と /code-review の #4 | |
 | 2026-10-24 | v0.5j | §5.3.5 に unmanaged の空行除外と `\r` 除去、表示の畳み方 (199 字 + `…`) を明記。§5.4 に「固定 activity」= `policy_*` 行で、共通の監査投影行 `ops_<endpoint>` は対象外と明記。 | B2b codex r1 (High 2 / 3 は投影行の誤読、Medium 1) と /code-review #4 | |
 | 2026-10-25 | v0.5k | §5.3.4 に shell fallback の失敗文 2 種、段 12 / shell が共有する書込み手順 (insert → commit → reconcile → activity、`request_id` は uuid4) と段 12 の DB 接続を先頭で開くことを明記 | B2c 着手前の指揮者による補完 (shell fallback の失敗文が未定義) | |
+| 2026-10-25 | v0.5l | §5.3.4 の共有手順を API と同じ順 (先頭 reconcile → 本文検査 4000 字 → insert → reconcile → activity) に改め、activity 失敗は第 2 文にしない、insert_policy の commit 失敗は rollback、段 12 の重複判定に DB 完全一致を追加、DB を開けないときの固定文を新設 | B2c /code-review high 6 件 (#1 activity の誤診断、#2 DB 二重行、#3 connect 失敗で段が落ちる、#4 4000 字の未検査、#5 先頭 reconcile 不在、#6 commit 失敗の rollback 不在) | |
