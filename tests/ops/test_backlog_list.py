@@ -283,6 +283,29 @@ def test_backlog_text_never_shows_a_fragment_of_a_split_token():
     assert len(text.encode()) <= service._BACKLOG_TEXT_LIMIT
 
 
+@pytest.mark.parametrize("control", ["\r", "\v", "\f", "\x1c", "\x1f", "\x85", "\u200b"])
+def test_backlog_text_does_not_treat_redactor_stripped_controls_as_a_boundary(control):
+    from agentic_fx.ops import service
+    piece = "AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+    secret = "sk-abcdefghijklmnop"
+    head = ":".join([piece] * 247) + ":"
+    pad = "x" * (service.redactor.MAX_REDACT_VALUE_BYTES - len(head.encode()) - 8)
+    value = head + pad + "sk-ab" + control + "cdefghijklmnop"
+    assert len(value.encode()) > service.redactor.MAX_REDACT_VALUE_BYTES
+    assert not service._is_token_boundary(control)
+    text, truncated = service._backlog_text(value)
+    assert truncated is True and text == service._BACKLOG_TRUNCATION
+
+
+@pytest.mark.parametrize("space", [" ", "\t", "\n", "\u00a0", "\u3000"])
+def test_backlog_text_keeps_the_head_before_a_surviving_whitespace(space):
+    from agentic_fx.ops import service
+    assert service._is_token_boundary(space)
+    value = "head" + space + "y" * 9000
+    text, truncated = service._backlog_text(value)
+    assert truncated is True and text.startswith("head") and "yyy" not in text
+
+
 @pytest.mark.parametrize("last_result", [None, ""])
 def test_backlog_list_cli_prints_no_second_line_for_empty_last_result(tmp_path, last_result):
     item = {"id": 1, "status": "open", "source": "user", "updated_at": "now", "idea": "i",

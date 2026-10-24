@@ -134,10 +134,16 @@ def _precut(value: object) -> tuple[object, bool]:
         return value, False
     kept = raw[:redactor.MAX_REDACT_VALUE_BYTES].decode("utf-8", "ignore")
     for index in range(len(kept) - 1, -1, -1):
-        if kept[index].isspace():
+        if _is_token_boundary(kept[index]):
             return kept[:index], True
-    # 空白が無いと最後の token が途中で切れているかを判別できないので、本文は見せない。
+    # 区切りが無いと最後の token が途中で切れているかを判別できないので、本文は見せない。
     return "", True
+
+
+def _is_token_boundary(ch: str) -> bool:
+    """redactor の正規化後も残る空白だけを token の区切りとみなす。redactor が除く制御文字
+    (CR、VT、FF、情報分離子など) は token の中を繋ぐので区切りではない。"""
+    return ch.isspace() and redactor.strip_controls(ch) == ch
 
 
 def _backlog_text(value: object) -> tuple[str | None, bool]:

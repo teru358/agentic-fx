@@ -475,7 +475,7 @@ live directory 不在は `source live: missing`、DB 不在は pending / journal
 {"items":[{"id":12,"status":"open","source":"user","updated_at":"2026-10-23T00:00:00+00:00","idea":"...","idea_truncated":false,"last_result":null,"last_result_truncated":false}],"limit":100,"has_more":false}
 ```
 
-API 応答の `idea` と `last_result` は redactor と改行 / 制御文字の正規化後にそれぞれ UTF-8 4,096 byte を上限とする。超過時は文字境界で切り、上限内の末尾を固定印 `…[truncated]` にし、対応する `idea_truncated` / `last_result_truncated` を true にする。`null` は切り詰めず false である。これにより 500 件の最大応答も有界にする。CLI は 1 行 1 件で `#<id> <status> <source> <updated_at> <idea>` を出す。`last_result` があるときだけ次行へ 2 空白 indent で出す。0 件は `backlog: 0 件` と出す。CLI 表示は API の制限後の文をさらに 200 文字へ畳む。応答の `has_more` が true のときは、最後の行の後に固定行 `… 他にもあります (--limit N で増やすか --all)` を stdout へ 1 行出す。false のときは出さない。`last_result` が `null` または空文字のときは次行を出さない。API 側の redactor は 8 KiB 超の値を全文伏せるので、redactor へ渡す前に UTF-8 8,192 byte 以内へ文字境界で前段切り詰めし、切った末尾は最後の空白まで戻す。空白が 1 つも無い値は token の途中かを判別できないので本文を残さず固定印だけにする。前段で切った値は `*_truncated` を true にし、本切り詰めと同じ固定印を付ける。
+API 応答の `idea` と `last_result` は redactor と改行 / 制御文字の正規化後にそれぞれ UTF-8 4,096 byte を上限とする。超過時は文字境界で切り、上限内の末尾を固定印 `…[truncated]` にし、対応する `idea_truncated` / `last_result_truncated` を true にする。`null` は切り詰めず false である。これにより 500 件の最大応答も有界にする。CLI は 1 行 1 件で `#<id> <status> <source> <updated_at> <idea>` を出す。`last_result` があるときだけ次行へ 2 空白 indent で出す。0 件は `backlog: 0 件` と出す。CLI 表示は API の制限後の文をさらに 200 文字へ畳む。応答の `has_more` が true のときは、最後の行の後に固定行 `… 他にもあります (--limit N で増やすか --all)` を stdout へ 1 行出す。false のときは出さない。`last_result` が `null` または空文字のときは次行を出さない。API 側の redactor は 8 KiB 超の値を全文伏せるので、redactor へ渡す前に UTF-8 8,192 byte 以内へ文字境界で前段切り詰めし、切った末尾は最後の空白まで戻す。ここでの空白は redactor の制御文字除去 (`strip_controls`) の後も残る空白 (空白・タブ・改行など) に限り、redactor が除く CR / VT / FF / 情報分離子などは token の中を繋ぐ字として区切りに数えない。そのような空白が 1 つも無い値は token の途中かを判別できないので本文を残さず固定印だけにする。前段で切った値は `*_truncated` を true にし、本切り詰めと同じ固定印を付ける。
 
 store に `list_items(conn, *, all_statuses: bool, limit: int) -> tuple[list[dict], bool]` を足す。`all_statuses=False` は上の 4 値の `IN`、`True` は status 条件なしである。SQL は `limit + 1` 件を読み、`has_more` を決める。既存 `list_open` と `list_notes` の意味は変えない (`store/backlog.py:57-65`)。
 
@@ -978,3 +978,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5e | §4.7 に `kind_mismatch` / `kind_missing` の issue 語彙と行の置き方を明記。 | A1 差分再確認 (opus) の Low | |
 | 2026-10-24 | v0.5f | §5.2 に has_more の固定行、空文字 last_result の扱い、redactor 8 KiB 上限に対する前段切り詰めを明記。 | B1 /code-review (sonnet) の指摘 2 / 3 / 4 | |
 | 2026-10-24 | v0.5g | §5.2 前段切り詰めで空白の無い値は本文を残さない (token 断片が redaction を逃れる経路を閉じる)。 | B1 閉鎖確認 (terra) の High | |
+| 2026-10-24 | v0.5h | §5.2 前段切り詰めの区切りを redactor の正規化後も残る空白に限定 (CR 等で token を跨がせる経路を閉じる)。 | B1 閉鎖再確認 (terra) の High | |
