@@ -1,9 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 131 件。完了分は closed/。
+未完了: 132 件。完了分は closed/。
 
-## 実装待ち (15)
+## 実装中 (1)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
+| [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
+
+## 実装待ち (14)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -11,7 +17,6 @@
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
-| [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
 | [improve-deployed-signal-lookup-gap](open/improve-deployed-signal-lookup-gap.md) | 中 | 2026-10-24 | 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -34,7 +39,7 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (110)
+## 設計待ち (111)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -68,6 +73,7 @@
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 中 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
+| [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |

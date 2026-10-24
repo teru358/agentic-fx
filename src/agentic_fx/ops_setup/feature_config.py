@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import errno
+import ipaddress
 import os
 import secrets
 import stat
 import tomllib
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,8 +18,13 @@ from agentic_fx.ops.keys import key_dir
 _SECRET_NAME = {"bot": "discord.token", "notify": "webhook.url"}
 _FIELDS = {"bot": ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids", "token"), "web": ("port",), "notify": ("webhook_url",)}
 _COMMON = ("instance_root", "key_dir")
-_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"), "web": (),
-             "notify": ("deliver_trade_events",)}
+# web の公開範囲の key。port と違って省略でき、省略は「自機のみ・allow 無し・認証無し」を表す
+_WEB_ACCESS = ("bind", "allow", "auth")
+_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
+             "web": _WEB_ACCESS, "notify": ("deliver_trade_events",)}
+_UNRESTRICTED = "0.0.0.0/0"
+_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
+_WEB_PASSWORD = "web.password"
 # 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
 _TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices"), "web": (), "notify": ("deliver_trade_events",)}
 TRADE_NOTICES = ("all", "results", "fills_closes", "off")
@@ -71,11 +78,55 @@ def _trade_options(feature: str, values: dict[str, Any]) -> dict[str, Any]:
         result[name] = value
     return result
 
+def _web_bind(value: object) -> str:
+    """十進 dotted-quad の canonical な数値 IPv4 (`0.0.0.0`・先頭ゼロ・空白付きは不可)。"""
+    if type(value) is not str: raise InputError("bind")
+    try: address = ipaddress.IPv4Address(value)
+    except ValueError: raise InputError("bind") from None
+    if str(address) != value or address.is_unspecified: raise InputError("bind")
+    return value
+
+
+def _web_allow(value: object) -> list[str]:
+    """canonical な数値 IPv4 / IPv4 CIDR の非空 list。書かれた表記と順序をそのまま返す。"""
+    if type(value) is not list or not value: raise InputError("allow")
+    networks = []
+    for item in value:
+        if type(item) is not str: raise InputError("allow")
+        try:
+            if "/" in item:
+                network = ipaddress.IPv4Network(item, strict=True)
+                if str(network) != item: raise InputError("allow")
+            else:
+                address = ipaddress.IPv4Address(item)
+                if str(address) != item: raise InputError("allow")
+                network = ipaddress.IPv4Network(address)
+        except ValueError: raise InputError("allow") from None
+        networks.append(network)
+    if len(set(networks)) != len(networks): raise InputError("allow")
+    if ipaddress.IPv4Network(_UNRESTRICTED) in networks and len(networks) != 1: raise InputError("allow")
+    return list(value)
+
+
+def _web_auth(value: object) -> str:
+    if type(value) is not str or value not in ("none", "basic"): raise InputError("auth")
+    return value
+
+
+def _web_values(values: dict[str, Any]) -> dict[str, Any]:
+    """web の 4 key (port・bind・allow・auth) の単独の文法。bind / allow / auth は省略できる。"""
+    if any(name in values for name in _COMMON): raise InputError("common_key")
+    port = values.get("port")
+    if type(port) is not int or not 1 <= port <= 65535: raise InputError("port")
+    result: dict[str, Any] = {"port": port}
+    for name, check in (("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth)):
+        if name in values: result[name] = check(values[name])
+    return result
+
+
 def validate(feature: str, values: dict[str, Any]) -> dict[str, Any]:
     if feature == "web":
-        port = values.get("port")
-        if type(port) is not int or not 1 <= port <= 65535: raise InputError("port")
-        return {"port": port}
+        return _web_values(values)
     if feature == "notify":
         url = values.get("webhook_url")
         try:
@@ -182,7 +233,9 @@ def _parse_config(root: Path, feature: str) -> dict[str, Any]:
     if parsed.get("instance_root") != str(Path(root).resolve()) or parsed.get("key_dir") != str(key_dir(root)): raise ValueError("wrong instance")
     public = {name: parsed[name] for name in _FIELDS[feature] if name in parsed}
     options = {name: parsed[name] for name in _TRADE_KEYS[feature] if name in parsed}
-    if feature != "notify": validate(feature, public | options | ({"token": "present"} if feature == "bot" else {}))
+    if feature == "web": options = {name: parsed[name] for name in _WEB_ACCESS if name in parsed}
+    if feature == "web": _web_values(public | options)
+    elif feature != "notify": validate(feature, public | options | ({"token": "present"} if feature == "bot" else {}))
     else: _trade_options(feature, options)
     return public | options
 
@@ -238,10 +291,93 @@ def collect(root: Path, feature: str) -> Inputs:
     except OSError: pass
     return Inputs(values, tuple(name for name in _FIELDS[feature] if name not in values))
 
+class InterfaceLookupFailed(Exception):
+    """本機の interface の列挙ができなかった (固定 reason `interface_lookup_failed`)。"""
+
+
+def _web_password_state(secret_fd: int) -> str:
+    """検査済みの secret dir fd から見た `web.password`: "absent" / "safe" / "unsafe"。"""
+    try:
+        with os.scandir(secret_fd) as entries: names = [entry.name for entry in entries]
+    except OSError: return "unsafe"
+    if any(name != _WEB_PASSWORD for name in names): return "unsafe"
+    if _WEB_PASSWORD not in names: return "absent"
+    try: fd = os.open(_WEB_PASSWORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=secret_fd)
+    except OSError: return "unsafe"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600 or not 16 <= st.st_size <= 128: return "unsafe"
+        data = os.read(fd, 130)
+    except OSError: return "unsafe"
+    finally: os.close(fd)
+    if len(data) != st.st_size or any(not 0x21 <= byte <= 0x7E for byte in data): return "unsafe"
+    return "safe"
+
+
+def _web_secret_state(base_fd: int) -> str:
+    try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
+    except FileNotFoundError: return "absent"
+    except OSError: return "unsafe"
+    try: return _web_password_state(secret_fd)
+    finally: os.close(secret_fd)
+
+
+def _web_parsed(root: Path, config_fd: int) -> dict[str, Any] | str:
+    """ops.toml を読んで web の全 key を検査する。通らなければ最終 reason (str)。"""
+    try: raw = _read_regular(config_fd, "ops.toml")
+    except FileNotFoundError: return "config_invalid"
+    except OSError: return "config_dir_invalid"
+    try: parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError): return "config_invalid"
+    required = (*_COMMON, "port")
+    if any(name not in parsed for name in required) or any(name not in {*required, *_WEB_ACCESS} for name in parsed): return "config_invalid"
+    if parsed["instance_root"] != str(Path(root).resolve()) or parsed["key_dir"] != str(key_dir(root)): return "config_invalid"
+    try: _web_values({name: parsed[name] for name in ("port", *_WEB_ACCESS) if name in parsed})
+    except InputError: return "config_invalid"
+    return parsed
+
+
+def web_access_reason(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> str | None:
+    """web の設定の最終 reason。許可なら None。
+
+    status・完全性の判定・要約・設定検査が共用する 1 実装で、`afx-ops` の起動 / probe と
+    同じ決定木 (config dir・ops.toml の安全性 → 文法 → allow の必須 → 未対応の capability →
+    interface の実在 → secret) を同じ順で評価する。`interfaces` は本機の up 状態の interface の
+    global / link IPv4 を返す関数で、列挙できなければ `InterfaceLookupFailed` を上げる。
+    非 loopback の bind でだけ呼び、渡されなければ列挙失敗とみなす。
+    """
+    try: base_fd = _open_feature("web")
+    except FileNotFoundError: return "config_dir_missing"
+    except OSError: return "config_dir_invalid"
+    try:
+        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+        except FileNotFoundError: return "config_dir_missing"
+        except OSError: return "config_dir_invalid"
+        try: parsed = _web_parsed(root, config_fd)
+        finally: os.close(config_fd)
+        if isinstance(parsed, str): return parsed
+        bind = ipaddress.IPv4Address(parsed.get("bind", "127.0.0.1"))
+        loopback, allow, auth = bind in _LOOPBACK, parsed.get("allow"), parsed.get("auth", "none")
+        if not loopback and allow is None: return "allow_required"
+        if allow is not None and _UNRESTRICTED in allow: return "unrestricted_not_supported"
+        if auth == "basic": return "auth_not_supported"
+        if not loopback:
+            try: found = {str(address) for address in interfaces()} if interfaces is not None else None
+            except InterfaceLookupFailed: found = None
+            if found is None: return "interface_lookup_failed"
+            if str(bind) not in found: return "bind_not_local"
+        state = _web_secret_state(base_fd)
+        if state == "unsafe": return "secret_invalid"
+        if auth == "basic" and state == "absent": return "secret_missing"
+        if auth == "none" and state == "safe": return "secret_unexpected"
+        return None
+    finally: os.close(base_fd)
+
+
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool): return "true" if value else "false"
     if isinstance(value, int): return str(value)
-    if isinstance(value, list): return "[" + ", ".join(str(item) for item in value) + "]"
+    if isinstance(value, list): return "[" + ", ".join(_toml_value(item) for item in value) + "]"
     if isinstance(value, str): return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     raise TypeError(value)
 
@@ -277,7 +413,7 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
     if feature == "bot":
         config.update({name: values[name] for name in ("guild_id", "channel_id", "allowlist_user_ids", "mention_user_ids")})
         if "mention_role_id" in values: config["mention_role_id"] = values["mention_role_id"]
-    elif feature == "web": config["port"] = values["port"]
+    elif feature == "web": config.update({name: values[name] for name in ("port", *_WEB_ACCESS) if name in values})
     config.update({name: values[name] for name in _TRADE_KEYS[feature] if name in values})
     try:
         _atomic(config_fd, "ops.toml", "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode(), 0o644)

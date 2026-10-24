@@ -33,6 +33,11 @@ spec:
   require_notify: 真なら NOTIFY_SOCKET を必須にする (unit の Type=notify と同じ扱い)
   swap_after_prepare: {"path": p, "to": q} なら領域の検査の直後 (Landlock の前) に p を
          p.orig へ退け、p を q への symlink に置き換える (検査と規則の間の差し替え)
+  toml: 真なら web の設定を起動口と同じ `read_config` で XDG の ops.toml から読み、その
+         port / bind / auth で plan を作る (設定の違反は起動口と同じ固定 reason で止まる)
+  foreign_owner: 真なら ops.toml の所有者として期待する uid を実 uid と別の値にする
+         (他 uid の file を実 process で作れないための再現)
+  fake_ip: interface 列挙に使う実行 file の path を差し替える
   resolv_conf: 名前解決の規則に使う resolv.conf の path を差し替える (実 /etc/resolv.conf を
          書き換えずに、rename 置換で規則の外れた inode を作る試験のため)
 
@@ -393,7 +398,7 @@ def op_serve(p, iso):
             if len(handled) >= p.get("count", 1):
                 done.set()
 
-        def on_accept(conn: socket.socket) -> None:
+        def on_accept(conn: socket.socket, peer: str) -> None:
             sys.stdout.write("ACCEPTED\n")
             sys.stdout.flush()
             loop.create_task(handle(conn))
@@ -475,6 +480,17 @@ def op_body_fds(p, iso):
 
 def op_noop(p, iso):
     return [0, 0]
+
+
+def op_web_fds(p, iso):
+    """隔離後に開いている fd・保持を許した fd・listener の fd・子 process の数。"""
+    fds = sorted(startup.open_fds(iso.proc_dir))
+    tid_children = 0
+    for tid in os.listdir(f"{iso.proc_dir}/task"):
+        with open(f"{iso.proc_dir}/task/{tid}/children", encoding="ascii") as f:
+            tid_children += len(f.read().split())
+    return {"fds": fds, "kept": sorted(iso.kept_fds), "listener": iso.listener.fileno(),
+            "children": tid_children}
 
 
 def op_listdir(p, iso):
@@ -648,7 +664,8 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
 
     plan_kind = spec.get("plan", "test")
     if plan_kind != "test":
-        plan = startup.StartupPlan.for_feature(feature, web_port=spec.get("web_port", 0))
+        plan = startup.StartupPlan.for_feature(feature, web_port=spec.get("web_port", 0),
+                                               web_bind=spec.get("web_bind", "127.0.0.1"))
         if plan_kind.startswith("widen:"):
             import dataclasses
             field = plan_kind.split(":", 1)[1]
@@ -665,13 +682,15 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
         return plan, startup.check_plan
     if spec.get("dirs") == "xdg":
         # 領域と secret は production と同じ XDG の配置 (環境変数で一時領域へ向ける)
-        return test_plan(feature, web_port=spec.get("web_port", 0)), check_feature_only
+        return test_plan(feature, web_port=spec.get("web_port", 0),
+                         web_bind=spec.get("web_bind", "127.0.0.1")), check_feature_only
     params = spec.get("params", {})
     ports = params.get("connect_ports")
     return test_plan(
         feature, config_dir=root / feature / "config", state_dir=root / feature / "state",
         secret_dir=root / feature / "secret",
         web_port=spec.get("web_port", 0) if feature == "web" else None,
+        web_bind=spec.get("web_bind", "127.0.0.1"),
         connect_ports=tuple(ports) if ports is not None else None,
         check_unit=bool(spec.get("unit")),
         require_notify=bool(spec.get("require_notify"))), check_feature_only
@@ -683,6 +702,11 @@ def _config(spec: dict) -> OpsConfig:
     extra = {}
     if spec["feature"] == "web":
         extra["port"] = spec.get("web_port", 0)
+        if "web_bind" in spec:
+            extra["bind"] = spec["web_bind"]
+        if "web_allow" in spec:
+            import ipaddress
+            extra["allow"] = tuple(ipaddress.IPv4Network(item) for item in spec["web_allow"])
     elif spec["feature"] == "bot":
         extra = {"guild_id": 123456789012345678, "channel_id": 223456789012345678}
         # bot の allowlist・mention (ops.toml の読取りは test_config が受け持つ)
@@ -831,7 +855,24 @@ def main() -> int:
         sys.stdin.readline()
     if spec.get("resolv_conf"):
         startup.RESOLV_CONF = spec["resolv_conf"]
-    plan, plan_check = _plan(spec)
+    if spec.get("foreign_owner"):
+        from afx_ops import config as ops_config
+        ops_config._expected_owner_uid = lambda: os.getuid() + 1
+    if spec.get("fake_ip"):
+        from afx_ops import interfaces
+        interfaces.IP_CANDIDATES = (spec["fake_ip"],)
+    config = None
+    if spec.get("toml"):
+        from afx_ops.config import ConfigError, read_config
+        try:
+            config = read_config("web")
+        except ConfigError as exc:
+            print(f"afx-ops: {exc.reason}", file=sys.stderr, flush=True)
+            return startup.RC_ISOLATION_FAILED
+        plan, plan_check = (test_plan("web", web_port=config.port, web_bind=config.web_bind,
+                                      web_auth=config.auth), check_feature_only)
+    else:
+        plan, plan_check = _plan(spec)
 
     def body(iso: startup.Isolated) -> int:
         sys.stdout.write("ISOLATED\n")
@@ -846,7 +887,8 @@ def main() -> int:
             sys.stdin.readline()
         return 0
 
-    return startup.run(plan, _config(spec), body, plan_check=plan_check, wait=_wait(spec),
+    return startup.run(plan, config if config is not None else _config(spec), body,
+                       plan_check=plan_check, wait=_wait(spec),
                        preload=cli.PRELOADS[spec["feature"]])
 
 

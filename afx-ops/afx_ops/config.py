@@ -1,6 +1,8 @@
 """機能ごとの ``ops.toml`` を隔離前に検証して読む。"""
 from __future__ import annotations
 
+import dataclasses
+import ipaddress
 import os
 import re
 import stat
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from afx_ops.isolation.accept_loop import LOOPBACK, LOOPBACK_NETWORK, UNRESTRICTED_NETWORK
 from afx_ops.trade_events import NOTICE_KINDS
 from afx_ops.isolation.startup import (
     StartupError,
@@ -29,7 +32,7 @@ _FEATURE_KEYS = MappingProxyType({
 })
 _OPTIONAL_FEATURE_KEYS = MappingProxyType({
     "bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
-    "web": (),
+    "web": ("bind", "allow", "auth"),
     "notify": ("deliver_trade_events",),
 })
 # 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
@@ -39,12 +42,21 @@ OPS_NOTICES = ("default", "all")
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
 
-class ConfigError(Exception):
-    """設定を使えない。値や path を例外へ含めない。"""
+WEB_LOOPBACK = LOOPBACK
+WEB_UNRESTRICTED = UNRESTRICTED_NETWORK
+WEB_AUTHS = ("none", "basic")
 
-    def __init__(self, detail: str) -> None:
-        super().__init__(f"{REASON_CONFIG_INVALID}: {detail}")
-        self.reason = REASON_CONFIG_INVALID
+
+class ConfigError(Exception):
+    """設定を使えない。値や path を例外へ含めない。
+
+    `reason` は既定が `config_invalid`。web は `ops.toml` の不在を `config_invalid`、config dir
+    の不在を `config_dir_missing`、config dir / `ops.toml` の不安全を `config_dir_invalid` で返す。
+    """
+
+    def __init__(self, detail: str, reason: str = REASON_CONFIG_INVALID) -> None:
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
         self.detail = detail
 
 
@@ -63,35 +75,67 @@ class OpsConfig:
     trade_amounts: str = "absolute"
     ops_notices: str = "default"
     deliver_trade_events: bool = False
+    # web の公開範囲。bind が None は loopback の `127.0.0.1`、allow が None は key の省略
+    bind: str | None = None
+    allow: tuple[ipaddress.IPv4Network, ...] | None = None
+    auth: str = "none"
+
+    def without_config_dir_fd(self) -> "OpsConfig":
+        """config dir の fd の所有を手放した写し (fd は閉じない)。"""
+        values = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)
+                  if f.name != "config_dir_fd"}
+        return OpsConfig(config_dir_fd=None, **values)
+
+    @property
+    def web_bind(self) -> str:
+        return WEB_LOOPBACK if self.bind is None else self.bind
+
+    @property
+    def web_loopback(self) -> bool:
+        return ipaddress.IPv4Address(self.web_bind) in LOOPBACK_NETWORK
+
+    def web_allow_networks(self) -> tuple[ipaddress.IPv4Network, ...]:
+        """接続元の照合に使う network。loopback で allow を省略したときは `127.0.0.0/8`。"""
+        return (LOOPBACK_NETWORK,) if self.allow is None else self.allow
+
+
+# ops.toml の所有者として期待する uid。試験が差し替えて他 uid の file を再現する場所で、
+# production は差し替えない (既定は実効 process の uid)。
+_expected_owner_uid = os.getuid
 
 
 def _read_toml(feature: str, *, preserve_config_dir_error: bool = False) -> tuple[dict[str, object], int]:
+    web = feature == "web"
     try:
         config_dir_fd = open_config_dir(feature_dirs(feature).config)
-    except StartupError:
+    except StartupError as exc:
+        if web:
+            raise ConfigError("config dir", exc.reason) from None
         if preserve_config_dir_error:
             raise
         raise ConfigError("ops.toml") from None
     except (OSError, ValueError):
-        raise ConfigError("ops.toml") from None
+        raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID) from None
     try:
         try:
             fd = os.open("ops.toml", os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK
                          | os.O_CLOEXEC, dir_fd=config_dir_fd)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             raise ConfigError("ops.toml") from None
+        except (OSError, ValueError):
+            raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID) from None
         try:
             st = os.fstat(fd)
-            if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+            if (not stat.S_ISREG(st.st_mode) or st.st_uid != _expected_owner_uid()
                     or stat.S_IMODE(st.st_mode) & 0o022):
-                raise ConfigError("ops.toml")
+                raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID)
             chunks = []
             while chunk := os.read(fd, 4096):
                 chunks.append(chunk)
         except ConfigError:
             raise
         except OSError:
-            raise ConfigError("ops.toml") from None
+            raise ConfigError("ops.toml", "config_dir_invalid" if web else REASON_CONFIG_INVALID) from None
         finally:
             os.close(fd)
         try:
@@ -252,6 +296,53 @@ def validate_key_dir(key_dir: Path, *, config_dir: Path, state_dir: Path,
         raise ConfigError("key_dir inside runtime_or_dns_tls")
 
 
+def _web_bind(value: object) -> str:
+    """十進 dotted-quad の canonical な数値 IPv4。`0.0.0.0` と先頭ゼロ・空白付きは拒否。"""
+    if type(value) is not str:
+        raise ConfigError("bind")
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ValueError:
+        raise ConfigError("bind") from None
+    if str(address) != value or address.is_unspecified:
+        raise ConfigError("bind")
+    return value
+
+
+def _web_allow(value: object) -> tuple[ipaddress.IPv4Network, ...]:
+    """canonical な数値 IPv4 又は IPv4 CIDR の非空 list。単一 IPv4 は `/32` にする。"""
+    if type(value) is not list or not value:
+        raise ConfigError("allow")
+    networks: list[ipaddress.IPv4Network] = []
+    for item in value:
+        if type(item) is not str:
+            raise ConfigError("allow")
+        try:
+            if "/" in item:
+                network = ipaddress.IPv4Network(item, strict=True)
+                if str(network) != item:
+                    raise ConfigError("allow")
+            else:
+                address = ipaddress.IPv4Address(item)
+                if str(address) != item:
+                    raise ConfigError("allow")
+                network = ipaddress.IPv4Network(address)
+        except ValueError:
+            raise ConfigError("allow") from None
+        networks.append(network)
+    if len(set(networks)) != len(networks):
+        raise ConfigError("allow")
+    if WEB_UNRESTRICTED in networks and len(networks) != 1:
+        raise ConfigError("allow")
+    return tuple(networks)
+
+
+def _web_auth(value: object) -> str:
+    if type(value) is not str or value not in WEB_AUTHS:
+        raise ConfigError("auth")
+    return value
+
+
 def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> OpsConfig:
     """固定 schema の設定を、検査済み config dir の fd と共に読む。"""
     if feature not in _FEATURE_KEYS:
@@ -276,8 +367,12 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
             port = _integer(parsed["port"], "port")
             if not 1 <= port <= 65535:
                 raise ConfigError("port")
-            return OpsConfig(instance_root=instance_root, key_dir=key_dir,
-                             config_dir_fd=config_dir_fd, port=port)
+            return OpsConfig(
+                instance_root=instance_root, key_dir=key_dir, config_dir_fd=config_dir_fd,
+                port=port,
+                bind=_web_bind(parsed["bind"]) if "bind" in parsed else None,
+                allow=_web_allow(parsed["allow"]) if "allow" in parsed else None,
+                auth=_web_auth(parsed["auth"]) if "auth" in parsed else "none")
         if feature == "bot":
             return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                              config_dir_fd=config_dir_fd,

@@ -10,7 +10,8 @@
    fd は Landlock の規則を付けるまで持つ。機能の固定 principal の API 鍵を、設定の key_dir
    から manifest の state と digest を照合して読む。続けて機能の secret を plan の secret
    dir から、plan が固定した名前の file だけ読む (鍵 dir と secret dir は Landlock の規則に
-   入れない)。web は loopback listener を pre-bind + listen して検査する (accept はしない)。
+   入れない)。web は設定の address の listener を pre-bind + listen して検査する (accept
+   はしない)。web の公開範囲 (allow / 実在する interface / secret dir) は鍵を読む前に検査する。
 2. 保持してよい fd (0/1/2、web の listener、sd_notify の fd、1 の領域の fd) 以外を全部閉じる。
 3. Landlock (領域の規則は 1 で検査した fd に付ける)。領域の fd を閉じる。
 4. 機能別 seccomp。
@@ -30,6 +31,7 @@ import contextlib
 import dataclasses
 import errno
 import glob
+import ipaddress
 import os
 import socket
 import stat
@@ -46,7 +48,13 @@ from afx_ops import keys
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, Endpoint, wait_ready
 from afx_ops.isolation import bpf, landlock
 from afx_ops.isolation._libc import libc as _libc
-from afx_ops.isolation.accept_loop import ListenerError, prebind_listener
+from afx_ops import interfaces
+from afx_ops.isolation.accept_loop import (
+    LOOPBACK,
+    UNRESTRICTED_NETWORK,
+    ListenerError,
+    prebind_listener,
+)
 from afx_ops.isolation.profiles import feature_filter
 from afx_ops.isolation.policy import PolicyBuildError
 
@@ -83,6 +91,14 @@ REASONS = (
     "notify_failed",
     "startup_internal_error",
     "body_failed",
+    "allow_required",
+    "unrestricted_not_supported",
+    "auth_not_supported",
+    "interface_lookup_failed",
+    "bind_not_local",
+    "secret_invalid",
+    "secret_missing",
+    "secret_unexpected",
     "config_dir_missing",
     "config_dir_invalid",
     "state_dir_failed",
@@ -132,7 +148,9 @@ class FeaturePlan:
     """機能ごとに固定の隔離境界。production の起動は必ずこれに従う。
 
     connect_ports は Landlock の TCP connect 許可、listener は web の pre-bind の有無。
-    secret_files は機能の secret dir から隔離前に読む file 名 (dir の外は指せない)。
+    secret_allowed は機能の secret dir に置いてよい file 名の全部、secret_files はそのうち
+    隔離前に読む必須の file 名 (dir の外は指せない)。web の必須集合は検証済みの auth だけから
+    決まる (`auth = "basic"` のとき `web.password`、`none` のとき空)。
     保持 fd は 0/1/2 と listener と sd_notify の fd だけで、追加の Landlock 規則は無い。
     """
 
@@ -140,14 +158,22 @@ class FeaturePlan:
     connect_ports: tuple[int, ...]
     listener: bool
     secret_files: tuple[str, ...]
+    secret_allowed: tuple[str, ...] = ()
 
 
-# bot は Discord の bot token、notify は webhook の URL (宛先そのものが送信の鍵)。web は
-# 初版は認証を持たないので読む secret が無い
+WEB_PASSWORD = "web.password"
+WEB_PASSWORD_MIN = 16
+WEB_PASSWORD_MAX = 128
+
+# bot は Discord の bot token、notify は webhook の URL (宛先そのものが送信の鍵)。web が置いてよい
+# secret は `web.password` だけで、必須かどうかは auth で決まる
 PLANS: Mapping[str, FeaturePlan] = MappingProxyType({
-    "bot": FeaturePlan("bot", (443,), listener=False, secret_files=("discord.token",)),
-    "web": FeaturePlan("web", (), listener=True, secret_files=()),
-    "notify": FeaturePlan("notify", (443,), listener=False, secret_files=("webhook.url",)),
+    "bot": FeaturePlan("bot", (443,), listener=False, secret_files=("discord.token",),
+                       secret_allowed=("discord.token",)),
+    "web": FeaturePlan("web", (), listener=True, secret_files=(),
+                       secret_allowed=(WEB_PASSWORD,)),
+    "notify": FeaturePlan("notify", (443,), listener=False, secret_files=("webhook.url",),
+                          secret_allowed=("webhook.url",)),
 })
 
 
@@ -203,20 +229,28 @@ class StartupPlan:
     connect_ports: tuple[int, ...]
     check_unit: bool
     require_notify: bool
+    secret_allowed: tuple[str, ...] = ()
+    web_bind: str = LOOPBACK
 
     @classmethod
-    def for_feature(cls, feature: str, *, web_port: int | None = None) -> StartupPlan:
+    def for_feature(cls, feature: str, *, web_port: int | None = None,
+                    web_bind: str = LOOPBACK, web_auth: str = "none") -> StartupPlan:
         """機能の固定境界と XDG の領域から plan を作る。
 
-        web の listener の port は web 機能の設定から読む経路が入るまで渡す元が無く、起動口
+        web の listener の bind と port は web 機能の設定から渡す。port が無いと起動口
         (`afx-ops web`) は `listener_invalid` で止まる。試験は一時 port を直接渡す。
         """
         fixed = PLANS[feature]
         dirs = feature_dirs(feature)
+        secret_files = fixed.secret_files
+        if feature == "web" and web_auth == "basic":
+            secret_files = (WEB_PASSWORD,)
         return cls(feature=feature, config_dir=dirs.config, secret_dir=dirs.secret,
-                   secret_files=fixed.secret_files, state_dir=dirs.state,
+                   secret_files=secret_files, state_dir=dirs.state,
                    web_port=web_port if fixed.listener else None,
-                   connect_ports=fixed.connect_ports, check_unit=True, require_notify=True)
+                   connect_ports=fixed.connect_ports, check_unit=True, require_notify=True,
+                   secret_allowed=fixed.secret_allowed,
+                   web_bind=web_bind if fixed.listener else LOOPBACK)
 
 
 def check_plan(plan: StartupPlan) -> None:
@@ -225,9 +259,17 @@ def check_plan(plan: StartupPlan) -> None:
         raise StartupError("plan_invalid", "feature")
     fixed = PLANS[plan.feature]
     dirs = feature_dirs(plan.feature)
+    # web の必須 secret は auth で決まるので、許可集合の部分集合であることだけを求める
+    required_ok = (plan.secret_files in ((), fixed.secret_allowed) if plan.feature == "web"
+                   else plan.secret_files == fixed.secret_files)
+    try:
+        bind_ok = str(ipaddress.IPv4Address(plan.web_bind)) == plan.web_bind
+    except ValueError:
+        bind_ok = False
     if (plan.connect_ports != fixed.connect_ports or not plan.check_unit
             or not plan.require_notify or plan.config_dir != dirs.config
-            or plan.secret_dir != dirs.secret or plan.secret_files != fixed.secret_files
+            or plan.secret_dir != dirs.secret or not required_ok
+            or plan.secret_allowed != fixed.secret_allowed or not bind_ok
             or plan.state_dir != dirs.state or (plan.web_port is not None and not fixed.listener)):
         raise StartupError("plan_invalid")
 
@@ -654,6 +696,98 @@ def prepare_dirs(plan: StartupPlan, *, config_dir_fd: int | None = None,
     return PreparedDirs(config_fd=config_fd, state_fd=state_fd)
 
 
+def inspect_web_secret(secret_dir: Path) -> bool:
+    """web の secret dir が安全か確かめ、安全な `web.password` があるかを返す。隔離前に呼ぶ。
+
+    dir が無ければ False (許可)。存在する dir は自 uid・0700 を求め、検査済みの dir fd から
+    許可外の entry (writer の一時 file を含む) の不在と、`web.password` の通常 file・自 uid・
+    0600 ちょうど・16〜128 byte・visible ASCII を確かめる。違反は `secret_invalid`。
+    password の中身は返さず、読んだ fd は全て閉じてから戻る。
+    """
+    try:
+        parent = os.open(secret_dir.parent, _DIR_FLAGS | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise StartupError("secret_invalid") from None
+    try:
+        try:
+            dir_fd = os.open(secret_dir.name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise StartupError("secret_invalid") from None
+    finally:
+        os.close(parent)
+    try:
+        try:
+            _check_owned_dir(dir_fd, "secret_invalid", exact_mode=0o700)
+            with os.scandir(dir_fd) as entries:
+                names = [entry.name for entry in entries]
+        except OSError:
+            raise StartupError("secret_invalid") from None
+        if any(name not in PLANS["web"].secret_allowed for name in names):
+            raise StartupError("secret_invalid")
+        if WEB_PASSWORD not in names:
+            return False
+        _check_web_password(dir_fd)
+        return True
+    finally:
+        os.close(dir_fd)
+
+
+def _check_web_password(dir_fd: int) -> None:
+    try:
+        fd = os.open(WEB_PASSWORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK
+                     | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        raise StartupError("secret_invalid") from None
+    try:
+        st = os.fstat(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid()
+                or stat.S_IMODE(st.st_mode) != 0o600
+                or not WEB_PASSWORD_MIN <= st.st_size <= WEB_PASSWORD_MAX):
+            raise StartupError("secret_invalid")
+        data = os.read(fd, WEB_PASSWORD_MAX + 2)
+    except OSError:
+        raise StartupError("secret_invalid") from None
+    finally:
+        os.close(fd)
+    if (len(data) != st.st_size or not WEB_PASSWORD_MIN <= len(data) <= WEB_PASSWORD_MAX
+            or any(not 0x21 <= byte <= 0x7e for byte in data)):
+        raise StartupError("secret_invalid")
+
+
+def check_web_access(plan: StartupPlan, config: OpsConfig, *,
+                     lookup: Callable[[], Iterable[object]] | None = None) -> None:
+    """web の公開範囲の組み合わせを固定の順序で検査する。最初に外れた 1 reason だけを返す。
+
+    allow の必須 → 未対応の capability (singleton の無制限 allow、basic) → 非 loopback bind
+    が up の interface に実在すること → secret dir の安全性 → auth に対する secret の
+    欠落 / 余剰。production の起動と `afx-ops probe web` が同じ関数を使う。loopback は
+    interface を列挙しない。
+    """
+    loopback = config.web_loopback
+    if not loopback and config.allow is None:
+        raise StartupError("allow_required")
+    if config.allow is not None and UNRESTRICTED_NETWORK in config.allow:
+        raise StartupError("unrestricted_not_supported")
+    if config.auth == "basic":
+        raise StartupError("auth_not_supported")
+    if not loopback:
+        try:
+            found = (interfaces.list_interfaces if lookup is None else lookup)()
+        except interfaces.InterfaceLookupError:
+            raise StartupError("interface_lookup_failed") from None
+        if config.web_bind not in {candidate.address for candidate in found}:
+            raise StartupError("bind_not_local")
+    present = inspect_web_secret(plan.secret_dir)
+    if config.auth == "basic" and not present:
+        raise StartupError("secret_missing")
+    if config.auth == "none" and present:
+        raise StartupError("secret_unexpected")
+
+
 _SECRET_MAX = 65536
 
 
@@ -785,6 +919,9 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
         pid = os.getpid()
         proc = f"/proc/{pid}"
         check_preconditions(plan, proc)
+        if PLANS[plan.feature].listener:
+            # 公開範囲の組み合わせは、領域を開く前・鍵を読む前に固定の順で検査する
+            check_web_access(plan, config)
         notify = connect_notify(os.environ.get(NOTIFY_ENV), required=plan.require_notify)
         if notify is not None:
             cleanup.callback(notify.close)
@@ -804,7 +941,7 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
                 if plan.web_port is None:
                     raise StartupError("listener_invalid", "no port source until web config")
                 try:
-                    listener = prebind_listener(plan.web_port)
+                    listener = prebind_listener(plan.web_port, bind=plan.web_bind)
                 except (ListenerError, OSError) as exc:
                     raise StartupError("listener_invalid", str(exc)) from None
                 cleanup.callback(listener.close)

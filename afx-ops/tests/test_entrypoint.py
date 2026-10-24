@@ -302,16 +302,18 @@ def test_web_startup_is_given_the_web_preload(home, monkeypatch):
 
 def test_probe_web_fails_when_the_configured_port_is_taken():
     import socket
-    from types import SimpleNamespace
+    from pathlib import Path
 
     from afx_ops import probe
+    from afx_ops.config import OpsConfig
 
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         holder.bind(("127.0.0.1", 0))
         holder.listen(1)
         with pytest.raises(probe.ProbeError) as raised:
-            probe.probe_web(SimpleNamespace(port=holder.getsockname()[1]), {})
+            probe.probe_web(OpsConfig(instance_root=Path("/srv/afx"), key_dir=Path("/srv/keys"),
+                                      config_dir_fd=None, port=holder.getsockname()[1]), {})
         assert raised.value.reason == "probe_bind_failed"
     finally:
         holder.close()

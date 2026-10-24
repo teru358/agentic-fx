@@ -28,7 +28,13 @@ from afx_ops.isolation.accept_loop import AcceptLoop
 from afx_ops.isolation.startup import client_for
 from afx_ops.web.headers import response_headers
 from afx_ops.web.render import render_error
-from afx_ops.web.request import MAX_BODY_BYTES, MAX_HEADER_BYTES, MAX_REQUEST_LINE, handle_request
+from afx_ops.web.request import (
+    MAX_BODY_BYTES,
+    MAX_HEADER_BYTES,
+    MAX_REQUEST_LINE,
+    HostPolicy,
+    handle_request,
+)
 
 # 同時に開いておく接続の上限。超えた接続は受けてすぐ閉じる (fd と memory を有界にする)
 MAX_CONNECTIONS = 16
@@ -69,7 +75,10 @@ def run(isolated, *, client=None, on_serving: Callable[[], None] | None = None,
     use_send_only_transport()
     if client is None:
         client = client_for(isolated, WebClient)
-    asyncio.run(_serve(_aiohttp_parts(), isolated.listener, client, on_serving, stop_after))
+    config = isolated.config
+    asyncio.run(_serve(_aiohttp_parts(), isolated.listener, client, on_serving, stop_after,
+                       allow=config.web_allow_networks(),
+                       host_policy=HostPolicy(config.web_bind, config.port, config.web_loopback)))
     return RC_OK
 
 
@@ -248,8 +257,10 @@ async def _raw_request(request) -> bytes:
 
 class _Service:
     def __init__(self, parts, loop: asyncio.AbstractEventLoop, client,
-                 executor: ThreadPoolExecutor, stop_after: int | None) -> None:
+                 executor: ThreadPoolExecutor, stop_after: int | None, *,
+                 host_policy: HostPolicy | None = None) -> None:
         server_cls, self._response = parts
+        self._host_policy = host_policy
         self._loop = loop
         self._client = client
         self._executor = executor
@@ -301,7 +312,7 @@ class _Service:
             if call.abandoned and interrupt is not None:
                 interrupt(ident)
         try:
-            return handle_request(raw, self._client)
+            return handle_request(raw, self._client, host_policy=self._host_policy)
         finally:
             with self._calls_lock:
                 call.ident = None
@@ -319,7 +330,8 @@ class _Service:
                 if call.ident is not None and interrupt is not None:
                     interrupt(call.ident)
 
-    def accept(self, conn) -> None:
+    def accept(self, conn, _peer: str) -> None:
+        # 送信元の判定は accept_loop の allow 照合で完了している
         if len(self.slots) >= MAX_CONNECTIONS:
             self.refused += 1
             conn.close()
@@ -385,12 +397,14 @@ def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     print(f"afx-ops: web_loop_error {name}", file=sys.stderr, flush=True)
 
 
-async def _serve(parts, listener, client, on_serving, stop_after) -> None:
+async def _serve(parts, listener, client, on_serving, stop_after, *,
+                 allow=None, host_policy: HostPolicy | None = None) -> None:
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_loop_error)
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="afx-web")
-    service = _Service(parts, loop, client, executor, stop_after)
-    acceptor = AcceptLoop(listener, service.accept)
+    service = _Service(parts, loop, client, executor, stop_after, host_policy=host_policy)
+    acceptor = (AcceptLoop(listener, service.accept) if allow is None
+                else AcceptLoop(listener, service.accept, allow=allow))
     try:
         acceptor.attach(loop)
         if on_serving is not None:

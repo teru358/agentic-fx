@@ -318,7 +318,7 @@ def test_isolation_failure_closes_notify_socket_and_prebound_listener(monkeypatc
     monkeypatch.setattr(startup, "read_api_token", lambda *args: b"token")
     monkeypatch.setattr(startup, "read_secrets", lambda *args: {})
     monkeypatch.setattr(startup, "apply_landlock", lambda *args: None)
-    monkeypatch.setattr(startup, "prebind_listener", lambda *args: _capture_listener())
+    monkeypatch.setattr(startup, "prebind_listener", lambda *args, **kw: _capture_listener())
 
     captured = []
     def _capture_listener():

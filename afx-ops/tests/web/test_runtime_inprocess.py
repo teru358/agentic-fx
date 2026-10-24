@@ -139,7 +139,7 @@ def test_a_cancelled_connect_gives_back_its_socket_and_slot():
         service = runtime._Service(runtime._aiohttp_parts(), loop, object(), executor, 1)
         left, right = socket.socketpair()
         try:
-            service.accept(left)
+            service.accept(left, "127.0.0.1")
             await started.wait()
             assert len(service.slots) == 1
             for task in list(service.tasks):
