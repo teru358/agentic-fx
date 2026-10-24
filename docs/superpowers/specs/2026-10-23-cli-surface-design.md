@@ -558,7 +558,9 @@ DB 行の無い旧 shell / 旧初回設定の行 (`commands.py:49-54` の `\n- t
 
 段 12 の失敗表示は次の 2 つに分ける。insert 前の失敗は従来の `警告: 方針文を書けませんでした (<理由>)。` である。insert の commit 後に file を書けなかったときは `警告: 方針文は記録しましたが policy/directives.md へ反映できませんでした (<理由>)。afx の次回起動時に反映されます。` と出す。どちらも段 12 をそこで終え、書いた所までが残る。
 
-shell の `policy add` は `ops_service` がある通常経路では既存どおり `add_policy` を呼ぶ (`commands.py:414-416`)。`ops_service is None` の fallback (`commands.py:417-420`) も `append_policy_directive` をやめ、`self.conn` に対して同じ `insert_policy` → `reconcile_policy_file` を呼ぶ。`append_policy_directive` は呼び出し元が無くなるので削除する。
+shell の `policy add` は `ops_service` がある通常経路では既存どおり `add_policy` を呼ぶ (`commands.py:414-416`)。`ops_service is None` の fallback (`commands.py:417-420`) も `append_policy_directive` をやめ、`self.conn` に対して同じ `insert_policy` → `reconcile_policy_file` を呼ぶ。`append_policy_directive` は呼び出し元が無くなるので削除する。 shell fallback の失敗表示も段 12 と同じ 2 分割とし、insert 前の失敗は `policy を書けませんでした (<理由>)`、commit 後の file 反映失敗は `policy は記録しましたが policy/directives.md へ反映できませんでした (<理由>)。afx の次回起動時に反映されます。` を返す。成功時の `policy に追記しました` と activity の `policy_added` (先頭 200 字) は変えない。
+
+段 12 と shell fallback は同じ書込み手順 (insert → commit → `reconcile_policy_file` → activity `policy_added`) を共有し、`request_id` は `uuid4().hex` を使う (`ops_policies.request_id` は `NOT NULL UNIQUE` で、`ops_requests` への外部キーではない)。activity は file 反映まで成功したときだけ書く。段 12 は DB 接続を段の先頭で 1 回開き、方針文と最初の課題の両方で使う。
 
 #### 5.3.5 `policy show` の応答と表示
 
@@ -983,3 +985,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5h | §5.2 前段切り詰めの区切りを redactor の正規化後も残る空白に限定 (CR 等で token を跨がせる経路を閉じる)。 | B1 閉鎖再確認 (terra) の High | |
 | 2026-10-24 | v0.5i | §5.3.3 の marker 除去を「認識済み block の marker 行だけ、行終端は保存、公開 helper を共有」に明確化。 | B2a codex r1 の P1 と /code-review の #4 | |
 | 2026-10-24 | v0.5j | §5.3.5 に unmanaged の空行除外と `\r` 除去、表示の畳み方 (199 字 + `…`) を明記。§5.4 に「固定 activity」= `policy_*` 行で、共通の監査投影行 `ops_<endpoint>` は対象外と明記。 | B2b codex r1 (High 2 / 3 は投影行の誤読、Medium 1) と /code-review #4 | |
+| 2026-10-25 | v0.5k | §5.3.4 に shell fallback の失敗文 2 種、段 12 / shell が共有する書込み手順 (insert → commit → reconcile → activity、`request_id` は uuid4) と段 12 の DB 接続を先頭で開くことを明記 | B2c 着手前の指揮者による補完 (shell fallback の失敗文が未定義) | |
