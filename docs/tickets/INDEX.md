@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 130 件。完了分は closed/。
+未完了: 131 件。完了分は closed/。
 
 ## 実装待ち (13)
 
@@ -32,7 +32,7 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (111)
+## 設計待ち (112)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -124,6 +124,7 @@
 | [isolated-worker-probe-lacks-bless](open/isolated-worker-probe-lacks-bless.md) | 低 | 2026-10-19 | 実隔離 worker の deploy 境界 probe に plugin bless が無い |
 | [ctl-status-shows-active-gate-floor](open/ctl-status-shows-active-gate-floor.md) | 低 | 2026-10-22 | afx ctl status に稼働中の収益性フロア 3 値を出す |
 | [improve-duplicate-self-computed-strategies](open/improve-duplicate-self-computed-strategies.md) | 低 | 2026-10-22 | 自前計算の戦略 (sma_cross 型) は重複判定を構造変更で避けられる |
+| [ops-web-head-request-loop-error](open/ops-web-head-request-loop-error.md) | 低 | 2026-10-24 | 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
