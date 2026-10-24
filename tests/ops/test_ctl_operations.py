@@ -92,13 +92,40 @@ def test_improve_runs_and_reports_the_mission(ctl_api):
 
 def test_backlog_add_and_transition(ctl_api):
     env = ctl_api.env
-    rc, out, _ = run_ctl(env.root, ["improve", "add", "RSI の閾値を見直す"])
+    rc, out, _ = run_ctl(env.root, ["backlog", "add", "RSI の閾値を見直す"])
     assert rc == 0
     bid = int(re.search(r"backlog #(\d+) を追加しました: 「RSI の閾値を見直す」", out).group(1))
     rc, out, _ = run_ctl(env.root, ["backlog", "reject", str(bid)])
     assert (rc, out.strip()) == (0, f"backlog #{bid} を rejected にしました")
     rc, out, _ = run_ctl(env.root, ["backlog", "reopen", str(bid)])
     assert (rc, out.strip()) == (0, f"backlog #{bid} を open に戻しました")
+
+
+def test_backlog_list_uses_updated_at_then_id_and_shows_last_result(ctl_api):
+    env = ctl_api.env
+    env.conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm,last_result) "
+        "VALUES ('older','user','open','2026-01-01T00:00:00+00:00',"
+        "'2026-01-02T00:00:00+00:00','older',NULL)")
+    env.conn.execute(
+        "INSERT INTO improvement_backlog "
+        "(idea,source,status,created_at,updated_at,idea_norm,last_result) "
+        "VALUES ('newer','system','note','2026-01-01T00:00:00+00:00',"
+        "'2026-01-03T00:00:00+00:00','newer','result')")
+    env.conn.commit()
+    rc, out, err = run_ctl(env.root, ["backlog", "list", "--limit", "1"])
+    assert rc == 0, err
+    assert out.splitlines() == ["#2 note system 2026-01-03T00:00:00+00:00 newer", "  result"]
+
+
+def test_backlog_list_empty_and_limit_boundaries(ctl_api):
+    env = ctl_api.env
+    assert run_ctl(env.root, ["backlog", "list"])[0:2] == (0, "backlog: 0 件\n")
+    for limit in ("499", "500"):
+        assert run_ctl(env.root, ["backlog", "list", "--limit", limit])[0] == 0
+    rc, out, err = run_ctl(env.root, ["backlog", "list", "--limit", "501"])
+    assert (rc, out) == (2, "") and "usage: afx ctl" in err
 
 
 def test_policy_add_writes_the_directive(ctl_api):

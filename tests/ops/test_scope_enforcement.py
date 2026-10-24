@@ -104,6 +104,7 @@ def _every_endpoint(service):
             p, f"k-ref-{p}", 9999, expected_attempts=0, expected_last_attempt_at=None),
         "improve": lambda p: service.improve(p, f"k-imp-{p}"),
         "backlog_add": lambda p: service.add_backlog(p, f"k-bl-{p}", "idea"),
+        "backlog_list": lambda p: service.list_backlog(p),
         "backlog_reject": lambda p: service.transition_backlog(p, 9999, "reject"),
         "backlog_reopen": lambda p: service.transition_backlog(p, 9999, "reopen"),
         "backlog_note": lambda p: service.transition_backlog(p, 9999, "note"),

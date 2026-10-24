@@ -59,6 +59,7 @@ def _calls(api, env):
          {"expected_attempts": 0, "expected_last_attempt_at": None}, key, 200),
         ("improve", "POST", "/v1/improve/runs", {}, key, 202),
         ("backlog_add", "POST", "/v1/backlog", {"idea": "i"}, key, 200),
+        ("backlog_list", "GET", "/v1/backlog?all=false&limit=100", None, {}, 200),
         ("backlog_reject", "POST", f"/v1/backlog/{open_backlog}/reject", {}, {}, 200),
         ("backlog_reopen", "POST", f"/v1/backlog/{rejected_backlog}/reopen", {}, {}, 200),
         ("backlog_note", "POST", f"/v1/backlog/{note_backlog}/note", {}, {}, 200),
@@ -88,7 +89,7 @@ def test_ac1_all_24_endpoints_over_real_uds(api):
             _wait_job(client, ask_job)
         if expected == 202:
             jobs.append(payload["data"]["job_id"])
-    assert len(ROUTES) == 25 and seen == set(ROUTES)
+    assert len(ROUTES) == 26 and seen == set(ROUTES)
     for job_id in jobs:
         assert _wait_job(client, job_id)["state"] in ("done", "failed")
     codes = {client.post("/v1/killswitch/reset", json={"expected_generation": 0})
@@ -269,6 +270,7 @@ _EXPECTED_TABLE = {
     "reflection_retry": ("POST", "/v1/reflections/{order_id}/retry", Scope.OPERATE),
     "improve": ("POST", "/v1/improve/runs", Scope.OPERATE),
     "backlog_add": ("POST", "/v1/backlog", Scope.OPERATE),
+    "backlog_list": ("GET", "/v1/backlog", Scope.GUIDANCE_READ),
     "backlog_reject": ("POST", "/v1/backlog/{id}/reject", Scope.OPERATE),
     "backlog_reopen": ("POST", "/v1/backlog/{id}/reopen", Scope.OPERATE),
     "backlog_note": ("POST", "/v1/backlog/{id}/note", Scope.OPERATE),
@@ -279,7 +281,7 @@ _EXPECTED_TABLE = {
 
 def test_ac1_routes_and_endpoints_match_the_independent_table_exactly():
     from agentic_fx.ops.service import ENDPOINTS
-    assert len(_EXPECTED_TABLE) == 25
+    assert len(_EXPECTED_TABLE) == 26
     assert {code: (e.route.split(" ", 1)[0], e.route.split(" ", 1)[1], e.scope)
             for code, e in ENDPOINTS.items()} == _EXPECTED_TABLE
     assert {r.handler: (r.method, r.scope) for r in ROUTES} == {

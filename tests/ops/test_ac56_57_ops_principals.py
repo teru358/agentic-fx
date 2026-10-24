@@ -152,6 +152,17 @@ def test_ac56_bot_cannot_operate_or_guard_and_web_notify_cannot_change(api5):
                    "scopes": sorted(SPEC_SCOPES["ops-web"])}
 
 
+@pytest.mark.parametrize("principal,allowed", [
+    (OPERATOR, True), (APPROVER, True), (OPS_BOT, False), (OPS_WEB, False),
+    (OPS_NOTIFY, False),
+])
+def test_backlog_list_is_authorized_only_for_guidance_read_principals(api5, principal, allowed):
+    response = api5.client(principal).get("/v1/backlog")
+    assert (response.status_code == 200) is allowed
+    if not allowed:
+        assert response.status_code == 403 and response.json()["error"]["code"] == "forbidden"
+
+
 @pytest.mark.parametrize("principal", list(Principal))
 def test_ac56_autopilot_on_orders_and_stop_stay_unreachable(api5, principal):
     client = api5.client(principal)

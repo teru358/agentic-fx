@@ -48,6 +48,42 @@ def test_backlog_and_run(tmp_path):
                         report_path="reports/improve-2026-07-26.md")
 
 
+@pytest.mark.parametrize("rows,has_more", [(99, False), (100, False), (101, True)])
+def test_list_items_reads_limit_plus_one_in_one_query(tmp_path, rows, has_more):
+    """A second query or missing extra row would break pagination at the boundary."""
+    c = connect(tmp_path / "t.db"); init_db(c)
+    for index in range(rows):
+        c.execute(
+            "INSERT INTO improvement_backlog "
+            "(idea,source,status,created_at,updated_at,idea_norm) VALUES (?,?,?,?,?,?)",
+            (str(index), "user", "open", NOW.isoformat(),
+             f"2026-10-05T00:00:{index:02d}+00:00", str(index)))
+    c.commit()
+    statements = []
+    c.set_trace_callback(statements.append)
+    found, more = backlog.list_items(c, all_statuses=False, limit=100)
+    c.set_trace_callback(None)
+    assert len(found) == min(rows, 100)
+    assert more is has_more
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 1 and "LIMIT 101" in selects[0]
+
+
+def test_list_items_orders_by_updated_at_then_id(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    for idea, updated in (("old", "2026-10-04T00:00:00+00:00"),
+                          ("first", "2026-10-05T00:00:00+00:00"),
+                          ("second", "2026-10-05T00:00:00+00:00")):
+        c.execute(
+            "INSERT INTO improvement_backlog "
+            "(idea,source,status,created_at,updated_at,idea_norm) VALUES (?,?,?,?,?,?)",
+            (idea, "user", "open", NOW.isoformat(), updated, idea))
+    c.commit()
+    items, more = backlog.list_items(c, all_statuses=False, limit=100)
+    assert [item["idea"] for item in items] == ["second", "first", "old"]
+    assert more is False
+
+
 # round2 最終是正 A6 (2026-08-29、verified-local-round2.md A6): #8 是正の
 # 「正規化は Python 側 1 箇所、全 INSERT 経路が idea_norm を書く」の
 # うち CLI/手動追加経路 (`backlog.add`) だけが観測されていなかった。

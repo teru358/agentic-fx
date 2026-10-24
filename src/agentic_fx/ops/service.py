@@ -33,6 +33,7 @@ from typing import Callable
 
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
+from . import redactor
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
@@ -99,6 +100,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
              autopilot_restricted=True),
     Endpoint("backlog_add", "POST /v1/backlog", Scope.OPERATE, True, idempotent=True,
              autopilot_restricted=True),
+    Endpoint("backlog_list", "GET /v1/backlog", Scope.GUIDANCE_READ, False),
     Endpoint("backlog_reject", "POST /v1/backlog/{id}/reject", Scope.OPERATE, True,
              autopilot_restricted=True),
     Endpoint("backlog_reopen", "POST /v1/backlog/{id}/reopen", Scope.OPERATE, True,
@@ -117,6 +119,22 @@ _BACKLOG_TRANSITIONS = {
     "reopen": (("done", "rejected"), "open", "reopened"),
 }
 _DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated"})
+_BACKLOG_TEXT_LIMIT = 4096
+_BACKLOG_TRUNCATION = "…[truncated]"
+
+
+def _backlog_text(value: object) -> tuple[str | None, bool]:
+    """Redact and bound user guidance before it crosses the API boundary."""
+    if value is None:
+        return None, False
+    text = redactor.redact_value(value)
+    text = " ".join(text.split())
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _BACKLOG_TEXT_LIMIT:
+        return text, False
+    suffix = _BACKLOG_TRUNCATION.encode("utf-8")
+    kept = encoded[:_BACKLOG_TEXT_LIMIT - len(suffix)].decode("utf-8", "ignore")
+    return kept + _BACKLOG_TRUNCATION, True
 
 
 def _is_busy(exc: BaseException) -> bool:
@@ -536,6 +554,32 @@ class OpsService:
         except ValueError:
             raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
         return self._tail(self._activity_path, limit, keep)
+
+    def list_backlog(self, principal: Caller, *, all_statuses: bool = False,
+                     limit: int = 100, deadline: float | None = None) -> dict:
+        _authorize(principal, "backlog_list")
+        if type(all_statuses) is not bool or type(limit) is not int or not 1 <= limit <= 500:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        deadline = self._deadline(deadline)
+        try:
+            with self._ops_lane(deadline):
+                from agentic_fx.store import backlog
+                rows, has_more = backlog.list_items(
+                    self._conn, all_statuses=all_statuses, limit=limit)
+        except BaseException as exc:
+            code = self._map_exception(exc)
+            if code is None or isinstance(exc, OpsError):
+                raise
+            raise OpsError(code) from None
+        items = []
+        for row in rows:
+            idea, idea_truncated = _backlog_text(row.get("idea"))
+            last_result, result_truncated = _backlog_text(row.get("last_result"))
+            items.append({"id": row["id"], "status": row["status"], "source": row["source"],
+                          "updated_at": row["updated_at"], "idea": idea,
+                          "idea_truncated": idea_truncated, "last_result": last_result,
+                          "last_result_truncated": result_truncated})
+        return {"items": items, "limit": limit, "has_more": has_more}
 
     @staticmethod
     def _tail(path: Path | None, limit: int, keep) -> dict:
