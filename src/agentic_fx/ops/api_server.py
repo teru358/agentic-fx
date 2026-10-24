@@ -271,14 +271,14 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
 
 
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
-_ENDPOINT_COUNT = 25
+_ENDPOINT_COUNT = 26
 
 
 def build_routes(endpoints: dict) -> tuple[Route, ...]:
-    """§4.2 の 25 本を endpoint 表から作る。表と route が別々に変わらないよう、
+    """Endpoint 表から route を作る。表と route が別々に変わらないよう、
     route の定義は表だけに置き、形が崩れていれば起動時に fail closed で止める。"""
     if len(endpoints) != _ENDPOINT_COUNT:
-        raise RuntimeError("endpoint table must hold exactly 25 entries")
+        raise RuntimeError("endpoint table must hold exactly 26 entries")
     routes = []
     for code, endpoint in endpoints.items():
         method, _, path = endpoint.route.partition(" ")
@@ -354,6 +354,15 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
         return ops.events_after(principal, after=_int(q.get("after"), default=0),
                                 limit=limit, deadline=deadline)
+    if name == "backlog_list":
+        raw_all = q.get("all", "false")
+        if raw_all not in ("false", "true"):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        limit = _int(q.get("limit"), default=100)
+        if not 1 <= limit <= 500:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        return ops.list_backlog(principal, all_statuses=raw_all == "true", limit=limit,
+                                deadline=deadline)
     body = _body(request)
     if name == "ask":
         return ops.ask(principal, key, body.get("question"), deadline=deadline)

@@ -65,6 +65,18 @@ def list_notes(conn: sqlite3.Connection) -> list[dict]:
         "SELECT * FROM improvement_backlog WHERE status='note' ORDER BY id")]
 
 
+def list_items(conn: sqlite3.Connection, *, all_statuses: bool,
+               limit: int) -> tuple[list[dict], bool]:
+    """Return the requested page and whether one more row exists."""
+    if type(all_statuses) is not bool or type(limit) is not int or not 1 <= limit <= 500:
+        raise ValueError("invalid backlog list bounds")
+    where = "" if all_statuses else "WHERE status IN ('open','observation','note','selected') "
+    rows = [dict(row) for row in conn.execute(
+        "SELECT id,status,source,updated_at,idea,last_result FROM improvement_backlog "
+        f"{where}ORDER BY updated_at DESC, id DESC LIMIT ?", (limit + 1,))]
+    return rows[:limit], len(rows) > limit
+
+
 def set_status(conn: sqlite3.Connection, backlog_id: int, status: str,
                now: datetime, *, last_result: str | None = None,
                commit: bool = True) -> bool:

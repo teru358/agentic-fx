@@ -725,6 +725,12 @@ def _safe_text(value, limit: int) -> str:
     return display_text(redactor.redact_value(value) if isinstance(value, str) else value, limit)
 
 
+def _backlog_display(value) -> str:
+    """Collapse already-bounded API guidance to at most 200 display characters."""
+    text = _safe_text(value, 1 << 20)
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
 def _hash_head(value) -> str:
     return value[:12] if isinstance(value, str) and _HASH_HEAD.fullmatch(value) else "-"
 
@@ -887,6 +893,7 @@ _APPROVING_OUTCOMES = frozenset({"deployed", "deployed_after_rollback"})
 class Op:
     name: str
     args: list
+    via_alias: str | None = None
 
 
 def parse(tokens: list[str]) -> Op:
@@ -930,9 +937,13 @@ def parse(tokens: list[str]) -> Op:
     if cmd == "improve" and n == 0:
         return Op("improve", [])
     if cmd == "improve" and n >= 2 and args[0] == "add":
+        return Op("backlog_add", [" ".join(args[1:])], via_alias="improve add")
+    if cmd == "backlog" and n >= 2 and args[0] == "add":
         return Op("backlog_add", [" ".join(args[1:])])
     if cmd == "backlog" and n == 2 and args[0] in ("reject", "reopen", "note"):
         return Op("backlog_transition", [args[0], _int_arg(args[1])])
+    if cmd == "backlog" and args and args[0] == "list":
+        return Op("backlog_list", _parse_backlog_list(args[1:]))
     if cmd == "policy" and n >= 2 and args[0] == "add":
         return Op("policy", [" ".join(args[1:])])
     if cmd == "reflect" and n == 2 and args[0] == "retry":
@@ -973,18 +984,50 @@ def _parse_events(args: list[str]) -> list:
     return [after, limit, follow]
 
 
+def _parse_backlog_list(args: list[str]) -> list:
+    all_statuses, limit, seen_limit = False, 100, False
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--all" and not all_statuses:
+            all_statuses = True
+        elif flag == "--limit" and rest and not seen_limit:
+            seen_limit = True
+            limit = _int_arg(rest.pop(0))
+        else:
+            raise ClientError(RC_USAGE, USAGE)
+    if not 1 <= limit <= 500:
+        raise ClientError(RC_USAGE, USAGE)
+    return [all_statuses, limit]
+
+
 class Runner:
     def __init__(self, api: ApiClient, *, stdin: TextIO, stdout: TextIO,
+                 stderr: TextIO | None = None,
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic) -> None:
         self.api = api
         self.stdin, self.stdout = stdin, stdout
+        self.stderr = stderr if stderr is not None else sys.stderr
         self.sleep, self.monotonic = sleep, monotonic
 
     def say(self, text: str) -> None:
         print(text, file=self.stdout, flush=True)
 
+    def warn(self, text: str) -> None:
+        print(text, file=self.stderr, flush=True)
+
     def run(self, op: Op) -> int:
+        if op.via_alias is not None:
+            from agentic_fx.cli_surface import ALIASES
+            by_alias = {item.parser_alias: item for item in ALIASES}
+            alias = by_alias.get(op.via_alias)
+            old = f"afx ctl {op.via_alias}"
+            if alias is None:
+                self.warn(f"`{old}` は旧名です。`afx ctl help` で正式名を確かめてください。")
+            else:
+                canonical = alias.canonical_usage.split(" <", 1)[0]
+                self.warn(f"`{old}` は旧名です。`{canonical}` を使ってください。")
         if op.name == "help":
             self.say(USAGE)
             return RC_OK
@@ -1121,6 +1164,24 @@ class Runner:
         if removed:
             text += f"\n表示できない文字を {removed} 個含みます"
         self.say(text)
+        return RC_OK
+
+    def _op_backlog_list(self, all_statuses: bool, limit: int, *, terminal) -> int:
+        data = self._get("/v1/backlog", all="true" if all_statuses else "false", limit=limit)
+        rows = data.get("items") if isinstance(data.get("items"), list) else []
+        if not rows:
+            self.say("backlog: 0 件")
+            return RC_OK
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            self.say(f"#{_ident(row.get('id'))} {_safe_cell(row.get('status'), 200)} "
+                     f"{_safe_cell(row.get('source'), 200)} {_safe_cell(row.get('updated_at'), 200)} "
+                     f"{_backlog_display(row.get('idea'))}")
+            if row.get("last_result") not in (None, ""):
+                self.say("  " + _backlog_display(row.get("last_result")))
+        if data.get("has_more") is True:
+            self.say("… 他にもあります (--limit N で増やすか --all)")
         return RC_OK
 
     def _op_backlog_transition(self, action: str, bid: int, *, terminal) -> int:
@@ -1426,7 +1487,7 @@ def main(argv: list[str], *, root: Path, stdin: TextIO | None = None,
                                 stderr=stderr, sleep=sleep)
         op = parse(tokens)
         api = ApiClient(root, principal, uid=uid) if op.name not in ("help", "stop") else None
-        return Runner(api, stdin=stdin, stdout=stdout, sleep=sleep).run(op)
+        return Runner(api, stdin=stdin, stdout=stdout, stderr=stderr, sleep=sleep).run(op)
     except ClientError as err:
         print(f"afx ctl: {err.message}", file=stderr, flush=True)
         return err.rc
@@ -1438,7 +1499,7 @@ def _interactive(root: Path, principal: Principal, *, uid, stdin, stdout, stderr
                  sleep) -> int:
     """``afx ctl>``。approver 操作は 1 回ごとに端末で確認する (まとめて許可しない)。"""
     api = ApiClient(root, principal, uid=uid)
-    runner = Runner(api, stdin=stdin, stdout=stdout, sleep=sleep)
+    runner = Runner(api, stdin=stdin, stdout=stdout, stderr=stderr, sleep=sleep)
     print(f"afx ctl ({principal.value})。help で一覧、exit で終了", file=stdout, flush=True)
     while True:
         print("afx ctl> ", end="", file=stdout, flush=True)

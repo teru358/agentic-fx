@@ -691,7 +691,7 @@ def test_backlog_idea_echo_is_sanitized(tmp_path):
     api = _StubApi(tmp_path, [_ok({"id": 3})])
     out = io.StringIO()
     client.Runner(api, stdin=io.StringIO(""), stdout=out).run(
-        client.parse(["improve", "add", f"x{ESC}y"]))
+        client.parse(["backlog", "add", f"x{ESC}y"]))
     assert "\x1b" not in out.getvalue()
 
 
@@ -873,7 +873,7 @@ def test_backlog_idea_echo_counts_the_removed_characters(tmp_path):
     api = _StubApi(tmp_path, [_ok({"id": 3})])
     out = io.StringIO()
     client.Runner(api, stdin=io.StringIO(""), stdout=out).run(
-        client.parse(["improve", "add", f"x{ESC}y"]))
+        client.parse(["backlog", "add", f"x{ESC}y"]))
     assert "表示できない文字を 1 個含みます" in out.getvalue()
 
 

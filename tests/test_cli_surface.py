@@ -324,13 +324,11 @@ def test_shell_advertises_the_canonical_backlog_add_form():
     assert _record("ctl backlog add").shell_usage == "backlog add <idea>"
 
 
-@pytest.mark.xfail(strict=True, reason="the ctl parser takes `backlog add` only once the canonical parser lands")
 def test_the_ctl_parser_accepts_the_advertised_backlog_add_form():
-    """metadata が広告する shell 形を、実際の parser が受理するまで赤のまま
-    置き、受理した時点で strict に失敗して pin の更新を強制する。"""
+    """Metadata の正式 shell 形は parser が同じ backlog 操作へ正規化する。"""
     from agentic_fx.ops.client import parse
     op = parse(["backlog", "add", "x"])
-    assert op.name == "backlog_add"
+    assert (op.name, op.args, op.via_alias) == ("backlog_add", ["x"], None)
 
 
 def test_hidden_records_render_nothing():

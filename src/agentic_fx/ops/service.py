@@ -33,6 +33,7 @@ from typing import Callable
 
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 
+from . import redactor
 from .activity import SuppressedActivity
 from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
@@ -99,6 +100,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
              autopilot_restricted=True),
     Endpoint("backlog_add", "POST /v1/backlog", Scope.OPERATE, True, idempotent=True,
              autopilot_restricted=True),
+    Endpoint("backlog_list", "GET /v1/backlog", Scope.GUIDANCE_READ, False),
     Endpoint("backlog_reject", "POST /v1/backlog/{id}/reject", Scope.OPERATE, True,
              autopilot_restricted=True),
     Endpoint("backlog_reopen", "POST /v1/backlog/{id}/reopen", Scope.OPERATE, True,
@@ -117,6 +119,46 @@ _BACKLOG_TRANSITIONS = {
     "reopen": (("done", "rejected"), "open", "reopened"),
 }
 _DEPLOYED = frozenset({"deployed", "deployed_after_rollback", "invalidated"})
+_BACKLOG_TEXT_LIMIT = 4096
+_BACKLOG_TRUNCATION = "…[truncated]"
+
+
+def _precut(value: object) -> tuple[object, bool]:
+    """Cut an oversized string to the redactor's input bound on a character boundary,
+    backing up to the last whitespace so a token is never split. Without any
+    whitespace nothing of the text is kept."""
+    if type(value) is not str:
+        return value, False
+    raw = value.encode("utf-8", "surrogatepass")
+    if len(raw) <= redactor.MAX_REDACT_VALUE_BYTES:
+        return value, False
+    kept = raw[:redactor.MAX_REDACT_VALUE_BYTES].decode("utf-8", "ignore")
+    for index in range(len(kept) - 1, -1, -1):
+        if _is_token_boundary(kept[index]):
+            return kept[:index], True
+    # 区切りが無いと最後の token が途中で切れているかを判別できないので、本文は見せない。
+    return "", True
+
+
+def _is_token_boundary(ch: str) -> bool:
+    """redactor の正規化後も残る空白だけを token の区切りとみなす。redactor が除く制御文字
+    (CR、VT、FF、情報分離子など) は token の中を繋ぐので区切りではない。"""
+    return ch.isspace() and redactor.strip_controls(ch) == ch
+
+
+def _backlog_text(value: object) -> tuple[str | None, bool]:
+    """Redact and bound user guidance before it crosses the API boundary."""
+    if value is None:
+        return None, False
+    value, precut = _precut(value)
+    text = redactor.redact_value(value)
+    text = " ".join(text.split())
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _BACKLOG_TEXT_LIMIT and not precut:
+        return text, False
+    suffix = _BACKLOG_TRUNCATION.encode("utf-8")
+    kept = encoded[:_BACKLOG_TEXT_LIMIT - len(suffix)].decode("utf-8", "ignore")
+    return kept + _BACKLOG_TRUNCATION, True
 
 
 def _is_busy(exc: BaseException) -> bool:
@@ -536,6 +578,32 @@ class OpsService:
         except ValueError:
             raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
         return self._tail(self._activity_path, limit, keep)
+
+    def list_backlog(self, principal: Caller, *, all_statuses: bool = False,
+                     limit: int = 100, deadline: float | None = None) -> dict:
+        _authorize(principal, "backlog_list")
+        if type(all_statuses) is not bool or type(limit) is not int or not 1 <= limit <= 500:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        deadline = self._deadline(deadline)
+        try:
+            with self._ops_lane(deadline):
+                from agentic_fx.store import backlog
+                rows, has_more = backlog.list_items(
+                    self._conn, all_statuses=all_statuses, limit=limit)
+        except BaseException as exc:
+            code = self._map_exception(exc)
+            if code is None or isinstance(exc, OpsError):
+                raise
+            raise OpsError(code) from None
+        items = []
+        for row in rows:
+            idea, idea_truncated = _backlog_text(row.get("idea"))
+            last_result, result_truncated = _backlog_text(row.get("last_result"))
+            items.append({"id": row["id"], "status": row["status"], "source": row["source"],
+                          "updated_at": row["updated_at"], "idea": idea,
+                          "idea_truncated": idea_truncated, "last_result": last_result,
+                          "last_result_truncated": result_truncated})
+        return {"items": items, "limit": limit, "has_more": has_more}
 
     @staticmethod
     def _tail(path: Path | None, limit: int, keep) -> dict:
