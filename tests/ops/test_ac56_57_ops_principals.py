@@ -21,9 +21,10 @@ OPS_BOT, OPS_WEB, OPS_NOTIFY = Principal.OPS_BOT, Principal.OPS_WEB, Principal.O
 
 SPEC_SCOPES = {
     "operator": {"status.read", "events.read", "approvals.list", "approvals.detail",
-                 "logs.read", "jobs.own", "operate"},
+                 "logs.read", "jobs.own", "operate", "guidance.read"},
     "approver": {"status.read", "events.read", "approvals.list", "approvals.detail",
-                 "logs.read", "jobs.own", "operate", "decide", "local_guard"},
+                 "logs.read", "jobs.own", "operate", "decide", "local_guard",
+                 "guidance.read"},
     "ops-bot": {"status.read", "events.read", "approvals.list", "approvals.detail",
                 "jobs.own", "decide"},
     "ops-web": {"status.read", "events.read", "approvals.list", "approvals.detail",
