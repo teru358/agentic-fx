@@ -309,8 +309,11 @@ def test_strip_keeps_all_three_lines_of_id_mismatched_block():
 
 def test_strip_removes_only_recognised_marker_lines_and_keeps_line_endings():
     assert strip_managed_markers(_block(1, "- A").decode()) == "- A\n"
-    assert strip_managed_markers(_block(1, "- A").decode().rstrip("\n")) == "- A"
+    assert strip_managed_markers(_block(1, "- A").decode().rstrip("\n")) == "- A\n"
     assert strip_managed_markers(_block(1, "- A", crlf=True).decode()) == "- A\r\n"
+    assert strip_managed_markers(_block(1, "- A", crlf=True).decode().rstrip("\r\n")) == "- A\r\n"
+    assert strip_managed_markers("x\n" + _block(1, "- A").decode() + "y") == "x\n- A\ny"
+    assert strip_managed_markers("x\r\n" + _block(1, "- A").decode().rstrip("\n")) == "x\r\n- A\n"
     mixed = _block(1, "- A").decode() + "<!-- /afx:managed-policy id=1 -->\nx"
     assert strip_managed_markers(mixed) == "- A\n<!-- /afx:managed-policy id=1 -->\nx"
 

@@ -155,8 +155,11 @@ def strip_managed_markers(text: str) -> str:
     parsed = _parse(text.encode("utf-8"))
     dropped = {positions[0] for _, _, positions in parsed.blocks}
     dropped |= {positions[2] for _, _, positions in parsed.blocks}
-    return "\n".join(
-        line.decode("utf-8") for position, line in enumerate(parsed.lines)
+    last = len(parsed.lines) - 1
+    # marker 行はその行終端ごと除く。残る行の終端 (LF / CRLF / 末尾の終端なし) はそのまま。
+    return "".join(
+        line.decode("utf-8") + ("" if position == last else "\n")
+        for position, line in enumerate(parsed.lines)
         if position not in dropped
     )
 
