@@ -90,4 +90,3 @@ def test_undecodable_terminal_input_is_treated_as_invalid_input_not_a_traceback(
     assert io.ask_raw("ユーザー名", "afx") == inter.UNDECODABLE_INPUT
     assert io.ask_secret("パスワード") == inter.UNDECODABLE_INPUT
     assert not inter.UNDECODABLE_INPUT.isascii()
-
