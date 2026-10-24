@@ -1,15 +1,15 @@
 ---
 id: improve-deployed-signal-lookup-gap
 title: 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ
-status: 実装待ち
+status: 是正済
 priority: 中
 opened: 2026-10-24
-closed: null
+closed: 2026-10-24
 related: [improve-context-family-attempt-summary]
 ---
 # [improve-deployed-signal-lookup-gap] 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ
 
-**状態**: 実装待ち / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -21,7 +21,10 @@ get_signals は取引判断 loop 専用で改善ループには IMPROVE_FORBIDDE
 
 ## 修正内容
 
+- 2026-10-24: 改善 mission の prompt の規律 8 に、get_signals は取引判断 loop 専用で改善では使えないこと、配備済み strategy の直近 signal を材料にしないこと、設計上の制約なので note / discovery に記録しないこと、過去の note の要望は解消済みであることを §4.2 の基準文面どおり明記 (設計書 2026-10-24-improve-feedback-structure-design v0.3b)。pin: 文面の全文一致、IMPROVE_FORBIDDEN 不変、registry exact set 不変 (既存)。事後観測 (AC-20) は次の土曜の改善周で、2 周続いて言及が残れば案 (b) を再検討
+
 ## 経緯
 
 - 2026-10-24: 起票。
 - 2026-10-24: 状態: 実装待ち — 同 spec §4 で案 (a) = prompt で不在と理由を明示、新 tool なし。T2 (小) が本チケット。2 周続いて言及が残れば案 (b) を再検討
+- 2026-10-24: 是正内容 — 改善 mission の prompt の規律 8 に、get_signals は取引判断 loop 専用で改善では使えないこと、配備済み strategy の直近 signal を材料にしないこと、設計上の制約なので note / discovery に記録しないこと、過去の note の要望は解消済みであることを §4.2 の基準文面どおり明記 (設計書 2026-10-24-improve-feedback-structure-design v0.3b)。pin: 文面の全文一致、IMPROVE_FORBIDDEN 不変、registry exact set 不変 (既存)。事後観測 (AC-20) は次の土曜の改善周で、2 周続いて言及が残れば案 (b) を再検討

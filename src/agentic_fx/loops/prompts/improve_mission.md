@@ -113,6 +113,13 @@
    「依存 indicator の warmup + 自分の lookback」を覆う値を宣言してください。
    **無い指標は自前計算せず**、`不足指標: <名前と定義>` として
    `discoveries` に起票してください。
+8. **`get_signals` は取引判断 loop 専用で、この改善 mission では利用できません。**
+   配備済み strategy の直近 signal の方向・status・payload は、仮説の選択や
+   候補評価の材料にしないでください。この不在は設計上の制約なので、課題・
+   note・discovery として記録せず、候補自体は許可された `run_backtest` と
+   self-test で検証してください。過去の note にある signal 照合や
+   `get_signals` 相当の tool の要望は、この制約によって解消済みです。
+   それに従って tool を探したり、同じ要望を再記録したりしないでください。
 
 ## 最終出力
 
