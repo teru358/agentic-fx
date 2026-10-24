@@ -39,8 +39,10 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # 属性未定義で ImportError になり、足しても sys.modules から取り直す
     # ため効かない)
 from agentic_fx.loops.improve_context import (
+    mission_template,
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
-    deployed_families_text, family_redirect_last_result, family_redirect_reason)
+    family_redirect_last_result, family_redirect_reason,
+    render_family_attempts)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -886,8 +888,8 @@ class ImproveLoop:
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
             "pin_broken_strategies": pin_broken_line,
-            "deployed_families": deployed_families_text(
-                inv.get("deployed_families", [])),
+            "family_attempts": render_family_attempts(
+                hist["family_attempts"]),
             "backlog_table": (
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])
@@ -906,9 +908,7 @@ class ImproveLoop:
             # にゲートと説明が食い違う)。
             "profitability_floor_rule": self._floor_rule_text(),
         }
-        template_path = (Path(__file__).resolve().parent / "prompts"
-                         / "improve_mission.md")
-        rendered = template_path.read_text().format(**render_map)
+        rendered = mission_template().format(**render_map)
         # [indicator-consumption-wiring] T5a Step 5-1c: テスト専用の観測面
         # (`tests/loops/test_improve_loop_source_snapshot.py::
         # test_prompt_shows_the_number_of_pin_broken_strategies`)。本番挙動

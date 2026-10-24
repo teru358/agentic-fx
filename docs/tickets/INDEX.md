@@ -3,17 +3,17 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 132 件。完了分は closed/。
 
-## 実装中 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
-
-## 実装待ち (14)
+## 実装中 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-context-family-attempt-summary](open/improve-context-family-attempt-summary.md) | 高 | 2026-10-24 | 改善 prompt に仮説族ごとの試行回数と結果区分を渡す |
+| [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
+
+## 実装待ち (13)
+
+| id | 優先 | 起票 | 概要 |
+|---|---|---|---|
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [scheduler-bars-per-tick-memo](open/scheduler-bars-per-tick-memo.md) | 中 | 2026-09-06 | 複数ペア化すると tick ごとの価格取得が注文数に比例して増える |
 | [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |

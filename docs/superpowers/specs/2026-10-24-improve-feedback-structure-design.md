@@ -1,6 +1,6 @@
 # 改善ループに渡す履歴の情報構造 設計書
 
-**版:** v0.3
+**版:** v0.3b
 **日付:** 2026-10-24  
 **対象チケット:** `improve-context-family-attempt-summary`、`improve-deployed-signal-lookup-gap`  
 **状態:** 設計案
@@ -102,6 +102,7 @@ class FamilyAttemptSection(TypedDict):
     rows: list[FamilyAttemptSummary]
     unkeyed_deployed: list[UnkeyedDeployedSummary]
     entries_omitted: int
+    invalid_name_count: int
 ```
 
 `ProjectedStrategyFamilyLabel` は、非配備の依存 indicator を固定語 `未配備指標` 1 個に置き換えた strategy key である (§2.3 の手順 4)。形は `strategy:` の後に配備済み依存名の昇順 (0 個以上) と末尾の `未配備指標` を `,` で結び、`@<tf>@<pair 列>` を続けたもので、足と pair 列は文法を通った値のままである。依存がすべて配備済みなら置換は起きず、key は `CanonicalFamilyKey` のままである。投影後の `family_key` は必ずこの 4 種のどれか 1 つに入り、どれにも入らない表示値は作らない。
@@ -154,7 +155,7 @@ context の `current_inventory.deployed_families` は残す。`build_improve_con
 
 判定は 2 段で行う。まず保存された key を `:`、`@`、`,` で分解し、各要素に**直接検査**を当てる。直接検査は name / tf / pair の字句文法、pair の `settings.pairs` 所属、pair 列が 1 件以上であること、key 全体の長さだけである。次に、分解した値を `family_key_from_parts` に渡して再生成し、元の key と byte 一致したものだけを既知族とする。name 列と pair 列が昇順で重複がないことは直接検査せず、再生成との byte 一致だけが担う (生成規則は `sorted(set(...))` なので、未整列や重複のある key は再生成値と一致しない)。分解できない、直接検査に通らない、再生成値と一致しない key は推測で補完せず、すべて `族不明` という**1 行**に集約する。改行、`|`、日本語、空白、数値と自由文を含む pair は字句文法で落ちる。
 
-`sorted(set(str(x)))` を `,` で結ぶ形は、要素に `,` が入りうると単射でない (pair `"A,B"` 1 個と pair `"A"`、`"B"` 2 個が同じ bytes になる)。本設計では各要素が字句文法を通ってから `,` で結ばれた値だけを既知族とし、字句文法は `,` を含む要素を許さないので、分解は一意で、文法を満たす key と要素列は 1 対 1 に対応する。配備側では meta の pairs・依存名・足の各要素に先に同じ直接検査を当て、通らない要素を持つ plugin は key を持たない配備済み plugin として残余一覧へ出す (§2.4)。生成した文字列を分解し直して検査するのではないので、配備側では `"EURUSD,USDJPY"` のような 1 要素が正規の 2 pair の key に化けることはない。archive 側は保存済み文字列しか無いので、候補 config が pair `"EURUSD,USDJPY"` 1 個で保存された過去行は 2 pair の族として数えられる (帰属の誤りであり、表示される識別子は文法を通ったものだけなので漏洩ではない。§9.3)。保存側の `family_key_from_parts` 自体は値を検査せず、既存の保存値と byte 互換のまま生成する。
+`sorted(set(str(x)))` を `,` で結ぶ形は、要素に `,` が入りうると単射でない (pair `"A,B"` 1 個と pair `"A"`、`"B"` 2 個が同じ bytes になる)。本設計では各要素が字句文法を通ってから `,` で結ばれた値だけを既知族とし、字句文法は `,` を含む要素を許さないので、分解は一意で、文法を満たす key と要素列は 1 対 1 に対応する。配備側では meta の pairs・依存名・足の各要素に先に同じ直接検査を当て、通らない要素を持つ plugin は key を持たない配備済み plugin として残余一覧へ出す (§2.4)。生成した文字列を分解し直して検査するのではないので、配備側では `"EURUSD,USDJPY"` のような 1 要素が正規の 2 pair の key に化けることはない。archive 側は保存済み文字列しか無いので、候補 config が pair `"EURUSD,USDJPY"` 1 個で保存された過去行は 2 pair の族として数えられる (帰属の誤りであり、表示される識別子は文法を通ったものだけなので漏洩ではない。§9.3)。保存側の `family_key_from_parts` 自体は値を検査せずに生成する。保存値と値が変わるのは、明示的な `timeframe: null` の indicator だけである (§9.3)。
 
 **候補名の投影。** 文法検査は保存値に対してだけ行い、その後で表示用の名前置換をする。手順は次の順に固定する。
 
@@ -207,7 +208,7 @@ prompt の表は次の 5 列に固定する。
 3. 非配備の既知族 (`indicator (未配備) @<tf>` を含む) を `attempts` 降順、`last_attempt_month` 降順、`family_key` 昇順。
 4. `族不明` を最後に出す。
 
-表示上限は、表と残余一覧を合わせて 50 entry、節全体で UTF-8 16 KiB とする。`族不明` がある場合はその 1 entry を先に予約する。残りは上の順序で、完成した 1 行ずつ byte 上限内に入るものだけを追加し、行の途中では切らない。省略した entry 数を固定文 `他 N 件を省略` で出す。配備済み entry を先に置くため、上限時も別名重複を避ける情報を優先する。
+表示上限は、表と残余一覧を合わせて 50 entry、節全体で UTF-8 16 KiB とする。`族不明` がある場合はその 1 entry を先に予約する。残りは上の順序で、完成した 1 行ずつ byte 上限内に入るものだけを追加し、行の途中では切らない。予算超過で省略した entry 数を固定文 `他 N 件を省略` で出す。名前が §2.3 の文法に合わない配備済み plugin は名前を出せないので省略 entry には数えず、別の固定文 `規則外の配備名 N 件` で件数だけを出す (`invalid_name_count`)。配備済み entry を先に置くため、上限時も別名重複を避ける情報を優先する。
 
 ### 2.6 agent への読み方
 
@@ -417,6 +418,7 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 - 非配備 indicator を足ごとに集約するため、indicator 候補の系統ごとの反復回数は見えない。名前を出さないこととの交換である。
 - `rejected_by_human` の族別件数から、人間がどの族を好まないかを推定できる。これは族 key と結果区分を渡すというユーザー裁定の範囲に入る残余であり、理由の文は渡さない。
 - entry / byte 上限を超えた古い非配備族は省略される。省略件数は見えるが詳細は見えない。
+- `family_attempt_projection` は archive の全行を読んで親が集計する。行数に上限が無く、数万行規模になると improve 起動ごとの時間とメモリが増える。SQL 側の集計は「3 列を返す関数 1 つ」(§3.1) と単一 SELECT の契約 (AC-1) を変えるので本 spec では採らない。規模が問題になった時点で、集計済み 3 列を返す形に契約ごと改める。
 - prompt 指示は agent の反復を確率的に抑えるもので、書込み時に要望 note を拒否する制約ではない。既存の言い換え note は窓に残り、基準文面だけが逆向きの申し送りを打ち消す。効いたかは AC-20 で観測する。
 - `timeframe: null` の indicator の key が `@None` から `@1h` に変わるので、旧 `@None` 行は族別要約で `族不明` に入り、同じ indicator の新しい `@1h` 行とは merge されない。これは表示と履歴 identity の互換性の問題である。質検査には影響しない (`find_same_family` は候補と live 配備だけを比べ、どちらも変更後の同じ生成関数を通る)。本番 DB の read-only 実測 (2026-10-24) では `@None` の行は 0 件である。
 - pair の字句文法を `^[A-Z]{6}$` にしたので、6 文字の大文字英字でない銘柄名 (接尾辞付きの broker 銘柄など) を `settings.pairs` に入れると、その pair を含む strategy は族別要約で `族不明`、配備済みなら残余一覧に入り、pair は `不明` と表示される。表示の縮退だけで、取引・承認・質検査は変わらない。そのような銘柄を使う段階で、`,`、`@`、`|`、CR、LF、空白を拒否したまま文法を広げる。
@@ -434,3 +436,4 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 | 2026-10-24 | v0.2 | 既存の遮断 pin (台帳新列の 8 面検査) の変更前後を定義。公開結果区分を既存 agent 面の畳み方に揃える。key の文法と再生成照合、非配備 indicator 名の集約、`family_key_from_parts` への一本化と parity pin、`deployed_families` の維持、3 列関数だけの AST pin、最終試行を月単位にして遮断 7 を pin。note dedup を削除し、解消済み要望の基準文面と事後観測 AC と戻り条件を追加。DB 実測値を訂正し、T1 → T2 を直列に | 1 周目の指摘 | |
 | 2026-10-24 | v0.3 | pair に `settings.pairs` 所属と字句文法 `^[A-Z]{6}$` の AND を課し、空 pair 列を `族不明` に、`,` 区切りの単射性を字句文法で保証。公開型に `ProjectedStrategyFamilyLabel` を追加。昇順・重複なしを再生成比較だけに担わせ M-14 を独立に落とせるようにした。AC-19 を族別節の形式検査と prompt 全体の時刻 canary 不在に分割。`timeframe: null` 正規化の残余リスクを表示・履歴 identity の互換性に訂正 | 2 周目の指摘 | |
 | 2026-10-24 | v0.3a | AC-3 の settings に `EURUSD` を加え、archive 側で `,` 入り pair の過去行が 2 pair 族に数えられる残余を §2.3 / §9.3 に明記。 | 閉鎖確認 (opus) の Low 2 | |
+| 2026-10-24 | v0.3b | 規則外の配備名を `他 N 件を省略` から分け、`invalid_name_count` と固定文 `規則外の配備名 N 件` で出す。`family_key_from_parts` の「保存値と byte 互換」を外し、`timeframe: null` の変化を明記。全行読みの規模を §9.3 に追加。 | T1 の /code-review の指摘 1・8・10 | |
