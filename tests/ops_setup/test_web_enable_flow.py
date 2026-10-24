@@ -373,6 +373,30 @@ def test_an_invalid_typed_password_is_asked_again_without_echoing_it(root, xdg):
     assert "short" not in io.text() and "x" * 33 not in io.text()
 
 
+def test_each_credential_failure_explains_the_rule_and_the_remaining_attempts(root, xdg):
+    from agentic_fx.ops_setup import web_wizard as ww
+    io = ScriptIO(answers=["8788", "2", "", "2", ""],
+                  secret_answers=["short", "ok-password-123456", "different", "ok-password-123456", "ok-password-123456"])
+    run = run_enable(root, io, candidates=ONE_CANDIDATE)
+    assert run.rc == 0
+    assert io.err.count("afx ops: setup_input_invalid") == 2
+    assert io.err.count(ww.PASSWORD_RULE + " " + ww.REMAINING_FMT.format(n=2)) == 1
+    assert io.err.count(ww.CONFIRM_MISMATCH + " " + ww.REMAINING_FMT.format(n=1)) == 1
+    assert "short" not in io.text() and "different" not in io.text()
+
+
+def test_the_third_credential_failure_aborts_without_a_remaining_count(root, xdg):
+    from agentic_fx.ops_setup import web_wizard as ww
+    io = ScriptIO(answers=["8788", "2", "", "2", ""],
+                  secret_answers=["short", "short", "short"])
+    run = run_enable(root, io, candidates=ONE_CANDIDATE)
+    assert (run.rc, run.reason) == (1, "setup_aborted")
+    assert io.err.count("afx ops: setup_input_invalid") == 3
+    remaining = [line for line in io.err if "入力できます" in line]
+    assert remaining == [ww.PASSWORD_RULE + " " + ww.REMAINING_FMT.format(n=2),
+                         ww.PASSWORD_RULE + " " + ww.REMAINING_FMT.format(n=1)]
+
+
 def test_unrestricted_prints_the_fixed_warning_then_needs_an_explicit_yes(root, xdg):
     io = ScriptIO(answers=["8788", "2", "", "4", "yes"])
     run = run_enable(root, io, candidates=ONE_CANDIDATE)

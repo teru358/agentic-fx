@@ -501,7 +501,7 @@ reconfigure の列の flag は §5.4 の flag を表す。reconfigure の `--ask
 5. LAN なら `アクセス制限 [1] 許可 IP [2] Basic 認証 [3] 両方 [4] なし (到達できる全 IPv4) [1]:` を尋ねる。
 6. Basic 認証を選んだ時点で、検査済みの安全な既存 `web.password` がある場合だけ、直ちに `現在の Basic 認証を [1] 維持する [2] 再設定する` を尋ねる。維持は user と password を不変にし、表示せず、非対話 `--secret-action keep` と同義とする。再設定、又は既存 password が無い場合は 8 で username と secret を収集する。
 7. 許可 IP 又は両方なら allow の IPv4 / CIDR を入力させる。既存値は角括弧内に示す。
-8. Basic 認証又は両方で 6 が再設定又は password 無しとなった場合は、`ユーザー名 [<既存の user、無ければ afx>]:`、続けて `パスワード (空 Enter で自動生成):` を尋ねる。空 Enter は新たな 22 文字の生成値を使う。手入力なら直後に `もう一度:` を尋ね、異なれば password の質問へ戻る。user と password の grammar 外入力、不一致はいずれも再質問し、合計の失敗が 3 回目なら以後書かず rc 1 `setup_aborted` とする。password の値又は伏字を初期値として表示しない。
+8. Basic 認証又は両方で 6 が再設定又は password 無しとなった場合は、`ユーザー名 [<既存の user、無ければ afx>]:`、続けて `パスワード (空 Enter で自動生成):` を尋ねる。空 Enter は新たな 22 文字の生成値を使う。手入力なら直後に `もう一度:` を尋ね、異なれば password の質問へ戻る。user と password の grammar 外入力、不一致はいずれも再質問し、合計の失敗が 3 回目なら以後書かず rc 1 `setup_aborted` とする。password の値又は伏字を初期値として表示しない。 ユーザー名の文法違反、password の文法違反、再確認の不一致のそれぞれで、`afx ops: setup_input_invalid` の次の行に理由の固定文 (ユーザー名の規則 / パスワードの規則 / 一致しない) と `あと N 回入力できます。` を stderr に出す (3 回目は出さずに `setup_aborted`)。
 9. 目標が `auth = "none"` で安全な既存 `web.password` がある場合は `secret_action=remove` を提示し、利用者が `none` を明示的に再選択した場合だけ削除する。
 10. 後述の前処理 (a) secret、(b) config の順に live へ atomic 保存し、probe を実行する。enable では probe が成功した後に初めて (c) enable の `staged` record を作る。reconfigure は (c) を行わず、§5.4 の手順に従う。
 
@@ -1033,3 +1033,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.10 | 実機確認後のウィザードを、待受 address の説明と interface 名、角括弧内の初期値、アクセス制限の 4 択へ改めた。`user` key と動的 Basic credential、status の user 表示、password の 8〜32 byte・空 Enter 生成・手入力確認、`--password-file` 境界、AC / mutation / T3 を追加した。 | ユーザー実機確認の指摘と裁定。 | `eaec85e` |
 | 2026-10-24 | v0.11 | 安全な既存 Basic password の維持 / 再設定、対話・非対話の対応、生成 password と要約の username 表示、`re.fullmatch` と writer 規則、interface JSON v2 / password 境界の両 package 同時更新、旧 password と版ずれの回復、AC / mutation / 運用文書 pin を追加した。 | v0.10 レビューとユーザー裁定 (2026-10-24 18:06)。 | — |
 | 2026-10-24 | v0.11a | 旧 password (33〜128 byte) の回復手順を「停止中に削除してから reconfigure」の 1 経路に統一 (§5.2 の非対話表と矛盾していた install 直接経路を除去)。 | v0.11 差分閉鎖確認 (codex terra) の Medium | |
+| 2026-10-24 | v0.11b | §5.2 の資格情報の再質問に、失敗理由の固定文と残り回数を stderr に出す規定を追加。 | ユーザー実機確認「なぜ失敗したか分からない」 | |

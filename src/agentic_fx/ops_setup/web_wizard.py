@@ -41,6 +41,10 @@ CONFIRM_LABEL = "もう一度"
 MAX_PROBES = 3
 MAX_CREDENTIAL_FAILURES = 3
 _INVALID = "afx ops: setup_input_invalid"
+USER_RULE = "ユーザー名は英小文字で始まり、英小文字・数字・_・- だけの 1〜32 文字です (空白と : は使えません)。"
+PASSWORD_RULE = "パスワードは 8〜32 文字の表示できる ASCII です (空白・改行・非 ASCII は使えません)。"
+CONFIRM_MISMATCH = "もう一度の入力が最初の入力と一致しません。"
+REMAINING_FMT = "あと {n} 回入力できます。"
 
 # 質問の段
 PORT, SCOPE, BIND, WHO = "port", "scope", "bind", "who"
@@ -148,19 +152,20 @@ class Session:
         """ユーザー名と password。user と password の文法違反、確認の不一致は合計 3 回で打ち切る。"""
         failures = 0
 
-        def failed() -> None:
+        def failed(reason: str) -> None:
             nonlocal failures
             failures += 1
             self._invalid()
             if failures >= MAX_CREDENTIAL_FAILURES:
                 raise WebSetupError("setup_aborted")
+            self.io.stderr(reason + " " + REMAINING_FMT.format(n=MAX_CREDENTIAL_FAILURES - failures))
 
         while True:
             answer = self.io.ask_raw(USER_LABEL, current_user) or ""
             if USER_PATTERN.fullmatch(answer) is not None:
                 user = answer
                 break
-            failed()
+            failed(USER_RULE)
         while True:
             typed = self.io.ask_secret(PASSWORD_LABEL)
             if typed == "":
@@ -168,10 +173,10 @@ class Session:
             try:
                 password = check_password(typed)
             except WebSetupError:
-                failed()
+                failed(PASSWORD_RULE)
                 continue
             if self.io.ask_secret(CONFIRM_LABEL) != typed:
-                failed()
+                failed(CONFIRM_MISMATCH)
                 continue
             return user, SecretPlan("install", password)
 
