@@ -56,6 +56,7 @@ class Scope(StrEnum):
     APPROVALS_DETAIL = "approvals.detail"
     LOGS_READ = "logs.read"
     JOBS_OWN = "jobs.own"
+    GUIDANCE_READ = "guidance.read"
     OPERATE = "operate"
     DECIDE = "decide"
     LOCAL_GUARD = "local_guard"
@@ -89,7 +90,8 @@ Caller = Principal | ShellCaller
 PRINCIPAL_SCOPES: dict[Principal, frozenset[Scope]] = {
     Principal.OPERATOR: frozenset({
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST,
-        Scope.APPROVALS_DETAIL, Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE}),
+        Scope.APPROVALS_DETAIL, Scope.LOGS_READ, Scope.JOBS_OWN, Scope.GUIDANCE_READ,
+        Scope.OPERATE}),
     Principal.APPROVER: frozenset(Scope),
     # bot は決定と、その job を追う jobs.own だけ。operate / local_guard / logs.read は持たない。
     Principal.OPS_BOT: frozenset({
@@ -115,6 +117,8 @@ def validate_principal_scopes(table: dict[Principal, frozenset[Scope]] = PRINCIP
             raise ValueError("duplicate scope")
         if Scope.LOCAL_GUARD in scopes and principal is not Principal.APPROVER:
             raise ValueError("local_guard is approver-only")
+        if Scope.GUIDANCE_READ in scopes and principal not in (Principal.OPERATOR, Principal.APPROVER):
+            raise ValueError("guidance.read is operator/approver-only")
 
 
 def assert_authorized(principal: Caller, scope: Scope) -> None:

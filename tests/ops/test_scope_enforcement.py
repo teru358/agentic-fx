@@ -37,12 +37,16 @@ def test_operator_cannot_decide_or_use_local_guard(ops_env):
 def test_scope_table_matches_the_spec():
     assert PRINCIPAL_SCOPES[Principal.OPERATOR] == frozenset({
         Scope.STATUS_READ, Scope.EVENTS_READ, Scope.APPROVALS_LIST, Scope.APPROVALS_DETAIL,
-        Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE})
+        Scope.LOGS_READ, Scope.JOBS_OWN, Scope.OPERATE, Scope.GUIDANCE_READ})
     assert PRINCIPAL_SCOPES[Principal.APPROVER] == frozenset(Scope)
     validate_principal_scopes()
     with pytest.raises(ValueError):
         validate_principal_scopes({Principal.OPERATOR: frozenset({Scope.LOCAL_GUARD}),
                                    Principal.APPROVER: frozenset(Scope)})
+    scopes = dict(PRINCIPAL_SCOPES)
+    scopes[Principal.OPS_WEB] = frozenset({Scope.GUIDANCE_READ})
+    with pytest.raises(ValueError, match="guidance.read is operator/approver-only"):
+        validate_principal_scopes(scopes)
 
 
 def test_jobs_are_visible_only_to_their_owner(ops_env):
