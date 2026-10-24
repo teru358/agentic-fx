@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 129 件。完了分は closed/。
+未完了: 131 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -36,7 +36,7 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (111)
+## 設計待ち (113)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -70,7 +70,9 @@
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 中 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
+| [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
+| [web-basic-username-not-shown-to-user](open/web-basic-username-not-shown-to-user.md) | 中 | 2026-10-24 | web の Basic 認証ユーザー名 afx が利用者に示されない |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
