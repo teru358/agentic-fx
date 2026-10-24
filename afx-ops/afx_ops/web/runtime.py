@@ -115,7 +115,7 @@ class _Slot:
     __slots__ = ("transport", "deadline", "on_release", "calls", "peer")
 
     def __init__(self, on_release: Callable[["_Slot"], None], peer: str) -> None:
-        # accept 直後に確かめた peer の IPv4。以後の判定はこの値だけを使う
+        # allow の判定は accept_loop が済ませた値。以後の送信元判定 (rate limit など) はこの値を使う
         self.peer = peer
         self.transport: asyncio.BaseTransport | None = None
         self.deadline: asyncio.TimerHandle | None = None

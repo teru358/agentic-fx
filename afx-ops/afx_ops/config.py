@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
+from afx_ops.isolation.accept_loop import LOOPBACK, LOOPBACK_NETWORK, UNRESTRICTED_NETWORK
 from afx_ops.trade_events import NOTICE_KINDS
 from afx_ops.isolation.startup import (
     StartupError,
@@ -41,17 +42,16 @@ OPS_NOTICES = ("default", "all")
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
 
-WEB_LOOPBACK = "127.0.0.1"
-WEB_UNRESTRICTED = ipaddress.IPv4Network("0.0.0.0/0")
+WEB_LOOPBACK = LOOPBACK
+WEB_UNRESTRICTED = UNRESTRICTED_NETWORK
 WEB_AUTHS = ("none", "basic")
-LOOPBACK_NETWORK = ipaddress.IPv4Network("127.0.0.0/8")
 
 
 class ConfigError(Exception):
     """設定を使えない。値や path を例外へ含めない。
 
-    `reason` は既定が `config_invalid`。web は config dir と ops.toml の不安全 / 不在を
-    `config_dir_missing` / `config_dir_invalid` で返す。
+    `reason` は既定が `config_invalid`。web は `ops.toml` の不在を `config_invalid`、config dir
+    の不在を `config_dir_missing`、config dir / `ops.toml` の不安全を `config_dir_invalid` で返す。
     """
 
     def __init__(self, detail: str, reason: str = REASON_CONFIG_INVALID) -> None:

@@ -189,6 +189,23 @@ def test_an_unexpected_renderer_exception_is_500_not_502(method, monkeypatch):
     assert (response.body == b"") is (method == "HEAD")
 
 
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("data", [{}, {"mode": 3}, {"mode": ["x"], "positions": None}])
+def test_a_dict_reply_the_renderer_cannot_draw_is_502(method, data, monkeypatch):
+    def reject(payload):
+        return payload["required"]["inner"]
+
+    monkeypatch.setattr(render, "render_status", reject)
+
+    class Odd:
+        def status(self):
+            return Reply(200, data, None)
+
+    response = handle_request(Request(method, "/", {}), Odd())
+    assert response.status == 502
+    assert (response.body == b"") is (method == "HEAD")
+
+
 def test_an_unexpected_adapter_exception_is_500(monkeypatch):
     def explode(path):
         raise RuntimeError("router bug")

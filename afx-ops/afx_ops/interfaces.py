@@ -23,6 +23,8 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from afx_ops.isolation.accept_loop import LOOPBACK_NETWORK
+
 REASON_LOOKUP_FAILED = "interface_lookup_failed"
 
 IP_CANDIDATES: tuple[str, ...] = ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip")
@@ -119,7 +121,7 @@ def _is_int(value: object) -> bool:
 def _classify(address: str) -> str | None:
     """候補にできる unicast IPv4 の scope。loopback・multicast・unspecified・broadcast は None。"""
     ip = ipaddress.IPv4Address(address)
-    if (ip in ipaddress.IPv4Network("127.0.0.0/8") or ip.is_multicast or ip.is_unspecified
+    if (ip in LOOPBACK_NETWORK or ip.is_multicast or ip.is_unspecified
             or ip == ipaddress.IPv4Address("255.255.255.255")):
         return None
     return "link" if ip in _LINK_LOCAL else "global"

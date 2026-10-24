@@ -48,7 +48,13 @@ from afx_ops import keys
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, Endpoint, wait_ready
 from afx_ops.isolation import bpf, landlock
 from afx_ops.isolation._libc import libc as _libc
-from afx_ops.isolation.accept_loop import LOOPBACK, ListenerError, prebind_listener
+from afx_ops import interfaces
+from afx_ops.isolation.accept_loop import (
+    LOOPBACK,
+    UNRESTRICTED_NETWORK,
+    ListenerError,
+    prebind_listener,
+)
 from afx_ops.isolation.profiles import feature_filter
 from afx_ops.isolation.policy import PolicyBuildError
 
@@ -761,12 +767,10 @@ def check_web_access(plan: StartupPlan, config: OpsConfig, *,
     欠落 / 余剰。production の起動と `afx-ops probe web` が同じ関数を使う。loopback は
     interface を列挙しない。
     """
-    from afx_ops import interfaces
     loopback = config.web_loopback
     if not loopback and config.allow is None:
         raise StartupError("allow_required")
-    from afx_ops.config import WEB_UNRESTRICTED
-    if config.allow is not None and WEB_UNRESTRICTED in config.allow:
+    if config.allow is not None and UNRESTRICTED_NETWORK in config.allow:
         raise StartupError("unrestricted_not_supported")
     if config.auth == "basic":
         raise StartupError("auth_not_supported")

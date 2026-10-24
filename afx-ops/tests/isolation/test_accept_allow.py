@@ -337,8 +337,37 @@ def test_consecutive_exhaustion_up_to_the_limit_gives_up_after_closing(code, cap
     assert _lines(capsys) == ["afx-ops: accept_backoff", "afx-ops: accept_exhausted"]
 
 
-@pytest.mark.parametrize("code", [errno.EPROTO, errno.EPERM, errno.ENOBUFS, errno.EBADF,
-                                  errno.EINVAL, errno.ENOMEM])
+PER_CONNECTION = [errno.ECONNABORTED, errno.EPROTO, errno.ENETDOWN, errno.ENOPROTOOPT,
+                  errno.EHOSTDOWN, errno.ENONET, errno.EHOSTUNREACH, errno.EOPNOTSUPP,
+                  errno.ENETUNREACH, errno.ENOBUFS, errno.ENOMEM]
+
+
+@pytest.mark.parametrize("code", PER_CONNECTION)
+def test_a_per_connection_errno_is_skipped_and_the_next_connection_is_taken(code, capsys):
+    survivor = SpyConn()
+    listener = Scripted([_errno(code), survivor, BlockingIOError()])
+    taken = []
+    loop = AcceptLoop(listener, lambda c, p: taken.append(c),
+                      on_failed=lambda: pytest.fail("listener must stay open"))
+    assert loop.accept_ready() == 1 and listener.attempts == 3
+    assert taken == [survivor] and listener.closed == 0
+    assert loop.accept_failed_total == 0 and loop.accept_exhausted_total == 0
+    assert _lines(capsys) == []
+
+
+@pytest.mark.parametrize("code", PER_CONNECTION)
+def test_64_consecutive_per_connection_errors_return_without_closing_or_exhausting(code, capsys):
+    listener = Scripted([_errno(code)] * 70)
+    loop = AcceptLoop(listener, lambda c, p: None,
+                      on_failed=lambda: pytest.fail("listener must stay open"),
+                      on_exhausted=lambda: pytest.fail("not fd exhaustion"))
+    assert loop.accept_ready() == 0
+    assert listener.attempts == ACCEPT_BUDGET == 64 and listener.closed == 0
+    assert loop.accept_failed_total == loop.accept_exhausted_total == 0
+    assert _lines(capsys) == []
+
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.EBADF, errno.EINVAL, errno.EFAULT])
 def test_an_unexpected_errno_closes_the_listener_and_ends_with_accept_failed(code, capsys):
     listener = Scripted([_errno(code), SpyConn()])
     order = []
@@ -350,11 +379,12 @@ def test_an_unexpected_errno_closes_the_listener_and_ends_with_accept_failed(cod
     assert _lines(capsys) == ["afx-ops: accept_failed"]
 
 
-def test_the_default_failure_exit_is_rc_72():
-    loop = AcceptLoop(Scripted([_errno(errno.EPROTO)]), lambda c, p: None)
+def test_the_default_failure_exit_is_rc_74_apart_from_exhaustion_rc_72():
+    loop = AcceptLoop(Scripted([_errno(errno.EPERM)]), lambda c, p: None)
     with pytest.raises(SystemExit) as info:
         loop.accept_ready()
-    assert info.value.code == accept_loop.RC_ACCEPT_EXHAUSTED == 72
+    assert info.value.code == accept_loop.RC_ACCEPT_FAILED == 74
+    assert accept_loop.RC_ACCEPT_EXHAUSTED == 72
 
 
 _FAILED_CHILD = r"""
@@ -363,7 +393,7 @@ from afx_ops.isolation.accept_loop import AcceptLoop, prebind_listener
 
 class Broken(socket.socket):
     def accept(self):
-        raise OSError(errno.EPROTO, "x")
+        raise OSError(errno.EPERM, "x")
 
 raw = prebind_listener(0)
 port = raw.getsockname()[1]
@@ -380,10 +410,10 @@ asyncio.run(main())
 """
 
 
-def test_an_unexpected_errno_ends_a_real_process_with_a_fixed_line_and_rc_72():
+def test_an_unexpected_errno_ends_a_real_process_with_a_fixed_line_and_rc_74():
     done = subprocess.run([sys.executable, "-c", _FAILED_CHILD], capture_output=True, text=True,
                           timeout=30)
-    assert done.returncode == 72, done.stderr[-1000:]
+    assert done.returncode == 74, done.stderr[-1000:]
     assert done.stderr == "afx-ops: accept_failed\n"
     assert "still running" not in done.stdout
 

@@ -41,6 +41,10 @@ class _Reject(Exception):
         self.status = status
 
 
+# renderer が reply の形の不一致で落ちたときの例外型
+_SCHEMA_ERRORS = (KeyError, TypeError, AttributeError, IndexError, ValueError)
+
+
 class _Upstream(Exception):
     """daemon との通信の失敗 (transport 例外・timeout)。502 にする。"""
 
@@ -293,13 +297,19 @@ def handle_request(request: Request | bytes, client, *,
         if match is None:
             return _error(404, head=head)
         if request.method not in {"GET", "HEAD"}:
-            return _error(405, extra={"Allow": "GET, HEAD"})
+            return _error(405, head=head, extra={"Allow": "GET, HEAD"})
         if request.body:
             raise _Reject(400)
         reply, renderer = _invoke(match, request.query, client)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
             return _error(502, head=head)
-        return _response(200, renderer(reply.data), head=head)
+        try:
+            body = renderer(reply.data)
+        except _SCHEMA_ERRORS:
+            # reply は dict でも必須 key の欠落・型違いで描画できない: 期待 schema でない reply。
+            # それ以外の例外 (renderer 自身の欠陥) は下の 500
+            raise _Upstream from None
+        return _response(200, body, head=head)
     except _Reject as reject:
         return _error(reject.status, head=head)
     except _Upstream:
