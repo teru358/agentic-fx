@@ -112,7 +112,7 @@ secret の有無から `auth` 又は必須集合を推測しない。
 secret dir が存在する場合は owner 所有の mode `0700` を検査し、その検査済み dir fd から `web.password` の有無を確認する。
 `web.password` 以外の entry は許可せず `secret_invalid` とする。
 crash で残った writer の一時 file も同じ扱いとし、production と probe は除去しない。除去は §5.2 の前処理 (0) だけが行う。
-`web.password` は owner 所有の通常 file、mode `0600` ちょうど、size 16〜128 byte とし、`O_NOFOLLOW` で一度だけ読む。
+`web.password` は owner 所有の通常 file、mode `0600` ちょうど、size 16〜128 byte とし、`O_NOFOLLOW` で開く。起動では検査と読取りの 2 回開いてよいが、どちらも同じ検査を通し、使う bytes は検査した bytes である。
 symlink、他 uid、mode 違反、非通常 file、size 違反、read 失敗を `secret_invalid` で拒否する。
 検査済み dir fd と password fd は listener の pre-bind、不要 fd 整理、Landlock 適用のいずれよりも前に閉じる。
 secret dir は隔離後の Landlock 規則へ加えない。
@@ -1000,3 +1000,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.9 | §5.3 の status reason を「`not_configured` + 共有 reader が返す G 層 / C1〜C7 の最終 reason」に広げ、`secret_missing` / `allow_required` を含む表と AC-30 の観測点を追加した。§5.2 の要約の出力先を「要約だけ stderr、prompt は既存 `ConsoleIO` の stdout のまま」に狭めた。 | 差分閉鎖確認 (codex terra) の Medium 1 (§5.3 の限定列挙が AC-12 の 4 入口同一 reason と矛盾) と Low 1 (stdout 契約が対話 prompt と衝突) | |
 | 2026-10-24 | v0.9 | status は stage を先に読み、未設定 / disabled は reader を呼ばず `not_configured`、それ以外は共有 reader の最終 reason (G1 は `config_dir_missing`、`ops.toml` 不在は `config_invalid`)。AC-12 の fixture は stage を terminal enabled に固定。 | 差分再確認 (codex terra) の Medium 1 (G1 の `config_dir_missing` と `not_configured` の適用条件が不定) | |
 | 2026-10-24 | v0.9a | accept の接続単位の errno 集合 (`EPROTO` / `ENETDOWN` / `ENOPROTOOPT` / `EHOSTDOWN` / `ENONET` / `EHOSTUNREACH` / `EOPNOTSUPP` / `ENETUNREACH` と `ENOBUFS` / `ENOMEM`、`ECONNABORTED` と同扱い) を §3.1 / §2.4 / AC-35 に追加し、`accept_failed` の rc を 72 から専用の 74 に分け、renderer が reply の形の不一致 (上記 5 例外型) で落ちる場合を 502 と明記した。 | /code-review high の指摘 (一過性 errno での全 web 停止、`accept_failed` と `accept_exhausted` の rc 共用) | |
+| 2026-10-24 | v0.9b | §2.2 の `web.password` を「一度だけ読む」から「検査と読取りで 2 回開いてよい (同じ検査)」に。 | T2a 実装レビュー (opus) の L-2 | |

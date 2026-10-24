@@ -238,3 +238,18 @@ def test_the_probe_reads_the_same_password_and_reports_missing_and_invalid(home,
     _password(dirs.secret)
     assert probe.main("web") == 0
     assert capsys.readouterr() == ("", "")
+
+
+def test_a_password_that_vanishes_after_scandir_counts_as_absent(tmp_path, monkeypatch):
+    """scandir で見えた `web.password` が open の前に消えたら「無し」。`auth = "none"` では
+    許可側に倒れ、`secret_missing` を名乗らない。"""
+    secret_dir = _secret_dir(tmp_path)
+    _password(secret_dir)
+    real_read = startup._read_web_password
+
+    def vanish_then_read(dir_fd):
+        os.unlink(secret_dir / startup.WEB_PASSWORD)
+        return real_read(dir_fd)
+
+    monkeypatch.setattr(startup, "_read_web_password", vanish_then_read)
+    assert startup.inspect_web_secret(secret_dir) is False

@@ -751,7 +751,13 @@ def inspect_web_secret(secret_dir: Path) -> bool:
             raise StartupError("secret_invalid")
         if WEB_PASSWORD not in names:
             return False
-        _read_web_password(dir_fd)
+        try:
+            _read_web_password(dir_fd)
+        except StartupError as exc:
+            if str(exc) == "secret_missing":
+                # scandir の後に消えた。「無し」として扱い、basic の欠落は呼び出し側が判定する。
+                return False
+            raise
         return True
     finally:
         os.close(dir_fd)
@@ -832,8 +838,9 @@ def read_secrets(plan: StartupPlan) -> Mapping[str, bytes]:
 
     dir は親 dir の fd から `O_NOFOLLOW|O_DIRECTORY` で開き、自 uid・0700 を確かめる。
     file は dir の fd から `O_NOFOLLOW` で開き、通常 file・自 uid・0600 を確かめる。
-    読む名前が無い機能は dir に触れない。失敗は `secrets_failed` で、例外文に path や
-    中身を載せない。
+    読む名前が無い機能は dir に触れない。失敗は bot / notify では `secrets_failed`、web では
+    `secret_missing` / `secret_invalid` で、例外文に path や中身を載せない。web の
+    `web.password` は検査 (inspect) と読取りで 2 回開くが、どちらも同じ検査関数を通る。
     """
     if not plan.secret_files:
         return MappingProxyType({})
