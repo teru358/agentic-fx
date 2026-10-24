@@ -169,7 +169,7 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
                             "broken:invalid_pending")
                         continue
                     live_set = live_kinds.get(name, set())
-                    if proposed not in _PLUGIN_KINDS:
+                    if not isinstance(proposed, str) or proposed not in _PLUGIN_KINDS:
                         placed = next(iter(live_set)) if len(live_set) == 1 else "unknown"
                         issue = "kind_missing"
                     else:

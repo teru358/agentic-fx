@@ -419,3 +419,17 @@ def test_observer_connection_requires_an_existing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         connect_observer_readonly(tmp_path / "nope.db")
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad_kind", [None, 5, [], {}, "indicatorx"])
+def test_plugin_list_pending_with_an_unhashable_or_unknown_kind_is_kind_missing(tmp_path, capsys, bad_kind):
+    _write_plugin(tmp_path, "beta")
+    db, conn = _new_db(tmp_path)
+    _pending(conn, {"name": "beta", "content_hash": H_PENDING, "kind": bad_kind})
+    conn.commit()
+    conn.close()
+
+    assert plugin_list(tmp_path) == 1
+
+    rows = [line.split() for line in _lines(capsys)[4:]]
+    assert len(rows) == 1 and rows[0][-1] == "kind_missing"

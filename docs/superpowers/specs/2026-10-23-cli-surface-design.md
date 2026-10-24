@@ -435,7 +435,7 @@ PluginListView(
 )
 ```
 
-1 行は `(name, kind)` 1 組とする。`version` は immutable な content hash (表示は一意な最短 12 文字以上の prefix、衝突時は full hash) である。下の固定例も 12 文字の prefix で書く。同じ name の indicator と strategy は別行にし、name 昇順、kind は `indicator` → `strategy` → `unknown` の順とする。同じ source 内の重複 name / version は上書きせずすべて保存し、version → approval id / operation id の順に並べ、`issues` に `duplicate_live`、`duplicate_pending` または `duplicate_open_op` を追加する。manifest を読めない plugin も落とさず `kind=unknown`、`issues=[broken:<fixed-reason>]` で出す。`--kind` 指定時は指定 kind の行だけを出し、unknown 行は出さないが source status は常に出す。終了コードは表示した行から算出し、`--kind` で隠した行の issue は数えない。
+1 行は `(name, kind)` 1 組とする。`version` は immutable な content hash (表示は一意な最短 12 文字以上の prefix、衝突時は full hash) である。下の固定例も 12 文字の prefix で書く。同じ name の indicator と strategy は別行にし (pending の kind が live と違えば issue `kind_mismatch` を付けた別行、kind が欠けているか不正なら live が単一 kind のときその行に同居させ issue `kind_missing` を付ける)、name 昇順、kind は `indicator` → `strategy` → `unknown` の順とする。同じ source 内の重複 name / version は上書きせずすべて保存し、version → approval id / operation id の順に並べ、`issues` に `duplicate_live`、`duplicate_pending` または `duplicate_open_op` を追加する。manifest を読めない plugin も落とさず `kind=unknown`、`issues=[broken:<fixed-reason>]` で出す。`--kind` 指定時は指定 kind の行だけを出し、unknown 行は出さないが source status は常に出す。終了コードは表示した行から算出し、`--kind` で隠した行の issue は数えない。
 
 stdout は source status 3 行と固定列 `NAME KIND LIVE PENDING OPEN_OP ISSUES` からなる。各列は見出しと値の最大幅まで空白で埋め、列の間は空白 2 つ、行末の空白は削る。配列は `,` で結合し、空は `-` とする。live `3f9a1c2b7d4e` + pending `8b0e6d5a2c91` + 未完 rollback を同時に持つ固定例は次とする。
 
@@ -975,3 +975,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5b | golden test は非 TTY capture + 3.14 以上だけ `color=False`。再生成する managed block の行終端は常に LF、外側の byte は保持 (CRLF block → `missing` の golden を追加)。 | 差分再確認 (codex terra) の Medium 2 | |
 | 2026-10-24 | v0.5c | §8.2-1 対話 shell の寿命をユーザー裁定で確定 (0.2.0 deprecated 表示、1.0.0 で削除)。 | ユーザー承認 | |
 | 2026-10-24 | v0.5d | §2.2 に `reconf` の書換えは web だけと明記。§4.7 に終了コードは表示した行から算出すると明記。 | 閉鎖確認 (opus) の Low 2 / Low 6 | |
+| 2026-10-24 | v0.5e | §4.7 に `kind_mismatch` / `kind_missing` の issue 語彙と行の置き方を明記。 | A1 差分再確認 (opus) の Low | |
