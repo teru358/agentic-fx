@@ -865,6 +865,7 @@ systemctl --user show afx -p ActiveEnterTimestampMonotonic   # reconfigure の�
 期待:
 
 - `web-access: bind=<bind>:<port> allow=<restricted|unrestricted|loopback-default> auth=<none|basic>` が出る。許可 IP の個別の値と password は出ない。設定を読めないときは `web-access: unavailable reason=<固定 reason>`。
+- 「到達できる全 IPv4」を選ぶと「LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が戦略の diff を読めます」と表示され、`yes` と入力しない限り何も書かれない。
 - 許可されていない端末からの接続は応答なしで切られる。`auth = "basic"` なら認証なしの要求は 401。
 - 生成した password は有効化の画面に 1 回だけ出て、再実行・`status`・ログには出ない。
 - `reconfigure` の前後で afx の `ActiveEnterTimestampMonotonic` が変わらず、`afx-ops@web` だけが再起動する。終わりに `web: reconfigured` (afx が止まっていたときは `web: reconfigured ops=starts_with_afx`) と出る。

@@ -195,8 +195,6 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
         return _fail(io, 1, "precheck", "already_enabled", ENABLED_GUIDANCE)
 
     try:
-        if options.flagless and (unsafe := unsafe_reason(root, "web")):
-            return _fail(io, 1, "config", f"feature_config_unsafe:{unsafe}")
         cleanup_temporaries(root, hook=hook)
         interactive_tty = io.isatty()
         addresses = lambda: [item.address for item in candidates()]  # noqa: E731
@@ -216,6 +214,8 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
             if options.ask and not interactive_tty:
                 return _fail(io, 2, "config", "setup_input_required")
             check = web_access_check(root, interfaces=addresses)
+            if check.reason == "config_dir_invalid" and options.flagless and (unsafe := unsafe_reason(root, "web")):
+                return _fail(io, 1, "config", f"feature_config_unsafe:{unsafe}")
             if check.reason in STOP_REASONS:
                 return _fail(io, 1, "config", check.reason, SECRET_GUIDANCE if check.reason in _SECRET_FAILURES else "")
             interactive = interactive_tty
@@ -233,6 +233,8 @@ def _prepare_web(root: Path, io: IO, options: WebOptions, probe_runner: Callable
         failure = session.converge(values, plan, interactive=interactive, show_password=show_password,
                                    reason_code=_probe_reason_code)
     except WebSetupError as error:
+        if error.reason == "config_dir_invalid" and options.flagless and (unsafe := unsafe_reason(root, "web")):
+            return _fail(io, 1, "config", f"feature_config_unsafe:{unsafe}")
         return _fail(io, error.rc, "config", error.reason, SECRET_GUIDANCE if error.reason in _SECRET_FAILURES else "")
     except OSError:
         return _fail(io, 1, "config", "material_write_failed")

@@ -331,28 +331,59 @@ def test_read_only_secret_fails_closed_without_prompt_or_enable(tmp_path, xdg):
     assert secret.read_bytes() == before
 
 
-def test_unknown_config_key_fails_closed_without_rewriting(tmp_path, xdg):
+@pytest.mark.parametrize("damage", [
+    lambda text: text + 'manual_value = "keep"\n',
+    lambda text: "not = [toml",
+    lambda text: text.replace("\n", '\nauth = "Basic"\n', 1),
+], ids=["unknown_key", "broken_toml", "auth_case"])
+def test_grammar_violation_in_flagless_tty_enable_goes_to_questions(tmp_path, xdg, damage):
     write_inputs(tmp_path, "web", {"port": 8788})
     config = xdg / "web" / "config" / "ops.toml"
-    config.write_text(config.read_text() + 'manual_value = "keep"\n')
-    before = config.read_bytes()
-    io = FakeIO()
+    config.write_text(damage(config.read_text()))
+    io = FakeIO(answers=["9999", ""])
     rc, setup = run(tmp_path, "web", io)
-    assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe:config_file"]
+    assert rc == 0 and setup.enabled == ["web"]
+    assert io.asked == ["port", SCOPE_Q]
+    assert not any("feature_config_unsafe" in line for line in io.err)
+
+
+@pytest.mark.parametrize("damage", [
+    lambda text: text + 'manual_value = "keep"\n',
+    lambda text: "not = [toml",
+    lambda text: text.replace("\n", '\nauth = "Basic"\n', 1),
+], ids=["unknown_key", "broken_toml", "auth_case"])
+def test_grammar_violation_in_flagless_non_tty_enable_needs_input(tmp_path, xdg, damage):
+    write_inputs(tmp_path, "web", {"port": 8788})
+    config = xdg / "web" / "config" / "ops.toml"
+    config.write_text(damage(config.read_text()))
+    before = config.read_bytes()
+    io = FakeIO(tty=False)
+    rc, setup = run(tmp_path, "web", io)
+    assert rc == 2 and setup.enabled == []
+    assert io.err == ["afx ops: setup_input_required"]
     assert config.read_bytes() == before
 
 
-def test_broken_toml_fails_closed_without_rewriting(tmp_path, xdg):
+def test_flagless_web_enable_cleans_temporaries_before_reading_config(tmp_path, xdg):
+    import agentic_fx.ops_setup.interactive as interactive
+
     write_inputs(tmp_path, "web", {"port": 8788})
-    config = xdg / "web" / "config" / "ops.toml"
-    config.write_text("not = [toml")
-    before = config.read_bytes()
-    io = FakeIO(answers=["9999"])
-    rc, setup = run(tmp_path, "web", io)
-    assert rc == 1 and setup.enabled == []
-    assert io.err == ["afx ops: feature_config_unsafe:config_file"]
-    assert config.read_bytes() == before
+    order = []
+    real_cleanup, real_check = interactive.cleanup_temporaries, interactive.web_access_check
+
+    def cleanup(*args, **kwargs):
+        order.append("cleanup")
+        return real_cleanup(*args, **kwargs)
+
+    def check(*args, **kwargs):
+        order.append("read")
+        return real_check(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(interactive, "cleanup_temporaries", cleanup)
+        patch.setattr(interactive, "web_access_check", check)
+        run(tmp_path, "web", FakeIO(tty=False))
+    assert order[:2] == ["cleanup", "read"]
 
 
 def test_group_writable_feature_parents_are_complete_without_prompting(tmp_path, xdg):
