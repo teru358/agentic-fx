@@ -41,6 +41,36 @@ class _Reject(Exception):
         self.status = status
 
 
+class _Upstream(Exception):
+    """daemon との通信の失敗 (transport 例外・timeout)。502 にする。"""
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    """`Host` header の許可。全 bind で、設定の address と port に完全一致するものだけを通す。
+
+    loopback の bind は設定 IPv4 の他に ASCII case-insensitive の `localhost` も通す。
+    port は `:<設定 port>` を要求し、設定 port が 80 のときだけ省略を許す。
+    """
+
+    bind: str
+    port: int
+    loopback: bool
+
+    def allows(self, values: list[str]) -> bool:
+        if len(values) != 1:
+            return False
+        host, sep, port = values[0].partition(":")
+        if sep:
+            if port != str(self.port):
+                return False
+        elif self.port != 80:
+            return False
+        if host == self.bind:
+            return True
+        return self.loopback and host.isascii() and host.lower() == "localhost"
+
+
 def _parse_target(target: str) -> tuple[str, dict[str, str]]:
     if not _TARGET.fullmatch(target) or "#" in target or "%" in target:
         raise _Reject(400)
@@ -119,7 +149,7 @@ def parse_http_request(raw: bytes) -> Request:
             raise _Reject(400)
         elif lowered == "host":
             saw_host = True
-        headers.append((name, value.strip()))
+        headers.append((name, value.strip(" \t")))
     if content_length > MAX_BODY_BYTES or len(body) > MAX_BODY_BYTES:
         raise _Reject(413)
     if not saw_host:
@@ -159,22 +189,32 @@ def _change_of(client, approval_id: int, detail) -> dict | None:
     return reply.data
 
 
+def _call(function, *args, **kwargs):
+    """daemon への呼出し。transport 例外・timeout は `_Upstream` (502) にする。"""
+    try:
+        return function(*args, **kwargs)
+    except Exception:  # noqa: BLE001 — 原因の文は外へ出さない
+        raise _Upstream from None
+
+
 def _invoke(match: RouteMatch, query: dict[str, str], client):
     method = match.route.client_method
     if method == "status":
         if query:
             raise _Reject(400)
-        return client.status(), render.render_status
+        return _call(client.status), render.render_status
     if method == "approvals":
-        return client.approvals(limit=_positive(query, "limit", maximum=200, default=20)), render.render_approvals
+        limit = _positive(query, "limit", maximum=200, default=20)
+        return _call(client.approvals, limit=limit), render.render_approvals
     if method == "approval":
         if query:
             raise _Reject(400)
-        reply = client.approval(match.values["id"])
+        reply = _call(client.approval, match.values["id"])
         change_data = _change_of(client, match.values["id"], reply)
         return reply, functools.partial(render.render_approval, change_data=change_data)
     if method == "log":
-        return client.log(n=_positive(query, "n", maximum=500, default=100)), render.render_log
+        n = _positive(query, "n", maximum=500, default=100)
+        return _call(client.log, n=n), render.render_log
     if method == "activity":
         if set(query) - {"n", "category"}:
             raise _Reject(400)
@@ -182,7 +222,7 @@ def _invoke(match: RouteMatch, query: dict[str, str], client):
         category = query.get("category")
         if category is not None and category not in _ACTIVITY_CATEGORIES:
             raise _Reject(400)
-        return client.activity(n=n, category=category), render.render_activity
+        return _call(client.activity, n=n, category=category), render.render_activity
     raise _Reject(404)
 
 
@@ -229,8 +269,14 @@ def _is_head(request: Request | bytes) -> bool:
     return isinstance(request, Request) and request.method == "HEAD"
 
 
-def handle_request(request: Request | bytes, client) -> Response:
-    """入力から response を作る唯一の adapter。client は read-only fake でもよい。"""
+def handle_request(request: Request | bytes, client, *,
+                   host_policy: HostPolicy | None = None) -> Response:
+    """入力から response を作る唯一の adapter。client は read-only fake でもよい。
+
+    拒否の順は 有界 parse → Host → route → daemon。daemon との通信の失敗と期待 schema で
+    ない reply は 502、この adapter 自身の想定外の例外は 500。`host_policy` が None なら
+    Host の値は検査しない (試験の部品。production の runtime は必ず渡す)。
+    """
     head = _is_head(request)
     try:
         if isinstance(request, bytes):
@@ -238,6 +284,9 @@ def handle_request(request: Request | bytes, client) -> Response:
         if not isinstance(request, Request):
             raise _Reject(400)
         _validate_request(request)
+        if host_policy is not None and not host_policy.allows(
+                [value for name, value in request.headers if name.lower() == "host"]):
+            raise _Reject(400)
         if any(name.lower() == "x-afx-asserted-actor" for name, _value in request.headers):
             raise _Reject(400)
         match = resolve_route(request.path)
@@ -253,5 +302,7 @@ def handle_request(request: Request | bytes, client) -> Response:
         return _response(200, renderer(reply.data), head=head)
     except _Reject as reject:
         return _error(reject.status, head=head)
-    except Exception:
+    except _Upstream:
         return _error(502, head=head)
+    except Exception:
+        return _error(500, head=head)

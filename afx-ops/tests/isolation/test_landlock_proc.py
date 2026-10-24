@@ -130,8 +130,9 @@ def test_xdg_layout_reads_config_and_writes_state_but_not_secrets(feature, root,
         (base / f / "config").chmod(0o755)
         (base / f / "config" / "settings.txt").write_text(f"{f}\n")
         (base / f / "secret").mkdir(mode=0o700)
-        # 機能の固定名の secret (起動時に読む) と、隔離後に読めないことを見る file
-        for name in (*PLANS[f].secret_files, "token"):
+        # 機能の固定名の secret (起動時に読む) と、隔離後に読めないことを見る file。
+        # web の secret dir は `web.password` 以外の entry を持てないので、読めないことは dir で見る
+        for name in (*PLANS[f].secret_files, *(() if f == "web" else ("token",))):
             (base / f / "secret" / name).write_text(f"{name}-of-{f}\n")
             (base / f / "secret" / name).chmod(0o600)
         (tmp_path / "xs" / "agentic-fx" / "ops" / f).mkdir(parents=True)
@@ -141,8 +142,9 @@ def test_xdg_layout_reads_config_and_writes_state_but_not_secrets(feature, root,
         "own_config": ({"op": "read_file", "params": {"path": str(base / feature / "config" /
                                                                 "settings.txt")}},
                        lambda r: r[0] > 0 and r[1] == 0),
-        "own_secret": ({"op": "read_file", "params": {"path": str(base / feature / "secret" /
-                                                                "token")}},
+        "own_secret": ({"op": "read_file" if feature != "web" else "open",
+                        "params": {"path": str(base / feature / "secret" /
+                                               ("token" if feature != "web" else ""))}},
                        lambda r: r == [-1, 13]),
         "own_state": ({"op": "write_state",
                        "params": {"dir": str(tmp_path / "xs" / "agentic-fx" / "ops" / feature)}},

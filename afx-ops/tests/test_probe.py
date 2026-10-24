@@ -235,7 +235,7 @@ def test_web_probe_releases_the_listener_it_bound(monkeypatch):
         def close(self):
             closed.append(True)
 
-    monkeypatch.setattr(probe, "prebind_listener", lambda port: _Listener())
+    monkeypatch.setattr(probe, "prebind_listener", lambda port, **kw: _Listener())
     probe.probe_web(OpsConfig(instance_root=Path("/srv/afx"), key_dir=Path("/srv/keys"),
                               config_dir_fd=None, port=18080), {})
     assert closed == [True]

@@ -13,7 +13,7 @@
 | 2 | ``unknown_feature`` (起動口が返す) |
 | 69 | ``probe_not_implemented`` |
 | 70 | ``runtime_unavailable`` (表の値を呼べない) |
-| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL) / ``token_invalid`` (bot token の形。想定外の失敗は ``startup_internal_error``) |
+| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL) / ``token_invalid`` (bot token の形。想定外の失敗は ``startup_internal_error``)。web は公開範囲の ``allow_required`` / ``unrestricted_not_supported`` / ``auth_not_supported`` / ``interface_lookup_failed`` / ``bind_not_local`` / ``secret_invalid`` / ``secret_missing`` / ``secret_unexpected`` |
 | 73 | ``probe_bind_failed`` (web) / ``probe_<原因>`` (notify の送信失敗・bot の到達失敗。語は ``afx_ops.notify.probe.REASONS`` / ``afx_ops.bot.probe.REASONS``) |
 """
 from __future__ import annotations
@@ -49,9 +49,13 @@ class ProbeError(Exception):
 
 
 def probe_web(config: OpsConfig, secrets: Mapping[str, bytes]) -> None:
-    """`127.0.0.1:<port>` を bind + listen できること。accept はせず、すぐ閉じる。"""
+    """設定の `<bind>:<port>` を bind + listen でき、`getsockname()` が一致すること。
+
+    設定と公開範囲の組み合わせ (allow・interface の実在・secret) は `_read_inputs` が起動と
+    同じ関数で検査済み。accept はせず、すぐ閉じる。
+    """
     try:
-        listener = prebind_listener(config.port)
+        listener = prebind_listener(config.port, bind=config.web_bind)
     except (ListenerError, OSError, TypeError):
         raise ProbeError("probe_bind_failed") from None
     listener.close()
@@ -89,18 +93,16 @@ PROBES: Mapping[str, Callable[[OpsConfig, Mapping[str, bytes]], None]] = Mapping
 def _read_inputs(feature: str) -> tuple[OpsConfig, Mapping[str, bytes]]:
     config = read_config(feature, preserve_config_dir_error=True)
     try:
-        plan = startup.StartupPlan.for_feature(feature, web_port=config.port)
+        plan = startup.StartupPlan.for_feature(
+            feature, web_port=config.port,
+            web_bind=config.web_bind if feature == "web" else startup.LOOPBACK,
+            web_auth=config.auth)
+        if feature == "web":
+            startup.check_web_access(plan, config)
         secrets = startup.read_secrets(plan)
     finally:
         os.close(config.config_dir_fd)
-    return OpsConfig(instance_root=config.instance_root, key_dir=config.key_dir, config_dir_fd=None,
-                     port=config.port, guild_id=config.guild_id, channel_id=config.channel_id,
-                     allowlist_user_ids=config.allowlist_user_ids,
-                     mention_role_id=config.mention_role_id,
-                     mention_user_ids=config.mention_user_ids,
-                     trade_notices=config.trade_notices, trade_amounts=config.trade_amounts,
-                     ops_notices=config.ops_notices,
-                     deliver_trade_events=config.deliver_trade_events), secrets
+    return config.without_config_dir_fd(), secrets
 
 
 def main(feature: str) -> int:

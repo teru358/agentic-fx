@@ -361,7 +361,7 @@ def real_web(ac, tmp_path):
 
 def _get(port: int, path: str = "/") -> tuple[int, str]:
     with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
-        client.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode())
+        client.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n".encode())
         data = b""
         while chunk := client.recv(65536):
             data += chunk
