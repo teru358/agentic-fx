@@ -3725,7 +3725,8 @@ def test_worker_runner_terminate_cli_pgid_escalates_to_sigkill_when_cli_ignores_
             pass
 
 
-def test_worker_runner_cli_started_non_int_pgid_is_ignored(tmp_path, monkeypatch):
+def test_worker_runner_cli_started_non_int_pgid_is_ignored(
+        tmp_path, monkeypatch, sacrificial_pid):
     """#75 (`verified-round1.md` 1-A): `reader_loop` の `cli_started` 処理
     (`isinstance(pgid, int)` ガード) を `cli_pgid_holder["pgid"] =
     frame.get("pgid")` (無条件代入) に潰すと、非 int (`"abc"` 等) の
@@ -3750,7 +3751,7 @@ def test_worker_runner_cli_started_non_int_pgid_is_ignored(tmp_path, monkeypatch
     t = threading.Thread(target=child_thread_fn, daemon=True)
 
     class FakeProc:
-        pid = os.getpid()
+        pid = sacrificial_pid
         stdin = os.fdopen(w2, "wb")
         stdout = os.fdopen(r, "rb")
         returncode = None
