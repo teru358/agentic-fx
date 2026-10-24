@@ -731,6 +731,15 @@ def _backlog_display(value) -> str:
     return text if len(text) <= 200 else text[:199] + "…"
 
 
+_STALE_ADVICE = (
+    ("unreadable", "policy/directives.md を読める状態 (権限、UTF-8) に直してから "
+                   "afx ctl policy reconcile を実行してください。"),
+    ("malformed", "marker を手修正してから afx ctl policy reconcile を実行してください。"),
+)
+_STALE_ADVICE_DEFAULT = ("Mission に入る方針が DB と一致していません。"
+                         "afx ctl policy reconcile で DB に合わせられます。")
+
+
 def _hash_head(value) -> str:
     return value[:12] if isinstance(value, str) and _HASH_HEAD.fullmatch(value) else "-"
 
@@ -946,6 +955,14 @@ def parse(tokens: list[str]) -> Op:
         return Op("backlog_list", _parse_backlog_list(args[1:]))
     if cmd == "policy" and n >= 2 and args[0] == "add":
         return Op("policy", [" ".join(args[1:])])
+    if cmd == "policy" and args == ["show"]:
+        return Op("policy_show", [])
+    if cmd == "policy" and args == ["reconcile"]:
+        return Op("policy_reconcile", [])
+    if cmd == "policy" and n == 2 and args[0] == "remove":
+        if re.fullmatch(r"[1-9][0-9]*", args[1]) is None:
+            raise ClientError(RC_USAGE, USAGE)
+        return Op("policy_remove", [int(args[1])])
     if cmd == "reflect" and n == 2 and args[0] == "retry":
         return Op("reflection_retry", [_int_arg(args[1])])
     if cmd == "killswitch" and n >= 1 and args[0] == "reset":
@@ -1205,6 +1222,54 @@ class Runner:
         if reply.data is None:
             raise _fail(reply)
         self.say("policy に追記しました")
+        return RC_OK
+
+    def _op_policy_show(self, *, terminal) -> int:
+        data = self._get("/v1/policy")
+        managed = [row for row in data.get("managed") or [] if isinstance(row, dict)]
+        unmanaged = [row for row in data.get("unmanaged") or [] if isinstance(row, dict)]
+        self.say("管理対象:")
+        if managed:
+            for row in managed:
+                self.say(f"  #{_ident(row.get('id'))} {_safe_cell(row.get('created_at'), 200)} "
+                         f"{_backlog_display(row.get('directive'))}")
+        else:
+            self.say("  0 件")
+        self.say("管理外 (API から削除できません):")
+        if unmanaged:
+            for row in unmanaged:
+                self.say(f"  line {_ident(row.get('line'))} {_backlog_display(row.get('directive'))}")
+        else:
+            self.say("  0 件")
+        projection = data.get("projection") if isinstance(data.get("projection"), dict) else {}
+        status = projection.get("status")
+        reasons = projection.get("reasons")
+        if status == "ok":
+            self.say("投影: ok")
+        elif not isinstance(reasons, list) or not any(isinstance(r, str) for r in reasons):
+            self.say("投影: stale (unknown)。" + _STALE_ADVICE_DEFAULT)
+        else:
+            reason_text = ", ".join(_safe_cell(reason, 80) for reason in reasons
+                                    if isinstance(reason, str))
+            advice = next((text for key, text in _STALE_ADVICE if key in reasons),
+                          _STALE_ADVICE_DEFAULT)
+            self.say("投影: stale (" + reason_text + ")。" + advice)
+        return RC_OK
+
+    def _op_policy_remove(self, identifier: int, *, terminal) -> int:
+        reply = self._post(f"/v1/policy/{identifier}/remove", idempotent=True)
+        if reply.data is None:
+            if reply.code == "not_found":
+                raise ClientError(RC_FAILED, f"policy #{identifier} は存在しません")
+            raise _fail(reply)
+        self.say(f"policy remove: #{identifier}")
+        return RC_OK
+
+    def _op_policy_reconcile(self, *, terminal) -> int:
+        reply = self._post("/v1/policy/reconcile", idempotent=True)
+        if reply.data is None:
+            raise _fail(reply)
+        self.say("policy reconcile: " + ("changed" if reply.data.get("changed") is True else "unchanged"))
         return RC_OK
 
     def _op_reflection_retry(self, order_id: int, *, terminal) -> int:

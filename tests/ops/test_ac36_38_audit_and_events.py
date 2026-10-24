@@ -1,4 +1,4 @@
-"""AC-36: 変更系 15 本の append-only 監査と自由文の不保存。
+"""AC-36: 変更系 17 本の append-only 監査と自由文の不保存。
 AC-38: event の固定 schema、cursor 再配送、best-effort 生成。"""
 from __future__ import annotations
 
@@ -10,7 +10,9 @@ import pytest
 from agentic_fx.ops import ErrorCode, OpsError
 from agentic_fx.ops.audit import AuditStore
 from agentic_fx.ops.events import EventCursor, EventPage, EventSchemaError, EventStore
+from agentic_fx.ops import service as service_module
 from agentic_fx.ops.service import ENDPOINTS
+from agentic_fx.policy_projection import insert_policy
 from agentic_fx.store import backlog
 
 from .conftest import APPROVER, OPERATOR, digest_of, wait_job
@@ -44,7 +46,7 @@ def test_ac38_equal_high_watermark_is_not_a_rewind():
 
 
 def _drive_all_mutations(env, service):
-    """15 本の変更 endpoint をそれぞれ 1 回ずつ呼び、呼んだ code を返す。"""
+    """17 本の変更 endpoint をそれぞれ 1 回ずつ呼び、呼んだ code を返す。"""
     called = []
 
     def run(code, call):
@@ -79,6 +81,9 @@ def _drive_all_mutations(env, service):
     run("backlog_reopen", lambda: service.transition_backlog(OPERATOR, backlog_id, "reopen"))
     run("backlog_reject", lambda: service.transition_backlog(OPERATOR, backlog_id, "reject"))
     run("policy", lambda: service.add_policy(OPERATOR, "k-pol", POLICY))
+    policy_id = env.conn.execute("SELECT MIN(id) AS id FROM ops_policies").fetchone()["id"]
+    run("policy_remove", lambda: service.remove_policy(OPERATOR, "k-prm", policy_id))
+    run("policy_reconcile", lambda: service.reconcile_policy(OPERATOR, "k-prc"))
     run("job_cancel", lambda: service.cancel_job(OPERATOR, "missing-job"))
     return called
 
@@ -91,7 +96,7 @@ def test_ac36_every_mutating_endpoint_leaves_accepted_and_one_terminal(ops_env):
                               improve_supervisor=_Improve())
     called = _drive_all_mutations(ops_env, service)
     mutating = sorted(code for code, e in ENDPOINTS.items() if e.mutating)
-    assert sorted(called) == mutating and len(mutating) == 15
+    assert sorted(called) == mutating and len(mutating) == 17
     rows = ops_env.ops_rows()
     accepted = {r["id"]: r for r in rows if r["phase"] == "accepted"}
     terminals = [r for r in rows if r["phase"] != "accepted"]
@@ -383,6 +388,7 @@ def _seamed_call(env, monkeypatch, code):
         "INSERT INTO reflection_attempts(order_id,attempts,last_attempt_at,last_reason) "
         "VALUES (?,?,?,?)", (order_id, 1, "2026-10-05T00:00:00+00:00", "r"))
     backlog_id = backlog.add(env.conn, "seed", "user", env.wall())
+    policy_id = insert_policy(env.conn, "既存方針", request_id="seed", now=env.wall())
     env.conn.commit()
 
     future = concurrent.futures.Future()
@@ -418,16 +424,22 @@ def _seamed_call(env, monkeypatch, code):
             seams("backlog_add" if _name == "add" else code)
             return _original(*args, **kwargs)
         monkeypatch.setattr(backlog, name, wrapped)
+    original_reconcile = service_module.reconcile_policy_file
+
+    def reconcile_seam(*args, **kwargs):
+        if code in ("policy", "policy_remove", "policy_reconcile"):
+            seams(code)
+        return original_reconcile(*args, **kwargs)
+    monkeypatch.setattr(service_module, "reconcile_policy_file", reconcile_seam)
     original_cancel = service.jobs.cancel
 
     def cancel(*args, **kwargs):
         seams("job_cancel")
         return original_cancel(*args, **kwargs)
     monkeypatch.setattr(service.jobs, "cancel", cancel)
-    # policy と reflection retry の最初の副作用は DB 書込みなので trigger で入口を捕まえる。
+    # policy 系の最初の副作用は action 先頭の reconcile なので、その入口 (上の包み) で捕まえる。
+    # reflection retry の最初の副作用は DB 書込みなので trigger で入口を捕まえる。
     env.conn.create_function("seam", 1, lambda code: seams(code) or 0)
-    env.conn.execute("CREATE TEMP TRIGGER seam_policy BEFORE INSERT ON ops_policies "
-                     "BEGIN SELECT seam('policy'); END")
     env.conn.execute("CREATE TEMP TRIGGER seam_reflection BEFORE DELETE ON reflection_attempts "
                      "BEGIN SELECT seam('reflection_retry'); END")
     env.conn.commit()
@@ -450,6 +462,8 @@ def _seamed_call(env, monkeypatch, code):
         "backlog_reject": lambda: service.transition_backlog(OPERATOR, backlog_id, "reject"),
         "backlog_reopen": lambda: service.transition_backlog(OPERATOR, backlog_id, "reopen"),
         "policy": lambda: service.add_policy(OPERATOR, "k", "方針"),
+        "policy_remove": lambda: service.remove_policy(OPERATOR, "k", policy_id),
+        "policy_reconcile": lambda: service.reconcile_policy(OPERATOR, "k"),
         "job_cancel": lambda: service.cancel_job(OPERATOR, "missing"),
     }
     original_take = service.jobs.take_next_decision

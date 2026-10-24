@@ -9,7 +9,7 @@ from agentic_fx.ops import contracts
 from agentic_fx.ops.api_server import ROUTES, _match
 from agentic_fx.ops.contracts import Principal, Scope
 
-from ._api import api, backlog_row, closed_order  # noqa: F401
+from ._api import backlog_row, closed_order
 from .conftest import digest_of
 
 
@@ -64,10 +64,14 @@ def _calls(api, env):
         ("backlog_reopen", "POST", f"/v1/backlog/{rejected_backlog}/reopen", {}, {}, 200),
         ("backlog_note", "POST", f"/v1/backlog/{note_backlog}/note", {}, {}, 200),
         ("policy", "POST", "/v1/policy", {"text": "be careful"}, key, 200),
+        ("policy_show", "GET", "/v1/policy", None, {}, 200),
+        ("policy_reconcile", "POST", "/v1/policy/reconcile", {}, {"Idempotency-Key": "k-2"},
+         200),
+        ("policy_remove", "POST", "/v1/policy/1/remove", {}, {"Idempotency-Key": "k-3"}, 200),
     ]
 
 
-def test_ac1_all_26_endpoints_over_real_uds(api):
+def test_ac1_all_29_endpoints_over_real_uds(api):
     from agentic_fx.ops.api_server import _match
     client = api.client(Principal.APPROVER)
     seen = set()
@@ -89,7 +93,7 @@ def test_ac1_all_26_endpoints_over_real_uds(api):
             _wait_job(client, ask_job)
         if expected == 202:
             jobs.append(payload["data"]["job_id"])
-    assert len(ROUTES) == 26 and seen == set(ROUTES)
+    assert len(ROUTES) == 29 and seen == set(ROUTES)
     for job_id in jobs:
         assert _wait_job(client, job_id)["state"] in ("done", "failed")
     codes = {client.post("/v1/killswitch/reset", json={"expected_generation": 0})
@@ -101,7 +105,7 @@ def test_ac1_all_26_endpoints_over_real_uds(api):
 def test_ac1_unknown_path_and_method_are_404(api):
     client = api.client(Principal.APPROVER)
     assert client.get("/v1/nothing").status_code == 404
-    assert client.get("/v1/policy").status_code == 404
+    assert client.get("/v1/policy/1").status_code == 404
     assert client.post("/v1/status", json={}).status_code == 404
     assert client.get("/v1/approvals/abc").status_code == 400
 
@@ -275,13 +279,16 @@ _EXPECTED_TABLE = {
     "backlog_reopen": ("POST", "/v1/backlog/{id}/reopen", Scope.OPERATE),
     "backlog_note": ("POST", "/v1/backlog/{id}/note", Scope.OPERATE),
     "policy": ("POST", "/v1/policy", Scope.OPERATE),
+    "policy_show": ("GET", "/v1/policy", Scope.GUIDANCE_READ),
+    "policy_remove": ("POST", "/v1/policy/{id}/remove", Scope.OPERATE),
+    "policy_reconcile": ("POST", "/v1/policy/reconcile", Scope.OPERATE),
     "job_cancel": ("POST", "/v1/jobs/{id}/cancel", Scope.JOBS_OWN),
 }
 
 
 def test_ac1_routes_and_endpoints_match_the_independent_table_exactly():
     from agentic_fx.ops.service import ENDPOINTS
-    assert len(_EXPECTED_TABLE) == 26
+    assert len(_EXPECTED_TABLE) == 29
     assert {code: (e.route.split(" ", 1)[0], e.route.split(" ", 1)[1], e.scope)
             for code, e in ENDPOINTS.items()} == _EXPECTED_TABLE
     assert {r.handler: (r.method, r.scope) for r in ROUTES} == {

@@ -21,7 +21,7 @@ from agentic_fx.ops.contracts import ErrorCode, OpsError, Principal
 
 from .conftest import digest_of
 from .test_ac54_55_manifest_v2_enroll import _code, _crash, _ready, _root, _write_ready
-from .test_ac56_57_ops_principals import ACTOR, H, api5  # noqa: F401 (fixture)
+from .test_ac56_57_ops_principals import ACTOR, H
 
 OPS_BOT, OPERATOR, APPROVER = Principal.OPS_BOT, Principal.OPERATOR, Principal.APPROVER
 
@@ -129,7 +129,7 @@ def test_enroll_crash_after_writing_the_temporary_key_leaves_no_key_file(tmp_pat
 
 @pytest.mark.parametrize("value", ["123456789012345678", ":123456789012345678",
                                    "discord123456789012345678"])
-def test_actor_without_the_discord_prefix_is_400(api5, value):  # noqa: F811
+def test_actor_without_the_discord_prefix_is_400(api5, value):
     bot = api5.client(OPS_BOT)
     response = bot.get("/v1/whoami", headers={H: value})
     assert response.status_code == 400, value
@@ -148,7 +148,7 @@ def test_validate_asserted_actor_accepts_only_ascii_digits(value):
     assert contracts.validate_asserted_actor(OPS_BOT, ACTOR) == ACTOR
 
 
-def test_service_layer_requires_the_actor_for_ops_bot(api5):  # noqa: F811
+def test_service_layer_requires_the_actor_for_ops_bot(api5):
     env = api5.env
     service = api5.service
     approval = env.make_plugin_approval("p1", 1.0)
@@ -171,7 +171,7 @@ def test_service_layer_requires_the_actor_for_ops_bot(api5):  # noqa: F811
 
 # ---------------------------------------------------------------- autopilot
 
-def test_ops_bot_decision_is_autopilot_restricted(api5):  # noqa: F811
+def test_ops_bot_decision_is_autopilot_restricted(api5):
     env = api5.env
     approval = env.make_plugin_approval("p1", 1.0)
     env.state.update(autopilot=True)

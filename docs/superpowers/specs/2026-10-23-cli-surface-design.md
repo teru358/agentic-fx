@@ -570,9 +570,9 @@ shell の `policy add` は `ops_service` がある通常経路では既存どお
 {"managed":[{"id":3,"created_at":"2026-10-23T00:00:00+00:00","directive":"..."}],"unmanaged":[{"line":1,"directive":"...","removable":false}],"limit":200,"has_more":false,"projection":{"status":"ok","reasons":[]}}
 ```
 
-`managed` は DB の `ops_policies` 行である。stale でも file の block ではなく DB の行を出す。`unmanaged` は現在の file の marker 外の手書き / legacy 行と不正 marker であり、常に `removable=false` と表示する。ただし file が `unreadable` のときは内容を推測せず空配列とする。移行後の同文判定は行わず、同一文の managed block と手書き行を ID marker で区別する。これらは `policy remove` では削除できない。
+`managed` は DB の `ops_policies` 行である。stale でも file の block ではなく DB の行を出す。`unmanaged` は現在の file の marker 外の手書き / legacy 行と不正 marker であり、常に `removable=false` と表示する。 行の `directive` は照合用 view (末尾の `\r` を高々 1 つ外した文) で返し、view が空の行 (空行) は数えず出さない。見出しや説明文などの非空行は方針文かどうかを判別しないので出す。ただし file が `unreadable` のときは内容を推測せず空配列とする。移行後の同文判定は行わず、同一文の managed block と手書き行を ID marker で区別する。これらは `policy remove` では削除できない。
 
-上限 `POLICY_SHOW_LIMIT=200` は managed と unmanaged の合計へ掛ける。managed は `id ASC`、unmanaged は file 順である。managed を先に budget へ入れる。残りへ unmanaged を入れる。超過時は `has_more=true` とする。directive は 4000 字の保存上限を保ち、CLI 表示だけ 200 字へ畳む。
+上限 `POLICY_SHOW_LIMIT=200` は managed と unmanaged の合計へ掛ける。managed は `id ASC`、unmanaged は file 順である。managed を先に budget へ入れる。残りへ unmanaged を入れる。超過時は `has_more=true` とする。directive は 4000 字の保存上限を保ち、CLI 表示だけ 200 字へ畳む。 畳み方は backlog と同じで、200 字を超える文は先頭 199 字 + `…` の計 200 字にする (AC-14 の 199 / 200 / 201 は表示幅が 200 を超えないことを pin する)。
 
 CLI は次の形を固定する。
 
@@ -600,6 +600,8 @@ remove は既存の accepted → 終端の機構だけで書く。新しい jour
 4. `DELETE FROM ops_policies WHERE id=?` を commit する。
 5. `regenerate_policy_file()` で file を replace する。
 6. 成功したら固定 activity `SYSTEM policy_removed id=<id>` を残し、応答 `{"id":<id>}` を返す。`_mutate` が `succeeded` の終端行を書く。
+
+本書で「固定 activity」と呼ぶのは `policy_added` / `policy_removed` / `policy_reconciled` / `policy_reconcile_failed` の `policy_*` 行である。`_mutate` の終端が全 endpoint に共通して書く監査の投影行 `SYSTEM ops_<endpoint>` は本書の対象外で、変えない (`outcome_unknown` の終端にも従来どおり書く)。「activity を残さない」「activity 1 件」はいずれも `policy_*` 行についての規則である。
 
 手順 4 の commit の後で手順 5 が例外になったら、成功とも失敗とも報告しない。action は専用の内部例外 `PolicyProjectionUnknown` を送出する。`_mutate` の except 節はこの例外だけを、code=`outcome_unknown`、state=`outcome_unknown` の終端行にして書き、`OpsError(OUTCOME_UNKNOWN)` を送出する。現行の `_terminal()` は state を渡さないので (`ops/service.py:412-423`)、`AuditStore.terminal()` の既存の `state` 引数 (`ops/audit.py:123-135`) へ通す keyword を足す。state を渡さないと phase は `failed` になる。activity はこの場合残さない。
 
@@ -980,3 +982,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5g | §5.2 前段切り詰めで空白の無い値は本文を残さない (token 断片が redaction を逃れる経路を閉じる)。 | B1 閉鎖確認 (terra) の High | |
 | 2026-10-24 | v0.5h | §5.2 前段切り詰めの区切りを redactor の正規化後も残る空白に限定 (CR 等で token を跨がせる経路を閉じる)。 | B1 閉鎖再確認 (terra) の High | |
 | 2026-10-24 | v0.5i | §5.3.3 の marker 除去を「認識済み block の marker 行だけ、行終端は保存、公開 helper を共有」に明確化。 | B2a codex r1 の P1 と /code-review の #4 | |
+| 2026-10-24 | v0.5j | §5.3.5 に unmanaged の空行除外と `\r` 除去、表示の畳み方 (199 字 + `…`) を明記。§5.4 に「固定 activity」= `policy_*` 行で、共通の監査投影行 `ops_<endpoint>` は対象外と明記。 | B2b codex r1 (High 2 / 3 は投影行の誤読、Medium 1) と /code-review #4 | |

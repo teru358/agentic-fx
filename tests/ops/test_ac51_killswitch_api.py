@@ -11,7 +11,6 @@ import pytest
 
 from agentic_fx.ops.contracts import Principal
 
-from ._api import api  # noqa: F401
 
 CHILD = Path(__file__).with_name("_reset_crash_child.py")
 

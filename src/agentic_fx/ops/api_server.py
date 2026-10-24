@@ -271,14 +271,14 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
 
 
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
-_ENDPOINT_COUNT = 26
+_ENDPOINT_COUNT = 29
 
 
 def build_routes(endpoints: dict) -> tuple[Route, ...]:
     """Endpoint 表から route を作る。表と route が別々に変わらないよう、
     route の定義は表だけに置き、形が崩れていれば起動時に fail closed で止める。"""
     if len(endpoints) != _ENDPOINT_COUNT:
-        raise RuntimeError("endpoint table must hold exactly 26 entries")
+        raise RuntimeError("endpoint table must hold exactly 29 entries")
     routes = []
     for code, endpoint in endpoints.items():
         method, _, path = endpoint.route.partition(" ")
@@ -363,6 +363,8 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
         return ops.list_backlog(principal, all_statuses=raw_all == "true", limit=limit,
                                 deadline=deadline)
+    if name == "policy_show":
+        return ops.show_policy(principal, deadline=deadline)
     body = _body(request)
     if name == "ask":
         return ops.ask(principal, key, body.get("question"), deadline=deadline)
@@ -398,6 +400,10 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
                                       deadline=deadline)
     if name == "policy":
         return ops.add_policy(principal, key, body.get("text"), deadline=deadline)
+    if name == "policy_remove":
+        return ops.remove_policy(principal, key, _int(params["id"]), deadline=deadline)
+    if name == "policy_reconcile":
+        return ops.reconcile_policy(principal, key, deadline=deadline)
     if name == "job_cancel":
         return ops.cancel_job(principal, params["id"], deadline=deadline,
                               asserted_actor=actor)

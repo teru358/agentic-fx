@@ -27,6 +27,10 @@ class ProjectionMalformedError(ProjectionReconcileBlocked):
     """The projection contains an unpaired managed-policy marker."""
 
 
+class MigrationRecordUnknown(RuntimeError):
+    """The projection was replaced before recording its migration failed."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionStatus:
     status: str
@@ -61,10 +65,12 @@ def _line_view(line: bytes) -> bytes:
 
 def _read(path: Path) -> bytes | None:
     try:
-        return path.read_bytes()
+        payload = path.read_bytes()
+        payload.decode("utf-8")
+        return payload
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ProjectionUnreadableError(str(exc)) from exc
 
 
@@ -211,6 +217,25 @@ def inspect_policy_file(conn, path: Path) -> ProjectionStatus:
     return _inspect_payload(conn, before)
 
 
+def unmanaged_policy_lines(path: Path) -> list[tuple[int, str]]:
+    """Return file lines that do not belong to a valid managed block."""
+    try:
+        before = _read(path)
+    except ProjectionUnreadableError:
+        return []
+    if before is None:
+        return []
+    parsed = _parse(before)
+    claimed = {position for _, _, positions in parsed.blocks for position in positions}
+    terminal = len(parsed.lines) - 1
+    return [
+        (position + 1, _line_view(line).decode("utf-8"))
+        for position, line in enumerate(parsed.lines)
+        if position not in claimed and _line_view(line)
+        and not (position == terminal and line == b"")
+    ]
+
+
 def _record_migration(conn, now=None) -> None:
     timestamp = (now or datetime.now(timezone.utc)).isoformat()
     conn.execute(
@@ -239,7 +264,12 @@ def reconcile_policy_file(conn, path: Path) -> bool:
             changed = _replace_if_changed(path, before, migrated)
             if changed:
                 current = migrated
-        _record_migration(conn)
+        try:
+            _record_migration(conn)
+        except BaseException as exc:
+            if changed:
+                raise MigrationRecordUnknown() from exc
+            raise
     if _inspect_payload(conn, current).status == "ok":
         return changed
     return _replace_if_changed(path, current, _candidate(conn, current)) or changed

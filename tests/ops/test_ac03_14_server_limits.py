@@ -24,7 +24,7 @@ from agentic_fx.ops import api_server, keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.contracts import Principal
 
-from ._api import _declare_empty_body, api, make_api  # noqa: F401
+from ._api import _declare_empty_body, make_api
 
 CHILD = Path(__file__).with_name("_peer_child.py")
 

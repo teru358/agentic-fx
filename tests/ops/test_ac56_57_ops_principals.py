@@ -9,11 +9,10 @@ import time
 
 import pytest
 
-from agentic_fx.ops import contracts, keys
+from agentic_fx.ops import contracts
 from agentic_fx.ops.api_server import ROUTES
 from agentic_fx.ops.contracts import Principal
 
-from ._api import make_api
 from .conftest import digest_of, hold_plugin_lock
 
 OPERATOR, APPROVER = Principal.OPERATOR, Principal.APPROVER
@@ -35,19 +34,6 @@ SPEC_SCOPES = {
 ACTOR = "discord:123456789012345678"
 OTHER_ACTOR = "discord:876543210987654321"
 H = "X-Afx-Asserted-Actor"
-
-
-@pytest.fixture
-def api5(ops_env):
-    directory = keys.key_dir(ops_env.root)
-    keys.initialize(directory, root=ops_env.root)
-    for principal in (OPS_BOT, OPS_WEB, OPS_NOTIFY):
-        keys.enroll(directory, principal)
-    api_env = make_api(ops_env)
-    yield api_env
-    for client in api_env.clients:
-        client.close()
-    api_env.server.stop(5.0)
 
 
 def _wait_job(client, job_id, headers=None, timeout=15.0):
@@ -161,6 +147,19 @@ def test_backlog_list_is_authorized_only_for_guidance_read_principals(api5, prin
     assert (response.status_code == 200) is allowed
     if not allowed:
         assert response.status_code == 403 and response.json()["error"]["code"] == "forbidden"
+
+
+@pytest.mark.parametrize("principal,allowed", [
+    (OPERATOR, True), (APPROVER, True), (OPS_BOT, False), (OPS_WEB, False),
+    (OPS_NOTIFY, False),
+])
+def test_policy_endpoints_follow_their_scopes(api5, principal, allowed):
+    client = api5.client(principal)
+    for method, path in (("GET", "/v1/policy"), ("POST", "/v1/policy/1/remove"),
+                         ("POST", "/v1/policy/reconcile")):
+        response = client.request(method, path, json={} if method == "POST" else None,
+                                  headers={"Idempotency-Key": "policy-scope"})
+        assert (response.status_code != 403) is allowed, (principal, path)
 
 
 @pytest.mark.parametrize("principal", list(Principal))
