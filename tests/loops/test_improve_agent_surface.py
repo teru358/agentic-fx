@@ -150,17 +150,36 @@ def test_ac13a_prompt_has_none_of_the_internal_canaries(conn, tmp_path):
 
 # --- AC-13b: 履歴の節 -------------------------------------------------------
 
-def test_ac13b_prompt_has_no_candidate_history_section(conn, tmp_path):
+def test_ac13b_family_section_reads_only_the_narrow_surface(conn, tmp_path):
     canary = _plant_ledger_and_decision(conn, tag="h")
     _assert_planted(conn, canary)
+    # 台帳の行を既知族に帰属させ、族別節が実際にこの行を読んだことを示す
+    conn.execute("UPDATE candidate_archives SET family_key=? "
+                 "WHERE artifact_hash=?",
+                 ("indicator:familyrow_h@1h", canary["artifact_hash"]))
+    conn.commit()
 
-    rendered, _ = _render(conn, _strict_settings(), tmp_path)
+    rendered, ctx_data = _render(conn, _strict_settings(), tmp_path)
 
     headings = [l for l in rendered.splitlines() if l.startswith("#")]
     for fragment in ("試した仮説", "候補の履歴", "候補台帳"):
         assert not [h for h in headings if fragment in h]
+    assert "## 仮説族の試行状況" in headings
+    assert "| indicator (未配備) @1h | 1 | not_submitted=1 |" in rendered
     for value in canary.values():
         assert value not in rendered, value
+        assert value not in json.dumps(ctx_data, default=str), value
+    assert "familyrow_h" not in rendered
+    assert "familyrow_h" not in json.dumps(ctx_data, default=str)
+    # store が返す列と、族の行が持つ key の集合は公開 schema と完全一致する
+    assert set(archives.family_attempt_projection(conn)[0]) == {
+        "family_key", "outcome_class", "created_at"}
+    section = ctx_data["improvement_history"]["family_attempts"]
+    assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted"}
+    for row in section["rows"]:
+        assert set(row) == {
+            "family_key", "attempts", "outcomes", "last_attempt_month",
+            "deployed", "deployed_names"}
 
 
 def _imported_modules(path: Path) -> set[str]:
@@ -176,9 +195,72 @@ def _imported_modules(path: Path) -> set[str]:
     return found
 
 
-def test_ac13b_improve_context_does_not_import_candidate_archives():
-    imported = _imported_modules(Path(improve_context.__file__))
-    assert not [m for m in imported if "candidate_archives" in m]
+def _candidate_archives_references(source: str) -> set[str]:
+    """`candidate_archives` module から参照している名前の全体。`ImportFrom` で
+    取り込む名前と、module alias を基点にした属性名の両方を数える。"""
+    tree = ast.parse(source)
+    module = "agentic_fx.store.candidate_archives"
+    names: set[str] = set()
+    aliases: set[str] = set()
+    dotted: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if base == module:
+                names.update(a.name for a in node.names)
+            elif base == "agentic_fx.store":
+                aliases.update(a.asname or a.name for a in node.names
+                               if a.name == "candidate_archives")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == module:
+                    if a.asname:
+                        aliases.add(a.asname)
+                    else:
+                        dotted.add(module)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        if isinstance(node.value, ast.Name) and node.value.id in aliases:
+            names.add(node.attr)
+        elif _dotted(node.value) in dotted:
+            names.add(node.attr)
+    return names
+
+
+def _dotted(node: ast.AST) -> str:
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def test_ac13b_improve_context_references_only_the_three_column_reader():
+    source = Path(improve_context.__file__).read_text(encoding="utf-8")
+    assert _candidate_archives_references(source) == {
+        "family_attempt_projection"}
+
+
+@pytest.mark.parametrize("snippet", [
+    "from agentic_fx.store.candidate_archives import list_by_mission\n",
+    "from agentic_fx.store.candidate_archives import (\n"
+    "    family_attempt_projection, get)\n",
+    "from agentic_fx.store.candidate_archives import *\n",
+    "from agentic_fx.store import candidate_archives as ca\n"
+    "def f(c):\n    return ca.list_by_mission(c, 1)\n",
+    "from agentic_fx.store import candidate_archives\n"
+    "x = candidate_archives.find_without_path\n",
+    "import agentic_fx.store.candidate_archives as ca\n"
+    "x = ca.get\n",
+    "import agentic_fx.store.candidate_archives\n"
+    "x = agentic_fx.store.candidate_archives.list_by_mission\n",
+])
+def test_ac13b_ast_pin_flags_every_wider_read(snippet):
+    assert _candidate_archives_references(snippet) - {
+        "family_attempt_projection"}
 
 
 # --- AC-13c: activity の agent 投影 ------------------------------------------

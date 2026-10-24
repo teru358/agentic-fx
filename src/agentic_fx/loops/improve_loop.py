@@ -40,7 +40,8 @@ from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
     # ため効かない)
 from agentic_fx.loops.improve_context import (
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
-    deployed_families_text, family_redirect_last_result, family_redirect_reason)
+    family_redirect_last_result, family_redirect_reason,
+    render_family_attempts)
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -886,8 +887,9 @@ class ImproveLoop:
                 for s in inv["news_sources"]) or "(なし)"),
             "risk_gate_summary": _dict_to_line(inv["risk_gate"]),
             "pin_broken_strategies": pin_broken_line,
-            "deployed_families": deployed_families_text(
-                inv.get("deployed_families", [])),
+            "family_attempts": render_family_attempts(hist.get(
+                "family_attempts",
+                {"rows": [], "unkeyed_deployed": [], "entries_omitted": 0})),
             "backlog_table": (
                 "## 選べる課題 (backlog_id を selected に書けるのはここだけ)\n\n"
                 + _backlog_table(bl["items"])

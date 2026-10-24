@@ -10,12 +10,17 @@ improvement_backlog、ユーザー方針 = Policy.tail、参照 = RunContext
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
+from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.plugin.logic_identity import (
+    ParsedFamilyKey, checked_family_key, is_plain_name, is_plain_pair,
+    parse_family_key)
 from agentic_fx.policy import Policy, directives_path
 from agentic_fx.store import news_sources
+from agentic_fx.store.candidate_archives import family_attempt_projection
 from agentic_fx.tools.plugin_loader import approved_plugins
 
 if TYPE_CHECKING:
@@ -170,6 +175,257 @@ def _improvement_history(conn: "sqlite3.Connection", *,
     return {"recent_runs": runs}
 
 
+PublicOutcome = Literal[
+    "not_submitted", "duplicate", "pending", "approved",
+    "rejected_by_human", "expired", "invalidated", "revoked",
+    "unclassified"]
+PUBLIC_OUTCOMES: tuple[str, ...] = (
+    "not_submitted", "duplicate", "pending", "approved", "rejected_by_human",
+    "expired", "invalidated", "revoked", "unclassified")
+# 保存値 -> 公開値。表に無い値は `unclassified` (fail-closed)。3 内部状態
+# (unprofitable / insufficient_trades / gate_failed) は同じ語に畳む。
+_OUTCOME_PROJECTION: dict[str, str] = {
+    "not_submitted": "not_submitted", "unprofitable": "not_submitted",
+    "insufficient_trades": "not_submitted", "gate_failed": "not_submitted",
+    "noop_copy": "not_submitted", "family_redirect": "not_submitted",
+    "duplicate_logic": "duplicate", "duplicate_metrics": "duplicate",
+    "pending": "pending", "approved": "approved",
+    "rejected_by_human": "rejected_by_human", "expired": "expired",
+    "invalidated": "invalidated", "revoked": "revoked"}
+UNCLASSIFIED_OUTCOME = "unclassified"
+
+UNKNOWN_FAMILY_LABEL = "族不明"
+UNDEPLOYED_DEPENDENCY_LABEL = "未配備指標"
+_UNKNOWN_PAIR = "不明"
+FAMILY_SECTION_MAX_ENTRIES = 50
+FAMILY_SECTION_MAX_BYTES = 16 * 1024
+
+
+class FamilyAttemptSummary(TypedDict):
+    family_key: str
+    attempts: int
+    outcomes: dict[str, int]
+    last_attempt_month: str | None
+    deployed: Literal["yes", "no"]
+    deployed_names: list[str]
+
+
+class UnkeyedDeployedSummary(TypedDict):
+    name: str
+    kind: str
+    timeframe: str | None
+    pairs: list[str]
+    indicators: list[str]
+
+
+class FamilyAttemptSection(TypedDict):
+    rows: list[FamilyAttemptSummary]
+    unkeyed_deployed: list[UnkeyedDeployedSummary]
+    entries_omitted: int
+
+
+def project_outcome(raw: object) -> str:
+    """台帳の `outcome_class` を公開語彙の 1 語に投影する。"""
+    if not isinstance(raw, str):
+        return UNCLASSIFIED_OUTCOME
+    return _OUTCOME_PROJECTION.get(raw, UNCLASSIFIED_OUTCOME)
+
+
+def _attempt_month(raw: object) -> str | None:
+    """ISO datetime の年月 (UTC) だけを返す。解釈できない値は None。"""
+    if not isinstance(raw, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    return f"{moment.year:04d}-{moment.month:02d}"
+
+
+def project_family_label(parsed: ParsedFamilyKey,
+                         deployed_indicators: "frozenset[str] | set[str]"
+                         ) -> str:
+    """既知族の表示 key。配備されていない indicator の名前は固定語へ置き換える。"""
+    if parsed.kind == "indicator":
+        name = parsed.names[0]
+        if name in deployed_indicators:
+            return f"indicator:{name}@{parsed.timeframe}"
+        return f"indicator (未配備) @{parsed.timeframe}"
+    known = [n for n in parsed.names if n in deployed_indicators]
+    if len(known) != len(parsed.names):
+        known.append(UNDEPLOYED_DEPENDENCY_LABEL)
+    return (f"strategy:{','.join(known)}@{parsed.timeframe}"
+            f"@{','.join(parsed.pairs)}")
+
+
+def _deployed_view(families: list[dict], allowed_pairs: "set[str]"
+                   ) -> tuple[dict[str, list[str]], list[UnkeyedDeployedSummary],
+                              int, frozenset[str]]:
+    """配備済み plugin を (表示 key -> 配備名, key なしの残余, 除外数,
+    配備済み indicator 名) に分ける。"""
+    deployed_indicators = frozenset(
+        f["name"] for f in families
+        if f["kind"] == "indicator" and is_plain_name(f["name"]))
+    keyed: dict[str, list[str]] = {}
+    unkeyed: list[UnkeyedDeployedSummary] = []
+    skipped = 0
+    for family in families:
+        name = family["name"]
+        if not is_plain_name(name):
+            skipped += 1
+            continue
+        key = checked_family_key(
+            family["kind"], name, family["timeframe"], family["pairs"],
+            family["indicators"], allowed_pairs=allowed_pairs)
+        parsed = (parse_family_key(key, allowed_pairs=allowed_pairs)
+                  if key is not None else None)
+        if parsed is not None:
+            label = project_family_label(parsed, deployed_indicators)
+            keyed.setdefault(label, []).append(name)
+            continue
+        timeframe = family["timeframe"]
+        unkeyed.append({
+            "name": name, "kind": family["kind"],
+            "timeframe": (timeframe if timeframe in PLUGIN_TIMEFRAMES
+                          else None),
+            "pairs": [p if is_plain_pair(p, allowed_pairs) else _UNKNOWN_PAIR
+                      for p in family["pairs"]],
+            "indicators": sorted(n for n in family["indicators"]
+                                 if is_plain_name(n))})
+    unkeyed.sort(key=lambda u: (u["kind"], u["name"]))
+    return ({label: sorted(set(names)) for label, names in keyed.items()},
+            unkeyed, skipped, deployed_indicators)
+
+
+def _deployed_cell(row: FamilyAttemptSummary) -> str:
+    if row["deployed"] != "yes":
+        return "no"
+    names = row["deployed_names"]
+    shown = names[:5]
+    if len(names) > 5:
+        shown = shown + [f"他 {len(names) - 5}"]
+    return f"yes ({', '.join(shown)})"
+
+
+def _family_row_line(row: FamilyAttemptSummary) -> str:
+    outcomes = ", ".join(f"{label}={count}"
+                         for label, count in row["outcomes"].items()) or "-"
+    return (f"| {row['family_key']} | {row['attempts']} | {outcomes} | "
+            f"{row['last_attempt_month'] or '-'} | {_deployed_cell(row)} |")
+
+
+def _unkeyed_line(entry: UnkeyedDeployedSummary) -> str:
+    line = (f"- {entry['name']} ({entry['kind']}): "
+            f"timeframe={entry['timeframe'] or '-'}, "
+            f"pairs={', '.join(entry['pairs']) or '-'}")
+    if entry["kind"] == "strategy":
+        line += f", indicators=[{', '.join(entry['indicators']) or '(なし)'}]"
+    return line
+
+
+def render_family_attempts(section: FamilyAttemptSection) -> str:
+    """prompt に差し込む族別の試行状況 (表と key なしの残余一覧)。"""
+    blocks: list[str] = []
+    if section["rows"]:
+        blocks.append(
+            "| family_key | attempts | outcomes | last_attempt_month | "
+            "deployed |\n|---|---:|---|---|---|\n"
+            + "\n".join(_family_row_line(r) for r in section["rows"]))
+    if section["unkeyed_deployed"]:
+        blocks.append(
+            "family key なしの配備済み plugin:\n"
+            + "\n".join(_unkeyed_line(u) for u in section["unkeyed_deployed"]))
+    if section["entries_omitted"]:
+        blocks.append(f"他 {section['entries_omitted']} 件を省略")
+    return "\n\n".join(blocks) if blocks else "(なし)"
+
+
+def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
+                     families: list[dict]) -> FamilyAttemptSection:
+    allowed_pairs = set(settings.pairs)
+    deployed_by_label, unkeyed, skipped, deployed_indicators = _deployed_view(
+        families, allowed_pairs)
+
+    groups: dict[str, dict] = {}
+    unknown = {"attempts": 0, "outcomes": {}, "month": None}
+
+    def _count(group: dict, outcome: str, month: str | None) -> None:
+        group["attempts"] += 1
+        group["outcomes"][outcome] = group["outcomes"].get(outcome, 0) + 1
+        if month is not None and (group["month"] is None
+                                  or month > group["month"]):
+            group["month"] = month
+
+    for record in family_attempt_projection(conn):
+        parsed = parse_family_key(record["family_key"],
+                                  allowed_pairs=allowed_pairs)
+        outcome = project_outcome(record["outcome_class"])
+        month = _attempt_month(record["created_at"])
+        if parsed is None:
+            _count(unknown, outcome, month)
+            continue
+        label = project_family_label(parsed, deployed_indicators)
+        _count(groups.setdefault(
+            label, {"attempts": 0, "outcomes": {}, "month": None}),
+            outcome, month)
+
+    def _summary(label: str, group: dict, names: list[str]
+                 ) -> FamilyAttemptSummary:
+        return {
+            "family_key": label, "attempts": group["attempts"],
+            "outcomes": {o: group["outcomes"][o] for o in PUBLIC_OUTCOMES
+                         if group["outcomes"].get(o)},
+            "last_attempt_month": group["month"],
+            "deployed": "yes" if names else "no",
+            "deployed_names": names}
+
+    empty = {"attempts": 0, "outcomes": {}, "month": None}
+    deployed_rows = [
+        _summary(label, groups.get(label, empty), names)
+        for label, names in sorted(deployed_by_label.items())]
+    # label 昇順 -> 月降順 -> 件数降順を、安定ソートの重ね掛けで作る。
+    undeployed = sorted(
+        (label for label in groups if label not in deployed_by_label),
+        key=lambda label: label)
+    undeployed.sort(key=lambda label: groups[label]["month"] or "",
+                    reverse=True)
+    undeployed.sort(key=lambda label: groups[label]["attempts"], reverse=True)
+    undeployed_rows = [_summary(label, groups[label], [])
+                       for label in undeployed]
+
+    ordered: list[tuple[str, Any]] = (
+        [("row", r) for r in deployed_rows]
+        + [("unkeyed", u) for u in unkeyed]
+        + [("row", r) for r in undeployed_rows])
+    unknown_row = (_summary(UNKNOWN_FAMILY_LABEL, unknown, [])
+                   if unknown["attempts"] else None)
+    total = len(ordered) + (1 if unknown_row else 0) + skipped
+
+    def _assemble(picked: list[tuple[str, Any]]) -> FamilyAttemptSection:
+        rows = [item for tag, item in picked if tag == "row"]
+        if unknown_row is not None:
+            rows.append(unknown_row)
+        shown = len(picked) + (1 if unknown_row else 0)
+        return {"rows": rows,
+                "unkeyed_deployed": [item for tag, item in picked
+                                     if tag == "unkeyed"],
+                "entries_omitted": total - shown}
+
+    picked: list[tuple[str, Any]] = []
+    reserved = 1 if unknown_row else 0
+    for entry in ordered:
+        if len(picked) + 1 + reserved > FAMILY_SECTION_MAX_ENTRIES:
+            break
+        trial = _assemble(picked + [entry])
+        if len(render_family_attempts(trial).encode("utf-8")
+               ) > FAMILY_SECTION_MAX_BYTES:
+            break
+        picked.append(entry)
+    return _assemble(picked)
+
+
 def deployed_families(metas: "list[Any]") -> list[dict]:
     """配備済み plugin の仮説族 (名前と構成だけ。成績は含まない)。
 
@@ -179,7 +435,8 @@ def deployed_families(metas: "list[Any]") -> list[dict]:
         out.append({
             "name": m.name, "kind": m.kind,
             "timeframe": m.timeframe,
-            "pairs": list(m.pairs) if m.kind == "strategy" else [],
+            "pairs": (list(m.pairs) if m.kind in ("strategy", "signal")
+                      else []),
             "indicators": (sorted({r.plugin for r in m.indicators})
                            if m.kind == "strategy" else [])})
     return sorted(out, key=lambda f: (f["kind"], f["name"]))
@@ -293,10 +550,13 @@ def build_improve_context(
         inventory_metas=inventory_metas)
     deployed_names = frozenset(
         family["name"] for family in current_inventory["deployed_families"])
+    improvement_history = _improvement_history(
+        conn, deployed_names=deployed_names)
+    improvement_history["family_attempts"] = _family_attempts(
+        conn, settings, current_inventory["deployed_families"])
     return {
         "performance_report": _performance_report(conn, now),
-        "improvement_history": _improvement_history(
-            conn, deployed_names=deployed_names),
+        "improvement_history": improvement_history,
         "current_inventory": current_inventory,
         "backlog": _backlog_section(
             conn, allowed_backlog_ids, deployed_names=deployed_names),

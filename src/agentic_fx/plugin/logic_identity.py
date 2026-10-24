@@ -9,10 +9,14 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection, Iterable
 
 import yaml
+
+from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 
 # hash の算法の版。規則を変えたら上げ、保存済みの hash は migration が
 # 接頭辞の違う行を再計算する。
@@ -147,21 +151,127 @@ def logic_hash_of(plugin_py: str, config_yaml: str) -> str | None:
     return _logic_hash(plugin_py, _parse_config(config_yaml))
 
 
+DEFAULT_FAMILY_TIMEFRAME = "1h"
+FAMILY_KEY_MAX_BYTES = 512
+_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_PAIR_RE = re.compile(r"[A-Z]{6}")
+
+
+def family_key_from_parts(kind: Any, name: str, timeframe: Any,
+                          pairs: Iterable[Any],
+                          indicator_names: Iterable[Any]) -> str | None:
+    """仮説族 key を作る唯一の関数。値は検査せず、保存値と byte 互換に作る。
+
+    indicator は名前 + 足、strategy は依存 indicator 名の集合 + 足 + pair 集合
+    (依存が空なら None)。timeframe が None のときは `1h`。集合は
+    `sorted(set(str(x)))` を `,` で結ぶので、宣言順や重複は key に影響しない。"""
+    tf = DEFAULT_FAMILY_TIMEFRAME if timeframe is None else str(timeframe)
+    if kind == "indicator":
+        return f"indicator:{name}@{tf}"
+    if kind != "strategy":
+        return None
+    plugins = sorted({str(x) for x in indicator_names})
+    if not plugins:
+        return None
+    pair_list = sorted({str(p) for p in pairs})
+    return f"strategy:{','.join(plugins)}@{tf}@{','.join(pair_list)}"
+
+
 def _family_key(config: Any, *, name: str) -> str | None:
     if not isinstance(config, dict):
         return None
-    kind = config.get("kind")
-    timeframe = str(config.get("timeframe", "1h"))
-    if kind == "indicator":
-        return f"indicator:{name}@{timeframe}"
-    if kind != "strategy":
-        return None
-    plugins = _indicator_plugins(config)
-    if not plugins:
-        return None
     pairs = config.get("pairs")
-    pair_list = sorted({str(p) for p in pairs}) if isinstance(pairs, list) else []
-    return (f"strategy:{','.join(plugins)}@{timeframe}@{','.join(pair_list)}")
+    return family_key_from_parts(
+        config.get("kind"), name, config.get("timeframe"),
+        pairs if isinstance(pairs, list) else [], _indicator_plugins(config))
+
+
+def is_plain_name(value: Any) -> bool:
+    """plugin 名の字句文法。"""
+    return isinstance(value, str) and _NAME_RE.fullmatch(value) is not None
+
+
+def is_plain_pair(value: Any, allowed_pairs: Collection[str]) -> bool:
+    """pair の字句文法 (大文字英字 6 文字) と、設定された pair への所属の両方。"""
+    return (isinstance(value, str) and _PAIR_RE.fullmatch(value) is not None
+            and value in allowed_pairs)
+
+
+def is_plain_timeframe(value: Any) -> bool:
+    return isinstance(value, str) and value in PLUGIN_TIMEFRAMES
+
+
+def checked_family_key(kind: Any, name: str, timeframe: Any,
+                       pairs: Iterable[Any], indicator_names: Iterable[Any],
+                       *, allowed_pairs: Collection[str]) -> str | None:
+    """配備側の key。各要素に字句文法を先に当て、通らない要素を持つものは
+    key を持たない (None)。生成した文字列を分解し直さない。"""
+    tf = DEFAULT_FAMILY_TIMEFRAME if timeframe is None else timeframe
+    if not is_plain_timeframe(tf):
+        return None
+    if kind == "indicator":
+        if not is_plain_name(name):
+            return None
+    elif kind == "strategy":
+        names = list(indicator_names)
+        pair_list = list(pairs)
+        if (not names or not pair_list
+                or not all(is_plain_name(n) for n in names)
+                or not all(is_plain_pair(p, allowed_pairs)
+                           for p in pair_list)):
+            return None
+    return family_key_from_parts(kind, name, tf, pairs, indicator_names)
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedFamilyKey:
+    kind: str
+    names: tuple[str, ...]
+    timeframe: str
+    pairs: tuple[str, ...]
+
+
+def parse_family_key(key: Any, *, allowed_pairs: Collection[str]
+                     ) -> ParsedFamilyKey | None:
+    """保存済みの key を文法で分解し、再生成値と byte 一致したものだけ返す。
+
+    直接検査は name / tf / pair の字句文法、pair の所属、pair 列が 1 件以上、
+    key 全体の長さだけ。昇順・重複なしは直接検査せず、再生成との一致だけが
+    担う。外れたものは None。"""
+    if not isinstance(key, str):
+        return None
+    if len(key.encode("utf-8", "surrogatepass")) > FAMILY_KEY_MAX_BYTES:
+        return None
+    kind, sep, rest = key.partition(":")
+    if sep != ":":
+        return None
+    parts = rest.split("@")
+    if kind == "indicator":
+        if len(parts) != 2:
+            return None
+        name, timeframe = parts
+        if not is_plain_name(name) or not is_plain_timeframe(timeframe):
+            return None
+        names: tuple[str, ...] = (name,)
+        pairs: tuple[str, ...] = ()
+        regenerated = family_key_from_parts(kind, name, timeframe, (), ())
+    elif kind == "strategy":
+        if len(parts) != 3:
+            return None
+        names = tuple(parts[0].split(","))
+        timeframe = parts[1]
+        pairs = tuple(parts[2].split(","))
+        if (not all(is_plain_name(n) for n in names)
+                or not is_plain_timeframe(timeframe)
+                or not pairs
+                or not all(is_plain_pair(p, allowed_pairs) for p in pairs)):
+            return None
+        regenerated = family_key_from_parts(kind, "", timeframe, pairs, names)
+    else:
+        return None
+    if regenerated != key:
+        return None
+    return ParsedFamilyKey(kind, names, timeframe, pairs)
 
 
 def family_key_of(config_yaml: str, *, name: str) -> str | None:
