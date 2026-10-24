@@ -467,18 +467,62 @@ def test_each_journal_kind_stops_after_10_lines_but_counters_continue(clock, cap
     assert a.web_auth_failed_total == 30
 
 
-class _SlowSeen(dict):
-    """読みと書きの間に他 thread が割り込める隙を広げる。"""
+class _HandshakeSeen(dict):
+    """count を読んだ thread が、もう 1 本の thread にも読む機会を与えてから書く。
 
-    def get(self, key, default=None):
-        value = super().get(key, default)
-        time.sleep(0.002)
+    lock が無ければ 2 本とも同じ count を読んで同じ枠を 2 回使う (決定的に再現)。
+    lock があれば 2 本目は lock で待つので、1 本目の「相手の読み待ち」は時間切れになり、
+    読み書きは直列になる。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+        self.first_read = threading.Event()
+        self.second_read = threading.Event()
+        self._state_lock = threading.Lock()
+
+    def get(self, key, default=None):  # type: ignore[override]
+        value = super().get(key, default)  # 読んだ値を先に確定させる
+        with self._state_lock:
+            self.reads += 1
+            order = self.reads
+        if order == 1:
+            self.first_read.set()
+            self.second_read.wait(timeout=0.5)
+        elif order == 2:
+            self.second_read.set()
         return value
 
 
-def test_concurrent_failures_from_distinct_peers_journal_exactly_10_lines_per_kind(clock, capsys):
+def test_two_racing_failures_reserve_distinct_journal_slots(clock, capsys):
+    """同じ枠を 2 本の thread が同時に取ろうとしても、予約は直列化される。
+    lock を外すと 2 本が count 0 を読んで両方書き、count は 1 で終わる (決定的)。"""
+    journal = Journal(limit=1)
+    seen = _HandshakeSeen()
+    journal._seen = seen
+    a = auth.BasicAuthenticator(PASSWORD, clock=clock, journal=journal)
+    start = threading.Barrier(2)
+
+    def attempt(i: int) -> None:
+        start.wait()
+        a.authenticate([BAD], f"10.1.{i}.1")
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not any(t.is_alive() for t in threads)
+    assert seen["web_auth_failed"] == 2
+    assert seen.reads == 2
+    # 2 本目は 1 本目の予約が終わるまで読めなかった (読みの handshake が時間切れ)。
+    assert seen.first_read.is_set() and seen.second_read.is_set()
+    assert capsys.readouterr().err.splitlines() == ["afx-ops: web_auth_failed"]
+    assert a.web_auth_failed_total == 2
+
+
+def test_many_concurrent_failures_journal_exactly_the_sample_limit(clock, capsys):
     journal = Journal()
-    journal._seen = _SlowSeen()
     a = auth.BasicAuthenticator(PASSWORD, clock=clock, journal=journal)
     start = threading.Barrier(48)
 

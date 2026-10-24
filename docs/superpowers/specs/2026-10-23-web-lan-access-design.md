@@ -283,7 +283,7 @@ credential は byte 列 `b"afx:" + password` と完全一致しなければな�
 password 内の `:` はそのまま password の一部であり、最初の `:` より後を再分割しない。
 
 rate limit 中でない各試行は、正解 `b"afx:" + password` 全体と decoded credential 全体をそれぞれ SHA-256 の 32 byte digest にする。
-Authorization header が無い要求は 401 を返すが認証試行ではない (hash も `compare_digest()` も 0 回、失敗に数えない、§3.4)。
+Authorization header が無い要求は、rate limit 中でなければ 401 を返すが認証試行ではない (hash も `compare_digest()` も 0 回、失敗に数えない)。rate limit 中なら header の有無にかかわらず 429 を先に返す (§3.4)。
 header がある要求は、重複、scheme 違い、壊れた Base64、区切り無しでも固定の dummy 入力から 32 byte digest を作り、dummy と比較して `hmac.compare_digest()` を 32 byte 対 32 byte でちょうど 1 回行う。
 decoded 上限超過も同じ固定 dummy 経路へ入れる。
 password 又は credential の可変長 bytes を直接 `compare_digest()` に渡さない。
@@ -1004,3 +1004,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.9b | §2.2 の `web.password` を「一度だけ読む」から「検査と読取りで 2 回開いてよい (同じ検査)」に。 | T2a 実装レビュー (opus) の L-2 | |
 | 2026-10-24 | v0.9c | §3.4 に、Authorization が無い要求は 401 を返すが rate limit の失敗に数えないことを追記した。 | T2a /code-review high の指摘 | |
 | 2026-10-24 | v0.9d | §3.3 と AC-16 の文言を、Authorization が無い要求は認証試行ではなく比較 0 回、header があれば壊れた形でも dummy と 1 回比較する、に直した。 | T2a 閉鎖確認の指摘 | |
+| 2026-10-24 | v0.9e | §3.3 の header 無し 401 を「rate limit 中でなければ」に限定 (§3.4 と実装に合わせる)。 | T2a 差分再確認 (codex terra) の Low | |
