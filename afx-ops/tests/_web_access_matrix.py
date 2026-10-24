@@ -2,7 +2,9 @@
 
 期待値は仕様の 2 表を行の順に書き下した関数 (`g_*` と `c_expected`) だけから導く。
 実装の関数は使わない。生成物は `fixtures/web_access_matrix.json` に置き、afx-ops の
-3 入口 (config・probe・production) と本体の reader が同じ fixture を読む。
+3 入口 (config・probe・production) と本体の reader が同じ fixture を読む。`expected` は
+限定公開だけを通す版の期待、第 2 層の行の `expected_t2` は basic と無制限も通す版
+(afx-ops) の期待で、G 行は共通なので `expected` だけを持つ。
 
     python tests/_web_access_matrix.py --write   # fixture を更新する
 """
@@ -105,7 +107,7 @@ SECRETS = ("none", "empty_dir", "safe", "unsafe")
 
 
 def c_expected(bind: str, allow: str, auth: str, secret: str, artifact: str = "T1") -> str | None:
-    """第 2 層の C1〜C8 を行の順に書き下したもの (T1 artifact)。"""
+    """第 2 層の C1〜C8 を行の順に書き下したもの。`artifact` は仕様の表の列で、限定公開だけを通す版か、basic と無制限も通す版。"""
     nonloop = bind in ("local", "absent", "failed")
     secret_state = {"none": "none", "empty_dir": "none", "safe": "safe", "unsafe": "unsafe"}[secret]
     if nonloop and allow == "omitted":
@@ -146,7 +148,9 @@ def c_rows() -> list[dict]:
     rows = []
     for bind, allow, auth, secret in itertools.product(BINDS, ALLOWS, AUTHS, SECRETS):
         rows.append(_row(f"C-{bind}-{allow}-{auth}-{secret}", "C",
-                         c_expected(bind, allow, auth, secret), text=_c_text(bind, allow, auth),
+                         c_expected(bind, allow, auth, secret),
+                         expected_t2=c_expected(bind, allow, auth, secret, "T2"),
+                         text=_c_text(bind, allow, auth),
                          bind=bind, allow=allow, auth=auth, secret=secret,
                          interfaces={"loopback": "na", "local": "local", "absent": "absent",
                                      "failed": "failed"}[bind]))

@@ -16,6 +16,7 @@ import fcntl
 import ipaddress
 import socket
 import sys
+import threading
 from collections.abc import Callable, Sequence
 
 from afx_ops.isolation.profiles import WEB_ACCEPT_SYSCALL
@@ -102,15 +103,20 @@ def canonical_peer(raw: object) -> str | None:
 
 
 class Journal:
-    """固定語の journal 行。種類ごとに先頭 `JOURNAL_SAMPLE` 行だけを出す。"""
+    """固定語の journal 行。種類ごとに先頭 `JOURNAL_SAMPLE` 行だけを出す。
+
+    複数 thread から呼ばれてよい。出す枠の予約だけを短い lock の下で行い、書き出しは lock の外。
+    """
 
     def __init__(self, limit: int = JOURNAL_SAMPLE) -> None:
         self._limit = limit
         self._seen: dict[str, int] = {}
+        self._lock = threading.Lock()
 
     def sampled(self, text: str) -> None:
-        count = self._seen.get(text, 0)
-        self._seen[text] = count + 1
+        with self._lock:
+            count = self._seen.get(text, 0)
+            self._seen[text] = count + 1
         if count < self._limit:
             _log(text)
 

@@ -6,8 +6,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
+from afx_ops.web import auth, render
 from afx_ops.web.headers import response_headers
-from afx_ops.web import render
 from afx_ops.web.routes import RouteMatch, resolve_route
 
 MAX_REQUEST_LINE = 2048
@@ -291,6 +291,20 @@ def _error(status: int, *, head: bool = False, extra: dict[str, str] | None = No
     return _response(status, render.render_error(status), head=head, extra=extra)
 
 
+def wire_authorization_values(head: bytes) -> list[str]:
+    """header block の bytes から、Authorization の field-value を OWS の正規化前のまま取り出す。
+
+    `:` の直後の SP 1 個だけを区切りとして外す。それ以外の空白 (tab、2 個目以降の SP、行末)
+    は値に残り、認証器が拒む。header 名は大小を区別しない。
+    """
+    values: list[str] = []
+    for line in head.split(b"\r\n")[1:]:
+        name, sep, value = line.partition(b":")
+        if sep and name.lower() == b"authorization":
+            values.append((value[1:] if value.startswith(b" ") else value).decode("latin-1"))
+    return values
+
+
 def _is_head(request: Request | bytes) -> bool:
     """HEAD への応答は、error でも本文を持たない。parser が拒む前の bytes は先頭の語で見る。"""
     if isinstance(request, bytes):
@@ -299,16 +313,25 @@ def _is_head(request: Request | bytes) -> bool:
 
 
 def handle_request(request: Request | bytes, client, *,
-                   host_policy: HostPolicy | None = None) -> Response:
+                   host_policy: HostPolicy | None = None,
+                   authenticator: auth.BasicAuthenticator | None = None,
+                   peer: str | None = None,
+                   authorization: list[str] | None = None) -> Response:
     """入力から response を作る唯一の adapter。client は read-only fake でもよい。
 
-    拒否の順は 有界 parse → Host → route → daemon。daemon との通信の失敗と期待 schema で
-    ない reply は 502、この adapter 自身の想定外の例外は 500。`host_policy` が None なら
-    Host の値は検査しない (試験の部品。production の runtime は必ず渡す)。
+    拒否の順は 有界 parse → Host → 認証 → route → daemon。daemon との通信の失敗と期待
+    schema でない reply は 502、この adapter 自身の想定外の例外は 500。`host_policy` が None
+    なら Host の値は検査しない (試験の部品。production の runtime は必ず渡す)。
+
+    `authenticator` を渡すと Basic 認証を要求する (`peer` は accepted socket の IPv4)。
+    `authorization` は OWS の正規化前の field-value で、transport が wire から取った値を渡す。
+    省略すると bytes 入力はその header block から、組み立て済みの Request は header から取る。
     """
     head = _is_head(request)
     try:
         if isinstance(request, bytes):
+            if authorization is None:
+                authorization = wire_authorization_values(request.partition(b"\r\n\r\n")[0])
             request = parse_http_request(request)
         if not isinstance(request, Request):
             raise _Reject(400)
@@ -316,6 +339,16 @@ def handle_request(request: Request | bytes, client, *,
         if host_policy is not None and not host_policy.allows(
                 [value for name, value in request.headers if name.lower() == "host"]):
             raise _Reject(400)
+        if authenticator is not None:
+            if peer is None:
+                raise RuntimeError("peer")
+            values = authorization if authorization is not None else [
+                value for name, value in request.headers if name.lower() == "authorization"]
+            decision = authenticator.authenticate(values, peer)
+            if decision.outcome == auth.UNAUTHORIZED:
+                return _error(401, head=head, extra={"WWW-Authenticate": auth.REALM_HEADER})
+            if decision.outcome == auth.LIMITED:
+                return _error(429, head=head, extra={"Retry-After": str(decision.retry_after)})
         if any(name.lower() == "x-afx-asserted-actor" for name, _value in request.headers):
             raise _Reject(400)
         match = resolve_route(request.path)
