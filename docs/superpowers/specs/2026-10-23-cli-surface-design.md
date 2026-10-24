@@ -475,7 +475,7 @@ live directory 不在は `source live: missing`、DB 不在は pending / journal
 {"items":[{"id":12,"status":"open","source":"user","updated_at":"2026-10-23T00:00:00+00:00","idea":"...","idea_truncated":false,"last_result":null,"last_result_truncated":false}],"limit":100,"has_more":false}
 ```
 
-API 応答の `idea` と `last_result` は redactor と改行 / 制御文字の正規化後にそれぞれ UTF-8 4,096 byte を上限とする。超過時は文字境界で切り、上限内の末尾を固定印 `…[truncated]` にし、対応する `idea_truncated` / `last_result_truncated` を true にする。`null` は切り詰めず false である。これにより 500 件の最大応答も有界にする。CLI は 1 行 1 件で `#<id> <status> <source> <updated_at> <idea>` を出す。`last_result` があるときだけ次行へ 2 空白 indent で出す。0 件は `backlog: 0 件` と出す。CLI 表示は API の制限後の文をさらに 200 文字へ畳む。
+API 応答の `idea` と `last_result` は redactor と改行 / 制御文字の正規化後にそれぞれ UTF-8 4,096 byte を上限とする。超過時は文字境界で切り、上限内の末尾を固定印 `…[truncated]` にし、対応する `idea_truncated` / `last_result_truncated` を true にする。`null` は切り詰めず false である。これにより 500 件の最大応答も有界にする。CLI は 1 行 1 件で `#<id> <status> <source> <updated_at> <idea>` を出す。`last_result` があるときだけ次行へ 2 空白 indent で出す。0 件は `backlog: 0 件` と出す。CLI 表示は API の制限後の文をさらに 200 文字へ畳む。応答の `has_more` が true のときは、最後の行の後に固定行 `… 他にもあります (--limit N で増やすか --all)` を stdout へ 1 行出す。false のときは出さない。`last_result` が `null` または空文字のときは次行を出さない。API 側の redactor は 8 KiB 超の値を全文伏せるので、redactor へ渡す前に UTF-8 8,192 byte 以内へ文字境界で前段切り詰めし、切った末尾は最後の空白まで戻す。前段で切った値は `*_truncated` を true にし、本切り詰めと同じ固定印を付ける。
 
 store に `list_items(conn, *, all_statuses: bool, limit: int) -> tuple[list[dict], bool]` を足す。`all_statuses=False` は上の 4 値の `IN`、`True` は status 条件なしである。SQL は `limit + 1` 件を読み、`has_more` を決める。既存 `list_open` と `list_notes` の意味は変えない (`store/backlog.py:57-65`)。
 
@@ -976,3 +976,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5c | §8.2-1 対話 shell の寿命をユーザー裁定で確定 (0.2.0 deprecated 表示、1.0.0 で削除)。 | ユーザー承認 | |
 | 2026-10-24 | v0.5d | §2.2 に `reconf` の書換えは web だけと明記。§4.7 に終了コードは表示した行から算出すると明記。 | 閉鎖確認 (opus) の Low 2 / Low 6 | |
 | 2026-10-24 | v0.5e | §4.7 に `kind_mismatch` / `kind_missing` の issue 語彙と行の置き方を明記。 | A1 差分再確認 (opus) の Low | |
+| 2026-10-24 | v0.5f | §5.2 に has_more の固定行、空文字 last_result の扱い、redactor 8 KiB 上限に対する前段切り詰めを明記。 | B1 /code-review (sonnet) の指摘 2 / 3 / 4 | |
