@@ -1,7 +1,7 @@
 ---
 id: cli-surface-principle-and-reorg
 title: afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 ---
 # [cli-surface-principle-and-reorg] afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -27,3 +27,4 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 - 2026-10-17: 裁定 (ユーザー概ね承認、sol 2 回の助言を踏まえる) — 用途の分類は **7 群 × 実行レーン (最上位 `afx` = daemon 不要 / `afx ctl` = 稼働 daemon の認証・監査つき API)** の表で help と文書を組む。群: 導入・接続管理 (init / check / keys / ops | ctl whoami)、稼働観測・実行追跡 (status | ctl status / log / activity / events / jobs)、市場入力を整える (news / history)、調査・評価する (backtest / analyze)、問い合わせ・改善運用 (ctl ask / improve / backlog / policy / reflect retry)、Plugin を採否・配備する (plugin 全操作 | ctl approval / approve / reject / approval retry)、保護状態を回復する (ctl killswitch / data resume)。危険度は群名に混ぜず `[読取] [変更] [確認] [approver]` のラベル (認可の軸 status.read / operate / decide / local_guard と対応)。`ctl` は分類対象でなくレーン。indicator / strategy は分けない (`plugin list --kind` で見せる)。横断表示 (`ctl status`) は正所属 1 つで、出力末尾から次のコマンドへ誘導し重複掲載しない。help は最上位に表、`afx ctl help` は右列を同じ群順で展開、末尾に「API に発注・SL 変更・クローズ・サービス停止は無い」を 1 文。分類メタデータから help を生成し陳腐化を防ぐ。助言全文: tmp/review-20261011-sc/reports/cli-taxonomy/ (advise 1 = 既存案の評価、advise 2 = 白紙)。
 - 2026-10-17: コスト見込み (指揮者) — 設計 0.5 日 (C0 短、sol 1〜2 周) + 実装 1〜1.5 日を 2 束 (A: 分類メタデータからの help 生成 + (1)(4)(5)(6)、B: (2) backlog list と (3) policy show/remove の API 追加)。影響: entry/cli/client/commands 計 3258 行、help 文言 pin の test 11 本、文書 39 か所。着手は pdo T7 (plugin disable / rollback / versions / revoke の CLI) の後。
 - 2026-10-17 22:49: ユーザー裁定 — 道筋 4 番目 (pdo → 承認の中身 → 改善の質 → 本件 → ウィザード UI)。
+- 2026-10-24: 状態: 実装待ち — 設計書 docs/superpowers/specs/2026-10-23-cli-surface-design.md v0.5b で収束 (設計レビュー 4 周 + 閉鎖確認 3 周)。実装順 S1 → B1 → B2a → B2b → B2c → A1 / A2 → I1、I1 は web-lan の本体 merge 後。§8.2-1 (対話 shell の寿命) はユーザー裁定待ちだが S1〜B2 を止めない
