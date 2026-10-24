@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from agentic_fx.policy_projection import strip_managed_markers
+
 
 def directives_path(root: Path) -> Path:
     """`policy add` の追記先であり Mission 注入元でもある directives.md の場所。"""
@@ -17,13 +19,13 @@ class Policy:
         if chars <= 0:
             return ""
         try:
-            return self._path.read_text(encoding="utf-8")[-chars:]
+            return strip_managed_markers(self._path.read_text(encoding="utf-8"))[-chars:]
         except OSError:
             return ""
 
     def size_warning(self, limit_chars: int = 16000) -> str | None:
         try:
-            text = self._path.read_text(encoding="utf-8")
+            text = strip_managed_markers(self._path.read_text(encoding="utf-8"))
             if len(text) > limit_chars:
                 return (f"警告: {self._path} が {limit_chars} 文字を超えています。"
                         "注入は末尾 4000 文字のみです。手動で整理してください。")

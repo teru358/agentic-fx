@@ -748,8 +748,6 @@ def test_startup_rebuilds_the_policy_file_from_its_records(tmp_path):
     app.ops.add_policy(Principal.OPERATOR, "p1", "risk small")
     assert _run(tmp_path, app) == 0
     path = tmp_path / "policy" / "directives.md"
-    kept = [line for line in path.read_text(encoding="utf-8").splitlines()
-            if line != "- risk small"]
-    path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    path.write_text("# hand written\n", encoding="utf-8")
     assert _run(tmp_path, _app(tmp_path)) == 0
     assert path.read_text(encoding="utf-8").splitlines().count("- risk small") == 1

@@ -550,7 +550,7 @@ DB 行の無い旧 shell / 旧初回設定の行 (`commands.py:49-54` の `\n- t
 
 #### 5.3.3 Mission への注入
 
-`Policy.tail()` (`policy.py:16-22`) は file 全体を `\n` で分割し、§5.3.1 と同じく照合時だけ末尾の `\r` を 1 つ外して marker 行を除き、その結果の末尾 4000 文字を返す。directive 行は残る。`Policy.size_warning()` も同じ marker 除去後の文字数で判定する。marker は注入予算を消費せず、切り口に marker の断片が来ることもない。
+`Policy.tail()` (`policy.py:16-22`) は file 全体を `\n` で分割し、§5.3.1 と同じ block 認識 (照合時だけ末尾の `\r` を 1 つ外し、開始 / directive / 同 ID 終了の連続 3 行) で**認識済み managed block の marker 行だけ**を除き、他の行 (malformed な marker 行を含む unmanaged 行) と各行の行終端は元のまま保って、その結果の末尾 4000 文字を返す。marker 除去は `policy_projection` の公開 helper 1 つで行い、service / policy が同じ規則を共有する。directive 行は残る。`Policy.size_warning()` も同じ marker 除去後の文字数で判定する。marker は注入予算を消費せず、切り口に marker の断片が来ることもない。
 
 #### 5.3.4 初回設定と shell が書く方針文
 
@@ -979,3 +979,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5f | §5.2 に has_more の固定行、空文字 last_result の扱い、redactor 8 KiB 上限に対する前段切り詰めを明記。 | B1 /code-review (sonnet) の指摘 2 / 3 / 4 | |
 | 2026-10-24 | v0.5g | §5.2 前段切り詰めで空白の無い値は本文を残さない (token 断片が redaction を逃れる経路を閉じる)。 | B1 閉鎖確認 (terra) の High | |
 | 2026-10-24 | v0.5h | §5.2 前段切り詰めの区切りを redactor の正規化後も残る空白に限定 (CR 等で token を跨がせる経路を閉じる)。 | B1 閉鎖再確認 (terra) の High | |
+| 2026-10-24 | v0.5i | §5.3.3 の marker 除去を「認識済み block の marker 行だけ、行終端は保存、公開 helper を共有」に明確化。 | B2a codex r1 の P1 と /code-review の #4 | |

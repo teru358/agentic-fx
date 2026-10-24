@@ -1955,12 +1955,15 @@ def _recover_ops(ops: OpsService, conn_ops, activity) -> bool:
     """起動時回復 (plugin 切替 journal の reconcile の後)。失敗したら listener を開かない。"""
     try:
         ops.recover_after_journal()
-        if conn_ops.execute("SELECT 1 FROM ops_policies LIMIT 1").fetchone() is not None:
-            ops.regenerate_policy()
     except Exception as exc:  # noqa: BLE001 — 取引と資金保護は止めない
         _log.exception("ops startup recovery failed")
         activity.write(Category.SYSTEM, "ops_recover_failed", safe_error_text(exc))
         return False
+    try:
+        ops.regenerate_policy()
+    except Exception as exc:  # noqa: BLE001 — policy 投影の失敗は listener を止めない
+        _log.exception("policy startup reconciliation failed")
+        activity.write(Category.SYSTEM, "policy_reconcile_failed", safe_error_text(exc))
     return True
 
 
