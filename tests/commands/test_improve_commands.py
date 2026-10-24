@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.activity import ActivityLog
+from agentic_fx import commands as commands_module
 from agentic_fx.commands import Commands
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.policy_projection import inspect_policy_file
 from agentic_fx.store import backlog, db as db_mod
 from agentic_fx.store.state import StateStore
 
@@ -352,3 +354,49 @@ def test_policy_add_appends_to_directives_file(commands):
                                                              # (下記申し送り)
     out = cmds.dispatch("policy add 新規指針テキスト")
     assert "新規指針テキスト" in cmds._policy_path.read_text(encoding="utf-8")
+
+
+def test_policy_add_fallback_records_a_managed_policy_and_activity(commands):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    assert cmds.dispatch("policy add fallback の方針") == "policy に追記しました"
+
+    assert [row["directive"] for row in conn.execute("SELECT directive FROM ops_policies")] == ["fallback の方針"]
+    assert inspect_policy_file(conn, cmds._policy_path).status == "ok"
+    log = (root / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert log.count("\tpolicy_added\t") == 1
+
+
+def test_policy_add_fallback_reports_insert_failure(commands, monkeypatch):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    def fail_insert(conn, text, *, request_id, now):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(commands_module, "insert_policy", fail_insert)
+
+    assert cmds.dispatch("policy add fallback の方針") == "policy を書けませんでした (OperationalError: database is locked)"
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+    assert not (root / "logs" / "activity.log").exists()
+
+
+def test_policy_add_fallback_reports_projection_failure(commands, monkeypatch):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    def fail_reconcile(conn, path):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(commands_module, "reconcile_policy_file", fail_reconcile)
+
+    assert cmds.dispatch("policy add fallback の方針") == (
+        "policy は記録しましたが policy/directives.md へ反映できませんでした "
+        "(OSError: read-only)。afx の次回起動時に反映されます。")
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+    assert not (root / "logs" / "activity.log").exists()
+
+
+def test_append_policy_directive_is_not_exported():
+    assert not hasattr(commands_module, "append_policy_directive")
