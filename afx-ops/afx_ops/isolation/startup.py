@@ -51,7 +51,6 @@ from afx_ops.isolation._libc import libc as _libc
 from afx_ops import interfaces
 from afx_ops.isolation.accept_loop import (
     LOOPBACK,
-    UNRESTRICTED_NETWORK,
     ListenerError,
     prebind_listener,
 )
@@ -92,8 +91,6 @@ REASONS = (
     "startup_internal_error",
     "body_failed",
     "allow_required",
-    "unrestricted_not_supported",
-    "auth_not_supported",
     "interface_lookup_failed",
     "bind_not_local",
     "secret_invalid",
@@ -680,7 +677,7 @@ def prepare_dirs(plan: StartupPlan, *, config_dir_fd: int | None = None,
         from afx_ops.config import validate_key_dir
         try:
             checked_dir_fds = {"config_dir": config_fd, "state_dir": state_fd}
-            secret_fd = _open_secret_dir(plan.secret_dir) if plan.secret_files else -1
+            secret_fd = _open_plan_secret_dir(plan) if plan.secret_files else -1
             try:
                 if secret_fd >= 0:
                     checked_dir_fds["secret_dir"] = secret_fd
@@ -696,6 +693,44 @@ def prepare_dirs(plan: StartupPlan, *, config_dir_fd: int | None = None,
     return PreparedDirs(config_fd=config_fd, state_fd=state_fd)
 
 
+def _open_web_secret_dir(secret_dir: Path) -> int | None:
+    """web の secret dir を開く。無ければ None。存在して不安全なら `secret_invalid`。"""
+    try:
+        parent = os.open(secret_dir.parent, _DIR_FLAGS | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise StartupError("secret_invalid") from None
+    try:
+        try:
+            dir_fd = os.open(secret_dir.name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise StartupError("secret_invalid") from None
+    finally:
+        os.close(parent)
+    try:
+        _check_owned_dir(dir_fd, "secret_invalid", exact_mode=0o700)
+    except OSError:
+        os.close(dir_fd)
+        raise StartupError("secret_invalid") from None
+    except BaseException:
+        os.close(dir_fd)
+        raise
+    return dir_fd
+
+
+def _open_plan_secret_dir(plan: StartupPlan) -> int:
+    """plan の secret dir の fd。web は固定 reason (`secret_missing` / `secret_invalid`) で止まる。"""
+    if plan.feature != "web":
+        return _open_secret_dir(plan.secret_dir)
+    fd = _open_web_secret_dir(plan.secret_dir)
+    if fd is None:
+        raise StartupError("secret_missing")
+    return fd
+
+
 def inspect_web_secret(secret_dir: Path) -> bool:
     """web の secret dir が安全か確かめ、安全な `web.password` があるかを返す。隔離前に呼ぶ。
 
@@ -704,24 +739,11 @@ def inspect_web_secret(secret_dir: Path) -> bool:
     0600 ちょうど・16〜128 byte・visible ASCII を確かめる。違反は `secret_invalid`。
     password の中身は返さず、読んだ fd は全て閉じてから戻る。
     """
-    try:
-        parent = os.open(secret_dir.parent, _DIR_FLAGS | os.O_NOFOLLOW)
-    except FileNotFoundError:
+    dir_fd = _open_web_secret_dir(secret_dir)
+    if dir_fd is None:
         return False
-    except OSError:
-        raise StartupError("secret_invalid") from None
     try:
         try:
-            dir_fd = os.open(secret_dir.name, _DIR_FLAGS | os.O_NOFOLLOW, dir_fd=parent)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            raise StartupError("secret_invalid") from None
-    finally:
-        os.close(parent)
-    try:
-        try:
-            _check_owned_dir(dir_fd, "secret_invalid", exact_mode=0o700)
             with os.scandir(dir_fd) as entries:
                 names = [entry.name for entry in entries]
         except OSError:
@@ -730,16 +752,25 @@ def inspect_web_secret(secret_dir: Path) -> bool:
             raise StartupError("secret_invalid")
         if WEB_PASSWORD not in names:
             return False
-        _check_web_password(dir_fd)
+        try:
+            _read_web_password(dir_fd)
+        except StartupError as exc:
+            if exc.reason == "secret_missing":
+                # scandir の後に消えた。「無し」として扱い、basic の欠落は呼び出し側が判定する。
+                return False
+            raise
         return True
     finally:
         os.close(dir_fd)
 
 
-def _check_web_password(dir_fd: int) -> None:
+def _read_web_password(dir_fd: int) -> bytes:
+    """`web.password` を一度だけ読む。通常 file・自 uid・0600 ちょうど・16〜128 byte・visible ASCII。"""
     try:
         fd = os.open(WEB_PASSWORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK
                      | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise StartupError("secret_missing") from None
     except OSError:
         raise StartupError("secret_invalid") from None
     try:
@@ -756,24 +787,20 @@ def _check_web_password(dir_fd: int) -> None:
     if (len(data) != st.st_size or not WEB_PASSWORD_MIN <= len(data) <= WEB_PASSWORD_MAX
             or any(not 0x21 <= byte <= 0x7e for byte in data)):
         raise StartupError("secret_invalid")
+    return data
 
 
 def check_web_access(plan: StartupPlan, config: OpsConfig, *,
                      lookup: Callable[[], Iterable[object]] | None = None) -> None:
     """web の公開範囲の組み合わせを固定の順序で検査する。最初に外れた 1 reason だけを返す。
 
-    allow の必須 → 未対応の capability (singleton の無制限 allow、basic) → 非 loopback bind
-    が up の interface に実在すること → secret dir の安全性 → auth に対する secret の
-    欠落 / 余剰。production の起動と `afx-ops probe web` が同じ関数を使う。loopback は
-    interface を列挙しない。
+    allow の必須 → 非 loopback bind が up の interface に実在すること → secret dir の安全性
+    → auth に対する secret の欠落 / 余剰。production の起動と `afx-ops probe web` が
+    同じ関数を使う。loopback は interface を列挙しない。
     """
     loopback = config.web_loopback
     if not loopback and config.allow is None:
         raise StartupError("allow_required")
-    if config.allow is not None and UNRESTRICTED_NETWORK in config.allow:
-        raise StartupError("unrestricted_not_supported")
-    if config.auth == "basic":
-        raise StartupError("auth_not_supported")
     if not loopback:
         try:
             found = (interfaces.list_interfaces if lookup is None else lookup)()
@@ -812,16 +839,19 @@ def read_secrets(plan: StartupPlan) -> Mapping[str, bytes]:
 
     dir は親 dir の fd から `O_NOFOLLOW|O_DIRECTORY` で開き、自 uid・0700 を確かめる。
     file は dir の fd から `O_NOFOLLOW` で開き、通常 file・自 uid・0600 を確かめる。
-    読む名前が無い機能は dir に触れない。失敗は `secrets_failed` で、例外文に path や
-    中身を載せない。
+    読む名前が無い機能は dir に触れない。失敗は bot / notify では `secrets_failed`、web では
+    `secret_missing` / `secret_invalid` で、例外文に path や中身を載せない。web の
+    `web.password` は検査 (inspect) と読取りで 2 回開くが、どちらも同じ検査関数を通る。
     """
     if not plan.secret_files:
         return MappingProxyType({})
     for name in plan.secret_files:
         if not name or "/" in name or name in (".", ".."):
             raise StartupError("secrets_failed", "name")
-    dir_fd = _open_secret_dir(plan.secret_dir)
+    dir_fd = _open_plan_secret_dir(plan)
     try:
+        if plan.feature == "web":
+            return MappingProxyType({WEB_PASSWORD: _read_web_password(dir_fd)})
         return MappingProxyType({name: _read_secret_file(dir_fd, name)
                                  for name in plan.secret_files})
     finally:

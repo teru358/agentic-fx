@@ -65,6 +65,10 @@ class Systemd:
     def start(self, unit: str) -> None:
         self._invoke("start", unit)
 
+    def reset_failed(self, unit: str) -> None:
+        """failed 状態と start-limit の履歴を消す。起動の拒否 (start-limit) を解く。"""
+        self._invoke("reset-failed", unit)
+
     def ensure_active(self, unit: str) -> None:
         if not self.is_active(unit):
             self.start(unit)

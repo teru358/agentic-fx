@@ -2,7 +2,7 @@
 
 期待値は仕様の 2 表を行の順に書き下した関数 (`g_*` と `c_expected`) だけから導く。
 実装の関数は使わない。生成物は `fixtures/web_access_matrix.json` に置き、afx-ops の
-3 入口 (config・probe・production) と本体の reader が同じ fixture を読む。
+3 入口 (config・probe・production) と本体の reader の 4 入口が、`expected` の 1 列を読む。
 
     python tests/_web_access_matrix.py --write   # fixture を更新する
 """
@@ -104,16 +104,12 @@ AUTHS = ("none", "basic")
 SECRETS = ("none", "empty_dir", "safe", "unsafe")
 
 
-def c_expected(bind: str, allow: str, auth: str, secret: str, artifact: str = "T1") -> str | None:
-    """第 2 層の C1〜C8 を行の順に書き下したもの (T1 artifact)。"""
+def c_expected(bind: str, allow: str, auth: str, secret: str) -> str | None:
+    """第 2 層の C1〜C8 を行の順に書き下したもの。"""
     nonloop = bind in ("local", "absent", "failed")
     secret_state = {"none": "none", "empty_dir": "none", "safe": "safe", "unsafe": "unsafe"}[secret]
     if nonloop and allow == "omitted":
         return "allow_required"                                          # C1
-    if artifact == "T1" and allow == "unrestricted":
-        return "unrestricted_not_supported"                              # C2
-    if artifact == "T1" and allow in ("omitted", "limited") and auth == "basic":
-        return "auth_not_supported"                                      # C3
     if bind == "failed" and allow in ("limited", "unrestricted"):
         return "interface_lookup_failed"                                 # C4
     if bind == "absent" and allow in ("limited", "unrestricted"):
@@ -146,7 +142,8 @@ def c_rows() -> list[dict]:
     rows = []
     for bind, allow, auth, secret in itertools.product(BINDS, ALLOWS, AUTHS, SECRETS):
         rows.append(_row(f"C-{bind}-{allow}-{auth}-{secret}", "C",
-                         c_expected(bind, allow, auth, secret), text=_c_text(bind, allow, auth),
+                         c_expected(bind, allow, auth, secret),
+                         text=_c_text(bind, allow, auth),
                          bind=bind, allow=allow, auth=auth, secret=secret,
                          interfaces={"loopback": "na", "local": "local", "absent": "absent",
                                      "failed": "failed"}[bind]))

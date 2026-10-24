@@ -620,3 +620,103 @@ def test_enable_with_afx_stopped_beforehand_leaves_afx_and_ops_down(env):
 
     assert _ctl("start", env.afx).returncode == 0
     assert _wait(lambda: _show(env.ops("bot"), "ActiveState")["ActiveState"] == "active")
+
+
+def test_reset_failed_clears_a_failed_unit_and_reports_an_unloaded_one(env):
+    from agentic_fx.ops_setup.systemd import SystemdError
+
+    unit = f"afx-test-{env.id}-rf.service"
+    done = subprocess.run(["systemd-run", "--user", f"--unit={unit}", "--quiet", "--wait", "/bin/false"],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode != 0
+    assert _show(unit, "ActiveState")["ActiveState"] == "failed"
+
+    Systemd().reset_failed(unit)
+
+    assert _show(unit, "ActiveState")["ActiveState"] != "failed"
+    with pytest.raises(SystemdError) as raised:
+        Systemd().reset_failed(f"afx-test-{env.id}-absent.service")
+    assert raised.value.reason == "reset-failed"
+
+
+def _web_target(tmp_path: Path, port: int) -> str:
+    target = tmp_path / f"target-{port}.toml"
+    target.write_text(f"port = {port}\n")
+    target.chmod(0o600)
+    return str(target)
+
+
+def _reconfigure(env, tmp_path, port: int):
+    from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
+    from agentic_fx.ops_setup.web_setup import WebOptions
+    from web_support import ScriptIO
+
+    io = ScriptIO(tty=False)
+    rc = run_ops_reconfigure(env.root, "web", io=io, setup_factory=lambda _root: env.setup(),
+                             probe_runner=lambda _feature: (0, ""),
+                             options=WebOptions(non_interactive=True, config_file=_web_target(tmp_path, port),
+                                                secret_action="absent"))
+    return rc, io.out
+
+
+def _tree_bytes(*bases: Path) -> dict[str, bytes]:
+    return {str(path): path.read_bytes() for base in bases for path in sorted(base.rglob("*"))
+            if path.is_file() and path.name != "setup.lock"}
+
+
+def test_reconfigure_restarts_only_ops_web_and_leaves_afx_keys_and_the_stage_alone(env, tmp_path, monkeypatch):
+    from agentic_fx.ops_setup.feature_config import collect, write_inputs
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    write_inputs(env.root, "web", {"port": 8788})
+    assert env.setup().enable("web").stage == "enabled"
+    assert _wait(lambda: _show(env.ops("web"), "ActiveState")["ActiveState"] == "active")
+    pid_before = _show(env.ops("web"), "MainPID")["MainPID"]
+    afx_before = _show(env.afx, "ActiveEnterTimestampMonotonic", "MainPID")
+    before = _tree_bytes(key_dir(env.root), env.root / "data" / "ops")
+
+    rc, out = _reconfigure(env, tmp_path, 9000)
+
+    assert rc == 0 and out == ["web: reconfigured"]
+    assert collect(env.root, "web").values == {"port": 9000}
+    assert _show(env.ops("web"), "ActiveState")["ActiveState"] == "active"
+    assert _show(env.ops("web"), "MainPID")["MainPID"] not in (pid_before, "0")
+    assert _show(env.afx, "ActiveEnterTimestampMonotonic", "MainPID") == afx_before
+    assert _tree_bytes(key_dir(env.root), env.root / "data" / "ops") == before
+
+
+def test_reconfigure_with_afx_stopped_leaves_ops_web_down_until_afx_starts(env, tmp_path, monkeypatch):
+    from agentic_fx.ops_setup.feature_config import collect, write_inputs
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    write_inputs(env.root, "web", {"port": 8788})
+    assert env.setup().enable("web").stage == "enabled"
+    assert _ctl("stop", env.afx).returncode == 0
+    assert _wait(lambda: _lock_free(env.root))
+
+    rc, out = _reconfigure(env, tmp_path, 9001)
+
+    assert rc == 0 and out == ["web: reconfigured ops=starts_with_afx"]
+    assert collect(env.root, "web").values == {"port": 9001}
+    assert _show(env.afx, "ActiveState")["ActiveState"] == "inactive"
+    assert _show(env.ops("web"), "ActiveState")["ActiveState"] == "inactive"
+
+    assert _ctl("start", env.afx).returncode == 0
+    assert _wait(lambda: _show(env.ops("web"), "ActiveState")["ActiveState"] == "active")
+
+
+def test_reconfigure_refuses_when_the_unit_files_changed_after_the_last_reload(env, tmp_path, monkeypatch):
+    from agentic_fx.ops_setup.feature_config import write_inputs
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    write_inputs(env.root, "web", {"port": 8788})
+    assert env.setup().enable("web").stage == "enabled"
+    unit_file = env.unit_dir / env.afx
+    unit_file.write_text(unit_file.read_text() + "\n# edited after the last reload\n")
+    afx_before = _show(env.afx, "ActiveEnterTimestampMonotonic", "NeedDaemonReload")
+    assert afx_before["NeedDaemonReload"] == "yes"
+
+    rc, out = _reconfigure(env, tmp_path, 9002)
+
+    assert rc == 1 and out == []
+    assert _show(env.afx, "ActiveEnterTimestampMonotonic", "NeedDaemonReload") == afx_before

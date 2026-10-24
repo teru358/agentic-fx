@@ -90,40 +90,38 @@ def test_a_non_loopback_bind_with_a_limited_allow_runs(tmp_path):
     assert _check(tmp_path, _config(bind=LAN, allow=["192.168.1.0/24"])) is None
 
 
-# --- capability の優先順位 --------------------------------------------------------------
+# --- unrestricted と basic は起動できる (C 表の basic と無制限も通す版の行) ----------------------------------
 
 @pytest.mark.parametrize("bind", [None, LAN])
-def test_a_singleton_unrestricted_allow_is_not_supported(tmp_path, bind):
-    """M-T1-CAP-UNRESTRICTED: T1 で singleton unrestricted を通す変異は落ちる。"""
-    lookup = Lookup(fail=True)
-    assert _check(tmp_path, _config(bind=bind, allow=["0.0.0.0/0"]), lookup) == (
-        "unrestricted_not_supported")
-    assert lookup.calls == 0
+def test_a_singleton_unrestricted_allow_runs_with_none(tmp_path, bind):
+    assert _check(tmp_path, _config(bind=bind, allow=["0.0.0.0/0"]), Lookup(LAN)) is None
 
 
 @pytest.mark.parametrize("bind", [None, LAN])
-def test_basic_auth_is_not_supported(tmp_path, bind):
-    """M-T1-CAP-BASIC: T1 で basic を通す変異は落ちる。"""
-    lookup = Lookup(fail=True)
-    assert _check(tmp_path, _config(bind=bind, allow=["192.168.1.0/24"], auth="basic"),
-                  lookup) == "auth_not_supported"
-    assert lookup.calls == 0
+@pytest.mark.parametrize("allow", [["192.168.1.0/24"], ["0.0.0.0/0"]])
+def test_basic_runs_with_a_safe_password(tmp_path, bind, allow):
+    _password(_secret_dir(tmp_path))
+    assert _check(tmp_path, _config(bind=bind, allow=allow, auth="basic"), Lookup(LAN)) is None
 
 
-def test_unrestricted_comes_before_basic(tmp_path):
-    config = _config(bind=LAN, allow=["0.0.0.0/0"], auth="basic")
-    assert _check(tmp_path, config) == "unrestricted_not_supported"
+def test_basic_without_a_secret_dir_or_password_is_secret_missing(tmp_path):
+    config = _config(allow=["192.168.1.0/24"], auth="basic")
+    assert _check(tmp_path, config) == "secret_missing"
+    _secret_dir(tmp_path)
+    assert _check(tmp_path, config) == "secret_missing"
 
 
-def test_allow_required_comes_before_the_capability_checks(tmp_path):
+def test_allow_required_comes_before_the_secret_checks(tmp_path):
     assert _check(tmp_path, _config(bind=LAN, auth="basic")) == "allow_required"
 
 
-def test_capability_checks_come_before_the_secret_check(tmp_path):
+def test_interface_checks_come_before_the_secret_check(tmp_path):
     _password(_secret_dir(tmp_path))
     (tmp_path / "ops" / "secret" / "stray").write_text("x")
-    assert _check(tmp_path, _config(allow=["0.0.0.0/0"])) == "unrestricted_not_supported"
-    assert _check(tmp_path, _config(auth="basic")) == "auth_not_supported"
+    config = _config(bind=LAN, allow=["0.0.0.0/0"], auth="basic")
+    assert _check(tmp_path, config, Lookup(fail=True)) == "interface_lookup_failed"
+    assert _check(tmp_path, config, Lookup("10.9.9.9")) == "bind_not_local"
+    assert _check(tmp_path, config, Lookup(LAN)) == "secret_invalid"
 
 
 # --- AC-1: interface の実在 --------------------------------------------------------------
@@ -337,7 +335,7 @@ def test_no_fd_is_left_open_on_any_failure(tmp_path):
     (directory / "stray").write_text("x")
     before = _fds()
     assert _check(tmp_path, _config()) == "secret_invalid"
-    assert _check(tmp_path, _config(allow=["0.0.0.0/0"])) == "unrestricted_not_supported"
+    assert _check(tmp_path, _config(allow=["0.0.0.0/0"], auth="basic")) == "secret_invalid"
     assert _fds() == before
 
 

@@ -1,15 +1,15 @@
 ---
 id: web-lan-access-bind-allow-auth
 title: 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定)
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-23
-closed: null
+closed: 2026-10-24
 related: [ops-ui, web-ui-charts-equity-indicators]
 ---
 # [web-lan-access-bind-allow-auth] 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定)
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -23,9 +23,12 @@ related: [ops-ui, web-ui-charts-equity-indicators]
 
 ## 修正内容
 
+- 2026-10-24: 設計書 2026-10-23-web-lan-access-design.md v0.9e。T1 (bind / allow / Host / probe / bounded interface 列挙、main 2c32a89) + T2a (afx-ops: Basic 認証、rate limit、web.password 読取り) + T2b (本体: ウィザード、--ask、非対話入力、staged 前に完結する enable 前処理、status の公開範囲行、afx に触れない reconfigure と別名 reconf、disable の setup lock、運用文書) + 統合 (fixture を 1 列に統一し 4 入口同一 oracle、実 afx-ops の probe / interfaces / READY / Basic 200・401・429 / 非対話 enable の統合 test)。レビュー: codex r1 ×4、/code-review high ×3、閉鎖確認 ×7 (opus / terra)。判定 本体 2287 / afx-ops 2880 green。既定は localhost / 認証なしのまま、LAN 公開は利用者が afx ops web enable --ask か reconfigure で選ぶ。残余: probe 子 process の XDG_CONFIG_HOME (別チケット)
+
 ## 経緯
 
 - 2026-10-23: 起票。
 - 2026-10-23: 状態: 設計待ち — C0 を sol に下書きさせ、sol レビュー → ユーザー確認の順
 - 2026-10-24: 状態: 実装待ち — 設計書 docs/superpowers/specs/2026-10-23-web-lan-access-design.md v0.9 で収束 (設計レビュー 6 周 + 差分閉鎖確認 3 周、ユーザー裁定 C' = enable 時の要約 + 1 問、afx に触れない reconfigure は T2、コマンド階層 afx ops <feature> <verb>、reconfigure + 別名 reconf)。T1 (bind + allow + Host + probe + 残骸検査、afx-ops と ops_setup writer) → T2 (auth + rate limit + ウィザード + reconfigure) の順で実装
 - 2026-10-24: 状態: 実装中 — T1 (bind + allow + Host 検査 + probe + bounded interface 列挙 + none の secret 残骸検査 + 本体 writer の web 4 key) を実装。codex r1 Medium 3 / /code-review high 8 件 / 閉鎖確認 2 周を是正して merge。設計書 v0.9a (接続単位 errno 11 種を続行、accept_failed に rc 74、reply 形不一致は 502)。判定: afx-ops 2716 / 本体 10717 + 1054 + 398 green。残り T2 (Basic 認証、rate limit、ウィザード、--ask、status、reconfigure、運用文書)
+- 2026-10-24: 是正内容 — 設計書 2026-10-23-web-lan-access-design.md v0.9e。T1 (bind / allow / Host / probe / bounded interface 列挙、main 2c32a89) + T2a (afx-ops: Basic 認証、rate limit、web.password 読取り) + T2b (本体: ウィザード、--ask、非対話入力、staged 前に完結する enable 前処理、status の公開範囲行、afx に触れない reconfigure と別名 reconf、disable の setup lock、運用文書) + 統合 (fixture を 1 列に統一し 4 入口同一 oracle、実 afx-ops の probe / interfaces / READY / Basic 200・401・429 / 非対話 enable の統合 test)。レビュー: codex r1 ×4、/code-review high ×3、閉鎖確認 ×7 (opus / terra)。判定 本体 2287 / afx-ops 2880 green。既定は localhost / 認証なしのまま、LAN 公開は利用者が afx ops web enable --ask か reconfigure で選ぶ。残余: probe 子 process の XDG_CONFIG_HOME (別チケット)

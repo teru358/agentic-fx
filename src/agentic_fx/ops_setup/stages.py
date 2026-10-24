@@ -17,11 +17,13 @@ from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store.enroll_marker import ENROLL_IN_PROGRESS, EXIT_ENROLL_IN_PROGRESS, enroll_marker_path
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 
-from .feature_config import collect
+from . import interfaces as interface_listing
+from .feature_config import InterfaceLookupFailed, collect, web_access_reason
 from .probe import run_probe
 from .systemd import Systemd, SystemdError
 from .units import (OpsExecNotFound, UnitPaths, atomic_write, install_units, remove_durably,
                     resolve_ops_exec, uninstall_feature, units_match)
+from .web_setup import access_line
 
 
 _FEATURE_PRINCIPALS = {
@@ -45,6 +47,7 @@ class SystemdPort(Protocol):
     def stop(self, unit: str) -> None: ...
     def start(self, unit: str) -> None: ...
     def ensure_active(self, unit: str) -> None: ...
+    def reset_failed(self, unit: str) -> None: ...
     def is_active(self, unit: str) -> bool: ...
     def is_stopped(self, unit: str) -> bool: ...
     def daemon_reload(self) -> None: ...
@@ -176,8 +179,10 @@ class OpsSetup:
     def __init__(self, root: Path, *, systemd: SystemdPort | None = None,
                  paths: UnitPaths | None = None, ready: Callable[[str], bool] | None = None,
                  hook: Hook = _noop, config_check: Callable[[Path, str], bool] | None = None,
-                 probe: Callable[[str, str], tuple[int, str]] | None = None) -> None:
+                 probe: Callable[[str, str], tuple[int, str]] | None = None,
+                 access_check: Callable[[], str | None] | None = None) -> None:
         self.root = Path(root)
+        self.access_check = self._web_access_reason if access_check is None else access_check
         self.config_check = _config_complete if config_check is None else config_check
         self.probe = run_probe if probe is None else probe
         self.systemd = Systemd() if systemd is None else systemd
@@ -188,6 +193,17 @@ class OpsSetup:
         # 記録済みの OSError を持つ。
         self._current: dict[str, Any] | None = None
         self._recorded: BaseException | None = None
+
+    def _interface_addresses(self) -> list[str]:
+        try:
+            ops_exec = resolve_ops_exec(self.paths).ops_exec
+        except OpsExecNotFound:
+            raise InterfaceLookupFailed from None
+        return [item.address for item in interface_listing.list_interfaces(str(ops_exec))]
+
+    def _web_access_reason(self) -> str | None:
+        """web の live 設定の最終 reason (許可なら None)。副作用なし。port の bind はしない。"""
+        return web_access_reason(self.root, interfaces=self._interface_addresses)
 
     def _before(self, name: str) -> None:
         self.hook(f"before_{name}")
@@ -355,6 +371,10 @@ class OpsSetup:
             # 場合もあるので、enable 前の記録ではなく今の afx の姿で決め、記録もそれに合わせる。
             afx_now = self.systemd.show(self.paths.afx_unit, "ActiveState")["ActiveState"]
             if afx_now in _AFX_RUNNING and not self.systemd.is_active(self._unit_name(feature)):
+                if feature == "web" and self.access_check() is not None:
+                    # 中断した reconfigure の中間の組や壊れた設定のまま afx を止めて起動し直さない。
+                    # stage file には書かない (巻戻しの記録を作らない)。
+                    raise InvalidState("invalid_state", "afx ops web reconfigure を再実行する")
                 state["afx_before_stop"] = afx_now
                 return "installed"
             return stage
@@ -690,6 +710,11 @@ class OpsSetup:
         warn = f" warn={saved['warn']}" if saved and saved.get("warn") else ""
         return f"{feature}: {result.operation} {result.stage}{failure} {observed}{waiting}{warn}{left}"
 
+    def web_access_line(self) -> str:
+        """`afx ops web status` の公開範囲 1 行。stage を先に読み、共有 reader の最終 reason をそのまま出す。"""
+        return access_line(self.root, read_stage(self.root, "web", missing_ok=True),
+                           interfaces=self._interface_addresses)
+
     def status(self, feature: str) -> StageResult:
         if feature not in _FEATURE_PRINCIPALS:
             raise ValueError("unknown_feature")
@@ -705,6 +730,7 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
     try:
         result = getattr(setup, action)(feature)
         line = setup.status_line(feature) if action == "status" else None
+        access = setup.web_access_line() if action == "status" and feature == "web" else None
     except (InvalidState, SystemdError, KeySetError, OSError, ValueError) as error:
         reason = getattr(error, "reason", None) or getattr(error, "code", None) or str(error)
         detail = getattr(error, "detail", "")
@@ -712,6 +738,8 @@ def run_ops_command(root: Path, action: str, feature: str) -> int:
         return 1
     if action == "status":
         print(line)
+        if access is not None:
+            print(access)
         open_ops = deploy_store.count_open_readonly(root / "data" / "agentic.db")
         if open_ops:
             print(f"配備操作が未完了: {open_ops} 件 (afx plugin versions <name>)")

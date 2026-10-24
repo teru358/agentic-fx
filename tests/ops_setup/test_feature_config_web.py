@@ -2,7 +2,7 @@
 
 reader の最終 reason は afx-ops の起動 / probe と同じ決定木で、期待値は
 `afx-ops/tests/fixtures/web_access_matrix.json` (afx-ops の試験が仕様の 2 表から機械生成する)
-を共有する。
+の `expected` 1 列を、afx-ops の 3 入口と共有する。
 """
 from __future__ import annotations
 
@@ -263,6 +263,14 @@ def test_the_body_reader_returns_the_same_final_reason_as_afx_ops(row, root, xdg
     _build(row, root, xdg, monkeypatch)
     got = web_access_reason(root, interfaces=_lookup_for(row["interfaces"], LAN))
     assert got == row["expected"]
+
+
+def test_the_two_capability_gates_are_open_in_the_body_reader(root, xdg):
+    write_inputs(root, "web", {"port": 8788, "allow": ["0.0.0.0/0"]})
+    assert web_access_reason(root) is None
+    from agentic_fx.ops_setup.web_setup import SecretPlan, apply_target
+    apply_target(root, {"port": 8788, "auth": "basic"}, SecretPlan("install", "A" * 22))
+    assert web_access_reason(root) is None
 
 
 def test_an_unset_interface_provider_is_a_lookup_failure_only_for_a_non_loopback_bind(root, xdg):

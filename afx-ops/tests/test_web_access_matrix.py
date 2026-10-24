@@ -24,6 +24,7 @@ from afx_ops.config import ConfigError, read_config
 from afx_ops.isolation import startup
 
 ROWS = matrix.rows()
+EXPECTED = {row["id"]: row["expected"] for row in ROWS}
 ABSENT = "192.168.77.5"
 OTHER = "192.168.1.99"
 
@@ -116,12 +117,11 @@ def _as_other_uid(monkeypatch, dirs, row: dict) -> None:
 
 
 _BEFORE_ENUMERATION = frozenset({
-    None, "config_dir_missing", "config_dir_invalid", "config_invalid", "allow_required",
-    "unrestricted_not_supported", "auth_not_supported"})
+    None, "config_dir_missing", "config_dir_invalid", "config_invalid", "allow_required"})
 
 
 def _check_called(row: dict, marker: Path) -> None:
-    if row["interfaces"] == "na" or (row["expected"] in _BEFORE_ENUMERATION - {None}):
+    if row["interfaces"] == "na" or (EXPECTED[row["id"]] in _BEFORE_ENUMERATION - {None}):
         assert not marker.exists(), "列挙に進まない入力で interface を列挙した"
 
 
@@ -145,9 +145,10 @@ def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
     assert {(r["bind"], r["allow"], r["auth"], r["secret"]) for r in c} == {
         (b, a, u, s) for b in matrix.BINDS for a in matrix.ALLOWS for u in matrix.AUTHS
         for s in matrix.SECRETS}
-    assert {row["expected"] for row in c} == {
-        None, "allow_required", "unrestricted_not_supported", "auth_not_supported",
-        "interface_lookup_failed", "bind_not_local", "secret_invalid", "secret_unexpected"}
+    assert {EXPECTED[row["id"]] for row in c} == {
+        None, "allow_required", "interface_lookup_failed", "bind_not_local", "secret_invalid",
+        "secret_missing", "secret_unexpected"}
+    assert all("expected_t2" not in row for row in ROWS)
     # 必須 fixture
     for needed in ("G5-bind-leading-space", "G7-auth-capital", "G3b-unknown-key",
                    "G4-port-bool", "G6-allow-ipv6", "G6-allow-empty-list",
@@ -160,13 +161,23 @@ def test_the_generator_covers_every_grammar_class_and_the_full_cross_product():
 
 def test_each_row_has_exactly_one_expected_final_result():
     for row in ROWS:
-        assert row["expected"] is None or isinstance(row["expected"], str)
-    # 表の先行行が後続行に勝つ: 無制限は secret や bind の状態によらず C2
+        assert EXPECTED[row["id"]] is None or isinstance(EXPECTED[row["id"]], str)
+        assert "expected_t2" not in row
+    # 表の先行行が後続行に勝つ: 非 loopback の allow 省略は C1 が先
     for row in ROWS:
-        if row["group"] == "C" and row["allow"] == "unrestricted" and row["bind"] != "failed":
-            expected = "unrestricted_not_supported"
-            if row["bind"] in ("local", "absent"):
-                assert row["expected"] == expected, row["id"]
+        if row["group"] == "C" and row["bind"] != "loopback" and row["allow"] == "omitted":
+            assert EXPECTED[row["id"]] == "allow_required", row["id"]
+
+
+def test_the_basic_rows_of_the_cross_product_match_the_t2_table():
+    basic = [row for row in ROWS if row["group"] == "C" and row["auth"] == "basic"
+             and row["bind"] in ("loopback", "local")
+             and not (row["bind"] == "local" and row["allow"] == "omitted")]
+    assert len(basic) == 3 * 4 + 2 * 4
+    for row in basic:
+        want = {"none": "secret_missing", "empty_dir": "secret_missing", "safe": None,
+                "unsafe": "secret_invalid"}[row["secret"]]
+        assert EXPECTED[row["id"]] == want, row["id"]
 
 
 # --- 入口 1: config (read_config + 起動と同じ検査) -----------------------------------------
@@ -197,7 +208,7 @@ def test_config_entry_reason(row, home, ops_dirs, monkeypatch, tmp_path, local_a
     _build(ops_dirs("web"), row, root="/srv/afx-matrix", keys="/srv/afx-matrix-keys", port=_free_port(),
            local=local_address)
     _as_other_uid(monkeypatch, ops_dirs("web"), row)
-    assert _config_reason(monkeypatch, row, local_address, tmp_path) == row["expected"]
+    assert _config_reason(monkeypatch, row, local_address, tmp_path) == EXPECTED[row["id"]]
 
 
 # --- 入口 2: probe ------------------------------------------------------------------------
@@ -214,10 +225,10 @@ def test_probe_entry_reason(row, home, ops_dirs, monkeypatch, tmp_path, capsys, 
     out, err = capsys.readouterr()
     assert out == ""
     _check_called(row, marker)
-    if row["expected"] is None:
+    if EXPECTED[row["id"]] is None:
         assert (rc, err) == (0, "")
     else:
-        assert (rc, err) == (71, f"afx-ops: {row['expected']}\n")
+        assert (rc, err) == (71, f"afx-ops: {EXPECTED[row['id']]}\n")
 
 
 # --- 入口 3: production (実 process、隔離まで通す) -------------------------------------------
@@ -237,9 +248,9 @@ def test_production_entry_reason(row, home, ops_dirs, tmp_path, local_address):
                       "op": "config_view", "params": {}, "fake_ip": script,
                       "foreign_owner": row.get("ops_toml") == "other_uid"}, env)
     _check_called(row, marker)
-    if row["expected"] is None:
+    if EXPECTED[row["id"]] is None:
         assert got.rc == 0 and got.isolated, got.stderr[-1500:]
         assert got.stderr == ""
     else:
         assert got.rc == 71 and not got.isolated, got.stdout + got.stderr
-        assert got.stderr == f"afx-ops: {row['expected']}\n"
+        assert got.stderr == f"afx-ops: {EXPECTED[row['id']]}\n"

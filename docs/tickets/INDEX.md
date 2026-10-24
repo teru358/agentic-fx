@@ -1,14 +1,13 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 130 件。完了分は closed/。
+未完了: 129 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
-| [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
 
 ## 実装待ち (11)
 

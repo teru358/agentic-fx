@@ -529,6 +529,7 @@ def render_activity(data: Mapping[str, object]) -> bytes:
 
 
 def render_error(status: int) -> bytes:
-    labels = {400: "Bad request", 404: "Not found", 405: "Method not allowed", 413: "Request too large",
+    labels = {400: "Bad request", 401: "Authentication required", 404: "Not found",
+              405: "Method not allowed", 413: "Request too large", 429: "Too many attempts",
               502: "Service unavailable"}
     return _page(labels.get(status, "Error"), "")

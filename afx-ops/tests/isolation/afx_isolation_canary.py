@@ -35,6 +35,8 @@ spec:
          p.orig へ退け、p を q への symlink に置き換える (検査と規則の間の差し替え)
   toml: 真なら web の設定を起動口と同じ `read_config` で XDG の ops.toml から読み、その
          port / bind / auth で plan を作る (設定の違反は起動口と同じ固定 reason で止まる)
+  web_auth: web の auth (none | basic)。basic は plan の必須 secret が `web.password` になり、
+         設定の auth も basic になる (secret dir に安全な password を置く)
   foreign_owner: 真なら ops.toml の所有者として期待する uid を実 uid と別の値にする
          (他 uid の file を実 process で作れないための再現)
   fake_ip: interface 列挙に使う実行 file の path を差し替える
@@ -665,7 +667,8 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
     plan_kind = spec.get("plan", "test")
     if plan_kind != "test":
         plan = startup.StartupPlan.for_feature(feature, web_port=spec.get("web_port", 0),
-                                               web_bind=spec.get("web_bind", "127.0.0.1"))
+                                               web_bind=spec.get("web_bind", "127.0.0.1"),
+                                               web_auth=spec.get("web_auth", "none"))
         if plan_kind.startswith("widen:"):
             import dataclasses
             field = plan_kind.split(":", 1)[1]
@@ -683,7 +686,8 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
     if spec.get("dirs") == "xdg":
         # 領域と secret は production と同じ XDG の配置 (環境変数で一時領域へ向ける)
         return test_plan(feature, web_port=spec.get("web_port", 0),
-                         web_bind=spec.get("web_bind", "127.0.0.1")), check_feature_only
+                         web_bind=spec.get("web_bind", "127.0.0.1"),
+                         web_auth=spec.get("web_auth", "none")), check_feature_only
     params = spec.get("params", {})
     ports = params.get("connect_ports")
     return test_plan(
@@ -691,6 +695,7 @@ def _plan(spec: dict) -> tuple[startup.StartupPlan, object]:
         secret_dir=root / feature / "secret",
         web_port=spec.get("web_port", 0) if feature == "web" else None,
         web_bind=spec.get("web_bind", "127.0.0.1"),
+        web_auth=spec.get("web_auth", "none"),
         connect_ports=tuple(ports) if ports is not None else None,
         check_unit=bool(spec.get("unit")),
         require_notify=bool(spec.get("require_notify"))), check_feature_only
@@ -704,6 +709,8 @@ def _config(spec: dict) -> OpsConfig:
         extra["port"] = spec.get("web_port", 0)
         if "web_bind" in spec:
             extra["bind"] = spec["web_bind"]
+        if "web_auth" in spec:
+            extra["auth"] = spec["web_auth"]
         if "web_allow" in spec:
             import ipaddress
             extra["allow"] = tuple(ipaddress.IPv4Network(item) for item in spec["web_allow"])
