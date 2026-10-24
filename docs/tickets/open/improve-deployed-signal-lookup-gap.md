@@ -1,7 +1,7 @@
 ---
 id: improve-deployed-signal-lookup-gap
 title: 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ
-status: 設計待ち
+status: 実装待ち
 priority: 中
 opened: 2026-10-24
 closed: null
@@ -9,7 +9,7 @@ related: [improve-context-family-attempt-summary]
 ---
 # [improve-deployed-signal-lookup-gap] 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装待ち / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ get_signals は取引判断 loop 専用で改善ループには IMPROVE_FORBIDDE
 ## 経緯
 
 - 2026-10-24: 起票。
+- 2026-10-24: 状態: 実装待ち — 同 spec §4 で案 (a) = prompt で不在と理由を明示、新 tool なし。T2 (小) が本チケット。2 周続いて言及が残れば案 (b) を再検討

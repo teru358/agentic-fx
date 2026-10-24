@@ -1,7 +1,7 @@
 ---
 id: improve-context-family-attempt-summary
 title: 改善 prompt に仮説族ごとの試行回数と結果区分を渡す
-status: 設計待ち
+status: 実装待ち
 priority: 高
 opened: 2026-10-24
 closed: null
@@ -9,7 +9,7 @@ related: [improve-objective-filtered-signal-quality, improve-new-candidate-metri
 ---
 # [improve-context-family-attempt-summary] 改善 prompt に仮説族ごとの試行回数と結果区分を渡す
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 実装待ち / **優先**: 高
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-objective-filtered-signal-quality, improve-new-candidate-metri
 ## 経緯
 
 - 2026-10-24: 起票。
+- 2026-10-24: 状態: 実装待ち — 設計書 docs/superpowers/specs/2026-10-24-improve-feedback-structure-design.md v0.3a で収束 (C0 + 2 周 + 閉鎖確認)、2026-10-24 ユーザー承認。T1 (中) が本チケット
