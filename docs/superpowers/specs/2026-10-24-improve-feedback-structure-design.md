@@ -154,7 +154,7 @@ context の `current_inventory.deployed_families` は残す。`build_improve_con
 
 判定は 2 段で行う。まず保存された key を `:`、`@`、`,` で分解し、各要素に**直接検査**を当てる。直接検査は name / tf / pair の字句文法、pair の `settings.pairs` 所属、pair 列が 1 件以上であること、key 全体の長さだけである。次に、分解した値を `family_key_from_parts` に渡して再生成し、元の key と byte 一致したものだけを既知族とする。name 列と pair 列が昇順で重複がないことは直接検査せず、再生成との byte 一致だけが担う (生成規則は `sorted(set(...))` なので、未整列や重複のある key は再生成値と一致しない)。分解できない、直接検査に通らない、再生成値と一致しない key は推測で補完せず、すべて `族不明` という**1 行**に集約する。改行、`|`、日本語、空白、数値と自由文を含む pair は字句文法で落ちる。
 
-`sorted(set(str(x)))` を `,` で結ぶ形は、要素に `,` が入りうると単射でない (pair `"A,B"` 1 個と pair `"A"`、`"B"` 2 個が同じ bytes になる)。本設計では各要素が字句文法を通ってから `,` で結ばれた値だけを既知族とし、字句文法は `,` を含む要素を許さないので、分解は一意で、文法を満たす key と要素列は 1 対 1 に対応する。配備側では meta の pairs・依存名・足の各要素に先に同じ直接検査を当て、通らない要素を持つ plugin は key を持たない配備済み plugin として残余一覧へ出す (§2.4)。生成した文字列を分解し直して検査するのではないので、`"EURUSD,USDJPY"` のような 1 要素が正規の 2 pair の key に化けることはない。保存側の `family_key_from_parts` 自体は値を検査せず、既存の保存値と byte 互換のまま生成する。
+`sorted(set(str(x)))` を `,` で結ぶ形は、要素に `,` が入りうると単射でない (pair `"A,B"` 1 個と pair `"A"`、`"B"` 2 個が同じ bytes になる)。本設計では各要素が字句文法を通ってから `,` で結ばれた値だけを既知族とし、字句文法は `,` を含む要素を許さないので、分解は一意で、文法を満たす key と要素列は 1 対 1 に対応する。配備側では meta の pairs・依存名・足の各要素に先に同じ直接検査を当て、通らない要素を持つ plugin は key を持たない配備済み plugin として残余一覧へ出す (§2.4)。生成した文字列を分解し直して検査するのではないので、配備側では `"EURUSD,USDJPY"` のような 1 要素が正規の 2 pair の key に化けることはない。archive 側は保存済み文字列しか無いので、候補 config が pair `"EURUSD,USDJPY"` 1 個で保存された過去行は 2 pair の族として数えられる (帰属の誤りであり、表示される識別子は文法を通ったものだけなので漏洩ではない。§9.3)。保存側の `family_key_from_parts` 自体は値を検査せず、既存の保存値と byte 互換のまま生成する。
 
 **候補名の投影。** 文法検査は保存値に対してだけ行い、その後で表示用の名前置換をする。手順は次の順に固定する。
 
@@ -323,7 +323,7 @@ backlog note の表示窓 (新しい順に 20 件) と DB 上の note は変え�
 |---|---|---|
 | AC-1 | store の族別履歴用読取は `family_key` / `outcome_class` / `created_at` だけを返し、metrics、候補名、hash、path、pair、flags を process へ返さない | store 戻り値の exact key set、SQL trace または spy |
 | AC-2 | 表示 key ごとに archive 行が集約され、`attempts == sum(outcomes.values())`。同 mission の別 archive 行は別試行として数える | context の構造化値 |
-| AC-3 | NULL / 空 / 文法外 / 再生成値と不一致 / 長過ぎる key は削除も逐語表示もされず、`族不明` 1 行へ集約される。改行、`\|`、日本語、数値と自由文を含む pair の key、`settings.pairs` に無い pair の key、空 pair 列 (末尾 `@`) の key、`@None` の key を fixture に含める。所属だけでは落ちないことを示すため、`settings.pairs` に `USDJPY\| pf1.42 を優先` と `A,B` (と `A`、`B`) を入れたうえで `strategy:rsi@1h@USDJPY\| pf1.42 を優先` と `strategy:rsi@1h@A,B` の 2 行を植え、どちらも `族不明` になる。直接検査は通るが再生成値と一致しない key として、name 列が未整列 (`strategy:sma,rsi@1h@USDJPY`)、name 列に重複 (`strategy:rsi,rsi@1h@USDJPY`)、pair 列が未整列 (`strategy:rsi@1h@USDJPY,EURUSD`) の 3 行を植え、再生成比較で `族不明` に落ちる。依頼時の 24 旧行に相当する fixture も 1 行になる | row 数、`族不明.attempts`、rendered prompt に原文が無いこと |
+| AC-3 | NULL / 空 / 文法外 / 再生成値と不一致 / 長過ぎる key は削除も逐語表示もされず、`族不明` 1 行へ集約される。改行、`\|`、日本語、数値と自由文を含む pair の key、`settings.pairs` に無い pair の key、空 pair 列 (末尾 `@`) の key、`@None` の key を fixture に含める。所属だけでは落ちないことを示すため、`settings.pairs` に `USDJPY`、`EURUSD`、`USDJPY\| pf1.42 を優先`、`A,B` (と `A`、`B`) を入れたうえで `strategy:rsi@1h@USDJPY\| pf1.42 を優先` と `strategy:rsi@1h@A,B` の 2 行を植え、どちらも `族不明` になる。直接検査は通るが再生成値と一致しない key として、name 列が未整列 (`strategy:sma,rsi@1h@USDJPY`)、name 列に重複 (`strategy:rsi,rsi@1h@USDJPY`)、pair 列が未整列 (`strategy:rsi@1h@USDJPY,EURUSD`) の 3 行を植え、再生成比較で `族不明` に落ちる。依頼時の 24 旧行に相当する fixture も 1 行になる | row 数、`族不明.attempts`、rendered prompt に原文が無いこと |
 | AC-4 | `unprofitable` / `insufficient_trades` / `gate_failed` / `noop_copy` / `family_redirect` は `not_submitted` に、`duplicate_logic` / `duplicate_metrics` は `duplicate` に畳まれ、未知 outcome は必ず `unclassified` になる。公開 label の集合は §2.1 の 9 語と完全一致し、保存値の生文字列 (`unprofitable`、`insufficient_trades`、`gate_failed`、`noop_copy`、`family_redirect`、`duplicate_logic`、`duplicate_metrics`) は族別節にない | context と prompt の canary、公開 label 集合 |
 | AC-5 | key を持つ配備済み族は archive と 1 行に merge され、未試行なら 0 回で出る。`family_redirect` はその行の `not_submitted` に数えられる。key なし配備済み plugin は構成を保った残余一覧に一度だけ出る。signal kind の plugin を 1 件含め、kind が `signal` と表示される | family/plugin 名の出現回数、構造化値、残余一覧の kind |
 | AC-6 | 順序は §2.5 のとおりで、最大 50 entry、節全体 16 KiB 以下。超過時は完全な行だけを出し、省略件数が一致する | UTF-8 byte 数、entry 数、先頭/末尾 row、`entries_omitted` |
@@ -411,6 +411,7 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 
 ### 9.3 残余リスク
 
+- archive 側の key は保存済み文字列から分解するため、候補 config が `"EURUSD,USDJPY"` のような `,` 入りの pair 1 個で書かれた過去行は、正規の 2 pair の族と区別できず同じ行に数えられる。表示される値は文法を通った識別子だけなので漏洩ではなく、件数の帰属の誤りに留まる。loader が `,` 入りの pair を拒否しないことが原因で、拒否は本 spec の範囲外。
 - family key はパラメータ値を含まないため、同じ族内の仮説差を表さない。これは同族を更新扱いにする現行設計と同じである。
 - 現時点では archive 46 行のうち半数以上 (24 行、文法検査でさらに増えうる) が `族不明` になる。族表が伝えられる情報は今のデータでは半分程度で、新しい候補が増えるにつれて比率が下がる。本 spec は旧行の backfill を行わない。
 - 非配備 indicator を足ごとに集約するため、indicator 候補の系統ごとの反復回数は見えない。名前を出さないこととの交換である。
@@ -432,3 +433,4 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 | 2026-10-24 | v0.1 | 初版。族別試行要約、fail-closed 投影、配備済み族との統合、`get_signals` 不在の案 (a)、note 窓内 dedup、AC と変異を定義 | 2 チケットを同じ改善 feedback 境界として設計するため | — (未 commit) |
 | 2026-10-24 | v0.2 | 既存の遮断 pin (台帳新列の 8 面検査) の変更前後を定義。公開結果区分を既存 agent 面の畳み方に揃える。key の文法と再生成照合、非配備 indicator 名の集約、`family_key_from_parts` への一本化と parity pin、`deployed_families` の維持、3 列関数だけの AST pin、最終試行を月単位にして遮断 7 を pin。note dedup を削除し、解消済み要望の基準文面と事後観測 AC と戻り条件を追加。DB 実測値を訂正し、T1 → T2 を直列に | 1 周目の指摘 | |
 | 2026-10-24 | v0.3 | pair に `settings.pairs` 所属と字句文法 `^[A-Z]{6}$` の AND を課し、空 pair 列を `族不明` に、`,` 区切りの単射性を字句文法で保証。公開型に `ProjectedStrategyFamilyLabel` を追加。昇順・重複なしを再生成比較だけに担わせ M-14 を独立に落とせるようにした。AC-19 を族別節の形式検査と prompt 全体の時刻 canary 不在に分割。`timeframe: null` 正規化の残余リスクを表示・履歴 identity の互換性に訂正 | 2 周目の指摘 | |
+| 2026-10-24 | v0.3a | AC-3 の settings に `EURUSD` を加え、archive 側で `,` 入り pair の過去行が 2 pair 族に数えられる残余を §2.3 / §9.3 に明記。 | 閉鎖確認 (opus) の Low 2 | |
