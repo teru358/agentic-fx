@@ -187,7 +187,7 @@ def test_loop_errors_print_only_the_exception_type(capsys):
 def test_closing_a_slot_cancels_its_deadline_timer():
     loop = asyncio.new_event_loop()
     try:
-        slot = runtime._Slot(lambda _slot: None)
+        slot = runtime._Slot(lambda _slot: None, "127.0.0.1")
         slot.deadline = loop.call_later(60, lambda: None)
         timer = slot.deadline
         slot.close()

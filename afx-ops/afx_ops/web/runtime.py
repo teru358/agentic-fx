@@ -25,7 +25,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 
 from afx_ops.api_client import HTTP_TIMEOUT, WebClient
 from afx_ops.isolation.accept_loop import AcceptLoop
-from afx_ops.isolation.startup import client_for
+from afx_ops.isolation.startup import WEB_PASSWORD, client_for
+from afx_ops.web.auth import BasicAuthenticator
 from afx_ops.web.headers import response_headers
 from afx_ops.web.render import render_error
 from afx_ops.web.request import (
@@ -34,6 +35,7 @@ from afx_ops.web.request import (
     MAX_REQUEST_LINE,
     HostPolicy,
     handle_request,
+    wire_authorization_values,
 )
 
 # 同時に開いておく接続の上限。超えた接続は受けてすぐ閉じる (fd と memory を有界にする)
@@ -76,9 +78,12 @@ def run(isolated, *, client=None, on_serving: Callable[[], None] | None = None,
     if client is None:
         client = client_for(isolated, WebClient)
     config = isolated.config
+    authenticator = (BasicAuthenticator(isolated.secrets[WEB_PASSWORD])
+                     if config.auth == "basic" else None)
     asyncio.run(_serve(_aiohttp_parts(), isolated.listener, client, on_serving, stop_after,
                        allow=config.web_allow_networks(),
-                       host_policy=HostPolicy(config.web_bind, config.port, config.web_loopback)))
+                       host_policy=HostPolicy(config.web_bind, config.port, config.web_loopback),
+                       authenticator=authenticator))
     return RC_OK
 
 
@@ -112,13 +117,19 @@ class _Slot:
     接続が閉じたとき (切断・期限・abort) は `on_release` を呼ぶ。
     """
 
-    __slots__ = ("transport", "deadline", "on_release", "calls")
+    __slots__ = ("transport", "deadline", "on_release", "calls", "_peer")
 
-    def __init__(self, on_release: Callable[["_Slot"], None]) -> None:
+    def __init__(self, on_release: Callable[["_Slot"], None], peer: str) -> None:
+        self._peer = peer
         self.transport: asyncio.BaseTransport | None = None
         self.deadline: asyncio.TimerHandle | None = None
         self.on_release = on_release
         self.calls: set[_Call] = set()
+
+    @property
+    def peer(self) -> str:
+        """accept 直後に確定した peer の IPv4。認証と rate limit はこの値だけを使う。"""
+        return self._peer
 
     def close(self) -> None:
         if self.deadline is not None:
@@ -142,6 +153,9 @@ def _aiohttp_parts():
             self._received = 0
             # 先頭の header block (終端まで) の wire の bytes。終端が見えたら None にして数えない
             self._head: bytearray | None = bytearray()
+            # header block (終端の空行を除く) の wire の bytes。Authorization を OWS の
+            # 正規化前のまま認証器へ渡すために残す
+            self.wire_head = b""
             # 先頭 5 bytes (method の語)。HEAD への error 応答は本文を持たないので、
             # parser が拒む前の bytes から見分ける
             self._lead: bytearray | None = bytearray()
@@ -180,6 +194,7 @@ def _aiohttp_parts():
             end = self._head.find(b"\r\n\r\n")
             if end < 0:
                 return len(self._head) >= MAX_HEADER_BYTES
+            self.wire_head = bytes(self._head[:end])
             self._head = None
             return end + 4 > MAX_HEADER_BYTES
 
@@ -258,9 +273,11 @@ async def _raw_request(request) -> bytes:
 class _Service:
     def __init__(self, parts, loop: asyncio.AbstractEventLoop, client,
                  executor: ThreadPoolExecutor, stop_after: int | None, *,
-                 host_policy: HostPolicy | None = None) -> None:
+                 host_policy: HostPolicy | None = None,
+                 authenticator: BasicAuthenticator | None = None) -> None:
         server_cls, self._response = parts
         self._host_policy = host_policy
+        self._authenticator = authenticator
         self._loop = loop
         self._client = client
         self._executor = executor
@@ -286,7 +303,8 @@ class _Service:
         call = _Call()
         if slot not in self.slots:
             return self._response(*_closed_reply())
-        call.future = self._executor.submit(self._run, call, raw)
+        authorization = wire_authorization_values(request.protocol.wire_head)
+        call.future = self._executor.submit(self._run, call, raw, slot.peer, authorization)
         slot.calls.add(call)
         self.calls.add(call.future)
         call.future.add_done_callback(self.calls.discard)
@@ -302,7 +320,7 @@ class _Service:
             slot.calls.discard(call)
         return self._response(reply.status, reply.headers, reply.body)
 
-    def _run(self, call: _Call, raw: bytes):
+    def _run(self, call: _Call, raw: bytes, peer: str, authorization: list[str]):
         """worker thread で adapter を回す。取り消された呼出しは daemon への接続ごと切る。"""
         ident = threading.get_ident()
         interrupt = getattr(self._client, "interrupt_thread", None)
@@ -312,7 +330,9 @@ class _Service:
             if call.abandoned and interrupt is not None:
                 interrupt(ident)
         try:
-            return handle_request(raw, self._client, host_policy=self._host_policy)
+            return handle_request(raw, self._client, host_policy=self._host_policy,
+                                  authenticator=self._authenticator, peer=peer,
+                                  authorization=authorization)
         finally:
             with self._calls_lock:
                 call.ident = None
@@ -330,13 +350,13 @@ class _Service:
                 if call.ident is not None and interrupt is not None:
                     interrupt(call.ident)
 
-    def accept(self, conn, _peer: str) -> None:
+    def accept(self, conn, peer: str) -> None:
         # 送信元の判定は accept_loop の allow 照合で完了している
         if len(self.slots) >= MAX_CONNECTIONS:
             self.refused += 1
             conn.close()
             return
-        slot = _Slot(self.released)
+        slot = _Slot(self.released, peer)
         self.slots.add(slot)
         task = self._loop.create_task(self._connect(conn, slot))
         self.tasks.add(task)
@@ -398,11 +418,13 @@ def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
 
 
 async def _serve(parts, listener, client, on_serving, stop_after, *,
-                 allow=None, host_policy: HostPolicy | None = None) -> None:
+                 allow=None, host_policy: HostPolicy | None = None,
+                 authenticator: BasicAuthenticator | None = None) -> None:
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(_loop_error)
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="afx-web")
-    service = _Service(parts, loop, client, executor, stop_after, host_policy=host_policy)
+    service = _Service(parts, loop, client, executor, stop_after, host_policy=host_policy,
+                       authenticator=authenticator)
     acceptor = (AcceptLoop(listener, service.accept) if allow is None
                 else AcceptLoop(listener, service.accept, allow=allow))
     try:

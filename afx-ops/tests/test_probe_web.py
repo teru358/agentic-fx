@@ -118,9 +118,8 @@ def test_a_secondary_address_passes(home, capsys, lan_present):
 
 @pytest.mark.parametrize(("extra", "reason", "rc"), [
     ('bind = "192.168.1.10"\n', "allow_required", 71),
-    ('allow = ["0.0.0.0/0"]\n', "unrestricted_not_supported", 71),
-    ('bind = "192.168.1.10"\nallow = ["0.0.0.0/0"]\n', "unrestricted_not_supported", 71),
-    ('allow = ["127.0.0.1"]\nauth = "basic"\n', "auth_not_supported", 71),
+    ('allow = ["127.0.0.1"]\nauth = "basic"\n', "secret_missing", 71),
+    ('bind = "192.168.1.10"\nallow = ["0.0.0.0/0"]\nauth = "basic"\n', "secret_missing", 71),
     ('allow = ["0.0.0.0/0", "10.0.0.0/8"]\n', "config_invalid", 71),
     ('bind = "192.168.77.5"\nallow = ["10.0.0.0/8"]\n', "bind_not_local", 71),
     ('bind = "0.0.0.0"\nallow = ["10.0.0.0/8"]\n', "config_invalid", 71),

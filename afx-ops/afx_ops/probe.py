@@ -13,7 +13,7 @@
 | 2 | ``unknown_feature`` (起動口が返す) |
 | 69 | ``probe_not_implemented`` |
 | 70 | ``runtime_unavailable`` (表の値を呼べない) |
-| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL) / ``token_invalid`` (bot token の形。想定外の失敗は ``startup_internal_error``)。web は公開範囲の ``allow_required`` / ``unrestricted_not_supported`` / ``auth_not_supported`` / ``interface_lookup_failed`` / ``bind_not_local`` / ``secret_invalid`` / ``secret_missing`` / ``secret_unexpected`` |
+| 71 | ``config_dir_missing`` / ``config_dir_invalid`` / ``config_invalid`` / ``secrets_failed`` / ``url_invalid`` (notify の webhook URL) / ``token_invalid`` (bot token の形。想定外の失敗は ``startup_internal_error``)。web は公開範囲の ``allow_required`` / ``interface_lookup_failed`` / ``bind_not_local`` / ``secret_invalid`` / ``secret_missing`` / ``secret_unexpected`` |
 | 73 | ``probe_bind_failed`` (web) / ``probe_<原因>`` (notify の送信失敗・bot の到達失敗。語は ``afx_ops.notify.probe.REASONS`` / ``afx_ops.bot.probe.REASONS``) |
 """
 from __future__ import annotations
