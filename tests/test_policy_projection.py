@@ -10,8 +10,10 @@ from agentic_fx.policy_projection import (
     _render_directive,
     insert_policy,
     inspect_policy_file,
+    _record_migration,
     reconcile_policy_file,
     regenerate_policy_file,
+    strip_managed_markers,
 )
 from agentic_fx.service import _recover_ops
 
@@ -294,3 +296,91 @@ def test_size_warning_excludes_marker_characters(tmp_path):
 
     assert Policy(path).size_warning(limit_chars=11) is None
     assert Policy(path).size_warning(limit_chars=10) is not None
+
+
+MISMATCHED = (b"<!-- afx:managed-policy id=1 -->\n- A\n"
+              b"<!-- /afx:managed-policy id=2 -->\n")
+
+
+def test_strip_keeps_all_three_lines_of_id_mismatched_block():
+    text = MISMATCHED.decode()
+    assert strip_managed_markers(text) == text
+
+
+def test_strip_removes_only_recognised_marker_lines_and_keeps_line_endings():
+    assert strip_managed_markers(_block(1, "- A").decode()) == "- A\n"
+    assert strip_managed_markers(_block(1, "- A").decode().rstrip("\n")) == "- A"
+    assert strip_managed_markers(_block(1, "- A", crlf=True).decode()) == "- A\r\n"
+    mixed = _block(1, "- A").decode() + "<!-- /afx:managed-policy id=1 -->\nx"
+    assert strip_managed_markers(mixed) == "- A\n<!-- /afx:managed-policy id=1 -->\nx"
+
+
+def test_reconcile_of_id_mismatched_file_changes_neither_bytes_nor_migration(tmp_path):
+    conn = _conn()
+    _policy(conn, "A", "request-1")
+    path = tmp_path / "directives.md"
+    path.write_bytes(MISMATCHED)
+
+    with pytest.raises(ProjectionReconcileBlocked):
+        reconcile_policy_file(conn, path)
+    assert path.read_bytes() == MISMATCHED
+    assert conn.execute("SELECT count(*) FROM data_migrations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("marker", [
+    b"<!-- afx:managed-policy id=0 -->",
+    b"<!-- afx:managed-policy id=03 -->",
+    b" <!-- afx:managed-policy id=3 -->",
+    b"<!-- afx:managed-policy id=3 --> ",
+    b"x<!-- afx:managed-policy id=3 -->",
+])
+def test_non_matching_marker_lines_stay_unmanaged_not_malformed(tmp_path, marker):
+    conn = _conn()
+    _migrated(conn)
+    path = tmp_path / "directives.md"
+    path.write_bytes(marker + b"\n- hand\n")
+
+    assert inspect_policy_file(conn, path).reasons == ()
+    assert reconcile_policy_file(conn, path) is False
+    assert path.read_bytes() == marker + b"\n- hand\n"
+
+
+def test_same_id_set_with_different_columns_is_stale(tmp_path):
+    def status(rows, payload):
+        conn = _conn()
+        for index, text in enumerate(rows):
+            _policy(conn, text, f"request-{index}")
+        _migrated(conn)
+        path = tmp_path / f"{len(list(tmp_path.iterdir()))}.md"
+        path.write_bytes(payload)
+        return inspect_policy_file(conn, path)
+
+    duplicate = status(["A", "B"], _block(1, "- A") + _block(2, "- B") + _block(2, "- B"))
+    changed = status(["A", "B"], _block(1, "- A") + _block(2, "- changed"))
+    reordered = status(["A", "B"], _block(2, "- B") + _block(1, "- A"))
+    assert [duplicate.status, changed.status, reordered.status] == ["stale"] * 3
+    assert duplicate.reasons == ("duplicate",)
+    assert changed.reasons == ("content",)
+    assert reordered.reasons == ("order",)
+
+
+def test_record_migration_twice_keeps_one_row():
+    conn = _conn()
+    _record_migration(conn)
+    _record_migration(conn)
+    assert conn.execute("SELECT count(*) FROM data_migrations").fetchone()[0] == 1
+
+
+def test_regenerate_matches_reconcile_output_bytes(tmp_path):
+    conn = _conn()
+    _policy(conn, "A", "request-1")
+    _policy(conn, "B", "request-2")
+    _migrated(conn)
+    payload = b"intro\n" + _block(2, "- stale") + b"tail"
+    first, second = tmp_path / "a.md", tmp_path / "b.md"
+    first.write_bytes(payload)
+    second.write_bytes(payload)
+
+    regenerate_policy_file(conn, first)
+    reconcile_policy_file(conn, second)
+    assert first.read_bytes() == second.read_bytes()

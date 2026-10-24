@@ -150,20 +150,29 @@ def _replace_if_changed(path: Path, before: bytes | None, candidate: bytes) -> b
     return True
 
 
+def strip_managed_markers(text: str) -> str:
+    """Remove the marker lines of recognised managed blocks, keeping every line ending."""
+    parsed = _parse(text.encode("utf-8"))
+    dropped = {positions[0] for _, _, positions in parsed.blocks}
+    dropped |= {positions[2] for _, _, positions in parsed.blocks}
+    return "\n".join(
+        line.decode("utf-8") for position, line in enumerate(parsed.lines)
+        if position not in dropped
+    )
+
+
+def _candidate(conn, before: bytes | None) -> bytes:
+    parsed = _parse(before or b"")
+    return _compose(_without_blocks(parsed), _canonical(conn))
+
+
 def regenerate_policy_file(conn, path: Path) -> None:
     """Rebuild managed blocks while retaining all non-managed bytes."""
     before = _read(path)
-    parsed = _parse(before or b"")
-    candidate = _compose(_without_blocks(parsed), _canonical(conn))
-    _replace_if_changed(path, before, candidate)
+    _replace_if_changed(path, before, _candidate(conn, before))
 
 
-def inspect_policy_file(conn, path: Path) -> ProjectionStatus:
-    """Compare the file projection with canonical policy rows without writing."""
-    try:
-        before = _read(path)
-    except ProjectionUnreadableError:
-        return ProjectionStatus("stale", ("unreadable",))
+def _inspect_payload(conn, before: bytes | None) -> ProjectionStatus:
     parsed = _parse(before or b"")
     canonical = _canonical(conn)
     actual = [(identifier, _line_view(directive))
@@ -190,44 +199,44 @@ def inspect_policy_file(conn, path: Path) -> ProjectionStatus:
         reasons.append("order")
     return ProjectionStatus("ok" if not reasons else "stale", tuple(reasons))
 
+def inspect_policy_file(conn, path: Path) -> ProjectionStatus:
+    """Compare the file projection with canonical policy rows without writing."""
+    try:
+        before = _read(path)
+    except ProjectionUnreadableError:
+        return ProjectionStatus("stale", ("unreadable",))
+    return _inspect_payload(conn, before)
 
-def _record_migration(conn) -> None:
-    conn.execute("INSERT INTO data_migrations(name,applied_at) VALUES (?,?)",
-                 (_MIGRATION, datetime.now(timezone.utc).isoformat()))
+
+def _record_migration(conn, now=None) -> None:
+    timestamp = (now or datetime.now(timezone.utc)).isoformat()
+    conn.execute(
+        "INSERT INTO data_migrations(name,applied_at) SELECT ?,? "
+        "WHERE NOT EXISTS (SELECT 1 FROM data_migrations WHERE name=?)",
+        (_MIGRATION, timestamp, _MIGRATION))
     conn.commit()
-
-
-def _migrate_legacy_projection(conn, path: Path) -> bool:
-    before = _read(path)
-    parsed = _parse(before or b"")
-    if parsed.malformed:
-        raise ProjectionMalformedError("managed-policy markers are malformed")
-    if _migration_applied(conn):
-        return False
-    if parsed.blocks:
-        _record_migration(conn)
-        return False
-    canonical = _canonical(conn)
-    legacy_owned = {directive for _, directive in canonical}
-    outside = b"\n".join(
-        line for line in parsed.lines if _line_view(line) not in legacy_owned
-    )
-    changed = _replace_if_changed(path, before, _compose(outside, canonical))
-    _record_migration(conn)
-    return changed
 
 
 def reconcile_policy_file(conn, path: Path) -> bool:
     """Migrate legacy directives once, then converge the file to its records."""
-    changed = _migrate_legacy_projection(conn, path)
-    status = inspect_policy_file(conn, path)
-    if status.reasons == ("unreadable",):
-        raise ProjectionUnreadableError("policy projection is unreadable")
-    if "malformed" in status.reasons:
-        raise ProjectionMalformedError("managed-policy markers are malformed")
-    if status.status == "ok":
-        return changed
     before = _read(path)
     parsed = _parse(before or b"")
-    candidate = _compose(_without_blocks(parsed), _canonical(conn))
-    return _replace_if_changed(path, before, candidate) or changed
+    if parsed.malformed:
+        raise ProjectionMalformedError("managed-policy markers are malformed")
+    changed = False
+    current = before
+    if not _migration_applied(conn):
+        if not parsed.blocks:
+            canonical = _canonical(conn)
+            legacy_owned = {directive for _, directive in canonical}
+            outside = b"\n".join(
+                line for line in parsed.lines if _line_view(line) not in legacy_owned
+            )
+            migrated = _compose(outside, canonical)
+            changed = _replace_if_changed(path, before, migrated)
+            if changed:
+                current = migrated
+        _record_migration(conn)
+    if _inspect_payload(conn, current).status == "ok":
+        return changed
+    return _replace_if_changed(path, current, _candidate(conn, current)) or changed
