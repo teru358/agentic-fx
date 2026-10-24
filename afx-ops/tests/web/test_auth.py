@@ -467,58 +467,53 @@ def test_each_journal_kind_stops_after_10_lines_but_counters_continue(clock, cap
     assert a.web_auth_failed_total == 30
 
 
-class _HandshakeSeen(dict):
-    """count を読んだ thread が、もう 1 本の thread にも読む機会を与えてから書く。
+class _LockedSeen(dict):
+    """`_seen` の読みと書きが、その Journal の lock を保持したまま行われることを記録する。
 
-    lock が無ければ 2 本とも同じ count を読んで同じ枠を 2 回使う (決定的に再現)。
-    lock があれば 2 本目は lock で待つので、1 本目の「相手の読み待ち」は時間切れになり、
-    読み書きは直列になる。"""
+    scheduler に依存しない構造的な pin。lock を外した実装では held が False になる。"""
 
-    def __init__(self) -> None:
+    def __init__(self, lock: threading.Lock) -> None:
         super().__init__()
-        self.reads = 0
-        self.first_read = threading.Event()
-        self.second_read = threading.Event()
-        self._state_lock = threading.Lock()
+        self._lock = lock
+        self.held: list[bool] = []
 
     def get(self, key, default=None):  # type: ignore[override]
-        value = super().get(key, default)  # 読んだ値を先に確定させる
-        with self._state_lock:
-            self.reads += 1
-            order = self.reads
-        if order == 1:
-            self.first_read.set()
-            self.second_read.wait(timeout=0.5)
-        elif order == 2:
-            self.second_read.set()
-        return value
+        self.held.append(self._lock.locked())
+        return super().get(key, default)
+
+    def __setitem__(self, key, value) -> None:
+        self.held.append(self._lock.locked())
+        super().__setitem__(key, value)
 
 
-def test_two_racing_failures_reserve_distinct_journal_slots(clock, capsys):
-    """同じ枠を 2 本の thread が同時に取ろうとしても、予約は直列化される。
-    lock を外すと 2 本が count 0 を読んで両方書き、count は 1 で終わる (決定的)。"""
+def test_journal_reads_and_writes_the_sample_count_under_its_lock(clock, capsys):
+    """枠の予約 (count の読み → 書き) は Journal の lock を保持したまま行われ、stderr への
+    書き出しは lock を放してから行われる。scheduler に依存しない構造の pin。"""
     journal = Journal(limit=1)
-    seen = _HandshakeSeen()
+    seen = _LockedSeen(journal._lock)
     journal._seen = seen
     a = auth.BasicAuthenticator(PASSWORD, clock=clock, journal=journal)
-    start = threading.Barrier(2)
-
-    def attempt(i: int) -> None:
-        start.wait()
-        a.authenticate([BAD], f"10.1.{i}.1")
-
-    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
-    assert not any(t.is_alive() for t in threads)
+    a.authenticate([BAD], "10.1.0.1")
+    a.authenticate([BAD], "10.1.0.2")
+    assert seen.held == [True, True, True, True]
     assert seen["web_auth_failed"] == 2
-    assert seen.reads == 2
-    # 2 本目は 1 本目の予約が終わるまで読めなかった (読みの handshake が時間切れ)。
-    assert seen.first_read.is_set() and seen.second_read.is_set()
+    assert not journal._lock.locked()
     assert capsys.readouterr().err.splitlines() == ["afx-ops: web_auth_failed"]
-    assert a.web_auth_failed_total == 2
+
+
+def test_the_journal_does_not_hold_its_lock_while_writing_to_stderr(clock, monkeypatch):
+    journal = Journal(limit=1)
+    held: list[bool] = []
+    from afx_ops.isolation import accept_loop as al
+    real_log = al._log
+
+    def spy_log(text: str) -> None:
+        held.append(journal._lock.locked())
+        real_log(text)
+
+    monkeypatch.setattr(al, "_log", spy_log)
+    journal.sampled("web_auth_failed")
+    assert held == [False]
 
 
 def test_many_concurrent_failures_journal_exactly_the_sample_limit(clock, capsys):
