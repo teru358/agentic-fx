@@ -1,13 +1,12 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 131 件。完了分は closed/。
+未完了: 130 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [improve-context-family-attempt-summary](open/improve-context-family-attempt-summary.md) | 高 | 2026-10-24 | 改善 prompt に仮説族ごとの試行回数と結果区分を渡す |
 | [web-lan-access-bind-allow-auth](open/web-lan-access-bind-allow-auth.md) | 中 | 2026-10-23 | 同梱 web を LAN から見られるようにする (bind / allow / auth の 3 設定) |
 
 ## 実装待ち (12)
