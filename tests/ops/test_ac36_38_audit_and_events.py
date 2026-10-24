@@ -427,8 +427,8 @@ def _seamed_call(env, monkeypatch, code):
     original_reconcile = service_module.reconcile_policy_file
 
     def reconcile_seam(*args, **kwargs):
-        if code == "policy_reconcile":
-            seams("policy_reconcile")
+        if code in ("policy", "policy_remove", "policy_reconcile"):
+            seams(code)
         return original_reconcile(*args, **kwargs)
     monkeypatch.setattr(service_module, "reconcile_policy_file", reconcile_seam)
     original_cancel = service.jobs.cancel
@@ -437,12 +437,9 @@ def _seamed_call(env, monkeypatch, code):
         seams("job_cancel")
         return original_cancel(*args, **kwargs)
     monkeypatch.setattr(service.jobs, "cancel", cancel)
-    # policy と reflection retry の最初の副作用は DB 書込みなので trigger で入口を捕まえる。
+    # policy 系の最初の副作用は action 先頭の reconcile なので、その入口 (上の包み) で捕まえる。
+    # reflection retry の最初の副作用は DB 書込みなので trigger で入口を捕まえる。
     env.conn.create_function("seam", 1, lambda code: seams(code) or 0)
-    env.conn.execute("CREATE TEMP TRIGGER seam_policy_remove BEFORE DELETE ON ops_policies "
-                     "BEGIN SELECT seam('policy_remove'); END")
-    env.conn.execute("CREATE TEMP TRIGGER seam_policy BEFORE INSERT ON ops_policies "
-                     "BEGIN SELECT seam('policy'); END")
     env.conn.execute("CREATE TEMP TRIGGER seam_reflection BEFORE DELETE ON reflection_attempts "
                      "BEGIN SELECT seam('reflection_retry'); END")
     env.conn.commit()

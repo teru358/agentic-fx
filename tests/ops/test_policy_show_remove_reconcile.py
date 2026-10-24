@@ -208,6 +208,22 @@ def test_policy_add_ops_error_after_commit_is_unknown_and_never_inserts_twice(op
     assert "\tpolicy_added\t" not in ops_env.activity_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("signal_type", [KeyboardInterrupt, SystemExit])
+def test_policy_add_interrupt_after_commit_propagates_without_a_terminal_row(ops_env, signal_type):
+    service = ops_env.service()
+
+    def interrupted():
+        raise signal_type()
+
+    service._regenerate_policy = interrupted
+
+    with pytest.raises(signal_type):
+        service.add_policy(OPERATOR, "same-key", "directive")
+
+    assert [(r["phase"], r["result_code"]) for r in ops_env.ops_rows()] == [("accepted", None)]
+    assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+
+
 def test_policy_remove_ops_error_after_commit_is_unknown_and_replays_unknown(ops_env):
     service = ops_env.service()
     service.add_policy(OPERATOR, "seed", "directive")

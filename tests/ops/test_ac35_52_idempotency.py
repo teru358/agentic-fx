@@ -280,6 +280,7 @@ def test_ac35_transient_failure_keeps_the_audit_row_but_the_key_can_be_resent(op
     assert ops_env.conn.execute("SELECT COUNT(*) AS n FROM ops_idempotency").fetchone()["n"] == 0
     reply = service.add_policy(OPERATOR, "retry-key", "risk small")
     assert "id" in reply and calls["n"] == 2
+    assert ops_env.conn.execute("SELECT COUNT(*) AS n FROM ops_policies").fetchone()["n"] == 1
     assert ops_env.conn.execute(
         "SELECT state FROM ops_idempotency").fetchone()["state"] == "succeeded"
 

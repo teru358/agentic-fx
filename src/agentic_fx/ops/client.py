@@ -1246,7 +1246,7 @@ class Runner:
         reasons = projection.get("reasons")
         if status == "ok":
             self.say("投影: ok")
-        elif not isinstance(reasons, list) or not reasons:
+        elif not isinstance(reasons, list) or not any(isinstance(r, str) for r in reasons):
             self.say("投影: stale (unknown)。" + _STALE_ADVICE_DEFAULT)
         else:
             reason_text = ", ".join(_safe_cell(reason, 80) for reason in reasons

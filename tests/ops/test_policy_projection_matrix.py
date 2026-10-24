@@ -67,9 +67,21 @@ def _snapshot(env) -> dict:
         "requests": _table(env, "SELECT * FROM ops_requests ORDER BY id"),
         "idempotency": _table(env, "SELECT * FROM ops_idempotency ORDER BY rowid"),
         "activity_raw": env.activity_path.read_bytes() if env.activity_path.exists() else None,
-        "activity": [line for line in _activity(env).splitlines() if "\tpolicy_" in line],
-        "ops_activity": [line for line in _activity(env).splitlines() if "\tops_" in line],
+        "activity": _activity(env).splitlines(),
     }
+
+
+def _assert_activity_delta(before: dict, after: dict, endpoint: str, result: str,
+                           policy_events: tuple[str, ...] = ()) -> None:
+    """既存の行は不変、増えた行は ops_<endpoint> がちょうど 1 行と期待どおりの policy_* だけ。"""
+    old, new = before["activity"], after["activity"]
+    assert new[:len(old)] == old
+    added = [line.split("\t") for line in new[len(old):]]
+    ops = [fields for fields in added if fields[2].startswith("ops_")]
+    assert len(ops) == 1 and ops[0][2] == f"ops_{endpoint}", added
+    assert ops[0][3].endswith(f" result={result}"), ops[0]
+    assert sorted(fields[2] for fields in added if not fields[2].startswith("ops_")) == sorted(
+        policy_events), added
 
 
 def _phases(env, endpoint: str) -> list[tuple]:
@@ -227,6 +239,22 @@ def test_policy_show_cli_stale_without_a_usable_reason_list_uses_the_generic_sen
         "afx ctl policy reconcile で DB に合わせられます。")
 
 
+@pytest.mark.parametrize("reasons", [[1], [None, {}], ["missing", 1]])
+def test_policy_show_cli_ignores_non_string_reasons(reasons):
+    data = _show_data("d", status="stale")
+    data["projection"]["reasons"] = reasons
+    rc, text = _run_show(data)
+
+    assert rc == 0
+    last = text.splitlines()[-1]
+    if reasons == ["missing", 1]:
+        assert last == ("投影: stale (missing)。Mission に入る方針が DB と一致していません。"
+                        "afx ctl policy reconcile で DB に合わせられます。")
+    else:
+        assert last == ("投影: stale (unknown)。Mission に入る方針が DB と一致していません。"
+                        "afx ctl policy reconcile で DB に合わせられます。")
+
+
 @pytest.mark.parametrize("reasons,advice", [
     (["unreadable"], "policy/directives.md を読める状態 (権限、UTF-8) に直してから "
                      "afx ctl policy reconcile を実行してください。"),
@@ -345,9 +373,9 @@ def test_removing_an_already_removed_id_changes_nothing_but_the_audit_rows(ops_e
 
     after = _snapshot(ops_env)
     assert raised.value.code is ErrorCode.NOT_FOUND
-    for key in ("file", "policies", "migrations", "activity"):
+    for key in ("file", "policies", "migrations"):
         assert after[key] == before[key], key
-    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
+    _assert_activity_delta(before, after, "policy_remove", "not_found")
     assert ops_env.policy_path.stat().st_mtime_ns == mtime
     assert len(after["requests"]) == len(before["requests"]) + 2
 
@@ -444,9 +472,9 @@ def test_remove_refuses_a_file_with_an_unpaired_marker_and_keeps_every_byte(ops_
         service.remove_policy(OPERATOR, "remove-1", 1)
 
     after = _snapshot(ops_env)
-    for key in ("file", "policies", "migrations", "activity"):
+    for key in ("file", "policies", "migrations"):
         assert after[key] == before[key], key
-    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
+    _assert_activity_delta(before, after, "policy_remove", "internal")
     assert _phases(ops_env, REMOVE) == [("accepted", None), ("failed", "internal")]
 
 
@@ -489,6 +517,36 @@ def test_add_that_fails_after_insert_is_unknown_stale_until_the_next_mutation(op
     assert _count(ops_env, "policy_added") == (2 if follow == "add" else 1)
 
 
+@pytest.mark.parametrize("operation", ["add", "remove", "reconcile"])
+def test_outcome_unknown_terminal_still_writes_one_ops_activity_row(ops_env, monkeypatch, operation):
+    service = ops_env.service()
+    if operation == "reconcile":
+        _legacy_pending(ops_env)
+    else:
+        _seed(service, "A")
+    before = _snapshot(ops_env)
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("injected record failure")
+
+    with monkeypatch.context() as patched:
+        if operation == "reconcile":
+            patched.setattr(policy_projection, "_record_migration", refuse)
+        else:
+            patched.setattr(service, "_regenerate_policy", _boom)
+        with pytest.raises(OpsError) as raised:
+            if operation == "add":
+                service.add_policy(OPERATOR, "k", "B")
+            elif operation == "remove":
+                service.remove_policy(OPERATOR, "k", 1)
+            else:
+                service.reconcile_policy(OPERATOR, "k")
+
+    assert raised.value.code is ErrorCode.OUTCOME_UNKNOWN
+    endpoint = {"add": "policy", "remove": "policy_remove", "reconcile": "policy_reconcile"}[operation]
+    _assert_activity_delta(before, _snapshot(ops_env), endpoint, "outcome_unknown")
+
+
 def _break_file(env, how: str) -> None:
     if how == "unreadable":
         _write_unreadable(env.policy_path)
@@ -515,9 +573,10 @@ def test_mutation_with_an_unsafe_file_fails_internal_without_touching_the_databa
             service.remove_policy(OPERATOR, "next", 1)
 
     after = _snapshot(ops_env)
-    for key in ("file", "policies", "migrations", "activity"):
+    for key in ("file", "policies", "migrations"):
         assert after[key] == before[key], key
-    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
+    _assert_activity_delta(before, after, "policy" if operation == "add" else "policy_remove",
+                           "internal")
     endpoint = ADD if operation == "add" else REMOVE
     assert _phases(ops_env, endpoint)[-2:] == [("accepted", None), ("failed", "internal")]
     assert all(row["phase"] != "outcome_unknown" for row in ops_env.ops_rows())
@@ -722,14 +781,14 @@ def test_reconcile_of_an_ok_file_touches_nothing_and_leaves_no_activity(ops_env)
     service = ops_env.service()
     _seed(service, "A")
     stat = ops_env.policy_path.stat()
-    activity = _snapshot(ops_env)["activity"]
+    before = _snapshot(ops_env)
 
     reply = service.reconcile_policy(OPERATOR, "rec-1")
 
     assert reply == {"changed": False, "projection": {"status": "ok", "reasons": []}}
     after = ops_env.policy_path.stat()
     assert (after.st_ino, after.st_mtime_ns) == (stat.st_ino, stat.st_mtime_ns)
-    assert _snapshot(ops_env)["activity"] == activity
+    _assert_activity_delta(before, _snapshot(ops_env), "policy_reconcile", "ok")
     assert _count(ops_env, "policy_reconciled") == 0
     assert _count(ops_env, "ops_policy_reconcile") == 1
     assert _phases(ops_env, RECONCILE) == [("accepted", None), ("succeeded", "ok")]
@@ -769,7 +828,8 @@ def test_reconcile_of_an_unsafe_file_fails_internal_and_keeps_every_byte(ops_env
     after = _snapshot(ops_env)
     assert after["file"] == before["file"]
     assert ops_env.policy_path.stat().st_ino == stat.st_ino
-    assert after["policies"] == before["policies"] and after["activity"] == before["activity"]
+    assert after["policies"] == before["policies"]
+    _assert_activity_delta(before, after, "policy_reconcile", "internal")
     assert _phases(ops_env, RECONCILE) == [("accepted", None), ("failed", "internal")]
     with pytest.raises(OpsError) as replayed:
         service.reconcile_policy(OPERATOR, "rec-1")

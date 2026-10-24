@@ -512,6 +512,9 @@ class OpsService:
                     raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
                 response = action(deadline, accepted)
             except BaseException as exc:
+                if not isinstance(exc, Exception):
+                    # 割り込みは終端行を書かず伝播させる (再起動時の復旧が outcome_unknown にする)。
+                    raise
                 if isinstance(exc, PolicyProjectionUnknown):
                     self._terminal(accepted, caller, endpoint, ErrorCode.OUTCOME_UNKNOWN.value,
                                    _error_response(ErrorCode.OUTCOME_UNKNOWN),
@@ -831,7 +834,7 @@ class OpsService:
             insert_policy(self._conn, text, request_id=request_id, now=self._wall_clock())
             try:
                 self._regenerate_policy()
-            except BaseException as exc:
+            except Exception as exc:
                 raise PolicyProjectionUnknown() from exc
             # 既存運用との互換で、policy_added だけは先頭 200 文字を残す (§8 の例外)。
             self._activity("SYSTEM", "policy_added", text[:200])
@@ -858,7 +861,7 @@ class OpsService:
             self._conn.commit()
             try:
                 self._regenerate_policy()
-            except BaseException as exc:
+            except Exception as exc:
                 raise PolicyProjectionUnknown() from exc
             self._activity("SYSTEM", "policy_removed", f"id={identifier}")
             return {"id": identifier}
