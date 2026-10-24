@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from agentic_fx._safe_error import safe_error_text
+from agentic_fx._safe_error import one_line_error, safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
@@ -24,7 +24,12 @@ from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundErro
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
-from agentic_fx.policy_projection import insert_policy, reconcile_policy_file
+from agentic_fx.policy_projection import (
+    MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy, reconcile_policy_file)
+
+POLICY_TEXT_LIMIT = 4000
+POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
+                       MigrationRecordUnknown)
 
 _HELP = """コマンド一覧:
   status                     残高・モード・kill switch・直近 mission
@@ -52,14 +57,24 @@ class PolicyFileNotReflected(RuntimeError):
 
 
 def add_policy_directive(conn, policy_path: Path, activity: ActivityLog, text: str, now) -> int:
-    """Record a policy, converge its projection, then record the activity event."""
+    """Converge the projection, record a policy, reflect it, then record the activity event.
+
+    Failures before the insert propagate as they are (ValueError for an invalid
+    body); a failure to reflect the committed row raises PolicyFileNotReflected;
+    an activity failure propagates as it is because the file is already reflected.
+    """
     policy_path.parent.mkdir(parents=True, exist_ok=True)
+    reconcile_policy_file(conn, policy_path)
+    if not text.strip():
+        raise ValueError("方針文が空です")
+    if len(text) > POLICY_TEXT_LIMIT:
+        raise ValueError(f"方針文は {POLICY_TEXT_LIMIT} 字以下にしてください")
     identifier = insert_policy(conn, text, request_id=uuid.uuid4().hex, now=now)
     try:
         reconcile_policy_file(conn, policy_path)
-        activity.write(Category.SYSTEM, "policy_added", text[:200])
     except Exception as error:
         raise PolicyFileNotReflected() from error
+    activity.write(Category.SYSTEM, "policy_added", text[:200])
     return identifier
 
 
@@ -431,9 +446,9 @@ class Commands:
                 except PolicyFileNotReflected as error:
                     cause = error.__cause__ or error
                     return ("policy は記録しましたが policy/directives.md へ反映できませんでした "
-                            f"({safe_error_text(cause)})。afx の次回起動時に反映されます。")
-                except (sqlite3.Error, OSError) as error:
-                    return f"policy を書けませんでした ({safe_error_text(error)})"
+                            f"({one_line_error(cause)})。afx の次回起動時に反映されます。")
+                except POLICY_WRITE_ERRORS as error:
+                    return f"policy を書けませんでした ({one_line_error(error)})"
                 return "policy に追記しました"
         except ApprovalNotFoundError:
             # E1 裁定 (2026-08-25): 「ID 不存在」は「CAS 失敗 (決定済み)」と

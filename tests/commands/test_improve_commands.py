@@ -386,10 +386,16 @@ def test_policy_add_fallback_reports_projection_failure(commands, monkeypatch):
     cmds, conn, root = commands
     cmds._policy_path = root / "policy" / "directives.md"
 
-    def fail_reconcile(conn, path):
+    real_reconcile = commands_module.reconcile_policy_file
+    calls = []
+
+    def fail_second_reconcile(conn, path):
+        calls.append(path)
+        if len(calls) == 1:
+            return real_reconcile(conn, path)
         raise OSError("read-only")
 
-    monkeypatch.setattr(commands_module, "reconcile_policy_file", fail_reconcile)
+    monkeypatch.setattr(commands_module, "reconcile_policy_file", fail_second_reconcile)
 
     assert cmds.dispatch("policy add fallback の方針") == (
         "policy は記録しましたが policy/directives.md へ反映できませんでした "
@@ -400,3 +406,58 @@ def test_policy_add_fallback_reports_projection_failure(commands, monkeypatch):
 
 def test_append_policy_directive_is_not_exported():
     assert not hasattr(commands_module, "append_policy_directive")
+
+
+def test_policy_add_fallback_stops_on_malformed_projection_before_insert(commands):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+    cmds._policy_path.parent.mkdir(parents=True, exist_ok=True)
+    cmds._policy_path.write_text("<!-- afx:managed-policy id=1 -->\n- 孤立\n", encoding="utf-8")
+
+    out = cmds.dispatch("policy add 新しい方針")
+
+    assert out.startswith("policy を書けませんでした (")
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("text", ["x" * 4001, "   "])
+def test_policy_add_fallback_rejects_oversized_body_without_row(commands, text):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    out = cmds.dispatch(f"policy add {text}")
+
+    if text.strip():
+        assert out.startswith("policy を書けませんでした (ValueError: ")
+        assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+    else:
+        assert out.startswith("usage: policy add")
+
+
+def test_policy_add_fallback_activity_failure_is_first_sentence_with_row_and_file(commands, monkeypatch):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    def fail_write(self, *args, **kwargs):
+        raise OSError("log full")
+
+    monkeypatch.setattr(ActivityLog, "write", fail_write)
+
+    assert cmds.dispatch("policy add 活動ログが落ちる方針") == "policy を書けませんでした (OSError: log full)"
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+    assert inspect_policy_file(conn, cmds._policy_path).status == "ok"
+
+
+def test_policy_add_fallback_reason_is_one_line_and_at_most_120_chars(commands, monkeypatch):
+    cmds, conn, root = commands
+    cmds._policy_path = root / "policy" / "directives.md"
+
+    def fail_insert(conn, text, *, request_id, now):
+        raise sqlite3.OperationalError("line one\n\n  line two " + "y" * 300)
+
+    monkeypatch.setattr(commands_module, "insert_policy", fail_insert)
+
+    out = cmds.dispatch("policy add 方針")
+    reason = out[len("policy を書けませんでした ("):-1]
+    assert "\n" not in out and len(reason) == 120
+    assert reason.startswith("OperationalError: line one line two ")

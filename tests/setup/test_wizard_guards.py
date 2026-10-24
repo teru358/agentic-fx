@@ -268,10 +268,16 @@ def test_stage12_projection_failure_keeps_record_without_activity(tmp_path, monk
     io = ScriptedWizardIO(["記録済み方針", "should-not-be-asked"])
     answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
 
-    def fail_reconcile(conn, path):
+    real_reconcile = commands_module.reconcile_policy_file
+    calls = []
+
+    def fail_second_reconcile(conn, path):
+        calls.append(path)
+        if len(calls) == 1:
+            return real_reconcile(conn, path)
         raise OSError("read-only")
 
-    monkeypatch.setattr(commands_module, "reconcile_policy_file", fail_reconcile)
+    monkeypatch.setattr(commands_module, "reconcile_policy_file", fail_second_reconcile)
     wizard._stage12(wizard._Session(root, io, deps), answers)
 
     conn = connect(root / "data" / "agentic.db")
@@ -457,3 +463,137 @@ def test_a_settings_file_changed_during_the_questions_stops_before_anything_is_w
     assert set(after) - set(before) <= LOCK_FILES | {"config/settings.yaml"}
     assert not (root / "data" / "agentic.db").exists()
     assert not list((root / "config").glob("settings.yaml.bak-*"))
+
+
+def _stage12_run(tmp_path, inputs, *, prepare=None):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    _stage12_database(root).close()
+    if prepare is not None:
+        prepare(root)
+    io = ScriptedWizardIO(inputs)
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
+    wizard._stage12(wizard._Session(root, io, deps), answers)
+    return root, io
+
+
+def _policy_rows(root):
+    conn = connect(root / "data" / "agentic.db")
+    try:
+        return conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _malform(root):
+    path = wizard.directives_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("<!-- afx:managed-policy id=1 -->\n- 孤立\n", encoding="utf-8")
+
+
+def test_stage12_malformed_projection_stops_before_insert(tmp_path):
+    root, io = _stage12_run(tmp_path, ["新しい方針", "should-not-be-asked"], prepare=_malform)
+
+    assert "警告: 方針文を書けませんでした (" in io.text
+    assert "記録しましたが" not in io.text
+    assert _policy_rows(root) == 0
+    assert io.asked == ["方針文: "]
+
+
+@pytest.mark.parametrize("text", ["x" * 4001, "   \t "])
+def test_stage12_rejects_oversized_or_blank_body_before_insert(tmp_path, text):
+    from agentic_fx.commands import add_policy_directive
+    from agentic_fx.activity import ActivityLog
+    from datetime import datetime
+    root = make_root(tmp_path)
+    _stage12_database(root).close()
+    conn = connect(root / "data" / "agentic.db")
+    with pytest.raises(ValueError):
+        add_policy_directive(conn, wizard.directives_path(root), ActivityLog(root / "logs" / "activity.log"),
+                             text, datetime(2026, 10, 25))
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+    conn.close()
+
+
+def test_stage12_oversized_body_reports_first_sentence_and_adds_no_row(tmp_path):
+    root, io = _stage12_run(tmp_path, ["x" * 4001, "should-not-be-asked"])
+
+    assert "警告: 方針文を書けませんでした (" in io.text
+    assert _policy_rows(root) == 0
+    assert io.asked == ["方針文: "]
+
+
+def test_stage12_activity_failure_keeps_row_and_reflected_file(tmp_path, monkeypatch):
+    from agentic_fx.activity import ActivityLog
+
+    def fail_write(self, *args, **kwargs):
+        raise OSError("log full")
+
+    monkeypatch.setattr(ActivityLog, "write", fail_write)
+    root, io = _stage12_run(tmp_path, ["活動ログが落ちる方針", "should-not-be-asked"])
+
+    assert "警告: 方針文を書けませんでした (OSError: log full)。" in io.text
+    assert "記録しましたが" not in io.text
+    conn = connect(root / "data" / "agentic.db")
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+    assert inspect_policy_file(conn, wizard.directives_path(root)).status == "ok"
+    assert "活動ログが落ちる方針" in wizard.directives_path(root).read_text(encoding="utf-8")
+    conn.close()
+
+
+def test_stage12_connect_failure_prints_fixed_sentence_and_returns(tmp_path, monkeypatch):
+    root = make_root(tmp_path)
+    deps, *_ = make_deps(tmp_path)
+    io = ScriptedWizardIO([])
+    answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
+
+    def fail_connect(path):
+        raise sqlite3.OperationalError("unable to open\ndatabase file")
+
+    monkeypatch.setattr(wizard, "connect", fail_connect)
+    assert wizard._stage12(wizard._Session(root, io, deps), answers) is None
+
+    lines = io.text.splitlines()
+    heading = lines.index("[段 12 方針文と最初の課題]")
+    assert lines[heading + 1] == (
+        "警告: データベースを開けませんでした (OperationalError: unable to open database file)。"
+        "方針文と最初の課題はあとから afx ctl policy add / afx ctl backlog add で足せます。")
+    assert io.asked == []
+
+
+def test_stage12_duplicate_is_detected_by_database_exact_match(tmp_path):
+    def seed_row_only(root):
+        conn = connect(root / "data" / "agentic.db")
+        from agentic_fx.policy_projection import insert_policy
+        insert_policy(conn, "DB にだけある方針", request_id="seed", now="2026-10-25T00:00:00+00:00")
+        conn.close()
+
+    root, io = _stage12_run(tmp_path, ["DB にだけある方針", "", ""], prepare=seed_row_only)
+
+    assert "方針文は追加済みです。" in io.text
+    assert _policy_rows(root) == 1
+
+
+def test_stage12_database_duplicate_after_file_block_removed(tmp_path):
+    root, io = _stage12_run(tmp_path, ["同じ方針", "", ""])
+    path = wizard.directives_path(root)
+    path.write_text("", encoding="utf-8")
+    deps, *_ = make_deps(tmp_path)
+    io2 = ScriptedWizardIO(["同じ方針", "", ""])
+    wizard._stage12(wizard._Session(root, io2, deps),
+                    wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m"))
+
+    assert "方針文は追加済みです。" in io2.text
+    assert _policy_rows(root) == 1
+
+
+@pytest.mark.parametrize("error", [ValueError("bad"), commands_module.ProjectionReconcileBlocked("blocked"),
+                                   commands_module.MigrationRecordUnknown("unknown")])
+def test_stage12_pre_insert_error_types_map_to_first_sentence(tmp_path, monkeypatch, error):
+    def fail(conn, policy_path, activity, text, now):
+        raise error
+
+    monkeypatch.setattr(wizard, "add_policy_directive", fail)
+    _root, io = _stage12_run(tmp_path, ["方針", "should-not-be-asked"])
+
+    assert f"警告: 方針文を書けませんでした ({type(error).__name__}: {error})。" in io.text

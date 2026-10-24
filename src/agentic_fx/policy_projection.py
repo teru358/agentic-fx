@@ -55,7 +55,14 @@ def insert_policy(conn, text: str, *, request_id: str, now) -> int:
         "INSERT INTO ops_policies(request_id,directive,created_at) VALUES (?,?,?)",
         (request_id, text, timestamp),
     )
-    conn.commit()
+    try:
+        conn.commit()
+    except BaseException:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     return int(cursor.lastrowid)
 
 

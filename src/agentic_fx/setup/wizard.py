@@ -32,9 +32,10 @@ import httpx
 import yaml
 
 from agentic_fx import service
-from agentic_fx._safe_error import safe_error_text, safe_text
+from agentic_fx._safe_error import one_line_error, safe_error_text, safe_text
 from agentic_fx.activity import ActivityLog, Category
-from agentic_fx.commands import PolicyFileNotReflected, add_backlog_idea, add_policy_directive
+from agentic_fx.commands import (
+    POLICY_WRITE_ERRORS, PolicyFileNotReflected, add_backlog_idea, add_policy_directive)
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
@@ -359,8 +360,7 @@ class _Session:
 
 
 def _one_line(value: object, limit: int = 120) -> str:
-    text = " ".join(safe_error_text(value).split()) if not isinstance(value, str) else " ".join(value.split())
-    return text[:limit]
+    return one_line_error(value, limit)
 
 
 def _check_record(result: CheckResult) -> dict[str, str]:
@@ -2005,10 +2005,15 @@ _BACKLOG_EXAMPLE = "標準指標だけで組める {timeframe} 足の押し目�
 
 
 def _stage12(sess: _Session, a: Answers | None) -> None:
-    conn = connect(sess.root / "data" / "agentic.db")
+    sess.say("")
+    sess.say("[段 12 方針文と最初の課題]")
     try:
-        sess.say("")
-        sess.say("[段 12 方針文と最初の課題]")
+        conn = connect(sess.root / "data" / "agentic.db")
+    except (sqlite3.Error, OSError) as error:
+        sess.say(f"警告: データベースを開けませんでした ({_one_line(error)})。"
+                 "方針文と最初の課題はあとから afx ctl policy add / afx ctl backlog add で足せます。")
+        return
+    try:
         path = directives_path(sess.root)
         count = _backlog_count(conn)
         sess.say(f"既存の方針文: {_text_length(path)} 文字 / 改善課題: {count if count is not None else '不明'} 件")
@@ -2031,7 +2036,13 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
             if not entries[0]:
                 break
             for text in entries:
-                if text in (_read_text(path) or ""):
+                try:
+                    duplicate = text in (_read_text(path) or "") or conn.execute(
+                        "SELECT 1 FROM ops_policies WHERE directive=? LIMIT 1", (text,)).fetchone() is not None
+                except sqlite3.Error as error:
+                    sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
+                    return
+                if duplicate:
                     sess.say("方針文は追加済みです。")
                     continue
                 try:
@@ -2042,7 +2053,7 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
                     sess.say("警告: 方針文は記録しましたが policy/directives.md へ反映できませんでした "
                              f"({_one_line(cause)})。afx の次回起動時に反映されます。")
                     return
-                except (sqlite3.Error, OSError) as error:
+                except POLICY_WRITE_ERRORS as error:
                     sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
                     return
         sess.say(f"方針文を {written} 行書きました。")
