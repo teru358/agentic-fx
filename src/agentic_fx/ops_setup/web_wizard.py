@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from agentic_fx.ops_setup.feature_config import InputError, InterfaceLookupFailed, validate
+from agentic_fx.ops_setup.feature_config import (UNRESTRICTED, InputError, InterfaceLookupFailed, is_loopback,
+                                                 validate)
 from agentic_fx.ops_setup.interfaces import Candidate
 from agentic_fx.ops_setup.web_setup import (
     SecretPlan,
@@ -22,11 +23,9 @@ from agentic_fx.ops_setup.web_setup import (
     auth_of,
     check_password,
     generate_password,
-    is_loopback,
     web_secret_state,
 )
 
-UNRESTRICTED = "0.0.0.0/0"
 DEFAULT_PORT = 8788
 UNRESTRICTED_WARNING = ("LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が"
                         "戦略の diff を読めます")
@@ -195,7 +194,7 @@ class Session:
             if SCOPE in steps:
                 chosen = self._choose("公開範囲", ["自機のみ", "LAN"], 2 if lan else 1) == 2
                 if not chosen:
-                    for name in ("bind", "allow", "auth"):
+                    for name in ("allow", "auth") if not lan else ("bind", "allow", "auth"):
                         cur.pop(name, None)
                 elif not lan:
                     cur.pop("bind", None)
@@ -226,6 +225,8 @@ class Session:
     def _normalize(cur: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {"port": cur["port"]}
         if is_loopback(cur):
+            if cur.get("bind", "127.0.0.1") != "127.0.0.1":
+                result["bind"] = cur["bind"]
             return result
         if "bind" not in cur or "allow" not in cur:
             raise WebSetupError("setup_input_required", 2)

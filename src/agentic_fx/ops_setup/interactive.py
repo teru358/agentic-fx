@@ -21,7 +21,7 @@ from agentic_fx.ops_setup.setup_lease import (SetupLease, SetupLeaseBusy, SetupL
 from agentic_fx.ops_setup.stages import InvalidState, OpsSetup, read_stage
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import resolve_ops_exec
-from agentic_fx.ops_setup.web_setup import (SecretPlan, WebOptions, WebSetupError, cleanup_temporaries,
+from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, SecretPlan, WebOptions, WebSetupError, cleanup_temporaries,
                                             options_problem, plan_for_input, read_config_file,
                                             read_password_file, summary_line, target_from_config_file)
 from agentic_fx.ops_setup.web_wizard import FULL, ONE_QUESTION, RETRY_STEPS, STOP_REASONS, Session
@@ -97,8 +97,7 @@ def _default_probe(feature: str) -> tuple[int, str]:
 
 
 def _ask_values(io: IO, feature: str, missing: tuple[str, ...]) -> dict[str, object]:
-    if feature == "web":
-        return {"port": int(io.ask("port", "8788") or "")} if "port" in missing else {}
+    """bot / notify の不足値の質問。web の質問は `Session` が担う。"""
     if feature == "notify":
         return {"webhook_url": io.ask_secret("webhook URL")} if "webhook_url" in missing else {}
     values: dict[str, object] = {}
@@ -134,7 +133,7 @@ def _setup_lock(root: Path):
         return _LOCK_UNSAFE
 
 
-SECRET_GUIDANCE = ("secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ enable を再実行する")
+SECRET_GUIDANCE = SECRET_GUIDANCE_TEMPLATE.format(verb="enable")
 ENABLED_GUIDANCE = "設定の変更は afx ops web reconfigure"
 _SECRET_FAILURES = frozenset({"secret_invalid"})
 

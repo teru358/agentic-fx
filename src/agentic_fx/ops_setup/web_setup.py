@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import base64
-import ipaddress
 import os
 import re
 import secrets
@@ -22,12 +21,14 @@ from pathlib import Path
 from typing import Any
 
 from agentic_fx.ops_setup.feature_config import (
+    UNRESTRICTED,
     InputError,
     InterfaceLookupFailed,
     UnsafeConfigError,
-    _atomic,
-    _open_child,
-    _open_feature,
+    atomic,
+    is_loopback,
+    open_child,
+    open_feature,
     validate,
     web_access_check,
     web_secret_state,
@@ -35,13 +36,12 @@ from agentic_fx.ops_setup.feature_config import (
 )
 
 PASSWORD_NAME = "web.password"
+SECRET_GUIDANCE_TEMPLATE = "secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ {verb} を再実行する"
 SECRET_ACTIONS = ("remove", "keep", "install", "absent")
 CONFIG_FILE_MAX = 65536
 PASSWORD_MIN, PASSWORD_MAX = 16, 128
 _TEMP_PASSWORD = re.compile(r"\.web\.password\.[0-9a-f]{32}\.tmp\Z")
 _TEMP_CONFIG = re.compile(r"\.ops\.toml\.[0-9a-f]{32}\.tmp\Z")
-_UNRESTRICTED = "0.0.0.0/0"
-_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
 Hook = Callable[[str], None]
 
 
@@ -182,10 +182,6 @@ class SecretPlan:
     generated: bool = False
 
 
-def is_loopback(values: dict[str, Any]) -> bool:
-    return ipaddress.IPv4Address(values.get("bind", "127.0.0.1")) in _LOOPBACK
-
-
 def auth_of(values: dict[str, Any]) -> str:
     return values.get("auth", "none")
 
@@ -236,7 +232,7 @@ def cleanup_temporaries(root: Path, *, hook: Hook | None = None) -> None:
     """
     emit = hook if hook is not None else (lambda _name: None)
     try:
-        base_fd = _open_feature("web")
+        base_fd = open_feature("web")
     except FileNotFoundError:
         return
     except OSError:
@@ -247,9 +243,9 @@ def cleanup_temporaries(root: Path, *, hook: Hook | None = None) -> None:
                                       ("config", _TEMP_CONFIG, "config_dir_invalid")):
             try:
                 if name == "secret":
-                    fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
+                    fd = open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
                 else:
-                    fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+                    fd = open_child(base_fd, "config", readable=True, component="config_dir")
             except FileNotFoundError:
                 continue
             except OSError:
@@ -276,9 +272,9 @@ def cleanup_temporaries(root: Path, *, hook: Hook | None = None) -> None:
 
 
 def _secret_dir(create: bool) -> tuple[int, int]:
-    base_fd = _open_feature("web", create=create)
+    base_fd = open_feature("web", create=create)
     try:
-        return base_fd, _open_child(base_fd, "secret", create=create, mode=0o700, exact=0o700,
+        return base_fd, open_child(base_fd, "secret", create=create, mode=0o700, exact=0o700,
                                     readable=True, component="secret_dir")
     except BaseException:
         os.close(base_fd)
@@ -298,7 +294,7 @@ def apply_secret(root: Path, plan: SecretPlan, *, hook: Hook | None = None) -> N
             base_fd, secret_fd = _secret_dir(True)
             os.close(base_fd)
             try:
-                _atomic(secret_fd, PASSWORD_NAME, data, 0o600, secret=True, hook=hook, label="secret")
+                atomic(secret_fd, PASSWORD_NAME, data, 0o600, secret=True, hook=hook, label="secret")
             finally:
                 os.close(secret_fd)
         elif plan.action == "remove":
@@ -347,7 +343,7 @@ def exposure(values: dict[str, Any]) -> str:
     if is_loopback(values):
         return "自機のみ"
     allow = values.get("allow", [])
-    if allow == [_UNRESTRICTED]:
+    if allow == [UNRESTRICTED]:
         return "到達できる全 IPv4"
     return f"許可範囲 {len(allow)} 件"
 
@@ -373,7 +369,7 @@ def access_line(root: Path, saved_stage: dict[str, Any] | None, *,
     allow = values.get("allow")
     if allow is None:
         kind = "loopback-default"
-    elif allow == [_UNRESTRICTED]:
+    elif allow == [UNRESTRICTED]:
         kind = "unrestricted"
     else:
         kind = "restricted"

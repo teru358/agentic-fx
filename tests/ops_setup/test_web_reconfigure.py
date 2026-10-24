@@ -1,7 +1,9 @@
 """`afx ops web reconfigure`: 入口表、setup lock、入口照合、手順 (1)〜(4)、crash 点、afx 不接触。"""
 from __future__ import annotations
 
+import errno
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -12,7 +14,7 @@ import pytest
 from agentic_fx.entry import main
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import KeySetError, key_dir, key_file_name
-from agentic_fx.ops_setup import interactive
+from agentic_fx.ops_setup import interactive, reconfigure
 from agentic_fx.ops_setup.feature_config import web_access_reason, write_inputs
 from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
 from agentic_fx.ops_setup.setup_lease import acquire_setup_lease
@@ -471,6 +473,61 @@ def test_an_input_file_error_is_reported_before_ops_web_is_touched(bundle, capsy
         assert "stop" not in out.names() and tree(bundle.xdg) == before
 
 
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO, errno.EROFS])
+@pytest.mark.parametrize("target", ["cleanup_temporaries", "web_secret_state", "web_defaults"])
+def test_an_os_error_while_collecting_the_input_is_a_fixed_reason_without_a_traceback(
+        bundle, capsys, monkeypatch, code, target):
+    def fail(*_args, **_kwargs):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(reconfigure, target, fail)
+    before = tree(bundle.xdg)
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO())
+    assert out.rc == 1 and out.err == "afx ops: material_write_failed\n"
+    assert "stop" not in out.names() and tree(bundle.xdg) == before and out.probes == []
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EIO])
+def test_an_os_error_reading_the_input_file_is_a_fixed_reason_without_a_traceback(
+        bundle, capsys, monkeypatch, tmp_path, code):
+    def fail(*_args, **_kwargs):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(reconfigure, "read_config_file", fail)
+    out = reconf(bundle, capsys, noninteractive(tmp_path))
+    assert out.rc == 1 and out.err == "afx ops: material_write_failed\n"
+    assert "stop" not in out.names() and out.probes == []
+
+
+def test_the_secret_state_is_read_once_for_the_interactive_flow(bundle, capsys, monkeypatch):
+    calls = []
+    real = reconfigure.web_secret_state
+
+    def counting(root):
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr(reconfigure, "web_secret_state", counting)
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=[""] * 2))
+    assert out.rc == 0 and len(calls) == 1
+
+
+def test_a_non_default_loopback_bind_survives_a_port_only_change(bundle, capsys):
+    write_inputs(bundle.root, "web", {"port": 9100, "bind": "127.0.0.2"})
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", ""]))
+    assert out.rc == 0
+    text = (bundle.xdg / "config" / "ops.toml").read_text()
+    assert 'bind = "127.0.0.2"' in text and "port = 9200" in text
+
+
+def test_the_default_loopback_bind_is_still_left_out(bundle, capsys):
+    write_inputs(bundle.root, "web", {"port": 9100, "bind": "127.0.0.1"})
+    out = reconf(bundle, capsys, WebOptions(), ScriptIO(answers=["9200", ""]))
+    assert out.rc == 0
+    lines = (bundle.xdg / "config" / "ops.toml").read_text().splitlines()
+    assert not any(line.startswith("bind") for line in lines)
+
+
 def test_the_temporary_files_a_death_left_are_removed_first(bundle, capsys, tmp_path):
     left = bundle.xdg / "secret" / (".web.password." + "a" * 32 + ".tmp")
     left.write_text("x")
@@ -828,6 +885,21 @@ def test_reconf_and_reconfigure_are_the_same_command(tmp_path, monkeypatch, caps
     second = _through_main("reconf", tmp_path, monkeypatch, capsys)
     assert first == second
     assert first[0] == 0 and first[5] == ["web: reconfigured"]
+
+
+@pytest.mark.parametrize("spelling", ["reconfigure", "reconf"])
+@pytest.mark.parametrize("action", ["enable", "reconfigure"])
+@pytest.mark.parametrize("argv", [["--conf", "x", "--secret-action", "absent"],
+                                  ["--non", "--config-file", "x", "--secret-action", "absent"],
+                                  ["--config-file", "x", "--pass", "p", "--secret-action", "install"],
+                                  ["--secret", "absent", "--config-file", "x"], ["--as"]])
+def test_an_abbreviated_option_is_input_required(tmp_path, monkeypatch, capsys, spelling, action, argv):
+    if action == "enable" and spelling == "reconf":
+        pytest.skip("enable has no short spelling")
+    monkeypatch.chdir(tmp_path)
+    assert main(["ops", "web", spelling if action == "reconfigure" else action, *argv]) == 2
+    captured = capsys.readouterr()
+    assert captured.err == "afx ops: setup_input_required\n" and captured.out == ""
 
 
 @pytest.mark.parametrize("spelling", ["reconfigure", "reconf"])

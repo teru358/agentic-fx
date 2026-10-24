@@ -22,8 +22,13 @@ _COMMON = ("instance_root", "key_dir")
 _WEB_ACCESS = ("bind", "allow", "auth")
 _OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
              "web": _WEB_ACCESS, "notify": ("deliver_trade_events",)}
-_UNRESTRICTED = "0.0.0.0/0"
-_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
+UNRESTRICTED = "0.0.0.0/0"
+LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
+
+
+def is_loopback(values: dict[str, Any]) -> bool:
+    """bind (省略時 127.0.0.1) が 127.0.0.0/8 にあるか。"""
+    return ipaddress.IPv4Address(values.get("bind", "127.0.0.1")) in LOOPBACK
 _WEB_PASSWORD = "web.password"
 # 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
 _TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices"), "web": (), "notify": ("deliver_trade_events",)}
@@ -104,7 +109,7 @@ def _web_allow(value: object) -> list[str]:
         except ValueError: raise InputError("allow") from None
         networks.append(network)
     if len(set(networks)) != len(networks): raise InputError("allow")
-    if ipaddress.IPv4Network(_UNRESTRICTED) in networks and len(networks) != 1: raise InputError("allow")
+    if ipaddress.IPv4Network(UNRESTRICTED) in networks and len(networks) != 1: raise InputError("allow")
     return list(value)
 
 
@@ -158,7 +163,7 @@ def _is_symlink(parent_fd: int, name: str) -> bool:
     except OSError: return False
 
 
-def _open_child(parent_fd: int, name: str, *, create: bool = False, mode: int = 0o700, exact: int | None = None,
+def open_child(parent_fd: int, name: str, *, create: bool = False, mode: int = 0o700, exact: int | None = None,
                 readable: bool = False, checked: bool = True, component: str = "parent_dir",
                 other_writable: bool = False) -> int:
     created = False
@@ -185,20 +190,20 @@ def _open_config_home(*, create: bool) -> int:
     fd = os.open("/", _DIR_FLAGS)
     try:
         for index, part in enumerate(path.parts[1:]):
-            next_fd = _open_child(fd, part, create=create, checked=index == len(path.parts) - 2)
+            next_fd = open_child(fd, part, create=create, checked=index == len(path.parts) - 2)
             os.close(fd); fd = next_fd
         _owned_dir(fd, component="parent_dir")
         return fd
     except BaseException:
         os.close(fd); raise
 
-def _open_feature(feature: str, *, create: bool = False) -> int:
+def open_feature(feature: str, *, create: bool = False) -> int:
     fd = _open_config_home(create=create)
     try:
         for name, exact, component, other_writable in (("agentic-fx", None, "parent_dir", True),
                                                         ("ops", None, "parent_dir", True),
                                                         (feature, 0o700, "feature_dir", False)):
-            next_fd = _open_child(fd, name, create=create, exact=exact, component=component,
+            next_fd = open_child(fd, name, create=create, exact=exact, component=component,
                                   other_writable=other_writable)
             os.close(fd); fd = next_fd
         return fd
@@ -222,8 +227,8 @@ def _read_regular(directory_fd: int, name: str, *, secret: bool = False) -> byte
     finally: os.close(fd)
 
 def _parse_config(root: Path, feature: str) -> dict[str, Any]:
-    base_fd = _open_feature(feature)
-    try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+    base_fd = open_feature(feature)
+    try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
     finally: os.close(base_fd)
     try: parsed = tomllib.loads(_read_regular(config_fd, "ops.toml").decode("utf-8"))
     finally: os.close(config_fd)
@@ -242,19 +247,19 @@ def _parse_config(root: Path, feature: str) -> dict[str, Any]:
 def _secret_present(feature: str) -> bool:
     name = _SECRET_NAME.get(feature)
     if name is None: return False
-    base_fd = _open_feature(feature)
-    try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
+    base_fd = open_feature(feature)
+    try: secret_fd = open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
     finally: os.close(base_fd)
     try: _read_regular(secret_fd, name, secret=True); return True
     finally: os.close(secret_fd)
 
 def unsafe_reason(root: Path, feature: str) -> str | None:
-    try: base_fd = _open_feature(feature)
+    try: base_fd = open_feature(feature)
     except FileNotFoundError: return None
     except UnsafeConfigError as error: return error.component
     except OSError: return "parent_dir"
     try:
-        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+        try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
         except FileNotFoundError: config_fd = None
         if config_fd is not None:
             try:
@@ -265,7 +270,7 @@ def unsafe_reason(root: Path, feature: str) -> str | None:
             finally: os.close(config_fd)
         secret = _SECRET_NAME.get(feature)
         if secret:
-            try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
+            try: secret_fd = open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
             except FileNotFoundError: secret_fd = None
             if secret_fd is not None:
                 try:
@@ -315,7 +320,7 @@ def _web_password_state(secret_fd: int) -> str:
 
 
 def _web_secret_state(base_fd: int) -> str:
-    try: secret_fd = _open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
+    try: secret_fd = open_child(base_fd, "secret", exact=0o700, readable=True, component="secret_dir")
     except FileNotFoundError: return "absent"
     except OSError: return "unsafe"
     try: return _web_password_state(secret_fd)
@@ -347,24 +352,24 @@ class WebAccess:
 def web_access_check(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> WebAccess:
     """web の設定の最終 reason と (許可のとき) その値。
 
-    status・完全性の判定・要約・設定検査が共用する 1 実装で、`afx-ops` の起動 / probe と
-    同じ決定木 (config dir・ops.toml の安全性 → 文法 → allow の必須 → interface の実在 →
+    status・完全性の判定・要約・設定検査が共用する 1 実装で、§2.3 の決定木
+    (config dir・ops.toml の安全性 → 文法 → allow の必須 → interface の実在 →
     secret) を同じ順で評価する。`interfaces` は本機の up 状態の interface の global / link IPv4
     を返す関数で、列挙できなければ `InterfaceLookupFailed` を上げる。非 loopback の bind で
     だけ呼び、渡されなければ列挙失敗とみなす。
     """
-    try: base_fd = _open_feature("web")
+    try: base_fd = open_feature("web")
     except FileNotFoundError: return WebAccess("config_dir_missing", {})
     except OSError: return WebAccess("config_dir_invalid", {})
     try:
-        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+        try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
         except FileNotFoundError: return WebAccess("config_dir_missing", {})
         except OSError: return WebAccess("config_dir_invalid", {})
         try: parsed = _web_parsed(root, config_fd)
         finally: os.close(config_fd)
         if isinstance(parsed, str): return WebAccess(parsed, {})
         bind = ipaddress.IPv4Address(parsed.get("bind", "127.0.0.1"))
-        loopback, allow, auth = bind in _LOOPBACK, parsed.get("allow"), parsed.get("auth", "none")
+        loopback, allow, auth = is_loopback(parsed), parsed.get("allow"), parsed.get("auth", "none")
         if not loopback and allow is None: return WebAccess("allow_required", {})
         if not loopback:
             try: found = {str(address) for address in interfaces()} if interfaces is not None else None
@@ -386,7 +391,7 @@ def web_access_reason(root: Path, *, interfaces: Callable[[], Iterable[str]] | N
 
 def web_secret_state(root: Path) -> str:
     """live の `web.password` の状態: "absent" / "safe" / "unsafe" (secret dir の不在は absent)。"""
-    try: base_fd = _open_feature("web")
+    try: base_fd = open_feature("web")
     except FileNotFoundError: return "absent"
     except OSError: return "unsafe"
     try: return _web_secret_state(base_fd)
@@ -398,10 +403,10 @@ def web_defaults(root: Path) -> dict[str, Any]:
 
     読めない・安全でない・別 instance の file は空。値の組み合わせは見ない。
     """
-    try: base_fd = _open_feature("web")
+    try: base_fd = open_feature("web")
     except OSError: return {}
     try:
-        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+        try: config_fd = open_child(base_fd, "config", readable=True, component="config_dir")
         except OSError: return {}
         try: raw = _read_regular(config_fd, "ops.toml")
         except OSError: return {}
@@ -429,7 +434,7 @@ def _toml_value(value: Any) -> str:
     if isinstance(value, str): return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     raise TypeError(value)
 
-def _atomic(directory_fd: int, name: str, data: bytes, mode: int, *, secret: bool = False,
+def atomic(directory_fd: int, name: str, data: bytes, mode: int, *, secret: bool = False,
             hook: Callable[[str], None] | None = None, label: str = "") -> None:
     try:
         if _read_regular(directory_fd, name, secret=secret) == data: return
@@ -458,10 +463,10 @@ def _atomic(directory_fd: int, name: str, data: bytes, mode: int, *, secret: boo
 def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
     values = validate(feature, values)
     if is_unsafe(root, feature): raise OSError("unsafe existing configuration")
-    base_fd = _open_feature(feature, create=True)
+    base_fd = open_feature(feature, create=True)
     try:
-        config_fd = _open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
-        secret_fd = _open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir")
+        config_fd = open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
+        secret_fd = open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir")
     finally: os.close(base_fd)
     config: dict[str, Any] = {"instance_root": str(Path(root).resolve()), "key_dir": str(key_dir(root))}
     if feature == "bot":
@@ -470,9 +475,9 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
     elif feature == "web": config.update({name: values[name] for name in ("port", *_WEB_ACCESS) if name in values})
     config.update({name: values[name] for name in _TRADE_KEYS[feature] if name in values})
     try:
-        _atomic(config_fd, "ops.toml", "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode(), 0o644)
-        if feature == "bot" and values["token"] != "present": _atomic(secret_fd, _SECRET_NAME[feature], values["token"].encode(), 0o600, secret=True)
-        if feature == "notify" and values["webhook_url"] != "present": _atomic(secret_fd, _SECRET_NAME[feature], values["webhook_url"].encode(), 0o600, secret=True)
+        atomic(config_fd, "ops.toml", "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode(), 0o644)
+        if feature == "bot" and values["token"] != "present": atomic(secret_fd, _SECRET_NAME[feature], values["token"].encode(), 0o600, secret=True)
+        if feature == "notify" and values["webhook_url"] != "present": atomic(secret_fd, _SECRET_NAME[feature], values["webhook_url"].encode(), 0o600, secret=True)
     finally: os.close(config_fd); os.close(secret_fd)
 
 def _web_config_text(root: Path, values: dict[str, Any]) -> bytes:
@@ -488,14 +493,14 @@ def write_web_config(root: Path, values: dict[str, Any], *, hook: Callable[[str]
     安全性 (symlink・他 uid・group / other 書込み可・型) に違反する場合だけで、`UnsafeConfigError`。
     """
     values = validate("web", values)
-    base_fd = _open_feature("web", create=True)
+    base_fd = open_feature("web", create=True)
     try:
-        config_fd = _open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
-        try: os.close(_open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir"))
+        config_fd = open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
+        try: os.close(open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir"))
         except BaseException:
             os.close(config_fd); raise
     finally: os.close(base_fd)
-    try: _atomic(config_fd, "ops.toml", _web_config_text(root, values), 0o644, hook=hook, label="config")
+    try: atomic(config_fd, "ops.toml", _web_config_text(root, values), 0o644, hook=hook, label="config")
     finally: os.close(config_fd)
 
 

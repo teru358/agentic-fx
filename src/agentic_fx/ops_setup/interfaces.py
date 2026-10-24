@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from agentic_fx.ops_setup.feature_config import InterfaceLookupFailed
+from agentic_fx.ops_setup.feature_config import LOOPBACK, InterfaceLookupFailed
 
 TIMEOUT = 10.0
 MAX_STDOUT = 65536
@@ -26,7 +26,6 @@ _READ = 8192
 _SLICE = 0.05
 _SCOPE_ORDER = {"global": 0, "link": 1}
 _LINK_LOCAL = ipaddress.IPv4Network("169.254.0.0/16")
-_LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
 _BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 
 
@@ -96,7 +95,7 @@ def _run_bounded(argv: list[str], *, timeout: float) -> bytes:
 
 
 def _scope(address: ipaddress.IPv4Address) -> str | None:
-    if (address in _LOOPBACK or address.is_multicast or address.is_unspecified
+    if (address in LOOPBACK or address.is_multicast or address.is_unspecified
             or address == _BROADCAST):
         return None
     return "link" if address in _LINK_LOCAL else "global"

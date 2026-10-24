@@ -23,7 +23,7 @@ from agentic_fx.ops_setup.stages import (InvalidState, OpsSetup, _ENABLE_TERMINA
                                          _KEY_MISMATCH_CODES, read_marker, read_stage)
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.units import OpsExecNotFound, resolve_ops_exec, units_match
-from agentic_fx.ops_setup.web_setup import (WebOptions, WebSetupError, cleanup_temporaries, options_problem,
+from agentic_fx.ops_setup.web_setup import (SECRET_GUIDANCE_TEMPLATE, WebOptions, WebSetupError, cleanup_temporaries, options_problem,
                                             plan_for_input, read_config_file, read_password_file,
                                             target_from_config_file)
 from agentic_fx.ops_setup.web_wizard import FULL, Session
@@ -33,7 +33,7 @@ RERUN = "afx ops web reconfigure を再実行する"
 RECOVER = "afx ops web enable で状態を回復してから再実行する"
 RELOAD = "systemctl --user daemon-reload の後に再実行する"
 KEYS = "afx を止めて afx keys rotate ops-web を実行し、afx を起動してから afx ops web reconfigure を再実行する"
-SECRET_GUIDANCE = "secret の所有者・mode・型を直すか、停止中に対象を退避してから同じ reconfigure を再実行する"
+SECRET_GUIDANCE = SECRET_GUIDANCE_TEMPLATE.format(verb="reconfigure")
 _AFX_RUNNING = frozenset({"active", "activating", "reloading"})
 _AFX_DOWN = frozenset({"inactive", "failed"})
 
@@ -176,9 +176,10 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
         try:
             cleanup_temporaries(root, hook=hook)
             if interactive:
-                if web_secret_state(root) == "unsafe":
+                secret_state = web_secret_state(root)
+                if secret_state == "unsafe":
                     raise WebSetupError("secret_invalid")
-                values, plan = session.collect(web_defaults(root), web_secret_state(root), FULL)
+                values, plan = session.collect(web_defaults(root), secret_state, FULL)
             else:
                 values = target_from_config_file(read_config_file(options.config_file or ""))
                 password = read_password_file(options.password_file) if options.password_file else None
@@ -187,6 +188,9 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
             guidance = SECRET_GUIDANCE if error.reason == "secret_invalid" else ""
             _report(Refusal(error.reason, guidance), rerun=False)
             return error.rc
+        except OSError:
+            _report(Refusal("material_write_failed"), rerun=False)
+            return 1
         except (EOFError, KeyboardInterrupt):
             print("afx ops: setup_aborted", file=sys.stderr)
             return 1

@@ -23,6 +23,11 @@ class _OpsOptionParser(argparse.ArgumentParser):
         raise _OpsOptionError(self.format_usage() + f"{self.prog}: error: {message}\n")
 
 
+def _web_parser_kw(feature: str) -> dict:
+    """web の subparser は option の略記を受けない。"""
+    return {"allow_abbrev": False} if feature == "web" else {}
+
+
 def _add_web_setup_options(parser: argparse.ArgumentParser) -> None:
     """enable / reconfigure が受ける option。重複は数えて表外として扱うため append / count にする。"""
     parser.add_argument("--ask", action="count", default=0,
@@ -137,12 +142,13 @@ def main(argv: list[str] | None = None) -> int:
         for action, text in (("enable", "機能を停止中に有効化する"),
                              ("disable", "機能を停止せずに無効化する"),
                              ("status", "機能の durable stage を表示する")):
-            action_parser = feature_sub.add_parser(action, help=text)
+            action_parser = feature_sub.add_parser(action, help=text, **_web_parser_kw(feature))
             if feature == "web" and action == "enable":
                 _add_web_setup_options(action_parser)
         if feature == "web":
             reconfigure_parser = feature_sub.add_parser(
-                "reconfigure", help="有効化済みの web の設定を変更する (ops-web だけを短時間止める)")
+                "reconfigure", help="有効化済みの web の設定を変更する (ops-web だけを短時間止める)",
+                allow_abbrev=False)
             _add_web_setup_options(reconfigure_parser)
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
