@@ -1,7 +1,7 @@
 ---
 id: cli-surface-principle-and-reorg
 title: afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
-status: 実装待ち
+status: 実装中
 priority: 中
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 ---
 # [cli-surface-principle-and-reorg] afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
 
-**状態**: 実装待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -28,3 +28,4 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 - 2026-10-17: コスト見込み (指揮者) — 設計 0.5 日 (C0 短、sol 1〜2 周) + 実装 1〜1.5 日を 2 束 (A: 分類メタデータからの help 生成 + (1)(4)(5)(6)、B: (2) backlog list と (3) policy show/remove の API 追加)。影響: entry/cli/client/commands 計 3258 行、help 文言 pin の test 11 本、文書 39 か所。着手は pdo T7 (plugin disable / rollback / versions / revoke の CLI) の後。
 - 2026-10-17 22:49: ユーザー裁定 — 道筋 4 番目 (pdo → 承認の中身 → 改善の質 → 本件 → ウィザード UI)。
 - 2026-10-24: 状態: 実装待ち — 設計書 docs/superpowers/specs/2026-10-23-cli-surface-design.md v0.5b で収束 (設計レビュー 4 周 + 閉鎖確認 3 周)。実装順 S1 → B1 → B2a → B2b → B2c → A1 / A2 → I1、I1 は web-lan の本体 merge 後。§8.2-1 (対話 shell の寿命) はユーザー裁定待ちだが S1〜B2 を止めない
+- 2026-10-24: 状態: 実装中 — S1 (cli_surface.py の分類メタデータ 59 record、prefix 木 renderer、別名と廃止名、shell lifecycle、scope guidance.read) を実装して merge。codex r1 High 1 / Medium 4、/code-review 9 件 (1 却下)、閉鎖確認 1 件を是正。全 record は I1 まで exposed=False で既存 help は不変。判定 ops+commands+backtest/cli+ops_setup/entry+setup 2237 green。次は A1 (argv shim と ops <feature> <verb>)
