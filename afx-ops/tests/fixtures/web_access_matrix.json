@@ -634,6 +634,222 @@
   "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = []\n"
  },
  {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-upper",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"Afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-all-upper",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"AFX\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-colon",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx:user\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-newline",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx\\n\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-carriage-return",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx\\r\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-empty",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-digit-first",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"1afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-hyphen-first",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"-afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-underscore-first",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"_afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-space",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"a b\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-dot",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"a.b\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-at",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx@host\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-non-ascii",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"af\\u00e9\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-nul",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx\\u0000\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-33-bytes",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-int",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = 1\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-bool",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = true\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-list",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = [\"afx\"]\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G8-user-upper-with-auth-none",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nuser = \"Afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G8-user-afx-accepted",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"afx\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G8-user-one-byte-accepted",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"a\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G8-user-32-bytes-accepted",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G8-user-mixed-accepted",
+  "interfaces": "na",
+  "secret": "safe",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nauth = \"basic\"\nuser = \"ops-web_1\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": null,
+  "group": "G",
+  "id": "G8-user-with-auth-none-accepted",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nuser = \"afx\"\n"
+ },
+ {
   "allow": "omitted",
   "auth": "none",
   "bind": "loopback",
@@ -1688,5 +1904,181 @@
   "interfaces": "failed",
   "secret": "unsafe",
   "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"{BIND}\"\nallow = [\"0.0.0.0/0\"]\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-0-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 0,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-1-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 1,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-7-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 7,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_unexpected",
+  "group": "S",
+  "id": "S-password-8-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 8,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_unexpected",
+  "group": "S",
+  "id": "S-password-22-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 22,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_unexpected",
+  "group": "S",
+  "id": "S-password-32-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 32,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-33-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 33,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "none",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-128-none",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 128,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-0-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 0,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-1-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 1,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-7-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 7,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": null,
+  "group": "S",
+  "id": "S-password-8-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 8,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": null,
+  "group": "S",
+  "id": "S-password-22-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 22,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": null,
+  "group": "S",
+  "id": "S-password-32-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 32,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-33-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 33,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
+ },
+ {
+  "auth": "basic",
+  "bind": "loopback",
+  "expected": "secret_invalid",
+  "group": "S",
+  "id": "S-password-128-basic",
+  "interfaces": "na",
+  "secret": "payload",
+  "secret_bytes": 128,
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nbind = \"127.0.0.1\"\nauth = \"basic\"\n"
  }
 ]

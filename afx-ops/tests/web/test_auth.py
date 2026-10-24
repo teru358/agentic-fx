@@ -117,9 +117,9 @@ def _failure_values() -> list:
         "Basic " + "!" + token[1:],
         "Basic " + base64.urlsafe_b64encode(urlsafe_source).decode("ascii"),
         "Basic " + base64.b64encode(b"afxonly").decode("ascii"),
-        basic(b"x" * 133),
-        basic(b"afx:" + b"p" * 128 + b"x"),
-        "Basic " + "A" * 177,
+        basic(b"x" * 66),
+        basic(b"afx:" + b"p" * 32 + b"x"),
+        "Basic " + "A" * 92,
         "Basic é",
     ]
 
@@ -149,12 +149,72 @@ def test_two_authorization_values_fail_even_when_both_are_valid(authenticator):
     assert authenticator.authenticate([GOOD, GOOD], PEER).outcome == auth.UNAUTHORIZED
 
 
-def test_the_decoded_credential_limit_is_132_bytes(clock):
-    long_password = b"p" * 128
-    a = auth.BasicAuthenticator(long_password, clock=clock)
-    assert len(b"afx:" + long_password) == 132
-    assert outcome(a, basic(b"afx:" + long_password)) == auth.OK
-    assert outcome(a, basic(b"afx:" + long_password + b"p")) == auth.UNAUTHORIZED
+def test_the_fixed_limits_follow_the_longest_user_and_password():
+    assert auth.MAX_CREDENTIAL_BYTES == len(b"u" * 32 + b":" + b"p" * 32) == 65
+    assert auth.MAX_TOKEN_BYTES == len(base64.b64encode(b"x" * 65)) == 88
+
+
+def test_the_decoded_credential_limit_is_65_bytes(clock):
+    user = "u" * 32
+    long_password = b"p" * 32
+    a = auth.BasicAuthenticator(long_password, user=user, clock=clock)
+    assert len(user.encode() + b":" + long_password) == 65
+    assert outcome(a, basic(user.encode() + b":" + long_password)) == auth.OK
+    assert outcome(a, basic(user.encode() + b":" + long_password + b"p")) == auth.UNAUTHORIZED
+
+
+def test_the_token_limit_is_88_ascii_bytes(clock):
+    a = auth.BasicAuthenticator(b"p" * 32, user="u" * 32, clock=clock)
+    good = base64.b64encode(b"u" * 32 + b":" + b"p" * 32).decode("ascii")
+    assert len(good) == 88
+    assert outcome(a, "Basic " + good) == auth.OK
+    assert outcome(a, "Basic " + good + "AAAA") == auth.UNAUTHORIZED
+
+
+# --- AC-14 / AC-34: 設定した user で比較する -------------------------------------------------
+
+def test_the_configured_user_and_the_password_pass_and_the_default_afx_does_not(clock):
+    a = auth.BasicAuthenticator(PASSWORD, user="ops-web", clock=clock)
+    assert outcome(a, basic(b"ops-web:" + PASSWORD)) == auth.OK
+    assert outcome(a, basic(b"afx:" + PASSWORD)) == auth.UNAUTHORIZED
+    assert outcome(a, basic(b"ops-web:" + PASSWORD + b"x")) == auth.UNAUTHORIZED
+    assert outcome(a, basic(b"ops-web2:" + PASSWORD)) == auth.UNAUTHORIZED
+    assert outcome(a, basic(b"ops-web" + PASSWORD)) == auth.UNAUTHORIZED
+
+
+def test_an_omitted_user_is_afx(clock):
+    a = auth.BasicAuthenticator(PASSWORD, clock=clock)
+    assert outcome(a, basic(b"afx:" + PASSWORD)) == auth.OK
+
+
+def test_the_configured_user_is_the_prefix_of_the_hashed_credential(clock, digests):
+    _compares, hashed = digests
+    a = auth.BasicAuthenticator(PASSWORD, user="ops-web", clock=clock)
+    a.authenticate([basic(b"ops-web:" + PASSWORD)], PEER)
+    assert hashed.count(b"ops-web:" + PASSWORD) == 2
+    assert b"afx:" + PASSWORD not in hashed
+
+
+@pytest.mark.parametrize("user", ["", "a:b", "é", None, b"afx"])
+def test_an_unusable_user_is_refused_at_construction(user):
+    with pytest.raises(ValueError):
+        auth.BasicAuthenticator(PASSWORD, user=user)
+
+
+@pytest.mark.parametrize("user", ["Afx", "ops:web", "afx\n", "afx ", " afx", "1afx", "_afx", "-afx", "a" * 33, "afx.web"])
+def test_a_user_outside_the_username_grammar_is_refused_at_construction(user):
+    with pytest.raises(ValueError):
+        auth.BasicAuthenticator(PASSWORD, user=user)
+
+
+@pytest.mark.parametrize("user", ["a", "afx", "a" * 32, "a-b_c9"])
+def test_a_user_inside_the_username_grammar_is_accepted_at_construction(user):
+    auth.BasicAuthenticator(PASSWORD, user=user)
+
+
+def test_the_default_user_is_the_configuration_default():
+    from afx_ops.config import WEB_USER_DEFAULT
+    assert auth.DEFAULT_USER == WEB_USER_DEFAULT
 
 
 def test_failures_do_not_change_the_log_line_or_the_counter_by_form(authenticator, capsys):
@@ -545,3 +605,15 @@ def test_nothing_secret_reaches_the_journal_or_repr(authenticator, capsys):
         assert canary not in text
     expected_digest = hashlib.sha256(b"afx:" + PASSWORD).hexdigest()
     assert expected_digest not in text
+
+
+def test_the_configured_user_never_reaches_the_journal_or_repr(clock, capsys):
+    user = "canary-user"
+    a = auth.BasicAuthenticator(PASSWORD, user=user, clock=clock)
+    secret_value = basic(user.encode() + b":" + PASSWORD)
+    a.authenticate([basic(b"canary-user:wrong-password-xx"), secret_value], "10.77.77.77")
+    a.authenticate([basic(b"canary-user:wrong-password-xx")], "10.77.77.77")
+    out = capsys.readouterr()
+    text = out.out + out.err + repr(a) + str(a.__dict__.get("_journal", ""))
+    for canary in (user, "canary-user:", PASSWORD.decode(), secret_value, "10.77.77.77"):
+        assert canary not in text

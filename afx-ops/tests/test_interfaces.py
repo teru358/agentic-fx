@@ -153,6 +153,12 @@ def test_failing_runs_are_lookup_failures_and_leave_no_child_or_fd(tmp_path, bod
     [{"ifindex": 2, "addr_info": [{"family": "inet", "local": "192.168.1.10", "prefixlen": True}]}],
     [{"ifindex": 2, "addr_info": [{"family": "inet", "local": "192.168.001.10", "prefixlen": 24}]}],
     [{"ifindex": 2, "addr_info": [{"family": "inet", "local": "192.168.1.10/24", "prefixlen": 24}]}],
+    # ifname は必須の文字列 (欠落・空・型違反)
+    [{"ifindex": 2, "addr_info": []}],
+    [{"ifindex": 2, "ifname": "", "addr_info": []}],
+    [{"ifindex": 2, "ifname": 5, "addr_info": []}],
+    [{"ifindex": 2, "ifname": None, "addr_info": []}],
+    [{"ifindex": 2, "ifname": ["eth0"], "addr_info": []}],
 ])
 def test_schema_violations_are_lookup_failures_without_partial_results(tmp_path, document):
     # 先頭の要素は正しい。違反があれば部分結果を使わない
@@ -167,7 +173,7 @@ def test_unknown_keys_and_non_inet_families_are_ignored(tmp_path):
         {"family": "inet6", "local": "garbage", "prefixlen": "x"},
         {"local": "no-family"},
         {"family": "inet", "local": "192.168.1.10", "prefixlen": 24, "future_key": 1}]}]
-    assert _list(_json_ip(tmp_path, document)) == (Candidate("192.168.1.10", 2, "global"),)
+    assert _list(_json_ip(tmp_path, document)) == (Candidate("192.168.1.10", 2, "global", "x"),)
 
 
 # --- AC-25: 候補の分類 ------------------------------------------------------------
@@ -179,7 +185,7 @@ def test_primary_and_secondary_addresses_on_one_interface_are_both_candidates(tm
 
 
 def test_scope_comes_from_the_address_range_not_the_ip_scope_string(tmp_path):
-    document = [{"ifindex": 2, "addr_info": [
+    document = [{"ifindex": 2, "ifname": "eth0", "addr_info": [
         {"family": "inet", "local": "169.254.3.4", "prefixlen": 16, "scope": "global"},
         {"family": "inet", "local": "10.0.0.5", "prefixlen": 8, "scope": "link"}]}]
     found = _list(_json_ip(tmp_path, document))
@@ -279,7 +285,7 @@ def test_a_run_that_never_ends_is_killed_and_reaped(tmp_path):
 
 
 def _padded(total: int) -> bytes:
-    base = json.dumps([{"ifindex": 2, "addr_info": [], "pad": ""}]).encode()
+    base = json.dumps([{"ifindex": 2, "ifname": "eth0", "addr_info": [], "pad": ""}]).encode()
     document = base.replace(b'"pad": ""', b'"pad": "' + b"a" * (total - len(base)) + b'"')
     assert len(document) == total
     return document
@@ -314,8 +320,9 @@ def test_the_command_prints_one_versioned_json_object(tmp_path, monkeypatch, cap
     assert cli.main(["interfaces"]) == 0
     out, err = capsys.readouterr()
     assert err == ""
-    assert out == ('{"interfaces":[{"address":"192.168.1.10","ifindex":2,"scope":"global"},'
-                   '{"address":"192.168.1.11","ifindex":2,"scope":"global"}],"version":1}\n')
+    assert out == ('{"interfaces":[{"address":"192.168.1.10","ifindex":2,"ifname":"if2",'
+                   '"scope":"global"},{"address":"192.168.1.11","ifindex":2,"ifname":"if2",'
+                   '"scope":"global"}],"version":2}\n')
 
 
 def test_the_command_failure_is_rc_71_with_one_fixed_line(tmp_path, monkeypatch, capsys):
@@ -339,5 +346,17 @@ def test_the_real_command_and_the_package_agree(home):
                           timeout=30, env=env, cwd=home, stdin=subprocess.DEVNULL)
     assert done.returncode == 0 and done.stderr == ""
     assert done.stdout == interfaces.render_json(interfaces.list_interfaces())
-    assert json.loads(done.stdout)["version"] == 1
+    assert json.loads(done.stdout)["version"] == 2
     assert list(home.iterdir()) == []
+
+
+def test_each_candidate_carries_the_interface_name_of_its_lowest_ifindex(tmp_path):
+    document = [_entry(9, "10.0.0.9"), _entry(3, "10.0.0.9", "192.168.5.1")]
+    found = _list(_json_ip(tmp_path, document))
+    assert [(c.address, c.ifname) for c in found] == [("10.0.0.9", "if3"), ("192.168.5.1", "if3")]
+
+
+def test_the_ifname_is_passed_through_unescaped(tmp_path):
+    document = [_entry(2, "192.168.1.10") | {"ifname": "en p6\ns"}]
+    found = _list(_json_ip(tmp_path, document))
+    assert found[0].ifname == "en p6\ns"

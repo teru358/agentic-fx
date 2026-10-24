@@ -13,9 +13,10 @@ from agentic_fx.ops_setup import interfaces
 from agentic_fx.ops_setup.feature_config import InterfaceLookupFailed
 from agentic_fx.ops_setup.interfaces import Candidate, list_interfaces, parse
 
-GOOD = {"interfaces": [{"address": "192.168.1.10", "ifindex": 2, "scope": "global"},
-                       {"address": "192.168.1.11", "ifindex": 2, "scope": "global"},
-                       {"address": "169.254.3.4", "ifindex": 3, "scope": "link"}], "version": 1}
+GOOD = {"interfaces": [{"address": "192.168.1.10", "ifindex": 2, "ifname": "enp6s0", "scope": "global"},
+                       {"address": "192.168.1.11", "ifindex": 2, "ifname": "enp6s0", "scope": "global"},
+                       {"address": "169.254.3.4", "ifindex": 3, "ifname": "wlp3s0", "scope": "link"}],
+        "version": 2}
 
 
 def _text(document) -> str:
@@ -38,12 +39,13 @@ def _emit(tmp_path: Path, text: str, *, rc: int = 0, stderr: str = "") -> str:
 
 def test_a_valid_listing_is_returned_in_the_contract_order(tmp_path):
     found = list_interfaces(_emit(tmp_path, _text(GOOD)))
-    assert found == (Candidate("192.168.1.10", 2, "global"), Candidate("192.168.1.11", 2, "global"),
-                     Candidate("169.254.3.4", 3, "link"))
+    assert found == (Candidate("192.168.1.10", 2, "global", "enp6s0"),
+                     Candidate("192.168.1.11", 2, "global", "enp6s0"),
+                     Candidate("169.254.3.4", 3, "link", "wlp3s0"))
 
 
 def test_an_empty_listing_is_valid(tmp_path):
-    assert list_interfaces(_emit(tmp_path, _text({"interfaces": [], "version": 1}))) == ()
+    assert list_interfaces(_emit(tmp_path, _text({"interfaces": [], "version": 2}))) == ()
 
 
 def test_the_call_is_exactly_the_resolved_command_plus_interfaces_with_a_closed_stdin(tmp_path):
@@ -149,36 +151,42 @@ def _doc(**override):
 
 @pytest.mark.parametrize("document", [
     [], "x", 1, None,
-    {"interfaces": [], "version": 1, "extra": 1},
+    {"interfaces": [], "version": 2, "extra": 1},
     {"interfaces": []},
-    {"version": 1},
-    _doc(version=2), _doc(version=True), _doc(version="1"), _doc(version=1.0),
+    {"version": 2},
+    # 版ずれ: 旧 afx-ops の version 1 は受理しない
+    _doc(version=1), _doc(version=3), _doc(version=True), _doc(version="2"), _doc(version=2.0),
     _doc(interfaces={}),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "scope": "global", "x": 1}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 0, "scope": "global"}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": True, "scope": "global"}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "scope": "host"}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "scope": "link"}]),
-    _doc(interfaces=[{"address": "169.254.3.4", "ifindex": 2, "scope": "global"}]),
-    _doc(interfaces=[{"address": "127.0.0.1", "ifindex": 1, "scope": "global"}]),
-    _doc(interfaces=[{"address": "0.0.0.0", "ifindex": 1, "scope": "global"}]),
-    _doc(interfaces=[{"address": "224.0.0.1", "ifindex": 1, "scope": "global"}]),
-    _doc(interfaces=[{"address": "255.255.255.255", "ifindex": 1, "scope": "global"}]),
-    _doc(interfaces=[{"address": "192.168.001.10", "ifindex": 2, "scope": "global"}]),
-    _doc(interfaces=[{"address": " 192.168.1.10", "ifindex": 2, "scope": "global"}]),
-    _doc(interfaces=[{"address": "fe80::1", "ifindex": 2, "scope": "link"}]),
-    _doc(interfaces=[{"address": 1, "ifindex": 2, "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0"}]),
+    # ifname は必須の空でない文字列
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": 3, "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": None, "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "global", "x": 1}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 0, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": True, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "host"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "link"}]),
+    _doc(interfaces=[{"address": "169.254.3.4", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "127.0.0.1", "ifindex": 1, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "0.0.0.0", "ifindex": 1, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "224.0.0.1", "ifindex": 1, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "255.255.255.255", "ifindex": 1, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.001.10", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": " 192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "fe80::1", "ifindex": 2, "ifname": "eth0", "scope": "link"}]),
+    _doc(interfaces=[{"address": 1, "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
     # 重複
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "scope": "global"},
-                     {"address": "192.168.1.10", "ifindex": 3, "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "global"},
+                     {"address": "192.168.1.10", "ifindex": 3, "ifname": "eth0", "scope": "global"}]),
     # sort 違反: link が global より前 / ifindex 降順 / address 降順
-    _doc(interfaces=[{"address": "169.254.3.4", "ifindex": 3, "scope": "link"},
-                     {"address": "192.168.1.10", "ifindex": 2, "scope": "global"}]),
-    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 3, "scope": "global"},
-                     {"address": "192.168.1.20", "ifindex": 2, "scope": "global"}]),
-    _doc(interfaces=[{"address": "192.168.1.11", "ifindex": 2, "scope": "global"},
-                     {"address": "192.168.1.10", "ifindex": 2, "scope": "global"}]),
+    _doc(interfaces=[{"address": "169.254.3.4", "ifindex": 3, "ifname": "eth0", "scope": "link"},
+                     {"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 3, "ifname": "eth0", "scope": "global"},
+                     {"address": "192.168.1.20", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
+    _doc(interfaces=[{"address": "192.168.1.11", "ifindex": 2, "ifname": "eth0", "scope": "global"},
+                     {"address": "192.168.1.10", "ifindex": 2, "ifname": "eth0", "scope": "global"}]),
 ])
 def test_a_contract_violation_is_a_lookup_failure(document):
     with pytest.raises(InterfaceLookupFailed):
@@ -211,3 +219,46 @@ def test_no_body_source_names_the_ops_package_in_an_import():
                      else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
             offenders += [str(path) for name in names if name.split(".")[0] == "afx_ops"]
     assert offenders == []
+
+
+def test_the_listing_carries_the_interface_name_of_each_candidate(tmp_path):
+    found = list_interfaces(_emit(tmp_path, _text(GOOD)))
+    assert [(c.address, c.ifname) for c in found] == [("192.168.1.10", "enp6s0"),
+                                                      ("192.168.1.11", "enp6s0"),
+                                                      ("169.254.3.4", "wlp3s0")]
+
+
+def test_the_json_ifname_is_kept_as_is_and_only_the_display_escapes_it(tmp_path):
+    document = _doc(interfaces=[{"address": "192.168.1.10", "ifindex": 2, "ifname": "en p6\x1b[31mé",
+                                 "scope": "global"}])
+    found = list_interfaces(_emit(tmp_path, _text(document)))
+    assert found[0].ifname == "en p6\x1b[31mé"
+    assert interfaces.display_name(found[0].ifname) == "en?p6??31m?"
+
+
+@pytest.mark.parametrize(("raw", "shown"), [
+    ("enp6s0", "enp6s0"), ("br-0.1_a", "br-0.1_a"), ("a b", "a?b"), ("a\nb", "a?b"),
+    ("\x1b[2J", "??2J"), ("eé", "e?"), ("a/b", "a?b"), ("a:b", "a?b"), ("a$b", "a?b"),
+])
+def test_the_display_name_replaces_every_character_outside_the_safe_class(raw, shown):
+    assert interfaces.display_name(raw) == shown
+
+
+def test_a_version_1_listing_adds_the_fixed_stale_version_detail_and_keeps_the_reason(tmp_path, capsys):
+    ops = _emit(tmp_path, _text({**GOOD, "version": 1}))
+    with pytest.raises(InterfaceLookupFailed):
+        list_interfaces(ops)
+    assert capsys.readouterr().err == f"afx ops: {interfaces.STALE_VERSION_DETAIL}\n"
+
+
+@pytest.mark.parametrize("version", [0, 3, "1", None])
+def test_any_other_wrong_version_adds_no_detail(tmp_path, capsys, version):
+    ops = _emit(tmp_path, _text({**GOOD, "version": version}))
+    with pytest.raises(InterfaceLookupFailed):
+        list_interfaces(ops)
+    assert capsys.readouterr().err == ""
+
+
+def test_a_current_listing_adds_no_detail(tmp_path, capsys):
+    list_interfaces(_emit(tmp_path, _text(GOOD)))
+    assert capsys.readouterr().err == ""

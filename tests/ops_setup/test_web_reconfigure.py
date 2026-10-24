@@ -21,8 +21,8 @@ from agentic_fx.ops_setup.setup_lease import acquire_setup_lease
 from agentic_fx.ops_setup.systemd import SystemdError
 from agentic_fx.ops_setup.web_setup import SecretPlan, WebOptions, apply_target
 from agentic_fx.store.enroll_marker import enroll_marker_path
-from web_support import (CANDIDATES, LAN, ONE_CANDIDATE, SCOPE_Q, ScriptIO, make_bundle, stage_file, tree,
-                         who_q)
+from web_support import (ACCESS_Q, CANDIDATES, IFNAME, KEEP_BASIC_Q, LAN, ONE_CANDIDATE, SCOPE_Q, ScriptIO,
+                         make_bundle, stage_file, tree)
 
 PW = "AAECAwQFBgcICQoLDA0ODw"
 FIXED_RNG = lambda n: bytes(range(n))  # noqa: E731
@@ -30,9 +30,8 @@ RERUN = "afx ops web reconfigure を再実行する"
 RECOVER = "afx ops web enable で状態を回復してから再実行する"
 RELOAD = "systemctl --user daemon-reload の後に再実行する"
 KEYS = "afx を止めて afx keys rotate ops-web を実行し、afx を起動してから afx ops web reconfigure を再実行する"
-BIND_Q = f"待受アドレス [1] {LAN} (global) (既定)"
+BIND_Q = f"待受アドレス [1] {LAN} ({IFNAME})"
 ALLOW_Q = "許可する IPv4 / CIDR (カンマ区切り)"
-PASSWORD_Q = "password [1] 生成する (既定) [2] 自分で入力する"
 
 
 class Crash(BaseException):
@@ -592,7 +591,7 @@ def test_a_re_stop_that_cannot_be_confirmed_before_the_start_sends_no_start(bund
 # --- 生成 password -----------------------------------------------------------------
 
 def _interactive_basic_answers():
-    return ["", "2", "", "2", ""]         # port 既定 / LAN / bind 既定 / パスワード / 生成
+    return ["", "2", "", "2", ""]         # port 既定 / LAN / bind 既定 / Basic 認証 / ユーザー名は既定
 
 
 def test_the_interactive_flow_asks_everything_with_existing_values_and_never_the_one_question(bundle, capsys):
@@ -603,7 +602,7 @@ def test_the_interactive_flow_asks_everything_with_existing_values_and_never_the
 
 
 def test_the_interactive_flow_shows_a_generated_password_once_after_the_secret_is_stored(bundle, capsys):
-    io = ScriptIO(answers=_interactive_basic_answers())
+    io = ScriptIO(answers=_interactive_basic_answers(), secret_answers=[""])
     out = reconf(bundle, capsys, WebOptions(), io, hook=_log_hook(bundle))
     assert out.rc == 0
     assert (bundle.xdg / "secret" / "web.password").read_text() == PW
@@ -611,6 +610,47 @@ def test_the_interactive_flow_shows_a_generated_password_once_after_the_secret_i
     calls = bundle.systemd.calls
     assert _index(calls, "hook", "secret_dir_synced") < _index(calls, "hook", "config_tmp_created")
     assert PW not in out.err and PW not in "\n".join(io.err)
+
+
+def test_the_generated_password_line_of_a_reconfigure_names_the_typed_user(bundle, capsys):
+    io = ScriptIO(answers=["", "2", "", "2", "ops-web"], secret_answers=[""])
+    out = reconf(bundle, capsys, WebOptions(), io)
+    assert out.rc == 0
+    assert [text for text in io.out if PW in text] == [
+        f"ユーザー名: ops-web / 生成した password (この表示は 1 回だけです): {PW}"]
+    assert "user = \"ops-web\"" in (bundle.xdg / "config" / "ops.toml").read_text()
+
+
+def test_a_typed_password_needs_the_confirmation_and_a_mismatch_asks_again(bundle, capsys):
+    io = ScriptIO(answers=["", "2", "", "2", ""],
+                  secret_answers=["first-attempt-1", "other-attempt-1", "second-attempt-1", "second-attempt-1"])
+    out = reconf(bundle, capsys, WebOptions(), io)
+    assert out.rc == 0
+    assert (bundle.xdg / "secret" / "web.password").read_text() == "second-attempt-1"
+    assert io.err.count("afx ops: setup_input_invalid") == 1
+
+
+def test_three_credential_failures_abort_before_ops_web_is_stopped_and_write_nothing(bundle, capsys):
+    before = unchanged_state(bundle), tree(bundle.xdg)
+    io = ScriptIO(answers=["", "2", "", "2", "Bad", "afx"], secret_answers=["short", "validpass-123", "mismatch-pass-1"])
+    out = reconf(bundle, capsys, WebOptions(), io)
+    assert out.rc == 1 and out.err == "afx ops: setup_aborted\n"
+    assert (unchanged_state(bundle), tree(bundle.xdg)) == before and "stop" not in out.names()
+
+
+def test_the_basic_keep_or_reset_question_is_asked_for_an_existing_password(bundle, capsys):
+    write_inputs(bundle.root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic",
+                                       "user": "ops-web"})
+    (bundle.xdg / "secret").mkdir(exist_ok=True)
+    (bundle.xdg / "secret" / "web.password").write_text("E" * 22)
+    (bundle.xdg / "secret" / "web.password").chmod(0o600)
+    io = ScriptIO(answers=["", "", "", "", "1", ""])
+    out = reconf(bundle, capsys, WebOptions(), io)
+    assert out.rc == 0
+    assert io.asked == ["port", SCOPE_Q, BIND_Q, ACCESS_Q, KEEP_BASIC_Q, ALLOW_Q] and io.of("secret") == []
+    assert (bundle.xdg / "secret" / "web.password").read_text() == "E" * 22
+    assert 'user = "ops-web"' in (bundle.xdg / "config" / "ops.toml").read_text()
+    assert [text for text in io.out if "E" * 22 in text] == []
 
 
 def test_invalid_keys_in_the_live_config_are_not_offered_as_defaults(bundle, capsys):
@@ -627,9 +667,10 @@ def test_an_existing_lan_config_is_offered_as_the_defaults_of_every_question(bun
     io = ScriptIO(answers=["", "", "", "", ""])
     out = reconf(bundle, capsys, WebOptions(), io)
     assert out.rc == 0
-    lan_scope = "公開範囲 [1] 自機のみ [2] LAN (既定)"  # 既存が LAN なので既定は LAN 側
-    assert io.asked == ["port", lan_scope, BIND_Q, who_q(1), ALLOW_Q]
-    assert dict(io.defaults)["port"] == "9100" and dict(io.defaults)[ALLOW_Q] == "10.0.0.0/8"
+    assert io.asked == ["port", SCOPE_Q, BIND_Q, ACCESS_Q, ALLOW_Q]
+    # 既存が LAN なので公開範囲の初期値は LAN 側
+    assert dict(io.defaults)["port"] == "9100" and dict(io.defaults)[SCOPE_Q] == "2"
+    assert dict(io.defaults)[ALLOW_Q] == "10.0.0.0/8"
 
 
 # --- probe 失敗 ----------------------------------------------------------------------------

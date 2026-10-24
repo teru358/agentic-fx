@@ -1,7 +1,8 @@
 """本機の待受候補の列挙。`afx-ops interfaces` を有界の subprocess で 1 回呼ぶだけで、
 afx_ops の package は import しない。
 
-成功契約は rc 0、stderr 空、stdout が UTF-8 の改行 1 個で終わる versioned JSON object 1 個。
+成功契約は rc 0、stderr 空、stdout が UTF-8 の改行 1 個で終わる versioned JSON object 1 個
+(version 2、各候補は interface 名 `ifname` を持つ)。
 どの失敗 (起動不能・timeout・stdout 上限超過・非 0 rc・signal・stderr 出力・形式違反) も
 区別せず `InterfaceLookupFailed` にし、子 process の出力や例外文を持ち出さない。
 """
@@ -10,15 +11,20 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import select
 import shlex
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from agentic_fx.ops_setup.feature_config import LOOPBACK, InterfaceLookupFailed
 
+VERSION = 2
+STALE_VERSION = 1
+STALE_VERSION_DETAIL = "afx-ops interfaces の出力版が古い (本体と afx-ops を同じ checkout で更新する)"
 TIMEOUT = 10.0
 MAX_STDOUT = 65536
 _MAX_STDERR = 4096
@@ -29,11 +35,16 @@ _LINK_LOCAL = ipaddress.IPv4Network("169.254.0.0/16")
 _BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 
 
+class StaleInterfaceVersion(InterfaceLookupFailed):
+    """出力が旧版 (version 1) の形だった。理由は `interface_lookup_failed` のまま。"""
+
+
 @dataclass(frozen=True)
 class Candidate:
     address: str
     ifindex: int
     scope: str
+    ifname: str
 
 
 def _run_bounded(argv: list[str], *, timeout: float) -> bytes:
@@ -94,6 +105,14 @@ def _run_bounded(argv: list[str], *, timeout: float) -> bytes:
             err.close()
 
 
+_DISPLAY_SAFE = re.compile(r"[a-zA-Z0-9_.-]")
+
+
+def display_name(ifname: str) -> str:
+    """端末への表示用の interface 名。`[a-zA-Z0-9_.-]` 以外の各文字を `?` に置き換える。"""
+    return "".join(ch if _DISPLAY_SAFE.fullmatch(ch) else "?" for ch in ifname)
+
+
 def _scope(address: ipaddress.IPv4Address) -> str | None:
     if (address in LOOPBACK or address.is_multicast or address.is_unspecified
             or address == _BROADCAST):
@@ -115,14 +134,17 @@ def parse(raw: bytes) -> tuple[Candidate, ...]:
         raise InterfaceLookupFailed from None
     if type(document) is not dict or set(document) != {"interfaces", "version"}:
         raise InterfaceLookupFailed
-    if type(document["version"]) is not int or document["version"] != 1 or type(document["interfaces"]) is not list:
+    if type(document["version"]) is int and document["version"] == STALE_VERSION:
+        raise StaleInterfaceVersion
+    if type(document["version"]) is not int or document["version"] != VERSION or type(document["interfaces"]) is not list:
         raise InterfaceLookupFailed
     found: list[Candidate] = []
     for entry in document["interfaces"]:
-        if type(entry) is not dict or set(entry) != {"address", "ifindex", "scope"}:
+        if type(entry) is not dict or set(entry) != {"address", "ifindex", "ifname", "scope"}:
             raise InterfaceLookupFailed
-        address, ifindex, scope = entry["address"], entry["ifindex"], entry["scope"]
-        if type(address) is not str or type(ifindex) is not int or ifindex < 1 or scope not in _SCOPE_ORDER:
+        address, ifindex, ifname, scope = entry["address"], entry["ifindex"], entry["ifname"], entry["scope"]
+        if (type(address) is not str or type(ifindex) is not int or ifindex < 1
+                or type(ifname) is not str or not ifname or scope not in _SCOPE_ORDER):
             raise InterfaceLookupFailed
         try:
             parsed = ipaddress.IPv4Address(address)
@@ -130,7 +152,7 @@ def parse(raw: bytes) -> tuple[Candidate, ...]:
             raise InterfaceLookupFailed from None
         if str(parsed) != address or _scope(parsed) != scope:
             raise InterfaceLookupFailed
-        found.append(Candidate(address, ifindex, scope))
+        found.append(Candidate(address, ifindex, scope, ifname))
     if len({c.address for c in found}) != len(found) or found != sorted(found, key=_sort_key):
         raise InterfaceLookupFailed
     return tuple(found)
@@ -142,7 +164,12 @@ def list_interfaces(ops_exec: str, *, timeout: float = TIMEOUT) -> tuple[Candida
         argv = [*shlex.split(ops_exec), "interfaces"]
     except ValueError:
         raise InterfaceLookupFailed from None
-    return parse(_run_bounded(argv, timeout=timeout))
+    raw = _run_bounded(argv, timeout=timeout)
+    try:
+        return parse(raw)
+    except StaleInterfaceVersion:
+        print(f"afx ops: {STALE_VERSION_DETAIL}", file=sys.stderr)
+        raise
 
 
 def provider(resolve_exec: Callable[[], str]) -> Callable[[], Sequence[Candidate]]:

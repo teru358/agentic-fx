@@ -28,7 +28,7 @@ def _toml(extra: str = "", *, head: str = BASE) -> str:
 
 
 def g_rows() -> list[dict]:
-    """第 1 層 (G1〜G7)。違反する class ごとに最終 reason を書き下す。"""
+    """第 1 層 (G1〜G8)。違反する class ごとに最終 reason を書き下す。"""
     rows: list[dict] = []
     ok = dict(bind="loopback", interfaces="na", secret="none")
 
@@ -95,6 +95,20 @@ def g_rows() -> list[dict]:
     for name, value in (("capital", '"Basic"'), ("upper", '"NONE"'), ("digest", '"digest"'),
                         ("empty", '""'), ("int", "1"), ("bool", "true"), ("list", "[]")):
         add(f"G7-auth-{name}", "config_invalid", _toml(f"auth = {value}\n"))
+    for name, value in (("upper", '"Afx"'), ("all-upper", '"AFX"'), ("colon", '"afx:user"'),
+                        ("newline", '"afx\\n"'), ("carriage-return", '"afx\\r"'),
+                        ("empty", '""'), ("digit-first", '"1afx"'), ("hyphen-first", '"-afx"'),
+                        ("underscore-first", '"_afx"'), ("space", '"a b"'), ("dot", '"a.b"'),
+                        ("at", '"afx@host"'), ("non-ascii", '"af\\u00e9"'), ("nul", '"afx\\u0000"'),
+                        ("33-bytes", '"' + "a" * 33 + '"'), ("int", "1"), ("bool", "true"),
+                        ("list", '["afx"]')):
+        add(f"G8-user-{name}", "config_invalid", _toml(f'auth = "basic"\nuser = {value}\n'))
+    add("G8-user-upper-with-auth-none", "config_invalid", _toml('user = "Afx"\n'))
+    for name, value in (("afx", "afx"), ("one-byte", "a"), ("32-bytes", "a" * 32),
+                        ("mixed", "ops-web_1")):
+        add(f"G8-user-{name}-accepted", None, _toml(f'auth = "basic"\nuser = "{value}"\n'),
+            secret="safe")
+    add("G8-user-with-auth-none-accepted", None, _toml('user = "afx"\n'))
     return rows
 
 
@@ -150,8 +164,29 @@ def c_rows() -> list[dict]:
     return rows
 
 
+PASSWORD_SIZES = (0, 1, 7, 8, 22, 32, 33, 128)
+
+
+def s_expected(auth: str, size: int) -> str | None:
+    """`web.password` の size 境界 (8〜32 byte が安全)。none は安全な残骸を `secret_unexpected` にする。"""
+    if not 8 <= size <= 32:
+        return "secret_invalid"
+    return "secret_unexpected" if auth == "none" else None
+
+
+def s_rows() -> list[dict]:
+    """password の size 境界 (loopback、secret dir に `web.password` だけを置く)。"""
+    rows = []
+    for auth in AUTHS:
+        for size in PASSWORD_SIZES:
+            rows.append(_row(f"S-password-{size}-{auth}", "S", s_expected(auth, size),
+                             text=_c_text("loopback", "omitted", auth), bind="loopback",
+                             interfaces="na", secret="payload", secret_bytes=size, auth=auth))
+    return rows
+
+
 def rows() -> list[dict]:
-    return g_rows() + c_rows()
+    return g_rows() + c_rows() + s_rows()
 
 
 def render() -> str:

@@ -1,4 +1,4 @@
-"""web の ops.toml の writer / reader (本体側): 4 key の round-trip、共通 key、filesystem 安全性。
+"""web の ops.toml の writer / reader (本体側): 5 key の round-trip、共通 key、filesystem 安全性。
 
 reader の最終 reason は afx-ops の起動 / probe と同じ決定木で、期待値は
 `afx-ops/tests/fixtures/web_access_matrix.json` (afx-ops の試験が仕様の 2 表から機械生成する)
@@ -52,7 +52,9 @@ def _ops_toml(xdg: Path) -> Path:
     {"port": 8788, "bind": "127.0.0.1"},
     {"port": 8788, "bind": LAN, "allow": ["192.168.1.0/24"]},
     {"port": 1, "bind": LAN, "allow": ["10.0.0.5", "192.168.1.0/24", "172.16.0.0/12"]},
-    {"port": 65535, "bind": LAN, "allow": ["192.168.1.0/24", "10.0.0.5"], "auth": "basic"},
+    {"port": 65535, "bind": LAN, "allow": ["192.168.1.0/24", "10.0.0.5"], "auth": "basic", "user": "afx"},
+    {"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "basic", "user": "ops-web_1"},
+    {"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "basic", "user": "a" * 32},
     {"port": 8788, "bind": "127.0.0.1", "allow": ["0.0.0.0/0"], "auth": "none"},
     {"port": 8788, "auth": "none"},
 ])
@@ -65,7 +67,7 @@ def test_write_collect_write_read_keeps_types_order_and_values(root, xdg, values
     write_inputs(root, "web", found.values)
     assert _ops_toml(xdg).read_bytes() == first
     assert collect(root, "web").values == values
-    for name in ("bind", "allow", "auth"):
+    for name in ("bind", "allow", "auth", "user"):
         if name in values:
             assert type(found.values[name]) is type(values[name])
 
@@ -77,11 +79,38 @@ def test_allow_keeps_the_written_order_and_a_single_ipv4_text(root, xdg):
     assert "10.0.0.5/32" not in text
 
 
-def test_the_toml_carries_the_injected_common_keys_first_and_the_four_keys_after(root, xdg):
+def test_the_toml_carries_the_injected_common_keys_first_and_the_web_keys_after(root, xdg):
     write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "none"})
     lines = _ops_toml(xdg).read_text().splitlines()
     assert lines == [f'instance_root = "{root.resolve()}"', f'key_dir = "{key_dir(root)}"',
                      "port = 8788", f'bind = "{LAN}"', 'allow = ["10.0.0.0/8"]', 'auth = "none"']
+
+
+def test_user_is_written_only_for_basic_and_even_when_it_is_afx(root, xdg):
+    write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic",
+                               "user": "afx"})
+    assert _ops_toml(xdg).read_text().splitlines()[-2:] == ['auth = "basic"', 'user = "afx"']
+    write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "none",
+                               "user": "ops"})
+    assert "\nuser = " not in _ops_toml(xdg).read_text()
+    write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "user": "ops"})
+    assert "\nuser = " not in _ops_toml(xdg).read_text()
+
+
+def test_basic_without_a_user_is_written_with_the_default_afx(root, xdg):
+    write_inputs(root, "web", {"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"})
+    assert collect(root, "web").values["user"] == "afx"
+    assert 'user = "afx"\n' in _ops_toml(xdg).read_text()
+
+
+def test_the_reader_returns_the_user_only_for_basic_and_defaults_it_to_afx(root, xdg):
+    from agentic_fx.ops_setup.feature_config import web_access_check
+    from agentic_fx.ops_setup.web_setup import SecretPlan, apply_target
+    apply_target(root, {"port": 8788, "auth": "basic", "user": "ops"}, SecretPlan("install", "A" * 22))
+    assert web_access_check(root).values == {"port": 8788, "auth": "basic", "user": "ops"}
+    text = _ops_toml(xdg).read_text().replace('user = "ops"\n', "")
+    _ops_toml(xdg).write_text(text)
+    assert web_access_check(root).values == {"port": 8788, "auth": "basic", "user": "afx"}
 
 
 def test_omitted_optional_keys_stay_omitted_so_old_settings_read_back_unchanged(root, xdg):
@@ -120,6 +149,11 @@ def test_the_writer_never_writes_values_other_than_this_instances_common_keys(ro
     {"port": 80, "allow": ["10.0.0.1", "10.0.0.1/32"]},
     {"port": 80, "allow": ["0.0.0.0/0", "10.0.0.0/8"]}, {"port": 80, "allow": ["10.0.0.0/8", "0.0.0.0/0"]},
     {"port": 80, "auth": "Basic"}, {"port": 80, "auth": ""}, {"port": 80, "auth": 1},
+    {"port": 80, "auth": "basic", "user": "Afx"}, {"port": 80, "auth": "basic", "user": "afx:user"},
+    {"port": 80, "auth": "basic", "user": "afx\n"}, {"port": 80, "auth": "basic", "user": ""},
+    {"port": 80, "auth": "basic", "user": "1afx"}, {"port": 80, "auth": "basic", "user": "a" * 33},
+    {"port": 80, "auth": "basic", "user": 5}, {"port": 80, "auth": "basic", "user": "afx\r"},
+    {"port": 80, "auth": "basic", "user": "af\u00e9"}, {"port": 80, "user": "Afx"},
 ])
 def test_validate_rejects_malformed_web_values(values):
     with pytest.raises(InputError):
@@ -250,9 +284,9 @@ def _build(row, root: Path, xdg: Path, monkeypatch) -> None:
     if secret != "none":
         (xdg / "secret").mkdir(mode=0o700)
         (xdg / "secret").chmod(0o700)
-        if secret in ("safe", "unsafe"):
+        if secret in ("safe", "unsafe", "payload"):
             password = xdg / "secret" / "web.password"
-            password.write_bytes(b"A" * 22)
+            password.write_bytes(b"A" * row.get("secret_bytes", 22))
             password.chmod(0o600)
         if secret == "unsafe":
             (xdg / "secret" / "stray").write_text("x")

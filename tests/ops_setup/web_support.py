@@ -14,19 +14,21 @@ from agentic_fx.ops_setup.units import UnitPaths
 
 LAN = "192.168.1.10"
 LAN2 = "192.168.1.11"
-CANDIDATES = (Candidate(LAN, 2, "global"), Candidate(LAN2, 2, "global"), Candidate("169.254.3.4", 3, "link"))
-ONE_CANDIDATE = (Candidate(LAN, 2, "global"),)
+IFNAME = "enp6s0"
+CANDIDATES = (Candidate(LAN, 2, "global", IFNAME), Candidate(LAN2, 2, "global", IFNAME),
+              Candidate("169.254.3.4", 3, "link", "wlp3s0"))
+ONE_CANDIDATE = (Candidate(LAN, 2, "global", IFNAME),)
 
-SCOPE_Q = "公開範囲 [1] 自機のみ (既定) [2] LAN"
-KEEP_Q = "この設定で有効化します。[1] このまま (既定) [2] 変更する"
-WHO_Q = ("誰が見られるか [1] 許可 IP だけ{a} [2] パスワード{b} [3] 両方{c} "
-         "[4] この待受アドレスへ到達できる全 IPv4{d}")
+# 質問の label。既定の番号は label でなく ask の default (`ScriptIO.defaults`) に載る
+SCOPE_Q = "公開範囲 [1] 自機のみ [2] LAN"
+KEEP_Q = "この設定で有効化します。[1] このまま [2] 変更する"
+BIND_EXPLANATION = "この PC のどの IP アドレスで待ち受けるかを選んでください（他の PC はこのアドレスにアクセスします）。"
+ACCESS_Q = "アクセス制限 [1] 許可 IP [2] Basic 認証 [3] 両方 [4] なし (到達できる全 IPv4)"
+KEEP_BASIC_Q = "現在の Basic 認証を [1] 維持する [2] 再設定する"
+USER_Q = "ユーザー名"
+PASSWORD_Q = "パスワード (空 Enter で自動生成)"
+CONFIRM_Q = "もう一度"
 WARNING = "LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が戦略の diff を読めます"
-
-
-def who_q(default: int = 1) -> str:
-    marks = {n: " (既定)" if n == default else "" for n in (1, 2, 3, 4)}
-    return WHO_Q.format(a=marks[1], b=marks[2], c=marks[3], d=marks[4])
 
 
 @dataclass
@@ -54,6 +56,9 @@ class ScriptIO:
         self.defaults.append((label, default))
         value = self.answers.pop(0)
         return value or default
+
+    def ask_raw(self, label, default=None):
+        return self.ask(label, default)
 
     def ask_secret(self, label):
         if self.eof_after is not None and self._consumed() >= self.eof_after:

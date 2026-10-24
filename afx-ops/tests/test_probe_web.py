@@ -73,7 +73,7 @@ class Lookup:
         self.calls += 1
         if self.fail:
             raise InterfaceLookupError
-        return [Candidate(address, 2, "global") for address in self.addresses]
+        return [Candidate(address, 2, "global", "eth0") for address in self.addresses]
 
 
 @pytest.fixture

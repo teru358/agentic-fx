@@ -39,7 +39,7 @@ class Lookup:
         self.calls += 1
         if self.fail:
             raise InterfaceLookupError
-        return [Candidate(a, 2, "global") for a in self.addresses]
+        return [Candidate(a, 2, "global", "eth0") for a in self.addresses]
 
 
 def _check(tmp_path, config: OpsConfig, lookup=None) -> str | None:
@@ -150,7 +150,7 @@ def test_a_failed_lookup_is_interface_lookup_failed_and_distinct_from_absence(tm
 def test_the_default_lookup_is_the_shared_enumeration(tmp_path, monkeypatch):
     seen = []
     monkeypatch.setattr(interfaces, "list_interfaces",
-                        lambda: seen.append(1) or [Candidate(LAN, 2, "global")])
+                        lambda: seen.append(1) or [Candidate(LAN, 2, "global", "eth0")])
     config = _config(bind=LAN, allow=["10.0.0.0/8"])
     startup.check_web_access(_plan(tmp_path, config), config)
     assert seen == [1]
@@ -201,8 +201,8 @@ def test_a_subdirectory_entry_is_secret_invalid(tmp_path):
 
 
 @pytest.mark.parametrize(("size", "reason"), [
-    (15, "secret_invalid"), (16, "secret_unexpected"), (128, "secret_unexpected"),
-    (129, "secret_invalid"), (0, "secret_invalid"),
+    (7, "secret_invalid"), (8, "secret_unexpected"), (32, "secret_unexpected"),
+    (33, "secret_invalid"), (0, "secret_invalid"), (16, "secret_unexpected"), (128, "secret_invalid"),
 ])
 def test_password_size_boundaries(tmp_path, size, reason):
     _password(_secret_dir(tmp_path), b"a" * size)

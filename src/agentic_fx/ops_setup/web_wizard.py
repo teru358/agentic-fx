@@ -1,8 +1,8 @@
 """web の公開範囲の対話。enable と reconfigure が同じ質問と同じ前処理・probe の周回を使う。
 
-質問の順は 2 port → 3 自機のみ / LAN → 4 待受 address → 5 誰が見られるか → 6 allow →
-7 / 8 password。LAN の待受候補は `afx-ops interfaces` の結果 (`candidates`) だけを使い、
-手入力の fallback は設けない。EOF と取消しは例外 (`EOFError` / `KeyboardInterrupt`) のまま
+質問の順は 2 port → 3 自機のみ / LAN → 4 待受 address → 5 アクセス制限 → 6 Basic の維持 /
+再設定 (安全な既存 password があるとき) → 7 allow → 8 ユーザー名 / password。LAN の待受候補は
+`afx-ops interfaces` の結果 (`candidates`) だけを使い、手入力の fallback は設けない。EOF と取消しは例外 (`EOFError` / `KeyboardInterrupt`) のまま
 呼び出し側へ返し、ここでは何も書かない。
 """
 from __future__ import annotations
@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from agentic_fx.ops_setup.feature_config import (UNRESTRICTED, InputError, InterfaceLookupFailed, is_loopback,
-                                                 validate)
-from agentic_fx.ops_setup.interfaces import Candidate
+from agentic_fx.ops_setup.feature_config import (DEFAULT_USER, UNRESTRICTED, USER_PATTERN, InputError,
+                                                 InterfaceLookupFailed, is_loopback, validate)
+from agentic_fx.ops_setup.interfaces import Candidate, display_name
 from agentic_fx.ops_setup.web_setup import (
     SecretPlan,
     WebSetupError,
@@ -29,8 +29,17 @@ from agentic_fx.ops_setup.web_setup import (
 DEFAULT_PORT = 8788
 UNRESTRICTED_WARNING = ("LAN、VPN、port-forward 等を含め、このアドレスへ到達できる全 IPv4 source が"
                         "戦略の diff を読めます")
-ONE_QUESTION = "この設定で有効化します。[1] このまま (既定) [2] 変更する"
+ONE_QUESTION = "この設定で有効化します。[1] このまま [2] 変更する"
+BIND_EXPLANATION = "この PC のどの IP アドレスで待ち受けるかを選んでください（他の PC はこのアドレスにアクセスします）。"
+KEEP_LABEL = "現在の Basic 認証を"
+KEEP_OPTIONS = ("維持する", "再設定する")
+ACCESS_LABEL = "アクセス制限"
+ACCESS_OPTIONS = ("許可 IP", "Basic 認証", "両方", "なし (到達できる全 IPv4)")
+USER_LABEL = "ユーザー名"
+PASSWORD_LABEL = "パスワード (空 Enter で自動生成)"
+CONFIRM_LABEL = "もう一度"
 MAX_PROBES = 3
+MAX_CREDENTIAL_FAILURES = 3
 _INVALID = "afx ops: setup_input_invalid"
 
 # 質問の段
@@ -49,9 +58,15 @@ RETRY_STEPS = {
 STOP_REASONS = frozenset({"interface_lookup_failed", "secret_invalid", "config_dir_invalid"})
 
 
+def choice_text(label: str, options: Sequence[str]) -> str:
+    """`label [1] a [2] b` の形の質問文。"""
+    return label + " " + " ".join(f"[{number}] {option}" for number, option in enumerate(options, 1))
+
+
 class IO(Protocol):
     def isatty(self) -> bool: ...
     def ask(self, label: str, default: str | None = None) -> str | None: ...
+    def ask_raw(self, label: str, default: str | None = None) -> str | None: ...
     def ask_secret(self, label: str) -> str: ...
     def stdout(self, text: str) -> None: ...
     def stderr(self, text: str) -> None: ...
@@ -75,14 +90,11 @@ class Session:
         self.io.stderr(_INVALID)
 
     def _choose(self, label: str, options: Sequence[str], default: int | None) -> int:
-        text = label + " " + " ".join(f"[{number}] {option}" + (" (既定)" if number == default else "")
-                                      for number, option in enumerate(options, 1))
+        """`label [1] a [2] b [既定の番号]:` の形で番号を選ばせる。空回答は default (無ければ再質問)。"""
+        text = choice_text(label, options)
         while True:
-            answer = self.io.ask(text)
-            if answer is None or answer == "":
-                if default is not None:
-                    return default
-            elif answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
+            answer = self.io.ask(text, str(default) if default is not None else None)
+            if answer and answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(options):
                 return int(answer)
             self._invalid()
 
@@ -105,7 +117,8 @@ class Session:
             default = 1
         elif current is not None:
             default = next((n for n, c in enumerate(found, 1) if c.address == current), None)
-        options = [f"{c.address} ({c.scope})" for c in found]
+        options = [f"{c.address} ({display_name(c.ifname)})" for c in found]
+        self.io.stdout(BIND_EXPLANATION)
         return found[self._choose("待受アドレス", options, default) - 1].address
 
     def _ask_allow(self, default: Sequence[str] | None) -> list[str]:
@@ -131,24 +144,39 @@ class Session:
         answer = self.io.ask("この設定で公開してよい場合は yes と入力してください")
         return (answer or "").strip() == "yes"
 
+    def _ask_credentials(self, current_user: str) -> tuple[str, SecretPlan]:
+        """ユーザー名と password。user と password の文法違反、確認の不一致は合計 3 回で打ち切る。"""
+        failures = 0
+
+        def failed() -> None:
+            nonlocal failures
+            failures += 1
+            self._invalid()
+            if failures >= MAX_CREDENTIAL_FAILURES:
+                raise WebSetupError("setup_aborted")
+
+        while True:
+            answer = self.io.ask_raw(USER_LABEL, current_user) or ""
+            if USER_PATTERN.fullmatch(answer) is not None:
+                user = answer
+                break
+            failed()
+        while True:
+            typed = self.io.ask_secret(PASSWORD_LABEL)
+            if typed == "":
+                return user, SecretPlan("install", generate_password(self.token_bytes), generated=True)
+            try:
+                password = check_password(typed)
+            except WebSetupError:
+                failed()
+                continue
+            if self.io.ask_secret(CONFIRM_LABEL) != typed:
+                failed()
+                continue
+            return user, SecretPlan("install", password)
+
     def _ask_secret(self, auth: str, live: str) -> SecretPlan | None:
-        """password の選択。None は「認証方式を選び直す」。"""
-        if auth == "basic":
-            if live == "safe":
-                choice = self._choose("password", ["既存の password を再利用する (表示しません)",
-                                                    "新しく生成する", "自分で入力する"], 1)
-                if choice == 1:
-                    return SecretPlan("keep")
-                generate = choice == 2
-            else:
-                generate = self._choose("password", ["生成する", "自分で入力する"], 1) == 1
-            if generate:
-                return SecretPlan("install", generate_password(self.token_bytes), generated=True)
-            while True:
-                try:
-                    return SecretPlan("install", check_password(self.io.ask_secret("password (16〜128 文字)")))
-                except WebSetupError:
-                    self._invalid()
+        """認証なしの目標での secret の扱い。None は「認証方式を選び直す」。"""
         if live == "safe":
             choice = self._choose("既存の password が残っています。認証なしにして削除します。",
                                   ["削除して認証なしにする", "認証方式を選び直す"], None)
@@ -164,8 +192,13 @@ class Session:
         else:
             default = 1
         while True:
-            who = self._choose("誰が見られるか", ["許可 IP だけ", "パスワード", "両方",
-                                                  "この待受アドレスへ到達できる全 IPv4"], default)
+            who = self._choose(ACCESS_LABEL, ACCESS_OPTIONS, default)
+            new_auth = "basic" if who in (2, 3) else "none"
+            plan: SecretPlan | None = None
+            user = cur.get("user", DEFAULT_USER)
+            if new_auth == "basic" and live == "safe":
+                if self._choose(KEEP_LABEL, KEEP_OPTIONS, None) == 1:
+                    plan = SecretPlan("keep")
             if who in (1, 3):
                 limited = allow if allow and allow != [UNRESTRICTED] else None
                 chosen = self._ask_allow(limited)
@@ -173,15 +206,20 @@ class Session:
                 chosen = [UNRESTRICTED]
                 if who == 4 and not self._confirm_unrestricted():
                     continue
-            new_auth = "basic" if who in (2, 3) else "none"
-            plan = self._ask_secret(new_auth, live)
-            if plan is None:
-                continue
+            if new_auth == "basic":
+                if plan is None:
+                    user, plan = self._ask_credentials(user)
+                cur["user"] = user
+            else:
+                plan = self._ask_secret(new_auth, live)
+                if plan is None:
+                    continue
+                cur.pop("user", None)
             cur["allow"], cur["auth"] = chosen, new_auth
             return plan
 
     def collect(self, defaults: dict[str, Any], live: str, steps: frozenset[str]) -> tuple[dict[str, Any], SecretPlan]:
-        """目標の web 4 key と secret の計画を質問で決める。defaults は live の単独の文法を通る値。"""
+        """目標の web 5 key と secret の計画を質問で決める。defaults は live の単独の文法を通る値。"""
         cur = dict(defaults)
         if WHO in steps and is_loopback(cur):
             # 自機のみの設定では認証を選べない。公開範囲から聞き直す。
@@ -231,12 +269,14 @@ class Session:
         if "bind" not in cur or "allow" not in cur:
             raise WebSetupError("setup_input_required", 2)
         result.update({"bind": cur["bind"], "allow": cur["allow"], "auth": auth_of(cur)})
+        if result["auth"] == "basic":
+            result["user"] = cur.get("user", DEFAULT_USER)
         return result
 
     # --- 前処理と probe の周回 -------------------------------------------------------------
 
     def converge(self, values: dict[str, Any], plan: SecretPlan, *, interactive: bool,
-                 show_password: Callable[[str], None],
+                 show_password: Callable[[str, str], None],
                  reason_code: Callable[[object], str]) -> tuple[int, str] | None:
         """(a) secret → (b) config → probe を、成功するか打ち切るまで繰り返す。成功は None、失敗は (rc, reason)。
 

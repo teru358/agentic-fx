@@ -81,10 +81,11 @@ def test_none_never_reads_the_password(tmp_path):
     assert startup.read_secrets(_plan(tmp_path, "none")) == {}
 
 
-# --- AC-34: 15 / 16 / 128 / 129 と文字 class ------------------------------------------------
+# --- AC-34: 7 / 8 / 32 / 33 と文字 class -----------------------------------------------------
 
-@pytest.mark.parametrize(("size", "reason"), [(15, "secret_invalid"), (16, None), (128, None),
-                                              (129, "secret_invalid"), (0, "secret_invalid")])
+@pytest.mark.parametrize(("size", "reason"), [(7, "secret_invalid"), (8, None), (32, None),
+                                              (33, "secret_invalid"), (0, "secret_invalid"),
+                                              (16, None), (128, "secret_invalid")])
 def test_password_size_boundaries_for_basic(tmp_path, size, reason):
     _password(_secret_dir(tmp_path), b"a" * size)
     assert _check(tmp_path) == reason
@@ -94,6 +95,7 @@ def test_password_size_boundaries_for_basic(tmp_path, size, reason):
 @pytest.mark.parametrize("data", [
     b"a" * 15 + b" ", b"a" * 15 + b"\n", b"a" * 15 + b"\t", b"a" * 15 + b"\x7f",
     b"a" * 15 + b"\x00", b"a" * 15 + "é".encode(), b"a" * 14 + b"\r\n", b"a" * 14 + b"\xff\xfe",
+    b"a" * 8 + b" ", b"a" * 7 + b"\n",
 ])
 def test_password_byte_grammar_for_basic(tmp_path, data):
     _password(_secret_dir(tmp_path), data)
@@ -102,7 +104,7 @@ def test_password_byte_grammar_for_basic(tmp_path, data):
 
 
 def test_every_visible_ascii_byte_is_allowed(tmp_path):
-    data = bytes(range(0x21, 0x7f))[:64]
+    data = bytes(range(0x21, 0x7f))[:32]
     _password(_secret_dir(tmp_path), data)
     assert _check(tmp_path) is None
     assert _read(tmp_path) == data
@@ -196,7 +198,7 @@ def test_prepare_dirs_never_reports_the_generic_secrets_failed_for_web(tmp_path)
 def test_no_fd_is_left_open_on_any_basic_outcome(tmp_path):
     before = _fds()
     directory = _secret_dir(tmp_path)
-    for data in (PASSWORD, b"x", b"a" * 129):
+    for data in (PASSWORD, b"x", b"a" * 33):
         _password(directory, data)
         _check(tmp_path)
         _read(tmp_path)

@@ -43,7 +43,7 @@ def quiet_manager(monkeypatch):
     monkeypatch.setattr("agentic_fx.ops_setup.stages.resolve_ops_exec",
                         lambda paths: replace(paths, ops_exec="/bin/true"))
     monkeypatch.setattr("agentic_fx.ops_setup.stages.interface_listing.list_interfaces",
-                        lambda _exec: (Candidate(LAN, 2, "global"),))
+                        lambda _exec: (Candidate(LAN, 2, "global", "enp6s0"),))
 
 
 def _status(capsys) -> list[str]:
@@ -68,9 +68,13 @@ def _access(capsys) -> str:
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "none"}, False,
      f"web-access: bind={LAN}:8788 allow=unrestricted auth=none"),
     ({"port": 8788, "bind": LAN, "allow": ["0.0.0.0/0"], "auth": "basic"}, True,
-     f"web-access: bind={LAN}:8788 allow=unrestricted auth=basic"),
+     f"web-access: bind={LAN}:8788 allow=unrestricted auth=basic user=afx"),
     ({"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic"}, True,
-     f"web-access: bind={LAN}:8788 allow=restricted auth=basic"),
+     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=afx"),
+    ({"port": 8788, "bind": LAN, "allow": ["10.0.0.0/8"], "auth": "basic", "user": "ops-web"}, True,
+     f"web-access: bind={LAN}:8788 allow=restricted auth=basic user=ops-web"),
+    ({"port": 8788, "bind": "127.0.0.1", "auth": "basic", "user": "a" * 32}, True,
+     f"web-access: bind=127.0.0.1:8788 allow=loopback-default auth=basic user={'a' * 32}"),
 ])
 def test_status_prints_the_stage_line_then_one_access_line(root, xdg, capsys, quiet_manager, values, secret, line):
     apply_target(root, values, SecretPlan("install", PW) if secret else SecretPlan("absent"))

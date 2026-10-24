@@ -159,8 +159,8 @@ class FeaturePlan:
 
 
 WEB_PASSWORD = "web.password"
-WEB_PASSWORD_MIN = 16
-WEB_PASSWORD_MAX = 128
+WEB_PASSWORD_MIN = 8
+WEB_PASSWORD_MAX = 32
 
 # bot は Discord の bot token、notify は webhook の URL (宛先そのものが送信の鍵)。web が置いてよい
 # secret は `web.password` だけで、必須かどうかは auth で決まる
@@ -736,7 +736,7 @@ def inspect_web_secret(secret_dir: Path) -> bool:
 
     dir が無ければ False (許可)。存在する dir は自 uid・0700 を求め、検査済みの dir fd から
     許可外の entry (writer の一時 file を含む) の不在と、`web.password` の通常 file・自 uid・
-    0600 ちょうど・16〜128 byte・visible ASCII を確かめる。違反は `secret_invalid`。
+    0600 ちょうど・8〜32 byte・visible ASCII を確かめる。違反は `secret_invalid`。
     password の中身は返さず、読んだ fd は全て閉じてから戻る。
     """
     dir_fd = _open_web_secret_dir(secret_dir)
@@ -765,7 +765,7 @@ def inspect_web_secret(secret_dir: Path) -> bool:
 
 
 def _read_web_password(dir_fd: int) -> bytes:
-    """`web.password` を一度だけ読む。通常 file・自 uid・0600 ちょうど・16〜128 byte・visible ASCII。"""
+    """`web.password` を一度だけ読む。通常 file・自 uid・0600 ちょうど・8〜32 byte・visible ASCII。"""
     try:
         fd = os.open(WEB_PASSWORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NOCTTY | os.O_NONBLOCK
                      | os.O_CLOEXEC, dir_fd=dir_fd)

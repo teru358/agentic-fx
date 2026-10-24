@@ -20,7 +20,7 @@ ABSENT = "192.168.77.5"
 
 
 def _fake_ip(directory, *addresses: str) -> str:
-    document = json.dumps([{"ifindex": 2, "addr_info": [
+    document = json.dumps([{"ifindex": 2, "ifname": "enp6s0", "addr_info": [
         {"family": "inet", "local": address, "prefixlen": 24} for address in addresses]}])
     script = directory / "ip"
     script.write_text(f"#!/bin/sh\ncat <<'EOF'\n{document}\nEOF\n", encoding="utf-8")
@@ -93,3 +93,20 @@ def test_every_entrance_runs_the_one_enumeration_function_once(home, tmp_path, c
     probe.main("web")
     capsys.readouterr()
     assert calls == [1, 1, 1]
+
+
+def test_a_missing_ifname_fails_the_command_probe_and_production_alike(home, tmp_path, capsys,
+                                                                       monkeypatch, _web_dirs):
+    document = json.dumps([{"ifindex": 2, "addr_info": [
+        {"family": "inet", "local": PRIMARY, "prefixlen": 24}]}])
+    script = tmp_path / "ip"
+    script.write_text(f"#!/bin/sh\ncat <<'EOF'\n{document}\nEOF\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr(interfaces, "IP_CANDIDATES", (str(script),))
+    assert cli.main(["interfaces"]) == 71
+    out, err = capsys.readouterr()
+    assert (out, err) == ("", "afx-ops: interface_lookup_failed\n")
+    _install(_web_dirs, PRIMARY)
+    assert _production(_web_dirs) == "interface_lookup_failed"
+    assert probe.main("web") == 71
+    assert capsys.readouterr().err == "afx-ops: interface_lookup_failed\n"
