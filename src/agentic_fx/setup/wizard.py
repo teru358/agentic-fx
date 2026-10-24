@@ -1213,7 +1213,7 @@ def _choose_improve_backend(sess: _Session, st: _Start, a: Answers, url: str, pr
         a.context_limit = limit if limit is not None else _ask_positive_int(
             sess, "context_limit (llama-swap の --ctx-size と同じ値)")
         sess.say("improve.llama_swap_verified はここでは true にしません。"
-                 "`afx improve verify-backend --backend opencode` に合格してから手で書いてください。")
+                 "`afx check backend --backend opencode` に合格してから手で書いてください。")
         return
     _node_check(sess)
     _secret_env_warning(sess)
@@ -1227,7 +1227,7 @@ def _choose_improve_backend(sess: _Session, st: _Start, a: Answers, url: str, pr
             _record_claude_binary(sess, cfg.bin, a)
         if result.result == "ok" and st.improve_isolation_ok:
             a.run_verify_improve = sess.yesno(
-                "改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。サブスクの枠を少し使います", False)
+                "改善 backend の実往復 (`afx check backend`) を確定の後に試験しますか。サブスクの枠を少し使います", False)
         return
     _improve_cli(sess, st, a, "codex", None)
 
@@ -1358,7 +1358,7 @@ def _improve_cli(sess: _Session, st: _Start, a: Answers, backend: str,
     sess.say("1 回の改善 mission はサブスク枠を使います。")
     if result.result == "ok" and st.improve_isolation_ok:
         a.run_verify_improve = sess.yesno(
-            "改善 backend の実往復 (`afx improve verify-backend`) を確定の後に試験しますか。"
+            "改善 backend の実往復 (`afx check backend`) を確定の後に試験しますか。"
             "サブスクの枠を少し使います", False)
 
 
@@ -1946,11 +1946,11 @@ def _verify_improve_backend(sess: _Session, a: Answers) -> None:
     backend = a.improve_backend
     if not a.run_verify_improve or backend is None:
         return
-    sess.say(f"改善 backend ({backend}) の実往復を試験します (子 process の `afx improve verify-backend`)。")
+    sess.say(f"改善 backend ({backend}) の実往復を試験します (子 process の `afx check backend`)。")
     reason: str | None = None
     try:
         completed = sess.deps.run(
-            [sys.executable, "main.py", "improve", "verify-backend", "--backend", backend],
+            [sys.executable, "main.py", "check", "backend", "--backend", backend],
             cwd=str(sess.root), capture_output=True, text=True, timeout=1800)
         ok = getattr(completed, "returncode", 1) == 0
         reason = None if ok else "verify_failed"

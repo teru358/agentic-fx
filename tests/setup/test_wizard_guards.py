@@ -256,7 +256,7 @@ def test_a_failed_check_naming_the_improve_schedule_returns_to_the_schedule_ques
 def test_a_failed_improve_exchange_is_verify_failed_not_a_connection_error(tmp_path, home):
     root = make_root(tmp_path)
     deps, run = claude_world(tmp_path, home)
-    run.on(__import__("sys").executable, "main.py", "improve", "verify-backend", "--backend", "claude", returncode=1)
+    run.on(__import__("sys").executable, "main.py", "check", "backend", "--backend", "claude", returncode=1)
     io = ScriptedWizardIO(responder=fresh_responder(("LLM の構成", "1"), ("改善 backend の実往復", "y")))
     assert run_wizard(root, io, deps) == 0, io.text
     improve = record_of(root)["llm_improve"]

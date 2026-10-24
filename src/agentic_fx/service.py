@@ -507,7 +507,7 @@ def _check_cli_backend_steps(settings, backend: str):
                 "opencode_unverified",
                 "runner.improve.backend='opencode' requires "
                 "improve.llama_swap_verified=true (set only after "
-                "`afx improve verify-backend --backend opencode` passes)")
+                "`afx check backend --backend opencode` passes)")
         bin_path = _resolve_cli_bin(settings.runner.opencode.bin, require_elf=True)
         settings = settings.model_copy(update={"runner": settings.runner.model_copy(
             update={"opencode": settings.runner.opencode.model_copy(

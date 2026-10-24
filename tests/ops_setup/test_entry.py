@@ -21,7 +21,7 @@ def test_ops_enable_dispatches_feature_without_starting_daemon(tmp_path, monkeyp
 
     monkeypatch.setattr("agentic_fx.ops_setup.interactive.interactive_enable", enable)
 
-    assert main(["ops", "enable", "bot"]) == 0
+    assert main(["ops", "bot", "enable"]) == 0
     assert seen == ["bot"]
     assert capsys.readouterr().out == ""
     assert not (tmp_path / "data" / "instance.lock").exists()
@@ -43,7 +43,7 @@ def test_ops_status_reports_saved_operation_stage_and_failure(tmp_path, monkeypa
 
     monkeypatch.setattr("agentic_fx.ops_setup.systemd.Systemd.show", show)
 
-    assert main(["ops", "status", "bot"]) == 0
+    assert main(["ops", "bot", "status"]) == 0
 
     assert capsys.readouterr().out.strip() == (
         "bot: enable installed (ops_not_ready) unit=activating result=exit-code")
@@ -62,7 +62,7 @@ def test_ops_dispatches_each_feature_and_action(tmp_path, monkeypatch, capsys, f
 
     monkeypatch.setattr(f"agentic_fx.ops_setup.stages.OpsSetup.{action}", run)
 
-    assert main(["ops", action, feature]) == 0
+    assert main(["ops", feature, action]) == 0
     assert seen == [(action, feature)]
     assert capsys.readouterr().out == f"{feature}: {action}d\n"
 
@@ -80,7 +80,7 @@ def test_ops_failure_prints_fixed_reason_and_exits_1(tmp_path, monkeypatch, caps
 
     monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "disable", "bot"]) == 1
+    assert main(["ops", "bot", "disable"]) == 1
     captured = capsys.readouterr()
     assert captured.err == f"afx ops: {reason}\n"
     assert captured.out == ""
@@ -94,7 +94,7 @@ def test_ops_failure_prints_detail_after_the_fixed_reason(tmp_path, monkeypatch,
 
     monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "disable", "bot"]) == 1
+    assert main(["ops", "bot", "disable"]) == 1
     assert capsys.readouterr().err == "afx ops: start (rc=5 stderr=Unit afx.service not found.)\n"
 
 
@@ -105,7 +105,7 @@ def test_ops_status_without_systemctl_reports_unknown_unit(tmp_path, monkeypatch
     empty.mkdir()
     monkeypatch.setenv("PATH", str(empty))
 
-    assert main(["ops", "status", "bot"]) == 0
+    assert main(["ops", "bot", "status"]) == 0
 
     assert capsys.readouterr().out == "bot: disable disabled unit=unknown result=unknown\n"
 
@@ -118,5 +118,41 @@ def test_ops_marker_rejection_prints_owner_and_recovery(tmp_path, monkeypatch, c
 
     monkeypatch.setattr("agentic_fx.ops_setup.stages.OpsSetup.disable", enable)
 
-    assert main(["ops", "disable", "bot"]) == 1
+    assert main(["ops", "bot", "disable"]) == 1
     assert capsys.readouterr().err == "afx ops: marker_foreign (path=/x feature=web)\n"
+
+
+def test_ops_legacy_shape_normalizes_after_multiple_daemon_prefixes(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    seen: list[tuple[str, str]] = []
+
+    def run(root, action: str, feature: str):
+        seen.append((action, feature))
+        return 0
+
+    monkeypatch.setattr("agentic_fx.ops_setup.stages.run_ops_command", run)
+    assert main(["--daemon", "--daemon", "ops", "status", "web"]) == 0
+    assert seen == [("status", "web")]
+    assert "afx ops status web は旧形です。afx ops web status を使ってください。" in capsys.readouterr().err
+
+
+def test_ops_reconf_dispatches_the_web_reconfigure_handler(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    seen: list[tuple[object, str]] = []
+
+    def reconfigure(root, feature: str):
+        seen.append((root, feature))
+        return 7
+
+    monkeypatch.setattr("agentic_fx.ops_setup.reconfigure.run_ops_reconfigure", reconfigure)
+    assert main(["ops", "web", "reconf"]) == 7
+    assert seen == [(tmp_path, "web")]
+
+
+def test_expired_compatibility_does_not_intercept_improve(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("agentic_fx.entry.importlib.metadata.version", lambda _name: "0.3.0")
+    with pytest.raises(SystemExit) as exc:
+        main(["improve"])
+    assert exc.value.code == 2
+    assert "廃止されました" not in capsys.readouterr().err

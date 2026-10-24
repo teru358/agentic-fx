@@ -1338,7 +1338,7 @@ def test_cli_improve_verify_backend_routes_to_verify_backend(tmp_path, monkeypat
         vb.return_value = VerifyBackendResult(
             ok=True, backend="local", provider=None,
             fingerprint="0" * 64, detail="ok")
-        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+        rc = entry_main(["check", "backend", "--backend", "local"])
     assert rc == 0
     assert vb.call_args.kwargs["backend"] == "local"
     assert vb.call_args.kwargs["provider"] is None
@@ -1360,7 +1360,7 @@ def test_cli_improve_verify_backend_routes_opencode_through_to_verify_backend(
         vb.return_value = VerifyBackendResult(
             ok=True, backend="opencode", provider=None,
             fingerprint="0" * 64, detail="ok")
-        rc = entry_main(["improve", "verify-backend", "--backend", "opencode"])
+        rc = entry_main(["check", "backend", "--backend", "opencode"])
     assert rc == 0
     assert vb.call_args.kwargs["backend"] == "opencode"
     assert vb.call_args.kwargs["provider"] is None
@@ -1380,7 +1380,7 @@ def test_cli_verify_backend_prints_enable_guidance_for_opencode(
         vb.return_value = VerifyBackendResult(
             ok=True, backend="opencode", provider=None,
             fingerprint="0" * 64, detail="ok")
-        rc = entry_main(["improve", "verify-backend", "--backend", "opencode"])
+        rc = entry_main(["check", "backend", "--backend", "opencode"])
     assert rc == 0
     assert vb.call_args.kwargs["provider"] is None
     assert "llama_swap_verified" in capsys.readouterr().out
@@ -1404,7 +1404,7 @@ def test_cli_verify_backend_prints_detail_and_fingerprint_on_success(
         vb.return_value = VerifyBackendResult(
             ok=True, backend="codex", provider="chatgpt",
             fingerprint=fp, detail="backend=codex provider=chatgpt model=m")
-        rc = entry_main(["improve", "verify-backend", "--backend", "codex",
+        rc = entry_main(["check", "backend", "--backend", "codex",
                         "--provider", "chatgpt"])
     out = capsys.readouterr().out
     assert rc == 0
@@ -1431,7 +1431,7 @@ def test_cli_improve_verify_backend_returns_1_when_verification_fails(
         vb.return_value = VerifyBackendResult(
             ok=False, backend="local", provider=None,
             fingerprint=None, detail="mission did not complete: status=failed")
-        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+        rc = entry_main(["check", "backend", "--backend", "local"])
     assert rc == 1
     assert "mission did not complete: status=failed" in capsys.readouterr().err
 
@@ -1456,7 +1456,7 @@ def test_cli_verify_backend_reports_ready_mismatch_as_rc1_not_traceback(
         vb.side_effect = VerifyBackendGateError(
             "verify-backend: ready frame run_context mismatch (expected "
             "mission_id=-1 ...)")
-        rc = entry_main(["improve", "verify-backend", "--backend", "local"])
+        rc = entry_main(["check", "backend", "--backend", "local"])
     assert rc == 1
     err = capsys.readouterr().err
     assert "run_context mismatch" in err
@@ -1474,9 +1474,42 @@ def test_cli_improve_verify_backend_requires_backend_argument(
     monkeypatch.chdir(tmp_path)
     _install_settings(tmp_path)
     with pytest.raises(SystemExit) as exc:
-        entry_main(["improve", "verify-backend"])
+        entry_main(["check", "backend"])
     assert exc.value.code == 2
     assert "--backend" in capsys.readouterr().err
+
+
+def test_check_backend_rejects_parent_read_options_before_the_backend(tmp_path, monkeypatch, capsys):
+    from agentic_fx.entry import main as entry_main
+    monkeypatch.chdir(tmp_path)
+    called = False
+
+    def backend(*_args, **_kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("agentic_fx.backtest.cli.verify_backend_command", backend)
+    assert entry_main(["check", "--json", "backend", "--backend", "local"]) == 2
+    assert called is False
+    assert capsys.readouterr().err == "`--json` / `--unit-env` は `afx check backend` と併用できません。\n"
+
+
+def test_check_backend_prints_the_fixed_warning_and_uses_no_isolation_sentinel(
+        tmp_path, monkeypatch, capsys):
+    from unittest.mock import patch
+    from agentic_fx.entry import main as entry_main
+    from agentic_fx.loops.verify_backend import OPERATOR_SHELL_NO_ISOLATION, VerifyBackendResult
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        verify.return_value = VerifyBackendResult(
+            ok=True, backend="local", provider=None, fingerprint="0" * 64, detail="ok")
+        assert entry_main(["check", "backend", "--backend", "local"]) == 0
+    assert verify.call_args.kwargs["isolation_options"] is OPERATOR_SHELL_NO_ISOLATION
+    assert capsys.readouterr().out.splitlines()[:2] == [
+        "この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ (`improve isolation: enabled; … fingerprint=`) を見る",
+        "実 backend へ 1 往復し、課金またはサブスク枠を使う。",
+    ]
 
 
 # --- [indicator-consumption-wiring] T3: CLI の依存解決 (A1'/A1'') ----------
