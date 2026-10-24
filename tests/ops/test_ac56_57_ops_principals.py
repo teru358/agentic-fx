@@ -9,11 +9,10 @@ import time
 
 import pytest
 
-from agentic_fx.ops import contracts, keys
+from agentic_fx.ops import contracts
 from agentic_fx.ops.api_server import ROUTES
 from agentic_fx.ops.contracts import Principal
 
-from ._api import make_api
 from .conftest import digest_of, hold_plugin_lock
 
 OPERATOR, APPROVER = Principal.OPERATOR, Principal.APPROVER
@@ -35,19 +34,6 @@ SPEC_SCOPES = {
 ACTOR = "discord:123456789012345678"
 OTHER_ACTOR = "discord:876543210987654321"
 H = "X-Afx-Asserted-Actor"
-
-
-@pytest.fixture
-def api5(ops_env):
-    directory = keys.key_dir(ops_env.root)
-    keys.initialize(directory, root=ops_env.root)
-    for principal in (OPS_BOT, OPS_WEB, OPS_NOTIFY):
-        keys.enroll(directory, principal)
-    api_env = make_api(ops_env)
-    yield api_env
-    for client in api_env.clients:
-        client.close()
-    api_env.server.stop(5.0)
 
 
 def _wait_job(client, job_id, headers=None, timeout=15.0):

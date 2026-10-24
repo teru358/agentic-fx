@@ -731,6 +731,15 @@ def _backlog_display(value) -> str:
     return text if len(text) <= 200 else text[:199] + "…"
 
 
+_STALE_ADVICE = (
+    ("unreadable", "policy/directives.md を読める状態 (権限、UTF-8) に直してから "
+                   "afx ctl policy reconcile を実行してください。"),
+    ("malformed", "marker を手修正してから afx ctl policy reconcile を実行してください。"),
+)
+_STALE_ADVICE_DEFAULT = ("Mission に入る方針が DB と一致していません。"
+                         "afx ctl policy reconcile で DB に合わせられます。")
+
+
 def _hash_head(value) -> str:
     return value[:12] if isinstance(value, str) and _HASH_HEAD.fullmatch(value) else "-"
 
@@ -1223,31 +1232,28 @@ class Runner:
         if managed:
             for row in managed:
                 self.say(f"  #{_ident(row.get('id'))} {_safe_cell(row.get('created_at'), 200)} "
-                         f"{_safe_cell(row.get('directive'), 200)}")
+                         f"{_backlog_display(row.get('directive'))}")
         else:
             self.say("  0 件")
         self.say("管理外 (API から削除できません):")
         if unmanaged:
             for row in unmanaged:
-                self.say(f"  line {_ident(row.get('line'))} {_safe_cell(row.get('directive'), 200)}")
+                self.say(f"  line {_ident(row.get('line'))} {_backlog_display(row.get('directive'))}")
         else:
             self.say("  0 件")
         projection = data.get("projection") if isinstance(data.get("projection"), dict) else {}
         status = projection.get("status")
         reasons = projection.get("reasons")
-        reason_text = ", ".join(_safe_cell(reason, 80) for reason in reasons if isinstance(reason, str)) \
-            if isinstance(reasons, list) else "-"
         if status == "ok":
             self.say("投影: ok")
-        elif "unreadable" in (reasons if isinstance(reasons, list) else []):
-            self.say("投影: stale (" + reason_text + ")。policy/directives.md を読める状態 "
-                     "(権限、UTF-8) に直してから afx ctl policy reconcile を実行してください。")
-        elif "malformed" in (reasons if isinstance(reasons, list) else []):
-            self.say("投影: stale (" + reason_text + ")。marker を手修正してから "
-                     "afx ctl policy reconcile を実行してください。")
+        elif not isinstance(reasons, list) or not reasons:
+            self.say("投影: stale (unknown)。" + _STALE_ADVICE_DEFAULT)
         else:
-            self.say("投影: stale (" + reason_text + ")。Mission に入る方針が DB と一致して"
-                     "いません。afx ctl policy reconcile で DB に合わせられます。")
+            reason_text = ", ".join(_safe_cell(reason, 80) for reason in reasons
+                                    if isinstance(reason, str))
+            advice = next((text for key, text in _STALE_ADVICE if key in reasons),
+                          _STALE_ADVICE_DEFAULT)
+            self.say("投影: stale (" + reason_text + ")。" + advice)
         return RC_OK
 
     def _op_policy_remove(self, identifier: int, *, terminal) -> int:

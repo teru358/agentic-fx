@@ -260,16 +260,16 @@ _TRANSIENT = [ErrorCode.DATABASE_BUSY, ErrorCode.REQUEST_TIMEOUT, ErrorCode.UNAV
 @pytest.mark.parametrize("code", _TRANSIENT)
 def test_ac35_transient_failure_keeps_the_audit_row_but_the_key_can_be_resent(ops_env, code):
     service = ops_env.service()
-    real = service._regenerate_policy
+    real = service._reconcile_policy
     calls = {"n": 0}
 
     def flaky():
         calls["n"] += 1
         if calls["n"] == 1:
             raise OpsError(code)
-        real()
+        return real()
 
-    service._regenerate_policy = flaky
+    service._reconcile_policy = flaky
     with pytest.raises(OpsError) as raised:
         service.add_policy(OPERATOR, "retry-key", "risk small")
     assert raised.value.code is code
@@ -292,7 +292,7 @@ def test_ac35_permanent_failure_stays_stored_and_does_not_rerun_the_action(ops_e
         calls["n"] += 1
         raise OpsError(ErrorCode.INVALID_STATE)
 
-    service._regenerate_policy = refuse
+    service._reconcile_policy = refuse
     for _ in range(2):
         with pytest.raises(OpsError) as raised:
             service.add_policy(OPERATOR, "perm-key", "risk small")

@@ -229,9 +229,10 @@ def unmanaged_policy_lines(path: Path) -> list[tuple[int, str]]:
     claimed = {position for _, _, positions in parsed.blocks for position in positions}
     terminal = len(parsed.lines) - 1
     return [
-        (position + 1, line.decode("utf-8"))
+        (position + 1, _line_view(line).decode("utf-8"))
         for position, line in enumerate(parsed.lines)
-        if position not in claimed and not (position == terminal and line == b"")
+        if position not in claimed and _line_view(line)
+        and not (position == terminal and line == b"")
     ]
 
 

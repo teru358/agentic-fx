@@ -21,9 +21,7 @@ from agentic_fx.ops.contracts import Principal
 from agentic_fx.service import _recover_ops
 
 from .conftest import APPROVER, OPERATOR
-from .test_ac56_57_ops_principals import (  # noqa: F401
-    H, ACTOR, OPS_BOT, OPS_NOTIFY, OPS_WEB, api5)
-from ._api import api  # noqa: F401
+from .test_ac56_57_ops_principals import H, ACTOR, OPS_BOT, OPS_NOTIFY, OPS_WEB
 
 CHILD = Path(__file__).with_name("_policy_crash_child.py")
 REMOVE = "POST /v1/policy/{id}/remove"
@@ -69,7 +67,8 @@ def _snapshot(env) -> dict:
         "requests": _table(env, "SELECT * FROM ops_requests ORDER BY id"),
         "idempotency": _table(env, "SELECT * FROM ops_idempotency ORDER BY rowid"),
         "activity_raw": env.activity_path.read_bytes() if env.activity_path.exists() else None,
-        "activity": [line for line in _activity(env).splitlines() if "\tops_" not in line],
+        "activity": [line for line in _activity(env).splitlines() if "\tpolicy_" in line],
+        "ops_activity": [line for line in _activity(env).splitlines() if "\tops_" in line],
     }
 
 
@@ -197,13 +196,48 @@ def _run_show(data):
     return rc, out.getvalue()
 
 
-@pytest.mark.parametrize("length,shown", [(199, 199), (200, 200), (201, 200)])
+@pytest.mark.parametrize("length,shown", [(199, 199), (200, 200), (201, 199)])
 def test_policy_show_cli_cuts_directive_at_200_characters(length, shown):
     rc, text = _run_show(_show_data("x" * length))
 
     assert rc == 0
     cell = text.splitlines()[1].removeprefix("  #1 at ")
     assert cell == "x" * shown + ("…" if length > 200 else "")
+    assert len(cell) <= 200
+
+
+def test_policy_show_cli_cuts_unmanaged_directive_the_same_way():
+    rc, text = _run_show(_show_data("d", unmanaged=[
+        {"line": 2, "directive": "y" * 500, "removable": False}]))
+
+    assert rc == 0
+    cell = text.splitlines()[3].removeprefix("  line 2 ")
+    assert cell == "y" * 199 + "…" and len(cell) == 200
+
+
+@pytest.mark.parametrize("reasons", [None, [], "missing", {"a": 1}])
+def test_policy_show_cli_stale_without_a_usable_reason_list_uses_the_generic_sentence(reasons):
+    data = _show_data("d", status="stale")
+    data["projection"]["reasons"] = reasons
+    rc, text = _run_show(data)
+
+    assert rc == 0
+    assert text.splitlines()[-1] == (
+        "投影: stale (unknown)。Mission に入る方針が DB と一致していません。"
+        "afx ctl policy reconcile で DB に合わせられます。")
+
+
+@pytest.mark.parametrize("reasons,advice", [
+    (["unreadable"], "policy/directives.md を読める状態 (権限、UTF-8) に直してから "
+                     "afx ctl policy reconcile を実行してください。"),
+    (["malformed"], "marker を手修正してから afx ctl policy reconcile を実行してください。"),
+    (["missing", "order"], "Mission に入る方針が DB と一致していません。"
+                           "afx ctl policy reconcile で DB に合わせられます。")])
+def test_policy_show_cli_stale_advice_by_reason(reasons, advice):
+    rc, text = _run_show(_show_data("d", status="stale", reasons=reasons))
+
+    assert rc == 0
+    assert text.splitlines()[-1] == f"投影: stale ({', '.join(reasons)})。" + advice
 
 
 @pytest.mark.parametrize("directive", [
@@ -313,6 +347,7 @@ def test_removing_an_already_removed_id_changes_nothing_but_the_audit_rows(ops_e
     assert raised.value.code is ErrorCode.NOT_FOUND
     for key in ("file", "policies", "migrations", "activity"):
         assert after[key] == before[key], key
+    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
     assert ops_env.policy_path.stat().st_mtime_ns == mtime
     assert len(after["requests"]) == len(before["requests"]) + 2
 
@@ -411,6 +446,7 @@ def test_remove_refuses_a_file_with_an_unpaired_marker_and_keeps_every_byte(ops_
     after = _snapshot(ops_env)
     for key in ("file", "policies", "migrations", "activity"):
         assert after[key] == before[key], key
+    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
     assert _phases(ops_env, REMOVE) == [("accepted", None), ("failed", "internal")]
 
 
@@ -481,6 +517,7 @@ def test_mutation_with_an_unsafe_file_fails_internal_without_touching_the_databa
     after = _snapshot(ops_env)
     for key in ("file", "policies", "migrations", "activity"):
         assert after[key] == before[key], key
+    assert len(after["ops_activity"]) == len(before["ops_activity"]) + 1
     endpoint = ADD if operation == "add" else REMOVE
     assert _phases(ops_env, endpoint)[-2:] == [("accepted", None), ("failed", "internal")]
     assert all(row["phase"] != "outcome_unknown" for row in ops_env.ops_rows())
@@ -694,6 +731,7 @@ def test_reconcile_of_an_ok_file_touches_nothing_and_leaves_no_activity(ops_env)
     assert (after.st_ino, after.st_mtime_ns) == (stat.st_ino, stat.st_mtime_ns)
     assert _snapshot(ops_env)["activity"] == activity
     assert _count(ops_env, "policy_reconciled") == 0
+    assert _count(ops_env, "ops_policy_reconcile") == 1
     assert _phases(ops_env, RECONCILE) == [("accepted", None), ("succeeded", "ok")]
 
 

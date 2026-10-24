@@ -97,15 +97,6 @@ def make_api(ops_env, *, limits: ApiLimits = ApiLimits(), start: bool = True,
     return ApiEnv(ops_env, service, server, socket_path, directory, notifier, improve)
 
 
-@pytest.fixture
-def api(ops_env):
-    api_env = make_api(ops_env)
-    yield api_env
-    for client in api_env.clients:
-        client.close()
-    api_env.server.stop(5.0)
-
-
 def closed_order(env) -> int:
     now = env.wall().isoformat()
     cur = env.conn.execute(

@@ -9,7 +9,7 @@ from agentic_fx.ops import contracts
 from agentic_fx.ops.api_server import ROUTES, _match
 from agentic_fx.ops.contracts import Principal, Scope
 
-from ._api import api, backlog_row, closed_order  # noqa: F401
+from ._api import backlog_row, closed_order
 from .conftest import digest_of
 
 

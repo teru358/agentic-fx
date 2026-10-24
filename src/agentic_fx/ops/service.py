@@ -779,6 +779,17 @@ class OpsService:
 
     def show_policy(self, principal: Caller, *, deadline: float | None = None) -> dict:
         _authorize(principal, "policy_show")
+        deadline = self._deadline(deadline)
+        try:
+            with self._ops_lane(deadline):
+                return self._show_policy()
+        except BaseException as exc:
+            code = self._map_exception(exc)
+            if code is None or isinstance(exc, OpsError):
+                raise
+            raise OpsError(code) from None
+
+    def _show_policy(self) -> dict:
         rows = self._conn.execute(
             "SELECT id,created_at,directive FROM ops_policies ORDER BY id").fetchall()
         managed = [{"id": int(row["id"]), "created_at": row["created_at"],
@@ -820,8 +831,6 @@ class OpsService:
             insert_policy(self._conn, text, request_id=request_id, now=self._wall_clock())
             try:
                 self._regenerate_policy()
-            except OpsError:
-                raise
             except BaseException as exc:
                 raise PolicyProjectionUnknown() from exc
             # 既存運用との互換で、policy_added だけは先頭 200 文字を残す (§8 の例外)。
@@ -839,6 +848,9 @@ class OpsService:
 
         def action(_deadline: float, _accepted: AcceptedRequest) -> dict:
             self._reconcile_before_policy_mutation()
+            if self._conn.execute("SELECT 1 FROM ops_policies WHERE id=?",
+                                  (identifier,)).fetchone() is None:
+                raise OpsError(ErrorCode.NOT_FOUND)
             cursor = self._conn.execute("DELETE FROM ops_policies WHERE id=?", (identifier,))
             if cursor.rowcount != 1:
                 self._conn.rollback()
@@ -846,8 +858,6 @@ class OpsService:
             self._conn.commit()
             try:
                 self._regenerate_policy()
-            except OpsError:
-                raise
             except BaseException as exc:
                 raise PolicyProjectionUnknown() from exc
             self._activity("SYSTEM", "policy_removed", f"id={identifier}")

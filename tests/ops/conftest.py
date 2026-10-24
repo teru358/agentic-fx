@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from agentic_fx.ops import keys
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.service import OpsLimits, OpsService
 from agentic_fx.store import db
@@ -215,3 +216,27 @@ def hold_plugin_lock(plugins_root: Path, name: str):
 
 APPROVER = Principal.APPROVER
 OPERATOR = Principal.OPERATOR
+
+
+@pytest.fixture
+def api(ops_env):
+    from ._api import make_api
+    api_env = make_api(ops_env)
+    yield api_env
+    for client in api_env.clients:
+        client.close()
+    api_env.server.stop(5.0)
+
+
+@pytest.fixture
+def api5(ops_env):
+    from ._api import make_api
+    directory = keys.key_dir(ops_env.root)
+    keys.initialize(directory, root=ops_env.root)
+    for principal in (Principal.OPS_BOT, Principal.OPS_WEB, Principal.OPS_NOTIFY):
+        keys.enroll(directory, principal)
+    api_env = make_api(ops_env)
+    yield api_env
+    for client in api_env.clients:
+        client.close()
+    api_env.server.stop(5.0)

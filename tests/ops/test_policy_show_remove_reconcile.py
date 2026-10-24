@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import io
+import sqlite3
 
 import pytest
+
+from agentic_fx import policy_projection
 
 from agentic_fx.ops import ErrorCode, OpsError
 from agentic_fx.ops.client import ClientError, Op, Reply, Runner, parse
@@ -175,8 +179,149 @@ def test_policy_show_client_uses_fixed_headings_and_safe_200_character_cells():
 
     lines = output.getvalue().splitlines()
     assert lines[0] == "管理対象:"
-    assert lines[1] == "  #1 at " + "x" * 200 + "…"
+    assert lines[1] == "  #1 at " + "x" * 199 + "…"
     assert lines[2] == "管理外 (API から削除できません):"
     assert lines[3] == "  line 3 hand written"
     assert lines[4] == ("投影: stale (missing)。Mission に入る方針が DB と一致していません。"
                         "afx ctl policy reconcile で DB に合わせられます。")
+
+
+def _ops_error_after_commit():
+    raise OpsError(ErrorCode.UNAVAILABLE)
+
+
+def test_policy_add_ops_error_after_commit_is_unknown_and_never_inserts_twice(ops_env):
+    service = ops_env.service()
+    service._regenerate_policy = _ops_error_after_commit
+
+    with pytest.raises(OpsError) as raised:
+        service.add_policy(OPERATOR, "same-key", "directive")
+    with pytest.raises(OpsError) as replayed:
+        service.add_policy(OPERATOR, "same-key", "directive")
+
+    assert raised.value.code is ErrorCode.OUTCOME_UNKNOWN
+    assert replayed.value.code is ErrorCode.OUTCOME_UNKNOWN
+    assert [(r["phase"], r["result_code"]) for r in ops_env.ops_rows()] == [
+        ("accepted", None), ("outcome_unknown", "outcome_unknown")]
+    assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+    assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_idempotency").fetchone()[0] == 1
+    assert "\tpolicy_added\t" not in ops_env.activity_path.read_text(encoding="utf-8")
+
+
+def test_policy_remove_ops_error_after_commit_is_unknown_and_replays_unknown(ops_env):
+    service = ops_env.service()
+    service.add_policy(OPERATOR, "seed", "directive")
+    service._regenerate_policy = _ops_error_after_commit
+
+    with pytest.raises(OpsError) as raised:
+        service.remove_policy(OPERATOR, "same-key", 1)
+    with pytest.raises(OpsError) as replayed:
+        service.remove_policy(OPERATOR, "same-key", 1)
+
+    assert raised.value.code is ErrorCode.OUTCOME_UNKNOWN
+    assert replayed.value.code is ErrorCode.OUTCOME_UNKNOWN
+    assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+    assert ops_env.conn.execute(
+        "SELECT COUNT(*) FROM ops_idempotency WHERE endpoint='POST /v1/policy/{id}/remove'"
+    ).fetchone()[0] == 1
+    assert "\tpolicy_removed\t" not in ops_env.activity_path.read_text(encoding="utf-8")
+
+
+def test_policy_remove_of_a_missing_id_never_executes_a_delete(ops_env):
+    service = ops_env.service()
+    service.add_policy(OPERATOR, "seed", "directive")
+    statements: list[str] = []
+    ops_env.conn.set_trace_callback(statements.append)
+    try:
+        with pytest.raises(OpsError) as raised:
+            service.remove_policy(OPERATOR, "missing", 99)
+    finally:
+        ops_env.conn.set_trace_callback(None)
+
+    assert raised.value.code is ErrorCode.NOT_FOUND
+    assert not [text for text in statements if text.lstrip().upper().startswith("DELETE")]
+    assert any("SELECT 1 FROM ops_policies" in text for text in statements)
+    assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
+
+
+def test_policy_show_reads_the_database_and_the_file_inside_the_ops_lane(ops_env, monkeypatch):
+    service = ops_env.service()
+    ops_env.policy_path.parent.mkdir(parents=True)
+    ops_env.policy_path.write_text("manual\n", encoding="utf-8")
+    inside = []
+    depth = [0]
+    original_lane = service._ops_lane
+    original_lines = policy_projection.unmanaged_policy_lines
+
+    @contextlib.contextmanager
+    def lane(deadline):
+        with original_lane(deadline):
+            depth[0] += 1
+            try:
+                yield
+            finally:
+                depth[0] -= 1
+
+    def lines(path):
+        inside.append(depth[0])
+        return original_lines(path)
+
+    monkeypatch.setattr(service, "_ops_lane", lane)
+    monkeypatch.setattr("agentic_fx.ops.service.unmanaged_policy_lines", lines)
+
+    result = service.show_policy(OPERATOR)
+
+    assert inside == [1]
+    assert result["unmanaged"] == [{"line": 1, "directive": "manual", "removable": False}]
+
+
+def test_policy_show_maps_a_busy_database_to_database_busy(ops_env, monkeypatch):
+    service = ops_env.service()
+
+    def busy():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service, "_show_policy", busy)
+    with pytest.raises(OpsError) as raised:
+        service.show_policy(OPERATOR)
+
+    assert raised.value.code is ErrorCode.DATABASE_BUSY
+
+
+def test_unmanaged_lines_drop_blank_views_strip_one_cr_and_keep_headings(tmp_path):
+    path = tmp_path / "directives.md"
+    path.write_bytes(b"# heading\r\n\r\n\n  \nplain\r\r\nlast\r\n")
+
+    assert policy_projection.unmanaged_policy_lines(path) == [
+        (1, "# heading"), (4, "  "), (5, "plain\r"), (6, "last")]
+
+
+def test_unmanaged_lines_exclude_valid_managed_blocks_and_blank_lines(tmp_path):
+    path = tmp_path / "directives.md"
+    path.write_bytes(b"\r\n- hand\n"
+                     b"<!-- afx:managed-policy id=1 -->\n- A\n<!-- /afx:managed-policy id=1 -->\n"
+                     b"\n")
+
+    assert policy_projection.unmanaged_policy_lines(path) == [(2, "- hand")]
+
+
+@pytest.mark.parametrize("endpoint,allowed", [("policy_reconcile", True), ("policy", False),
+                                              ("policy_remove", False)])
+def test_policy_autopilot_restriction_is_pinned_per_endpoint(ops_env, endpoint, allowed):
+    service = ops_env.service()
+    service.add_policy(OPERATOR, "seed", "directive")
+    ops_env.state.update(kill_switch_latched=True)
+    ops_env.state.update(autopilot=True)
+    calls = {
+        "policy_reconcile": lambda: service.reconcile_policy(OPERATOR, "k"),
+        "policy": lambda: service.add_policy(OPERATOR, "k", "second"),
+        "policy_remove": lambda: service.remove_policy(OPERATOR, "k", 1),
+    }
+
+    if allowed:
+        assert calls[endpoint]()["projection"]["status"] == "ok"
+    else:
+        with pytest.raises(OpsError) as raised:
+            calls[endpoint]()
+        assert raised.value.code is ErrorCode.AUTOPILOT_RESTRICTED
+        assert ops_env.conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1

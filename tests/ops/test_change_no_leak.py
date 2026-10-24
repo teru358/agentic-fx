@@ -12,7 +12,7 @@ import pytest
 from agentic_fx.ops import client
 from agentic_fx.ops.contracts import PRINCIPAL_SCOPES, ErrorCode, OpsError, Principal, Scope
 
-from ._api import api, backlog_row  # noqa: F401
+from ._api import backlog_row
 from ._change_fixtures import (approval_payload, insert_approval, make_live, make_staging,
                                make_version)
 from .conftest import OPERATOR
