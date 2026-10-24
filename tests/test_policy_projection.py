@@ -7,6 +7,7 @@ import pytest
 from agentic_fx.policy import Policy
 from agentic_fx.policy_projection import (
     ProjectionReconcileBlocked,
+    MigrationRecordUnknown,
     _render_directive,
     insert_policy,
     inspect_policy_file,
@@ -234,7 +235,7 @@ def test_replace_before_migration_record_converges_on_retry(tmp_path):
         def commit(self):
             conn.commit()
 
-    with pytest.raises(RuntimeError, match="injected record failure"):
+    with pytest.raises(MigrationRecordUnknown):
         reconcile_policy_file(RecordFailure(), path)
     replaced = path.read_bytes()
     assert b"<!-- afx:managed-policy id=1 -->" in replaced

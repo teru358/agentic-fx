@@ -109,6 +109,9 @@ def _every_endpoint(service):
         "backlog_reopen": lambda p: service.transition_backlog(p, 9999, "reopen"),
         "backlog_note": lambda p: service.transition_backlog(p, 9999, "note"),
         "policy": lambda p: service.add_policy(p, f"k-pol-{p}", "text"),
+        "policy_show": lambda p: service.show_policy(p),
+        "policy_remove": lambda p: service.remove_policy(p, f"k-pol-rem-{p}", 9999),
+        "policy_reconcile": lambda p: service.reconcile_policy(p, f"k-pol-rec-{p}"),
         "job_cancel": lambda p: service.cancel_job(p, "missing"),
     }
 

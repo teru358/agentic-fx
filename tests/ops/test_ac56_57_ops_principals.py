@@ -163,6 +163,19 @@ def test_backlog_list_is_authorized_only_for_guidance_read_principals(api5, prin
         assert response.status_code == 403 and response.json()["error"]["code"] == "forbidden"
 
 
+@pytest.mark.parametrize("principal,allowed", [
+    (OPERATOR, True), (APPROVER, True), (OPS_BOT, False), (OPS_WEB, False),
+    (OPS_NOTIFY, False),
+])
+def test_policy_endpoints_follow_their_scopes(api5, principal, allowed):
+    client = api5.client(principal)
+    for method, path in (("GET", "/v1/policy"), ("POST", "/v1/policy/1/remove"),
+                         ("POST", "/v1/policy/reconcile")):
+        response = client.request(method, path, json={} if method == "POST" else None,
+                                  headers={"Idempotency-Key": "policy-scope"})
+        assert (response.status_code != 403) is allowed, (principal, path)
+
+
 @pytest.mark.parametrize("principal", list(Principal))
 def test_ac56_autopilot_on_orders_and_stop_stay_unreachable(api5, principal):
     client = api5.client(principal)

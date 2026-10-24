@@ -30,7 +30,9 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.store import plugin_deploy_ops as deploy_store
-from agentic_fx.policy_projection import insert_policy, reconcile_policy_file
+from agentic_fx.policy_projection import (MigrationRecordUnknown, insert_policy,
+                                          inspect_policy_file, reconcile_policy_file,
+                                          regenerate_policy_file, unmanaged_policy_lines)
 
 from . import redactor
 from .activity import SuppressedActivity
@@ -71,6 +73,10 @@ class Endpoint:
     autopilot_restricted: bool = False
 
 
+class PolicyProjectionUnknown(RuntimeError):
+    """A committed policy mutation may not have reached its file projection."""
+
+
 ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("status", "GET /v1/status", Scope.STATUS_READ, False),
     Endpoint("log", "GET /v1/log", Scope.LOGS_READ, False),
@@ -108,8 +114,15 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
              autopilot_restricted=True),
     Endpoint("policy", "POST /v1/policy", Scope.OPERATE, True, idempotent=True,
              autopilot_restricted=True),
+    Endpoint("policy_show", "GET /v1/policy", Scope.GUIDANCE_READ, False),
+    Endpoint("policy_remove", "POST /v1/policy/{id}/remove", Scope.OPERATE, True,
+             idempotent=True, autopilot_restricted=True),
+    Endpoint("policy_reconcile", "POST /v1/policy/reconcile", Scope.OPERATE, True,
+             idempotent=True),
     Endpoint("job_cancel", "POST /v1/jobs/{id}/cancel", Scope.JOBS_OWN, True),
 )}
+
+POLICY_SHOW_LIMIT = 200
 
 _DECISION_KINDS = ("approve", "reject", "retry")
 _BACKLOG_TRANSITIONS = {
@@ -447,8 +460,8 @@ class OpsService:
         return replay.response
 
     def _terminal(self, accepted: AcceptedRequest, caller: Caller, endpoint: Endpoint,
-                  code: str, response: dict, *, audit: AuditStore | None = None,
-                  events: EventStore | None = None) -> None:
+                  code: str, response: dict, *, state: str | None = None,
+                  audit: AuditStore | None = None, events: EventStore | None = None) -> None:
         audit = audit or self.audit
         conn = audit.connection
         waiting = getattr(conn, "waiting_until", None)
@@ -456,7 +469,7 @@ class OpsService:
         budget = (waiting(self._monotonic() + self.limits.terminal_write_seconds)
                   if waiting is not None else contextlib.nullcontext())
         with budget:
-            audit.terminal(accepted.audit_id, code=code, response=response)
+            audit.terminal(accepted.audit_id, code=code, response=response, state=state)
             self._project(accepted.audit_id, caller, endpoint, code, events=events)
 
     def _project(self, audit_id: int, caller: Caller, endpoint: Endpoint, code: str, *,
@@ -499,6 +512,11 @@ class OpsService:
                     raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
                 response = action(deadline, accepted)
             except BaseException as exc:
+                if isinstance(exc, PolicyProjectionUnknown):
+                    self._terminal(accepted, caller, endpoint, ErrorCode.OUTCOME_UNKNOWN.value,
+                                   _error_response(ErrorCode.OUTCOME_UNKNOWN),
+                                   state="outcome_unknown")
+                    raise OpsError(ErrorCode.OUTCOME_UNKNOWN) from None
                 code = self._map_exception(exc)
                 self._terminal(accepted, caller, endpoint,
                                (code or ErrorCode.INTERNAL).value,
@@ -759,6 +777,36 @@ class OpsService:
 
     # ------------------------------------------------------- sync mutations
 
+    def show_policy(self, principal: Caller, *, deadline: float | None = None) -> dict:
+        _authorize(principal, "policy_show")
+        rows = self._conn.execute(
+            "SELECT id,created_at,directive FROM ops_policies ORDER BY id").fetchall()
+        managed = [{"id": int(row["id"]), "created_at": row["created_at"],
+                    "directive": row["directive"]} for row in rows]
+        unmanaged = ([] if self._policy_path is None else [
+            {"line": line, "directive": directive, "removable": False}
+            for line, directive in unmanaged_policy_lines(self._policy_path)
+        ])
+        listed_managed = managed[:POLICY_SHOW_LIMIT]
+        remaining = POLICY_SHOW_LIMIT - len(listed_managed)
+        listed_unmanaged = unmanaged[:remaining]
+        projection = (inspect_policy_file(self._conn, self._policy_path)
+                      if self._policy_path is not None else None)
+        return {"managed": listed_managed, "unmanaged": listed_unmanaged,
+                "limit": POLICY_SHOW_LIMIT,
+                "has_more": len(managed) + len(unmanaged) > POLICY_SHOW_LIMIT,
+                "projection": {"status": projection.status if projection else "ok",
+                               "reasons": list(projection.reasons) if projection else []}}
+
+    def _reconcile_policy(self) -> bool:
+        if self._policy_path is None:
+            return False
+        return reconcile_policy_file(self._conn, self._policy_path)
+
+    def _reconcile_before_policy_mutation(self) -> None:
+        if self._reconcile_policy():
+            self._activity("SYSTEM", "policy_reconciled", "")
+
     def add_policy(self, principal: Caller, idempotency_key: str, text: str, *,
                    deadline: float | None = None) -> dict:
         """canonical record を正にして policy file を毎回再生成する。"""
@@ -767,9 +815,15 @@ class OpsService:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
 
         def action(_deadline: float, accepted: AcceptedRequest) -> dict:
+            self._reconcile_before_policy_mutation()
             request_id = accepted.request_id
             insert_policy(self._conn, text, request_id=request_id, now=self._wall_clock())
-            self._regenerate_policy()
+            try:
+                self._regenerate_policy()
+            except OpsError:
+                raise
+            except BaseException as exc:
+                raise PolicyProjectionUnknown() from exc
             # 既存運用との互換で、policy_added だけは先頭 200 文字を残す (§8 の例外)。
             self._activity("SYSTEM", "policy_added", text[:200])
             return {"id": request_id}
@@ -777,15 +831,63 @@ class OpsService:
         return self._mutate(principal, ENDPOINTS["policy"], {"text": text}, "policy", action,
                             key=idempotency_key, deadline=deadline)
 
+    def remove_policy(self, principal: Caller, idempotency_key: str, identifier: int, *,
+                      deadline: float | None = None) -> dict:
+        _authorize(principal, "policy_remove")
+        if type(identifier) is not int or identifier < 1:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+
+        def action(_deadline: float, _accepted: AcceptedRequest) -> dict:
+            self._reconcile_before_policy_mutation()
+            cursor = self._conn.execute("DELETE FROM ops_policies WHERE id=?", (identifier,))
+            if cursor.rowcount != 1:
+                self._conn.rollback()
+                raise OpsError(ErrorCode.NOT_FOUND)
+            self._conn.commit()
+            try:
+                self._regenerate_policy()
+            except OpsError:
+                raise
+            except BaseException as exc:
+                raise PolicyProjectionUnknown() from exc
+            self._activity("SYSTEM", "policy_removed", f"id={identifier}")
+            return {"id": identifier}
+
+        return self._mutate(principal, ENDPOINTS["policy_remove"], {"id": identifier}, str(identifier), action,
+                            key=idempotency_key, deadline=deadline)
+
+    def reconcile_policy(self, principal: Caller, idempotency_key: str, *,
+                         deadline: float | None = None) -> dict:
+        _authorize(principal, "policy_reconcile")
+
+        def action(_deadline: float, _accepted: AcceptedRequest) -> dict:
+            try:
+                changed = self._reconcile_policy()
+            except MigrationRecordUnknown as exc:
+                raise PolicyProjectionUnknown() from exc
+            try:
+                projection = (inspect_policy_file(self._conn, self._policy_path)
+                              if self._policy_path is not None else None)
+            except BaseException as exc:
+                raise PolicyProjectionUnknown() from exc
+            if changed:
+                self._activity("SYSTEM", "policy_reconciled", "")
+            return {"changed": changed,
+                    "projection": {"status": projection.status if projection else "ok",
+                                   "reasons": list(projection.reasons) if projection else []}}
+
+        return self._mutate(principal, ENDPOINTS["policy_reconcile"], {}, "policy", action,
+                            key=idempotency_key, deadline=deadline)
+
     def regenerate_policy(self) -> None:
         """起動時などに canonical record から policy file を作り直す。"""
         with self._ops_lane(self._deadline(None)):
-            self._regenerate_policy()
+            self._reconcile_policy()
 
     def _regenerate_policy(self) -> None:
         if self._policy_path is None:
             return
-        reconcile_policy_file(self._conn, self._policy_path)
+        regenerate_policy_file(self._conn, self._policy_path)
 
     def add_backlog(self, principal: Caller, idempotency_key: str, idea: str, *,
                     deadline: float | None = None) -> dict:
