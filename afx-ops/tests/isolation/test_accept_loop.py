@@ -111,7 +111,7 @@ def test_accept_ready_hands_every_pending_connection_to_the_callback():
     clients = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]
     got = []
     try:
-        loop = AcceptLoop(listener, got.append)
+        loop = AcceptLoop(listener, lambda c, peer: got.append(c))
         deadline = time.monotonic() + 5
         while len(got) < 3 and time.monotonic() < deadline:
             loop.accept_ready()
@@ -129,7 +129,7 @@ def test_a_failing_callback_closes_the_connection_and_the_rest_are_still_taken()
     clients = [socket.create_connection(("127.0.0.1", port), timeout=5) for _ in range(2)]
     seen = []
 
-    def explode(conn):
+    def explode(conn, peer):
         seen.append(conn.fileno())
         raise RuntimeError("callback failed")
     try:
@@ -164,7 +164,7 @@ class Counting(AcceptLoop):
 
 async def main():
     loop = asyncio.get_running_loop()
-    acc = Counting(listener, got.append)
+    acc = Counting(listener, lambda c, peer: got.append(c))
     _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
     fillers = []
@@ -241,7 +241,7 @@ def test_the_retry_limit_covers_about_ten_seconds_of_exhaustion():
 def test_consecutive_fd_exhaustion_up_to_the_limit_closes_the_listener_and_gives_up():
     listener = _Scripted([_emfile(), _emfile(), _emfile()])
     gave_up = []
-    acc = AcceptLoop(listener, lambda c: None, exhausted_limit=3,
+    acc = AcceptLoop(listener, lambda c, peer: None, exhausted_limit=3,
                      on_exhausted=lambda: gave_up.append(listener.closed))
     acc.accept_ready()
     acc.accept_ready()
@@ -258,7 +258,7 @@ def test_a_successful_accept_resets_the_exhaustion_count():
         listener = _Scripted([_emfile(), _emfile(), (conn, ("127.0.0.1", 1)), _emfile(),
                               _emfile()])
         gave_up = []
-        acc = AcceptLoop(listener, lambda c: None, exhausted_limit=3,
+        acc = AcceptLoop(listener, lambda c, peer: None, exhausted_limit=3,
                          on_exhausted=lambda: gave_up.append(True))
         acc.accept_ready()
         acc.accept_ready()
@@ -279,7 +279,7 @@ client = socket.create_connection(("127.0.0.1", listener.getsockname()[1]))
 
 async def main():
     loop = asyncio.get_running_loop()
-    acc = AcceptLoop(listener, lambda c: None, exhausted_limit=5)
+    acc = AcceptLoop(listener, lambda c, peer: None, exhausted_limit=5)
     _soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
     try:

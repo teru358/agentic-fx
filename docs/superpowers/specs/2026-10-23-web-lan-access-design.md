@@ -198,7 +198,7 @@ auth は allow の代わりではない。
 | `listener_invalid` | 71 | production 起動の bind / listen 又は listener 自己検査に失敗した。 |
 | `probe_bind_failed` | 73 | probe の実 bind / listen 又は `getsockname()` 一致に失敗した。 |
 | `accept_exhausted` | 72 | `EMFILE` / `ENFILE` が accept syscall 成功を挟まず 200 回連続したため listener を閉じる。既存契約を維持する。 |
-| `accept_failed` | 72 | `EAGAIN` / `EWOULDBLOCK` / `EINTR` / `ECONNABORTED` / `EMFILE` / `ENFILE` 以外の errno が accept syscall から返ったため、reader を解除し listener を閉じて終了する。 |
+| `accept_failed` | 74 | 接続単位の errno 集合 (§3.1)、`EAGAIN` / `EWOULDBLOCK` / `EINTR` / `EMFILE` / `ENFILE` 以外の errno が accept syscall から返ったため、reader を解除し listener を閉じて終了する。rc は `accept_exhausted` (72) と分け、journal と終了 code の両方で区別できる。 |
 
 複数の不正が同時にある場合は、次の決定木で最初に該当した reason だけを返す。
 
@@ -245,14 +245,14 @@ auth と rate limit はこの値だけを使い、socket、proxy header、Host �
 peer reject と peer lookup failure はそれぞれ専用 counter だけを増やす。
 callback error は `EMFILE` / `ENFILE` の連続回数に含めず、listener を誤って停止させない。
 
-accept errno の扱いは次に固定する。`ECONNABORTED` は接続を生成せず続行するが 1 試行と数える。`EAGAIN` / `EWOULDBLOCK` は 1 試行と数えて callback を正常終了する。`EINTR` は 1 試行と数え、残り予算がある場合だけ再試行する。`EMFILE` / `ENFILE` は以下の backoff へ進む。その他の errno は reader を同期的に解除し、listener を閉じ、`afx-ops: accept_failed` の 1 行だけを出して rc 72 で process を終了する。errno や例外文は出さない。
+accept errno の扱いは次に固定する。接続単位の errno 集合 (`ECONNABORTED` / `EPROTO` / `ENETDOWN` / `ENOPROTOOPT` / `EHOSTDOWN` / `ENONET` / `EHOSTUNREACH` / `EOPNOTSUPP` / `ENETUNREACH`。accept(2) が再試行を勧めるもの) と一時的な資源不足 (`ENOBUFS` / `ENOMEM`) は接続を生成せず、listener を閉じずに続行するが 1 試行と数える。`EAGAIN` / `EWOULDBLOCK` は 1 試行と数えて callback を正常終了する。`EINTR` は 1 試行と数え、残り予算がある場合だけ再試行する。`EMFILE` / `ENFILE` は以下の backoff へ進む。その他の errno は reader を同期的に解除し、listener を閉じ、`afx-ops: accept_failed` の 1 行だけを出して rc 74 で process を終了する。errno や例外文は出さない。
 
 既存の fd 枯渇契約も維持する。
 accept syscall が `EMFILE` 又は `ENFILE` を返したら reader を同期的に解除し、50 ms 後に 1 回だけ再登録する。
 accept syscall の成功時点で、後続の peer lookup、allow 判定又は runtime callback の成否にかかわらず fd 枯渇の連続回数を 0 に戻す。
 成功を 1 本も挟まず `EMFILE` / `ENFILE` が 200 回連続した場合は reader を解除したまま listener を閉じ、固定 reason `accept_exhausted` を 1 行だけ出して rc 72 で process を終了する。
 
-64 回目の accept syscall が成功した場合は、まず連続回数を reset し、その接続の引渡し又は close を完了してから callback を返す。64 回連続の `ECONNABORTED` でも callback を返し、65 回目の accept syscall は同じ callback で発行しない。これにより同時に ready になった 30 秒 deadline callback は次 tick までに進行できる。
+64 回目の accept syscall が成功した場合は、まず連続回数を reset し、その接続の引渡し又は close を完了してから callback を返す。64 回連続の接続単位の errno でも callback を返し、65 回目の accept syscall は同じ callback で発行しない。これにより同時に ready になった 30 秒 deadline callback は次 tick までに進行できる。
 次 tick の callback が直ちに `EMFILE` / `ENFILE` になった場合は、その callback で reader を解除してから 50 ms timer を登録する。64 試行上限による次 tick への譲渡自体は reader を解除・再登録しない。backoff に入った場合だけ timer 満了時に再登録する。
 したがって 64 試行境界と fd 枯渇が連続しても、reader は二重登録されず、成功した 64 回目による reset と次の resource error の 1 回目がこの順で観測される。
 
@@ -333,7 +333,7 @@ web principal は引き続き読み取り専用である。
 認証失敗を daemon activity 又は event に書かない。
 
 method 不許可の 405 は POST 等の GET / HEAD 以外で観測する。HEAD 自体は許可 method なので 405 へは到達しない。
-protocol、request adapter、route dispatch 又は renderer 自身の想定外例外は 500 とする。
+protocol、request adapter、route dispatch 又は renderer 自身の想定外例外は 500 とする。ただし reply が dict でも必須 key の欠落・型違いで renderer が `KeyError` / `TypeError` / `AttributeError` / `IndexError` / `ValueError` で落ちる場合は schema 不正 response として 502 とする。
 daemon client の transport 例外 / timeout、daemon の非 200 reply、code 付き reply、又は期待 schema でない backend reply は 502 とする。
 この境界より前に確定した 400 / 401 / 404 / 413 / 429 は内部例外へ読み替えない。
 HEAD で到達し得る error status は 400 / 401 / 404 / 413 / 429 / 500 / 502 とし、いずれも同条件の GET と同じ Content-Length、body 0 とする。
@@ -355,7 +355,7 @@ accept loop の運用 event は security event と別に、次の集合へ固定
 | `accept_resource_error_total` | `EMFILE` / `ENFILE` ごとに 1 | `afx-ops: accept_backoff`。連続 episode の先頭だけ、かつ process lifetime で最大 10 行。errno は付けない。 |
 | `accept_callback_failed_total` | runtime callback の例外ごとに 1 | `afx-ops: accept_callback_failed`。process lifetime の先頭 10 件だけ。例外型・例外文は付けない。 |
 | `accept_exhausted_total` | 連続 200 回到達時に 1 | `afx-ops: accept_exhausted` を sampling 枠と独立にちょうど 1 行出して rc 72 で終了する。 |
-| `accept_failed_total` | 想定外の accept errno ごとに 1 | `afx-ops: accept_failed` をちょうど 1 行出し、reader 解除と listener close 後に rc 72 で終了する。 |
+| `accept_failed_total` | 想定外の accept errno ごとに 1 | `afx-ops: accept_failed` をちょうど 1 行出し、reader 解除と listener close 後に rc 74 で終了する。 |
 
 全 journal 文に IP、port、Host、Authorization、username、password、secret、回数、errno、例外型、例外文を足さない。
 aiohttp の access log は引き続き無効にする (`afx-ops/afx_ops/web/runtime.py:54`)。
@@ -831,7 +831,7 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-32 | `0.0.0.0` bind、IPv6 bind / allow、proxy header による peer 上書き、新しい変更 route が存在しない。 | schema、route 一覧、`_Slot` の peer 判定入力の pin。 |
 | AC-33 | T1 / T2 の `FeaturePlan` の許可 secret 名は常に `{"web.password"}` で、必須集合は検証済み auth だけから決まる。T1 の none でも dir 不在を許可し、存在時は検査済み dir fd から残骸と未知 entry を判定する。 | T1 / T2 plan object、openat spy、auth / dir / entry 直積。 |
 | AC-34 | 手入力 password は 16〜128 byte の visible ASCII (`:` を含む) だけを受理し、space、改行、非 ASCII と境界外を `secret_invalid` にする。Basic は `b"afx:" + password` 全体を hash し、password 中の `:` を正しく認証する。 | 15 / 16 / 128 / 129 byte、文字 class、複数 colon、digest 入力 spy。 |
-| AC-35 | readiness 1 回の accept syscall 試行は 64 以下であり、`ECONNABORTED` も数え、64 回連続しても callback が返って 30 秒 deadline callback が次 tick までに進む。`EAGAIN` / `EWOULDBLOCK` は正常終了、`EINTR` は予算内再試行、`EMFILE` / `ENFILE` は既存 backoff と連続 200 回の `accept_exhausted` / rc 72 とする。その他の errno は reader 解除、listener close、`accept_failed` / rc 72 で有界終了する。成功は allow / callback 結果にかかわらず連続回数を reset する。 | 63 / 64 / 65 syscall、64 回連続 ECONNABORTED + deadline、EAGAIN / EINTR / EMFILE、想定外 errno、reader / timer / listener / rc / counter / journal 全文。 |
+| AC-35 | readiness 1 回の accept syscall 試行は 64 以下であり、`ECONNABORTED` も数え、64 回連続しても callback が返って 30 秒 deadline callback が次 tick までに進む。`EAGAIN` / `EWOULDBLOCK` は正常終了、`EINTR` は予算内再試行、`EMFILE` / `ENFILE` は既存 backoff と連続 200 回の `accept_exhausted` / rc 72 とする。接続単位の errno 集合は listener を閉じず 1 試行と数えて続行し、その他の errno は reader 解除、listener close、`accept_failed` / rc 74 で有界終了する。成功は allow / callback 結果にかかわらず連続回数を reset する。 | 63 / 64 / 65 syscall、64 回連続 ECONNABORTED + deadline、EAGAIN / EINTR / EMFILE、想定外 errno、reader / timer / listener / rc / counter / journal 全文。 |
 | AC-36 | 隔離の fd 自己検査時点の保持 fd は `{0,1,2,listener,notify}` だけで、secret dir / password / config / interface 列挙の pipe fd が無く、interface 列挙の `ip` 子 process は回収済みである。READY 後は notify も閉じる。 | `/proc/self/fd`、子 process 一覧、syscall trace の phase 別 snapshot。 |
 | AC-39 | request line / header / body の malformed と上限境界が既存契約の 400 / 413 になり、Host / auth より先に止まる。405 は POST 等で観測する。HEAD は実際に到達する 400 / 401 / 404 / 413 / 429 / 500 / 502 について body 0 と GET と同じ Content-Length を検査する。protocol 内部例外は 500、daemon / backend 障害は 502 にする。 | 各 parser 上限の L-1 / L / L+1、POST 405、到達可能な全 HEAD status、daemon 回数。 |
 | AC-40 | 下記の有限な mutation ID を 1 個ずつ有効にし、対応 AC が少なくとも 1 個失敗する。T1 完了時は T1 集合だけ、T2 完了時は T1 + T2 集合を実行する。 | mutation ID、対応 AC、意図した failure の CI 記録。 |
@@ -999,3 +999,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-23 | v0.8 | reconfigure の手順 (3) の各 probe の前と手順 (4) の start の前に ops-web を止め直し (手順 (4) は stop → `is_stopped` → `reset-failed` → start)、start 失敗時に afx を観測し直すようにした。`afx ops <feature> disable` にも setup lock を取らせた。terminal enabled の enable で stage を probe より先に判定し、`installed` へ戻す前に副作用の無い設定検査を加えた (AC-49)。`ops.toml` の writer 所有の共通 key (`instance_root`、`key_dir`) を §2.1 と G3a / G3b に加え、`--config-file` を web の 4 key に限った。AC-12 に本体 reader を 4 入口目として加えた。入口照合を daemon_reload なし (file 比較と `NeedDaemonReload`) にし、`resolve_ops_exec`、他 feature の未終端操作と marker、鍵の状態ごとの reason と案内を定めた。要約を `許可範囲 <N> 件`、loopback は `自機のみ`、stderr 出力に改めた。§10.1 の CLI を `entry.py` に直し、merge 順を §10.2 に書いた。mutation 4 個を加え、§12 の「reconfigure 途中の enable」行を削除した。 | 設計レビュー 6 周目 opus、High 1 / Medium 3 / 吸収可 6 を全採用。収束: 残りは差分の閉鎖確認 1 本。 | — |
 | 2026-10-24 | v0.9 | §5.3 の status reason を「`not_configured` + 共有 reader が返す G 層 / C1〜C7 の最終 reason」に広げ、`secret_missing` / `allow_required` を含む表と AC-30 の観測点を追加した。§5.2 の要約の出力先を「要約だけ stderr、prompt は既存 `ConsoleIO` の stdout のまま」に狭めた。 | 差分閉鎖確認 (codex terra) の Medium 1 (§5.3 の限定列挙が AC-12 の 4 入口同一 reason と矛盾) と Low 1 (stdout 契約が対話 prompt と衝突) | |
 | 2026-10-24 | v0.9 | status は stage を先に読み、未設定 / disabled は reader を呼ばず `not_configured`、それ以外は共有 reader の最終 reason (G1 は `config_dir_missing`、`ops.toml` 不在は `config_invalid`)。AC-12 の fixture は stage を terminal enabled に固定。 | 差分再確認 (codex terra) の Medium 1 (G1 の `config_dir_missing` と `not_configured` の適用条件が不定) | |
+| 2026-10-24 | v0.9a | accept の接続単位の errno 集合 (`EPROTO` / `ENETDOWN` / `ENOPROTOOPT` / `EHOSTDOWN` / `ENONET` / `EHOSTUNREACH` / `EOPNOTSUPP` / `ENETUNREACH` と `ENOBUFS` / `ENOMEM`、`ECONNABORTED` と同扱い) を §3.1 / §2.4 / AC-35 に追加し、`accept_failed` の rc を 72 から専用の 74 に分け、renderer が reply の形の不一致 (上記 5 例外型) で落ちる場合を 502 と明記した。 | /code-review high の指摘 (一過性 errno での全 web 停止、`accept_failed` と `accept_exhausted` の rc 共用) | |

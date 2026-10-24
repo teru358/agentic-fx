@@ -16,9 +16,11 @@ from afx_ops.isolation import startup
 def test_plan(feature: str, *, config_dir: Path | None = None,
               secret_dir: Path | None = None, secret_files: tuple[str, ...] | None = None,
               state_dir: Path | None = None, web_port: int | None = None,
+              web_bind: str = startup.LOOPBACK, web_auth: str = "none",
               connect_ports: tuple[int, ...] | None = None, check_unit: bool = False,
               require_notify: bool = False) -> startup.StartupPlan:
-    base = startup.StartupPlan.for_feature(feature, web_port=web_port)
+    base = startup.StartupPlan.for_feature(feature, web_port=web_port, web_bind=web_bind,
+                                           web_auth=web_auth)
     changes: dict[str, Any] = {"check_unit": check_unit, "require_notify": require_notify}
     if config_dir is not None:
         changes["config_dir"] = config_dir

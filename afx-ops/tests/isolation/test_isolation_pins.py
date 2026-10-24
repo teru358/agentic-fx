@@ -199,7 +199,7 @@ def test_one_accept_ready_takes_every_queued_connection():
     got = []
     try:
         time.sleep(0.05)
-        loop = AcceptLoop(listener, got.append)
+        loop = AcceptLoop(listener, lambda c, peer: got.append(c))
         assert loop.accept_ready() == 3
         assert len(got) == 3
     finally:
@@ -226,11 +226,15 @@ class _ScriptedListener:
 
 
 def test_an_aborted_connection_does_not_stop_the_accept_loop():
-    conn = object()
+    class _Conn:
+        def getpeername(self):
+            return ("127.0.0.1", 1)
+
+    conn = _Conn()
     listener = _ScriptedListener([ConnectionAbortedError(), (conn, ("127.0.0.1", 1)),
                                   BlockingIOError()])
     got = []
-    assert AcceptLoop(listener, got.append).accept_ready() == 1
+    assert AcceptLoop(listener, lambda c, peer: got.append(c)).accept_ready() == 1
     assert got == [conn]
 
 

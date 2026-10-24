@@ -106,10 +106,15 @@ def spec(root, port, *, requests=1, **extra) -> dict:
             "params": params, **extra}
 
 
+def with_host(raw: bytes, port: int) -> bytes:
+    """要求の `Host: x` を、待受の address と port の Host に置き換える。"""
+    return raw.replace(b"Host: x\r\n", f"Host: 127.0.0.1:{port}\r\n".encode())
+
+
 def exchange(port: int, raw: bytes, *, timeout: float = 10) -> bytes:
     """1 接続で raw を送り、server が閉じるまでの応答を全部読む。"""
     with socket.create_connection(("127.0.0.1", port), timeout=timeout) as client:
-        client.sendall(raw)
+        client.sendall(with_host(raw, port))
         data = b""
         while chunk := client.recv(65536):
             data += chunk
@@ -117,7 +122,7 @@ def exchange(port: int, raw: bytes, *, timeout: float = 10) -> bytes:
 
 
 def get(path: str, method: str = "GET", extra: bytes = b"") -> bytes:
-    return (f"{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n".encode() + extra
+    return (f"{method} {path} HTTP/1.1\r\nHost: x\r\n".encode() + extra
             + b"Connection: close\r\n\r\n")
 
 
@@ -300,7 +305,7 @@ def test_header_block_padded_with_whitespace_is_cut_by_its_wire_size(root, daemo
         one = exchange(port, whole)
         # 終端が来ない (header が続いている) うちに上限を超えても切る
         with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
-            client.sendall(split)
+            client.sendall(with_host(split, port))
             two = b""
             while chunk := client.recv(65536):
                 two += chunk
@@ -320,7 +325,8 @@ def test_header_block_padded_with_whitespace_is_cut_by_its_wire_size(root, daemo
 
 def test_a_compact_header_block_at_the_wire_limit_is_served(root, daemon, child_env):
     # `Name:value` (区切りに空白なし) で wire が上限ちょうどの要求は、再構成後も上限内
-    head = b"GET / HTTP/1.1\r\nHost:x\r\n"
+    port = free_port()
+    head = f"GET / HTTP/1.1\r\nHost:127.0.0.1:{port}\r\n".encode()
     lines = []
     for i in range(40):
         lines.append(b"X-Pad-%02d:" % i + b"a" * 190 + b"\r\n")
@@ -328,7 +334,6 @@ def test_a_compact_header_block_at_the_wire_limit_is_served(root, daemon, child_
     block += b"X-Fill:" + b"b" * (8192 - len(block) - 4 - len(b"X-Fill:")) + b"\r\n"
     raw = block + b"\r\n"
     assert len(raw) == 8192
-    port = free_port()
     replies, done = serve(root, port, child_env, [raw])
     assert_finished(done)
     assert parse(replies[0])[0] == 200
@@ -345,7 +350,7 @@ def test_a_header_flood_beyond_one_request_is_cut_without_reaching_the_daemon(ro
     try:
         web.wait_line("SERVING")
         with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
-            client.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")
+            client.sendall(with_host(b"GET / HTTP/1.1\r\nHost: x\r\n", port))
             try:
                 client.sendall(flood)
                 cut = client.recv(65536)
@@ -370,7 +375,7 @@ def test_stopping_while_the_daemon_hangs_returns_within_the_bound(root, daemon, 
     try:
         web.wait_line("SERVING")
         with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
-            client.sendall(get("/"))
+            client.sendall(with_host(get("/"), port))
             deadline = time.monotonic() + 10
             while not daemon.requests() and time.monotonic() < deadline:
                 time.sleep(0.05)
@@ -435,7 +440,7 @@ def test_connection_before_isolation_is_served_only_after_isolation(root, daemon
         web.wait_line("BOUND")
         # 隔離前: 接続と要求は backlog に入るだけで、handler にも daemon にも届かない
         client = socket.create_connection(("127.0.0.1", port), timeout=5)
-        client.sendall(get("/"))
+        client.sendall(with_host(get("/"), port))
         client.settimeout(0.5)
         with pytest.raises(TimeoutError):
             client.recv(64)
@@ -471,7 +476,7 @@ def test_connection_during_the_authentication_wait_is_served_after_ready(root, t
         # 隔離と自己検査は済み、server 認証を待っている間に接続して送る
         web.wait_line("WAITING")
         client = socket.create_connection(("127.0.0.1", port), timeout=5)
-        client.sendall(get("/logs"))
+        client.sendall(with_host(get("/logs"), port))
         client.settimeout(0.5)
         with pytest.raises(TimeoutError):
             client.recv(64)
@@ -503,7 +508,7 @@ def test_fd_exhaustion_ends_the_runtime_with_accept_exhausted(root, daemon, chil
     try:
         web.wait_line("SERVING")
         client = socket.create_connection(("127.0.0.1", port), timeout=5)
-        client.sendall(get("/"))
+        client.sendall(with_host(get("/"), port))
         done = web.finish(timeout=60)
     finally:
         if client is not None:
@@ -569,7 +574,7 @@ def _slow_read(port: int, raw: bytes) -> bytes:
         # 受信 buffer を小さくして読まずに待ち、server の送信側に残りを持たせる
         slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
         slow.connect(("127.0.0.1", port))
-        slow.sendall(raw)
+        slow.sendall(with_host(raw, port))
         time.sleep(1.0)
         slow.settimeout(10)
         data = b""
@@ -665,7 +670,7 @@ def test_connections_beyond_the_limit_are_closed_and_the_rest_still_served(root,
 
 def test_a_pipelined_second_request_on_one_connection_is_not_answered(root, daemon, child_env):
     port = free_port()
-    raw = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n" * 2
+    raw = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n" * 2
     replies, done = serve(root, port, child_env, [raw])
     assert_finished(done)
     assert replies[0].count(b"HTTP/1.1 ") == 1

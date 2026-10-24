@@ -124,6 +124,9 @@ def test_head_error_responses_carry_no_body_for_every_status():
         def log(self, *, n):
             return Reply(200, {"lines": []}, None)
 
+        def status(self):
+            raise ConnectionError("daemon is down")
+
     cases = {
         400: Request("HEAD", "/logs", {"x": "1"}),
         404: Request("HEAD", "/nowhere", {}),

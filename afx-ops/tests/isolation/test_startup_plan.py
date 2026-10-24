@@ -37,7 +37,8 @@ def test_plans_are_fixed_per_feature():
 
 def test_for_feature_takes_no_boundary_arguments():
     params = set(inspect.signature(StartupPlan.for_feature).parameters)
-    assert params == {"feature", "web_port"}
+    # web の listener の address と auth は設定から来る値で、領域・secret・port の境界は動かさない
+    assert params == {"feature", "web_port", "web_bind", "web_auth"}
 
 
 @pytest.mark.parametrize("feature", ["bot", "web", "notify"])
@@ -97,7 +98,8 @@ def test_a_widened_production_plan_is_rejected(change, tmp_path, monkeypatch):
 def test_the_plan_type_carries_no_test_only_field():
     names = {f.name for f in dataclasses.fields(StartupPlan)}
     assert names == {"feature", "config_dir", "secret_dir", "secret_files", "state_dir",
-                     "web_port", "connect_ports", "check_unit", "require_notify"}
+                     "web_port", "connect_ports", "check_unit", "require_notify",
+                     "secret_allowed", "web_bind"}
     assert not hasattr(StartupPlan, "_for_tests")
 
 
