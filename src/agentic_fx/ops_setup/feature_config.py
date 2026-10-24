@@ -337,41 +337,89 @@ def _web_parsed(root: Path, config_fd: int) -> dict[str, Any] | str:
     return parsed
 
 
-def web_access_reason(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> str | None:
-    """web の設定の最終 reason。許可なら None。
+@dataclass(frozen=True)
+class WebAccess:
+    """web の設定の判定。reason が None なら許可で、values は検査済みの port / bind / allow / auth。"""
+    reason: str | None
+    values: dict[str, Any]
+
+
+def web_access_check(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> WebAccess:
+    """web の設定の最終 reason と (許可のとき) その値。
 
     status・完全性の判定・要約・設定検査が共用する 1 実装で、`afx-ops` の起動 / probe と
-    同じ決定木 (config dir・ops.toml の安全性 → 文法 → allow の必須 → 未対応の capability →
-    interface の実在 → secret) を同じ順で評価する。`interfaces` は本機の up 状態の interface の
-    global / link IPv4 を返す関数で、列挙できなければ `InterfaceLookupFailed` を上げる。
-    非 loopback の bind でだけ呼び、渡されなければ列挙失敗とみなす。
+    同じ決定木 (config dir・ops.toml の安全性 → 文法 → allow の必須 → interface の実在 →
+    secret) を同じ順で評価する。`interfaces` は本機の up 状態の interface の global / link IPv4
+    を返す関数で、列挙できなければ `InterfaceLookupFailed` を上げる。非 loopback の bind で
+    だけ呼び、渡されなければ列挙失敗とみなす。
     """
     try: base_fd = _open_feature("web")
-    except FileNotFoundError: return "config_dir_missing"
-    except OSError: return "config_dir_invalid"
+    except FileNotFoundError: return WebAccess("config_dir_missing", {})
+    except OSError: return WebAccess("config_dir_invalid", {})
     try:
         try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
-        except FileNotFoundError: return "config_dir_missing"
-        except OSError: return "config_dir_invalid"
+        except FileNotFoundError: return WebAccess("config_dir_missing", {})
+        except OSError: return WebAccess("config_dir_invalid", {})
         try: parsed = _web_parsed(root, config_fd)
         finally: os.close(config_fd)
-        if isinstance(parsed, str): return parsed
+        if isinstance(parsed, str): return WebAccess(parsed, {})
         bind = ipaddress.IPv4Address(parsed.get("bind", "127.0.0.1"))
         loopback, allow, auth = bind in _LOOPBACK, parsed.get("allow"), parsed.get("auth", "none")
-        if not loopback and allow is None: return "allow_required"
-        if allow is not None and _UNRESTRICTED in allow: return "unrestricted_not_supported"
-        if auth == "basic": return "auth_not_supported"
+        if not loopback and allow is None: return WebAccess("allow_required", {})
         if not loopback:
             try: found = {str(address) for address in interfaces()} if interfaces is not None else None
             except InterfaceLookupFailed: found = None
-            if found is None: return "interface_lookup_failed"
-            if str(bind) not in found: return "bind_not_local"
+            if found is None: return WebAccess("interface_lookup_failed", {})
+            if str(bind) not in found: return WebAccess("bind_not_local", {})
         state = _web_secret_state(base_fd)
-        if state == "unsafe": return "secret_invalid"
-        if auth == "basic" and state == "absent": return "secret_missing"
-        if auth == "none" and state == "safe": return "secret_unexpected"
-        return None
+        if state == "unsafe": return WebAccess("secret_invalid", {})
+        if auth == "basic" and state == "absent": return WebAccess("secret_missing", {})
+        if auth == "none" and state == "safe": return WebAccess("secret_unexpected", {})
+        return WebAccess(None, {name: parsed[name] for name in ("port", *_WEB_ACCESS) if name in parsed})
     finally: os.close(base_fd)
+
+
+def web_access_reason(root: Path, *, interfaces: Callable[[], Iterable[str]] | None = None) -> str | None:
+    """`web_access_check` の reason だけ。許可なら None。"""
+    return web_access_check(root, interfaces=interfaces).reason
+
+
+def web_secret_state(root: Path) -> str:
+    """live の `web.password` の状態: "absent" / "safe" / "unsafe" (secret dir の不在は absent)。"""
+    try: base_fd = _open_feature("web")
+    except FileNotFoundError: return "absent"
+    except OSError: return "unsafe"
+    try: return _web_secret_state(base_fd)
+    finally: os.close(base_fd)
+
+
+def web_defaults(root: Path) -> dict[str, Any]:
+    """live の ops.toml のうち、単独の文法を通る port / bind / allow / auth だけ。質問の既定値に使う。
+
+    読めない・安全でない・別 instance の file は空。値の組み合わせは見ない。
+    """
+    try: base_fd = _open_feature("web")
+    except OSError: return {}
+    try:
+        try: config_fd = _open_child(base_fd, "config", readable=True, component="config_dir")
+        except OSError: return {}
+        try: raw = _read_regular(config_fd, "ops.toml")
+        except OSError: return {}
+        finally: os.close(config_fd)
+    finally: os.close(base_fd)
+    try: parsed = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError): return {}
+    result: dict[str, Any] = {}
+    for name, check in (("port", None), ("bind", _web_bind), ("allow", _web_allow), ("auth", _web_auth)):
+        if name not in parsed: continue
+        try:
+            if check is None:
+                _web_values({"port": parsed[name]})
+            else:
+                check(parsed[name])
+        except InputError: continue
+        result[name] = parsed[name]
+    return result
 
 
 def _toml_value(value: Any) -> str:
@@ -381,21 +429,27 @@ def _toml_value(value: Any) -> str:
     if isinstance(value, str): return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     raise TypeError(value)
 
-def _atomic(directory_fd: int, name: str, data: bytes, mode: int, *, secret: bool = False) -> None:
+def _atomic(directory_fd: int, name: str, data: bytes, mode: int, *, secret: bool = False,
+            hook: Callable[[str], None] | None = None, label: str = "") -> None:
     try:
         if _read_regular(directory_fd, name, secret=secret) == data: return
     except FileNotFoundError: pass
+    emit = hook if hook is not None else (lambda _name: None)
     temporary = f".{name}.{secrets.token_hex(16)}.tmp"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=directory_fd)
     try:
+        emit(f"{label}_tmp_created")
         os.fchmod(fd, mode); offset = 0
         while offset < len(data):
             written = os.write(fd, data[offset:])
             if written <= 0: raise OSError(errno.EIO, "short write")
             offset += written
         os.fsync(fd)
+        emit(f"{label}_tmp_synced")
         os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        emit(f"{label}_renamed")
         os.fsync(directory_fd)
+        emit(f"{label}_dir_synced")
     finally:
         os.close(fd)
         try: os.unlink(temporary, dir_fd=directory_fd)
@@ -420,6 +474,30 @@ def write_inputs(root: Path, feature: str, values: dict[str, Any]) -> None:
         if feature == "bot" and values["token"] != "present": _atomic(secret_fd, _SECRET_NAME[feature], values["token"].encode(), 0o600, secret=True)
         if feature == "notify" and values["webhook_url"] != "present": _atomic(secret_fd, _SECRET_NAME[feature], values["webhook_url"].encode(), 0o600, secret=True)
     finally: os.close(config_fd); os.close(secret_fd)
+
+def _web_config_text(root: Path, values: dict[str, Any]) -> bytes:
+    config: dict[str, Any] = {"instance_root": str(Path(root).resolve()), "key_dir": str(key_dir(root))}
+    config.update({name: values[name] for name in ("port", *_WEB_ACCESS) if name in values})
+    return "".join(f"{key} = {_toml_value(value)}\n" for key, value in config.items()).encode()
+
+
+def write_web_config(root: Path, values: dict[str, Any], *, hook: Callable[[str], None] | None = None) -> None:
+    """web の ops.toml だけを atomic に書く (内容が live と byte 一致なら書かない)。
+
+    既存の ops.toml が文法や key の点で壊れていても置き換える。置き換えを拒むのは filesystem 上の
+    安全性 (symlink・他 uid・group / other 書込み可・型) に違反する場合だけで、`UnsafeConfigError`。
+    """
+    values = validate("web", values)
+    base_fd = _open_feature("web", create=True)
+    try:
+        config_fd = _open_child(base_fd, "config", create=True, mode=0o755, readable=True, component="config_dir")
+        try: os.close(_open_child(base_fd, "secret", create=True, mode=0o700, exact=0o700, readable=True, component="secret_dir"))
+        except BaseException:
+            os.close(config_fd); raise
+    finally: os.close(base_fd)
+    try: _atomic(config_fd, "ops.toml", _web_config_text(root, values), 0o644, hook=hook, label="config")
+    finally: os.close(config_fd)
+
 
 def redact(feature: str, value: str) -> str:
     return (urlsplit(value).hostname or "<invalid>") if feature == "notify" else "<redacted>"

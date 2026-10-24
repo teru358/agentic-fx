@@ -14,6 +14,40 @@ from agentic_fx.ops.contracts import Principal
 _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
 
 
+class _OpsOptionError(Exception):
+    """`afx ops web` の option の誤り。argparse の usage 付きの文面を持つ。"""
+
+
+class _OpsOptionParser(argparse.ArgumentParser):
+    def error(self, message: str):  # type: ignore[override]
+        raise _OpsOptionError(self.format_usage() + f"{self.prog}: error: {message}\n")
+
+
+def _add_web_setup_options(parser: argparse.ArgumentParser) -> None:
+    """enable / reconfigure が受ける option。重複は数えて表外として扱うため append / count にする。"""
+    parser.add_argument("--ask", action="count", default=0,
+                        help="既存の値を既定として全項目を質問する")
+    parser.add_argument("--non-interactive", action="count", default=0, dest="non_interactive",
+                        help="質問せず --config-file と --secret-action だけで進める")
+    parser.add_argument("--config-file", action="append", metavar="FILE", dest="config_file",
+                        help="目標の web 設定 (port・bind・allow・auth だけの TOML)")
+    parser.add_argument("--password-file", action="append", metavar="FILE", dest="password_file",
+                        help="password を読む file (mode 0600、--secret-action install のときだけ)")
+    parser.add_argument("--secret-action", action="append", metavar="ACTION", dest="secret_action",
+                        help="remove | keep | install | absent")
+
+
+def _web_options(args: argparse.Namespace):
+    from agentic_fx.ops_setup.web_setup import WebOptions
+    lists = {name: getattr(args, name) or [] for name in ("config_file", "password_file", "secret_action")}
+    return WebOptions(
+        ask=args.ask == 1, non_interactive=args.non_interactive == 1,
+        config_file=lists["config_file"][0] if lists["config_file"] else None,
+        password_file=lists["password_file"][0] if lists["password_file"] else None,
+        secret_action=lists["secret_action"][0] if lists["secret_action"] else None,
+        duplicated=args.ask > 1 or args.non_interactive > 1 or any(len(v) > 1 for v in lists.values()))
+
+
 def _compatibility_active(record) -> bool:
     """期限前なら真。version を引けない環境 (未 install) は期限判定不能として有効のまま。"""
     try:
@@ -66,7 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         from agentic_fx.ops.client import main as ctl_main
         return ctl_main(args_list[head + 1:], root=Path.cwd())
     # 略記 (--dae など) を許すと、上の完全一致の前置きをすり抜けて ctl が argparse に届く。
-    parser = argparse.ArgumentParser(prog="afx", description="agentic-fx", allow_abbrev=False)
+    parser = _OpsOptionParser(prog="afx", description="agentic-fx", allow_abbrev=False)
     parser.add_argument("--daemon", action="store_true",
                         help="systemd 用 (コマンド受付なし)")
     sub = parser.add_subparsers(dest="command")
@@ -97,19 +131,32 @@ def main(argv: list[str] | None = None) -> int:
     ops_sub = ops_parser.add_subparsers(dest="feature", required=True)
     for feature in ("bot", "web", "notify"):
         feature_parser = ops_sub.add_parser(feature, help=f"{feature} の操作")
-        feature_sub = feature_parser.add_subparsers(dest="ops_action", required=True)
+        feature_sub = feature_parser.add_subparsers(
+            dest="ops_action", required=True,
+            **({"parser_class": _OpsOptionParser} if feature == "web" else {}))
         for action, text in (("enable", "機能を停止中に有効化する"),
                              ("disable", "機能を停止せずに無効化する"),
                              ("status", "機能の durable stage を表示する")):
-            feature_sub.add_parser(action, help=text)
+            action_parser = feature_sub.add_parser(action, help=text)
+            if feature == "web" and action == "enable":
+                _add_web_setup_options(action_parser)
         if feature == "web":
-            feature_sub.add_parser("reconfigure",
-                                   help="web の設定を変更する (現在は未実装)")
+            reconfigure_parser = feature_sub.add_parser(
+                "reconfigure", help="有効化済みの web の設定を変更する (ops-web だけを短時間止める)")
+            _add_web_setup_options(reconfigure_parser)
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")
     backtest_cli.register_subparsers(sub)
-    args = parser.parse_args(args_list)
+    try:
+        args = parser.parse_args(args_list)
+    except _OpsOptionError as error:
+        if args_list[head:head + 2] == ["ops", "web"] and args_list[head + 2:head + 3] in (
+                ["enable"], ["reconfigure"]):
+            print("afx ops: setup_input_required", file=sys.stderr)
+            return 2
+        sys.stderr.write(str(error))
+        raise SystemExit(2) from None
 
     root = Path.cwd()
     if args.command == "init":
@@ -138,10 +185,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ops":
         if args.ops_action == "reconfigure":
             from agentic_fx.ops_setup.reconfigure import run_ops_reconfigure
-            return run_ops_reconfigure(root, args.feature)
+            return run_ops_reconfigure(root, args.feature, options=_web_options(args))
         if args.ops_action == "enable":
             from agentic_fx.ops_setup.interactive import ConsoleIO, interactive_enable
-            return interactive_enable(root, args.feature, io=ConsoleIO()).rc
+            options = _web_options(args) if args.feature == "web" else None
+            return interactive_enable(root, args.feature, io=ConsoleIO(), options=options).rc
+        if args.ops_action == "disable":
+            from agentic_fx.ops_setup.interactive import run_ops_disable
+            return run_ops_disable(root, args.feature)
         from agentic_fx.ops_setup.stages import run_ops_command
         return run_ops_command(root, args.ops_action, args.feature)
     if args.command in _BACKTEST_COMMANDS:

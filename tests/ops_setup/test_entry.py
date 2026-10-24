@@ -140,7 +140,7 @@ def test_ops_reconf_dispatches_the_web_reconfigure_handler(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     seen: list[tuple[object, str]] = []
 
-    def reconfigure(root, feature: str):
+    def reconfigure(root, feature: str, **_kwargs):
         seen.append((root, feature))
         return 7
 
@@ -181,7 +181,7 @@ def _ops_spies(monkeypatch):
         calls.append((action, root, feature))
         return _RC[action]
 
-    def reconfigure(root, feature):
+    def reconfigure(root, feature, **_kwargs):
         calls.append(("reconfigure", root, feature))
         return _RC["reconfigure"]
 
@@ -296,19 +296,22 @@ def test_bot_and_notify_reject_both_reconfigure_spellings_as_typed(
     assert "旧形です" not in err
 
 
-def test_the_unimplemented_web_reconfigure_stub_fails_with_a_fixed_reason(tmp_path, monkeypatch, capsys):
+def test_web_reconfigure_on_a_web_that_is_not_enabled_is_refused_without_a_write(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    assert main(["ops", "web", "reconfigure"]) == 1
+    assert main(["ops", "web", "reconfigure", "--non-interactive", "--config-file", "x",
+                 "--secret-action", "absent"]) == 1
     captured = capsys.readouterr()
-    assert captured.err == "afx ops: reconfigure_not_available\n"
+    assert captured.err == "afx ops: not_enabled\n"
     assert captured.out == ""
+    assert not (tmp_path / "data" / "ops" / "web.stage.json").exists()
 
 
-def test_the_help_marks_the_web_reconfigure_stub_as_unimplemented(capsys):
+def test_the_help_describes_the_web_reconfigure_command(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["ops", "web", "--help"])
     assert exc.value.code == 0
-    assert "(現在は未実装)" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "reconfigure" in out and "未実装" not in out
 
 
 def test_expired_ops_legacy_shape_is_left_to_argparse(tmp_path, monkeypatch, capsys):
@@ -385,8 +388,9 @@ def test_enable_with_a_running_daemon_and_no_keys_stops_with_rc1_before_keys_ini
 
     captured = capsys.readouterr()
     assert keys_init == []
-    assert captured.err.startswith("afx ops: afx_running_keys_not_initialized")
-    assert captured.err.count("\n") == 1
+    assert captured.err.splitlines()[0].startswith("web: 待受 127.0.0.1:8788")
+    assert captured.err.splitlines()[1].startswith("afx ops: afx_running_keys_not_initialized")
+    assert captured.err.count("\n") == 2
 
 
 def test_enable_with_a_running_daemon_completes_with_rc0(tmp_path, monkeypatch, capsys):

@@ -10,7 +10,9 @@ import subprocess
 _FIXED_REASONS = frozenset({
     "config_dir_missing", "config_dir_invalid", "config_invalid", "secrets_failed",
     "url_invalid", "token_invalid", "startup_internal_error", "probe_not_implemented",
-    "runtime_unavailable", "probe_bind_failed",
+    "runtime_unavailable", "probe_bind_failed", "allow_required", "unrestricted_not_supported",
+    "auth_not_supported", "interface_lookup_failed", "bind_not_local", "secret_invalid",
+    "secret_missing", "secret_unexpected", "listener_invalid",
 })
 _PROBE_REASON = re.compile(r"probe_[a-z][a-z0-9_]{0,63}\Z")
 

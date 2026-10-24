@@ -530,6 +530,8 @@ unit (afx.service) を設置しました。
 - 段 8 で常駐を選ばないと、段 13 は unit 設置・linger・enable・起動を尋ねず「手動起動: `uv run afx`。常駐に切り替えるときは `afx init` を再実行してください。」で終えます。
 - unit の設置前に、unit と同じ環境で `afx check` を走らせます。fatal があると unit を置きません (理由を表示)。warning だけ (LLM 未検証など) なら `afx check の warning (unit は置きます): <コード>` と表示して置きます。
 - 設置済みの unit と内容が違うと差分を表示して `この内容で unit を置きますか [y/N] ` を尋ね、旧 unit は `afx.service.bak-<時刻>` に退避します。同じなら「unit は設置済みです (内容は同じです)。」
+- web を選ぶと、web の質問 (port・自機のみ / LAN・待受 address・誰が見られるか・許可する IPv4 / CIDR・パスワード) が `afx ops web enable` から端末に直接出ます。既定は自機のみ (`127.0.0.1`) で認証はありません。LAN に出す場合の選択肢と注意は [操作 API と `afx ctl` の運用](ops-api-2026-10-09.md) の 10 節にあります。
+- **`afx init` を再実行したとき**: web が未設定、又は disable 済みで、設定が揃っていれば、候補の質問は出ず、要約 1 行 (`web: 待受 <bind>:<port> / 公開 <範囲> / 認証 <none|basic>`、stderr) と `この設定で有効化します。[1] このまま (既定) [2] 変更する` の 1 問だけが出ます (空回答は「このまま」)。「変更する」は全項目を既存値つきで尋ねます。有効化済みの web には何も尋ねません。
 - unit を置けない環境は次の 3 つに分かれます。いずれも unit は置かずに進みます (`su` は使いません)。
   - `systemctl` コマンドが無い: 「systemd のユーザーサービスが使えません。手で起動するには `uv run afx` を実行してください」。記録の理由は `systemd_unavailable`。
   - `systemctl` はあるが `XDG_RUNTIME_DIR` が無く、ユーザーセッションに繋がらない: 「systemd のユーザーセッションが見えません (XDG_RUNTIME_DIR が無い)。`su` ではなく <user> で直接ログインして `afx init` を再実行してください」。記録の理由は `user_session_missing`。対象ユーザーで直接ログインして実行します。
@@ -588,6 +590,8 @@ unit を置けていないため、有効化・起動は行いません。起動
 未完の手順:
   - <各項目>
 ```
+
+web の公開範囲 (自機のみ / LAN / 許可 IP / パスワード) だけを変えるときは、afx を止めずに `afx ops web reconfigure` (別名 `reconf`) を使います。止まるのは ops-web だけで、web が数秒から十数秒見えなくなります。`afx ops web disable` → `afx ops web enable --ask` でも変えられますが、enable が afx を止めて再起動するので、ペーパー運用が数十秒止まり得ます。
 
 `未完の手順:` は、未確認の LLM、MT5 bridge 未接続、標準指標の未導入、戦略なし、履歴源なし、linger、起動が未了、などが残っているときだけ出ます。0 件なら何も出ません。同じ内容は起動後も `afx ctl status` の末尾と起動画面に出続けます (操作 API が無効のときは起動画面と、この段の表示だけです)。
 
@@ -845,6 +849,28 @@ systemctl --version | head -1
 stat -fc %T /sys/fs/cgroup
 grep -qi microsoft /proc/version && echo WSL || echo not-WSL
 ```
+
+### 6.11 web の公開範囲 (自機のみ / LAN / reconfigure)
+
+web を有効にした実機で確かめます。LAN の address と許可 IP は環境のものに置き換えてください (この文書には書きません)。
+
+```
+uv run afx ops web status                         # stage / unit の行の次に web-access: の 1 行
+ss -ltn | grep ':<port> '                         # 待受が設定した bind だけ (0.0.0.0 ではない)
+curl -s -o /dev/null -w '%{http_code}\n' http://<bind>:<port>/        # 許可された端末から
+uv run afx ops web reconfigure                    # 対話。afx は止まらない
+systemctl --user show afx -p ActiveEnterTimestampMonotonic   # reconfigure の前後で同じ値
+```
+
+期待:
+
+- `web-access: bind=<bind>:<port> allow=<restricted|unrestricted|loopback-default> auth=<none|basic>` が出る。許可 IP の個別の値と password は出ない。設定を読めないときは `web-access: unavailable reason=<固定 reason>`。
+- 許可されていない端末からの接続は応答なしで切られる。`auth = "basic"` なら認証なしの要求は 401。
+- 生成した password は有効化の画面に 1 回だけ出て、再実行・`status`・ログには出ない。
+- `reconfigure` の前後で afx の `ActiveEnterTimestampMonotonic` が変わらず、`afx-ops@web` だけが再起動する。終わりに `web: reconfigured` (afx が止まっていたときは `web: reconfigured ops=starts_with_afx`) と出る。
+- 途中で中断した場合、設定と password の組が一時的に食い違って web が起動しない状態になる (`web-access: unavailable reason=secret_unexpected` 又は `secret_missing`)。`afx ops web reconfigure` の再実行で直る。`afx ops web enable` では直らず、afx も止めない。
+
+残余リスク (平文 HTTP、IP allowlist の限界、到達できる全 IPv4、password の初回表示など) は [操作 API と `afx ctl` の運用](ops-api-2026-10-09.md) の 10.6 節。利用者の責任として受け入れる前提です。
 
 ---
 

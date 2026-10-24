@@ -21,6 +21,7 @@ G, C, U = 10**16 + 1, 10**16 + 2, 10**16 + 3
 
 BOT = {"guild_id": G, "channel_id": C, "allowlist_user_ids": [U], "mention_user_ids": [U], "token": TOKEN}
 VALUES = {"bot": BOT, "web": {"port": 8788}, "notify": {"webhook_url": WEBHOOK}}
+SCOPE_Q = "公開範囲 [1] 自機のみ (既定) [2] LAN"
 
 
 @dataclass
@@ -87,7 +88,7 @@ def test_held_lease_runs_enable_without_reacquiring_setup_lock(tmp_path, xdg, mo
     try:
         monkeypatch.setattr("agentic_fx.ops_setup.interactive.acquire_setup_lock",
                             lambda _root: (_ for _ in ()).throw(AssertionError("lock reacquired")))
-        result = interactive_enable(tmp_path, "web", io=FakeIO(), lease=lease,
+        result = interactive_enable(tmp_path, "web", io=FakeIO(answers=[""]), lease=lease,
                                     probe_runner=lambda _feature: (0, ""),
                                     setup_factory=lambda _root: setup)
     finally:
@@ -130,7 +131,7 @@ def test_missing_configuration_without_ops_io_returns_structured_reason(tmp_path
 
 def test_lease_without_io_collects_missing_values_from_terminal(tmp_path, xdg, monkeypatch):
     class TerminalInput:
-        def __init__(self): self.lines = iter(["9000\n"])
+        def __init__(self): self.lines = iter(["9000\n", "\n"])
         def isatty(self): return True
         def readline(self): return next(self.lines)
 
@@ -187,7 +188,7 @@ def test_enable_reason_code_does_not_depend_on_error_detail(tmp_path, xdg):
     write_inputs(tmp_path, "web", {"port": 8788})
     results = []
     for detail in ("first diagnostic", "different diagnostic"):
-        result = interactive_enable(tmp_path, "web", io=FakeIO(),
+        result = interactive_enable(tmp_path, "web", io=FakeIO(answers=[""]),
                                     probe_runner=lambda _feature: (0, ""),
                                     setup_factory=lambda _root, d=detail: Setup([SystemdError("start", d)]))
         results.append((result.rc, result.stage, result.reason_code))
@@ -200,7 +201,7 @@ def test_enable_reason_code_rejects_freeform_exception_reason(tmp_path, xdg):
     class FreeformFailure(RuntimeError):
         reason = "diagnostic containing a URL https://example.test/secret"
 
-    result = interactive_enable(tmp_path, "web", io=FakeIO(),
+    result = interactive_enable(tmp_path, "web", io=FakeIO(answers=[""]),
                                 probe_runner=lambda _feature: (0, ""),
                                 setup_factory=lambda _root: Setup([FreeformFailure()]))
     assert (result.rc, result.stage, result.reason_code) == (1, "enable", "unknown")
@@ -226,7 +227,7 @@ def test_lease_remains_flocked_during_enable(tmp_path, xdg):
 
     setup = CheckingSetup()
     try:
-        result = interactive_enable(tmp_path, "web", io=FakeIO(), lease=lease,
+        result = interactive_enable(tmp_path, "web", io=FakeIO(answers=[""]), lease=lease,
                                     probe_runner=lambda _feature: (0, ""),
                                     setup_factory=lambda _root: setup)
     finally:
@@ -257,7 +258,7 @@ def test_console_io_requires_tty_stdin_and_stdout(monkeypatch):
 
 
 def test_probe_failure_reasks_then_enables_once(tmp_path, xdg):
-    io = FakeIO(answers=["8788", "8789"])
+    io = FakeIO(answers=["8788", "", "8789"])
     seen = []
 
     def probe(feature):
@@ -269,11 +270,12 @@ def test_probe_failure_reasks_then_enables_once(tmp_path, xdg):
     assert seen == ["web", "web"]
     assert setup.enabled == ["web"]
     assert io.err == ["afx-ops: probe_bind_failed"]
+    assert io.asked == ["port", SCOPE_Q, "port"]
     assert collect(tmp_path, "web").values == {"port": 8789}
 
 
 def test_probe_failure_three_times_gives_up_without_enable(tmp_path, xdg):
-    io = FakeIO(answers=["8788", "8788", "8788"])
+    io = FakeIO(answers=["8788", "", "8788", "", "8788", ""])
     rc, setup = run(tmp_path, "web", io, probe=lambda _f: (71, "config_invalid"))
     assert rc == 1 and setup.enabled == []
     assert io.err == ["afx-ops: config_invalid"] * 3
@@ -288,15 +290,15 @@ def test_probe_failure_non_tty_with_existing_ends_after_one_probe(tmp_path, xdg)
 
 
 def test_probe_non_retry_status_stops_without_reasking(tmp_path, xdg):
-    io = FakeIO(answers=["8788", "8789"])
+    io = FakeIO(answers=["8788", "", "8789"])
     rc, setup = run(tmp_path, "web", io, probe=lambda _f: (69, "config_invalid"))
     assert rc == 1 and setup.enabled == []
-    assert io.asked == ["port"]
+    assert io.asked == ["port", SCOPE_Q]
     assert io.err == ["afx-ops: config_invalid"]
 
 
 def test_probe_reason_is_never_untrusted_output(tmp_path, xdg):
-    io = FakeIO(answers=["8788"])
+    io = FakeIO(answers=["8788", ""])
     rc, setup = run(tmp_path, "web", io, probe=lambda _f: (69, "https://example/SECRET\nconfig_invalid"))
     assert rc == 1 and setup.enabled == []
     assert io.err == ["afx-ops: feature_probe_unreadable"]
@@ -402,41 +404,41 @@ def test_bot_retry_keeps_mentions_equal_to_reentered_allowlist(tmp_path, xdg):
 
 
 def test_not_initialized_inactive_initializes_then_retries_enable(tmp_path, xdg):
-    write_inputs(tmp_path, "web", {"port": 8788})
+    write_inputs(tmp_path, "notify", VALUES["notify"])
     setup = Setup([KeySetError("not_initialized")])
     initialized = []
-    rc, _ = run(tmp_path, "web", FakeIO(), setup=setup, keys_init=lambda: initialized.append(True) or 0)
+    rc, _ = run(tmp_path, "notify", FakeIO(), setup=setup, keys_init=lambda: initialized.append(True) or 0)
     assert rc == 0
     assert initialized == [True]
-    assert setup.enabled == ["web", "web"]
+    assert setup.enabled == ["notify", "notify"]
 
 
 @pytest.mark.parametrize("state", ["active", "activating", "reloading"])
 def test_not_initialized_with_running_afx_stops_with_fixed_reason(tmp_path, xdg, state):
-    write_inputs(tmp_path, "web", {"port": 8788})
+    write_inputs(tmp_path, "notify", VALUES["notify"])
     setup = Setup([KeySetError("not_initialized")], state=state)
     initialized = []
     io = FakeIO()
-    rc, _ = run(tmp_path, "web", io, setup=setup, keys_init=lambda: initialized.append(True) or 0)
+    rc, _ = run(tmp_path, "notify", io, setup=setup, keys_init=lambda: initialized.append(True) or 0)
     assert rc == 1
     assert initialized == []
-    assert setup.enabled == ["web"]
+    assert setup.enabled == ["notify"]
     assert len(io.err) == 1 and io.err[0].startswith("afx ops: afx_running_keys_not_initialized")
 
 
 def test_not_initialized_keys_init_failure_does_not_retry_enable(tmp_path, xdg):
-    write_inputs(tmp_path, "web", {"port": 8788})
+    write_inputs(tmp_path, "notify", VALUES["notify"])
     setup = Setup([KeySetError("not_initialized")])
-    rc, _ = run(tmp_path, "web", FakeIO(), setup=setup, keys_init=lambda: 1)
-    assert rc == 1 and setup.enabled == ["web"]
+    rc, _ = run(tmp_path, "notify", FakeIO(), setup=setup, keys_init=lambda: 1)
+    assert rc == 1 and setup.enabled == ["notify"]
 
 
 def test_other_key_errors_are_reported_not_initialized_over(tmp_path, xdg):
-    write_inputs(tmp_path, "web", {"port": 8788})
+    write_inputs(tmp_path, "notify", VALUES["notify"])
     setup = Setup([KeySetError("key_dir_invalid")])
     initialized = []
     io = FakeIO()
-    rc, _ = run(tmp_path, "web", io, setup=setup, keys_init=lambda: initialized.append(1) or 0)
+    rc, _ = run(tmp_path, "notify", io, setup=setup, keys_init=lambda: initialized.append(1) or 0)
     assert rc == 1 and initialized == []
     assert io.err == ["afx ops: key_dir_invalid"]
 
@@ -444,7 +446,6 @@ def test_other_key_errors_are_reported_not_initialized_over(tmp_path, xdg):
 # (a) minimal question sets
 @pytest.mark.parametrize("feature,answers,asked,secrets", [
     ("bot", [TOKEN, str(G), str(C), str(U)], ["guild ID", "channel ID", "allowlist user IDs (comma separated)"], ["Discord token"]),
-    ("web", ["9000"], ["port"], []),
     ("notify", [WEBHOOK], [], ["webhook URL"]),
 ])
 def test_questions_are_minimal_per_feature(tmp_path, xdg, feature, answers, asked, secrets):
@@ -519,7 +520,7 @@ def test_invalid_input_message_does_not_echo_the_value(tmp_path, xdg):
 
 
 # (d) complete existing inputs: zero questions, files untouched
-@pytest.mark.parametrize("feature", ["bot", "web", "notify"])
+@pytest.mark.parametrize("feature", ["bot", "notify"])
 def test_complete_existing_asks_nothing_and_leaves_files_untouched(tmp_path, xdg, feature):
     write_inputs(tmp_path, feature, VALUES[feature])
     base = xdg / feature
@@ -560,7 +561,7 @@ def test_setup_lock_held_by_another_process_is_setup_busy(tmp_path, xdg):
         holder.stdin.flush()
         holder.wait(timeout=10)
     lock.chmod(0o600)
-    rc, setup = run(tmp_path, "web", FakeIO(answers=["8788"]))
+    rc, setup = run(tmp_path, "web", FakeIO(answers=["8788", ""]))
     assert rc == 0 and setup.enabled == ["web"]
 
 
@@ -579,9 +580,9 @@ def test_setup_lock_other_writable_directory_is_unsafe(tmp_path, xdg):
 
 
 def test_setup_lock_is_released_after_failure(tmp_path, xdg):
-    rc, _ = run(tmp_path, "web", FakeIO(answers=["8788"]), probe=lambda _f: 1 / 0)
+    rc, _ = run(tmp_path, "web", FakeIO(answers=["8788", ""]), probe=lambda _f: 1 / 0)
     assert rc == 1
-    rc, setup = run(tmp_path, "web", FakeIO())
+    rc, setup = run(tmp_path, "web", FakeIO(answers=[""]))
     assert rc == 0 and setup.enabled == ["web"]
 
 
@@ -597,7 +598,7 @@ def _mode(path):
 
 @pytest.mark.parametrize("feature,secret", [("bot", "discord.token"), ("notify", "webhook.url"), ("web", None)])
 def test_interactive_write_modes(tmp_path, xdg, feature, secret):
-    answers = {"bot": [TOKEN, str(G), str(C), str(U)], "notify": [WEBHOOK], "web": ["8788"]}[feature]
+    answers = {"bot": [TOKEN, str(G), str(C), str(U)], "notify": [WEBHOOK], "web": ["8788", ""]}[feature]
     run(tmp_path, feature, FakeIO(answers=answers))
     base = xdg / feature
     assert _mode(base) == 0o700
@@ -624,7 +625,7 @@ def test_abort_during_input_leaves_no_files(tmp_path, xdg, exc, feature, after):
 
 
 def test_abort_on_retry_leaves_only_complete_files(tmp_path, xdg):
-    io = FakeIO(answers=["8788"], raise_after=(1, EOFError()))
+    io = FakeIO(answers=["8788", ""], raise_after=(2, EOFError()))
     rc, setup = run(tmp_path, "web", io, probe=lambda _f: (73, "probe_bind_failed"))
     assert rc == 1 and io.err == ["afx-ops: probe_bind_failed", "afx ops: setup_aborted"]
     files = [p for p in xdg.rglob("*") if p.is_file()]
