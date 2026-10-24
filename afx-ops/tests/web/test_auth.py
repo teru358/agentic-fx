@@ -4,9 +4,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import threading
+import time
 
 import pytest
 
+from afx_ops.isolation.accept_loop import Journal
 from afx_ops.web import auth
 
 PASSWORD = b"s3cret:with:colons-1234"
@@ -463,6 +465,35 @@ def test_each_journal_kind_stops_after_10_lines_but_counters_continue(clock, cap
     lines = capsys.readouterr().err.splitlines()
     assert lines == ["afx-ops: web_auth_failed"] * 10
     assert a.web_auth_failed_total == 30
+
+
+class _SlowSeen(dict):
+    """読みと書きの間に他 thread が割り込める隙を広げる。"""
+
+    def get(self, key, default=None):
+        value = super().get(key, default)
+        time.sleep(0.002)
+        return value
+
+
+def test_concurrent_failures_from_distinct_peers_journal_exactly_10_lines_per_kind(clock, capsys):
+    journal = Journal()
+    journal._seen = _SlowSeen()
+    a = auth.BasicAuthenticator(PASSWORD, clock=clock, journal=journal)
+    start = threading.Barrier(48)
+
+    def attempt(i: int) -> None:
+        start.wait()
+        a.authenticate([BAD], f"10.1.{i}.1")
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(48)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert capsys.readouterr().err.splitlines() == ["afx-ops: web_auth_failed"] * 10
+    assert journal._seen == {"web_auth_failed": 48}
+    assert a.web_auth_failed_total == 48
 
 
 def test_nothing_secret_reaches_the_journal_or_repr(authenticator, capsys):

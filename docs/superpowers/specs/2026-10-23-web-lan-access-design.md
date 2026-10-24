@@ -283,9 +283,9 @@ credential は byte 列 `b"afx:" + password` と完全一致しなければな�
 password 内の `:` はそのまま password の一部であり、最初の `:` より後を再分割しない。
 
 rate limit 中でない各試行は、正解 `b"afx:" + password` 全体と decoded credential 全体をそれぞれ SHA-256 の 32 byte digest にする。
-欠落、重複、scheme 違い、壊れた Base64、区切り無しも固定の dummy 入力から 32 byte digest を作る。
+Authorization header が無い要求は 401 を返すが認証試行ではない (hash も `compare_digest()` も 0 回、失敗に数えない、§3.4)。
+header がある要求は、重複、scheme 違い、壊れた Base64、区切り無しでも固定の dummy 入力から 32 byte digest を作り、dummy と比較して `hmac.compare_digest()` を 32 byte 対 32 byte でちょうど 1 回行う。
 decoded 上限超過も同じ固定 dummy 経路へ入れる。
-全試行は `hmac.compare_digest()` を 32 byte 対 32 byte でちょうど 1 回行う。
 password 又は credential の可変長 bytes を直接 `compare_digest()` に渡さない。
 
 欠落、重複、scheme 違い、壊れた Base64、decoded 上限超過、username 違い、password 違いは同じ認証失敗として扱う。
@@ -813,7 +813,7 @@ mock の単体試験だけでなく、listener、accepted fd、実 process、実
 | AC-13 | T1 / T2 とも `auth = "none"` は secret dir 不在を許可する。安全な残骸を `secret_unexpected`、symlink、未知 entry を含む unsafe な状態を `secret_invalid` で拒否し、secret の存在だけでは auth が有効にならない。 | T1 / T2 artifact の probe と production の rc 71 と固定 reason。 |
 | AC-14 | username `afx` と正しい password だけが通る。別 username と正しい password、`afx` と誤 password は同じ失敗になる。 | 200 / 401 と daemon 呼出し 1 / 0。 |
 | AC-15 | Authorization の欠落、重複、scheme 違い、区切り無し、tab、2 SP、前後 OWS、壊れた Base64、URL-safe alphabet、余分 padding、非 canonical pad bit、username 違い、password 違い、decoded 132 byte 超が同じ 401、同じ `WWW-Authenticate: Basic realm="afx"`、同じ固定 journal 文になる。canonical token だけが decode 後の再 encode と一致して通る。 | raw field-value、status、header、body、counter、journal。 |
-| AC-16 | rate limit 中でない認証試行が、成功、誤り、壊れた入力を含め常に 32 byte 対 32 byteの `compare_digest` を 1 回だけ呼ぶ。rate limit 中は 0 回になる。 | spy した引数長と呼出し回数。 |
+| AC-16 | rate limit 中でなく Authorization がある認証試行が、成功、誤り、壊れた入力を含め常に 32 byte 対 32 byteの `compare_digest` を 1 回だけ呼ぶ。rate limit 中と Authorization が無い要求は 0 回になる。 | spy した引数長と呼出し回数。 |
 | AC-17 | 401 の GET は固定 error 本文を持つ。HEAD は本文 0 byteで GET と同じ Content-Length を持つ。 | GET / HEAD の status、body、Content-Length。 |
 | AC-18 | 同じ送信元の失敗 4 / 5 / 6 回目が 401 / 401 / 429 になる。60 秒境界で古い失敗が契約どおり外れる。窓内 429 は比較と daemon 呼出しが 0 回で、queue に加わらない。 | fake clock、status、compare 回数、daemon 回数、queue 長。 |
 | AC-19 | 全体の失敗 99 / 100 / 101 回目が 401 / 401 / 429 になる。異なる送信元でも全体窓を共有し、global 先行 429 は送信元 entry の lookup / allocation と per-source 評価を行わない。 | fake clock、全体 counter、送信元表の lookup / allocation 回数。 |
@@ -1003,3 +1003,4 @@ durable な段つきの稼働中再設定 (仮置きの後続チケット `web-l
 | 2026-10-24 | v0.9a | accept の接続単位の errno 集合 (`EPROTO` / `ENETDOWN` / `ENOPROTOOPT` / `EHOSTDOWN` / `ENONET` / `EHOSTUNREACH` / `EOPNOTSUPP` / `ENETUNREACH` と `ENOBUFS` / `ENOMEM`、`ECONNABORTED` と同扱い) を §3.1 / §2.4 / AC-35 に追加し、`accept_failed` の rc を 72 から専用の 74 に分け、renderer が reply の形の不一致 (上記 5 例外型) で落ちる場合を 502 と明記した。 | /code-review high の指摘 (一過性 errno での全 web 停止、`accept_failed` と `accept_exhausted` の rc 共用) | |
 | 2026-10-24 | v0.9b | §2.2 の `web.password` を「一度だけ読む」から「検査と読取りで 2 回開いてよい (同じ検査)」に。 | T2a 実装レビュー (opus) の L-2 | |
 | 2026-10-24 | v0.9c | §3.4 に、Authorization が無い要求は 401 を返すが rate limit の失敗に数えないことを追記した。 | T2a /code-review high の指摘 | |
+| 2026-10-24 | v0.9d | §3.3 と AC-16 の文言を、Authorization が無い要求は認証試行ではなく比較 0 回、header があれば壊れた形でも dummy と 1 回比較する、に直した。 | T2a 閉鎖確認の指摘 | |
