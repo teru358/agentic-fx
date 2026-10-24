@@ -70,3 +70,24 @@ def test_choosing_none_for_good_drops_the_username_from_the_target(tmp_path):
     cur = {"port": 8788, "bind": "192.168.1.10", "allow": ["10.0.0.0/8"], "auth": "basic", "user": "alice"}
     plan = _session(tmp_path, io)._ask_who(cur, "safe")
     assert plan.action == "remove" and cur["auth"] == "none" and "user" not in cur
+
+
+def test_undecodable_terminal_input_is_treated_as_invalid_input_not_a_traceback(monkeypatch):
+    """端末が UTF-8 として読めない byte 列を送っても、ConsoleIO は traceback を出さず、
+    どの文法にも合わない値を返して呼び出し側の再質問に任せる。"""
+    from agentic_fx.ops_setup import interactive as inter
+
+    def broken_input(prompt: str) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 2, "invalid continuation byte")
+
+    def broken_getpass(prompt: str) -> str:
+        raise UnicodeDecodeError("utf-8", b"\xff\xfe", 0, 2, "invalid continuation byte")
+
+    monkeypatch.setattr("builtins.input", broken_input)
+    monkeypatch.setattr(inter.getpass, "getpass", broken_getpass)
+    io = inter.ConsoleIO()
+    assert io.ask("公開範囲", "1") == inter.UNDECODABLE_INPUT
+    assert io.ask_raw("ユーザー名", "afx") == inter.UNDECODABLE_INPUT
+    assert io.ask_secret("パスワード") == inter.UNDECODABLE_INPUT
+    assert not inter.UNDECODABLE_INPUT.isascii()
+

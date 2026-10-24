@@ -36,23 +36,38 @@ class IO(Protocol):
     def stderr(self, text: str) -> None: ...
 
 
+# 端末が UTF-8 として読めない byte 列を送ってきたとき (IME の未確定入力や別 encoding) に
+# 返す値。どの質問の文法にも合わないので、呼び出し側は通常の不正入力として再質問する。
+UNDECODABLE_INPUT = "\ufffd"
+
+
+def _read_line(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except UnicodeDecodeError:
+        return UNDECODABLE_INPUT
+
+
 class ConsoleIO:
     def isatty(self) -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
 
     def ask(self, label: str, default: str | None = None) -> str | None:
         suffix = f" [{default}]" if default is not None else ""
-        answer = input(f"{label}{suffix}: ").strip()
+        answer = _read_line(f"{label}{suffix}: ").strip()
         return answer or default
 
     def ask_raw(self, label: str, default: str | None = None) -> str | None:
         """前後の空白を取り除かずに返す。空の行だけが default になる。"""
         suffix = f" [{default}]" if default is not None else ""
-        answer = input(f"{label}{suffix}: ")
+        answer = _read_line(f"{label}{suffix}: ")
         return answer or default
 
     def ask_secret(self, label: str) -> str:
-        return getpass.getpass(f"{label}: ")
+        try:
+            return getpass.getpass(f"{label}: ")
+        except UnicodeDecodeError:
+            return UNDECODABLE_INPUT
 
     def stdout(self, text: str) -> None:
         print(text)
