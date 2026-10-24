@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 128 件。完了分は closed/。
+未完了: 130 件。完了分は closed/。
 
 ## 実装待ち (13)
 
@@ -32,11 +32,12 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (109)
+## 設計待ち (111)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
+| [improve-context-family-attempt-summary](open/improve-context-family-attempt-summary.md) | 高 | 2026-10-24 | 改善 prompt に仮説族ごとの試行回数と結果区分を渡す |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
 | [baseline-replay-unimplemented](open/baseline-replay-unimplemented.md) | 中 | 2026-09-12 | 設計書 2026-08-16 §4.2-4「(pair, timeframe) ごとに現在 live の D4-app… |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
@@ -66,6 +67,7 @@
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 中 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
+| [improve-deployed-signal-lookup-gap](open/improve-deployed-signal-lookup-gap.md) | 中 | 2026-10-24 | 改善 agent が毎周「get_signals 相当の tool が無い」で止まる穴を塞ぐ |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |

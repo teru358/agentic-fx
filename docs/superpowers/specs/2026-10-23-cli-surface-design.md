@@ -816,7 +816,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 
 製品方針として残るのは次の 1 件だけである。
 
-1. **対話 shell の寿命。** 本書はこの release (`0.2.0`) で shell を残し、help 末尾に deprecated 固定文を 1 行出す。既定案は次 major (`1.0.0`) で素の TTY `afx` shell を削除し、`afx ctl` へ一本化することである。この削除方針だけはユーザー裁定として残す。I1 の固定文 `1.0.0 で削除予定` がこの裁定に依存するので、I1 の着手前に取る。
+1. **対話 shell の寿命。** 本書はこの release (`0.2.0`) で shell を残し、help 末尾に deprecated 固定文を 1 行出す。既定案は次 major (`1.0.0`) で素の TTY `afx` shell を削除し、`afx ctl` へ一本化することである。**裁定 (2026-10-24、ユーザー承認): 既定案のとおり。`0.2.0` で shell を残して deprecated 固定文を出し、`1.0.0` で素の TTY `afx` shell を削除して `afx ctl` へ一本化する。** I1 の固定文 `1.0.0 で削除予定` はこの裁定に基づく。
 
 旧 (2) は技術決定で閉じた。§5.1 / §5.5 のとおり `logs.read` を流用せず新 scope `guidance.read` を operator / approver にだけ与え、ops-web / ops-bot / ops-notify には与えない。
 
@@ -973,3 +973,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-24 | v0.5 | `unreadable` / `malformed` を自動上書きしない stale とし、CRLF 照合、手修正案内、起動時 reconcile の fail-open、投影例外の endpoint 境界、byte 基準の `changed`、DB 0 行・file 不在の記録のみ移行、reconcile の autopilot 許可を固定。help の完全形 `usage` / `shell_usage` 分離、整数 tuple の version 比較、色を消した golden を追加し、AC-6 / 13 / 16 / 32 / 35 / 39 / 42 / 43 を更新 | 4 周目の指摘 | |
 | 2026-10-24 | v0.5a | AC-13 / AC-32 に ID の食い違う終了 marker 3 行と CRLF の managed block 全体の fixture を逐語で追加。golden test は `color=False` を渡さず環境変数の除去だけにする (3.13 の argparse は `color` を受けない)。`unreadable` の show は手修正の固定文を出す。 | 閉鎖確認 (codex sol) の Medium 2 / Low 1 | |
 | 2026-10-24 | v0.5b | golden test は非 TTY capture + 3.14 以上だけ `color=False`。再生成する managed block の行終端は常に LF、外側の byte は保持 (CRLF block → `missing` の golden を追加)。 | 差分再確認 (codex terra) の Medium 2 | |
+| 2026-10-24 | v0.5c | §8.2-1 対話 shell の寿命をユーザー裁定で確定 (0.2.0 deprecated 表示、1.0.0 で削除)。 | ユーザー承認 | |
