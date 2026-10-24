@@ -199,6 +199,19 @@ UNDEPLOYED_DEPENDENCY_LABEL = "未配備指標"
 _UNKNOWN_PAIR = "不明"
 FAMILY_SECTION_MAX_ENTRIES = 50
 FAMILY_SECTION_MAX_BYTES = 16 * 1024
+_FAMILY_SECTION_HEADING = "## 仮説族の試行状況"
+_FAMILY_PLACEHOLDER = "{family_attempts}"
+
+
+def family_section_fixed_bytes() -> int:
+    """prompt template の族別節のうち、動的な表を除く固定部分 (見出し・
+    基準文面・改行) の byte 数。節全体の上限から差し引く。"""
+    template = (Path(__file__).resolve().parent / "prompts"
+                / "improve_mission.md").read_text()
+    start = template.index(_FAMILY_SECTION_HEADING)
+    end = template.find("\n## ", start + 1)
+    body = template[start:end if end != -1 else len(template)]
+    return len(body.replace(_FAMILY_PLACEHOLDER, "").encode("utf-8"))
 
 
 class FamilyAttemptSummary(TypedDict):
@@ -327,16 +340,22 @@ def _unkeyed_line(entry: UnkeyedDeployedSummary) -> str:
 
 def render_family_attempts(section: FamilyAttemptSection) -> str:
     """prompt に差し込む族別の試行状況 (表と key なしの残余一覧)。"""
+    rows = section["rows"]
+    deployed_rows = [r for r in rows if r["deployed"] == "yes"]
+    other_rows = [r for r in rows if r["deployed"] != "yes"]
+    header = ("| family_key | attempts | outcomes | last_attempt_month | "
+              "deployed |\n|---|---:|---|---|---|")
     blocks: list[str] = []
-    if section["rows"]:
-        blocks.append(
-            "| family_key | attempts | outcomes | last_attempt_month | "
-            "deployed |\n|---|---:|---|---|---|\n"
-            + "\n".join(_family_row_line(r) for r in section["rows"]))
+    if deployed_rows:
+        blocks.append(header + "\n"
+                      + "\n".join(_family_row_line(r) for r in deployed_rows))
     if section["unkeyed_deployed"]:
         blocks.append(
             "family key なしの配備済み plugin:\n"
             + "\n".join(_unkeyed_line(u) for u in section["unkeyed_deployed"]))
+    if other_rows:
+        blocks.append(header + "\n"
+                      + "\n".join(_family_row_line(r) for r in other_rows))
     if section["entries_omitted"]:
         blocks.append(f"他 {section['entries_omitted']} 件を省略")
     return "\n\n".join(blocks) if blocks else "(なし)"
@@ -413,14 +432,14 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
                                      if tag == "unkeyed"],
                 "entries_omitted": total - shown}
 
+    budget = FAMILY_SECTION_MAX_BYTES - family_section_fixed_bytes()
     picked: list[tuple[str, Any]] = []
     reserved = 1 if unknown_row else 0
     for entry in ordered:
         if len(picked) + 1 + reserved > FAMILY_SECTION_MAX_ENTRIES:
             break
         trial = _assemble(picked + [entry])
-        if len(render_family_attempts(trial).encode("utf-8")
-               ) > FAMILY_SECTION_MAX_BYTES:
+        if len(render_family_attempts(trial).encode("utf-8")) > budget:
             break
         picked.append(entry)
     return _assemble(picked)

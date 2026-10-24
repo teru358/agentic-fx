@@ -107,6 +107,27 @@ def test_new_ledger_columns_do_not_reach_the_agent_surface(improve_env,
         assert canary not in text, f"{column} leaked to {surface}"
 
 
+def test_surfaces_that_read_the_ledger_actually_ran(improve_env):
+    """note と INDEX は台帳の行から best を引く面。実際にその経路を通って
+    いること (空振りで canary が無いのを漏れなしと誤認しない)。"""
+    app, root = improve_env
+    surfaces = _surfaces(app, root)
+    assert "best=" in surfaces["best_note_suffix"]
+    assert "best=" in surfaces["archive_index"]
+
+
+@pytest.mark.parametrize("function", [
+    improve_loop.best_candidate, improve_loop._best_label,
+    improve_loop.ImproveLoop._best_note_suffix,
+    improve_loop.ImproveLoop._append_archive_index])
+def test_best_note_and_index_read_paths_do_not_reference_the_new_columns(
+        function):
+    source = inspect.getsource(function)
+    for column in CANARIES:
+        assert column not in source, (
+            f"{function.__qualname__} references {column}")
+
+
 _PROJECTED_ROW = re.compile(
     r"\| indicator \(未配備\) @1h \| (\d+) \| duplicate=(\d+) \|")
 _OTHER_SURFACES = (

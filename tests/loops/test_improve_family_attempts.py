@@ -366,8 +366,30 @@ def test_ac6_order_is_deployed_then_unkeyed_then_undeployed_then_unknown(
         UNKNOWN_FAMILY_LABEL]
     assert [u["name"] for u in section["unkeyed_deployed"]] == ["bare"]
     text = render_family_attempts(section)
-    assert text.index("family key なしの配備済み plugin") > text.index(
-        UNKNOWN_FAMILY_LABEL)
+    unkeyed_at = text.index("family key なしの配備済み plugin")
+    assert unkeyed_at > text.index("| indicator:rsi_ind@1h |")
+    assert unkeyed_at > text.index(f"| strategy:rsi_ind@1h@{pairs[0]} |")
+    assert unkeyed_at < text.index(f"| strategy:rsi_ind@1h@{pairs[5]} |")
+    assert unkeyed_at < text.index(UNKNOWN_FAMILY_LABEL)
+
+
+def test_ac6_rendered_order_deployed_unkeyed_undeployed_unknown(
+        conn, tmp_path):
+    metas = [_meta("rsi", "indicator"),
+             _meta("bare", "strategy", pairs=("USDJPY",))]
+    _plant(conn, "indicator:ema@1h")
+    _plant(conn, None)
+    section = _section(conn, tmp_path, metas=metas)
+    text = render_family_attempts(section)
+    positions = [text.index(marker) for marker in (
+        "| indicator:rsi@1h |", "- bare (strategy)",
+        "| indicator (未配備) @1h |", f"| {UNKNOWN_FAMILY_LABEL} |")]
+    assert positions == sorted(positions)
+    prompt = _prompt(conn, tmp_path, metas=metas)
+    prompt_positions = [prompt.index(marker) for marker in (
+        "| indicator:rsi@1h |", "- bare (strategy)",
+        "| indicator (未配備) @1h |", f"| {UNKNOWN_FAMILY_LABEL} |")]
+    assert prompt_positions == sorted(prompt_positions)
 
 
 def test_ac6_entry_limit_keeps_deployed_first_and_reserves_unknown(
@@ -400,6 +422,13 @@ def test_ac6_byte_limit_drops_whole_rows_in_order(conn, tmp_path, monkeypatch):
     section = _section(conn, tmp_path, settings=settings, metas=metas)
     text = render_family_attempts(section)
     assert len(text.encode("utf-8")) <= FAMILY_SECTION_MAX_BYTES
+    prompt = _prompt(conn, tmp_path, settings=settings, metas=metas)
+    start = prompt.index("## 仮説族の試行状況")
+    end = prompt.index("\n## ", start + 1)
+    whole_section = prompt[start:end]
+    assert text in whole_section
+    assert len(whole_section.encode("utf-8")) <= FAMILY_SECTION_MAX_BYTES
+    assert len(whole_section.encode("utf-8")) > FAMILY_SECTION_MAX_BYTES - 1024 - 2048
     assert 0 < len(section["rows"]) < FAMILY_SECTION_MAX_ENTRIES
     for line in text.splitlines():
         if line.startswith("| strategy:"):
