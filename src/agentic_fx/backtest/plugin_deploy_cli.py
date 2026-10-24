@@ -12,6 +12,7 @@ import dataclasses
 import functools
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -25,8 +26,12 @@ from agentic_fx.plugin import deploy_disable, deploy_ops, deploy_retire, deploy_
 from agentic_fx.plugin import deploy_versions
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.store.db import connect_observer_readonly
 
 LOCK_WAIT_SECONDS = 30.0
+
+_PLUGIN_KINDS = frozenset({"indicator", "strategy"})
+_HASH_PATTERN = re.compile(r"[0-9a-fA-F]{12,}")
 
 RC_OK = 0
 RC_FAILED = 1
@@ -117,16 +122,21 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
             from agentic_fx.plugin import loader
             entries = sorted(entry for entry in plugins_root.iterdir()
                              if not entry.name.startswith((".", "_")))
-            for entry in entries:
+        except OSError:
+            entries = []
+            sources["live"] = "unavailable"
+        for entry in entries:
+            # 診断コマンドなので 1 件の壊れた plugin で一覧を止めない。
+            try:
                 if not (entry.is_dir() or entry.is_symlink()):
                     continue
-                meta, reason = loader.discover_one_with_reason(entry, entry.name)
+                meta, _reason = loader.discover_one_with_reason(entry, entry.name)
                 if meta is None:
-                    item(entry.name, "unknown")["issues"].add("broken:invalid_manifest")
-                else:
-                    item(meta.name, meta.kind)["live"].append(meta.content_hash)
-        except OSError:
-            sources["live"] = "unavailable"
+                    raise ValueError("invalid manifest")
+                live_item = item(meta.name, meta.kind)
+                live_item["live"].append(meta.content_hash)
+            except Exception:
+                item(entry.name, "unknown")["issues"].add("broken:invalid_manifest")
 
     db_path = root / "data" / "agentic.db"
     conn = None
@@ -134,11 +144,15 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
         sources["pending"] = sources["journal"] = "missing"
     else:
         try:
-            conn = deploy_store.open_readonly(db_path)
-        except sqlite3.Error:
+            conn = connect_observer_readonly(db_path)
+        except (sqlite3.Error, OSError):
             sources["pending"] = sources["journal"] = "unavailable"
         if conn is not None:
             try:
+                live_kinds: dict[str, set[str]] = {}
+                for (live_name, live_kind), live_row in rows.items():
+                    if live_row["live"] and live_kind in _PLUGIN_KINDS:
+                        live_kinds.setdefault(live_name, set()).add(live_kind)
                 pending_rows = conn.execute(
                     "SELECT id,payload_json FROM approval_requests "
                     "WHERE kind='plugin' AND status='pending' ORDER BY id").fetchall()
@@ -146,13 +160,25 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
                     try:
                         payload = json.loads(pending["payload_json"])
                         name, content = payload["name"], payload["content_hash"]
-                        if not isinstance(name, str) or not isinstance(content, str):
+                        if (not isinstance(name, str) or not isinstance(content, str)
+                                or not _HASH_PATTERN.fullmatch(content)):
                             raise ValueError
+                        proposed = payload.get("kind")
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                         item(f"invalid-pending-{pending['id']}", "unknown")["issues"].add(
-                            "broken:invalid_manifest")
+                            "broken:invalid_pending")
+                        continue
+                    live_set = live_kinds.get(name, set())
+                    mismatch = proposed not in _PLUGIN_KINDS or (
+                        bool(live_set) and proposed not in live_set)
+                    if not mismatch:
+                        placed = proposed
                     else:
-                        item(name, known_kind(name, str(payload.get("kind", "unknown"))))["pending"].append(content)
+                        placed = next(iter(live_set)) if len(live_set) == 1 else "unknown"
+                    row = item(name, placed)
+                    row["pending"].append(content)
+                    if mismatch:
+                        row["issues"].add("kind_mismatch")
             except sqlite3.Error:
                 sources["pending"] = "unavailable"
             try:
@@ -179,7 +205,11 @@ def plugin_list(root: Path, *, kind: str | None = None) -> int:
     for row in rows.values():
         for field, issue in (("live", "duplicate_live"), ("pending", "duplicate_pending"),
                              ("open_ops", "duplicate_open_op")):
-            if len(row[field]) != len(set(row[field])):
+            if field == "open_ops":
+                duplicated = len(row[field]) > 1
+            else:
+                duplicated = len(row[field]) != len(set(row[field]))
+            if duplicated:
                 row["issues"].add(issue)
     if kind is not None:
         rows = {key: row for key, row in rows.items() if key[1] == kind}

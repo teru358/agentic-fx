@@ -3,7 +3,7 @@
 段 0〜9 は何も書かない「集める層」(書くのは lock ファイルだけ)。段 10 は回復可能な
 commit protocol (marker → settings → DB → 確認記録 → 状態 → marker 除去) で、その後の
 段 11〜14 は 1 つずつ独立に確定する。外部への呼び出し (HTTP・subprocess・systemd・
-`afx ops enable`) は全て `WizardDeps` から注入され、既定が本物。
+`afx ops <feature> enable`) は全て `WizardDeps` から注入され、既定が本物。
 
 ウィザードは秘密を受け取らず、書かず、表示しない。`WizardIO` が秘密用の入口を
 持たないのはそのため。
@@ -84,12 +84,12 @@ NON_TTY_MESSAGE = ("対話が必要です (標準入力が端末ではありま�
 _NOT_REPO_MESSAGE = ("ここは agentic-fx のリポジトリ直下ではありません "
                      "(config/settings.yaml.example が見つかりません)。"
                      "clone したディレクトリで実行してください。")
-_SETUP_BUSY_MESSAGE = ("別の `afx init` または `afx ops enable` が実行中です。"
+_SETUP_BUSY_MESSAGE = ("別の `afx init` または `afx ops <feature> enable` が実行中です。"
                        "終了してから再実行してください。設定・DB は変更していません。")
 _INSTANCE_BUSY_MESSAGE = ("別の agentic-fx が動いています。`systemctl --user stop afx` で止めてから"
                           "再実行してください (`uv run afx` で手動起動しているなら、"
                           "その端末で終了してください)。設定・DB は変更していません。")
-_ENROLL_MESSAGE = ("`afx ops enable <feature>` が途中で止まっています。同じコマンドを再実行して"
+_ENROLL_MESSAGE = ("`afx ops <feature> enable` が途中で止まっています。同じコマンドを再実行して"
                    "完了させてください。その間 afx は起動できません。")
 _NOTHING_CHANGED = "確定していないので何も変えていません。"
 _AFTER_COMMIT_STOP = ("ここまでの確定は残っています。続きは `afx init` の再実行で行えます "
@@ -1636,7 +1636,7 @@ def _stage8(sess: _Session, st: _Start, a: Answers) -> None:
     else:
         sess.say(".env に必要なキーはありません。")
     sess.say(".env は作りません (.gitignore で除外済みです)。Discord の token と通知の webhook URL は "
-             "`afx ops enable` が feature 専用の secret file に置きます。")
+             "`afx ops <feature> enable` が feature 専用の secret file に置きます。")
 
 
 # ---------------------------------------------------------------------------
@@ -2091,7 +2091,7 @@ _FEATURES = ("bot", "web", "notify")
 
 def _ask_features(sess: _Session) -> list[str]:
     sess.say("外から見る / 操作する手段: bot (Discord bot) / web (読み取り専用 web) / notify (通知)。"
-             "質問 (token・port・webhook URL など) は `afx ops enable` 側が端末から直接受けます。")
+             "質問 (token・port・webhook URL など) は `afx ops <feature> enable` 側が端末から直接受けます。")
     if not sess.yesno("外から見る手段を今設定しますか (既定: あとで)", False):
         return []
     while True:
@@ -2234,7 +2234,7 @@ def _stage13(sess: _Session, settings: Settings, *, resume_handoff: bool, daemon
                          "afx-ops が見つかりません。`afx-ops/` を PATH に置くか `afx_ops` を import できる環境にしてください。")
             else:
                 sess.say(f"{item.feature}: 有効化が途中です ({item.reason_code})。"
-                         f"`afx ops enable {item.feature}` を再実行してください。")
+                         f"`afx ops {item.feature} enable` を再実行してください。")
         _update_record(sess, ops={**_prior_ops(sess), **post_start.ops_record_values(outcomes)})
     if resume_handoff:
         remove_setup_marker(root, hook=deps.hook)

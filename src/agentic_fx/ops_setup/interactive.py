@@ -1,4 +1,4 @@
-"""Terminal-facing preflight for ``afx ops enable``."""
+"""Terminal-facing preflight for ``afx ops <feature> enable``."""
 from __future__ import annotations
 
 import fcntl

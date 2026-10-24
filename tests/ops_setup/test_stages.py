@@ -718,7 +718,7 @@ def test_marker_of_another_feature_is_rejected_without_changes(tmp_path, monkeyp
     assert caught.value.reason == "marker_foreign"
     assert f"path={path}" in caught.value.detail
     assert "feature=web" in caught.value.detail
-    assert "afx ops enable web" in caught.value.detail
+    assert "afx ops web enable" in caught.value.detail
     assert path.read_bytes() == before
     assert systemd.calls == []
     assert read_stage(setup.root, "bot", missing_ok=True) is None

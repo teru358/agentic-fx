@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,6 +24,7 @@ from agentic_fx.backtest.dataset import HistoryDataset
 from agentic_fx.backtest.mt5_import import ImportConflictError
 from agentic_fx.backtest.runner import BacktestResult
 from tests.backtest.factories import DATASET_1M
+from tests.fixtures.fs_tree import tree_snapshot
 from agentic_fx.entry import main
 from agentic_fx.store import backtest_runs as backtest_runs_real
 from agentic_fx.store.db import connect, init_db
@@ -1510,6 +1513,137 @@ def test_check_backend_prints_the_fixed_warning_and_uses_no_isolation_sentinel(
         "この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ (`improve isolation: enabled; … fingerprint=`) を見る",
         "実 backend へ 1 往復し、課金またはサブスク枠を使う。",
     ]
+
+
+_BACKEND_WARNING = (
+    "この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。"
+    "隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ "
+    "(`improve isolation: enabled; … fingerprint=`) を見る\n"
+    "実 backend へ 1 往復し、課金またはサブスク枠を使う。\n")
+_PARENT_OPTIONS_MESSAGE = "`--json` / `--unit-env` は `afx check backend` と併用できません。\n"
+
+
+def _ok_result(backend="local", provider=None):
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    return VerifyBackendResult(ok=True, backend=backend, provider=provider,
+                               fingerprint="0" * 64, detail="ok")
+
+
+def test_check_backend_stdout_is_byte_identical_and_the_sentinel_reaches_the_backend_once(
+        tmp_path, monkeypatch, capsys):
+    from unittest.mock import patch
+    from agentic_fx.loops.verify_backend import OPERATOR_SHELL_NO_ISOLATION
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        verify.return_value = _ok_result("codex", "chatgpt")
+        assert main(["check", "backend", "--backend", "codex", "--provider", "chatgpt"]) == 0
+    assert verify.call_count == 1
+    assert verify.call_args.kwargs["backend"] == "codex"
+    assert verify.call_args.kwargs["provider"] == "chatgpt"
+    assert verify.call_args.kwargs["isolation_options"] is OPERATOR_SHELL_NO_ISOLATION
+    captured = capsys.readouterr()
+    assert captured.out == _BACKEND_WARNING + "ok\n" + "fingerprint: " + "0" * 64 + "\n"
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("parent", [["--json"], ["--unit-env"], ["--json", "--unit-env"]])
+def test_check_backend_rejects_every_parent_option_combination_before_any_round_trip(
+        tmp_path, monkeypatch, capsys, parent):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    before = tree_snapshot(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        assert main(["check", *parent, "backend", "--backend", "local"]) == 2
+    verify.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.err == _PARENT_OPTIONS_MESSAGE and captured.out == ""
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_check_backend_json_after_the_subcommand_is_the_argparse_error_route(
+        tmp_path, monkeypatch, capsys):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        with pytest.raises(SystemExit) as exc:
+            main(["check", "backend", "--backend", "local", "--json"])
+    assert exc.value.code == 2
+    verify.assert_not_called()
+    err = capsys.readouterr().err
+    assert "unrecognized arguments: --json" in err
+    assert _PARENT_OPTIONS_MESSAGE not in err
+
+
+@pytest.mark.parametrize("argv", [
+    ["check", "backend", "--backend", "invalid"],
+    ["check", "backend", "--backend", "local", "--provider", "invalid"],
+    ["check", "backend", "--backend", "codex", "--provider", "other"],
+    ["check", "backend", "--backend", ""],
+])
+def test_check_backend_rejects_invalid_values_before_any_round_trip(
+        tmp_path, monkeypatch, capsys, argv):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    before = tree_snapshot(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        with pytest.raises(SystemExit) as exc:
+            main(argv)
+    assert exc.value.code == 2
+    verify.assert_not_called()
+    assert "invalid choice" in capsys.readouterr().err
+    assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_check_backend_leaves_the_root_tree_untouched_and_creates_no_database(
+        tmp_path, monkeypatch, capsys, initialized):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    if initialized:
+        StateStore(tmp_path / "data" / "state" / "app_state.json").save(
+            replace(StateStore(tmp_path / "data" / "state" / "app_state.json").load(),
+                    initialized=True))
+    before = tree_snapshot(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        verify.return_value = _ok_result()
+        assert main(["check", "backend", "--backend", "local"]) == 0
+    assert verify.call_count == 1
+    assert tree_snapshot(tmp_path) == before
+    assert not (tmp_path / "data" / "agentic.db").exists()
+
+
+@pytest.mark.parametrize("error", [
+    OSError("tmp dir"), ValueError("backend launch"), KeyError("model"),
+    sqlite3.OperationalError("database is locked")])
+def test_check_backend_folds_expected_failures_into_rc1_without_a_traceback(
+        tmp_path, monkeypatch, capsys, error):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    before = tree_snapshot(tmp_path)
+    with patch("agentic_fx.loops.verify_backend.verify_backend", side_effect=error):
+        assert main(["check", "backend", "--backend", "local"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("エラー: ") and "Traceback" not in err
+    assert err.count("\n") == 1
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_check_backend_with_broken_settings_is_rc1_before_the_warning(tmp_path, monkeypatch, capsys):
+    from unittest.mock import patch
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "settings.yaml").write_text("schema_version: [broken\n")
+    with patch("agentic_fx.loops.verify_backend.verify_backend") as verify:
+        assert main(["check", "backend", "--backend", "local"]) == 1
+    verify.assert_not_called()
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err.startswith("エラー: ")
 
 
 # --- [indicator-consumption-wiring] T3: CLI の依存解決 (A1'/A1'') ----------

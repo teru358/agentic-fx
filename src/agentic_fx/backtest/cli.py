@@ -787,18 +787,15 @@ def verify_backend_command(root: Path, args: argparse.Namespace) -> int:
     load_env_file(root / ".env")
     try:
         settings = load_settings(root / "config" / "settings.yaml")
-    except ConfigError as e:
-        print(f"エラー: {e}", file=sys.stderr)
-        return 1
-    print("この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。"
-          "隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ "
-          "(`improve isolation: enabled; … fingerprint=`) を見る")
-    print("実 backend へ 1 往復し、課金またはサブスク枠を使う。")
-    try:
+        print("この確認は運用者の shell で、service の追加隔離 (seccomp / cgroup) なしに疎通だけを見る。"
+              "隔離適合の合格ではない。隔離付きの自己試験の結果は service 起動時の技術ログ "
+              "(`improve isolation: enabled; … fingerprint=`) を見る")
+        print("実 backend へ 1 往復し、課金またはサブスク枠を使う。")
         result = verify_backend(root, settings, backend=args.backend,
                                 provider=args.provider, clock=SystemClock(),
                                 isolation_options=OPERATOR_SHELL_NO_ISOLATION)
-    except VerifyBackendGateError as e:
+    except (ConfigError, ValueError, KeyError, OSError, sqlite3.Error,
+            VerifyBackendGateError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
     if not result.ok:

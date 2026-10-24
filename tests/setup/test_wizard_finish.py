@@ -201,7 +201,7 @@ def test_a_failed_enable_does_not_stop_the_wizard_and_is_recorded_with_its_reaso
     item = record_of(root)["ops"]["bot"]
     assert item["result"] == "failed" and item["stage"] == "probe"
     assert item["reason_code"] == "feature_probe_failed:bot"
-    assert "afx ops enable bot" in io.text
+    assert "afx ops bot enable" in io.text
     assert not setup_marker_present(root)
     assert calls.enable_and_start[0]["features"] == []
 

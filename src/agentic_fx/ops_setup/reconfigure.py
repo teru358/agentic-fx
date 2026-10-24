@@ -7,5 +7,5 @@ from pathlib import Path
 
 def run_ops_reconfigure(root: Path, feature: str) -> int:
     del root, feature
-    print("afx ops: reconfigure は未実装です", file=sys.stderr)
+    print("afx ops: reconfigure_not_available", file=sys.stderr)
     return 1

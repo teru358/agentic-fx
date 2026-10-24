@@ -114,10 +114,10 @@ def render_pending_step(step: PendingStep) -> str:
         return f"承認 #{number(p.get('approval_id'))} が途中で止まっています。`afx ctl --as approver approval retry {number(p.get('approval_id'))}`"
     if step.code == "ops_incomplete":
         feature = ident(p.get("feature"), "feature")
-        return f"{feature} の有効化が途中です ({ident(p.get('reason_code'), 'unknown')})。`afx ops enable {feature}` を再実行してください"
+        return f"{feature} の有効化が途中です ({ident(p.get('reason_code'), 'unknown')})。`afx ops {feature} enable` を再実行してください"
     if step.code == "ops_not_ready":
         feature = ident(p.get("feature"), "feature")
-        return f"{feature} は有効化済みですが ready を確認できていません。`afx ops status {feature}`"
+        return f"{feature} は有効化済みですが ready を確認できていません。`afx ops {feature} status`"
     if step.code == "isolation_not_admitted":
         return f"改善の CLI backend は隔離の適合検査を通っていません ({ident(p.get('reason_code'), 'unknown')})"
     if step.code == "api_disabled":

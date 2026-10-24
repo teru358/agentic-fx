@@ -15,7 +15,12 @@ _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
 
 
 def _compatibility_active(record) -> bool:
-    return version_tuple(importlib.metadata.version("agentic-fx")) < version_tuple(record.remove_in)
+    """期限前なら真。version を引けない環境 (未 install) は期限判定不能として有効のまま。"""
+    try:
+        current = importlib.metadata.version("agentic-fx")
+    except importlib.metadata.PackageNotFoundError:
+        return True
+    return version_tuple(current) < version_tuple(record.remove_in)
 
 
 def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
@@ -23,13 +28,13 @@ def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
     if args_list[head:head + 1] == ["ctl"]:
         return args_list, None
     improve, ops = COMPATIBILITY_RECORDS
-    if _compatibility_active(improve) and args_list[head:head + 1] == ["improve"]:
+    if args_list[head:head + 1] == ["improve"] and _compatibility_active(improve):
         print(improve.message, file=sys.stderr)
         return args_list, 2
     if args_list[head:head + 1] != ["ops"]:
         return args_list, None
     verb = args_list[head + 1] if len(args_list) > head + 1 else None
-    if _compatibility_active(ops) and verb in {"enable", "disable", "status"}:
+    if verb in {"enable", "disable", "status"} and _compatibility_active(ops):
         feature = args_list[head + 2] if len(args_list) > head + 2 else None
         display_feature = feature if feature in {"bot", "web", "notify"} else "<bot|web|notify>"
         message = ops.message.replace("<verb>", verb).replace("<feature>", display_feature)
@@ -39,7 +44,7 @@ def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
         normalized = args_list[:head + 1] + [feature, verb] + args_list[head + 3:]
         print(message, file=sys.stderr)
         return normalized, None
-    if args_list[head + 2:head + 3] == ["reconf"]:
+    if args_list[head + 1:head + 2] == ["web"] and args_list[head + 2:head + 3] == ["reconf"]:
         normalized = list(args_list)
         normalized[head + 2] = "reconfigure"
         return normalized, None
@@ -98,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
                              ("status", "機能の durable stage を表示する")):
             feature_sub.add_parser(action, help=text)
         if feature == "web":
-            feature_sub.add_parser("reconfigure", help="web の設定を変更する")
+            feature_sub.add_parser("reconfigure",
+                                   help="web の設定を変更する (web-lan T2 で実装、現在は未実装)")
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")
