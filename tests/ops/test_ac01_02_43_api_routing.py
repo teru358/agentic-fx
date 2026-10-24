@@ -64,6 +64,10 @@ def _calls(api, env):
         ("backlog_reopen", "POST", f"/v1/backlog/{rejected_backlog}/reopen", {}, {}, 200),
         ("backlog_note", "POST", f"/v1/backlog/{note_backlog}/note", {}, {}, 200),
         ("policy", "POST", "/v1/policy", {"text": "be careful"}, key, 200),
+        ("policy_show", "GET", "/v1/policy", None, {}, 200),
+        ("policy_reconcile", "POST", "/v1/policy/reconcile", {}, {"Idempotency-Key": "k-2"},
+         200),
+        ("policy_remove", "POST", "/v1/policy/1/remove", {}, {"Idempotency-Key": "k-3"}, 200),
     ]
 
 
@@ -101,7 +105,7 @@ def test_ac1_all_29_endpoints_over_real_uds(api):
 def test_ac1_unknown_path_and_method_are_404(api):
     client = api.client(Principal.APPROVER)
     assert client.get("/v1/nothing").status_code == 404
-    assert client.get("/v1/policy").status_code == 404
+    assert client.get("/v1/policy/1").status_code == 404
     assert client.post("/v1/status", json={}).status_code == 404
     assert client.get("/v1/approvals/abc").status_code == 400
 
