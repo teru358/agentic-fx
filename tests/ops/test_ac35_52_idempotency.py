@@ -150,7 +150,11 @@ def test_ac35_policy_file_is_regenerated_and_hand_written_lines_survive(ops_env)
     service.add_policy(OPERATOR, "k2", "no news trading")
     service.regenerate_policy()
     assert ops_env.policy_path.read_text(encoding="utf-8") == (
-        "# 方針\n- 手で書いた方針\n- always protect capital\n- no news trading\n")
+        "# 方針\n- 手で書いた方針\n"
+        "<!-- afx:managed-policy id=1 -->\n- always protect capital\n"
+        "<!-- /afx:managed-policy id=1 -->\n"
+        "<!-- afx:managed-policy id=2 -->\n- no news trading\n"
+        "<!-- /afx:managed-policy id=2 -->\n")
 
 
 def test_ac52_reflect_retry_requires_key_and_identifier(ops_env):

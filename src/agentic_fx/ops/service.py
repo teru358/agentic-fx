@@ -21,9 +21,7 @@ import concurrent.futures
 import contextlib
 import json
 import logging
-import os
 import sqlite3
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.store import plugin_deploy_ops as deploy_store
+from agentic_fx.policy_projection import insert_policy, reconcile_policy_file
 
 from . import redactor
 from .activity import SuppressedActivity
@@ -268,10 +267,6 @@ def _decided_by(caller: Caller) -> str:
     if caller is ShellCaller.SHELL:
         return "shell"
     return f"api:{caller.value}"
-
-
-def _render_directive(text: str) -> str:
-    return "- " + " ".join(text.split())
 
 
 class OpsService:
@@ -773,10 +768,7 @@ class OpsService:
 
         def action(_deadline: float, accepted: AcceptedRequest) -> dict:
             request_id = accepted.request_id
-            self._conn.execute(
-                "INSERT INTO ops_policies(request_id,directive,created_at) VALUES (?,?,?)",
-                (request_id, text, self._wall_clock().isoformat()))
-            self._conn.commit()
+            insert_policy(self._conn, text, request_id=request_id, now=self._wall_clock())
             self._regenerate_policy()
             # 既存運用との互換で、policy_added だけは先頭 200 文字を残す (§8 の例外)。
             self._activity("SYSTEM", "policy_added", text[:200])
@@ -793,34 +785,7 @@ class OpsService:
     def _regenerate_policy(self) -> None:
         if self._policy_path is None:
             return
-        rendered = [_render_directive(row["directive"]) for row in self._conn.execute(
-            "SELECT directive FROM ops_policies ORDER BY id").fetchall()]
-        owned = set(rendered)
-        try:
-            existing = self._policy_path.read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
-            existing = []
-        # 利用者が手で書いた行は残し、record 由来の行だけを record 集合から作り直す。
-        kept = [line for line in existing if line not in owned]
-        payload = "".join(f"{line}\n" for line in kept + rendered).encode()
-        self._policy_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=self._policy_path.name + ".",
-                                         suffix=".tmp", dir=self._policy_path.parent)
-        try:
-            with os.fdopen(fd, "wb") as file:
-                file.write(payload)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary, self._policy_path)
-            directory = os.open(self._policy_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary)
-            raise
+        reconcile_policy_file(self._conn, self._policy_path)
 
     def add_backlog(self, principal: Caller, idempotency_key: str, idea: str, *,
                     deadline: float | None = None) -> dict:
