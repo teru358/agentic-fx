@@ -34,6 +34,7 @@ import yaml
 from agentic_fx import service
 from agentic_fx._safe_error import one_line_error, safe_error_text, safe_text
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx.policy_projection import _render_directive
 from agentic_fx.commands import (
     POLICY_WRITE_ERRORS, PolicyFileNotReflected, add_backlog_idea, add_policy_directive)
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
@@ -2027,21 +2028,26 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
         backlog_example = _BACKLOG_EXAMPLE.format(timeframe=timeframe)
         for example in examples:
             sess.say(f"例: 「{example}」")
-        sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
+        sess.say("後から `afx ctl policy add` / `afx ctl backlog add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
         written = 0
         activity = ActivityLog(sess.root / "logs" / "activity.log")
-        while True:
+        policy_failed = False
+        while not policy_failed:
             raw = sess.ask("方針文: ", allow_quit=False)
             entries = examples if raw == "e" else (" ".join(raw.split()),)
             if not entries[0]:
                 break
             for text in entries:
                 try:
-                    duplicate = text in (_read_text(path) or "") or conn.execute(
+                    rendered = _render_directive(text)
+                    lines = {line[:-1] if line.endswith("\r") else line
+                             for line in (_read_text(path) or "").split("\n")}
+                    duplicate = rendered in lines or conn.execute(
                         "SELECT 1 FROM ops_policies WHERE directive=? LIMIT 1", (text,)).fetchone() is not None
                 except (sqlite3.Error, OSError, UnicodeDecodeError) as error:
                     sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
-                    return
+                    policy_failed = True
+                    break
                 if duplicate:
                     sess.say("方針文は追加済みです。")
                     continue
@@ -2052,14 +2058,16 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
                     cause = error.__cause__ or error
                     sess.say("警告: 方針文は記録しましたが policy/directives.md へ反映できませんでした "
                              f"({_one_line(cause)})。afx の次回起動時に反映されます。")
-                    return
+                    policy_failed = True
+                    break
                 except POLICY_WRITE_ERRORS as error:
                     sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
-                    return
+                    policy_failed = True
+                    break
         sess.say(f"方針文を {written} 行書きました。")
         sess.say("課題は改善ループが最初に取り組む 1 件です。")
         sess.say(f"例: 「{backlog_example}」")
-        sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
+        sess.say("後から `afx ctl policy add` / `afx ctl backlog add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
         added = 0
         while True:
             raw = sess.ask("最初の課題: ", allow_quit=False)
@@ -2275,7 +2283,7 @@ def _stage14(sess: _Session, settings: Settings) -> None:
     sess.say("起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。")
     if settings.api.enabled:
         sess.say("操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、"
-                 "`afx ctl improve add <案>`、`afx ctl policy add <文>`。")
+                 "`afx ctl backlog add <案>`、`afx ctl policy add <文>`。")
         sess.say("改善候補の承認は二通り: Discord bot を有効にしたなら承認依頼で二段操作 (claim → confirm)、"
                  "もう一つは `afx ctl --as approver approve <id>` (端末での確認あり)。")
     else:

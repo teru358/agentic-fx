@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.store import plugin_deploy_ops as deploy_store
-from agentic_fx.policy_projection import (MigrationRecordUnknown, insert_policy,
+from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnknown, insert_policy,
                                           inspect_policy_file, reconcile_policy_file,
                                           regenerate_policy_file, unmanaged_policy_lines)
 
@@ -825,7 +825,7 @@ class OpsService:
                    deadline: float | None = None) -> dict:
         """canonical record を正にして policy file を毎回再生成する。"""
         _authorize(principal, "policy")
-        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+        if not isinstance(text, str) or not text.strip() or len(text) > POLICY_TEXT_LIMIT:
             raise OpsError(ErrorCode.INVALID_ARGUMENT)
 
         def action(_deadline: float, accepted: AcceptedRequest) -> dict:

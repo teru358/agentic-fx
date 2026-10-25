@@ -354,7 +354,7 @@ def test_parent_help_comes_from_the_parent_and_label_is_derived():
     assert r.parser_help("ctl") == "稼働中の daemon を操作 API で操作する"
     assert r.parser_help("ops web") == "web 表示 (ops-web)"
     assert r.parser_help("init") == "[変更] 初期設定を行う"
-    assert r.parser_help("status") == "[読取] 停止中の状態を表示する"
+    assert r.parser_help("status") == "[読取] オフライン状態を書き込まずに表示する"
     assert r.parser_description("init") == "初期設定を行う"
     assert r.parser_help("news") is None and r.leaf_help("news") is None
     assert r.parser_help("nonexistent") is None
