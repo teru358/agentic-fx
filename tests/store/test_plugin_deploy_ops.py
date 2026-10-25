@@ -809,3 +809,17 @@ def test_a_database_under_a_path_with_uri_special_characters_opens_read_only(tmp
     assert ro is not None
     ro.close()
     assert deploy_ops.count_open_readonly(db_path) == 0
+
+
+def test_count_open_readonly_uses_the_supplied_readonly_opener(tmp_path):
+    db_path = tmp_path / "ops.db"
+    conn = _conn(tmp_path)
+    conn.close()
+    calls = []
+
+    def opener(path):
+        calls.append(path)
+        return sqlite3.connect(path)
+
+    assert deploy_ops.count_open_readonly(db_path, opener=opener) == 0
+    assert calls == [db_path]

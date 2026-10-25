@@ -282,13 +282,13 @@ def open_readonly(db_path: Path) -> sqlite3.Connection | None:
     return conn
 
 
-def count_open_readonly(db_path: Path) -> int | None:
+def count_open_readonly(db_path: Path, *, opener=open_readonly) -> int | None:
     """Blocking deploy ops in the database file, without creating or changing it.
 
     ``None`` when the file is missing or cannot be read as a database.
     """
     try:
-        conn = open_readonly(db_path)
+        conn = opener(db_path)
     except sqlite3.Error:
         return None
     if conn is None:
