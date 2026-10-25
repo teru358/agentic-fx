@@ -139,6 +139,39 @@ uv run afx init
 
    停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは詳細を読まず、稼働 daemon の状態が必要なら `afx ctl status` を使います。
 
+   `instance: free` のときの出力は次の行の並びで、各 `<...>` はそのときの観測値です。`instance: unknown` でも同じ形で、`state:` だけが `mode=unavailable kill_switch=unavailable` になります。`unavailable` の節が 1 つでもあれば rc 1、それ以外は rc 0 です。
+
+   ```
+   agentic-fx offline status
+   instance: free
+   setup: <ok|missing|corrupt>
+   settings: <ok|missing|invalid>
+   unit: afx.service=<installed|missing> active=<active|activating|deactivating|inactive|failed|unknown> linger=<enabled|disabled|unknown>
+   ops: bot=<stage|missing|invalid|unavailable> web=<...> notify=<...> marker=<none|feature|invalid>
+   state: mode=<learning|trading|unavailable> kill_switch=<clear|latched|unavailable>
+   database: <ok|missing|unavailable>
+   recent mission: <#id state at|none|unavailable>
+   pending approvals: <N|unavailable>
+   plugin deploy ops: <N|none|unavailable>
+   recent activity: <timestamp category event|none|unavailable>
+   pending steps: <N|unavailable>
+     - <未完了の手順の文 (N 行)>
+   note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
+   next: <afx init | afx check | systemctl --user start afx.service | afx ctl status のうち 1 つ>
+   ```
+
+   初期設定の記録が無い空の root では、`setup: missing`、`settings: missing`、`database: missing`、`recent mission: none`、`plugin deploy ops: none`、`recent activity: none` となり、`pending steps:` の下に `afx init` の再実行を促す 1 行が出て、`next: afx init` で終わります。
+
+   `instance: locked` のときは詳細を読まず、次の 5 行だけを出して rc 0 で終わります。
+
+   ```
+   agentic-fx offline status
+   instance: locked
+   locked-by: <setup|enroll:<feature>|enroll:<feature>+setup|enroll:unknown|unknown (daemon 稼働中とみられる)>
+   note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
+   next: <afx init の完了を待ってから afx status | afx ops <feature> status | afx ops の有効化の完了を待ってから afx status | afx ctl status | journalctl --user -u afx.service (operator の鍵が無いため afx ctl status は使えません)>
+   ```
+
    稼働 daemon に課題を足すには `afx ctl backlog add <idea>` を実行し、`backlog #<id> を追加しました: …` が出ることを確認します。方針の確認と回復は次のとおりです。
 
    ```

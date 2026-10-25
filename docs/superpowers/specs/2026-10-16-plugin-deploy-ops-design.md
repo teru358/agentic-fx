@@ -671,7 +671,9 @@ AC-23 の観測には §5.5 の `signal_max_id` も含める。submit 時点の�
 | T5 retire 統合 | symlink = disable_symlink への委譲、plain の `retire_plain` 状態機械、`_plugin_locks` 化、依存確認、`st_dev` 検査 | AC-17, 18 の正常系・拒否系 (退避先衝突 / EXDEV / symlink に変わった live)。crash 点は T4b の P 系を呼ぶだけ | M |
 | T4b crash matrix 全点統合 | §7.0 の N1〜N5、§7.1〜7.6 の D / R / P / S / G 全点を、T3 / T4a / T5 / T6 の実装の上で実 FS + 実 SQLite の fault injection (関数境界の例外 + `rename` / `unlink` / `symlink` の失敗注入) で網羅する | AC-3, 15, 16, 33 の収束側。変異: unlink を reconcile から外すと D3 が落ちる / `abandoned` に閉じる旧挙動に戻すと IV-15 が落ちる / 5(a) を `force` で免除すると AC-32 が落ちる / `syscall_failed` を blocking/open から外すと AC-33 が落ちる / `from_kind=symlink` + live 不在の行を `foreign` に落とすと R9 / R19 が落ちる / G6 snapshot または **G6a signal / 同時 stale** の consume 前検査を外すと対応 case が落ちる。規模が大きいので D / N / P と R / S / G の 2 束に分けて実行してよい | XL |
 | T7 CLI + versions | 5 コマンドの parser・確認 (TTY / `--yes` / `--force` / `--dry-run`)、rc と stderr の文言 pin、`versions`、仮列挙 → 再列挙のリトライ、`afx ctl status` / `afx ops status <feature>` への op 状態表示 (`open` と `attention`、読めないときは `unavailable`) | AC-24, 25, 30。CLI の rc / 文言を pin。rollback 完了表示 | M |
-| T8 文書 + 遮断 | 独立 spec の清書、既存 spec v1.10、運用文書 §7 置換 (§10 の 3b / 3c を含む)、遮断の完全集合 test (improve 13 本 / `_ALLOWED_REL` / API 29 endpoint / bot の 2 集合 / `BotClient` 直接定義 8 メソッド / `TABLE_NAMES` 32)、実隔離 worker integration (CI の `isolation` job が kernel の Landlock ABI を測り、ABI 8 以上なら skip があれば fail、ABI 8 未満なら「kernel 不足」を明示して neutral。release の受入は ABI 8 の実機で手順書どおり手で実行する。AC-27) | AC-26〜29, 36。spec と実装の番号 (IV / AC) の突き合わせ。integration は実 kernel を触る。Landlock ABI の skip 規約に従う | L |
+| T8 文書 + 遮断 | 独立 spec の清書、既存 spec v1.10、運用文書 §7 置換 (§10 の 3b / 3c を含む)、遮断の完全集合 test (improve 13 本 / `_ALLOWED_REL` / API 24 endpoint / bot の 2 集合 / `BotClient` 直接定義 8 メソッド / `TABLE_NAMES` 32)、実隔離 worker integration (CI の `isolation` job が kernel の Landlock ABI を測り、ABI 8 以上なら skip があれば fail、ABI 8 未満なら「kernel 不足」を明示して neutral。release の受入は ABI 8 の実機で手順書どおり手で実行する。AC-27) | AC-26〜29, 36。spec と実装の番号 (IV / AC) の突き合わせ。integration は実 kernel を触る。Landlock ABI の skip 規約に従う | L |
+
+追補 (2026-10-25): 上の T8 の API endpoint 数は当時の 24 本である。現行は 29 本で、完全集合 test もその数に従う。
 
 
 

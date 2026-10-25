@@ -150,7 +150,7 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |12|`reflect retry <order_id>`|`POST /v1/reflections/{order_id}/retry`|operate|`Idempotency-Key` 必須。body に client が行 12b で見た試行記録の識別子 (`expected_attempts`、`expected_last_attempt_at`、記録なしは `0` / null) を必須で送り、台帳の現在値と一致する場合だけ clear する。不一致は 409 `attempt_changed` で無変更。closed かつ reflection 未済の条件は従来どおり|
 |12b|—|`GET /v1/reflections/{order_id}`|status.read|order の status、reflection の有無、試行台帳 (`attempts`、`last_attempt_at`) の現在値。自由文の `last_reason` は返さない|
 |13|`improve`|`POST /v1/improve/runs` → job|operate|冪等 key、同時 1 本、停止時 join|
-|14|`backlog add <idea>`|`POST /v1/backlog`|operate|冪等 key、1〜2,000 文字|
+|14|`improve add <idea>`|`POST /v1/backlog`|operate|冪等 key、1〜2,000 文字|
 |15|`backlog reject <id>`|`POST /v1/backlog/{id}/reject`|operate|状態条件付き UPDATE|
 |16|`backlog reopen <id>`|`POST /v1/backlog/{id}/reopen`|operate|状態条件付き UPDATE、selected 不可|
 |17|`backlog note <id>`|`POST /v1/backlog/{id}/note`|operate|状態条件付き UPDATE|
@@ -166,6 +166,8 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |新|—|`GET /v1/jobs/{id}`|`jobs.own`|所有者の組が一致する job の状態と結果。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`POST /v1/jobs/{id}/cancel`|`jobs.own`|所有者の組が一致する queued だけ cancelled、running は 409。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`GET /v1/events?after=&limit=`|`events.read`|DB cursor 後の通知用投影。limit 1〜500、長い待受はしない|
+
+追補 (2026-10-25): 行 14 の現行名は `backlog add <idea>` である (`improve add` は旧名)。
 
 実装する endpoint は 29 本で、内訳は変更系 17 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy add / remove / reconcile、jobs cancel) と読取 12 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、reflection 試行記録、whoami、job get、events、backlog list、policy show) である。このうち冪等 key 必須は 7 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
 

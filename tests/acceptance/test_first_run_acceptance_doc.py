@@ -189,21 +189,42 @@ def test_canonical_cli_names_are_listed_in_their_one_home_group() -> None:
         "afx ctl policy reconcile": "問い合わせ・改善運用",
         "afx plugin list": "Plugin を採否・配備する",
     }
+    rows = [line for line in section.splitlines() if re.match(r"^\| [^|]+ \|", line)][1:]
+    assert len(rows) == 7, rows
     for command, group in homes.items():
-        row = re.search(rf"^\| {re.escape(group)} \|.*$", section, flags=re.MULTILINE)
-        assert row, group
-        assert command in row.group(0), command
+        holders = [row.split("|")[1].strip() for row in rows if command in row]
+        assert holders == [group], (command, holders)
+
+
+# 旧形式・旧名を説明する追補行。ここに無い行は旧コマンドを含んではならない。
+_LEGACY_NOTES: frozenset[tuple[str, str]] = frozenset({
+    ("docs/operations/ops-api-2026-10-09.md",
+     "旧形式 (`\"version\": 1`、operator と approver の 2 本だけ) はそのまま読める。読むだけでは書き換えず、"
+     "最初に成功した鍵変更 (enroll / rotate / revoke) で version 2 に書き換わる。手で書き換えない。"),
+    ("docs/operations/ops-api-2026-10-09.md",
+     "方針文は DB の managed 行と、`policy/directives.md` の marker 外にある unmanaged 行に分かれる。"
+     "旧形式のファイルは最初の投影照合で 1 回だけ移行され、DB に対応する行は ID marker 付き managed block へ再構成される。"
+     "手書き行と legacy 行は unmanaged のまま保持される。"),
+})
 
 
 def test_current_user_documents_do_not_present_deprecated_cli_names_as_commands() -> None:
-    paths = [README, *(REPOSITORY / "docs" / "operations").glob("*.md")]
-    text = "\n".join(
-        line for path in paths for line in path.read_text(encoding="utf-8").splitlines()
-        if "旧名" not in line and "旧形" not in line
-    )
-    assert "afx improve verify-backend" not in text
-    assert "afx ctl improve add" not in text
-    assert not re.search(r"afx ops (enable|disable|status) (bot|web|notify|<feature>)", text)
+    paths = [README, *sorted((REPOSITORY / "docs" / "operations").glob("*.md"))]
+    legacy_seen: list[tuple[str, str]] = []
+    offenders: list[tuple[str, str]] = []
+    for path in paths:
+        relative = path.relative_to(REPOSITORY).as_posix()
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if "旧名" in line or "旧形" in line:
+                legacy_seen.append((relative, line))
+            if (relative, line) in _LEGACY_NOTES:
+                continue
+            if ("afx improve verify-backend" in line or "afx ctl improve add" in line
+                    or re.search(r"afx ops (enable|disable|status) (bot|web|notify|<feature>)", line)):
+                offenders.append((relative, line))
+    assert not offenders, offenders
+    assert len(_LEGACY_NOTES) == 2
+    assert sorted(legacy_seen) == sorted(_LEGACY_NOTES), legacy_seen
 
 
 def test_cli_placement_principle_records_labels_for_both_lanes() -> None:
@@ -212,6 +233,21 @@ def test_cli_placement_principle_records_labels_for_both_lanes() -> None:
         assert label in section
     assert "`afx`（daemon 不要）" in section
     assert "`afx ctl`（稼働 daemon）" in section
+    rows = [line for line in section.splitlines() if re.match(r"^\| [^|]+ \|", line)][1:]
+    assert len(rows) == 7, rows
+    labelled = re.compile(r"^`\[(?:読取|変更|確認|approver)\](?: \[(?:読取|変更|確認|approver)\])*` `afx[ `]")
+    commands = 0
+    for row in rows:
+        cells = row.strip().strip("|").split("|")[1:]
+        assert len(cells) == 2, row
+        for cell in cells:
+            for segment in cell.strip().split(" / "):
+                if segment == "—":
+                    continue
+                assert labelled.match(segment), segment
+                assert segment.startswith(("`[読取]", "`[変更]")), segment
+                commands += segment.count("`afx")
+    assert commands >= 20, commands
 
 
 def test_new_ops_feature_then_verb_form_is_in_operator_guides() -> None:
