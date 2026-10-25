@@ -703,6 +703,7 @@ lock の保持者は daemon だけではない。初回設定、`afx keys`、`op
 | pending | setup record、optional settings、optional DB、`.env` の鍵名、plugin inventory | source ごとの collector から `PendingFacts` を合成し、`pending_steps(..., for_status=True)` へ渡す。外部接続を probe しない (`setup/pending_facts.py:32-65`) |
 | ops | `data/ops/<feature>.stage.json` と enroll marker | `read_stage(..., missing_ok=True)`、`read_marker()` (`ops_setup/stages.py:70-89,128-150`) |
 | units | user unit file、systemd、linger | unit の有無と `is-active`。systemd が無ければ `unknown` |
+| plugin inventory (pending 用) | `plugins/` directory と §6.4 の観測用 DB 接続 | daemon と同じ `plugin_loader.approved_plugins(conn, plugins_dir, settings=settings).inventory.metas`。`plugins/` 不在、settings か DB が無い / 読めないときは `()`。directory も DB も作らない |
 | recent mission | §6.4 の観測用 DB 接続で `missions.recent(conn, 1)` | DB が無ければ `none`、破損 / schema 不足は `unavailable` (`store/missions.py:258`) |
 | pending approvals | §6.4 の観測用 DB 接続で `approvals.pending(conn)` | 件数だけ出す (`store/approvals.py:263`) |
 | plugin deploy ops | `count_open_readonly(db_path, opener=<§6.4 の helper>)` | `none / N / unavailable` を区別する (`store/plugin_deploy_ops.py:272-300`) |
@@ -733,7 +734,7 @@ setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
 unit: afx.service=<installed|missing> active=<inactive|failed|unknown> linger=<enabled|disabled|unknown>
 ops: bot=<stage|missing|invalid|unavailable> web=<stage|missing|invalid|unavailable> notify=<stage|missing|invalid|unavailable> marker=<none|feature|invalid>
-state: mode=<learning|paper|live|unavailable> kill_switch=<clear|latched|unavailable>
+state: mode=<learning|trading|unavailable> kill_switch=<clear|latched|unavailable>
 database: <ok|missing|unavailable>
 recent mission: <#id state at|none|unavailable>
 pending approvals: <N|unavailable>
@@ -991,3 +992,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-25 | v0.5l | §5.3.4 の共有手順を API と同じ順 (先頭 reconcile → 本文検査 4000 字 → insert → reconcile → activity) に改め、activity 失敗は第 2 文にしない、insert_policy の commit 失敗は rollback、段 12 の重複判定に DB 完全一致を追加、DB を開けないときの固定文を新設 | B2c /code-review high 6 件 (#1 activity の誤診断、#2 DB 二重行、#3 connect 失敗で段が落ちる、#4 4000 字の未検査、#5 先頭 reconcile 不在、#6 commit 失敗の rollback 不在) | |
 | 2026-10-25 | v0.5m | §5.3.4: activity 失敗は ActivityLog の非送出契約に従い成功扱い (第 2 文にしない)、段 12 の重複判定での OSError / sqlite3.Error は第 1 文 | B2c 閉鎖確認 (terra) P1 2 件: ActivityLog.write は例外を出さないので「伝播」は成立しない / 重複判定の file 読取が先頭 reconcile より前で OSError が未捕捉 | |
 | 2026-10-25 | v0.5n | §6.3: `unavailable` の定義と rc の規則 (unavailable のみ rc 1、invalid / unknown / missing は rc 0)、ops の読取例外は `unavailable`、`pending steps: unavailable`、DB 3 行は別読取 | A2 受入 test (sonnet) が見つけた実装との食い違い 7 本の裁定 (4〜6 は spec の語を厳密化) | |
+| 2026-10-25 | v0.5o | §6.3 の `mode` の語を実 schema (`Mode` = learning / trading) に合わせ、§6.2 に pending 用の plugin inventory の取り方 (daemon と同じ `approved_plugins`、欠落時は `()`) を追加 | A2 codex r1 High 2 (state の mode 語が実 schema と不一致、plugin inventory 未収集) | |
