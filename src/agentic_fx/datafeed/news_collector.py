@@ -97,6 +97,7 @@ class NewsCollector:
             key = fetch_attempts.news_source_key(name)
             try:
                 health_read = news_health.read(self.conn, name)
+                health_read = news_health.cap_backoff_for_collector(self.conn, name, health_read, now)
                 current = health_read.record
                 overlay = self._health_overlay.get(name)
                 if overlay and overlay[1] == health_read.raw:
@@ -166,8 +167,8 @@ class NewsCollector:
         return total
 
     def _update_health(self, name, raw, current, outcome, now, *, count=None, reason=None) -> None:
+        record = news_health.next_record(current, outcome, now, count=count, reason=reason)
         try:
-            record = news_health.next_record(current, outcome, now, count=count, reason=reason)
             if not news_health.write_if_unchanged(self.conn, name, raw, record, now):
                 self._health_overlay.pop(name, None)
         except Exception as exc:  # noqa: BLE001

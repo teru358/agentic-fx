@@ -26,3 +26,11 @@ def test_refusal_preserves_failures_and_success_resets_both():
 def test_effective_wait_caps_future_components_at_one_day():
     h = Health(backoff_until=NOW + timedelta(days=10), backoff_cause="failures")
     assert effective_wait(h, None, NOW) == (NOW + timedelta(hours=24), "failures")
+
+
+def test_failure_resets_refusal_streak_and_preserves_exact_stage_time():
+    old = Health(consecutive_failures=2, retry_after_streak=8)
+    result = next_record(old, "failure", NOW, reason="HTTP 404")
+    assert result.consecutive_failures == 3
+    assert result.retry_after_streak == 0
+    assert result.backoff_until == NOW + timedelta(hours=1)

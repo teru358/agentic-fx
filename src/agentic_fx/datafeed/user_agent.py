@@ -9,11 +9,11 @@ def user_agent() -> str:
     except metadata.PackageNotFoundError:
         version = "unknown"
     try:
-        repository = metadata.metadata("agentic-fx").get("Project-URL", "")
-        # Metadata represents this as "Repository, URL".
-        label, _, value = repository.partition(",")
-        if label.strip().lower() == "repository" and value.strip():
-            return f"agentic-fx/{version} (+{value.strip()})"
+        project_urls = metadata.metadata("agentic-fx").get_all("Project-URL", [])
+        for project_url in project_urls:
+            label, _, value = project_url.partition(",")
+            if label.strip().lower() == "repository" and value.strip():
+                return f"agentic-fx/{version} (+{value.strip()})"
     except metadata.PackageNotFoundError:
         pass
     return f"agentic-fx/{version}"
