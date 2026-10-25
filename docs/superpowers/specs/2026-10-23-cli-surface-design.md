@@ -732,20 +732,20 @@ instance: free
 setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
 unit: afx.service=<installed|missing> active=<inactive|failed|unknown> linger=<enabled|disabled|unknown>
-ops: bot=<stage|missing|invalid> web=<stage|missing|invalid> notify=<stage|missing|invalid> marker=<none|feature|invalid>
+ops: bot=<stage|missing|invalid|unavailable> web=<stage|missing|invalid|unavailable> notify=<stage|missing|invalid|unavailable> marker=<none|feature|invalid>
 state: mode=<learning|paper|live|unavailable> kill_switch=<clear|latched|unavailable>
 database: <ok|missing|unavailable>
 recent mission: <#id state at|none|unavailable>
 pending approvals: <N|unavailable>
 plugin deploy ops: <N|none|unavailable>
 recent activity: <timestamp category event|none|unavailable>
-pending steps: <N>
+pending steps: <N|unavailable>
   - <既存 render_pending_step の文>
 note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
 next: afx init | afx check | systemctl --user start afx.service | afx ctl status
 ```
 
-`instance: unknown` の場合も同じ形を出すが、`state: mode=unavailable kill_switch=unavailable` として state reader 自体を呼ばない。`next` は観測結果から 1 つだけ選ぶ。setup missing / corrupt は `afx init`、settings missing / invalid は `afx check`、unit があり `instance: free` は `systemctl --user start afx.service`、それ以外は `afx ctl status` とする。鍵 file は locked / free / unknown の判定に使わず、鍵が一つも無くてもこの固定出力を出す。値が無いことと読めないことを混同しない。各 source の失敗で traceback を出さず、他の source の表示を続け、読めない節だけ `unavailable` にする。
+`instance: unknown` の場合も同じ形を出すが、`state: mode=unavailable kill_switch=unavailable` として state reader 自体を呼ばない。`next` は観測結果から 1 つだけ選ぶ。setup missing / corrupt は `afx init`、settings missing / invalid は `afx check`、unit があり `instance: free` は `systemctl --user start afx.service`、それ以外は `afx ctl status` とする。鍵 file は locked / free / unknown の判定に使わず、鍵が一つも無くてもこの固定出力を出す。値が無いことと読めないことを混同しない。各 source の失敗で traceback を出さず、他の source の表示を続け、読めない節だけ `unavailable` にする。`unavailable` は「読もうとして読めなかった」(例外、壊れた DB、table 欠落、lock の待ち切れ) にだけ使う。file の形が違う `invalid` / `corrupt`、systemd が無い `unknown`、file が無い `missing` / `none` は観測できた値であり `unavailable` ではない。終了コードは、どこかの節が `unavailable` なら 1、そうでなければ 0 とする (`invalid` / `unknown` / `missing` は rc を変えない)。ops の stage file は、形が違えば `invalid` (rc 0)、読取そのものが例外なら `unavailable` (rc 1)。DB の 3 行 (recent mission / pending approvals / plugin deploy ops) はそれぞれ別の読取であり、1 つの table が欠けても他の 2 行は出す。
 
 ### 6.4 観測用の読み取り専用 DB 接続
 
@@ -990,3 +990,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-25 | v0.5k | §5.3.4 に shell fallback の失敗文 2 種、段 12 / shell が共有する書込み手順 (insert → commit → reconcile → activity、`request_id` は uuid4) と段 12 の DB 接続を先頭で開くことを明記 | B2c 着手前の指揮者による補完 (shell fallback の失敗文が未定義) | |
 | 2026-10-25 | v0.5l | §5.3.4 の共有手順を API と同じ順 (先頭 reconcile → 本文検査 4000 字 → insert → reconcile → activity) に改め、activity 失敗は第 2 文にしない、insert_policy の commit 失敗は rollback、段 12 の重複判定に DB 完全一致を追加、DB を開けないときの固定文を新設 | B2c /code-review high 6 件 (#1 activity の誤診断、#2 DB 二重行、#3 connect 失敗で段が落ちる、#4 4000 字の未検査、#5 先頭 reconcile 不在、#6 commit 失敗の rollback 不在) | |
 | 2026-10-25 | v0.5m | §5.3.4: activity 失敗は ActivityLog の非送出契約に従い成功扱い (第 2 文にしない)、段 12 の重複判定での OSError / sqlite3.Error は第 1 文 | B2c 閉鎖確認 (terra) P1 2 件: ActivityLog.write は例外を出さないので「伝播」は成立しない / 重複判定の file 読取が先頭 reconcile より前で OSError が未捕捉 | |
+| 2026-10-25 | v0.5n | §6.3: `unavailable` の定義と rc の規則 (unavailable のみ rc 1、invalid / unknown / missing は rc 0)、ops の読取例外は `unavailable`、`pending steps: unavailable`、DB 3 行は別読取 | A2 受入 test (sonnet) が見つけた実装との食い違い 7 本の裁定 (4〜6 は spec の語を厳密化) | |
