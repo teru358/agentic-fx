@@ -136,7 +136,7 @@ class Rag:
             if not articles:
                 return 0
             now_utc = _require_utc(now, "add_news now")
-            ids = [a["url"] for a in articles]
+            ids = [a.get("rag_id", a["url"]) for a in articles]
             # 既存の added_at をまとめて 1 回で引く (N 件を N 回 get しない)
             existing = self._news.get(ids=ids, include=["metadatas"])
             existing_added_at = {i: m["added_at"] for i, m in

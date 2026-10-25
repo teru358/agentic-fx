@@ -29,6 +29,9 @@ dev = [
 [project.scripts]
 afx = "agentic_fx.entry:main"
 
+[project.urls]
+Repository = "https://github.com/teru358/agentic-fx"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from agentic_fx.setup.pending_text import PendingStep, render_pending_step
+from agentic_fx.setup.pending_text import PendingStep, render_pending_step, is_ident
 from agentic_fx.store.setup_record import SetupRecord
 from agentic_fx.core.improve_admission import MIN_LANDLOCK_ABI
 
@@ -34,6 +34,7 @@ class PendingFacts:
     service_active: bool | None = None
     data_state: str | None = None
     extra_steps: list[PendingStep] = field(default_factory=list)
+    failing_news_sources: tuple[str, ...] = ()
 
 
 def _get(value: object | None, *names: str, default=None):
@@ -165,6 +166,23 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
     for code in _TRAILING_PENDING_ORDER:
         steps.extend(deferred[code])
     steps.extend(facts.extra_steps)
+    # News is intentionally trailing: setup and safety actions keep priority.
+    eligible = sorted(name for name in facts.failing_news_sources if is_ident(name))
+    folded = len(facts.failing_news_sources) - len(eligible)
+    news: list[PendingStep] = [_step(facts, "news_source_failing", "warn", {"name": name}) for name in eligible[:5]]
+    folded += max(0, len(eligible) - 5)
+    if folded:
+        news.append(_step(facts, "news_source_failing_more", "warn", {"count": folded}))
+    available = MAX_PENDING_STEPS - len(steps)
+    if available > 0:
+        if len(news) <= available:
+            steps.extend(news)
+        else:
+            # Preserve one summary when the block cannot fit in full.
+            shown = max(0, available - 1)
+            steps.extend(news[:shown])
+            hidden = len(facts.failing_news_sources) - shown
+            steps.append(_step(facts, "news_source_failing_more", "warn", {"count": hidden}))
     if for_status:
         steps = [step for step in steps if step.visible_in_status]
     return steps[:MAX_PENDING_STEPS]

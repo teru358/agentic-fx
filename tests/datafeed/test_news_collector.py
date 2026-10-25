@@ -190,7 +190,7 @@ def test_unknown_fetcher_is_recorded_in_activity_with_source_name(tmp_path):
     log = (tmp_path / "a.log").read_text(encoding="utf-8")
     assert "news_source_failed" in log
     assert "weird" in log                  # ソース名が分からないと対処できない
-    assert "bogus" in log                  # 何が未知だったか
+    assert "未知の取得方式" in log           # 固定語で安全に分類する
     assert "NEWS" in log
 
 
@@ -211,7 +211,7 @@ def test_source_fetch_failure_is_recorded_in_activity(tmp_path):
     log = (tmp_path / "a.log").read_text(encoding="utf-8")
     assert "news_source_failed" in log
     assert "bad" in log
-    assert "OSError" in log                       # 型名は診断に要る
+    assert "取得できません" in log                 # activity は固定語だけ
     assert "SECRET_KEY_123" not in log            # 秘密抑止を通す
     assert "bad.example" not in log               # URL も出さない
 

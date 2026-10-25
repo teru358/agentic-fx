@@ -20,6 +20,8 @@ STEP_PARAMS: Mapping[str, Mapping[str, tuple[str, object]]] = {
     "ops_not_ready": {"feature": ("ident", "feature")},
     "isolation_not_admitted": {"reason_code": ("ident", "unknown")},
     "improve_isolation_unavailable": {},
+    "news_source_failing": {"name": ("ident", "unknown")},
+    "news_source_failing_more": {"count": ("int", 0)},
 }
 
 
@@ -124,4 +126,8 @@ def render_pending_step(step: PendingStep) -> str:
         return "操作 API が無効です。settings.yaml の api.enabled を true にして再起動してください"
     if step.code == "api_start_failed":
         return f"操作 API の起動確認に失敗しました ({ident(p.get('reason_code'), 'unknown')})"
+    if step.code == "news_source_failing":
+        return f"源 {ident(p.get('name'), 'unknown')} が連続で失敗しています。`afx news list` で確認し、不要なら `afx news disable {ident(p.get('name'), 'unknown')}` で止めてください"
+    if step.code == "news_source_failing_more":
+        return f"ほか {number(p.get('count'))} 件の源も連続で失敗しています。`afx news list` で確認してください"
     return messages.get(step.code, f"未知の手順 (code={step.code})。afx を更新してください")

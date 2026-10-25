@@ -216,19 +216,20 @@ def test_fetch_web_extracts_body():
     assert arts[0].source_name == "example"
     assert arts[0].published is None
     get.assert_called_once_with("https://ex.com/page", timeout=10,
-                                follow_redirects=True)
+                                follow_redirects=True,
+                                headers={"User-Agent": "agentic-fx/0.2.0"})
     # コメント欄が本文に混入しないこと (ブリーフの逐語コードからの意図的変更)
     assert ext.call_args.kwargs.get("include_comments") is False
 
 
-def test_fetch_web_title_falls_back_to_url_when_no_metadata():
+def test_fetch_web_title_falls_back_to_source_name_when_no_metadata():
     resp = MagicMock(text="<html>...</html>")
     resp.raise_for_status = MagicMock()
     with patch("httpx.get", return_value=resp), \
          patch("trafilatura.extract", return_value="本文テキスト"), \
          patch("trafilatura.extract_metadata", return_value=None):
         arts = fetch_web("https://ex.com/page", "example", timeout_sec=10)
-    assert arts[0].title == "https://ex.com/page"
+    assert arts[0].title == "example"
 
 
 def test_fetch_web_extract_failure_returns_empty():

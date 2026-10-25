@@ -11,6 +11,7 @@ from agentic_fx.setup.checks import present_env_keys
 from agentic_fx.setup.pending_steps import MAX_PENDING_STEPS, PendingFacts
 from agentic_fx.store import plugin_switch_journal
 from agentic_fx.store.setup_record import read_setup_record
+from agentic_fx.store import news_health, news_sources
 
 _log = logging.getLogger(__name__)
 _COMPUTE = object()
@@ -56,6 +57,14 @@ def collect_pending_facts(root, settings: Settings | None, conn: sqlite3.Connect
     if len(found_ids) > MAX_PENDING_STEPS:
         _log.info("stalled approvals exceed %d; showing the newest", MAX_PENDING_STEPS)
     approval_ids = tuple(found_ids[:MAX_PENDING_STEPS])
+    failing_news: tuple[str, ...] = ()
+    if conn is not None:
+        try:
+            failing_news = tuple(row["name"] for row in news_sources.list_enabled(conn)
+                                 if (h := news_health.read(conn, row["name"]).record) is not None
+                                 and (h.consecutive_failures >= 3 or h.retry_after_streak >= 3))
+        except (sqlite3.Error, ValueError):
+            failing_news = ()
     return PendingFacts(
         record_state=setup_read.state, record=setup_read.record, settings=settings,
         deployed_plugins=deployed, history_counts=history_counts,
@@ -65,5 +74,5 @@ def collect_pending_facts(root, settings: Settings | None, conn: sqlite3.Connect
         landlock_abi=(_landlock_abi_now() if landlock_abi is _COMPUTE else int(landlock_abi)),
         data_state=(data_state if data_state is not None
                     else (outage.state if outage is not None else None)),
-        service_active=service_active, now=clock.now(),
+        service_active=service_active, now=clock.now(), failing_news_sources=failing_news,
     )

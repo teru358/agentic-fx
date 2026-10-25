@@ -18,6 +18,12 @@ from datetime import datetime, timezone
 import feedparser
 import httpx
 import trafilatura
+from urllib.parse import urlsplit, urlunsplit
+from agentic_fx.datafeed.user_agent import user_agent
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("trafilatura").setLevel(logging.WARNING)
 
 # feedparser が「解釈できる」タイムゾーン略号の一覧。**自前の略号表は持たず**、
 # feedparser 内部の実データ (private だが実ソース) をそのまま参照する。
@@ -77,10 +83,10 @@ class Article:
     body: str
     published: datetime | None
     source_name: str
+    rag_id: str | None = None
 
 
-def _feed_published(entry: object, source_name: str,
-                    feed_url: str) -> datetime | None:
+def _feed_published(entry: object, source_name: str) -> datetime | None:
     """entry の日付を tz-aware UTC datetime にする (naive は作らない)。
 
     feedparser は RFC822/W3CDTF 等あらゆる日付形式を解釈し、**GMT に
@@ -119,10 +125,10 @@ def _feed_published(entry: object, source_name: str,
     abbrev = _unrecognized_tz_abbrev(raw)
     if abbrev is not None:
         _log.warning(
-            "feed %s (%s): date %r has unrecognized timezone abbreviation "
+            "feed %s: date %r has unrecognized timezone abbreviation "
             "%r; feedparser silently treats it as +0000 (UTC), which may "
             "be wrong — article is kept but its published time may be off",
-            source_name, feed_url, raw, abbrev)
+            source_name, raw, abbrev)
     return datetime(*parsed[:6], tzinfo=timezone.utc)
 
 
@@ -168,7 +174,8 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
     - bozo が立っていない (健全なフィードがたまたま 0 件) は従来どおり
       無警告で空リストを返す — これはエラーではない。
     """
-    response = httpx.get(url, timeout=timeout_sec, follow_redirects=True)
+    response = httpx.get(url, timeout=timeout_sec, follow_redirects=True,
+                         headers={"User-Agent": user_agent()})
     response.raise_for_status()
     parsed = feedparser.parse(response.content, response_headers=dict(response.headers))
     if getattr(parsed, "bozo", False):
@@ -191,10 +198,14 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
             title = e.title
         except AttributeError:
             title = ""
+        parsed_link = urlsplit(link)
+        if parsed_link.scheme not in {"http", "https"}:
+            _log.warning("feed %s: non-http article link skipped", source_name)
+            continue
         out.append(Article(
             url=link, title=title,
             body=getattr(e, "summary", "") or "",
-            published=_feed_published(e, source_name, url),
+            published=_feed_published(e, source_name),
             source_name=source_name))
     return out
 
@@ -211,12 +222,15 @@ def fetch_web(url: str, source_name: str, *, timeout_sec: float) -> list[Article
     trafilatura.extract の既定は True で、そのままだとコメント欄の文章が
     本文に混入し、LLM の取引判断材料として記事本文と同格に扱われてしまう。
     """
-    r = httpx.get(url, timeout=timeout_sec, follow_redirects=True)
+    r = httpx.get(url, timeout=timeout_sec, follow_redirects=True,
+                  headers={"User-Agent": user_agent()})
     r.raise_for_status()
     body = trafilatura.extract(r.text, include_comments=False)
     if not body:
         return []
     meta = trafilatura.extract_metadata(r.text)
-    title = meta.title if meta and meta.title else url
-    return [Article(url=url, title=title, body=body, published=None,
-                    source_name=source_name)]
+    title = meta.title if meta and meta.title else source_name
+    parts = urlsplit(url)
+    display_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    return [Article(url=display_url, title=title, body=body, published=None,
+                    source_name=source_name, rag_id=f"web:{source_name}")]
