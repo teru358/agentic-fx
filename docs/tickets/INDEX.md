@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 133 件。完了分は closed/。
+未完了: 132 件。完了分は closed/。
 
 ## 実装待ち (11)
 
@@ -30,7 +30,7 @@
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
-## 設計待ち (116)
+## 設計待ち (115)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -66,7 +66,6 @@
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 中 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
-| [afx-on-path-and-root-resolution](open/afx-on-path-and-root-resolution.md) | 中 | 2026-10-25 | afx を PATH に置き、root 解決と bash 補完を足す |
 | [e2e-phase1-reflection-not-generated](open/e2e-phase1-reflection-not-generated.md) | 中 | 2026-10-25 | test_e2e_phase1 の tick 4 で reflection が 0 件 (main で恒常的に赤) |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
