@@ -196,5 +196,6 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
     if for_status:
         steps = [step for step in steps if step.visible_in_status]
     steps = steps[:MAX_PENDING_STEPS]
-    steps.extend(_news_steps(facts, MAX_PENDING_STEPS - len(steps)))
+    if facts.record_state != "corrupt":
+        steps.extend(_news_steps(facts, MAX_PENDING_STEPS - len(steps)))
     return steps[:MAX_PENDING_STEPS]

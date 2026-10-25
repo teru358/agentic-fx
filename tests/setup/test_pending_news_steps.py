@@ -109,6 +109,13 @@ def test_missing_setup_record_shows_no_news_row():
     assert [s.code for s in steps] == ["setup_record_missing"]
 
 
+def test_corrupt_setup_record_shows_no_news_row():
+    steps = pending_steps(PendingFacts(record_state="corrupt", failing_news_sources=_names("a")))
+    assert steps[0].code == "setup_record_missing"
+    assert steps[0].params == {"state": "corrupt"}
+    assert _news(steps) == []
+
+
 # ---- wording ---------------------------------------------------------------
 
 def test_wording_is_fixed_and_sanitized():
