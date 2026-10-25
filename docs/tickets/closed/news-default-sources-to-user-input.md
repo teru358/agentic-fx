@@ -1,15 +1,15 @@
 ---
 id: news-default-sources-to-user-input
 title: 同梱の既定ニュース源を廃止し afx init の入力式にする
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-25
-closed: null
+closed: 2026-10-25
 related: [news-source-cli-and-429-backoff]
 ---
 # [news-default-sources-to-user-input] 同梱の既定ニュース源を廃止し afx init の入力式にする
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -21,7 +21,10 @@ src/agentic_fx/datafeed/default_sources.py の DEFAULT_SOURCES 3 本 (yahoo-fina
 
 ## 修正内容
 
+- 2026-10-25: default_sources / seed_default_sources / 起動時 seed を削除、afx init 段 3 の副段で入力式に、README と受入手順書に候補例と注意。main 81461a61。本機受入: 既存 DB の源は不変、新規は afx news add で登録できることを確認
+
 ## 経緯
 
 - 2026-10-25: 起票。
 - 2026-10-25: 状態: 実装中 — 2026-10-25: T1 / T2a / T2b を main に merge (81461a61)。残り AC-1 の本機確認 (daemon 再起動後に yahoo を disable、次の収集周期で backoff と status を観測)
+- 2026-10-25: 是正内容 — default_sources / seed_default_sources / 起動時 seed を削除、afx init 段 3 の副段で入力式に、README と受入手順書に候補例と注意。main 81461a61。本機受入: 既存 DB の源は不変、新規は afx news add で登録できることを確認

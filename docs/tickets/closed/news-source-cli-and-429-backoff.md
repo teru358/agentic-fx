@@ -1,15 +1,15 @@
 ---
 id: news-source-cli-and-429-backoff
 title: afx news (list/add/enable/disable/test) と 429 連続時のバックオフ
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-15
-closed: null
+closed: 2026-10-25
 related: [news-source-route-omitted]
 ---
 # [news-source-cli-and-429-backoff] afx news (list/add/enable/disable/test) と 429 連続時のバックオフ
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -21,8 +21,11 @@ related: [news-source-route-omitted]
 
 ## 修正内容
 
+- 2026-10-25: afx news (list/add/enable/disable/test、独自の入口と例外境界)、収集器のバックオフ (連続失敗・拒否連続の段階待機、24h 上限、enable で解除)、UA、status の未完手順。main 81461a61 (spec v0.9)。本機受入 2026-10-25 20:04: yahoo を disable、源 10 件を add で登録、10:50 UTC の収集で 10 源すべて成功 (380 記事)、news_source_failed 0、status にニュースの未完手順なし
+
 ## 経緯
 
 - 2026-10-15: 起票。
 - 2026-10-16: 優先: 中 — 吸収: news-fetch-no-user-agent-yahoo-429 の「ニュース取得が User-Agent を付けない (python-httpx 既定)」も直す。収集器の取得に固定の UA (製品名/版 + repo URL) を付ける。yahoo は 2026-10-15 の実測で UA 付きでも 404 (源が止まった) なので UA だけでは直らない
 - 2026-10-25: 状態: 実装中 — 2026-10-25: T1 / T2a / T2b を main に merge (81461a61)。残り AC-1 の本機確認 (daemon 再起動後に yahoo を disable、次の収集周期で backoff と status を観測)
+- 2026-10-25: 是正内容 — afx news (list/add/enable/disable/test、独自の入口と例外境界)、収集器のバックオフ (連続失敗・拒否連続の段階待機、24h 上限、enable で解除)、UA、status の未完手順。main 81461a61 (spec v0.9)。本機受入 2026-10-25 20:04: yahoo を disable、源 10 件を add で登録、10:50 UTC の収集で 10 源すべて成功 (380 記事)、news_source_failed 0、status にニュースの未完手順なし

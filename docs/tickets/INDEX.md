@@ -1,17 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 142 件。完了分は closed/。
+未完了: 140 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (1)
 
-### 機能 (3)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
-| [news-default-sources-to-user-input](open/news-default-sources-to-user-input.md) | 中 | 2026-10-25 | 同梱の既定ニュース源を廃止し afx init の入力式にする |
 
 ## 実装待ち (11)
 
