@@ -1,8 +1,10 @@
 # afx news (ニュース源の操作) と取得の連続失敗バックオフ設計書
 
-**版:** v0.2 (裁定 6 点を反映。2026-10-25 ユーザー裁定「すべて推奨で」)
+**版:** v0.3 (v0.2 の裁定 6 点に、既定源の同梱廃止と `afx init` の入力式を追加。2026-10-25 ユーザー裁定)
 
 **対象:** `news-source-cli-and-429-backoff` (2026-10-15 のユーザー承認骨子、2026-10-16 に User-Agent の件を吸収)
+
+**関連チケット:** `news-default-sources-to-user-input` (本書の T2 に統合)
 
 **前提:** コマンド面の 7 群 × 2 レーン (`2026-10-23-cli-surface-design.md`)、ニュース源の追加は人間の運用操作 (2026-09-07 裁定、チケット `news-source-route-omitted`)。
 
@@ -12,6 +14,7 @@
 
 - `afx news` は最上位コマンドで、daemon を必要としない。停止中でも動く。DB と activity log を直接書く点は `afx plugin` と同じ流儀である。
 - 操作は人間だけが行う。改善ループ、bot、web、`afx ctl` (操作 API) からはニュース源を追加も変更もできない。経路を作らない。
+- 既定のニュース源の同梱は廃止する (裁定 2026-10-25)。`datafeed/default_sources.py` と `seed_default_sources` を削除し、起動時も `afx init` も源を自動登録しない。`afx init` に名前と URL の入力式の段を足す (§2.7)。源は利用者が自分で選ぶ (§8)。
 - 非目標: 代替源の選定 (候補の実測表は別に出す。どの源を足すかは利用者の運用判断)。経済指標カレンダーの取得 (別の取得経路。本書の User-Agent とバックオフは news 取得だけに入れる)。源ごとの取得間隔の設定。源の削除 (無効化だけ。履歴と重複判定を残すため)。
 
 ## 1. 用語
@@ -29,7 +32,7 @@
 - どの副コマンドも daemon 不要。root の解決は他の最上位コマンドと同じ。
 - 変更系 (`add` / `enable` / `disable`) は最後に固定文を 1 行出す: `反映は次の収集周期 (最長 30 分) です。`
 - rc: 0 = 成功 (冪等な再実行を含む)。1 = 実行時の失敗 (源が無い、重複、取得失敗、DB が使えない、確認に答えなかった・拒否した)。2 = 使い方の誤り (引数の文法、名前・URL の文法違反)。2 は DB にも先方にも触れる前に返す。
-- 名前の文法: `[a-z0-9][a-z0-9-]{0,39}`。status の未完手順に名前をそのまま出すので、既存の `ident` (`[a-z0-9_.-]{1,64}`) に収まる範囲に絞る。同梱の 3 源 (`yahoo-finance-topstories` / `nhk-keizai` / `fxstreet-news`) は通る。
+- 名前の文法: `[a-z0-9][a-z0-9-]{0,39}`。status の未完手順に名前をそのまま出すので、既存の `ident` (`[a-z0-9_.-]{1,64}`) に収まる範囲に絞る。既存 DB に登録済みの 3 源 (`yahoo-finance-topstories` / `nhk-keizai` / `fxstreet-news`) の名前は通る。
 - URL の検査: scheme は `http` / `https` のみ、host あり、userinfo (`user:pw@`) 無し、2048 文字以内。URL の内容の可否 (私設 LAN など) は検査しない。本機の利用者自身の操作で、制限しても守る対象が無い。
 - 重複: 名前または URL が既存 (有効・無効を問わず) なら、どちらが重複かを書いて rc=1。判定は完全一致で、DB の UNIQUE 制約を最終の判定とする (同時に 2 本走っても片方が確実に失敗する)。
 - activity log には URL を書かない (query に鍵が入る URL がありうる)。名前と取得方式だけを書く。
@@ -87,6 +90,17 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 - daemon が動いていても、`afx news` は instance lock を取らない。lock の役割は daemon の単一起動と、資金・状態ファイルの所有である。`afx news` が触るのは `news_sources` の 1 行 (と `enable` が消す 1 つの健康記録) だけで、短い自動コミットの 1 文で終わる。`afx plugin` が daemon と同じ DB に書くのと同じ前提である。取っても守るものが無く、lock を取ると daemon の稼働中は何も操作できなくなる。
 - DB は WAL で、書き込み待ちは 5 秒 (`busy_timeout`)。競合で待ちが切れたら `DB が使用中です。もう一度実行してください。` で rc=1 (部分的な変更は残らない)。
 - 収集器は周期ごとに有効な源を読み直す (キャッシュしない)。`disable` した時点で走っている周期があれば、その周期が最悪 1 回その源を取る。それ以降は取らない。
+
+### 2.7 `afx init` のニュース源の入力 (既定源の同梱廃止)
+
+段 3 (価格源) の末尾の副段として足す。新しい番号の段は足さない。価格源と同じ「市場入力の取得元を決める」段で、取得元の入力がここに集まるため (初回ウィザード設計 `2026-10-12-first-run-wizard-design.md` §3 の段 3 を改訂する)。
+
+- 問い: `ニュース源 (名前 URL、空 Enter で飛ばす):`。空行になるまで繰り返す。
+- 1 件ごとに `afx news add` と同じ文法 (§2.1 の名前・URL の検査と重複判定。違反はその場で理由を出して同じ問いに戻る) で検査し、1 回取得する。結果は `取得: <n> 件 (うち本文・要約あり <m> 件)`。取得に失敗した件は登録せず理由を出して問いに戻る。0 件のときは §2.3 と同じ確認 (`0 件でした。それでも追加しますか? [y/N]`) を出す。取得方式は `feed`。
+- 空 Enter で終えたら `後から `afx news add` で足せます。候補例は README を参照。` を出す。1 件も入力しなかった場合も同じ。
+- 登録は段 10 の確定 1 の DB transaction の中で、入力された件だけを行う (取得は確定の前に済ませ、確定の transaction は INSERT のみ)。入力が無ければ `news_sources` は 0 行のまま。
+- 既存の DB (再実行を含む) の登録済みの源には触らない。起動時の自動登録はなくなる。
+- `--non-interactive` は源を登録しない (入力式の段が無い)。
 
 ## 3. 収集器のバックオフ
 
@@ -163,7 +177,8 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 | AC-12 | status: 連続失敗 N 以上の有効な源ごとに `afx status` と `afx ctl status` の未完手順に `news_source_failing` が 1 行出る。N-1、無効な源、成功後は出ない。DB が読めないときは step を出さず他の節は表示する | 両経路の stdout、pending steps 件数上限の境界 |
 | AC-13 | 同時実行: 収集器が書いている DB に `add` / `enable` が成功する。2 本の同名 `add` は片方だけ成功。`busy_timeout` 超過は rc=1 で変更が残らない。instance lock を取らない (daemon が lock 保持中でも動く) | 2 process の test、flock 記録 |
 | AC-14 | `news` は implemented / exposed、5 本の葉 record が [読取] / [変更] の分類と accessor 由来の help を持つ。planned の例外 pin は消える。`afx --help` と `afx news --help` が実出力の golden と byte 一致する。ops-api の原則表と cli-surface 設計に news が出る。doc test (c) の 9 名は不変 | golden、一致 test、文書 grep pin |
-| AC-15 | 経路の遮断: `ENDPOINTS` に news 系の code が無い。`afx ctl news …` は parse できない。改善 agent の tool registry と bot / web の module が `news_sources` の変更関数 (`add` / `set_enabled`) を import していない。seed (`seed_default_sources`) は無効化した源を再有効化も再追加もしない | AST / grep pin、parse test、seed の再実行 test |
+| AC-15 | 経路の遮断: `ENDPOINTS` に news 系の code が無い。`afx ctl news …` は parse できない。改善 agent の tool registry と bot / web の module が `news_sources` の変更関数 (`add` / `set_enabled`) を import していない。`seed_default_sources` は存在しない (AC-16)。無効化した源は、起動でも `afx init` の再実行でも再有効化・再追加されない | AST / grep pin、parse test、起動と `afx init` の再実行 test |
+| AC-16 | 既定源の廃止。(a) 空の root で、ニュース源を 1 件も入力せずに `afx init` を通すと `news_sources` は 0 行で、その後の起動も `news_source_*` の activity を 1 行も書かない。(b) `seed_default_sources` と `DEFAULT_SOURCES` と `datafeed/default_sources.py` が存在しない (`hasattr` と `src/` の grep で pin)。(c) ウィザードの入力で打った源がちょうどその件数だけ登録される (文法違反・取得失敗・重複は登録されない、0 件は確認、空 Enter で終了)。(d) 既存 DB の登録済み 3 源は起動後も変わらない。(e) ウィザードの say 行の変更に合わせ、受入手順書の引用 pin (`tests/acceptance/test_first_run_acceptance_doc.py`、`test_first_run_scripts_replay.py`) と台本を更新する | 空 root の init test、起動 test、hasattr / grep pin、ウィザードの台本 test、受入手順書の pin |
 
 ## 6. 変更一覧と task 分割
 
@@ -178,11 +193,19 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 | 新規 | `news_cli.py` (仮) | list / add / enable / disable / test |
 | 変更 | `backtest/cli.py` (parser と dispatch) `cli_surface.py` | 親と葉 5 本、planned 解除 |
 | 変更 | cli-surface 設計 §2.1 / §3.2 / §3.4 / §9 AC-27 / 履歴、ops-api 原則表 | 文書 |
+| 削除 | `datafeed/default_sources.py` | `DEFAULT_SOURCES` の 3 源。`news_collector.py` の import と `__all__` から外す |
+| 変更 | `datafeed/news_collector.py` | `seed_default_sources` を削除 |
+| 変更 | `service.py` (2 箇所の起動時 seed と `基本ニュースソースを N 件登録しました` の出力)、`setup/wizard.py` (段 10 の `seed_default_sources` 呼び出しを、入力された源の INSERT に置換。段 3 の副段を追加)、初回ウィザード設計の段 3 / 段 10 / 範囲外の記述 | 起動時の自動登録の除去とウィザードの入力式 |
+| 変更 | README、`docs/operations/first-run-acceptance.md` | 「ニュース源の候補例」(§8) と注意 |
 | 変更 | `config/settings.yaml.example` | 変更なし (設定キーを足さない) |
 | 変更 | チケット | 起票時の骨子を状態に反映 |
 
 - **T1 収集器 (UA + 健康記録 + バックオフ + status の step)**: 純 Python。コード約 250 行、test 約 350 行。codex (terra) 向き。AC-2〜6、12 (status 側)。
-- **T2 CLI + コマンド面 + 文書**: 純 Python と文書。README と `docs/operations/first-run-acceptance.md` に §9 の注意を各 1 段落足す。コード約 300 行、test 約 400 行、golden の再生成は指揮者が実出力で確認。T1 の健康記録の読み書き (`list` の「直近」、`enable` の消去) に依存するので T1 の後。AC-1 は両方が main に入った後の本機確認で、指揮者が行う。
+- **T2 CLI + コマンド面 + 文書**: 純 Python と文書。README と `docs/operations/first-run-acceptance.md` に §8 の注意の段落と「ニュース源の候補例」の表を足す。既定源の廃止 (`default_sources.py` と `seed_default_sources` の削除、起動時 seed の除去)、`afx init` の入力式の副段 (§2.7)、受入手順書の引用 pin と台本の更新を含む。AC-16 を所有する。コード約 300 行、test 約 400 行、golden の再生成は指揮者が実出力で確認。T1 の健康記録の読み書き (`list` の「直近」、`enable` の消去) に依存するので T1 の後。AC-1 は両方が main に入った後の本機確認で、指揮者が行う。
+- **既定源を pin している既存 test (T2 で更新または削除)**:
+  - 削除: `tests/datafeed/test_news_collector.py` の seed 系 (`seed_default_sources` の冪等・DEFAULT_SOURCES の各フィールド・名前 / url 重複・1 件登録済みの 5 本前後)、`tests/store/test_news_sources.py::test_seed_default_sources_commit_flag_defaults_to_committing`、`tests/setup/test_wizard_commit.py` の `seed_default_sources` を monkeypatch する失敗注入 (入力された源の INSERT 失敗に置換)。
+  - 更新: `tests/test_init_and_guard.py` (行 12 の import、350・355・416 付近の「基本ニュースソースを N 件登録しました」と件数の pin。0 行の pin に反転)、`tests/test_service_app.py` (行 21・362〜374 の `default sources` の activity 行と件数の pin。起動が seed しない pin に反転)、`tests/core/test_app_conn_signal.py` (行 270 の `agentic_fx.service.seed_default_sources` の monkeypatch を除去)。
+  - 追加: AC-16 の各 test、ウィザードの副段の台本 test。
 - 周回: 境界コードではない (資金・隔離・鍵・削除に触れない) が、DB 書込と外向き要求を含む。codex 1 周目 → 閉鎖確認。変異スイープは段階計算の境界とカウント規則を対象にする。
 
 ## 7. 裁定 (2026-10-25、ユーザー: 「すべて推奨で」)
@@ -195,11 +218,19 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 4. **閾値 N**: 3。一時障害を「連続」と数えて止めない一方、1.5 時間で間引きが始まる。裁定 (2026-10-25、ユーザー): 推奨どおり。
 5. **最初の待機**: 1 時間 (§3.2)。骨子の 30 分は周期が 30 分なので何も間引かない。骨子の文面とは異なることを承知のうえの裁定。裁定 (2026-10-25、ユーザー): 推奨どおり。
 6. **`test` を待機中の源に対して許す**: 許す (利用者の明示した 1 回で、書き込みも無い。禁止すると原因調査ができない)。裁定 (2026-10-25、ユーザー): 推奨どおり。
+7. **既定源の同梱廃止と `afx init` の入力式**: 同梱をやめ、`afx init` で名前と URL を入力式にする (空 Enter で飛ばす、後から `afx news add`)。候補例は README と受入手順書に注記つきで載せる (yahoo は除く)。既存 DB の登録済みの源は消さない。裁定 (2026-10-25、ユーザー)。
 
 ## 8. 利用者の責任と文書
 
 - ニュース源を足すかどうかは運用者 (利用者) の判断である。各源の利用規約・robots の確認は運用者の責任で、製品は代わって確認も保証もしない。
-- 現状の事実: 製品は既定のニュース源を同梱している。`datafeed/default_sources.py` の 3 源 (`yahoo-finance-topstories` / `nhk-keizai` / `fxstreet-news`、いずれも feed) で、`afx init` と起動時の `seed_default_sources` が登録する。公式 RSS だけではなく商用サイトの feed を含む。この同梱の扱い (残す / 利用者が選ぶ形にする) は本書では変えない。必要なら別チケット候補とする。`config/settings.yaml.example` の `news:` は `cleanup_hours` のみで、源は持たない。
+- 既定源の同梱は廃止する (裁定 2026-10-25、チケット `news-default-sources-to-user-input`)。従来の 3 源 (`yahoo-finance-topstories` / `nhk-keizai` / `fxstreet-news`) のうち 2 本は商用サイトの feed で、源は利用者の判断、規約の確認は利用者という原則と合わなかった。yahoo-finance-topstories は 2026-09-02 から停止している。`default_sources.py` と `seed_default_sources` を削除し、`afx init` は名前と URL の入力式にする (§2.7)。`config/settings.yaml.example` の `news:` は `cleanup_hours` のみで、源は持たない。
+- 既存の DB に登録済みの 3 源は消さない。利用者が `afx news disable` で止める (削除は将来の `remove`)。
+- README と受入手順書に「ニュース源の候補例」の表を載せる。取得方式はどちらも `feed`。載せるのは例であって推奨でも保証でもなく、各源の利用規約の確認は運用者の責任である旨を表の直下に書く。yahoo-finance-topstories は源が 2026-09-02 から停止しているので載せない。
+
+  | 名前 | URL | 取得方式 |
+  |---|---|---|
+  | `nhk-keizai` | `https://www3.nhk.or.jp/rss/news/cat5.xml` | `feed` |
+  | `fxstreet-news` | `https://www.fxstreet.com/rss/news` | `feed` |
 - UA の URL は先方が連絡できる窓口で、責任の引き受けを意味しない。
 - T2 で README と `docs/operations/first-run-acceptance.md` に各 1 段落を足す: ニュース源は運用者の判断で追加すること、各源の利用規約の確認は運用者の責任であること、UA の URL は連絡先であること。
 - 免責の法的根拠は LICENSE (MIT) の無保証条項。リポジトリ直下に `LICENSE` が在り、`pyproject.toml` も `license = "MIT"` / `license-files = ["LICENSE"]` で参照している。新規作成は不要。
@@ -210,3 +241,4 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 |---|---|---|---|---|
 | 2026-10-25 | v0.1 C0 | 初版 (指揮者承認前の清書) | チケット `news-source-cli-and-429-backoff` の骨子の設計化 | |
 | 2026-10-25 | v0.2 | 裁定 6 点の反映と利用者責任の節 | ユーザー裁定「すべて推奨で」 | |
+| 2026-10-25 | v0.3 | 既定源の同梱廃止と `afx init` の入力式 (§0、§2.7、§5 AC-15・AC-16、§6、§7 裁定 7、§8)、README の候補例 | ユーザー裁定 2026-10-25、チケット `news-default-sources-to-user-input` | |
