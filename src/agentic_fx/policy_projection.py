@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+POLICY_TEXT_LIMIT = 4000
 _MIGRATION = "policy_directives_managed_v1"
 _START = re.compile(br"^<!-- afx:managed-policy id=([1-9][0-9]*) -->$")
 _END = re.compile(br"^<!-- /afx:managed-policy id=([1-9][0-9]*) -->$")

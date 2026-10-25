@@ -206,7 +206,7 @@ def test_example_shortcut_uses_answers_and_does_not_add_duplicates(tmp_path):
 def test_example_write_failure_stops_the_policy_prompt(tmp_path, monkeypatch):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(["e", "should-not-be-asked"])
+    io = ScriptedWizardIO(["e", ""])
     answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
 
     def fail(conn, policy_path, activity, text, now):
@@ -215,7 +215,7 @@ def test_example_write_failure_stops_the_policy_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(wizard, "add_policy_directive", fail)
     wizard._stage12(wizard._Session(root, io, deps), answers)
     assert "書けませんでした" in io.text
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
 
 
 def test_stage12_examples_create_removable_managed_policies(tmp_path):
@@ -244,7 +244,7 @@ def test_stage12_insert_failure_keeps_no_policy_or_activity(tmp_path, monkeypatc
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
     _stage12_database(root).close()
-    io = ScriptedWizardIO(["失敗する方針", "should-not-be-asked"])
+    io = ScriptedWizardIO(["失敗する方針", ""])
     answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
 
     def fail_insert(conn, text, *, request_id, now):
@@ -257,7 +257,7 @@ def test_stage12_insert_failure_keeps_no_policy_or_activity(tmp_path, monkeypatc
     assert "警告: 方針文を書けませんでした (OperationalError: database is locked)。" in io.text
     assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
     assert not (root / "logs" / "activity.log").exists()
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
     conn.close()
 
 
@@ -265,7 +265,7 @@ def test_stage12_projection_failure_keeps_record_without_activity(tmp_path, monk
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
     _stage12_database(root).close()
-    io = ScriptedWizardIO(["記録済み方針", "should-not-be-asked"])
+    io = ScriptedWizardIO(["記録済み方針", ""])
     answers = wizard.Answers("Asia/Tokyo", "JPY", ["EURUSD"], 1_000_000, timeframe="30m")
 
     real_reconcile = commands_module.reconcile_policy_file
@@ -285,7 +285,7 @@ def test_stage12_projection_failure_keeps_record_without_activity(tmp_path, monk
             "(OSError: read-only)。afx の次回起動時に反映されます。") in io.text
     assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 1
     assert not (root / "logs" / "activity.log").exists()
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
     conn.close()
 
 
@@ -492,12 +492,12 @@ def _malform(root):
 
 
 def test_stage12_malformed_projection_stops_before_insert(tmp_path):
-    root, io = _stage12_run(tmp_path, ["新しい方針", "should-not-be-asked"], prepare=_malform)
+    root, io = _stage12_run(tmp_path, ["新しい方針", ""], prepare=_malform)
 
     assert "警告: 方針文を書けませんでした (" in io.text
     assert "記録しましたが" not in io.text
     assert _policy_rows(root) == 0
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
 
 
 @pytest.mark.parametrize("text", ["x" * 4001, "   \t "])
@@ -516,11 +516,11 @@ def test_stage12_rejects_oversized_or_blank_body_before_insert(tmp_path, text):
 
 
 def test_stage12_oversized_body_reports_first_sentence_and_adds_no_row(tmp_path):
-    root, io = _stage12_run(tmp_path, ["x" * 4001, "should-not-be-asked"])
+    root, io = _stage12_run(tmp_path, ["x" * 4001, ""])
 
     assert "警告: 方針文を書けませんでした (" in io.text
     assert _policy_rows(root) == 0
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
 
 
 def test_stage12_activity_failure_keeps_row_and_reflected_file(tmp_path, monkeypatch):
@@ -530,7 +530,7 @@ def test_stage12_activity_failure_keeps_row_and_reflected_file(tmp_path, monkeyp
         raise OSError("log full")
 
     monkeypatch.setattr(ActivityLog, "write", fail_write)
-    root, io = _stage12_run(tmp_path, ["活動ログが落ちる方針", "should-not-be-asked"])
+    root, io = _stage12_run(tmp_path, ["活動ログが落ちる方針", ""])
 
     assert "警告: 方針文を書けませんでした (OSError: log full)。" in io.text
     assert "記録しましたが" not in io.text
@@ -594,7 +594,7 @@ def test_stage12_pre_insert_error_types_map_to_first_sentence(tmp_path, monkeypa
         raise error
 
     monkeypatch.setattr(wizard, "add_policy_directive", fail)
-    _root, io = _stage12_run(tmp_path, ["方針", "should-not-be-asked"])
+    _root, io = _stage12_run(tmp_path, ["方針", ""])
 
     assert f"警告: 方針文を書けませんでした ({type(error).__name__}: {error})。" in io.text
 
@@ -605,8 +605,67 @@ def test_stage12_unreadable_directives_during_duplicate_check_reports_first_sent
         path.parent.mkdir(parents=True, exist_ok=True)
         path.mkdir()
 
-    root, io = _stage12_run(tmp_path, ["新規方針", "should-not-be-asked"], prepare=make_directory)
+    root, io = _stage12_run(tmp_path, ["新規方針", ""], prepare=make_directory)
 
     assert "警告: 方針文を書けませんでした (IsADirectoryError" in io.text
-    assert io.asked == ["方針文: "]
+    assert io.asked == ["方針文: ", "最初の課題: "]
     assert _policy_rows(root) == 0
+
+
+def test_stage12_policy_failure_continues_to_the_first_task_prompt(tmp_path, monkeypatch):
+    def fail(conn, policy_path, activity, text, now):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(wizard, "add_policy_directive", fail)
+    root, io = _stage12_run(tmp_path, ["方針", "最初の課題として十分に長い文章を書く", ""])
+
+    assert "警告: 方針文を書けませんでした (OSError: read-only)。" in io.text
+    assert io.asked == ["方針文: ", "最初の課題: ", "最初の課題: "]
+    assert "方針文を 0 行書きました。" in io.text
+    conn = connect(root / "data" / "agentic.db")
+    assert conn.execute("SELECT COUNT(*) FROM improvement_backlog").fetchone()[0] == 1
+    conn.close()
+
+
+def test_stage12_guidance_names_backlog_add_not_improve_add(tmp_path):
+    _root, io = _stage12_run(tmp_path, ["", ""])
+
+    assert "afx ctl backlog add" in io.text
+    assert "afx ctl improve add" not in io.text
+
+
+def test_stage12_short_new_policy_is_added_when_a_longer_line_contains_it(tmp_path):
+    def seed_file(root):
+        path = wizard.directives_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("- RSI が 70 超の押し目は買わない\n", encoding="utf-8")
+
+    root, io = _stage12_run(tmp_path, ["RSI", "", ""], prepare=seed_file)
+
+    assert "方針文は追加済みです。" not in io.text
+    assert _policy_rows(root) == 1
+
+
+def test_stage12_identical_file_line_is_a_duplicate(tmp_path):
+    def seed_file(root):
+        path = wizard.directives_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes("- RSI が 70 超の押し目は買わない\r\n".encode("utf-8"))
+
+    root, io = _stage12_run(tmp_path, ["RSI  が 70 超の押し目は買わない", "", ""], prepare=seed_file)
+
+    assert "方針文は追加済みです。" in io.text
+    assert _policy_rows(root) == 0
+
+
+def test_one_line_error_uses_the_cause_when_the_message_is_empty():
+    from agentic_fx.policy_projection import MigrationRecordUnknown
+
+    try:
+        try:
+            raise OSError("disk full")
+        except OSError as cause:
+            raise MigrationRecordUnknown() from cause
+    except MigrationRecordUnknown as error:
+        assert wizard._one_line(error) == "OSError: disk full"
+        assert commands_module.one_line_error(error) == "OSError: disk full"

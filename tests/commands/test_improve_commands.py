@@ -461,3 +461,23 @@ def test_policy_add_fallback_reason_is_one_line_and_at_most_120_chars(commands, 
     reason = out[len("policy を書けませんでした ("):-1]
     assert "\n" not in out and len(reason) == 120
     assert reason.startswith("OperationalError: line one line two ")
+
+
+@pytest.mark.parametrize("text", ["x" * 4001, "   "])
+def test_add_policy_directive_checks_the_body_before_any_reconcile(tmp_path, monkeypatch, text):
+    calls = []
+    monkeypatch.setattr(commands_module, "reconcile_policy_file", lambda *a, **k: calls.append(a))
+
+    with pytest.raises(ValueError):
+        commands_module.add_policy_directive(None, tmp_path / "policy" / "directives.md", None, text, None)
+
+    assert calls == []
+    assert not (tmp_path / "policy").exists()
+
+
+def test_policy_text_limit_is_one_constant_shared_by_shell_and_api():
+    from agentic_fx import policy_projection
+    from agentic_fx.ops import service as ops_service_module
+
+    assert commands_module.POLICY_TEXT_LIMIT is policy_projection.POLICY_TEXT_LIMIT
+    assert ops_service_module.POLICY_TEXT_LIMIT is policy_projection.POLICY_TEXT_LIMIT

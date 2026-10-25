@@ -79,5 +79,8 @@ def safe_error_text(e: BaseException) -> str:
 
 def one_line_error(value: object, limit: int = 120) -> str:
     """例外 (または文字列) を空白正規化した 1 行にして limit 字へ切る。"""
+    if isinstance(value, BaseException):
+        while not str(value).strip() and value.__cause__ is not None:
+            value = value.__cause__
     text = value if isinstance(value, str) else safe_error_text(value)
     return " ".join(text.split())[:limit]

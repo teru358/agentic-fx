@@ -25,9 +25,9 @@ from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
-    MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy, reconcile_policy_file)
+    POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
+    reconcile_policy_file)
 
-POLICY_TEXT_LIMIT = 4000
 POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
                        MigrationRecordUnknown)
 
@@ -63,12 +63,12 @@ def add_policy_directive(conn, policy_path: Path, activity: ActivityLog, text: s
     body); a failure to reflect the committed row raises PolicyFileNotReflected;
     an activity failure propagates as it is because the file is already reflected.
     """
-    policy_path.parent.mkdir(parents=True, exist_ok=True)
-    reconcile_policy_file(conn, policy_path)
     if not text.strip():
         raise ValueError("方針文が空です")
     if len(text) > POLICY_TEXT_LIMIT:
         raise ValueError(f"方針文は {POLICY_TEXT_LIMIT} 字以下にしてください")
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    reconcile_policy_file(conn, policy_path)
     identifier = insert_policy(conn, text, request_id=uuid.uuid4().hex, now=now)
     try:
         reconcile_policy_file(conn, policy_path)
