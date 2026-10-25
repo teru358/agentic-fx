@@ -29,19 +29,19 @@ def test_probe_instance_lock_reports_a_lock_held_by_another_fd(tmp_path):
 def test_read_state_without_lock_file_does_not_create_one(tmp_path):
     state_path = tmp_path / "data" / "state" / "app_state.json"
     state_path.parent.mkdir(parents=True)
-    state_path.write_text('{"initialized":true,"mode":"paper","autopilot":false,"kill_switch_latched":false}', encoding="utf-8")
+    state_path.write_text('{"initialized":true,"mode":"learning","autopilot":false,"kill_switch_latched":false}', encoding="utf-8")
 
-    assert status.read_state(tmp_path) == ("paper", "clear")
+    assert status.read_state(tmp_path) == ("learning", "clear")
     assert not state_path.with_name("app_state.json.lock").exists()
 
 
 def test_read_state_marker_latches_the_kill_switch(tmp_path):
     state_path = tmp_path / "data" / "state" / "app_state.json"
     state_path.parent.mkdir(parents=True)
-    state_path.write_text('{"initialized":true,"mode":"live","autopilot":false,"kill_switch_latched":false}', encoding="utf-8")
+    state_path.write_text('{"initialized":true,"mode":"trading","autopilot":false,"kill_switch_latched":false}', encoding="utf-8")
     state_path.with_name("app_state.json.reset-in-progress").write_text("{}", encoding="utf-8")
 
-    assert status.read_state(tmp_path) == ("live", "latched")
+    assert status.read_state(tmp_path) == ("trading", "latched")
 
 
 def test_render_locked_status_is_exact_five_lines():

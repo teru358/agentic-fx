@@ -66,7 +66,7 @@ def test_setup_and_settings_vocabulary_do_not_disturb_other_sources(tmp_path, ca
     assert values["setup"] == setup
     assert values["settings"] == settings
     assert values["instance"] == "free"
-    assert values["state"] == "mode=paper kill_switch=clear"
+    assert values["state"] == "mode=learning kill_switch=clear"
     assert values["database"] == "ok"
     assert values["recent mission"].startswith("#1 ")
     assert values["pending approvals"] == "2"
@@ -172,7 +172,7 @@ def test_corrupt_database_is_unavailable_and_the_other_sections_survive(tmp_path
     assert values["plugin deploy ops"] == "unavailable"
     assert values["setup"] == "ok" and values["settings"] == "ok"
     assert values["recent activity"] == "2026-10-25T00:00:00Z mission started"
-    assert values["state"] == "mode=paper kill_switch=clear"
+    assert values["state"] == "mode=learning kill_switch=clear"
     assert values["unit"].startswith("afx.service=")
     assert manifest(root) == before
 
@@ -246,7 +246,7 @@ def test_unit_line_follows_unit_file_and_is_active(tmp_path, capsys, unit_dir, i
     linger = "unknown" if case == "no systemctl" else "enabled"
     assert values["unit"] == f"afx.service={word} active={active} linger={linger}"
     assert values["setup"] == "ok" and values["database"] == "ok"
-    assert values["state"] == "mode=paper kill_switch=clear"
+    assert values["state"] == "mode=learning kill_switch=clear"
 
 
 @pytest.mark.parametrize("linger,word", [("Linger=yes\n", "enabled"), ("Linger=no\n", "disabled"),
@@ -516,8 +516,8 @@ def test_an_unreadable_settings_file_degrades_only_the_settings_line(tmp_path, c
     rc, out = run_status(root, capsys)
     values = fields(out)
 
-    assert rc == 1
-    assert values["settings"] in {"invalid", "unavailable"}
+    assert rc == 0
+    assert values["settings"] == "invalid"
     for other in ("setup", "unit", "ops", "state", "database", "recent mission", "pending approvals",
                   "plugin deploy ops", "recent activity"):
         assert values[other] == healthy[other]
@@ -566,6 +566,13 @@ def _shape_db_sidecar(root):
     add_sidecars(make_db(root, approval=2))
 
 
+def _shape_plugins_dir(root):
+    _shape_no_db(root)
+    make_db(root, approval=2)
+    (root / "plugins" / "stray").mkdir(parents=True)
+    (root / "plugins" / "stray" / "note.txt").write_text("not a plugin", encoding="utf-8")
+
+
 def _shape_state_lock(root):
     _shape_no_db(root)
     write_state(root, state_json(), lock=True, reset_marker=True)
@@ -575,7 +582,7 @@ def _shape_state_lock(root):
 SHAPES = {
     "empty": _shape_empty, "partial": _shape_partial, "corrupt": _shape_corrupt_settings,
     "no-db": _shape_no_db, "db": _shape_no_keys_db_no_sidecar, "sidecar": _shape_db_sidecar,
-    "state-lock": _shape_state_lock,
+    "state-lock": _shape_state_lock, "plugins": _shape_plugins_dir,
 }
 
 
@@ -642,3 +649,213 @@ def test_home_key_directory_is_not_created_or_touched_when_no_key_exists(tmp_pat
     status.main(root, run=make_run())
     capsys.readouterr()
     assert not key_dir(root).exists()
+
+
+# state schema ---------------------------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    '{"initialized":true,"mode":"paper","autopilot":false,"kill_switch_latched":false}',
+    '{"initialized":true,"mode":"live","autopilot":false,"kill_switch_latched":false}',
+    '{"mode":"learning","kill_switch_latched":false}',
+    '{"initialized":true,"mode":"learning","autopilot":false}',
+    '{"initialized":1,"mode":"learning","autopilot":false,"kill_switch_latched":false}',
+    '{"initialized":true,"mode":"learning","autopilot":false,"kill_switch_latched":false,'
+    '"kill_switch_generation":"1"}',
+    '{"initialized":true,"mode":"learning","autopilot":false,"kill_switch_latched":false,'
+    '"kill_switch_latched_at":5}',
+])
+def test_state_outside_the_state_store_schema_is_unavailable(tmp_path, text):
+    root = tmp_path / "root"
+    write_state(root, text)
+    assert status.read_state(root) == ("unavailable", "unavailable")
+
+
+def test_state_with_the_optional_keys_is_read_like_the_state_store(tmp_path):
+    root = tmp_path / "root"
+    write_state(root, '{"initialized":true,"mode":"trading","autopilot":true,"kill_switch_latched":false,'
+                      '"kill_switch_generation":3,"kill_switch_latched_at":"2026-10-25T00:00:00+00:00"}')
+    assert status.read_state(root) == ("trading", "clear")
+
+
+def test_reset_marker_without_a_state_file_is_latched(tmp_path):
+    root = tmp_path / "root"
+    state_dir = root / "data" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "app_state.json.reset-in-progress").write_text("{}", encoding="utf-8")
+    assert status.read_state(root) == ("learning", "latched")
+
+
+# plugin inventory -------------------------------------------------------------
+
+def _spy_pending(monkeypatch):
+    seen = {}
+    real = status.collect_pending_facts
+
+    def spy(*args, **kwargs):
+        seen["deployed"] = kwargs.get("deployed_plugins")
+        seen["args"] = args
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(status, "collect_pending_facts", spy)
+    return seen
+
+
+class _Inventory:
+    def __init__(self, metas):
+        self.inventory = type("Inv", (), {"metas": metas})()
+
+
+def test_the_approved_inventory_is_passed_when_settings_database_and_plugins_exist(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    (root / "plugins").mkdir()
+    seen = _spy_pending(monkeypatch)
+    calls = []
+
+    def fake_approved(conn, plugins_dir, *, settings):
+        calls.append((conn, plugins_dir, settings))
+        return _Inventory(("meta-a", "meta-b"))
+
+    monkeypatch.setattr(status.plugin_loader, "approved_plugins", fake_approved)
+    run_status(root, capsys)
+
+    assert seen["deployed"] == ("meta-a", "meta-b")
+    assert len(calls) == 1 and calls[0][1] == root / "plugins" and calls[0][2] is not None
+
+
+@pytest.mark.parametrize("missing", ["plugins", "settings", "database"])
+def test_the_inventory_is_empty_when_a_source_is_missing(tmp_path, monkeypatch, capsys, missing):
+    root = full_root(tmp_path, settings="missing" if missing == "settings" else "ok",
+                     db=missing != "database")
+    if missing != "plugins":
+        (root / "plugins").mkdir()
+    seen = _spy_pending(monkeypatch)
+    calls = []
+    monkeypatch.setattr(status.plugin_loader, "approved_plugins",
+                        lambda *a, **k: calls.append(1) or _Inventory(("x",)))
+    run_status(root, capsys)
+
+    assert seen["deployed"] == ()
+    assert calls == []
+
+
+def test_a_plugins_file_instead_of_a_directory_is_not_inventoried(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    (root / "plugins").write_text("file", encoding="utf-8")
+    seen = _spy_pending(monkeypatch)
+    run_status(root, capsys)
+    assert seen["deployed"] == ()
+
+
+def test_a_failing_inventory_degrades_to_an_empty_one(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    (root / "plugins").mkdir()
+    seen = _spy_pending(monkeypatch)
+    monkeypatch.setattr(status.plugin_loader, "approved_plugins", _boom)
+    rc, out = run_status(root, capsys)
+    assert seen["deployed"] == ()
+    assert rc == 0 and fields(out)["pending steps"] != "unavailable"
+
+
+# database robustness ----------------------------------------------------------
+
+def test_the_observer_connections_are_always_closed(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    opened = []
+    real = status.connect_observer_readonly
+
+    class Tracked:
+        def __init__(self, conn):
+            self.conn = conn
+            self.closed = False
+            opened.append(self)
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def close(self):
+            self.closed = True
+            self.conn.close()
+
+    monkeypatch.setattr(status, "connect_observer_readonly", lambda path: Tracked(real(path)))
+    monkeypatch.setattr(status.missions, "recent", _boom)
+    run_status(root, capsys)
+
+    assert opened and all(item.closed for item in opened)
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo"])
+def test_a_database_path_that_is_not_a_regular_file_is_unavailable(tmp_path, capsys, kind):
+    root = full_root(tmp_path, db=False)
+    target = root / "data" / "agentic.db"
+    if kind == "directory":
+        target.mkdir()
+    else:
+        os.mkfifo(target)
+
+    rc, out = run_status(root, capsys)
+    values = fields(out)
+
+    assert rc == 1
+    assert values["database"] == "unavailable"
+    assert (values["recent mission"], values["pending approvals"], values["plugin deploy ops"]) == (
+        "unavailable",) * 3
+    assert values["setup"] == "ok"
+
+
+def test_a_database_symlink_to_nowhere_is_unavailable(tmp_path, capsys):
+    root = full_root(tmp_path, db=False)
+    (root / "data" / "agentic.db").symlink_to(tmp_path / "nowhere.db")
+    rc, out = run_status(root, capsys)
+    assert rc == 1 and fields(out)["database"] == "unavailable"
+
+
+# ops reader exceptions and rc rules ----------------------------------------------
+
+def test_an_unreadable_stage_file_is_unavailable_and_exits_one(tmp_path, capsys):
+    root = full_root(tmp_path)
+    (root / "data" / "ops").mkdir(parents=True, exist_ok=True)
+    (root / "data" / "ops" / "bot.stage.json").mkdir()
+    rc, out = run_status(root, capsys)
+    assert rc == 1
+    assert fields(out)["ops"] == "bot=unavailable web=missing notify=missing marker=none"
+
+
+def test_a_malformed_stage_file_is_invalid_and_exits_zero(tmp_path, capsys):
+    root = full_root(tmp_path)
+    write_stage(root, "web", "{not json")
+    rc, out = run_status(root, capsys)
+    assert rc == 0
+    assert fields(out)["ops"] == "bot=missing web=invalid notify=missing marker=none"
+
+
+def test_a_failing_pending_collector_says_unavailable_without_step_lines(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    monkeypatch.setattr(status, "collect_pending_facts", _boom)
+    rc, out = run_status(root, capsys)
+    assert rc == 1
+    assert fields(out)["pending steps"] == "unavailable"
+    assert not [line for line in out.splitlines() if line.startswith("  - ")]
+
+
+def test_a_failing_step_builder_says_unavailable(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    monkeypatch.setattr(status, "pending_steps", _boom)
+    rc, out = run_status(root, capsys)
+    assert rc == 1
+    assert fields(out)["pending steps"] == "unavailable"
+
+
+def test_a_missing_systemd_is_unknown_and_exits_zero(tmp_path, capsys):
+    root = full_root(tmp_path)
+    rc, out = run_status(root, capsys, run=make_run(fail=FileNotFoundError("systemctl")))
+    assert rc == 0
+    assert fields(out)["unit"] == "afx.service=missing active=unknown linger=unknown"
+
+
+def test_invalid_and_missing_values_alone_never_exit_one(tmp_path, capsys):
+    root = full_root(tmp_path, setup="corrupt", settings="invalid")
+    write_enroll_marker(root, "not json")
+    rc, out = run_status(root, capsys)
+    values = fields(out)
+    assert (values["setup"], values["settings"]) == ("corrupt", "invalid")
+    assert rc == 0

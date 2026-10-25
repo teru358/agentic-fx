@@ -154,9 +154,9 @@ def _state_root(tmp_path, text, **kwargs):
 
 @pytest.mark.parametrize("lock", [False, True])
 @pytest.mark.parametrize("case,text,marker,expected", [
-    ("clear", state_json("paper"), False, ("paper", "clear")),
-    ("latched", state_json("live", latched=True), False, ("live", "latched")),
-    ("reset marker", state_json("paper"), True, ("paper", "latched")),
+    ("clear", state_json("learning"), False, ("learning", "clear")),
+    ("latched", state_json("trading", latched=True), False, ("trading", "latched")),
+    ("reset marker", state_json("learning"), True, ("learning", "latched")),
     ("corrupt", "{broken", False, ("unavailable", "unavailable")),
 ])
 def test_state_reader_values(tmp_path, lock, case, text, marker, expected):
@@ -176,7 +176,7 @@ def test_state_reader_missing_state_reports_defaults_without_a_lock_file(tmp_pat
 
 def test_state_reader_corrupt_values_never_pass_through(tmp_path):
     for number, text in enumerate(('{"mode":"weird","kill_switch_latched":false}',
-                                   '{"mode":"paper","kill_switch_latched":"no"}', "[]", "")):
+                                   '{"mode":"learning","kill_switch_latched":"no"}', "[]", "")):
         root = tmp_path / f"r{number}"
         write_state(root, text)
         assert status.read_state(root) == ("unavailable", "unavailable")
@@ -186,7 +186,7 @@ def test_state_reader_does_not_create_the_lock_file_and_leaves_the_tree_alone(tm
     root = _state_root(tmp_path, state_json())
     before = manifest(root)
 
-    assert status.read_state(root) == ("paper", "clear")
+    assert status.read_state(root) == ("learning", "clear")
 
     assert manifest(root) == before
     assert not (root / "data" / "state" / "app_state.json.lock").exists()
@@ -220,7 +220,7 @@ def test_state_reader_waits_fifty_milliseconds_per_try_for_one_second_in_total(t
 
 
 def test_state_reader_gets_the_value_when_the_writer_releases_inside_the_window(tmp_path):
-    root = _state_root(tmp_path, state_json("live"), lock=True)
+    root = _state_root(tmp_path, state_json("trading"), lock=True)
     lock = root / "data" / "state" / "app_state.json.lock"
     clock = _Clock()
     holder = held_by_other_process(lock, fcntl.LOCK_EX)
@@ -234,7 +234,7 @@ def test_state_reader_gets_the_value_when_the_writer_releases_inside_the_window(
             holder.__exit__(None, None, None)
 
     try:
-        assert status.read_state(root, sleep=sleep, monotonic=clock.monotonic) == ("live", "clear")
+        assert status.read_state(root, sleep=sleep, monotonic=clock.monotonic) == ("trading", "clear")
     finally:
         if not released:
             holder.__exit__(None, None, None)
@@ -273,7 +273,7 @@ def test_state_store_load_and_shared_are_never_called(tmp_path, monkeypatch, cap
 
     assert status.main(root, run=make_run()) == 0
     assert calls == []
-    assert "state: mode=paper kill_switch=clear" in capsys.readouterr().out
+    assert "state: mode=learning kill_switch=clear" in capsys.readouterr().out
 
 
 def _recording_open(monkeypatch_ctx):
@@ -358,7 +358,7 @@ def test_a_second_process_can_take_the_exclusive_instance_lock_while_state_is_re
 
 def _spy_state(monkeypatch):
     calls = []
-    monkeypatch.setattr(status, "read_state", lambda *a, **k: calls.append(1) or ("paper", "clear"))
+    monkeypatch.setattr(status, "read_state", lambda *a, **k: calls.append(1) or ("learning", "clear"))
     return calls
 
 

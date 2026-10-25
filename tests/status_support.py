@@ -168,7 +168,7 @@ def write_state(root: Path, text: str, *, lock: bool = False, reset_marker: bool
     return path
 
 
-def state_json(mode="paper", latched=False) -> str:
+def state_json(mode="learning", latched=False) -> str:
     flag = "true" if latched else "false"
     return '{"initialized":true,"mode":"%s","autopilot":false,"kill_switch_latched":%s}' % (mode, flag)
 

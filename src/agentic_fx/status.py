@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -13,12 +14,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agentic_fx.config import load_settings_text
-from agentic_fx.core.contracts import SystemClock
+from agentic_fx.core.contracts import Mode, SystemClock
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.ops.keys import key_dir, key_file_name
 from agentic_fx.ops.redactor import redact
 from agentic_fx.ops.tail import tail_lines
-from agentic_fx.ops_setup.stages import read_marker, read_stage
+from agentic_fx.ops_setup.stages import InvalidState, read_marker, read_stage
 from agentic_fx.setup.pending_facts import collect_pending_facts
 from agentic_fx.setup.pending_steps import pending_steps
 from agentic_fx.setup.pending_text import render_pending_step
@@ -28,6 +29,7 @@ from agentic_fx.store.db import connect_observer_readonly
 from agentic_fx.store.plugin_deploy_ops import count_open_readonly
 from agentic_fx.store.setup_marker import setup_marker_present
 from agentic_fx.store.setup_record import read_setup_record
+from agentic_fx.tools import plugin_loader
 
 _NOTE = "note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。"
 
@@ -51,6 +53,10 @@ def probe_instance_lock(root: Path) -> str:
         return "free"
     finally:
         os.close(fd)
+
+
+_STATE_BOOL_FIELDS = ("initialized", "autopilot", "kill_switch_latched")
+_STATE_REQUIRED_KEYS = ("initialized", "mode", "autopilot", "kill_switch_latched")
 
 
 def _state_path(root: Path) -> Path:
@@ -83,19 +89,6 @@ def read_state(root: Path, *, sleep: Callable[[float], None] = time.sleep,
                     sleep(0.05)
                 except OSError:
                     return "unavailable", "unavailable"
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return "learning", "clear"
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("state is not an object")
-        mode = data.get("mode")
-        if mode not in {"learning", "paper", "live"}:
-            raise ValueError("invalid mode")
-        latched = data.get("kill_switch_latched")
-        if type(latched) is not bool:
-            raise ValueError("invalid kill switch")
         marker = Path(str(path) + ".reset-in-progress")
         try:
             os.lstat(marker)
@@ -105,8 +98,27 @@ def read_state(root: Path, *, sleep: Callable[[float], None] = time.sleep,
             marker_present = True
         else:
             marker_present = True
-        return mode, "latched" if latched or marker_present else "clear"
-    except (OSError, ValueError, json.JSONDecodeError):
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "learning", "latched" if marker_present else "clear"
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("state is not an object")
+        missing = [key for key in _STATE_REQUIRED_KEYS if key not in data]
+        if missing:
+            raise ValueError("state file is missing required keys")
+        for key in _STATE_BOOL_FIELDS:
+            if type(data[key]) is not bool:
+                raise ValueError(f"state field {key} is not a boolean")
+        mode = Mode(data["mode"]).value
+        if type(data.get("kill_switch_generation", 0)) is not int:
+            raise ValueError("invalid kill switch generation")
+        latched_at = data.get("kill_switch_latched_at")
+        if latched_at is not None and type(latched_at) is not str:
+            raise ValueError("invalid kill switch timestamp")
+        return mode, "latched" if data["kill_switch_latched"] or marker_present else "clear"
+    except Exception:  # noqa: BLE001 - any unreadable state is one unavailable observation
         return "unavailable", "unavailable"
     finally:
         if fd is not None:
@@ -174,25 +186,28 @@ class StatusData:
     approvals: str
     deploy_ops: str
     activity: str
-    steps: tuple[str, ...]
+    steps: tuple[str, ...] | None
     unavailable: bool
 
 
-def _settings(root: Path) -> tuple[str, Any | None, bool]:
+def _settings(root: Path) -> tuple[str, Any | None]:
     try:
         raw = (Path(root) / "config" / "settings.yaml").read_text(encoding="utf-8")
     except FileNotFoundError:
-        return "missing", None, False
-    except OSError:
-        return "invalid", None, True
+        return "missing", None
+    except (OSError, UnicodeDecodeError):
+        return "invalid", None
     try:
-        return "ok", load_settings_text(raw), False
+        return "ok", load_settings_text(raw)
     except Exception:  # noqa: BLE001 - validation is display-only
-        return "invalid", None, False
+        return "invalid", None
 
 
 def _unit(run: Callable[..., Any], unit_path: Path) -> tuple[tuple[str, str, str], bool]:
-    installed = "installed" if unit_path.is_file() else "missing"
+    try:
+        installed = "installed" if unit_path.is_file() else "missing"
+    except OSError:
+        installed = "missing"
     unavailable = False
     try:
         active_result = run(["systemctl", "--user", "is-active", UNIT_NAME], capture_output=True,
@@ -200,7 +215,9 @@ def _unit(run: Callable[..., Any], unit_path: Path) -> tuple[tuple[str, str, str
         state = str(getattr(active_result, "stdout", "")).strip()
         active = "active" if state == "active" and getattr(active_result, "returncode", 1) == 0 else (
             "failed" if state == "failed" else "inactive")
-    except (OSError, subprocess.SubprocessError):
+    except FileNotFoundError:
+        active = "unknown"
+    except Exception:  # noqa: BLE001 - the injected runner is an observation source
         active, unavailable = "unknown", True
     try:
         linger = {"yes": "enabled", "no": "disabled"}.get(linger_state(run), "unknown")
@@ -216,33 +233,65 @@ def _ops(root: Path) -> tuple[tuple[str, str, str, str], bool]:
         try:
             stage = read_stage(root, feature, missing_ok=True)
             values.append("missing" if stage is None else str(stage.get("stage", "invalid")))
-        except Exception:  # noqa: BLE001 - each stage is fail-soft
+        except InvalidState:
             values.append("invalid")
+        except Exception:  # noqa: BLE001 - each stage is fail-soft
+            values.append("unavailable")
+            bad = True
     try:
         marker = read_marker(root)
         marker_value = "none" if marker is None else (str(marker.get("feature")) if marker else "invalid")
     except Exception:  # noqa: BLE001
-        marker_value, bad = "invalid", True
+        marker_value, bad = "unavailable", True
     return (values[0], values[1], values[2], marker_value), bad
 
 
-def _database(root: Path) -> tuple[tuple[str, str, str, str], sqlite3.Connection | None, bool]:
+def _observer_db_path(root: Path) -> tuple[Path, str]:
+    """Return the database path and `missing`, `file` or `other` without following a failure."""
     db_path = Path(root) / "data" / "agentic.db"
-    if not db_path.is_file():
-        return ("missing", "none", "0", "none"), None, False
+    try:
+        mode = os.lstat(db_path).st_mode
+    except FileNotFoundError:
+        return db_path, "missing"
+    except OSError:
+        return db_path, "other"
+    return db_path, "file" if stat.S_ISREG(mode) else "other"
+
+
+def _database(root: Path) -> tuple[tuple[str, str, str, str], bool]:
+    db_path, kind = _observer_db_path(root)
+    if kind == "missing":
+        return ("missing", "none", "0", "none"), False
+    unavailable = ("unavailable", "unavailable", "unavailable", "unavailable")
+    if kind == "other":
+        return unavailable, True
     try:
         conn = connect_observer_readonly(db_path)
-        rows = missions.recent(conn, 1)
-        mission = (f"#{rows[0]['id']} {rows[0].get('state', rows[0].get('status', 'unknown'))} at "
-                   f"{rows[0].get('started_at', rows[0].get('created_at', 'unknown'))}"
-                   if rows else "none")
-        approval_count = str(len(approvals.pending(conn)))
-        deploy = count_open_readonly(db_path, opener=connect_observer_readonly)
-        if deploy is None:
-            return ("ok", mission, approval_count, "unavailable"), conn, True
-        return ("ok", mission, approval_count, "none" if deploy == 0 else str(deploy)), conn, False
-    except Exception:  # noqa: BLE001 - readonly DB can be corrupt or schema-incomplete
-        return ("unavailable", "unavailable", "unavailable", "unavailable"), None, True
+    except Exception:  # noqa: BLE001 - readonly DB can be corrupt or unreadable
+        return unavailable, True
+    try:
+        try:
+            rows = missions.recent(conn, 1)
+            mission = (f"#{rows[0]['id']} {rows[0].get('state', rows[0].get('status', 'unknown'))} at "
+                       f"{rows[0].get('started_at', rows[0].get('created_at', 'unknown'))}"
+                       if rows else "none")
+        except Exception:  # noqa: BLE001
+            mission = "unavailable"
+        try:
+            approval_count = str(len(approvals.pending(conn)))
+        except Exception:  # noqa: BLE001
+            approval_count = "unavailable"
+    finally:
+        conn.close()
+    try:
+        deploy_count = count_open_readonly(db_path, opener=connect_observer_readonly)
+    except Exception:  # noqa: BLE001
+        deploy_count = None
+    deploy = "unavailable" if deploy_count is None else ("none" if deploy_count == 0 else str(deploy_count))
+    lines = (mission, approval_count, deploy)
+    if all(line == "unavailable" for line in lines):
+        return unavailable, True
+    return ("ok", *lines), "unavailable" in lines
 
 
 def _activity(root: Path) -> tuple[str, bool]:
@@ -258,18 +307,28 @@ def _activity(root: Path) -> tuple[str, bool]:
         return "unavailable", True
 
 
-def _pending(root: Path, instance: str) -> tuple[tuple[str, ...], bool]:
+def _pending(root: Path, instance: str, settings: Any | None) -> tuple[tuple[str, ...] | None, bool]:
     conn: sqlite3.Connection | None = None
     try:
-        _settings_state, settings, _settings_bad = _settings(root)
-        db_path = Path(root) / "data" / "agentic.db"
-        if db_path.is_file():
-            conn = connect_observer_readonly(db_path)
-        facts = collect_pending_facts(root, settings, conn, deployed_plugins=(), outage=None,
+        db_path, kind = _observer_db_path(root)
+        if kind == "file":
+            try:
+                conn = connect_observer_readonly(db_path)
+            except Exception:  # noqa: BLE001 - the database line reports the failure
+                conn = None
+        deployed: tuple[Any, ...] = ()
+        plugins_dir = Path(root) / "plugins"
+        if settings is not None and conn is not None and plugins_dir.is_dir():
+            try:
+                deployed = tuple(plugin_loader.approved_plugins(
+                    conn, plugins_dir, settings=settings).inventory.metas)
+            except Exception:  # noqa: BLE001 - an unreadable inventory means no deployed plugins
+                deployed = ()
+        facts = collect_pending_facts(root, settings, conn, deployed_plugins=deployed, outage=None,
                                       clock=SystemClock(), service_active=False if instance == "free" else None)
         return tuple(render_pending_step(step) for step in pending_steps(facts, for_status=True)), False
     except Exception:  # noqa: BLE001 - optional facts must not suppress status
-        return (), True
+        return None, True
     finally:
         if conn is not None:
             conn.close()
@@ -279,19 +338,35 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
                    unit_path: Path | None = None, instance: str | None = None) -> StatusData:
     """Collect independent local observations for a non-locked instance."""
     instance = probe_instance_lock(root) if instance is None else instance
-    setup_read = read_setup_record(root)
-    settings_state, _settings_value, settings_bad = _settings(root)
-    unit, unit_bad = _unit(run, unit_path or default_unit_dir() / UNIT_NAME)
-    ops, ops_bad = _ops(root)
-    state = ("unavailable", "unavailable") if instance == "unknown" else read_state(root)
-    db, _conn, db_bad = _database(root)
-    if _conn is not None:
-        _conn.close()
+    try:
+        setup_state, setup_bad = read_setup_record(root).state, False
+    except Exception:  # noqa: BLE001 - each source is independent
+        setup_state, setup_bad = "unavailable", True
+    settings_state, settings_value = _settings(root)
+    try:
+        unit, unit_bad = _unit(run, unit_path or default_unit_dir() / UNIT_NAME)
+    except Exception:  # noqa: BLE001
+        unit, unit_bad = ("missing", "unknown", "unknown"), True
+    try:
+        ops, ops_bad = _ops(root)
+    except Exception:  # noqa: BLE001
+        ops, ops_bad = ("unavailable",) * 4, True
+    if instance == "unknown":
+        state = ("unavailable", "unavailable")
+    else:
+        try:
+            state = read_state(root)
+        except Exception:  # noqa: BLE001
+            state = ("unavailable", "unavailable")
+    try:
+        db, db_bad = _database(root)
+    except Exception:  # noqa: BLE001
+        db, db_bad = ("unavailable",) * 4, True
     activity, activity_bad = _activity(root)
-    steps, pending_bad = _pending(root, instance)
+    steps, pending_bad = _pending(root, instance, settings_value)
     state_bad = state[0] == "unavailable" and instance != "unknown"
-    return StatusData(instance, setup_read.state, settings_state, unit, ops, state, *db,
-                      activity, steps, any((settings_bad, unit_bad, ops_bad, state_bad, db_bad,
+    return StatusData(instance, setup_state, settings_state, unit, ops, state, *db,
+                      activity, steps, any((setup_bad, unit_bad, ops_bad, state_bad, db_bad,
                                             activity_bad, pending_bad)))
 
 
@@ -304,8 +379,9 @@ def render_status(data: StatusData) -> str:
     lines.append("state: mode=%s kill_switch=%s" % data.state)
     lines.extend((f"database: {data.database}", f"recent mission: {data.mission}",
                   f"pending approvals: {data.approvals}", f"plugin deploy ops: {data.deploy_ops}",
-                  f"recent activity: {data.activity}", f"pending steps: {len(data.steps)}"))
-    lines.extend(f"  - {step}" for step in data.steps)
+                  f"recent activity: {data.activity}",
+                  f"pending steps: {'unavailable' if data.steps is None else len(data.steps)}"))
+    lines.extend(f"  - {step}" for step in data.steps or ())
     lines.append(_NOTE)
     if data.setup in {"missing", "corrupt"}:
         next_step = "afx init"
