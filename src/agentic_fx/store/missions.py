@@ -5,7 +5,9 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+from agentic_fx._safe_error import safe_text
 from agentic_fx.core import market_hours
+from agentic_fx.loops import improve_notice_codes as notice_codes
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -53,6 +55,9 @@ def finish_improve_mission(
         mission_status: str, run_result: str | None,
         backlog_transition: dict | None,
         now: datetime,
+        notice: notice_codes.NoticeCode,
+        tool_calls: int | None,
+        observation_text: str | None = None,
         approval_id: int | None = None,
         report_path: str | None = None,
         report_state: str = "none",
@@ -64,17 +69,30 @@ def finish_improve_mission(
     `approval_id`/`report_path`/`report_state` は `improve_runs.finish`
     へそのまま転送する独立 kw であり `backlog_transition` からは拾わない
     (B9 — backlog_transition は `{"backlog_id","status","last_result"}`
-    の 3 キーのみで承認/レポート情報を持たない)。"""
+    の 3 キーのみで承認/レポート情報を持たない)。
+
+    `notice` (既定値なし) は終端の通知分類。CAS が成功した同じ tx で、
+    許可対の検査を通してから終端 snapshot (`improve_run_notices`) を 1 行
+    書く。違反は `ValueError` (呼び出し元がロールバック)。`tool_calls` は
+    記録が無ければ None。`observation_text` は `safe_text` を通して 2,000
+    字に切り詰めて保存する (拒否はしない)。`trigger` は同じ tx で
+    `improvement_runs.trigger` から読み、NULL は `manual`。"""
     from agentic_fx.store import backlog as backlog_mod
     from agentic_fx.store import improve_runs as improve_runs_mod
     from agentic_fx.store import improve_waves as improve_waves_mod
 
+    notice_codes.validate_notice_fields(
+        notice.result_code, notice.reason_code, tool_calls)
     ok = finish(conn, mission_id, mission_status, output, transcript or [], now,
                commit=False)
     if not ok:
         raise RuntimeError(
             f"finish_improve_mission: mission {mission_id} is not 'running' "
             "(already terminal — CAS rowcount=0)")
+    _insert_notice_snapshot(
+        conn, mission_id=mission_id, run_id=run_id, notice=notice,
+        tool_calls=tool_calls, observation_text=observation_text,
+        approval_id=approval_id, now=now)
     run_ok = improve_runs_mod.finish(
         conn, run_id, result=run_result, now=now,
         approval_id=approval_id, report_path=report_path,
@@ -104,6 +122,37 @@ def finish_improve_mission(
                 "(rowcount=0, refusing silent no-op)")
     if commit:
         conn.commit()
+
+
+def _trigger_of_run(conn: sqlite3.Connection, run_id: int) -> str:
+    row = conn.execute(
+        "SELECT trigger FROM improvement_runs WHERE id=?", (run_id,)).fetchone()
+    value = row["trigger"] if row is not None else None
+    return value if value is not None else notice_codes.TRIGGER_MANUAL
+
+
+def _insert_notice_snapshot(
+        conn: sqlite3.Connection, *, mission_id: int, run_id: int | None,
+        notice: notice_codes.NoticeCode, tool_calls: int | None,
+        observation_text: str | None, approval_id: int | None,
+        now: datetime, trigger: str | None = None,
+        ignore_existing: bool = False) -> None:
+    if observation_text is not None and notice.result_code != "observation":
+        raise ValueError("observation_text is only allowed for observation")
+    if trigger is None:
+        trigger = (_trigger_of_run(conn, run_id) if run_id is not None
+                   else notice_codes.TRIGGER_MANUAL)
+    notice_codes.validate_trigger(trigger)
+    stored_text = (
+        notice_codes.truncate_observation_text(safe_text(observation_text))
+        if observation_text is not None else None)
+    verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
+    conn.execute(
+        f"{verb} INTO improve_run_notices (mission_id, trigger, result_code, "
+        "reason_code, tool_calls, observation_text, approval_id, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (mission_id, trigger, notice.result_code, notice.reason_code,
+         tool_calls, stored_text, approval_id, now.isoformat()))
 
 
 def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
@@ -174,6 +223,21 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                 "SELECT id, backlog_id FROM improvement_runs "
                 f"WHERE mission_id IN ({placeholders2}) "
                 "AND finished_at IS NULL", improve_mission_ids).fetchall()
+            # 終端 snapshot の trigger は run 行の列から読む (slot の片付けに
+            # 依らない)。run 行が無い・列が NULL の mission は manual。
+            trigger_by_mission = {
+                r["mission_id"]: r["trigger"] for r in conn.execute(
+                    "SELECT mission_id, trigger FROM improvement_runs "
+                    f"WHERE mission_id IN ({placeholders2})",
+                    improve_mission_ids).fetchall()}
+            for mid in improve_mission_ids:
+                _insert_notice_snapshot(
+                    conn, mission_id=mid, run_id=None,
+                    notice=notice_codes.NOTICE_INTERRUPTED, tool_calls=None,
+                    observation_text=None, approval_id=None, now=now,
+                    trigger=(trigger_by_mission.get(mid)
+                             or notice_codes.TRIGGER_MANUAL),
+                    ignore_existing=True)
             for run_row in run_rows:
                 conn.execute(
                     "UPDATE improvement_runs SET finished_at=? "

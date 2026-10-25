@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.loops import improve_notice_codes as notice_codes
 from agentic_fx.backtest.holdout import NoHistoryError
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
@@ -317,7 +318,8 @@ def test_finalize_gate_failed_persists_gate_rows_when_report_write_raises_oserro
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows)
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     assert conn.execute(
         "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=?",
@@ -370,7 +372,8 @@ def test_f4_9_gate_row_and_ledger_row_share_the_same_branch_local_outcome(
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
         now=datetime(2026, 8, 22, tzinfo=timezone.utc),
-        gate_rows=gate_rows, mission_outcome="unprofitable")
+        gate_rows=gate_rows, mission_outcome="unprofitable",
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     rows = conn.execute(
         "SELECT scope, mission_outcome FROM backtest_runs "
@@ -425,7 +428,8 @@ def test_f4_7_default_mission_outcome_stays_gate_failed_for_both_sinks(
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
         reason="insufficient_trades:5",
-        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows)
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows,
+        notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     rows = conn.execute(
         "SELECT scope, mission_outcome FROM backtest_runs "
@@ -480,7 +484,8 @@ def test_f4_10_report_write_failure_forces_report_failed_on_all_four_points(
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
         now=datetime(2026, 8, 22, tzinfo=timezone.utc), gate_rows=gate_rows,
-        mission_outcome="unprofitable")
+        mission_outcome="unprofitable",
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     rows = conn.execute(
         "SELECT scope, mission_outcome FROM backtest_runs "
@@ -1603,7 +1608,8 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22))
+        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
@@ -1644,7 +1650,8 @@ def test_finalize_gate_failed_writes_tool_calls_when_present(
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
         reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22),
-        tool_calls=7)
+        tool_calls=7,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "gate_failed" in line)
@@ -1673,7 +1680,8 @@ def test_finalize_gate_failed_preserves_new_gate_reason(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason=f"gate_failed:{gate_reason}", now=datetime(2026, 8, 22))
+        reason=f"gate_failed:{gate_reason}", now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     row = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -1708,7 +1716,8 @@ def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason="insufficient_trades:5", now=datetime(2026, 8, 22))
+        reason="insufficient_trades:5", now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     period_key, k = slot_key
     slot = conn.execute(
@@ -1965,7 +1974,9 @@ def test_report_and_observation_activity_are_written_only_after_successful_commi
         loop_min._finalize_report_or_observation(
             _CommitFailingConnection(conn), ctx=ctx, backlog_id=backlog_id,
             report_path=report_path, artifact=artifact,
-            now=datetime(2026, 8, 22))
+            now=datetime(2026, 8, 22),
+            notice=(notice_codes.NOTICE_REPORT_PUBLISHED if report_path is not None
+            else notice_codes.NOTICE_OBSERVATION))
     text = ((tmp_path / "activity.log").read_text()
             if (tmp_path / "activity.log").exists() else "")
     assert f"\t{forbidden_event}\t" not in text
@@ -1982,7 +1993,8 @@ def test_observation_artifact_records_reason_not_risk_gate_label(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "observation", "reason": "insufficient data"},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_OBSERVATION)
 
     backlog = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -2011,7 +2023,8 @@ def test_observation_without_backlog_logs_dash(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no candidate"},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_OBSERVATION)
     activity_text = (tmp_path / "activity.log").read_text()
     assert f"mission={mission_id} backlog=- reason=observation:no candidate" in activity_text
 
@@ -2028,7 +2041,8 @@ def test_observation_writes_tool_calls_when_present(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no tools available"},
-        now=datetime(2026, 8, 22), tool_calls=0)
+        now=datetime(2026, 8, 22), tool_calls=0,
+        notice=notice_codes.NOTICE_OBSERVATION)
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_observation" in line)
     assert "tool_calls=0" in line
@@ -2046,7 +2060,8 @@ def test_observation_omits_tool_calls_when_none(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no candidate"},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_OBSERVATION)
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_observation" in line)
     assert "tool_calls=" not in line
@@ -2066,7 +2081,8 @@ def test_risk_gate_report_artifact_keeps_unsupported_label(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "report", "proposal_kind": "risk_gate"},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_RISK_GATE_UNSUPPORTED)
 
     backlog = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -2107,7 +2123,8 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_REPORT_PUBLISHED)
 
     assert not staging_dir.exists()
     run = conn.execute(
@@ -2142,7 +2159,8 @@ def test_report_published_writes_tool_calls_when_present(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22), tool_calls=3)
+        artifact={"type": "report"}, now=datetime(2026, 8, 22), tool_calls=3,
+        notice=notice_codes.NOTICE_REPORT_PUBLISHED)
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "report_published" in line)
@@ -2167,7 +2185,8 @@ def test_report_published_omits_tool_calls_when_none(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_REPORT_PUBLISHED)
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "report_published" in line)
@@ -2195,7 +2214,8 @@ def test_report_publish_failure_does_not_log_published(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22))
+        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        notice=notice_codes.NOTICE_REPORT_PUBLISHED)
 
     run = conn.execute(
         "SELECT report_state FROM improvement_runs WHERE id=?",

@@ -30,7 +30,7 @@ import yaml  # /code-review 2 周目 CR3: `is_relock_transition` の
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
 
-from agentic_fx._safe_error import safe_error_text
+from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.activity import Category
 from agentic_fx.backtest.dataset import HISTORY_SOURCE_UNCONFIGURED_REASON
 from agentic_fx.backtest import holdout  # precheck 2026-08-22 wave2: 型6#5 —
@@ -46,6 +46,20 @@ from agentic_fx.loops.improve_context import (
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
+from agentic_fx.loops.improve_notice_codes import (
+    NOTICE_APPROVAL_TX_FAILED, NOTICE_BACKTEST_DATA_UNAVAILABLE,
+    NOTICE_COMMIT_CRASHED, NOTICE_DEMOTED_RECOVERED, NOTICE_DUPLICATE_SKIPPED,
+    NOTICE_INDICATOR_UNRESOLVED, NOTICE_KIND_UNSUPPORTED,
+    NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED, NOTICE_MAX_BARS_LIMIT,
+    NOTICE_MAX_TURNS, NOTICE_OBSERVATION, NOTICE_OBSERVATION_NOT_SUBMITTED,
+    NOTICE_OUTPUT_INVALID, NOTICE_OUTPUTS_REQUIRED, NOTICE_PREPARE_FAILED,
+    NOTICE_REPORT_PUBLISHED, NOTICE_REPORT_WRITE_FAILED,
+    NOTICE_RISK_GATE_UNSUPPORTED, NOTICE_RUNNER_FAILED,
+    NOTICE_SANDBOX_UNAVAILABLE, NOTICE_SUBMITTED, NOTICE_TIMEOUT,
+    NOTICE_TOOL_BUDGET_ABORT, NOTICE_UNPROFITABLE, NOTICE_UNVERIFIED,
+    PLUGIN_GATE_CODES, QUALITY_CODES, TRIGGER_MANUAL, TRIGGER_SCHEDULED,
+    NoticeCode, notice_for_plugin_gate, notice_for_quality,
+    notice_for_unevaluable_kind)
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import is_tool_budget_abort
 from agentic_fx.loops.summary import IMPROVE_OUTPUT_SCHEMA  # precheck 2026-08-22 wave2: T10-B12
@@ -312,12 +326,24 @@ class _PluginGateVerdict:  # 新規命名
     全ての return は、候補自身の self-test が staging を書き換えていても
     最終 bytes を表すよう、return の直前に取り直した値を持つ。取り直せなかった
     ときと、hash を取る前に抜ける snapshot 検査の不合格は None。
-    `failure_kind` は不合格の種別 (`noop_copy` か `gate_failed`)。"""
+    `failure_kind` は不合格の種別 (`noop_copy` か `gate_failed`)。
+    `code` は不合格の意味分岐を表す固定語 (通知の分類に使う。文面は含めない)。
+    通過のときは None。"""
     passed: bool
     reason: str = ""
     content_hash: str | None = None
     artifact_hash: str | None = None
     failure_kind: str | None = None
+    code: str | None = None
+
+    def __post_init__(self) -> None:
+        # 通知側は `code` だけから分類を引く。不合格は固定語を必ず持ち、
+        # 通過は持たない。
+        if self.passed:
+            if self.code is not None:
+                raise ValueError("a passing gate verdict carries no code")
+        elif self.code not in PLUGIN_GATE_CODES:
+            raise ValueError("a failed gate verdict needs a fixed code")
 
 
 @dataclass(frozen=True)
@@ -349,12 +375,24 @@ class _DuplicateDemotion:
 class _QualityVerdict:
     """質検査 (段 L・F・M) の結果。`outcome` が None なら通過。
     降格・拒否の `reason` は固定語彙で、配備済み名への誘導だけが名前を
-    持つ。`detail` は運用者向けの activity にだけ書く。"""
+    持つ。`detail` は運用者向けの activity にだけ書く。`code` は通知の分類に
+    使う固定語 (`duplicate_logic` / `duplicate_metrics` / `family_redirect` /
+    `comparison_base_unavailable`)。"""
     outcome: str | None = None
     flags: tuple[str, ...] = ()
     reason: str = ""
     last_result: str | None = None
     detail: str = ""
+    code: str | None = None
+
+    def __post_init__(self) -> None:
+        # `code` は降格・拒否の意味を表す固定語 (通知の分類に使う)。
+        # 通過のときは持たない。
+        if self.outcome is None:
+            if self.code is not None:
+                raise ValueError("a passing quality verdict carries no code")
+        elif self.code not in QUALITY_CODES:
+            raise ValueError("a quality rejection needs a fixed code")
 
 
 def _artifact_hash_of(plugin_py: bytes, config_yaml: bytes,
@@ -468,6 +506,77 @@ _MAX_DISCOVERIES_PER_MISSION = 5
 _REPORT_WRITE_FAILED = object()
 
 
+class ImprovePrepareFailed(Exception):
+    """`prepare()` が Tx-0 の後で失敗した。mission は補償で終端済み
+    (`__cause__` に元の例外)。"""
+
+    def __init__(self, mission_id: int,
+                 slot_key: "tuple[str, int] | None") -> None:
+        super().__init__(f"improve prepare failed mission_id={mission_id}")
+        self.mission_id = mission_id
+        self.slot_key = slot_key
+
+
+@dataclass(frozen=True)
+class _ObservationChoice:
+    """agent の observation を扱う 1 回の判定結果。backlog の `last_result`・
+    snapshot に保存する観察文・通知の分類は、同じ結果から同時に決まる。"""
+    last_result: str
+    observation_text: str | None
+    notice: NoticeCode
+
+
+def _select_observation(artifact: dict) -> _ObservationChoice:
+    """reason が `family_redirect:` / `duplicate` で始まるときは agent に理由を
+    返さず、`last_result` を中立な固定文言に倒す (観察文も保存しない)。
+    文字列の prefix 判定はこの 1 か所だけで行う。"""
+    observation_reason = safe_text(str(artifact.get("reason", "")))
+    if observation_reason.startswith(("family_redirect:", "duplicate")):
+        return _ObservationChoice(
+            NOT_SUBMITTED_LAST_RESULT, None, NOTICE_OBSERVATION_NOT_SUBMITTED)
+    return _ObservationChoice(
+        f"observation:{observation_reason}", observation_reason,
+        NOTICE_OBSERVATION)
+
+
+def _plain_outcome_notice(
+        report_path: "str | None", artifact: dict,
+        ) -> "tuple[NoticeCode, _ObservationChoice | None]":
+    """質検査・resume 回収を経ない通常の終端 (report の公開 / agent の
+    observation / 未対応の risk_gate) の分類。observation は selector の
+    結果をそのまま返す。"""
+    if report_path is not None:
+        return NOTICE_REPORT_PUBLISHED, None
+    if artifact.get("type") == "observation":
+        choice = _select_observation(artifact)
+        return choice.notice, choice
+    if (artifact.get("type") == "report"
+            and artifact.get("proposal_kind") == "risk_gate"):
+        return NOTICE_RISK_GATE_UNSUPPORTED, None
+    raise ValueError("no notice code for this terminal artifact")
+
+
+@dataclass(frozen=True)
+class _FailedMissionClass:
+    """runner が完走しなかった mission の分類。`writes_note` は backlog へ
+    system note を残す死因か (timeout / max_turns / tool 予算 abort)。"""
+    notice: NoticeCode
+    writes_note: bool
+
+
+def _classify_failed_mission(status: str, reason: str | None
+                             ) -> _FailedMissionClass:
+    """優先順位は timeout → max_turns → (failed かつ tool 予算 abort) →
+    その他の failed。文面は使わず、閉じた集合の固定語だけを返す。"""
+    if status == "timeout":
+        return _FailedMissionClass(NOTICE_TIMEOUT, True)
+    if status == "max_turns":
+        return _FailedMissionClass(NOTICE_MAX_TURNS, True)
+    if status == "failed" and is_tool_budget_abort(reason):
+        return _FailedMissionClass(NOTICE_TOOL_BUDGET_ABORT, True)
+    return _FailedMissionClass(NOTICE_RUNNER_FAILED, False)
+
+
 def _tool_calls_suffix(tool_calls: int | None) -> str:
     """A4 10 回目 #71 観測 B (2026-09-11): registry 経由の tool 呼び出しが
     0 件で終端した improve mission は「agent が自主的に観察を選んだ」
@@ -516,6 +625,8 @@ class ImproveLoop:
                     self._settings.runner.improve.model, now=now, commit=False)
                 run_id = improve_runs_store.start(
                     conn, backlog_id=None, mission_id=mission_id, now=now,
+                    trigger=(TRIGGER_MANUAL if slot_key is None
+                             else TRIGGER_SCHEDULED),
                     commit=False)
                 if slot_key is not None:
                     period_key, k = slot_key
@@ -601,15 +712,17 @@ class ImproveLoop:
                               timeout_sec=self._settings.improve.mission_timeout_sec)
             # precheck 2026-08-22 wave2: T10-B2/R-D1
             runner = self._build_worker_runner(ctx, on_ready=on_ready)
-        except BaseException:
+        except BaseException as exc:
             _log.exception(
                 "improve prepare failed after Tx-0 for mission_id=%s "
                 "slot_key=%r", mission_id, slot_key)
             self._compensate_prepare_failure(
                 conn, mission_id=mission_id, run_id=run_id,
-                slot_key=slot_key, now=now)
+                slot_key=slot_key, now=now, notice=NOTICE_PREPARE_FAILED)
             if getattr(self, "_conn_for_test", None) is None:
                 conn.close()
+            if isinstance(exc, Exception):
+                raise ImprovePrepareFailed(mission_id, slot_key) from exc
             raise
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
         # `commit()` (10.11 節) は `_conn_for_test` シームがあれば close
@@ -625,7 +738,8 @@ class ImproveLoop:
         return mission, ctx, runner
 
     def _compensate_prepare_failure(self, conn, *, mission_id, run_id,
-                                    slot_key, now) -> None:
+                                    slot_key, now, notice: NoticeCode,
+                                    tool_calls: int | None = None) -> None:
         """I3 是正 (プラン10 束D round1、ユーザー裁定 D②、2026-08-28):
         Tx-0 commit 後の `prepare()` 例外を、自作の mission/run/(あれば)
         slot に限って 1 tx で終端化する (`_compensate_tx2_failure`、
@@ -639,6 +753,7 @@ class ImproveLoop:
                     conn, mission_id=mission_id, run_id=run_id,
                     slot_key=slot_key, mission_status="failed",
                     run_result=None, backlog_transition=None, now=now,
+                    notice=notice, tool_calls=tool_calls, observation_text=None,
                     commit=False)
                 conn.commit()
             except BaseException:
@@ -680,7 +795,8 @@ class ImproveLoop:
     # 1 tx 終端を、`_launch_slot` から呼べる形で公開する (新規 write conn
     # を自前で開く — prepare() が close した後の呼び出しのため)。
     def compensate_launch_failure(self, *, ctx: "ImproveRunContext",
-                                  now: datetime) -> None:
+                                  now: datetime,
+                                  tool_calls: int | None = None) -> None:
         # R5 是正 (2026-08-30): launch failure で DB 行 (mission/run/slot) を
         # 終端化するだけでなく、staging ディレクトリ
         # (`plugins/_staging/<mission_id>/`) も削除する。`_snapshot_src` 配下は
@@ -704,14 +820,16 @@ class ImproveLoop:
         try:
             self._compensate_prepare_failure(
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
-                slot_key=ctx.slot_key, now=now)
+                slot_key=ctx.slot_key, now=now, notice=NOTICE_LAUNCH_CRASHED,
+                tool_calls=tool_calls)
         finally:
             if getattr(self, "_conn_for_test", None) is None:
                 conn.close()
 
     def compensate_commit_failure(
             self, *, ctx: "ImproveRunContext", now: datetime,
-            exc: BaseException, slot_terminalize: bool = True) -> None:
+            exc: BaseException, slot_terminalize: bool = True,
+            tool_calls: int | None = None) -> None:
         """`commit()` 例外後に mission/run/(必要なら slot) を終端する。
 
         失敗した `commit()` の接続は transaction 状態が不明なため再利用せず、
@@ -775,7 +893,9 @@ class ImproveLoop:
                         conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                         slot_key=ctx.slot_key if slot_terminalize else None,
                         mission_status="failed", run_result=None, now=now,
-                        backlog_transition=None, commit=False)
+                        backlog_transition=None,
+                        notice=NOTICE_COMMIT_CRASHED, tool_calls=tool_calls,
+                        observation_text=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -1648,38 +1768,42 @@ class ImproveLoop:
         try:
             check_candidate_snapshot(plugin_dir)
         except CandidateSnapshotError as exc:
-            return _PluginGateVerdict(passed=False, reason=str(exc))
+            return _PluginGateVerdict(
+                passed=False, reason=str(exc), code="snapshot_rejected")
 
         content_hash_before, artifact_hash_before = hashes_of(plugin_dir)
 
-        def _failed_before_pytest(reason: str,
+        def _failed_before_pytest(reason: str, *, code: str,
                                   kind: str = "gate_failed") -> _PluginGateVerdict:
             # pytest の実行前は staging が変わっていないので、取った hash が
             # そのまま最終 artifact を表す。
             return _PluginGateVerdict(
                 passed=False, reason=reason,
                 content_hash=content_hash_before,
-                artifact_hash=artifact_hash_before, failure_kind=kind)
+                artifact_hash=artifact_hash_before, failure_kind=kind,
+                code=code)
 
-        def _failed_after_pytest(reason: str) -> _PluginGateVerdict:
+        def _failed_after_pytest(reason: str, *, code: str) -> _PluginGateVerdict:
             # pytest の実行後は候補自身の self-test が staging を書き換えて
             # いる場合があるため、return の直前に取り直す。
             content_hash_final, artifact_hash_final = self._final_hashes(
                 plugin_dir)
             return _PluginGateVerdict(
                 passed=False, reason=reason, content_hash=content_hash_final,
-                artifact_hash=artifact_hash_final, failure_kind="gate_failed")
+                artifact_hash=artifact_hash_final, failure_kind="gate_failed",
+                code=code)
 
         try:
             check_source(plugin_dir / "plugin.py")
             check_source(plugin_dir / "test_plugin.py",
                         extra_allowed=frozenset({"pytest", "plugin"}))
         except SandboxError as exc:
-            return _failed_before_pytest(str(exc))
+            return _failed_before_pytest(str(exc), code="source_rejected")
 
         meta, reason = plugin_loader.discover_one_with_reason(plugin_dir, name)
         if meta is None:
-            return _failed_before_pytest(f"loader_rejected: {reason}")
+            return _failed_before_pytest(
+                f"loader_rejected: {reason}", code="loader_rejected")
 
         try:
             noop_copy = find_noop_copy(
@@ -1688,24 +1812,27 @@ class ImproveLoop:
                 inventory=(inventory if inventory is not None
                           else _empty_inventory_result(self._root / "plugins")))
         except SyntaxError:
-            return _failed_before_pytest("plugin.py syntax error")
+            return _failed_before_pytest(
+                "plugin.py syntax error", code="syntax_error")
         if noop_copy is not None:
             return _failed_before_pytest(
-                f"noop_copy_of:{noop_copy}", kind="noop_copy")
+                f"noop_copy_of:{noop_copy}", code="noop_copy", kind="noop_copy")
 
         test_count = count_self_test_functions(plugin_dir / "test_plugin.py")
         minimum = self._settings.improve.gate.min_test_functions
         if test_count == 0:
-            return _failed_before_pytest("self_test_missing")
+            return _failed_before_pytest(
+                "self_test_missing", code="self_test_missing")
 
         try:
             result = run_gate_pytest(plugin_dir, settings=self._settings)
         except RuntimeError as exc:
             # M7: Landlock 不可 (run_gate_pytest の fail-closed RuntimeError,
             # 設計書 §4.2-3d) は commit() 全体を例外で抜けさせず gate 不合格に倒す
-            return _failed_after_pytest(str(exc))
+            return _failed_after_pytest(str(exc), code="sandbox_unavailable")
         if not result.passed:
-            return _failed_after_pytest(f"pytest failed: {result.stdout_tail}")
+            return _failed_after_pytest(
+                f"pytest failed: {result.stdout_tail}", code="pytest_failed")
 
         # 1 周目 I1: AST の事前カウントは名前規則の近似でしかない (pytest が
         # 収集しない class 内でも数える等の水増しが可能)。真の下限は pytest の
@@ -1725,7 +1852,8 @@ class ImproveLoop:
         collected_count = int(match.group(1)) if match is not None else 0
         if collected_count < minimum:
             return _failed_after_pytest(
-                f"self_test_too_thin_collected:{collected_count}<{minimum}")
+                f"self_test_too_thin_collected:{collected_count}<{minimum}",
+                code="self_test_too_thin")
 
         content_hash_after, artifact_hash_after = self._final_hashes(plugin_dir)
         if (content_hash_after is None
@@ -1736,7 +1864,8 @@ class ImproveLoop:
                 reason=("hash changed after pytest execution "
                         "(candidate was mutated by its own test)"),
                 content_hash=content_hash_after,
-                artifact_hash=artifact_hash_after, failure_kind="gate_failed")
+                artifact_hash=artifact_hash_after, failure_kind="gate_failed",
+                code="self_test_mutated")
 
         return _PluginGateVerdict(
             passed=True, content_hash=content_hash_before,
@@ -2529,7 +2658,8 @@ class ImproveLoop:
                 mission_outcome=mission_outcome, **row)
 
     def _compensate_tx2_failure(self, conn, *, ctx, mission_id, run_id,
-                                backlog_id, slot_key, now) -> None:
+                                backlog_id, slot_key, now,
+                                tool_calls: int | None = None) -> None:
         """10.10 Step 3: Tx-2 失敗時の補償 tx。"""
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
@@ -2544,7 +2674,8 @@ class ImproveLoop:
                     {"backlog_id": backlog_id, "status": "observation",
                      "last_result": "commit_failed"}
                     if backlog_id is not None else None),
-                commit=False)
+                notice=NOTICE_APPROVAL_TX_FAILED, tool_calls=tool_calls,
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -2658,21 +2789,25 @@ class ImproveLoop:
         if file_population is not None:
             if candidate.candidate_dir is None:
                 return self._quality_unavailable(
-                    mission_id, "candidate_dir_missing")
+                    mission_id, "candidate_dir_missing",
+                    code="comparison_base_unavailable")
             if candidate.logic_hash is None:
                 return self._quality_rejection(
                     "gate_failed",
                     detail=f"candidate_identity_unavailable "
-                           f"name={candidate.name}")
+                           f"name={candidate.name}",
+                    code="comparison_base_unavailable")
             try:
                 archive = improve_quality.load_archive(
                     conn, mission_id=mission_id)
             except (sqlite3.Error, ValueError, OSError) as exc:
                 return self._quality_unavailable(
-                    mission_id, f"archive_read_failed:{type(exc).__name__}")
+                    mission_id, f"archive_read_failed:{type(exc).__name__}",
+                    code="comparison_base_unavailable")
             if file_population.unavailable is not None:
                 return self._quality_unavailable(
-                    mission_id, file_population.unavailable)
+                    mission_id, file_population.unavailable,
+                    code="comparison_base_unavailable")
             try:
                 deployed, drift, unavailable = (
                     improve_quality.deployed_from_live(conn, file_population))
@@ -2680,7 +2815,8 @@ class ImproveLoop:
                 deployed, drift, unavailable = None, [], (
                     f"deploy_state_read_failed:{type(exc).__name__}")
             if unavailable is not None:
-                return self._quality_unavailable(mission_id, unavailable)
+                return self._quality_unavailable(
+                    mission_id, unavailable, code="comparison_base_unavailable")
             if drift is None:
                 self._write_quality_activity(
                     "quality_population_drift_unreadable",
@@ -2697,7 +2833,8 @@ class ImproveLoop:
                         f"mission={mission_id} row={skipped}", mission_id)
             if improve_quality.base_unavailable(*populations):
                 return self._quality_unavailable(
-                    mission_id, "no_usable_comparison_row")
+                    mission_id, "no_usable_comparison_row",
+                    code="comparison_base_unavailable")
             duplicate = improve_quality.find_duplicate_logic(
                 name=candidate.name, kind=approval_payload.get("kind"),
                 logic_hash=candidate.logic_hash,
@@ -2705,7 +2842,8 @@ class ImproveLoop:
             if duplicate is not None:
                 return self._quality_rejection(
                     "duplicate_logic",
-                    detail=f"matched={duplicate.source}:{duplicate.name}")
+                    detail=f"matched={duplicate.source}:{duplicate.name}",
+                    code="duplicate_logic")
             same_family = improve_quality.find_same_family(
                 name=candidate.name, kind=approval_payload.get("kind"),
                 family_key=candidate.family_key,
@@ -2716,7 +2854,8 @@ class ImproveLoop:
                     detail=(f"matched={same_family.source}:{same_family.name} "
                             f"family_key={candidate.family_key}"),
                     reason=family_redirect_reason(same_family.name),
-                    last_result=family_redirect_last_result(same_family.name))
+                    last_result=family_redirect_last_result(same_family.name),
+                    code="family_redirect")
         metrics_dup = self._check_duplicate_metrics_for_approval(
             conn, approval_payload, inventory=inventory,
             staging_dir=staging_dir)
@@ -2724,11 +2863,11 @@ class ImproveLoop:
             detail = (f"duplicate_metrics_of:{metrics_dup.content_hash} "
                       f"pair={metrics_dup.pair}")
             return self._quality_rejection(
-                "duplicate_metrics", detail=detail)
+                "duplicate_metrics", detail=detail, code="duplicate_metrics")
         return _QualityVerdict()
 
     @staticmethod
-    def _quality_rejection(outcome: str, *, detail: str,
+    def _quality_rejection(outcome: str, *, detail: str, code: str,
                            reason: str | None = None,
                            last_result: str | None = None) -> _QualityVerdict:
         """agent 面の reason は固定語彙だけで、配備済み名への誘導だけが
@@ -2740,17 +2879,17 @@ class ImproveLoop:
                 reason = "not_submitted"
         return _QualityVerdict(
             outcome=outcome, reason=reason, last_result=last_result,
-            detail=detail)
+            detail=detail, code=code)
 
-    def _quality_unavailable(self, mission_id: int,
-                             reason: str) -> _QualityVerdict:
+    def _quality_unavailable(self, mission_id: int, reason: str, *,
+                             code: str) -> _QualityVerdict:
         """比較の根拠が作れなかった: 原因は activity にだけ残し、agent 面には
         固定語彙の `gate_failed` を返す。"""
         self._write_quality_activity(
             "quality_check_unavailable",
             f"mission={mission_id} reason={reason}", mission_id)
         return self._quality_rejection(
-            "gate_failed", detail="comparison_base_unavailable")
+            "gate_failed", detail="comparison_base_unavailable", code=code)
 
     def _write_quality_activity(self, event: str, summary: str,
                                 mission_id: int) -> None:
@@ -2843,7 +2982,8 @@ class ImproveLoop:
                     self._remove_created_archive(created_archive_path)
                     return self._quality_unavailable(
                         mission_id,
-                        f"deploy_guard_unavailable:{type(exc).__name__}")
+                        f"deploy_guard_unavailable:{type(exc).__name__}",
+                        code="comparison_base_unavailable")
                 file_population = self._load_quality_population(ctx)
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -2942,7 +3082,8 @@ class ImproveLoop:
                     backlog_transition={
                         "backlog_id": backlog_id, "status": "selected",
                         "last_result": f"approval_pending:{approval_id}"},
-                    commit=False)
+                    notice=NOTICE_SUBMITTED, tool_calls=tool_calls,
+                    observation_text=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -2993,7 +3134,8 @@ class ImproveLoop:
             try:
                 self._compensate_tx2_failure(
                     conn, ctx=persist_ctx, mission_id=mission_id, run_id=run_id,
-                    backlog_id=backlog_id, slot_key=slot_key, now=now)
+                    backlog_id=backlog_id, slot_key=slot_key, now=now,
+                    tool_calls=tool_calls)
             except Exception:
                 _log.exception(
                     "compensation itself failed for mission_id=%s — mission "
@@ -3072,7 +3214,9 @@ class ImproveLoop:
 
             selection = self._select_and_bind(conn, output, ctx, now=now)  # 手順2
             if not selection.won:
-                self._finalize_loser(conn, ctx=ctx, output=output, now=now)
+                self._finalize_loser(
+                    conn, ctx=ctx, output=output, now=now,
+                    tool_calls=tool_calls)
                 return
 
             artifact = output.get("artifact", {})
@@ -3115,7 +3259,8 @@ class ImproveLoop:
                         "reason": (f"title={title} — "
                                   "resume 回収経由のため降格"),
                     },
-                    now=now, tool_calls=tool_calls)
+                    now=now, tool_calls=tool_calls,
+                    notice=NOTICE_DEMOTED_RECOVERED)
                 return
 
             if atype == "plugin":
@@ -3138,7 +3283,8 @@ class ImproveLoop:
                         reason=f"gate_failed:{gate_verdict.reason}", now=now,
                         tool_calls=tool_calls, candidate=final_candidate,
                         candidate_outcome=(
-                            gate_verdict.failure_kind or "gate_failed"))
+                            gate_verdict.failure_kind or "gate_failed"),
+                        notice=notice_for_plugin_gate(gate_verdict.code))
                     return
 
                 from agentic_fx.plugin import approval
@@ -3151,7 +3297,8 @@ class ImproveLoop:
                         reason="gate_failed:loader_rejected", now=now,
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="gate_failed")
+                        candidate_outcome="gate_failed",
+                        notice=NOTICE_LOADER_REJECTED)
                     return
                 if (final_candidate is not None
                         and final_candidate.logic_hash is None):
@@ -3161,7 +3308,8 @@ class ImproveLoop:
                         activity_extra=" cause=candidate_identity_unavailable",
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="gate_failed")
+                        candidate_outcome="gate_failed",
+                        notice=NOTICE_UNVERIFIED)
                     return
                 try:
                     approval.assert_max_bars_within_limit(
@@ -3172,7 +3320,8 @@ class ImproveLoop:
                         reason=f"gate_failed:max_bars_limit:{exc}", now=now,
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="gate_failed")
+                        candidate_outcome="gate_failed",
+                        notice=NOTICE_MAX_BARS_LIMIT)
                     return
 
                 kind = candidate_meta.kind
@@ -3182,7 +3331,8 @@ class ImproveLoop:
                         reason=f"gate_failed:kind_unsupported:{kind}", now=now,
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="gate_failed")
+                        candidate_outcome="gate_failed",
+                        notice=NOTICE_KIND_UNSUPPORTED)
                     return
                 # [indicator-consumption-wiring] U4a: kind=indicator の
                 # `outputs` 宣言は新規承認で必須。固定文言のみ
@@ -3196,7 +3346,8 @@ class ImproveLoop:
                         reason="outputs_required", now=now,
                         tool_calls=tool_calls,
                         candidate=final_candidate,
-                        candidate_outcome="gate_failed")
+                        candidate_outcome="gate_failed",
+                        notice=NOTICE_OUTPUTS_REQUIRED)
                     return
                 if kind == "strategy":
                     # [indicator-consumption-wiring] §2.8: 解決は commit
@@ -3218,7 +3369,8 @@ class ImproveLoop:
                             candidate=final_candidate,
                             candidate_outcome="gate_failed",
                             activity_extra=(f" alias={exc.alias or '-'} "
-                                            f"cause={exc.reason}"))
+                                            f"cause={exc.reason}"),
+                            notice=NOTICE_INDICATOR_UNRESOLVED)
                         return
                     try:
                         strategy_verdict = self._run_strategy_gate(     # 手順4
@@ -3256,7 +3408,8 @@ class ImproveLoop:
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             candidate=final_candidate,
                             candidate_outcome="gate_failed",
-                            not_submitted=True)
+                            not_submitted=True,
+                            notice=NOTICE_BACKTEST_DATA_UNAVAILABLE)
                         return
                     # `backtest_cpu` は gate が評価 1 回ごとに `evaluation_sink`
                     # へ渡し、そこで書く (失敗で例外が伝播する評価でも
@@ -3271,7 +3424,9 @@ class ImproveLoop:
                                 "insufficient_trades"
                                 if strategy_verdict.unevaluable_kind
                                 == "insufficient_trades" else "gate_failed"),
-                            not_submitted=True)
+                            not_submitted=True,
+                            notice=notice_for_unevaluable_kind(
+                                strategy_verdict.unevaluable_kind))
                         return
                     # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書
                     # §3 T1-b): 収益性フロア不合格の再ルート。`reason` は
@@ -3302,7 +3457,8 @@ class ImproveLoop:
                             report_detail=report_detail,
                             candidate=final_candidate,
                             candidate_outcome="unprofitable",
-                            not_submitted=True)
+                            not_submitted=True,
+                            notice=NOTICE_UNPROFITABLE)
                         return
                     gate_metrics["baseline"] = strategy_verdict.baseline_row
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
@@ -3356,7 +3512,7 @@ class ImproveLoop:
             if approval_payload is None:
                 report_path = self._prepare_report_if_applicable(       # 手順6
                     conn, ctx=ctx, artifact=artifact, output=output, now=now,
-                    backlog_id=selection.backlog_id)
+                    backlog_id=selection.backlog_id, tool_calls=tool_calls)
                 if report_path is _REPORT_WRITE_FAILED:
                     # OSError を _prepare_report_if_applicable 自身が Tx-2
                     # で終端済み — 二重終端を避けてここで抜ける。
@@ -3393,12 +3549,16 @@ class ImproveLoop:
                         candidate=final_candidate,
                         candidate_outcome=demotion.outcome,
                         quality_last_result=(demotion.last_result
-                                             or f"observation:{demotion.reason}"))
+                                             or f"observation:{demotion.reason}"),
+                        notice=notice_for_quality(demotion.code))
             else:
+                plain_notice, plain_choice = _plain_outcome_notice(
+                    report_path, artifact)
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
                     report_path=report_path, artifact=artifact, now=now,
-                    tool_calls=tool_calls)
+                    tool_calls=tool_calls, notice=plain_notice,
+                    observation_choice=plain_choice)
         except BaseException:
             commit_raised = True
             if ctx.ledger.state() == "FROZEN":
@@ -3409,7 +3569,9 @@ class ImproveLoop:
                 conn.close()
 
     def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
-                                      now, backlog_id=None) -> str | None:
+                                      now, backlog_id=None,
+                                      tool_calls: int | None = None,
+                                      ) -> str | None:
         """`artifact.type=='report'` かつ `proposal_kind != 'risk_gate'` の
         ときだけ本文を `.tmp/*.part` へ書き、Tx-2 で `report_state=
         'prepared'` + 予定パスを書く。
@@ -3448,7 +3610,8 @@ class ImproveLoop:
                          "last_result":
                              f"report_failed:{safe_error_text(exc)}"}
                         if backlog_id is not None else None),
-                    commit=False)
+                    notice=NOTICE_REPORT_WRITE_FAILED, tool_calls=tool_calls,
+                    observation_text=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -3471,6 +3634,9 @@ class ImproveLoop:
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
                                         report_path, artifact, now,
+                                        notice: NoticeCode,
+                                        observation_choice: (
+                                            "_ObservationChoice | None") = None,
                                         gate_rows=(),
                                         tool_calls: int | None = None,
                                         candidate: _FinalCandidate | None = None,
@@ -3502,15 +3668,19 @@ class ImproveLoop:
         素の文字列である `reason` には型名の無い `safe_text` を使う —
         どちらも同じ `_URL_RE`/`_SECRET_RE` 抑止を共有する)。"""
         from agentic_fx.store import missions as missions_store
+        observation_text: str | None = None
         if quality_last_result is not None:
             observation_last_result = quality_last_result
         elif report_path is None and artifact.get("type") == "observation":
-            from agentic_fx._safe_error import safe_text
-            observation_reason = safe_text(str(artifact.get("reason", "")))
-            if observation_reason.startswith(("family_redirect:", "duplicate")):
-                observation_last_result = NOT_SUBMITTED_LAST_RESULT
-            else:
-                observation_last_result = f"observation:{observation_reason}"
+            choice = (observation_choice if observation_choice is not None
+                      else _select_observation(artifact))
+            if (observation_choice is not None
+                    and observation_choice.notice != notice):
+                raise ValueError("notice does not match the observation choice")
+            observation_last_result = choice.last_result
+            # 観察文を保存するのは、マスクされない agent の申告のときだけ。
+            observation_text = (choice.observation_text
+                                if notice == NOTICE_OBSERVATION else None)
         else:
             # D-15 是正: 設計書 §4.3 状態表の逐語は
             # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`
@@ -3542,7 +3712,8 @@ class ImproveLoop:
                     else ({"backlog_id": backlog_id, "status": "done",
                           "last_result": "reported"}
                           if backlog_id is not None else None)),
-                commit=False)
+                notice=notice, tool_calls=tool_calls,
+                observation_text=observation_text, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3647,15 +3818,14 @@ class ImproveLoop:
             f"mission={ctx.mission_id} status={result.status} "
             f"reason={reason_text}"
             f"{_tool_calls_suffix(getattr(result, 'tool_calls', None))}")
+        failed_class = _classify_failed_mission(result.status, result.reason)
         self._delete_staging(ctx)
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
         try:
             ledger_ids = self._persist_ledger_in_tx(
                 conn, ctx=ctx, now=now, mission_outcome="failed")
-            if (result.status in ("timeout", "max_turns") or
-                    (result.status == "failed" and
-                     is_tool_budget_abort(result.reason))):
+            if failed_class.writes_note:
                 entries = ctx.ledger.entries()
                 n_bt = sum(e["kind"] == "run_backtest" for e in entries)
                 n_corr = sum(e["kind"] == "analyze_corr" for e in entries)
@@ -3699,7 +3869,9 @@ class ImproveLoop:
                 slot_key=ctx.slot_key if slot_terminalize else None,
                 mission_status="failed",
                 run_result=None, now=now, backlog_transition=None,
-                commit=False)
+                notice=failed_class.notice,
+                tool_calls=getattr(result, "tool_calls", None),
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3741,7 +3913,8 @@ class ImproveLoop:
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "open", "last_result": None}
                     if backlog_id is not None else None),
-                commit=False)
+                notice=NOTICE_SANDBOX_UNAVAILABLE, tool_calls=tool_calls,
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3788,7 +3961,8 @@ class ImproveLoop:
                 conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
                 run_result=None, now=now, backlog_transition=None,
-                commit=False)
+                notice=NOTICE_OUTPUT_INVALID, tool_calls=tool_calls,
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3796,7 +3970,8 @@ class ImproveLoop:
         self._settle_ledger_after_commit(
             conn, ctx=ctx, ledger_ids=ledger_ids, outcome="output_invalid", now=now)
 
-    def _finalize_loser(self, conn, *, ctx, output, now) -> None:
+    def _finalize_loser(self, conn, *, ctx, output, now,
+                        tool_calls: int | None = None) -> None:
         """§4.2 手順2 敗者経路 (Tx-1 の選択 CAS で rowcount=0):
         backlog は一切遷移しない (自分は選択に負けただけで、勝者側の状態を
         壊さない — §4.3「遷移は起きない」)。親が「重複のため見送り」の
@@ -3832,7 +4007,9 @@ class ImproveLoop:
                     slot_key=ctx.slot_key, mission_status="completed",
                     run_result=None, now=now,
                     report_state="failed",
-                    backlog_transition=None, commit=False)
+                    backlog_transition=None,
+                    notice=NOTICE_REPORT_WRITE_FAILED, tool_calls=tool_calls,
+                    observation_text=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -3853,7 +4030,9 @@ class ImproveLoop:
                 slot_key=ctx.slot_key, mission_status="completed",
                 run_result="report", now=now,
                 report_path=str(final_path), report_state="prepared",
-                backlog_transition=None, commit=False)
+                backlog_transition=None,
+                notice=NOTICE_DUPLICATE_SKIPPED, tool_calls=tool_calls,
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -3924,7 +4103,8 @@ class ImproveLoop:
                               activity_extra: str = "",
                               candidate: _FinalCandidate | None = None,
                               candidate_outcome: str = "gate_failed",
-                              not_submitted: bool = False) -> None:
+                              not_submitted: bool = False,
+                              notice: NoticeCode) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
         `commit()` が `gate_failed:<...>`/`insufficient_trades:<n>` の形で
@@ -4028,7 +4208,8 @@ class ImproveLoop:
                          "last_result":
                              f"report_failed:{safe_error_text(exc)}"}
                         if backlog_id is not None else None),
-                    commit=False)
+                    notice=notice, tool_calls=tool_calls,
+                    observation_text=None, commit=False)
                 conn.commit()
             except BaseException:
                 conn.rollback()
@@ -4080,7 +4261,8 @@ class ImproveLoop:
                      "last_result": (NOT_SUBMITTED_LAST_RESULT
                                      if not_submitted else reason)}
                     if backlog_id is not None else None),
-                commit=False)
+                notice=notice, tool_calls=tool_calls,
+                observation_text=None, commit=False)
             conn.commit()
         except BaseException:
             conn.rollback()

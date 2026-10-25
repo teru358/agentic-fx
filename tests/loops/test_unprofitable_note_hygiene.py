@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.loops import improve_notice_codes as notice_codes
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import Mission, MissionResult
@@ -224,7 +225,8 @@ def test_n2_default_gate_failed_outcome_leaves_origin_outcome_null(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="insufficient_trades:5",
-        now=_NOW)
+        now=_NOW,
+        notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     row = _row_by_id(conn, note_id)
     assert row["origin_outcome"] is None
@@ -251,7 +253,8 @@ def test_n2_report_failed_branch_leaves_origin_outcome_null(
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable", now=_NOW,
         mission_outcome="unprofitable",
-        not_submitted=True)
+        not_submitted=True,
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     row = _row_by_id(conn, note_id)
     assert row["origin_outcome"] is None
@@ -454,7 +457,8 @@ def test_n4_rollback_in_same_tx_undoes_origin_outcome(
         loop_min._finalize_gate_failed(
             conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
             now=_NOW, mission_outcome="unprofitable",
-            not_submitted=True)
+            not_submitted=True,
+            notice=notice_codes.NOTICE_UNPROFITABLE)
 
     row = _row_by_id(conn, note_id)
     assert row["origin_outcome"] is None
@@ -685,7 +689,8 @@ def test_n8_annotated_row_origin_outcome_persists_after_later_termination(
 
     loop_full._finalize_gate_failed(
         conn, ctx=ctx2, backlog_id=annotated_id,
-        reason="insufficient_trades:2", now=_NOW)
+        reason="insufficient_trades:2", now=_NOW,
+        notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     row = _row_by_id(conn, annotated_id)
     assert row["last_result"] == "insufficient_trades:2"
@@ -717,7 +722,8 @@ def test_n9_out_of_order_termination_and_origin_annotation_coexist(
                     tmp_path / "source_b", frozen=True)
     loop_full._finalize_gate_failed(
         conn, ctx=ctx_b, backlog_id=note_id,
-        reason="insufficient_trades:2", now=_NOW)
+        reason="insufficient_trades:2", now=_NOW,
+        notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     row = _row_by_id(conn, note_id)
     assert row["last_result"] == "insufficient_trades:2"
@@ -731,7 +737,8 @@ def test_n9_out_of_order_termination_and_origin_annotation_coexist(
     loop_full._finalize_gate_failed(
         conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=_NOW,
         mission_outcome="unprofitable",
-        not_submitted=True)
+        not_submitted=True,
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     row = _row_by_id(conn, note_id)
     # 別列なので B の終端値は潰れない。A の系譜注記も両立して付く。
@@ -839,7 +846,8 @@ def test_s6_origin_update_does_not_annotate_other_missions_rows(
     loop_full._finalize_gate_failed(
         conn, ctx=ctx_a, backlog_id=None, reason="unprofitable", now=_NOW,
         mission_outcome="unprofitable",
-        not_submitted=True)
+        not_submitted=True,
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     assert _row_by_id(conn, row_a)["origin_outcome"] == "not_submitted"
     assert _row_by_id(conn, row_b)["origin_outcome"] is None
@@ -983,7 +991,8 @@ def test_l1_origin_update_failure_rolls_back_the_whole_terminal(
         loop_min._finalize_gate_failed(
             _FailingOriginUpdateConn(conn), ctx=ctx, backlog_id=backlog_id,
             reason="unprofitable", now=_NOW, mission_outcome="unprofitable",
-            not_submitted=True)
+            not_submitted=True,
+            notice=notice_codes.NOTICE_UNPROFITABLE)
 
     assert _row_by_id(conn, note_id)["origin_outcome"] is None
     mission_status = conn.execute(

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from agentic_fx.loops import improve_notice_codes as notice_codes
 from agentic_fx.loops.improve_loop import _best_label, best_candidate
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.improve_run_context import ImproveRunContext
@@ -278,7 +279,8 @@ def test_finalize_gate_failed_appends_index_row(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     text = _index_path(loop_min).read_text()
     assert f"| date | mission | status |" in text
@@ -308,7 +310,8 @@ def test_f4_5_finalize_gate_failed_index_status_is_unprofitable(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
-        now=NOW, mission_outcome="unprofitable")
+        now=NOW, mission_outcome="unprofitable",
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     text = _index_path(loop_min).read_text()
     assert f"mission {mission_id}" in text
@@ -339,7 +342,8 @@ def test_l7_f4_10_report_write_failure_index_status_is_report_failed(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="unprofitable",
-        now=NOW, mission_outcome="unprofitable")
+        now=NOW, mission_outcome="unprofitable",
+        notice=notice_codes.NOTICE_UNPROFITABLE)
 
     text = _index_path(loop_min).read_text()
     assert f"mission {mission_id}" in text
@@ -416,7 +420,8 @@ def test_index_append_is_fsynced(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     index_path = str(_index_path(loop_min))
     assert index_path in synced, synced
@@ -590,7 +595,8 @@ def test_index_header_written_only_once(
                [_backtest_entry(tmp, artifact_hash)])
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:1",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     mission_id2, run_id2, backlog_id2 = _second_mission(conn)
     tmp2 = tmp_path / "archive2"
@@ -599,7 +605,8 @@ def test_index_header_written_only_once(
                [_backtest_entry(tmp2, artifact_hash2)])
     loop_min._finalize_gate_failed(
         conn, ctx=ctx2, backlog_id=backlog_id2, reason="gate_failed:2",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     text = _index_path(loop_min).read_text()
     assert text.count("| date | mission | status |") == 1
@@ -635,7 +642,8 @@ def test_index_write_failure_does_not_break_termination(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     assert conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",

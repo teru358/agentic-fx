@@ -11,7 +11,8 @@ import pytest
 from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
-from agentic_fx.loops.improve_loop import _chmod_tree_readonly
+from agentic_fx.loops.improve_loop import (
+    ImprovePrepareFailed, _chmod_tree_readonly)
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
@@ -597,8 +598,11 @@ def test_prepare_failure_after_tx0_leaves_no_dangling_rows(
     else:
         monkeypatch.setattr(loop_full, injection_point, _boom)
 
-    with pytest.raises(OSError, match=injection_point):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop_full.prepare(slot_key=("2026-W50", 0), now=now)
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert injection_point in str(exc_info.value.__cause__)
+    assert exc_info.value.slot_key == ("2026-W50", 0)
 
     m = conn.execute("SELECT count(*) c FROM missions "
                      "WHERE status='running'").fetchone()["c"]
@@ -630,8 +634,11 @@ def test_prepare_failure_after_tx0_manual_one_shot_has_no_slot_to_terminalize(
 
     monkeypatch.setattr(loop_full, "_materialize_workspace", _boom)
 
-    with pytest.raises(OSError, match="_materialize_workspace"):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop_full.prepare(slot_key=None, now=now)
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "_materialize_workspace" in str(exc_info.value.__cause__)
+    assert exc_info.value.slot_key is None
 
     m = conn.execute("SELECT count(*) c FROM missions "
                      "WHERE status='running'").fetchone()["c"]
@@ -860,8 +867,10 @@ def test_prepare_compensation_failure_with_activity_none_preserves_original_exce
         improve_loop_mod.missions_store, "finish_improve_mission",
         _boom_compensation)
 
-    with pytest.raises(OSError, match="_materialize_workspace"):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop.prepare(slot_key=None, now=clock.now())
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "_materialize_workspace" in str(exc_info.value.__cause__)
 
 
 def test_build_worker_runner_passes_ctx_as_run_context(

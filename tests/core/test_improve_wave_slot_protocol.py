@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx.loops import improve_notice_codes as codes
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_runs as improve_runs_store
@@ -762,7 +763,8 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
                 conn, mission_id=mission_id, run_id=run_id,
                 slot_key=slot_key if slot_terminalize else None,
                 mission_status="failed", run_result=None, now=now,
-                backlog_transition=None, commit=False)
+                backlog_transition=None, commit=False,
+                notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
             conn.commit()
 
     fake_loop = _RealCommitFakeImproveLoop()
@@ -1465,7 +1467,8 @@ class _Round2FakeImproveLoop:
                 self._conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
                 run_result=None, backlog_transition=None, now=now,
-                commit=False)
+                commit=False,
+                notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
