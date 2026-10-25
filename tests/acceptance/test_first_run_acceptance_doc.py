@@ -6,12 +6,23 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 DOC = REPOSITORY / "docs" / "operations" / "first-run-acceptance.md"
+OPS_API_DOC = REPOSITORY / "docs" / "operations" / "ops-api-2026-10-09.md"
+README = REPOSITORY / "README.md"
 WIZARD = REPOSITORY / "src" / "agentic_fx" / "setup" / "wizard.py"
 INDICATORS = REPOSITORY / "src" / "agentic_fx" / "setup" / "indicators.py"
 
 
 def _doc() -> str:
     return DOC.read_text(encoding="utf-8")
+
+
+def _ops_api_doc() -> str:
+    return OPS_API_DOC.read_text(encoding="utf-8")
+
+
+def _principle_section() -> str:
+    text = _ops_api_doc()
+    return text.split("## CLI の置き場の原則", 1)[1].split("## 1. 前提と有効化の条件", 1)[0]
 
 
 def test_stage_headings_are_quoted_verbatim_from_the_wizard() -> None:
@@ -128,7 +139,7 @@ def test_observation_commands_and_journal_contract_are_present() -> None:
                     "loginctl show-user", "systemctl --user show afx.service -p InvocationID --value",
                     "journalctl --user -u afx.service -n 0 --show-cursor", "_SYSTEMD_INVOCATION_ID",
                     "USER_INVOCATION_ID", "--after-cursor", "-p ExecMainStatus -p NRestarts -p Result",
-                    "-p Wants -p Requisite -p PartOf -p After", "afx ctl status", "afx ops status",
+                    "-p Wants -p Requisite -p PartOf -p After", "afx ctl status", "afx ops web status",
                     "systemctl --user restart afx", "scripts/first-run-reset.sh", "git status --porcelain --ignored"):
         assert command in text, command
 
@@ -149,3 +160,67 @@ def test_document_carries_no_process_labels() -> None:
     for label in ("周目", "レビュー", "是正"):
         assert label not in text, label
     assert not re.search(r"\bT\d{1,2}[ab]?\b", text)
+
+
+def test_cli_placement_principle_keeps_the_seven_groups_in_surface_order() -> None:
+    section = _principle_section()
+    expected = [
+        "導入・接続管理", "稼働観測・実行追跡", "市場入力を整える", "調査・評価する",
+        "問い合わせ・改善運用", "Plugin を採否・配備する", "保護状態を回復する",
+    ]
+    rows = re.findall(r"^\| (.+?) \|", section, flags=re.MULTILINE)[1:8]
+    assert rows == expected
+
+
+def test_readme_links_to_the_canonical_cli_placement_principle() -> None:
+    assert "docs/operations/ops-api-2026-10-09.md#cli-placement-principle" in README.read_text(encoding="utf-8")
+
+
+def test_canonical_cli_names_are_listed_in_their_one_home_group() -> None:
+    section = _principle_section()
+    homes = {
+        "afx status": "稼働観測・実行追跡",
+        "afx ctl status": "稼働観測・実行追跡",
+        "afx check backend": "導入・接続管理",
+        "afx ctl backlog add": "問い合わせ・改善運用",
+        "afx ctl backlog list": "問い合わせ・改善運用",
+        "afx ctl policy show": "問い合わせ・改善運用",
+        "afx ctl policy remove": "問い合わせ・改善運用",
+        "afx ctl policy reconcile": "問い合わせ・改善運用",
+        "afx plugin list": "Plugin を採否・配備する",
+    }
+    for command, group in homes.items():
+        row = re.search(rf"^\| {re.escape(group)} \|.*$", section, flags=re.MULTILINE)
+        assert row, group
+        assert command in row.group(0), command
+
+
+def test_current_user_documents_do_not_present_deprecated_cli_names_as_commands() -> None:
+    paths = [README, *(REPOSITORY / "docs" / "operations").glob("*.md")]
+    text = "\n".join(
+        line for path in paths for line in path.read_text(encoding="utf-8").splitlines()
+        if "旧名" not in line and "旧形" not in line
+    )
+    assert "afx improve verify-backend" not in text
+    assert "afx ctl improve add" not in text
+    assert not re.search(r"afx ops (enable|disable|status) (bot|web|notify|<feature>)", text)
+
+
+def test_cli_placement_principle_records_labels_for_both_lanes() -> None:
+    section = _principle_section()
+    for label in ("[読取]", "[変更]", "[確認]", "[approver]"):
+        assert label in section
+    assert "`afx`（daemon 不要）" in section
+    assert "`afx ctl`（稼働 daemon）" in section
+
+
+def test_new_ops_feature_then_verb_form_is_in_operator_guides() -> None:
+    for path in (DOC, OPS_API_DOC):
+        text = path.read_text(encoding="utf-8")
+        assert "afx ops <feature> enable|disable|status" in text
+
+
+def test_ops_api_document_pins_backlog_usage_and_managed_only_policy_removal() -> None:
+    text = _ops_api_doc()
+    assert "afx ctl backlog list [--all] [--limit N]" in text
+    assert "削除できるのは ID marker 付きの managed 行だけで、marker 外の手書き行と legacy 行は削除できない" in text

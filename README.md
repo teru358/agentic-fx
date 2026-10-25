@@ -2,6 +2,8 @@
 
 決定論的な資金保護コアと、取引判断・改善の二つの agent loop を組み合わせた FX 自動トレードシステムです。まずはペーパー運用で、設定と未完の手順を確認しながら育てます。
 
+停止中の設定・記録を診断するときは `afx status`、稼働中 daemon の状態と未完の手順を見るときは `afx ctl status` を使います。daemon の生きた状態が必要かで入口を選ぶ全体の規則は、[CLI の置き場の原則](docs/operations/ops-api-2026-10-09.md#cli-placement-principle)を参照してください。
+
 前提は Ubuntu 22 以降、Python 3.12 と uv、systemd user session、Node.js と `claude` または `codex` CLI、または llama-swap です。改善ループの隔離には Linux 6.18 以降 (Landlock ABI 8) が必要です。
 
 ```bash

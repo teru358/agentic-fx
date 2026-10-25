@@ -13,7 +13,7 @@ journalctl --user -u afx
 afx ctl status
 ```
 
-承認、方針、改善の操作は `afx ctl` を入口にします。bot / web / notify は `afx ops enable <feature>` で有効化します。詳細は [操作 API と afx ctl の運用](ops-api-2026-10-09.md) を参照してください。
+承認、方針、改善の操作は `afx ctl` を入口にします。bot / web / notify は `afx ops <feature> enable` で有効化します。詳細は [操作 API と afx ctl の運用](ops-api-2026-10-09.md) を参照してください。
 
 起動ガードは、ops の有効化が途中なら rc 75、初期設定の確定途中なら rc 76 でサービスを停止します。marker を残した操作を同じ入口から再実行して収束させてください。
 

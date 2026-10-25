@@ -80,14 +80,15 @@ client は鍵を送る前に、socket の型・所有者・親 dir 0700、`SO_PE
 |`approvals.detail`|親記録、agent claims、holdout / in-sample 数値、reject reason を含む承認詳細の閲覧|approval detail|
 |`logs.read`|log と activity の閲覧|log、activity|
 |`jobs.own`|同じ `(authenticated_principal, asserted_actor)` が作成した job の閲覧と queued cancel|job get / cancel|
+|`guidance.read`|backlog と policy の読取|backlog list、policy show|
 |`operate`|資金保護と採用に直接触れない日常操作|ask、improve、backlog、policy、reflection retry|
 |`decide`|plugin 承認依頼の approve / reject / retry|決定 3 本|
 |`local_guard`|kill switch 解除、解除途中状態の確定、data resume|UDS 上の 3 本だけ|
 
 |principal|scope|`decided_by`|鍵|
 |---|---|---|---|
-|`operator`|`status.read events.read approvals.list approvals.detail logs.read jobs.own operate`|—|`operator.token`|
-|`approver`|`status.read events.read approvals.list approvals.detail logs.read jobs.own operate decide local_guard`|`api:approver`|`approver.token`|
+|`operator`|`status.read events.read approvals.list approvals.detail logs.read jobs.own guidance.read operate`|—|`operator.token`|
+|`approver`|`status.read events.read approvals.list approvals.detail logs.read jobs.own guidance.read operate decide local_guard`|`api:approver`|`approver.token`|
 |`ops-bot`|`status.read events.read approvals.list approvals.detail jobs.own decide`|`api:ops-bot`|`ops-bot.token`|
 |`ops-web`|`status.read events.read approvals.list approvals.detail logs.read`|—|`ops-web.token`|
 |`ops-notify`|`events.read`|—|`ops-notify.token`|
@@ -149,11 +150,15 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |12|`reflect retry <order_id>`|`POST /v1/reflections/{order_id}/retry`|operate|`Idempotency-Key` 必須。body に client が行 12b で見た試行記録の識別子 (`expected_attempts`、`expected_last_attempt_at`、記録なしは `0` / null) を必須で送り、台帳の現在値と一致する場合だけ clear する。不一致は 409 `attempt_changed` で無変更。closed かつ reflection 未済の条件は従来どおり|
 |12b|—|`GET /v1/reflections/{order_id}`|status.read|order の status、reflection の有無、試行台帳 (`attempts`、`last_attempt_at`) の現在値。自由文の `last_reason` は返さない|
 |13|`improve`|`POST /v1/improve/runs` → job|operate|冪等 key、同時 1 本、停止時 join|
-|14|`improve add <idea>`|`POST /v1/backlog`|operate|冪等 key、1〜2,000 文字|
+|14|`backlog add <idea>`|`POST /v1/backlog`|operate|冪等 key、1〜2,000 文字|
 |15|`backlog reject <id>`|`POST /v1/backlog/{id}/reject`|operate|状態条件付き UPDATE|
 |16|`backlog reopen <id>`|`POST /v1/backlog/{id}/reopen`|operate|状態条件付き UPDATE、selected 不可|
 |17|`backlog note <id>`|`POST /v1/backlog/{id}/note`|operate|状態条件付き UPDATE|
 |18|`policy add <text>`|`POST /v1/policy`|operate|冪等 key。既存 `directives_path(root)` 配線を ops 層で再利用|
+|新|`backlog list [--all] [--limit N]`|`GET /v1/backlog`|guidance.read|open を既定で返し、`--all` は全 status、limit は 1〜500|
+|新|`policy show`|`GET /v1/policy`|guidance.read|managed / unmanaged と projection (`ok` または `stale` と理由) を読むだけで返す|
+|新|`policy remove <id>`|`POST /v1/policy/{id}/remove`|operate|ID marker 付き managed row だけを削除する|
+|新|`policy reconcile`|`POST /v1/policy/reconcile`|operate|明示的に投影を再生成し、changed と projection を返す|
 |19|`stop`|**廃止: endpoint に載せない**|—|systemd の SIGTERM を使う|
 |-|`help`|client 内|—|server へ送らない|
 |新|—|`GET /v1/approvals/{id}/change`|`approvals.detail`|承認の変更内容。3 ファイルの構造化 diff (redaction 済み・escape なし・応答上限 512 KiB)、変更要約、申告。web だけが読み、bot は呼ばない。内容が取れないときは 200 で固定 reason code。計算は読み出し時で、どこにも保存しない (承認の中身を見せる設計 §5)|
@@ -162,7 +167,7 @@ approve と retry は表示した `payload_json` の SHA-256 を必須とし、�
 |新|—|`POST /v1/jobs/{id}/cancel`|`jobs.own`|所有者の組が一致する queued だけ cancelled、running は 409。`ops-bot` は決定作成時と同じ `X-Afx-Asserted-Actor` 必須|
 |新|—|`GET /v1/events?after=&limit=`|`events.read`|DB cursor 後の通知用投影。limit 1〜500、長い待受はしない|
 
-実装する endpoint は 25 本で、内訳は変更系 15 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy、jobs cancel) と読取 10 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、reflection 試行記録、whoami、job get、events) である。このうち冪等 key 必須は 5 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
+実装する endpoint は 29 本で、内訳は変更系 17 本 (POST: asks、data/resume、approve、reject、retry、killswitch/reset、killswitch/reconcile、reflections retry、improve/runs、backlog add、backlog reject / reopen / note、policy add / remove / reconcile、jobs cancel) と読取 12 本 (status、log、activity、approval 詳細、approval 変更内容、approval 一覧、reflection 試行記録、whoami、job get、events、backlog list、policy show) である。このうち冪等 key 必須は 7 本、`local_guard` は 3 本 (reset、reconcile、data resume)、決定は 3 本である。
 
 ### 4.3 event 契約
 
@@ -307,7 +312,7 @@ activity は best-effort の人向け投影で、読み取り要求は DEBUG、�
 
 |ID|観測できる条件|
 |---|---|
-|AC-1|実 UDS で 25 endpoint を全数実行し、期待する HTTP / error code を得る|
+|AC-1|実 UDS で 29 endpoint を全数実行し、期待する HTTP / error code を得る|
 |AC-2|鍵なし / 不一致は 401、operator の decide / local_guard は 403、approver は成功する|
 |AC-3|service 子 process は正しい鍵でも本文読取前に 403、activity と notifier に記録。二重 fork は既知の限界として通る再現 test を持つ|
 |AC-3b|接続直後に peer が exit し pidfd が `Pid:-1`、または pid 不一致なら 403|
@@ -444,3 +449,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-15|v1.18|I-36 に status.setup の固定 code を列挙 (`improve_isolation_unavailable` を追加。実装の `_STATUS_SETUP_CODES` と一致させる)|first-run fr-fix1 で新 code を足したため正本に列挙を置いた||
 |2026-10-19|v1.19|§3.3 に申告の見出し分離を追記し、`GET /v1/approvals/{id}/change` を足した (endpoint 25 本)。`approval_detail` に `change` 要約を足す|承認の中身を見せる設計 v1.0 (T1)|
 |2026-10-20|v1.20|§4.3 の event 表に `order_state_changed` / `position_closed` を追加し、daemon の `events.poll` は high watermark と行の取得を 1 つの読み取り tx にした|取引通知の設計書 v1.0 (T2)||
+|2026-10-25|v1.21|backlog / policy の読取と policy の remove / reconcile を route・scope 表へ追加し、endpoint 数を 29 本に更新|CLI surface の現行運用名と API 契約を同期するため||

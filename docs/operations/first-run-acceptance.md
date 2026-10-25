@@ -131,9 +131,25 @@ uv run afx init
    systemctl --user is-active afx          # 1. サービス
    uv run afx ctl status                   # 2. 操作 API (認証つきの status)。repo の root で打つ
    systemctl --user is-active afx-ops@web  # 3. ops の feature (有効にしたものの名前に置き換える)
-   uv run afx ops status web
+   uv run afx ops web status
    journalctl --user -u afx | grep 'improve isolation'   # 改善 backend の隔離適合 (admission) の行
    ```
+
+   backend の実往復は、使う backend を明示して `afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]` で確認します。接続できれば backend の確認結果が出て rc=0、未導入・未認証・隔離不適合なら固定 reason と次の手順が出ます。
+
+   停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは詳細を読まず、稼働 daemon の状態が必要なら `afx ctl status` を使います。
+
+   稼働 daemon に課題を足すには `afx ctl backlog add <idea>` を実行し、`backlog #<id> を追加しました: …` が出ることを確認します。方針の確認と回復は次のとおりです。
+
+   ```
+   afx ctl policy show
+   afx ctl policy remove <id>
+   afx ctl policy reconcile
+   ```
+
+   `policy show` は「管理対象:」「管理外 (API から削除できません):」「投影: ok」、または理由を伴う `投影: stale (...)` を出します。`policy remove` は managed の ID だけを消し `policy remove: #<id>`、`policy reconcile` は `policy reconcile: changed` または `policy reconcile: unchanged` を出します。
+
+   ops の通常手順は `afx ops <feature> enable|disable|status` です。たとえば `afx ops web enable`、`afx ops web status` の順に実行し、後者が feature の durable stage を表示することを確認します。
 
 4. release の受入では、Landlock ABI 8 以上の実機 (Linux 6.18 以降) で実隔離の integration を 2 段で通します。
 
@@ -536,7 +552,7 @@ unit (afx.service) を設置しました。
   - `systemctl` コマンドが無い: 「systemd のユーザーサービスが使えません。手で起動するには `uv run afx` を実行してください」。記録の理由は `systemd_unavailable`。
   - `systemctl` はあるが `XDG_RUNTIME_DIR` が無く、ユーザーセッションに繋がらない: 「systemd のユーザーセッションが見えません (XDG_RUNTIME_DIR が無い)。`su` ではなく <user> で直接ログインして `afx init` を再実行してください」。記録の理由は `user_session_missing`。対象ユーザーで直接ログインして実行します。
   - `systemctl` があり `XDG_RUNTIME_DIR` もあるのに失敗する: 上の 1 つ目と同じ文面。記録の理由は `systemd_unavailable`。
-- 外から見る手段に `y` を選ぶと `有効にする手段 (カンマ区切り。空 Enter = あとで): ` を尋ね、選んだものごとに `afx ops enable` の質問が続きます (token などは端末から直接入力し、この文書にも記録にも残りません)。
+- 外から見る手段に `y` を選ぶと `有効にする手段 (カンマ区切り。空 Enter = あとで): ` を尋ね、選んだものごとに `afx ops <feature> enable` の質問が続きます (token などは端末から直接入力し、この文書にも記録にも残りません)。
 - linger が `no` のときだけ次を尋ねます。
 
   ```
@@ -794,7 +810,7 @@ rm -- data/state/setup_in_progress                           # 印を消す
 systemctl --user reset-failed afx
 ```
 
-期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76`)。終了コード 75 は `afx ops enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
+期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76`)。終了コード 75 は `afx ops <feature> enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
 
 ### 6.6 依存の実効値
 
@@ -809,13 +825,13 @@ systemctl --user show afx-ops@web.service -p Wants -p Requisite -p PartOf -p Aft
 
 ```
 systemctl --user is-active afx-ops@web
-uv run afx ops status web
+uv run afx ops web status
 uv run afx ctl status
 # 鍵が見えない環境の拒否 (HOME を空の dir に向ける。鍵は $HOME/.config に置かれる)
 d=$(mktemp -d) && HOME=$d .venv/bin/afx ctl status; echo "rc=$?"; rmdir "$d"
 ```
 
-期待: ops が `active` で、`afx ops status` が ready、`afx ctl status` が成功する。ops の READY は操作 API の server 認証が通った後にだけ送られる。鍵が見えない環境では `afx ctl status` が rc=3 で拒否する。
+期待: ops が `active` で、`afx ops web status` が ready、`afx ctl status` が成功する。ops の READY は操作 API の server 認証が通った後にだけ送られる。鍵が見えない環境では `afx ctl status` が rc=3 で拒否する。
 
 ### 6.8 ops の restart 連動
 

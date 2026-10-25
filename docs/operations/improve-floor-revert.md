@@ -66,6 +66,8 @@ systemctl --user status afx --no-pager
 
 現在の実装には、`min_pf`、`require_positive_avg_r`、`require_holdout_evaluable` を daemon の active snapshot として表示する `afx ctl` コマンドも、起動 journal の記録行もありません。`afx ctl status` はこの3値を表示しません。
 
+停止中の設定・記録を読む診断は `afx status`、稼働 daemon の状態と未完の手順は `afx ctl status` を選びます。plugin の候補一覧は `afx plugin list`、配備済みの版と deploy op の詳細は `afx plugin versions <name>` を使います。
+
 したがって、この3値だけを daemon 内部から直接確認する面は未提供です。ここで `config/settings.yaml` の再読だけを active snapshot の確認として扱ってはいけません。再起動の成否を確認し、次の承認 payload を実効確認面として確認します。
 
 ```bash
