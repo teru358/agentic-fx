@@ -2129,3 +2129,38 @@ def test_migrate_improve_wave_slots_mission_fk_skips_backup_when_already_migrate
     init_db(conn)  # fresh は _SCHEMA が FK 付きで作るため rebuild 不要
     assert not (
         tmp_path / "fresh.db.bak-improve-wave-slots-mission-fk").exists()
+
+
+def test_connect_existing_rw_closes_the_connection_when_a_pragma_fails(tmp_path, monkeypatch):
+    import sqlite3
+    from agentic_fx.store import db as store_db
+    path = tmp_path / "agentic.db"
+    sqlite3.connect(path).close()
+    opened = []
+
+    class Wrapped:
+        def __init__(self, conn):
+            self.conn = conn
+            opened.append(conn)
+
+        def __setattr__(self, name, value):
+            if name == "conn":
+                object.__setattr__(self, name, value)
+            else:
+                setattr(self.conn, name, value)
+
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA foreign_keys"):
+                raise sqlite3.OperationalError("boom")
+            return self.conn.execute(sql, *args)
+
+        def close(self):
+            self.conn.close()
+
+    real = sqlite3.connect
+    with monkeypatch.context() as patch:
+        patch.setattr(store_db.sqlite3, "connect", lambda *a, **k: Wrapped(real(*a, **k)))
+        with pytest.raises(sqlite3.OperationalError):
+            store_db.connect_existing_rw(path)
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")

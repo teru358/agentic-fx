@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from agentic_fx.setup.pending_text import PendingStep, render_pending_step
+from agentic_fx.setup.pending_text import PendingStep, render_pending_step, is_ident
 from agentic_fx.store.setup_record import SetupRecord
 from agentic_fx.core.improve_admission import MIN_LANDLOCK_ABI
 
@@ -34,6 +34,7 @@ class PendingFacts:
     service_active: bool | None = None
     data_state: str | None = None
     extra_steps: list[PendingStep] = field(default_factory=list)
+    failing_news_sources: tuple[str, ...] = ()
 
 
 def _get(value: object | None, *names: str, default=None):
@@ -66,6 +67,33 @@ def _at(facts: PendingFacts, value: object = None) -> datetime:
 def _step(facts: PendingFacts, code: str, severity: str, params: Mapping[str, Any] = {}, *,
           at: object = None, visible_in_status: bool = True) -> PendingStep:
     return PendingStep(code, severity, _at(facts, at), dict(params), visible_in_status)
+
+
+NEWS_LISTED_MAX = 5
+
+
+def _news_steps(facts: PendingFacts, room: int) -> list[PendingStep]:
+    """Failing-source rows, always after every other step.
+
+    At most five individual rows (by name); further sources and names that do
+    not fit the ident grammar fold into one summary row.  When the block does
+    not fit in `room`, the last slot becomes the summary and its count is
+    recomputed from what is not shown.  With no room nothing is added.
+    """
+    names = sorted(set(facts.failing_news_sources))
+    fit = [name for name in names if is_ident(name)]
+    rows = [_step(facts, "news_source_failing", "warn", {"name": name})
+            for name in fit[:NEWS_LISTED_MAX]]
+    folded = len(names) - len(rows)
+    if room <= 0 or not names:
+        return []
+    if len(rows) + (1 if folded else 0) <= room:
+        if folded:
+            rows.append(_step(facts, "news_source_failing_more", "warn", {"count": folded}))
+        return rows
+    shown = rows[:room - 1]
+    return shown + [_step(facts, "news_source_failing_more", "warn",
+                          {"count": len(names) - len(shown)})]
 
 
 def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[PendingStep]:
@@ -167,4 +195,7 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
     steps.extend(facts.extra_steps)
     if for_status:
         steps = [step for step in steps if step.visible_in_status]
+    steps = steps[:MAX_PENDING_STEPS]
+    if facts.record_state != "corrupt":
+        steps.extend(_news_steps(facts, MAX_PENDING_STEPS - len(steps)))
     return steps[:MAX_PENDING_STEPS]

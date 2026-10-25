@@ -17,12 +17,12 @@ from agentic_fx.entry import main as entry_main
 
 
 TOP_HELP = """usage: afx [-h] [--daemon] [--root DIR]
-           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
+           {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
@@ -31,6 +31,7 @@ positional arguments:
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
+    news                [下位操作ごと] 市場ニュース源を扱う
     backtest            [変更] バックテスト
     analyze             [変更] 履歴分析
     plugin              [下位操作ごと] plugin の採否・配備・表示
@@ -47,7 +48,7 @@ options:
 用途                     daemon 不要                稼働 daemon
 導入・接続管理           init / check / keys / ops  ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
-市場入力を整える         history                    —
+市場入力を整える         news / history             —
 調査・評価する           backtest / analyze         —
 問い合わせ・改善運用     —                          ctl ask / improve / backlog / policy / reflect
 Plugin を採否・配備する  plugin                     ctl approval / approve / reject
@@ -77,6 +78,29 @@ options:
   afx ops web reconfigure         [変更] afx に触れずに設定を変える (別名 reconf)
 
 旧形 `afx ops enable|disable|status <feature>` は 0.2.0 だけ受け付け、0.3.0 で削除する。
+"""
+
+NEWS_HELP = """usage: afx news [-h] {list,add,enable,disable,test} ...
+
+市場ニュース源を扱う
+
+positional arguments:
+  {list,add,enable,disable,test}
+    list                [読取] 源を一覧する
+    add                 [変更] 源を追加する (0 件のとき確認)
+    enable              [変更] 源を有効にする (次の収集周期で反映)
+    disable             [変更] 源を無効にする (次の収集周期で反映)
+    test                [読取] 源を 1 回取得して確認する
+
+options:
+  -h, --help            show this help message and exit
+
+操作:
+  afx news list  [読取] 源を一覧する
+  afx news test <name>  [読取] 源を 1 回取得して確認する
+  afx news add <name> <url> [--fetcher feed|web] [--yes]  [変更] 源を追加する (0 件のとき確認)
+  afx news enable <name>  [変更] 源を有効にする (次の収集周期で反映)
+  afx news disable <name>  [変更] 源を無効にする (次の収集周期で反映)
 """
 
 COMPLETION_HELP = """usage: afx completion [-h] {bash} ...
@@ -149,6 +173,7 @@ def test_public_help_matches_the_surface_golden(capsys):
     assert _captured_help(["--help"], capsys) == TOP_HELP
     assert _captured_help(["ops", "--help"], capsys) == OPS_HELP
     assert _captured_help(["completion", "--help"], capsys) == COMPLETION_HELP
+    assert _captured_help(["news", "--help"], capsys) == NEWS_HELP
     assert entry_main(["ctl", "help"]) == 0
     assert capsys.readouterr().out == CTL_HELP
 
@@ -219,13 +244,15 @@ def test_metadata_summary_mutation_changes_the_rendered_help():
 def test_help_golden_is_uncolored_narrow_and_hides_compatibility_choices(capsys, monkeypatch):
     for variable in ("FORCE_COLOR", "NO_COLOR", "PYTHON_COLORS", "TERM", "CLICOLOR", "CLICOLOR_FORCE"):
         monkeypatch.delenv(variable, raising=False)
-    output = _captured_help(["--help"], capsys) + _captured_help(["ops", "--help"], capsys)
+    output = (_captured_help(["--help"], capsys) + _captured_help(["ops", "--help"], capsys)
+              + _captured_help(["news", "--help"], capsys))
     for line in output.splitlines():
         width = sum(2 if unicodedata.east_asian_width(char) in {"F", "W", "A"} else 1
                     for char in line)
         assert width <= 100, line
     assert "{improve" not in output
-    assert "news" not in output
+    assert "    news                [下位操作ごと] 市場ニュース源を扱う" in output
+    assert "{list,add,enable,disable,test}" in output
     assert "reconf}" not in output
     assert "<feature> enable|disable|status" not in output
 
@@ -360,7 +387,9 @@ def test_exposure_is_explicit_and_never_inferred():
 _FIXED_WIDTH_HELPS = (
     ["--help"], ["ops", "--help"], ["ops", "bot", "--help"], ["ops", "web", "--help"],
     ["ops", "notify", "--help"], ["completion", "--help"], ["history", "--help"], ["plugin", "--help"],
-    ["backtest", "--help"], ["analyze", "--help"],
+    ["backtest", "--help"], ["analyze", "--help"], ["news", "--help"],
+    ["news", "list", "--help"], ["news", "add", "--help"], ["news", "enable", "--help"],
+    ["news", "disable", "--help"], ["news", "test", "--help"],
 )
 
 
@@ -404,7 +433,7 @@ def test_top_overview_rows_follow_the_records():
         r for r in records if r.command.split()[0] != "history" and r.command != "ctl whoami"))
     rows = {group.value: line for line in renderer.render_top_epilog().splitlines()
             for group in cli_surface.Group if line.startswith(group.value)}
-    assert rows["市場入力を整える"].split() == ["市場入力を整える", "—", "—"]
+    assert rows["市場入力を整える"].split() == ["市場入力を整える", "news", "—"]
     assert rows["導入・接続管理"].split() == [
         "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "—"]
     assert "history" not in "".join(rows.values())
@@ -571,7 +600,6 @@ def test_every_exposed_local_record_has_one_argparse_node_and_no_other_node_exis
     expected |= {f"afx {parent.command}" for parent in cli_surface.PARENTS
                  if not parent.command.startswith("ctl ") and parent.command != "ctl"}
     exceptions = {"afx ctl"}  # `afx ctl` is handed to the client before argparse; only its help row is registered
-    assert "afx news" not in registered  # planned, not yet a command
     assert set(registered) - exceptions == expected
     assert exceptions <= set(registered)
 

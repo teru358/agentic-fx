@@ -7,6 +7,7 @@
   {"expect": "価格源", "send": "3", "comment": "段 3 価格源: 3 = 使わない (yfinance などを使う)"},
   {"expect": "価格源", "send": "1", "comment": "段 3: 1 = yfinance"},
   {"expect": "1 回問い合わせて確認します", "send": "y", "comment": "段 3: yfinance への 1 回の問い合わせに同意"},
+  {"expect": "ニュース源 (名前 URL、空 Enter で飛ばす)", "send": "", "comment": "段 3 ニュース源: 空 Enter で飛ばす"},
   {"expect": "LLM の構成", "send": "2", "comment": "段 4: 2 = 取引判断に Claude (改善の既定は Codex)"},
   {"expect": "のモデル (番号 / m = 手入力)", "send": "", "comment": "段 4 取引判断のモデル: 既定 (sonnet)"},
   {"expect": "trade 用の `claude -p` を 1 往復で試験します", "send": "y", "comment": "段 4: claude -p の 1 往復に同意"},

@@ -364,7 +364,7 @@ news_sources: id, name, fetcher (feed | web), url,
 
 - 根拠: ①ソース追加はデータ 1 行で機械検証できるが、plugin はコード審査が重い ②新しい取得方式が必要になるのは年数回程度で、news 側に plugin 機構を持つのは YAGNI ③fetcher (HTML 抽出・外部依存) は local LLM が最も失敗しやすいコードであり、改善ループに書かせず人間が保守する方が安全
 - 新しい取得方式 (認証付き API 等) が必要になった場合は、改善ループの提案レポートを受けて**人間が** fetcher を追加する (改善ループは本体コードを書けない — 上記「出力の 2 経路」)
-- **ユーザーによる追加コマンド**: `news add <url> [--name]` (§8)。fetcher (feed/web) を自動判定し、機械検証 (URL 到達性・parse 成功・重複) を実行して登録する。`added_by=user` は自分の意思による追加のため**人間承認は不要** (機械検証のみで enabled)。agent 追加は従来通り approval_requests を通す
+- **利用者による追加**: 最上位コマンド `afx news add <name> <url> [--fetcher feed|web]` (2026-10-25 裁定、`2026-10-25-news-source-cli-design.md`)。追加の前に 1 回だけ取得して件数を見せ、0 件は確認し、文法・重複を検査して登録する。`added_by=user` で有効。daemon 停止中でも動き、操作は人間だけが行う。`afx init` にも名前と URL を入れる副段がある (初回ウィザード設計 段 3)。~~agent 追加は approval_requests を通す~~ は廃止 (2026-09-07 裁定で agent 経路そのものを廃止済み)
 
 ### plugin 機構
 
@@ -394,7 +394,7 @@ news_sources: id, name, fetcher (feed | web), url,
 - **命名について**: 傘の呼称は `plugin` を維持する。`strategy` は 3 種別の 1 つの名前として使うため、傘と種別が同名になる衝突を避ける
 - **config.yaml の変更に再承認免除は無い** (裁定 2026-08-11 — 旧「人間がローカルで明示的に編集した場合のみ免除」は**廃止**): 編集主体 (人間 / agent) はファイル内容からもハッシュからも判別できず、免除経路を設けると agent がそれを装う迂回を原理的に塞げない。**あらゆる内容変更は新しい content_hash への承認が必要** (現実装も従来からハッシュ一致のみで判定しており、実態の追認でもある)。人間が自分で編集した場合は bless CLI で自分の変更を即時承認すればよい (コストは 1 コマンド)。**agent による `strategy` の config.yaml 変更は戦略採用ゲート (下記) を通す** — パラメータ変更は戦略結果を直接変えるため、承認迂回経路にしない。`indicator` / `signal` の config 変更は各種別の検証手段 (§6 分類表: pytest / 検出精度) + 人間承認で足りる (収益バックテストは帰属不能のため課さない)
 - **サンドボックス実行**: 「純関数・I/O 禁止」は規約だけでは強制できない (import 時の任意コード実行を pytest では防げない) ため、plugin は**サービスプロセスに直接 import せずサブプロセスで実行**し、入力 (OHLCV DataFrame) と出力 (JSON) だけを IPC で渡す。ロード時に **AST 検査 + import allowlist** (numpy / pandas / math 等の計算系のみ) で禁止 import を拒否する。サブプロセスには**最小限の環境変数のみ渡し (秘密情報・broker 資格情報は渡さない)**、作業ディレクトリを限定し、CPU 時間・メモリ・プロセス数を resource limit で制限、タイムアウト・出力サイズ制限を課す。これらは**到達を最小化する多層防御であり完全な隔離の保証ではない** — だからこそ plugin の採用には人間承認を必須とする
-- 素の clone でも動くよう、組み込みデフォルト実装 (基本指標 + 基本ニュースソース数件の `news_sources` 初期データ) は `src/` 側にコミットする
+- 素の clone でも動くよう、組み込みデフォルト実装 (基本指標) は `src/` 側にコミットする。~~基本ニュースソース数件の `news_sources` 初期データの同梱~~ は廃止した (2026-10-25 裁定: ニュース源は利用者が `afx init` の副段または `afx news add` で選ぶ。起動時にも自動登録しない)
 - サンプル plugin を `docs/examples/plugins/` にコミットし、LLM のリサーチ→実装時の参照テンプレートにする
 - **plugin 原本の履歴管理 (プラン 9 で実装)**: 現状は承認台帳 (`approval_requests` の `content_hash`) はあるが**原本の履歴が無い** — 改善ループが plugin を上書きすると前の版が失われ、承認済み状態へ戻せない。そこで `plugins/` 配下を**親から独立した入れ子 git リポジトリ**とし、生成物に履歴とロールバックを持たせる (価値は改善ループが plugin を上書きし始めた時点から発生するため、実装はプラン 9 と同時でよい)。確定 3 点: ①**submodule にしない** (親リポジトリに gitlink が入り、切り離したはずの結合が戻る) ②**commit を打つのは親プロセスのみ** (worker はファイルを書くだけ。承認時に親が commit する — worker に exec 権が不要になり、履歴が「承認済み状態の歴史」になる) ③**git 操作の失敗を資金保護に波及させない** (取引・SL/TP 監視は plugin 履歴と無関係に継続する)。ただし**承認の有効化は原本保全と切り離さない** — 「履歴 = 承認済み状態の歴史」は commit が承認の有効化に先行するときだけ成立するため、commit 失敗時は承認決定を保留 (pending のまま再試行 + 通知) とし、原本を保全できないまま plugin を有効化しない (fail closed)。**承認有効化の不変条件** (詳細設計はプラン 9): ⓐ**決定時に content_hash を再計算し申請時ハッシュと照合**する — 申請〜承認操作の間に plugin が上書きされた場合は承認を成立させない (submit 時の再照合だけでは不十分) ⓑcommit は**対象 plugin のパスに限定**する (無関係な作業中ファイルを「承認済み状態」に混入させない) ⓒ**同一対象への決定は直列化**する ⓓcommit 失敗で保留中の承認より**後発の決定が優先** — 後発 reject が付いたら保留中の古い承認は失効させ、再試行で復活させない
 
@@ -566,18 +566,18 @@ tooldef を経由せず直接 agent 側へ晒す経路を新設してはなら�
 人間承認が必要な事象を一元管理する汎用テーブル:
 
 ```
-id, kind (plugin | news_source | live_trade), payload_json,
+id, kind (plugin | live_trade。news_source は廃止), payload_json,
 status (pending | approved | rejected | expired | invalidated),
 reason, decided_by, decided_at, message_id, expires_at, created_at
 ```
 
 - `kind=plugin`: 改善ループが plugin を書いたら発行。payload は plugin パス・`kind` (indicator/signal/strategy)・要約・テスト結果・バックテスト結果 (strategy/signal のみ)。承認されるまでロードされない
-- `kind=news_source`: ニュースソース追加 (**agent 追加時のみ発行**。user 追加は機械検証成功後に直接 enabled — §6)。payload はソース情報 + 機械検証結果 (URL 到達性・parse 成功・取得サンプル)。承認されるまで `news_sources.enabled` にならない
+- ~~`kind=news_source`: ニュースソース追加 (agent 追加時のみ発行)~~ **廃止 (2026-09-07 裁定で agent 経路を廃止、2026-10-25 に人間の `afx news` へ一本化)**。この kind は発行しない。ニュース源の追加・有効化・無効化は人間の運用操作で、承認は通さない
 - `kind=live_trade` (Phase 3): 取引モード (手動承認時) の open intent。payload は TradeIntent 全体。expires_at 超過で自動 expired。autopilot on の間は発行されない (§5)
 - `status=invalidated`: live_trade の承認時再検証 (§5) に失敗した場合の終端状態 (理由を reason に記録)
 - 決定の反映は冪等 (二重承認は 409 相当で拒否)
 - **kind=plugin の同一対象への複数決定の規則 (裁定 2026-08-11、プラン 7 T3-3)**: 個々の行の決定は冪等だが、**同一対象 (name, content_hash) に決定済み行が複数併存し得る** — 例: 承認済みハッシュに対し、後から別リクエストで reject。有効な決定は**最新の決定** (decided_at 最大、同時刻は id 大) とする。rejected が approved より後なら**承認の取り消し**として機能する。根拠: ①取り消し不能な承認は「採用は必ず人間承認」の意味を弱める (誤承認・事後の問題発覚に対処する手段が要る) ②「rejected が 1 つでもあれば拒否」(deny-wins) は誤った却下を恒久化し、再承認の意思を表明できなくなる — 時系列の最新意思を正とするのが監査直観とも一致する。現実装 (プラン 7) は「一致する approved 行が 1 つでもあれば承認」で取り消しが効かないため、**プラン 9 で最新決定優先へ改める**。反映は従来どおり次回起動時 (plugin ロードは起動時 1 回) — 即時失効が必要ならサービス再起動を運用手順とする
-- **この規則は kind=plugin 専用** (他 kind には複数行を横断して消費する実装が無く、同一性キーの意味論も異なる): `live_trade` は時点依存の単発要求であり**行単位の冪等のみ** — 別行による事後取り消しは適用しない (承認後の安全弁は承認時再検証 (§5) と expires_at)。`news_source` の取り消しは承認履歴ではなく **`news_sources.enabled` を落とす操作**で行う (approval は enable の入口に過ぎず、行の無効化が即時かつ唯一の失効手段)
+- **この規則は kind=plugin 専用** (他 kind には複数行を横断して消費する実装が無く、同一性キーの意味論も異なる): `live_trade` は時点依存の単発要求であり**行単位の冪等のみ** — 別行による事後取り消しは適用しない (承認後の安全弁は承認時再検証 (§5) と expires_at)。~~`news_source` の取り消しは承認履歴ではなく `news_sources.enabled` を落とす操作で行う~~ (この kind は廃止。`afx news disable` が即時かつ唯一の失効手段)
 
 ### 操作 REST API (FastAPI)
 
@@ -595,13 +595,13 @@ reason, decided_by, decided_at, message_id, expires_at, created_at
 | `POST /policy` | 方針書への追記 | client.py |
 | `POST /backlog` | 改善アイデアの投入 | client.py |
 | `POST /improve` | 改善 loop の即時手動起動 (実行は常にサービスプロセス内) | client.py |
-| `POST /news` | news ソース追加 (fetcher 自動判定 + 機械検証、§6) | client.py |
+| ~~`POST /news`~~ | **廃止 (2026-10-25)**。ニュース源の追加は操作 API に載せず、人間の `afx news` だけで行う | — |
 | `GET /models` | 利用可能モデル一覧 (llama-swap `/v1/models` + claude、番号付き) | client.py |
 | `POST /model` | LLM runner / ローカルモデルの切替 (client 側で番号→モデル名を解決して送る。資金と無関係のため API 可) | client.py |
 
-- `X-API-Key` 認証 (finance 方式踏襲)。ただし**キーは 2 段に分離**する: **operator キー** (閲覧・ask・policy・backlog・news・model・plugin / news_source の承認) と **approver キー** (live_trade の承認/却下のみ)。単一キーの漏洩で実発注の承認まで通ることを防ぐ。`decided_by` はリクエスト本文でなく**認証主体から生成**する (本文の自己申告を信用しない)
+- `X-API-Key` 認証 (finance 方式踏襲)。ただし**キーは 2 段に分離**する: **operator キー** (閲覧・ask・policy・backlog・model・plugin の承認。~~news / news_source の承認~~ は廃止) と **approver キー** (live_trade の承認/却下のみ)。単一キーの漏洩で実発注の承認まで通ることを防ぐ。`decided_by` はリクエスト本文でなく**認証主体から生成**する (本文の自己申告を信用しない)
 - API の bind は**デフォルト localhost のみ**。外部公開する場合は reverse proxy + TLS を前提とする (ドキュメントに明記)
-- **autopilot 中の追加制限**: trading + autopilot on の間は **API の変更系操作を全面拒否**する — 許可するのは読み取り系 (`GET *`)・`reject` (安全方向の却下)・`ask` (回答専用) のみ。`POST /policy` / `/model` / `/news` / `/improve` / `/backlog` / approve は**ホスト上の対話シェルのみ**。operator キー漏洩時に判断入力・戦略構成の変更 (方針・モデル・ニュースソースの RAG 混入・plugin 承認) で次周期から人間承認なしの実発注を誘導する経路を、個別列挙でなく原則として閉じるため
+- **autopilot 中の追加制限**: trading + autopilot on の間は **API の変更系操作を全面拒否**する — 許可するのは読み取り系 (`GET *`)・`reject` (安全方向の却下)・`ask` (回答専用) のみ。`POST /policy` / `/model` / `/improve` / `/backlog` / approve (~~`/news`~~ は廃止) は**ホスト上の対話シェルのみ**。operator キー漏洩時に判断入力・戦略構成の変更 (方針・モデル・ニュースソースの RAG 混入・plugin 承認) で次周期から人間承認なしの実発注を誘導する経路を、個別列挙でなく原則として閉じるため
 - **載せない一線**: 発注操作・risk gate 等の資金関連設定の変更・モード切替 (`mode`)・自動発注切替 (`autopilot`)・サービス停止。金を動かす経路と重大操作はホスト上の明示操作のみ
 - Mission 実行 (`/ask`) も含め、**Mission を実行するのは常にサービスプロセスだけ**。排他制御はプロセス内の Mission スロットで完結する (クロスプロセスロックは不要)
 
@@ -638,7 +638,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 | `policy add "..."` | 方針書へ追記 |
 | `improve` | 改善 loop の即時手動起動 (実行は常にサービスプロセス内の排他スロット) |
 | `improve add "..."` / `backlog` | 改善アイデア投入 / バックログ一覧 |
-| `news add <url> [--name]` / `news list` | ニュース取得対象の追加 (機械検証つき、§6) / 一覧 |
+| `afx news add <name> <url>` / `afx news list` ほか | ニュース取得対象の追加 (追加前に 1 回取得、人間だけが行う、`2026-10-25-news-source-cli-design.md`) / 一覧 / enable / disable / test。~~対話シェルの `news add <url> [--name]`~~ は廃止 |
 | `model` | 利用可能モデルの一覧表示 (llama-swap `/v1/models` から動的取得 + claude)。**各モデルに番号を割り振り**、両 loop の現在選択に印を付けて表示 |
 | `model <trade\|improve> <番号>` | 一覧の**番号で切替** (モデル名の手入力は不要。番号→モデル名の解決は表示時の一覧で行い、内部にはモデル名で保存する) |
 | `autopilot on\|off` | 取引モードの自動発注切替 (Phase 3、確認プロンプト付き。**対話シェルのみ**、API には載せない) |
@@ -655,7 +655,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 1. **`afx init`** — 対話ウィザード（非対話は `--non-interactive`）。settings.yaml の生成、DB 初期化、接続確認、direct exec の user unit 設置を案内する。詳細設計は [2026-10-12 の初期設定ウィザード設計](2026-10-12-first-run-wizard-design.md) を参照する。
 2. **`afx ctl status`** — 常駐サービスの状態確認と日常操作の入口。
 
-初期構築 (ニュースソース拡充・指標追加) は専用ウィザードを持たず、**通常チャネルで行う**: `news add` で取得対象を足す、`improve add "..."` でアイデアを投入して `improve` を手動起動する (runner は config / `model` コマンドで claude / local を選択、ClaudeRunner はサブスク認証で利用可能)。成果は通常の承認フローに乗る。
+初期構築 (ニュースソース拡充・指標追加) は専用ウィザードを持たず、**通常チャネルで行う**: `afx news add` で取得対象を足す (`afx init` の副段でも入れられる)、`improve add "..."` でアイデアを投入して `improve` を手動起動する (runner は config / `model` コマンドで claude / local を選択、ClaudeRunner はサブスク認証で利用可能)。成果は通常の承認フローに乗る。
 
 ### ユーザー入力チャネル
 
@@ -664,8 +664,8 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 | `policy add "..."` → `policy/directives.md` | 永続的な方針 (例: 「USDJPY は当面見送り」) | 取引/改善の全 Mission に毎回**末尾 4000 文字**を注入 (§5 と同一) |
 | `ask "..."` | ワンショットの質問・指示 | 臨時 Mission を即時実行、その 1 回だけ注入 |
 | `improve add "..."` | 改善アイデアの投入 | 次回の改善 loop がバックログから選択 (`improve` で即時起動も可) |
-| `news add <url>` | ニュース取得対象の追加 | 機械検証後に即 enabled (user 追加は承認不要、§6) |
-| Discord ボタン / `approve` | plugin・news ソース (agent 追加)・実発注の承認 | approval_requests の決定 |
+| `afx news add <name> <url>` | ニュース取得対象の追加 | 追加前に 1 回取得して件数を確認、即 enabled (承認は通さない。~~`news add <url>`~~ の対話シェル形は廃止) |
+| Discord ボタン / `approve` | plugin・実発注の承認 (~~news ソース (agent 追加)~~ の承認は廃止) | approval_requests の決定 |
 
 `policy/directives.md` はタイムスタンプ付き追記 (削除は手動編集)。サイズ超過時は起動時に警告する。
 
@@ -678,7 +678,7 @@ uv run main.py mode learning|trading  # 稼働モード切替 (Phase 3、サー�
 - `discord.ui.DynamicItem` + custom_id 正規表現 (`agentic_fx_gate:approve:{id}` — finance cog と衝突しない名前空間) で bot 再起動を跨いでボタンが生きる
 - 承認者ロール deny-by-default、却下理由 Modal、TOCTOU 再チェック、起動時 reconcile、重複投稿ガード
 
-表示: `kind=plugin` は plugin パス・種別・要約・テスト結果・バックテスト結果、`kind=news_source` はソース情報 + 機械検証結果、`kind=live_trade` は TradeIntent の内容 (ペア/方向/entry/SL/TP/理由) をそれぞれ embed 表示。`?afx status` は `GET /status` の内容を表示する。
+表示: `kind=plugin` は plugin パス・種別・要約・テスト結果・バックテスト結果、~~`kind=news_source`~~ は廃止、`kind=live_trade` は TradeIntent の内容 (ペア/方向/entry/SL/TP/理由) をそれぞれ embed 表示。`?afx status` は `GET /status` の内容を表示する。
 
 ## 10. 前身からの移植資産
 
@@ -817,7 +817,7 @@ agentic-fx/
 | `improvement_backlog` | 改善アイデア (source: user/agent/research, status: open/selected/done/rejected) |
 | `improvement_runs` | 改善実施記録 (選択 backlog, approval_request ID / レポートパス)。旧 PR 経路の廃止 (§6) に伴い `result='pr'` / `pr_url` は使用しない (既存列の削除 migration はプラン 9 で判断) |
 | `econ_events` | 経済指標カレンダー (前身 econ_event_store 移植) |
-| `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / news_source / live_trade) |
+| `approval_requests` | 人間承認の一元管理 (§7: kind = plugin / live_trade。~~news_source~~ は廃止) |
 | `news_sources` | ニュース取得先リスト (§6: name, fetcher, url, enabled, added_by) |
 | `backtest_runs` | **Phase 2**。バックテスト実行記録 (plugin パス + コンテンツハッシュ, kind, pair, timeframe, source, 期間端点, **scope** (in_sample / holdout_gate / human_custom), 指標 JSON, 設定スナップショット hash, コア git commit, 初期資金, created_at)。**改善ループの読み取りビューは scope='in_sample' かつハーネス発行行のみ** (§6 バックテスト) |
 | `analysis_runs` | **Phase 2**。履歴分析 (相関探索) の実行記録 (params_json = 候補集合・timeframe・window・lag 範囲, trial_count, source, created_at)。plugin 提案の approval payload / `improvement_runs` が `analysis_run_id` で参照し、多重比較の探索数を人間レビューが監査できるようにする (§6 履歴分析) |
@@ -908,9 +908,9 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 
 ## 15. 段階導入
 
-- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + 価格取得 (デフォルト yfinance、設定時は MT5 / TD を優先) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装 + news_sources 初期データのみ)
+- **Phase 1**: 決定論的コア + LocalRunner + 取引判断 loop (学習モード = ペーパー、ハイブリッド発注、horizon) + 価格取得 (デフォルト yfinance、設定時は MT5 / TD を優先) + main.py (スプラッシュ + 対話シェル + init 起動ガード + stop) + ログ 2 軸。ツールは get_ohlcv / get_indicators / search_news / get_positions の最小セット (組み込み実装のみ。~~news_sources 初期データ~~ の同梱は廃止)
   - **Phase 2 のシグナル起動に向けた接合点 (Phase 1 で形だけ用意する)**: ①`scheduler.tick()` の Mission 起動を、時刻の真偽値ではなく**起動理由を返す関数** (`"cron" | None`) にする ②`missions.trigger` 列を追加する。後から入れると `tick()` の中核と DB migration に手が入るため先に整える。**シグナル検出そのものは Phase 1 に含めない**
-- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + plugin 機構 (indicator/signal/strategy) + `signals` テーブル + plugin 評価ランナー + `get_signals` ツール + **strategy シグナルによる Mission 起動** (§5、エグジット先行) + **バックテスト基盤** (BacktestRunner + Dukascopy 一括インポータ + `backtest_runs` — §6) + **履歴分析 (相関調査、§6)** + news_sources 承認フロー + 操作 API + client.py + `news add` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
+- **Phase 2**: ClaudeRunner (Agent SDK) + 戦略改善 loop (バックログ + Web リサーチ) + plugin 機構 (indicator/signal/strategy) + `signals` テーブル + plugin 評価ランナー + `get_signals` ツール + **strategy シグナルによる Mission 起動** (§5、エグジット先行) + **バックテスト基盤** (BacktestRunner + Dukascopy 一括インポータ + `backtest_runs` — §6) + **履歴分析 (相関調査、§6)** + ~~news_sources 承認フロー~~ (廃止) + 操作 API + client.py + `afx news` / `model` コマンド + Discord 承認 (discord_bot 側 cog 含む) + policy チャネル
   - **Mission preemption (プロセス隔離) の受入条件** (プラン 5 A-1 裁定の引き継ぎ): worker process への Mission 隔離 / 子プロセス側 DB 接続の分離 / 親の壁時計監視と terminate→kill エスカレーション / kill 後の missions 行 timeout finalize / 部分 transcript の保存範囲の定義 / **Mission 実行中も SL/TP 監視 (資金保護) が継続すること** (Phase 1 は core_lock 共有のため Mission 中は次 tick の資金保護が待たされる — reflection の件数 cap で窓を制限している)
 - **Phase 3**: MT5 の発注系接続 + 資金保護系の本格接続 + 取引モード切替 (`mode trading`、人間の明示操作のみ) + 手動承認ゲート (live_trade) + `autopilot` (自動発注への段階移行)
 
@@ -928,3 +928,4 @@ activity のカテゴリ (処理の流れ「収集 → 分析 → 統合判断 �
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-10-14 | 運用追補 | 初期設定ウィザード、direct exec user unit、起動ガードの運用記述を更新 | 初回設定の運用責任を明確化 | |
+| 2026-10-25 | 運用追補 | ニュース源: 基本ニュースソースの同梱・agent 追加時の `news_source` approval・`POST /news`・対話シェルの `news add` を廃止の注記つきに改め、人間の `afx news` と `afx init` の副段へ一本化 | 2026-09-07 の agent 経路廃止と 2026-10-25 の同梱廃止の裁定に合わせる | |

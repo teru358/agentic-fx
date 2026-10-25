@@ -16,7 +16,7 @@ from agentic_fx.cli_surface import (COMMANDS, COMPATIBILITY_RECORDS, HelpFormatt
                                     render_top_epilog, top_description, version_tuple)
 from agentic_fx.ops.contracts import Principal
 
-_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
+_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "news")
 
 
 class _OpsOptionError(Exception):
@@ -184,8 +184,26 @@ def resolve_root(argv: list[str], environ: Mapping[str, str], cwd: Path) -> Path
     return here
 
 
+NEWS_USAGE_ERROR = "使い方が誤っています。afx news --help を参照してください。"
+NEWS_INTERRUPTED = "中断しました。"
+
+
+def _is_news(args_list: list[str]) -> bool:
+    return args_list[_split_prefix(args_list)[0]:][:1] == ["news"]
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = sys.argv[1:] if argv is None else list(argv)
+    if not _is_news(args_list):
+        return _main(args_list)
+    try:
+        return _main(args_list)
+    except KeyboardInterrupt:
+        print(NEWS_INTERRUPTED, file=sys.stderr)
+        return 130
+
+
+def _main(args_list: list[str]) -> int:
     # 全体 flag の後ろの ctl も argparse に通さない (REMAINDER は `--as` 始まりを
     # 受け取れない)。全体 flag は client には関係ないので読み捨て、daemon も起動しない。
     head, _ = _split_prefix(args_list)
@@ -294,6 +312,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(args_list)
     except _OpsOptionError as error:
+        if _is_news(args_list):
+            print(NEWS_USAGE_ERROR, file=sys.stderr)
+            raise SystemExit(2) from None
         if args_list[head:head + 2] == ["ops", "web"] and args_list[head + 2:head + 3] in (
                 ["enable"], ["reconfigure"]):
             print("afx ops: setup_input_required", file=sys.stderr)

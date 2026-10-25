@@ -81,7 +81,11 @@ EXPECTED = (
     ('ctl events', G.OBSERVE, "CTL", 'afx ctl events [--after <id>] [--limit <n>] [--follow]', None, "READ", False, False, 'events.read', 'events', True, None),
     ('ctl jobs get', G.OBSERVE, "CTL", 'afx ctl jobs get <id>', None, "READ", False, False, 'jobs.own', 'job_get', True, None),
     ('ctl jobs cancel', G.OBSERVE, "CTL", 'afx ctl jobs cancel <id>', None, "CHANGE", True, False, 'jobs.own', 'job_cancel', True, None),
-    ('news', G.MARKET, "LOCAL", 'afx news …', None, "PER_OPERATION", False, False, None, None, False, None),
+    ('news list', G.MARKET, "LOCAL", 'afx news list', None, "READ", False, False, None, None, False, None),
+    ('news test', G.MARKET, "LOCAL", 'afx news test <name>', None, "READ", False, False, None, None, False, None),
+    ('news add', G.MARKET, "LOCAL", 'afx news add <name> <url> [--fetcher feed|web] [--yes]', None, "CHANGE", False, False, None, None, False, '0 件のとき確認'),
+    ('news enable', G.MARKET, "LOCAL", 'afx news enable <name>', None, "CHANGE", False, False, None, None, False, '次の収集周期で反映'),
+    ('news disable', G.MARKET, "LOCAL", 'afx news disable <name>', None, "CHANGE", False, False, None, None, False, '次の収集周期で反映'),
     ('history import', G.MARKET, "LOCAL", 'afx history import …', None, "CHANGE", False, False, None, None, False, None),
     ('history compare', G.MARKET, "LOCAL", 'afx history compare …', None, "READ", False, False, None, None, False, None),
     ('history coverage', G.MARKET, "LOCAL", 'afx history coverage …', None, "READ", False, False, None, None, False, None),
@@ -161,9 +165,10 @@ def test_record_summaries_carry_the_table_notes():
     assert (bot.implemented, bot.exposed, notify.implemented, notify.exposed) == (
         False, False, False, False)
     assert (web.implemented, web.exposed) == (True, True)
-    news = _record("news")
-    assert (news.label, news.planned, news.implemented, news.exposed) == (
-        cli_surface.Label.PER_OPERATION, True, False, False)
+    assert [_record(f"news {action}").label for action in ("list", "test")] == [
+        cli_surface.Label.READ, cli_surface.Label.READ]
+    assert [_record(f"news {action}").label for action in ("add", "enable", "disable")] == [
+        cli_surface.Label.CHANGE, cli_surface.Label.CHANGE, cli_surface.Label.CHANGE]
 
 
 def test_endpoint_codes_and_scopes_agree_with_the_service_table():
@@ -352,8 +357,8 @@ def test_public_records_render_and_reserved_records_do_not():
     for command in ("ops", "keys", "init", "ops web enable"):
         assert cli_surface.parser_description(command)
     assert cli_surface.parser_description("ops web") is None
-    assert cli_surface.parser_help("news") is None
-    assert cli_surface.parser_description("news") is None
+    assert cli_surface.parser_help("news") == "[下位操作ごと] 市場ニュース源を扱う"
+    assert cli_surface.parser_description("news") == "市場ニュース源を扱う"
     assert cli_surface.leaf_help("news") is None
     assert cli_surface.render_shell_help()
 
@@ -373,7 +378,8 @@ def test_parent_help_comes_from_the_parent_and_label_is_derived():
     assert r.parser_help("init") == "[変更] 初期設定 (対話。`--non-interactive` で従来の非対話)"
     assert r.parser_help("status") == "[読取] オフライン状態を書き込まずに表示する"
     assert r.parser_description("init") == "初期設定 (対話。`--non-interactive` で従来の非対話)"
-    assert r.parser_help("news") is None and r.leaf_help("news") is None
+    assert r.parser_help("news") == "[下位操作ごと] 市場ニュース源を扱う"
+    assert r.leaf_help("news") is None
     assert r.parser_help("nonexistent") is None
 
 
@@ -408,9 +414,18 @@ def test_every_visible_leaf_resolves_exactly_once_in_epilogs():
     assert r.render_epilog("nonexistent") == ""
 
 
+def test_news_records_are_implemented_and_exposed():
+    assert all(_record(f"news {action}").implemented and _record(f"news {action}").exposed
+               and not _record(f"news {action}").planned
+               for action in ("list", "test", "add", "enable", "disable"))
+    assert not [record.command for record in cli_surface.COMMANDS if record.command == "news"]
+    assert any(parent.command == "news" for parent in cli_surface.PARENTS)
+
+
 def test_planned_records_never_render_even_when_marked_exposed():
-    news = dataclasses.replace(_record("news"), exposed=True)
-    records = tuple(news if r.command == "news" else r for r in _all_exposed())
+    """The reservation mechanism stays guarded: a planned record must not become visible."""
+    reserved = dataclasses.replace(_record("history coverage"), planned=True, implemented=False, exposed=True)
+    records = tuple(reserved if r.command == "history coverage" else r for r in _all_exposed())
     with pytest.raises(ValueError):
         cli_surface.SurfaceRenderer(records)
 
