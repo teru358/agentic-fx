@@ -228,3 +228,48 @@ def test_the_scanner_lets_reads_pass(snippet):
 def test_adding_one_write_call_to_a_guarded_module_would_be_caught(relative):
     source = (REPO / relative).read_text(encoding="utf-8") + "\nnews_sources.add(None)\n"
     assert write_paths(source)
+
+
+# --- argv echo and interruption boundary -----------------------------------------------------------
+
+_CANARY = "CANARY-9f3a"
+_NEWS_USAGE_ERROR = "使い方が誤っています。afx news --help を参照してください。\n"
+
+
+@pytest.mark.parametrize("argv", [
+    (f"https://secret.example/feed?k={_CANARY}",),
+    ("add", "x", "https://ok.invalid/", f"https://secret.example/feed?k={_CANARY}"),
+    ("add", "x", "https://ok.invalid/", f"--bogus-{_CANARY}"),
+    ("list", f"https://secret.example/feed?k={_CANARY}"),
+])
+def test_argparse_errors_under_news_never_echo_argv(tmp_path, monkeypatch, capsys, argv):
+    root = make_root(tmp_path)
+    with pytest.raises(SystemExit) as raised:
+        run_news(capsys, monkeypatch, root, *argv)
+    captured = capsys.readouterr()
+    assert raised.value.code == 2
+    assert _CANARY not in captured.out + captured.err
+    assert captured.out == ""
+    assert captured.err == _NEWS_USAGE_ERROR
+
+
+@pytest.mark.parametrize("target", ["parser", "root"])
+def test_interrupt_while_parsing_or_resolving_the_root_is_reported_without_traceback(
+        tmp_path, monkeypatch, capsys, target):
+    root = make_root(tmp_path)
+
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+
+    if target == "parser":
+        monkeypatch.setattr(entry._OpsOptionParser, "parse_args", boom)
+    else:
+        monkeypatch.setattr(entry, "resolve_root", boom)
+    rc, out, err = run_news(capsys, monkeypatch, root, "list")
+    assert (rc, out, err) == (130, "", "中断しました。\n")
+
+
+def test_interrupt_outside_news_is_not_swallowed(tmp_path, monkeypatch):
+    monkeypatch.setattr(entry, "resolve_root", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        entry.main(["--root", str(tmp_path), "status"])
