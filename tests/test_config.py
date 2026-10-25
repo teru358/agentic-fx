@@ -1135,3 +1135,25 @@ def test_settings_without_api_block_uses_enabled_default():
     s = Settings.model_validate(raw)
     assert s.api.enabled is True
     assert s.api.socket_path == "data/run/api.sock"
+
+
+def test_notify_improve_events_defaults_to_true_and_example_states_it():
+    assert load_settings(EXAMPLE).notify.improve_events is True
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["notify"].pop("improve_events")
+    assert Settings.model_validate(raw).notify.improve_events is True
+    assert "  improve_events: true" in EXAMPLE.read_text()
+
+
+@pytest.mark.parametrize("value", ["false", 0, 1, "yes", None])
+def test_notify_improve_events_rejects_non_bool(value):
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["notify"]["improve_events"] = value
+    with pytest.raises(ValidationError):
+        Settings.model_validate(raw)
+
+
+def test_notify_improve_events_false_is_accepted():
+    raw = load_settings(EXAMPLE).model_dump()
+    raw["notify"]["improve_events"] = False
+    assert Settings.model_validate(raw).notify.improve_events is False

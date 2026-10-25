@@ -1526,7 +1526,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         improve_supervisor = ImproveSupervisor(
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
-            stop_event=stop_event, activity=activity)
+            stop_event=stop_event, activity=activity,
+            emit_events=settings.notify.improve_events)
         # プラン10 Task10-12 Step1: ImproveLoop を構築し
         # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
         # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は
@@ -1734,6 +1735,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
             trade_event_sink=trade_sink)
+        # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
+        ops_service.emit_pending_improve_notices(
+            enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
@@ -1940,7 +1944,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         status_provider=status_provider, log_path=root / "logs" / "agentic.log",
         activity_path=root / "logs" / "activity.log", data_resume=data_resume,
         ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
-        plugins_root=plugins_dir, settings=settings, activity_log=activity)
+        plugins_root=plugins_dir, settings=settings, activity_log=activity,
+        improve_reports_dir=root / "data" / "improve_reports")
     holder.append(service)
     return service
 

@@ -590,6 +590,146 @@ def _tool_calls_suffix(tool_calls: int | None) -> str:
     return f" tool_calls={tool_calls}"
 
 
+@dataclass(frozen=True)
+class FloorPairRow:
+    """床未達レポートの失敗段の 1 pair 分。数値は表の値そのまま。"""
+    pair: str
+    trades: int
+    pf: float | None
+    avg_r: float | None
+    evaluable: bool
+
+
+@dataclass(frozen=True)
+class FloorDetail:
+    stage: str
+    pairs: tuple[FloorPairRow, ...]
+
+
+_FLOOR_PAIR_RE = re.compile(r"[A-Z0-9_]{3,16}")
+_FLOOR_INT_RE = re.compile(r"[0-9]{1,18}")
+_FLOOR_FLOAT_RE = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+_FLOOR_REPORT_NO_APPROVAL = "No approval request was produced by this mission."
+_FLOOR_REPORT_DETAIL_HEADING = "## Profitability floor detail"
+_FLOOR_STAGES = ("in_sample", "holdout")
+
+
+def _floor_float(cell: str) -> float | None:
+    """有限の浮動小数、または `None` (文字列) だけを受ける。"""
+    if cell == "None":
+        return None
+    if _FLOOR_FLOAT_RE.fullmatch(cell) is None:
+        raise ValueError("not a finite float")
+    value = float(cell)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("not a finite float")
+    return value
+
+
+def _floor_row(line: str, keys: tuple[str, ...]) -> FloorPairRow:
+    if not (line.startswith("| ") and line.endswith(" |")):
+        raise ValueError("row shape")
+    cells = line[2:-2].split(" | ")
+    if len(cells) != len(keys) + 1:
+        raise ValueError("row width")
+    pair = cells[0]
+    if _FLOOR_PAIR_RE.fullmatch(pair) is None:
+        raise ValueError("pair")
+    by_key = dict(zip(keys, cells[1:]))
+    trades = by_key["trades"]
+    if _FLOOR_INT_RE.fullmatch(trades) is None:
+        raise ValueError("trades")
+    evaluable = by_key["evaluable"]
+    if evaluable not in ("True", "False"):
+        raise ValueError("evaluable")
+    return FloorPairRow(
+        pair=pair, trades=int(trades), pf=_floor_float(by_key["pf"]),
+        avg_r=_floor_float(by_key["avg_r"]), evaluable=evaluable == "True")
+
+
+def _floor_table(lines: list[str], start: int, stage: str,
+                 keys: tuple[str, ...]) -> tuple[list[FloorPairRow], int]:
+    """`### <stage>` の見出しから表の終わりまでを読む。"""
+    i = start
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    if i >= len(lines) or lines[i] != f"### {stage}":
+        raise ValueError("table heading")
+    i += 1
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    header = "| pair | " + " | ".join(keys) + " |"
+    separator = "|---" * (len(keys) + 1) + "|"
+    if lines[i:i + 2] != [header, separator]:
+        raise ValueError("table columns")
+    i += 2
+    rows: list[FloorPairRow] = []
+    while i < len(lines) and lines[i].startswith("|"):
+        rows.append(_floor_row(lines[i], keys))
+        i += 1
+    if not rows or len({row.pair for row in rows}) != len(rows):
+        raise ValueError("table rows")
+    return rows, i
+
+
+def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
+    keys = tuple(ImproveLoop._FLOOR_REPORT_METRIC_KEYS)
+    lines = text.split("\n")
+    while lines and lines[-1] == "":
+        lines.pop()
+    if not lines or lines[0] != f"# Improve Mission {mission_id} — gate failed":
+        raise ValueError("title")
+    if lines.count(_FLOOR_REPORT_DETAIL_HEADING) != 1:
+        raise ValueError("detail heading")
+    at = lines.index(_FLOOR_REPORT_DETAIL_HEADING)
+    for line in lines[1:at]:
+        if not (line == "" or line.startswith("reason: ")
+                or line == _FLOOR_REPORT_NO_APPROVAL):
+            raise ValueError("preamble")
+    i = at + 1
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    if i + 2 >= len(lines):
+        raise ValueError("detail lines")
+    stage_line, pairs_line, thresholds_line = lines[i:i + 3]
+    if not stage_line.startswith("failed_stage: "):
+        raise ValueError("failed_stage")
+    stage = stage_line[len("failed_stage: "):]
+    if stage not in _FLOOR_STAGES:
+        raise ValueError("failed_stage value")
+    if not pairs_line.startswith("failed_pairs: "):
+        raise ValueError("failed_pairs")
+    failed_pairs = pairs_line[len("failed_pairs: "):].split(", ")
+    if (any(_FLOOR_PAIR_RE.fullmatch(p) is None for p in failed_pairs)
+            or len(set(failed_pairs)) != len(failed_pairs)):
+        raise ValueError("failed_pairs value")
+    if not thresholds_line.startswith("thresholds:"):
+        raise ValueError("thresholds")
+    in_sample, i = _floor_table(lines, i + 3, "in_sample", keys)
+    rows = in_sample
+    if stage == "holdout":
+        rows, i = _floor_table(lines, i, "holdout", keys)
+    present = {row.pair for row in rows}
+    if not set(failed_pairs) <= present:
+        raise ValueError("failed pair missing from the table")
+    return FloorDetail(
+        stage=stage,
+        pairs=tuple(row for row in rows if row.pair in failed_pairs))
+
+
+def parse_floor_report(text: str, *, mission_id: int) -> FloorDetail | None:
+    """床未達レポート本文から、落ちた段の失敗 pair の数値を取り出す純関数。
+
+    形式が 1 つでも崩れていれば全体を捨てて `None` を返す (部分出力しない)。
+    `reason:` と `thresholds:` の内容は値として使わない。"""
+    if not isinstance(text, str) or type(mission_id) is not int:
+        return None
+    try:
+        return _parse_floor_report(text, mission_id)
+    except Exception:  # noqa: BLE001 — 形式不正は理由を持たず None に畳む
+        return None
+
+
 class ImproveLoop:
     # INDEX.md の追記を直列化する (プロセス内、slot スレッド間で共有)。
     _archive_index_lock = threading.Lock()

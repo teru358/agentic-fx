@@ -25,7 +25,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -40,7 +40,7 @@ from .audit import AcceptedRequest, AuditStore, IdempotencyReplay
 from .contracts import (ACTOR_PRINCIPALS, PRINCIPAL_SCOPES, Caller, ErrorCode, OpsError,
                         Principal, Scope, ShellCaller, assert_authorized,
                         validate_asserted_actor)
-from .events import EventStore
+from .events import EventSchemaError, EventStore
 from .jobs import Job, JobRegistry, JobState, new_job_id
 from .tail import activity_filter, tail_lines
 
@@ -84,6 +84,7 @@ ENDPOINTS: dict[str, Endpoint] = {e.code: e for e in (
     Endpoint("approval_detail", "GET /v1/approvals/{id}", Scope.APPROVALS_DETAIL, False),
     Endpoint("approval_change", "GET /v1/approvals/{id}/change", Scope.APPROVALS_DETAIL, False),
     Endpoint("approval_list", "GET /v1/approvals", Scope.APPROVALS_LIST, False),
+    Endpoint("improve_run", "GET /v1/improve/runs/{id}", Scope.APPROVALS_DETAIL, False),
     Endpoint("reflection_status", "GET /v1/reflections/{order_id}", Scope.STATUS_READ, False),
     Endpoint("whoami", "GET /v1/whoami", Scope.STATUS_READ, False),
     Endpoint("job_get", "GET /v1/jobs/{id}", Scope.JOBS_OWN, False),
@@ -258,6 +259,68 @@ class _PatientConnection:
         self._retry(self._raw.commit)
 
 
+IMPROVE_OUTBOX_WINDOW = timedelta(days=7)
+
+
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return _aware(datetime.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _elapsed_sec(started_at: object, notice) -> int | None:
+    """snapshot の作成時刻 - mission の開始時刻 (整数秒、0.5 秒は切り上げ)。
+
+    マイクロ秒の整数で計算し float を使わない。再起動回収の終端 (停止していた
+    時間を含む)、時刻が読めない、終了が開始より前のときは None。"""
+    if notice is None or (notice["result_code"], notice["reason_code"]) == (
+            "failed", "interrupted"):
+        return None
+    start, end = _parse_time(started_at), _parse_time(notice["created_at"])
+    if start is None or end is None:
+        return None
+    delta = end - start
+    micros = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+    return None if micros < 0 else (micros + 500_000) // 1_000_000
+
+
+def _notice_text(value: object) -> str | None:
+    """観察文を 1 行に畳む。制御文字・改行は空白へ、空なら空文字。"""
+    if not isinstance(value, str):
+        return None
+    from agentic_fx.improve_notice_codes import OBSERVATION_TEXT_MAX
+    from agentic_fx.loops.approval_facts import display_text
+    shown = display_text(value, OBSERVATION_TEXT_MAX)
+    if shown == "-" and not any(ch.isprintable() and not ch.isspace() for ch in value):
+        return ""
+    return shown
+
+
+def _approval_of(notice, row) -> dict | None:
+    if notice is None or notice["approval_id"] is None or row is None:
+        return None
+    from agentic_fx.loops.approval_facts import display_text
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError, RecursionError):
+        payload = None
+    name = payload.get("name") if isinstance(payload, dict) else None
+    from . import safe_open
+    plugin = (display_text(name) if isinstance(name, str)
+              and safe_open.NAME_RE.fullmatch(name) else None)
+    kind = row["kind"]
+    return {"id": row["id"],
+            "plugin": plugin,
+            "kind": display_text(kind) if isinstance(kind, str) and kind.strip() else None}
+
+
 def _authorize(caller: Caller, endpoint_code: str) -> None:
     """endpoint の認可は表の scope だけを参照する (§3.1)。"""
     assert_authorized(caller, ENDPOINTS[endpoint_code].scope)
@@ -296,7 +359,8 @@ class OpsService:
                  data_resume: Callable[[bool], dict] | None = None,
                  ask_submitter: Callable[[str], object] | None = None,
                  improve_supervisor=None, plugins_root: Path | None = None,
-                 settings=None, activity_log=None) -> None:
+                 settings=None, activity_log=None,
+                 improve_reports_dir: Path | None = None) -> None:
         self.stop_event = stop_event or threading.Event()
         self._owns_decide_conn = decide_conn is None
         raw_decide = decide_conn if decide_conn is not None else self._open_peer(conn)
@@ -325,6 +389,7 @@ class OpsService:
         self._ask_submitter = ask_submitter
         self._improve_supervisor = improve_supervisor
         self._plugins_root = plugins_root
+        self._improve_reports_dir = improve_reports_dir
         self._settings = settings
         self._activity_log = activity_log
         self.jobs = JobRegistry(monotonic=monotonic)
@@ -738,6 +803,106 @@ class OpsService:
                     "claims": change_mod.claims_of(payload), "diff": result.diff}
         change_mod.fit_response_to_bytes(response)
         return response
+
+    # ---- 改善 mission の通知材料 -------------------------------------
+
+    def improve_run(self, principal: Caller, mission_id: int, *,
+                    deadline: float | None = None) -> dict:
+        """改善 mission 1 件の通知材料。終端 snapshot を正本に、mission 行・run 行・
+        承認・床未達の数値(公開済みレポートから)を足す。監査行は書かない。"""
+        _authorize(principal, "improve_run")
+        with self._ops_lane(self._deadline(deadline)):
+            mission = self._conn.execute(
+                "SELECT loop,runner,model,started_at FROM missions WHERE id=?",
+                (mission_id,)).fetchone()
+            if mission is None or mission["loop"] != "improve":
+                raise OpsError(ErrorCode.NOT_FOUND)
+            notice = self._conn.execute(
+                "SELECT trigger,result_code,reason_code,tool_calls,observation_text,"
+                "approval_id,created_at FROM improve_run_notices WHERE mission_id=?",
+                (mission_id,)).fetchone()
+            run = self._conn.execute(
+                "SELECT report_state,report_path FROM improvement_runs "
+                "WHERE mission_id=? ORDER BY id DESC LIMIT 1", (mission_id,)).fetchone()
+            approval = None
+            if notice is not None and notice["approval_id"] is not None:
+                approval = self._conn.execute(
+                    "SELECT id,kind,payload_json FROM approval_requests WHERE id=?",
+                    (notice["approval_id"],)).fetchone()
+        from agentic_fx.loops.approval_facts import display_text
+        report_state = run["report_state"] if run is not None else "none"
+        snapshot = None
+        if notice is not None:
+            snapshot = {
+                "trigger": notice["trigger"], "result_code": notice["result_code"],
+                "reason_code": notice["reason_code"], "tool_calls": notice["tool_calls"],
+                "observation_text": _notice_text(notice["observation_text"])}
+        floor = None
+        if (notice is not None and run is not None and report_state == "published"
+                and (notice["result_code"], notice["reason_code"])
+                == ("gate_failed", "unprofitable")):
+            floor = self._floor_of(mission_id, run["report_path"])
+        return {"id": mission_id,
+                "backend": display_text(mission["runner"]),
+                "model": display_text(mission["model"]),
+                "elapsed_sec": _elapsed_sec(mission["started_at"], notice),
+                "snapshot": snapshot,
+                "report_state": report_state,
+                "approval": _approval_of(notice, approval),
+                "floor": floor}
+
+    def _floor_of(self, mission_id: int, report_path: object) -> dict | None:
+        """公開済み床未達レポートの数値。読めない・形式不正はすべて None (理由は出さない)。"""
+        if self._improve_reports_dir is None or not isinstance(report_path, str):
+            return None
+        from agentic_fx.loops.improve_loop import parse_floor_report
+        from . import safe_open
+        try:
+            text = safe_open.read_improve_report(
+                self._improve_reports_dir, mission_id, report_path).decode("utf-8")
+            detail = parse_floor_report(text, mission_id=mission_id)
+        except Exception:  # noqa: BLE001 — 理由もパスも応答・ログに出さない
+            detail = None
+        if detail is None:
+            _log.warning("improve_run floor unavailable")
+            return None
+        return {"stage": detail.stage,
+                "pairs": [{"pair": row.pair, "trades": row.trades, "pf": row.pf,
+                           "avg_r": row.avg_r, "evaluable": row.evaluable}
+                          for row in detail.pairs]}
+
+    def emit_pending_improve_notices(self, *, enabled: bool) -> int:
+        """終端 snapshot を outbox として、まだ ``finished`` event が無い mission の
+        event を出す。起動時に listener を開く前に 1 回呼ぶ。出した件数を返す。
+        ``enabled`` が偽、または失敗したときは何も出さない (失敗は固定語だけ記録)。"""
+        if not enabled:
+            return 0
+        try:
+            return self._emit_pending_improve_notices()
+        except Exception:  # noqa: BLE001
+            _log.error("improve_notice_skipped reason=outbox_failed")
+            return 0
+
+    def _emit_pending_improve_notices(self) -> int:
+        floor = _aware(self._wall_clock()) - IMPROVE_OUTBOX_WINDOW
+        pending = []
+        for row in self.events.unannounced_improve_finishes():
+            created = _parse_time(row["created_at"])
+            if created is not None and created >= floor:
+                pending.append((created, row["mission_id"], row))
+        emitted = 0
+        for _, mission_id, row in sorted(pending, key=lambda item: item[:2]):
+            try:
+                event_id = self.events.emit_best_effort(
+                    "improve_run_changed", f"improve:{mission_id}",
+                    {"state": "finished", "trigger": row["trigger"],
+                     "result_code": row["result_code"], "reason_code": row["reason_code"],
+                     "tool_calls": row["tool_calls"]})
+            except EventSchemaError:
+                _log.error("improve_notice_skipped reason=schema")
+                continue
+            emitted += event_id is not None
+        return emitted
 
     def events_after(self, principal: Caller, *, after: int, limit: int,
                      deadline: float | None = None) -> dict:

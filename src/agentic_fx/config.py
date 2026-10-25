@@ -305,8 +305,9 @@ class AlertSettings(_Strict):
 
 
 class NotifySettings(_Strict):
-    """取引 event の発行。false にすると daemon は取引 event を一切出さない。"""
+    """event の発行。false にすると daemon は該当する event を一切出さない。"""
     trade_events: StrictBool = True
+    improve_events: StrictBool = True
 
 
 class NewsSettings(_Strict):

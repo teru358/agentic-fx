@@ -32,6 +32,10 @@ STAGING_ROOT = "_staging"
 ARCHIVE_ROOT = "_archive"
 HUMAN_ROOT = "_human"
 
+# 改善レポート (親専有の `data/improve_reports`) を読む上限と名前の文法。
+REPORT_MAX_BYTES = 64 * 1024
+_REPORT_DATE = r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 _CHUNK = 64 * 1024
@@ -146,7 +150,7 @@ def _open_plugins_dir(plugins_root: Path) -> int:
     return fd
 
 
-def _read_file(dir_fd: int, filename: str) -> bytes:
+def _read_file(dir_fd: int, filename: str, limit: int = MAX_FILE_BYTES) -> bytes:
     try:
         fd = os.open(filename, _FILE_FLAGS, dir_fd=dir_fd)
     except FileNotFoundError:
@@ -157,16 +161,16 @@ def _read_file(dir_fd: int, filename: str) -> bytes:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise SourceError(UNSAFE_SOURCE)
-        if info.st_size > MAX_FILE_BYTES:
+        if info.st_size > limit:
             raise SourceError(TOO_LARGE)
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(fd, min(_CHUNK, MAX_FILE_BYTES - total + 1))
+            chunk = os.read(fd, min(_CHUNK, limit - total + 1))
             if not chunk:
                 break
             total += len(chunk)
-            if total > MAX_FILE_BYTES:
+            if total > limit:
                 raise SourceError(TOO_LARGE)
             chunks.append(chunk)
         return b"".join(chunks)
@@ -216,3 +220,34 @@ def inspect_live(plugins_root: Path, name: object) -> LiveEntry:
         return LiveEntry("other")
     finally:
         os.close(pfd)
+
+
+def read_improve_report(reports_root: Path, mission_id: int,
+                        report_path_value: str) -> bytes:
+    """親が信頼する ``reports_root`` を dirfd として開き、同一 mission の report 1 本を読む。
+
+    ``report_path_value`` (DB に残る path 文字列) は開かない。basename が
+    ``improve-<日付>-<mission_id>.md`` の正規形に一致し、directory 部があれば
+    ``reports_root`` と一致するときだけ、``reports_root`` 直下のその名前を
+    ``O_NOFOLLOW`` で開く。regular file・64 KiB 以下・厳密な UTF-8 を確かめ、
+    失敗は固定の reason code の :class:`SourceError` で返す (path は入れない)。"""
+    if type(mission_id) is not int or not 1 <= mission_id < MISSION_ID_MAX:
+        raise SourceError(UNSAFE_SOURCE)
+    if type(report_path_value) is not str or "\x00" in report_path_value:
+        raise SourceError(UNSAFE_SOURCE)
+    directory, separator, basename = report_path_value.rpartition("/")
+    if re.fullmatch(rf"improve-{_REPORT_DATE}-{mission_id}\.md", basename) is None:
+        raise SourceError(UNSAFE_SOURCE)
+    if separator and os.path.normpath(directory or "/") != os.path.normpath(
+            os.fspath(reports_root)):
+        raise SourceError(UNSAFE_SOURCE)
+    dir_fd = _open_plugins_dir(reports_root)
+    try:
+        data = _read_file(dir_fd, basename, REPORT_MAX_BYTES)
+    finally:
+        os.close(dir_fd)
+    try:
+        data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        raise SourceError(UNSAFE_SOURCE) from None
+    return data
