@@ -498,12 +498,12 @@ settings.yaml の変更点はありません。
 例: 「ペーパー運用。実資金の発注は行わない。」
 例: 「対象は USDJPY の 1 時間足。指標発表の前後 30 分は新規に入らない。」
 例: 「選別して勝つを優先し、取引回数より負けを減らす提案を評価する。」
-後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。
+後から `afx ctl policy add` / `afx ctl backlog add` で足せます。空 Enter で飛ばせます。e で例文を入れます。
 方針文: 
 方針文を <N> 行書きました。
 課題は改善ループが最初に取り組む 1 件です。
 例: 「標準指標だけで組める 1 時間足の押し目買い戦略候補を 1 本作り、直近 3 ヶ月の履歴で PF と最大ドローダウンを測る」
-後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。
+後から `afx ctl policy add` / `afx ctl backlog add` で足せます。空 Enter で飛ばせます。e で例文を入れます。
 最初の課題: 
 最初の課題を <N> 件追加しました。
 ```
@@ -582,7 +582,7 @@ unit を置けていないため、有効化・起動は行いません。起動
 ```
 [段 14 次の一歩]
 起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。
-操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、`afx ctl improve add <案>`、`afx ctl policy add <文>`。
+操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、`afx ctl backlog add <案>`、`afx ctl policy add <文>`。
 改善候補の承認は二通り: Discord bot を有効にしたなら承認依頼で二段操作 (claim → confirm)、もう一つは `afx ctl --as approver approve <id>` (端末での確認あり)。
 ログ: logs/agentic.log、logs/activity.log、unit なら `journalctl --user -u afx`。
 設定を変えるときは `afx init` の再実行です (稼働中は先に `systemctl --user stop afx`)。

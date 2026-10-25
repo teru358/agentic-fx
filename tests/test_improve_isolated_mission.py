@@ -134,8 +134,9 @@ def test_operator_shell_verify_cli_passes_no_isolation_constant(
         return VB.VerifyBackendResult(True, "local", None, "a" * 64, "ok")
 
     monkeypatch.setattr(VB, "verify_backend", fake_verify)
-    rc = cli._improve_verify_backend(
-        None, _settings(), SimpleNamespace(backend="local", provider=None), tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda _path: _settings())
+    monkeypatch.setattr(cli, "load_env_file", lambda _path: None)
+    rc = cli.verify_backend_command(tmp_path, SimpleNamespace(backend="local", provider=None))
 
     assert rc == 0
     assert captured["isolation_options"] is VB.OPERATOR_SHELL_NO_ISOLATION

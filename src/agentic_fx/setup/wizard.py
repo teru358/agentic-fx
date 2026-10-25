@@ -2283,7 +2283,7 @@ def _stage14(sess: _Session, settings: Settings) -> None:
     sess.say("起動: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。")
     if settings.api.enabled:
         sess.say("操作は `afx ctl`: `afx ctl status` (稼働状態と未完の手順)、`afx ctl approval list`、"
-                 "`afx ctl improve add <案>`、`afx ctl policy add <文>`。")
+                 "`afx ctl backlog add <案>`、`afx ctl policy add <文>`。")
         sess.say("改善候補の承認は二通り: Discord bot を有効にしたなら承認依頼で二段操作 (claim → confirm)、"
                  "もう一つは `afx ctl --as approver approve <id>` (端末での確認あり)。")
     else:

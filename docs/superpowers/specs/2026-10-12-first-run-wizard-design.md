@@ -336,7 +336,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 - 表示:
   - 起動のしかた: unit なら `systemctl --user start afx` (状態は `systemctl --user status afx`)、手動なら `uv run afx`。
-  - 操作は `afx ctl`: `afx ctl status` で稼働状態と未完の手順、`afx ctl approval list`、`afx ctl improve add <案>`、`afx ctl policy add <文>`。
+  - 操作は `afx ctl`: `afx ctl status` で稼働状態と未完の手順、`afx ctl approval list`、`afx ctl backlog add <案>`、`afx ctl policy add <文>`。
   - 改善候補の承認は二通り。Discord bot を有効にしたなら、bot の承認依頼で二段操作 (claim → confirm)。もう一つは `afx ctl --as approver approve <id>` (approver 鍵、端末での確認あり)。
   - ログの場所: `logs/agentic.log`、`logs/activity.log`、unit なら `journalctl --user -u afx`。
   - 設定を変えるときは `afx init` の再実行 (稼働中は先に `systemctl --user stop afx`)。
