@@ -89,7 +89,7 @@ EXPECTED = (
     ('ctl ask', G.GUIDANCE, "CTL", 'afx ctl ask <question>', 'ask <質問>', "CHANGE", False, False, 'operate', 'ask', True, None),
     ('ctl improve', G.GUIDANCE, "CTL", 'afx ctl improve', 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
     ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'backlog add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
-    ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit <n>]', 'backlog list [--all] [--limit <n>]', "READ", False, False, 'guidance.read', 'backlog_list', True, None),
+    ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit <n>]', None, "READ", False, False, 'guidance.read', 'backlog_list', True, None),
     ('ctl backlog reject', G.GUIDANCE, "CTL", 'afx ctl backlog reject <id>', 'backlog reject <id>', "CHANGE", False, False, 'operate', 'backlog_reject', True, None),
     ('ctl backlog reopen', G.GUIDANCE, "CTL", 'afx ctl backlog reopen <id>', 'backlog reopen <id>', "CHANGE", False, False, 'operate', 'backlog_reopen', True, None),
     ('ctl backlog note', G.GUIDANCE, "CTL", 'afx ctl backlog note <id>', 'backlog note <id>', "CHANGE", False, False, 'operate', 'backlog_note', True, None),

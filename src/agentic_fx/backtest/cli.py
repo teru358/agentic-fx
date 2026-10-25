@@ -31,7 +31,8 @@ from agentic_fx.backtest.mt5_import import (
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
-from agentic_fx.cli_surface import leaf_help, parser_description, parser_help, render_epilog
+from agentic_fx.cli_surface import (HelpFormatter, leaf_help, parser_description, parser_help,
+                                    render_epilog)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin.history_git import HistoryGitError
@@ -59,7 +60,7 @@ def _surface_parser_kw(command: str, *, leaf: bool = False) -> dict:
         "help": leaf_help(command) if leaf else parser_help(command),
         "description": parser_description(command),
         "epilog": render_epilog(command),
-        "formatter_class": argparse.RawDescriptionHelpFormatter,
+        "formatter_class": HelpFormatter,
     }
 
 

@@ -1,14 +1,18 @@
 """Public CLI help is rendered from the command-surface metadata."""
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
+import subprocess
+import sys
 from pathlib import Path
 import unicodedata
 
 import pytest
 
 from agentic_fx import cli_surface
+from agentic_fx import entry
 from agentic_fx.entry import main as entry_main
 
 
@@ -177,7 +181,7 @@ def test_surface_publication_and_shell_help():
                    if not record.implemented or record.planned)
     shell_help = cli_surface.render_shell_help()
     assert "  backlog add <idea>  バックログへ課題を追加する" in shell_help
-    assert "  backlog list [--all] [--limit <n>]  バックログを表示する" in shell_help
+    assert "backlog list" not in shell_help
     assert "  improve add <idea>  旧名 (backlog add <idea>)" in shell_help
     assert "  stop  daemon を graceful shutdown する" in shell_help
     assert shell_help.endswith(
@@ -216,6 +220,36 @@ def test_product_copy_has_no_legacy_ops_word_order():
             assert "afx ops status " not in path.read_text(encoding="utf-8"), path
 
 
+_ACCESSORS = frozenset({
+    "parser_help", "parser_description", "leaf_help", "render_epilog", "top_description",
+    "render_top_epilog", "render_ctl_help", "render_shell_help"})
+_PARSER_CALLS = frozenset({"ArgumentParser", "add_parser", "_OpsOptionParser"})
+_COPY_KEYWORDS = frozenset({"help", "description", "epilog"})
+
+
+def _call_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _copy_outside_accessors(tree: ast.AST) -> list[int]:
+    """Lines of parser help / description / epilog values that are not an accessor call."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _call_name(node.func) not in _PARSER_CALLS:
+            continue
+        for keyword in node.keywords:
+            if keyword.arg not in _COPY_KEYWORDS:
+                continue
+            value = keyword.value
+            if not (isinstance(value, ast.Call) and _call_name(value.func) in _ACCESSORS):
+                found.append(keyword.value.lineno)
+    return found
+
+
 def test_parser_copy_comes_only_from_surface_accessors():
     source_files = (
         Path("src/agentic_fx/entry.py"),
@@ -230,11 +264,260 @@ def test_parser_copy_comes_only_from_surface_accessors():
     } | {record.usage for record in cli_surface.COMMANDS if " " in record.usage}
     for path in source_files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert _copy_outside_accessors(tree) == [], path
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in {
-                    "ArgumentParser", "add_parser"}:
-                for keyword in node.keywords:
-                    if keyword.arg in {"help", "description", "epilog"}:
-                        assert not isinstance(keyword.value, (ast.Constant, ast.JoinedStr)), path
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 assert node.value not in metadata_copy, (path, node.value)
+
+
+@pytest.mark.parametrize("source", [
+    'sub.add_parser("x", help="直書きの説明")',
+    'copy = "a" + "b"\nsub.add_parser("x", description="a" + "b")',
+    'copy = leaf_help("x")\nsub.add_parser("x", epilog=copy)',
+    'sub.add_parser("x", help=f"{name}")',
+    'argparse.ArgumentParser(prog="afx", description=SUMMARY.text)',
+    '_OpsOptionParser(prog="afx", epilog=copies["x"])',
+])
+def test_parser_copy_check_rejects_everything_but_accessor_calls(source):
+    assert _copy_outside_accessors(ast.parse(source)) != []
+
+
+def test_parser_copy_check_accepts_accessor_calls_and_ignores_options():
+    tree = ast.parse(
+        'sub.add_parser("x", help=leaf_help("x"), description=cli_surface.parser_description("x"),'
+        ' epilog=render_epilog("x"))\n'
+        'parser.add_argument("--n", help="option の説明")\n'
+        'argparse.ArgumentParser(prog="literal", description=top_description())')
+    assert _copy_outside_accessors(tree) == []
+
+
+def test_surface_module_has_no_assert_statement():
+    tree = ast.parse(Path("src/agentic_fx/cli_surface.py").read_text(encoding="utf-8"))
+    assert not [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+
+
+def test_exposure_is_explicit_and_never_inferred():
+    record = cli_surface._record(cli_surface.Group.SETUP, cli_surface.Lane.LOCAL, "x", "afx x",
+                                 cli_surface.Label.READ, "要約", "entry.py")
+    assert record.implemented and not record.planned
+    assert record.exposed is False
+
+
+# --- help layout is independent of the terminal width ---
+
+_FIXED_WIDTH_HELPS = (
+    ["--help"], ["ops", "--help"], ["ops", "bot", "--help"], ["ops", "web", "--help"],
+    ["ops", "notify", "--help"], ["history", "--help"], ["plugin", "--help"],
+    ["backtest", "--help"], ["analyze", "--help"],
+)
+
+
+def _display_width(line: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(char) in {"F", "W", "A"} else 1 for char in line)
+
+
+@pytest.mark.parametrize("argv", _FIXED_WIDTH_HELPS, ids=lambda argv: " ".join(argv))
+def test_help_text_does_not_follow_the_terminal_width(argv, capsys, monkeypatch):
+    outputs = {}
+    for columns in ("20", "200"):
+        monkeypatch.setenv("COLUMNS", columns)
+        outputs[columns] = _captured_help(argv, capsys)
+    assert outputs["20"] == outputs["200"]
+    for line in outputs["20"].splitlines():
+        assert _display_width(line) <= 100, line
+
+
+def test_every_parser_shares_the_fixed_width_formatter(monkeypatch):
+    formatters = []
+    real = argparse._SubParsersAction.add_parser
+
+    def spy(self, name, **kwargs):
+        parser = real(self, name, **kwargs)
+        formatters.append((f"{self._prog_prefix} {name}", parser.formatter_class))
+        return parser
+
+    monkeypatch.setattr(argparse._SubParsersAction, "add_parser", spy)
+    with pytest.raises(SystemExit):
+        entry_main(["--help"])
+    assert formatters
+    for path, formatter in formatters:
+        assert formatter is cli_surface.HelpFormatter, path
+
+
+# --- the top overview table follows the records ---
+
+def test_top_overview_rows_follow_the_records():
+    records = cli_surface.COMMANDS
+    renderer = cli_surface.SurfaceRenderer(tuple(
+        r for r in records if r.command.split()[0] != "history" and r.command != "ctl whoami"))
+    rows = {group.value: line for line in renderer.render_top_epilog().splitlines()
+            for group in cli_surface.Group if line.startswith(group.value)}
+    assert rows["市場入力を整える"].split() == ["市場入力を整える", "—", "—"]
+    assert rows["導入・接続管理"].split() == [
+        "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "—"]
+    assert "history" not in "".join(rows.values())
+
+
+def test_top_overview_survives_an_empty_record_set():
+    text = cli_surface.SurfaceRenderer(()).render_top_epilog()
+    for group in cli_surface.Group:
+        row = next(line for line in text.splitlines() if line.startswith(group.value))
+        assert row.split() == [*group.value.split(), "—", "—"]
+
+
+def test_ops_epilog_omits_the_legacy_paragraph_without_a_legacy_record():
+    renderer = cli_surface.SurfaceRenderer(compatibility=())
+    epilog = renderer.render_epilog("ops")
+    assert epilog.startswith("操作:")
+    assert "旧形" not in epilog
+
+
+# --- the ctl help follows the records ---
+
+def test_ctl_help_follows_the_records():
+    records = cli_surface.COMMANDS
+    changed = tuple(dataclasses.replace(r, ctl_text="whoami (差し替え)") if r.command == "ctl whoami"
+                    else r for r in records)
+    text = cli_surface.SurfaceRenderer(changed).render_ctl_help()
+    assert "  [読取] whoami (差し替え)" in text
+    dropped = tuple(r for r in records if r.command != "ctl policy show")
+    assert "policy show" not in cli_surface.SurfaceRenderer(dropped).render_ctl_help()
+
+
+def test_ctl_help_fold_mistakes_are_rejected_when_the_records_are_validated():
+    records = cli_surface.COMMANDS
+    first = next(r for r in records if r.command == "ctl whoami")
+    with pytest.raises(ValueError, match="no line to join"):
+        cli_surface.SurfaceRenderer(tuple(
+            dataclasses.replace(r, ctl_fold="join") if r is first else r for r in records))
+    log = next(r for r in records if r.command == "ctl activity")
+    with pytest.raises(ValueError, match="changes the label"):
+        cli_surface.SurfaceRenderer(tuple(
+            dataclasses.replace(r, label=cli_surface.Label.CHANGE) if r is log else r
+            for r in records))
+    with pytest.raises(ValueError, match="unknown ctl help fold"):
+        cli_surface.SurfaceRenderer(tuple(
+            dataclasses.replace(r, ctl_fold="x") if r is first else r for r in records))
+    hidden = next(r for r in records if r.command == "ops bot reconfigure")
+    with pytest.raises(ValueError, match="not shown"):
+        cli_surface.SurfaceRenderer(tuple(
+            dataclasses.replace(r, ctl_fold="join") if r is hidden else r for r in records))
+
+
+def test_ctl_usage_error_prints_the_help_without_a_traceback(capsys, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert entry_main(["ctl", "no-such-operation"]) == 2
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err + captured.out
+    assert (captured.out + captured.err).rstrip().endswith(
+        "API に発注・SL 変更・クローズ・サービス停止は無い。")
+
+
+# --- ops <feature> reconfigure: the parser and the old spelling share one table ---
+
+def test_reconfigure_registration_and_old_spelling_follow_the_same_records(monkeypatch, capsys):
+    choices = "{enable,disable,reconfigure,status}"
+    assert choices not in _captured_help(["ops", "bot", "--help"], capsys)
+    assert entry._shim_argv(["ops", "bot", "reconf"], 0) == (["ops", "bot", "reconf"], None)
+
+    bot = next(r for r in entry.COMMANDS if r.command == "ops bot reconfigure")
+    enabled = dataclasses.replace(bot, implemented=True, exposed=True)
+    monkeypatch.setattr(entry, "COMMANDS", tuple(
+        enabled if r is bot else r for r in entry.COMMANDS))
+
+    assert choices in _captured_help(["ops", "bot", "--help"], capsys)
+    assert entry._shim_argv(["ops", "bot", "reconf"], 0) == (["ops", "bot", "reconfigure"], None)
+    assert "{enable,disable,status}" in _captured_help(["ops", "notify", "--help"], capsys)
+
+
+# --- the parsers, the ctl grammar and the confirmation sets agree with the records ---
+
+_CTL_GRAMMAR = {
+    "afx ctl whoami": (["whoami"], "whoami"),
+    "afx ctl status": (["status"], "status"),
+    "afx ctl log [n]": (["log", "5"], "log"),
+    "afx ctl activity [n] [category]": (["activity", "5", "system"], "activity"),
+    "afx ctl events [--after <id>] [--limit <n>] [--follow]": (["events", "--follow"], "events"),
+    "afx ctl jobs get <id>": (["jobs", "get", "0123456789abcdef0123456789abcdef"], "job_get"),
+    "afx ctl jobs cancel <id>": (["jobs", "cancel", "0123456789abcdef0123456789abcdef"], "job_cancel"),
+    "afx ctl ask <question>": (["ask", "なぜ"], "ask"),
+    "afx ctl improve": (["improve"], "improve"),
+    "afx ctl backlog add <idea>": (["backlog", "add", "案"], "backlog_add"),
+    "afx ctl backlog list [--all] [--limit <n>]": (["backlog", "list", "--all"], "backlog_list"),
+    "afx ctl backlog reject <id>": (["backlog", "reject", "3"], "backlog_transition"),
+    "afx ctl backlog reopen <id>": (["backlog", "reopen", "3"], "backlog_transition"),
+    "afx ctl backlog note <id>": (["backlog", "note", "3"], "backlog_transition"),
+    "afx ctl policy add <text>": (["policy", "add", "方針"], "policy"),
+    "afx ctl policy show": (["policy", "show"], "policy_show"),
+    "afx ctl policy remove <id>": (["policy", "remove", "2"], "policy_remove"),
+    "afx ctl policy reconcile": (["policy", "reconcile"], "policy_reconcile"),
+    "afx ctl reflect retry <order_id>": (["reflect", "retry", "4"], "reflection_retry"),
+    "afx ctl approval list [n]": (["approval", "list"], "approval_list"),
+    "afx ctl approval show <id>": (["approval", "show", "5"], "approval_detail"),
+    "afx ctl approve <id>": (["approve", "5"], "approve"),
+    "afx ctl reject <id> [reason]": (["reject", "5", "理由"], "reject"),
+    "afx ctl approval retry <id>": (["approval", "retry", "5"], "retry"),
+    "afx ctl killswitch reset": (["killswitch", "reset"], "killswitch_show"),
+    "afx ctl killswitch reset <generation>": (["killswitch", "reset", "7"], "killswitch_reset"),
+    "afx ctl killswitch reconcile [confirm]": (["killswitch", "reconcile"], "killswitch_reconcile"),
+    "afx ctl data resume [--acknowledge]": (["data", "resume"], "data_resume"),
+    "afx stop": (["stop"], "stop"),
+}
+
+
+def _ctl_records() -> list:
+    return [r for r in cli_surface.COMMANDS if r.lane is cli_surface.Lane.CTL and r.exposed]
+
+
+def test_every_ctl_record_parses_from_its_own_grammar_one_to_one():
+    from agentic_fx.ops.client import parse
+
+    assert sorted(_CTL_GRAMMAR) == sorted(r.usage for r in _ctl_records())
+    for usage, (tokens, op_name) in _CTL_GRAMMAR.items():
+        assert parse(tokens).name == op_name, usage
+
+
+def test_confirmation_and_approver_labels_match_the_client_sets():
+    from agentic_fx.ops.client import _APPROVER_OPS, _CONFIRM_OPS
+
+    ops = {r.usage: _CTL_GRAMMAR[r.usage][1] for r in _ctl_records()}
+    confirm = {ops[r.usage] for r in _ctl_records() if r.confirm}
+    approver = {ops[r.usage] for r in _ctl_records() if r.approver}
+    assert confirm == set(_CONFIRM_OPS)
+    assert approver == set(_APPROVER_OPS)
+    cancel = next(r for r in _ctl_records() if r.usage == "afx ctl jobs cancel <id>")
+    assert (cancel.confirm, cancel.approver) == (True, False)
+    assert "job_cancel" in _CONFIRM_OPS and "job_cancel" not in _APPROVER_OPS
+
+
+def test_every_exposed_local_record_has_one_argparse_node_and_no_other_node_exists(monkeypatch):
+    registered = []
+    real = argparse._SubParsersAction.add_parser
+
+    def spy(self, name, **kwargs):
+        registered.append(f"{self._prog_prefix} {name}")
+        return real(self, name, **kwargs)
+
+    monkeypatch.setattr(argparse._SubParsersAction, "add_parser", spy)
+    with pytest.raises(SystemExit):
+        entry_main(["--help"])
+    assert len(registered) == len(set(registered))
+
+    expected = set()
+    for record in cli_surface.COMMANDS:
+        if record.lane is cli_surface.Lane.LOCAL and record.exposed:
+            expected.update(f"afx {path}" for path in cli_surface._expand(record))
+    expected |= {f"afx {parent.command}" for parent in cli_surface.PARENTS
+                 if not parent.command.startswith("ctl ") and parent.command != "ctl"}
+    exceptions = {"afx ctl"}  # `afx ctl` is handed to the client before argparse; only its help row is registered
+    assert "afx news" not in registered  # planned, not yet a command
+    assert set(registered) - exceptions == expected
+    assert exceptions <= set(registered)
+
+
+def test_surface_import_keeps_the_agentic_fx_closure_to_two_modules():
+    code = (
+        "import sys, agentic_fx.cli_surface\n"
+        "print(sorted(n for n in sys.modules if n == 'agentic_fx' or n.startswith('agentic_fx.')))")
+    completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert completed.stdout.strip() == "['agentic_fx', 'agentic_fx.cli_surface']", completed.stderr

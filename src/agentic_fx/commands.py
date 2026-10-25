@@ -58,6 +58,9 @@ def add_policy_directive(conn, policy_path: Path, activity: ActivityLog, text: s
     return identifier
 
 
+_LEGACY_IMPROVE_ADD_NOTICE = "improve add は旧名です。backlog add を使ってください。"
+
+
 def add_backlog_idea(conn: sqlite3.Connection, activity: ActivityLog, text: str, now: datetime,
                      *, via: str = "shell") -> int:
     """バックログへ課題を足し、activity に backlog_added を残す (shell と初期設定が共有)。"""
@@ -227,6 +230,10 @@ class Commands:
                 # の id を知るための一覧。**holdout / in_sample の数値は出さない**
                 # (詳細は `approval <id>`)。
                 return self._approval_list(args[1] if len(args) == 2 else None)
+            if cmd == "approval" and args[:1] == ["show"]:
+                args = args[1:]
+                if len(args) != 1 or not args[0].isdigit():
+                    return "usage: approval show <id>"
             if cmd == "approval" and len(args) == 1 and args[0].isdigit():
                 # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
                 # claude #69 観測 A、2026-09-11): approve/reject する前に
@@ -324,11 +331,11 @@ class Commands:
                     return f"improve job {reply['job_id']} を受理しました"
                 mission_id = self.improve_supervisor.submit_manual()
                 return f"improve mission #{mission_id} を起動しました"
-            if ((cmd == "backlog" and args and args[0] == "add")
-                    or (cmd == "improve" and args and args[0] == "add")):
+            if cmd in ("backlog", "improve") and args[:1] == ["add"]:
+                notice = _LEGACY_IMPROVE_ADD_NOTICE + "\n" if cmd == "improve" else ""
                 text = " ".join(args[1:])
                 if not text:
-                    return "usage: backlog add <idea text>"
+                    return notice + "usage: backlog add <idea text>"
                 if self.ops_service is not None:
                     bid = self.ops_service.add_backlog(
                         ShellCaller.SHELL, uuid.uuid4().hex, text)["id"]
@@ -337,7 +344,7 @@ class Commands:
                 else:
                     bid = add_backlog_idea(self.conn, self.activity, text, self.clock.now())
                 display, removed = normalize_idea_display(text)
-                reply = f"backlog #{bid} を追加しました: 「{display}」"
+                reply = notice + f"backlog #{bid} を追加しました: 「{display}」"
                 if idea_looks_unintended(display):
                     reply += ("\n⚠ 短い/プレースホルダのように見えます。意図した内容で"
                              "あることを確認してください (削除・訂正は "

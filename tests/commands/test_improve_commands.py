@@ -77,8 +77,44 @@ def test_backlog_add_and_legacy_alias_share_the_shell_dispatch(command, commands
 
     result = cmds.dispatch(command)
 
+    notice = "improve add は旧名です。backlog add を使ってください。"
+    if command.startswith("improve"):
+        assert result.startswith(notice + "\n")
+        result = result.removeprefix(notice + "\n")
+    else:
+        assert notice not in result
     assert result.startswith("backlog #1 を追加しました:")
     assert len(backlog.list_open(conn)) == 1
+
+
+def test_legacy_improve_add_prefixes_the_notice_on_the_usage_reply_too(commands):
+    cmds, _, _ = commands
+
+    assert cmds.dispatch("improve add") == (
+        "improve add は旧名です。backlog add を使ってください。\n"
+        "usage: backlog add <idea text>")
+    assert cmds.dispatch("backlog add") == "usage: backlog add <idea text>"
+
+
+def test_every_shell_help_operation_reaches_a_dispatch_branch(commands):
+    from agentic_fx import cli_surface
+
+    cmds, _, _ = commands
+    help_text = cli_surface.render_shell_help()
+    records = [r for r in cli_surface.COMMANDS if r.exposed and r.shell and r.shell_usage]
+    assert records
+    for record in records:
+        if record.command == "stop":
+            continue  # 終了は dispatch でなく shell の入力 loop が受ける
+        words = []
+        for word in record.shell_usage.split():
+            if word.startswith(("[", "-")):
+                break
+            words.append("1" if word.startswith("<") else word)
+        reply = cmds.dispatch(" ".join(words))
+        assert reply != help_text, record.shell_usage
+    assert "backlog list" not in help_text
+    assert cmds.dispatch("backlog list") == help_text
 
 
 def test_improve_add_without_text_returns_usage(commands):
