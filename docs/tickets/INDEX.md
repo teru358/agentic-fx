@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 140 件。完了分は closed/。
+未完了: 142 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -62,9 +62,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (122)
+## 設計待ち (124)
 
-### 不具合 (69)
+### 不具合 (70)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -124,6 +124,7 @@
 | [rollback-foreign-temp-link-sweep](open/rollback-foreign-temp-link-sweep.md) | 低 | 2026-10-18 | foreign で終端した rollback の temp symlink を sweep の対象にする |
 | [improve-duplicate-self-computed-strategies](open/improve-duplicate-self-computed-strategies.md) | 低 | 2026-10-22 | 自前計算の戦略 (sma_cross 型) は重複判定を構造変更で避けられる |
 | [ops-web-head-request-loop-error](open/ops-web-head-request-loop-error.md) | 低 | 2026-10-24 | 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す |
+| [news-cli-distinguish-permission-from-missing-db](open/news-cli-distinguish-permission-from-missing-db.md) | 低 | 2026-10-25 | afx news が権限不足・パス不備も「DB がありません」と出す |
 | [test-init-guard-order-dependent-on-fetchers](open/test-init-guard-order-dependent-on-fetchers.md) | 低 | 2026-10-25 | offline init test が test_fetchers の後では赤になる (順序依存) |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
@@ -138,7 +139,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (33)
+### 機能 (34)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -173,6 +174,7 @@
 | [ctl-status-shows-active-gate-floor](open/ctl-status-shows-active-gate-floor.md) | 低 | 2026-10-22 | afx ctl status に稼働中の収益性フロア 3 値を出す |
 | [ctl-improve-return-on-accept](open/ctl-improve-return-on-accept.md) | 低 | 2026-10-25 | afx ctl improve は受理で返り、完了を待たない |
 | [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 低 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
+| [init-news-source-remove-on-revisit](open/init-news-source-remove-on-revisit.md) | 低 | 2026-10-25 | afx init 段 3 の再入時に入力済みのニュース源を取り消せない |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
