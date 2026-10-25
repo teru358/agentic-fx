@@ -1,6 +1,6 @@
 # 改善 mission の開始・終了通知 (Discord) 設計書
 
-**版:** v0.6 (T1a 実装レビューの是正: plugin gate の隔離不能を `gate_failed/gate_sandbox_unavailable` に、`improve_notice_codes` の置き場、終端 helper の引数を `choice` のみに)
+**版:** v0.7 (T1b 実装で GET `/v1/improve/runs/{id}` の応答 DTO を確定: §4.6 に表を追加)
 
 **対象:** `improve-start-and-result-to-discord` (追加要望 2 点を含む)
 
@@ -314,6 +314,45 @@ bot ──escape・切詰め──▶ Discord に投稿。本文は worker の�
 
 parser は `_render_floor_report_detail` と同じ module に置き、render → parse の往復を test で固定する。
 
+**応答 DTO (T1b 実装で確定。キー名・型・null の条件は afx-ops との契約)**
+
+```json
+{"id": 2043, "backend": "local", "model": "qwen3.6-35b", "elapsed_sec": 261,
+ "snapshot": {"trigger": "scheduled", "result_code": "gate_failed", "reason_code": "unprofitable",
+              "tool_calls": 10, "observation_text": null},
+ "report_state": "published",
+ "approval": null,
+ "floor": {"stage": "holdout",
+           "pairs": [{"pair": "USDJPY", "trades": 13, "pf": 1.8458377992140615,
+                      "avg_r": 0.3029234868346611, "evaluable": false}]}}
+```
+
+| キー | 型 | null / 値の条件 |
+|---|---|---|
+| `id` | 整数 | 要求した mission id |
+| `backend` / `model` | 文字列 | `missions.runner` / `missions.model` を `display_text` で 1 行に畳んだもの。終端前でも返る |
+| `elapsed_sec` | 整数 または null | snapshot の `created_at` − `missions.started_at` をマイクロ秒の整数で引き、`(us + 500_000) // 1_000_000` (0.5 秒は切り上げ、float を使わない)。snapshot なし (終端前)、`(failed, interrupted)`、時刻のパース失敗、終了が開始より前のとき null。tz 無しの時刻は UTC とみなす |
+| `snapshot` | オブジェクト または null | 終端前 (snapshot なし) は null |
+| `snapshot.trigger` | `manual` / `scheduled` | |
+| `snapshot.result_code` | 5 値のどれか | `submitted` / `observation` / `report` / `gate_failed` / `failed` |
+| `snapshot.reason_code` | 文字列 または null | §4.2 の許可対に入る値、または null |
+| `snapshot.tool_calls` | 整数 または null | 記録なしは null |
+| `snapshot.observation_text` | 文字列 または null | `observation` のときだけ非 null になり得る。`display_text` で制御文字・改行を畳んだもの (上限 2,000 字の保存分をそのまま。切詰めは bot)。畳んだ結果が空なら空文字 `""` (bot は `(記載なし)` に倒す) |
+| `report_state` | `none` / `prepared` / `published` / `failed` | run 行が無ければ `none` |
+| `approval` | オブジェクト または null | snapshot の `approval_id` が null、または `approval_requests` に行が無いとき null |
+| `approval.id` | 整数 | |
+| `approval.plugin` | 文字列 または null | 承認 payload の `name` が plugin 名の文法 (`^[a-z][a-z0-9_]{0,63}$`) に一致するときだけ。取れなければ null |
+| `approval.kind` | 文字列 または null | `approval_requests.kind` を `display_text` で畳んだもの。空なら null |
+| `floor` | オブジェクト または null | `result_code=gate_failed` かつ `reason_code=unprofitable` かつ `report_state=published` で、親専有レポートを読んで形式検査に通ったときだけ非 null。それ以外 (読めない、形式不正、`improve_reports_dir` 未設定を含む) は null。理由は応答にもログにも出さない |
+| `floor.stage` | `in_sample` / `holdout` | レポートの `failed_stage` (1 段だけ) |
+| `floor.pairs` | 配列 | 落ちた段の表のうち `failed_pairs` に載った pair を表の順に。件数の上限は設けない (3 本超でも全部返す。表示側が切る) |
+| `floor.pairs[].pair` | 文字列 | `^[A-Z0-9_]{3,16}$` |
+| `floor.pairs[].trades` | 整数 | 0 以上 |
+| `floor.pairs[].pf` / `avg_r` | 浮動小数 または null | 表の値そのまま (丸めは表示側)。レポートの `None` は null。`nan` / `inf` / 空欄はレポートごと形式不正 |
+| `floor.pairs[].evaluable` | 真偽値 | `True` / `False` だけ |
+
+404 (`NOT_FOUND`) は mission が存在しない、または `missions.loop` が `improve` でないときだけ。応答にパス・例外の文面・鍵は含まれない。
+
 ### 4.7 afx-ops
 
 afx-ops は `agentic_fx` を import しない独立 package で、event の検証は `notify/payload.py` に自前の写しを持つ。daemon の厳格な許可対 (§4.2) はそのまま残し、afx-ops 側は**文法だけを検証して、語の追加で止まらない**ようにする。
@@ -384,3 +423,4 @@ T1a → T1b は順序あり (T1b は T1a の定数と snapshot を使う)。T1b 
 | 2026-10-25 | v0.4 | `_finalize_report_or_observation` の 3 呼び出しの notice の出所と observation selector (§4.2)、質検査を 4 種に (到達不能の `candidate_identity_unavailable` 行を削除)、status の優先順位、wrapper の `code=` の AST 検査と suffix 変異 (AC-5)、`BaseException` も補償してから再送出 (§4.5・AC-7)、outbox の 3 条件と `ops_events (code, ref)` の index (§4.4)、`failed_stage` は 1 段のみ (§2.2・§4.6・AC-2)、T1b に `src/agentic_fx/service.py` と呼び出し位置・統合条件、T1a の件数を grep 74 / call 式 68 に (§6) | 設計レビュー 3 周目 (sol 閉鎖確認、詳細 `tmp/review-discord/c0-r3-triage.md`) | |
 | 2026-10-25 | v0.5 | §7 の 2 件 (開始通知の要否と既定、床未達の数値の粒度) を裁定済に (推奨どおり) | ユーザー裁定 (2026-10-25、「推奨で」) | |
 | 2026-10-25 | v0.6 | plugin gate の隔離不能を `gate_failed/gate_sandbox_unavailable` に (backlog を消費する実挙動と一致させる。strategy gate の `failed/sandbox_unavailable` と区別。§4.2)、`improve_notice_codes` を `agentic_fx/improve_notice_codes.py` に (§4.1)、`_finalize_report_or_observation` は `choice` のみを受け notice は `choice.notice` から導出、未知 artifact は `risk_gate_unsupported` に倒す (§4.2・AC-5)、質検査の防御枝 `candidate_identity_unavailable` を `unverified` に引く (§4.2・AC-5) | T1a 実装レビュー (/code-review high + codex r1、詳細 `tmp/review-discord/reports/t1a/t1a-rulings.md`) | |
+| 2026-10-25 | v0.7 | GET `/v1/improve/runs/{id}` の応答 DTO (キー名・型・null の条件) を表で確定 (§4.6) | T1b 実装で DTO を確定 (T2 との契約) | |
