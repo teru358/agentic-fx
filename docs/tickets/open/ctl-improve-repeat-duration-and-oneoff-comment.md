@@ -16,6 +16,13 @@ related: [improve-feedback-structure, improve-run-summary-for-humans, improve-st
 
 1 回の戦略改善でうまくいくことはなく、数をこなすしかない。いまは afx ctl improve を 1 回ずつ手で打つ。(1) 期間指定: -t 1h のようにタイマーをかけ、時間が残っている限り improve を再試行させたい。残り数分で走り始めても作業を切り捨てるのは勿体ないので完走を許容する (最低保証: -t 1m でも 1 回は実施)。繰り返しの間、連続した情報 (族別の試行結果、直前の mission の観察文) は保持できるほうがよい。(2) 一時的な指示: backlog や policy/directives.md は恒久的な指示しかできず「今回だけ」の融通が難しい。-c 'ほげほげ' のような comment で、その繰り返し期間 (または 1 回) に限る指示を mission のプロンプトに注入したい (2026-10-25 ユーザー依頼)。
 
+## 裁定と案 (2026-10-25)
+
+- 時間は h と m で指定する (例 `1h30m`、`45m`、`2h`)。単位なしの数は拒否 (rc=2)。
+- 最長期間は設ける。指揮者推奨 **24h** (超過は rc=2)。理由: 無人で codex / claude の枠を食い尽くす、429 連続で `mission_failed` が並ぶ、週次と重なる。settings で変えられる値にはしない (安全側の固定)。
+- オプション案: `-t/--duration <h/m>` (繰り返し期間)、`-c/--comment '<文>'` (その job 限りの指示。上限 1000 字、directives.md と同じ除染、activity と Discord には固定語だけ)、`-n/--max-runs N` (回数でも止められる。`-t` と併用時は先に達したほうで止める)。既定は従来の 1 回。
+- 細かい設計は実装時に決める (ユーザー了承)。
+
 ## 原因
 
 ## 処置案・裁定
@@ -27,3 +34,4 @@ related: [improve-feedback-structure, improve-run-summary-for-humans, improve-st
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 時間単位 (h/m)、最長期間 24h、オプション案 (-t / -c / -n) を追記。
