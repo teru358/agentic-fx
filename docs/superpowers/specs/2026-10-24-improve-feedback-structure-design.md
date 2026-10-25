@@ -428,6 +428,32 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 - in-sample 成績の族別順序尺度は、holdout・期間・標本数・人間判断の漏洩境界を別 spec で裁定する。
 - note のあいまい一致による畳み込みは入れない。解消済みの note を退役させる人間の操作は別チケットで扱う。
 
+## 9.5 indicator 新設の経路 (v0.4、チケット improve-mission-indicator-creation-path)
+
+### 9.5.1 事実と原因
+
+2026-10-25、利用者が方針文 3 件 (「必要な指標が無ければ kind=indicator の plugin を新設して検証に使う」等) を入れて `afx ctl improve` を 3 回回しても、候補は既存 12 指標の strategy だけで新指標は作られなかった。その後、indicator を作る課題を backlog に明示して回した 1 回で `atr_regime` (ATR の相対分位) が候補になり、承認・配備され、次の mission の strategy が依存した。つまり機構は動く。足りないのは prompt の導線で、原因は 2 つ。
+
+1. 規律 7 「**無い指標は自前計算せず**、`不足指標: <名前と定義>` として `discoveries` に起票」が、方針文より強く読まれる (規律は「必ず守ること」、方針は参照節)。「作るな」と読める。
+2. 族表の `indicator (未配備) @<足>` 行と `未配備指標` の説明は、それを候補として作る選択肢だと言っていない。最終出力の例は `kind: indicator` を含むが、indicator 候補の作り方 (self-test のみ、`run_backtest` は strategy 専用、同じ mission で strategy と同時提出は不可、承認後に依存できる) がどこにも書かれていない。
+
+### 9.5.2 変更 (prompt の文言だけ、tool・gate・table は変えない)
+
+| 箇所 | 現行 | 変更後 |
+|---|---|---|
+| 規律 7 の末尾 | 「**無い指標は自前計算せず**、`不足指標: <名前と定義>` として `discoveries` に起票してください。」 | 「**無い指標を strategy の中で自前計算しないでください。** 無い指標は、この mission の候補を `kind: indicator` の plugin にして新設できます (self-test のみで提出。`run_backtest` は strategy 専用。strategy と同時には提出できず、承認・配備の後の mission で `indicators:` に書けます)。配備済みに同じ定義があれば別名で作らず再利用してください。今回は strategy を続けるなら、`不足指標: <名前と定義>` として `discoveries` に起票してください。」 |
+| 族表の説明 (「仮説族の試行状況」節) | 「`indicator (未配備) @<足>` は配備されていない indicator 候補を足ごとにまとめた行で、`未配備指標` は配備されていない indicator への依存を表します。」 | 同文の直後に「未配備の indicator は、それ自体を `kind: indicator` の候補として作る選択肢です (規律 7)。」を足す |
+| 「ユーザー方針」節の冒頭 | (見出しの直後に本文) | 見出しの直後に 1 文「方針は規律の範囲で、仮説と候補の種類 (indicator / strategy) の選択を導きます。規律と矛盾する方針は規律が優先します。」 |
+| 最終出力の説明 | `artifact.kind` の値の説明なし | 箇条書きに 1 項「`artifact.kind` は `indicator` か `strategy`。indicator 候補は `outputs` を `config.yaml` に宣言し、self-test で warmup と出力列を確認します。」 |
+
+### 9.5.3 受入条件
+
+| ID | 条件 | 観測点 |
+|---|---|---|
+| AC-30 | 描画した prompt に上の 4 文が逐語で含まれ、旧文「無い指標は自前計算せず、`不足指標`」が含まれない。遮断 (AC-16 の FORBIDDEN) は不変 | `test_improve_prompt_objective.py` の REQUIRED / FORBIDDEN に追加 |
+| AC-31 | 「ユーザー方針」節は規律の節より前にあり、優先文は方針本文より前にある | 描画結果の index 比較 |
+| AC-32 | 実測 (手動 `afx ctl improve`、方針文のみ・indicator 課題なし): indicator 候補が 1 件以上出るか、出ないなら `不足指標:` の discovery が残る。10/31 の週次でも同じ観測 | 運用観測 (AC-20 と同じ枝) |
+
 ## 10. 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
@@ -437,3 +463,4 @@ T1 と T2 は `improve_mission.md`、`improve_loop.py` の render、`test_improv
 | 2026-10-24 | v0.3 | pair に `settings.pairs` 所属と字句文法 `^[A-Z]{6}$` の AND を課し、空 pair 列を `族不明` に、`,` 区切りの単射性を字句文法で保証。公開型に `ProjectedStrategyFamilyLabel` を追加。昇順・重複なしを再生成比較だけに担わせ M-14 を独立に落とせるようにした。AC-19 を族別節の形式検査と prompt 全体の時刻 canary 不在に分割。`timeframe: null` 正規化の残余リスクを表示・履歴 identity の互換性に訂正 | 2 周目の指摘 | |
 | 2026-10-24 | v0.3a | AC-3 の settings に `EURUSD` を加え、archive 側で `,` 入り pair の過去行が 2 pair 族に数えられる残余を §2.3 / §9.3 に明記。 | 閉鎖確認 (opus) の Low 2 | |
 | 2026-10-24 | v0.3b | 規則外の配備名を `他 N 件を省略` から分け、`invalid_name_count` と固定文 `規則外の配備名 N 件` で出す。`family_key_from_parts` の「保存値と byte 互換」を外し、`timeframe: null` の変化を明記。全行読みの規模を §9.3 に追加。 | T1 の /code-review の指摘 1・8・10 | |
+| 2026-10-25 | v0.4 | §9.5 indicator 新設の経路: 規律 7 の文言を「strategy の中で自前計算しない。kind=indicator 候補として新設できる」に改め、族表の説明・ユーザー方針節の優先文・最終出力の kind 説明を追加。AC-30〜32 | チケット improve-mission-indicator-creation-path (2026-10-25 ユーザー承認)。方針 3 件で新指標が作られず、課題の明示で `atr_regime` が作られた実測 | |
