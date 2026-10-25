@@ -153,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False,
                    help="稼働中の daemon を操作 API で操作する (afx ctl help)")
+    sub.add_parser("status", help="オフライン状態を書き込まずに表示する")
     backtest_cli.register_subparsers(sub)
     try:
         args = parser.parse_args(args_list)
@@ -201,6 +202,9 @@ def main(argv: list[str] | None = None) -> int:
             return run_ops_disable(root, args.feature)
         from agentic_fx.ops_setup.stages import run_ops_command
         return run_ops_command(root, args.ops_action, args.feature)
+    if args.command == "status":
+        from agentic_fx.status import main as status_main
+        return status_main(root)
     if args.command in _BACKTEST_COMMANDS:
         return backtest_cli.dispatch(args, root)
     daemon = args.daemon

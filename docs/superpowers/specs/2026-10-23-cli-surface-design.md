@@ -702,11 +702,12 @@ lock の保持者は daemon だけではない。初回設定、`afx keys`、`op
 | settings | `config/settings.yaml` | 他 source と分離して `ok / missing / invalid` を返す。missing / invalid でも後続 collector を止めない |
 | pending | setup record、optional settings、optional DB、`.env` の鍵名、plugin inventory | source ごとの collector から `PendingFacts` を合成し、`pending_steps(..., for_status=True)` へ渡す。外部接続を probe しない (`setup/pending_facts.py:32-65`) |
 | ops | `data/ops/<feature>.stage.json` と enroll marker | `read_stage(..., missing_ok=True)`、`read_marker()` (`ops_setup/stages.py:70-89,128-150`) |
-| units | user unit file、systemd、linger | unit の有無と `is-active`。systemd が無ければ `unknown` |
+| units | user unit file、systemd、linger | unit の有無と `is-active`。`is-active` の stdout が `active` / `activating` / `deactivating` / `inactive` / `failed` ならその語、systemd が無い・bus に繋がらない・stdout が空か未知の語なら `unknown` (rc 1 にしない)。`inactive` は systemd がそう答えたときだけ |
+| plugin inventory (pending 用) | `plugins/` directory と §6.4 の観測用 DB 接続 | daemon と同じ `plugin_loader.approved_plugins(conn, plugins_dir, settings=settings).inventory.metas`。`plugins/` 不在、settings か DB が無いときは `()` (観測できた「無い」)。inventory の構築そのものが例外のときは `()` にせず `pending steps: unavailable` (rc 1)。directory も DB も作らない |
 | recent mission | §6.4 の観測用 DB 接続で `missions.recent(conn, 1)` | DB が無ければ `none`、破損 / schema 不足は `unavailable` (`store/missions.py:258`) |
 | pending approvals | §6.4 の観測用 DB 接続で `approvals.pending(conn)` | 件数だけ出す (`store/approvals.py:263`) |
 | plugin deploy ops | `count_open_readonly(db_path, opener=<§6.4 の helper>)` | `none / N / unavailable` を区別する (`store/plugin_deploy_ops.py:272-300`) |
-| recent activity | `logs/activity.log` | `tail_lines(..., 1)`。本文は redactor を通し 200 字 |
+| recent activity | `logs/activity.log` | `tail_lines(..., 1)`。行を `\t` で分けてから field ごとに redactor を通し、本文は 200 字 (行全体を redact すると 1 か所の該当で全文が消え、分割できなくなる) |
 | kill switch / mode | `data/state/app_state.json` と reset marker `app_state.json.reset-in-progress` (`store/state.py:89,148-150`) | §6.5 の読取専用 state reader で読む。`instance: unknown` のときは呼ばない |
 
 setup、settings、DB、state、ops、unit、activity、plugin はそれぞれ独立 collector とし、入力と失敗を共有しない。settings や DB が無いときはそれを要する pending fact だけを集めず、その欠落は `settings:` 行と `database:` 行で示す。鍵の存在、unit、ops marker、activity など残りは表示する。DB、lock、設定、unit、log、directory を作らない。初期化関数と migration を呼ばない。
@@ -731,21 +732,21 @@ agentic-fx offline status
 instance: free
 setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
-unit: afx.service=<installed|missing> active=<inactive|failed|unknown> linger=<enabled|disabled|unknown>
-ops: bot=<stage|missing|invalid> web=<stage|missing|invalid> notify=<stage|missing|invalid> marker=<none|feature|invalid>
-state: mode=<learning|paper|live|unavailable> kill_switch=<clear|latched|unavailable>
+unit: afx.service=<installed|missing> active=<active|activating|deactivating|inactive|failed|unknown> linger=<enabled|disabled|unknown>
+ops: bot=<stage|missing|invalid|unavailable> web=<stage|missing|invalid|unavailable> notify=<stage|missing|invalid|unavailable> marker=<none|feature|invalid>
+state: mode=<learning|trading|unavailable> kill_switch=<clear|latched|unavailable>
 database: <ok|missing|unavailable>
 recent mission: <#id state at|none|unavailable>
 pending approvals: <N|unavailable>
 plugin deploy ops: <N|none|unavailable>
 recent activity: <timestamp category event|none|unavailable>
-pending steps: <N>
+pending steps: <N|unavailable>
   - <既存 render_pending_step の文>
 note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
 next: afx init | afx check | systemctl --user start afx.service | afx ctl status
 ```
 
-`instance: unknown` の場合も同じ形を出すが、`state: mode=unavailable kill_switch=unavailable` として state reader 自体を呼ばない。`next` は観測結果から 1 つだけ選ぶ。setup missing / corrupt は `afx init`、settings missing / invalid は `afx check`、unit があり `instance: free` は `systemctl --user start afx.service`、それ以外は `afx ctl status` とする。鍵 file は locked / free / unknown の判定に使わず、鍵が一つも無くてもこの固定出力を出す。値が無いことと読めないことを混同しない。各 source の失敗で traceback を出さず、他の source の表示を続け、読めない節だけ `unavailable` にする。
+`instance: unknown` の場合も同じ形を出すが、`state: mode=unavailable kill_switch=unavailable` として state reader 自体を呼ばない。`next` は観測結果から 1 つだけ選ぶ。setup missing / corrupt は `afx init`、settings missing / invalid は `afx check`、unit があり `instance: free` で active が `inactive` / `failed` / `unknown` なら `systemctl --user start afx.service`、それ以外 (active / activating / deactivating を含む) は `afx ctl status` とする。鍵 file は locked / free / unknown の判定に使わず、鍵が一つも無くてもこの固定出力を出す。値が無いことと読めないことを混同しない。各 source の失敗で traceback を出さず、他の source の表示を続け、読めない節だけ `unavailable` にする。`unavailable` は「読もうとして読めなかった」(例外、壊れた DB、table 欠落、lock の待ち切れ) にだけ使う。file の形が違う `invalid` / `corrupt`、systemd が無い `unknown`、file が無い `missing` / `none` は観測できた値であり `unavailable` ではない。終了コードは、どこかの節が `unavailable` なら 1、そうでなければ 0 とする (`invalid` / `unknown` / `missing` は rc を変えない)。ops の stage file は、形が違えば `invalid` (rc 0)、読取そのものが例外なら `unavailable` (rc 1)。DB の 3 行 (recent mission / pending approvals / plugin deploy ops) はそれぞれ別の読取であり、1 つの table が欠けても他の 2 行は出す。
 
 ### 6.4 観測用の読み取り専用 DB 接続
 
@@ -990,3 +991,7 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-25 | v0.5k | §5.3.4 に shell fallback の失敗文 2 種、段 12 / shell が共有する書込み手順 (insert → commit → reconcile → activity、`request_id` は uuid4) と段 12 の DB 接続を先頭で開くことを明記 | B2c 着手前の指揮者による補完 (shell fallback の失敗文が未定義) | |
 | 2026-10-25 | v0.5l | §5.3.4 の共有手順を API と同じ順 (先頭 reconcile → 本文検査 4000 字 → insert → reconcile → activity) に改め、activity 失敗は第 2 文にしない、insert_policy の commit 失敗は rollback、段 12 の重複判定に DB 完全一致を追加、DB を開けないときの固定文を新設 | B2c /code-review high 6 件 (#1 activity の誤診断、#2 DB 二重行、#3 connect 失敗で段が落ちる、#4 4000 字の未検査、#5 先頭 reconcile 不在、#6 commit 失敗の rollback 不在) | |
 | 2026-10-25 | v0.5m | §5.3.4: activity 失敗は ActivityLog の非送出契約に従い成功扱い (第 2 文にしない)、段 12 の重複判定での OSError / sqlite3.Error は第 1 文 | B2c 閉鎖確認 (terra) P1 2 件: ActivityLog.write は例外を出さないので「伝播」は成立しない / 重複判定の file 読取が先頭 reconcile より前で OSError が未捕捉 | |
+| 2026-10-25 | v0.5n | §6.3: `unavailable` の定義と rc の規則 (unavailable のみ rc 1、invalid / unknown / missing は rc 0)、ops の読取例外は `unavailable`、`pending steps: unavailable`、DB 3 行は別読取 | A2 受入 test (sonnet) が見つけた実装との食い違い 7 本の裁定 (4〜6 は spec の語を厳密化) | |
+| 2026-10-25 | v0.5o | §6.3 の `mode` の語を実 schema (`Mode` = learning / trading) に合わせ、§6.2 に pending 用の plugin inventory の取り方 (daemon と同じ `approved_plugins`、欠落時は `()`) を追加 | A2 codex r1 High 2 (state の mode 語が実 schema と不一致、plugin inventory 未収集) | |
+| 2026-10-25 | v0.5p | §6.2 / 6.3: `is-active` の語を systemd の答えどおり (active / activating / deactivating / inactive / failed、観測できなければ unknown)、activity は field ごとに redact、plugin inventory の構築例外は pending steps unavailable。`data/agentic.db` の regular 判定は symlink を辿る (stat)、辿れない symlink は unavailable | A2 /code-review high 8 件 (#2 #3 #4 #6 採用、#5 #7 #8 部分採用、#1 probe の瞬間 shared lock は §6.1 の設計どおりで却下) | |
+| 2026-10-25 | v0.5q | §6.3 の `next` の start 条件に active の語 (inactive / failed / unknown) を加える | A2 是正 2 (sonnet) の指摘: is-active の語を増やしたので start を勧める条件が要る | |

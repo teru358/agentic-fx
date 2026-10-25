@@ -170,7 +170,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             scope="status.read", endpoint_code="whoami", daemon_required=True),
 
     _record(Group.OBSERVE, Lane.LOCAL, "status", "afx status", Label.READ,
-            "停止中の状態を表示する", "status.py", implemented=False),
+            "オフライン状態を書き込まずに表示する", "status.py", implemented=True),
     _record(Group.OBSERVE, Lane.CTL, "ctl status", "afx ctl status", Label.READ,
             "daemon の状態を表示する", "ops/client.py", shell_usage="status", shell=True,
             scope="status.read", endpoint_code="status", daemon_required=True),

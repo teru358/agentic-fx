@@ -5,6 +5,32 @@ from tests.test_service_app import NOW, _init
 from tests.ops.test_service_api_wiring import _app
 
 
+def test_collection_accepts_none_settings_and_connection_without_sql(tmp_path):
+    class Clock:
+        def now(self):
+            return NOW
+
+    facts = collect_pending_facts(tmp_path, None, None, deployed_plugins=(), outage=None, clock=Clock(),
+                                  service_active=None)
+    assert facts.settings is None
+    assert facts.history_counts == {}
+    assert facts.required_env_keys == ()
+    assert facts.env_present_keys == frozenset()
+    assert facts.approval_ids == ()
+    assert facts.service_active is None
+
+
+def test_collection_preserves_explicit_service_active_values(tmp_path):
+    class Clock:
+        def now(self):
+            return NOW
+
+    for value in (True, False, None):
+        facts = collect_pending_facts(tmp_path, None, None, deployed_plugins=(), outage=None, clock=Clock(),
+                                      service_active=value)
+        assert facts.service_active is value
+
+
 def test_collection_limits_history_pairs_and_journal_ids(tmp_path, caplog, monkeypatch):
     _init(tmp_path)
     app = _app(tmp_path)

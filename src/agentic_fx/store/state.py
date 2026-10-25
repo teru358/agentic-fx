@@ -86,6 +86,50 @@ _BOOL_FIELDS = ("initialized", "autopilot", "kill_switch_latched")
 _REQUIRED_KEYS = ("initialized", "mode", "autopilot", "kill_switch_latched")
 
 
+def parse_state(raw: object) -> AppState:
+    """Validate a decoded state document; I/O free, shared with read-only observers."""
+    if not isinstance(raw, dict):
+        raise StateError(
+            f"state file must contain a JSON object, got {type(raw).__name__}")
+
+    missing = [k for k in _REQUIRED_KEYS if k not in raw]
+    if missing:
+        raise StateError(f"state file missing required keys: {missing}")
+
+    for key in _BOOL_FIELDS:
+        v = raw[key]
+        if type(v) is not bool:
+            raise StateError(
+                f"state field {key!r} must be a JSON boolean, "
+                f"got {v!r} ({type(v).__name__})")
+
+    mode_raw = raw["mode"]
+    try:
+        mode = Mode(mode_raw)
+    except ValueError:
+        raise StateError(
+            f"state field 'mode' has invalid value {mode_raw!r} "
+            f"(allowed: {[m.value for m in Mode]})") from None
+
+    generation = raw.get("kill_switch_generation", 0)
+    if type(generation) is not int:
+        raise StateError(
+            f"state field 'kill_switch_generation' must be a JSON integer, "
+            f"got {generation!r} ({type(generation).__name__})")
+    latched_at = raw.get("kill_switch_latched_at")
+    if latched_at is not None and type(latched_at) is not str:
+        raise StateError(
+            f"state field 'kill_switch_latched_at' must be a string or "
+            f"null, got {latched_at!r} ({type(latched_at).__name__})")
+
+    return AppState(initialized=raw["initialized"],
+                    mode=mode,
+                    autopilot=raw["autopilot"],
+                    kill_switch_latched=raw["kill_switch_latched"],
+                    kill_switch_generation=generation,
+                    kill_switch_latched_at=latched_at)
+
+
 _MARKER_SUFFIX = ".reset-in-progress"
 
 
@@ -228,46 +272,7 @@ class StateStore:
         if not self._path.exists():
             return AppState()
         raw = json.loads(self._path.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            raise StateError(
-                f"state file must contain a JSON object, got {type(raw).__name__}")
-
-        missing = [k for k in _REQUIRED_KEYS if k not in raw]
-        if missing:
-            raise StateError(f"state file missing required keys: {missing}")
-
-        for key in _BOOL_FIELDS:
-            v = raw[key]
-            if type(v) is not bool:
-                raise StateError(
-                    f"state field {key!r} must be a JSON boolean, "
-                    f"got {v!r} ({type(v).__name__})")
-
-        mode_raw = raw["mode"]
-        try:
-            mode = Mode(mode_raw)
-        except ValueError:
-            raise StateError(
-                f"state field 'mode' has invalid value {mode_raw!r} "
-                f"(allowed: {[m.value for m in Mode]})") from None
-
-        generation = raw.get("kill_switch_generation", 0)
-        if type(generation) is not int:
-            raise StateError(
-                f"state field 'kill_switch_generation' must be a JSON integer, "
-                f"got {generation!r} ({type(generation).__name__})")
-        latched_at = raw.get("kill_switch_latched_at")
-        if latched_at is not None and type(latched_at) is not str:
-            raise StateError(
-                f"state field 'kill_switch_latched_at' must be a string or "
-                f"null, got {latched_at!r} ({type(latched_at).__name__})")
-
-        return AppState(initialized=raw["initialized"],
-                        mode=mode,
-                        autopilot=raw["autopilot"],
-                        kill_switch_latched=raw["kill_switch_latched"],
-                        kill_switch_generation=generation,
-                        kill_switch_latched_at=latched_at)
+        return parse_state(raw)
 
     def save(self, state: AppState) -> None:
         """一意名の一時ファイル → fsync → os.replace → 親 dir の fsync。"""
