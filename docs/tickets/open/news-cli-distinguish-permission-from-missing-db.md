@@ -1,8 +1,8 @@
 ---
 id: news-cli-distinguish-permission-from-missing-db
-title: afx news が権限不足・パス不備も「DB がありません」と出す
+title: afx news が root 未解決・権限不足も「DB がありません」と出す
 status: 設計待ち
-priority: 低
+priority: 中
 kind: 不具合
 opened: 2026-10-25
 closed: null
@@ -10,7 +10,7 @@ related: []
 ---
 # [news-cli-distinguish-permission-from-missing-db] afx news が権限不足・パス不備も「DB がありません」と出す
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ afx news の add / enable / disable は、DB を開く操作の失敗を FileNot
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 優先: 中、題名: afx news が root 未解決・権限不足も「DB がありません」と出す — 2026-10-25 ユーザー実機: ~/project/finance で afx news add を実行 → root が cwd に落ちて「ニュース源を読めません (DB がありません)。」。原因 (AFX_ROOT / --root 未指定、上方探索で config/settings.yaml が見つからない) が読めない。案: root が cwd fallback で決まり、かつ config/settings.yaml も DB も無いときは「agentic-fx の root が見つかりません。AFX_ROOT か --root で指定してください (いまの root: <path>)」を固定文で出す (path は利用者の cwd なので秘密ではない)。権限不足の分岐と合わせて 1 束。
