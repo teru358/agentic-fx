@@ -702,12 +702,12 @@ lock の保持者は daemon だけではない。初回設定、`afx keys`、`op
 | settings | `config/settings.yaml` | 他 source と分離して `ok / missing / invalid` を返す。missing / invalid でも後続 collector を止めない |
 | pending | setup record、optional settings、optional DB、`.env` の鍵名、plugin inventory | source ごとの collector から `PendingFacts` を合成し、`pending_steps(..., for_status=True)` へ渡す。外部接続を probe しない (`setup/pending_facts.py:32-65`) |
 | ops | `data/ops/<feature>.stage.json` と enroll marker | `read_stage(..., missing_ok=True)`、`read_marker()` (`ops_setup/stages.py:70-89,128-150`) |
-| units | user unit file、systemd、linger | unit の有無と `is-active`。systemd が無ければ `unknown` |
-| plugin inventory (pending 用) | `plugins/` directory と §6.4 の観測用 DB 接続 | daemon と同じ `plugin_loader.approved_plugins(conn, plugins_dir, settings=settings).inventory.metas`。`plugins/` 不在、settings か DB が無い / 読めないときは `()`。directory も DB も作らない |
+| units | user unit file、systemd、linger | unit の有無と `is-active`。`is-active` の stdout が `active` / `activating` / `deactivating` / `inactive` / `failed` ならその語、systemd が無い・bus に繋がらない・stdout が空か未知の語なら `unknown` (rc 1 にしない)。`inactive` は systemd がそう答えたときだけ |
+| plugin inventory (pending 用) | `plugins/` directory と §6.4 の観測用 DB 接続 | daemon と同じ `plugin_loader.approved_plugins(conn, plugins_dir, settings=settings).inventory.metas`。`plugins/` 不在、settings か DB が無いときは `()` (観測できた「無い」)。inventory の構築そのものが例外のときは `()` にせず `pending steps: unavailable` (rc 1)。directory も DB も作らない |
 | recent mission | §6.4 の観測用 DB 接続で `missions.recent(conn, 1)` | DB が無ければ `none`、破損 / schema 不足は `unavailable` (`store/missions.py:258`) |
 | pending approvals | §6.4 の観測用 DB 接続で `approvals.pending(conn)` | 件数だけ出す (`store/approvals.py:263`) |
 | plugin deploy ops | `count_open_readonly(db_path, opener=<§6.4 の helper>)` | `none / N / unavailable` を区別する (`store/plugin_deploy_ops.py:272-300`) |
-| recent activity | `logs/activity.log` | `tail_lines(..., 1)`。本文は redactor を通し 200 字 |
+| recent activity | `logs/activity.log` | `tail_lines(..., 1)`。行を `\t` で分けてから field ごとに redactor を通し、本文は 200 字 (行全体を redact すると 1 か所の該当で全文が消え、分割できなくなる) |
 | kill switch / mode | `data/state/app_state.json` と reset marker `app_state.json.reset-in-progress` (`store/state.py:89,148-150`) | §6.5 の読取専用 state reader で読む。`instance: unknown` のときは呼ばない |
 
 setup、settings、DB、state、ops、unit、activity、plugin はそれぞれ独立 collector とし、入力と失敗を共有しない。settings や DB が無いときはそれを要する pending fact だけを集めず、その欠落は `settings:` 行と `database:` 行で示す。鍵の存在、unit、ops marker、activity など残りは表示する。DB、lock、設定、unit、log、directory を作らない。初期化関数と migration を呼ばない。
@@ -732,7 +732,7 @@ agentic-fx offline status
 instance: free
 setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
-unit: afx.service=<installed|missing> active=<inactive|failed|unknown> linger=<enabled|disabled|unknown>
+unit: afx.service=<installed|missing> active=<active|activating|deactivating|inactive|failed|unknown> linger=<enabled|disabled|unknown>
 ops: bot=<stage|missing|invalid|unavailable> web=<stage|missing|invalid|unavailable> notify=<stage|missing|invalid|unavailable> marker=<none|feature|invalid>
 state: mode=<learning|trading|unavailable> kill_switch=<clear|latched|unavailable>
 database: <ok|missing|unavailable>
@@ -993,3 +993,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-25 | v0.5m | §5.3.4: activity 失敗は ActivityLog の非送出契約に従い成功扱い (第 2 文にしない)、段 12 の重複判定での OSError / sqlite3.Error は第 1 文 | B2c 閉鎖確認 (terra) P1 2 件: ActivityLog.write は例外を出さないので「伝播」は成立しない / 重複判定の file 読取が先頭 reconcile より前で OSError が未捕捉 | |
 | 2026-10-25 | v0.5n | §6.3: `unavailable` の定義と rc の規則 (unavailable のみ rc 1、invalid / unknown / missing は rc 0)、ops の読取例外は `unavailable`、`pending steps: unavailable`、DB 3 行は別読取 | A2 受入 test (sonnet) が見つけた実装との食い違い 7 本の裁定 (4〜6 は spec の語を厳密化) | |
 | 2026-10-25 | v0.5o | §6.3 の `mode` の語を実 schema (`Mode` = learning / trading) に合わせ、§6.2 に pending 用の plugin inventory の取り方 (daemon と同じ `approved_plugins`、欠落時は `()`) を追加 | A2 codex r1 High 2 (state の mode 語が実 schema と不一致、plugin inventory 未収集) | |
+| 2026-10-25 | v0.5p | §6.2 / 6.3: `is-active` の語を systemd の答えどおり (active / activating / deactivating / inactive / failed、観測できなければ unknown)、activity は field ごとに redact、plugin inventory の構築例外は pending steps unavailable。`data/agentic.db` の regular 判定は symlink を辿る (stat)、辿れない symlink は unavailable | A2 /code-review high 8 件 (#2 #3 #4 #6 採用、#5 #7 #8 部分採用、#1 probe の瞬間 shared lock は §6.1 の設計どおりで却下) | |
