@@ -945,6 +945,50 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 
 ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_policy_backlog_and_improve_go_through_the_lane` も **update** する。旧 `improve add` と正式 `backlog add` の同一動作は別の **new** parameterized node 1 本に集約する。shell help の `tests/test_commands.py::{test_approval_list_argument_boundaries,test_approval_retry_missing_id_is_value_error_with_help,test_help_includes_approval_list_journal_hint}` は **update** し、**new** の全文 snapshot と `stop` graceful-shutdown node を追加する。「22 本」という文字列出現数は test 数として使わない。
 
+## 13. PATH・root 解決・bash 補完 (v0.5s、チケット afx-on-path-and-root-resolution)
+
+### 13.1 root の解決
+
+`afx` は root を次の順で 1 つに決め、全 subcommand (ctl と `--daemon` を含む) と `ops_setup` の `OpsSetup(...)` に同じ値を渡す。改善 mission worker の `Path.cwd()` は専用 workdir なので対象外である。
+
+1. 最上位 option `--root <dir>` (`--daemon` と同じく subcommand より前に置く。argv shim の head 計算は `--root <dir>` の 2 token を `--daemon` と同様に前置きとして数える)。
+2. 環境変数 `AFX_ROOT`。
+3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。symlink は辿らず、`/` まで見る。
+4. どれも無ければ `Path.cwd()` (初回の `afx init` はここに落ちる)。
+
+1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
+
+### 13.2 PATH への配置
+
+console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` では `.venv/bin/afx` にしか置かれない。利用者向けの導入は `uv tool install --editable <repo>` で `~/.local/bin/afx` を作る形を正とし、README と `first-run-acceptance.md` の冒頭に手順と、`~/.local/bin` が PATH に無いときの 1 行 (`uv tool update-shell`) を書く。daemon の unit は従来どおり `.venv/bin/python main.py --daemon` のままで変えない。コードは変えない (文書のみ)。
+
+### 13.3 bash 補完
+
+`afx completion bash` を導入・接続管理の群に `[読取]` で足す (usage `afx completion bash`、summary `bash の補完スクリプトを出力する`、daemon 不要、何も書かない)。stdout に bash の補完スクリプトを出し、利用者は `.bashrc` に `eval "$(afx completion bash)"` を書く。`bash` 以外の shell 名は `afx: 補完は bash だけです` で rc=2。
+
+スクリプトは `cli_surface.py` の record から決定論的に生成する。候補は次のとおりで、planned と非公開 (`exposed=False`)、互換別名、廃止名は含めない。
+
+| 位置 | 候補 |
+|---|---|
+| 最上位 | `exposed=True` の local 親 command と `ctl`、option `--root` / `--daemon` |
+| `afx <parent>` の直下 | その親の葉 (`check backend`、`keys init|enroll|rotate|revoke`、`ops bot|web|notify`、`history …`、`backtest run`、`analyze corr`、`plugin …`、`completion bash`) |
+| `afx ops <feature>` の直下 | その機能で `implemented=True` の動詞 (web だけ `reconfigure` を含む) |
+| `afx ctl` の直下 | ctl record の第 1 語 (正式名のみ) と `--as`、`--as` の直後は `operator` / `approver` |
+| `afx ctl <word>` の直下 | その語で始まる ctl record の第 2 語 (`backlog add|list|reject|reopen|note`、`policy add|show|remove|reconcile`、`approval list|show|retry`、`killswitch reset|reconcile`、`data resume`、`jobs get|cancel`、`reflect retry`) |
+
+引数 (`<id>`、`<text>`、`--limit N` 等) は補完しない。option の値 (`--root <dir>`) は directory 補完に委ねる。生成物は `bash -n` を通り、`complete -F _afx afx` で終わる。実機の test は `bash` を subprocess で起こし `COMP_WORDS` / `COMP_CWORD` を与えて `_afx` を呼び、`COMPREPLY` を読む。
+
+### 13.4 受入条件の追加
+
+| ID | 条件 | 観測点 |
+|---|---|---|
+| AC-44 | root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd) が 4 経路すべてで正しく、`--root` / `AFX_ROOT` が directory でなければ rc=2 で何も書かない。サブ directory から `afx status` / `afx ctl …` / `afx check` を打つと親 root を使う。`--daemon --root <dir>` と `--root <dir> --daemon` の両順で shim と ctl が同じ head を得る | tmp_path の入れ子 root、env monkeypatch、stdout の `root:` 行、tree zero-write |
+| AC-45 | `afx completion bash` の出力が `bash -n` を通り、record を 1 つ変える (summary でなく command の追加 / 削除 / `exposed` 反転) と出力が変わる。候補集合は `afx --help` の choices、各 `afx <parent> --help` の choices、ctl `parse()` の正式語順と一致し、planned / 非公開 / 別名 / 廃止名を含まない | 生成物の文字列、集合比較、record 変異 |
+| AC-46 | 実 bash で `afx ct` → `ctl`、`afx ctl pol` → `policy`、`afx ctl policy ` → 4 語、`afx ops w` → `web`、`afx ops web ` → `enable disable reconfigure status`、`afx ops bot ` に `reconfigure` が無い、`afx ctl --as ` → `operator approver`、`afx completion ` → `bash` | subprocess bash + COMP_WORDS |
+| AC-47 | `afx completion zsh` は rc=2 で固定文、stdout 空。`afx completion bash` は file / DB / lock を作らない | rc、stderr、tree zero-write |
+
+§3.2 / §3.2.1 / §3.3 の golden は `--root` と `completion` の追加で変わる。更新後の全文は I1 と同じ検査条件 (非 TTY、色なし、幅 100、全行 100 桁以内) で実装の出力を写し、本節の v0.5s 改訂で §3.2 に反映する。ops-api 文書の原則節と `first-run-acceptance.md` にも `completion bash` を足す (doc test (c) の正式名は 9 つのまま。`completion` は正所属の表にだけ出す)。
+
 ## 11. 後続と非目標
 
 - `afx news` の parser、source 選択、429 backoff は `news-source-cli-and-429-backoff` で行う。
@@ -998,3 +1042,4 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 | 2026-10-25 | v0.5p | §6.2 / 6.3: `is-active` の語を systemd の答えどおり (active / activating / deactivating / inactive / failed、観測できなければ unknown)、activity は field ごとに redact、plugin inventory の構築例外は pending steps unavailable。`data/agentic.db` の regular 判定は symlink を辿る (stat)、辿れない symlink は unavailable | A2 /code-review high 8 件 (#2 #3 #4 #6 採用、#5 #7 #8 部分採用、#1 probe の瞬間 shared lock は §6.1 の設計どおりで却下) | |
 | 2026-10-25 | v0.5q | §6.3 の `next` の start 条件に active の語 (inactive / failed / unknown) を加える | A2 是正 2 (sonnet) の指摘: is-active の語を増やしたので start を勧める条件が要る | |
 | 2026-10-25 | v0.5r | §5.3.4: 方針文の失敗は課題の入力へ続く、本文検査を先頭 reconcile の前に、上限は `POLICY_TEXT_LIMIT` 1 定数、file 側の重複判定を行単位完全一致に、空メッセージ例外は `__cause__`、案内文は正式名 | B2c merge 後の /code-review 8 件 (採用 6 / 却下 2、裁定 tmp/review-cli/reports/b2c/b2c-cr2-rulings.md) | |
+| 2026-10-25 | v0.5s | §13 新設: root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd)、`uv tool install` による PATH 配置の文書化、`afx completion bash` (record から生成、bash のみ)、AC-44〜47。§3.2 等の golden は実装出力を写して改訂する | チケット afx-on-path-and-root-resolution (ユーザー裁定 2026-10-25: 優先 中、補完は静的生成の案 2) | |
