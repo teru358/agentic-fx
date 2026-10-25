@@ -228,7 +228,7 @@ def test_shell_policy_backlog_and_improve_go_through_the_lane(ops_env):
     lane = _legacy_shell(ops_env, improve_supervisor=improve)
     lane.use_ops_service(service)
     assert lane.dispatch("policy add 方針を守る") == "policy に追記しました"
-    assert lane.dispatch("improve add 新しい案").startswith("backlog #")
+    assert lane.dispatch("backlog add 新しい案").startswith("backlog #")
     assert lane.dispatch("improve").startswith("improve job ")
     assert sorted(_shell_routes(ops_env)) == ["POST /v1/backlog", "POST /v1/improve/runs",
                                               "POST /v1/policy"]

@@ -94,7 +94,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
             confirm: bool = False, approver: bool = False, scope: str | None = None,
             endpoint_code: str | None = None, daemon_required: bool = False,
             condition: str | None = None, aliases: tuple[str, ...] = (), shell: bool = False,
-            classified: bool = True, implemented: bool = True, exposed: bool = False,
+            classified: bool = True, implemented: bool = True, exposed: bool | None = None,
             planned: bool = False, deprecated_since: str | None = None,
             remove_in: str | None = None) -> CommandRecord:
     return CommandRecord(
@@ -118,7 +118,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
         shell=shell,
         classified=classified,
         implemented=implemented,
-        exposed=exposed,
+        exposed=implemented and not planned if exposed is None else exposed,
         planned=planned,
         deprecated_since=deprecated_since,
         remove_in=remove_in,
@@ -138,12 +138,12 @@ SHELL_LIFECYCLE = ShellLifecycle(deprecated_since="0.2.0", remove_in="1.0.0")
 
 _BASE_COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.SETUP, Lane.LOCAL, "init", "afx init [--non-interactive] [--config FILE]",
-            Label.CHANGE, "初期設定を行う", "entry.py", shell_usage=None),
+            Label.CHANGE, "初期設定 (対話。`--non-interactive` で従来の非対話)", "entry.py", shell_usage=None),
     _record(Group.SETUP, Lane.LOCAL, "check", "afx check [--json] [--unit-env]", Label.READ,
-            "設定と実行環境を検査する", "entry.py"),
+            "設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)", "entry.py"),
     _record(Group.SETUP, Lane.LOCAL, "check backend",
             "afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]",
-            Label.CHANGE, "backend への接続を検査する", "backtest/cli.py", implemented=False),
+            Label.CHANGE, "backend への接続を検査する", "backtest/cli.py"),
     _record(Group.SETUP, Lane.LOCAL, "keys init", "afx keys init", Label.CHANGE,
             "操作 API の鍵を初期化する", "entry.py", condition="停止中のみ"),
     _record(Group.SETUP, Lane.LOCAL, "keys enroll", "afx keys enroll <principal>", Label.CHANGE,
@@ -153,18 +153,17 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.SETUP, Lane.LOCAL, "keys revoke", "afx keys revoke <principal>", Label.CHANGE,
             "principal の鍵を失効させる", "entry.py", condition="停止中のみ"),
     _record(Group.SETUP, Lane.LOCAL, "ops enable", "afx ops <bot|web|notify> enable", Label.CHANGE,
-            "機能を有効化する", "entry.py", condition="必要時だけ daemon を一時停止し、元が稼働中なら再開",
-            implemented=False),
+            "有効化する", "entry.py", condition="必要時だけ daemon を一時停止して再開"),
     _record(Group.SETUP, Lane.LOCAL, "ops disable", "afx ops <bot|web|notify> disable", Label.CHANGE,
-            "機能を無効化する", "entry.py", implemented=False),
+            "daemon を止めずに無効化する", "entry.py"),
     _record(Group.SETUP, Lane.LOCAL, "ops web reconfigure", "afx ops web reconfigure", Label.CHANGE,
-            "afx に触れずに設定を変える", "ops_setup", implemented=False),
+            "afx に触れずに設定を変える", "ops_setup"),
     _record(Group.SETUP, Lane.LOCAL, "ops bot reconfigure", "afx ops bot reconfigure", Label.CHANGE,
             "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops notify reconfigure", "afx ops notify reconfigure", Label.CHANGE,
             "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops status", "afx ops <bot|web|notify> status", Label.READ,
-            "機能の状態を表示する", "entry.py", implemented=False),
+            "durable stage を表示する", "entry.py"),
     _record(Group.SETUP, Lane.CTL, "ctl whoami", "afx ctl whoami", Label.READ,
             "認証した principal を表示する", "ops/client.py", shell_usage=None,
             scope="status.read", endpoint_code="whoami", daemon_required=True),
@@ -181,7 +180,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "activity を表示する", "ops/client.py", shell_usage="activity [n] [category]", shell=True,
             scope="logs.read", endpoint_code="activity", daemon_required=True),
     _record(Group.OBSERVE, Lane.CTL, "ctl events",
-            "afx ctl events [--after ID] [--limit N] [--follow]", Label.READ,
+            "afx ctl events [--after <id>] [--limit <n>] [--follow]", Label.READ,
             "event を追跡する", "ops/client.py", scope="events.read", endpoint_code="events",
             daemon_required=True),
     _record(Group.OBSERVE, Lane.CTL, "ctl jobs get", "afx ctl jobs get <id>", Label.READ,
@@ -215,9 +214,10 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "バックログへ課題を追加する", "ops/client.py", shell_usage="backlog add <idea>", shell=True,
             scope="operate", endpoint_code="backlog_add", daemon_required=True),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog list",
-            "afx ctl backlog list [--all] [--limit N]", Label.READ,
-            "バックログを表示する", "ops/client.py", scope="guidance.read", endpoint_code="backlog_list",
-            daemon_required=True, implemented=True),
+            "afx ctl backlog list [--all] [--limit <n>]", Label.READ,
+            "バックログを表示する", "ops/client.py", shell_usage="backlog list [--all] [--limit <n>]",
+            shell=True, scope="guidance.read", endpoint_code="backlog_list", daemon_required=True,
+            implemented=True),
     _record(Group.GUIDANCE, Lane.CTL, "ctl backlog reject", "afx ctl backlog reject <id>", Label.CHANGE,
             "バックログを却下する", "ops/client.py", shell_usage="backlog reject <id>", shell=True,
             scope="operate", endpoint_code="backlog_reject", daemon_required=True),
@@ -262,7 +262,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.PLUGIN, Lane.LOCAL, "plugin versions", "afx plugin versions <name>", Label.READ,
             "plugin の版を表示する", "backtest/cli.py"),
     _record(Group.PLUGIN, Lane.LOCAL, "plugin list", "afx plugin list [--kind indicator|strategy]",
-            Label.READ, "plugin を一覧表示する", "backtest/cli.py", implemented=False),
+            Label.READ, "plugin を一覧表示する", "backtest/cli.py"),
     _record(Group.PLUGIN, Lane.CTL, "ctl approval list", "afx ctl approval list [n]", Label.READ,
             "承認待ちを表示する", "ops/client.py", shell_usage="approval list [n]", shell=True,
             scope="approvals.list", endpoint_code="approval_list", daemon_required=True),
@@ -397,13 +397,13 @@ class ParentRecord:
 
 
 PARENTS: tuple[ParentRecord, ...] = (
-    ParentRecord("check", "設定と実行環境の検査"),
-    ParentRecord("keys", "操作 API の鍵管理"),
+    ParentRecord("check", "設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)"),
+    ParentRecord("keys", "操作 API の鍵管理 (停止中のみ)"),
     ParentRecord("ops", "bot / web / notify の有効化・無効化・再設定・状態表示"),
     ParentRecord("ops bot", "操作 bot (ops-bot)", labeled=False),
     ParentRecord("ops web", "web 表示 (ops-web)", labeled=False),
     ParentRecord("ops notify", "通知 (ops-notify)", labeled=False),
-    ParentRecord("ctl", "稼働中の daemon を操作 API で操作する", labeled=False),
+    ParentRecord("ctl", "稼働中の daemon を操作 API で操作する (afx ctl help)", labeled=False),
     ParentRecord("ctl jobs", "ジョブの参照と取消"),
     ParentRecord("ctl backlog", "改善バックログの操作"),
     ParentRecord("ctl policy", "ユーザー方針 (directives) の操作"),
@@ -488,7 +488,20 @@ class SurfaceRenderer:
         return "agentic-fx"
 
     def render_top_epilog(self) -> str:
-        return "実行レーン:\n  afx <sub>      daemon を介さない\n  afx ctl <op>   稼働 daemon を操作する"
+        return (
+            "実行レーン:\n"
+            "  afx <sub>      daemon を介さない。停止中でも実行できる\n"
+            "  afx ctl <op>   稼働 daemon の認証・監査つき操作 API\n\n"
+            "用途                     daemon 不要                稼働 daemon\n"
+            "導入・接続管理           init / check / keys / ops  ctl whoami\n"
+            "稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs\n"
+            "市場入力を整える         history                    —\n"
+            "調査・評価する           backtest / analyze         —\n"
+            "問い合わせ・改善運用     —                          ctl ask / improve / backlog / policy / reflect\n"
+            "Plugin を採否・配備する  plugin                     ctl approval / approve / reject\n"
+            "保護状態を回復する       —                          ctl killswitch / data resume\n\n"
+            "ラベル: [読取] 状態を変えない  [変更] 状態を変える  [確認] 端末確認  [approver] approver 権限\n"
+            "詳しい操作: afx <sub> --help / afx ctl help")
 
     def _parent_label(self, children: tuple[CommandRecord, ...]) -> str:
         kinds = {record.label for record in children}
@@ -512,6 +525,8 @@ class SurfaceRenderer:
         return f"{_labels(exacts[0])} {exacts[0].summary}" if exacts else None
 
     def parser_description(self, command: str) -> str | None:
+        if command in {f"ops {feature}" for feature in _OPS_FEATURES}:
+            return None
         children = self._children(command)
         exacts = self._exacts(command)
         if children:
@@ -528,9 +543,28 @@ class SurfaceRenderer:
         if record is None:
             return None
         suffix = f" ({record.condition})" if record.condition else ""
-        return f"{_labels(record)} {record.summary}{suffix}"
+        aliases = " (別名 " + ", ".join(record.aliases) + ")" if record.aliases else ""
+        return f"{_labels(record)} {record.summary}{suffix}{aliases}"
 
     def render_epilog(self, command: str) -> str:
+        if command in {f"ops {feature}" for feature in _OPS_FEATURES}:
+            return ""
+        if command == "ops":
+            generic = {record.command: record for record in self._visible
+                       if record.command in _OPS_GENERIC}
+            web = self._exact("ops web reconfigure")
+            lines = ["操作:"]
+            for command_name in ("ops enable", "ops disable", "ops status"):
+                record = generic[command_name]
+                suffix = f" ({record.condition})" if record.condition else ""
+                lines.append(
+                    f"  afx ops <feature> {command_name.rsplit(' ', 1)[1]:<13}"
+                    f" {_labels(record)} {record.summary}{suffix}")
+            if web is not None:
+                lines.append(f"  afx ops web reconfigure         {_labels(web)} {web.summary} (別名 reconf)")
+            legacy = next(item for item in self._compatibility if not item.rejects)
+            return "\n".join(lines + ["", "旧形 `afx ops enable|disable|status <feature>` は "
+                                      f"{legacy.deprecated_since} だけ受け付け、{legacy.remove_in} で削除する。"])
         records = self._children(command)
         if not records:
             return ""
@@ -547,17 +581,37 @@ class SurfaceRenderer:
         return "\n".join(lines)
 
     def render_ctl_help(self) -> str:
-        lines = ["usage: afx ctl [--as operator|approver] <操作>", ""]
-        for group in Group:
-            records = tuple(record for record in self._visible
-                            if record.lane is Lane.CTL and record.group is group)
-            lines.append(f"{group.value}:")
-            lines.extend(f"  {_labels(record)} {record.usage.removeprefix('afx ctl ')}"
-                         for record in records)
-            if not records:
-                lines.append("  —")
-            lines.append("")
-        return "\n".join(lines).rstrip()
+        def shown(command: str) -> CommandRecord:
+            record = self._exact(command)
+            assert record is not None
+            return record
+
+        def line(command: str) -> str:
+            record = shown(command)
+            return f"  {_labels(record)} {record.usage.removeprefix('afx ctl ')}"
+
+        lines = ["usage: afx ctl [--as operator|approver] <操作>",
+                 "       afx ctl [--as operator|approver]        (端末なら対話モード afx ctl>)", "",
+                 f"{Group.SETUP.value}:", line("ctl whoami"), "",
+                 f"{Group.OBSERVE.value}:", line("ctl status"),
+                 "  [読取] log [n] / activity [n] [カテゴリ]",
+                 line("ctl events"), line("ctl jobs get"), line("ctl jobs cancel"), "",
+                 f"{Group.MARKET.value}:", "  —", "",
+                 f"{Group.RESEARCH.value}:", "  —", "",
+                 f"{Group.GUIDANCE.value}:",
+                 "  [変更] ask <質問> / improve", line("ctl backlog add"), line("ctl backlog list"),
+                 "  [変更] backlog reject|reopen|note <id>", line("ctl policy add"),
+                 line("ctl policy show"), line("ctl policy remove"), line("ctl policy reconcile"),
+                 line("ctl reflect retry"), "",
+                 f"{Group.PLUGIN.value}:",
+                 "  [読取] approval list [n] / approval show <id>",
+                 "  [変更] [確認] [approver] approve <id> / reject <id> [理由] / approval retry <id>", "",
+                 f"{Group.RECOVERY.value}:", line("ctl killswitch reset"),
+                 "  [変更] [確認] [approver] killswitch reset <世代> / killswitch reconcile [confirm]",
+                 line("ctl data resume"), "",
+                 "互換名: improve add <idea> / approvals list / approvals show / approval <id> / retry <id>",
+                 "API に発注・SL 変更・クローズ・サービス停止は無い。"]
+        return "\n".join(lines)
 
     def render_shell_help(self) -> str:
         records = tuple(record for record in self._visible
@@ -566,6 +620,13 @@ class SurfaceRenderer:
             return ""
         lines = ["コマンド一覧:"]
         lines.extend(f"  {record.shell_usage}  {record.summary}" for record in records)
+        for alias in ALIASES:
+            if alias.parser_alias != "improve add":
+                continue
+            canonical = self._by_usage.get(alias.canonical_usage)
+            if canonical is not None and canonical.shell_usage is not None:
+                suffix = alias.usage.removeprefix("afx ctl ").removeprefix("improve add")
+                lines.append(f"  improve add{suffix}  旧名 ({canonical.shell_usage})")
         lifecycle = self._shell_lifecycle
         lines.append(f"廃止予定: 対話 shell は {lifecycle.deprecated_since} で deprecated。"
                      f"{lifecycle.remove_in} で削除予定。afx ctl を使用してください。")

@@ -31,6 +31,7 @@ from agentic_fx.backtest.mt5_import import (
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
+from agentic_fx.cli_surface import leaf_help, parser_description, parser_help, render_epilog
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin.history_git import HistoryGitError
@@ -53,6 +54,15 @@ from agentic_fx.tools import plugin_loader as tools_plugin_loader
 _NO_LIMIT = datetime(9999, 12, 28, tzinfo=timezone.utc)
 
 
+def _surface_parser_kw(command: str, *, leaf: bool = False) -> dict:
+    return {
+        "help": leaf_help(command) if leaf else parser_help(command),
+        "description": parser_description(command),
+        "epilog": render_epilog(command),
+        "formatter_class": argparse.RawDescriptionHelpFormatter,
+    }
+
+
 def _parse_date(v: str) -> datetime:
     """``YYYY-MM-DD`` (時刻付き ISO も可) を aware UTC に変換する。
 
@@ -65,10 +75,10 @@ def _parse_date(v: str) -> datetime:
 def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     """entry.py の ``sub`` (top-level subparsers) に history/backtest/analyze
     を登録する。"""
-    history = sub.add_parser("history", help="履歴データ操作")
+    history = sub.add_parser("history", **_surface_parser_kw("history"))
     history_sub = history.add_subparsers(dest="history_command", required=True)
 
-    imp = history_sub.add_parser("import", help="一括取り込み (進捗を件数で表示)")
+    imp = history_sub.add_parser("import", **_surface_parser_kw("history import", leaf=True))
     imp.add_argument("--source", choices=["dukascopy", "mt5"])
     imp.add_argument("--symbol", required=True)
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
@@ -79,11 +89,11 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                           "相手は無料公開サービスなので 1 秒間隔で投げる — "
                           "長期取得は範囲を分けるか、この値を明示的に上げること")
 
-    comp = history_sub.add_parser("compare", help="source 間の close 差照合")
+    comp = history_sub.add_parser("compare", **_surface_parser_kw("history compare", leaf=True))
     comp.add_argument("--symbol", required=True)
     comp.add_argument("--interval", choices=("1m", "5m", "15m"), required=True)
 
-    cov = history_sub.add_parser("coverage", help="カバレッジレポート")
+    cov = history_sub.add_parser("coverage", **_surface_parser_kw("history coverage", leaf=True))
     cov.add_argument("--symbol", required=True)
     cov.add_argument("--timeframe", required=True)
     cov.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
@@ -91,11 +101,10 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
 
-    backtest = sub.add_parser("backtest", help="バックテスト")
+    backtest = sub.add_parser("backtest", **_surface_parser_kw("backtest"))
     backtest_sub = backtest.add_subparsers(dest="backtest_command",
                                            required=True)
-    run = backtest_sub.add_parser(
-        "run", help="人間用バックテスト実行 (自由期間・scope=human_custom)")
+    run = backtest_sub.add_parser("run", **_surface_parser_kw("backtest run", leaf=True))
     run.add_argument("--symbol", required=True)
     run.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     run.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
@@ -111,10 +120,10 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                               "(<cwd>/plugins/<name>/)")
     run.add_argument("--timeframe", default=None)
 
-    analyze = sub.add_parser("analyze", help="履歴分析")
+    analyze = sub.add_parser("analyze", **_surface_parser_kw("analyze"))
     analyze_sub = analyze.add_subparsers(dest="analyze_command",
                                          required=True)
-    corr = analyze_sub.add_parser("corr", help="2 ペアの相関 (人間の自由探索)")
+    corr = analyze_sub.add_parser("corr", **_surface_parser_kw("analyze corr", leaf=True))
     corr.add_argument("--a", required=True)
     corr.add_argument("--b", required=True)
     corr.add_argument("--timeframe", required=True)
@@ -124,41 +133,33 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
 
     # plugin 承認フロー (プラン 7 Task 6): submit は pending 行を作るだけ、
     # bless は検証 + 即時承認 (人間 CLI からのみ — 改善ループには非露出)。
-    plugin = sub.add_parser("plugin", help="plugin 承認フロー")
+    plugin = sub.add_parser("plugin", **_surface_parser_kw("plugin"))
     plugin_sub = plugin.add_subparsers(dest="plugin_command", required=True)
-    submit = plugin_sub.add_parser(
-        "submit", help="plugin を検証し承認申請 (pending) 行を作る")
+    submit = plugin_sub.add_parser("submit", **_surface_parser_kw("plugin submit", leaf=True))
     submit.add_argument("name")
     submit.add_argument(
         "--from", dest="from_kind", choices=["_human"], default=None,
         help="'_human' なら plugins/_human/<name> の候補を submit する "
              "(P1 candidate_origin=human、プラン10 Task11)")
-    bless_parser = plugin_sub.add_parser(
-        "bless", help="plugin を検証し即時承認する (人間 CLI 専用)")
+    bless_parser = plugin_sub.add_parser("bless", **_surface_parser_kw("plugin bless", leaf=True))
     bless_parser.add_argument("name")
     bless_parser.add_argument(
         "--from", dest="from_kind", choices=["_human"], default=None,
         help="'_human' 必須 (裁定3: 指定なしは常に拒否 — materialize を案内)")
     materialize_parser = plugin_sub.add_parser(
-        "materialize", help="live plain plugin を plugins/_human/<name> へ"
-                            "読み取り専用コピーする (0700/0600)")
+        "materialize", **_surface_parser_kw("plugin materialize", leaf=True))
     materialize_parser.add_argument("name")
-    lock_parser = plugin_sub.add_parser(
-        "lock", help="候補の indicators 依存を現在の配備版でロックする "
-                     "(config.yaml の pin を書き換える)")
+    lock_parser = plugin_sub.add_parser("lock", **_surface_parser_kw("plugin lock", leaf=True))
     lock_parser.add_argument("name")
     lock_parser.add_argument(
         "--from", dest="from_kind", choices=["_human"], default=None,
         help="'_human' 必須 (submit/bless と同じ --from 規約)")
-    retire_parser = plugin_sub.add_parser(
-        "retire", help="legacy plain live plugin を plugins/_retired/ へ退避する"
-                       " (flock、未完ジャーナルは拒否)")
+    retire_parser = plugin_sub.add_parser("retire", **_surface_parser_kw("plugin retire", leaf=True))
     retire_parser.add_argument("name")
     retire_parser.add_argument("--force", action="store_true")
     retire_parser.add_argument("--dry-run", action="store_true")
     retire_parser.add_argument("--yes", action="store_true", help="確認を省略する")
-    disable_parser = plugin_sub.add_parser(
-        "disable", help="symlink 配備の live を外す (退避はしない。--revoke で外す版を却下)")
+    disable_parser = plugin_sub.add_parser("disable", **_surface_parser_kw("plugin disable", leaf=True))
     disable_parser.add_argument("name")
     disable_parser.add_argument("--revoke", action="store_true",
                                 help="外す版の承認を取り消す (rejected を追記)")
@@ -166,8 +167,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                                 help="依存 strategy を止めてでも続行する")
     disable_parser.add_argument("--dry-run", action="store_true")
     disable_parser.add_argument("--yes", action="store_true", help="確認を省略する")
-    rollback_parser = plugin_sub.add_parser(
-        "rollback", help="live を以前の版へ戻す (反映は daemon の再起動後)")
+    rollback_parser = plugin_sub.add_parser("rollback", **_surface_parser_kw("plugin rollback", leaf=True))
     rollback_parser.add_argument("name")
     rollback_parser.add_argument("--to", default=None, metavar="HASH",
                                  help="戻り先の版 (前方一致可。省略時は直前の版)")
@@ -177,17 +177,15 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                                  help="依存 strategy を止めてでも続行する")
     rollback_parser.add_argument("--dry-run", action="store_true")
     rollback_parser.add_argument("--yes", action="store_true", help="確認を省略する")
-    revoke_parser = plugin_sub.add_parser(
-        "revoke", help="live ではない版の承認を取り消す (FS は変えない)")
+    revoke_parser = plugin_sub.add_parser("revoke", **_surface_parser_kw("plugin revoke", leaf=True))
     revoke_parser.add_argument("name")
     revoke_parser.add_argument("--version", required=True, metavar="HASH",
                                help="取り消す版の content hash (`versions` の content=。前方一致可)")
     revoke_parser.add_argument("--dry-run", action="store_true")
     revoke_parser.add_argument("--yes", action="store_true", help="確認を省略する")
-    versions_parser = plugin_sub.add_parser(
-        "versions", help="版・経歴・未完の配備操作を表示する (読み取り専用)")
+    versions_parser = plugin_sub.add_parser("versions", **_surface_parser_kw("plugin versions", leaf=True))
     versions_parser.add_argument("name")
-    plugin_sub.add_parser("list", help="plugin の live・pending・未完操作を表示する").add_argument(
+    plugin_sub.add_parser("list", **_surface_parser_kw("plugin list", leaf=True)).add_argument(
         "--kind", choices=("indicator", "strategy"), default=None)
 
 

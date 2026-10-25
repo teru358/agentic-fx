@@ -1427,12 +1427,12 @@ def test_approval_list_argument_boundaries(tmp_path):
     「引数過多 → `_HELP`」と「ちょうど上限 (200) は丸めない」が未 pin で、
     `len(args) <= 3` への緩和も `>` → `>=` も SURVIVED した。
     丸めた件数そのもの (MAX の 2 倍にする変異) も測る。"""
-    from agentic_fx.commands import _HELP
+    from agentic_fx.cli_surface import render_shell_help
     conn, _, _, cmds = _commands(tmp_path)
     for i in range(3):
         _pending_plugin_approval(conn, "sma", chash=f"{i:064d}")
 
-    assert cmds.dispatch("approval list 5 6") == _HELP, "引数過多は _HELP"
+    assert cmds.dispatch("approval list 5 6") == render_shell_help(), "引数過多は shell help"
     assert "打ち切り" not in cmds.dispatch("approval list 200"), \
         "ちょうど上限では丸めていないので打ち切り文言を出してはならない"
     assert "(上限 200 件で打ち切り)" in cmds.dispatch("approval list 201")
@@ -1444,15 +1444,14 @@ def test_approval_list_argument_boundaries(tmp_path):
         f"丸めた先の件数が上限 + 打ち切り 1 行と違う: {len(out)}"
 
 
-def test_help_includes_approval_list_journal_hint():
+def test_shell_help_includes_the_canonical_approval_list_operation():
     """1 周目トリアージ T-03 = S0-38: `_HELP` の `approval list [n]` 行
     (未終端の切替ジャーナルが一緒に出る旨のヒント) をリテラルで pin する。
     既存の `dispatch("approval list 5 6") == _HELP` は同じ定数同士の比較
     なので `_HELP` 自体からこの 1 行を削除しても両辺が揃って green になり、
     検出できない (段 0 pin 済 S0-38)。"""
-    from agentic_fx.commands import _HELP
-    assert "approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)" \
-        in _HELP
+    from agentic_fx.cli_surface import render_shell_help
+    assert "approval list [n]  承認待ちを表示する" in render_shell_help()
 
 
 def test_approval_list_rejects_bad_argument(tmp_path):
@@ -1527,7 +1526,7 @@ def test_approval_retry_fails_loud_on_unknown_outcome(tmp_path, monkeypatch):
 def test_approval_retry_missing_id_is_value_error_with_help(tmp_path, monkeypatch):
     """AC-14a: 存在しない approval への retry は `ValueError` 送出で、
     先行する `except (ValueError, KeyError)` に捕まり `_HELP` が付く。"""
-    from agentic_fx.commands import _HELP
+    from agentic_fx.cli_surface import render_shell_help
     conn, _, _, cmds = _commands(tmp_path)
     plugins_dir = tmp_path / "plugins"
     (plugins_dir / ".locks").mkdir(parents=True)
@@ -1541,7 +1540,7 @@ def test_approval_retry_missing_id_is_value_error_with_help(tmp_path, monkeypatc
 
     out = cmds.dispatch("approval retry 42")
 
-    assert out == f"エラー: ValueError: approval 42 not found\n{_HELP}"
+    assert out == f"エラー: ValueError: approval 42 not found\n{render_shell_help()}"
 
 
 def test_approval_retry_message_unaffected_by_later_deployment(tmp_path, monkeypatch):

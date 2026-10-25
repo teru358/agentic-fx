@@ -51,6 +51,21 @@ def test_parse_date_ignores_explicit_offset():
         2026, 7, 1, tzinfo=timezone.utc)
 
 
+def test_cli_plugin_list_skips_initialization_and_does_not_create_a_tree(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    def refuse(_root):
+        raise AssertionError("plugin list must not initialize")
+
+    monkeypatch.setattr(cli, "ensure_initialized", refuse)
+    assert main(["plugin", "list"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "source live: missing", "source pending: missing", "source journal: missing",
+        "NAME  KIND  LIVE  PENDING  OPEN_OP  ISSUES"]
+    assert list(tmp_path.iterdir()) == []
+
+
 # ---- history import ---------------------------------------------------
 
 

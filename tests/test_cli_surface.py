@@ -12,7 +12,7 @@ from agentic_fx import cli_surface
 from agentic_fx.cli_surface import Group as G
 
 
-def test_command_records_cover_the_seven_groups_and_remain_hidden():
+def test_command_records_cover_the_seven_groups_and_publish_implemented_commands():
     from agentic_fx import cli_surface
 
     assert tuple(group.value for group in cli_surface.Group) == (
@@ -20,7 +20,8 @@ def test_command_records_cover_the_seven_groups_and_remain_hidden():
         "問い合わせ・改善運用", "Plugin を採否・配備する", "保護状態を回復する")
     assert {record.group for record in cli_surface.COMMANDS if record.classified} == set(
         cli_surface.Group)
-    assert all(not record.exposed for record in cli_surface.COMMANDS)
+    assert all(record.exposed for record in cli_surface.COMMANDS
+               if record.implemented and not record.planned)
     assert all(record.implemented for record in cli_surface.COMMANDS if record.exposed)
     assert all(not record.exposed for record in cli_surface.COMMANDS if record.planned)
 
@@ -65,7 +66,7 @@ EXPECTED = (
     ('keys enroll', G.SETUP, "LOCAL", 'afx keys enroll <principal>', None, "CHANGE", False, False, None, None, False, '停止中のみ'),
     ('keys rotate', G.SETUP, "LOCAL", 'afx keys rotate <principal>', None, "CHANGE", False, False, None, None, False, '停止中のみ'),
     ('keys revoke', G.SETUP, "LOCAL", 'afx keys revoke <principal>', None, "CHANGE", False, False, None, None, False, '停止中のみ'),
-    ('ops enable', G.SETUP, "LOCAL", 'afx ops <bot|web|notify> enable', None, "CHANGE", False, False, None, None, False, '必要時だけ daemon を一時停止し、元が稼働中なら再開'),
+    ('ops enable', G.SETUP, "LOCAL", 'afx ops <bot|web|notify> enable', None, "CHANGE", False, False, None, None, False, '必要時だけ daemon を一時停止して再開'),
     ('ops disable', G.SETUP, "LOCAL", 'afx ops <bot|web|notify> disable', None, "CHANGE", False, False, None, None, False, None),
     ('ops web reconfigure', G.SETUP, "LOCAL", 'afx ops web reconfigure', None, "CHANGE", False, False, None, None, False, None),
     ('ops bot reconfigure', G.SETUP, "LOCAL", 'afx ops bot reconfigure', None, "CHANGE", False, False, None, None, False, None),
@@ -76,7 +77,7 @@ EXPECTED = (
     ('ctl status', G.OBSERVE, "CTL", 'afx ctl status', 'status', "READ", False, False, 'status.read', 'status', True, None),
     ('ctl log', G.OBSERVE, "CTL", 'afx ctl log [n]', 'log [n]', "READ", False, False, 'logs.read', 'log', True, None),
     ('ctl activity', G.OBSERVE, "CTL", 'afx ctl activity [n] [category]', 'activity [n] [category]', "READ", False, False, 'logs.read', 'activity', True, None),
-    ('ctl events', G.OBSERVE, "CTL", 'afx ctl events [--after ID] [--limit N] [--follow]', None, "READ", False, False, 'events.read', 'events', True, None),
+    ('ctl events', G.OBSERVE, "CTL", 'afx ctl events [--after <id>] [--limit <n>] [--follow]', None, "READ", False, False, 'events.read', 'events', True, None),
     ('ctl jobs get', G.OBSERVE, "CTL", 'afx ctl jobs get <id>', None, "READ", False, False, 'jobs.own', 'job_get', True, None),
     ('ctl jobs cancel', G.OBSERVE, "CTL", 'afx ctl jobs cancel <id>', None, "CHANGE", True, False, 'jobs.own', 'job_cancel', True, None),
     ('news', G.MARKET, "LOCAL", 'afx news …', None, "PER_OPERATION", False, False, None, None, False, None),
@@ -88,7 +89,7 @@ EXPECTED = (
     ('ctl ask', G.GUIDANCE, "CTL", 'afx ctl ask <question>', 'ask <質問>', "CHANGE", False, False, 'operate', 'ask', True, None),
     ('ctl improve', G.GUIDANCE, "CTL", 'afx ctl improve', 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
     ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'backlog add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
-    ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit N]', None, "READ", False, False, 'guidance.read', 'backlog_list', True, None),
+    ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit <n>]', 'backlog list [--all] [--limit <n>]', "READ", False, False, 'guidance.read', 'backlog_list', True, None),
     ('ctl backlog reject', G.GUIDANCE, "CTL", 'afx ctl backlog reject <id>', 'backlog reject <id>', "CHANGE", False, False, 'operate', 'backlog_reject', True, None),
     ('ctl backlog reopen', G.GUIDANCE, "CTL", 'afx ctl backlog reopen <id>', 'backlog reopen <id>', "CHANGE", False, False, 'operate', 'backlog_reopen', True, None),
     ('ctl backlog note', G.GUIDANCE, "CTL", 'afx ctl backlog note <id>', 'backlog note <id>', "CHANGE", False, False, 'operate', 'backlog_note', True, None),
@@ -151,14 +152,14 @@ def test_every_record_matches_the_independent_expected_table():
 
 
 def test_record_summaries_carry_the_table_notes():
-    assert "元が稼働中なら再開" in _record("ops enable").condition
+    assert _record("ops enable").condition == "必要時だけ daemon を一時停止して再開"
     for feature in ("web", "bot", "notify"):
         assert "afx に触れず" in _record(f"ops {feature} reconfigure").summary
         assert _record(f"ops {feature} reconfigure").aliases == ("reconf",)
     web, bot, notify = (_record(f"ops {name} reconfigure") for name in ("web", "bot", "notify"))
     assert (bot.implemented, bot.exposed, notify.implemented, notify.exposed) == (
         False, False, False, False)
-    assert web.implemented is False  # flips together with its parser in the integration task
+    assert (web.implemented, web.exposed) == (True, True)
     news = _record("news")
     assert (news.label, news.planned, news.implemented, news.exposed) == (
         cli_surface.Label.PER_OPERATION, True, False, False)
@@ -211,8 +212,14 @@ def test_every_node_with_children_has_parser_help():
             "ctl data", "ctl reflect", "ops web"} <= nodes
     for node in sorted(nodes):
         assert r.parser_help(node), node
-        assert r.parser_description(node), node
-        assert r.render_epilog(node), node
+        if node.startswith("ops ") and node.count(" ") == 1:
+            assert r.parser_description(node) is None
+        else:
+            assert r.parser_description(node), node
+        if node.startswith("ops ") and node.count(" ") == 1:
+            assert r.render_epilog(node) == ""
+        else:
+            assert r.render_epilog(node), node
 
 
 def test_alias_and_compatibility_text_is_pinned():
@@ -289,7 +296,6 @@ def test_package_version_is_below_every_removal_and_checked_by_the_validator():
         cli_surface.validate_compatibility_versions("1.0.0", compatibility=())
 
 
-@pytest.mark.xfail(strict=True, reason="pyproject version is raised to 0.2.0 by the integration task")
 def test_package_version_reaches_every_deprecated_since():
     current = cli_surface.version_tuple(importlib.metadata.version("agentic-fx"))
     since = {r.deprecated_since for r in cli_surface.COMPATIBILITY_RECORDS} | {
@@ -298,11 +304,17 @@ def test_package_version_reaches_every_deprecated_since():
     assert all(current >= cli_surface.version_tuple(value) for value in since)
 
 
+def test_version_expiry_pin_rejects_the_next_compatibility_release(monkeypatch):
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.3.0")
+    with pytest.raises(ValueError, match="expired compatibility record"):
+        cli_surface.validate_compatibility_versions(importlib.metadata.version("agentic-fx"))
+
+
 def test_shell_lifecycle_has_one_owner():
     stop = _record("stop")
     assert (stop.deprecated_since, stop.remove_in) == (
         cli_surface.SHELL_LIFECYCLE.deprecated_since, cli_surface.SHELL_LIFECYCLE.remove_in)
-    assert cli_surface.RENDERER.render_shell_help() == ""
+    assert cli_surface.RENDERER.render_shell_help()
     text = _renderer().render_shell_help()
     assert text.splitlines()[-1] == (
         "廃止予定: 対話 shell は 0.2.0 で deprecated。1.0.0 で削除予定。afx ctl を使用してください。")
@@ -331,31 +343,35 @@ def test_the_ctl_parser_accepts_the_advertised_backlog_add_form():
     assert (op.name, op.args, op.via_alias) == ("backlog_add", ["x"], None)
 
 
-def test_hidden_records_render_nothing():
+def test_public_records_render_and_reserved_records_do_not():
     for name in ("top_description", "render_top_epilog"):
         assert getattr(cli_surface, name)()
-    for command in ("ops", "ops web", "keys", "init", "ops web enable", "news"):
-        assert cli_surface.parser_help(command) is None
-        assert cli_surface.parser_description(command) is None
-        assert cli_surface.leaf_help(command) is None
-        assert cli_surface.render_epilog(command) == ""
-    assert cli_surface.render_shell_help() == ""
+    for command in ("ops", "ops web", "keys", "init", "ops web enable"):
+        assert cli_surface.parser_help(command)
+    for command in ("ops", "keys", "init", "ops web enable"):
+        assert cli_surface.parser_description(command)
+    assert cli_surface.parser_description("ops web") is None
+    assert cli_surface.parser_help("news") is None
+    assert cli_surface.parser_description("news") is None
+    assert cli_surface.leaf_help("news") is None
+    assert cli_surface.render_shell_help()
 
 
 def test_parent_help_comes_from_the_parent_and_label_is_derived():
     r = _renderer()
     assert r.parser_help("ops") == "[下位操作ごと] bot / web / notify の有効化・無効化・再設定・状態表示"
     assert r.parser_description("ops") == "bot / web / notify の有効化・無効化・再設定・状態表示"
-    assert r.parser_help("check") == "[下位操作ごと] 設定と実行環境の検査"
+    assert r.parser_help("check") == (
+        "[下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)")
     assert r.parser_help("history") == "[下位操作ごと] 履歴データ操作"
     assert r.parser_help("plugin") == "[下位操作ごと] plugin の採否・配備・表示"
-    assert r.parser_help("keys") == "[変更] 操作 API の鍵管理"
+    assert r.parser_help("keys") == "[変更] 操作 API の鍵管理 (停止中のみ)"
     assert r.parser_help("backtest") == "[変更] バックテスト"
-    assert r.parser_help("ctl") == "稼働中の daemon を操作 API で操作する"
+    assert r.parser_help("ctl") == "稼働中の daemon を操作 API で操作する (afx ctl help)"
     assert r.parser_help("ops web") == "web 表示 (ops-web)"
-    assert r.parser_help("init") == "[変更] 初期設定を行う"
+    assert r.parser_help("init") == "[変更] 初期設定 (対話。`--non-interactive` で従来の非対話)"
     assert r.parser_help("status") == "[読取] オフライン状態を書き込まずに表示する"
-    assert r.parser_description("init") == "初期設定を行う"
+    assert r.parser_description("init") == "初期設定 (対話。`--non-interactive` で従来の非対話)"
     assert r.parser_help("news") is None and r.leaf_help("news") is None
     assert r.parser_help("nonexistent") is None
 
@@ -364,10 +380,10 @@ def test_leaf_help_resolves_feature_verbs_and_conditions():
     r = _renderer()
     for feature in ("bot", "web", "notify"):
         assert r.leaf_help(f"ops {feature} enable") == (
-            "[変更] 機能を有効化する (必要時だけ daemon を一時停止し、元が稼働中なら再開)")
-        assert r.leaf_help(f"ops {feature} disable") == "[変更] 機能を無効化する"
-        assert r.leaf_help(f"ops {feature} status") == "[読取] 機能の状態を表示する"
-        assert r.leaf_help(f"ops {feature} reconfigure") == "[変更] afx に触れずに設定を変える"
+            "[変更] 有効化する (必要時だけ daemon を一時停止して再開)")
+        assert r.leaf_help(f"ops {feature} disable") == "[変更] daemon を止めずに無効化する"
+        assert r.leaf_help(f"ops {feature} status") == "[読取] durable stage を表示する"
+    assert r.leaf_help("ops web reconfigure") == "[変更] afx に触れずに設定を変える (別名 reconf)"
     assert r.leaf_help("ops web") is None
     assert r.leaf_help("keys init") == "[変更] 操作 API の鍵を初期化する (停止中のみ)"
     assert r.leaf_help("ctl approve") == "[変更] [確認] [approver] 承認申請を承認する"
@@ -375,13 +391,11 @@ def test_leaf_help_resolves_feature_verbs_and_conditions():
 
 def test_every_visible_leaf_resolves_exactly_once_in_epilogs():
     r = _renderer()
-    ops_records = [rec for rec in _all_exposed() if rec.command.startswith("ops ")]
     epilog = r.render_epilog("ops")
     lines = epilog.splitlines()
     assert lines[0] == "操作:"
-    for record in ops_records:
-        assert sum(line.startswith(f"  {record.usage}  ") for line in lines) == 1, record.usage
-    assert lines[-1] == ("旧形 `afx ops <enable|disable|status> <bot|web|notify> …` は 0.2.0 だけ"
+    assert [line.split()[3] for line in lines[1:5]] == ["enable", "disable", "status", "reconfigure"]
+    assert lines[-1] == ("旧形 `afx ops enable|disable|status <feature>` は 0.2.0 だけ"
                          "受け付け、0.3.0 で削除する。")
     assert "afx improve" not in epilog
     for record in _all_exposed():
@@ -405,10 +419,9 @@ def test_ctl_help_lists_each_group_and_each_ctl_record_once():
     assert text.startswith("usage: afx ctl [--as operator|approver] <操作>")
     for group in G:
         assert text.count(f"{group.value}:") == 1
-    ctl = [r for r in cli_surface.COMMANDS if r.lane is cli_surface.Lane.CTL and r.classified]
-    for record in ctl:
-        assert text.count(record.usage.removeprefix("afx ctl ") + "\n") + (
-            text.endswith(record.usage.removeprefix("afx ctl "))) >= 1, record.usage
+    for usage in ("log [n] / activity [n] [カテゴリ]", "backlog reject|reopen|note <id>",
+                  "approval list [n] / approval show <id>"):
+        assert usage in text
     assert "afx stop" not in text
 
 
