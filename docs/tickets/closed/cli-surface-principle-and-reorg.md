@@ -1,15 +1,15 @@
 ---
 id: cli-surface-principle-and-reorg
 title: afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-15
-closed: null
+closed: 2026-10-25
 related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rollback]
 ---
 # [cli-surface-principle-and-reorg] afx / afx ctl の置き場の原則を定義し、コマンド面を整理する
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中
 
 ## 現象
 
@@ -20,6 +20,8 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 ## 処置案・裁定
 
 ## 修正内容
+
+- 2026-10-25: S1 / A1 / A2 / B1 / B2a / B2b / B2c / I1 を merge (設計書 docs/superpowers/specs/2026-10-23-cli-surface-design.md v0.5r)。help は分類メタデータ (cli_surface.py) から生成し AST で literal ゼロ、afx / afx ops / afx ctl help / shell help の全文 golden、endpoint 29 本 (backlog list、policy show / remove / reconcile)、policy の managed 投影と 1 回限りの移行、offline afx status、afx ops <feature> <verb> の新形と期限付き別名、version 0.2.0、CLI の置き場の原則を ops-api 文書に正本化。確認: 直下 + 10 群の判定 green、受入手順書と doc test (a)〜(g)。PATH / root 解決は afx-on-path-and-root-resolution へ
 
 ## 経緯
 
@@ -37,3 +39,4 @@ related: [news-source-cli-and-429-backoff, deployed-plugin-has-no-disable-or-rol
 - 2026-10-25: 状態: 実装中 — A2 (offline `afx status`: `status.py` の instance lock probe と locked-by / next、読取専用 state reader (`parse_state` を StateStore と共有)、9 源の独立 collector と固定 renderer、観測用 DB 接続 1 本、pending_facts の `service_active` と settings / conn の None 許容、`count_open_readonly(opener=)`) を merge。受入 test 155 本 (sonnet、赤 7 → 是正)、codex r1 High 2 / Medium 3、/code-review 8 件 (採用 6 / 部分 1 / 却下 1)、閉鎖確認 merge 可。設計書 v0.5n〜q。判定 10 束 7422 green (core 1 本は順序依存で単独 green)。残: B2c 追加是正の小束 → I1
 - 2026-10-25: 状態: 実装中 — B2c 追加是正 (merge 後の /code-review 6 件: 方針文失敗でも課題入力へ続く、本文検査を先頭 reconcile の前に、POLICY_TEXT_LIMIT の一本化、file 重複判定を行単位完全一致に、空メッセージ例外は __cause__ (循環で停止)、案内文を backlog add に) を merge。設計書 v0.5r。閉鎖確認 (terra) Medium 1 を是正。判定で拾った A1 / A2 由来の tests/ 直下の退行 2 本 (status help の pin、verify-backend の旧関数名) と手順書の引用を追従。判定 10 群 + tests/ 直下 7555 green (egress / runners の 6 本は負荷由来、単独 green)。残: I1
 - 2026-10-25: 状態: 実装中 — I1 (I1a: help を分類メタデータの accessor に正本化し AST で literal ゼロを検査、afx / afx ops / 3 feature / afx ctl help / shell help の全文 golden、実装済み record を公開 (exposed 明示 56 件)、surface ↔ argparse / ctl parse / ENDPOINTS / 確認・approver 集合の一致 test、shell の backlog add と stop と deprecated 行、HelpFormatter 幅 100 を全 parser に、version 0.2.0。I1b: ops-api 文書に「CLI の置き場の原則」の正本節、README の使い分けと link、文書 10 件の新形化と追補、受入手順書に offline status / check backend / backlog / policy / ops <feature> <verb>、doc test (a)〜(g)) を merge。codex r1 High 3 / Medium 1、/code-review 7 件、閉鎖確認 2 周 (Medium 各 1) を是正。判定 直下+10 群 8756 / 7764 green、core 単独 2015 green (cli_launch 1 本は既存の順序依存チケット)。S1 / A1 / A2 / B1 / B2a / B2b / B2c / I1 で設計書 v0.5r の全 task が完了。残: 道筋の release 手動手順 (CLAUDE.md の原則 link 同期) と小束 afx-on-path-and-root-resolution
+- 2026-10-25: 是正内容 — S1 / A1 / A2 / B1 / B2a / B2b / B2c / I1 を merge (設計書 docs/superpowers/specs/2026-10-23-cli-surface-design.md v0.5r)。help は分類メタデータ (cli_surface.py) から生成し AST で literal ゼロ、afx / afx ops / afx ctl help / shell help の全文 golden、endpoint 29 本 (backlog list、policy show / remove / reconcile)、policy の managed 投影と 1 回限りの移行、offline afx status、afx ops <feature> <verb> の新形と期限付き別名、version 0.2.0、CLI の置き場の原則を ops-api 文書に正本化。確認: 直下 + 10 群の判定 green、受入手順書と doc test (a)〜(g)。PATH / root 解決は afx-on-path-and-root-resolution へ

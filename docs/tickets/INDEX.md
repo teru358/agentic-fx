@@ -1,13 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 133 件。完了分は closed/。
-
-## 実装中 (1)
-
-| id | 優先 | 起票 | 概要 |
-|---|---|---|---|
-| [cli-surface-principle-and-reorg](open/cli-surface-principle-and-reorg.md) | 中 | 2026-10-15 | afx / afx ctl の置き場の原則を定義し、コマンド面を整理する |
+未完了: 132 件。完了分は closed/。
 
 ## 実装待ち (11)
 
