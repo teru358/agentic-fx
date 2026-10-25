@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-17
 closed: null
 related: [first-run-setup]
+kind: 不具合
 ---
 # [first-start-check-times-out-on-model-download] 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ related: [first-run-setup]
 ## 経緯
 
 - 2026-10-17: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

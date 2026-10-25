@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-11
 closed: null
 related: []
+kind: 不具合
 ---
 # [ops-bot-display-residuals] ops bot の表示まわりの残余 (CAS 不一致後の終端 edit が 1 回のみ、承認単位 Lock の表が増え続ける)
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ afx-ops T6 bot の codex 6 周目で残った Low 2 件。(1) 再投稿の CAS �
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

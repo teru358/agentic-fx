@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-18
 closed: null
 related: [deployed-plugin-has-no-disable-or-rollback]
+kind: 保守
 ---
 # [plugin-lock-wait-notice-on-wait-argument] plugin lock の待機通知を on_wait 引数に置き換える
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象
 
@@ -24,3 +25,4 @@ deploy CLI の「他の操作の完了を待っています」通知は switch.s
 ## 経緯
 
 - 2026-10-18: 起票。
+- 2026-10-25: 種別: 保守 — 種別を付与

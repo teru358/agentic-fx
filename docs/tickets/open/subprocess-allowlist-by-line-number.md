@@ -8,10 +8,11 @@ closed: null
 related: []
 backfilled: true
 source_section: 未完了
+kind: 保守
 ---
 # [subprocess-allowlist-by-line-number]
 
-**状態**: 実装待ち / **優先**: 低
+**状態**: 実装待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 低、題名: subprocess の stdin 方針テストが行番号固定で壊れやすい — 仕分け (2026-10-02、現物で成立を確認): 関数名かマーカーコメント固定へ変えるか、運用として明記する。 根拠: tests/test_subprocess_stdin_policy.py:17 の allowlist が (path, 行番号 351) 固定のまま。
+- 2026-10-25: 種別: 保守 — 種別を付与

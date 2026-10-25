@@ -8,10 +8,11 @@ closed: null
 related: []
 backfilled: true
 source_section: 未完了
+kind: 不具合
 ---
 # [backtest-available-lists-over-max-bars]
 
-**状態**: 実装待ち / **優先**: 低
+**状態**: 実装待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 低、題名: bars 上限で拒否した指標が代替候補として返る — 仕分け (2026-10-02、現物で成立を確認): agent への軽い誤誘導で、遮断 8 違反ではない。 根拠: improve_loop.py:1057-1060 付近の available は m.outputs is not None だけで絞り、over_max_bars_limit の指標も含む。
+- 2026-10-25: 種別: 不具合 — 種別を付与

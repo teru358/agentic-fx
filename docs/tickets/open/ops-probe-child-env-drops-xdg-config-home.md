@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-24
 closed: null
 related: [web-lan-access-bind-allow-auth]
+kind: 不具合
 ---
 # [ops-probe-child-env-drops-xdg-config-home] afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ ops_setup/probe.py の run_probe は子 process (afx-ops probe) の env を {"PA
 ## 経緯
 
 - 2026-10-24: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

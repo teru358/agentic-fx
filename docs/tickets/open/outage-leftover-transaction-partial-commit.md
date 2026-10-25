@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-02
 closed: null
 related: [outage-stalled-on-broker-daily-rollover-gap]
+kind: 不具合
 ---
 # [outage-leftover-transaction-partial-commit] 停止判定の rollback 失敗で残った中途の書き込みが、次の足の保存で確定し得る
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +27,4 @@ tick の lock 区間の先頭 (足の保存の前) で、停止判定に残骸�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

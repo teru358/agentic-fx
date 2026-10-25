@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-10
 closed: null
 related: [multi-timeframe-indicator-deps, signal-producer-hourly-warning-before-confirmation]
+kind: 不具合
 ---
 # [signal-producer-evaluates-before-bar-arrives] signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +26,4 @@ plugin sma_cross_10_30 (USDJPY, 1h) の評価が毎時 00 分すぎ (取引 miss
 
 - 2026-10-10: 起票。
 - 2026-10-23: 関連: [multi-timeframe-indicator-deps, signal-producer-hourly-warning-before-confirmation] — 重複チケット signal-producer-hourly-warning-before-confirmation を本件に統合 (2026-10-23 棚卸し)
+- 2026-10-25: 種別: 不具合 — 種別を付与

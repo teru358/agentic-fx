@@ -6,10 +6,11 @@ priority: 高
 opened: 2026-10-03
 closed: null
 related: [gate-pytest-worker-dev-dir-rw]
+kind: 不具合
 ---
 # [gate-pytest-dev-writable-and-ldso-exec] gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -27,3 +28,4 @@ gate_pytest_worker の allowlist は /dev をディレクトリ単位で書き�
 
 - 2026-10-03: 起票。
 - 2026-10-23: 関連: [gate-pytest-worker-dev-dir-rw] — 重複チケット gate-pytest-worker-dev-dir-rw を本件に統合 (2026-10-23 棚卸し)
+- 2026-10-25: 種別: 不具合 — 種別を付与

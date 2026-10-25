@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-01
 closed: null
 related: []
+kind: 不具合
 ---
 # [backtest-aggregates-partial-minute-bars] backtest と resample が欠けた 1m 足をある分だけ集約し、部分的な足を作る
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ broker は tick が無かった分の 1m 足を作らない (USDJPY で 60 日�
 ## 経緯
 
 - 2026-10-01: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

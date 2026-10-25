@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-11
 closed: null
 related: [canary-reject-flaky-port-reuse-forward]
+kind: 不具合
 ---
 # [rpc-dispatcher-join-budget-test-flaky-under-load] rpc dispatcher の join budget 試験が高負荷時に揺れる
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ tests/runners/test_worker_runner.py::test_rpc_dispatcher_join_budget_dominates_r
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

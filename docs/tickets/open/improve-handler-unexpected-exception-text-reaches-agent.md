@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-02
 closed: null
 related: []
+kind: 不具合
 ---
 # [improve-handler-unexpected-exception-text-reaches-agent] 改善 mission の handler で想定外例外の文面が agent に届く
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ handler 全体で、想定外例外は固定の error と hint に写し、原�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

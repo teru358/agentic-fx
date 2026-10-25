@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-18
 closed: null
 related: [deployed-plugin-has-no-disable-or-rollback, cli-surface-principle-and-reorg]
+kind: 不具合
 ---
 # [deploy-cli-config-error-traceback] afx の subcommand は設定不在・不正 YAML で traceback を出す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ config/settings.yaml が無い、または YAML が壊れていると、afx plug
 ## 経緯
 
 - 2026-10-18: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

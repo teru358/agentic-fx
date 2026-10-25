@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-09
 closed: null
 related: [ops-api]
+kind: 不具合
 ---
 # [ops-keys-orphan-secret-temp-after-hard-crash] 鍵 rotate が key:written 直後に強制停止されると平文の一時 file が鍵 dir に残る
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ ops/keys.py の rotate は新鍵を鍵 dir 内の一時 file (.<principal>.token
 ## 経緯
 
 - 2026-10-09: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

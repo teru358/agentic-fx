@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-11
 closed: null
 related: [real-cli-selftest-opencode-does-not-stop]
+kind: 不具合
 ---
 # [canary-reject-flaky-port-reuse-forward] canary の reject 試験が稀に port_reuse_forward も失敗項目に含めて落ちる
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ tests/core/test_improve_canary.py::test_canary_failure_blocks_exec_under_real_is
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

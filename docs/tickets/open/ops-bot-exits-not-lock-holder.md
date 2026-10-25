@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-22
 closed: null
 related: [ops-bot-initial-start-replays-all-events]
+kind: 不具合
 ---
 # [ops-bot-exits-not-lock-holder] afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ afx-ops@bot が daemon 稼働中に `afx-ops: not_lock_holder` (exit 3) で終�
 ## 経緯
 
 - 2026-10-22: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

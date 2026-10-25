@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-24
 closed: null
 related: [web-lan-access-bind-allow-auth]
+kind: 不具合
 ---
 # [ops-web-head-request-loop-error] 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ related: [web-lan-access-bind-allow-auth]
 ## 経緯
 
 - 2026-10-24: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

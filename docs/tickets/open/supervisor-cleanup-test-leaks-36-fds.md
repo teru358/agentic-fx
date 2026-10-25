@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-03
 closed: null
 related: [full-suite-fd-over-1024-breaks-shell-tests]
+kind: 不具合
 ---
 # [supervisor-cleanup-test-leaks-36-fds] worker supervisor の cleanup テストが 1 回で fd を 36 本増やす
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ related: [full-suite-fd-over-1024-breaks-shell-tests]
 ## 経緯
 
 - 2026-10-03: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

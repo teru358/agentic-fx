@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-02
 closed: null
 related: [outage-stalled-on-broker-daily-rollover-gap]
+kind: 不具合
 ---
 # [first-run-empty-1m-starts-degraded] 初期化直後に 1m 足が空だと degraded から始まる (実機で確認)
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +27,4 @@ init 直後の初回起動を実機 (または実 bridge を使う結合テス�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

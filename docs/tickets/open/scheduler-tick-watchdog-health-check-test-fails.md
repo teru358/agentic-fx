@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-24
 closed: null
 related: []
+kind: 不具合
 ---
 # [scheduler-tick-watchdog-health-check-test-fails] scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ tests/test_service_app.py::test_scheduler_tick_actually_invokes_the_watchdog_hea
 ## 経緯
 
 - 2026-10-24: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

@@ -8,10 +8,11 @@ closed: null
 related: []
 backfilled: true
 source_section: 未完了
+kind: 不具合
 ---
 # [legacy-d-stage0-e]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: switch の resume 経路が symlink 版ディレクトリを resolve せず受理 — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): fresh 経路との非対称が残っているかは未確認。 根拠: switch.py:344 は .resolve() 付きだが、本文の resume 経路 (_reverify_switched_journal) との対応は個別に読まないと決まらない。
+- 2026-10-25: 種別: 不具合 — 種別を付与

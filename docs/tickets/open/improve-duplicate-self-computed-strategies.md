@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-22
 closed: null
 related: [candidates-converge-to-example-sma, strategy-attribution-and-shadow-evaluation]
+kind: 不具合
 ---
 # [improve-duplicate-self-computed-strategies] 自前計算の戦略 (sma_cross 型) は重複判定を構造変更で避けられる
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ spec 2026-10-19-improve-loop-quality-design §11 の既知の未解決穴。indi
 ## 経緯
 
 - 2026-10-22: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

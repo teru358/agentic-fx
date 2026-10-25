@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-01
 closed: null
 related: [plugin-sees-live-spread]
+kind: 不具合
 ---
 # [risk-gate-rr-uses-configured-spread] risk gate の RR 計算が設定値の spread を使い、実 spread と乖離する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ plugin-sees-live-spread で実 spread を保持した後に、RR 計算へ実測
 ## 経緯
 
 - 2026-10-01: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

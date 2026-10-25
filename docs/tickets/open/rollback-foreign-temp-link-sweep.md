@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-18
 closed: null
 related: [deployed-plugin-has-no-disable-or-rollback]
+kind: 不具合
 ---
 # [rollback-foreign-temp-link-sweep] foreign で終端した rollback の temp symlink を sweep の対象にする
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ rollback が temp symlink (.<name>.link-d<op_id>) を作った後に第三者の
 ## 経緯
 
 - 2026-10-18: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

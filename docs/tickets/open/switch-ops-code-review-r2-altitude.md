@@ -8,10 +8,11 @@ closed: null
 related: [switch-ops-hardening]
 backfilled: true
 source_section: 未完了
+kind: 保守
 ---
 # [switch-ops-code-review-r2-altitude]
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: switch ops の重複コードや型の緩さの整理 — 仕分け (2026-10-02、要確認 (再現・実機観測などが要る)): lock 内再読の 3 重複、Literal 化、print 重複などの整理候補。未再確認。 根拠: 保守性の指摘 8 点の現存は個別に読まないと決まらない。現挙動の欠陥ではない。
+- 2026-10-25: 種別: 保守 — 種別を付与

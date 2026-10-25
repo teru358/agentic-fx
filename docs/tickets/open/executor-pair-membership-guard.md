@@ -6,10 +6,11 @@ priority: 高
 opened: 2026-10-25
 closed: null
 related: [reference-symbols-as-indicator-inputs]
+kind: 不具合
 ---
 # [executor-pair-membership-guard] 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い
 
-**状態**: 設計待ち / **優先**: 高
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ related: [reference-symbols-as-indicator-inputs]
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-25
 closed: null
 related: [scheduler-tick-watchdog-health-check-test-fails]
+kind: 不具合
 ---
 # [e2e-phase1-reflection-not-generated] test_e2e_phase1 の tick 4 で reflection が 0 件 (main で恒常的に赤)
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ related: [scheduler-tick-watchdog-health-check-test-fails]
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

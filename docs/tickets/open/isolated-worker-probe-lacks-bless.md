@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-19
 closed: null
 related: [deployed-plugin-has-no-disable-or-rollback]
+kind: 保守
 ---
 # [isolated-worker-probe-lacks-bless] 実隔離 worker の deploy 境界 probe に plugin bless が無い
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象
 
@@ -24,3 +25,4 @@ tests/integration/test_improve_worker_deploy_boundary.py の CLI probe は disab
 ## 経緯
 
 - 2026-10-19: 起票。
+- 2026-10-25: 種別: 保守 — 種別を付与

@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-02
 closed: null
 related: []
+kind: 不具合
 ---
 # [settings-yaml-duplicate-key-silently-last-wins] settings.yaml の重複キーは黙って後の値が効く
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +27,4 @@ pyyaml の safe_load は重複キーを後勝ちにする。手編集で同じ�
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

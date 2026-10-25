@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-11
 closed: null
 related: []
+kind: 保守
 ---
 # [improve-admission-hashes-cli-every-mission] 改善 mission の admission が毎回 CLI binary を hash し fingerprint を再計算する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象
 
@@ -24,3 +25,4 @@ admit() は mission のたびに inspect_artifact で数十〜数百 MB の CLI 
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-25: 種別: 保守 — 種別を付与

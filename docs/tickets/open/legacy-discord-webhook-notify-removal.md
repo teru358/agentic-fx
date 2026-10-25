@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-12
 closed: null
 related: [first-run-setup]
+kind: 保守
 ---
 # [legacy-discord-webhook-notify-removal] 旧 discord.enabled + .env webhook の簡易通知を廃止する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象
 
@@ -24,3 +25,4 @@ service には旧 discord.enabled + DISCORD_WEBHOOK_URL の簡易通知が配線
 ## 経緯
 
 - 2026-10-12: 起票。
+- 2026-10-25: 種別: 保守 — 種別を付与

@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-04
 closed: null
 related: []
+kind: 不具合
 ---
 # [activity-log-grows-without-rotation] activity ログが無期限に伸びる
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ logs/activity.log に rotation / retention が無い。読み取りは末尾か�
 ## 経緯
 
 - 2026-10-04: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-02
 closed: null
 related: []
+kind: 不具合
 ---
 # [runner-trade-backend-error-wording-mismatch] runner.trade の backend の検証文言が受け付け方と食い違う
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +27,4 @@ config.py:115 のパターンは 4 種を受けてから 2 種を拒否する。
 ## 経緯
 
 - 2026-10-02: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

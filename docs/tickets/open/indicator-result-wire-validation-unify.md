@@ -8,10 +8,11 @@ closed: null
 related: []
 backfilled: true
 source_section: 未完了
+kind: 保守
 ---
 # [indicator-result-wire-validation-unify]
 
-**状態**: 実装待ち / **優先**: 低
+**状態**: 実装待ち / **優先**: 低 / **種別**: 保守
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +22,4 @@ source_section: 未完了
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 低、題名: 指標結果の検査が 2 箇所に重複している — 仕分け (2026-10-02、現物で成立を確認): 現行は健全、共通 validator に統一できる (整理)。 根拠: plugin/sandbox.py:1082 _validate_indicator_result と core/plugin_contract.py:35 _check_number に検査が重複。
+- 2026-10-25: 種別: 保守 — 種別を付与

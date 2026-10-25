@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-11
 closed: null
 related: [real-cli-selftest-should-exercise-tools-call]
+kind: 不具合
 ---
 # [seccomp-chmod-eperm-breaks-codex-rollout] seccomp の chmod/fchmod EPERM で codex の rollout 書込みが失敗する
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ related: [real-cli-selftest-should-exercise-tools-call]
 ## 経緯
 
 - 2026-10-11: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

@@ -6,10 +6,11 @@ priority: 低
 opened: 2026-10-17
 closed: null
 related: []
+kind: 不具合
 ---
 # [tests-leak-tmp-dirs-outside-basetemp] 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外)
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -28,3 +29,4 @@ helper の 3 か所を tmp_path_factory 由来の path に置き換える (隔�
 ## 経緯
 
 - 2026-10-17: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与

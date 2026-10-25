@@ -6,10 +6,11 @@ priority: 中
 opened: 2026-10-25
 closed: null
 related: [improve-mission-indicator-creation-path]
+kind: 不具合
 ---
 # [sandbox-to-datetime-and-staging-precheck] 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -24,3 +25,4 @@ mission 2037 は backtest 3 回 ok の後、最終 gate で test_plugin.py の p
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 種別: 不具合 — 種別を付与
