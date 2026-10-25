@@ -32,6 +32,8 @@ _DB_FAILED = "DB を操作できません。"
 _SETTINGS_UNREADABLE = "設定を読めません。"
 _UNEXPECTED = "予期しない失敗のため中止しました。"
 _BAD_INPUT = "入力が正しくありません"
+_INTERRUPTED = "中断しました。"
+_EMPTY_STDIN = "標準入力の URL が正しくありません"
 _REFLECT = "反映は次の収集周期 (最長 30 分) です。"
 _KNOWN_INPUT_ERRORS = frozenset({
     "名前の形式が正しくありません",
@@ -294,6 +296,12 @@ def dispatch_news(args, root: Path) -> int:
     except _Stop as stop:
         print(stop.message, file=sys.stderr)
         return stop.rc
+    except KeyboardInterrupt:
+        print(_INTERRUPTED, file=sys.stderr)
+        return 130
+    except EOFError:
+        print(_EMPTY_STDIN, file=sys.stderr)
+        return 2
     except NewsInputError as exc:
         text = str(exc)
         print(text if text in _KNOWN_INPUT_ERRORS else _BAD_INPUT, file=sys.stderr)

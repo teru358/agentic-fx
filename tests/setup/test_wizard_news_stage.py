@@ -487,3 +487,14 @@ def test_the_timeout_follows_the_settings_value(tmp_path):
     start_default = load_settings_text(
         (root / "config" / "settings.yaml").read_text()).worker.data_hook_timeout_sec
     assert spy.calls[0][3] == start_default
+
+
+def test_the_precheck_follows_the_same_rule_as_the_add_command(tmp_path):
+    from agentic_fx.store import news_sources as store
+    rows = [("nhk-keizai", FEED)]
+    for name, url in (("fresh", "HTTPS://EXAMPLE.invalid:443/feed"), ("nhk-keizai", f"{FEED}9"),
+                      ("fresh", FEED), ("fresh", f"{FEED}9")):
+        rc, io, root, spy = go(tmp_path / f"{abs(hash((name, url)))}", entries(ENTRY, f"{name} {url}"))
+        assert rc == 0, io.text
+        refused = "既に登録されています: nhk-keizai" in io.text
+        assert refused == (store.duplicate_of(rows, name, news_probe.normalize_url(url)) is not None)

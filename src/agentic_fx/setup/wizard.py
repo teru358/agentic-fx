@@ -1039,13 +1039,6 @@ def _registered_news_sources(sess: _Session) -> list[tuple[str, str]] | None:
         return None
 
 
-def _same_news_url(stored: str, normalized: str) -> bool:
-    try:
-        return news_probe.normalize_url(stored) == normalized
-    except ValueError:
-        return stored == normalized
-
-
 def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
     """Take news sources by name and URL; nothing is written here and no URL is shown."""
     if a.news_sources:
@@ -1073,10 +1066,9 @@ def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
         except Exception:  # noqa: BLE001 - never echo the cause
             sess.say("ニュース源の入力を確認できませんでした。")
             continue
-        duplicate = next((other for other, other_url in [*existing, *a.news_sources]
-                          if other == name or _same_news_url(other_url, normalized)), None)
-        if duplicate is not None:
-            sess.say(f"既に登録されています: {duplicate}")
+        clash = news_sources.duplicate_of([*existing, *a.news_sources], name, normalized)
+        if clash is not None:
+            sess.say(f"既に登録されています: {clash[1]}")
             continue
         try:
             result = news_probe.probe("feed", normalized, name,

@@ -108,3 +108,30 @@ def test_importing_the_store_does_not_load_the_fetch_libraries():
             "bad=[m for m in ('trafilatura','feedparser') if m in sys.modules];"
             "sys.exit(1 if bad else 0)")
     assert subprocess.run([sys.executable, "-I", "-c", code]).returncode == 0
+
+
+# --- duplicate_of: the single decision shared by add and the init wizard ---------------------
+
+def test_duplicate_of_reports_name_then_url_then_none():
+    rows = [("a", "https://example.invalid/x"), ("b", "https://example.invalid/y")]
+    assert news_sources.duplicate_of(rows, "a", "https://example.invalid/z") == ("name", "a")
+    assert news_sources.duplicate_of(rows, "fresh", "https://example.invalid/y") == ("url", "b")
+    assert news_sources.duplicate_of(rows, "fresh", "https://example.invalid/z") is None
+    assert news_sources.duplicate_of(rows, "b", "https://example.invalid/x") == ("name", "b")
+
+
+def test_duplicate_of_normalizes_both_sides_and_tolerates_unnormalizable_rows():
+    rows = [("a", "HTTPS://Example.invalid:443/x"), ("broken", "not a url")]
+    assert news_sources.duplicate_of(rows, "fresh", "https://example.invalid/x") == ("url", "a")
+    assert news_sources.duplicate_of(rows, "fresh", "https://example.invalid:443/x") == ("url", "a")
+    assert news_sources.duplicate_of(rows, "fresh", "https://example.invalid/other") is None
+    assert news_sources.duplicate_of(iter(rows), "broken", "https://example.invalid/other") == ("name", "broken")
+
+
+def test_find_duplicate_agrees_with_duplicate_of(tmp_path):
+    c = _db(tmp_path)
+    news_sources.add(c, name="a", fetcher="feed", url="https://example.invalid/x", added_by="user", now=NOW)
+    for name, url in (("a", "https://example.invalid/q"), ("n", "HTTPS://EXAMPLE.invalid:443/x"),
+                      ("n", "https://example.invalid/q")):
+        rows = [(r["name"], r["url"]) for r in news_sources.list_all(c)]
+        assert news_sources.find_duplicate(c, name, url) == news_sources.duplicate_of(rows, name, url)

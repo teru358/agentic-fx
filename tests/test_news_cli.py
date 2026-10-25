@@ -705,3 +705,28 @@ def test_test_with_an_unknown_stored_fetcher_is_a_fixed_failure(tmp_path, monkey
     conn.close()
     rc, _, err = run_news(capsys, monkeypatch, root, "test", "odd")
     assert (rc, err) == (1, "取得に失敗しました: 取得できません\n")
+
+
+def test_ctrl_c_ends_with_one_line_rc_130_and_no_traceback(tmp_path, monkeypatch, capsys):
+    root = make_root(tmp_path)
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(news_probe, "probe", interrupted)
+    rc, out, err = run_news(capsys, monkeypatch, root, "add", "src", OK_URL)
+    assert (rc, out, err) == (130, "", "中断しました。\n")
+    assert dump_tables(root)["news_sources"] == []
+
+
+def test_a_closed_stdin_for_dash_is_the_same_as_an_empty_value(tmp_path, monkeypatch, capsys):
+    root = make_root(tmp_path)
+    rc, out, err = run_news(capsys, monkeypatch, root, "add", "x", "-", stdin=FakeStdin(""))
+    assert (rc, out, err) == (2, "", "標準入力の URL が正しくありません\n")
+
+    def eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr(news_cli.getpass, "getpass", eof)
+    rc, out, err = run_news(capsys, monkeypatch, root, "add", "x", "-", stdin=FakeStdin("", tty=True))
+    assert (rc, out, err) == (2, "", "標準入力の URL が正しくありません\n")

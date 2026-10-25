@@ -26,15 +26,6 @@ UNKNOWN_FETCHER_REASON = "未知の取得方式"
 
 __all__ = ["NewsCollector"]
 
-# 秘密抑止は datafeed/_safe_error.py の safe_error_text に一本化した
-# (Task 8)。collector は複数ソースの失敗を集約してログに残すため、ソース
-# URL に秘密が含まれるケース (added_by="agent" で追加された将来のソース等)
-# を想定して同じ配慮が要る。以前はここに同じ関数を複製していたが
-# (「private ヘルパーはモジュール間で import せず複製する」方針)、econ
-# カレンダーが 3 つ目の複製先になる時点でその方針は割に合わない —
-# 抑止パターンを 1 箇所で更新できないと片側だけ古いままになる。
-
-
 
 class NewsCollector:
     """enabled な news_sources を全件回し、fetcher で取得して RAG へ upsert する。

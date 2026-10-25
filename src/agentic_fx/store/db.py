@@ -599,9 +599,13 @@ def connect_existing_rw(db_path: Path) -> sqlite3.Connection:
         if "unable to open" in str(exc).lower():
             raise FileNotFoundError("connect_existing_rw requires an existing DB") from None
         raise
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
