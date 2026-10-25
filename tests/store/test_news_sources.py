@@ -33,22 +33,6 @@ def test_add_without_commit_can_be_rolled_back(tmp_path):
     assert news_sources.list_all(c) == []
 
 
-def test_seed_default_sources_commit_flag_defaults_to_committing(tmp_path):
-    from agentic_fx.datafeed.news_collector import seed_default_sources
-
-    c = connect(tmp_path / "t.db")
-    init_db(c)
-    c.commit()
-    c.execute("BEGIN IMMEDIATE")
-    added = seed_default_sources(c, NOW, commit=False)
-    assert added > 0 and c.in_transaction
-    c.rollback()
-    assert news_sources.list_all(c) == []
-    assert seed_default_sources(c, NOW) == added
-    assert not c.in_transaction
-    assert len(news_sources.list_all(c)) == added
-
-
 def _db(tmp_path):
     c = connect(tmp_path / "t.db")
     init_db(c)

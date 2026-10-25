@@ -1024,21 +1024,36 @@ def _stage3_without_bridge(sess: _Session, a: Answers) -> None:
     a.price = _plain_record("ok", sess.now_iso())
 
 
+def _registered_news_sources(sess: _Session) -> list[tuple[str, str]] | None:
+    """Names and stored URLs already in the database; None when they cannot be read."""
+    db_path = sess.root / "data" / "agentic.db"
+    if not db_path.is_file():
+        return []
+    try:
+        conn = connect_readonly(db_path)
+        try:
+            return [(row["name"], row["url"]) for row in news_sources.list_all(conn)]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - the message must not carry the cause
+        return None
+
+
+def _same_news_url(stored: str, normalized: str) -> bool:
+    try:
+        return news_probe.normalize_url(stored) == normalized
+    except ValueError:
+        return stored == normalized
+
+
 def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
-    """Collect news sources without writing them or exposing their URLs."""
+    """Take news sources by name and URL; nothing is written here and no URL is shown."""
     if a.news_sources:
         sess.say("入力済みのニュース源: " + ", ".join(name for name, _ in a.news_sources))
-    existing: list[tuple[str, str]] = []
-    db_path = sess.root / "data" / "agentic.db"
-    if db_path.is_file():
-        try:
-            conn = connect_readonly(db_path)
-            try:
-                existing = [(row["name"], row["url"]) for row in news_sources.list_all(conn)]
-            finally:
-                conn.close()
-        except Exception:
-            sess.say("ニュース源を確認できませんでした。")
+    existing = _registered_news_sources(sess)
+    if existing is None:
+        sess.say("登録済みのニュース源を確認できませんでした。")
+        existing = []
     while True:
         raw = sess.text("ニュース源 (名前 URL、空 Enter で飛ばす)")
         if not raw:
@@ -1051,13 +1066,15 @@ def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
         name, url = parts
         try:
             news_probe.validate_name(name)
-            news_probe.validate_url(url)
             normalized = news_probe.normalize_url(url)
-        except Exception:
-            sess.say("名前または URL の形式が正しくありません。")
+        except news_probe.NewsInputError as error:
+            sess.say(str(error))
+            continue
+        except Exception:  # noqa: BLE001 - never echo the cause
+            sess.say("ニュース源の入力を確認できませんでした。")
             continue
         duplicate = next((other for other, other_url in [*existing, *a.news_sources]
-                          if other == name or news_probe.normalize_url(other_url) == normalized), None)
+                          if other == name or _same_news_url(other_url, normalized)), None)
         if duplicate is not None:
             sess.say(f"既に登録されています: {duplicate}")
             continue
@@ -1065,10 +1082,10 @@ def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
             result = news_probe.probe("feed", normalized, name,
                                       timeout_sec=st.base_settings.worker.data_hook_timeout_sec)
         except news_probe.ProbeFailure as error:
-            sess.say(error.reason)
+            sess.say(f"取得に失敗したので追加しません: {error.reason}")
             continue
-        except Exception:
-            sess.say("ニュース源を確認できませんでした。")
+        except Exception:  # noqa: BLE001 - never echo the cause
+            sess.say("取得に失敗したので追加しません: 取得できません")
             continue
         sess.say(f"取得: {result.count} 件 (うち本文・要約あり {result.with_body} 件)")
         if result.count == 0 and not sess.yesno("0 件でした。それでも追加しますか?", False):

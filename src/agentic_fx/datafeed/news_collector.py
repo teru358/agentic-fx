@@ -10,6 +10,7 @@ tz-aware UTC を強制する経路はそのまま素通しし、ここで naive 
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime, timezone
 
 from agentic_fx.activity import ActivityLog, Category

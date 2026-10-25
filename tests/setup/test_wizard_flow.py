@@ -43,12 +43,12 @@ def test_fresh_root_with_a_connected_bridge_completes_with_only_the_answered_lin
 def test_questions_are_asked_in_the_designed_order(tmp_path):
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    answers = ["", "", "", "", "", "1", "", "", "", "", "", "", "", "", "", "", "", "n", "y", "", ""]
+    answers = ["", "", "", "", "", "1", "", "", "", "", "", "", "", "", "", "", "", "", "n", "y", "", ""]
     io = ScriptedWizardIO(answers)
     assert run_wizard(root, io, deps) == 0, io.text
     io.assert_consumed()
     topics = ["読みました", "表示タイムゾーン (例", "口座通貨", "対象ペア", "初期残高", "価格源", "bridge の URL",
-              "bridge 側で API キー", "LLM の構成", "取引判断のモデルの番号", "改善の backend",
+              "bridge 側で API キー", "ニュース源 (名前 URL", "LLM の構成", "取引判断のモデルの番号", "改善の backend",
               "改善のモデルの番号", "判断足", "backtest の基底足", "改善の周期", "改善の時刻", "最初の 1 本",
               "afx を常駐サービス", "この内容で書き込みます", "方針文", "最初の課題"]
     assert len(io.asked) == len(topics)

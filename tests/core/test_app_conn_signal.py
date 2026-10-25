@@ -267,7 +267,7 @@ def test_build_app_failure_closes_signal_connection(tmp_path, monkeypatch):
         return conn
 
     monkeypatch.setattr("agentic_fx.service.connect", tracking_connect)
-    monkeypatch.setattr("agentic_fx.service.seed_default_sources",
+    monkeypatch.setattr("agentic_fx.service.missions.recover_interrupted",
                         MagicMock(side_effect=RuntimeError("boom")))
     import pytest
     with pytest.raises(RuntimeError, match="boom"):
