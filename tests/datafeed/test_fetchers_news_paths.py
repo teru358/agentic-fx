@@ -83,6 +83,21 @@ def test_feed_links_other_than_http_and_https_are_skipped(serve, caplog):
     assert "web:my-web-source" not in text and "javascript" not in text
 
 
+def test_skipped_feed_links_are_reported_once_per_source(serve, caplog):
+    serve(rss(
+        rss_item("https://example.invalid/ok"),
+        rss_item("javascript:alert(1)"),
+        rss_item("ftp://example.invalid/x"),
+        rss_item("/relative/path")))
+    with caplog.at_level(logging.DEBUG):
+        arts = fetch_feed(URL, "src", timeout_sec=5)
+    assert len(arts) == 1
+    skipped = [r for r in caplog.records if "skipped" in r.getMessage()]
+    assert len(skipped) == 1
+    text = skipped[0].getMessage()
+    assert "3" in text and "javascript" not in text and "example.invalid" not in text
+
+
 def test_feed_article_urls_keep_their_own_spelling(serve):
     link = "https://example.invalid/story?id=7&ref=a"
     serve(rss(rss_item(link)))

@@ -1,6 +1,29 @@
 from email.message import Message
 
+import pytest
+
 from agentic_fx.datafeed.user_agent import user_agent
+
+
+@pytest.fixture(autouse=True)
+def _fresh_user_agent():
+    user_agent.cache_clear()
+    yield
+    user_agent.cache_clear()
+
+
+def test_user_agent_reads_metadata_once(monkeypatch):
+    calls = []
+
+    def version(_):
+        calls.append(1)
+        return "9.8.7"
+
+    with monkeypatch.context() as patch:
+        patch.setattr("importlib.metadata.version", version)
+        patch.setattr("importlib.metadata.metadata", lambda _: Message())
+        assert user_agent() == user_agent() == "agentic-fx/9.8.7"
+    assert len(calls) == 1
 
 
 def test_user_agent_uses_repository_metadata(monkeypatch):

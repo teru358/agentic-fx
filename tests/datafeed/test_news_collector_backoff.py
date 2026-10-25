@@ -615,3 +615,32 @@ def test_uppercase_and_long_legacy_names_are_tracked(tmp_path, monkeypatch):
         patch.setattr("agentic_fx.datafeed.news_collector.fetch_feed", fetch)
         col.collect()
     assert _health(conn, name).record.consecutive_failures == 1
+
+
+# ---- storage failure is not a source failure -------------------------------
+
+class _BrokenRag:
+    def add_news(self, articles, now):
+        raise RuntimeError(f"chroma down {CANARY_STORE}")
+
+    def cleanup_news(self, now, hours=48):
+        return 0
+
+
+CANARY_STORE = "https://example.invalid/store-canary?k=SECRETSTORE"
+
+
+def test_rag_write_failure_is_not_counted_against_the_source(tmp_path, monkeypatch, caplog):
+    conn, rag, clock, col = make_env(tmp_path, rag=_BrokenRag())
+    add_source(conn)
+    before = _health(conn)
+    fetch = Scripted([[article(1)]], clock)
+    with monkeypatch.context() as patch, caplog.at_level(logging.DEBUG):
+        patch.setattr("agentic_fx.datafeed.news_collector.fetch_feed", fetch)
+        col.collect()
+    lines = activity_lines(tmp_path)
+    assert not any("news_source_failed" in line for line in lines)
+    assert sum("news_store_failed" in line for line in lines) == 1
+    assert _health(conn).raw == before.raw and _health(conn).record is None
+    assert not any("SECRETSTORE" in line or "example.invalid" in line for line in lines)
+    assert "SECRETSTORE" not in caplog.text and "chroma down" not in caplog.text

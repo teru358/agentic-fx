@@ -25,12 +25,15 @@ def validate_name(name: str) -> None:
 
 
 def validate_url(url: str) -> None:
-    """Accept http/https with a host, no userinfo, no '#', at most 2048 chars.
+    """Accept http/https with a host, no userinfo, no '#', no whitespace or control
+    characters, at most 2048 chars.
 
     The length is that of the input as given.  Raises NewsInputError whose text
     does not contain the URL.
     """
     if not isinstance(url, str) or len(url) > MAX_URL_CHARS:
+        raise NewsInputError(_BAD_URL)
+    if any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
         raise NewsInputError(_BAD_URL)
     try:
         parts = urlsplit(url)

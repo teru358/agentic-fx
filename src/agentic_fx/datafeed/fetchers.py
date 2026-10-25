@@ -198,6 +198,7 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
             "returning partial results", source_name, reason,
             len(parsed.entries), "y" if len(parsed.entries) == 1 else "ies")
     out: list[Article] = []
+    skipped_links = 0
     for e in parsed.entries:
         try:
             link = e.link
@@ -209,13 +210,16 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
         except AttributeError:
             title = ""
         if not _is_http_link(link):
-            _log.warning("feed %s: article link skipped (not http/https)", source_name)
+            skipped_links += 1
             continue
         out.append(Article(
             url=link, title=title,
             body=getattr(e, "summary", "") or "",
             published=_feed_published(e, source_name),
             source_name=source_name))
+    if skipped_links:
+        _log.warning("feed %s: %d article link(s) skipped (not http/https)",
+                     source_name, skipped_links)
     return out
 
 

@@ -50,6 +50,8 @@ def test_valid_urls(url):
     "https://user:pw@example.invalid/x", "https://example.invalid/x#frag",
     "https://example.invalid/x#", "https://example.invalid/#", "https://example.invalid:99999/x",
     "https://example.invalid:abc/x", "", None,
+    "http://exa mple.com/", "http://example.com/\x00", "http://example.com/a\tb",
+    "http://example.com/\n", "http://example.com/a\x7fb", "http://example.com/a b",
     "https://example.invalid/" + "a" * (2049 - len("https://example.invalid/")),
 ])
 def test_invalid_urls(url):

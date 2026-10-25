@@ -124,18 +124,24 @@ class NewsCollector:
             self._remember_attempt(key, now)
             try:
                 articles = fetch(src["url"], src["name"], timeout_sec=self.timeout_sec)
-                total += self.rag.add_news(
-                    [{"url": a.url, "title": a.title, "body": a.body,
-                      "source_name": a.source_name, "published": a.published,
-                      **({"rag_id": a.rag_id} if a.rag_id else {})}
-                     for a in articles], now)
-                self._update_health(name, raw, current, "ok", now, count=len(articles))
             except Exception as e:  # noqa: BLE001 — 1 ソース障害で止めない
                 failure = classify_failure(e, now)
                 self._remember_retry_after(key, failure, now)
                 self._update_health(name, raw, current, failure.kind, now,
                                     reason=failure.reason)
                 self._record_failure(name, failure.reason)
+                continue
+            try:
+                total += self.rag.add_news(
+                    [{"url": a.url, "title": a.title, "body": a.body,
+                      "source_name": a.source_name, "published": a.published,
+                      **({"rag_id": a.rag_id} if a.rag_id else {})}
+                     for a in articles], now)
+            except Exception as e:  # noqa: BLE001 — 保存側の障害は源の失敗に数えない
+                _log.warning("news source %s store failed (%s)", name, type(e).__name__)
+                self.activity.write(Category.NEWS, "news_store_failed", name)
+                continue
+            self._update_health(name, raw, current, "ok", now, count=len(articles))
         removed = self.rag.cleanup_news(now, hours=48)
         self.activity.write(Category.NEWS, "collected",
                             f"{total} articles ({removed} cleaned)")

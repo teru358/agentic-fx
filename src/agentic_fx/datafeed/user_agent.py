@@ -1,7 +1,9 @@
 """The one User-Agent used for outbound news requests."""
+from functools import lru_cache
 from importlib import metadata
 
 
+@lru_cache(maxsize=1)
 def user_agent() -> str:
     """Return package identity, without falling back to httpx's default."""
     try:
