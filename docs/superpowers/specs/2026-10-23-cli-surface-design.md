@@ -977,7 +977,9 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 1. 最上位 option `--root <dir>` (`--daemon` と同じく subcommand より前に置く。argv shim の head 計算は `--root <dir>` の 2 token を `--daemon` と同様に前置きとして数える)。
 2. 環境変数 `AFX_ROOT`。
 3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。親は与えられた path の字句上の親で (`resolve()` しない)、`/` まで見る。`config` や `settings.yaml` が symlink でも、辿った先が directory / regular file なら root と数える (辿れない symlink は数えない)。
-4. どれも無ければ `Path.cwd()` (初回の `afx init` はここに落ちる)。
+4. どれも無ければ `Path.cwd()`。
+
+3 の上方探索は、既存 root を対象にする操作 (`status`、`check`、`keys`、`ops`、`history`、`backtest`、`analyze`、`plugin`、`ctl`) にだけ適用する。**`afx init` と `--daemon` は探索せず**、1 → 2 → cwd で決める (空の sub directory で `afx init` を打ったとき親の root を書き換えないため。daemon は unit の `WorkingDirectory` が root)。探索は、候補 directory の所有者が実行 uid と異なる時点で止めて cwd に落とす (`/tmp` のような共有 directory に置かれた偽の `config/settings.yaml` を root と見ないため)。採用した root が cwd と違うときは、`afx status` の `root:` 行以外では表示しない。
 
 1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` (`<dir>` は指定された文字列そのまま) を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
 
@@ -987,7 +989,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 
 ### 13.3 bash 補完
 
-`afx completion bash` を導入・接続管理の群に `[読取]` で足す (usage `afx completion bash`、summary `bash の補完スクリプトを出力する`、daemon 不要、何も書かない)。stdout に bash の補完スクリプトを出し、利用者は `.bashrc` に `eval "$(afx completion bash)"` を書く。`bash` 以外の shell 名は `afx: 補完は bash だけです` で rc=2。
+`afx completion bash` を導入・接続管理の群に `[読取]` で足す (usage `afx completion bash`、summary `bash の補完スクリプトを出力する`、daemon 不要、何も書かない)。stdout に bash の補完スクリプトを出し、利用者は生成物を bash-completion の利用者 directory に置く (`afx completion bash > ~/.local/share/bash-completion/completions/afx`。bash-completion が遅延読込する。無い環境では `.bashrc` に `eval "$(afx completion bash)"` でもよいが、shell 起動ごとに afx を起動する)。生成物の関数は `local IFS=' '` で語の結合を固定する。`bash` 以外の shell 名は `afx: 補完は bash だけです` で rc=2。
 
 スクリプトは `cli_surface.py` の record から決定論的に生成する。候補は次のとおりで、planned と非公開 (`exposed=False`)、互換別名、廃止名は含めない。
 
@@ -1066,3 +1068,4 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | 2026-10-25 | v0.5q | §6.3 の `next` の start 条件に active の語 (inactive / failed / unknown) を加える | A2 是正 2 (sonnet) の指摘: is-active の語を増やしたので start を勧める条件が要る | |
 | 2026-10-25 | v0.5r | §5.3.4: 方針文の失敗は課題の入力へ続く、本文検査を先頭 reconcile の前に、上限は `POLICY_TEXT_LIMIT` 1 定数、file 側の重複判定を行単位完全一致に、空メッセージ例外は `__cause__`、案内文は正式名 | B2c merge 後の /code-review 8 件 (採用 6 / 却下 2、裁定 tmp/review-cli/reports/b2c/b2c-cr2-rulings.md) | |
 | 2026-10-25 | v0.5s | §13 新設: root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd)、`uv tool install` による PATH 配置の文書化、`afx completion bash` (record から生成、bash のみ)、AC-44〜47。§3.2 等の golden は実装出力を写して改訂する | チケット afx-on-path-and-root-resolution (ユーザー裁定 2026-10-25: 優先 中、補完は静的生成の案 2) | |
+| 2026-10-25 | v0.5t | §13.1: 上方探索は init と --daemon に適用しない、所有者が異なる directory で探索を止める、エラー文は指定値を含む、symlink の marker は辿った先で判定。§13.3: 生成物は bash-completion の利用者 directory へ、`local IFS`。§13.4: completion は用途表に載せない (100 桁) | afx-path /code-review high 8 件 (採用 7 / 却下 1 = zsh の固定文は spec どおり) と指揮者検収 3 件 | |
