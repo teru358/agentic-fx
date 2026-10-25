@@ -45,7 +45,7 @@ options:
   afx ctl <op>   稼働 daemon の認証・監査つき操作 API
 
 用途                     daemon 不要                稼働 daemon
-導入・接続管理           init / check / keys / ops / completion ctl whoami
+導入・接続管理           init / check / keys / ops  ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
 市場入力を整える         history                    —
 調査・評価する           backtest / analyze         —
@@ -406,8 +406,17 @@ def test_top_overview_rows_follow_the_records():
             for group in cli_surface.Group if line.startswith(group.value)}
     assert rows["市場入力を整える"].split() == ["市場入力を整える", "—", "—"]
     assert rows["導入・接続管理"].split() == [
-        "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "/", "completion", "—"]
+        "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "—"]
     assert "history" not in "".join(rows.values())
+    assert "completion" not in "".join(rows.values())
+
+
+def test_a_record_kept_out_of_the_overview_still_appears_in_the_positional_list():
+    record = next(r for r in cli_surface.COMMANDS if r.command == "completion bash")
+    assert record.overview is False and record.exposed is True
+    assert "completion" in cli_surface.parser_help("completion") or cli_surface.parser_help("completion")
+    shown = cli_surface.SurfaceRenderer(cli_surface.COMMANDS).render_top_epilog()
+    assert "completion" not in shown
 
 
 def test_top_overview_survives_an_empty_record_set():

@@ -135,14 +135,14 @@ def _split_prefix(args_list: list[str]) -> tuple[int, str | None]:
 
 def _is_regular_file(path: Path) -> bool:
     try:
-        return stat.S_ISREG(os.lstat(path).st_mode)
+        return stat.S_ISREG(os.stat(path).st_mode)
     except OSError:
         return False
 
 
-def _is_plain_directory(path: Path) -> bool:
+def _is_directory(path: Path) -> bool:
     try:
-        return stat.S_ISDIR(os.lstat(path).st_mode)
+        return stat.S_ISDIR(os.stat(path).st_mode)
     except OSError:
         return False
 
@@ -153,17 +153,17 @@ def resolve_root(argv: list[str], environ: Mapping[str, str], cwd: Path) -> Path
     if option is not None:
         path = Path(os.path.abspath(Path(cwd) / option))
         if not path.is_dir():
-            raise RootError("afx: --root <dir> は directory ではありません")
+            raise RootError(f"afx: --root {option} は directory ではありません")
         return path
     env_value = environ.get("AFX_ROOT")
     if env_value:
         path = Path(os.path.abspath(Path(cwd) / env_value))
         if not path.is_dir():
-            raise RootError("afx: AFX_ROOT=<dir> は directory ではありません")
+            raise RootError(f"afx: AFX_ROOT={env_value} は directory ではありません")
         return path
     here = Path(os.path.abspath(cwd))
     for candidate in (here, *here.parents):
-        if (_is_plain_directory(candidate / "config")
+        if (_is_directory(candidate / "config")
                 and _is_regular_file(candidate / "config" / "settings.yaml")):
             return candidate
     return here

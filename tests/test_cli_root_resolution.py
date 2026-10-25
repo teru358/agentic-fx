@@ -8,8 +8,12 @@ import pytest
 from agentic_fx import entry, status
 from tests.status_support import make_run, manifest
 
-NOT_A_DIRECTORY_OPTION = "afx: --root <dir> は directory ではありません\n"
-NOT_A_DIRECTORY_ENV = "afx: AFX_ROOT=<dir> は directory ではありません\n"
+def not_a_directory_option(path):
+    return f"afx: --root {path} は directory ではありません\n"
+
+
+def not_a_directory_env(path):
+    return f"afx: AFX_ROOT={path} は directory ではありません\n"
 
 
 def _make_root(path: Path) -> Path:
@@ -62,18 +66,24 @@ def test_without_any_settings_the_root_is_the_working_directory(tmp_path):
     assert entry.resolve_root(["init"], {}, work) == work
 
 
-def test_the_search_does_not_follow_symlinks(tmp_path):
+def test_the_search_walks_lexical_parents_and_accepts_symlinked_markers(tmp_path):
     real = _make_root(tmp_path / "real")
     work = tmp_path / "work"
     (work / "child").mkdir(parents=True)
     (work / "config").symlink_to(real / "config", target_is_directory=True)
-    assert entry.resolve_root(["init"], {}, work / "child") == work / "child"
+    assert entry.resolve_root(["init"], {}, work / "child") == work
 
     other = tmp_path / "other"
     (other / "config").mkdir(parents=True)
     (other / "config" / "settings.yaml").symlink_to(real / "config" / "settings.yaml")
     (other / "child").mkdir()
-    assert entry.resolve_root(["init"], {}, other / "child") == other / "child"
+    assert entry.resolve_root(["init"], {}, other / "child") == other
+
+    dangling = tmp_path / "dangling"
+    (dangling / "config").mkdir(parents=True)
+    (dangling / "config" / "settings.yaml").symlink_to(tmp_path / "nowhere")
+    (dangling / "child").mkdir()
+    assert entry.resolve_root(["init"], {}, dangling / "child") == dangling / "child"
 
 
 def test_an_empty_environment_value_is_treated_as_unset(tmp_path):
@@ -113,7 +123,7 @@ def test_an_invalid_root_option_stops_with_a_fixed_sentence_and_writes_nothing(
     assert entry.main(["--root", str(bad), "status"]) == 2
     out = capsys.readouterr()
     assert out.out == ""
-    assert out.err == NOT_A_DIRECTORY_OPTION
+    assert out.err == not_a_directory_option(bad)
     assert manifest(tmp_path) == before
 
 
@@ -128,7 +138,7 @@ def test_an_invalid_environment_root_stops_with_a_fixed_sentence_and_writes_noth
     assert entry.main(["status"]) == 2
     out = capsys.readouterr()
     assert out.out == ""
-    assert out.err == NOT_A_DIRECTORY_ENV
+    assert out.err == not_a_directory_env(bad)
     assert manifest(tmp_path) == before
 
 
@@ -138,7 +148,7 @@ def test_an_invalid_root_also_stops_the_ctl_route_before_the_client_runs(tmp_pat
     monkeypatch.chdir(tmp_path)
     assert entry.main(["--root", str(tmp_path / "nothing"), "ctl", "status"]) == 2
     assert called == []
-    assert capsys.readouterr().err == NOT_A_DIRECTORY_OPTION
+    assert capsys.readouterr().err == not_a_directory_option(tmp_path / "nothing")
 
 
 # --- every subcommand receives the resolved root ---

@@ -58,6 +58,7 @@ class CommandRecord:
     ctl_text: str | None = None
     ctl_fold: str = ""
     overview_term: str | None = None
+    overview: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +103,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
             classified: bool = True, implemented: bool = True, exposed: bool = False,
             planned: bool = False, deprecated_since: str | None = None,
             remove_in: str | None = None, ctl_text: str | None = None, ctl_fold: str = "",
-            overview_term: str | None = None) -> CommandRecord:
+            overview_term: str | None = None, overview: bool = True) -> CommandRecord:
     return CommandRecord(
         group=group,
         group_order=(tuple(Group).index(group) + 1) if group is not None else None,
@@ -131,6 +132,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
         ctl_text=ctl_text,
         ctl_fold=ctl_fold,
         overview_term=overview_term,
+        overview=overview,
     )
 
 
@@ -174,7 +176,7 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
     _record(Group.SETUP, Lane.LOCAL, "ops status", "afx ops <bot|web|notify> status", Label.READ,
             "durable stage を表示する", "entry.py", exposed=True),
     _record(Group.SETUP, Lane.LOCAL, "completion bash", "afx completion bash", Label.READ,
-            "bash の補完スクリプトを出力する", "completion.py", exposed=True),
+            "bash の補完スクリプトを出力する", "completion.py", exposed=True, overview=False),
     _record(Group.SETUP, Lane.CTL, "ctl whoami", "afx ctl whoami", Label.READ,
             "認証した principal を表示する", "ops/client.py", shell_usage=None,
             scope="status.read", endpoint_code="whoami", daemon_required=True, exposed=True),
@@ -496,10 +498,14 @@ def _expand(record: CommandRecord) -> tuple[str, ...]:
     return (record.command,)
 
 
+def _display_width(text: str) -> int:
+    """Display width in which fullwidth and wide characters take two columns."""
+    return sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in text)
+
+
 def _pad(text: str, width: int) -> str:
-    """Pad to a display width in which fullwidth and wide characters take two columns."""
-    used = sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in text)
-    return text + " " * max(width - used, 1)
+    """Pad to a display width; fullwidth and wide characters take two columns."""
+    return text + " " * max(width - _display_width(text), 1)
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -557,12 +563,12 @@ class SurfaceRenderer:
         return "agentic-fx"
 
     def render_top_epilog(self) -> str:
-        columns = (25, 27)
         rows = [("用途", "daemon 不要", "稼働 daemon")]
         for group in Group:
             local, ctl = self._lane_terms(group, Lane.LOCAL), self._lane_terms(group, Lane.CTL)
             rows.append((group.value, " / ".join(local) or "—",
                          ("ctl " + " / ".join(ctl)) if ctl else "—"))
+        columns = tuple(max(_display_width(row[index]) for row in rows) + 2 for index in (0, 1))
         table = [_pad(first, columns[0]) + _pad(second, columns[1]) + third
                  for first, second, third in rows]
         return (
@@ -577,7 +583,7 @@ class SurfaceRenderer:
         """Command words a group lists for one lane, in record order without repeats."""
         terms: list[str] = []
         for record in self._visible:
-            if record.group is not group or record.lane is not lane:
+            if record.group is not group or record.lane is not lane or not record.overview:
                 continue
             words = record.command.split(" ")
             term = record.overview_term or (words[1] if lane is Lane.CTL else words[0])

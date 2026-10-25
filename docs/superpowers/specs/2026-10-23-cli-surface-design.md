@@ -242,7 +242,7 @@ options:
   afx ctl <op>   稼働 daemon の認証・監査つき操作 API
 
 用途                     daemon 不要                稼働 daemon
-導入・接続管理           init / check / keys / ops / completion ctl whoami
+導入・接続管理           init / check / keys / ops  ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
 市場入力を整える         history                    —
 調査・評価する           backtest / analyze         —
@@ -976,10 +976,10 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 
 1. 最上位 option `--root <dir>` (`--daemon` と同じく subcommand より前に置く。argv shim の head 計算は `--root <dir>` の 2 token を `--daemon` と同様に前置きとして数える)。
 2. 環境変数 `AFX_ROOT`。
-3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。symlink は辿らず、`/` まで見る。
+3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。親は与えられた path の字句上の親で (`resolve()` しない)、`/` まで見る。`config` や `settings.yaml` が symlink でも、辿った先が directory / regular file なら root と数える (辿れない symlink は数えない)。
 4. どれも無ければ `Path.cwd()` (初回の `afx init` はここに落ちる)。
 
-1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
+1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` (`<dir>` は指定された文字列そのまま) を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
 
 ### 13.2 PATH への配置
 
@@ -1010,7 +1010,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | AC-46 | 実 bash で `afx ct` → `ctl`、`afx ctl pol` → `policy`、`afx ctl policy ` → 4 語、`afx ops w` → `web`、`afx ops web ` → `enable disable reconfigure status`、`afx ops bot ` に `reconfigure` が無い、`afx ctl --as ` → `operator approver`、`afx completion ` → `bash` | subprocess bash + COMP_WORDS |
 | AC-47 | `afx completion zsh` は rc=2 で固定文、stdout 空。`afx completion bash` は file / DB / lock を作らない | rc、stderr、tree zero-write |
 
-§3.2 / §3.2.1 / §3.3 の golden は `--root` と `completion` の追加で変わる。更新後の全文は I1 と同じ検査条件 (非 TTY、色なし、幅 100、全行 100 桁以内) で実装の出力を写し、本節の v0.5s 改訂で §3.2 に反映する。ops-api 文書の原則節と `first-run-acceptance.md` にも `completion bash` を足す (doc test (c) の正式名は 9 つのまま。`completion` は正所属の表にだけ出す)。
+§3.2 / §3.2.1 / §3.3 の golden は `--root` と `completion` の追加で変わる。更新後の全文は I1 と同じ検査条件 (非 TTY、色なし、幅 100、全行 100 桁以内) で実装の出力を写し、本節の v0.5s 改訂で §3.2 に反映する。ops-api 文書の原則節と `first-run-acceptance.md` にも `completion bash` を足す (doc test (c) の正式名は 9 つのまま)。`afx --help` 末尾の用途表は運用操作の一覧であり、補完の導入語 `completion` は positional 一覧にだけ出して用途表には載せない (record の `overview=False`。載せると「稼働観測・実行追跡」行が 100 桁を超える)。
 
 ## 11. 後続と非目標
 
