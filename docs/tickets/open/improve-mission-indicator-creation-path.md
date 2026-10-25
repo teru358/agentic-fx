@@ -1,7 +1,7 @@
 ---
 id: improve-mission-indicator-creation-path
 title: 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突)
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-25
 closed: null
@@ -9,7 +9,7 @@ related: [improve-objective-filtered-signal-quality, improve-run-summary-for-hum
 ---
 # [improve-mission-indicator-creation-path] 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突)
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-objective-filtered-signal-quality, improve-run-summary-for-hum
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 状態: 実装中 — 2026-10-25: feedback spec v0.4 §9.5 で設計、prompt と pin test を実装 (terra)、判定 tests/loops + integration + 直下 2766 green。AC-32 (方針文だけで indicator 候補が出るか) は次の手動 improve と 10/31 週次で観測。本番反映は次の daemon 再起動 (prompt は起動時に読む)
