@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -746,16 +747,6 @@ def test_a_plugins_file_instead_of_a_directory_is_not_inventoried(tmp_path, monk
     assert seen["deployed"] == ()
 
 
-def test_a_failing_inventory_degrades_to_an_empty_one(tmp_path, monkeypatch, capsys):
-    root = full_root(tmp_path)
-    (root / "plugins").mkdir()
-    seen = _spy_pending(monkeypatch)
-    monkeypatch.setattr(status.plugin_loader, "approved_plugins", _boom)
-    rc, out = run_status(root, capsys)
-    assert seen["deployed"] == ()
-    assert rc == 0 and fields(out)["pending steps"] != "unavailable"
-
-
 # database robustness ----------------------------------------------------------
 
 def test_the_observer_connections_are_always_closed(tmp_path, monkeypatch, capsys):
@@ -859,3 +850,129 @@ def test_invalid_and_missing_values_alone_never_exit_one(tmp_path, capsys):
     values = fields(out)
     assert (values["setup"], values["settings"]) == ("corrupt", "invalid")
     assert rc == 0
+
+
+# field-wise activity, unit words, symlinked database, shared connection ----------
+
+def test_a_percent_encoded_non_ascii_field_is_redacted_alone(tmp_path, capsys):
+    root = full_root(tmp_path)
+    write_activity(root, "2026-10-25T01:02:03Z\tpolicy\ttoken=%E3%81%82\tsummary")
+    rc, out = run_status(root, capsys)
+    assert fields(out)["recent activity"] == "2026-10-25T01:02:03Z policy [redacted]"
+    assert rc == 0
+
+
+def test_a_redacted_category_does_not_hide_the_other_fields(tmp_path, capsys):
+    root = full_root(tmp_path)
+    write_activity(root, "2026-10-25T01:02:03Z\ttoken=%E3%81%82\tevent\tsummary")
+    assert fields(run_status(root, capsys)[1])["recent activity"] == "2026-10-25T01:02:03Z [redacted] event"
+
+
+@pytest.mark.parametrize("stdout,rc_code,word", [
+    ("activating\n", 3, "activating"),
+    ("deactivating\n", 3, "deactivating"),
+    ("active\n", 3, "active"),
+    ("inactive\n", 0, "inactive"),
+    ("failed\n", 0, "failed"),
+    ("", 3, "unknown"),
+    ("\n", 0, "unknown"),
+    ("reloading\n", 0, "unknown"),
+    ("Failed to connect to bus\n", 1, "unknown"),
+])
+def test_is_active_stdout_decides_the_word_and_the_exit_code_is_unchanged(tmp_path, capsys, stdout,
+                                                                       rc_code, word):
+    root = full_root(tmp_path)
+    rc, out = run_status(root, capsys, run=make_run(active=stdout.rstrip("\n"), active_rc=rc_code))
+    assert fields(out)["unit"].split(" ")[1] == f"active={word}"
+    assert rc == 0
+
+
+@pytest.mark.parametrize("word,rc_code,expected", [
+    ("inactive", 3, "systemctl --user start afx.service"),
+    ("failed", 3, "systemctl --user start afx.service"),
+    ("", 1, "systemctl --user start afx.service"),
+    ("reloading", 0, "systemctl --user start afx.service"),
+    ("active", 0, "afx ctl status"),
+    ("activating", 3, "afx ctl status"),
+])
+def test_next_starts_the_unit_only_when_it_is_not_running(tmp_path, capsys, unit_dir, word, rc_code, expected):
+    root = full_root(tmp_path)
+    unit_dir.mkdir()
+    (unit_dir / "afx.service").write_text("[Unit]\n", encoding="utf-8")
+    out = run_status(root, capsys, run=make_run(active=word, active_rc=rc_code))[1]
+    assert fields(out)["next"] == expected
+
+
+def test_stderr_only_is_active_answer_is_unknown(tmp_path, capsys):
+    root = full_root(tmp_path)
+
+    def run(argv, **_kwargs):
+        if argv[0] == "loginctl":
+            return SimpleNamespace(returncode=0, stdout="Linger=yes\n")
+        return SimpleNamespace(returncode=1, stdout="", stderr="inactive\n")
+
+    assert fields(run_status(root, capsys, run=run)[1])["unit"].split(" ")[1] == "active=unknown"
+
+
+def test_a_symlinked_database_is_read_and_left_untouched(tmp_path, capsys):
+    root = full_root(tmp_path, db=False)
+    target_root = tmp_path / "elsewhere"
+    (target_root / "data").mkdir(parents=True)
+    real = make_db(target_root, approval=2)
+    (root / "data" / "agentic.db").symlink_to(real)
+    before = real.read_bytes()
+
+    rc, out = run_status(root, capsys)
+    values = fields(out)
+
+    assert rc == 0
+    assert values["database"] == "ok" and values["pending approvals"] == "2"
+    assert values["recent mission"].startswith("#")
+    assert real.read_bytes() == before
+    assert sorted(path.name for path in real.parent.iterdir()) == ["agentic.db"]
+
+
+def test_a_dangling_symlink_is_unavailable_and_a_plain_absence_is_missing(tmp_path, capsys):
+    root = full_root(tmp_path, db=False)
+    assert fields(run_status(root, capsys)[1])["database"] == "missing"
+    (root / "data" / "agentic.db").symlink_to(tmp_path / "gone.db")
+    rc, out = run_status(root, capsys)
+    assert rc == 1 and fields(out)["database"] == "unavailable"
+
+
+def test_a_failing_inventory_is_an_unavailable_pending_section(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    (root / "plugins").mkdir()
+    monkeypatch.setattr(status.plugin_loader, "approved_plugins", _boom)
+    rc, out = run_status(root, capsys)
+    values = fields(out)
+    assert rc == 1 and values["pending steps"] == "unavailable"
+    assert values["database"] == "ok" and values["recent activity"] != "unavailable"
+
+
+def test_the_database_is_opened_once_for_the_shared_connection(tmp_path, monkeypatch, capsys):
+    root = full_root(tmp_path)
+    opened = []
+    real = status.connect_observer_readonly
+    monkeypatch.setattr(status, "connect_observer_readonly", lambda path: opened.append(path) or real(path))
+    run_status(root, capsys)
+    assert len(opened) == 2  # one shared connection plus the deploy-ops counter's own opener
+
+
+def test_the_state_reader_and_the_state_store_validate_alike(tmp_path):
+    from agentic_fx.store.state import StateError, StateStore, parse_state
+
+    assert status.parse_state is parse_state
+    good = '{"initialized":true,"mode":"trading","autopilot":false,"kill_switch_latched":true}'
+    bad = ['[]', '{}', '{"initialized":true,"mode":"x","autopilot":false,"kill_switch_latched":false}',
+           '{"initialized":1,"mode":"learning","autopilot":false,"kill_switch_latched":false}']
+    for number, text in enumerate([good, *bad]):
+        root = tmp_path / f"r{number}"
+        write_state(root, text)
+        path = root / "data" / "state" / "app_state.json"
+        try:
+            StateStore(path).load()
+            store_ok = True
+        except StateError:
+            store_ok = False
+        assert (status.read_state(root)[0] != "unavailable") is store_ok
