@@ -673,6 +673,8 @@ AC-23 の観測には §5.5 の `signal_max_id` も含める。submit 時点の�
 | T7 CLI + versions | 5 コマンドの parser・確認 (TTY / `--yes` / `--force` / `--dry-run`)、rc と stderr の文言 pin、`versions`、仮列挙 → 再列挙のリトライ、`afx ctl status` / `afx ops status <feature>` への op 状態表示 (`open` と `attention`、読めないときは `unavailable`) | AC-24, 25, 30。CLI の rc / 文言を pin。rollback 完了表示 | M |
 | T8 文書 + 遮断 | 独立 spec の清書、既存 spec v1.10、運用文書 §7 置換 (§10 の 3b / 3c を含む)、遮断の完全集合 test (improve 13 本 / `_ALLOWED_REL` / API 24 endpoint / bot の 2 集合 / `BotClient` 直接定義 8 メソッド / `TABLE_NAMES` 32)、実隔離 worker integration (CI の `isolation` job が kernel の Landlock ABI を測り、ABI 8 以上なら skip があれば fail、ABI 8 未満なら「kernel 不足」を明示して neutral。release の受入は ABI 8 の実機で手順書どおり手で実行する。AC-27) | AC-26〜29, 36。spec と実装の番号 (IV / AC) の突き合わせ。integration は実 kernel を触る。Landlock ABI の skip 規約に従う | L |
 
+追補 (2026-10-25): 上の T8 の API endpoint 数は当時の 24 本である。現行は 29 本で、完全集合 test もその数に従う。
+
 
 
 ## 14. 決定と後続チケット
@@ -698,5 +700,6 @@ AC-23 の観測には §5.5 の `signal_max_id` も含める。submit 時点の�
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-25 | v1.2 | 現行の一覧は `afx plugin list`、停止中診断は `afx status`、稼働 daemon の状態は `afx ctl status` とする案内を追記 | CLI surface の運用導線を同期するため | |
 | 2026-10-18 | v1.1 | 実装済みの deploy 操作、状態遷移、status、隔離受入、運用手順 (手順の順序を含む) を正本化 | T1〜T7 の実装と crash matrix の実測で確定した事項の追記 | |
 | 2026-10-16 | v1.0 | disable / rollback / retire / revoke の正本仕様を確定 | チケット `deployed-plugin-has-no-disable-or-rollback` | |

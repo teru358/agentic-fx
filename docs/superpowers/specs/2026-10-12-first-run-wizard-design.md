@@ -10,6 +10,10 @@ v0.4 で引き直したのは、サービスの起動ガード (marker の検査
 
 v0.5 で引き直したのは、LLM 未検証の扱い (`afx check` の結果を fatal と warning に分け、warning だけなら unit を設置して degraded で起動する。Claude を選んだときはウィザードが消費確認のうえ trade 用の `claude -p` を 1 往復する、§3 段 4・§6.2)、リセットの所有判定の実装契約 (bash は orchestration だけ、所有の判定は `python3 -I` の標準ライブラリ、ops の config は canonical な 1 行の一致だけを owned とする、§4.5)、自動化 driver のリセットコマンドと linger の反復試験 (§8.4、AC-39)、リセットの製品契約と試験の clean 判定の分離 (AC-36)、実装 task ごとの「所有する受入条件」と共有ファイルの関数単位の責務、実装順序 (§9)、未決事項の仕分けと決定記録 (§10)。本文の規範は B / P / U / T の番号だけで挙動を決めず、意味のある名前を併記する。番号は履歴と参照の索引にすぎない。
 
+## 現行 CLI の追補
+
+ウィザードを起動する argv は `afx init`（repo の開発環境では `uv run afx init`）である。案内する backend の実往復確認は `afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]`、後からの改善課題追加は `afx ctl backlog add <idea>` とする。段 12 で確定した方針文は `ops_policies` に記録され、ID marker 付きの managed 方針として投影される。外から見る手段を有効にする案内は `afx ops <feature> enable` の機能→動詞形とする。
+
 ## 要点
 
 1. 初めての利用者が `afx init` を 1 回打てば、対話で「価格をどこから取るか・どの LLM で判断と改善をするか・何分足で判断するか・いつ改善を回すか」を決め、各項目をその場で接続試験し、結果を読める文面で見せる。従来の非対話 init は `--non-interactive` として残す (B-1 a、B-3 b)。
@@ -940,6 +944,7 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-25 | v1.9 | ウィザード起動 argv と案内文、段 12 の managed 方針、`afx ops <feature> enable` の現行形を追補 | CLI surface の現行運用名を設計資料へ同期するため | |
 | 2026-10-02 | v0.1 | 草稿。流れを「集める層 → 確定 1 → 確定 2」に組み直し、B-2 (行単位 + G1〜G3)、B-7 の 3 分岐と未接続時の現物の振る舞い、B-8 ((b): `expected=0` の期の消費印)、unit の差し替え点と lock 解放の順序、未完の手順の一覧、不変条件 15・受入条件 21、task 8 本、未決 8 件、現物の問題 13 件を記述 | 裁定記録 (2026-10-02) と inventory を設計に落とすため | |
 | 2026-10-12 | v0.2 | 常駐化を direct exec の user unit に差し替え (screen・対話シェル・start/stop スクリプトを廃止、B-5 は daemon に確定、`afx ctl` を操作の入口に)。段 13 に外から見る手段の一問を足し、bot / web / notify は既存の `afx ops enable <feature>` に任せる (順序: unit 設置 → lock 解放 → enable → 起動)。段 8 を操作 API と `.env` に差し替え (`api.enabled`)。段 4 の疎通確認を非隔離の `verify-backend` と起動時 admission の行に分けた。秘密は Discord token・webhook URL を `afx ops enable` の secret に、ウィザード本体は書かない。承認の導線を bot の二段操作と `afx ctl --as approver approve` に。§5 §6 §7 §8 §9 §10 を更新 (不変条件 IV-16〜18、受入条件 AC-22〜26、問題 P16〜P18・P-14〜P-16、U-4・U-5 解消)。裁定 4 件を反映 (段 8 の操作 API は既定有効で example の既定変更を T8 に、通知は ops の notify に一本化し旧簡易通知の廃止は別チケット、実機受入は別マシンまたは WSL、`afx ops enable` は同一 process の `interactive_enable` 呼び出し。P-14・P-16 解消) | 常駐化 (本番 unit の direct exec 移行) と afx-ops の対話層 (`afx ops enable`) の main 投入、改善 CLI 隔離の有効化 | |
 | 2026-10-12 | v0.3 | 設計レビューの指摘を全て反映。(1) 確定 1 を「全部か無か」から回復可能な commit protocol に (durable marker `setup_in_progress`・終了コード 76・fsync つきの置換・DB は 1 transaction・crash matrix、§4.3)。(2) 排他を `setup.lock → instance.lock` に統一し、`afx init` は setup.lock を保持、引き渡し (marker → instance.lock 解放 → enable → marker 除去) と競合試験 (§4.2)。T9 側の変更を task に (lease 引数・`EnableResult`)。(3) `backtest.eval_source: none` を追加、MT5 を使わない分岐は必ず `none` (U-3・P-7 解消)。(4) 起動後確認を 3 段階に (サービス / 認証つき `afx ctl status` / ops ready)、API 無効時は `afx ctl` に出せない旨を明記。(5) settings に `schema_version` と版ごとの migration (§4.4)。(6) ウィザードの IO と ops の IO を別型に、秘密の口は T9 のみ。(7) status 応答の `setup.pending_steps` / `record_state` の固定 schema と前方互換 (§7.3)、ops-api spec の改訂を task に。(8) admission 行を InvocationID / cursor で今回の起動分に絞り、journal 不可・timeout・形式不正を別 reason に。(9) 実機受入の表 (§8.4) と fake TTY の範囲 (isatty / EOF / KeyboardInterrupt)。(10) 範囲外に基本ニュースソース seed のみ・strategy の自動採用なし・Pine Script 対象外を明記。(11) AC-1 を分岐 1 / 2 / 3 の別シナリオに。ユーザー裁定 (2026-10-12) 2 件: 実機受入は別マシンで repo の案内だけで clean clone から立ち上げる (手順書 `docs/operations/first-run-acceptance.md` を成果物に)、やり直し用に `afx init --reset` を追加 (§4.5。§5 に「リセットで消すもの」列、AC-36〜40、T14・T15)。不変条件 IV-19〜26、受入条件 AC-1a〜c・AC-27〜40、task T10〜T15、未決 U-9〜U-12 を追加 | 設計レビューの差し戻し と実機受入の方針裁定 | |

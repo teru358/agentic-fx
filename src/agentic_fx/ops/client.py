@@ -33,6 +33,7 @@ import httpx
 
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
+from agentic_fx.cli_surface import render_ctl_help
 from agentic_fx.setup.pending_text import (STEP_PARAMS, PendingStep, is_ident,
                                            parse_observed_at, render_pending_step)
 
@@ -60,28 +61,8 @@ _TEXT_LIMIT = 2000
 _JOB_ID = re.compile(r"[0-9a-f]{32}")
 _INCIDENT = re.compile(r"[0-9a-f]{1,32}")
 
-USAGE = """usage: afx ctl [--as operator|approver] <操作>
-       afx ctl [--as operator|approver]        (端末なら対話モード afx ctl>)
-
-操作:
-  status / whoami
-  log [n] / activity [n] [カテゴリ]
-  events [--after <id>] [--limit <n>] [--follow]
-  approval list [n] / approvals list [n]
-  approval <id> / approvals show <id>
-  ask <質問>
-  improve / improve add <idea>
-  backlog reject|reopen|note <id>
-  policy add <text>
-  reflect retry <order_id>
-  jobs get <id>
-  -- 端末からの確認が要る操作 --
-  approve <id> / reject <id> [理由] / approval retry <id>   (--as approver)
-  killswitch reset <世代> / killswitch reconcile             (--as approver)
-  data resume [--acknowledge]                               (--as approver)
-  jobs cancel <id>
-  help
-サービスの停止は API では行いません (systemctl --user stop で SIGTERM)。"""
+def _usage() -> str:
+    return render_ctl_help()
 
 STOP_GUIDANCE = ("afx ctl は stop を送りません。サービスを止めるには "
                  "`systemctl --user stop <unit>` (SIGTERM) を使ってください")
@@ -843,7 +824,7 @@ def _multiline(text) -> str:
 
 def _int_arg(text: str) -> int:
     if not (text.isascii() and text.isdigit()) or len(text) > 18:
-        raise ClientError(RC_USAGE, USAGE)
+        raise ClientError(RC_USAGE, _usage())
     return int(text)
 
 
@@ -851,7 +832,7 @@ def _count_arg(text: str, upper: int) -> int:
     """件数の引数。範囲外は丸めず usage にする (server へ届く値と画面の指定を一致させる)。"""
     value = _int_arg(text)
     if not 1 <= value <= upper:
-        raise ClientError(RC_USAGE, USAGE)
+        raise ClientError(RC_USAGE, _usage())
     return value
 
 
@@ -908,7 +889,7 @@ class Op:
 def parse(tokens: list[str]) -> Op:
     """対話シェルと同じ語順の操作を読む。読めなければ usage (rc=2)。"""
     if not tokens:
-        raise ClientError(RC_USAGE, USAGE)
+        raise ClientError(RC_USAGE, _usage())
     cmd, args = tokens[0], tokens[1:]
     n = len(args)
     if cmd == "help" and n == 0:
@@ -922,7 +903,7 @@ def parse(tokens: list[str]) -> Op:
     if cmd == "activity" and n <= 2:
         category = args[1].upper() if n == 2 else None
         if category is not None and category not in ACTIVITY_CATEGORIES:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
         return Op("activity", [_count_arg(args[0], 500) if args else 20, category])
     if cmd == "events":
         return Op("events", _parse_events(args))
@@ -961,7 +942,7 @@ def parse(tokens: list[str]) -> Op:
         return Op("policy_reconcile", [])
     if cmd == "policy" and n == 2 and args[0] == "remove":
         if re.fullmatch(r"[1-9][0-9]*", args[1]) is None:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
         return Op("policy_remove", [int(args[1])])
     if cmd == "reflect" and n == 2 and args[0] == "retry":
         return Op("reflection_retry", [_int_arg(args[1])])
@@ -976,9 +957,9 @@ def parse(tokens: list[str]) -> Op:
         return Op("data_resume", [n == 2])
     if cmd == "jobs" and n == 2 and args[0] in ("get", "cancel"):
         if _JOB_ID.fullmatch(args[1]) is None:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
         return Op("job_get" if args[0] == "get" else "job_cancel", [args[1]])
-    raise ClientError(RC_USAGE, USAGE)
+    raise ClientError(RC_USAGE, _usage())
 
 
 def _parse_events(args: list[str]) -> list:
@@ -995,9 +976,9 @@ def _parse_events(args: list[str]) -> list:
             else:
                 limit = value
         else:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
     if not 1 <= limit <= 500:
-        raise ClientError(RC_USAGE, USAGE)
+        raise ClientError(RC_USAGE, _usage())
     return [after, limit, follow]
 
 
@@ -1012,9 +993,9 @@ def _parse_backlog_list(args: list[str]) -> list:
             seen_limit = True
             limit = _int_arg(rest.pop(0))
         else:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
     if not 1 <= limit <= 500:
-        raise ClientError(RC_USAGE, USAGE)
+        raise ClientError(RC_USAGE, _usage())
     return [all_statuses, limit]
 
 
@@ -1046,7 +1027,7 @@ class Runner:
                 canonical = alias.canonical_usage.split(" <", 1)[0]
                 self.warn(f"`{old}` は旧名です。`{canonical}` を使ってください。")
         if op.name == "help":
-            self.say(USAGE)
+            self.say(_usage())
             return RC_OK
         if op.name == "stop":
             raise ClientError(RC_USAGE, STOP_GUIDANCE)
@@ -1519,14 +1500,14 @@ def _split_principal(argv: list[str]) -> tuple[Principal, list[str]]:
         elif flag.startswith("--as="):
             value = flag[len("--as="):]
         else:
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
         try:
             principal = Principal(value)
         except ValueError:
-            raise ClientError(RC_USAGE, USAGE) from None
+            raise ClientError(RC_USAGE, _usage()) from None
         # 常駐 service 用の principal は人間の CLI から名乗らせない。
         if principal not in (Principal.OPERATOR, Principal.APPROVER):
-            raise ClientError(RC_USAGE, USAGE)
+            raise ClientError(RC_USAGE, _usage())
     return principal, rest
 
 
@@ -1547,7 +1528,7 @@ def main(argv: list[str], *, root: Path, stdin: TextIO | None = None,
         principal, tokens = _split_principal(argv)
         if not tokens:
             if not (_is_terminal(stdin) and _is_terminal(stdout)):
-                raise ClientError(RC_USAGE, USAGE)
+                raise ClientError(RC_USAGE, _usage())
             return _interactive(root, principal, uid=uid, stdin=stdin, stdout=stdout,
                                 stderr=stderr, sleep=sleep)
         op = parse(tokens)

@@ -14,6 +14,7 @@ from agentic_fx.core.contracts import Clock
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.paper_broker import PaperBroker
+from agentic_fx.cli_surface import render_shell_help
 from agentic_fx.datafeed.outage import format_unprocessed_positions
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
@@ -30,27 +31,6 @@ from agentic_fx.policy_projection import (
 
 POLICY_WRITE_ERRORS = (sqlite3.Error, OSError, ValueError, ProjectionReconcileBlocked,
                        MigrationRecordUnknown)
-
-_HELP = """コマンド一覧:
-  status                     残高・モード・kill switch・直近 mission
-  log [n]                    技術ログの直近 n 行 (default 20)
-  activity [n] [カテゴリ]     activity ログ (NEWS/TECH/AGGREGATE/TRADE/IMPROVE/APPROVAL/SYSTEM)
-  ask <質問>                  臨時 Mission (回答専用 — 発注はしない)
-  data resume [--acknowledge]  価格源 degraded / restricted からの手動復帰要求 (次 tick で判定)
-  approve <id> / reject <id> [理由]   承認操作
-  approval <id>               承認申請の詳細 (in_sample/holdout 成績を含む)
-  approval list [n]          承認待ちの一覧 (+ 未終端の切替ジャーナル)
-  approval retry <id>        承認手順を頭から再試行 (§5.3 契機③)
-  killswitch reset [<世代>]  kill switch ラッチの解除 (人間の明示操作)
-  killswitch reconcile [confirm]  解除が途中で止まったときの確認 / ラッチ中として確定
-  reflect retry <order_id>   abandon された reflection を再試行対象へ戻す
-  improve                    手動 improve one-shot (全バックログ担当)
-  improve add <idea text>    バックログへ課題を追加
-  backlog reject <id> / reopen <id> / note <id>   バックログの手動操作
-  policy add <text>          policy/directives.md へ追記
-  stop                       graceful shutdown (シェルのみ)
-(Phase 2 で追加: news / model / mode / autopilot)"""
-
 
 class PolicyFileNotReflected(RuntimeError):
     """A committed policy record could not be reflected to its file."""
@@ -76,6 +56,9 @@ def add_policy_directive(conn, policy_path: Path, activity: ActivityLog, text: s
         raise PolicyFileNotReflected() from error
     activity.write(Category.SYSTEM, "policy_added", text[:200])
     return identifier
+
+
+_LEGACY_IMPROVE_ADD_NOTICE = "improve add は旧名です。backlog add を使ってください。"
 
 
 def add_backlog_idea(conn: sqlite3.Connection, activity: ActivityLog, text: str, now: datetime,
@@ -247,6 +230,10 @@ class Commands:
                 # の id を知るための一覧。**holdout / in_sample の数値は出さない**
                 # (詳細は `approval <id>`)。
                 return self._approval_list(args[1] if len(args) == 2 else None)
+            if cmd == "approval" and args[:1] == ["show"]:
+                args = args[1:]
+                if len(args) != 1 or not args[0].isdigit():
+                    return "usage: approval show <id>"
             if cmd == "approval" and len(args) == 1 and args[0].isdigit():
                 # [approval-payload-missing-gate-metrics] 是正 (A4 10 回目
                 # claude #69 観測 A、2026-09-11): approve/reject する前に
@@ -344,10 +331,11 @@ class Commands:
                     return f"improve job {reply['job_id']} を受理しました"
                 mission_id = self.improve_supervisor.submit_manual()
                 return f"improve mission #{mission_id} を起動しました"
-            if cmd == "improve" and args and args[0] == "add":
+            if cmd in ("backlog", "improve") and args[:1] == ["add"]:
+                notice = _LEGACY_IMPROVE_ADD_NOTICE + "\n" if cmd == "improve" else ""
                 text = " ".join(args[1:])
                 if not text:
-                    return "usage: improve add <idea text>"
+                    return notice + "usage: backlog add <idea text>"
                 if self.ops_service is not None:
                     bid = self.ops_service.add_backlog(
                         ShellCaller.SHELL, uuid.uuid4().hex, text)["id"]
@@ -356,11 +344,11 @@ class Commands:
                 else:
                     bid = add_backlog_idea(self.conn, self.activity, text, self.clock.now())
                 display, removed = normalize_idea_display(text)
-                reply = f"backlog #{bid} を追加しました: 「{display}」"
+                reply = notice + f"backlog #{bid} を追加しました: 「{display}」"
                 if idea_looks_unintended(display):
                     reply += ("\n⚠ 短い/プレースホルダのように見えます。意図した内容で"
                              "あることを確認してください (削除・訂正は "
-                             f"`backlog reject {bid}` の上で `improve add` を"
+                             f"`backlog reject {bid}` の上で `backlog add` を"
                              "やり直す)")
                 if removed:
                     reply += f"\n表示できない文字を {removed} 個含みます"
@@ -463,10 +451,10 @@ class Commands:
         except AlreadyDecidedError:
             return "その approval は決定済みです"
         except (ValueError, KeyError) as e:
-            return f"エラー: {safe_error_text(e)}\n{_HELP}"
+            return f"エラー: {safe_error_text(e)}\n{render_shell_help()}"
         except Exception as e:
             return f"エラー: {safe_error_text(e)}"
-        return _HELP
+        return render_shell_help()
 
     def _ops_decide(self, kind: str, approval_id: int, reason: str | None,
                     shown_id: str) -> str:

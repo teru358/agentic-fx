@@ -8,6 +8,8 @@
 
 ## 0. 本書の役割 — 何を設計し、何を設計しないか
 
+> 現行運用名の追補: backend の実往復確認は `afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]` で行う。本書の履歴本文に現れる旧い呼称は当時の記録として変更しない。
+
 プラン 10 は **改善ループを初めて動かす**プランである。プラン 6〜9 が積んだ部品 (バックテスト・holdout・plugin 機構・worker 隔離・improve profile の空殻・`improvement_backlog` / `improvement_runs` / `backtest_runs` / `analysis_runs`) を、**書き手 (LLM) と親側の受け取り**で結線する。加えて **AgentRunner を 3 実装 (local / claude / codex) にする**。
 
 | 由来 | 設計状態 |

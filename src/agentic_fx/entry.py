@@ -8,7 +8,9 @@ from pathlib import Path
 
 from agentic_fx import service
 from agentic_fx.backtest import cli as backtest_cli
-from agentic_fx.cli_surface import COMPATIBILITY_RECORDS, version_tuple
+from agentic_fx.cli_surface import (COMMANDS, COMPATIBILITY_RECORDS, HelpFormatter, leaf_help,
+                                    parser_description, parser_help, render_epilog,
+                                    render_top_epilog, top_description, version_tuple)
 from agentic_fx.ops.contracts import Principal
 
 _BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
@@ -19,6 +21,11 @@ class _OpsOptionError(Exception):
 
 
 class _OpsOptionParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs) -> None:
+        if sys.version_info >= (3, 14):
+            kwargs.setdefault("color", False)
+        super().__init__(*args, **kwargs)
+
     def error(self, message: str):  # type: ignore[override]
         raise _OpsOptionError(self.format_usage() + f"{self.prog}: error: {message}\n")
 
@@ -53,6 +60,14 @@ def _web_options(args: argparse.Namespace):
         duplicated=args.ask > 1 or args.non_interactive > 1 or any(len(v) > 1 for v in lists.values()))
 
 
+def _reconfigurable_features() -> frozenset[str]:
+    """`afx ops <feature> reconfigure` を持つ feature。parser と旧綴りの変換が同じ表を見る。"""
+    return frozenset(
+        record.command.split()[1] for record in COMMANDS
+        if record.command.startswith("ops ") and record.command.endswith(" reconfigure")
+        and record.implemented)
+
+
 def _compatibility_active(record) -> bool:
     """期限前なら真。version を引けない環境 (未 install) は期限判定不能として有効のまま。"""
     try:
@@ -83,7 +98,9 @@ def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
         normalized = args_list[:head + 1] + [feature, verb] + args_list[head + 3:]
         print(message, file=sys.stderr)
         return normalized, None
-    if args_list[head + 1:head + 2] == ["web"] and args_list[head + 2:head + 3] == ["reconf"]:
+    reconfigurable = _reconfigurable_features()
+    feature = args_list[head + 1] if len(args_list) > head + 1 else None
+    if feature in reconfigurable and args_list[head + 2:head + 3] == ["reconf"]:
         normalized = list(args_list)
         normalized[head + 2] = "reconfigure"
         return normalized, None
@@ -105,55 +122,80 @@ def main(argv: list[str] | None = None) -> int:
         from agentic_fx.ops.client import main as ctl_main
         return ctl_main(args_list[head + 1:], root=Path.cwd())
     # 略記 (--dae など) を許すと、上の完全一致の前置きをすり抜けて ctl が argparse に届く。
-    parser = _OpsOptionParser(prog="afx", description="agentic-fx", allow_abbrev=False)
+    parser = _OpsOptionParser(prog="afx", description=top_description(), epilog=render_top_epilog(),
+                              formatter_class=HelpFormatter, allow_abbrev=False)
     parser.add_argument("--daemon", action="store_true",
                         help="systemd 用 (コマンド受付なし)")
     sub = parser.add_subparsers(dest="command")
-    init_parser = sub.add_parser("init", help="初期設定 (対話。`--non-interactive` で従来の非対話)")
+    init_parser = sub.add_parser("init", help=parser_help("init"),
+                                 description=parser_description("init"), epilog=render_epilog("init"),
+                                 formatter_class=HelpFormatter)
     init_parser.add_argument("--non-interactive", action="store_true",
                              help="従来の非対話初期化を実行する")
     init_parser.add_argument("--config", type=Path, metavar="FILE",
                              help="settings.yaml として配置する検証済み設定ファイル")
-    check_parser = sub.add_parser("check", help="設定と実行環境の起動前検査 (読み取りのみ。fatal があると非 0)")
+    check_parser = sub.add_parser("check", help=parser_help("check"),
+                                  description=parser_description("check"), epilog=render_epilog("check"),
+                                  formatter_class=HelpFormatter)
     check_parser.add_argument("--json", action="store_true", dest="as_json",
                               help="結果を JSON ({\"fatal\": [...], \"warning\": [...]}) で出す")
     check_parser.add_argument("--unit-env", action="store_true", dest="unit_env",
                               help="unit の最小環境で呼ばれたときの検査 (秘密らしい env を fatal に数える)")
     check_sub = check_parser.add_subparsers(dest="check_action")
-    backend_parser = check_sub.add_parser("backend", help="backend への接続を検査する")
+    backend_parser = check_sub.add_parser("backend", help=leaf_help("check backend"),
+                                          description=parser_description("check backend"),
+                                          epilog=render_epilog("check backend"), formatter_class=HelpFormatter)
     backend_parser.add_argument("--backend", choices=("local", "claude", "codex", "opencode"),
                                 required=True)
     backend_parser.add_argument("--provider", choices=("chatgpt",), default=None)
-    keys_parser = sub.add_parser("keys", help="操作 API の鍵管理 (サービス停止中だけ)")
+    keys_parser = sub.add_parser("keys", help=parser_help("keys"),
+                                 description=parser_description("keys"), epilog=render_epilog("keys"),
+                                 formatter_class=HelpFormatter)
     keys_sub = keys_parser.add_subparsers(dest="keys_action", required=True)
-    keys_sub.add_parser("init", help="初回の鍵を作る (作成済みなら何もしない)")
-    for action, text in (("enroll", "未登録の principal の鍵を作って登録する"),
-                         ("rotate", "principal の鍵を rotate する"),
-                         ("revoke", "principal の鍵を revoke する")):
-        p = keys_sub.add_parser(action, help=text)
+    keys_sub.add_parser("init", help=leaf_help("keys init"),
+                        description=parser_description("keys init"), epilog=render_epilog("keys init"),
+                        formatter_class=HelpFormatter)
+    for action in ("enroll", "rotate", "revoke"):
+        command = f"keys {action}"
+        p = keys_sub.add_parser(action, help=leaf_help(command),
+                                description=parser_description(command), epilog=render_epilog(command),
+                                formatter_class=HelpFormatter)
         p.add_argument("principal", choices=tuple(member.value for member in Principal))
-    ops_parser = sub.add_parser("ops", help="外部 operations 機能の有効化・無効化・状態表示")
+    ops_parser = sub.add_parser("ops", help=parser_help("ops"),
+                                description=parser_description("ops"), epilog=render_epilog("ops"),
+                                formatter_class=HelpFormatter)
     ops_sub = ops_parser.add_subparsers(dest="feature", required=True)
+    reconfigurable = _reconfigurable_features()
     for feature in ("bot", "web", "notify"):
-        feature_parser = ops_sub.add_parser(feature, help=f"{feature} の操作")
+        feature_command = f"ops {feature}"
+        feature_parser = ops_sub.add_parser(feature, help=parser_help(feature_command),
+                                             description=parser_description(feature_command),
+                                             epilog=render_epilog(feature_command), formatter_class=HelpFormatter)
         feature_sub = feature_parser.add_subparsers(
             dest="ops_action", required=True,
             **({"parser_class": _OpsOptionParser} if feature == "web" else {}))
-        for action, text in (("enable", "機能を停止中に有効化する"),
-                             ("disable", "機能を停止せずに無効化する"),
-                             ("status", "機能の durable stage を表示する")):
-            action_parser = feature_sub.add_parser(action, help=text, **_web_parser_kw(feature))
+        actions = (("enable", "disable", "reconfigure", "status")
+                   if feature in reconfigurable else ("enable", "disable", "status"))
+        for action in actions:
+            command = f"ops {feature} {action}"
+            if action == "reconfigure":
+                action_parser = feature_sub.add_parser(
+                    action, help=leaf_help(command), description=parser_description(command),
+                    epilog=render_epilog(command), formatter_class=HelpFormatter, allow_abbrev=False)
+                if feature == "web":
+                    _add_web_setup_options(action_parser)
+                continue
+            action_parser = feature_sub.add_parser(
+                action, help=leaf_help(command), description=parser_description(command),
+                epilog=render_epilog(command), formatter_class=HelpFormatter, **_web_parser_kw(feature))
             if feature == "web" and action == "enable":
                 _add_web_setup_options(action_parser)
-        if feature == "web":
-            reconfigure_parser = feature_sub.add_parser(
-                "reconfigure", help="有効化済みの web の設定を変更する (ops-web だけを短時間止める)",
-                allow_abbrev=False)
-            _add_web_setup_options(reconfigure_parser)
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
-    sub.add_parser("ctl", add_help=False,
-                   help="稼働中の daemon を操作 API で操作する (afx ctl help)")
-    sub.add_parser("status", help="オフライン状態を書き込まずに表示する")
+    sub.add_parser("ctl", add_help=False, help=parser_help("ctl"),
+                   description=parser_description("ctl"), epilog=render_epilog("ctl"),
+                   formatter_class=HelpFormatter)
+    sub.add_parser("status", help=parser_help("status"), description=parser_description("status"),
+                   epilog=render_epilog("status"), formatter_class=HelpFormatter)
     backtest_cli.register_subparsers(sub)
     try:
         args = parser.parse_args(args_list)
