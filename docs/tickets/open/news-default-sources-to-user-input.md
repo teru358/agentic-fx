@@ -1,7 +1,7 @@
 ---
 id: news-default-sources-to-user-input
 title: 同梱の既定ニュース源を廃止し afx init の入力式にする
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-25
 closed: null
@@ -9,7 +9,7 @@ related: [news-source-cli-and-429-backoff]
 ---
 # [news-default-sources-to-user-input] 同梱の既定ニュース源を廃止し afx init の入力式にする
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -24,3 +24,4 @@ src/agentic_fx/datafeed/default_sources.py の DEFAULT_SOURCES 3 本 (yahoo-fina
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 状態: 実装中 — 2026-10-25: T1 / T2a / T2b を main に merge (81461a61)。残り AC-1 の本機確認 (daemon 再起動後に yahoo を disable、次の収集周期で backoff と status を観測)

@@ -1,7 +1,7 @@
 ---
 id: news-source-cli-and-429-backoff
 title: afx news (list/add/enable/disable/test) と 429 連続時のバックオフ
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-15
 closed: null
@@ -9,7 +9,7 @@ related: [news-source-route-omitted]
 ---
 # [news-source-cli-and-429-backoff] afx news (list/add/enable/disable/test) と 429 連続時のバックオフ
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [news-source-route-omitted]
 
 - 2026-10-15: 起票。
 - 2026-10-16: 優先: 中 — 吸収: news-fetch-no-user-agent-yahoo-429 の「ニュース取得が User-Agent を付けない (python-httpx 既定)」も直す。収集器の取得に固定の UA (製品名/版 + repo URL) を付ける。yahoo は 2026-10-15 の実測で UA 付きでも 404 (源が止まった) なので UA だけでは直らない
+- 2026-10-25: 状態: 実装中 — 2026-10-25: T1 / T2a / T2b を main に merge (81461a61)。残り AC-1 の本機確認 (daemon 再起動後に yahoo を disable、次の収集周期で backoff と status を観測)

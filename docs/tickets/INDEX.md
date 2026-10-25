@@ -3,13 +3,15 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 142 件。完了分は closed/。
 
-## 実装中 (1)
+## 実装中 (3)
 
-### 機能 (1)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
+| [news-default-sources-to-user-input](open/news-default-sources-to-user-input.md) | 中 | 2026-10-25 | 同梱の既定ニュース源を廃止し afx init の入力式にする |
 
 ## 実装待ち (11)
 
@@ -62,7 +64,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (124)
+## 設計待ち (122)
 
 ### 不具合 (70)
 
@@ -139,7 +141,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (34)
+### 機能 (32)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -151,10 +153,8 @@
 | [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
 | [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
 | [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
-| [news-source-cli-and-429-backoff](open/news-source-cli-and-429-backoff.md) | 中 | 2026-10-15 | afx news (list/add/enable/disable/test) と 429 連続時のバックオフ |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [improve-start-and-result-to-discord](open/improve-start-and-result-to-discord.md) | 中 | 2026-10-25 | improve の開始と結果を Discord に通知する |
-| [news-default-sources-to-user-input](open/news-default-sources-to-user-input.md) | 中 | 2026-10-25 | 同梱の既定ニュース源を廃止し afx init の入力式にする |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
