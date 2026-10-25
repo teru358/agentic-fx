@@ -18,7 +18,6 @@ from agentic_fx.core.contracts import (
     Action, ConversionRate, Direction, EntryType, FixedClock, Horizon,
     InstrumentSpec, Origin, Quote, TradeIntent,
 )
-from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
@@ -348,8 +347,8 @@ def test_settings_without_service_section_loads_with_default_empty_allowlist(tmp
     assert settings.service.secret_env_allowlist == []
 
 
-def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
-    """afx init 未実行の DB でも起動時 seed され、再起動で重複しない。"""
+def test_build_app_registers_no_news_sources_and_leaves_existing_ones_alone(tmp_path):
+    """起動は news_sources に何も足さず、news_source_* の activity も書かない。"""
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "settings.yaml").write_text(
@@ -359,21 +358,23 @@ def test_build_app_seeds_default_news_sources_idempotently(tmp_path):
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                     embedding_fn=FakeEmbedding())
     try:
-        assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
-        assert sum("\tNEWS\tsources_seeded\t" in line
-                   for line in app.activity.tail(20)) == 1
-        assert any("\tNEWS\tsources_seeded\t" in line and
-                   f"\t{len(DEFAULT_SOURCES)} default sources\t" in line
-                   for line in app.activity.tail(20))
+        assert news_sources.list_all(app.conn_core) == []
+        assert not any("\tNEWS\tnews_source" in line or "sources_seeded" in line
+                       for line in app.activity.tail(50))
+        news_sources.add(app.conn_core, name="kept-on", fetcher="feed",
+                         url="https://example.invalid/on", added_by="user", now=NOW, enabled=True)
+        news_sources.add(app.conn_core, name="kept-off", fetcher="feed",
+                         url="https://example.invalid/off", added_by="user", now=NOW, enabled=False)
+        before = news_sources.list_all(app.conn_core)
     finally:
         app.close()
 
     app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
                     embedding_fn=FakeEmbedding())
     try:
-        assert len(news_sources.list_all(app.conn_core)) == len(DEFAULT_SOURCES)
-        assert sum("\tNEWS\tsources_seeded\t" in line
-                   for line in app.activity.tail(20)) == 1
+        assert news_sources.list_all(app.conn_core) == before
+        assert [row["enabled"] for row in before] == [1, 0]
+        assert not any("sources_seeded" in line for line in app.activity.tail(50))
     finally:
         app.close()
 

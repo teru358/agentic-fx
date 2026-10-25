@@ -41,7 +41,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 
 - `afx init` (= `uv run afx init`) の対話化。段ごとの接続試験と読める文面。
 - `config/settings.yaml` の生成と、再実行時の部分書き換え。
-- DB 初期化・基本ニュースソース・状態ファイル (従来の init がやっていたこと)。
+- DB 初期化・状態ファイル (従来の init がやっていたこと)。ニュースソースは同梱せず、段 3 の副段で利用者が名前と URL を入れる (2026-10-25 裁定)。
 - 確認記録 (どの項目を、いつ、どう確認したか) の保存と、`status`・起動画面での「未完の手順」表示。
 - 改善周期と「最初の 1 本をいつ走らせるか」。
 - 標準指標 9 本の採用 (一覧を見せ、明示確認を取ってから既存の bless 経路で 1 本ずつ)。
@@ -63,7 +63,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 設定とデータの整合を検出する一般的な仕組み (inventory C-6)。本設計は「注意が要る項目を再実行で変えるときの確認文」だけを持つ。
 - 戦略 plugin の同梱 (方針: 生成コードはリポジトリに入れない)。
 - `mode trading` への遷移 (未実装、ペーパー専用のまま)。
-- ニュースソースの追加・品質評価・自動採用 (ウィザードは基本ニュースソースの seed だけを行う。ニュースソース追加は人の運用操作で、改善ループの経路ではない)。
+- ニュースソースの品質評価・自動採用・同梱 (ウィザードは利用者が入れた源を登録するだけで、既定の源は持たない。ニュースソースの追加は人の運用操作 `afx news` で、改善ループの経路ではない)。
 - strategy の生成物の自動採用 (改善ループの出力は既存の plugin gate と人間承認を迂回しない。ウィザードが採用するのは標準指標だけで、既存の bless 経路を明示確認つきで通す)。
 - Pine Script の入力・変換・配備。
 - 内蔵の `afx init --reset` (低チケット `afx-init-reset-builtin`。リセットは独立スクリプトを主にする。§4.5、§10.3)。
@@ -203,6 +203,12 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 記録: `price: ok | failed` + 時刻。
 - **履歴について**: 段 6 で「戦略の採用審査はできません」を表示し、`backtest.eval_source: none` を書く。
 
+**副段: ニュース源** (2026-10-25 裁定、`2026-10-25-news-source-cli-design.md` §2.7)
+- 価格源の分岐 (1・2・3 のいずれ、確認を断った場合・失敗した場合を含む) によらず、段 3 を抜けるときに必ず 1 度だけ通る。段 3 の出口は 1 つにそろえる (本体の後に副段を呼ぶ薄い入口)。新しい番号の段は足さない。
+- 問い: 「ニュース源 (名前 URL、空 Enter で飛ばす)」。空行になるまで繰り返す。1 件ごとに `afx news add` と同じ文法・重複の検査をし、取得方式 `feed` で 1 回取得して「取得: <n> 件 (うち本文・要約あり <m> 件)」を出す。失敗は固定語で理由を出して登録せず問いに戻る。0 件は確認 (既定は追加しない)。URL は画面・要約・確認記録・ログに出さない。
+- 入力した件は回答として保持し、段を戻って再実行したときは名前だけを見せて追加の入力だけを受ける (取り直し・二重登録なし)。空 Enter で終えたら「後から `afx news add` で足せます。候補例は README を参照。」を出す。
+- 登録は段 10 の確定 1 の DB transaction の中 (上の 4.)。既存 DB の登録済みの源 (無効にしたものを含む) には、再実行でも起動でも触らない。
+
 ### 段 4: LLM (取引判断と改善)
 
 - **表示の要旨**: 「取引判断 (1 足ごと) と戦略改善 (週次など) にそれぞれ LLM を割り当てます。取引判断は local か claude、改善は local / opencode / claude / codex。claude と codex はサブスク (従量課金 API ではない) を使います。」
@@ -293,7 +299,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 1. **marker を置く**: `data/state/setup_in_progress` (`phase=commit\nstarted_at=<UTC ISO>\nsettings_sha256=<新しい settings.yaml 全文の sha256 hex>\n`。handoff は `phase=handoff\nstarted_at=<UTC ISO>\n`。読む側は `store/setup_marker.py::read_setup_marker`) を、一時ファイルに書く → fsync → rename → 親 dir の fsync で置く。以後、サービスは起動時にこの marker を見て、専用の終了コード 76 (`setup_in_progress`。`afx ops enable` の enroll 中の 75 とは別) で即終了する (§4.3)。
 2. `config/settings.yaml`: 初回は example を写したものに回答を当てた全文、再実行は既存ファイルに回答を当てた全文 (版が古ければ migration も同じ全文に含める。§4.4) を、一時ファイルに書く → fsync → `os.replace` → 親 dir の fsync。再実行では置き換え前の内容を `config/settings.yaml.bak-<UTC時刻>` に残す。ただし marker の sha256 と既存ファイルが一致する (= 前回の続き) ときは bak を作り直さず、最初の bak を保つ。
 3. `logs/` と技術ログの設定。
-4. DB: `connect` + `init_db` (旧スキーマの移行を含む。lock 保持下なのでサービスと同時に走らない)。続けて**1 つの transaction (`BEGIN IMMEDIATE`) で**、基本ニュースソースの登録 (`seed_default_sources`、冪等) と期の消費印 (段 7 で「待つ」を選んだとき、`INSERT OR IGNORE`) を行う。失敗したら transaction は rollback され、次に進まない。`init_db` の移行が `agentic.db.bak-*` を作ってから rebuild する現行の挙動は変えない。
+4. DB: `connect` + `init_db` (旧スキーマの移行を含む。lock 保持下なのでサービスと同時に走らない)。続けて**1 つの transaction (`BEGIN IMMEDIATE`) で**、段 3 の副段で入力された源だけの登録 (`news_sources.add(commit=False)`。取得は確定の前に済んでおり、transaction の中は INSERT のみ。transaction の中で名前・URL の重複を再検査し、取得の後に他の process が足していた源は INSERT せず、確定の後に `既に登録されていたので飛ばしました: <名前>` を出す。入力が無ければ 0 行のまま) と期の消費印 (段 7 で「待つ」を選んだとき、`INSERT OR IGNORE`) を行う。失敗したら transaction は rollback され、次に進まない。`init_db` の移行が `agentic.db.bak-*` を作ってから rebuild する現行の挙動は変えない。
 5. 確認記録 `data/state/setup.json` (§7) を原子的置換 (一時ファイル → fsync → rename → 親 dir の fsync) で書く。書けなければ失敗として扱い (警告で流さない)、marker を残す。
 6. 状態 `data/state/app_state.json`: `initialized=true`。初回 (`initialized` が偽だった) のときだけ `mode=learning, autopilot=off`。kill switch の latch には触れない。再実行では `initialized` 以外に触れない (現行 `run_init` は毎回 mode/autopilot を戻す `service.py:470-471` — この挙動は `--non-interactive` だけに残す)。
 7. activity `init_completed` (現行どおり。失敗は警告)。
@@ -369,7 +375,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 - 「注意が要る項目」を変えるときは段 9 の確認 (帰結の文 + `yes` の打ち込み)。
 - 個別変更コマンド (`afx config set` 等) は作らない (B-11 の裁定)。手で編集した人向けに、設定だけを検査する `afx check` (§6、task T7a) を足す。これは unit 有効化前の検査と兼用。
 - 設定を変えずに「最初からやり直す」ための独立スクリプト `scripts/first-run-reset.sh` は別枠 (§4.5)。再実行 (答えた行だけ変える) とは別物で、当 instance の設置した unit・鍵・設定・データを取り除く。`afx` のコマンドには入れない。
-- `--non-interactive`: 従来の init と同じ (無ければ example を写す・検証・DB・ニュースソース・価格源と llama-swap の確認は警告のみ・`initialized=true` と mode/autopilot の初期化)。加えて確認記録を `mode: non-interactive` で書き、外部確認の結果は警告と同じ内容で `unverified | failed | ok` を残す。`--config <file>` を受け付け、渡されたファイルを settings.yaml に置く (既存があれば上書きせず rc=1)。
+- `--non-interactive`: 従来の init と同じ (無ければ example を写す・検証・DB・価格源と llama-swap の確認は警告のみ・ニュースソースは登録しない・`initialized=true` と mode/autopilot の初期化)。加えて確認記録を `mode: non-interactive` で書き、外部確認の結果は警告と同じ内容で `unverified | failed | ok` を残す。`--config <file>` を受け付け、渡されたファイルを settings.yaml に置く (既存があれば上書きせず rc=1)。
 
 ### 4.2 稼働中のサービスとの排他と、lock の引き渡し
 
@@ -399,7 +405,7 @@ clone した人が README を読まなくても、`afx init` の対話だけで�
 | marker 後、settings の置換前 | marker (新 sha)、settings は旧 | 76 | 段 0 から。既定は旧 settings。確定で marker を置き直す |
 | settings の置換後 (replace は原子的なので新旧のどちらか) | settings 新、DB と記録は旧 | 76 | 段 0 から。既定は新 settings なので同じ回答で確定すれば収束。marker の sha と一致するので bak は作り直さない |
 | `init_db` の途中 | DB は現行 `init_db` の挙動 (bak を作ってから rebuild) | 76 | 同上 |
-| seed + 消費印の transaction の途中 | rollback 済み (DB は `init_db` 済み) | 76 | 同上 (冪等) |
+| 入力された源の登録 + 消費印の transaction の途中 | rollback 済み (DB は `init_db` 済み) | 76 | 同上 (冪等) |
 | `setup.json` 更新後、`app_state.json` 更新前 | 記録は新、`initialized` は旧 | 76 | 同上 (記録は上書き) |
 | `app_state.json` 更新後、marker を消す前 | 全部新 | 76 | 段 0 で marker の sha・settings・`initialized`・DB を照合し、揃っていれば「前回の確定は印を消す所だけが残っています。消しますか [Y/n]」で質問 0 回で収束し段 11 へ。揃っていなければ上の行と同じく段 0 から |
 | marker を消した後 | 確定済み | 起動可 | 段 11 から (§3.1) |
@@ -493,7 +499,7 @@ marker が壊れて読めないとき: 内容 (sha) が無いので「前回の�
 | `config/settings.yaml` | 段 10-2 | 一時ファイル → fsync → `os.replace` → 親 dir fsync。G1〜G3 を通った全文 (必要なら migration を含む) | 一時ファイルを消し、元のまま。rc=1。marker は残る | 消す |
 | `config/settings.yaml.bak-<UTC>` | 段 10-2 (再実行のみ。前回の続きでは作り直さない) | 置き換え前の全文 | 書けなければ置き換えもしない | 消す |
 | `logs/` | 段 10-3 | ディレクトリと技術ログ | 失敗は rc=1。settings は書けている旨を表示。marker は残る | 消す |
-| `data/agentic.db` | 段 10-4 | スキーマ・移行 (`init_db`)、続けて 1 transaction でニュースソースと期の消費印 (`improve_waves` に `expected=0` の 1 行) | 移行失敗は現行の `init_db` の挙動 (`agentic.db.bak-*` を作ってから rebuild — `service.py:427-431`) に従う。transaction は失敗で rollback、marker は残り再実行で収束 | 消す (`data/` ごと。`agentic.db.bak-*` を含む) |
+| `data/agentic.db` | 段 10-4 | スキーマ・移行 (`init_db`)、続けて 1 transaction で入力されたニュースソース (入力が無ければ 0 行) と期の消費印 (`improve_waves` に `expected=0` の 1 行) | 移行失敗は現行の `init_db` の挙動 (`agentic.db.bak-*` を作ってから rebuild — `service.py:427-431`) に従う。transaction は失敗で rollback、marker は残り再実行で収束 | 消す (`data/` ごと。`agentic.db.bak-*` を含む) |
 | `data/state/setup.json` | 段 10-5、以後の段と起動後確認で原子的置換 | 確認記録 (§7) | 段 10 では失敗として扱い marker を残す。以後の段では警告 (`status` は「確認記録なし」と表示) | 消す (`data/` ごと) |
 | `data/state/app_state.json` | 段 10-6 | `initialized=true` (+ 初回のみ mode/autopilot) | 失敗は rc=1。「設定と DB は書けています。再実行してください」。marker は残る | 消す (`data/` ごと) |
 | `logs/activity.log` | 段 10-7 | `init_completed` | 現行どおり | 消す (`logs/` ごと) |
@@ -944,6 +950,7 @@ T10 → T1 → T3 → T2 → T4 → T13 → T11 → T5b → T7a → T7b → T12 
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-25 | v2.0 | 基本ニュースソースの seed を廃止。段 3 に副段「ニュース源」を足し (出口は 1 つにそろえ、どの分岐でも 1 度だけ通る)、入力された源だけを段 10 の DB transaction の中で登録する。`--non-interactive` と起動はニュース源を登録しない。範囲・範囲外・crash matrix・DB 行を合わせた | ニュース源は利用者が選ぶ裁定 (2026-10-25)。既定源の同梱が責任の所在を曖昧にするため | |
 | 2026-10-25 | v1.9 | ウィザード起動 argv と案内文、段 12 の managed 方針、`afx ops <feature> enable` の現行形を追補 | CLI surface の現行運用名を設計資料へ同期するため | |
 | 2026-10-02 | v0.1 | 草稿。流れを「集める層 → 確定 1 → 確定 2」に組み直し、B-2 (行単位 + G1〜G3)、B-7 の 3 分岐と未接続時の現物の振る舞い、B-8 ((b): `expected=0` の期の消費印)、unit の差し替え点と lock 解放の順序、未完の手順の一覧、不変条件 15・受入条件 21、task 8 本、未決 8 件、現物の問題 13 件を記述 | 裁定記録 (2026-10-02) と inventory を設計に落とすため | |
 | 2026-10-12 | v0.2 | 常駐化を direct exec の user unit に差し替え (screen・対話シェル・start/stop スクリプトを廃止、B-5 は daemon に確定、`afx ctl` を操作の入口に)。段 13 に外から見る手段の一問を足し、bot / web / notify は既存の `afx ops enable <feature>` に任せる (順序: unit 設置 → lock 解放 → enable → 起動)。段 8 を操作 API と `.env` に差し替え (`api.enabled`)。段 4 の疎通確認を非隔離の `verify-backend` と起動時 admission の行に分けた。秘密は Discord token・webhook URL を `afx ops enable` の secret に、ウィザード本体は書かない。承認の導線を bot の二段操作と `afx ctl --as approver approve` に。§5 §6 §7 §8 §9 §10 を更新 (不変条件 IV-16〜18、受入条件 AC-22〜26、問題 P16〜P18・P-14〜P-16、U-4・U-5 解消)。裁定 4 件を反映 (段 8 の操作 API は既定有効で example の既定変更を T8 に、通知は ops の notify に一本化し旧簡易通知の廃止は別チケット、実機受入は別マシンまたは WSL、`afx ops enable` は同一 process の `interactive_enable` 呼び出し。P-14・P-16 解消) | 常駐化 (本番 unit の direct exec 移行) と afx-ops の対話層 (`afx ops enable`) の main 投入、改善 CLI 隔離の有効化 | |

@@ -6,9 +6,7 @@ from urllib.error import URLError
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.datafeed.fetchers import Article
-from agentic_fx.datafeed.news_collector import (
-    DEFAULT_SOURCES, NewsCollector, seed_default_sources,
-)
+from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.store import news_sources
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
@@ -27,86 +25,6 @@ def _env(tmp_path):
     col = NewsCollector(conn, rag, ActivityLog(tmp_path / "a.log"),
                         FixedClock(NOW), timeout_sec=10)
     return conn, rag, col
-
-
-def test_seed_defaults_idempotent(tmp_path):
-    conn, _, _ = _env(tmp_path)
-    n1 = seed_default_sources(conn, NOW)
-    assert n1 == len(DEFAULT_SOURCES) >= 2
-    assert seed_default_sources(conn, NOW) == 0  # 冪等
-    rows = news_sources.list_all(conn)
-    assert all(s["enabled"] for s in rows)
-    # ブリーフが太字で指定する要件 (「enabled=True, added_by="user" で
-    # 未登録分のみ INSERT」)。added_by の値には元々どのテストも掛かって
-    # いなかった (レビューの変異テストで agent に変えても全緑と判明) ので
-    # ここでピンを打つ。
-    assert all(s["added_by"] == "user" for s in rows)
-    # 再レビューで判明した同型の穴: fetcher / url にもピンが無く、
-    # `url=s["name"]` (DB に URL でなく名前が入る) や fetcher の固定値化に
-    # 変えても全テストが緑だった。DEFAULT_SOURCES の各フィールドが
-    # そのまま DB に載ることを name をキーに突き合わせる。
-    by_name = {s["name"]: s for s in rows}
-    for src in DEFAULT_SOURCES:
-        assert by_name[src["name"]]["url"] == src["url"]
-        assert by_name[src["name"]]["fetcher"] == src["fetcher"]
-
-
-def test_seed_defaults_dedupes_within_default_sources_list(tmp_path, monkeypatch):
-    """DEFAULT_SOURCES 自体の中で name が重複していても IntegrityError に
-    ならないこと。
-
-    修正ラウンド 1 で発見: existing_names/urls をループ開始前に 1 回だけ
-    スナップショットすると、リスト内部での重複は防げない (2 件目を
-    挿入しようとする時点で、同じループで挿入したばかりの 1 件目をまだ
-    「既存」として知らないため)。ループ内で集合を更新して初めて閉じる。
-    """
-    conn, _, _ = _env(tmp_path)
-    dup_sources = [
-        {"name": "dup-src", "fetcher": "feed", "url": "https://a.example/rss"},
-        {"name": "dup-src", "fetcher": "feed", "url": "https://b.example/rss"},
-    ]
-    monkeypatch.setattr("agentic_fx.datafeed.news_collector.DEFAULT_SOURCES",
-                        dup_sources)
-    n = seed_default_sources(conn, NOW)  # 例外を送出しないこと
-    assert n == 1
-    assert [s["name"] for s in news_sources.list_all(conn)] == ["dup-src"]
-
-
-def test_seed_defaults_dedupes_url_collision_within_list(tmp_path, monkeypatch):
-    """上と対になるケース: DEFAULT_SOURCES 内で **url** だけが重複する。
-
-    name 側だけを補ったつもりでも url 側の集合更新を落とすと、db.py:92 の
-    url UNIQUE で IntegrityError になり init が落ちる。name 衝突のケース
-    だけでは `existing_urls.add(...)` にピンが掛からない (変異テストで
-    実測: url 側の更新だけ削除しても name 衝突のテストは緑のままだった)。
-    """
-    conn, _, _ = _env(tmp_path)
-    dup_sources = [
-        {"name": "src-a", "fetcher": "feed", "url": "https://same.example/rss"},
-        {"name": "src-b", "fetcher": "feed", "url": "https://same.example/rss"},
-    ]
-    monkeypatch.setattr("agentic_fx.datafeed.news_collector.DEFAULT_SOURCES",
-                        dup_sources)
-    n = seed_default_sources(conn, NOW)  # 例外を送出しないこと
-    assert n == 1
-    assert [s["name"] for s in news_sources.list_all(conn)] == ["src-a"]
-
-
-def test_seed_defaults_skips_on_name_or_url_collision(tmp_path):
-    """name/url どちらか片方だけの衝突でも IntegrityError を起こさないこと。
-
-    schema は name と url の両方に UNIQUE 制約を持つ。url だけを見て
-    重複判定すると、name が同じで url を修正した既存行 (例: 到達性確認の
-    結果 URL を差し替えた場合) に対して再度 INSERT を試み、name の
-    UNIQUE 制約で落ちる。
-    """
-    conn, _, _ = _env(tmp_path)
-    first_name = DEFAULT_SOURCES[0]["name"]
-    news_sources.add(conn, name=first_name, fetcher="feed",
-                     url="https://different-url.example/rss",
-                     added_by="user", now=NOW, enabled=True)
-    n = seed_default_sources(conn, NOW)  # 例外を送出しないこと
-    assert n == len(DEFAULT_SOURCES) - 1
 
 
 def test_collect_fetches_enabled_sources(tmp_path):

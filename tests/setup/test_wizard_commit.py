@@ -266,16 +266,20 @@ def test_a_first_run_starts_in_learning_mode_with_autopilot_off(tmp_path):
 
 
 def test_the_marker_is_left_when_the_database_transaction_fails(tmp_path, monkeypatch):
-    import agentic_fx.setup.wizard as wizard
+    from agentic_fx.datafeed import news_probe
+    from agentic_fx.store import news_sources
 
     def broken(*args, **kwargs):
         raise sqlite3.OperationalError("disk I/O error")
 
-    monkeypatch.setattr(wizard, "seed_default_sources", broken)
     root = make_root(tmp_path)
     deps, *_ = make_deps(tmp_path)
-    io = ScriptedWizardIO(responder=fresh_responder())
-    assert run_wizard(root, io, deps) == 1
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("ニュース源", ("nhk-keizai https://example.invalid/feed", ""))))
+    with monkeypatch.context() as m:
+        m.setattr(news_probe, "probe", lambda *a, **k: news_probe.ProbeResult(1, 1))
+        m.setattr(news_sources, "add", broken)
+        assert run_wizard(root, io, deps) == 1
     assert setup_marker_present(root)
     assert db_rows(root)["news_sources"] == []
     assert "確定の途中で失敗しました" in io.text

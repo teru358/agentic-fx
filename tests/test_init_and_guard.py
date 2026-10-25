@@ -9,7 +9,6 @@ import pytest
 import yaml
 
 from agentic_fx.datafeed.health import DataUnhealthy
-from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.entry import main as entry_main
 from agentic_fx.service import ensure_initialized, run_init
 from agentic_fx.setup.checks import CheckReason, CheckResult
@@ -337,22 +336,18 @@ def test_init_records_independent_trade_and_improve_backend_checks(tmp_path):
     }
 
 
-# ---- Task 9: 基本ニュースソース投入 + 価格ソース接続確認 --------------------
+# ---- 価格ソース接続確認 (ニュース源は登録しない) ----------------------------
 
 
-def test_init_seeds_news_sources_and_checks_price(tmp_path, capsys,
-                                                  mock_price_check):
+def test_init_registers_no_news_sources_and_checks_price(tmp_path, capsys,
+                                                         mock_price_check):
     _example(tmp_path)
     assert run_init(tmp_path) == 0
     conn = connect(tmp_path / "data" / "agentic.db")
-    # 件数リテラルに結合しない (ソース選定は後日見直される)。list_enabled で
-    # 数えることで「全件 enabled で入る」ことも同時に固定する
-    assert len(news_sources.list_enabled(conn)) == len(DEFAULT_SOURCES)
+    assert news_sources.list_all(conn) == []
     out = capsys.readouterr().out
     assert "価格ソース OK (USDJPY, source=yfinance)" in out
-    # 件数リテラルを書かない。tmp_path に数字が混ざるので部分一致では
-    # 弱すぎる (print を消しても通ってしまう) — 文言ごと突き合わせる
-    assert f"基本ニュースソースを {len(DEFAULT_SOURCES)} 件登録しました" in out
+    assert "ニュースソース" not in out
     # 確認するのは設定の先頭ペア (プラン 5 の fail closed と同じ対象)
     mock_price_check.return_value.healthcheck.assert_called_once_with("USDJPY")
 
@@ -380,41 +375,21 @@ def test_init_price_check_constructor_args(tmp_path, mock_price_check):
     assert isinstance(clock_arg, SystemClock)
 
 
-def test_init_seeds_with_a_real_utc_clock(tmp_path, mock_price_check):
-    """`run_init` が **`SystemClock` を実際に使っている**ことを固定する。
-
-    レビュー指摘 (I-1 / Minor-5): `SystemClock` 側のテストは
-    `tests/core/test_contracts.py` にあるが、**入口がそれを使っていること**には
-    ピンが 1 本も無かった。実測で 2 つの改変が全テスト緑のまま生存している:
-
-    ①`clock = SystemClock()` を `FixedClock(2020-01-01Z)` に差し替える →
-      止まった時計は `validate_quote` の鮮度検証を必ず落とすので、init が
-      **オンラインでも常に「接続できません」を出す**。exit 0 のままなので誰も気づかない
-    ②`seed_default_sources(conn, clock.now().replace(tzinfo=None))` で naive を渡す →
-      `store/news_sources.add` は `Rag.cleanup_news` と違って tz 検証を持たず
-      素で `now.isoformat()` を書く。**Task 9 がこの無防備な書き込み経路の
-      初の production 呼び出し元**
-
-    `created_at` の tz と実時刻近傍性を見ることで両方を同時に閉じる。
-    """
+def test_init_leaves_registered_sources_untouched_including_disabled_ones(tmp_path, capsys):
     _example(tmp_path)
-    before = datetime.now(timezone.utc)
     assert run_init(tmp_path) == 0
-    after = datetime.now(timezone.utc)
     conn = connect(tmp_path / "data" / "agentic.db")
-    created = datetime.fromisoformat(news_sources.list_all(conn)[0]["created_at"])
-    assert created.tzinfo is not None          # naive を書かない (②)
-    assert before <= created <= after          # 実時計である (①)
-
-
-def test_init_seeding_is_idempotent(tmp_path, capsys):
-    _example(tmp_path)
-    run_init(tmp_path)
+    news_sources.add(conn, name="kept-on", fetcher="feed", url="https://example.invalid/on",
+                     added_by="user", now=datetime(2026, 10, 1, tzinfo=timezone.utc), enabled=True)
+    news_sources.add(conn, name="kept-off", fetcher="feed", url="https://example.invalid/off",
+                     added_by="user", now=datetime(2026, 10, 1, tzinfo=timezone.utc), enabled=False)
+    before = news_sources.list_all(conn)
+    conn.close()
     capsys.readouterr()
     assert run_init(tmp_path) == 0
     conn = connect(tmp_path / "data" / "agentic.db")
-    assert len(news_sources.list_all(conn)) == len(DEFAULT_SOURCES)
-    # 2 回目は「登録しました」を出さない (0 件を報告しない)
+    assert news_sources.list_all(conn) == before
+    assert [row["enabled"] for row in before] == [1, 0]
     assert "ニュースソース" not in capsys.readouterr().out
 
 
