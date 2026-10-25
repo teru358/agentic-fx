@@ -80,6 +80,29 @@ options:
 旧形 `afx ops enable|disable|status <feature>` は 0.2.0 だけ受け付け、0.3.0 で削除する。
 """
 
+NEWS_HELP = """usage: afx news [-h] {list,add,enable,disable,test} ...
+
+市場ニュース源を扱う
+
+positional arguments:
+  {list,add,enable,disable,test}
+    list                [読取] 源を一覧する
+    add                 [変更] 源を追加する (0 件のとき確認)
+    enable              [変更] 源を有効にする (次の収集周期で反映)
+    disable             [変更] 源を無効にする (次の収集周期で反映)
+    test                [読取] 源を 1 回取得して確認する
+
+options:
+  -h, --help            show this help message and exit
+
+操作:
+  afx news list  [読取] 源を一覧する
+  afx news test <name>  [読取] 源を 1 回取得して確認する
+  afx news add <name> <url> [--fetcher feed|web] [--yes]  [変更] 源を追加する (0 件のとき確認)
+  afx news enable <name>  [変更] 源を有効にする (次の収集周期で反映)
+  afx news disable <name>  [変更] 源を無効にする (次の収集周期で反映)
+"""
+
 COMPLETION_HELP = """usage: afx completion [-h] {bash} ...
 
 シェル補完スクリプトの出力
@@ -150,6 +173,7 @@ def test_public_help_matches_the_surface_golden(capsys):
     assert _captured_help(["--help"], capsys) == TOP_HELP
     assert _captured_help(["ops", "--help"], capsys) == OPS_HELP
     assert _captured_help(["completion", "--help"], capsys) == COMPLETION_HELP
+    assert _captured_help(["news", "--help"], capsys) == NEWS_HELP
     assert entry_main(["ctl", "help"]) == 0
     assert capsys.readouterr().out == CTL_HELP
 
@@ -220,13 +244,15 @@ def test_metadata_summary_mutation_changes_the_rendered_help():
 def test_help_golden_is_uncolored_narrow_and_hides_compatibility_choices(capsys, monkeypatch):
     for variable in ("FORCE_COLOR", "NO_COLOR", "PYTHON_COLORS", "TERM", "CLICOLOR", "CLICOLOR_FORCE"):
         monkeypatch.delenv(variable, raising=False)
-    output = _captured_help(["--help"], capsys) + _captured_help(["ops", "--help"], capsys)
+    output = (_captured_help(["--help"], capsys) + _captured_help(["ops", "--help"], capsys)
+              + _captured_help(["news", "--help"], capsys))
     for line in output.splitlines():
         width = sum(2 if unicodedata.east_asian_width(char) in {"F", "W", "A"} else 1
                     for char in line)
         assert width <= 100, line
     assert "{improve" not in output
-    assert "news" in output
+    assert "    news                [下位操作ごと] 市場ニュース源を扱う" in output
+    assert "{list,add,enable,disable,test}" in output
     assert "reconf}" not in output
     assert "<feature> enable|disable|status" not in output
 
@@ -361,7 +387,9 @@ def test_exposure_is_explicit_and_never_inferred():
 _FIXED_WIDTH_HELPS = (
     ["--help"], ["ops", "--help"], ["ops", "bot", "--help"], ["ops", "web", "--help"],
     ["ops", "notify", "--help"], ["completion", "--help"], ["history", "--help"], ["plugin", "--help"],
-    ["backtest", "--help"], ["analyze", "--help"],
+    ["backtest", "--help"], ["analyze", "--help"], ["news", "--help"],
+    ["news", "list", "--help"], ["news", "add", "--help"], ["news", "enable", "--help"],
+    ["news", "disable", "--help"], ["news", "test", "--help"],
 )
 
 

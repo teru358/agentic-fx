@@ -106,16 +106,18 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     news_sub = news.add_subparsers(dest="news_command", required=True)
     news_sub.add_parser("list", **_surface_parser_kw("news list", leaf=True))
     add = news_sub.add_parser("add", **_surface_parser_kw("news add", leaf=True))
-    add.add_argument("name")
-    add.add_argument("url")
-    add.add_argument("--fetcher", choices=("feed", "web"), default="feed")
-    add.add_argument("--yes", action="store_true")
+    add.add_argument("name", help="源の名前 (小文字・数字・ハイフン、先頭は小文字か数字、40 文字まで)")
+    add.add_argument("url", help="取得先の URL。鍵を含む URL は `-` を渡して標準入力から読む")
+    add.add_argument("--fetcher", choices=("feed", "web"), default="feed",
+                     help="取得方式 (feed = RSS/Atom、web = ページ本文)")
+    add.add_argument("--yes", action="store_true",
+                     help="0 件のときの確認を省く (取得の失敗は越えない)")
     enable = news_sub.add_parser("enable", **_surface_parser_kw("news enable", leaf=True))
-    enable.add_argument("name")
+    enable.add_argument("name", help="源の名前")
     disable = news_sub.add_parser("disable", **_surface_parser_kw("news disable", leaf=True))
-    disable.add_argument("name")
+    disable.add_argument("name", help="源の名前")
     test = news_sub.add_parser("test", **_surface_parser_kw("news test", leaf=True))
-    test.add_argument("name")
+    test.add_argument("name", help="源の名前")
 
     backtest = sub.add_parser("backtest", **_surface_parser_kw("backtest"))
     backtest_sub = backtest.add_subparsers(dest="backtest_command",

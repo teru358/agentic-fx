@@ -416,7 +416,18 @@ def test_every_visible_leaf_resolves_exactly_once_in_epilogs():
 
 def test_news_records_are_implemented_and_exposed():
     assert all(_record(f"news {action}").implemented and _record(f"news {action}").exposed
+               and not _record(f"news {action}").planned
                for action in ("list", "test", "add", "enable", "disable"))
+    assert not [record.command for record in cli_surface.COMMANDS if record.command == "news"]
+    assert any(parent.command == "news" for parent in cli_surface.PARENTS)
+
+
+def test_planned_records_never_render_even_when_marked_exposed():
+    """The reservation mechanism stays guarded: a planned record must not become visible."""
+    reserved = dataclasses.replace(_record("history coverage"), planned=True, implemented=False, exposed=True)
+    records = tuple(reserved if r.command == "history coverage" else r for r in _all_exposed())
+    with pytest.raises(ValueError):
+        cli_surface.SurfaceRenderer(records)
 
 
 def test_ctl_help_lists_each_group_and_each_ctl_record_once():

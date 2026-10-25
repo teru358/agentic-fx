@@ -17,7 +17,7 @@ from tests.test_cli_surface_integration import _CTL_GRAMMAR
 BASH = shutil.which("bash")
 needs_bash = pytest.mark.skipif(BASH is None, reason="bash is not installed")
 
-FORBIDDEN_WORDS = {"news", "approvals", "reconf", "verify-backend", "stop", "help"}
+FORBIDDEN_WORDS = {"approvals", "reconf", "verify-backend", "stop", "help"}
 
 
 def _script() -> str:
@@ -97,10 +97,10 @@ def test_flipping_exposed_changes_the_output_in_both_directions():
                     for r in cli_surface.COMMANDS)
     assert completion.render_bash(flipped) != _script()
     assert "list" not in completion.candidate_table(flipped)[("plugin",)]
-    hidden = tuple(dataclasses.replace(r, exposed=True) if r.command == "news" else r
-                   for r in cli_surface.COMMANDS)
+    reserved = tuple(dataclasses.replace(r, planned=True, implemented=False, exposed=True)
+                     if r.command == "plugin list" else r for r in cli_surface.COMMANDS)
     # a planned record never becomes a candidate even when it is marked exposed
-    assert completion.render_bash(hidden) == _script()
+    assert "list" not in completion.candidate_table(reserved)[("plugin",)]
     bot = tuple(dataclasses.replace(r, exposed=True, implemented=True) if r.command == "ops bot reconfigure"
                 else r for r in cli_surface.COMMANDS)
     assert "reconfigure" in completion.candidate_table(bot)[("ops", "bot")]
@@ -158,7 +158,9 @@ def test_no_planned_private_alias_or_retired_word_is_a_candidate():
     assert "reconfigure" not in table[("ops", "bot")]
     assert "reconfigure" not in table[("ops", "notify")]
     assert "reconfigure" in table[("ops", "web")]
-    assert not any(word in _script() for word in ("verify-backend", "approvals", "news"))
+    assert not any(word in _script() for word in ("verify-backend", "approvals"))
+    assert "news" in table[()]
+    assert table[("news",)] == ["list", "test", "add", "enable", "disable"]
 
 
 # --- a real bash ---

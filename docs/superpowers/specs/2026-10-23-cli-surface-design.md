@@ -30,7 +30,7 @@
 ### 0.1 範囲外
 
 - ウィザード対話の見栄えは別束である。
-- `afx news` はニュース源を管理するローカル操作である。取得先 URL は表示・activity に出さない。
+- `afx news` はニュース源を管理するローカル操作である。取得先 URL は `<scheme>://<host>/…` に畳んで表示し、path と query は出力にも activity にも出さない。
 - 発注系 API は追加しない。
 - `afx-ops <bot|web|notify>` は unit の入口であり、利用者向け操作面ではない。
 - daemon や売買ロジックの動作は変えない。
@@ -340,6 +340,34 @@ options:
 
 `news` は親 record とし、list / test は `[読取]`、add / enable / disable は `[変更]` の葉 record とする。help は実装済みの利用可能性を表す契約である。
 
+### 3.2.3 `afx news --help` の全文 golden
+
+§3.2 と同じ条件 (幅 100、非 TTY の capture、色の環境変数を消す、`color=False` は 3.14 以上だけ) で実装の出力を取り、stdout 全体を次の byte 列と一致させる。
+
+```text
+usage: afx news [-h] {list,add,enable,disable,test} ...
+
+市場ニュース源を扱う
+
+positional arguments:
+  {list,add,enable,disable,test}
+    list                [読取] 源を一覧する
+    add                 [変更] 源を追加する (0 件のとき確認)
+    enable              [変更] 源を有効にする (次の収集周期で反映)
+    disable             [変更] 源を無効にする (次の収集周期で反映)
+    test                [読取] 源を 1 回取得して確認する
+
+options:
+  -h, --help            show this help message and exit
+
+操作:
+  afx news list  [読取] 源を一覧する
+  afx news test <name>  [読取] 源を 1 回取得して確認する
+  afx news add <name> <url> [--fetcher feed|web] [--yes]  [変更] 源を追加する (0 件のとき確認)
+  afx news enable <name>  [変更] 源を有効にする (次の収集周期で反映)
+  afx news disable <name>  [変更] 源を無効にする (次の収集周期で反映)
+```
+
 ### 3.3 `afx ctl help` の固定出力
 
 ```text
@@ -390,6 +418,7 @@ API に発注・SL 変更・クローズ・サービス停止は無い。
 
 ### 3.4 一致 test
 
+- §3.2 と §3.2.3 の golden は本書の code block と test の定数が byte 一致することを test で確かめる (本書だけ古くなるのを防ぐ)。
 - `cli_surface.py` の正式な local 親 command と argparse の全 `add_parser` を一致させる。`ops` は機能 → 動詞の 2 段まで比較する。`ctl` ダミー parser は明示的な例外集合にする。
 - ctl の正式名と互換別名を parser table 化するか、独立 fixture から `parse()` へ全語順を与える。各正式名は 1 record にだけ対応させる。
 - API command の `endpoint_code`、scope、mutating の文字列を `ENDPOINTS` と比較する。この surface ↔ `ENDPOINTS` 照合 (AC-4) は I1 で有効化し、schema task 単独の完了条件にはしない。
@@ -860,7 +889,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 
 | ID | 条件 | 観測点 |
 |---|---|---|
-| AC-1 | `afx --help` の stdout 全体が §3.2 と byte 一致し、7 群の順、左右レーン、local ラベルが固定される。ラベル表記は `[読取]` / `[変更]` / `[下位操作ごと]` だけで、「用途」表にはラベルが無い。全角 2 桁で数えてどの行も 100 桁以内である。choices に `improve` / `news` は出ない | stdout 全文 golden、表示幅の検査 |
+| AC-1 | `afx --help` の stdout 全体が §3.2 と byte 一致し、7 群の順、左右レーン、local ラベルが固定される。ラベル表記は `[読取]` / `[変更]` / `[下位操作ごと]` だけで、「用途」表にはラベルが無い。全角 2 桁で数えてどの行も 100 桁以内である。choices に `improve` は出ない。`news` は親 command として出る | stdout 全文 golden、表示幅の検査 |
 | AC-2 | `afx ctl help` が §3.3 と byte 一致し、末尾が「API に発注・SL 変更・クローズ・サービス停止は無い。」で終わる | stdout、rc=0 |
 | AC-3 | argparse の全正式 local command (`ops` は機能 → 動詞の 2 段)、ctl `parse()` の全正式語順、`exposed=True` の surface record が一対一である。`exposed` なら `implemented`、planned なら非 exposed、alias / compatibility record は通常 parser と独立である。`import agentic_fx.cli_surface` 後の `sys.modules` にある `agentic_fx` 配下は `agentic_fx` と `agentic_fx.cli_surface` だけである | 独立 expected table と集合比較、子 process の `sys.modules` |
 | AC-4 | B1 の完了時に endpoint 26 本、B2b の完了時に 29 本で、`_ENDPOINT_COUNT`、routing test の個数 pin 2 か所、独立 `_EXPECTED_TABLE` が一致し、listener が起動する。I1 で API record の endpoint code / scope / mutating の文字列が `ENDPOINTS` と一致する。I1 まで新 record は help 非表示 | `ops/api_server.py:274-281` と routing test 2 か所、surface ↔ `ENDPOINTS` 照合、help snapshot |
@@ -886,7 +915,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-24 | offline status の各 source が例外でも traceback を出さず、読めない節だけ `unavailable`、rc=1 になる。全 source が読めると rc=0 | source ごとの fault injection |
 | AC-25 | shell help は `shell=True` から生成され、`backlog add`、`classified=False` の `stop`、deprecated 末尾 1 行を出す。旧 `improve add` は同一動作、`stop` は現行の graceful shutdown 要求になる | shell help snapshot、dispatch spy、既存 16 node の更新 |
 | AC-26 | ops-api の 7 群順、README anchor link、§7.2 (c) の正式名 9 つ、local / ctl ラベルが存在し、現行手順の旧名が 0 件である。ops-api 文書に `backlog list [--all] [--limit N]` と `policy remove` の managed だけという制約が出る。どれか 1 つを文書から消す変異で落ちる。CLAUDE.md は release 手動確認 | `test_first_run_acceptance_doc.py` と追跡文書 grep pin |
-| AC-27 | `news` は local 親 command と 5 葉 record を持ち、choices / help / parser に出るが API endpoint には出ない | full help golden と parser pin |
+| AC-27 | `news` は ParentRecord で、5 本の葉 record が `[読取]` / `[変更]` の分類と accessor 由来の help を持つ。planned の `news` record と例外 pin は消える。`entry.py` が `afx news …` を `news_cli` に振り分ける (daemon 起動に落ちない)。`afx --help` と `afx news --help` が実出力の golden (§3.2、§3.2.3) と byte 一致する。ops-api の原則表と本書に news が出る。doc test (c) の 9 名は不変。`ENDPOINTS` は 29 のまま news 系の code を持たない (ニュース源 CLI 設計 AC-14 が置換) | golden、一致 test、dispatch test、文書 grep pin |
 | AC-28 | daemon 稼働中の `ops enable` は rc=1 拒否へ変異されず、marker → stop → lock → enroll / install → unlock → restart の順で完了する。元が停止中なら再起動しない | 既存 durable stage test と mutation test |
 | AC-29 | 空 root、主要 file 不在、settings 破損、DB 不在、鍵不在、DB sidecar 有り / 無しの locked / free / unknown すべてで、実行前後の tree が同一である。例外は sidecar 有りのときの `data/agentic.db-wal` と `data/agentic.db-shm` だけで、`data/agentic.db` は byte 一致する。sidecar 無しの DB では sidecar が作られない | recursive tree manifest と byte compare |
 | AC-30 | instance lock 不在 / unreadable は `instance: unknown`、state reader 0 回となり、locked / free / unknown すべてで「観測時点」固定文を出す | lock fault injection、stdout snapshot、spy |
@@ -1071,4 +1100,4 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | 2026-10-25 | v0.5r | §5.3.4: 方針文の失敗は課題の入力へ続く、本文検査を先頭 reconcile の前に、上限は `POLICY_TEXT_LIMIT` 1 定数、file 側の重複判定を行単位完全一致に、空メッセージ例外は `__cause__`、案内文は正式名 | B2c merge 後の /code-review 8 件 (採用 6 / 却下 2、裁定 tmp/review-cli/reports/b2c/b2c-cr2-rulings.md) | |
 | 2026-10-25 | v0.5s | §13 新設: root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd)、`uv tool install` による PATH 配置の文書化、`afx completion bash` (record から生成、bash のみ)、AC-44〜47。§3.2 等の golden は実装出力を写して改訂する | チケット afx-on-path-and-root-resolution (ユーザー裁定 2026-10-25: 優先 中、補完は静的生成の案 2) | |
 | 2026-10-25 | v0.5t | §13.1: 上方探索は init と --daemon に適用しない、所有者が異なる directory で探索を止める、エラー文は指定値を含む、symlink の marker は辿った先で判定。§13.3: 生成物は bash-completion の利用者 directory へ、`local IFS`。§13.4: completion は用途表に載せない (100 桁) | afx-path /code-review high 8 件 (採用 7 / 却下 1 = zsh の固定文は spec どおり) と指揮者検収 3 件 | |
-| 2026-10-25 | v0.5u | `afx news` を local 親 command と 5 操作として公開し、help golden、分類表、照合規則、AC を現行実装へ更新 | ニュース源管理 CLI の実装 | |
+| 2026-10-25 | v0.5u | `afx news` を local 親 command と 5 操作 (list / test = `[読取]`、add / enable / disable = `[変更]`) として公開。分類表 (§2.1)、§3.2 の golden (`history` の隣に `news`、用途表の「市場入力を整える」)、§3.2.3 (`afx news --help`) の新設、§3.2.2 と §3.4 の planned `news` 例外の削除、AC-1 の choices の記述、AC-27 を AC-14 (ニュース源 CLI 設計) の内容で置換 | ニュース源管理 CLI の実装 (ニュース源 CLI 設計 §4) | |
