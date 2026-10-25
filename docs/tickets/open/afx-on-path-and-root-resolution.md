@@ -1,6 +1,6 @@
 ---
 id: afx-on-path-and-root-resolution
-title: afx を PATH に置き、root を cwd 以外からも解決する
+title: afx を PATH に置き、root 解決と bash 補完を足す
 status: 設計待ち
 priority: 中
 opened: 2026-10-25
@@ -24,3 +24,4 @@ related: [cli-surface-principle-and-reorg]
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-25: 題名: afx を PATH に置き、root 解決と bash 補完を足す — 2026-10-25 ユーザー裁定: 範囲に bash 補完を追加 (案 2 = 静的スクリプト生成)。`afx completion bash` が cli_surface.py の record (正式名・別名・`ops <feature> <verb>` の 2 段・ctl の語順表。planned / 非公開は除外) から補完スクリプトを出力し、利用者は `.bashrc` に `eval "$(afx completion bash)"`。依存を増やさない (argcomplete 不採用: ctl 以下が argparse を通らず正本が分かれるため)。zsh / fish は対象外。test: record を 1 つ変えると出力が変わる pin、help golden と候補集合の一致。PATH 導入 (`uv tool install --editable`) と `.bashrc` の案内を受入手順書に同じ節で書く
