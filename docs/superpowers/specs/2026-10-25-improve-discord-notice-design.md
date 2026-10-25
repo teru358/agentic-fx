@@ -1,6 +1,6 @@
 # 改善 mission の開始・終了通知 (Discord) 設計書
 
-**版:** v0.4 (設計レビュー 3 周目 (sol 閉鎖確認) の指摘を反映)
+**版:** v0.5 (§7 の 2 件をユーザー裁定済に)
 
 **対象:** `improve-start-and-result-to-discord` (追加要望 2 点を含む)
 
@@ -363,10 +363,10 @@ T1a → T1b は順序あり (T1b は T1a の定数と snapshot を使う)。T1b 
 
 ## 7. 裁定が要る点
 
-技術で決まるものは推奨で決める。ユーザー裁定が要るのは次の 2 点。
+技術で決まるものは推奨で決める。ユーザー裁定が要った次の 2 点は、どちらも推奨で裁定済。
 
-1. **開始通知の要否と既定。** 推奨: 依頼どおり実装し、既定 `all`、`improve_notices = "results"` で終了のみに絞れる。根拠: 週次は無人なので開始の可視化に意味があり、現設定 (`improve.parallel: 1`) では 1 周 1 本で通知疲れにならず、「開始あり・終了なし」が異常終了や停止を切り分ける唯一の手掛かりになる。要らなければ実装の差は設定 1 値で済む。
-2. **床未達の数値の粒度。** 推奨: 落ちた段の、落ちた pair の行だけを出す (in_sample で落ちたなら in_sample の行、holdout で落ちたなら holdout の行)。項目は pf / avg_r / 取引数 / 評価不能 (依頼どおり)。通った段の数値、win_rate、max_drawdown、total_pnl、閾値は載せない。根拠: pf・avg_r・取引数・評価可否は床の判定そのものの入力なので「なぜ落ちたか」はこれで足り、それ以外を載せるほど運用者が方針へ書き写す数値が増える。in_sample の成績は agent が `run_backtest` で既に見ており、in_sample で落ちた候補は holdout を回さないので、in_sample の行は遮断 8 の外にある。holdout の数値を人間が見ることは、遮断 8 (agent に見せない) の範囲外だが、§3 の 8 の注記を運用文書に入れる前提。
+1. **開始通知の要否と既定。** **裁定済 (2026-10-25、ユーザー: 推奨で)。** 推奨: 依頼どおり実装し、既定 `all`、`improve_notices = "results"` で終了のみに絞れる。根拠: 週次は無人なので開始の可視化に意味があり、現設定 (`improve.parallel: 1`) では 1 周 1 本で通知疲れにならず、「開始あり・終了なし」が異常終了や停止を切り分ける唯一の手掛かりになる。要らなければ実装の差は設定 1 値で済む。
+2. **床未達の数値の粒度。** **裁定済 (2026-10-25、ユーザー: 推奨で)。** 推奨: 落ちた段の、落ちた pair の行だけを出す (in_sample で落ちたなら in_sample の行、holdout で落ちたなら holdout の行)。項目は pf / avg_r / 取引数 / 評価不能 (依頼どおり)。通った段の数値、win_rate、max_drawdown、total_pnl、閾値は載せない。根拠: pf・avg_r・取引数・評価可否は床の判定そのものの入力なので「なぜ落ちたか」はこれで足り、それ以外を載せるほど運用者が方針へ書き写す数値が増える。in_sample の成績は agent が `run_backtest` で既に見ており、in_sample で落ちた候補は holdout を回さないので、in_sample の行は遮断 8 の外にある。holdout の数値を人間が見ることは、遮断 8 (agent に見せない) の範囲外だが、§3 の 8 の注記を運用文書に入れる前提。
 
 以下は推奨で決めた (裁定不要)。観察文の上限は 300 字 (依頼どおり、切詰めは表示のみで保存は 2,000 字まで)。plugin 名は submitted のみ。課題 (idea) は載せない (`improve-run-summary-for-humans` の範囲)。
 
@@ -382,3 +382,4 @@ T1a → T1b は順序あり (T1b は T1a の定数と snapshot を使う)。T1b 
 | 2026-10-25 | v0.2 | event の専用意味検査と (result_code, reason_code) の変換表 (§4.1・§4.2)、mission 終端 tx と同時に書く不変な終端 snapshot を通知の正本に (§4.3)、再起動回収の通知 (§4.4)、`prepare()` 後段失敗の `ImprovePrepareFailed` (§4.5)、`finished` 前の終端確認 (§4.4)、取得失敗時の全文と要求全体の deadline (§2.4)、bot のローカル値の所有期間と canary の分離 (§3-7・AC-3)、report 読取の厳密規則と null 表示 (§4.6)、秒の丸め規則と実データに合わせた例 (§2.2・AC-1)、AC-6 の因果分割、task 範囲の拡張 (§6)、`cut_escaped` / `allow_mentions=False` の明記、§8 を確定事項 (§0.2) へ移動 | 設計レビュー 1 周目 (sol、Critical 2 / Important 10 / Minor 3 + §8 回答 6 件、全件採用。詳細は `tmp/review-discord/c0-r1-triage.md`) | |
 | 2026-10-25 | v0.3 | 変換表を分岐ごとの定数に作り直し (`NoticeCode`、`_PluginGateVerdict` / `_QualityVerdict` の `code`、不足 site の追加、`gate_other` の廃止、AST 検査の対象変更。§4.2・AC-5)、afx-ops は文法検証 + 自前ラベル表で daemon の語の追加に縛られない (§4.7・§4.8)、所要を snapshot の `created_at` 基準に (§2.2)、見出し・本文行を 1 枚の表に (§2.2)、in_sample で落ちたら in_sample の行を出す (§2.2・§7-2)、`report_state` で公開失敗を表示 (§4.3・§4.6・AC-13)、snapshot を outbox とする起動時の取りこぼし回収と回収の戻り値の持ち回しの廃止 (§4.4・AC-8)、`improvement_runs.trigger` を Tx-0 で記録 (§4.3)、DB の追加作法 (`IF NOT EXISTS`・旧 DB の test)、`observation_text` の保存時切詰め、`ImprovePrepareFailed` は `Exception` のみ、supervisor の自前接続、数値の丸めと `-0.00`、読み飛ばす行の列挙 (§4.6)、実例を escape 後の content・新しい所要で再生成 (§2.2・AC-1)、T1 を T1a / T1b に分割し既存 test 74 か所の追従と `notify/payload.py` を見積りに追加 (§6) | 設計レビュー 2 周目 (opus、Critical 0 / Important 7 / Minor 8、全件採用。詳細は `tmp/review-discord/c0-r2-triage.md`) | |
 | 2026-10-25 | v0.4 | `_finalize_report_or_observation` の 3 呼び出しの notice の出所と observation selector (§4.2)、質検査を 4 種に (到達不能の `candidate_identity_unavailable` 行を削除)、status の優先順位、wrapper の `code=` の AST 検査と suffix 変異 (AC-5)、`BaseException` も補償してから再送出 (§4.5・AC-7)、outbox の 3 条件と `ops_events (code, ref)` の index (§4.4)、`failed_stage` は 1 段のみ (§2.2・§4.6・AC-2)、T1b に `src/agentic_fx/service.py` と呼び出し位置・統合条件、T1a の件数を grep 74 / call 式 68 に (§6) | 設計レビュー 3 周目 (sol 閉鎖確認、詳細 `tmp/review-discord/c0-r3-triage.md`) | |
+| 2026-10-25 | v0.5 | §7 の 2 件 (開始通知の要否と既定、床未達の数値の粒度) を裁定済に (推奨どおり) | ユーザー裁定 (2026-10-25、「推奨で」) | |
