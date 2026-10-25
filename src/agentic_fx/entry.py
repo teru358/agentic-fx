@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import os
+import stat
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from agentic_fx import service
@@ -107,25 +110,109 @@ def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
     return args_list, None
 
 
+class RootError(Exception):
+    """root の指定が directory でない。文面に指定された値をそのまま含める。"""
+
+
+def _split_prefix(args_list: list[str]) -> tuple[int, str | None]:
+    """subcommand より前の `--daemon` と `--root <dir>` を数える。head と最後の `--root` の値を返す。"""
+    head = 0
+    root: str | None = None
+    while head < len(args_list):
+        token = args_list[head]
+        if token == "--daemon":
+            head += 1
+        elif token == "--root" and head + 1 < len(args_list):
+            root = args_list[head + 1]
+            head += 2
+        elif token.startswith("--root="):
+            root = token.partition("=")[2]
+            head += 1
+        else:
+            break
+    return head, root
+
+
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _is_directory(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _owned_by_current_user(path: Path) -> bool:
+    try:
+        return os.stat(path).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
+def resolve_root(argv: list[str], environ: Mapping[str, str], cwd: Path) -> Path:
+    """root を `--root`、`AFX_ROOT`、cwd と親の `config/settings.yaml`、cwd の順に決める。
+
+    上方探索は既存 root を対象にする操作だけに適用する。`init` と `--daemon` は探索せず cwd に落とす。
+    探索は、所有者が実行 uid と異なる directory に達した時点で止めて cwd に落とす。
+    """
+    head, option = _split_prefix(argv)
+    if option is not None:
+        path = Path(os.path.abspath(Path(cwd) / option))
+        if not path.is_dir():
+            raise RootError(f"afx: --root {option} は directory ではありません")
+        return path
+    env_value = environ.get("AFX_ROOT")
+    if env_value:
+        path = Path(os.path.abspath(Path(cwd) / env_value))
+        if not path.is_dir():
+            raise RootError(f"afx: AFX_ROOT={env_value} は directory ではありません")
+        return path
+    here = Path(os.path.abspath(cwd))
+    if "--daemon" in argv[:head] or argv[head:head + 1] == ["init"]:
+        return here
+    for candidate in (here, *here.parents):
+        if not _owned_by_current_user(candidate):
+            return here
+        if (_is_directory(candidate / "config")
+                and _is_regular_file(candidate / "config" / "settings.yaml")):
+            return candidate
+    return here
+
+
 def main(argv: list[str] | None = None) -> int:
     args_list = sys.argv[1:] if argv is None else list(argv)
     # 全体 flag の後ろの ctl も argparse に通さない (REMAINDER は `--as` 始まりを
     # 受け取れない)。全体 flag は client には関係ないので読み捨て、daemon も起動しない。
-    head = 0
-    while args_list[head:head + 1] == ["--daemon"]:
-        head += 1
+    head, _ = _split_prefix(args_list)
     args_list, shim_rc = _shim_argv(args_list, head)
     if shim_rc is not None:
         return shim_rc
     if args_list[head:head + 1] == ["ctl"]:
         # client は .env も設定の dotenv も読まない。--as を含む残りの引数は client が読む。
         from agentic_fx.ops.client import main as ctl_main
-        return ctl_main(args_list[head + 1:], root=Path.cwd())
+        try:
+            ctl_root = resolve_root(args_list, os.environ, Path.cwd())
+        except RootError as error:
+            print(error, file=sys.stderr)
+            return 2
+        return ctl_main(args_list[head + 1:], root=ctl_root)
+    if args_list[head:head + 1] == ["completion"]:
+        shell = args_list[head + 1] if len(args_list) > head + 1 else None
+        if shell is not None and not shell.startswith("-") and shell != "bash":
+            from agentic_fx import completion
+            return completion.main(shell)
     # 略記 (--dae など) を許すと、上の完全一致の前置きをすり抜けて ctl が argparse に届く。
     parser = _OpsOptionParser(prog="afx", description=top_description(), epilog=render_top_epilog(),
                               formatter_class=HelpFormatter, allow_abbrev=False)
     parser.add_argument("--daemon", action="store_true",
                         help="systemd 用 (コマンド受付なし)")
+    parser.add_argument("--root", metavar="DIR",
+                        help="作業 root (未指定なら AFX_ROOT、無ければ上位の config/settings.yaml)")
     sub = parser.add_subparsers(dest="command")
     init_parser = sub.add_parser("init", help=parser_help("init"),
                                  description=parser_description("init"), epilog=render_epilog("init"),
@@ -190,6 +277,13 @@ def main(argv: list[str] | None = None) -> int:
                 epilog=render_epilog(command), formatter_class=HelpFormatter, **_web_parser_kw(feature))
             if feature == "web" and action == "enable":
                 _add_web_setup_options(action_parser)
+    completion_parser = sub.add_parser("completion", help=parser_help("completion"),
+                                       description=parser_description("completion"),
+                                       epilog=render_epilog("completion"), formatter_class=HelpFormatter)
+    completion_sub = completion_parser.add_subparsers(dest="completion_action", required=True)
+    completion_sub.add_parser("bash", help=leaf_help("completion bash"),
+                              description=parser_description("completion bash"),
+                              epilog=render_epilog("completion bash"), formatter_class=HelpFormatter)
     # ctl は上の分岐で client へ渡す。ここは help の一覧に載せるためだけに置く。
     sub.add_parser("ctl", add_help=False, help=parser_help("ctl"),
                    description=parser_description("ctl"), epilog=render_epilog("ctl"),
@@ -207,7 +301,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(str(error))
         raise SystemExit(2) from None
 
-    root = Path.cwd()
+    if args.command == "completion":
+        from agentic_fx import completion
+        return completion.main(args.completion_action)
+    try:
+        root = resolve_root(args_list, os.environ, Path.cwd())
+    except RootError as error:
+        print(error, file=sys.stderr)
+        return 2
     if args.command == "init":
         if not args.non_interactive:
             from agentic_fx.setup import wizard

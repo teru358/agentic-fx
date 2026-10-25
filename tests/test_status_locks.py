@@ -68,14 +68,14 @@ HOLDERS = {
 }
 
 
-def _expected_locked(locked_by, next_step):
-    return "\n".join(("agentic-fx offline status", "instance: locked", f"locked-by: {locked_by}", NOTE,
-                      f"next: {next_step}")) + "\n"
+def _expected_locked(root, locked_by, next_step):
+    return "\n".join(("agentic-fx offline status", f"root: {root}", "instance: locked",
+                      f"locked-by: {locked_by}", NOTE, f"next: {next_step}")) + "\n"
 
 
 @pytest.mark.parametrize("keys", ["operator", "approver", "both", "none"])
 @pytest.mark.parametrize("holder", sorted(HOLDERS))
-def test_locked_output_is_five_exact_lines_for_every_holder(tmp_path, monkeypatch, capsys, holder, keys):
+def test_locked_output_is_six_exact_lines_for_every_holder(tmp_path, monkeypatch, capsys, holder, keys):
     spec = HOLDERS[holder]
     root = _root(tmp_path)
     lock = touch_lock(root)
@@ -97,7 +97,7 @@ def test_locked_output_is_five_exact_lines_for_every_holder(tmp_path, monkeypatc
     assert rc == 0
     assert out.err == ""
     assert readers == []
-    assert out.out == _expected_locked(spec["locked_by"], spec["next"])
+    assert out.out == _expected_locked(root, spec["locked_by"], spec["next"])
     assert manifest(root) == before
     assert (manifest(key_dir(root)) if key_dir(root).exists() else {}) == before_keys
 
@@ -114,7 +114,7 @@ def test_locked_with_no_marker_depends_on_the_key_files(tmp_path, monkeypatch, c
     with held_by_other_process(lock):
         assert status.main(root) == 0
 
-    assert capsys.readouterr().out == _expected_locked(UNKNOWN_HOLDER, expected)
+    assert capsys.readouterr().out == _expected_locked(root, UNKNOWN_HOLDER, expected)
 
 
 def test_locked_next_is_chosen_without_reading_key_contents(tmp_path, monkeypatch, capsys):
@@ -138,7 +138,7 @@ def test_locked_next_is_chosen_without_reading_key_contents(tmp_path, monkeypatc
         with held_by_other_process(lock):
             assert status.main(root) == 0
     try:
-        assert capsys.readouterr().out == _expected_locked(UNKNOWN_HOLDER, "afx ctl status")
+        assert capsys.readouterr().out == _expected_locked(root, UNKNOWN_HOLDER, "afx ctl status")
         assert not [name for name in opened if name.endswith(".token")]
     finally:
         os.chmod(path, 0o600)

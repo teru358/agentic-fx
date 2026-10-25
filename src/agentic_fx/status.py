@@ -148,9 +148,14 @@ def _locked_next(root: Path | None, locked_by: str) -> str:
     return "journalctl --user -u afx.service (operator の鍵が無いため afx ctl status は使えません)"
 
 
+def _root_line(root: Path | None) -> tuple[str, ...]:
+    return () if root is None else (f"root: {os.path.abspath(root)}",)
+
+
 def render_locked(locked_by: str, *, root: Path | None = None) -> str:
-    return "\n".join(("agentic-fx offline status", "instance: locked", f"locked-by: {locked_by}",
-                      _NOTE, f"next: {_locked_next(root, locked_by)}")) + "\n"
+    return "\n".join(("agentic-fx offline status", *_root_line(root), "instance: locked",
+                      f"locked-by: {locked_by}", _NOTE,
+                      f"next: {_locked_next(root, locked_by)}")) + "\n"
 
 
 @dataclass(frozen=True)
@@ -346,8 +351,9 @@ def collect_status(root: Path, *, run: Callable[..., Any] = subprocess.run,
                                             activity_bad, pending_bad)))
 
 
-def render_status(data: StatusData) -> str:
-    lines = ["agentic-fx offline status", f"instance: {data.instance}", f"setup: {data.setup}",
+def render_status(data: StatusData, *, root: Path | None = None) -> str:
+    lines = ["agentic-fx offline status", *_root_line(root), f"instance: {data.instance}",
+             f"setup: {data.setup}",
              f"settings: {data.settings}",
              f"unit: afx.service={data.unit[0]} active={data.unit[1]} linger={data.unit[2]}"]
     lines.append("ops: bot=%s web=%s notify=%s marker=%s" % data.ops)
@@ -378,5 +384,5 @@ def main(root: Path, *, run: Callable[..., Any] = subprocess.run) -> int:
         print(render_locked(_locked_by(root), root=root), end="")
         return 0
     data = collect_status(root, run=run, instance=instance)
-    print(render_status(data), end="")
+    print(render_status(data, root=root), end="")
     return 1 if data.unavailable else 0

@@ -16,16 +16,18 @@ from agentic_fx import entry
 from agentic_fx.entry import main as entry_main
 
 
-TOP_HELP = """usage: afx [-h] [--daemon] {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin} ...
+TOP_HELP = """usage: afx [-h] [--daemon] [--root DIR]
+           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
     ops                 [下位操作ごと] bot / web / notify の有効化・無効化・再設定・状態表示
+    completion          [読取] シェル補完スクリプトの出力
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
@@ -36,6 +38,7 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --daemon              systemd 用 (コマンド受付なし)
+  --root DIR            作業 root (未指定なら AFX_ROOT、無ければ上位の config/settings.yaml)
 
 実行レーン:
   afx <sub>      daemon を介さない。停止中でも実行できる
@@ -74,6 +77,21 @@ options:
   afx ops web reconfigure         [変更] afx に触れずに設定を変える (別名 reconf)
 
 旧形 `afx ops enable|disable|status <feature>` は 0.2.0 だけ受け付け、0.3.0 で削除する。
+"""
+
+COMPLETION_HELP = """usage: afx completion [-h] {bash} ...
+
+シェル補完スクリプトの出力
+
+positional arguments:
+  {bash}
+    bash      [読取] bash の補完スクリプトを出力する
+
+options:
+  -h, --help  show this help message and exit
+
+操作:
+  afx completion bash  [読取] bash の補完スクリプトを出力する
 """
 
 CTL_HELP = """usage: afx ctl [--as operator|approver] <操作>
@@ -130,6 +148,7 @@ def _captured_help(argv: list[str], capsys) -> str:
 def test_public_help_matches_the_surface_golden(capsys):
     assert _captured_help(["--help"], capsys) == TOP_HELP
     assert _captured_help(["ops", "--help"], capsys) == OPS_HELP
+    assert _captured_help(["completion", "--help"], capsys) == COMPLETION_HELP
     assert entry_main(["ctl", "help"]) == 0
     assert capsys.readouterr().out == CTL_HELP
 
@@ -340,7 +359,7 @@ def test_exposure_is_explicit_and_never_inferred():
 
 _FIXED_WIDTH_HELPS = (
     ["--help"], ["ops", "--help"], ["ops", "bot", "--help"], ["ops", "web", "--help"],
-    ["ops", "notify", "--help"], ["history", "--help"], ["plugin", "--help"],
+    ["ops", "notify", "--help"], ["completion", "--help"], ["history", "--help"], ["plugin", "--help"],
     ["backtest", "--help"], ["analyze", "--help"],
 )
 
@@ -389,6 +408,15 @@ def test_top_overview_rows_follow_the_records():
     assert rows["導入・接続管理"].split() == [
         "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "—"]
     assert "history" not in "".join(rows.values())
+    assert "completion" not in "".join(rows.values())
+
+
+def test_a_record_kept_out_of_the_overview_still_appears_in_the_positional_list():
+    record = next(r for r in cli_surface.COMMANDS if r.command == "completion bash")
+    assert record.overview is False and record.exposed is True
+    assert "completion" in cli_surface.parser_help("completion") or cli_surface.parser_help("completion")
+    shown = cli_surface.SurfaceRenderer(cli_surface.COMMANDS).render_top_epilog()
+    assert "completion" not in shown
 
 
 def test_top_overview_survives_an_empty_record_set():
@@ -539,7 +567,7 @@ def test_every_exposed_local_record_has_one_argparse_node_and_no_other_node_exis
     expected = set()
     for record in cli_surface.COMMANDS:
         if record.lane is cli_surface.Lane.LOCAL and record.exposed:
-            expected.update(f"afx {path}" for path in cli_surface._expand(record))
+            expected.update(f"afx {path}" for path in cli_surface.expand_command(record))
     expected |= {f"afx {parent.command}" for parent in cli_surface.PARENTS
                  if not parent.command.startswith("ctl ") and parent.command != "ctl"}
     exceptions = {"afx ctl"}  # `afx ctl` is handed to the client before argparse; only its help row is registered

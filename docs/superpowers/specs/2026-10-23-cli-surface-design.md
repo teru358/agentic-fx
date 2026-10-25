@@ -213,16 +213,18 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 formatter の幅を 100 に固定し、stdout 全体を次の byte 列と一致させる。本節以降のすべての help golden test は、実行前に `FORCE_COLOR`、`NO_COLOR`、`PYTHON_COLORS`、`TERM` など色に関わる環境変数を消して実行する。golden は TTY に出さず、`parser.format_help()` の戻り値 (stdout への書き出しを伴わない) と、`--help` 実行は pytest の capture (非 TTY の pipe) で取る。Python 3.13 の argparse は `color` 引数を受けないため、`sys.version_info >= (3, 14)` のときだけ `color=False` を渡し、3.13 では渡さない。test はこの 2 条件 (非 TTY と条件付き `color=False`) の両方を満たした上で byte 一致を要求する。左レーンの親 command にもラベルを付け、副作用が下位操作ごとに異なる場合は `[下位操作ごと]` とする。ラベルは positional 一覧にだけ付け、末尾の「用途」表には左右どちらの列にも付けない。各 `afx <sub> --help` では葉操作ごとに `[読取]` / `[変更]` / `[確認]` と condition を出す。全角を 2 桁、`—` を 1 桁で数えて、どの行も 100 桁以内に収める。
 
 ```text
-usage: afx [-h] [--daemon] {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin} ...
+usage: afx [-h] [--daemon] [--root DIR]
+           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
     ops                 [下位操作ごと] bot / web / notify の有効化・無効化・再設定・状態表示
+    completion          [読取] シェル補完スクリプトの出力
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
@@ -233,6 +235,7 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --daemon              systemd 用 (コマンド受付なし)
+  --root DIR            作業 root (未指定なら AFX_ROOT、無ければ上位の config/settings.yaml)
 
 実行レーン:
   afx <sub>      daemon を介さない。停止中でも実行できる
@@ -312,6 +315,24 @@ options:
 `afx ops notify --help` は 1 行目が `usage: afx ops notify [-h] {enable,disable,status} ...` である以外、bot と同じ byte 列とする。
 
 この 4 つの golden は本 release の固定値であり、I1 の実装状態で変えない。§3.1 の `implemented` / `exposed` の値と一体で固定する。bot / notify に `reconfigure` の本体を足すときは、record と golden を同じ変更で改訂する。
+
+`afx completion --help` の stdout 全体を次の byte 列と一致させる。
+
+```text
+usage: afx completion [-h] {bash} ...
+
+シェル補完スクリプトの出力
+
+positional arguments:
+  {bash}
+    bash      [読取] bash の補完スクリプトを出力する
+
+options:
+  -h, --help  show this help message and exit
+
+操作:
+  afx completion bash  [読取] bash の補完スクリプトを出力する
+```
 
 ### 3.2.2 help に出す条件
 
@@ -672,10 +693,11 @@ probe の結果は次の 3 語で出す。
 
 lock file や親 directory は作らない。判定前後の状態変化を含む TOCTOU はゼロと主張せず、「観測時点」固定文を locked / free / unknown のすべてで出す。
 
-`instance: locked` のときは次の 5 行だけを出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。
+`instance: locked` のときは次の 6 行だけを出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。
 
 ```text
 agentic-fx offline status
+root: <absolute path>
 instance: locked
 locked-by: <setup|enroll:<feature>|enroll:<feature>+setup|unknown (daemon 稼働中とみられる)>
 note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
@@ -731,6 +753,7 @@ setup、settings、DB、state、ops、unit、activity、plugin はそれぞれ�
 
 ```text
 agentic-fx offline status
+root: <absolute path>
 instance: free
 setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
@@ -852,7 +875,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-15 | `policy remove <id>` は該当 DB row だけを消し、DB の全 row から ID marker 付き block を file 末尾に再生成し、marker 外の手書き / legacy / 不正 marker を byte 保存し、成功時だけ固定 activity を 1 件残す。`ops_requests` の phase は `accepted` と `succeeded` の 2 行だけで、CHECK 制約の 4 値以外を書かない | DB / file / audit / activity の before-after |
 | AC-16 | (a) remove の同一 idempotency key 再送は保存済みの応答を返す。(b) DELETE commit 後の file replace 例外は、`ops_requests` に phase=`outcome_unknown` の終端行を書き、`outcome_unknown` を応答する。(c) DELETE commit 後・replace 前の hard crash を fault injection し、再起動で `recover_after_journal()` がその要求を `outcome_unknown` にし、file が DB 正本へ収束する。(d) managed が 1 件だけの状態でその 1 件を remove し、同じ位置で crash しても、再起動後の file に block が残らない (DB 0 行でも reconcile が走る)。(e) (b) の後に別 key で同じ ID を remove すると、`not_found` を返す前に file が収束し、先頭 reconcile が直した場合の `policy_reconciled` activity は残る。daemon は再起動しない。(f) 別 key で削除済みの正の整数 ID を送ると、API は `not_found` を返し、先頭 reconcile が unchanged なら DB / file / activity は変わらない。`0`、負数、非数値 (`abc`、`1.5`、空文字) は client の parse で API 接続前に rc=2 となり、鍵の読込と接続は 0 回である。(g) (b) の後の file に AC-13 の (i)〜(iii) の変異を重ねても、別 key の remove の先頭 reconcile で canonical 列へ収束する。(h) 起動時 reconcile が例外でも `SYSTEM policy_reconcile_failed` と技術ログを残して listener は開き、`recover_after_journal()` の失敗だけが listener を妨げる | replace fault、crash child、再起動 recovery、listener、API と client parse |
 | AC-17 | principal × scope / 新 endpoint が §5.5 と一致する。`guidance.read` は operator / approver だけが持ち、ops-web / ops-bot / ops-notify は backlog / policy 自由文を取得できない。remove と reconcile も operator / approver だけが通る | principal × scope × endpoint の直積 test |
-| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 5 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
+| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 6 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
 | AC-19 | `instance: free` で setup=`ok / missing / corrupt`、settings=`ok / missing / invalid`、主要 file 不在を固定語で出す。どの source が不良でも残りの collector と pending steps を表示する | source 直積 fixture |
 | AC-20 | DB が ok / missing / corrupt、各 table が present / absent の場合に `ok / missing / unavailable`、mission、approval 件数、deploy op 件数を固定形で出す。DB を作成・migration せず、DB collector の失敗で settings / unit / ops / activity の表示を抑止しない | FS / sqlite fixture の直積 |
 | AC-21 | instance lock の shared lock は probe の 1 回だけ取り、state を読む前に解放されている。state は `data/state/app_state.json.lock` を `O_RDONLY` で開いて shared で読み、clear / latched / markerあり / missing / corrupt を出す。lock file 不在は lock なしで読み、lock file を作らない。`app_state.json.lock` が 1 秒排他保持されたままなら `unavailable` になる。`StateStore.load()` / `_shared()` は呼ばず、`instance: unknown` では state を読まない | flock fixture、state-reader spy、open flag の記録 |
@@ -953,10 +976,12 @@ ops lane の 1 node `tests/ops/test_ac09_25_26_decision_lane.py::test_shell_poli
 
 1. 最上位 option `--root <dir>` (`--daemon` と同じく subcommand より前に置く。argv shim の head 計算は `--root <dir>` の 2 token を `--daemon` と同様に前置きとして数える)。
 2. 環境変数 `AFX_ROOT`。
-3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。symlink は辿らず、`/` まで見る。
-4. どれも無ければ `Path.cwd()` (初回の `afx init` はここに落ちる)。
+3. `Path.cwd()` とその親を順に見て、最初に `config/settings.yaml` を持つ directory。親は与えられた path の字句上の親で (`resolve()` しない)、`/` まで見る。`config` や `settings.yaml` が symlink でも、辿った先が directory / regular file なら root と数える (辿れない symlink は数えない)。
+4. どれも無ければ `Path.cwd()`。
 
-1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
+3 の上方探索は、既存 root を対象にする操作 (`status`、`check`、`keys`、`ops`、`history`、`backtest`、`analyze`、`plugin`、`ctl`) にだけ適用する。**`afx init` と `--daemon` は探索せず**、1 → 2 → cwd で決める (空の sub directory で `afx init` を打ったとき親の root を書き換えないため。daemon は unit の `WorkingDirectory` が root)。探索は、候補 directory の所有者が実行 uid と異なる時点で止めて cwd に落とす (`/tmp` のような共有 directory に置かれた偽の `config/settings.yaml` を root と見ないため)。採用した root が cwd と違うときは、`afx status` の `root:` 行以外では表示しない。
+
+1 と 2 で指定された path が directory でなければ `afx: --root <dir> は directory ではありません` / `afx: AFX_ROOT=<dir> は directory ではありません` (`<dir>` は指定された文字列そのまま) を stderr に出して rc=2 とし、何も書かない。解決した root は `afx status` の 1 行目 `agentic-fx offline status` の直後に `root: <absolute path>` として出す (§6.3 の golden に 1 行加える。locked の 5 行形も 6 行になる)。他の subcommand は表示しない。
 
 ### 13.2 PATH への配置
 
@@ -964,7 +989,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 
 ### 13.3 bash 補完
 
-`afx completion bash` を導入・接続管理の群に `[読取]` で足す (usage `afx completion bash`、summary `bash の補完スクリプトを出力する`、daemon 不要、何も書かない)。stdout に bash の補完スクリプトを出し、利用者は `.bashrc` に `eval "$(afx completion bash)"` を書く。`bash` 以外の shell 名は `afx: 補完は bash だけです` で rc=2。
+`afx completion bash` を導入・接続管理の群に `[読取]` で足す (usage `afx completion bash`、summary `bash の補完スクリプトを出力する`、daemon 不要、何も書かない)。stdout に bash の補完スクリプトを出し、利用者は生成物を bash-completion の利用者 directory に置く (`afx completion bash > ~/.local/share/bash-completion/completions/afx`。bash-completion が遅延読込する。無い環境では `.bashrc` に `eval "$(afx completion bash)"` でもよいが、shell 起動ごとに afx を起動する)。生成物の関数は `local IFS=' '` で語の結合を固定する。`bash` 以外の shell 名は `afx: 補完は bash だけです` で rc=2。
 
 スクリプトは `cli_surface.py` の record から決定論的に生成する。候補は次のとおりで、planned と非公開 (`exposed=False`)、互換別名、廃止名は含めない。
 
@@ -987,7 +1012,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | AC-46 | 実 bash で `afx ct` → `ctl`、`afx ctl pol` → `policy`、`afx ctl policy ` → 4 語、`afx ops w` → `web`、`afx ops web ` → `enable disable reconfigure status`、`afx ops bot ` に `reconfigure` が無い、`afx ctl --as ` → `operator approver`、`afx completion ` → `bash` | subprocess bash + COMP_WORDS |
 | AC-47 | `afx completion zsh` は rc=2 で固定文、stdout 空。`afx completion bash` は file / DB / lock を作らない | rc、stderr、tree zero-write |
 
-§3.2 / §3.2.1 / §3.3 の golden は `--root` と `completion` の追加で変わる。更新後の全文は I1 と同じ検査条件 (非 TTY、色なし、幅 100、全行 100 桁以内) で実装の出力を写し、本節の v0.5s 改訂で §3.2 に反映する。ops-api 文書の原則節と `first-run-acceptance.md` にも `completion bash` を足す (doc test (c) の正式名は 9 つのまま。`completion` は正所属の表にだけ出す)。
+§3.2 / §3.2.1 / §3.3 の golden は `--root` と `completion` の追加で変わる。更新後の全文は I1 と同じ検査条件 (非 TTY、色なし、幅 100、全行 100 桁以内) で実装の出力を写し、本節の v0.5s 改訂で §3.2 に反映する。ops-api 文書の原則節と `first-run-acceptance.md` にも `completion bash` を足す (doc test (c) の正式名は 9 つのまま)。`afx --help` 末尾の用途表は運用操作の一覧であり、補完の導入語 `completion` は positional 一覧にだけ出して用途表には載せない (record の `overview=False`。載せると「稼働観測・実行追跡」行が 100 桁を超える)。
 
 ## 11. 後続と非目標
 
@@ -1043,3 +1068,4 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | 2026-10-25 | v0.5q | §6.3 の `next` の start 条件に active の語 (inactive / failed / unknown) を加える | A2 是正 2 (sonnet) の指摘: is-active の語を増やしたので start を勧める条件が要る | |
 | 2026-10-25 | v0.5r | §5.3.4: 方針文の失敗は課題の入力へ続く、本文検査を先頭 reconcile の前に、上限は `POLICY_TEXT_LIMIT` 1 定数、file 側の重複判定を行単位完全一致に、空メッセージ例外は `__cause__`、案内文は正式名 | B2c merge 後の /code-review 8 件 (採用 6 / 却下 2、裁定 tmp/review-cli/reports/b2c/b2c-cr2-rulings.md) | |
 | 2026-10-25 | v0.5s | §13 新設: root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd)、`uv tool install` による PATH 配置の文書化、`afx completion bash` (record から生成、bash のみ)、AC-44〜47。§3.2 等の golden は実装出力を写して改訂する | チケット afx-on-path-and-root-resolution (ユーザー裁定 2026-10-25: 優先 中、補完は静的生成の案 2) | |
+| 2026-10-25 | v0.5t | §13.1: 上方探索は init と --daemon に適用しない、所有者が異なる directory で探索を止める、エラー文は指定値を含む、symlink の marker は辿った先で判定。§13.3: 生成物は bash-completion の利用者 directory へ、`local IFS`。§13.4: completion は用途表に載せない (100 桁) | afx-path /code-review high 8 件 (採用 7 / 却下 1 = zsh の固定文は spec どおり) と指揮者検収 3 件 | |

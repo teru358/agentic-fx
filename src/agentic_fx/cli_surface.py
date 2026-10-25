@@ -58,6 +58,7 @@ class CommandRecord:
     ctl_text: str | None = None
     ctl_fold: str = ""
     overview_term: str | None = None
+    overview: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +103,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
             classified: bool = True, implemented: bool = True, exposed: bool = False,
             planned: bool = False, deprecated_since: str | None = None,
             remove_in: str | None = None, ctl_text: str | None = None, ctl_fold: str = "",
-            overview_term: str | None = None) -> CommandRecord:
+            overview_term: str | None = None, overview: bool = True) -> CommandRecord:
     return CommandRecord(
         group=group,
         group_order=(tuple(Group).index(group) + 1) if group is not None else None,
@@ -131,6 +132,7 @@ def _record(group: Group | None, lane: Lane, command: str, usage: str, label: La
         ctl_text=ctl_text,
         ctl_fold=ctl_fold,
         overview_term=overview_term,
+        overview=overview,
     )
 
 
@@ -173,6 +175,8 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops status", "afx ops <bot|web|notify> status", Label.READ,
             "durable stage を表示する", "entry.py", exposed=True),
+    _record(Group.SETUP, Lane.LOCAL, "completion bash", "afx completion bash", Label.READ,
+            "bash の補完スクリプトを出力する", "completion.py", exposed=True, overview=False),
     _record(Group.SETUP, Lane.CTL, "ctl whoami", "afx ctl whoami", Label.READ,
             "認証した principal を表示する", "ops/client.py", shell_usage=None,
             scope="status.read", endpoint_code="whoami", daemon_required=True, exposed=True),
@@ -451,6 +455,7 @@ class ParentRecord:
 PARENTS: tuple[ParentRecord, ...] = (
     ParentRecord("check", "設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)"),
     ParentRecord("keys", "操作 API の鍵管理 (停止中のみ)"),
+    ParentRecord("completion", "シェル補完スクリプトの出力"),
     ParentRecord("ops", "bot / web / notify の有効化・無効化・再設定・状態表示"),
     ParentRecord("ops bot", "操作 bot (ops-bot)", labeled=False),
     ParentRecord("ops web", "web 表示 (ops-web)", labeled=False),
@@ -485,7 +490,7 @@ def _labels(record: CommandRecord) -> str:
     return " ".join(values)
 
 
-def _expand(record: CommandRecord) -> tuple[str, ...]:
+def expand_command(record: CommandRecord) -> tuple[str, ...]:
     """Concrete command paths a record answers to (feature-generic ops verbs fan out)."""
     if record.command in _OPS_GENERIC:
         verb = record.command.split(" ", 1)[1]
@@ -493,10 +498,14 @@ def _expand(record: CommandRecord) -> tuple[str, ...]:
     return (record.command,)
 
 
+def _display_width(text: str) -> int:
+    """Display width in which fullwidth and wide characters take two columns."""
+    return sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in text)
+
+
 def _pad(text: str, width: int) -> str:
-    """Pad to a display width in which fullwidth and wide characters take two columns."""
-    used = sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in text)
-    return text + " " * max(width - used, 1)
+    """Pad to a display width; fullwidth and wide characters take two columns."""
+    return text + " " * max(width - _display_width(text), 1)
 
 
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -526,7 +535,7 @@ class SurfaceRenderer:
         children: dict[str, list[CommandRecord]] = {}
         for record in self._visible:
             by_usage.setdefault(record.usage, record)
-            for path in _expand(record):
+            for path in expand_command(record):
                 by_path.setdefault(path, []).append(record)
                 words = path.split(" ")
                 for size in range(1, len(words)):
@@ -554,12 +563,12 @@ class SurfaceRenderer:
         return "agentic-fx"
 
     def render_top_epilog(self) -> str:
-        columns = (25, 27)
         rows = [("用途", "daemon 不要", "稼働 daemon")]
         for group in Group:
             local, ctl = self._lane_terms(group, Lane.LOCAL), self._lane_terms(group, Lane.CTL)
             rows.append((group.value, " / ".join(local) or "—",
                          ("ctl " + " / ".join(ctl)) if ctl else "—"))
+        columns = tuple(max(_display_width(row[index]) for row in rows) + 2 for index in (0, 1))
         table = [_pad(first, columns[0]) + _pad(second, columns[1]) + third
                  for first, second, third in rows]
         return (
@@ -574,7 +583,7 @@ class SurfaceRenderer:
         """Command words a group lists for one lane, in record order without repeats."""
         terms: list[str] = []
         for record in self._visible:
-            if record.group is not group or record.lane is not lane:
+            if record.group is not group or record.lane is not lane or not record.overview:
                 continue
             words = record.command.split(" ")
             term = record.overview_term or (words[1] if lane is Lane.CTL else words[0])
