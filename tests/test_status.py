@@ -54,6 +54,19 @@ def test_render_locked_status_is_exact_five_lines():
     )) + "\n"
 
 
+def test_render_locked_status_with_a_root_is_six_lines_with_the_root_second(tmp_path):
+    lines = status.render_locked("setup", root=tmp_path).splitlines()
+    assert len(lines) == 6
+    assert lines[:3] == ["agentic-fx offline status", f"root: {tmp_path}", "instance: locked"]
+
+
+def test_free_status_prints_the_root_after_the_title(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(status, "default_unit_dir", lambda: tmp_path / "unit")
+    status.main(tmp_path, run=lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout=""))
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == ["agentic-fx offline status", f"root: {tmp_path}"]
+
+
 def test_locked_by_prefers_enroll_and_uses_unknown_for_an_invalid_marker(tmp_path):
     enroll = tmp_path / "data" / "ops" / "enroll_in_progress"
     enroll.parent.mkdir(parents=True)

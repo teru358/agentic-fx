@@ -213,16 +213,18 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 formatter の幅を 100 に固定し、stdout 全体を次の byte 列と一致させる。本節以降のすべての help golden test は、実行前に `FORCE_COLOR`、`NO_COLOR`、`PYTHON_COLORS`、`TERM` など色に関わる環境変数を消して実行する。golden は TTY に出さず、`parser.format_help()` の戻り値 (stdout への書き出しを伴わない) と、`--help` 実行は pytest の capture (非 TTY の pipe) で取る。Python 3.13 の argparse は `color` 引数を受けないため、`sys.version_info >= (3, 14)` のときだけ `color=False` を渡し、3.13 では渡さない。test はこの 2 条件 (非 TTY と条件付き `color=False`) の両方を満たした上で byte 一致を要求する。左レーンの親 command にもラベルを付け、副作用が下位操作ごとに異なる場合は `[下位操作ごと]` とする。ラベルは positional 一覧にだけ付け、末尾の「用途」表には左右どちらの列にも付けない。各 `afx <sub> --help` では葉操作ごとに `[読取]` / `[変更]` / `[確認]` と condition を出す。全角を 2 桁、`—` を 1 桁で数えて、どの行も 100 桁以内に収める。
 
 ```text
-usage: afx [-h] [--daemon] {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin} ...
+usage: afx [-h] [--daemon] [--root DIR]
+           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
     ops                 [下位操作ごと] bot / web / notify の有効化・無効化・再設定・状態表示
+    completion          [読取] シェル補完スクリプトの出力
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
@@ -233,13 +235,14 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   --daemon              systemd 用 (コマンド受付なし)
+  --root DIR            作業 root (未指定なら AFX_ROOT、無ければ上位の config/settings.yaml)
 
 実行レーン:
   afx <sub>      daemon を介さない。停止中でも実行できる
   afx ctl <op>   稼働 daemon の認証・監査つき操作 API
 
 用途                     daemon 不要                稼働 daemon
-導入・接続管理           init / check / keys / ops  ctl whoami
+導入・接続管理           init / check / keys / ops / completion ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
 市場入力を整える         history                    —
 調査・評価する           backtest / analyze         —
@@ -312,6 +315,24 @@ options:
 `afx ops notify --help` は 1 行目が `usage: afx ops notify [-h] {enable,disable,status} ...` である以外、bot と同じ byte 列とする。
 
 この 4 つの golden は本 release の固定値であり、I1 の実装状態で変えない。§3.1 の `implemented` / `exposed` の値と一体で固定する。bot / notify に `reconfigure` の本体を足すときは、record と golden を同じ変更で改訂する。
+
+`afx completion --help` の stdout 全体を次の byte 列と一致させる。
+
+```text
+usage: afx completion [-h] {bash} ...
+
+シェル補完スクリプトの出力
+
+positional arguments:
+  {bash}
+    bash      [読取] bash の補完スクリプトを出力する
+
+options:
+  -h, --help  show this help message and exit
+
+操作:
+  afx completion bash  [読取] bash の補完スクリプトを出力する
+```
 
 ### 3.2.2 help に出す条件
 
@@ -672,10 +693,11 @@ probe の結果は次の 3 語で出す。
 
 lock file や親 directory は作らない。判定前後の状態変化を含む TOCTOU はゼロと主張せず、「観測時点」固定文を locked / free / unknown のすべてで出す。
 
-`instance: locked` のときは次の 5 行だけを出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。
+`instance: locked` のときは次の 6 行だけを出し、DB、state file、activity log の詳細を読まない。終了コードは 0 とする。
 
 ```text
 agentic-fx offline status
+root: <absolute path>
 instance: locked
 locked-by: <setup|enroll:<feature>|enroll:<feature>+setup|unknown (daemon 稼働中とみられる)>
 note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。
@@ -731,6 +753,7 @@ setup、settings、DB、state、ops、unit、activity、plugin はそれぞれ�
 
 ```text
 agentic-fx offline status
+root: <absolute path>
 instance: free
 setup: <ok|missing|corrupt>
 settings: <ok|missing|invalid>
@@ -852,7 +875,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-15 | `policy remove <id>` は該当 DB row だけを消し、DB の全 row から ID marker 付き block を file 末尾に再生成し、marker 外の手書き / legacy / 不正 marker を byte 保存し、成功時だけ固定 activity を 1 件残す。`ops_requests` の phase は `accepted` と `succeeded` の 2 行だけで、CHECK 制約の 4 値以外を書かない | DB / file / audit / activity の before-after |
 | AC-16 | (a) remove の同一 idempotency key 再送は保存済みの応答を返す。(b) DELETE commit 後の file replace 例外は、`ops_requests` に phase=`outcome_unknown` の終端行を書き、`outcome_unknown` を応答する。(c) DELETE commit 後・replace 前の hard crash を fault injection し、再起動で `recover_after_journal()` がその要求を `outcome_unknown` にし、file が DB 正本へ収束する。(d) managed が 1 件だけの状態でその 1 件を remove し、同じ位置で crash しても、再起動後の file に block が残らない (DB 0 行でも reconcile が走る)。(e) (b) の後に別 key で同じ ID を remove すると、`not_found` を返す前に file が収束し、先頭 reconcile が直した場合の `policy_reconciled` activity は残る。daemon は再起動しない。(f) 別 key で削除済みの正の整数 ID を送ると、API は `not_found` を返し、先頭 reconcile が unchanged なら DB / file / activity は変わらない。`0`、負数、非数値 (`abc`、`1.5`、空文字) は client の parse で API 接続前に rc=2 となり、鍵の読込と接続は 0 回である。(g) (b) の後の file に AC-13 の (i)〜(iii) の変異を重ねても、別 key の remove の先頭 reconcile で canonical 列へ収束する。(h) 起動時 reconcile が例外でも `SYSTEM policy_reconcile_failed` と技術ログを残して listener は開き、`recover_after_journal()` の失敗だけが listener を妨げる | replace fault、crash child、再起動 recovery、listener、API と client parse |
 | AC-17 | principal × scope / 新 endpoint が §5.5 と一致する。`guidance.read` は operator / approver だけが持ち、ops-web / ops-bot / ops-notify は backlog / policy 自由文を取得できない。remove と reconcile も operator / approver だけが通る | principal × scope × endpoint の直積 test |
-| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 5 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
+| AC-18 | `afx status` は instance lock が排他保持されているとき §6.1 の `instance: locked` の 6 行だけを出し、DB / state / log reader を呼ばない。`locked-by` は setup marker / enroll marker / 両方 (enroll が先) / 読めない enroll marker / どちらも無い、の各場合に §6.1 の語になり、`next` は §6.1 の表どおりになる。どちらの marker も無く鍵 file も無いときは `next` が `journalctl --user -u afx.service …` になる。marker と鍵は作成・変更しない | exclusive lock holder fixture、marker 直積、鍵有無、spy |
 | AC-19 | `instance: free` で setup=`ok / missing / corrupt`、settings=`ok / missing / invalid`、主要 file 不在を固定語で出す。どの source が不良でも残りの collector と pending steps を表示する | source 直積 fixture |
 | AC-20 | DB が ok / missing / corrupt、各 table が present / absent の場合に `ok / missing / unavailable`、mission、approval 件数、deploy op 件数を固定形で出す。DB を作成・migration せず、DB collector の失敗で settings / unit / ops / activity の表示を抑止しない | FS / sqlite fixture の直積 |
 | AC-21 | instance lock の shared lock は probe の 1 回だけ取り、state を読む前に解放されている。state は `data/state/app_state.json.lock` を `O_RDONLY` で開いて shared で読み、clear / latched / markerあり / missing / corrupt を出す。lock file 不在は lock なしで読み、lock file を作らない。`app_state.json.lock` が 1 秒排他保持されたままなら `unavailable` になる。`StateStore.load()` / `_shared()` は呼ばず、`instance: unknown` では state を読まない | flock fixture、state-reader spy、open flag の記録 |

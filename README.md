@@ -15,6 +15,8 @@ uv run afx init
 
 `afx init` が設定、user unit の設置、起動後確認までを案内します。やり直すときは `scripts/first-run-reset.sh` を使ってください。
 
+どのディレクトリからも `afx` を打てるようにするには、clone 先で `uv tool install --editable <clone 先のパス>` を実行します (`~/.local/bin/afx` ができます。PATH に無いときは `uv tool update-shell`)。bash の補完は `~/.bashrc` に `eval "$(afx completion bash)"` を足すと効きます。作業 root は `--root <dir>`、環境変数 `AFX_ROOT`、今いる場所とその親の `config/settings.yaml` の順で決まります。詳しくは [初回起動の手順書](docs/operations/first-run-acceptance.md) を参照してください。
+
 日常の確認は `afx ctl status` から始めます。操作 API の運用は [操作 API と afx ctl の運用](docs/operations/ops-api-2026-10-09.md) を参照してください。
 
 設計は [全体設計](docs/superpowers/specs/2026-07-25-agentic-fx-design.md) と [初期設定ウィザード設計](docs/superpowers/specs/2026-10-12-first-run-wizard-design.md) にあります。秘密は `.env` のみに置きます。Anthropic API の従量課金は使いません。

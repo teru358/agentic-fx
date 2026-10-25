@@ -7,6 +7,35 @@
 
 設計の正は [初回起動ウィザード設計](../superpowers/specs/2026-10-12-first-run-wizard-design.md) です。ウィザードの文面はこの文書に引用していますが、食い違ったら実際の画面 (`src/agentic_fx/setup/wizard.py`) が正です。
 
+## afx コマンドの導入 (PATH・root・補完)
+
+`uv sync` が作る `afx` は `.venv/bin/afx` にだけ置かれます。どのディレクトリからでも打てるように、clone 先で次を一度実行します。
+
+```
+uv tool install --editable <clone 先のパス>
+```
+
+`~/.local/bin/afx` ができます。`~/.local/bin` が PATH に無いときは、次を実行してシェルを開き直します。
+
+```
+uv tool update-shell
+```
+
+bash の補完は `~/.bashrc` に次の 1 行を足すと効きます。
+
+```
+eval "$(afx completion bash)"
+```
+
+`afx` が使う root (`config/` や `data/` を持つディレクトリ) は、次の順で決まります。
+
+1. 最上位 option `--root <dir>` (例 `afx --root ~/agentic-fx status`)
+2. 環境変数 `AFX_ROOT`
+3. 今いるディレクトリとその親のうち、最初に `config/settings.yaml` を持つもの (シンボリックリンクは辿りません)
+4. 見つからなければ今いるディレクトリ (初回の `afx init` はここに落ちます)
+
+`--root` と `AFX_ROOT` にディレクトリでないものを渡すと、何も書かずに終了コード 2 で止まります。解決した root は `afx status` の 2 行目 `root:` に表示されます。常駐サービス (`afx.service`) の定義はこの導入で変わりません。
+
 ## 目次
 
 1. 前提: OS と実行環境
@@ -137,12 +166,13 @@ uv run afx init
 
    backend の実往復は、使う backend を明示して `afx check backend --backend <local|claude|codex|opencode> [--provider chatgpt]` で確認します。接続できれば backend の確認結果が出て rc=0、未導入・未認証・隔離不適合なら固定 reason と次の手順が出ます。
 
-   停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは詳細を読まず、稼働 daemon の状態が必要なら `afx ctl status` を使います。
+   停止中の root を調べるときは `afx status` を使います。期待する先頭は `agentic-fx offline status` で、2 行目の `root:` は解決した root です。`instance:` は `locked`、`free`、`unknown` のいずれかです。`locked` のときは詳細を読まず、稼働 daemon の状態が必要なら `afx ctl status` を使います。
 
    `instance: free` のときの出力は次の行の並びで、各 `<...>` はそのときの観測値です。`instance: unknown` でも同じ形で、`state:` だけが `mode=unavailable kill_switch=unavailable` になります。`unavailable` の節が 1 つでもあれば rc 1、それ以外は rc 0 です。
 
    ```
    agentic-fx offline status
+   root: <絶対パス>
    instance: free
    setup: <ok|missing|corrupt>
    settings: <ok|missing|invalid>
@@ -162,10 +192,11 @@ uv run afx init
 
    初期設定の記録が無い空の root では、`setup: missing`、`settings: missing`、`database: missing`、`recent mission: none`、`plugin deploy ops: none`、`recent activity: none` となり、`pending steps:` の下に `afx init` の再実行を促す 1 行が出て、`next: afx init` で終わります。
 
-   `instance: locked` のときは詳細を読まず、次の 5 行だけを出して rc 0 で終わります。
+   `instance: locked` のときは詳細を読まず、次の 6 行だけを出して rc 0 で終わります。
 
    ```
    agentic-fx offline status
+   root: <絶対パス>
    instance: locked
    locked-by: <setup|enroll:<feature>|enroll:<feature>+setup|enroll:unknown|unknown (daemon 稼働中とみられる)>
    note: この表示は観測時点の情報です。複数データ源の原子的 snapshot ではありません。

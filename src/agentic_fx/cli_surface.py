@@ -173,6 +173,8 @@ _BASE_COMMANDS: tuple[CommandRecord, ...] = (
             "afx に触れずに設定を変える", "ops_setup", implemented=False),
     _record(Group.SETUP, Lane.LOCAL, "ops status", "afx ops <bot|web|notify> status", Label.READ,
             "durable stage を表示する", "entry.py", exposed=True),
+    _record(Group.SETUP, Lane.LOCAL, "completion bash", "afx completion bash", Label.READ,
+            "bash の補完スクリプトを出力する", "completion.py", exposed=True),
     _record(Group.SETUP, Lane.CTL, "ctl whoami", "afx ctl whoami", Label.READ,
             "認証した principal を表示する", "ops/client.py", shell_usage=None,
             scope="status.read", endpoint_code="whoami", daemon_required=True, exposed=True),
@@ -451,6 +453,7 @@ class ParentRecord:
 PARENTS: tuple[ParentRecord, ...] = (
     ParentRecord("check", "設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)"),
     ParentRecord("keys", "操作 API の鍵管理 (停止中のみ)"),
+    ParentRecord("completion", "シェル補完スクリプトの出力"),
     ParentRecord("ops", "bot / web / notify の有効化・無効化・再設定・状態表示"),
     ParentRecord("ops bot", "操作 bot (ops-bot)", labeled=False),
     ParentRecord("ops web", "web 表示 (ops-web)", labeled=False),

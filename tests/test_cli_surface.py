@@ -72,6 +72,7 @@ EXPECTED = (
     ('ops bot reconfigure', G.SETUP, "LOCAL", 'afx ops bot reconfigure', None, "CHANGE", False, False, None, None, False, None),
     ('ops notify reconfigure', G.SETUP, "LOCAL", 'afx ops notify reconfigure', None, "CHANGE", False, False, None, None, False, None),
     ('ops status', G.SETUP, "LOCAL", 'afx ops <bot|web|notify> status', None, "READ", False, False, None, None, False, None),
+    ('completion bash', G.SETUP, "LOCAL", 'afx completion bash', None, "READ", False, False, None, None, False, None),
     ('ctl whoami', G.SETUP, "CTL", 'afx ctl whoami', None, "READ", False, False, 'status.read', 'whoami', True, None),
     ('status', G.OBSERVE, "LOCAL", 'afx status', None, "READ", False, False, None, None, False, None),
     ('ctl status', G.OBSERVE, "CTL", 'afx ctl status', 'status', "READ", False, False, 'status.read', 'status', True, None),

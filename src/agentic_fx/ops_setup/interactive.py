@@ -113,8 +113,8 @@ def _normalize_reason_code(value: object) -> str:
     return "unknown"
 
 
-def _default_probe(feature: str) -> tuple[int, str]:
-    paths = resolve_ops_exec(OpsSetup(Path.cwd()).paths)
+def _default_probe(feature: str, root: Path) -> tuple[int, str]:
+    paths = resolve_ops_exec(OpsSetup(root).paths)
     return run_probe(str(paths.ops_exec), feature)
 
 
@@ -271,7 +271,7 @@ def _fail_quiet(failure: tuple[int, str]) -> EnableResult:
 
 
 def interactive_enable(root: Path, feature: str, *, lease: SetupLease | None = None,
-                       io: IO | None = None, probe_runner: Callable[[str], tuple[int, str]] = _default_probe,
+                       io: IO | None = None, probe_runner: Callable[[str], tuple[int, str]] | None = None,
                        setup_factory: Callable[[Path], OpsSetup] = OpsSetup,
                        keys_init: Callable[[], int] | None = None,
                        options: WebOptions | None = None,
@@ -282,6 +282,9 @@ def interactive_enable(root: Path, feature: str, *, lease: SetupLease | None = N
     root = Path(root).resolve()
     if io is None:
         io = ConsoleIO()
+    if probe_runner is None:
+        def probe_runner(feature: str) -> tuple[int, str]:
+            return _default_probe(feature, root)
     options = options if options is not None else WebOptions()
     if lease is not None:
         if lease.root != root or not lease.active:
