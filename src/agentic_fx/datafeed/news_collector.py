@@ -10,12 +10,10 @@ tz-aware UTC を強制する経路はそのまま素通しし、ここで naive 
 from __future__ import annotations
 
 import logging
-import sqlite3
 from datetime import datetime, timezone
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
-from agentic_fx.datafeed.default_sources import DEFAULT_SOURCES
 from agentic_fx.datafeed.fetchers import fetch_feed, fetch_web
 from agentic_fx.datafeed.news_probe import classify_failure
 from agentic_fx.store import fetch_attempts, news_health, news_sources
@@ -25,7 +23,7 @@ _log = logging.getLogger("agentic_fx.news")
 
 UNKNOWN_FETCHER_REASON = "未知の取得方式"
 
-__all__ = ["DEFAULT_SOURCES", "NewsCollector", "seed_default_sources"]
+__all__ = ["NewsCollector"]
 
 # 秘密抑止は datafeed/_safe_error.py の safe_error_text に一本化した
 # (Task 8)。collector は複数ソースの失敗を集約してログに残すため、ソース
@@ -35,40 +33,6 @@ __all__ = ["DEFAULT_SOURCES", "NewsCollector", "seed_default_sources"]
 # カレンダーが 3 つ目の複製先になる時点でその方針は割に合わない —
 # 抑止パターンを 1 箇所で更新できないと片側だけ古いままになる。
 
-
-def seed_default_sources(conn: sqlite3.Connection, now: datetime, *, commit: bool = True) -> int:
-    """DEFAULT_SOURCES のうち未登録 (name/url いずれも未登録) の分だけ INSERT する。
-
-    enabled=True, added_by="user" で登録する (素の clone でも即取り込み
-    対象になる)。冪等 — 既に name か url のどちらかが登録済みのものは
-    触らない (name/url の両方が UNIQUE 制約なので、片方だけ見て事前
-    チェックすると、name はそのままで url だけ差し替えた既存行 (例:
-    到達性確認の結果 nhk-keizai の url だけ修正した場合) に対して
-    再度 INSERT を試み、name の UNIQUE 制約で sqlite3.IntegrityError に
-    なり init 自体が落ちる)。
-
-    **修正ラウンド 1 (レビュー指摘)**: `existing_names`/`existing_urls` は
-    ループの中で都度更新する。ループ前の 1 回だけのスナップショットだと
-    `DEFAULT_SOURCES` **自体の中に** name/url の衝突があった場合に検知
-    できない (2 件目を挿入しようとする時点で、まだ「同じループで挿入した
-    1 件目」を知らないため)。あわせて `news_sources.list_all(conn)` は
-    1 回だけ呼ぶ (以前は existing_names/urls それぞれで 1 回ずつ、計 2 回
-    呼んでいた)。
-    """
-    existing = news_sources.list_all(conn)
-    existing_names = {s["name"] for s in existing}
-    existing_urls = {s["url"] for s in existing}
-    added = 0
-    for s in DEFAULT_SOURCES:
-        if s["name"] in existing_names or s["url"] in existing_urls:
-            continue
-        news_sources.add(conn, name=s["name"], fetcher=s["fetcher"],
-                         url=s["url"], added_by="user", now=now,
-                         enabled=True, commit=commit)
-        existing_names.add(s["name"])
-        existing_urls.add(s["url"])
-        added += 1
-    return added
 
 
 class NewsCollector:

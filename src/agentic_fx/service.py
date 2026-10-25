@@ -45,7 +45,7 @@ from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
-from agentic_fx.datafeed.news_collector import NewsCollector, seed_default_sources
+from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops import keys as ops_keys
@@ -646,9 +646,6 @@ def run_init(root: Path, *, config_file: Path | None = None) -> int:
         init_db(conn, root=root)
 
         clock = SystemClock()
-        seeded = seed_default_sources(conn, clock.now())
-        if seeded:
-            print(f"基本ニュースソースを {seeded} 件登録しました")
 
     # 価格ソースの接続確認。**DataUnhealthy は警告に留めて init は成功させる**
     # (オフライン環境でも初期化を完了できるようにする。データ不健全時に取引を
@@ -1258,10 +1255,6 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         if settings.notify.trade_events is True:
             # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
             trade_sink, trade_token = _start_trade_events(root, conn_core, settings, state, clock)
-        seeded = seed_default_sources(conn_core, clock.now())
-        if seeded:
-            activity.write(Category.NEWS, "sources_seeded",
-                           f"{seeded} default sources")
         # プラン 8 (codex C-5): 前回停止時に running のまま残った mission と、
         # それが claim していた signal を同一トランザクションで回収する。
         # 既存の signals.reclaim_expired (403-407 行付近、lease ベースの

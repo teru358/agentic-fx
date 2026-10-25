@@ -18,7 +18,6 @@ from agentic_fx.core.contracts import (
     Action, ConversionRate, Direction, EntryType, FixedClock, Horizon,
     InstrumentSpec, Origin, Quote, TradeIntent,
 )
-from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.core.supervisor import SubmitResult
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner

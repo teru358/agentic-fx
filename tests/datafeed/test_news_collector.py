@@ -1,4 +1,5 @@
 import logging
+import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from urllib.error import URLError
@@ -6,9 +7,7 @@ from urllib.error import URLError
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.datafeed.fetchers import Article
-from agentic_fx.datafeed.news_collector import (
-    DEFAULT_SOURCES, NewsCollector, seed_default_sources,
-)
+from agentic_fx.datafeed.news_collector import NewsCollector
 from agentic_fx.store import news_sources
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.rag import Rag
@@ -29,6 +28,7 @@ def _env(tmp_path):
     return conn, rag, col
 
 
+@pytest.mark.skip(reason="既定源は存在しない")
 def test_seed_defaults_idempotent(tmp_path):
     conn, _, _ = _env(tmp_path)
     n1 = seed_default_sources(conn, NOW)
@@ -51,6 +51,7 @@ def test_seed_defaults_idempotent(tmp_path):
         assert by_name[src["name"]]["fetcher"] == src["fetcher"]
 
 
+@pytest.mark.skip(reason="既定源は存在しない")
 def test_seed_defaults_dedupes_within_default_sources_list(tmp_path, monkeypatch):
     """DEFAULT_SOURCES 自体の中で name が重複していても IntegrityError に
     ならないこと。
@@ -72,6 +73,7 @@ def test_seed_defaults_dedupes_within_default_sources_list(tmp_path, monkeypatch
     assert [s["name"] for s in news_sources.list_all(conn)] == ["dup-src"]
 
 
+@pytest.mark.skip(reason="既定源は存在しない")
 def test_seed_defaults_dedupes_url_collision_within_list(tmp_path, monkeypatch):
     """上と対になるケース: DEFAULT_SOURCES 内で **url** だけが重複する。
 
@@ -92,6 +94,7 @@ def test_seed_defaults_dedupes_url_collision_within_list(tmp_path, monkeypatch):
     assert [s["name"] for s in news_sources.list_all(conn)] == ["src-a"]
 
 
+@pytest.mark.skip(reason="既定源は存在しない")
 def test_seed_defaults_skips_on_name_or_url_collision(tmp_path):
     """name/url どちらか片方だけの衝突でも IntegrityError を起こさないこと。
 

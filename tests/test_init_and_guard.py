@@ -9,7 +9,6 @@ import pytest
 import yaml
 
 from agentic_fx.datafeed.health import DataUnhealthy
-from agentic_fx.datafeed.news_collector import DEFAULT_SOURCES
 from agentic_fx.entry import main as entry_main
 from agentic_fx.service import ensure_initialized, run_init
 from agentic_fx.setup.checks import CheckReason, CheckResult

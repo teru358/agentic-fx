@@ -1065,3 +1065,14 @@ systemctl --user show afx -p ActiveEnterTimestampMonotonic   # reconfigure の�
 
      観測表の読み取りだけの観測コマンドを束ねて `tmp/acceptance/diag-<時刻>.tar.gz` にします。先頭に収集するものと収集しないもの (`.env`・`config/settings.yaml`・ops の secret・API の鍵) を表示します。unit が無い・journalctl が使えない場合は「取得できず」と記録して続け、終了コードは 0 です。
 - 台本が参照する文面は、実装 (`src/agentic_fx/setup/wizard.py` など) の文字列です。ウィザードの文面を変えたら、`tests/acceptance/test_first_run_driver.py` が台本の `expect` と実装の文面を突き合わせて落ちるので、台本とこの文書を一緒に直します。
+
+## 段 3 のニュース源
+
+価格源の選択後に `ニュース源 (名前 URL、空 Enter で飛ばす):` を表示します。空 Enter では `後から `afx news add` で足せます。候補例は README を参照。` と表示されます。1 件を追加する場合は名前と URL を空白で区切って入力し、`取得: <n> 件 (うち本文・要約あり <m> 件)` を確認します。0 件なら `0 件でした。それでも追加しますか? [y/N]` に答えます。
+
+| 名前 | URL | 取得方式 |
+| --- | --- | --- |
+| `nhk-keizai` | `https://www3.nhk.or.jp/rss/news/cat5.xml` | `feed` |
+| `fxstreet-news` | `https://www.fxstreet.com/rss/news` | `feed` |
+
+これは例であって推奨でも保証でもなく、各源の利用規約の確認は運用者の責任です。源の追加は運用者の判断であり、User-Agent の URL は連絡先で責任の引き受けを意味しません。鍵を含む URL は標準入力で渡しても DB に平文で残り、引数なら shell 履歴に残り、path の鍵は `web` 方式で RAG に出ます。`--non-interactive` はニュース源を登録しません。本機の既存 DB にある yahoo-finance-topstories は消えないため、受入では `afx news disable yahoo-finance-topstories` を実行します。

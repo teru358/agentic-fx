@@ -19,4 +19,15 @@ uv run afx init
 
 日常の確認は `afx ctl status` から始めます。操作 API の運用は [操作 API と afx ctl の運用](docs/operations/ops-api-2026-10-09.md) を参照してください。
 
+## ニュース源
+
+利用者が選んだ源を `afx news list`、`afx news add <name> <url>`、`afx news enable <name>`、`afx news disable <name>`、`afx news test <name>` で管理します。
+
+| 名前 | URL | 取得方式 |
+| --- | --- | --- |
+| `nhk-keizai` | `https://www3.nhk.or.jp/rss/news/cat5.xml` | `feed` |
+| `fxstreet-news` | `https://www.fxstreet.com/rss/news` | `feed` |
+
+これは例であって推奨でも保証でもなく、各源の利用規約の確認は運用者の責任です。ニュース源を追加するかは運用者の判断です。User-Agent の URL は連絡先であり、責任の引き受けを意味しません。鍵を含む URL は `afx news add <name> -` で標準入力から渡せますが、DB には原文が平文で残り、引数なら shell 履歴に残ります。path に鍵を置く URL は `web` 方式で RAG に出るため、扱いは利用者の責任です。
+
 設計は [全体設計](docs/superpowers/specs/2026-07-25-agentic-fx-design.md) と [初期設定ウィザード設計](docs/superpowers/specs/2026-10-12-first-run-wizard-design.md) にあります。秘密は `.env` のみに置きます。Anthropic API の従量課金は使いません。

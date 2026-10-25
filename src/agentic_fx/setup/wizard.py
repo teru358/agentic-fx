@@ -46,7 +46,8 @@ from agentic_fx.core.scheduler import (
     DAILY_AT_RE, WEEKLY_AT_RE, latest_scheduled_occurrence, scheduled_period,
 )
 from agentic_fx.datafeed import sources
-from agentic_fx.datafeed.news_collector import seed_default_sources
+from agentic_fx.datafeed import news_probe
+from agentic_fx.store import news_sources
 from agentic_fx.logging_setup import setup_technical_logging
 from agentic_fx.ops_setup.interactive import EnableResult, interactive_enable
 from agentic_fx.ops_setup.setup_lease import (
@@ -469,6 +470,7 @@ class Answers:
     wait_first: bool = False
     api_enabled: bool = True
     daemon: bool = True
+    news_sources: list[tuple[str, str]] = field(default_factory=list)
 
 
 _SOURCE_KEYS = ("yfinance", "mt5", "twelvedata")
@@ -896,6 +898,11 @@ def _bridge_check(sess: _Session, a: Answers, url: str) -> CheckResult:
 
 
 def _stage3(sess: _Session, st: _Start, a: Answers) -> None:
+    _stage3_price(sess, st, a)
+    _stage3_news_sources(sess, st, a)
+
+
+def _stage3_price(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
     sess.say("[段 3 価格源] 取引判断と約定判定に使う価格をどこから取るかを決めます。")
     sess.say("本線は MT5 bridge (MetaTrader 5 から価格を受け取る小さな HTTP サーバ) です。")
@@ -1015,6 +1022,58 @@ def _stage3_without_bridge(sess: _Session, a: Answers) -> None:
         return
     sess.say("yfinance OK")
     a.price = _plain_record("ok", sess.now_iso())
+
+
+def _stage3_news_sources(sess: _Session, st: _Start, a: Answers) -> None:
+    """Collect news sources without writing them or exposing their URLs."""
+    if a.news_sources:
+        sess.say("入力済みのニュース源: " + ", ".join(name for name, _ in a.news_sources))
+    existing: list[tuple[str, str]] = []
+    db_path = sess.root / "data" / "agentic.db"
+    if db_path.is_file():
+        try:
+            conn = connect_readonly(db_path)
+            try:
+                existing = [(row["name"], row["url"]) for row in news_sources.list_all(conn)]
+            finally:
+                conn.close()
+        except Exception:
+            sess.say("ニュース源を確認できませんでした。")
+    while True:
+        raw = sess.text("ニュース源 (名前 URL、空 Enter で飛ばす)")
+        if not raw:
+            sess.say("後から `afx news add` で足せます。候補例は README を参照。")
+            return
+        parts = raw.split()
+        if len(parts) != 2:
+            sess.say("名前と URL を空白で区切って入力してください。")
+            continue
+        name, url = parts
+        try:
+            news_probe.validate_name(name)
+            news_probe.validate_url(url)
+            normalized = news_probe.normalize_url(url)
+        except Exception:
+            sess.say("名前または URL の形式が正しくありません。")
+            continue
+        duplicate = next((other for other, other_url in [*existing, *a.news_sources]
+                          if other == name or news_probe.normalize_url(other_url) == normalized), None)
+        if duplicate is not None:
+            sess.say(f"既に登録されています: {duplicate}")
+            continue
+        try:
+            result = news_probe.probe("feed", normalized, name,
+                                      timeout_sec=st.base_settings.worker.data_hook_timeout_sec)
+        except news_probe.ProbeFailure as error:
+            sess.say(error.reason)
+            continue
+        except Exception:
+            sess.say("ニュース源を確認できませんでした。")
+            continue
+        sess.say(f"取得: {result.count} 件 (うち本文・要約あり {result.with_body} 件)")
+        if result.count == 0 and not sess.yesno("0 件でした。それでも追加しますか?", False):
+            continue
+        a.news_sources.append((name, normalized))
 
 
 class _LaterChosen(Exception):
@@ -1915,7 +1974,13 @@ def _commit_database(sess: _Session, a: Answers, plan: _Plan, now: datetime) -> 
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            seed_default_sources(conn, now, commit=False)
+            skipped: list[str] = []
+            for name, url in a.news_sources:
+                if news_sources.find_duplicate(conn, name, url) is not None:
+                    skipped.append(name)
+                    continue
+                news_sources.add(conn, name=name, fetcher="feed", url=url,
+                                 added_by="user", now=now, enabled=True, commit=False)
             if a.wait_first:
                 consume_scheduled_period(conn, plan.new_settings, now=now, commit=False)
             sess.hook("before_seed_commit")
@@ -1924,6 +1989,8 @@ def _commit_database(sess: _Session, a: Answers, plan: _Plan, now: datetime) -> 
             conn.rollback()
             raise
         sess.hook("after_seed_commit")
+        for name in skipped:
+            sess.say(f"既に登録されていたので飛ばしました: {name}")
     finally:
         conn.close()
 
