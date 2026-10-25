@@ -62,7 +62,8 @@ def collect_pending_facts(root, settings: Settings | None, conn: sqlite3.Connect
         try:
             failing_news = tuple(row["name"] for row in news_sources.list_enabled(conn)
                                  if (h := news_health.read(conn, row["name"]).record) is not None
-                                 and (h.consecutive_failures >= 3 or h.retry_after_streak >= 3))
+                                 and (h.consecutive_failures >= news_health.N
+                                      or h.retry_after_streak >= news_health.N))
         except (sqlite3.Error, ValueError):
             failing_news = ()
     return PendingFacts(

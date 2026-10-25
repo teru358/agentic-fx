@@ -69,6 +69,33 @@ def _step(facts: PendingFacts, code: str, severity: str, params: Mapping[str, An
     return PendingStep(code, severity, _at(facts, at), dict(params), visible_in_status)
 
 
+NEWS_LISTED_MAX = 5
+
+
+def _news_steps(facts: PendingFacts, room: int) -> list[PendingStep]:
+    """Failing-source rows, always after every other step.
+
+    At most five individual rows (by name); further sources and names that do
+    not fit the ident grammar fold into one summary row.  When the block does
+    not fit in `room`, the last slot becomes the summary and its count is
+    recomputed from what is not shown.  With no room nothing is added.
+    """
+    names = sorted(set(facts.failing_news_sources))
+    fit = [name for name in names if is_ident(name)]
+    rows = [_step(facts, "news_source_failing", "warn", {"name": name})
+            for name in fit[:NEWS_LISTED_MAX]]
+    folded = len(names) - len(rows)
+    if room <= 0 or not names:
+        return []
+    if len(rows) + (1 if folded else 0) <= room:
+        if folded:
+            rows.append(_step(facts, "news_source_failing_more", "warn", {"count": folded}))
+        return rows
+    shown = rows[:room - 1]
+    return shown + [_step(facts, "news_source_failing_more", "warn",
+                          {"count": len(names) - len(shown)})]
+
+
 def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[PendingStep]:
     """Return ordered pending work from supplied observations, without I/O or probes."""
     if facts.record_state == "missing":
@@ -166,23 +193,8 @@ def pending_steps(facts: PendingFacts, *, for_status: bool = False) -> list[Pend
     for code in _TRAILING_PENDING_ORDER:
         steps.extend(deferred[code])
     steps.extend(facts.extra_steps)
-    # News is intentionally trailing: setup and safety actions keep priority.
-    eligible = sorted(name for name in facts.failing_news_sources if is_ident(name))
-    folded = len(facts.failing_news_sources) - len(eligible)
-    news: list[PendingStep] = [_step(facts, "news_source_failing", "warn", {"name": name}) for name in eligible[:5]]
-    folded += max(0, len(eligible) - 5)
-    if folded:
-        news.append(_step(facts, "news_source_failing_more", "warn", {"count": folded}))
-    available = MAX_PENDING_STEPS - len(steps)
-    if available > 0:
-        if len(news) <= available:
-            steps.extend(news)
-        else:
-            # Preserve one summary when the block cannot fit in full.
-            shown = max(0, available - 1)
-            steps.extend(news[:shown])
-            hidden = len(facts.failing_news_sources) - shown
-            steps.append(_step(facts, "news_source_failing_more", "warn", {"count": hidden}))
     if for_status:
         steps = [step for step in steps if step.visible_in_status]
+    steps = steps[:MAX_PENDING_STEPS]
+    steps.extend(_news_steps(facts, MAX_PENDING_STEPS - len(steps)))
     return steps[:MAX_PENDING_STEPS]

@@ -75,7 +75,7 @@ def _instant(data: dict, key: str) -> datetime | None:
 
 def _parse(raw: str) -> Health:
     data = json.loads(raw)
-    if not isinstance(data, dict) or data.get("v") != 1:
+    if not isinstance(data, dict) or type(data.get("v")) is not int or data["v"] != 1:
         raise ValueError("invalid health record")
     cause, outcome = data.get("backoff_cause"), data.get("last_outcome")
     if cause not in (None, "failures", "refusals") or outcome not in (None, "ok", "failed", "rate_limited"):
@@ -93,7 +93,7 @@ def read(conn: sqlite3.Connection, name: str) -> HealthRead:
     row = conn.execute("SELECT value FROM alert_state WHERE key=?", (_key(name),)).fetchone()
     if row is None:
         return HealthRead(None, None, False)
-    raw = row["value"]
+    raw = row[0]
     try:
         return HealthRead(raw, _parse(raw), False)
     except (ValueError, TypeError, KeyError, json.JSONDecodeError, OverflowError):
@@ -151,13 +151,24 @@ def effective_wait(health: Health | None, attempt: tuple[datetime, timedelta] | 
     return max(choices, key=lambda value: value[0]) if choices else None
 
 
-def read_effective_wait(conn: sqlite3.Connection, name: str, now: datetime) -> tuple[datetime, str] | None:
-    """Read waits only; SQLite errors propagate and malformed attempts have no wait."""
-    health = read(conn, name).record
+def load_attempt(conn: sqlite3.Connection, key: str) -> tuple[datetime, timedelta] | None:
+    """Return the attempt record for a fetch_attempts key; a malformed value is None.
+
+    sqlite3.Error propagates (the caller treats an unreadable store as "do not fetch").
+    """
     try:
-        attempt = fetch_attempts.load(conn, fetch_attempts.news_source_key(name))
+        return fetch_attempts.load(conn, key)
     except ValueError:
-        attempt = None
+        return None
+
+
+def read_effective_wait(conn: sqlite3.Connection, name: str, now: datetime) -> tuple[datetime, str] | None:
+    """Read waits only; SQLite errors propagate and malformed attempts have no wait.
+
+    A malformed health record is read as no health wait.  Never writes.
+    """
+    health = read(conn, name).record
+    attempt = load_attempt(conn, fetch_attempts.news_source_key(name))
     return effective_wait(health, attempt, now)
 
 

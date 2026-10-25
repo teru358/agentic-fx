@@ -7,6 +7,7 @@ from urllib.error import URLError
 import httpx
 import pytest
 
+from agentic_fx.datafeed.user_agent import user_agent
 from agentic_fx.datafeed.fetchers import (
     Article, FeedFetchError, _unrecognized_tz_abbrev, fetch_feed, fetch_web,
 )
@@ -217,7 +218,7 @@ def test_fetch_web_extracts_body():
     assert arts[0].published is None
     get.assert_called_once_with("https://ex.com/page", timeout=10,
                                 follow_redirects=True,
-                                headers={"User-Agent": "agentic-fx/0.2.0"})
+                                headers={"User-Agent": user_agent()})
     # コメント欄が本文に混入しないこと (ブリーフの逐語コードからの意図的変更)
     assert ext.call_args.kwargs.get("include_comments") is False
 

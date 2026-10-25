@@ -103,7 +103,10 @@ class Rag:
         return self._news.count()
 
     def add_news(self, articles: list[dict], now: datetime) -> int:
-        """記事を upsert する (url を ID にして重複投入は上書き)。追加件数を返す。
+        """記事を upsert する (ID は任意の `rag_id`、無ければ url。重複投入は上書き)。追加件数を返す。
+
+        metadata の url と検索結果の url は常に表示用の `url` で、`rag_id` は
+        内部 ID にだけ使う。
 
         `published` は入力 dict のキーとして受け取るが保存しない:
         - search_news の出力契約 (url/title/body/source_name) に published は
@@ -147,8 +150,8 @@ class Rag:
                 metadatas=[{"url": a["url"], "title": a["title"],
                             "body": a["body"], "source_name": a["source_name"],
                             "added_at": existing_added_at.get(
-                                a["url"], now_utc.isoformat())}
-                           for a in articles])
+                                i, now_utc.isoformat())}
+                           for a, i in zip(articles, ids)])
             return len(articles)
 
     def search_news(self, query: str, n: int = 5) -> list[dict]:

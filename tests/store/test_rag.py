@@ -225,3 +225,39 @@ def test_reflections_roundtrip(tmp_path):
                        "USDJPY")
     hits = rag.search_reflections("stopped out CPI", n=1)
     assert hits and hits[0]["order_id"] == 1
+
+
+def test_add_news_uses_rag_id_as_the_id_and_keeps_the_display_url(tmp_path):
+    rag = _rag(tmp_path)
+    t0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    web = {"url": "https://ex.com/page", "title": "w1", "body": "first body",
+           "source_name": "web-a", "published": None, "rag_id": "web:web-a"}
+    feed_same_link = {"url": "https://ex.com/page", "title": "f1", "body": "feed body",
+                      "source_name": "feed-a", "published": None}
+    other_web = dict(web, source_name="web-b", rag_id="web:web-b", title="w2")
+    assert rag.add_news([web, feed_same_link, other_web], t0) == 3
+    assert rag.count_news() == 3
+    found = rag.search_news("body", n=5)
+    assert {r["url"] for r in found} == {"https://ex.com/page"}
+    assert {r["source_name"] for r in found} == {"web-a", "web-b", "feed-a"}
+    ids = set(rag._news.get()["ids"])
+    assert ids == {"web:web-a", "web:web-b", "https://ex.com/page"}
+
+
+def test_add_news_without_rag_id_still_uses_the_url(tmp_path):
+    rag = _rag(tmp_path)
+    t0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    rag.add_news([ARTS[0]], t0)
+    assert rag._news.get()["ids"] == [ARTS[0]["url"]]
+
+
+def test_added_at_is_kept_per_id_for_rag_id_articles(tmp_path):
+    rag = _rag(tmp_path)
+    t0 = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    art = {"url": "https://ex.com/page", "title": "t", "body": "b", "source_name": "w",
+           "published": None, "rag_id": "web:w"}
+    rag.add_news([art], t0)
+    rag.add_news([dict(art, body="changed")], t0 + timedelta(hours=40))
+    meta = rag._news.get(ids=["web:w"], include=["metadatas"])["metadatas"][0]
+    assert meta["added_at"] == t0.isoformat() and meta["body"] == "changed"
+    assert rag.cleanup_news(t0 + timedelta(hours=49), hours=48) == 1

@@ -13,7 +13,6 @@ import logging
 import sqlite3
 from datetime import datetime, timezone
 
-from agentic_fx._retry_after import retry_after_from
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.datafeed.default_sources import DEFAULT_SOURCES
@@ -23,6 +22,8 @@ from agentic_fx.store import fetch_attempts, news_health, news_sources
 from agentic_fx.store.rag import Rag
 
 _log = logging.getLogger("agentic_fx.news")
+
+UNKNOWN_FETCHER_REASON = "未知の取得方式"
 
 __all__ = ["DEFAULT_SOURCES", "NewsCollector", "seed_default_sources"]
 
@@ -71,7 +72,11 @@ def seed_default_sources(conn: sqlite3.Connection, now: datetime, *, commit: boo
 
 
 class NewsCollector:
-    """enabled な news_sources を全件回し、fetcher で取得して RAG へ upsert する。"""
+    """enabled な news_sources を全件回し、fetcher で取得して RAG へ upsert する。
+
+    源ごとの取得結果は健康記録 (store/news_health) に残り、連続失敗や先方の
+    拒否が続く源は段階的に間引かれる。健康記録を読めない周期は取得を見送る。
+    """
 
     def __init__(self, conn: sqlite3.Connection, rag: Rag,
                  activity: ActivityLog, clock: Clock, *, timeout_sec: float) -> None:
@@ -81,6 +86,8 @@ class NewsCollector:
         self.clock = clock
         self.timeout_sec = timeout_sec
         self._skip_reported: dict[str, datetime] = {}
+        # 書込に失敗した源の (新しい記録, 取得前に読んだ DB の原文)。DB の原文が
+        # 組の原文と文字列として一致する間だけ、現在の記録として使う。
         self._health_overlay: dict[str, tuple[news_health.Health, str | None]] = {}
         self._gate_errors: set[str] = set()
 
@@ -95,85 +102,100 @@ class NewsCollector:
         for src in news_sources.list_enabled(self.conn):
             name = src["name"]
             key = fetch_attempts.news_source_key(name)
-            try:
-                health_read = news_health.read(self.conn, name)
-                health_read = news_health.cap_backoff_for_collector(self.conn, name, health_read, now)
-                current = health_read.record
-                overlay = self._health_overlay.get(name)
-                if overlay and overlay[1] == health_read.raw:
-                    current = overlay[0]
-                elif overlay:
-                    self._health_overlay.pop(name, None)
-                wait = news_health.read_effective_wait(self.conn, name, now)
-                if current is not health_read.record:
-                    try: attempt = fetch_attempts.load(self.conn, key)
-                    except ValueError: attempt = None
-                    wait = news_health.effective_wait(current, attempt, now)
-            except sqlite3.Error as exc:
-                if name not in self._gate_errors:
-                    self._gate_errors.add(name)
-                    _log.warning("news source %s health read failed (%s)", name, type(exc).__name__)
+            gate = self._gate(name, key, now)
+            if gate is None:
                 continue
-            self._gate_errors.discard(name)
-            until = wait[0] if wait else None
-            if until is not None:
-                # 先方が Retry-After で待てと言った間は叩かない。cycle ごとに
-                # 記録すると長い待ちで activity が埋まるので、期限ごとに 1 回
-                if self._skip_reported.get(name) != until:
-                    self._skip_reported[name] = until
-                    cause = wait[1]
-                    if cause == "failures":
-                        prefix = f"{name}: 連続 {current.consecutive_failures if current else 0} 回失敗のため "
-                    elif cause == "refusals":
-                        prefix = f"{name}: 先方の拒否が {current.retry_after_streak if current else 0} 回続いたため "
-                    else:
-                        prefix = f"{name}: 先方の指示により "
-                    self.activity.write(
-                        Category.NEWS, "news_source_skipped",
-                        prefix +
-                        f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
+            raw, current, wait = gate
+            if wait is not None:
+                self._report_skip(name, current, wait)
                 continue
             self._skip_reported.pop(name, None)
+            if src["fetcher"] == "feed":
+                fetch = fetch_feed
+            elif src["fetcher"] == "web":
+                fetch = fetch_web
+            else:
+                # news_sources.add / スキーマは fetcher の値を検証しない
+                # (CHECK 制約なし)。feed/web 以外を fetch_web に無言で
+                # フォールバックさせない (壊れた抽出結果が記事として RAG に
+                # 混入しうる)。要求は出さないので健康記録は更新しない。
+                self._record_failure(name, UNKNOWN_FETCHER_REASON)
+                continue
             self._remember_attempt(key, now)
             try:
-                if src["fetcher"] == "feed":
-                    fetch = fetch_feed
-                elif src["fetcher"] == "web":
-                    fetch = fetch_web
-                else:
-                    # news_sources.add / スキーマは fetcher の値を検証しない
-                    # (CHECK 制約なし)。added_by="agent" の将来のソースが
-                    # 未知の fetcher 名で登録される可能性があるため、feed/web
-                    # 以外を fetch_web に無言でフォールバックさせない
-                    # (未知形式に httpx+trafilatura を適用すると壊れた
-                    # 抽出結果が記事として RAG に混入しうる)。
-                    self._record_failure(name, "未知の取得方式")
-                    continue
                 articles = fetch(src["url"], src["name"], timeout_sec=self.timeout_sec)
                 total += self.rag.add_news(
                     [{"url": a.url, "title": a.title, "body": a.body,
                       "source_name": a.source_name, "published": a.published,
                       **({"rag_id": a.rag_id} if a.rag_id else {})}
                      for a in articles], now)
-                self._update_health(name, health_read.raw, current, "ok", now, count=len(articles), reason="ok")
+                self._update_health(name, raw, current, "ok", now, count=len(articles))
             except Exception as e:  # noqa: BLE001 — 1 ソース障害で止めない
-                self._remember_retry_after(key, e, now)
                 failure = classify_failure(e, now)
-                self._update_health(name, health_read.raw, current, failure.kind, now, reason=failure.reason)
+                self._remember_retry_after(key, failure, now)
+                self._update_health(name, raw, current, failure.kind, now,
+                                    reason=failure.reason)
                 self._record_failure(name, failure.reason)
         removed = self.rag.cleanup_news(now, hours=48)
         self.activity.write(Category.NEWS, "collected",
                             f"{total} articles ({removed} cleaned)")
         return total
 
-    def _update_health(self, name, raw, current, outcome, now, *, count=None, reason=None) -> None:
-        record = news_health.next_record(current, outcome, now, count=count, reason=reason)
+    def _gate(self, name: str, key: str, now: datetime):
+        """(取得前の原文, 現在の記録, 実効待機) を返す。読めなければ None (見送り)。"""
         try:
-            if not news_health.write_if_unchanged(self.conn, name, raw, record, now):
-                self._health_overlay.pop(name, None)
-        except Exception as exc:  # noqa: BLE001
+            observed = news_health.read(self.conn, name)
+            observed = news_health.cap_backoff_for_collector(self.conn, name, observed, now)
+            current = observed.record
+            overlay = self._health_overlay.get(name)
+            if overlay is not None:
+                if overlay[1] == observed.raw:
+                    current = overlay[0]
+                else:
+                    del self._health_overlay[name]
+            attempt = news_health.load_attempt(self.conn, key)
+            wait = news_health.effective_wait(current, attempt, now)
+        except (sqlite3.Error, ValueError) as exc:
+            if name not in self._gate_errors:
+                self._gate_errors.add(name)
+                _log.warning("news source %s: state unreadable, skipping (%s)",
+                             name, type(exc).__name__)
+            return None
+        self._gate_errors.discard(name)
+        return observed.raw, current, wait
+
+    def _report_skip(self, name: str, current: news_health.Health | None,
+                     wait: tuple[datetime, str]) -> None:
+        until, cause = wait
+        # 周期ごとに記録すると長い待ちで activity が埋まるので、期限ごとに 1 回
+        if self._skip_reported.get(name) == until:
+            return
+        self._skip_reported[name] = until
+        if cause == "failures":
+            prefix = f"{name}: 連続 {current.consecutive_failures if current else 0} 回失敗のため "
+        elif cause == "refusals":
+            prefix = f"{name}: 先方の拒否が {current.retry_after_streak if current else 0} 回続いたため "
+        else:
+            prefix = f"{name}: 先方の指示により "
+        self.activity.write(Category.NEWS, "news_source_skipped",
+                            prefix + f"{until.astimezone(timezone.utc):%H:%M} UTC まで待つ")
+
+    def _update_health(self, name: str, raw: str | None,
+                       current: news_health.Health | None, outcome: str,
+                       now: datetime, *, count: int | None = None,
+                       reason: str | None = None) -> None:
+        try:
+            record = news_health.next_record(current, outcome, now, count=count, reason=reason)
+        except ValueError as exc:
+            _log.warning("news source %s health update failed (%s)", name, type(exc).__name__)
+            return
+        try:
+            news_health.write_if_unchanged(self.conn, name, raw, record, now)
+        except Exception as exc:  # noqa: BLE001 — 取得結果の扱いは止めない
             self._health_overlay[name] = (record, raw)
             _log.warning("news source %s health write failed (%s)", name, type(exc).__name__)
+            return
+        self._health_overlay.pop(name, None)
 
     def _remember_attempt(self, key: str, now: datetime) -> None:
         try:
@@ -181,12 +203,11 @@ class NewsCollector:
         except Exception as e:  # noqa: BLE001
             _log.warning("news attempt record failed (%s)", type(e).__name__)
 
-    def _remember_retry_after(self, key: str, e: BaseException,
-                              now: datetime) -> None:
+    def _remember_retry_after(self, key: str, failure, now: datetime) -> None:
+        if failure.retry_after is None:
+            return
         try:
-            wait = retry_after_from(e, now)
-            if wait is not None:
-                fetch_attempts.record_retry_after(self.conn, key, now, wait)
+            fetch_attempts.record_retry_after(self.conn, key, now, failure.retry_after)
         except Exception as exc:  # noqa: BLE001 — 失敗の記録で失敗を増やさない
             _log.warning("news retry-after record failed (%s)", type(exc).__name__)
 
@@ -200,9 +221,8 @@ class NewsCollector:
         読めてしまう。EconCalendar._record_failure と同じ形に揃える。
 
         **fail-open は維持する** — この関数は記録するだけで、呼び出し側の
-        制御フロー (スキップして次のソースへ) は変えない。detail は
-        `safe_error_text` を通した文字列を渡すこと (ソース URL に秘密が
-        含まれうる)。
+        制御フロー (スキップして次のソースへ) は変えない。detail は固定語
+        だけを渡すこと (例外の文面にはソース URL の秘密が含まれうる)。
         """
         _log.warning("news source %s failed: %s", source_name, detail)
         self.activity.write(Category.NEWS, "news_source_failed",

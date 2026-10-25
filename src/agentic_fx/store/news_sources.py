@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from agentic_fx.datafeed.news_probe import normalize_url
+from agentic_fx.datafeed.news_url import normalize_url
 
 
 def add(conn: sqlite3.Connection, *, name: str, fetcher: str, url: str,
@@ -27,16 +27,26 @@ def list_enabled(conn: sqlite3.Connection) -> list[dict]:
 
 
 def find_duplicate(conn: sqlite3.Connection, name: str, url: str) -> tuple[str, str] | None:
-    """Return duplicate kind/name, without returning a potentially secret URL."""
-    normalized = normalize_url(url)
-    for row in list_all(conn):
+    """Pre-check for add: ("name" | "url", existing source name) or None.
+
+    The URL is compared in normalized form against every row (enabled or not),
+    each row normalized the same way; a row whose stored URL cannot be
+    normalized is compared as written.  The returned name is the existing
+    source's; no URL text is returned.  The UNIQUE constraints remain the final
+    decision.  Raises NewsInputError when url itself is invalid.
+    """
+    wanted = normalize_url(url)
+    rows = list_all(conn)
+    for row in rows:
         if row["name"] == name:
             return "name", row["name"]
+    for row in rows:
         try:
-            if normalize_url(row["url"]) == normalized:
-                return "url", row["name"]
+            stored = normalize_url(row["url"])
         except ValueError:
-            continue
+            stored = row["url"]
+        if stored == wanted:
+            return "url", row["name"]
     return None
 
 

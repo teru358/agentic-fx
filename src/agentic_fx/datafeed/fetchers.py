@@ -86,6 +86,16 @@ class Article:
     rag_id: str | None = None
 
 
+def _is_http_link(link: object) -> bool:
+    """True for a link whose scheme is http or https (anything else is not adopted)."""
+    if not isinstance(link, str):
+        return False
+    try:
+        return urlsplit(link).scheme in {"http", "https"}
+    except ValueError:
+        return False
+
+
 def _feed_published(entry: object, source_name: str) -> datetime | None:
     """entry の日付を tz-aware UTC datetime にする (naive は作らない)。
 
@@ -198,9 +208,8 @@ def fetch_feed(url: str, source_name: str, *, timeout_sec: float) -> list[Articl
             title = e.title
         except AttributeError:
             title = ""
-        parsed_link = urlsplit(link)
-        if parsed_link.scheme not in {"http", "https"}:
-            _log.warning("feed %s: non-http article link skipped", source_name)
+        if not _is_http_link(link):
+            _log.warning("feed %s: article link skipped (not http/https)", source_name)
             continue
         out.append(Article(
             url=link, title=title,
@@ -231,6 +240,6 @@ def fetch_web(url: str, source_name: str, *, timeout_sec: float) -> list[Article
     meta = trafilatura.extract_metadata(r.text)
     title = meta.title if meta and meta.title else source_name
     parts = urlsplit(url)
-    display_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+    display_url = urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
     return [Article(url=display_url, title=title, body=body, published=None,
                     source_name=source_name, rag_id=f"web:{source_name}")]
