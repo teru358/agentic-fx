@@ -235,17 +235,42 @@ def _call_name(node: ast.expr) -> str | None:
     return None
 
 
+_KW_HELPERS = frozenset({"_surface_parser_kw", "_web_parser_kw"})
+
+
+def _is_accessor_copy(value: ast.expr) -> bool:
+    if isinstance(value, ast.Call):
+        return _call_name(value.func) in _ACCESSORS
+    if isinstance(value, ast.IfExp):
+        return _is_accessor_copy(value.body) and _is_accessor_copy(value.orelse)
+    return False
+
+
 def _copy_outside_accessors(tree: ast.AST) -> list[int]:
-    """Lines of parser help / description / epilog values that are not an accessor call."""
+    """Lines of parser help / description / epilog values that are not an accessor call.
+
+    Covers the keyword directly, a ``**`` expansion (only the known helper is
+    allowed) and every dict literal that carries one of the copy keys.
+    """
     found = []
     for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values):
+                if (isinstance(key, ast.Constant) and key.value in _COPY_KEYWORDS
+                        and not _is_accessor_copy(value)):
+                    found.append(value.lineno)
+            continue
         if not isinstance(node, ast.Call) or _call_name(node.func) not in _PARSER_CALLS:
             continue
         for keyword in node.keywords:
+            if keyword.arg is None:
+                value = keyword.value
+                if not (isinstance(value, ast.Call) and _call_name(value.func) in _KW_HELPERS):
+                    found.append(value.lineno)
+                continue
             if keyword.arg not in _COPY_KEYWORDS:
                 continue
-            value = keyword.value
-            if not (isinstance(value, ast.Call) and _call_name(value.func) in _ACCESSORS):
+            if not _is_accessor_copy(keyword.value):
                 found.append(keyword.value.lineno)
     return found
 
@@ -277,6 +302,10 @@ def test_parser_copy_comes_only_from_surface_accessors():
     'sub.add_parser("x", help=f"{name}")',
     'argparse.ArgumentParser(prog="afx", description=SUMMARY.text)',
     '_OpsOptionParser(prog="afx", epilog=copies["x"])',
+    'copy = {"help": "手書き copy"}\nsub.add_parser("x", **copy)',
+    'sub.add_parser("x", **{"help": "手書き copy"})',
+    'sub.add_parser("x", **other_helper("x"))',
+    'def _surface_parser_kw(c):\n    return {"help": "手書き copy", "epilog": render_epilog(c)}',
 ])
 def test_parser_copy_check_rejects_everything_but_accessor_calls(source):
     assert _copy_outside_accessors(ast.parse(source)) != []
@@ -287,7 +316,11 @@ def test_parser_copy_check_accepts_accessor_calls_and_ignores_options():
         'sub.add_parser("x", help=leaf_help("x"), description=cli_surface.parser_description("x"),'
         ' epilog=render_epilog("x"))\n'
         'parser.add_argument("--n", help="option の説明")\n'
-        'argparse.ArgumentParser(prog="literal", description=top_description())')
+        'argparse.ArgumentParser(prog="literal", description=top_description())\n'
+        'sub.add_parser("y", **_surface_parser_kw("y"))\n'
+        'def _surface_parser_kw(c, *, leaf=False):\n'
+        '    return {"help": leaf_help(c) if leaf else parser_help(c), "epilog": render_epilog(c),'
+        ' "formatter_class": HelpFormatter}')
     assert _copy_outside_accessors(tree) == []
 
 
