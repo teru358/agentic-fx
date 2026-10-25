@@ -669,3 +669,14 @@ def test_one_line_error_uses_the_cause_when_the_message_is_empty():
     except MigrationRecordUnknown as error:
         assert wizard._one_line(error) == "OSError: disk full"
         assert commands_module.one_line_error(error) == "OSError: disk full"
+
+
+def test_one_line_error_stops_on_a_cause_cycle():
+    from agentic_fx.policy_projection import MigrationRecordUnknown
+
+    error = MigrationRecordUnknown()
+    error.__cause__ = error
+    assert commands_module.one_line_error(error) == "MigrationRecordUnknown:"
+    first, second = MigrationRecordUnknown(), MigrationRecordUnknown()
+    first.__cause__, second.__cause__ = second, first
+    assert commands_module.one_line_error(first) == "MigrationRecordUnknown:"
