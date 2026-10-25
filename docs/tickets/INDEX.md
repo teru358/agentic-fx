@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 137 件。完了分は closed/。
+未完了: 138 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -62,9 +62,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (119)
+## 設計待ち (120)
 
-### 不具合 (66)
+### 不具合 (67)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -91,6 +91,7 @@
 | [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
 | [e2e-phase1-reflection-not-generated](open/e2e-phase1-reflection-not-generated.md) | 中 | 2026-10-25 | test_e2e_phase1 の tick 4 で reflection が 0 件 (main で恒常的に赤) |
+| [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
