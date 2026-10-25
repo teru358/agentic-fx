@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -46,7 +46,7 @@ from agentic_fx.loops.improve_context import (
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
-from agentic_fx.loops.improve_notice_codes import (
+from agentic_fx.improve_notice_codes import (
     NOTICE_APPROVAL_TX_FAILED, NOTICE_BACKTEST_DATA_UNAVAILABLE,
     NOTICE_COMMIT_CRASHED, NOTICE_DEMOTED_RECOVERED, NOTICE_DUPLICATE_SKIPPED,
     NOTICE_INDICATOR_UNRESOLVED, NOTICE_KIND_UNSUPPORTED,
@@ -539,21 +539,21 @@ def _select_observation(artifact: dict) -> _ObservationChoice:
         NOTICE_OBSERVATION)
 
 
-def _plain_outcome_notice(
-        report_path: "str | None", artifact: dict,
-        ) -> "tuple[NoticeCode, _ObservationChoice | None]":
+_RISK_GATE_UNSUPPORTED_LAST_RESULT = "unsupported_in_plan10:risk_gate"
+
+
+def _plain_outcome_choice(report_path: "str | None",
+                          artifact: dict) -> _ObservationChoice:
     """質検査・resume 回収を経ない通常の終端 (report の公開 / agent の
     observation / 未対応の risk_gate) の分類。observation は selector の
-    結果をそのまま返す。"""
+    結果をそのまま返す。上記以外の artifact は、従来どおり未対応の
+    risk_gate として観察に倒す (mission は失敗させない)。"""
     if report_path is not None:
-        return NOTICE_REPORT_PUBLISHED, None
+        return _ObservationChoice("reported", None, NOTICE_REPORT_PUBLISHED)
     if artifact.get("type") == "observation":
-        choice = _select_observation(artifact)
-        return choice.notice, choice
-    if (artifact.get("type") == "report"
-            and artifact.get("proposal_kind") == "risk_gate"):
-        return NOTICE_RISK_GATE_UNSUPPORTED, None
-    raise ValueError("no notice code for this terminal artifact")
+        return _select_observation(artifact)
+    return _ObservationChoice(
+        _RISK_GATE_UNSUPPORTED_LAST_RESULT, None, NOTICE_RISK_GATE_UNSUPPORTED)
 
 
 @dataclass(frozen=True)
@@ -2796,7 +2796,7 @@ class ImproveLoop:
                     "gate_failed",
                     detail=f"candidate_identity_unavailable "
                            f"name={candidate.name}",
-                    code="comparison_base_unavailable")
+                    code="candidate_identity_unavailable")
             try:
                 archive = improve_quality.load_archive(
                     conn, mission_id=mission_id)
@@ -3248,19 +3248,22 @@ class ImproveLoop:
                 # mission`/`_finalize_output_invalid` と同じ規律 —
                 # [fail-observability] 是正: tx が例外を送出しても降格の
                 # 痕跡が activity.log に残るようにする)。
+                recovered_artifact = {
+                    "type": "observation",
+                    "reason": f"title={title} — resume 回収経由のため降格",
+                }
                 self._activity.write(
                     Category.IMPROVE, "report_demoted_recovered",
                     f"mission={ctx.mission_id} title={title}")
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
                     report_path=None,
-                    artifact={
-                        "type": "observation",
-                        "reason": (f"title={title} — "
-                                  "resume 回収経由のため降格"),
-                    },
-                    now=now, tool_calls=tool_calls,
-                    notice=NOTICE_DEMOTED_RECOVERED)
+                    artifact=recovered_artifact, now=now,
+                    tool_calls=tool_calls,
+                    choice=dataclass_replace(
+                        _select_observation(recovered_artifact),
+                        observation_text=None,
+                        notice=NOTICE_DEMOTED_RECOVERED))
                 return
 
             if atype == "plugin":
@@ -3548,17 +3551,16 @@ class ImproveLoop:
                         tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome=demotion.outcome,
-                        quality_last_result=(demotion.last_result
-                                             or f"observation:{demotion.reason}"),
-                        notice=notice_for_quality(demotion.code))
+                        choice=_ObservationChoice(
+                            demotion.last_result
+                            or f"observation:{demotion.reason}",
+                            None, notice_for_quality(demotion.code)))
             else:
-                plain_notice, plain_choice = _plain_outcome_notice(
-                    report_path, artifact)
                 self._finalize_report_or_observation(
                     conn, ctx=ctx, backlog_id=selection.backlog_id,
                     report_path=report_path, artifact=artifact, now=now,
-                    tool_calls=tool_calls, notice=plain_notice,
-                    observation_choice=plain_choice)
+                    tool_calls=tool_calls,
+                    choice=_plain_outcome_choice(report_path, artifact))
         except BaseException:
             commit_raised = True
             if ctx.ledger.state() == "FROZEN":
@@ -3634,14 +3636,11 @@ class ImproveLoop:
 
     def _finalize_report_or_observation(self, conn, *, ctx, backlog_id,
                                         report_path, artifact, now,
-                                        notice: NoticeCode,
-                                        observation_choice: (
-                                            "_ObservationChoice | None") = None,
+                                        choice: _ObservationChoice,
                                         gate_rows=(),
                                         tool_calls: int | None = None,
                                         candidate: _FinalCandidate | None = None,
                                         candidate_outcome: str = "gate_failed",
-                                        quality_last_result: str | None = None,
                                         ) -> None:
         """承認申請を出さない経路の Tx-2 + finish。
 
@@ -3668,24 +3667,10 @@ class ImproveLoop:
         素の文字列である `reason` には型名の無い `safe_text` を使う —
         どちらも同じ `_URL_RE`/`_SECRET_RE` 抑止を共有する)。"""
         from agentic_fx.store import missions as missions_store
-        observation_text: str | None = None
-        if quality_last_result is not None:
-            observation_last_result = quality_last_result
-        elif report_path is None and artifact.get("type") == "observation":
-            choice = (observation_choice if observation_choice is not None
-                      else _select_observation(artifact))
-            if (observation_choice is not None
-                    and observation_choice.notice != notice):
-                raise ValueError("notice does not match the observation choice")
-            observation_last_result = choice.last_result
-            # 観察文を保存するのは、マスクされない agent の申告のときだけ。
-            observation_text = (choice.observation_text
-                                if notice == NOTICE_OBSERVATION else None)
-        else:
-            # D-15 是正: 設計書 §4.3 状態表の逐語は
-            # `unsupported_in_plan10:risk_gate` — `proposal_kind=='risk_gate'`
-            # (本プラン未対応) のときの正規ラベル。
-            observation_last_result = "unsupported_in_plan10:risk_gate"
+        # last_result・観察文・通知の分類は `choice` 1 つから決まる。観察文を
+        # 持つのはマスクされない agent の申告のときだけ。
+        observation_last_result = choice.last_result
+        observation_text = choice.observation_text
         outcome = "report" if report_path is not None else "observation"
         conn.execute("BEGIN IMMEDIATE")
         ledger_ids = None
@@ -3712,7 +3697,7 @@ class ImproveLoop:
                     else ({"backlog_id": backlog_id, "status": "done",
                           "last_result": "reported"}
                           if backlog_id is not None else None)),
-                notice=notice, tool_calls=tool_calls,
+                notice=choice.notice, tool_calls=tool_calls,
                 observation_text=observation_text, commit=False)
             conn.commit()
         except BaseException:

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from agentic_fx._safe_error import safe_text
 from agentic_fx.core import market_hours
-from agentic_fx.loops import improve_notice_codes as notice_codes
+from agentic_fx import improve_notice_codes as notice_codes
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -219,17 +219,16 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                                if loop_by_id.get(mid) == "improve"]
         if improve_mission_ids:
             placeholders2 = ",".join("?" * len(improve_mission_ids))
-            run_rows = conn.execute(
-                "SELECT id, backlog_id FROM improvement_runs "
-                f"WHERE mission_id IN ({placeholders2}) "
-                "AND finished_at IS NULL", improve_mission_ids).fetchall()
+            all_run_rows = conn.execute(
+                "SELECT id, backlog_id, mission_id, trigger, finished_at "
+                "FROM improvement_runs "
+                f"WHERE mission_id IN ({placeholders2})",
+                improve_mission_ids).fetchall()
+            run_rows = [r for r in all_run_rows if r["finished_at"] is None]
             # 終端 snapshot の trigger は run 行の列から読む (slot の片付けに
             # 依らない)。run 行が無い・列が NULL の mission は manual。
             trigger_by_mission = {
-                r["mission_id"]: r["trigger"] for r in conn.execute(
-                    "SELECT mission_id, trigger FROM improvement_runs "
-                    f"WHERE mission_id IN ({placeholders2})",
-                    improve_mission_ids).fetchall()}
+                r["mission_id"]: r["trigger"] for r in all_run_rows}
             for mid in improve_mission_ids:
                 _insert_notice_snapshot(
                     conn, mission_id=mid, run_id=None,

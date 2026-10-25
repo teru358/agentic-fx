@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.store import backlog, improve_runs, improve_waves, missions
 from agentic_fx.store.db import connect, init_db
 
@@ -241,6 +241,21 @@ def test_recover_interrupted_with_already_finished_run_row(conn):
     improve_runs.finish(conn, rid, result=None, now=LATER)
     missions.recover_interrupted(conn, now=LATER, max_requeue=3)
     assert _snap(conn, mid)["trigger"] == "scheduled"
+
+
+def test_recover_interrupted_reads_improvement_runs_with_a_single_select(conn):
+    _start(conn, trigger="scheduled")
+    _start(conn, trigger="manual")
+    statements = []
+    conn.set_trace_callback(statements.append)
+    try:
+        missions.recover_interrupted(conn, now=LATER, max_requeue=3)
+    finally:
+        conn.set_trace_callback(None)
+    selects = [q for q in statements
+               if q.lstrip().upper().startswith("SELECT")
+               and "FROM improvement_runs" in q]
+    assert len(selects) == 1, selects
 
 
 def test_recover_interrupted_skips_non_improve_missions(conn):

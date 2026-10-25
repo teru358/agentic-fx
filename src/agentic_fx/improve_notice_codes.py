@@ -63,6 +63,10 @@ NOTICE_MAX_BARS_LIMIT = NoticeCode("gate_failed", "max_bars_limit")
 NOTICE_KIND_UNSUPPORTED = NoticeCode("gate_failed", "kind_unsupported")
 NOTICE_OUTPUTS_REQUIRED = NoticeCode("gate_failed", "outputs_required")
 NOTICE_INDICATOR_UNRESOLVED = NoticeCode("gate_failed", "indicator_unresolved")
+# plugin gate の Landlock 不可。backlog を消費する点が strategy gate の
+# failed/sandbox_unavailable (backlog を open に戻す) と異なるため別の語にする。
+NOTICE_GATE_SANDBOX_UNAVAILABLE = NoticeCode(
+    "gate_failed", "gate_sandbox_unavailable")
 
 NOTICE_REPORT_WRITE_FAILED = NoticeCode("failed", "report_write_failed")
 NOTICE_SANDBOX_UNAVAILABLE = NoticeCode("failed", "sandbox_unavailable")
@@ -90,7 +94,7 @@ _ALL_NOTICES = (
     NOTICE_NOOP_COPY, NOTICE_SELF_TEST_MISSING, NOTICE_PYTEST_FAILED,
     NOTICE_SELF_TEST_TOO_THIN, NOTICE_SELF_TEST_MUTATED, NOTICE_UNVERIFIED,
     NOTICE_MAX_BARS_LIMIT, NOTICE_KIND_UNSUPPORTED, NOTICE_OUTPUTS_REQUIRED,
-    NOTICE_INDICATOR_UNRESOLVED,
+    NOTICE_INDICATOR_UNRESOLVED, NOTICE_GATE_SANDBOX_UNAVAILABLE,
     NOTICE_REPORT_WRITE_FAILED, NOTICE_SANDBOX_UNAVAILABLE, NOTICE_TIMEOUT,
     NOTICE_MAX_TURNS, NOTICE_RUNNER_FAILED, NOTICE_TOOL_BUDGET_ABORT,
     NOTICE_OUTPUT_INVALID, NOTICE_APPROVAL_TX_FAILED, NOTICE_COMMIT_CRASHED,
@@ -120,7 +124,7 @@ _PLUGIN_GATE_NOTICES = {
     "pytest_failed": NOTICE_PYTEST_FAILED,
     "self_test_too_thin": NOTICE_SELF_TEST_TOO_THIN,
     "self_test_mutated": NOTICE_SELF_TEST_MUTATED,
-    "sandbox_unavailable": NOTICE_SANDBOX_UNAVAILABLE,
+    "sandbox_unavailable": NOTICE_GATE_SANDBOX_UNAVAILABLE,
 }
 PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
 
@@ -129,6 +133,7 @@ _QUALITY_NOTICES = {
     "duplicate_metrics": NOTICE_DUPLICATE_METRICS,
     "family_redirect": NOTICE_FAMILY_REDIRECT,
     "comparison_base_unavailable": NOTICE_COMPARISON_BASE_UNAVAILABLE,
+    "candidate_identity_unavailable": NOTICE_UNVERIFIED,
 }
 QUALITY_CODES = frozenset(_QUALITY_NOTICES)
 

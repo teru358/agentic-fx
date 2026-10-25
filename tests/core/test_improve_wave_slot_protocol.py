@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from agentic_fx.activity import ActivityLog, Category
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_runs as improve_runs_store

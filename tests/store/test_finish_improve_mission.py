@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.store import backlog, improve_runs, improve_waves, missions
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)

@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 
 from agentic_fx.backtest import holdout
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.loops.improve_loop import ImproveLoop, ImprovePrepareFailed
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.gate_pytest import GateResult
@@ -330,6 +330,27 @@ def test_quality_comparison_base_unavailable(improve_env):
                                            "comparison_base_unavailable")
 
 
+def test_quality_candidate_without_identity_inside_the_tx_is_unverified(
+        improve_env):
+    """commit の事前検査を通った候補が tx の内側で identity を失っていても、
+    終端 snapshot は unverified (comparison_base_unavailable ではない)。"""
+    original = ImproveLoop._finalize_success
+
+    def stripped(self, *a, **kw):
+        candidate = kw.get("final_candidate")
+        if candidate is not None:
+            kw["final_candidate"] = dataclasses.replace(
+                candidate, logic_hash=None)
+        return original(self, *a, **kw)
+
+    app, root = improve_env
+    conn = app.conn_core
+    loop, ctx, _ = _run_strategy(
+        app, root, "cand",
+        extra=[patch.object(ImproveLoop, "_finalize_success", stripped)])
+    assert _pair(conn, ctx.mission_id) == ("gate_failed", "unverified")
+
+
 def test_quality_deploy_guard_unavailable_is_the_same_word(improve_env):
     from agentic_fx.plugin import switch as plugin_switch
     app, root = improve_env
@@ -502,7 +523,8 @@ def test_gate_self_test_mutated(improve_env):
         == ("gate_failed", "self_test_mutated")
 
 
-def test_gate_sandbox_unavailable_is_failed_but_the_mission_completes(improve_env):
+def test_plugin_gate_sandbox_unavailable_is_gate_failed_and_the_mission_completes(
+        improve_env):
     def unavailable(d, *, settings):
         raise RuntimeError("landlock unavailable")
 
@@ -511,7 +533,8 @@ def test_gate_sandbox_unavailable_is_failed_but_the_mission_completes(improve_en
         app, root, _plugin_artifact("cand"), files=_indicator(),
         extra=[patch("agentic_fx.loops.improve_loop.run_gate_pytest",
                      unavailable)])
-    assert _pair(app.conn_core, ctx.mission_id) == ("failed", "sandbox_unavailable")
+    assert _pair(app.conn_core, ctx.mission_id) == (
+        "gate_failed", "gate_sandbox_unavailable")
     assert app.conn_core.execute("SELECT status FROM missions WHERE id=?",
                                  (ctx.mission_id,)).fetchone()[0] == "completed"
 
@@ -612,7 +635,9 @@ def test_plugin_gate_verdict_carries_the_fixed_code(improve_env, tmp_path, expec
             p.stop()
     assert verdict.passed is False
     assert verdict.code == expected
-    assert codes.notice_for_plugin_gate(verdict.code).reason_code == expected
+    reason = {"sandbox_unavailable": "gate_sandbox_unavailable"}.get(
+        expected, expected)
+    assert codes.notice_for_plugin_gate(verdict.code).reason_code == reason
 
 
 def test_plugin_gate_snapshot_and_loader_codes(improve_env, tmp_path):
@@ -878,6 +903,25 @@ def test_prepare_failure_after_tx0_is_wrapped_and_compensated(improve_env, slot)
                         (mission_id,)).fetchone()[0] == "failed"
     assert conn.execute("SELECT finished_at FROM improvement_runs WHERE "
                         "mission_id=?", (mission_id,)).fetchone()[0] is not None
+
+
+def test_manual_submit_after_tx0_failure_keeps_the_ops_exception_classification(
+        improve_env):
+    from agentic_fx.ops import ErrorCode
+    from agentic_fx.ops.service import OpsService
+    from tests.loops.test_improve_candidate_ledger import _supervisor
+    app, root = improve_env
+    conn = app.conn_core
+    sup = _supervisor(app, root, _loop(app, root))
+    busy = sqlite3.OperationalError("database is locked")
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               _raising_runner_factory(busy)):
+        with pytest.raises(sqlite3.OperationalError) as info:
+            sup.submit_manual()
+    assert info.value is busy
+    assert OpsService._map_exception(info.value) is ErrorCode.DATABASE_BUSY
+    mission_id = conn.execute("SELECT id FROM missions").fetchone()[0]
+    assert _pair(conn, mission_id) == ("failed", "prepare_failed")
 
 
 def test_prepare_failure_is_an_exception_type_with_attributes():

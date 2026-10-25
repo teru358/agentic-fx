@@ -123,8 +123,7 @@ class ImproveSupervisor:
         # ここで on_ready を渡さなくても子は正しく go を受け取って進む。
         """
         now = self._clock.now()
-        mission, ctx, runner = self._improve_loop.prepare(
-            slot_key=None, now=now)
+        mission, ctx, runner = self._prepare(slot_key=None, now=now)
         if on_prepared is not None:
             # 操作 API の job は mission id を走行中から見せる。通知の失敗で
             # mission を止めない。
@@ -162,7 +161,7 @@ class ImproveSupervisor:
             try:
                 self._improve_loop.compensate_commit_failure(
                     ctx=ctx, now=self._clock.now(), exc=exc,
-                    slot_terminalize=True)
+                    slot_terminalize=True, tool_calls=result.tool_calls)
             except Exception:
                 _log.exception(
                     "commit compensation failed for manual mission_id=%s",
@@ -170,6 +169,18 @@ class ImproveSupervisor:
                 self._record_compensation_failed(ctx.mission_id, "commit")
             raise
         return ctx.mission_id
+
+    def _prepare(self, **kwargs):
+        """`prepare()` が Tx-0 後に失敗すると mission は補償で終端済みで、
+        `ImprovePrepareFailed` が原因の例外を `__cause__` に持つ。呼び出し元
+        (操作 API の例外分類など) が元の型で分岐できるよう、原因を再送出する。"""
+        from agentic_fx.loops.improve_loop import ImprovePrepareFailed
+        try:
+            return self._improve_loop.prepare(**kwargs)
+        except ImprovePrepareFailed as exc:
+            if exc.__cause__ is not None:
+                raise exc.__cause__
+            raise
 
     def _record_compensation_failed(self, mission_id, phase: str) -> None:
         """補償の失敗を activity に残す。記録に失敗しても何も送出しない
@@ -297,7 +308,7 @@ class ImproveSupervisor:
                         "more; refusing to authorize the child")
                 reached_running = True
 
-            mission, ctx, runner = self._improve_loop.prepare(
+            mission, ctx, runner = self._prepare(
                 slot_key=(period_key, k), now=now, on_ready=_on_ready)
             # round2 #5 是正 (2026-08-29): I3/I2(b)/C1 のどの窓にも属さない
             # 「prepare() 成功後、runner.run() 自体が例外を投げる」第 4 の窓
@@ -334,7 +345,7 @@ class ImproveSupervisor:
                         period_key, k)
                     self._improve_loop.compensate_commit_failure(
                         ctx=ctx, now=self._clock.now(), exc=exc,
-                        slot_terminalize=True)
+                        slot_terminalize=True, tool_calls=result.tool_calls)
                     raise
                 return
             # pre-ready 失敗 (on_ready 未到達) — I2b: 巻き戻し
@@ -354,7 +365,7 @@ class ImproveSupervisor:
                     "compensating", period_key, k)
                 self._improve_loop.compensate_commit_failure(
                     ctx=ctx, now=self._clock.now(), exc=exc,
-                    slot_terminalize=False)
+                    slot_terminalize=False, tool_calls=result.tool_calls)
                 raise
             if not should_retry:
                 return

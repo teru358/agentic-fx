@@ -5,7 +5,7 @@ import itertools
 
 import pytest
 
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 
 # 設計書の変換表を、実装とは別に書き下した期待値 (定数名, result, reason)。
 EXPECTED = [
@@ -38,6 +38,8 @@ EXPECTED = [
     ("NOTICE_SELF_TEST_TOO_THIN", "gate_failed", "self_test_too_thin"),
     ("NOTICE_SELF_TEST_MUTATED", "gate_failed", "self_test_mutated"),
     ("NOTICE_SANDBOX_UNAVAILABLE", "failed", "sandbox_unavailable"),
+    ("NOTICE_GATE_SANDBOX_UNAVAILABLE", "gate_failed",
+     "gate_sandbox_unavailable"),
     ("NOTICE_UNVERIFIED", "gate_failed", "unverified"),
     ("NOTICE_MAX_BARS_LIMIT", "gate_failed", "max_bars_limit"),
     ("NOTICE_KIND_UNSUPPORTED", "gate_failed", "kind_unsupported"),
@@ -114,13 +116,14 @@ PLUGIN_GATE = {
     "pytest_failed": "NOTICE_PYTEST_FAILED",
     "self_test_too_thin": "NOTICE_SELF_TEST_TOO_THIN",
     "self_test_mutated": "NOTICE_SELF_TEST_MUTATED",
-    "sandbox_unavailable": "NOTICE_SANDBOX_UNAVAILABLE",
+    "sandbox_unavailable": "NOTICE_GATE_SANDBOX_UNAVAILABLE",
 }
 QUALITY = {
     "duplicate_logic": "NOTICE_DUPLICATE_LOGIC",
     "duplicate_metrics": "NOTICE_DUPLICATE_METRICS",
     "family_redirect": "NOTICE_FAMILY_REDIRECT",
     "comparison_base_unavailable": "NOTICE_COMPARISON_BASE_UNAVAILABLE",
+    "candidate_identity_unavailable": "NOTICE_UNVERIFIED",
 }
 
 
@@ -137,7 +140,7 @@ def test_quality_dictionary(code, name):
 def test_dictionaries_are_closed_sets():
     assert codes.PLUGIN_GATE_CODES == set(PLUGIN_GATE)
     assert codes.QUALITY_CODES == set(QUALITY)
-    assert len(codes.QUALITY_CODES) == 4
+    assert len(codes.QUALITY_CODES) == 5
 
 
 @pytest.mark.parametrize("lookup", [

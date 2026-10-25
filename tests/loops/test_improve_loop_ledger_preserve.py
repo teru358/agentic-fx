@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentic_fx.loops import improve_notice_codes as notice_codes
+from agentic_fx.loops.improve_loop import _plain_outcome_choice
+from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.loops.improve_loop import _REPORT_WRITE_FAILED
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
@@ -301,7 +302,7 @@ def test_finalize_report_or_observation_persists_outcome_report(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
         artifact={"type": "report"}, now=NOW,
-        notice=notice_codes.NOTICE_REPORT_PUBLISHED)
+        choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
@@ -325,7 +326,7 @@ def test_finalize_report_or_observation_persists_outcome_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "observation", "reason": "insufficient data"},
         now=NOW,
-        notice=notice_codes.NOTICE_OBSERVATION)
+        choice=_plain_outcome_choice(None, {"type": "observation", "reason": "insufficient data"}))
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",

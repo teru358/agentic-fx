@@ -11,7 +11,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agentic_fx.loops import improve_notice_codes as notice_codes
+from agentic_fx.loops.improve_loop import _plain_outcome_choice
+from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.config import load_settings
 from agentic_fx.loops import improve_context
 from agentic_fx.loops.improve_context import (
@@ -390,7 +391,7 @@ def test_agent_observation_cannot_persist_quality_redirect_prefix(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "observation", "reason": "family_redirect:abc_123"},
         now=NOW,
-        notice=notice_codes.NOTICE_OBSERVATION_NOT_SUBMITTED)
+        choice=_plain_outcome_choice(None, {"type": "observation", "reason": "family_redirect:abc_123"}))
     value = conn.execute(
         "SELECT last_result FROM improvement_backlog WHERE id=?", (backlog_id,)
     ).fetchone()[0]

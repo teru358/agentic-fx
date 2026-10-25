@@ -23,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentic_fx.loops import improve_notice_codes as notice_codes
+from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.runners.base import Mission, MissionResult

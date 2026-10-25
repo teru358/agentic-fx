@@ -478,3 +478,55 @@ def test_datafeed_outage_state_restricted_columns_are_added_to_an_old_table(tmp_
     assert (row["state"], row["epoch"]) == ("degraded", 3)
     assert row["restricted_since"] is None
     assert row["restricted_deadline_at"] is None
+
+
+def _ops_events_index_sql(conn):
+    return conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='ix_ops_events_code_ref'").fetchone()
+
+
+def test_ops_events_code_ref_index_exists_on_fresh_db(tmp_path):
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    row = _ops_events_index_sql(conn)
+    assert row is not None
+    assert "ops_events" in row[0] and "code" in row[0] and "ref" in row[0]
+
+
+def test_ops_events_code_ref_index_is_added_to_old_db(tmp_path):
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    conn.execute("DROP INDEX ix_ops_events_code_ref")
+    conn.commit()
+    assert _ops_events_index_sql(conn) is None
+    init_db(conn)
+    assert _ops_events_index_sql(conn) is not None
+    init_db(conn)
+    assert _ops_events_index_sql(conn) is not None
+
+
+def test_store_package_does_not_import_loops():
+    import ast
+    import pathlib
+
+    import agentic_fx.store as store_pkg
+
+    offenders = []
+    for path in pathlib.Path(store_pkg.__file__).parent.glob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            names = []
+            if isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+                if node.module == "agentic_fx":
+                    names += [f"agentic_fx.{a.name}" for a in node.names]
+            elif isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            if any(n == "agentic_fx.loops" or n.startswith("agentic_fx.loops.")
+                   for n in names):
+                offenders.append((path.name, node.lineno))
+    assert offenders == []

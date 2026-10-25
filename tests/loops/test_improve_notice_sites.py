@@ -11,7 +11,7 @@ import pytest
 
 import agentic_fx
 from agentic_fx.loops import improve_loop
-from agentic_fx.loops import improve_notice_codes as codes
+from agentic_fx import improve_notice_codes as codes
 
 SRC = Path(agentic_fx.__file__).parent
 LOOP_PATH = Path(improve_loop.__file__)
@@ -77,7 +77,7 @@ def _notice_names() -> set[str]:
 EXPECTED_FINISH_SITES = sorted([
     ("_compensate_prepare_failure", "notice"),
     ("_compensate_tx2_failure", "NOTICE_APPROVAL_TX_FAILED"),
-    ("_finalize_report_or_observation", "notice"),
+    ("_finalize_report_or_observation", "choice.notice"),
     ("_finalize_failed_mission", "failed_class.notice"),
     ("_finalize_gate_sandbox_unavailable", "NOTICE_SANDBOX_UNAVAILABLE"),
     ("_finalize_output_invalid", "NOTICE_OUTPUT_INVALID"),
@@ -102,10 +102,12 @@ EXPECTED_GATE_FAILED_CALLS = sorted([
     "notice_for_unevaluable_kind(strategy_verdict.unevaluable_kind)",
     "NOTICE_UNPROFITABLE",
 ])
-EXPECTED_REPORT_OR_OBSERVATION_CALLS = sorted([
-    "NOTICE_DEMOTED_RECOVERED",
-    "notice_for_quality(demotion.code)",
-    "plain_notice",
+EXPECTED_REPORT_OR_OBSERVATION_CHOICES = sorted([
+    "dataclass_replace(_select_observation(recovered_artifact), "
+    "observation_text=None, notice=NOTICE_DEMOTED_RECOVERED)",
+    "_ObservationChoice(demotion.last_result or f'observation:{demotion.reason}', "
+    "None, notice_for_quality(demotion.code))",
+    "_plain_outcome_choice(report_path, artifact)",
 ])
 EXPECTED_COMPENSATE_PREPARE_CALLS = sorted([
     "NOTICE_PREPARE_FAILED", "NOTICE_LAUNCH_CRASHED"])
@@ -149,14 +151,12 @@ def _is_allowed_notice_expr(expr: ast.expr, func_name: str) -> bool:
     # selector / 分類関数の戻り値から取り出した式
     if isinstance(expr, ast.Attribute) and expr.attr == "notice":
         return True
-    if isinstance(expr, ast.Name) and expr.id in {"plain_notice"}:
-        return True
     return False
 
 
 def test_every_notice_argument_is_a_constant_a_closed_lookup_or_a_selector_result():
     names = ("finish_improve_mission", "_finalize_gate_failed",
-             "_finalize_report_or_observation", "_compensate_prepare_failure")
+             "_compensate_prepare_failure")
     for name in names:
         for call in _calls(name):
             expr = _kw(call, "notice")
@@ -165,7 +165,7 @@ def test_every_notice_argument_is_a_constant_a_closed_lookup_or_a_selector_resul
                 name, ast.unparse(expr))
 
 
-def test_plain_and_failed_notice_names_are_bound_from_the_single_classifiers():
+def test_failed_notice_name_is_bound_from_the_single_classifier():
     bound = {}
     for node in ast.walk(TREE):
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
@@ -174,7 +174,6 @@ def test_plain_and_failed_notice_names_are_bound_from_the_single_classifiers():
                 for name in ast.walk(target):
                     if isinstance(name, ast.Name):
                         bound.setdefault(name.id, set()).add(fn)
-    assert bound["plain_notice"] == {"_plain_outcome_notice"}
     assert bound["failed_class"] == {"_classify_failed_mission"}
 
 
@@ -188,8 +187,9 @@ def test_gate_failed_helper_call_sites_each_pass_their_own_notice():
 def test_report_or_observation_helper_call_sites_each_pass_their_own_notice():
     calls = _calls("_finalize_report_or_observation")
     assert {_func_of(c) for c in calls} == {"commit"}
-    assert sorted(ast.unparse(_kw(c, "notice")) for c in calls) \
-        == EXPECTED_REPORT_OR_OBSERVATION_CALLS
+    assert all(_kw(c, "notice") is None for c in calls)
+    assert sorted(ast.unparse(_kw(c, "choice")) for c in calls) \
+        == EXPECTED_REPORT_OR_OBSERVATION_CHOICES
 
 
 def test_prepare_failure_compensation_call_sites_each_pass_their_own_notice():
@@ -200,10 +200,19 @@ def test_prepare_failure_compensation_call_sites_each_pass_their_own_notice():
 
 
 @pytest.mark.parametrize("helper", [
-    "_finalize_gate_failed", "_finalize_report_or_observation",
-    "_compensate_prepare_failure"])
+    "_finalize_gate_failed", "_compensate_prepare_failure"])
 def test_helper_notice_parameter_is_required(helper):
     assert not _param_has_default(_funcdef(helper), "notice")
+
+
+def test_report_or_observation_helper_takes_only_the_choice():
+    func = _funcdef("_finalize_report_or_observation")
+    params = [a.arg for a in func.args.kwonlyargs + func.args.args]
+    assert "choice" in params
+    assert "notice" not in params
+    assert "observation_choice" not in params
+    assert "quality_last_result" not in params
+    assert not _param_has_default(func, "choice")
 
 
 def test_finish_improve_mission_notice_and_tool_calls_are_required():
@@ -329,7 +338,7 @@ NOTICE_BUILDING_FUNCTIONS = (
     "_finalize_output_invalid", "_finalize_loser", "_finalize_success",
     "_prepare_report_if_applicable", "_compensate_prepare_failure",
     "_compensate_tx2_failure", "compensate_commit_failure",
-    "compensate_launch_failure", "_plain_outcome_notice",
+    "compensate_launch_failure", "_plain_outcome_choice",
     "_classify_failed_mission", "_run_plugin_gate", "_check_candidate_quality",
     "_quality_rejection", "_quality_unavailable")
 

@@ -507,6 +507,7 @@ CREATE TABLE IF NOT EXISTS ops_events (
   ref TEXT NOT NULL,
   fields_json TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_ops_events_code_ref ON ops_events(code, ref);
 CREATE TABLE IF NOT EXISTS ops_policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL UNIQUE,
