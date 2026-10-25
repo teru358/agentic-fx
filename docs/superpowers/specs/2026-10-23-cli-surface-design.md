@@ -1,6 +1,6 @@
 # afx / afx ctl コマンド面整理設計書
 
-**版:** v0.5 (policy の安全な照合・移行・読取 API と明示 reconcile、alias 期限、help の正本、argv shim の前置き flag)
+**版:** v0.5u (policy の安全な照合・移行・読取 API と明示 reconcile、alias 期限、help の正本、argv shim の前置き flag)
 
 **対象:** `cli-surface-principle-and-reorg`
 
@@ -30,7 +30,7 @@
 ### 0.1 範囲外
 
 - ウィザード対話の見栄えは別束である。
-- `afx news` の本体は `news-source-cli-and-429-backoff` で設計する。本書では群の planned metadata だけを定義し、実装まで help には出さない。
+- `afx news` はニュース源を管理するローカル操作である。取得先 URL は表示・activity に出さない。
 - 発注系 API は追加しない。
 - `afx-ops <bot|web|notify>` は unit の入口であり、利用者向け操作面ではない。
 - daemon や売買ロジックの動作は変えない。
@@ -81,7 +81,8 @@
 | 稼働観測・実行追跡 | `afx ctl` | `afx ctl events [--after ID] [--limit N] [--follow]` | `[読取]` | `events.read` | はい | `client.py:911,956,1052`; `service.py:84` |
 | 稼働観測・実行追跡 | `afx ctl` | `afx ctl jobs get <id>` | `[読取]` | `jobs.own` | はい | `client.py:949,1048`; `service.py:83` |
 | 稼働観測・実行追跡 | `afx ctl` | `afx ctl jobs cancel <id>` | `[変更] [確認]` | `jobs.own` | はい | `client.py:949,1305`; `service.py:110` |
-| 市場入力を整える | `afx` | `afx news …` | `[読取] / [変更]` は下位操作ごと | — | いいえ | 後続 `news-source-cli-and-429-backoff`。本書は予約行のみ |
+| 市場入力を整える | `afx` | `afx news list` / `test <name>` | `[読取]` | — | いいえ | `news_cli.py` |
+| 市場入力を整える | `afx` | `afx news add <name> <url>` / `enable <name>` / `disable <name>` | `[変更]` | — | いいえ | `news_cli.py` |
 | 市場入力を整える | `afx` | `afx history import …` | `[変更]` | — | いいえ | `backtest/cli.py:68-78` |
 | 市場入力を整える | `afx` | `afx history compare …` | `[読取]` | — | いいえ | `backtest/cli.py:80-84` |
 | 市場入力を整える | `afx` | `afx history coverage …` | `[読取]` | — | いいえ | `backtest/cli.py:86-92` |
@@ -187,7 +188,7 @@ argv shim はすべて、現行 `entry.main()` と同じ方法で command head �
 | `shell` | 対話 shell に存在するか |
 | `classified` | 7 群の分類表に載せるか。shell 専用 `stop` は false |
 | `implemented`, `exposed` | parser / endpoint 実装済みか、help 公開済みか。`exposed=True` は `implemented=True` を必須とする |
-| `planned` | `news` のように別束で実装する予約行か。`planned=True` は通常 help から必ず除外 |
+| `planned` | 将来の別束で実装する予約行か。`planned=True` は通常 help から必ず除外 |
 | `deprecated_since`, `remove_in` | 廃止 compatibility record の package version。通常 record は `None` |
 
 `implemented` は record ごとに持つ。`ops <feature> reconfigure` は 3 機能分の record を持ち、値を次で固定する。web は `implemented=True, exposed=True` である。§0.1 の web-lan spec が動作本体 `run_ops_reconfigure(root, feature) -> int` を作るのは web だけなので、bot と notify は `implemented=False, exposed=False` である。web の値は web-lan の本体が main に入っていることを前提とし、I1 はその merge 後に着手する (§10.2)。`implemented=False` の機能の `reconfigure` は parser に登録せず、help にも出さない。
@@ -214,12 +215,12 @@ formatter の幅を 100 に固定し、stdout 全体を次の byte 列と一致�
 
 ```text
 usage: afx [-h] [--daemon] [--root DIR]
-           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
+           {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
@@ -228,6 +229,7 @@ positional arguments:
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
+    news                [下位操作ごと] 市場ニュース源を扱う
     backtest            [変更] バックテスト
     analyze             [変更] 履歴分析
     plugin              [下位操作ごと] plugin の採否・配備・表示
@@ -244,7 +246,7 @@ options:
 用途                     daemon 不要                稼働 daemon
 導入・接続管理           init / check / keys / ops  ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
-市場入力を整える         history                    —
+市場入力を整える         news / history             —
 調査・評価する           backtest / analyze         —
 問い合わせ・改善運用     —                          ctl ask / improve / backlog / policy / reflect
 Plugin を採否・配備する  plugin                     ctl approval / approve / reject
@@ -336,7 +338,7 @@ options:
 
 ### 3.2.2 help に出す条件
 
-`news` は `planned=True, implemented=False, exposed=False` の予約 record とし、本 release の choices と help には出さない。同様に `backlog list` / `policy show` / `policy remove` / `policy reconcile` は B の parser / endpoint と test が完了するまで `exposed=False` とし、最終統合 task でだけ true にする。help は実装済みの利用可能性を表す契約である。
+`news` は親 record とし、list / test は `[読取]`、add / enable / disable は `[変更]` の葉 record とする。help は実装済みの利用可能性を表す契約である。
 
 ### 3.3 `afx ctl help` の固定出力
 
@@ -388,7 +390,7 @@ API に発注・SL 変更・クローズ・サービス停止は無い。
 
 ### 3.4 一致 test
 
-- `cli_surface.py` の正式な local 親 command と argparse の全 `add_parser` を一致させる。`ops` は機能 → 動詞の 2 段まで比較する。予約行 `news` と `ctl` ダミー parser は明示的な例外集合にする。
+- `cli_surface.py` の正式な local 親 command と argparse の全 `add_parser` を一致させる。`ops` は機能 → 動詞の 2 段まで比較する。`ctl` ダミー parser は明示的な例外集合にする。
 - ctl の正式名と互換別名を parser table 化するか、独立 fixture から `parse()` へ全語順を与える。各正式名は 1 record にだけ対応させる。
 - API command の `endpoint_code`、scope、mutating の文字列を `ENDPOINTS` と比較する。この surface ↔ `ENDPOINTS` 照合 (AC-4) は I1 で有効化し、schema task 単独の完了条件にはしない。
 - `[読取]` は `ENDPOINTS[code].mutating is False` と一致させる。`[変更]` は `True` と一致させる。
@@ -884,7 +886,7 @@ survey §2 の集計は 6 パターンで 248 行 / 46 ファイルであるが�
 | AC-24 | offline status の各 source が例外でも traceback を出さず、読めない節だけ `unavailable`、rc=1 になる。全 source が読めると rc=0 | source ごとの fault injection |
 | AC-25 | shell help は `shell=True` から生成され、`backlog add`、`classified=False` の `stop`、deprecated 末尾 1 行を出す。旧 `improve add` は同一動作、`stop` は現行の graceful shutdown 要求になる | shell help snapshot、dispatch spy、既存 16 node の更新 |
 | AC-26 | ops-api の 7 群順、README anchor link、§7.2 (c) の正式名 9 つ、local / ctl ラベルが存在し、現行手順の旧名が 0 件である。ops-api 文書に `backlog list [--all] [--limit N]` と `policy remove` の managed だけという制約が出る。どれか 1 つを文書から消す変異で落ちる。CLAUDE.md は release 手動確認 | `test_first_run_acceptance_doc.py` と追跡文書 grep pin |
-| AC-27 | `news` は `planned=True, implemented=False, exposed=False` で、本 release の choices / help / parser / API endpoint のいずれにも出ない | full help golden と planned 例外 pin |
+| AC-27 | `news` は local 親 command と 5 葉 record を持ち、choices / help / parser に出るが API endpoint には出ない | full help golden と parser pin |
 | AC-28 | daemon 稼働中の `ops enable` は rc=1 拒否へ変異されず、marker → stop → lock → enroll / install → unlock → restart の順で完了する。元が停止中なら再起動しない | 既存 durable stage test と mutation test |
 | AC-29 | 空 root、主要 file 不在、settings 破損、DB 不在、鍵不在、DB sidecar 有り / 無しの locked / free / unknown すべてで、実行前後の tree が同一である。例外は sidecar 有りのときの `data/agentic.db-wal` と `data/agentic.db-shm` だけで、`data/agentic.db` は byte 一致する。sidecar 無しの DB では sidecar が作られない | recursive tree manifest と byte compare |
 | AC-30 | instance lock 不在 / unreadable は `instance: unknown`、state reader 0 回となり、locked / free / unknown すべてで「観測時点」固定文を出す | lock fault injection、stdout snapshot、spy |
@@ -1016,7 +1018,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 
 ## 11. 後続と非目標
 
-- `afx news` の parser、source 選択、429 backoff は `news-source-cli-and-429-backoff` で行う。
+- `afx news` の parser と source 選択は `news_cli.py` が担い、待機状態は健康記録を読む。
 - 対話 shell の廃止は §8.2-1 のユーザー裁定後、次 major 向けの別束とする。本 release は deprecated 表示までである。
 - bare `afx` の daemon 起動挙動は本束で変えない。
 - 人間が書いた policy の手書き行は API 管理下へ移行しない。システムが書いた旧形式の行は §5.3.2 の規則で 1 回だけ移行する。対象は DB 行と文面が一致する行だけで、DB 行の無い旧 shell / 旧初回設定の行は unmanaged のまま残る。
@@ -1038,7 +1040,7 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 - instance lock の probe は shared lock を 1 回取って直ちに解放するが、その瞬間に重なった `LOCK_EX|LOCK_NB` の取得 (daemon 起動、`afx keys`、`afx init` 等) は失敗し得る。窓は flock の system call 2 回の間に限られる。daemon は `Restart=on-failure` で再試行され (`setup/unit.py:47`)、他の操作は利用者が再実行する。
 - `locked-by` は marker からの推定である。marker を書かない保持者 (`afx keys`、marker を書く前の `afx init`、post_start) も `unknown (daemon 稼働中とみられる)` と出る。`next` の `afx ctl status` が失敗したら、利用者はその保持者の完了を待って `afx status` を再実行する。
 - `immutable=1` の観測用接続は並行 writer を無視する。sidecar の無い DB を読んでいる間に daemon が起動して書き始めると、古い内容を読むか読取が失敗する。表示は「観測時点」の診断に限る。
-- `news` は planned metadata だけに存在し、実装まで help に出ない。metadata だけが陳腐する可能性は後続束で解消する。
+- `news` は local CLI の metadata と parser が同じ 5 操作を公開する。API endpoint は持たない。
 
 ## 13. 変更履歴
 
@@ -1069,3 +1071,4 @@ console script `afx` (`pyproject.toml` の `[project.scripts]`) は `uv sync` �
 | 2026-10-25 | v0.5r | §5.3.4: 方針文の失敗は課題の入力へ続く、本文検査を先頭 reconcile の前に、上限は `POLICY_TEXT_LIMIT` 1 定数、file 側の重複判定を行単位完全一致に、空メッセージ例外は `__cause__`、案内文は正式名 | B2c merge 後の /code-review 8 件 (採用 6 / 却下 2、裁定 tmp/review-cli/reports/b2c/b2c-cr2-rulings.md) | |
 | 2026-10-25 | v0.5s | §13 新設: root の解決順 (`--root` → `AFX_ROOT` → 上方探索 → cwd)、`uv tool install` による PATH 配置の文書化、`afx completion bash` (record から生成、bash のみ)、AC-44〜47。§3.2 等の golden は実装出力を写して改訂する | チケット afx-on-path-and-root-resolution (ユーザー裁定 2026-10-25: 優先 中、補完は静的生成の案 2) | |
 | 2026-10-25 | v0.5t | §13.1: 上方探索は init と --daemon に適用しない、所有者が異なる directory で探索を止める、エラー文は指定値を含む、symlink の marker は辿った先で判定。§13.3: 生成物は bash-completion の利用者 directory へ、`local IFS`。§13.4: completion は用途表に載せない (100 桁) | afx-path /code-review high 8 件 (採用 7 / 却下 1 = zsh の固定文は spec どおり) と指揮者検収 3 件 | |
+| 2026-10-25 | v0.5u | `afx news` を local 親 command と 5 操作として公開し、help golden、分類表、照合規則、AC を現行実装へ更新 | ニュース源管理 CLI の実装 | |

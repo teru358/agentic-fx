@@ -17,12 +17,12 @@ from agentic_fx.entry import main as entry_main
 
 
 TOP_HELP = """usage: afx [-h] [--daemon] [--root DIR]
-           {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin} ...
+           {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin} ...
 
 agentic-fx
 
 positional arguments:
-  {init,check,keys,ops,completion,ctl,status,history,backtest,analyze,plugin}
+  {init,check,keys,ops,completion,ctl,status,history,news,backtest,analyze,plugin}
     init                [変更] 初期設定 (対話。`--non-interactive` で従来の非対話)
     check               [下位操作ごと] 設定と実行環境の検査 (`backend` は非隔離・課金ありの接続確認)
     keys                [変更] 操作 API の鍵管理 (停止中のみ)
@@ -31,6 +31,7 @@ positional arguments:
     ctl                 稼働中の daemon を操作 API で操作する (afx ctl help)
     status              [読取] オフライン状態を書き込まずに表示する
     history             [下位操作ごと] 履歴データ操作
+    news                [下位操作ごと] 市場ニュース源を扱う
     backtest            [変更] バックテスト
     analyze             [変更] 履歴分析
     plugin              [下位操作ごと] plugin の採否・配備・表示
@@ -47,7 +48,7 @@ options:
 用途                     daemon 不要                稼働 daemon
 導入・接続管理           init / check / keys / ops  ctl whoami
 稼働観測・実行追跡       status                     ctl status / log / activity / events / jobs
-市場入力を整える         history                    —
+市場入力を整える         news / history             —
 調査・評価する           backtest / analyze         —
 問い合わせ・改善運用     —                          ctl ask / improve / backlog / policy / reflect
 Plugin を採否・配備する  plugin                     ctl approval / approve / reject
@@ -225,7 +226,7 @@ def test_help_golden_is_uncolored_narrow_and_hides_compatibility_choices(capsys,
                     for char in line)
         assert width <= 100, line
     assert "{improve" not in output
-    assert "news" not in output
+    assert "news" in output
     assert "reconf}" not in output
     assert "<feature> enable|disable|status" not in output
 
@@ -404,7 +405,7 @@ def test_top_overview_rows_follow_the_records():
         r for r in records if r.command.split()[0] != "history" and r.command != "ctl whoami"))
     rows = {group.value: line for line in renderer.render_top_epilog().splitlines()
             for group in cli_surface.Group if line.startswith(group.value)}
-    assert rows["市場入力を整える"].split() == ["市場入力を整える", "—", "—"]
+    assert rows["市場入力を整える"].split() == ["市場入力を整える", "news", "—"]
     assert rows["導入・接続管理"].split() == [
         "導入・接続管理", "init", "/", "check", "/", "keys", "/", "ops", "—"]
     assert "history" not in "".join(rows.values())
@@ -571,7 +572,6 @@ def test_every_exposed_local_record_has_one_argparse_node_and_no_other_node_exis
     expected |= {f"afx {parent.command}" for parent in cli_surface.PARENTS
                  if not parent.command.startswith("ctl ") and parent.command != "ctl"}
     exceptions = {"afx ctl"}  # `afx ctl` is handed to the client before argparse; only its help row is registered
-    assert "afx news" not in registered  # planned, not yet a command
     assert set(registered) - exceptions == expected
     assert exceptions <= set(registered)
 

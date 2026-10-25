@@ -16,7 +16,7 @@ from agentic_fx.cli_surface import (COMMANDS, COMPATIBILITY_RECORDS, HelpFormatt
                                     render_top_epilog, top_description, version_tuple)
 from agentic_fx.ops.contracts import Principal
 
-_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin")
+_BACKTEST_COMMANDS = ("history", "backtest", "analyze", "plugin", "news")
 
 
 class _OpsOptionError(Exception):

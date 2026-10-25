@@ -102,6 +102,21 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
 
+    news = sub.add_parser("news", **_surface_parser_kw("news"))
+    news_sub = news.add_subparsers(dest="news_command", required=True)
+    news_sub.add_parser("list", **_surface_parser_kw("news list", leaf=True))
+    add = news_sub.add_parser("add", **_surface_parser_kw("news add", leaf=True))
+    add.add_argument("name")
+    add.add_argument("url")
+    add.add_argument("--fetcher", choices=("feed", "web"), default="feed")
+    add.add_argument("--yes", action="store_true")
+    enable = news_sub.add_parser("enable", **_surface_parser_kw("news enable", leaf=True))
+    enable.add_argument("name")
+    disable = news_sub.add_parser("disable", **_surface_parser_kw("news disable", leaf=True))
+    disable.add_argument("name")
+    test = news_sub.add_parser("test", **_surface_parser_kw("news test", leaf=True))
+    test.add_argument("name")
+
     backtest = sub.add_parser("backtest", **_surface_parser_kw("backtest"))
     backtest_sub = backtest.add_subparsers(dest="backtest_command",
                                            required=True)
@@ -812,6 +827,9 @@ def verify_backend_command(root: Path, args: argparse.Namespace) -> int:
 
 
 def dispatch(args: argparse.Namespace, root: Path) -> int:
+    if args.command == "news":
+        from agentic_fx.news_cli import dispatch_news
+        return dispatch_news(args, root)
     # `plugin versions` は何も書かない読み取り専用の表示なので、state ファイルの
     # lock を作りうる初期化確認を通さない (DB が無ければ自身で案内して終わる)。
     read_only_view = args.command == "plugin" and args.plugin_command in {"versions", "list"}

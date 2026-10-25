@@ -578,6 +578,33 @@ def connect_observer_readonly(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def connect_existing_rw(db_path: Path) -> sqlite3.Connection:
+    """Open an existing database for mutation without ever creating it.
+
+    This is intentionally separate from :func:`connect`: command-line news
+    operations must not initialise a root as a side effect of an attempted
+    edit.  The URI mode is the authority; the preliminary file check merely
+    gives callers a stable error for the common missing-file case.
+    """
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        raise RuntimeError(
+            f"SQLite {sqlite3.sqlite_version} is too old (>= 3.35 required)")
+    path = Path(db_path)
+    if not path.is_file():
+        raise FileNotFoundError("connect_existing_rw requires an existing DB")
+    uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=rw"
+    try:
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    except sqlite3.OperationalError as exc:
+        if "unable to open" in str(exc).lower():
+            raise FileNotFoundError("connect_existing_rw requires an existing DB") from None
+        raise
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
     """読み取り専用で SQLite に接続する (mission worker 子プロセス専用 —
     設計書 §3.4 codex I-7)。
