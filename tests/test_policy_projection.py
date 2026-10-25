@@ -257,6 +257,43 @@ def test_insert_policy_commits_and_returns_stable_integer_id():
         "request-1", "risk small")
 
 
+def test_insert_policy_rolls_back_the_pending_insert_when_commit_fails():
+    class CommitFails(sqlite3.Connection):
+        fail = False
+
+        def commit(self):
+            if self.fail:
+                raise sqlite3.OperationalError("disk I/O error")
+            super().commit()
+
+    conn = sqlite3.connect(":memory:", factory=CommitFails)
+    conn.execute("CREATE TABLE ops_policies (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                 "request_id TEXT NOT NULL UNIQUE, directive TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.commit()
+    conn.fail = True
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        insert_policy(conn, "risk small", request_id="request-1", now="2026-10-23T00:00:00+00:00")
+
+    assert conn.execute("SELECT COUNT(*) FROM ops_policies").fetchone()[0] == 0
+    assert not conn.in_transaction
+
+
+def test_insert_policy_reraises_the_commit_error_when_rollback_also_fails():
+    class Broken:
+        def execute(self, *_args):
+            return type("Cursor", (), {"lastrowid": 1})()
+
+        def commit(self):
+            raise sqlite3.OperationalError("commit failed")
+
+        def rollback(self):
+            raise sqlite3.OperationalError("rollback failed")
+
+    with pytest.raises(sqlite3.OperationalError, match="commit failed"):
+        insert_policy(Broken(), "risk small", request_id="r", now="2026-10-23T00:00:00+00:00")
+
+
 def test_startup_reconcile_runs_without_policy_rows_and_does_not_block_on_error():
     events = []
 

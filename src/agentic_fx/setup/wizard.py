@@ -32,9 +32,10 @@ import httpx
 import yaml
 
 from agentic_fx import service
-from agentic_fx._safe_error import safe_error_text, safe_text
+from agentic_fx._safe_error import one_line_error, safe_error_text, safe_text
 from agentic_fx.activity import ActivityLog, Category
-from agentic_fx.commands import add_backlog_idea, append_policy_directive
+from agentic_fx.commands import (
+    POLICY_WRITE_ERRORS, PolicyFileNotReflected, add_backlog_idea, add_policy_directive)
 from agentic_fx.config import MAX_STORED_DECISION_INTERVAL_MIN, Settings, load_settings_text
 from agentic_fx.core import improve_admission, landlock
 from agentic_fx.core.contracts import Mode
@@ -359,8 +360,7 @@ class _Session:
 
 
 def _one_line(value: object, limit: int = 120) -> str:
-    text = " ".join(safe_error_text(value).split()) if not isinstance(value, str) else " ".join(value.split())
-    return text[:limit]
+    return one_line_error(value, limit)
 
 
 def _check_record(result: CheckResult) -> dict[str, str]:
@@ -1989,20 +1989,11 @@ def _text_length(path: Path) -> int:
         return 0
 
 
-def _backlog_count(root: Path) -> int | None:
-    db_path = root / "data" / "agentic.db"
-    if not db_path.is_file():
-        return None
-    try:
-        conn = connect_readonly(db_path)
-    except Exception:  # noqa: BLE001
-        return None
+def _backlog_count(conn) -> int | None:
     try:
         return int(conn.execute("SELECT COUNT(*) FROM improvement_backlog").fetchone()[0])
     except sqlite3.Error:
         return None
-    finally:
-        conn.close()
 
 
 _POLICY_EXAMPLES = (
@@ -2016,45 +2007,60 @@ _BACKLOG_EXAMPLE = "標準指標だけで組める {timeframe} 足の押し目�
 def _stage12(sess: _Session, a: Answers | None) -> None:
     sess.say("")
     sess.say("[段 12 方針文と最初の課題]")
-    path = directives_path(sess.root)
-    count = _backlog_count(sess.root)
-    sess.say(f"既存の方針文: {_text_length(path)} 文字 / 改善課題: {count if count is not None else '不明'} 件")
-    sess.say("方針文は取引判断と改善の全 mission に注入される運用者の方針です。")
-    if a is None:
-        settings = _load_settings((sess.root / "config" / "settings.yaml").read_text(encoding="utf-8"))
-        pair, timeframe = settings.pairs[0], settings.datafeed.decision_timeframe
-    else:
-        pair, timeframe = a.pairs[0], a.timeframe
-    examples = tuple(example.format(pair=pair, timeframe=timeframe) for example in _POLICY_EXAMPLES)
-    backlog_example = _BACKLOG_EXAMPLE.format(timeframe=timeframe)
-    for example in examples:
-        sess.say(f"例: 「{example}」")
-    sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
-    written = 0
-    activity = ActivityLog(sess.root / "logs" / "activity.log")
-    while True:
-        raw = sess.ask("方針文: ", allow_quit=False)
-        entries = examples if raw == "e" else (" ".join(raw.split()),)
-        if not entries[0]:
-            break
-        for text in entries:
-            if text in (_read_text(path) or ""):
-                sess.say("方針文は追加済みです。")
-                continue
-            try:
-                append_policy_directive(path, activity, text)
-                written += 1
-            except OSError as error:
-                sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
-                return
-    sess.say(f"方針文を {written} 行書きました。")
-    sess.say("課題は改善ループが最初に取り組む 1 件です。")
-    sess.say(f"例: 「{backlog_example}」")
-    sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
-    added = 0
-    conn = None
     try:
         conn = connect(sess.root / "data" / "agentic.db")
+    except (sqlite3.Error, OSError) as error:
+        sess.say(f"警告: データベースを開けませんでした ({_one_line(error)})。"
+                 "方針文と最初の課題はあとから afx ctl policy add / afx ctl backlog add で足せます。")
+        return
+    try:
+        path = directives_path(sess.root)
+        count = _backlog_count(conn)
+        sess.say(f"既存の方針文: {_text_length(path)} 文字 / 改善課題: {count if count is not None else '不明'} 件")
+        sess.say("方針文は取引判断と改善の全 mission に注入される運用者の方針です。")
+        if a is None:
+            settings = _load_settings((sess.root / "config" / "settings.yaml").read_text(encoding="utf-8"))
+            pair, timeframe = settings.pairs[0], settings.datafeed.decision_timeframe
+        else:
+            pair, timeframe = a.pairs[0], a.timeframe
+        examples = tuple(example.format(pair=pair, timeframe=timeframe) for example in _POLICY_EXAMPLES)
+        backlog_example = _BACKLOG_EXAMPLE.format(timeframe=timeframe)
+        for example in examples:
+            sess.say(f"例: 「{example}」")
+        sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
+        written = 0
+        activity = ActivityLog(sess.root / "logs" / "activity.log")
+        while True:
+            raw = sess.ask("方針文: ", allow_quit=False)
+            entries = examples if raw == "e" else (" ".join(raw.split()),)
+            if not entries[0]:
+                break
+            for text in entries:
+                try:
+                    duplicate = text in (_read_text(path) or "") or conn.execute(
+                        "SELECT 1 FROM ops_policies WHERE directive=? LIMIT 1", (text,)).fetchone() is not None
+                except (sqlite3.Error, OSError, UnicodeDecodeError) as error:
+                    sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
+                    return
+                if duplicate:
+                    sess.say("方針文は追加済みです。")
+                    continue
+                try:
+                    add_policy_directive(conn, path, activity, text, sess.now())
+                    written += 1
+                except PolicyFileNotReflected as error:
+                    cause = error.__cause__ or error
+                    sess.say("警告: 方針文は記録しましたが policy/directives.md へ反映できませんでした "
+                             f"({_one_line(cause)})。afx の次回起動時に反映されます。")
+                    return
+                except POLICY_WRITE_ERRORS as error:
+                    sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
+                    return
+        sess.say(f"方針文を {written} 行書きました。")
+        sess.say("課題は改善ループが最初に取り組む 1 件です。")
+        sess.say(f"例: 「{backlog_example}」")
+        sess.say("後から `afx ctl policy add` / `afx ctl improve add` で足せます。空 Enter で飛ばせます。e で例文を入れます。")
+        added = 0
         while True:
             raw = sess.ask("最初の課題: ", allow_quit=False)
             if raw == "e":
@@ -2076,10 +2082,9 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
             except (sqlite3.Error, OSError) as error:
                 sess.say(f"警告: 課題を追加できませんでした ({_one_line(error)})。")
                 break
+        sess.say(f"最初の課題を {added} 件追加しました。")
     finally:
-        if conn is not None:
-            conn.close()
-    sess.say(f"最初の課題を {added} 件追加しました。")
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.ops_setup.interactive import EnableResult
+from agentic_fx.policy_projection import inspect_policy_file
 from agentic_fx.ops_setup.setup_lease import SetupLeaseBusy, acquire_setup_lease
 from agentic_fx.setup import post_start, unit as unit_module, wizard
 from agentic_fx.setup.wizard import IndicatorOutcome, WizardContext, run_wizard
@@ -75,8 +76,16 @@ def test_policy_lines_and_first_ideas_are_written_one_at_a_time(tmp_path):
         ("このまま追加しますか", "n")))
     assert run_wizard(root, io, deps) == 0, io.text
     directives = (root / "policy" / "directives.md").read_text()
-    assert directives == "\n- ボラティリティ収縮の後を重視する\n\n- 損切りを広げない\n"
+    assert directives == ("<!-- afx:managed-policy id=1 -->\n"
+                          "- ボラティリティ収縮の後を重視する\n"
+                          "<!-- /afx:managed-policy id=1 -->\n"
+                          "<!-- afx:managed-policy id=2 -->\n"
+                          "- 損切りを広げない\n"
+                          "<!-- /afx:managed-policy id=2 -->\n")
     conn = sqlite3.connect(root / "data" / "agentic.db")
+    assert conn.execute("SELECT directive FROM ops_policies ORDER BY id").fetchall() == [
+        ("ボラティリティ収縮の後を重視する",), ("損切りを広げない",)]
+    assert inspect_policy_file(conn, root / "policy" / "directives.md").status == "ok"
     rows = conn.execute("SELECT idea, source FROM improvement_backlog").fetchall()
     assert rows == [("ボリンジャーバンドの逆張りを検討する", "user")]
     assert "プレースホルダ" in io.text
