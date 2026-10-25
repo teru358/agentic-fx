@@ -1,6 +1,6 @@
 # afx news (ニュース源の操作) と取得の連続失敗バックオフ設計書
 
-**版:** v0.1 C0 (指揮者承認前の清書)
+**版:** v0.2 (裁定 6 点を反映。2026-10-25 ユーザー裁定「すべて推奨で」)
 
 **対象:** `news-source-cli-and-429-backoff` (2026-10-15 のユーザー承認骨子、2026-10-16 に User-Agent の件を吸収)
 
@@ -129,7 +129,7 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 
 ### 3.5 User-Agent
 
-`feed` / `web` の取得はどちらも、固定の `User-Agent: agentic-fx/<版> (+<repo URL>)` を付ける。版は package のメタデータから読む。ブラウザを装う値は使わない。定義は 1 箇所に置き、`afx news add` / `test` の取得も同じ関数を通る (収集器と試験取得で挙動が分かれない)。repo URL の値は §7 の確認事項。
+`feed` / `web` の取得はどちらも、固定の `User-Agent: agentic-fx/<版> (+https://github.com/teru358/agentic-fx)` を付ける。版は `importlib.metadata` から、URL は `pyproject.toml` の `[project.urls]` の `Repository` から読んで組み立てる (§7 の裁定 1)。URL を他の場所に文字列で複製しない。ブラウザを装う値は使わない。定義は 1 箇所に置き、`afx news add` / `test` の取得も同じ関数を通る (収集器と試験取得で挙動が分かれない)。
 
 ### 3.6 外向きリクエストの予算
 
@@ -154,7 +154,7 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 | AC-3 | 待機中の周期は取得 0 回、期限ごとに `news_source_skipped` が 1 行 (周期を 2 回回しても 1 行)。期限を 1 秒過ぎた最初の周期で 1 回取得する。成功で連続失敗と期限が消え、以後の失敗は f=1 から数える | 収集器 test、activity の行数 |
 | AC-4 | 数える失敗と数えない失敗。429 / 5xx (Retry-After なし)、404、タイムアウトは数える。Retry-After 付きの 429 / 503、0 件の成功、未知の取得方式は連続失敗を増やさない | 例外種の直積 test |
 | AC-5 | 再起動をまたぐ。f=3 で待機中に収集器を作り直しても待機が続き、取得 0 回。健康記録が壊れた値なら待機なしとして取得し、書き直す。永続層が例外でも取得が続く | 収集器の再生成 test、fault injection |
-| AC-6 | `feed` / `web` のすべての外向き取得 (収集器、`add`、`test`) に `User-Agent: agentic-fx/<版> (+<URL>)` が付く。python-httpx 既定の値は出ない | httpx の送信記録 (mock transport) |
+| AC-6 | `feed` / `web` のすべての外向き取得 (収集器、`add`、`test`) に `User-Agent: agentic-fx/<版> (+<URL>)` が付く。python-httpx 既定の値は出ない。版と URL は pyproject の `version` と `[project.urls]` `Repository` に一致する (pyproject を読む test で pin。コード側に URL の文字列リテラルが無い) | httpx の送信記録 (mock transport)、pyproject との照合 test |
 | AC-7 | `list` と `test` は実行前後で DB (全 table と `alert_state`)、activity log、RAG ディレクトリが byte 一致。DB が無いとき `list` は DB を作らず rc=1 | before/after の tree と DB の比較 |
 | AC-8 | rc 規則。名前・URL・`--fetcher` の文法違反と使い方の誤りは rc=2 で、取得 0 回・DB 書込 0 回。源が無い・重複・取得失敗・確認拒否・非対話で `--yes` 無しは rc=1。冪等な `enable` / `disable` は rc=0 で activity を増やさない | CLI test |
 | AC-9 | `add` の取得は 1 回だけで再試行しない。0 件は確認、`y` 以外は追加しない。`--yes` で 0 件を通すが、取得失敗は通らない。件数 1 以上は確認しない。名前または URL の重複は取得の前に rc=1 | 取得回数の spy、DB |
@@ -169,7 +169,8 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 
 | 区分 | file | 内容 |
 |---|---|---|
-| 新規 | `datafeed/user_agent.py` (仮) | 固定 UA の組み立て 1 箇所 |
+| 新規 | `datafeed/user_agent.py` (仮) | 固定 UA の組み立て 1 箇所 (`importlib.metadata` の版 + `Repository` URL) |
+| 変更 | `pyproject.toml` | `[project.urls]` に `Repository = "https://github.com/teru358/agentic-fx"` を足す (現状は無い) |
 | 新規 | `store/news_health.py` (仮) | 源の健康記録の読み書きと段階計算 (純関数 + `alert_state`) |
 | 変更 | `datafeed/fetchers.py` | 両 `httpx.get` に UA |
 | 変更 | `datafeed/news_collector.py` | 失敗の分類、段階待機、健康記録、`news_source_skipped` の文面 |
@@ -181,22 +182,31 @@ fxstreet-news             有効  feed  直近: 失敗 (HTTP 429)  2026-10-25 09
 | 変更 | チケット | 起票時の骨子を状態に反映 |
 
 - **T1 収集器 (UA + 健康記録 + バックオフ + status の step)**: 純 Python。コード約 250 行、test 約 350 行。codex (terra) 向き。AC-2〜6、12 (status 側)。
-- **T2 CLI + コマンド面 + 文書**: 純 Python と文書。コード約 300 行、test 約 400 行、golden の再生成は指揮者が実出力で確認。T1 の健康記録の読み書き (`list` の「直近」、`enable` の消去) に依存するので T1 の後。AC-1 は両方が main に入った後の本機確認で、指揮者が行う。
+- **T2 CLI + コマンド面 + 文書**: 純 Python と文書。README と `docs/operations/first-run-acceptance.md` に §9 の注意を各 1 段落足す。コード約 300 行、test 約 400 行、golden の再生成は指揮者が実出力で確認。T1 の健康記録の読み書き (`list` の「直近」、`enable` の消去) に依存するので T1 の後。AC-1 は両方が main に入った後の本機確認で、指揮者が行う。
 - 周回: 境界コードではない (資金・隔離・鍵・削除に触れない) が、DB 書込と外向き要求を含む。codex 1 周目 → 閉鎖確認。変異スイープは段階計算の境界とカウント規則を対象にする。
 
-## 7. 裁定が要る点
+## 7. 裁定 (2026-10-25、ユーザー: 「すべて推奨で」)
 
-技術で決められるもの (状態の置き場所、数えるエラー種、`enable` が記録を消す、確認の仕方) は本書で決めた。次は製品・運用の判断である。
+技術で決められるもの (状態の置き場所、数えるエラー種、`enable` が記録を消す、確認の仕方) は本書で決めた。次の 6 点は製品・運用の判断で、すべて推奨どおりに決まった。
 
-1. **repo URL の値**: User-Agent に入れる連絡先の URL。pyproject にも README にも公開 URL が無い。推奨: 公開時に確定する URL を 1 定数にし、未確定の間は GitHub のリポジトリ URL をユーザーが指定する。先方に見える識別子なので、実在しない URL を出さない。
-2. **0 件の源の追加**: 取得は通るが 0 件のとき、確認のうえ追加を許すか。推奨: 許す (確認あり、非対話は `--yes` 必須)。理由: 更新が少ない feed を足せなくなるのを避ける。0 件が続けば `list` に出るので、利用者が気づける。
-3. **待機の上限**: 1 日 (24 時間) でよいか。推奨: 1 日。理由: 長くすると回復に気づけない。短くしても 1 日 1 回の取得は先方に許容される範囲。上限に達した源は `afx news disable` を案内する step が残り続ける。
-4. **閾値 N**: 3 でよいか。推奨: 3。理由: 一時障害 (数時間以内) を「連続」と数えて止めない一方、1.5 時間で間引きが始まる。
-5. **最初の待機を 1 時間にする**: 骨子の 30 分は、周期が 30 分なので何も間引かない。推奨: 1 時間から始める (§3.2)。骨子の文面と食い違うので確認する。
-6. **`test` を待機中の源に対して許すか**: 推奨: 許す (利用者の明示した 1 回で、書き込みも無い)。禁止すると原因調査ができない。
+1. **User-Agent と repo URL**: `agentic-fx/<版> (+https://github.com/teru358/agentic-fx)`。URL は `pyproject.toml` の `[project.urls]` (key `Repository`) に 1 回だけ書き、UA は `importlib.metadata` の版とその URL から組み立てる。他の場所にリテラルとして複製しない。UA を pyproject と照合する test を足す (AC-6)。裁定 (2026-10-25、ユーザー): 推奨どおり。
+2. **0 件の源の追加**: 確認のうえ追加を許す (非対話は `--yes` 必須)。更新が少ない feed を足せなくなるのを避ける。0 件が続けば `list` に出る。裁定 (2026-10-25、ユーザー): 推奨どおり。
+3. **待機の上限**: 24 時間。長くすると回復に気づけない。上限に達した源は `afx news disable` を案内する step が残り続ける。裁定 (2026-10-25、ユーザー): 推奨どおり。
+4. **閾値 N**: 3。一時障害を「連続」と数えて止めない一方、1.5 時間で間引きが始まる。裁定 (2026-10-25、ユーザー): 推奨どおり。
+5. **最初の待機**: 1 時間 (§3.2)。骨子の 30 分は周期が 30 分なので何も間引かない。骨子の文面とは異なることを承知のうえの裁定。裁定 (2026-10-25、ユーザー): 推奨どおり。
+6. **`test` を待機中の源に対して許す**: 許す (利用者の明示した 1 回で、書き込みも無い。禁止すると原因調査ができない)。裁定 (2026-10-25、ユーザー): 推奨どおり。
 
-## 8. 変更履歴
+## 8. 利用者の責任と文書
+
+- ニュース源を足すかどうかは運用者 (利用者) の判断である。各源の利用規約・robots の確認は運用者の責任で、製品は代わって確認も保証もしない。
+- 現状の事実: 製品は既定のニュース源を同梱している。`datafeed/default_sources.py` の 3 源 (`yahoo-finance-topstories` / `nhk-keizai` / `fxstreet-news`、いずれも feed) で、`afx init` と起動時の `seed_default_sources` が登録する。公式 RSS だけではなく商用サイトの feed を含む。この同梱の扱い (残す / 利用者が選ぶ形にする) は本書では変えない。必要なら別チケット候補とする。`config/settings.yaml.example` の `news:` は `cleanup_hours` のみで、源は持たない。
+- UA の URL は先方が連絡できる窓口で、責任の引き受けを意味しない。
+- T2 で README と `docs/operations/first-run-acceptance.md` に各 1 段落を足す: ニュース源は運用者の判断で追加すること、各源の利用規約の確認は運用者の責任であること、UA の URL は連絡先であること。
+- 免責の法的根拠は LICENSE (MIT) の無保証条項。リポジトリ直下に `LICENSE` が在り、`pyproject.toml` も `license = "MIT"` / `license-files = ["LICENSE"]` で参照している。新規作成は不要。
+
+## 9. 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
 | 2026-10-25 | v0.1 C0 | 初版 (指揮者承認前の清書) | チケット `news-source-cli-and-429-backoff` の骨子の設計化 | |
+| 2026-10-25 | v0.2 | 裁定 6 点の反映と利用者責任の節 | ユーザー裁定「すべて推奨で」 | |
