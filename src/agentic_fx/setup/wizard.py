@@ -2039,7 +2039,7 @@ def _stage12(sess: _Session, a: Answers | None) -> None:
                 try:
                     duplicate = text in (_read_text(path) or "") or conn.execute(
                         "SELECT 1 FROM ops_policies WHERE directive=? LIMIT 1", (text,)).fetchone() is not None
-                except sqlite3.Error as error:
+                except (sqlite3.Error, OSError, UnicodeDecodeError) as error:
                     sess.say(f"警告: 方針文を書けませんでした ({_one_line(error)})。")
                     return
                 if duplicate:

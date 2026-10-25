@@ -597,3 +597,16 @@ def test_stage12_pre_insert_error_types_map_to_first_sentence(tmp_path, monkeypa
     _root, io = _stage12_run(tmp_path, ["方針", "should-not-be-asked"])
 
     assert f"警告: 方針文を書けませんでした ({type(error).__name__}: {error})。" in io.text
+
+
+def test_stage12_unreadable_directives_during_duplicate_check_reports_first_sentence(tmp_path):
+    def make_directory(root):
+        path = wizard.directives_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.mkdir()
+
+    root, io = _stage12_run(tmp_path, ["新規方針", "should-not-be-asked"], prepare=make_directory)
+
+    assert "警告: 方針文を書けませんでした (IsADirectoryError" in io.text
+    assert io.asked == ["方針文: "]
+    assert _policy_rows(root) == 0
