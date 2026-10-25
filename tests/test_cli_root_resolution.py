@@ -63,7 +63,7 @@ def test_the_upward_search_takes_the_nearest_directory_with_settings(tmp_path):
 def test_without_any_settings_the_root_is_the_working_directory(tmp_path):
     work = tmp_path / "work" / "sub"
     work.mkdir(parents=True)
-    assert entry.resolve_root(["init"], {}, work) == work
+    assert entry.resolve_root(["status"], {}, work) == work
 
 
 def test_the_search_walks_lexical_parents_and_accepts_symlinked_markers(tmp_path):
@@ -71,19 +71,19 @@ def test_the_search_walks_lexical_parents_and_accepts_symlinked_markers(tmp_path
     work = tmp_path / "work"
     (work / "child").mkdir(parents=True)
     (work / "config").symlink_to(real / "config", target_is_directory=True)
-    assert entry.resolve_root(["init"], {}, work / "child") == work
+    assert entry.resolve_root(["status"], {}, work / "child") == work
 
     other = tmp_path / "other"
     (other / "config").mkdir(parents=True)
     (other / "config" / "settings.yaml").symlink_to(real / "config" / "settings.yaml")
     (other / "child").mkdir()
-    assert entry.resolve_root(["init"], {}, other / "child") == other
+    assert entry.resolve_root(["status"], {}, other / "child") == other
 
     dangling = tmp_path / "dangling"
     (dangling / "config").mkdir(parents=True)
     (dangling / "config" / "settings.yaml").symlink_to(tmp_path / "nowhere")
     (dangling / "child").mkdir()
-    assert entry.resolve_root(["init"], {}, dangling / "child") == dangling / "child"
+    assert entry.resolve_root(["status"], {}, dangling / "child") == dangling / "child"
 
 
 def test_an_empty_environment_value_is_treated_as_unset(tmp_path):
@@ -241,3 +241,91 @@ def test_the_interactive_ops_probe_uses_the_given_root(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert interactive._default_probe("web", tmp_path / "elsewhere") == (0, "")
     assert seen["root"] == tmp_path / "elsewhere"
+
+
+def test_init_does_not_search_upward_and_uses_the_working_directory(tmp_path):
+    outer = _make_root(tmp_path / "outer")
+    sub = outer / "sub"
+    sub.mkdir()
+    assert entry.resolve_root(["init", "--non-interactive"], {}, sub) == sub
+    assert entry.resolve_root(["--root", str(outer), "init"], {}, sub) == outer
+    assert entry.resolve_root(["init"], {"AFX_ROOT": str(outer)}, sub) == outer
+
+
+@pytest.mark.parametrize("argv", [["--daemon"], ["--daemon", "status"], ["--root", "", "--daemon"]])
+def test_the_daemon_does_not_search_upward_and_uses_the_working_directory(tmp_path, argv):
+    outer = _make_root(tmp_path / "outer")
+    sub = outer / "sub"
+    sub.mkdir()
+    if argv[:2] == ["--root", ""]:
+        argv = ["--daemon"]
+    assert entry.resolve_root(argv, {}, sub) == sub
+
+
+def test_the_search_stops_at_a_directory_owned_by_another_user(tmp_path, monkeypatch):
+    outer = _make_root(tmp_path / "outer")
+    foreign = outer / "foreign"
+    deep = foreign / "deep"
+    deep.mkdir(parents=True)
+    real_stat = entry.os.stat
+
+    class Owned:
+        def __init__(self, result, uid):
+            self._result = result
+            self.st_uid = uid
+
+        def __getattr__(self, name):
+            return getattr(self._result, name)
+
+    def fake_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if Path(path) == foreign:
+            return Owned(result, entry.os.getuid() + 1)
+        return result
+
+    monkeypatch.setattr(entry.os, "stat", fake_stat)
+    assert entry.resolve_root(["status"], {}, deep) == deep
+    (foreign / "config").mkdir()
+    (foreign / "config" / "settings.yaml").write_text("x: 1\n", encoding="utf-8")
+    assert entry.resolve_root(["status"], {}, deep) == deep
+
+
+def test_the_reconfigure_default_probe_is_bound_to_the_root(tmp_path, monkeypatch):
+    from agentic_fx.ops_setup import interactive, reconfigure
+
+    seen = []
+    monkeypatch.setattr(interactive, "_default_probe", lambda feature, root: seen.append((feature, root)) or (0, ""))
+
+    class Stop(Exception):
+        pass
+
+    class FakeSession:
+        def __init__(self, root, io, probe, *args, **kwargs):
+            probe()
+            raise Stop
+
+    monkeypatch.setattr(reconfigure, "Session", FakeSession)
+
+    class FakeSetup:
+        class systemd:  # noqa: N801
+            @staticmethod
+            def is_stopped(unit):
+                return True
+
+        paths = None
+
+    monkeypatch.setattr(reconfigure, "_check_stage", lambda root: None)
+    monkeypatch.setattr(reconfigure, "_check_others", lambda setup: None)
+    monkeypatch.setattr(reconfigure, "resolve_ops_exec", lambda paths: paths)
+    monkeypatch.setattr(reconfigure, "_check_principal", lambda setup: None)
+    monkeypatch.setattr(reconfigure, "_check_units", lambda setup: None)
+    monkeypatch.setattr(reconfigure, "_unit", lambda setup: "u")
+    lock_file = (tmp_path / "lock").open("w")
+    monkeypatch.setattr(interactive, "_setup_lock", lambda root: lock_file)
+
+    class Io:
+        def isatty(self):
+            return True
+    with pytest.raises(Stop):
+        reconfigure.run_ops_reconfigure(tmp_path, "web", io=Io(), setup_factory=lambda root: FakeSetup())
+    assert seen == [("web", tmp_path.resolve())]

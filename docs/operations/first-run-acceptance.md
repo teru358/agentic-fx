@@ -21,11 +21,14 @@ uv tool install --editable <clone 先のパス>
 uv tool update-shell
 ```
 
-bash の補完は `~/.bashrc` に次の 1 行を足すと効きます。
+bash の補完は、生成物を bash-completion の利用者 directory に置くと効きます (遅延読込されます)。
 
 ```
-eval "$(afx completion bash)"
+mkdir -p ~/.local/share/bash-completion/completions
+afx completion bash > ~/.local/share/bash-completion/completions/afx
 ```
+
+bash-completion が無い環境では、`~/.bashrc` に `eval "$(afx completion bash)"` を足しても効きますが、shell 起動ごとに afx を起動します。
 
 `afx` が使う root (`config/` や `data/` を持つディレクトリ) は、次の順で決まります。
 

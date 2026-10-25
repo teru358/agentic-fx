@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 
-from agentic_fx.cli_surface import COMMANDS, CommandRecord, Lane, _expand
+from agentic_fx.cli_surface import COMMANDS, CommandRecord, Lane, expand_command
 
 TOP_OPTIONS = ("--root", "--daemon")
 CTL_OPTIONS = ("--as",)
@@ -31,7 +31,7 @@ def candidate_table(records: tuple[CommandRecord, ...] = COMMANDS) -> dict[tuple
             if len(words) > 2:
                 _add(table, ("ctl", words[1]), words[2])
             continue
-        for path in _expand(record):
+        for path in expand_command(record):
             words = path.split(" ")
             for size, word in enumerate(words):
                 _add(table, tuple(words[:size]), word)
@@ -55,6 +55,7 @@ def render_bash(records: tuple[CommandRecord, ...] = COMMANDS) -> str:
     arm_text = "\n".join(arms)
     return f"""# bash completion for afx
 _afx() {{
+    local IFS=' '
     local cur prev key candidates options i word line
     local -a words
     COMPREPLY=()

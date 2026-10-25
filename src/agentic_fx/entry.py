@@ -111,7 +111,7 @@ def _shim_argv(args_list: list[str], head: int) -> tuple[list[str], int | None]:
 
 
 class RootError(Exception):
-    """root の指定が directory でない。文面は固定で、指定された値は含めない。"""
+    """root の指定が directory でない。文面に指定された値をそのまま含める。"""
 
 
 def _split_prefix(args_list: list[str]) -> tuple[int, str | None]:
@@ -147,9 +147,20 @@ def _is_directory(path: Path) -> bool:
         return False
 
 
+def _owned_by_current_user(path: Path) -> bool:
+    try:
+        return os.stat(path).st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 def resolve_root(argv: list[str], environ: Mapping[str, str], cwd: Path) -> Path:
-    """root を `--root`、`AFX_ROOT`、cwd と親の `config/settings.yaml`、cwd の順に決める。"""
-    _, option = _split_prefix(argv)
+    """root を `--root`、`AFX_ROOT`、cwd と親の `config/settings.yaml`、cwd の順に決める。
+
+    上方探索は既存 root を対象にする操作だけに適用する。`init` と `--daemon` は探索せず cwd に落とす。
+    探索は、所有者が実行 uid と異なる directory に達した時点で止めて cwd に落とす。
+    """
+    head, option = _split_prefix(argv)
     if option is not None:
         path = Path(os.path.abspath(Path(cwd) / option))
         if not path.is_dir():
@@ -162,7 +173,11 @@ def resolve_root(argv: list[str], environ: Mapping[str, str], cwd: Path) -> Path
             raise RootError(f"afx: AFX_ROOT={env_value} は directory ではありません")
         return path
     here = Path(os.path.abspath(cwd))
+    if "--daemon" in argv[:head] or argv[head:head + 1] == ["init"]:
+        return here
     for candidate in (here, *here.parents):
+        if not _owned_by_current_user(candidate):
+            return here
         if (_is_directory(candidate / "config")
                 and _is_regular_file(candidate / "config" / "settings.yaml")):
             return candidate

@@ -567,7 +567,7 @@ def test_every_exposed_local_record_has_one_argparse_node_and_no_other_node_exis
     expected = set()
     for record in cli_surface.COMMANDS:
         if record.lane is cli_surface.Lane.LOCAL and record.exposed:
-            expected.update(f"afx {path}" for path in cli_surface._expand(record))
+            expected.update(f"afx {path}" for path in cli_surface.expand_command(record))
     expected |= {f"afx {parent.command}" for parent in cli_surface.PARENTS
                  if not parent.command.startswith("ctl ") and parent.command != "ctl"}
     exceptions = {"afx ctl"}  # `afx ctl` is handed to the client before argparse; only its help row is registered

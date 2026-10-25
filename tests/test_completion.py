@@ -41,9 +41,9 @@ def script_file(tmp_path):
     return path
 
 
-def _complete(script_file, words: list[str], *, cword: int | None = None, cwd=None) -> list[str]:
+def _complete(script_file, words: list[str], *, cword: int | None = None, cwd=None, prelude: str = "") -> list[str]:
     index = len(words) - 1 if cword is None else cword
-    code = (f"source {shlex.quote(str(script_file))}; "
+    code = (f"{prelude + '; ' if prelude else ''}source {shlex.quote(str(script_file))}; "
             f"COMP_WORDS=({' '.join(shlex.quote(word) for word in words)}); COMP_CWORD={index}; "
             '_afx; printf "%s\\n" "${COMPREPLY[@]}"')
     done = subprocess.run([BASH, "--norc", "--noprofile", "-c", code], capture_output=True, text=True,
@@ -175,6 +175,12 @@ def test_no_planned_private_alias_or_retired_word_is_a_candidate():
 ])
 def test_a_real_bash_completes_the_documented_cases(script_file, words, expected):
     assert sorted(_complete(script_file, words)) == sorted(expected)
+
+
+@needs_bash
+def test_a_real_bash_completion_survives_a_newline_ifs(script_file):
+    replies = _complete(script_file, ["afx", "ops", "web", ""], prelude="IFS=$'\\n'")
+    assert sorted(replies) == ["disable", "enable", "reconfigure", "status"]
 
 
 @needs_bash

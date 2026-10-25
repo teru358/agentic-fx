@@ -490,7 +490,7 @@ def _labels(record: CommandRecord) -> str:
     return " ".join(values)
 
 
-def _expand(record: CommandRecord) -> tuple[str, ...]:
+def expand_command(record: CommandRecord) -> tuple[str, ...]:
     """Concrete command paths a record answers to (feature-generic ops verbs fan out)."""
     if record.command in _OPS_GENERIC:
         verb = record.command.split(" ", 1)[1]
@@ -535,7 +535,7 @@ class SurfaceRenderer:
         children: dict[str, list[CommandRecord]] = {}
         for record in self._visible:
             by_usage.setdefault(record.usage, record)
-            for path in _expand(record):
+            for path in expand_command(record):
                 by_path.setdefault(path, []).append(record)
                 words = path.split(" ")
                 for size in range(1, len(words)):

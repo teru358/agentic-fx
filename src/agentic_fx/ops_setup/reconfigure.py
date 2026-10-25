@@ -159,7 +159,11 @@ def run_ops_reconfigure(root: Path, feature: str, *, options: WebOptions | None 
             print(f"afx ops: {error.reason}", file=sys.stderr)
             return 1
         unit = _unit(setup)
-        probe_one = probe_runner if probe_runner is not None else _default_probe
+        if probe_runner is not None:
+            probe_one = probe_runner
+        else:
+            def probe_one(feature: str) -> tuple[int, str]:
+                return _default_probe(feature, root)
         interactive = options.flagless
 
         def ensure_stopped() -> None:
