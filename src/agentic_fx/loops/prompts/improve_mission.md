@@ -30,7 +30,7 @@
 
 ## 仮説族の試行状況
 
-この表は候補の順位表でも、成績表でもありません。`attempts=0` の族を機械的に順番に消費せず、配備済みとの違い、すでに試した族の広がりと反復回数、今回の根拠と検証可能性を合わせて仮説を選んでください。1 回の非提出・却下を族全体の否定とみなさず、同じ族を再試行するなら前回と異なる仮説上の理由を説明してください。`indicator (未配備) @<足>` は配備されていない indicator 候補を足ごとにまとめた行で、`未配備指標` は配備されていない indicator への依存を表します。`族不明` は一つの族ではなく、族へ帰属できない候補 (依存 indicator を持たない strategy、記録の欠けた旧行、key の形が規則に合わない行) の件数です。`deployed=yes` の族は別名の新規候補にせず、表示された配備名の更新として扱ってください。
+この表は候補の順位表でも、成績表でもありません。`attempts=0` の族を機械的に順番に消費せず、配備済みとの違い、すでに試した族の広がりと反復回数、今回の根拠と検証可能性を合わせて仮説を選んでください。1 回の非提出・却下を族全体の否定とみなさず、同じ族を再試行するなら前回と異なる仮説上の理由を説明してください。`indicator (未配備) @<足>` は配備されていない indicator 候補を足ごとにまとめた行で、`未配備指標` は配備されていない indicator への依存を表します。未配備の indicator は、それ自体を `kind: indicator` の候補として作る選択肢です (規律 7)。`族不明` は一つの族ではなく、族へ帰属できない候補 (依存 indicator を持たない strategy、記録の欠けた旧行、key の形が規則に合わない行) の件数です。`deployed=yes` の族は別名の新規候補にせず、表示された配備名の更新として扱ってください。
 
 {family_attempts}
 
@@ -50,6 +50,8 @@
 {backlog_table}
 
 ## ユーザー方針
+
+方針は規律の範囲で、仮説と候補の種類 (indicator / strategy) の選択を導きます。規律と矛盾する方針は規律が優先します。
 
 {user_policy_tail}
 
@@ -111,8 +113,7 @@
    再実行してください** (テストした artifact == 提出する artifact)。
    系列が全 NaN のままなら warmup 不足の兆候です — `max_bars` は
    「依存 indicator の warmup + 自分の lookback」を覆う値を宣言してください。
-   **無い指標は自前計算せず**、`不足指標: <名前と定義>` として
-   `discoveries` に起票してください。
+   **無い指標を strategy の中で自前計算しないでください。** 無い指標は、この mission の候補を `kind: indicator` の plugin にして新設できます (self-test のみで提出。`run_backtest` は strategy 専用。strategy と同時には提出できず、承認・配備の後の mission で `indicators:` に書けます)。配備済みに同じ定義があれば別名で作らず再利用してください。今回は strategy を続けるなら、`不足指標: <名前と定義>` として `discoveries` に起票してください。
 8. **`get_signals` は取引判断 loop 専用で、この改善 mission では利用できません。**
    配備済み strategy の直近 signal の方向・status・payload は、仮説の選択や
    候補評価の材料にしないでください。この不在は設計上の制約なので、課題・
@@ -165,6 +166,7 @@
   - plugin 形: 上の実例のとおり (`name` は候補置き場に書いた plugin 名)
   - report 形: `{{"type": "report", "proposal_kind": "core" | "risk_gate" | "research", "title": "...", "body_md": "..."}}`
   - observation 形 (実施まで至らなかった場合): `{{"type": "observation", "reason": "..."}}`
+- `artifact.kind` は `indicator` か `strategy`。indicator 候補は `outputs` を `config.yaml` に宣言し、self-test で warmup と出力列を確認します。
 - 上に挙げたキー以外は追加しないでください。
 - **書く欄によって、成績を書くかどうかが違います。**
   - `selection_rationale` と plugin の `summary` は人間の承認画面にそのまま

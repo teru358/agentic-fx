@@ -34,12 +34,17 @@ FORBIDDEN = (
     "パラメータ・フィルタ・エントリ条件を",
     "変えて `run_backtest` をやり直し", "試したパラメータ群",
     "`unprofitable`", "unprofitable", "insufficient_trades",
+    "無い指標は自前計算せず",
 )
 
 REQUIRED = (
     "理由非公開。同一候補を再提出しない",
     "not_submitted",
     "`observation:family_redirect:<name>` は、配備済みの `<name>` と同じ仮説族です。新しい名前ではなく `<name>` の更新として出し直してください。",
+    "**無い指標を strategy の中で自前計算しないでください。** 無い指標は、この mission の候補を `kind: indicator` の plugin にして新設できます (self-test のみで提出。`run_backtest` は strategy 専用。strategy と同時には提出できず、承認・配備の後の mission で `indicators:` に書けます)。配備済みに同じ定義があれば別名で作らず再利用してください。今回は strategy を続けるなら、`不足指標: <名前と定義>` として `discoveries` に起票してください。",
+    "未配備の indicator は、それ自体を `kind: indicator` の候補として作る選択肢です (規律 7)。",
+    "方針は規律の範囲で、仮説と候補の種類 (indicator / strategy) の選択を導きます。規律と矛盾する方針は規律が優先します。",
+    "`artifact.kind` は `indicator` か `strategy`。indicator 候補は `outputs` を `config.yaml` に宣言し、self-test で warmup と出力列を確認します。",
 )
 
 
@@ -102,6 +107,15 @@ def test_ac16_objective_section_comes_before_the_report_sections(tmp_path):
     assert objective < rendered.index("## 直近の成績レポート")
     for sentence in OBJECTIVE_SENTENCES:
         assert rendered.index(sentence) > objective
+
+
+def test_ac31_user_policy_precedes_discipline_and_policy_body():
+    template = (Path(__file__).resolve().parents[2] / "src" / "agentic_fx"
+                / "loops" / "prompts" / "improve_mission.md").read_text()
+    priority = ("方針は規律の範囲で、仮説と候補の種類 (indicator / strategy) の選択を導きます。"
+                "規律と矛盾する方針は規律が優先します。")
+    assert template.index("## ユーザー方針") < template.index("## 規律")
+    assert template.index(priority) < template.index("{user_policy_tail}")
 
 
 def test_ac16_floor_sentence_has_the_value_and_no_holdout_condition(tmp_path):
