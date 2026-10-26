@@ -262,3 +262,16 @@ def test_any_other_wrong_version_adds_no_detail(tmp_path, capsys, version):
 def test_a_current_listing_adds_no_detail(tmp_path, capsys):
     list_interfaces(_emit(tmp_path, _text(GOOD)))
     assert capsys.readouterr().err == ""
+
+
+def test_a_listing_is_read_while_the_process_holds_more_than_1024_descriptors(tmp_path):
+    held = []
+    try:
+        while True:
+            held.append(os.open(os.devnull, os.O_RDONLY))
+            if held[-1] > 1100:
+                break
+        assert len(list_interfaces(_emit(tmp_path, _text(GOOD)))) == 3
+    finally:
+        for fd in held:
+            os.close(fd)

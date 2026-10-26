@@ -593,6 +593,9 @@ def test_ac18_the_in_tx_check_also_rejects_a_candidate_without_identity(
             deployed=quality.Population(), examples=quality.Population()))
     assert verdict.outcome == "gate_failed"
     assert verdict.reason == "not_submitted"
+    assert verdict.code == "candidate_identity_unavailable"
+    from agentic_fx import improve_notice_codes as _codes
+    assert _codes.notice_for_quality(verdict.code) == _codes.NOTICE_UNVERIFIED
 
 
 def test_ac18_one_corrupted_row_is_skipped_with_a_warning_and_others_compared(

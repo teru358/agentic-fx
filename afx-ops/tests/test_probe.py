@@ -259,6 +259,13 @@ def test_probe_input_reading_leaves_no_descriptor_open(home):
     ("bot", 'trade_notices = "everything"\n', 71, "config_invalid"),
     ("bot", 'trade_amounts = 1\n', 71, "config_invalid"),
     ("notify", 'deliver_trade_events = "yes"\n', 71, "config_invalid"),
+    ("bot", 'improve_notices = "results"\n', 71, "token_invalid"),
+    ("bot", 'improve_notices = "everything"\n', 71, "config_invalid"),
+    ("bot", 'improve_notices = true\n', 71, "config_invalid"),
+    ("notify", "deliver_improve_events = true\n", 71, "url_invalid"),
+    ("notify", 'deliver_improve_events = "yes"\n', 71, "config_invalid"),
+    ("notify", 'improve_notices = "all"\n', 71, "config_invalid"),
+    ("bot", "deliver_improve_events = true\n", 71, "config_invalid"),
 ])
 def test_ac23_probe_accepts_the_trade_keys_and_rejects_invalid_values(
         feature, extra, rc, reason, child_env, home):
@@ -275,6 +282,10 @@ def test_ac23_probe_accepts_the_trade_keys_and_rejects_invalid_values(
     ("bot", "", {"ops_notices": "default"}),
     ("notify", "deliver_trade_events = true\n", {"deliver_trade_events": True}),
     ("notify", "", {"deliver_trade_events": False}),
+    ("bot", 'improve_notices = "off"\n', {"improve_notices": "off"}),
+    ("bot", "", {"improve_notices": "all"}),
+    ("notify", "deliver_improve_events = true\n", {"deliver_improve_events": True}),
+    ("notify", "", {"deliver_improve_events": False}),
 ])
 def test_ac24_the_probe_input_reader_carries_the_trade_values(
         feature, extra, expected, home, monkeypatch):

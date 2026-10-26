@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +11,8 @@ import pytest
 from agentic_fx.activity import ActivityLog
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
-from agentic_fx.loops.improve_loop import _chmod_tree_readonly
+from agentic_fx.loops.improve_loop import (
+    ImprovePrepareFailed, _chmod_tree_readonly)
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
@@ -263,7 +264,7 @@ def test_tx0_mission_id_unique_partial_index_on_improvement_runs(conn):
     merge (main 649a811 束 C 裁定 D1) が improvement_runs.mission_id に
     FK を付けたため、実在しない mission_id の直挿しは FK 違反で拒否される。
     UNIQUE 索引を検証するには実在する mission 行を先に作る必要がある。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     mission_id = conn.execute(
         "INSERT INTO missions (loop, runner, model, status, started_at) "
         "VALUES ('improve', 'local', 'x', 'running', ?)",
@@ -287,7 +288,7 @@ def test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan(
     是正後もテスト自身の `conn` で状態確認できる `loop_full` (シーム有り)
     を使う (`loop_min` は write conn = 検証用 `conn` そのものなので、
     是正後は prepare() 内で close されてしまい検証不能になる)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
 
     from agentic_fx.store import improve_runs as improve_runs_store
 
@@ -495,7 +496,7 @@ def test_tx0_mutation_M2_system_exit_without_rollback(loop_full, conn, monkeypat
     ACC-B1 是正で `loop_min` → `loop_full` に適応 (理由は
     `test_tx0_crash_between_mission_insert_and_run_insert_leaves_no_orphan`
     の docstring 参照)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     from agentic_fx.store import improve_runs as improve_runs_store
 
     def _sys_exit(*a, **kw):
@@ -514,7 +515,7 @@ def test_tx0_mutation_M2_system_exit_without_rollback(loop_full, conn, monkeypat
 def test_tx0_mutation_M3_null_mission_id_rows_allowed(conn):
     """M3: 部分 UNIQUE index の WHERE clause が無いと、NULL 行同士が衝突。
     逆に WHERE mission_id IS NOT NULL があれば、複数の NULL 行が共存できる。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     # 2 つの NULL mission_id 行を挿入
     conn.execute(
         "INSERT INTO improvement_runs (backlog_id, mission_id, started_at) "
@@ -597,8 +598,11 @@ def test_prepare_failure_after_tx0_leaves_no_dangling_rows(
     else:
         monkeypatch.setattr(loop_full, injection_point, _boom)
 
-    with pytest.raises(OSError, match=injection_point):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop_full.prepare(slot_key=("2026-W50", 0), now=now)
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert injection_point in str(exc_info.value.__cause__)
+    assert exc_info.value.slot_key == ("2026-W50", 0)
 
     m = conn.execute("SELECT count(*) c FROM missions "
                      "WHERE status='running'").fetchone()["c"]
@@ -630,8 +634,11 @@ def test_prepare_failure_after_tx0_manual_one_shot_has_no_slot_to_terminalize(
 
     monkeypatch.setattr(loop_full, "_materialize_workspace", _boom)
 
-    with pytest.raises(OSError, match="_materialize_workspace"):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop_full.prepare(slot_key=None, now=now)
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "_materialize_workspace" in str(exc_info.value.__cause__)
+    assert exc_info.value.slot_key is None
 
     m = conn.execute("SELECT count(*) c FROM missions "
                      "WHERE status='running'").fetchone()["c"]
@@ -860,8 +867,10 @@ def test_prepare_compensation_failure_with_activity_none_preserves_original_exce
         improve_loop_mod.missions_store, "finish_improve_mission",
         _boom_compensation)
 
-    with pytest.raises(OSError, match="_materialize_workspace"):
+    with pytest.raises(ImprovePrepareFailed) as exc_info:
         loop.prepare(slot_key=None, now=clock.now())
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "_materialize_workspace" in str(exc_info.value.__cause__)
 
 
 def test_build_worker_runner_passes_ctx_as_run_context(
@@ -972,8 +981,8 @@ def test_compensate_launch_failure_terminalizes_mission_run_and_slot_via_fresh_c
     (`status='running'`/`finished_at IS NULL`) のまま・slot が `claimed`
     のままになるため red になる。"""
     loop, db_path = loop_no_seam
-    now = datetime(2026, 8, 22, 12, 0)
-    later = datetime(2026, 8, 22, 12, 5)
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 8, 22, 12, 5, tzinfo=timezone.utc)
 
     seed = connect(db_path)
     try:
@@ -1033,8 +1042,8 @@ def test_compensate_launch_failure_deletes_readonly_staging_dir(loop_no_seam):
     import os
 
     loop, db_path = loop_no_seam
-    now = datetime(2026, 8, 22, 12, 0)
-    later = datetime(2026, 8, 22, 12, 5)
+    now = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+    later = datetime(2026, 8, 22, 12, 5, tzinfo=timezone.utc)
 
     seed = connect(db_path)
     try:

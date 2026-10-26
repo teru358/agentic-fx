@@ -13,8 +13,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
+from agentic_fx import improve_notice_codes
 from . import trade_events
 from .contracts import ErrorCode, OpsError
+
+IMPROVE_CODE = "improve_run_changed"
 
 FIELDS = {
     "ops_request_terminal": frozenset({"endpoint_code", "result_code", "authenticated_principal"}),
@@ -23,6 +26,7 @@ FIELDS = {
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
+    IMPROVE_CODE: frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls"}),
     **trade_events.FIELDS,
 }
 
@@ -40,7 +44,26 @@ _REF = {
     "event_stream_health": re.compile(r"instance"),
     trade_events.ORDER_CODE: trade_events.REF_PATTERN,
     trade_events.CLOSE_CODE: trade_events.REF_PATTERN,
+    IMPROVE_CODE: re.compile(r"improve:[0-9]{1,18}"),
 }
+
+
+def _validate_improve_fields(fields: dict, ref: str | None) -> None:
+    """改善 mission の開始・終了 event。値はすべて固定語と整数で、専用検査で全値を見る。"""
+    if not isinstance(ref, str) or _REF[IMPROVE_CODE].fullmatch(ref) is None:
+        raise EventSchemaError(IMPROVE_CODE)
+    try:
+        improve_notice_codes.validate_state(fields["state"])
+        improve_notice_codes.validate_trigger(fields["trigger"])
+        if fields["state"] == "started":
+            if any(fields[key] is not None
+                   for key in ("result_code", "reason_code", "tool_calls")):
+                raise ValueError("started carries no result")
+        else:
+            improve_notice_codes.validate_notice_fields(
+                fields["result_code"], fields["reason_code"], fields["tool_calls"])
+    except ValueError:
+        raise EventSchemaError(IMPROVE_CODE) from None
 
 
 class EventSchemaError(ValueError):
@@ -54,6 +77,9 @@ def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
         # 取引 event は ref 必須。field ごとの grammar と canonical、ref の整数範囲まで見る
         if not trade_events.valid_ref(ref) or not trade_events.valid_fields(code, fields):
             raise EventSchemaError(code)
+        return
+    if code == IMPROVE_CODE:
+        _validate_improve_fields(fields, ref)
         return
     if ref is not None and (not isinstance(ref, str) or _REF[code].fullmatch(ref) is None):
         raise EventSchemaError(code)
@@ -127,6 +153,20 @@ class EventStore:
                 except Exception:
                     pass
         return event_id
+
+    def unannounced_improve_finishes(self, *, since: str) -> list[sqlite3.Row]:
+        """終端 snapshot があるのに、同じ ref の `finished` event がまだ無い改善 mission。
+
+        完了の判定は code・ref・state=finished の 3 条件すべてで行う。`started` が
+        あるだけでは完了扱いにしない。`since` (UTC の ISO 8601) より前に作られた snapshot は
+        SQL で除く。"""
+        return self._conn.execute(
+            "SELECT n.mission_id,n.trigger,n.result_code,n.reason_code,n.tool_calls,"
+            "n.created_at FROM improve_run_notices n WHERE n.created_at >= ? AND NOT EXISTS ("
+            "SELECT 1 FROM ops_events e WHERE e.code='improve_run_changed' "
+            "AND e.ref='improve:' || n.mission_id "
+            "AND json_extract(e.fields_json,'$.state')='finished') "
+            "ORDER BY n.created_at,n.mission_id", (since,)).fetchall()
 
     def poll(self, *, after: int, limit: int) -> EventPage:
         if type(after) is not int or after < 0 or type(limit) is not int \

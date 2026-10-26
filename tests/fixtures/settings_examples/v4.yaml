@@ -181,3 +181,4 @@ alert:                         # 運用アラート (プラン9 Task17)。省略
 
 notify:                        # 取引 event の発行。省略可 (省略時は発行する)
   trade_events: true            # false にすると daemon は order_state_changed / position_closed を一切出さない (rollback 用。bot / notify 側の表示設定ではない)
+  improve_events: true          # false にすると daemon は改善 mission の開始・終了通知 (improve_run_changed) を生成しない (rollback 用。変更後は daemon の再起動が必要)

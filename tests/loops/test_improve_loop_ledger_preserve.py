@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from agentic_fx.loops.improve_loop import _plain_outcome_choice
+from agentic_fx import improve_notice_codes as notice_codes
 from agentic_fx.loops.improve_loop import _REPORT_WRITE_FAILED
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
@@ -195,7 +197,8 @@ def test_finalize_gate_failed_persists_outcome_gate_failed_and_archives(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=NOW)
+        now=NOW,
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
@@ -227,7 +230,8 @@ def test_finalize_gate_failed_gate_rows_carry_outcome_and_stay_out_of_live(
         settings_hash="s", core_commit="c", initial_balance=1.0, now=NOW)
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id, reason="gate_failed:test",
-        now=NOW, gate_rows=[gate_row])
+        now=NOW, gate_rows=[gate_row],
+        notice=notice_codes.NOTICE_PYTEST_FAILED)
     rows = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=? "
         "AND content_hash=?", (mission_id, live_hash)).fetchall()
@@ -297,7 +301,8 @@ def test_finalize_report_or_observation_persists_outcome_report(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=NOW)
+        artifact={"type": "report"}, now=NOW,
+        choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",
@@ -320,7 +325,8 @@ def test_finalize_report_or_observation_persists_outcome_observation(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "observation", "reason": "insufficient data"},
-        now=NOW)
+        now=NOW,
+        choice=_plain_outcome_choice(None, {"type": "observation", "reason": "insufficient data"}))
 
     row = conn.execute(
         "SELECT mission_outcome FROM backtest_runs WHERE mission_id=?",

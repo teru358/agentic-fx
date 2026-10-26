@@ -507,12 +507,27 @@ CREATE TABLE IF NOT EXISTS ops_events (
   ref TEXT NOT NULL,
   fields_json TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS ix_ops_events_code_ref ON ops_events(code, ref);
 CREATE TABLE IF NOT EXISTS ops_policies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   request_id TEXT NOT NULL UNIQUE,
   directive TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS improve_run_notices (
+  mission_id INTEGER PRIMARY KEY REFERENCES missions(id),
+  trigger TEXT NOT NULL,
+  result_code TEXT NOT NULL,
+  reason_code TEXT,
+  tool_calls INTEGER,
+  observation_text TEXT,
+  approval_id INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS improve_run_notices_no_update
+BEFORE UPDATE ON improve_run_notices BEGIN SELECT RAISE(ABORT, 'improve_run_notices is append-only'); END;
+CREATE TRIGGER IF NOT EXISTS improve_run_notices_no_delete
+BEFORE DELETE ON improve_run_notices BEGIN SELECT RAISE(ABORT, 'improve_run_notices is append-only'); END;
 """
 
 TABLE_NAMES = frozenset({
@@ -524,7 +539,7 @@ TABLE_NAMES = frozenset({
     "candidate_archives", "datafeed_outage_state", "datafeed_outage_gap",
     "cron_cursor", "mission_decision_bars",
     "ops_requests", "ops_idempotency", "ops_events", "ops_policies",
-    "plugin_deploy_ops", "plugin_deploy_op_signals",
+    "plugin_deploy_ops", "plugin_deploy_op_signals", "improve_run_notices",
 })
 
 
@@ -1591,6 +1606,10 @@ def init_db(conn: sqlite3.Connection, *, root: Path | None = None) -> None:
         conn, "improvement_runs", "report_state",
         "report_state TEXT NOT NULL DEFAULT 'none' "
         "CHECK(report_state IN ('none','prepared','published','failed'))")
+    # `trigger` は improvement_runs を作り直す 2 つの移行 (`_migrate_improvement_
+    # runs_v2` と `_migrate_improvement_runs_mission_id_fk`) の後に足す。
+    # 作り直しの DDL はこの列を持たないので、先に足すと値が黙って消える。
+    _ensure_column(conn, "improvement_runs", "trigger", "trigger TEXT")
     _ensure_column(
         conn, "backtest_runs", "variant",
         "variant TEXT NOT NULL DEFAULT 'candidate' "

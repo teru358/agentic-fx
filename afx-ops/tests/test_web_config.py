@@ -106,7 +106,8 @@ def test_the_port_is_required(monkeypatch, tmp_path):
     assert _reason(monkeypatch, tmp_path, 'bind = "127.0.0.1"\n') == "config_invalid"
 
 
-@pytest.mark.parametrize("extra", ['proxy = "x"\n', 'tls = true\n', 'trade_notices = "all"\n'])
+@pytest.mark.parametrize("extra", ['proxy = "x"\n', 'tls = true\n', 'trade_notices = "all"\n',
+                                   'improve_notices = "all"\n', 'deliver_improve_events = true\n'])
 def test_unknown_keys_are_config_invalid_for_web(monkeypatch, tmp_path, extra):
     assert _reason(monkeypatch, tmp_path, "port = 8080\n" + extra) == "config_invalid"
 

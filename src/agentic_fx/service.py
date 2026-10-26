@@ -1526,7 +1526,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         improve_supervisor = ImproveSupervisor(
             capacity=settings.improve.parallel, root=root, settings=settings,
             clock=clock, db_path=root / "data" / "agentic.db",
-            stop_event=stop_event, activity=activity)
+            stop_event=stop_event, activity=activity,
+            emit_events=settings.notify.improve_events)
         # プラン10 Task10-12 Step1: ImproveLoop を構築し
         # `improve_supervisor._improve_loop` へ注入する (R-i2 — Tx-0 の
         # slot claim は ImproveLoop.prepare の責務、ImproveSupervisor は
@@ -1734,6 +1735,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
             trade_event_sink=trade_sink)
+        # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
+        ops_service.emit_pending_improve_notices(
+            enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
@@ -1940,7 +1944,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
         status_provider=status_provider, log_path=root / "logs" / "agentic.log",
         activity_path=root / "logs" / "activity.log", data_resume=data_resume,
         ask_submitter=ask_submitter, improve_supervisor=improve_supervisor,
-        plugins_root=plugins_dir, settings=settings, activity_log=activity)
+        plugins_root=plugins_dir, settings=settings, activity_log=activity,
+        improve_reports_dir=root / "data" / "improve_reports")
     holder.append(service)
     return service
 
@@ -2193,6 +2198,18 @@ def _scheduler_tick_once(app: App) -> None:
         raise tick_error
     for hook in pending:
         hook()
+
+
+def _sweep_improve_notices(app: App) -> None:
+    """終端 snapshot があるのに `finished` event が無い改善 mission を、tick ごとに拾う
+    (起動時の回収と同じ関数)。失敗は tick を止めない。"""
+    if app.ops is None:
+        return
+    try:
+        app.ops.emit_pending_improve_notices(
+            enabled=app.settings.notify.improve_events)
+    except Exception:  # noqa: BLE001
+        _log.warning("improve_notice_skipped reason=sweep_failed")
 
 
 def _watchdog_tick(app: App) -> None:
@@ -2539,6 +2556,8 @@ def run_service(root: Path, *, daemon: bool = False,
                     _log.exception("tick failed")
                 finally:
                     scheduler_busy.clear()
+                if not stop_event.is_set():
+                    _sweep_improve_notices(app)
                 if not stop_event.is_set():
                     try:
                         _check_watchdog_health(app, wd, stop_event)

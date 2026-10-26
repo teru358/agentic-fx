@@ -31,14 +31,17 @@ _FEATURE_KEYS = MappingProxyType({
     "notify": (),
 })
 _OPTIONAL_FEATURE_KEYS = MappingProxyType({
-    "bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
+    "bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices",
+            "improve_notices"),
     "web": ("bind", "allow", "auth", "user"),
-    "notify": ("deliver_trade_events",),
+    "notify": ("deliver_trade_events", "deliver_improve_events"),
 })
 # 取引通知の出し方。key が無い旧 ops.toml は既定値で起動する
 TRADE_NOTICES = tuple(NOTICE_KINDS)
 TRADE_AMOUNTS = ("absolute", "relative")
 OPS_NOTICES = ("default", "all")
+# 改善通知の出し方。key が無い旧 ops.toml は既定値で起動する
+IMPROVE_NOTICES = ("all", "results", "off")
 _SAFE_DETAIL_KEY = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
 
@@ -77,6 +80,8 @@ class OpsConfig:
     trade_amounts: str = "absolute"
     ops_notices: str = "default"
     deliver_trade_events: bool = False
+    improve_notices: str = "all"
+    deliver_improve_events: bool = False
     # web の公開範囲。bind が None は loopback の `127.0.0.1`、allow が None は key の省略
     bind: str | None = None
     allow: tuple[ipaddress.IPv4Network, ...] | None = None
@@ -398,10 +403,13 @@ def read_config(feature: str, *, preserve_config_dir_error: bool = False) -> Ops
                              trade_notices=_choice(parsed, "trade_notices", TRADE_NOTICES, "all"),
                              trade_amounts=_choice(parsed, "trade_amounts", TRADE_AMOUNTS,
                                                    "absolute"),
-                             ops_notices=_choice(parsed, "ops_notices", OPS_NOTICES, "default"))
+                             ops_notices=_choice(parsed, "ops_notices", OPS_NOTICES, "default"),
+                             improve_notices=_choice(parsed, "improve_notices",
+                                                     IMPROVE_NOTICES, "all"))
         return OpsConfig(instance_root=instance_root, key_dir=key_dir,
                          config_dir_fd=config_dir_fd,
-                         deliver_trade_events=_boolean(parsed, "deliver_trade_events", False))
+                         deliver_trade_events=_boolean(parsed, "deliver_trade_events", False),
+                         deliver_improve_events=_boolean(parsed, "deliver_improve_events", False))
     except BaseException:
         os.close(config_dir_fd)
         raise

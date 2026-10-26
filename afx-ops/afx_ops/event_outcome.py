@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from afx_ops.notify.payload import encode_event
+from afx_ops.improve_events import CODE as IMPROVE_CODE
 from afx_ops.trade_events import TRADE_CODES
 
 
@@ -37,3 +38,7 @@ def decide(event: object, wants: Callable[[dict], bool]) -> Post | SkipKnown:
 
 def is_trade(payload: dict) -> bool:
     return payload["code"] in TRADE_CODES
+
+
+def is_improve(payload: dict) -> bool:
+    return payload["code"] == IMPROVE_CODE

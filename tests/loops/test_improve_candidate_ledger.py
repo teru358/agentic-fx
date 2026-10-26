@@ -15,7 +15,7 @@ import pytest
 from agentic_fx.backtest import holdout
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
-from agentic_fx.loops.improve_loop import ImproveLoop
+from agentic_fx.loops.improve_loop import ImproveLoop, ImprovePrepareFailed
 from agentic_fx.plugin.gate_pytest import GateResult, hashes_of
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.runners.base import MissionResult
@@ -655,8 +655,9 @@ def test_ac23_e18a_prepare_failure_leaves_no_rows(improve_env):
         raise RuntimeError("injected")
 
     with patch("agentic_fx.runners.worker_runner.WorkerRunner", boom):
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ImprovePrepareFailed) as exc_info:
             loop.prepare(slot_key=None, now=NOW)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
     assert conn.execute("SELECT COUNT(*) FROM candidate_archives"
                         ).fetchone()[0] == 0
     assert conn.execute(

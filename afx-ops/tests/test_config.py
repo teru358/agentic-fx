@@ -1,6 +1,7 @@
 """機能ごとの ``ops.toml`` を隔離前に安全に読む。"""
 from __future__ import annotations
 
+import dataclasses
 import os
 import sysconfig
 from pathlib import Path
@@ -553,3 +554,63 @@ def test_ac23_web_rejects_the_trade_keys(monkeypatch, tmp_path):
 def test_the_ops_notices_default_holds_for_features_that_do_not_read_it(monkeypatch, tmp_path):
     _write_config(monkeypatch, tmp_path, "notify", _BASE)
     assert _read_closing("notify").ops_notices == "default"
+
+
+def test_old_ops_toml_without_the_improve_keys_gets_the_defaults(monkeypatch, tmp_path):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT)
+    assert _read_closing("bot").improve_notices == "all"
+    _write_config(monkeypatch, tmp_path / "n", "notify", _BASE)
+    assert _read_closing("notify").deliver_improve_events is False
+
+
+@pytest.mark.parametrize("notices", ["all", "results", "off"])
+def test_bot_reads_improve_notices(monkeypatch, tmp_path, notices):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + f'improve_notices = "{notices}"\n')
+    assert _read_closing("bot").improve_notices == notices
+
+
+@pytest.mark.parametrize("line", ['improve_notices = "ALL"', 'improve_notices = ""',
+                                  'improve_notices = true', 'improve_notices = 1',
+                                  'improve_notices = ["all"]', 'improve_notices = "fills_closes"',
+                                  'improve_notices = "default"', 'improve_notices = "none"',
+                                  'deliver_improve_events = true'])
+def test_bot_rejects_invalid_improve_values_and_notify_only_keys(monkeypatch, tmp_path, line):
+    _write_config(monkeypatch, tmp_path, "bot", _BASE + _BOT + line + "\n")
+    with pytest.raises(ConfigError) as info:
+        read_config("bot")
+    if line.startswith("improve_notices"):
+        assert info.value.detail == "improve_notices"
+
+
+@pytest.mark.parametrize("value,expected", [("true", True), ("false", False)])
+def test_notify_reads_deliver_improve_events(monkeypatch, tmp_path, value, expected):
+    _write_config(monkeypatch, tmp_path, "notify", _BASE + f"deliver_improve_events = {value}\n")
+    assert _read_closing("notify").deliver_improve_events is expected
+
+
+@pytest.mark.parametrize("line", ['deliver_improve_events = "true"', "deliver_improve_events = 1",
+                                  "deliver_improve_events = 0", 'improve_notices = "all"'])
+def test_notify_rejects_invalid_improve_values_and_bot_only_keys(monkeypatch, tmp_path, line):
+    _write_config(monkeypatch, tmp_path, "notify", _BASE + line + "\n")
+    with pytest.raises(ConfigError):
+        read_config("notify")
+
+
+@pytest.mark.parametrize("line", ['improve_notices = "all"', "deliver_improve_events = true"])
+def test_web_rejects_the_improve_keys(monkeypatch, tmp_path, line):
+    _write_config(monkeypatch, tmp_path, "web", _BASE + "port = 8080\n" + line + "\n")
+    with pytest.raises(ConfigError):
+        read_config("web")
+
+
+def test_the_improve_setting_read_at_start_does_not_follow_a_later_file_change(
+        monkeypatch, tmp_path):
+    path = _write_config(monkeypatch, tmp_path, "bot",
+                         _BASE + _BOT + 'improve_notices = "results"\n')
+    config = _read_closing("bot")
+
+    path.write_text(path.read_text(encoding="utf-8").replace("results", "off"), encoding="utf-8")
+
+    assert config.improve_notices == "results"
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        config.improve_notices = "off"  # type: ignore[misc]

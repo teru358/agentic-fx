@@ -258,7 +258,7 @@ def _commit_failure_supervisor(tmp_path, *, stop_event=None):
 def test_submit_manual_compensates_commit_exception_and_reraises(tmp_path):
     ctx = SimpleNamespace(mission_id=101)
     loop = _CommitFailureLoop(
-        ctx, _CommitFailureRunner(type("Result", (), {"status": "completed"})()))
+        ctx, _CommitFailureRunner(type("Result", (), {"status": "completed", "tool_calls": 37})()))
     sup = _commit_failure_supervisor(tmp_path)
     sup._improve_loop = loop
 
@@ -268,13 +268,15 @@ def test_submit_manual_compensates_commit_exception_and_reraises(tmp_path):
     assert len(loop.compensations) == 1
     assert loop.compensations[0]["ctx"] is ctx
     assert loop.compensations[0]["slot_terminalize"] is True
+    assert loop.compensations[0]["tool_calls"] == 37
 
 
 def test_launch_slot_running_path_compensates_commit_exception_and_reraises(
         tmp_path, monkeypatch):
     ctx = SimpleNamespace(mission_id=102)
     runner = _CommitFailureRunner(
-        type("Result", (), {"status": "failed"})(), call_on_ready=True)
+        type("Result", (), {"status": "failed", "tool_calls": 37})(),
+        call_on_ready=True)
     loop = _CommitFailureLoop(ctx, runner)
     sup = _commit_failure_supervisor(tmp_path)
     sup._improve_loop = loop
@@ -289,6 +291,7 @@ def test_launch_slot_running_path_compensates_commit_exception_and_reraises(
     assert len(loop.compensations) == 1
     assert loop.compensations[0]["ctx"] is ctx
     assert loop.compensations[0]["slot_terminalize"] is True
+    assert loop.compensations[0]["tool_calls"] == 37
 
 
 def test_launch_slot_pre_ready_path_compensates_commit_exception_and_reraises(
@@ -296,7 +299,8 @@ def test_launch_slot_pre_ready_path_compensates_commit_exception_and_reraises(
     stop_event = threading.Event()
     ctx = SimpleNamespace(mission_id=103)
     runner = _CommitFailureRunner(
-        type("Result", (), {"status": "failed"})(), stop_event=stop_event)
+        type("Result", (), {"status": "failed", "tool_calls": 37})(),
+        stop_event=stop_event)
     loop = _CommitFailureLoop(ctx, runner)
     sup = _commit_failure_supervisor(tmp_path, stop_event=stop_event)
     sup._improve_loop = loop
@@ -308,6 +312,7 @@ def test_launch_slot_pre_ready_path_compensates_commit_exception_and_reraises(
     assert len(loop.compensations) == 1
     assert loop.compensations[0]["ctx"] is ctx
     assert loop.compensations[0]["slot_terminalize"] is False
+    assert loop.compensations[0]["tool_calls"] == 37
 
 
 class _RunFailureRunner:
@@ -418,3 +423,50 @@ def test_failed_compensation_record_failure_keeps_the_original_error(
     sup._activity = _RecordingActivity(fail=True)
     with pytest.raises(error):
         sup.submit_manual()
+
+
+class _PrepareFailingLoop:
+    def __init__(self, cause):
+        self.cause = cause
+
+    def prepare(self, *, slot_key, now, on_ready=None):
+        from agentic_fx.loops.improve_loop import ImprovePrepareFailed
+        failure = ImprovePrepareFailed(7, slot_key)
+        if self.cause is None:
+            raise failure
+        raise failure from self.cause
+
+
+@pytest.mark.parametrize("entry", ["manual", "slot"])
+def test_prepare_failure_after_tx0_reraises_the_original_cause(tmp_path, entry):
+    import sqlite3
+
+    from agentic_fx.ops import ErrorCode
+    from agentic_fx.ops.service import OpsService
+
+    cause = sqlite3.OperationalError("database is locked")
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = _PrepareFailingLoop(cause)
+
+    with pytest.raises(sqlite3.OperationalError) as raised:
+        if entry == "manual":
+            sup.submit_manual()
+        else:
+            sup._launch_slot("2026-W36", 0)
+
+    assert raised.value is cause
+    assert OpsService._map_exception(raised.value) is ErrorCode.DATABASE_BUSY
+
+
+@pytest.mark.parametrize("entry", ["manual", "slot"])
+def test_prepare_failure_without_a_cause_is_not_swallowed(tmp_path, entry):
+    from agentic_fx.loops.improve_loop import ImprovePrepareFailed
+
+    sup = _commit_failure_supervisor(tmp_path)
+    sup._improve_loop = _PrepareFailingLoop(None)
+
+    with pytest.raises(ImprovePrepareFailed):
+        if entry == "manual":
+            sup.submit_manual()
+        else:
+            sup._launch_slot("2026-W36", 0)

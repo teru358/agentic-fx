@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from agentic_fx.store import backlog, improve_runs, improve_waves, missions
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
@@ -69,7 +70,8 @@ def test_finish_improve_mission_success_path_updates_all_four(tmp_path):
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "report:reports/x.md"},
-        now=NOW, output={"ok": True}, transcript=[])
+        now=NOW, output={"ok": True}, transcript=[],
+        notice=codes.NOTICE_REPORT_PUBLISHED, tool_calls=None)
 
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "completed"
     run = c.execute("SELECT finished_at, result FROM improvement_runs WHERE id=?",
@@ -93,7 +95,8 @@ def test_finish_improve_mission_approval_path_persists_approval_id(tmp_path):
         mission_status="completed", run_result="approval",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "approval:42"},
-        now=NOW, approval_id=42, output=None, transcript=[])
+        now=NOW, approval_id=42, output=None, transcript=[],
+        notice=codes.NOTICE_SUBMITTED, tool_calls=None)
 
     run = c.execute("SELECT result, approval_id FROM improvement_runs WHERE id=?",
                     (rid,)).fetchone()
@@ -111,7 +114,8 @@ def test_finish_improve_mission_non_completed_marks_slot_failed(tmp_path, missio
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status=mission_status, run_result=None,
-        backlog_transition=None, now=NOW, output=None, transcript=[])
+        backlog_transition=None, now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "failed"
     run = c.execute("SELECT result, finished_at FROM improvement_runs WHERE id=?",
                     (rid,)).fetchone()
@@ -128,7 +132,8 @@ def test_finish_improve_mission_output_invalid_treated_as_failed(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="failed", run_result=None, backlog_transition=None,
-        now=NOW, output=None, transcript=[])
+        now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "failed"
 
 
@@ -140,7 +145,8 @@ def test_finish_improve_mission_shutdown_path_same_helper(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="timeout", run_result=None, backlog_transition=None,
-        now=NOW, output=None, transcript=[])
+        now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "failed"
 
 
@@ -153,7 +159,8 @@ def test_finish_improve_mission_manual_one_shot_slot_key_none(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=None,
         mission_status="completed", run_result=None, backlog_transition=None,
-        now=NOW, output=None, transcript=[])
+        now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_OBSERVATION, tool_calls=None)
     assert c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()["status"] == "completed"
 
 
@@ -171,12 +178,14 @@ def test_finish_improve_mission_cas_zero_rowcount_raises_and_rolls_back(tmp_path
         mission_status="completed", run_result="report",
         backlog_transition={"backlog_id": bid, "status": "done",
                             "last_result": "x"},
-        now=NOW, output=None, transcript=[])
+        now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_REPORT_PUBLISHED, tool_calls=None)
     with pytest.raises(Exception):
         missions.finish_improve_mission(
             c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
             mission_status="failed", run_result=None, backlog_transition=None,
-            now=NOW, output=None, transcript=[])
+            now=NOW, output=None, transcript=[],
+            notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
     assert improve_waves.get_slot(c, period_key="2026-W34", k=0)["status"] == "done"  # 変化なし
 
 
@@ -206,7 +215,8 @@ def test_finish_improve_mission_mid_call_exception_rolls_back_all_four_rows(
             mission_status="completed", run_result="report",
             backlog_transition={"backlog_id": bid, "status": "done",
                                 "last_result": "x"},
-            now=NOW, output=None, transcript=[])
+            now=NOW, output=None, transcript=[],
+            notice=codes.NOTICE_REPORT_PUBLISHED, tool_calls=None)
     c.rollback()
 
     mission = c.execute("SELECT status FROM missions WHERE id=?", (mid,)).fetchone()
@@ -248,7 +258,8 @@ def test_run_lifecycle_created_bound_finished_no_dangling(tmp_path):
     missions.finish_improve_mission(
         c, mission_id=mid, run_id=rid, slot_key=("2026-W34", 0),
         mission_status="completed", run_result=None, backlog_transition=None,
-        now=NOW, output=None, transcript=[])
+        now=NOW, output=None, transcript=[],
+        notice=codes.NOTICE_OBSERVATION, tool_calls=None)
     run2 = c.execute("SELECT finished_at FROM improvement_runs WHERE id=?",
                      (rid,)).fetchone()
     assert run2["finished_at"] is not None  # FINISHED

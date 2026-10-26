@@ -9,7 +9,7 @@ import re
 from types import MappingProxyType
 from typing import Mapping
 
-from afx_ops import trade_events
+from afx_ops import improve_events, trade_events
 
 _SAFE_VALUE = re.compile(r"[A-Za-z0-9_.:+\-]{0,64}\Z")
 _TIMESTAMP = re.compile(r"[A-Za-z0-9_.:+\-]{1,64}\Z")
@@ -23,6 +23,7 @@ ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
     trade_events.ORDER_CODE: trade_events.ORDER_FIELDS,
     trade_events.CLOSE_CODE: trade_events.CLOSE_FIELDS,
+    improve_events.CODE: improve_events.FIELDS,
 })
 # 外へ出さない field。event にあっても無くてもよい
 _OPTIONAL_FIELDS = frozenset({"decided_by"})
@@ -35,6 +36,7 @@ _REF = MappingProxyType({
     "event_stream_health": re.compile(r"instance\Z"),
     trade_events.ORDER_CODE: trade_events.REF_PATTERN,
     trade_events.CLOSE_CODE: trade_events.REF_PATTERN,
+    improve_events.CODE: improve_events.REF_PATTERN,
 })
 
 
@@ -61,6 +63,9 @@ def _event_valid(code: str, ref: str, fields: dict) -> bool:
     if code in trade_events.TRADE_CODES:
         # 取引 event は field ごとの grammar と canonical で見る。範囲は ref も整数で確かめる
         return trade_events.valid_ref(ref) and trade_events.valid_fields(code, fields)
+    if code == improve_events.CODE:
+        # 改善 event は field ごとの文法だけで見る (語は列挙しない)
+        return improve_events.valid_fields(fields)
     return (_fields_match(code, fields)
             and all(_safe_value(value) for value in fields.values()))
 

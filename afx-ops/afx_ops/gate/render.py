@@ -396,6 +396,34 @@ OPS_EVENT_SPECS = {
 }
 
 
+# 改善通知の見出し。鍵は (result_code, reason_code)。専用の見出しを持つ対だけで、表に無い対は
+# `IMPROVE_BASE_WORDS` の基本語に reason を括弧で添える。daemon 側の許可対と語を揃える
+IMPROVE_HEADINGS = {
+    ("submitted", None): "[改善] 候補を提出 #{id}",
+    ("observation", None): "[改善] 提出なし (agent の申告) #{id}",
+    ("observation", "not_submitted"): "[改善] 提出なし #{id}",
+    ("observation", "demoted_recovered"): "[改善] 提出なし (降格) #{id}",
+    ("observation", "risk_gate_unsupported"): "[改善] 提出なし (risk_gate は未対応) #{id}",
+    ("observation", "duplicate_logic"): "[改善] 見送り (既存候補と同じロジック) #{id}",
+    ("observation", "duplicate_metrics"): "[改善] 見送り (既存候補と同じ成績) #{id}",
+    ("observation", "family_redirect"): "[改善] 見送り (既存系統への誘導) #{id}",
+    ("gate_failed", "unprofitable"): "[改善] 床未達で見送り #{id} (unprofitable)",
+    ("report", None): "[改善] レポートを公開 #{id}",
+    ("report", "duplicate_skipped"): "[改善] レポートを公開 #{id} (duplicate_skipped)",
+}
+IMPROVE_BASE_WORDS = {
+    "submitted": "候補を提出",
+    "observation": "提出なし",
+    "gate_failed": "見送り",
+    "failed": "失敗",
+    "report": "レポートを公開",
+}
+IMPROVE_REPORT_FAILED_HEADING = "[改善] レポートの公開に失敗 #{id}"
+IMPROVE_UNKNOWN_HEADING = "[改善] 終了 #{id}"
+IMPROVE_START_HEADING = "[改善] 開始 #{id} ({trigger})"
+IMPROVE_OBSERVATION_CHARS = 300
+
+
 def wants_ops_event(payload: dict[str, object], ops_notices: str) -> bool:
     default, _template = OPS_EVENT_SPECS[payload["code"]]
     return ops_notices == "all" or (default(payload) if callable(default) else default)

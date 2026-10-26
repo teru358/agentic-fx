@@ -250,6 +250,24 @@
   "bind": "loopback",
   "expected": "config_invalid",
   "group": "G",
+  "id": "G3b-improve-key",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\nimprove_notices = \"all\"\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
+  "id": "G3b-improve-delivery-key",
+  "interfaces": "na",
+  "secret": "none",
+  "text": "instance_root = \"{ROOT}\"\nkey_dir = \"{KEYS}\"\nport = {PORT}\ndeliver_improve_events = true\n"
+ },
+ {
+  "bind": "loopback",
+  "expected": "config_invalid",
+  "group": "G",
   "id": "G4-port-missing",
   "interfaces": "na",
   "secret": "none",

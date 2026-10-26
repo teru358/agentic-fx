@@ -63,17 +63,21 @@ def _run_bounded(argv: list[str], *, timeout: float) -> bytes:
         assert out is not None and err is not None
         deadline = time.monotonic() + timeout
         open_fds = {out.fileno(): "out", err.fileno(): "err"}
+        poller = select.poll()
+        for fd in open_fds:
+            poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
         chunks: list[bytes] = []
         size = errsize = 0
         while open_fds:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise InterfaceLookupFailed
-            ready, _w, _x = select.select(list(open_fds), [], [], min(_SLICE, remaining))
+            ready = [fd for fd, _event in poller.poll(min(_SLICE, remaining) * 1000)]
             for fd in ready:
                 chunk = os.read(fd, _READ)
                 if not chunk:
                     del open_fds[fd]
+                    poller.unregister(fd)
                     continue
                 if open_fds[fd] == "out":
                     size += len(chunk)

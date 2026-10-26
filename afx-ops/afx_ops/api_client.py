@@ -135,16 +135,22 @@ class _Request:
     一回だけ閉じる (pidfd を閉じる箇所はここだけ)。
     """
 
-    def __init__(self, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> None:
+    def __init__(self, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT,
+                 deadline: float | None = None) -> None:
         self._endpoint = endpoint
         self._timeout = timeout
+        self._deadline = deadline
         self._sock: socket.socket | None = None
         self._pidfd = -1
         self._sent = False
 
     @classmethod
-    def open(cls, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> "_Request":
-        request = cls(endpoint, timeout=timeout)
+    def open(cls, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT,
+             deadline: float | None = None) -> "_Request":
+        """``deadline`` (``time.monotonic`` の時刻) があれば、socket を使う admission の各段にも
+        残り時間を渡す。socket を使わない段 (lock device の検査) は上限の外で、合計は
+        ``deadline`` にその段の所要を足した時間まで延び得る。"""
+        request = cls(endpoint, timeout=timeout, deadline=deadline)
         try:
             request._connect_and_verify()
         except BaseException:
@@ -167,15 +173,26 @@ class _Request:
             raise ApiError(_connect_failure(exc)) from None
         try:
             # 固有 admission (共有契約の接続後検査より前)。
+            self._spend_remaining()
             self._pidfd = server_auth.fetch_pidfd(self._sock)
             server_auth.check_pidfd(self._sock, self._pidfd)
             server_auth.check_lock_device(ep.lock_path, proc_locks=ep.proc_locks)
             # 共有契約の接続後検査。pidfd はこの object が持ち、dev の救済はしない。
+            self._spend_remaining()
             server_auth.verify_peer(self._sock, uid=ep.uid, lock_path=ep.lock_path,
                                     proc_locks=ep.proc_locks, pidfd=self._pidfd,
                                     dev_fallback=False)
         except ServerAuthError as err:
             raise ApiError(err.reason) from None
+
+    def _spend_remaining(self) -> None:
+        """deadline が指定されていれば、残り時間を socket の期限にする (尽きていれば期限切れ)。"""
+        if self._deadline is None or self._sock is None:
+            return
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise ApiError("timeout")
+        self._sock.settimeout(left)
 
     def _peer_exited(self) -> bool:
         return server_auth.pidfd_exited(self._pidfd)
@@ -191,6 +208,11 @@ class _Request:
             self._sock.sendall(payload)
         except OSError:
             raise ApiError("response_lost", token_sent=True) from None
+
+    def limit(self, seconds: float) -> None:
+        """以後の送受信に使う socket の期限 (要求全体の残り時間に合わせるため)。"""
+        if self._sock is not None:
+            self._sock.settimeout(seconds)
 
     def receive(self, *, timeout: float = HTTP_TIMEOUT) -> tuple[int, bytes, int | None]:
         """応答を読む。相手の終了・期限・形式不正はすべて応答喪失。"""
@@ -325,6 +347,14 @@ def _reply(status: int, body: bytes, retry_after: int | None = None) -> Reply:
 
 # --------------------------------------------------------------- client
 
+def _remaining(deadline: float, *, token_sent: bool = False) -> float:
+    """deadline までの残り時間。尽きていれば期限切れ。"""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise ApiError("timeout", token_sent=token_sent)
+    return left
+
+
 class _Client:
     """principal 1 つ分の client。鍵は自分の principal のものだけを持つ。"""
 
@@ -355,13 +385,25 @@ class _Client:
         return f"{type(self).__name__}(socket={str(self._endpoint.socket_path)!r})"
 
     def _call(self, method: str, path: str, *, query: dict | None = None,
-              body: dict | None = None, timeout: float | None = None) -> Reply:
+              body: dict | None = None, timeout: float | None = None,
+              deadline: float | None = None) -> Reply:
         """actor header を付けない要求。actor を付けられるのは ``BotClient`` だけ。"""
-        return self._send(_build(self._token, method, path, query, body, None), timeout=timeout)
+        return self._send(_build(self._token, method, path, query, body, None), timeout=timeout,
+                          deadline=deadline)
 
-    def _send(self, payload: bytes, *, timeout: float | None = None) -> Reply:
-        request_timeout = HTTP_TIMEOUT if timeout is None else timeout
-        with _Request.open(self._endpoint, timeout=request_timeout) as request:
+    def _send(self, payload: bytes, *, timeout: float | None = None,
+              deadline: float | None = None) -> Reply:
+        """1 要求を送る。``timeout`` は接続と受信それぞれの期限、``deadline`` (``time.monotonic``
+        の時刻) は接続・admission・送信・受信の合計の期限で、各段は残り時間で打ち切る。ただし
+        admission の lock device の検査 (socket を使わない) は上限の外で、合計は ``deadline`` に
+        その所要を足した時間まで延び得る。"""
+        if deadline is None:
+            request_timeout = HTTP_TIMEOUT if timeout is None else timeout
+        else:
+            request_timeout = _remaining(deadline)
+        opened = (_Request.open(self._endpoint, timeout=request_timeout) if deadline is None
+                  else _Request.open(self._endpoint, timeout=request_timeout, deadline=deadline))
+        with opened as request:
             with self._lock:
                 ident = threading.get_ident()
                 self._inflight[request] = ident
@@ -369,8 +411,12 @@ class _Client:
             try:
                 if interrupted:
                     request.abort()
+                if deadline is None:
+                    request.send(payload)
+                    return _reply(*request.receive(timeout=request_timeout))
+                request.limit(_remaining(deadline))
                 request.send(payload)
-                return _reply(*request.receive(timeout=request_timeout))
+                return _reply(*request.receive(timeout=_remaining(deadline, token_sent=True)))
             finally:
                 with self._lock:
                     self._inflight.pop(request, None)
@@ -395,9 +441,10 @@ class _Client:
         with self._lock:
             self._interrupted_threads.discard(ident)
 
-    def _get(self, path: str, *, timeout: float | None = None, **query) -> Reply:
+    def _get(self, path: str, *, timeout: float | None = None, deadline: float | None = None,
+             **query) -> Reply:
         return self._call("GET", path, query={k: v for k, v in query.items() if v is not None},
-                          timeout=timeout)
+                          timeout=timeout, deadline=deadline)
 
 
 class BotClient(_Client):
@@ -413,6 +460,11 @@ class BotClient(_Client):
 
     def approval(self, approval_id: int, *, timeout: float | None = None) -> Reply:
         return self._get(f"/v1/approvals/{_int_id(approval_id)}", timeout=timeout)
+
+    def improve_run(self, mission_id: int, *, deadline: float) -> Reply:
+        """改善 mission の終端 snapshot と詳細。``deadline`` は ``time.monotonic`` の時刻で、
+        接続から本文の読込までの合計をこれで打ち切る。"""
+        return self._get(f"/v1/improve/runs/{_int_id(mission_id)}", deadline=deadline)
 
     def approve(self, actor: Actor, approval_id: int, *, payload_sha256: str) -> "Decision":
         return self._decide(actor, "approve", approval_id, {"payload_sha256": payload_sha256})

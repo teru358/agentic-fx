@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from agentic_fx.activity import ActivityLog, Category
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_runs as improve_runs_store
@@ -74,7 +75,7 @@ def _fake_settings(parallel: int) -> Any:
 def test_wave_creation_writes_wave_and_m_slots_in_one_tx(conn):
     """M = min(parallel, 空き) 個の reserved slot が wave 行と**同じ commit**
     で現れる (part-way な状態が外部から観測できない — 単一 tx pin)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     ok = improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=2, commit=True)
     assert ok is True
     wave = conn.execute(
@@ -277,7 +278,7 @@ def test_three_way_launch_order_prepare_then_ready_then_running_commit_then_run(
     (裁定 R-D1: spawn/send_go/run_to_completion の 3 相 API は撤去。新規
     プロトコルフレームは追加しない)。"""
     events: list[str] = []
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -305,7 +306,7 @@ def test_mission_body_not_continued_before_running_commit(conn):
     fake WorkerRunner 経由で確認する。commit 前に継続が記録されたら
     fail (裁定 R-D1: 新規フレームは無いので、継続そのものが同期点)。"""
     events: list[str] = []
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
 
     class _OrderCheckingRunner(_RecordingFakeWorkerRunner):
@@ -336,7 +337,7 @@ def test_mark_running_cas_failure_does_not_authorize_the_child(conn):
     実行されていた (設計 §3.1③ authorization 順序の破れ)。fake runner が
     `on_ready` 呼び出しの**直前**に slot を他経路で `failed` へ終端させ、
     CAS を確実に失敗させる (probe_c1_i2_i3.py::probe_c1 と同形)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -385,7 +386,7 @@ def test_handle_pre_ready_failure_revert_cas_failure_does_not_retry(conn):
     (`WHERE status='claimed'`) は当たらない — bool を無視すると
     「reserved に戻した」と誤認して呼び出し元に retry (=再 claim) を
     促してしまう。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     conn.execute(
@@ -430,7 +431,7 @@ def test_on_ready_exception_reverts_to_reserved_then_failed(conn, monkeypatch):
     「2 つの独立プロセス」を模して `_launch_slot` を**2 回**呼んでいたが、
     新実装では**1 回**の呼び出しが内部で 2 回 (初回+再試行1回) 試みる —
     2 回呼ぶと 4 attempt 分進んでしまい old 版の期待値と矛盾する。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -492,7 +493,7 @@ def test_failure_after_running_does_not_retry_the_slot(conn):
     ので、実際の mission 行整合はここでは問わない。実 `finish_improve_
     mission` を通す検証は `test_pre_ready_failure_keeps_slot_reserved_
     through_real_commit` が別途担う)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -558,7 +559,7 @@ def test_pre_ready_failure_reverts_to_reserved_with_mission_id_null(conn):
     reserved_then_failed`/`test_pre_ready_failure_second_attempt_goes_
     to_failed` (単一呼び出しで両 attempt を進める形に書き換え済み) が
     担う。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     conn.execute(
         "INSERT INTO missions (id, loop, runner, model, status, started_at) "
@@ -588,7 +589,7 @@ def test_pre_ready_failure_second_attempt_goes_to_failed(conn):
     """spawn_attempts が 2 に達したら (初回 + 再試行 1 回) failed へ収束する
     (I2b 是正の逸脱申告: 単一 `_launch_slot` 呼び出しで両 attempt を
     進める形へ書き換え — 上の pin と同じ理由)。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
@@ -625,7 +626,7 @@ def test_launch_slot_retry_loop_does_not_respawn_after_shutdown(conn):
     崩れていた。1 attempt 目の `run()` の中で `stop_event.set()` してから
     pre-ready 失敗を返し、`prepare()` が**1 回しか呼ばれない**こと
     (= 2 attempt 目が始まらない) を pin する。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     stop_event = threading.Event()
@@ -670,7 +671,7 @@ def test_pre_ready_failure_also_covers_ready_timeout_before_running_commit(conn)
     返す fake runner (ready 受信前 timeout を模す) で、`prepare` が
     2 回呼ばれること (初回+再試行1回) と、最終的に slot が
     `failed`/`spawn_attempts=2` へ収束することを実測する。"""
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -713,7 +714,7 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
     failed で終端することを実測する。"""
     from agentic_fx.store import improve_runs as improve_runs_store
 
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         conn, period_key="2026-W34", now=now, expected=1, commit=True)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
@@ -762,7 +763,8 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
                 conn, mission_id=mission_id, run_id=run_id,
                 slot_key=slot_key if slot_terminalize else None,
                 mission_status="failed", run_result=None, now=now,
-                backlog_transition=None, commit=False)
+                backlog_transition=None, commit=False,
+                notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
             conn.commit()
 
     fake_loop = _RealCommitFakeImproveLoop()
@@ -832,7 +834,7 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_wiring(tmp_path):
     db_path = tmp_path / "real_wiring.db"
     bootstrap = db_mod.connect(db_path)
     db_mod.init_db(bootstrap)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
     # L-B13 裁定是正 (束D検収 verified-local-round1.md §7): 空 partition
@@ -911,7 +913,7 @@ def test_isolation_refusal_is_terminal_without_retry(tmp_path, monkeypatch):
     db_path = tmp_path / "refused.db"
     bootstrap = db_mod.connect(db_path)
     db_mod.init_db(bootstrap)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
     backlog_store.add(bootstrap, "idea-for-partition", "user", now)
@@ -961,7 +963,7 @@ def test_real_wiring_runner_run_exception_terminalizes_via_real_compensate(tmp_p
     db_path = tmp_path / "real_wiring_runner_exception.db"
     bootstrap = db_mod.connect(db_path)
     db_mod.init_db(bootstrap)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
     from agentic_fx.store import backlog as backlog_store
@@ -1018,7 +1020,7 @@ def test_mixed_failure_windows_real_wiring_preserves_two_spawn_attempts(tmp_path
     db_path = tmp_path / "mixed_windows.db"
     bootstrap = db_mod.connect(db_path)
     db_mod.init_db(bootstrap)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(
         bootstrap, period_key="2026-W34", now=now, expected=1, commit=True)
     backlog_store.add(bootstrap, "idea-for-partition", "user", now)
@@ -1084,7 +1086,7 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
     db_path = tmp_path / "agentic.db"
     conn0 = db_mod.connect(db_path)
     db_mod.init_db(conn0)
-    now = datetime(2026, 8, 22, 3, 0)
+    now = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)
     improve_waves.create_wave_and_slots(conn0, period_key="2026-W34", now=now, expected=4, commit=True)
     # 裁定 D1: mission_id=100+k (k=0..3) が claim 対象。FK のため事前に
     # 実在させる (id を明示指定した INSERT)。
@@ -1357,7 +1359,7 @@ def test_submit_manual_returns_mission_id_without_slot_claim(conn):
     events: list[str] = []
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
-                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
                              db_path=Path("x"), stop_event=threading.Event())
     sup._conn_for_test = conn
     fake_loop = _ManualFakeImproveLoop(
@@ -1382,7 +1384,7 @@ def test_submit_manual_prepares_with_slot_key_none_and_no_on_ready(conn):
     events: list[str] = []
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
-                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
                              db_path=Path("x"), stop_event=threading.Event())
     sup._conn_for_test = conn
     fake_loop = _ManualFakeImproveLoop(
@@ -1465,7 +1467,8 @@ class _Round2FakeImproveLoop:
                 self._conn, mission_id=ctx.mission_id, run_id=ctx.run_id,
                 slot_key=ctx.slot_key, mission_status="failed",
                 run_result=None, backlog_transition=None, now=now,
-                commit=False)
+                commit=False,
+                notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
             self._conn.commit()
         except BaseException:
             self._conn.rollback()
@@ -1483,7 +1486,7 @@ def test_runner_run_exception_does_not_burn_capacity(conn):
     fake_loop = _Round2FakeImproveLoop(conn, runner)
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
-                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
                              db_path=Path("x"), stop_event=threading.Event())
     sup._conn_for_test = conn
     sup._improve_loop = fake_loop
@@ -1523,7 +1526,7 @@ def test_spawn_slot_thread_crash_is_recorded_in_activity(conn, tmp_path):
     activity = ActivityLog(tmp_path / "activity.tsv")
     sup = ImproveSupervisor(capacity=1, root=Path("/tmp"),
                              settings=_fake_settings(parallel=1),
-                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0)),
+                             clock=_FixedClock(datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)),
                              db_path=Path("x"), stop_event=threading.Event(),
                              activity=activity)
     sup._conn_for_test = conn

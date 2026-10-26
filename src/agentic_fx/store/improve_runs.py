@@ -6,10 +6,14 @@ from datetime import datetime
 
 
 def start(conn: sqlite3.Connection, backlog_id: int | None, now: datetime, *,
-          mission_id: int | None = None, commit: bool = True) -> int:
+          mission_id: int | None = None, trigger: str | None = None,
+          commit: bool = True) -> int:
+    """`trigger` は起動の経路 (`manual` / `scheduled`)。導入前に始まった run は
+    NULL のままで、読む側は `manual` として扱う。"""
     cur = conn.execute(
-        "INSERT INTO improvement_runs (backlog_id, mission_id, started_at) "
-        "VALUES (?,?,?)", (backlog_id, mission_id, now.isoformat()))
+        "INSERT INTO improvement_runs (backlog_id, mission_id, started_at, "
+        "trigger) VALUES (?,?,?,?)",
+        (backlog_id, mission_id, now.isoformat(), trigger))
     if commit:
         conn.commit()
     return cur.lastrowid

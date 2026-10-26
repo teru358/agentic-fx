@@ -102,7 +102,7 @@ def test_the_design_document_no_longer_describes_news_as_reserved_or_hidden():
 # --- no route from the API or an agent -----------------------------------------------------------------
 
 def test_no_operation_endpoint_exists_for_news_and_ctl_cannot_parse_it(tmp_path, monkeypatch, capsys):
-    assert len(ENDPOINTS) == 29
+    assert len(ENDPOINTS) == 30
     assert not [code for code in ENDPOINTS if "news" in code]
     assert not [e.route for e in ENDPOINTS.values() if "news" in e.route]
     for tokens in (["news", "list"], ["news", "add", "x", "https://example.invalid/"], ["news"]):

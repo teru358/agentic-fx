@@ -221,7 +221,7 @@ def test_ac26_old_yaml_without_notify_section_reads_with_default_true():
 def test_ac26_example_is_v4_and_validates_with_notify_section():
     from agentic_fx.config import Settings
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 4 and raw["notify"] == {"trade_events": True}
+    assert raw["schema_version"] == 4 and raw["notify"] == {"trade_events": True, "improve_events": True}
     assert Settings.model_validate(raw).notify.trade_events is True
 
 

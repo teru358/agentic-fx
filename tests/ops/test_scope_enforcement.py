@@ -88,6 +88,7 @@ def _every_endpoint(service):
         "activity": lambda p: service.activity(p, 1),
         "approval_detail": lambda p: service.approval_detail(p, 9999),
         "approval_change": lambda p: service.approval_change(p, 9999),
+        "improve_run": lambda p: service.improve_run(p, 9999),
         "approval_list": lambda p: service.approval_list(p),
         "reflection_status": lambda p: service.reflection_status(p, 9999),
         "whoami": lambda p: service.whoami(p),

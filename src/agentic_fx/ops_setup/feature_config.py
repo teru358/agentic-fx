@@ -25,8 +25,9 @@ DEFAULT_USER = "afx"
 USER_PATTERN = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 # web.password の size (byte)。起動側の検査と同じ範囲
 PASSWORD_MIN, PASSWORD_MAX = 8, 32
-_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices"),
-             "web": _WEB_ACCESS, "notify": ("deliver_trade_events",)}
+_OPTIONAL = {"bot": ("mention_role_id", "trade_notices", "trade_amounts", "ops_notices",
+                     "improve_notices"),
+             "web": _WEB_ACCESS, "notify": ("deliver_trade_events", "deliver_improve_events")}
 UNRESTRICTED = "0.0.0.0/0"
 LOOPBACK = ipaddress.IPv4Network("127.0.0.0/8")
 
@@ -36,10 +37,13 @@ def is_loopback(values: dict[str, Any]) -> bool:
     return ipaddress.IPv4Address(values.get("bind", "127.0.0.1")) in LOOPBACK
 _WEB_PASSWORD = "web.password"
 # 取引通知の出し方 (afx-ops の ops.toml の optional key。値の集合は afx-ops と同じ)
-_TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices"), "web": (), "notify": ("deliver_trade_events",)}
+_TRADE_KEYS = {"bot": ("trade_notices", "trade_amounts", "ops_notices", "improve_notices"), "web": (),
+               "notify": ("deliver_trade_events", "deliver_improve_events")}
 TRADE_NOTICES = ("all", "results", "fills_closes", "off")
 TRADE_AMOUNTS = ("absolute", "relative")
 OPS_NOTICES = ("default", "all")
+IMPROVE_NOTICES = ("all", "results", "off")
+_BOOLEAN_KEYS = frozenset({"deliver_trade_events", "deliver_improve_events"})
 _DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 class InputError(ValueError): pass
@@ -79,11 +83,12 @@ def _trade_options(feature: str, values: dict[str, Any]) -> dict[str, Any]:
     for name in _TRADE_KEYS[feature]:
         if name not in values: continue
         value = values[name]
-        if name == "deliver_trade_events":
+        if name in _BOOLEAN_KEYS:
             if type(value) is not bool: raise InputError(name)
         elif type(value) is not str or value not in {"trade_notices": TRADE_NOTICES,
                                                        "trade_amounts": TRADE_AMOUNTS,
-                                                       "ops_notices": OPS_NOTICES}[name]:
+                                                       "ops_notices": OPS_NOTICES,
+                                                       "improve_notices": IMPROVE_NOTICES}[name]:
             raise InputError(name)
         result[name] = value
     return result

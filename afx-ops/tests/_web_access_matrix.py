@@ -68,6 +68,8 @@ def g_rows() -> list[dict]:
         body_only=True)
     add("G3b-unknown-key", "config_invalid", _toml('proxy = "x"\n'))
     add("G3b-trade-key", "config_invalid", _toml('trade_notices = "all"\n'))
+    add("G3b-improve-key", "config_invalid", _toml('improve_notices = "all"\n'))
+    add("G3b-improve-delivery-key", "config_invalid", _toml("deliver_improve_events = true\n"))
 
     for name, value in (("missing", None), ("string", '"8080"'), ("bool", "true"), ("zero", "0"),
                         ("high", "65536"), ("negative", "-1"), ("float", "8080.0")):

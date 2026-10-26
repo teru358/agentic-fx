@@ -301,3 +301,82 @@ def test_bot_ops_notices_survives_a_writer_round_trip_and_rejects_other_values(t
     for invalid in ("everything", "ALL", 1, True, None):
         with pytest.raises(InputError):
             validate("bot", BOT | {"ops_notices": invalid})
+
+
+def test_improve_keys_added_by_hand_are_kept_when_the_inputs_are_collected_and_rewritten(
+        tmp_path, xdg):
+    write_inputs(tmp_path, "bot", BOT)
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/x"})
+    bot_path = _hand_edit(xdg, "bot", 'improve_notices = "results"\n')
+    notify_path = _hand_edit(xdg, "notify", "deliver_improve_events = true\n")
+
+    bot = collect(tmp_path, "bot")
+    notify = collect(tmp_path, "notify")
+
+    assert bot.complete and bot.values["improve_notices"] == "results"
+    assert notify.complete and notify.values["deliver_improve_events"] is True
+    write_inputs(tmp_path, "bot", bot.values | {"token": "t"})
+    write_inputs(tmp_path, "notify", notify.values | {"webhook_url": "https://h.example.com/y"})
+    assert 'improve_notices = "results"\n' in bot_path.read_text()
+    assert "deliver_improve_events = true\n" in notify_path.read_text()
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/y",
+                                       "deliver_improve_events": False})
+    assert "deliver_improve_events = false\n" in notify_path.read_text()
+
+
+@pytest.mark.parametrize("value", ["all", "results", "off"])
+def test_bot_improve_notices_accepts_the_three_values(tmp_path, xdg, value):
+    write_inputs(tmp_path, "bot", BOT | {"improve_notices": value})
+
+    assert collect(tmp_path, "bot").values["improve_notices"] == value
+    assert f'improve_notices = "{value}"\n' in (xdg / "bot" / "config" / "ops.toml").read_text()
+
+
+def test_old_inputs_stay_without_the_improve_keys(tmp_path, xdg):
+    write_inputs(tmp_path, "bot", BOT)
+    write_inputs(tmp_path, "notify", {"webhook_url": "https://h.example.com/x"})
+
+    for feature in ("bot", "notify"):
+        found = collect(tmp_path, feature)
+        assert found.complete
+        assert not {"improve_notices", "deliver_improve_events"} & set(found.values)
+        assert "improve" not in (xdg / feature / "config" / "ops.toml").read_text()
+
+
+@pytest.mark.parametrize("feature,extra", [
+    ("bot", 'improve_notices = "everything"\n'), ("bot", "improve_notices = true\n"),
+    ("bot", 'improve_notices = "ALL"\n'), ("bot", "deliver_improve_events = true\n"),
+    ("notify", 'deliver_improve_events = "yes"\n'), ("notify", "deliver_improve_events = 1\n"),
+    ("notify", 'improve_notices = "all"\n'),
+])
+def test_invalid_improve_keys_in_an_existing_config_make_the_inputs_unusable(
+        tmp_path, xdg, feature, extra):
+    write_inputs(tmp_path, feature, BOT if feature == "bot"
+                 else {"webhook_url": "https://h.example.com/x"})
+    _hand_edit(xdg, feature, extra)
+
+    assert unsafe_reason(tmp_path, feature) == "config_file"
+
+
+@pytest.mark.parametrize("feature,values", [
+    ("bot", BOT | {"improve_notices": "everything"}), ("bot", BOT | {"improve_notices": 1}),
+    ("bot", BOT | {"improve_notices": True}), ("bot", BOT | {"improve_notices": "ALL"}),
+    ("bot", BOT | {"improve_notices": ""}),
+    ("notify", {"webhook_url": "https://h.example.com/x", "deliver_improve_events": 1}),
+    ("notify", {"webhook_url": "https://h.example.com/x", "deliver_improve_events": "true"}),
+])
+def test_validate_rejects_invalid_improve_values(feature, values):
+    with pytest.raises(InputError):
+        validate(feature, values)
+
+
+def test_the_accepted_improve_notice_values_match_afx_ops():
+    import ast
+
+    from agentic_fx.ops_setup.feature_config import IMPROVE_NOTICES
+
+    config = ast.parse((Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops"
+                        / "config.py").read_text(encoding="utf-8"))
+    notices = next(node.value for node in config.body if isinstance(node, ast.Assign)
+                   and getattr(node.targets[0], "id", None) == "IMPROVE_NOTICES")
+    assert IMPROVE_NOTICES == tuple(e.value for e in notices.elts)
