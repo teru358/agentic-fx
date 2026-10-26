@@ -135,16 +135,22 @@ class _Request:
     一回だけ閉じる (pidfd を閉じる箇所はここだけ)。
     """
 
-    def __init__(self, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> None:
+    def __init__(self, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT,
+                 deadline: float | None = None) -> None:
         self._endpoint = endpoint
         self._timeout = timeout
+        self._deadline = deadline
         self._sock: socket.socket | None = None
         self._pidfd = -1
         self._sent = False
 
     @classmethod
-    def open(cls, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT) -> "_Request":
-        request = cls(endpoint, timeout=timeout)
+    def open(cls, endpoint: Endpoint, *, timeout: float = HTTP_TIMEOUT,
+             deadline: float | None = None) -> "_Request":
+        """``deadline`` (``time.monotonic`` の時刻) があれば、socket を使う admission の各段にも
+        残り時間を渡す。socket を使わない段 (lock device の検査) は上限の外で、合計は
+        ``deadline`` にその段の所要を足した時間まで延び得る。"""
+        request = cls(endpoint, timeout=timeout, deadline=deadline)
         try:
             request._connect_and_verify()
         except BaseException:
@@ -167,15 +173,26 @@ class _Request:
             raise ApiError(_connect_failure(exc)) from None
         try:
             # 固有 admission (共有契約の接続後検査より前)。
+            self._spend_remaining()
             self._pidfd = server_auth.fetch_pidfd(self._sock)
             server_auth.check_pidfd(self._sock, self._pidfd)
             server_auth.check_lock_device(ep.lock_path, proc_locks=ep.proc_locks)
             # 共有契約の接続後検査。pidfd はこの object が持ち、dev の救済はしない。
+            self._spend_remaining()
             server_auth.verify_peer(self._sock, uid=ep.uid, lock_path=ep.lock_path,
                                     proc_locks=ep.proc_locks, pidfd=self._pidfd,
                                     dev_fallback=False)
         except ServerAuthError as err:
             raise ApiError(err.reason) from None
+
+    def _spend_remaining(self) -> None:
+        """deadline が指定されていれば、残り時間を socket の期限にする (尽きていれば期限切れ)。"""
+        if self._deadline is None or self._sock is None:
+            return
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            raise ApiError("timeout")
+        self._sock.settimeout(left)
 
     def _peer_exited(self) -> bool:
         return server_auth.pidfd_exited(self._pidfd)
@@ -377,12 +394,16 @@ class _Client:
     def _send(self, payload: bytes, *, timeout: float | None = None,
               deadline: float | None = None) -> Reply:
         """1 要求を送る。``timeout`` は接続と受信それぞれの期限、``deadline`` (``time.monotonic``
-        の時刻) は接続・admission・送信・受信の合計の期限で、各段は残り時間で打ち切る。"""
+        の時刻) は接続・admission・送信・受信の合計の期限で、各段は残り時間で打ち切る。ただし
+        admission の lock device の検査 (socket を使わない) は上限の外で、合計は ``deadline`` に
+        その所要を足した時間まで延び得る。"""
         if deadline is None:
             request_timeout = HTTP_TIMEOUT if timeout is None else timeout
         else:
             request_timeout = _remaining(deadline)
-        with _Request.open(self._endpoint, timeout=request_timeout) as request:
+        opened = (_Request.open(self._endpoint, timeout=request_timeout) if deadline is None
+                  else _Request.open(self._endpoint, timeout=request_timeout, deadline=deadline))
+        with opened as request:
             with self._lock:
                 ident = threading.get_ident()
                 self._inflight[request] = ident

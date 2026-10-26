@@ -174,12 +174,25 @@ def test_an_unknown_reason_word_does_not_stop_delivery_and_the_cursor_advances(t
     _improve(2, state="done"),
     {**_improve(2), "ref": "order:1"},
 ])
-def test_an_invalid_improve_event_stops_without_moving_the_cursor(tmp_path, bad, enabled):
+def test_an_invalid_improve_event_is_skipped_and_the_events_after_it_are_delivered(
+        tmp_path, bad, enabled):
     state_dir = _state_dir(tmp_path)
     send = _Send()
 
     rc, err = _run(state_dir, _Client(_page(_health(1), bad, _health(3))), send,
                    config=_Config(deliver_improve_events=enabled))
+
+    assert (rc, err) == (0, "afx-ops: warning improve_event_invalid event=2\n")
+    assert [body["event_id"] for body in send.bodies] == [1, 3]
+    assert _state(state_dir).cursor == 3
+
+
+def test_an_invalid_event_that_is_not_an_improve_event_still_stops_the_delivery(tmp_path):
+    state_dir = _state_dir(tmp_path)
+    send = _Send()
+    bad = {**_health(2), "ref": "elsewhere"}
+
+    rc, err = _run(state_dir, _Client(_page(_health(1), bad, _health(3))), send)
 
     assert (rc, err) == (1, "afx-ops: payload_invalid\n")
     assert [body["event_id"] for body in send.bodies] == [1]

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 
 from afx_ops import improve_events
@@ -23,6 +24,10 @@ STAGES = ("in_sample", "holdout")
 STAGE_LABELS = {"in_sample": "in-sample", "holdout": "holdout"}
 TRIGGER_LABELS = {"manual": "手動", "scheduled": "週次"}
 MAX_PAIR_LINES = 3
+IMPROVE_BODY_LIMIT = 2000
+FIELD_CHARS = 64
+OMITTED_LINE = "(本文を省略)"
+_PAIR_NAME = re.compile(r"[A-Z0-9_]{3,16}\Z")
 UNAVAILABLE_LINE = "(詳細を取得できませんでした)"
 NO_NOTE = "(記載なし)"
 
@@ -99,10 +104,19 @@ def _pair_row(value: object) -> dict | bool:
             "evaluable": value["evaluable"]}
 
 
-def _floor(value: object) -> dict | None | bool:
+class _DropFloor:
+    """floor の中身が契約の形に反する印。DTO 全体は生かし、床の数値だけを使わない。"""
+
+
+_DROP_FLOOR = _DropFloor()
+
+
+def _floor(value: object) -> dict | None | bool | _DropFloor:
+    """型の不正は False (DTO 全体を不正とする)。型は合うが中身が契約に反する (空の stages・
+    段の順序・重複・空の pairs・pair 名の文法) ときは _DROP_FLOOR。"""
     if value is None:
         return None
-    if type(value) is not dict or type(value.get("stages")) is not list or not value["stages"]:
+    if type(value) is not dict or type(value.get("stages")) is not list:
         return False
     stages = []
     for stage in value["stages"]:
@@ -113,9 +127,20 @@ def _floor(value: object) -> dict | None | bool:
         if any(row is False for row in rows):
             return False
         stages.append({"stage": stage["stage"], "pairs": rows})
-    if len({stage["stage"] for stage in stages}) != len(stages):
-        return False
+    if not stages:
+        return _DROP_FLOOR
+    order = [STAGES.index(stage["stage"]) for stage in stages]
+    if (order != sorted(set(order)) or any(not stage["pairs"] for stage in stages)
+            or any(_PAIR_NAME.match(row["pair"]) is None
+                   for stage in stages for row in stage["pairs"])):
+        return _DROP_FLOOR
     return {"stages": stages}
+
+
+def _floor_allowed(snapshot: dict | None, report_state: str) -> bool:
+    """床の数値を出してよいのは、床未達で見送り、かつ report が公開済みのときだけ。"""
+    return (snapshot is not None and snapshot["result_code"] == "gate_failed"
+            and snapshot["reason_code"] == "unprofitable" and report_state == "published")
 
 
 def validate_improve_run(data: object, mission_id: int) -> dict | None:
@@ -131,6 +156,8 @@ def validate_improve_run(data: object, mission_id: int) -> dict | None:
                                  _floor(data.get("floor")))
     if snapshot is False or approval is False or floor is False:
         return None
+    if floor is _DROP_FLOOR or not _floor_allowed(snapshot, data["report_state"]):
+        floor = None
     return {"id": data["id"], "backend": data["backend"], "model": data["model"],
             "elapsed_sec": data["elapsed_sec"], "snapshot": snapshot,
             "report_state": data["report_state"], "approval": approval, "floor": floor}
@@ -186,7 +213,7 @@ def _floor_lines(floor: dict) -> list[str]:
         label = STAGE_LABELS[stage["stage"]]
         pairs = stage["pairs"]
         for row in pairs[:MAX_PAIR_LINES]:
-            line = (f"{label}: {escape_discord(row['pair'])} pf {_pf(row['pf'])} "
+            line = (f"{label}: {cut_escaped(row['pair'], FIELD_CHARS)} pf {_pf(row['pf'])} "
                     f"avg_r {_avg_r(row['avg_r'])} 取引 {row['trades']}")
             lines.append(line + ("" if row["evaluable"] else " (評価不能)"))
         if len(pairs) > MAX_PAIR_LINES:
@@ -203,9 +230,9 @@ def _body_lines(snapshot: dict, detail: dict) -> list[str]:
         plugin, kind = approval["plugin"], approval["kind"]
         head = ""
         if plugin is not None:
-            head = f"plugin {escape_discord(plugin)}"
+            head = f"plugin {cut_escaped(plugin, FIELD_CHARS)}"
             if kind:
-                head += f" ({escape_discord(kind)})"
+                head += f" ({cut_escaped(kind, FIELD_CHARS)})"
             head += " / "
         return [f"{head}承認 #{approval['id']}"]
     if key == ("observation", None):
@@ -220,13 +247,23 @@ def _body_lines(snapshot: dict, detail: dict) -> list[str]:
     return []
 
 
+def _fit(lines: list[str]) -> str:
+    """Discord の本文上限に収める。超えるときは見出し (1 行目) と固定の省略行だけにする。"""
+    text = "\n".join(lines)
+    if len(text) <= IMPROVE_BODY_LIMIT:
+        return text
+    return f"{lines[0]}\n{OMITTED_LINE}"
+
+
 def render_improve_start(payload: Mapping[str, object], detail: dict | None) -> str:
     """開始通知。detail (検査済みの応答) があれば backend / model の行を添える。"""
     head = IMPROVE_START_HEADING.format(id=mission_id_of(payload),
                                         trigger=TRIGGER_LABELS[payload["trigger"]])
     if detail is None:
         return head
-    return f"{head}\nbackend {escape_discord(detail['backend'])} / {escape_discord(detail['model'])}"
+    backend = cut_escaped(detail["backend"], FIELD_CHARS)
+    model = cut_escaped(detail["model"], FIELD_CHARS)
+    return _fit([head, f"backend {backend} / {model}"])
 
 
 def render_improve_finish(payload: Mapping[str, object], detail: dict | None) -> str:
@@ -243,4 +280,4 @@ def render_improve_finish(payload: Mapping[str, object], detail: dict | None) ->
                       detail["report_state"])]
     lines.extend(_body_lines(snapshot, detail))
     lines.append(_last_line(detail["elapsed_sec"], snapshot["tool_calls"]))
-    return "\n".join(lines)
+    return _fit(lines)

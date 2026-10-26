@@ -358,12 +358,133 @@ def test_the_known_rounding_values_differ_from_a_naive_round_half_up():
     assert "pf 2.67 avg_r +0.01" in text
 
 
-def test_a_hostile_pair_name_is_escaped():
+def test_a_pair_name_outside_the_grammar_drops_only_the_floor():
     checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
                                        report_state="published",
                                        floor=_floor(("holdout", [pair("@everyone<@&1>")]))), 2040)
+    assert checked is not None and checked["floor"] is None
+    text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), checked)
+    assert text.splitlines() == ["[改善] 床未達で見送り #2040 (unprofitable)",
+                                 "所要 4分49秒 / tool 11 回"]
+
+
+def test_a_pair_name_that_reaches_the_renderer_is_still_escaped():
+    checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
+                                       report_state="published",
+                                       floor=_floor(("holdout", [pair()]))), 2040)
+    checked["floor"]["stages"][0]["pairs"][0]["pair"] = "@everyone<@&1>"
     text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), checked)
     assert escape_discord("@everyone<@&1>") in text and not _mentions(text)
+
+
+# ------------------------------------------------------------ 本文の長さ
+
+LONG = "ab_*" * 100
+
+
+def test_long_backend_model_kind_and_plugin_are_cut_to_sixty_four_characters():
+    start = validate_improve_run(dto(2043, backend=LONG, model=LONG), 2043)
+    text = render_improve_start(started(2043), start)
+    backend_line = text.splitlines()[1]
+    assert len(backend_line) <= len("backend  / ") + 2 * 64 and backend_line.count("…") == 2
+    approval = {"id": 3, "plugin": "p" * 40, "kind": LONG}
+    done = validate_improve_run(dto(2040, result="submitted", approval=approval), 2040)
+    line = render_improve_finish(finished(2040, "submitted", None), done).splitlines()[1]
+    assert len(line) <= len("plugin  () / 承認 #3") + 64 + 64 and "…" in line
+
+
+def test_a_pair_name_is_cut_even_when_it_reaches_the_renderer():
+    checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
+                                       report_state="published",
+                                       floor=_floor(("holdout", [pair()]))), 2040)
+    checked["floor"]["stages"][0]["pairs"][0]["pair"] = LONG
+    text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), checked)
+    assert "…" in text and len(text) < 400
+
+
+def test_the_longest_accepted_values_stay_inside_the_discord_limit():
+    pairs = [pair("A" * 16, evaluable=True) for _ in range(5)]
+    text = finish("gate_failed", "unprofitable", report_state="published", backend=LONG,
+                  model=LONG, floor=_floor(("in_sample", pairs), ("holdout", pairs)))
+    assert len(text) <= 2000 and "本文を省略" not in text
+
+
+def test_a_body_over_the_discord_limit_falls_back_to_the_heading_and_a_fixed_line(monkeypatch):
+    from afx_ops.gate import improve_render
+    monkeypatch.setattr(improve_render, "IMPROVE_BODY_LIMIT", 30)
+    text = finish("observation", None, text="あ" * 200)
+    assert text == "[改善] 提出なし (agent の申告) #2040\n(本文を省略)"
+    start = render_improve_start(started(2043), validate_improve_run(dto(2043), 2043))
+    assert start == "[改善] 開始 #2043 (手動)\n(本文を省略)"
+
+
+def test_the_fit_helper_keeps_a_short_text_and_cuts_a_long_one_to_the_first_line():
+    from afx_ops.gate.improve_render import _fit
+    assert _fit(["a", "b"]) == "a\nb"
+    assert _fit(["head", "x" * 3000]) == "head\n(本文を省略)"
+
+
+# ------------------------------------------------------------ 床の条件と形
+
+def _floor_text(**kw):
+    detail = validate_improve_run(dto(2040, **kw), 2040)
+    assert detail is not None
+    return detail
+
+
+@pytest.mark.parametrize("kw", [
+    dict(result="gate_failed", reason="unprofitable", report_state="failed"),
+    dict(result="gate_failed", reason="unprofitable", report_state="prepared"),
+    dict(result="gate_failed", reason="unprofitable", report_state="none"),
+    dict(result="gate_failed", reason="other_reason", report_state="published"),
+    dict(result="failed", reason="unprofitable", report_state="published"),
+    dict(result="observation", reason=None, report_state="published"),
+])
+def test_the_floor_is_used_only_for_an_unprofitable_gate_failure_with_a_published_report(kw):
+    detail = _floor_text(floor=_floor(("holdout", [pair()])), **kw)
+    assert detail["floor"] is None and detail["snapshot"]["result_code"] == kw["result"]
+    text = render_improve_finish(finished(2040, kw["result"], kw["reason"]), detail)
+    assert "pf " not in text and "落ちた段" not in text
+
+
+def test_a_floor_without_a_terminal_snapshot_is_dropped():
+    detail = validate_improve_run({**dto(2040, report_state="published",
+                                         floor=_floor(("holdout", [pair()]))),
+                                   "snapshot": None}, 2040)
+    assert detail is not None and detail["floor"] is None
+
+
+def test_the_floor_is_kept_for_an_unprofitable_gate_failure_with_a_published_report():
+    detail = _floor_text(result="gate_failed", reason="unprofitable", report_state="published",
+                         floor=_floor(("holdout", [pair()])))
+    assert detail["floor"]["stages"][0]["stage"] == "holdout"
+
+
+def test_empty_stages_mean_no_numbers_and_the_rest_of_the_detail_is_kept():
+    detail = _floor_text(result="gate_failed", reason="unprofitable", report_state="published",
+                         floor={"stages": []})
+    assert detail["floor"] is None and detail["elapsed_sec"] == 289
+    text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), detail)
+    assert text == "[改善] 床未達で見送り #2040 (unprofitable)\n所要 4分49秒 / tool 11 回"
+
+
+@pytest.mark.parametrize("name,floor", [
+    ("empty pairs", _floor(("holdout", []))),
+    ("empty pairs in the first of two", _floor(("in_sample", []), ("holdout", [pair()]))),
+    ("reversed order", _floor(("holdout", [pair()]), ("in_sample", [pair()]))),
+    ("duplicated stage", _floor(("holdout", [pair()]), ("holdout", [pair()]))),
+    ("lowercase pair", _floor(("holdout", [pair("usdjpy")]))),
+    ("slash in pair", _floor(("holdout", [pair("bad/name")]))),
+    ("short pair", _floor(("holdout", [pair("US")]))),
+    ("long pair", _floor(("holdout", [pair("A" * 17)]))),
+    ("second row bad", _floor(("holdout", [pair(), pair("a b")]))),
+])
+def test_a_floor_that_breaks_the_stage_contract_is_dropped_but_the_detail_is_kept(name, floor):
+    detail = _floor_text(result="gate_failed", reason="unprofitable", report_state="published",
+                         floor=floor)
+    assert detail["floor"] is None and detail["id"] == 2040
+    assert render_improve_finish(finished(2040, "gate_failed", "unprofitable"),
+                                 detail).splitlines()[-1] == "所要 4分49秒 / tool 11 回"
 
 
 # ------------------------------------------------------------ 取得失敗の全文
@@ -455,10 +576,9 @@ def _bad(mutate):
     ("approval key missing", lambda d: d["approval"].pop("kind")),
     ("floor list", lambda d: d.update(floor=[])),
     ("floor no stages", lambda d: d.update(floor={})),
-    ("floor empty stages", lambda d: d.update(floor={"stages": []})),
     ("floor stage unknown", lambda d: d["floor"]["stages"][0].update(stage="train")),
-    ("floor stage duplicated", lambda d: d["floor"]["stages"].append(
-        {"stage": "holdout", "pairs": []})),
+    ("floor stage name not a string", lambda d: d["floor"]["stages"][0].update(stage=["holdout"])),
+    ("floor stages not a list", lambda d: d["floor"].update(stages="holdout")),
     ("floor pairs missing", lambda d: d["floor"]["stages"][0].pop("pairs")),
     ("pair not dict", lambda d: d["floor"]["stages"][0]["pairs"].append("USDJPY")),
     ("pair name int", lambda d: d["floor"]["stages"][0]["pairs"][0].update(pair=1)),

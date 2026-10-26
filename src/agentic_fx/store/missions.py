@@ -146,7 +146,7 @@ def _insert_notice_snapshot(
     stored_text = (
         notice_codes.truncate_observation_text(safe_text(observation_text))
         if observation_text is not None else None)
-    if now.tzinfo is None:
+    if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("improve_run_notices: naive datetime は受け付けない")
     created_at = now.astimezone(timezone.utc).isoformat()
     verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"

@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import os
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,12 @@ def _improve(event_id: int, mission: int, state: str = "finished", result=None, 
 
 def _started(event_id: int, mission: int, trigger: str = "manual") -> dict:
     return _improve(event_id, mission, "started", trigger=trigger)
+
+
+def _approval_event(event_id: int, approval_id: int = 7) -> dict:
+    return {"id": event_id, "ts": TS, "code": "approval_state_changed",
+            "ref": f"approval:{approval_id}",
+            "fields": {"state": "approved", "decision_code": "approve"}}
 
 
 def _pair(name="USDJPY", trades=13, pf=1.8458377992140615, avg_r=0.3029234868346611,
@@ -324,14 +331,108 @@ def test_an_unknown_reason_word_is_rendered_in_parentheses_and_the_cursor_advanc
     {**_improve(2, 2040), "ref": "order:1"},
     {**_improve(2, 2040), "ref": "improve:1234567890123456789"},
 ])
-def test_an_event_outside_the_grammar_stops_the_bot_without_moving_the_cursor(make_bot, bad):
-    bot = make_bot(_page([_improve(1, 2039, result="failed", reason="x"), bad]),
+def test_an_improve_event_outside_the_grammar_is_skipped_and_the_events_after_it_are_posted(
+        make_bot, bad, capsys):
+    after = _improve(3, 2041, result="failed", reason="interrupted")
+    bot = make_bot(_page([_improve(1, 2039, result="failed", reason="x"), bad, after]),
+                   runs={2039: _ok(_dto(2039, result="failed", reason="x")),
+                         2041: _ok(_dto(2041, result="failed", reason="interrupted"))})
+
+    bot.poll()
+
+    assert [t.splitlines()[0] for t in bot.texts] == ["[改善] 失敗 #2039 (x)",
+                                                      "[改善] 失敗 #2041 (interrupted)"]
+    assert bot.state().cursor == 3
+    assert "improve_event_invalid event=2" in capsys.readouterr().err
+    assert [call[0] for call in bot.client.run_calls] == [2039, 2041]
+
+
+def test_an_invalid_improve_event_does_not_hold_back_an_approval_event_after_it(make_bot):
+    bad = _improve(2, 2040, result="failed", reason="pf:7.7777")
+    bot = make_bot(_page([bad, _approval_event(3)]))
+
+    bot.poll()
+
+    assert bot.texts == ["承認 #7 が承認・配備されました。"]
+    assert bot.state().cursor == 3
+
+
+def test_an_invalid_event_that_is_not_an_improve_event_still_stops_the_bot(make_bot):
+    bot = make_bot(_page([_improve(1, 2039, result="failed", reason="x"),
+                          {**_approval_event(2), "ref": "approval:0x"}]),
                    runs={2039: _ok(_dto(2039, result="failed", reason="x"))})
 
     with pytest.raises(BotFailure):
         bot.poll()
 
     assert bot.state().cursor == 1 and len(bot.texts) == 1
+
+
+def test_a_very_long_backend_and_model_still_post_within_the_discord_limit(make_bot):
+    long_name = "ab_*" * 400
+    events = [_started(1, 2043), _improve(2, 2044, result="submitted", tool=1)]
+    bot = make_bot(_page(events), runs={
+        2043: _ok(_dto(2043, terminal=False, backend=long_name, model=long_name)),
+        2044: _ok(_dto(2044, result="submitted", tool=1, backend=long_name, model=long_name,
+                       approval={"id": 3, "plugin": "p" * 40, "kind": long_name}))})
+
+    bot.poll()
+
+    assert len(bot.texts) == 2 and all(len(text) <= 2000 for text in bot.texts)
+    assert bot.state().cursor == 2
+
+
+# ------------------------------------------------------------ 取得の thread と設定の分岐
+
+def test_a_slow_detail_fetch_does_not_hold_the_gate_thread(make_bot):
+    entered, release, seen = threading.Event(), threading.Event(), {}
+    bot = make_bot(_page([_started(1, 2043)]))
+
+    def slow(mission_id, *, deadline):
+        seen["thread"] = threading.current_thread().name
+        entered.set()
+        assert release.wait(10)
+        return _ok(_dto(2043, terminal=False))
+
+    bot.client.improve_run = slow
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(bot.adapter.deliver_events())
+        assert await loop.run_in_executor(None, entered.wait, 10)
+        try:
+            return await asyncio.wait_for(
+                bot.adapter._run(lambda: threading.current_thread().name), 2)
+        finally:
+            release.set()
+            await task
+
+    gate_thread = asyncio.run(scenario())
+
+    assert gate_thread.startswith("afx-bot-gate")
+    assert seen["thread"].startswith("afx-bot-improve")
+    assert len(bot.texts) == 1 and bot.state().cursor == 1
+
+
+def test_every_plan_of_an_improve_event_carries_the_same_settings(make_bot):
+    bot = make_bot(_page([_improve(1, 2040, result="observation", tool=1)]),
+                   runs={2040: _ok(_dto(2040, result="observation", tool=1))},
+                   improve_notices="results", trade_notices="all")
+    calls: list[dict] = []
+    real = bot.adapter.gate.plan_event
+
+    def spy(event, **kwargs):
+        calls.append(kwargs)
+        return real(event, **kwargs)
+
+    bot.adapter.gate.plan_event = spy
+
+    bot.poll()
+
+    assert len(bot.texts) == 1 and calls
+    assert {call["improve_notices"] for call in calls} == {"results"}
+    assert {call["trade_notices"] for call in calls} == {"all"}
+    assert [("improve_detail" in call) for call in calls] == [False, True]
 
 
 # ------------------------------------------------------------ mention

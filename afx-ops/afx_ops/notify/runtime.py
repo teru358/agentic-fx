@@ -22,6 +22,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
+from afx_ops import improve_events
 from afx_ops.event_outcome import Post, SkipKnown, decide, is_improve, is_trade
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
@@ -157,7 +158,15 @@ class _Loop:
                 outcome = decide(event, self._wants)
                 if isinstance(outcome, Post):
                     body = encode_json_object(outcome.payload)
-            except (PayloadError, DeliveryError):
+            except PayloadError:
+                if event.get("code") != improve_events.CODE:
+                    raise _Failure("payload_invalid") from None
+                # 形が契約に反する改善 event は、固定語を残して確定し、後ろの event を止めない
+                self._warn(f"improve_event_invalid event={event['id']}")
+                state = self._save(dir_fd, advance_delivery(state, event["id"]))
+                skipped += 1
+                continue
+            except DeliveryError:
                 raise _Failure("payload_invalid") from None
             if isinstance(outcome, SkipKnown):
                 # 既知だが配送しない event。送らずに cursor と watermark を同じ保存で進める

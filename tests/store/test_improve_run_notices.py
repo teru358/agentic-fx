@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import pytest
 
@@ -404,5 +404,26 @@ def test_naive_now_is_rejected_and_adds_no_snapshot(conn):
     mid, rid = _start(conn)
     with pytest.raises(ValueError, match="naive"):
         _finish_at(conn, mid, rid, datetime(2026, 10, 25, 3, 5))
+    conn.rollback()
+    assert _snap(conn, mid) is None
+
+
+class _OffsetlessZone(tzinfo):
+    """tzinfo はあるが utcoffset() が None を返す。Python では naive と同じ扱い。"""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+def test_a_tzinfo_whose_utcoffset_is_none_is_rejected_like_a_naive_datetime(conn):
+    mid, rid = _start(conn)
+    with pytest.raises(ValueError, match="naive"):
+        _finish_at(conn, mid, rid, datetime(2026, 10, 25, 3, 5, tzinfo=_OffsetlessZone()))
     conn.rollback()
     assert _snap(conn, mid) is None

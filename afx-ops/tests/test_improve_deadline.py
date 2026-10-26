@@ -41,7 +41,7 @@ class _FakeRequest:
     def install(self, monkeypatch) -> "_FakeRequest":
         fake = self
 
-        def open_(endpoint, *, timeout=api_client.HTTP_TIMEOUT):
+        def open_(endpoint, *, timeout=api_client.HTTP_TIMEOUT, deadline=None):
             fake.open_timeout = timeout
             if fake.cost["open"] > timeout:
                 fake.clock.now += timeout
@@ -106,7 +106,7 @@ def test_a_slow_admission_that_uses_up_the_deadline_stops_before_the_key_is_sent
     fake = _FakeRequest(clock).install(monkeypatch)
 
     # open が (timeout の外にある admission の遅さで) deadline を超えて戻った状況
-    def late_open(endpoint, *, timeout=api_client.HTTP_TIMEOUT):
+    def late_open(endpoint, *, timeout=api_client.HTTP_TIMEOUT, deadline=None):
         fake.open_timeout = timeout
         clock.now += 3.5
         return fake
@@ -190,7 +190,7 @@ def test_the_wall_clock_total_stays_inside_a_short_deadline(monkeypatch, tmp_pat
             time.sleep(timeout)
             raise ApiError("response_lost", token_sent=True)
 
-    def slow_open(endpoint, *, timeout):
+    def slow_open(endpoint, *, timeout, deadline=None):
         seen["open"] = timeout
         time.sleep(0.15)
         return _Slow()
@@ -261,3 +261,110 @@ def test_the_request_object_applies_the_remaining_time_to_a_blocked_send(tmp_pat
         os.close(pidfd)
         left.close()
         right.close()
+
+
+class _Sock:
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.timeouts: list[float] = []
+
+    def settimeout(self, seconds: float) -> None:
+        self.timeouts.append(seconds)
+
+    def close(self) -> None:
+        pass
+
+
+class _Admission:
+    """admission の各段の所要を時計に足し、socket に渡された期限と呼ばれた段を記録する。"""
+
+    def __init__(self, monkeypatch, clock: _Clock, **cost) -> None:
+        self.clock = clock
+        self.cost = {"fetch": 0.0, "lock": 0.0, "verify": 0.0, **cost}
+        self.sock = _Sock(clock)
+        self.called: list[str] = []
+        auth = api_client.server_auth
+        monkeypatch.setattr(api_client, "time", SimpleNamespace(
+            monotonic=clock.monotonic, sleep=time.sleep))
+        monkeypatch.setattr(auth, "check_socket_path", lambda *a, **k: None)
+        monkeypatch.setattr(auth, "connect_unix", lambda *a, **k: self.sock)
+        monkeypatch.setattr(auth, "fetch_pidfd", lambda sock: self._stage("fetch", 99))
+        monkeypatch.setattr(auth, "check_pidfd", lambda *a, **k: None)
+        monkeypatch.setattr(auth, "check_lock_device", lambda *a, **k: self._stage("lock"))
+        monkeypatch.setattr(auth, "verify_peer", lambda *a, **k: self._stage("verify"))
+
+    def _stage(self, name: str, value=None):
+        self.called.append(name)
+        self.clock.now += self.cost[name]
+        return value
+
+
+def _admit(tmp_path, deadline):
+    request = api_client._Request(Endpoint(tmp_path / "s", tmp_path / "l"), timeout=3.0,
+                                  deadline=deadline)
+    request._connect_and_verify()
+    request._pidfd = -1
+    return request
+
+
+def test_admission_stages_that_use_the_socket_get_only_the_time_that_is_left(
+        monkeypatch, tmp_path):
+    clock = _Clock()
+    admission = _Admission(monkeypatch, clock, fetch=1.0, lock=0.5)
+
+    _admit(tmp_path, clock.now + 3.0)
+
+    assert admission.called == ["fetch", "lock", "verify"]
+    assert admission.sock.timeouts == [pytest.approx(3.0), pytest.approx(1.5)]
+
+
+def test_admission_stops_when_the_deadline_is_used_up_before_the_next_socket_stage(
+        monkeypatch, tmp_path):
+    clock = _Clock()
+    admission = _Admission(monkeypatch, clock, fetch=2.0, lock=1.5)
+
+    with pytest.raises(ApiError) as info:
+        _admit(tmp_path, clock.now + 3.0)
+
+    assert info.value.reason == "timeout"
+    assert admission.called == ["fetch", "lock"]
+
+
+def test_a_deadline_already_passed_stops_admission_before_the_first_stage(
+        monkeypatch, tmp_path):
+    clock = _Clock()
+    admission = _Admission(monkeypatch, clock)
+
+    with pytest.raises(ApiError) as info:
+        _admit(tmp_path, clock.now - 1.0)
+
+    assert info.value.reason == "timeout" and admission.called == []
+
+
+def test_without_a_deadline_admission_leaves_the_socket_timeout_alone(monkeypatch, tmp_path):
+    clock = _Clock()
+    admission = _Admission(monkeypatch, clock, fetch=5.0, lock=5.0)
+
+    _admit(tmp_path, None)
+
+    assert admission.called == ["fetch", "lock", "verify"] and admission.sock.timeouts == []
+
+
+def test_the_client_hands_its_deadline_to_the_request_open(monkeypatch, tmp_path):
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def open_(endpoint, *, timeout=api_client.HTTP_TIMEOUT, deadline=None):
+        seen.update(timeout=timeout, deadline=deadline)
+        raise Stop
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(open_))
+    with pytest.raises(Stop):
+        _client(tmp_path).improve_run(7, deadline=time.monotonic() + 3.0)
+    assert seen["deadline"] is not None and 2.0 < seen["timeout"] <= 3.0
+    seen.clear()
+    with pytest.raises(Stop):
+        _client(tmp_path).approval(7, timeout=3.0)
+    assert seen["deadline"] is None

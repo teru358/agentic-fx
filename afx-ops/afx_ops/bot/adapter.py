@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 import discord
 
+from afx_ops import improve_events
 from afx_ops.event_outcome import SkipKnown, is_improve
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
@@ -42,6 +43,7 @@ from afx_ops.gate.render import footer as gate_footer
 from afx_ops.gate.render import plugin_name_or_none, primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import ApprovalRecord, StateError
+from afx_ops.notify.payload import PayloadError
 from afx_ops.gate.types import CustomIdError, GateResult, Interaction, SideEffect, decode_custom_id
 from afx_ops.bot.views import GateView
 
@@ -180,6 +182,10 @@ class BotAdapter:
         self._posted_improve: OrderedDict[tuple[str, str], None] = OrderedDict()
         # gate の状態と snapshot を触る唯一の thread
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afx-bot-gate")
+        # 改善通知の詳細取得 (最大 deadline まで待つ) 専用。gate の thread (承認ボタンの処理と
+        # 共有) を塞がないよう分ける。gate の状態は触らない
+        self._improve_worker = ThreadPoolExecutor(max_workers=1,
+                                                  thread_name_prefix="afx-bot-improve")
         self._routes: dict[int, _Route] = {}
         # approval_id → (表示 (世代, 状態), 失敗回数, 次に試してよい時刻)。表示が変われば数え直す
         self._edit_retry: dict[int, tuple[tuple[int, str], int, float]] = {}
@@ -198,6 +204,9 @@ class BotAdapter:
     async def _run(self, fn, *args):
         return await asyncio.get_running_loop().run_in_executor(self._worker, fn, *args)
 
+    async def _run_improve(self, fn, *args):
+        return await asyncio.get_running_loop().run_in_executor(self._improve_worker, fn, *args)
+
     def _save(self) -> None:
         try:
             gate_state.save(self._dir_fd, self.gate.state)
@@ -211,6 +220,7 @@ class BotAdapter:
 
     def close(self) -> None:
         self._worker.shutdown()
+        self._improve_worker.shutdown()
 
     @property
     def _channel(self) -> discord.PartialMessageable:
@@ -698,13 +708,17 @@ class BotAdapter:
             plugin_name = None
             approval_id = _approval_id_of(event)
             try:
-                plan = await self._run(lambda e=event: self.gate.plan_event(
-                    e, mention_role_id=self.settings.mention_role_id,
-                    mention_user_ids=self.settings.mention_user_ids,
-                    trade_notices=self.settings.trade_notices,
-                    trade_amounts=self.settings.trade_amounts,
-                    ops_notices=self.settings.ops_notices, plugin_name=plugin_name,
-                    improve_notices=self.settings.improve_notices))
+                plan = await self._plan(event)
+            except PayloadError:
+                if event.get("code") != improve_events.CODE:
+                    raise BotFailure("payload_invalid") from None
+                # 形が契約に反する改善 event は、固定語を残して確定し、後ろの event を止めない
+                if event["id"] > self.gate.state.cursor:
+                    print(f"afx-ops bot: improve_event_invalid event={event['id']}",
+                          file=sys.stderr)
+                    await self._run(self._commit_skip, event["id"], max(high, event["id"]))
+                    progressed = True
+                continue
             except Exception:
                 raise BotFailure("payload_invalid") from None
             if plan is None:
@@ -734,12 +748,7 @@ class BotAdapter:
                 else:
                     self._observe(approval_id, detail)
                     plugin_name = _plugin_name(detail)
-                    plan = await self._run(lambda e=event: self.gate.plan_event(
-                        e, mention_role_id=self.settings.mention_role_id,
-                        mention_user_ids=self.settings.mention_user_ids,
-                        trade_notices=self.settings.trade_notices,
-                        trade_amounts=self.settings.trade_amounts,
-                        ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
+                    plan = await self._plan(event, plugin_name=plugin_name)
             content = _event_content(plan)
             allowed = (self._allowed_mentions() if plan.allow_mentions
                        else discord.AllowedMentions.none())
@@ -760,16 +769,27 @@ class BotAdapter:
             # 確定する event が無い周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
             await self._run(self._observe_high, high)
 
+    async def _plan(self, event: dict, *, plugin_name: str | None = None, **extra):
+        """event の扱いを gate の thread で決める。設定の分岐はここだけ。"""
+        settings = self.settings
+        kwargs = dict(mention_role_id=settings.mention_role_id,
+                      mention_user_ids=settings.mention_user_ids,
+                      trade_notices=settings.trade_notices, trade_amounts=settings.trade_amounts,
+                      ops_notices=settings.ops_notices, plugin_name=plugin_name,
+                      improve_notices=settings.improve_notices, **extra)
+        return await self._run(lambda: self.gate.plan_event(event, **kwargs))
+
     async def _improve_plan(self, event: dict):
         """改善通知の詳細を GET で 1 回取り、検査を通ったものだけで文面を作る。
 
         取得の失敗 (接続・deadline 超過・404 / 5xx・検査違反) は詳細なしの文面に倒し、投稿は
-        止めない。応答の本文はこの関数の局所値で、文面を作った後はどこにも残さない。
+        止めない。GET は gate の thread と別の thread で待つ。応答の本文はこの関数の局所値で、
+        検査済みの写しだけを文面の組立てに渡す。
         """
         mission_id = mission_id_of(event)
         detail = None
         try:
-            reply = await self._run(lambda: self.client.improve_run(
+            reply = await self._run_improve(lambda: self.client.improve_run(
                 mission_id, deadline=time.monotonic() + IMPROVE_DETAIL_DEADLINE_SECONDS))
         except (ApiError, TimeoutError, OSError):
             reply = None
@@ -778,15 +798,9 @@ class BotAdapter:
                 detail = validate_improve_run(getattr(reply, "data", None), mission_id)
             except Exception:  # noqa: BLE001 — 検査できない応答は詳細なしと同じ
                 detail = None
-        reply = None
+        del reply
         try:
-            return await self._run(lambda: self.gate.plan_event(
-                event, mention_role_id=self.settings.mention_role_id,
-                mention_user_ids=self.settings.mention_user_ids,
-                trade_notices=self.settings.trade_notices,
-                trade_amounts=self.settings.trade_amounts,
-                ops_notices=self.settings.ops_notices,
-                improve_notices=self.settings.improve_notices, improve_detail=detail))
+            return await self._plan(event, improve_detail=detail)
         except Exception:
             raise BotFailure("payload_invalid") from None
 
