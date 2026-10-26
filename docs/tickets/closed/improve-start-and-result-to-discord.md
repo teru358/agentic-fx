@@ -1,15 +1,15 @@
 ---
 id: improve-start-and-result-to-discord
 title: improve の開始と結果を Discord に通知する
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-25
-closed: null
+closed: 2026-10-26
 related: [improve-run-summary-for-humans, bot-event-notices-are-raw-log-lines]
 ---
 # [improve-start-and-result-to-discord] improve の開始と結果を Discord に通知する
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -28,8 +28,11 @@ related: [improve-run-summary-for-humans, bot-event-notices-are-raw-log-lines]
 
 ## 修正内容
 
+- 2026-10-26: improve_run_changed event (固定語のみ、意味検査)、不変の終端 snapshot improve_run_notices (outbox 兼用、起動時と tick ごとに掃き出し)、GET /v1/improve/runs/{id} (snapshot + report_state + 床未達の数値、report の安全な読取)、afx-ops の検証・描画・improve_notices。main 2fafa785 (spec v0.9)。本機受入 2026-10-26: 配備 (afx-ops → daemon) 後、afx ctl improve で Discord に開始・終了の 2 通を確認 (ユーザー)
+
 ## 経緯
 
 - 2026-10-25: 起票。
 - 2026-10-25: ユーザー要望を追加 (mission_observation の文と gate_failed の拒否理由・落ちた段の数値を通知に出す)。
 - 2026-10-26: 状態: 実装中 — 2026-10-26 main に merge (2fafa785、spec v0.9)。残り: 配備 (afx-ops 再起動 → daemon 再起動) と本機観測 (afx ctl improve 1 回で Discord に開始・終了の 2 通)
+- 2026-10-26: 是正内容 — improve_run_changed event (固定語のみ、意味検査)、不変の終端 snapshot improve_run_notices (outbox 兼用、起動時と tick ごとに掃き出し)、GET /v1/improve/runs/{id} (snapshot + report_state + 床未達の数値、report の安全な読取)、afx-ops の検証・描画・improve_notices。main 2fafa785 (spec v0.9)。本機受入 2026-10-26: 配備 (afx-ops → daemon) 後、afx ctl improve で Discord に開始・終了の 2 通を確認 (ユーザー)

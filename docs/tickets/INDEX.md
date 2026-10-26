@@ -1,16 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 143 件。完了分は closed/。
+未完了: 142 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
-| [improve-start-and-result-to-discord](open/improve-start-and-result-to-discord.md) | 中 | 2026-10-25 | improve の開始と結果を Discord に通知する |
 
 ## 実装待ち (11)
 
