@@ -114,7 +114,7 @@ def test_commit_runs_all_nine_steps_in_order_for_happy_path_plugin(
         monkeypatch.setattr(loop_full, name, _make_recorder(name))
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     assert call_order == _EXPECTED_ORDER
     assert ctx.ledger._state == "PERSISTED"
@@ -151,7 +151,7 @@ def test_commit_loader_rejection_becomes_gate_failed(
         "selection_rationale": "r"}, transcript=[])
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     backlog = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -634,7 +634,7 @@ def test_commit_rolls_back_tx2_on_db_fault_between_gate_rows_and_approval(
     monkeypatch.setattr(approvals_store, "create", _boom)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     # 補償側 (§4.2 の Tx-2 失敗時の意味論) — approval は作られておらず、
     # mission/run は failed で終端する (10.10 節の補償経路と同じ契約)。
@@ -702,7 +702,7 @@ def test_finalize_success_tx2_internal_seams_run_ledger_then_gate_then_approval_
         conn, mission_id=mission_id, run_id=run_id, backlog_id=backlog_id,
         slot_key=None, approval_payload={"name": "x", "kind": "indicator",
                           "content_hash": "c-x", "artifact_hash": "a-x"},
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     assert call_order == [
         "_persist_ledger_rows",
@@ -856,7 +856,7 @@ def test_commit_terminates_scheduler_wave_slot_via_ctx_slot_key(
         "selection_rationale": "r"}, transcript=[])
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     period_key, k = slot_key
     slot = conn.execute(
@@ -900,7 +900,7 @@ def test_commit_demotes_recovered_report_to_observation_without_publishing(
         "selection_rationale": "r"}, transcript=[], recovered=True)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     reports_dir = tmp_path / "data" / "improve_reports"
     published = [p for p in reports_dir.glob("*.md")] if reports_dir.exists() else []
@@ -959,7 +959,7 @@ def test_commit_publishes_report_normally_when_not_recovered(
         "selection_rationale": "r"}, transcript=[])
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     run = conn.execute(
         "SELECT result, report_state FROM improvement_runs WHERE id=?",
@@ -1006,7 +1006,7 @@ def test_commit_recovered_risk_gate_report_keeps_unsupported_label(
         "selection_rationale": "r"}, transcript=[], recovered=True)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     backlog = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -1044,7 +1044,7 @@ def test_commit_recovered_plugin_still_goes_through_gate(
         "selection_rationale": "r"}, transcript=[], recovered=True)
 
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     r = conn.execute("SELECT result FROM improvement_runs WHERE id=?",
                      (run_id,)).fetchone()
@@ -1089,7 +1089,7 @@ def test_finalize_failed_mission_terminates_failed_with_null_result_and_deletes_
     result = MissionResult(status="timeout", output=None, transcript=[])
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
@@ -1125,7 +1125,7 @@ def test_finalize_failed_status_does_not_write_system_note(
     loop_min._finalize_failed_mission(
         conn, ctx=ctx,
         result=MissionResult(status="failed", output=None, transcript=[]),
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     assert conn.execute(
         "SELECT COUNT(*) FROM improvement_backlog WHERE source='system'").fetchone()[0] == 0
 
@@ -1144,7 +1144,7 @@ def test_finalize_tool_budget_abort_writes_zero_backtest_note(
         conn, ctx=ctx,
         result=MissionResult(status="failed", output=None, transcript=[],
                              reason=reason),
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     note = conn.execute(
         "SELECT idea, last_result FROM improvement_backlog WHERE source='system'"
     ).fetchone()
@@ -1167,7 +1167,7 @@ def test_finalize_timeout_continues_when_system_note_upsert_fails(
     loop_min._finalize_failed_mission(
         conn, ctx=ctx,
         result=MissionResult(status="timeout", output=None, transcript=[]),
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     assert conn.execute(
         "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()[0] == "failed"
     assert "backlog_note_failed" in (tmp_path / "activity.log").read_text()
@@ -1189,7 +1189,7 @@ def test_finalize_timeout_rolls_back_note_when_finish_fails(
         loop_min._finalize_failed_mission(
             conn, ctx=ctx,
             result=MissionResult(status="timeout", output=None, transcript=[]),
-            now=datetime(2026, 8, 22))
+            now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     assert conn.execute(
         "SELECT COUNT(*) FROM improvement_backlog WHERE source='system'").fetchone()[0] == 0
 
@@ -1213,7 +1213,7 @@ def test_finalize_failed_mission_terminates_scheduler_wave_slot_as_failed(
     result = MissionResult(status="failed", output=None, transcript=[])
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     period_key, k = slot_key
     slot = conn.execute(
@@ -1241,7 +1241,7 @@ def test_finalize_failed_mission_slot_terminalize_false_leaves_slot_untouched(
     period_key, k = slot_key
     # `_launch_slot` の pre-ready 失敗巻き戻しを模す (revert_to_reserved 済み)
     reverted = improve_waves.revert_to_reserved(
-        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22),
+        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         commit=True)
     assert reverted
 
@@ -1258,7 +1258,7 @@ def test_finalize_failed_mission_slot_terminalize_false_leaves_slot_untouched(
     result = MissionResult(status="failed", output=None, transcript=[])
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22),
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc),
                                       slot_terminalize=False)
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
@@ -1294,7 +1294,7 @@ def test_finalize_failed_mission_writes_mission_failed_activity_with_reason(
                            reason="worker eof")
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_failed" in line)
@@ -1322,7 +1322,7 @@ def test_finalize_failed_mission_writes_activity_with_dash_reason_when_none(
                            reason=None)
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_failed" in line)
@@ -1342,7 +1342,7 @@ def test_commit_slot_terminalize_false_propagates_to_finalize_failed_mission(
     mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
     period_key, k = slot_key
     assert improve_waves.revert_to_reserved(
-        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22),
+        conn, period_key=period_key, k=k, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         commit=True)
 
     staging_dir = tmp_path / "staging"
@@ -1357,7 +1357,7 @@ def test_commit_slot_terminalize_false_propagates_to_finalize_failed_mission(
     result = MissionResult(status="failed", output=None, transcript=[])
 
     loop_full.commit(mission="m", ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22), slot_terminalize=False)
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc), slot_terminalize=False)
 
     slot = conn.execute(
         "SELECT status FROM improve_wave_slots WHERE wave_period_key=? "
@@ -1389,7 +1389,7 @@ def test_finalize_failed_mission_writes_tool_calls_when_present(
                            reason="worker eof", tool_calls=0)
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_failed" in line)
@@ -1416,7 +1416,7 @@ def test_finalize_failed_mission_omits_tool_calls_when_none(
                            reason="worker eof")
 
     loop_min._finalize_failed_mission(conn, ctx=ctx, result=result,
-                                      now=datetime(2026, 8, 22))
+                                      now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_failed" in line)
@@ -1445,7 +1445,7 @@ def test_commit_writes_cli_stderr_fatal_activity_when_result_has_it(
         stderr_fatal="pattern=SIGTRAP tail=error=code-mode host…")
 
     loop_min.commit(mission=mission, ctx=ctx, result=result,
-                    now=datetime(2026, 8, 22))
+                    now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     lines = (tmp_path / "activity.log").read_text().splitlines()
     line = next(line for line in lines if "cli_stderr_fatal" in line)
@@ -1472,7 +1472,7 @@ def test_commit_does_not_write_cli_stderr_fatal_when_result_has_none(
                            reason="cli timeout")
 
     loop_min.commit(mission=mission, ctx=ctx, result=result,
-                    now=datetime(2026, 8, 22))
+                    now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     lines = (tmp_path / "activity.log").read_text().splitlines()
     assert not any("cli_stderr_fatal" in line for line in lines)
@@ -1497,7 +1497,7 @@ def test_finalize_output_invalid_terminates_failed_with_null_result_and_deletes_
 
     loop_min._finalize_output_invalid(
         conn, ctx=ctx, reason="artifact.name is not canonical",
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
@@ -1527,7 +1527,7 @@ def test_finalize_output_invalid_writes_tool_calls_when_present(
 
     loop_min._finalize_output_invalid(
         conn, ctx=ctx, reason="artifact.name is not canonical",
-        now=datetime(2026, 8, 22), tool_calls=11)
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), tool_calls=11)
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "output_invalid" in line)
@@ -1555,7 +1555,7 @@ def test_finalize_loser_writes_skip_report_and_finishes_run_as_report(
     output = {"selected": {"idea": "dup idea"}}
 
     loop_min._finalize_loser(conn, ctx=ctx, output=output,
-                             now=datetime(2026, 8, 22))
+                             now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
                      (mission_id,)).fetchone()
@@ -1594,7 +1594,7 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
     mission_id, run_id, backlog_id = mission_and_run_fixture
     from agentic_fx.store import backlog as backlog_store
     backlog_store.select_for_mission(conn, backlog_id,
-                                     now=datetime(2026, 8, 22), commit=True)
+                                     now=datetime(2026, 8, 22, tzinfo=timezone.utc), commit=True)
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
 
@@ -1609,7 +1609,7 @@ def test_finalize_gate_failed_sets_backlog_observation_with_reason(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22),
+        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     m = conn.execute("SELECT status FROM missions WHERE id=?",
@@ -1635,7 +1635,7 @@ def test_finalize_gate_failed_writes_tool_calls_when_present(
     mission_id, run_id, backlog_id = mission_and_run_fixture
     from agentic_fx.store import backlog as backlog_store
     backlog_store.select_for_mission(conn, backlog_id,
-                                     now=datetime(2026, 8, 22), commit=True)
+                                     now=datetime(2026, 8, 22, tzinfo=timezone.utc), commit=True)
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
 
@@ -1650,7 +1650,7 @@ def test_finalize_gate_failed_writes_tool_calls_when_present(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22),
+        reason="gate_failed:pytest failed: boom", now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         tool_calls=7,
         notice=notice_codes.NOTICE_PYTEST_FAILED)
 
@@ -1668,7 +1668,7 @@ def test_finalize_gate_failed_preserves_new_gate_reason(
     mission_id, run_id, backlog_id = mission_and_run_fixture
     from agentic_fx.store import backlog as backlog_store
     backlog_store.select_for_mission(
-        conn, backlog_id, now=datetime(2026, 8, 22), commit=True)
+        conn, backlog_id, now=datetime(2026, 8, 22, tzinfo=timezone.utc), commit=True)
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
     ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0,
@@ -1681,7 +1681,7 @@ def test_finalize_gate_failed_preserves_new_gate_reason(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason=f"gate_failed:{gate_reason}", now=datetime(2026, 8, 22),
+        reason=f"gate_failed:{gate_reason}", now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         notice=notice_codes.NOTICE_PYTEST_FAILED)
 
     row = conn.execute(
@@ -1702,7 +1702,7 @@ def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(
     mission_id, run_id, backlog_id, slot_key = mission_and_run_fixture_with_slot
     from agentic_fx.store import backlog as backlog_store
     backlog_store.select_for_mission(conn, backlog_id,
-                                     now=datetime(2026, 8, 22), commit=True)
+                                     now=datetime(2026, 8, 22, tzinfo=timezone.utc), commit=True)
     staging_dir = tmp_path / "staging"
     staging_dir.mkdir()
 
@@ -1717,7 +1717,7 @@ def test_finalize_gate_failed_terminates_scheduler_wave_slot_as_done(
 
     loop_min._finalize_gate_failed(
         conn, ctx=ctx, backlog_id=backlog_id,
-        reason="insufficient_trades:5", now=datetime(2026, 8, 22),
+        reason="insufficient_trades:5", now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         notice=notice_codes.NOTICE_INSUFFICIENT_TRADES)
 
     period_key, k = slot_key
@@ -1975,7 +1975,7 @@ def test_report_and_observation_activity_are_written_only_after_successful_commi
         loop_min._finalize_report_or_observation(
             _CommitFailingConnection(conn), ctx=ctx, backlog_id=backlog_id,
             report_path=report_path, artifact=artifact,
-            now=datetime(2026, 8, 22),
+            now=datetime(2026, 8, 22, tzinfo=timezone.utc),
             choice=_plain_outcome_choice(report_path, artifact))
     text = ((tmp_path / "activity.log").read_text()
             if (tmp_path / "activity.log").exists() else "")
@@ -1993,7 +1993,7 @@ def test_observation_artifact_records_reason_not_risk_gate_label(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "observation", "reason": "insufficient data"},
-        now=datetime(2026, 8, 22),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(None, {"type": "observation", "reason": "insufficient data"}))
 
     backlog = conn.execute(
@@ -2023,7 +2023,7 @@ def test_observation_without_backlog_logs_dash(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no candidate"},
-        now=datetime(2026, 8, 22),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(None, {"type": "observation", "reason": "no candidate"}))
     activity_text = (tmp_path / "activity.log").read_text()
     assert f"mission={mission_id} backlog=- reason=observation:no candidate" in activity_text
@@ -2041,7 +2041,7 @@ def test_observation_writes_tool_calls_when_present(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no tools available"},
-        now=datetime(2026, 8, 22), tool_calls=0,
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc), tool_calls=0,
         choice=_plain_outcome_choice(None, {"type": "observation", "reason": "no tools available"}))
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_observation" in line)
@@ -2060,7 +2060,7 @@ def test_observation_omits_tool_calls_when_none(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=None, report_path=None,
         artifact={"type": "observation", "reason": "no candidate"},
-        now=datetime(2026, 8, 22),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(None, {"type": "observation", "reason": "no candidate"}))
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
                if "mission_observation" in line)
@@ -2081,7 +2081,7 @@ def test_risk_gate_report_artifact_keeps_unsupported_label(
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
         artifact={"type": "report", "proposal_kind": "risk_gate"},
-        now=datetime(2026, 8, 22),
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(None, {"type": "report", "proposal_kind": "risk_gate"}))
 
     backlog = conn.execute(
@@ -2106,7 +2106,7 @@ def test_unknown_terminal_artifact_ends_as_the_risk_gate_unsupported_observation
     assert choice.notice == notice_codes.NOTICE_RISK_GATE_UNSUPPORTED
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=None,
-        artifact=artifact, now=datetime(2026, 8, 22), choice=choice)
+        artifact=artifact, now=datetime(2026, 8, 22, tzinfo=timezone.utc), choice=choice)
 
     backlog = conn.execute(
         "SELECT status, last_result FROM improvement_backlog WHERE id=?",
@@ -2152,7 +2152,7 @@ def test_report_path_deletes_staging_including_readonly_snapshot(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     assert not staging_dir.exists()
@@ -2188,7 +2188,7 @@ def test_report_published_writes_tool_calls_when_present(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22), tool_calls=3,
+        artifact={"type": "report"}, now=datetime(2026, 8, 22, tzinfo=timezone.utc), tool_calls=3,
         choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
@@ -2214,7 +2214,7 @@ def test_report_published_omits_tool_calls_when_none(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     line = next(line for line in (tmp_path / "activity.log").read_text().splitlines()
@@ -2243,7 +2243,7 @@ def test_report_publish_failure_does_not_log_published(
 
     loop_min._finalize_report_or_observation(
         conn, ctx=ctx, backlog_id=backlog_id, report_path=str(final_path),
-        artifact={"type": "report"}, now=datetime(2026, 8, 22),
+        artifact={"type": "report"}, now=datetime(2026, 8, 22, tzinfo=timezone.utc),
         choice=_plain_outcome_choice(str(final_path), {"type": "report"}))
 
     run = conn.execute(
@@ -2281,7 +2281,7 @@ def test_finalize_max_turns_also_writes_system_note(
     loop_min._finalize_failed_mission(
         conn, ctx=ctx,
         result=MissionResult(status="max_turns", output=None, transcript=[]),
-        now=datetime(2026, 8, 22))
+        now=datetime(2026, 8, 22, tzinfo=timezone.utc))
 
     note = conn.execute(
         "SELECT status, idea, last_result FROM improvement_backlog "
@@ -2321,7 +2321,7 @@ def test_commit_writes_activity_when_completed_result_carries_abort_reason(
                            recovered=True,
                            reason="tool_budget_abort:terminal_refusals calls=40 refused=10")
     loop_full.commit(mission=mission, ctx=ctx, result=result,
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     activity_text = (tmp_path / "activity.log").read_text()
     assert "tool_budget_abort_recovered" in activity_text
     assert f"mission={mission_id}" in activity_text
@@ -2347,7 +2347,7 @@ def test_commit_does_not_write_abort_activity_without_abort_reason(
     loop_full.commit(mission=mission, ctx=ctx,
                      result=MissionResult(status="completed", output=output,
                                           transcript=[]),
-                     now=datetime(2026, 8, 22))
+                     now=datetime(2026, 8, 22, tzinfo=timezone.utc))
     activity_path = tmp_path / "activity.log"
     text = activity_path.read_text() if activity_path.exists() else ""
     assert "tool_budget_abort_recovered" not in text
@@ -2390,7 +2390,7 @@ def test_system_note_type_is_chosen_by_cause_not_backtest_count(
     loop_min._finalize_failed_mission(
         conn, ctx=ctx, result=MissionResult(status=status, output=None, transcript=[],
                                             reason=reason),
-        now=datetime(2026, 9, 9))
+        now=datetime(2026, 9, 9, tzinfo=timezone.utc))
     note = conn.execute(
         "SELECT idea FROM improvement_backlog WHERE source='system'").fetchone()
     assert expect in note["idea"]
