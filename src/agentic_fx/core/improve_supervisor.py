@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from agentic_fx import improve_notice_codes
 from agentic_fx.activity import Category
+from agentic_fx.core import improve_repeat as ir
 from agentic_fx.core.scheduler import scheduled_period
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
@@ -34,6 +36,29 @@ if TYPE_CHECKING:
 _log = logging.getLogger("agentic_fx.improve_supervisor")
 
 _MAX_SPAWN_ATTEMPTS = 2  # 初回 + 再試行 1 回 (設計書 §3.1 手順⑥)
+
+#: 待ちの刻み (秒)。停止系と期限をこの間隔で見直す。
+_POLL_SEC = 0.5
+
+
+@dataclass(frozen=True)
+class RepeatResult:
+    stop_reason: str
+    runs: int
+    last_mission_id: int | None
+
+
+class _ClaimHold:
+    """gate の lock を保持している間だけ有効な握り。`release` は何度呼んでもよい。"""
+
+    def __init__(self, cond: threading.Condition) -> None:
+        self._cond = cond
+        self._held = True
+
+    def release(self) -> None:
+        if self._held:
+            self._held = False
+            self._cond.release()
 
 
 class _NoticeEmitter:
@@ -181,6 +206,15 @@ class ImproveSupervisor:
         self._conn_for_test = None  # pytest シーム。本番は常に None。
         self._launch_lock = threading.Lock()
         self._active_threads: list[threading.Thread] = []
+        # admission gate: 繰り返し側の mission 開始と週次 slot の claim を線形化する。
+        # lock は admission の間だけ持ち、runner の実行中は持たない。
+        self._gate = threading.Condition(threading.Lock())
+        self._manual_active = False
+        self._owned_slots: set[tuple[str, int]] = set()
+        self._weekly_waiting = 0
+        self._poll_sec = _POLL_SEC
+        self._wait_fn: Callable[[threading.Event, float], object] = (
+            lambda event, timeout: event.wait(timeout))
 
     # ---- 公開 API ----------------------------------------------------
 
@@ -223,30 +257,64 @@ class ImproveSupervisor:
             m = min(self._settings.improve.parallel, max(open_slots, 0))
             if m == 0:
                 return
-            created = improve_waves.create_wave_and_slots(
-                conn, period_key=period_key, now=now, expected=m, commit=True)
-            if not created:
-                return
-            pending_ks = list(range(m))
+            # wave / slot の作成と所有登録を同じ lock の中で行い、繰り返し側から
+            # 「slot はあるが所有登録が無い」窓を見せない。
+            with self._gate:
+                created = improve_waves.create_wave_and_slots(
+                    conn, period_key=period_key, now=now, expected=m,
+                    commit=True)
+                if not created:
+                    return
+                pending_ks = list(range(m))
+                self._owned_slots.update((period_key, k) for k in pending_ks)
         finally:
             if owns:
                 conn.close()
         for k in pending_ks:
-            self._spawn_slot_thread(period_key, k)
+            try:
+                self._spawn_slot_thread(period_key, k)
+            except Exception:  # noqa: BLE001
+                _log.exception(
+                    "improve slot thread start failed for %s/%s", period_key, k)
+                self._converge_slot(period_key, k)
 
-    def submit_manual(self, *, on_prepared: "Callable[[int], None] | None" = None) -> int:
+    def submit_manual(self, *, on_prepared: "Callable[[int], None] | None" = None,
+                      comment: str | None = None) -> int:
         """手動 one-shot。slot/wave 行を作らず M=1 で全バックログを担当
         させる (§8.1-該当、9.7 節「improve」コマンドから呼ばれる)。
         wave slot が無いため on_ready コールバックは不要 (mark_running する
         対象が無い) — `prepare(on_ready=)` を省略すると既定 `None` になる。
-        # precheck 2026-08-23 wave3: RW1/RW2 改訂 — `on_ready=None` でも
-        # 子は go を待つ (§10.9b Step 12-4b/RW6)。WorkerRunner が go を
-        # 送る条件は `on_ready is not None` ではなく `worker_profile`
-        # そのものなので (Interfaces 節「Task 1 が produces」ブロック参照)、
-        # ここで on_ready を渡さなくても子は正しく go を受け取って進む。
-        """
+        admission gate は通らない。例外は従来どおり呼び出し元へ再送出する。"""
+        return self._execute_mission(
+            comment=comment, on_prepared=on_prepared, reraise=True).mission_id
+
+    def _execute_mission(self, *, comment: str | None = None,
+                         on_prepared: "Callable[[int], None] | None" = None,
+                         reraise: bool = True) -> ir.MissionOutcome:
+        """1 mission の実行 (prepare -> run -> commit・補償)。
+
+        `reraise` が真なら従来の手動実行と同じく例外を呼び出し元へ再送出する。
+        偽なら例外は補償して失敗の outcome にする。outcome の status は補償後の
+        `missions.status`。run の終了時に停止の Event が立っていれば `shutdown`
+        (DB の mission は既存の補償終端のまま)。"""
+        from agentic_fx.loops.improve_loop import ImprovePrepareFailed
         now = self._clock.now()
-        mission, ctx, runner = self._prepare(slot_key=None, now=now)
+        kwargs: dict = {"slot_key": None, "now": now}
+        if comment is not None:
+            kwargs["oneoff_comment"] = comment
+        if reraise:
+            mission, ctx, runner = self._prepare(**kwargs)
+        else:
+            try:
+                mission, ctx, runner = self._prepare_impl(kwargs, keep_failed=True)
+            except ImprovePrepareFailed as exc:
+                return self._outcome(exc.mission_id, None,
+                                     self._stop_event.is_set(), read_db=True)
+            except Exception:  # noqa: BLE001
+                _log.exception("improve prepare raised for a repeat mission")
+                return ir.MissionOutcome(
+                    ir.STATUS_SHUTDOWN if self._stop_event.is_set() else "failed",
+                    None, None)
         if on_prepared is not None:
             # 操作 API の job は mission id を走行中から見せる。通知の失敗で
             # mission を止めない。
@@ -255,16 +323,16 @@ class ImproveSupervisor:
             except Exception:  # noqa: BLE001
                 _log.exception("on_prepared callback failed")
         # runner.run() 自体が例外を投げる窓: 補償しないと mission / run が
-        # 非終端のまま残るため、定期 slot と同じく補償してから re-raise する。
+        # 非終端のまま残るため、定期 slot と同じく補償する。
         # shutdown 系 (KeyboardInterrupt / SystemExit) では補償を新しく始めない。
-        # 補償自身が失敗しても、呼び出し元には元の例外を見せる (補償の失敗は
-        # log に残す)。
+        # 補償自身が失敗しても、元の例外を見せる (補償の失敗は log に残す)。
         try:
             result = runner.run(mission)
         except Exception:
             _log.exception(
                 "improve runner.run raised for manual mission_id=%s — "
                 "compensating", ctx.mission_id)
+            stopping = self._stop_event.is_set()
             try:
                 self._improve_loop.compensate_launch_failure(
                     ctx=ctx, now=self._clock.now())
@@ -274,7 +342,10 @@ class ImproveSupervisor:
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "launch")
             self._notify_finished(ctx)
-            raise
+            if reraise:
+                raise
+            return self._outcome(ctx.mission_id, None, stopping, read_db=True)
+        stopping = self._stop_event.is_set()
         try:
             self._improve_loop.commit(
                 mission=mission, ctx=ctx, result=result, now=self._clock.now())
@@ -292,20 +363,63 @@ class ImproveSupervisor:
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "commit")
             self._notify_finished(ctx)
-            raise
+            if reraise:
+                raise
+            return self._outcome(ctx.mission_id, None, stopping, read_db=True)
         self._notify_finished(ctx)
-        return ctx.mission_id
+        failure_class = getattr(result, "failure_class", None)
+        if failure_class not in ir.FAILURE_CLASSES:
+            failure_class = None
+        return self._outcome(ctx.mission_id, failure_class, stopping,
+                             read_db=not reraise,
+                             runner_status=getattr(result, "status", None))
+
+    def _outcome(self, mission_id, failure_class, stopping: bool, *,
+                 read_db: bool, runner_status: str | None = None
+                 ) -> ir.MissionOutcome:
+        if stopping:
+            return ir.MissionOutcome(ir.STATUS_SHUTDOWN, failure_class, mission_id)
+        if read_db:
+            status = self._read_mission_status(mission_id)
+        else:
+            status = "completed" if runner_status == "completed" else "failed"
+        return ir.MissionOutcome(status, failure_class, mission_id)
+
+    def _read_mission_status(self, mission_id) -> str:
+        if mission_id is None:
+            return "failed"
+        try:
+            conn = self._conn()
+        except Exception:  # noqa: BLE001
+            _log.exception("improve mission status read failed")
+            return "failed"
+        owns = self._conn_for_test is None
+        try:
+            row = conn.execute(
+                "SELECT status FROM missions WHERE id=?", (mission_id,)).fetchone()
+            return row["status"] if row is not None else "failed"
+        except Exception:  # noqa: BLE001
+            _log.exception("improve mission status read failed")
+            return "failed"
+        finally:
+            if owns:
+                conn.close()
 
     def _prepare(self, **kwargs):
         """`prepare()` が Tx-0 後に失敗すると mission は補償で終端済みで、
         `ImprovePrepareFailed` が原因の例外を `__cause__` に持つ。呼び出し元
         (操作 API の例外分類など) が元の型で分岐できるよう、原因を再送出する。"""
+        return self._prepare_impl(kwargs, keep_failed=False)
+
+    def _prepare_impl(self, kwargs: dict, *, keep_failed: bool):
         from agentic_fx.loops.improve_loop import ImprovePrepareFailed
         try:
             prepared = self._improve_loop.prepare(**kwargs)
         except ImprovePrepareFailed as exc:
             # 補償済みの mission は終端している。開始は出さず、終了だけ出す。
             self._notices.finished(exc.mission_id, exc)
+            if keep_failed:
+                raise
             if exc.__cause__ is not None:
                 raise exc.__cause__
             raise
@@ -335,6 +449,13 @@ class ImproveSupervisor:
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        # gate で待っている週次・繰り返しを起こす。lock を取れなくても止める
+        # 動作は止めない (待ちは刻みごとに停止を見る)。
+        if self._gate.acquire(timeout=1.0):
+            try:
+                self._gate.notify_all()
+            finally:
+                self._gate.release()
 
     def join(self, timeout: float) -> None:
         """検収 B5 (2026-08-22): 全スレッドで**共有する 1 つの deadline**
@@ -379,6 +500,29 @@ class ImproveSupervisor:
                 self._activity.write(
                     Category.IMPROVE, "improve_slot_thread_crashed",
                     f"period_key={period_key} k={k}")
+        finally:
+            self._converge_slot(period_key, k)
+
+    def _converge_slot(self, period_key: str, k: int) -> None:
+        """所有中の非終端 slot を fail-closed に `failed` へ落とし、所有登録を外して
+        gate を起こす。終端済みの slot には何もしない (CAS)。"""
+        try:
+            conn = self._conn()
+            owns = self._conn_for_test is None
+            try:
+                improve_waves.mark_slot_failed(
+                    conn, period_key=period_key, k=k, now=self._clock.now(),
+                    commit=True)
+            finally:
+                if owns:
+                    conn.close()
+        except Exception:  # noqa: BLE001
+            _log.exception("improve slot convergence failed for %s/%s",
+                           period_key, k)
+        finally:
+            with self._gate:
+                self._owned_slots.discard((period_key, k))
+                self._gate.notify_all()
 
     def _spawn_slot_thread(self, period_key: str, k: int) -> None:
         t = threading.Thread(
@@ -390,7 +534,13 @@ class ImproveSupervisor:
             self._active_threads = [
                 s for s in self._active_threads if s.is_alive()]
             self._active_threads.append(t)
-        t.start()
+        try:
+            t.start()
+        except BaseException:
+            with self._launch_lock:
+                self._active_threads = [
+                    s for s in self._active_threads if s is not t]
+            raise
 
     # precheck 2026-08-22 wave2: T10-B2 R-D1 実装時改訂 — 3相 API
     # (spawn/send_go/run_to_completion、非実在) を on_ready 方式へ書き換え。
@@ -448,8 +598,15 @@ class ImproveSupervisor:
                         "more; refusing to authorize the child")
                 reached_running = True
 
-            mission, ctx, runner = self._prepare(
-                slot_key=(period_key, k), now=now, on_ready=_on_ready)
+            hold = self._weekly_enter()
+            if hold is None:
+                return
+            try:
+                mission, ctx, runner = self._prepare(
+                    slot_key=(period_key, k), now=now, on_ready=_on_ready,
+                    on_claimed=hold.release)
+            finally:
+                hold.release()
             # round2 #5 是正 (2026-08-29): I3/I2(b)/C1 のどの窓にも属さない
             # 「prepare() 成功後、runner.run() 自体が例外を投げる」第 4 の窓
             # (verified-round2.md #5)。WorkerRunner.run は shutil.copytree /
@@ -585,6 +742,223 @@ class ImproveSupervisor:
         finally:
             if owns:
                 conn.close()
+
+    # ---- admission gate ------------------------------------------------
+
+    def _weekly_enter(self) -> "_ClaimHold | None":
+        """週次 slot の claim の前に呼ぶ。繰り返しの mission が走っている間は待ち、
+        空いたら gate の lock を保持したまま戻る。呼び出し元は claim Tx の完了後
+        (`on_claimed`) か失敗時に `release()` する。停止中は None (lock は放してある)。"""
+        self._gate.acquire()
+        hold = _ClaimHold(self._gate)
+        try:
+            self._weekly_waiting += 1
+            try:
+                while self._manual_active:
+                    if self._stop_event.is_set():
+                        break
+                    self._gate.wait(self._poll_sec)
+            finally:
+                self._weekly_waiting -= 1
+            if self._stop_event.is_set():
+                hold.release()
+                return None
+            return hold
+        except BaseException:
+            hold.release()
+            raise
+
+    def _weekly_busy_locked(self, warned: set) -> bool:
+        """gate の lock 内で呼ぶ。この process が所有する週次 slot に非終端のものが
+        あるか。所有登録の無い非終端 slot は待たず、固定語の警告だけ出す。"""
+        conn = self._conn()
+        owns = self._conn_for_test is None
+        try:
+            rows = conn.execute(
+                "SELECT wave_period_key, k FROM improve_wave_slots "
+                "WHERE status IN ('reserved','claimed','running')").fetchall()
+        finally:
+            if owns:
+                conn.close()
+        busy = False
+        for row in rows:
+            key = (row["wave_period_key"], row["k"])
+            if key in self._owned_slots:
+                busy = True
+            elif key not in warned:
+                warned.add(key)
+                _log.warning("improve_repeat_unowned_open_slot")
+        return busy
+
+    def _admit_manual(self, check: "Callable[[], str | None]") -> "str | None":
+        """繰り返しの mission を始めてよくなるまで待つ。始めてよければ
+        `manual_active` を立てて None を返す。停止の理由があればそれを返す。"""
+        warned: set = set()
+        with self._gate:
+            while True:
+                reason = check()
+                if reason is not None:
+                    return reason
+                if (not self._manual_active and self._weekly_waiting == 0
+                        and not self._weekly_busy_locked(warned)):
+                    self._manual_active = True
+                    return None
+                self._gate.wait(self._poll_sec)
+
+    def _release_manual(self) -> None:
+        with self._gate:
+            self._manual_active = False
+            self._gate.notify_all()
+
+    # ---- 繰り返し --------------------------------------------------------
+
+    def submit_repeat(self, *, duration_sec: "int | None", max_runs: "int | None",
+                      comment_holder: "ir.CommentHolder | None",
+                      on_progress: "Callable[[dict], None]",
+                      cancel_event: threading.Event,
+                      autopilot_check: "Callable[[], bool]",
+                      monotonic: "Callable[[], float]" = time.monotonic,
+                      deadline_mono: "float | None" = None,
+                      deadline_at: "str | None" = None) -> RepeatResult:
+        """mission を直列に繰り返す。期限は受理の時点で一度だけ決める:
+        `deadline_mono` / `deadline_at` を渡せばそれを使い、渡さなければこの呼び出しの
+        時点で単調時計と壁時計を同時に採って計算する。期限は新しい mission を始めて
+        よいかの判定にだけ使う (1 回目は見ない)。"""
+        if duration_sec is None and max_runs is None:
+            raise ValueError("duration or max runs is required")
+        limit = ir.MAX_RUNS if max_runs is None else ir.validate_max_runs(max_runs)
+        if deadline_mono is None:
+            span = ir.MAX_DURATION_SEC if duration_sec is None else duration_sec
+            if (isinstance(span, bool) or not isinstance(span, (int, float))
+                    or span <= 0 or span > ir.MAX_DURATION_SEC):
+                raise ValueError("invalid duration")
+            start_mono = monotonic()
+            wall = self._clock.now()
+            deadline_mono = start_mono + span
+            deadline_at = self._iso_utc(wall + timedelta(seconds=span))
+        elif deadline_at is None:
+            wall = self._clock.now()
+            deadline_at = self._iso_utc(
+                wall + timedelta(seconds=deadline_mono - monotonic()))
+
+        def progress(**patch) -> None:
+            try:
+                on_progress(patch)
+            except Exception:  # noqa: BLE001
+                _log.warning("improve_repeat_progress_failed")
+
+        def stop_check(runs: int, consecutive: int, exhausted: bool,
+                       autopilot: bool) -> "str | None":
+            return ir.decide_next(
+                runs=runs, max_runs=limit, mono_now=monotonic(),
+                deadline_mono=deadline_mono, consecutive_failures=consecutive,
+                last_resource_exhausted=exhausted,
+                stop_requested=cancel_event.is_set(),
+                daemon_stopping=self._stop_event.is_set(), autopilot=autopilot)
+
+        runs = 0
+        consecutive = 0
+        exhausted = False
+        last_mission_id: "int | None" = None
+        reason: "str | None" = None
+        progress(phase="waiting_slot", runs=0, deadline_at=deadline_at)
+        try:
+            while True:
+                reason = stop_check(runs, consecutive, exhausted,
+                                    bool(autopilot_check()))
+                if reason is not None:
+                    break
+                if runs > 0:
+                    progress(phase="waiting_slot")
+                reason = self._admit_manual(
+                    lambda: stop_check(runs, consecutive, exhausted, False))
+                if reason is not None:
+                    break
+                try:
+                    reason = stop_check(runs, consecutive, exhausted,
+                                        bool(autopilot_check()))
+                    if reason is not None:
+                        break
+                    started = False
+
+                    def on_prepared(mission_id: int) -> None:
+                        nonlocal runs, last_mission_id, started
+                        started = True
+                        runs += 1
+                        last_mission_id = mission_id
+                        progress(phase="running", runs=runs, mission_id=mission_id)
+
+                    comment = comment_holder.get() if comment_holder else None
+                    outcome = self._execute_mission(
+                        comment=comment, on_prepared=on_prepared, reraise=False)
+                    comment = None
+                finally:
+                    self._release_manual()
+                if not started:
+                    runs += 1
+                    if outcome.mission_id is not None:
+                        last_mission_id = outcome.mission_id
+                        progress(phase="running", runs=runs,
+                                 mission_id=outcome.mission_id)
+                    else:
+                        progress(phase="running", runs=runs)
+                if outcome.status == ir.STATUS_SHUTDOWN:
+                    reason = ir.STOP_SHUTDOWN
+                    break
+                if outcome.status == "completed":
+                    consecutive = 0
+                    exhausted = False
+                    continue
+                if (outcome.status == "failed"
+                        and outcome.failure_class == ir.FAILURE_RESOURCE_EXHAUSTED):
+                    exhausted = True
+                    reason = ir.STOP_RESOURCE_EXHAUSTED
+                    break
+                consecutive += 1
+                reason = stop_check(runs, consecutive, exhausted, False)
+                if reason is not None:
+                    break
+                progress(phase="backoff")
+                reason = self._backoff(
+                    ir.BACKOFF_SEC, cancel_event, monotonic,
+                    lambda: stop_check(runs, consecutive, exhausted, False))
+                if reason is not None:
+                    break
+        finally:
+            if comment_holder is not None:
+                comment_holder.clear()
+            final_reason = reason if reason is not None else "error"
+            if reason is not None:
+                progress(phase="finished", stop_reason=reason)
+            else:
+                progress(phase="finished")
+            if self._activity is not None:
+                try:
+                    self._activity.write(
+                        Category.IMPROVE, "improve_repeat_finished",
+                        f"reason={final_reason} runs={runs}")
+                except Exception:  # noqa: BLE001
+                    _log.warning("improve_repeat_activity_failed")
+        return RepeatResult(reason, runs, last_mission_id)
+
+    def _backoff(self, seconds: float, cancel_event: threading.Event,
+                 monotonic: "Callable[[], float]",
+                 check: "Callable[[], str | None]") -> "str | None":
+        end = monotonic() + seconds
+        while True:
+            reason = check()
+            if reason is not None:
+                return reason
+            remaining = end - monotonic()
+            if remaining <= 0:
+                return None
+            self._wait_fn(cancel_event, min(remaining, self._poll_sec))
+
+    @staticmethod
+    def _iso_utc(moment: datetime) -> str:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).isoformat()
 
     def _running_slot_count(self, conn) -> int:
         row = conn.execute(

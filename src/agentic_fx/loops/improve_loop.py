@@ -43,6 +43,7 @@ from agentic_fx.loops.improve_context import (
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
     family_redirect_last_result, family_redirect_reason,
     render_family_attempts)
+from agentic_fx.core.improve_repeat import render_oneoff_section
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -788,6 +789,8 @@ class ImproveLoop:
     # one-shot=`submit_manual` は on_ready 不要なので省略する)
     def prepare(self, *, slot_key: tuple[str, int] | None, now: datetime,
                on_ready: Callable[[dict], None] | None = None,
+               on_claimed: Callable[[], None] | None = None,
+               oneoff_comment: str | None = None,
                ) -> tuple[Mission, ImproveRunContext, "WorkerRunner"]:
         conn = self._db_write_conn_factory()
         try:
@@ -846,6 +849,10 @@ class ImproveLoop:
         # 知る唯一の点が `prepare()` 内部であるため (`_compensate_tx2_
         # failure`、10.10 節と同型)。
         try:
+            if on_claimed is not None:
+                # slot の claim を含む Tx-0 は commit 済み。呼び出し元はここで
+                # 週次の開始の排他を放す。
+                on_claimed()
             allowed_ids = self._compute_partition_hint(conn, slot_key)
             staging_dir, source_snapshot_dir, inventory_result = \
                 self._materialize_workspace(conn, mission_id, allowed_ids)
@@ -872,7 +879,8 @@ class ImproveLoop:
                 allowed_backlog_ids=allowed_ids,
                 inventory_view=ctx.inventory_view,
                 inventory_metas=list(inventory_result.inventory.metas))
-            prompt_text = self._render_improve_mission_prompt(ctx_data, ctx=ctx)
+            prompt_text = self._render_improve_mission_prompt(
+                ctx_data, ctx=ctx, oneoff_comment=oneoff_comment)
             # precheck 2026-08-22 wave2: T10-B12/B17 — tools/output_schema は
             # 10.9 節 Step 12 (`_build_mission_tools`) で完成させる。ここでは
             # その呼び出しに置き換えるだけ (完全実装は 10.9 節参照)
@@ -1098,7 +1106,8 @@ class ImproveLoop:
     # 最小実装。8-I 節「プレースホルダ⇔戻り値キーの対応表 (B8)」の 17 項目
     # をそのまま埋める。self の属性には依存しない (Step 2a のテストが
     # ImproveLoop.__new__ で検証できる理由)。
-    def _render_improve_mission_prompt(self, ctx_data: dict, *, ctx) -> str:
+    def _render_improve_mission_prompt(self, ctx_data: dict, *, ctx,
+                                       oneoff_comment: str | None = None) -> str:
         perf = ctx_data["performance_report"]
         hist = ctx_data["improvement_history"]
         inv = ctx_data["current_inventory"]
@@ -1192,6 +1201,7 @@ class ImproveLoop:
                    if bl.get("notes_omitted", 0) else "")),
             "min_test_functions": self._settings.improve.gate.min_test_functions,
             "user_policy_tail": policy["tail"],
+            "oneoff_comment_section": render_oneoff_section(oneoff_comment),
             "plugin_name_pattern": refs["plugin_name_pattern"],
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
@@ -1206,7 +1216,10 @@ class ImproveLoop:
         # (`tests/loops/test_improve_loop_source_snapshot.py::
         # test_prompt_shows_the_number_of_pin_broken_strategies`)。本番挙動
         # は変わらない。
-        self._last_rendered_prompt = rendered
+        # 観測面には一時指示の本文を残さない。
+        self._last_rendered_prompt = (
+            rendered if oneoff_comment is None else mission_template().format(
+                **{**render_map, "oneoff_comment_section": ""}))
         return rendered
 
     def _floor_rule_text(self) -> str:

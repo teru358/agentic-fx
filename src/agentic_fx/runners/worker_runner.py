@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.improve_repeat import FAILURE_CLASSES as _FAILURE_CLASSES
 from agentic_fx.core.mission_ceiling import (DISPATCHER_JOIN_MARGIN_SEC, KILL_WAIT_SEC, READER_JOIN_SEC)
 from agentic_fx.core import mission_cleanup as MC
 from agentic_fx.core.mission_protocol import (
@@ -763,6 +764,10 @@ class WorkerRunner(AgentRunner):
                         _log.warning("invalid market_tool_calls in result frame")
                     market_tool_calls = None
                 stderr_fatal = payload.get("stderr_fatal")
+                failure_class = payload.get("failure_class")
+                if (not isinstance(failure_class, str)
+                        or failure_class not in _FAILURE_CLASSES):
+                    failure_class = None
             else:  # eof / protocol_error / error — すべて failed に正規化
                 status = "failed"
                 output = None
@@ -774,10 +779,12 @@ class WorkerRunner(AgentRunner):
                 tool_calls = None
                 market_tool_calls = None
                 stderr_fatal = None
+                failure_class = None
             return MissionResult(status, output, transcript, reason=reason,
                                  recovered=recovered, tool_calls=tool_calls,
                                  market_tool_calls=market_tool_calls,
-                                 stderr_fatal=stderr_fatal)
+                                 stderr_fatal=stderr_fatal,
+                                 failure_class=failure_class)
         finally:
             dispatch_queue.put(None)
             if cleanup is None:

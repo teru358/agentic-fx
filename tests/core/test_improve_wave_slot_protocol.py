@@ -243,7 +243,8 @@ class _FakeImproveLoop:
             (mission_id, "2026-08-22T03:00:00"))
         conn.commit()
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         self.prepare_call_count += 1
         period_key, k = slot_key
         claimed = improve_waves.claim_slot(
@@ -739,7 +740,8 @@ def test_pre_ready_failure_keeps_slot_reserved_through_real_commit(conn):
         def __init__(self):
             self.committed: list[tuple] = []
 
-        def prepare(self, *, slot_key, now, on_ready=None):
+        def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
             period_key, k = slot_key
             mid = missions_store.start(
                 conn, "improve", "local", "m", now=now, commit=False)
@@ -1117,7 +1119,8 @@ def test_n4_concurrent_slots_no_connection_sharing_no_mixup(tmp_path):
         """各スレッドが自分専用の write 接続で `claim_slot`/`commit` を
         行う fake (本番の `ImproveLoop` の接続所有パターンを模す)。"""
 
-        def prepare(self, *, slot_key, now, on_ready=None):
+        def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
             period_key, k = slot_key
             conn = db_mod.connect(db_path)
             try:
@@ -1343,7 +1346,8 @@ class _ManualFakeImproveLoop(_FakeImproveLoop):
         super().__init__(conn, worker_runner, mission_id=mission_id)
         self.prepare_calls: list[dict] = []
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         self.prepare_calls.append({"slot_key": slot_key, "on_ready": on_ready})
         if on_ready is not None:
             self._worker_runner.on_ready = on_ready
@@ -1438,7 +1442,8 @@ class _Round2FakeImproveLoop:
         self.committed: list[str] = []
         self.compensate_calls: list[dict] = []
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         period_key, k = slot_key
         mission_id = missions_store.start(
             self._conn, "improve", "local", "m", now=now, commit=False)

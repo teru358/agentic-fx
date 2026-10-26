@@ -75,6 +75,9 @@ class MissionResult:
     # 拒否は固定 reason で決まり、同じ process で起こし直しても同じ結果になるので、improve の
     # supervisor は pre-ready 失敗の再試行に回さず終端する。既定 False。
     refused: bool = False
+    # 失敗の固定分類 (`resource_exhausted` / `runner_fault` / なし)。`stderr_fatal` の
+    # 自由文とは別に、検知したパターンの表から直接決める。
+    failure_class: str | None = None
 
 
 class AgentRunner(ABC):

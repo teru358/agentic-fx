@@ -53,7 +53,7 @@
 
 方針は規律の範囲で、仮説と候補の種類 (indicator / strategy) の選択を導きます。規律と矛盾する方針は規律が優先します。
 
-{user_policy_tail}
+{user_policy_tail}{oneoff_comment_section}
 
 ## 参照
 

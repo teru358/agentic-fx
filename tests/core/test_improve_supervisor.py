@@ -236,7 +236,8 @@ class _CommitFailureLoop:
         self.runner = runner
         self.compensations = []
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         self.runner.on_ready = on_ready
         return "mission", self.ctx, self.runner
 
@@ -429,7 +430,8 @@ class _PrepareFailingLoop:
     def __init__(self, cause):
         self.cause = cause
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         from agentic_fx.loops.improve_loop import ImprovePrepareFailed
         failure = ImprovePrepareFailed(7, slot_key)
         if self.cause is None:
