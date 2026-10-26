@@ -1,6 +1,6 @@
 # afx ctl improve の繰り返し (-t) / 一時的な指示 (-c) / 回数 (-n) 設計書
 
-**版:** v0.3 C0 (設計レビュー 2 周目の反映。§8 の製品判断 6 件はユーザー裁定済、2026-10-26)
+**版:** v0.4 C0 (設計レビュー 3 周目の反映。§8 の製品判断 6 件はユーザー裁定済、2026-10-26)
 
 **対象:** `ctl-improve-repeat-duration-and-oneoff-comment` (2026-10-25 のユーザー依頼と裁定)
 
@@ -70,13 +70,13 @@ daemon を再起動すると繰り返しは中断します。
 45 秒で `mission_id` が付かないとき (週次の slot が空くのを待っているときなど) は、3 行目を「週次の slot が空くのを待っています。1 回目は空き次第始まります」に替え、同じく rc=0 で戻る。再投入はしない (再投入すると `improve_running` になる)。
 
 - 期限の表示は、wire 値 (ISO-8601 UTC、`+00:00`) を CLI の formatter だけが上の人向け表記にする。例は formatter の出力と一致させる。
-- **rc=1 は受理拒否、または受理前の失敗に限る**。受理後、準備前に job が終端した場合 (`state=failed`、または `runs=0` で `done`: `autopilot` / `shutdown` / `stopped`) は rc=1 で理由を出す。slot 待ちの長さでは rc=1 にしない。単発の従来形は従来どおり終端まで待つ。
+- **rc=1 は job を作らなかった同期拒否に限る**。job id を伴う受理後は、準備前に終端した場合 (`state=failed`、または `runs=0` で `done`: `autopilot` / `shutdown` / `stopped`) も rc=0 で、理由と job id を出す。slot 待ちの長さでは rc=1 にしない。単発の従来形は従来どおり終端まで待つ。
 - `-c` の本文は出さない (`一時指示あり` だけ)。引数なしの従来の形は、表示も rc も今のまま。
 
 | rc | 意味 |
 |---|---|
-| 0 | 受理した (繰り返しでは以後 client は待たない。1 回目が slot 待ちのままでも 0) |
-| 1 | `improve_running` (別の improve job が走行中)、autopilot 制限、daemon 側の拒否、受理前の終端 |
+| 0 | 受理した (繰り返しでは以後 client は待たない。1 回目が slot 待ちのままでも、受理後に終端していても 0) |
+| 1 | job を作らなかった同期拒否 (`improve_running`、autopilot 制限、daemon 側の拒否) |
 | 2 | 引数の違反 (上記)、usage |
 | 3 | daemon に届かない |
 | 130 | 待機中の Ctrl-C。受理済みの job は続く (既存の案内) |
@@ -169,13 +169,13 @@ supervisor が 1 つの admission gate (lock + 条件 + `manual_active`) を持�
 
 job の `result` は進捗を持つ辞書で、**enqueue 時に完全な初期値 (`runs=0`、`phase=waiting_slot` ほか) を設定する**: `mission_id`、`runs`、`max_runs`、`deadline_at` (ISO-8601 UTC)、`phase` (固定語: `waiting_slot` / `running` / `backoff` / `finished`)、`stop_requested`、終了後は `stop_reason`。自由文を含めない (ops-api §8)。`stop_reason` は固定語: `deadline` / `max_runs` / `stopped` / `consecutive_failures` / `resource_exhausted` / `autopilot` / `shutdown`。
 
-**進捗の更新は thread-safe にする**。現行の prepared callback は `job.result` を lock 外で直接更新している。`JobRegistry.update_result(job, patch)` を追加し、registry の lock 内で辞書を丸ごと置換する。`runs` は mission の開始を確定した時点、`mission_id` は同じ更新で公開する。終端の audit / result との競合は CAS で防ぎ、`JobRegistry.finish()` は最後の進捗 (`phase` / `stop_reason` / `runs`) を失わない (result を上書きせず合成する)。job 側の `cancel_event` と `stop_requested` は registry の lock 内で扱う (§2.3)。
+**進捗の更新は thread-safe にする**。現行の prepared callback は `job.result` を lock 外で直接更新している。`JobRegistry.update_result(job, patch)` を追加し、registry の lock 内で辞書を丸ごと置換する。`runs` は mission の開始を確定した時点、`mission_id` は同じ更新で公開する。終端の audit / result との競合は CAS で防ぎ、`JobRegistry.finish()` は registry の lock 内で終端 result を合成し、進捗キー (`phase` / `stop_reason` / `runs` / `mission_id` / `stop_requested`) は現在の `job.result` を優先する (終端 result は追加キーだけ足せ、同名キーでは進捗が勝つ)。job 側の `cancel_event` と `stop_requested` は registry の lock 内で扱う (§2.3)。
 
 ### 5.2 supervisor
 
 `submit_manual` の本体を **1 mission executor** (prepare → run → commit・補償 → `MissionOutcome` を返す) に切り出し (挙動は同一)、`submit_manual` はそれを 1 回呼ぶ薄い形にする。新規の **repeat controller** (`submit_repeat`) が §3 のループ、gate、backoff を持つ。判定は純関数 (次を始めるか、止める理由) に出し、単調時刻・停止要求・daemon stop・autopilot・slot の状態は引数で渡す (test しやすくするため)。
 
-controller には callback interface を渡す: `on_progress(patch)` (job の `update_result` に繋ぐ)、利用者 cancel の `cancel_event`、autopilot の再確認 callback。**利用者 cancel の Event は WorkerRunner の daemon stop Event と分離する**。cancel は走行中 mission を中断せず、daemon stop は既存どおり WorkerRunner が mission を打ち切る (`interrupted`)。comment は `prepare` の任意引数で受けてプロンプトの組立てに渡し、`ImproveRunContext` には保存しない。各 mission の開始・終了の通知は、Discord 設計 §4.4 のとおり `prepare` 成功後と終端後に supervisor が mission ごとに出すので、繰り返しのために変えない。
+controller には callback interface を渡す: `on_progress(patch)` (job の `update_result` に繋ぐ)、利用者 cancel の `cancel_event`、autopilot の再確認 callback。**利用者 cancel の Event は WorkerRunner の daemon stop Event と分離する**。cancel は走行中 mission を中断せず、daemon stop は既存どおり WorkerRunner が mission を打ち切る。DB の mission は既存の補償終端 (`failed` / `timeout` など) のまま、executor が repeat 用の outcome として `shutdown` を返す。`interrupted` は crash-restart の起動時回収専用で、停止中の controller は使わない。comment は `prepare` の任意引数で受けてプロンプトの組立てに渡し、`ImproveRunContext` には保存しない。各 mission の開始・終了の通知は、Discord 設計 §4.4 のとおり `prepare` 成功後と終端後に supervisor が mission ごとに出すので、繰り返しのために変えない。
 
 ### 5.3 再起動と失敗
 
@@ -206,9 +206,9 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 12b | 残余の確認: 意図的に comment を復唱する fake runner で、復唱が agent 出力の保存経路に残ることを test が確認する (契約の外であることの pin。afx が追加で書いた箇所が無いこと) |
 | 13 | 停止と再起動の区別: graceful shutdown を shutdown-before-first (`runs=0`)、worker ready 前、mission running、backoff 中の 4 点で別々に test し、いずれも新しい mission が始まらず停止理由 `shutdown` で失敗に数えない。crash-restart (daemon 異常終了後の再起動) では繰り返しが再開せず、走行中の mission は起動時回収で `interrupted` になる |
 | 14 | 通知: mission ごとに started / finished が 1 組ずつ出る (繰り返しで増減しない)。繰り返し専用の event は出ない |
-| 15 | `jobs get` の進捗が各時点で正しい (`runs`、`mission_id`、`phase`、`stop_requested`、`stop_reason`)。comment は出ない。`update_result` は lock 内で丸ごと置換し、終端 audit / result との競合 (CAS) で壊れない。`finish()` のあとも最後の `phase` / `stop_reason` / `runs` が残る。cancel 応答に `stop_requested` が必ず入る |
+| 15 | `jobs get` の進捗が各時点で正しい (`runs`、`mission_id`、`phase`、`stop_requested`、`stop_reason`)。comment は出ない。`update_result` は lock 内で丸ごと置換し、終端 audit / result との競合 (CAS) で壊れない。`finish()` のあとも最後の `phase` / `stop_reason` / `runs` / `mission_id` / `stop_requested` が残り、終端 result が同名キーを持っていても現在の進捗が勝つ (同名キーの競合 test)。cancel 応答に `stop_requested` が必ず入る |
 | 16 | `cli_surface` の record、usage、説明、対話シェルの usage、help golden が `-t` `-c` `-n` を出す。help に literal を置かない (AST 検査) |
-| 17 | client の poll 契約: 繰り返し job は受理で rc=0。enqueue 時の初期 result が `phase=waiting_slot` で公開される。slot 待ちが 45 秒を超えても rc=0 で「slot 待ち」の表示になり、同じ job が続き、再投入されない。`state=running` かつ `mission_id` と `runs>=1` で 1 回目の起動行を出す。rc=1 は受理拒否と受理前の終端 (`failed`、または `runs=0` の `done`) だけ。単発は終端まで待つ従来のまま。`afx ctl status` は変わらない |
+| 17 | client の poll 契約: 繰り返し job は受理で rc=0。enqueue 時の初期 result が `phase=waiting_slot` で公開される。slot 待ちが 45 秒を超えても rc=0 で「slot 待ち」の表示になり、同じ job が続き、再投入されない。`state=running` かつ `mission_id` と `runs>=1` で 1 回目の起動行を出す。受理後に終端した場合 (`failed`、`runs=0` の `done`) も rc=0 で理由を出す。rc=1 は job を作らなかった同期拒否だけ。単発は終端まで待つ従来のまま。`afx ctl status` は変わらない |
 | 18 | 変異スイープ: 期限の等号、判定点 (mission 途中で見ない)、期限と回数だけが 1 回目で無条件であること (cancel / shutdown / autopilot は見る)、連続失敗の数え直し、`resource_exhausted` の 1 回停止、backoff、gate の対象 (reserved / claimed / running)、週次優先、autopilot の再確認、comment の経路、単調時計 |
 
 ## 7. 変更一覧と task 分割
@@ -272,3 +272,4 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 2026-10-26 | v0.1 C0 | 初版 (指揮者承認前の清書) | チケット `ctl-improve-repeat-duration-and-oneoff-comment` の設計化 | |
 | 2026-10-26 | v0.2 C0 | admission gate と週次優先 (1 回目も gate 経由)、無条件を期限と回数に限定、comment の契約を直接経路に限定し復唱を残余化、単調時計の注入、失敗の正規化と `resource_exhausted` と backoff、cancel の応答と thread-safe な進捗、repeat 専用の poll 契約、対話シェルの `shlex`、task 分割と統合条件、§8 を確定事項 + ユーザー確認待ちに組み替え | 設計レビュー 1 周目 (sol、詳細 `tmp/review-repeat/c0-r1-triage.md`) | |
 | 2026-10-26 | v0.3 C0 | repeat の判定を `-t` / `-n` に (`-c` 単独は one-shot)、受理で rc=0 と初期 `phase=waiting_slot`、gate の lock 範囲 (admission のみ、週次は claim Tx まで)、孤児 `reserved` の fail-closed 収束、`MissionOutcome` と `failure_class` の 5 段 (resource_exhausted / runner_fault の pattern)、graceful shutdown の outcome と crash-restart の区別、`CommentHolder` の明示消去と Job retention、`Zs` / `Zl` / `Zp` の拒否、controller 例外は `internal`、`finish()` の進捗保持、§8 を裁定済に、§9 を実装時確認のみに、T1 / T2 の範囲と AC 1・7・9・11・12a・13・15・17 を追従 | 設計レビュー 2 周目 (sol、詳細 `tmp/review-repeat/c0-r2-triage.md`) | |
+| 2026-10-26 | v0.4 C0 | job id を伴う受理後の終端はすべて rc=0 (rc=1 は同期拒否だけ、§2.2 と AC 17)、daemon stop 時の契約を `shutdown` outcome に統一 (DB mission は既存の補償終端、`interrupted` は起動時回収専用、§5.2)、`finish()` は lock 内で合成し進捗キーは現在の `job.result` 優先 (§5.1、AC 15 に同名キー競合 test) | 設計レビュー 3 周目 (sol 差分閉鎖確認、`tmp/review-repeat/c0-r3-out.md`) | |
