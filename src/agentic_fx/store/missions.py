@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from agentic_fx._safe_error import safe_text
@@ -146,13 +146,16 @@ def _insert_notice_snapshot(
     stored_text = (
         notice_codes.truncate_observation_text(safe_text(observation_text))
         if observation_text is not None else None)
+    if now.tzinfo is None:
+        raise ValueError("improve_run_notices: naive datetime は受け付けない")
+    created_at = now.astimezone(timezone.utc).isoformat()
     verb = "INSERT OR IGNORE" if ignore_existing else "INSERT"
     conn.execute(
         f"{verb} INTO improve_run_notices (mission_id, trigger, result_code, "
         "reason_code, tool_calls, observation_text, approval_id, created_at) "
         "VALUES (?,?,?,?,?,?,?,?)",
         (mission_id, trigger, notice.result_code, notice.reason_code,
-         tool_calls, stored_text, approval_id, now.isoformat()))
+         tool_calls, stored_text, approval_id, created_at))
 
 
 def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,

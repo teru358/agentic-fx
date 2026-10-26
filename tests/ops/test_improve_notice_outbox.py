@@ -274,3 +274,20 @@ def test_rows_outside_the_window_are_removed_by_sql_not_by_python(ops_env):
     svc.events.unannounced_improve_finishes = spy
     assert svc.emit_pending_improve_notices(enabled=True) == 1
     assert fetched == [[fresh]]
+
+
+def test_since_is_built_as_utc_even_when_the_wall_clock_has_an_offset(ops_env):
+    jst = timezone(timedelta(hours=9))
+    svc = ops_env.service(wall_clock=lambda: ops_env.wall().astimezone(jst))
+    seen = []
+    original = svc.events.unannounced_improve_finishes
+
+    def spy(**kwargs):
+        seen.append(kwargs["since"])
+        return original(**kwargs)
+
+    svc.events.unannounced_improve_finishes = spy
+    svc.emit_pending_improve_notices(enabled=True)
+    expected = (ops_env.wall() - timedelta(days=7)).astimezone(timezone.utc)
+    assert seen == [expected.isoformat()]
+    assert seen[0].endswith("+00:00")

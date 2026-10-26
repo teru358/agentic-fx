@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -369,3 +369,40 @@ def test_fresh_db_has_trigger_column_and_table(conn):
     assert "improve_run_notices" in {
         r["name"] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+JST = timezone(timedelta(hours=9))
+
+
+def _finish_at(c, mid, rid, now):
+    missions.finish_improve_mission(
+        c, mission_id=mid, run_id=rid, slot_key=None, mission_status="failed",
+        run_result=None, backlog_transition=None, now=now,
+        notice=codes.NOTICE_COMMIT_CRASHED, tool_calls=None)
+
+
+def test_snapshot_created_at_is_normalized_to_utc(conn):
+    mid, rid = _start(conn)
+    _finish_at(conn, mid, rid, datetime(2026, 10, 19, 20, 30, tzinfo=JST))
+    assert _snap(conn, mid)["created_at"] == "2026-10-19T11:30:00+00:00"
+
+
+def test_offset_input_older_than_cutoff_is_excluded_by_the_window_sql(conn):
+    from agentic_fx.ops.events import EventStore
+    mid, rid = _start(conn)
+    # 2026-10-19T20:30+09:00 = 11:30Z。cutoff 12:00Z より 30 分古い。
+    _finish_at(conn, mid, rid, datetime(2026, 10, 19, 20, 30, tzinfo=JST))
+    cutoff = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+    events = EventStore(conn, wall_clock=lambda: cutoff)
+    assert events.unannounced_improve_finishes(since=cutoff.isoformat()) == []
+    older = cutoff - timedelta(minutes=31)
+    assert [r["mission_id"] for r in events.unannounced_improve_finishes(
+        since=older.isoformat())] == [mid]
+
+
+def test_naive_now_is_rejected_and_adds_no_snapshot(conn):
+    mid, rid = _start(conn)
+    with pytest.raises(ValueError, match="naive"):
+        _finish_at(conn, mid, rid, datetime(2026, 10, 25, 3, 5))
+    conn.rollback()
+    assert _snap(conn, mid) is None
