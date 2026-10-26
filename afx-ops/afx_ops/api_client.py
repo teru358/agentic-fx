@@ -192,6 +192,11 @@ class _Request:
         except OSError:
             raise ApiError("response_lost", token_sent=True) from None
 
+    def limit(self, seconds: float) -> None:
+        """以後の送受信に使う socket の期限 (要求全体の残り時間に合わせるため)。"""
+        if self._sock is not None:
+            self._sock.settimeout(seconds)
+
     def receive(self, *, timeout: float = HTTP_TIMEOUT) -> tuple[int, bytes, int | None]:
         """応答を読む。相手の終了・期限・形式不正はすべて応答喪失。"""
         assert self._sock is not None and self._sent
@@ -325,6 +330,14 @@ def _reply(status: int, body: bytes, retry_after: int | None = None) -> Reply:
 
 # --------------------------------------------------------------- client
 
+def _remaining(deadline: float, *, token_sent: bool = False) -> float:
+    """deadline までの残り時間。尽きていれば期限切れ。"""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise ApiError("timeout", token_sent=token_sent)
+    return left
+
+
 class _Client:
     """principal 1 つ分の client。鍵は自分の principal のものだけを持つ。"""
 
@@ -355,12 +368,20 @@ class _Client:
         return f"{type(self).__name__}(socket={str(self._endpoint.socket_path)!r})"
 
     def _call(self, method: str, path: str, *, query: dict | None = None,
-              body: dict | None = None, timeout: float | None = None) -> Reply:
+              body: dict | None = None, timeout: float | None = None,
+              deadline: float | None = None) -> Reply:
         """actor header を付けない要求。actor を付けられるのは ``BotClient`` だけ。"""
-        return self._send(_build(self._token, method, path, query, body, None), timeout=timeout)
+        return self._send(_build(self._token, method, path, query, body, None), timeout=timeout,
+                          deadline=deadline)
 
-    def _send(self, payload: bytes, *, timeout: float | None = None) -> Reply:
-        request_timeout = HTTP_TIMEOUT if timeout is None else timeout
+    def _send(self, payload: bytes, *, timeout: float | None = None,
+              deadline: float | None = None) -> Reply:
+        """1 要求を送る。``timeout`` は接続と受信それぞれの期限、``deadline`` (``time.monotonic``
+        の時刻) は接続・admission・送信・受信の合計の期限で、各段は残り時間で打ち切る。"""
+        if deadline is None:
+            request_timeout = HTTP_TIMEOUT if timeout is None else timeout
+        else:
+            request_timeout = _remaining(deadline)
         with _Request.open(self._endpoint, timeout=request_timeout) as request:
             with self._lock:
                 ident = threading.get_ident()
@@ -369,8 +390,12 @@ class _Client:
             try:
                 if interrupted:
                     request.abort()
+                if deadline is None:
+                    request.send(payload)
+                    return _reply(*request.receive(timeout=request_timeout))
+                request.limit(_remaining(deadline))
                 request.send(payload)
-                return _reply(*request.receive(timeout=request_timeout))
+                return _reply(*request.receive(timeout=_remaining(deadline, token_sent=True)))
             finally:
                 with self._lock:
                     self._inflight.pop(request, None)
@@ -395,9 +420,10 @@ class _Client:
         with self._lock:
             self._interrupted_threads.discard(ident)
 
-    def _get(self, path: str, *, timeout: float | None = None, **query) -> Reply:
+    def _get(self, path: str, *, timeout: float | None = None, deadline: float | None = None,
+             **query) -> Reply:
         return self._call("GET", path, query={k: v for k, v in query.items() if v is not None},
-                          timeout=timeout)
+                          timeout=timeout, deadline=deadline)
 
 
 class BotClient(_Client):
@@ -413,6 +439,11 @@ class BotClient(_Client):
 
     def approval(self, approval_id: int, *, timeout: float | None = None) -> Reply:
         return self._get(f"/v1/approvals/{_int_id(approval_id)}", timeout=timeout)
+
+    def improve_run(self, mission_id: int, *, deadline: float) -> Reply:
+        """改善 mission の終端 snapshot と詳細。``deadline`` は ``time.monotonic`` の時刻で、
+        接続から本文の読込までの合計をこれで打ち切る。"""
+        return self._get(f"/v1/improve/runs/{_int_id(mission_id)}", deadline=deadline)
 
     def approve(self, actor: Actor, approval_id: int, *, payload_sha256: str) -> "Decision":
         return self._decide(actor, "approve", approval_id, {"payload_sha256": payload_sha256})

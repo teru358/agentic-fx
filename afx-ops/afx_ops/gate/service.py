@@ -9,15 +9,24 @@ from dataclasses import replace
 from typing import Callable
 
 from afx_ops.api_client import Actor, Decision, DecisionJob, Reply
-from afx_ops.event_outcome import SkipKnown, decide
+from afx_ops.event_outcome import SkipKnown, decide, is_improve
 from afx_ops.trade_events import NOTICE_KINDS, notice_kind
 
+from .improve_render import render_improve_finish, render_improve_start
 from .render import confirm_view, render_event, wants_ops_event
 from .trade_render import render_trade
 from .state import (ApprovalRecord, BotState, advance_event, initialize_event_cursor, load,
                     observe_high, save)
 from .types import DecisionPlan, EventPlan, GateResult, Interaction, decode_custom_id
 
+# 改善通知の設定ごとに投稿する state
+IMPROVE_NOTICE_STATES = {
+    "all": frozenset({"started", "finished"}),
+    "results": frozenset({"finished"}),
+    "off": frozenset(),
+}
+# plan_event の improve_detail の既定: 詳細をまだ取得していない
+DETAIL_NOT_FETCHED = object()
 CLAIM_SECONDS = 10 * 60
 JOB_POLL_LIMIT = 3
 JOB_POLL_INTERVAL_SECONDS = 0.05
@@ -99,12 +108,16 @@ class GateService:
     def plan_event(self, event: object, *, mention_role_id: int | None = None,
                    mention_user_ids: tuple[int, ...] = (), trade_notices: str = "all",
                    trade_amounts: str = "absolute", ops_notices: str = "default",
-                   plugin_name: str | None = None) -> EventPlan | SkipKnown | None:
+                   plugin_name: str | None = None, improve_notices: str = "all",
+                   improve_detail: object = DETAIL_NOT_FETCHED) -> EventPlan | SkipKnown | None:
         """event の扱い。None は cursor 以下 (すでに確定済み)、`SkipKnown` は検証を通ったが
         設定で出さない event、`EventPlan` は投稿する event。完全検証 (`PayloadError`) が先。"""
         kinds = NOTICE_KINDS[trade_notices]
+        improve_states = IMPROVE_NOTICE_STATES[improve_notices]
 
         def wants(payload: dict) -> bool:
+            if is_improve(payload):
+                return payload["state"] in improve_states
             kind = notice_kind(payload)
             if kind is not None:
                 return kind in kinds
@@ -116,6 +129,13 @@ class GateService:
             return None
         if isinstance(outcome, SkipKnown):
             return outcome
+        if is_improve(outcome.payload):
+            # 改善通知は固定 template で、設定済みの mention を付けない。詳細 (検査済みの応答)
+            # を取得できていないときは event の固定 field だけの文面になる
+            detail = None if improve_detail is DETAIL_NOT_FETCHED else improve_detail
+            render = (render_improve_start if outcome.payload["state"] == "started"
+                      else render_improve_finish)
+            return EventPlan(event_id, render(outcome.payload, detail), (), allow_mentions=False)
         if notice_kind(outcome.payload) is not None:
             # 取引通知は固定 template で、設定済みの mention を付けない
             return EventPlan(event_id, render_trade(outcome.payload, amounts=trade_amounts), (),

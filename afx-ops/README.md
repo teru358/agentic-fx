@@ -23,6 +23,8 @@ trade_notices = "all"        # bot のみ: all | results | fills_closes | off。
 trade_amounts = "absolute"   # bot のみ: absolute | relative。relative は数量と損益の絶対額を出さない
 ops_notices = "default"      # bot のみ: default | all。ops event 通知の種類
 deliver_trade_events = false # notify のみ: 取引 event を webhook に配送するか (既定 false)
+improve_notices = "all"      # bot のみ: all | results | off。改善 mission の開始・終了通知 (results は終了のみ)
+deliver_improve_events = false # notify のみ: 改善 event を webhook に配送するか (既定 false)
 ```
 
 - UDS は `<instance_root>/data/run/api.sock`、lock は `<instance_root>/data/instance.lock` に固定

@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable
 from typing import TextIO
 
-from afx_ops.event_outcome import Post, SkipKnown, decide, is_trade
+from afx_ops.event_outcome import Post, SkipKnown, decide, is_improve, is_trade
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
 from afx_ops.isolation.startup import client_for
@@ -94,9 +94,10 @@ class _Loop:
         self._out = out
         # 同じ原因の warning は event をまたいで間引く
         self._throttle = WarningThrottle()
-        # 取引 event を配送するか。隔離の前に検査済みの設定の値で、runtime では読み直さない
+        # 取引・改善 event を配送するか。隔離の前に検査済みの設定の値で、runtime では読み直さない
         config = getattr(isolated, "config", None)
         self._deliver_trade_events = getattr(config, "deliver_trade_events", False) is True
+        self._deliver_improve_events = getattr(config, "deliver_improve_events", False) is True
         # 直近の取得で進んだ件数 (配送と配送なしの確定の合計)
         self._progressed = 0
 
@@ -175,6 +176,8 @@ class _Loop:
         return state, len(events), delivered
 
     def _wants(self, payload: dict) -> bool:
+        if is_improve(payload):
+            return self._deliver_improve_events
         return self._deliver_trade_events or not is_trade(payload)
 
     @staticmethod

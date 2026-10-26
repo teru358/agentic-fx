@@ -24,18 +24,20 @@ import os
 import re
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import discord
 
-from afx_ops.event_outcome import SkipKnown
+from afx_ops.event_outcome import SkipKnown, is_improve
 from afx_ops.events_page import parse_page, unreadable_notice
 from afx_ops.gate import reconcile as gate_reconcile
 from afx_ops.gate import state as gate_state
 from afx_ops.gate.reconcile import MessageMetadata
 from afx_ops.api_client import ApiError
+from afx_ops.gate.improve_render import mission_id_of, validate_improve_run
 from afx_ops.gate.render import footer as gate_footer
 from afx_ops.gate.render import plugin_name_or_none, primary_view, render_approval, render_terminal
 from afx_ops.gate.service import GateService
@@ -55,6 +57,10 @@ EDIT_BACKOFF_MAX_SECONDS = 60.0
 THROTTLE_DEFAULT_SECONDS = 10.0
 THROTTLE_MAX_SECONDS = 300.0
 NAME_LOOKUP_TIMEOUT_SECONDS = 3.0
+# 改善通知の詳細取得は、接続から本文の読込までの合計をこの秒数で打ち切る
+IMPROVE_DETAIL_DEADLINE_SECONDS = 3.0
+# 投稿済みの改善通知 (ref, state) をこの process で覚える件数の上限 (古いものから捨てる)
+POSTED_IMPROVE_LIMIT = 512
 _TERMINAL = frozenset({"done"})
 # event の ref は daemon の固定形。int() が受ける Unicode 数字や先頭 0 は承認 ID とみなさない
 _APPROVAL_REF = re.compile(r"approval:([1-9][0-9]{0,17})\Z")
@@ -80,6 +86,8 @@ class BotSettings:
     trade_notices: str = "all"
     trade_amounts: str = "absolute"
     ops_notices: str = "default"
+    # 改善通知の出し方 (all | results | off)。起動時に確定し、runtime では読み直さない
+    improve_notices: str = "all"
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,9 @@ class BotAdapter:
         self.discord = discord_client
         self._dir_fd = dir_fd
         self._now = now
+        # 投稿に成功した改善通知の (ref, state)。同じ event の重複を 1 通に畳む。この process の
+        # 中だけで持ち、永続化しない
+        self._posted_improve: OrderedDict[tuple[str, str], None] = OrderedDict()
         # gate の状態と snapshot を触る唯一の thread
         self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="afx-bot-gate")
         self._routes: dict[int, _Route] = {}
@@ -692,7 +703,8 @@ class BotAdapter:
                     mention_user_ids=self.settings.mention_user_ids,
                     trade_notices=self.settings.trade_notices,
                     trade_amounts=self.settings.trade_amounts,
-                    ops_notices=self.settings.ops_notices, plugin_name=plugin_name))
+                    ops_notices=self.settings.ops_notices, plugin_name=plugin_name,
+                    improve_notices=self.settings.improve_notices))
             except Exception:
                 raise BotFailure("payload_invalid") from None
             if plan is None:
@@ -703,6 +715,15 @@ class BotAdapter:
                 await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
                 progressed = True
                 continue
+            improve_key = None
+            if is_improve(event):
+                improve_key = (event["ref"], event["fields"]["state"])
+                if improve_key in self._posted_improve:
+                    # 投稿済みの event の重複 (at-least-once)。投稿せずに確定する
+                    await self._run(self._commit_skip, plan.event_id, max(high, plan.event_id))
+                    progressed = True
+                    continue
+                plan = await self._improve_plan(event)
             if (approval_id is not None and event["fields"].get("state") in {"approved", "rejected", "expired"}
                     and self._poll_due(approval_id)):
                 try:
@@ -727,6 +748,8 @@ class BotAdapter:
             except (discord.HTTPException, OSError, asyncio.TimeoutError):
                 # 投稿できなかった event から先は確定しない。次の周回で同じ event から再送する
                 return
+            if improve_key is not None:
+                self._remember_improve(improve_key)
             await self._run(self._commit_post, plan.event_id, max(high, plan.event_id))
             progressed = True
             if approval_id is not None:
@@ -736,6 +759,42 @@ class BotAdapter:
         if not progressed and high > self.gate.state.high_watermark:
             # 確定する event が無い周回でも watermark を進め、daemon の巻戻りを次回以降も検出する
             await self._run(self._observe_high, high)
+
+    async def _improve_plan(self, event: dict):
+        """改善通知の詳細を GET で 1 回取り、検査を通ったものだけで文面を作る。
+
+        取得の失敗 (接続・deadline 超過・404 / 5xx・検査違反) は詳細なしの文面に倒し、投稿は
+        止めない。応答の本文はこの関数の局所値で、文面を作った後はどこにも残さない。
+        """
+        mission_id = mission_id_of(event)
+        detail = None
+        try:
+            reply = await self._run(lambda: self.client.improve_run(
+                mission_id, deadline=time.monotonic() + IMPROVE_DETAIL_DEADLINE_SECONDS))
+        except (ApiError, TimeoutError, OSError):
+            reply = None
+        if reply is not None and getattr(reply, "status", None) == 200:
+            try:
+                detail = validate_improve_run(getattr(reply, "data", None), mission_id)
+            except Exception:  # noqa: BLE001 — 検査できない応答は詳細なしと同じ
+                detail = None
+        reply = None
+        try:
+            return await self._run(lambda: self.gate.plan_event(
+                event, mention_role_id=self.settings.mention_role_id,
+                mention_user_ids=self.settings.mention_user_ids,
+                trade_notices=self.settings.trade_notices,
+                trade_amounts=self.settings.trade_amounts,
+                ops_notices=self.settings.ops_notices,
+                improve_notices=self.settings.improve_notices, improve_detail=detail))
+        except Exception:
+            raise BotFailure("payload_invalid") from None
+
+    def _remember_improve(self, key: tuple[str, str]) -> None:
+        self._posted_improve[key] = None
+        self._posted_improve.move_to_end(key)
+        while len(self._posted_improve) > POSTED_IMPROVE_LIMIT:
+            self._posted_improve.popitem(last=False)
 
     def _initialize_cursor(self, high: int) -> None:
         try:

@@ -68,7 +68,8 @@ def test_bot_client_direct_public_methods_are_exactly_the_supported_api():
         name for name, member in BotClient.__dict__.items()
         if not name.startswith("_") and inspect.isfunction(member))
     assert methods == frozenset({
-        "events", "approvals", "approval", "approve", "reject", "retry", "poll", "cancel"})
+        "events", "approvals", "approval", "improve_run", "approve", "reject", "retry", "poll",
+        "cancel"})
 
 
 def test_bot_approval_passes_an_explicit_timeout_without_changing_the_default(tmp_path, monkeypatch):
