@@ -1,6 +1,6 @@
 # 改善 mission の開始・終了通知 (Discord) 設計書
 
-**版:** v0.8 (T1b 実装レビューの反映: outbox を tick ごとにも走らせ emit 失敗を固定語で記録、report の `failed` 列と複数段の読み方、DTO を `floor.stages[]` に)
+**版:** v0.9 (T2 実装レビューの反映: 本文 2000 字超の短縮本文、floor を描く条件と stages の形式不正の扱い、GET は gate worker と別 thread)
 
 **対象:** `improve-start-and-result-to-discord` (追加要望 2 点を含む)
 
@@ -179,6 +179,8 @@ plugin <name> (strategy) / 承認 #26
 
 この全文は AC-1 の完全一致 test の対象 (5 結果 + 開始 × 取得失敗)。
 
+**本文が 2000 字を超えるとき**: 変数部分 (backend / model / pair / kind / plugin 名) は escape 後に各 64 字で切る (観察文は従来どおり 300 字)。それでも組み立てた本文が 2000 字を超えるときは、1 行目 (見出し) と固定の 1 行 `(本文を省略)` だけを投稿する。Discord が 400 を返して同じ event を再送し続け、cursor が進まなくなることを避けるため。
+
 ## 3. 秘密と遮断
 
 通知は人間だけに届く経路である。agent への戻り経路を持たないことを、データの流れで示す。
@@ -352,6 +354,8 @@ parser は `_render_floor_report_detail` と同じ module に置き、render →
 | `floor.stages[].pairs[].pf` / `avg_r` | 浮動小数 または null | 表の値そのまま (丸めは表示側)。レポートの `None` は null。`nan` / `inf` / 空欄はレポートごと形式不正 |
 | `floor.stages[].pairs[].evaluable` | 真偽値 | `True` / `False` だけ |
 
+**bot / notify が floor を描く条件** (daemon が守る契約を受け側でも確かめる): `snapshot.result_code=gate_failed` かつ `snapshot.reason_code=unprofitable` かつ `report_state=published` のときだけ。それ以外で `floor` が非 null でも捨てる (数値を出さない)。`floor.stages` の形式不正は **floor だけ**を捨て、見出し・所要・tool 回数など detail の残りは生かす: `stages` が空、段の順序が `in_sample` → `holdout` でない、段の重複、段の `pairs` が空、pair 名が `^[A-Z0-9_]{3,16}$` に合わない。「空の `stages`」は「床未達の数値なし」と同じ扱い。型そのものが違う応答 (floor が object でない、`stages` が配列でない、pair 行の型違反) は従来どおり detail 全体を不正とする。
+
 404 (`NOT_FOUND`) は mission が存在しない、または `missions.loop` が `improve` でないときだけ。応答にパス・例外の文面・鍵は含まれない。
 
 ### 4.7 afx-ops
@@ -361,6 +365,7 @@ afx-ops は `agentic_fx` を import しない独立 package で、event の検�
 - **検証 (`notify/payload.py`、bot と notify が共有)**: `state` ∈ {started, finished}、`trigger` ∈ {manual, scheduled}、`result_code` は 5 値の列挙か null、`reason_code` は文法 `[a-z][a-z0-9_]{0,31}` か null、`tool_calls` は 0〜1,000,000 の整数 (bool 不可) か null。reason_code を列挙で照合しない (取引 event の型に倣うと、daemon が語を足した直後に未知の語で `PayloadError` となり、cursor が進まず全 event の配送が止まるため)。
 - **表示ラベルの表**: §2.2 の見出しの表を `gate/render.py` に定数として置く (`web/render.py` の「daemon 側の定義と同じ」の先例)。表に無い `(result_code, reason_code)` は §2.2 の「上記以外」の行、未知の `result_code` は `[改善] 終了 #<id>` で描画する (止まらない)。未知の reason は escape して括弧内にそのまま出す。
 - **語の一致の確認 (daemon → afx-ops の 1 方向)**: afx-ops は同じリポジトリ (`afx-ops/afx_ops/gate/render.py`) にあるので、daemon 側の test がそのファイルを読み (`ast` で定数のリテラルを評価する。import しない)、(1) afx-ops の表のキーがすべて daemon の許可対に入っていること、(2) daemon 側が「専用の見出しを持つ対」として宣言した集合 (`improve_notice_codes.PAIRS_WITH_DEDICATED_HEADING`) がすべて afx-ops の表にあることを確かめる。
+- **文法に反する改善 event**: bot / notify とも、その event だけを固定語 (`improve_event_invalid event=<id>`) を stderr に残して確定し、後続の event の配送を止めない。改善 event の形の不正が承認通知を巻き込まないため。改善以外の event の形の不正は従来どおり停止する。
 - bot: `improve_run_changed` の template (§2)、`improve_notices` の設定、BotClient (`api_client.py`) の新しい GET method (承認の plugin 名補完と同じ型。要求全体の 3 秒 deadline、失敗時は §2.4 の全文)。`EventPlan.allow_mentions=False`。
 - notify: 未知 code で止まらないよう、新 code を allowlist に足し、`deliver_improve_events` (既定 false、cursor は進める) を取引 event と同じ型で足す。webhook に送る場合も fields の固定語だけ。
 - web: 無変更 (event 一覧が未知 code で落ちないことだけ確認する)。
@@ -368,6 +373,8 @@ afx-ops は `agentic_fx` を import しない独立 package で、event の検�
 ### 4.8 配備順と再起動
 
 取引通知と同じ。**afx-ops (bot / notify) を先に配って再起動 → daemon を再起動して emitter を有効にする。** 逆順だと、新 code を読んだ旧 bot / notify が停止する。以後は daemon が語を足しても afx-ops の再配備は要らない (§4.7 の文法検証。見出しは括弧内に出るだけで、専用の見出しを足したいときだけ afx-ops を更新する)。daemon の再起動は mission の実行中を避ける (走行中の mission は再起動で中断され、中断は §4.4 の回収で `interrupted` として通知される)。rollback は `notify.improve_events: false` → daemon 再起動 → bot / notify が追いついてから afx-ops を戻す。`improve_notices` は bot の再起動で反映される。
+
+bot の詳細取得 (GET、最大 3 秒待つ) は、承認ボタンの処理と gate の状態を扱う gate worker (1 thread) とは**別の thread** (改善通知専用、1 thread) で待つ。gate worker は文面の組立て (ms 単位) だけを担い、GET の待ちで承認ボタンの 3 秒 ack を遅らせない。要求全体の deadline は socket を使う admission の各段にも残り時間として渡す。socket を使わない lock device の検査だけは deadline の外で、合計の上限は 3 秒にその検査の所要を足したもの。
 
 ## 5. 受入
 
@@ -426,3 +433,4 @@ T1a → T1b は順序あり (T1b は T1a の定数と snapshot を使う)。T1b 
 | 2026-10-25 | v0.6 | plugin gate の隔離不能を `gate_failed/gate_sandbox_unavailable` に (backlog を消費する実挙動と一致させる。strategy gate の `failed/sandbox_unavailable` と区別。§4.2)、`improve_notice_codes` を `agentic_fx/improve_notice_codes.py` に (§4.1)、`_finalize_report_or_observation` は `choice` のみを受け notice は `choice.notice` から導出、未知 artifact は `risk_gate_unsupported` に倒す (§4.2・AC-5)、質検査の防御枝 `candidate_identity_unavailable` を `unverified` に引く (§4.2・AC-5) | T1a 実装レビュー (/code-review high + codex r1、詳細 `tmp/review-discord/reports/t1a/t1a-rulings.md`) | |
 | 2026-10-25 | v0.7 | GET `/v1/improve/runs/{id}` の応答 DTO (キー名・型・null の条件) を表で確定 (§4.6) | T1b 実装で DTO を確定 (T2 との契約) | |
 | 2026-10-26 | v0.8 | §4.4: outbox を起動時に加えて scheduler の tick ごとにも走らせる、emit 失敗の固定語 `improve_notice_emit_failed` と接続の作り直し、終端確認は emit と同じ接続、7 日窓は SQL。§4.6 / §2.2: report の表に `failed` 列 (段ごと・pair ごと)、複数段を段ごとに読む、旧形式 (`failed` 列なし) は従来の 1 段規則、DTO を `floor.stages[]` に (`floor.stage` / `floor.pairs` は廃止)、警告の固定語に mission と reason、読取を ops lane 内に。§4.6 の DTO 例・AC-2・AC-8 を追従 | T1b 実装レビュー (/code-review high、詳細 `tmp/review-discord/reports/t1b/t1b-rulings.md`) | |
+| 2026-10-26 | v0.9 | §2.4: 本文が 2000 字を超えるときは見出し + `(本文を省略)`、変数部分は各 64 字で切る。§4.6: floor を描く条件 (`gate_failed` / `unprofitable` / `published`)、stages の形式不正は floor だけ捨てる (空 stages は数値なし)。§4.8: GET は gate worker と別 thread、deadline は socket を使う admission 段にも渡す (lock device の検査は外)、§4.7: 文法に反する改善 event は skip して確定 | T2 実装レビュー (/code-review high + codex r1、詳細 `tmp/review-discord/reports/t2/t2-rulings.md`) | |
