@@ -1,7 +1,7 @@
 ---
 id: ctl-improve-repeat-duration-and-oneoff-comment
 title: afx ctl improve に繰り返し実施期間 (-t) と一時的な指示 (-c) を足す
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 機能
 opened: 2026-10-25
@@ -10,7 +10,7 @@ related: [improve-feedback-structure, improve-run-summary-for-humans, improve-st
 ---
 # [ctl-improve-repeat-duration-and-oneoff-comment] afx ctl improve に繰り返し実施期間 (-t) と一時的な指示 (-c) を足す
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -35,3 +35,4 @@ related: [improve-feedback-structure, improve-run-summary-for-humans, improve-st
 
 - 2026-10-25: 起票。
 - 2026-10-25: 時間単位 (h/m)、最長期間 24h、オプション案 (-t / -c / -n) を追記。
+- 2026-10-26: 状態: 実装中 — 2026-10-26 設計 C0 v0.4 閉鎖 (sol r1 17 → v0.2 → sol r2 12 → v0.3 → sol r3 差分 3 → v0.4、指揮者の差分検収で閉鎖)。§8 の 6 件はユーザー裁定済。実装 T1 着手
