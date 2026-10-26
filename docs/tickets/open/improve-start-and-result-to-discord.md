@@ -1,7 +1,7 @@
 ---
 id: improve-start-and-result-to-discord
 title: improve の開始と結果を Discord に通知する
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-10-25
 closed: null
@@ -9,7 +9,7 @@ related: [improve-run-summary-for-humans, bot-event-notices-are-raw-log-lines]
 ---
 # [improve-start-and-result-to-discord] improve の開始と結果を Discord に通知する
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -32,3 +32,4 @@ related: [improve-run-summary-for-humans, bot-event-notices-are-raw-log-lines]
 
 - 2026-10-25: 起票。
 - 2026-10-25: ユーザー要望を追加 (mission_observation の文と gate_failed の拒否理由・落ちた段の数値を通知に出す)。
+- 2026-10-26: 状態: 実装中 — 2026-10-26 main に merge (2fafa785、spec v0.9)。残り: 配備 (afx-ops 再起動 → daemon 再起動) と本機観測 (afx ctl improve 1 回で Discord に開始・終了の 2 通)
