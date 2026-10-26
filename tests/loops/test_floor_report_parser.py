@@ -10,8 +10,8 @@ from agentic_fx.loops.improve_loop import ImproveLoop, parse_floor_report
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "improve_reports"
 KEYS = ImproveLoop._FLOOR_REPORT_METRIC_KEYS
-HEADER = "| pair | " + " | ".join(KEYS) + " |"
-SEPARATOR = "|---" * (len(KEYS) + 1) + "|"
+HEADER = "| pair | " + " | ".join(KEYS + ("failed",)) + " |"
+SEPARATOR = "|---" * (len(KEYS) + 2) + "|"
 MID = 2043
 
 
@@ -43,10 +43,20 @@ def _render(loop, in_sample, holdout, mission_id=MID):
         in_sample_metrics=in_sample, holdout_metrics=holdout), mission_id)
 
 
+def _rows(stage):
+    return [(p.pair, p.trades, p.pf, p.avg_r, p.evaluable) for p in stage.pairs]
+
+
+def _stages(detail):
+    return None if detail is None else [(s.stage, _rows(s)) for s in detail.stages]
+
+
 def _summary(detail):
-    return None if detail is None else (
-        detail.stage, [(p.pair, p.trades, p.pf, p.avg_r, p.evaluable)
-                       for p in detail.pairs])
+    """1 段だけ落ちたレポートの (段, 行)。"""
+    if detail is None:
+        return None
+    assert len(detail.stages) == 1
+    return (detail.stages[0].stage, _rows(detail.stages[0]))
 
 
 # ---- 往復 ----
@@ -88,10 +98,46 @@ def test_roundtrip_none_pf_and_avg_r_become_none(strict_loop):
         "holdout", [("USDJPY", 5, None, None, False)])
 
 
-def test_roundtrip_both_stages_failing_is_rejected(loop_min):
-    text = _render(loop_min, {"USDJPY": _m(pf=0.5)}, {"USDJPY": _m(pf=0.5)})
+def test_roundtrip_both_stages_failing_returns_each_stage_with_its_own_failed_pairs(loop_min):
+    in_sample = {"USDJPY": _m(trades=31, pf=0.5), "EURUSD": _m(trades=32, pf=1.4)}
+    holdout = {"USDJPY": _m(trades=11, pf=1.4), "EURUSD": _m(trades=12, pf=0.6)}
+    text = _render(loop_min, in_sample, holdout)
     assert "failed_stage: in_sample, holdout" in text
-    assert parse_floor_report(text, mission_id=MID) is None
+    assert _stages(parse_floor_report(text, mission_id=MID)) == [
+        ("in_sample", [("USDJPY", 31, 0.5, 0.2, True)]),
+        ("holdout", [("EURUSD", 12, 0.6, 0.2, True)])]
+
+
+def test_rendered_tables_carry_a_failed_column_per_pair_and_stage(loop_min):
+    in_sample = {"USDJPY": _m(pf=0.5), "EURUSD": _m()}
+    text = _render(loop_min, in_sample, {"USDJPY": _m(), "EURUSD": _m(pf=0.6)})
+    assert text.count(HEADER) == 2
+    in_part, _, hold_part = text.partition("### holdout")
+    assert [l.rsplit(" | ", 1)[1] for l in in_part.split("\n") if l.startswith("| ")
+            and "pair" not in l] == ["True |", "False |"]
+    assert [l.rsplit(" | ", 1)[1] for l in hold_part.split("\n") if l.startswith("| ")
+            and "pair" not in l] == ["False |", "True |"]
+
+
+def test_legacy_report_without_failed_column_still_reads_one_stage():
+    text = _real("improve-2026-10-25-2043.md")
+    assert "failed" not in text.split("## Profitability floor detail")[1].split("thresholds")[1]
+    assert _stages(parse_floor_report(text, mission_id=2043)) == [
+        ("holdout", [("USDJPY", 13, 1.8458377992140615, 0.3029234868346611, False)])]
+
+
+def test_legacy_report_with_two_stages_is_rejected():
+    text = _real("improve-2026-10-25-2043.md").replace(
+        "failed_stage: holdout", "failed_stage: in_sample, holdout")
+    assert parse_floor_report(text, mission_id=2043) is None
+
+
+def test_failed_column_must_agree_with_failed_pairs(loop_min):
+    text = _render(loop_min, {"USDJPY": _m(), "EURUSD": _m()},
+                   {"USDJPY": _m(pf=0.5), "EURUSD": _m()})
+    assert parse_floor_report(text, mission_id=MID) is not None
+    assert parse_floor_report(text.replace("failed_pairs: USDJPY", "failed_pairs: EURUSD"),
+                              mission_id=MID) is None
 
 
 def test_reason_and_thresholds_lines_do_not_change_the_output(loop_min):
@@ -133,8 +179,9 @@ def _base(loop):
                    {"USDJPY": _m(trades=13, pf=0.9, avg_r=-0.1, evaluable=True)})
 
 
-def _row(pair="USDJPY", trades="13", pf="0.9", avg_r="-0.1", evaluable="True"):
-    cells = [pair, trades, pf, "0.5", avg_r, "0.05", "100.0", "0", evaluable]
+def _row(pair="USDJPY", trades="13", pf="0.9", avg_r="-0.1", evaluable="True",
+         failed="True"):
+    cells = [pair, trades, pf, "0.5", avg_r, "0.05", "100.0", "0", evaluable, failed]
     return "| " + " | ".join(cells) + " |"
 
 
@@ -157,6 +204,10 @@ def _replace_holdout_row(text, new):
     lambda t: t.replace("failed_stage: holdout", "failed_stage: "),
     lambda t: t.replace("failed_stage: holdout", "failed_stage: in_sample, holdout"),
     lambda t: t.replace("failed_stage: holdout", "failed_stage: in_sample,holdout"),
+    lambda t: t.replace("failed_stage: holdout", "failed_stage: holdout, holdout"),
+    lambda t: _replace_holdout_row(t, _row(failed="true")),
+    lambda t: _replace_holdout_row(t, _row(failed="")),
+    lambda t: _replace_holdout_row(t, _row(failed="False")),
     lambda t: t.replace("failed_stage: holdout", "failed_stage: weekly"),
     lambda t: t.replace("failed_pairs: USDJPY", "failed_pairs: "),
     lambda t: t.replace("failed_pairs: USDJPY", "failed_pairs: usdjpy"),
@@ -170,6 +221,7 @@ def _replace_holdout_row(text, new):
     lambda t: t.replace("### holdout", "### holdout_x"),
     lambda t: t.replace(HEADER, HEADER.replace("pf", "pf2")),
     lambda t: t.replace(HEADER, HEADER.replace("| avg_r", "| avg_r | extra")),
+    lambda t: t.replace(HEADER, HEADER.replace("| failed", "| fail")),
     lambda t: t.replace(SEPARATOR, SEPARATOR[:-4] + "|"),
     lambda t: t.replace(SEPARATOR, SEPARATOR.replace("---", "--", 1)),
     lambda t: t.rpartition("### holdout")[0],
@@ -250,4 +302,5 @@ def test_parse_is_pure_and_does_not_raise_on_garbage():
 
 def test_values_are_finite_floats():
     detail = parse_floor_report(_real("improve-2026-10-25-2043.md"), mission_id=2043)
-    assert all(isinstance(p.pf, float) and math.isfinite(p.pf) for p in detail.pairs)
+    assert all(isinstance(p.pf, float) and math.isfinite(p.pf)
+               for st in detail.stages for p in st.pairs)

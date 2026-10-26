@@ -29,24 +29,22 @@ if TYPE_CHECKING:
     from agentic_fx.activity import ActivityLog
     from agentic_fx.config import Settings
     from agentic_fx.core.contracts import Clock
-    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.loops.improve_loop import ImproveLoop, ImprovePrepareFailed
 
 _log = logging.getLogger("agentic_fx.improve_supervisor")
 
 _MAX_SPAWN_ATTEMPTS = 2  # 初回 + 再試行 1 回 (設計書 §3.1 手順⑥)
 
 
-def _mission_id_of(ctx) -> int:
-    return ctx if isinstance(ctx, int) else ctx.mission_id
-
-
 class _NoticeEmitter:
     """改善 mission の開始・終了 event を出す唯一の場所。
 
     ops service の event store は使わず、`db_path` から専用の書込み接続と
-    `EventStore` を作る (supervisor は ops service より先に作られる)。emit は lock で
-    直列化する (週次は並列に終端し得る)。`enabled` が偽なら接続も作らず何もしない。
-    どの経路も `Exception` を呼び出し側へ出さない。技術ログへは固定語だけを書く。"""
+    `EventStore` を作る (supervisor は ops service より先に作られる)。emit と終端確認は
+    同じ lock の下で、同じ接続を使う (週次は並列に終端し得る)。`enabled` が偽なら接続も
+    作らず何もしない。どの経路も `Exception` を呼び出し側へ出さない。技術ログへは固定語だけを
+    書く。emit が通らなかったときは接続を捨て、次回に開き直す。取りこぼした finished は
+    ops service の outbox 掃き出しが拾う。"""
 
     def __init__(self, *, db_path: Path, clock: "Clock", enabled: bool) -> None:
         self._db_path = db_path
@@ -57,25 +55,31 @@ class _NoticeEmitter:
         self._store = None
         self._closed = False
 
-    def started(self, ctx, trigger: str) -> None:
-        if not self._enabled:
-            return
-        self._emit(_mission_id_of(ctx), {
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def started(self, mission_id: int, trigger: str) -> None:
+        self._emit(mission_id, {
             "state": "started", "trigger": trigger, "result_code": None,
             "reason_code": None, "tool_calls": None})
 
-    def finished(self, ctx) -> None:
+    def finished(self, mission_id: int,
+                 exc: "ImprovePrepareFailed | None" = None) -> None:
         """終端 snapshot から `finished` を作る。mission が終端していなければ出さない。
 
-        `ctx` は mission id か、`mission_id` を持つ実行文脈。"""
+        `exc` は prepare が Tx-0 の後で失敗し、補償で終端した場合の原因。"""
         if not self._enabled:
             return
-        mission_id = _mission_id_of(ctx)
         try:
-            row = self._terminal_snapshot(mission_id)
+            with self._lock:
+                if self._closed:
+                    return
+                row = self._terminal_snapshot(mission_id)
         except Exception:  # noqa: BLE001 — 例外の文面は記録しない
             _log.warning("improve_notice_skipped reason=read_failed mission=%s",
                          mission_id)
+            self._drop_connection()
             return
         if row is None:
             _log.warning("improve_notice_skipped reason=not_terminal mission=%s",
@@ -96,39 +100,59 @@ class _NoticeEmitter:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _drop_connection(self) -> None:
+        with self._lock:
+            conn, self._conn, self._store = self._conn, None, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _ensure_store(self):
+        # lock を持って呼ぶ。接続は初回と、捨てた後にだけ開く。
+        from agentic_fx.ops.events import EventStore
+        if self._store is None:
+            self._conn = db_mod.connect(self._db_path)
+            self._store = EventStore(self._conn, wall_clock=self._clock.now)
+        return self._store
+
     def _terminal_snapshot(self, mission_id: int):
-        # 別の読取接続で、呼ばれた時点の DB を見る。mission が running でなく、run が
-        # 終端し、snapshot がある、の 3 つが揃ったときだけ行が返る。
-        conn = db_mod.connect_readonly(self._db_path)
-        try:
-            return conn.execute(
-                "SELECT n.trigger,n.result_code,n.reason_code,n.tool_calls "
-                "FROM improve_run_notices n "
-                "JOIN missions m ON m.id=n.mission_id AND m.status != 'running' "
-                "JOIN improvement_runs r ON r.mission_id=n.mission_id "
-                "AND r.finished_at IS NOT NULL "
-                "WHERE n.mission_id=? LIMIT 1", (mission_id,)).fetchone()
-        finally:
-            conn.close()
+        # lock を持って呼ぶ。emit と同じ接続で、呼ばれた時点の DB を見る。mission が
+        # running でなく、run が終端し、snapshot がある、の 3 つが揃ったときだけ行が返る。
+        self._ensure_store()
+        return self._conn.execute(
+            "SELECT n.trigger,n.result_code,n.reason_code,n.tool_calls "
+            "FROM improve_run_notices n "
+            "JOIN missions m ON m.id=n.mission_id AND m.status != 'running' "
+            "JOIN improvement_runs r ON r.mission_id=n.mission_id "
+            "AND r.finished_at IS NOT NULL "
+            "WHERE n.mission_id=? LIMIT 1", (mission_id,)).fetchone()
 
     def _emit(self, mission_id: int, fields: dict) -> None:
         if not self._enabled:
             return
-        from agentic_fx.ops.events import IMPROVE_CODE, EventSchemaError, EventStore
+        from agentic_fx.ops.events import IMPROVE_CODE, EventSchemaError
+        failed = False
         try:
             with self._lock:
                 if self._closed:
                     return
-                if self._store is None:
-                    self._conn = db_mod.connect(self._db_path)
-                    self._store = EventStore(self._conn, wall_clock=self._clock.now)
-                self._store.emit_best_effort(
+                event_id = self._ensure_store().emit_best_effort(
                     IMPROVE_CODE, f"improve:{mission_id}", fields)
+            failed = event_id is None
         except EventSchemaError:
             _log.warning("improve_notice_skipped reason=schema mission=%s", mission_id)
+            return
         except Exception:  # noqa: BLE001
             _log.warning("improve_notice_skipped reason=emit_failed mission=%s",
                          mission_id)
+            self._drop_connection()
+            return
+        if failed:
+            _log.warning("improve_notice_emit_failed mission=%s state=%s",
+                         mission_id, fields["state"])
+            self._drop_connection()
 
 
 class ImproveSupervisor:
@@ -249,7 +273,7 @@ class ImproveSupervisor:
                     "launch compensation failed for manual mission_id=%s",
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "launch")
-            self._notices.finished(ctx)
+            self._notify_finished(ctx)
             raise
         try:
             self._improve_loop.commit(
@@ -267,9 +291,9 @@ class ImproveSupervisor:
                     "commit compensation failed for manual mission_id=%s",
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "commit")
-            self._notices.finished(ctx)
+            self._notify_finished(ctx)
             raise
-        self._notices.finished(ctx)
+        self._notify_finished(ctx)
         return ctx.mission_id
 
     def _prepare(self, **kwargs):
@@ -281,15 +305,21 @@ class ImproveSupervisor:
             prepared = self._improve_loop.prepare(**kwargs)
         except ImprovePrepareFailed as exc:
             # 補償済みの mission は終端している。開始は出さず、終了だけ出す。
-            self._notices.finished(exc)
+            self._notices.finished(exc.mission_id, exc)
             if exc.__cause__ is not None:
                 raise exc.__cause__
             raise
         trigger = (improve_notice_codes.TRIGGER_MANUAL
                    if kwargs.get("slot_key") is None
                    else improve_notice_codes.TRIGGER_SCHEDULED)
-        self._notices.started(prepared[1], trigger)
+        if self._notices.enabled:
+            self._notices.started(prepared[1].mission_id, trigger)
         return prepared
+
+    def _notify_finished(self, ctx) -> None:
+        # 通知が無効なときは ctx に触れない。
+        if self._notices.enabled:
+            self._notices.finished(ctx.mission_id)
 
     def _record_compensation_failed(self, mission_id, phase: str) -> None:
         """補償の失敗を activity に残す。記録に失敗しても何も送出しない
@@ -440,7 +470,7 @@ class ImproveSupervisor:
                     self._improve_loop.compensate_launch_failure(
                         ctx=ctx, now=self._clock.now())
                 finally:
-                    self._notices.finished(ctx)
+                    self._notify_finished(ctx)
                 raise
             if (reached_running or result.status == "completed"
                     or getattr(result, "refused", False)):
@@ -461,9 +491,9 @@ class ImproveSupervisor:
                             ctx=ctx, now=self._clock.now(), exc=exc,
                             slot_terminalize=True, tool_calls=result.tool_calls)
                     finally:
-                        self._notices.finished(ctx)
+                        self._notify_finished(ctx)
                     raise
-                self._notices.finished(ctx)
+                self._notify_finished(ctx)
                 return
             # pre-ready 失敗 (on_ready 未到達) — I2b: 巻き戻し
             # (`_handle_pre_ready_failure`) は `commit()` より**前**に完了
@@ -485,9 +515,9 @@ class ImproveSupervisor:
                         ctx=ctx, now=self._clock.now(), exc=exc,
                         slot_terminalize=False, tool_calls=result.tool_calls)
                 finally:
-                    self._notices.finished(ctx)
+                    self._notify_finished(ctx)
                 raise
-            self._notices.finished(ctx)
+            self._notify_finished(ctx)
             if not should_retry:
                 return
             if self._stop_event.is_set():

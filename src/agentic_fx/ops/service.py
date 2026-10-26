@@ -829,19 +829,19 @@ class OpsService:
                 approval = self._conn.execute(
                     "SELECT id,kind,payload_json FROM approval_requests WHERE id=?",
                     (notice["approval_id"],)).fetchone()
+            report_state = run["report_state"] if run is not None else "none"
+            floor = None
+            if (notice is not None and run is not None
+                    and (notice["result_code"], notice["reason_code"])
+                    == ("gate_failed", "unprofitable")):
+                floor = self._floor_of(mission_id, report_state, run["report_path"])
         from agentic_fx.loops.approval_facts import display_text
-        report_state = run["report_state"] if run is not None else "none"
         snapshot = None
         if notice is not None:
             snapshot = {
                 "trigger": notice["trigger"], "result_code": notice["result_code"],
                 "reason_code": notice["reason_code"], "tool_calls": notice["tool_calls"],
                 "observation_text": _notice_text(notice["observation_text"])}
-        floor = None
-        if (notice is not None and run is not None and report_state == "published"
-                and (notice["result_code"], notice["reason_code"])
-                == ("gate_failed", "unprofitable")):
-            floor = self._floor_of(mission_id, run["report_path"])
         return {"id": mission_id,
                 "backend": display_text(mission["runner"]),
                 "model": display_text(mission["model"]),
@@ -851,47 +851,64 @@ class OpsService:
                 "approval": _approval_of(notice, approval),
                 "floor": floor}
 
-    def _floor_of(self, mission_id: int, report_path: object) -> dict | None:
-        """公開済み床未達レポートの数値。読めない・形式不正はすべて None (理由は出さない)。"""
-        if self._improve_reports_dir is None or not isinstance(report_path, str):
-            return None
+    def _floor_of(self, mission_id: int, report_state: str,
+                  report_path: object) -> dict | None:
+        """公開済み床未達レポートの数値。読めないときは None で、理由は固定語だけを警告に残す
+        (path・数値・例外文面は出さない)。ops lane の中で呼ぶ。"""
         from agentic_fx.loops.improve_loop import parse_floor_report
         from . import safe_open
-        try:
-            text = safe_open.read_improve_report(
-                self._improve_reports_dir, mission_id, report_path).decode("utf-8")
-            detail = parse_floor_report(text, mission_id=mission_id)
-        except Exception:  # noqa: BLE001 — 理由もパスも応答・ログに出さない
-            detail = None
+        from .change_limits import TOO_LARGE, UNAVAILABLE
+        reason = None
+        detail = None
+        if report_state != "published":
+            reason = "unpublished"
+        elif self._improve_reports_dir is None or not isinstance(report_path, str):
+            reason = "missing"
+        else:
+            try:
+                text = safe_open.read_improve_report(
+                    self._improve_reports_dir, mission_id, report_path).decode("utf-8")
+            except safe_open.SourceError as exc:
+                reason = {UNAVAILABLE: "missing", TOO_LARGE: "oversized"}.get(
+                    exc.code, "unsafe")
+            except Exception:  # noqa: BLE001
+                reason = "unsafe"
+            else:
+                detail = parse_floor_report(text, mission_id=mission_id)
+                if detail is None:
+                    reason = "malformed"
         if detail is None:
-            _log.warning("improve_run floor unavailable")
+            _log.warning("improve_run floor unavailable mission=%s reason=%s",
+                         mission_id, reason)
             return None
-        return {"stage": detail.stage,
-                "pairs": [{"pair": row.pair, "trades": row.trades, "pf": row.pf,
-                           "avg_r": row.avg_r, "evaluable": row.evaluable}
-                          for row in detail.pairs]}
+        return {"stages": [
+            {"stage": stage.stage,
+             "pairs": [{"pair": row.pair, "trades": row.trades, "pf": row.pf,
+                        "avg_r": row.avg_r, "evaluable": row.evaluable}
+                       for row in stage.pairs]}
+            for stage in detail.stages]}
 
     def emit_pending_improve_notices(self, *, enabled: bool) -> int:
         """終端 snapshot を outbox として、まだ ``finished`` event が無い mission の
-        event を出す。起動時に listener を開く前に 1 回呼ぶ。出した件数を返す。
+        event を出す。起動時に listener を開く前と、scheduler の tick ごとに呼ぶ。出した件数を返す。
         ``enabled`` が偽、または失敗したときは何も出さない (失敗は固定語だけ記録)。"""
         if not enabled:
             return 0
         try:
-            return self._emit_pending_improve_notices()
+            with self._ops_lane(self._deadline(None)):
+                return self._emit_pending_improve_notices()
+        except OpsError:
+            return 0  # lane が空かなかった。次の周期に回す
         except Exception:  # noqa: BLE001
             _log.error("improve_notice_skipped reason=outbox_failed")
             return 0
 
     def _emit_pending_improve_notices(self) -> int:
         floor = _aware(self._wall_clock()) - IMPROVE_OUTBOX_WINDOW
-        pending = []
-        for row in self.events.unannounced_improve_finishes():
-            created = _parse_time(row["created_at"])
-            if created is not None and created >= floor:
-                pending.append((created, row["mission_id"], row))
+        since = floor.astimezone(timezone.utc).isoformat()
         emitted = 0
-        for _, mission_id, row in sorted(pending, key=lambda item: item[:2]):
+        for row in self.events.unannounced_improve_finishes(since=since):
+            mission_id = row["mission_id"]
             try:
                 event_id = self.events.emit_best_effort(
                     "improve_run_changed", f"improve:{mission_id}",

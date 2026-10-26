@@ -421,28 +421,80 @@ def test_unknown_mission_is_not_terminal(db_path, tmp_path, caplog):
         "improve_notice_skipped reason=not_terminal mission=424242"]
 
 
-def test_terminal_check_reads_the_database_at_emit_time_over_a_fresh_connection(
+def test_terminal_check_reads_the_database_at_emit_time_over_the_writer_connection(
         db_path, tmp_path, monkeypatch, caplog):
     sup, _ = build(db_path, tmp_path, [])
+    first = _terminal_state(db_path, tmp_path)
+    sup._notices.finished(first)  # writer 接続を開く
     mission_id = _terminal_state(db_path, tmp_path)
-    real = db_mod.connect_readonly
+    other = _REAL_CONNECT(db_path)
+    other.execute("UPDATE missions SET status='running' WHERE id=?", (mission_id,))
+    other.commit()
+    other.close()
+    monkeypatch.setattr(sup_mod.db_mod, "connect_readonly",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no read conn")))
+    with caplog.at_level(logging.DEBUG):
+        sup._notices.finished(mission_id)
+    assert [ref for ref, _ in events(db_path)] == [f"improve:{first}"]
+    assert not_terminal_records(caplog)
+
+
+def test_finished_opens_no_connection_besides_the_writer(db_path, tmp_path, monkeypatch):
+    sup, _ = build(db_path, tmp_path, [])
+    mission_ids = [_terminal_state(db_path, tmp_path) for _ in range(3)]
     opened = []
 
-    def racing(path):
-        # 確認の直前に別の接続が状態を変える。確認は現在の DB を見なければならない。
-        other = _REAL_CONNECT(path)
-        other.execute("UPDATE missions SET status='running' WHERE id=?", (mission_id,))
-        other.commit()
-        other.close()
-        conn = real(path)
+    def counting(path, *a, **k):
+        opened.append(path)
+        return _REAL_CONNECT(path, *a, **k)
+
+    monkeypatch.setattr(sup_mod.db_mod, "connect", counting)
+    monkeypatch.setattr(sup_mod.db_mod, "connect_readonly",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no read conn")))
+    for mission_id in mission_ids:
+        sup._notices.finished(mission_id)
+    assert len(events(db_path)) == 3 and len(opened) == 1
+
+
+def _fail_next_emit(monkeypatch, times=1):
+    from agentic_fx.ops.events import EventStore
+    real = EventStore.emit
+    left = [times]
+
+    def flaky(self, code, ref, fields):
+        if left[0] > 0:
+            left[0] -= 1
+            raise sqlite3.OperationalError("disk I/O error /secret/path")
+        return real(self, code, ref, fields)
+
+    monkeypatch.setattr(EventStore, "emit", flaky)
+
+
+def test_a_failed_emit_logs_one_fixed_line_and_the_next_emit_uses_a_new_connection(
+        db_path, tmp_path, monkeypatch, caplog):
+    sup, _ = build(db_path, tmp_path, [])
+    first, second = (_terminal_state(db_path, tmp_path) for _ in range(2))
+    opened = []
+
+    def counting(path, *a, **k):
+        conn = _REAL_CONNECT(path, *a, **k)
         opened.append(conn)
         return conn
 
-    monkeypatch.setattr(sup_mod.db_mod, "connect_readonly", racing)
+    monkeypatch.setattr(sup_mod.db_mod, "connect", counting)
+    _fail_next_emit(monkeypatch)
     with caplog.at_level(logging.DEBUG):
-        sup._notices.finished(mission_id)
-    assert events(db_path) == [] and len(opened) == 1
-    assert not_terminal_records(caplog)
+        sup._notices.finished(first)
+    assert [r.getMessage() for r in caplog.records
+            if "emit_failed" in r.getMessage()] == [
+        f"improve_notice_emit_failed mission={first} state=finished"]
+    assert "secret" not in caplog.text
+    assert events(db_path) == [] and sup._notices._conn is None
+    sup._notices.finished(second)
+    assert [ref for ref, _ in events(db_path)] == [f"improve:{second}"]
+    assert len(opened) == 2
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")  # 失敗した接続は閉じられている
 
 
 # ---- 設定と構造 ----

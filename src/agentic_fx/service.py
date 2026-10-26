@@ -2200,6 +2200,18 @@ def _scheduler_tick_once(app: App) -> None:
         hook()
 
 
+def _sweep_improve_notices(app: App) -> None:
+    """終端 snapshot があるのに `finished` event が無い改善 mission を、tick ごとに拾う
+    (起動時の回収と同じ関数)。失敗は tick を止めない。"""
+    if app.ops is None:
+        return
+    try:
+        app.ops.emit_pending_improve_notices(
+            enabled=app.settings.notify.improve_events)
+    except Exception:  # noqa: BLE001
+        _log.warning("improve_notice_skipped reason=sweep_failed")
+
+
 def _watchdog_tick(app: App) -> None:
     """1 回分の watchdog 監視 (上書き 3)。activity/notifier の失敗はスレッドを
     殺さない — 呼び出し元 (watchdog スレッド) 側も広い try で包む。
@@ -2544,6 +2556,8 @@ def run_service(root: Path, *, daemon: bool = False,
                     _log.exception("tick failed")
                 finally:
                     scheduler_busy.clear()
+                if not stop_event.is_set():
+                    _sweep_improve_notices(app)
                 if not stop_event.is_set():
                     try:
                         _check_watchdog_health(app, wd, stop_event)

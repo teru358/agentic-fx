@@ -154,17 +154,19 @@ class EventStore:
                     pass
         return event_id
 
-    def unannounced_improve_finishes(self) -> list[sqlite3.Row]:
+    def unannounced_improve_finishes(self, *, since: str) -> list[sqlite3.Row]:
         """終端 snapshot があるのに、同じ ref の `finished` event がまだ無い改善 mission。
 
         完了の判定は code・ref・state=finished の 3 条件すべてで行う。`started` が
-        あるだけでは完了扱いにしない。"""
+        あるだけでは完了扱いにしない。`since` (UTC の ISO 8601) より前に作られた snapshot は
+        SQL で除く。"""
         return self._conn.execute(
             "SELECT n.mission_id,n.trigger,n.result_code,n.reason_code,n.tool_calls,"
-            "n.created_at FROM improve_run_notices n WHERE NOT EXISTS ("
+            "n.created_at FROM improve_run_notices n WHERE n.created_at >= ? AND NOT EXISTS ("
             "SELECT 1 FROM ops_events e WHERE e.code='improve_run_changed' "
             "AND e.ref='improve:' || n.mission_id "
-            "AND json_extract(e.fields_json,'$.state')='finished')").fetchall()
+            "AND json_extract(e.fields_json,'$.state')='finished') "
+            "ORDER BY n.created_at,n.mission_id", (since,)).fetchall()
 
     def poll(self, *, after: int, limit: int) -> EventPage:
         if type(after) is not int or after < 0 or type(limit) is not int \

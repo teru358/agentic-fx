@@ -256,3 +256,21 @@ def test_crash_between_recovery_commit_and_emit_is_announced_next_start(ops_env)
     assert ops_env.service().emit_pending_improve_notices(enabled=True) == 1
     assert ops_env.service().emit_pending_improve_notices(enabled=True) == 0
     assert [r for r, _ in finished_refs(ops_env)] == [f"improve:{mission_id}"]
+
+
+def test_rows_outside_the_window_are_removed_by_sql_not_by_python(ops_env):
+    made(ops_env, age=timedelta(days=30))
+    made(ops_env, age=timedelta(days=9))
+    fresh = made(ops_env)
+    svc = ops_env.service()
+    fetched = []
+    original = svc.events.unannounced_improve_finishes
+
+    def spy(**kwargs):
+        rows = original(**kwargs)
+        fetched.append([row["mission_id"] for row in rows])
+        return rows
+
+    svc.events.unannounced_improve_finishes = spy
+    assert svc.emit_pending_improve_notices(enabled=True) == 1
+    assert fetched == [[fresh]]

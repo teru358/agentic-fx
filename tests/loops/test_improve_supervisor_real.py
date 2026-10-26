@@ -181,6 +181,44 @@ def test_events_are_off_when_the_switch_is_off_but_the_snapshot_is_written(impro
     assert _events(conn) == []
 
 
+def test_failed_finished_emit_is_logged_once_and_the_tick_sweep_announces_it_once(
+        improve_env, caplog):
+    import sqlite3
+    from types import SimpleNamespace
+    from agentic_fx import service as service_mod
+    from agentic_fx.ops.events import EventStore
+    app, root = improve_env
+    conn = app.conn_core
+    sup = _supervisor(app, root, _loop(app, root))
+    real = EventStore.emit
+
+    def flaky(self, code, ref, fields):
+        if fields["state"] == "finished":
+            raise sqlite3.OperationalError("database is locked")
+        return real(self, code, ref, fields)
+
+    result = MissionResult(status="completed", output=_plugin_artifact("cand"),
+                           transcript=[], tool_calls=5)
+    from tests.loops.test_improve_candidate_ledger import _indicator
+    with patch.object(EventStore, "emit", flaky), caplog.at_level(logging.WARNING):
+        mission_id = _drive(sup, result, files=_indicator())
+    assert [r.getMessage() for r in caplog.records
+            if "emit_failed" in r.getMessage()] == [
+        f"improve_notice_emit_failed mission={mission_id} state=finished"]
+    assert [f["state"] for _, f in _events(conn)] == ["started"]
+    tick_app = SimpleNamespace(
+        ops=app.ops, settings=SimpleNamespace(notify=SimpleNamespace(improve_events=True)))
+    service_mod._sweep_improve_notices(tick_app)
+    assert [f["state"] for _, f in _events(conn)] == ["started", "finished"]
+    service_mod._sweep_improve_notices(tick_app)
+    service_mod._sweep_improve_notices(tick_app)
+    assert [f["state"] for _, f in _events(conn)] == ["started", "finished"]
+    off = SimpleNamespace(
+        ops=app.ops, settings=SimpleNamespace(notify=SimpleNamespace(improve_events=False)))
+    service_mod._sweep_improve_notices(off)
+    assert len(_events(conn)) == 2
+
+
 # ---- canary ----
 
 def _sinks(app, root, caplog):
@@ -227,7 +265,7 @@ def test_secret_and_number_canaries_stay_out_of_every_sink(improve_env, caplog):
     with caplog.at_level(logging.DEBUG):
         floor_view = app.ops.improve_run(Principal.OPERATOR, floor_mission)
         obs_view = app.ops.improve_run(Principal.OPERATOR, obs_mission)
-    assert floor_view["floor"]["pairs"][0]["pf"] == float(NUMBER)
+    assert floor_view["floor"]["stages"][0]["pairs"][0]["pf"] == float(NUMBER)
     assert obs_view["snapshot"]["observation_text"]
     assert "SECRET9" not in json.dumps(obs_view) and "SECRET9" not in json.dumps(floor_view)
     assert NUMBER not in json.dumps(obs_view)

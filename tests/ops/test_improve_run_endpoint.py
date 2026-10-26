@@ -223,16 +223,17 @@ def _floor_mission(env, reports, source="improve-2026-10-25-2043.md", **kwargs):
 def test_floor_from_the_real_2043_report(ops_env, reports):
     mission_id = _floor_mission(ops_env, reports)
     assert service(ops_env, reports).improve_run(OPERATOR, mission_id)["floor"] == {
-        "stage": "holdout",
-        "pairs": [{"pair": "USDJPY", "trades": 13, "pf": 1.8458377992140615,
-                   "avg_r": 0.3029234868346611, "evaluable": False}]}
+        "stages": [{"stage": "holdout", "pairs": [
+            {"pair": "USDJPY", "trades": 13, "pf": 1.8458377992140615,
+             "avg_r": 0.3029234868346611, "evaluable": False}]}]}
 
 
 def test_floor_from_the_real_2045_report_returns_raw_floats(ops_env, reports):
     mission_id = _floor_mission(ops_env, reports, "improve-2026-10-25-2045.md")
     floor = service(ops_env, reports).improve_run(OPERATOR, mission_id)["floor"]
-    assert floor["pairs"] == [{"pair": "USDJPY", "trades": 24, "pf": 0.5145606198869912,
-                               "avg_r": -0.2772392430083411, "evaluable": False}]
+    assert floor["stages"] == [{"stage": "holdout", "pairs": [
+        {"pair": "USDJPY", "trades": 24, "pf": 0.5145606198869912,
+         "avg_r": -0.2772392430083411, "evaluable": False}]}]
 
 
 @pytest.mark.parametrize("state", ["none", "prepared", "failed"])
@@ -310,26 +311,90 @@ def test_oversized_and_non_utf8_and_malformed_reports_give_null_floor(ops_env, r
         "SELECT report_path FROM improvement_runs WHERE mission_id=?", (malformed,)
     ).fetchone()[0])
     mpath.write_text(mpath.read_text().replace("failed_stage: holdout",
-                                               "failed_stage: in_sample, holdout"))
+                                               "failed_stage: in_sample, holdout"))  # 旧形式で 2 段
     svc = service(ops_env, reports)
     for mission_id in (big, bad_utf8, malformed):
         assert svc.improve_run(OPERATOR, mission_id)["floor"] is None
 
 
-def test_report_is_read_outside_the_ops_lane(ops_env, reports, monkeypatch):
+def test_report_is_read_inside_the_ops_lane(ops_env, reports, monkeypatch):
     from agentic_fx.ops import safe_open
     svc = service(ops_env, reports)
     seen = {}
     real = safe_open.read_improve_report
 
     def spy(*args, **kwargs):
-        seen["locked"] = not svc._ops_lock._is_owned()
+        seen["locked"] = svc._ops_lock._is_owned()
         return real(*args, **kwargs)
 
     monkeypatch.setattr(safe_open, "read_improve_report", spy)
     mission_id = _floor_mission(ops_env, reports)
     assert svc.improve_run(OPERATOR, mission_id)["floor"] is not None
     assert seen == {"locked": True}
+
+
+def test_improve_run_past_its_deadline_is_a_request_timeout(ops_env, reports):
+    import threading
+    import time
+    svc = service(ops_env, reports)
+    mission_id = _floor_mission(ops_env, reports)
+    holding, release = threading.Event(), threading.Event()
+
+    def hold():
+        with svc._ops_lane(time.monotonic() + 60):
+            holding.set()
+            release.wait(30)
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    assert holding.wait(5)
+    try:
+        with pytest.raises(OpsError) as raised:
+            svc.improve_run(OPERATOR, mission_id, deadline=time.monotonic() + 0.2)
+    finally:
+        release.set()
+        thread.join(5)
+    assert raised.value.code is ErrorCode.REQUEST_TIMEOUT
+
+
+def _warnings(caplog, mission_id):
+    return [r.getMessage() for r in caplog.records
+            if "floor unavailable" in r.getMessage()]
+
+
+def _set_path(env, mission_id, path):
+    env.conn.execute("UPDATE improvement_runs SET report_path=? WHERE mission_id=?",
+                     (str(path), mission_id))
+    env.conn.commit()
+
+
+@pytest.mark.parametrize("reason", ["missing", "malformed", "oversized", "unsafe",
+                                    "unpublished"])
+def test_floor_warning_names_mission_and_a_fixed_reason(ops_env, reports, caplog,
+                                                        tmp_path, reason):
+    import logging
+    if reason == "unpublished":
+        mission_id = _floor_mission(ops_env, reports, report_state="failed")
+    else:
+        mission_id = _floor_mission(ops_env, reports)
+        path = Path(ops_env.conn.execute(
+            "SELECT report_path FROM improvement_runs WHERE mission_id=?",
+            (mission_id,)).fetchone()[0])
+        if reason == "missing":
+            path.unlink()
+        elif reason == "malformed":
+            path.write_text(path.read_text().replace("thresholds:", "limits:"))
+        elif reason == "oversized":
+            path.write_bytes(path.read_bytes() + b"x" * (64 * 1024))
+        else:
+            real = tmp_path / "real.md"
+            real.write_bytes(path.read_bytes())
+            path.unlink()
+            os.symlink(real, path)
+    with caplog.at_level(logging.WARNING):
+        assert service(ops_env, reports).improve_run(OPERATOR, mission_id)["floor"] is None
+    assert _warnings(caplog, mission_id) == [
+        f"improve_run floor unavailable mission={mission_id} reason={reason}"]
 
 
 def test_gate_failed_with_failed_publish_has_null_floor_and_unchanged_snapshot(
@@ -395,7 +460,7 @@ def test_http_round_trip(api5, ops_env):
     response = client.get(f"/v1/improve/runs/{mission_id}")
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["id"] == mission_id and data["floor"]["pairs"][0]["trades"] == 13
+    assert data["id"] == mission_id and data["floor"]["stages"][0]["pairs"][0]["trades"] == 13
     assert client.get("/v1/improve/runs/987654").status_code == 404
     assert client.get("/v1/improve/runs/abc").status_code == 400
     assert api5.client(Principal.OPS_NOTIFY).get(

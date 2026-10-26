@@ -601,9 +601,14 @@ class FloorPairRow:
 
 
 @dataclass(frozen=True)
-class FloorDetail:
+class FloorStage:
     stage: str
     pairs: tuple[FloorPairRow, ...]
+
+
+@dataclass(frozen=True)
+class FloorDetail:
+    stages: tuple[FloorStage, ...]
 
 
 _FLOOR_PAIR_RE = re.compile(r"[A-Z0-9_]{3,16}")
@@ -626,7 +631,8 @@ def _floor_float(cell: str) -> float | None:
     return value
 
 
-def _floor_row(line: str, keys: tuple[str, ...]) -> FloorPairRow:
+def _floor_row(line: str, keys: tuple[str, ...]) -> tuple[FloorPairRow, bool | None]:
+    """表の 1 行。`keys` の末尾が `failed` なら、その列も読んで返す (旧形式は None)。"""
     if not (line.startswith("| ") and line.endswith(" |")):
         raise ValueError("row shape")
     cells = line[2:-2].split(" | ")
@@ -642,13 +648,19 @@ def _floor_row(line: str, keys: tuple[str, ...]) -> FloorPairRow:
     evaluable = by_key["evaluable"]
     if evaluable not in ("True", "False"):
         raise ValueError("evaluable")
+    failed: bool | None = None
+    if "failed" in by_key:
+        if by_key["failed"] not in ("True", "False"):
+            raise ValueError("failed")
+        failed = by_key["failed"] == "True"
     return FloorPairRow(
         pair=pair, trades=int(trades), pf=_floor_float(by_key["pf"]),
-        avg_r=_floor_float(by_key["avg_r"]), evaluable=evaluable == "True")
+        avg_r=_floor_float(by_key["avg_r"]), evaluable=evaluable == "True"), failed
 
 
 def _floor_table(lines: list[str], start: int, stage: str,
-                 keys: tuple[str, ...]) -> tuple[list[FloorPairRow], int]:
+                 keys: tuple[str, ...]
+                 ) -> tuple[list[tuple[FloorPairRow, bool | None]], int]:
     """`### <stage>` の見出しから表の終わりまでを読む。"""
     i = start
     while i < len(lines) and lines[i] == "":
@@ -663,17 +675,17 @@ def _floor_table(lines: list[str], start: int, stage: str,
     if lines[i:i + 2] != [header, separator]:
         raise ValueError("table columns")
     i += 2
-    rows: list[FloorPairRow] = []
+    rows: list[tuple[FloorPairRow, bool | None]] = []
     while i < len(lines) and lines[i].startswith("|"):
         rows.append(_floor_row(lines[i], keys))
         i += 1
-    if not rows or len({row.pair for row in rows}) != len(rows):
+    if not rows or len({row.pair for row, _ in rows}) != len(rows):
         raise ValueError("table rows")
     return rows, i
 
 
 def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
-    keys = tuple(ImproveLoop._FLOOR_REPORT_METRIC_KEYS)
+    metric_keys = tuple(ImproveLoop._FLOOR_REPORT_METRIC_KEYS)
     lines = text.split("\n")
     while lines and lines[-1] == "":
         lines.pop()
@@ -694,8 +706,9 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
     stage_line, pairs_line, thresholds_line = lines[i:i + 3]
     if not stage_line.startswith("failed_stage: "):
         raise ValueError("failed_stage")
-    stage = stage_line[len("failed_stage: "):]
-    if stage not in _FLOOR_STAGES:
+    stage_names = stage_line[len("failed_stage: "):].split(", ")
+    if not stage_names or any(n not in _FLOOR_STAGES for n in stage_names) \
+            or len(set(stage_names)) != len(stage_names):
         raise ValueError("failed_stage value")
     if not pairs_line.startswith("failed_pairs: "):
         raise ValueError("failed_pairs")
@@ -705,20 +718,40 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
         raise ValueError("failed_pairs value")
     if not thresholds_line.startswith("thresholds:"):
         raise ValueError("thresholds")
+    # `failed` 列の有無は in_sample 表の見出しで決める。無い旧形式は 1 段だけ読む。
+    first_header = next((line for line in lines[i + 3:] if line.startswith("| pair |")), "")
+    with_failed = first_header == "| pair | " + " | ".join(metric_keys + ("failed",)) + " |"
+    keys = metric_keys + (("failed",) if with_failed else ())
+    if not with_failed and len(stage_names) != 1:
+        raise ValueError("legacy report with several stages")
     in_sample, i = _floor_table(lines, i + 3, "in_sample", keys)
-    rows = in_sample
-    if stage == "holdout":
-        rows, i = _floor_table(lines, i, "holdout", keys)
-    present = {row.pair for row in rows}
-    if not set(failed_pairs) <= present:
+    tables = {"in_sample": in_sample}
+    if "holdout" in stage_names:
+        tables["holdout"], i = _floor_table(lines, i, "holdout", keys)
+    stages: list[FloorStage] = []
+    seen: set[str] = set()
+    for name in (n for n in _FLOOR_STAGES if n in stage_names):
+        rows = tables[name]
+        if with_failed:
+            picked = [row for row, failed in rows if failed]
+        else:
+            picked = [row for row, _ in rows if row.pair in failed_pairs]
+        if not picked:
+            raise ValueError("no failed pair in the failed stage")
+        seen.update(row.pair for row in picked)
+        stages.append(FloorStage(stage=name, pairs=tuple(picked)))
+    if stage_names != [s.stage for s in stages]:
+        raise ValueError("failed_stage order")
+    if with_failed:
+        if seen != set(failed_pairs):
+            raise ValueError("failed_pairs and failed column disagree")
+    elif not set(failed_pairs) <= {row.pair for row, _ in tables[stage_names[0]]}:
         raise ValueError("failed pair missing from the table")
-    return FloorDetail(
-        stage=stage,
-        pairs=tuple(row for row in rows if row.pair in failed_pairs))
+    return FloorDetail(stages=tuple(stages))
 
 
 def parse_floor_report(text: str, *, mission_id: int) -> FloorDetail | None:
-    """床未達レポート本文から、落ちた段の失敗 pair の数値を取り出す純関数。
+    """床未達レポート本文から、落ちた段ごとの失敗 pair の数値を取り出す純関数。
 
     形式が 1 つでも崩れていれば全体を捨てて `None` を返す (部分出力しない)。
     `reason:` と `thresholds:` の内容は値として使わない。"""
@@ -4203,13 +4236,15 @@ class ImproveLoop:
                 for pair, _msg in fail_items:
                     if pair not in failed_pairs:
                         failed_pairs.append(pair)
+            scope_failed = {pair for pair, _msg in fail_items}
             header = "| pair | " + " | ".join(
-                self._FLOOR_REPORT_METRIC_KEYS) + " |"
-            separator = "|---" * (len(self._FLOOR_REPORT_METRIC_KEYS) + 1) + "|"
+                self._FLOOR_REPORT_METRIC_KEYS + ("failed",)) + " |"
+            separator = "|---" * (len(self._FLOOR_REPORT_METRIC_KEYS) + 2) + "|"
             rows = [header, separator]
             for pair, m in per_pair.items():
                 values = [str(m.get(key, "")) for key
                           in self._FLOOR_REPORT_METRIC_KEYS]
+                values.append(str(pair in scope_failed))
                 rows.append("| " + pair + " | " + " | ".join(values) + " |")
             tables.append(f"### {scope}\n\n" + "\n".join(rows))
 
