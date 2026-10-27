@@ -2457,7 +2457,8 @@ def _log_improve_isolation_diagnostics(settings: object, root: Path,
     try:
         line = improve_admission.startup(settings, root,
                                          deadline=time.monotonic() + 10.0,
-                                         stop_event=stop_event)
+                                         stop_event=stop_event,
+                                         technical_log=lambda detail: _log.info("%s", detail))
     except Exception:  # noqa: BLE001  診断の失敗で起動を止めない
         _log.exception("improve isolation startup failed")
         return

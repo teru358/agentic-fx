@@ -181,6 +181,16 @@ def test_admission_uses_matching_invocation_and_last_valid_line():
     assert "-n" not in run.calls[0]
 
 
+def test_admission_reader_does_not_expose_the_selftest_detail_line():
+    secret = "stderr token=TOPSECRET9"
+    run = Run([Completed(stdout=_line("new", f"improve isolation: selftest detail: {secret}"))])
+
+    observed = read_admission_line(run, "new", cursor_fallback="cursor", backend="claude")
+
+    assert (observed.admitted, observed.reason_code) == ("unknown", "admission_line_timeout")
+    assert secret not in repr(observed)
+
+
 def test_admission_reads_the_last_entries_when_no_cursor_was_obtained():
     run = Run([Completed(stdout=_line("new", "improve isolation: enabled; backend=claude admitted=yes fingerprint=a"))])
     observed = read_admission_line(run, "new", cursor_fallback=None, backend="claude")

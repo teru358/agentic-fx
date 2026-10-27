@@ -33,10 +33,13 @@ import logging
 import os
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from agentic_fx.ops.redactor import redact_value
 
 from agentic_fx.core import improve_fingerprint as F
 
@@ -98,6 +101,7 @@ class AdmissionDecision:
     supported: bool = False
     retryable: bool = False
     detail: str = ""
+    selftest_detail: str = ""
 
 
 def artifact_path(settings: Any, backend: str) -> str:
@@ -281,7 +285,8 @@ class ImproveAdmission:
                 transient = isinstance(out, ProbeOutcome) and out.transient
                 detail = out.detail if isinstance(out, ProbeOutcome) else "no outcome"
                 return AdmissionDecision(False, reason, ctx.backend, fp, art,
-                                         retryable=transient, detail=detail)
+                                         retryable=transient, detail=detail,
+                                         selftest_detail=detail if reason == REASON_SELFTEST else "")
         return AdmissionDecision(True, None, ctx.backend, fp, art,
                                  detail="fingerprint is outside the supported set; "
                                         "canary and selftest passed in this process")
@@ -399,13 +404,25 @@ def choose_for_mission(settings: Any, root: Path, *, enabled: bool | None = None
                          decision=decision)
 
 
+def _selftest_detail_log_line(detail: str) -> str:
+    """自己試験 detail を技術ログ用の安全な 1 行へ整える。"""
+    folded = "".join(
+        " " if unicodedata.category(ch).startswith("C") else ch
+        for ch in detail
+    )
+    safe = " ".join(redact_value(folded).split())[:200]
+    return f"improve isolation: selftest detail: {safe}"
+
+
 def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None = None,
             host_factory: Callable[[], Any] | None = None,
             admit_unit: Callable[[], Any] | None = None,
             kernel_probe: Callable[[], F.KernelCapabilities] = F.probe_kernel,
-            stop_event: threading.Event | None = None) -> str:
-    """afx の起動時に 1 回。技術ログ用の 1 行を返す。`stop_event` は afx の停止の合図で、
-    同じ fingerprint の判定の終わりを待つ間に見る。
+            stop_event: threading.Event | None = None,
+            technical_log: Callable[[str], None] | None = None) -> str:
+    """afx の起動時に 1 回。admission の技術ログ 1 行を返す。`technical_log` があれば、
+    自己試験の不合格 detail を別行で渡す。`stop_event` は afx の停止の合図で、同じ
+    fingerprint の判定の終わりを待つ間に見る。
 
     有効なら mission cgroup host を起こし (unit の admission、afx の `supervisor/` への自己移動、
     前回の `m-*` の回収)、設定の backend を eager に判定する。無効なら読むだけの診断
@@ -443,6 +460,9 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
                    else "none")
     if choice.refusal is None:
         return f"improve isolation: enabled; backend={backend} admitted=yes fingerprint={fingerprint}"
+    if (choice.refusal == REASON_SELFTEST and choice.decision is not None
+            and technical_log is not None):
+        technical_log(_selftest_detail_log_line(choice.decision.selftest_detail))
     return (f"improve isolation: enabled; backend={backend} admitted=no "
             f"reason={choice.refusal} fingerprint={fingerprint}")
 

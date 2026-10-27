@@ -393,6 +393,92 @@ def test_enabled_startup_reports_the_decision_fingerprint(tmp_path, monkeypatch,
                       enabled=True, host_factory=StartupHost) == expected
 
 
+@pytest.mark.parametrize("retryable", [False, True])
+def test_startup_emits_a_redacted_single_line_selftest_detail(tmp_path, monkeypatch, retryable):
+    """自己試験の診断だけを技術ログの別行へ出し、admission ABI は変えない。"""
+    class StartupHost(Host):
+        def start(self, *, deadline):
+            assert deadline == 0.0
+
+    detail = "left\x01right\nstderr token=TOPSECRET9 " + "x" * 240
+    choice = IA.MissionChoice(
+        refusal=IA.REASON_SELFTEST,
+        decision=IA.AdmissionDecision(
+            False, IA.REASON_SELFTEST, "codex",
+            fingerprint=SimpleNamespace(aggregate="refused-fingerprint"),
+            retryable=retryable, detail=detail, selftest_detail=detail),
+    )
+    emitted: list[str] = []
+    monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(IA, "choose_for_mission", lambda *_args, **_kwargs: choice)
+    monkeypatch.setattr(IA, "_HOST", None)
+
+    line = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
+                      enabled=True, host_factory=StartupHost, technical_log=emitted.append)
+
+    assert line == ("improve isolation: enabled; backend=codex admitted=no "
+                    "reason=runtime_fingerprint_selftest_failed fingerprint=refused-fingerprint")
+    assert len(emitted) == 1
+    prefix = "improve isolation: selftest detail: "
+    assert emitted[0].startswith(prefix)
+    logged_detail = emitted[0][len(prefix):]
+    assert len(logged_detail) == 200
+    assert logged_detail.startswith("left right stderr token=[redacted] ")
+    assert "TOPSECRET9" not in logged_detail and "[redacted]" in logged_detail
+    assert all(not ch.isspace() or ch == " " for ch in logged_detail)
+    assert all(ord(ch) >= 32 for ch in logged_detail)
+
+
+def test_selftest_failure_keeps_its_detail_in_the_dedicated_field(tmp_path):
+    detail = "mission did not complete: status=failed reason=timeout"
+    decision = _admission(selftest=Probe(IA.ProbeOutcome(False, detail=detail))).admit(
+        backend="codex", artifact_path=str(_elf(tmp_path)), host=Host())
+
+    assert decision.detail == detail
+    assert decision.selftest_detail == detail
+
+
+def test_startup_does_not_emit_a_selftest_detail_when_admitted(tmp_path, monkeypatch):
+    class StartupHost(Host):
+        def start(self, *, deadline):
+            assert deadline == 0.0
+
+    choice = IA.MissionChoice(decision=IA.AdmissionDecision(
+        True, None, "codex", fingerprint=SimpleNamespace(aggregate="admitted-fingerprint")))
+    emitted: list[str] = []
+    monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(IA, "choose_for_mission", lambda *_args, **_kwargs: choice)
+    monkeypatch.setattr(IA, "_HOST", None)
+
+    line = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
+                      enabled=True, host_factory=StartupHost, technical_log=emitted.append)
+
+    assert line == ("improve isolation: enabled; backend=codex admitted=yes "
+                    "fingerprint=admitted-fingerprint")
+    assert emitted == []
+
+
+def test_service_writes_the_selftest_detail_only_to_technical_logs(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from agentic_fx import service
+
+    detail_line = "improve isolation: selftest detail: [redacted]"
+    admission_line = ("improve isolation: enabled; backend=codex admitted=no "
+                      "reason=runtime_fingerprint_selftest_failed fingerprint=fingerprint")
+
+    def startup(*_args, technical_log, **_kwargs):
+        technical_log(detail_line)
+        return admission_line
+
+    monkeypatch.setattr(IA, "startup", startup)
+    with caplog.at_level(logging.INFO, logger="agentic_fx.service"):
+        service._log_improve_isolation_diagnostics(object(), tmp_path)
+
+    assert [record.getMessage() for record in caplog.records] == [detail_line, admission_line]
+    assert not (tmp_path / "logs" / "activity.log").exists()
+
+
 def test_selftest_exception_is_a_failure(tmp_path):
     """自己試験の例外は通さない (canary と同じく失敗として固定 reason に入る)。"""
     def boom(ctx):
