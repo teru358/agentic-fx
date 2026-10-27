@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 142 件。完了分は closed/。
+未完了: 145 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -63,9 +63,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (123)
+## 設計待ち (126)
 
-### 不具合 (71)
+### 不具合 (72)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -96,6 +96,7 @@
 | [news-cli-distinguish-permission-from-missing-db](open/news-cli-distinguish-permission-from-missing-db.md) | 中 | 2026-10-25 | afx news が root 未解決・権限不足も「DB がありません」と出す |
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
+| [approval-base-identity-cas](open/approval-base-identity-cas.md) | 中 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -141,7 +142,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (32)
+### 機能 (34)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -175,6 +176,8 @@
 | [ctl-improve-return-on-accept](open/ctl-improve-return-on-accept.md) | 低 | 2026-10-25 | afx ctl improve は受理で返り、完了を待たない |
 | [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 低 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
 | [init-news-source-remove-on-revisit](open/init-news-source-remove-on-revisit.md) | 低 | 2026-10-25 | afx init 段 3 の再入時に入力済みのニュース源を取り消せない |
+| [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 低 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
+| [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 低 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
