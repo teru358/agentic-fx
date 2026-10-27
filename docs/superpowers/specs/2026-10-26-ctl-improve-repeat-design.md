@@ -53,7 +53,7 @@ afx ctl improve [-t|--duration <h/m>] [-c|--comment '<文>'] [-n|--max-runs <N>]
 - `-n` は 1〜24 の整数。範囲外・非整数は rc=2。
 - `-c` は §4 の文法。違反は rc=2。同じ option の重複、未知 option、値の欠落、`improve add …` との併用は rc=2 (usage)。長形式は `--duration=1h` も受ける。
 - 検査はすべて鍵を読む前・接続する前に client で行い、daemon も同じ検査を持つ (client を通らない要求が来るため)。daemon 側の違反は 400 `invalid_argument`。
-- 対話シェル (`afx ctl>`) は現行 `line.split()` で引用を解釈しない。**対話シェルだけ `shlex.split(line, posix=True)` に変える**。引用の不整合は rc=2 相当のエラーを出して shell を続ける (通常 shell と同じ引用が使える)。
+- 対話シェル (`afx ctl>`) は現行 `line.split()` で引用を解釈しない。**対話シェルの `improve` 行だけ `shlex.split(line, posix=True)` に変える** (他のコマンドは `split()` のまま。`ask what's up` のような自由文の apostrophe を壊さないため)。引用の不整合は rc=2 相当のエラーを出して shell を続ける (通常 shell と同じ引用が使える)。
 
 ### 2.2 表示と rc
 
@@ -245,7 +245,7 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 次の 6 件は製品・運用の判断で、**ユーザー裁定済 (2026-10-26「推奨で」)**。定数・文言の差し替えで変えられる。
 
 1. **失敗の停止回数: 2、枠切れ (429・usage limit・認証失効) は即停止**。一般の失敗は一度は偶然がある。2 回続けば原因が残る可能性が高い。枠切れは回復しない状態なので 1 回で止め、もう 1 mission 分を使わない。3 以上は枠を空打ちする。止まったことは `jobs get` と activity の `improve_repeat_finished` でしか分からない点が代償。
-2. **cancel の意味: 現在の mission は完走、次を始めない** (daemon の停止は別で、走行中 mission は打ち切られ `shutdown`)。mission の強制中断は Landlock 下の worker の途中終了と補償の新しい経路を作る。代償は、止めても最長 1 時間待つ。
+2. **cancel の意味: 現在の mission は完走、次を始めない** (daemon の停止も走行中 mission を打ち切らず、終了後に `shutdown`。§5.2)。mission の強制中断は Landlock 下の worker の途中終了と補償の新しい経路を作る。代償は、止めても最長 1 時間待つ。
 3. **一時指示と恒久方針の優先: 一時指示を優先** (規律は常に優先)。「今回だけ」の融通が目的で、その job の間だけ効く。
 4. **回数の上限: 24** (`-n` の最大と暗黙の上限)。1 時間 1 回なら 24h で 24 回。それ以上は枠を使い切る。変更は定数の書き換えが要る (settings にしない)。
 5. **繰り返し全体の終了通知: 出さない** (mission ごとの通知、`jobs get`、activity の固定語だけ)。通知の event を増やすと Discord 設計の契約 (`improve_run_changed`) を広げる。連続失敗の停止に気づけない場合は別チケットで足す。
@@ -275,3 +275,4 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 2026-10-26 | v0.3 C0 | repeat の判定を `-t` / `-n` に (`-c` 単独は one-shot)、受理で rc=0 と初期 `phase=waiting_slot`、gate の lock 範囲 (admission のみ、週次は claim Tx まで)、孤児 `reserved` の fail-closed 収束、`MissionOutcome` と `failure_class` の 5 段 (resource_exhausted / runner_fault の pattern)、graceful shutdown の outcome と crash-restart の区別、`CommentHolder` の明示消去と Job retention、`Zs` / `Zl` / `Zp` の拒否、controller 例外は `internal`、`finish()` の進捗保持、§8 を裁定済に、§9 を実装時確認のみに、T1 / T2 の範囲と AC 1・7・9・11・12a・13・15・17 を追従 | 設計レビュー 2 周目 (sol、詳細 `tmp/review-repeat/c0-r2-triage.md`) | |
 | 2026-10-26 | v0.4 C0 | job id を伴う受理後の終端はすべて rc=0 (rc=1 は同期拒否だけ、§2.2 と AC 17)、daemon stop 時の契約を `shutdown` outcome に統一 (DB mission は既存の補償終端、`interrupted` は起動時回収専用、§5.2)、`finish()` は lock 内で合成し進捗キーは現在の `job.result` 優先 (§5.1、AC 15 に同名キー競合 test) | 設計レビュー 3 周目 (sol 差分閉鎖確認、`tmp/review-repeat/c0-r3-out.md`) | |
 | 2026-10-27 | v0.5 C0 | 期限の正本を受理時に (slot 待ちも含む、§1・§3.2・§5.1)、daemon stop は改善 mission を打ち切らず終了後に `shutdown` outcome (§3.3・§5.2・§5.3・AC13、shutdown 挙動の変更は範囲外)、mission_worker の実体パス (§7)、`resource_exhausted` は failed / timeout のみ・行単位語境界・優先・`401 Unauthorized` 形のみ (§3.3・AC7)、週次 tick の spawn 失敗の収束と再送出 (§3.5)、gate 待ちの確認刻み (0.5 秒 / 30 秒) と時刻の採り直し (§3.5・AC9) | T1 実装とレビュー 1 周目の裁定 | |
+| 2026-10-27 | v0.5.1 | §8-2 の daemon 停止の記述を §5.2 に合わせる、対話シェルの shlex は `improve` 行だけ (§2.1) | T2 準備の食い違い D1 / D10 | |
