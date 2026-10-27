@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 146 件。完了分は closed/。
+未完了: 148 件。完了分は closed/。
 
 ## 実装中 (2)
 
@@ -63,9 +63,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (127)
+## 設計待ち (129)
 
-### 不具合 (72)
+### 不具合 (74)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -97,6 +97,8 @@
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 中 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
+| [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 中 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
+| [selftest-failure-detail-not-logged](open/selftest-failure-detail-not-logged.md) | 中 | 2026-10-27 | improve 隔離の自己試験が落ちた理由がどこにも残らない |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
