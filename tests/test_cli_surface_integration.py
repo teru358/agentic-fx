@@ -138,7 +138,7 @@ CTL_HELP = """usage: afx ctl [--as operator|approver] <操作>
   —
 
 問い合わせ・改善運用:
-  [変更] ask <質問> / improve
+  [変更] ask <質問> / improve [-t|--duration <h/m>] [-c|--comment '<文>'] [-n|--max-runs <N>]
   [変更] backlog add <idea>
   [読取] backlog list [--all] [--limit <n>]
   [変更] backlog reject|reopen|note <id>
@@ -531,7 +531,7 @@ _CTL_GRAMMAR = {
     "afx ctl jobs get <id>": (["jobs", "get", "0123456789abcdef0123456789abcdef"], "job_get"),
     "afx ctl jobs cancel <id>": (["jobs", "cancel", "0123456789abcdef0123456789abcdef"], "job_cancel"),
     "afx ctl ask <question>": (["ask", "なぜ"], "ask"),
-    "afx ctl improve": (["improve"], "improve"),
+    "afx ctl improve [-t|--duration <h/m>] [-c|--comment '<文>'] [-n|--max-runs <N>]": (["improve"], "improve"),
     "afx ctl backlog add <idea>": (["backlog", "add", "案"], "backlog_add"),
     "afx ctl backlog list [--all] [--limit <n>]": (["backlog", "list", "--all"], "backlog_list"),
     "afx ctl backlog reject <id>": (["backlog", "reject", "3"], "backlog_transition"),

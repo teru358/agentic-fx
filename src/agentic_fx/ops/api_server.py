@@ -270,6 +270,7 @@ def _route(method: str, path: str, scope: Scope, handler: str, accepted: int = 2
     return Route(method, re.compile(regex), scope, handler, accepted)
 
 
+_IMPROVE_BODY_KEYS = frozenset({"duration_sec", "max_runs", "comment"})
 _ACCEPTED_202 = frozenset({"ask", "approve", "reject", "retry", "improve"})
 _ENDPOINT_COUNT = 30
 
@@ -394,7 +395,11 @@ def _call(ops, route: Route, params: dict, request: Request, principal: Principa
             expected_last_attempt_at=body.get("expected_last_attempt_at"),
             deadline=deadline)
     if name == "improve":
-        return ops.improve(principal, key, deadline=deadline)
+        # 渡された key だけを写す。本文が空なら従来と同じ呼び出しになる。
+        for field, value in body.items():
+            if field not in _IMPROVE_BODY_KEYS or value is None:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        return ops.improve(principal, key, deadline=deadline, **body)
     if name == "backlog_add":
         return ops.add_backlog(principal, key, body.get("idea"), deadline=deadline)
     if name.startswith("backlog_"):

@@ -29,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from agentic_fx.core import improve_repeat as ir
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnknown, insert_policy,
                                           inspect_policy_file, reconcile_policy_file,
@@ -957,8 +958,10 @@ class OpsService:
 
     @staticmethod
     def _job_view(job: Job) -> dict:
+        result = job.result
         return {"id": job.id, "kind": job.kind, "state": job.state.value,
-                "result": job.result, "result_code": job.error_code}
+                "result": dict(result) if result is not None else None,
+                "result_code": job.error_code}
 
     # ------------------------------------------------------- sync mutations
 
@@ -1240,8 +1243,13 @@ class OpsService:
             job = self.jobs.cancel(job_id, principal, actor)
             if job.state is JobState.CANCELLED and job.audit_id is not None:
                 self._finish_job_audit(job, self.audit, self.events)
-            self._job_event(job, self.events)
-            return {"id": job.id, "state": job.state.value}
+            if job.state is not JobState.RUNNING:
+                # 走行中の繰り返し job は停止を要求しただけで、state は変わらない。
+                self._job_event(job, self.events)
+            response = {"id": job.id, "state": job.state.value}
+            if job.cancel_event is not None:
+                response["stop_requested"] = bool((job.result or {}).get("stop_requested"))
+            return response
 
         return self._mutate(principal, ENDPOINTS["job_cancel"], {"job_id": job_id},
                             f"job:{job_id}", action, deadline=deadline,
@@ -1307,49 +1315,138 @@ class OpsService:
         return run
 
     def improve(self, principal: Caller, idempotency_key: str, *,
-                deadline: float | None = None) -> dict:
+                deadline: float | None = None, duration_sec: int | None = None,
+                max_runs: int | None = None, comment: str | None = None) -> dict:
         _authorize(principal, "improve")
         endpoint = ENDPOINTS["improve"]
+        # 受理前の検査。違反は監査行を作らずに断る。
+        body: dict = {}
+        if duration_sec is not None:
+            if (isinstance(duration_sec, bool) or not isinstance(duration_sec, int)
+                    or not 60 <= duration_sec <= ir.MAX_DURATION_SEC):
+                raise OpsError(ErrorCode.INVALID_ARGUMENT)
+            body["duration_sec"] = duration_sec
+        if max_runs is not None:
+            try:
+                body["max_runs"] = ir.validate_max_runs(max_runs)
+            except ValueError:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
+        if comment is not None:
+            try:
+                comment = ir.normalize_comment(comment)
+            except ValueError:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
+            body["comment"] = comment
+        repeat = duration_sec is not None or max_runs is not None
         self._ensure_accepting()
         deadline = self._deadline(deadline)
         job_id = new_job_id()
+        holder = ir.CommentHolder(comment) if comment is not None else None
+        del comment
         with self._ops_lane(deadline):
             self._ensure_accepting()
-            accepted = self._accept(principal, endpoint, {}, "improve",
+            accepted = self._accept(principal, endpoint, body, "improve",
                                     key=idempotency_key, job_id=job_id)
             if isinstance(accepted, IdempotencyReplay):
+                if holder is not None:
+                    holder.clear()
                 return self._replay(accepted)
             try:
                 if self._improve_supervisor is None:
                     raise OpsError(ErrorCode.INVALID_STATE)
                 if self._restricted(principal, endpoint, deadline):
                     raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
-                job = self.jobs.enqueue_single(
-                    principal, None, "improve", self._improve_action,
-                    deadline_seconds=self.limits.improve_start_deadline_seconds,
-                    busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id,
-                    audit_id=accepted.audit_id)
+                if repeat:
+                    job = self._enqueue_repeat(principal, job_id, accepted.audit_id,
+                                               duration_sec, max_runs, holder)
+                else:
+                    job = self.jobs.enqueue_single(
+                        principal, None, "improve", self._improve_action(holder),
+                        deadline_seconds=self.limits.improve_start_deadline_seconds,
+                        busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id,
+                        audit_id=accepted.audit_id)
             except BaseException as exc:
+                if holder is not None:
+                    holder.clear()
                 code = self._map_exception(exc) or ErrorCode.INTERNAL
                 self._terminal(accepted, principal, endpoint, code.value,
                                _error_response(code))
                 raise
+            if holder is not None:
+                self._activity("IMPROVE", "improve_requested",
+                               f"repeat={'yes' if repeat else 'no'} comment=yes")
             self._start_thread(job)
             return {"job_id": job.id, "state": job.state.value}
 
-    def _improve_action(self, job: Job) -> dict:
+    def _enqueue_repeat(self, principal: Caller, job_id: str, audit_id: int,
+                        duration_sec: int | None, max_runs: int | None,
+                        holder: "ir.CommentHolder | None") -> Job:
+        # 期限は受理の時点で一度だけ決める (単調時計が判定の正本、壁時計は表示用)。
+        span = ir.MAX_DURATION_SEC if duration_sec is None else duration_sec
+        started_mono = self._monotonic()
+        wall = self._wall_clock()
+        if wall.tzinfo is None:
+            wall = wall.replace(tzinfo=timezone.utc)
+        deadline_mono = started_mono + span
+        deadline_at = (wall + timedelta(seconds=span)).astimezone(timezone.utc).isoformat()
+        initial = {"mission_id": None, "runs": 0,
+                   "max_runs": ir.MAX_RUNS if max_runs is None else max_runs,
+                   "deadline_at": deadline_at, "phase": "waiting_slot",
+                   "stop_requested": False}
+        return self.jobs.enqueue_single(
+            principal, None, "improve",
+            self._repeat_action(holder, duration_sec, max_runs, deadline_mono, deadline_at),
+            deadline_seconds=self.limits.improve_start_deadline_seconds,
+            busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id, audit_id=audit_id,
+            initial_result=initial, cancel_event=threading.Event())
+
+    def _improve_action(self, holder: "ir.CommentHolder | None" = None) -> Callable[[Job], dict]:
+        """1 回だけの improve。一時指示は holder 越しにだけ持ち、終わったら必ず消す。"""
+        def run(job: Job) -> dict:
+            try:
+                self._precheck_improve(job)
+
+                def prepared(mission_id: int) -> None:
+                    self.jobs.update_result(job, {"mission_id": mission_id})
+
+                kwargs = {"on_prepared": prepared}
+                text = holder.get() if holder is not None else None
+                if text is not None:
+                    kwargs["comment"] = text
+                mission_id = self._improve_supervisor.submit_manual(**kwargs)
+                return {"mission_id": mission_id}
+            finally:
+                if holder is not None:
+                    holder.clear()
+        return run
+
+    def _repeat_action(self, holder: "ir.CommentHolder | None", duration_sec: int | None,
+                       max_runs: int | None, deadline_mono: float,
+                       deadline_at: str) -> Callable[[Job], dict]:
+        def run(job: Job) -> dict:
+            try:
+                self._precheck_improve(job)
+                outcome = self._improve_supervisor.submit_repeat(
+                    duration_sec=duration_sec, max_runs=max_runs, comment_holder=holder,
+                    on_progress=lambda patch: self.jobs.update_result(job, patch),
+                    cancel_event=job.cancel_event,
+                    autopilot_check=lambda: self._autopilot_recheck(job),
+                    monotonic=self._monotonic, deadline_mono=deadline_mono,
+                    deadline_at=deadline_at)
+                return {"stop_reason": outcome.stop_reason, "runs": outcome.runs,
+                        "mission_id": outcome.last_mission_id}
+            finally:
+                if holder is not None:
+                    holder.clear()
+        return run
+
+    def _precheck_improve(self, job: Job) -> None:
         # 開始直前に StateStore の flock 内で autopilot を読み直す (§5)。
         if job.authenticated_principal is not ShellCaller.SHELL \
                 and self._autopilot_at_start(job):
             raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
         if self.stop_event.is_set():
             raise OpsError(ErrorCode.UNAVAILABLE)
-
-        def prepared(mission_id: int) -> None:
-            job.result = {"mission_id": mission_id}
-
-        mission_id = self._improve_supervisor.submit_manual(on_prepared=prepared)
-        return {"mission_id": mission_id}
 
     def _start_thread(self, job: Job) -> None:
         thread = threading.Thread(target=self._run_single, args=(job,),
@@ -1435,6 +1532,16 @@ class OpsService:
             return False
         return bool(self._state_store.autopilot_at_start(
             deadline=self._foreign(job.deadline_mono), stop_event=self.stop_event))
+
+    def _autopilot_recheck(self, job: Job) -> bool:
+        """繰り返しの mission ごとの開始前確認。受理から時間が経つので、呼ぶたびに
+        新しい期限で読む。読めなければ例外のまま伝え (mission を始めない)、
+        対話シェルは制限しない。"""
+        if self._state_store is None or job.authenticated_principal is ShellCaller.SHELL:
+            return False
+        deadline = self._monotonic() + self.limits.request_deadline_seconds
+        return bool(self._state_store.autopilot_at_start(
+            deadline=self._foreign(deadline), stop_event=self.stop_event))
 
     # ------------------------------------------------------------- decisions
 

@@ -13,6 +13,8 @@ from .contracts import Caller, ErrorCode, OpsError
 DECISION_QUEUE_CAPACITY = 8
 TERMINAL_RETENTION = 64
 TERMINAL_TTL_SECONDS = 3600.0
+#: 走行中の job が公開する進捗のキー。終端 result と同名でも現在の値が勝つ。
+PROGRESS_KEYS = ("phase", "stop_reason", "runs", "mission_id", "stop_requested")
 
 
 class JobState(StrEnum):
@@ -50,6 +52,8 @@ class Job:
     # 同一プロセス内の呼び出し元 (対話シェル) にだけ渡す結果。job GET には出さない。
     detail: object = None
     done: threading.Event | None = None
+    # 繰り返し job の印。走行中の cancel はこの Event を立てるだけで state は変えない。
+    cancel_event: threading.Event | None = None
 
 
 class JobRegistry:
@@ -100,8 +104,11 @@ class JobRegistry:
     def enqueue_single(self, principal: Caller, actor: str | None, kind: str,
                        action: Callable[[Job], dict], *, deadline_seconds: float,
                        busy_code: ErrorCode, job_id: str | None = None,
-                       audit_id: int | None = None) -> Job:
-        """ask / 手動 improve の 1 本枠。走行中の同種 job があれば作らない。"""
+                       audit_id: int | None = None, initial_result: dict | None = None,
+                       cancel_event: threading.Event | None = None) -> Job:
+        """ask / 手動 improve の 1 本枠。走行中の同種 job があれば作らない。
+
+        `initial_result` と `cancel_event` は job が見えるようになる lock 内で設定する。"""
         with self._lock:
             if self._closed:
                 raise OpsError(ErrorCode.UNAVAILABLE)
@@ -110,7 +117,20 @@ class JobRegistry:
             job = self._new(job_id, principal, actor, kind, action,
                             deadline_seconds=deadline_seconds, audit_id=audit_id)
             job.state = JobState.RUNNING
+            if initial_result is not None:
+                job.result = dict(initial_result)
+            job.cancel_event = cancel_event
             return job
+
+    def update_result(self, job: Job, patch: dict) -> None:
+        """進捗を重ねた新しい dict に置き換える。終端の job には何もしない。
+        停止要求は registry だけが書き、patch では下げない。"""
+        with self._lock:
+            if job.state in TERMINAL_STATES:
+                return
+            merged = dict(job.result or {})
+            merged.update({k: v for k, v in patch.items() if k != "stop_requested"})
+            job.result = merged
 
     def has_active(self, kind: str) -> bool:
         with self._lock:
@@ -130,6 +150,11 @@ class JobRegistry:
         with self._lock:
             if job.state in TERMINAL_STATES:
                 return job
+            if result is not None or job.result is not None:
+                current = job.result or {}
+                merged = {**current, **(result or {})}
+                merged.update({k: current[k] for k in PROGRESS_KEYS if k in current})
+                result = merged
             job.result, job.error_code, job.detail = result, error_code, detail
             job.state = state
             job.terminal_mono = self._monotonic()
@@ -175,7 +200,12 @@ class JobRegistry:
             if job.state in TERMINAL_STATES:
                 return job
             if job.state is JobState.RUNNING:
-                raise OpsError(ErrorCode.JOB_RUNNING)
+                if job.cancel_event is None:
+                    raise OpsError(ErrorCode.JOB_RUNNING)
+                # 繰り返し job は停止を要求するだけ。走行中の mission は完走する。
+                job.cancel_event.set()
+                job.result = {**(job.result or {}), "stop_requested": True}
+                return job
             job.state, job.terminal_mono = JobState.CANCELLED, self._monotonic()
             job.error_code = "cancelled"
         if job.done is not None:
