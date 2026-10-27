@@ -47,6 +47,9 @@ from .tail import activity_filter, tail_lines
 
 _log = logging.getLogger(__name__)
 
+#: 引数が渡されなかったことの印 (None は「渡された null」として断る)。
+_UNSET = object()
+
 
 @dataclass(frozen=True, slots=True)
 class OpsLimits:
@@ -1315,11 +1318,19 @@ class OpsService:
         return run
 
     def improve(self, principal: Caller, idempotency_key: str, *,
-                deadline: float | None = None, duration_sec: int | None = None,
-                max_runs: int | None = None, comment: str | None = None) -> dict:
+                deadline: float | None = None, duration_sec=_UNSET, max_runs=_UNSET,
+                comment=_UNSET, **unknown) -> dict:
         _authorize(principal, "improve")
         endpoint = ENDPOINTS["improve"]
-        # 受理前の検査。違反は監査行を作らずに断る。
+        # 受理前の検査。違反は監査行を作らずに断る。渡されなかった key は本文に入れない。
+        if unknown:
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        given = {k: v for k, v in (("duration_sec", duration_sec), ("max_runs", max_runs),
+                                   ("comment", comment)) if v is not _UNSET}
+        if any(v is None for v in given.values()):
+            raise OpsError(ErrorCode.INVALID_ARGUMENT)
+        duration_sec, max_runs, comment = (given.get("duration_sec"), given.get("max_runs"),
+                                           given.get("comment"))
         body: dict = {}
         if duration_sec is not None:
             if (isinstance(duration_sec, bool) or not isinstance(duration_sec, int)

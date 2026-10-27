@@ -70,7 +70,7 @@ def test_valid_bodies_reach_the_service(repeat_api, body, mode):
 
 
 @pytest.mark.parametrize("body", [
-    {"unknown": 1}, {"max_runs": 1, "extra": True}, {"max_runs": "2"}, {"max_runs": None},
+    {"unknown": 1}, {"deadline": 1}, {"principal": "x"}, {"idempotency_key": "x"}, {"max_runs": 1, "extra": True}, {"max_runs": "2"}, {"max_runs": None},
     {"max_runs": 0}, {"max_runs": 25}, {"max_runs": True}, {"duration_sec": 59},
     {"duration_sec": 86401}, {"duration_sec": "600"}, {"duration_sec": None},
     {"duration_sec": 600.5}, {"comment": 5}, {"comment": ""}, {"comment": None},
