@@ -159,6 +159,7 @@ supervisor が 1 つの admission gate (lock + 条件 + `manual_active`) を持�
   - <comment>
   ```
 - **契約 (直接経路に限る)**: **afx が入力された comment を直接永続フィールドへ書かない**。comment は daemon のメモリ (job の closure) と、各 mission の prompt にだけある。DB (`ops_requests`、idempotency 表、missions の入力側、backlog、event、snapshot)、activity、技術ログ、Discord、job の GET には書かない。冪等 key は本文の digest だけを持つ (digest は既存の作法)。activity には固定語 `comment=yes` だけ。
+- **冪等と監査の digest**: `ops_requests` / 冪等表の `body_sha256` は comment 本文を除き `has_comment` (真偽) に置き換えた本文から計算する (短い定型文は digest から推測できるため)。代償として、comment だけが違う同じ冪等 key の再送は区別されず、同じ job を返す。
 - **残余 (契約の外)**: agent が comment を出力に復唱・派生させたもの (`artifact.summary`、observation、discovery、backlog 行、提案・approval の payload、レポート) は afx の通常の保存経路で残る。mission の output / transcript は DB に保存され、CLI runner の stdout は診断 transcript に常時保存される。prompt の転記禁止文は誘導にとどまる。復唱を禁止するには全出力・transcript・report・approval 経路の情報フロー遮断が要り、prompt の注意書きでは保証できない。範囲外とし、残余として §8 に書く。prompt 本文は WorkerRunner の一時 workdir の `prompt.txt` に入り、通常は終了で消える。opencode backend は prompt を argv に渡す既存経路があり、実行中は `/proc` から見える (残余)。
 - comment は消去可能な holder (`CommentHolder`) に入れ、`Job.action` の closure は holder だけを捕捉する (本文を直接捕捉しない)。終端後の `Job` は最大 1 時間または 64 件保持されるので、controller (one-shot の `-c` では `submit_manual` の呼び出し側) の `finally` で `holder.clear()` する。job が終わる (終端、cancel、例外) と保持中の `Job` から本文へ到達できない。daemon 再起動ではメモリごと消える。
 
@@ -277,3 +278,4 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 2026-10-27 | v0.5 C0 | 期限の正本を受理時に (slot 待ちも含む、§1・§3.2・§5.1)、daemon stop は改善 mission を打ち切らず終了後に `shutdown` outcome (§3.3・§5.2・§5.3・AC13、shutdown 挙動の変更は範囲外)、mission_worker の実体パス (§7)、`resource_exhausted` は failed / timeout のみ・行単位語境界・優先・`401 Unauthorized` 形のみ (§3.3・AC7)、週次 tick の spawn 失敗の収束と再送出 (§3.5)、gate 待ちの確認刻み (0.5 秒 / 30 秒) と時刻の採り直し (§3.5・AC9) | T1 実装とレビュー 1 周目の裁定 | |
 | 2026-10-27 | v0.5.1 | §8-2 の daemon 停止の記述を §5.2 に合わせる、対話シェルの shlex は `improve` 行だけ (§2.1) | T2 準備の食い違い D1 / D10 | |
 | 2026-10-27 | v0.5.2 | `finish()` の合成規則を変更: 同名キーは終端 result、`stop_requested` だけ現在値、終端に無い進捗キーは残す (§5.1、AC 15) | T2 レビュー 1 周目 (進捗更新が握りつぶされると古い `runs` が終端に残る) | |
+| 2026-10-27 | v0.5.3 | 冪等・監査の digest から comment を除き `has_comment` に (§4) | T2 レビュー 1 周目 | |
