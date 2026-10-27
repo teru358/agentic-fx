@@ -84,6 +84,50 @@ class VerifyBackendResult:
     detail: str
 
 
+_FAILURE_GATES = frozenset({
+    "handshake", "incomplete", "nonce", "no_cli_child", "not_reaped", "spawn", "cgroup_gate",
+})
+_RESULT_STATUSES = frozenset({"completed", "failed", "timeout", "max_turns"})
+_REASON_TOKEN = re.compile(r"[a-z0-9_]+")
+_WATCH_SUMMARY = re.compile(
+    r"\Aecho_reached=(yes|no) mcp=(none|init_only|tools=[0-9]+(?: \((?:empty|uninitialized)\))?) "
+    r"call=([0-9]+) steps=([0-9]+) events=([0-9]+)(?: grace_expired)?\Z")
+_SAFE_SELFTEST_DETAIL = re.compile(
+    r"\Agate=(?:handshake|incomplete|nonce|no_cli_child|not_reaped|spawn|cgroup_gate) "
+    r"status=(?:completed|failed|timeout|max_turns) reason=(?:[a-z0-9_]+|-)"
+    r"(?: watch=echo_reached=(?:yes|no),mcp=(?:none|init_only|tools=[0-9]+(?:,\((?:empty|uninitialized)\))?),"
+    r"call=[0-9]+,steps=[0-9]+,events=[0-9]+(?:,grace_expired)?)?"
+    r"(?: unreaped=[0-9]+)?\Z")
+
+
+def selftest_failure_detail(gate: str, *, status: str, reason: object = None,
+                            watch: object | None = None,
+                            unreaped: int | None = None) -> str:
+    """Build the bounded diagnostic carried by a failed compatibility selftest."""
+    if gate not in _FAILURE_GATES:
+        raise ValueError(f"unknown selftest gate: {gate}")
+    if status not in _RESULT_STATUSES:
+        raise ValueError(f"unknown selftest status: {status}")
+    token = _REASON_TOKEN.match(reason) if isinstance(reason, str) else None
+    fields = [f"gate={gate}", f"status={status}", f"reason={token.group() if token else '-'}"]
+    if watch is not None:
+        summary = watch.summary()
+        if not isinstance(summary, str) or _WATCH_SUMMARY.fullmatch(summary) is None:
+            raise ValueError("unexpected selftest watch summary")
+        fields.append("watch=" + summary.replace(" ", ","))
+    if unreaped is not None:
+        fields.append(f"unreaped={max(0, unreaped)}")
+    return " ".join(fields)
+
+
+def selftest_detail_or_default(detail: object, *, gate: str = "incomplete",
+                               status: str = "failed") -> str:
+    """Accept only a canonical probe diagnostic; replace every other value."""
+    if isinstance(detail, str) and _SAFE_SELFTEST_DETAIL.fullmatch(detail) is not None:
+        return detail
+    return selftest_failure_detail(gate, status=status)
+
+
 def _reject_rpc(method: str) -> Callable[[dict], dict]:
     def _handler(args: dict) -> dict:
         raise RuntimeError(
@@ -487,37 +531,37 @@ def verify_backend(
         if not ready_frames:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=("mission never reached ready (handshake failed): "
-                        f"status={result.status} reason={result.reason}"))
+                detail=selftest_failure_detail("handshake", status=result.status,
+                                               reason=result.reason))
         progress = f" [{watch.summary()}]" if watch is not None else ""
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
             # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=f"mission did not complete: status={result.status} "
-                      f"reason={result.reason}{progress}")
+                detail=selftest_failure_detail("incomplete", status=result.status,
+                                               reason=result.reason, watch=watch))
         if not echoed and (result.status != "completed" or not result.output):
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=f"mission did not complete: status={result.status} "
-                      f"reason={result.reason}{progress}")
+                detail=selftest_failure_detail("incomplete", status=result.status,
+                                               reason=result.reason))
         if not echoed and result.output.get("echo") != nonce:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="mission output failed the nonce round-trip "
-                      f"(schema/nonce gate){progress}")
+                detail=selftest_failure_detail("nonce", status=result.status,
+                                               reason=result.reason))
         if backend != "local" and not watcher.saw_any_descendant():
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="no CLI child process was observed during the run "
-                      "(cli_started gate)")
+                detail=selftest_failure_detail("no_cli_child", status=result.status,
+                                               reason=result.reason))
         if backend != "local" and after_descendants:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="CLI child process(es) were not reaped after the "
-                      f"mission completed (pgid recovery gate): "
-                      f"{sorted(after_descendants)}")
+                detail=selftest_failure_detail("not_reaped", status=result.status,
+                                               reason=result.reason,
+                                               unreaped=len(after_descendants)))
 
         model = scoped_settings.runner.improve.model
         fingerprint = hashlib.sha256(

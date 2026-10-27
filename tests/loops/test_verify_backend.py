@@ -376,7 +376,24 @@ def test_verify_backend_fails_closed_when_handshake_never_reaches_ready(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "handshake failed" in result.detail
+    assert result.detail == "gate=handshake status=completed reason=-"
+
+
+def test_verify_backend_failure_detail_discards_untrusted_reason_text(tmp_path, monkeypatch):
+    """Failure diagnostics retain only the classified gate, status, and reason token."""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    unsafe = ("worker_eof stderr=token-ABC alice@example.com "
+              "https://private.invalid/v1 sk-live-credential")
+    _BEHAVIOR["current"] = {
+        "result": lambda _mission: MissionResult("failed", None, [], reason=unsafe)}
+
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                            provider=None, clock=FixedClock(NOW))
+
+    assert result.detail == "gate=incomplete status=failed reason=worker_eof"
+    assert all(value not in result.detail for value in (
+        "stderr", "alice@example.com", "https://", "sk-live-credential"))
 
 
 def test_verify_backend_fingerprint_changes_across_runs_with_identical_config(
@@ -634,7 +651,7 @@ def test_verify_backend_fails_closed_when_no_cli_descendant_is_observed(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "cli_started gate" in result.detail
+    assert result.detail == "gate=no_cli_child status=completed reason=-"
 
 
 def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
@@ -657,7 +674,7 @@ def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "pgid recovery gate" in result.detail
+    assert result.detail == "gate=not_reaped status=completed reason=- unreaped=1"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"),
@@ -869,7 +886,7 @@ def test_stop_on_echo_fails_without_tools_list(tmp_path, monkeypatch):
     _BEHAVIOR["current"] = {"events": events, "final": ok_output}
     result = _run_stop_on_echo(tmp_path)
     assert result.ok is False
-    assert "echo_reached=yes mcp=none" in result.detail
+    assert "watch=echo_reached=yes,mcp=none,call=0,steps=0,events=1" in result.detail
 
 
 def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
@@ -882,7 +899,7 @@ def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "mcp=tools=0 (empty)" in result.detail
+    assert result.ok is False and "mcp=tools=0,(empty),call=0" in result.detail
 
 
 def test_stop_on_echo_ignores_a_cli_printed_mcp_observation(tmp_path, monkeypatch):
@@ -1009,7 +1026,7 @@ def test_stop_on_echo_failure_keeps_cli_result_and_reports_progress(tmp_path, mo
 
     assert result.ok is False
     assert "cleanup_deadline_received" in result.detail
-    assert "echo_reached=no mcp=none" in result.detail
+    assert "watch=echo_reached=no,mcp=none,call=0,steps=3,events=9" in result.detail
     assert "steps=3" in result.detail and "events=9" in result.detail
 
 
@@ -1026,7 +1043,7 @@ def test_stop_on_echo_timeout_without_echo_is_readable(tmp_path, monkeypatch):
 
     assert result.ok is False
     assert "status=timeout" in result.detail
-    assert "echo_reached=no mcp=none call=0 steps=2" in result.detail
+    assert "watch=echo_reached=no,mcp=none,call=0,steps=2,events=2" in result.detail
 
 
 def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch):
@@ -1043,7 +1060,7 @@ def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "pgid recovery gate" in result.detail
+    assert result.ok is False and result.detail == "gate=not_reaped status=timeout reason=- unreaped=1"
 
 
 def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, monkeypatch):
@@ -1056,7 +1073,7 @@ def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, m
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "mcp=tools=2 (uninitialized)" in result.detail
+    assert result.ok is False and "mcp=tools=2,(uninitialized),call=0" in result.detail
 
 
 def test_stop_on_echo_summary_marks_uninitialized_only_when_initialize_was_not_seen(
@@ -1072,7 +1089,7 @@ def test_stop_on_echo_summary_marks_uninitialized_only_when_initialize_was_not_s
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
     assert result.ok is False
-    assert "mcp=tools=2 " in result.detail and "uninitialized" not in result.detail
+    assert "mcp=tools=2,call=0" in result.detail and "uninitialized" not in result.detail
     assert "call=0" in result.detail
 
 

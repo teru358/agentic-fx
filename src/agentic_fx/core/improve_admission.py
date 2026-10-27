@@ -33,13 +33,10 @@ import logging
 import os
 import threading
 import time
-import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from agentic_fx.ops.redactor import redact_value
 
 from agentic_fx.core import improve_fingerprint as F
 
@@ -101,7 +98,6 @@ class AdmissionDecision:
     supported: bool = False
     retryable: bool = False
     detail: str = ""
-    selftest_detail: str = ""
 
 
 def artifact_path(settings: Any, backend: str) -> str:
@@ -185,7 +181,8 @@ class ImproveAdmission:
                  supported: Callable[[], frozenset[str]] | None = None,
                  retry_interval_sec: float = SELFTEST_RETRY_INTERVAL_SEC,
                  clock: Callable[[], float] = time.monotonic,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None,
+                 technical_log: Callable[[str], None] | None = None) -> None:
         self._canary = canary
         self._selftest = selftest
         self._kernel_probe = kernel_probe
@@ -193,6 +190,7 @@ class ImproveAdmission:
         self._retry = retry_interval_sec
         self._clock = clock
         self._stop = stop_event
+        self._technical_log = technical_log or (lambda line: _log.info("%s", line))
         #: kernel の probe と判定の cache だけを守る (canary と自己試験の間は握らない)
         self._lock = threading.Lock()
         self._kernel: F.KernelCapabilities | None = None
@@ -258,7 +256,19 @@ class ImproveAdmission:
                 finally:
                     self._running.pop(key, None)
                     done.set()
+        self._emit_new_selftest_failure(decision)
         return decision
+
+    def _emit_new_selftest_failure(self, decision: AdmissionDecision | None) -> None:
+        if decision is None or decision.reason != REASON_SELFTEST:
+            return
+        from agentic_fx.loops.verify_backend import selftest_detail_or_default
+
+        try:
+            self._technical_log(
+                f"improve isolation: selftest detail: {selftest_detail_or_default(decision.detail)}")
+        except Exception:  # noqa: BLE001
+            _log.exception("improve isolation selftest detail logging failed")
 
     def _stopping(self) -> bool:
         return self._stop is not None and self._stop.is_set()
@@ -285,8 +295,7 @@ class ImproveAdmission:
                 transient = isinstance(out, ProbeOutcome) and out.transient
                 detail = out.detail if isinstance(out, ProbeOutcome) else "no outcome"
                 return AdmissionDecision(False, reason, ctx.backend, fp, art,
-                                         retryable=transient, detail=detail,
-                                         selftest_detail=detail if reason == REASON_SELFTEST else "")
+                                         retryable=transient, detail=detail)
         return AdmissionDecision(True, None, ctx.backend, fp, art,
                                  detail="fingerprint is outside the supported set; "
                                         "canary and selftest passed in this process")
@@ -359,7 +368,8 @@ def current_host() -> Any:
         return _HOST
 
 
-def default_admission(root: Path, *, stop_event: threading.Event | None = None
+def default_admission(root: Path, *, stop_event: threading.Event | None = None,
+                      technical_log: Callable[[str], None] | None = None
                       ) -> ImproveAdmission:
     """canary と自己試験の本番の実装を持つ admission (process に 1 個)。
 
@@ -375,7 +385,9 @@ def default_admission(root: Path, *, stop_event: threading.Event | None = None
                                                              root=root),
                 selftest=lambda ctx: improve_canary.run_selftest(ctx, settings=ctx.settings,
                                                                  root=root),
-                stop_event=stop_event)
+                stop_event=stop_event, technical_log=technical_log)
+        elif technical_log is not None:
+            _ADMISSION._technical_log = technical_log
         return _ADMISSION
 
 
@@ -402,16 +414,6 @@ def choose_for_mission(settings: Any, root: Path, *, enabled: bool | None = None
         return MissionChoice(refusal=decision.reason, decision=decision)
     return MissionChoice(worker_options=worker_runner_options(decision, host),
                          decision=decision)
-
-
-def _selftest_detail_log_line(detail: str) -> str:
-    """自己試験 detail を技術ログ用の安全な 1 行へ整える。"""
-    folded = "".join(
-        " " if unicodedata.category(ch).startswith("C") else ch
-        for ch in detail
-    )
-    safe = " ".join(redact_value(folded).split())[:200]
-    return f"improve isolation: selftest detail: {safe}"
 
 
 def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None = None,
@@ -453,16 +455,13 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
     if backend not in F.BACKENDS:
         return (f"improve isolation: enabled; backend={backend} is not a CLI backend; "
                 f"cgroup_gate={'open' if host.mission_allowed() else 'closed'}")
-    adm = default_admission(root, stop_event=stop_event)
+    adm = default_admission(root, stop_event=stop_event, technical_log=technical_log)
     choice = choose_for_mission(settings, root, enabled=True, host=host, admission=adm)
     fingerprint = (choice.decision.fingerprint.aggregate
                    if choice.decision is not None and choice.decision.fingerprint is not None
                    else "none")
     if choice.refusal is None:
         return f"improve isolation: enabled; backend={backend} admitted=yes fingerprint={fingerprint}"
-    if (choice.refusal == REASON_SELFTEST and choice.decision is not None
-            and technical_log is not None):
-        technical_log(_selftest_detail_log_line(choice.decision.selftest_detail))
     return (f"improve isolation: enabled; backend={backend} admitted=no "
             f"reason={choice.refusal} fingerprint={fingerprint}")
 

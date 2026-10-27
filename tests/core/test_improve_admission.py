@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -394,19 +395,19 @@ def test_enabled_startup_reports_the_decision_fingerprint(tmp_path, monkeypatch,
 
 
 @pytest.mark.parametrize("retryable", [False, True])
-def test_startup_emits_a_redacted_single_line_selftest_detail(tmp_path, monkeypatch, retryable):
-    """自己試験の診断だけを技術ログの別行へ出し、admission ABI は変えない。"""
+def test_startup_keeps_the_admission_line_byte_for_byte(tmp_path, monkeypatch, retryable):
+    """自己試験の診断は判定生成時に出し、admission ABI は変えない。"""
     class StartupHost(Host):
         def start(self, *, deadline):
             assert deadline == 0.0
 
-    detail = "left\x01right\nstderr token=TOPSECRET9 " + "x" * 240
+    detail = "gate=incomplete status=failed reason=timeout"
     choice = IA.MissionChoice(
         refusal=IA.REASON_SELFTEST,
         decision=IA.AdmissionDecision(
             False, IA.REASON_SELFTEST, "codex",
             fingerprint=SimpleNamespace(aggregate="refused-fingerprint"),
-            retryable=retryable, detail=detail, selftest_detail=detail),
+            retryable=retryable, detail=detail),
     )
     emitted: list[str] = []
     monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
@@ -418,24 +419,79 @@ def test_startup_emits_a_redacted_single_line_selftest_detail(tmp_path, monkeypa
 
     assert line == ("improve isolation: enabled; backend=codex admitted=no "
                     "reason=runtime_fingerprint_selftest_failed fingerprint=refused-fingerprint")
-    assert len(emitted) == 1
-    prefix = "improve isolation: selftest detail: "
-    assert emitted[0].startswith(prefix)
-    logged_detail = emitted[0][len(prefix):]
-    assert len(logged_detail) == 200
-    assert logged_detail.startswith("left right stderr token=[redacted] ")
-    assert "TOPSECRET9" not in logged_detail and "[redacted]" in logged_detail
-    assert all(not ch.isspace() or ch == " " for ch in logged_detail)
-    assert all(ord(ch) >= 32 for ch in logged_detail)
+    assert emitted == []
 
 
-def test_selftest_failure_keeps_its_detail_in_the_dedicated_field(tmp_path):
+def test_selftest_failure_keeps_its_detail_in_the_decision(tmp_path):
     detail = "mission did not complete: status=failed reason=timeout"
     decision = _admission(selftest=Probe(IA.ProbeOutcome(False, detail=detail))).admit(
         backend="codex", artifact_path=str(_elf(tmp_path)), host=Host())
 
     assert decision.detail == detail
-    assert decision.selftest_detail == detail
+
+
+def test_admission_decision_has_no_second_selftest_detail_field():
+    assert "selftest_detail" not in IA.AdmissionDecision.__dataclass_fields__
+
+
+def test_selftest_probe_logs_each_new_safe_decision_once(tmp_path, monkeypatch):
+    from agentic_fx.core import improve_canary
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    from agentic_fx.setup.post_start import read_admission_line
+
+    unsafe = ("try again at alice@example.com https://private.invalid/ "
+              "stderr=credential-ABC")
+    results = [
+        VerifyBackendResult(False, "codex", None, None, unsafe),
+        VerifyBackendResult(False, "codex", None, None,
+                            "gate=nonce status=completed reason=-"),
+    ]
+
+    def fake_verify(*_args, **_kwargs):
+        return results.pop(0)
+
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.verify_backend", fake_verify)
+    now = [0.0]
+    emitted: list[str] = []
+    settings = _settings("codex", _elf(tmp_path))
+    admission = IA.ImproveAdmission(
+        canary=Probe(OK),
+        selftest=lambda ctx: improve_canary.run_selftest(ctx, settings=settings, root=tmp_path),
+        kernel_probe=lambda: KERNEL,
+        retry_interval_sec=1.0,
+        clock=lambda: now[0],
+        technical_log=emitted.append,
+    )
+
+    first = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
+    cached = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
+    now[0] = 1.0
+    retried = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
+
+    assert first.decision.detail == "gate=incomplete status=failed reason=-"
+    assert cached.decision is first.decision
+    assert retried.decision.detail == "gate=nonce status=completed reason=-"
+    assert emitted == [
+        "improve isolation: selftest detail: gate=incomplete status=failed reason=-",
+        "improve isolation: selftest detail: gate=nonce status=completed reason=-",
+    ]
+    rendered = "\n".join(emitted)
+    assert all(value not in rendered for value in (
+        "alice@example.com", "https://", "stderr", "credential-ABC"))
+    assert not (tmp_path / "logs" / "activity.log").exists()
+    from agentic_fx.status import collect_status, render_status
+    status_text = render_status(collect_status(
+        tmp_path, instance="free",
+        run=lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="")), root=tmp_path)
+    assert all(value not in status_text for value in emitted)
+    observed = read_admission_line(
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"_SYSTEMD_INVOCATION_ID": "new", "MESSAGE": emitted[0]})),
+        "new", cursor_fallback="cursor", backend="codex", clock=lambda: 0.0,
+        sleep=lambda _seconds: None, timeout=0,
+    )
+    assert (observed.admitted, observed.reason_code) == ("unknown", "admission_line_timeout")
 
 
 def test_startup_does_not_emit_a_selftest_detail_when_admitted(tmp_path, monkeypatch):
