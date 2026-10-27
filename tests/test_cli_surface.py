@@ -92,7 +92,7 @@ EXPECTED = (
     ('backtest run', G.RESEARCH, "LOCAL", 'afx backtest run …', None, "CHANGE", False, False, None, None, False, None),
     ('analyze corr', G.RESEARCH, "LOCAL", 'afx analyze corr …', None, "CHANGE", False, False, None, None, False, None),
     ('ctl ask', G.GUIDANCE, "CTL", 'afx ctl ask <question>', 'ask <質問>', "CHANGE", False, False, 'operate', 'ask', True, None),
-    ('ctl improve', G.GUIDANCE, "CTL", 'afx ctl improve', 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
+    ('ctl improve', G.GUIDANCE, "CTL", "afx ctl improve [-t|--duration <h/m>] [-c|--comment '<文>'] [-n|--max-runs <N>]", 'improve', "CHANGE", False, False, 'operate', 'improve', True, None),
     ('ctl backlog add', G.GUIDANCE, "CTL", 'afx ctl backlog add <idea>', 'backlog add <idea>', "CHANGE", False, False, 'operate', 'backlog_add', True, None),
     ('ctl backlog list', G.GUIDANCE, "CTL", 'afx ctl backlog list [--all] [--limit <n>]', None, "READ", False, False, 'guidance.read', 'backlog_list', True, None),
     ('ctl backlog reject', G.GUIDANCE, "CTL", 'afx ctl backlog reject <id>', 'backlog reject <id>', "CHANGE", False, False, 'operate', 'backlog_reject', True, None),

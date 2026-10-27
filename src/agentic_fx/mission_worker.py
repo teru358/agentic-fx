@@ -1090,7 +1090,8 @@ def main(*, build_runner: Callable[..., Any] | None = None) -> None:
                         # パターン検知 (`CliRunner._detect_stderr_fatal`)。
                         # LocalRunner の結果には存在しない属性なので
                         # getattr で安全に既定 None。
-                        "stderr_fatal": getattr(result, "stderr_fatal", None)})
+                        "stderr_fatal": getattr(result, "stderr_fatal", None),
+                        "failure_class": getattr(result, "failure_class", None)})
                 except Exception as exc:  # noqa: BLE001
                     _finish_isolation(isolation, protocol_out, out_seq)
                     _send_frame(protocol_out, out_seq, {

@@ -196,6 +196,10 @@ event は append-only DB `ops_events` に置く通知用投影であり、要求
 
 ask、手動 improve、approve / reject / retry は 202 と job id を返す。client は `GET /v1/jobs/{id}` を poll する。job 表はメモリ上で、未終端は決定 queued 8 + running 1、ask 1、improve 1、終端は 64 件か 1 時間とし、終端の古いものから evict する。
 
+**繰り返し improve の job。** `POST /v1/improve/runs` の本文に任意の `duration_sec` / `max_runs` / `comment` を足せる (未知 key と型違いは 400 `invalid_argument`、検査は監査行を作る前)。`duration_sec` か `max_runs` がある要求は、1 本の job が mission を直列に回す繰り返し job になる (1 本枠と `improve_running` は同じ)。`comment` のみは従来の 1 回。job の `result` は進捗を持つ辞書で、enqueue 時に `mission_id` (None)、`runs` (0)、`max_runs`、`deadline_at` (ISO-8601 UTC)、`phase=waiting_slot`、`stop_requested=false` を完全な形で公開する。`phase` は `waiting_slot` / `running` / `backoff` / `finished`、終了後は固定語の `stop_reason` (`deadline` / `max_runs` / `stopped` / `consecutive_failures` / `resource_exhausted` / `autopilot` / `shutdown`) が付き、通常の停止は `state=done`、controller の予期しない例外は `failed` / `internal` になる。進捗の更新と終端 result の合成は registry の lock 内で行い、終端 result と進捗が同名キーを持てば進捗が勝つ。comment の本文は result、監査、event、activity に出さない。
+
+**走行中の cancel。** `POST /v1/jobs/{id}/cancel` は、走行中の繰り返し job に限り停止を要求する。応答は `state=running` かつ `stop_requested=true` で、二度目も同じ応答 (冪等)。実行中の mission は完走し、次を始めず、`state=done` / `stop_reason=stopped` で終わる。繰り返し job の応答には `stop_requested` が入る。単発 improve・ask・決定の走行中 cancel は従来どおり `job_running`。走行中の cancel は state を変えないので `job_state_changed` event を出さない。所有者の規則は変えない。
+
 DB 操作は 2 レーンに分ける。ops レーンは ops lock + ops 用接続で read と通常変更を行う。決定レーンは decide lock + 決定用接続 + worker 1 本で決定だけを FIFO 実行する。両 lock を同時に取らず、API thread は `core_lock` を取らない。
 
 ops lock、decide lock、plugin flock、StateStore flock、SQLite busy、socket / queue / thread の待ちを含む全ての待機は non-blocking の反復取得とし、各試行の上限を `min(その待機の設定値, caller の monotonic deadline までの残り時間)` にする。同期要求の caller deadline は accept から既定 5 秒、非同期 job は受理時に固定した job deadline とし、どちらも `stop_event` を毎回確認する。plugin flock は既定 30 秒、0.1 秒間隔で試し、取得前の timeout / shutdown は無変更で終える。設定値が要求の残り時間より長くても要求 deadline を延長しない。
@@ -452,3 +456,4 @@ C0 v0.3 の設計レビューで、plugin worker 隔離、世代 CAS、kind fail
 |2026-10-19|v1.19|§3.3 に申告の見出し分離を追記し、`GET /v1/approvals/{id}/change` を足した (endpoint 25 本)。`approval_detail` に `change` 要約を足す|承認の中身を見せる設計 v1.0 (T1)|
 |2026-10-20|v1.20|§4.3 の event 表に `order_state_changed` / `position_closed` を追加し、daemon の `events.poll` は high watermark と行の取得を 1 つの読み取り tx にした|取引通知の設計書 v1.0 (T2)||
 |2026-10-25|v1.21|backlog / policy の読取と policy の remove / reconcile を route・scope 表へ追加し、endpoint 数を 29 本に更新|CLI surface の現行運用名と API 契約を同期するため||
+|2026-10-27|v1.22|§5 に繰り返し improve の job 契約 (本文拡張、進捗 result、`stop_requested`、走行中 cancel の条件) を追記|`afx ctl improve` の繰り返し (-t / -c / -n) の操作面||

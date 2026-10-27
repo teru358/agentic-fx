@@ -91,11 +91,51 @@ CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
     "try again at",
     "401 Unauthorized",
     "Unauthorized",
+    "429 Too Many Requests",
 )
+
+#: パターンから失敗の固定分類を引く唯一の表。`stderr_fatal` の自由文は後から解析しない。
+#: 文言単独の `Unauthorized` は通常の文中にも現れるため分類には使わない (診断用の
+#: `CLI_STDERR_FATAL_PATTERNS` には残す)。
+CLI_STDERR_FAILURE_CLASS: dict[str, str] = {
+    "code-mode host": "runner_fault",
+    "SIGTRAP": "runner_fault",
+    "closed its stdout": "runner_fault",
+    "Segmentation fault": "runner_fault",
+    "usage limit": "resource_exhausted",
+    "try again at": "resource_exhausted",
+    "401 Unauthorized": "resource_exhausted",
+    "429 Too Many Requests": "resource_exhausted",
+}
 
 #: activity `cli_stderr_fatal` 1 行に埋め込む tail の文字数上限
 #: (ブリーフ「先頭 200 字」)。
 _STDERR_FATAL_TAIL_CHARS = 200
+
+
+def _line_has_pattern(pattern: str, line: str) -> bool:
+    """語境界つきで 1 行の中に pattern があるか。"""
+    return re.search(
+        rf"(?<![\w]){re.escape(pattern)}(?![\w])", line) is not None
+
+
+def _detect_stderr_failure_class(stderr_text: str) -> str | None:
+    """行単位・語境界つきで全 pattern を照合し、固定分類を返す。`resource_exhausted`
+    が 1 つでも一致すれば、他の分類より優先する。"""
+    found: str | None = None
+    for line in stderr_text.splitlines():
+        for pattern, failure_class in CLI_STDERR_FAILURE_CLASS.items():
+            if not _line_has_pattern(pattern, line):
+                continue
+            if failure_class == "resource_exhausted":
+                return failure_class
+            found = found or failure_class
+    return found
+
+
+def _merge_failure_class(primary: str | None, recovery: str | None) -> str | None:
+    """primary を優先し、無ければ追撃側の分類。"""
+    return primary or recovery
 
 
 def _detect_stderr_fatal(stderr_text: str) -> str | None:
@@ -299,6 +339,8 @@ class CliRunner(AgentRunner):
         # `MissionResult.stderr_fatal` へ渡す。`_recover_output` を
         # override しない backend (既定 no-op) は触らないため None のまま。
         self._recovery_stderr_fatal: str | None = None
+        # 同じ追撃の stderr から決めた失敗の固定分類。
+        self._recovery_failure_class: str | None = None
 
     @abstractmethod
     def _build_argv(self, mission: Mission, *,
@@ -510,6 +552,7 @@ class CliRunner(AgentRunner):
         # 検知結果を毎回リセットする — インスタンスが再利用されないのが
         # 通例でも、前回呼び出しの残骸を次の `run()` に持ち越さない。
         self._recovery_stderr_fatal = None
+        self._recovery_failure_class = None
 
         try:
             cause, rc, stdout_lines, stderr_chunks = self._run_cli_process(
@@ -530,6 +573,7 @@ class CliRunner(AgentRunner):
         # を含む — codex の code-mode host 無力化はまさに rc=0/completed
         # で起きた) stderr に既知の致命パターンが無いか調べておく。
         stderr_fatal = _detect_stderr_fatal("".join(stderr_chunks))
+        failure_class = _detect_stderr_failure_class("".join(stderr_chunks))
 
         # M4: どちらの追撃経路 (timeout/no-output) を通って `raw` が
         # 得られたかを覚えておき、schema 検証を通った completed にだけ
@@ -543,6 +587,8 @@ class CliRunner(AgentRunner):
             # ため、追撃を実装しない backend は従来どおり "timeout" になる。
             raw = self._recover_with_launch(mission, list(stdout_lines), recovery_timeout)
             stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
+            failure_class = _merge_failure_class(
+                failure_class, self._recovery_failure_class)
             if cause == "abort":
                 abort_reason = _normalize_reason(
                     self._abort_reason_fn() if self._abort_reason_fn
@@ -550,26 +596,32 @@ class CliRunner(AgentRunner):
             if raw is None:
                 if cause == "abort":
                     return MissionResult("failed", None, [], reason=abort_reason,
-                                         stderr_fatal=stderr_fatal)
+                                         stderr_fatal=stderr_fatal,
+                                         failure_class=failure_class)
                 return MissionResult("timeout", None, [], reason="cli timeout",
-                                     stderr_fatal=stderr_fatal)
+                                     stderr_fatal=stderr_fatal,
+                                     failure_class=failure_class)
             via_recovery = True
         else:
             if rc != 0:
                 reason = _normalize_reason(
                     f"HTTP-like CLI exit rc={rc}: {_stderr_reason_tail(''.join(stderr_chunks))}")
                 return MissionResult("failed", None, [], reason=reason,
-                                     stderr_fatal=stderr_fatal)
+                                     stderr_fatal=stderr_fatal,
+                                     failure_class=failure_class)
 
             raw = self._extract_output(stdout_lines, self._workdir)
             if raw is None:
                 # 段B: 最終出力が回収できない場合も追撃回収を 1 回試みる。
                 raw = self._recover_with_launch(mission, list(stdout_lines), recovery_timeout)
                 stderr_fatal = _merge_stderr_fatal(stderr_fatal, self._recovery_stderr_fatal)
+                failure_class = _merge_failure_class(
+                    failure_class, self._recovery_failure_class)
                 if raw is None:
                     return MissionResult("failed", None, [],
                                          reason=_normalize_reason("no output recovered from cli"),
-                                         stderr_fatal=stderr_fatal)
+                                         stderr_fatal=stderr_fatal,
+                                         failure_class=failure_class)
                 via_recovery = True
         try:
             jsonschema.validate(raw, mission.output_schema)
@@ -577,13 +629,15 @@ class CliRunner(AgentRunner):
             return MissionResult(
                 "failed", None, [],
                 reason=_normalize_reason(f"output_schema mismatch: {e.message}"),
-                stderr_fatal=stderr_fatal)
+                stderr_fatal=stderr_fatal,
+                failure_class=failure_class)
         # /code-review 2 周目 #2 (2026-09-08): abort → 追撃で回収できた
         # completed は abort の provenance (reason) を保持する — worker の
         # summary 付与と親の activity がこれを読む。
         return MissionResult("completed", raw, [], recovered=via_recovery,
                              reason=abort_reason if cause == "abort" else None,
-                             stderr_fatal=stderr_fatal)
+                             stderr_fatal=stderr_fatal,
+                             failure_class=failure_class)
 
     def _recover_with_launch(self, mission: Mission, stdout_lines: list[str],
                              recovery_timeout_sec: float) -> dict[str, Any] | None:

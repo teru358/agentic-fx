@@ -89,7 +89,8 @@ class FakeLoop:
         finally:
             conn.close()
 
-    def prepare(self, *, slot_key, now, on_ready=None):
+    def prepare(self, *, slot_key, now, on_ready=None, on_claimed=None,
+                oneoff_comment=None):
         step = self.script.pop(0)
         conn = self._conn()
         try:

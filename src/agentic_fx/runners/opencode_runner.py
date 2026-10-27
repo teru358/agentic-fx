@@ -12,7 +12,7 @@ from typing import Any, Callable, Literal
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.runners.base import Mission
 from agentic_fx.runners.cli_runner import (
-    CliRunner, _detect_stderr_fatal, require_mcp_spool,
+    CliRunner, _detect_stderr_failure_class, _detect_stderr_fatal, require_mcp_spool,
 )
 from agentic_fx.runners.response_parser import ParseError, parse_json_output
 from agentic_fx.tools.registry import ToolRegistry
@@ -229,6 +229,8 @@ class OpencodeRunner(CliRunner):
         # — ここで検知して `self._recovery_stderr_fatal` に置き、`run()` が
         # primary 分と合成する (`_merge_stderr_fatal`)。
         self._recovery_stderr_fatal = _detect_stderr_fatal("".join(stderr_chunks))
+        self._recovery_failure_class = _detect_stderr_failure_class(
+            "".join(stderr_chunks))
         step_finish_reason = self._last_step_finish_reason(resume_lines)
         if cause == "timeout":
             discard_reason = "timed_out"

@@ -17,6 +17,7 @@ import errno
 import os
 import re
 import select
+import shlex
 import socket
 import stat
 import struct
@@ -31,6 +32,7 @@ from typing import Callable, TextIO
 import httpcore
 import httpx
 
+from agentic_fx.core import improve_repeat as ir
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
@@ -927,7 +929,12 @@ def parse(tokens: list[str]) -> Op:
     if cmd == "improve" and n == 0:
         return Op("improve", [])
     if cmd == "improve" and n >= 2 and args[0] == "add":
+        if any(_is_improve_flag(token) for token in args[1:]):
+            # 旧 `improve add` と繰り返しの option は併用できない。
+            raise ClientError(RC_USAGE, _usage())
         return Op("backlog_add", [" ".join(args[1:])], via_alias="improve add")
+    if cmd == "improve" and n >= 1 and args[0] != "add":
+        return Op("improve", _parse_improve(args))
     if cmd == "backlog" and n >= 2 and args[0] == "add":
         return Op("backlog_add", [" ".join(args[1:])])
     if cmd == "backlog" and n == 2 and args[0] in ("reject", "reopen", "note"):
@@ -960,6 +967,49 @@ def parse(tokens: list[str]) -> Op:
             raise ClientError(RC_USAGE, _usage())
         return Op("job_get" if args[0] == "get" else "job_cancel", [args[1]])
     raise ClientError(RC_USAGE, _usage())
+
+
+_IMPROVE_FLAGS = {"-t": "duration", "--duration": "duration",
+                  "-c": "comment", "--comment": "comment",
+                  "-n": "max_runs", "--max-runs": "max_runs"}
+
+
+def _is_improve_flag(token: str) -> bool:
+    return token.split("=", 1)[0] in _IMPROVE_FLAGS if token.startswith("--") \
+        else token in _IMPROVE_FLAGS
+
+
+def _parse_improve(args: list[str]) -> list:
+    """`improve` の option を読み、[duration_sec, max_runs, comment] を返す。
+
+    値は次の token を無条件に取る (`-c -n` の `-n` は値)。長形式は `--x=v` も受ける。
+    違反はすべて usage (鍵を読む前・接続前)。位置引数は 1 つでもあれば違反。"""
+    found: dict[str, str] = {}
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        value = None
+        if flag.startswith("--") and "=" in flag:
+            flag, value = flag.split("=", 1)
+        name = _IMPROVE_FLAGS.get(flag)
+        if name is None or name in found:
+            raise ClientError(RC_USAGE, _usage())
+        if value is None:
+            if not rest:
+                raise ClientError(RC_USAGE, _usage())
+            value = rest.pop(0)
+        found[name] = value
+    try:
+        duration = ir.parse_duration(found["duration"]) if "duration" in found else None
+        max_runs = None
+        if "max_runs" in found:
+            if re.fullmatch(r"[0-9]+", found["max_runs"]) is None:
+                raise ValueError("invalid max runs")
+            max_runs = ir.validate_max_runs(int(found["max_runs"]))
+        comment = ir.normalize_comment(found["comment"]) if "comment" in found else None
+    except ValueError:
+        raise ClientError(RC_USAGE, _usage()) from None
+    return [duration, max_runs, comment]
 
 
 def _parse_events(args: list[str]) -> list:
@@ -1142,14 +1192,84 @@ class Runner:
         self.say(_multiline(result.get("answer")))
         return RC_OK
 
-    def _op_improve(self, *, terminal) -> int:
-        reply = self._post("/v1/improve/runs", idempotent=True)
+    def _op_improve(self, duration_sec: int | None = None, max_runs: int | None = None,
+                    comment: str | None = None, *, terminal) -> int:
+        if duration_sec is not None or max_runs is not None:
+            return self._improve_repeat(duration_sec, max_runs, comment)
+        reply = self._post("/v1/improve/runs",
+                           {"comment": comment} if comment is not None else None,
+                           idempotent=True)
         job = self._accepted(reply, "improve")
         if job is None:
             return RC_FAILED
         result = job.get("result") if isinstance(job.get("result"), dict) else {}
         self.say(f"improve mission #{_ident(result.get('mission_id'))} を起動しました")
         return RC_OK
+
+    def _improve_repeat(self, duration_sec: int | None, max_runs: int | None,
+                        comment: str | None) -> int:
+        """繰り返し job は受理で返る。受理後の待ちは表示のためだけで、rc には効かない。"""
+        body: dict = {}
+        if duration_sec is not None:
+            body["duration_sec"] = duration_sec
+        if max_runs is not None:
+            body["max_runs"] = max_runs
+        if comment is not None:
+            body["comment"] = comment
+        reply = self._post("/v1/improve/runs", body, idempotent=True)
+        if reply.data is None:
+            raise _fail(reply)
+        job_id = reply.data.get("job_id")
+        if not isinstance(job_id, str) or _JOB_ID.fullmatch(job_id) is None:
+            raise ClientError(RC_FAILED, "daemon の応答を解釈できません (job id)")
+        state = reply.data.get("state")
+        self.say(f"job {job_id} を受理しました")
+        span = _span_text(duration_sec if duration_sec is not None else ir.MAX_DURATION_SEC)
+        give_up = self.monotonic() + _POLL_LIMITS["improve"]
+        header = launched = False
+        try:
+            while True:
+                job = self._get(f"/v1/jobs/{job_id}")
+                state = job.get("state")
+                result = job.get("result") if isinstance(job.get("result"), dict) else {}
+                if not header:
+                    header = True
+                    shown_runs = result.get("max_runs")
+                    self.say(
+                        "improve を繰り返します: "
+                        f"期限 {_format_deadline(result.get('deadline_at'))} ({span})、"
+                        f"最大 {shown_runs if type(shown_runs) is int else (max_runs or ir.MAX_RUNS)} 回"
+                        + ("、一時指示あり" if comment is not None else ""))
+                runs, mission_id = result.get("runs"), result.get("mission_id")
+                # 1 回目が始まったかは回数で決める。mission_id は表示にだけ使う
+                # (mission が作られる前に失敗した回も 1 回と数える)。
+                started = type(runs) is int and runs >= 1
+                if started and not launched:
+                    launched = True
+                    self.say(f"1 回目 mission #{mission_id} を起動しました"
+                             if type(mission_id) is int else "1 回目を起動しました")
+                if state in _TERMINAL_JOB_STATES:
+                    self.say(_improve_end_text(job_id, job))
+                    return RC_OK
+                if started:
+                    self._improve_footer(job_id)
+                    return RC_OK
+                if self.monotonic() >= give_up:
+                    self.say("週次の slot が空くのを待っています。1 回目は空き次第始まります")
+                    self._improve_footer(job_id)
+                    return RC_OK
+                self.sleep(_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            self.say(interrupt_notice(job_id, state))
+            raise
+        except ClientError:
+            self.say(interrupt_notice(job_id, state, lost=True))
+            raise
+
+    def _improve_footer(self, job_id: str) -> None:
+        self.say("各 mission の開始・終了は通知に出ます。止める: "
+                 f"afx ctl jobs cancel {job_id} (実行中の mission は完走し、次を始めません)\n"
+                 "daemon を再起動すると繰り返しは中断します。")
 
     def _op_backlog_add(self, idea: str, *, terminal) -> int:
         from agentic_fx.core.idea_check import normalize_idea_display
@@ -1415,6 +1535,10 @@ class Runner:
         reply = self._post(f"/v1/jobs/{job_id}/cancel")
         if reply.data is None:
             raise _fail(reply)
+        if reply.data.get("state") == "running" and reply.data.get("stop_requested") is True:
+            self.say(f"job {job_id}: 停止を受け付けました。"
+                     "実行中の mission の終了後に止まります")
+            return RC_OK
         self.say(f"job {job_id}: {display_text(reply.data.get('state'))}")
         return RC_OK
 
@@ -1468,6 +1592,55 @@ class Runner:
             # 受理の行は流れ去っているかもしれない。結果を確かめる id をここで示す。
             self.say(interrupt_notice(job_id, state, lost=True))
             raise
+
+
+_TERMINAL_JOB_STATES = ("done", "failed", "cancelled", "shutdown")
+
+_STOP_REASON_TEXT = {
+    "deadline": "期限に達したため終了しました",
+    "max_runs": "最大回数に達したため終了しました",
+    "stopped": "停止の要求により終了しました",
+    "consecutive_failures": "mission が連続して失敗したため終了しました",
+    "resource_exhausted": "利用枠などの上限で mission を続けられないため終了しました",
+    "autopilot": "autopilot 中のため終了しました",
+    "shutdown": "daemon の停止により終了しました",
+}
+
+
+def _span_text(seconds: int) -> str:
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours}h" * (hours > 0) + f"{minutes}m" * (minutes > 0)
+
+
+def _format_deadline(value) -> str:
+    """wire の ISO-8601 UTC を人向けの表記にする。読めなければ無害化して返す。"""
+    if isinstance(value, str):
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            return display_text(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return display_text(value)
+
+
+def _improve_end_text(job_id: str, job: dict) -> str:
+    """受理後に終端した繰り返し job の理由。rc は 0 のまま (job を作った後なので)。"""
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    state = job.get("state")
+    runs = result.get("runs")
+    done_runs = f" (実施 {runs} 回)" if type(runs) is int else ""
+    if state == "done":
+        reason = result.get("stop_reason")
+        text = _STOP_REASON_TEXT.get(reason, f"終了しました ({display_text(reason)})")
+        return f"job {job_id}: {text}{done_runs}"
+    if state == "shutdown":
+        return f"job {job_id}: {_STOP_REASON_TEXT['shutdown']}{done_runs}"
+    code = job.get("result_code")
+    why = (MESSAGES[code] if code in ("autopilot_restricted", "unavailable")
+           else error_text(code if isinstance(code, str) else None))
+    return f"job {job_id}: improve を続けられませんでした: {why}{done_runs}"
 
 
 def _kill_switch(status: dict) -> dict:
@@ -1561,6 +1734,14 @@ def _interactive(root: Path, principal: Principal, *, uid, stdin, stdout, stderr
             continue
         if tokens[0] in ("exit", "quit") and len(tokens) == 1:
             return RC_OK
+        if tokens[0] == "improve" and tokens[1:2] != ["add"]:
+            # improve の option だけは引用が使える。他のコマンドの自由文は壊さない。
+            try:
+                tokens = shlex.split(line, posix=True)
+            except ValueError:
+                print("afx ctl: 引用符が閉じていません (improve の引数は shell と同じ引用が"
+                      "使えます)", file=stderr, flush=True)
+                continue
         try:
             runner.run(parse(tokens))
         except ClientError as err:
