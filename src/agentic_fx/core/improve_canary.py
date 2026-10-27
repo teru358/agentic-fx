@@ -469,8 +469,8 @@ def _scratch_context(root: Path):
     return scratch, ctx
 
 
-def _transient(status: str, reason: str | None) -> bool:
-    text = reason or ""
+def _transient(status: object, reason: object) -> bool:
+    text = reason if isinstance(reason, str) else ""
     return (status == "timeout" or "never reached ready" in text or "worker eof" in text
             or "usage limit" in text or "try again at" in text)
 
@@ -556,11 +556,12 @@ def run_selftest(ctx, *, settings: Any, root: Path):
         return IA.ProbeOutcome(False, True,
                                selftest_failure_detail("spawn", status="failed"))
     if not res.ok:
-        return IA.ProbeOutcome(False, _transient("failed", res.detail),
+        return IA.ProbeOutcome(False, _transient(res.status, res.operator_detail),
                                selftest_detail_or_default(res.detail))
     if not host.mission_allowed():
         return IA.ProbeOutcome(False, False,
-                               selftest_failure_detail("cgroup_gate", status="completed"))
+                               selftest_failure_detail("cgroup_gate", status="completed",
+                                                       blocking=host.blocking_reasons()))
     return IA.ProbeOutcome(True, False, "")
 
 

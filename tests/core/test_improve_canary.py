@@ -393,3 +393,50 @@ def test_selftest_mission_timeout_is_below_the_unit_runtime_max(monkeypatch, tmp
     assert seen == [(C.SELFTEST_MISSION_TIMEOUT_SEC, True), (120, True)]
     assert C.SELFTEST_MISSION_TIMEOUT_SEC < 900
     _ = IA
+
+
+@pytest.mark.parametrize(("status", "operator_detail"), [
+    ("failed", "mission never reached ready (handshake failed): status=failed"),
+    ("failed", "CLI reported usage limit reached"),
+    ("timeout", "private timeout diagnostic"),
+])
+def test_selftest_retries_transient_verify_backend_failures(
+        monkeypatch, tmp_path, status, operator_detail):
+    from types import SimpleNamespace
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.loops import verify_backend as VB
+
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config"
+                             / "settings.yaml.example")
+    monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
+        False, "opencode", None, None, "gate=handshake status=failed reason=-",
+        operator_detail=operator_detail, status=status))
+    ctx = SimpleNamespace(host=SimpleNamespace(mission_allowed=lambda: True), backend="opencode",
+                          artifact=SimpleNamespace(as_dict=lambda: {}),
+                          fingerprint=SimpleNamespace(aggregate="a"))
+
+    outcome = C.run_selftest(ctx, settings=settings, root=tmp_path)
+
+    assert outcome.transient is True
+
+
+def test_selftest_cgroup_failure_includes_fixed_blocking_reasons(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from agentic_fx.config import load_settings
+    from agentic_fx.loops import verify_backend as VB
+
+    settings = load_settings(Path(__file__).resolve().parents[2] / "config"
+                             / "settings.yaml.example")
+    monkeypatch.setattr(VB, "verify_backend", lambda *_args, **_kwargs: VB.VerifyBackendResult(
+        True, "opencode", None, "f", "ok"))
+    host = SimpleNamespace(mission_allowed=lambda: False,
+                           blocking_reasons=lambda: ("cgroup_not_empty", "worker_not_reaped"))
+    ctx = SimpleNamespace(host=host, backend="opencode", artifact=SimpleNamespace(as_dict=lambda: {}),
+                          fingerprint=SimpleNamespace(aggregate="a"))
+
+    outcome = C.run_selftest(ctx, settings=settings, root=tmp_path)
+
+    assert outcome.detail == ("gate=cgroup_gate status=completed reason=- "
+                              "blocking=cgroup_not_empty,worker_not_reaped")

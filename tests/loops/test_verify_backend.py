@@ -24,7 +24,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.verify_backend import (
     OPERATOR_SHELL_NO_ISOLATION, VerifyBackendGateError, VerifyBackendResult,
-    verify_backend as _verify_backend)
+    selftest_detail_or_default, selftest_failure_detail, verify_backend as _verify_backend)
 from agentic_fx.runners.base import Mission, MissionResult
 
 NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
@@ -122,7 +122,32 @@ def test_verify_backend_default_requires_admission_and_fails_closed_without_host
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert result.detail == "sandbox_unavailable: cgroup_topology_unsupported"
+    assert result.detail == ("gate=sandbox_unavailable status=failed reason=- "
+                             "refusal=cgroup_topology_unsupported")
+    assert result.operator_detail == "sandbox_unavailable: cgroup_topology_unsupported"
+
+
+@pytest.mark.parametrize(("reason", "expected"), [
+    ("worker eof after private output", "worker_eof"),
+    ("usage limit reached; retry later", "usage_limit"),
+    ("child ready ok=false: private error", "child_ready_not_ok"),
+    ("arbitrary private diagnostic", "-"),
+])
+def test_selftest_failure_detail_maps_only_known_reason_text(reason, expected):
+    assert selftest_failure_detail("incomplete", status="failed", reason=reason) == (
+        f"gate=incomplete status=failed reason={expected}")
+
+
+def test_selftest_detail_sanitizer_degrades_unknown_fields_without_raising():
+    class BadWatch:
+        def summary(self):
+            return object()
+
+    assert selftest_failure_detail("not-a-gate", status="not-a-status", reason="private",
+                                   watch=BadWatch(), unreaped="one") == (
+        "gate=unknown status=- reason=-")
+    assert selftest_detail_or_default("SANDBOX_UNAVAILABLE: private refusal") == (
+        "gate=unknown status=failed reason=-")
 
 
 @pytest.mark.parametrize("options", [{}, {"cleanup_protocol": object()}])
@@ -1006,7 +1031,8 @@ def test_without_stop_on_echo_the_normal_result_decides(tmp_path, monkeypatch):
                             "final": MissionResult("failed", None, [], reason="boom")}
     result = verify_backend(tmp_path, _settings(), backend="opencode", provider=None,
                             clock=FixedClock(NOW))
-    assert result.ok is False and "boom" in result.detail
+    assert result.ok is False and result.detail == "gate=incomplete status=failed reason=-"
+    assert "boom" in result.operator_detail
     assert _StreamingRunner.captured_kwargs.get("stop_event") is None
 
 
@@ -1027,7 +1053,8 @@ def test_stop_on_echo_failure_keeps_cli_result_and_reports_progress(tmp_path, mo
     result = _run_stop_on_echo(tmp_path)
 
     assert result.ok is False
-    assert "cleanup_deadline_received" in result.detail
+    assert "reason=-" in result.detail
+    assert "cleanup_deadline_received" in result.operator_detail
     assert "watch=echo_reached=no,mcp=none,call=0,steps=3,events=9" in result.detail
     assert "steps=3" in result.detail and "events=9" in result.detail
 

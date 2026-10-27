@@ -489,6 +489,21 @@ def test_selftest_probe_logs_safe_detail_without_operator_detail(tmp_path, monke
     assert (observed.admitted, observed.reason_code) == ("unknown", "admission_line_timeout")
 
 
+def test_default_admission_replaces_the_technical_log_for_the_singleton(tmp_path, monkeypatch):
+    first_lines: list[str] = []
+    second_lines: list[str] = []
+    monkeypatch.setattr(IA, "_ADMISSION", None)
+
+    first = IA.default_admission(tmp_path, technical_log=first_lines.append)
+    second = IA.default_admission(tmp_path, technical_log=second_lines.append)
+    second._emit_new_selftest_failure(IA.AdmissionDecision(
+        False, IA.REASON_SELFTEST, "codex", detail="gate=incomplete status=failed reason=-"))
+
+    assert first is second
+    assert first_lines == []
+    assert second_lines == ["improve isolation: selftest detail: gate=incomplete status=failed reason=-"]
+
+
 def test_startup_does_not_emit_a_selftest_detail_when_admitted(tmp_path, monkeypatch):
     class StartupHost(Host):
         def start(self, *, deadline):

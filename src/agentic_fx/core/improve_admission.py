@@ -207,6 +207,10 @@ class ImproveAdmission:
                 self._kernel = self._kernel_probe()
             return self._kernel
 
+    def _set_technical_log(self, technical_log: Callable[[str], None]) -> None:
+        with self._lock:
+            self._technical_log = technical_log
+
     def admit(self, *, backend: str, artifact_path: str, host: Any,
               settings: Any = None) -> AdmissionDecision:
         kernel = self.kernel()
@@ -264,8 +268,10 @@ class ImproveAdmission:
             return
         from agentic_fx.loops.verify_backend import selftest_detail_or_default
 
+        with self._lock:
+            technical_log = self._technical_log
         try:
-            self._technical_log(
+            technical_log(
                 f"improve isolation: selftest detail: {selftest_detail_or_default(decision.detail)}")
         except Exception:  # noqa: BLE001
             _log.exception("improve isolation selftest detail logging failed")
@@ -387,7 +393,7 @@ def default_admission(root: Path, *, stop_event: threading.Event | None = None,
                                                                  root=root),
                 stop_event=stop_event, technical_log=technical_log)
         elif technical_log is not None:
-            _ADMISSION._technical_log = technical_log
+            _ADMISSION._set_technical_log(technical_log)
         return _ADMISSION
 
 

@@ -83,41 +83,96 @@ class VerifyBackendResult:
     fingerprint: str | None
     detail: str
     operator_detail: str = ""
+    gate: str | None = None
+    status: object = None
+    reason: object = None
+    watch: object | None = None
+    unreaped: object | None = None
+    refusal: object = None
+    blocking: object = None
 
 
 _FAILURE_GATES = frozenset({
     "handshake", "incomplete", "nonce", "no_cli_child", "not_reaped", "spawn", "cgroup_gate",
+    "sandbox_unavailable", "unknown",
 })
 _RESULT_STATUSES = frozenset({"completed", "failed", "timeout", "max_turns"})
-_REASON_TOKEN = re.compile(r"[a-z0-9_]+")
+_FIXED_REASONS = (
+    ("worker eof", "worker_eof"), ("worker_eof", "worker_eof"),
+    ("worker protocol_error", "worker_protocol_error"),
+    ("worker_protocol_error", "worker_protocol_error"),
+    ("worker error", "worker_error"), ("worker_error", "worker_error"),
+    ("worker requested cleanup before ready", "worker_cleanup_before_ready"),
+    ("child ready ok=false", "child_ready_not_ok"),
+    ("on_ready failed", "on_ready_failed"), ("cli timeout", "cli_timeout"),
+    ("no output recovered from cli", "no_output_recovered"),
+    ("output_schema mismatch", "output_schema_mismatch"),
+    ("source_snapshot_dir origin is missing", "source_snapshot_missing"),
+    ("claude credentials copy failed", "claude_credentials_copy_failed"),
+    ("codex auth copy failed", "codex_auth_copy_failed"),
+    ("opencode runtime assets copy failed", "opencode_assets_copy_failed"),
+    ("usage limit", "usage_limit"), ("try again at", "try_again_at"),
+)
+_FIXED_REFUSALS = frozenset({
+    "arch_unsupported", "landlock_abi_too_old", "seccomp_user_notif_unavailable",
+    "seccomp_wait_killable_unavailable", "seccomp_tsync_esrch_unavailable",
+    "pidfd_thread_unavailable", "ptrace_scope_unsupported", "proxy_start_failed",
+    "cgroup_delegation_missing", "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed", "worker_not_reaped",
+    "cli_artifact_unsupported", "safety_canary_failed", "runtime_fingerprint_selftest_failed",
+    "service_stopping",
+})
+_FIXED_BLOCKING_REASONS = frozenset({
+    "cgroup_delegation_missing", "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed", "worker_not_reaped",
+})
 _WATCH_SUMMARY = re.compile(
     r"\Aecho_reached=(yes|no) mcp=(none|init_only|tools=[0-9]+(?: \((?:empty|uninitialized)\))?) "
     r"call=([0-9]+) steps=([0-9]+) events=([0-9]+)(?: grace_expired)?\Z")
 _SAFE_SELFTEST_DETAIL = re.compile(
-    r"\Agate=(?:handshake|incomplete|nonce|no_cli_child|not_reaped|spawn|cgroup_gate) "
-    r"status=(?:completed|failed|timeout|max_turns) reason=(?:[a-z0-9_]+|-)"
+    r"\Agate=(?:handshake|incomplete|nonce|no_cli_child|not_reaped|spawn|cgroup_gate|sandbox_unavailable|unknown) "
+    r"status=(?:completed|failed|timeout|max_turns|-) reason=(?:[a-z0-9_]+|-)"
     r"(?: watch=echo_reached=(?:yes|no),mcp=(?:none|init_only|tools=[0-9]+(?:,\((?:empty|uninitialized)\))?),"
     r"call=[0-9]+,steps=[0-9]+,events=[0-9]+(?:,grace_expired)?)?"
-    r"(?: unreaped=[0-9]+)?\Z")
+    r"(?: unreaped=[0-9]+)?(?: refusal=(?:[a-z0-9_]+|-))?"
+    r"(?: blocking=[a-z0-9_]+(?:,[a-z0-9_]+)*)?\Z")
 
 
 def selftest_failure_detail(gate: str, *, status: str, reason: object = None,
                             watch: object | None = None,
-                            unreaped: int | None = None) -> str:
+                            unreaped: object | None = None, refusal: object = None,
+                            blocking: object = None) -> str:
     """Build the bounded diagnostic carried by a failed compatibility selftest."""
-    if gate not in _FAILURE_GATES:
-        raise ValueError(f"unknown selftest gate: {gate}")
-    if status not in _RESULT_STATUSES:
-        raise ValueError(f"unknown selftest status: {status}")
-    token = _REASON_TOKEN.match(reason) if isinstance(reason, str) else None
-    fields = [f"gate={gate}", f"status={status}", f"reason={token.group() if token else '-'}"]
+    gate = gate if gate in _FAILURE_GATES else "unknown"
+    status = status if status in _RESULT_STATUSES else "-"
+    fixed_reason = "-"
+    if isinstance(reason, str):
+        for prefix, token in _FIXED_REASONS:
+            if reason.startswith(prefix):
+                fixed_reason = token
+                break
+    fields = [f"gate={gate}", f"status={status}", f"reason={fixed_reason}"]
     if watch is not None:
-        summary = watch.summary()
-        if not isinstance(summary, str) or _WATCH_SUMMARY.fullmatch(summary) is None:
-            raise ValueError("unexpected selftest watch summary")
-        fields.append("watch=" + summary.replace(" ", ","))
-    if unreaped is not None:
+        try:
+            summary = watch.summary()
+        except Exception:  # noqa: BLE001
+            summary = None
+        if isinstance(summary, str) and _WATCH_SUMMARY.fullmatch(summary) is not None:
+            fields.append("watch=" + summary.replace(" ", ","))
+    if isinstance(unreaped, int) and not isinstance(unreaped, bool):
         fields.append(f"unreaped={max(0, unreaped)}")
+    if gate == "sandbox_unavailable":
+        token = refusal if isinstance(refusal, str) and refusal in _FIXED_REFUSALS else "-"
+        fields.append(f"refusal={token}")
+    if gate == "cgroup_gate":
+        try:
+            reasons = tuple(blocking)
+        except TypeError:
+            reasons = ()
+        fixed = [value for value in reasons
+                 if isinstance(value, str) and value in _FIXED_BLOCKING_REASONS]
+        if fixed:
+            fields.append("blocking=" + ",".join(fixed))
     return " ".join(fields)
 
 
@@ -126,7 +181,29 @@ def selftest_detail_or_default(detail: object, *, gate: str = "incomplete",
     """Accept only a canonical probe diagnostic; replace every other value."""
     if isinstance(detail, str) and _SAFE_SELFTEST_DETAIL.fullmatch(detail) is not None:
         return detail
-    return selftest_failure_detail(gate, status=status)
+    return selftest_failure_detail("unknown", status=status)
+
+
+def _failure_result(*, backend: str, provider: Literal["chatgpt"] | None, gate: str,
+                    status: object, reason: object = None, watch: object | None = None,
+                    unreaped: object | None = None, refusal: object = None,
+                    blocking: object = None, operator_detail: str) -> VerifyBackendResult:
+    return VerifyBackendResult(
+        ok=False, backend=backend, provider=provider, fingerprint=None,
+        detail=selftest_failure_detail(gate, status=status, reason=reason, watch=watch,
+                                       unreaped=unreaped, refusal=refusal, blocking=blocking),
+        operator_detail=operator_detail, gate=gate, status=status, reason=reason, watch=watch,
+        unreaped=unreaped, refusal=refusal, blocking=blocking)
+
+
+def _watch_progress(watch: object | None) -> str:
+    if watch is None:
+        return ""
+    try:
+        summary = watch.summary()
+    except Exception:  # noqa: BLE001
+        return ""
+    return f" [{summary}]" if isinstance(summary, str) else ""
 
 
 def _reject_rpc(method: str) -> Callable[[dict], dict]:
@@ -466,11 +543,10 @@ def verify_backend(
 
             choice = improve_admission.choose_for_mission(scoped_settings, root)
             if choice.refusal is not None:
-                detail = f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}"
-                return VerifyBackendResult(
-                    ok=False, backend=backend, provider=effective_provider,
-                    fingerprint=None,
-                    detail=detail, operator_detail=detail)
+                operator_detail = f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}"
+                return _failure_result(
+                    backend=backend, provider=effective_provider, gate="sandbox_unavailable",
+                    status="failed", refusal=choice.refusal, operator_detail=operator_detail)
             isolation_options = choice.worker_options
         elif isolation_options is OPERATOR_SHELL_NO_ISOLATION:
             isolation_options = {}
@@ -531,49 +607,42 @@ def verify_backend(
         after_descendants = _descendant_pids(os.getpid())
 
         if not ready_frames:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("handshake", status=result.status,
-                                               reason=result.reason),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="handshake",
+                status=result.status, reason=result.reason,
                 operator_detail=("mission never reached ready (handshake failed): "
                                  f"status={result.status} reason={result.reason}"))
-        progress = f" [{watch.summary()}]" if watch is not None else ""
+        progress = _watch_progress(watch)
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
             # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("incomplete", status=result.status,
-                                               reason=result.reason, watch=watch),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="incomplete",
+                status=result.status, reason=result.reason, watch=watch,
                 operator_detail=(f"mission did not complete: status={result.status} "
                                  f"reason={result.reason}{progress}"))
         if not echoed and (result.status != "completed" or not result.output):
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("incomplete", status=result.status,
-                                               reason=result.reason),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="incomplete",
+                status=result.status, reason=result.reason,
                 operator_detail=(f"mission did not complete: status={result.status} "
                                  f"reason={result.reason}{progress}"))
         if not echoed and result.output.get("echo") != nonce:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("nonce", status=result.status,
-                                               reason=result.reason),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="nonce",
+                status=result.status, reason=result.reason,
                 operator_detail=("mission output failed the nonce round-trip "
                                  f"(schema/nonce gate){progress}"))
         if backend != "local" and not watcher.saw_any_descendant():
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("no_cli_child", status=result.status,
-                                               reason=result.reason),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="no_cli_child",
+                status=result.status, reason=result.reason,
                 operator_detail=("no CLI child process was observed during the run "
                                  "(cli_started gate)"))
         if backend != "local" and after_descendants:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=selftest_failure_detail("not_reaped", status=result.status,
-                                               reason=result.reason,
-                                               unreaped=len(after_descendants)),
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="not_reaped",
+                status=result.status, reason=result.reason, unreaped=len(after_descendants),
                 operator_detail=("CLI child process(es) were not reaped after the "
                                  "mission completed (pgid recovery gate): "
                                  f"{sorted(after_descendants)}"))
@@ -582,12 +651,11 @@ def verify_backend(
         fingerprint = hashlib.sha256(
             f"{backend}:{effective_provider}:{model}:{nonce}".encode("utf-8")
         ).hexdigest()
+        operator_detail = (f"backend={backend} provider={effective_provider} "
+                           f"model={model} fingerprint={fingerprint}{progress}")
         return VerifyBackendResult(
             ok=True, backend=backend, provider=effective_provider,
             fingerprint=fingerprint,
-            detail=f"backend={backend} provider={effective_provider} "
-                  f"model={model} fingerprint={fingerprint}{progress}",
-            operator_detail=f"backend={backend} provider={effective_provider} "
-                            f"model={model} fingerprint={fingerprint}{progress}")
+            detail=operator_detail, operator_detail=operator_detail)
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)
