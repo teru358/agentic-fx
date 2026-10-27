@@ -95,6 +95,8 @@ CLI_STDERR_FATAL_PATTERNS: tuple[str, ...] = (
 )
 
 #: パターンから失敗の固定分類を引く唯一の表。`stderr_fatal` の自由文は後から解析しない。
+#: 文言単独の `Unauthorized` は通常の文中にも現れるため分類には使わない (診断用の
+#: `CLI_STDERR_FATAL_PATTERNS` には残す)。
 CLI_STDERR_FAILURE_CLASS: dict[str, str] = {
     "code-mode host": "runner_fault",
     "SIGTRAP": "runner_fault",
@@ -103,7 +105,6 @@ CLI_STDERR_FAILURE_CLASS: dict[str, str] = {
     "usage limit": "resource_exhausted",
     "try again at": "resource_exhausted",
     "401 Unauthorized": "resource_exhausted",
-    "Unauthorized": "resource_exhausted",
     "429 Too Many Requests": "resource_exhausted",
 }
 
@@ -112,12 +113,24 @@ CLI_STDERR_FAILURE_CLASS: dict[str, str] = {
 _STDERR_FATAL_TAIL_CHARS = 200
 
 
+def _line_has_pattern(pattern: str, line: str) -> bool:
+    """語境界つきで 1 行の中に pattern があるか。"""
+    return re.search(
+        rf"(?<![\w]){re.escape(pattern)}(?![\w])", line) is not None
+
+
 def _detect_stderr_failure_class(stderr_text: str) -> str | None:
-    """`_detect_stderr_fatal` と同じ照合 (タプル順の最初の一致) で、固定分類を返す。"""
-    for pattern in CLI_STDERR_FATAL_PATTERNS:
-        if pattern and pattern in stderr_text:
-            return CLI_STDERR_FAILURE_CLASS.get(pattern)
-    return None
+    """行単位・語境界つきで全 pattern を照合し、固定分類を返す。`resource_exhausted`
+    が 1 つでも一致すれば、他の分類より優先する。"""
+    found: str | None = None
+    for line in stderr_text.splitlines():
+        for pattern, failure_class in CLI_STDERR_FAILURE_CLASS.items():
+            if not _line_has_pattern(pattern, line):
+                continue
+            if failure_class == "resource_exhausted":
+                return failure_class
+            found = found or failure_class
+    return found
 
 
 def _merge_failure_class(primary: str | None, recovery: str | None) -> str | None:

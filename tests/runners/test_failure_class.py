@@ -35,7 +35,6 @@ UNOBSERVED = {
     "try again at": "You've hit your limit. Please try again at 3:00 PM.",
     "429 Too Many Requests": "HTTP 429 Too Many Requests",
     "401 Unauthorized": "HTTP 401 Unauthorized: token expired",
-    "Unauthorized": "request failed: Unauthorized",
 }
 OBSERVED = {
     "code-mode host": REAL_CODEX_TAIL + "rror=code-mode host exited with status",
@@ -50,14 +49,43 @@ def test_every_pattern_has_exactly_one_class_and_the_pattern_order_is_kept():
         "code-mode host", "SIGTRAP", "closed its stdout", "Segmentation fault",
         "usage limit", "try again at", "401 Unauthorized", "Unauthorized",
         "429 Too Many Requests")
-    assert set(CLI_STDERR_FAILURE_CLASS) == set(CLI_STDERR_FATAL_PATTERNS)
+    assert set(CLI_STDERR_FAILURE_CLASS) == (
+        set(CLI_STDERR_FATAL_PATTERNS) - {"Unauthorized"})
     assert {p for p, c in CLI_STDERR_FAILURE_CLASS.items()
             if c == "resource_exhausted"} == {
         "usage limit", "try again at", "429 Too Many Requests",
-        "401 Unauthorized", "Unauthorized"}
+        "401 Unauthorized"}
     assert {p for p, c in CLI_STDERR_FAILURE_CLASS.items()
             if c == "runner_fault"} == {
         "code-mode host", "SIGTRAP", "closed its stdout", "Segmentation fault"}
+
+
+@pytest.mark.parametrize("text", [
+    "request failed: Unauthorized",
+    "the Unauthorized access check passed; schema mismatch in output",
+    "error: unauthorized_client is not a known field",
+    "got 4010 Unauthorizedx while parsing",
+    "elapsed 14012 ms; usage limits section was skipped",
+])
+def test_ordinary_text_with_the_words_does_not_classify(text):
+    assert _detect_stderr_failure_class(text) is None
+
+
+def test_a_bare_unauthorized_still_reaches_the_diagnostic_fatal_detection():
+    assert "pattern=Unauthorized" in _detect_stderr_fatal("request failed: Unauthorized")
+
+
+def test_resource_exhausted_wins_over_an_earlier_runner_fault_pattern():
+    text = ("code-mode host exited with status signal: 5 (SIGTRAP)\n"
+            "You've hit the usage limit. Please try again at 3:00 PM.")
+    assert _detect_stderr_failure_class(text) == "resource_exhausted"
+    reordered = "\n".join(reversed(text.splitlines()))
+    assert _detect_stderr_failure_class(reordered) == "resource_exhausted"
+
+
+def test_runner_fault_alone_stays_runner_fault():
+    assert _detect_stderr_failure_class("Segmentation fault (core dumped)") == (
+        "runner_fault")
 
 
 @pytest.mark.parametrize("pattern,text", {**OBSERVED, **UNOBSERVED}.items())
@@ -71,7 +99,7 @@ def test_no_match_gives_no_class():
     assert _detect_stderr_failure_class("elapsed 14012 ms, id abc-401-xyz") is None
 
 
-def test_class_follows_the_first_matching_pattern_like_stderr_fatal():
+def test_class_without_a_resource_pattern_follows_the_matching_pattern():
     text = "Unauthorized and also SIGTRAP"
     assert "pattern=SIGTRAP" in _detect_stderr_fatal(text)
     assert _detect_stderr_failure_class(text) == "runner_fault"
@@ -95,6 +123,15 @@ def test_cli_runner_failed_exit_carries_the_class(tmp_path):
     result = _new_runner(script, tmp_path).run(_mission())
     assert result.status == "failed"
     assert result.failure_class == "resource_exhausted"
+
+
+def test_cli_runner_failed_exit_with_ordinary_words_has_no_resource_class(tmp_path):
+    script = ("import sys\n"
+              "sys.stderr.write('Unauthorized access check passed; schema mismatch\\n')\n"
+              "sys.exit(3)\n")
+    result = _new_runner(script, tmp_path).run(_mission())
+    assert result.status == "failed"
+    assert result.failure_class is None
 
 
 def test_cli_runner_without_a_pattern_has_no_class(tmp_path):

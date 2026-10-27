@@ -286,12 +286,28 @@ def test_runner_fault_is_a_general_failure(env):
     assert (res.runs, res.stop_reason) == (2, "consecutive_failures")
 
 
-def test_failure_class_only_counts_for_failed(env):
+def test_resource_exhausted_on_a_timeout_stops_after_one(env):
     step = {"result": result("timeout", failure_class="resource_exhausted"),
             "db_status": "timeout"}
+    sup, loop, mono, waits = make(env, [step, OK])
+    res = Repeat(sup, mono=mono, max_runs=10).run()
+    assert (res.runs, res.stop_reason) == (1, "resource_exhausted")
+    assert waits == []
+
+
+def test_a_class_on_a_completed_mission_does_not_stop(env):
+    step = {"result": result("completed", failure_class="resource_exhausted")}
+    sup, loop, mono, _ = make(env, [step, step, step])
+    res = Repeat(sup, mono=mono, max_runs=3).run()
+    assert (res.runs, res.stop_reason) == (3, "max_runs")
+
+
+def test_max_turns_with_a_class_is_a_general_failure(env):
+    step = {"result": result("max_turns", failure_class="resource_exhausted"),
+            "db_status": "max_turns"}
     sup, loop, mono, _ = make(env, [step, step])
     res = Repeat(sup, mono=mono, max_runs=10).run()
-    assert res.stop_reason == "consecutive_failures"
+    assert (res.runs, res.stop_reason) == (2, "consecutive_failures")
 
 
 @pytest.mark.parametrize("status", ["timeout", "max_turns"])

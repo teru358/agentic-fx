@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -382,7 +383,8 @@ def test_spawn_failure_fails_the_slot_and_releases_ownership(tmp_path, monkeypat
         return real_start(self)
 
     monkeypatch.setattr(threading.Thread, "start", start)
-    sup.tick(NOW)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        sup.tick(NOW)
     conn = db_mod.connect(db)
     rows = conn.execute("SELECT status FROM improve_wave_slots").fetchall()
     conn.close()
@@ -522,3 +524,188 @@ def test_a_waiting_weekly_start_blocks_admission_even_without_an_open_slot(tmp_p
         sup._gate.notify_all()
     t.join(T)
     assert admitted == [None] and sup._manual_active is True
+
+
+# ---- 待ちの間の autopilot / DB 確認の頻度 / now の採り直し / tick の再送出 ----
+
+def test_autopilot_turning_true_while_waiting_for_the_gate_stops_the_repeat(tmp_path):
+    db, sup, loop = fresh(tmp_path, default={})
+    own(sup)
+    busy = busy_spy(sup)
+    flag = {"on": False}
+    rep = Repeat(sup, max_runs=3, autopilot=lambda: flag["on"])
+    out = []
+    rt = threading.Thread(target=lambda: out.append(rep.run()), daemon=True)
+    rt.start()
+    assert busy.wait(T)
+    assert rt.is_alive() and loop.prepared == []
+    flag["on"] = True
+    rt.join(T)
+    assert not rt.is_alive()
+    assert out[0].stop_reason == "autopilot" and out[0].runs == 0
+    assert loop.prepared == []
+    assert slot_status(db) == "reserved"       # 週次 slot はまだ終わっていない
+    assert sup._manual_active is False
+
+
+def counting_busy(sup):
+    calls = []
+    real = sup._weekly_busy_locked
+
+    def spy(warned):
+        calls.append(1)
+        return real(warned)
+
+    sup._weekly_busy_locked = spy
+    return calls
+
+
+def test_the_wait_does_not_hit_the_database_every_poll(tmp_path):
+    db, sup, loop = fresh(tmp_path, default={})
+    own(sup)
+    calls = counting_busy(sup)
+    rep = Repeat(sup, max_runs=1)
+    rt = threading.Thread(target=rep.run, daemon=True)
+    rt.start()
+    deadline = time.monotonic() + T
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+    time.sleep(0.4)                       # poll は 0.02 秒: 20 回は回る
+    assert len(calls) == 1
+    rep.cancel.set()
+    rt.join(T)
+    assert not rt.is_alive()
+
+
+def test_the_database_is_rechecked_at_the_recheck_interval(tmp_path, monkeypatch):
+    monkeypatch.setattr(ir, "WAIT_RECHECK_SEC", 0.1)
+    db, sup, loop = fresh(tmp_path, default={})
+    own(sup)
+    calls = counting_busy(sup)
+    rep = Repeat(sup, max_runs=1)
+    rt = threading.Thread(target=rep.run, daemon=True)
+    rt.start()
+    deadline = time.monotonic() + T
+    while len(calls) < 3 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(calls) >= 3
+    rep.cancel.set()
+    rt.join(T)
+
+
+def test_a_notify_triggers_a_database_recheck_without_waiting_for_the_interval(tmp_path):
+    db, sup, loop = fresh(tmp_path, default={})
+    own(sup)
+    calls = counting_busy(sup)
+    rep = Repeat(sup, max_runs=1)
+    out = []
+    rt = threading.Thread(target=lambda: out.append(rep.run()), daemon=True)
+    rt.start()
+    deadline = time.monotonic() + T
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+    spawn_weekly(sup).join(T)             # 終端 + 収束で notify される
+    rt.join(T)
+    assert out and out[0].runs == 1
+    assert len(calls) >= 2
+
+
+@pytest.mark.parametrize("kind", ["cancel", "stop"])
+def test_cancel_and_stop_are_quick_and_cost_no_extra_database_checks(tmp_path, kind):
+    stop = threading.Event()
+    db, sup, loop = fresh(tmp_path, stop=stop)
+    own(sup)
+    calls = counting_busy(sup)
+    rep = Repeat(sup, max_runs=3)
+    out = []
+    rt = threading.Thread(target=lambda: out.append(rep.run()), daemon=True)
+    rt.start()
+    deadline = time.monotonic() + T
+    while not calls and time.monotonic() < deadline:
+        time.sleep(0.005)
+    n = len(calls)
+    started = time.monotonic()
+    if kind == "cancel":
+        rep.cancel.set()
+    else:
+        stop.set()
+        sup.shutdown()
+    rt.join(T)
+    assert not rt.is_alive()
+    assert time.monotonic() - started < 1.0
+    assert len(calls) == n
+
+
+def test_prepare_receives_the_time_taken_after_the_gate_wait(tmp_path):
+    from datetime import timedelta
+
+    from tests.core._improve_repeat_helpers import Clock
+    clock = Clock()
+    db, sup, loop = fresh(tmp_path, slots=1, clock=clock)
+    loop.default = {}
+    seen = []
+    real_prepare = loop.prepare
+
+    def prepare(*, slot_key, now, **kw):
+        seen.append((slot_key, now))
+        return real_prepare(slot_key=slot_key, now=now, **kw)
+
+    loop.prepare = prepare
+    sup._manual_active = True               # 繰り返しの mission が走っている
+    own(sup)
+    wt = spawn_weekly(sup)
+    wait_until(sup, lambda: sup._weekly_waiting == 1)
+    later = NOW + timedelta(minutes=45)
+    clock.value = later
+    with sup._gate:
+        sup._manual_active = False
+        sup._gate.notify_all()
+    wt.join(T)
+    assert not wt.is_alive()
+    assert seen == [((PERIOD, 0), later)]
+
+
+def test_tick_starts_the_remaining_slots_and_reraises_the_first_spawn_failure(tmp_path):
+    db = init_db(tmp_path, slots=0)
+    sup, loop = build(db, tmp_path, default={})
+    sup._capacity = 2
+    sup._settings.improve.parallel = 2
+    started = []
+
+    def spawn(period_key, k):
+        if k == 0:
+            raise RuntimeError("can't start new thread")
+        started.append(k)
+
+    sup._spawn_slot_thread = spawn
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        sup.tick(NOW)
+    assert started == [1]
+    conn = db_mod.connect(db)
+    rows = conn.execute(
+        "SELECT k, status FROM improve_wave_slots ORDER BY k").fetchall()
+    conn.close()
+    assert [(r["k"], r["status"]) for r in rows] == [(0, "failed"), (1, "reserved")]
+    assert sup._owned_slots == {(PERIOD, 1)}
+
+
+def test_tick_reraises_the_first_failure_when_every_spawn_fails(tmp_path):
+    db = init_db(tmp_path, slots=0)
+    sup, loop = build(db, tmp_path, default={})
+    sup._capacity = 2
+    sup._settings.improve.parallel = 2
+    errors = []
+
+    def spawn(period_key, k):
+        errors.append(RuntimeError(f"spawn {k}"))
+        raise errors[-1]
+
+    sup._spawn_slot_thread = spawn
+    with pytest.raises(RuntimeError, match="spawn 0") as info:
+        sup.tick(NOW)
+    assert info.value is errors[0]
+    conn = db_mod.connect(db)
+    rows = conn.execute("SELECT status FROM improve_wave_slots").fetchall()
+    conn.close()
+    assert [r["status"] for r in rows] == ["failed", "failed"]
+    assert sup._owned_slots == set()

@@ -1201,7 +1201,6 @@ class ImproveLoop:
                    if bl.get("notes_omitted", 0) else "")),
             "min_test_functions": self._settings.improve.gate.min_test_functions,
             "user_policy_tail": policy["tail"],
-            "oneoff_comment_section": render_oneoff_section(oneoff_comment),
             "plugin_name_pattern": refs["plugin_name_pattern"],
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
@@ -1211,15 +1210,18 @@ class ImproveLoop:
             # にゲートと説明が食い違う)。
             "profitability_floor_rule": self._floor_rule_text(),
         }
-        rendered = mission_template().format(**render_map)
+        # 一時指示の節は template の 1 か所だけ。その前後を描画して間に節を挟む
+        # (全体を 2 回描画しない)。観測面 (`_last_rendered_prompt`) は節なしの形で、
+        # 一時指示の本文を残さない。
+        head, _sep, tail = mission_template().partition("{oneoff_comment_section}")
+        head_text = head.format(**render_map)
+        tail_text = tail.format(**render_map)
+        rendered = head_text + render_oneoff_section(oneoff_comment) + tail_text
         # [indicator-consumption-wiring] T5a Step 5-1c: テスト専用の観測面
         # (`tests/loops/test_improve_loop_source_snapshot.py::
         # test_prompt_shows_the_number_of_pin_broken_strategies`)。本番挙動
         # は変わらない。
-        # 観測面には一時指示の本文を残さない。
-        self._last_rendered_prompt = (
-            rendered if oneoff_comment is None else mission_template().format(
-                **{**render_map, "oneoff_comment_section": ""}))
+        self._last_rendered_prompt = head_text + tail_text
         return rendered
 
     def _floor_rule_text(self) -> str:

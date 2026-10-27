@@ -270,13 +270,21 @@ class ImproveSupervisor:
         finally:
             if owns:
                 conn.close()
+        # 起動に失敗した slot は fail-closed に収束させ、残りの slot は起動する。
+        # 呼び出し元 (scheduler) が tick の異常を知れるよう、全 slot の処理後に
+        # 最初の例外を送出し直す。
+        first_error: Exception | None = None
         for k in pending_ks:
             try:
                 self._spawn_slot_thread(period_key, k)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 _log.exception(
                     "improve slot thread start failed for %s/%s", period_key, k)
                 self._converge_slot(period_key, k)
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def submit_manual(self, *, on_prepared: "Callable[[int], None] | None" = None,
                       comment: str | None = None) -> int:
@@ -563,7 +571,6 @@ class ImproveSupervisor:
         # mission_id はまだ無い。Tx-0 (missions.start + improve_runs.start +
         # slot claim reserved→claimed) は self._improve_loop.prepare が
         # 一体で行う (統合裁定 R-i2、Task 10 の 10.2 節が正)。
-        now = self._clock.now()
         while True:
             reached_running = False
 
@@ -601,6 +608,8 @@ class ImproveSupervisor:
             hold = self._weekly_enter()
             if hold is None:
                 return
+            # gate を待った後の時刻で claim する。
+            now = self._clock.now()
             try:
                 mission, ctx, runner = self._prepare(
                     slot_key=(period_key, k), now=now, on_ready=_on_ready,
@@ -685,10 +694,10 @@ class ImproveSupervisor:
                 # I-3 不変条件 (join budget は watchdog ceiling と同じ値
                 # を共有する) に、retry loop 導入で 1 スレッドが最大 2 回
                 # 分の spawn/待ちを行いうるようになったことが抵触する。
-                # slot は既に `_handle_pre_ready_failure` が `reserved`
-                # へ戻し終えている (次回起動時の reconcile/tick が拾う)。
+                # slot は `_handle_pre_ready_failure` が `reserved` へ戻した後、
+                # スレッド終端の収束が `failed` にする (再起動時の回収も
+                # `reserved` を `failed` にするので、どちらでも再実行されない)。
                 return
-            now = self._clock.now()
 
     def _handle_pre_ready_failure(self, period_key: str, k: int) -> bool:
         """戻り値: `True` = slot を `reserved` へ戻した (呼び出し元は
@@ -792,18 +801,32 @@ class ImproveSupervisor:
 
     def _admit_manual(self, check: "Callable[[], str | None]") -> "str | None":
         """繰り返しの mission を始めてよくなるまで待つ。始めてよければ
-        `manual_active` を立てて None を返す。停止の理由があればそれを返す。"""
+        `manual_active` を立てて None を返す。停止の理由があればそれを返す。
+
+        停止・期限・autopilot の確認 (`check`) は短い刻みで毎回行う。週次 slot の
+        DB 確認は、gate の通知を受けたときと `WAIT_RECHECK_SEC` ごとだけにする。"""
         warned: set = set()
+        busy = True
+        need_db = True
+        last_db = time.monotonic()
         with self._gate:
             while True:
                 reason = check()
                 if reason is not None:
                     return reason
-                if (not self._manual_active and self._weekly_waiting == 0
-                        and not self._weekly_busy_locked(warned)):
-                    self._manual_active = True
-                    return None
-                self._gate.wait(self._poll_sec)
+                if not self._manual_active and self._weekly_waiting == 0:
+                    if need_db:
+                        busy = self._weekly_busy_locked(warned)
+                        last_db = time.monotonic()
+                        need_db = False
+                    if not busy:
+                        self._manual_active = True
+                        return None
+                else:
+                    need_db = True
+                notified = self._gate.wait(self._poll_sec)
+                if notified or time.monotonic() - last_db >= ir.WAIT_RECHECK_SEC:
+                    need_db = True
 
     def _release_manual(self) -> None:
         with self._gate:
@@ -847,36 +870,34 @@ class ImproveSupervisor:
             except Exception:  # noqa: BLE001
                 _log.warning("improve_repeat_progress_failed")
 
-        def stop_check(runs: int, consecutive: int, exhausted: bool,
+        def stop_check(runs: int, consecutive: int,
                        autopilot: bool) -> "str | None":
             return ir.decide_next(
                 runs=runs, max_runs=limit, mono_now=monotonic(),
                 deadline_mono=deadline_mono, consecutive_failures=consecutive,
-                last_resource_exhausted=exhausted,
+                last_resource_exhausted=False,
                 stop_requested=cancel_event.is_set(),
                 daemon_stopping=self._stop_event.is_set(), autopilot=autopilot)
 
         runs = 0
         consecutive = 0
-        exhausted = False
         last_mission_id: "int | None" = None
         reason: "str | None" = None
         progress(phase="waiting_slot", runs=0, deadline_at=deadline_at)
         try:
             while True:
-                reason = stop_check(runs, consecutive, exhausted,
-                                    bool(autopilot_check()))
+                reason = stop_check(runs, consecutive, bool(autopilot_check()))
                 if reason is not None:
                     break
                 if runs > 0:
                     progress(phase="waiting_slot")
                 reason = self._admit_manual(
-                    lambda: stop_check(runs, consecutive, exhausted, False))
+                    lambda: stop_check(runs, consecutive,
+                                       bool(autopilot_check())))
                 if reason is not None:
                     break
                 try:
-                    reason = stop_check(runs, consecutive, exhausted,
-                                        bool(autopilot_check()))
+                    reason = stop_check(runs, consecutive, bool(autopilot_check()))
                     if reason is not None:
                         break
                     started = False
@@ -891,7 +912,6 @@ class ImproveSupervisor:
                     comment = comment_holder.get() if comment_holder else None
                     outcome = self._execute_mission(
                         comment=comment, on_prepared=on_prepared, reraise=False)
-                    comment = None
                 finally:
                     self._release_manual()
                 if not started:
@@ -907,21 +927,19 @@ class ImproveSupervisor:
                     break
                 if outcome.status == "completed":
                     consecutive = 0
-                    exhausted = False
                     continue
-                if (outcome.status == "failed"
+                if (outcome.status in ("failed", "timeout")
                         and outcome.failure_class == ir.FAILURE_RESOURCE_EXHAUSTED):
-                    exhausted = True
                     reason = ir.STOP_RESOURCE_EXHAUSTED
                     break
                 consecutive += 1
-                reason = stop_check(runs, consecutive, exhausted, False)
+                reason = stop_check(runs, consecutive, False)
                 if reason is not None:
                     break
                 progress(phase="backoff")
                 reason = self._backoff(
                     ir.BACKOFF_SEC, cancel_event, monotonic,
-                    lambda: stop_check(runs, consecutive, exhausted, False))
+                    lambda: stop_check(runs, consecutive, False))
                 if reason is not None:
                     break
         finally:

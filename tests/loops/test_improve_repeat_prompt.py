@@ -64,3 +64,34 @@ def test_last_rendered_prompt_never_keeps_the_comment(tmp_path):
     assert "CANARY-ONEOFF" in text
     assert "CANARY-ONEOFF" not in loop._last_rendered_prompt
     assert "今回だけの指示" not in loop._last_rendered_prompt
+
+
+def test_last_rendered_prompt_is_the_comment_free_prompt(tmp_path):
+    base = _render(tmp_path)
+    loop = _loop()
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+    text = loop._render_improve_mission_prompt(
+        _sample_ctx_data(), ctx=ctx, oneoff_comment="CANARY-ONEOFF")
+    assert loop._last_rendered_prompt == base
+    assert text != base
+    plain = _loop()
+    plain._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
+    assert plain._last_rendered_prompt == base
+
+
+def test_the_template_body_is_rendered_once_even_with_a_comment(tmp_path, monkeypatch):
+    template = mission_template()
+    formatted = []
+
+    class Counting(str):
+        def format(self, *args, **kw):
+            formatted.append(len(self))
+            return str.format(self, *args, **kw)
+
+        def partition(self, sep):
+            head, mid, tail = str.partition(self, sep)
+            return Counting(head), mid, Counting(tail)
+
+    monkeypatch.setattr(il, "mission_template", lambda: Counting(template))
+    _render(tmp_path, oneoff_comment="x")
+    assert sum(formatted) <= len(template)
