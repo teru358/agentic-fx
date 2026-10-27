@@ -1,6 +1,6 @@
 # afx ctl improve の繰り返し (-t) / 一時的な指示 (-c) / 回数 (-n) 設計書
 
-**版:** v0.4 C0 (設計レビュー 3 周目の反映。§8 の製品判断 6 件はユーザー裁定済、2026-10-26)
+**版:** v0.5 C0 (T1 実装とレビュー 1 周目の裁定の反映。v0.4 は設計レビュー 3 周目の反映。§8 の製品判断 6 件はユーザー裁定済、2026-10-26)
 
 **対象:** `ctl-improve-repeat-duration-and-oneoff-comment` (2026-10-25 のユーザー依頼と裁定)
 
@@ -26,7 +26,7 @@
 ## 1. 用語
 
 - **繰り返し job**: `-t` か `-n` を付けた `afx ctl improve` が作る 1 本の job。mission を直列に回す (最大 1 回の場合も含む)。`-c` はその全 mission に注入される。
-- **期限**: 繰り返し controller が走り始めた時刻 (単調時計) に `-t` を足した時刻。`-n` だけのときは 24h。**新しい mission を始めてよいかの判定にだけ使う** (admission の上限)。開始済みの mission と後処理は既存の各 timeout に従う。
+- **期限**: 繰り返し job を受理した時刻 (単調時計。slot 待ちも期限に含む) に `-t` を足した時刻。`-n` だけのときは 24h。**新しい mission を始めてよいかの判定にだけ使う** (admission の上限)。開始済みの mission と後処理は既存の各 timeout に従う。
 - **完走**: 開始した mission を中断せずに終端まで走らせること。
 - **一時指示 (comment)**: `-c` の文。その job の全 mission に同じ文で注入する。job が終わると消える。
 - **admission gate**: supervisor 内の 1 つの排他。繰り返し job の mission 開始と、週次 slot の `claimed` への遷移を線形化する (§3.5)。
@@ -106,12 +106,12 @@ daemon を再起動すると繰り返しは中断します。
 
 - 期間 24h、`-n` 24、comment 1000 字は固定値で、settings にしない (チケット裁定。理由: 無人で codex / claude の枠を使い切る、429 連続、週次との重なり)。
 - `-n` だけのときも、期限は 24h として判定する (無期限の job を作らない)。
-- **時計**: 期限の判定は単調時計。`Clock` 契約 (`now()` のみ) には単調時刻が無いので、repeat controller に `monotonic: Callable[[], float]` を注入する。開始時に `repeat_deadline_mono = start_mono + duration` を一度だけ計算する。表示用の `deadline_at` は、同時に採った UTC の wall time から別に計算する (wire は ISO-8601 UTC)。wall clock が前後しても開始判定は変わらない。
+- **時計**: 期限の判定は単調時計。`Clock` 契約 (`now()` のみ) には単調時刻が無いので、repeat controller に `monotonic: Callable[[], float]` を注入する。受理時 (submit_repeat の呼び出し時。controller thread の起動や slot 待ちより前) に `repeat_deadline_mono = start_mono + duration` を一度だけ計算する。表示用の `deadline_at` は、同時に採った UTC の wall time から別に計算する (wire は ISO-8601 UTC)。wall clock が前後しても開始判定は変わらない。
 - `repeat_deadline_mono` は新設の値で、既存 `Job.deadline_mono` (improve 開始時の認可・flock のための 35 秒の期限) とは別。後者の意味は変えない。
 
 ### 3.3 失敗時
 
-全 mission を同じ outcome に正規化する。executor が prepare / run / commit・補償を実行し、`MissionOutcome(status, failure_class, mission_id)` を返す。`status` は**補償後の DB 終端 `missions.status`** (`MissionResult.status` が `completed` でも commit の schema / gate 判定で `failed` になり得るため、正はこちら)。ただし run の終了時に daemon stop Event が立っていた場合 (graceful shutdown) は、executor 固有の `status=shutdown` を返す。DB の `missions.status` は既存どおり (`failed` / `timeout` など) で変えない。`interrupted` は起動時回収 (`store/missions.py`) だけが書く値で、停止中の controller は読めないので、これには依存しない。prepare / run / commit が例外を投げた場合も補償して `failed` として数える (stop Event が立っていれば `shutdown`)。1 回目も 2 回目以降も同じ扱いで、従来の例外再送出は非 repeat の `submit_manual` だけに残す。
+全 mission を同じ outcome に正規化する。executor が prepare / run / commit・補償を実行し、`MissionOutcome(status, failure_class, mission_id)` を返す。`status` は**補償後の DB 終端 `missions.status`** (`MissionResult.status` が `completed` でも commit の schema / gate 判定で `failed` になり得るため、正はこちら)。ただし run の終了後に supervisor の stop が立っていた場合 (graceful shutdown) は、executor 固有の `status=shutdown` を返す。DB の `missions.status` は既存どおり (`failed` / `timeout` など) で変えない。`interrupted` は起動時回収 (`store/missions.py`) だけが書く値で、停止中の controller は読めないので、これには依存しない。prepare / run / commit が例外を投げた場合も補償して `failed` として数える (stop Event が立っていれば `shutdown`)。1 回目も 2 回目以降も同じ扱いで、従来の例外再送出は非 repeat の `submit_manual` だけに残す。
 
 **failure_class** は固定語の閉集合 `resource_exhausted` / `runner_fault` / なし。自由文の `stderr_fatal` は診断用に残し、controller は解析しない。5 段で通す (T1):
 
@@ -119,12 +119,12 @@ daemon を再起動すると繰り返しは中断します。
 2. `mission_worker` の result frame に `failure_class` を足す。
 3. `WorkerRunner` が閉集合で検証し (外の値はなしに倒す)、親側の `MissionResult` に復元する。
 4. executor が、commit 後に読んだ `missions.status` と手元の class を `MissionOutcome` にまとめる。
-5. controller は `status == failed` かつ `failure_class == resource_exhausted` のときだけ即停止する。
+5. controller は `status` が `failed` または `timeout` で `failure_class == resource_exhausted` のときだけ即停止する (`completed` / `max_turns` は対象外)。
 
-pattern の分類: `resource_exhausted` は `usage limit`、`try again at`、`429 Too Many Requests`、認証失効 (`Unauthorized`) の固定 pattern のみ (現行に 429 は無く追加する)。`runner_fault` は `code-mode host`、`SIGTRAP`、`closed its stdout`、`Segmentation fault`。`runner_fault` は資源枯渇ではない (一般の失敗)。正確な文字列は実 transcript から確定する (§9)。
+pattern の分類: `resource_exhausted` は `usage limit`、`try again at`、`429 Too Many Requests`、認証失効 (`401 Unauthorized` の形のみ。素の `Unauthorized` は含めない) の固定 pattern のみ (現行に 429 は無く追加する)。照合は行単位・語境界で行い、複数の class に一致したときは `resource_exhausted` を優先する。`runner_fault` は `code-mode host`、`SIGTRAP`、`closed its stdout`、`Segmentation fault`。`runner_fault` は資源枯渇ではない (一般の失敗)。正確な文字列は実 transcript から確定する (§9)。
 
 - **一般の失敗: 連続 2 回で止める** (成功が 1 回挟まれば数え直し)。`failed` のうち `resource_exhausted` でないもの (`timeout` / `max_turns` / `runner_fault` / class なしを含む)。停止理由 `consecutive_failures`。
-- **回復待ちの失敗: 1 回で止める** (`resource_exhausted`)。回復しない枠にもう 1 mission 分を使わないため。停止理由 `resource_exhausted`。
+- **回復待ちの失敗: 1 回で止める** (`resource_exhausted`、status が `failed` または `timeout` のとき)。回復しない枠にもう 1 mission 分を使わないため。停止理由 `resource_exhausted`。
 - **一般の失敗の後に backoff を置く**: 固定 300 秒 (固定値、settings にしない)。同時 controller は 1 本なので jitter は不要。`sleep` でなく Event / Condition の wait とし、cancel / daemon 停止で即座に起き、30 秒ごとに停止系と (2 回目以降は) 期限を見直す。成功の後と `resource_exhausted` の停止は置かない。
 - `shutdown` は失敗に数えず、停止理由 `shutdown` で終わる。
 
@@ -141,7 +141,8 @@ supervisor が 1 つの admission gate (lock + 条件 + `manual_active`) を持�
 - `manual_active` は mission の終端 (commit・補償の後) に `finally` で必ず下ろし、Condition を notify する (例外・cancel・shutdown でも)。
 - 繰り返しが待つ slot は、**supervisor が所有登録している週次開始に対応するもの**だけ。DB にある所有登録の無い非終端 slot は待たず、固定語の警告を技術ログに出す (永久待ちを避ける)。
 - **孤児 `reserved` の fail-closed 収束** (時限 lease は作らない。daemon crash は既存の起動時回収 `recover_stale_slots`): (a) wave / slot 作成後に slot thread の登録・`start()` が失敗したら、その slot を `failed` にして所有登録を外す。(b) slot thread (`_run_slot_thread`) の top-level `finally` で、所有中の非終端 slot を `failed` に終端し (`store/improve_waves.py` の終端 API)、所有登録を外して gate を notify する。claim 前の例外終了もここに含む。(c) pre-ready の補償が失敗しても slot は `failed` にする。
-- 1 回目も同じ gate を通る。期限は無視するが、cancel / shutdown / autopilot は見る (§3.1)。待ちは 30 秒ごとの再確認で、停止要求・daemon 停止と、2 回目以降は期限を見る。待っている間に期限が来たら次を始めずに止める (`deadline`)。
+- 1 回目も同じ gate を通る。期限は無視するが、cancel / shutdown / autopilot は見る (§3.1)。繰り返し側の gate 待ちは、cancel / stop / 2 回目以降の期限 / autopilot を短い刻み (0.5 秒) で確認し、DB の週次占有確認は gate の通知時と `WAIT_RECHECK_SEC` (30 秒) 刻みで行う。gate 待ちの後は時刻を採り直して判定する。待っている間に期限が来たら次を始めずに止める (`deadline`)。
+- 週次の `tick` で slot の spawn に失敗したら、その slot を `failed` に収束して残りの slot を起動し、全 slot の処理後に最初の例外を再送出する。
 - 引数なし・`-c` のみの手動 1 回はこの gate を通らない (従来どおり)。週次の `tick` の容量計算は変えない。変えるのは claim と start が `manual_active` を待つ点だけ。
 
 ## 4. comment の扱い
@@ -167,7 +168,7 @@ supervisor が 1 つの admission gate (lock + 条件 + `manual_active`) を持�
 
 `POST /v1/improve/runs` の本文に任意の `duration_sec` (整数秒)、`max_runs`、`comment` を足す。`ENDPOINTS` の code・route・scope・件数は変えない (同じ endpoint の本文拡張。routing の期待引数、全 endpoint 表の pin、crash / idempotency grid は更新対象)。本文が空の要求は従来と同じ (digest も同じ、従来の経路)。`comment` のみの要求は従来の経路 (one-shot) で、`duration_sec` か `max_runs` がある要求が繰り返し job になる。job は既存の `enqueue_single("improve")` を使い、1 本枠と `improve_running` をそのまま保つ。
 
-job の `result` は進捗を持つ辞書で、**enqueue 時に完全な初期値 (`runs=0`、`phase=waiting_slot` ほか) を設定する**: `mission_id`、`runs`、`max_runs`、`deadline_at` (ISO-8601 UTC)、`phase` (固定語: `waiting_slot` / `running` / `backoff` / `finished`)、`stop_requested`、終了後は `stop_reason`。自由文を含めない (ops-api §8)。`stop_reason` は固定語: `deadline` / `max_runs` / `stopped` / `consecutive_failures` / `resource_exhausted` / `autopilot` / `shutdown`。
+job の `result` は進捗を持つ辞書で、**enqueue 時に完全な初期値 (`runs=0`、`phase=waiting_slot` ほか) を設定する**: `mission_id`、`runs`、`max_runs`、`deadline_at` (ISO-8601 UTC。正本は受理時に決めた期限)、`phase` (固定語: `waiting_slot` / `running` / `backoff` / `finished`)、`stop_requested`、終了後は `stop_reason`。自由文を含めない (ops-api §8)。`stop_reason` は固定語: `deadline` / `max_runs` / `stopped` / `consecutive_failures` / `resource_exhausted` / `autopilot` / `shutdown`。
 
 **進捗の更新は thread-safe にする**。現行の prepared callback は `job.result` を lock 外で直接更新している。`JobRegistry.update_result(job, patch)` を追加し、registry の lock 内で辞書を丸ごと置換する。`runs` は mission の開始を確定した時点、`mission_id` は同じ更新で公開する。終端の audit / result との競合は CAS で防ぎ、`JobRegistry.finish()` は registry の lock 内で終端 result を合成し、進捗キー (`phase` / `stop_reason` / `runs` / `mission_id` / `stop_requested`) は現在の `job.result` を優先する (終端 result は追加キーだけ足せ、同名キーでは進捗が勝つ)。job 側の `cancel_event` と `stop_requested` は registry の lock 内で扱う (§2.3)。
 
@@ -175,11 +176,11 @@ job の `result` は進捗を持つ辞書で、**enqueue 時に完全な初期�
 
 `submit_manual` の本体を **1 mission executor** (prepare → run → commit・補償 → `MissionOutcome` を返す) に切り出し (挙動は同一)、`submit_manual` はそれを 1 回呼ぶ薄い形にする。新規の **repeat controller** (`submit_repeat`) が §3 のループ、gate、backoff を持つ。判定は純関数 (次を始めるか、止める理由) に出し、単調時刻・停止要求・daemon stop・autopilot・slot の状態は引数で渡す (test しやすくするため)。
 
-controller には callback interface を渡す: `on_progress(patch)` (job の `update_result` に繋ぐ)、利用者 cancel の `cancel_event`、autopilot の再確認 callback。**利用者 cancel の Event は WorkerRunner の daemon stop Event と分離する**。cancel は走行中 mission を中断せず、daemon stop は既存どおり WorkerRunner が mission を打ち切る。DB の mission は既存の補償終端 (`failed` / `timeout` など) のまま、executor が repeat 用の outcome として `shutdown` を返す。`interrupted` は crash-restart の起動時回収専用で、停止中の controller は使わない。comment は `prepare` の任意引数で受けてプロンプトの組立てに渡し、`ImproveRunContext` には保存しない。各 mission の開始・終了の通知は、Discord 設計 §4.4 のとおり `prepare` 成功後と終端後に supervisor が mission ごとに出すので、繰り返しのために変えない。
+controller には callback interface を渡す: `on_progress(patch)` (job の `update_result` に繋ぐ)、利用者 cancel の `cancel_event`、autopilot の再確認 callback。**利用者 cancel の Event は WorkerRunner の daemon stop Event と分離する**。cancel は走行中 mission を中断せず、daemon stop も改善 mission を打ち切らない (改善 mission の WorkerRunner に daemon の stop_event は渡っていない。`improve_loop.py` の `_build_worker_runner`、現行挙動が正。shutdown 挙動の変更は本書の範囲外)。走行中 mission は自分の timeout まで走り、終了後に supervisor の stop を見て、executor が repeat 用の outcome として `shutdown` を返す。DB の mission は既存の補償終端 (`failed` / `timeout` など) のまま。`interrupted` は crash-restart の起動時回収専用で、停止中の controller は使わない。comment は `prepare` の任意引数で受けてプロンプトの組立てに渡し、`ImproveRunContext` には保存しない。各 mission の開始・終了の通知は、Discord 設計 §4.4 のとおり `prepare` 成功後と終端後に supervisor が mission ごとに出すので、繰り返しのために変えない。
 
 ### 5.3 再起動と失敗
 
-- job 表はメモリ上 (ops-api §5)。**graceful shutdown (通常停止)** では、走行中 mission は daemon stop Event で WorkerRunner に打ち切られ、executor が `shutdown` outcome を返し、controller が停止理由 `shutdown` で終わる (shutdown-before-first、worker ready 前、running、backoff 中を別々に test)。**crash-restart** (daemon が落ちた場合) は controller が消えており、繰り返しは再開しない (安全側。期限・回数の再計算と comment の復元が要るため)。走行中の mission は起動時回収で `interrupted` になり、Discord の `finished` (failed / interrupted) で分かる。二つは別経路。開始時の表示 (§2.2) で利用者に伝える。
+- job 表はメモリ上 (ops-api §5)。**graceful shutdown (通常停止)** では、走行中 mission は打ち切られず自分の timeout まで走り (WorkerRunner に daemon stop は渡っていない。shutdown 挙動の変更は範囲外)、終了後に supervisor の stop を見て executor が `shutdown` outcome を返し、controller が停止理由 `shutdown` で終わる (shutdown-before-first、worker ready 前、running、backoff 中を別々に test)。**crash-restart** (daemon が落ちた場合) は controller が消えており、繰り返しは再開しない (安全側。期限・回数の再計算と comment の復元が要るため)。走行中の mission は起動時回収で `interrupted` になり、Discord の `finished` (failed / interrupted) で分かる。二つは別経路。開始時の表示 (§2.2) で利用者に伝える。
 - autopilot: ops-api §5 の規律 (autopilot=true の後に新しい変更を始めない) を mission ごとに守る。開始前の再確認 (`_autopilot_at_start` と同じ flock 内の読み) を**毎回の開始前**に行う (1 回目の確認は job 受理時の既存のものに加えて、controller が開始直前にもう一度)。引数なしの従来の確認は変えない。
 - 補償は mission ごと (既存の `compensate_*`)。job の途中で止まった理由は `stop_reason` と activity に固定語 `improve_repeat_finished reason=<固定語> runs=<n>` で残す。controller 自体の予期しない例外は、既存 `_run_single` と同じく job を `failed` (固定の失敗コード `internal`、新設しない) にする。その前に `finally` で `manual_active` の解放、comment holder の消去、最後の進捗の保持を行う。通常の停止 (上の `stop_reason`) は `state=done`。
 
@@ -197,14 +198,14 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 4 | 最低保証: 期限が過ぎていても 1 回目は開始する (`-t 1m` で 1 回目が 1 分を越えて走っても完走)。ただし cancel / daemon stop / autopilot が先に成立していれば 1 回目も開始しない (`runs=0`、`stopped` / `shutdown` / `autopilot`) |
 | 5 | 期限の判定点: 期限の 1 秒前に開始した mission は完走し、期限ちょうど (`now == deadline`) では次を始めない。mission の途中で期限が来ても中断しない。単調時計を注入した test で、wall clock を前後させても開始判定が変わらない。実時計の短い期限 (内部 API で秒指定) で単調時計の統合 test を 1 本。`Job.deadline_mono` (35 秒) は変わらない |
 | 6 | `-n` と `-t` は先に達した方で止まる。`-n` のみは 24h の期限を持つ。回数の上限は開始数 (失敗も数える) |
-| 7 | 失敗: 全回で同じ outcome (`MissionOutcome` の DB 終端 `missions.status` で数える)。1 回目の例外も 2 回目以降と同じく、補償して失敗に数える。一般の失敗は連続 2 回で `consecutive_failures`、成功が挟まれば数え直す。`failure_class` は CliRunner → `MissionResult` → worker frame → WorkerRunner → `MissionOutcome` の 5 段を通し、`usage limit` / `try again at` / `429` / 認証失効 (`Unauthorized`) は `resource_exhausted` で 1 回停止、`SIGTRAP` / `Segmentation fault` / `code-mode host` / `closed its stdout` は `resource_exhausted` にならない (一般の失敗)。worker frame の閉集合外の値はなしに倒す。一般の失敗の後は 300 秒の backoff (Event wait で cancel / shutdown に即応し、30 秒ごとに期限も見直す。成功の後は置かない)。graceful shutdown は `shutdown` outcome で失敗に数えず、停止理由 `shutdown` |
+| 7 | 失敗: 全回で同じ outcome (`MissionOutcome` の DB 終端 `missions.status` で数える)。1 回目の例外も 2 回目以降と同じく、補償して失敗に数える。一般の失敗は連続 2 回で `consecutive_failures`、成功が挟まれば数え直す。`failure_class` は CliRunner → `MissionResult` → worker frame → WorkerRunner → `MissionOutcome` の 5 段を通し、`usage limit` / `try again at` / `429` / 認証失効 (`401 Unauthorized` の形のみ。素の `Unauthorized` は対象外) は `resource_exhausted` で 1 回停止 (status が `failed` / `timeout` のとき。`completed` / `max_turns` は対象外)、行単位・語境界で照合し複数一致では `resource_exhausted` 優先、`SIGTRAP` / `Segmentation fault` / `code-mode host` / `closed its stdout` は `resource_exhausted` にならない (一般の失敗)。worker frame の閉集合外の値はなしに倒す。一般の失敗の後は 300 秒の backoff (Event wait で cancel / shutdown に即応し、30 秒ごとに期限も見直す。成功の後は置かない)。graceful shutdown は `shutdown` outcome で失敗に数えず、停止理由 `shutdown` |
 | 8 | 停止: `jobs cancel` が走行中の繰り返し job に停止要求を立て、応答は `state=running, stop_requested=true`、GET も同値。現在の mission は完走して次を始めない。mission 完了後に `state=done, stop_reason=stopped`。二重 cancel は冪等。cancel と daemon stop の Event は別で、cancel は走行中 mission を中断しない。単発・ask・decision の走行中 cancel は従来どおり `job_running`。所有者の規則も既存 pin のまま |
-| 9 | 週次との排他 (競合 test): 1 回目を含む繰り返しの全 mission が gate を通る。gate は admission のみで、runner 実行中に gate の lock が取れる (別 thread が lock を取得できることで保持範囲を pin)。`reserved` 作成直後、claim 直前、repeat の gate 取得直前に barrier を置いた競合で、繰り返しと週次の mission が重ならない。週次の claim Tx は gate 保持のまま完了する。週次が待っていれば繰り返しは次を始めない (週次優先)。`manual_active` 中、週次の claim / start は待つ。週次の tick の容量計算は変わらない。待ちの間も停止・期限 (2 回目以降) が効く。1 回目は期限を無視して slot の解放後に走る。**孤児収束**: slot thread の登録・`start()` 失敗、claim 前の例外終了、pre-ready の補償失敗のそれぞれで、`reserved` が残らず (`failed`)、繰り返しが永久待ちしない。所有登録の無い非終端 slot は待たない |
+| 9 | 週次との排他 (競合 test): 1 回目を含む繰り返しの全 mission が gate を通る。gate は admission のみで、runner 実行中に gate の lock が取れる (別 thread が lock を取得できることで保持範囲を pin)。`reserved` 作成直後、claim 直前、repeat の gate 取得直前に barrier を置いた競合で、繰り返しと週次の mission が重ならない。週次の claim Tx は gate 保持のまま完了する。週次が待っていれば繰り返しは次を始めない (週次優先)。`manual_active` 中、週次の claim / start は待つ。週次の tick の容量計算は変わらない。待ちの間も停止・期限 (2 回目以降) が効く (0.5 秒刻み)。週次 tick の slot spawn 失敗は、その slot が `failed` に収束し残りが起動し、最初の例外が再送出される。1 回目は期限を無視して slot の解放後に走る。**孤児収束**: slot thread の登録・`start()` 失敗、claim 前の例外終了、pre-ready の補償失敗のそれぞれで、`reserved` が残らず (`failed`)、繰り返しが永久待ちしない。所有登録の無い非終端 slot は待たない |
 | 10 | autopilot: 毎回の開始前 (1 回目の直前を含む) に再確認し、true なら `autopilot` で止まる。API の principal のみに効き、対話シェルは制限しない (既存) |
 | 11 | comment: 畳み込み (許す空白の明示集合)、1000 字、`Cc` / `Cf` / `Cs` / NUL の拒否 (Python の `split()` が消す `Cc` が受理されない)、`Zs` / `Zl` / `Zp` (NBSP だけの comment を含む) の拒否。`{}` を含んでも prompt が崩れない。comment が無い prompt は現行とバイト一致。comment ありの prompt に節が 1 つだけ、全 mission に同じ文が入る |
 | 12a | comment の不在 (直接経路): runner を起動前に止める test で、DB 全表、activity、技術ログ、event、Discord 送出物、job の GET、`ops_requests` に canary の comment が無い。activity は `comment=yes` のみ。**メモリ**: job の終端・cancel・controller 例外のあと、保持中の `Job` (action の closure を含む) から canary に到達できず、`CommentHolder` が空 |
 | 12b | 残余の確認: 意図的に comment を復唱する fake runner で、復唱が agent 出力の保存経路に残ることを test が確認する (契約の外であることの pin。afx が追加で書いた箇所が無いこと) |
-| 13 | 停止と再起動の区別: graceful shutdown を shutdown-before-first (`runs=0`)、worker ready 前、mission running、backoff 中の 4 点で別々に test し、いずれも新しい mission が始まらず停止理由 `shutdown` で失敗に数えない。crash-restart (daemon 異常終了後の再起動) では繰り返しが再開せず、走行中の mission は起動時回収で `interrupted` になる |
+| 13 | 停止と再起動の区別: graceful shutdown を shutdown-before-first (`runs=0`)、worker ready 前、mission running (打ち切られず自分の timeout まで走り、終了後に `shutdown`)、backoff 中の 4 点で別々に test し、いずれも新しい mission が始まらず停止理由 `shutdown` で失敗に数えない。crash-restart (daemon 異常終了後の再起動) では繰り返しが再開せず、走行中の mission は起動時回収で `interrupted` になる |
 | 14 | 通知: mission ごとに started / finished が 1 組ずつ出る (繰り返しで増減しない)。繰り返し専用の event は出ない |
 | 15 | `jobs get` の進捗が各時点で正しい (`runs`、`mission_id`、`phase`、`stop_requested`、`stop_reason`)。comment は出ない。`update_result` は lock 内で丸ごと置換し、終端 audit / result との競合 (CAS) で壊れない。`finish()` のあとも最後の `phase` / `stop_reason` / `runs` / `mission_id` / `stop_requested` が残り、終端 result が同名キーを持っていても現在の進捗が勝つ (同名キーの競合 test)。cancel 応答に `stop_requested` が必ず入る |
 | 16 | `cli_surface` の record、usage、説明、対話シェルの usage、help golden が `-t` `-c` `-n` を出す。help に literal を置かない (AST 検査) |
@@ -220,7 +221,7 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 - 新規 `src/agentic_fx/core/improve_repeat.py`: 期間・comment の文法 (client と daemon が共有)、停止判定の純関数、`CommentHolder`、`MissionOutcome`、定数 (24h / 24 回 / 1000 字 / 連続失敗 2 / backoff 300 秒)。
 - `core/improve_supervisor.py`: 1 mission executor の切り出し、repeat controller (`submit_repeat`)、admission gate (週次の claim / start 側の待ちと、claim Tx までの lock 保持を含む)、単調時計の注入、callback interface (`on_progress`、`cancel_event`、autopilot 再確認)、graceful shutdown の `shutdown` outcome、slot thread の登録・起動失敗と top-level `finally` の収束。
 - `store/improve_waves.py`: 非終端 slot の fail-closed 終端 (孤児 `reserved` の収束)。時限回収は作らない。
-- `runners/base.py` (`MissionResult.failure_class`)、`runners/cli_runner.py` (pattern の分類。`resource_exhausted` と `runner_fault`)、`runners/mission_worker.py` (result frame)、`runners/worker_runner.py` (閉集合の検証と復元)。
+- `runners/base.py` (`MissionResult.failure_class`)、`runners/cli_runner.py` (pattern の分類。`resource_exhausted` と `runner_fault`)、`mission_worker.py` (実体 `src/agentic_fx/mission_worker.py`。result frame)、`runners/worker_runner.py` (閉集合の検証と復元)。
 - `loops/improve_loop.py` と `loops/prompts/improve_mission.md`: `prepare` の任意引数 comment、節の差し込み (無いときバイト一致)。
 - test: AC 1(core 部)、4〜7、9、11、12a、12b、13、14。変異 (AC 18 の core 部)。
 
@@ -273,3 +274,4 @@ settings のキー、DB の schema、ImproveRunContext、event の種類 (`impro
 | 2026-10-26 | v0.2 C0 | admission gate と週次優先 (1 回目も gate 経由)、無条件を期限と回数に限定、comment の契約を直接経路に限定し復唱を残余化、単調時計の注入、失敗の正規化と `resource_exhausted` と backoff、cancel の応答と thread-safe な進捗、repeat 専用の poll 契約、対話シェルの `shlex`、task 分割と統合条件、§8 を確定事項 + ユーザー確認待ちに組み替え | 設計レビュー 1 周目 (sol、詳細 `tmp/review-repeat/c0-r1-triage.md`) | |
 | 2026-10-26 | v0.3 C0 | repeat の判定を `-t` / `-n` に (`-c` 単独は one-shot)、受理で rc=0 と初期 `phase=waiting_slot`、gate の lock 範囲 (admission のみ、週次は claim Tx まで)、孤児 `reserved` の fail-closed 収束、`MissionOutcome` と `failure_class` の 5 段 (resource_exhausted / runner_fault の pattern)、graceful shutdown の outcome と crash-restart の区別、`CommentHolder` の明示消去と Job retention、`Zs` / `Zl` / `Zp` の拒否、controller 例外は `internal`、`finish()` の進捗保持、§8 を裁定済に、§9 を実装時確認のみに、T1 / T2 の範囲と AC 1・7・9・11・12a・13・15・17 を追従 | 設計レビュー 2 周目 (sol、詳細 `tmp/review-repeat/c0-r2-triage.md`) | |
 | 2026-10-26 | v0.4 C0 | job id を伴う受理後の終端はすべて rc=0 (rc=1 は同期拒否だけ、§2.2 と AC 17)、daemon stop 時の契約を `shutdown` outcome に統一 (DB mission は既存の補償終端、`interrupted` は起動時回収専用、§5.2)、`finish()` は lock 内で合成し進捗キーは現在の `job.result` 優先 (§5.1、AC 15 に同名キー競合 test) | 設計レビュー 3 周目 (sol 差分閉鎖確認、`tmp/review-repeat/c0-r3-out.md`) | |
+| 2026-10-27 | v0.5 C0 | 期限の正本を受理時に (slot 待ちも含む、§1・§3.2・§5.1)、daemon stop は改善 mission を打ち切らず終了後に `shutdown` outcome (§3.3・§5.2・§5.3・AC13、shutdown 挙動の変更は範囲外)、mission_worker の実体パス (§7)、`resource_exhausted` は failed / timeout のみ・行単位語境界・優先・`401 Unauthorized` 形のみ (§3.3・AC7)、週次 tick の spawn 失敗の収束と再送出 (§3.5)、gate 待ちの確認刻み (0.5 秒 / 30 秒) と時刻の採り直し (§3.5・AC9) | T1 実装とレビュー 1 周目の裁定 | |
