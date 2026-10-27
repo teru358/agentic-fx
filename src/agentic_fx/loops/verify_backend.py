@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, TypeAlias
 
 from agentic_fx.runners.base import Mission
+from agentic_fx.runners.cli_runner import CLI_STDERR_FATAL_PATTERNS
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
@@ -97,7 +98,7 @@ _FAILURE_GATES = frozenset({
     "sandbox_unavailable", "unknown",
 })
 _RESULT_STATUSES = frozenset({"completed", "failed", "timeout", "max_turns"})
-_FIXED_REASONS = (
+_FIXED_REASON_PREFIXES = (
     ("worker eof", "worker_eof"), ("worker_eof", "worker_eof"),
     ("worker protocol_error", "worker_protocol_error"),
     ("worker_protocol_error", "worker_protocol_error"),
@@ -111,8 +112,40 @@ _FIXED_REASONS = (
     ("claude credentials copy failed", "claude_credentials_copy_failed"),
     ("codex auth copy failed", "codex_auth_copy_failed"),
     ("opencode runtime assets copy failed", "opencode_assets_copy_failed"),
-    ("usage limit", "usage_limit"), ("try again at", "try_again_at"),
 )
+_CLI_PATTERN_REASONS = {
+    "code-mode host": "code_mode_host",
+    "SIGTRAP": "sigtrap",
+    "closed its stdout": "closed_stdout",
+    "Segmentation fault": "segmentation_fault",
+    "usage limit": "usage_limit",
+    "try again at": "try_again_at",
+    "401 Unauthorized": "unauthorized",
+    "Unauthorized": "unauthorized",
+}
+_FIXED_REASON_TOKENS = frozenset({
+    "bin_not_found", "tool_budget_abort", "spool_flood", "supervisor_died", "proxy_died",
+    "cleanup_deadline_received", "parent_gone", "isolated_launch_once",
+    "artifact_exceeds_memory_max", "fingerprint_mismatch", "cgroup_create_failed",
+    "inherited_seccomp_filter", "credentials_unexpected", "rlimit_failed",
+    "subreaper_failed", "landlock_abi_too_old", "landlock_create_failed",
+    "no_new_privs_failed", "landlock_restrict_failed", "seccomp_install_failed",
+    "seccomp_self_check_failed", "policy_compile_failed", "artifact_copy_failed",
+    "artifact_digest_mismatch", "artifact_copy_unsupported", "artifact_changed",
+    "attestation_malformed", "attestation_order", "attestation_deadline",
+    "attestation_mismatch", "attestation_go_send_failed", "attestation_exec_failed",
+    "launcher_died", "launcher_spawn_failed", "cgroup_join_failed",
+    "receiver_handoff_failed", "cli_exec_unproven", "cli_artifact_unsupported",
+    "launch_thread_unsupported", "seccomp_user_notif_unavailable",
+    "seccomp_wait_killable_unavailable", "seccomp_tsync_esrch_unavailable",
+    "pidfd_thread_unavailable", "ptrace_scope_unsupported", "supervisor_stalled",
+    "supervisor_resource", "connect_timeout", "cgroup_delegation_missing",
+    "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed",
+    "worker_not_reaped", "cleanup_deadline_exceeded", "proxy_start_failed",
+    "arch_unsupported", "safety_canary_failed", "runtime_fingerprint_selftest_failed",
+    "service_stopping",
+})
 _FIXED_REFUSALS = frozenset({
     "arch_unsupported", "landlock_abi_too_old", "seccomp_user_notif_unavailable",
     "seccomp_wait_killable_unavailable", "seccomp_tsync_esrch_unavailable",
@@ -138,6 +171,22 @@ _SAFE_SELFTEST_DETAIL = re.compile(
     r"(?: blocking=[a-z0-9_]+(?:,[a-z0-9_]+)*)?\Z")
 
 
+def _fixed_reason(reason: object) -> str:
+    if not isinstance(reason, str):
+        return "-"
+    for prefix, token in _FIXED_REASON_PREFIXES:
+        if reason.startswith(prefix):
+            return token
+    for pattern in CLI_STDERR_FATAL_PATTERNS:
+        token = _CLI_PATTERN_REASONS.get(pattern)
+        if token is not None and pattern in reason:
+            return token
+    for token in _FIXED_REASON_TOKENS:
+        if re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", reason):
+            return token
+    return "-"
+
+
 def selftest_failure_detail(gate: str, *, status: str, reason: object = None,
                             watch: object | None = None,
                             unreaped: object | None = None, refusal: object = None,
@@ -145,12 +194,7 @@ def selftest_failure_detail(gate: str, *, status: str, reason: object = None,
     """Build the bounded diagnostic carried by a failed compatibility selftest."""
     gate = gate if gate in _FAILURE_GATES else "unknown"
     status = status if status in _RESULT_STATUSES else "-"
-    fixed_reason = "-"
-    if isinstance(reason, str):
-        for prefix, token in _FIXED_REASONS:
-            if reason.startswith(prefix):
-                fixed_reason = token
-                break
+    fixed_reason = _fixed_reason(reason)
     fields = [f"gate={gate}", f"status={status}", f"reason={fixed_reason}"]
     if watch is not None:
         try:
