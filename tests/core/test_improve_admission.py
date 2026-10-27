@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import sys
 from pathlib import Path
@@ -391,6 +392,157 @@ def test_enabled_startup_reports_the_decision_fingerprint(tmp_path, monkeypatch,
 
     assert IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
                       enabled=True, host_factory=StartupHost) == expected
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_startup_keeps_the_admission_line_byte_for_byte(tmp_path, monkeypatch, retryable):
+    """自己試験の診断は判定生成時に出し、admission ABI は変えない。"""
+    class StartupHost(Host):
+        def start(self, *, deadline):
+            assert deadline == 0.0
+
+    detail = "gate=incomplete status=failed reason=timeout"
+    choice = IA.MissionChoice(
+        refusal=IA.REASON_SELFTEST,
+        decision=IA.AdmissionDecision(
+            False, IA.REASON_SELFTEST, "codex",
+            fingerprint=SimpleNamespace(aggregate="refused-fingerprint"),
+            retryable=retryable, detail=detail),
+    )
+    emitted: list[str] = []
+    monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(IA, "choose_for_mission", lambda *_args, **_kwargs: choice)
+    monkeypatch.setattr(IA, "_HOST", None)
+
+    line = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
+                      enabled=True, host_factory=StartupHost, technical_log=emitted.append)
+
+    assert line == ("improve isolation: enabled; backend=codex admitted=no "
+                    "reason=runtime_fingerprint_selftest_failed fingerprint=refused-fingerprint")
+    assert emitted == []
+
+
+def test_selftest_failure_keeps_its_detail_in_the_decision(tmp_path):
+    detail = "mission did not complete: status=failed reason=timeout"
+    decision = _admission(selftest=Probe(IA.ProbeOutcome(False, detail=detail))).admit(
+        backend="codex", artifact_path=str(_elf(tmp_path)), host=Host())
+
+    assert decision.detail == detail
+
+
+def test_admission_decision_has_no_second_selftest_detail_field():
+    assert "selftest_detail" not in IA.AdmissionDecision.__dataclass_fields__
+
+
+def test_selftest_probe_logs_safe_detail_without_operator_detail(tmp_path, monkeypatch):
+    from agentic_fx.core import improve_canary
+    from agentic_fx.loops.verify_backend import VerifyBackendResult
+    from agentic_fx.setup.post_start import read_admission_line
+
+    unsafe = ("try again at alice@example.com https://private.invalid/ "
+              "stderr=credential-ABC")
+    results = [
+        VerifyBackendResult(False, "codex", None, None,
+                            "gate=nonce status=completed reason=-",
+                            operator_detail=unsafe),
+    ]
+
+    def fake_verify(*_args, **_kwargs):
+        return results.pop(0)
+
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.verify_backend", fake_verify)
+    emitted: list[str] = []
+    settings = _settings("codex", _elf(tmp_path))
+    admission = IA.ImproveAdmission(
+        canary=Probe(OK),
+        selftest=lambda ctx: improve_canary.run_selftest(ctx, settings=settings, root=tmp_path),
+        kernel_probe=lambda: KERNEL,
+        retry_interval_sec=1.0,
+        clock=lambda: 0.0,
+        technical_log=emitted.append,
+    )
+
+    first = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
+    cached = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
+
+    assert first.decision.detail == "gate=nonce status=completed reason=-"
+    assert cached.decision is first.decision
+    assert emitted == [
+        "improve isolation: selftest detail: gate=nonce status=completed reason=-",
+    ]
+    rendered = "\n".join(emitted)
+    assert all(value not in rendered for value in (
+        "alice@example.com", "https://", "stderr", "credential-ABC"))
+    assert not (tmp_path / "logs" / "activity.log").exists()
+    from agentic_fx.status import collect_status, render_status
+    status_text = render_status(collect_status(
+        tmp_path, instance="free",
+        run=lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout="")), root=tmp_path)
+    assert all(value not in status_text for value in emitted)
+    observed = read_admission_line(
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"_SYSTEMD_INVOCATION_ID": "new", "MESSAGE": emitted[0]})),
+        "new", cursor_fallback="cursor", backend="codex", clock=lambda: 0.0,
+        sleep=lambda _seconds: None, timeout=0,
+    )
+    assert (observed.admitted, observed.reason_code) == ("unknown", "admission_line_timeout")
+
+
+def test_default_admission_replaces_the_technical_log_for_the_singleton(tmp_path, monkeypatch):
+    first_lines: list[str] = []
+    second_lines: list[str] = []
+    monkeypatch.setattr(IA, "_ADMISSION", None)
+
+    first = IA.default_admission(tmp_path, technical_log=first_lines.append)
+    second = IA.default_admission(tmp_path, technical_log=second_lines.append)
+    second._emit_new_selftest_failure(IA.AdmissionDecision(
+        False, IA.REASON_SELFTEST, "codex", detail="gate=incomplete status=failed reason=-"))
+
+    assert first is second
+    assert first_lines == []
+    assert second_lines == ["improve isolation: selftest detail: gate=incomplete status=failed reason=-"]
+
+
+def test_startup_does_not_emit_a_selftest_detail_when_admitted(tmp_path, monkeypatch):
+    class StartupHost(Host):
+        def start(self, *, deadline):
+            assert deadline == 0.0
+
+    choice = IA.MissionChoice(decision=IA.AdmissionDecision(
+        True, None, "codex", fingerprint=SimpleNamespace(aggregate="admitted-fingerprint")))
+    emitted: list[str] = []
+    monkeypatch.setattr(IA, "default_admission", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(IA, "choose_for_mission", lambda *_args, **_kwargs: choice)
+    monkeypatch.setattr(IA, "_HOST", None)
+
+    line = IA.startup(_settings("codex", _elf(tmp_path)), tmp_path, deadline=0.0,
+                      enabled=True, host_factory=StartupHost, technical_log=emitted.append)
+
+    assert line == ("improve isolation: enabled; backend=codex admitted=yes "
+                    "fingerprint=admitted-fingerprint")
+    assert emitted == []
+
+
+def test_service_writes_the_selftest_detail_only_to_technical_logs(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from agentic_fx import service
+
+    detail_line = "improve isolation: selftest detail: [redacted]"
+    admission_line = ("improve isolation: enabled; backend=codex admitted=no "
+                      "reason=runtime_fingerprint_selftest_failed fingerprint=fingerprint")
+
+    def startup(*_args, technical_log, **_kwargs):
+        technical_log(detail_line)
+        return admission_line
+
+    monkeypatch.setattr(IA, "startup", startup)
+    with caplog.at_level(logging.INFO, logger="agentic_fx.service"):
+        service._log_improve_isolation_diagnostics(object(), tmp_path)
+
+    assert [record.getMessage() for record in caplog.records] == [detail_line, admission_line]
+    assert not (tmp_path / "logs" / "activity.log").exists()
 
 
 def test_selftest_exception_is_a_failure(tmp_path):

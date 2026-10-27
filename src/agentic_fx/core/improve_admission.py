@@ -181,7 +181,8 @@ class ImproveAdmission:
                  supported: Callable[[], frozenset[str]] | None = None,
                  retry_interval_sec: float = SELFTEST_RETRY_INTERVAL_SEC,
                  clock: Callable[[], float] = time.monotonic,
-                 stop_event: threading.Event | None = None) -> None:
+                 stop_event: threading.Event | None = None,
+                 technical_log: Callable[[str], None] | None = None) -> None:
         self._canary = canary
         self._selftest = selftest
         self._kernel_probe = kernel_probe
@@ -189,6 +190,7 @@ class ImproveAdmission:
         self._retry = retry_interval_sec
         self._clock = clock
         self._stop = stop_event
+        self._technical_log = technical_log or (lambda line: _log.info("%s", line))
         #: kernel の probe と判定の cache だけを守る (canary と自己試験の間は握らない)
         self._lock = threading.Lock()
         self._kernel: F.KernelCapabilities | None = None
@@ -204,6 +206,10 @@ class ImproveAdmission:
             if self._kernel is None:
                 self._kernel = self._kernel_probe()
             return self._kernel
+
+    def _set_technical_log(self, technical_log: Callable[[str], None]) -> None:
+        with self._lock:
+            self._technical_log = technical_log
 
     def admit(self, *, backend: str, artifact_path: str, host: Any,
               settings: Any = None) -> AdmissionDecision:
@@ -254,7 +260,21 @@ class ImproveAdmission:
                 finally:
                     self._running.pop(key, None)
                     done.set()
+        self._emit_new_selftest_failure(decision)
         return decision
+
+    def _emit_new_selftest_failure(self, decision: AdmissionDecision | None) -> None:
+        if decision is None or decision.reason != REASON_SELFTEST:
+            return
+        from agentic_fx.loops.verify_backend import selftest_detail_or_default
+
+        with self._lock:
+            technical_log = self._technical_log
+        try:
+            technical_log(
+                f"improve isolation: selftest detail: {selftest_detail_or_default(decision.detail)}")
+        except Exception:  # noqa: BLE001
+            _log.exception("improve isolation selftest detail logging failed")
 
     def _stopping(self) -> bool:
         return self._stop is not None and self._stop.is_set()
@@ -354,7 +374,8 @@ def current_host() -> Any:
         return _HOST
 
 
-def default_admission(root: Path, *, stop_event: threading.Event | None = None
+def default_admission(root: Path, *, stop_event: threading.Event | None = None,
+                      technical_log: Callable[[str], None] | None = None
                       ) -> ImproveAdmission:
     """canary と自己試験の本番の実装を持つ admission (process に 1 個)。
 
@@ -370,7 +391,9 @@ def default_admission(root: Path, *, stop_event: threading.Event | None = None
                                                              root=root),
                 selftest=lambda ctx: improve_canary.run_selftest(ctx, settings=ctx.settings,
                                                                  root=root),
-                stop_event=stop_event)
+                stop_event=stop_event, technical_log=technical_log)
+        elif technical_log is not None:
+            _ADMISSION._set_technical_log(technical_log)
         return _ADMISSION
 
 
@@ -403,9 +426,11 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
             host_factory: Callable[[], Any] | None = None,
             admit_unit: Callable[[], Any] | None = None,
             kernel_probe: Callable[[], F.KernelCapabilities] = F.probe_kernel,
-            stop_event: threading.Event | None = None) -> str:
-    """afx の起動時に 1 回。技術ログ用の 1 行を返す。`stop_event` は afx の停止の合図で、
-    同じ fingerprint の判定の終わりを待つ間に見る。
+            stop_event: threading.Event | None = None,
+            technical_log: Callable[[str], None] | None = None) -> str:
+    """afx の起動時に 1 回。admission の技術ログ 1 行を返す。`technical_log` があれば、
+    自己試験の不合格 detail を別行で渡す。`stop_event` は afx の停止の合図で、同じ
+    fingerprint の判定の終わりを待つ間に見る。
 
     有効なら mission cgroup host を起こし (unit の admission、afx の `supervisor/` への自己移動、
     前回の `m-*` の回収)、設定の backend を eager に判定する。無効なら読むだけの診断
@@ -436,7 +461,7 @@ def startup(settings: Any, root: Path, *, deadline: float, enabled: bool | None 
     if backend not in F.BACKENDS:
         return (f"improve isolation: enabled; backend={backend} is not a CLI backend; "
                 f"cgroup_gate={'open' if host.mission_allowed() else 'closed'}")
-    adm = default_admission(root, stop_event=stop_event)
+    adm = default_admission(root, stop_event=stop_event, technical_log=technical_log)
     choice = choose_for_mission(settings, root, enabled=True, host=host, admission=adm)
     fingerprint = (choice.decision.fingerprint.aggregate
                    if choice.decision is not None and choice.decision.fingerprint is not None

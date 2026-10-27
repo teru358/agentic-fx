@@ -24,7 +24,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.verify_backend import (
     OPERATOR_SHELL_NO_ISOLATION, VerifyBackendGateError, VerifyBackendResult,
-    verify_backend as _verify_backend)
+    selftest_detail_or_default, selftest_failure_detail, verify_backend as _verify_backend)
 from agentic_fx.runners.base import Mission, MissionResult
 
 NOW = datetime(2026, 8, 23, 10, 0, tzinfo=timezone.utc)
@@ -122,7 +122,124 @@ def test_verify_backend_default_requires_admission_and_fails_closed_without_host
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert result.detail == "sandbox_unavailable: cgroup_topology_unsupported"
+    assert result.detail == ("gate=sandbox_unavailable status=failed reason=- "
+                             "refusal=cgroup_topology_unsupported")
+    assert result.operator_detail == "sandbox_unavailable: cgroup_topology_unsupported"
+
+
+@pytest.mark.parametrize(("reason", "expected"), [
+    ("worker eof after private output", "worker_eof"),
+    ("usage limit reached; retry later", "usage_limit"),
+    ("child ready ok=false: private error", "child_ready_not_ok"),
+    ("arbitrary private diagnostic", "-"),
+])
+def test_selftest_failure_detail_maps_only_known_reason_text(reason, expected):
+    assert selftest_failure_detail("incomplete", status="failed", reason=reason) == (
+        f"gate=incomplete status=failed reason={expected}")
+
+
+@pytest.mark.parametrize(("reason", "expected"), [
+    ("worker eof secret", "worker_eof"),
+    ("worker protocol_error secret", "worker_protocol_error"),
+    ("worker error secret", "worker_error"),
+    ("child ready ok=false: secret", "child_ready_not_ok"),
+    ("runner.claude.bin が見つかりません (bin_not_found) secret", "bin_not_found"),
+    ("source_snapshot_dir origin is missing or is a symlink secret", "source_snapshot_missing"),
+    ("claude credentials copy failed secret", "claude_credentials_copy_failed"),
+    ("codex auth copy failed secret", "codex_auth_copy_failed"),
+    ("opencode runtime assets copy failed secret", "opencode_assets_copy_failed"),
+    ("worker requested cleanup before ready secret", "worker_cleanup_before_ready"),
+    ("on_ready failed: RuntimeError: secret", "on_ready_failed"),
+    ("cli timeout secret", "cli_timeout"),
+    ("no output recovered from cli secret", "no_output_recovered"),
+    ("output_schema mismatch: secret", "output_schema_mismatch"),
+    ("tool_budget_abort: secret", "tool_budget_abort"),
+    ("failed: spool_flood secret", "spool_flood"),
+    ("sandbox_unavailable: supervisor_died secret", "supervisor_died"),
+    ("sandbox_unavailable: proxy_died secret", "proxy_died"),
+    ("sandbox_unavailable: cleanup_deadline_received secret", "cleanup_deadline_received"),
+    ("sandbox_unavailable: parent_gone secret", "parent_gone"),
+    ("sandbox_unavailable: isolated_launch_once secret", "isolated_launch_once"),
+    ("sandbox_unavailable: artifact_exceeds_memory_max secret", "artifact_exceeds_memory_max"),
+    ("sandbox_unavailable: fingerprint_mismatch secret", "fingerprint_mismatch"),
+    ("sandbox_unavailable: cgroup_create_failed secret", "cgroup_create_failed"),
+    ("sandbox_unavailable: inherited_seccomp_filter secret", "inherited_seccomp_filter"),
+    ("sandbox_unavailable: credentials_unexpected secret", "credentials_unexpected"),
+    ("sandbox_unavailable: rlimit_failed secret", "rlimit_failed"),
+    ("sandbox_unavailable: subreaper_failed secret", "subreaper_failed"),
+    ("sandbox_unavailable: landlock_create_failed secret", "landlock_create_failed"),
+    ("sandbox_unavailable: no_new_privs_failed secret", "no_new_privs_failed"),
+    ("sandbox_unavailable: landlock_restrict_failed secret", "landlock_restrict_failed"),
+    ("sandbox_unavailable: seccomp_install_failed secret", "seccomp_install_failed"),
+    ("sandbox_unavailable: seccomp_self_check_failed secret", "seccomp_self_check_failed"),
+    ("sandbox_unavailable: policy_compile_failed secret", "policy_compile_failed"),
+    ("sandbox_unavailable: artifact_copy_failed secret", "artifact_copy_failed"),
+    ("sandbox_unavailable: artifact_digest_mismatch secret", "artifact_digest_mismatch"),
+    ("sandbox_unavailable: artifact_copy_unsupported secret", "artifact_copy_unsupported"),
+    ("sandbox_unavailable: artifact_changed secret", "artifact_changed"),
+    ("sandbox_unavailable: attestation_malformed secret", "attestation_malformed"),
+    ("sandbox_unavailable: attestation_order secret", "attestation_order"),
+    ("sandbox_unavailable: attestation_deadline secret", "attestation_deadline"),
+    ("sandbox_unavailable: attestation_mismatch secret", "attestation_mismatch"),
+    ("sandbox_unavailable: attestation_go_send_failed secret", "attestation_go_send_failed"),
+    ("sandbox_unavailable: attestation_exec_failed secret", "attestation_exec_failed"),
+    ("sandbox_unavailable: launcher_died secret", "launcher_died"),
+    ("sandbox_unavailable: launcher_spawn_failed secret", "launcher_spawn_failed"),
+    ("sandbox_unavailable: cgroup_join_failed secret", "cgroup_join_failed"),
+    ("sandbox_unavailable: receiver_handoff_failed secret", "receiver_handoff_failed"),
+    ("failed: cli_exec_unproven secret", "cli_exec_unproven"),
+    ("sandbox_unavailable: cli_artifact_unsupported secret", "cli_artifact_unsupported"),
+    ("sandbox_unavailable: launch_thread_unsupported secret", "launch_thread_unsupported"),
+    ("sandbox_unavailable: seccomp_user_notif_unavailable secret", "seccomp_user_notif_unavailable"),
+    ("sandbox_unavailable: seccomp_wait_killable_unavailable secret", "seccomp_wait_killable_unavailable"),
+    ("sandbox_unavailable: seccomp_tsync_esrch_unavailable secret", "seccomp_tsync_esrch_unavailable"),
+    ("sandbox_unavailable: pidfd_thread_unavailable secret", "pidfd_thread_unavailable"),
+    ("sandbox_unavailable: ptrace_scope_unsupported secret", "ptrace_scope_unsupported"),
+    ("sandbox_unavailable: supervisor_stalled secret", "supervisor_stalled"),
+    ("sandbox_unavailable: supervisor_resource secret", "supervisor_resource"),
+    ("sandbox_unavailable: connect_timeout secret", "connect_timeout"),
+    ("sandbox_unavailable: cgroup_cleanup_timeout secret", "cgroup_cleanup_timeout"),
+    ("sandbox_unavailable: cgroup_not_empty secret", "cgroup_not_empty"),
+    ("sandbox_unavailable: cgroup_rmdir_failed secret", "cgroup_rmdir_failed"),
+    ("sandbox_unavailable: worker_not_reaped secret", "worker_not_reaped"),
+    ("sandbox_unavailable: cleanup_deadline_exceeded secret", "cleanup_deadline_exceeded"),
+    ("sandbox_unavailable: arch_unsupported secret", "arch_unsupported"),
+    ("sandbox_unavailable: landlock_abi_too_old secret", "landlock_abi_too_old"),
+    ("sandbox_unavailable: proxy_start_failed secret", "proxy_start_failed"),
+    ("sandbox_unavailable: cgroup_delegation_missing secret", "cgroup_delegation_missing"),
+    ("sandbox_unavailable: cgroup_topology_unsupported secret", "cgroup_topology_unsupported"),
+    ("sandbox_unavailable: unit_stop_policy_unsupported secret", "unit_stop_policy_unsupported"),
+    ("sandbox_unavailable: safety_canary_failed secret", "safety_canary_failed"),
+    ("sandbox_unavailable: runtime_fingerprint_selftest_failed secret",
+     "runtime_fingerprint_selftest_failed"),
+    ("sandbox_unavailable: service_stopping secret", "service_stopping"),
+    ("HTTP-like CLI exit rc=1: prefix code-mode host secret", "code_mode_host"),
+    ("HTTP-like CLI exit rc=1: prefix SIGTRAP secret", "sigtrap"),
+    ("HTTP-like CLI exit rc=1: prefix closed its stdout secret", "closed_stdout"),
+    ("HTTP-like CLI exit rc=1: prefix Segmentation fault secret", "segmentation_fault"),
+    ("HTTP-like CLI exit rc=1: prefix usage limit secret", "usage_limit"),
+    ("HTTP-like CLI exit rc=1: prefix try again at secret", "try_again_at"),
+    ("HTTP-like CLI exit rc=1: prefix 401 Unauthorized secret", "unauthorized"),
+    ("HTTP-like CLI exit rc=1: prefix Unauthorized secret", "unauthorized"),
+])
+def test_selftest_failure_detail_maps_every_emitted_fixed_reason_without_free_text(
+        reason, expected):
+    detail = selftest_failure_detail("incomplete", status="failed", reason=reason)
+
+    assert detail == f"gate=incomplete status=failed reason={expected}"
+    assert "secret" not in detail
+
+
+def test_selftest_detail_sanitizer_degrades_unknown_fields_without_raising():
+    class BadWatch:
+        def summary(self):
+            return object()
+
+    assert selftest_failure_detail("not-a-gate", status="not-a-status", reason="private",
+                                   watch=BadWatch(), unreaped="one") == (
+        "gate=unknown status=- reason=-")
+    assert selftest_detail_or_default("SANDBOX_UNAVAILABLE: private refusal") == (
+        "gate=unknown status=failed reason=-")
 
 
 @pytest.mark.parametrize("options", [{}, {"cleanup_protocol": object()}])
@@ -376,7 +493,26 @@ def test_verify_backend_fails_closed_when_handshake_never_reaches_ready(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "handshake failed" in result.detail
+    assert result.detail == "gate=handshake status=completed reason=-"
+
+
+def test_verify_backend_failure_detail_discards_untrusted_reason_text(tmp_path, monkeypatch):
+    """Selftest detail is bounded while the operator diagnostic retains the cause."""
+    monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
+                        _FakeVerifyWorkerRunner)
+    unsafe = ("worker_eof stderr=token-ABC alice@example.com "
+              "https://private.invalid/v1 sk-live-credential")
+    _BEHAVIOR["current"] = {
+        "result": lambda _mission: MissionResult("failed", None, [], reason=unsafe)}
+
+    result = verify_backend(tmp_path, _settings(), backend="local",
+                            provider=None, clock=FixedClock(NOW))
+
+    assert result.detail == "gate=incomplete status=failed reason=worker_eof"
+    assert all(value not in result.detail for value in (
+        "stderr", "alice@example.com", "https://", "sk-live-credential"))
+    assert result.operator_detail == (
+        f"mission did not complete: status=failed reason={unsafe}")
 
 
 def test_verify_backend_fingerprint_changes_across_runs_with_identical_config(
@@ -634,7 +770,7 @@ def test_verify_backend_fails_closed_when_no_cli_descendant_is_observed(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "cli_started gate" in result.detail
+    assert result.detail == "gate=no_cli_child status=completed reason=-"
 
 
 def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
@@ -657,7 +793,7 @@ def test_verify_backend_fails_closed_when_descendants_are_not_reaped(
 
     assert result.ok is False
     assert result.fingerprint is None
-    assert "pgid recovery gate" in result.detail
+    assert result.detail == "gate=not_reaped status=completed reason=- unreaped=1"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"),
@@ -869,7 +1005,7 @@ def test_stop_on_echo_fails_without_tools_list(tmp_path, monkeypatch):
     _BEHAVIOR["current"] = {"events": events, "final": ok_output}
     result = _run_stop_on_echo(tmp_path)
     assert result.ok is False
-    assert "echo_reached=yes mcp=none" in result.detail
+    assert "watch=echo_reached=yes,mcp=none,call=0,steps=0,events=1" in result.detail
 
 
 def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
@@ -882,7 +1018,7 @@ def test_stop_on_echo_fails_when_tools_list_is_empty(tmp_path, monkeypatch):
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "mcp=tools=0 (empty)" in result.detail
+    assert result.ok is False and "mcp=tools=0,(empty),call=0" in result.detail
 
 
 def test_stop_on_echo_ignores_a_cli_printed_mcp_observation(tmp_path, monkeypatch):
@@ -987,7 +1123,8 @@ def test_without_stop_on_echo_the_normal_result_decides(tmp_path, monkeypatch):
                             "final": MissionResult("failed", None, [], reason="boom")}
     result = verify_backend(tmp_path, _settings(), backend="opencode", provider=None,
                             clock=FixedClock(NOW))
-    assert result.ok is False and "boom" in result.detail
+    assert result.ok is False and result.detail == "gate=incomplete status=failed reason=-"
+    assert "boom" in result.operator_detail
     assert _StreamingRunner.captured_kwargs.get("stop_event") is None
 
 
@@ -1008,8 +1145,9 @@ def test_stop_on_echo_failure_keeps_cli_result_and_reports_progress(tmp_path, mo
     result = _run_stop_on_echo(tmp_path)
 
     assert result.ok is False
-    assert "cleanup_deadline_received" in result.detail
-    assert "echo_reached=no mcp=none" in result.detail
+    assert "reason=cleanup_deadline_received" in result.detail
+    assert "cleanup_deadline_received" in result.operator_detail
+    assert "watch=echo_reached=no,mcp=none,call=0,steps=3,events=9" in result.detail
     assert "steps=3" in result.detail and "events=9" in result.detail
 
 
@@ -1026,7 +1164,7 @@ def test_stop_on_echo_timeout_without_echo_is_readable(tmp_path, monkeypatch):
 
     assert result.ok is False
     assert "status=timeout" in result.detail
-    assert "echo_reached=no mcp=none call=0 steps=2" in result.detail
+    assert "watch=echo_reached=no,mcp=none,call=0,steps=2,events=2" in result.detail
 
 
 def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch):
@@ -1043,7 +1181,7 @@ def test_stop_on_echo_still_requires_cli_child_and_reaping(tmp_path, monkeypatch
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "pgid recovery gate" in result.detail
+    assert result.ok is False and result.detail == "gate=not_reaped status=timeout reason=- unreaped=1"
 
 
 def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, monkeypatch):
@@ -1056,7 +1194,7 @@ def test_stop_on_echo_fails_when_tools_list_comes_without_initialize(tmp_path, m
 
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
-    assert result.ok is False and "mcp=tools=2 (uninitialized)" in result.detail
+    assert result.ok is False and "mcp=tools=2,(uninitialized),call=0" in result.detail
 
 
 def test_stop_on_echo_summary_marks_uninitialized_only_when_initialize_was_not_seen(
@@ -1072,7 +1210,7 @@ def test_stop_on_echo_summary_marks_uninitialized_only_when_initialize_was_not_s
     _BEHAVIOR["current"] = {"events": events, "final": MissionResult("failed", None, [])}
     result = _run_stop_on_echo(tmp_path)
     assert result.ok is False
-    assert "mcp=tools=2 " in result.detail and "uninitialized" not in result.detail
+    assert "mcp=tools=2,call=0" in result.detail and "uninitialized" not in result.detail
     assert "call=0" in result.detail
 
 

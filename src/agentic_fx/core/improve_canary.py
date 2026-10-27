@@ -469,8 +469,8 @@ def _scratch_context(root: Path):
     return scratch, ctx
 
 
-def _transient(status: str, reason: str | None) -> bool:
-    text = reason or ""
+def _transient(status: object, reason: object) -> bool:
+    text = reason if isinstance(reason, str) else ""
     return (status == "timeout" or "never reached ready" in text or "worker eof" in text
             or "usage limit" in text or "try again at" in text)
 
@@ -535,7 +535,11 @@ def run_selftest(ctx, *, settings: Any, root: Path):
     probe) 走らせる。schema の往復、終了後の cgroup の片付け、gate が開いたままを確かめる。"""
     from agentic_fx.core import improve_admission as IA
     from agentic_fx.core.contracts import SystemClock
-    from agentic_fx.loops.verify_backend import verify_backend
+    from agentic_fx.loops.verify_backend import (
+        selftest_detail_or_default,
+        selftest_failure_detail,
+        verify_backend,
+    )
 
     host = ctx.host
     improve = settings.improve
@@ -548,12 +552,16 @@ def run_selftest(ctx, *, settings: Any, root: Path):
         res = verify_backend(root, settings, backend=ctx.backend, provider=None,
                              clock=SystemClock(), isolation_options=options,
                              stop_on_echo=True)
-    except Exception as e:  # noqa: BLE001
-        return IA.ProbeOutcome(False, True, f"selftest spawn: {type(e).__name__}")
+    except Exception:  # noqa: BLE001
+        return IA.ProbeOutcome(False, True,
+                               selftest_failure_detail("spawn", status="failed"))
     if not res.ok:
-        return IA.ProbeOutcome(False, _transient("failed", res.detail), res.detail[:200])
+        return IA.ProbeOutcome(False, _transient(res.status, res.operator_detail),
+                               selftest_detail_or_default(res.detail))
     if not host.mission_allowed():
-        return IA.ProbeOutcome(False, False, "cgroup_gate: " + ",".join(host.blocking_reasons()))
+        return IA.ProbeOutcome(False, False,
+                               selftest_failure_detail("cgroup_gate", status="completed",
+                                                       blocking=host.blocking_reasons()))
     return IA.ProbeOutcome(True, False, "")
 
 

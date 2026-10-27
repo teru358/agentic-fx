@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, TypeAlias
 
 from agentic_fx.runners.base import Mission
+from agentic_fx.runners.cli_runner import CLI_STDERR_FATAL_PATTERNS
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.store.rag import Rag
 from agentic_fx.tools.improve_rpc_tools import build_ledger_wrapped_rpc_handlers
@@ -82,6 +83,171 @@ class VerifyBackendResult:
     provider: Literal["chatgpt"] | None
     fingerprint: str | None
     detail: str
+    operator_detail: str = ""
+    gate: str | None = None
+    status: object = None
+    reason: object = None
+    watch: object | None = None
+    unreaped: object | None = None
+    refusal: object = None
+    blocking: object = None
+
+
+_FAILURE_GATES = frozenset({
+    "handshake", "incomplete", "nonce", "no_cli_child", "not_reaped", "spawn", "cgroup_gate",
+    "sandbox_unavailable", "unknown",
+})
+_RESULT_STATUSES = frozenset({"completed", "failed", "timeout", "max_turns"})
+_FIXED_REASON_PREFIXES = (
+    ("worker eof", "worker_eof"), ("worker_eof", "worker_eof"),
+    ("worker protocol_error", "worker_protocol_error"),
+    ("worker_protocol_error", "worker_protocol_error"),
+    ("worker error", "worker_error"), ("worker_error", "worker_error"),
+    ("worker requested cleanup before ready", "worker_cleanup_before_ready"),
+    ("child ready ok=false", "child_ready_not_ok"),
+    ("on_ready failed", "on_ready_failed"), ("cli timeout", "cli_timeout"),
+    ("no output recovered from cli", "no_output_recovered"),
+    ("output_schema mismatch", "output_schema_mismatch"),
+    ("source_snapshot_dir origin is missing", "source_snapshot_missing"),
+    ("claude credentials copy failed", "claude_credentials_copy_failed"),
+    ("codex auth copy failed", "codex_auth_copy_failed"),
+    ("opencode runtime assets copy failed", "opencode_assets_copy_failed"),
+)
+_CLI_PATTERN_REASONS = {
+    "code-mode host": "code_mode_host",
+    "SIGTRAP": "sigtrap",
+    "closed its stdout": "closed_stdout",
+    "Segmentation fault": "segmentation_fault",
+    "usage limit": "usage_limit",
+    "try again at": "try_again_at",
+    "401 Unauthorized": "unauthorized",
+    "Unauthorized": "unauthorized",
+}
+_FIXED_REASON_TOKENS = frozenset({
+    "bin_not_found", "tool_budget_abort", "spool_flood", "supervisor_died", "proxy_died",
+    "cleanup_deadline_received", "parent_gone", "isolated_launch_once",
+    "artifact_exceeds_memory_max", "fingerprint_mismatch", "cgroup_create_failed",
+    "inherited_seccomp_filter", "credentials_unexpected", "rlimit_failed",
+    "subreaper_failed", "landlock_abi_too_old", "landlock_create_failed",
+    "no_new_privs_failed", "landlock_restrict_failed", "seccomp_install_failed",
+    "seccomp_self_check_failed", "policy_compile_failed", "artifact_copy_failed",
+    "artifact_digest_mismatch", "artifact_copy_unsupported", "artifact_changed",
+    "attestation_malformed", "attestation_order", "attestation_deadline",
+    "attestation_mismatch", "attestation_go_send_failed", "attestation_exec_failed",
+    "launcher_died", "launcher_spawn_failed", "cgroup_join_failed",
+    "receiver_handoff_failed", "cli_exec_unproven", "cli_artifact_unsupported",
+    "launch_thread_unsupported", "seccomp_user_notif_unavailable",
+    "seccomp_wait_killable_unavailable", "seccomp_tsync_esrch_unavailable",
+    "pidfd_thread_unavailable", "ptrace_scope_unsupported", "supervisor_stalled",
+    "supervisor_resource", "connect_timeout", "cgroup_delegation_missing",
+    "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed",
+    "worker_not_reaped", "cleanup_deadline_exceeded", "proxy_start_failed",
+    "arch_unsupported", "safety_canary_failed", "runtime_fingerprint_selftest_failed",
+    "service_stopping",
+})
+_FIXED_REFUSALS = frozenset({
+    "arch_unsupported", "landlock_abi_too_old", "seccomp_user_notif_unavailable",
+    "seccomp_wait_killable_unavailable", "seccomp_tsync_esrch_unavailable",
+    "pidfd_thread_unavailable", "ptrace_scope_unsupported", "proxy_start_failed",
+    "cgroup_delegation_missing", "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed", "worker_not_reaped",
+    "cli_artifact_unsupported", "safety_canary_failed", "runtime_fingerprint_selftest_failed",
+    "service_stopping",
+})
+_FIXED_BLOCKING_REASONS = frozenset({
+    "cgroup_delegation_missing", "cgroup_topology_unsupported", "unit_stop_policy_unsupported",
+    "cgroup_cleanup_timeout", "cgroup_not_empty", "cgroup_rmdir_failed", "worker_not_reaped",
+})
+_WATCH_SUMMARY = re.compile(
+    r"\Aecho_reached=(yes|no) mcp=(none|init_only|tools=[0-9]+(?: \((?:empty|uninitialized)\))?) "
+    r"call=([0-9]+) steps=([0-9]+) events=([0-9]+)(?: grace_expired)?\Z")
+_SAFE_SELFTEST_DETAIL = re.compile(
+    r"\Agate=(?:handshake|incomplete|nonce|no_cli_child|not_reaped|spawn|cgroup_gate|sandbox_unavailable|unknown) "
+    r"status=(?:completed|failed|timeout|max_turns|-) reason=(?:[a-z0-9_]+|-)"
+    r"(?: watch=echo_reached=(?:yes|no),mcp=(?:none|init_only|tools=[0-9]+(?:,\((?:empty|uninitialized)\))?),"
+    r"call=[0-9]+,steps=[0-9]+,events=[0-9]+(?:,grace_expired)?)?"
+    r"(?: unreaped=[0-9]+)?(?: refusal=(?:[a-z0-9_]+|-))?"
+    r"(?: blocking=[a-z0-9_]+(?:,[a-z0-9_]+)*)?\Z")
+
+
+def _fixed_reason(reason: object) -> str:
+    if not isinstance(reason, str):
+        return "-"
+    for prefix, token in _FIXED_REASON_PREFIXES:
+        if reason.startswith(prefix):
+            return token
+    for pattern in CLI_STDERR_FATAL_PATTERNS:
+        token = _CLI_PATTERN_REASONS.get(pattern)
+        if token is not None and pattern in reason:
+            return token
+    for token in _FIXED_REASON_TOKENS:
+        if re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", reason):
+            return token
+    return "-"
+
+
+def selftest_failure_detail(gate: str, *, status: str, reason: object = None,
+                            watch: object | None = None,
+                            unreaped: object | None = None, refusal: object = None,
+                            blocking: object = None) -> str:
+    """Build the bounded diagnostic carried by a failed compatibility selftest."""
+    gate = gate if gate in _FAILURE_GATES else "unknown"
+    status = status if status in _RESULT_STATUSES else "-"
+    fixed_reason = _fixed_reason(reason)
+    fields = [f"gate={gate}", f"status={status}", f"reason={fixed_reason}"]
+    if watch is not None:
+        try:
+            summary = watch.summary()
+        except Exception:  # noqa: BLE001
+            summary = None
+        if isinstance(summary, str) and _WATCH_SUMMARY.fullmatch(summary) is not None:
+            fields.append("watch=" + summary.replace(" ", ","))
+    if isinstance(unreaped, int) and not isinstance(unreaped, bool):
+        fields.append(f"unreaped={max(0, unreaped)}")
+    if gate == "sandbox_unavailable":
+        token = refusal if isinstance(refusal, str) and refusal in _FIXED_REFUSALS else "-"
+        fields.append(f"refusal={token}")
+    if gate == "cgroup_gate":
+        try:
+            reasons = tuple(blocking)
+        except TypeError:
+            reasons = ()
+        fixed = [value for value in reasons
+                 if isinstance(value, str) and value in _FIXED_BLOCKING_REASONS]
+        if fixed:
+            fields.append("blocking=" + ",".join(fixed))
+    return " ".join(fields)
+
+
+def selftest_detail_or_default(detail: object, *, gate: str = "incomplete",
+                               status: str = "failed") -> str:
+    """Accept only a canonical probe diagnostic; replace every other value."""
+    if isinstance(detail, str) and _SAFE_SELFTEST_DETAIL.fullmatch(detail) is not None:
+        return detail
+    return selftest_failure_detail("unknown", status=status)
+
+
+def _failure_result(*, backend: str, provider: Literal["chatgpt"] | None, gate: str,
+                    status: object, reason: object = None, watch: object | None = None,
+                    unreaped: object | None = None, refusal: object = None,
+                    blocking: object = None, operator_detail: str) -> VerifyBackendResult:
+    return VerifyBackendResult(
+        ok=False, backend=backend, provider=provider, fingerprint=None,
+        detail=selftest_failure_detail(gate, status=status, reason=reason, watch=watch,
+                                       unreaped=unreaped, refusal=refusal, blocking=blocking),
+        operator_detail=operator_detail, gate=gate, status=status, reason=reason, watch=watch,
+        unreaped=unreaped, refusal=refusal, blocking=blocking)
+
+
+def _watch_progress(watch: object | None) -> str:
+    if watch is None:
+        return ""
+    try:
+        summary = watch.summary()
+    except Exception:  # noqa: BLE001
+        return ""
+    return f" [{summary}]" if isinstance(summary, str) else ""
 
 
 def _reject_rpc(method: str) -> Callable[[dict], dict]:
@@ -421,10 +587,10 @@ def verify_backend(
 
             choice = improve_admission.choose_for_mission(scoped_settings, root)
             if choice.refusal is not None:
-                return VerifyBackendResult(
-                    ok=False, backend=backend, provider=effective_provider,
-                    fingerprint=None,
-                    detail=f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}")
+                operator_detail = f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}"
+                return _failure_result(
+                    backend=backend, provider=effective_provider, gate="sandbox_unavailable",
+                    status="failed", refusal=choice.refusal, operator_detail=operator_detail)
             isolation_options = choice.worker_options
         elif isolation_options is OPERATOR_SHELL_NO_ISOLATION:
             isolation_options = {}
@@ -485,48 +651,55 @@ def verify_backend(
         after_descendants = _descendant_pids(os.getpid())
 
         if not ready_frames:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=("mission never reached ready (handshake failed): "
-                        f"status={result.status} reason={result.reason}"))
-        progress = f" [{watch.summary()}]" if watch is not None else ""
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="handshake",
+                status=result.status, reason=result.reason,
+                operator_detail=("mission never reached ready (handshake failed): "
+                                 f"status={result.status} reason={result.reason}"))
+        progress = _watch_progress(watch)
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
             # 自己試験は echo と MCP の両方が揃って初めて成功 (CLI の最終出力だけでは足りない)
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=f"mission did not complete: status={result.status} "
-                      f"reason={result.reason}{progress}")
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="incomplete",
+                status=result.status, reason=result.reason, watch=watch,
+                operator_detail=(f"mission did not complete: status={result.status} "
+                                 f"reason={result.reason}{progress}"))
         if not echoed and (result.status != "completed" or not result.output):
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail=f"mission did not complete: status={result.status} "
-                      f"reason={result.reason}{progress}")
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="incomplete",
+                status=result.status, reason=result.reason,
+                operator_detail=(f"mission did not complete: status={result.status} "
+                                 f"reason={result.reason}{progress}"))
         if not echoed and result.output.get("echo") != nonce:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="mission output failed the nonce round-trip "
-                      f"(schema/nonce gate){progress}")
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="nonce",
+                status=result.status, reason=result.reason,
+                operator_detail=("mission output failed the nonce round-trip "
+                                 f"(schema/nonce gate){progress}"))
         if backend != "local" and not watcher.saw_any_descendant():
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="no CLI child process was observed during the run "
-                      "(cli_started gate)")
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="no_cli_child",
+                status=result.status, reason=result.reason,
+                operator_detail=("no CLI child process was observed during the run "
+                                 "(cli_started gate)"))
         if backend != "local" and after_descendants:
-            return VerifyBackendResult(
-                ok=False, backend=backend, provider=effective_provider, fingerprint=None,
-                detail="CLI child process(es) were not reaped after the "
-                      f"mission completed (pgid recovery gate): "
-                      f"{sorted(after_descendants)}")
+            return _failure_result(
+                backend=backend, provider=effective_provider, gate="not_reaped",
+                status=result.status, reason=result.reason, unreaped=len(after_descendants),
+                operator_detail=("CLI child process(es) were not reaped after the "
+                                 "mission completed (pgid recovery gate): "
+                                 f"{sorted(after_descendants)}"))
 
         model = scoped_settings.runner.improve.model
         fingerprint = hashlib.sha256(
             f"{backend}:{effective_provider}:{model}:{nonce}".encode("utf-8")
         ).hexdigest()
+        operator_detail = (f"backend={backend} provider={effective_provider} "
+                           f"model={model} fingerprint={fingerprint}{progress}")
         return VerifyBackendResult(
             ok=True, backend=backend, provider=effective_provider,
             fingerprint=fingerprint,
-            detail=f"backend={backend} provider={effective_provider} "
-                  f"model={model} fingerprint={fingerprint}{progress}")
+            detail=operator_detail, operator_detail=operator_detail)
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)
