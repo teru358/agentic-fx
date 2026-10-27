@@ -434,7 +434,7 @@ def test_admission_decision_has_no_second_selftest_detail_field():
     assert "selftest_detail" not in IA.AdmissionDecision.__dataclass_fields__
 
 
-def test_selftest_probe_logs_each_new_safe_decision_once(tmp_path, monkeypatch):
+def test_selftest_probe_logs_safe_detail_without_operator_detail(tmp_path, monkeypatch):
     from agentic_fx.core import improve_canary
     from agentic_fx.loops.verify_backend import VerifyBackendResult
     from agentic_fx.setup.post_start import read_admission_line
@@ -442,16 +442,15 @@ def test_selftest_probe_logs_each_new_safe_decision_once(tmp_path, monkeypatch):
     unsafe = ("try again at alice@example.com https://private.invalid/ "
               "stderr=credential-ABC")
     results = [
-        VerifyBackendResult(False, "codex", None, None, unsafe),
         VerifyBackendResult(False, "codex", None, None,
-                            "gate=nonce status=completed reason=-"),
+                            "gate=nonce status=completed reason=-",
+                            operator_detail=unsafe),
     ]
 
     def fake_verify(*_args, **_kwargs):
         return results.pop(0)
 
     monkeypatch.setattr("agentic_fx.loops.verify_backend.verify_backend", fake_verify)
-    now = [0.0]
     emitted: list[str] = []
     settings = _settings("codex", _elf(tmp_path))
     admission = IA.ImproveAdmission(
@@ -459,20 +458,16 @@ def test_selftest_probe_logs_each_new_safe_decision_once(tmp_path, monkeypatch):
         selftest=lambda ctx: improve_canary.run_selftest(ctx, settings=settings, root=tmp_path),
         kernel_probe=lambda: KERNEL,
         retry_interval_sec=1.0,
-        clock=lambda: now[0],
+        clock=lambda: 0.0,
         technical_log=emitted.append,
     )
 
     first = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
     cached = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
-    now[0] = 1.0
-    retried = IA.choose_for_mission(settings, tmp_path, enabled=True, host=Host(), admission=admission)
 
-    assert first.decision.detail == "gate=incomplete status=failed reason=-"
+    assert first.decision.detail == "gate=nonce status=completed reason=-"
     assert cached.decision is first.decision
-    assert retried.decision.detail == "gate=nonce status=completed reason=-"
     assert emitted == [
-        "improve isolation: selftest detail: gate=incomplete status=failed reason=-",
         "improve isolation: selftest detail: gate=nonce status=completed reason=-",
     ]
     rendered = "\n".join(emitted)

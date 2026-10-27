@@ -1438,7 +1438,7 @@ def test_cli_improve_verify_backend_returns_1_when_verification_fails(
     (メモリ §6.11「fixture が一様だと条件分岐の片側が一度も踏まれない」)。
     検証専用 CLI の終了コードは契約そのもの (runbook 側は
     `afx improve verify-backend ... && ...` の形で判定する) — `ok=False`
-    側で `rc == 1` かつ stderr に `result.detail` が出ることを固定する。"""
+    側で `rc == 1` かつ stderr に運用者向け detail が出ることを固定する。"""
     from unittest.mock import patch
     from agentic_fx.entry import main as entry_main
     from agentic_fx.loops.verify_backend import VerifyBackendResult
@@ -1448,10 +1448,14 @@ def test_cli_improve_verify_backend_returns_1_when_verification_fails(
          patch("agentic_fx.loops.verify_backend.verify_backend") as vb:
         vb.return_value = VerifyBackendResult(
             ok=False, backend="local", provider=None,
-            fingerprint=None, detail="mission did not complete: status=failed")
+            fingerprint=None, detail="gate=incomplete status=failed reason=worker_eof",
+            operator_detail=("mission did not complete: status=failed "
+                             "reason=HTTP-like CLI exit rc=401: token expired"))
         rc = entry_main(["check", "backend", "--backend", "local"])
     assert rc == 1
-    assert "mission did not complete: status=failed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "HTTP-like CLI exit rc=401: token expired" in err
+    assert "gate=incomplete" not in err
 
 
 def test_cli_verify_backend_reports_ready_mismatch_as_rc1_not_traceback(

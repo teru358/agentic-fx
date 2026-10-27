@@ -82,6 +82,7 @@ class VerifyBackendResult:
     provider: Literal["chatgpt"] | None
     fingerprint: str | None
     detail: str
+    operator_detail: str = ""
 
 
 _FAILURE_GATES = frozenset({
@@ -465,10 +466,11 @@ def verify_backend(
 
             choice = improve_admission.choose_for_mission(scoped_settings, root)
             if choice.refusal is not None:
+                detail = f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}"
                 return VerifyBackendResult(
                     ok=False, backend=backend, provider=effective_provider,
                     fingerprint=None,
-                    detail=f"{improve_admission.SANDBOX_UNAVAILABLE}: {choice.refusal}")
+                    detail=detail, operator_detail=detail)
             isolation_options = choice.worker_options
         elif isolation_options is OPERATOR_SHELL_NO_ISOLATION:
             isolation_options = {}
@@ -532,7 +534,9 @@ def verify_backend(
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("handshake", status=result.status,
-                                               reason=result.reason))
+                                               reason=result.reason),
+                operator_detail=("mission never reached ready (handshake failed): "
+                                 f"status={result.status} reason={result.reason}"))
         progress = f" [{watch.summary()}]" if watch is not None else ""
         echoed = watch is not None and watch.ok
         if watch is not None and not watch.ok:
@@ -540,28 +544,39 @@ def verify_backend(
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("incomplete", status=result.status,
-                                               reason=result.reason, watch=watch))
+                                               reason=result.reason, watch=watch),
+                operator_detail=(f"mission did not complete: status={result.status} "
+                                 f"reason={result.reason}{progress}"))
         if not echoed and (result.status != "completed" or not result.output):
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("incomplete", status=result.status,
-                                               reason=result.reason))
+                                               reason=result.reason),
+                operator_detail=(f"mission did not complete: status={result.status} "
+                                 f"reason={result.reason}{progress}"))
         if not echoed and result.output.get("echo") != nonce:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("nonce", status=result.status,
-                                               reason=result.reason))
+                                               reason=result.reason),
+                operator_detail=("mission output failed the nonce round-trip "
+                                 f"(schema/nonce gate){progress}"))
         if backend != "local" and not watcher.saw_any_descendant():
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("no_cli_child", status=result.status,
-                                               reason=result.reason))
+                                               reason=result.reason),
+                operator_detail=("no CLI child process was observed during the run "
+                                 "(cli_started gate)"))
         if backend != "local" and after_descendants:
             return VerifyBackendResult(
                 ok=False, backend=backend, provider=effective_provider, fingerprint=None,
                 detail=selftest_failure_detail("not_reaped", status=result.status,
                                                reason=result.reason,
-                                               unreaped=len(after_descendants)))
+                                               unreaped=len(after_descendants)),
+                operator_detail=("CLI child process(es) were not reaped after the "
+                                 "mission completed (pgid recovery gate): "
+                                 f"{sorted(after_descendants)}"))
 
         model = scoped_settings.runner.improve.model
         fingerprint = hashlib.sha256(
@@ -571,6 +586,8 @@ def verify_backend(
             ok=True, backend=backend, provider=effective_provider,
             fingerprint=fingerprint,
             detail=f"backend={backend} provider={effective_provider} "
-                  f"model={model} fingerprint={fingerprint}{progress}")
+                  f"model={model} fingerprint={fingerprint}{progress}",
+            operator_detail=f"backend={backend} provider={effective_provider} "
+                            f"model={model} fingerprint={fingerprint}{progress}")
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)

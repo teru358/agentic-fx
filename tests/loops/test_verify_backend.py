@@ -380,7 +380,7 @@ def test_verify_backend_fails_closed_when_handshake_never_reaches_ready(
 
 
 def test_verify_backend_failure_detail_discards_untrusted_reason_text(tmp_path, monkeypatch):
-    """Failure diagnostics retain only the classified gate, status, and reason token."""
+    """Selftest detail is bounded while the operator diagnostic retains the cause."""
     monkeypatch.setattr("agentic_fx.loops.verify_backend.WorkerRunner",
                         _FakeVerifyWorkerRunner)
     unsafe = ("worker_eof stderr=token-ABC alice@example.com "
@@ -394,6 +394,8 @@ def test_verify_backend_failure_detail_discards_untrusted_reason_text(tmp_path, 
     assert result.detail == "gate=incomplete status=failed reason=worker_eof"
     assert all(value not in result.detail for value in (
         "stderr", "alice@example.com", "https://", "sk-live-credential"))
+    assert result.operator_detail == (
+        f"mission did not complete: status=failed reason={unsafe}")
 
 
 def test_verify_backend_fingerprint_changes_across_runs_with_identical_config(

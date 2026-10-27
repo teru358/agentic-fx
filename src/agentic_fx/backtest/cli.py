@@ -815,9 +815,9 @@ def verify_backend_command(root: Path, args: argparse.Namespace) -> int:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
     if not result.ok:
-        print(f"エラー: {result.detail}", file=sys.stderr)
+        print(f"エラー: {result.operator_detail or result.detail}", file=sys.stderr)
         return 1
-    print(result.detail)
+    print(result.operator_detail or result.detail)
     print(f"fingerprint: {result.fingerprint}")
     if result.backend == "opencode":
         print("合格後、人間が config/settings.yaml の improve.llama_swap_verified "
