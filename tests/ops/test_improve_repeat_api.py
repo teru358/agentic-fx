@@ -81,3 +81,28 @@ def test_bad_bodies_are_400_invalid_argument_and_leave_no_audit_row(repeat_api, 
     assert response.json()["error"]["code"] == "invalid_argument"
     assert ops_env.ops_rows() == []
     assert repeat_api.sup.repeat_calls == [] and repeat_api.sup.manual_calls == []
+
+
+@pytest.mark.parametrize("principal", [Principal.OPS_WEB, Principal.OPS_NOTIFY])
+@pytest.mark.parametrize("path", ["/v1/improve/runs", "/v1/asks"])
+@pytest.mark.parametrize("content", [
+    b"{not json", b"[1, 2]", b"5", b'"text"', b"null", b'{"max_runs": "x", "zzz": null}',
+    b"\xff\xfe", b'{"duration_sec": 1}'])
+def test_an_unauthorized_caller_gets_403_whatever_the_body_looks_like(
+        api5, ops_env, principal, path, content):
+    client = api5.client(principal)
+    response = client.post(path, content=content,
+                           headers={"Idempotency-Key": "k",
+                                    "Content-Type": "application/json"})
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "forbidden"
+    assert ops_env.ops_rows() == []
+
+
+@pytest.mark.parametrize("content", [b"{not json", b"[1, 2]", b"5"])
+def test_an_authorized_caller_with_a_broken_body_is_still_400(repeat_api, content):
+    client = repeat_api.client(Principal.OPERATOR)
+    response = client.post("/v1/improve/runs", content=content,
+                           headers={"Idempotency-Key": "k"})
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_argument"

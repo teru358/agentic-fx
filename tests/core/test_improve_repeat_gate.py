@@ -548,6 +548,36 @@ def test_autopilot_turning_true_while_waiting_for_the_gate_stops_the_repeat(tmp_
     assert sup._manual_active is False
 
 
+def test_the_gate_lock_is_free_while_the_autopilot_check_is_blocked(tmp_path):
+    db, sup, loop = fresh(tmp_path, default={})
+    own(sup)
+    busy = busy_spy(sup)
+    block, inside, release = threading.Event(), threading.Event(), threading.Event()
+
+    def autopilot():
+        if block.is_set():
+            inside.set()
+            release.wait(T)
+        return False
+
+    rep = Repeat(sup, max_runs=3, autopilot=autopilot)
+    rt = threading.Thread(target=rep.run, daemon=True)
+    rt.start()
+    try:
+        assert busy.wait(T)
+        block.set()
+        assert inside.wait(T)
+        took = sup._gate.acquire(timeout=1.0)
+        if took:
+            sup._gate.release()
+        assert took, "the autopilot check held the gate lock"
+    finally:
+        release.set()
+        rep.cancel.set()
+        rt.join(T)
+    assert not rt.is_alive()
+
+
 def counting_busy(sup):
     calls = []
     real = sup._weekly_busy_locked

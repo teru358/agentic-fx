@@ -803,17 +803,18 @@ class ImproveSupervisor:
         """繰り返しの mission を始めてよくなるまで待つ。始めてよければ
         `manual_active` を立てて None を返す。停止の理由があればそれを返す。
 
-        停止・期限・autopilot の確認 (`check`) は短い刻みで毎回行う。週次 slot の
-        DB 確認は、gate の通知を受けたときと `WAIT_RECHECK_SEC` ごとだけにする。"""
+        停止・期限・autopilot の確認 (`check`) は短い刻みで毎回行うが、gate の lock の
+        外で呼ぶ (外部の排他 lock を待つことがあるため)。週次 slot の DB 確認は、
+        gate の通知を受けたときと `WAIT_RECHECK_SEC` ごとだけにする。"""
         warned: set = set()
         busy = True
         need_db = True
         last_db = time.monotonic()
-        with self._gate:
-            while True:
-                reason = check()
-                if reason is not None:
-                    return reason
+        while True:
+            reason = check()
+            if reason is not None:
+                return reason
+            with self._gate:
                 if not self._manual_active and self._weekly_waiting == 0:
                     if need_db:
                         busy = self._weekly_busy_locked(warned)

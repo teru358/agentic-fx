@@ -8,7 +8,6 @@ import time
 
 import pytest
 
-from agentic_fx.ops.jobs import JobState
 from agentic_fx.store import db as db_mod
 from agentic_fx.store import improve_waves
 from tests.core._improve_repeat_helpers import (
@@ -22,7 +21,8 @@ FAIL = {"result": result("failed")}
 
 
 class Rig:
-    def __init__(self, env, script=(), *, default=None, stop=None, slots=0, emit=False):
+    def __init__(self, env, script=(), *, default=None, stop=None, slots=0, emit=False,
+                 service_kwargs=None):
         if slots:
             conn = db_mod.connect(env.db_path)
             try:
@@ -35,7 +35,8 @@ class Rig:
         self.sup, self.loop = build(env.db_path, env.root, script, default=default,
                                     stop=self.stop, emit=emit)
         self.sup._poll_sec = 0.02
-        self.service = env.service(improve_supervisor=self.sup, stop_event=self.stop)
+        self.service = env.service(improve_supervisor=self.sup, stop_event=self.stop,
+                                   **(service_kwargs or {}))
 
     def fast_waits(self):
         """待ちを (実時間ではなく) 注入の単調時計の前進に置き換える。"""
@@ -221,11 +222,9 @@ def test_a_repeat_and_a_weekly_slot_never_overlap(rig):
 
 # ---- 停止 (daemon) ----
 
-def test_shutdown_before_the_first_mission_ends_the_controller_with_shutdown(
-        rig, monkeypatch):
+def test_shutdown_before_the_first_mission_ends_the_controller_with_shutdown(rig):
     stop = threading.Event()
     r = rig([OK], stop=stop)
-    monkeypatch.setattr(r.service, "_precheck_improve", lambda job: None)
     stop.set()
     reply = r.service.improve(OPERATOR, "k1", max_runs=2)
     job = wait_job(r.service, reply["job_id"])
@@ -234,7 +233,15 @@ def test_shutdown_before_the_first_mission_ends_the_controller_with_shutdown(
     assert r.loop.prepared == []
 
 
-def test_graceful_shutdown_while_a_job_waits_to_start_ends_with_shutdown(rig):
+def _complete_and_finished(job, reason):
+    result = job["result"]
+    assert (job["state"], result["stop_reason"], result["runs"], result["phase"]) == (
+        "done", reason, 0, "finished")
+    assert result["mission_id"] is None and result["stop_requested"] is False
+    assert isinstance(result["max_runs"], int) and "deadline_at" in result
+
+
+def test_graceful_shutdown_while_a_job_waits_to_start_ends_done_with_shutdown(rig):
     stop = threading.Event()
     r = rig([OK], stop=stop)
     started = []
@@ -243,9 +250,56 @@ def test_graceful_shutdown_while_a_job_waits_to_start_ends_with_shutdown(rig):
     stop.set()
     type(r.service)._start_thread(r.service, started[0])
     job = wait_job(r.service, reply["job_id"])
-    # 事前確認の段階で停止を見るので、controller には入らない。
-    assert job["state"] == JobState.SHUTDOWN.value
+    _complete_and_finished(job, "shutdown")
+    assert job["result_code"] is None
     assert r.loop.prepared == []
+
+
+class _AutopilotStore:
+    """受理前の読み (load) は通し、開始時の autopilot 読み (autopilot_at_start) だけ真にする。"""
+
+    def __init__(self, real):
+        self._real = real
+        self.on = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def autopilot_at_start(self, *, deadline, stop_event):
+        return self.on
+
+
+def test_autopilot_after_acceptance_but_before_the_controller_ends_done_with_autopilot(
+        rig, ops_env):
+    store = _AutopilotStore(ops_env.state)
+    r = rig([OK], service_kwargs={"state_store": store})
+    started = []
+    r.service._start_thread = lambda job: started.append(job)
+    reply = r.service.improve(OPERATOR, "k1", max_runs=2)
+    store.on = True
+    type(r.service)._start_thread(r.service, started[0])
+    job = wait_job(r.service, reply["job_id"])
+    _complete_and_finished(job, "autopilot")
+    assert job["result_code"] is None
+    assert r.loop.prepared == []
+    last = ops_env.ops_rows()[-1]
+    assert last["phase"] == "succeeded"
+
+
+def test_autopilot_at_acceptance_is_still_refused_before_any_job(rig, ops_env):
+    from agentic_fx.ops import ErrorCode, OpsError
+    state = ops_env.state
+
+    class On(_AutopilotStore):
+        def load(self, **kw):
+            real = self._real.load(**kw)
+            return type("S", (), {"autopilot": True})() if real is not None else real
+
+    r = rig([OK], service_kwargs={"state_store": On(state)})
+    with pytest.raises(OpsError) as raised:
+        r.service.improve(OPERATOR, "k1", max_runs=2)
+    assert raised.value.code is ErrorCode.AUTOPILOT_RESTRICTED
+    assert r.service.jobs._jobs == {}
 
 
 def test_graceful_shutdown_with_the_controller_waiting_ends_done_shutdown(rig):

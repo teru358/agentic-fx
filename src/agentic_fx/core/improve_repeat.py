@@ -10,6 +10,7 @@ import threading
 import unicodedata
 from dataclasses import dataclass
 
+MIN_DURATION_SEC = 60
 MAX_DURATION_SEC = 86400
 MAX_RUNS = 24
 COMMENT_MAX_CHARS = 1000
@@ -48,9 +49,16 @@ def parse_duration(text: str) -> int:
     if m is None or not text or (m.group(1) is None and m.group(2) is None):
         raise ValueError("invalid duration")
     total = int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60
-    if total < 60 or total > MAX_DURATION_SEC:
+    return validate_duration_sec(total)
+
+
+def validate_duration_sec(seconds: object) -> int:
+    """期間 (秒) の型と範囲の検査。client の解釈と daemon の受理が同じ規則を使う。"""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("invalid duration")
+    if seconds < MIN_DURATION_SEC or seconds > MAX_DURATION_SEC:
         raise ValueError("duration out of range")
-    return total
+    return seconds
 
 
 def validate_max_runs(n: object) -> int:

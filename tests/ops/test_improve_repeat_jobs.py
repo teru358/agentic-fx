@@ -22,7 +22,8 @@ def _registry():
 def _single(registry, kind="improve", *, repeat=False, actor=None, principal=OPERATOR):
     kwargs = {}
     if repeat:
-        kwargs = {"initial_result": dict(INITIAL), "cancel_event": threading.Event()}
+        kwargs = {"initial_result": dict(INITIAL), "cancel_event": threading.Event(),
+                  "repeat": True}
     return registry.enqueue_single(principal, actor, kind, lambda job: {},
                                    deadline_seconds=35.0,
                                    busy_code=ErrorCode.IMPROVE_RUNNING, **kwargs)
@@ -34,13 +35,13 @@ def test_initial_result_is_visible_as_soon_as_the_job_is():
     seen = registry.lookup(job.id)
     assert seen.result == INITIAL
     assert seen.result is not INITIAL
-    assert seen.cancel_event is not None
+    assert seen.cancel_event is not None and seen.repeat is True
 
 
 def test_enqueue_without_the_new_arguments_is_unchanged():
     registry = _registry()
     job = _single(registry)
-    assert job.result is None and job.cancel_event is None
+    assert job.result is None and job.cancel_event is None and job.repeat is False
 
 
 @pytest.mark.parametrize("kind", ["improve", "ask"])
@@ -51,6 +52,27 @@ def test_running_cancel_of_a_non_repeat_job_is_still_job_running(kind):
         registry.cancel(job.id, OPERATOR, None)
     assert raised.value.code is ErrorCode.JOB_RUNNING
     assert job.state is JobState.RUNNING
+
+
+def test_an_event_alone_does_not_make_a_running_job_cancellable():
+    registry = _registry()
+    event = threading.Event()
+    job = registry.enqueue_single(OPERATOR, None, "improve", lambda job: {},
+                                  deadline_seconds=35.0,
+                                  busy_code=ErrorCode.IMPROVE_RUNNING, cancel_event=event)
+    with pytest.raises(OpsError) as raised:
+        registry.cancel(job.id, OPERATOR, None)
+    assert raised.value.code is ErrorCode.JOB_RUNNING
+    assert not event.is_set() and job.repeat is False
+
+
+def test_a_repeat_job_always_has_a_cancel_event():
+    registry = _registry()
+    job = registry.enqueue_single(OPERATOR, None, "improve", lambda job: {},
+                                  deadline_seconds=35.0,
+                                  busy_code=ErrorCode.IMPROVE_RUNNING, repeat=True)
+    out = registry.cancel(job.id, OPERATOR, None)
+    assert out is job and job.cancel_event.is_set()
 
 
 def test_running_decision_cancel_is_still_job_running():
@@ -141,20 +163,43 @@ def test_update_result_after_a_terminal_state_is_ignored():
     assert job.result == snapshot
 
 
-def test_finish_keeps_the_last_progress_and_progress_wins_on_shared_keys():
+def test_finish_prefers_the_action_result_over_a_stale_progress():
     registry = _registry()
     job = _single(registry, repeat=True)
-    registry.update_result(job, {"phase": "finished", "stop_reason": "deadline",
-                                 "runs": 2, "mission_id": 5})
+    registry.update_result(job, {"phase": "running", "runs": 1, "mission_id": 5})
     registry.finish(job, state=JobState.DONE, result={
-        "stop_reason": "max_runs", "runs": 99, "mission_id": 1, "phase": "running",
-        "stop_requested": True, "extra": "kept"})
-    assert job.result["stop_reason"] == "deadline"
-    assert job.result["runs"] == 2 and job.result["mission_id"] == 5
+        "stop_reason": "max_runs", "runs": 2, "mission_id": 6, "extra": "kept"})
+    assert job.result["stop_reason"] == "max_runs"
+    assert job.result["runs"] == 2 and job.result["mission_id"] == 6
     assert job.result["phase"] == "finished"
-    assert job.result["stop_requested"] is False
     assert job.result["extra"] == "kept"
     assert job.result["max_runs"] == 3
+
+
+def test_finish_takes_progress_the_action_result_lacks_from_the_current_value():
+    registry = _registry()
+    job = _single(registry, repeat=True)
+    registry.update_result(job, {"phase": "running", "runs": 2, "mission_id": 5,
+                                 "stop_reason": "deadline"})
+    registry.finish(job, state=JobState.DONE, result={"extra": 1})
+    assert job.result["runs"] == 2 and job.result["mission_id"] == 5
+    assert job.result["stop_reason"] == "deadline"
+
+
+def test_finish_always_keeps_the_stop_request_the_registry_recorded():
+    registry = _registry()
+    job = _single(registry, repeat=True)
+    registry.cancel(job.id, OPERATOR, None)
+    registry.finish(job, state=JobState.DONE, result={
+        "stop_reason": "stopped", "runs": 1, "stop_requested": False})
+    assert job.result["stop_requested"] is True
+
+
+def test_finish_marks_a_repeat_job_finished_even_when_the_progress_is_stale():
+    registry = _registry()
+    job = _single(registry, repeat=True)
+    registry.finish(job, state=JobState.FAILED, result=None, error_code="internal")
+    assert job.result["phase"] == "finished"
 
 
 def test_finish_with_no_result_keeps_the_progress():

@@ -929,6 +929,9 @@ def parse(tokens: list[str]) -> Op:
     if cmd == "improve" and n == 0:
         return Op("improve", [])
     if cmd == "improve" and n >= 2 and args[0] == "add":
+        if any(_is_improve_flag(token) for token in args[1:]):
+            # 旧 `improve add` と繰り返しの option は併用できない。
+            raise ClientError(RC_USAGE, _usage())
         return Op("backlog_add", [" ".join(args[1:])], via_alias="improve add")
     if cmd == "improve" and n >= 1 and args[0] != "add":
         return Op("improve", _parse_improve(args))
@@ -969,6 +972,11 @@ def parse(tokens: list[str]) -> Op:
 _IMPROVE_FLAGS = {"-t": "duration", "--duration": "duration",
                   "-c": "comment", "--comment": "comment",
                   "-n": "max_runs", "--max-runs": "max_runs"}
+
+
+def _is_improve_flag(token: str) -> bool:
+    return token.split("=", 1)[0] in _IMPROVE_FLAGS if token.startswith("--") \
+        else token in _IMPROVE_FLAGS
 
 
 def _parse_improve(args: list[str]) -> list:
@@ -1233,10 +1241,13 @@ class Runner:
                         f"最大 {shown_runs if type(shown_runs) is int else (max_runs or ir.MAX_RUNS)} 回"
                         + ("、一時指示あり" if comment is not None else ""))
                 runs, mission_id = result.get("runs"), result.get("mission_id")
-                started = type(runs) is int and runs >= 1 and type(mission_id) is int
+                # 1 回目が始まったかは回数で決める。mission_id は表示にだけ使う
+                # (mission が作られる前に失敗した回も 1 回と数える)。
+                started = type(runs) is int and runs >= 1
                 if started and not launched:
                     launched = True
-                    self.say(f"1 回目 mission #{mission_id} を起動しました")
+                    self.say(f"1 回目 mission #{mission_id} を起動しました"
+                             if type(mission_id) is int else "1 回目を起動しました")
                 if state in _TERMINAL_JOB_STATES:
                     self.say(_improve_end_text(job_id, job))
                     return RC_OK

@@ -137,11 +137,23 @@ def test_duplicates_unknown_missing_values_and_positionals_are_usage(argv):
     _usage_rc(argv)
 
 
-def test_add_after_other_tokens_is_not_the_legacy_alias_but_before_them_it_is_an_idea():
-    op = client.parse(["improve", "add", "x", "-t", "1h"])
-    assert (op.name, op.args, op.via_alias) == ("backlog_add", ["x -t 1h"], "improve add")
-    op = client.parse(["improve", "add", "-n", "3", "-c", "y"])
-    assert (op.name, op.args) == ("backlog_add", ["-n 3 -c y"])
+@pytest.mark.parametrize("argv", [
+    ["improve", "add", "idea", "-n", "3"],
+    ["improve", "add", "x", "-t", "1h"],
+    ["improve", "add", "-n", "3", "-c", "y"],
+    ["improve", "add", "x", "--max-runs=2"],
+    ["improve", "add", "x", "--comment", "y"],
+    ["improve", "add", "x", "--duration=1h"],
+])
+def test_add_together_with_a_repeat_option_is_usage(argv):
+    _usage_rc(argv)
+
+
+def test_a_legacy_add_without_a_repeat_option_is_still_an_idea():
+    op = client.parse(["improve", "add", "x", "y"])
+    assert (op.name, op.args, op.via_alias) == ("backlog_add", ["x y"], "improve add")
+    op = client.parse(["improve", "add", "x-n", "-nope", "--t=1"])
+    assert (op.name, op.args) == ("backlog_add", ["x-n -nope --t=1"])
     _usage_rc(["improve", "-t", "1h", "add", "x"])
 
 
@@ -270,15 +282,18 @@ def test_a_slot_wait_over_45_seconds_is_still_rc0_with_one_post(tmp_path):
     assert f"afx ctl jobs cancel {JOB}" in out
 
 
-def test_state_running_without_a_mission_id_is_not_a_launch(tmp_path):
+def test_state_running_with_a_run_but_no_mission_id_is_a_launch(tmp_path):
     rc, out, api, clock = _run(tmp_path, ["improve", "-n", "2"], [
         _ok({"job_id": JOB, "state": "running"}),
         _progress(1, None)])
     assert rc == 0
-    assert "起動しました" not in out and "slot が空くのを待って" in out
+    assert "1 回目を起動しました" in out and "mission #" not in out
+    assert "slot が空くのを待って" not in out
+    assert clock.now < 1.0
+    assert f"afx ctl jobs cancel {JOB}" in out
 
 
-def test_a_launch_needs_both_runs_and_mission_id(tmp_path):
+def test_a_launch_needs_a_run_count(tmp_path):
     _, out, _, _ = _run(tmp_path, ["improve", "-n", "2"], [
         _ok({"job_id": JOB, "state": "running"}), _progress(0, 41)])
     assert "起動しました" not in out
@@ -447,9 +462,16 @@ def test_other_commands_still_split_on_whitespace_only(monkeypatch):
 
 
 def test_legacy_improve_add_keeps_whitespace_splitting(monkeypatch):
-    rc, seen, out, err = _shell(monkeypatch, "improve add it's -n 3\n")
+    rc, seen, out, err = _shell(monkeypatch, "improve add it's fine\n")
     assert rc == 0 and err == ""
-    assert [(op.name, op.args) for op in seen] == [("backlog_add", ["it's -n 3"])]
+    assert [(op.name, op.args) for op in seen] == [("backlog_add", ["it's fine"])]
+
+
+def test_the_shell_refuses_add_with_a_repeat_option_and_continues(monkeypatch):
+    rc, seen, out, err = _shell(monkeypatch, "improve add idea -n 3\nwhoami\n")
+    assert rc == 0
+    assert err.startswith("afx ctl: ") and "improve" in err
+    assert [op.name for op in seen] == ["whoami"]
 
 
 # ---- 実 server を通す ----

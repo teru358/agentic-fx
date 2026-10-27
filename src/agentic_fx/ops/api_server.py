@@ -32,7 +32,8 @@ from typing import Callable
 from urllib.parse import parse_qsl, urlsplit
 
 from .contracts import (PRINCIPAL_SCOPES, ErrorCode, OpsError, Principal,
-                        Scope, validate_asserted_actor, validate_principal_scopes)
+                        Scope, assert_authorized, validate_asserted_actor,
+                        validate_principal_scopes)
 from .keys import KeySet
 from .service import ENDPOINTS
 
@@ -630,6 +631,8 @@ class ApiServer:
             route, params = found
             if route.scope in _PIDFD_REQUIRED and not peer.pidfd_verified:
                 raise _Reject(403, ErrorCode.FORBIDDEN)
+            # 認可は本文を読む前に済ませる (本文の形に依らず、権限の無い呼び出しは 403)。
+            assert_authorized(principal, route.scope)
             data = _call(self._ops, route, params, request, principal, deadline, actor)
             if route.method == "GET":
                 _log.debug("api read %s", route.handler)

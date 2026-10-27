@@ -1250,7 +1250,7 @@ class OpsService:
                 # 走行中の繰り返し job は停止を要求しただけで、state は変わらない。
                 self._job_event(job, self.events)
             response = {"id": job.id, "state": job.state.value}
-            if job.cancel_event is not None:
+            if job.repeat:
                 response["stop_requested"] = bool((job.result or {}).get("stop_requested"))
             return response
 
@@ -1333,10 +1333,10 @@ class OpsService:
                                            given.get("comment"))
         body: dict = {}
         if duration_sec is not None:
-            if (isinstance(duration_sec, bool) or not isinstance(duration_sec, int)
-                    or not 60 <= duration_sec <= ir.MAX_DURATION_SEC):
-                raise OpsError(ErrorCode.INVALID_ARGUMENT)
-            body["duration_sec"] = duration_sec
+            try:
+                body["duration_sec"] = ir.validate_duration_sec(duration_sec)
+            except ValueError:
+                raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
         if max_runs is not None:
             try:
                 body["max_runs"] = ir.validate_max_runs(max_runs)
@@ -1347,7 +1347,8 @@ class OpsService:
                 comment = ir.normalize_comment(comment)
             except ValueError:
                 raise OpsError(ErrorCode.INVALID_ARGUMENT) from None
-            body["comment"] = comment
+            # 本文 (とその digest) は監査・冪等の表に残さない。有無だけを写す。
+            body["has_comment"] = True
         repeat = duration_sec is not None or max_runs is not None
         self._ensure_accepting()
         deadline = self._deadline(deadline)
@@ -1362,6 +1363,9 @@ class OpsService:
                 if holder is not None:
                     holder.clear()
                 return self._replay(accepted)
+            # 期限の基準は受理に成功した時点。以降の確認や待ちで動かさない。
+            started_mono, started_wall = self._monotonic(), self._wall_clock()
+            job: Job | None = None
             try:
                 if self._improve_supervisor is None:
                     raise OpsError(ErrorCode.INVALID_STATE)
@@ -1369,33 +1373,43 @@ class OpsService:
                     raise OpsError(ErrorCode.AUTOPILOT_RESTRICTED)
                 if repeat:
                     job = self._enqueue_repeat(principal, job_id, accepted.audit_id,
-                                               duration_sec, max_runs, holder)
+                                               duration_sec, max_runs, holder,
+                                               started_mono, started_wall)
                 else:
                     job = self.jobs.enqueue_single(
                         principal, None, "improve", self._improve_action(holder),
                         deadline_seconds=self.limits.improve_start_deadline_seconds,
                         busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id,
                         audit_id=accepted.audit_id)
+                self._start_thread(job)
+                if holder is not None:
+                    self._activity("IMPROVE", "improve_requested",
+                                   f"repeat={'yes' if repeat else 'no'} comment=yes")
             except BaseException as exc:
                 if holder is not None:
                     holder.clear()
                 code = self._map_exception(exc) or ErrorCode.INTERNAL
-                self._terminal(accepted, principal, endpoint, code.value,
-                               _error_response(code))
+                if job is None:
+                    self._terminal(accepted, principal, endpoint, code.value,
+                                   _error_response(code))
+                else:
+                    # job は作ったが走らせられなかった。誰も終わらせないので、ここで失敗にする。
+                    self._finish_job_audit(job, self.audit, self.events,
+                                           state=JobState.FAILED, error_code=code.value)
+                    self.jobs.finish(job, state=JobState.FAILED, error_code=code.value,
+                                     result=job.result)
+                    self._job_event(job, self.events)
                 raise
-            if holder is not None:
-                self._activity("IMPROVE", "improve_requested",
-                               f"repeat={'yes' if repeat else 'no'} comment=yes")
-            self._start_thread(job)
             return {"job_id": job.id, "state": job.state.value}
 
     def _enqueue_repeat(self, principal: Caller, job_id: str, audit_id: int,
                         duration_sec: int | None, max_runs: int | None,
-                        holder: "ir.CommentHolder | None") -> Job:
-        # 期限は受理の時点で一度だけ決める (単調時計が判定の正本、壁時計は表示用)。
+                        holder: "ir.CommentHolder | None", started_mono: float,
+                        started_wall: datetime) -> Job:
+        # 期限は受理の時点 (呼び出し側が採った時刻) で一度だけ決める。単調時計が判定の正本、
+        # 壁時計は表示用。
         span = ir.MAX_DURATION_SEC if duration_sec is None else duration_sec
-        started_mono = self._monotonic()
-        wall = self._wall_clock()
+        wall = started_wall
         if wall.tzinfo is None:
             wall = wall.replace(tzinfo=timezone.utc)
         deadline_mono = started_mono + span
@@ -1409,7 +1423,7 @@ class OpsService:
             self._repeat_action(holder, duration_sec, max_runs, deadline_mono, deadline_at),
             deadline_seconds=self.limits.improve_start_deadline_seconds,
             busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id, audit_id=audit_id,
-            initial_result=initial, cancel_event=threading.Event())
+            initial_result=initial, cancel_event=threading.Event(), repeat=True)
 
     def _improve_action(self, holder: "ir.CommentHolder | None" = None) -> Callable[[Job], dict]:
         """1 回だけの improve。一時指示は holder 越しにだけ持ち、終わったら必ず消す。"""
@@ -1436,7 +1450,7 @@ class OpsService:
                        deadline_at: str) -> Callable[[Job], dict]:
         def run(job: Job) -> dict:
             try:
-                self._precheck_improve(job)
+                # 開始前の autopilot / daemon 停止の判定は controller が行い、通常の停止として終える。
                 outcome = self._improve_supervisor.submit_repeat(
                     duration_sec=duration_sec, max_runs=max_runs, comment_holder=holder,
                     on_progress=lambda patch: self.jobs.update_result(job, patch),
@@ -1464,7 +1478,12 @@ class OpsService:
                                   name=f"afx-ops-{job.kind}", daemon=True)
         with self._threads_lock:
             self._operation_threads.add(thread)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self._threads_lock:
+                self._operation_threads.discard(thread)
+            raise
 
     def _run_single(self, job: Job) -> None:
         try:

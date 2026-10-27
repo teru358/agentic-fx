@@ -117,17 +117,53 @@ def test_duration_bounds_are_accepted(ops_env, seconds):
     assert wait_job(service, reply["job_id"])["state"] == "done"
 
 
-def test_the_idempotency_digest_is_taken_over_the_normalised_body(ops_env):
+def _all_persisted_text(ops_env):
+    """監査表と冪等表に残る全 column の文字列表現。"""
+    out = []
+    for table in ("ops_requests", "ops_idempotency"):
+        for row in ops_env.conn.execute(f"SELECT * FROM {table}"):
+            out.extend(str(v) for v in tuple(row))
+    return out
+
+
+def _digest(body):
+    return hashlib.sha256(json.dumps(body, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def test_the_comment_and_its_digest_are_not_persisted_only_its_presence_is(ops_env):
+    service = _service(ops_env, FakeSupervisor())
+    reply = service.improve(OPERATOR, "k1", max_runs=2, comment=CANARY)
+    wait_job(service, reply["job_id"])
+    persisted = _all_persisted_text(ops_env)
+    assert not any(CANARY in text for text in persisted)
+    for candidate in ({"max_runs": 2, "comment": CANARY},
+                      {"comment": CANARY}, {"comment": CANARY, "max_runs": 2}):
+        assert _digest(candidate) not in persisted
+    assert _digest({"max_runs": 2, "has_comment": True}) in persisted
+    assert hashlib.sha256(CANARY.encode()).hexdigest() not in persisted
+
+
+def test_a_resend_with_the_same_key_returns_the_same_job_whatever_the_comment(ops_env):
     service = _service(ops_env, FakeSupervisor())
     first = service.improve(OPERATOR, "same", comment=" a   b ")
     wait_job(service, first["job_id"])
-    replay = service.improve(OPERATOR, "same", comment="a b")
-    assert replay["job_id"] == first["job_id"]
+    assert service.improve(OPERATOR, "same", comment="a b")["job_id"] == first["job_id"]
+    # 本文に残さないので、comment だけが違う再送は見分けない (同じ job を返す)。
+    assert service.improve(OPERATOR, "same", comment="a c")["job_id"] == first["job_id"]
+    assert len({r["body_sha256"] for r in ops_env.ops_rows() if r["body_sha256"]}) == 1
+
+
+def test_a_resend_that_differs_in_the_rest_of_the_body_is_still_a_mismatch(ops_env):
+    service = _service(ops_env, FakeSupervisor())
+    first = service.improve(OPERATOR, "same", max_runs=2, comment="a")
+    wait_job(service, first["job_id"])
     with pytest.raises(OpsError) as raised:
-        service.improve(OPERATOR, "same", comment="a c")
+        service.improve(OPERATOR, "same", max_runs=3, comment="a")
     assert raised.value.code is ErrorCode.IDEMPOTENCY_MISMATCH
-    rows = ops_env.ops_rows()
-    assert len({r["body_sha256"] for r in rows}) == 2
+    with pytest.raises(OpsError) as no_comment:
+        service.improve(OPERATOR, "same", max_runs=2)
+    assert no_comment.value.code is ErrorCode.IDEMPOTENCY_MISMATCH
 
 
 def test_a_body_without_comment_keeps_only_the_keys_that_were_given(ops_env):
@@ -190,6 +226,83 @@ def test_the_deadline_is_fixed_at_acceptance_not_in_the_job_thread(ops_env):
     assert seen["deadline_at"].startswith("2026-10-05T00:10:00")
 
 
+def test_a_delay_after_acceptance_does_not_move_the_deadline(ops_env):
+    class SlowStore(_Store):
+        def load(self, **kw):
+            ops_env.mono.advance(1000)
+            ops_env.wall.advance(seconds=1000)
+            return self._real.load(**kw)
+
+    seen = {}
+
+    def repeat(**kw):
+        seen.update(kw)
+        return RepeatResult("deadline", 1, 5)
+
+    service = _service(ops_env, FakeSupervisor(repeat), state_store=SlowStore(ops_env.state, []))
+    mono_at_acceptance = ops_env.mono()
+    reply = service.improve(OPERATOR, "k1", duration_sec=600)
+    wait_job(service, reply["job_id"])
+    assert seen["deadline_mono"] == pytest.approx(mono_at_acceptance + 600, abs=2.0)
+    assert seen["deadline_at"].startswith("2026-10-05T00:10:00")
+    initial = service.get_job(OPERATOR, reply["job_id"])["result"]
+    assert initial["deadline_at"].startswith("2026-10-05T00:10:00")
+
+
+def test_the_duration_floor_is_the_one_the_client_grammar_uses(ops_env, monkeypatch):
+    from agentic_fx.core import improve_repeat as ir
+    monkeypatch.setattr(ir, "MIN_DURATION_SEC", 120)
+    service = _service(ops_env, FakeSupervisor())
+    with pytest.raises(OpsError) as raised:
+        service.improve(OPERATOR, "k1", duration_sec=119)
+    assert raised.value.code is ErrorCode.INVALID_ARGUMENT
+    with pytest.raises(ValueError):
+        ir.parse_duration("1m")
+    assert wait_job(service, service.improve(OPERATOR, "k2", duration_sec=120)["job_id"]
+                    )["state"] == "done"
+
+
+@pytest.mark.parametrize("kind", ["repeat", "one-shot"])
+def test_a_thread_that_cannot_start_fails_the_job_and_frees_the_slot(ops_env, kind):
+    service = _service(ops_env, FakeSupervisor())
+
+    def broken(job):
+        raise RuntimeError("can't start new thread")
+
+    service._start_thread = broken
+    kwargs = {"max_runs": 2} if kind == "repeat" else {}
+    with pytest.raises(RuntimeError):
+        service.improve(OPERATOR, "k1", comment=CANARY, **kwargs)
+    (job,) = service.jobs._jobs.values()
+    assert job.state is JobState.FAILED and job.error_code == "internal"
+    assert job.done is None or job.done.is_set()
+    view = service.get_job(OPERATOR, job.id)
+    assert (view["state"], view["result_code"]) == ("failed", "internal")
+    holder = _holder(service, job.id)
+    assert holder is not None and holder.get() is None
+    assert ops_env.ops_rows()[-1]["phase"] == "failed"
+    # 同種の improve は拒否されない。
+    service._start_thread = lambda job: None
+    assert service.improve(OPERATOR, "k2", max_runs=2)["state"] == "running"
+
+
+def test_a_real_thread_start_failure_leaves_no_registered_thread(ops_env, monkeypatch):
+    service = _service(ops_env, FakeSupervisor())
+    real_start = threading.Thread.start
+
+    def start(self):
+        if self.name == "afx-ops-improve":
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    with pytest.raises(RuntimeError):
+        service.improve(OPERATOR, "k1", max_runs=2, comment=CANARY)
+    assert service._operation_threads == set()
+    (job,) = service.jobs._jobs.values()
+    assert job.state is JobState.FAILED
+
+
 def test_progress_is_visible_through_get_job_and_the_final_progress_stays(ops_env):
     gate = threading.Event()
 
@@ -215,6 +328,18 @@ def test_progress_is_visible_through_get_job_and_the_final_progress_stays(ops_en
     assert final["state"] == "done"
     assert final["result"]["stop_reason"] == "deadline"
     assert final["result"]["phase"] == "finished"
+    assert final["result"]["max_runs"] == 3 and "deadline_at" in final["result"]
+
+
+def test_the_final_result_follows_the_return_value_when_no_progress_arrived(ops_env):
+    sup = FakeSupervisor(lambda **kw: RepeatResult("max_runs", 3, 9))
+    service = _service(ops_env, sup)
+    reply = service.improve(OPERATOR, "k1", max_runs=3)
+    final = wait_job(service, reply["job_id"])
+    assert final["state"] == "done"
+    assert (final["result"]["stop_reason"], final["result"]["runs"],
+            final["result"]["mission_id"], final["result"]["phase"]) == (
+        "max_runs", 3, 9, "finished")
     assert final["result"]["max_runs"] == 3 and "deadline_at" in final["result"]
 
 
@@ -282,7 +407,7 @@ class _Store:
 
 
 def test_the_recheck_uses_a_fresh_deadline_each_time_not_the_job_deadline(ops_env):
-    store = _Store(ops_env.state, [False, False, False])
+    store = _Store(ops_env.state, [False, False])
     checks = []
 
     def repeat(*, autopilot_check, **kw):
@@ -295,13 +420,13 @@ def test_the_recheck_uses_a_fresh_deadline_each_time_not_the_job_deadline(ops_en
     reply = service.improve(OPERATOR, "k1", max_runs=3)
     assert wait_job(service, reply["job_id"])["state"] == "done"
     assert checks == [False, False]
-    assert len(store.calls) == 3  # 受理直後の確認 + 再確認 2 回
-    for deadline, now in store.calls[1:]:
+    assert len(store.calls) == 2  # controller の再確認 2 回だけ (service は事前に読まない)
+    for deadline, now in store.calls:
         assert 3.0 < deadline - now < 6.0
 
 
 def test_an_autopilot_true_in_the_recheck_is_the_controllers_decision(ops_env):
-    store = _Store(ops_env.state, [False, True])
+    store = _Store(ops_env.state, [True])
 
     def repeat(*, autopilot_check, **kw):
         assert autopilot_check() is True
@@ -311,16 +436,6 @@ def test_an_autopilot_true_in_the_recheck_is_the_controllers_decision(ops_env):
     reply = service.improve(OPERATOR, "k1", max_runs=3)
     job = wait_job(service, reply["job_id"])
     assert (job["state"], job["result"]["stop_reason"]) == ("done", "autopilot")
-
-
-def test_autopilot_true_right_after_acceptance_fails_before_the_controller(ops_env):
-    store = _Store(ops_env.state, [True])
-    sup = FakeSupervisor()
-    service = _service(ops_env, sup, state_store=store)
-    reply = service.improve(OPERATOR, "k1", max_runs=3)
-    job = wait_job(service, reply["job_id"])
-    assert (job["state"], job["result_code"]) == ("failed", "autopilot_restricted")
-    assert sup.repeat_calls == []
 
 
 def test_the_shell_caller_is_never_restricted_by_the_recheck(ops_env):
@@ -339,7 +454,7 @@ def test_the_shell_caller_is_never_restricted_by_the_recheck(ops_env):
 
 
 def test_a_failing_recheck_fails_the_job_closed(ops_env):
-    store = _Store(ops_env.state, [False, RuntimeError("flock unreadable")])
+    store = _Store(ops_env.state, [RuntimeError("flock unreadable")])
     started = []
 
     def repeat(*, autopilot_check, **kw):
