@@ -325,6 +325,18 @@ def _approval_of(notice, row) -> dict | None:
             "kind": display_text(kind) if isinstance(kind, str) and kind.strip() else None}
 
 
+def _approval_plugin_kind(conn: sqlite3.Connection, approval_id: int) -> str | None:
+    """承認 payload の表示可能な plugin 種別だけを event へ写す。"""
+    row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
+                       (approval_id,)).fetchone()
+    try:
+        payload = json.loads(row["payload_json"]) if row is not None else None
+    except (TypeError, ValueError, RecursionError):
+        payload = None
+    kind = payload.get("kind") if isinstance(payload, dict) else None
+    return kind if kind in {"strategy", "indicator"} else None
+
+
 def _authorize(caller: Caller, endpoint_code: str) -> None:
     """endpoint の認可は表の scope だけを参照する (§3.1)。"""
     assert_authorized(caller, ENDPOINTS[endpoint_code].scope)
@@ -635,6 +647,9 @@ class OpsService:
         deploy_ops = self._deploy_ops_status(deadline)
         if deploy_ops is not None:
             data["plugin_deploy_ops"] = deploy_ops
+        repeat = self.jobs.active_repeat()
+        if repeat is not None:
+            data["improve_repeat"] = self._job_view(repeat)
         return data
 
     def _deploy_ops_status(self, deadline: float) -> dict | None:
@@ -959,11 +974,12 @@ class OpsService:
         self.jobs.check_owner(job_id, principal, actor)
         return self._job_view(self.jobs.get(job_id, principal, actor))
 
-    @staticmethod
-    def _job_view(job: Job) -> dict:
-        result = job.result
+    def _job_view(self, job: Job) -> dict:
+        result = dict(job.result) if job.result is not None else None
+        if job.repeat and result is not None:
+            result["elapsed_sec"] = max(0, int(self._monotonic() - job.created_mono))
         return {"id": job.id, "kind": job.kind, "state": job.state.value,
-                "result": dict(result) if result is not None else None,
+                "result": result,
                 "result_code": job.error_code}
 
     # ------------------------------------------------------- sync mutations
@@ -1416,6 +1432,7 @@ class OpsService:
         deadline_at = (wall + timedelta(seconds=span)).astimezone(timezone.utc).isoformat()
         initial = {"mission_id": None, "runs": 0,
                    "max_runs": ir.MAX_RUNS if max_runs is None else max_runs,
+                   "duration_sec": span,
                    "deadline_at": deadline_at, "phase": "waiting_slot",
                    "stop_requested": False}
         return self.jobs.enqueue_single(
@@ -1703,7 +1720,8 @@ class OpsService:
                 raise _DecisionOutcome(ErrorCode.INVALID_STATE, result, outcome)
             self._decide_events.emit_best_effort(
                 "approval_state_changed", f"approval:{approval_id}",
-                {"state": result["status"], "decision_code": kind, "decided_by": decided_by})
+                {"state": result["status"], "decision_code": kind, "decided_by": decided_by,
+                 "plugin_kind": _approval_plugin_kind(self._decide_conn, approval_id)})
             return result
         return run
 

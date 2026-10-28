@@ -81,6 +81,19 @@ def _snapshot(value: object) -> dict | None | bool:
     return {key: value[key] for key in keys}
 
 
+def _repeat(value: object) -> dict | None | bool:
+    if value is None:
+        return None
+    if type(value) is not dict or set(value) != {"run", "max_runs", "elapsed_sec", "duration_sec"}:
+        return False
+    run, maximum = value["run"], value["max_runs"]
+    elapsed, duration = value["elapsed_sec"], value["duration_sec"]
+    if (not _int(run, low=1) or not _int(maximum, low=1) or run > maximum
+            or not _int(elapsed) or not _int(duration, low=60)):
+        return False
+    return value
+
+
 def _approval(value: object) -> dict | None | bool:
     if value is None:
         return None
@@ -152,15 +165,16 @@ def validate_improve_run(data: object, mission_id: int) -> dict | None:
             or not (data.get("elapsed_sec") is None or _int(data["elapsed_sec"]))
             or data.get("report_state") not in REPORT_STATES):
         return None
-    snapshot, approval, floor = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
-                                 _floor(data.get("floor")))
-    if snapshot is False or approval is False or floor is False:
+    snapshot, approval, floor, repeat = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
+                                         _floor(data.get("floor")), _repeat(data.get("repeat")))
+    if snapshot is False or approval is False or floor is False or repeat is False:
         return None
     if floor is _DROP_FLOOR or not _floor_allowed(snapshot, data["report_state"]):
         floor = None
     return {"id": data["id"], "backend": data["backend"], "model": data["model"],
             "elapsed_sec": data["elapsed_sec"], "snapshot": snapshot,
-            "report_state": data["report_state"], "approval": approval, "floor": floor}
+            "report_state": data["report_state"], "approval": approval, "floor": floor,
+            "repeat": repeat}
 
 
 # ------------------------------------------------------------ 文面
@@ -194,6 +208,27 @@ def _last_line(elapsed: int | None, tool_calls: int | None) -> str:
     if elapsed is None:
         return "所要 -" if tool_calls is None else tool
     return f"所要 {format_elapsed(elapsed)} / {tool}"
+
+
+def _repeat_line(repeat: object) -> str | None:
+    if type(repeat) is not dict:
+        return None
+    run, maximum = repeat.get("run"), repeat.get("max_runs")
+    elapsed, duration = repeat.get("elapsed_sec"), repeat.get("duration_sec")
+    if (type(run) is not int or type(maximum) is not int or type(elapsed) is not int
+            or type(duration) is not int or run < 1 or run > maximum or elapsed < 0
+            or duration < 60):
+        return None
+    return f"繰り返し {run}/{maximum} 回 · {elapsed // 60}m/{duration // 60}m"
+
+
+def _event_repeat(payload: Mapping[str, object]) -> dict | None:
+    values = (payload.get("repeat_run"), payload.get("repeat_max_runs"),
+              payload.get("repeat_elapsed_sec"), payload.get("repeat_duration_sec"))
+    if any(type(value) is not int for value in values):
+        return None
+    return {"run": values[0], "max_runs": values[1], "elapsed_sec": values[2],
+            "duration_sec": values[3]}
 
 
 def _pf(value: float | None) -> str:
@@ -263,7 +298,11 @@ def render_improve_start(payload: Mapping[str, object], detail: dict | None) -> 
         return head
     backend = cut_escaped(detail["backend"], FIELD_CHARS)
     model = cut_escaped(detail["model"], FIELD_CHARS)
-    return _fit([head, f"backend {backend} / {model}"])
+    lines = [head, f"backend {backend} / {model}"]
+    repeat = _repeat_line(detail.get("repeat")) or _repeat_line(_event_repeat(payload))
+    if repeat is not None:
+        lines.append(repeat)
+    return _fit(lines)
 
 
 def render_improve_finish(payload: Mapping[str, object], detail: dict | None) -> str:
@@ -279,5 +318,8 @@ def render_improve_finish(payload: Mapping[str, object], detail: dict | None) ->
     lines = [_heading(mission_id, snapshot["result_code"], snapshot["reason_code"],
                       detail["report_state"])]
     lines.extend(_body_lines(snapshot, detail))
+    repeat = _repeat_line(detail.get("repeat")) or _repeat_line(_event_repeat(payload))
+    if repeat is not None:
+        lines.append(repeat)
     lines.append(_last_line(detail["elapsed_sec"], snapshot["tool_calls"]))
     return _fit(lines)

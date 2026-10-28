@@ -395,15 +395,15 @@ def test_cancel_of_a_queued_job_keeps_the_old_line(tmp_path):
     assert out.getvalue().strip() == f"job {JOB}: cancelled"
 
 
-def test_jobs_get_shows_progress_without_a_comment(tmp_path):
-    api = _StubApi(tmp_path, [_progress(2, 41, stop_requested=True)])
+def test_jobs_get_shows_repeat_progress_without_a_comment(tmp_path):
+    api = _StubApi(tmp_path, [_progress(2, 41, stop_requested=True,
+                                        elapsed_sec=305, duration_sec=1800)])
     out = io.StringIO()
     runner = client.Runner(api, stdin=io.StringIO(""), stdout=out)
     runner.run(client.parse(["jobs", "get", JOB]))
-    line = out.getvalue()
-    for cell in ("runs=2", "max_runs=3", "mission_id=41", "phase=running",
-                 "stop_requested=True", f"deadline_at={DEADLINE}"):
-        assert cell in line
+    assert out.getvalue().strip() == (
+        f"job {JOB}: improve の繰り返し: 実行中、実施 2 回 / 最大 3 回、"
+        "経過 5m / 30m、残り 25m、実行中 mission #41、停止要求あり")
 
 
 # ---- 対話シェル ----

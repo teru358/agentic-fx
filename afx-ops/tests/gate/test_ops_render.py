@@ -17,16 +17,19 @@ def _event(code: str, fields: dict, *, ref: str = "instance") -> dict:
     return {"id": 1, "ts": TS, "code": code, "ref": refs.get(code, ref), "fields": fields}
 
 
-@pytest.mark.parametrize(("state", "name", "expected"), [
-    ("approved", "sma_cross", r"承認 #25 (戦略 sma\_cross) が承認・配備されました。"),
-    ("approved", None, "承認 #25 が承認・配備されました。"),
-    ("rejected", "sma_cross", r"承認 #25 (戦略 sma\_cross) が却下されました。"),
-    ("expired", "sma_cross", r"承認 #25 (戦略 sma\_cross) は期限切れになりました。"),
-    ("expired", None, "承認 #25 は期限切れになりました。"),
+@pytest.mark.parametrize(("state", "name", "plugin_kind", "expected"), [
+    ("approved", "sma_cross", "strategy", r"承認 #25 (戦略 sma\_cross) が承認・配備されました。"),
+    ("approved", "rsi", "indicator", "承認 #25 (指標 rsi) が承認・配備されました。"),
+    ("approved", "unknown", "signal", "承認 #25 (plugin unknown) が承認・配備されました。"),
+    ("approved", None, None, "承認 #25 が承認・配備されました。"),
+    ("rejected", "sma_cross", "strategy", r"承認 #25 (戦略 sma\_cross) が却下されました。"),
+    ("expired", "sma_cross", "strategy", r"承認 #25 (戦略 sma\_cross) は期限切れになりました。"),
+    ("expired", None, None, "承認 #25 は期限切れになりました。"),
 ])
-def test_ac17_approval_event_has_a_fixed_human_sentence(state, name, expected):
+def test_ac17_approval_event_has_a_fixed_human_sentence(state, name, plugin_kind, expected):
     rendered = render_event(_event("approval_state_changed", {
-        "state": state, "decision_code": "approve", "decided_by": "api:ops-bot"}),
+        "state": state, "decision_code": "approve", "decided_by": "api:ops-bot",
+        "plugin_kind": plugin_kind}),
                             plugin_name=name)
     assert rendered.content == expected
     assert "=" not in rendered.content

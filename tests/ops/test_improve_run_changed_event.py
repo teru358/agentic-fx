@@ -23,7 +23,8 @@ def _finished(result="gate_failed", reason="unprofitable", trigger="scheduled",
 
 def test_field_set_is_fixed():
     assert FIELDS[CODE] == frozenset(
-        {"state", "trigger", "result_code", "reason_code", "tool_calls"})
+        {"state", "trigger", "result_code", "reason_code", "tool_calls",
+         "repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec"})
 
 
 @pytest.mark.parametrize("trigger", codes.TRIGGERS)

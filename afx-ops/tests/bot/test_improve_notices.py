@@ -230,6 +230,21 @@ def test_start_notices_show_the_trigger_and_the_backend_line(make_bot):
                          "[改善] 開始 #2044 (週次)\nbackend local / qwen3.6-35b"]
 
 
+def test_repeat_notices_add_the_fixed_progress_line(make_bot):
+    event = _started(1, 2043)
+    event["fields"].update({"repeat_run": 2, "repeat_max_runs": 10,
+                            "repeat_elapsed_sec": 305, "repeat_duration_sec": 1800})
+    detail = _dto(2043, terminal=False)
+    detail["repeat"] = {"run": 2, "max_runs": 10, "elapsed_sec": 305,
+                        "duration_sec": 1800}
+    bot = make_bot(_page([event]), runs={2043: _ok(detail)})
+
+    bot.poll()
+
+    assert bot.texts == ["[改善] 開始 #2043 (手動)\nbackend codex / gpt-5.6-luna\n"
+                         "繰り返し 2/10 回 · 5m/30m"]
+
+
 def test_a_start_notice_for_a_mission_that_already_finished_still_shows_the_backend(make_bot):
     bot = make_bot(_page([_started(1, 2043)]),
                    runs={2043: _ok(_dto(2043, result="observation", tool=3, elapsed=10))})

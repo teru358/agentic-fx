@@ -187,6 +187,7 @@ def test_the_initial_result_is_complete_before_the_job_thread_starts(ops_env):
     assert job["state"] == "running"
     assert job["result"] == {
         "mission_id": None, "runs": 0, "max_runs": 3, "deadline_at": expected_deadline,
+        "duration_sec": 5400, "elapsed_sec": 0,
         "phase": "waiting_slot", "stop_requested": False}
     assert job["result"]["deadline_at"].endswith("+00:00")
 

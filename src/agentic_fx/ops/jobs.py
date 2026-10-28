@@ -141,6 +141,11 @@ class JobRegistry:
         with self._lock:
             return self._active(lambda j: j.kind == kind)
 
+    def active_repeat(self) -> Job | None:
+        with self._lock:
+            return next((job for job in self._jobs.values()
+                         if job.repeat and job.state not in TERMINAL_STATES), None)
+
     def take_next_decision(self) -> Job | None:
         with self._lock:
             while self._decisions:

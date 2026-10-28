@@ -21,7 +21,8 @@ def _event(ref: str = "improve:2043", **fields) -> dict:
 
 def test_the_allowlist_has_the_improve_code_with_its_exact_field_set():
     assert ALLOWED_FIELDS["improve_run_changed"] == frozenset(
-        {"state", "trigger", "result_code", "reason_code", "tool_calls"})
+        {"state", "trigger", "result_code", "reason_code", "tool_calls",
+         "repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec"})
 
 
 def test_a_finished_event_is_encoded_flat_with_the_fixed_fields():
