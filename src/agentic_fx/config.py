@@ -195,6 +195,14 @@ class DatafeedSettings(_Strict):
                                          min_length=1)
     # 取引不可・分析専用。pair enum には入らない (§6)
     watch_symbols: list[str] = Field(default_factory=list)
+
+    @field_validator("watch_symbols")
+    @classmethod
+    def _watch_symbols_are_bounded_raw_names(cls, values: list[str]) -> list[str]:
+        for symbol in values:
+            if len(symbol.encode("utf-8")) > 32:
+                raise ValueError("watch_symbol_too_long")
+        return values
     # プラン 9 Task 16: ohlcv_cache の保持期間 (日)。起動時検証
     # (service.py:_validate_cache_retention — _validate_startup から呼ばれる)
     # が、構成済み intervals × **既知チェーン source 全部** の要求日数
@@ -732,7 +740,14 @@ class Settings(_Strict):
 
     @model_validator(mode="after")
     def _watch_symbols_capped(self) -> "Settings":
-        if len(self.datafeed.watch_symbols) > self.analysis.max_watch_symbols:
+        watch = self.datafeed.watch_symbols
+        if len(set(watch)) != len(watch):
+            raise ValueError("watch_symbols_duplicate")
+        if set(watch) & set(self.pairs):
+            raise ValueError("watch_symbols_overlap")
+        if watch and self.datafeed.primary != "mt5":
+            raise ValueError("watch_symbols_require_mt5_primary")
+        if len(watch) > self.analysis.max_watch_symbols:
             raise ValueError(
                 f"datafeed.watch_symbols ({len(self.datafeed.watch_symbols)}) "
                 f"exceeds analysis.max_watch_symbols ({self.analysis.max_watch_symbols})")

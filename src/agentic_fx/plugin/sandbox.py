@@ -670,6 +670,7 @@ _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "signal": ("df", "params"),
     "strategy": ("df", "params"),
 }
+MAX_CALL_INPUT_BYTES = 3_145_728
 
 # セッション起動 (handshake → ready 応答) を待つ固定タイムアウト。
 # `sandbox_timeout_sec` (既定 10s、call() 用) とは別枠 — pandas の初回
@@ -1263,9 +1264,23 @@ class PluginSession:
         request: dict[str, Any] = {}
         for key in required:
             request[key] = _df_to_wire(payload[key]) if key == "df" else payload[key]
+        if "frames" in payload:
+            if kind != "strategy" or not isinstance(payload["frames"], dict):
+                raise SandboxError("frames are only valid for strategy calls")
+            request["frames"] = {
+                frame_id: _df_to_wire(frame)
+                for frame_id, frame in payload["frames"].items()
+            }
         request_id = secrets.token_hex(8)
         request["id"] = request_id
         self._check_no_stray_output()
+
+        try:
+            call_input = json.dumps(request).encode("utf-8") + b"\n"
+        except (TypeError, ValueError) as exc:
+            raise SandboxError(f"failed to serialize request: {exc}") from exc
+        if len(call_input) > MAX_CALL_INPUT_BYTES:
+            raise SandboxError("call input exceeds maximum size", code="call_input_too_large")
 
         # 1 回の call は 1 つの deadline を書き込みと読み取りで共有する
         # (`sandbox_timeout_sec` が call 全体の上限)

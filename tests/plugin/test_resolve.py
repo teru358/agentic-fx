@@ -86,11 +86,47 @@ def test_pin_object_is_alias_sorted_plain_json(tmp_path):
     obj = resolved.pin_object()
     assert list(obj) == ["alpha", "zeta"]
     assert obj["zeta"] == {"plugin": "rsi", "content_hash": rsi.content_hash,
-                           "params": {"period": 21}}
+                           "params": {"period": 21}, "symbol_mode": "self",
+                           "symbol": None, "timeframe": "1h", "max_age_seconds": 10_800}
     assert obj["alpha"] == {"plugin": "adx", "content_hash": adx.content_hash,
-                            "params": {"period": 14}}
+                            "params": {"period": 14}, "symbol_mode": "self",
+                            "symbol": None, "timeframe": "1h", "max_age_seconds": 10_800}
     import json
     json.dumps(obj)  # plain JSON であること
+
+
+def test_resolver_canonicalizes_literal_reference_coordinates_and_default_age(tmp_path):
+    root = tmp_path / "plugins"
+    ema = _indicator(root, "ema", max_bars="max_bars: 500\n")
+    strategy = _strategy(tmp_path / "candidate", "s", "indicators:\n"
+                         "  jp: {plugin: ema, symbol: JP225, timeframe: 1h}\n")
+    settings = SETTINGS.model_copy(update={
+        "datafeed": SETTINGS.datafeed.model_copy(update={"watch_symbols": ["JP225"]})})
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, ema), settings=settings,
+                                      pin_mode="ignore")
+
+    item = resolved.items[0]
+    assert (item.symbol_mode, item.literal_symbol, item.timeframe,
+            item.max_age_seconds, item.frame_id) == ("literal", "JP225", "1h", 10_800,
+                                                     "JP225@1h")
+
+
+def test_resolver_rejects_reference_window_that_exceeds_indicator_max_bars(tmp_path):
+    root = tmp_path / "plugins"
+    ema = _indicator(root, "ema", max_bars="max_bars: 1000\n")
+    strategy = _plugin(tmp_path / "candidate", "s",
+                       "kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\n"
+                       "exit_mode: levels\nmax_bars: 1000\n"
+                       "indicators:\n  jp: {plugin: ema, symbol: JP225, timeframe: 1h}\n",
+                       _STRATEGY_PY)
+    settings = SETTINGS.model_copy(update={
+        "datafeed": SETTINGS.datafeed.model_copy(update={"watch_symbols": ["JP225"]})})
+
+    with pytest.raises(IndicatorResolutionError) as error:
+        resolve_indicator_deps(strategy, _inv(root, ema), settings=settings, pin_mode="ignore")
+
+    assert error.value.reason == "reference_window_exceeds_max_bars"
 
 
 def test_indicator_resolution_error_str_is_fixed_text():

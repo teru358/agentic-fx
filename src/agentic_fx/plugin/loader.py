@@ -112,7 +112,7 @@ MAX_PARAMS_BYTES = 8192
 _ALIAS_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _OUTPUT_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _PIN_RE = re.compile(r"^[0-9a-f]{64}$")
-_INDICATOR_REF_KEYS = frozenset({"plugin", "params", "pin"})
+_INDICATOR_REF_KEYS = frozenset({"plugin", "params", "pin", "symbol", "timeframe", "max_age"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +121,9 @@ class IndicatorRef:
     plugin: str
     params: dict
     pin: str | None
+    symbol: str = "self"
+    timeframe: str | None = None
+    max_age: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,8 +347,25 @@ def _validate_config(raw: dict, name: str) -> dict | None:
                                     or not _PIN_RE.fullmatch(pin)):
                 _reject(name, "indicator_ref_bad_pin")
                 return None
+            symbol = ref.get("symbol", "self")
+            if not isinstance(symbol, str) or not symbol:
+                _reject(name, "indicator_ref_bad_symbol")
+                return None
+            ref_timeframe = ref.get("timeframe")
+            if ref_timeframe is not None and ref_timeframe not in PLUGIN_TIMEFRAMES:
+                _reject(name, "indicator_ref_bad_timeframe")
+                return None
+            max_age = ref.get("max_age")
+            if max_age is not None:
+                from agentic_fx.plugin.reference import canonical_duration_seconds
+                try:
+                    canonical_duration_seconds(max_age)
+                except ValueError:
+                    _reject(name, "indicator_ref_bad_max_age")
+                    return None
             built.append(IndicatorRef(alias=alias, plugin=plugin_name,
-                                      params=ref_params, pin=pin))
+                                      params=ref_params, pin=pin, symbol=symbol,
+                                      timeframe=ref_timeframe, max_age=max_age))
         indicators = tuple(built)
 
     outputs: tuple[str, ...] | None = None

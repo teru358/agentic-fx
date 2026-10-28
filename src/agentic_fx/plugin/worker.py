@@ -183,7 +183,7 @@ def _load_plugins(isolated: "worker_isolation.IsolatedWorker",
         deps.append({
             "alias": record.alias, "compute": getattr(dep_module, "compute"),
             "params": spec["params"], "max_bars": int(spec["max_bars"]),
-            "outputs": tuple(spec["outputs"])})
+            "outputs": tuple(spec["outputs"]), "frame_id": spec.get("frame_id")})
     return fn, deps
 
 
@@ -252,9 +252,12 @@ def main() -> None:
             df = _wire_to_df(request["df"])
             params = _deep_copy_json(request["params"])
             if kind == "strategy":
+                frames = {name: _wire_to_df(wire)
+                          for name, wire in (request.get("frames") or {}).items()}
                 indicators = {}
                 for dep in deps:
-                    sub_df = df.tail(dep["max_bars"]).copy(deep=True)
+                    source = df if dep.get("frame_id") is None else frames[dep["frame_id"]]
+                    sub_df = source.tail(dep["max_bars"]).copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
                     validated = validate_indicator_result(
                         raw, df_index=sub_df.index, outputs=dep["outputs"])
