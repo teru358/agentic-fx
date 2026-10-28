@@ -2,7 +2,7 @@
 id: improve-gpt6-models-fail-isolated-selftest
 title: gpt-6 系モデルで improve 隔離の自己試験が通らない
 status: 設計待ち
-priority: 中
+priority: 低
 kind: 不具合
 opened: 2026-10-27
 closed: null
@@ -10,7 +10,7 @@ related: [selftest-failure-detail-not-logged]
 ---
 # [improve-gpt6-models-fail-isolated-selftest] gpt-6 系モデルで improve 隔離の自己試験が通らない
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [selftest-failure-detail-not-logged]
 ## 経緯
 
 - 2026-10-27: 起票。
+- 2026-10-28: 優先: 低 — 2026-10-28: 隔離の fingerprint は model を含まない。codex 0.164.0 の値 96cdd7f2… を登録した後、gpt-6-luna に切り替えると自己試験なしで admitted=yes になり、本番の改善 mission は隔離下で完走し指標を提出した (ユーザー確認)。不合格は自己試験 (verify_backend の 1 ターン probe) に限られる。原因は次に自己試験が走ったとき (fingerprint が集合外のとき) の `improve isolation: selftest detail:` 行で読む。別の論点: model を変えても自己試験が走らないので「その model で動く」ことは admission で保証されない (model を fingerprint に含めるか、model ごとの自己試験 cache にするかを決める)。優先度を低に。

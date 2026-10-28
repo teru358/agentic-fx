@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 148 件。完了分は closed/。
+未完了: 147 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -62,9 +62,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (130)
+## 設計待ち (129)
 
-### 不具合 (74)
+### 不具合 (73)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -96,8 +96,6 @@
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 中 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 中 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
-| [selftest-failure-detail-not-logged](open/selftest-failure-detail-not-logged.md) | 中 | 2026-10-27 | improve 隔離の自己試験が落ちた理由がどこにも残らない |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -130,6 +128,7 @@
 | [ops-web-head-request-loop-error](open/ops-web-head-request-loop-error.md) | 低 | 2026-10-24 | 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す |
 | [test-init-guard-order-dependent-on-fetchers](open/test-init-guard-order-dependent-on-fetchers.md) | 低 | 2026-10-25 | offline init test が test_fetchers の後では赤になる (順序依存) |
 | [test-service-app-leaks-fds](open/test-service-app-leaks-fds.md) | 低 | 2026-10-26 | tests/test_service_app.py が fd を 1100 超残し後続 test に波及する |
+| [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
