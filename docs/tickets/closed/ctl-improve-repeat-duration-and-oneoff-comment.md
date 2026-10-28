@@ -1,16 +1,16 @@
 ---
 id: ctl-improve-repeat-duration-and-oneoff-comment
 title: afx ctl improve に繰り返し実施期間 (-t) と一時的な指示 (-c) を足す
-status: 実装中
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-10-25
-closed: null
+closed: 2026-10-28
 related: [improve-feedback-structure, improve-run-summary-for-humans, improve-start-and-result-to-discord]
 ---
 # [ctl-improve-repeat-duration-and-oneoff-comment] afx ctl improve に繰り返し実施期間 (-t) と一時的な指示 (-c) を足す
 
-**状態**: 実装中 / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -31,8 +31,11 @@ related: [improve-feedback-structure, improve-run-summary-for-humans, improve-st
 
 ## 修正内容
 
+- 2026-10-28: afx ctl improve に -t / -n / -c を実装 (設計 v0.5.3、T1 controller + T2 面、main 73428607、配備 2026-10-28 19:08)。本機で -t 30m -c を実行: 受理 rc=0、5 回実施、期限で stop_reason=deadline、期限直前に始めた mission は打ち切らず完走、一時指示の本文は activity / 技術ログ / DB に残らないことを grep で確認。
+
 ## 経緯
 
 - 2026-10-25: 起票。
 - 2026-10-25: 時間単位 (h/m)、最長期間 24h、オプション案 (-t / -c / -n) を追記。
 - 2026-10-26: 状態: 実装中 — 2026-10-26 設計 C0 v0.4 閉鎖 (sol r1 17 → v0.2 → sol r2 12 → v0.3 → sol r3 差分 3 → v0.4、指揮者の差分検収で閉鎖)。§8 の 6 件はユーザー裁定済。実装 T1 着手
+- 2026-10-28: 是正内容 — afx ctl improve に -t / -n / -c を実装 (設計 v0.5.3、T1 controller + T2 面、main 73428607、配備 2026-10-28 19:08)。本機で -t 30m -c を実行: 受理 rc=0、5 回実施、期限で stop_reason=deadline、期限直前に始めた mission は打ち切らず完走、一時指示の本文は activity / 技術ログ / DB に残らないことを grep で確認。

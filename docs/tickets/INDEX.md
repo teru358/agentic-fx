@@ -1,15 +1,14 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 149 件。完了分は closed/。
+未完了: 148 件。完了分は closed/。
 
-## 実装中 (2)
+## 実装中 (1)
 
-### 機能 (2)
+### 機能 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [ctl-improve-repeat-duration-and-oneoff-comment](open/ctl-improve-repeat-duration-and-oneoff-comment.md) | 中 | 2026-10-25 | afx ctl improve に繰り返し実施期間 (-t) と一時的な指示 (-c) を足す |
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
 
 ## 実装待ち (11)
