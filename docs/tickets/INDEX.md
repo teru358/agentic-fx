@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 147 件。完了分は closed/。
+未完了: 148 件。完了分は closed/。
 
 ## 実装中 (1)
 
@@ -62,7 +62,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (129)
+## 設計待ち (130)
 
 ### 不具合 (73)
 
@@ -142,7 +142,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (36)
+### 機能 (37)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -179,6 +179,7 @@
 | [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 低 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-auto-approve-paper-only](open/plugin-auto-approve-paper-only.md) | 低 | 2026-10-27 | plugin 自動承認モード (ペーパー限定の検討メモ) |
 | [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 低 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
+| [reference-series-additional-sources](open/reference-series-additional-sources.md) | 低 | 2026-10-28 | 参照系列の取得先を MT5 以外に広げる (金利など) |
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
