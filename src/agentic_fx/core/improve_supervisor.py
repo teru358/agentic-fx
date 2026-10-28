@@ -426,7 +426,7 @@ class ImproveSupervisor:
             prepared = self._improve_loop.prepare(**kwargs)
         except ImprovePrepareFailed as exc:
             # 補償済みの mission は終端している。開始は出さず、終了だけ出す。
-            self._notices.finished(exc.mission_id, exc)
+            self._notices.finished(exc.mission_id, exc, repeat=repeat)
             if keep_failed:
                 raise
             if exc.__cause__ is not None:

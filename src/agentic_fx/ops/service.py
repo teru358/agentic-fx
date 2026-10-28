@@ -977,7 +977,8 @@ class OpsService:
     def _job_view(self, job: Job) -> dict:
         result = dict(job.result) if job.result is not None else None
         if job.repeat and result is not None:
-            result["elapsed_sec"] = max(0, int(self._monotonic() - job.created_mono))
+            started_mono = job.started_mono if job.started_mono is not None else job.created_mono
+            result["elapsed_sec"] = max(0, int(self._monotonic() - started_mono))
         return {"id": job.id, "kind": job.kind, "state": job.state.value,
                 "result": result,
                 "result_code": job.error_code}
@@ -1440,7 +1441,8 @@ class OpsService:
             self._repeat_action(holder, duration_sec, max_runs, deadline_mono, deadline_at),
             deadline_seconds=self.limits.improve_start_deadline_seconds,
             busy_code=ErrorCode.IMPROVE_RUNNING, job_id=job_id, audit_id=audit_id,
-            initial_result=initial, cancel_event=threading.Event(), repeat=True)
+            initial_result=initial, cancel_event=threading.Event(), repeat=True,
+            started_mono=started_mono)
 
     def _improve_action(self, holder: "ir.CommentHolder | None" = None) -> Callable[[Job], dict]:
         """1 回だけの improve。一時指示は holder 越しにだけ持ち、終わったら必ず消す。"""

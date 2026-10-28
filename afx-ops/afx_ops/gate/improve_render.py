@@ -219,7 +219,12 @@ def _repeat_line(repeat: object) -> str | None:
             or type(duration) is not int or run < 1 or run > maximum or elapsed < 0
             or duration < 60):
         return None
-    return f"繰り返し {run}/{maximum} 回 · {elapsed // 60}m/{duration // 60}m"
+    return f"繰り返し {run}/{maximum} 回 · {_repeat_span(elapsed // 60)}/{_repeat_span(duration // 60)}"
+
+
+def _repeat_span(minutes: int) -> str:
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours > 0 else f"{minutes}m"
 
 
 def _event_repeat(payload: Mapping[str, object]) -> dict | None:

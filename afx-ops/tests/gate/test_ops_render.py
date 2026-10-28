@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from afx_ops.improve_events import CODE as IMPROVE_CODE
+from afx_ops.gate.improve_render import render_improve_start
 from afx_ops.gate.render import OPS_EVENT_SPECS, escape_discord, render_event
 from afx_ops.notify.payload import ALLOWED_FIELDS
 from afx_ops.trade_events import TRADE_CODES
@@ -97,6 +98,18 @@ def test_event_templates_omit_invalid_fields_and_use_the_generic_sentence_withou
 
 def test_ops_event_table_matches_the_daemon_non_trade_event_schema():
     assert set(OPS_EVENT_SPECS) == set(ALLOWED_FIELDS) - set(TRADE_CODES) - {IMPROVE_CODE}
+
+
+def test_repeat_render_formats_spans_of_an_hour_like_jobs_get():
+    payload = {"ref": "improve:2043", "trigger": "manual",
+               "repeat_run": 2, "repeat_max_runs": 10,
+               "repeat_elapsed_sec": 3900, "repeat_duration_sec": 7500}
+    detail = {"backend": "codex", "model": "gpt-5.6-luna",
+              "repeat": {"run": 2, "max_runs": 10, "elapsed_sec": 3900,
+                         "duration_sec": 7500}}
+    assert render_improve_start(payload, detail) == (
+        "[改善] 開始 #2043 (手動)\nbackend codex / gpt-5.6-luna\n"
+        "繰り返し 2/10 回 · 1h05m/2h05m")
 
 
 

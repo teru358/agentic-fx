@@ -14,6 +14,7 @@ FIELDS = frozenset({"state", "trigger", "result_code", "reason_code", "tool_call
                     "repeat_duration_sec"})
 _REPEAT_FIELDS = frozenset({"repeat_run", "repeat_max_runs", "repeat_elapsed_sec",
                             "repeat_duration_sec"})
+_REPEAT_KEYS = ("repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec")
 REF_PATTERN = re.compile(r"improve:[0-9]{1,18}\Z")
 
 STATES = frozenset({"started", "finished"})
@@ -40,12 +41,15 @@ def valid_fields(fields: object) -> bool:
     """field 集合の完全一致と、各値の文法・範囲を満たすか。"""
     if type(fields) is not dict or not FIELDS - _REPEAT_FIELDS <= set(fields) <= FIELDS:
         return False
-    present = {key: fields.get(key) for key in _REPEAT_FIELDS}
-    repeat_values = tuple(present.values())
+    repeat_values = tuple(fields.get(key) for key in _REPEAT_KEYS)
     if any(value is not None and (type(value) is not int or value < 0)
            for value in repeat_values):
         return False
     if any(value is None for value in repeat_values) and any(value is not None for value in repeat_values):
+        return False
+    if (repeat_values[0] is not None and (repeat_values[0] < 1
+                                           or repeat_values[1] < repeat_values[0]
+                                           or repeat_values[3] < 60)):
         return False
     return (type(fields["state"]) is str and fields["state"] in STATES
             and type(fields["trigger"]) is str and fields["trigger"] in TRIGGERS

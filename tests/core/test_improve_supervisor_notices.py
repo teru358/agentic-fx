@@ -329,6 +329,24 @@ def test_prepare_failure_after_tx0_emits_finished_only_and_shows_the_cause(
         (f"improve:{mission_id}", finished(trigger, "failed", "prepare_failed", None))]
 
 
+def test_repeat_prepare_failure_keeps_its_context_on_the_finished_event(db_path, tmp_path):
+    # `finished(..., repeat=...)` が抜けると、repeat の失敗だけ進捗行を失う。
+    sup, loop = build(db_path, tmp_path, [{"prepare_fails": "exception"}])
+    result = sup.submit_repeat(
+        duration_sec=600, max_runs=1, comment_holder=None, on_progress=lambda _: None,
+        cancel_event=threading.Event(), autopilot_check=lambda: False,
+        monotonic=lambda: 100.0, deadline_mono=700.0,
+        deadline_at="2026-10-25T03:10:00+00:00")
+    mission_id = loop.prepared[0].mission_id
+    assert result.runs == 1
+    assert events(db_path) == [
+        (f"improve:{mission_id}", {
+            "state": "finished", "trigger": "manual", "result_code": "failed",
+            "reason_code": "prepare_failed", "tool_calls": None,
+            "repeat_run": 1, "repeat_max_runs": 1,
+            "repeat_elapsed_sec": 0, "repeat_duration_sec": 600})]
+
+
 @pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])
 def test_base_exception_in_prepare_passes_through_without_events(
         db_path, tmp_path, exc_type):

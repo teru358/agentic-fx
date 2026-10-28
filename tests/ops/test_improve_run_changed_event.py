@@ -106,6 +106,38 @@ def test_ref_boundaries_are_accepted():
     validate_fields(CODE, _started(), "improve:" + "9" * 18)
 
 
+@pytest.mark.parametrize("repeat", [
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 2, "repeat_max_runs": 10,
+     "repeat_elapsed_sec": 305, "repeat_duration_sec": 1800},
+])
+def test_complete_repeat_context_with_daemon_bounds_is_accepted(repeat):
+    validate_fields(CODE, {**_started(), **repeat}, REF)
+
+
+@pytest.mark.parametrize("repeat", [
+    {"repeat_run": 1},
+    {"repeat_run": 0, "repeat_max_runs": 0,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 0},
+    {"repeat_run": -1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": -1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": -1, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": -1},
+    {"repeat_run": 3, "repeat_max_runs": 2,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 59},
+])
+def test_repeat_context_outside_the_daemon_contract_is_rejected(repeat):
+    with pytest.raises(EventSchemaError):
+        validate_fields(CODE, {**_started(), **repeat}, REF)
+
+
 def test_event_schema_error_surfaces_from_both_emit_paths(ops_env):
     store = EventStore(ops_env.conn, wall_clock=ops_env.wall)
     bad = _bad(reason_code="pf:7.7777")

@@ -35,6 +35,39 @@ def test_a_started_event_with_null_outcome_fields_is_accepted():
                         tool_calls=None))
 
 
+@pytest.mark.parametrize("repeat", [
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 2, "repeat_max_runs": 10,
+     "repeat_elapsed_sec": 305, "repeat_duration_sec": 1800},
+])
+def test_complete_repeat_context_with_daemon_bounds_is_accepted(repeat):
+    encoded = encode_event(_event(**repeat))
+    assert {key: encoded[key] for key in repeat} == repeat
+
+
+@pytest.mark.parametrize("repeat", [
+    {"repeat_run": 1},
+    {"repeat_run": 0, "repeat_max_runs": 0,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 0},
+    {"repeat_run": -1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": -1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": -1, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": -1},
+    {"repeat_run": 3, "repeat_max_runs": 2,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+    {"repeat_run": 1, "repeat_max_runs": 1,
+     "repeat_elapsed_sec": 0, "repeat_duration_sec": 59},
+])
+def test_repeat_context_outside_the_daemon_contract_is_rejected(repeat):
+    with pytest.raises(PayloadError):
+        encode_event(_event(**repeat))
+
+
 @pytest.mark.parametrize("result", ["submitted", "observation", "report", "gate_failed",
                                     "failed", None])
 def test_every_result_code_and_null_is_accepted(result):
