@@ -1,6 +1,6 @@
 # 参照系列 (株価指数など) を戦略の材料にする — 設計 C1
 
-**版:** v0.5.1 C1（sol 4 周目の指摘全件を反映）
+**版:** v0.6 C1 (裁定済)（sol 4 周目の指摘全件を反映）
 **チケット:** `reference-symbols-as-indicator-inputs`（中）、`multi-timeframe-indicator-deps`（低）、`executor-pair-membership-guard`（高、T1 に含める）
 **正本の関係:** indicator の loader / resolver / pin は `2026-09-14-indicator-consumption-wiring-design.md` を拡張する。価格源の outage / backfill 規則は `2026-09-24-outage-stop-and-backfill-design.md` を変更しない。
 
@@ -134,6 +134,8 @@ T1→T2→T3→T4 は直列である。T1 の protocol / 安全境界試験を�
 
 ## 4. 指揮者裁定（利用者判断が必要な製品・運用方針）
 
+**2026-10-28 ユーザー裁定済**: R1・R2 (run 全体を `reference_history_missing` で失敗にする)・R4 は表の推奨どおり、R5 は MT5 限定。
+
 | # | C1 裁定、sol の推奨 | なぜ利用者の判断が要るか |
 |---|---|---|
 | R1 | 参照取得は **soft**。ただし sol 推奨どおり、影響 strategy は NaN のまま実行せず `reference_unavailable` hold/skip にする。システム全体は止めない。 | 参照材料を欠く時の取引機会と、当該 strategy を止める安全性の優先度は製品方針だから。 |
@@ -179,3 +181,4 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-28 | v0.4 C1 | I-1〜I-4（3 MiB の実測境界、時間範囲ベースの `K_ref`、512-byte family key / symbol 長上限、fail-closed の run 行契約）を反映 | 設計レビュー 3 周目 (sol) | |
 | 2026-10-28 | v0.5 C1 | I-5・I-6・R5 | 設計レビュー 4 周目 (sol) | |
 | 2026-10-28 | v0.5.1 C1 | runtime 超過の固定 reason `reference_window_exceeded_at_runtime` (§2.3、AC-3)、AC-14 を `K_ref_actual` に統一 | 設計レビュー 5 周目 (sol、I-5 部分・I-7) | |
+| 2026-10-28 | v0.6 C1 | §4 の R1・R2・R4 を推奨どおりユーザー裁定済に | ユーザー承認、実装着手 | |

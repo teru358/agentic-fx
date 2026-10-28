@@ -1,7 +1,7 @@
 ---
 id: executor-pair-membership-guard
 title: 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い
-status: 設計待ち
+status: 実装中
 priority: 高
 opened: 2026-10-25
 closed: null
@@ -10,7 +10,7 @@ kind: 不具合
 ---
 # [executor-pair-membership-guard] 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +26,4 @@ kind: 不具合
 
 - 2026-10-25: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-28: 状態: 実装中 — 2026-10-28: 参照系列 T1 に含めて実装 (設計 2026-10-25-reference-series-design.md §2.1、AC-11)
