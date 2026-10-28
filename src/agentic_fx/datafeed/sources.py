@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -40,6 +41,28 @@ VENDOR_SYMBOLS: dict[str, dict[str, str]] = {
     # 関連指標の拡張例 (Phase 1 では未使用):
     "DXY": {"yf": "DX-Y.NYB", "td": "DXY"},
 }
+
+
+@dataclass(frozen=True, slots=True)
+class MT5RawSymbol:
+    """Validated broker spelling for analysis-only MT5 reference series.
+
+    This is deliberately not a logical trading pair and has no conversion via
+    ``VENDOR_SYMBOLS``.  The MT5 reference adapter consumes this type in T2.
+    """
+    value: str
+
+    @classmethod
+    def parse(cls, value: object) -> "MT5RawSymbol":
+        if not isinstance(value, str) or not value:
+            raise ValueError("mt5_raw_symbol_invalid")
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("mt5_raw_symbol_invalid") from exc
+        if size > 32:
+            raise ValueError("watch_symbol_too_long")
+        return cls(value)
 
 
 def vendor_symbol(logical: str, vendor: str) -> str:

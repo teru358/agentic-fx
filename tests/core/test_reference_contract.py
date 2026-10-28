@@ -5,8 +5,12 @@ import pytest
 
 from agentic_fx.plugin.reference import (
     align_reference,
+    actual_reference_bars,
     canonical_duration_seconds,
+    complete_reference_buckets,
+    native_reference_bars,
     nominal_reference_bars,
+    runtime_reference_window_reason,
 )
 
 
@@ -59,3 +63,53 @@ def test_align_reference_is_fresh_at_boundary_and_stale_one_second_after():
 def test_nominal_reference_bars_uses_the_inclusive_decision_window(
         strategy_tf, rows, reference_tf, expected):
     assert nominal_reference_bars(rows, strategy_tf, reference_tf) == expected
+
+
+def test_actual_reference_bars_uses_real_decision_span_including_both_ends():
+    assert actual_reference_bars(
+        pd.Timestamp("2026-10-23T15:00:00Z"),
+        pd.Timestamp("2026-10-27T23:00:00Z"), "1h") == 105
+
+
+def test_actual_reference_window_over_limit_has_the_fixed_fail_closed_reason():
+    actual = actual_reference_bars(
+        pd.Timestamp("2026-10-23T15:00:00Z"),
+        pd.Timestamp("2026-10-27T23:00:00Z"), "1h")
+    assert runtime_reference_window_reason(actual, max_bars=100) == \
+        "reference_window_exceeded_at_runtime"
+    assert runtime_reference_window_reason(100, max_bars=100) is None
+
+
+@pytest.mark.parametrize(("reference_tf", "expected"), [
+    ("4h", 12), ("1d", 72),
+])
+def test_native_reference_bars_requires_full_hourly_inputs(reference_tf, expected):
+    assert native_reference_bars(3, reference_tf, "1h") == expected
+
+
+def _hourly_frame(start: str, periods: int) -> pd.DataFrame:
+    index = pd.date_range(start, periods=periods, freq="1h", tz="UTC")
+    values = list(range(periods))
+    return pd.DataFrame({"open": values, "high": [v + 1 for v in values],
+                         "low": [v - 1 for v in values], "close": values,
+                         "volume": [10] * periods}, index=index)
+
+
+def test_complete_reference_buckets_drops_incomplete_head_and_tail_4h():
+    # 01:00 starts inside the 00:00 bucket (head is unavailable); 12:00--14:00
+    # are a partial tail.  Only UTC buckets [04:00,08:00) and [08:00,12:00)
+    # are valid reference rows.
+    frame = _hourly_frame("2026-10-26T01:00:00Z", 13)
+    got = complete_reference_buckets(frame, effective_timeframe="4h")
+    assert list(got.index) == [pd.Timestamp("2026-10-26T04:00:00Z"),
+                               pd.Timestamp("2026-10-26T08:00:00Z")]
+    assert list(got["open"]) == [3, 7]
+    assert list(got["close"]) == [6, 10]
+
+
+def test_complete_reference_buckets_uses_utc_midnight_and_drops_partial_day():
+    frame = _hourly_frame("2026-10-25T23:00:00Z", 27)
+    got = complete_reference_buckets(frame, effective_timeframe="1d")
+    assert list(got.index) == [pd.Timestamp("2026-10-26T00:00:00Z")]
+    assert got.iloc[0].to_dict() == {"open": 1, "high": 25, "low": 0,
+                                      "close": 24, "volume": 240}

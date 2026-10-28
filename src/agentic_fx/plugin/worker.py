@@ -183,7 +183,8 @@ def _load_plugins(isolated: "worker_isolation.IsolatedWorker",
         deps.append({
             "alias": record.alias, "compute": getattr(dep_module, "compute"),
             "params": spec["params"], "max_bars": int(spec["max_bars"]),
-            "outputs": tuple(spec["outputs"]), "frame_id": spec.get("frame_id")})
+            "outputs": tuple(spec["outputs"]), "frame_id": spec.get("frame_id"),
+            "plugin_name": spec.get("plugin_name")})
     return fn, deps
 
 
@@ -234,7 +235,9 @@ def main() -> None:
     import numpy as np
     import pandas as pd
 
-    from agentic_fx.core.plugin_contract import validate_indicator_result
+    from agentic_fx.core.plugin_contract import (
+        validate_indicator_result, validate_ohlcv_passthrough,
+    )
 
     baseline_chained = pd.get_option("mode.chained_assignment")
     baseline_errstate = dict(np.geterr())
@@ -258,9 +261,13 @@ def main() -> None:
                 for dep in deps:
                     source = df if dep.get("frame_id") is None else frames[dep["frame_id"]]
                     sub_df = source.tail(dep["max_bars"]).copy(deep=True)
+                    before = sub_df.copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
-                    validated = validate_indicator_result(
-                        raw, df_index=sub_df.index, outputs=dep["outputs"])
+                    validated = (
+                        validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
+                        if dep["plugin_name"] == "ohlcv" else
+                        validate_indicator_result(
+                            raw, df_index=sub_df.index, outputs=dep["outputs"]))
                     indicators[dep["alias"]] = {
                         key: (value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)
@@ -272,11 +279,15 @@ def main() -> None:
                         "indicator mutated shared pandas/numpy global state")
                 result = fn(df, indicators, None, params)
             else:
+                before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
                 result = fn(df, params)
                 if kind == "indicator":
-                    result = _indicator_result_to_wire(
+                    validated = (
+                        validate_ohlcv_passthrough(result, df=df, original_df=before)
+                        if handshake.get("name") == "ohlcv" else
                         validate_indicator_result(result, df_index=df.index,
                                                   outputs=main_outputs))
+                    result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
                                       "id": request_id})
         except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ

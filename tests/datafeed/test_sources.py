@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from agentic_fx.datafeed.sources import (
-    INTERVAL_MIN, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
+    INTERVAL_MIN, MT5RawSymbol, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
     td_bars, td_quote, vendor_symbol, yf_bars, yf_quote,
 )
 
@@ -44,6 +44,20 @@ def test_vendor_symbol_resolver():
     assert vendor_symbol("USDJPY", "mt5") == "USDJPY"
     with pytest.raises(KeyError):
         vendor_symbol("CHFUSD", "yf")  # 未定義は KeyError
+
+
+def test_mt5_raw_symbol_is_a_distinct_validated_type_without_vendor_lookup():
+    raw = MT5RawSymbol.parse("JP225.cash")
+    assert raw.value == "JP225.cash"
+    assert raw != "JP225.cash"
+    assert "JP225.cash" not in __import__("agentic_fx.datafeed.sources", fromlist=["VENDOR_SYMBOLS"]).VENDOR_SYMBOLS
+    assert MT5RawSymbol.parse("x" * 32).value == "x" * 32
+
+
+@pytest.mark.parametrize("value", ["", "x" * 33, b"JP225", 1])
+def test_mt5_raw_symbol_rejects_invalid_or_overlong_values(value):
+    with pytest.raises(ValueError, match="mt5_raw_symbol_invalid|watch_symbol_too_long"):
+        MT5RawSymbol.parse(value)
 
 
 def test_yf_bars_maps_dataframe():

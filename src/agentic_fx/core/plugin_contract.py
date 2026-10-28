@@ -32,6 +32,9 @@ class IndicatorResultError(ValueError):
     それぞれの層の例外 (`SandboxError` 等) へ写像する。"""
 
 
+_OHLCV_OUTPUTS = ("open", "high", "low", "close", "volume")
+
+
 def _check_number(value: Any, where: str) -> float:
     # opus r1 M3 是正: `float(value)` を先に呼ぶと `float("1.5")` が通り、
     # **数値文字列を受理**してしまう (設計書 §2.5 は「要素は数値」)。
@@ -111,3 +114,37 @@ def validate_indicator_result(result: Any, *, df_index, outputs):
             continue
         out[key] = _check_number(value, where)
     return out
+
+
+def validate_ohlcv_passthrough(result: Any, *, df, original_df=None):
+    """Validate the approved ``ohlcv`` indicator's exact causal passthrough.
+
+    ``original_df`` is the pre-compute snapshot held by the worker.  Supplying
+    it makes mutation observable even when a plugin mutates its private input
+    frame before returning a superficially valid result.
+    """
+    import pandas as pd
+
+    before = df if original_df is None else original_df
+    if not isinstance(result, dict) or tuple(result) != _OHLCV_OUTPUTS:
+        raise IndicatorResultError(
+            "ohlcv outputs must be ordered open, high, low, close, volume")
+    if not before.index.equals(df.index) or not before.equals(df):
+        raise IndicatorResultError("ohlcv indicator mutated its input frame")
+    for column in _OHLCV_OUTPUTS:
+        if column not in before.columns:
+            raise IndicatorResultError(f"ohlcv input missing column {column!r}")
+        if not isinstance(result[column], pd.Series):
+            raise IndicatorResultError(f"ohlcv output {column!r} must be a Series")
+
+    validated = validate_indicator_result(result, df_index=before.index,
+                                          outputs=_OHLCV_OUTPUTS)
+    for column in _OHLCV_OUTPUTS:
+        value = validated[column]
+        try:
+            pd.testing.assert_series_equal(value, before[column], check_dtype=False,
+                                            check_names=False, check_exact=True)
+        except AssertionError as exc:
+            raise IndicatorResultError(
+                f"ohlcv output {column!r} must exactly equal input") from exc
+    return validated

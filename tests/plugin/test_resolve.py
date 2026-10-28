@@ -110,6 +110,7 @@ def test_resolver_canonicalizes_literal_reference_coordinates_and_default_age(tm
     assert (item.symbol_mode, item.literal_symbol, item.timeframe,
             item.max_age_seconds, item.frame_id) == ("literal", "JP225", "1h", 10_800,
                                                      "JP225@1h")
+    assert resolved.handshake_items()[0]["plugin_name"] == "ema"
 
 
 def test_resolver_rejects_reference_window_that_exceeds_indicator_max_bars(tmp_path):
@@ -127,6 +128,22 @@ def test_resolver_rejects_reference_window_that_exceeds_indicator_max_bars(tmp_p
         resolve_indicator_deps(strategy, _inv(root, ema), settings=settings, pin_mode="ignore")
 
     assert error.value.reason == "reference_window_exceeds_max_bars"
+
+
+def test_self_same_timeframe_400_bar_strategy_is_not_a_reference_window(tmp_path):
+    """A weekend-sized elapsed span never applies the reference K window to self."""
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi", max_bars="max_bars: 200\n")
+    strategy = _plugin(
+        tmp_path / "candidate", "weekend_self",
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+        "exit_mode: levels\nmax_bars: 400\n"
+        "indicators:\n  rsi: {plugin: rsi}\n", _STRATEGY_PY)
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, rsi), settings=SETTINGS,
+                                      pin_mode="ignore")
+
+    assert resolved.items[0].frame_id is None
 
 
 def test_indicator_resolution_error_str_is_fixed_text():

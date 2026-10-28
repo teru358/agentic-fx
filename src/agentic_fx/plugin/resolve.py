@@ -116,9 +116,9 @@ class ResolvedIndicatorSet:
     def pin_object(self) -> dict:
         """承認 payload 用の plain JSON object (alias 昇順)。"""
         return {i.alias: {"plugin": i.plugin_name,
+                          "symbol_mode": i.symbol_mode,
                           "content_hash": i.content_hash,
                           "params": thaw(i.params),
-                          "symbol_mode": i.symbol_mode,
                           "symbol": i.literal_symbol,
                           "timeframe": i.timeframe,
                           "max_age_seconds": i.max_age_seconds}
@@ -127,6 +127,7 @@ class ResolvedIndicatorSet:
     def handshake_items(self) -> list[dict]:
         """`PluginSession.__enter__` が handshake に載せる形 (alias 順)。"""
         return [{"alias": i.alias, "plugin_py": str(i.plugin_py),
+                 "plugin_name": i.plugin_name,
                  "params": thaw(i.params), "max_bars": i.max_bars,
                  "outputs": list(i.outputs), "symbol_mode": i.symbol_mode,
                  "symbol": i.literal_symbol, "timeframe": i.timeframe,

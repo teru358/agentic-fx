@@ -253,7 +253,9 @@ def test_indicator_deps_is_present_and_identical_in_all_three_corridors(
         "SELECT payload_json FROM approval_requests WHERE id=?",
         (submit_id,)).fetchone()["payload_json"])
     expected = {"rsi": {"plugin": "rsi", "content_hash": hashes["rsi"],
-                        "params": {"period": fx.RSI_PERIOD}}}
+                        "params": {"period": fx.RSI_PERIOD},
+                        "symbol_mode": "self", "symbol": None,
+                        "timeframe": "1h", "max_age_seconds": 10_800}}
     assert payload["indicator_deps"] == expected
     json.dumps(payload)     # plain JSON であること
 

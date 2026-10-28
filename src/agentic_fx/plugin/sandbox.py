@@ -959,6 +959,7 @@ class PluginSession:
                 "fsize_mb": self._settings.sandbox_fsize_mb,
                 "attest_nonce": nonce,
                 "content_hash": self._meta.content_hash,
+                "name": self._meta.name,
                 "kind": self._meta.kind,
                 "indicators": indicator_specs,
             }

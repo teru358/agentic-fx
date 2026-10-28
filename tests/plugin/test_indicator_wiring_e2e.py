@@ -185,4 +185,6 @@ def test_resolved_object_identity_across_both_scopes(wired, monkeypatch):
     # 一致することまでを固定する)
     assert outcome.resolved.pin_object() == {
         "rsi": {"plugin": "rsi", "content_hash": inventory.inventory.metas[0]
-                .content_hash, "params": {"period": fx.RSI_PERIOD}}}
+                .content_hash, "params": {"period": fx.RSI_PERIOD},
+                "symbol_mode": "self", "symbol": None,
+                "timeframe": "1h", "max_age_seconds": 10_800}}
