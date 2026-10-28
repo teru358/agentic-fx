@@ -20,6 +20,7 @@ from agentic_fx.config import (
     BacktestSettings, ConfigError, DatafeedSettings, Settings, load_settings,
 )
 from agentic_fx.core.accounting import drawdown_pct
+from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
 
@@ -42,7 +43,7 @@ def test_example_file_loads():
     assert s.datafeed.primary == "yfinance"
     # 既定の allowlist は空であるべき (検査⑤の守りを弱めない既定値)。
     assert s.service.secret_env_allowlist == []
-    assert s.schema_version == 4
+    assert s.schema_version == CURRENT_SCHEMA_VERSION
     assert s.api.enabled is True
 
 
@@ -761,7 +762,9 @@ def test_backtest_eval_source_rejects_non_import_source(source):
 def test_watch_symbols_never_extend_pairs():
     """watch は取引対象ではない — pair enum / risk 検証との独立を実 assert でピン。"""
     # watch_symbols を足した settings でも:
-    s = _settings_with(watch_symbols=["XAUUSD"])
+    s = _settings_with(
+        watch_symbols=["XAUUSD"], primary="mt5",
+        mt5={"enabled": True, "bridge_url": "http://localhost:8812"})
     # ① market_tools の pair enum は settings.pairs のみ (watch が混入しない)
     from agentic_fx.tools import market_tools
     from agentic_fx.tools.registry import ToolRegistry

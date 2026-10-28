@@ -13,6 +13,7 @@ from agentic_fx.entry import main as entry_main
 from agentic_fx.service import ensure_initialized, run_init
 from agentic_fx.setup.checks import CheckReason, CheckResult
 from agentic_fx.setup.settings_edit import atomic_write_settings
+from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION
 from agentic_fx.store import news_sources
 from agentic_fx.store.db import connect
 from agentic_fx.store.setup_marker import setup_marker_present
@@ -218,7 +219,7 @@ def test_init_config_file_does_not_overwrite_existing_settings(tmp_path):
 def test_init_config_file_must_pass_settings_validation(tmp_path):
     _example(tmp_path)
     source = tmp_path / "provided.yaml"
-    source.write_text("schema_version: 4\npairs: []\n", encoding="utf-8")
+    source.write_text(f"schema_version: {CURRENT_SCHEMA_VERSION}\npairs: []\n", encoding="utf-8")
     assert run_init(tmp_path, config_file=source) == 1
     assert not (tmp_path / "config" / "settings.yaml").exists()
 
@@ -227,7 +228,8 @@ def test_init_does_not_migrate_an_older_settings_schema(tmp_path, capsys):
     _example(tmp_path)
     target = tmp_path / "config" / "settings.yaml"
     target.write_text((tmp_path / "config" / "settings.yaml.example").read_text().replace(
-        "schema_version: 4", "schema_version: 0"), encoding="utf-8")
+        f"schema_version: {CURRENT_SCHEMA_VERSION}",
+        f"schema_version: {CURRENT_SCHEMA_VERSION - 1}"), encoding="utf-8")
     before = target.read_text(encoding="utf-8")
     assert run_init(tmp_path) == 1
     assert target.read_text(encoding="utf-8") == before
@@ -238,7 +240,8 @@ def test_init_does_not_migrate_an_older_settings_schema(tmp_path, capsys):
 def test_init_rejects_newer_schema_without_writing_files(tmp_path, capsys, use_config):
     _example(tmp_path)
     newer = (tmp_path / "config" / "settings.yaml.example").read_text(
-        encoding="utf-8").replace("schema_version: 4", "schema_version: 5")
+        encoding="utf-8").replace(f"schema_version: {CURRENT_SCHEMA_VERSION}",
+                                 f"schema_version: {CURRENT_SCHEMA_VERSION + 1}")
     if use_config:
         source = tmp_path / "provided.yaml"
         source.write_text(newer, encoding="utf-8")

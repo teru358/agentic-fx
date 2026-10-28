@@ -114,15 +114,23 @@ class ResolvedIndicatorSet:
         return {i.alias: i.content_hash for i in self.items}
 
     def pin_object(self) -> dict:
-        """承認 payload 用の plain JSON object (alias 昇順)。"""
-        return {i.alias: {"plugin": i.plugin_name,
-                          "symbol_mode": i.symbol_mode,
-                          "content_hash": i.content_hash,
-                          "params": thaw(i.params),
-                          "symbol": i.literal_symbol,
-                          "timeframe": i.timeframe,
-                          "max_age_seconds": i.max_age_seconds}
-                for i in self.items}
+        """承認・監査 payload 用の plain JSON object (alias 昇順)。
+
+        self dependency は既存 strategy の承認済み payload と同じ形を保つ。
+        literal reference だけが解決済みの入力座標を追加で公開する。
+        """
+        payload: dict[str, dict] = {}
+        for item in self.items:
+            entry = {"plugin": item.plugin_name,
+                     "content_hash": item.content_hash,
+                     "params": thaw(item.params)}
+            if item.symbol_mode == "literal":
+                entry.update({"symbol_mode": item.symbol_mode,
+                              "symbol": item.literal_symbol,
+                              "timeframe": item.timeframe,
+                              "max_age_seconds": item.max_age_seconds})
+            payload[item.alias] = entry
+        return payload
 
     def handshake_items(self) -> list[dict]:
         """`PluginSession.__enter__` が handshake に載せる形 (alias 順)。"""
