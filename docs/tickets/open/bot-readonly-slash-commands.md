@@ -2,14 +2,14 @@
 id: bot-readonly-slash-commands
 title: Discord bot に読み取り専用の slash command を足す
 status: 設計待ち
-priority: 中
+priority: 低
 opened: 2026-10-15
 closed: null
 related: [cli-surface-principle-and-reorg, news-source-cli-and-429-backoff]
 ---
 # [bot-readonly-slash-commands] Discord bot に読み取り専用の slash command を足す
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [cli-surface-principle-and-reorg, news-source-cli-and-429-backoff]
 ## 経緯
 
 - 2026-10-15: 起票。
+- 2026-10-29: 優先: 低 — 2026-10-29 棚卸し: 承認の中身は通知 + web が先。bot の状態照会は後

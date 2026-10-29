@@ -5,7 +5,7 @@ status: 実装待ち
 priority: 低
 opened: 2026-09-27
 closed: null
-related: []
+related: [improve-add-quotes]
 backfilled: true
 source_section: 未完了
 kind: 不具合
@@ -23,3 +23,4 @@ kind: 不具合
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 低、題名: improve add で全角プレースホルダが警告されない — 仕分け (2026-10-02、現物で成立を確認): 日本語 UI では踏みやすい、判定の全角拡張を検討。 根拠: commands.py:244-247 のプレースホルダ判定は ASCII の <> と [] のみ。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [improve-add-quotes] — 2026-10-29 棚卸し: 関連を束ねる先に張る

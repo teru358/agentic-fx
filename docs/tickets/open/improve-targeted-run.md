@@ -1,16 +1,16 @@
 ---
 id: improve-targeted-run
 status: 設計待ち
-priority: 中
+priority: 低
 opened: 2026-09-12
 closed: null
-related: [id, indicator-consumption-wiring]
+related: [id, indicator-consumption-wiring, improve-mission-indicator-creation-path]
 backfilled: true
 source_section: 未完了
 ---
 # [improve-targeted-run]
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +19,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-29: 優先: 低、関連: [id, indicator-consumption-wiring, improve-mission-indicator-creation-path] — 2026-10-29 棚卸し: ctl improve の -c 一時指示 (10/27 merge) が部分吸収の疑い。backlog 指名実行・kind 付与は残る。indicator 新設は improve-mission-indicator-creation-path が担当

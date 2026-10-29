@@ -5,7 +5,7 @@ status: 実装待ち
 priority: 中
 opened: 2026-09-06
 closed: null
-related: [pair-rules-vs-data-availability]
+related: [pair-rules-vs-data-availability, reference-symbols-as-indicator-inputs]
 backfilled: true
 source_section: 完了ログ
 kind: 保守
@@ -23,3 +23,4 @@ kind: 保守
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 実装待ち、優先: 中、題名: 複数ペア化すると tick ごとの価格取得が注文数に比例して増える — 仕分け (2026-10-02、現物で成立を確認): pairs を 2 つ以上にする前に必ず実装する前提条件 (2026-09-06 裁定)。現状 1 ペアでは実害なし。 根拠: scheduler.py:621,635,711,1318 が行ごとに bars_fn を呼ぶ。tick 先頭で pair 単位に配る仕組みは無い。
 - 2026-10-25: 種別: 保守 — 種別を付与
+- 2026-10-29: 関連: [pair-rules-vs-data-availability, reference-symbols-as-indicator-inputs] — 2026-10-29 棚卸し: 関連を束ねる先に張る

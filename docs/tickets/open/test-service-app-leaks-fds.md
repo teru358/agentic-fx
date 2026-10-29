@@ -6,7 +6,7 @@ priority: 低
 kind: 不具合
 opened: 2026-10-26
 closed: null
-related: []
+related: [full-suite-from-repo-root-hangs-with-live-data]
 ---
 # [test-service-app-leaks-fds] tests/test_service_app.py が fd を 1100 超残し後続 test に波及する
 
@@ -27,3 +27,4 @@ tests/test_service_app.py を同じ process で先に回すと fd が 1100 超�
 ## 経緯
 
 - 2026-10-26: 起票。
+- 2026-10-29: 関連: [full-suite-from-repo-root-hangs-with-live-data] — 2026-10-29 棚卸し: 関連を束ねる先に張る

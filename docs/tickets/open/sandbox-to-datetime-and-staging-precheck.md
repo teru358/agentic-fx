@@ -26,3 +26,4 @@ mission 2037 は backtest 3 回 ok の後、最終 gate で test_plugin.py の p
 
 - 2026-10-25: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 優先: 中 — 2026-10-29 棚卸し: 是正済みの疑い (to_datetime 拒否は 95ab11dd / f57d94c2 で _TO_ALLOWED に追加済み)。残件: staging 事前検査 / write_staging_file の検査 / last_result の理由

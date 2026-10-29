@@ -2,7 +2,7 @@
 id: indicator-params-not-new-plugin
 title: 既存の指標の params で表せる指標を新規として提出させない
 status: 設計待ち
-priority: 低
+priority: 中
 kind: 機能
 opened: 2026-10-29
 closed: null
@@ -10,7 +10,7 @@ related: [plugin-naming-lifecycle-policy, weekly-plugin-inventory-notice]
 ---
 # [indicator-params-not-new-plugin] 既存の指標の params で表せる指標を新規として提出させない
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
+**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [plugin-naming-lifecycle-policy, weekly-plugin-inventory-notice]
 ## 経緯
 
 - 2026-10-29: 起票。
+- 2026-10-29: 優先: 中 — 2026-10-29 棚卸し: 2026-10-29 方針の一部。指標 50 本中 9 本しか参照されず、増殖を止める。plugin-naming 方針の確定に連動

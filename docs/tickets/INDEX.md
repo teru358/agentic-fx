@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 151 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
 ## 実装中 (6)
 
@@ -72,13 +72,15 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (128)
+## 設計待ち (126)
 
 ### 不具合 (71)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
+| [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
+| [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -92,10 +94,10 @@
 | [signal-producer-evaluates-before-bar-arrives](open/signal-producer-evaluates-before-bar-arrives.md) | 中 | 2026-10-10 | signal_producer が 1h 足の確定前に評価して毎時 WARNING を出す |
 | [full-suite-from-repo-root-hangs-with-live-data](open/full-suite-from-repo-root-hangs-with-live-data.md) | 中 | 2026-10-11 | 全 suite (約 8.8k 本) を 1 プロセスで回すと約 6,800 本目で固まる |
 | [first-start-check-times-out-on-model-download](open/first-start-check-times-out-on-model-download.md) | 中 | 2026-10-17 | 初回起動の確認が埋め込みモデル取得中に timeout して失敗表示になる |
+| [tests-leak-tmp-dirs-outside-basetemp](open/tests-leak-tmp-dirs-outside-basetemp.md) | 中 | 2026-10-17 | 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外) |
 | [deploy-cli-config-error-traceback](open/deploy-cli-config-error-traceback.md) | 中 | 2026-10-18 | afx の subcommand は設定不在・不正 YAML で traceback を出す |
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
-| [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 中 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
 | [backtest-tmp-state-leaks-and-tmp-quota](open/backtest-tmp-state-leaks-and-tmp-quota.md) | 中 | 2026-10-25 | backtest の一時 state が /tmp に残り続け、/tmp の枯渇で改善 mission が落ちる |
@@ -103,9 +105,7 @@
 | [news-cli-distinguish-permission-from-missing-db](open/news-cli-distinguish-permission-from-missing-db.md) | 中 | 2026-10-25 | afx news が root 未解決・権限不足も「DB がありません」と出す |
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
-| [approval-base-identity-cas](open/approval-base-identity-cas.md) | 中 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
-| [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
 | [pair-rules-vs-data-availability](open/pair-rules-vs-data-availability.md) | 低 | 2026-09-03 | データの無い通貨ペアを agent に見せてしまう余地がある |
@@ -130,7 +130,6 @@
 | [rpc-dispatcher-join-budget-test-flaky-under-load](open/rpc-dispatcher-join-budget-test-flaky-under-load.md) | 低 | 2026-10-11 | rpc dispatcher の join budget 試験が高負荷時に揺れる |
 | [seccomp-chmod-eperm-breaks-codex-rollout](open/seccomp-chmod-eperm-breaks-codex-rollout.md) | 低 | 2026-10-11 | seccomp の chmod/fchmod EPERM で codex の rollout 書込みが失敗する |
 | [ops-decision-lane-ac25-timing-flake](open/ops-decision-lane-ac25-timing-flake.md) | 低 | 2026-10-13 | tests/ops の ac25 が負荷下で timing flake |
-| [tests-leak-tmp-dirs-outside-basetemp](open/tests-leak-tmp-dirs-outside-basetemp.md) | 低 | 2026-10-17 | 改善隔離 test helper が /tmp に afx-root-* を残す (basetemp 外) |
 | [rollback-foreign-temp-link-sweep](open/rollback-foreign-temp-link-sweep.md) | 低 | 2026-10-18 | foreign で終端した rollback の temp symlink を sweep の対象にする |
 | [improve-duplicate-self-computed-strategies](open/improve-duplicate-self-computed-strategies.md) | 低 | 2026-10-22 | 自前計算の戦略 (sma_cross 型) は重複判定を構造変更で避けられる |
 | [ops-web-head-request-loop-error](open/ops-web-head-request-loop-error.md) | 低 | 2026-10-24 | 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す |
@@ -140,6 +139,7 @@
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
+| [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 低 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [latest-in-sample-metrics-requires-row-factory](open/latest-in-sample-metrics-requires-row-factory.md) | 低 |  | `latest_in_sample_metrics` は `row_factory=sqlite3.Row` を暗黙に… |
 | [legacy-d-stage0-e](open/legacy-d-stage0-e.md) | 低 |  | switch の resume 経路が symlink 版ディレクトリを resolve せず受理 |
 | [legacy-l72](open/legacy-l72.md) | 低 |  | holdout の空期間分岐に穴があるとの記録 |
@@ -150,31 +150,34 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (37)
+### 機能 (36)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 高 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
 | [backtest-dedup-cache](open/backtest-dedup-cache.md) | 中 | 2026-09-08 | 同一 (候補, config) の backtest 再実行で予算を消費しない (run6: 6 枠中 3 枠がビット… |
-| [improve-targeted-run](open/improve-targeted-run.md) | 中 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
-| [trade-cron-hybrid-mode](open/trade-cron-hybrid-mode.md) | 中 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
-| [improve-daily-params-weekly-algorithm](open/improve-daily-params-weekly-algorithm.md) | 中 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
-| [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 中 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
-| [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 中 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
-| [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
+| [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 中 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 中 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
+| [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 中 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
+| [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 低 | 2026-09-21 | ライブで集めた確定足を履歴に積めず二重保存になる |
 | [multi-decision-timeframes](open/multi-decision-timeframes.md) | 低 | 2026-09-21 | 判断足を複数持つ構想 (将来拡張) |
 | [intent-evidence-timeframe-gate](open/intent-evidence-timeframe-gate.md) | 低 | 2026-09-27 | 判断足と無関係な足を根拠にした OPEN を gate が弾かない |
+| [trade-cron-hybrid-mode](open/trade-cron-hybrid-mode.md) | 低 | 2026-09-28 | 取引判断 LLM の起動をハイブリッドにする — 建玉・未約定指値が**ある**間だけ判断足ごとの cron miss… |
 | [plugin-sees-live-spread](open/plugin-sees-live-spread.md) | 低 | 2026-10-01 | plugin と判断 mission が実 spread を見られるようにする |
 | [restricted-state-followups](open/restricted-state-followups.md) | 低 | 2026-10-02 | restricted 状態の残り: 欠落の記録、入力契約のテスト、結合検証 |
+| [improve-daily-params-weekly-algorithm](open/improve-daily-params-weekly-algorithm.md) | 低 | 2026-10-03 | 改善を日次のパラメータ調整と週次のアルゴリズム改善に分ける |
 | [verify-backend-isolated-via-service](open/verify-backend-isolated-via-service.md) | 低 | 2026-10-11 | 隔離付きの backend 疎通確認を service 経由 (ops API / afx ctl) で提供する |
 | [web-ui-charts-equity-indicators](open/web-ui-charts-equity-indicators.md) | 低 | 2026-10-11 | 同梱 web に資金遷移グラフとチャート重ね表示 |
 | [afx-init-reset-builtin](open/afx-init-reset-builtin.md) | 低 | 2026-10-12 | afx init --reset (内蔵のリセット) を追加する |
+| [trade-backend-opencode-single-local-path](open/trade-backend-opencode-single-local-path.md) | 低 | 2026-10-14 | 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に |
+| [wizard-stage4-menu-per-role](open/wizard-stage4-menu-per-role.md) | 低 | 2026-10-14 | 段 4 の LLM 構成メニューを役割ごとの 2 問に揃える |
+| [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 低 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
 | [bridge-expose-margin-mode](open/bridge-expose-margin-mode.md) | 低 | 2026-10-16 | bridge の /account に margin_mode (netting / hedging) を出す |
 | [per-strategy-virtual-books](open/per-strategy-virtual-books.md) | 低 | 2026-10-16 | 戦略ごとの実帳簿 (同一口座内の仮想分割、両建ては戦略間のみ) |
 | [signal-maintenance-offload-worker](open/signal-maintenance-offload-worker.md) | 低 | 2026-10-16 | signal maintenance を tick から別 worker へ切り出す |
@@ -182,26 +185,21 @@
 | [disable-dependent-change-error-notice](open/disable-dependent-change-error-notice.md) | 低 | 2026-10-18 | disable 後に依存 strategy が解決不能になる旨の表示が無い |
 | [ctl-status-shows-active-gate-floor](open/ctl-status-shows-active-gate-floor.md) | 低 | 2026-10-22 | afx ctl status に稼働中の収益性フロア 3 値を出す |
 | [ctl-improve-return-on-accept](open/ctl-improve-return-on-accept.md) | 低 | 2026-10-25 | afx ctl improve は受理で返り、完了を待たない |
-| [improve-run-summary-for-humans](open/improve-run-summary-for-humans.md) | 低 | 2026-10-25 | 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる |
 | [init-news-source-remove-on-revisit](open/init-news-source-remove-on-revisit.md) | 低 | 2026-10-25 | afx init 段 3 の再入時に入力済みのニュース源を取り消せない |
-| [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 低 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
-| [plugin-auto-approve-paper-only](open/plugin-auto-approve-paper-only.md) | 低 | 2026-10-27 | plugin 自動承認モード (ペーパー限定の検討メモ) |
 | [reference-series-additional-sources](open/reference-series-additional-sources.md) | 低 | 2026-10-28 | 参照系列の取得先を MT5 以外に広げる (金利など) |
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
-| [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 低 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (20)
+### 保守 (19)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [live-storage-source-mapping-scattered](open/live-storage-source-mapping-scattered.md) | 中 | 2026-09-28 | primary → ライブ保存名 (`mt5` → `mt5-live`) の写像が 8 箇所に散在 (service… |
 | [gate-admission-helper](open/gate-admission-helper.md) | 低 | 2026-09-06 | gate 検査が 3 経路で重複し drift する |
-| [jinja-templating-deferred](open/jinja-templating-deferred.md) | 低 | 2026-09-07 | 改善プロンプトの {{ }} 脱出が読みにくい (jinja 化は保留) |
 | [fake-run-context-consolidation](open/fake-run-context-consolidation.md) | 低 | 2026-09-17 | テストのフェイク RunContext が散在し追随漏れで壊れやすい |
 | [iw-r3-unverified-residuals](open/iw-r3-unverified-residuals.md) | 低 | 2026-09-19 | iw 3 周目で未検証のまま残った 3 点 |
 | [switch-ops-code-review-r2-altitude](open/switch-ops-code-review-r2-altitude.md) | 低 | 2026-09-20 | switch ops の重複コードや型の緩さの整理 |
+| [live-storage-source-mapping-scattered](open/live-storage-source-mapping-scattered.md) | 低 | 2026-09-28 | primary → ライブ保存名 (`mt5` → `mt5-live`) の写像が 8 箇所に散在 (service… |
 | [outage-observe-closed-guard-unpinned](open/outage-observe-closed-guard-unpinned.md) | 低 | 2026-09-29 | `OutageStateMachine.observe` の「閉場中は観測しない」early return を落として… |
 | [improve-admission-hashes-cli-every-mission](open/improve-admission-hashes-cli-every-mission.md) | 低 | 2026-10-11 | 改善 mission の admission が毎回 CLI binary を hash し fingerprint … |
 | [legacy-discord-webhook-notify-removal](open/legacy-discord-webhook-notify-removal.md) | 低 | 2026-10-12 | 旧 discord.enabled + .env webhook の簡易通知を廃止する |

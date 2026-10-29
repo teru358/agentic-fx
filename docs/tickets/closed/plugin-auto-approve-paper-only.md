@@ -1,16 +1,16 @@
 ---
 id: plugin-auto-approve-paper-only
 title: plugin 自動承認モード (ペーパー限定の検討メモ)
-status: 設計待ち
+status: 見送り
 priority: 低
 kind: 機能
 opened: 2026-10-27
-closed: null
+closed: 2026-10-29
 related: [approval-base-identity-cas, plugin-naming-lifecycle-policy]
 ---
 # [plugin-auto-approve-paper-only] plugin 自動承認モード (ペーパー限定の検討メモ)
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
+**状態**: 見送り / **優先**: 低 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [approval-base-identity-cas, plugin-naming-lifecycle-policy]
 ## 経緯
 
 - 2026-10-27: 起票。
+- 2026-10-29: 見送り理由 — 採用は人間承認必須の絶対制約と全体設計 §604 に衝突する検討メモ

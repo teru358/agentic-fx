@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 低
 opened: 2026-10-03
 closed: null
-related: [full-suite-fd-over-1024-breaks-shell-tests]
+related: [full-suite-fd-over-1024-breaks-shell-tests, full-suite-from-repo-root-hangs-with-live-data]
 kind: 不具合
 ---
 # [supervisor-cleanup-test-leaks-36-fds] worker supervisor の cleanup テストが 1 回で fd を 36 本増やす
@@ -30,3 +30,4 @@ kind: 不具合
 
 - 2026-10-03: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [full-suite-fd-over-1024-breaks-shell-tests, full-suite-from-repo-root-hangs-with-live-data] — 2026-10-29 棚卸し: 関連を束ねる先に張る

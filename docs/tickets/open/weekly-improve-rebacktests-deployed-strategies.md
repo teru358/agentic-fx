@@ -6,7 +6,7 @@ priority: 中
 kind: 機能
 opened: 2026-10-25
 closed: null
-related: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, improve-feedback-structure]
+related: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, improve-feedback-structure, same-name-candidate-must-beat-deployed-baseline]
 ---
 # [weekly-improve-rebacktests-deployed-strategies] 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする
 
@@ -39,3 +39,4 @@ related: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, 
 
 - 2026-10-25: 起票。
 - 2026-10-25: 指揮者の意見 (定期評価として設計、主源はペーパー実績、ローリング判断、agent にはラベルだけ) をユーザーが了承、処置案に反映。
+- 2026-10-29: 関連: [improve-daily-params-weekly-algorithm, baseline-replay-unimplemented, improve-feedback-structure, same-name-candidate-must-beat-deployed-baseline] — 2026-10-29 棚卸し: 関連を束ねる先に張る
