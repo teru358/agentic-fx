@@ -27,8 +27,8 @@ from pathlib import Path
 
 import yaml
 
-from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 from agentic_fx.core import plugin_files
+from agentic_fx.plugin.reference_time import PLUGIN_TIMEFRAMES
 
 _log = logging.getLogger(__name__)
 
@@ -357,7 +357,7 @@ def _validate_config(raw: dict, name: str) -> dict | None:
                 return None
             max_age = ref.get("max_age")
             if max_age is not None:
-                from agentic_fx.plugin.reference import canonical_duration_seconds
+                from agentic_fx.plugin.reference_time import canonical_duration_seconds
                 try:
                     canonical_duration_seconds(max_age)
                 except ValueError:

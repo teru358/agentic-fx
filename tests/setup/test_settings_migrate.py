@@ -131,6 +131,19 @@ def test_v4_duplicate_watch_symbol_is_a_migration_error_without_editing():
     assert result.reason == "watch_symbols_duplicate"
 
 
+def test_v4_non_mt5_watch_symbols_have_a_fixed_migration_error_and_guidance():
+    old = (FIXTURES / "v4.yaml").read_text(encoding="utf-8").replace(
+        "watch_symbols: []", "watch_symbols: [JP225]", 1)
+
+    result = migrate(old)
+
+    assert not result.ok
+    assert result.text is None
+    assert result.reason == (
+        "watch_symbols_require_mt5_primary: datafeed.primary を mt5 にしてから "
+        "afx init を再実行してください。")
+
+
 def test_watch_symbols_require_mt5_are_disjoint_and_have_a_32_utf8_byte_limit():
     from agentic_fx.config import Settings
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))

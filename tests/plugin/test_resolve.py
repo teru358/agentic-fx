@@ -97,6 +97,26 @@ def test_self_pin_object_is_alias_sorted_and_byte_identical_to_the_legacy_payloa
             == json.dumps(expected, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
+def test_self_dependency_with_nondefault_coordinates_exposes_them_in_pin_payload(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")
+    strategy = _plugin(
+        tmp_path / "candidate", "s",
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
+        "max_bars: 200\nindicators:\n"
+        "  slow: {plugin: rsi, symbol: self, timeframe: 4h, max_age: 7d}\n",
+        _STRATEGY_PY)
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, rsi), settings=SETTINGS,
+                                      pin_mode="ignore")
+
+    assert resolved.pin_object()["slow"] == {
+        "plugin": "rsi", "content_hash": rsi.content_hash, "params": {"period": 14},
+        "symbol_mode": "self", "symbol": None, "timeframe": "4h",
+        "max_age_seconds": 604800,
+    }
+
+
 def test_resolver_canonicalizes_literal_reference_coordinates_and_default_age(tmp_path):
     root = tmp_path / "plugins"
     ema = _indicator(root, "ema", max_bars="max_bars: 500\n")

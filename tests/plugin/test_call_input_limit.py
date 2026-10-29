@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import secrets
+from types import SimpleNamespace
 
 import pytest
 
@@ -165,3 +166,32 @@ def test_shared_frame_one_byte_over_is_rejected(tmp_path, plugin_settings, write
         assert len(write_calls) == started
         out = session.call({"df": df, "params": {}, "frames": one})
         assert out["action"] == "hold"
+
+
+def test_call_encodes_the_request_once_before_measuring_and_writing(monkeypatch):
+    session = object.__new__(PluginSession)
+    session._dead = False
+    session._proc = object()
+    session._meta = SimpleNamespace(kind="signal")
+    session._settings = SimpleNamespace(sandbox_timeout_sec=10.0,
+                                        sandbox_output_max_bytes=1024)
+    session._check_no_stray_output = lambda: None
+    session._check_response_envelope = lambda *args, **kwargs: None
+    session._reap_worker = lambda: False
+    written = []
+    session._write_line = lambda data, *, deadline: written.append(data)
+    session._read_response = lambda *args: {"ok": True, "result": [], "id": "ignored"}
+    real_dumps = sandbox.json.dumps
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(args[0])
+        return real_dumps(*args, **kwargs)
+
+    monkeypatch.setattr(sandbox.json, "dumps", counted)
+    out = session._call_locked({"df": _df(), "params": {}})
+
+    assert out == {"signals": []}
+    assert len(calls) == 1
+    assert len(written) == 1
+    assert written[0].endswith(b"\n")

@@ -1,4 +1,8 @@
 from datetime import timedelta
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -54,6 +58,43 @@ def test_align_reference_is_fresh_at_boundary_and_stale_one_second_after():
                             max_age_seconds=3 * 3600)
     assert fresh.fresh is True
     assert stale.fresh is False
+
+
+def test_align_reference_uses_latest_end_even_when_input_is_reverse_sorted():
+    reference = pd.DataFrame(
+        {"close": [9.0, 8.0]},
+        index=pd.DatetimeIndex(["2026-10-26T09:00:00Z", "2026-10-26T08:00:00Z"]),
+    )
+
+    aligned = align_reference(reference, strategy_start=pd.Timestamp("2026-10-26T09:00:00Z"),
+                              strategy_timeframe="1h", reference_timeframe="1h",
+                              max_age_seconds=3600)
+
+    assert aligned.row_start == pd.Timestamp("2026-10-26T09:00:00Z")
+    assert aligned.age == timedelta(0)
+
+
+def test_align_reference_rejects_duplicate_reference_timestamps():
+    reference = pd.DataFrame(
+        {"close": [1.0, 2.0]},
+        index=pd.DatetimeIndex(["2026-10-26T09:00:00Z", "2026-10-26T09:00:00Z"]),
+    )
+
+    with pytest.raises(ValueError, match="must not contain duplicates"):
+        align_reference(reference, strategy_start=pd.Timestamp("2026-10-26T09:00:00Z"),
+                        strategy_timeframe="1h", reference_timeframe="1h",
+                        max_age_seconds=3600)
+
+
+def test_resolver_import_keeps_pandas_out_of_the_parent_process():
+    root = os.fspath(Path(__file__).resolve().parents[2] / "src")
+    result = subprocess.run(
+        [sys.executable, "-c", "import sys; import agentic_fx.plugin.resolve; "
+         "assert 'pandas' not in sys.modules"],
+        env={**os.environ, "PYTHONPATH": root}, text=True, capture_output=True,
+        check=False)
+
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(("strategy_tf", "rows", "reference_tf", "expected"), [

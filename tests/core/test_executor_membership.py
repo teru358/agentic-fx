@@ -6,14 +6,17 @@ from __future__ import annotations
 
 import pytest
 
-from agentic_fx.core.executor import ExecutionSnapshot, NotTradableSymbol
+from agentic_fx.core.executor import (
+    EXPOSURE_NOT_TRADABLE_REASON, ExecutionSnapshot, ExposureNotTradableSymbol,
+    NotTradableSymbol,
+)
 from agentic_fx.core.contracts import BrokerResult, OrderStatus
 from agentic_fx.loops.summary import trade_intent_schema
 from agentic_fx.store import orders
 
 from tests.core.test_executor_snapshot import (
     NOW, QUOTE, SETTINGS, SPECS, _insert_intent, _make_executor, _open_intent,
-    _rate_fn, _start_trade_mission,
+    _insert_open_order, _rate_fn, _start_trade_mission,
 )
 
 REFERENCE_PAIR = "JP225"
@@ -109,6 +112,24 @@ def test_gather_open_snapshot_refuses_before_any_io(tmp_path):
                                 exposure_pairs=["USDJPY"])
 
     _assert_untouched(ex, calls)
+
+
+def test_out_of_pairs_exposure_rejects_before_any_open_io_in_both_paths(tmp_path):
+    ex, calls = _executor(tmp_path)
+    _insert_open_order(ex.conn, REFERENCE_PAIR)
+    mid = _start_trade_mission(ex.conn)
+    intent = _open_intent(pair="USDJPY")
+    iid = _insert_intent(ex.conn, mid, intent)
+
+    out = ex._open(intent, iid)
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": [EXPOSURE_NOT_TRADABLE_REASON]}
+    assert calls.quote == calls.spec == calls.rate == calls.submit == []
+    with pytest.raises(ExposureNotTradableSymbol,
+                       match=EXPOSURE_NOT_TRADABLE_REASON):
+        ex.gather_open_snapshot(intent, exposure_pairs=[REFERENCE_PAIR])
+    assert calls.quote == calls.spec == calls.rate == calls.submit == []
 
 
 def test_open_from_snapshot_rejects_before_any_io(tmp_path):

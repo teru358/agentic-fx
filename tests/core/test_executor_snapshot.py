@@ -125,6 +125,7 @@ def test_gather_open_snapshot_covers_intent_pair_and_exposure_pairs(tmp_path):
     """gather_open_snapshot は intent.pair と exposure_pairs の両方の
     spec/通貨レートを含む。"""
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=["EURUSD"])
 
@@ -334,6 +335,7 @@ def test_open_risk_and_notional_from_snapshot_matches_live_version(tmp_path):
     (集計ロジックの逐語移植の pin)。"""
     from agentic_fx.core.executor import open_risk_and_notional
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     _insert_open_order(ex.conn, pair="USDJPY")
     _insert_open_order(ex.conn, pair="EURUSD")
     cycle_rate = ex.cycle_rate_fn(NOW)

@@ -97,6 +97,11 @@ class NotTradableSymbol(Exception):
 
 
 NOT_TRADABLE_REASON = "not_tradable_symbol"
+EXPOSURE_NOT_TRADABLE_REASON = "exposure_not_tradable_symbol"
+
+
+class ExposureNotTradableSymbol(Exception):
+    """既存 exposure に発注対象外の symbol が混在している。"""
 
 
 class SnapshotCoverageError(Exception):
@@ -546,8 +551,23 @@ class Executor:
         return {"result": "rejected", "order_id": None,
                 "reasons": [NOT_TRADABLE_REASON]}
 
+    def _reject_if_exposure_not_tradable(self, iid: int) -> dict | None:
+        pairs = {row["pair"] for row in orders.list_by_status(self.conn, *_EXPOSURE)}
+        if pairs <= set(self.settings.pairs):
+            return None
+        intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                      reject_reason=EXPOSURE_NOT_TRADABLE_REASON,
+                                      reject_category="execution")
+        self.activity.write(Category.TRADE, "gate_rejected",
+                            EXPOSURE_NOT_TRADABLE_REASON, ref_id=str(iid))
+        return {"result": "rejected", "order_id": None,
+                "reasons": [EXPOSURE_NOT_TRADABLE_REASON]}
+
     def _open(self, intent: TradeIntent, iid: int) -> dict:
         rejected = self._reject_if_not_tradable(intent, iid)
+        if rejected is not None:
+            return rejected
+        rejected = self._reject_if_exposure_not_tradable(iid)
         if rejected is not None:
             return rejected
         now = self.clock.now()
@@ -759,6 +779,8 @@ class Executor:
         """
         if intent.pair not in self.settings.pairs:
             raise NotTradableSymbol(NOT_TRADABLE_REASON)
+        if not set(exposure_pairs) <= set(self.settings.pairs):
+            raise ExposureNotTradableSymbol(EXPOSURE_NOT_TRADABLE_REASON)
         now = self.clock.now()
         budget = self.settings.worker.snapshot_max_age_sec
         check = self._make_deadline_checker(budget)

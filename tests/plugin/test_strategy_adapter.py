@@ -454,6 +454,27 @@ def test_sandbox_error_propagates_uncaught(tmp_path):
         src(_bar(H))
 
 
+def test_missing_reference_frame_skips_the_strategy_without_a_plugin_error(tmp_path):
+    from dataclasses import replace
+
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H, 61)
+    session = _FakeSession(raises=SandboxError("reference unavailable",
+                                               code="reference_unavailable"))
+    resolved = replace(_EMPTY, items=(
+        __import__("agentic_fx.plugin.resolve", fromlist=["ResolvedIndicator"]).ResolvedIndicator(
+            alias="ref", plugin_name="rsi", plugin_py=Path("/plugins/rsi/plugin.py"),
+            content_hash="a" * 64, params=("d", frozenset()), max_bars=200,
+            outputs=("v",), pinned=True, timeframe="4h", max_age_seconds=43200,
+            frame_id="self@4h"),))
+    src = strategy_adapter.build_intent_source(
+        _meta(timeframe="1h"), conn=conn, pair="USDJPY", dataset=DATASET_1M,
+        settings=SETTINGS, resolved=resolved, session=session)
+
+    assert src(_bar(H)) is None
+    assert len(session.calls) == 1
+
+
 # --- セッション所有権 (session=None は lazy 生成・自前 close。注入は所有しない) --
 
 class _RecordingSession:

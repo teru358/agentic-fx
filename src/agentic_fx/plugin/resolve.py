@@ -24,9 +24,9 @@ from typing import Any, Literal, Mapping
 import yaml
 
 from agentic_fx.plugin.loader import PluginMeta, _check_json_safe, content_hash
-from agentic_fx.plugin.reference import (canonical_duration_seconds,
-                                         nominal_reference_bars,
-                                         timeframe_seconds)
+from agentic_fx.plugin.reference_time import (canonical_duration_seconds,
+                                              nominal_reference_bars,
+                                              timeframe_seconds)
 
 # 展開後の canonical handshake 総 byte 数の上限 (設計書 §2.2、codex r5 C1)。
 # 既存 `sandbox._STARTUP_MAX_BYTES` (65536、worker → 親の起動応答) とは
@@ -116,15 +116,16 @@ class ResolvedIndicatorSet:
     def pin_object(self) -> dict:
         """承認・監査 payload 用の plain JSON object (alias 昇順)。
 
-        self dependency は既存 strategy の承認済み payload と同じ形を保つ。
-        literal reference だけが解決済みの入力座標を追加で公開する。
+        既定の self dependency は既存 strategy の承認済み payload と同じ形を保つ。
+        入力座標を変えた dependency は解決済みの座標を公開する。
         """
         payload: dict[str, dict] = {}
         for item in self.items:
             entry = {"plugin": item.plugin_name,
                      "content_hash": item.content_hash,
                      "params": thaw(item.params)}
-            if item.symbol_mode == "literal":
+            if (item.symbol_mode == "literal" or item.frame_id is not None
+                    or item.max_age_seconds != 3 * timeframe_seconds(item.timeframe)):
                 entry.update({"symbol_mode": item.symbol_mode,
                               "symbol": item.literal_symbol,
                               "timeframe": item.timeframe,

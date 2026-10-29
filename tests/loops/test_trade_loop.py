@@ -15,7 +15,8 @@ from agentic_fx.core.accounting import record_snapshot
 from agentic_fx.core.contracts import (
     ConversionRate, FixedClock, InstrumentSpec, Quote,
 )
-from agentic_fx.core.executor import Executor
+from agentic_fx.core.contracts import OrderStatus as S
+from agentic_fx.core.executor import Executor, NotTradableSymbol
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.datafeed.health import DataUnhealthy
@@ -24,7 +25,7 @@ from agentic_fx.loops.trade_loop import TradeLoop
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.store import mission_decision_bars, signals
+from agentic_fx.store import mission_decision_bars, orders, signals
 from agentic_fx.store.db import connect, init_db
 from agentic_fx.store.state import StateStore
 
@@ -93,6 +94,42 @@ def test_hold_mission_recorded(tmp_path):
     prompt = runner.missions[0].prompt
     assert "月末は控えめに" in prompt
     assert "現在の状態" in prompt
+
+
+def test_five_phase_not_tradable_snapshot_uses_the_shared_fixed_reason(tmp_path):
+    result = {"action": "open", "pair": "USDJPY", "direction": "long",
+              "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+              "take_profit": 149.0, "reasoning": "x"}
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", result, [])])
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: (
+        (_ for _ in ()).throw(NotTradableSymbol("not_tradable_symbol")))
+
+    out = loop.run_once()
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["not_tradable_symbol"]}
+    row = conn.execute("SELECT reject_reason, reject_category FROM trade_intents").fetchone()
+    assert dict(row) == {"reject_reason": "not_tradable_symbol",
+                         "reject_category": "execution"}
+    assert "not_tradable_symbol" in (tmp_path / "a.log").read_text(encoding="utf-8")
+
+
+def test_five_phase_out_of_pairs_exposure_uses_its_fixed_reason(tmp_path):
+    result = {"action": "open", "pair": "USDJPY", "direction": "long",
+              "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+              "take_profit": 149.0, "reasoning": "x"}
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult("completed", result, [])])
+    orders.insert(conn, pair="JP225", direction="long", entry_type="market",
+                  horizon="day", status=S.OPEN, now=NOW, quantity=0.1,
+                  remaining_quantity=0.0, requested_price=1.0, avg_fill_price=1.0,
+                  filled_quantity=0.1, stop_loss=0.5, take_profit=2.0,
+                  filled_at=NOW.isoformat())
+
+    out = loop.run_once()
+
+    assert out["reasons"] == ["exposure_not_tradable_symbol"]
+    assert conn.execute("SELECT reject_reason FROM trade_intents").fetchone()[0] == \
+        "exposure_not_tradable_symbol"
 
 
 def test_prompt_lists_context_timeframes_only_when_configured(tmp_path):

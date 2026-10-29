@@ -961,6 +961,7 @@ class PluginSession:
                 "content_hash": self._meta.content_hash,
                 "name": self._meta.name,
                 "kind": self._meta.kind,
+                "timeframe": self._meta.timeframe,
                 "indicators": indicator_specs,
             }
             # `outputs` は kind == "indicator" のときだけ載せる契約 (strategy / signal に
@@ -1065,7 +1066,10 @@ class PluginSession:
         待って分類する。書き切れないまま期限が切れたら、読取の期限切れと同じく
         `sandbox_startup_timeout` (load をまだ送り切っていないので)。"""
         try:
-            self._write_line(obj, deadline=deadline)
+            data = json.dumps(obj).encode("utf-8") + b"\n"
+            self._write_line(data, deadline=deadline)
+        except (TypeError, ValueError) as exc:
+            raise SandboxError(f"failed to serialize request: {exc}") from exc
         except _WriteDeadlineExpired:
             raise self._deadline_expired(_STARTUP_TIMEOUT_SEC) from None
         except OSError as exc:
@@ -1149,7 +1153,9 @@ class PluginSession:
         request_id = secrets.token_hex(8)
         # close の要求と応答の待ちで 1 つの deadline を共有する
         deadline = time.monotonic() + self._settings.sandbox_timeout_sec
-        self._write_line({"op": "close", "id": request_id}, deadline=deadline)
+        self._write_line(
+            json.dumps({"op": "close", "id": request_id}).encode("utf-8") + b"\n",
+            deadline=deadline)
         response = self._read_response(_remaining(deadline),
                                        _STARTUP_MAX_BYTES)
         self._check_response_envelope(response, request_id,
@@ -1287,16 +1293,10 @@ class PluginSession:
         # (`sandbox_timeout_sec` が call 全体の上限)
         deadline = time.monotonic() + self._settings.sandbox_timeout_sec
         try:
-            self._write_line(request, deadline=deadline)
+            self._write_line(call_input, deadline=deadline)
         except _WriteDeadlineExpired:
             # load の後なので、読取の期限切れと同じ `timeout`
             raise self._deadline_expired(self._settings.sandbox_timeout_sec) from None
-        except SandboxError:
-            # `_write_line` 内の json.dumps 失敗 (payload に numpy スカラー
-            # 等シリアライズ不能な値が混入) — 実際にはまだ何もパイプへ
-            # 書き込んでいないため、セッションは継続利用可能 (レビュー
-            # fix round 1 F5)。
-            raise
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
@@ -1321,10 +1321,13 @@ class PluginSession:
         self._check_response_envelope(
             response, request_id, allowed=frozenset({"ok", "result", "error", "pid", "id"}))
         if not response["ok"]:
-            self.error_code = "plugin_error"
+            code = ("reference_unavailable"
+                    if response.get("error") == "ValueError: reference_unavailable"
+                    else "plugin_error")
+            self.error_code = code
             raise SandboxError(
                 untrusted_text(response.get("error"), fallback="unknown plugin error"),
-                code="plugin_error")
+                code=code)
         if self._reap_worker():
             # 応答の後に死んでいた worker の結果は使わない
             self._dead = True
@@ -1351,14 +1354,9 @@ class PluginSession:
 
     # -- IPC 詳細 --
 
-    def _write_line(self, obj: dict[str, Any], *, deadline: float) -> None:
-        """1 行書き込む。**例外の型で「シリアライズ失敗 (書き込み前、
-        セッション継続可)」と「I/O 失敗 (壊れたパイプ、セッション死亡)」
-        を呼び出し元が区別できるようにする** (レビュー fix round 1 F5):
-        `json.dumps` が `TypeError`/`ValueError` (payload に numpy スカラー
-        等シリアライズ不能な値が混入) を出したら `SandboxError` として
-        送出し、実際のパイプ書き込みで失敗したら `OSError` をそのまま
-        伝播させる (呼び出し元の `call()`/`__enter__` が使い分ける)。
+    def _write_line(self, data: bytes, *, deadline: float) -> None:
+        """1 行書き込む。呼び出し元が一度だけ JSON 化した byte 列を書き込む。実際のパイプ
+        書き込みで失敗したら `OSError` をそのまま伝播させる。
 
         stdin は non-blocking にしてあり、書ける分だけ書いて POLLOUT を待つ。worker が
         stdin を読まずに pipe が埋まっても、`deadline` を過ぎれば
@@ -1367,10 +1365,6 @@ class PluginSession:
         assert self._proc is not None
         self._ensure_pipe_ownership()
         assert self._stdin_fd is not None
-        try:
-            data = json.dumps(obj).encode("utf-8") + b"\n"
-        except (TypeError, ValueError) as exc:
-            raise SandboxError(f"failed to serialize request: {exc}") from exc
         fd = self._stdin_fd
         view = memoryview(data)
         poller: Any = None

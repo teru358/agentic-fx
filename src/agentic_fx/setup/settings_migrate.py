@@ -169,6 +169,10 @@ def _migrate_four_to_five(text: str) -> EditResult:
             return _failure("watch_symbols_duplicate")
         if set(watch) & set(pairs if isinstance(pairs, list) else []):
             return _failure("watch_symbols_overlap")
+        if watch and datafeed.get("primary") != "mt5":
+            return _failure(
+                "watch_symbols_require_mt5_primary: datafeed.primary を mt5 にしてから "
+                "afx init を再実行してください。")
     lines = text.splitlines(keepends=True)
     marker = next((i for i, line in enumerate(lines) if _VERSION_FOUR_LINE.fullmatch(line)), None)
     if marker is None:

@@ -2,38 +2,15 @@
 from __future__ import annotations
 
 import math
-import re
 from dataclasses import dataclass
 from datetime import timedelta
 
 import pandas as pd
 
-_DURATION = re.compile(r"^([1-9][0-9]*)([smhd])$")
-_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-_TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600,
-                      "4h": 14400, "1d": 86400}
-
-
-def canonical_duration_seconds(value: object) -> int:
-    if not isinstance(value, str):
-        raise ValueError("reference_duration_invalid")
-    match = _DURATION.fullmatch(value)
-    if match is None:
-        raise ValueError("reference_duration_invalid")
-    return int(match.group(1)) * _SECONDS[match.group(2)]
-
-
-def timeframe_seconds(timeframe: str) -> int:
-    try:
-        return _TIMEFRAME_SECONDS[timeframe]
-    except KeyError as exc:
-        raise ValueError(f"reference_timeframe_invalid:{timeframe}") from exc
-
-
-def nominal_reference_bars(strategy_max_bars: int, strategy_timeframe: str,
-                           reference_timeframe: str) -> int:
-    return math.ceil(((strategy_max_bars - 1) * timeframe_seconds(strategy_timeframe))
-                     / timeframe_seconds(reference_timeframe)) + 1
+from agentic_fx.plugin.reference_time import (
+    canonical_duration_seconds, native_reference_bars, nominal_reference_bars,
+    timeframe_seconds,
+)
 
 
 def actual_reference_bars(decision_first: pd.Timestamp, decision_last: pd.Timestamp,
@@ -55,15 +32,6 @@ def runtime_reference_window_reason(actual_bars: int, *, max_bars: int) -> str |
         raise ValueError("reference bar counts must be positive")
     return ("reference_window_exceeded_at_runtime"
             if actual_bars > max_bars else None)
-
-
-def native_reference_bars(actual_bars: int, reference_timeframe: str,
-                          native_timeframe: str) -> int:
-    """Return native rows needed to form ``actual_bars`` complete effective rows."""
-    if actual_bars < 1:
-        raise ValueError("actual_bars must be positive")
-    return math.ceil(actual_bars * timeframe_seconds(reference_timeframe)
-                     / timeframe_seconds(native_timeframe))
 
 
 def complete_reference_buckets(native: pd.DataFrame, *,
@@ -127,14 +95,20 @@ def align_reference(reference: pd.DataFrame, *, strategy_start: pd.Timestamp,
     if decision.tz is None:
         raise ValueError("strategy_start must be timezone-aware")
     decision += pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
+    reference = reference.sort_index()
     index = reference.index
     if not isinstance(index, pd.DatetimeIndex) or index.tz is None:
         raise ValueError("reference index must be timezone-aware DatetimeIndex")
+    if index.has_duplicates:
+        raise ValueError("reference index must not contain duplicates")
+    index = reference.index
     ends = index + pd.Timedelta(seconds=timeframe_seconds(reference_timeframe))
     eligible = ends <= decision
     if not eligible.any():
         return AlignedReference(None, decision, None, None, False)
-    position = eligible.nonzero()[0][-1]
+    position = ends.argmax()
+    if not eligible[position]:
+        position = eligible.nonzero()[0][ends[eligible].argmax()]
     end = ends[position]
     age = decision - end
     return AlignedReference(index[position], decision, end, age,

@@ -151,6 +151,25 @@ def _write_line(fd: int, obj: dict[str, Any]) -> None:
         view = view[n:]
 
 
+def _align_indicator_to_main(value, *, source, main_index, strategy_timeframe,
+                             reference_timeframe, max_age_seconds):
+    import pandas as pd
+
+    from agentic_fx.plugin.reference import align_reference
+
+    aligned = []
+    for strategy_start in main_index:
+        selected = align_reference(
+            source, strategy_start=strategy_start,
+            strategy_timeframe=strategy_timeframe,
+            reference_timeframe=reference_timeframe,
+            max_age_seconds=max_age_seconds)
+        aligned.append(
+            value.loc[selected.row_start]
+            if selected.fresh and selected.row_start in value.index else float("nan"))
+    return pd.Series(aligned, index=main_index, dtype="float64")
+
+
 def _load_error_text(exc: BaseException) -> str:
     cause = exc.__cause__
     if isinstance(exc, worker_isolation.PluginLoadError) and cause is not None:
@@ -184,6 +203,8 @@ def _load_plugins(isolated: "worker_isolation.IsolatedWorker",
             "alias": record.alias, "compute": getattr(dep_module, "compute"),
             "params": spec["params"], "max_bars": int(spec["max_bars"]),
             "outputs": tuple(spec["outputs"]), "frame_id": spec.get("frame_id"),
+            "timeframe": spec.get("timeframe"),
+            "max_age_seconds": spec.get("max_age_seconds"),
             "plugin_name": spec.get("plugin_name")})
     return fn, deps
 
@@ -259,7 +280,10 @@ def main() -> None:
                           for name, wire in (request.get("frames") or {}).items()}
                 indicators = {}
                 for dep in deps:
-                    source = df if dep.get("frame_id") is None else frames[dep["frame_id"]]
+                    frame_id = dep.get("frame_id")
+                    if frame_id is not None and frame_id not in frames:
+                        raise ValueError("reference_unavailable")
+                    source = df if frame_id is None else frames[frame_id]
                     sub_df = source.tail(dep["max_bars"]).copy(deep=True)
                     before = sub_df.copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
@@ -269,7 +293,13 @@ def main() -> None:
                         validate_indicator_result(
                             raw, df_index=sub_df.index, outputs=dep["outputs"]))
                     indicators[dep["alias"]] = {
-                        key: (value.reindex(df.index)
+                        key: (_align_indicator_to_main(
+                            value, source=sub_df, main_index=df.index,
+                            strategy_timeframe=handshake["timeframe"],
+                            reference_timeframe=dep["timeframe"],
+                            max_age_seconds=dep["max_age_seconds"])
+                              if isinstance(value, pd.Series) and frame_id is not None
+                              else value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)
                         for key, value in validated.items()}
                 # indicator が pandas/numpy の process 全体の状態を変えていないこと

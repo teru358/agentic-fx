@@ -158,6 +158,8 @@ def test_gather_open_snapshot_completes_when_within_budget(tmp_path):
     calls, quote_fn, spec_fn, rate_fn = _recording_stubs(mono, leg_costs={})
     ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
                         spec_fn=spec_fn, rate_fn=rate_fn)
+    ex.settings = ex.settings.model_copy(
+        update={"pairs": ["USDJPY", "EURUSD", "GBPUSD"]})
     intent = _open_intent("USDJPY")
 
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
@@ -176,6 +178,8 @@ def test_gather_open_snapshot_boundary_exact_budget_still_succeeds(tmp_path):
         mono, leg_costs={"quote:USDJPY": BUDGET})
     ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
                         spec_fn=spec_fn, rate_fn=rate_fn)
+    ex.settings = ex.settings.model_copy(
+        update={"pairs": ["USDJPY", "EURUSD", "GBPUSD"]})
     intent = _open_intent("USDJPY")
 
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
@@ -192,6 +196,8 @@ def test_gather_open_snapshot_aborts_before_spec_of_intent_pair(tmp_path):
         mono, leg_costs={"quote:USDJPY": BUDGET + 0.1})
     ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
                         spec_fn=spec_fn, rate_fn=rate_fn)
+    ex.settings = ex.settings.model_copy(
+        update={"pairs": ["USDJPY", "EURUSD", "GBPUSD"]})
     intent = _open_intent("USDJPY")
 
     with pytest.raises(DataUnhealthy, match="deadline exceeded"):
@@ -210,6 +216,8 @@ def test_gather_open_snapshot_aborts_before_second_exposure_pair_spec(tmp_path):
         mono, leg_costs={"spec:EURUSD": BUDGET + 0.1})
     ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
                         spec_fn=spec_fn, rate_fn=rate_fn)
+    ex.settings = ex.settings.model_copy(
+        update={"pairs": ["USDJPY", "EURUSD", "GBPUSD"]})
     intent = _open_intent("USDJPY")
 
     with pytest.raises(DataUnhealthy, match="deadline exceeded"):
@@ -502,6 +510,8 @@ def test_gather_open_snapshot_aborts_before_first_exposure_pair_spec(tmp_path):
         mono, leg_costs={"spec:USDJPY": BUDGET + 0.1})
     ex = _make_executor(tmp_path, monotonic_fn=mono, quote_fn=quote_fn,
                         spec_fn=spec_fn, rate_fn=rate_fn)
+    ex.settings = ex.settings.model_copy(
+        update={"pairs": ["USDJPY", "EURUSD", "GBPUSD"]})
     intent = _open_intent("USDJPY")
 
     with pytest.raises(DataUnhealthy, match="deadline exceeded"):

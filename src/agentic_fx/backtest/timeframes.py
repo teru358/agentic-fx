@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from agentic_fx.datafeed.bars import pandas_rule, resample
+from agentic_fx.plugin.reference_time import PLUGIN_TIMEFRAMES
 from agentic_fx.store.ohlcv import IMPORT_SOURCES, LIVE_SOURCES
 
 
@@ -50,8 +51,6 @@ RESAMPLE_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 # 拡張が要るため本プランでは不可。将来の拡張点はこの定数 +
 # RESAMPLE_TIMEFRAMES/TF_MINUTES + signals store の CASE 式 (Task 7) の
 # 3 箇所に集約されている (5m 追加は小 task 1 個で可能な設計)。
-PLUGIN_TIMEFRAMES = ("15m", "1h", "4h", "1d")
-
 TF_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
 
 assert set(TF_MINUTES) == set(RESAMPLE_TIMEFRAMES)
