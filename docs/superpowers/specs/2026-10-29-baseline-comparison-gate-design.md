@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.5 C0 (裁定済、実装着手) (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.5.1 C0 (裁定済、実装中) (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -210,3 +210,4 @@ comparison = {
 | 2026-10-29 | v0.3.1 C0 | `unavailable` の 2 種 (再生失敗 = baseline 0 行 / 非 evaluable = 完全な baseline 行を保持) を §3.4 と AC 6 で分ける | 設計レビュー 3 周目 (sol、Important 1) | |
 | 2026-10-29 | v0.4 C0 | J5 をユーザー裁定で改訂: `improved` のとき Discord に holdout の 4 項目を候補 / 配備中の版で出す (§2、AC 11、§8) | ユーザー要望 | |
 | 2026-10-29 | v0.5 C0 | J1〜J4・J6 をユーザー裁定済 (推奨どおり) に | ユーザー承認、実装着手 | |
+| 2026-10-29 | v0.5.1 C0 | T1 レビュー 1 周目 (/code-review) の追従: 壁時計は各 sandbox 呼び出しの前だけで判定し完走した結果は捨てない (§3.6)、pair 別 verdict の優先順位は not_improved > improved > unavailable (§3.3)、gate は baseline 行を verdict の `baseline_rows` で返し T2 が終端 tx で永続化 (§3.4 の checkpoint)、`comparison.reason` の固定語 7 種 (holdout_exceeds / holdout_not_exceeds / baseline_not_evaluable / candidate_not_evaluable / baseline_unhealthy / gate_timeout / no_pairs) を §4 に | T1 実装とレビュー | |
