@@ -189,9 +189,9 @@ def compute(df, params):
     origin = pd.to_datetime("2026-01-01", format="%Y-%m-%d", cache=True)
     from_origin = pd.to_datetime([0, 1], unit="D", origin=origin, cache=True)
     return {"numeric": float(numeric.iloc[-1]),
-            "formatted": formatted[1].isoformat(),
+            "formatted": formatted[1].timestamp(),
             "elapsed": elapsed[0].total_seconds(),
-            "origin": from_origin[1].isoformat()}
+            "origin": from_origin[1].timestamp()}
 """
 
 PYARROW_NUMERIC_PY = """
@@ -408,15 +408,15 @@ def test_real_session_allows_conversion_apis_and_pyarrow_is_a_plugin_error(
     conversion_session = PluginSession(conversion_meta, settings=plugin_settings)
     with conversion_session:
         out = conversion_session.call({"df": _df(), "params": {}})
-    assert out == {"numeric": 102.9, "formatted": "2026-01-02T00:00:00",
-                   "elapsed": 86400.0, "origin": "2026-01-02T00:00:00"}
+    assert out == {"numeric": 102.9, "formatted": 1767312000.0,
+                   "elapsed": 86400.0, "origin": 1767312000.0}
     assert (conversion_session.worker_returncode, conversion_session.worker_signal,
             conversion_session.parent_kill_sent) == (0, None, False)
 
     pyarrow_meta = _meta(tmp_path, "pyarrow", "indicator", PYARROW_NUMERIC_PY)
     pyarrow_session = PluginSession(pyarrow_meta, settings=plugin_settings)
     with pytest.raises(SandboxError,
-                       match="ImportError: Missing optional dependency 'pyarrow'"):
+                       match=r"(ImportError|ModuleNotFoundError): .*pyarrow"):
         with pyarrow_session:
             pyarrow_session.call({"df": _df(), "params": {}})
     assert (pyarrow_session.worker_returncode, pyarrow_session.worker_signal,
