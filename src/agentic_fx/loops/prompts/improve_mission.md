@@ -121,7 +121,7 @@
    self-test で検証してください。過去の note にある signal 照合や
    `get_signals` 相当の tool の要望は、この制約によって解消済みです。
    それに従って tool を探したり、同じ要望を再記録したりしないでください。
-9. plugin のコードでは `read_` / `to_` で始まる名前は使えません。`to_` の例外は {sandbox_to_allowed} です。
+9. plugin のコードでは `read_` / `to_` で始まる名前と、固定の禁止名 {sandbox_denied_names} は使えません (変数名・引数名・関数定義名・from-import にも及びます)。`to_` の例外は {sandbox_to_allowed} です。
 
 ## 最終出力
 

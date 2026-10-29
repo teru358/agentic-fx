@@ -192,6 +192,16 @@ _TO_ALLOWED = frozenset({
 })
 
 
+def allowed_to_conversions() -> tuple[str, ...]:
+    """plugin コードで使える `to_` 名をソート済みで返す。"""
+    return tuple(sorted(_TO_ALLOWED))
+
+
+def denied_names() -> tuple[str, ...]:
+    """plugin コードで使えない固定名をソート済みで返す。"""
+    return tuple(sorted(_DENY_NAMES))
+
+
 def _is_denied_bare_name(name: str) -> bool:
     """`read_`/`to_` 接頭辞規則 + 固定 denylist 集合を 1 箇所に統一した
     判定 (レビュー fix round 1 F1)。**`ast.Attribute.attr`・`ast.Name.id`

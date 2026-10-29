@@ -23,8 +23,9 @@ import pytest
 from agentic_fx.config import load_settings
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import (
-    SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
-    PluginSession, reap_orphans,
+    PluginSession, SandboxError, _SINGLE_THREAD_ENV, _build_env,
+    allowed_to_conversions, check_source, denied_names, reap_orphans,
+    inherited_filter_preflight, run_plugin,
 )
 
 
@@ -174,6 +175,32 @@ PRINT_THEN_COMPUTE_PY = """
 def compute(df, params):
     print("x" * 100_000)
     return {"x": 1.0}
+"""
+
+CONVERSION_APIS_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    numeric = pd.to_numeric(df["close"], errors="raise")
+    formatted = pd.to_datetime(
+        ["2026-01-01", "2026-01-02"], format="%Y-%m-%d", cache=True)
+    elapsed = pd.to_timedelta(["1 day"], errors="raise")
+    origin = pd.to_datetime("2026-01-01", format="%Y-%m-%d", cache=True)
+    from_origin = pd.to_datetime([0, 1], unit="D", origin=origin, cache=True)
+    return {"numeric": float(numeric.iloc[-1]),
+            "formatted": formatted[1].isoformat(),
+            "elapsed": elapsed[0].total_seconds(),
+            "origin": from_origin[1].isoformat()}
+"""
+
+PYARROW_NUMERIC_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    values = pd.to_numeric(df["close"], dtype_backend="pyarrow")
+    return {"value": float(values.iloc[-1])}
 """
 
 
@@ -334,10 +361,7 @@ def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
     check_source(src)  # 例外を投げなければ OK
 
 
-@pytest.mark.parametrize("name", [
-    "to_datetime", "to_dict", "to_list", "to_numeric", "to_numpy",
-    "to_pydatetime", "to_timedelta",
-])
+@pytest.mark.parametrize("name", allowed_to_conversions())
 @pytest.mark.parametrize("source", [
     "import pandas as pd\n"
     "def compute(df, params):\n"
@@ -356,6 +380,47 @@ def test_check_source_allows_pure_conversions_across_ast_name_paths(
     src = tmp_path / "ok.py"
     src.write_text(source.format(name=name))
     check_source(src)
+
+
+def test_sandbox_name_rule_accessors_are_sorted_and_complete():
+    assert allowed_to_conversions() == tuple(sorted(allowed_to_conversions()))
+    assert denied_names() == tuple(sorted(denied_names()))
+    assert set(allowed_to_conversions()).isdisjoint(denied_names())
+    assert {"open", "getattr", "set_option"}.issubset(denied_names())
+
+
+def test_conversion_api_plugin_sources_pass_static_sandbox_validation(tmp_path):
+    conversion_path = tmp_path / "conversions.py"
+    conversion_path.write_text(CONVERSION_APIS_PY)
+    pyarrow_path = tmp_path / "pyarrow.py"
+    pyarrow_path.write_text(PYARROW_NUMERIC_PY)
+
+    check_source(conversion_path)
+    check_source(pyarrow_path)
+
+
+def test_real_session_allows_conversion_apis_and_pyarrow_is_a_plugin_error(
+        tmp_path, plugin_settings):
+    reason = inherited_filter_preflight()
+    if reason is not None:
+        pytest.skip(f"requires a runnable PluginSession sandbox ({reason})")
+    conversion_meta = _meta(tmp_path, "conversions", "indicator", CONVERSION_APIS_PY)
+    conversion_session = PluginSession(conversion_meta, settings=plugin_settings)
+    with conversion_session:
+        out = conversion_session.call({"df": _df(), "params": {}})
+    assert out == {"numeric": 102.9, "formatted": "2026-01-02T00:00:00",
+                   "elapsed": 86400.0, "origin": "2026-01-02T00:00:00"}
+    assert (conversion_session.worker_returncode, conversion_session.worker_signal,
+            conversion_session.parent_kill_sent) == (0, None, False)
+
+    pyarrow_meta = _meta(tmp_path, "pyarrow", "indicator", PYARROW_NUMERIC_PY)
+    pyarrow_session = PluginSession(pyarrow_meta, settings=plugin_settings)
+    with pytest.raises(SandboxError,
+                       match="ImportError: Missing optional dependency 'pyarrow'"):
+        with pyarrow_session:
+            pyarrow_session.call({"df": _df(), "params": {}})
+    assert (pyarrow_session.worker_returncode, pyarrow_session.worker_signal,
+            pyarrow_session.parent_kill_sent) == (0, None, False)
 
 
 @pytest.mark.parametrize("name", [
