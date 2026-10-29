@@ -324,7 +324,7 @@ def test_check_source_rejects_function_named_with_denied_prefix(tmp_path):
 
 
 def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
-    """`to_numpy` は許可 4 種の 1 つ — from-import で持ち込んでも拒否
+    """`to_numpy` は許可リストの 1 つ — from-import で持ち込んでも拒否
     されないことのピン (実在の pandas API では無い名前だが、
     `check_source` は AST のみを見て実行はしないため合成できる)。"""
     src = tmp_path / "ok.py"
@@ -332,6 +332,55 @@ def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
         "from pandas import to_numpy\n"
         "def compute(df, params):\n    return {}\n")
     check_source(src)  # 例外を投げなければ OK
+
+
+@pytest.mark.parametrize("name", [
+    "to_datetime", "to_dict", "to_list", "to_numeric", "to_numpy",
+    "to_pydatetime", "to_timedelta",
+])
+@pytest.mark.parametrize("source", [
+    "import pandas as pd\n"
+    "def compute(df, params):\n"
+    "    return pd.{name}(df['close'])\n",
+    "def compute(df, params):\n"
+    "    return {name}\n",
+    "def {name}(df, params):\n"
+    "    return {{}}\n",
+    "from pandas import {name}\n"
+    "def compute(df, params):\n"
+    "    return {{}}\n",
+])
+def test_check_source_allows_pure_conversions_across_ast_name_paths(
+        tmp_path, name, source):
+    """許可された変換名は Attribute/Name/定義/from-import で一貫して通る。"""
+    src = tmp_path / "ok.py"
+    src.write_text(source.format(name=name))
+    check_source(src)
+
+
+@pytest.mark.parametrize("name", [
+    "read_csv", "load", "to_csv", "to_pickle", "to_sql", "to_parquet",
+    "to_hdf",
+])
+@pytest.mark.parametrize("source", [
+    "import pandas as pd\n"
+    "def compute(df, params):\n"
+    "    return pd.{name}(df['close'])\n",
+    "def compute(df, params):\n"
+    "    return {name}\n",
+    "def {name}(df, params):\n"
+    "    return {{}}\n",
+    "from pandas import {name}\n"
+    "def compute(df, params):\n"
+    "    return {{}}\n",
+])
+def test_check_source_rejects_denied_names_across_ast_name_paths(
+        tmp_path, name, source):
+    """read_、固定 denylist、書出し to_ は全 AST 経路で一貫して拒否する。"""
+    src = tmp_path / "bad.py"
+    src.write_text(source.format(name=name))
+    with pytest.raises(SandboxError, match=name):
+        check_source(src)
 
 
 # --- レビュー fix round 1 F4: ExcelWriter/HDFStore/dump denylist 補完 ----

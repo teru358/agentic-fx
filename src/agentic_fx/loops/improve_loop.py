@@ -43,6 +43,7 @@ from agentic_fx.loops.improve_context import (
     NOT_SUBMITTED_LAST_RESULT, NOT_SUBMITTED_ORIGINS, build_improve_context,
     family_redirect_last_result, family_redirect_reason,
     render_family_attempts)
+from agentic_fx.plugin.sandbox import _TO_ALLOWED
 from agentic_fx.core.improve_repeat import render_oneoff_section
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
@@ -1205,6 +1206,8 @@ class ImproveLoop:
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
             "source_snapshot_dir": str(ctx.source_snapshot_dir),
+            "sandbox_to_allowed": ", ".join(
+                f"`{name}`" for name in sorted(_TO_ALLOWED)),
             # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
             # 文言は settings からレンダする (ハードコードすると設定変更後
             # にゲートと説明が食い違う)。
