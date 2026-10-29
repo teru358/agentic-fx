@@ -78,6 +78,10 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # 再生失敗のうち `unavailable` に倒したときの `SandboxError.code`
     # (承認 payload には載せない、運用ログ用)。
     baseline_failure_code: str = ""
+    # 配備中の版の再生で得た行 (`variant="baseline"`)。再生が最後まで成功した
+    # ときだけ入り、gate は `record_fn` へ流さない。永続化は呼び出し側が
+    # 候補の行と同じ終端 tx で行う。
+    baseline_rows: tuple[dict, ...] = ()
 
 
 def _floor_fail_items(
@@ -203,6 +207,10 @@ class _DeadlineSource:
         return self._inner(closed_bar)
 
     def __getattr__(self, attr):
+        # `_inner` が未設定の状態 (copy / unpickle) で自分自身を引き直して
+        # 無限再帰しないよう、`_` 始まりは委譲しない。
+        if attr.startswith("_"):
+            raise AttributeError(attr)
         return getattr(self._inner, attr)
 
 
@@ -210,8 +218,9 @@ def _project(m: dict) -> dict:
     return {k: m.get(k) for k in _COMPARE_METRIC_KEYS}
 
 
-def _build_comparison(*, pairs: list[str], candidate: dict[str, dict],
-                      deployed: dict[str, dict]) -> dict:
+def _build_comparison(*, pairs: list[str], stage: dict) -> dict:
+    """`stage` は `{"candidate": {pair: 指標}, "deployed": {pair: 指標}}`。"""
+    candidate, deployed = stage["candidate"], stage["deployed"]
     return {
         pair: {"candidate": _project(candidate[pair]),
                "deployed": _project(deployed[pair]),
@@ -224,28 +233,32 @@ def _unavailable_comparison(mode: str, reason: str) -> dict:
             "stages": {"holdout": {}, "in_sample": {}}}
 
 
-def _decide_comparison(*, mode: str, pairs: list[str], in_sample_c: dict,
-                       in_sample_d: dict, holdout_c: dict,
-                       holdout_d: dict) -> dict:
-    stages = {
-        "holdout": _build_comparison(
-            pairs=pairs, candidate=holdout_c, deployed=holdout_d),
+def _decide_comparison(*, mode: str, pairs: list[str],
+                       stages: dict) -> dict:
+    """`stages` は `{"in_sample"|"holdout": {"candidate": {...},
+    "deployed": {...}}}`。決定段は holdout。明確に劣る pair が 1 つでも
+    あれば、他の pair が比較不能でも `not_improved` (比較不能が通す側に
+    倒れて劣る候補を通さないため)。"""
+    built = {
+        "holdout": _build_comparison(pairs=pairs, stage=stages["holdout"]),
         "in_sample": _build_comparison(
-            pairs=pairs, candidate=in_sample_c, deployed=in_sample_d)}
-    verdicts = [stages["holdout"][p]["verdict"] for p in pairs]
+            pairs=pairs, stage=stages["in_sample"])}
+    verdicts = [built["holdout"][p]["verdict"] for p in pairs]
     if not verdicts:
         verdict, reason = "unavailable", "no_pairs"
+    elif "not_improved" in verdicts:
+        verdict, reason = "not_improved", "holdout_not_exceeds"
     elif "unavailable" in verdicts:
-        base_short = any(not holdout_d[p].get("evaluable") for p in pairs)
+        base_short = any(
+            not stages["holdout"]["deployed"][p].get("evaluable")
+            for p in pairs)
         verdict = "unavailable"
         reason = ("baseline_not_evaluable" if base_short
                   else "candidate_not_evaluable")
-    elif all(v == "improved" for v in verdicts):
-        verdict, reason = "improved", "holdout_exceeds"
     else:
-        verdict, reason = "not_improved", "holdout_not_exceeds"
+        verdict, reason = "improved", "holdout_exceeds"
     return {"mode": mode, "verdict": verdict, "reason": reason,
-            "stages": stages}
+            "stages": built}
 
 
 def floor_settings_kv(gate_settings: "ImproveGateSettings") -> str:
@@ -386,8 +399,9 @@ def evaluate_strategy_adoption_gate(
     比較なし (従来どおり)。契約検査は床より前、再生は床通過の後。
     `baseline_replay_wall_clock_max_sec` は床通過直後に始まり、配備中の
     版の再生だけに掛かる (候補の床は打ち切らない)。配備中の版の行は
-    再生が最後まで成功したときだけ `record_fn` へ流す。失敗・超過では
-    1 行も流さない。"""
+    `record_fn` へ流さず verdict の `baseline_rows` に載せて返す (再生が
+    最後まで成功したときだけ。失敗・超過では空)。契約違反は
+    `evaluable=False`、`floor_reason=same_name_contract_changed` で返す。"""
     if kind != "strategy":
         return None
     if compare_mode not in ("off", "shadow", "enforce"):
@@ -454,9 +468,11 @@ def evaluate_strategy_adoption_gate(
     if deployed_meta is not None and (
             deployed_meta.timeframe != timeframe
             or set(deployed_meta.pairs) != set(pairs)):
+        # 既存の呼び出し側は `evaluable` で fail closed になる。
         return StrategyGateVerdict(
-            evaluable=True, baseline_variant="baseline",
+            evaluable=False, baseline_variant="baseline",
             baseline_row={"ref_plugin_ref": plugin_ref, "variant": "baseline"},
+            floor_reason=SAME_NAME_CONTRACT_CHANGED,
             contract_violation=SAME_NAME_CONTRACT_CHANGED)
 
     # no_strategy baseline (§4.2-4): 候補の in-sample 行 (pair ごと) の
@@ -574,16 +590,17 @@ def evaluate_strategy_adoption_gate(
         baseline_row = {"ref_plugin_ref": plugin_ref, "variant": "baseline"}
         comparison = None
         failure_code = ""
+        replay_rows: list[dict] = []
         if deployed_meta is not None and not floor_reason:
             baseline_row["base_content_hash"] = deployed_meta.content_hash
-            comparison, failure_code = _compare_with_deployed(
+            comparison, failure_code, replay_rows = _compare_with_deployed(
                 deployed_meta, inventory=inventory, mode=compare_mode,
                 conn=conn, history_conn=history_conn, settings=settings,
                 dataset=dataset, pairs=list(pairs), now=now,
                 plugin_ref=plugin_ref, candidate_hash=content_hash,
-                eval_timeframe=eval_timeframe, in_sample_c=per_pair,
-                holdout_c=holdout_per_pair, run_in_sample=run_in_sample,
-                run_holdout=run_holdout, record_fn=record_fn,
+                eval_timeframe=eval_timeframe,
+                candidate={"in_sample": per_pair, "holdout": holdout_per_pair},
+                run_in_sample=run_in_sample, run_holdout=run_holdout,
                 notify=_notify, cpu_samples=cpu_samples,
                 max_sec=baseline_replay_wall_clock_max_sec, clock=clock)
         return StrategyGateVerdict(
@@ -594,7 +611,8 @@ def evaluate_strategy_adoption_gate(
             comparison=comparison,
             not_improved=bool(
                 comparison and comparison["verdict"] == "not_improved"),
-            baseline_failure_code=failure_code)
+            baseline_failure_code=failure_code,
+            baseline_rows=tuple(replay_rows))
 
     for row in in_sample_rows:
         no_strategy_row = dict(row)
@@ -623,23 +641,25 @@ def evaluate_strategy_adoption_gate(
 def _compare_with_deployed(
         deployed: PluginMeta, *, inventory, mode: str, conn, history_conn,
         settings, dataset, pairs: list[str], now: datetime, plugin_ref: str,
-        candidate_hash: str, eval_timeframe: str, in_sample_c: dict,
-        holdout_c: dict, run_in_sample, run_holdout, record_fn, notify,
-        cpu_samples: list, max_sec: float,
-        clock: Callable[[], float]) -> tuple[dict, str]:
+        candidate_hash: str, eval_timeframe: str, candidate: dict,
+        run_in_sample, run_holdout, notify, cpu_samples: list,
+        max_sec: float,
+        clock: Callable[[], float]) -> tuple[dict, str, list[dict]]:
     """配備中の版を pair ごとに in_sample → holdout で回し、比較を返す。
-    戻り値は `(comparison, failure_code)`。
+    `candidate` は `{"in_sample": {pair: 指標}, "holdout": {...}}`。
+    戻り値は `(comparison, failure_code, baseline_rows)`。
 
-    行は再生中は内部に溜め、最後まで成功したときだけ `record_fn` へ流す
-    (途中で失敗・超過したら 1 行も流さない = 候補の行だけが残る)。
-    `sandbox_unavailable` と未知の code、`SandboxError` 以外の例外は
-    そのまま伝播する (呼び出し側が mission を failed にする)。"""
+    行は `record_fn` へ流さず、最後まで成功したときだけ返す (失敗・超過では
+    空 = 候補の行だけが残る)。`sandbox_unavailable` と未知の code、
+    `SandboxError` 以外の例外はそのまま伝播する (呼び出し側が mission を
+    failed にする)。壁時計は各呼び出しの前に確かめる (完走した結果は
+    捨てない。1 回の呼び出しの固まりは worker の timeout に委ねる)。"""
     from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 
     resolved = inventory.resolved.get((deployed.name, deployed.content_hash))
     if resolved is None:
         if deployed.indicators:
-            return _unavailable_comparison(mode, "baseline_unhealthy"), ""
+            return _unavailable_comparison(mode, "baseline_unhealthy"), "", []
         resolved = ResolvedIndicatorSet.empty(inventory.inventory.root)
 
     deadline = clock() + max_sec
@@ -650,13 +670,11 @@ def _compare_with_deployed(
                        "ref_plugin_ref": plugin_ref,
                        "ref_content_hash": candidate_hash})
 
-    in_sample_d: dict = {}
-    holdout_d: dict = {}
+    deployed_metrics: dict[str, dict] = {"in_sample": {}, "holdout": {}}
     try:
         for pair in pairs:
-            for scope, run_fn, sink in (
-                    ("in_sample", run_in_sample, in_sample_d),
-                    ("holdout", run_holdout, holdout_d)):
+            for scope, run_fn in (("in_sample", run_in_sample),
+                                  ("holdout", run_holdout)):
                 if clock() >= deadline:
                     raise _ReplayDeadline()
                 source = strategy_adapter.build_intent_source(
@@ -664,15 +682,13 @@ def _compare_with_deployed(
                     settings=settings, resolved=resolved)
                 error: BaseException | None = None
                 try:
-                    sink[pair] = run_fn(
+                    deployed_metrics[scope][pair] = run_fn(
                         settings, history_conn=history_conn, symbol=pair,
                         dataset=dataset,
                         intent_source=_DeadlineSource(source, deadline, clock),
                         eval_timeframe=eval_timeframe, plugin_ref=plugin_ref,
                         content_hash=deployed.content_hash, kind="strategy",
                         now=now, record_fn=_stage)
-                    if clock() > deadline:
-                        raise _ReplayDeadline()
                 except Exception as exc:
                     error = exc
                     raise
@@ -680,21 +696,22 @@ def _compare_with_deployed(
                     source.close()
                     cpu_samples.append(
                         (f"baseline_{scope}", pair, source.cpu_sec))
-                    notify(f"baseline_{scope}", pair, source, error)
+                    # 上限超過はこの gate の正常な unavailable なので、
+                    # 失敗として sink へは通知しない。
+                    if not isinstance(error, _ReplayDeadline):
+                        notify(f"baseline_{scope}", pair, source, error)
     except _ReplayDeadline:
-        return _unavailable_comparison(mode, "gate_timeout"), "gate_timeout"
+        return (_unavailable_comparison(mode, "gate_timeout"),
+                "gate_timeout", [])
     except SandboxError as exc:
         kind = classify_replay_failure(exc.code)
         if kind != "unavailable":
             raise
-        return (_unavailable_comparison(mode, "baseline_unhealthy"), exc.code)
+        return (_unavailable_comparison(mode, "baseline_unhealthy"),
+                exc.code, [])
 
-    from agentic_fx.store import backtest_runs as backtest_runs_store
-    for row in staged:
-        if record_fn is not None:
-            record_fn(row)
-        else:
-            backtest_runs_store.save_harness_run(history_conn, **row)
-    return (_decide_comparison(
-        mode=mode, pairs=pairs, in_sample_c=in_sample_c, in_sample_d=in_sample_d,
-        holdout_c=holdout_c, holdout_d=holdout_d), "")
+    stages = {scope: {"candidate": candidate[scope],
+                      "deployed": deployed_metrics[scope]}
+              for scope in ("in_sample", "holdout")}
+    return (_decide_comparison(mode=mode, pairs=pairs, stages=stages),
+            "", staged)

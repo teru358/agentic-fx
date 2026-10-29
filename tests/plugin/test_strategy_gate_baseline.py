@@ -213,7 +213,8 @@ def test_improved_replays_deployed_under_same_conditions(monkeypatch):
         twin = next(c for c in cand_calls if c[:2] == b[:2])
         assert b[3:] == twin[3:]
     # baseline の行: pair x 段で 4 行、候補の行の後ろ
-    rows = env.baseline_rows()
+    rows = list(v.baseline_rows)
+    assert env.baseline_rows() == []
     assert sorted((r["scope"], r["pair"]) for r in rows) == sorted(
         (s, p) for s in ("in_sample", "holdout_gate")
         for p in ("USDJPY", "EURUSD"))
@@ -222,9 +223,9 @@ def test_improved_replays_deployed_under_same_conditions(monkeypatch):
         assert r["content_hash"] == DEPL
         assert r["ref_plugin_ref"] == "plugins/myst"
         assert r["ref_content_hash"] == CAND
-    first_base = env.rows.index(rows[0])
-    assert all(r.get("variant") != "baseline" for r in env.rows[:first_base])
-    assert first_base == 4
+    # 配備中の版の行は gate では書かない。verdict に載せて返す
+    assert len(env.rows) == 4
+    assert all(r.get("variant") != "baseline" for r in env.rows)
 
 
 def test_comparison_payload_schema(monkeypatch):
@@ -263,7 +264,8 @@ def test_not_improved_when_equal_holdout(monkeypatch):
     assert v.comparison["verdict"] == "not_improved"
     assert v.comparison["reason"] == "holdout_not_exceeds"
     assert v.not_improved is True
-    assert len(env.baseline_rows()) == 2  # 却下でも行は残る
+    assert len(v.baseline_rows) == 2  # 却下でも行は返す
+    assert env.baseline_rows() == []
 
 
 def test_multi_pair_one_failing_pair_fails_whole(monkeypatch):
@@ -315,8 +317,7 @@ def test_floor_rows_and_order_unchanged_by_compare_mode(monkeypatch):
     v_off = off.gate(mode="off")
     on = Env(monkeypatch, pairs=("USDJPY", "EURUSD"))
     v_on = on.gate(mode="shadow")
-    cand_rows = [r for r in on.rows if r.get("variant") != "baseline"]
-    assert cand_rows == off.rows
+    assert on.rows == off.rows
     assert v_on.candidate_metrics == v_off.candidate_metrics
     assert v_on.holdout_metrics == v_off.holdout_metrics
     assert v_on.floor_reason == v_off.floor_reason == ""
@@ -332,6 +333,11 @@ def test_contract_change_fails_closed_before_any_backtest(
     env = Env(monkeypatch, pairs=("USDJPY",))
     v = env.gate(mode="enforce", timeframe=cand_tf, pairs=cand_pairs)
     assert v.contract_violation == SAME_NAME_CONTRACT_CHANGED
+    # 呼び出し側 (approval.run_kind_gate / improve_loop) は evaluable を見て
+    # fail closed になる。candidate_metrics が None のまま通してはならない
+    assert v.evaluable is False
+    assert v.floor_reason == SAME_NAME_CONTRACT_CHANGED
+    assert v.candidate_metrics is None
     assert env.calls == [] and env.rows == [] and env.sources == []
     assert v.comparison is None
 
@@ -355,7 +361,8 @@ def test_contract_wins_over_floor_failure(monkeypatch):
         (CAND, "in_sample", "USDJPY"): _m(pf=0.1, avg_r=-1.0)})
     v = env.gate(mode="enforce", timeframe="4h")
     assert v.contract_violation == SAME_NAME_CONTRACT_CHANGED
-    assert v.floor_reason == ""
+    assert v.evaluable is False
+    assert v.floor_reason == SAME_NAME_CONTRACT_CHANGED
     assert env.rows == []
 
 
@@ -373,7 +380,7 @@ def _verdict_fields(v):
     return (v.evaluable, v.baseline_variant, v.baseline_row,
             v.candidate_metrics, v.holdout_metrics, v.floor_reason,
             v.floor_detail, v.comparison, v.not_improved,
-            v.contract_violation)
+            v.contract_violation, v.baseline_rows)
 
 
 def test_new_name_is_identical_to_off(monkeypatch):
@@ -435,6 +442,7 @@ def test_replay_failure_becomes_unavailable_with_no_baseline_rows(
     assert v.comparison["reason"] == "baseline_unhealthy"
     assert v.comparison["stages"] == {"holdout": {}, "in_sample": {}}
     assert v.baseline_failure_code == code
+    assert v.baseline_rows == ()
     assert v.not_improved is False
     # 先に回った USDJPY の baseline 行も出ていない。候補は完全
     assert env.baseline_rows() == []
@@ -482,7 +490,8 @@ def test_baseline_holdout_not_evaluable_is_unavailable_but_keeps_rows(
     assert v.comparison["reason"] == "baseline_not_evaluable"
     assert v.not_improved is False
     assert v.baseline_failure_code == ""
-    assert len(env.baseline_rows()) == 2  # 完全な対が残る
+    assert len(v.baseline_rows) == 2  # 完全な対を返す
+    assert env.baseline_rows() == []
 
 
 def test_candidate_holdout_not_evaluable_is_unavailable(monkeypatch):
@@ -508,6 +517,7 @@ def test_missing_resolved_with_indicators_is_unavailable(monkeypatch):
     v = env.gate(inventory=_inventory(deployed))
     assert v.comparison["verdict"] == "unavailable"
     assert v.comparison["reason"] == "baseline_unhealthy"
+    assert v.baseline_rows == ()
     assert env.baseline_rows() == []
 
 
@@ -545,20 +555,23 @@ def test_timer_starts_after_floor_candidate_floor_never_times_out(monkeypatch):
                  baseline_replay_wall_clock_max_sec=300.0)
     assert v.comparison["reason"] in ("holdout_exceeds",
                                       "holdout_not_exceeds")
-    assert len(env.baseline_rows()) == 2
+    assert len(v.baseline_rows) == 2
+    assert env.baseline_rows() == []
 
 
 def test_baseline_replay_over_limit_is_gate_timeout(monkeypatch):
     clock = FakeClock()
-    env = _advancing_env(monkeypatch, clock, base_cost=200.0)
+    env = _advancing_env(monkeypatch, clock, base_cost=200.0,
+                         pairs=("USDJPY", "EURUSD"))
     v = env.gate(mode="enforce", clock=clock,
                  baseline_replay_wall_clock_max_sec=300.0)
-    # in_sample 200s + holdout 200s で合計 400s > 300s
+    # 2 回目の呼び出し後に 400s > 300s、3 回目の前の事前判定で取り消す
     assert v.comparison["verdict"] == "unavailable"
     assert v.comparison["reason"] == "gate_timeout"
     assert v.baseline_failure_code == "gate_timeout"
+    assert v.baseline_rows == ()
     assert env.baseline_rows() == []
-    assert len([r for r in env.rows if r["content_hash"] == CAND]) == 2
+    assert len([r for r in env.rows if r["content_hash"] == CAND]) == 4
 
 
 def test_replay_exactly_within_limit_is_kept(monkeypatch):
@@ -567,7 +580,8 @@ def test_replay_exactly_within_limit_is_kept(monkeypatch):
     v = env.gate(mode="enforce", clock=clock,
                  baseline_replay_wall_clock_max_sec=300.0)
     assert v.comparison["reason"] != "gate_timeout"
-    assert len(env.baseline_rows()) == 2
+    assert len(v.baseline_rows) == 2
+    assert env.baseline_rows() == []
 
 
 def test_deadline_cancels_replay_midway_through_source_calls(monkeypatch):
@@ -592,6 +606,7 @@ def test_deadline_cancels_replay_midway_through_source_calls(monkeypatch):
     v = env.gate(mode="enforce", clock=clock,
                  baseline_replay_wall_clock_max_sec=300.0)
     assert v.comparison["reason"] == "gate_timeout"
+    assert v.baseline_rows == ()
     assert env.baseline_rows() == []
     assert all(s.closed for s in env.sources)
     # 上限に達した 3 回目以降は中の source を呼ばずに取り消す
@@ -639,6 +654,129 @@ def test_same_inputs_twice_give_identical_rows_and_comparison(monkeypatch):
 
 def test_decide_comparison_without_pairs_is_unavailable():
     from agentic_fx.plugin.strategy_gate import _decide_comparison
-    c = _decide_comparison(mode="shadow", pairs=[], in_sample_c={},
-                           in_sample_d={}, holdout_c={}, holdout_d={})
+    c = _decide_comparison(
+        mode="shadow", pairs=[],
+        stages={"in_sample": {"candidate": {}, "deployed": {}},
+                "holdout": {"candidate": {}, "deployed": {}}})
     assert c["verdict"] == "unavailable" and c["reason"] == "no_pairs"
+
+
+# ---- 是正 -----------------------------------------------------------------
+
+def test_overrun_of_the_last_call_keeps_the_completed_result(monkeypatch):
+    clock = FakeClock()
+    env = _advancing_env(monkeypatch, clock, base_cost=400.0)
+    v = env.gate(mode="enforce", clock=clock,
+                 baseline_replay_wall_clock_max_sec=300.0)
+    # in_sample (400s) の後の事前判定で既に超過 -> holdout は始めない
+    assert v.comparison["reason"] == "gate_timeout"
+    clock2 = FakeClock()
+    env2 = _advancing_env(monkeypatch, clock2, base_cost=250.0)
+    v2 = env2.gate(mode="enforce", clock=clock2,
+                   baseline_replay_wall_clock_max_sec=300.0)
+    # 2 回目 (holdout) の開始時は 250s < 300s、完走して 500s になるが、
+    # 完走した結果は捨てない
+    assert v2.comparison["reason"] != "gate_timeout"
+    assert len(v2.baseline_rows) == 2
+
+
+def test_deadline_is_not_reported_to_evaluation_sink(monkeypatch):
+    clock = FakeClock()
+    env = Env(monkeypatch)
+    base_run = env._run
+
+    def run_factory(scope):
+        run = base_run(scope)
+
+        def wrapped(settings, **kw):
+            if kw["content_hash"] == DEPL and scope == "in_sample":
+                clock.t += 1000.0
+                kw["intent_source"](object())   # 途中で上限に達する
+            return run(settings, **kw)
+        return wrapped
+    env._run = run_factory
+    v = env.gate(mode="enforce", clock=clock,
+                 baseline_replay_wall_clock_max_sec=300.0)
+    assert v.comparison["reason"] == "gate_timeout"
+    assert [c[0] for c in env.sink_calls] == ["in_sample", "holdout"]
+    assert all(c[3] is None for c in env.sink_calls)
+    assert [s[0] for s in v.cpu_samples] == [
+        "in_sample", "holdout", "baseline_in_sample"]
+
+
+def test_deadline_source_underscore_attr_raises_without_recursion():
+    import copy
+    from agentic_fx.plugin.strategy_gate import _DeadlineSource
+    src = _DeadlineSource(_Source(None), 1.0, lambda: 0.0)
+    assert copy.copy(src)._deadline == 1.0
+    bare = _DeadlineSource.__new__(_DeadlineSource)
+    with pytest.raises(AttributeError):
+        bare._inner
+    with pytest.raises(AttributeError):
+        src._not_there
+    assert src.cpu_sec == 1.5
+
+
+def test_one_not_improved_pair_wins_over_unavailable_pair(monkeypatch):
+    env = Env(monkeypatch, pairs=("USDJPY", "EURUSD"), table={
+        (DEPL, "holdout", "USDJPY"): _m(pf=1.5, avg_r=0.2),   # 候補と同じ
+        (DEPL, "holdout", "EURUSD"): _m(trades=5, pf=1.0, avg_r=0.0)})
+    v = env.gate(mode="enforce")
+    assert v.comparison["verdict"] == "not_improved"
+    assert v.comparison["reason"] == "holdout_not_exceeds"
+    assert v.not_improved is True
+
+
+def test_improved_plus_unavailable_is_unavailable(monkeypatch):
+    env = Env(monkeypatch, pairs=("USDJPY", "EURUSD"), table={
+        (DEPL, "holdout", "USDJPY"): _m(pf=1.2, avg_r=0.1),
+        (DEPL, "holdout", "EURUSD"): _m(trades=5, pf=1.0, avg_r=0.0)})
+    v = env.gate(mode="enforce")
+    assert v.comparison["verdict"] == "unavailable"
+    assert v.comparison["reason"] == "baseline_not_evaluable"
+    assert v.not_improved is False
+
+
+def test_gate_alone_never_writes_baseline_rows_through_record_fn(monkeypatch):
+    env = Env(monkeypatch, pairs=("USDJPY", "EURUSD"))
+    calls = []
+    env.rows = type("R", (list,), {"append": lambda self, r: (
+        calls.append(r.get("variant")), list.append(self, r))})()
+    v = env.gate(mode="enforce")
+    assert "baseline" not in calls
+    assert len(v.baseline_rows) == 4
+    for r in v.baseline_rows:
+        assert r["variant"] == "baseline"
+        assert r["ref_plugin_ref"] == "plugins/myst"
+        assert r["ref_content_hash"] == CAND
+        assert r["content_hash"] == DEPL
+
+
+def test_failing_record_fn_cannot_leave_partial_baseline_rows(monkeypatch):
+    env = Env(monkeypatch, pairs=("USDJPY", "EURUSD"))
+    seen = []
+
+    def flaky(row):
+        seen.append(row)
+        if len(seen) == 5:
+            raise RuntimeError("db locked")
+        env.rows.append(row)
+    v = env.gate(mode="enforce", record_fn=flaky)
+    assert len(seen) == 4 and len(v.baseline_rows) == 4
+
+
+def test_contract_violation_is_not_evaluable_for_existing_callers(monkeypatch):
+    env = Env(monkeypatch, pairs=("USDJPY",))
+    v = env.gate(mode="enforce", timeframe="4h")
+    assert v.evaluable is False and v.candidate_metrics is None
+    # off / new name / indicator は変わらない
+    assert env.gate(mode="off", timeframe="4h").evaluable is True
+
+
+def test_deadline_boundary_is_inclusive_before_a_call(monkeypatch):
+    clock = FakeClock()
+    env = _advancing_env(monkeypatch, clock, base_cost=300.0)
+    v = env.gate(mode="enforce", clock=clock,
+                 baseline_replay_wall_clock_max_sec=300.0)
+    # in_sample の完走でちょうど 300s。次の呼び出しの前で取り消す
+    assert v.comparison["reason"] == "gate_timeout"
