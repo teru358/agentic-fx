@@ -406,6 +406,20 @@ def test_jobs_get_shows_repeat_progress_without_a_comment(tmp_path):
         "経過 5m / 30m、残り 25m、実行中 mission #41、停止要求あり")
 
 
+def test_jobs_get_of_a_finished_repeat_shows_the_last_mission_without_remaining(tmp_path):
+    api = _StubApi(tmp_path, [_progress(3, 2498, state="done", phase="finished",
+                                        stop_reason="max_runs",
+                                        elapsed_sec=245, duration_sec=86400)])
+    out = io.StringIO()
+    runner = client.Runner(api, stdin=io.StringIO(""), stdout=out)
+    runner.run(client.parse(["jobs", "get", JOB]))
+    text = out.getvalue().strip()
+    assert text.startswith(
+        f"job {JOB}: improve の繰り返し: 終了、実施 3 回 / 最大 3 回、"
+        "経過 4m / 24h00m、最後の mission #2498、")
+    assert "残り" not in text and "実行中 mission" not in text
+
+
 # ---- 対話シェル ----
 
 def _shell(monkeypatch, text):

@@ -1628,12 +1628,14 @@ def _repeat_job_summary(job: dict) -> str | None:
     state = {"running": "実行中", "done": "終了", "failed": "失敗",
              "shutdown": "停止"}.get(job.get("state"), "状態不明")
     elapsed_minutes, duration_minutes = elapsed // 60, duration // 60
+    terminal = job.get("state") in _TERMINAL_JOB_STATES
     text = (f"improve の繰り返し: {state}、実施 {runs} 回 / 最大 {maximum} 回、"
-            f"経過 {_repeat_span(elapsed_minutes)} / {_repeat_span(duration_minutes)}、残り "
-            f"{_repeat_span(max(duration_minutes - elapsed_minutes, 0))}")
+            f"経過 {_repeat_span(elapsed_minutes)} / {_repeat_span(duration_minutes)}")
+    if not terminal:
+        text += f"、残り {_repeat_span(max(duration_minutes - elapsed_minutes, 0))}"
     mission_id = result.get("mission_id")
     if type(mission_id) is int and mission_id >= 0:
-        text += f"、実行中 mission #{mission_id}"
+        text += f"、{'最後の' if terminal else '実行中'} mission #{mission_id}"
     if result.get("stop_requested") is True:
         text += "、停止要求あり"
     reason = result.get("stop_reason")

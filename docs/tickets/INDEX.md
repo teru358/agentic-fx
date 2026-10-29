@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 149 件。完了分は closed/。
 
-## 実装中 (6)
+## 実装中 (5)
 
 ### 不具合 (2)
 
@@ -12,13 +12,12 @@
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 | [plugin-sandbox-allows-pure-conversions](open/plugin-sandbox-allows-pure-conversions.md) | 高 | 2026-10-28 | pd.to_numeric が plugin 検査で禁止され、改善 mission が gate で繰り返し落ちる |
 
-### 機能 (4)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [reference-symbols-as-indicator-inputs](open/reference-symbols-as-indicator-inputs.md) | 中 | 2026-10-08 | 戦略 plugin に株価指数など参照 symbol の値を指標として渡す |
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
-| [improve-repeat-progress-display](open/improve-repeat-progress-display.md) | 中 | 2026-10-28 | 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
 ## 実装待ち (11)
