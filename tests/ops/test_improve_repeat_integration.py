@@ -446,3 +446,32 @@ def test_a_deadline_in_the_monotonic_past_stops_after_the_first_mission(rig, ops
     reply = r.service.improve(OPERATOR, "k1", duration_sec=600)
     job = wait_job(r.service, reply["job_id"])
     assert (job["result"]["stop_reason"], job["result"]["runs"]) == ("deadline", 1)
+
+
+def test_repeat_elapsed_uses_acceptance_time_in_event_job_and_status(rig, ops_env, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+
+    def hold(_ctx):
+        entered.set()
+        release.wait(T)
+
+    r = rig([{"run": hold}], emit=True)
+    enqueue = r.service._enqueue_repeat
+
+    def delayed_enqueue(*args, **kwargs):
+        ops_env.mono.advance(65)
+        return enqueue(*args, **kwargs)
+
+    monkeypatch.setattr(r.service, "_enqueue_repeat", delayed_enqueue)
+    reply = r.service.improve(OPERATOR, "k1", duration_sec=600, max_runs=1)
+    assert entered.wait(T)
+    job = r.service.get_job(OPERATOR, reply["job_id"])
+    status = r.service.status(OPERATOR)
+    row = ops_env.conn.execute(
+        "SELECT fields_json FROM ops_events WHERE code='improve_run_changed' ORDER BY id").fetchone()
+    event = json.loads(row["fields_json"])
+    assert event["repeat_elapsed_sec"] == 65
+    assert job["result"]["elapsed_sec"] == 65
+    assert status["improve_repeat"]["result"]["elapsed_sec"] == 65
+    release.set()
+    wait_job(r.service, reply["job_id"])

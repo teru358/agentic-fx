@@ -44,6 +44,7 @@ class Job:
     result: dict | None = None
     error_code: str | None = None
     created_mono: float = 0.0
+    started_mono: float | None = None
     deadline_mono: float | None = None
     audit_id: int | None = None
     terminal_mono: float | None = None
@@ -105,7 +106,7 @@ class JobRegistry:
                        busy_code: ErrorCode, job_id: str | None = None,
                        audit_id: int | None = None, initial_result: dict | None = None,
                        cancel_event: threading.Event | None = None,
-                       repeat: bool = False) -> Job:
+                       repeat: bool = False, started_mono: float | None = None) -> Job:
         """ask / 手動 improve の 1 本枠。走行中の同種 job があれば作らない。
 
         `initial_result` と `repeat` (と `cancel_event`) は job が見えるようになる lock 内で
@@ -121,6 +122,7 @@ class JobRegistry:
             if initial_result is not None:
                 job.result = dict(initial_result)
             job.repeat = repeat
+            job.started_mono = started_mono
             if repeat:
                 job.cancel_event = cancel_event or threading.Event()
             else:
@@ -140,6 +142,11 @@ class JobRegistry:
     def has_active(self, kind: str) -> bool:
         with self._lock:
             return self._active(lambda j: j.kind == kind)
+
+    def active_repeat(self) -> Job | None:
+        with self._lock:
+            return next((job for job in self._jobs.values()
+                         if job.repeat and job.state not in TERMINAL_STATES), None)
 
     def take_next_decision(self) -> Job | None:
         with self._lock:

@@ -16,7 +16,7 @@ _TIMESTAMP = re.compile(r"[A-Za-z0-9_.:+\-]{1,64}\Z")
 
 ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     "ops_request_terminal": frozenset({"endpoint_code", "result_code", "authenticated_principal"}),
-    "approval_state_changed": frozenset({"state", "decision_code", "decided_by"}),
+    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind"}),
     "job_state_changed": frozenset({"job_kind", "state", "result_code"}),
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
@@ -26,7 +26,8 @@ ALLOWED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType({
     improve_events.CODE: improve_events.FIELDS,
 })
 # 外へ出さない field。event にあっても無くてもよい
-_OPTIONAL_FIELDS = frozenset({"decided_by"})
+_OPTIONAL_FIELDS = frozenset({"decided_by", "plugin_kind"})
+_OMITTED_FIELDS = frozenset({"decided_by"})
 _REF = MappingProxyType({
     "ops_request_terminal": re.compile(r"audit:[0-9]{1,18}\Z"),
     "approval_state_changed": re.compile(r"approval:[0-9]{1,18}\Z"),
@@ -83,5 +84,5 @@ def encode_event(event: object) -> dict[str, object]:
             or not _event_valid(code, ref, fields)):
         raise PayloadError()
     payload: dict[str, object] = {"event_id": event_id, "ts": ts, "code": code, "ref": ref}
-    payload.update({key: value for key, value in fields.items() if key not in _OPTIONAL_FIELDS})
+    payload.update({key: value for key, value in fields.items() if key not in _OMITTED_FIELDS})
     return payload

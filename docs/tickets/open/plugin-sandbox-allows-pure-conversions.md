@@ -1,7 +1,7 @@
 ---
 id: plugin-sandbox-allows-pure-conversions
 title: pd.to_numeric が plugin 検査で禁止され、改善 mission が gate で繰り返し落ちる
-status: 設計待ち
+status: 実装中
 priority: 高
 kind: 不具合
 opened: 2026-10-28
@@ -10,7 +10,7 @@ related: [improve-loop-quality]
 ---
 # [plugin-sandbox-allows-pure-conversions] pd.to_numeric が plugin 検査で禁止され、改善 mission が gate で繰り返し落ちる
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ plugin の AST 検査 (src/agentic_fx/plugin/sandbox.py の _is_denied_bare_name
 ## 経緯
 
 - 2026-10-28: 起票。
+- 2026-10-29: 状態: 実装中 — 2026-10-29: worktree tmp/wt/sandbox-conv で codex terra 実装

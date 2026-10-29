@@ -150,6 +150,22 @@ def test_start_without_detail_is_the_first_line_only():
     assert render_improve_start(started(2043, "scheduled"), None) == "[改善] 開始 #2043 (週次)"
 
 
+def test_detail_repeat_is_ignored_and_an_unknown_shape_does_not_hide_the_backend():
+    payload = started(2043)
+    payload.update({"repeat_run": 2, "repeat_max_runs": 10,
+                    "repeat_elapsed_sec": 305, "repeat_duration_sec": 1800})
+    data = dto(2043)
+    data["repeat"] = {"run": 1, "max_runs": 1, "elapsed_sec": 0, "duration_sec": 60}
+    detail = validate_improve_run(data, 2043)
+
+    assert detail is not None
+    assert render_improve_start(payload, detail).splitlines() == [
+        "[改善] 開始 #2043 (手動)", "backend codex / gpt-5.6-luna",
+        "繰り返し 2/10 回 · 5m/30m"]
+    data["repeat"] = {"different": "future_daemon_shape"}
+    assert validate_improve_run(data, 2043) is not None
+
+
 def test_start_escapes_backend_and_model():
     detail = validate_improve_run(dto(2043, backend="@everyone", model="<@&1>_x*"), 2043)
     lines = render_improve_start(started(2043), detail).splitlines()

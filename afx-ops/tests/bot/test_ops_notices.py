@@ -127,7 +127,8 @@ def test_ac18_plan_event_uses_skip_known_for_default_ops_filters(setting, posted
         event_id for event_id in range(1, 7) if event_id not in posted]
 
 
-_APPROVED = {"state": "approved", "decision_code": "approve", "decided_by": "api:ops-bot"}
+_APPROVED = {"state": "approved", "decision_code": "approve", "decided_by": "api:ops-bot",
+             "plugin_kind": "strategy"}
 
 
 def _approved(event_id: int = 1, approval_id: int = 8) -> dict:

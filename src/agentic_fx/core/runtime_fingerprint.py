@@ -168,10 +168,10 @@ def compute_fingerprint(*, landlock_abi: int) -> RuntimeFingerprint:
     )
 
 
-# 2026-10-03 に正常 workload を完走した 1 組
+# 2026-10-03 に正常 workload を完走した 1 組 (2026-10-29 にカーネルを 7.0.0-42 へ更新し、本番の自己試験合格を受けて差し替え)
 _SUPPORTED = (
     RuntimeFingerprint(
-        kernel_release="7.0.0-38-generic",
+        kernel_release="7.0.0-42-generic",
         machine="x86_64",
         landlock_abi=8,
         glibc_version="2.43",

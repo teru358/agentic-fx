@@ -1,16 +1,16 @@
 ---
 id: improve-repeat-progress-display
 title: 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す
-status: 設計待ち
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-10-28
-closed: null
+closed: 2026-10-29
 related: [ctl-improve-repeat-duration-and-oneoff-comment]
 ---
 # [improve-repeat-progress-display] 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -22,6 +22,11 @@ afx ctl improve -t / -n の繰り返し中、何回目の実施か・経過時�
 
 ## 修正内容
 
+- 2026-10-29: 繰り返し improve の進捗を Discord の開始・終了通知 (繰り返し n/N 回 · 経過/期間)、afx ctl jobs get、afx ctl status に出す (main d2c8bf76、配備 2026-10-29、本機の Discord で確認 = ユーザー)。終了後の jobs get が「残り」「実行中 mission」と出た不具合は、終了後は残りを出さず「最後の mission」と書くよう是正 (client のみ、再起動不要)。
+
 ## 経緯
 
 - 2026-10-28: 起票。
+- 2026-10-29: 状態: 実装中 — 2026-10-29: main d2c8bf76 で merge・配備。次の afx ctl improve -t / -n で Discord・jobs get・status の表示を確認して closed
+- 2026-10-29: 状態: 実装中 — 2026-10-29 本機: jobs get / status の表示を確認。不具合: 終了後も「残り 23h56m」「実行中 mission #2498」と出る (終了後は残りを出さず「最後の mission」にすべき)。Discord の表示はユーザー確認待ち
+- 2026-10-29: 是正内容 — 繰り返し improve の進捗を Discord の開始・終了通知 (繰り返し n/N 回 · 経過/期間)、afx ctl jobs get、afx ctl status に出す (main d2c8bf76、配備 2026-10-29、本機の Discord で確認 = ユーザー)。終了後の jobs get が「残り」「実行中 mission」と出た不具合は、終了後は残りを出さず「最後の mission」と書くよう是正 (client のみ、再起動不要)。

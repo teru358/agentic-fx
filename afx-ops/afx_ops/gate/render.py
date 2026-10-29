@@ -359,7 +359,9 @@ def _event_text_for_code(payload: dict[str, object], plugin_name: str | None,
     if code == "approval_state_changed":
         approval, state = payload["ref"].split(":", 1)[1], _event_value(payload.get("state"))
         name = plugin_name_or_none(plugin_name)
-        subject = f"承認 #{approval}" + (f" (戦略 {escape_discord(name)})" if name else "")
+        kind = {"strategy": "戦略", "indicator": "指標"}.get(
+            _event_value(payload.get("plugin_kind")), "plugin")
+        subject = f"承認 #{approval}" + (f" ({kind} {escape_discord(name)})" if name else "")
         endings = {"approved": "が承認・配備されました", "rejected": "が却下されました", "expired": "は期限切れになりました"}
         return f"{subject} {endings[state]}。" if state in endings else f"承認 #{approval} の状態が変わりました" + (f" ({escape_discord(state)})" if state else "") + "。"
     if code == "job_state_changed":
