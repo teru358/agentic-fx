@@ -3,21 +3,23 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 151 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (7)
 
-### 不具合 (2)
+### 不具合 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 | [plugin-sandbox-allows-pure-conversions](open/plugin-sandbox-allows-pure-conversions.md) | 高 | 2026-10-28 | pd.to_numeric が plugin 検査で禁止され、改善 mission が gate で繰り返し落ちる |
+| [approval-notice-shows-strategy-for-indicator](open/approval-notice-shows-strategy-for-indicator.md) | 中 | 2026-10-28 | 指標の承認・配備の通知が「戦略」と表示される |
 
-### 機能 (3)
+### 機能 (4)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [reference-symbols-as-indicator-inputs](open/reference-symbols-as-indicator-inputs.md) | 中 | 2026-10-08 | 戦略 plugin に株価指数など参照 symbol の値を指標として渡す |
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
+| [improve-repeat-progress-display](open/improve-repeat-progress-display.md) | 中 | 2026-10-28 | 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
 ## 実装待ち (11)
@@ -71,9 +73,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (129)
+## 設計待ち (127)
 
-### 不具合 (73)
+### 不具合 (72)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -104,7 +106,6 @@
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 中 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [approval-notice-shows-strategy-for-indicator](open/approval-notice-shows-strategy-for-indicator.md) | 中 | 2026-10-28 | 指標の承認・配備の通知が「戦略」と表示される |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [improvement-runs-backlog-id-on-failure](open/improvement-runs-backlog-id-on-failure.md) | 中 |  | 失敗 mission では `improvement_runs.backlog_id` が NULL のままで選択 b… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
@@ -151,7 +152,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (36)
+### 機能 (35)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -164,7 +165,6 @@
 | [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
-| [improve-repeat-progress-display](open/improve-repeat-progress-display.md) | 中 | 2026-10-28 | 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 低 | 2026-09-21 | ライブで集めた確定足を履歴に積めず二重保存になる |

@@ -1,7 +1,7 @@
 ---
 id: approval-notice-shows-strategy-for-indicator
 title: 指標の承認・配備の通知が「戦略」と表示される
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 不具合
 opened: 2026-10-28
@@ -10,7 +10,7 @@ related: []
 ---
 # [approval-notice-shows-strategy-for-indicator] 指標の承認・配備の通知が「戦略」と表示される
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ Discord の承認状態の通知が plugin の種別を見ずに「承認 #63 (�
 ## 経緯
 
 - 2026-10-28: 起票。
+- 2026-10-29: 状態: 実装中 — 2026-10-29: main d2c8bf76 で merge・配備 (afx-ops 再起動 → daemon 再起動 19:34)。次に指標の承認・配備があったときに Discord の文面「(指標 …)」を確認して closed

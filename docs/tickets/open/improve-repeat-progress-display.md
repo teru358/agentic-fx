@@ -1,7 +1,7 @@
 ---
 id: improve-repeat-progress-display
 title: 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 機能
 opened: 2026-10-28
@@ -10,7 +10,7 @@ related: [ctl-improve-repeat-duration-and-oneoff-comment]
 ---
 # [improve-repeat-progress-display] 繰り返し improve の何回目・経過時間を通知・jobs get・status に出す
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ afx ctl improve -t / -n の繰り返し中、何回目の実施か・経過時�
 ## 経緯
 
 - 2026-10-28: 起票。
+- 2026-10-29: 状態: 実装中 — 2026-10-29: main d2c8bf76 で merge・配備。次の afx ctl improve -t / -n で Discord・jobs get・status の表示を確認して closed
