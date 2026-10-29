@@ -1,7 +1,7 @@
 ---
 id: same-name-candidate-must-beat-deployed-baseline
 title: 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する
-status: 設計待ち
+status: 実装中
 priority: 中
 kind: 機能
 opened: 2026-10-29
@@ -10,7 +10,7 @@ related: [weekly-improve-rebacktests-deployed-strategies, improve-objective-filt
 ---
 # [same-name-candidate-must-beat-deployed-baseline] 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装中 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -26,3 +26,4 @@ related: [weekly-improve-rebacktests-deployed-strategies, improve-objective-filt
 
 - 2026-10-29: 起票。
 - 2026-10-29: 状態: 設計待ち — 2026-10-29: 週次改善・手動 improve (単発・繰り返し) のすべての mission を対象にする (ユーザー)。参照系列と並行で設計 C0 を起こす
+- 2026-10-29: 状態: 実装中 — 2026-10-29: 設計 v0.5 C0 (sol 3 周、J1〜J6 裁定済)。T1 (strategy_gate) から着手

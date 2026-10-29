@@ -1,6 +1,6 @@
 ---
 id: baseline-replay-unimplemented
-status: 設計待ち
+status: 実装中
 priority: 中
 opened: 2026-09-12
 closed: null
@@ -11,7 +11,7 @@ kind: 不具合
 ---
 # [baseline-replay-unimplemented]
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 実装中 / **優先**: 中 / **種別**: 不具合
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -21,3 +21,4 @@ kind: 不具合
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 状態: 実装中 — 2026-10-29: 同名候補の配備版比較 gate (same-name-candidate-must-beat-deployed-baseline、設計 2026-10-29-baseline-comparison-gate-design.md) で閉じる

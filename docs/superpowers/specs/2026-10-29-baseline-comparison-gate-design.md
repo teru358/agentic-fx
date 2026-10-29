@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.4 C0 (J5 裁定済) (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.5 C0 (裁定済、実装着手) (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -186,6 +186,8 @@ comparison = {
 
 ## 8. 裁定 (利用者判断が要るもの)
 
+**2026-10-29 ユーザー裁定済**: J1〜J4・J6 はいずれも推奨どおり (J1 = holdout の pf と avg_r が共に厳密に上回る、in_sample は添付のみ / J2 = 床のみで通し承認画面に比較不能と理由 / J3 = 再生専用 300 秒 / J4 = 監視条件つきで受容 / J6 = 既定 shadow、人間が切替)。J5 は §2。
+
 技術で決まるものは含めない。**J5 (Discord の比較数値) は 2026-10-29 にユーザー裁定済**: `improved` のときだけ holdout の 4 項目 (pf / avg_r / 取引数 / 評価可能) を候補と配備中の版について出す。`not_improved` / `unavailable` は出さない (§2)。2026-10-25 の裁定 (落ちた段・落ちた pair の 4 項目のみ) に「上回ったときの比較」を加える改訂。
 
 **J1 改善の定義と保守的 ratchet の採否。** 本規則は優位の証明ではなく、両指標の点推定の優越を要求する保守的な ratchet で、60 取引前後では偽棄却が大きく、勝者の呪いは窓の重なりでほぼ残る。これを理解したうえで採用するか。推奨: 採用し、holdout の pf と avg_r が共に厳密に上回る (差の下限 0)、in_sample は添付のみ。根拠: in_sample は agent が最適化した窓。avg_r も損益幅を含む期待値なので 2 指標で足りる。代案 B = in_sample の悪化なしも要求 (`15a66f12` → `01fd0352` は in_sample pf 1.0229 → 1.0165 で落ちうる)、C = 差の下限を正に (基準値の根拠が無く実測要)。利用者判断の理由: 厳しいほど改善が止まる。
@@ -207,3 +209,4 @@ comparison = {
 | 2026-10-29 | v0.3 C0 | sol 2 周目の全件反映: 壁時計を baseline 再生専用に二分 (候補の床は打ち切らない)・repeat 期限式・SandboxError 全 code 閉じ (`backtest_failed`、`cpu_limit` 実装済み)・checkpoint 切り戻し・mode の mission 開始時 snapshot・activity に hash と集計器 schema・表示面の AC 11・窓重複率の再定義・契約検査の優先・J3 / J6 文言 | sol 2 周目 (Critical 1 / Important 7 / Minor 1) | |
 | 2026-10-29 | v0.3.1 C0 | `unavailable` の 2 種 (再生失敗 = baseline 0 行 / 非 evaluable = 完全な baseline 行を保持) を §3.4 と AC 6 で分ける | 設計レビュー 3 周目 (sol、Important 1) | |
 | 2026-10-29 | v0.4 C0 | J5 をユーザー裁定で改訂: `improved` のとき Discord に holdout の 4 項目を候補 / 配備中の版で出す (§2、AC 11、§8) | ユーザー要望 | |
+| 2026-10-29 | v0.5 C0 | J1〜J4・J6 をユーザー裁定済 (推奨どおり) に | ユーザー承認、実装着手 | |
