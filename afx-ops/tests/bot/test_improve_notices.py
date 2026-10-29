@@ -235,8 +235,6 @@ def test_repeat_notices_add_the_fixed_progress_line(make_bot):
     event["fields"].update({"repeat_run": 2, "repeat_max_runs": 10,
                             "repeat_elapsed_sec": 305, "repeat_duration_sec": 1800})
     detail = _dto(2043, terminal=False)
-    detail["repeat"] = {"run": 2, "max_runs": 10, "elapsed_sec": 305,
-                        "duration_sec": 1800}
     bot = make_bot(_page([event]), runs={2043: _ok(detail)})
 
     bot.poll()

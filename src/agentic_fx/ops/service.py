@@ -978,7 +978,8 @@ class OpsService:
         result = dict(job.result) if job.result is not None else None
         if job.repeat and result is not None:
             started_mono = job.started_mono if job.started_mono is not None else job.created_mono
-            result["elapsed_sec"] = max(0, int(self._monotonic() - started_mono))
+            ended_mono = job.terminal_mono if job.terminal_mono is not None else self._monotonic()
+            result["elapsed_sec"] = max(0, int(ended_mono - started_mono))
         return {"id": job.id, "kind": job.kind, "state": job.state.value,
                 "result": result,
                 "result_code": job.error_code}
@@ -1720,10 +1721,14 @@ class OpsService:
                 raise _DecisionOutcome(ErrorCode.ALREADY_DECIDED, result, outcome)
             if outcome is not None and outcome.outcome not in _DEPLOYED:
                 raise _DecisionOutcome(ErrorCode.INVALID_STATE, result, outcome)
+            try:
+                plugin_kind = _approval_plugin_kind(self._decide_conn, approval_id)
+            except Exception:  # noqa: BLE001 — notification metadata is best-effort
+                plugin_kind = None
             self._decide_events.emit_best_effort(
                 "approval_state_changed", f"approval:{approval_id}",
                 {"state": result["status"], "decision_code": kind, "decided_by": decided_by,
-                 "plugin_kind": _approval_plugin_kind(self._decide_conn, approval_id)})
+                 "plugin_kind": plugin_kind})
             return result
         return run
 

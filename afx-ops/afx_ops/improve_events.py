@@ -12,9 +12,8 @@ CODE = "improve_run_changed"
 FIELDS = frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls",
                     "repeat_run", "repeat_max_runs", "repeat_elapsed_sec",
                     "repeat_duration_sec"})
-_REPEAT_FIELDS = frozenset({"repeat_run", "repeat_max_runs", "repeat_elapsed_sec",
-                            "repeat_duration_sec"})
 _REPEAT_KEYS = ("repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec")
+_REPEAT_FIELDS = frozenset(_REPEAT_KEYS)
 REF_PATTERN = re.compile(r"improve:[0-9]{1,18}\Z")
 
 STATES = frozenset({"started", "finished"})

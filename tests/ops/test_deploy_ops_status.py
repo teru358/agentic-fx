@@ -103,6 +103,15 @@ def test_ctl_status_adds_a_repeat_summary_only_while_one_is_running():
     assert "improve の繰り返し: 実行中、実施 2 回 / 最大 10 回、経過 5m / 30m、残り 25m、実行中 mission #2358" in text
 
 
+def test_ctl_status_builds_the_repeat_summary_without_reparsing_a_job_line():
+    text = client.format_status({"improve_repeat": {
+        "id": "opaque: prefix", "kind": "improve", "state": "running", "result_code": None,
+        "result": {"runs": 2, "max_runs": 10, "elapsed_sec": 305,
+                   "duration_sec": 1800, "mission_id": 2358, "stop_requested": False}}})
+
+    assert "improve の繰り返し: 実行中、実施 2 回 / 最大 10 回、経過 5m / 30m、残り 25m、実行中 mission #2358" in text.splitlines()
+
+
 def test_ctl_status_sanitises_control_characters_in_a_plugin_name():
     text = client.format_status({"plugin_deploy_ops": {"open": [
         {"op_id": 1, "name": "bad\x1b[31mname", "op_kind": "disable_symlink",

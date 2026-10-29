@@ -49,8 +49,8 @@ def _settings():
 
 
 class _Runner:
-    def __init__(self, loop, *, result=None, error=None, call_on_ready=False):
-        self.loop, self.result, self.error = loop, result, error
+    def __init__(self, loop, *, result=None, error=None, call_on_ready=False, advance=None):
+        self.loop, self.result, self.error, self.advance = loop, result, error, advance
         self.call_on_ready = call_on_ready
         self.on_ready = None
 
@@ -59,6 +59,8 @@ class _Runner:
             self.on_ready({"type": "ready", "ok": True})
         if self.error is not None:
             raise self.error
+        if self.advance is not None:
+            self.advance()
         return self.result
 
 
@@ -115,7 +117,8 @@ class FakeLoop:
             raise kind()
         runner = _Runner(self, result=step.get("result", _result()),
                          error=step.get("run_error"),
-                         call_on_ready=step.get("ready", slot_key is not None))
+                         call_on_ready=step.get("ready", slot_key is not None),
+                         advance=step.get("advance"))
         runner.on_ready = on_ready
         ctx.step = step
         return "mission", ctx, runner
@@ -345,6 +348,29 @@ def test_repeat_prepare_failure_keeps_its_context_on_the_finished_event(db_path,
             "reason_code": "prepare_failed", "tool_calls": None,
             "repeat_run": 1, "repeat_max_runs": 1,
             "repeat_elapsed_sec": 0, "repeat_duration_sec": 600})]
+
+
+def test_repeat_finish_recomputes_elapsed_and_coerces_float_duration_to_int(
+        db_path, tmp_path):
+    class Monotonic:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    monotonic = Monotonic()
+    sup, loop = build(db_path, tmp_path, [{"advance": lambda: setattr(monotonic, "value", 405.0)}])
+    sup.submit_repeat(
+        duration_sec=600.9, max_runs=1, comment_holder=None, on_progress=lambda _: None,
+        cancel_event=threading.Event(), autopilot_check=lambda: False,
+        monotonic=monotonic, deadline_mono=700.0,
+        deadline_at="2026-10-25T03:10:00+00:00")
+    started_event, finished_event = [fields for _, fields in events(db_path)]
+
+    assert started_event["repeat_elapsed_sec"] == 0
+    assert started_event["repeat_duration_sec"] == 600
+    assert finished_event["repeat_elapsed_sec"] == 305
+    assert finished_event["repeat_duration_sec"] == 600
 
 
 @pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit])

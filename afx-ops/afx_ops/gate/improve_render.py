@@ -81,19 +81,6 @@ def _snapshot(value: object) -> dict | None | bool:
     return {key: value[key] for key in keys}
 
 
-def _repeat(value: object) -> dict | None | bool:
-    if value is None:
-        return None
-    if type(value) is not dict or set(value) != {"run", "max_runs", "elapsed_sec", "duration_sec"}:
-        return False
-    run, maximum = value["run"], value["max_runs"]
-    elapsed, duration = value["elapsed_sec"], value["duration_sec"]
-    if (not _int(run, low=1) or not _int(maximum, low=1) or run > maximum
-            or not _int(elapsed) or not _int(duration, low=60)):
-        return False
-    return value
-
-
 def _approval(value: object) -> dict | None | bool:
     if value is None:
         return None
@@ -165,16 +152,15 @@ def validate_improve_run(data: object, mission_id: int) -> dict | None:
             or not (data.get("elapsed_sec") is None or _int(data["elapsed_sec"]))
             or data.get("report_state") not in REPORT_STATES):
         return None
-    snapshot, approval, floor, repeat = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
-                                         _floor(data.get("floor")), _repeat(data.get("repeat")))
-    if snapshot is False or approval is False or floor is False or repeat is False:
+    snapshot, approval, floor = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
+                                 _floor(data.get("floor")))
+    if snapshot is False or approval is False or floor is False:
         return None
     if floor is _DROP_FLOOR or not _floor_allowed(snapshot, data["report_state"]):
         floor = None
     return {"id": data["id"], "backend": data["backend"], "model": data["model"],
             "elapsed_sec": data["elapsed_sec"], "snapshot": snapshot,
-            "report_state": data["report_state"], "approval": approval, "floor": floor,
-            "repeat": repeat}
+            "report_state": data["report_state"], "approval": approval, "floor": floor}
 
 
 # ------------------------------------------------------------ 文面
@@ -304,7 +290,7 @@ def render_improve_start(payload: Mapping[str, object], detail: dict | None) -> 
     backend = cut_escaped(detail["backend"], FIELD_CHARS)
     model = cut_escaped(detail["model"], FIELD_CHARS)
     lines = [head, f"backend {backend} / {model}"]
-    repeat = _repeat_line(detail.get("repeat")) or _repeat_line(_event_repeat(payload))
+    repeat = _repeat_line(_event_repeat(payload))
     if repeat is not None:
         lines.append(repeat)
     return _fit(lines)
@@ -323,7 +309,7 @@ def render_improve_finish(payload: Mapping[str, object], detail: dict | None) ->
     lines = [_heading(mission_id, snapshot["result_code"], snapshot["reason_code"],
                       detail["report_state"])]
     lines.extend(_body_lines(snapshot, detail))
-    repeat = _repeat_line(detail.get("repeat")) or _repeat_line(_event_repeat(payload))
+    repeat = _repeat_line(_event_repeat(payload))
     if repeat is not None:
         lines.append(repeat)
     lines.append(_last_line(detail["elapsed_sec"], snapshot["tool_calls"]))

@@ -88,6 +88,19 @@ def test_duration_only_does_not_take_the_one_shot_path(ops_env):
     assert sup.repeat_calls[0]["duration_sec"] == 3600
 
 
+def test_terminal_repeat_job_elapsed_stops_at_its_terminal_monotonic_time(ops_env):
+    service = _service(ops_env, FakeSupervisor())
+    job = service.jobs.enqueue_single(
+        OPERATOR, None, "improve", lambda _: {}, deadline_seconds=35.0,
+        busy_code=ErrorCode.IMPROVE_RUNNING,
+        initial_result={"elapsed_sec": 0, "duration_sec": 600}, repeat=True)
+    job.started_mono = 100.0
+    job.terminal_mono = 425.0
+    job.state = JobState.DONE
+
+    assert service._job_view(job)["result"]["elapsed_sec"] == 325
+
+
 # ---- 受理前の検査 ----
 
 @pytest.mark.parametrize("kwargs", [
