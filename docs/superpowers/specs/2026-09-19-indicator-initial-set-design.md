@@ -294,7 +294,7 @@ def _float_param(params: dict, name: str, default: float) -> float:
 | `compute(df, params)` がモジュール直下に定義され、位置引数名が完全一致・デコレータなし・必須 kwonly なし | `loader._KIND_FUNCS` (`:93-97`) / `_has_matching_function` (`:371-411`) | 9 本とも `def compute(df: pd.DataFrame, params: dict) -> dict:` |
 | フォルダ直下に規定 3 ファイル以外の `.py` を置かない (`conftest.py` 同梱の遮断) | `loader._reject_unexpected_py_files` (`:519-539`) | 3 ファイルのみ。`__pycache__/` はディレクトリなので対象外 |
 
-**禁止事項 (サンドボックスの実測結果、§5)**: `df.open` のような属性アクセス (`open` は denylist)、`to_frame` を含む `to_` 接頭辞のメソッド (許可は `to_dict`/`to_list`/`to_numpy`/`to_pydatetime` の 4 つのみ)、`getattr`、`global`、外部オブジェクトの属性への代入。**OHLCV 列は必ず `df["open"]` のように添字で取る。**
+**禁止事項 (サンドボックスの実測結果、§5)**: `df.open` のような属性アクセス (`open` は denylist)、`to_frame` を含む `to_` 接頭辞のメソッド。`to_` の許可一覧は `sandbox._TO_ALLOWED` が正であり、2026-10-29 時点では `to_datetime`/`to_dict`/`to_list`/`to_numeric`/`to_numpy`/`to_pydatetime`/`to_timedelta` の 4 つである。`getattr`、`global`、外部オブジェクトの属性への代入も禁止する。**OHLCV 列は必ず `df["open"]` のように添字で取る。**
 
 **入力 df を書き換えない (r2 I2)**: `check_source` は**属性**代入 (`df.attrs = ...`) を拒否するが (`sandbox.py:202-214` の `isinstance(node.ctx, (ast.Store, ast.Del))`)、**添字代入 `df["tmp"] = ...` は拒否しない** (実測で PASS)。したがって「入力を壊さない」は AST では守られておらず、**作者の規律 + 受入条件 I9 (入力不変・反復決定性) が唯一の観測点**である。必要なら `df["close"].copy()` や新しい `pd.Series` を作る。
 
@@ -496,6 +496,7 @@ I3 / I4 / I9 は各 plugin の `test_plugin.py` の中 (= bless の pytest ゲ�
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-29 | v1.3g | `to_` の許可一覧を「4 つのみ」から、sandbox の `_TO_ALLOWED` を正とする 7 名へ訂正 | sandbox の許可集合拡張に文書が追随していなかったため | — |
 | 2026-09-19 | v1.3f | **3 周目レビュー (絞り込み、codex terra 1 束) の是正を反映。Critical 0 / Important 1。** **§4**: `_reject_unknown_params` が `set(params)` / `sorted(...)` を無条件に呼んでおり、`params` が非 dict (`None` 等) や未知キーの型が混ざる場合 (`{0: 1, "typo": 1}`) に規約どおりの `ValueError` ではなく生の `TypeError` を漏らしていた。**規則表に「`params` 自体が非 mapping / 未知キー型混在」の行を追加** — 非 mapping は `params.` 接頭辞のまま `ValueError`、未知キー選択は型を跨いで比較しない決定的な順序 (str 優先 + repr) にする。9 本の `plugin.py` を同形で是正、自己テストに負例を追加 (160 → 214 passed) | 3 周目 codex terra Important (`tmp/review-20260919-iis/r3/codex-1.md`) | 本行の docs commit |
 | 2026-09-19 | v1.3e | **設計変更 1 件 (締め付け方向、ユーザー提示済)。** **§4**: params の規則表に「**未知キーは `ValueError`**」を追加し、既定値の出所を `plugin.py` の `_DEFAULTS` 1 箇所に定める (受入テストは `config.yaml` の `params` と `_DEFAULTS` を**型込みで**比較)。**§8.4** を新設し、影響の全数確認 (params が `compute` に届く 2 経路と、ハーネスが内部キーを足さないこと) を実コードの行番号つきで記録。動機は「出力比較が弱い」ではなく**本番の穴** — strategy 側の params 上書きは承認不要なので、綴り誤りが黙って既定値で動くと、その値を前提にした backtest 結果が出る | 2 周目 codex terra Important (`tmp/review-20260919-iis/r2/codex/codex-1.md`)。2026-09-19 指揮者裁定で採用、ユーザーへ提示済。**異論が出たら revert できるよう commit 列を分離** | `a97b3bc` (plugin 9 本 + 自己テスト) / `e2214aa` (受入テスト) / 本行の docs commit |
 | 2026-09-19 | v1.3d | **設計変更なし — 記述の訂正 1 件。** **§6 I5** の fixture 生成式①の `open` を `open = close` から **`open[0] = close[0]` / `open[t] = close[t−1]` (t > 0)** (前足の終値) へ訂正。実テスト (`_df` / `_spike_df` / `_trend_df` / `_degenerate_df`) と 9 本の自己テスト `_mkdf` はいずれも前足 close を入れており、**spec の文言だけが実態に追いついていなかった**。`open == close` の fixture は「close の代わりに open を読む」型の変異 (M-sma-4) を素通りさせるので、実態側が正しい。9 本のどれも `open` を読まないため数値結果は不変、**コードは 1 行も変えない** | 2 周目 codex terra Minor (`tmp/review-20260919-iis/r2/codex/codex-1.md`)。1 周目トリアージ §4-6 で「コードを spec に寄せる是正はしない」と申し送り済 | 本行の docs commit |

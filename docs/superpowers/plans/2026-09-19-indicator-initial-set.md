@@ -43,8 +43,9 @@ r1 (C0/I4/M2 全件採用) / r2 (C0/I3/M0 全件採用) / r3 (**指摘 0、収�
   `_int_param` / `_float_param` / `_true_range` は**使う plugin がそれぞれ逐語で持つ**
   (共有 import は構造的に不可能)。直すときは該当する全 plugin をまとめて直す
 - **`check_source` で落ちる 3 形を使わない** (実測済み): `df.open` のような属性アクセス
-  (`open` は denylist)、`to_frame` を含む `to_` 接頭辞のメソッド (許可は
-  `to_dict`/`to_list`/`to_numpy`/`to_pydatetime` の 4 つのみ)、`getattr`。
+  (`open` は denylist)、`to_frame` を含む `to_` 接頭辞のメソッド (`to_` の許可一覧は
+  sandbox の `_TO_ALLOWED` が正で、2026-10-29 時点では
+  `to_datetime`/`to_dict`/`to_list`/`to_numeric`/`to_numpy`/`to_pydatetime`/`to_timedelta` の 4 つ)、`getattr`。
   加えて `global` 文と**外部オブジェクトの属性への代入**も拒否される。
   **OHLCV 列は必ず `df["open"]` のように添字で取る**
 - **params は「変換」ではなく「型の確認」** (設計書 §4)。`int(params.get(...))` を書かない。
@@ -6941,6 +6942,7 @@ I8(b) の残骸 assert に「journal 0 行」を書くと red /
 
 | 日付 | 版 | 変更 | 理由 | commit |
 |---|---|---|---|---|
+| 2026-10-29 | v1.6 | `to_` の許可一覧を「4 つのみ」から、sandbox の `_TO_ALLOWED` を正とする 7 名へ訂正 | sandbox の許可集合拡張に文書が追随していなかったため | — |
 | 2026-09-19 | v1.0 | 起案。設計書 v1.3a を T0 (共通テンプレート) / T1〜T9 (指標 1 本ずつ、並列可) / T10 (repo 側受入テストと runbook) の 11 task へ分割。**T1〜T9 の逐語コード 27 ファイルは指揮者が scratchpad で生成・実行し 131 passed を確認済み**。逆変異 54 件を実測し 54/54 KILLED (初回 9 件生存 → すべてテスト側の欠陥として修正)。I5 の数値・壊れた実装の red・等価変異 1 件を「着手前検証の記録」に記載 | 設計書 v1.3a (codex 設計レビュー r3 で指摘 0、収束) | - |
 | 2026-09-19 | v1.5 | **3 周目 (絞り込み、codex terra 1 束) の是正を反映。Critical 0 / Important 1** — `_reject_unknown_params` が非 dict の `params` と型混在キーで `TypeError` を出す → `ValueError` の統一形へ。`params` が `dict` でなければキー検査の前に `params.` 接頭辞つきの `ValueError` を投げ、未知キーの選択は型を跨いで比較しない決定的な順序 (str キー優先の辞書順 → 非 str キーは `repr` 順) にする。9 本の `plugin.py` (`_reject_unknown_params` の関数本体は 9 本で逐語同一のまま) と自己テスト (負例 6 件 x 9 本、160 → **214 passed**) に反映し、プラン記載の抽出コマンドで T1〜T9 の 27 ファイル + Step 10-i = 28 ブロックすべて DIFF-ZERO を再確認。設計書 §4 に非 mapping / 型混在キーの文言規則の行を追加 (v1.3f) | `tmp/review-20260919-iis/r3/codex-1.md`、是正 diff `4b09c86..d1e15bf` | `5d8c325` (plugin 9 本 + 自己テスト) / 本行の docs commit |
 | 2026-09-19 | v1.1 | **T10 の着手前検証** (Critical 4 / Important 8 / Minor 5) を全件反映。Step 10-b〜10-h を実物照合済みの記述へ改訂し、**Step 10-i に完成ファイル `tests/plugin/test_indicator_initial_set.py` の逐語 (実測 10 passed / 41.7 秒) を追加**。「着手前検証の記録 §8」の 2 件を設計書 v1.3b へ反映して閉じ、§9 に T10 の実測を追加。**T1〜T9 の節と行番号は一切動かしていない** (改訂は L4438 以降 + 冒頭 1 行の版表記のみ)。なお本文 L24 / L73 の「設計書 v1.3a」表記は、T10 より前の行を動かさない制約のため据え置き — **v1.3b は v1.3a に対する設計変更ゼロの改訂** (観測値の訂正 + 既知の欠落の起票) なので参照の妥当性は保たれる | T10 は起草者自身が「tmp 環境での bless 実測をしていない、最もプラン記述の欠陥を踏みやすい」と申告していた箇所 ([[plan-code-defects-not-implementer-defects]] 「着手前検証を必須工程にする」) | - |

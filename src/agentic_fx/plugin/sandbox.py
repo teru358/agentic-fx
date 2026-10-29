@@ -185,8 +185,21 @@ _DENY_NAMES = frozenset({
 })
 
 # `to_` 前綴りの属性は既定で禁止 (`to_csv`/`to_pickle`/`to_sql` 等の I/O
-# 系メソッドを想定) だが、純粋な型変換であるこの 4 つだけは許可する。
-_TO_ALLOWED = frozenset({"to_dict", "to_list", "to_numpy", "to_pydatetime"})
+# 系メソッドを想定) だが、純粋な型変換だけは許可する。
+_TO_ALLOWED = frozenset({
+    "to_datetime", "to_dict", "to_list", "to_numeric", "to_numpy",
+    "to_pydatetime", "to_timedelta",
+})
+
+
+def allowed_to_conversions() -> tuple[str, ...]:
+    """plugin コードで使える `to_` 名をソート済みで返す。"""
+    return tuple(sorted(_TO_ALLOWED))
+
+
+def denied_names() -> tuple[str, ...]:
+    """plugin コードで使えない固定名をソート済みで返す。"""
+    return tuple(sorted(_DENY_NAMES))
 
 
 def _is_denied_bare_name(name: str) -> bool:

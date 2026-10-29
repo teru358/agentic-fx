@@ -370,7 +370,7 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
             "{user_policy_tail}", "{plugin_name_pattern}",
             "{plugin_contract_summary}", "{staging_dir}",
             "{source_snapshot_dir}", "{min_test_functions}",
-            "{profitability_floor_rule}"):
+            "{profitability_floor_rule}", "{sandbox_to_allowed}"):
         assert placeholder not in text, f"未展開のプレースホルダ: {placeholder}"
     assert str(tmp_path / "staging") in text
     assert str(tmp_path / "source") in text
@@ -378,6 +378,33 @@ def test_render_improve_mission_prompt_fills_all_placeholders(tmp_path):
     # F7-5: 規律に「宣言全 pair を最低 1 回 backtest」が含まれる。
     assert "宣言した全 pair を" in text
     assert "最低 1 回 `run_backtest`" in text
+
+
+def test_render_improve_mission_prompt_states_sandbox_conversion_allowlist(tmp_path):
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    from agentic_fx.plugin.sandbox import (
+        allowed_to_conversions, check_source, denied_names,
+    )
+
+    loop = ImproveLoop.__new__(ImproveLoop)
+    loop._settings = SETTINGS
+    ctx = _FakeRunContext(tmp_path / "staging", tmp_path / "source")
+
+    text = loop._render_improve_mission_prompt(_sample_ctx_data(), ctx=ctx)
+
+    allowed = ", ".join(f"`{name}`" for name in allowed_to_conversions())
+    denied = ", ".join(f"`{name}`" for name in denied_names())
+    assert (
+        "plugin のコードでは `read_` / `to_` で始まる名前と、固定の禁止名 "
+        f"{denied} は使えません (変数名・引数名・関数定義名・from-import にも及びます)。"
+        f"`to_` の例外は {allowed} です。"
+    ) in text
+    for name in allowed_to_conversions():
+        source = tmp_path / f"{name}.py"
+        source.write_text(
+            f"from pandas import {name}\n"
+            "def compute(df, params):\n    return {}\n")
+        check_source(source)
 
 
 def test_f7_3_floor_rule_text_renders_min_pf_from_settings(tmp_path):

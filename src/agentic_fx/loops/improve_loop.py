@@ -71,7 +71,9 @@ from agentic_fx.plugin.gate_pytest import (
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.resolve import InventoryBuildResult, is_relock_transition
-from agentic_fx.plugin.sandbox import SandboxError, check_source
+from agentic_fx.plugin.sandbox import (
+    SandboxError, allowed_to_conversions, check_source, denied_names,
+)
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
@@ -1205,6 +1207,10 @@ class ImproveLoop:
             "plugin_contract_summary": refs["plugin_contract_summary"],
             "staging_dir": str(ctx.staging_dir),
             "source_snapshot_dir": str(ctx.source_snapshot_dir),
+            "sandbox_to_allowed": ", ".join(
+                f"`{name}`" for name in allowed_to_conversions()),
+            "sandbox_denied_names": ", ".join(
+                f"`{name}`" for name in denied_names()),
             # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
             # 文言は settings からレンダする (ハードコードすると設定変更後
             # にゲートと説明が食い違う)。

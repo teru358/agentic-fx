@@ -23,8 +23,9 @@ import pytest
 from agentic_fx.config import load_settings
 from agentic_fx.plugin.loader import PluginMeta, content_hash as _real_content_hash
 from agentic_fx.plugin.sandbox import (
-    SandboxError, check_source, run_plugin, _build_env, _SINGLE_THREAD_ENV,
-    PluginSession, reap_orphans,
+    PluginSession, SandboxError, _SINGLE_THREAD_ENV, _build_env,
+    allowed_to_conversions, check_source, denied_names, reap_orphans,
+    inherited_filter_preflight, run_plugin,
 )
 
 
@@ -176,6 +177,32 @@ def compute(df, params):
     return {"x": 1.0}
 """
 
+CONVERSION_APIS_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    numeric = pd.to_numeric(df["close"], errors="raise")
+    formatted = pd.to_datetime(
+        ["2026-01-01", "2026-01-02"], format="%Y-%m-%d", cache=True)
+    elapsed = pd.to_timedelta(["1 day"], errors="raise")
+    origin = pd.to_datetime("2026-01-01", format="%Y-%m-%d", cache=True)
+    from_origin = pd.to_datetime([0, 1], unit="D", origin=origin, cache=True)
+    return {"numeric": float(numeric.iloc[-1]),
+            "formatted": formatted[1].timestamp(),
+            "elapsed": elapsed[0].total_seconds(),
+            "origin": from_origin[1].timestamp()}
+"""
+
+PYARROW_NUMERIC_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    values = pd.to_numeric(df["close"], dtype_backend="pyarrow")
+    return {"value": float(values.iloc[-1])}
+"""
+
 
 # --- check_source: allowlist/denylist -----------------------------------
 
@@ -324,7 +351,7 @@ def test_check_source_rejects_function_named_with_denied_prefix(tmp_path):
 
 
 def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
-    """`to_numpy` は許可 4 種の 1 つ — from-import で持ち込んでも拒否
+    """`to_numpy` は許可リストの 1 つ — from-import で持ち込んでも拒否
     されないことのピン (実在の pandas API では無い名前だが、
     `check_source` は AST のみを見て実行はしないため合成できる)。"""
     src = tmp_path / "ok.py"
@@ -332,6 +359,93 @@ def test_check_source_allows_from_import_of_to_numpy_allowed_name(tmp_path):
         "from pandas import to_numpy\n"
         "def compute(df, params):\n    return {}\n")
     check_source(src)  # 例外を投げなければ OK
+
+
+@pytest.mark.parametrize("name", allowed_to_conversions())
+@pytest.mark.parametrize("source", [
+    "import pandas as pd\n"
+    "def compute(df, params):\n"
+    "    return pd.{name}(df['close'])\n",
+    "def compute(df, params):\n"
+    "    return {name}\n",
+    "def {name}(df, params):\n"
+    "    return {{}}\n",
+    "from pandas import {name}\n"
+    "def compute(df, params):\n"
+    "    return {{}}\n",
+])
+def test_check_source_allows_pure_conversions_across_ast_name_paths(
+        tmp_path, name, source):
+    """許可された変換名は Attribute/Name/定義/from-import で一貫して通る。"""
+    src = tmp_path / "ok.py"
+    src.write_text(source.format(name=name))
+    check_source(src)
+
+
+def test_sandbox_name_rule_accessors_are_sorted_and_complete():
+    assert allowed_to_conversions() == tuple(sorted(allowed_to_conversions()))
+    assert denied_names() == tuple(sorted(denied_names()))
+    assert set(allowed_to_conversions()).isdisjoint(denied_names())
+    assert {"open", "getattr", "set_option"}.issubset(denied_names())
+
+
+def test_conversion_api_plugin_sources_pass_static_sandbox_validation(tmp_path):
+    conversion_path = tmp_path / "conversions.py"
+    conversion_path.write_text(CONVERSION_APIS_PY)
+    pyarrow_path = tmp_path / "pyarrow.py"
+    pyarrow_path.write_text(PYARROW_NUMERIC_PY)
+
+    check_source(conversion_path)
+    check_source(pyarrow_path)
+
+
+def test_real_session_allows_conversion_apis_and_pyarrow_is_a_plugin_error(
+        tmp_path, plugin_settings):
+    reason = inherited_filter_preflight()
+    if reason is not None:
+        pytest.skip(f"requires a runnable PluginSession sandbox ({reason})")
+    conversion_meta = _meta(tmp_path, "conversions", "indicator", CONVERSION_APIS_PY)
+    conversion_session = PluginSession(conversion_meta, settings=plugin_settings)
+    with conversion_session:
+        out = conversion_session.call({"df": _df(), "params": {}})
+    assert out == {"numeric": 102.9, "formatted": 1767312000.0,
+                   "elapsed": 86400.0, "origin": 1767312000.0}
+    assert (conversion_session.worker_returncode, conversion_session.worker_signal,
+            conversion_session.parent_kill_sent) == (0, None, False)
+
+    pyarrow_meta = _meta(tmp_path, "pyarrow", "indicator", PYARROW_NUMERIC_PY)
+    pyarrow_session = PluginSession(pyarrow_meta, settings=plugin_settings)
+    with pytest.raises(SandboxError,
+                       match=r"(ImportError|ModuleNotFoundError): .*pyarrow"):
+        with pyarrow_session:
+            pyarrow_session.call({"df": _df(), "params": {}})
+    assert (pyarrow_session.worker_returncode, pyarrow_session.worker_signal,
+            pyarrow_session.parent_kill_sent) == (0, None, False)
+
+
+@pytest.mark.parametrize("name", [
+    "read_csv", "load", "to_csv", "to_pickle", "to_sql", "to_parquet",
+    "to_hdf",
+])
+@pytest.mark.parametrize("source", [
+    "import pandas as pd\n"
+    "def compute(df, params):\n"
+    "    return pd.{name}(df['close'])\n",
+    "def compute(df, params):\n"
+    "    return {name}\n",
+    "def {name}(df, params):\n"
+    "    return {{}}\n",
+    "from pandas import {name}\n"
+    "def compute(df, params):\n"
+    "    return {{}}\n",
+])
+def test_check_source_rejects_denied_names_across_ast_name_paths(
+        tmp_path, name, source):
+    """read_、固定 denylist、書出し to_ は全 AST 経路で一貫して拒否する。"""
+    src = tmp_path / "bad.py"
+    src.write_text(source.format(name=name))
+    with pytest.raises(SandboxError, match=name):
+        check_source(src)
 
 
 # --- レビュー fix round 1 F4: ExcelWriter/HDFStore/dump denylist 補完 ----
