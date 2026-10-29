@@ -68,7 +68,7 @@ def test_supported_set_is_the_single_spec_entry_with_both_record_hashes():
     runtimes = F.supported_runtimes()
     assert len(runtimes) == 1
     s = runtimes[0]
-    assert (s.kernel_release, s.machine, s.landlock_abi) == ("7.0.0-38-generic", "x86_64", 8)
+    assert (s.kernel_release, s.machine, s.landlock_abi) == ("7.0.0-42-generic", "x86_64", 8)
     assert (s.glibc_version, s.glibc_build) == ("2.43", "Ubuntu GLIBC 2.43-2ubuntu2.4")
     assert (s.python_version, s.python_build) == ("3.13.14", ("main", "Jun 11 2026 04:03:13"))
     assert s.numpy == F.DistIdentity("numpy", "2.5.1", "meson",
