@@ -1,6 +1,6 @@
 # 参照系列 (株価指数など) を戦略の材料にする — 設計 C1
 
-**版:** v0.6 C1 (裁定済)（sol 4 周目の指摘全件を反映）
+**版:** v0.6.1 C1 (裁定済)（sol 4 周目の指摘全件を反映）
 **チケット:** `reference-symbols-as-indicator-inputs`（中）、`multi-timeframe-indicator-deps`（低）、`executor-pair-membership-guard`（高、T1 に含める）
 **正本の関係:** indicator の loader / resolver / pin は `2026-09-14-indicator-consumption-wiring-design.md` を拡張する。価格源の outage / backfill 規則は `2026-09-24-outage-stop-and-backfill-design.md` を変更しない。
 
@@ -46,7 +46,7 @@
 
 初回 wizard は固定 stage を増やさない。段 3 の「MT5 接続済み」分岐でだけ `/symbols` 成功後に候補を任意選択させ、初回既定は空、再実行既定は現在の `watch_symbols` とする。bridge 未接続、認証、timeout は既存 probe と同じ安全なエラーへ送り、値を黙って空にしない。選択結果は段 9 の要約に出し、段 10 の commit まで settings を書かない。yfinance / Twelve Data 分岐には出さない。
 
-参照 symbol は `settings.pairs` に決して昇格しない。T1 で `action=open and intent.pair not in settings.pairs` を executor の通常 open と five-phase の両入口で `not_tradable_symbol` reject にする。検査は `quote_fn`、`spec_fn`、broker の前であり、`risk.pair_rules` の余剰 key も起動時に拒否する。trade-intent schema の enum は `settings.pairs` のまま保つ。
+参照 symbol は `settings.pairs` に決して昇格しない。T1 で `action=open and intent.pair not in settings.pairs` を executor の通常 open と five-phase の両入口で `not_tradable_symbol` reject にする。検査は `quote_fn`、`spec_fn`、broker の前であり、`risk.pair_rules` の余剰 key (`pairs` に無い pair の規則) は起動時に警告する (拒否しない。発注の境界は `pairs` の membership 検査で、余剰の規則は取引対象を増やさない。同梱の設定例と既存の個人設定を壊さないため)。trade-intent schema の enum は `settings.pairs` のまま保つ。
 
 ### 2.2 取得、保存、状態表示
 
@@ -125,7 +125,7 @@ family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encod
 
 | task | 内容と成果物 | AC | 依存 | exit criteria | 見積り | 担当 |
 |---|---|---|---|---|---:|---|
-| T1 契約・安全境界 | schema v5 migration、MT5-only/raw symbol、`IndicatorRef` / resolver / audit、duration、named-frame payload と call 入力上限、executor membership guard、時刻純関数と UTC fixture | AC-1, 3–6, 11, 14 | なし | schema / resolver、`risk.pair_rules` 余剰 key、all-open-path I/O 0、protocol の limit / limit+1 / shared-frame、UTC / 4h / 1d の安全境界試験が全て通る | 650–850 行 | sonnet（通常 / five-phase の競合境界試験を含む） |
+| T1 契約・安全境界 | schema v5 migration、MT5-only/raw symbol、`IndicatorRef` / resolver / audit、duration、named-frame payload と call 入力上限、executor membership guard、時刻純関数と UTC fixture | AC-1, 3–6, 11, 14 | なし | schema / resolver、`risk.pair_rules` 余剰 key の警告、all-open-path I/O 0、protocol の limit / limit+1 / shared-frame、UTC / 4h / 1d の安全境界試験が全て通る | 650–850 行 | sonnet（通常 / five-phase の競合境界試験を含む） |
 | T2 live 取得・worker 配線 | symbol-keyed registry、hard-first/soft backoff、raw MT5 adapter、1h→4h/1d、named frames、`ohlcv` 配備、strategy skip、status/activity | AC-2, 5–7, 12, 14 | T1 | capped exponential backoff の増加列と cap、`K_ref_actual`→native 本数、4h / 1d の完全・先頭不足・末尾部分 bucket、固定 activity reason の試験が通る | 700–950 行 | codex（純 Python） |
 | T3 backtest・履歴・改善 | 同一 dataset preflight、live/backtest parity、family v2 / legacy、inventory sink、`run_backtest` 配線 | AC-7–9, 12, 15 | T1, T2 | 推奨 fail-closed で history 完全不在なら `backtest_runs` の run 行、signal、order、候補 archive 等の業務副作用は 0 件。ただし RPC ledger・mission transcript・activity の監査記録は残す。NaN/seed は skip、live/backtest の入力列一致、v2 round-trip / legacy 読取の試験が通る | 550–750 行 | codex（純 Python） |
 | T4 wizard・read tool・check・文書 | stage 3 `/symbols`、read schema 分離、check warning、history/corr 操作文、ops / golden 更新 | AC-9–10, 13 | T1–T3 | raw adapter 経路と runtime membership を組にした read-tool 試験、wizard zero-write と golden / 操作文更新が通る | 400–600 行 | codex（純 Python） |
@@ -182,3 +182,4 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-28 | v0.5 C1 | I-5・I-6・R5 | 設計レビュー 4 周目 (sol) | |
 | 2026-10-28 | v0.5.1 C1 | runtime 超過の固定 reason `reference_window_exceeded_at_runtime` (§2.3、AC-3)、AC-14 を `K_ref_actual` に統一 | 設計レビュー 5 周目 (sol、I-5 部分・I-7) | |
 | 2026-10-28 | v0.6 C1 | §4 の R1・R2・R4 を推奨どおりユーザー裁定済に | ユーザー承認、実装着手 | |
+| 2026-10-29 | v0.6.1 C1 | `risk.pair_rules` の余剰 key は起動拒否でなく警告 (§2.1、T1 の exit criteria) | T1a で設定例 (EURUSD の規則) と衝突。membership 検査が境界で余剰規則は取引対象を増やさない | |
