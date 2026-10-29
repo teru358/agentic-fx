@@ -26,3 +26,4 @@ afx ctl improve -t / -n の繰り返し中、何回目の実施か・経過時�
 
 - 2026-10-28: 起票。
 - 2026-10-29: 状態: 実装中 — 2026-10-29: main d2c8bf76 で merge・配備。次の afx ctl improve -t / -n で Discord・jobs get・status の表示を確認して closed
+- 2026-10-29: 状態: 実装中 — 2026-10-29 本機: jobs get / status の表示を確認。不具合: 終了後も「残り 23h56m」「実行中 mission #2498」と出る (終了後は残りを出さず「最後の mission」にすべき)。Discord の表示はユーザー確認待ち
