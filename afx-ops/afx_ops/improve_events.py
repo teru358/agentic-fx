@@ -9,7 +9,11 @@ from __future__ import annotations
 import re
 
 CODE = "improve_run_changed"
-FIELDS = frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls"})
+FIELDS = frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls",
+                    "repeat_run", "repeat_max_runs", "repeat_elapsed_sec",
+                    "repeat_duration_sec"})
+_REPEAT_KEYS = ("repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec")
+_REPEAT_FIELDS = frozenset(_REPEAT_KEYS)
 REF_PATTERN = re.compile(r"improve:[0-9]{1,18}\Z")
 
 STATES = frozenset({"started", "finished"})
@@ -34,8 +38,19 @@ def valid_tool_calls(value: object) -> bool:
 
 def valid_fields(fields: object) -> bool:
     """field 集合の完全一致と、各値の文法・範囲を満たすか。"""
-    return (type(fields) is dict and set(fields) == FIELDS
-            and type(fields["state"]) is str and fields["state"] in STATES
+    if type(fields) is not dict or not FIELDS - _REPEAT_FIELDS <= set(fields) <= FIELDS:
+        return False
+    repeat_values = tuple(fields.get(key) for key in _REPEAT_KEYS)
+    if any(value is not None and (type(value) is not int or value < 0)
+           for value in repeat_values):
+        return False
+    if any(value is None for value in repeat_values) and any(value is not None for value in repeat_values):
+        return False
+    if (repeat_values[0] is not None and (repeat_values[0] < 1
+                                           or repeat_values[1] < repeat_values[0]
+                                           or repeat_values[3] < 60)):
+        return False
+    return (type(fields["state"]) is str and fields["state"] in STATES
             and type(fields["trigger"]) is str and fields["trigger"] in TRIGGERS
             and valid_result_code(fields["result_code"])
             and valid_reason_code(fields["reason_code"])

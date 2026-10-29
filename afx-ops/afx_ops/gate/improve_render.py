@@ -196,6 +196,32 @@ def _last_line(elapsed: int | None, tool_calls: int | None) -> str:
     return f"所要 {format_elapsed(elapsed)} / {tool}"
 
 
+def _repeat_line(repeat: object) -> str | None:
+    if type(repeat) is not dict:
+        return None
+    run, maximum = repeat.get("run"), repeat.get("max_runs")
+    elapsed, duration = repeat.get("elapsed_sec"), repeat.get("duration_sec")
+    if (type(run) is not int or type(maximum) is not int or type(elapsed) is not int
+            or type(duration) is not int or run < 1 or run > maximum or elapsed < 0
+            or duration < 60):
+        return None
+    return f"繰り返し {run}/{maximum} 回 · {_repeat_span(elapsed // 60)}/{_repeat_span(duration // 60)}"
+
+
+def _repeat_span(minutes: int) -> str:
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours > 0 else f"{minutes}m"
+
+
+def _event_repeat(payload: Mapping[str, object]) -> dict | None:
+    values = (payload.get("repeat_run"), payload.get("repeat_max_runs"),
+              payload.get("repeat_elapsed_sec"), payload.get("repeat_duration_sec"))
+    if any(type(value) is not int for value in values):
+        return None
+    return {"run": values[0], "max_runs": values[1], "elapsed_sec": values[2],
+            "duration_sec": values[3]}
+
+
 def _pf(value: float | None) -> str:
     text = "-" if value is None else f"{value:.2f}"
     return "0.00" if text == "-0.00" else text
@@ -263,7 +289,11 @@ def render_improve_start(payload: Mapping[str, object], detail: dict | None) -> 
         return head
     backend = cut_escaped(detail["backend"], FIELD_CHARS)
     model = cut_escaped(detail["model"], FIELD_CHARS)
-    return _fit([head, f"backend {backend} / {model}"])
+    lines = [head, f"backend {backend} / {model}"]
+    repeat = _repeat_line(_event_repeat(payload))
+    if repeat is not None:
+        lines.append(repeat)
+    return _fit(lines)
 
 
 def render_improve_finish(payload: Mapping[str, object], detail: dict | None) -> str:
@@ -279,5 +309,8 @@ def render_improve_finish(payload: Mapping[str, object], detail: dict | None) ->
     lines = [_heading(mission_id, snapshot["result_code"], snapshot["reason_code"],
                       detail["report_state"])]
     lines.extend(_body_lines(snapshot, detail))
+    repeat = _repeat_line(_event_repeat(payload))
+    if repeat is not None:
+        lines.append(repeat)
     lines.append(_last_line(detail["elapsed_sec"], snapshot["tool_calls"]))
     return _fit(lines)

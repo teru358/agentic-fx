@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from agentic_fx.ops import client as ops_client
 from agentic_fx.ops import events as ev
 from agentic_fx.ops import trade_events as te
 
@@ -55,6 +56,18 @@ out = {
 print(json.dumps(out))
 """
 
+IMPROVE_CHILD = r"""
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from afx_ops import improve_events
+from afx_ops.gate.improve_render import _repeat_span
+case = json.load(sys.stdin)
+print(json.dumps({
+  "valid": [improve_events.valid_fields(fields) for fields in case["fields"]],
+  "spans": [_repeat_span(minutes) for minutes in case["minutes"]],
+}))
+"""
+
 
 def _cases() -> list[tuple[str, dict]]:
     cases = []
@@ -73,6 +86,14 @@ def _afx_ops_view(cases):
     done = subprocess.run(
         [sys.executable, "-c", CHILD, str(AFX_OPS)], input=json.dumps(
             {"refs": REFS, "fields": [[c, f] for c, f in cases]}),
+        capture_output=True, text=True, check=True, cwd=str(AFX_OPS.parent))
+    return json.loads(done.stdout)
+
+
+def _afx_ops_improve_view(fields, minutes):
+    done = subprocess.run(
+        [sys.executable, "-c", IMPROVE_CHILD, str(AFX_OPS)], input=json.dumps(
+            {"fields": fields, "minutes": minutes}),
         capture_output=True, text=True, check=True, cwd=str(AFX_OPS.parent))
     return json.loads(done.stdout)
 
@@ -110,3 +131,38 @@ def test_ac3_daemon_formatter_outputs_are_accepted_by_afx_ops():
         cases.append((te.CLOSE_CODE, {**CLOSE, "pnl_r": r}))
     other = _afx_ops_view(cases)
     assert other["valid"] == [True] * len(cases)
+
+
+def test_improve_repeat_field_validation_agrees_across_packages():
+    base = {"state": "started", "trigger": "manual", "result_code": None,
+            "reason_code": None, "tool_calls": None}
+    cases = [
+        {**base, "repeat_run": 1, "repeat_max_runs": 1,
+         "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+        {**base, "repeat_run": 1},
+        {**base, "repeat_run": 1, "repeat_max_runs": 1,
+         "repeat_elapsed_sec": -1, "repeat_duration_sec": 60},
+        {**base, "repeat_run": 3, "repeat_max_runs": 2,
+         "repeat_elapsed_sec": 0, "repeat_duration_sec": 60},
+        {**base, "repeat_run": 1, "repeat_max_runs": 1,
+         "repeat_elapsed_sec": 0, "repeat_duration_sec": 59},
+    ]
+
+    def daemon_valid(fields):
+        try:
+            ev.validate_fields(ev.IMPROVE_CODE, fields, "improve:2043")
+        except ev.EventSchemaError:
+            return False
+        return True
+
+    other = _afx_ops_improve_view(cases, [])
+    assert other["valid"] == [True, False, False, False, False]
+    assert other["valid"] == [daemon_valid(fields) for fields in cases]
+
+
+def test_repeat_span_formatting_agrees_across_packages():
+    minutes = [0, 59, 60, 65, 125, 24 * 60]
+    other = _afx_ops_improve_view([], minutes)
+
+    assert other["spans"] == ["0m", "59m", "1h00m", "1h05m", "2h05m", "24h00m"]
+    assert other["spans"] == [ops_client._repeat_span(value) for value in minutes]

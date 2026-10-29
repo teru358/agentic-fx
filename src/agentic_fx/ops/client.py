@@ -633,6 +633,11 @@ def format_status(data: dict) -> str:
         lines.append("取引 event の欠落: " + " ".join(
             f"{name}={_num(trade_events.get(name))}" for name in DROP_REASONS))
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
+    repeat = data.get("improve_repeat")
+    if isinstance(repeat, dict):
+        summary = _repeat_job_summary(repeat)
+        if summary is not None:
+            lines.append(summary)
     setup = data.get("setup")
     record_state = setup.get("record_state") if isinstance(setup, dict) else None
     if record_state == "unknown":
@@ -1545,11 +1550,14 @@ class Runner:
     # ---- job
     @staticmethod
     def _job_line(job: dict) -> str:
+        repeat = _repeat_job_summary(job)
+        if repeat is not None:
+            return f"job {display_text(job.get('id'))}: {repeat}"
+        result = job.get("result")
         text = (f"job {display_text(job.get('id'))} kind={display_text(job.get('kind'))} "
                 f"state={display_text(job.get('state'))}")
         if job.get("result_code"):
             text += f" result_code={display_text(job.get('result_code'))}"
-        result = job.get("result")
         if isinstance(result, dict):
             cells = " ".join(f"{display_text(str(k))}={display_text(str(v))}"
                              for k, v in sorted(result.items()) if k != "answer")
@@ -1607,9 +1615,43 @@ _STOP_REASON_TEXT = {
 }
 
 
+def _repeat_job_summary(job: dict) -> str | None:
+    result = job.get("result")
+    if job.get("kind") != "improve" or not isinstance(result, dict):
+        return None
+    runs, maximum = result.get("runs"), result.get("max_runs")
+    elapsed, duration = result.get("elapsed_sec"), result.get("duration_sec")
+    if (type(runs) is not int or type(maximum) is not int or type(elapsed) is not int
+            or type(duration) is not int or not 0 <= runs <= maximum
+            or elapsed < 0 or duration < 0):
+        return None
+    state = {"running": "実行中", "done": "終了", "failed": "失敗",
+             "shutdown": "停止"}.get(job.get("state"), "状態不明")
+    elapsed_minutes, duration_minutes = elapsed // 60, duration // 60
+    terminal = job.get("state") in _TERMINAL_JOB_STATES
+    text = (f"improve の繰り返し: {state}、実施 {runs} 回 / 最大 {maximum} 回、"
+            f"経過 {_repeat_span(elapsed_minutes)} / {_repeat_span(duration_minutes)}")
+    if not terminal:
+        text += f"、残り {_repeat_span(max(duration_minutes - elapsed_minutes, 0))}"
+    mission_id = result.get("mission_id")
+    if type(mission_id) is int and mission_id >= 0:
+        text += f"、{'最後の' if terminal else '実行中'} mission #{mission_id}"
+    if result.get("stop_requested") is True:
+        text += "、停止要求あり"
+    reason = result.get("stop_reason")
+    if job.get("state") in _TERMINAL_JOB_STATES and isinstance(reason, str):
+        text += f"、{_STOP_REASON_TEXT.get(reason, display_text(reason))}"
+    return text
+
+
 def _span_text(seconds: int) -> str:
     hours, minutes = divmod(seconds // 60, 60)
     return f"{hours}h" * (hours > 0) + f"{minutes}m" * (minutes > 0)
+
+
+def _repeat_span(minutes: int) -> str:
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m" if hours > 0 else f"{minutes}m"
 
 
 def _format_deadline(value) -> str:

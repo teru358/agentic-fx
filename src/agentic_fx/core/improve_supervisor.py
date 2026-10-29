@@ -84,13 +84,14 @@ class _NoticeEmitter:
     def enabled(self) -> bool:
         return self._enabled
 
-    def started(self, mission_id: int, trigger: str) -> None:
+    def started(self, mission_id: int, trigger: str, repeat: dict | None = None) -> None:
         self._emit(mission_id, {
             "state": "started", "trigger": trigger, "result_code": None,
-            "reason_code": None, "tool_calls": None})
+            "reason_code": None, "tool_calls": None, **(repeat or {})})
 
     def finished(self, mission_id: int,
-                 exc: "ImprovePrepareFailed | None" = None) -> None:
+                 exc: "ImprovePrepareFailed | None" = None,
+                 repeat: dict | None = None) -> None:
         """終端 snapshot から `finished` を作る。mission が終端していなければ出さない。
 
         `exc` は prepare が Tx-0 の後で失敗し、補償で終端した場合の原因。"""
@@ -113,7 +114,7 @@ class _NoticeEmitter:
         self._emit(mission_id, {
             "state": "finished", "trigger": row["trigger"],
             "result_code": row["result_code"], "reason_code": row["reason_code"],
-            "tool_calls": row["tool_calls"]})
+            "tool_calls": row["tool_calls"], **(repeat or {})})
 
     def close(self) -> None:
         with self._lock:
@@ -298,7 +299,8 @@ class ImproveSupervisor:
 
     def _execute_mission(self, *, comment: str | None = None,
                          on_prepared: "Callable[[int], None] | None" = None,
-                         reraise: bool = True) -> ir.MissionOutcome:
+                         reraise: bool = True, repeat: dict | None = None,
+                         repeat_finished: "Callable[[], dict] | None" = None) -> ir.MissionOutcome:
         """1 mission の実行 (prepare -> run -> commit・補償)。
 
         `reraise` が真なら従来の手動実行と同じく例外を呼び出し元へ再送出する。
@@ -311,10 +313,12 @@ class ImproveSupervisor:
         if comment is not None:
             kwargs["oneoff_comment"] = comment
         if reraise:
-            mission, ctx, runner = self._prepare(**kwargs)
+            mission, ctx, runner = self._prepare(
+                repeat=repeat, repeat_finished=repeat_finished, **kwargs)
         else:
             try:
-                mission, ctx, runner = self._prepare_impl(kwargs, keep_failed=True)
+                mission, ctx, runner = self._prepare_impl(
+                    kwargs, keep_failed=True, repeat=repeat, repeat_finished=repeat_finished)
             except ImprovePrepareFailed as exc:
                 return self._outcome(exc.mission_id, None,
                                      self._stop_event.is_set(), read_db=True)
@@ -349,7 +353,7 @@ class ImproveSupervisor:
                     "launch compensation failed for manual mission_id=%s",
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "launch")
-            self._notify_finished(ctx)
+            self._notify_finished(ctx, repeat_finished() if repeat_finished is not None else repeat)
             if reraise:
                 raise
             return self._outcome(ctx.mission_id, None, stopping, read_db=True)
@@ -370,11 +374,11 @@ class ImproveSupervisor:
                     "commit compensation failed for manual mission_id=%s",
                     ctx.mission_id)
                 self._record_compensation_failed(ctx.mission_id, "commit")
-            self._notify_finished(ctx)
+            self._notify_finished(ctx, repeat_finished() if repeat_finished is not None else repeat)
             if reraise:
                 raise
             return self._outcome(ctx.mission_id, None, stopping, read_db=True)
-        self._notify_finished(ctx)
+        self._notify_finished(ctx, repeat_finished() if repeat_finished is not None else repeat)
         failure_class = getattr(result, "failure_class", None)
         if failure_class not in ir.FAILURE_CLASSES:
             failure_class = None
@@ -413,19 +417,24 @@ class ImproveSupervisor:
             if owns:
                 conn.close()
 
-    def _prepare(self, **kwargs):
+    def _prepare(self, *, repeat: dict | None = None,
+                 repeat_finished: "Callable[[], dict] | None" = None, **kwargs):
         """`prepare()` が Tx-0 後に失敗すると mission は補償で終端済みで、
         `ImprovePrepareFailed` が原因の例外を `__cause__` に持つ。呼び出し元
         (操作 API の例外分類など) が元の型で分岐できるよう、原因を再送出する。"""
-        return self._prepare_impl(kwargs, keep_failed=False)
+        return self._prepare_impl(
+            kwargs, keep_failed=False, repeat=repeat, repeat_finished=repeat_finished)
 
-    def _prepare_impl(self, kwargs: dict, *, keep_failed: bool):
+    def _prepare_impl(self, kwargs: dict, *, keep_failed: bool, repeat: dict | None = None,
+                      repeat_finished: "Callable[[], dict] | None" = None):
         from agentic_fx.loops.improve_loop import ImprovePrepareFailed
         try:
             prepared = self._improve_loop.prepare(**kwargs)
         except ImprovePrepareFailed as exc:
             # 補償済みの mission は終端している。開始は出さず、終了だけ出す。
-            self._notices.finished(exc.mission_id, exc)
+            self._notices.finished(
+                exc.mission_id, exc,
+                repeat=repeat_finished() if repeat_finished is not None else repeat)
             if keep_failed:
                 raise
             if exc.__cause__ is not None:
@@ -435,13 +444,15 @@ class ImproveSupervisor:
                    if kwargs.get("slot_key") is None
                    else improve_notice_codes.TRIGGER_SCHEDULED)
         if self._notices.enabled:
-            self._notices.started(prepared[1].mission_id, trigger)
+            self._notices.started(
+                prepared[1].mission_id, trigger,
+                repeat_finished() if repeat_finished is not None else repeat)
         return prepared
 
-    def _notify_finished(self, ctx) -> None:
+    def _notify_finished(self, ctx, repeat: dict | None = None) -> None:
         # 通知が無効なときは ctx に触れない。
         if self._notices.enabled:
-            self._notices.finished(ctx.mission_id)
+            self._notices.finished(ctx.mission_id, repeat=repeat)
 
     def _record_compensation_failed(self, mission_id, phase: str) -> None:
         """補償の失敗を activity に残す。記録に失敗しても何も送出しない
@@ -911,8 +922,19 @@ class ImproveSupervisor:
                         progress(phase="running", runs=runs, mission_id=mission_id)
 
                     comment = comment_holder.get() if comment_holder else None
+                    duration = ir.MAX_DURATION_SEC if duration_sec is None else duration_sec
+                    repeat_started_mono = deadline_mono - duration
+                    context = {"repeat_run": runs + 1, "repeat_max_runs": limit,
+                               "repeat_elapsed_sec": max(0, int(monotonic() - repeat_started_mono)),
+                               "repeat_duration_sec": int(duration)}
+
+                    def repeat_finished():
+                        return {**context, "repeat_elapsed_sec": max(
+                            0, int(monotonic() - repeat_started_mono))}
+
                     outcome = self._execute_mission(
-                        comment=comment, on_prepared=on_prepared, reraise=False)
+                        comment=comment, on_prepared=on_prepared, reraise=False,
+                        repeat=context, repeat_finished=repeat_finished)
                 finally:
                     self._release_manual()
                 if not started:

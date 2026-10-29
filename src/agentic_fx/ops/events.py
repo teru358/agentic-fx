@@ -21,12 +21,14 @@ IMPROVE_CODE = "improve_run_changed"
 
 FIELDS = {
     "ops_request_terminal": frozenset({"endpoint_code", "result_code", "authenticated_principal"}),
-    "approval_state_changed": frozenset({"state", "decision_code", "decided_by"}),
+    "approval_state_changed": frozenset({"state", "decision_code", "decided_by", "plugin_kind"}),
     "job_state_changed": frozenset({"job_kind", "state", "result_code"}),
     "guard_state_changed": frozenset({"guard_kind", "state", "generation"}),
     "service_health_changed": frozenset({"component_code", "health_code"}),
     "event_stream_health": frozenset({"failure_count", "first_failed_at", "last_failed_at"}),
-    IMPROVE_CODE: frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls"}),
+    IMPROVE_CODE: frozenset({"state", "trigger", "result_code", "reason_code", "tool_calls",
+                             "repeat_run", "repeat_max_runs", "repeat_elapsed_sec",
+                             "repeat_duration_sec"}),
     **trade_events.FIELDS,
 }
 
@@ -53,6 +55,15 @@ def _validate_improve_fields(fields: dict, ref: str | None) -> None:
     if not isinstance(ref, str) or _REF[IMPROVE_CODE].fullmatch(ref) is None:
         raise EventSchemaError(IMPROVE_CODE)
     try:
+        repeat = ("repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec")
+        values = tuple(fields.get(key) for key in repeat)
+        if any(value is None for value in values) and any(value is not None for value in values):
+            raise ValueError("partial repeat context")
+        if any(value is not None and (type(value) is not int or value < 0) for value in values):
+            raise ValueError("invalid repeat context")
+        if values[0] is not None and (values[0] < 1 or values[1] < values[0]
+                                      or values[3] < 60):
+            raise ValueError("invalid repeat context")
         improve_notice_codes.validate_state(fields["state"])
         improve_notice_codes.validate_trigger(fields["trigger"])
         if fields["state"] == "started":
@@ -71,7 +82,11 @@ class EventSchemaError(ValueError):
 
 
 def validate_fields(code: str, fields: dict, ref: str | None = None) -> None:
-    if code not in FIELDS or set(fields) != FIELDS[code]:
+    optional = ({"plugin_kind"} if code == "approval_state_changed" else set())
+    if code == IMPROVE_CODE:
+        optional = {"repeat_run", "repeat_max_runs", "repeat_elapsed_sec", "repeat_duration_sec"}
+    if (code not in FIELDS or not isinstance(fields, dict)
+            or not FIELDS[code] - optional <= set(fields) <= FIELDS[code]):
         raise EventSchemaError(code)
     if code in trade_events.TRADE_CODES:
         # 取引 event は ref 必須。field ごとの grammar と canonical、ref の整数範囲まで見る

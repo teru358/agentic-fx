@@ -1,6 +1,8 @@
 """AC-9 / AC-25 / AC-26: 決定レーンの一意性、同期失敗、FIFO と容量。"""
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
 import time
 
@@ -47,6 +49,29 @@ def test_ac9_two_api_approves_decide_once(ops_env):
         service.approve(APPROVER, approval_id, digest)
     assert raised.value.code is ErrorCode.ALREADY_DECIDED
     assert _decision_count(ops_env, approval_id) == 1
+
+
+def test_approval_succeeds_and_emits_event_without_kind_when_kind_read_is_locked(
+        ops_env, monkeypatch):
+    """A notification-only kind read must not turn a deployed approval into a failed job."""
+    from agentic_fx.ops import service as service_mod
+
+    service = ops_env.service()
+    approval_id = ops_env.make_plugin_approval()
+
+    def locked(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(service_mod, "_approval_plugin_kind", locked)
+    reply = service.approve(APPROVER, approval_id, digest_of(ops_env, approval_id))
+    job = wait_job(service, reply["job_id"])
+    event = ops_env.conn.execute(
+        "SELECT fields_json FROM ops_events WHERE code='approval_state_changed' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+
+    assert job["state"] == "done"
+    assert ops_env.approval(approval_id)["status"] == "approved"
+    assert json.loads(event["fields_json"])["plugin_kind"] is None
 
 
 def test_ac9_shell_and_api_share_the_decision_lane(ops_env):
