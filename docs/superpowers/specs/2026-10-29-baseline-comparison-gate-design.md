@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.5 C0 (裁定済、実装着手) (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.5.1 C0 (裁定済、実装中) (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -70,7 +70,7 @@
 
 pair p、段 s ごとに純関数 `compare_metrics(b, c)` で `improved(s, p)` を決める。`pf is None` (損失ゼロ) は +∞、両方 None は等しい (改善でない)。推奨 (§8 J1):
 
-- 決定段は holdout。全 pair で、pf と avg_r が共に配備中の版を **厳密に** 上回る (差の下限 0)。avg_r は損益幅を含む期待値。
+- 決定段は holdout。全 pair で、pf と avg_r が共に配備中の版を **厳密に** 上回る (差の下限 0)。avg_r は損益幅を含む期待値。 pair 別 verdict の集約は優先順位つき: いずれかの pair が `not_improved` なら全体 `not_improved`、全 pair が `improved` なら `improved`、`unavailable` が混ざり `not_improved` が無ければ `unavailable` (片方の pair で明確に劣る候補を `unavailable` の fail open で通さないため)。
 - in_sample は記録・添付のみで判定に使わない。取引数は判定に使わない。ただし両側の holdout が `evaluable` (30 取引以上) の pair だけが比較対象で、いずれか 1 pair でも非 evaluable なら `unavailable`。
 - 性質: 点推定の優越を両指標に要求するため、60 取引前後では雑音による偽棄却が大きい。意図的な受容。窓が約 87/90 日重なるので勝者の呪いもほぼ残る。有意性は主張しない。
 
@@ -92,7 +92,7 @@ pair p、段 s ごとに純関数 `compare_metrics(b, c)` で `improved(s, p)` �
 
 対応表は上の 7 code で閉じる。新しい code が sandbox に足されると未知として fail closed になり、表の更新が要る。
 
-**途中行の切り戻し (全破棄の境界)。** baseline 再生の前に `gate_rows` の長さを checkpoint する。再生が失敗 (上表で `unavailable` または failed) したら、その位置以降の `variant=baseline` 行だけを切り戻す。候補の floor 行 (checkpoint より前) は保持し、candidate は完全な pair × 段が残る。理由: 一部 pair だけの baseline 行は「同条件の対」(AC 1) を満たさず、片側だけの行は読み手に誤った比較を見せる。`gate_rows` は evaluator がメモリ上で積み、終端 tx が `_persist_gate_rows` で書く。baseline 行・候補行・approval payload の `comparison.verdict=unavailable`・mission 終端は同じ終端 tx で保存し、payload の `unavailable` のうち再生失敗 (`baseline_unhealthy` / `gate_timeout` / mission failed) は baseline 行 0 行と対応し、再生に成功したが baseline holdout が非 evaluable (標本不足) の場合は完全な baseline 行を保持したまま `verdict=unavailable` と対応する (AC 6 はこの二つを分けて検査する)。
+**途中行の切り戻し (全破棄の境界)。** gate は baseline 行を `record_fn` に流さず、再生が最後まで成功したときだけ verdict の `baseline_rows` に載せて返す (失敗・超過では空)。永続化は improve_loop の終端 tx (`_persist_gate_rows`) が候補の行と一緒に行う。候補の floor 行 (checkpoint より前) は保持し、candidate は完全な pair × 段が残る。理由: 一部 pair だけの baseline 行は「同条件の対」(AC 1) を満たさず、片側だけの行は読み手に誤った比較を見せる。`gate_rows` は evaluator がメモリ上で積み、終端 tx が `_persist_gate_rows` で書く。baseline 行・候補行・approval payload の `comparison.verdict=unavailable`・mission 終端は同じ終端 tx で保存し、payload の `unavailable` のうち再生失敗 (`baseline_unhealthy` / `gate_timeout` / mission failed) は baseline 行 0 行と対応し、再生に成功したが baseline holdout が非 evaluable (標本不足) の場合は完全な baseline 行を保持したまま `verdict=unavailable` と対応する (AC 6 はこの二つを分けて検査する)。
 
 ### 3.5 対象外
 
@@ -102,7 +102,7 @@ pair p、段 s ごとに純関数 `compare_metrics(b, c)` で `improved(s, p)` �
 
 `max_backtests_per_candidate` (既定 6) は agent の RPC 回数で、gate の再生は数えず、config の検証も変えない (§8 J3)。追加の CPU は mission あたり pair 数 × (in_sample 約 20 秒 + holdout 約 2 秒)。
 
-**壁時計の上限は二分する。** (1) 候補の既存 floor は従来どおり完了または失敗させ、壁時計で打ち切らない (打ち切ると絶対床を迂回できるため)。候補を含む総上限は設けない。(2) 設定 `improve.baseline_replay_wall_clock_max_sec` は **床通過直後に開始** し、配備中の版の再生だけに掛かる。既定 300 秒 (最悪 pair 数 6 × (in_sample + holdout の実測 約 22 秒) × 2 = 264 を丸めた値。pair 数の上限は実装時に settings から確定し、T1 の壁時計実測で見直す)。超過は再生を取消し `baseline_unhealthy` (reason `gate_timeout`) として `unavailable` に倒す (§3.4 の切り戻しを適用し、床のみで通す)。候補の floor 実行中は timer が動かないので、床の途中で `unavailable` になることはない。
+**壁時計の上限は二分する。** (1) 候補の既存 floor は従来どおり完了または失敗させ、壁時計で打ち切らない (打ち切ると絶対床を迂回できるため)。候補を含む総上限は設けない。(2) 設定 `improve.baseline_replay_wall_clock_max_sec` は **床通過直後に開始** し、配備中の版の再生だけに掛かる。判定は各 sandbox 呼び出しの**前**にだけ行い (`>=` で超過)、呼び出しの途中では打ち切らず (1 回の固まりは worker の `timeout` に委ねる)、上限を少し超えて完走した結果は捨てない。既定 300 秒 (最悪 pair 数 6 × (in_sample + holdout の実測 約 22 秒) × 2 = 264 を丸めた値。pair 数の上限は実装時に settings から確定し、T1 の壁時計実測で見直す)。超過は再生を取消し `baseline_unhealthy` (reason `gate_timeout`) として `unavailable` に倒す (§3.4 の切り戻しを適用し、床のみで通す)。候補の floor 実行中は timer が動かないので、床の途中で `unavailable` になることはない。
 
 **repeat の期限。** 2 回目以降の mission は `remaining >= mission_timeout_sec + baseline_replay_wall_clock_max_sec + cleanup_margin` (cleanup_margin は 60 秒) のときだけ始め、満たさなければ `deadline` で終える。1 回目は現行どおり期限を見ない (ctl-improve-repeat 設計 §3.1 の裁定)。この条件は同設計 v0.5.3 §3.1 の改訂を要する (§7、改訂は指揮者)。
 
@@ -210,3 +210,4 @@ comparison = {
 | 2026-10-29 | v0.3.1 C0 | `unavailable` の 2 種 (再生失敗 = baseline 0 行 / 非 evaluable = 完全な baseline 行を保持) を §3.4 と AC 6 で分ける | 設計レビュー 3 周目 (sol、Important 1) | |
 | 2026-10-29 | v0.4 C0 | J5 をユーザー裁定で改訂: `improved` のとき Discord に holdout の 4 項目を候補 / 配備中の版で出す (§2、AC 11、§8) | ユーザー要望 | |
 | 2026-10-29 | v0.5 C0 | J1〜J4・J6 をユーザー裁定済 (推奨どおり) に | ユーザー承認、実装着手 | |
+| 2026-10-29 | v0.5.1 C0 | T1 レビュー 1 周目 (/code-review) の追従: 壁時計は各 sandbox 呼び出しの前だけで判定し完走した結果は捨てない (§3.6)、pair 別 verdict の優先順位は not_improved > improved > unavailable (§3.3)、gate は baseline 行を verdict の `baseline_rows` で返し T2 が終端 tx で永続化 (§3.4 の checkpoint)、`comparison.reason` の固定語 7 種 (holdout_exceeds / holdout_not_exceeds / baseline_not_evaluable / candidate_not_evaluable / baseline_unhealthy / gate_timeout / no_pairs) を §4 に | T1 実装とレビュー | |

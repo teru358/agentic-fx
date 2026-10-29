@@ -2,14 +2,14 @@
 id: improve-run-summary-for-humans
 title: 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる
 status: 設計待ち
-priority: 低
+priority: 高
 opened: 2026-10-25
 closed: null
-related: [improve-objective-filtered-signal-quality, bot-event-notices-are-raw-log-lines]
+related: [improve-objective-filtered-signal-quality, bot-event-notices-are-raw-log-lines, improve-mission-output-not-persisted]
 ---
 # [improve-run-summary-for-humans] 改善周ごとの要約 (仮説・使った指標・床との差) を人間に見せる
 
-**状態**: 設計待ち / **優先**: 低
+**状態**: 設計待ち / **優先**: 高 / **種別**: 機能
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-objective-filtered-signal-quality, bot-event-notices-are-raw-l
 ## 経緯
 
 - 2026-10-25: 起票。
+- 2026-10-29: 優先: 高、関連: [improve-objective-filtered-signal-quality, bot-event-notices-are-raw-log-lines, improve-mission-output-not-persisted] — 2026-10-29 棚卸し: 道筋 2 番目「承認の中身を見せる」の核: 床未達の試行が承認待ちにも plugin にも現れず、改善が行われているか読めない。優先を低から引き上げ提案

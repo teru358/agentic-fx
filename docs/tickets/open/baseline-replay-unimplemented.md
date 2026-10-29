@@ -4,7 +4,7 @@ status: 実装中
 priority: 中
 opened: 2026-09-12
 closed: null
-related: [profitability-floor]
+related: [profitability-floor, same-name-candidate-must-beat-deployed-baseline]
 backfilled: true
 source_section: 未完了
 kind: 不具合
@@ -22,3 +22,4 @@ kind: 不具合
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-25: 種別: 不具合 — 種別を付与
 - 2026-10-29: 状態: 実装中 — 2026-10-29: 同名候補の配備版比較 gate (same-name-candidate-must-beat-deployed-baseline、設計 2026-10-29-baseline-comparison-gate-design.md) で閉じる
+- 2026-10-29: 関連: [profitability-floor, same-name-candidate-must-beat-deployed-baseline] — 2026-10-29 棚卸し: 吸収の疑い。2026-10-29 追記で same-name 比較 gate 設計 (2026-10-29-baseline-comparison-gate-design.md) で閉じると明記済み。現コードに baseline 再生なし (strategy_gate は marker のみ)

@@ -1,7 +1,7 @@
 ---
 id: trade-cron-hybrid-mode
 status: 設計待ち
-priority: 中
+priority: 低
 opened: 2026-09-28
 closed: null
 related: [backtest-worker-cpu-budget-shrinks-with-timeframe]
@@ -10,7 +10,7 @@ source_section: 未完了
 ---
 # [trade-cron-hybrid-mode]
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -19,4 +19,4 @@ source_section: 未完了
 ## 経緯
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
-
+- 2026-10-29: 優先: 低 — 2026-10-29 棚卸し: 取引起動の最適化。すぐ取引・すぐ勝てるは目指さない方針に照らし後回し (本文は中〜高)

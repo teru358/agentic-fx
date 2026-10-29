@@ -4,7 +4,7 @@ status: 設計待ち
 priority: 低
 opened: 2026-09-21
 closed: null
-related: [ops-first-contact-fixes, ops-ui]
+related: [ops-first-contact-fixes, ops-ui, improve-add-quotes]
 backfilled: true
 source_section: 完了ログ
 kind: 不具合
@@ -21,3 +21,4 @@ kind: 不具合
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [ops-first-contact-fixes, ops-ui, improve-add-quotes] — 2026-10-29 棚卸し: 関連を束ねる先に張る

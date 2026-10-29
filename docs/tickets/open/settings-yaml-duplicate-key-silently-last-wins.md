@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-10-02
 closed: null
-related: []
+related: [deploy-cli-config-error-traceback]
 kind: 不具合
 ---
 # [settings-yaml-duplicate-key-silently-last-wins] settings.yaml の重複キーは黙って後の値が効く
@@ -28,3 +28,4 @@ pyyaml の safe_load は重複キーを後勝ちにする。手編集で同じ�
 
 - 2026-10-02: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [deploy-cli-config-error-traceback] — 2026-10-29 棚卸し: 関連を束ねる先に張る

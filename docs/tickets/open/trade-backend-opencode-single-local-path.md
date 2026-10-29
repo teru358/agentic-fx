@@ -2,14 +2,14 @@
 id: trade-backend-opencode-single-local-path
 title: 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に
 status: 設計待ち
-priority: 中
+priority: 低
 opened: 2026-10-14
 closed: null
 related: [first-run-setup, wizard-stage4-menu-per-role]
 ---
 # [trade-backend-opencode-single-local-path] 取引判断にも opencode backend を許し、完全ローカル運用を opencode 1 本に
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [first-run-setup, wizard-stage4-menu-per-role]
 ## 経緯
 
 - 2026-10-14: 起票。
+- 2026-10-29: 優先: 低 — 2026-10-29 棚卸し: 完全ローカル手順の簡素化、ウィザード後

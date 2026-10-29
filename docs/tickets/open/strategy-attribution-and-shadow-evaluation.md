@@ -5,11 +5,11 @@ status: 設計待ち
 priority: 中
 opened: 2026-10-16
 closed: null
-related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands]
+related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands, per-strategy-virtual-books, plugin-naming-lifecycle-policy]
 ---
 # [strategy-attribution-and-shadow-evaluation] 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す)
 
-**状態**: 設計待ち / **優先**: 中
+**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -24,3 +24,4 @@ related: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands
 ## 経緯
 
 - 2026-10-16: 起票。
+- 2026-10-29: 関連: [improve-objective-filtered-signal-quality, bot-readonly-slash-commands, per-strategy-virtual-books, plugin-naming-lifecycle-policy] — 2026-10-29 棚卸し: 関連を束ねる先に張る

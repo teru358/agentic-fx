@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: 2026-10-24
 closed: null
-related: []
+related: [e2e-phase1-reflection-not-generated]
 kind: 不具合
 ---
 # [scheduler-tick-watchdog-health-check-test-fails] scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる
@@ -26,3 +26,4 @@ tests/test_service_app.py::test_scheduler_tick_actually_invokes_the_watchdog_hea
 
 - 2026-10-24: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [e2e-phase1-reflection-not-generated] — 2026-10-29 棚卸し: 関連を束ねる先に張る

@@ -5,7 +5,7 @@ status: 設計待ち
 priority: 中
 opened: null
 closed: null
-related: []
+related: [harness-failure-becomes-fact]
 backfilled: true
 source_section: 未完了
 kind: 不具合
@@ -23,3 +23,4 @@ kind: 不具合
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 中、題名: 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い — 仕分け (2026-10-02、現物で成立を確認): 同一署名の連続失敗を abort に載せるか、Tier A を誘導から外すかの設計判断。 根拠: improve_staging_tools.py:389-405 は directive を返すだけで、mission_counters.py:138 の連続失敗カウントは abort に繋がらない。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 関連: [harness-failure-becomes-fact] — 2026-10-29 棚卸し: 関連を束ねる先に張る

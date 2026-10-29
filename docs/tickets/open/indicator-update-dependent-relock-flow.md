@@ -2,15 +2,15 @@
 id: indicator-update-dependent-relock-flow
 title: 指標更新時に依存する戦略の再ロックを手順化する
 status: 設計待ち
-priority: 低
+priority: 中
 kind: 機能
 opened: 2026-10-27
 closed: null
-related: [approval-base-identity-cas]
+related: [approval-base-identity-cas, plugin-naming-lifecycle-policy]
 ---
 # [indicator-update-dependent-relock-flow] 指標更新時に依存する戦略の再ロックを手順化する
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 機能
+**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [approval-base-identity-cas]
 ## 経緯
 
 - 2026-10-27: 起票。
+- 2026-10-29: 優先: 中、関連: [approval-base-identity-cas, plugin-naming-lifecycle-policy] — 2026-10-29 棚卸し: 指標更新で依存戦略の pin が不一致になり新規エントリー拒否。同名更新を前提にする plugin-naming 方針と同時に決める

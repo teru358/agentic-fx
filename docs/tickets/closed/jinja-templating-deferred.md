@@ -1,10 +1,10 @@
 ---
 id: jinja-templating-deferred
 title: 改善プロンプトの {{ }} 脱出が読みにくい (jinja 化は保留)
-status: 設計待ち
+status: 見送り
 priority: 低
 opened: 2026-09-07
-closed: null
+closed: 2026-10-29
 related: []
 backfilled: true
 source_section: 未完了
@@ -12,7 +12,7 @@ kind: 保守
 ---
 # [jinja-templating-deferred]
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 保守
+**状態**: 見送り / **優先**: 低 / **種別**: 保守
 
 ## 現象・原因・処置案 (tickets.md からの移行、原文)
 
@@ -23,3 +23,4 @@ kind: 保守
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-02: 状態: 設計待ち、優先: 低、題名: 改善プロンプトの {{ }} 脱出が読みにくい (jinja 化は保留) — 仕分け (2026-10-02、現物で成立を確認): 種別分岐を入れる時に improve_mission.md だけ移行する。 根拠: プロンプトは str.format のまま (improve_mission.md の JSON 例が {{ }} 脱出)。種別分岐を入れるまで移行しない方針。
 - 2026-10-25: 種別: 保守 — 種別を付与
+- 2026-10-29: 見送り理由 — 保留と明記済み、必要が出るまで不要

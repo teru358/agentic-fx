@@ -2,7 +2,7 @@
 id: ops-bot-exits-not-lock-holder
 title: afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する
 status: 設計待ち
-priority: 中
+priority: 高
 opened: 2026-10-22
 closed: null
 related: [ops-bot-initial-start-replays-all-events]
@@ -10,7 +10,7 @@ kind: 不具合
 ---
 # [ops-bot-exits-not-lock-holder] afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +26,4 @@ afx-ops@bot が daemon 稼働中に `afx-ops: not_lock_holder` (exit 3) で終�
 
 - 2026-10-22: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
+- 2026-10-29: 優先: 高 — 2026-10-29 棚卸し: 承認通知・承認ボタンの経路 (afx-ops bot) が稼働中に落ち再起動を繰り返す。「承認の中身を見せる」の経路が不安定
