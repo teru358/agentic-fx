@@ -50,9 +50,9 @@ class RetentionPlan:
                 if interval == "1m":
                     days = 2
                 else:
-                    required = max((registry.required_closed_bars(pair, interval)
-                                    for pair in {pair for entry in registry.entries
-                                                 for pair in entry.pairs}), default=1)
+                    required = max((registry.required_closed_bars(symbol, interval)
+                                    for symbol in {symbol for entry in registry.entries
+                                                   for symbol in entry.symbols}), default=1)
                     result = planner.plan(source, interval, required)
                     days = (result.days if result.ok else 0) + margin_days
                 cutoffs[(source, interval)] = now - timedelta(days=days)

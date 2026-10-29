@@ -600,6 +600,49 @@ def _deploy_ops_lines(section) -> list[str]:
     return lines
 
 
+_REFERENCE_STATES = frozenset({"ok", "stale", "missing", "fetch_failed",
+                               "budget_deferred", "source_unavailable"})
+_REFERENCE_ROWS_SHOWN = 16
+_REFERENCE_SAFE = re.compile(r"[^A-Za-z0-9._#!+-]")
+
+
+def _reference_token(value, limit: int = 32) -> str:
+    """broker の名前は設定由来の外部入力。区切りに使う文字を残さない。"""
+    return _REFERENCE_SAFE.sub("?", display_text(value, limit))
+
+
+def _age_text(seconds) -> str:
+    if type(seconds) is not int or seconds < 0:
+        return "-"
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{rest // 60:02d}m"
+    return f"{rest // 60}m"
+
+
+def _references_line(rows) -> str | None:
+    if not isinstance(rows, list) or not rows:
+        return None
+    parts = []
+    for row in rows[:_REFERENCE_ROWS_SHOWN]:
+        if not isinstance(row, dict):
+            continue
+        state = row.get("state")
+        state = state if isinstance(state, str) and state in _REFERENCE_STATES else "unknown"
+        if state == "stale":
+            state = f"stale({_age_text(row.get('age_seconds'))})"
+        parts.append(f"{_reference_token(row.get('symbol'))}/"
+                     f"{_reference_token(row.get('interval'), 8)}/"
+                     f"{_reference_token(row.get('source'), 16)}={state}")
+    if not parts:
+        return None
+    extra = len(rows) - _REFERENCE_ROWS_SHOWN
+    return "references: " + " ".join(parts) + (f" (+{extra})" if extra > 0 else "")
+
+
 def format_status(data: dict) -> str:
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
@@ -628,6 +671,9 @@ def format_status(data: dict) -> str:
     feed = data.get("data") if isinstance(data.get("data"), dict) else None
     if feed is not None:
         lines.append(f"data: {display_text(feed.get('state'))}")
+    references = _references_line(data.get("references"))
+    if references is not None:
+        lines.append(references)
     trade_events = data.get("trade_events")
     if isinstance(trade_events, dict):
         lines.append("取引 event の欠落: " + " ".join(

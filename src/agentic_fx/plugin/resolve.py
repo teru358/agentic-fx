@@ -24,7 +24,8 @@ from typing import Any, Literal, Mapping
 import yaml
 
 from agentic_fx.plugin.loader import PluginMeta, _check_json_safe, content_hash
-from agentic_fx.plugin.reference_time import (canonical_duration_seconds,
+from agentic_fx.plugin.reference_time import (DEFAULT_MAX_AGE_FACTOR,
+                                              canonical_duration_seconds,
                                               nominal_reference_bars,
                                               timeframe_seconds)
 
@@ -125,7 +126,7 @@ class ResolvedIndicatorSet:
                      "content_hash": item.content_hash,
                      "params": thaw(item.params)}
             if (item.symbol_mode == "literal" or item.frame_id is not None
-                    or item.max_age_seconds != 3 * timeframe_seconds(item.timeframe)):
+                    or item.max_age_seconds != DEFAULT_MAX_AGE_FACTOR * timeframe_seconds(item.timeframe)):
                 entry.update({"symbol_mode": item.symbol_mode,
                               "symbol": item.literal_symbol,
                               "timeframe": item.timeframe,
@@ -224,7 +225,7 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         try:
             max_age_seconds = (canonical_duration_seconds(ref.max_age)
                                if ref.max_age is not None
-                               else 3 * timeframe_seconds(reference_timeframe))
+                               else DEFAULT_MAX_AGE_FACTOR * timeframe_seconds(reference_timeframe))
         except ValueError as exc:
             raise IndicatorResolutionError(ref.alias, "max_age_invalid") from exc
         if max_age_seconds > 7 * 86400:

@@ -44,6 +44,7 @@ from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
 from agentic_fx.datafeed.outage import IngestTickReport, OutageStateMachine
 from agentic_fx.datafeed.planner import RequirementPlanner, startup_disposition
+from agentic_fx.datafeed.reference_status import reference_rows
 from agentic_fx.datafeed.requirements import build_registry
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
@@ -1620,15 +1621,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             required_intervals=requirement_registry.required_intervals,
             now=clock.now())
         ingest = Ingest(settings, approved, read_conn=conn_supervisor)
+        # scheduler thread が書く不変 snapshot を、同じ thread の producer が読む
+        signal_producer.reference_state = (
+            lambda key: ingest.reference_fetch_state.get(key))
 
         # hard 必須 key (paper/mtm/hwm の 1m、health の判断足) だけを
         # OutageStateMachine の観測対象にする。`RequirementRegistry.entries`
         # の `hard=True` がそのまま核となる価格取得要求の定義 — strategy/
         # indicator (hard=False) は欠けても資金保護に直結しないので対象外。
-        hard_keys = frozenset(
-            (pair, req.interval)
-            for req in requirement_registry.entries if req.hard
-            for pair in req.pairs)
+        hard_keys = requirement_registry.hard_keys()
         outage_interval_widths = {
             interval: timedelta(minutes=sources.INTERVAL_MIN[interval])
             for _, interval in hard_keys}
@@ -1736,7 +1737,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
-            trade_event_sink=trade_sink)
+            trade_event_sink=trade_sink, ingest=ingest)
         # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
@@ -1865,9 +1866,22 @@ def _serialize_status_setup(facts) -> dict:
     return {"record_state": record_state, "pending_steps": items}
 
 
+def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] | None:
+    """監視 symbol があるときだけ参照系列の状態を返す。失敗しても status は止めない。"""
+    watch = tuple(getattr(settings.datafeed, "watch_symbols", ()) or ())
+    if not watch:
+        return None
+    try:
+        return reference_rows(conn, ingest, now, watch_symbols=watch,
+                              storage_source=ingest.storage_source)
+    except Exception as exc:  # noqa: BLE001 — optional display must not break status
+        _log.warning("status references unavailable: %s", type(exc).__name__)
+        return None
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
-                       outage, trade_event_sink=None) -> OpsService:
+                       outage, trade_event_sink=None, ingest=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -1892,6 +1906,9 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                                                "protection_pending")
                 recent = missions.recent(conn, 1)
                 data_state = str(outage.state_from(conn))
+                references = (
+                    _reference_status_rows(conn, ingest, clock.now(), settings)
+                    if ingest is not None else None)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
@@ -1916,6 +1933,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                   "health": {"latched": health_latch.is_latched(),
                              "failures": len(health_latch.summary())},
                   "data": {"state": data_state}, "setup": setup}
+        if references:
+            status["references"] = references
         if trade_event_sink is not None:
             # 理由別の件数だけ。理由の文言や event の中身は載せない
             status["trade_events"] = trade_event_sink.counters()

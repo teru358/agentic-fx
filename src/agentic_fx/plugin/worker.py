@@ -41,7 +41,8 @@
             "low": [...], "close": [...], "volume": [...]}`
 - response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
   `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`。
-  frame 不在だけは worker 内部の `"error_code": "reference_unavailable"` を加える。
+  frame 不在は `"error_code": "reference_unavailable"`、frame を使う indicator の出力が
+  最後の main 行で NaN のときは `"error_code": "indicator_unavailable"` を加える。
 - close request: `{"op": "close", "id": "<hex>"}` / close response:
   `{"ok": true, "cpu_sec": <float>, "pid": int, "id": <要求の id>}`
 
@@ -106,6 +107,10 @@ def _cpu_sec() -> float:
 
 
 _KIND_FUNC = {"indicator": "compute", "signal": "detect", "strategy": "evaluate"}
+
+
+class _IndicatorUnavailable(Exception):
+    """A reference indicator has no value at the last main row."""
 
 
 class _ReferenceUnavailable(Exception):
@@ -307,6 +312,12 @@ def main() -> None:
                               else value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)
                         for key, value in validated.items()}
+                for dep in deps:
+                    if dep.get("frame_id") is None:
+                        continue
+                    for value in indicators[dep["alias"]].values():
+                        if isinstance(value, pd.Series) and len(value) and pd.isna(value.iloc[-1]):
+                            raise _IndicatorUnavailable
                 # indicator が pandas/numpy の process 全体の状態を変えていないこと
                 if (pd.get_option("mode.chained_assignment") != baseline_chained
                         or dict(np.geterr()) != baseline_errstate):
@@ -324,6 +335,10 @@ def main() -> None:
                                                   outputs=main_outputs))
                     result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
+                                      "id": request_id})
+        except _IndicatorUnavailable:
+            _write_line(protocol_fd, {"ok": False, "error": "indicator unavailable",
+                                      "error_code": "indicator_unavailable", "pid": pid,
                                       "id": request_id})
         except _ReferenceUnavailable:
             _write_line(protocol_fd, {"ok": False, "error": "reference unavailable",

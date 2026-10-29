@@ -157,7 +157,7 @@ class PluginStrategyIntentSource:
         try:
             result = session.call({"df": df, "params": self._meta.params})
         except SandboxError as exc:
-            if exc.code == "reference_unavailable":
+            if exc.code in ("reference_unavailable", "indicator_unavailable"):
                 return None
             raise
         if self._decision_sink is not None:

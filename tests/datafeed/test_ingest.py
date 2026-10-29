@@ -272,3 +272,29 @@ def test_report_excludes_backoff_waiting_key_from_every_set(tmp_path):
         assert key not in report.deferred
         assert key not in report.empty
     conn.close()
+
+
+def test_ingest_never_requests_a_key_nobody_asked_for(tmp_path):
+    from agentic_fx.core.contracts import Bar  # noqa: F401
+
+    conn = connect(tmp_path / "bars.db")
+    init_db(conn)
+    settings = SimpleNamespace(
+        pairs=["USDJPY", "EURUSD"],
+        datafeed=SimpleNamespace(primary="yfinance", intervals=["1m", "1h", "15m"],
+                                 primary_intervals=["1h"], ingest_budget_sec=10,
+                                 closed_bar_grace_sec=0))
+    strategy = SimpleNamespace(name="fast", kind="strategy", timeframe="15m",
+                               pairs=("USDJPY",), max_bars=50, indicators=())
+    calls = []
+
+    def fetch(pair, interval, start, end, *, timeout):
+        calls.append((pair, interval))
+        return []
+
+    ingest = Ingest(settings, [strategy], fetch=fetch)
+    ingest.prepare(NOW, conn)
+    assert ("EURUSD", "15m") not in ingest.keys
+    assert ("EURUSD", "15m") not in calls
+    assert ("USDJPY", "15m") in calls
+    conn.close()

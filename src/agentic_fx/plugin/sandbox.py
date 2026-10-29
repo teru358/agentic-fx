@@ -670,6 +670,7 @@ _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "signal": ("df", "params"),
     "strategy": ("df", "params"),
 }
+_REFERENCE_ERROR_CODES = frozenset({"reference_unavailable", "indicator_unavailable"})
 MAX_CALL_INPUT_BYTES = 3_145_728
 
 # セッション起動 (handshake → ready 応答) を待つ固定タイムアウト。
@@ -1323,9 +1324,9 @@ class PluginSession:
             response, request_id,
             allowed=frozenset({"ok", "result", "error", "error_code", "pid", "id"}))
         if not response["ok"]:
-            code = ("reference_unavailable"
-                    if response.get("error_code") == "reference_unavailable"
-                    else "plugin_error")
+            reported = response.get("error_code")
+            code = (reported if isinstance(reported, str)
+                    and reported in _REFERENCE_ERROR_CODES else "plugin_error")
             self.error_code = code
             raise SandboxError(
                 untrusted_text(response.get("error"), fallback="unknown plugin error"),

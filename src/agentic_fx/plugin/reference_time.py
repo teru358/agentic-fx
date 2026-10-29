@@ -9,6 +9,7 @@ _SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _TIMEFRAME_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600,
                       "4h": 14400, "1d": 86400}
 PLUGIN_TIMEFRAMES = ("15m", "1h", "4h", "1d")
+DEFAULT_MAX_AGE_FACTOR = 3
 
 
 def canonical_duration_seconds(value: object) -> int:

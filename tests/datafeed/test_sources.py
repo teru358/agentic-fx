@@ -263,3 +263,67 @@ def test_native_intervals_reflect_source_capability():
     # 全ソースのネイティブ足は INTERVAL_MIN に載っていること
     for src, ivs in NATIVE_INTERVALS.items():
         assert ivs <= set(INTERVAL_MIN), f"{src} に未知の足がある"
+
+
+def _raw_bridge(seen):
+    import httpx
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"symbol": "x", "interval": "1h", "bars": [
+            {"time": "2026-10-26T09:00:00+00:00", "open": 1, "high": 2, "low": 0.5,
+             "close": 1.5, "volume": 7}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return lambda url, **kw: client.get(url, **kw)
+
+
+START = datetime(2026, 10, 26, 8, tzinfo=timezone.utc)
+END = datetime(2026, 10, 26, 12, tzinfo=timezone.utc)
+
+
+def test_mt5_raw_adapter_gets_a_symbol_missing_from_the_vendor_table():
+    from agentic_fx.datafeed.sources import VENDOR_SYMBOLS, mt5_raw_bars_range
+
+    assert "JP225" not in VENDOR_SYMBOLS
+    seen = []
+    with patch("httpx.get", side_effect=_raw_bridge(seen)):
+        bars = mt5_raw_bars_range("http://bridge:8812/", MT5RawSymbol.parse("JP225"),
+                                  "1h", START, END, timeout=3)
+    assert seen[0].url.path == "/ohlcv/JP225"
+    assert seen[0].url.params["interval"] == "1h"
+    assert [(b.symbol, b.interval, b.close) for b in bars] == [("JP225", "1h", 1.5)]
+
+
+@pytest.mark.parametrize("raw", ["JP225.cash", "A/B", "A?B", "A#B", "A B", "A%2FB"])
+def test_mt5_raw_adapter_keeps_the_symbol_inside_one_path_segment(raw):
+    from agentic_fx.datafeed.sources import mt5_raw_bars_range
+
+    seen = []
+    with patch("httpx.get", side_effect=_raw_bridge(seen)):
+        bars = mt5_raw_bars_range("http://bridge:8812", MT5RawSymbol.parse(raw),
+                                  "1h", START, END)
+    from urllib.parse import quote, unquote
+
+    path = seen[0].url.raw_path.decode().split("?")[0]
+    assert path == "/ohlcv/" + quote(raw, safe="")
+    assert path.count("/") == 2
+    assert unquote(path.split("/")[2]) == raw
+    assert seen[0].url.query.decode().count("?") == 0
+    assert bars[0].symbol == raw
+
+
+def test_mt5_raw_adapter_rejects_a_plain_string():
+    from agentic_fx.datafeed.sources import mt5_raw_bars_range
+
+    with pytest.raises(TypeError):
+        mt5_raw_bars_range("http://bridge:8812", "JP225", "1h", START, END)
+
+
+def test_trading_pair_adapter_still_resolves_through_the_vendor_table():
+    seen = []
+    with patch("httpx.get", side_effect=_raw_bridge(seen)):
+        bars = mt5_bars_range("http://bridge:8812", "USDJPY", "1h", START, END)
+    assert seen[0].url.path == "/ohlcv/USDJPY" and bars[0].symbol == "USDJPY"
+    with pytest.raises(KeyError):
+        mt5_bars_range("http://bridge:8812", "JP225", "1h", START, END)
