@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 149 件。完了分は closed/。
+未完了: 151 件。完了分は closed/。
 
 ## 実装中 (6)
 
@@ -72,7 +72,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (126)
+## 設計待ち (128)
 
 ### 不具合 (71)
 
@@ -150,7 +150,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (35)
+### 機能 (37)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -163,6 +163,8 @@
 | [bot-readonly-slash-commands](open/bot-readonly-slash-commands.md) | 中 | 2026-10-15 | Discord bot に読み取り専用の slash command を足す |
 | [strategy-attribution-and-shadow-evaluation](open/strategy-attribution-and-shadow-evaluation.md) | 中 | 2026-10-16 | 戦略ごとの帰属と影の評価 (共有建玉のまま戦略別の成績を出す) |
 | [weekly-improve-rebacktests-deployed-strategies](open/weekly-improve-rebacktests-deployed-strategies.md) | 中 | 2026-10-25 | 週次改善の冒頭で稼働中の戦略を再 backtest し、成績を改善の方向性の材料にする |
+| [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 中 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
+| [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
 | [live-confirmed-bars-into-history](open/live-confirmed-bars-into-history.md) | 低 | 2026-09-21 | ライブで集めた確定足を履歴に積めず二重保存になる |
@@ -184,9 +186,9 @@
 | [init-news-source-remove-on-revisit](open/init-news-source-remove-on-revisit.md) | 低 | 2026-10-25 | afx init 段 3 の再入時に入力済みのニュース源を取り消せない |
 | [indicator-update-dependent-relock-flow](open/indicator-update-dependent-relock-flow.md) | 低 | 2026-10-27 | 指標更新時に依存する戦略の再ロックを手順化する |
 | [plugin-auto-approve-paper-only](open/plugin-auto-approve-paper-only.md) | 低 | 2026-10-27 | plugin 自動承認モード (ペーパー限定の検討メモ) |
-| [plugin-naming-lifecycle-policy](open/plugin-naming-lifecycle-policy.md) | 低 | 2026-10-27 | plugin の命名・引退・保有上限の方針 (同名更新か新名作成か) |
 | [reference-series-additional-sources](open/reference-series-additional-sources.md) | 低 | 2026-10-28 | 参照系列の取得先を MT5 以外に広げる (金利など) |
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
+| [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 低 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
