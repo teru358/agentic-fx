@@ -781,6 +781,20 @@ class Settings(_Strict):
         return self
 
 
+def warn_surplus_pair_rules(settings: "Settings") -> list[str]:
+    """`pairs` に無い pair の `risk.pair_rules` を技術ログに 1 行で警告する。
+
+    拒否はしない。発注の境界は `pairs` の membership で、余剰の規則は取引対象を
+    増やさない。daemon の起動経路だけが呼ぶ (CLI の各設定読込では出さない)。
+    """
+    surplus = sorted(p for p in settings.risk.pair_rules if p not in settings.pairs)
+    if surplus:
+        _log.warning(
+            "risk.pair_rules has rules for pairs not in `pairs` (ignored, "
+            "they do not make the pair tradable): %s", surplus)
+    return surplus
+
+
 def load_env_file(path: Path) -> None:
     """`.env` を `os.environ` へ読み込む唯一の関数 (既存の環境変数は上書きしない)。
 

@@ -27,7 +27,9 @@ import jsonschema
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.commands import Commands
-from agentic_fx.config import load_env_file, load_settings, load_settings_text
+from agentic_fx.config import (
+    load_env_file, load_settings, load_settings_text, warn_surplus_pair_rules,
+)
 from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
 from agentic_fx.core import transitions
@@ -2501,6 +2503,7 @@ def run_service(root: Path, *, daemon: bool = False,
     settings = load_settings(root / "config" / "settings.yaml")
     setup_technical_logging(root / "logs", settings.logging.level,
                             daemon=daemon)
+    warn_surplus_pair_rules(settings)
     stop_event = _stop_event if _stop_event is not None else threading.Event()
     try:
         app = build_app(root, stop_event=stop_event)

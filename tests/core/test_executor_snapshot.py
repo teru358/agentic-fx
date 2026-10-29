@@ -293,6 +293,8 @@ def test_open_from_snapshot_rejects_when_intent_pair_not_in_snapshot(tmp_path):
     CLOSE 側の test_close_order_from_snapshot_rejects_mismatched_pair と対称。
     """
     ex = _make_executor(tmp_path)
+    ex.settings = SETTINGS.model_copy(
+        update={"pairs": [*SETTINGS.pairs, "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)

@@ -92,6 +92,13 @@ def snapshot_age_exceeded(snapshot: ExecutionSnapshot, now: datetime,
             "core_lock (設計書 §3.1)")
 
 
+class NotTradableSymbol(Exception):
+    """`settings.pairs` に無い pair の open。参照 symbol は発注対象にならない。"""
+
+
+NOT_TRADABLE_REASON = "not_tradable_symbol"
+
+
 class SnapshotCoverageError(Exception):
     """commit-core 開始時点の exposure がスナップショットでカバーされて
     いない (設計書 §12 申し送り① N4-2 — commit-pre と commit-core の間に
@@ -526,7 +533,23 @@ class Executor:
 
     # ---- open -----------------------------------------------------------
 
+    def _reject_if_not_tradable(self, intent: TradeIntent, iid: int) -> dict | None:
+        """open の発注対象は `settings.pairs` だけ。quote / spec / 換算 / broker の
+        どれよりも前に呼ぶ。"""
+        if intent.pair in self.settings.pairs:
+            return None
+        intents_store.set_gate_result(self.conn, iid, accepted=False,
+                                      reject_reason=NOT_TRADABLE_REASON,
+                                      reject_category="execution")
+        self.activity.write(Category.TRADE, "gate_rejected", NOT_TRADABLE_REASON,
+                            ref_id=str(iid))
+        return {"result": "rejected", "order_id": None,
+                "reasons": [NOT_TRADABLE_REASON]}
+
     def _open(self, intent: TradeIntent, iid: int) -> dict:
+        rejected = self._reject_if_not_tradable(intent, iid)
+        if rejected is not None:
+            return rejected
         now = self.clock.now()
         # quote 取得・GateContext 構築より前に fail closed する — 不通中は
         # 新規成行 open (新規の drawdown/kill switch 判定を含む) を一切
@@ -734,6 +757,8 @@ class Executor:
         `DataUnhealthy` (次の脚を呼ぶ前に打ち切る — 実行中の 1 脚は
         中断できない)。
         """
+        if intent.pair not in self.settings.pairs:
+            raise NotTradableSymbol(NOT_TRADABLE_REASON)
         now = self.clock.now()
         budget = self.settings.worker.snapshot_max_age_sec
         check = self._make_deadline_checker(budget)
@@ -769,6 +794,9 @@ class Executor:
         broker 執行は `_evaluate_and_execute_open` へ委譲 (`_open` と
         完全共有 — 判定ロジック不変)。
         """
+        rejected = self._reject_if_not_tradable(intent, iid)
+        if rejected is not None:
+            return rejected
         now = self.clock.now()
         rejected = self._reject_if_data_not_ready(iid)
         if rejected is not None:
