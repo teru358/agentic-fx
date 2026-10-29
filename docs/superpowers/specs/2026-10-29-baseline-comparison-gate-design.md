@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.3 C0 (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.3.1 C0 (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -91,7 +91,7 @@ pair p、段 s ごとに純関数 `compare_metrics(b, c)` で `improved(s, p)` �
 
 対応表は上の 7 code で閉じる。新しい code が sandbox に足されると未知として fail closed になり、表の更新が要る。
 
-**途中行の切り戻し (全破棄の境界)。** baseline 再生の前に `gate_rows` の長さを checkpoint する。再生が失敗 (上表で `unavailable` または failed) したら、その位置以降の `variant=baseline` 行だけを切り戻す。候補の floor 行 (checkpoint より前) は保持し、candidate は完全な pair × 段が残る。理由: 一部 pair だけの baseline 行は「同条件の対」(AC 1) を満たさず、片側だけの行は読み手に誤った比較を見せる。`gate_rows` は evaluator がメモリ上で積み、終端 tx が `_persist_gate_rows` で書く。baseline 行・候補行・approval payload の `comparison.verdict=unavailable`・mission 終端は同じ終端 tx で保存し、payload の `unavailable` は baseline 行 0 行と必ず対応する。
+**途中行の切り戻し (全破棄の境界)。** baseline 再生の前に `gate_rows` の長さを checkpoint する。再生が失敗 (上表で `unavailable` または failed) したら、その位置以降の `variant=baseline` 行だけを切り戻す。候補の floor 行 (checkpoint より前) は保持し、candidate は完全な pair × 段が残る。理由: 一部 pair だけの baseline 行は「同条件の対」(AC 1) を満たさず、片側だけの行は読み手に誤った比較を見せる。`gate_rows` は evaluator がメモリ上で積み、終端 tx が `_persist_gate_rows` で書く。baseline 行・候補行・approval payload の `comparison.verdict=unavailable`・mission 終端は同じ終端 tx で保存し、payload の `unavailable` のうち再生失敗 (`baseline_unhealthy` / `gate_timeout` / mission failed) は baseline 行 0 行と対応し、再生に成功したが baseline holdout が非 evaluable (標本不足) の場合は完全な baseline 行を保持したまま `verdict=unavailable` と対応する (AC 6 はこの二つを分けて検査する)。
 
 ### 3.5 対象外
 
@@ -204,3 +204,4 @@ comparison = {
 | 2026-10-29 | v0.1 C0 | 初版 (指揮者承認前の清書) | チケット `same-name-candidate-must-beat-deployed-baseline` の設計化 | |
 | 2026-10-29 | v0.2 C0 | sol 1 周目の全件反映: 契約変更の不正化・shadow 段階・SandboxError 対応表・payload schema・壁時計上限・3 入口 AC・J4 独立化・J5 外し・J6 新設 | sol 1 周目 (Critical 1 / Important 8 / Minor 2) | |
 | 2026-10-29 | v0.3 C0 | sol 2 周目の全件反映: 壁時計を baseline 再生専用に二分 (候補の床は打ち切らない)・repeat 期限式・SandboxError 全 code 閉じ (`backtest_failed`、`cpu_limit` 実装済み)・checkpoint 切り戻し・mode の mission 開始時 snapshot・activity に hash と集計器 schema・表示面の AC 11・窓重複率の再定義・契約検査の優先・J3 / J6 文言 | sol 2 周目 (Critical 1 / Important 7 / Minor 1) | |
+| 2026-10-29 | v0.3.1 C0 | `unavailable` の 2 種 (再生失敗 = baseline 0 行 / 非 evaluable = 完全な baseline 行を保持) を §3.4 と AC 6 で分ける | 設計レビュー 3 周目 (sol、Important 1) | |
