@@ -822,9 +822,6 @@ class Executor:
         rejected = self._reject_if_not_tradable(intent, iid)
         if rejected is not None:
             return rejected
-        rejected = self._reject_if_exposure_not_tradable(iid)
-        if rejected is not None:
-            return rejected
         now = self.clock.now()
         rejected = self._reject_if_data_not_ready(iid)
         if rejected is not None:
@@ -848,6 +845,9 @@ class Executor:
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
+        rejected = self._reject_if_exposure_not_tradable(iid)
+        if rejected is not None:
+            return rejected
         equity, hwm = account
 
         try:

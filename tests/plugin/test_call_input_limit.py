@@ -124,7 +124,9 @@ def _strategy_session_parts(tmp_path, aliases):
     resolved = _resolved(root, *[
         (alias, rsi_dir, ("rsi",), {"period": 14}, 200) for alias in aliases])
     resolved = dataclasses.replace(resolved, items=tuple(
-        dataclasses.replace(item, frame_id=REF_FRAME) for item in resolved.items))
+        dataclasses.replace(
+            item, frame_id=REF_FRAME, symbol_mode="literal",
+            literal_symbol="JP225", timeframe="1h", max_age_seconds=3 * 3600) for item in resolved.items))
     meta = _meta(tmp_path, "strat", "strategy", STRATEGY_READS_INDICATORS_PY,
                  timeframe="1h", pairs=("USDJPY",))
     return meta, resolved

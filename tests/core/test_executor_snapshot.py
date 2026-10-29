@@ -14,7 +14,7 @@ from agentic_fx.core.contracts import (
     OrderStatus as S, Quote, TradeIntent,
 )
 from agentic_fx.core.executor import (
-    CloseSnapshot, ExecutionSnapshot, Executor, SnapshotCoverageError,
+    CloseSnapshot, ExecutionSnapshot, Executor, NotTradableSymbol, SnapshotCoverageError,
     _intent_payload, open_risk_and_notional_from_snapshot,
 )
 from agentic_fx.core.notifier import Notifier
@@ -217,6 +217,7 @@ def test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre(tmp_path
     """N4-2: commit-pre と commit-core の間に新規 exposure が確定し、
     スナップショットに必要通貨が無い場合は lock 内取得せず intent 拒否。"""
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
@@ -947,3 +948,43 @@ def test_notify_sends_immediately_outside_defer_notifications(tmp_path):
     ex.close_order(row, price=148.49, reason="sl_hit")
 
     assert len(recording.sent) == 1
+
+
+def test_open_from_snapshot_reports_stale_snapshot_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    iid = _insert_intent(ex.conn, _start_trade_mission(ex.conn), intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    stale = ExecutionSnapshot(
+        quote=snapshot.quote, spec=snapshot.spec,
+        specs_by_pair=snapshot.specs_by_pair, rates=snapshot.rates,
+        captured_at=snapshot.captured_at - timedelta(seconds=999))
+    _insert_open_order(ex.conn, pair="JP225")
+
+    out = ex.open_from_snapshot(intent, iid, stale, max_snapshot_age_sec=5.0)
+
+    assert out["result"] == "rejected"
+    assert "stale" in out["reasons"][0]
+
+
+def test_open_from_snapshot_reports_account_unknown_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    iid = _insert_intent(ex.conn, _start_trade_mission(ex.conn), intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    _insert_open_order(ex.conn, pair="JP225")
+    ex.conn.execute("DELETE FROM account_snapshots")
+    ex.conn.commit()
+
+    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["no fresh account snapshot (fail closed)"]}
+
+
+def test_gather_open_snapshot_reports_untradable_intent_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+
+    with pytest.raises(NotTradableSymbol):
+        ex.gather_open_snapshot(_open_intent(pair="JP225"),
+                                exposure_pairs=["JP225"])
