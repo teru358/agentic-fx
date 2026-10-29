@@ -25,3 +25,4 @@ related: [weekly-improve-rebacktests-deployed-strategies, improve-objective-filt
 ## 経緯
 
 - 2026-10-29: 起票。
+- 2026-10-29: 状態: 設計待ち — 2026-10-29: 週次改善・手動 improve (単発・繰り返し) のすべての mission を対象にする (ユーザー)。参照系列と並行で設計 C0 を起こす
