@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.3.1 C0 (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.4 C0 (J5 裁定済) (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -46,7 +46,8 @@
 
 - mission は `completed`、承認依頼は作らない。`data/improve_reports/improve-<日付>-<mission>.md` に `reason: not_improved` と節「Baseline comparison detail」が残る。節は段・pair ごとの候補と配備中の版の 8 指標と判定、配備中の版の hash 12 桁。親専有で agent は読めない。
 - activity: `IMPROVE gate_failed mission=<id> reason=not_improved` と、比較を行った全 mission に `IMPROVE baseline_compare mission=<id> plugin=<name> mode=shadow|enforce result=improved|not_improved|unavailable detail=<固定語> candidate=<hash 先頭 12 桁> base=<hash 先頭 12 桁>`。数値は書かない。hash は数値でなく遮断 8 に抵触しない。
-- backlog の `last_result` / `origin_outcome` は他の非提出と同じ `observation:not_submitted` / `not_submitted`。Discord 終了通知: 見出し「配備中の版を上回らず見送り」、本文は固定 1 行 (数値なし、§8 J5 は裁定済み)。
+- backlog の `last_result` / `origin_outcome` は他の非提出と同じ `observation:not_submitted` / `not_submitted`。Discord 終了通知: 見出し「配備中の版を上回らず見送り」、本文は固定 1 行 (数値なし)。
+- **上回ったとき (improved、enforce / shadow とも)**: 承認依頼を作り、Discord の終了通知 (提出) に比較の数値を出す (2026-10-29 ユーザー裁定で J5 を改訂)。本文は固定見出し「配備中の版を上回りました」の下に、holdout の pair ごとに候補 / 配備中の版の **pf・avg_r・取引数・評価可能** の 4 項目 (2026-10-25 裁定の語彙と同じ) を 1 行ずつ。in_sample と max_dd は出さない (承認画面・親専有レポートにだけ)。`not_improved` / `unavailable` のときは数値なし (固定 1 行のまま)。数値の出所は承認依頼 payload の `comparison.stages.holdout` (不変 snapshot) で、afx-ops は GET で読む (Discord 通知設計 §4.6 の DTO に `comparison` を足す = T3)。
 - **shadow のとき** は比較を同じ形で記録し (行・レポート節・承認画面・activity の `mode=shadow`)、`not_improved` でも却下せず従来どおり承認へ進める。
 
 **同名更新として不正なとき。** 候補の `timeframe` か `pairs` が配備中の版と違う場合は、mode に関わらず、床より常に優先して `same_name_contract_changed` で fail closed (床未達でも同じ outcome。candidate の backtest 行は 0 行)。agent 面は `observation:not_submitted` に畳む。親専有レポートに「意味が変わる変更は新しい名前で提出する」と書く (`plugin-naming-lifecycle-policy` と整合)。
@@ -160,7 +161,7 @@ comparison = {
 8. **遮断 8 と監視。** 注入面 (prompt 全文、`last_result`、`origin_outcome`、族別要約、RPC 返却、mission 出力) に数値 canary・段名・`baseline`・`not_improved`・`same_name_contract_changed` が現れない。Discord と activity にも数値が出ない (hash 12 桁と `verdict` は固定語の行に出る)。変異: 床の前に回すと 4 が落ちる、行の variant を `candidate` にすると 1 が落ちる。監視: 集計器 (§4 の出力 schema) が親専有 DB から strategy / hash ごとの試行回数、単調な候補系列、`not_submitted` の集中を計算し、activity の hash 付き行と件数が一致する。
 9. **shadow・mode 固定・壁時計。** shadow では `not_improved` でも承認依頼ができ、行・レポート・activity (`mode=shadow`) は enforce と同形。**shadow で始めた mission は途中で settings が変わっても enforce にならない** (mission 開始時 snapshot、反映は daemon 再起動)。enforce 切替前の測定値 (通過率・差分分布・窓重複率、取得不能は `null` で除外) が集計できる。壁時計: baseline の再生が `baseline_replay_wall_clock_max_sec` を超えると取消され `gate_timeout` で `unavailable` (床のみ)、**候補の floor 実行中は timeout が `unavailable` にならない** (timer は床通過後に開始)。repeat は 2 回目以降、`remaining < mission_timeout_sec + baseline_replay_wall_clock_max_sec + 60 秒` なら次の mission を始めず `deadline` で終わり、1 回目は期限を見ない (実時刻の例で pin、60 秒 repeat を含む)。
 10. **予算。** 候補の `backtest_call_count` と `max_backtests_per_candidate` の消費は比較の有無で変わらない。
-11. **表示の各面。** CLI (`afx ctl approval show`)・対話 shell・web の各面で、candidate / deployed の 8 指標・verdict・`base_content_hash` が出る。旧 payload (`comparison` 無し) は各面で後方互換 (表を出さず落ちない)。Discord は固定見出しのみ (数値なし)。閉じた辞書 (`improve_notice_codes.py`) の全消費側 (`ops/events.py`、`ops/service.py`、`afx-ops` の `improve_render` / `improve_events`、web `DETAIL_FIELDS`) を grep で列挙し、新語が全てに在ることを test で確かめる。
+11. **表示の各面。** CLI (`afx ctl approval show`)・対話 shell・web の各面で、candidate / deployed の 8 指標・verdict・`base_content_hash` が出る。旧 payload (`comparison` 無し) は各面で後方互換 (表を出さず落ちない)。Discord は `improved` のとき holdout の 4 項目 (候補 / 配備中の版) を出し、`not_improved` / `unavailable` は固定見出しのみ (数値なし)。閉じた辞書 (`improve_notice_codes.py`) の全消費側 (`ops/events.py`、`ops/service.py`、`afx-ops` の `improve_render` / `improve_events`、web `DETAIL_FIELDS`) を grep で列挙し、新語が全てに在ることを test で確かめる。
 
 ## 6. 残余
 
@@ -185,7 +186,7 @@ comparison = {
 
 ## 8. 裁定 (利用者判断が要るもの)
 
-技術で決まるものは含めない。J5 は 2026-10-25 の裁定 (数値は Discord に出さない) で固定済みのため本節から外した (§2)。
+技術で決まるものは含めない。**J5 (Discord の比較数値) は 2026-10-29 にユーザー裁定済**: `improved` のときだけ holdout の 4 項目 (pf / avg_r / 取引数 / 評価可能) を候補と配備中の版について出す。`not_improved` / `unavailable` は出さない (§2)。2026-10-25 の裁定 (落ちた段・落ちた pair の 4 項目のみ) に「上回ったときの比較」を加える改訂。
 
 **J1 改善の定義と保守的 ratchet の採否。** 本規則は優位の証明ではなく、両指標の点推定の優越を要求する保守的な ratchet で、60 取引前後では偽棄却が大きく、勝者の呪いは窓の重なりでほぼ残る。これを理解したうえで採用するか。推奨: 採用し、holdout の pf と avg_r が共に厳密に上回る (差の下限 0)、in_sample は添付のみ。根拠: in_sample は agent が最適化した窓。avg_r も損益幅を含む期待値なので 2 指標で足りる。代案 B = in_sample の悪化なしも要求 (`15a66f12` → `01fd0352` は in_sample pf 1.0229 → 1.0165 で落ちうる)、C = 差の下限を正に (基準値の根拠が無く実測要)。利用者判断の理由: 厳しいほど改善が止まる。
 
@@ -205,3 +206,4 @@ comparison = {
 | 2026-10-29 | v0.2 C0 | sol 1 周目の全件反映: 契約変更の不正化・shadow 段階・SandboxError 対応表・payload schema・壁時計上限・3 入口 AC・J4 独立化・J5 外し・J6 新設 | sol 1 周目 (Critical 1 / Important 8 / Minor 2) | |
 | 2026-10-29 | v0.3 C0 | sol 2 周目の全件反映: 壁時計を baseline 再生専用に二分 (候補の床は打ち切らない)・repeat 期限式・SandboxError 全 code 閉じ (`backtest_failed`、`cpu_limit` 実装済み)・checkpoint 切り戻し・mode の mission 開始時 snapshot・activity に hash と集計器 schema・表示面の AC 11・窓重複率の再定義・契約検査の優先・J3 / J6 文言 | sol 2 周目 (Critical 1 / Important 7 / Minor 1) | |
 | 2026-10-29 | v0.3.1 C0 | `unavailable` の 2 種 (再生失敗 = baseline 0 行 / 非 evaluable = 完全な baseline 行を保持) を §3.4 と AC 6 で分ける | 設計レビュー 3 周目 (sol、Important 1) | |
+| 2026-10-29 | v0.4 C0 | J5 をユーザー裁定で改訂: `improved` のとき Discord に holdout の 4 項目を候補 / 配備中の版で出す (§2、AC 11、§8) | ユーザー要望 | |
