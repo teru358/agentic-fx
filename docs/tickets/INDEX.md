@@ -1,17 +1,16 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 151 件。完了分は closed/。
+未完了: 150 件。完了分は closed/。
 
-## 実装中 (7)
+## 実装中 (6)
 
-### 不具合 (3)
+### 不具合 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 | [plugin-sandbox-allows-pure-conversions](open/plugin-sandbox-allows-pure-conversions.md) | 高 | 2026-10-28 | pd.to_numeric が plugin 検査で禁止され、改善 mission が gate で繰り返し落ちる |
-| [approval-notice-shows-strategy-for-indicator](open/approval-notice-shows-strategy-for-indicator.md) | 中 | 2026-10-28 | 指標の承認・配備の通知が「戦略」と表示される |
 
 ### 機能 (4)
 
