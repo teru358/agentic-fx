@@ -552,7 +552,10 @@ class Executor:
                 "reasons": [NOT_TRADABLE_REASON]}
 
     def _reject_if_exposure_not_tradable(self, iid: int) -> dict | None:
-        pairs = {row["pair"] for row in orders.list_by_status(self.conn, *_EXPOSURE)}
+        exposure = orders.list_by_status(self.conn, *_EXPOSURE)
+        if exposure is None:
+            return None
+        pairs = {row["pair"] for row in exposure}
         if pairs <= set(self.settings.pairs):
             return None
         intents_store.set_gate_result(self.conn, iid, accepted=False,
@@ -567,9 +570,6 @@ class Executor:
         rejected = self._reject_if_not_tradable(intent, iid)
         if rejected is not None:
             return rejected
-        rejected = self._reject_if_exposure_not_tradable(iid)
-        if rejected is not None:
-            return rejected
         now = self.clock.now()
         # quote 取得・GateContext 構築より前に fail closed する — 不通中は
         # 新規成行 open (新規の drawdown/kill switch 判定を含む) を一切
@@ -577,8 +577,6 @@ class Executor:
         rejected = self._reject_if_data_not_ready(iid)
         if rejected is not None:
             return rejected
-        quote = self.quote_fn(intent.pair)
-        spec = self.spec_fn(intent.pair)
         account = accounting.current_account(self.conn, now)
         if account is None:
             reasons = ["no fresh account snapshot (fail closed)"]
@@ -588,6 +586,11 @@ class Executor:
             self.activity.write(Category.TRADE, "gate_rejected", reasons[0],
                                 ref_id=str(iid))
             return {"result": "rejected", "order_id": None, "reasons": reasons}
+        rejected = self._reject_if_exposure_not_tradable(iid)
+        if rejected is not None:
+            return rejected
+        quote = self.quote_fn(intent.pair)
+        spec = self.spec_fn(intent.pair)
         equity, hwm = account
         # 1 回の gate 評価内でレートを固定する (設計書 §5)。既存集計
         # (open_risk_and_notional) とこの intent 自身の換算に同じ
@@ -817,6 +820,9 @@ class Executor:
         完全共有 — 判定ロジック不変)。
         """
         rejected = self._reject_if_not_tradable(intent, iid)
+        if rejected is not None:
+            return rejected
+        rejected = self._reject_if_exposure_not_tradable(iid)
         if rejected is not None:
             return rejected
         now = self.clock.now()

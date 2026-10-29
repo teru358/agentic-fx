@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
@@ -51,6 +52,43 @@ def test_session_exposes_parent_observation_fields(tmp_path, plugin_settings):
     assert session.worker_cpu_sec is None
     assert session.parent_kill_sent is False
     assert session.worker_unreaped is False
+
+
+def test_write_line_encodes_a_serialized_text_line_once(monkeypatch, tmp_path,
+                                                         plugin_settings):
+    session = PluginSession(_meta(tmp_path, "write-line", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    written = []
+    monkeypatch.setattr(os, "write", lambda _fd, data: written.append(bytes(data)) or len(data))
+
+    session._write_line('{"op":"読込"}\n', deadline=time.monotonic() + 1.0)
+
+    assert written == ['{"op":"読込"}\n'.encode("utf-8")]
+    session._close_parent_fds()
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_code"),
+    [({"error": "ValueError: reference_unavailable"}, "plugin_error"),
+     ({"error": "reference unavailable", "error_code": "reference_unavailable"},
+      "reference_unavailable")])
+def test_call_uses_structured_reference_unavailable_code(
+        monkeypatch, tmp_path, plugin_settings, response, expected_code):
+    session = PluginSession(_meta(tmp_path, f"response-{expected_code}", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    sent = []
+    monkeypatch.setattr(session, "_write_line",
+                        lambda line, **_kwargs: sent.append(json.loads(line)))
+    monkeypatch.setattr(session, "_read_response", lambda *_args: {
+        "ok": False, "pid": _PipeHandle.pid, "id": sent[-1]["id"], **response})
+
+    with pytest.raises(SandboxError) as error:
+        session.call({"df": _df(), "params": {}})
+
+    assert error.value.code == expected_code
+
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 SAMPLES = Path(__file__).resolve().parents[2] / "docs" / "examples" / "plugins"
@@ -975,6 +1013,42 @@ def test_indicator_failure_becomes_sandbox_error(tmp_path, plugin_settings):
             s.call({"df": _df(10), "params": {}})
 
 
+def test_self_indicator_reference_unavailable_value_error_is_a_plugin_error(
+        tmp_path, plugin_settings):
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(
+        root, "wording",
+        "def compute(df, params):\n    raise ValueError('reference_unavailable')\n")
+    meta = _meta(tmp_path, "strat-wording", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as session:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(10), "params": {}})
+
+    assert error.value.code == "plugin_error"
+
+
+def test_missing_reference_frame_has_reference_unavailable_code(tmp_path, plugin_settings):
+    from dataclasses import replace
+
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(root, "reference", RSI_SERIES_PY, outputs=("rsi",))
+    meta = _meta(tmp_path, "strat-reference", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+    resolved = replace(resolved, items=(replace(
+        resolved.items[0], timeframe="4h", max_age_seconds=43_200,
+        frame_id="self@4h"),))
+
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as session:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(10), "params": {}})
+
+    assert error.value.code == "reference_unavailable"
+
+
 def test_indicator_output_set_mismatch_becomes_sandbox_error(tmp_path,
                                                              plugin_settings):
     """V1: outputs 集合不一致は親に SandboxError として届く。"""
@@ -1027,9 +1101,9 @@ def test_handshake_omits_outputs_key_for_non_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings, resolved=resolved)
     real_write_line = session._write_line
 
-    def _spy(obj, **kwargs):
-        sent.append(obj)
-        real_write_line(obj, **kwargs)
+    def _spy(line, **kwargs):
+        sent.append(json.loads(line))
+        real_write_line(line, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1046,9 +1120,9 @@ def test_handshake_includes_outputs_key_for_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings)
     real_write_line = session._write_line
 
-    def _spy(obj, **kwargs):
-        sent.append(obj)
-        real_write_line(obj, **kwargs)
+    def _spy(line, **kwargs):
+        sent.append(json.loads(line))
+        real_write_line(line, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1508,7 +1582,7 @@ def _scripted_startup(monkeypatch, target, *, pid=None, loaded=None, sent=None):
     reads = {"n": 0}
 
     def write(*args, **_kwargs):
-        sent.append(args[-1])
+        sent.append(json.loads(args[-1]))
 
     def read(*_args):
         reads["n"] += 1
@@ -2194,7 +2268,8 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     real_write = os.write
     monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
     sent = []
-    monkeypatch.setattr(session, "_write_line", lambda obj, **_k: sent.append(obj))
+    monkeypatch.setattr(session, "_write_line",
+                        lambda line, **_k: sent.append(json.loads(line)))
     monkeypatch.setattr(session, "_read_response", lambda *_: {
         "ok": False, "error": "boom", "pid": _PipeHandle.pid, "id": sent[-1]["id"]})
     with pytest.raises(SandboxError) as plugin_error:

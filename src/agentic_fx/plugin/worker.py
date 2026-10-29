@@ -40,7 +40,8 @@
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
 - response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
-  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`
+  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`。
+  frame 不在だけは worker 内部の `"error_code": "reference_unavailable"` を加える。
 - close request: `{"op": "close", "id": "<hex>"}` / close response:
   `{"ok": true, "cpu_sec": <float>, "pid": int, "id": <要求の id>}`
 
@@ -105,6 +106,10 @@ def _cpu_sec() -> float:
 
 
 _KIND_FUNC = {"indicator": "compute", "signal": "detect", "strategy": "evaluate"}
+
+
+class _ReferenceUnavailable(Exception):
+    pass
 
 
 def _wire_to_df(wire: dict[str, Any]):
@@ -282,7 +287,7 @@ def main() -> None:
                 for dep in deps:
                     frame_id = dep.get("frame_id")
                     if frame_id is not None and frame_id not in frames:
-                        raise ValueError("reference_unavailable")
+                        raise _ReferenceUnavailable
                     source = df if frame_id is None else frames[frame_id]
                     sub_df = source.tail(dep["max_bars"]).copy(deep=True)
                     before = sub_df.copy(deep=True)
@@ -319,6 +324,10 @@ def main() -> None:
                                                   outputs=main_outputs))
                     result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
+                                      "id": request_id})
+        except _ReferenceUnavailable:
+            _write_line(protocol_fd, {"ok": False, "error": "reference unavailable",
+                                      "error_code": "reference_unavailable", "pid": pid,
                                       "id": request_id})
         except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ
             try:

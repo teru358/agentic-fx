@@ -1066,8 +1066,8 @@ class PluginSession:
         待って分類する。書き切れないまま期限が切れたら、読取の期限切れと同じく
         `sandbox_startup_timeout` (load をまだ送り切っていないので)。"""
         try:
-            data = json.dumps(obj).encode("utf-8") + b"\n"
-            self._write_line(data, deadline=deadline)
+            line = json.dumps(obj) + "\n"
+            self._write_line(line, deadline=deadline)
         except (TypeError, ValueError) as exc:
             raise SandboxError(f"failed to serialize request: {exc}") from exc
         except _WriteDeadlineExpired:
@@ -1154,7 +1154,7 @@ class PluginSession:
         # close の要求と応答の待ちで 1 つの deadline を共有する
         deadline = time.monotonic() + self._settings.sandbox_timeout_sec
         self._write_line(
-            json.dumps({"op": "close", "id": request_id}).encode("utf-8") + b"\n",
+            json.dumps({"op": "close", "id": request_id}) + "\n",
             deadline=deadline)
         response = self._read_response(_remaining(deadline),
                                        _STARTUP_MAX_BYTES)
@@ -1283,7 +1283,8 @@ class PluginSession:
         self._check_no_stray_output()
 
         try:
-            call_input = json.dumps(request).encode("utf-8") + b"\n"
+            call_line = json.dumps(request) + "\n"
+            call_input = call_line.encode("utf-8")
         except (TypeError, ValueError) as exc:
             raise SandboxError(f"failed to serialize request: {exc}") from exc
         if len(call_input) > MAX_CALL_INPUT_BYTES:
@@ -1293,7 +1294,7 @@ class PluginSession:
         # (`sandbox_timeout_sec` が call 全体の上限)
         deadline = time.monotonic() + self._settings.sandbox_timeout_sec
         try:
-            self._write_line(call_input, deadline=deadline)
+            self._write_line(call_line, deadline=deadline)
         except _WriteDeadlineExpired:
             # load の後なので、読取の期限切れと同じ `timeout`
             raise self._deadline_expired(self._settings.sandbox_timeout_sec) from None
@@ -1319,10 +1320,11 @@ class PluginSession:
                                        self._settings.sandbox_output_max_bytes)
         # 応答の pid は Popen.pid と照合するだけで保持しない
         self._check_response_envelope(
-            response, request_id, allowed=frozenset({"ok", "result", "error", "pid", "id"}))
+            response, request_id,
+            allowed=frozenset({"ok", "result", "error", "error_code", "pid", "id"}))
         if not response["ok"]:
             code = ("reference_unavailable"
-                    if response.get("error") == "ValueError: reference_unavailable"
+                    if response.get("error_code") == "reference_unavailable"
                     else "plugin_error")
             self.error_code = code
             raise SandboxError(
@@ -1354,9 +1356,9 @@ class PluginSession:
 
     # -- IPC 詳細 --
 
-    def _write_line(self, data: bytes, *, deadline: float) -> None:
-        """1 行書き込む。呼び出し元が一度だけ JSON 化した byte 列を書き込む。実際のパイプ
-        書き込みで失敗したら `OSError` をそのまま伝播させる。
+    def _write_line(self, line: str, *, deadline: float) -> None:
+        """JSON 化済みの text 1 行を一度だけ encode して書き込む。実際のパイプ書き込みで
+        失敗したら `OSError` をそのまま伝播させる。
 
         stdin は non-blocking にしてあり、書ける分だけ書いて POLLOUT を待つ。worker が
         stdin を読まずに pipe が埋まっても、`deadline` を過ぎれば
@@ -1366,7 +1368,7 @@ class PluginSession:
         self._ensure_pipe_ownership()
         assert self._stdin_fd is not None
         fd = self._stdin_fd
-        view = memoryview(data)
+        view = memoryview(line.encode("utf-8"))
         poller: Any = None
         while view:
             try:

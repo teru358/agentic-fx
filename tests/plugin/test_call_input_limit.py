@@ -194,4 +194,4 @@ def test_call_encodes_the_request_once_before_measuring_and_writing(monkeypatch)
     assert out == {"signals": []}
     assert len(calls) == 1
     assert len(written) == 1
-    assert written[0].endswith(b"\n")
+    assert written[0].endswith("\n")
