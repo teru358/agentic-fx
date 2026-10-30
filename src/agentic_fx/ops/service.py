@@ -325,7 +325,12 @@ def _approval_of(notice, row) -> dict | None:
             "kind": display_text(kind) if isinstance(kind, str) and kind.strip() else None}
 
 
+_COMPARISON_NOTICE_KEYS = ("pf", "avg_r", "trades", "evaluable")
+
+
 def _comparison_of(notice, row) -> dict | None:
+    """提出通知に添える holdout の 4 項目。上回った (improved) ときだけ作り、
+    それ以外と旧 payload は None。in_sample と他の指標は載せない。"""
     if notice is None or row is None:
         return None
     try:
@@ -334,10 +339,24 @@ def _comparison_of(notice, row) -> dict | None:
         return None
     baseline = payload.get("baseline") if isinstance(payload, dict) else None
     comparison = baseline.get("comparison") if isinstance(baseline, dict) else None
-    if not isinstance(comparison, dict):
+    if not isinstance(comparison, dict) or comparison.get("verdict") != "improved":
         return None
-    return {"base_content_hash": baseline.get("base_content_hash"),
-            "comparison": comparison}
+    stages = comparison.get("stages")
+    holdout = stages.get("holdout") if isinstance(stages, dict) else None
+    if not isinstance(holdout, dict) or not holdout:
+        return None
+    pairs = {}
+    for pair, entry in holdout.items():
+        if not isinstance(pair, str) or not isinstance(entry, dict):
+            return None
+        shown = {}
+        for side in ("candidate", "deployed"):
+            metrics = entry.get(side)
+            if not isinstance(metrics, dict):
+                return None
+            shown[side] = {key: metrics.get(key) for key in _COMPARISON_NOTICE_KEYS}
+        pairs[pair] = shown
+    return {"holdout": pairs}
 
 
 def _baseline_hash_warning(payload: dict, plugins_root: Path | None) -> dict | None:

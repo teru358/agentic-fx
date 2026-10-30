@@ -876,6 +876,22 @@ def _report_text(root) -> str:
 _COMPARISON_SECTION = "## Baseline comparison detail"
 
 
+def _notice_holdout_strings(kind: str) -> set[str]:
+    """Discord の提出通知が読む GET だけは、上回った mission の holdout の
+    pf・avg_r・取引数を返してよい。他の指標・in_sample・上回らなかった mission は不可。"""
+    if kind != "improved":
+        return set()
+    out = set()
+    for name in ("cand_ho", "dep_ho_worse"):
+        metrics = CANARY_METRICS[name]
+        for key in ("pf", "avg_r", "trades"):
+            value = metrics[key]
+            out.add(str(value))
+            if isinstance(value, float):
+                out.update({f"{value:.2f}", f"{value:.3f}"})
+    return out
+
+
 @pytest.mark.parametrize("kind,mode", [
     ("not_improved", "enforce"), ("not_improved", "shadow"),
     ("improved", "shadow"), ("improved", "enforce"),
@@ -892,7 +908,9 @@ def test_holdout_metrics_do_not_reach_agent_or_notice_surfaces(
                  "notices", "activity"):
         assert surfaces[name], f"{name} is empty; the surface was not exercised"
     for name, text in surfaces.items():
-        for canary in canaries:
+        allowed = (_notice_holdout_strings(kind)
+                   if name == "rpc_improve_run" else set())
+        for canary in canaries - allowed:
             assert canary not in text, f"{canary} leaked to {name}"
     report = _report_text(root)
     outside_comparison = report.split(_COMPARISON_SECTION)[0]
@@ -923,3 +941,22 @@ def test_holdout_metrics_do_not_reach_agent_or_notice_surfaces(
                             else "dep_ho_worse")
         assert str(CANARY_METRICS[holdout_deployed]["pf"]) in text
         assert str(CANARY_METRICS["dep_in"]["pf"]) in text
+
+
+def test_the_parent_report_ends_with_the_monitoring_section_and_nothing_else_carries_it(
+        improve_env):
+    """The aggregate lives only in the parent-only report; activity, notices and the
+    agent-facing surfaces never carry its labels."""
+    app, root = improve_env
+    gate, loop, ctx = _drive(app, root, "not_improved", "enforce", metrics=CANARY_METRICS)
+    report = _report_text(root)
+    assert _COMPARISON_SECTION in report
+    assert report.index(_COMPARISON_SECTION) < report.index("## Baseline monitoring")
+    assert "Counts cover missions committed before this one." in report
+    surfaces = _agent_surfaces(app, root, loop, ctx)
+    for name, text in surfaces.items():
+        for label in ("monotone_run", "not_submitted_share", "unavailable_rate",
+                      "window_overlap", "Baseline monitoring"):
+            assert label not in text, f"{label} leaked to {name}"
+    outside = report.split(_COMPARISON_SECTION)[0]
+    assert "monotone_run" not in outside

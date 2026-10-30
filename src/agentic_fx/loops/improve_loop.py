@@ -4424,6 +4424,17 @@ class ImproveLoop:
         ]
         return "\n".join(lines) + "\n\n".join(tables)
 
+    @staticmethod
+    def _baseline_monitor_report_section(conn) -> str:
+        """親専有レポートの末尾に付ける集計節。読めなければ節ごと省き、終端は止めない。"""
+        from agentic_fx.loops import baseline_monitor
+        try:
+            rows = baseline_monitor.monitor_summary(conn)
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            return ""
+        return (f"\n## {baseline_monitor.MONITOR_SECTION_TITLE}\n\n"
+                f"{baseline_monitor.render_monitor_section(rows)}\n")
+
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,
                               mission_outcome: str = "gate_failed",
@@ -4500,6 +4511,8 @@ class ImproveLoop:
             # 後段にのみ全数値を書く。activity/last_result には流れない
             # (report_detail の呼び出し元は `reason` と混ぜていない)。
             body_md += f"\n## {report_section}\n\n{report_detail}\n"
+            if report_section == _BASELINE_REPORT_SECTION:
+                body_md += self._baseline_monitor_report_section(conn)
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
         # D-15 是正: 設計書 §4.2 手順6/7「一時ファイル作成に失敗していたら

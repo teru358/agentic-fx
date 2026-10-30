@@ -18,7 +18,7 @@ from .render import (IMPROVE_BASE_WORDS, IMPROVE_HEADINGS, IMPROVE_OBSERVATION_C
                      IMPROVE_UNKNOWN_HEADING, cut_escaped, escape_discord, plugin_name_or_none)
 
 _DTO_KEYS = frozenset({"id", "backend", "model", "elapsed_sec", "snapshot", "report_state",
-                      "approval", "floor", "comparison"})
+                      "approval", "floor"})
 REPORT_STATES = frozenset({"none", "prepared", "published", "failed"})
 STAGES = ("in_sample", "holdout")
 STAGE_LABELS = {"in_sample": "in-sample", "holdout": "holdout"}
@@ -146,14 +146,9 @@ def _floor_allowed(snapshot: dict | None, report_state: str) -> bool:
 def _comparison(value: object) -> dict | None | bool:
     if value is None:
         return None
-    if type(value) is not dict or type(value.get("base_content_hash")) is not str:
+    if type(value) is not dict or type(value.get("holdout")) is not dict:
         return False
-    comparison = value.get("comparison")
-    if (type(comparison) is not dict or comparison.get("verdict") not in
-            {"improved", "not_improved", "unavailable"} or
-            type(comparison.get("stages")) is not dict):
-        return False
-    return {"base_content_hash": value["base_content_hash"], "comparison": comparison}
+    return {"holdout": value["holdout"]}
 
 
 def validate_improve_run(data: object, mission_id: int) -> dict | None:
@@ -262,12 +257,7 @@ def _floor_lines(floor: dict) -> list[str]:
 
 
 def _comparison_lines(comparison: dict) -> list[str]:
-    data = comparison["comparison"]
-    if data.get("verdict") != "improved":
-        return []
-    holdout = data.get("stages", {}).get("holdout")
-    if type(holdout) is not dict:
-        return []
+    holdout = comparison["holdout"]
     lines = ["配備中の版を上回りました"]
     for pair, entry in holdout.items():
         if type(pair) is not str or type(entry) is not dict:

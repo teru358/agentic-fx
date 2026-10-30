@@ -546,32 +546,51 @@ def test_a_valid_dto_is_returned_with_only_the_used_keys():
     assert checked["floor"]["stages"][0]["pairs"][0]["pf"] == 1.8458377992140615
 
 
+def _holdout_dto(**over):
+    entry = {"candidate": {"pf": 1.2, "avg_r": 0.1, "trades": 40, "evaluable": True},
+             "deployed": {"pf": 1.1, "avg_r": 0.05, "trades": 38, "evaluable": True}}
+    return {"holdout": {"USDJPY": {**entry, **over}}}
+
+
 def test_improved_submission_renders_only_the_four_holdout_metrics_per_version():
-    comparison = {"base_content_hash": "b" * 64, "comparison": {
-        "verdict": "improved", "stages": {"holdout": {"USDJPY": {
-            "candidate": {"pf": 1.2, "avg_r": 0.1, "trades": 40, "evaluable": True,
-                          "max_drawdown": 0.9},
-            "deployed": {"pf": 1.1, "avg_r": 0.05, "trades": 38, "evaluable": True,
-                         "max_drawdown": 0.8}}}}}}
     text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
-                  comparison=comparison)
+                  comparison=_holdout_dto())
     assert "配備中の版を上回りました" in text
     assert "USDJPY 候補: pf 1.20 avg_r +0.10 取引 40 評価可能 はい" in text
     assert "USDJPY 配備中の版: pf 1.10 avg_r +0.05 取引 38 評価可能 はい" in text
     assert "max_drawdown" not in text and "in-sample" not in text
 
 
-@pytest.mark.parametrize("result,reason,verdict", [
-    ("gate_failed", "not_improved", "not_improved"),
-    ("submitted", None, "unavailable"),
+def test_each_pair_gets_its_own_candidate_and_deployed_lines():
+    comparison = _holdout_dto()
+    comparison["holdout"]["EURUSD"] = comparison["holdout"]["USDJPY"]
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert text.count("候補: pf") == 2 and text.count("配備中の版: pf") == 2
+
+
+@pytest.mark.parametrize("result,reason,approval", [
+    ("gate_failed", "not_improved", None),
+    ("submitted", None, {"id": 7, "plugin": "s", "kind": "strategy"}),
 ])
-def test_non_improved_comparisons_never_render_numbers(result, reason, verdict):
-    comparison = {"base_content_hash": "b" * 64, "comparison": {
-        "verdict": verdict, "stages": {"holdout": {"USDJPY": {
-            "candidate": {"pf": 9.9, "avg_r": 9.9, "trades": 999, "evaluable": True},
-            "deployed": {"pf": 1.0, "avg_r": 0.0, "trades": 1, "evaluable": False}}}}}}
-    text = finish(result, reason, comparison=comparison)
-    assert "9.9" not in text and "999" not in text
+def test_a_missing_comparison_never_renders_numbers_or_the_improved_heading(
+        result, reason, approval):
+    """shadow の not_improved / unavailable は提出されるが、daemon は comparison を返さない。"""
+    text = finish(result, reason, approval=approval, comparison=None)
+    assert "配備中の版を上回りました" not in text
+    assert "候補:" not in text and "pf " not in text
+
+
+def test_a_dto_without_the_comparison_key_is_still_valid():
+    """旧 daemon の応答 (comparison 無し) でも落ちず、比較の行は出ない。"""
+    data = dto(2050, result="submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"})
+    del data["comparison"]
+    checked = validate_improve_run(data, 2050)
+    assert checked is not None and checked["comparison"] is None
+
+
+def test_a_malformed_comparison_invalidates_the_dto():
+    assert validate_improve_run(dto(2051, comparison={"holdout": []}), 2051) is None
 
 
 def test_a_pre_terminal_dto_with_null_snapshot_and_elapsed_is_valid():
@@ -654,3 +673,16 @@ def test_a_non_object_response_is_rejected(value):
 
 def test_the_default_dto_used_by_the_negative_cases_is_itself_valid():
     assert validate_improve_run(_bad(lambda d: None), 2040) is not None
+
+
+@pytest.mark.parametrize("reason,line", [
+    ("not_improved", "配備中の版を上回らなかったため見送ります"),
+    ("same_name_contract_changed", "意味が変わる変更は新しい名前で提出する"),
+])
+def test_the_comparison_rejections_have_one_fixed_body_line_without_numbers(reason, line):
+    comparison = {"holdout": {"USDJPY": {
+        "candidate": {"pf": 9.9, "avg_r": 9.9, "trades": 999, "evaluable": True},
+        "deployed": {"pf": 1.0, "avg_r": 0.0, "trades": 1, "evaluable": True}}}}
+    text = finish("gate_failed", reason, comparison=comparison)
+    assert text.split("\n")[1].strip() == line
+    assert "9.9" not in text and "999" not in text
