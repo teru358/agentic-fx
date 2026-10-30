@@ -18,7 +18,7 @@ from .render import (IMPROVE_BASE_WORDS, IMPROVE_HEADINGS, IMPROVE_OBSERVATION_C
                      IMPROVE_UNKNOWN_HEADING, cut_escaped, escape_discord, plugin_name_or_none)
 
 _DTO_KEYS = frozenset({"id", "backend", "model", "elapsed_sec", "snapshot", "report_state",
-                      "approval", "floor"})
+                      "approval", "floor", "comparison"})
 REPORT_STATES = frozenset({"none", "prepared", "published", "failed"})
 STAGES = ("in_sample", "holdout")
 STAGE_LABELS = {"in_sample": "in-sample", "holdout": "holdout"}

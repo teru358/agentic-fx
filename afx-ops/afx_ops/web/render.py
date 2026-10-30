@@ -193,6 +193,10 @@ def _baseline_section(data: Mapping[str, object]) -> str:
     value = baseline.get("base_content_hash")
     if type(value) is str:
         rows.append("<p>base_content_hash: " + _text(value[:12]) + "</p>")
+    warning = data.get("baseline_hash_warning")
+    if type(warning) is dict and type(warning.get("expected")) is str and type(warning.get("actual")) is str:
+        rows.append("<p>警告: 配備中の版の hash が比較時と異なります (比較時="
+                    + _text(warning["expected"]) + " 現在=" + _text(warning["actual"]) + ")</p>")
     for stage in ("in_sample", "holdout"):
         pairs = stages.get(stage)
         if type(pairs) is not dict:

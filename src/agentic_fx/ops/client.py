@@ -799,7 +799,8 @@ def format_approval_detail(data: dict) -> str:
              f"status={display_text(data.get('status'))}"]
     lines += Commands._metrics_lines("in_sample", data.get("in_sample"))
     lines += Commands._metrics_lines("holdout", data.get("holdout"))
-    lines += Commands._baseline_comparison_lines(data.get("baseline"))
+    lines += Commands._baseline_comparison_lines(data.get("baseline"),
+                                                 data.get("baseline_hash_warning"))
     lines += format_change_lines(data.get("change"))
     facts = data.get("facts_lines")
     if isinstance(facts, list):

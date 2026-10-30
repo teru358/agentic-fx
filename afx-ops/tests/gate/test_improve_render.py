@@ -39,11 +39,12 @@ def pair(name="USDJPY", trades=13, pf=1.8458377992140615, avg_r=0.30292348683466
 
 def dto(mission_id=2040, *, result="observation", reason=None, tool=11, elapsed=289,
         text=None, report_state="none", approval=None, floor=None, trigger="manual",
-        backend="codex", model="gpt-5.6-luna"):
+        backend="codex", model="gpt-5.6-luna", comparison=None):
     return {"id": mission_id, "backend": backend, "model": model, "elapsed_sec": elapsed,
             "snapshot": {"trigger": trigger, "result_code": result, "reason_code": reason,
                          "tool_calls": tool, "observation_text": text},
-            "report_state": report_state, "approval": approval, "floor": floor}
+            "report_state": report_state, "approval": approval, "floor": floor,
+            "comparison": comparison}
 
 
 def finish(result="observation", reason=None, *, tool=11, mission_id=2040, **kw):
@@ -543,6 +544,34 @@ def test_a_valid_dto_is_returned_with_only_the_used_keys():
     checked = validate_improve_run(data, 2043)
     assert checked is not None and "extra" not in checked
     assert checked["floor"]["stages"][0]["pairs"][0]["pf"] == 1.8458377992140615
+
+
+def test_improved_submission_renders_only_the_four_holdout_metrics_per_version():
+    comparison = {"base_content_hash": "b" * 64, "comparison": {
+        "verdict": "improved", "stages": {"holdout": {"USDJPY": {
+            "candidate": {"pf": 1.2, "avg_r": 0.1, "trades": 40, "evaluable": True,
+                          "max_drawdown": 0.9},
+            "deployed": {"pf": 1.1, "avg_r": 0.05, "trades": 38, "evaluable": True,
+                         "max_drawdown": 0.8}}}}}}
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert "配備中の版を上回りました" in text
+    assert "USDJPY 候補: pf 1.20 avg_r +0.10 取引 40 評価可能 はい" in text
+    assert "USDJPY 配備中の版: pf 1.10 avg_r +0.05 取引 38 評価可能 はい" in text
+    assert "max_drawdown" not in text and "in-sample" not in text
+
+
+@pytest.mark.parametrize("result,reason,verdict", [
+    ("gate_failed", "not_improved", "not_improved"),
+    ("submitted", None, "unavailable"),
+])
+def test_non_improved_comparisons_never_render_numbers(result, reason, verdict):
+    comparison = {"base_content_hash": "b" * 64, "comparison": {
+        "verdict": verdict, "stages": {"holdout": {"USDJPY": {
+            "candidate": {"pf": 9.9, "avg_r": 9.9, "trades": 999, "evaluable": True},
+            "deployed": {"pf": 1.0, "avg_r": 0.0, "trades": 1, "evaluable": False}}}}}}
+    text = finish(result, reason, comparison=comparison)
+    assert "9.9" not in text and "999" not in text
 
 
 def test_a_pre_terminal_dto_with_null_snapshot_and_elapsed_is_valid():

@@ -340,6 +340,25 @@ def _comparison_of(notice, row) -> dict | None:
             "comparison": comparison}
 
 
+def _baseline_hash_warning(payload: dict, plugins_root: Path | None) -> dict | None:
+    """比較 snapshot の基準版と現在の配備版が違うときだけ表示用の印を返す。"""
+    baseline = payload.get("baseline")
+    name = payload.get("name")
+    if (not isinstance(baseline, dict) or not isinstance(name, str)
+            or not isinstance(baseline.get("base_content_hash"), str)
+            or plugins_root is None):
+        return None
+    try:
+        from agentic_fx.core.plugin_files import content_hash_of_dir
+        actual = content_hash_of_dir(plugins_root / name)
+    except (OSError, ValueError):
+        return None
+    expected = baseline["base_content_hash"]
+    if actual == expected:
+        return None
+    return {"expected": expected[:12], "actual": actual[:12]}
+
+
 def _approval_plugin_kind(conn: sqlite3.Connection, approval_id: int) -> str | None:
     """承認 payload の表示可能な plugin 種別だけを event へ写す。"""
     row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
@@ -785,6 +804,7 @@ class OpsService:
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
                 "baseline": payload.get("baseline"),
+                "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root),
                 "payload_sha256": payload_sha256(row["payload_json"]),
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
