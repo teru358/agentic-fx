@@ -1,6 +1,6 @@
 # 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する — 設計 C0
 
-**版:** v0.5.2 C0 (裁定済、実装中) (sol 2 周目の全件反映、指揮者承認前の清書)
+**版:** v0.5.3 C0 (裁定済、実装中) (sol 2 周目の全件反映、指揮者承認前の清書)
 **チケット:** `same-name-candidate-must-beat-deployed-baseline` (中)。`baseline-replay-unimplemented` (2026-09-12、同じ未実装を指す) はこの束で閉じる。
 **正本の関係:** 収益性の床は `2026-09-12-profitability-floor-design.md`、遮断 8 の規律は同 §4、通知は `2026-10-25-improve-discord-notice-design.md`、族別要約は `2026-10-24-improve-feedback-structure-design.md`。いずれも変えず、gate に 1 段足す。
 
@@ -45,7 +45,7 @@
 **却下されたとき (enforce)。** 週次・手動単発・手動 repeat の mission で候補が床を通り、同名の配備中の版を上回らなかった場合:
 
 - mission は `completed`、承認依頼は作らない。`data/improve_reports/improve-<日付>-<mission>.md` に `reason: not_improved` と節「Baseline comparison detail」が残る。節は段・pair ごとの候補と配備中の版の 8 指標と判定、配備中の版の hash 12 桁。親専有で agent は読めない。
-- activity: `IMPROVE gate_failed mission=<id> reason=not_improved` と、比較を行った全 mission に `IMPROVE baseline_compare mission=<id> plugin=<name> mode=shadow|enforce result=improved|not_improved|unavailable detail=<固定語> candidate=<hash 先頭 12 桁> base=<hash 先頭 12 桁>`。数値は書かない。hash は数値でなく遮断 8 に抵触しない。
+- activity: `IMPROVE gate_failed mission=<id> reason=not_improved` と、比較を行い終端 tx が commit された全 mission に (補償で failed になった mission は baseline 行も 0 で出さない) `IMPROVE baseline_compare mission=<id> plugin=<name> mode=shadow|enforce result=improved|not_improved|unavailable detail=<固定語> candidate=<hash 先頭 12 桁> base=<hash 先頭 12 桁>`。数値は書かない。hash は数値でなく遮断 8 に抵触しない。
 - backlog の `last_result` / `origin_outcome` は他の非提出と同じ `observation:not_submitted` / `not_submitted`。Discord 終了通知: 見出し「配備中の版を上回らず見送り」、本文は固定 1 行 (数値なし)。
 - **上回ったとき (improved、enforce / shadow とも)**: 承認依頼を作り、Discord の終了通知 (提出) に比較の数値を出す (2026-10-29 ユーザー裁定で J5 を改訂)。本文は固定見出し「配備中の版を上回りました」の下に、holdout の pair ごとに候補 / 配備中の版の **pf・avg_r・取引数・評価可能** の 4 項目 (2026-10-25 裁定の語彙と同じ) を 1 行ずつ。in_sample と max_dd は出さない (承認画面・親専有レポートにだけ)。`not_improved` / `unavailable` のときは数値なし (固定 1 行のまま)。数値の出所は承認依頼 payload の `comparison.stages.holdout` (不変 snapshot) で、afx-ops は GET で読む (Discord 通知設計 §4.6 の DTO に `comparison` を足す = T3)。
 - **shadow のとき** は比較を同じ形で記録し (行・レポート節・承認画面・activity の `mode=shadow`)、`not_improved` でも却下せず従来どおり承認へ進める。
@@ -212,3 +212,4 @@ comparison = {
 | 2026-10-29 | v0.5 C0 | J1〜J4・J6 をユーザー裁定済 (推奨どおり) に | ユーザー承認、実装着手 | |
 | 2026-10-29 | v0.5.1 C0 | T1 レビュー 1 周目 (/code-review) の追従: 壁時計は各 sandbox 呼び出しの前だけで判定し完走した結果は捨てない (§3.6)、pair 別 verdict の優先順位は not_improved > improved > unavailable (§3.3)、gate は baseline 行を verdict の `baseline_rows` で返し T2 が終端 tx で永続化 (§3.4 の checkpoint)、`comparison.reason` の固定語 7 種 (holdout_exceeds / holdout_not_exceeds / baseline_not_evaluable / candidate_not_evaluable / baseline_unhealthy / gate_timeout / no_pairs) を §4 に | T1 実装とレビュー | |
 | 2026-10-30 | v0.5.2 C0 | T2 準備の食い違い: repeat の開始条件は現行規則を維持 (§3.6、ユーザー裁定の優先)、`comparison` は `payload.baseline.comparison` (§2 / AC 3 を §4 に揃える)、レポート節は enforce の却下と契約違反のみ (§2)、prompt の 1 文は enforce のみ、settings の新キーは任意で schema 版は上げない (§3.7) | T2 準備 | |
+| 2026-10-30 | v0.5.3 C0 | §2 の `baseline_compare` activity は終端 tx が commit された mission だけに出す | T2 レビュー 2 周目 (opus) の食い違い指摘、Imp-1 の是正に合わせる | |
