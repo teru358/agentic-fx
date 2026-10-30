@@ -234,3 +234,34 @@ def test_a_stale_reference_is_refused_even_when_a_long_strategy_window_reaches_i
         max_age_seconds=3 * 3600)
     assert frame.index[-1] == pd.Timestamp(FRIDAY_LAST - timedelta(hours=1))
     conn.close()
+
+
+def test_consecutive_buckets_share_one_read_of_the_reference_and_match_uncached_frames(
+        tmp_path, monkeypatch):
+    conn = _world(tmp_path)
+    meta = _meta(timeframe="1h", max_bars=3)
+    item = _item(max_age_hours=84)
+    session = _Session()
+    source = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", dataset=HISTORY, settings=SETTINGS_WITH_WATCH,
+        resolved=ResolvedIndicatorSet(inventory_root=Path("/nonexistent"),
+                                      items=(item,), all_pinned=True), session=session)
+    reads = []
+    real = strategy_adapter.load_history_native_frame
+    monkeypatch.setattr(strategy_adapter, "load_history_native_frame",
+                        lambda *a, **k: reads.append(1) or real(*a, **k))
+    starts = [datetime(2026, 10, 23, 15, tzinfo=timezone.utc),
+              datetime(2026, 10, 26, 0, tzinfo=timezone.utc),
+              datetime(2026, 10, 26, 5, tzinfo=timezone.utc)]
+    for start in starts:
+        source(Bar("USDJPY", "1h", start, 1.0, 1.0, 1.0, 1.0, 1.0))
+    assert len(reads) == 1
+    assert len(session.calls) == 3
+    for start, call in zip(starts, session.calls):
+        expected = load_history_reference_frame(
+            conn, "JP225", reference_timeframe="1h", source="dukascopy",
+            base_interval="1m", d_last=pd.Timestamp(start + timedelta(hours=1)),
+            actual_bars=3, max_age_seconds=84 * 3600)
+        pd.testing.assert_frame_equal(call["frames"]["JP225@1h"], expected,
+                                      check_freq=False)
+    conn.close()

@@ -1317,6 +1317,10 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: strategy not evaluable "
             f"({outcome.insufficient_trades_reason})")
+    if outcome.verdict_kind == "reference_history_missing":
+        _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
+        raise ValueError(
+            f"plugin {name!r}: strategy not evaluable ({outcome.unevaluable_reason})")
     if outcome.verdict_kind == "history_source_unconfigured":
         _persist_human_gate_rows(conn, rows, mission_outcome="gate_failed", now=now)
         raise ValueError(

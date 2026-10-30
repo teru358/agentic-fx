@@ -8,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from agentic_fx.backtest.dataset import HistoryDataset
-from agentic_fx.backtest.holdout import NoHistoryError, ReferenceHistoryMissingError
 from agentic_fx.plugin.resolve import ResolvedIndicatorSet
 from agentic_fx.plugin.strategy_gate import evaluate_strategy_adoption_gate
 from tests.backtest.factories import _conn
@@ -30,7 +29,7 @@ def _call(conn, resolved, *, record=None):
         record_fn=record)
 
 
-def test_a_reference_with_no_history_stops_the_gate_before_any_run_or_row(
+def test_a_reference_with_no_history_returns_an_unevaluable_verdict_before_any_run_or_row(
         tmp_path, monkeypatch):
     conn = _conn(tmp_path)
     ran, rows = [], []
@@ -39,13 +38,20 @@ def test_a_reference_with_no_history_stops_the_gate_before_any_run_or_row(
     monkeypatch.setattr(
         "agentic_fx.plugin.strategy_gate.strategy_adapter.build_intent_source",
         lambda meta, **kw: ran.append("built") or MagicMock(close=lambda: None))
-    with pytest.raises(ReferenceHistoryMissingError,
-                       match=r"^reference_history_missing\(JP225, 1h, no_rows\)$"):
-        _call(conn, _resolved(_item()), record=rows.append)
+    verdict = _call(conn, _resolved(_item()), record=rows.append)
+    assert verdict.evaluable is False
+    assert verdict.unevaluable_kind == "reference_history_missing"
+    assert verdict.observation_reason == "reference_history_missing(JP225, 1h, no_rows)"
     assert ran == [] and rows == []
     assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
-    assert issubclass(ReferenceHistoryMissingError, NoHistoryError)
     conn.close()
+
+
+def test_the_unevaluable_kind_has_a_notice_and_a_human_gate_outcome():
+    from agentic_fx.improve_notice_codes import (
+        NOTICE_BACKTEST_DATA_UNAVAILABLE, notice_for_unevaluable_kind)
+    assert notice_for_unevaluable_kind("reference_history_missing") is (
+        NOTICE_BACKTEST_DATA_UNAVAILABLE)
 
 
 def test_the_gate_runs_when_the_reference_has_any_history(tmp_path, monkeypatch):

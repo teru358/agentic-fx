@@ -132,12 +132,17 @@ def test_a_512_byte_key_is_accepted_and_513_is_refused_by_the_key_builder():
     over = _tuned_config(1)
     assert family_key_of(over, name="x") is None
     parsed = _parse(exact)
-    longer = reference_family_key(
+    from agentic_fx.plugin.logic_identity import FamilyKeyTooLong, _v2_family_key
+    longer = _v2_family_key(
         parsed.timeframe, parsed.pairs,
         [replace(parsed.dependencies[0], alias=parsed.dependencies[0].alias + "x"),
          *parsed.dependencies[1:]])
     assert len(longer.encode()) == 513
     assert _parse(longer) is None
+    with pytest.raises(FamilyKeyTooLong):
+        reference_family_key(parsed.timeframe, parsed.pairs, [
+            replace(parsed.dependencies[0], alias=parsed.dependencies[0].alias + "x"),
+            *parsed.dependencies[1:]])
 
 
 def _resolve(tmp_path, config):
@@ -174,3 +179,32 @@ def test_the_resolver_and_the_config_derive_the_same_key_for_the_same_strategy(t
         [ParsedDependency(item.alias, item.plugin_name, item.symbol_mode,
                           item.literal_symbol, item.timeframe)])
     assert from_resolver == family_key_of(config, name="s")
+
+
+def test_a_lone_surrogate_in_a_symbol_still_makes_a_key_that_round_trips():
+    symbol = "\ud800X"
+    config = ("kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nindicators:\n"
+              '  a: {plugin: ema, symbol: "\\ud800X", timeframe: 1h}\n')
+    key = family_key_of(config, name="x")
+    assert key is not None and "%ED%A0%80X" in key
+    assert _parse(key).dependencies[0].literal_symbol == symbol
+
+
+def test_the_key_builder_raises_past_the_limit_instead_of_returning_a_long_key():
+    from agentic_fx.plugin.logic_identity import FamilyKeyTooLong, dependency_of
+    deps = [dependency_of(f"d{i}", "ema", "日" * 10, "1h", "1h") for i in range(8)]
+    with pytest.raises(FamilyKeyTooLong):
+        reference_family_key("1h", ["USDJPY"], deps)
+    assert len(reference_family_key("1h", ["USDJPY"], deps[:3]).encode()) <= 512
+
+
+def test_a_deployed_strategy_whose_v2_key_is_too_long_is_listed_without_a_key():
+    from types import SimpleNamespace
+
+    from agentic_fx.loops.improve_context import _deployed_view, deployed_families
+    refs = tuple(SimpleNamespace(alias=f"d{i}", plugin="ema", symbol="日" * 10,
+                                 timeframe=None) for i in range(8))
+    meta = SimpleNamespace(name="big", kind="strategy", timeframe="1h",
+                           pairs=("USDJPY",), indicators=refs)
+    keyed, unkeyed, _, _ = _deployed_view(deployed_families([meta]), {"USDJPY"})
+    assert keyed == {} and [u["name"] for u in unkeyed] == ["big"]

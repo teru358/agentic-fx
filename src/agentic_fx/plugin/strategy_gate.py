@@ -62,7 +62,8 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     # evaluable=False の理由の種別 (判別子)。呼び出し側は observation_reason の
     # 文字列ではなくこの値で分岐する。
     unevaluable_kind: Literal["insufficient_trades",
-                              "history_source_unconfigured"] = "insufficient_trades"
+                              "history_source_unconfigured",
+                              "reference_history_missing"] = "insufficient_trades"
 
 
 def _floor_fail_items(
@@ -271,7 +272,12 @@ def evaluate_strategy_adoption_gate(
     timeframe = meta.timeframe if timeframe is None else timeframe
     content_hash = meta.content_hash if content_hash is None else content_hash
     history_conn = conn if history_conn is None else history_conn
-    holdout.require_reference_history(history_conn, dataset, resolved)
+    try:
+        holdout.require_reference_history(history_conn, dataset, resolved)
+    except holdout.ReferenceHistoryMissingError as exc:
+        return StrategyGateVerdict(
+            evaluable=False, observation_reason=str(exc),
+            unevaluable_kind="reference_history_missing")
     run_in_sample = run_in_sample_fn or holdout.run_in_sample
     run_holdout = run_holdout_gate_fn or holdout.run_holdout_gate
     plugin_ref = f"plugins/{name}"

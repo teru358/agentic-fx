@@ -113,7 +113,7 @@ def build_improve_staging_tooldefs(
         return {"plugins": list(view["plugins"]),
                 "pin_broken_strategies": list(view["pin_broken_strategies"]),
                 "watch_symbols": list(view.get("watch_symbols", [])),
-                "history_available": bool(view.get("history_available", False))}
+                "history_available": dict(view.get("history_available", {}))}
 
     def lock_staging_deps(name: str) -> dict:
         """候補 `config.yaml` の `indicators.<alias>.pin` を、`inventory_view`

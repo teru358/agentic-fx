@@ -498,16 +498,16 @@ def build_inventory_view(result: "InventoryBuildResult", *, settings=None, conn=
     if settings is not None:
         watches = list(settings.datafeed.watch_symbols)
         dataset = settings.backtest.dataset()
-        covered = 0
+        covered: set[str] = set()
         if conn is not None and not dataset.unconfigured and watches:
             placeholders = ",".join("?" for _ in watches)
-            covered = conn.execute(
-                "SELECT COUNT(DISTINCT symbol) FROM ohlcv_history "
+            covered = {row[0] for row in conn.execute(
+                "SELECT DISTINCT symbol FROM ohlcv_history "
                 "WHERE source=? AND interval=? "
                 f"AND symbol IN ({placeholders})",
-                (dataset.source, dataset.base_interval, *watches)).fetchone()[0]
+                (dataset.source, dataset.base_interval, *watches))}
         view["watch_symbols"] = watches
-        view["history_available"] = bool(watches) and covered == len(set(watches))
+        view["history_available"] = {symbol: symbol in covered for symbol in watches}
     return view
 
 
@@ -1541,14 +1541,10 @@ class ImproveLoop:
                                  "discovery. Continue without backtest "
                                  "results."),
                     }
-                from agentic_fx.backtest.dataset import (
-                    literal_reference_coordinates, missing_reference_history,
-                    reference_history_missing_error,
-                )
-                missing = missing_reference_history(
-                    conn, dataset, literal_reference_coordinates(resolved))
-                if missing is not None:
-                    error = reference_history_missing_error(*missing)
+                try:
+                    holdout.require_reference_history(conn, dataset, resolved)
+                except holdout.ReferenceHistoryMissingError as exc:
+                    error = str(exc)
                     self._activity.write(
                         Category.IMPROVE, "reference_history_missing",
                         f"mission={staging_dir.name} name={args['name']} error={error}")
@@ -3636,7 +3632,13 @@ class ImproveLoop:
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
-                            reason=strategy_verdict.observation_reason, now=now,
+                            reason=(
+                                "gate_failed:backtest_data_unavailable:"
+                                + strategy_verdict.observation_reason
+                                if strategy_verdict.unevaluable_kind
+                                == "reference_history_missing"
+                                else strategy_verdict.observation_reason),
+                            now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             candidate=final_candidate,
                             candidate_outcome=(

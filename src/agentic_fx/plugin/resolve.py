@@ -256,7 +256,7 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         raise IndicatorResolutionError(None, "handshake_too_large")
     if any(item.symbol_mode == "literal" for item in items):
         from agentic_fx.plugin.logic_identity import (
-            FAMILY_KEY_MAX_BYTES, ParsedDependency, reference_family_key,
+            FamilyKeyTooLong, ParsedDependency, reference_family_key,
         )
         by_alias = {item.alias: item for item in items}
         dependencies = [
@@ -265,9 +265,10 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
                              by_alias[ref.alias].literal_symbol,
                              by_alias[ref.alias].timeframe)
             for ref in meta.indicators]
-        family_key = reference_family_key(meta.timeframe, meta.pairs, dependencies)
-        if len(family_key.encode("utf-8")) > FAMILY_KEY_MAX_BYTES:
-            raise IndicatorResolutionError(None, "family_key_too_long")
+        try:
+            reference_family_key(meta.timeframe, meta.pairs, dependencies)
+        except FamilyKeyTooLong as exc:
+            raise IndicatorResolutionError(None, "family_key_too_long") from exc
     return resolved
 
 

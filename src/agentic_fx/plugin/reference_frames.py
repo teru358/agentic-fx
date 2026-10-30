@@ -32,7 +32,7 @@ def actual_bars_for(df_index: pd.DatetimeIndex, strategy_timeframe: str,
                                  reference_timeframe)
 
 
-def _window_lower(d_last_dt: datetime, reference_timeframe: str, actual_bars: int,
+def window_lower(d_last_dt: datetime, reference_timeframe: str, actual_bars: int,
                   max_age_seconds: int) -> datetime:
     ref_width = timedelta(seconds=timeframe_seconds(reference_timeframe))
     lookback = max(ref_width * actual_bars,
@@ -57,7 +57,7 @@ def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
     native = native_interval(reference_timeframe)
     native_width = timedelta(minutes=TF_MINUTES[native])
     d_last_dt = pd.Timestamp(d_last).to_pydatetime()
-    lower = _window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
+    lower = window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
     now_utc = now.astimezone(timezone.utc)
     rows = conn.execute(
         f"SELECT bar_time, open, high, low, close, volume FROM {_table(source)} "
@@ -74,6 +74,30 @@ def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
     return df
 
 
+def load_history_native_frame(conn: sqlite3.Connection, symbol: str, *,
+                              reference_timeframe: str, source: str,
+                              base_interval: str, since: datetime,
+                              until: datetime) -> pd.DataFrame:
+    """Complete native-interval rows of a replay dataset over ``[since, until]``."""
+    native = native_interval(reference_timeframe)
+    if TF_MINUTES[base_interval] > TF_MINUTES[native]:
+        return pd.DataFrame({c: pd.Series(dtype="float64") for c in _COLUMNS},
+                            index=pd.DatetimeIndex([], tz="UTC"))
+    return load_resampled_frame(conn, symbol, native, source=source,
+                                base_interval=base_interval, since=since, until=until)
+
+
+def history_reference_frame(native: pd.DataFrame, *, reference_timeframe: str,
+                            lower: datetime, d_last: pd.Timestamp) -> pd.DataFrame:
+    """The reference frame a decision at ``d_last`` sees, cut from native rows."""
+    width = pd.Timedelta(minutes=TF_MINUTES[native_interval(reference_timeframe)])
+    d_last = pd.Timestamp(d_last)
+    df = native[(native.index >= pd.Timestamp(lower)) & (native.index + width <= d_last)]
+    if reference_timeframe in ("4h", "1d"):
+        df = complete_reference_buckets(df, effective_timeframe=reference_timeframe)
+    return df
+
+
 def load_history_reference_frame(conn: sqlite3.Connection, symbol: str, *,
                                  reference_timeframe: str, source: str,
                                  base_interval: str, d_last: pd.Timestamp,
@@ -85,19 +109,13 @@ def load_history_reference_frame(conn: sqlite3.Connection, symbol: str, *,
     dataset's base interval resampled to the native reference interval, and
     "closed" simply means ended by ``d_last`` (there is no wall clock in a replay).
     """
-    native = native_interval(reference_timeframe)
     d_last_dt = pd.Timestamp(d_last).to_pydatetime()
-    lower = _window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
-    if TF_MINUTES[base_interval] > TF_MINUTES[native]:
-        df = pd.DataFrame({c: pd.Series(dtype="float64") for c in _COLUMNS},
-                          index=pd.DatetimeIndex([], tz="UTC"))
-    else:
-        df = load_resampled_frame(conn, symbol, native, source=source,
-                                  base_interval=base_interval,
-                                  since=lower, until=d_last_dt)
-    if reference_timeframe in ("4h", "1d"):
-        df = complete_reference_buckets(df, effective_timeframe=reference_timeframe)
-    return df
+    lower = window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
+    native = load_history_native_frame(
+        conn, symbol, reference_timeframe=reference_timeframe, source=source,
+        base_interval=base_interval, since=lower, until=d_last_dt)
+    return history_reference_frame(native, reference_timeframe=reference_timeframe,
+                                   lower=lower, d_last=d_last)
 
 
 def judge_reference(frame: pd.DataFrame, *, bucket_start: pd.Timestamp,

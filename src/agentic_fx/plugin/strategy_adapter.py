@@ -54,13 +54,17 @@ from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.reference import runtime_reference_window_reason
 from agentic_fx.plugin.reference_frames import (
-    actual_bars_for, judge_reference, load_history_reference_frame,
+    actual_bars_for, history_reference_frame, judge_reference,
+    load_history_native_frame, window_lower,
 )
 from agentic_fx.plugin.sandbox import PluginSession, REFERENCE_ERROR_CODES, SandboxError
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
     from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+
+
+_FRAME_CACHE_SPAN = timedelta(days=30)
 
 
 class _SessionLike(Protocol):
@@ -113,6 +117,9 @@ class PluginStrategyIntentSource:
         # session を注入した呼び出し元がその所有者 (close の責務も持つ)。
         # 既定 (None) はこのアダプタ自身が lazy 生成し、自分で閉じる。
         self._owns_session = session is None
+        # (symbol, reference timeframe) -> (lower, upper, native rows): a replay reads
+        # each reference once per chunk instead of once per strategy bar.
+        self._native_cache: dict[tuple[str, str], tuple] = {}
         self._cpu_sec: float | None = None
         # 親が観測した worker の終了状態。session 参照を消す前に取り込む
         # (close 応答の自己申告ではなく親の wait4 が出所)。
@@ -198,11 +205,7 @@ class PluginStrategyIntentSource:
                 continue
             if item.symbol_mode != "self" and symbol not in watch:
                 return None
-            frame = load_history_reference_frame(
-                self._conn, symbol, reference_timeframe=item.timeframe,
-                source=self._dataset.source, base_interval=self._dataset.base_interval,
-                d_last=d_last, actual_bars=actual,
-                max_age_seconds=item.max_age_seconds)
+            frame = self._frame(symbol, item, d_last, actual)
             aligned = judge_reference(
                 frame, bucket_start=bucket_start,
                 strategy_timeframe=self._meta.timeframe,
@@ -212,6 +215,22 @@ class PluginStrategyIntentSource:
                 return None
             frames[item.frame_id] = frame
         return frames
+
+    def _frame(self, symbol: str, item, d_last, actual: int):
+        d_last_dt = d_last.to_pydatetime()
+        lower = window_lower(d_last_dt, item.timeframe, actual, item.max_age_seconds)
+        key = (symbol, item.timeframe)
+        cached = self._native_cache.get(key)
+        if cached is None or lower < cached[0] or d_last_dt > cached[1]:
+            upper = d_last_dt + _FRAME_CACHE_SPAN
+            native = load_history_native_frame(
+                self._conn, symbol, reference_timeframe=item.timeframe,
+                source=self._dataset.source, base_interval=self._dataset.base_interval,
+                since=lower, until=upper)
+            cached = (lower, upper, native)
+            self._native_cache[key] = cached
+        return history_reference_frame(
+            cached[2], reference_timeframe=item.timeframe, lower=lower, d_last=d_last)
 
     def _ensure_session(self) -> _SessionLike:
         if self._session is None:

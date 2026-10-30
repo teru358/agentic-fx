@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 from agentic_fx.plugin.logic_identity import (
-    DEFAULT_FAMILY_TIMEFRAME, ParsedFamilyKey, checked_family_key,
+    DEFAULT_FAMILY_TIMEFRAME, FamilyKeyTooLong, ParsedFamilyKey, checked_family_key,
     dependency_of, is_plain_name, is_plain_pair, parse_family_key,
     reference_family_key)
 from agentic_fx.policy import Policy, directives_path
@@ -317,9 +317,12 @@ def _deployed_view(families: list[dict], allowed_pairs: "set[str]"
             continue
         if family.get("dependencies"):
             strategy_tf = family["timeframe"] or DEFAULT_FAMILY_TIMEFRAME
-            key = reference_family_key(strategy_tf, family["pairs"], [
-                dependency_of(d["alias"], d["plugin"], d["symbol"], d["timeframe"],
-                              strategy_tf) for d in family["dependencies"]])
+            try:
+                key = reference_family_key(strategy_tf, family["pairs"], [
+                    dependency_of(d["alias"], d["plugin"], d["symbol"], d["timeframe"],
+                                  strategy_tf) for d in family["dependencies"]])
+            except FamilyKeyTooLong:
+                key = None  # listed among the strategies without a family key
         else:
             key = checked_family_key(
                 family["kind"], name, family["timeframe"], family["pairs"],
