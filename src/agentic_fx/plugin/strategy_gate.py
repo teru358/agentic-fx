@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -408,8 +409,9 @@ def evaluate_strategy_adoption_gate(
         raise ValueError(f"unknown compare_mode: {compare_mode!r}")
     if compare_mode != "off" and inventory is None:
         raise ValueError("compare_mode requires inventory")
-    if baseline_replay_wall_clock_max_sec <= 0:
-        raise ValueError("baseline_replay_wall_clock_max_sec must be > 0")
+    if (not math.isfinite(baseline_replay_wall_clock_max_sec)
+            or baseline_replay_wall_clock_max_sec <= 0):
+        raise ValueError("baseline_replay_wall_clock_max_sec must be finite and > 0")
     dataset = settings.backtest.dataset()
     if dataset.unconfigured:
         return StrategyGateVerdict(

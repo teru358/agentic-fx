@@ -632,7 +632,7 @@ def test_wrapped_source_delegates_attributes(monkeypatch):
     assert seen["cpu"] == 1.5
 
 
-@pytest.mark.parametrize("bad", [0, -1, 0.0])
+@pytest.mark.parametrize("bad", [0, -1, 0.0, float("nan"), float("inf"), float("-inf")])
 def test_nonpositive_wall_clock_rejected(monkeypatch, bad):
     env = Env(monkeypatch)
     with pytest.raises(ValueError):
