@@ -121,6 +121,8 @@ def test_registry_hard_keys_for_a_pairs_only_config_equal_the_old_derivation():
     assert registry.hard_keys() == old
     assert registry.hard_keys() == {(p, i) for p in ("USDJPY", "EURUSD")
                                     for i in ("1m", "1h")}
+    assert not registry.is_hard("USDJPY", "15m")
+    assert not registry.is_reference("USDJPY", "15m")
 
 
 def test_literal_reference_is_a_soft_key_with_the_largest_window():

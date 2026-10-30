@@ -13,6 +13,7 @@ from agentic_fx.datafeed import sources
 from agentic_fx.datafeed.ingest import (
     SOFT_BACKOFF_BASE_SEC, Ingest, classify_fetch_error, soft_backoff_delay,
 )
+from agentic_fx.datafeed.planner import PlanResult
 from agentic_fx.datafeed.outage import OutageStateMachine
 from agentic_fx.plugin.loader import IndicatorRef
 from agentic_fx.store.db import connect, init_db
@@ -163,12 +164,63 @@ def _attempt_gaps(tmp_path, timeframe, rounds, *, raises):
 @pytest.mark.parametrize("raises", [True, False])
 def test_soft_backoff_doubles_from_sixty_seconds_up_to_one_bar_width(tmp_path, raises):
     gaps = _attempt_gaps(tmp_path, "1h", 9, raises=raises)
-    assert gaps == [60, 120, 240, 480, 960, 1920, 3600, 3600]
+    assert gaps == [3600] * 8
 
 
 def test_soft_backoff_cap_is_the_bar_width_of_a_fifteen_minute_key(tmp_path):
     gaps = _attempt_gaps(tmp_path, "15m", 8, raises=True)
-    assert gaps == [60, 120, 240, 480, 900, 900, 900]
+    assert gaps == [900] * 7
+
+
+def test_a_trading_pair_strategy_key_keeps_the_hard_retry_schedule(tmp_path):
+    conn = _db(tmp_path)
+
+    def fetch(pair, interval, start, end, *, timeout):
+        if (pair, interval) == ("USDJPY", "15m"):
+            raise httpx.ConnectError("down")
+        return []
+
+    ingest = Ingest(_settings(), [_strategy(timeframe="15m")], fetch=fetch,
+                    monotonic=_Clock())
+    _, report = ingest.prepare(NOW, conn)
+    assert (("USDJPY", "15m"), "down") in report.failed
+    assert ("USDJPY", "15m") not in report.soft_attempted
+    assert ingest.next_probe_at[("USDJPY", "15m")] == NOW
+    conn.close()
+
+
+def test_a_soft_planner_failure_is_visible_once_in_state_and_logs(tmp_path, caplog):
+    conn = _db(tmp_path)
+
+    class Planner:
+        def plan(self, source, interval, required):
+            return PlanResult(1, True) if required == 1 else PlanResult(0, False)
+
+    caplog.set_level("WARNING")
+    ingest = Ingest(_settings(), [_strategy(_ref(), max_bars=50)], fetch=lambda *a, **k: [],
+                    planner=Planner(), monotonic=_Clock())
+    ingest.prepare(NOW, conn)
+    ingest.prepare(NOW + timedelta(seconds=1), conn)
+    key = ("JP225", "1h")
+    assert ingest.reference_fetch_state[key] == "plan_failed"
+    assert sum("reference plan failed for JP225 1h" in r.message for r in caplog.records) == 1
+    conn.close()
+
+
+def test_a_rejected_reference_is_recorded_once_and_not_reconsidered(tmp_path, caplog):
+    conn = _db(tmp_path)
+    settings = _settings()
+    ingest = Ingest(settings, [_strategy(_ref())], fetch=lambda *a, **k: [], monotonic=_Clock())
+    settings.datafeed.watch_symbols = []
+    caplog.set_level("WARNING")
+    _, first = ingest.prepare(NOW, conn)
+    _, second = ingest.prepare(NOW + timedelta(seconds=1), conn)
+    key = ("JP225", "1h")
+    assert first.soft_failed == {(key, "symbol_rejected")}
+    assert key not in {failed for failed, _ in second.soft_failed}
+    assert ingest.reference_fetch_state[key] == "symbol_rejected"
+    assert sum("reference symbol rejected for JP225 1h" in r.message for r in caplog.records) == 1
+    conn.close()
 
 
 def test_backoff_delay_function_pins_the_series_and_the_constant():
@@ -188,17 +240,17 @@ def test_a_non_empty_fetch_resets_the_backoff_and_waits_for_the_next_bar(tmp_pat
             return []
         if state["fail"]:
             raise httpx.ConnectError("down")
-        return [Bar("JP225", "1h", close - timedelta(hours=1), 1, 1, 1, 1, 1)]
+        return [Bar("JP225", "1h", end - timedelta(hours=1), 1, 1, 1, 1, 1)]
 
     ingest = Ingest(_settings(), [_strategy(_ref())], fetch=fetch, monotonic=_Clock())
     ingest.prepare(NOW, conn)
-    ingest.prepare(NOW + timedelta(seconds=60), conn)
+    ingest.prepare(NOW + timedelta(hours=1), conn)
     assert ingest._backoff[("JP225", "1h")] == 2
     state["fail"] = False
-    ingest.prepare(NOW + timedelta(seconds=180), conn)
+    ingest.prepare(NOW + timedelta(hours=2), conn)
     assert ingest._backoff[("JP225", "1h")] == 0
-    # newest bar 11:00-12:00 closes at 12:00; the next one at 13:00
-    assert ingest.next_probe_at[("JP225", "1h")] == close + timedelta(hours=1)
+    # The successful 13:00-14:00 bar is reflected immediately; the next probe is 15:00.
+    assert ingest.next_probe_at[("JP225", "1h")] == NOW + timedelta(hours=3)
     conn.close()
 
 
@@ -212,7 +264,7 @@ def test_a_stale_newest_bar_while_open_backs_off_instead_of_using_fx_confirmatio
 
     ingest = Ingest(_settings(), [_strategy(_ref())], fetch=fetch, monotonic=_Clock())
     ingest.prepare(NOW, conn)
-    assert ingest.next_probe_at[("JP225", "1h")] == NOW + timedelta(seconds=60)
+    assert ingest.next_probe_at[("JP225", "1h")] == NOW + timedelta(hours=1)
     conn.close()
 
 
@@ -391,16 +443,19 @@ def test_a_rejected_watch_symbol_makes_no_request_and_is_a_soft_failure(tmp_path
 
 # --- status view -----------------------------------------------------------
 
-def _status_rows(tmp_path, *, fetch, bars=None, now=NOW, strategies=None, steps=1):
+def _status_rows(tmp_path, *, fetch, bars=None, now=NOW, strategies=None, steps=1,
+                 settings=None):
     from agentic_fx.datafeed.reference_status import reference_rows
 
     conn = _db(tmp_path)
-    ingest = Ingest(_settings(), strategies or [_strategy(_ref())], fetch=fetch,
+    settings = settings or _settings()
+    ingest = Ingest(settings, strategies or [_strategy(_ref())], fetch=fetch,
                     monotonic=_Clock())
     for _ in range(steps):
         ingest.prepare(now, conn)
         ingest.commit(conn)
-    rows = reference_rows(conn, ingest, now, watch_symbols=["JP225"],
+    rows = reference_rows(conn, ingest, now,
+                          watch_symbols=settings.datafeed.watch_symbols,
                           storage_source="mt5-live")
     conn.close()
     return rows
@@ -452,6 +507,15 @@ def test_status_rows_cover_the_six_states(tmp_path):
 def test_status_only_lists_watched_symbols(tmp_path):
     rows = _status_rows(tmp_path, fetch=_fetch_returning(1))
     assert [r["symbol"] for r in rows] == ["JP225"]
+
+
+def test_status_rows_are_not_silently_truncated(tmp_path):
+    symbols = tuple(f"REF{i}" for i in range(65))
+    refs = tuple(_ref(symbol, alias=f"r{i}") for i, symbol in enumerate(symbols))
+    rows = _status_rows(tmp_path, fetch=lambda *a, **k: [],
+                        strategies=[_strategy(*refs)], now=NOW,
+                        settings=_settings(watch=symbols))
+    assert [row["symbol"] for row in rows] == sorted(symbols)
 
 
 def test_status_uses_the_tightest_max_age_of_the_indicators_reading_the_key(tmp_path):

@@ -52,7 +52,7 @@ from agentic_fx.backtest.runner import parse_timeframe
 from agentic_fx.backtest.timeframes import floor_to_bucket, load_resampled_frame
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
-from agentic_fx.plugin.sandbox import PluginSession, SandboxError
+from agentic_fx.plugin.sandbox import PluginSession, REFERENCE_ERROR_CODES, SandboxError
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -157,7 +157,7 @@ class PluginStrategyIntentSource:
         try:
             result = session.call({"df": df, "params": self._meta.params})
         except SandboxError as exc:
-            if exc.code in ("reference_unavailable", "indicator_unavailable"):
+            if exc.code in REFERENCE_ERROR_CODES:
                 return None
             raise
         if self._decision_sink is not None:

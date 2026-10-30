@@ -33,6 +33,7 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops.approval_facts import display_text
 from agentic_fx.cli_surface import render_ctl_help
@@ -600,8 +601,6 @@ def _deploy_ops_lines(section) -> list[str]:
     return lines
 
 
-_REFERENCE_STATES = frozenset({"ok", "stale", "missing", "fetch_failed",
-                               "budget_deferred", "source_unavailable"})
 _REFERENCE_ROWS_SHOWN = 16
 _REFERENCE_SAFE = re.compile(r"[^A-Za-z0-9._#!+-]")
 
@@ -631,7 +630,7 @@ def _references_line(rows) -> str | None:
         if not isinstance(row, dict):
             continue
         state = row.get("state")
-        state = state if isinstance(state, str) and state in _REFERENCE_STATES else "unknown"
+        state = state if isinstance(state, str) and state in REFERENCE_STATES else "unknown"
         if state == "stale":
             state = f"stale({_age_text(row.get('age_seconds'))})"
         parts.append(f"{_reference_token(row.get('symbol'))}/"
@@ -640,7 +639,7 @@ def _references_line(rows) -> str | None:
     if not parts:
         return None
     extra = len(rows) - _REFERENCE_ROWS_SHOWN
-    return "references: " + " ".join(parts) + (f" (+{extra})" if extra > 0 else "")
+    return "references: " + " ".join(parts) + (f" … 他 {extra} 件" if extra > 0 else "")
 
 
 def format_status(data: dict) -> str:

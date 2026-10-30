@@ -60,6 +60,8 @@ class Ingest:
         self._deferred: list[tuple[str, str]] = []
         self._soft_deferred: list[tuple[str, str]] = []
         self._soft_last_attempt: dict[tuple[str, str], int] = {}
+        self._soft_last_request_at: dict[tuple[str, str], datetime] = {}
+        self._rejected_soft: set[tuple[str, str]] = set()
         self._soft_state: dict[tuple[str, str], str] = {}
         self._attempt_serial = 0
         self.last_request_count = 0
@@ -74,7 +76,8 @@ class Ingest:
         return self.registry.keys()
 
     def _is_hard(self, key) -> bool:
-        return self.registry.is_hard(*key)
+        """Trading-pair keys keep the per-tick schedule; only reference keys are soft."""
+        return not self.registry.is_reference(*key)
 
     def _priority(self, key):
         _, interval = key
@@ -163,6 +166,8 @@ class Ingest:
         soft_keys = {key for key in self.keys if not self._is_hard(key)}
         for key in self._ordered_keys():
             soft = key in soft_keys
+            if soft and key in self._rejected_soft:
+                continue
             if self.next_probe_at.get(key, now) > now:
                 if soft:
                     soft_waiting.add(key)
@@ -177,13 +182,19 @@ class Ingest:
                 continue
             pair, interval = key
             if soft and not self._reference_symbol_allowed(pair):
-                soft_failed[key] = "reference symbol rejected"
-                self._soft_state[key] = "fetch_failed"
+                self._rejected_soft.add(key)
+                soft_failed[key] = "symbol_rejected"
+                self._soft_state[key] = "symbol_rejected"
+                _log.warning("reference symbol rejected for %s %s", pair, interval)
                 continue
             watermark = self._watermark(conn, key)
             required = self.registry.required_closed_bars(pair, interval)
             plan = self.planner.plan(self.source, interval, required)
             if not plan.ok:
+                if soft:
+                    if self._soft_state.get(key) != "plan_failed":
+                        _log.warning("reference plan failed for %s %s", pair, interval)
+                    self._soft_state[key] = "plan_failed"
                 continue
             (soft_attempted if soft else attempted).add(key)
             start = (now - timedelta(days=plan.days) if watermark is None
@@ -193,6 +204,7 @@ class Ingest:
             if soft:
                 self._attempt_serial += 1
                 self._soft_last_attempt[key] = self._attempt_serial
+                self._soft_last_request_at[key] = now
             width = timedelta(minutes=sources.INTERVAL_MIN[interval])
             try:
                 raw = self._request(pair, interval, start, now, timeout)
@@ -264,8 +276,10 @@ class Ingest:
     def _soft_miss(self, key, now: datetime, width: timedelta) -> None:
         attempt = self._backoff.get(key, 0) + 1
         self._backoff[key] = attempt
-        self.next_probe_at[key] = now + timedelta(
+        backoff_due = now + timedelta(
             seconds=soft_backoff_delay(attempt, width.total_seconds()))
+        rate_due = self._soft_last_request_at.get(key, now) + width
+        self.next_probe_at[key] = max(backoff_due, rate_due)
 
     def commit(self, conn) -> int:
         written = 0

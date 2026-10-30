@@ -8,13 +8,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pandas as pd
 
 from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import Bar
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.reference_frames import (
-    REFERENCE_REASONS, RUNTIME_WINDOW_REASON,
+    REFERENCE_REASONS, RUNTIME_WINDOW_REASON, load_reference_frame,
 )
+from agentic_fx.plugin import signal_producer as producer_module
+from agentic_fx.plugin.reference_frames import native_interval as frame_native_interval
+from agentic_fx.datafeed.requirements import native_interval as requirement_native_interval
+from agentic_fx.plugin.sandbox import REFERENCE_ERROR_CODES
 from agentic_fx.plugin.resolve import (
     ResolvedIndicator, ResolvedIndicatorSet, freeze_params,
 )
@@ -381,6 +386,61 @@ def test_transitions_are_recorded_once_and_recovery_names_the_previous_reason(tm
     assert "recovered_from=age_exceeded" in recovered[0] and "reason=" not in recovered[0]
     assert len(activity.events("reference_stale")) == 1
     conn.close()
+
+
+def test_reference_transitions_are_independent_for_each_pair(tmp_path):
+    conn, meta, resolved = _fixture(tmp_path, jp_end=T0 - timedelta(hours=6),
+                                    pairs=("USDJPY", "EURUSD"))
+    activity, producer = _Activity(), SignalProducer()
+    for _ in range(2):
+        _run(conn, producer, [meta], resolved, NOW, _Sandbox(), activity=activity,
+             settings=_settings(pairs=("USDJPY", "EURUSD")))
+    stale = activity.events("reference_stale")
+    assert len(stale) == 2 and {"pair=USDJPY", "pair=EURUSD"} == {
+        next(field for field in text.split() if field.startswith("pair=")) for text in stale}
+    _seed(conn, "JP225", "1h", T0 - timedelta(hours=6), T0 + timedelta(hours=4), price=7.0)
+    for _ in range(2):
+        _run(conn, producer, [meta], resolved, NOW, _Sandbox(), activity=activity,
+             settings=_settings(pairs=("USDJPY", "EURUSD")))
+    recovered = activity.events("reference_recovered")
+    assert len(recovered) == 2 and {"pair=USDJPY", "pair=EURUSD"} == {
+        next(field for field in text.split() if field.startswith("pair=")) for text in recovered}
+    assert len(activity.events("reference_stale")) == 2
+
+
+def test_reference_frame_uses_the_requirements_native_interval_rule():
+    assert frame_native_interval("1wk") == requirement_native_interval("1wk") == "1h"
+
+
+def test_reference_error_codes_have_one_exported_owner():
+    assert REFERENCE_ERROR_CODES == frozenset({"reference_unavailable", "indicator_unavailable"})
+
+
+def test_reference_loader_does_not_accept_an_unused_span_start(tmp_path):
+    conn = _conn(tmp_path)
+    frame = load_reference_frame(
+        conn, "JP225", reference_timeframe="1h", source=SOURCE,
+        d_last=pd.Timestamp(NOW), now=NOW, grace=timedelta(), actual_bars=1,
+        max_age_seconds=3600)
+    assert frame.empty
+    conn.close()
+
+
+def test_reference_unavailability_keeps_newer_buckets_behind_the_oldest_one(monkeypatch):
+    producer = SignalProducer()
+    meta = _meta(max_bars=1)
+    seen = []
+
+    def unavailable(conn, meta, pair, bucket, **kwargs):
+        seen.append(bucket)
+        raise producer_module._ReferenceUnavailable("missing")
+
+    monkeypatch.setattr(producer, "_evaluate_bucket", unavailable)
+    settings = _settings()
+    settings.plugin = SimpleNamespace(signal_freshness_bars=3)
+    producer._evaluate_one(None, meta, "USDJPY", now=NOW, source=SOURCE,
+                           call=lambda *a: {}, settings=settings)
+    assert seen == [datetime(2026, 7, 22, 10, tzinfo=timezone.utc)]
 
 
 def test_age_is_its_own_token_and_never_part_of_reason(tmp_path):

@@ -7,9 +7,8 @@ from agentic_fx.datafeed import sources
 from agentic_fx.plugin.reference_time import DEFAULT_MAX_AGE_FACTOR
 
 REFERENCE_STATES = ("ok", "stale", "missing", "fetch_failed", "budget_deferred",
-                    "source_unavailable")
-_FETCH_PROBLEMS = ("source_unavailable", "fetch_failed", "budget_deferred")
-MAX_ROWS = 64
+                    "source_unavailable", "plan_failed", "symbol_rejected")
+_FETCH_PROBLEMS = REFERENCE_STATES[3:]
 
 
 def reference_rows(conn, ingest, now: datetime, *, watch_symbols,
@@ -46,6 +45,4 @@ def reference_rows(conn, ingest, now: datetime, *, watch_symbols,
             state = "ok" if age <= limit else (problem or "stale")
         rows.append({"symbol": symbol, "interval": interval, "source": storage_source,
                      "state": state, "age_seconds": age if state == "stale" else None})
-        if len(rows) >= MAX_ROWS:
-            break
     return rows

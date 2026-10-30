@@ -75,6 +75,13 @@ class RequirementRegistry:
     def is_hard(self, symbol: str, interval: str) -> bool:
         return any(entry.hard for entry in self.requirements_for(symbol, interval))
 
+    def is_reference(self, symbol: str, interval: str) -> bool:
+        """True when only literal reference symbols ask for this key; such keys are
+        fetched with the leftover budget and retried with a backoff instead of
+        every tick."""
+        entries = self.requirements_for(symbol, interval)
+        return bool(entries) and all(entry.reason == "reference" for entry in entries)
+
     def hard_keys(self) -> frozenset[tuple[str, str]]:
         return frozenset((symbol, entry.interval)
                          for entry in self.entries if entry.hard

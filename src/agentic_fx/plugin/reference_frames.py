@@ -9,6 +9,7 @@ import pandas as pd
 from agentic_fx.backtest.timeframes import (
     TF_MINUTES, _COLUMNS, _table, floor_to_bucket,
 )
+from agentic_fx.datafeed.requirements import native_interval
 from agentic_fx.plugin.reference import (
     AlignedReference, actual_reference_bars, align_reference,
     complete_reference_buckets,
@@ -23,10 +24,6 @@ REFERENCE_REASONS = (*FETCH_STATE_REASONS, "missing", "age_exceeded",
 RUNTIME_WINDOW_REASON = "reference_window_exceeded_at_runtime"
 
 
-def native_interval(reference_timeframe: str) -> str:
-    return "1h" if reference_timeframe in ("4h", "1d") else reference_timeframe
-
-
 def actual_bars_for(df_index: pd.DatetimeIndex, strategy_timeframe: str,
                     reference_timeframe: str) -> int:
     tf = pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
@@ -36,7 +33,7 @@ def actual_bars_for(df_index: pd.DatetimeIndex, strategy_timeframe: str,
 
 def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
                          reference_timeframe: str, source: str,
-                         d_first: pd.Timestamp, d_last: pd.Timestamp,
+                         d_last: pd.Timestamp,
                          now: datetime, grace: timedelta, actual_bars: int,
                          max_age_seconds: int) -> pd.DataFrame:
     """Closed reference rows over the real-time span the strategy window covers.

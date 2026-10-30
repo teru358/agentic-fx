@@ -57,6 +57,7 @@ from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_clo
 from agentic_fx.activity import Category
 from agentic_fx.core import market_hours
 from agentic_fx.plugin import sandbox as plugin_sandbox
+from agentic_fx.plugin.sandbox import REFERENCE_ERROR_CODES
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin import switch
 from agentic_fx.plugin.deploy_ops import acquire_name_locks
@@ -112,8 +113,8 @@ class SignalProducer:
         self._source_notices: dict[tuple[str, str, str], str] = {}
         # reference_unavailable は判断足ごとに 1 回。key ごとに最後に記録した bucket だけ持つ。
         self._reference_notices: dict[tuple[str, str, str], datetime] = {}
-        # (strategy, symbol, timeframe) -> 直近に記録した reason。None なら使える。
-        self._reference_states: dict[tuple[str, str, str], str] = {}
+        # (strategy, pair, symbol, timeframe) -> 直近に記録した reason。None なら使える。
+        self._reference_states: dict[tuple[str, str, str, str], str] = {}
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
@@ -429,16 +430,16 @@ class SignalProducer:
         try:
             result = call(meta, payload)
         except plugin_sandbox.SandboxError as exc:
-            if getattr(exc, "code", None) in _REFERENCE_SANDBOX_CODES:
+            if getattr(exc, "code", None) in REFERENCE_ERROR_CODES:
                 reason = ("indicator_unavailable"
                           if exc.code == "indicator_unavailable" else "missing")
                 for symbol, timeframe in references.coordinates:
                     self._note_reference_state(
-                        meta, symbol, timeframe, reason, None, activity)
+                        meta, pair, symbol, timeframe, reason, None, activity)
                 raise _ReferenceUnavailable(reason) from exc
             raise
         for symbol, timeframe in references.coordinates:
-            self._note_reference_state(meta, symbol, timeframe, None, None, activity)
+            self._note_reference_state(meta, pair, symbol, timeframe, None, None, activity)
         if result.get("action") != "open":
             return 0
         def insert_strategy() -> int:
@@ -466,7 +467,7 @@ class SignalProducer:
         watch = set(getattr(settings.datafeed, "watch_symbols", ()) or ())
         tf = timedelta(minutes=TF_MINUTES[meta.timeframe])
         bucket_start = df.index[-1]
-        d_first, d_last = df.index[0] + tf, df.index[-1] + tf
+        d_last = df.index[-1] + tf
         frames: dict = {}
         coordinates: list[tuple[str, str]] = []
         for item in items:
@@ -474,7 +475,7 @@ class SignalProducer:
             ref_tf = item.timeframe
             actual = actual_bars_for(df.index, meta.timeframe, ref_tf)
             if runtime_reference_window_reason(actual, max_bars=item.max_bars):
-                raise _ReferenceUnavailable(RUNTIME_WINDOW_REASON, runtime=True)
+                raise _ReferenceUnavailable(RUNTIME_WINDOW_REASON)
             if item.frame_id in frames:
                 continue
             fetch_state = (reference_state((symbol, native_interval(ref_tf)))
@@ -483,7 +484,7 @@ class SignalProducer:
             if item.symbol_mode == "self" or symbol in watch:
                 frame = load_reference_frame(
                     conn, symbol, reference_timeframe=ref_tf, source=source,
-                    d_first=d_first, d_last=d_last, now=now, grace=grace,
+                    d_last=d_last, now=now, grace=grace,
                     actual_bars=actual, max_age_seconds=item.max_age_seconds)
             if frame is None:
                 aligned = None
@@ -507,16 +508,16 @@ class SignalProducer:
                     reason = "missing" if newest is None else "age_exceeded"
                     if newest is not None:
                         age = int((d_last - newest).total_seconds())
-                self._note_reference_state(meta, symbol, ref_tf, reason, age, activity)
+                self._note_reference_state(meta, pair, symbol, ref_tf, reason, age, activity)
                 raise _ReferenceUnavailable(reason)
             frames[item.frame_id] = frame
             coordinates.append((symbol, ref_tf))
         return _References(frames, tuple(coordinates))
 
-    def _note_reference_state(self, meta: PluginMeta, symbol: str, timeframe: str,
+    def _note_reference_state(self, meta: PluginMeta, pair: str, symbol: str, timeframe: str,
                               reason: str | None, age: int | None, activity) -> None:
         """参照 frame の状態が変わったときだけ activity に出す。"""
-        key = (meta.name, symbol, timeframe)
+        key = (meta.name, pair, symbol, timeframe)
         previous = self._reference_states.get(key)
         if reason == previous:
             return
@@ -524,14 +525,14 @@ class SignalProducer:
             del self._reference_states[key]
             _write_activity(
                 activity, "reference_recovered",
-                "strategy=%s symbol=%s timeframe=%s recovered_from=%s"
-                % (meta.name, symbol, timeframe, previous), meta.name)
+                "strategy=%s pair=%s symbol=%s timeframe=%s recovered_from=%s"
+                % (meta.name, pair, symbol, timeframe, previous), meta.name)
             return
         self._reference_states[key] = reason
         _write_activity(
             activity, "reference_stale",
-            "strategy=%s symbol=%s timeframe=%s reason=%s age=%s"
-            % (meta.name, symbol, timeframe, reason,
+            "strategy=%s pair=%s symbol=%s timeframe=%s reason=%s age=%s"
+            % (meta.name, pair, symbol, timeframe, reason,
                "-" if age is None else age), meta.name)
 
     def _report_reference_unavailable(self, meta: PluginMeta, pair: str,
@@ -575,10 +576,9 @@ class _SourceLockTimeout(Exception):
 class _ReferenceUnavailable(Exception):
     """必要な参照 frame が使えない。plugin の失敗ではなく strategy 単位の skip。"""
 
-    def __init__(self, reason: str, *, runtime: bool = False) -> None:
+    def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
-        self.runtime = runtime
 
 
 class _References:
@@ -587,10 +587,6 @@ class _References:
     def __init__(self, frames: dict, coordinates: tuple) -> None:
         self.frames = frames
         self.coordinates = coordinates
-
-
-# worker が参照の不在・指標値の欠損で返す error code。plugin の失敗には数えない。
-_REFERENCE_SANDBOX_CODES = frozenset({"reference_unavailable", "indicator_unavailable"})
 
 
 class _SourceNotLive(Exception):

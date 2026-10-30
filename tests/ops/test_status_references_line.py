@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from agentic_fx.ops import client
+from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 
 
 def _row(symbol="JP225", interval="1h", source="mt5-live", state="ok", age=None):
@@ -46,4 +47,8 @@ def test_an_unknown_state_or_age_is_not_echoed():
 def test_the_number_of_rows_is_bounded():
     rows = [_row(f"S{i}") for i in range(40)]
     line = client.format_status({"references": rows})
-    assert line.count("=ok") == 16 and line.endswith("(+24)")
+    assert line.count("=ok") == 16 and line.endswith("… 他 24 件")
+
+
+def test_client_uses_the_daemon_reference_state_vocabulary():
+    assert client.REFERENCE_STATES is REFERENCE_STATES
