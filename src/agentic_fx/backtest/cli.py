@@ -84,7 +84,9 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
 
     imp = history_sub.add_parser("import", **_surface_parser_kw("history import", leaf=True))
     imp.add_argument("--source", choices=["dukascopy", "mt5"])
-    imp.add_argument("--symbol", required=True)
+    imp.add_argument("--symbol", required=True,
+                     help="取引 pair、または MT5 の参照銘柄 (broker の raw 名。例 JP225。"
+                          "参照銘柄は --source mt5 で取り込む)")
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
     imp.add_argument("--to", dest="to", type=_parse_date, required=True)
     imp.add_argument("--interval", choices=("1m", "5m", "15m"), default="1m")
@@ -98,7 +100,8 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     comp.add_argument("--interval", choices=("1m", "5m", "15m"), required=True)
 
     cov = history_sub.add_parser("coverage", **_surface_parser_kw("history coverage", leaf=True))
-    cov.add_argument("--symbol", required=True)
+    cov.add_argument("--symbol", required=True,
+                     help="取引 pair、または参照銘柄 (raw 名)。1 回に 1 銘柄だけ表示する")
     cov.add_argument("--timeframe", required=True)
     cov.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     cov.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
@@ -145,8 +148,10 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     analyze_sub = analyze.add_subparsers(dest="analyze_command",
                                          required=True)
     corr = analyze_sub.add_parser("corr", **_surface_parser_kw("analyze corr", leaf=True))
-    corr.add_argument("--a", required=True)
-    corr.add_argument("--b", required=True)
+    corr.add_argument("--a", required=True,
+                      help="取引 pair、または参照銘柄 (raw 名)")
+    corr.add_argument("--b", required=True,
+                      help="--a と別の銘柄。両方が同じ --source の 1m 履歴を 30 本以上共有している必要がある")
     corr.add_argument("--timeframe", required=True)
     corr.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     corr.add_argument("--from", dest="from_", type=_parse_date, default=None)

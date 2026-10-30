@@ -1024,6 +1024,8 @@ class StartupContext:
     cli_ok: set[str] = field(default_factory=set)
     cli_verified: dict[tuple[str, str], list[PreflightFailure]] = field(default_factory=dict)
     check_secret_env: bool = True
+    bridge_fetch: Any = None
+    bridge_api_key: str | None = None
 
 
 def _startup_settings_valid(settings, ctx: StartupContext):
@@ -1058,6 +1060,32 @@ def _startup_cli_backend(which: str):
     return check
 
 
+def _startup_watch_symbols(settings, ctx: StartupContext):
+    """bridge の銘柄一覧と突き合わせ、一覧に無い参照銘柄を warning にする (起動は止めない)。
+
+    参照銘柄が無い、または価格源が MT5 でないときは何も呼ばない。bridge に届かないときは
+    「未確認」とだけ言い、unknown とは言わない。"""
+    watch = list(getattr(settings.datafeed, "watch_symbols", ()) or ())
+    if not watch or settings.datafeed.primary != "mt5" or ctx.findings is None:
+        return settings
+    import httpx
+    from agentic_fx.setup import checks
+
+    key = ctx.bridge_api_key if ctx.bridge_api_key is not None else os.environ.get("MT5_BRIDGE_API_KEY")
+    listing = checks.list_bridge_symbols(
+        settings.datafeed.mt5.bridge_url or "", fetch=ctx.bridge_fetch or httpx.get, timeout=5,
+        headers={"X-Bridge-Api-Key": key} if key else {})
+    if listing.result != "ok":
+        ctx.findings.append(Finding("watch_symbols_unchecked", listing.reason_code.value
+                                    if listing.reason_code else ""))
+        return settings
+    known = set(listing.params.get("symbols", ()))
+    unknown = [name for name in watch if name not in known]
+    if unknown:
+        ctx.findings.append(Finding("watch_symbol_unknown", ", ".join(unknown[:8])))
+    return settings
+
+
 # サービスの起動前検査と `afx check` が同じ順で回す一覧。各段は (settings, ctx) を受けて
 # 解決済みの settings を返す。検査を足すときはここに足す。
 STARTUP_CHECKS: tuple = (
@@ -1066,6 +1094,7 @@ STARTUP_CHECKS: tuple = (
     _startup_mission_ceilings,
     _startup_cli_backend("trade"),
     _startup_cli_backend("improve"),
+    _startup_watch_symbols,
 )
 
 def run_startup_checks(settings, ctx: StartupContext):

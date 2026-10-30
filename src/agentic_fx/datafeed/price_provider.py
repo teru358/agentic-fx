@@ -139,8 +139,7 @@ class PriceProvider:
             if name == "mt5" and d.mt5.enabled:
                 return ("mt5", (lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
                         if kind == "quote" else
-                        (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
-                                                  lookback_days)))
+                        (lambda: self._mt5_bars(pair, interval, lookback_days)))
             if name == "twelvedata" and td_key:
                 return ("twelvedata", (lambda: sources.td_quote(td_key, pair))
                         if kind == "quote" else
@@ -346,6 +345,16 @@ class PriceProvider:
 
     # ---- 足の導出 ---------------------------------------------------------
 
+    def _mt5_bars(self, pair: str, interval: str, lookback_days: float) -> list[Bar]:
+        """取引 pair は論理名 → vendor 名の表を通し、参照銘柄は broker の raw 名のまま取る。"""
+        d = self.settings.datafeed
+        if pair not in self.settings.pairs and pair in d.watch_symbols:
+            end = self.clock.now()
+            return sources.mt5_raw_bars_range(
+                d.mt5.bridge_url, sources.MT5RawSymbol.parse(pair), interval,
+                end - timedelta(days=lookback_days), end)
+        return sources.mt5_bars(d.mt5.bridge_url, pair, interval, lookback_days)
+
     def _fetch_native(self, pair: str, source: str, interval: str,
                       lookback_days: float) -> list[Bar]:
         """指定 source から指定のネイティブ足を取る (_chain を経由しない)。
@@ -356,7 +365,7 @@ class PriceProvider:
         d = self.settings.datafeed
         days = max(1, int(lookback_days))
         if source == "mt5":
-            return sources.mt5_bars(d.mt5.bridge_url, pair, interval, days)
+            return self._mt5_bars(pair, interval, days)
         if source == "twelvedata":
             return sources.td_bars(self._td_key(), pair, interval, days)
         if source == "yfinance":

@@ -23,6 +23,16 @@ def pair_param(settings: Settings) -> dict:
                           "enum": list(settings.datafeed.intervals)}}
 
 
+def read_symbol_param(settings: Settings) -> dict:
+    """読み取り専用の market tool 用。取引 pair に加えて参照銘柄 (watch_symbols) も受ける。
+
+    発注・signal の pair enum (`pair_param`) は広げない。"""
+    schema = pair_param(settings)
+    schema["pair"] = {"enum": [*settings.pairs, *settings.datafeed.watch_symbols],
+                      "description": schema["pair"]["description"]}
+    return schema
+
+
 def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
           indicator_plugins: list[PluginMeta] | None = None,
           sandbox_run=None) -> list[ToolDef]:
@@ -77,7 +87,13 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
                         "available": len(df), "capability": "temporary"}
         return df, None
 
+    def _readable(symbol: str) -> None:
+        allowed = [*settings.pairs, *settings.datafeed.watch_symbols]
+        if symbol not in allowed:
+            raise ValueError(f"symbol must be one of {allowed}: {symbol!r}")
+
     def get_ohlcv(pair: str, timeframe: str | None = None) -> list[dict]:
+        _readable(pair)
         timeframe = timeframe or settings.datafeed.decision_timeframe
         df, shortage = _frame(pair, timeframe, required=100,
                               consumer="get_ohlcv")
@@ -110,6 +126,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         (fail-open: plugin 出力は LLM 向けの参考情報であり、1 つの plugin
         の不調で get_indicators 全体を失敗させない)。
         """
+        _readable(pair)
         timeframe = timeframe or settings.datafeed.decision_timeframe
         required = max([50, *(meta.max_bars for meta in indicator_plugins
                               if meta.kind == "indicator")])
@@ -159,7 +176,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
     def get_econ_calendar(days: int = 1) -> list[dict]:
         return econ.upcoming(hours=days * 24)
 
-    pair_schema = pair_param(settings)
+    pair_schema = read_symbol_param(settings)
     return [
         ToolDef("get_ohlcv", "OHLCV 価格データ (直近 100 本)",
                 {"type": "object", "properties": pair_schema,

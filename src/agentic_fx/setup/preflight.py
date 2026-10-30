@@ -9,6 +9,7 @@ lock を作らず、DB は読み取り専用で開いて承認済み plugin の�
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ FATAL_CODES: dict[str, str] = {
 
 WARNING_CODES: dict[str, str] = {
     "plugin_list_unavailable": "承認済み plugin の一覧を読めませんでした (旧 schema の DB は起動時に migration されます)",
+    "watch_symbol_unknown": "datafeed.watch_symbols に bridge の銘柄一覧に無い名前があります (取得は失敗します。綴りを確かめてください)",
+    "watch_symbols_unchecked": "bridge に問い合わせられず、datafeed.watch_symbols を確かめていません",
     CheckReason.BIN_NOT_FOUND.value: "CLI backend の実行ファイルが見つかりません (LLM は未検証のままです)",
     CheckReason.CREDENTIALS_MISSING.value: "CLI backend の認証ファイルがありません (ログインしてください)",
     CheckReason.VERSION_CHECK_FAILED.value: "CLI backend の --version が通りません (LLM は未検証のままです)",
@@ -201,6 +204,18 @@ def _shell_secret_note(settings) -> list[str]:
     return []
 
 
+def _bridge_api_key(root: Path) -> str | None:
+    """環境変数、無ければ root の `.env` から bridge の鍵を読む (環境は書き換えない)。"""
+    value = os.environ.get("MT5_BRIDGE_API_KEY")
+    if value:
+        return value
+    try:
+        from dotenv import dotenv_values
+        return dotenv_values(root / ".env").get("MT5_BRIDGE_API_KEY") or None
+    except Exception:  # noqa: BLE001 - 鍵が読めなければ鍵なしで問い合わせる
+        return None
+
+
 def run_check(root: Path, *, unit_env: bool = False) -> CheckReport:
     """設定と実行環境だけで決まる起動前検査を、書き込みなしで実行する。
 
@@ -221,7 +236,8 @@ def run_check(root: Path, *, unit_env: bool = False) -> CheckReport:
     except PreflightFailure as exc:
         findings.append(Finding(exc.code, str(exc)))
         plugins = []
-    context = service.StartupContext(_NullActivity(), plugins, findings, check_secret_env=unit_env)
+    context = service.StartupContext(_NullActivity(), plugins, findings, check_secret_env=unit_env,
+                                     bridge_api_key=_bridge_api_key(root))
     for check in service.STARTUP_CHECKS:
         try:
             settings = check(settings, context)
