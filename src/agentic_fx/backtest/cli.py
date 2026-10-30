@@ -23,7 +23,10 @@ from pathlib import Path
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog
 from agentic_fx.backtest.analysis import coverage_report, corr_matrix
-from agentic_fx.backtest.dataset import UNCONFIGURED_SOURCE, HistoryDataset
+from agentic_fx.backtest.dataset import (
+    UNCONFIGURED_SOURCE, HistoryDataset, literal_reference_coordinates,
+    missing_reference_history, reference_history_missing_error,
+)
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
@@ -500,6 +503,11 @@ def _backtest_run_plugin(conn, settings, args: argparse.Namespace,
         return 1
 
     dataset = HistoryDataset(args.source, args.base_interval)
+    missing = missing_reference_history(
+        conn, dataset, literal_reference_coordinates(resolved))
+    if missing is not None:
+        print(reference_history_missing_error(*missing), file=sys.stderr)
+        return 1
     intent_source = strategy_adapter.build_intent_source(
         meta, conn=conn, pair=args.symbol, dataset=dataset,
         settings=settings, resolved=resolved)

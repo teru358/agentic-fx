@@ -2289,3 +2289,35 @@ def test_plugin_retire_dry_run_is_rc0_and_does_not_claim_retired(
 
     out = capsys.readouterr().out
     assert rc == 0 and "dry-run" in out and "retire しました" not in out
+
+
+def test_cli_backtest_run_plugin_refuses_a_reference_without_any_history(
+        tmp_path, capsys, monkeypatch):
+    """The main pair has history, the declared reference has none: rc!=0, fixed
+    stderr line, no replay, no run row."""
+    from pathlib import Path as _P
+
+    from agentic_fx.plugin.resolve import ResolvedIndicatorSet
+    from agentic_fx.store.db import connect
+    from tests.plugin.test_signal_producer_reference import _item
+    root = _cli_root_with_deployed_rsi_pullback(tmp_path)
+    monkeypatch.chdir(root)
+    resolved = ResolvedIndicatorSet(inventory_root=_P("/nonexistent"),
+                                    items=(_item(),), all_pinned=True)
+    monkeypatch.setattr(cli, "resolve_indicator_deps", lambda *a, **k: resolved)
+    replay, saved = MagicMock(), MagicMock()
+    monkeypatch.setattr(cli, "run_replay", replay)
+    monkeypatch.setattr(cli.backtest_runs, "save_human_run", saved)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"):
+        rc = main(["backtest", "run", "--plugin", "rsi_pullback",
+                   "--symbol", "USDJPY", "--source", "dukascopy",
+                   "--base-interval", "5m",
+                   "--from", "2025-12-01", "--to", "2026-01-01"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert err.strip().splitlines()[-1] == "reference_history_missing(JP225, 1h, no_rows)"
+    replay.assert_not_called()
+    saved.assert_not_called()
+    conn = connect(root / "data" / "agentic.db")
+    assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
+    conn.close()
