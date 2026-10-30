@@ -227,3 +227,10 @@ def test_a_non_200_reply_code_outside_the_fixed_shape_is_left_out(capsys):
 
     assert status == 502
     assert err == "afx-ops: web_upstream status=500\n"
+
+
+def test_a_reply_of_the_wrong_shape_reports_one_fixed_line(capsys):
+    status, err = _upstream_lines(_ReplyClient(Reply(200, {"mode": 5}, None)), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream shape=invalid\n"

@@ -391,7 +391,11 @@ def handle_request(request: Request | bytes, client, *,
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
             _report_bad_reply(reply)
             return _error(502, head=head)
-        _check_reply_shape(match.route.client_method, reply.data)
+        try:
+            _check_reply_shape(match.route.client_method, reply.data)
+        except _Upstream:
+            _report_upstream("shape=invalid")
+            raise
         body = renderer(reply.data)
         return _response(200, body, head=head)
     except _Reject as reject:

@@ -205,12 +205,42 @@ def test_loop_errors_for_a_missing_attribute_add_only_fixed_words(capsys):
                                "message": "Exception in callback X(secret-value-42)"})
 
     assert capsys.readouterr().err == (
-        "afx-ops: web_loop_error AttributeError name=close message=Exception_in_callback\n")
+        "afx-ops: web_loop_error AttributeError name=close message=exception_in_callback\n")
 
 
 def test_loop_error_attribute_names_must_be_identifiers(capsys):
     error = AttributeError("x")
     error.name = "secret value 42"
+    runtime._loop_error(None, {"exception": error})
+
+    assert capsys.readouterr().err == "afx-ops: web_loop_error AttributeError\n"
+
+
+@pytest.mark.parametrize("message", [
+    "secretpath", "例外 in callback", "Exception in callbac\u212a",
+    "Fatal error on transport!", "Exception", "",
+    " ".join(["exception"] * 3),
+])
+def test_loop_error_messages_outside_the_known_phrases_are_other(capsys, message):
+    runtime._loop_error(None, {"exception": ValueError("x"), "message": message})
+
+    assert capsys.readouterr().err == "afx-ops: web_loop_error ValueError message=other\n"
+
+
+@pytest.mark.parametrize("message, kept", [
+    ("Fatal error on transport TCPTransport(secret)", "fatal_error_on_transport"),
+    ("Exception in callback secretpath", "exception_in_callback"),
+])
+def test_known_loop_error_messages_are_normalised(capsys, message, kept):
+    runtime._loop_error(None, {"exception": ValueError("x"), "message": message})
+
+    assert capsys.readouterr().err == f"afx-ops: web_loop_error ValueError message={kept}\n"
+
+
+@pytest.mark.parametrize("attr", ["Close", "a" * 41, "ｃlose", "close2", ""])
+def test_loop_error_attribute_names_must_be_short_lowercase_words(capsys, attr):
+    error = AttributeError("x")
+    error.name = attr
     runtime._loop_error(None, {"exception": error})
 
     assert capsys.readouterr().err == "afx-ops: web_loop_error AttributeError\n"

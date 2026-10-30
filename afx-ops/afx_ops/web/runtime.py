@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 import threading
 from asyncio import selector_events
@@ -412,25 +413,49 @@ def _closed_reply() -> tuple[int, dict[str, str], bytes]:
     return 502, response_headers(length=len(body)), body
 
 
+_FIXED_WORD = re.compile(r"[a-z_]{1,40}")
+
+# asyncio が loop の exception handler に渡す message の定型句 (小文字 + `_` に正規化した形)
+_LOOP_MESSAGES = frozenset({
+    "exception_in_callback",
+    "fatal_error_on_transport",
+    "fatal_error_on_ssl_transport",
+    "fatal_read_error_on_socket_transport",
+    "fatal_write_error_on_socket_transport",
+    "task_exception_was_never_retrieved",
+    "future_exception_was_never_retrieved",
+    "unhandled_exception_in_client_connected_cb",
+    "exception_in_default_exception_handler",
+    "accept_failed_on_a_socket",
+})
+
+
+def _loop_message(message: str) -> str:
+    # 先頭の連続する ASCII 英字語を正規化し、定型句に一致する最長の前置きだけを採る
+    words: list[str] = []
+    for word in message.split()[:8]:
+        if not (word.isascii() and word.isalpha()):
+            break
+        words.append(word.lower())
+    for count in range(len(words), 0, -1):
+        if "_".join(words[:count]) in _LOOP_MESSAGES:
+            return "_".join(words[:count])
+    return "other"
+
+
 def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     # 既定の handler は例外文と traceback (要求由来の値を含み得る) を出す。型名と、
-    # 固定語だけの情報 (AttributeError の属性名、asyncio の message の先頭の語) にする
+    # 固定語だけの情報 (AttributeError の属性名、asyncio の定型 message) にする
     exc = context.get("exception")
     name = type(exc).__name__ if exc is not None else "none"
     line = f"afx-ops: web_loop_error {name}"
     if isinstance(exc, AttributeError):
         attr = getattr(exc, "name", None)
-        if isinstance(attr, str) and attr.isidentifier() and len(attr) <= 40:
+        if isinstance(attr, str) and _FIXED_WORD.fullmatch(attr):
             line += f" name={attr}"
     message = context.get("message")
     if isinstance(message, str):
-        words: list[str] = []
-        for word in message.split()[:5]:
-            if not word.isalpha():
-                break
-            words.append(word)
-        if words:
-            line += " message=" + "_".join(words)
+        line += " message=" + _loop_message(message)
     print(line, file=sys.stderr, flush=True)
 
 
