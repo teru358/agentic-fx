@@ -99,7 +99,6 @@
 | [improve-mission-output-not-persisted](open/improve-mission-output-not-persisted.md) | 中 | 2026-10-18 | 改善 mission の出力 (output_json / transcript) が DB に残らない |
 | [improve-new-candidate-metric-reference-set-freeze](open/improve-new-candidate-metric-reference-set-freeze.md) | 中 | 2026-10-22 | 方向性指標の「新規候補」の参照集合を観測開始時点で凍結する |
 | [ops-probe-child-env-drops-xdg-config-home](open/ops-probe-child-env-drops-xdg-config-home.md) | 中 | 2026-10-24 | afx ops の probe 子 process に XDG_CONFIG_HOME が渡らない |
-| [ops-web-head-request-loop-error](open/ops-web-head-request-loop-error.md) | 中 | 2026-10-24 | 同梱 web が HEAD / 早期切断で web_loop_error AttributeError を 1 行出す |
 | [scheduler-tick-watchdog-health-check-test-fails](open/scheduler-tick-watchdog-health-check-test-fails.md) | 中 | 2026-10-24 | scheduler tick が watchdog の健全性チェックを呼ぶ test が main で落ちる |
 | [backtest-tmp-state-leaks-and-tmp-quota](open/backtest-tmp-state-leaks-and-tmp-quota.md) | 中 | 2026-10-25 | backtest の一時 state が /tmp に残り続け、/tmp の枯渇で改善 mission が落ちる |
 | [e2e-phase1-reflection-not-generated](open/e2e-phase1-reflection-not-generated.md) | 中 | 2026-10-25 | test_e2e_phase1 の tick 4 で reflection が 0 件 (main で恒常的に赤) |
@@ -136,6 +135,7 @@
 | [test-init-guard-order-dependent-on-fetchers](open/test-init-guard-order-dependent-on-fetchers.md) | 低 | 2026-10-25 | offline init test が test_fetchers の後では赤になる (順序依存) |
 | [test-service-app-leaks-fds](open/test-service-app-leaks-fds.md) | 低 | 2026-10-26 | tests/test_service_app.py が fd を 1100 超残し後続 test に波及する |
 | [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
+| [ops-web-502-stuck-cause-unknown](open/ops-web-502-stuck-cause-unknown.md) | 低 | 2026-10-30 | web が Service unavailable (502) を返し続けた原因が未確定 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
