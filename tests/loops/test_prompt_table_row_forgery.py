@@ -38,6 +38,7 @@ class _FakeRunContext:
         self.staging_dir = staging_dir
         self.source_snapshot_dir = source_snapshot_dir
         self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        self.baseline_gate_mode = "off"
 
 
 def _ctx_data(*, history_rows, backlog_items):

@@ -101,6 +101,8 @@ EXPECTED_GATE_FAILED_CALLS = sorted([
     "NOTICE_BACKTEST_DATA_UNAVAILABLE",
     "notice_for_unevaluable_kind(strategy_verdict.unevaluable_kind)",
     "NOTICE_UNPROFITABLE",
+    "NOTICE_SAME_NAME_CONTRACT_CHANGED",
+    "NOTICE_NOT_IMPROVED",
 ])
 EXPECTED_REPORT_OR_OBSERVATION_CHOICES = sorted([
     "dataclass_replace(_select_observation(recovered_artifact), "

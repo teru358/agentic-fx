@@ -101,6 +101,8 @@ def _install_floor_strategy_gate(monkeypatch, loop, *, holdout_metrics):
             candidate_metrics={"USDJPY": _floor_metrics(0.5)},
             holdout_metrics=holdout_metrics,
             baseline_row=None,
+            contract_violation="", baseline_rows=(), comparison=None,
+            not_improved=False,
             # [indicator-consumption-wiring] T5b 逸脱是正: Step 5-6c が
             # `commit()` の strategy 分岐で `strategy_verdict.cpu_samples`
             # を無条件に読むようになった (backtest_cpu activity、評価不能
@@ -502,6 +504,7 @@ class _FakeRunContext:
         # [indicator-consumption-wiring] T5a Step 5-1: _render_improve_mission_prompt
         # が ctx.inventory_view を読むようになった (P1')。
         self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        self.baseline_gate_mode = "off"
 
 
 def _sample_ctx_data_with_origin():

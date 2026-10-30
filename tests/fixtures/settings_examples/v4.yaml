@@ -87,6 +87,8 @@ improve:
   accept_drain_sec: 30
   archive_max_bytes: 209715200   # plugins/_archive の保持上限 (bytes、既定 200MB)
   archive_max_missions: 50       # plugins/_archive の保持上限 (mission 数)
+  baseline_gate: shadow          # 同名更新を配備中の版と比べる。shadow=記録のみ / enforce=上回らない候補を却下。反映は daemon 再起動後
+  baseline_replay_wall_clock_max_sec: 300  # 配備中の版の再生に使う壁時計の上限 (秒)。超えたら比較せず床だけで進む
   tool_budget:                  # 改善 mission 1 回あたりの tool 予算
     self_test_warn_after: 3     # 同一失敗の警告を返し始める連続回数
     max_self_test_runs: 12      # self-test 実行回数の上限

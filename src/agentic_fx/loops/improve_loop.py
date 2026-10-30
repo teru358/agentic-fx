@@ -52,7 +52,8 @@ from agentic_fx.improve_notice_codes import (
     NOTICE_COMMIT_CRASHED, NOTICE_DEMOTED_RECOVERED, NOTICE_DUPLICATE_SKIPPED,
     NOTICE_INDICATOR_UNRESOLVED, NOTICE_KIND_UNSUPPORTED,
     NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED, NOTICE_MAX_BARS_LIMIT,
-    NOTICE_MAX_TURNS, NOTICE_OBSERVATION, NOTICE_OBSERVATION_NOT_SUBMITTED,
+    NOTICE_MAX_TURNS, NOTICE_NOT_IMPROVED, NOTICE_OBSERVATION,
+    NOTICE_OBSERVATION_NOT_SUBMITTED, NOTICE_SAME_NAME_CONTRACT_CHANGED,
     NOTICE_OUTPUT_INVALID, NOTICE_OUTPUTS_REQUIRED, NOTICE_PREPARE_FAILED,
     NOTICE_REPORT_PUBLISHED, NOTICE_REPORT_WRITE_FAILED,
     NOTICE_RISK_GATE_UNSUPPORTED, NOTICE_RUNNER_FAILED,
@@ -614,6 +615,18 @@ class FloorDetail:
     stages: tuple[FloorStage, ...]
 
 
+_BASELINE_REPORT_SECTION = "Baseline comparison detail"
+_CONTRACT_VIOLATION_REPORT_DETAIL = (
+    "意味が変わる変更 (足または pair 集合の変更) は、新しい名前で提出する。")
+
+
+def _base_hash_of(verdict) -> str:
+    row = verdict.baseline_row or {}
+    return row.get("base_content_hash") or ""
+
+
+_SAME_NAME_UPDATE_RULE = (
+    " 同名で更新する候補は、配備中の版を上回ることが採用の条件である。")
 _FLOOR_PAIR_RE = re.compile(r"[A-Z0-9_]{3,16}")
 _FLOOR_INT_RE = re.compile(r"[0-9]{1,18}")
 _FLOOR_FLOAT_RE = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
@@ -868,7 +881,10 @@ class ImproveLoop:
                 allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
                 rpc_handlers=rpc_handlers,
                 inventory=inventory_result,
-                inventory_view=build_inventory_view(inventory_result))
+                inventory_view=build_inventory_view(inventory_result),
+                baseline_gate_mode=self._settings.improve.baseline_gate,
+                baseline_replay_wall_clock_max_sec=(
+                    self._settings.improve.baseline_replay_wall_clock_max_sec))
 
             # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
             # `prompt_text` も非実在だった (build_improve_context は
@@ -1214,7 +1230,8 @@ class ImproveLoop:
             # [profitability-floor] T2 Step 2-2 (2026-09-13、codex I8):
             # 文言は settings からレンダする (ハードコードすると設定変更後
             # にゲートと説明が食い違う)。
-            "profitability_floor_rule": self._floor_rule_text(),
+            "profitability_floor_rule": self._floor_rule_text(
+                baseline_gate_mode=ctx.baseline_gate_mode),
         }
         # 一時指示の節は template の 1 か所だけ。その前後を描画して間に節を挟む
         # (全体を 2 回描画しない)。観測面 (`_last_rendered_prompt`) は節なしの形で、
@@ -1230,7 +1247,7 @@ class ImproveLoop:
         self._last_rendered_prompt = head_text + tail_text
         return rendered
 
-    def _floor_rule_text(self) -> str:
+    def _floor_rule_text(self, *, baseline_gate_mode: str = "off") -> str:
         """[profitability-floor] T2 Step 2-2 (2026-09-13、設計書 §6 T2、
         codex I8): 収益性フロアの規律文言を `improve.gate` の実値から
         組み立てる。`.format()` は条件分岐できないため、文そのものを
@@ -1246,12 +1263,15 @@ class ImproveLoop:
         holdout の閾値・条件を agent に見せない)。"""
         g = self._settings.improve.gate
         condition = _strategy_gate_floor_rule_text(g, audience="agent")
-        return (
+        text = (
             f"**{condition} の候補は提出しても承認申請になりません**。"
             f"`pf >= {g.min_pf}`"
             + (f" かつ `avg_r > 0`" if g.require_positive_avg_r else "")
             + " を満たさない候補は提出しないでください。予算内で満たせなければ"
             "**提出せず** `observation` として、試した仮説を理由に書いてください。")
+        if baseline_gate_mode == "enforce":
+            text += _SAME_NAME_UPDATE_RULE
+        return text
 
     def _compute_partition_hint(self, conn, slot_key) -> frozenset[int] | None:
         # <!-- precheck 2026-08-24 D-10 是正: 逸脱申告 -->
@@ -2077,7 +2097,8 @@ class ImproveLoop:
     def _run_strategy_gate(self, conn, *, name, pairs, timeframe, content_hash,
                            now, meta, resolved, kind="strategy",
                            record_fn=None, inventory=None,
-                           evaluation_sink=None):
+                           evaluation_sink=None, compare_mode="off",
+                           baseline_replay_wall_clock_max_sec=300.0):
         # [profitability-floor] T1 Step 1-3 (2026-09-12、設計書 §3 T1-b):
         # 改善ループは常に `floor_mode="enforce"` (in_sample 段の不合格で
         # holdout を回さず即終端 — evaluator の既定と同じ値だが、この
@@ -2092,7 +2113,9 @@ class ImproveLoop:
             content_hash=content_hash, now=now, settings=self._settings,
             meta=meta, kind=kind, record_fn=record_fn, floor_mode="enforce",
             inventory=inventory, evaluation_sink=evaluation_sink,
-            resolved=resolved)
+            resolved=resolved, compare_mode=compare_mode,
+            baseline_replay_wall_clock_max_sec=(
+                baseline_replay_wall_clock_max_sec))
 
     def _build_approval_payload(self, conn, *, name, kind, content_hash,
                                 artifact_hash, ctx_ledger, mission_id,
@@ -3581,7 +3604,12 @@ class ImproveLoop:
                             evaluation_sink=self._backtest_cpu_sink(
                                 mission=str(ctx.mission_id),
                                 plugin=artifact["name"],
-                                deps=len(candidate_meta.indicators)))
+                                deps=len(candidate_meta.indicators)),
+                            compare_mode=self._baseline_compare_mode(
+                                ctx, name=artifact["name"],
+                                candidate_dir=candidate_dir),
+                            baseline_replay_wall_clock_max_sec=(
+                                ctx.baseline_replay_wall_clock_max_sec))
                     except SandboxError as exc:
                         if exc.code == "sandbox_unavailable":
                             # 環境側の失敗。候補の責任ではないので staging を残し、
@@ -3611,6 +3639,33 @@ class ImproveLoop:
                     # `backtest_cpu` は gate が評価 1 回ごとに `evaluation_sink`
                     # へ渡し、そこで書く (失敗で例外が伝播する評価でも
                     # 1 行残すため、verdict 経由では書かない)。
+                    if strategy_verdict.contract_violation:
+                        # 同名で足か pair 集合を変える更新。床や標本数より先に
+                        # 判定済みで、候補の backtest は 1 行も回していない。
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason=strategy_verdict.contract_violation,
+                            now=now, tool_calls=tool_calls,
+                            mission_outcome=strategy_verdict.contract_violation,
+                            report_detail=_CONTRACT_VIOLATION_REPORT_DETAIL,
+                            report_section=_BASELINE_REPORT_SECTION,
+                            candidate=final_candidate,
+                            candidate_outcome="gate_failed",
+                            not_submitted=True,
+                            notice=NOTICE_SAME_NAME_CONTRACT_CHANGED)
+                        return
+                    candidate_rows = tuple(gate_rows)
+                    gate_rows.extend(strategy_verdict.baseline_rows)
+                    comparison = strategy_verdict.comparison
+                    if comparison is not None:
+                        self._activity.write(
+                            Category.IMPROVE, "baseline_compare",
+                            f"mission={ctx.mission_id} plugin={artifact['name']} "
+                            f"mode={comparison['mode']} "
+                            f"result={comparison['verdict']} "
+                            f"detail={comparison['reason']} "
+                            f"candidate={(gate_verdict.content_hash or '')[:12]} "
+                            f"base={_base_hash_of(strategy_verdict)[:12]}")
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
@@ -3657,7 +3712,27 @@ class ImproveLoop:
                             not_submitted=True,
                             notice=NOTICE_UNPROFITABLE)
                         return
-                    gate_metrics["baseline"] = strategy_verdict.baseline_row
+                    if (ctx.baseline_gate_mode == "enforce"
+                            and strategy_verdict.not_improved):
+                        self._finalize_gate_failed(
+                            conn, ctx=ctx, backlog_id=selection.backlog_id,
+                            reason="not_improved", now=now,
+                            gate_rows=tuple(gate_rows), tool_calls=tool_calls,
+                            mission_outcome="not_improved",
+                            report_detail=self._render_comparison_report_detail(
+                                comparison, candidate_hash=gate_verdict.content_hash,
+                                base_hash=_base_hash_of(strategy_verdict)),
+                            report_section=_BASELINE_REPORT_SECTION,
+                            candidate=final_candidate,
+                            candidate_outcome="gate_failed",
+                            not_submitted=True,
+                            notice=NOTICE_NOT_IMPROVED)
+                        return
+                    baseline_for_payload = strategy_verdict.baseline_row
+                    if comparison is not None and baseline_for_payload is not None:
+                        baseline_for_payload = {
+                            **baseline_for_payload, "comparison": comparison}
+                    gate_metrics["baseline"] = baseline_for_payload
                     # [approval-payload-missing-gate-metrics] 是正 (A4 10
                     # 回目 claude #69 観測 A、2026-09-11): ゲートが実際に
                     # 測った in-sample/holdout の成績を承認 payload へ載せる。
@@ -3672,7 +3747,7 @@ class ImproveLoop:
                     # ブリーフの明示指定どおり)。
                     gate_metrics["in_sample"] = strategy_verdict.candidate_metrics
                     holdout_by_pair = {
-                        row["pair"]: row["metrics"] for row in gate_rows
+                        row["pair"]: row["metrics"] for row in candidate_rows
                         if row.get("scope") == "holdout_gate"}
                     if len(holdout_by_pair) == 1:
                         gate_metrics["holdout"] = next(iter(holdout_by_pair.values()))
@@ -4221,6 +4296,57 @@ class ImproveLoop:
         self._publish_report(conn, run_id=ctx.run_id, part_path=part_path,
                              final_path=final_path, now=now)
 
+    def _baseline_compare_mode(self, ctx, *, name, candidate_dir) -> str:
+        """gate に渡す比較 mode。再ロック (pin の貼り直しだけの更新) は
+        コードが同じなので比較しない。判定が読み取りで失敗したら再ロックでは
+        ないものとして扱い、比較する側に倒す。"""
+        mode = ctx.baseline_gate_mode
+        if mode == "off":
+            return mode
+        deployed_dir = self._deployed_dir_for(name, inventory=ctx.inventory)
+        if deployed_dir is None or candidate_dir is None:
+            return mode
+        try:
+            if is_relock_transition(candidate_dir, deployed_dir,
+                                    ctx.inventory.inventory):
+                return "off"
+        except (OSError, UnicodeError, SyntaxError, yaml.YAMLError):
+            pass
+        return mode
+
+    @staticmethod
+    def _render_comparison_report_detail(comparison: dict, *,
+                                         candidate_hash: str | None,
+                                         base_hash: str) -> str:
+        """配備中の版との比較節。段 (holdout → in_sample)・pair ごとに候補と
+        配備中の版の指標を並べる。親専有で、activity と agent 面には流さない。"""
+        lines = [
+            f"mode: {comparison['mode']}",
+            f"verdict: {comparison['verdict']}",
+            f"reason: {comparison['reason']}",
+            f"candidate: {(candidate_hash or '')[:12]}",
+            f"deployed: {base_hash[:12]}",
+            "",
+        ]
+        tables: list[str] = []
+        for scope in ("holdout", "in_sample"):
+            per_pair = comparison["stages"].get(scope) or {}
+            if not per_pair:
+                continue
+            keys: tuple[str, ...] = ()
+            for entry in per_pair.values():
+                keys = tuple(entry["candidate"])
+                break
+            rows = ["| pair | version | " + " | ".join(keys) + " | verdict |",
+                    "|---" * (len(keys) + 3) + "|"]
+            for pair, entry in per_pair.items():
+                for label in ("candidate", "deployed"):
+                    values = [str(entry[label].get(k, "")) for k in keys]
+                    rows.append(f"| {pair} | {label} | " + " | ".join(values)
+                                + f" | {entry['verdict'] if label == 'candidate' else ''} |")
+            tables.append(f"### {scope}\n\n" + "\n".join(rows))
+        return "\n".join(lines) + "\n\n".join(tables)
+
     _FLOOR_REPORT_METRIC_KEYS = (
         "trades", "pf", "win_rate", "avg_r", "max_drawdown", "total_pnl",
         "kill_switch_latches", "evaluable")
@@ -4285,6 +4411,7 @@ class ImproveLoop:
                               candidate: _FinalCandidate | None = None,
                               candidate_outcome: str = "gate_failed",
                               not_submitted: bool = False,
+                              report_section: str = "Profitability floor detail",
                               notice: NoticeCode) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
@@ -4351,7 +4478,7 @@ class ImproveLoop:
             # [profitability-floor] T1 Step 1-3: 親専有レポート本文の
             # 後段にのみ全数値を書く。activity/last_result には流れない
             # (report_detail の呼び出し元は `reason` と混ぜていない)。
-            body_md += f"\n## Profitability floor detail\n\n{report_detail}\n"
+            body_md += f"\n## {report_section}\n\n{report_detail}\n"
         reports_dir = self._root / "data" / "improve_reports"
         (reports_dir / ".tmp").mkdir(parents=True, exist_ok=True)
         # D-15 是正: 設計書 §4.2 手順6/7「一時ファイル作成に失敗していたら

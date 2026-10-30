@@ -61,9 +61,10 @@ class _Ctx:
         self.staging_dir = tmp_path / "staging"
         self.source_snapshot_dir = tmp_path / "source"
         self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        self.baseline_gate_mode = "off"
 
 
-def _render(tmp_path, settings, *, inventory_metas=None):
+def _render(tmp_path, settings, *, inventory_metas=None, mode="off"):
     conn = connect(tmp_path / "p.db")
     init_db(conn)
     ctx_data = build_improve_context(
@@ -74,7 +75,9 @@ def _render(tmp_path, settings, *, inventory_metas=None):
     conn.close()
     loop = ImproveLoop.__new__(ImproveLoop)
     loop._settings = settings
-    return loop._render_improve_mission_prompt(ctx_data, ctx=_Ctx(tmp_path))
+    ctx = _Ctx(tmp_path)
+    ctx.baseline_gate_mode = mode
+    return loop._render_improve_mission_prompt(ctx_data, ctx=ctx)
 
 
 _SETTINGS_CASES = {
@@ -203,3 +206,29 @@ def test_ac17_approval_payload_floor_snapshot_carries_the_new_values(
     assert payload["profitability_floor"] == {
         "min_pf": 1.0, "require_positive_avg_r": True,
         "require_holdout_evaluable": True}
+
+
+_SAME_NAME_SENTENCE = "同名で更新する候補は、配備中の版を上回ることが採用の条件である。"
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow"])
+def test_prompt_sentence_absent_unless_enforce(tmp_path, mode):
+    assert _SAME_NAME_SENTENCE not in _render(tmp_path, _settings(), mode=mode)
+
+
+def test_prompt_sentence_appears_once_when_enforce(tmp_path):
+    rendered = _render(tmp_path, _settings(), mode="enforce")
+    assert rendered.count(_SAME_NAME_SENTENCE) == 1
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_prompt_has_no_forbidden_comparison_words(tmp_path, mode):
+    rendered = _render(tmp_path, _settings(), mode=mode)
+    for word in ("baseline", "not_improved", "same_name_contract_changed",
+                 "holdout"):
+        assert word not in rendered.lower(), word
+
+
+def test_shadow_prompt_is_byte_identical_to_off(tmp_path):
+    assert _render(tmp_path, _settings(), mode="shadow") \
+        == _render(tmp_path, _settings(), mode="off")

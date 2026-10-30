@@ -768,3 +768,26 @@ def test_cr4_three_payload_sites_match_gate_settings_snapshot(
         (approval_id,)).fetchone()
     payload = json_module.loads(row["payload_json"])
     assert payload["profitability_floor"] == expected
+
+
+def test_human_corridor_never_compares(env, monkeypatch):
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    from agentic_fx.plugin.loader import _discover_one
+    meta = _discover_one(d, "st")
+    seen = []
+
+    def spy(conn, **kw):
+        seen.append(kw)
+        return _insufficient_trades_gate(conn, **kw)
+
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate", spy)
+    settings.improve.baseline_gate = "enforce"
+
+    approval.run_kind_gate(conn, meta, settings=settings, now=NOW,
+                           inventory=_empty_inventory(plugins_dir))
+
+    assert len(seen) == 1
+    assert seen[0].get("compare_mode", "off") == "off"

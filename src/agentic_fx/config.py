@@ -6,6 +6,7 @@ import os
 import re
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -381,6 +382,11 @@ class ImproveSettings(_Strict):
     accept_drain_sec: float = Field(ge=0, default=30.0)
     archive_max_bytes: int = Field(ge=0, default=200 * 1024 * 1024)
     archive_max_missions: int = Field(ge=1, default=50)
+    # 同名で更新する候補を配備中の版と比べる gate。shadow は記録のみ、
+    # enforce は上回らない候補を却下する。反映は daemon の再起動後。
+    baseline_gate: Literal["shadow", "enforce"] = "shadow"
+    baseline_replay_wall_clock_max_sec: float = Field(
+        gt=0, allow_inf_nan=False, strict=True, default=300)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
     tool_budget: ImproveToolBudgetSettings = ImproveToolBudgetSettings()
