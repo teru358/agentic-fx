@@ -1,6 +1,6 @@
 # 参照系列 (株価指数など) を戦略の材料にする — 設計 C1
 
-**版:** v0.6.2 C1 (裁定済)（T2 実装・レビューで確定した事項を反映）
+**版:** v0.6.3 C1 (裁定済)（T2 実装・レビューで確定した事項を反映）
 **チケット:** `reference-symbols-as-indicator-inputs`（中）、`multi-timeframe-indicator-deps`（低）、`executor-pair-membership-guard`（高、T1 に含める）
 **正本の関係:** indicator の loader / resolver / pin は `2026-09-14-indicator-consumption-wiring-design.md` を拡張する。価格源の outage / backfill 規則は `2026-09-24-outage-stop-and-backfill-design.md` を変更しない。
 
@@ -129,11 +129,11 @@ soft はシステム全体を degraded にしない、という意味だけで�
 
 ### 2.5 履歴、分析、改善 mission、read tool
 
-backtest は取引 pair と全参照 symbol を一つの `HistoryDataset(source, base_interval)` から読む。`run_backtest` 前に全宣言を preflight し、同じ import source/base interval に reference history が完全に無い場合だけ R2 で選んだ処理を業務副作用前に適用する。推奨 fail-closed は `reference_history_missing(<symbol>, <tf>, <reason>)` の固定応答 `started:false` として **`backtest_runs` の run 行を作らない**。signal、order、候補 archive 等の業務副作用も 0 件とする一方、RPC ledger、mission transcript、activity の監査記録は残す。seed 不足、indicator NaN、合法的休場 / age stale はこの missing 判定にしない。`analyze corr` は既存実装のまま、両 symbol が同じ `--source`、1m、30 以上の共通 timestamp を持つ場合だけ動く。live で JP225 1h を取っただけでは相関分析に使えない。`history coverage` は既存どおり単一 `--symbol` の表示であり、参照一覧の表を新設しない。
+backtest は取引 pair と全参照 symbol を一つの `HistoryDataset(source, base_interval)` から読む。`run_backtest` 前に全宣言を preflight し、同じ import source/base interval に reference history が完全に無い場合だけ R2 で選んだ処理を業務副作用前に適用する。推奨 fail-closed は `reference_history_missing(<symbol>, <tf>, <reason>)` (reason は固定語 `no_rows`) の固定応答 `started:false` として **`backtest_runs` の run 行を作らない**。signal、order、候補 archive 等の業務副作用も 0 件とする一方、RPC ledger、mission transcript、activity の監査記録は残す。seed 不足、indicator NaN、合法的休場 / age stale はこの missing 判定にしない。`analyze corr` は既存実装のまま、両 symbol が同じ `--source`、1m、30 以上の共通 timestamp を持つ場合だけ動く。live で JP225 1h を取っただけでは相関分析に使えない。`history coverage` は既存どおり単一 `--symbol` の表示であり、参照一覧の表を新設しない。
 
 `get_ohlcv` と `get_indicators` だけは market-read 専用の `read_symbol_param()` を新設して `pairs + watch_symbols` を enum / runtime membership ともに検査する。共通 `market_tools.pair_param()` は拡張しないため、`get_signals` と trade-intent schema は pairs 限定のままである。read tool も MT5 primary / raw symbol 契約に従う。
 
-改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols` と `history_available: true|false` だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
+改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols` と `history_available` (watch symbol ごとの `{symbol: true|false}`、同じ dataset に 1 行以上あるか) だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
 
 family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encoded-resolved-deps>` にする。各 dep は alias の宣言順で `alias;plugin;symbol_mode;literal_symbol_or_-;ref_tf` を percent-escape した token とし、alias、plugin、self/literal symbol、reference timeframe、順序を全て区別する。escape `E` は UTF-8 byte 列に対し RFC 3986 unreserved（`A-Z a-z 0-9 - . _ ~`）だけをそのまま出し、それ以外を大文字 hex の `%XX` にする。各 variable field に `E` を適用してから grammar の literal separator `@`、`,`、`;` を結ぶ。decoder は不正な `%`、小文字 hex、safe 文字の過剰 escape、decode 後に再 encode して原文と一致しない値を reject する。既存の `FAMILY_KEY_MAX_BYTES = 512` は上げない。resolver は生成後の encoded family key が 512 bytes 以下であることを検査し、超過は固定 reason `family_key_too_long` で config reject する。literal symbol は `watch_symbols` membership を満たし、その UTF-8 32-byte 上限にも従う。新 parser はこの正規形だけを受け、既存 `strategy:<names>@<tf>@<pairs>` は legacy として parse / 表示のみ維持する。旧 key は新 key と同一族に畳み込まない。これは scalar を落とす config shape hash だけでは JP225 と US500 を区別できないためである。
 
@@ -143,7 +143,7 @@ family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encod
 |---|---|---|---|---|---:|---|
 | T1 契約・安全境界 | schema v5 migration、MT5-only/raw symbol、`IndicatorRef` / resolver / audit、duration、named-frame payload と call 入力上限、executor membership guard、時刻純関数と UTC fixture | AC-1, 3–6, 11, 14 | なし | schema / resolver、`risk.pair_rules` 余剰 key の警告、all-open-path I/O 0、protocol の limit / limit+1 / shared-frame、UTC / 4h / 1d の安全境界試験が全て通る | 650–850 行 | sonnet（通常 / five-phase の競合境界試験を含む） |
 | T2 live 取得・worker 配線 | symbol-keyed registry、hard-first/soft backoff、raw MT5 adapter、1h→4h/1d、named frames、`ohlcv` 配備、strategy skip、status/activity | AC-2, 5–7, 12, 14 | T1 | capped exponential backoff の増加列と cap、`K_ref_actual`→native 本数、4h / 1d の完全・先頭不足・末尾部分 bucket、固定 activity reason の試験が通る。レビュー閉鎖 2026-10-30 (codex r1 + /code-review high 12 件、閉鎖確認 2 回) | 700–950 行 | codex（純 Python） |
-| T3 backtest・履歴・改善 | 同一 dataset preflight、live/backtest parity、family v2 / legacy、inventory sink、`run_backtest` 配線 | AC-7–9, 12, 15 | T1, T2 | 推奨 fail-closed で history 完全不在なら `backtest_runs` の run 行、signal、order、候補 archive 等の業務副作用は 0 件。ただし RPC ledger・mission transcript・activity の監査記録は残す。NaN/seed は skip、live/backtest の入力列一致、v2 round-trip / legacy 読取の試験が通る | 550–750 行 | codex（純 Python） |
+| T3 backtest・履歴・改善 | 同一 dataset preflight、live/backtest parity、family v2 / legacy、inventory sink、`run_backtest` 配線 | AC-7–9, 12, 15 | T1, T2 | 推奨 fail-closed で history 完全不在なら `backtest_runs` の run 行、signal、order、候補 archive 等の業務副作用は 0 件。ただし RPC ledger・mission transcript・activity の監査記録は残す。NaN/seed は skip、live/backtest の入力列一致、v2 round-trip / legacy 読取の試験が通る。gate は参照履歴不在を構造化 verdict (`evaluable=False`、`reference_history_missing`) で返し、improve の commit 相はそれを `backtest_data_unavailable` の固定語で fail-closed に畳む。replay の adapter は (symbol, ref_tf) ごとに参照 frame を 30 日チャンクで cache し live の整列関数を共有する。レビュー閉鎖 2026-10-30 (codex r1 Critical 1 + /code-review high 7 件、閉鎖確認) | 550–750 行 | codex（純 Python） |
 | T4 wizard・read tool・check・文書 | stage 3 `/symbols`、read schema 分離、check warning、history/corr 操作文、ops / golden 更新 | AC-9–10, 13 | T1–T3 | raw adapter 経路と runtime membership を組にした read-tool 試験、wizard zero-write と golden / 操作文更新が通る | 400–600 行 | codex（純 Python） |
 
 T1→T2→T3→T4 は直列である。T1 の protocol / 安全境界試験を通過してから T2、T2 の native frame 試験を通過してから T3 に進む。registry は resolver の effective 座標と worker の履歴契約を必要とするため、C0 の「T1 と T2 は独立」は採らない。
@@ -201,3 +201,4 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-28 | v0.6 C1 | §4 の R1・R2・R4 を推奨どおりユーザー裁定済に | ユーザー承認、実装着手 | |
 | 2026-10-29 | v0.6.1 C1 | `risk.pair_rules` の余剰 key は起動拒否でなく警告 (§2.1、T1 の exit criteria) | T1a で設定例 (EURUSD の規則) と衝突。membership 検査が境界で余剰規則は取引対象を増やさない | |
 | 2026-10-30 | v0.6.2 C1 | T2 で確定した soft 再要求上限、状態・activity・frame 読込・週末・`max_bars`・再起動境界を反映 | T2 実装・レビューで確定 | |
+| 2026-10-30 | v0.6.3 C1 | T3 で確定: `history_available` は symbol ごと、`reference_history_missing` の reason は `no_rows`、gate の構造化 verdict と commit 相の固定語、replay の frame cache | T3 実装・レビューで確定 | |
