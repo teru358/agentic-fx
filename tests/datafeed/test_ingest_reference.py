@@ -189,6 +189,24 @@ def test_a_trading_pair_strategy_key_keeps_the_hard_retry_schedule(tmp_path):
     conn.close()
 
 
+def test_a_trading_pair_requested_as_a_reference_keeps_the_hard_retry_schedule(tmp_path):
+    conn = _db(tmp_path)
+
+    def fetch(pair, interval, start, end, *, timeout):
+        if (pair, interval) == ("USDJPY", "15m"):
+            raise httpx.ConnectError("down")
+        return []
+
+    ingest = Ingest(_settings(watch=("USDJPY",)),
+                    [_strategy(_ref("USDJPY", "15m", "usd"), timeframe="1h")],
+                    fetch=fetch, monotonic=_Clock())
+    _, report = ingest.prepare(NOW, conn)
+    assert (("USDJPY", "15m"), "down") in report.failed
+    assert ("USDJPY", "15m") not in report.soft_attempted
+    assert ingest.next_probe_at[("USDJPY", "15m")] == NOW
+    conn.close()
+
+
 def test_a_soft_planner_failure_is_visible_once_in_state_and_logs(tmp_path, caplog):
     conn = _db(tmp_path)
 

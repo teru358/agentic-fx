@@ -76,8 +76,8 @@ class Ingest:
         return self.registry.keys()
 
     def _is_hard(self, key) -> bool:
-        """Trading-pair keys keep the per-tick schedule; only reference keys are soft."""
-        return not self.registry.is_reference(*key)
+        """Trading-pair keys keep the per-tick schedule whatever asked for them; only other reference keys are soft."""
+        return key[0] in self.settings.pairs or not self.registry.is_reference(*key)
 
     def _priority(self, key):
         _, interval = key

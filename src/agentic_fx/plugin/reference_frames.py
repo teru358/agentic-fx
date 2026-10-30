@@ -18,7 +18,8 @@ from agentic_fx.plugin.reference_time import timeframe_seconds
 
 # Reasons a reference frame cannot be used.  Fetch states reported by ingest
 # win over what the cache alone shows, in this order.
-FETCH_STATE_REASONS = ("source_unavailable", "fetch_failed", "budget_deferred")
+FETCH_STATE_REASONS = ("source_unavailable", "fetch_failed", "budget_deferred",
+                       "plan_failed", "symbol_rejected")
 REFERENCE_REASONS = (*FETCH_STATE_REASONS, "missing", "age_exceeded",
                      "indicator_unavailable")
 RUNTIME_WINDOW_REASON = "reference_window_exceeded_at_runtime"

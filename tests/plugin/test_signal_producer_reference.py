@@ -456,14 +456,20 @@ def test_age_is_its_own_token_and_never_part_of_reason(tmp_path):
 def test_the_reason_vocabulary_is_a_closed_set():
     assert set(REFERENCE_REASONS) == {
         "missing", "age_exceeded", "fetch_failed", "budget_deferred",
-        "source_unavailable", "indicator_unavailable"}
+        "source_unavailable", "indicator_unavailable", "plan_failed", "symbol_rejected"}
     assert RUNTIME_WINDOW_REASON == "reference_window_exceeded_at_runtime"
+
+
+def test_fetch_state_reasons_are_reference_states():
+    from agentic_fx.datafeed.reference_status import REFERENCE_STATES
+    from agentic_fx.plugin.reference_frames import FETCH_STATE_REASONS
+    assert set(FETCH_STATE_REASONS) <= set(REFERENCE_STATES)
 
 
 def test_every_reason_the_producer_emits_is_in_the_closed_set(tmp_path):
     seen = set()
     cases = [("source_unavailable", None), ("fetch_failed", None), ("budget_deferred", None),
-             (None, "missing"), (None, "age_exceeded")]
+             ("plan_failed", None), ("symbol_rejected", None), (None, "missing"), (None, "age_exceeded")]
     for index, (state, kind) in enumerate(cases):
         sub = tmp_path / f"c{index}"
         sub.mkdir()
@@ -477,8 +483,8 @@ def test_every_reason_the_producer_emits_is_in_the_closed_set(tmp_path):
         for text in activity.events("reference_unavailable") + activity.events("reference_stale"):
             seen.add(dict(part.split("=", 1) for part in text.split())["reason"])
         conn.close()
-    assert seen == {"source_unavailable", "fetch_failed", "budget_deferred", "missing",
-                    "age_exceeded"}
+    assert seen == {"source_unavailable", "fetch_failed", "budget_deferred", "plan_failed",
+                    "symbol_rejected", "missing", "age_exceeded"}
     assert seen <= set(REFERENCE_REASONS)
 
 
