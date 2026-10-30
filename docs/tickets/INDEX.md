@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 150 件。完了分は closed/。
+未完了: 153 件。完了分は closed/。
 
 ## 実装中 (6)
 
@@ -49,7 +49,7 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 
-## 裁定待ち (6)
+## 裁定待ち (9)
 
 ### 不具合 (2)
 
@@ -58,11 +58,14 @@
 | [improve-catchup-runs-at-startup](open/improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 
-### 機能 (3)
+### 機能 (6)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
+| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
+| [econ-event-hold-window-deterministic](open/econ-event-hold-window-deterministic.md) | 中 | 2026-10-30 | 指標前の様子見を tool 側で重要イベントと回避帯に絞る |
+| [llm-vs-strategy-signal-authority](open/llm-vs-strategy-signal-authority.md) | 中 | 2026-10-30 | LLM と戦略シグナルの役割分担 (シグナルの最終審査員にするか) |
 | [legacy-e2e-ttl](open/legacy-e2e-ttl.md) | 低 |  | llama-swap の TTL 120 秒で mission 中にモデルが unload される |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 
