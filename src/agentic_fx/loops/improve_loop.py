@@ -3386,6 +3386,9 @@ class ImproveLoop:
             conn = self._db_write_conn_factory()
             owns_conn = True
         commit_raised = False
+        # 比較の activity は終端 tx の commit 後にだけ出す (途中で失敗して
+        # rollback した mission に行を残さない)
+        deferred_compare_activity: str | None = None
         try:
             self._freeze_ledger(ctx)                                  # 手順0
 
@@ -3658,8 +3661,7 @@ class ImproveLoop:
                     gate_rows.extend(strategy_verdict.baseline_rows)
                     comparison = strategy_verdict.comparison
                     if comparison is not None:
-                        self._activity.write(
-                            Category.IMPROVE, "baseline_compare",
+                        deferred_compare_activity = (
                             f"mission={ctx.mission_id} plugin={artifact['name']} "
                             f"mode={comparison['mode']} "
                             f"result={comparison['verdict']} "
@@ -3836,8 +3838,24 @@ class ImproveLoop:
                 ctx.ledger.mark_persist_failed()
             raise
         finally:
+            if (deferred_compare_activity is not None and not commit_raised
+                    and self._activity is not None
+                    and self._mission_completed(conn, ctx.mission_id)):
+                self._activity.write(
+                    Category.IMPROVE, "baseline_compare",
+                    deferred_compare_activity)
             if owns_conn:
                 conn.close()
+
+    @staticmethod
+    def _mission_completed(conn, mission_id) -> bool:
+        """終端 tx が commit されたか (補償で failed になった mission は含まない)。"""
+        try:
+            row = conn.execute("SELECT status FROM missions WHERE id=?",
+                               (mission_id,)).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None and row[0] == "completed"
 
     def _prepare_report_if_applicable(self, conn, *, ctx, artifact, output,
                                       now, backlog_id=None,

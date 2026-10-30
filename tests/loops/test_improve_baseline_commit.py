@@ -16,9 +16,11 @@ from agentic_fx.loops.improve_loop import ImproveLoop
 from agentic_fx.plugin.sandbox import SandboxError
 from agentic_fx.plugin.strategy_gate import (
     StrategyGateVerdict, _decide_comparison)
-from tests.loops.test_improve_candidate_ledger import _run, _strategy
+from tests.loops.test_improve_candidate_ledger import (
+    _indicator, _run, _strategy)
 from tests.loops.test_improve_e2e import (
-    NOW, _fake_record_kwargs, _no_real_network, _install, improve_env)  # noqa: F401
+    NOW, _fake_record_kwargs, _no_real_network, _install, _plugin_artifact,
+    improve_env)  # noqa: F401
 from tests.loops.test_improve_quality_gate import (
     PY_X, PY_Y, _artifact, _files)
 
@@ -59,10 +61,14 @@ class FakeGate:
     """`ImproveLoop._run_strategy_gate` の差し替え。呼び出しの kwargs を
     積み、`kind` に応じた verdict を返す。"""
 
-    def __init__(self, settings, kind):
+    def __init__(self, settings, kind, *, metrics=None):
         self.settings = settings
         self.kind = kind
         self.calls: list[dict] = []
+        self.m = metrics or {
+            "cand_in": CAND_IN, "cand_ho": CAND_HO, "dep_in": DEPLOYED_IN,
+            "dep_ho_worse": DEPLOYED_HO_WORSE,
+            "dep_ho_better": DEPLOYED_HO_BETTER}
 
     def __call__(self, conn, **kw):
         self.calls.append(kw)
@@ -82,10 +88,11 @@ class FakeGate:
             return StrategyGateVerdict(
                 evaluable=True, floor_reason="in_sample pair=USDJPY pf",
                 candidate_metrics={PAIR: {**CAND_IN, "pf": 0.4}})
+        m = self.m
         in_row = _candidate_row(self.settings, "in_sample", content_hash,
-                                CAND_IN)
+                                m["cand_in"])
         ho_row = _candidate_row(self.settings, "holdout_gate", content_hash,
-                                CAND_HO)
+                                m["cand_ho"])
         record(in_row)
         record(ho_row)
         base = {"ref_plugin_ref": "plugins/cand", "variant": "baseline"}
@@ -93,16 +100,16 @@ class FakeGate:
         if mode != "off" and self.kind != "new_name":
             base["base_content_hash"] = BASE_HASH
             if self.kind in ("improved", "not_improved"):
-                holdout = (DEPLOYED_HO_BETTER if self.kind == "not_improved"
-                           else DEPLOYED_HO_WORSE)
+                holdout = (m["dep_ho_better"] if self.kind == "not_improved"
+                           else m["dep_ho_worse"])
                 comparison = _decide_comparison(
                     mode=mode, pairs=[PAIR], stages={
-                        "in_sample": {"candidate": {PAIR: CAND_IN},
-                                      "deployed": {PAIR: DEPLOYED_IN}},
-                        "holdout": {"candidate": {PAIR: CAND_HO},
+                        "in_sample": {"candidate": {PAIR: m["cand_in"]},
+                                      "deployed": {PAIR: m["dep_in"]}},
+                        "holdout": {"candidate": {PAIR: m["cand_ho"]},
                                     "deployed": {PAIR: holdout}}})
                 rows = _baseline_rows(self.settings, content_hash,
-                                      DEPLOYED_IN, holdout)
+                                      m["dep_in"], holdout)
             elif self.kind == "unavailable_unhealthy":
                 comparison = {"mode": mode, "verdict": "unavailable",
                               "reason": "baseline_unhealthy",
@@ -119,14 +126,16 @@ class FakeGate:
                                       DEPLOYED_NOT_EVALUABLE)
         return StrategyGateVerdict(
             evaluable=True, baseline_variant="baseline", baseline_row=base,
-            candidate_metrics={PAIR: CAND_IN}, holdout_metrics={PAIR: CAND_HO},
+            candidate_metrics={PAIR: m["cand_in"]},
+            holdout_metrics={PAIR: m["cand_ho"]},
             comparison=comparison,
             not_improved=bool(
                 comparison and comparison["verdict"] == "not_improved"),
             baseline_rows=rows)
 
 
-def _drive(app, root, kind, mode, *, name="cand", files=None, **gate_kw):
+def _drive(app, root, kind, mode, *, name="cand", files=None, artifact=None,
+           **gate_kw):
     app.settings.improve.baseline_gate = mode
     gate = FakeGate(app.settings, kind, **gate_kw)
     outcomes: list[str] = []
@@ -137,7 +146,7 @@ def _drive(app, root, kind, mode, *, name="cand", files=None, **gate_kw):
         return real(self, conn, **kw)
 
     loop, ctx, _ = _run(
-        app, root, _artifact(name), files=files or _files(name),
+        app, root, artifact or _artifact(name), files=files or _files(name),
         extra=[patch.object(ImproveLoop, "_run_strategy_gate", gate),
                patch.object(ImproveLoop, "_persist_ledger_in_tx", spy)],
         seed=False)
@@ -366,6 +375,7 @@ def test_baseline_rows_roll_back_with_the_terminal_tx(improve_env):
     assert calls["n"] >= 3
     assert _backtest_rows(conn, ctx.mission_id) == []
     assert _approvals(conn) == []
+    assert "baseline_compare" not in _activity(root)
 
 
 def test_unknown_sandbox_code_propagates(improve_env):
@@ -557,7 +567,7 @@ def test_no_relock_probe_when_mode_is_off(improve_env):
     assert [c["compare_mode"] for c in gate.calls] == ["shadow"]
 
 
-# --- 3 入口 ---------------------------------------------------------------
+# --- 3 入口と repeat ---------------------------------------------------------
 
 def test_every_entrance_snapshots_the_mode_in_prepare(
         loop_full, conn, clock):
@@ -578,26 +588,82 @@ def test_every_entrance_snapshots_the_mode_in_prepare(
         assert ctx.baseline_replay_wall_clock_max_sec == 42.0
 
 
-# --- off / 新名 / 再ロックの出力が mode に依らない ---------------------------------
+def test_repeat_rounds_each_take_their_own_snapshot(loop_full, clock):
+    """repeat の各 mission は prepare() で settings を読み直す。1 周目の途中で
+    settings を書き換えても 1 周目は変わらず、2 周目は書き換え後の値になる。"""
+    settings = loop_full._settings.improve
+    now = clock.now()
+    settings.baseline_gate = "shadow"
+    settings.baseline_replay_wall_clock_max_sec = 11.0
+    first = loop_full.prepare(slot_key=None, now=now)[1]
+    settings.baseline_gate = "enforce"
+    settings.baseline_replay_wall_clock_max_sec = 22.0
+    assert first.baseline_gate_mode == "shadow"
+    assert first.baseline_replay_wall_clock_max_sec == 11.0
+    second = loop_full.prepare(slot_key=None, now=now)[1]
+    settings.baseline_gate = "off"
+    assert second.baseline_gate_mode == "enforce"
+    assert second.baseline_replay_wall_clock_max_sec == 22.0
+    assert first.baseline_gate_mode == "shadow"
+    assert first is not second
+
+
+def test_repeat_second_round_commit_uses_its_own_mode(improve_env):
+    """commit まで通した 2 周を、1 周目 shadow・2 周目 enforce で回す。"""
+    app, root = improve_env
+    app.settings.improve.baseline_gate = "shadow"
+    gate = FakeGate(app.settings, "not_improved")
+
+    def flip_after_first(loop, ctx):
+        loop._settings.improve.baseline_gate = "enforce"
+
+    _run(app, root, _artifact("cand"), files=_files("cand"),
+         extra=[patch.object(ImproveLoop, "_run_strategy_gate", gate)],
+         before_commit=flip_after_first, seed=False)
+    assert len(_approvals(app.conn_core)) == 1
+    _run(app, root, _artifact("cand2"), files=_files("cand2", PY_Y),
+         extra=[patch.object(ImproveLoop, "_run_strategy_gate", gate)],
+         seed=False)
+    assert [c["compare_mode"] for c in gate.calls] == ["shadow", "enforce"]
+    assert len(_approvals(app.conn_core)) == 1
+    assert _last_result(app.conn_core) == "observation:not_submitted"
+
+
+# --- off / 新名 / indicator の出力が mode に依らない (生の bytes で) --------------
+
+def _raw_activity(root) -> list[str]:
+    """activity の行。実時刻の先頭欄だけ落とし、残りは加工しない。"""
+    path = root / "logs" / "activity.log"
+    lines = path.read_text().splitlines() if path.exists() else []
+    return [ln.split("\t", 1)[1] for ln in lines]
+
 
 def _fingerprint(app, root, ctx):
     conn = app.conn_core
     mid = ctx.mission_id
-    activity = [ln.split(" ", 3)[-1] for ln in _activity(root).splitlines()]
-    reports = sorted(p.read_text() for p in
-                     (root / "data" / "improve_reports").glob("improve-*.md")) \
-        if (root / "data" / "improve_reports").exists() else []
+    reports_dir = root / "data" / "improve_reports"
+    reports = sorted(p.read_bytes() for p in reports_dir.glob("improve-*.md")
+                     ) if reports_dir.exists() else []
     rows = [(r["variant"], r["scope"], r["mission_outcome"], r["metrics_json"])
             for r in _backtest_rows(conn, mid)]
+    payloads = [r[0] for r in conn.execute(
+        "SELECT payload_json FROM approval_requests ORDER BY id")]
     return {
-        "rows": rows, "payload": _approvals(conn), "last": _last_result(conn),
+        "rows": rows, "payload": payloads, "last": _last_result(conn),
         "notice": _notice(conn, mid), "reports": reports,
-        "activity": [a for a in activity if "baseline_compare" not in a],
-        "no_compare": not any("baseline_compare" in a for a in activity)}
+        "activity": _raw_activity(root)}
 
 
-@pytest.mark.parametrize("kind", ["new_name"])
-def test_new_name_is_identical_across_modes(tmp_path_factory, kind):
+_NEW_NAME = {}
+_INDICATOR = {"artifact": _plugin_artifact("cand", kind="indicator"),
+              "files": _indicator()}
+
+
+@pytest.mark.parametrize("kind,drive_kw", [
+    ("new_name", _NEW_NAME), ("new_name", _INDICATOR)],
+    ids=["new_name_strategy", "indicator"])
+def test_outputs_are_byte_identical_across_modes(
+        tmp_path_factory, kind, drive_kw):
     from tests.loops.test_improve_e2e import FakeEmbedding, FakeRunner, FixedClock
     from agentic_fx.service import build_app
     prints = {}
@@ -608,18 +674,144 @@ def test_new_name_is_identical_across_modes(tmp_path_factory, kind):
             app = build_app(root, runner=FakeRunner([]), clock=FixedClock(NOW),
                             embedding_fn=FakeEmbedding())
             try:
-                gate, loop, ctx = _drive(app, root, kind, mode)
+                gate, loop, ctx = _drive(app, root, kind, mode, **drive_kw)
                 print_ = _fingerprint(app, root, ctx)
             finally:
                 app.close()
-        if mode == "off":
-            assert [c["compare_mode"] for c in gate.calls] == ["off"]
         prints[mode] = print_
+    off = prints["off"]
+    assert off["payload"], "the candidate must reach approval"
+    assert off["reports"] or off["payload"]
+    assert off["activity"]
+    assert not any("baseline_compare" in ln for ln in off["activity"])
     for mode in ("shadow", "enforce"):
-        a, b = dict(prints["off"]), dict(prints[mode])
-        for key in ("rows", "payload", "last", "notice", "no_compare"):
-            assert a[key] == b[key], key
-        # activity は mission の id と時刻以外が同一
-        assert a["activity"] == b["activity"]
-        assert a["reports"] == b["reports"]
-    assert prints["off"]["no_compare"]
+        for key in off:
+            assert off[key] == prints[mode][key], (mode, key)
+
+
+# --- 遮断 8: holdout を含む 8 指標は agent の見る面に出ない ---------------------
+
+def _canary(i, pf, avg_r):
+    return {"trades": 600000 + i * 1111, "pf": pf,
+            "win_rate": 0.5 + i * 0.0001237, "avg_r": avg_r,
+            "max_drawdown": 0.1 + i * 0.0002711,
+            "total_pnl": 1000.0 + i * 7.3131,
+            "kill_switch_latches": 0, "evaluable": True}
+
+
+CANARY_METRICS = {
+    "cand_in": _canary(1, 1.5000123, 0.2000456),
+    "cand_ho": _canary(2, 1.4000789, 0.1500321),
+    "dep_in": _canary(3, 1.2000654, 0.1000987),
+    "dep_ho_worse": _canary(4, 1.1000246, 0.0500135),
+    "dep_ho_better": _canary(5, 2.5000864, 0.4000579)}
+
+
+def _canary_strings() -> set[str]:
+    out = set()
+    for metrics in CANARY_METRICS.values():
+        for key in ("trades", "pf", "win_rate", "avg_r", "max_drawdown",
+                    "total_pnl"):
+            out.add(str(metrics[key]))
+    assert len(out) == 6 * len(CANARY_METRICS)
+    return out
+
+
+def _agent_surfaces(app, root, loop, ctx) -> dict[str, str]:
+    """終端させた mission の後、agent や通知先が読みうる面の本文を集める。
+    比較節を持つ親専有レポートは別扱い (`_report_text`)。"""
+    from agentic_fx.loops.improve_context import build_improve_context
+    from agentic_fx.ops.contracts import Principal
+    from agentic_fx.runners.base import MissionResult
+    from tests.loops.test_improve_candidate_ledger import (
+        FakeImproveWorkerRunner)
+    conn = app.conn_core
+    result = MissionResult(status="completed", output={}, transcript=[])
+    with patch("agentic_fx.runners.worker_runner.WorkerRunner",
+               lambda **kw: FakeImproveWorkerRunner(result=result, **kw)):
+        next_mission, next_ctx, _ = loop.prepare(slot_key=None, now=NOW)
+    ctx_data = build_improve_context(
+        conn, settings=app.settings, now=NOW, root=root,
+        allowed_backlog_ids=None)
+
+    def dump(sql):
+        return json.dumps([dict(r) for r in conn.execute(sql)],
+                          ensure_ascii=False, default=str)
+
+    rpc = app.ops.improve_run(Principal.OPERATOR, ctx.mission_id)
+    index = root / "plugins" / "_archive" / "INDEX.md"
+    return {
+        "generated_prompt": next_mission.prompt,
+        "improve_context": json.dumps(ctx_data, ensure_ascii=False,
+                                      default=str),
+        "family_summary": json.dumps(
+            ctx_data["improvement_history"]["family_attempts"],
+            ensure_ascii=False, default=str),
+        "rendered_prompt": loop._render_improve_mission_prompt(
+            ctx_data, ctx=next_ctx),
+        "rpc_improve_run": json.dumps(rpc, ensure_ascii=False, default=str),
+        "mission_output": dump("SELECT * FROM missions"),
+        "backlog_last_result": dump("SELECT * FROM improvement_backlog"),
+        "improvement_runs": dump("SELECT * FROM improvement_runs"),
+        "notices": dump("SELECT * FROM improve_run_notices"),
+        "activity": "\n".join(app.activity.tail(10_000)),
+        "archive_index": index.read_text(encoding="utf-8")
+        if index.exists() else ""}
+
+
+def _report_text(root) -> str:
+    reports_dir = root / "data" / "improve_reports"
+    return "\n".join(p.read_text() for p in sorted(
+        reports_dir.glob("improve-*.md"))) if reports_dir.exists() else ""
+
+
+_COMPARISON_SECTION = "## Baseline comparison detail"
+
+
+@pytest.mark.parametrize("kind,mode", [
+    ("not_improved", "enforce"), ("not_improved", "shadow"),
+    ("improved", "shadow"), ("improved", "enforce"),
+    ("violation", "enforce")])
+def test_holdout_metrics_do_not_reach_agent_or_notice_surfaces(
+        improve_env, kind, mode):
+    app, root = improve_env
+    gate, loop, ctx = _drive(app, root, kind, mode,
+                             metrics=CANARY_METRICS)
+    canaries = _canary_strings()
+    surfaces = _agent_surfaces(app, root, loop, ctx)
+    for name in ("generated_prompt", "improve_context", "family_summary",
+                 "rpc_improve_run", "mission_output", "backlog_last_result",
+                 "notices", "activity"):
+        assert surfaces[name], f"{name} is empty; the surface was not exercised"
+    for name, text in surfaces.items():
+        for canary in canaries:
+            assert canary not in text, f"{canary} leaked to {name}"
+    report = _report_text(root)
+    outside_comparison = report.split(_COMPARISON_SECTION)[0]
+    for canary in canaries:
+        assert canary not in outside_comparison
+    conn = app.conn_core
+    if kind == "violation":
+        assert _backtest_rows(conn, ctx.mission_id) == []
+        for canary in canaries:
+            assert canary not in report
+        return
+    # positive control: 値は親専有の置き場には実在する
+    stored = "".join(r["metrics_json"] for r in _backtest_rows(
+        conn, ctx.mission_id))
+    assert str(CANARY_METRICS["cand_in"]["pf"]) in stored
+    assert str(CANARY_METRICS["dep_in"]["pf"]) in stored
+    if (kind, mode) == ("not_improved", "enforce"):
+        assert _COMPARISON_SECTION in report
+        assert str(CANARY_METRICS["cand_ho"]["pf"]) in report
+        assert str(CANARY_METRICS["dep_ho_better"]["pf"]) in report
+    else:
+        assert _COMPARISON_SECTION not in report
+        (payload,) = _approvals(conn)
+        stages = payload["baseline"]["comparison"]["stages"]
+        text = json.dumps(stages)
+        assert str(CANARY_METRICS["cand_ho"]["pf"]) in text
+        holdout_deployed = ("dep_ho_better" if kind == "not_improved"
+                            else "dep_ho_worse")
+        assert str(CANARY_METRICS[holdout_deployed]["pf"]) in text
+        assert str(CANARY_METRICS["dep_in"]["pf"]) in text
