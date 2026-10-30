@@ -124,6 +124,25 @@ def test_new_format_shows_parent_section_before_claims_with_fixed_note(
                          if ln.startswith("reason="))
 
 
+def test_approval_detail_shows_deployed_comparison_and_legacy_omits_it(tmp_path):
+    comparison = {"mode": "shadow", "verdict": "not_improved", "reason": "holdout_not_exceeds",
+                  "stages": {"holdout": {"USDJPY": {
+                      "candidate": {"pf": 1.2, "trades": 40, "avg_r": 0.1,
+                                    "max_drawdown": 0.05, "win_rate": 0.5,
+                                    "total_pnl": 1.0, "evaluable": True, "x": 1},
+                      "deployed": {"pf": 1.1, "trades": 40, "avg_r": 0.05,
+                                   "max_drawdown": 0.06, "win_rate": 0.4,
+                                   "total_pnl": 0.5, "evaluable": True, "x": 1},
+                      "verdict": "not_improved"}}, "in_sample": {}}}
+    payload = _new_payload(baseline={"base_content_hash": "b" * 64,
+                                     "comparison": comparison})
+    shown = _show(tmp_path, payload)
+    assert "配備中の版 (同条件で再評価)" in shown
+    assert "base_content_hash=bbbbbbbbbbbb" in shown
+    assert "未改善 (観測のみ)" in shown
+    assert "配備中の版 (同条件で再評価)" not in _show(tmp_path, _new_payload())
+
+
 def test_no_prior_runs_and_no_backlog_are_stated(tmp_path):
     payload = _new_payload()
     payload["parent_facts"]["backlog"] = None

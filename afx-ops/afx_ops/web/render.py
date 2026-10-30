@@ -63,7 +63,7 @@ STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balanc
 APPROVAL_FIELDS = frozenset({"id", "kind", "name", "content_hash", "created_at"})
 JOURNAL_FIELDS = frozenset({"approval_id", "name", "phase"})
 DETAIL_FIELDS = frozenset({"id", "kind", "status", "in_sample", "holdout", "payload_sha256",
-                           "decided_by", "decided_at", "asserted_actor", "parent_facts"})
+                           "decided_by", "decided_at", "asserted_actor", "parent_facts", "baseline"})
 # 変更内容の節を出すときは、成績を専用の節に移す
 OVERVIEW_FIELDS = DETAIL_FIELDS - {"in_sample", "holdout"}
 ACTIVITY_FIELDS = frozenset({"id", "ts", "category", "code", "ref", "state", "result_code",
@@ -172,6 +172,51 @@ def _change_is_well_formed(change: Mapping[str, object]) -> bool:
     return type(params) is dict and type(params.get("items", [])) is list
 
 
+def _baseline_section(data: Mapping[str, object]) -> str:
+    baseline = data.get("baseline")
+    if type(baseline) is not dict or type(baseline.get("comparison")) is not dict:
+        return ""
+    comparison = baseline["comparison"]
+    stages = comparison.get("stages")
+    if type(stages) is not dict:
+        return ""
+    verdict = comparison.get("verdict")
+    if verdict == "not_improved" and comparison.get("mode") == "shadow":
+        label = "未改善 (観測のみ)"
+    elif verdict == "unavailable":
+        label = "比較不能 (" + _text(comparison.get("reason")) + ")"
+    elif verdict == "improved":
+        label = "改善"
+    else:
+        label = _text(verdict)
+    rows = ["<p>判定: " + label + "</p>"]
+    value = baseline.get("base_content_hash")
+    if type(value) is str:
+        rows.append("<p>base_content_hash: " + _text(value[:12]) + "</p>")
+    for stage in ("in_sample", "holdout"):
+        pairs = stages.get(stage)
+        if type(pairs) is not dict:
+            continue
+        rows.append("<h3>" + html.escape(stage) + "</h3><table><thead><tr>"
+                    "<th>pair</th><th>version</th><th>pf</th><th>trades</th>"
+                    "<th>win_rate</th><th>avg_r</th><th>max_drawdown</th>"
+                    "<th>total_pnl</th><th>kill_switch_latches</th><th>evaluable</th>"
+                    "</tr></thead><tbody>")
+        for pair, entry in list(pairs.items())[:MAX_ITEMS]:
+            if type(entry) is not dict:
+                continue
+            for version, label_ in (("candidate", "候補"), ("deployed", "配備中の版")):
+                metrics = entry.get(version)
+                if type(metrics) is not dict:
+                    continue
+                cells = "".join("<td>" + _text(metrics.get(key)) + "</td>" for key in
+                                ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
+                                 "total_pnl", "kill_switch_latches", "evaluable"))
+                rows.append("<tr><td>" + _text(pair) + "</td><td>" + label_ + "</td>" + cells + "</tr>")
+        rows.append("</tbody></table>")
+    return "<section><h2>配備中の版 (同条件で再評価)</h2>" + "".join(rows) + "</section>"
+
+
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
     """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
     change = data.get("change") if type(data.get("change")) is dict else None
@@ -179,14 +224,16 @@ def render_approval(data: Mapping[str, object], change_data: Mapping[str, object
         change = change_data["change"]
     if change is None:
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>")
+                + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>"
+                + _baseline_section(data))
         return _page("Approval", body)
     if not _change_is_well_formed(change):
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>")
+                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>"
+                + _baseline_section(data))
         return _page("Approval", body)
-    return compose_approval_page(
-        data, change, change_data if type(change_data) is dict else None).page
+    rendered = compose_approval_page(data, change, change_data if type(change_data) is dict else None).page
+    return rendered.replace(b"</body></html>", _baseline_section(data).encode("utf-8") + b"</body></html>")
 
 
 # ---------------------------------------------------------------- 承認の変更内容

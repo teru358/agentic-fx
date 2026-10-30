@@ -712,6 +712,41 @@ class Commands:
         return [cls._metrics_line(f"{prefix} {display_text(pair)}", metrics)
                 for pair, metrics in value.items()]
 
+    @classmethod
+    def _baseline_comparison_lines(cls, baseline) -> list[str]:
+        """承認 payload に保存された比較 snapshot のみを表示する。"""
+        if not isinstance(baseline, dict):
+            return []
+        comparison = baseline.get("comparison")
+        base_hash = baseline.get("base_content_hash")
+        if not isinstance(comparison, dict) or not isinstance(comparison.get("stages"), dict):
+            return []
+        verdict = comparison.get("verdict")
+        mode = comparison.get("mode")
+        labels = {"improved": "改善", "unavailable": "比較不能"}
+        if verdict == "not_improved" and mode == "shadow":
+            label = "未改善 (観測のみ)"
+        elif verdict == "unavailable":
+            label = f"比較不能 ({display_text(comparison.get('reason'))})"
+        else:
+            label = labels.get(verdict, display_text(verdict))
+        lines = ["配備中の版 (同条件で再評価)", f"判定={label}"]
+        if isinstance(base_hash, str):
+            lines.append(f"base_content_hash={display_text(base_hash[:12])}")
+        for stage in ("in_sample", "holdout"):
+            pairs = comparison["stages"].get(stage)
+            if not isinstance(pairs, dict):
+                continue
+            for pair, entry in pairs.items():
+                if not isinstance(entry, dict):
+                    continue
+                for version, prefix in (("candidate", "候補"), ("deployed", "配備中の版")):
+                    metrics = entry.get(version)
+                    if isinstance(metrics, dict):
+                        lines += cls._metrics_lines(
+                            f"{stage} {display_text(pair)} {prefix}", metrics)
+        return lines
+
     _APPROVAL_LIST_DEFAULT = 20
     _APPROVAL_LIST_MAX = 200
 
@@ -831,6 +866,7 @@ class Commands:
         ]
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
+        lines += self._baseline_comparison_lines(payload.get("baseline"))
         lines += approval_facts.render_facts_lines(payload)
         # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の
         # 読み出し導線。`approval_requests.reason` は backlog の

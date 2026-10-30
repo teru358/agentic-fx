@@ -66,6 +66,7 @@ DEDICATED = {
     ("observation", "risk_gate_unsupported"),
     ("observation", "duplicate_logic"), ("observation", "duplicate_metrics"),
     ("observation", "family_redirect"), ("gate_failed", "unprofitable"),
+    ("gate_failed", "not_improved"), ("gate_failed", "same_name_contract_changed"),
     ("report", None), ("report", "duplicate_skipped"),
 }
 

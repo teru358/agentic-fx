@@ -325,6 +325,21 @@ def _approval_of(notice, row) -> dict | None:
             "kind": display_text(kind) if isinstance(kind, str) and kind.strip() else None}
 
 
+def _comparison_of(notice, row) -> dict | None:
+    if notice is None or row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError, RecursionError):
+        return None
+    baseline = payload.get("baseline") if isinstance(payload, dict) else None
+    comparison = baseline.get("comparison") if isinstance(baseline, dict) else None
+    if not isinstance(comparison, dict):
+        return None
+    return {"base_content_hash": baseline.get("base_content_hash"),
+            "comparison": comparison}
+
+
 def _approval_plugin_kind(conn: sqlite3.Connection, approval_id: int) -> str | None:
     """承認 payload の表示可能な plugin 種別だけを event へ写す。"""
     row = conn.execute("SELECT payload_json FROM approval_requests WHERE id=?",
@@ -769,6 +784,7 @@ class OpsService:
                 "agent_claims": payload.get("agent_claims"),
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
+                "baseline": payload.get("baseline"),
                 "payload_sha256": payload_sha256(row["payload_json"]),
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
@@ -868,6 +884,7 @@ class OpsService:
                 "snapshot": snapshot,
                 "report_state": report_state,
                 "approval": _approval_of(notice, approval),
+                "comparison": _comparison_of(notice, approval),
                 "floor": floor}
 
     def _floor_of(self, mission_id: int, report_state: str,

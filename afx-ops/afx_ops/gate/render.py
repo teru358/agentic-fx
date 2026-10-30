@@ -410,6 +410,8 @@ IMPROVE_HEADINGS = {
     ("observation", "duplicate_metrics"): "[改善] 見送り (既存候補と同じ成績) #{id}",
     ("observation", "family_redirect"): "[改善] 見送り (既存系統への誘導) #{id}",
     ("gate_failed", "unprofitable"): "[改善] 床未達で見送り #{id} (unprofitable)",
+    ("gate_failed", "not_improved"): "[改善] 配備中の版を上回らず見送り #{id}",
+    ("gate_failed", "same_name_contract_changed"): "[改善] 見送り #{id} (同名更新の条件変更)",
     ("report", None): "[改善] レポートを公開 #{id}",
     ("report", "duplicate_skipped"): "[改善] レポートを公開 #{id} (duplicate_skipped)",
 }
