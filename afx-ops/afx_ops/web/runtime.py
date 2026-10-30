@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import sys
 import threading
 from asyncio import selector_events
@@ -35,6 +34,7 @@ from afx_ops.web.request import (
     MAX_HEADER_BYTES,
     MAX_REQUEST_LINE,
     HostPolicy,
+    _fixed_word,
     handle_request,
     wire_authorization_values,
 )
@@ -132,8 +132,9 @@ class _Slot:
             self.deadline.cancel()
             self.deadline = None
         transport = self.transport
-        # すでに閉じ始めた transport を abort すると、閉じ終わりの通知が二度予約される
-        if transport is not None and not transport.is_closing():
+        # 閉じ終わった transport は connection_lost が枠から外している。残っていれば、
+        # 閉じ始めていても (buffer の送出待ちでも) 強制的に切る
+        if transport is not None:
             transport.abort()
 
 
@@ -335,7 +336,8 @@ class _Service:
         try:
             return handle_request(raw, self._client, host_policy=self._host_policy,
                                   authenticator=self._authenticator, peer=peer,
-                                  authorization=authorization)
+                                  authorization=authorization,
+                                  report_upstream=lambda: not call.abandoned)
         finally:
             with self._calls_lock:
                 call.ident = None
@@ -413,8 +415,6 @@ def _closed_reply() -> tuple[int, dict[str, str], bytes]:
     return 502, response_headers(length=len(body)), body
 
 
-_FIXED_WORD = re.compile(r"[a-z_]{1,40}")
-
 # asyncio が loop の exception handler に渡す message の定型句 (小文字 + `_` に正規化した形)
 _LOOP_MESSAGES = frozenset({
     "exception_in_callback",
@@ -451,7 +451,7 @@ def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
     line = f"afx-ops: web_loop_error {name}"
     if isinstance(exc, AttributeError):
         attr = getattr(exc, "name", None)
-        if isinstance(attr, str) and _FIXED_WORD.fullmatch(attr):
+        if _fixed_word(attr, None) is not None:
             line += f" name={attr}"
     message = context.get("message")
     if isinstance(message, str):

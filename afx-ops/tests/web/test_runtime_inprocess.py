@@ -334,23 +334,41 @@ def test_repeated_large_replies_keep_the_slots_and_the_next_request_answers(
     assert "web_loop_error" not in capsys.readouterr().err
 
 
-def test_a_slot_does_not_abort_a_transport_that_is_already_closing():
-    class Transport:
-        def __init__(self, closing: bool) -> None:
-            self.closing = closing
-            self.aborted = 0
+class _AbortCounter:
+    def __init__(self, closing: bool) -> None:
+        self.closing = closing
+        self.aborted = 0
 
-        def is_closing(self) -> bool:
-            return self.closing
+    def is_closing(self) -> bool:
+        return self.closing
 
-        def abort(self) -> None:
-            self.aborted += 1
+    def abort(self) -> None:
+        self.aborted += 1
 
-    for closing, aborted in ((True, 0), (False, 1)):
-        slot = runtime._Slot(lambda _slot: None, "peer")
-        slot.transport = Transport(closing)
-        slot.close()
-        assert slot.transport.aborted == aborted
+
+def test_a_slot_whose_connection_was_lost_does_not_abort_anything():
+    slot = runtime._Slot(lambda _slot: None, "peer")
+    transport = _AbortCounter(True)
+    slot.transport = transport
+    slot.transport = None  # connection_lost が外した後
+    slot.close()
+    assert transport.aborted == 0
+
+
+def test_service_close_aborts_a_closing_transport_that_has_not_reached_connection_lost():
+    async def main() -> list[int]:
+        loop = asyncio.get_running_loop()
+        service = runtime._Service(runtime._aiohttp_parts(), loop, object(), None, None)
+        counters = []
+        for closing in (True, False):
+            slot = runtime._Slot(lambda _slot: None, "peer")
+            slot.transport = _AbortCounter(closing)
+            counters.append(slot.transport)
+            service.slots.add(slot)
+        service.close()
+        return [c.aborted for c in counters]
+
+    assert asyncio.run(main()) == [1, 1]
 
 
 def test_a_finished_connection_leaves_no_transport_in_its_slot():
@@ -368,3 +386,55 @@ def test_a_finished_connection_leaves_no_transport_in_its_slot():
 
     asyncio.run(main())
     assert seen == [None]
+
+
+class _FailingClient:
+    """`wait_for_interrupt` なら接続が切られて interrupt されるまで待ってから ApiError を投げる。"""
+
+    def __init__(self, wait_for_interrupt: bool) -> None:
+        self.wait_for_interrupt = wait_for_interrupt
+        self.entered = threading.Event()
+        self.interrupted = threading.Event()
+
+    def status(self):
+        from afx_ops.api_client import ApiError
+        self.entered.set()
+        if self.wait_for_interrupt:
+            assert self.interrupted.wait(10)
+        raise ApiError("timeout")
+
+    def interrupt_thread(self, ident: int) -> None:
+        self.interrupted.set()
+
+    def release_thread(self, ident: int) -> None:
+        pass
+
+
+def test_a_call_cancelled_by_a_closed_connection_reports_no_upstream_line(capsys):
+    client = _FailingClient(wait_for_interrupt=True)
+    port, thread, outcome = start(client, stop_after=1)
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        sock.sendall(GET)
+        assert client.entered.wait(10)
+        sock.close()
+        thread.join(15)
+        assert outcome == ["done"]
+    finally:
+        client.interrupted.set()
+        thread.join(5)
+    assert client.interrupted.is_set()
+    assert "web_upstream" not in capsys.readouterr().err
+
+
+def test_a_failed_call_on_a_live_connection_reports_one_upstream_line(capsys):
+    client = _FailingClient(wait_for_interrupt=False)
+    port, thread, outcome = start(client, stop_after=1)
+    try:
+        assert exchange(port, GET).startswith(b"HTTP/1.1 502")
+        thread.join(15)
+        assert outcome == ["done"]
+    finally:
+        thread.join(5)
+    lines = [line for line in capsys.readouterr().err.splitlines() if "web_upstream" in line]
+    assert lines == ["afx-ops: web_upstream reason=timeout route=status"]

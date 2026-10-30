@@ -196,7 +196,7 @@ def test_an_api_error_reason_is_reported_as_a_fixed_word(capsys):
     status, err = _upstream_lines(_RaisingClient(ApiError("socket_missing")), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream reason=socket_missing\n"
+    assert err == "afx-ops: web_upstream reason=socket_missing route=status\n"
 
 
 def test_an_api_error_reason_outside_the_fixed_shape_is_other(capsys):
@@ -205,32 +205,52 @@ def test_an_api_error_reason_outside_the_fixed_shape_is_other(capsys):
     status, err = _upstream_lines(_RaisingClient(ApiError("/home/u/secret.sock Bad")), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream reason=other\n"
+    assert err == "afx-ops: web_upstream reason=other route=status\n"
 
 
 def test_other_exceptions_report_only_the_type_name(capsys):
     status, err = _upstream_lines(_RaisingClient(OSError("/run/user/1000/afx/secret.sock")), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream error=OSError\n"
+    assert err == "afx-ops: web_upstream error=OSError route=status\n"
 
 
 def test_a_non_200_reply_reports_the_status_and_a_fixed_code(capsys):
     status, err = _upstream_lines(_ReplyClient(Reply(401, None, "unauthorized")), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream status=401 code=unauthorized\n"
+    assert err == "afx-ops: web_upstream status=401 code=unauthorized route=status\n"
 
 
 def test_a_non_200_reply_code_outside_the_fixed_shape_is_left_out(capsys):
     status, err = _upstream_lines(_ReplyClient(Reply(500, None, "Bad /path?x=1")), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream status=500\n"
+    assert err == "afx-ops: web_upstream status=500 route=status\n"
 
 
 def test_a_reply_of_the_wrong_shape_reports_one_fixed_line(capsys):
     status, err = _upstream_lines(_ReplyClient(Reply(200, {"mode": 5}, None)), capsys)
 
     assert status == 502
-    assert err == "afx-ops: web_upstream shape=invalid\n"
+    assert err == "afx-ops: web_upstream shape=invalid route=status\n"
+
+
+def test_an_abandoned_call_reports_nothing_and_a_live_one_reports_one_line(capsys):
+    from afx_ops.api_client import ApiError
+
+    for live, expected in ((False, ""), (True, "afx-ops: web_upstream reason=timeout route=status\n")):
+        response = handle_request(Request("GET", "/", {}), _RaisingClient(ApiError("timeout")),
+                                  report_upstream=lambda live=live: live)
+        assert response.status == 502
+        assert capsys.readouterr().err == expected
+
+
+def test_the_route_of_each_upstream_line_is_the_matched_client_method(capsys):
+    class Client:
+        def log(self, n):
+            raise OSError("x")
+
+    response = handle_request(Request("GET", "/logs", {}), Client())
+    assert response.status == 502
+    assert capsys.readouterr().err == "afx-ops: web_upstream error=OSError route=log\n"

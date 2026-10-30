@@ -4,6 +4,7 @@ from __future__ import annotations
 import functools
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
@@ -220,15 +221,15 @@ def _check_reply_shape(route: str, data: dict) -> None:
         raise _Upstream
 
 
-def _call(function, *args, **kwargs):
+def _call(report, function, *args, **kwargs):
     """daemon への呼出し。transport 例外・timeout は `_Upstream` (502) にする。"""
     try:
         return function(*args, **kwargs)
     except ApiError as error:
-        _report_upstream(f"reason={_fixed_word(error.reason, 'other')}")
+        report(f"reason={_fixed_word(error.reason, 'other')}")
         raise _Upstream from None
     except Exception as error:  # noqa: BLE001 — 原因の文は外へ出さない
-        _report_upstream(f"error={type(error).__name__}")
+        report(f"error={type(error).__name__}")
         raise _Upstream from None
 
 
@@ -241,38 +242,49 @@ def _fixed_word(value: object, fallback: str | None) -> str | None:
     return fallback
 
 
-def _report_upstream(detail: str) -> None:
-    """502 にした理由を、固定語と整数だけで stderr に残す (例外文・要求由来の値は出さない)。"""
-    print(f"afx-ops: web_upstream {detail}", file=sys.stderr, flush=True)
+class _Reporter:
+    """502 にした理由を、固定語と整数だけで stderr に残す (例外文・要求由来の値は出さない)。
+
+    `enabled` は出力の直前に評価する。None なら常に出す。
+    """
+
+    def __init__(self, route: str, enabled: Callable[[], bool] | None) -> None:
+        self._route = _fixed_word(route, "other")
+        self._enabled = enabled
+
+    def __call__(self, detail: str) -> None:
+        if self._enabled is not None and not self._enabled():
+            return
+        print(f"afx-ops: web_upstream {detail} route={self._route}", file=sys.stderr, flush=True)
 
 
-def _report_bad_reply(reply: object) -> None:
+def _report_bad_reply(reply: object, report: _Reporter) -> None:
     status = getattr(reply, "status", None)
     detail = f"status={status}" if type(status) is int else "status=none"
     code = _fixed_word(getattr(reply, "code", None), None)
     if code is not None:
         detail += f" code={code}"
-    _report_upstream(detail)
+    report(detail)
 
 
-def _invoke(match: RouteMatch, query: dict[str, str], client):
+def _invoke(match: RouteMatch, query: dict[str, str], client, report: _Reporter):
     method = match.route.client_method
     if method == "status":
         if query:
             raise _Reject(400)
-        return _call(client.status), render.render_status
+        return _call(report, client.status), render.render_status
     if method == "approvals":
         limit = _positive(query, "limit", maximum=200, default=20)
-        return _call(client.approvals, limit=limit), render.render_approvals
+        return _call(report, client.approvals, limit=limit), render.render_approvals
     if method == "approval":
         if query:
             raise _Reject(400)
-        reply = _call(client.approval, match.values["id"])
+        reply = _call(report, client.approval, match.values["id"])
         change_data = _change_of(client, match.values["id"], reply)
         return reply, functools.partial(render.render_approval, change_data=change_data)
     if method == "log":
         n = _positive(query, "n", maximum=500, default=100)
-        return _call(client.log, n=n), render.render_log
+        return _call(report, client.log, n=n), render.render_log
     if method == "activity":
         if set(query) - {"n", "category"}:
             raise _Reject(400)
@@ -280,7 +292,7 @@ def _invoke(match: RouteMatch, query: dict[str, str], client):
         category = query.get("category")
         if category is not None and category not in _ACTIVITY_CATEGORIES:
             raise _Reject(400)
-        return _call(client.activity, n=n, category=category), render.render_activity
+        return _call(report, client.activity, n=n, category=category), render.render_activity
     raise _Reject(404)
 
 
@@ -345,7 +357,8 @@ def handle_request(request: Request | bytes, client, *,
                    host_policy: HostPolicy | None = None,
                    authenticator: auth.BasicAuthenticator | None = None,
                    peer: str | None = None,
-                   authorization: list[str] | None = None) -> Response:
+                   authorization: list[str] | None = None,
+                   report_upstream: Callable[[], bool] | None = None) -> Response:
     """入力から response を作る唯一の adapter。client は read-only fake でもよい。
 
     拒否の順は 有界 parse → Host → 認証 → route → daemon。daemon との通信の失敗と期待
@@ -355,6 +368,7 @@ def handle_request(request: Request | bytes, client, *,
     `authenticator` を渡すと Basic 認証を要求する (`peer` は accepted socket の IPv4)。
     `authorization` は OWS の正規化前の field-value で、transport が wire から取った値を渡す。
     省略すると bytes 入力はその header block から、組み立て済みの Request は header から取る。
+    `report_upstream` は 502 の理由行を出す直前に呼ぶ。False を返すと行を出さない (省略は常に出す)。
     """
     head = _is_head(request)
     try:
@@ -387,14 +401,15 @@ def handle_request(request: Request | bytes, client, *,
             return _error(405, head=head, extra={"Allow": "GET, HEAD"})
         if request.body:
             raise _Reject(400)
-        reply, renderer = _invoke(match, request.query, client)
+        report = _Reporter(match.route.client_method, report_upstream)
+        reply, renderer = _invoke(match, request.query, client, report)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
-            _report_bad_reply(reply)
+            _report_bad_reply(reply, report)
             return _error(502, head=head)
         try:
             _check_reply_shape(match.route.client_method, reply.data)
         except _Upstream:
-            _report_upstream("shape=invalid")
+            report("shape=invalid")
             raise
         body = renderer(reply.data)
         return _response(200, body, head=head)
