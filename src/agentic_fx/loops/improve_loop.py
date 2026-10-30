@@ -3385,7 +3385,6 @@ class ImproveLoop:
         if conn is None:
             conn = self._db_write_conn_factory()
             owns_conn = True
-        commit_raised = False
         # 比較の activity は終端 tx の commit 後にだけ出す (途中で失敗して
         # rollback した mission に行を残さない)
         deferred_compare_activity: str | None = None
@@ -3833,19 +3832,23 @@ class ImproveLoop:
                     tool_calls=tool_calls,
                     choice=_plain_outcome_choice(report_path, artifact))
         except BaseException:
-            commit_raised = True
             if ctx.ledger.state() == "FROZEN":
                 ctx.ledger.mark_persist_failed()
             raise
         finally:
-            if (deferred_compare_activity is not None and not commit_raised
-                    and self._activity is not None
-                    and self._mission_completed(conn, ctx.mission_id)):
-                self._activity.write(
-                    Category.IMPROVE, "baseline_compare",
-                    deferred_compare_activity)
-            if owns_conn:
-                conn.close()
+            try:
+                if (deferred_compare_activity is not None
+                        and self._activity is not None
+                        and self._mission_completed(conn, ctx.mission_id)):
+                    self._activity.write(
+                        Category.IMPROVE, "baseline_compare",
+                        deferred_compare_activity)
+            except Exception:  # noqa: BLE001 — 通知の失敗で接続を残さない
+                _log.warning("baseline_compare activity write failed",
+                             exc_info=True)
+            finally:
+                if owns_conn:
+                    conn.close()
 
     @staticmethod
     def _mission_completed(conn, mission_id) -> bool:

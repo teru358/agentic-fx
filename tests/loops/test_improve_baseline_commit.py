@@ -357,6 +357,98 @@ def test_quality_demotion_keeps_baseline_rows_with_observation_outcome(
     assert sum(1 for r in rows if r[0] == "candidate") == 2
 
 
+def _compare_lines(root):
+    return [ln for ln in _activity(root).splitlines()
+            if "\tbaseline_compare\t" in ln]
+
+
+@pytest.mark.parametrize("kind,mode,result,detail,outcome", [
+    ("not_improved", "shadow", "not_improved", "holdout_not_exceeds",
+     "approval"),
+    ("improved", "shadow", "improved", None, "approval"),
+    ("improved", "enforce", "improved", None, "approval"),
+    ("unavailable_unhealthy", "shadow", "unavailable", "baseline_unhealthy",
+     "approval"),
+    ("unavailable_unhealthy", "enforce", "unavailable", "baseline_unhealthy",
+     "approval"),
+    ("unavailable_not_evaluable", "shadow", "unavailable",
+     "baseline_not_evaluable", "approval"),
+    ("not_improved", "enforce", "not_improved", "holdout_not_exceeds",
+     "not_improved")])
+def test_baseline_compare_line_is_emitted_on_every_terminal_path(
+        improve_env, kind, mode, result, detail, outcome):
+    app, root = improve_env
+    gate, loop, ctx = _drive(app, root, kind, mode)
+    (line,) = _compare_lines(root)
+    assert f"mission={ctx.mission_id} " in line
+    assert f"mode={mode} " in line
+    assert f"result={result} " in line
+    assert " detail=" in line
+    if detail is not None:
+        assert f"detail={detail} " in line
+    assert {r[2] for r in _variants(app.conn_core, ctx.mission_id)} \
+        == {outcome}
+
+
+def test_baseline_compare_line_is_emitted_on_quality_demotion(improve_env):
+    app, root = improve_env
+    _drive(app, root, "improved", "shadow", name="conv_a",
+           files=_files("conv_a", PY_X))
+    gate, loop, ctx = _drive(app, root, "improved", "shadow", name="conv_b",
+                             files=_files("conv_b", PY_Y))
+    mid = ctx.mission_id
+    assert {r[2] for r in _variants(app.conn_core, mid)} == {"observation"}
+    mine = [ln for ln in _compare_lines(root) if f"mission={mid} " in ln]
+    assert len(mine) == 1
+    assert "mode=shadow " in mine[0] and "result=improved " in mine[0]
+
+
+def test_baseline_compare_line_survives_a_post_commit_publish_failure(
+        improve_env):
+    app, root = improve_env
+    conn = app.conn_core
+    with patch.object(ImproveLoop, "_publish_report",
+                      side_effect=OSError("injected")):
+        with pytest.raises(OSError):
+            _drive(app, root, "not_improved", "enforce")
+    mid = conn.execute("SELECT id FROM missions ORDER BY id DESC LIMIT 1"
+                       ).fetchone()[0]
+    assert conn.execute("SELECT status FROM missions WHERE id=?",
+                        (mid,)).fetchone()[0] == "completed"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM backtest_runs WHERE mission_id=? AND "
+        "variant='baseline'", (mid,)).fetchone()[0] == 2
+    assert len([ln for ln in _compare_lines(root)
+                if f"mission={mid} " in ln]) == 1
+
+
+def test_activity_write_failure_does_not_leak_the_connection(improve_env):
+    app, root = improve_env
+    from agentic_fx.store.db import connect
+    opened = []
+
+    def tracking_connect(*a, **kw):
+        c = connect(*a, **kw)
+        opened.append(c)
+        return c
+
+    real_write = app.activity.write
+
+    def boom(category, event, *a, **kw):
+        if event == "baseline_compare":
+            raise RuntimeError("activity down")
+        return real_write(category, event, *a, **kw)
+
+    with patch("tests.loops.test_improve_candidate_ledger.connect",
+               tracking_connect), \
+            patch.object(app.activity, "write", boom):
+        gate, loop, ctx = _drive(app, root, "improved", "shadow")
+    assert opened
+    for c in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            c.execute("SELECT 1")
+
+
 def test_baseline_rows_roll_back_with_the_terminal_tx(improve_env):
     app, root = improve_env
     conn = app.conn_core
@@ -638,18 +730,29 @@ def _raw_activity(root) -> list[str]:
     return [ln.split("\t", 1)[1] for ln in lines]
 
 
+def _columns_but_id_and_created_at(conn, table):
+    return ", ".join(
+        r[1] for r in conn.execute(f"PRAGMA table_info({table})")
+        if r[1] not in ("id", "created_at"))
+
+
 def _fingerprint(app, root, ctx):
     conn = app.conn_core
     mid = ctx.mission_id
     reports_dir = root / "data" / "improve_reports"
     reports = sorted(p.read_bytes() for p in reports_dir.glob("improve-*.md")
                      ) if reports_dir.exists() else []
-    rows = [(r["variant"], r["scope"], r["mission_outcome"], r["metrics_json"])
-            for r in _backtest_rows(conn, mid)]
+    tables = {
+        table: [tuple(str(v).replace(str(root), "<root>") for v in row)
+                for row in conn.execute(
+                    f"SELECT {_columns_but_id_and_created_at(conn, table)} "
+                    f"FROM {table} ORDER BY id")]
+        for table in ("backtest_runs", "missions", "improvement_runs",
+                      "candidate_archives")}
     payloads = [r[0] for r in conn.execute(
         "SELECT payload_json FROM approval_requests ORDER BY id")]
     return {
-        "rows": rows, "payload": payloads, "last": _last_result(conn),
+        "tables": tables, "payload": payloads, "last": _last_result(conn),
         "notice": _notice(conn, mid), "reports": reports,
         "activity": _raw_activity(root)}
 
@@ -693,27 +796,32 @@ def test_outputs_are_byte_identical_across_modes(
 
 def _canary(i, pf, avg_r):
     return {"trades": 600000 + i * 1111, "pf": pf,
-            "win_rate": 0.5 + i * 0.0001237, "avg_r": avg_r,
-            "max_drawdown": 0.1 + i * 0.0002711,
-            "total_pnl": 1000.0 + i * 7.3131,
+            "win_rate": round(0.5113 + i * 0.0371, 4), "avg_r": avg_r,
+            "max_drawdown": round(0.0917 + i * 0.0233, 4),
+            "total_pnl": round(1000.0 + i * 7.3131, 4),
             "kill_switch_latches": 0, "evaluable": True}
 
 
 CANARY_METRICS = {
-    "cand_in": _canary(1, 1.5000123, 0.2000456),
-    "cand_ho": _canary(2, 1.4000789, 0.1500321),
-    "dep_in": _canary(3, 1.2000654, 0.1000987),
-    "dep_ho_worse": _canary(4, 1.1000246, 0.0500135),
-    "dep_ho_better": _canary(5, 2.5000864, 0.4000579)}
+    "cand_in": _canary(1, 3.1716, 0.6137),
+    "cand_ho": _canary(2, 2.9473, 0.5281),
+    "dep_in": _canary(3, 2.1839, 0.4062),
+    "dep_ho_worse": _canary(4, 1.7264, 0.3195),
+    "dep_ho_better": _canary(5, 5.2381, 0.8473)}
 
 
 def _canary_strings() -> set[str]:
+    """値の文字列表現に加え、2 桁・3 桁に丸めた表記も探す。"""
     out = set()
     for metrics in CANARY_METRICS.values():
         for key in ("trades", "pf", "win_rate", "avg_r", "max_drawdown",
                     "total_pnl"):
-            out.add(str(metrics[key]))
-    assert len(out) == 6 * len(CANARY_METRICS)
+            value = metrics[key]
+            out.add(str(value))
+            if isinstance(value, float):
+                out.add(f"{value:.2f}")
+                out.add(f"{value:.3f}")
+    assert len(out) > 70
     return out
 
 
