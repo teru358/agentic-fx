@@ -165,7 +165,7 @@ def test_a_submission_that_did_not_improve_carries_no_numbers(ops_env, verdict, 
     mission = _submitted(ops_env, {"base_content_hash": "b" * 64,
                                    "comparison": _comparison(verdict, mode, "x")})
     data = _run(ops_env, mission)
-    assert data["comparison"] is None
+    assert "comparison" not in data
     text = json.dumps(data)
     for hidden in ("1.31", "1.17", "1.91", "0.0731"):
         assert hidden not in text
@@ -179,12 +179,12 @@ def test_a_submission_that_did_not_improve_carries_no_numbers(ops_env, verdict, 
                                                     "stages": {"holdout": {"P": 1}}}}])
 def test_a_legacy_or_malformed_payload_gives_no_comparison_and_does_not_fail(ops_env, baseline):
     data = _run(ops_env, _submitted(ops_env, baseline))
-    assert data["comparison"] is None and data["approval"] is not None
+    assert "comparison" not in data and data["approval"] is not None
 
 
 def test_a_not_improved_rejection_carries_no_comparison(ops_env):
     mission = seed(ops_env, notice=codes.NOTICE_NOT_IMPROVED)
-    assert _run(ops_env, mission)["comparison"] is None
+    assert "comparison" not in _run(ops_env, mission)
 
 
 def _detail(env, baseline, **payload):
@@ -236,3 +236,34 @@ def test_a_legacy_payload_shows_no_table_on_the_service_and_the_cli(ops_env, bas
 def test_the_cli_formatter_accepts_a_detail_from_an_older_daemon():
     shown = client.format_approval_detail({"id": 1, "kind": "plugin", "status": "pending"})
     assert "配備中の版" not in shown
+
+
+def test_a_mission_without_a_comparison_serializes_exactly_as_before(ops_env):
+    """The key is present only when there is a value; adding it unconditionally must fail."""
+    mission = seed(ops_env, notice=codes.NOTICE_NOT_IMPROVED)
+    data = _run(ops_env, mission)
+    assert json.dumps(data, sort_keys=True) == json.dumps({
+        "id": mission, "backend": "local", "model": "qwen", "elapsed_sec": 261,
+        "snapshot": {"trigger": "scheduled", "result_code": "gate_failed",
+                     "reason_code": "not_improved", "tool_calls": 10,
+                     "observation_text": None},
+        "report_state": "none", "approval": None, "floor": None}, sort_keys=True)
+    improved = _submitted(ops_env, {"base_content_hash": "b" * 64, "comparison": _comparison()})
+    assert "comparison" in _run(ops_env, improved)
+
+
+_EIGHT = ("pf", "trades", "win_rate", "avg_r", "max_drawdown", "total_pnl",
+          "kill_switch_latches", "evaluable")
+
+
+def test_the_cli_table_shows_eight_metrics_and_each_pair_verdict(ops_env):
+    shown = client.format_approval_detail(_detail(
+        ops_env, {"base_content_hash": "b" * 64, "comparison": _comparison()}))
+    for stage in ("in_sample", "holdout"):
+        assert f"{stage} USDJPY 判定=improved" in shown
+        for side in ("候補", "配備中の版"):
+            (line,) = [ln for ln in shown.split("\n")
+                       if ln.startswith(f"{stage} USDJPY {side}:")]
+            for key in _EIGHT:
+                assert f" {key}=" in " " + line.split(": ", 1)[1]
+    assert "win_rate=0.51" in shown and "total_pnl=123.5" in shown and "evaluable=True" in shown

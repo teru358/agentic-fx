@@ -686,3 +686,18 @@ def test_the_comparison_rejections_have_one_fixed_body_line_without_numbers(reas
     text = finish("gate_failed", reason, comparison=comparison)
     assert text.split("\n")[1].strip() == line
     assert "9.9" not in text and "999" not in text
+
+
+def test_the_not_improved_notice_is_exactly_heading_fixed_line_and_footer():
+    text = finish("gate_failed", "not_improved", mission_id=9)
+    lines = text.split("\n")
+    assert lines[0] == "[改善] 配備中の版を上回らず見送り #9"
+    assert lines[1] == "配備中の版を上回らなかったため見送ります"
+    assert len(lines) == 3
+
+
+def test_the_same_name_notice_is_exactly_heading_fixed_line_and_footer():
+    lines = finish("gate_failed", "same_name_contract_changed", mission_id=9).split("\n")
+    assert lines[0] == "[改善] 見送り #9 (同名更新の条件変更)"
+    assert lines[1] == "意味が変わる変更は新しい名前で提出する"
+    assert len(lines) == 3

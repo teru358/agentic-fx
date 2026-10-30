@@ -42,7 +42,7 @@ def test_improved_comparison_shows_both_versions_eight_metrics_verdict_and_hash(
     assert "判定: 改善" in page
     assert "base_content_hash: " + "b" * 12 in page and "b" * 13 not in page
     for column in ("pf", "trades", "win_rate", "avg_r", "max_drawdown", "total_pnl",
-                   "kill_switch_latches", "evaluable"):
+                   "kill_switch_latches", "evaluable", "verdict"):
         assert f"<th>{column}</th>" in page
     assert page.count("<td>候補</td>") == 2 and page.count("<td>配備中の版</td>") == 2
     assert "<td>1.31</td>" in page and "<td>1.17</td>" in page
@@ -98,3 +98,9 @@ def test_a_payload_without_a_usable_comparison_renders_no_table_and_does_not_fai
 
 def test_the_page_stays_static_without_script():
     assert "<script" not in _page(_data()).lower()
+
+
+def test_each_row_carries_its_pair_verdict():
+    page = _page(_data(baseline={"base_content_hash": BASE,
+                                 "comparison": _comparison("improved")}))
+    assert page.count("<td>improved</td></tr>") == 4

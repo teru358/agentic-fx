@@ -712,6 +712,25 @@ class Commands:
         return [cls._metrics_line(f"{prefix} {display_text(pair)}", metrics)
                 for pair, metrics in value.items()]
 
+    _COMPARISON_KEYS = ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
+                        "total_pnl", "kill_switch_latches", "evaluable")
+
+    @classmethod
+    def _comparison_metrics_line(cls, prefix: str, metrics: dict) -> str:
+        """比較表の 1 行。8 指標を固定の順で出し、値が無ければ `-`、数値でなければ不正形式。"""
+        cells = []
+        for key in cls._COMPARISON_KEYS:
+            v = metrics.get(key)
+            if v is None:
+                cells.append(f"{key}=-")
+            elif type(v) is bool:
+                cells.append(f"{key}={'True' if v else 'False'}")
+            elif type(v) is int or (type(v) is float and math.isfinite(v)):
+                cells.append(f"{key}={approval_facts.num_text(v)}")
+            else:
+                return f"{display_text(prefix)}: {approval_facts.INVALID_FORMAT_TEXT}"
+        return f"{display_text(prefix)}: " + " ".join(cells)
+
     @classmethod
     def _baseline_comparison_lines(cls, baseline, hash_warning=None) -> list[str]:
         """承認 payload に保存された比較 snapshot のみを表示する。"""
@@ -745,11 +764,13 @@ class Commands:
             for pair, entry in pairs.items():
                 if not isinstance(entry, dict):
                     continue
+                lines.append(f"{stage} {display_text(pair)} 判定="
+                             f"{display_text(entry.get('verdict'))}")
                 for version, prefix in (("candidate", "候補"), ("deployed", "配備中の版")):
                     metrics = entry.get(version)
                     if isinstance(metrics, dict):
-                        lines += cls._metrics_lines(
-                            f"{stage} {display_text(pair)} {prefix}", metrics)
+                        lines.append(cls._comparison_metrics_line(
+                            f"{stage} {display_text(pair)} {prefix}", metrics))
         return lines
 
     _APPROVAL_LIST_DEFAULT = 20

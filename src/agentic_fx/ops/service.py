@@ -916,15 +916,18 @@ class OpsService:
                 "trigger": notice["trigger"], "result_code": notice["result_code"],
                 "reason_code": notice["reason_code"], "tool_calls": notice["tool_calls"],
                 "observation_text": _notice_text(notice["observation_text"])}
-        return {"id": mission_id,
+        data = {"id": mission_id,
                 "backend": display_text(mission["runner"]),
                 "model": display_text(mission["model"]),
                 "elapsed_sec": _elapsed_sec(mission["started_at"], notice),
                 "snapshot": snapshot,
                 "report_state": report_state,
                 "approval": _approval_of(notice, approval),
-                "comparison": _comparison_of(notice, approval),
                 "floor": floor}
+        comparison = _comparison_of(notice, approval)
+        if comparison is not None:
+            data["comparison"] = comparison
+        return data
 
     def _floor_of(self, mission_id: int, report_state: str,
                   report_path: object) -> dict | None:

@@ -769,3 +769,16 @@ def test_the_shell_warns_only_when_the_deployed_hash_differs_from_the_comparison
     assert "警告: 配備中の版の hash が比較時と異なります" in results["stale"]
     assert "現在=" + live[:12] in results["stale"]
     assert "警告" not in results["fresh"]
+
+
+def test_the_shell_table_shows_eight_metrics_and_each_pair_verdict(tmp_path):
+    shown = _show(tmp_path, _new_payload(baseline={
+        "base_content_hash": "b" * 64, "comparison": _comparison()}))
+    for stage in ("in_sample", "holdout"):
+        assert f"{stage} USDJPY 判定=improved" in shown
+        for side in ("候補", "配備中の版"):
+            (line,) = [ln for ln in shown.split("\n")
+                       if ln.startswith(f"{stage} USDJPY {side}:")]
+            for key in ("pf", "trades", "win_rate", "avg_r", "max_drawdown", "total_pnl",
+                        "kill_switch_latches", "evaluable"):
+                assert f" {key}=" in line

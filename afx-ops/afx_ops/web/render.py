@@ -205,7 +205,7 @@ def _baseline_section(data: Mapping[str, object]) -> str:
                     "<th>pair</th><th>version</th><th>pf</th><th>trades</th>"
                     "<th>win_rate</th><th>avg_r</th><th>max_drawdown</th>"
                     "<th>total_pnl</th><th>kill_switch_latches</th><th>evaluable</th>"
-                    "</tr></thead><tbody>")
+                    "<th>verdict</th></tr></thead><tbody>")
         for pair, entry in list(pairs.items())[:MAX_ITEMS]:
             if type(entry) is not dict:
                 continue
@@ -216,7 +216,8 @@ def _baseline_section(data: Mapping[str, object]) -> str:
                 cells = "".join("<td>" + _text(metrics.get(key)) + "</td>" for key in
                                 ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
                                  "total_pnl", "kill_switch_latches", "evaluable"))
-                rows.append("<tr><td>" + _text(pair) + "</td><td>" + label_ + "</td>" + cells + "</tr>")
+                rows.append("<tr><td>" + _text(pair) + "</td><td>" + label_ + "</td>" + cells
+                            + "<td>" + _text(entry.get("verdict")) + "</td></tr>")
         rows.append("</tbody></table>")
     return "<section><h2>配備中の版 (同条件で再評価)</h2>" + "".join(rows) + "</section>"
 
