@@ -497,18 +497,17 @@ def build_inventory_view(result: "InventoryBuildResult", *, settings=None, conn=
     }
     if settings is not None:
         watches = list(settings.datafeed.watch_symbols)
-        available: set[str] = set()
         dataset = settings.backtest.dataset()
+        covered = 0
         if conn is not None and not dataset.unconfigured and watches:
             placeholders = ",".join("?" for _ in watches)
-            rows = conn.execute(
-                "SELECT DISTINCT symbol FROM ohlcv_history WHERE source=? AND interval=? "
+            covered = conn.execute(
+                "SELECT COUNT(DISTINCT symbol) FROM ohlcv_history "
+                "WHERE source=? AND interval=? "
                 f"AND symbol IN ({placeholders})",
-                (dataset.source, dataset.base_interval, *watches)).fetchall()
-            available = {row[0] for row in rows}
-        view["watch_symbols"] = [
-            {"symbol": symbol, "history_available": symbol in available}
-            for symbol in watches]
+                (dataset.source, dataset.base_interval, *watches)).fetchone()[0]
+        view["watch_symbols"] = watches
+        view["history_available"] = bool(watches) and covered == len(set(watches))
     return view
 
 
@@ -1542,14 +1541,14 @@ class ImproveLoop:
                                  "discovery. Continue without backtest "
                                  "results."),
                     }
-                from agentic_fx.backtest.dataset import missing_reference_history
+                from agentic_fx.backtest.dataset import (
+                    literal_reference_coordinates, missing_reference_history,
+                    reference_history_missing_error,
+                )
                 missing = missing_reference_history(
-                    conn, dataset,
-                    ((item.literal_symbol, item.timeframe) for item in resolved.items
-                     if item.symbol_mode == "literal" and item.literal_symbol is not None))
+                    conn, dataset, literal_reference_coordinates(resolved))
                 if missing is not None:
-                    symbol, timeframe, reason = missing
-                    error = f"reference_history_missing({symbol}, {timeframe}, {reason})"
+                    error = reference_history_missing_error(*missing)
                     self._activity.write(
                         Category.IMPROVE, "reference_history_missing",
                         f"mission={staging_dir.name} name={args['name']} error={error}")

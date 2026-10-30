@@ -271,6 +271,7 @@ def evaluate_strategy_adoption_gate(
     timeframe = meta.timeframe if timeframe is None else timeframe
     content_hash = meta.content_hash if content_hash is None else content_hash
     history_conn = conn if history_conn is None else history_conn
+    holdout.require_reference_history(history_conn, dataset, resolved)
     run_in_sample = run_in_sample_fn or holdout.run_in_sample
     run_holdout = run_holdout_gate_fn or holdout.run_holdout_gate
     plugin_ref = f"plugins/{name}"

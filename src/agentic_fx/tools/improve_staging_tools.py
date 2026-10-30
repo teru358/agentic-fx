@@ -112,7 +112,8 @@ def build_improve_staging_tooldefs(
         `outputs` が `null` の indicator は依存先にできない (U4)。"""
         return {"plugins": list(view["plugins"]),
                 "pin_broken_strategies": list(view["pin_broken_strategies"]),
-                "watch_symbols": list(view.get("watch_symbols", []))}
+                "watch_symbols": list(view.get("watch_symbols", [])),
+                "history_available": bool(view.get("history_available", False))}
 
     def lock_staging_deps(name: str) -> dict:
         """候補 `config.yaml` の `indicators.<alias>.pin` を、`inventory_view`

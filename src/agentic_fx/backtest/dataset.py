@@ -54,6 +54,16 @@ class HistoryDataset:
         return {"source": self.source, "base_interval": self.base_interval}
 
 
+def literal_reference_coordinates(resolved) -> list[tuple[str, str]]:
+    """Literal-symbol `(symbol, reference_timeframe)` declarations, in alias order."""
+    return [(item.literal_symbol, item.timeframe) for item in resolved.items
+            if item.symbol_mode == "literal" and item.literal_symbol is not None]
+
+
+def reference_history_missing_error(symbol: str, timeframe: str, reason: str) -> str:
+    return f"reference_history_missing({symbol}, {timeframe}, {reason})"
+
+
 def missing_reference_history(conn, dataset: HistoryDataset,
                               references: Iterable[tuple[str, str]]) -> tuple[str, str, str] | None:
     """Return the first literal reference with no rows in this replay dataset.

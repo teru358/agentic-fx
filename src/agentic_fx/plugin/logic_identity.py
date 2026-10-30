@@ -184,22 +184,15 @@ def _family_key(config: Any, *, name: str) -> str | None:
         return None
     pairs = config.get("pairs")
     indicators = config.get("indicators")
-    if isinstance(indicators, dict):
-        deps: list[ParsedDependency] = []
-        has_reference = False
-        for alias, spec in indicators.items():
-            if not isinstance(spec, dict) or not isinstance(spec.get("plugin"), str):
-                continue
-            symbol = spec.get("symbol", "self")
-            if symbol != "self":
-                has_reference = True
-                mode, literal = "literal", str(symbol)
-            else:
-                mode, literal = "self", None
-            deps.append(ParsedDependency(str(alias), spec["plugin"], mode, literal,
-                                         str(spec.get("timeframe") or config.get("timeframe") or DEFAULT_FAMILY_TIMEFRAME)))
-        if has_reference:
-            key = _v2_family_key(str(config.get("timeframe") or DEFAULT_FAMILY_TIMEFRAME),
+    if config.get("kind") == "strategy" and isinstance(indicators, dict):
+        strategy_tf = str(config.get("timeframe") or DEFAULT_FAMILY_TIMEFRAME)
+        deps = [
+            dependency_of(str(alias), spec["plugin"], spec.get("symbol", "self"),
+                          spec.get("timeframe"), strategy_tf)
+            for alias, spec in indicators.items()
+            if isinstance(spec, dict) and isinstance(spec.get("plugin"), str)]
+        if any(dep.symbol_mode == "literal" for dep in deps):
+            key = _v2_family_key(strategy_tf,
                                  pairs if isinstance(pairs, list) else [], deps)
             return key if len(key.encode("utf-8")) <= FAMILY_KEY_MAX_BYTES else None
     return family_key_from_parts(
@@ -295,8 +288,17 @@ def _unescape(value: str) -> str | None:
     return decoded if _escape(decoded) == value else None
 
 
+def dependency_of(alias: str, plugin: str, symbol: Any, timeframe: Any,
+                  strategy_timeframe: str) -> ParsedDependency:
+    """One declared dependency in the shape the v2 key encodes."""
+    ref_tf = str(timeframe or strategy_timeframe)
+    if symbol == "self":
+        return ParsedDependency(alias, plugin, "self", None, ref_tf)
+    return ParsedDependency(alias, plugin, "literal", str(symbol), ref_tf)
+
+
 def _v2_family_key(timeframe: str, pairs: Iterable[Any], dependencies: Iterable[ParsedDependency]) -> str:
-    pair_part = ",".join(_escape(str(pair)) for pair in pairs)
+    pair_part = ",".join(_escape(pair) for pair in sorted({str(p) for p in pairs}))
     dep_part = ",".join(";".join((_escape(dep.alias), _escape(dep.plugin),
                                     _escape(dep.symbol_mode),
                                     _escape(dep.literal_symbol or "-"),
@@ -351,8 +353,9 @@ def parse_family_key(key: Any, *, allowed_pairs: Collection[str]
         regenerated = _v2_family_key(timeframe, pairs, dependencies)
         if regenerated != key:
             return None
-        return ParsedFamilyKey("strategy", (), timeframe, tuple(pairs), "v2",
-                               tuple(dependencies))
+        return ParsedFamilyKey(
+            "strategy", tuple(sorted({dep.plugin for dep in dependencies})),
+            timeframe, tuple(pairs), "v2", tuple(dependencies))
     kind, sep, rest = key.partition(":")
     if sep != ":":
         return None

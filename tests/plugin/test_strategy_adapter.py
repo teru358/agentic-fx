@@ -458,7 +458,7 @@ def test_missing_reference_frame_skips_the_strategy_without_a_plugin_error(tmp_p
     from dataclasses import replace
 
     conn = _conn(tmp_path)
-    _seed_flat(conn, H, 61)
+    _seed_flat(conn, H - timedelta(hours=24), 24 * 60 + 61)
     session = _FakeSession(raises=SandboxError("reference unavailable",
                                                code="reference_unavailable"))
     resolved = replace(_EMPTY, items=(

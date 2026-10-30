@@ -43,6 +43,22 @@ class NoHistoryError(ValueError):
     """Requested symbol/source has no local 1m history."""
 
 
+class ReferenceHistoryMissingError(NoHistoryError):
+    """A declared reference symbol has no history in the replay dataset."""
+
+
+def require_reference_history(conn, dataset, resolved) -> None:
+    """Fail closed before any replay when a literal reference has no rows at all."""
+    from agentic_fx.backtest.dataset import (
+        literal_reference_coordinates, missing_reference_history,
+        reference_history_missing_error,
+    )
+    missing = missing_reference_history(
+        conn, dataset, literal_reference_coordinates(resolved))
+    if missing is not None:
+        raise ReferenceHistoryMissingError(reference_history_missing_error(*missing))
+
+
 def _require_aware(dt: datetime, label: str) -> datetime:
     if dt.tzinfo is None:
         raise ValueError(f"{label} is naive; tz-aware UTC datetime required "

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 from agentic_fx.backtest.timeframes import (
-    TF_MINUTES, _COLUMNS, _table, floor_to_bucket,
+    TF_MINUTES, _COLUMNS, _table, floor_to_bucket, load_resampled_frame,
 )
 from agentic_fx.datafeed.requirements import native_interval
 from agentic_fx.plugin.reference import (
@@ -32,6 +32,14 @@ def actual_bars_for(df_index: pd.DatetimeIndex, strategy_timeframe: str,
                                  reference_timeframe)
 
 
+def _window_lower(d_last_dt: datetime, reference_timeframe: str, actual_bars: int,
+                  max_age_seconds: int) -> datetime:
+    ref_width = timedelta(seconds=timeframe_seconds(reference_timeframe))
+    lookback = max(ref_width * actual_bars,
+                   timedelta(seconds=max_age_seconds) + ref_width)
+    return floor_to_bucket(d_last_dt - lookback, reference_timeframe)
+
+
 def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
                          reference_timeframe: str, source: str,
                          d_last: pd.Timestamp,
@@ -48,11 +56,8 @@ def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
     """
     native = native_interval(reference_timeframe)
     native_width = timedelta(minutes=TF_MINUTES[native])
-    ref_width = timedelta(seconds=timeframe_seconds(reference_timeframe))
     d_last_dt = pd.Timestamp(d_last).to_pydatetime()
-    lookback = max(ref_width * actual_bars,
-                   timedelta(seconds=max_age_seconds) + ref_width)
-    lower = floor_to_bucket(d_last_dt - lookback, reference_timeframe)
+    lower = _window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
     now_utc = now.astimezone(timezone.utc)
     rows = conn.execute(
         f"SELECT bar_time, open, high, low, close, volume FROM {_table(source)} "
@@ -64,6 +69,32 @@ def load_reference_frame(conn: sqlite3.Connection, symbol: str, *,
                       index=index, columns=list(_COLUMNS), dtype="float64")
     df = df[(df.index + native_width + grace <= now_utc)
             & (df.index + native_width <= pd.Timestamp(d_last))]
+    if reference_timeframe in ("4h", "1d"):
+        df = complete_reference_buckets(df, effective_timeframe=reference_timeframe)
+    return df
+
+
+def load_history_reference_frame(conn: sqlite3.Connection, symbol: str, *,
+                                 reference_timeframe: str, source: str,
+                                 base_interval: str, d_last: pd.Timestamp,
+                                 actual_bars: int,
+                                 max_age_seconds: int) -> pd.DataFrame:
+    """The replay counterpart of ``load_reference_frame``.
+
+    Same window and the same 4h / 1d derivation, but the rows come from the
+    dataset's base interval resampled to the native reference interval, and
+    "closed" simply means ended by ``d_last`` (there is no wall clock in a replay).
+    """
+    native = native_interval(reference_timeframe)
+    d_last_dt = pd.Timestamp(d_last).to_pydatetime()
+    lower = _window_lower(d_last_dt, reference_timeframe, actual_bars, max_age_seconds)
+    if TF_MINUTES[base_interval] > TF_MINUTES[native]:
+        df = pd.DataFrame({c: pd.Series(dtype="float64") for c in _COLUMNS},
+                          index=pd.DatetimeIndex([], tz="UTC"))
+    else:
+        df = load_resampled_frame(conn, symbol, native, source=source,
+                                  base_interval=base_interval,
+                                  since=lower, until=d_last_dt)
     if reference_timeframe in ("4h", "1d"):
         df = complete_reference_buckets(df, effective_timeframe=reference_timeframe)
     return df
