@@ -111,7 +111,8 @@ def build_improve_staging_tooldefs(
         列挙しない — phase 2 で落ちた strategy が混ざらないようにするため)。
         `outputs` が `null` の indicator は依存先にできない (U4)。"""
         return {"plugins": list(view["plugins"]),
-                "pin_broken_strategies": list(view["pin_broken_strategies"])}
+                "pin_broken_strategies": list(view["pin_broken_strategies"]),
+                "watch_symbols": list(view.get("watch_symbols", []))}
 
     def lock_staging_deps(name: str) -> dict:
         """候補 `config.yaml` の `indicators.<alias>.pin` を、`inventory_view`

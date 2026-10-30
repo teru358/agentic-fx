@@ -477,14 +477,14 @@ def _chmod_tree_readonly(root: Path) -> None:
         p.chmod(0o500)
 
 
-def build_inventory_view(result: "InventoryBuildResult") -> dict:
+def build_inventory_view(result: "InventoryBuildResult", *, settings=None, conn=None) -> dict:
     """[indicator-consumption-wiring] §2.9(b): 子 worker の tool が読む
     JSON-safe な inventory。**snapshot ディレクトリを列挙しない** —
     phase 2 で落ちた strategy が inventory に混ざらないようにするため、
     最終 admit 済 plugin だけを載せる。遮断 8 との照合: 載るのは
     name / kind / pairs / params / outputs / content_hash のみ
     (成績・期間・段名は一切含まない)。"""
-    return {
+    view = {
         "plugins": [
             {"name": m.name, "kind": m.kind, "pairs": list(m.pairs),
              "params": m.params,
@@ -495,6 +495,21 @@ def build_inventory_view(result: "InventoryBuildResult") -> dict:
             {"name": r.name, "alias": r.alias, "reason": r.reason}
             for r in result.rejected_strategies],
     }
+    if settings is not None:
+        watches = list(settings.datafeed.watch_symbols)
+        available: set[str] = set()
+        dataset = settings.backtest.dataset()
+        if conn is not None and not dataset.unconfigured and watches:
+            placeholders = ",".join("?" for _ in watches)
+            rows = conn.execute(
+                "SELECT DISTINCT symbol FROM ohlcv_history WHERE source=? AND interval=? "
+                f"AND symbol IN ({placeholders})",
+                (dataset.source, dataset.base_interval, *watches)).fetchall()
+            available = {row[0] for row in rows}
+        view["watch_symbols"] = [
+            {"symbol": symbol, "history_available": symbol in available}
+            for symbol in watches]
+    return view
 
 
 # discoveries として受け付ける入力件数の上限。超過分は落として activity に残す。
@@ -866,7 +881,8 @@ class ImproveLoop:
                 allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
                 rpc_handlers=rpc_handlers,
                 inventory=inventory_result,
-                inventory_view=build_inventory_view(inventory_result))
+                inventory_view=build_inventory_view(
+                    inventory_result, settings=self._settings, conn=conn))
 
             # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
             # `prompt_text` も非実在だった (build_improve_context は
@@ -1526,6 +1542,19 @@ class ImproveLoop:
                                  "discovery. Continue without backtest "
                                  "results."),
                     }
+                from agentic_fx.backtest.dataset import missing_reference_history
+                missing = missing_reference_history(
+                    conn, dataset,
+                    ((item.literal_symbol, item.timeframe) for item in resolved.items
+                     if item.symbol_mode == "literal" and item.literal_symbol is not None))
+                if missing is not None:
+                    symbol, timeframe, reason = missing
+                    error = f"reference_history_missing({symbol}, {timeframe}, {reason})"
+                    self._activity.write(
+                        Category.IMPROVE, "reference_history_missing",
+                        f"mission={staging_dir.name} name={args['name']} error={error}")
+                    conn.close()
+                    return {"started": False, "error": error}
                 intent_source = strategy_adapter.build_intent_source(
                     meta, conn=conn, pair=args["pair"], dataset=dataset,
                     settings=self._settings, resolved=resolved)
