@@ -188,14 +188,30 @@ class Mt5Client:
         self._offset_disk_loaded = False
 
     def connect(self) -> None:
-        """MT5 ターミナルを起動 (or 既起動なら attach) し、ログインする。"""
+        """MT5 ターミナルを起動 (or 既起動なら attach) し、必要なときだけログインする。
+
+        OANDA は 2026-10-31 から MT5 ログインに TOTP を必須化した。Python API の
+        login() は新規認証として扱われ OTP を要求して失敗する
+        (-7, 'Unsupported authorization mode, OTP or certificate password needed')。
+        一方 initialize() だけならターミナル側で既に認証済みの口座に attach できるため、
+        ターミナルが同じ口座でログイン済みなら login() を呼ばない。これが無人運用の
+        唯一の経路。別口座 / 未ログインのときは従来どおり login() を試みる。
+        """
         self._mt5 = _import_mt5()
         with self._lock:
             if not self._mt5.initialize():
                 err = self._mt5.last_error()
                 raise RuntimeError(f"MT5 initialize() failed: {err}")
-            if not self._mt5.login(login=self._login, password=self._password,
-                                   server=self._server):
+            info = self._mt5.account_info()
+            # 防御的に両辺 int 比較 (login が str で返っても attach 判定を落とさない)
+            current_login = int(getattr(info, "login", 0) or 0) if info is not None else 0
+            if info is not None and current_login == int(self._login):
+                logger.info(
+                    f"MT5 attached to already-authorized account {self._login}; "
+                    "skipping login()"
+                )
+            elif not self._mt5.login(login=self._login, password=self._password,
+                                     server=self._server):
                 err = self._mt5.last_error()
                 self._mt5.shutdown()
                 raise RuntimeError(f"MT5 login failed: {err}")
