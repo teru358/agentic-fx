@@ -167,3 +167,63 @@ def test_a_built_request_is_counted_like_the_wire_including_request_line_and_fin
 
     assert handle_request(build(8192), Client()).status == 200
     assert handle_request(build(8193), Client()).status == 413
+
+
+class _RaisingClient:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def status(self):
+        raise self.error
+
+
+class _ReplyClient:
+    def __init__(self, reply) -> None:
+        self.reply = reply
+
+    def status(self):
+        return self.reply
+
+
+def _upstream_lines(client, capsys) -> tuple[int, str]:
+    response = handle_request(Request("GET", "/", {}), client)
+    return response.status, capsys.readouterr().err
+
+
+def test_an_api_error_reason_is_reported_as_a_fixed_word(capsys):
+    from afx_ops.api_client import ApiError
+
+    status, err = _upstream_lines(_RaisingClient(ApiError("socket_missing")), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream reason=socket_missing\n"
+
+
+def test_an_api_error_reason_outside_the_fixed_shape_is_other(capsys):
+    from afx_ops.api_client import ApiError
+
+    status, err = _upstream_lines(_RaisingClient(ApiError("/home/u/secret.sock Bad")), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream reason=other\n"
+
+
+def test_other_exceptions_report_only_the_type_name(capsys):
+    status, err = _upstream_lines(_RaisingClient(OSError("/run/user/1000/afx/secret.sock")), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream error=OSError\n"
+
+
+def test_a_non_200_reply_reports_the_status_and_a_fixed_code(capsys):
+    status, err = _upstream_lines(_ReplyClient(Reply(401, None, "unauthorized")), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream status=401 code=unauthorized\n"
+
+
+def test_a_non_200_reply_code_outside_the_fixed_shape_is_left_out(capsys):
+    status, err = _upstream_lines(_ReplyClient(Reply(500, None, "Bad /path?x=1")), capsys)
+
+    assert status == 502
+    assert err == "afx-ops: web_upstream status=500\n"

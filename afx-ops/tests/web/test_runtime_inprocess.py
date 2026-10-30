@@ -264,3 +264,107 @@ def test_shutdown_frees_the_workers_of_connections_still_open(monkeypatch):
         live.close()
         client.free_all()
         thread.join(5)
+
+
+class BigPageClient:
+    def status(self):
+        return Reply(200, {"mode": "paper"}, None)
+
+
+@pytest.fixture
+def services(monkeypatch):
+    made: list[runtime._Service] = []
+    original = runtime._Service.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        made.append(self)
+
+    monkeypatch.setattr(runtime._Service, "__init__", init)
+    return made
+
+
+def _wait_for(condition, seconds: float = 5.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+@pytest.mark.parametrize("size", [2000, 2048, 4096, 20000])
+def test_a_large_reply_ends_without_a_loop_error(monkeypatch, capsys, services, size):
+    from afx_ops.web import render
+    monkeypatch.setattr(render, "render_status", lambda data: b"x" * size)
+    port, thread, outcome = start(BigPageClient(), stop_after=3)
+    try:
+        for _ in range(3):
+            reply = exchange(port, GET)
+            assert reply.startswith(b"HTTP/1.1 200"), reply[:80]
+            assert len(reply) > size
+        thread.join(10)
+        assert outcome == ["done"]
+    finally:
+        thread.join(5)
+    assert "web_loop_error" not in capsys.readouterr().err
+    assert len(services[0].slots) == 0
+
+
+def test_repeated_large_replies_keep_the_slots_and_the_next_request_answers(
+        monkeypatch, capsys, services):
+    from afx_ops.web import render
+    monkeypatch.setattr(render, "render_status", lambda data: b"x" * 2500)
+    port, thread, outcome = start(BigPageClient(), stop_after=60)
+    try:
+        for _ in range(50):
+            assert exchange(port, GET).startswith(b"HTTP/1.1 200")
+        service = services[0]
+        assert _wait_for(lambda: len(service.slots) == 0)
+        assert exchange(port, GET).startswith(b"HTTP/1.1 200")
+        assert _wait_for(lambda: len(service.slots) == 0)
+        assert service.refused == 0
+    finally:
+        for _ in range(10):
+            try:
+                exchange(port, GET)
+            except OSError:
+                break
+        thread.join(10)
+    assert "web_loop_error" not in capsys.readouterr().err
+
+
+def test_a_slot_does_not_abort_a_transport_that_is_already_closing():
+    class Transport:
+        def __init__(self, closing: bool) -> None:
+            self.closing = closing
+            self.aborted = 0
+
+        def is_closing(self) -> bool:
+            return self.closing
+
+        def abort(self) -> None:
+            self.aborted += 1
+
+    for closing, aborted in ((True, 0), (False, 1)):
+        slot = runtime._Slot(lambda _slot: None, "peer")
+        slot.transport = Transport(closing)
+        slot.close()
+        assert slot.transport.aborted == aborted
+
+
+def test_a_finished_connection_leaves_no_transport_in_its_slot():
+    seen: list[object] = []
+    parts = runtime._aiohttp_parts()
+    server_cls = parts[0]
+    slot = runtime._Slot(lambda s: seen.append(s.transport), "peer")
+
+    async def main() -> None:
+        loop = asyncio.get_running_loop()
+        server = server_cls(lambda request: None, loop=loop)
+        protocol = server.protocol(slot)
+        slot.transport = object()  # type: ignore[assignment]
+        protocol.connection_lost(None)
+
+    asyncio.run(main())
+    assert seen == [None]

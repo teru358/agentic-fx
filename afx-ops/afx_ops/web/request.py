@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import functools
 import re
+import sys
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
+from afx_ops.api_client import ApiError
 from afx_ops.web import auth, render
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
@@ -222,8 +224,35 @@ def _call(function, *args, **kwargs):
     """daemon への呼出し。transport 例外・timeout は `_Upstream` (502) にする。"""
     try:
         return function(*args, **kwargs)
-    except Exception:  # noqa: BLE001 — 原因の文は外へ出さない
+    except ApiError as error:
+        _report_upstream(f"reason={_fixed_word(error.reason, 'other')}")
         raise _Upstream from None
+    except Exception as error:  # noqa: BLE001 — 原因の文は外へ出さない
+        _report_upstream(f"error={type(error).__name__}")
+        raise _Upstream from None
+
+
+_FIXED_WORD = re.compile(r"[a-z_]{1,40}")
+
+
+def _fixed_word(value: object, fallback: str | None) -> str | None:
+    if type(value) is str and _FIXED_WORD.fullmatch(value):
+        return value
+    return fallback
+
+
+def _report_upstream(detail: str) -> None:
+    """502 にした理由を、固定語と整数だけで stderr に残す (例外文・要求由来の値は出さない)。"""
+    print(f"afx-ops: web_upstream {detail}", file=sys.stderr, flush=True)
+
+
+def _report_bad_reply(reply: object) -> None:
+    status = getattr(reply, "status", None)
+    detail = f"status={status}" if type(status) is int else "status=none"
+    code = _fixed_word(getattr(reply, "code", None), None)
+    if code is not None:
+        detail += f" code={code}"
+    _report_upstream(detail)
 
 
 def _invoke(match: RouteMatch, query: dict[str, str], client):
@@ -360,6 +389,7 @@ def handle_request(request: Request | bytes, client, *,
             raise _Reject(400)
         reply, renderer = _invoke(match, request.query, client)
         if getattr(reply, "status", None) != 200 or getattr(reply, "code", None) is not None or type(getattr(reply, "data", None)) is not dict:
+            _report_bad_reply(reply)
             return _error(502, head=head)
         _check_reply_shape(match.route.client_method, reply.data)
         body = renderer(reply.data)

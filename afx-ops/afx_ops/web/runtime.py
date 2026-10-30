@@ -130,8 +130,10 @@ class _Slot:
         if self.deadline is not None:
             self.deadline.cancel()
             self.deadline = None
-        if self.transport is not None:
-            self.transport.abort()
+        transport = self.transport
+        # すでに閉じ始めた transport を abort すると、閉じ終わりの通知が二度予約される
+        if transport is not None and not transport.is_closing():
+            transport.abort()
 
 
 def _aiohttp_parts():
@@ -214,6 +216,8 @@ def _aiohttp_parts():
             try:
                 super().connection_lost(exc)
             finally:
+                # 閉じ終わった transport は枠から外す (枠の解放が abort で再入しない)
+                self._slot.transport = None
                 self._slot.on_release(self._slot)
 
         def handle_error(self, request, status: int = 500, exc: BaseException | None = None,
@@ -409,10 +413,25 @@ def _closed_reply() -> tuple[int, dict[str, str], bytes]:
 
 
 def _loop_error(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-    # 既定の handler は例外文と traceback (要求由来の値を含み得る) を出す。型名だけにする
+    # 既定の handler は例外文と traceback (要求由来の値を含み得る) を出す。型名と、
+    # 固定語だけの情報 (AttributeError の属性名、asyncio の message の先頭の語) にする
     exc = context.get("exception")
     name = type(exc).__name__ if exc is not None else "none"
-    print(f"afx-ops: web_loop_error {name}", file=sys.stderr, flush=True)
+    line = f"afx-ops: web_loop_error {name}"
+    if isinstance(exc, AttributeError):
+        attr = getattr(exc, "name", None)
+        if isinstance(attr, str) and attr.isidentifier() and len(attr) <= 40:
+            line += f" name={attr}"
+    message = context.get("message")
+    if isinstance(message, str):
+        words: list[str] = []
+        for word in message.split()[:5]:
+            if not word.isalpha():
+                break
+            words.append(word)
+        if words:
+            line += " message=" + "_".join(words)
+    print(line, file=sys.stderr, flush=True)
 
 
 async def _serve(parts, listener, client, on_serving, stop_after, *,

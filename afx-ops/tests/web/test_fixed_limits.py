@@ -196,3 +196,21 @@ def test_closing_a_slot_cancels_its_deadline_timer():
         assert slot.deadline is None
     finally:
         loop.close()
+
+
+def test_loop_errors_for_a_missing_attribute_add_only_fixed_words(capsys):
+    error = AttributeError("secret-value-42")
+    error.name = "close"
+    runtime._loop_error(None, {"exception": error,
+                               "message": "Exception in callback X(secret-value-42)"})
+
+    assert capsys.readouterr().err == (
+        "afx-ops: web_loop_error AttributeError name=close message=Exception_in_callback\n")
+
+
+def test_loop_error_attribute_names_must_be_identifiers(capsys):
+    error = AttributeError("x")
+    error.name = "secret value 42"
+    runtime._loop_error(None, {"exception": error})
+
+    assert capsys.readouterr().err == "afx-ops: web_loop_error AttributeError\n"
