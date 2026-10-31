@@ -21,6 +21,7 @@ import concurrent.futures
 import contextlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -354,13 +355,31 @@ def _comparison_of(notice, row) -> dict | None:
             metrics = entry.get(side)
             if not isinstance(metrics, dict):
                 return None
+            if not _comparison_metrics_valid(metrics):
+                _log.warning("improve comparison metrics malformed; comparison omitted")
+                return None
             shown[side] = {key: metrics.get(key) for key in _COMPARISON_NOTICE_KEYS}
         pairs[pair] = shown
     return {"holdout": pairs}
 
 
-def _baseline_hash_warning(payload: dict, plugins_root: Path | None) -> dict | None:
-    """比較 snapshot の基準版と現在の配備版が違うときだけ表示用の印を返す。"""
+def _is_number_or_none(value: object) -> bool:
+    return value is None or (type(value) in (int, float) and math.isfinite(value))
+
+
+def _comparison_metrics_valid(metrics: dict) -> bool:
+    """pf / avg_r は数値か None、trades は int、evaluable は bool のときだけ通す。"""
+    return (_is_number_or_none(metrics.get("pf")) and _is_number_or_none(metrics.get("avg_r"))
+            and type(metrics.get("trades")) is int and metrics["trades"] >= 0
+            and type(metrics.get("evaluable")) is bool)
+
+
+def _baseline_hash_warning(payload: dict, plugins_root: Path | None,
+                           status: object = "pending") -> dict | None:
+    """承認待ちの間だけ、比較 snapshot の基準版と現在の配備版が違うときの表示用の印を返す。
+    決定済みの承認は配備中の版が候補自身になり得るので、警告は出さない。"""
+    if status != "pending":
+        return None
     baseline = payload.get("baseline")
     name = payload.get("name")
     if (not isinstance(baseline, dict) or not isinstance(name, str)
@@ -823,7 +842,8 @@ class OpsService:
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
                 "baseline": payload.get("baseline"),
-                "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root),
+                "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root,
+                                                              row["status"]),
                 "payload_sha256": payload_sha256(row["payload_json"]),
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),

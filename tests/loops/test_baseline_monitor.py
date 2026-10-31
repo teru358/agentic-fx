@@ -39,10 +39,10 @@ def _rec(candidate, pf, avg_r, **over):
             "window_overlap": None, **over}
 
 
-def test_monitor_run_resets_when_the_direction_flips():
+def test_monitor_run_restarts_from_the_reversing_step_when_the_direction_flips():
     rows = summarize_comparisons([_rec("a", 1.0, 0.1), _rec("b", 1.1, 0.2), _rec("c", 1.0, 0.1),
                                   _rec("d", 0.9, 0.0)])
-    assert [h["monotone_run"] for h in rows[0]["by_candidate_hash"]] == [1, 2, 1, 2]
+    assert [h["monotone_run"] for h in rows[0]["by_candidate_hash"]] == [1, 2, 2, 3]
 
 
 def test_monitor_one_metric_moving_alone_is_not_monotone():
@@ -88,3 +88,9 @@ def test_the_report_section_lists_counts_and_hashes_and_handles_no_history():
     text = render_monitor_section(summarize_comparisons([_rec("a", 1.0, 0.1)]))
     assert "- s: attempts=1" in text and "window_overlap mean=null n=0" in text
     assert "candidate=" + "a" * 12 in text and "monotone_run=1" in text
+
+
+def test_monitor_up_up_down_down_counts_the_reversal_as_a_two_row_run():
+    rows = summarize_comparisons([_rec("a", 1.0, 0.1), _rec("b", 1.1, 0.2), _rec("c", 1.2, 0.3),
+                                  _rec("d", 1.1, 0.2), _rec("e", 1.0, 0.1)])
+    assert [h["monotone_run"] for h in rows[0]["by_candidate_hash"]] == [1, 2, 3, 2, 3]

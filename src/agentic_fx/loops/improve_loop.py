@@ -4429,11 +4429,12 @@ class ImproveLoop:
         """親専有レポートの末尾に付ける集計節。読めなければ節ごと省き、終端は止めない。"""
         from agentic_fx.loops import baseline_monitor
         try:
-            rows = baseline_monitor.monitor_summary(conn)
-        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            body = baseline_monitor.render_monitor_section(
+                baseline_monitor.monitor_summary(conn))
+        except Exception:
+            _log.warning("baseline monitor section omitted", exc_info=True)
             return ""
-        return (f"\n## {baseline_monitor.MONITOR_SECTION_TITLE}\n\n"
-                f"{baseline_monitor.render_monitor_section(rows)}\n")
+        return f"\n## {baseline_monitor.MONITOR_SECTION_TITLE}\n\n{body}\n"
 
     def _finalize_gate_failed(self, conn, *, ctx, backlog_id, reason, now,
                               gate_rows=(), tool_calls: int | None = None,

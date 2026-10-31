@@ -894,7 +894,8 @@ class Commands:
         lines += self._metrics_lines("holdout", payload.get("holdout"))
         warning = None
         baseline = payload.get("baseline")
-        if (isinstance(baseline, dict) and isinstance(payload.get("name"), str)
+        if (row["status"] == "pending" and isinstance(baseline, dict)
+                and isinstance(payload.get("name"), str)
                 and self.plugins_root is not None):
             try:
                 from agentic_fx.core.plugin_files import content_hash_of_dir

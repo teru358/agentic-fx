@@ -91,13 +91,54 @@ def test_monitor_counts_an_unavailable_submission_that_left_no_baseline_row(ops_
     assert row["by_candidate_hash"][0]["verdict"] == "unavailable"
 
 
+def test_monitor_reads_adoption_windows_in_one_select_regardless_of_the_row_count(ops_env):
+    """Going back to one SELECT per baseline row must raise the counted statements."""
+    conn = ops_env.conn
+    _adopted(conn)
+    for mission in range(1, 9):
+        _compare(conn, mission, f"{mission:x}" * 64, pf=1.1, avg_r=0.1)
+    seen = []
+    conn.set_trace_callback(seen.append)
+    try:
+        summary = monitor_summary(conn)
+    finally:
+        conn.set_trace_callback(None)
+    window_selects = [q for q in seen if "period_start,period_end" in q or
+                      "content_hash,pair,period_start,period_end" in q]
+    assert len(window_selects) == 1
+    assert summary[0]["window_overlap"] == {"mean": 16 / 45, "n": 8}
+
+
 def test_monitor_monotone_run_grows_only_while_both_metrics_move_the_same_way(ops_env):
     conn = ops_env.conn
     for mission, (pf, avg_r) in enumerate([(1.1, 0.1), (1.2, 0.2), (1.3, 0.3), (1.3, 0.4),
                                            (1.4, 0.5), (1.2, 0.3)], start=1):
         _compare(conn, mission, f"{mission:x}" * 64, pf=pf, avg_r=avg_r)
     (row,) = monitor_summary(conn)
-    assert [h["monotone_run"] for h in row["by_candidate_hash"]] == [1, 2, 3, 1, 2, 1]
+    assert [h["monotone_run"] for h in row["by_candidate_hash"]] == [1, 2, 3, 1, 2, 2]
+
+
+def test_the_report_section_is_omitted_and_logged_when_the_monitor_cannot_read(ops_env, caplog):
+    """Narrowing the catch back to a few exception types must fail on a deeply nested row."""
+    from agentic_fx.loops.improve_loop import ImproveLoop
+    conn = ops_env.conn
+    _compare(conn, 1, "c" * 64, pf=1.2, avg_r=0.2)
+    deep = "[" * 100000 + "]" * 100000
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE variant='candidate'", (deep,))
+    with caplog.at_level("WARNING"):
+        assert ImproveLoop._baseline_monitor_report_section(conn) == ""
+    assert "baseline monitor section omitted" in caplog.text
+    conn.execute("UPDATE backtest_runs SET metrics_json='{}'")
+    assert "## Baseline monitoring" in ImproveLoop._baseline_monitor_report_section(conn)
+
+
+def test_monitor_monotone_run_restarts_from_the_reversing_step(ops_env):
+    conn = ops_env.conn
+    for mission, (pf, avg_r) in enumerate([(1.1, 0.1), (1.2, 0.2), (1.3, 0.3), (1.2, 0.2),
+                                           (1.1, 0.1), (1.1, 0.1)], start=1):
+        _compare(conn, mission, f"{mission:x}" * 64, pf=pf, avg_r=avg_r)
+    (row,) = monitor_summary(conn)
+    assert [h["monotone_run"] for h in row["by_candidate_hash"]] == [1, 2, 3, 2, 3, 1]
 
 
 def test_monitor_keeps_runs_apart_per_deployed_version(ops_env):
@@ -182,6 +223,35 @@ def test_a_legacy_or_malformed_payload_gives_no_comparison_and_does_not_fail(ops
     assert "comparison" not in data and data["approval"] is not None
 
 
+@pytest.mark.parametrize("key,value", [("evaluable", None), ("evaluable", 1),
+                                       ("trades", None), ("trades", 4.0), ("trades", True), ("trades", -1),
+                                       ("pf", "1.3"), ("avg_r", [1]), ("pf", float("nan"))])
+def test_a_comparison_with_a_malformed_metric_is_omitted_and_logged(ops_env, caplog, key, value):
+    comparison = _comparison()
+    comparison["stages"]["holdout"]["USDJPY"]["candidate"][key] = value
+    mission = _submitted(ops_env, {"base_content_hash": "b" * 64, "comparison": comparison})
+    with caplog.at_level("WARNING"):
+        data = _run(ops_env, mission)
+    assert "comparison" not in data
+    assert "improve comparison metrics malformed; comparison omitted" in caplog.text
+    assert "1.31" not in caplog.text and "1.17" not in caplog.text
+
+
+def test_a_missing_metric_key_omits_the_comparison(ops_env):
+    comparison = _comparison()
+    del comparison["stages"]["holdout"]["USDJPY"]["deployed"]["evaluable"]
+    mission = _submitted(ops_env, {"base_content_hash": "b" * 64, "comparison": comparison})
+    assert "comparison" not in _run(ops_env, mission)
+
+
+def test_a_comparison_with_null_pf_and_avg_r_is_kept(ops_env):
+    comparison = _comparison()
+    for side in ("candidate", "deployed"):
+        comparison["stages"]["holdout"]["USDJPY"][side].update(pf=None, avg_r=None)
+    mission = _submitted(ops_env, {"base_content_hash": "b" * 64, "comparison": comparison})
+    assert _run(ops_env, mission)["comparison"]["holdout"]["USDJPY"]["candidate"]["pf"] is None
+
+
 def test_a_not_improved_rejection_carries_no_comparison(ops_env):
     mission = seed(ops_env, notice=codes.NOTICE_NOT_IMPROVED)
     assert "comparison" not in _run(ops_env, mission)
@@ -222,6 +292,24 @@ def test_the_cli_shows_a_hash_mismatch_warning_only_when_the_hashes_differ(ops_e
     fresh = _detail(ops_env, {"base_content_hash": live, "comparison": _comparison()})
     assert fresh["baseline_hash_warning"] is None
     assert "警告" not in client.format_approval_detail(fresh)
+
+
+def test_the_service_warns_about_a_hash_mismatch_only_while_the_approval_is_pending(ops_env):
+    deployed = ops_env.plugins_root / "s"
+    deployed.mkdir()
+    (deployed / "plugin.py").write_text("x = 1\n")
+    (deployed / "config.yaml").write_text("kind: strategy\n")
+    approval = ops_env.raw_approval(payload={"name": "s", "baseline": {
+        "base_content_hash": "b" * 64, "comparison": _comparison()}})
+    service = ops_env.service()
+    assert service.approval_detail(Principal.OPERATOR, approval)["baseline_hash_warning"]
+    for status in ("approved", "rejected", "expired"):
+        ops_env.conn.execute("UPDATE approval_requests SET status=? WHERE id=?",
+                             (status, approval))
+        ops_env.conn.commit()
+        detail = service.approval_detail(Principal.OPERATOR, approval)
+        assert detail["baseline_hash_warning"] is None
+        assert "警告" not in client.format_approval_detail(detail)
 
 
 @pytest.mark.parametrize("baseline", [None, {"ref_plugin_ref": "plugins/s"},

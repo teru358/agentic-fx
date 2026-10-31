@@ -569,6 +569,29 @@ def test_each_pair_gets_its_own_candidate_and_deployed_lines():
     assert text.count("候補: pf") == 2 and text.count("配備中の版: pf") == 2
 
 
+def test_many_pairs_keep_the_heading_the_approval_line_and_the_first_pairs():
+    """Without a pair cap the body overflows and the fit drops everything but the heading."""
+    comparison = _holdout_dto()
+    base = comparison["holdout"]["USDJPY"]
+    comparison["holdout"] = {f"PAIR{index:02d}": base for index in range(14)}
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert "承認 #7" in text and "配備中の版を上回りました" in text
+    assert "PAIR00 候補: pf" in text and "PAIR02 配備中の版: pf" in text
+    assert "PAIR03" not in text
+    assert "ほか 11 本" in text
+    assert text.count("候補: pf") == 3
+
+
+def test_three_pairs_or_fewer_have_no_omitted_line():
+    comparison = _holdout_dto()
+    base = comparison["holdout"]["USDJPY"]
+    comparison["holdout"] = {f"PAIR{index:02d}": base for index in range(3)}
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert text.count("候補: pf") == 3 and "ほか" not in text
+
+
 @pytest.mark.parametrize("result,reason,approval", [
     ("gate_failed", "not_improved", None),
     ("submitted", None, {"id": 7, "plugin": "s", "kind": "strategy"}),

@@ -40,6 +40,9 @@ def summarize_comparisons(records: list[dict]) -> list[dict]:
             step = _direction(prior[0], row) if prior is not None else 0
             if step != 0 and (prior[2] == 0 or prior[2] == step):
                 length, heading = prior[1] + 1, step
+            elif step != 0:
+                # 逆向きに動いた 1 歩は、直前の行と今の行の 2 行からなる新しい系列の起点。
+                length, heading = 2, step
             else:
                 length, heading = 1, 0
             runs[base] = (row, length, heading)
@@ -93,6 +96,8 @@ def monitor_summary(conn: sqlite3.Connection) -> list[dict]:
     for row in rows:
         key = (row["mission_id"], row["ref_content_hash"])
         keyed.setdefault(key, []).append(row)
+    windows = _adoption_windows(conn, {row["content_hash"] for row in rows
+                                       if row["content_hash"] in approved})
     for key, group in keyed.items():
         first = group[0]
         payload, comparison = by_candidate.get(first["ref_content_hash"], ({}, {}))
@@ -106,8 +111,7 @@ def monitor_summary(conn: sqlite3.Connection) -> list[dict]:
             pf, avg_r = metrics.get("pf"), metrics.get("avg_r")
         overlaps = []
         for row in group:
-            window = (_adoption_window(conn, row["content_hash"], row["pair"])
-                      if row["content_hash"] in approved else None)
+            window = windows.get((row["content_hash"], row["pair"]))
             overlap = _window_overlap(row["period_start"], row["period_end"], window)
             if overlap is not None:
                 overlaps.append(overlap)
@@ -141,20 +145,31 @@ def _strategy_name(plugin_ref: object) -> str | None:
     return PurePosixPath(plugin_ref).name if isinstance(plugin_ref, str) else None
 
 
-def _adoption_window(conn: sqlite3.Connection, content_hash: str,
-                     pair: str) -> tuple[datetime, datetime] | None:
-    """承認済みの版が採用時に通った holdout の期間。記録が無ければ None。"""
-    row = conn.execute(
-        "SELECT period_start,period_end FROM backtest_runs WHERE variant='candidate' "
-        "AND scope='holdout_gate' AND content_hash=? AND pair=? ORDER BY id DESC LIMIT 1",
-        (content_hash, pair)).fetchone()
-    if row is None:
-        return None
-    try:
-        return (datetime.fromisoformat(row["period_start"]),
-                datetime.fromisoformat(row["period_end"]))
-    except (TypeError, ValueError):
-        return None
+_ADOPTION_CHUNK = 500
+
+
+def _adoption_windows(conn: sqlite3.Connection, hashes: set[str]
+                      ) -> dict[tuple[str, str], tuple[datetime, datetime]]:
+    """承認済みの版が採用時に通った holdout の期間を (版, pair) ごとに一括で読む。
+    記録が無い、または期間が読めない組は含めない。同じ組が複数あれば最新の行。"""
+    ordered = sorted(hashes)
+    found: dict[tuple[str, str], tuple[datetime, datetime]] = {}
+    for start in range(0, len(ordered), _ADOPTION_CHUNK):
+        chunk = ordered[start:start + _ADOPTION_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            "SELECT content_hash,pair,period_start,period_end FROM backtest_runs "
+            "WHERE variant='candidate' AND scope='holdout_gate' "
+            f"AND content_hash IN ({marks}) ORDER BY id", chunk).fetchall()
+        for row in rows:
+            try:
+                found[(row["content_hash"], row["pair"])] = (
+                    datetime.fromisoformat(row["period_start"]),
+                    datetime.fromisoformat(row["period_end"]))
+            except (TypeError, ValueError):
+                # 最新の行が読めない組は、古い行にさかのぼらず記録なしとして扱う。
+                found.pop((row["content_hash"], row["pair"]), None)
+    return found
 
 
 def _window_overlap(start: object, end: object,

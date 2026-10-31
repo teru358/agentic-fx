@@ -771,6 +771,26 @@ def test_the_shell_warns_only_when_the_deployed_hash_differs_from_the_comparison
     assert "警告" not in results["fresh"]
 
 
+def test_the_shell_does_not_warn_about_a_hash_mismatch_once_the_approval_is_decided(tmp_path):
+    plugins = tmp_path / "plugins"
+    deployed = plugins / "sma_cross"
+    deployed.mkdir(parents=True)
+    (deployed / "plugin.py").write_text("x = 1\n")
+    (deployed / "config.yaml").write_text("kind: strategy\n")
+    conn, cmds = _commands(tmp_path)
+    cmds.plugins_root = plugins
+    approval_id = approvals.create(conn, kind="plugin", payload={}, now=NOW)
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?", (json.dumps(
+        _new_payload(baseline={"base_content_hash": "b" * 64, "comparison": _comparison()})),
+        approval_id))
+    conn.commit()
+    assert "警告: 配備中の版の hash" in cmds.dispatch(f"approval {approval_id}")
+    for status in ("approved", "rejected", "expired"):
+        conn.execute("UPDATE approval_requests SET status=? WHERE id=?", (status, approval_id))
+        conn.commit()
+        assert "警告" not in cmds.dispatch(f"approval {approval_id}")
+
+
 def test_the_shell_table_shows_eight_metrics_and_each_pair_verdict(tmp_path):
     shown = _show(tmp_path, _new_payload(baseline={
         "base_content_hash": "b" * 64, "comparison": _comparison()}))

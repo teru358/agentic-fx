@@ -259,7 +259,7 @@ def _floor_lines(floor: dict) -> list[str]:
 def _comparison_lines(comparison: dict) -> list[str]:
     holdout = comparison["holdout"]
     lines = ["配備中の版を上回りました"]
-    for pair, entry in holdout.items():
+    for pair, entry in list(holdout.items())[:MAX_PAIR_LINES]:
         if type(pair) is not str or type(entry) is not dict:
             return []
         for label, key in (("候補", "candidate"), ("配備中の版", "deployed")):
@@ -273,6 +273,8 @@ def _comparison_lines(comparison: dict) -> list[str]:
             lines.append(f"{cut_escaped(pair, FIELD_CHARS)} {label}: pf {_pf(pf)} "
                          f"avg_r {_avg_r(avg_r)} 取引 {trades} "
                          f"評価可能 {'はい' if evaluable else 'いいえ'}")
+    if len(holdout) > MAX_PAIR_LINES:
+        lines.append(f"ほか {len(holdout) - MAX_PAIR_LINES} 本")
     return lines
 
 

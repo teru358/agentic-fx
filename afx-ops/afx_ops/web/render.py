@@ -237,8 +237,8 @@ def render_approval(data: Mapping[str, object], change_data: Mapping[str, object
                 + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>"
                 + _baseline_section(data))
         return _page("Approval", body)
-    rendered = compose_approval_page(data, change, change_data if type(change_data) is dict else None).page
-    return rendered.replace(b"</body></html>", _baseline_section(data).encode("utf-8") + b"</body></html>")
+    return compose_approval_page(data, change, change_data if type(change_data) is dict else None,
+                                 extra_html=_baseline_section(data)).page
 
 
 # ---------------------------------------------------------------- 承認の変更内容
@@ -526,10 +526,12 @@ class ApprovalPage:
 
 
 def compose_approval_page(data: Mapping[str, object], change: Mapping[str, object],
-                          change_data: Mapping[str, object] | None) -> ApprovalPage:
+                          change_data: Mapping[str, object] | None,
+                          extra_html: str = "") -> ApprovalPage:
     """5 節 (概要・params の差分・成績・申告・変更 diff) を組み、ページ全体を 64 KiB 未満に収める。
     diff は 48 KiB 以下、それ以外 (骨格を含む) は 15 KiB 以下。超えるときは params の差分 →
-    申告 → 親の記録 の順で省略する。"""
+    申告 → 親の記録 の順で省略する。``extra_html`` は末尾に足す節で、予算の配分には数えないが、
+    ページ全体の上限には含める。"""
     claims = change_data.get("claims") if change_data and type(change_data.get("claims")) is dict else {}
     summary = claims.get("summary", change.get("summary"))
     rationale = claims.get("selection_rationale")
@@ -558,8 +560,8 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
         if skeleton + _bytes(others) + frame <= OTHER_BUDGET_BYTES:
             break
     body = others + (diff_html if diff_body else "")
-    page = _document("Approval", body)
-    other_bytes = len(page) - diff_bytes
+    other_bytes = len(_document("Approval", body)) - diff_bytes
+    page = _document("Approval", body + extra_html)
     if len(page) >= PAGE_LIMIT_BYTES:
         page = _page("Approval", "<p>Output clipped</p>")
     return ApprovalPage(page, diff_bytes, other_bytes, plans)

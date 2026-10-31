@@ -104,3 +104,32 @@ def test_each_row_carries_its_pair_verdict():
     page = _page(_data(baseline={"base_content_hash": BASE,
                                  "comparison": _comparison("improved")}))
     assert page.count("<td>improved</td></tr>") == 4
+
+
+def _big_comparison(pairs=50):
+    entry = {"candidate": _metrics(1.31), "deployed": _metrics(1.17), "verdict": "improved"}
+    stage = {f"PAIR{index:03d}": entry for index in range(pairs)}
+    return {"mode": "enforce", "verdict": "improved", "reason": "holdout_exceeds",
+            "stages": {"in_sample": stage, "holdout": stage}}
+
+
+def _change_with_diff(lines):
+    from tests.web.test_approval_page_budget import change_data, entry
+    return change_data(files=[entry("plugin.py", ["+" + "a" * 60] * lines)])
+
+
+@pytest.mark.parametrize("lines", [0, 200, 600, 1400])
+def test_the_approval_page_with_a_large_comparison_never_exceeds_the_response_limit(lines):
+    """Appending the section after the size check must fail here."""
+    from afx_ops.web.render import MAX_RESPONSE_BYTES
+    data = _data(baseline={"base_content_hash": BASE, "comparison": _big_comparison()})
+    change_data = _change_with_diff(lines)
+    page = render_approval(data, change_data)
+    assert len(page) <= MAX_RESPONSE_BYTES
+    assert page.rstrip().endswith(b"</html>")
+
+
+def test_the_section_is_kept_inside_the_page_when_the_size_allows():
+    from tests.web.test_approval_page_budget import change_data
+    page = render_approval(_data(), change_data()).decode("utf-8")
+    assert SECTION in page and page.count("</body>") == 1
