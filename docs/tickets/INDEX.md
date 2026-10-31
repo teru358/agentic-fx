@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 156 件。完了分は closed/。
+未完了: 157 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -74,7 +74,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (131)
+## 設計待ち (132)
 
 ### 不具合 (72)
 
@@ -197,7 +197,7 @@
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
-### 保守 (20)
+### 保守 (21)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -212,6 +212,7 @@
 | [plugin-lock-wait-notice-on-wait-argument](open/plugin-lock-wait-notice-on-wait-argument.md) | 低 | 2026-10-18 | plugin lock の待機通知を on_wait 引数に置き換える |
 | [isolated-worker-probe-lacks-bless](open/isolated-worker-probe-lacks-bless.md) | 低 | 2026-10-19 | 実隔離 worker の deploy 境界 probe に plugin bless が無い |
 | [e2e-phase1-full-cycle-flaky](open/e2e-phase1-full-cycle-flaky.md) | 低 | 2026-10-30 | e2e phase1 full_cycle が sleep 0.5 の競合で時々落ちる |
+| [improve-repeat-shutdown-test-flaky](open/improve-repeat-shutdown-test-flaky.md) | 低 | 2026-10-31 | improve_repeat の shutdown test が束でだけ落ちる (flaky) |
 | [backend-descriptor](open/backend-descriptor.md) | 低 |  | backend 別の if 分岐が 5 ファイルに散在 |
 | [credentials-file-copied-unused](open/credentials-file-copied-unused.md) | 低 |  | `ClaudeRunner.__init__(credentials_file_copied)` が未使用 |
 | [db-rebuild-helper](open/db-rebuild-helper.md) | 低 |  | DB の table rebuild migration が 7 本重複している |
