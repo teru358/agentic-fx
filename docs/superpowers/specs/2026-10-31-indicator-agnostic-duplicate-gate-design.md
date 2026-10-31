@@ -144,7 +144,7 @@
 検査ロジックと token 化・禁止語の閉じた語彙は新モジュール `src/agentic_fx/plugin/indicator_gate.py` に置く。通知側の語彙 (`NoticeCode`・`ALLOWED_PAIRS`) は既存の `improve_notice_codes.py` に code を足す (新モジュールで二重定義しない)。生成側 (gate)・表示側・test は同じ語彙を import する:
 
 - reject code: `symbol_in_name` / `param_price_unit` / `fixture_run_failed` / `output_not_finite` / `output_constant` / `indicator_duplicate` / `indicator_monotone_duplicate` (mode enforce のみ)
-- warning: `scale_dependent` / `indicator_monotone_duplicate` (mode warn のみ) / `indicator_similar` / `indicator_output_overlap` / `sparse_output` / `output_constant_suspect` / `legacy_symbol_name` / `indicator_redefined` / `duplicate_unavailable` (bless のみ)
+- warning: `scale_dependent` / `indicator_monotone_duplicate` (mode warn のみ) / `indicator_similar` / `indicator_output_overlap` / `sparse_output` / `output_constant_suspect` / `legacy_symbol_name` / `indicator_redefined` / `duplicate_unavailable` (bless のみ) / `symbol_in_name` と `param_price_unit` (bless のみ: 政策検査を warning に落とした語で、reject code と同じ綴り) / `duplicate_at_approve` (approve 時の再判定で mode warn のとき: exact または単調変換が新たに成立した warning。enforce では `approve` の失敗語)
 - `fixture_run_failed` の detail: `cpu_limit` / `timeout` / `exception` / `outputs_mismatch` / `probe_timeout` / `probe_exception`
 
 `_PluginGateVerdict(code=...)` へは上記の値を渡す (loader 系の既存リテラルは触らない: §6)。`_finalize_gate_failed` の reason は固定語だけにし、ヒットした token や相関値は親専有レポートへ別経路で出す。`last_result` の逐語形は `observation:gate_failed:<固定語>` の 1 形だけ。relation (相手名) は `last_result` に載せず族表で投影する (単一値に 2 形を同居させない)。`project_last_result` に `family_redirect` と同じ配備済み名 allowlist の分岐を足す。
@@ -241,3 +241,4 @@
 | 2026-10-31 | v0.5 C0 | 閉鎖確認の部分閉鎖 4 件: bless は exact 重複も reject (J5 推奨)、`duplicate_unavailable` の範囲を AC 11 の条件に限定、`last_result` は `observation:gate_failed:<固定語>` の 1 形 (relation は族表のみ)、AC の detail 表記を統一。6 便目 (別 seed 2 本) を §0.2 と J4 に。sol の第二意見で J5 / J6 を追加 | 閉鎖確認と第二意見 | |
 | 2026-10-31 | v0.6 C0 | J1 / J4 / J5 / J6 をユーザー裁定済 (推奨どおり) に。J6 の配線 (approve 時の再判定、`duplicate_at_approve`、AC 15) を §3.5 / §4 / §5 に | ユーザー承認、実装着手 | |
 | 2026-10-31 | v0.6.1 C0 | T1 レビューの追従: param 禁止語を閉じた句の表に (bare `point` と「`price` を含む」を廃止、§3.3)、exact は共通有限 1 以上・atol 1e-12・比較不能は不一致・exact 対は単調/類似から除外・warning は全部集める (§3.5) | /code-review high (T1) の #5 / #6 / #1 / #2 | |
+| 2026-10-31 | v0.6.2 C0 | §3.7 の warning 語彙に bless 限定の `symbol_in_name` / `param_price_unit` と、approve 再判定の `duplicate_at_approve` (warn では warning、enforce では失敗語) を明示 | T3 レビュー 1 周目 (閉語彙外の語) | |
