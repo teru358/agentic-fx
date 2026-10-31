@@ -26,7 +26,9 @@ from agentic_fx.core import market_hours
 from agentic_fx.core.contracts import (
     Action, Clock, IntentParseError, Origin, OrderStatus as S, TradeIntent,
 )
-from agentic_fx.core.executor import Executor, snapshot_age_exceeded
+from agentic_fx.core.executor import (EXPOSURE_NOT_TRADABLE_REASON, Executor,
+                                      ExposureNotTradableSymbol, NotTradableSymbol,
+                                      snapshot_age_exceeded)
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
@@ -460,6 +462,18 @@ class TradeLoop:
                             reject_reason=reason, reject_category="signal")
                         self.activity.write(Category.TRADE, "gate_rejected",
                                             reason, ref_id=str(iid))
+                        out = {"result": "rejected", "order_id": None,
+                               "reasons": [reason]}
+                    elif isinstance(snapshot_error,
+                                    (NotTradableSymbol, ExposureNotTradableSymbol)):
+                        reason = (EXPOSURE_NOT_TRADABLE_REASON
+                                  if isinstance(snapshot_error, ExposureNotTradableSymbol)
+                                  else "not_tradable_symbol")
+                        intents_store.set_gate_result(
+                            self.conn, iid, accepted=False, reject_reason=reason,
+                            reject_category="execution")
+                        self.activity.write(Category.TRADE, "gate_rejected", reason,
+                                            ref_id=str(iid))
                         out = {"result": "rejected", "order_id": None,
                                "reasons": [reason]}
                     elif snapshot_error is not None:

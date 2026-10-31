@@ -135,14 +135,20 @@ def validate_conversion_skew(rate: ConversionRate, *, reference_ts: datetime,
 
 
 def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
-                  interval_min: float) -> None:
+                  interval_min: float, *, check_calendar: bool = True) -> None:
+    """足の健全性を検査する。
+
+    `check_calendar=False` は FX の開場時間を前提にしない銘柄 (参照銘柄の足) 用で、鮮度と
+    開場中の欠損 (gap) の検査を外す。その銘柄の休止は FX の calendar からは分からず、
+    鮮度は利用側 (alignment の max_age) が実経過時間で判定する。未来時刻・zero/NaN・
+    スパイクの検査は残る。"""
     if not bars:
         raise DataUnhealthy("empty bars")
     now = as_utc(now)
     last_ts = as_utc(bars[-1].ts)
     # ts はバー開始時刻: 確定直後を stale にしないため interval 分を許容に足す
     allowed = timedelta(minutes=freshness_max_min + interval_min)
-    if now - last_ts > allowed:
+    if check_calendar and now - last_ts > allowed:
         raise DataUnhealthy(f"bars stale: last={last_ts}")
     # gap (連続性) 検査は末尾直近の窓に限定する。zero/NaN・スパイク検査は
     # バー個々のデータ整合性の話であり窓の対象外 (バー列全体で検査する)。
@@ -163,7 +169,7 @@ def validate_bars(bars: list[Bar], now: datetime, freshness_max_min: float,
             raise DataUnhealthy(f"anomalous bar (zero/NaN) at {ts}")
         if prev_ts is not None:
             gap_units = (ts - prev_ts).total_seconds() / 60 / interval_min
-            if gap_units > _MAX_GAP_BARS and ts >= gap_window_start:
+            if check_calendar and gap_units > _MAX_GAP_BARS and ts >= gap_window_start:
                 # 区間全体を免除するのではなく、休場だった時間だけを差し引き、
                 # 残り (開場中のはずの欠損) が閾値を超えるかで判定する
                 # (修正ラウンド 1: 指摘 1 — 丸ごと免除は fail-open だった)。

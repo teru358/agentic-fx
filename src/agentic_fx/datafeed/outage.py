@@ -33,6 +33,10 @@ class IngestTickReport:
       ここには現れない。
     - ``deferred``: budget 切れで持ち越した判断足優先度の key (未試行)。
     - ``empty``: 成功したが 0 本だった key。
+    - ``soft_*``: hard の要求が無い key (参照系列など) だけの同名の集合。
+      ``attempted`` 以下の集合には soft key を決して入れない。soft の失敗や
+      空応答は outage の判定に使われない。``soft_backoff_waiting`` は
+      backoff 待ちで今回は probe しなかった soft key。
 
     ``attempted``/``failed``/``succeeded``/``deferred``/``empty`` の
     いずれにも無い key は「backoff 待ちで今回はそもそも probe しなかった」
@@ -44,6 +48,12 @@ class IngestTickReport:
     failed: frozenset[tuple[tuple[str, str], str]]
     deferred: frozenset[tuple[str, str]]
     empty: frozenset[tuple[str, str]]
+    soft_attempted: frozenset[tuple[str, str]] = frozenset()
+    soft_succeeded: frozenset[tuple[str, str]] = frozenset()
+    soft_failed: frozenset[tuple[tuple[str, str], str]] = frozenset()
+    soft_deferred: frozenset[tuple[str, str]] = frozenset()
+    soft_empty: frozenset[tuple[str, str]] = frozenset()
+    soft_backoff_waiting: frozenset[tuple[str, str]] = frozenset()
 
 
 EMPTY_REPORT = IngestTickReport(

@@ -57,9 +57,16 @@ from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_clo
 from agentic_fx.activity import Category
 from agentic_fx.core import market_hours
 from agentic_fx.plugin import sandbox as plugin_sandbox
+from agentic_fx.plugin.sandbox import REFERENCE_ERROR_CODES
 from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin import switch
 from agentic_fx.plugin.deploy_ops import acquire_name_locks
+from agentic_fx.plugin.reference_frames import (
+    FETCH_STATE_REASONS, RUNTIME_WINDOW_REASON,
+    actual_bars_for, judge_reference, latest_native_end, load_reference_frame,
+    native_interval,
+)
+from agentic_fx.plugin.reference import runtime_reference_window_reason
 from agentic_fx.plugin.source_state import live_mismatch, source_state
 from agentic_fx.store import signals
 
@@ -88,7 +95,11 @@ class SignalProducer:
     (冪等 — signals の UNIQUE dedupe が重複挿入を防ぐ)。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, reference_state: Callable[[tuple[str, str]], str | None] | None = None
+                 ) -> None:
+        # (symbol, native interval) -> ingest が最後に観測した取得の状態
+        # (source_unavailable / fetch_failed / budget_deferred / ok)。
+        self.reference_state = reference_state
         # (plugin.name, content_hash, pair) -> 最後に評価成功したバケット開始時刻
         self._cursor: dict[tuple[str, str, str], datetime] = {}
         # The set is deliberately in-memory like the cursor: an outage should
@@ -100,6 +111,10 @@ class SignalProducer:
             tuple[str, str, str, datetime, str], int] = {}
         self._paused = False
         self._source_notices: dict[tuple[str, str, str], str] = {}
+        # reference_unavailable は判断足ごとに 1 回。key ごとに最後に記録した bucket だけ持つ。
+        self._reference_notices: dict[tuple[str, str, str], datetime] = {}
+        # (strategy, pair, symbol, timeframe) -> 直近に記録した reason。None なら使える。
+        self._reference_states: dict[tuple[str, str, str, str], str] = {}
 
     def evaluate_due_plugins(self, conn: "sqlite3.Connection", *,
                              plugins: list[PluginMeta], now: datetime,
@@ -199,7 +214,7 @@ class SignalProducer:
                     conn, meta, pair, now=now, source=source, call=_call,
                     settings=settings, activity=activity,
                     resolved=resolved_by_identity.get((meta.name, meta.content_hash)),
-                    plugins_root=plugins_root)
+                    plugins_root=plugins_root, reference_state=self.reference_state)
         finally:
             # 1 本の close の失敗で後続の session の後始末を飛ばさない
             for session in sessions.values():
@@ -212,7 +227,8 @@ class SignalProducer:
     def _evaluate_one(self, conn: "sqlite3.Connection", meta: PluginMeta,
                       pair: str, *, now: datetime, source: str,
                       call: _CallFn, settings: "Settings", activity=None,
-                      resolved=None, plugins_root: Path | None = None) -> int:
+                      resolved=None, plugins_root: Path | None = None,
+                      reference_state=None) -> int:
         """1 plugin × 1 pair 分の catch-up 評価。古いバケットから順に評価し、
         失敗したバケットの手前で打ち切る (cursor はそこまでしか進めない)。
         """
@@ -241,7 +257,13 @@ class SignalProducer:
                 inserted += self._evaluate_bucket(
                     conn, meta, pair, b, now=now, width=width, source=source,
                     call=call, settings=settings, resolved=resolved,
-                    plugins_root=plugins_root)
+                    plugins_root=plugins_root, activity=activity,
+                    reference_state=reference_state)
+            except _ReferenceUnavailable as e:
+                # plugin の失敗ではない。cursor は進めず、参照が戻れば次 tick で同じ
+                # bucket を評価する (鮮度窓を過ぎれば自然に放棄される)。
+                self._report_reference_unavailable(meta, pair, b, e, activity)
+                break
             except _SourceLockTimeout:
                 self._report_source_state(meta, pair, "lock_timeout", activity)
                 break
@@ -330,7 +352,8 @@ class SignalProducer:
                          pair: str, bucket_start: datetime, *, now: datetime,
                          width: timedelta, source: str, call: _CallFn,
                          settings: "Settings", resolved=None,
-                         plugins_root: Path | None = None) -> int:
+                         plugins_root: Path | None = None, activity=None,
+                         reference_state=None) -> int:
         if plugins_root is not None:
             # worker を起動する前の安い検査。正しさは lock 内の再検証が担う。
             reason = live_mismatch(
@@ -398,7 +421,25 @@ class SignalProducer:
                 conn, meta, resolved, plugins_root, settings, insert)
 
         # strategy: action="open" のみ保存 ("hold" は非保存)
-        result = call(meta, {"df": df, "params": meta.params})
+        payload = {"df": df, "params": meta.params}
+        references = self._reference_frames(
+            conn, meta, pair, df, now=now, source=source, settings=settings,
+            resolved=resolved, activity=activity, reference_state=reference_state)
+        if references.frames:
+            payload["frames"] = references.frames
+        try:
+            result = call(meta, payload)
+        except plugin_sandbox.SandboxError as exc:
+            if getattr(exc, "code", None) in REFERENCE_ERROR_CODES:
+                reason = ("indicator_unavailable"
+                          if exc.code == "indicator_unavailable" else "missing")
+                for symbol, timeframe in references.coordinates:
+                    self._note_reference_state(
+                        meta, pair, symbol, timeframe, reason, None, activity)
+                raise _ReferenceUnavailable(reason) from exc
+            raise
+        for symbol, timeframe in references.coordinates:
+            self._note_reference_state(meta, pair, symbol, timeframe, None, None, activity)
         if result.get("action") != "open":
             return 0
         def insert_strategy() -> int:
@@ -409,6 +450,102 @@ class SignalProducer:
             return 1 if row_id is not None else 0
         return self._insert_while_live(
             conn, meta, resolved, plugins_root, settings, insert_strategy)
+
+    def _reference_frames(self, conn, meta: PluginMeta, pair: str, df, *,
+                          now: datetime, source: str, settings, resolved,
+                          activity, reference_state) -> "_References":
+        """strategy の参照 frame を作り、使えないものがあれば呼出し前に skip する。
+
+        既存の self・同一 timeframe dependency (frame_id なし) は main df を使うので
+        何も作らない。frame は ``frame_id`` で 1 回だけ作る。
+        """
+        items = [item for item in (resolved.items if resolved is not None else ())
+                 if item.frame_id is not None]
+        if not items:
+            return _References({}, ())
+        grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
+        watch = set(getattr(settings.datafeed, "watch_symbols", ()) or ())
+        tf = timedelta(minutes=TF_MINUTES[meta.timeframe])
+        bucket_start = df.index[-1]
+        d_last = df.index[-1] + tf
+        frames: dict = {}
+        coordinates: list[tuple[str, str]] = []
+        for item in items:
+            symbol = pair if item.symbol_mode == "self" else item.literal_symbol
+            ref_tf = item.timeframe
+            actual = actual_bars_for(df.index, meta.timeframe, ref_tf)
+            if runtime_reference_window_reason(actual, max_bars=item.max_bars):
+                raise _ReferenceUnavailable(RUNTIME_WINDOW_REASON)
+            if item.frame_id in frames:
+                continue
+            fetch_state = (reference_state((symbol, native_interval(ref_tf)))
+                           if reference_state is not None else None)
+            frame = None
+            if item.symbol_mode == "self" or symbol in watch:
+                frame = load_reference_frame(
+                    conn, symbol, reference_timeframe=ref_tf, source=source,
+                    d_last=d_last, now=now, grace=grace,
+                    actual_bars=actual, max_age_seconds=item.max_age_seconds)
+            if frame is None:
+                aligned = None
+            else:
+                aligned = judge_reference(
+                    frame, bucket_start=bucket_start, strategy_timeframe=meta.timeframe,
+                    reference_timeframe=ref_tf, max_age_seconds=item.max_age_seconds)
+            usable = aligned is not None and aligned.row_start is not None and aligned.fresh
+            if not usable:
+                age = (None if aligned is None or aligned.age is None
+                       else int(aligned.age.total_seconds()))
+                if fetch_state in FETCH_STATE_REASONS:
+                    reason = fetch_state
+                elif aligned is not None and aligned.row_start is not None:
+                    reason = "age_exceeded"
+                else:
+                    # 窓の中に行が無い。窓より古い行があれば古すぎる、無ければ missing。
+                    newest = (latest_native_end(
+                        conn, symbol, reference_timeframe=ref_tf, source=source,
+                        d_last=d_last) if frame is not None else None)
+                    reason = "missing" if newest is None else "age_exceeded"
+                    if newest is not None:
+                        age = int((d_last - newest).total_seconds())
+                self._note_reference_state(meta, pair, symbol, ref_tf, reason, age, activity)
+                raise _ReferenceUnavailable(reason)
+            frames[item.frame_id] = frame
+            coordinates.append((symbol, ref_tf))
+        return _References(frames, tuple(coordinates))
+
+    def _note_reference_state(self, meta: PluginMeta, pair: str, symbol: str, timeframe: str,
+                              reason: str | None, age: int | None, activity) -> None:
+        """参照 frame の状態が変わったときだけ activity に出す。"""
+        key = (meta.name, pair, symbol, timeframe)
+        previous = self._reference_states.get(key)
+        if reason == previous:
+            return
+        if reason is None:
+            del self._reference_states[key]
+            _write_activity(
+                activity, "reference_recovered",
+                "strategy=%s pair=%s symbol=%s timeframe=%s recovered_from=%s"
+                % (meta.name, pair, symbol, timeframe, previous), meta.name)
+            return
+        self._reference_states[key] = reason
+        _write_activity(
+            activity, "reference_stale",
+            "strategy=%s pair=%s symbol=%s timeframe=%s reason=%s age=%s"
+            % (meta.name, pair, symbol, timeframe, reason,
+               "-" if age is None else age), meta.name)
+
+    def _report_reference_unavailable(self, meta: PluginMeta, pair: str,
+                                      bucket: datetime, exc: "_ReferenceUnavailable",
+                                      activity) -> None:
+        key = (meta.name, meta.content_hash, pair)
+        if self._reference_notices.get(key) == bucket:
+            return
+        self._reference_notices[key] = bucket
+        _write_activity(
+            activity, "reference_unavailable",
+            "strategy=%s pair=%s bucket=%s reason=%s"
+            % (meta.name, pair, bucket.isoformat(), exc.reason), meta.name)
 
     def _insert_while_live(self, conn, meta: PluginMeta, resolved,
                            plugins_root: Path | None, settings, insert) -> int:
@@ -434,6 +571,22 @@ class SignalProducer:
 
 class _SourceLockTimeout(Exception):
     pass
+
+
+class _ReferenceUnavailable(Exception):
+    """必要な参照 frame が使えない。plugin の失敗ではなく strategy 単位の skip。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class _References:
+    __slots__ = ("frames", "coordinates")
+
+    def __init__(self, frames: dict, coordinates: tuple) -> None:
+        self.frames = frames
+        self.coordinates = coordinates
 
 
 class _SourceNotLive(Exception):

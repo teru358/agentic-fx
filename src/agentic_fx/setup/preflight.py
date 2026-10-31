@@ -9,6 +9,7 @@ lock を作らず、DB は読み取り専用で開いて承認済み plugin の�
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from typing import Iterable
 from pydantic import ValidationError
 
 from agentic_fx.config import ConfigError, load_settings
+from agentic_fx.setup import checks
 from agentic_fx.setup.checks import CheckReason
 from agentic_fx.store.setup_record import read_setup_record
 
@@ -37,6 +39,8 @@ FATAL_CODES: dict[str, str] = {
 
 WARNING_CODES: dict[str, str] = {
     "plugin_list_unavailable": "承認済み plugin の一覧を読めませんでした (旧 schema の DB は起動時に migration されます)",
+    "watch_symbol_unknown": "datafeed.watch_symbols に bridge の銘柄一覧に無い名前があります (取得は失敗します。綴りを確かめてください)",
+    "watch_symbols_unchecked": "bridge に問い合わせられず、datafeed.watch_symbols を確かめていません",
     CheckReason.BIN_NOT_FOUND.value: "CLI backend の実行ファイルが見つかりません (LLM は未検証のままです)",
     CheckReason.CREDENTIALS_MISSING.value: "CLI backend の認証ファイルがありません (ログインしてください)",
     CheckReason.VERSION_CHECK_FAILED.value: "CLI backend の --version が通りません (LLM は未検証のままです)",
@@ -221,7 +225,10 @@ def run_check(root: Path, *, unit_env: bool = False) -> CheckReport:
     except PreflightFailure as exc:
         findings.append(Finding(exc.code, str(exc)))
         plugins = []
-    context = service.StartupContext(_NullActivity(), plugins, findings, check_secret_env=unit_env)
+    context = service.StartupContext(_NullActivity(), plugins, findings, check_secret_env=unit_env,
+                                     query_bridge=True, bridge_api_key=checks.bridge_key_headers(
+                                         settings.datafeed.mt5.bridge_url or "", root, os.environ,
+                                         check_destination=False).get("X-Bridge-Api-Key"))
     for check in service.STARTUP_CHECKS:
         try:
             settings = check(settings, context)

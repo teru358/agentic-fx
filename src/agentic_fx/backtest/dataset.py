@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Iterable
 from datetime import timedelta
 
 from agentic_fx.store.ohlcv import IMPORT_SOURCES
@@ -51,3 +52,31 @@ class HistoryDataset:
 
     def as_dict(self) -> dict[str, str]:
         return {"source": self.source, "base_interval": self.base_interval}
+
+
+def literal_reference_coordinates(resolved) -> list[tuple[str, str]]:
+    """Literal-symbol `(symbol, reference_timeframe)` declarations, in alias order."""
+    return [(item.literal_symbol, item.timeframe) for item in resolved.items
+            if item.symbol_mode == "literal" and item.literal_symbol is not None]
+
+
+def reference_history_missing_error(symbol: str, timeframe: str, reason: str) -> str:
+    return f"reference_history_missing({symbol}, {timeframe}, {reason})"
+
+
+def missing_reference_history(conn, dataset: HistoryDataset,
+                              references: Iterable[tuple[str, str]]) -> tuple[str, str, str] | None:
+    """Return the first literal reference with no rows in this replay dataset.
+
+    This deliberately tests existence only.  Gaps, stale bars and indicator
+    warm-up remain strategy-level availability outcomes rather than a replay
+    admission failure.
+    """
+    dataset.require_configured()
+    for symbol, timeframe in references:
+        row = conn.execute(
+            "SELECT 1 FROM ohlcv_history WHERE symbol=? AND interval=? AND source=? LIMIT 1",
+            (symbol, dataset.base_interval, dataset.source)).fetchone()
+        if row is None:
+            return symbol, timeframe, "no_rows"
+    return None

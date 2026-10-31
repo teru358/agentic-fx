@@ -114,6 +114,8 @@ class Fetch:
         self.bridge_status = 200
         self.bridge_time = "2026-10-02T06:00:00+00:00"
         self.props: dict[str, int] = {}
+        self.bridge_symbols: Any = []
+        self.bridge_symbols_status = 200
 
     def __call__(self, url: str, **kwargs: Any) -> FakeResponse:
         self.calls.append((url, kwargs))
@@ -125,6 +127,10 @@ class Fetch:
             if isinstance(entry, int):
                 return FakeResponse({"data": []}, entry)
             return FakeResponse({"data": [{"id": name} for name in entry]})
+        if url.endswith("/symbols"):
+            if self.bridge_symbols_status != 200:
+                return FakeResponse({}, self.bridge_symbols_status)
+            return FakeResponse(self.bridge_symbols)
         if url.endswith("/props"):
             return FakeResponse({"default_generation_settings": {"n_ctx": self.props.get("n_ctx", 8192)}})
         if url.endswith("/health"):

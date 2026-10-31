@@ -20,6 +20,7 @@ from agentic_fx.config import (
     BacktestSettings, ConfigError, DatafeedSettings, Settings, load_settings,
 )
 from agentic_fx.core.accounting import drawdown_pct
+from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example"
 
@@ -42,7 +43,7 @@ def test_example_file_loads():
     assert s.datafeed.primary == "yfinance"
     # 既定の allowlist は空であるべき (検査⑤の守りを弱めない既定値)。
     assert s.service.secret_env_allowlist == []
-    assert s.schema_version == 4
+    assert s.schema_version == CURRENT_SCHEMA_VERSION
     assert s.api.enabled is True
 
 
@@ -761,15 +762,21 @@ def test_backtest_eval_source_rejects_non_import_source(source):
 def test_watch_symbols_never_extend_pairs():
     """watch は取引対象ではない — pair enum / risk 検証との独立を実 assert でピン。"""
     # watch_symbols を足した settings でも:
-    s = _settings_with(watch_symbols=["XAUUSD"])
-    # ① market_tools の pair enum は settings.pairs のみ (watch が混入しない)
+    s = _settings_with(
+        watch_symbols=["XAUUSD"], primary="mt5",
+        mt5={"enabled": True, "bridge_url": "http://localhost:8812"})
+    # ① 取引側の pair enum (共通 pair_param と取引意図の schema) は settings.pairs のみ。
+    #    読み取り tool (get_ohlcv) は参照銘柄を読める (取引はできない)
+    from agentic_fx.loops.summary import trade_intent_schema
     from agentic_fx.tools import market_tools
     from agentic_fx.tools.registry import ToolRegistry
+    assert market_tools.pair_param(s)["pair"]["enum"] == list(s.pairs)
+    assert trade_intent_schema(s.pairs)["properties"]["pair"]["enum"] == list(s.pairs)
     reg = ToolRegistry()
     reg.register_all(market_tools.build(MagicMock(), MagicMock(), s))
     schema = [t for t in reg.openai_tools(["get_ohlcv"])][0]
     enum = schema["function"]["parameters"]["properties"]["pair"]["enum"]
-    assert enum == list(s.pairs) and "XAUUSD" not in enum
+    assert enum == [*s.pairs, "XAUUSD"] and "XAUUSD" not in s.pairs
     # ② watch_symbols は risk.pair_rules の検証対象外 (load が通ること自体が証明)
 
 

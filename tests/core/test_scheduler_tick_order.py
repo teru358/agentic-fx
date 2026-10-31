@@ -106,11 +106,11 @@ def test_account_unknown_still_cancels_pending_before_hooks_run(tmp_path):
     # snapshot (Env.__init__ 時点の WED) が更新されないまま 10 分の陳腐化
     # チェックを超過する。
     env = Env(tmp_path)
+    oid = env.place_limit()  # USDJPY entry=148.20
     orders_store.insert(env.conn, pair="EURUSD", direction="long",
                        entry_type="market", horizon="swing", status="open",
                        now=WED, quantity=0.1, avg_fill_price=1.1000,
                        stop_loss=1.0960, take_profit=1.1120)
-    oid = env.place_limit()  # USDJPY entry=148.20
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))

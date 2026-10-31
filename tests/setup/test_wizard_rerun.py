@@ -115,7 +115,7 @@ def test_a_duplicate_key_stops_the_rerun_and_names_the_lines(tmp_path):
 
 
 def test_a_settings_file_newer_than_this_afx_is_never_modified(tmp_path):
-    root, before = installed_root(tmp_path, mutate=lambda t: t.replace("schema_version: 4", "schema_version: 99"))
+    root, before = installed_root(tmp_path, mutate=lambda t: t.replace("schema_version: 5", "schema_version: 99"))
     snap = snapshot(root)
     deps, *_ = make_deps(tmp_path)
     io = ScriptedWizardIO(responder=fresh_responder(("この内容で書き込みます", ("d", "y"))))
@@ -150,8 +150,8 @@ def test_an_old_version_is_migrated_in_the_same_write_and_shown_in_the_summary(t
                                                     ("この内容で書き込みます", ("d", "y"))))
     assert run_wizard(root, io, deps) == 0, io.text
     after = (root / "config" / "settings.yaml").read_text()
-    assert after.startswith("schema_version: 4") or "\nschema_version: 4" in after
-    assert "移行する行" in io.text and "+schema_version: 4" in io.text
+    assert after.startswith("schema_version: 5") or "\nschema_version: 5" in after
+    assert "移行する行" in io.text and "+schema_version: 5" in io.text
     kept = [line for line in after.splitlines() if not line.startswith("schema_version")]
     assert kept == before.splitlines()
     assert len(list((root / "config").glob("settings.yaml.bak-*"))) == 1

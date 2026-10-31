@@ -140,6 +140,7 @@ QUALITY_CODES = frozenset(_QUALITY_NOTICES)
 _UNEVALUABLE_NOTICES = {
     "insufficient_trades": NOTICE_INSUFFICIENT_TRADES,
     "history_source_unconfigured": NOTICE_HISTORY_SOURCE_UNCONFIGURED,
+    "reference_history_missing": NOTICE_BACKTEST_DATA_UNAVAILABLE,
 }
 
 

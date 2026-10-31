@@ -40,7 +40,9 @@
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
 - response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
-  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`
+  `{"ok": false, "error": "<message>", "pid": int, "id": <要求の id>}`。
+  frame 不在は `"error_code": "reference_unavailable"`、frame を使う indicator の出力が
+  最後の main 行で NaN のときは `"error_code": "indicator_unavailable"` を加える。
 - close request: `{"op": "close", "id": "<hex>"}` / close response:
   `{"ok": true, "cpu_sec": <float>, "pid": int, "id": <要求の id>}`
 
@@ -107,6 +109,14 @@ def _cpu_sec() -> float:
 _KIND_FUNC = {"indicator": "compute", "signal": "detect", "strategy": "evaluate"}
 
 
+class _IndicatorUnavailable(Exception):
+    """A reference indicator has no value at the last main row."""
+
+
+class _ReferenceUnavailable(Exception):
+    pass
+
+
 def _wire_to_df(wire: dict[str, Any]):
     import pandas as pd
 
@@ -151,6 +161,25 @@ def _write_line(fd: int, obj: dict[str, Any]) -> None:
         view = view[n:]
 
 
+def _align_indicator_to_main(value, *, source, main_index, strategy_timeframe,
+                             reference_timeframe, max_age_seconds):
+    import pandas as pd
+
+    from agentic_fx.plugin.reference import align_reference
+
+    aligned = []
+    for strategy_start in main_index:
+        selected = align_reference(
+            source, strategy_start=strategy_start,
+            strategy_timeframe=strategy_timeframe,
+            reference_timeframe=reference_timeframe,
+            max_age_seconds=max_age_seconds)
+        aligned.append(
+            value.loc[selected.row_start]
+            if selected.fresh and selected.row_start in value.index else float("nan"))
+    return pd.Series(aligned, index=main_index, dtype="float64")
+
+
 def _load_error_text(exc: BaseException) -> str:
     cause = exc.__cause__
     if isinstance(exc, worker_isolation.PluginLoadError) and cause is not None:
@@ -183,7 +212,10 @@ def _load_plugins(isolated: "worker_isolation.IsolatedWorker",
         deps.append({
             "alias": record.alias, "compute": getattr(dep_module, "compute"),
             "params": spec["params"], "max_bars": int(spec["max_bars"]),
-            "outputs": tuple(spec["outputs"])})
+            "outputs": tuple(spec["outputs"]), "frame_id": spec.get("frame_id"),
+            "timeframe": spec.get("timeframe"),
+            "max_age_seconds": spec.get("max_age_seconds"),
+            "plugin_name": spec.get("plugin_name")})
     return fn, deps
 
 
@@ -234,7 +266,9 @@ def main() -> None:
     import numpy as np
     import pandas as pd
 
-    from agentic_fx.core.plugin_contract import validate_indicator_result
+    from agentic_fx.core.plugin_contract import (
+        validate_indicator_result, validate_ohlcv_passthrough,
+    )
 
     baseline_chained = pd.get_option("mode.chained_assignment")
     baseline_errstate = dict(np.geterr())
@@ -252,16 +286,38 @@ def main() -> None:
             df = _wire_to_df(request["df"])
             params = _deep_copy_json(request["params"])
             if kind == "strategy":
+                frames = {name: _wire_to_df(wire)
+                          for name, wire in (request.get("frames") or {}).items()}
                 indicators = {}
                 for dep in deps:
-                    sub_df = df.tail(dep["max_bars"]).copy(deep=True)
+                    frame_id = dep.get("frame_id")
+                    if frame_id is not None and frame_id not in frames:
+                        raise _ReferenceUnavailable
+                    source = df if frame_id is None else frames[frame_id]
+                    sub_df = source.tail(dep["max_bars"]).copy(deep=True)
+                    before = sub_df.copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
-                    validated = validate_indicator_result(
-                        raw, df_index=sub_df.index, outputs=dep["outputs"])
+                    validated = (
+                        validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
+                        if dep["plugin_name"] == "ohlcv" else
+                        validate_indicator_result(
+                            raw, df_index=sub_df.index, outputs=dep["outputs"]))
                     indicators[dep["alias"]] = {
-                        key: (value.reindex(df.index)
+                        key: (_align_indicator_to_main(
+                            value, source=sub_df, main_index=df.index,
+                            strategy_timeframe=handshake["timeframe"],
+                            reference_timeframe=dep["timeframe"],
+                            max_age_seconds=dep["max_age_seconds"])
+                              if isinstance(value, pd.Series) and frame_id is not None
+                              else value.reindex(df.index)
                               if isinstance(value, pd.Series) else value)
                         for key, value in validated.items()}
+                for dep in deps:
+                    if dep.get("frame_id") is None:
+                        continue
+                    for value in indicators[dep["alias"]].values():
+                        if isinstance(value, pd.Series) and len(value) and pd.isna(value.iloc[-1]):
+                            raise _IndicatorUnavailable
                 # indicator が pandas/numpy の process 全体の状態を変えていないこと
                 if (pd.get_option("mode.chained_assignment") != baseline_chained
                         or dict(np.geterr()) != baseline_errstate):
@@ -269,12 +325,24 @@ def main() -> None:
                         "indicator mutated shared pandas/numpy global state")
                 result = fn(df, indicators, None, params)
             else:
+                before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
                 result = fn(df, params)
                 if kind == "indicator":
-                    result = _indicator_result_to_wire(
+                    validated = (
+                        validate_ohlcv_passthrough(result, df=df, original_df=before)
+                        if handshake.get("name") == "ohlcv" else
                         validate_indicator_result(result, df_index=df.index,
                                                   outputs=main_outputs))
+                    result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
+                                      "id": request_id})
+        except _IndicatorUnavailable:
+            _write_line(protocol_fd, {"ok": False, "error": "indicator unavailable",
+                                      "error_code": "indicator_unavailable", "pid": pid,
+                                      "id": request_id})
+        except _ReferenceUnavailable:
+            _write_line(protocol_fd, {"ok": False, "error": "reference unavailable",
+                                      "error_code": "reference_unavailable", "pid": pid,
                                       "id": request_id})
         except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ
             try:

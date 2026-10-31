@@ -166,7 +166,8 @@ def family_key_from_parts(kind: Any, name: str, timeframe: Any,
     (依存が空なら None)。timeframe が None のときは `1h`。明示的な `timeframe: null` の
     indicator だけは旧実装の `@None` から `@1h` に値が変わる (現データに
     該当行は 0)。集合は
-    `sorted(set(str(x)))` を `,` で結ぶので、宣言順や重複は key に影響しない。"""
+    `sorted(set(str(x)))` を `,` で結ぶので、宣言順や重複は key に影響しない
+    (この記述は legacy の key のもの。v2 は依存の宣言順と alias を区別する)。"""
     tf = DEFAULT_FAMILY_TIMEFRAME if timeframe is None else str(timeframe)
     if kind == "indicator":
         return f"indicator:{name}@{tf}"
@@ -183,6 +184,20 @@ def _family_key(config: Any, *, name: str) -> str | None:
     if not isinstance(config, dict):
         return None
     pairs = config.get("pairs")
+    indicators = config.get("indicators")
+    if config.get("kind") == "strategy" and isinstance(indicators, dict):
+        strategy_tf = str(config.get("timeframe") or DEFAULT_FAMILY_TIMEFRAME)
+        deps = [
+            dependency_of(str(alias), spec["plugin"], spec.get("symbol", "self"),
+                          spec.get("timeframe"), strategy_tf)
+            for alias, spec in indicators.items()
+            if isinstance(spec, dict) and isinstance(spec.get("plugin"), str)]
+        if any(dep.symbol_mode == "literal" for dep in deps):
+            try:
+                return reference_family_key(
+                    strategy_tf, pairs if isinstance(pairs, list) else [], deps)
+            except FamilyKeyTooLong:
+                return None
     return family_key_from_parts(
         config.get("kind"), name, config.get("timeframe"),
         pairs if isinstance(pairs, list) else [], _indicator_plugins(config))
@@ -231,6 +246,84 @@ class ParsedFamilyKey:
     names: tuple[str, ...]
     timeframe: str
     pairs: tuple[str, ...]
+    version: str = "legacy"
+    dependencies: tuple["ParsedDependency", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedDependency:
+    alias: str
+    plugin: str
+    symbol_mode: str
+    literal_symbol: str | None
+    timeframe: str
+
+
+_UNRESERVED = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+
+
+def _escape(value: str) -> str:
+    encoded = value.encode("utf-8", "surrogatepass")
+    return "".join(chr(byte) if byte in _UNRESERVED else f"%{byte:02X}"
+                   for byte in encoded)
+
+
+def _unescape(value: str) -> str | None:
+    out = bytearray()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "%":
+            if (index + 2 >= len(value) or value[index + 1] not in "0123456789ABCDEF"
+                    or value[index + 2] not in "0123456789ABCDEF"):
+                return None
+            out.append(int(value[index + 1:index + 3], 16))
+            index += 3
+        else:
+            if ord(char) not in _UNRESERVED:
+                return None
+            out.append(ord(char))
+            index += 1
+    try:
+        decoded = out.decode("utf-8", "surrogatepass")
+    except UnicodeDecodeError:
+        return None
+    return decoded if _escape(decoded) == value else None
+
+
+def dependency_of(alias: str, plugin: str, symbol: Any, timeframe: Any,
+                  strategy_timeframe: str) -> ParsedDependency:
+    """One declared dependency in the shape the v2 key encodes."""
+    ref_tf = str(timeframe or strategy_timeframe)
+    if symbol == "self":
+        return ParsedDependency(alias, plugin, "self", None, ref_tf)
+    return ParsedDependency(alias, plugin, "literal", str(symbol), ref_tf)
+
+
+def _v2_family_key(timeframe: str, pairs: Iterable[Any], dependencies: Iterable[ParsedDependency]) -> str:
+    pair_part = ",".join(_escape(pair) for pair in sorted({str(p) for p in pairs}))
+    dep_part = ",".join(";".join((_escape(dep.alias), _escape(dep.plugin),
+                                    _escape(dep.symbol_mode),
+                                    _escape(dep.literal_symbol or "-"),
+                                    _escape(dep.timeframe))) for dep in dependencies)
+    return f"strategy-v2:{_escape(timeframe)}@{pair_part}@{dep_part}"
+
+
+class FamilyKeyTooLong(ValueError):
+    """The canonical v2 key would exceed `FAMILY_KEY_MAX_BYTES`."""
+
+
+def reference_family_key(timeframe: str, pairs: Iterable[Any],
+                         dependencies: Iterable[ParsedDependency]) -> str:
+    """Build the canonical v2 key; raises `FamilyKeyTooLong` past the byte limit.
+
+    Unlike the legacy key, a v2 key distinguishes dependency declaration order and
+    alias (the order and every alias is part of the identity); only the pair set is
+    sorted and de-duplicated."""
+    key = _v2_family_key(timeframe, pairs, dependencies)
+    if len(key.encode("utf-8")) > FAMILY_KEY_MAX_BYTES:
+        raise FamilyKeyTooLong(key[:32])
+    return key
 
 
 def parse_family_key(key: Any, *, allowed_pairs: Collection[str]
@@ -244,6 +337,39 @@ def parse_family_key(key: Any, *, allowed_pairs: Collection[str]
         return None
     if len(key.encode("utf-8", "surrogatepass")) > FAMILY_KEY_MAX_BYTES:
         return None
+    if key.startswith("strategy-v2:"):
+        parts = key[len("strategy-v2:"):].split("@")
+        if len(parts) != 3:
+            return None
+        timeframe = _unescape(parts[0])
+        pairs = tuple(_unescape(value) for value in parts[1].split(","))
+        if (timeframe is None or not is_plain_timeframe(timeframe) or not pairs
+                or any(pair is None or pair not in allowed_pairs for pair in pairs)):
+            return None
+        dependencies: list[ParsedDependency] = []
+        for token in parts[2].split(","):
+            fields = token.split(";")
+            if len(fields) != 5:
+                return None
+            decoded = [_unescape(field) for field in fields]
+            if any(value is None for value in decoded):
+                return None
+            alias, plugin, mode, symbol, ref_tf = decoded
+            if mode not in ("self", "literal") or not is_plain_timeframe(ref_tf):
+                return None
+            if mode == "self":
+                if symbol != "-":
+                    return None
+                symbol = None
+            elif symbol == "-":
+                return None
+            dependencies.append(ParsedDependency(alias, plugin, mode, symbol, ref_tf))
+        regenerated = _v2_family_key(timeframe, pairs, dependencies)
+        if regenerated != key:
+            return None
+        return ParsedFamilyKey(
+            "strategy", tuple(sorted({dep.plugin for dep in dependencies})),
+            timeframe, tuple(pairs), "v2", tuple(dependencies))
     kind, sep, rest = key.partition(":")
     if sep != ":":
         return None

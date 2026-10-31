@@ -5,6 +5,7 @@ DB は使わない (approved_plugins 二相のテストは tests/tools/test_plug
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,7 @@ def test_empty_set_has_no_items_and_is_all_pinned():
     assert empty.handshake_items() == []
 
 
-def test_pin_object_is_alias_sorted_plain_json(tmp_path):
+def test_self_pin_object_is_alias_sorted_and_byte_identical_to_the_legacy_payload(tmp_path):
     root = tmp_path / "plugins"
     rsi = _indicator(root, "rsi")
     adx = _indicator(root, "adx")
@@ -85,12 +86,90 @@ def test_pin_object_is_alias_sorted_plain_json(tmp_path):
     assert [i.alias for i in resolved.items] == ["alpha", "zeta"]   # alias 昇順
     obj = resolved.pin_object()
     assert list(obj) == ["alpha", "zeta"]
-    assert obj["zeta"] == {"plugin": "rsi", "content_hash": rsi.content_hash,
-                           "params": {"period": 21}}
-    assert obj["alpha"] == {"plugin": "adx", "content_hash": adx.content_hash,
-                            "params": {"period": 14}}
-    import json
-    json.dumps(obj)  # plain JSON であること
+    expected = {
+        "alpha": {"plugin": "adx", "content_hash": adx.content_hash,
+                  "params": {"period": 14}},
+        "zeta": {"plugin": "rsi", "content_hash": rsi.content_hash,
+                 "params": {"period": 21}},
+    }
+    assert obj == expected
+    assert (json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            == json.dumps(expected, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def test_self_dependency_with_nondefault_coordinates_exposes_them_in_pin_payload(tmp_path):
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi")
+    strategy = _plugin(
+        tmp_path / "candidate", "s",
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
+        "max_bars: 200\nindicators:\n"
+        "  slow: {plugin: rsi, symbol: self, timeframe: 4h, max_age: 7d}\n",
+        _STRATEGY_PY)
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, rsi), settings=SETTINGS,
+                                      pin_mode="ignore")
+
+    assert resolved.pin_object()["slow"] == {
+        "plugin": "rsi", "content_hash": rsi.content_hash, "params": {"period": 14},
+        "symbol_mode": "self", "symbol": None, "timeframe": "4h",
+        "max_age_seconds": 604800,
+    }
+
+
+def test_resolver_canonicalizes_literal_reference_coordinates_and_default_age(tmp_path):
+    root = tmp_path / "plugins"
+    ema = _indicator(root, "ema", max_bars="max_bars: 500\n")
+    strategy = _strategy(tmp_path / "candidate", "s", "indicators:\n"
+                         "  jp: {plugin: ema, symbol: JP225, timeframe: 1h}\n")
+    settings = SETTINGS.model_copy(update={
+        "datafeed": SETTINGS.datafeed.model_copy(update={"watch_symbols": ["JP225"]})})
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, ema), settings=settings,
+                                      pin_mode="ignore")
+
+    item = resolved.items[0]
+    assert (item.symbol_mode, item.literal_symbol, item.timeframe,
+            item.max_age_seconds, item.frame_id) == ("literal", "JP225", "1h", 10_800,
+                                                     "JP225@1h")
+    assert resolved.pin_object() == {
+        "jp": {"plugin": "ema", "content_hash": ema.content_hash,
+               "params": {"period": 14}, "symbol_mode": "literal",
+               "symbol": "JP225", "timeframe": "1h", "max_age_seconds": 10_800}}
+    assert resolved.handshake_items()[0]["plugin_name"] == "ema"
+
+
+def test_resolver_rejects_reference_window_that_exceeds_indicator_max_bars(tmp_path):
+    root = tmp_path / "plugins"
+    ema = _indicator(root, "ema", max_bars="max_bars: 1000\n")
+    strategy = _plugin(tmp_path / "candidate", "s",
+                       "kind: strategy\ntimeframe: 1d\npairs: [USDJPY]\n"
+                       "exit_mode: levels\nmax_bars: 1000\n"
+                       "indicators:\n  jp: {plugin: ema, symbol: JP225, timeframe: 1h}\n",
+                       _STRATEGY_PY)
+    settings = SETTINGS.model_copy(update={
+        "datafeed": SETTINGS.datafeed.model_copy(update={"watch_symbols": ["JP225"]})})
+
+    with pytest.raises(IndicatorResolutionError) as error:
+        resolve_indicator_deps(strategy, _inv(root, ema), settings=settings, pin_mode="ignore")
+
+    assert error.value.reason == "reference_window_exceeds_max_bars"
+
+
+def test_self_same_timeframe_400_bar_strategy_is_not_a_reference_window(tmp_path):
+    """A weekend-sized elapsed span never applies the reference K window to self."""
+    root = tmp_path / "plugins"
+    rsi = _indicator(root, "rsi", max_bars="max_bars: 200\n")
+    strategy = _plugin(
+        tmp_path / "candidate", "weekend_self",
+        "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+        "exit_mode: levels\nmax_bars: 400\n"
+        "indicators:\n  rsi: {plugin: rsi}\n", _STRATEGY_PY)
+
+    resolved = resolve_indicator_deps(strategy, _inv(root, rsi), settings=SETTINGS,
+                                      pin_mode="ignore")
+
+    assert resolved.items[0].frame_id is None
 
 
 def test_indicator_resolution_error_str_is_fixed_text():

@@ -246,7 +246,8 @@ class GateOutcome:
     evaluable: bool
     verdict_kind: Literal["ok", "insufficient_trades",
                           "history_source_unconfigured", "floor",
-                          "indicator_unresolved"] = "ok"
+                          "indicator_unresolved",
+                          "reference_history_missing"] = "ok"
     # [profitability-floor] codex 2 周目レビュー CR6 (2026-09-13):
     # `floor_failed` フィールドは削除した (`verdict_kind == "floor"` と
     # 完全な同値で、生産コードのどこからも読まれず — `switch.py::
@@ -256,6 +257,7 @@ class GateOutcome:
     floor_warning: str = ""  # "" | "unprofitable"
     floor_detail: str = ""  # 人間向け全数値 (payload/表示用)
     insufficient_trades_reason: str = ""  # "insufficient_trades:<n>"
+    unevaluable_reason: str = ""  # "reference_history_missing(<symbol>, <tf>, <reason>)"
     # T1-f の非コミット sink。CR7 (2026-09-13): 呼び出し元が `run_kind_gate`
     # に `sink=` を渡した場合はその**同じ list オブジェクト**になる
     # (`is` で同一性が成立する) — 既定は空 tuple。
@@ -370,6 +372,8 @@ def run_kind_gate(conn: sqlite3.Connection, meta: PluginMeta, *,
                 verdict_kind=verdict_kind,
                 insufficient_trades_reason=(
                     reason if verdict_kind == "insufficient_trades" else ""),
+                unevaluable_reason=(
+                    reason if verdict_kind == "reference_history_missing" else ""),
                 gate_rows=rows,
                 resolved=resolved, cpu_samples=cpu_samples)
         if verdict.floor_reason:

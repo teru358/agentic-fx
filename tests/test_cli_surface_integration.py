@@ -610,3 +610,67 @@ def test_surface_import_keeps_the_agentic_fx_closure_to_two_modules():
         "print(sorted(n for n in sys.modules if n == 'agentic_fx' or n.startswith('agentic_fx.')))")
     completed = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert completed.stdout.strip() == "['agentic_fx', 'agentic_fx.cli_surface']", completed.stderr
+
+
+_SYMBOL_OPTION_HELP = {
+    ("history", "import"): [
+        "取引 pair、または MT5 の参照銘柄 (broker の raw 名。例 JP225。"
+        "参照銘柄は --source mt5 で取り込む)"],
+    ("history", "coverage"): ["取引 pair、または参照銘柄 (raw 名)。1 回に 1 銘柄だけ表示する"],
+    ("analyze", "corr"): [
+        "取引 pair、または参照銘柄 (raw 名)",
+        "--a と別の銘柄。両方が同じ --source の 1m 履歴を 30 本以上共有している必要がある"],
+}
+
+
+@pytest.mark.parametrize(("argv", "texts"), list(_SYMBOL_OPTION_HELP.items()))
+def test_symbol_option_help_is_pinned(argv, texts, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "300")
+    out = " ".join(_captured_help([*argv, "--help"], capsys).split())
+    for text in texts:
+        assert text in out
+
+
+def test_symbol_option_help_text_changes_with_the_surface_table(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setitem(cli_surface.ARGUMENT_HELP, ("analyze corr", "--a"), "差し替え")
+        assert cli_surface.argument_help("analyze corr", "--a") == "差し替え"
+
+
+_ARGUMENT_OPTIONS = frozenset({"--symbol", "--a", "--b"})
+
+
+def _argument_copy_outside_accessor(tree: ast.AST) -> list[int]:
+    found = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _call_name(node.func) == "add_argument"):
+            continue
+        if not (node.args and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in _ARGUMENT_OPTIONS):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "help" and not (
+                    isinstance(keyword.value, ast.Call)
+                    and _call_name(keyword.value.func) == "argument_help"):
+                found.append(keyword.value.lineno)
+    return found
+
+
+def test_symbol_option_help_comes_only_from_the_surface_accessor():
+    tree = ast.parse(Path("src/agentic_fx/backtest/cli.py").read_text(encoding="utf-8"))
+    assert _argument_copy_outside_accessor(tree) == []
+
+
+@pytest.mark.parametrize("source", [
+    'p.add_argument("--symbol", help="直書き")',
+    'p.add_argument("--a", help="x" "y")',
+    'p.add_argument("--b", help=f"{x}")',
+])
+def test_symbol_option_check_rejects_literals(source):
+    assert _argument_copy_outside_accessor(ast.parse(source)) != []
+
+
+def test_symbol_option_check_accepts_the_accessor():
+    tree = ast.parse('p.add_argument("--a", help=argument_help("analyze corr", "--a"))\n'
+                     'p.add_argument("--n", help="別 option")')
+    assert _argument_copy_outside_accessor(tree) == []

@@ -471,6 +471,8 @@ class Answers:
     api_enabled: bool = True
     daemon: bool = True
     news_sources: list[tuple[str, str]] = field(default_factory=list)
+    watch_symbols: list[str] | None = None
+    watch_notes: list[str] = field(default_factory=list)
 
 
 _SOURCE_KEYS = ("yfinance", "mt5", "twelvedata")
@@ -511,6 +513,9 @@ def build_changes(raw: Mapping[str, Any], a: Answers) -> dict[str, Any]:
         put("runner.codex.bin", a.codex_bin)
     if a.claude_bin is not None:
         put("runner.claude.bin", a.claude_bin)
+    if a.watch_symbols is not None and (a.watch_symbols
+                                        or _get_path(raw, "datafeed.watch_symbols") is not None):
+        put("datafeed.watch_symbols", list(a.watch_symbols))
     intervals = _get_path(raw, "datafeed.intervals")
     if isinstance(intervals, list) and a.timeframe not in intervals:
         put("datafeed.intervals", [*intervals, a.timeframe])
@@ -861,38 +866,16 @@ def _stage2(sess: _Session, st: _Start, a: Answers) -> None:
 
 
 def _env_value(root: Path, environ: Mapping[str, str], key: str) -> str | None:
-    if environ.get(key):
-        return environ[key]
-    try:
-        from dotenv import dotenv_values
-        value = dotenv_values(root / ".env").get(key)
-    except Exception:  # noqa: BLE001 — .env が読めなくても試験を続ける
-        return None
-    return value or None
+    return checks.env_secret(root, environ, key)
 
 
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
-
-def _may_send_bridge_key(url: str) -> bool:
-    """API 鍵のヘッダを送ってよい宛先か (https か、この端末の http だけ)。"""
-    try:
-        parts = urlsplit(url)
-        host = parts.hostname
-    except ValueError:
-        return False
-    return parts.scheme == "https" or (parts.scheme == "http" and host in _LOOPBACK_HOSTS)
+_may_send_bridge_key = checks.may_send_bridge_key
 
 
 def _bridge_check(sess: _Session, a: Answers, url: str) -> CheckResult:
-    headers: dict[str, str] = {}
-    if a.bridge_key == "yes":
-        if _may_send_bridge_key(url):
-            key = _env_value(sess.root, sess.deps.environ, "MT5_BRIDGE_API_KEY")
-            if key:
-                headers["X-Bridge-Api-Key"] = key
-        else:
-            sess.say("平文 http には鍵を送りません。鍵なしで /health を試します。")
+    headers = _bridge_key_headers(sess, a, url)
+    if a.bridge_key == "yes" and not _may_send_bridge_key(url):
+        sess.say("平文 http には鍵を送りません。鍵なしで /health を試します。")
     return checks.check_bridge(url, a.pairs[0], fetch=sess.deps.fetch, headers=headers,
                                now=sess.deps.now)
 
@@ -903,6 +886,41 @@ def _stage3(sess: _Session, st: _Start, a: Answers) -> None:
 
 
 def _stage3_price(sess: _Session, st: _Start, a: Answers) -> None:
+    a.watch_symbols = None
+    a.watch_notes = []
+    _stage3_price_choose(sess, st, a)
+    if a.source != "mt5":
+        _drop_mt5_only_watch(sess, st, a)
+    elif a.watch_symbols is None:
+        kept, changed = _current_watch_without_overlap(sess, st, a)
+        if changed:
+            a.watch_symbols = kept
+
+
+def _drop_mt5_only_watch(sess: _Session, st: _Start, a: Answers) -> None:
+    """参照銘柄は MT5 専用。別の価格源を選んだら、今ある参照銘柄は理由を示して外す。"""
+    current = list(st.base_settings.datafeed.watch_symbols)
+    if not current:
+        return
+    note = f"参照銘柄 {len(current)} 件は MT5 専用のため外します。"
+    sess.say(note)
+    a.watch_notes.append(note)
+    a.watch_symbols = []
+
+
+def _current_watch_without_overlap(sess: _Session, st: _Start, a: Answers) -> tuple[list[str], bool]:
+    """今の参照銘柄から、これから取引 pair になる銘柄 (と重複) を除く。外したら表示して記録する。"""
+    current = list(st.base_settings.datafeed.watch_symbols)
+    kept = [name for name in dict.fromkeys(current) if name not in a.pairs]
+    dropped = [name for name in current if name in a.pairs]
+    if dropped:
+        note = f"参照銘柄 {' '.join(dropped)} は取引 pair に入るため外します。残りは今の値のままです。"
+        sess.say(note)
+        a.watch_notes.append(note)
+    return kept, kept != current
+
+
+def _stage3_price_choose(sess: _Session, st: _Start, a: Answers) -> None:
     sess.say("")
     sess.say("[段 3 価格源] 取引判断と約定判定に使う価格をどこから取るかを決めます。")
     sess.say("本線は MT5 bridge (MetaTrader 5 から価格を受け取る小さな HTTP サーバ) です。")
@@ -941,6 +959,7 @@ def _stage3_price(sess: _Session, st: _Start, a: Answers) -> None:
                 sess.say("MT5 bridge OK")
                 a.price = _check_record(result)
                 a.bridge_plan = "connected"
+                _stage3_watch_symbols(sess, st, a, url)
             else:
                 sess.say(_PRICE_FAILURE_TEXT.get(
                     result.reason_code.value if result.reason_code else "", "接続できませんでした。"))
@@ -953,11 +972,13 @@ def _stage3_price(sess: _Session, st: _Start, a: Answers) -> None:
             sess.say(f"MT5 bridge OK: {a.pairs[0]} (bridge の時刻 {server_time})")
             a.price = _check_record(result)
             a.bridge_plan = "connected"
+            _stage3_watch_symbols(sess, st, a, url)
             return
         reason = result.reason_code.value if result.reason_code else "connect_error"
         if (not _may_send_bridge_key(url) and reason == checks.CheckReason.AUTH_REQUIRED.value):
             a.price = _plain_record("unverified", sess.now_iso(), checks.CheckReason.KEY_WITHHELD_PLAIN_HTTP.value)
             a.bridge_plan = "connected"
+            sess.say("参照銘柄の選択は飛ばします (平文 http には鍵を送らず、銘柄の一覧を取れないため)。")
             sess.say("bridge は応答しています。平文 http には鍵を送らないため接続の検査はここでは行いません。"
                      "daemon は `.env` の鍵で接続します。")
             if not _env_value(sess.root, sess.deps.environ, "MT5_BRIDGE_API_KEY"):
@@ -979,6 +1000,66 @@ def _stage3_price(sess: _Session, st: _Start, a: Answers) -> None:
                 break
             sess.say(problem)
         a.bridge_url = url
+
+
+_WATCH_SEARCH_LIMIT = 30
+
+
+def _bridge_key_headers(sess: _Session, a: Answers, url: str) -> dict[str, str]:
+    if a.bridge_key != "yes":
+        return {}
+    return checks.bridge_key_headers(url, sess.root, sess.deps.environ)
+
+
+def _stage3_watch_symbols(sess: _Session, st: _Start, a: Answers, url: str) -> None:
+    """MT5 に接続できたときだけ、分析専用の参照銘柄を bridge の一覧から選ばせる。
+
+    一覧を取れないときは理由を示して質問を飛ばし、現在の値は変えない (`a.watch_symbols` は None のまま)。
+    """
+    listing = checks.list_bridge_symbols(url, fetch=sess.deps.fetch,
+                                         headers=_bridge_key_headers(sess, a, url), now=sess.deps.now)
+    if listing.result != "ok":
+        reason = listing.reason_code.value if listing.reason_code else "connect_error"
+        sess.say(_PRICE_FAILURE_TEXT.get(reason, "接続できませんでした。"))
+        sess.say("参照銘柄の選択は飛ばします。settings.yaml の datafeed.watch_symbols は変えません。")
+        return
+    candidates = list(listing.params.get("symbols", ()))
+    if not candidates:
+        return
+    current, _ = _current_watch_without_overlap(sess, st, a)
+    limit = st.base_settings.analysis.max_watch_symbols
+    known = set(candidates)
+    sess.say("")
+    sess.say("[段 3 参照銘柄] 発注はせず、分析と戦略の入力にだけ使う銘柄 (株価指数など) を選べます。選ばなくても進めます。")
+    sess.say(f"bridge の銘柄は {len(candidates)} 件です。名前をカンマ区切りで入れてください "
+             f"(最大 {limit} 件、`?語` で名前を検索、`-` で 1 つも使わない)。")
+    while True:
+        answer = sess.text("参照銘柄", ",".join(current)).strip()
+        if answer.startswith("?"):
+            needle = answer[1:].strip().lower()
+            found = [name for name in candidates if needle in name.lower()][:_WATCH_SEARCH_LIMIT]
+            sess.say("  " + (" ".join(found) if found else "一致する銘柄はありません"))
+            continue
+        names = [] if answer == "-" else [part.strip() for part in answer.split(",") if part.strip()]
+        problem = _watch_problem(names, candidates=known, current=current, pairs=a.pairs, limit=limit)
+        if problem is None:
+            a.watch_symbols = names
+            return
+        sess.say(problem)
+
+
+def _watch_problem(names: list[str], *, candidates: set[str], current: list[str],
+                   pairs: list[str], limit: int) -> str | None:
+    if len(set(names)) != len(names):
+        return "同じ銘柄が重なっています。"
+    if len(names) > limit:
+        return f"銘柄が多すぎます (最大 {limit} 件)。"
+    for name in names:
+        if name in pairs:
+            return f"{name} は取引 pair です。参照銘柄には取引 pair とは別の銘柄を選んでください。"
+        if name not in candidates and name not in current:
+            return f"{name} は bridge の銘柄にありません。`?語` で検索できます。"
+    return None
 
 
 def _ask_bridge_key(sess: _Session) -> str:
@@ -1750,7 +1831,8 @@ def _open_order_count(root: Path) -> int | None:
         conn.close()
 
 
-def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, ...]:
+def _summary_lines(a: Answers, settings: Settings, now: datetime,
+                   previous_watch: Sequence[str] = ()) -> tuple[str, ...]:
     key = "あり" if a.bridge_key == "yes" else "なし" if a.bridge_key == "no" else "不明"
     price_ok = a.price.get("result") == "ok"
     price = "確認済み" if price_ok else ("bridge の接続は未確認" if a.source == "mt5" else "価格の取得は未確認")
@@ -1773,8 +1855,16 @@ def _summary_lines(a: Answers, settings: Settings, now: datetime) -> tuple[str, 
         if record.get("result") != "ok":
             reason = record.get("reason_code")
             unverified.append(f"{label} は未確認です" + (f" ({reason})" if reason else ""))
+    if a.watch_symbols:
+        watch = f"参照銘柄 (分析専用・発注しない): {' '.join(a.watch_symbols)}"
+    elif a.watch_symbols is not None and previous_watch:
+        watch = f"参照銘柄: なし (今ある {' '.join(previous_watch)} を外します)"
+    else:
+        watch = None
     return (
         source,
+        *((watch,) if watch else ()),
+        *a.watch_notes,
         f"取引判断と改善: {trade}（{trade_model}）/ {improve}（{improve_model}）",
         f"判断足: {a.timeframe}。backtest の基底足: {a.base_interval or settings.backtest.base_interval}、履歴源: {a.eval_source}",
         f"改善: {cadence} {at}。次回: {_next_schedule_text(settings, now)}。最初の 1 本: {first}",
@@ -1821,7 +1911,7 @@ def _stage9(sess: _Session, st: _Start, a: Answers) -> _Plan:
     sess.say("")
     sess.say("")
     sess.say("[段 9 要約]")
-    for line in _summary_lines(a, new_settings, sess.now()):
+    for line in _summary_lines(a, new_settings, sess.now(), st.base_settings.datafeed.watch_symbols):
         sess.say(line)
     if st.mode != "fresh":
         sentences: list[str] = []

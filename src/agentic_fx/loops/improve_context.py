@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
 from agentic_fx.plugin.logic_identity import (
-    ParsedFamilyKey, checked_family_key, is_plain_name, is_plain_pair,
-    parse_family_key)
+    DEFAULT_FAMILY_TIMEFRAME, FamilyKeyTooLong, ParsedFamilyKey, checked_family_key,
+    dependency_of, is_plain_name, is_plain_pair, parse_family_key,
+    reference_family_key)
 from agentic_fx.policy import Policy, directives_path
 from agentic_fx.store import news_sources
 from agentic_fx.store.candidate_archives import family_attempt_projection
@@ -293,7 +294,8 @@ def project_family_label(parsed: ParsedFamilyKey,
     known = [n for n in parsed.names if n in deployed_indicators]
     if len(known) != len(parsed.names):
         known.append(UNDEPLOYED_DEPENDENCY_LABEL)
-    return (f"strategy:{','.join(known)}@{parsed.timeframe}"
+    head = "strategy-v2" if parsed.version == "v2" else "strategy"
+    return (f"{head}:{','.join(known)}@{parsed.timeframe}"
             f"@{','.join(parsed.pairs)}")
 
 
@@ -313,9 +315,18 @@ def _deployed_view(families: list[dict], allowed_pairs: "set[str]"
         if not is_plain_name(name):
             skipped += 1
             continue
-        key = checked_family_key(
-            family["kind"], name, family["timeframe"], family["pairs"],
-            family["indicators"], allowed_pairs=allowed_pairs)
+        if family.get("dependencies"):
+            strategy_tf = family["timeframe"] or DEFAULT_FAMILY_TIMEFRAME
+            try:
+                key = reference_family_key(strategy_tf, family["pairs"], [
+                    dependency_of(d["alias"], d["plugin"], d["symbol"], d["timeframe"],
+                                  strategy_tf) for d in family["dependencies"]])
+            except FamilyKeyTooLong:
+                key = None  # listed among the strategies without a family key
+        else:
+            key = checked_family_key(
+                family["kind"], name, family["timeframe"], family["pairs"],
+                family["indicators"], allowed_pairs=allowed_pairs)
         parsed = (parse_family_key(key, allowed_pairs=allowed_pairs)
                   if key is not None else None)
         if parsed is not None:
@@ -478,13 +489,18 @@ def deployed_families(metas: "list[Any]") -> list[dict]:
     strategy は依存 indicator の組・足・pair、indicator は名前と足。"""
     out = []
     for m in metas:
-        out.append({
+        family = {
             "name": m.name, "kind": m.kind,
             "timeframe": m.timeframe,
             "pairs": (list(m.pairs) if m.kind in ("strategy", "signal")
                       else []),
             "indicators": (sorted({r.plugin for r in m.indicators})
-                           if m.kind == "strategy" else [])})
+                           if m.kind == "strategy" else [])}
+        if m.kind == "strategy" and any(r.symbol != "self" for r in m.indicators):
+            family["dependencies"] = [
+                {"alias": r.alias, "plugin": r.plugin, "symbol": r.symbol,
+                 "timeframe": r.timeframe} for r in m.indicators]
+        out.append(family)
     return sorted(out, key=lambda f: (f["kind"], f["name"]))
 
 

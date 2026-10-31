@@ -44,8 +44,7 @@ def test_a_root_finished_without_a_bridge_degrades_then_recovers_when_the_bridge
 
     ingest = Ingest(settings, fetch=fetch)
     conn = connect(root / "data" / "agentic.db")
-    hard_keys = frozenset((pair, req.interval) for req in ingest.registry.entries if req.hard
-                          for pair in req.pairs)
+    hard_keys = ingest.registry.hard_keys()
     outage = OutageStateMachine(
         conn, hard_keys=hard_keys,
         interval_widths={interval: timedelta(minutes=sources.INTERVAL_MIN[interval]) for _, interval in hard_keys},

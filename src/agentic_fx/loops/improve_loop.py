@@ -479,14 +479,14 @@ def _chmod_tree_readonly(root: Path) -> None:
         p.chmod(0o500)
 
 
-def build_inventory_view(result: "InventoryBuildResult") -> dict:
+def build_inventory_view(result: "InventoryBuildResult", *, settings=None, conn=None) -> dict:
     """[indicator-consumption-wiring] §2.9(b): 子 worker の tool が読む
     JSON-safe な inventory。**snapshot ディレクトリを列挙しない** —
     phase 2 で落ちた strategy が inventory に混ざらないようにするため、
     最終 admit 済 plugin だけを載せる。遮断 8 との照合: 載るのは
     name / kind / pairs / params / outputs / content_hash のみ
     (成績・期間・段名は一切含まない)。"""
-    return {
+    view = {
         "plugins": [
             {"name": m.name, "kind": m.kind, "pairs": list(m.pairs),
              "params": m.params,
@@ -497,6 +497,20 @@ def build_inventory_view(result: "InventoryBuildResult") -> dict:
             {"name": r.name, "alias": r.alias, "reason": r.reason}
             for r in result.rejected_strategies],
     }
+    if settings is not None:
+        watches = list(settings.datafeed.watch_symbols)
+        dataset = settings.backtest.dataset()
+        covered: set[str] = set()
+        if conn is not None and not dataset.unconfigured and watches:
+            placeholders = ",".join("?" for _ in watches)
+            covered = {row[0] for row in conn.execute(
+                "SELECT DISTINCT symbol FROM ohlcv_history "
+                "WHERE source=? AND interval=? "
+                f"AND symbol IN ({placeholders})",
+                (dataset.source, dataset.base_interval, *watches))}
+        view["watch_symbols"] = watches
+        view["history_available"] = {symbol: symbol in covered for symbol in watches}
+    return view
 
 
 # discoveries として受け付ける入力件数の上限。超過分は落として activity に残す。
@@ -868,7 +882,8 @@ class ImproveLoop:
                 allowed_backlog_ids=allowed_ids, slot_key=slot_key, ledger=ledger,
                 rpc_handlers=rpc_handlers,
                 inventory=inventory_result,
-                inventory_view=build_inventory_view(inventory_result))
+                inventory_view=build_inventory_view(
+                    inventory_result, settings=self._settings, conn=conn))
 
             # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
             # `prompt_text` も非実在だった (build_improve_context は
@@ -1532,6 +1547,15 @@ class ImproveLoop:
                                  "discovery. Continue without backtest "
                                  "results."),
                     }
+                try:
+                    holdout.require_reference_history(conn, dataset, resolved)
+                except holdout.ReferenceHistoryMissingError as exc:
+                    error = str(exc)
+                    self._activity.write(
+                        Category.IMPROVE, "reference_history_missing",
+                        f"mission={staging_dir.name} name={args['name']} error={error}")
+                    conn.close()
+                    return {"started": False, "error": error}
                 intent_source = strategy_adapter.build_intent_source(
                     meta, conn=conn, pair=args["pair"], dataset=dataset,
                     settings=self._settings, resolved=resolved)
@@ -3614,7 +3638,13 @@ class ImproveLoop:
                     if not strategy_verdict.evaluable:
                         self._finalize_gate_failed(
                             conn, ctx=ctx, backlog_id=selection.backlog_id,
-                            reason=strategy_verdict.observation_reason, now=now,
+                            reason=(
+                                "gate_failed:backtest_data_unavailable:"
+                                + strategy_verdict.observation_reason
+                                if strategy_verdict.unevaluable_kind
+                                == "reference_history_missing"
+                                else strategy_verdict.observation_reason),
+                            now=now,
                             gate_rows=tuple(gate_rows), tool_calls=tool_calls,
                             candidate=final_candidate,
                             candidate_outcome=(

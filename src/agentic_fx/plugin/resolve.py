@@ -24,6 +24,10 @@ from typing import Any, Literal, Mapping
 import yaml
 
 from agentic_fx.plugin.loader import PluginMeta, _check_json_safe, content_hash
+from agentic_fx.plugin.reference_time import (DEFAULT_MAX_AGE_FACTOR,
+                                              canonical_duration_seconds,
+                                              nominal_reference_bars,
+                                              timeframe_seconds)
 
 # 展開後の canonical handshake 総 byte 数の上限 (設計書 §2.2、codex r5 C1)。
 # 既存 `sandbox._STARTUP_MAX_BYTES` (65536、worker → 親の起動応答) とは
@@ -88,6 +92,11 @@ class ResolvedIndicator:
     max_bars: int
     outputs: tuple[str, ...]
     pinned: bool
+    symbol_mode: str = "self"
+    literal_symbol: str | None = None
+    timeframe: str | None = None
+    max_age_seconds: int | None = None
+    frame_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,17 +115,33 @@ class ResolvedIndicatorSet:
         return {i.alias: i.content_hash for i in self.items}
 
     def pin_object(self) -> dict:
-        """承認 payload 用の plain JSON object (alias 昇順)。"""
-        return {i.alias: {"plugin": i.plugin_name,
-                          "content_hash": i.content_hash,
-                          "params": thaw(i.params)}
-                for i in self.items}
+        """承認・監査 payload 用の plain JSON object (alias 昇順)。
+
+        既定の self dependency は既存 strategy の承認済み payload と同じ形を保つ。
+        入力座標を変えた dependency は解決済みの座標を公開する。
+        """
+        payload: dict[str, dict] = {}
+        for item in self.items:
+            entry = {"plugin": item.plugin_name,
+                     "content_hash": item.content_hash,
+                     "params": thaw(item.params)}
+            if (item.symbol_mode == "literal" or item.frame_id is not None
+                    or item.max_age_seconds != DEFAULT_MAX_AGE_FACTOR * timeframe_seconds(item.timeframe)):
+                entry.update({"symbol_mode": item.symbol_mode,
+                              "symbol": item.literal_symbol,
+                              "timeframe": item.timeframe,
+                              "max_age_seconds": item.max_age_seconds})
+            payload[item.alias] = entry
+        return payload
 
     def handshake_items(self) -> list[dict]:
         """`PluginSession.__enter__` が handshake に載せる形 (alias 順)。"""
         return [{"alias": i.alias, "plugin_py": str(i.plugin_py),
+                 "plugin_name": i.plugin_name,
                  "params": thaw(i.params), "max_bars": i.max_bars,
-                 "outputs": list(i.outputs)}
+                 "outputs": list(i.outputs), "symbol_mode": i.symbol_mode,
+                 "symbol": i.literal_symbol, "timeframe": i.timeframe,
+                 "max_age_seconds": i.max_age_seconds, "frame_id": i.frame_id}
                 for i in self.items]
 
 
@@ -187,12 +212,40 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         except (TypeError, ValueError) as exc:
             raise IndicatorResolutionError(
                 ref.alias, "params_not_json_safe") from exc
+        reference_timeframe = ref.timeframe or meta.timeframe
+        if reference_timeframe is None:
+            raise IndicatorResolutionError(ref.alias, "reference_timeframe_invalid")
+        symbol_mode = "self" if ref.symbol == "self" else "literal"
+        literal_symbol = None if symbol_mode == "self" else ref.symbol
+        if literal_symbol is not None:
+            if literal_symbol not in settings.datafeed.watch_symbols:
+                raise IndicatorResolutionError(ref.alias, "symbol_not_watched")
+            if len(literal_symbol.encode("utf-8")) > 32:
+                raise IndicatorResolutionError(ref.alias, "watch_symbol_too_long")
+        try:
+            max_age_seconds = (canonical_duration_seconds(ref.max_age)
+                               if ref.max_age is not None
+                               else DEFAULT_MAX_AGE_FACTOR * timeframe_seconds(reference_timeframe))
+        except ValueError as exc:
+            raise IndicatorResolutionError(ref.alias, "max_age_invalid") from exc
+        if max_age_seconds > 7 * 86400:
+            raise IndicatorResolutionError(ref.alias, "max_age_too_large")
+        is_main_frame = symbol_mode == "self" and reference_timeframe == meta.timeframe
+        if not is_main_frame:
+            required_bars = nominal_reference_bars(meta.max_bars, meta.timeframe,
+                                                   reference_timeframe)
+            if required_bars > dep.max_bars:
+                raise IndicatorResolutionError(ref.alias, "reference_window_exceeds_max_bars")
+        frame_id = None if is_main_frame else f"{literal_symbol or 'self'}@{reference_timeframe}"
         items.append(ResolvedIndicator(
             alias=ref.alias, plugin_name=dep.name,
             plugin_py=dep.path / "plugin.py", content_hash=dep.content_hash,
             params=freeze_params(merged), max_bars=dep.max_bars,
             outputs=dep.outputs,
-            pinned=(pin_mode == "ignore") or ref.pin is not None))
+            pinned=(pin_mode == "ignore") or ref.pin is not None,
+            symbol_mode=symbol_mode, literal_symbol=literal_symbol,
+            timeframe=reference_timeframe, max_age_seconds=max_age_seconds,
+            frame_id=frame_id))
     items.sort(key=lambda i: i.alias)
     resolved = ResolvedIndicatorSet(
         inventory_root=inventory.root, items=tuple(items),
@@ -201,6 +254,21 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
                          sort_keys=True, ensure_ascii=False, allow_nan=False)
     if len(encoded.encode("utf-8")) > MAX_HANDSHAKE_BYTES:
         raise IndicatorResolutionError(None, "handshake_too_large")
+    if any(item.symbol_mode == "literal" for item in items):
+        from agentic_fx.plugin.logic_identity import (
+            FamilyKeyTooLong, ParsedDependency, reference_family_key,
+        )
+        by_alias = {item.alias: item for item in items}
+        dependencies = [
+            ParsedDependency(ref.alias, by_alias[ref.alias].plugin_name,
+                             by_alias[ref.alias].symbol_mode,
+                             by_alias[ref.alias].literal_symbol,
+                             by_alias[ref.alias].timeframe)
+            for ref in meta.indicators]
+        try:
+            reference_family_key(meta.timeframe, meta.pairs, dependencies)
+        except FamilyKeyTooLong as exc:
+            raise IndicatorResolutionError(None, "family_key_too_long") from exc
     return resolved
 
 

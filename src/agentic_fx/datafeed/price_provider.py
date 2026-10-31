@@ -139,8 +139,7 @@ class PriceProvider:
             if name == "mt5" and d.mt5.enabled:
                 return ("mt5", (lambda: sources.mt5_quote(d.mt5.bridge_url, pair))
                         if kind == "quote" else
-                        (lambda: sources.mt5_bars(d.mt5.bridge_url, pair, interval,
-                                                  lookback_days)))
+                        (lambda: self._mt5_bars(pair, interval, lookback_days)))
             if name == "twelvedata" and td_key:
                 return ("twelvedata", (lambda: sources.td_quote(td_key, pair))
                         if kind == "quote" else
@@ -209,7 +208,8 @@ class PriceProvider:
                 if (interval in sources.NATIVE_INTERVALS[name]
                         and interval not in DERIVE_ONLY_INTERVALS):
                     bars, origin = fn(), name
-                    validate_bars(bars, now, d.freshness_max_min, interval_min)
+                    validate_bars(bars, now, d.freshness_max_min, interval_min,
+                                  check_calendar=not self._is_raw_watch(pair))
                     bars = normalize_closed_range(
                         bars, interval=interval, start=window_start, end=now,
                         cutoff=now, grace=grace)
@@ -233,7 +233,7 @@ class PriceProvider:
                         # 内部で足すため、ここでは終端分の interval と grace を足す)
                         d.freshness_max_min + interval_min
                         + d.closed_bar_grace_sec / 60,
-                        interval_min)
+                        interval_min, check_calendar=not self._is_raw_watch(pair))
                 # source は素の名前、origin は導出情報つき (別々に持つ —
                 # 品質フラグの完全一致判定を導出で壊さないため)
                 self._bars_source[(pair, interval)] = name
@@ -307,7 +307,7 @@ class PriceProvider:
                         cached, now,
                         d.freshness_max_min + cached_interval_min
                         + d.closed_bar_grace_sec / 60,
-                        cached_interval_min)
+                        cached_interval_min, check_calendar=not self._is_raw_watch(pair))
                     if src == interval:
                         return cached, "cache"
                     derived = self._resample(cached, pair, interval)
@@ -320,7 +320,7 @@ class PriceProvider:
                         derived, now,
                         d.freshness_max_min + derived_interval_min
                         + d.closed_bar_grace_sec / 60,
-                        derived_interval_min)
+                        derived_interval_min, check_calendar=not self._is_raw_watch(pair))
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"{label}: {_safe_error_text(e)}")
                     continue
@@ -346,6 +346,20 @@ class PriceProvider:
 
     # ---- 足の導出 ---------------------------------------------------------
 
+    def _is_raw_watch(self, pair: str) -> bool:
+        """取引 pair ではなく参照銘柄 (broker の raw 名) として扱う名前か。"""
+        return pair not in self.settings.pairs and pair in self.settings.datafeed.watch_symbols
+
+    def _mt5_bars(self, pair: str, interval: str, lookback_days: float) -> list[Bar]:
+        """取引 pair は論理名 → vendor 名の表を通し、参照銘柄は broker の raw 名のまま取る。"""
+        d = self.settings.datafeed
+        if self._is_raw_watch(pair):
+            end = self.clock.now()
+            return sources.mt5_raw_bars_range(
+                d.mt5.bridge_url, sources.MT5RawSymbol.parse(pair), interval,
+                end - timedelta(days=lookback_days), end)
+        return sources.mt5_bars(d.mt5.bridge_url, pair, interval, lookback_days)
+
     def _fetch_native(self, pair: str, source: str, interval: str,
                       lookback_days: float) -> list[Bar]:
         """指定 source から指定のネイティブ足を取る (_chain を経由しない)。
@@ -356,7 +370,7 @@ class PriceProvider:
         d = self.settings.datafeed
         days = max(1, int(lookback_days))
         if source == "mt5":
-            return sources.mt5_bars(d.mt5.bridge_url, pair, interval, days)
+            return self._mt5_bars(pair, interval, days)
         if source == "twelvedata":
             return sources.td_bars(self._td_key(), pair, interval, days)
         if source == "yfinance":
@@ -401,7 +415,7 @@ class PriceProvider:
         # 捕まり、技術ログ warning + 次ソース (最終的にキャッシュ) へ流れる。
         validate_bars(raw, self.clock.now(),
                       self.settings.datafeed.freshness_max_min,
-                      sources.INTERVAL_MIN[base])
+                      sources.INTERVAL_MIN[base], check_calendar=not self._is_raw_watch(pair))
         now = self.clock.now()
         raw = normalize_closed_range(
             raw, interval=base,

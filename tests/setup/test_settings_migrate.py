@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
 from agentic_fx.setup.settings_migrate import (
@@ -27,7 +28,7 @@ def test_version_zero_migration_inserts_only_schema_version_line():
     assert result.ok
     assert result.text is not None
     assert without_lock_lines(result.text).replace(
-        "schema_version: 4  # settings の版。`afx init` が移行する\n", "",
+        "schema_version: 5  # settings の版。`afx init` が移行する\n", "",
     ) == old
 
 
@@ -36,7 +37,7 @@ def test_version_zero_migration_inserts_the_exact_line_before_display_timezone()
     result = migrate(old)
     assert result.ok
     assert result.text is not None
-    assert result.text.index("schema_version: 4  # settings の版。`afx init` が移行する\n") < \
+    assert result.text.index("schema_version: 5  # settings の版。`afx init` が移行する\n") < \
         result.text.index("display_timezone: Asia/Tokyo")
 
 
@@ -53,7 +54,7 @@ def test_version_zero_to_one_migration_remains_available_for_the_chain():
 
 
 def test_newer_schema_is_left_unchanged_with_update_guidance():
-    text = EXAMPLE.read_text(encoding="utf-8").replace("schema_version: 4", "schema_version: 5")
+    text = EXAMPLE.read_text(encoding="utf-8").replace("schema_version: 5", "schema_version: 6")
 
     result = migrate(text)
 
@@ -85,17 +86,19 @@ def test_every_schema_fixture_exists_and_migrates_without_changing_existing_line
         assert result.text is not None
         if fixture.name == "v0.yaml":
             assert without_lock_lines(result.text).replace(
-                "schema_version: 4  # settings の版。`afx init` が移行する\n", "",
+                    "schema_version: 5  # settings の版。`afx init` が移行する\n", "",
             ) == original
         elif fixture.name == "v1.yaml":
             assert without_lock_lines(result.text) == original.replace(
-                "schema_version: 1", "schema_version: 4", 1)
+                "schema_version: 1", "schema_version: 5", 1)
         elif fixture.name == "v2.yaml":
             assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace(
-                "schema_version: 3", "schema_version: 4", 1)
+                "schema_version: 3", "schema_version: 5", 1)
         elif fixture.name == "v3.yaml":
-            assert result.text == original.replace("schema_version: 3", "schema_version: 4", 1)
+            assert result.text == original.replace("schema_version: 3", "schema_version: 5", 1)
         elif fixture.name == "v4.yaml":
+            assert result.text == original.replace("schema_version: 4", "schema_version: 5", 1)
+        elif fixture.name == "v5.yaml":
             assert result.text == original
 
 
@@ -106,6 +109,58 @@ def test_fixtures_are_tied_to_current_example_bytes_and_schema_version():
     assert (FIXTURES / f"v{current}.yaml").read_bytes() == EXAMPLE.read_bytes()
 
 
+def test_v4_watch_symbol_overlap_is_a_migration_error_without_editing():
+    old = (FIXTURES / "v4.yaml").read_text(encoding="utf-8").replace(
+        "watch_symbols: []", "watch_symbols: [USDJPY]", 1)
+
+    result = migrate(old)
+
+    assert not result.ok
+    assert result.text is None
+    assert result.reason == "watch_symbols_overlap"
+
+
+def test_v4_duplicate_watch_symbol_is_a_migration_error_without_editing():
+    old = (FIXTURES / "v4.yaml").read_text(encoding="utf-8").replace(
+        "watch_symbols: []", "watch_symbols: [JP225, JP225]", 1)
+
+    result = migrate(old)
+
+    assert not result.ok
+    assert result.text is None
+    assert result.reason == "watch_symbols_duplicate"
+
+
+def test_v4_non_mt5_watch_symbols_have_a_fixed_migration_error_and_guidance():
+    old = (FIXTURES / "v4.yaml").read_text(encoding="utf-8").replace(
+        "watch_symbols: []", "watch_symbols: [JP225]", 1)
+
+    result = migrate(old)
+
+    assert not result.ok
+    assert result.text is None
+    assert result.reason == (
+        "watch_symbols_require_mt5_primary: datafeed.primary を mt5 にしてから "
+        "afx init を再実行してください。")
+
+
+def test_watch_symbols_require_mt5_are_disjoint_and_have_a_32_utf8_byte_limit():
+    from agentic_fx.config import Settings
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["datafeed"]["watch_symbols"] = ["JP225"]
+    with pytest.raises(ValueError, match="watch_symbols_require_mt5_primary"):
+        Settings.model_validate(raw)
+
+    raw["datafeed"]["primary"] = "mt5"
+    raw["datafeed"]["yfinance"]["enabled"] = False
+    raw["datafeed"]["mt5"]["enabled"] = True
+    raw["datafeed"]["watch_symbols"] = ["あ" * 10, "a" * 32]
+    assert Settings.model_validate(raw).datafeed.watch_symbols == ["あ" * 10, "a" * 32]
+    raw["datafeed"]["watch_symbols"] = ["あ" * 11]
+    with pytest.raises(ValueError, match="watch_symbol_too_long"):
+        Settings.model_validate(raw)
+
+
 def test_version_one_migration_changes_only_the_schema_version_line():
     old = (FIXTURES / "v1.yaml").read_text(encoding="utf-8")
 
@@ -114,7 +169,7 @@ def test_version_one_migration_changes_only_the_schema_version_line():
     assert result.ok
     assert result.text is not None
     assert without_lock_lines(result.text).replace(
-        "schema_version: 4", "schema_version: 1", 1) == old
+        "schema_version: 5", "schema_version: 1", 1) == old
     assert "enabled: false              # 改善 worker" in result.text
 
 
@@ -125,7 +180,7 @@ def test_version_zero_migrates_through_version_one_to_version_two():
 
     assert result.ok
     expected = (FIXTURES / "v1.yaml").read_text(encoding="utf-8").replace(
-        "schema_version: 1", "schema_version: 4", 1)
+        "schema_version: 1", "schema_version: 5", 1)
     assert without_lock_lines(result.text) == expected
     assert PLUGIN_LOCK_LINE in result.text
 
@@ -137,8 +192,8 @@ def test_version_two_migrates_to_the_current_example_by_adding_the_lock_timeout(
 
     assert result.ok
     assert result.text == (FIXTURES / "v3.yaml").read_text(encoding="utf-8").replace(
-        "schema_version: 3", "schema_version: 4", 1)
-    assert yaml.safe_load(result.text)["schema_version"] == 4
+        "schema_version: 3", "schema_version: 5", 1)
+    assert yaml.safe_load(result.text)["schema_version"] == 5
 
 
 def test_version_two_migration_keeps_an_existing_lock_timeout_value():
@@ -148,7 +203,7 @@ def test_version_two_migration_keeps_an_existing_lock_timeout_value():
     result = migrate(old)
 
     assert result.ok
-    assert result.text == old.replace("schema_version: 2", "schema_version: 4", 1).replace(
+    assert result.text == old.replace("schema_version: 2", "schema_version: 5", 1).replace(
         "(lock内再取得しない)\n", "(lock内再取得しない)\n" + RECONCILE_LOCK_LINE, 1)
 
 
@@ -161,7 +216,7 @@ def test_version_two_migration_without_a_worker_section_changes_only_the_marker(
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text == old.replace("schema_version: 2", "schema_version: 4", 1)
+    assert result.text == old.replace("schema_version: 2", "schema_version: 5", 1)
 
 
 def test_version_two_migration_without_trailing_newline_keeps_lines_separate():
@@ -188,8 +243,8 @@ def test_version_two_marker_does_not_match_a_longer_number():
     assert not result.ok
 
 
-def test_version_four_is_a_noop():
-    current = (FIXTURES / "v4.yaml").read_text(encoding="utf-8")
+def test_version_five_is_a_noop():
+    current = (FIXTURES / "v5.yaml").read_text(encoding="utf-8")
 
     result = migrate(current)
 
@@ -203,7 +258,7 @@ def test_ac26_version_three_migrates_by_changing_only_the_marker():
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+    assert result.text == old.replace("schema_version: 3", "schema_version: 5", 1)
     assert "notify:" not in result.text
     # 節が無くても既定 true で読める
     from agentic_fx.config import Settings
@@ -218,10 +273,10 @@ def test_ac26_old_yaml_without_notify_section_reads_with_default_true():
         assert Settings.model_validate(raw).notify.trade_events is True
 
 
-def test_ac26_example_is_v4_and_validates_with_notify_section():
+def test_example_is_v5_and_validates_with_notify_section():
     from agentic_fx.config import Settings
     raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == 4 and raw["notify"] == {"trade_events": True, "improve_events": True}
+    assert raw["schema_version"] == 5 and raw["notify"] == {"trade_events": True, "improve_events": True}
     assert Settings.model_validate(raw).notify.trade_events is True
 
 
@@ -245,7 +300,7 @@ def test_version_three_migration_keeps_crlf_line_endings_byte_for_byte():
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+    assert result.text == old.replace("schema_version: 3", "schema_version: 5", 1)
 
 
 def test_version_three_migration_rejects_an_invalid_notify_value():
@@ -267,7 +322,7 @@ def test_version_three_marker_without_a_comment_migrates_under_crlf():
     result = migrate(old)
 
     assert result.ok, result.reason
-    assert result.text == old.replace("schema_version: 3", "schema_version: 4", 1)
+    assert result.text == old.replace("schema_version: 3", "schema_version: 5", 1)
 
 
 def _variants(version: int):
@@ -284,8 +339,8 @@ def test_version_three_marker_with_odd_spacing_is_really_rewritten():
         result = migrate(old)
 
         assert result.ok, result.reason
-        assert yaml.safe_load(result.text)["schema_version"] == 4
-        assert result.text == old.replace(line, line.replace("3", "4", 1), 1)
+        assert yaml.safe_load(result.text)["schema_version"] == 5
+        assert result.text == old.replace(line, line.replace("3", "5", 1), 1)
 
 
 def test_version_two_marker_with_odd_spacing_is_really_rewritten():

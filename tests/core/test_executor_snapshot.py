@@ -14,7 +14,7 @@ from agentic_fx.core.contracts import (
     OrderStatus as S, Quote, TradeIntent,
 )
 from agentic_fx.core.executor import (
-    CloseSnapshot, ExecutionSnapshot, Executor, SnapshotCoverageError,
+    CloseSnapshot, ExecutionSnapshot, Executor, NotTradableSymbol, SnapshotCoverageError,
     _intent_payload, open_risk_and_notional_from_snapshot,
 )
 from agentic_fx.core.notifier import Notifier
@@ -125,6 +125,7 @@ def test_gather_open_snapshot_covers_intent_pair_and_exposure_pairs(tmp_path):
     """gather_open_snapshot は intent.pair と exposure_pairs の両方の
     spec/通貨レートを含む。"""
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     snapshot = ex.gather_open_snapshot(intent, exposure_pairs=["EURUSD"])
 
@@ -157,10 +158,66 @@ def test_open_from_snapshot_rejects_stale_snapshot(tmp_path):
                                  S.PENDING_FILL) == []
 
 
+def test_open_from_snapshot_rejects_untradable_existing_exposure_before_sizing(
+        monkeypatch, tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    jp225 = InstrumentSpec(symbol="JP225", pip_size=1.0, min_lot=0.01,
+                           max_lot=50.0, lot_step=0.01, contract_size=1.0,
+                           base_currency="JPY", quote_currency="JPY")
+    _insert_open_order(ex.conn, pair="JP225")
+    snapshot = ExecutionSnapshot(
+        quote=QUOTE, spec=SPECS["USDJPY"],
+        specs_by_pair={"USDJPY": SPECS["USDJPY"], "JP225": jp225},
+        rates={"JPY": ConversionRate(1.0, "JPY", "JPY", (NOW,)),
+               "USD": ConversionRate(QUOTE.ask, "USD", "JPY", (NOW,))},
+        captured_at=NOW)
+    sized = []
+
+    def no_sizing(*_args, **_kwargs):
+        sized.append(True)
+        raise AssertionError("untradable exposure reached sizing")
+
+    monkeypatch.setattr("agentic_fx.core.executor.open_risk_and_notional_from_snapshot",
+                        no_sizing)
+
+    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["exposure_not_tradable_symbol"]}
+    assert sized == []
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.PENDING_FILL) == []
+
+
+def test_exposure_membership_check_skips_when_exposure_cannot_be_read(
+        monkeypatch, tmp_path):
+    ex = _make_executor(tmp_path)
+    iid = _insert_intent(ex.conn, _start_trade_mission(ex.conn), _open_intent())
+    monkeypatch.setattr("agentic_fx.core.executor.orders.list_by_status",
+                        lambda *_args, **_kwargs: None)
+
+    assert ex._reject_if_exposure_not_tradable(iid) is None
+
+
+def test_open_preserves_account_unknown_rejection_before_exposure_check(tmp_path):
+    ex = _make_executor(tmp_path)
+    _insert_open_order(ex.conn, pair="JP225")
+    ex.conn.execute("DELETE FROM account_snapshots")
+    ex.conn.commit()
+
+    out = ex.handle_intent(_open_intent(), _start_trade_mission(ex.conn))
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["no fresh account snapshot (fail closed)"]}
+
+
 def test_open_from_snapshot_rejects_when_exposure_grew_after_commit_pre(tmp_path):
     """N4-2: commit-pre と commit-core の間に新規 exposure が確定し、
     スナップショットに必要通貨が無い場合は lock 内取得せず intent 拒否。"""
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
@@ -293,6 +350,8 @@ def test_open_from_snapshot_rejects_when_intent_pair_not_in_snapshot(tmp_path):
     CLOSE 側の test_close_order_from_snapshot_rejects_mismatched_pair と対称。
     """
     ex = _make_executor(tmp_path)
+    ex.settings = SETTINGS.model_copy(
+        update={"pairs": [*SETTINGS.pairs, "EURUSD"]})
     intent = _open_intent(pair="USDJPY")
     mid = _start_trade_mission(ex.conn)
     iid = _insert_intent(ex.conn, mid, intent)
@@ -332,6 +391,7 @@ def test_open_risk_and_notional_from_snapshot_matches_live_version(tmp_path):
     (集計ロジックの逐語移植の pin)。"""
     from agentic_fx.core.executor import open_risk_and_notional
     ex = _make_executor(tmp_path)
+    ex.settings = ex.settings.model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
     _insert_open_order(ex.conn, pair="USDJPY")
     _insert_open_order(ex.conn, pair="EURUSD")
     cycle_rate = ex.cycle_rate_fn(NOW)
@@ -888,3 +948,43 @@ def test_notify_sends_immediately_outside_defer_notifications(tmp_path):
     ex.close_order(row, price=148.49, reason="sl_hit")
 
     assert len(recording.sent) == 1
+
+
+def test_open_from_snapshot_reports_stale_snapshot_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    iid = _insert_intent(ex.conn, _start_trade_mission(ex.conn), intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    stale = ExecutionSnapshot(
+        quote=snapshot.quote, spec=snapshot.spec,
+        specs_by_pair=snapshot.specs_by_pair, rates=snapshot.rates,
+        captured_at=snapshot.captured_at - timedelta(seconds=999))
+    _insert_open_order(ex.conn, pair="JP225")
+
+    out = ex.open_from_snapshot(intent, iid, stale, max_snapshot_age_sec=5.0)
+
+    assert out["result"] == "rejected"
+    assert "stale" in out["reasons"][0]
+
+
+def test_open_from_snapshot_reports_account_unknown_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(pair="USDJPY")
+    iid = _insert_intent(ex.conn, _start_trade_mission(ex.conn), intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+    _insert_open_order(ex.conn, pair="JP225")
+    ex.conn.execute("DELETE FROM account_snapshots")
+    ex.conn.commit()
+
+    out = ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0)
+
+    assert out == {"result": "rejected", "order_id": None,
+                   "reasons": ["no fresh account snapshot (fail closed)"]}
+
+
+def test_gather_open_snapshot_reports_untradable_intent_before_untradable_exposure(tmp_path):
+    ex = _make_executor(tmp_path)
+
+    with pytest.raises(NotTradableSymbol):
+        ex.gather_open_snapshot(_open_intent(pair="JP225"),
+                                exposure_pairs=["JP225"])

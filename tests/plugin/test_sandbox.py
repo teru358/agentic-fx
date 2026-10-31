@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
@@ -52,6 +53,47 @@ def test_session_exposes_parent_observation_fields(tmp_path, plugin_settings):
     assert session.worker_cpu_sec is None
     assert session.parent_kill_sent is False
     assert session.worker_unreaped is False
+
+
+def test_write_line_encodes_a_serialized_text_line_once(monkeypatch, tmp_path,
+                                                         plugin_settings):
+    session = PluginSession(_meta(tmp_path, "write-line", "indicator", INDICATOR_OK_PY),
+                            settings=plugin_settings)
+    session._proc = _PipeHandle()
+    written = []
+    monkeypatch.setattr(os, "write", lambda _fd, data: written.append(bytes(data)) or len(data))
+
+    session._write_line('{"op":"読込"}\n', deadline=time.monotonic() + 1.0)
+
+    assert written == ['{"op":"読込"}\n'.encode("utf-8")]
+    session._close_parent_fds()
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_code"),
+    [({"error": "ValueError: reference_unavailable"}, "plugin_error"),
+     ({"error": "reference unavailable", "error_code": "reference_unavailable"},
+      "reference_unavailable"),
+     ({"error": "indicator unavailable", "error_code": "indicator_unavailable"},
+      "indicator_unavailable"),
+     ({"error": "x", "error_code": "something_else"}, "plugin_error"),
+     ({"error": "x", "error_code": ["reference_unavailable"]}, "plugin_error")])
+def test_call_uses_structured_reference_unavailable_code(
+        monkeypatch, tmp_path, plugin_settings, response, expected_code):
+    session = PluginSession(_meta(tmp_path, f"response-{expected_code}", "indicator",
+                                  INDICATOR_OK_PY), settings=plugin_settings)
+    session._proc = _PipeHandle()
+    sent = []
+    monkeypatch.setattr(session, "_write_line",
+                        lambda line, **_kwargs: sent.append(json.loads(line)))
+    monkeypatch.setattr(session, "_read_response", lambda *_args: {
+        "ok": False, "pid": _PipeHandle.pid, "id": sent[-1]["id"], **response})
+
+    with pytest.raises(SandboxError) as error:
+        session.call({"df": _df(), "params": {}})
+
+    assert error.value.code == expected_code
+
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 SAMPLES = Path(__file__).resolve().parents[2] / "docs" / "examples" / "plugins"
@@ -1089,6 +1131,42 @@ def test_indicator_failure_becomes_sandbox_error(tmp_path, plugin_settings):
             s.call({"df": _df(10), "params": {}})
 
 
+def test_self_indicator_reference_unavailable_value_error_is_a_plugin_error(
+        tmp_path, plugin_settings):
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(
+        root, "wording",
+        "def compute(df, params):\n    raise ValueError('reference_unavailable')\n")
+    meta = _meta(tmp_path, "strat-wording", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as session:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(10), "params": {}})
+
+    assert error.value.code == "plugin_error"
+
+
+def test_missing_reference_frame_has_reference_unavailable_code(tmp_path, plugin_settings):
+    from dataclasses import replace
+
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(root, "reference", RSI_SERIES_PY, outputs=("rsi",))
+    meta = _meta(tmp_path, "strat-reference", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+    resolved = replace(resolved, items=(replace(
+        resolved.items[0], timeframe="4h", max_age_seconds=43_200,
+        frame_id="self@4h"),))
+
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as session:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": _df(10), "params": {}})
+
+    assert error.value.code == "reference_unavailable"
+
+
 def test_indicator_output_set_mismatch_becomes_sandbox_error(tmp_path,
                                                              plugin_settings):
     """V1: outputs 集合不一致は親に SandboxError として届く。"""
@@ -1141,9 +1219,9 @@ def test_handshake_omits_outputs_key_for_non_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings, resolved=resolved)
     real_write_line = session._write_line
 
-    def _spy(obj, **kwargs):
-        sent.append(obj)
-        real_write_line(obj, **kwargs)
+    def _spy(line, **kwargs):
+        sent.append(json.loads(line))
+        real_write_line(line, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1160,9 +1238,9 @@ def test_handshake_includes_outputs_key_for_indicator_kind(tmp_path,
     session = PluginSession(meta, settings=plugin_settings)
     real_write_line = session._write_line
 
-    def _spy(obj, **kwargs):
-        sent.append(obj)
-        real_write_line(obj, **kwargs)
+    def _spy(line, **kwargs):
+        sent.append(json.loads(line))
+        real_write_line(line, **kwargs)
 
     monkeypatch.setattr(session, "_write_line", _spy)
     with session:
@@ -1622,7 +1700,7 @@ def _scripted_startup(monkeypatch, target, *, pid=None, loaded=None, sent=None):
     reads = {"n": 0}
 
     def write(*args, **_kwargs):
-        sent.append(args[-1])
+        sent.append(json.loads(args[-1]))
 
     def read(*_args):
         reads["n"] += 1
@@ -2308,7 +2386,8 @@ def test_terminal_error_codes_are_fixed_before_diagnostic_logging(
     real_write = os.write
     monkeypatch.setattr(os, "write", lambda _fd, data: len(data))
     sent = []
-    monkeypatch.setattr(session, "_write_line", lambda obj, **_k: sent.append(obj))
+    monkeypatch.setattr(session, "_write_line",
+                        lambda line, **_k: sent.append(json.loads(line)))
     monkeypatch.setattr(session, "_read_response", lambda *_: {
         "ok": False, "error": "boom", "pid": _PipeHandle.pid, "id": sent[-1]["id"]})
     with pytest.raises(SandboxError) as plugin_error:
@@ -3832,3 +3911,173 @@ def test_indicator_scalar_null_is_kept_as_an_undetermined_value():
 
     assert sandbox._validate_indicator_result({"x": None, "y": 1.5},
                                               outputs=("x", "y")) == {"x": None, "y": 1.5}
+
+
+CLOSE_AS_RSI_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    return {"rsi": df["close"].astype(float)}
+"""
+
+ALL_NAN_RSI_PY = """
+import pandas as pd
+
+
+def compute(df, params):
+    return {"rsi": pd.Series(float("nan"), index=df.index)}
+"""
+
+
+def _frame_df(first: str, periods: int, freq: str = "1h", value: float = 7.0):
+    idx = pd.date_range(first, periods=periods, freq=freq, tz="UTC")
+    return pd.DataFrame({"open": value, "high": value, "low": value, "close": value,
+                         "volume": 1.0}, index=idx)
+
+
+def _reference_session(tmp_path, plugin_settings, plugin_py, *, frame_id="JP225@1h"):
+    from dataclasses import replace
+
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(root, "reference", plugin_py, outputs=("rsi",))
+    meta = _meta(tmp_path, "strat-reference", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+    resolved = replace(resolved, items=(replace(
+        resolved.items[0], symbol_mode="literal", literal_symbol="JP225",
+        timeframe="1h", max_age_seconds=3 * 3600, frame_id=frame_id),))
+    return PluginSession(meta, settings=plugin_settings, resolved=resolved)
+
+
+def test_a_fresh_reference_frame_reaches_the_worker_through_session_call(
+        tmp_path, plugin_settings):
+    main = _df(10)  # 2026-01-01 00:00 .. 09:00
+    with _reference_session(tmp_path, plugin_settings, CLOSE_AS_RSI_PY) as session:
+        out = session.call({"df": main, "params": {},
+                            "frames": {"JP225@1h": _frame_df("2026-01-01 00:00", 10)}})
+    assert "last=7.0000" in out["rationale"]
+
+
+def test_a_reference_indicator_that_is_nan_at_the_last_main_row_is_unavailable(
+        tmp_path, plugin_settings):
+    main = _df(10)
+    stale = _frame_df("2026-01-01 00:00", 5)  # last end 05:00, decision 10:00, age 5h > 3h
+    with _reference_session(tmp_path, plugin_settings, CLOSE_AS_RSI_PY) as session:
+        with pytest.raises(SandboxError) as error:
+            session.call({"df": main, "params": {}, "frames": {"JP225@1h": stale}})
+        assert error.value.code == "indicator_unavailable"
+        # the session stays usable and a fresh frame is evaluated normally
+        out = session.call({"df": main, "params": {},
+                            "frames": {"JP225@1h": _frame_df("2026-01-01 00:00", 10)}})
+    assert out["action"] == "hold"
+
+
+def test_a_main_frame_dependency_with_nan_values_still_runs(tmp_path, plugin_settings):
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(root, "nanind", ALL_NAN_RSI_PY, outputs=("rsi",))
+    meta = _meta(tmp_path, "strat-nan", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as session:
+        out = session.call({"df": _df(10), "params": {}})
+    assert out["action"] == "hold" and "last=nan" in out["rationale"]
+
+
+
+STRATEGY_OPENS_PY = """
+def evaluate(df, indicators, signals, params):
+    r = indicators["rsi"]["rsi"]
+    return {"action": "open", "rationale": f"ref={float(r.iloc[-1]):.1f}",
+            "direction": "long", "entry_type": "market", "limit_price": None,
+            "stop_loss": 100.0, "take_profit": None}
+"""
+
+
+def _real_producer_run(tmp_path, plugin_settings, *, jp_last_hour: int,
+                       indicator_py: str = CLOSE_AS_RSI_PY):
+    """The live producer driving a real worker with a reference frame it built."""
+    from dataclasses import replace
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from agentic_fx.core.contracts import Bar
+    from agentic_fx.plugin.signal_producer import SignalProducer
+    from agentic_fx.store import ohlcv as ohlcv_store
+    from agentic_fx.store.db import connect, init_db
+
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    start = datetime(2026, 7, 22, 0, tzinfo=timezone.utc)
+    for symbol, price, hours in (("USDJPY", 100.0, 12), ("JP225", 7.0, jp_last_hour)):
+        ohlcv_store.upsert_cache_bars(conn, [
+            Bar(symbol, "1h", start + timedelta(hours=h), price, price, price, price, 5.0)
+            for h in range(hours)], source="mt5-live")
+    root = tmp_path / "plugins"
+    indicator = _indicator_dir(root, "reference", indicator_py, outputs=("rsi",))
+    meta = _meta(tmp_path, "strat-live", "strategy", STRATEGY_OPENS_PY,
+                 timeframe="1h", pairs=("USDJPY",), max_bars=3)
+    resolved = _resolved(root, ("rsi", indicator, ("rsi",), {}, 200))
+    resolved = replace(resolved, items=(replace(
+        resolved.items[0], symbol_mode="literal", literal_symbol="JP225",
+        timeframe="1h", max_age_seconds=3 * 3600, frame_id="JP225@1h"),))
+    settings = SimpleNamespace(
+        plugin=plugin_settings, pairs=["USDJPY"],
+        datafeed=SimpleNamespace(closed_bar_grace_sec=0, watch_symbols=["JP225"]))
+    events = []
+    activity = SimpleNamespace(write=lambda category, event, summary, ref_id="":
+                               events.append((event, summary)))
+    inserted = SignalProducer().evaluate_due_plugins(
+        conn, plugins=[meta], now=datetime(2026, 7, 22, 12, 1, tzinfo=timezone.utc),
+        source="mt5-live", settings=settings, activity=activity,
+        resolved_by_identity={(meta.name, meta.content_hash): resolved})
+    rows = [(r["bar_ts"], r["payload_json"])
+            for r in conn.execute("SELECT bar_ts, payload_json FROM signals")]
+    conn.close()
+    return inserted, rows, events
+
+
+def test_the_live_producer_feeds_a_real_worker_a_fresh_reference_frame(
+        tmp_path, plugin_settings):
+    inserted, rows, events = _real_producer_run(tmp_path, plugin_settings, jp_last_hour=12)
+    assert inserted >= 1 and any("ref=7.0" in payload for _, payload in rows)
+    assert not [e for e in events if e[0] in ("plugin_eval_failed", "reference_unavailable")]
+
+
+def test_the_live_producer_skips_a_stale_frame_before_calling_the_worker(
+        tmp_path, plugin_settings):
+    """Frame rows end at 08:00; the 12:00 decision is stale, so no signal is stored."""
+    inserted, rows, events = _real_producer_run(tmp_path, plugin_settings, jp_last_hour=8)
+    assert not any(bar_ts.startswith("2026-07-22T11") for bar_ts, _ in rows)
+    assert any(e[0] == "reference_unavailable" and "reason=age_exceeded" in e[1] for e in events)
+    assert not [e for e in events if e[0] == "plugin_eval_failed"]
+
+
+def test_the_live_producer_skips_when_the_real_worker_reports_no_indicator_value(
+        tmp_path, plugin_settings):
+    inserted, rows, events = _real_producer_run(
+        tmp_path, plugin_settings, jp_last_hour=12, indicator_py=ALL_NAN_RSI_PY)
+    assert inserted == 0 and rows == []
+    assert any(e[0] == "reference_unavailable" and "reason=indicator_unavailable" in e[1]
+               for e in events)
+    assert not [e for e in events if e[0] == "plugin_eval_failed"]
+
+
+def test_sample_ohlcv_indicator_passes_check_source_and_passes_through_in_a_real_worker(
+        tmp_path, plugin_settings):
+    import shutil
+
+    source = SAMPLES / "ohlcv"
+    check_source(source / "plugin.py")
+    check_source(source / "test_plugin.py", extra_allowed=frozenset({"pytest", "plugin"}))
+    plugin_dir = tmp_path / "ohlcv"
+    shutil.copytree(source, plugin_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    meta = PluginMeta(name="ohlcv", kind="indicator", path=plugin_dir, params={},
+                      timeframe=None, pairs=(), max_bars=400,
+                      content_hash=_real_content_hash(plugin_dir),
+                      outputs=("open", "high", "low", "close", "volume"))
+    df = _df(30)
+    with PluginSession(meta, settings=plugin_settings) as session:
+        out = session.call({"df": df, "params": {}})
+    assert list(out) == ["open", "high", "low", "close", "volume"]
+    assert out["close"] == df["close"].tolist()

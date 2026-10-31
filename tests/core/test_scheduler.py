@@ -877,6 +877,7 @@ def test_pending_fill_not_processed_when_account_snapshot_unknown(tmp_path):
     が約定してしまう (fail-open)。全 pending_fill を取消し、その tick の
     fills 処理をスキップしなければならない。"""
     env = Env(tmp_path)
+    oid = env.place_limit()  # USDJPY entry=148.20
     # 別ペア (EURUSD) の open ポジションを直接挿入。このペアのバーは一度も
     # 与えないため、mark_to_market は毎 tick 陳腐化スキップし続け、
     # snapshot (Env.__init__ 時点の WED) が更新されないまま 10 分の陳腐化
@@ -885,7 +886,6 @@ def test_pending_fill_not_processed_when_account_snapshot_unknown(tmp_path):
                  entry_type="market", horizon="swing", status="open",
                  now=WED, quantity=0.1, avg_fill_price=1.1000,
                  stop_loss=1.0960, take_profit=1.1120)
-    oid = env.place_limit()  # USDJPY entry=148.20
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))
@@ -983,11 +983,11 @@ def test_pending_fill_still_skipped_when_account_snapshot_unknown_after_split(tm
     """_process_limit_fills / _process_exits に分離した後も、修正 1 の意図
     (口座不明時は新規約定させない) が維持されていることの回帰確認。"""
     env = Env(tmp_path)
+    oid = env.place_limit()  # USDJPY entry=148.20
     orders.insert(env.conn, pair="EURUSD", direction="long",
                  entry_type="market", horizon="swing", status="open",
                  now=WED, quantity=0.1, avg_fill_price=1.1000,
                  stop_loss=1.0960, take_profit=1.1120)
-    oid = env.place_limit()  # USDJPY entry=148.20
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))
@@ -1724,11 +1724,11 @@ def test_account_unknown_cancel_pending_activity_event_name(tmp_path):
     close_reason の `account_unknown` (部分一致) しか見ておらず、イベント名
     そのものが変わっても検出できなかった。"""
     env = Env(tmp_path)
+    env.place_limit()  # USDJPY entry=148.20
     orders.insert(env.conn, pair="EURUSD", direction="long",
                  entry_type="market", horizon="swing", status="open",
                  now=WED, quantity=0.1, avg_fill_price=1.1000,
                  stop_loss=1.0960, take_profit=1.1120)
-    env.place_limit()  # USDJPY entry=148.20
     env.bars["USDJPY"] = Bar("USDJPY", "1m", WED + timedelta(minutes=11),
                              148.30, 148.35, 148.15, 148.25, 100)
     env.sched.tick(WED + timedelta(minutes=11))

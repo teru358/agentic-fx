@@ -111,6 +111,46 @@ def test_approved_plugins_includes_approved_hash_match(tmp_path):
     assert isinstance(metas[0], PluginMeta)
 
 
+def test_ohlcv_indicator_is_resolvable_only_after_its_approval(tmp_path):
+    """The passthrough's name does not bypass the normal approval inventory."""
+    from agentic_fx.plugin.loader import content_hash, discover_one_with_reason
+    from agentic_fx.plugin.resolve import (
+        IndicatorResolutionError, resolve_indicator_deps,
+    )
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    ohlcv = _write_plugin(
+        plugins_dir, "ohlcv",
+        plugin_py=("def compute(df, params):\n"
+                   "    return {c: df[c].copy() for c in "
+                   "('open', 'high', 'low', 'close', 'volume')}\n"),
+        config_yaml=("kind: indicator\noutputs: [open, high, low, close, volume]\n"),
+    )
+    strategy_dir = _write_plugin(
+        tmp_path, "strategy",
+        plugin_py=("def evaluate(df, indicators, signals, params):\n"
+                   "    return {'action': 'hold', 'rationale': 'test'}\n"),
+        config_yaml=("kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\n"
+                     "exit_mode: levels\nindicators:\n  bars: {plugin: ohlcv}\n"),
+    )
+    strategy, reason = discover_one_with_reason(strategy_dir, "strategy")
+    assert reason is None
+    conn = _conn(tmp_path)
+
+    before = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS)
+    with pytest.raises(IndicatorResolutionError, match="not_found"):
+        resolve_indicator_deps(strategy, before.inventory, settings=_SETTINGS,
+                               pin_mode="ignore")
+
+    _approve(conn, "ohlcv", content_hash(ohlcv))
+    after = plugin_loader.approved_plugins(conn, plugins_dir, settings=_SETTINGS)
+    resolved = resolve_indicator_deps(strategy, after.inventory, settings=_SETTINGS,
+                                      pin_mode="ignore")
+    assert resolved.items[0].plugin_name == "ohlcv"
+    assert resolved.items[0].outputs == ("open", "high", "low", "close", "volume")
+
+
 # レビュー fix round 1 F2 (Task 3 レビュー, codex) — status='approved' の
 # 完全一致を固定するテスト (status を LIKE 一致や大文字許容に緩める変異、
 # pending/rejected を admit してしまう変異を検出する)。

@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import quote
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -40,6 +42,28 @@ VENDOR_SYMBOLS: dict[str, dict[str, str]] = {
     # 関連指標の拡張例 (Phase 1 では未使用):
     "DXY": {"yf": "DX-Y.NYB", "td": "DXY"},
 }
+
+
+@dataclass(frozen=True, slots=True)
+class MT5RawSymbol:
+    """Validated broker spelling for analysis-only MT5 reference series.
+
+    This is deliberately not a logical trading pair and has no conversion via
+    ``VENDOR_SYMBOLS``.  ``mt5_raw_bars_range`` is the only consumer.
+    """
+    value: str
+
+    @classmethod
+    def parse(cls, value: object) -> "MT5RawSymbol":
+        if not isinstance(value, str) or not value:
+            raise ValueError("mt5_raw_symbol_invalid")
+        try:
+            size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("mt5_raw_symbol_invalid") from exc
+        if size > 32:
+            raise ValueError("watch_symbol_too_long")
+        return cls(value)
 
 
 def vendor_symbol(logical: str, vendor: str) -> str:
@@ -143,6 +167,28 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
     # bar の出来高キーは "volume" (bridge が MT5 の tick_volume を変換済み)。
     # "tick_volume" を読むと全バーが 0 になる
     return [Bar(pair, interval, _to_utc(datetime.fromisoformat(x["time"]), "mt5"),
+                float(x["open"]), float(x["high"]), float(x["low"]),
+                float(x["close"]), float(x["volume"]))
+            for x in payload["bars"]]
+
+
+def mt5_raw_bars_range(bridge_url: str, symbol: MT5RawSymbol, interval: str,
+                       start: datetime, end: datetime, *, timeout: float = 30) -> list[Bar]:
+    """Fetch a broker-spelled analysis symbol; never maps through ``VENDOR_SYMBOLS``.
+
+    The symbol is percent-encoded as one path segment, and the returned bars carry
+    the raw spelling.
+    """
+    if not isinstance(symbol, MT5RawSymbol):
+        raise TypeError("mt5_raw_bars_range requires an MT5RawSymbol")
+    r = httpx.get(f"{bridge_url.rstrip('/')}/ohlcv/{quote(symbol.value, safe='')}",
+                  params={"from": start.isoformat(), "to": end.isoformat(),
+                          "interval": interval},
+                  headers=_mt5_headers(), timeout=timeout)
+    r.raise_for_status()
+    payload = r.json()
+    return [Bar(symbol.value, interval,
+                _to_utc(datetime.fromisoformat(x["time"]), "mt5"),
                 float(x["open"]), float(x["high"]), float(x["low"]),
                 float(x["close"]), float(x["volume"]))
             for x in payload["bars"]]

@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from agentic_fx.core.plugin_contract import (
-    IndicatorResultError, validate_indicator_result,
+    IndicatorResultError, validate_indicator_result, validate_ohlcv_passthrough,
 )
 
 
@@ -203,3 +203,70 @@ def test_nested_container_element_raises_indicator_result_error():
     with pytest.raises(IndicatorResultError):
         validate_indicator_result({"a": [{"x": 1}] * 5}, df_index=idx,
                                   outputs=("a",))
+
+
+def test_ohlcv_passthrough_preserves_order_values_index_and_all_prefixes():
+    idx = _idx()
+    df = pd.DataFrame({"open": [1.0, 2.0, 3.0, 4.0, 5.0],
+                       "high": [2.0, 3.0, 4.0, 5.0, 6.0],
+                       "low": [0.0, 1.0, 2.0, 3.0, 4.0],
+                       "close": [1.5, 2.5, 3.5, 4.5, 5.5],
+                       "volume": [10.0, 20.0, 30.0, 40.0, 50.0]}, index=idx)
+    before = df.copy(deep=True)
+    result = {column: df[column].copy() for column in
+              ("open", "high", "low", "close", "volume")}
+
+    got = validate_ohlcv_passthrough(result, df=df, original_df=before)
+
+    assert list(got) == ["open", "high", "low", "close", "volume"]
+    for end in range(1, len(df) + 1):
+        for column in got:
+            pd.testing.assert_series_equal(got[column].iloc[:end],
+                                            before[column].iloc[:end], check_names=False)
+    pd.testing.assert_frame_equal(df, before)
+    assert not any(series.isna().any() for series in got.values())
+
+
+@pytest.mark.parametrize("broken", [
+    lambda df: {"open": df["open"].copy(), "volume": df["volume"].copy(),
+                "high": df["high"].copy(), "low": df["low"].copy(),
+                "close": df["close"].copy()},
+    lambda df: {c: (df[c].copy() + 1 if c == "close" else df[c].copy())
+                for c in ("open", "high", "low", "close", "volume")},
+])
+def test_ohlcv_passthrough_rejects_wrong_output_order_or_value(broken):
+    idx = _idx()
+    df = pd.DataFrame({c: [float(i) for i in range(5)]
+                       for c in ("open", "high", "low", "close", "volume")}, index=idx)
+    result = broken(df)
+    if list(result) == ["open", "high", "low", "close", "volume"]:
+        with pytest.raises(IndicatorResultError, match="equal input"):
+            validate_ohlcv_passthrough(result, df=df, original_df=df.copy(deep=True))
+    else:
+        with pytest.raises(IndicatorResultError, match="order"):
+            validate_ohlcv_passthrough(result, df=df, original_df=df.copy(deep=True))
+
+
+def test_ohlcv_passthrough_rejects_input_mutation_and_new_nan():
+    idx = _idx()
+    before = pd.DataFrame({c: [1.0] * 5 for c in
+                           ("open", "high", "low", "close", "volume")}, index=idx)
+    changed = before.copy(deep=True)
+    changed.loc[idx[0], "close"] = 9.0
+    result = {c: changed[c].copy() for c in changed}
+    with pytest.raises(IndicatorResultError, match="mutated"):
+        validate_ohlcv_passthrough(result, df=changed, original_df=before)
+
+    result = {c: before[c].copy() for c in before}
+    result["close"].iloc[2] = float("nan")
+    with pytest.raises(IndicatorResultError, match="equal input"):
+        validate_ohlcv_passthrough(result, df=before, original_df=before.copy(deep=True))
+
+
+def test_ohlcv_passthrough_rejects_a_list_even_when_its_values_match():
+    idx = _idx()
+    df = pd.DataFrame({c: [1.0] * 5 for c in
+                       ("open", "high", "low", "close", "volume")}, index=idx)
+    result = {c: df[c].tolist() for c in df}
+    with pytest.raises(IndicatorResultError, match="must be a Series"):
+        validate_ohlcv_passthrough(result, df=df, original_df=df.copy(deep=True))

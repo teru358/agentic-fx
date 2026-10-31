@@ -4,7 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from agentic_fx.plugin.logic_identity import (
-    LOGIC_HASH_PREFIX, family_key_of, identity_of_dir, logic_hash_of)
+    FAMILY_KEY_MAX_BYTES, LOGIC_HASH_PREFIX, family_key_of, identity_of_dir,
+    logic_hash_of, parse_family_key)
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "docs" / "examples" / "plugins"
 CONFIG = "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nparams: {x: 1}\n"
@@ -83,3 +84,34 @@ def test_strategy_family_is_indicator_set_timeframe_and_pairs():
               "  c: {plugin: rsi}\n")
     assert family_key_of(config, name="x") == (
         "strategy:bollinger,rsi@1h@EURUSD,USDJPY")
+
+
+def test_reference_strategy_family_is_versioned_and_round_trips_escaped_fields():
+    config = ("kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nindicators:\n"
+              "  z: {plugin: ema@fast, symbol: '日経@;%.cash', timeframe: 4h}\n"
+              "  a: {plugin: ohlcv, symbol: US500.cash, timeframe: 1h}\n")
+    key = family_key_of(config, name="x")
+    assert key == ("strategy-v2:1h@USDJPY@"
+                   "z;ema%40fast;literal;%E6%97%A5%E7%B5%8C%40%3B%25.cash;4h,"
+                   "a;ohlcv;literal;US500.cash;1h")
+    parsed = parse_family_key(key, allowed_pairs={"USDJPY"})
+    assert parsed is not None
+    assert parsed.version == "v2"
+    assert parsed.dependencies[0].literal_symbol == "日経@;%.cash"
+
+
+def test_family_v2_rejects_noncanonical_percent_encoding_and_preserves_legacy():
+    legacy = "strategy:rsi@1h@USDJPY"
+    assert parse_family_key(legacy, allowed_pairs={"USDJPY"}).version == "legacy"
+    for bad in ("strategy-v2:1h@USDJPY@a;rsi;literal;A%2fB;1h",
+                "strategy-v2:1h@USDJPY@a;rsi;literal;A%41;1h",
+                "strategy-v2:1h@USDJPY@a;rsi;literal;%ZZ;1h"):
+        assert parse_family_key(bad, allowed_pairs={"USDJPY"}) is None
+
+
+def test_reference_family_key_honors_512_byte_boundary():
+    base = "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nindicators:\n  a: {plugin: x, symbol: "
+    suffix = ", timeframe: 1h}\n"
+    symbol = "A" * 32
+    key = family_key_of(base + symbol + suffix, name="x")
+    assert len(key.encode()) < FAMILY_KEY_MAX_BYTES

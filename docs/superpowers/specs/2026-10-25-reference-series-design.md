@@ -1,6 +1,6 @@
 # 参照系列 (株価指数など) を戦略の材料にする — 設計 C1
 
-**版:** v0.6.1 C1 (裁定済)（sol 4 周目の指摘全件を反映）
+**版:** v0.6.3 C1 (裁定済)（T2 実装・レビューで確定した事項を反映）
 **チケット:** `reference-symbols-as-indicator-inputs`（中）、`multi-timeframe-indicator-deps`（低）、`executor-pair-membership-guard`（高、T1 に含める）
 **正本の関係:** indicator の loader / resolver / pin は `2026-09-14-indicator-consumption-wiring-design.md` を拡張する。価格源の outage / backfill 規則は `2026-09-24-outage-stop-and-backfill-design.md` を変更しない。
 
@@ -54,9 +54,19 @@ resolver が解決した `(effective_symbol, native_interval)` を `RequirementR
 
 各 ingest tick は hard queue を全て先に試し、soft は残予算だけを使う。soft を deferred にしても次 tick の hard より先には置かない。soft の empty / error には interval 上限付き capped exponential backoff を適用し、FX 用 `market_hours.next_bar_confirmation()` を指数 CFD の次回時刻に流用しない。`budget_exhausted`、`IngestTickReport`、activity は hard deferred と soft deferred、attempted と backoff 待ちを区別する。soft の失敗・empty は `DataUnhealthy` と outage state を変えない。
 
+soft の再要求 due は key ごとに `max(backoff due, 前回要求 + 足幅)` とし、empty / 例外とも同じにする。定常状態では任意の連続する足幅の窓で外向き要求は 1 回以下である。
+
+soft は、その key を要求する全 entry の reason が `reference` のときだけ（`RequirementRegistry.is_reference`）である。`settings.pairs` の symbol の key は参照として要求されても hard のまま毎 tick 再試行し、outage / 起動 disposition の既存の意味を変えない。
+
 live の参照 bar は `ohlcv_cache` に `symbol`、native `interval`、`source="mt5-live"` として保存する。取得は resolver が要求した参照足だけで、参照 1m は作らない。ただし 4h / 1d の宣言は native 1h を要求して UTC epoch 格子で resample する。`ohlcv_history` は import 専用で、live cache と混同しない。
 
-status は `(symbol, timeframe, source)` ごとに `ok | stale(<age>) | missing | fetch_failed | budget_deferred | source_unavailable` を表示する。symbol 集約表示を残す場合は worst state と内訳を併記する。activity の `reference_stale` の `reason` は `missing | age_exceeded | fetch_failed | budget_deferred | source_unavailable | indicator_unavailable` の固定語彙だけを使い、表示用 age は別 field とする。`reference_recovered` は同じ `reason` を持たず、直前値を `recovered_from` に置く。いずれも状態遷移時だけ記録する。`afx status` は offline の保存済み履歴範囲だけを示し、live の freshness を推測しない。
+status は `(symbol, timeframe, source)` ごとに `ok | stale | missing | fetch_failed | budget_deferred | source_unavailable | plan_failed | symbol_rejected` を表示し、daemon 側 `REFERENCE_STATES` を正本として CLI は import する。
+
+`plan_failed` は planner 失敗を毎 tick 再評価し key ごとに一度だけログし、`symbol_rejected` は許可されない symbol を key ごとに一度だけログして再起動まで再評価しない。daemon は status 行を切り詰めず、CLI は表示件数と総数から `… 他 N 件` を示す。
+
+activity の `reference_stale` の `reason` は `FETCH_STATE_REASONS`（`source_unavailable | fetch_failed | budget_deferred | plan_failed | symbol_rejected`）に `missing | age_exceeded | indicator_unavailable` を加えた閉集合だけを使い、runtime 超過は `reference_window_exceeded_at_runtime` とする。
+
+参照状態は `(strategy, pair, symbol, timeframe)` ごとに持ち、activity 本文にも pair を載せる。`reference_recovered` は同じ `reason` を持たず、直前値を `recovered_from` に置く。いずれも状態遷移時だけ記録する。`afx status` は offline の保存済み履歴範囲だけを示し、live の freshness を推測しない。
 
 ### 2.3 indicator 宣言、解決、worker
 
@@ -78,7 +88,9 @@ loader は syntax だけを扱う。`symbol` は `self` または非空文字列
 
 `MAX_CALL_INPUT_BYTES = 3_145_728`（3 MiB）とする。計測対象は `_df_to_wire` 後に pipe へ書く request の UTF-8 JSON byte 列であり、末尾改行 1 byte を含む。`max_bars_limit=1000`、OHLCV 5 列、main 1 frame + 最大 8 alias の重複排除後 reference frame 8 個という代表的な最大 fixture は **1,444,312 bytes の見積り**である。ただし timestamp の小数秒、float の文字列表現、params と wrapper の serialization から一定の事前上限は導かない。安全境界は唯一、pipe write の直前に request を serialize した後の UTF-8 byte 数（改行込み）の実測とする。超過は固定 error code `call_input_too_large` で call だけを reject し、worker session は死亡扱いにせず再利用可能とする。
 
-依存 plugin の現行 `max_bars` は「worker に渡せる最大本数」であり warmup ではない。この束は任意 indicator の warmup を推論もしないし、`max_bars` を warmup 下限として reject もしない。参照系列の必要 effective bar 数は config 時の名目値と実行時の実測値を分ける。resolver は `K_ref_nominal = ceil(((strategy.max_bars - 1) × strategy_tf) / ref_tf) + 1` を用い、これが当該 indicator の `max_bars`（設定上限 1000）を超える明白な不成立だけを固定 reason `reference_window_exceeds_max_bars` で config reject する。main `df` 取得後は、その最初と最後の判定時刻 `d_first` / `d_last` が覆う実時間範囲から `K_ref_actual = ceil((d_last - d_first) / ref_tf) + 1` を再計算する。`+1` は両端を包含する境界分である。`K_ref_actual` が上限を超えたときは main 窓を縮小したり先頭の参照値を黙って欠損させたりせず、当該 strategy を固定 reason `reference_window_exceeded_at_runtime` で fail-closed skip する (activity に記録し、判断足ごとに 1 回)。既存の self・同一 timeframe dependency は従来どおり main `df` を使い、参照用 `K_ref` の config reject / runtime 上限判定の対象外とする。native 要求本数は `ceil(K_ref_actual × ref_tf / native_tf)` とし、native 1h から導く 4h は `4K_ref_actual`、1d は `24K_ref_actual` を要求する。不足や未完成 bucket は値を捏造せず unavailable とする。従って seed 不足を含む indicator 出力 NaN は live / backtest とも有効な unavailable 入力として strategy を skip する。`ohlcv` は seed 不要の passthrough である。作者は従来どおり `max_bars` が自身の lookback を覆うよう宣言し、例と prompt にこの制約を明記する。
+依存 plugin の現行 `max_bars` は「worker に渡せる最大本数」であり warmup ではない。この束は任意 indicator の warmup を推論もしないし、`max_bars` を warmup 下限として reject もしない。参照系列の必要 effective bar 数は config 時の名目値と実行時の実測値を分ける。resolver は `K_ref_nominal = ceil(((strategy.max_bars - 1) × strategy_tf) / ref_tf) + 1` を用い、これが当該 indicator の `max_bars`（設定上限 1000）を超える明白な不成立だけを固定 reason `reference_window_exceeds_max_bars` で config reject する。main `df` 取得後は、その最初と最後の判定時刻 `d_first` / `d_last` が覆う実時間範囲から `K_ref_actual = ceil((d_last - d_first) / ref_tf) + 1` を再計算する。`+1` は両端を包含する境界分である。
+
+参照 frame は `d_last − max(K_ref_actual × ref_tf, max_age + ref_tf)` まで読み、鮮度判定に必要な直近 bar を落とさない。`K_ref_actual` が上限を超えたときは main 窓を縮小したり先頭の参照値を黙って欠損させたりせず、当該 strategy を固定 reason `reference_window_exceeded_at_runtime` で fail-closed skip する (activity に記録し、判断足ごとに 1 回)。既存の self・同一 timeframe dependency は従来どおり main `df` を使い、参照用 `K_ref` の config reject / runtime 上限判定の対象外とする。native 要求本数は `ceil(K_ref_actual × ref_tf / native_tf)` とし、native 1h から導く 4h は `4K_ref_actual`、1d は `24K_ref_actual` を要求する。不足や未完成 bucket は値を捏造せず unavailable とする。従って seed 不足を含む indicator 出力 NaN は live / backtest とも有効な unavailable 入力として strategy を skip する。`ohlcv` は seed 不要の passthrough である。`K_ref_nominal` は名目であり週末・欠損では `K_ref_actual` が延びるため、作者は参照 indicator の `max_bars` を名目より余裕をもって宣言し、例と prompt にこの制約を明記する。
 
 人間提供の `ohlcv` indicator は approval 済み inventory に materialize → submit / bless して初めて利用できる。outputs は順に `open high low close volume`、各 output は同じ index の numeric Series で対応する入力列と完全一致、入力 mutation なし、NaN を新規生成しない、全 prefix で出力 prefix が一致、を validator と prefix test で pin する。追加 field を省略した既存 config は旧 effective 値へ解決し、既存 2 strategy と example の content hash は不変とする。
 
@@ -97,9 +109,13 @@ fresh: age <= max_age; stale: age > max_age
 
 live loader はその前段で `e + closed_bar_grace <= now` の bar だけを渡す。backtest loader は historical `d` までの `e <= d` の履歴を渡す。loader / availability 判定は source ごとに異なるが、閉じた input frame への asof・age 判定は同じ純粋関数を使う。`load_resampled_frame(until=d)` の排他 SQL と bucket end `<= d` はこの契約に一致する。
 
-参照市場の個別 calendar は本束で持たない。`max_age` は UTC 実経過時間であり、休場中も進む。したがって合法的休場と内部 gap を厳密には区別しない。backtest preflight の検査対象は「参照 symbol / source / base interval の履歴が完全に存在しない」だけであり、seed や indicator 出力を事前判定しない。休場、seed 不足、indicator NaN は live / backtest とも同じ unavailable/skip である。
+参照市場の個別 calendar は本束で持たない。`max_age` は UTC 実経過時間であり、休場中も進む。FX 取引 pair 自身が週末 21:00 UTC 境界で休場していても参照 symbol の `max_age` は進む。これは calendar を持たない方針の帰結である。従って live の取得側でも、参照 symbol (watch_symbols の raw name) の frame には FX 前提の鮮度判定と開場中 gap の連続性検査を掛けない (zero / NaN / spike の検査だけ残す)。鮮度は alignment の `max_age` が唯一の判定点である。取引 pair の検査は従来どおり。
 
-soft はシステム全体を degraded にしない、という意味だけである。required reference frame が missing、stale、fetch failure、budget deferred、source unavailable、または指標値が unavailable の strategy は `reference_unavailable` を記録して evaluate / signal / open を行わない。他 strategy、LLM loop、既存の価格源 outage 規則、kill switch、drawdown 保護は継続する。これにより live の NaN 実行と backtest abort の非対称を無くす。
+したがって合法的休場と内部 gap を厳密には区別しない。backtest preflight の検査対象は「参照 symbol / source / base interval の履歴が完全に存在しない」だけであり、seed や indicator 出力を事前判定しない。休場、seed 不足、indicator NaN は live / backtest とも同じ unavailable/skip である。
+
+soft はシステム全体を degraded にしない、という意味だけである。required reference frame が unavailable、bucket が欠損、または指標値が unavailable の strategy は `reference_unavailable` / `reference_stale` を記録して evaluate / signal / open を行わない。
+
+どちらも最古 bucket で停止し cursor を進めず、参照が戻れば同じ bucket から再評価する。他 strategy、LLM loop、既存の価格源 outage 規則、kill switch、drawdown 保護は継続する。これにより live の NaN 実行と backtest abort の非対称を無くす。
 
 実時刻 fixture（すべて UTC）:
 
@@ -113,11 +129,11 @@ soft はシステム全体を degraded にしない、という意味だけで�
 
 ### 2.5 履歴、分析、改善 mission、read tool
 
-backtest は取引 pair と全参照 symbol を一つの `HistoryDataset(source, base_interval)` から読む。`run_backtest` 前に全宣言を preflight し、同じ import source/base interval に reference history が完全に無い場合だけ R2 で選んだ処理を業務副作用前に適用する。推奨 fail-closed は `reference_history_missing(<symbol>, <tf>, <reason>)` の固定応答 `started:false` として **`backtest_runs` の run 行を作らない**。signal、order、候補 archive 等の業務副作用も 0 件とする一方、RPC ledger、mission transcript、activity の監査記録は残す。seed 不足、indicator NaN、合法的休場 / age stale はこの missing 判定にしない。`analyze corr` は既存実装のまま、両 symbol が同じ `--source`、1m、30 以上の共通 timestamp を持つ場合だけ動く。live で JP225 1h を取っただけでは相関分析に使えない。`history coverage` は既存どおり単一 `--symbol` の表示であり、参照一覧の表を新設しない。
+backtest は取引 pair と全参照 symbol を一つの `HistoryDataset(source, base_interval)` から読む。`run_backtest` 前に全宣言を preflight し、同じ import source/base interval に reference history が完全に無い場合だけ R2 で選んだ処理を業務副作用前に適用する。推奨 fail-closed は `reference_history_missing(<symbol>, <tf>, <reason>)` (reason は固定語 `no_rows`) の固定応答 `started:false` として **`backtest_runs` の run 行を作らない**。signal、order、候補 archive 等の業務副作用も 0 件とする一方、RPC ledger、mission transcript、activity の監査記録は残す。seed 不足、indicator NaN、合法的休場 / age stale はこの missing 判定にしない。`analyze corr` は既存実装のまま、両 symbol が同じ `--source`、1m、30 以上の共通 timestamp を持つ場合だけ動く。live で JP225 1h を取っただけでは相関分析に使えない。`history coverage` は既存どおり単一 `--symbol` の表示であり、参照一覧の表を新設しない。
 
 `get_ohlcv` と `get_indicators` だけは market-read 専用の `read_symbol_param()` を新設して `pairs + watch_symbols` を enum / runtime membership ともに検査する。共通 `market_tools.pair_param()` は拡張しないため、`get_signals` と trade-intent schema は pairs 限定のままである。read tool も MT5 primary / raw symbol 契約に従う。
 
-改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols` と `history_available: true|false` だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
+改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols` と `history_available` (watch symbol ごとの `{symbol: true|false}`、同じ dataset に 1 行以上あるか) だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
 
 family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encoded-resolved-deps>` にする。各 dep は alias の宣言順で `alias;plugin;symbol_mode;literal_symbol_or_-;ref_tf` を percent-escape した token とし、alias、plugin、self/literal symbol、reference timeframe、順序を全て区別する。escape `E` は UTF-8 byte 列に対し RFC 3986 unreserved（`A-Z a-z 0-9 - . _ ~`）だけをそのまま出し、それ以外を大文字 hex の `%XX` にする。各 variable field に `E` を適用してから grammar の literal separator `@`、`,`、`;` を結ぶ。decoder は不正な `%`、小文字 hex、safe 文字の過剰 escape、decode 後に再 encode して原文と一致しない値を reject する。既存の `FAMILY_KEY_MAX_BYTES = 512` は上げない。resolver は生成後の encoded family key が 512 bytes 以下であることを検査し、超過は固定 reason `family_key_too_long` で config reject する。literal symbol は `watch_symbols` membership を満たし、その UTF-8 32-byte 上限にも従う。新 parser はこの正規形だけを受け、既存 `strategy:<names>@<tf>@<pairs>` は legacy として parse / 表示のみ維持する。旧 key は新 key と同一族に畳み込まない。これは scalar を落とす config shape hash だけでは JP225 と US500 を区別できないためである。
 
@@ -126,8 +142,8 @@ family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encod
 | task | 内容と成果物 | AC | 依存 | exit criteria | 見積り | 担当 |
 |---|---|---|---|---|---:|---|
 | T1 契約・安全境界 | schema v5 migration、MT5-only/raw symbol、`IndicatorRef` / resolver / audit、duration、named-frame payload と call 入力上限、executor membership guard、時刻純関数と UTC fixture | AC-1, 3–6, 11, 14 | なし | schema / resolver、`risk.pair_rules` 余剰 key の警告、all-open-path I/O 0、protocol の limit / limit+1 / shared-frame、UTC / 4h / 1d の安全境界試験が全て通る | 650–850 行 | sonnet（通常 / five-phase の競合境界試験を含む） |
-| T2 live 取得・worker 配線 | symbol-keyed registry、hard-first/soft backoff、raw MT5 adapter、1h→4h/1d、named frames、`ohlcv` 配備、strategy skip、status/activity | AC-2, 5–7, 12, 14 | T1 | capped exponential backoff の増加列と cap、`K_ref_actual`→native 本数、4h / 1d の完全・先頭不足・末尾部分 bucket、固定 activity reason の試験が通る | 700–950 行 | codex（純 Python） |
-| T3 backtest・履歴・改善 | 同一 dataset preflight、live/backtest parity、family v2 / legacy、inventory sink、`run_backtest` 配線 | AC-7–9, 12, 15 | T1, T2 | 推奨 fail-closed で history 完全不在なら `backtest_runs` の run 行、signal、order、候補 archive 等の業務副作用は 0 件。ただし RPC ledger・mission transcript・activity の監査記録は残す。NaN/seed は skip、live/backtest の入力列一致、v2 round-trip / legacy 読取の試験が通る | 550–750 行 | codex（純 Python） |
+| T2 live 取得・worker 配線 | symbol-keyed registry、hard-first/soft backoff、raw MT5 adapter、1h→4h/1d、named frames、`ohlcv` 配備、strategy skip、status/activity | AC-2, 5–7, 12, 14 | T1 | capped exponential backoff の増加列と cap、`K_ref_actual`→native 本数、4h / 1d の完全・先頭不足・末尾部分 bucket、固定 activity reason の試験が通る。レビュー閉鎖 2026-10-30 (codex r1 + /code-review high 12 件、閉鎖確認 2 回) | 700–950 行 | codex（純 Python） |
+| T3 backtest・履歴・改善 | 同一 dataset preflight、live/backtest parity、family v2 / legacy、inventory sink、`run_backtest` 配線 | AC-7–9, 12, 15 | T1, T2 | 推奨 fail-closed で history 完全不在なら `backtest_runs` の run 行、signal、order、候補 archive 等の業務副作用は 0 件。ただし RPC ledger・mission transcript・activity の監査記録は残す。NaN/seed は skip、live/backtest の入力列一致、v2 round-trip / legacy 読取の試験が通る。gate は参照履歴不在を構造化 verdict (`evaluable=False`、`reference_history_missing`) で返し、improve の commit 相はそれを `backtest_data_unavailable` の固定語で fail-closed に畳む。replay の adapter は (symbol, ref_tf) ごとに参照 frame を 30 日チャンクで cache し live の整列関数を共有する。レビュー閉鎖 2026-10-30 (codex r1 Critical 1 + /code-review high 7 件、閉鎖確認) | 550–750 行 | codex（純 Python） |
 | T4 wizard・read tool・check・文書 | stage 3 `/symbols`、read schema 分離、check warning、history/corr 操作文、ops / golden 更新 | AC-9–10, 13 | T1–T3 | raw adapter 経路と runtime membership を組にした read-tool 試験、wizard zero-write と golden / 操作文更新が通る | 400–600 行 | codex（純 Python） |
 
 T1→T2→T3→T4 は直列である。T1 の protocol / 安全境界試験を通過してから T2、T2 の native frame 試験を通過してから T3 に進む。registry は resolver の effective 座標と worker の履歴契約を必要とするため、C0 の「T1 と T2 は独立」は採らない。
@@ -145,7 +161,7 @@ T1→T2→T3→T4 は直列である。T1 の protocol / 安全境界試験を�
 
 R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` 契約を壊さない技術判断として §2.3 に確定した。pin を入力座標まで緩和しないことも §2.3 の安全境界で確定し、裁定には残さない。
 
-## 5. 受入条件（v0.5 C1 確定版）
+## 5. 受入条件（v0.6.2 C1 確定版）
 
 - AC-1: schema v4 の overlap / duplicate watch 設定は v5 migration error、空でない watch + non-MT5 primary も reject。各 watch symbol は UTF-8 32 bytes 以下、33 bytes は `watch_symbol_too_long` で reject。unknown raw symbol は bridge 接続時 `watch_symbol_unknown` warning、件数上限超過は reject。
 - AC-2: `JP225` が `VENDOR_SYMBOLS` に無くても raw adapter で `/ohlcv/JP225` を取得し `ohlcv_cache(source="mt5-live")` に保存する。hard key は soft timeout / retry 中でも先に attempted され、soft deferred / backoff が hard deferred と区別される。
@@ -158,7 +174,7 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 - AC-9: `analyze corr` は両 symbol を `source=mt5, interval=1m` で import し 30 共通観測以上ある場合に通る。`history import --symbol JP225` と単一-symbol `history coverage` は既存 CLI 契約を保つ。
 - AC-10: `get_ohlcv/get_indicators` は watch symbol を read-only で受け、`get_signals` と trade-intent schema は拒否する。runtime membership も再検査する。
 - AC-11: open intent `JP225` は通常 `_open`、`gather_open_snapshot`、`open_from_snapshot` の各経路で `not_tradable_symbol`。tool/schema 拒否、executor 拒否、quote/spec/broker 呼出し 0 回を別テストで pin する。
-- AC-12: `references:` は `(symbol,timeframe,source)` と固定 reason を示し、`reference_stale` は `missing | age_exceeded | fetch_failed | budget_deferred | source_unavailable | indicator_unavailable`、`reference_recovered` は `recovered_from` を持ち、いずれも遷移時に一度だけ出る。improve inventory は `watch_symbols` と bool だけで履歴範囲を漏らさず、family v2 は JP225 / US500、alias 順、reference timeframe を区別し legacy key を読める。
+- AC-12: `references:` の状態語彙は `REFERENCE_STATES` の `ok | stale | missing | fetch_failed | budget_deferred | source_unavailable | plan_failed | symbol_rejected` とし、daemon は全行、CLI は `… 他 N 件` を示す。`reference_stale` の reason は `FETCH_STATE_REASONS + missing | age_exceeded | indicator_unavailable`、状態 key は `(strategy,pair,symbol,timeframe)`、`reference_recovered` は `recovered_from` を持ち、いずれも遷移時に一度だけ出る。improve inventory は `watch_symbols` と bool だけで履歴範囲を漏らさず、family v2 は JP225 / US500、alias 順、reference timeframe を区別し legacy key を読める。
 - AC-13: wizard は stage 3 の MT5 connected 成功時だけ選択し、初回空・再実行現値・stage 9 summary・stage 10 まで zero-write を保つ。既存 `afx --help` 等 golden と取引 pair の outage/backfill 規則は不変。
 - AC-14: 4h / 1d native-frame fixture は完全 bucket で `4K_ref_actual` / `24K_ref_actual` rows を渡し、先頭不足では対応する最初の effective row を unavailable、末尾の部分 bucket は除外する。soft backoff は増加列と cap を満たす。
 - AC-15: family v2 は `@`、`;`、`%`、Unicode、broker suffix を含む symbol を UTF-8 percent-escape で round-trip し、不正 `%`、小文字 hex、safe 文字の過剰 escape、decode 後の再 encode 不一致を reject する。8 dependency と percent-escape を含む正規 key を round-trip し、encoded family key が 512 bytes ちょうどは通し、513 bytes は `family_key_too_long` で reject する。watch symbol の 32-byte ちょうど / 33-byte も AC-1 の設定検証で pin する。
@@ -170,6 +186,7 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 - 参照系列の LLM prompt への自動注入。
 - 参照 1m の取得、複数取引 pair × 複数参照で call input 上限を超える場合の製品上限見直し。
 - `GET /symbols` の候補分類（指数 / 商品）の broker metadata は未確認。C1 は実測リストを UI 候補に使うが、symbol 種別の自動推論はしない。
+- 再起動直後は `_soft_last_request_at` が失われ、再起動前後の 2 要求が足幅未満になり得る。取引 pair の hard key も再起動で全部再要求する既存挙動と同じ性質で、crash loop は systemd の `RestartSec` が律するため永続化しない（2026-10-30 裁定）。
 
 ## 7. 変更履歴
 
@@ -183,3 +200,6 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-28 | v0.5.1 C1 | runtime 超過の固定 reason `reference_window_exceeded_at_runtime` (§2.3、AC-3)、AC-14 を `K_ref_actual` に統一 | 設計レビュー 5 周目 (sol、I-5 部分・I-7) | |
 | 2026-10-28 | v0.6 C1 | §4 の R1・R2・R4 を推奨どおりユーザー裁定済に | ユーザー承認、実装着手 | |
 | 2026-10-29 | v0.6.1 C1 | `risk.pair_rules` の余剰 key は起動拒否でなく警告 (§2.1、T1 の exit criteria) | T1a で設定例 (EURUSD の規則) と衝突。membership 検査が境界で余剰規則は取引対象を増やさない | |
+| 2026-10-30 | v0.6.2 C1 | T2 で確定した soft 再要求上限、状態・activity・frame 読込・週末・`max_bars`・再起動境界を反映 | T2 実装・レビューで確定 | |
+| 2026-10-30 | v0.6.3 C1 | T3 で確定: `history_available` は symbol ごと、`reference_history_missing` の reason は `no_rows`、gate の構造化 verdict と commit 相の固定語、replay の frame cache | T3 実装・レビューで確定 | |
+| 2026-10-31 | v0.6.4 C1 | 参照 symbol の live frame には FX 前提の鮮度・開場 gap 検査を掛けない (§ calendar の節)。daemon 起動検査は bridge に問い合わせず `afx check` だけが突合。wizard: 非 MT5 選択時は現在の watch を表示して外す、一覧取得を飛ばす経路でも overlap を検査、区切りはカンマのみ | T4 レビュー 2 周目 (/code-review) #1・#2・#4・#6・#9 の是正に合わせる | |

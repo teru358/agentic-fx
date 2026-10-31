@@ -1,0 +1,4 @@
+kind: indicator
+outputs: [open, high, low, close, volume]
+max_bars: 400
+params: {}

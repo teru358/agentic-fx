@@ -437,6 +437,8 @@ def test_ref_price_included_in_intent_payload(tmp_path):
 
 EUR_SPEC = InstrumentSpec("EURUSD", 0.0001, 0.01, 10.0, 0.01, 100_000,
                           base_currency="EUR", quote_currency="USD")
+EURUSD_SETTINGS = SETTINGS.model_copy(
+    update={"pairs": [*SETTINGS.pairs, "EURUSD"]})
 
 
 def test_open_risk_and_notional_converts_per_pair_no_price_in_notional(
@@ -662,6 +664,7 @@ def test_open_rejected_when_conversion_rate_unavailable(tmp_path):
     却下される (設計書 §5: gate → intent 却下、理由に換算不能を明記)。"""
     conn, ex, _, mid = _setup(tmp_path)
     ex.spec_fn = lambda p: EUR_SPEC   # quote=USD, base=EUR
+    ex.settings = EURUSD_SETTINGS   # open は pairs の中だけ
     ex.rate_fn = _rate_fn             # EUR->JPY は解決不可 (スタブの制約)
     it = _open_intent(pair="EURUSD", limit_price=1.1000, stop_loss=1.0950,
                       take_profit=1.1200)
@@ -681,6 +684,7 @@ def test_open_rejected_when_overall_snapshot_skew_exceeded(tmp_path):
     変えない)。"""
     conn, ex, _, mid = _setup(tmp_path)
     ex.spec_fn = lambda p: EUR_SPEC   # quote=USD, base=EUR
+    ex.settings = EURUSD_SETTINGS   # open は pairs の中だけ
     skew = SETTINGS.datafeed.conversion_skew_max_min
 
     def rate_fn(ccy, account_ccy, now):
@@ -716,6 +720,7 @@ def _assert_no_url(text: str) -> None:
 def test_open_rejected_rate_error_message_is_sanitized(tmp_path):
     conn, ex, _, mid = _setup(tmp_path)
     ex.spec_fn = lambda p: EUR_SPEC
+    ex.settings = EURUSD_SETTINGS   # open は pairs の中だけ
 
     def leaky_rate_fn(ccy, account_ccy, now):
         if ccy == account_ccy:
