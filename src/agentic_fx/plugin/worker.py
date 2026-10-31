@@ -269,11 +269,12 @@ def main() -> None:
     import pandas as pd
 
     from agentic_fx.core.plugin_contract import (
-        validate_indicator_result, validate_ohlcv_passthrough,
+        OutputsMismatchError, validate_indicator_result, validate_ohlcv_passthrough,
     )
 
     baseline_chained = pd.get_option("mode.chained_assignment")
     baseline_errstate = dict(np.geterr())
+    retained: dict | None = None
 
     while True:
         request = _read_line()
@@ -327,14 +328,23 @@ def main() -> None:
                         "indicator mutated shared pandas/numpy global state")
                 result = fn(df, indicators, None, params)
             else:
-                before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
-                result = fn(df, params)
+                retain = request.get("retain") is True
+                reuse = request.get("reuse") is True
+                if kind == "indicator" and reuse:
+                    if retained is None or retain:
+                        raise ValueError("no retained indicator result to reuse")
+                    validated = retained
+                else:
+                    before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
+                    result = fn(df, params)
+                    if kind == "indicator":
+                        validated = (
+                            validate_ohlcv_passthrough(result, df=df, original_df=before)
+                            if handshake.get("name") == "ohlcv" else
+                            validate_indicator_result(result, df_index=df.index,
+                                                      outputs=main_outputs))
+                        retained = validated if retain else None
                 if kind == "indicator":
-                    validated = (
-                        validate_ohlcv_passthrough(result, df=df, original_df=before)
-                        if handshake.get("name") == "ohlcv" else
-                        validate_indicator_result(result, df_index=df.index,
-                                                  outputs=main_outputs))
                     select = request.get("select")
                     if select is not None:
                         if (not isinstance(select, list) or not select
@@ -352,6 +362,10 @@ def main() -> None:
             _write_line(protocol_fd, {"ok": False, "error": "reference unavailable",
                                       "error_code": "reference_unavailable", "pid": pid,
                                       "id": request_id})
+        except OutputsMismatchError as exc:
+            _write_line(protocol_fd, {"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "error_code": "outputs_mismatch", "pid": pid, "id": request_id})
         except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ
             try:
                 traceback.print_exc(file=sys.stderr)

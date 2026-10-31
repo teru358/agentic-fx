@@ -96,17 +96,43 @@ def _open_dir(directory: Path) -> Iterator[int]:
         os.close(fd)
 
 
+def _acquire_lock(dir_fd: int, stem: str, *, blocking: bool) -> int | None:
+    """Return the fd holding the key lock, or None when ``blocking`` is false and
+    another holder has it.  The lock file may be unlinked by a collector while this
+    waits, so the path is re-checked after the lock is won and the open is retried
+    when it no longer names the locked inode."""
+    name = stem + _LOCK_SUFFIX
+    while True:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     0o600, dir_fd=dir_fd)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid():
+                raise IndicatorCacheError("cache lock file is not a private regular file")
+            if stat.S_IMODE(st.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                os.close(fd)
+                return None
+            try:
+                current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            if current is not None and (current.st_ino, current.st_dev) == (st.st_ino, st.st_dev):
+                return fd
+        except BaseException:
+            os.close(fd)
+            raise
+        os.close(fd)
+
+
 @contextmanager
 def _key_lock(dir_fd: int, stem: str) -> Iterator[None]:
-    fd = os.open(stem + _LOCK_SUFFIX, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-                 0o600, dir_fd=dir_fd)
+    fd = _acquire_lock(dir_fd, stem, blocking=True)
+    assert fd is not None
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid():
-            raise IndicatorCacheError("cache lock file is not a private regular file")
-        if stat.S_IMODE(st.st_mode) != 0o600:
-            os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
@@ -144,31 +170,59 @@ def _encode(key: CacheKey, entry: CacheEntry) -> bytes:
     return buf.getvalue()
 
 
+_KINDS = ("series", "scalar")
+
+
+def _text(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("cache entry field is not a string")
+    return value
+
+
 def _decode(key: CacheKey, raw: bytes) -> CacheEntry:
     with np.load(io.BytesIO(raw), allow_pickle=False) as data:
         meta = json.loads(str(data["meta"]))
+        if not isinstance(meta, dict):
+            raise ValueError("cache entry meta is not an object")
         if (meta.get("schema") != SCHEMA or meta.get("content_hash") != key.content_hash
                 or meta.get("fixture_data_hash") != key.fixture_data_hash
                 or meta.get("timeframe") != key.timeframe):
             raise ValueError("cache entry does not match its key")
-        unit = meta["unit"]
+        unit = meta.get("unit")
         if unit not in ("s", "ms", "us", "ns"):
             raise ValueError("unknown index unit")
+        columns = meta.get("columns")
+        if not isinstance(columns, list):
+            raise ValueError("cache entry columns are not a list")
         index = pd.DatetimeIndex(pd.to_datetime(data["index"], unit="ns", utc=True)).as_unit(unit)
         scalars = data["scalars"]
         outputs: dict[str, Any] = {}
         classes: dict[str, tuple[str, str]] = {}
-        for col in meta["columns"]:
-            name = str(col["name"])
-            if col["kind"] == "series":
-                values = data[col["array"]]
-                if len(values) != len(index):
+        for col in columns:
+            if not isinstance(col, dict):
+                raise ValueError("cache entry column is not an object")
+            name = _text(col.get("name"))
+            if name in outputs:
+                raise ValueError("duplicate column name")
+            kind = col.get("kind")
+            if kind not in _KINDS:
+                raise ValueError("unknown column kind")
+            price, volume = _text(col.get("price")), _text(col.get("volume"))
+            if kind == "series":
+                array = _text(col.get("array"))
+                if array not in data.files:
+                    raise ValueError("column array is missing")
+                values = data[array]
+                if values.ndim != 1 or len(values) != len(index):
                     raise ValueError("series length differs from the index")
                 outputs[name] = pd.Series(values, index=index, dtype="float64")
             else:
-                outputs[name] = float(scalars[int(col["slot"])])
-            if col["price"] or col["volume"]:
-                classes[name] = (str(col["price"]), str(col["volume"]))
+                slot = col.get("slot")
+                if isinstance(slot, bool) or not isinstance(slot, int) or not 0 <= slot < len(scalars):
+                    raise ValueError("scalar slot is out of range")
+                outputs[name] = float(scalars[slot])
+            if price or volume:
+                classes[name] = (price, volume)
     return CacheEntry(outputs, classes)
 
 
@@ -198,6 +252,8 @@ def _read(dir_fd: int, key: CacheKey) -> CacheEntry | None:
 
 def _write(dir_fd: int, key: CacheKey, entry: CacheEntry) -> None:
     payload = _encode(key, entry)
+    if len(payload) > MAX_FILE_BYTES:
+        raise IndicatorCacheError("encoded cache entry exceeds the size limit")
     tmp = f"{key.stem}{_TMP_MARK}{os.getpid()}-{os.urandom(4).hex()}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                  0o600, dir_fd=dir_fd)
@@ -244,7 +300,10 @@ def get_or_build(data_dir: Path, key: CacheKey,
 
 
 def gc_stale(data_dir: Path, keep_fixture_data_hash: str) -> list[str]:
-    """Remove entries (and their lock / temp files) of other fixture generations."""
+    """Remove entries (and their lock / temp files) of other fixture generations.
+
+    A key whose lock is held is in use and is left for the next collection."""
+    stems: dict[str, list[str]] = {}
     removed: list[str] = []
     with _open_dir(cache_dir(data_dir)) as dir_fd:
         for name in os.listdir(dir_fd):
@@ -257,9 +316,19 @@ def gc_stale(data_dir: Path, keep_fixture_data_hash: str) -> list[str]:
             match = _NAME_RE.fullmatch(stem)
             if match is None or match["data"] == keep_fixture_data_hash:
                 continue
-            try:
-                os.unlink(name, dir_fd=dir_fd)
-            except FileNotFoundError:
+            stems.setdefault(stem, []).append(name)
+        for stem, names in stems.items():
+            fd = _acquire_lock(dir_fd, stem, blocking=False)
+            if fd is None:
                 continue
-            removed.append(name)
+            try:
+                lock_name = stem + _LOCK_SUFFIX
+                for name in sorted(set(names) | {lock_name}):
+                    try:
+                        os.unlink(name, dir_fd=dir_fd)
+                    except FileNotFoundError:
+                        continue
+                    removed.append(name)
+            finally:
+                os.close(fd)
     return sorted(removed)

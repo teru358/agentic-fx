@@ -17,7 +17,7 @@ import pandas as pd
 
 from agentic_fx.plugin import indicator_gate as gate
 from agentic_fx.plugin.indicator_fixture_cache import CacheEntry
-from agentic_fx.plugin.sandbox import PluginSession, SandboxError
+from agentic_fx.plugin.sandbox import OUTPUTS_MISMATCH_DETAIL, PluginSession, SandboxError
 
 if TYPE_CHECKING:
     from agentic_fx.config import PluginSettings
@@ -30,7 +30,6 @@ PRICE_COLUMNS = ("open", "high", "low", "close")
 # (label, price multiplier, volume multiplier)
 PROBE_RUNS = (("k1", 1.0, 1.0), ("k100", 100.0, 1.0), ("k001", 0.01, 1.0),
               ("vol100", 1.0, 100.0))
-OUTPUTS_MISMATCH_MARKER = "do not match declared outputs"
 
 Outputs = dict[str, "pd.Series | float"]
 
@@ -69,17 +68,14 @@ class ProbeResult:
 
 
 def classify_sandbox_error(exc: SandboxError, *, probe: bool = False) -> str:
-    """Map a post-load SandboxError to a ``fixture_run_failed`` detail.
-
-    A pre-load environment failure (``sandbox_unavailable``) is not the candidate's
-    fault and is raised as ``IndicatorEnvironmentError`` instead."""
-    if exc.code == "sandbox_unavailable":
-        raise IndicatorEnvironmentError(str(exc)) from exc
+    """Map a SandboxError raised after the plugin was loaded to a
+    ``fixture_run_failed`` detail.  Everything here is the candidate's doing; only a
+    failure before the load (see ``open_session``) is the environment's."""
     if probe:
         return "probe_timeout" if exc.code in ("timeout", "cpu_limit") else "probe_exception"
     if exc.code in ("cpu_limit", "timeout"):
         return exc.code
-    if exc.code == "plugin_error" and OUTPUTS_MISMATCH_MARKER in str(exc):
+    if exc.detail == OUTPUTS_MISMATCH_DETAIL:
         return "outputs_mismatch"
     return "exception"
 
@@ -155,6 +151,9 @@ def run_probe(session: PluginSession, candidate: "PluginMeta", bars: pd.DataFram
               clock: Any = time.monotonic) -> ProbeResult:
     """Four scaled runs (k=1/100/0.01 on OHLC, volume x100) in output groups.
 
+    Each scaled run computes the indicator once; the output groups are served from
+    the result the worker retained for that run.
+
     The total wall clock of all calls is capped; running out, an overrun call or an
     exception is a candidate failure (``probe_timeout`` / ``probe_exception``)."""
     deadline = clock() + wall_clock_max_sec
@@ -163,13 +162,17 @@ def run_probe(session: PluginSession, candidate: "PluginMeta", bars: pd.DataFram
     for label, price, volume in PROBE_RUNS:
         df = _scaled(bars, price, volume)
         merged: Outputs = {}
-        for group in groups:
+        for gi, group in enumerate(groups):
             remaining = deadline - clock()
             if remaining <= 0:
                 return ProbeResult(runs=runs, failure="probe_timeout")
             payload: dict[str, Any] = {"df": df, "params": dict(candidate.params)}
             if group is not None:
                 payload["select"] = group
+                if len(groups) > 1:
+                    # compute and validate once per scaling; later groups only read the
+                    # retained result
+                    payload["reuse" if gi else "retain"] = True
             try:
                 result = session.call(payload, timeout_sec=remaining)
             except SandboxError as exc:

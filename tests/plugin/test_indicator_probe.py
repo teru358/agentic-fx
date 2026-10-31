@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import inspect
+import json
+import secrets
+import time
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,11 +16,14 @@ from agentic_fx.config import load_settings
 from agentic_fx.plugin import indicator_probe as probe
 from agentic_fx.plugin.canonical_fixture import aggregate_to, build_canonical_5m
 from agentic_fx.plugin.loader import PluginMeta, content_hash
-from agentic_fx.plugin.sandbox import PluginSession, SandboxError, inherited_filter_preflight
+from agentic_fx.plugin.sandbox import (
+    OUTPUTS_MISMATCH_DETAIL, PluginSession, SandboxError, host_preflight,
+    inherited_filter_preflight,
+)
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
 
-_reason = inherited_filter_preflight()
+_reason = host_preflight()[0] or inherited_filter_preflight()
 needs_sandbox = pytest.mark.skipif(_reason is not None,
                                    reason=f"requires a runnable PluginSession sandbox ({_reason})")
 
@@ -257,8 +265,8 @@ class _FakeSession:
         return {k: [1.0] * len(payload["df"]) for k in keys}
 
 
-def _fake_meta(outputs):
-    return PluginMeta(name="f", kind="indicator", path=Path("."), params={}, timeframe="1h",
+def _fake_meta(outputs, params=None):
+    return PluginMeta(name="f", kind="indicator", path=Path("."), params=params or {}, timeframe="1h",
                       pairs=(), max_bars=200, content_hash="0" * 64, outputs=outputs)
 
 
@@ -303,26 +311,27 @@ def test_each_call_gets_the_remaining_wall_clock_as_its_limit(bars_4096):
     assert [t for _, t in fake.calls] == [9.0, 8.0, 7.0, 6.0]
 
 
-@pytest.mark.parametrize("code,message,probe_mode,expected", [
-    ("cpu_limit", "x", False, "cpu_limit"),
-    ("timeout", "x", False, "timeout"),
-    ("plugin_error", "indicator result keys ['b'] do not match declared outputs ['a']", False, "outputs_mismatch"),
-    ("plugin_error", "ValueError: boom", False, "exception"),
-    ("crashed", "x", False, "exception"),
-    ("protocol_error", "x", False, "exception"),
-    ("timeout", "x", True, "probe_timeout"),
-    ("cpu_limit", "x", True, "probe_timeout"),
-    ("plugin_error", "ValueError: boom", True, "probe_exception"),
-    ("crashed", "x", True, "probe_exception"),
+@pytest.mark.parametrize("code,message,detail,probe_mode,expected", [
+    ("cpu_limit", "x", None, False, "cpu_limit"),
+    ("timeout", "x", None, False, "timeout"),
+    ("plugin_error", "any wording at all", OUTPUTS_MISMATCH_DETAIL, False, "outputs_mismatch"),
+    ("backtest_failed", "any wording at all", OUTPUTS_MISMATCH_DETAIL, False, "outputs_mismatch"),
+    ("plugin_error", "indicator result keys ['b'] do not match declared outputs ['a']", None, False,
+     "exception"),
+    ("plugin_error", "ValueError: boom", None, False, "exception"),
+    ("crashed", "x", None, False, "exception"),
+    ("protocol_error", "x", None, False, "exception"),
+    ("sandbox_unavailable", "x", None, False, "exception"),
+    ("timeout", "x", None, True, "probe_timeout"),
+    ("cpu_limit", "x", None, True, "probe_timeout"),
+    ("plugin_error", "ValueError: boom", None, True, "probe_exception"),
+    ("plugin_error", "x", OUTPUTS_MISMATCH_DETAIL, True, "probe_exception"),
+    ("crashed", "x", None, True, "probe_exception"),
+    ("sandbox_unavailable", "x", None, True, "probe_exception"),
 ])
-def test_candidate_side_failures_map_to_fixture_details(code, message, probe_mode, expected):
-    assert probe.classify_sandbox_error(SandboxError(message, code=code), probe=probe_mode) == expected
-
-
-@pytest.mark.parametrize("probe_mode", [False, True])
-def test_sandbox_unavailable_is_an_environment_error_not_a_candidate_failure(probe_mode):
-    with pytest.raises(probe.IndicatorEnvironmentError):
-        probe.classify_sandbox_error(SandboxError("x", code="sandbox_unavailable"), probe=probe_mode)
+def test_candidate_side_failures_map_to_fixture_details(code, message, detail, probe_mode, expected):
+    exc = SandboxError(message, code=code, detail=detail)
+    assert probe.classify_sandbox_error(exc, probe=probe_mode) == expected
 
 
 def test_environment_failure_during_session_start_is_raised_as_environment(monkeypatch, tmp_path, settings):
@@ -336,15 +345,49 @@ def test_environment_failure_during_session_start_is_raised_as_environment(monke
             pass
 
 
-def test_environment_failure_inside_a_call_is_raised_by_run_contract(hourly):
+def test_environment_failure_after_the_load_is_the_candidates(hourly):
     class Env:
         def call(self, payload, *, timeout_sec=None):
             raise SandboxError("unavailable", code="sandbox_unavailable")
 
-    with pytest.raises(probe.IndicatorEnvironmentError):
-        probe.run_contract(Env(), _fake_meta(("v",)), hourly)
-    with pytest.raises(probe.IndicatorEnvironmentError):
-        probe.run_probe(Env(), _fake_meta(("v",)), hourly)
+    assert probe.run_contract(Env(), _fake_meta(("v",)), hourly).failure == "exception"
+    assert probe.run_probe(Env(), _fake_meta(("v",)), hourly).failure == "probe_exception"
+
+
+def test_a_failed_session_start_is_closed_and_a_clean_one_is_closed_too(monkeypatch, tmp_path, settings):
+    closed = []
+    monkeypatch.setattr(PluginSession, "close", lambda self: closed.append(1))
+
+    def refuse(self):
+        raise SandboxError("unavailable", code="sandbox_unavailable")
+
+    meta = make_meta(tmp_path, "cl", OK_PY, outputs=OK_OUTPUTS)
+    with monkeypatch.context() as patch:
+        patch.setattr(PluginSession, "__enter__", refuse)
+        with pytest.raises(probe.IndicatorEnvironmentError):
+            with probe.open_session(meta, settings):
+                pass
+    assert closed == [1]
+    with monkeypatch.context() as patch:
+        patch.setattr(PluginSession, "__enter__", lambda self: self)
+        with probe.open_session(meta, settings):
+            assert closed == [1]
+    assert closed == [1, 1]
+
+
+def test_a_candidate_failure_at_session_start_is_closed_and_classified(monkeypatch, tmp_path, settings):
+    closed = []
+    monkeypatch.setattr(PluginSession, "close", lambda self: closed.append(1))
+
+    def fail(self):
+        raise SandboxError("load failed", code="plugin_error")
+
+    meta = make_meta(tmp_path, "cl2", OK_PY, outputs=OK_OUTPUTS)
+    monkeypatch.setattr(PluginSession, "__enter__", fail)
+    with pytest.raises(probe.FixtureFailure) as err:
+        with probe.open_session(meta, settings):
+            pass
+    assert err.value.detail == "exception" and closed == [1]
 
 
 def test_all_nan_detection_counts_scalars_and_series():
@@ -408,3 +451,285 @@ def test_second_get_or_build_starts_no_sandbox_and_a_new_fixture_hash_rebuilds(
     other = cache.CacheKey(meta.content_hash, "e" * 64, "1h")
     _, built = cache.get_or_build(data_dir, other, builder)
     assert built and starts == [1]
+
+
+# --- one compute per scaling --------------------------------------------------------
+
+COUNTING_PY = """
+import pandas as pd
+
+CALLS = []
+
+def compute(df, params):
+    CALLS.append(1)
+    out = {f"c{i}": df["close"] * (1.0 + i * 0.0013) + df["high"] * 0.00017 for i in range(31)}
+    out["calls"] = float(len(CALLS))
+    return out
+"""
+COUNTING_OUTPUTS = tuple(f"c{i}" for i in range(31)) + ("calls",)
+
+
+@needs_sandbox
+def test_thirty_two_outputs_compute_once_per_scaling_not_once_per_group(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "counting", COUNTING_PY, outputs=COUNTING_OUTPUTS)
+    with probe.open_session(meta, settings) as session:
+        res = probe.run_probe(session, meta, bars_4096)
+    assert res.ok and all(len(outs) == 32 for outs in res.runs.values())
+    assert [res.runs[label]["calls"] for label in ("k1", "k100", "k001", "vol100")] == [1.0, 2.0, 3.0, 4.0]
+
+
+@needs_sandbox
+def test_every_group_of_a_scaling_is_served_from_the_same_computation(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "samecomp", COUNTING_PY, outputs=COUNTING_OUTPUTS)
+    with probe.open_session(meta, settings) as session:
+        first = session.call({"df": bars_4096, "params": {}, "select": ["c0", "calls"], "retain": True})
+        again = session.call({"df": bars_4096, "params": {}, "select": ["c1", "calls"], "reuse": True})
+        fresh = session.call({"df": bars_4096, "params": {}, "select": ["calls"]})
+    assert first["calls"] == 1.0 and again["calls"] == 1.0 and fresh["calls"] == 2.0
+    assert set(again) == {"c1", "calls"}
+
+
+@needs_sandbox
+def test_reuse_without_a_retained_result_or_with_retain_is_refused_and_a_plain_call_drops_it(
+        tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "reuse", COUNTING_PY, outputs=COUNTING_OUTPUTS)
+    df = bars_4096
+    with probe.open_session(meta, settings) as session:
+        with pytest.raises(SandboxError, match="no retained"):
+            session.call({"df": df, "params": {}, "select": ["calls"], "reuse": True})
+    with probe.open_session(meta, settings) as session:
+        session.call({"df": df, "params": {}, "select": ["calls"], "retain": True})
+        session.call({"df": df, "params": {}, "select": ["calls"]})
+        with pytest.raises(SandboxError, match="no retained"):
+            session.call({"df": df, "params": {}, "select": ["calls"], "reuse": True})
+
+
+@needs_sandbox
+@pytest.mark.parametrize("payload,message", [
+    ({"retain": True, "reuse": True}, "retain and reuse cannot be combined"),
+    ({"retain": "yes"}, "retain must be a bool"),
+    ({"reuse": 1}, "reuse must be a bool"),
+])
+def test_retain_and_reuse_must_be_distinct_booleans(tmp_path, settings, bars_4096, payload, message):
+    meta = make_meta(tmp_path, "flags", OK_PY, outputs=OK_OUTPUTS)
+    with probe.open_session(meta, settings) as session:
+        session.call({"df": bars_4096.tail(50), "params": {}, "retain": True})
+        with pytest.raises(SandboxError, match=message):
+            session.call({"df": bars_4096.tail(50), "params": {}, **payload})
+        assert set(session.call({"df": bars_4096.tail(50), "params": {}, "reuse": True})) == set(OK_OUTPUTS)
+
+
+@needs_sandbox
+def test_the_worker_refuses_retain_together_with_reuse(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "wflags", OK_PY, outputs=OK_OUTPUTS)
+    with PluginSession(meta, settings=settings) as session:
+        assert _raw_call(session, bars_4096.tail(50), retain=True)["ok"] is True
+        both = _raw_call(session, bars_4096.tail(50), retain=True, reuse=True)
+        assert both["ok"] is False and "no retained" in both["error"]
+
+
+@needs_sandbox
+def test_a_mismatch_found_by_the_parents_own_check_carries_the_fixed_detail(
+        tmp_path, settings, hourly, monkeypatch):
+    meta = make_meta(tmp_path, "pmm", OK_PY, outputs=OK_OUTPUTS)
+    real = PluginSession._read_response
+
+    def lying(self, timeout_sec, max_bytes):
+        resp = real(self, timeout_sec, max_bytes)
+        if resp.get("ok") and isinstance(resp.get("result"), dict):
+            resp["result"] = {"zzz": 1.0}
+        return resp
+
+    with PluginSession(meta, settings=settings) as session:
+        monkeypatch.setattr(PluginSession, "_read_response", lying)
+        with pytest.raises(SandboxError) as err:
+            session.call({"df": hourly.tail(50), "params": {}})
+    assert err.value.detail == OUTPUTS_MISMATCH_DETAIL
+
+
+@needs_sandbox
+def test_outputs_mismatch_carries_a_structured_code_not_a_wording(tmp_path, settings, hourly):
+    meta = make_meta(tmp_path, "mmcode", MISMATCH_PY, outputs=("a",))
+    with probe.open_session(meta, settings) as session:
+        with pytest.raises(SandboxError) as err:
+            session.call({"df": hourly.tail(50), "params": {}})
+    assert err.value.detail == OUTPUTS_MISMATCH_DETAIL and err.value.code == "plugin_error"
+    other = make_meta(tmp_path, "rzcode", RAISE_PY, outputs=("v",))
+    with probe.open_session(other, settings) as session:
+        with pytest.raises(SandboxError) as err:
+            session.call({"df": hourly.tail(50), "params": {}})
+    assert err.value.detail is None
+
+
+def test_a_plain_sandbox_error_has_no_detail():
+    assert SandboxError("x").detail is None
+
+
+def test_probe_asks_the_first_group_to_retain_and_the_rest_to_reuse(bars_4096):
+    outputs = tuple(f"c{i}" for i in range(19))
+    fake = _FakeSession(outputs)
+    probe.run_probe(fake, _fake_meta(outputs), bars_4096)
+    flags = [(p.get("retain"), p.get("reuse")) for p, _ in fake.calls]
+    assert flags == [(True, None), (None, True), (None, True)] * 4
+
+
+def test_a_single_group_or_undeclared_outputs_need_no_retention(bars_4096):
+    for outputs in (("v",), tuple(f"c{i}" for i in range(8)), None):
+        fake = _FakeSession(("v",))
+        probe.run_probe(fake, _fake_meta(outputs), bars_4096)
+        assert all("retain" not in p and "reuse" not in p for p, _ in fake.calls)
+
+
+# --- pinned details -----------------------------------------------------------------
+
+def test_params_reach_the_contract_run_and_every_probe_call(bars_4096):
+    fake = _FakeSession(("v",))
+    meta = _fake_meta(("v",), params={"n": 7})
+    probe.run_contract(fake, meta, bars_4096)
+    probe.run_probe(fake, meta, bars_4096)
+    assert len(fake.calls) == 5 and all(p["params"] == {"n": 7} for p, _ in fake.calls)
+
+
+def test_the_default_wall_clock_is_sixty_seconds(bars_4096):
+    assert probe.DEFAULT_WALL_CLOCK_MAX_SEC == 60.0
+    assert inspect.signature(probe.run_probe).parameters["wall_clock_max_sec"].default == 60.0
+    fake = _FakeSession(("v",))
+    probe.run_probe(fake, _fake_meta(("v",)), bars_4096, clock=lambda: 0.0)
+    assert fake.calls[0][1] == 60.0
+
+
+def test_a_call_with_exactly_no_time_left_is_not_made(bars_4096):
+    ticks = iter([0.0, 10.0, 10.0, 10.0])
+    fake = _FakeSession(("v",))
+    res = probe.run_probe(fake, _fake_meta(("v",)), bars_4096, wall_clock_max_sec=10.0,
+                          clock=lambda: next(ticks))
+    assert res.failure == "probe_timeout" and fake.calls == []
+
+
+def test_all_nan_counts_infinite_and_empty_outputs_as_having_no_value():
+    idx = pd.date_range("2026-01-01", periods=2, freq="1h", tz="UTC")
+    assert probe.outputs_all_nan({})
+    assert probe.outputs_all_nan({"s": float("inf")})
+    assert probe.outputs_all_nan({"s": float("-inf")})
+    assert probe.outputs_all_nan({"s": float("-inf"), "t": pd.Series([np.inf, -np.inf], index=idx)})
+    assert not probe.outputs_all_nan({"s": float("-inf"), "t": 0.0})
+    assert not probe.outputs_all_nan({"s": 0.0})
+
+
+def test_a_null_scalar_becomes_nan_not_zero():
+    idx = pd.date_range("2026-01-01", periods=2, freq="1h", tz="UTC")
+    out = probe._to_outputs({"s": None, "l": [1.0, None], "f": 2}, idx)
+    assert np.isnan(out["s"]) and out["f"] == 2.0 and isinstance(out["f"], float)
+    assert isinstance(out["l"], pd.Series) and np.isnan(out["l"].iloc[1])
+
+
+# --- the session's select / timeout checks, hit directly -----------------------------------
+
+SIGNAL_PY = "def detect(df, params):\n    return []\n"
+SPIN_ALWAYS_PY = """
+def compute(df, params):
+    x = 0
+    while True:
+        x += 1
+"""
+
+
+ONE_OUTPUT_PY = """
+def compute(df, params):
+    return {"v": df["close"]}
+"""
+
+
+@needs_sandbox
+@pytest.mark.parametrize("select", ["v", {"v": 1}])
+def test_a_select_that_is_not_a_list_is_refused_even_when_its_items_name_an_output(
+        tmp_path, settings, hourly, select):
+    meta = make_meta(tmp_path, "sel3", ONE_OUTPUT_PY, outputs=("v",))
+    with PluginSession(meta, settings=settings) as session:
+        with pytest.raises(SandboxError, match="^select must be a non-empty subset"):
+            session.call({"df": hourly.tail(50), "params": {}, "select": select})
+        resp = _raw_call(session, hourly.tail(50), select=select)
+        assert resp["ok"] is False and "select must name outputs" in resp["error"]
+
+
+@needs_sandbox
+@pytest.mark.parametrize("select", [["nope"], [], [["ma"]], [3], "ma", ["ma", "nope"]])
+def test_the_session_refuses_a_bad_select_before_the_worker_sees_it(tmp_path, settings, hourly, select):
+    meta = make_meta(tmp_path, "sel2", OK_PY, outputs=OK_OUTPUTS)
+    with PluginSession(meta, settings=settings) as session:
+        with pytest.raises(SandboxError, match="^select must be a non-empty subset of the declared outputs$"):
+            session.call({"df": hourly.tail(50), "params": {}, "select": select})
+        assert set(session.call({"df": hourly.tail(50), "params": {}, "select": ("ma",)})) == {"ma"}
+
+
+@needs_sandbox
+def test_select_is_only_valid_for_an_indicator_call(tmp_path, settings, hourly):
+    d = tmp_path / "sig"
+    d.mkdir()
+    (d / "plugin.py").write_text(SIGNAL_PY)
+    (d / "config.yaml").write_text("kind: signal\n")
+    (d / "test_plugin.py").write_text("def test_placeholder():\n    pass\n")
+    meta = PluginMeta(name="sig", kind="signal", path=d, params={}, timeframe="1h", pairs=(),
+                      max_bars=200, content_hash=content_hash(d), outputs=("v",))
+    with PluginSession(meta, settings=settings) as session:
+        with pytest.raises(SandboxError, match="^select must be a non-empty subset"):
+            session.call({"df": hourly.tail(50), "params": {}, "select": ["v"]})
+
+
+def _raw_call(session, df, **fields):
+    from agentic_fx.plugin import sandbox as sb
+
+    request = {"df": sb._df_to_wire(df), "params": {}, "id": secrets.token_hex(8), **fields}
+    session._write_line(json.dumps(request) + "\n", deadline=time.monotonic() + 20.0)
+    return session._read_response(20.0, session._settings.sandbox_output_max_bytes)
+
+
+@needs_sandbox
+@pytest.mark.parametrize("select", [[], ["nope"], ["ma", "nope"], [3], "ma", {"a": 1}])
+def test_the_worker_itself_refuses_a_bad_select(tmp_path, settings, hourly, select):
+    meta = make_meta(tmp_path, "wsel", OK_PY, outputs=OK_OUTPUTS)
+    with PluginSession(meta, settings=settings) as session:
+        resp = _raw_call(session, hourly.tail(50), select=select)
+        assert resp["ok"] is False and "select must name outputs" in resp["error"]
+        good = _raw_call(session, hourly.tail(50), select=["ma", "last"])
+        assert good["ok"] is True and set(good["result"]) == {"ma", "last"}
+
+
+@needs_sandbox
+def test_the_worker_reports_an_outputs_mismatch_with_its_fixed_code(tmp_path, settings, hourly):
+    meta = make_meta(tmp_path, "wmm", MISMATCH_PY, outputs=("a",))
+    with PluginSession(meta, settings=settings) as session:
+        resp = _raw_call(session, hourly.tail(50))
+        assert resp["ok"] is False and resp["error_code"] == "outputs_mismatch"
+    other = make_meta(tmp_path, "wrz", RAISE_PY, outputs=("v",))
+    with PluginSession(other, settings=settings) as session:
+        resp = _raw_call(session, hourly.tail(50))
+        assert resp["ok"] is False and "error_code" not in resp
+
+
+@needs_sandbox
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "1", True, 0, -1.0])
+def test_a_bad_call_timeout_is_refused(tmp_path, settings, hourly, bad):
+    meta = make_meta(tmp_path, "tmo", OK_PY, outputs=OK_OUTPUTS)
+    with PluginSession(meta, settings=settings) as session:
+        with pytest.raises(SandboxError, match="timeout_sec"):
+            session.call({"df": hourly.tail(50), "params": {}}, timeout_sec=bad)
+        assert set(session.call({"df": hourly.tail(50), "params": {}})) == set(OK_OUTPUTS)
+
+
+@needs_sandbox
+def test_a_call_timeout_cannot_exceed_the_session_limit(tmp_path, settings, hourly):
+    quick = settings.model_copy(update={"sandbox_timeout_sec": 1.0, "sandbox_session_cpu_sec": 30})
+    meta = make_meta(tmp_path, "tmo2", SPIN_ALWAYS_PY, outputs=("v",))
+    with PluginSession(meta, settings=quick) as session:
+        started = time.monotonic()
+        with pytest.raises(SandboxError) as err:
+            session.call({"df": hourly.tail(50), "params": {}}, timeout_sec=25)
+        assert err.value.code == "timeout" and time.monotonic() - started < 10.0
+    with PluginSession(make_meta(tmp_path, "tmo3", SPIN_ALWAYS_PY, outputs=("v",)),
+                       settings=settings.model_copy(update={"sandbox_timeout_sec": 25.0,
+                                                           "sandbox_session_cpu_sec": 30})) as session:
+        started = time.monotonic()
+        with pytest.raises(SandboxError) as err:
+            session.call({"df": hourly.tail(50), "params": {}}, timeout_sec=1.0)
+        assert err.value.code == "timeout" and time.monotonic() - started < 10.0

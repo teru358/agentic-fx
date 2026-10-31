@@ -32,6 +32,10 @@ class IndicatorResultError(ValueError):
     それぞれの層の例外 (`SandboxError` 等) へ写像する。"""
 
 
+class OutputsMismatchError(IndicatorResultError):
+    """The result keys differ from the declared outputs."""
+
+
 _OHLCV_OUTPUTS = ("open", "high", "low", "close", "volume")
 
 
@@ -72,7 +76,7 @@ def validate_indicator_result(result: Any, *, df_index, outputs):
             raise IndicatorResultError(
                 f"indicator result keys must be str, got {key!r}")
     if outputs is not None and set(result) != set(outputs):
-        raise IndicatorResultError(
+        raise OutputsMismatchError(
             f"indicator result keys {sorted(result)} do not match declared "
             f"outputs {sorted(outputs)}")
 
