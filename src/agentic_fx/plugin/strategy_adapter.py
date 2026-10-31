@@ -57,6 +57,7 @@ from agentic_fx.plugin.reference_frames import (
     actual_bars_for, history_reference_frame, judge_reference,
     load_history_native_frame, window_lower,
 )
+from agentic_fx.symbols import readable_symbols
 from agentic_fx.plugin.sandbox import PluginSession, REFERENCE_ERROR_CODES, SandboxError
 
 if TYPE_CHECKING:
@@ -191,7 +192,7 @@ class PluginStrategyIntentSource:
         items = [item for item in self._resolved.items if item.frame_id is not None]
         if not items:
             return {}
-        watch = set(getattr(self._settings.datafeed, "watch_symbols", ()) or ())
+        readable = set(readable_symbols(self._settings))
         tf = timedelta(minutes=TF_MINUTES[self._meta.timeframe])
         bucket_start = df.index[-1]
         d_last = bucket_start + tf
@@ -203,7 +204,7 @@ class PluginStrategyIntentSource:
                 return None
             if item.frame_id in frames:
                 continue
-            if item.symbol_mode != "self" and symbol not in watch:
+            if item.symbol_mode != "self" and symbol not in readable:
                 return None
             frame = self._frame(symbol, item, d_last, actual)
             aligned = judge_reference(

@@ -203,6 +203,24 @@ def test_a_literal_outside_the_watch_list_sends_no_frame_and_skips(tmp_path):
     conn.close()
 
 
+def test_a_literal_trading_pair_frame_is_aligned_and_reaches_the_strategy(tmp_path):
+    conn, meta, resolved = _fixture(
+        tmp_path, pairs=("USDJPY", "EURUSD"),
+        items=[_item("eur", symbol="EURUSD", timeframe="1h")])
+    sandbox = _Sandbox()
+
+    inserted = _run(conn, SignalProducer(), [meta], resolved, NOW, sandbox,
+                    settings=_settings(watch=(), pairs=("USDJPY", "EURUSD")))
+
+    assert inserted >= 1
+    payload = next(payload for _, payload in sandbox.calls
+                   if payload["df"]["close"].iloc[-1] == 100.0)
+    frame = payload["frames"]["EURUSD@1h"]
+    assert list(frame.index) == [T0 + timedelta(hours=hour) for hour in (0, 1, 2, 3)]
+    assert set(frame["close"]) == {101.0}
+    conn.close()
+
+
 def _four_hour_fixture(tmp_path, *, skip=(), now=NOW, timeframe="4h"):
     conn = _conn(tmp_path)
     _seed(conn, "USDJPY", "1h", T0 - timedelta(days=3), T0 + timedelta(hours=4))

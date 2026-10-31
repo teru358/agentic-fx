@@ -147,6 +147,15 @@ def test_hard_wins_when_a_reference_key_is_also_a_hard_requirement():
     assert soft.is_hard("JP225", "1h") and soft.required_closed_bars("JP225", "1h") == 9
 
 
+def test_literal_trading_pair_reference_keeps_its_registry_key_hard():
+    refs = (IndicatorRef("eur", "ema", {}, None, symbol="EURUSD", timeframe="1h"),)
+    registry = build_registry(_watch_settings(watch=()), [_ref_strategy(refs)])
+
+    assert ("EURUSD", "1h") in registry.keys()
+    assert registry.is_hard("EURUSD", "1h") is True
+    assert registry.is_reference("EURUSD", "1h") is False
+
+
 def test_four_hour_and_daily_references_fold_into_native_hours():
     four = (IndicatorRef("jp", "ema", {}, None, symbol="JP225", timeframe="4h"),)
     daily = (IndicatorRef("jd", "ema", {}, None, symbol="JP225", timeframe="1d"),)

@@ -66,6 +66,7 @@ from agentic_fx.plugin.reference_frames import (
     actual_bars_for, judge_reference, latest_native_end, load_reference_frame,
     native_interval,
 )
+from agentic_fx.symbols import readable_symbols
 from agentic_fx.plugin.reference import runtime_reference_window_reason
 from agentic_fx.plugin.source_state import live_mismatch, source_state
 from agentic_fx.store import signals
@@ -464,7 +465,7 @@ class SignalProducer:
         if not items:
             return _References({}, ())
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
-        watch = set(getattr(settings.datafeed, "watch_symbols", ()) or ())
+        readable = set(readable_symbols(settings))
         tf = timedelta(minutes=TF_MINUTES[meta.timeframe])
         bucket_start = df.index[-1]
         d_last = df.index[-1] + tf
@@ -481,7 +482,7 @@ class SignalProducer:
             fetch_state = (reference_state((symbol, native_interval(ref_tf)))
                            if reference_state is not None else None)
             frame = None
-            if item.symbol_mode == "self" or symbol in watch:
+            if item.symbol_mode == "self" or symbol in readable:
                 frame = load_reference_frame(
                     conn, symbol, reference_timeframe=ref_tf, source=source,
                     d_last=d_last, now=now, grace=grace,

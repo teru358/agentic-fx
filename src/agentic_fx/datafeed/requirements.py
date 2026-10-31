@@ -8,6 +8,7 @@ from agentic_fx.plugin.reference_time import (
     DEFAULT_MAX_AGE_FACTOR, PLUGIN_TIMEFRAMES, canonical_duration_seconds,
     nominal_reference_bars, timeframe_seconds,
 )
+from agentic_fx.symbols import readable_symbols
 
 
 _INTERVAL_MINUTES = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30,
@@ -102,7 +103,6 @@ class RequirementRegistry:
 def build_registry(settings, deployed_plugins) -> RequirementRegistry:
     registry = RequirementRegistry()
     pairs = tuple(settings.pairs)
-    watch = tuple(getattr(settings.datafeed, "watch_symbols", ()) or ())
     registry.register("paper", pairs, "1m", 1, hard=True, reason="paper")
     registry.register("mtm", pairs, "1m", 1, hard=True, reason="mtm")
     registry.register("hwm", pairs, "1m", 1, hard=True, reason="hwm")
@@ -131,7 +131,7 @@ def build_registry(settings, deployed_plugins) -> RequirementRegistry:
                 continue
             if symbol == "self":
                 targets = strategy_pairs
-            elif symbol in watch:
+            elif symbol in readable_symbols(settings):
                 targets = (symbol,)
             else:
                 continue

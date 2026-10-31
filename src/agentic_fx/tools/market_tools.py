@@ -11,6 +11,7 @@ from agentic_fx.datafeed.planner import RequirementPlanner
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.plugin import sandbox as plugin_sandbox
 from agentic_fx.plugin.loader import PluginMeta
+from agentic_fx.symbols import readable_symbols
 from agentic_fx.tools.registry import ToolDef
 
 _log = logging.getLogger(__name__)
@@ -21,11 +22,6 @@ def pair_param(settings: Settings) -> dict:
     return {"pair": {"enum": list(settings.pairs), "description": "e.g. USDJPY"},
             "timeframe": {"type": "string",
                           "enum": list(settings.datafeed.intervals)}}
-
-
-def readable_symbols(settings: Settings) -> list[str]:
-    """読み取り専用の market tool が受ける銘柄 (取引 pair、続けて参照銘柄)。schema と実行時検査の共通の元。"""
-    return [*settings.pairs, *settings.datafeed.watch_symbols]
 
 
 def read_symbol_param(settings: Settings) -> dict:
