@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 155 件。完了分は closed/。
+未完了: 154 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -20,13 +20,12 @@
 | [same-name-candidate-must-beat-deployed-baseline](open/same-name-candidate-must-beat-deployed-baseline.md) | 中 | 2026-10-29 | 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (12)
+## 実装待ち (11)
 
-### 不具合 (7)
+### 不具合 (6)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
-| [ops-web-502-stuck-cause-unknown](open/ops-web-502-stuck-cause-unknown.md) | 高 | 2026-10-30 | web が Service unavailable (502) を返し続けた原因が未確定 |
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
