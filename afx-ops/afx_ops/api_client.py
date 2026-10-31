@@ -597,7 +597,8 @@ def wait_ready(endpoint: Endpoint, *, interval: float = READINESS_INTERVAL,
         except ApiError as err:
             if err.reason not in _WAITABLE:
                 raise
-            last_detail = err.detail or last_detail
+            # 最後の失敗の detail だけを出す (detail の無い失敗が最後なら何も添えない)
+            last_detail = err.detail
         if now() + interval > deadline:
             raise ApiError("readiness_timeout", detail=last_detail)
         sleep(interval)

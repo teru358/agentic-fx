@@ -259,6 +259,27 @@ def test_wait_ready_timeout_keeps_the_last_transient_detail(monkeypatch, tmp_pat
         "readiness_timeout detail=step=fdinfo_open errno=12")
 
 
+def test_wait_ready_timeout_drops_a_stale_detail_when_the_last_failure_has_none(monkeypatch, tmp_path):
+    clock = [0.0]
+    calls = [0]
+
+    def fake_open(endpoint, *, timeout):
+        clock[0] += timeout
+        calls[0] += 1
+        if calls[0] == 1:
+            raise ApiError("pidfd_transient", detail=f"step=fdinfo_open errno={errno.ENOMEM}")
+        raise ApiError("refused")
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(fake_open))
+    with pytest.raises(ApiError) as caught:
+        api_client.wait_ready(api_client.Endpoint(tmp_path / "s", tmp_path / "l"),
+                              interval=0.25, limit=30.0, sleep=lambda _v: None,
+                              now=lambda: clock[0])
+    assert caught.value.reason == "readiness_timeout"
+    assert caught.value.detail == ""
+    assert with_detail(caught.value.reason, caught.value.detail) == "readiness_timeout"
+
+
 def test_wait_ready_timeout_without_a_transient_has_no_detail(monkeypatch, tmp_path):
     clock = [0.0]
 
