@@ -92,6 +92,26 @@ def test_status_rows_flow_through_to_the_formatted_line(tmp_path):
         app.close()
 
 
+def test_a_referenced_trading_pair_reaches_status_without_any_watch_symbol(tmp_path):
+    _init(tmp_path)
+    app = _app(tmp_path)
+    try:
+        from types import SimpleNamespace
+        from agentic_fx.plugin.loader import IndicatorRef
+        from agentic_fx.datafeed.requirements import build_registry
+
+        pair = app.settings.pairs[0]
+        strategy = SimpleNamespace(
+            name="ref", kind="strategy", timeframe="1h", pairs=(pair,),
+            max_bars=50, indicators=(IndicatorRef("own", "ema", {}, None, symbol=pair,
+                                                  timeframe="4h"),))
+        app.ingest.registry = build_registry(app.settings, [strategy])
+        rows = app.ops._status_provider()["references"]
+        assert [(r["symbol"], r["interval"]) for r in rows] == [(pair, "1h")]
+    finally:
+        app.close()
+
+
 def test_the_signal_producer_reads_the_ingest_fetch_state_snapshot(tmp_path, monkeypatch):
     from types import MappingProxyType
 

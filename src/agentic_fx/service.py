@@ -83,6 +83,7 @@ from agentic_fx.store.setup_marker import (
 from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
 from agentic_fx.store.rag import Rag
 from agentic_fx.store.setup_record import SetupRecord, read_setup_record, write_setup_record
+from agentic_fx.symbols import readable_symbols
 from agentic_fx.ops_setup.setup_lease import SetupLeaseBusy, acquire_setup_lease
 from agentic_fx.setup.settings_migrate import CURRENT_SCHEMA_VERSION, _schema_version
 from agentic_fx.store.state import StateStore
@@ -1899,12 +1900,9 @@ def _serialize_status_setup(facts) -> dict:
 
 
 def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] | None:
-    """監視 symbol があるときだけ参照系列の状態を返す。失敗しても status は止めない。"""
-    watch = tuple(getattr(settings.datafeed, "watch_symbols", ()) or ())
-    if not watch:
-        return None
+    """strategy が参照する symbol (取引 pair と watch_symbols) の状態を返す。失敗しても status は止めない。"""
     try:
-        return reference_rows(conn, ingest, now, watch_symbols=watch,
+        return reference_rows(conn, ingest, now, symbols=readable_symbols(settings),
                               storage_source=ingest.storage_source)
     except Exception as exc:  # noqa: BLE001 — optional display must not break status
         _log.warning("status references unavailable: %s", type(exc).__name__)

@@ -8,7 +8,10 @@ from agentic_fx.plugin.reference_time import (
     DEFAULT_MAX_AGE_FACTOR, PLUGIN_TIMEFRAMES, canonical_duration_seconds,
     nominal_reference_bars, timeframe_seconds,
 )
+from agentic_fx.symbols import readable_symbols
 
+
+REFERENCE_REASONS = frozenset({"reference", "reference_pair"})
 
 _INTERVAL_MINUTES = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30,
                      "60m": 60, "90m": 90, "1h": 60, "4h": 240,
@@ -82,6 +85,11 @@ class RequirementRegistry:
         entries = self.requirements_for(symbol, interval)
         return bool(entries) and all(entry.reason == "reference" for entry in entries)
 
+    def is_referenced(self, symbol: str, interval: str) -> bool:
+        """True when some strategy declared this key as a literal reference."""
+        return any(entry.reason in REFERENCE_REASONS
+                   for entry in self.requirements_for(symbol, interval))
+
     def hard_keys(self) -> frozenset[tuple[str, str]]:
         return frozenset((symbol, entry.interval)
                          for entry in self.entries if entry.hard
@@ -102,7 +110,7 @@ class RequirementRegistry:
 def build_registry(settings, deployed_plugins) -> RequirementRegistry:
     registry = RequirementRegistry()
     pairs = tuple(settings.pairs)
-    watch = tuple(getattr(settings.datafeed, "watch_symbols", ()) or ())
+    readable: frozenset[str] | None = None
     registry.register("paper", pairs, "1m", 1, hard=True, reason="paper")
     registry.register("mtm", pairs, "1m", 1, hard=True, reason="mtm")
     registry.register("hwm", pairs, "1m", 1, hard=True, reason="hwm")
@@ -131,19 +139,24 @@ def build_registry(settings, deployed_plugins) -> RequirementRegistry:
                 continue
             if symbol == "self":
                 targets = strategy_pairs
-            elif symbol in watch:
-                targets = (symbol,)
             else:
-                continue
+                if readable is None:
+                    readable = frozenset(readable_symbols(settings))
+                if symbol not in readable:
+                    continue
+                targets = (symbol,)
             try:
                 max_age = (canonical_duration_seconds(ref.max_age)
                            if getattr(ref, "max_age", None) is not None
                            else DEFAULT_MAX_AGE_FACTOR * timeframe_seconds(reference_tf))
             except ValueError:
                 continue
+            trading_pair = symbol in configured_pairs
             registry.register(strategy.name, targets, reference_tf,
                               nominal_reference_bars(
                                   getattr(strategy, "max_bars", DEFAULT_MAX_BARS),
                                   strategy.timeframe, reference_tf),
-                              hard=False, reason="reference", max_age_seconds=max_age)
+                              hard=trading_pair,
+                              reason="reference_pair" if trading_pair else "reference",
+                              max_age_seconds=max_age)
     return registry

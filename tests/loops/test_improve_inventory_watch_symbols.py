@@ -42,21 +42,23 @@ def test_the_view_carries_the_watch_list_and_a_boolean_per_symbol(tmp_path):
     conn = _conn(tmp_path, [("JP225", "2019-03-04T05:06:07+00:00", 7777)])
     view = build_inventory_view(_result(), settings=_settings(["JP225"]), conn=conn)
     assert view["watch_symbols"] == ["JP225"]
-    assert view["history_available"] == {"JP225": True}
+    assert view["reference_symbols"] == [*BASE.pairs, "JP225"]
+    assert view["history_available"] == {**{pair: False for pair in BASE.pairs}, "JP225": True}
     assert set(view) == {"plugins", "pin_broken_strategies", "watch_symbols",
-                         "history_available"}
+                         "reference_symbols", "history_available"}
 
 
 def test_the_boolean_is_per_symbol_and_false_without_history(tmp_path):
     conn = _conn(tmp_path, [("JP225", "2019-03-04T05:06:07+00:00", 1)])
     view = build_inventory_view(_result(), settings=_settings(["JP225", "US500"]), conn=conn)
     assert view["watch_symbols"] == ["JP225", "US500"]
-    assert view["history_available"] == {"JP225": True, "US500": False}
+    pairs_off = {pair: False for pair in BASE.pairs}
+    assert view["history_available"] == {**pairs_off, "JP225": True, "US500": False}
     empty = build_inventory_view(_result(), settings=_settings([]), conn=conn)
-    assert empty["watch_symbols"] == [] and empty["history_available"] == {}
+    assert empty["watch_symbols"] == [] and empty["history_available"] == pairs_off
     unconfigured = build_inventory_view(
         _result(), settings=_settings(["JP225"], source="none"), conn=conn)
-    assert unconfigured["history_available"] == {"JP225": False}
+    assert unconfigured["history_available"] == {**pairs_off, "JP225": False}
 
 
 def test_nothing_about_the_extent_or_quality_of_the_history_reaches_the_view(tmp_path):
@@ -74,11 +76,13 @@ def test_the_tool_returns_the_watch_list_and_the_booleans_only(tmp_path):
     source = tmp_path / "src"
     staging.mkdir(), source.mkdir()
     view = {"plugins": [], "pin_broken_strategies": [], "watch_symbols": ["JP225", "US500"],
+            "reference_symbols": ["USDJPY", "JP225", "US500"],
             "history_available": {"JP225": True, "US500": False}, "history_range": ["2019", "2025"]}
     tools = {t.name: t for t in build_improve_staging_tooldefs(
         staging_dir=staging, source_snapshot_dir=source, inventory_view=view)}
     assert tools["list_deployed_plugins"].func() == {
         "plugins": [], "pin_broken_strategies": [], "watch_symbols": ["JP225", "US500"],
+        "reference_symbols": ["USDJPY", "JP225", "US500"],
         "history_available": {"JP225": True, "US500": False}}
 
 
@@ -110,3 +114,13 @@ def test_a_deployed_reference_strategy_is_shown_under_its_own_v2_family_label():
     keyed, _, _, _ = _deployed_view(families, {"USDJPY"})
     assert keyed["strategy:ema@1h@USDJPY"] == ["plain"]
     assert keyed["strategy-v2:ema@1h@USDJPY"] == ["jp", "us"]
+
+
+def test_a_trading_pair_is_a_reference_symbol_with_its_own_history_flag(tmp_path):
+    """Pairs are readable references, so the agent sees them and whether replay data exists."""
+    settings = _settings([]).model_copy(update={"pairs": ["USDJPY", "EURUSD"]})
+    conn = _conn(tmp_path, [("EURUSD", "2019-03-04T05:06:07+00:00", 1)])
+    view = build_inventory_view(_result(), settings=settings, conn=conn)
+    assert view["watch_symbols"] == []
+    assert view["reference_symbols"] == ["USDJPY", "EURUSD"]
+    assert view["history_available"] == {"USDJPY": False, "EURUSD": True}

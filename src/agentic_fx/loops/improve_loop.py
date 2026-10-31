@@ -89,6 +89,7 @@ from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
+from agentic_fx.symbols import readable_symbols
 from agentic_fx.tools.improve_rpc_tools import RpcOutcome, build_rpc_handlers
 
 if TYPE_CHECKING:
@@ -499,17 +500,19 @@ def build_inventory_view(result: "InventoryBuildResult", *, settings=None, conn=
     }
     if settings is not None:
         watches = list(settings.datafeed.watch_symbols)
+        readable = readable_symbols(settings)
         dataset = settings.backtest.dataset()
         covered: set[str] = set()
-        if conn is not None and not dataset.unconfigured and watches:
-            placeholders = ",".join("?" for _ in watches)
+        if conn is not None and not dataset.unconfigured and readable:
+            placeholders = ",".join("?" for _ in readable)
             covered = {row[0] for row in conn.execute(
                 "SELECT DISTINCT symbol FROM ohlcv_history "
                 "WHERE source=? AND interval=? "
                 f"AND symbol IN ({placeholders})",
-                (dataset.source, dataset.base_interval, *watches))}
+                (dataset.source, dataset.base_interval, *readable))}
         view["watch_symbols"] = watches
-        view["history_available"] = {symbol: symbol in covered for symbol in watches}
+        view["reference_symbols"] = readable
+        view["history_available"] = {symbol: symbol in covered for symbol in readable}
     return view
 
 

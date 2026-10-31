@@ -11,21 +11,21 @@ REFERENCE_STATES = ("ok", "stale", "missing", "fetch_failed", "budget_deferred",
 _FETCH_PROBLEMS = REFERENCE_STATES[3:]
 
 
-def reference_rows(conn, ingest, now: datetime, *, watch_symbols,
+def reference_rows(conn, ingest, now: datetime, *, symbols,
                    storage_source: str) -> list[dict]:
-    """One row per ``(symbol, native interval, source)`` of the watched symbols.
+    """One row per referenced ``(symbol, native interval, source)`` among the readable symbols.
 
     ``ingest.reference_fetch_state`` is an immutable snapshot replaced by the
     scheduler thread; the rest is read through ``conn``.  A stale row carries
     ``age_seconds`` measured from the end of the newest closed bar.
     """
-    watch = set(watch_symbols)
+    readable = set(symbols)
     registry = ingest.registry
     fetch_state = ingest.reference_fetch_state
     now = now.astimezone(timezone.utc)
     rows = []
     for symbol, interval in registry.keys():
-        if symbol not in watch:
+        if symbol not in readable or not registry.is_referenced(symbol, interval):
             continue
         width = timedelta(minutes=sources.INTERVAL_MIN[interval])
         newest = conn.execute(
