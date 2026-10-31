@@ -113,7 +113,7 @@
   - **各 k の検査**: 全 k の run で 契約 run と同じ全 NaN 検査を当て、どれかで全列が全 NaN になれば `output_not_finite` で reject (例: `log(close - 100)` は 150 では動くが k=0.01 では全 NaN。チケット (2) の「両スケールで有限」)。本数が減るだけなら `sparse_output`。
   - **スケール分類**: 出力列ごとに price は `invariant` (k=1 と allclose rtol 1e-6) / `proportional` (k 倍と allclose) / `neither`、volume は `invariant` / `neither` (volume 比例は設けない)。2 つの k で食い違えば `neither`。いずれかの列が `neither` なら **warning** `scale_dependent` を付けて承認へ進む (reject しない。チケット (2) で決定済み。対数収益のクリップなど正当な例があり得る)。k=1 の出力を cache し、重複・類似はこの出力で行う。
 - **cache**: 配備済み indicator の k=1 出力 (列ごとの系列と分類) を親専有の `data/indicator_fixture_cache/` に置く。key = `<content_hash>-<fixture 実データ hash>-<tf>` (式や numpy の版で fixture が変われば旧 cache は自動で無効。旧世代は mission 終端で GC)。規律: directory 0700 / file 0600、`O_NOFOLLOW` + 通常ファイル + `nlink==1` の検査、temp + fsync + atomic rename、key ごとの lock、読出時に schema と content_hash を検証、sandbox の allowlist に入れない。無ければその場で同じ sandbox 経路で生成する (初回 56 本 × 4 回で約 16 秒 CPU と見積もる。sandbox 外の値で起動費は T2 で実測)。pending の indicator 候補の k=1 出力も同じ規律で cache する。
-- cache や inventory が使えないときの扱いは §2。
+- cache や inventory が使えないときの扱いは §2。ただし**配備済み indicator 1 本の候補起因の失敗** (その plugin 自身の `FixtureFailure`: 例外・全 NaN・壁時計超過) は環境事象ではないので、その 1 本だけを比較相手から外し、`duplicate_unavailable` warning を改善ループでも付けて候補は通す (activity に相手名と detail)。環境起因 (sandbox 不可・lock timeout) だけが retryable。
 
 ### 3.5 重複と単調変換と類似
 
@@ -242,3 +242,4 @@
 | 2026-10-31 | v0.6 C0 | J1 / J4 / J5 / J6 をユーザー裁定済 (推奨どおり) に。J6 の配線 (approve 時の再判定、`duplicate_at_approve`、AC 15) を §3.5 / §4 / §5 に | ユーザー承認、実装着手 | |
 | 2026-10-31 | v0.6.1 C0 | T1 レビューの追従: param 禁止語を閉じた句の表に (bare `point` と「`price` を含む」を廃止、§3.3)、exact は共通有限 1 以上・atol 1e-12・比較不能は不一致・exact 対は単調/類似から除外・warning は全部集める (§3.5) | /code-review high (T1) の #5 / #6 / #1 / #2 | |
 | 2026-10-31 | v0.6.2 C0 | §3.7 の warning 語彙に bless 限定の `symbol_in_name` / `param_price_unit` と、approve 再判定の `duplicate_at_approve` (warn では warning、enforce では失敗語) を明示 | T3 レビュー 1 周目 (閉語彙外の語) | |
+| 2026-10-31 | v0.6.3 C0 | 配備済み 1 本の候補起因の probe 失敗は環境事象でなく、その 1 本を比較から外して `duplicate_unavailable` warning (改善ループでも候補は通す) に (§3.4)。壊れた配備済み 1 本で indicator の改善が永久停止するのを防ぐ | T3 レビュー 2 周目 #5 | |
