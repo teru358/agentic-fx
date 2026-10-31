@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 153 件。完了分は closed/。
+未完了: 154 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -75,7 +75,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (127)
+## 設計待ち (128)
 
 ### 不具合 (70)
 
@@ -152,7 +152,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (37)
+### 機能 (38)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -165,6 +165,7 @@
 | [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 中 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
+| [reference-literal-symbol-allow-trading-pairs](open/reference-literal-symbol-allow-trading-pairs.md) | 中 | 2026-10-31 | 戦略の参照 symbol に取引 pair も許す (pairs + watch_symbols) |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
