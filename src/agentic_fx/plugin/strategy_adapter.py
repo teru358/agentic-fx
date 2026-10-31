@@ -57,8 +57,8 @@ from agentic_fx.plugin.reference_frames import (
     actual_bars_for, history_reference_frame, judge_reference,
     load_history_native_frame, window_lower,
 )
-from agentic_fx.symbols import readable_symbols
 from agentic_fx.plugin.sandbox import PluginSession, REFERENCE_ERROR_CODES, SandboxError
+from agentic_fx.symbols import readable_symbols
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -121,6 +121,7 @@ class PluginStrategyIntentSource:
         # (symbol, reference timeframe) -> (lower, upper, native rows): a replay reads
         # each reference once per chunk instead of once per strategy bar.
         self._native_cache: dict[tuple[str, str], tuple] = {}
+        self._readable: frozenset[str] | None = None
         self._cpu_sec: float | None = None
         # 親が観測した worker の終了状態。session 参照を消す前に取り込む
         # (close 応答の自己申告ではなく親の wait4 が出所)。
@@ -192,7 +193,9 @@ class PluginStrategyIntentSource:
         items = [item for item in self._resolved.items if item.frame_id is not None]
         if not items:
             return {}
-        readable = set(readable_symbols(self._settings))
+        if self._readable is None:
+            self._readable = frozenset(readable_symbols(self._settings))
+        readable = self._readable
         tf = timedelta(minutes=TF_MINUTES[self._meta.timeframe])
         bucket_start = df.index[-1]
         d_last = bucket_start + tf

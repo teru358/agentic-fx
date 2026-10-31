@@ -1,6 +1,6 @@
 # 参照系列 (株価指数など) を戦略の材料にする — 設計 C1
 
-**版:** v0.6.5 C1 (裁定済)（T2 実装・レビューで確定した事項を反映）
+**版:** v0.6.6 C1 (裁定済)（T2 実装・レビューで確定した事項を反映）
 **チケット:** `reference-symbols-as-indicator-inputs`（中）、`multi-timeframe-indicator-deps`（低）、`executor-pair-membership-guard`（高、T1 に含める）
 **正本の関係:** indicator の loader / resolver / pin は `2026-09-14-indicator-consumption-wiring-design.md` を拡張する。価格源の outage / backfill 規則は `2026-09-24-outage-stop-and-backfill-design.md` を変更しない。
 
@@ -133,7 +133,7 @@ backtest は取引 pair と全参照 symbol を一つの `HistoryDataset(source,
 
 `get_ohlcv` と `get_indicators` だけは market-read 専用の `read_symbol_param()` を新設して `pairs + watch_symbols` を enum / runtime membership ともに検査する。共通 `market_tools.pair_param()` は拡張しないため、`get_signals` と trade-intent schema は pairs 限定のままである。read tool も MT5 primary / raw symbol 契約に従う。
 
-改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols` と `history_available` (watch symbol ごとの `{symbol: true|false}`、同じ dataset に 1 行以上あるか) だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
+改善 mission の `list_deployed_plugins()` には bounded な top-level `watch_symbols`、参照できる全 symbol (取引 pair + watch_symbols) の `reference_symbols`、`history_available` (reference symbol ごとの `{symbol: true|false}`、同じ dataset に 1 行以上あるか) だけを載せる。履歴の開始・終了時刻や成績・holdout 境界を inventory sink に出さない。prompt 規律には「参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まない」を加える。
 
 family identity は新 grammar `strategy-v2:<strategy_tf>@<trading-pairs>@<encoded-resolved-deps>` にする。各 dep は alias の宣言順で `alias;plugin;symbol_mode;literal_symbol_or_-;ref_tf` を percent-escape した token とし、alias、plugin、self/literal symbol、reference timeframe、順序を全て区別する。escape `E` は UTF-8 byte 列に対し RFC 3986 unreserved（`A-Z a-z 0-9 - . _ ~`）だけをそのまま出し、それ以外を大文字 hex の `%XX` にする。各 variable field に `E` を適用してから grammar の literal separator `@`、`,`、`;` を結ぶ。decoder は不正な `%`、小文字 hex、safe 文字の過剰 escape、decode 後に再 encode して原文と一致しない値を reject する。既存の `FAMILY_KEY_MAX_BYTES = 512` は上げない。resolver は生成後の encoded family key が 512 bytes 以下であることを検査し、超過は固定 reason `family_key_too_long` で config reject する。literal symbol は `watch_symbols` membership を満たし、その UTF-8 32-byte 上限にも従う。新 parser はこの正規形だけを受け、既存 `strategy:<names>@<tf>@<pairs>` は legacy として parse / 表示のみ維持する。旧 key は新 key と同一族に畳み込まない。これは scalar を落とす config shape hash だけでは JP225 と US500 を区別できないためである。
 
@@ -204,3 +204,4 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-30 | v0.6.3 C1 | T3 で確定: `history_available` は symbol ごと、`reference_history_missing` の reason は `no_rows`、gate の構造化 verdict と commit 相の固定語、replay の frame cache | T3 実装・レビューで確定 | |
 | 2026-10-31 | v0.6.4 C1 | 参照 symbol の live frame には FX 前提の鮮度・開場 gap 検査を掛けない (§ calendar の節)。daemon 起動検査は bridge に問い合わせず `afx check` だけが突合。wizard: 非 MT5 選択時は現在の watch を表示して外す、一覧取得を飛ばす経路でも overlap を検査、区切りはカンマのみ | T4 レビュー 2 周目 (/code-review) #1・#2・#4・#6・#9 の是正に合わせる | |
 | 2026-10-31 | v0.6.5 C1 | literal の membership を `pairs + watch_symbols` に拡張し、取引 pair の参照 key が hard のままであることを明記 | `reference-literal-symbol-allow-trading-pairs` | |
+| 2026-10-31 | v0.6.6 C1 | inventory view に `reference_symbols` (pairs + watch_symbols) を足し `history_available` をその全体に広げた。取引 pair の参照 key は registry でも hard (reason `reference_pair`)、status の参照行は読める symbol の参照 key を対象にした。`symbol_not_watched` は閉じた語彙のまま (pairs または watch_symbols に無い意味) | `reference-literal-symbol-allow-trading-pairs` /code-review 2 周目 | |

@@ -219,6 +219,8 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         symbol_mode = "self" if ref.symbol == "self" else "literal"
         literal_symbol = None if symbol_mode == "self" else ref.symbol
         if literal_symbol is not None:
+            # The code name is a closed vocabulary; the check covers both
+            # settings.pairs and datafeed.watch_symbols.
             if literal_symbol not in readable_symbols(settings):
                 raise IndicatorResolutionError(ref.alias, "symbol_not_watched")
             if len(literal_symbol.encode("utf-8")) > 32:

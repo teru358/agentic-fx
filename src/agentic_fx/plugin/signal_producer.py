@@ -66,10 +66,10 @@ from agentic_fx.plugin.reference_frames import (
     actual_bars_for, judge_reference, latest_native_end, load_reference_frame,
     native_interval,
 )
-from agentic_fx.symbols import readable_symbols
 from agentic_fx.plugin.reference import runtime_reference_window_reason
 from agentic_fx.plugin.source_state import live_mismatch, source_state
 from agentic_fx.store import signals
+from agentic_fx.symbols import readable_symbols
 
 if TYPE_CHECKING:
     import sqlite3
@@ -101,6 +101,9 @@ class SignalProducer:
         # (symbol, native interval) -> ingest が最後に観測した取得の状態
         # (source_unavailable / fetch_failed / budget_deferred / ok)。
         self.reference_state = reference_state
+        # Membership of readable symbols is invariant per settings object.
+        self._readable: frozenset[str] = frozenset()
+        self._readable_for = None
         # (plugin.name, content_hash, pair) -> 最後に評価成功したバケット開始時刻
         self._cursor: dict[tuple[str, str, str], datetime] = {}
         # The set is deliberately in-memory like the cursor: an outage should
@@ -465,7 +468,10 @@ class SignalProducer:
         if not items:
             return _References({}, ())
         grace = timedelta(seconds=settings.datafeed.closed_bar_grace_sec)
-        readable = set(readable_symbols(settings))
+        if self._readable_for is not settings:
+            self._readable = frozenset(readable_symbols(settings))
+            self._readable_for = settings
+        readable = self._readable
         tf = timedelta(minutes=TF_MINUTES[meta.timeframe])
         bucket_start = df.index[-1]
         d_last = df.index[-1] + tf

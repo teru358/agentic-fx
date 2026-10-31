@@ -189,3 +189,32 @@ def test_max_age_is_the_tightest_among_indicators_reading_the_key():
     registry = build_registry(_watch_settings(), [_ref_strategy(refs)])
     assert registry.max_age_seconds("JP225", "1h") == 7200
     assert registry.max_age_seconds("USDJPY", "1h") is None
+
+
+def test_trading_pair_reference_on_a_non_primary_interval_is_hard_for_registry_and_ingest():
+    from agentic_fx.datafeed.ingest import Ingest
+
+    settings = _watch_settings(watch=(), primary=("5m",))
+    settings.datafeed.primary = "mt5"
+    refs = (IndicatorRef("eur", "ema", {}, None, symbol="EURUSD", timeframe="1h"),)
+    plugins = [_ref_strategy(refs)]
+    registry = build_registry(settings, plugins)
+
+    assert ("EURUSD", "1h") in registry.hard_keys()
+    assert registry.is_reference("EURUSD", "1h") is False
+    ingest = Ingest(settings, plugins)
+    assert ingest._is_hard(("EURUSD", "1h")) is True
+    assert ingest._is_hard(("EURUSD", "1h")) == (("EURUSD", "1h") in registry.hard_keys())
+
+
+def test_readable_symbols_are_computed_once_per_registry_build(monkeypatch):
+    from agentic_fx.datafeed import requirements
+
+    calls = []
+    real = requirements.readable_symbols
+    monkeypatch.setattr(requirements, "readable_symbols",
+                        lambda settings: calls.append(1) or real(settings))
+    refs = (IndicatorRef("a", "ema", {}, None, symbol="JP225", timeframe="1h"),
+            IndicatorRef("b", "ema", {}, None, symbol="EURUSD", timeframe="1h"))
+    build_registry(_watch_settings(), [_ref_strategy(refs), _ref_strategy(refs)])
+    assert len(calls) == 1

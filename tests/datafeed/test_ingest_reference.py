@@ -507,7 +507,7 @@ def _status_rows(tmp_path, *, fetch, bars=None, now=NOW, strategies=None, steps=
         ingest.prepare(now, conn)
         ingest.commit(conn)
     rows = reference_rows(conn, ingest, now,
-                          watch_symbols=settings.datafeed.watch_symbols,
+                          symbols=[*settings.pairs, *settings.datafeed.watch_symbols],
                           storage_source="mt5-live")
     conn.close()
     return rows
@@ -551,7 +551,7 @@ def test_status_rows_cover_the_six_states(tmp_path):
                     fetch=lambda *a, **k: (setattr(clock, "t", clock.t + 5), [])[1],
                     monotonic=clock)
     ingest.prepare(NOW, conn)
-    [row] = reference_rows(conn, ingest, NOW, watch_symbols=["JP225"], storage_source="mt5-live")
+    [row] = reference_rows(conn, ingest, NOW, symbols=["JP225"], storage_source="mt5-live")
     assert row["state"] == "budget_deferred"
     conn.close()
 
@@ -577,3 +577,11 @@ def test_status_uses_the_tightest_max_age_of_the_indicators_reading_the_key(tmp_
                          strategies=[_strategy(loose, tight)])
     assert row["state"] == "stale"
 
+
+
+def test_status_lists_a_referenced_trading_pair_but_not_the_core_pair_keys(tmp_path):
+    settings = _settings(watch=(), pairs=("USDJPY", "EURUSD"))
+    rows = _status_rows(tmp_path, fetch=lambda *a, **k: [], settings=settings,
+                        strategies=[_strategy(_ref("EURUSD", alias="eur"))])
+    assert [(r["symbol"], r["interval"], r["state"]) for r in rows] == [
+        ("EURUSD", "1h", "missing")]

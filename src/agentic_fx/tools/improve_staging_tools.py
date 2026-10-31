@@ -113,6 +113,7 @@ def build_improve_staging_tooldefs(
         return {"plugins": list(view["plugins"]),
                 "pin_broken_strategies": list(view["pin_broken_strategies"]),
                 "watch_symbols": list(view.get("watch_symbols", [])),
+                "reference_symbols": list(view.get("reference_symbols", [])),
                 "history_available": dict(view.get("history_available", {}))}
 
     def lock_staging_deps(name: str) -> dict:

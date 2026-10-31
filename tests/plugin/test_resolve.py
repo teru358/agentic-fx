@@ -174,9 +174,38 @@ def test_literal_unknown_symbol_keeps_the_closed_rejection_vocabulary(tmp_path):
     assert error.value.reason == "symbol_not_watched"
 
 
-def test_resolver_and_read_tools_share_the_readable_symbols_helper():
-    """Replacing either consumer's shared helper import must break this pin."""
-    assert resolve.readable_symbols is market_tools.readable_symbols
+@pytest.mark.parametrize("symbol,accepted", [("EURUSD", True), ("JP225", True),
+                                             ("US500", False)])
+def test_resolver_and_read_tools_accept_the_same_symbols(tmp_path, symbol, accepted):
+    """A pairs-only symbol and a watch symbol pass both; anything else fails both."""
+    from unittest.mock import MagicMock
+
+    root = tmp_path / "plugins"
+    ema = _indicator(root, "ema", max_bars="max_bars: 500\n")
+    strategy = _strategy(tmp_path / "candidate", "s", "indicators:\n"
+                         f"  ref: {{plugin: ema, symbol: {symbol}, timeframe: 1h}}\n")
+    settings = SETTINGS.model_copy(update={"pairs": ["USDJPY", "EURUSD"],
+        "datafeed": SETTINGS.datafeed.model_copy(update={"watch_symbols": ["JP225"]})})
+
+    try:
+        resolve_indicator_deps(strategy, _inv(root, ema), settings=settings,
+                               pin_mode="ignore")
+        resolver_accepts = True
+    except IndicatorResolutionError as error:
+        assert error.reason == "symbol_not_watched"
+        resolver_accepts = False
+
+    provider = MagicMock()
+    provider.get_bars.return_value = []
+    tool = {t.name: t for t in market_tools.build(
+        provider, MagicMock(), settings, sandbox_run=lambda *a, **k: {})}["get_ohlcv"]
+    try:
+        tool.func(symbol, "1h")
+        tool_accepts = True
+    except ValueError:
+        tool_accepts = False
+
+    assert resolver_accepts == tool_accepts == accepted
 
 
 def test_resolver_rejects_reference_window_that_exceeds_indicator_max_bars(tmp_path):
