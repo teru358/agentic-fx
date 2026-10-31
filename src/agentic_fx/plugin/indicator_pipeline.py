@@ -36,6 +36,7 @@ Lane = Literal["loop", "submit", "bless"]
 MAX_WARNINGS = 8
 MAX_SIMILAR = 3
 DUPLICATE_UNAVAILABLE = "duplicate_unavailable"
+DUPLICATE_AT_APPROVE = "duplicate_at_approve"
 SCALE_DEPENDENT = "scale_dependent"
 SPARSE_OUTPUT = "sparse_output"
 OUTPUT_CONSTANT_SUSPECT = "output_constant_suspect"
@@ -343,7 +344,7 @@ def run_fixture_stage(
                 raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
             warnings.append(DUPLICATE_UNAVAILABLE)
     for label, content_hash, pending_name in pending:
-        if pending_name == meta.name:
+        if content_hash == meta.content_hash and pending_name == meta.name:
             continue    # an earlier submission of this very candidate
         try:
             found = cache.read(data_dir, cache.CacheKey(content_hash, data_hash, timeframe))
@@ -378,14 +379,18 @@ def run_fixture_stage(
     if not result.ok:
         return IndicatorReport(
             False, result.code, warnings=_clean_warnings(warnings),
-            detail=_relation_detail(result.similar_to), **common)
+            detail=_relation_detail(result), **common)
     return IndicatorReport(warnings=_clean_warnings(warnings),
-                           detail=_relation_detail(result.similar_to), **common)
+                           detail=_relation_detail(result), **common)
 
 
-def _relation_detail(similar_to: Sequence[dict[str, str]]) -> str:
-    return "\n".join(f"- {row['kind']}: {row['name']}.{row['column']}"
-                     for row in similar_to)
+def _relation_detail(result: gate.CompareResult) -> str:
+    """One line per relation, with the numbers behind it: parent-only report text."""
+    measures = [*result.measures, *[""] * len(result.similar_to)]
+    return "\n".join(
+        f"- {row['kind']}: {row['name']}.{row['column']}"
+        + (f" ({measure})" if measure else "")
+        for row, measure in zip(result.similar_to, measures))
 
 
 # --- approval-time re-judgement ---------------------------------------------
@@ -431,8 +436,7 @@ def rejudge_at_approval(
                 lambda other=other: _probe_entry(other, settings, bars, wall_clock),
                 counter).outputs
         except _BuildFailed:
-            if mode == "enforce":
-                raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
+            raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
     result = gate.compare_outputs(
         entry.outputs, others, mode=mode,
         similar_corr=settings.improve.indicator_similar_corr,
@@ -440,13 +444,13 @@ def rejudge_at_approval(
     # only the two findings that approval re-judges
     keep = [row for row in result.similar_to if row["kind"] in ("duplicate", "monotone")]
     warnings: list[str] = []
-    if any(row["kind"] == "duplicate" for row in keep):
-        warnings.append("indicator_output_overlap")
+    if keep:
+        warnings.append(DUPLICATE_AT_APPROVE)
     if any(row["kind"] == "monotone" for row in keep):
         warnings.append(gate.MONOTONE_DUPLICATE)
     rejected = ""
     if mode == "enforce" and (not result.ok or keep):
-        rejected = "duplicate_at_approve"
+        rejected = DUPLICATE_AT_APPROVE
     return Rejudgement(warnings=_clean_warnings(warnings),
                        similar_to=tuple(keep[:MAX_SIMILAR]),
                        rejected_code=rejected, changed=bool(keep))

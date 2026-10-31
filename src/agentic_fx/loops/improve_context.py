@@ -378,7 +378,8 @@ def project_relations(raw: object, deployed_indicators: "frozenset[str] | set[st
     if not isinstance(rows, list):
         return found
     for row in rows:
-        if (isinstance(row, dict) and row.get("kind") in _RELATION_LABELS
+        if (isinstance(row, dict) and isinstance(row.get("kind"), str)
+                and row["kind"] in _RELATION_LABELS
                 and isinstance(row.get("name"), str)
                 and re.fullmatch(_PLUGIN_NAME_PATTERN, row["name"])
                 and row["name"] in deployed_indicators):

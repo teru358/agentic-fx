@@ -160,6 +160,9 @@ _PLUGIN_GATE_NOTICES = {
     "self_test_too_thin": NOTICE_SELF_TEST_TOO_THIN,
     "self_test_mutated": NOTICE_SELF_TEST_MUTATED,
     "sandbox_unavailable": NOTICE_GATE_SANDBOX_UNAVAILABLE,
+    "max_bars_limit": NOTICE_MAX_BARS_LIMIT,
+    "kind_unsupported": NOTICE_KIND_UNSUPPORTED,
+    "outputs_required": NOTICE_OUTPUTS_REQUIRED,
     "symbol_in_name": NOTICE_SYMBOL_IN_NAME,
     "param_price_unit": NOTICE_PARAM_PRICE_UNIT,
     "fixture_run_failed": NOTICE_FIXTURE_RUN_FAILED,
@@ -174,10 +177,11 @@ PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
 INDICATOR_LAST_RESULT_CODES = (
     INDICATOR_GATE_REJECT_CODES | INDICATOR_GATE_MODE_CODES)
 # bless (人間回廊) は政策検査を reject でなく warning にするので、承認 payload の
-# gate_warnings が取る語はこの全体になる。
+# gate_warnings が取る語はこの全体になる (`duplicate_at_approve` は approve 時の
+# 再判定が mode warn で足す語。enforce では approve の失敗語)。
 INDICATOR_PAYLOAD_WARNING_CODES = (
     INDICATOR_GATE_WARNING_CODES | INDICATOR_GATE_MODE_CODES
-    | frozenset({"symbol_in_name", "param_price_unit"}))
+    | frozenset({"symbol_in_name", "param_price_unit", "duplicate_at_approve"}))
 
 _QUALITY_NOTICES = {
     "duplicate_logic": NOTICE_DUPLICATE_LOGIC,

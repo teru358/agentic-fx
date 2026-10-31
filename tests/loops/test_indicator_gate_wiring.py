@@ -68,8 +68,12 @@ def gate_env(tmp_path, loop_min, monkeypatch):
         events = order
 
         def run(self, name, *, probe, deployed=(), pending=(), mode=None,
-                params=None, plugin_py=_PLUGIN, conn=None):
-            d = _candidate(tmp_path, name, params=params, plugin_py=plugin_py)
+                params=None, plugin_py=_PLUGIN, conn=None, on_candidate=None,
+                outputs=("value",)):
+            d = _candidate(tmp_path, name, params=params, plugin_py=plugin_py,
+                           outputs=outputs)
+            if on_candidate is not None:
+                on_candidate(d)
             fake = probe.install(monkeypatch)
             fake.events = order
             return loop_min._run_plugin_gate(
@@ -127,7 +131,7 @@ def test_exact_duplicate_of_a_deployed_indicator_rejects(tmp_path, gate_env):
         "cand", probe=_probe(rsi=fakes.ratio),
         deployed=[_deployed(tmp_path, "rsi", "a")])
     assert (verdict.passed, verdict.code) == (False, "indicator_duplicate")
-    assert verdict.report_detail == "- duplicate: rsi.value"
+    assert verdict.report_detail == "- duplicate: rsi.value (exact column=value)"
 
 
 def test_monotone_duplicate_is_a_warning_in_warn_mode(tmp_path, gate_env):
@@ -200,21 +204,40 @@ def test_pending_candidate_is_a_comparison_partner(tmp_path, gate_env, conn):
     assert "queued" not in verdict.report_detail
 
 
-def test_an_earlier_pending_submission_of_the_same_name_is_not_a_partner(
-        tmp_path, gate_env, conn):
+def _plant_pending(conn, tmp_path, *, name, content_hash, fn=fakes.ratio):
     from agentic_fx.plugin import indicator_fixture_cache as cache
     from agentic_fx.plugin.indicator_pipeline import canonical_bars
     from agentic_fx.store import approvals as approvals_store
     from datetime import datetime, timezone
     bars, data_hash = canonical_bars("1h")
-    approvals_store.create(conn, "plugin", {
-        "name": "cand", "kind": "indicator", "content_hash": "q" * 64},
+    approval_id = approvals_store.create(conn, "plugin", {
+        "name": name, "kind": "indicator", "content_hash": content_hash},
         datetime(2026, 8, 22, tzinfo=timezone.utc))
-    cache.write(tmp_path / "data", cache.CacheKey("q" * 64, data_hash, "1h"),
+    cache.write(tmp_path / "data", cache.CacheKey(content_hash, data_hash, "1h"),
                 indicator_pipeline.probe_mod.fixture_cache_entry(
-                    _fake_result(fakes.ratio, bars)))
-    verdict = gate_env.run("cand", probe=_probe(), conn=conn)
+                    _fake_result(fn, bars)))
+    return approval_id
+
+
+def test_an_earlier_submission_of_this_very_candidate_is_not_a_partner(
+        tmp_path, gate_env, conn):
+    def plant_self(candidate_dir):
+        _plant_pending(conn, tmp_path, name="cand",
+                       content_hash=improve_loop.hashes_of(candidate_dir)[0])
+
+    verdict = gate_env.run("cand", probe=_probe(), conn=conn,
+                           on_candidate=plant_self)
     assert verdict.passed and verdict.similar_to == ()
+
+
+def test_a_pending_of_the_same_name_and_other_content_is_a_partner(
+        tmp_path, gate_env, conn):
+    approval_id = _plant_pending(conn, tmp_path, name="cand",
+                                 content_hash="q" * 64)
+    verdict = gate_env.run("cand", probe=_probe(), conn=conn)
+    assert (verdict.passed, verdict.code) == (False, "indicator_duplicate")
+    assert f"pending-{approval_id}" in verdict.report_detail
+    assert verdict.indicator_report.similar_to[0]["name"] == f"pending-{approval_id}"
 
 
 def _fake_result(fn, bars):
@@ -324,7 +347,8 @@ def test_contract_violation_skips_the_fixture_run(tmp_path, loop_min,
     source.mkdir()
     verdict = loop_min._run_plugin_gate(
         d, name="cand", source_snapshot_dir=source)
-    assert verdict.passed and fake.events == []
+    assert (verdict.passed, verdict.code) == (False, "outputs_required")
+    assert fake.events == []
 
 
 # --- commit 全体: 終端 ---------------------------------------------------------

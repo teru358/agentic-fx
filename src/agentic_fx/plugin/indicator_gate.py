@@ -79,6 +79,8 @@ class Verdict:
 @dataclass(frozen=True)
 class CompareResult(Verdict):
     similar_to: tuple[dict[str, str], ...] = ()
+    # `similar_to` と同じ並びの、親専有レポート用の数値文 (agent 面には出さない)。
+    measures: tuple[str, ...] = ()
 
 
 def _tokens(value: str) -> list[str]:
@@ -382,31 +384,36 @@ def compare_outputs(candidate: dict[str, Any], deployed: dict[str, dict[str, Any
     series_cols = [col for col, value in candidate.items()
                    if isinstance(value, pd.Series) and classifications.get(col, ("invariant", "invariant"))[0] != "neither"]
     prepared = {col: _prepare(candidate[col]) for col in series_cols}
-    relations: list[tuple[str, str, str, float]] = []
+    relations: list[tuple[str, str, str, float, str]] = []
     for name, outputs in deployed.items():
         exact_edges = {col: [old for old, value in outputs.items() if _exact(series, value)]
                        for col, series in candidate.items()}
         exact_match = _best_one_to_one(exact_edges, list(candidate))
         if exact_match and len(outputs) == len(candidate):
-            for col, old in exact_match.items(): relations.append((name, old, "duplicate", 1.0))
+            for col, old in exact_match.items(): relations.append((name, old, "duplicate", 1.0, f"exact column={col}"))
             continue
         exact_pairs = {(col, old) for col, olds in exact_edges.items() for old in olds}
-        for col, old in sorted(exact_pairs): relations.append((name, old, "overlap", 1.0))
+        for col, old in sorted(exact_pairs): relations.append((name, old, "overlap", 1.0, f"exact column={col}"))
         mono_edges: dict[str, list[str]] = {}
         similar_edges: dict[str, list[tuple[str, float]]] = {}
+        measured: dict[tuple[str, str], tuple[float, float, float]] = {}
         for col in series_cols:
             for old, value in outputs.items():
                 if (col, old) in exact_pairs or not isinstance(value, pd.Series): continue
                 stats = _pair_stats(prepared[col], value)
                 if stats is None: continue
                 level, diff, corr = stats
+                measured[(col, old)] = stats
                 if abs(level) >= MONOTONE_LEVEL_CORR and abs(diff) >= MONOTONE_DIFF_CORR:
                     mono_edges.setdefault(col, []).append(old)
                 if abs(corr) >= similar_corr:
                     similar_edges.setdefault(col, []).append((old, abs(corr)))
         mono_match = _best_one_to_one(mono_edges, series_cols) if series_cols else None
         if mono_match:
-            for col, old in mono_match.items(): relations.append((name, old, "monotone", 1.0))
+            for col, old in mono_match.items():
+                level, diff, _ = measured[(col, old)]
+                relations.append((name, old, "monotone", 1.0,
+                                  f"column={col} level_spearman={level:.4f} diff_spearman={diff:.4f}"))
         else:
             similar_match = _best_one_to_one(
                 {col: [old for old, _ in edges] for col, edges in similar_edges.items()},
@@ -414,16 +421,18 @@ def compare_outputs(candidate: dict[str, Any], deployed: dict[str, dict[str, Any
             if similar_match:
                 for col, old in similar_match.items():
                     score = next(score for match, score in similar_edges[col] if match == old)
-                    relations.append((name, old, "similar", score))
+                    relations.append((name, old, "similar", score,
+                                      f"column={col} diff_pearson={score:.4f}"))
     strength = {"duplicate": 4, "monotone": 3, "overlap": 2, "similar": 1}
     relations.sort(key=lambda x: (-strength[x[2]], -x[3], x[0], x[1]))
-    similar_to = tuple({"name": name, "column": col, "kind": kind} for name, col, kind, _ in relations[:3])
-    kinds = {kind for _, _, kind, _ in relations}
+    similar_to = tuple({"name": name, "column": col, "kind": kind} for name, col, kind, _, _ in relations[:3])
+    measures = tuple(text for *_, text in relations[:3])
+    kinds = {kind for _, _, kind, _, _ in relations}
     if "duplicate" in kinds:
-        return CompareResult(False, "indicator_duplicate", similar_to=similar_to)
+        return CompareResult(False, "indicator_duplicate", similar_to=similar_to, measures=measures)
     warnings = tuple(code for code, kind in ((MONOTONE_DUPLICATE, "monotone"), (OUTPUT_OVERLAP, "overlap"),
                                              (INDICATOR_SIMILAR, "similar"))
                      if kind in kinds and not (kind == "monotone" and mode == "enforce"))
     if "monotone" in kinds and mode == "enforce":
-        return CompareResult(False, MONOTONE_DUPLICATE, warnings, similar_to=similar_to)
-    return CompareResult(warnings=warnings, similar_to=similar_to)
+        return CompareResult(False, MONOTONE_DUPLICATE, warnings, similar_to=similar_to, measures=measures)
+    return CompareResult(warnings=warnings, similar_to=similar_to, measures=measures)

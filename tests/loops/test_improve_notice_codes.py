@@ -129,6 +129,9 @@ PLUGIN_GATE = {
     "self_test_too_thin": "NOTICE_SELF_TEST_TOO_THIN",
     "self_test_mutated": "NOTICE_SELF_TEST_MUTATED",
     "sandbox_unavailable": "NOTICE_GATE_SANDBOX_UNAVAILABLE",
+    "max_bars_limit": "NOTICE_MAX_BARS_LIMIT",
+    "kind_unsupported": "NOTICE_KIND_UNSUPPORTED",
+    "outputs_required": "NOTICE_OUTPUTS_REQUIRED",
 }
 INDICATOR_GATE = {
     "symbol_in_name": "NOTICE_SYMBOL_IN_NAME",

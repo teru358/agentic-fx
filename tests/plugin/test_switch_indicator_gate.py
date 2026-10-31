@@ -281,7 +281,8 @@ def test_approve_warn_updates_the_warning_instead_of_refusing(env):
     payload = _payload(env.conn, approval_id)
     updated = switch._rejudge_indicator_at_approval(
         env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
-    assert "indicator_output_overlap" in updated["gate_warnings"]
+    assert "duplicate_at_approve" in updated["gate_warnings"]
+    assert "indicator_output_overlap" not in updated["gate_warnings"]
     assert updated["similar_to"][0] == {
         "name": "twin", "column": "value", "kind": "duplicate"}
     assert _payload(env.conn, approval_id) == updated
@@ -316,3 +317,344 @@ def test_approve_rejudge_ignores_the_candidates_own_deployed_version(env):
         env.conn, approval_id, payload,
         settings=_with_mode(env.settings, "enforce"),
         plugins_root=env.plugins) == payload
+
+
+# --- 人間回廊の段の順序 (改善ループの gate と同じ) --------------------------------------
+
+def _trace_stages(monkeypatch):
+    events: list[str] = []
+
+    def wrap(owner, attr, tag):
+        real = getattr(owner, attr)
+
+        def traced(*a, **k):
+            events.append(tag)
+            return real(*a, **k)
+
+        monkeypatch.setattr(owner, attr, traced)
+
+    wrap(switch, "check_candidate_snapshot", "snapshot")
+    wrap(switch, "check_source", "source")
+    wrap(switch.loader, "_discover_one", "loader")
+    wrap(switch.approval, "outputs_required_violation", "outputs")
+    wrap(switch.approval, "assert_max_bars_within_limit", "max_bars")
+    wrap(switch.indicator_pipeline, "check_static", "static")
+    wrap(switch, "run_gate_pytest", "pytest")
+    return events
+
+
+@pytest.mark.parametrize("floor_mode", ["enforce", "warn"])
+def test_the_human_corridor_runs_cheap_checks_first(env, monkeypatch, floor_mode):
+    env.install({"cand": fakes.ratio})
+    events = _trace_stages(monkeypatch)
+    env.gate("cand", floor_mode=floor_mode)
+    assert events == ["snapshot", "source", "source", "loader", "outputs",
+                      "max_bars", "static", "pytest"]
+
+
+def _write_raw(dirpath: Path, *, plugin_py=_PLUGIN, config=None) -> None:
+    dirpath.mkdir(parents=True)
+    (dirpath / "plugin.py").write_text(plugin_py)
+    (dirpath / "config.yaml").write_text(yaml.safe_dump(
+        config or {"kind": "indicator", "outputs": ["value"], "max_bars": 200,
+                   "params": {}}, sort_keys=False))
+    (dirpath / "test_plugin.py").write_text("def test_x():\n    pass\n")
+
+
+def _gate_raw(env, name, **kw):
+    d = env.plugins / "_human" / name
+    _write_raw(d, **kw)
+    return switch._run_full_gate(
+        env.conn, d, name=name, settings=env.settings, now=NOW,
+        floor_mode="warn", plugins_root=env.plugins)
+
+
+def test_a_rejected_source_stops_before_the_name_check_and_any_run(env, monkeypatch):
+    env.install({"usdjpy_x": fakes.ratio})
+    events = _trace_stages(monkeypatch)
+    with pytest.raises(ValueError) as raised:
+        _gate_raw(env, "usdjpy_x", plugin_py="import os\n" + _PLUGIN)
+    assert "symbol_in_name" not in str(raised.value)
+    assert "static" not in events and "pytest" not in events and "loader" not in events
+
+
+def test_a_candidate_the_loader_rejects_is_not_statically_checked(env, monkeypatch):
+    env.install({"usdjpy_x": fakes.ratio})
+    events = _trace_stages(monkeypatch)
+    with pytest.raises(ValueError, match="failed discovery"):
+        _gate_raw(env, "usdjpy_x", config={"kind": "bogus_kind"})
+    assert events[-1] == "loader"
+
+
+def test_a_missing_outputs_declaration_stops_before_the_name_check(env, monkeypatch):
+    env.install({"usdjpy_x": fakes.ratio})
+    events = _trace_stages(monkeypatch)
+    with pytest.raises(ValueError, match="^outputs_required$"):
+        _gate_raw(env, "usdjpy_x", config={"kind": "indicator", "max_bars": 200})
+    assert "static" not in events and "pytest" not in events
+
+
+def test_an_oversized_max_bars_stops_before_the_name_check_and_pytest(env, monkeypatch):
+    env.install({"usdjpy_x": fakes.ratio})
+    events = _trace_stages(monkeypatch)
+    limit = env.settings.plugin.max_bars_limit
+    with pytest.raises(ValueError, match="max_bars_limit"):
+        _gate_raw(env, "usdjpy_x", config={
+            "kind": "indicator", "outputs": ["value"], "max_bars": limit + 1})
+    assert "static" not in events and "pytest" not in events
+
+
+# --- pending を比較相手にする (自分自身の再提出を除く) --------------------------------------
+
+def _submit_in(env, name, mission, *, params=None):
+    _write(env.plugins / "_staging" / str(mission) / name, params=params)
+    return switch.submit_candidate(
+        env.conn, name=name, staging_dir=env.plugins / "_staging" / str(mission),
+        candidate_origin="staging", mission_id=mission, backlog_id=None,
+        settings=env.settings, now=NOW)
+
+
+def test_a_pending_of_the_same_name_and_other_content_is_a_comparison_partner(env):
+    env.install({"cand": fakes.ratio})
+    first = _submit_in(env, "cand", 1)
+    with pytest.raises(ValueError, match="indicator_duplicate"):
+        _submit_in(env, "cand", 2, params={"window": 5})
+    assert [r["id"] for r in approvals_store.pending(env.conn, kind="plugin")] == [first]
+
+
+def test_resubmitting_the_identical_candidate_is_not_compared_with_itself(env):
+    env.install({"cand": fakes.ratio})
+    first = _submit_in(env, "cand", 1)
+    second = _submit_in(env, "cand", 2)
+    assert second != first
+    assert _payload(env.conn, second)["similar_to"] == []
+
+
+def test_a_similar_pending_is_named_by_approval_id_in_the_payload(env):
+    env.install({"cand": fakes.affine_of_ratio, "other": fakes.ratio})
+    first = _submit_in(env, "other", 1)
+    second = _submit_in(env, "cand", 2, params={"window": 5})
+    assert _payload(env.conn, second)["similar_to"] == [
+        {"name": f"pending-{first}", "column": "value", "kind": "monotone"}]
+
+
+def test_the_fixture_stage_gets_lane_mode_deployed_indicators_and_pending(env, monkeypatch):
+    env.deploy("rsi", "a")
+    env.metas = env.deployed
+    env.deployed.append(fakes.meta_for(
+        "strat", env.plugins / "strat", content_hash="9" * 64, kind="strategy"))
+    env.install({"cand": fakes.ratio, "cand2": fakes.ratio, "rsi": fakes.noise})
+    seen = []
+    real = indicator_pipeline.run_fixture_stage
+
+    def spy(meta, **kw):
+        seen.append(kw)
+        return real(meta, **kw)
+
+    monkeypatch.setattr(indicator_pipeline, "run_fixture_stage", spy)
+    env.gate("cand", floor_mode="enforce", settings=_with_mode(env.settings, "enforce"))
+    env.gate("cand2", floor_mode="warn")
+    submit, bless = seen
+    assert (submit["lane"], submit["mode"]) == ("submit", "enforce")
+    assert (bless["lane"], bless["mode"]) == ("bless", "warn")
+    assert [m.name for m in submit["deployed_metas"]] == ["rsi"]
+    assert submit["pending"] == []
+    assert submit["static_warnings"] == ()
+
+
+def test_a_bless_static_warning_reaches_the_outcome_and_the_stage(env, monkeypatch):
+    env.install({"usdjpy_x": fakes.ratio})
+    seen = []
+    real = indicator_pipeline.run_fixture_stage
+
+    def spy(meta, **kw):
+        seen.append(kw["static_warnings"])
+        return real(meta, **kw)
+
+    monkeypatch.setattr(indicator_pipeline, "run_fixture_stage", spy)
+    *_, outcome = env.gate("usdjpy_x", floor_mode="warn")
+    assert seen == [("symbol_in_name",)]
+    assert outcome.gate_warnings == ("symbol_in_name",)
+
+
+def test_the_outcome_carries_the_similar_rows_and_report(env):
+    env.deploy("rsi", "a")
+    env.install({"cand": fakes.ratio, "rsi": fakes.affine_of_ratio})
+    *_, outcome = env.gate("cand", floor_mode="warn")
+    assert outcome.similar_to == ({"name": "rsi", "column": "value", "kind": "monotone"},)
+    assert outcome.indicator_report.similar_to == outcome.similar_to
+    assert outcome.gate_warnings == ("indicator_monotone_duplicate",)
+
+
+def test_a_deployed_strategy_is_not_a_comparison_partner(env):
+    env.deployed.append(fakes.meta_for(
+        "strat", env.plugins / "strat", content_hash="9" * 64, kind="strategy"))
+    env.install({"cand": fakes.ratio})
+    *_, outcome = env.gate("cand", floor_mode="enforce")
+    assert outcome.similar_to == ()
+
+
+# --- approve の再判定の配線 -------------------------------------------------------------
+
+class _Reached(Exception):
+    pass
+
+
+def _reach_after_the_rejudge(env, monkeypatch, *, journal=None):
+    """approve を、再判定の判断の直後 (候補ディレクトリの二度目の解決) で止める。"""
+    calls = {"rejudge": [], "resolve": 0}
+
+    def fake_rejudge(conn, approval_id, payload, **kw):
+        calls["rejudge"].append(approval_id)
+        return payload
+
+    real_resolve = switch.resolve_candidate_dir
+
+    def counting_resolve(*a, **k):
+        calls["resolve"] += 1
+        if calls["resolve"] >= 2:
+            raise _Reached
+        return real_resolve(*a, **k)
+
+    monkeypatch.setattr(switch, "_rejudge_indicator_at_approval", fake_rejudge)
+    monkeypatch.setattr(switch, "resolve_candidate_dir", counting_resolve)
+    if journal is not None:
+        monkeypatch.setattr(switch.journal_store, "get_open_by_name",
+                            lambda conn, name: journal)
+    return calls
+
+
+def _approve(env, approval_id):
+    return switch.approve_candidate(
+        env.conn, approval_id, decided_by="alice", now=NOW,
+        plugins_root=env.plugins, settings=env.settings)
+
+
+def test_approve_rejudges_an_indicator_before_anything_is_deployed(env, monkeypatch):
+    env.install({"cand": fakes.ratio})
+    approval_id = env.submit("cand")
+    calls = _reach_after_the_rejudge(env, monkeypatch)
+    with pytest.raises(_Reached):
+        _approve(env, approval_id)
+    assert calls["rejudge"] == [approval_id]
+
+
+def test_approve_does_not_rejudge_when_it_resumes_its_own_journal(env, monkeypatch):
+    env.install({"cand": fakes.ratio})
+    approval_id = env.submit("cand")
+    journal = {"approval_id": approval_id, "op_id": 7, "phase": "recorded",
+               "switch_required": 1, "old_kind": "absent", "old_target": None,
+               "new_target": "x"}
+    calls = _reach_after_the_rejudge(env, monkeypatch, journal=journal)
+    with pytest.raises(_Reached):
+        _approve(env, approval_id)
+    assert calls["rejudge"] == []
+
+
+def test_approve_does_not_rejudge_a_payload_that_is_not_an_indicator(env, monkeypatch):
+    env.install({"cand": fakes.ratio})
+    approval_id = env.submit("cand")
+    payload = _payload(env.conn, approval_id)
+    payload["kind"] = "strategy"
+    env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                     (json.dumps(payload), approval_id))
+    env.conn.commit()
+    calls = _reach_after_the_rejudge(env, monkeypatch)
+    with pytest.raises(_Reached):
+        _approve(env, approval_id)
+    assert calls["rejudge"] == []
+
+
+def _row_status(env, approval_id):
+    return env.conn.execute("SELECT status FROM approval_requests WHERE id=?",
+                            (approval_id,)).fetchone()["status"]
+
+
+@pytest.mark.parametrize("mode", ["warn", "enforce"])
+def test_approve_stays_pending_when_a_deployed_cache_cannot_be_built(env, mode):
+    env.install({"cand": fakes.ratio, "twin": fakes.ratio})
+    settings = _with_mode(env.settings, mode)
+    approval_id = env.submit("cand", settings=settings)
+    env.deploy("twin", "b")
+    env.install({"cand": fakes.ratio, "twin": fakes.ratio},
+                fail_names=frozenset({"twin"}))
+    with pytest.raises(ValueError, match="^indicator_gate_unavailable$") as raised:
+        switch.approve_candidate(
+            env.conn, approval_id, decided_by="alice", now=NOW,
+            plugins_root=env.plugins, settings=settings)
+    assert isinstance(raised.value.__cause__, indicator_pipeline.IndicatorGateUnavailable)
+    assert _row_status(env, approval_id) == "pending"
+    assert not (env.plugins / ".versions").exists()
+
+
+def test_approve_stays_pending_on_a_cache_lock_timeout_in_warn_mode(env, monkeypatch):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "warn")
+    real = cache.get_or_build
+
+    def wrapper(data_dir, key, builder, **kw):
+        if key.content_hash == "b" * 64:
+            raise cache.IndicatorCacheLockTimeout("held")
+        return real(data_dir, key, builder, **kw)
+
+    monkeypatch.setattr(indicator_pipeline.cache, "get_or_build", wrapper)
+    with pytest.raises(ValueError, match="indicator_gate_unavailable"):
+        switch.approve_candidate(
+            env.conn, approval_id, decided_by="alice", now=NOW,
+            plugins_root=env.plugins, settings=settings)
+    assert _row_status(env, approval_id) == "pending"
+
+
+def test_approve_warn_merges_the_new_findings_into_the_existing_payload(env):
+    env.install({"cand": fakes.absolute_threshold, "twin": fakes.absolute_threshold})
+    settings = _with_mode(env.settings, "warn")
+    approval_id = env.submit("cand", settings=settings)
+    payload = _payload(env.conn, approval_id)
+    assert payload["gate_warnings"] == ["scale_dependent"]
+    payload["similar_to"] = [{"name": "older", "column": "v", "kind": "similar"}]
+    env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                     (json.dumps(payload), approval_id))
+    env.conn.commit()
+    env.deploy("twin", "b")
+    env.install({"cand": fakes.absolute_threshold, "twin": fakes.absolute_threshold})
+    updated = switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
+    assert updated["gate_warnings"] == ["scale_dependent", "duplicate_at_approve"]
+    assert updated["similar_to"] == [
+        {"name": "twin", "column": "value", "kind": "duplicate"},
+        {"name": "older", "column": "v", "kind": "similar"}]
+    assert _payload(env.conn, approval_id) == updated
+
+
+def test_approve_warn_does_not_write_when_nothing_changed(env):
+    env.install({"cand": fakes.ratio})
+    approval_id = env.submit("cand")
+    payload = _payload(env.conn, approval_id)
+    before = env.conn.total_changes
+    out = switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=_with_mode(env.settings, "warn"),
+        plugins_root=env.plugins)
+    assert out is payload and env.conn.total_changes == before
+
+
+def test_the_rewritten_payload_only_lands_on_a_pending_row(env):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "warn")
+    payload = _payload(env.conn, approval_id)
+    env.conn.execute("UPDATE approval_requests SET status='rejected' WHERE id=?",
+                     (approval_id,))
+    env.conn.commit()
+    switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
+    assert _payload(env.conn, approval_id) == payload
+
+
+def test_approve_enforce_refuses_a_monotone_twin_too(env):
+    env.install({"cand": fakes.ratio, "twin": fakes.affine_of_ratio})
+    settings = _with_mode(env.settings, "enforce")
+    approval_id = env.submit("cand", settings=settings)
+    env.deploy("twin", "b")
+    env.install({"cand": fakes.ratio, "twin": fakes.affine_of_ratio})
+    with pytest.raises(ValueError, match="^duplicate_at_approve$"):
+        switch.approve_candidate(
+            env.conn, approval_id, decided_by="alice", now=NOW,
+            plugins_root=env.plugins, settings=settings)
+    assert _row_status(env, approval_id) == "pending"

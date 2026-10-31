@@ -50,11 +50,11 @@ from agentic_fx.loops import improve_quality
 from agentic_fx.improve_notice_codes import (
     INDICATOR_LAST_RESULT_CODES, NOTICE_APPROVAL_TX_FAILED, NOTICE_BACKTEST_DATA_UNAVAILABLE,
     NOTICE_COMMIT_CRASHED, NOTICE_DEMOTED_RECOVERED, NOTICE_DUPLICATE_SKIPPED,
-    NOTICE_INDICATOR_UNRESOLVED, NOTICE_KIND_UNSUPPORTED,
-    NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED, NOTICE_MAX_BARS_LIMIT,
+    NOTICE_INDICATOR_UNRESOLVED,
+    NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED,
     NOTICE_MAX_TURNS, NOTICE_NOT_IMPROVED, NOTICE_OBSERVATION,
     NOTICE_OBSERVATION_NOT_SUBMITTED, NOTICE_SAME_NAME_CONTRACT_CHANGED,
-    NOTICE_OUTPUT_INVALID, NOTICE_OUTPUTS_REQUIRED, NOTICE_PREPARE_FAILED,
+    NOTICE_OUTPUT_INVALID, NOTICE_PREPARE_FAILED,
     NOTICE_REPORT_PUBLISHED, NOTICE_REPORT_WRITE_FAILED,
     NOTICE_RISK_GATE_UNSUPPORTED, NOTICE_RUNNER_FAILED,
     NOTICE_SANDBOX_UNAVAILABLE, NOTICE_SUBMITTED, NOTICE_TIMEOUT,
@@ -2050,6 +2050,8 @@ class ImproveLoop:
                 passed=False, reason=reason, content_hash=content_hash_final,
                 artifact_hash=artifact_hash_final, failure_kind="gate_failed",
                 code=code, report_detail=report_detail,
+                similar_to=(indicator_report.similar_to
+                            if indicator_report is not None else ()),
                 indicator_report=indicator_report)
 
         try:
@@ -2063,6 +2065,18 @@ class ImproveLoop:
         if meta is None:
             return _failed_before_pytest(
                 f"loader_rejected: {reason}", code="loader_rejected")
+
+        violation = self._contract_violation(meta)
+        if violation is not None:
+            violation_code, violation_reason = violation
+            if violation_code == "max_bars_limit":
+                return _failed_before_pytest(
+                    violation_reason, code="max_bars_limit")
+            if violation_code == "kind_unsupported":
+                return _failed_before_pytest(
+                    violation_reason, code="kind_unsupported")
+            return _failed_before_pytest(
+                violation_reason, code="outputs_required")
 
         deployed_indicators: list = []
         static = None
@@ -2147,8 +2161,7 @@ class ImproveLoop:
                 artifact_hash=artifact_hash_after, failure_kind="gate_failed",
                 code="self_test_mutated")
 
-        if (meta.kind == "indicator" and static is not None
-                and self._indicator_contract_ok(meta)):
+        if meta.kind == "indicator" and static is not None:
             pending = (indicator_pipeline.pending_indicator_refs(conn)
                        if conn is not None else [])
             report = indicator_pipeline.run_fixture_stage(
@@ -2187,17 +2200,29 @@ class ImproveLoop:
             passed=True, content_hash=content_hash_before,
             artifact_hash=artifact_hash_before)
 
-    def _indicator_contract_ok(self, meta) -> bool:
-        """outputs 宣言と max_bars 上限の契約検査。違反は commit 本体が従来の固定語で
-        不合格にするので、ここでは fixture を回さない (宣言の無い候補を回さない)。"""
+    def _contract_violation(self, meta) -> tuple[str, str] | None:
+        """max_bars 上限・kind・outputs 宣言の契約検査。違反は (固定語, last_result
+        用の理由) で、plugin gate の前段と commit の再判定が同じこの関数を通る。理由は
+        固定文言 (max_bars の超過量と kind 名だけを含み、`last_result` にそのまま流れる)。"""
         from agentic_fx.plugin import approval
-        if approval.outputs_required_violation(meta):
-            return False
         try:
             approval.assert_max_bars_within_limit(meta, settings=self._settings)
-        except ValueError:
-            return False
-        return True
+        except ValueError as exc:
+            return "max_bars_limit", f"max_bars_limit:{exc}"
+        if meta.kind not in {"indicator", "strategy"}:
+            return "kind_unsupported", f"kind_unsupported:{meta.kind}"
+        if approval.outputs_required_violation(meta):
+            return "outputs_required", "outputs_required"
+        return None
+
+    @staticmethod
+    def _gate_failed_reason(verdict, indicator_code: str | None) -> str:
+        """gate 不合格の終端理由 (`last_result` の元)。"""
+        if indicator_code:
+            return indicator_code
+        if verdict.code == "outputs_required":
+            return verdict.reason
+        return f"gate_failed:{verdict.reason}"
 
     @staticmethod
     def _final_hashes(plugin_dir: Path) -> tuple[str | None, str | None]:
@@ -2794,7 +2819,8 @@ class ImproveLoop:
         """fixture cache の生成本数と GC の掃除しきれなかった本数 (技術ログ)。"""
         report = getattr(verdict, "indicator_report", None)
         if (report is None or self._activity is None
-                or not (report.built or report.gc_skipped)):
+                or not (report.built or report.gc_removed
+                       or report.gc_skipped)):
             return
         self._activity.write(
             Category.IMPROVE, "indicator_cache",
@@ -3665,8 +3691,8 @@ class ImproveLoop:
                         else None)
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=(indicator_code
-                                or f"gate_failed:{gate_verdict.reason}"),
+                        reason=self._gate_failed_reason(
+                            gate_verdict, indicator_code),
                         now=now,
                         tool_calls=tool_calls, candidate=final_candidate,
                         candidate_outcome=(
@@ -3707,44 +3733,21 @@ class ImproveLoop:
                         candidate_outcome="gate_failed",
                         notice=NOTICE_UNVERIFIED)
                     return
-                try:
-                    approval.assert_max_bars_within_limit(
-                        candidate_meta, settings=self._settings)
-                except ValueError as exc:
+                violation = self._contract_violation(candidate_meta)
+                if violation is not None:
+                    violation_code, violation_reason = violation
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:max_bars_limit:{exc}", now=now,
-                        tool_calls=tool_calls,
+                        reason=(violation_reason
+                                if violation_code == "outputs_required"
+                                else f"gate_failed:{violation_reason}"),
+                        now=now, tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed",
-                        notice=NOTICE_MAX_BARS_LIMIT)
+                        notice=notice_for_plugin_gate(violation_code))
                     return
 
                 kind = candidate_meta.kind
-                if kind not in {"indicator", "strategy"}:
-                    self._finalize_gate_failed(
-                        conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:kind_unsupported:{kind}", now=now,
-                        tool_calls=tool_calls,
-                        candidate=final_candidate,
-                        candidate_outcome="gate_failed",
-                        notice=NOTICE_KIND_UNSUPPORTED)
-                    return
-                # [indicator-consumption-wiring] U4a: kind=indicator の
-                # `outputs` 宣言は新規承認で必須。固定文言のみ
-                # (`last_result` にそのまま流れる — 遮断 8)。
-                # /code-review 2 周目 CR7 (2026-09-18): 条件式は
-                # `approval.outputs_required_violation` に一本化
-                # (`switch._run_full_gate` と共有 — 挙動不変)。
-                if approval.outputs_required_violation(candidate_meta):
-                    self._finalize_gate_failed(
-                        conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="outputs_required", now=now,
-                        tool_calls=tool_calls,
-                        candidate=final_candidate,
-                        candidate_outcome="gate_failed",
-                        notice=NOTICE_OUTPUTS_REQUIRED)
-                    return
                 if kind == "strategy":
                     # [indicator-consumption-wiring] §2.8: 解決は commit
                     # gate でも `require` (提出物は必ず pinned)。**alias と

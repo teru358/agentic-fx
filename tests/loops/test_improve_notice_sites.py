@@ -94,9 +94,7 @@ EXPECTED_GATE_FAILED_CALLS = sorted([
     "notice_for_plugin_gate(gate_verdict.code)",
     "NOTICE_LOADER_REJECTED",
     "NOTICE_UNVERIFIED",
-    "NOTICE_MAX_BARS_LIMIT",
-    "NOTICE_KIND_UNSUPPORTED",
-    "NOTICE_OUTPUTS_REQUIRED",
+    "notice_for_plugin_gate(violation_code)",
     "NOTICE_INDICATOR_UNRESOLVED",
     "NOTICE_BACKTEST_DATA_UNAVAILABLE",
     "notice_for_unevaluable_kind(strategy_verdict.unevaluable_kind)",
@@ -268,9 +266,9 @@ def test_plugin_gate_failures_carry_a_distinct_fixed_code_per_semantic_branch():
             continue
         assert isinstance(value, ast.Constant) and isinstance(value.value, str)
         seen.append(value.value)
-    # 不合格 return は 17 か所 (既存 10 + indicator 検査 7)、意味分岐ごとに別の語
+    # 不合格 return は 20 か所 (既存 10 + 契約 3 + indicator 検査 7)、意味分岐ごとに別の語
     assert sorted(seen) == sorted(codes.PLUGIN_GATE_CODES)
-    assert len(seen) == 17
+    assert len(seen) == 20
 
 
 def test_plugin_gate_wrappers_take_code_without_a_default():

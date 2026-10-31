@@ -1242,6 +1242,16 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     check_candidate_snapshot(candidate_dir)  # 手順 2 (B-5: 名指し再利用)
     before_content, before_artifact = hashes_of(candidate_dir)  # 手順 3
 
+    # 順序は改善ループの plugin gate と同じ: snapshot → ソース検査 → loader →
+    # 契約 (outputs・max_bars) → 名前・param の静的検査 → 以降の実行段。
+    # 未検査の候補は loader にも静的検査にも渡さない。
+    try:
+        check_source(candidate_dir / "plugin.py")  # 手順 4
+        check_source(candidate_dir / "test_plugin.py",
+                    extra_allowed=frozenset({"pytest", "plugin"}))
+    except SandboxError as exc:
+        raise ValueError(f"plugin {name!r}: {exc}") from exc
+
     meta = loader._discover_one(candidate_dir, name)
     if meta is None:
         raise ValueError(
@@ -1257,6 +1267,8 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     # commit gate と共有 — 挙動不変)。
     if approval.outputs_required_violation(meta):
         raise ValueError("outputs_required")
+    # max_bars 上限は実行段 (pytest・run_kind_gate) の前で fail closed する。
+    approval.assert_max_bars_within_limit(meta, settings=settings)
 
     # submit は改善ループと同じ reject、bless は政策検査を warning にする
     # (収益床の floor_mode と同じ 2 値)。
@@ -1273,10 +1285,6 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
 
     rows: list[dict] = []
     try:
-        check_source(candidate_dir / "plugin.py")  # 手順 4
-        check_source(candidate_dir / "test_plugin.py",
-                    extra_allowed=frozenset({"pytest", "plugin"}))
-
         gate_result = run_gate_pytest(candidate_dir, settings=settings)  # 手順 5
         if not gate_result.passed:
             raise GateCheckError(
@@ -1288,14 +1296,6 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
             raise GateCheckError(
                 f"plugin {name!r}: candidate content changed during gate "
                 "(hash mismatch) — refusing", kind="hash")
-
-        # round2 #2 是正 (2026-08-29、verified-round2.md #2): F1 の
-        # max_bars_limit ゲートは `approval.submit_plugin` にしか付かず、
-        # プラン10で新設された本 corridor には無かった
-        # (`grep -rn max_bars switch.py` → 0 件だった)。手順 7 の直前に置く
-        # — 手順 7 (run_kind_gate、strategy は run_in_sample を呼ぶ) の
-        # 前で fail closed する。
-        approval.assert_max_bars_within_limit(meta, settings=settings)
 
         # [indicator-consumption-wiring] §2.3: 承認回廊の inventory は
         # **ここで 1 回だけ**構築する (submit / bless の両方が通る唯一の
