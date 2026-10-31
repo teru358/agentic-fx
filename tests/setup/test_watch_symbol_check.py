@@ -65,7 +65,9 @@ def test_the_listing_asks_for_symbols_with_the_headers_and_a_timeout():
     (lambda url, **k: Resp({"a": 1}), CheckReason.INVALID_RESPONSE),
     (lambda url, **k: (_ for _ in ()).throw(httpx.ConnectError("refused")), CheckReason.CONNECT_ERROR),
     (lambda url, **k: (_ for _ in ()).throw(httpx.ReadTimeout("slow")), CheckReason.CONNECT_ERROR),
-    (lambda url, **k: (_ for _ in ()).throw(status_error(401)), CheckReason.CONNECT_ERROR),
+    (lambda url, **k: (_ for _ in ()).throw(status_error(401)), CheckReason.AUTH_REQUIRED),
+    (lambda url, **k: (_ for _ in ()).throw(status_error(403)), CheckReason.AUTH_REQUIRED),
+    (lambda url, **k: (_ for _ in ()).throw(status_error(503)), CheckReason.CONNECT_ERROR),
 ])
 def test_a_failed_listing_is_unverified_with_a_fixed_reason(fetch, reason):
     result = listing(fetch)

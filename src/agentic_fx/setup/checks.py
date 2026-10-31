@@ -300,6 +300,10 @@ def list_bridge_symbols(base_url: str, *, fetch: Callable[..., Any], timeout: fl
             fetch(f"{base_url.rstrip('/')}/symbols", timeout=timeout, headers=headers or {}), list)
     except _BridgeFailure as failure:
         return _result("bridge_symbols", "unverified", failure.reason, now=now)
+    except httpx.HTTPStatusError as error:
+        reason = (CheckReason.AUTH_REQUIRED if error.response.status_code in (401, 403)
+                  else CheckReason.CONNECT_ERROR)
+        return _result("bridge_symbols", "unverified", reason, now=now)
     except httpx.HTTPError:
         return _result("bridge_symbols", "unverified", CheckReason.CONNECT_ERROR, now=now)
     names = list(dict.fromkeys(item for item in payload if _is_raw_symbol(item)))[:_MAX_LISTED_SYMBOLS]
