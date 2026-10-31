@@ -15,6 +15,8 @@ from types import MappingProxyType
 
 from typing import Any, Callable, Literal, Mapping
 
+from urllib.parse import urlsplit
+
 import httpx
 
 from agentic_fx.core.cli_bin import resolve_cli_bin
@@ -194,7 +196,8 @@ class _BridgeFailure(Exception):
         self.reason = reason
 
 
-def _bridge_json(response: Any) -> dict[str, Any]:
+def _bridge_payload(response: Any, expected: type) -> Any:
+    """Read a bridge response body that must be of type ``expected``; failures carry a fixed reason."""
     if _is_auth_status(response):
         raise _BridgeFailure(CheckReason.AUTH_REQUIRED)
     try:
@@ -207,9 +210,13 @@ def _bridge_json(response: Any) -> dict[str, Any]:
         payload = response.json()
     except ValueError:
         raise _BridgeFailure(CheckReason.INVALID_RESPONSE) from None
-    if not isinstance(payload, dict):
+    if not isinstance(payload, expected):
         raise _BridgeFailure(CheckReason.INVALID_RESPONSE)
     return payload
+
+
+def _bridge_json(response: Any) -> dict[str, Any]:
+    return _bridge_payload(response, dict)
 
 
 def check_bridge(base_url: str, pair: str, *, fetch: Callable[..., Any],
@@ -241,6 +248,45 @@ def check_bridge(base_url: str, pair: str, *, fetch: Callable[..., Any],
     return _result("bridge", "ok", params={"server_time": server_time}, now=now)
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+BRIDGE_KEY_ENV = "MT5_BRIDGE_API_KEY"
+
+
+def may_send_bridge_key(url: str) -> bool:
+    """Whether the API key header may go to this destination (https, or http on this machine)."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        return False
+    return parts.scheme == "https" or (parts.scheme == "http" and host in _LOOPBACK_HOSTS)
+
+
+def env_secret(root: Path, environ: Mapping[str, str], key: str) -> str | None:
+    """A secret from the environment, else from ``root/.env`` (the environment is not modified)."""
+    if environ.get(key):
+        return environ[key]
+    try:
+        from dotenv import dotenv_values
+        value = dotenv_values(root / ".env").get(key)
+    except Exception:  # noqa: BLE001 - an unreadable .env means no key
+        return None
+    return value or None
+
+
+def bridge_key_headers(url: str, root: Path, environ: Mapping[str, str], *,
+                       check_destination: bool = True) -> dict[str, str]:
+    """The bridge API key header, or nothing.
+
+    With ``check_destination`` the key is withheld from a destination that is not https or
+    this machine; without it the configured destination is trusted (the daemon already uses it).
+    """
+    if check_destination and not may_send_bridge_key(url):
+        return {}
+    key = env_secret(root, environ, BRIDGE_KEY_ENV)
+    return {"X-Bridge-Api-Key": key} if key else {}
+
+
 def list_bridge_symbols(base_url: str, *, fetch: Callable[..., Any], timeout: float = 10,
                         headers: dict[str, str] | None = None,
                         now: Callable[[], datetime] | None = None) -> CheckResult:
@@ -250,29 +296,12 @@ def list_bridge_symbols(base_url: str, *, fetch: Callable[..., Any], timeout: fl
     shape failures map to the same fixed reasons as ``check_bridge``.
     """
     try:
-        response = fetch(f"{base_url.rstrip('/')}/symbols", timeout=timeout, headers=headers or {})
-        if _is_auth_status(response):
-            raise _BridgeFailure(CheckReason.AUTH_REQUIRED)
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as error:
-            reason = (CheckReason.AUTH_REQUIRED if error.response.status_code in (401, 403)
-                      else CheckReason.CONNECT_ERROR)
-            raise _BridgeFailure(reason) from None
-        try:
-            payload = response.json()
-        except ValueError:
-            raise _BridgeFailure(CheckReason.INVALID_RESPONSE) from None
+        payload = _bridge_payload(
+            fetch(f"{base_url.rstrip('/')}/symbols", timeout=timeout, headers=headers or {}), list)
     except _BridgeFailure as failure:
         return _result("bridge_symbols", "unverified", failure.reason, now=now)
-    except httpx.HTTPStatusError as error:
-        reason = (CheckReason.AUTH_REQUIRED if error.response.status_code in (401, 403)
-                  else CheckReason.CONNECT_ERROR)
-        return _result("bridge_symbols", "unverified", reason, now=now)
     except httpx.HTTPError:
         return _result("bridge_symbols", "unverified", CheckReason.CONNECT_ERROR, now=now)
-    if not isinstance(payload, list):
-        return _result("bridge_symbols", "unverified", CheckReason.INVALID_RESPONSE, now=now)
     names = list(dict.fromkeys(item for item in payload if _is_raw_symbol(item)))[:_MAX_LISTED_SYMBOLS]
     return _result("bridge_symbols", "ok", params={"symbols": names}, now=now)
 

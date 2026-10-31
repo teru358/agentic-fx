@@ -19,6 +19,7 @@ from typing import Iterable
 from pydantic import ValidationError
 
 from agentic_fx.config import ConfigError, load_settings
+from agentic_fx.setup import checks
 from agentic_fx.setup.checks import CheckReason
 from agentic_fx.store.setup_record import read_setup_record
 
@@ -204,18 +205,6 @@ def _shell_secret_note(settings) -> list[str]:
     return []
 
 
-def _bridge_api_key(root: Path) -> str | None:
-    """環境変数、無ければ root の `.env` から bridge の鍵を読む (環境は書き換えない)。"""
-    value = os.environ.get("MT5_BRIDGE_API_KEY")
-    if value:
-        return value
-    try:
-        from dotenv import dotenv_values
-        return dotenv_values(root / ".env").get("MT5_BRIDGE_API_KEY") or None
-    except Exception:  # noqa: BLE001 - 鍵が読めなければ鍵なしで問い合わせる
-        return None
-
-
 def run_check(root: Path, *, unit_env: bool = False) -> CheckReport:
     """設定と実行環境だけで決まる起動前検査を、書き込みなしで実行する。
 
@@ -237,7 +226,9 @@ def run_check(root: Path, *, unit_env: bool = False) -> CheckReport:
         findings.append(Finding(exc.code, str(exc)))
         plugins = []
     context = service.StartupContext(_NullActivity(), plugins, findings, check_secret_env=unit_env,
-                                     bridge_api_key=_bridge_api_key(root))
+                                     query_bridge=True, bridge_api_key=checks.bridge_key_headers(
+                                         settings.datafeed.mt5.bridge_url or "", root, os.environ,
+                                         check_destination=False).get("X-Bridge-Api-Key"))
     for check in service.STARTUP_CHECKS:
         try:
             settings = check(settings, context)

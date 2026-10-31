@@ -23,12 +23,17 @@ def pair_param(settings: Settings) -> dict:
                           "enum": list(settings.datafeed.intervals)}}
 
 
+def readable_symbols(settings: Settings) -> list[str]:
+    """読み取り専用の market tool が受ける銘柄 (取引 pair、続けて参照銘柄)。schema と実行時検査の共通の元。"""
+    return [*settings.pairs, *settings.datafeed.watch_symbols]
+
+
 def read_symbol_param(settings: Settings) -> dict:
     """読み取り専用の market tool 用。取引 pair に加えて参照銘柄 (watch_symbols) も受ける。
 
     発注・signal の pair enum (`pair_param`) は広げない。"""
     schema = pair_param(settings)
-    schema["pair"] = {"enum": [*settings.pairs, *settings.datafeed.watch_symbols],
+    schema["pair"] = {"enum": readable_symbols(settings),
                       "description": schema["pair"]["description"]}
     return schema
 
@@ -88,7 +93,7 @@ def build(provider: PriceProvider, econ: EconCalendar, settings: Settings, *,
         return df, None
 
     def _readable(symbol: str) -> None:
-        allowed = [*settings.pairs, *settings.datafeed.watch_symbols]
+        allowed = readable_symbols(settings)
         if symbol not in allowed:
             raise ValueError(f"symbol must be one of {allowed}: {symbol!r}")
 

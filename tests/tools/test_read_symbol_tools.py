@@ -89,6 +89,22 @@ def test_with_no_watch_symbols_the_tool_schemas_are_byte_identical_to_the_pair_o
             json.dumps(old, sort_keys=True)
 
 
+def test_the_enum_and_the_runtime_check_share_one_ordered_set():
+    settings = settings_with(["JP225", "US500"])
+    provider = MagicMock()
+    provider.get_bars.return_value = []
+    allowed = market_tools.readable_symbols(settings)
+    assert allowed == [*settings.pairs, "JP225", "US500"]
+    for name in ("get_ohlcv", "get_indicators"):
+        tool = tools_of(settings, provider)[name]
+        assert tool.parameters["properties"]["pair"]["enum"] == allowed
+        for symbol in allowed:
+            tool.func(symbol, "1h")
+        with pytest.raises(ValueError) as refused:
+            tool.func("NOPE", "1h")
+        assert str(allowed) in str(refused.value)
+
+
 # --- 実行時の所属検査 ---------------------------------------------------------------
 
 @pytest.mark.parametrize("name", ["get_ohlcv", "get_indicators"])

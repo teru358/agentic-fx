@@ -65,7 +65,7 @@ def test_the_listing_asks_for_symbols_with_the_headers_and_a_timeout():
     (lambda url, **k: Resp({"a": 1}), CheckReason.INVALID_RESPONSE),
     (lambda url, **k: (_ for _ in ()).throw(httpx.ConnectError("refused")), CheckReason.CONNECT_ERROR),
     (lambda url, **k: (_ for _ in ()).throw(httpx.ReadTimeout("slow")), CheckReason.CONNECT_ERROR),
-    (lambda url, **k: (_ for _ in ()).throw(status_error(401)), CheckReason.AUTH_REQUIRED),
+    (lambda url, **k: (_ for _ in ()).throw(status_error(401)), CheckReason.CONNECT_ERROR),
 ])
 def test_a_failed_listing_is_unverified_with_a_fixed_reason(fetch, reason):
     result = listing(fetch)
@@ -143,14 +143,79 @@ def test_warning_codes_are_registered_so_they_never_fail_the_check():
     assert fatal == [] and warning == ["watch_symbol_unknown"]
 
 
-def test_the_daemon_start_records_a_startup_warning_and_continues(tmp_path):
+def test_afx_check_context_records_a_startup_warning_and_continues(tmp_path):
     from agentic_fx.config import load_settings
     root = watch_root(tmp_path, ["JP225", "NOPE"])
     settings = load_settings(root / "config" / "settings.yaml")
     ctx = service_mod.StartupContext(None, [], [], bridge_fetch=lambda url, **k: Resp(["JP225"]),
-                                     bridge_api_key="k")
+                                     bridge_api_key="k", query_bridge=True)
     assert service_mod._startup_watch_symbols(settings, ctx) is settings
     assert [(f.code, f.message) for f in ctx.findings] == [("watch_symbol_unknown", "NOPE")]
+
+
+def test_the_daemon_start_path_never_asks_the_bridge_and_says_nothing(tmp_path):
+    from agentic_fx.config import load_settings
+    root = watch_root(tmp_path, ["JP225", "NOPE"])
+    settings = load_settings(root / "config" / "settings.yaml")
+
+    def forbidden(url, **k):
+        raise AssertionError("daemon start must not call the bridge")
+
+    ctx = service_mod.StartupContext(None, [], [], bridge_fetch=forbidden, bridge_api_key="k")
+    assert ctx.query_bridge is False
+    assert service_mod._startup_watch_symbols(settings, ctx) is settings
+    assert ctx.findings == []
+
+
+def test_run_startup_checks_for_the_daemon_makes_no_bridge_request(tmp_path, monkeypatch):
+    from agentic_fx.config import load_settings
+    calls = serve(monkeypatch, error=AssertionError("must not call the bridge"))
+    root = watch_root(tmp_path, ["NOPE"])
+    settings = load_settings(root / "config" / "settings.yaml")
+    ctx = service_mod.StartupContext(None, [], [])
+    service_mod._startup_watch_symbols(settings, ctx)
+    assert calls == [] and ctx.findings == []
+
+
+def test_afx_check_gives_the_bridge_five_seconds(tmp_path, monkeypatch):
+    calls = serve(monkeypatch, ["JP225"])
+    run_check(watch_root(tmp_path, ["JP225"]))
+    assert calls[0][1]["timeout"] == 5
+
+
+# --- 鍵の取得と送ってよい宛先の判定は 1 か所 ---------------------------------------------
+
+def test_the_key_helper_withholds_from_plain_remote_http_unless_the_destination_is_trusted(tmp_path):
+    from agentic_fx.setup.checks import bridge_key_headers
+    env = {"MT5_BRIDGE_API_KEY": "K1"}
+    assert bridge_key_headers("http://10.0.0.5:8812", tmp_path, env) == {}
+    assert bridge_key_headers("http://10.0.0.5:8812", tmp_path, env, check_destination=False) == \
+        {"X-Bridge-Api-Key": "K1"}
+    assert bridge_key_headers("https://b.example", tmp_path, env) == {"X-Bridge-Api-Key": "K1"}
+    assert bridge_key_headers("http://localhost:8812", tmp_path, env) == {"X-Bridge-Api-Key": "K1"}
+    assert bridge_key_headers("http://localhost:8812", tmp_path, {}) == {}
+
+
+def test_the_key_helper_falls_back_to_dotenv(tmp_path):
+    from agentic_fx.setup.checks import bridge_key_headers
+    (tmp_path / ".env").write_text("MT5_BRIDGE_API_KEY=D1\n")
+    assert bridge_key_headers("https://b", tmp_path, {}) == {"X-Bridge-Api-Key": "D1"}
+
+
+def test_only_the_helper_reads_the_key_store():
+    from pathlib import Path
+    base = Path(preflight.__file__).parent
+    for name in ("wizard.py", "preflight.py"):
+        assert "dotenv_values" not in (base / name).read_text(), name
+    assert "dotenv_values" in (base / "checks.py").read_text()
+
+
+def test_the_listing_and_the_health_probe_share_one_payload_reader(tmp_path):
+    from agentic_fx.setup import checks
+    for fetch in (lambda url, **k: Resp(None, 200),):
+        assert checks.list_bridge_symbols("http://b", fetch=fetch).reason_code is CheckReason.INVALID_RESPONSE
+        assert checks.check_bridge("http://b", "USDJPY", fetch=fetch).reason_code is CheckReason.INVALID_RESPONSE
+    assert checks._bridge_payload(Resp([1]), list) == [1]
 
 
 def test_the_startup_check_is_part_of_the_shared_list():

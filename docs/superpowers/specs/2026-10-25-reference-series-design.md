@@ -109,7 +109,7 @@ fresh: age <= max_age; stale: age > max_age
 
 live loader はその前段で `e + closed_bar_grace <= now` の bar だけを渡す。backtest loader は historical `d` までの `e <= d` の履歴を渡す。loader / availability 判定は source ごとに異なるが、閉じた input frame への asof・age 判定は同じ純粋関数を使う。`load_resampled_frame(until=d)` の排他 SQL と bucket end `<= d` はこの契約に一致する。
 
-参照市場の個別 calendar は本束で持たない。`max_age` は UTC 実経過時間であり、休場中も進む。FX 取引 pair 自身が週末 21:00 UTC 境界で休場していても参照 symbol の `max_age` は進む。これは calendar を持たない方針の帰結である。
+参照市場の個別 calendar は本束で持たない。`max_age` は UTC 実経過時間であり、休場中も進む。FX 取引 pair 自身が週末 21:00 UTC 境界で休場していても参照 symbol の `max_age` は進む。これは calendar を持たない方針の帰結である。従って live の取得側でも、参照 symbol (watch_symbols の raw name) の frame には FX 前提の鮮度判定と開場中 gap の連続性検査を掛けない (zero / NaN / spike の検査だけ残す)。鮮度は alignment の `max_age` が唯一の判定点である。取引 pair の検査は従来どおり。
 
 したがって合法的休場と内部 gap を厳密には区別しない。backtest preflight の検査対象は「参照 symbol / source / base interval の履歴が完全に存在しない」だけであり、seed や indicator 出力を事前判定しない。休場、seed 不足、indicator NaN は live / backtest とも同じ unavailable/skip である。
 
@@ -202,3 +202,4 @@ R3（passthrough `ohlcv`）は利用者裁定ではなく、既存 `evaluate` �
 | 2026-10-29 | v0.6.1 C1 | `risk.pair_rules` の余剰 key は起動拒否でなく警告 (§2.1、T1 の exit criteria) | T1a で設定例 (EURUSD の規則) と衝突。membership 検査が境界で余剰規則は取引対象を増やさない | |
 | 2026-10-30 | v0.6.2 C1 | T2 で確定した soft 再要求上限、状態・activity・frame 読込・週末・`max_bars`・再起動境界を反映 | T2 実装・レビューで確定 | |
 | 2026-10-30 | v0.6.3 C1 | T3 で確定: `history_available` は symbol ごと、`reference_history_missing` の reason は `no_rows`、gate の構造化 verdict と commit 相の固定語、replay の frame cache | T3 実装・レビューで確定 | |
+| 2026-10-31 | v0.6.4 C1 | 参照 symbol の live frame には FX 前提の鮮度・開場 gap 検査を掛けない (§ calendar の節)。daemon 起動検査は bridge に問い合わせず `afx check` だけが突合。wizard: 非 MT5 選択時は現在の watch を表示して外す、一覧取得を飛ばす経路でも overlap を検査、区切りはカンマのみ | T4 レビュー 2 周目 (/code-review) #1・#2・#4・#6・#9 の是正に合わせる | |

@@ -1026,6 +1026,7 @@ class StartupContext:
     check_secret_env: bool = True
     bridge_fetch: Any = None
     bridge_api_key: str | None = None
+    query_bridge: bool = False
 
 
 def _startup_settings_valid(settings, ctx: StartupContext):
@@ -1063,15 +1064,17 @@ def _startup_cli_backend(which: str):
 def _startup_watch_symbols(settings, ctx: StartupContext):
     """bridge の銘柄一覧と突き合わせ、一覧に無い参照銘柄を warning にする (起動は止めない)。
 
-    参照銘柄が無い、または価格源が MT5 でないときは何も呼ばない。bridge に届かないときは
-    「未確認」とだけ言い、unknown とは言わない。"""
+    問い合わせるのは `afx check` (`ctx.query_bridge`) だけ。daemon の起動経路では bridge を呼ばず、
+    取得の失敗は ingest が記録する。参照銘柄が無い、または価格源が MT5 でないときも何も呼ばない。
+    bridge に届かないときは「未確認」とだけ言い、unknown とは言わない。"""
     watch = list(getattr(settings.datafeed, "watch_symbols", ()) or ())
-    if not watch or settings.datafeed.primary != "mt5" or ctx.findings is None:
+    if (not ctx.query_bridge or not watch or settings.datafeed.primary != "mt5"
+            or ctx.findings is None):
         return settings
     import httpx
     from agentic_fx.setup import checks
 
-    key = ctx.bridge_api_key if ctx.bridge_api_key is not None else os.environ.get("MT5_BRIDGE_API_KEY")
+    key = ctx.bridge_api_key
     listing = checks.list_bridge_symbols(
         settings.datafeed.mt5.bridge_url or "", fetch=ctx.bridge_fetch or httpx.get, timeout=5,
         headers={"X-Bridge-Api-Key": key} if key else {})
