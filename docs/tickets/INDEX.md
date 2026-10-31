@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 154 件。完了分は closed/。
+未完了: 155 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -75,9 +75,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (128)
+## 設計待ち (129)
 
-### 不具合 (70)
+### 不具合 (71)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -138,6 +138,7 @@
 | [test-init-guard-order-dependent-on-fetchers](open/test-init-guard-order-dependent-on-fetchers.md) | 低 | 2026-10-25 | offline init test が test_fetchers の後では赤になる (順序依存) |
 | [test-service-app-leaks-fds](open/test-service-app-leaks-fds.md) | 低 | 2026-10-26 | tests/test_service_app.py が fd を 1100 超残し後続 test に波及する |
 | [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
+| [wizard-codex-model-list-fetch-failed](open/wizard-codex-model-list-fetch-failed.md) | 低 | 2026-10-31 | afx init: codex のモデル一覧取得に失敗する |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
