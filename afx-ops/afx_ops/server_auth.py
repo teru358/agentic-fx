@@ -55,7 +55,7 @@ class ServerAuthError(Exception):
 
 # detail に出てよい段の全部。生成側 (ここ) と表示側 (api_client.with_detail) の両方で閉じる
 DETAIL_STEPS = frozenset({"getsockopt", "fdinfo_open", "fdinfo_read", "locks_open", "locks_read",
-                          "unknown"})
+                          "pin_locks", "pin_proc", "unknown"})
 
 
 def step_detail(step: str, err: int | None) -> str:
@@ -108,20 +108,13 @@ def check_socket_path(path: Path, *, uid: int) -> None:
         raise ServerAuthError("socket_file")
 
 
-def _flock_write_lines(proc_locks: Path) -> list[tuple[int, int, int, int]] | None:
+def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
     """``/proc/locks`` の FLOCK WRITE 保持行を (pid, major, minor, inode) で返す。
 
     行は ``N: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF`` で major /
-    minor は 16 進。``->`` の付いた行は待っている側なので数えない。読めなければ None。
+    minor は 16 進。``->`` の付いた行は待っている側なので数えない。読めなければ段つきの
+    ``_StepError`` (呼び出し側が握りつぶすか理由にするかを決める)。
     """
-    try:
-        return _flock_rows(proc_locks)
-    except OSError:
-        return None
-
-
-def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
-    """`_flock_write_lines` の本体。読めなければ段つきの ``_StepError``。"""
     try:
         with open(proc_locks, "rb") as file:
             try:
@@ -161,8 +154,9 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
     except OSError:
         return set()
     device = (os.major(st.st_dev), os.minor(st.st_dev))
-    rows = _flock_write_lines(proc_locks)
-    if rows is None:
+    try:
+        rows = _flock_rows(proc_locks)
+    except OSError:
         return set()
     holders = set()
     for pid, major, minor, inode in rows:

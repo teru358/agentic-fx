@@ -9,6 +9,7 @@ import errno
 import io
 import re
 import socket
+import types
 from pathlib import Path
 
 import pytest
@@ -114,12 +115,22 @@ def test_the_reason_vocabulary_is_unchanged():
 
 def test_with_detail_appends_only_the_fixed_shape():
     assert with_detail("a", "step=fdinfo_open errno=13") == "a detail=step=fdinfo_open errno=13"
+    assert with_detail("a", "step=unknown errno=0") == "a detail=step=unknown errno=0"
     assert with_detail("a", "") == "a"
-    assert with_detail("a", "step=x errno=13 /home/u/secret") == "a"
     assert with_detail("a", "step=x errno=13") == "a"
-    assert with_detail("a", "step=fdinfo_open errno=13") == "a detail=step=fdinfo_open errno=13"
-    assert step_detail("x", 13) == "step=unknown errno=13"
+    assert with_detail("a", "step=x errno=13 /home/u/secret") == "a"
     assert with_detail("a", "step=x errno=123456") == "a"
+    assert with_detail("a", "step=fdinfo_open errno=13\n") == "a"
+    assert with_detail("a", "step=fdinfo_open errno=13 tail") == "a"
+    assert with_detail("a", "step=fdinfo_open errno=13\nstep=fdinfo_open errno=13") == "a"
+    assert step_detail("x", 13) == "step=unknown errno=13"
+
+
+@pytest.mark.parametrize("step", ["pin_locks", "pin_proc"])
+def test_pin_steps_are_in_the_closed_vocabulary_and_displayed(step):
+    assert step in server_auth.DETAIL_STEPS
+    assert step_detail(step, 2) == f"step={step} errno=2"
+    assert with_detail("a", f"step={step} errno=2") == f"a detail=step={step} errno=2"
 
 
 class _Client:
@@ -187,9 +198,80 @@ def test_bot_exit_line_carries_detail(monkeypatch, tmp_path):
     assert out.getvalue() == "afx-ops: pidfd_transient detail=step=getsockopt errno=12\n"
 
 
-def test_startup_run_prints_detail_for_an_api_error():
+def _config(tmp_path):
+    from afx_ops.config import OpsConfig
+    return OpsConfig(tmp_path, tmp_path, None)
+
+
+def test_startup_run_prints_detail_for_an_api_error(tmp_path, capsys, monkeypatch):
     from afx_ops.isolation import startup
-    assert startup.with_detail("x", "step=getsockopt errno=1") == "x detail=step=getsockopt errno=1"
+
+    def wait(_endpoint):
+        raise ApiError("pidfd_transient", detail="step=fdinfo_open errno=12")
+
+    monkeypatch.setattr(startup, "isolate", lambda *a, **k: (types.SimpleNamespace(endpoint=None), None))
+    rc = startup.run(object(), _config(tmp_path), lambda isolated: 0,
+                     preload=lambda: None, wait=wait)
+    assert rc == api_client.RC_UNREACHABLE
+    assert capsys.readouterr().err == "afx-ops: pidfd_transient detail=step=fdinfo_open errno=12\n"
+
+
+def test_startup_run_prints_pin_failure_detail(tmp_path, capsys, monkeypatch):
+    from afx_ops.isolation import startup
+
+    def isolate(*_a, **_k):
+        raise startup.StartupError("proc_pin_failed", "13", shape="step=pin_locks errno=13")
+
+    monkeypatch.setattr(startup, "isolate", isolate)
+    rc = startup.run(object(), _config(tmp_path), lambda isolated: 0, preload=lambda: None)
+    assert rc == startup.RC_ISOLATION_FAILED
+    assert capsys.readouterr().err == "afx-ops: proc_pin_failed detail=step=pin_locks errno=13\n"
+
+
+def test_run_guarded_prints_detail():
+    out = io.StringIO()
+    rc = api_client.run_guarded(_raise(ApiError("peer_check", detail="step=getsockopt errno=9")),
+                                stderr=out)
+    assert rc == api_client.RC_UNREACHABLE
+    assert out.getvalue() == "afx-ops: peer_check detail=step=getsockopt errno=9\n"
+
+
+def test_run_guarded_without_detail_prints_the_reason_only():
+    out = io.StringIO()
+    api_client.run_guarded(_raise(ApiError("refused")), stderr=out)
+    assert out.getvalue() == "afx-ops: refused\n"
+
+
+def test_wait_ready_timeout_keeps_the_last_transient_detail(monkeypatch, tmp_path):
+    clock = [0.0]
+
+    def fake_open(endpoint, *, timeout):
+        clock[0] += timeout
+        raise ApiError("pidfd_transient", detail=f"step=fdinfo_open errno={errno.ENOMEM}")
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(fake_open))
+    with pytest.raises(ApiError) as caught:
+        api_client.wait_ready(api_client.Endpoint(tmp_path / "s", tmp_path / "l"),
+                              interval=0.25, limit=3.0, sleep=lambda _v: None,
+                              now=lambda: clock[0])
+    assert caught.value.reason == "readiness_timeout"
+    assert with_detail(caught.value.reason, caught.value.detail) == (
+        "readiness_timeout detail=step=fdinfo_open errno=12")
+
+
+def test_wait_ready_timeout_without_a_transient_has_no_detail(monkeypatch, tmp_path):
+    clock = [0.0]
+
+    def fake_open(endpoint, *, timeout):
+        clock[0] += timeout
+        raise ApiError("refused")
+
+    monkeypatch.setattr(api_client._Request, "open", staticmethod(fake_open))
+    with pytest.raises(ApiError) as caught:
+        api_client.wait_ready(api_client.Endpoint(tmp_path / "s", tmp_path / "l"),
+                              interval=0.25, limit=3.0, sleep=lambda _v: None,
+                              now=lambda: clock[0])
+    assert caught.value.detail == ""
 
 
 def test_api_error_defaults_to_no_detail():

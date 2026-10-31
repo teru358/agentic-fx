@@ -586,18 +586,20 @@ def wait_ready(endpoint: Endpoint, *, interval: float = READINESS_INTERVAL,
     期限を過ぎたら ``readiness_timeout``。
     """
     deadline = now() + limit
+    last_detail = ""
     while True:
         remaining = deadline - now()
         if remaining <= 0:
-            raise ApiError("readiness_timeout")
+            raise ApiError("readiness_timeout", detail=last_detail)
         try:
             with _Request.open(endpoint, timeout=min(HTTP_TIMEOUT, remaining)):
                 return
         except ApiError as err:
             if err.reason not in _WAITABLE:
                 raise
+            last_detail = err.detail or last_detail
         if now() + interval > deadline:
-            raise ApiError("readiness_timeout")
+            raise ApiError("readiness_timeout", detail=last_detail)
         sleep(interval)
 
 
@@ -610,7 +612,7 @@ def run_guarded(body: Callable[[], object], *, stderr: TextIO | None = None) -> 
     try:
         body()
     except ApiError as err:
-        print(f"afx-ops: {err.reason}", file=out, flush=True)
+        print(f"afx-ops: {with_detail(err.reason, err.detail)}", file=out, flush=True)
         return RC_UNREACHABLE
     except KeyReadError as err:
         print(f"afx-ops: key {err.code}", file=out, flush=True)

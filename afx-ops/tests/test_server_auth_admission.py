@@ -35,7 +35,7 @@ def _layout_spec(built, keys: Path, principal: str = "ops-web", steps=WHOAMI, **
 def _rejected(rc: int, stderr: str) -> str:
     """固定 reason で非零終了したことを確かめて reason を返す。"""
     assert rc == 3, stderr
-    match = re.fullmatch(r"afx-ops: ([a-z_]+)\n", stderr)
+    match = re.fullmatch(r"afx-ops: ([a-z_]+)( detail=step=[a-z_]+ errno=[0-9]{1,4})?\n", stderr)
     assert match, stderr
     return match.group(1)
 

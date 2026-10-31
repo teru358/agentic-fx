@@ -9,6 +9,7 @@ import operator
 import os
 import socket
 import time
+from pathlib import Path
 
 import pytest
 
@@ -344,6 +345,16 @@ def test_pin_proc_failure_closes_what_it_opened_and_is_a_fixed_reason():
     with pytest.raises(StartupError) as info:
         startup.pin_proc("/proc/0/none")
     assert info.value.reason == "proc_pin_failed"
+    assert info.value.shape == "step=pin_proc errno=2"
+    assert startup.open_fds(f"/proc/{os.getpid()}") == before
+
+
+def test_pin_proc_failure_on_the_locks_path_names_that_step(monkeypatch):
+    before = startup.open_fds(f"/proc/{os.getpid()}")
+    monkeypatch.setattr(startup.server_auth, "PROC_LOCKS", Path("/proc/none-locks"))
+    with pytest.raises(StartupError) as info:
+        startup.pin_proc(f"/proc/{os.getpid()}")
+    assert info.value.shape == "step=pin_locks errno=2"
     assert startup.open_fds(f"/proc/{os.getpid()}") == before
 
 

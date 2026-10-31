@@ -140,10 +140,12 @@ _PR_SET_DUMPABLE = 4
 
 
 class StartupError(Exception):
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", *, shape: str = "") -> None:
         assert reason in REASONS, reason
         super().__init__(reason if not detail else f"{reason}: {detail}")
         self.reason = reason
+        # 終了行に添えてよい固定形 (``step=<段> errno=<n>``)。自由文の detail は出さない
+        self.shape = shape
 
 
 @dataclass(frozen=True)
@@ -545,13 +547,16 @@ class ProcPins:
 def pin_proc(proc: str) -> ProcPins:
     """server 認証が隔離後に読む 2 つの procfs の inode を fd で握る (dentry 回収対策)。"""
     opened: list[int] = []
+    steps = ("pin_proc", "pin_locks")
     try:
         for path in (proc, str(server_auth.PROC_LOCKS)):
             opened.append(os.open(path, os.O_PATH | os.O_CLOEXEC))
     except OSError as exc:
+        step = steps[len(opened)]
         for fd in opened:
             os.close(fd)
-        raise StartupError("proc_pin_failed", str(exc.errno)) from None
+        raise StartupError("proc_pin_failed", str(exc.errno),
+                           shape=server_auth.step_detail(step, exc.errno)) from None
     return ProcPins(proc_fd=opened[0], locks_fd=opened[1])
 
 
@@ -1072,8 +1077,9 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
                                       release_config_dir=owner.close)
             announce_ready(notify, isolated.endpoint, wait=wait)
     except StartupError as exc:
-        reason = exc.reason
-        rc = RC_RUNTIME_IMPORT_FAILED if reason == "runtime_import_failed" else RC_ISOLATION_FAILED
+        reason = with_detail(exc.reason, exc.shape)
+        rc = (RC_RUNTIME_IMPORT_FAILED if exc.reason == "runtime_import_failed"
+              else RC_ISOLATION_FAILED)
     except ApiError as exc:
         reason, rc = with_detail(exc.reason, exc.detail), RC_UNREACHABLE
     except Exception as exc:  # 想定外の失敗も traceback (path や値を含み得る) にせず固定語で閉じる
