@@ -475,10 +475,22 @@ def op_snapshot_rounds(p, iso):
         os.close(fd)
 
 
+def _pins(iso):
+    """保持 fd のうち 0/1/2 と listener 以外 (= procfs の pin) の [指す先, O_PATH か]。"""
+    skip = {0, 1, 2} | ({iso.listener.fileno()} if iso.listener is not None else set())
+    pins = []
+    for fd in sorted(iso.kept_fds - skip):
+        target = os.readlink(f"{iso.proc_dir}/fd/{fd}")
+        with open(f"{iso.proc_dir}/fdinfo/{fd}", encoding="ascii") as f:
+            flags = int(next(l for l in f if l.startswith("flags:")).split()[1], 8)
+        pins.append([target.replace(iso.proc_dir, "/proc/<pid>"), bool(flags & os.O_PATH)])
+    return pins
+
+
 def op_body_fds(p, iso):
-    """(body の open fd、Isolated.kept_fds、旧い通知 fd への書込みの結果)。"""
+    """(body の open fd、Isolated.kept_fds、旧い通知 fd への書込みの結果、pin の [先, O_PATH])。"""
     fds = sorted(startup.open_fds(iso.proc_dir))
-    return [fds, sorted(iso.kept_fds), op_notify_fd_write(p, iso)]
+    return [fds, sorted(iso.kept_fds), op_notify_fd_write(p, iso), _pins(iso)]
 
 
 def op_noop(p, iso):
@@ -493,7 +505,7 @@ def op_web_fds(p, iso):
         with open(f"{iso.proc_dir}/task/{tid}/children", encoding="ascii") as f:
             tid_children += len(f.read().split())
     return {"fds": fds, "kept": sorted(iso.kept_fds), "listener": iso.listener.fileno(),
-            "children": tid_children}
+            "children": tid_children, "pins": _pins(iso)}
 
 
 def op_listdir(p, iso):
@@ -766,7 +778,7 @@ def _inject(fault) -> None:
             _inject(one)
         return
     if fault == "skip_landlock":
-        startup.apply_landlock = lambda plan, proc, dirs: None
+        startup.apply_landlock = lambda *args: None
     elif fault == "skip_seccomp":
         startup.apply_seccomp = lambda compiled: None
     elif fault == "keep_dumpable":

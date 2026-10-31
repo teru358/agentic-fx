@@ -31,7 +31,7 @@ from typing import TextIO
 
 import discord
 
-from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient
+from afx_ops.api_client import RC_UNREACHABLE, ApiError, BotClient, with_detail
 from afx_ops.bot.adapter import BotAdapter, BotFailure, BotSettings, open_state_dir
 from afx_ops.gate.service import GateService
 from afx_ops.gate.state import BotState
@@ -102,7 +102,7 @@ def run(isolated, *, client=None, connector_factory: Callable[[], object] | None
         _say(out, failure.reason)
         return RC_BOT_FAILED
     except ApiError as exc:
-        _say(out, exc.reason)
+        _say(out, with_detail(exc.reason, exc.detail))
         return RC_UNREACHABLE
     except Exception:  # 例外文には token や URL が入り得るので、固定語だけにする
         _say(out, "bot_internal_error")

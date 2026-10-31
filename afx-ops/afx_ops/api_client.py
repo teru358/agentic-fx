@@ -70,10 +70,22 @@ class ApiError(Exception):
     ``token_sent`` が False なら鍵は 1 byte も送っていない。
     """
 
-    def __init__(self, reason: str, *, token_sent: bool = False) -> None:
+    def __init__(self, reason: str, *, token_sent: bool = False, detail: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
         self.token_sent = token_sent
+        # server 認証の失敗段 (``step=<段> errno=<n>``)。stderr の診断専用で、応答や通知には出さない
+        self.detail = detail
+
+
+_DETAIL_SHAPE = re.compile(r"step=[a-z_]{1,16} errno=[0-9]{1,4}")
+
+
+def with_detail(reason: str, detail: object) -> str:
+    """stderr の 1 行用に ``<reason> detail=<detail>``。detail が固定形でなければ reason だけ。"""
+    if type(detail) is str and _DETAIL_SHAPE.fullmatch(detail):
+        return f"{reason} detail={detail}"
+    return reason
 
 
 @dataclass(frozen=True)
@@ -168,7 +180,7 @@ class _Request:
         except SocketMissing:
             raise ApiError("no_socket") from None
         except ServerAuthError as err:
-            raise ApiError(err.reason) from None
+            raise ApiError(err.reason, detail=err.detail) from None
         except OSError as exc:
             raise ApiError(_connect_failure(exc)) from None
         try:
@@ -183,7 +195,7 @@ class _Request:
                                     proc_locks=ep.proc_locks, pidfd=self._pidfd,
                                     dev_fallback=False)
         except ServerAuthError as err:
-            raise ApiError(err.reason) from None
+            raise ApiError(err.reason, detail=err.detail) from None
 
     def _spend_remaining(self) -> None:
         """deadline が指定されていれば、残り時間を socket の期限にする (尽きていれば期限切れ)。"""
