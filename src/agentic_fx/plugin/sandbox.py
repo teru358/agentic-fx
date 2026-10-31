@@ -1928,7 +1928,7 @@ def _validate_indicator_result(result: Any, *,
     NaN は wire 上で `null` になっている。戻り値は
     `{key: float | list[float | None]}`。
 
-    **codex plan r2 束1 Important**: wire 形式を Python 値
+    wire 形式を Python 値
     (`float | list[float|None]`) へ復元した**後**、
     `core.plugin_contract.validate_indicator_result(out, df_index=None,
     outputs=outputs)` を必ず通す。`df_index=None` なので系列長は検査しない
@@ -1975,7 +1975,7 @@ def _validate_indicator_result(result: Any, *,
     from agentic_fx.core.plugin_contract import (
         IndicatorResultError, OutputsMismatchError,
         validate_indicator_result as _validate_common)
-    # codex r1 束1 Important: 共通 validator は **plugin の生の戻り値**を
+    # 共通 validator は **plugin の生の戻り値**を
     # 見る前提なので、スカラーの `None` は無条件に拒否する (`_check_number`)。
     # 一方 wire では scalar NaN が `null` になり、上のループで `None` へ
     # 復元されている — そのまま渡すと `run_plugin` 経由の scalar NaN が
