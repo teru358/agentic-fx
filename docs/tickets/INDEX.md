@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 157 件。完了分は closed/。
+未完了: 156 件。完了分は closed/。
 
 ## 実装中 (5)
 
@@ -74,7 +74,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (132)
+## 設計待ち (131)
 
 ### 不具合 (72)
 
@@ -153,7 +153,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (40)
+### 機能 (39)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -168,7 +168,6 @@
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [indicator-symbol-agnostic-and-duplicate-gate](open/indicator-symbol-agnostic-and-duplicate-gate.md) | 中 | 2026-10-31 | indicator の銘柄非依存と重複を決定論 gate で検査する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
-| [reference-literal-symbol-allow-trading-pairs](open/reference-literal-symbol-allow-trading-pairs.md) | 中 | 2026-10-31 | 戦略の参照 symbol に取引 pair も許す (pairs + watch_symbols) |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
