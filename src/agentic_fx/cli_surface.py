@@ -724,6 +724,20 @@ class SurfaceRenderer:
 
 RENDERER = SurfaceRenderer()
 
+ARGUMENT_HELP: dict[tuple[str, str], str] = {
+    ("history import", "--symbol"): (
+        "取引 pair、または MT5 の参照銘柄 (broker の raw 名。例 JP225。"
+        "参照銘柄は --source mt5 で取り込む)"),
+    ("history coverage", "--symbol"): "取引 pair、または参照銘柄 (raw 名)。1 回に 1 銘柄だけ表示する",
+    ("analyze corr", "--a"): "取引 pair、または参照銘柄 (raw 名)",
+    ("analyze corr", "--b"): (
+        "--a と別の銘柄。両方が同じ --source の 1m 履歴を 30 本以上共有している必要がある"),
+}
+
+
+def argument_help(command: str, option: str) -> str:
+    return ARGUMENT_HELP[(command, option)]
+
 
 def top_description() -> str:
     return RENDERER.top_description()

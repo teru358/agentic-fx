@@ -356,6 +356,40 @@ def test_soft_failures_never_move_the_outage_state_or_hard_report_sets(tmp_path)
                ("JP225", "1h") in {k for k, _ in r.soft_failed} for r in soft_reports)
 
 
+def test_a_failing_watch_symbol_with_a_healthy_pair_raises_no_outage_or_unhealthy(tmp_path):
+    conn = _db(tmp_path)
+    activity = ActivityLog(tmp_path / "activity")
+
+    def fetch(pair, interval, start, end, *, timeout):
+        if pair == "JP225":
+            raise httpx.ConnectError("watch source down")
+        return [_bar(pair, interval, end)]
+
+    ingest = Ingest(_settings(), [_strategy(_ref())], fetch=fetch, monotonic=_Clock())
+    hard = ingest.registry.hard_keys()
+    outage = OutageStateMachine(
+        conn, hard_keys=hard,
+        interval_widths={i: timedelta(minutes=sources.INTERVAL_MIN[i]) for _, i in hard},
+        grace=timedelta(seconds=0), storage_source=ingest.storage_source,
+        activity=activity, ready_confirm_ticks=3, auto_resume_when_flat=True,
+        flat_stall_max_sec=3600)
+    soft_failed_ticks = 0
+    for minute in range(8):
+        now = NOW + timedelta(minutes=minute)
+        _, report = ingest.prepare(now, conn)
+        ingest.commit(conn)
+        assert outage.observe(now, report) == "ready"
+        assert report.failed == frozenset() and report.deferred == frozenset()
+        assert {key[0] for key in report.succeeded} == {"USDJPY"}
+        soft_failed_ticks += ("JP225", "1h") in {key for key, _ in report.soft_failed}
+    assert soft_failed_ticks >= 1
+    assert outage.state == "ready"
+    assert not [line for line in activity.tail(200)
+                if "datafeed_degraded" in line or "datafeed_restricted" in line]
+    assert load_cache_bars(conn, "USDJPY", "1h", source=ingest.storage_source)
+    conn.close()
+
+
 def test_reference_bars_are_saved_as_symbol_interval_mt5_live(tmp_path):
     conn = _db(tmp_path)
     four_hour = _ref(timeframe="4h")

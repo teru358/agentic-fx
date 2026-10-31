@@ -34,7 +34,7 @@ from agentic_fx.backtest.mt5_import import (
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
-from agentic_fx.cli_surface import (HelpFormatter, leaf_help, parser_description, parser_help,
+from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
                                     render_epilog)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
@@ -85,8 +85,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     imp = history_sub.add_parser("import", **_surface_parser_kw("history import", leaf=True))
     imp.add_argument("--source", choices=["dukascopy", "mt5"])
     imp.add_argument("--symbol", required=True,
-                     help="取引 pair、または MT5 の参照銘柄 (broker の raw 名。例 JP225。"
-                          "参照銘柄は --source mt5 で取り込む)")
+                     help=argument_help("history import", "--symbol"))
     imp.add_argument("--from", dest="from_", type=_parse_date, required=True)
     imp.add_argument("--to", dest="to", type=_parse_date, required=True)
     imp.add_argument("--interval", choices=("1m", "5m", "15m"), default="1m")
@@ -101,7 +100,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
 
     cov = history_sub.add_parser("coverage", **_surface_parser_kw("history coverage", leaf=True))
     cov.add_argument("--symbol", required=True,
-                     help="取引 pair、または参照銘柄 (raw 名)。1 回に 1 銘柄だけ表示する")
+                     help=argument_help("history coverage", "--symbol"))
     cov.add_argument("--timeframe", required=True)
     cov.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     cov.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
@@ -149,9 +148,9 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
                                          required=True)
     corr = analyze_sub.add_parser("corr", **_surface_parser_kw("analyze corr", leaf=True))
     corr.add_argument("--a", required=True,
-                      help="取引 pair、または参照銘柄 (raw 名)")
+                      help=argument_help("analyze corr", "--a"))
     corr.add_argument("--b", required=True,
-                      help="--a と別の銘柄。両方が同じ --source の 1m 履歴を 30 本以上共有している必要がある")
+                      help=argument_help("analyze corr", "--b"))
     corr.add_argument("--timeframe", required=True)
     corr.add_argument("--source", required=True, choices=sorted(ohlcv.IMPORT_SOURCES))
     corr.add_argument("--from", dest="from_", type=_parse_date, default=None)
