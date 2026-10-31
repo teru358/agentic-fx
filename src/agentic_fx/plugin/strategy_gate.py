@@ -147,7 +147,7 @@ SAME_NAME_CONTRACT_CHANGED = "same_name_contract_changed"
 
 _COMPARE_METRIC_KEYS = (
     "trades", "pf", "win_rate", "avg_r", "max_drawdown", "total_pnl",
-    "evaluable", "fallback_spread_used")
+    "kill_switch_latches", "evaluable", "fallback_spread_used")
 
 CompareVerdict = Literal["improved", "not_improved", "unavailable"]
 

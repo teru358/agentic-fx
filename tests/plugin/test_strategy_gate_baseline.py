@@ -242,7 +242,8 @@ def test_comparison_payload_schema(monkeypatch):
         assert list(entry) == ["candidate", "deployed", "verdict"]
         assert set(entry["candidate"]) == {
             "trades", "pf", "win_rate", "avg_r", "max_drawdown",
-            "total_pnl", "evaluable", "fallback_spread_used"}
+            "total_pnl", "kill_switch_latches", "evaluable",
+            "fallback_spread_used"}
         assert set(entry["deployed"]) == set(entry["candidate"])
     import json
     json.dumps(c)
