@@ -9,6 +9,7 @@ import operator
 import os
 import socket
 import time
+from pathlib import Path
 
 import pytest
 
@@ -72,7 +73,7 @@ def test_isolate_runs_the_stages_in_the_fixed_order():
     lines = _first_call_lines(startup.isolate)
     order = ["plan_check", "check_preconditions", "connect_notify", "feature_filter",
              "prepare_dirs", "read_api_token", "read_secrets", "prebind_listener",
-             "close_unlisted_fds", "apply_landlock", "apply_seccomp", "set_dumpable_zero",
+             "pin_proc", "close_unlisted_fds", "apply_landlock", "apply_seccomp", "set_dumpable_zero",
              "self_check"]
     assert [lines[name] for name in order] == sorted(lines[name] for name in order)
     # READY=1 は isolate では送らない (server 認証の後に run が送る)
@@ -320,3 +321,49 @@ def test_shared_libc_returns_long_from_syscall():
     libc = _libc.libc()
     assert libc.syscall.restype is ctypes.c_long
     assert _libc.libc() is libc
+
+
+# --- procfs の pin ---------------------------------------------------------------
+
+def test_pin_proc_opens_the_proc_dir_and_locks_as_o_path_fds():
+    pins = startup.pin_proc(f"/proc/{os.getpid()}")
+    try:
+        assert pins.fds() == {pins.proc_fd, pins.locks_fd} and len(pins.fds()) == 2
+        assert os.readlink(f"/proc/self/fd/{pins.proc_fd}") == f"/proc/{os.getpid()}"
+        assert os.readlink(f"/proc/self/fd/{pins.locks_fd}") == "/proc/locks"
+        for fd in pins.fds():
+            with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as f:
+                flags = int(next(l for l in f if l.startswith("flags:")).split()[1], 8)
+            assert flags & os.O_PATH and flags & os.O_CLOEXEC
+    finally:
+        for fd in pins.fds():
+            os.close(fd)
+
+
+def test_pin_proc_failure_closes_what_it_opened_and_is_a_fixed_reason():
+    before = startup.open_fds(f"/proc/{os.getpid()}")
+    with pytest.raises(StartupError) as info:
+        startup.pin_proc("/proc/0/none")
+    assert info.value.reason == "proc_pin_failed"
+    assert info.value.shape == "step=pin_proc errno=2"
+    assert startup.open_fds(f"/proc/{os.getpid()}") == before
+
+
+def test_pin_proc_failure_on_the_locks_path_names_that_step(monkeypatch):
+    before = startup.open_fds(f"/proc/{os.getpid()}")
+    monkeypatch.setattr(startup.server_auth, "PROC_LOCKS", Path("/proc/none-locks"))
+    with pytest.raises(StartupError) as info:
+        startup.pin_proc(f"/proc/{os.getpid()}")
+    assert info.value.shape == "step=pin_locks errno=2"
+    assert startup.open_fds(f"/proc/{os.getpid()}") == before
+
+
+def test_landlock_proc_rules_are_bound_to_the_pinned_fds(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xc"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xs"))
+    dirs = startup.PreparedDirs(config_fd=-1, state_fd=-1)
+    pins = startup.ProcPins(proc_fd=71, locks_fd=72)
+    for feature in ("bot", "web", "notify"):
+        plan = StartupPlan.for_feature(feature, web_port=0)
+        rules = {r.path: r.fd for r in startup.landlock_plan(plan, "/proc/1", dirs, pins).path_rules}
+        assert rules["/proc/1"] == 71 and rules["/proc/locks"] == 72

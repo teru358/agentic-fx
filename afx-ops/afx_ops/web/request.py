@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
-from afx_ops.api_client import ApiError
+from afx_ops.api_client import ApiError, with_detail
 from afx_ops.web import auth, render
 from afx_ops.web.headers import response_headers
 from afx_ops.web.routes import RouteMatch, resolve_route
@@ -226,7 +226,7 @@ def _call(report, function, *args, **kwargs):
     try:
         return function(*args, **kwargs)
     except ApiError as error:
-        report(f"reason={_fixed_word(error.reason, 'other')}")
+        report(with_detail(f"reason={_fixed_word(error.reason, 'other')}", error.detail))
         raise _Upstream from None
     except Exception as error:  # noqa: BLE001 — 原因の文は外へ出さない
         report(f"error={type(error).__name__}")

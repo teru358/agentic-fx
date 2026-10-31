@@ -499,9 +499,10 @@ def test_config_dir_fd_from_the_entry_is_used_and_closed_before_the_body(feature
     # 起動口と同じく設定読込みで開いた config dir の fd を渡しても、body には漏れない
     got = run_canary({**_spec(root, feature, "body_fds"), "config_fd": True}, child_env)
     assert got.rc == 0, got.stderr[-2000:]
-    open_fds, kept, _notify = got.result
+    open_fds, kept, _notify, pins = got.result
     assert open_fds == kept
-    assert len(kept) == (4 if feature == "web" else 3) and kept[:3] == [0, 1, 2]
+    assert len(kept) == (6 if feature == "web" else 5) and kept[:3] == [0, 1, 2]
+    assert sorted(pins) == sorted([["/proc/<pid>", True], ["/proc/locks", True]])
     # 規則はその fd の dir に付いていて、読めるが書けない
     config = root / feature / "config"
     got = run_canary({**_spec(root, feature, "read_file"), "config_fd": True,

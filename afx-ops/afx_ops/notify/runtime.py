@@ -25,7 +25,7 @@ from typing import TextIO
 from afx_ops import improve_events
 from afx_ops.event_outcome import Post, SkipKnown, decide, is_improve, is_trade
 from afx_ops.events_page import parse_page, unreadable_notice
-from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient
+from afx_ops.api_client import RC_UNREACHABLE, ApiError, NotifyClient, with_detail
 from afx_ops.isolation.startup import client_for
 from afx_ops.notify import transport
 from afx_ops.notify.delivery import DeliveryError, encode_json_object, validate_webhook_url
@@ -70,7 +70,7 @@ def run(isolated, *, client=None, send: Callable[..., None] | None = None,
         _say(out, failure.reason)
         return RC_NOTIFY_FAILED
     except ApiError as exc:
-        _say(out, exc.reason)
+        _say(out, with_detail(exc.reason, exc.detail))
         return RC_UNREACHABLE
     except Exception:  # 例外文には URL や secret が入り得るので、固定語だけにして traceback を出さない
         _say(out, "notify_internal_error")

@@ -70,10 +70,22 @@ class ApiError(Exception):
     ``token_sent`` が False なら鍵は 1 byte も送っていない。
     """
 
-    def __init__(self, reason: str, *, token_sent: bool = False) -> None:
+    def __init__(self, reason: str, *, token_sent: bool = False, detail: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
         self.token_sent = token_sent
+        # server 認証の失敗段 (``step=<段> errno=<n>``)。stderr の診断専用で、応答や通知には出さない
+        self.detail = detail
+
+
+_DETAIL_SHAPE = re.compile(r"step=(" + "|".join(sorted(server_auth.DETAIL_STEPS)) + r") errno=[0-9]{1,4}")
+
+
+def with_detail(reason: str, detail: object) -> str:
+    """stderr の 1 行用に ``<reason> detail=<detail>``。detail が固定形でなければ reason だけ。"""
+    if type(detail) is str and _DETAIL_SHAPE.fullmatch(detail):
+        return f"{reason} detail={detail}"
+    return reason
 
 
 @dataclass(frozen=True)
@@ -168,7 +180,7 @@ class _Request:
         except SocketMissing:
             raise ApiError("no_socket") from None
         except ServerAuthError as err:
-            raise ApiError(err.reason) from None
+            raise ApiError(err.reason, detail=err.detail) from None
         except OSError as exc:
             raise ApiError(_connect_failure(exc)) from None
         try:
@@ -183,7 +195,7 @@ class _Request:
                                     proc_locks=ep.proc_locks, pidfd=self._pidfd,
                                     dev_fallback=False)
         except ServerAuthError as err:
-            raise ApiError(err.reason) from None
+            raise ApiError(err.reason, detail=err.detail) from None
 
     def _spend_remaining(self) -> None:
         """deadline が指定されていれば、残り時間を socket の期限にする (尽きていれば期限切れ)。"""
@@ -574,18 +586,21 @@ def wait_ready(endpoint: Endpoint, *, interval: float = READINESS_INTERVAL,
     期限を過ぎたら ``readiness_timeout``。
     """
     deadline = now() + limit
+    last_detail = ""
     while True:
         remaining = deadline - now()
         if remaining <= 0:
-            raise ApiError("readiness_timeout")
+            raise ApiError("readiness_timeout", detail=last_detail)
         try:
             with _Request.open(endpoint, timeout=min(HTTP_TIMEOUT, remaining)):
                 return
         except ApiError as err:
             if err.reason not in _WAITABLE:
                 raise
+            # 最後の失敗の detail だけを出す (detail の無い失敗が最後なら何も添えない)
+            last_detail = err.detail
         if now() + interval > deadline:
-            raise ApiError("readiness_timeout")
+            raise ApiError("readiness_timeout", detail=last_detail)
         sleep(interval)
 
 
@@ -598,7 +613,7 @@ def run_guarded(body: Callable[[], object], *, stderr: TextIO | None = None) -> 
     try:
         body()
     except ApiError as err:
-        print(f"afx-ops: {err.reason}", file=out, flush=True)
+        print(f"afx-ops: {with_detail(err.reason, err.detail)}", file=out, flush=True)
         return RC_UNREACHABLE
     except KeyReadError as err:
         print(f"afx-ops: key {err.code}", file=out, flush=True)

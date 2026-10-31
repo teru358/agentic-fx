@@ -122,10 +122,11 @@ def test_notify_fd_never_reaches_the_body_and_is_closed_after_ready(feature, roo
     got = run_canary(_spec(root, feature, "body_fds"), env)
     assert got.rc == 0, got.stderr[-2000:]
     assert manager.pending() == [b"READY=1"]
-    open_fds, kept, notify_write = got.result
-    # body に残るのは 0/1/2 と web の listener だけで、通知 fd は渡されない
+    open_fds, kept, notify_write, pins = got.result
+    # body に残るのは 0/1/2、web の listener、procfs の pin 2 本だけで、通知 fd は渡されない
     assert open_fds == kept
-    assert len(kept) == (4 if feature == "web" else 3) and kept[:3] == [0, 1, 2]
+    assert len(kept) == (6 if feature == "web" else 5) and kept[:3] == [0, 1, 2]
+    assert sorted(pins) == sorted([["/proc/<pid>", True], ["/proc/locks", True]])
     # 旧い通知 fd の番号へは書けない (READY=1 の後に閉じている)
     assert notify_write == [-1, 9]
 

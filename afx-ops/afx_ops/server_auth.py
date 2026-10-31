@@ -46,9 +46,38 @@ _PIDFD_PEER_GONE = (errno.ESRCH, errno.ENODATA)
 class ServerAuthError(Exception):
     """接続先を確かめられない。``reason`` は固定語で、この時点で鍵は送っていない。"""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(reason)
         self.reason = reason
+        # 失敗した段と errno だけの固定形 (``step=<段> errno=<n>``)。stderr の診断専用
+        self.detail = detail
+
+
+# detail に出てよい段の全部。生成側 (ここ) と表示側 (api_client.with_detail) の両方で閉じる
+DETAIL_STEPS = frozenset({"getsockopt", "fdinfo_open", "fdinfo_read", "locks_open", "locks_read",
+                          "pin_locks", "pin_proc", "unknown"})
+
+
+def step_detail(step: str, err: int | None) -> str:
+    if step not in DETAIL_STEPS:
+        step = "unknown"
+    return f"step={step} errno={err if type(err) is int else 0}"
+
+
+class _StepError(OSError):
+    """どの段で失敗したかを持つ OSError (``detail`` の元)。"""
+
+    def __init__(self, step: str, err: OSError) -> None:
+        super().__init__(err.errno, "")
+        self.step = step
+
+    @property
+    def detail(self) -> str:
+        return step_detail(self.step, self.errno)
+
+
+def _detail_of(exc: OSError) -> str:
+    return exc.detail if isinstance(exc, _StepError) else step_detail("unknown", exc.errno)
 
 
 class SocketMissing(Exception):
@@ -79,16 +108,23 @@ def check_socket_path(path: Path, *, uid: int) -> None:
         raise ServerAuthError("socket_file")
 
 
-def _flock_write_lines(proc_locks: Path) -> list[tuple[int, int, int, int]] | None:
+def _flock_rows(proc_locks: Path) -> list[tuple[int, int, int, int]]:
     """``/proc/locks`` の FLOCK WRITE 保持行を (pid, major, minor, inode) で返す。
 
     行は ``N: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF`` で major /
-    minor は 16 進。``->`` の付いた行は待っている側なので数えない。読めなければ None。
+    minor は 16 進。``->`` の付いた行は待っている側なので数えない。読めなければ段つきの
+    ``_StepError`` (呼び出し側が握りつぶすか理由にするかを決める)。
     """
     try:
-        text = proc_locks.read_text(encoding="ascii", errors="replace")
-    except OSError:
-        return None
+        with open(proc_locks, "rb") as file:
+            try:
+                text = file.read().decode("ascii", errors="replace")
+            except OSError as exc:
+                raise _StepError("locks_read", exc) from None
+    except _StepError:
+        raise
+    except OSError as exc:
+        raise _StepError("locks_open", exc) from None
     rows = []
     for line in text.splitlines():
         parts = line.split()
@@ -118,8 +154,9 @@ def lock_holders(lock_path: Path, *, proc_locks: Path = PROC_LOCKS,
     except OSError:
         return set()
     device = (os.major(st.st_dev), os.minor(st.st_dev))
-    rows = _flock_write_lines(proc_locks)
-    if rows is None:
+    try:
+        rows = _flock_rows(proc_locks)
+    except OSError:
         return set()
     holders = set()
     for pid, major, minor, inode in rows:
@@ -148,10 +185,17 @@ def _has_open_fd(pid: int, real_path: str) -> bool:
 
 def pidfd_pid(pidfd: int) -> int | None:
     """自分の ``/proc/<自 pid>/fdinfo/<pidfd>`` の ``Pid:``。相手が死んでいれば -1。"""
-    with open(f"/proc/{os.getpid()}/fdinfo/{pidfd}", encoding="ascii") as file:
-        for line in file:
-            if line.startswith("Pid:"):
-                return int(line.split()[1])
+    try:
+        file = open(f"/proc/{os.getpid()}/fdinfo/{pidfd}", encoding="ascii")
+    except OSError as exc:
+        raise _StepError("fdinfo_open", exc) from None
+    with file:
+        try:
+            for line in file:
+                if line.startswith("Pid:"):
+                    return int(line.split()[1])
+        except OSError as exc:
+            raise _StepError("fdinfo_read", exc) from None
     return None
 
 
@@ -167,8 +211,8 @@ def peer_credentials(sock: socket.socket) -> tuple[int, int]:
     """``SO_PEERCRED`` の (pid, uid)。読めなければ ``peer_check``。"""
     try:
         raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
-    except OSError:
-        raise ServerAuthError("peer_check") from None
+    except OSError as exc:
+        raise ServerAuthError("peer_check", step_detail("getsockopt", exc.errno)) from None
     pid, uid, _gid = _UCRED.unpack(raw)
     return pid, uid
 
@@ -196,8 +240,8 @@ def verify_peer(sock: socket.socket, *, uid: int, lock_path: Path,
         if pidfd is not None:
             try:
                 matched = pidfd_pid(pidfd)
-            except OSError:
-                raise ServerAuthError("peer_check") from None
+            except OSError as exc:
+                raise ServerAuthError("peer_check", _detail_of(exc)) from None
             if matched != pid:
                 raise ServerAuthError("peer_gone")
         # 保持者を一意に確定できなければ送らない。
@@ -276,12 +320,13 @@ def fetch_pidfd(sock: socket.socket) -> int:
     try:
         return sock.getsockopt(socket.SOL_SOCKET, SO_PEERPIDFD)
     except OSError as exc:
+        detail = step_detail("getsockopt", exc.errno)
         if exc.errno in _PIDFD_PEER_GONE:
-            raise ServerAuthError("peer_gone") from None
+            raise ServerAuthError("peer_gone", detail) from None
         if exc.errno in _PIDFD_TRANSIENT:
-            raise ServerAuthError("pidfd_transient") from None
+            raise ServerAuthError("pidfd_transient", detail) from None
         # 非対応 (EINVAL / ENOPROTOOPT 等) と未知の errno は pidfd を持てない扱いで閉じる
-        raise ServerAuthError("ops_requires_so_peerpidfd") from None
+        raise ServerAuthError("ops_requires_so_peerpidfd", detail) from None
 
 
 def check_pidfd(sock: socket.socket, pidfd: int) -> None:
@@ -289,8 +334,11 @@ def check_pidfd(sock: socket.socket, pidfd: int) -> None:
     pid, _uid = peer_credentials(sock)
     try:
         matched = pidfd_pid(pidfd)
-    except OSError:
-        raise ServerAuthError("ops_requires_so_peerpidfd") from None
+    except OSError as exc:
+        # fd・memory の一時的な枯渇は恒久の拒否にしない (待てる語)
+        reason = ("pidfd_transient" if exc.errno in _PIDFD_TRANSIENT
+                  else "ops_requires_so_peerpidfd")
+        raise ServerAuthError(reason, _detail_of(exc)) from None
     if matched is None:
         raise ServerAuthError("ops_requires_so_peerpidfd")
     if matched != pid:
@@ -311,9 +359,10 @@ def check_lock_device(lock_path: Path, *, proc_locks: Path = PROC_LOCKS) -> None
         st = os.stat(lock_path)
     except OSError:
         raise ServerAuthError("not_lock_holder") from None
-    rows = _flock_write_lines(proc_locks)
-    if rows is None:
-        raise ServerAuthError("not_lock_holder")
+    try:
+        rows = _flock_rows(proc_locks)
+    except OSError as exc:
+        raise ServerAuthError("not_lock_holder", _detail_of(exc)) from None
     device = (os.major(st.st_dev), os.minor(st.st_dev))
     devices = {(major, minor) for _pid, major, minor, inode in rows if inode == st.st_ino}
     if devices and device not in devices:

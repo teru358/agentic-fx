@@ -98,7 +98,11 @@ def test_a_lan_bind_serves_only_its_own_host_and_nothing_on_loopback(root, daemo
     assert bind_lan == bind_any == [-1, EPERM]
     assert listen == relisten == [-1, EPERM]
     # 隔離後に保持している fd は {0,1,2,listener} だけで、子 process も残っていない
-    assert fds["fds"] == sorted({0, 1, 2, fds["listener"]}) == fds["kept"]
+    # 保持は 0/1/2・listener・procfs の pin 2 本 (O_PATH、/proc/<pid> と /proc/locks) だけ
+    assert len(fds["pins"]) == 2 and all(flag for _target, flag in fds["pins"])
+    assert sorted(t for t, _f in fds["pins"]) == ["/proc/<pid>", "/proc/locks"]
+    assert fds["fds"] == fds["kept"]
+    assert len(fds["kept"]) == 6 and {0, 1, 2, fds["listener"]} <= set(fds["kept"])
     assert fds["children"] == 0
 
 

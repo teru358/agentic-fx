@@ -142,7 +142,11 @@ def test_no_secret_fd_survives_isolation_and_nothing_identifying_is_written(root
     result = assert_finished(done)
     assert [parse(reply)[0] for reply in replies] == [401, 200]
     fds = result["after"][0]
-    assert fds["fds"] == sorted({0, 1, 2, fds["listener"]}) == fds["kept"]
+    # 保持は 0/1/2・listener・procfs の pin 2 本 (O_PATH、/proc/<pid> と /proc/locks) だけ
+    assert len(fds["pins"]) == 2 and all(flag for _target, flag in fds["pins"])
+    assert sorted(t for t, _f in fds["pins"]) == ["/proc/<pid>", "/proc/locks"]
+    assert fds["fds"] == fds["kept"]
+    assert len(fds["kept"]) == 6 and {0, 1, 2, fds["listener"]} <= set(fds["kept"])
     assert fds["children"] == 0
     output = done.stdout + done.stderr
     for canary in ("intruder-canary", "203.0.113.77", "127.0.0.1", intruder.decode(),

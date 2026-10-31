@@ -12,8 +12,13 @@
    dir から、plan が固定した名前の file だけ読む (鍵 dir と secret dir は Landlock の規則に
    入れない)。web は設定の address の listener を pre-bind + listen して検査する (accept
    はしない)。web の公開範囲 (allow / 実在する interface / secret dir) は鍵を読む前に検査する。
-2. 保持してよい fd (0/1/2、web の listener、sd_notify の fd、1 の領域の fd) 以外を全部閉じる。
-3. Landlock (領域の規則は 1 で検査した fd に付ける)。領域の fd を閉じる。
+   続けて `/proc/<pid>` と `/proc/locks` を `O_PATH` で開いて pin する (Landlock を掛ける前。
+   procfs の dentry は回収されると、Landlock の path 規則が指す inode ごと失われて
+   server 認証の読みが EACCES になる。pin はプロセス終了まで保持する)。
+2. 保持してよい fd (0/1/2、web の listener、sd_notify の fd、pin の 2 本、1 の領域の fd)
+   以外を全部閉じる。
+3. Landlock (領域の規則は 1 で検査した fd、`/proc` の規則は pin の fd に付ける。path で
+   開き直さない)。領域の fd を閉じる。
 4. 機能別 seccomp。
 5. `PR_SET_DUMPABLE=0` と自己検査。
 6. server 認証 (`wait_ready`、鍵は送らない) が通ったら `READY=1` を送る。成否に依らず
@@ -45,10 +50,10 @@ from typing import TYPE_CHECKING, TypeVar
 
 import afx_ops
 from afx_ops import keys
-from afx_ops.api_client import RC_UNREACHABLE, ApiError, Endpoint, wait_ready
+from afx_ops.api_client import RC_UNREACHABLE, ApiError, Endpoint, wait_ready, with_detail
 from afx_ops.isolation import bpf, landlock
 from afx_ops.isolation._libc import libc as _libc
-from afx_ops import interfaces
+from afx_ops import interfaces, server_auth
 from afx_ops.isolation.accept_loop import (
     LOOPBACK,
     ListenerError,
@@ -74,6 +79,7 @@ REASONS = (
     "secrets_failed",
     "listener_invalid",
     "fd_close_failed",
+    "proc_pin_failed",
     "landlock_abi_too_old",
     "landlock_failed",
     "seccomp_failed",
@@ -134,10 +140,12 @@ _PR_SET_DUMPABLE = 4
 
 
 class StartupError(Exception):
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", *, shape: str = "") -> None:
         assert reason in REASONS, reason
         super().__init__(reason if not detail else f"{reason}: {detail}")
         self.reason = reason
+        # 終了行に添えてよい固定形 (``step=<段> errno=<n>``)。自由文の detail は出さない
+        self.shape = shape
 
 
 @dataclass(frozen=True)
@@ -148,7 +156,8 @@ class FeaturePlan:
     secret_allowed は機能の secret dir に置いてよい file 名の全部、secret_files はそのうち
     隔離前に読む必須の file 名 (dir の外は指せない)。web の必須集合は検証済みの auth だけから
     決まる (`auth = "basic"` のとき `web.password`、`none` のとき空)。
-    保持 fd は 0/1/2 と listener と sd_notify の fd だけで、追加の Landlock 規則は無い。
+    保持 fd は 0/1/2 と listener と sd_notify の fd と procfs の pin 2 本 (`/proc/<pid>`、`/proc/locks`)
+    で、追加の Landlock 規則は無い。
     """
 
     feature: str
@@ -449,7 +458,8 @@ def dns_tls_rules() -> list[landlock.PathRule]:
     return rules
 
 
-def landlock_plan(plan: StartupPlan, proc: str, dirs: PreparedDirs) -> landlock.LandlockPlan:
+def landlock_plan(plan: StartupPlan, proc: str, dirs: PreparedDirs,
+                  pins: ProcPins | None = None) -> landlock.LandlockPlan:
     rules = runtime_rules()
     # 領域の規則は path を開き直さず、検査済みの fd に付ける (検査後の symlink 差し替えで
     # 別の dir に許可が移らないように)
@@ -458,15 +468,19 @@ def landlock_plan(plan: StartupPlan, proc: str, dirs: PreparedDirs) -> landlock.
     if plan.feature in ("bot", "notify"):
         rules += dns_tls_rules()
     # server 認証の /proc 規則: /proc/locks の leaf と、自 pid の dir だけ
-    rules.append(landlock.PathRule("/proc/locks", landlock.ACCESS_FS_READ_FILE))
-    rules.append(landlock.PathRule(proc, landlock.READ))
+    # (pin した fd に付ける。path で開き直すと pin と別の inode になり得る)
+    rules.append(landlock.PathRule("/proc/locks", landlock.ACCESS_FS_READ_FILE,
+                                   fd=None if pins is None else pins.locks_fd))
+    rules.append(landlock.PathRule(proc, landlock.READ,
+                                   fd=None if pins is None else pins.proc_fd))
     ports = plan.connect_ports if plan.feature in ("bot", "notify") else ()
     return landlock.LandlockPlan(path_rules=tuple(rules), connect_ports=tuple(ports))
 
 
-def apply_landlock(plan: StartupPlan, proc: str, dirs: PreparedDirs) -> None:
+def apply_landlock(plan: StartupPlan, proc: str, dirs: PreparedDirs,
+                   pins: ProcPins | None = None) -> None:
     try:
-        landlock.apply(landlock_plan(plan, proc, dirs))
+        landlock.apply(landlock_plan(plan, proc, dirs, pins))
     except landlock.LandlockError as exc:
         raise StartupError(exc.reason, str(exc)) from None
     except OSError as exc:
@@ -517,6 +531,33 @@ def self_check(proc: str, *, filters_before: int, keep: Iterable[int]) -> None:
         raise StartupError("self_check_fds", f"{sorted(fds)}")
     if tasks != 1:
         raise StartupError("self_check_threads", str(tasks))
+
+
+@dataclass(frozen=True)
+class ProcPins:
+    """`/proc/<pid>` と `/proc/locks` の `O_PATH` fd。プロセス終了まで閉じない。"""
+
+    proc_fd: int
+    locks_fd: int
+
+    def fds(self) -> set[int]:
+        return {self.proc_fd, self.locks_fd}
+
+
+def pin_proc(proc: str) -> ProcPins:
+    """server 認証が隔離後に読む 2 つの procfs の inode を fd で握る (dentry 回収対策)。"""
+    opened: list[int] = []
+    steps = ("pin_proc", "pin_locks")
+    try:
+        for path in (proc, str(server_auth.PROC_LOCKS)):
+            opened.append(os.open(path, os.O_PATH | os.O_CLOEXEC))
+    except OSError as exc:
+        step = steps[len(opened)]
+        for fd in opened:
+            os.close(fd)
+        raise StartupError("proc_pin_failed", str(exc.errno),
+                           shape=server_auth.step_detail(step, exc.errno)) from None
+    return ProcPins(proc_fd=opened[0], locks_fd=opened[1])
 
 
 @dataclass
@@ -975,7 +1016,9 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
                 except (ListenerError, OSError) as exc:
                     raise StartupError("listener_invalid", str(exc)) from None
                 cleanup.callback(listener.close)
-            keep = {0, 1, 2}
+            pins = pin_proc(proc)
+            cleanup.callback(_close_all, pins.fds())
+            keep = {0, 1, 2} | pins.fds()
             if listener is not None:
                 keep.add(listener.fileno())
             if notify is not None:
@@ -985,7 +1028,7 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
                 filters_before = filter_count(proc)
             except (OSError, ValueError) as exc:
                 raise StartupError("self_check_unreadable", type(exc).__name__) from None
-            apply_landlock(plan, proc, dirs)
+            apply_landlock(plan, proc, dirs, pins)
         finally:
             dirs.close()
         apply_seccomp(compiled)
@@ -1000,6 +1043,12 @@ def isolate(plan: StartupPlan, config: OpsConfig, *,
                             state_dir=plan.state_dir)
         cleanup.pop_all()
         return isolated, notify
+
+
+def _close_all(fds: Iterable[int]) -> None:
+    for fd in fds:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _no_preload() -> None:
@@ -1028,10 +1077,11 @@ def run(plan: StartupPlan, config: OpsConfig, body: Callable[[Isolated], int], *
                                       release_config_dir=owner.close)
             announce_ready(notify, isolated.endpoint, wait=wait)
     except StartupError as exc:
-        reason = exc.reason
-        rc = RC_RUNTIME_IMPORT_FAILED if reason == "runtime_import_failed" else RC_ISOLATION_FAILED
+        reason = with_detail(exc.reason, exc.shape)
+        rc = (RC_RUNTIME_IMPORT_FAILED if exc.reason == "runtime_import_failed"
+              else RC_ISOLATION_FAILED)
     except ApiError as exc:
-        reason, rc = exc.reason, RC_UNREACHABLE
+        reason, rc = with_detail(exc.reason, exc.detail), RC_UNREACHABLE
     except Exception as exc:  # 想定外の失敗も traceback (path や値を含み得る) にせず固定語で閉じる
         reason = "config_invalid" if getattr(exc, "reason", None) == "config_invalid" else \
             "startup_internal_error"
