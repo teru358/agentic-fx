@@ -113,7 +113,7 @@
   - **各 k の検査**: 全 k の run で 契約 run と同じ全 NaN 検査を当て、どれかで全列が全 NaN になれば `output_not_finite` で reject (例: `log(close - 100)` は 150 では動くが k=0.01 では全 NaN。チケット (2) の「両スケールで有限」)。本数が減るだけなら `sparse_output`。
   - **スケール分類**: 出力列ごとに price は `invariant` (k=1 と allclose rtol 1e-6) / `proportional` (k 倍と allclose) / `neither`、volume は `invariant` / `neither` (volume 比例は設けない)。2 つの k で食い違えば `neither`。いずれかの列が `neither` なら **warning** `scale_dependent` を付けて承認へ進む (reject しない。チケット (2) で決定済み。対数収益のクリップなど正当な例があり得る)。k=1 の出力を cache し、重複・類似はこの出力で行う。
 - **cache**: 配備済み indicator の k=1 出力 (列ごとの系列と分類) を親専有の `data/indicator_fixture_cache/` に置く。key = `<content_hash>-<fixture 実データ hash>-<tf>` (式や numpy の版で fixture が変われば旧 cache は自動で無効。旧世代は mission 終端で GC)。規律: directory 0700 / file 0600、`O_NOFOLLOW` + 通常ファイル + `nlink==1` の検査、temp + fsync + atomic rename、key ごとの lock、読出時に schema と content_hash を検証、sandbox の allowlist に入れない。無ければその場で同じ sandbox 経路で生成する (初回 56 本 × 4 回で約 16 秒 CPU と見積もる。sandbox 外の値で起動費は T2 で実測)。pending の indicator 候補の k=1 出力も同じ規律で cache する。
-- cache や inventory が使えないときの扱いは §2。ただし**配備済み indicator 1 本の候補起因の失敗** (その plugin 自身の `FixtureFailure`: 例外・全 NaN・壁時計超過) は環境事象ではないので、その 1 本だけを比較相手から外し、`duplicate_unavailable` warning を改善ループでも付けて候補は通す (activity に相手名と detail)。環境起因 (sandbox 不可・lock timeout) だけが retryable。
+- cache や inventory が使えないときの扱いは §2。ただし**配備済み indicator 1 本の候補起因の失敗** (その plugin 自身の `FixtureFailure`: 例外・全 NaN・壁時計超過) は環境事象ではないので、その 1 本だけを比較相手から外し、`duplicate_unavailable` warning を改善ループでも付けて候補は通す (activity に相手名と detail)。環境起因 (sandbox 不可・lock timeout) だけが retryable。approve 時の再判定 (§3.5 J6) も同じ規則 (候補起因の 1 本は外して warning、環境起因は pending のまま止める)。
 
 ### 3.5 重複と単調変換と類似
 
@@ -144,7 +144,7 @@
 検査ロジックと token 化・禁止語の閉じた語彙は新モジュール `src/agentic_fx/plugin/indicator_gate.py` に置く。通知側の語彙 (`NoticeCode`・`ALLOWED_PAIRS`) は既存の `improve_notice_codes.py` に code を足す (新モジュールで二重定義しない)。生成側 (gate)・表示側・test は同じ語彙を import する:
 
 - reject code: `symbol_in_name` / `param_price_unit` / `fixture_run_failed` / `output_not_finite` / `output_constant` / `indicator_duplicate` / `indicator_monotone_duplicate` (mode enforce のみ)
-- warning: `scale_dependent` / `indicator_monotone_duplicate` (mode warn のみ) / `indicator_similar` / `indicator_output_overlap` / `sparse_output` / `output_constant_suspect` / `legacy_symbol_name` / `indicator_redefined` / `duplicate_unavailable` (bless のみ) / `symbol_in_name` と `param_price_unit` (bless のみ: 政策検査を warning に落とした語で、reject code と同じ綴り) / `duplicate_at_approve` (approve 時の再判定で mode warn のとき: exact または単調変換が新たに成立した warning。enforce では `approve` の失敗語)
+- warning: `scale_dependent` / `indicator_monotone_duplicate` (mode warn のみ) / `indicator_similar` / `indicator_output_overlap` / `sparse_output` / `output_constant_suspect` / `legacy_symbol_name` / `indicator_redefined` / `duplicate_unavailable` (配備済み 1 本の候補起因の失敗でその 1 本を比較から外したとき: 改善ループ・submit・bless・approve 再判定とも。環境起因で比較自体ができないときは bless だけがこの warning で通り、他は retryable) / `symbol_in_name` と `param_price_unit` (bless のみ: 政策検査を warning に落とした語で、reject code と同じ綴り) / `duplicate_at_approve` (approve 時の再判定で mode warn のとき: exact または単調変換が新たに成立した warning。enforce では `approve` の失敗語)
 - `fixture_run_failed` の detail: `cpu_limit` / `timeout` / `exception` / `outputs_mismatch` / `probe_timeout` / `probe_exception`
 
 `_PluginGateVerdict(code=...)` へは上記の値を渡す (loader 系の既存リテラルは触らない: §6)。`_finalize_gate_failed` の reason は固定語だけにし、ヒットした token や相関値は親専有レポートへ別経路で出す。`last_result` の逐語形は `observation:gate_failed:<固定語>` の 1 形だけ。relation (相手名) は `last_result` に載せず族表で投影する (単一値に 2 形を同居させない)。`project_last_result` に `family_redirect` と同じ配備済み名 allowlist の分岐を足す。
@@ -243,3 +243,4 @@
 | 2026-10-31 | v0.6.1 C0 | T1 レビューの追従: param 禁止語を閉じた句の表に (bare `point` と「`price` を含む」を廃止、§3.3)、exact は共通有限 1 以上・atol 1e-12・比較不能は不一致・exact 対は単調/類似から除外・warning は全部集める (§3.5) | /code-review high (T1) の #5 / #6 / #1 / #2 | |
 | 2026-10-31 | v0.6.2 C0 | §3.7 の warning 語彙に bless 限定の `symbol_in_name` / `param_price_unit` と、approve 再判定の `duplicate_at_approve` (warn では warning、enforce では失敗語) を明示 | T3 レビュー 1 周目 (閉語彙外の語) | |
 | 2026-10-31 | v0.6.3 C0 | 配備済み 1 本の候補起因の probe 失敗は環境事象でなく、その 1 本を比較から外して `duplicate_unavailable` warning (改善ループでも候補は通す) に (§3.4)。壊れた配備済み 1 本で indicator の改善が永久停止するのを防ぐ | T3 レビュー 2 周目 #5 | |
+| 2026-10-31 | v0.6.4 C0 | `duplicate_unavailable` の注記を v0.6.3 の規則に揃え、approve 再判定にも同じ規則を明示 (§3.4 / §3.7) | T3 cr 是正の申し送り | |
