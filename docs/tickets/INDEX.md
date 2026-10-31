@@ -18,7 +18,7 @@
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (11)
+## 実装待ち (12)
 
 ### 不具合 (6)
 
@@ -31,10 +31,11 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (1)
+### 機能 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [indicator-symbol-agnostic-and-duplicate-gate](open/indicator-symbol-agnostic-and-duplicate-gate.md) | 中 | 2026-10-31 | indicator の銘柄非依存と重複を決定論 gate で検査する |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
 ### 保守 (4)
@@ -72,7 +73,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (132)
+## 設計待ち (131)
 
 ### 不具合 (72)
 
@@ -151,7 +152,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (39)
+### 機能 (38)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -164,7 +165,6 @@
 | [indicator-params-not-new-plugin](open/indicator-params-not-new-plugin.md) | 中 | 2026-10-29 | 既存の指標の params で表せる指標を新規として提出させない |
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
-| [indicator-symbol-agnostic-and-duplicate-gate](open/indicator-symbol-agnostic-and-duplicate-gate.md) | 中 | 2026-10-31 | indicator の銘柄非依存と重複を決定論 gate で検査する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |

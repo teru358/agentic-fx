@@ -1,7 +1,7 @@
 ---
 id: indicator-symbol-agnostic-and-duplicate-gate
 title: indicator の銘柄非依存と重複を決定論 gate で検査する
-status: 設計待ち
+status: 実装待ち
 priority: 中
 kind: 機能
 opened: 2026-10-31
@@ -10,7 +10,7 @@ related: [multi-input-indicator-relations, reference-symbols-as-indicator-inputs
 ---
 # [indicator-symbol-agnostic-and-duplicate-gate] indicator の銘柄非依存と重複を決定論 gate で検査する
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -20,9 +20,17 @@ related: [multi-input-indicator-relations, reference-symbols-as-indicator-inputs
 
 ## 処置案・裁定
 
+設計 C0 v0.6 (docs/superpowers/specs/2026-10-31-indicator-agnostic-duplicate-gate-design.md) で清書済み。sol / opus / terra の 3 周、実測 6 便 (配備済み 56 本) を §0.2 に記録。
+
+- 裁定: J1 grandfather (既存 indicator は遡及 reject しない) / J4 既定 warn / J5 bless でも exact 重複は reject / J6 approve 時に再判定。
+- 変更: 『相関 0.99 超で reject』は実測で否定。重複は exact 一致 + 単調変換 (Spearman 2 条件) に変更し、mode warn | enforce で扱う。
+- 検査の分離: 契約 run (本番形 tail(max_bars)) と解析 probe (N=4096、k 倍・volume 倍) を分ける。名前・param は静的検査。
+- 人間回廊: submit = enforce / bless = warn。
+
 ## 修正内容
 
 ## 経緯
 
 - 2026-10-31: 起票。
 - 2026-10-31: 状態: 設計待ち — 2026-10-31 ユーザー裁定で起票。C0 は baseline T4 / ref-literal の閉鎖後、multi-input より先
+- 2026-10-31: 状態: 実装待ち — 2026-10-31: 設計 C0 v0.6 (docs/superpowers/specs/2026-10-31-indicator-agnostic-duplicate-gate-design.md)。sol / opus / terra の 3 周、実測 6 便。ユーザー裁定 J1 grandfather / J4 既定 warn / J5 bless でも exact は reject / J6 approve 時再判定。チケット (4) の『相関 0.99 超で reject』は実測で否定され exact + 単調変換 (Spearman 2 条件) に変更
