@@ -302,6 +302,16 @@ def test_a_class_on_a_completed_mission_does_not_stop(env):
     assert (res.runs, res.stop_reason) == (3, "max_runs")
 
 
+def test_missions_that_end_without_a_proposal_are_not_failures(env):
+    # 却下や非提出で終わる mission も status は completed で、連続失敗にも
+    # backoff にも数えない。
+    sup, loop, mono, waits = make(env, [OK, OK, OK])
+    res = Repeat(sup, mono=mono, max_runs=3).run()
+    assert (res.runs, res.stop_reason) == (3, "max_runs")
+    assert waits == []
+    assert statuses(env) == ["completed"] * 3
+
+
 def test_max_turns_with_a_class_is_a_general_failure(env):
     step = {"result": result("max_turns", failure_class="resource_exhausted"),
             "db_status": "max_turns"}

@@ -84,7 +84,8 @@ def test_unfinished_mission_is_a_200_with_nulls_but_keeps_backend_and_model(ops_
     mission_id = seed(ops_env, terminal=False, runner="claude", model="opus")
     assert service(ops_env).improve_run(OPERATOR, mission_id) == {
         "id": mission_id, "backend": "claude", "model": "opus", "elapsed_sec": None,
-        "snapshot": None, "report_state": "none", "approval": None, "floor": None}
+        "snapshot": None, "report_state": "none", "approval": None,
+        "floor": None}
 
 
 def test_unknown_and_non_improve_missions_are_404(ops_env):

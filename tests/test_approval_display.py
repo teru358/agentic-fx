@@ -124,6 +124,25 @@ def test_new_format_shows_parent_section_before_claims_with_fixed_note(
                          if ln.startswith("reason="))
 
 
+def test_approval_detail_shows_deployed_comparison_and_legacy_omits_it(tmp_path):
+    comparison = {"mode": "shadow", "verdict": "not_improved", "reason": "holdout_not_exceeds",
+                  "stages": {"holdout": {"USDJPY": {
+                      "candidate": {"pf": 1.2, "trades": 40, "avg_r": 0.1,
+                                    "max_drawdown": 0.05, "win_rate": 0.5,
+                                    "total_pnl": 1.0, "evaluable": True, "x": 1},
+                      "deployed": {"pf": 1.1, "trades": 40, "avg_r": 0.05,
+                                   "max_drawdown": 0.06, "win_rate": 0.4,
+                                   "total_pnl": 0.5, "evaluable": True, "x": 1},
+                      "verdict": "not_improved"}}, "in_sample": {}}}
+    payload = _new_payload(baseline={"base_content_hash": "b" * 64,
+                                     "comparison": comparison})
+    shown = _show(tmp_path, payload)
+    assert "配備中の版 (同条件で再評価)" in shown
+    assert "base_content_hash=bbbbbbbbbbbb" in shown
+    assert "未改善 (観測のみ)" in shown
+    assert "配備中の版 (同条件で再評価)" not in _show(tmp_path, _new_payload())
+
+
 def test_no_prior_runs_and_no_backlog_are_stated(tmp_path):
     payload = _new_payload()
     payload["parent_facts"]["backlog"] = None
@@ -691,3 +710,95 @@ def test_redacted_value_shows_no_secret_after_display_text_removes_controls():
     from agentic_fx.ops import redactor
     for raw in ("sk-ab\x00cdefghijklmnopq123", "10.0.0.\x001", "/h​ome/bob"):
         assert display_text(redactor.redact_value(raw)) == "[redacted]"
+
+
+def _comparison(verdict="improved", mode="enforce", reason="holdout_exceeds"):
+    metrics = {"pf": 1.2, "trades": 40, "avg_r": 0.1, "max_drawdown": 0.05, "win_rate": 0.5,
+               "total_pnl": 1.0, "kill_switch_latches": 0, "evaluable": True}
+    stage = {"USDJPY": {"candidate": metrics, "deployed": {**metrics, "pf": 1.1},
+                        "verdict": verdict}}
+    return {"mode": mode, "verdict": verdict, "reason": reason,
+            "stages": {"in_sample": stage, "holdout": stage}}
+
+
+@pytest.mark.parametrize("verdict,mode,reason,label", [
+    ("improved", "enforce", "holdout_exceeds", "判定=改善"),
+    ("not_improved", "shadow", "x", "判定=未改善 (観測のみ)"),
+    ("unavailable", "enforce", "baseline_unhealthy", "判定=比較不能 (baseline_unhealthy)")])
+def test_the_shell_shows_the_verdict_label_hash_and_both_versions(
+        tmp_path, verdict, mode, reason, label):
+    shown = _show(tmp_path, _new_payload(baseline={
+        "base_content_hash": "b" * 64, "comparison": _comparison(verdict, mode, reason)}))
+    assert label in shown and "base_content_hash=" + "b" * 12 in shown
+    assert "in_sample USDJPY 候補" in shown and "holdout USDJPY 配備中の版" in shown
+    lines = shown.split("\n")
+    plain = [i for i, ln in enumerate(lines) if ln.startswith("holdout")][0]
+    assert plain < lines.index("配備中の版 (同条件で再評価)")
+
+
+@pytest.mark.parametrize("baseline", [
+    None, {"ref_plugin_ref": "plugins/s", "variant": "baseline"},
+    {"base_content_hash": "b" * 64}, {"comparison": "x"},
+    {"base_content_hash": "b" * 64, "comparison": {"verdict": "improved", "stages": []}}])
+def test_the_shell_shows_no_table_for_a_legacy_or_malformed_payload(tmp_path, baseline):
+    payload = _new_payload()
+    if baseline is not None:
+        payload["baseline"] = baseline
+    shown = _show(tmp_path, payload)
+    assert "配備中の版" not in shown and "警告" not in shown
+
+
+def test_the_shell_warns_only_when_the_deployed_hash_differs_from_the_comparison_base(tmp_path):
+    from agentic_fx.core.plugin_files import content_hash_of_dir
+    plugins = tmp_path / "plugins"
+    deployed = plugins / "sma_cross"
+    deployed.mkdir(parents=True)
+    (deployed / "plugin.py").write_text("x = 1\n")
+    (deployed / "config.yaml").write_text("kind: strategy\n")
+    live = content_hash_of_dir(deployed)
+    conn, cmds = _commands(tmp_path)
+    cmds.plugins_root = plugins
+    results = {}
+    for tag, base in (("stale", "b" * 64), ("fresh", live)):
+        approval_id = approvals.create(conn, kind="plugin", payload={}, now=NOW)
+        conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?", (json.dumps(
+            _new_payload(baseline={"base_content_hash": base, "comparison": _comparison()})),
+            approval_id))
+        conn.commit()
+        results[tag] = cmds.dispatch(f"approval {approval_id}")
+    assert "警告: 配備中の版の hash が比較時と異なります" in results["stale"]
+    assert "現在=" + live[:12] in results["stale"]
+    assert "警告" not in results["fresh"]
+
+
+def test_the_shell_does_not_warn_about_a_hash_mismatch_once_the_approval_is_decided(tmp_path):
+    plugins = tmp_path / "plugins"
+    deployed = plugins / "sma_cross"
+    deployed.mkdir(parents=True)
+    (deployed / "plugin.py").write_text("x = 1\n")
+    (deployed / "config.yaml").write_text("kind: strategy\n")
+    conn, cmds = _commands(tmp_path)
+    cmds.plugins_root = plugins
+    approval_id = approvals.create(conn, kind="plugin", payload={}, now=NOW)
+    conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?", (json.dumps(
+        _new_payload(baseline={"base_content_hash": "b" * 64, "comparison": _comparison()})),
+        approval_id))
+    conn.commit()
+    assert "警告: 配備中の版の hash" in cmds.dispatch(f"approval {approval_id}")
+    for status in ("approved", "rejected", "expired"):
+        conn.execute("UPDATE approval_requests SET status=? WHERE id=?", (status, approval_id))
+        conn.commit()
+        assert "警告" not in cmds.dispatch(f"approval {approval_id}")
+
+
+def test_the_shell_table_shows_eight_metrics_and_each_pair_verdict(tmp_path):
+    shown = _show(tmp_path, _new_payload(baseline={
+        "base_content_hash": "b" * 64, "comparison": _comparison()}))
+    for stage in ("in_sample", "holdout"):
+        assert f"{stage} USDJPY 判定=improved" in shown
+        for side in ("候補", "配備中の版"):
+            (line,) = [ln for ln in shown.split("\n")
+                       if ln.startswith(f"{stage} USDJPY {side}:")]
+            for key in ("pf", "trades", "win_rate", "avg_r", "max_drawdown", "total_pnl",
+                        "kill_switch_latches", "evaluable"):
+                assert f" {key}=" in line

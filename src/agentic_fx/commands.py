@@ -712,6 +712,67 @@ class Commands:
         return [cls._metrics_line(f"{prefix} {display_text(pair)}", metrics)
                 for pair, metrics in value.items()]
 
+    _COMPARISON_KEYS = ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
+                        "total_pnl", "kill_switch_latches", "evaluable")
+
+    @classmethod
+    def _comparison_metrics_line(cls, prefix: str, metrics: dict) -> str:
+        """比較表の 1 行。8 指標を固定の順で出し、値が無ければ `-`、数値でなければ不正形式。"""
+        cells = []
+        for key in cls._COMPARISON_KEYS:
+            v = metrics.get(key)
+            if v is None:
+                cells.append(f"{key}=-")
+            elif type(v) is bool:
+                cells.append(f"{key}={'True' if v else 'False'}")
+            elif type(v) is int or (type(v) is float and math.isfinite(v)):
+                cells.append(f"{key}={approval_facts.num_text(v)}")
+            else:
+                return f"{display_text(prefix)}: {approval_facts.INVALID_FORMAT_TEXT}"
+        return f"{display_text(prefix)}: " + " ".join(cells)
+
+    @classmethod
+    def _baseline_comparison_lines(cls, baseline, hash_warning=None) -> list[str]:
+        """承認 payload に保存された比較 snapshot のみを表示する。"""
+        if not isinstance(baseline, dict):
+            return []
+        comparison = baseline.get("comparison")
+        base_hash = baseline.get("base_content_hash")
+        if not isinstance(comparison, dict) or not isinstance(comparison.get("stages"), dict):
+            return []
+        verdict = comparison.get("verdict")
+        mode = comparison.get("mode")
+        labels = {"improved": "改善", "unavailable": "比較不能"}
+        if verdict == "not_improved" and mode == "shadow":
+            label = "未改善 (観測のみ)"
+        elif verdict == "unavailable":
+            label = f"比較不能 ({display_text(comparison.get('reason'))})"
+        else:
+            label = labels.get(verdict, display_text(verdict))
+        lines = ["配備中の版 (同条件で再評価)", f"判定={label}"]
+        if isinstance(base_hash, str):
+            lines.append(f"base_content_hash={display_text(base_hash[:12])}")
+        if isinstance(hash_warning, dict):
+            expected, actual = hash_warning.get("expected"), hash_warning.get("actual")
+            if isinstance(expected, str) and isinstance(actual, str):
+                lines.append("警告: 配備中の版の hash が比較時と異なります "
+                             f"(比較時={display_text(expected)} 現在={display_text(actual)})")
+        for stage in ("in_sample", "holdout"):
+            pairs = comparison["stages"].get(stage)
+            if not isinstance(pairs, dict):
+                continue
+            for pair, entry in pairs.items():
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(f"{stage} {display_text(pair)} 判定="
+                             f"{display_text(entry.get('verdict'))}")
+                for version, prefix in (("candidate", "候補"), ("deployed", "配備中の版")):
+                    metrics = entry.get(version)
+                    if isinstance(metrics, dict):
+                        lines.append(cls._comparison_metrics_line(
+                            f"{stage} {display_text(pair)} {prefix}", metrics))
+        return lines
+
     _APPROVAL_LIST_DEFAULT = 20
     _APPROVAL_LIST_MAX = 200
 
@@ -831,6 +892,20 @@ class Commands:
         ]
         lines += self._metrics_lines("in_sample", payload.get("in_sample"))
         lines += self._metrics_lines("holdout", payload.get("holdout"))
+        warning = None
+        baseline = payload.get("baseline")
+        if (row["status"] == "pending" and isinstance(baseline, dict)
+                and isinstance(payload.get("name"), str)
+                and self.plugins_root is not None):
+            try:
+                from agentic_fx.core.plugin_files import content_hash_of_dir
+                expected = baseline.get("base_content_hash")
+                actual = content_hash_of_dir(self.plugins_root / payload["name"])
+                if isinstance(expected, str) and actual != expected:
+                    warning = {"expected": expected[:12], "actual": actual[:12]}
+            except (AttributeError, OSError, ValueError):
+                pass
+        lines += self._baseline_comparison_lines(baseline, warning)
         lines += approval_facts.render_facts_lines(payload)
         # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の
         # 読み出し導線。`approval_requests.reason` は backlog の

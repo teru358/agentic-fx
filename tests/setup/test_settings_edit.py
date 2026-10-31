@@ -75,8 +75,8 @@ def test_fourteen_answers_change_exactly_twelve_lines_without_reformatting():
         58: "  freshness_max_min: 10        # これより古い quote/bar は不健全扱い",
         77: "  improve: daily               # [init] weekly | daily",
         78: "  improve_at: 03:00            # [init] weekly は \"<weekday> HH:MM\"、daily は \"HH:MM\" (表示 TZ)",
-        115: "  level: DEBUG",
-        124: "  max_connections: 5           # 同時接続。超えた接続は 503",
+        117: "  level: DEBUG",
+        126: "  max_connections: 5           # 同時接続。超えた接続は 503",
     }
     assert b"".join(
         line.encode() for number, line in enumerate(after, 1) if number not in changed

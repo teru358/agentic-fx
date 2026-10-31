@@ -39,11 +39,12 @@ def pair(name="USDJPY", trades=13, pf=1.8458377992140615, avg_r=0.30292348683466
 
 def dto(mission_id=2040, *, result="observation", reason=None, tool=11, elapsed=289,
         text=None, report_state="none", approval=None, floor=None, trigger="manual",
-        backend="codex", model="gpt-5.6-luna"):
+        backend="codex", model="gpt-5.6-luna", comparison=None):
     return {"id": mission_id, "backend": backend, "model": model, "elapsed_sec": elapsed,
             "snapshot": {"trigger": trigger, "result_code": result, "reason_code": reason,
                          "tool_calls": tool, "observation_text": text},
-            "report_state": report_state, "approval": approval, "floor": floor}
+            "report_state": report_state, "approval": approval, "floor": floor,
+            "comparison": comparison}
 
 
 def finish(result="observation", reason=None, *, tool=11, mission_id=2040, **kw):
@@ -59,8 +60,9 @@ PAIRS_WITH_HEADING = {
     ("submitted", None), ("observation", None), ("observation", "not_submitted"),
     ("observation", "demoted_recovered"), ("observation", "risk_gate_unsupported"),
     ("observation", "duplicate_logic"), ("observation", "duplicate_metrics"),
-    ("observation", "family_redirect"), ("gate_failed", "unprofitable"), ("report", None),
-    ("report", "duplicate_skipped"),
+    ("observation", "family_redirect"), ("gate_failed", "unprofitable"),
+    ("gate_failed", "not_improved"), ("gate_failed", "same_name_contract_changed"),
+    ("report", None), ("report", "duplicate_skipped"),
 }
 
 
@@ -75,7 +77,7 @@ def test_the_heading_table_is_a_plain_dict_literal_the_daemon_side_can_read_by_a
              and any(isinstance(t, ast.Name) and t.id == "IMPROVE_HEADINGS" for t in n.targets)]
     assert len(nodes) == 1 and isinstance(nodes[0].value, ast.Dict)
     keys = [ast.literal_eval(key) for key in nodes[0].value.keys]
-    assert len(keys) == len(set(keys)) == 11
+    assert len(keys) == len(set(keys)) == 13
 
 
 @pytest.mark.parametrize("result,reason,heading", [
@@ -88,6 +90,8 @@ def test_the_heading_table_is_a_plain_dict_literal_the_daemon_side_can_read_by_a
     ("observation", "duplicate_metrics", "[改善] 見送り (既存候補と同じ成績) #9"),
     ("observation", "family_redirect", "[改善] 見送り (既存系統への誘導) #9"),
     ("gate_failed", "unprofitable", "[改善] 床未達で見送り #9 (unprofitable)"),
+    ("gate_failed", "not_improved", "[改善] 配備中の版を上回らず見送り #9"),
+    ("gate_failed", "same_name_contract_changed", "[改善] 見送り #9 (同名更新の条件変更)"),
     ("report", None, "[改善] レポートを公開 #9"),
     ("report", "duplicate_skipped", "[改善] レポートを公開 #9 (duplicate_skipped)"),
 ])
@@ -542,6 +546,76 @@ def test_a_valid_dto_is_returned_with_only_the_used_keys():
     assert checked["floor"]["stages"][0]["pairs"][0]["pf"] == 1.8458377992140615
 
 
+def _holdout_dto(**over):
+    entry = {"candidate": {"pf": 1.2, "avg_r": 0.1, "trades": 40, "evaluable": True},
+             "deployed": {"pf": 1.1, "avg_r": 0.05, "trades": 38, "evaluable": True}}
+    return {"holdout": {"USDJPY": {**entry, **over}}}
+
+
+def test_improved_submission_renders_only_the_four_holdout_metrics_per_version():
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=_holdout_dto())
+    assert "配備中の版を上回りました" in text
+    assert "USDJPY 候補: pf 1.20 avg_r +0.10 取引 40 評価可能 はい" in text
+    assert "USDJPY 配備中の版: pf 1.10 avg_r +0.05 取引 38 評価可能 はい" in text
+    assert "max_drawdown" not in text and "in-sample" not in text
+
+
+def test_each_pair_gets_its_own_candidate_and_deployed_lines():
+    comparison = _holdout_dto()
+    comparison["holdout"]["EURUSD"] = comparison["holdout"]["USDJPY"]
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert text.count("候補: pf") == 2 and text.count("配備中の版: pf") == 2
+
+
+def test_many_pairs_keep_the_heading_the_approval_line_and_the_first_pairs():
+    """Without a pair cap the body overflows and the fit drops everything but the heading."""
+    comparison = _holdout_dto()
+    base = comparison["holdout"]["USDJPY"]
+    comparison["holdout"] = {f"PAIR{index:02d}": base for index in range(14)}
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert "承認 #7" in text and "配備中の版を上回りました" in text
+    assert "PAIR00 候補: pf" in text and "PAIR02 配備中の版: pf" in text
+    assert "PAIR03" not in text
+    assert "ほか 11 本" in text
+    assert text.count("候補: pf") == 3
+
+
+def test_three_pairs_or_fewer_have_no_omitted_line():
+    comparison = _holdout_dto()
+    base = comparison["holdout"]["USDJPY"]
+    comparison["holdout"] = {f"PAIR{index:02d}": base for index in range(3)}
+    text = finish("submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"},
+                  comparison=comparison)
+    assert text.count("候補: pf") == 3 and "ほか" not in text
+
+
+@pytest.mark.parametrize("result,reason,approval", [
+    ("gate_failed", "not_improved", None),
+    ("submitted", None, {"id": 7, "plugin": "s", "kind": "strategy"}),
+])
+def test_a_missing_comparison_never_renders_numbers_or_the_improved_heading(
+        result, reason, approval):
+    """shadow の not_improved / unavailable は提出されるが、daemon は comparison を返さない。"""
+    text = finish(result, reason, approval=approval, comparison=None)
+    assert "配備中の版を上回りました" not in text
+    assert "候補:" not in text and "pf " not in text
+
+
+def test_a_dto_without_the_comparison_key_is_still_valid():
+    """旧 daemon の応答 (comparison 無し) でも落ちず、比較の行は出ない。"""
+    data = dto(2050, result="submitted", approval={"id": 7, "plugin": "s", "kind": "strategy"})
+    del data["comparison"]
+    checked = validate_improve_run(data, 2050)
+    assert checked is not None and checked["comparison"] is None
+
+
+def test_a_malformed_comparison_invalidates_the_dto():
+    assert validate_improve_run(dto(2051, comparison={"holdout": []}), 2051) is None
+
+
 def test_a_pre_terminal_dto_with_null_snapshot_and_elapsed_is_valid():
     checked = validate_improve_run({**dto(2043), "snapshot": None, "elapsed_sec": None}, 2043)
     assert checked is not None and checked["snapshot"] is None
@@ -622,3 +696,31 @@ def test_a_non_object_response_is_rejected(value):
 
 def test_the_default_dto_used_by_the_negative_cases_is_itself_valid():
     assert validate_improve_run(_bad(lambda d: None), 2040) is not None
+
+
+@pytest.mark.parametrize("reason,line", [
+    ("not_improved", "配備中の版を上回らなかったため見送ります"),
+    ("same_name_contract_changed", "意味が変わる変更は新しい名前で提出する"),
+])
+def test_the_comparison_rejections_have_one_fixed_body_line_without_numbers(reason, line):
+    comparison = {"holdout": {"USDJPY": {
+        "candidate": {"pf": 9.9, "avg_r": 9.9, "trades": 999, "evaluable": True},
+        "deployed": {"pf": 1.0, "avg_r": 0.0, "trades": 1, "evaluable": True}}}}
+    text = finish("gate_failed", reason, comparison=comparison)
+    assert text.split("\n")[1].strip() == line
+    assert "9.9" not in text and "999" not in text
+
+
+def test_the_not_improved_notice_is_exactly_heading_fixed_line_and_footer():
+    text = finish("gate_failed", "not_improved", mission_id=9)
+    lines = text.split("\n")
+    assert lines[0] == "[改善] 配備中の版を上回らず見送り #9"
+    assert lines[1] == "配備中の版を上回らなかったため見送ります"
+    assert len(lines) == 3
+
+
+def test_the_same_name_notice_is_exactly_heading_fixed_line_and_footer():
+    lines = finish("gate_failed", "same_name_contract_changed", mission_id=9).split("\n")
+    assert lines[0] == "[改善] 見送り #9 (同名更新の条件変更)"
+    assert lines[1] == "意味が変わる変更は新しい名前で提出する"
+    assert len(lines) == 3

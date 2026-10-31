@@ -41,3 +41,7 @@ class ImproveRunContext:
     # `prepare()` が非空の値を書き込む実配線は T5a の仕事 (完了済み)。
     inventory: InventoryBuildResult = field(default_factory=_empty_inventory_result)
     inventory_view: dict = field(default_factory=dict)
+    # prepare 時点の settings を写した値。mission 実行中に settings が書き換わっても
+    # この mission の挙動は変わらない。直組みの既定 `off` は比較しない。
+    baseline_gate_mode: str = "off"
+    baseline_replay_wall_clock_max_sec: float = 300.0

@@ -129,6 +129,7 @@ def test_ac16_generated_improve_prompt_carries_no_change_summary_or_claims(ops_e
 
     class Ctx:
         inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        baseline_gate_mode = "off"
         staging_dir = ops_env.root / "staging"
         source_snapshot_dir = ops_env.root / "source"
 

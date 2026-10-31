@@ -63,7 +63,7 @@ STATUS_FIELDS = frozenset({"mode", "autopilot", "kill_switch", "equity", "balanc
 APPROVAL_FIELDS = frozenset({"id", "kind", "name", "content_hash", "created_at"})
 JOURNAL_FIELDS = frozenset({"approval_id", "name", "phase"})
 DETAIL_FIELDS = frozenset({"id", "kind", "status", "in_sample", "holdout", "payload_sha256",
-                           "decided_by", "decided_at", "asserted_actor", "parent_facts"})
+                           "decided_by", "decided_at", "asserted_actor", "parent_facts", "baseline"})
 # 変更内容の節を出すときは、成績を専用の節に移す
 OVERVIEW_FIELDS = DETAIL_FIELDS - {"in_sample", "holdout"}
 ACTIVITY_FIELDS = frozenset({"id", "ts", "category", "code", "ref", "state", "result_code",
@@ -172,6 +172,56 @@ def _change_is_well_formed(change: Mapping[str, object]) -> bool:
     return type(params) is dict and type(params.get("items", [])) is list
 
 
+def _baseline_section(data: Mapping[str, object]) -> str:
+    baseline = data.get("baseline")
+    if type(baseline) is not dict or type(baseline.get("comparison")) is not dict:
+        return ""
+    comparison = baseline["comparison"]
+    stages = comparison.get("stages")
+    if type(stages) is not dict:
+        return ""
+    verdict = comparison.get("verdict")
+    if verdict == "not_improved" and comparison.get("mode") == "shadow":
+        label = "未改善 (観測のみ)"
+    elif verdict == "unavailable":
+        label = "比較不能 (" + _text(comparison.get("reason")) + ")"
+    elif verdict == "improved":
+        label = "改善"
+    else:
+        label = _text(verdict)
+    rows = ["<p>判定: " + label + "</p>"]
+    value = baseline.get("base_content_hash")
+    if type(value) is str:
+        rows.append("<p>base_content_hash: " + _text(value[:12]) + "</p>")
+    warning = data.get("baseline_hash_warning")
+    if type(warning) is dict and type(warning.get("expected")) is str and type(warning.get("actual")) is str:
+        rows.append("<p>警告: 配備中の版の hash が比較時と異なります (比較時="
+                    + _text(warning["expected"]) + " 現在=" + _text(warning["actual"]) + ")</p>")
+    for stage in ("in_sample", "holdout"):
+        pairs = stages.get(stage)
+        if type(pairs) is not dict:
+            continue
+        rows.append("<h3>" + html.escape(stage) + "</h3><table><thead><tr>"
+                    "<th>pair</th><th>version</th><th>pf</th><th>trades</th>"
+                    "<th>win_rate</th><th>avg_r</th><th>max_drawdown</th>"
+                    "<th>total_pnl</th><th>kill_switch_latches</th><th>evaluable</th>"
+                    "<th>verdict</th></tr></thead><tbody>")
+        for pair, entry in list(pairs.items())[:MAX_ITEMS]:
+            if type(entry) is not dict:
+                continue
+            for version, label_ in (("candidate", "候補"), ("deployed", "配備中の版")):
+                metrics = entry.get(version)
+                if type(metrics) is not dict:
+                    continue
+                cells = "".join("<td>" + _text(metrics.get(key)) + "</td>" for key in
+                                ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
+                                 "total_pnl", "kill_switch_latches", "evaluable"))
+                rows.append("<tr><td>" + _text(pair) + "</td><td>" + label_ + "</td>" + cells
+                            + "<td>" + _text(entry.get("verdict")) + "</td></tr>")
+        rows.append("</tbody></table>")
+    return "<section><h2>配備中の版 (同条件で再評価)</h2>" + "".join(rows) + "</section>"
+
+
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
     """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
     change = data.get("change") if type(data.get("change")) is dict else None
@@ -179,14 +229,16 @@ def render_approval(data: Mapping[str, object], change_data: Mapping[str, object
         change = change_data["change"]
     if change is None:
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>")
+                + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>"
+                + _baseline_section(data))
         return _page("Approval", body)
     if not _change_is_well_formed(change):
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>")
+                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>"
+                + _baseline_section(data))
         return _page("Approval", body)
-    return compose_approval_page(
-        data, change, change_data if type(change_data) is dict else None).page
+    return compose_approval_page(data, change, change_data if type(change_data) is dict else None,
+                                 extra_html=_baseline_section(data)).page
 
 
 # ---------------------------------------------------------------- 承認の変更内容
@@ -474,10 +526,12 @@ class ApprovalPage:
 
 
 def compose_approval_page(data: Mapping[str, object], change: Mapping[str, object],
-                          change_data: Mapping[str, object] | None) -> ApprovalPage:
+                          change_data: Mapping[str, object] | None,
+                          extra_html: str = "") -> ApprovalPage:
     """5 節 (概要・params の差分・成績・申告・変更 diff) を組み、ページ全体を 64 KiB 未満に収める。
     diff は 48 KiB 以下、それ以外 (骨格を含む) は 15 KiB 以下。超えるときは params の差分 →
-    申告 → 親の記録 の順で省略する。"""
+    申告 → 親の記録 の順で省略する。``extra_html`` は末尾に足す節で、予算の配分には数えないが、
+    ページ全体の上限には含める。"""
     claims = change_data.get("claims") if change_data and type(change_data.get("claims")) is dict else {}
     summary = claims.get("summary", change.get("summary"))
     rationale = claims.get("selection_rationale")
@@ -506,8 +560,8 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
         if skeleton + _bytes(others) + frame <= OTHER_BUDGET_BYTES:
             break
     body = others + (diff_html if diff_body else "")
-    page = _document("Approval", body)
-    other_bytes = len(page) - diff_bytes
+    other_bytes = len(_document("Approval", body)) - diff_bytes
+    page = _document("Approval", body + extra_html)
     if len(page) >= PAGE_LIMIT_BYTES:
         page = _page("Approval", "<p>Output clipped</p>")
     return ApprovalPage(page, diff_bytes, other_bytes, plans)

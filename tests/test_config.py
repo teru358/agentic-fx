@@ -1164,3 +1164,30 @@ def test_notify_improve_events_false_is_accepted():
     raw = load_settings(EXAMPLE).model_dump()
     raw["notify"]["improve_events"] = False
     assert Settings.model_validate(raw).notify.improve_events is False
+
+
+def test_baseline_gate_settings_defaults_and_example():
+    from agentic_fx.config import ImproveSettings
+
+    s = ImproveSettings()
+    assert s.baseline_gate == "shadow"
+    assert s.baseline_replay_wall_clock_max_sec == 300
+    ex = load_settings(EXAMPLE).improve
+    assert ex.baseline_gate == "shadow"
+    assert ex.baseline_replay_wall_clock_max_sec == 300
+
+
+@pytest.mark.parametrize("value", ["off", "Shadow", "ENFORCE", True, 0, None])
+def test_baseline_gate_rejects_other_modes(value):
+    from agentic_fx.config import ImproveSettings
+
+    with pytest.raises(ValidationError):
+        ImproveSettings(baseline_gate=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "300"])
+def test_baseline_replay_wall_clock_rejects_bad_values(value):
+    from agentic_fx.config import ImproveSettings
+
+    with pytest.raises(ValidationError):
+        ImproveSettings(baseline_replay_wall_clock_max_sec=value)

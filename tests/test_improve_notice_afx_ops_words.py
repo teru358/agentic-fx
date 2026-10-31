@@ -58,3 +58,25 @@ def test_every_key_of_the_afx_ops_table_is_an_allowed_pair():
 @_NEEDS_TABLE
 def test_every_pair_with_a_dedicated_heading_is_in_the_afx_ops_table():
     assert set(codes.PAIRS_WITH_DEDICATED_HEADING) <= set(_TABLE)
+
+
+def _heading_texts(path: Path = RENDER) -> dict:
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+        if (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(value, ast.Dict)
+                and any(isinstance(t, ast.Name) and t.id == "IMPROVE_HEADINGS"
+                        for t in (node.targets if isinstance(node, ast.Assign) else [node.target]))):
+            return {ast.literal_eval(k): ast.literal_eval(v)
+                    for k, v in zip(value.keys, value.values)}
+    raise AssertionError("IMPROVE_HEADINGS not found")
+
+
+@_NEEDS_TABLE
+@pytest.mark.parametrize("notice,fixed_words", [
+    (codes.NOTICE_NOT_IMPROVED, "配備中の版を上回らず見送り"),
+    (codes.NOTICE_SAME_NAME_CONTRACT_CHANGED, "同名更新の条件変更"),
+])
+def test_the_two_comparison_words_are_allowed_and_have_their_fixed_headings(notice, fixed_words):
+    pair = (notice.result_code, notice.reason_code)
+    assert pair in codes.ALLOWED_PAIRS and pair in codes.PAIRS_WITH_DEDICATED_HEADING
+    assert fixed_words in _heading_texts()[pair]

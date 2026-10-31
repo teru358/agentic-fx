@@ -54,6 +54,7 @@ class _Ctx:
         self.staging_dir = tmp_path / "staging"
         self.source_snapshot_dir = tmp_path / "source"
         self.inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        self.baseline_gate_mode = "off"
 
 
 def _render(conn, settings, tmp_path) -> tuple[str, dict]:

@@ -21,6 +21,7 @@ import concurrent.futures
 import contextlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -323,6 +324,77 @@ def _approval_of(notice, row) -> dict | None:
     return {"id": row["id"],
             "plugin": plugin,
             "kind": display_text(kind) if isinstance(kind, str) and kind.strip() else None}
+
+
+_COMPARISON_NOTICE_KEYS = ("pf", "avg_r", "trades", "evaluable")
+
+
+def _comparison_of(notice, row) -> dict | None:
+    """提出通知に添える holdout の 4 項目。上回った (improved) ときだけ作り、
+    それ以外と旧 payload は None。in_sample と他の指標は載せない。"""
+    if notice is None or row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError, RecursionError):
+        return None
+    baseline = payload.get("baseline") if isinstance(payload, dict) else None
+    comparison = baseline.get("comparison") if isinstance(baseline, dict) else None
+    if not isinstance(comparison, dict) or comparison.get("verdict") != "improved":
+        return None
+    stages = comparison.get("stages")
+    holdout = stages.get("holdout") if isinstance(stages, dict) else None
+    if not isinstance(holdout, dict) or not holdout:
+        return None
+    pairs = {}
+    for pair, entry in holdout.items():
+        if not isinstance(pair, str) or not isinstance(entry, dict):
+            return None
+        shown = {}
+        for side in ("candidate", "deployed"):
+            metrics = entry.get(side)
+            if not isinstance(metrics, dict):
+                return None
+            if not _comparison_metrics_valid(metrics):
+                _log.warning("improve comparison metrics malformed; comparison omitted")
+                return None
+            shown[side] = {key: metrics.get(key) for key in _COMPARISON_NOTICE_KEYS}
+        pairs[pair] = shown
+    return {"holdout": pairs}
+
+
+def _is_number_or_none(value: object) -> bool:
+    return value is None or (type(value) in (int, float) and math.isfinite(value))
+
+
+def _comparison_metrics_valid(metrics: dict) -> bool:
+    """pf / avg_r は数値か None、trades は int、evaluable は bool のときだけ通す。"""
+    return (_is_number_or_none(metrics.get("pf")) and _is_number_or_none(metrics.get("avg_r"))
+            and type(metrics.get("trades")) is int and metrics["trades"] >= 0
+            and type(metrics.get("evaluable")) is bool)
+
+
+def _baseline_hash_warning(payload: dict, plugins_root: Path | None,
+                           status: object = "pending") -> dict | None:
+    """承認待ちの間だけ、比較 snapshot の基準版と現在の配備版が違うときの表示用の印を返す。
+    決定済みの承認は配備中の版が候補自身になり得るので、警告は出さない。"""
+    if status != "pending":
+        return None
+    baseline = payload.get("baseline")
+    name = payload.get("name")
+    if (not isinstance(baseline, dict) or not isinstance(name, str)
+            or not isinstance(baseline.get("base_content_hash"), str)
+            or plugins_root is None):
+        return None
+    try:
+        from agentic_fx.core.plugin_files import content_hash_of_dir
+        actual = content_hash_of_dir(plugins_root / name)
+    except (OSError, ValueError):
+        return None
+    expected = baseline["base_content_hash"]
+    if actual == expected:
+        return None
+    return {"expected": expected[:12], "actual": actual[:12]}
 
 
 def _approval_plugin_kind(conn: sqlite3.Connection, approval_id: int) -> str | None:
@@ -769,6 +841,9 @@ class OpsService:
                 "agent_claims": payload.get("agent_claims"),
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
+                "baseline": payload.get("baseline"),
+                "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root,
+                                                              row["status"]),
                 "payload_sha256": payload_sha256(row["payload_json"]),
                 "reason": (None if row["reason"] is None else
                            display_text(row["reason"], approval_facts.CLAIM_DISPLAY_LIMIT)),
@@ -861,7 +936,7 @@ class OpsService:
                 "trigger": notice["trigger"], "result_code": notice["result_code"],
                 "reason_code": notice["reason_code"], "tool_calls": notice["tool_calls"],
                 "observation_text": _notice_text(notice["observation_text"])}
-        return {"id": mission_id,
+        data = {"id": mission_id,
                 "backend": display_text(mission["runner"]),
                 "model": display_text(mission["model"]),
                 "elapsed_sec": _elapsed_sec(mission["started_at"], notice),
@@ -869,6 +944,10 @@ class OpsService:
                 "report_state": report_state,
                 "approval": _approval_of(notice, approval),
                 "floor": floor}
+        comparison = _comparison_of(notice, approval)
+        if comparison is not None:
+            data["comparison"] = comparison
+        return data
 
     def _floor_of(self, mission_id: int, report_state: str,
                   report_path: object) -> dict | None:

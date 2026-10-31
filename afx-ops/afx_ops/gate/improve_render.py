@@ -143,6 +143,14 @@ def _floor_allowed(snapshot: dict | None, report_state: str) -> bool:
             and snapshot["reason_code"] == "unprofitable" and report_state == "published")
 
 
+def _comparison(value: object) -> dict | None | bool:
+    if value is None:
+        return None
+    if type(value) is not dict or type(value.get("holdout")) is not dict:
+        return False
+    return {"holdout": value["holdout"]}
+
+
 def validate_improve_run(data: object, mission_id: int) -> dict | None:
     """応答 DTO が契約の型・null 条件に合えば、使うキーだけの写しを返す。反すれば None。"""
     if type(data) is not dict or not _DTO_KEYS <= set(data):
@@ -152,15 +160,16 @@ def validate_improve_run(data: object, mission_id: int) -> dict | None:
             or not (data.get("elapsed_sec") is None or _int(data["elapsed_sec"]))
             or data.get("report_state") not in REPORT_STATES):
         return None
-    snapshot, approval, floor = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
-                                 _floor(data.get("floor")))
-    if snapshot is False or approval is False or floor is False:
+    snapshot, approval, floor, comparison = (_snapshot(data.get("snapshot")), _approval(data.get("approval")),
+                                              _floor(data.get("floor")), _comparison(data.get("comparison")))
+    if snapshot is False or approval is False or floor is False or comparison is False:
         return None
     if floor is _DROP_FLOOR or not _floor_allowed(snapshot, data["report_state"]):
         floor = None
     return {"id": data["id"], "backend": data["backend"], "model": data["model"],
             "elapsed_sec": data["elapsed_sec"], "snapshot": snapshot,
-            "report_state": data["report_state"], "approval": approval, "floor": floor}
+            "report_state": data["report_state"], "approval": approval, "floor": floor,
+            "comparison": comparison}
 
 
 # ------------------------------------------------------------ 文面
@@ -247,6 +256,28 @@ def _floor_lines(floor: dict) -> list[str]:
     return lines
 
 
+def _comparison_lines(comparison: dict) -> list[str]:
+    holdout = comparison["holdout"]
+    lines = ["配備中の版を上回りました"]
+    for pair, entry in list(holdout.items())[:MAX_PAIR_LINES]:
+        if type(pair) is not str or type(entry) is not dict:
+            return []
+        for label, key in (("候補", "candidate"), ("配備中の版", "deployed")):
+            metrics = entry.get(key)
+            if type(metrics) is not dict:
+                return []
+            pf, avg_r = _number_or_none(metrics.get("pf")), _number_or_none(metrics.get("avg_r"))
+            trades, evaluable = metrics.get("trades"), metrics.get("evaluable")
+            if pf is False or avg_r is False or not _int(trades) or type(evaluable) is not bool:
+                return []
+            lines.append(f"{cut_escaped(pair, FIELD_CHARS)} {label}: pf {_pf(pf)} "
+                         f"avg_r {_avg_r(avg_r)} 取引 {trades} "
+                         f"評価可能 {'はい' if evaluable else 'いいえ'}")
+    if len(holdout) > MAX_PAIR_LINES:
+        lines.append(f"ほか {len(holdout) - MAX_PAIR_LINES} 本")
+    return lines
+
+
 def _body_lines(snapshot: dict, detail: dict) -> list[str]:
     key = (snapshot["result_code"], snapshot["reason_code"])
     if key == ("submitted", None):
@@ -260,7 +291,10 @@ def _body_lines(snapshot: dict, detail: dict) -> list[str]:
             if kind:
                 head += f" ({cut_escaped(kind, FIELD_CHARS)})"
             head += " / "
-        return [f"{head}承認 #{approval['id']}"]
+        lines = [f"{head}承認 #{approval['id']}"]
+        if detail["comparison"] is not None:
+            lines += _comparison_lines(detail["comparison"])
+        return lines
     if key == ("observation", None):
         note = cut_escaped(snapshot["observation_text"], IMPROVE_OBSERVATION_CHARS)
         return [f"agent の申告: {note or NO_NOTE}"]
@@ -270,6 +304,10 @@ def _body_lines(snapshot: dict, detail: dict) -> list[str]:
         return [_DEMOTED_LINE]
     if key == ("gate_failed", "unprofitable") and detail["floor"] is not None:
         return _floor_lines(detail["floor"])
+    if key == ("gate_failed", "not_improved"):
+        return ["配備中の版を上回らなかったため見送ります"]
+    if key == ("gate_failed", "same_name_contract_changed"):
+        return ["意味が変わる変更は新しい名前で提出する"]
     return []
 
 

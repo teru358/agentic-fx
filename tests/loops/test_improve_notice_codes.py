@@ -28,6 +28,9 @@ EXPECTED = [
      "history_source_unconfigured"),
     ("NOTICE_BACKTEST_DATA_UNAVAILABLE", "gate_failed",
      "backtest_data_unavailable"),
+    ("NOTICE_NOT_IMPROVED", "gate_failed", "not_improved"),
+    ("NOTICE_SAME_NAME_CONTRACT_CHANGED", "gate_failed",
+     "same_name_contract_changed"),
     ("NOTICE_SNAPSHOT_REJECTED", "gate_failed", "snapshot_rejected"),
     ("NOTICE_SOURCE_REJECTED", "gate_failed", "source_rejected"),
     ("NOTICE_LOADER_REJECTED", "gate_failed", "loader_rejected"),
@@ -63,6 +66,7 @@ DEDICATED = {
     ("observation", "risk_gate_unsupported"),
     ("observation", "duplicate_logic"), ("observation", "duplicate_metrics"),
     ("observation", "family_redirect"), ("gate_failed", "unprofitable"),
+    ("gate_failed", "not_improved"), ("gate_failed", "same_name_contract_changed"),
     ("report", None), ("report", "duplicate_skipped"),
 }
 

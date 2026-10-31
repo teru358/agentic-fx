@@ -113,6 +113,7 @@ def test_improve_prompt_has_no_host_or_secret_canary(tmp_path, env):
         staging_dir = tmp_path / "staging"
         source_snapshot_dir = tmp_path / "source"
         inventory_view = {"plugins": [], "pin_broken_strategies": []}
+        baseline_gate_mode = "off"
 
     loop = ImproveLoop.__new__(ImproveLoop)
     loop._settings = env
