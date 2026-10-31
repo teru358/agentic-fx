@@ -17,6 +17,21 @@ TRIGGER_SCHEDULED = "scheduled"
 TOOL_CALLS_MAX = 1_000_000
 OBSERVATION_TEXT_MAX = 2000
 
+INDICATOR_GATE_REJECT_CODES = frozenset({
+    "symbol_in_name", "param_price_unit", "fixture_run_failed",
+    "output_not_finite", "output_constant", "indicator_duplicate",
+    "indicator_monotone_duplicate",
+})
+INDICATOR_GATE_WARNING_CODES = frozenset({
+    "scale_dependent", "indicator_monotone_duplicate", "indicator_similar",
+    "indicator_output_overlap", "sparse_output", "output_constant_suspect",
+    "legacy_symbol_name", "indicator_redefined", "duplicate_unavailable",
+})
+INDICATOR_FIXTURE_FAILURE_DETAILS = frozenset({
+    "cpu_limit", "timeout", "exception", "outputs_mismatch", "probe_timeout",
+    "probe_exception",
+})
+
 
 @dataclass(frozen=True)
 class NoticeCode:
@@ -66,6 +81,14 @@ NOTICE_MAX_BARS_LIMIT = NoticeCode("gate_failed", "max_bars_limit")
 NOTICE_KIND_UNSUPPORTED = NoticeCode("gate_failed", "kind_unsupported")
 NOTICE_OUTPUTS_REQUIRED = NoticeCode("gate_failed", "outputs_required")
 NOTICE_INDICATOR_UNRESOLVED = NoticeCode("gate_failed", "indicator_unresolved")
+NOTICE_SYMBOL_IN_NAME = NoticeCode("gate_failed", "symbol_in_name")
+NOTICE_PARAM_PRICE_UNIT = NoticeCode("gate_failed", "param_price_unit")
+NOTICE_FIXTURE_RUN_FAILED = NoticeCode("gate_failed", "fixture_run_failed")
+NOTICE_OUTPUT_NOT_FINITE = NoticeCode("gate_failed", "output_not_finite")
+NOTICE_OUTPUT_CONSTANT = NoticeCode("gate_failed", "output_constant")
+NOTICE_INDICATOR_DUPLICATE = NoticeCode("gate_failed", "indicator_duplicate")
+NOTICE_INDICATOR_MONOTONE_DUPLICATE = NoticeCode(
+    "gate_failed", "indicator_monotone_duplicate")
 # plugin gate の Landlock 不可。backlog を消費する点が strategy gate の
 # failed/sandbox_unavailable (backlog を open に戻す) と異なるため別の語にする。
 NOTICE_GATE_SANDBOX_UNAVAILABLE = NoticeCode(
@@ -99,6 +122,9 @@ _ALL_NOTICES = (
     NOTICE_SELF_TEST_TOO_THIN, NOTICE_SELF_TEST_MUTATED, NOTICE_UNVERIFIED,
     NOTICE_MAX_BARS_LIMIT, NOTICE_KIND_UNSUPPORTED, NOTICE_OUTPUTS_REQUIRED,
     NOTICE_INDICATOR_UNRESOLVED, NOTICE_GATE_SANDBOX_UNAVAILABLE,
+    NOTICE_SYMBOL_IN_NAME, NOTICE_PARAM_PRICE_UNIT, NOTICE_FIXTURE_RUN_FAILED,
+    NOTICE_OUTPUT_NOT_FINITE, NOTICE_OUTPUT_CONSTANT, NOTICE_INDICATOR_DUPLICATE,
+    NOTICE_INDICATOR_MONOTONE_DUPLICATE,
     NOTICE_REPORT_WRITE_FAILED, NOTICE_SANDBOX_UNAVAILABLE, NOTICE_TIMEOUT,
     NOTICE_MAX_TURNS, NOTICE_RUNNER_FAILED, NOTICE_TOOL_BUDGET_ABORT,
     NOTICE_OUTPUT_INVALID, NOTICE_APPROVAL_TX_FAILED, NOTICE_COMMIT_CRASHED,
@@ -129,6 +155,13 @@ _PLUGIN_GATE_NOTICES = {
     "self_test_too_thin": NOTICE_SELF_TEST_TOO_THIN,
     "self_test_mutated": NOTICE_SELF_TEST_MUTATED,
     "sandbox_unavailable": NOTICE_GATE_SANDBOX_UNAVAILABLE,
+    "symbol_in_name": NOTICE_SYMBOL_IN_NAME,
+    "param_price_unit": NOTICE_PARAM_PRICE_UNIT,
+    "fixture_run_failed": NOTICE_FIXTURE_RUN_FAILED,
+    "output_not_finite": NOTICE_OUTPUT_NOT_FINITE,
+    "output_constant": NOTICE_OUTPUT_CONSTANT,
+    "indicator_duplicate": NOTICE_INDICATOR_DUPLICATE,
+    "indicator_monotone_duplicate": NOTICE_INDICATOR_MONOTONE_DUPLICATE,
 }
 PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
 

@@ -48,6 +48,14 @@ EXPECTED = [
     ("NOTICE_KIND_UNSUPPORTED", "gate_failed", "kind_unsupported"),
     ("NOTICE_OUTPUTS_REQUIRED", "gate_failed", "outputs_required"),
     ("NOTICE_INDICATOR_UNRESOLVED", "gate_failed", "indicator_unresolved"),
+    ("NOTICE_SYMBOL_IN_NAME", "gate_failed", "symbol_in_name"),
+    ("NOTICE_PARAM_PRICE_UNIT", "gate_failed", "param_price_unit"),
+    ("NOTICE_FIXTURE_RUN_FAILED", "gate_failed", "fixture_run_failed"),
+    ("NOTICE_OUTPUT_NOT_FINITE", "gate_failed", "output_not_finite"),
+    ("NOTICE_OUTPUT_CONSTANT", "gate_failed", "output_constant"),
+    ("NOTICE_INDICATOR_DUPLICATE", "gate_failed", "indicator_duplicate"),
+    ("NOTICE_INDICATOR_MONOTONE_DUPLICATE", "gate_failed",
+     "indicator_monotone_duplicate"),
     ("NOTICE_TIMEOUT", "failed", "timeout"),
     ("NOTICE_MAX_TURNS", "failed", "max_turns"),
     ("NOTICE_RUNNER_FAILED", "failed", "runner_failed"),
@@ -121,6 +129,13 @@ PLUGIN_GATE = {
     "self_test_too_thin": "NOTICE_SELF_TEST_TOO_THIN",
     "self_test_mutated": "NOTICE_SELF_TEST_MUTATED",
     "sandbox_unavailable": "NOTICE_GATE_SANDBOX_UNAVAILABLE",
+    "symbol_in_name": "NOTICE_SYMBOL_IN_NAME",
+    "param_price_unit": "NOTICE_PARAM_PRICE_UNIT",
+    "fixture_run_failed": "NOTICE_FIXTURE_RUN_FAILED",
+    "output_not_finite": "NOTICE_OUTPUT_NOT_FINITE",
+    "output_constant": "NOTICE_OUTPUT_CONSTANT",
+    "indicator_duplicate": "NOTICE_INDICATOR_DUPLICATE",
+    "indicator_monotone_duplicate": "NOTICE_INDICATOR_MONOTONE_DUPLICATE",
 }
 QUALITY = {
     "duplicate_logic": "NOTICE_DUPLICATE_LOGIC",
@@ -145,6 +160,19 @@ def test_dictionaries_are_closed_sets():
     assert codes.PLUGIN_GATE_CODES == set(PLUGIN_GATE)
     assert codes.QUALITY_CODES == set(QUALITY)
     assert len(codes.QUALITY_CODES) == 5
+
+
+def test_indicator_gate_vocabulary_is_closed_and_complete():
+    assert codes.INDICATOR_GATE_REJECT_CODES <= codes.PLUGIN_GATE_CODES
+    assert codes.INDICATOR_GATE_WARNING_CODES == {
+        "scale_dependent", "indicator_monotone_duplicate", "indicator_similar",
+        "indicator_output_overlap", "sparse_output", "output_constant_suspect",
+        "legacy_symbol_name", "indicator_redefined", "duplicate_unavailable",
+    }
+    assert codes.INDICATOR_FIXTURE_FAILURE_DETAILS == {
+        "cpu_limit", "timeout", "exception", "outputs_mismatch", "probe_timeout",
+        "probe_exception",
+    }
 
 
 @pytest.mark.parametrize("lookup", [
