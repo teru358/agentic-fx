@@ -43,6 +43,8 @@ _VIEW = {
     ],
     "pin_broken_strategies": [
         {"name": "s_old", "alias": "rsi", "reason": "pin_mismatch"}],
+    "watch_symbols": [],
+    "history_available": {},
 }
 
 
