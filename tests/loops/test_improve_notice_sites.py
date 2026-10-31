@@ -238,6 +238,7 @@ def test_every_notice_constant_is_placed_by_a_site_or_a_closed_dictionary():
         n.attr for n in ast.walk(missions_tree)
         if isinstance(n, ast.Attribute) and n.attr in _notice_names()}
     dictionary_values = (set(codes._PLUGIN_GATE_NOTICES.values())
+                         | set(codes._INDICATOR_GATE_NOTICES.values())
                          | set(codes._QUALITY_NOTICES.values())
                          | set(codes._UNEVALUABLE_NOTICES.values()))
     unplaced = {name for name in _notice_names() - referenced

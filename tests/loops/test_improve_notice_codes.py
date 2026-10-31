@@ -129,6 +129,8 @@ PLUGIN_GATE = {
     "self_test_too_thin": "NOTICE_SELF_TEST_TOO_THIN",
     "self_test_mutated": "NOTICE_SELF_TEST_MUTATED",
     "sandbox_unavailable": "NOTICE_GATE_SANDBOX_UNAVAILABLE",
+}
+INDICATOR_GATE = {
     "symbol_in_name": "NOTICE_SYMBOL_IN_NAME",
     "param_price_unit": "NOTICE_PARAM_PRICE_UNIT",
     "fixture_run_failed": "NOTICE_FIXTURE_RUN_FAILED",
@@ -146,7 +148,7 @@ QUALITY = {
 }
 
 
-@pytest.mark.parametrize("code,name", PLUGIN_GATE.items())
+@pytest.mark.parametrize("code,name", {**PLUGIN_GATE, **INDICATOR_GATE}.items())
 def test_plugin_gate_dictionary(code, name):
     assert codes.notice_for_plugin_gate(code) == getattr(codes, name)
 
@@ -158,12 +160,16 @@ def test_quality_dictionary(code, name):
 
 def test_dictionaries_are_closed_sets():
     assert codes.PLUGIN_GATE_CODES == set(PLUGIN_GATE)
+    assert codes.INDICATOR_GATE_CODES == set(INDICATOR_GATE)
     assert codes.QUALITY_CODES == set(QUALITY)
     assert len(codes.QUALITY_CODES) == 5
 
 
 def test_indicator_gate_vocabulary_is_closed_and_complete():
-    assert codes.INDICATOR_GATE_REJECT_CODES <= codes.PLUGIN_GATE_CODES
+    assert codes.INDICATOR_GATE_REJECT_CODES | codes.INDICATOR_GATE_MODE_CODES == codes.INDICATOR_GATE_CODES
+    assert codes.INDICATOR_GATE_CODES.isdisjoint(codes.PLUGIN_GATE_CODES)
+    for code in codes.INDICATOR_GATE_CODES:
+        assert codes.notice_for_plugin_gate(code).reason_code == code
     assert codes.INDICATOR_GATE_WARNING_CODES == {
         "scale_dependent", "indicator_similar",
         "indicator_output_overlap", "sparse_output", "output_constant_suspect",
