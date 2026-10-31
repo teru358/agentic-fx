@@ -145,6 +145,10 @@ def _scaled(bars: pd.DataFrame, price: float, volume: float) -> pd.DataFrame:
     return df
 
 
+def _shape(outputs: Outputs) -> dict[str, bool]:
+    return {key: isinstance(value, pd.Series) for key, value in outputs.items()}
+
+
 def run_probe(session: PluginSession, candidate: "PluginMeta", bars: pd.DataFrame, *,
               wall_clock_max_sec: float = DEFAULT_WALL_CLOCK_MAX_SEC,
               columns_per_call: int = PROBE_COLUMNS_PER_CALL,
@@ -157,6 +161,7 @@ def run_probe(session: PluginSession, candidate: "PluginMeta", bars: pd.DataFram
     The total wall clock of all calls is capped; running out, an overrun call or an
     exception is a candidate failure (``probe_timeout`` / ``probe_exception``)."""
     deadline = clock() + wall_clock_max_sec
+    bars = bars.tail(PROBE_BARS)
     groups = _groups(candidate.outputs, columns_per_call)
     runs: dict[str, Outputs] = {}
     for label, price, volume in PROBE_RUNS:
@@ -173,23 +178,35 @@ def run_probe(session: PluginSession, candidate: "PluginMeta", bars: pd.DataFram
                     # compute and validate once per scaling; later groups only read the
                     # retained result
                     payload["reuse" if gi else "retain"] = True
+                    if gi == len(groups) - 1:
+                        payload["release"] = True
             try:
                 result = session.call(payload, timeout_sec=remaining)
             except SandboxError as exc:
                 return ProbeResult(runs=runs, failure=classify_sandbox_error(exc, probe=True))
             merged.update(_to_outputs(result, df.index))
+        if label != "k1" and _shape(merged) != _shape(runs["k1"]):
+            # the same indicator must return the same outputs, in the same form, at
+            # every scaling; anything else cannot be compared or cached
+            return ProbeResult(runs=runs, failure="probe_exception")
         runs[label] = merged
     nan_runs = tuple(label for label, outs in runs.items() if outputs_all_nan(outs))
     return ProbeResult(runs=runs, all_nan_runs=nan_runs)
 
 
 def fixture_cache_entry(probe: ProbeResult) -> CacheEntry:
-    """The k=1 outputs and their scale classes, in the form the cache stores."""
+    """The k=1 outputs and their scale classes, in the form the cache stores.
+
+    A scalar is classified like a series of one value: unchanged by the scaling,
+    scaled with it, or neither."""
     base = probe.runs["k1"]
-    series = [k for k, v in base.items() if isinstance(v, pd.Series)]
     classes: dict[str, tuple[str, str]] = {}
-    if series:
-        frames = [pd.DataFrame({k: probe.runs[label][k] for k in series})
+    for is_series in (True, False):
+        keys = [k for k, v in base.items() if isinstance(v, pd.Series) == is_series]
+        if not keys:
+            continue
+        frames = [pd.DataFrame({k: (probe.runs[label][k] if is_series
+                                    else [probe.runs[label][k]]) for k in keys})
                   for label in ("k1", "k100", "k001", "vol100")]
-        classes = gate.classify_scale(*frames)
+        classes.update(gate.classify_scale(*frames))
     return CacheEntry(dict(base), classes)

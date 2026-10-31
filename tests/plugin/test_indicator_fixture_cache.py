@@ -345,11 +345,11 @@ def test_the_sandbox_allowlist_never_covers_the_cache_directory(tmp_path):
 # --- key grammar ------------------------------------------------------------------------
 
 def test_key_length_and_character_limits_are_exact():
-    assert cache.CacheKey("a" * 128, "b" * 128, "t" * 16).filename.endswith(".npz")
+    assert cache.CacheKey("a" * 64, "b" * 64, "t" * 16).filename.endswith(".npz")
     with pytest.raises(ValueError):
-        cache.CacheKey("a" * 129, D1, "1h")
+        cache.CacheKey("a" * 65, D1, "1h")
     with pytest.raises(ValueError):
-        cache.CacheKey(H, "b" * 129, "1h")
+        cache.CacheKey(H, "b" * 65, "1h")
     with pytest.raises(ValueError):
         cache.CacheKey(H, D1, "t" * 17)
     with pytest.raises(ValueError):
@@ -854,3 +854,112 @@ def test_the_real_sandbox_tests_skip_on_the_host_preflight_and_on_an_inherited_f
     assert _probe_tests_skip_reason(monkeypatch, "arch_unsupported", None) == "arch_unsupported"
     assert _probe_tests_skip_reason(monkeypatch, None, "inherited_seccomp_filter") == "inherited_seccomp_filter"
     assert _probe_tests_skip_reason(monkeypatch, None, None) is None
+
+
+# --- collection of leftovers ---------------------------------------------------------------
+
+def _age(path, seconds):
+    old = time.time() - seconds
+    os.utime(path, (old, old), follow_symlinks=False)
+
+
+def test_gc_removes_an_old_orphan_temp_file_of_the_current_generation_and_keeps_a_young_one(tmp_path):
+    build(tmp_path)
+    d = cache.cache_dir(tmp_path)
+    old = d / f"{key().stem}.tmp-1-aa"
+    young = d / f"{key().stem}.tmp-2-bb"
+    old.write_bytes(b"x")
+    young.write_bytes(b"y")
+    _age(old, 2 * 3600)
+    _age(young, 60)
+    removed = cache.gc_stale(tmp_path, D1)
+    assert old.name in removed and not old.exists()
+    assert young.exists() and path_of(tmp_path).exists()
+
+
+def test_gc_removes_an_orphan_lock_but_not_one_that_guards_an_entry_or_a_temp_file(tmp_path):
+    build(tmp_path)                                  # entry + lock
+    d = cache.cache_dir(tmp_path)
+    orphan = key(content="7" * 64)
+    (d / f"{orphan.stem}.lock").write_bytes(b"")
+    os.chmod(d / f"{orphan.stem}.lock", 0o600)
+    busy = key(content="6" * 64)
+    (d / f"{busy.stem}.lock").write_bytes(b"")
+    os.chmod(d / f"{busy.stem}.lock", 0o600)
+    (d / f"{busy.stem}.tmp-1-aa").write_bytes(b"x")  # young temp file: someone may be writing
+    removed = cache.gc_stale(tmp_path, D1)
+    names = set(os.listdir(d))
+    assert f"{orphan.stem}.lock" in removed and f"{orphan.stem}.lock" not in names
+    assert f"{key().stem}.lock" in names and f"{busy.stem}.lock" in names
+
+
+def test_one_unusable_lock_does_not_stop_the_collection_of_the_others(tmp_path):
+    build(tmp_path, key(content="1" * 64, data=D1))
+    bad = key(content="2" * 64, data=D1)
+    build(tmp_path, bad)
+    build(tmp_path, key(content="3" * 64, data=D1))
+    d = cache.cache_dir(tmp_path)
+    (d / f"{bad.stem}.lock").unlink()
+    (d / f"{bad.stem}.lock").symlink_to(tmp_path / "elsewhere")
+    result = cache.gc_stale(tmp_path, D2)
+    left = [n for n in os.listdir(d) if f"-{D1}-" in n]
+    assert result.skipped == [bad.stem]
+    assert sorted(left) == sorted([bad.filename, f"{bad.stem}.lock"])
+    assert key(content="1" * 64, data=D1).filename in result and key(content="3" * 64, data=D1).filename in result
+
+
+# --- file name length -----------------------------------------------------------------------
+
+def test_the_longest_file_names_stay_below_the_limit_even_with_a_huge_pid(tmp_path, monkeypatch):
+    k = cache.CacheKey("a" * 64, "b" * 64, "t" * 16)
+    monkeypatch.setattr(os, "getpid", lambda: 10 ** 19)
+    names = []
+    real_open = os.open
+
+    def spy(path, *a, **kw):
+        names.append(str(path))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(cache.os, "open", spy)
+    cache.write(tmp_path, k, entry())
+    assert any(".tmp-" in n for n in names)
+    assert max(len(n) for n in names) < 255
+    assert len(k.stem + ".lock") < 255 and len(k.filename) < 255
+
+
+# --- time zone, round trip on a miss, lock limit ---------------------------------------------
+
+def test_a_timezone_naive_index_is_refused_before_anything_is_written(tmp_path):
+    idx = pd.date_range("2026-01-05", periods=3, freq="1h")
+    bad = cache.CacheEntry({"a": pd.Series([1.0, 2.0, 3.0], index=idx)})
+    with pytest.raises(cache.IndicatorCacheError):
+        cache.get_or_build(tmp_path, key(), lambda: bad)
+    assert not [n for n in os.listdir(cache.cache_dir(tmp_path)) if n.endswith(".npz") or ".tmp-" in n]
+
+
+def test_a_built_entry_has_the_same_form_as_a_later_hit(tmp_path):
+    idx = pd.date_range("2026-01-05", periods=4, freq="1h", tz="Asia/Tokyo")
+    raw = cache.CacheEntry({"v": pd.Series(np.arange(4, dtype="float32"), index=idx), "s": 3},
+                           {"v": ("invariant", "neither")})
+    built, was_built = cache.get_or_build(tmp_path, key(), lambda: raw)
+    hit, was_built_again = cache.get_or_build(tmp_path, key(), lambda: raw)
+    assert was_built and not was_built_again
+    assert built.outputs["v"].dtype == "float64" and built.outputs["v"].index.tz is not None
+    assert isinstance(built.outputs["s"], float)
+    same(built, hit)
+    assert str(built.outputs["v"].index.tz) == "UTC"
+
+
+def test_waiting_for_a_key_lock_held_elsewhere_times_out(tmp_path):
+    child, release = _start_holder(tmp_path)
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(cache.IndicatorCacheLockTimeout):
+            cache.write(tmp_path, key(), entry(), lock_timeout_sec=0.4)
+        with pytest.raises(cache.IndicatorCacheLockTimeout):
+            cache.get_or_build(tmp_path, key(), entry, lock_timeout_sec=0.4)
+        assert 0.7 < time.monotonic() - t0 < 10
+    finally:
+        _finish(child, release)
+    assert issubclass(cache.IndicatorCacheLockTimeout, cache.IndicatorCacheError)
+    assert cache.DEFAULT_LOCK_TIMEOUT_SEC == 120.0

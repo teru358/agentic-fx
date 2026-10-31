@@ -300,11 +300,16 @@ def main() -> None:
                     sub_df = source.tail(dep["max_bars"]).copy(deep=True)
                     before = sub_df.copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
-                    validated = (
-                        validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
-                        if dep["plugin_name"] == "ohlcv" else
-                        validate_indicator_result(
-                            raw, df_index=sub_df.index, outputs=dep["outputs"]))
+                    try:
+                        validated = (
+                            validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
+                            if dep["plugin_name"] == "ohlcv" else
+                            validate_indicator_result(
+                                raw, df_index=sub_df.index, outputs=dep["outputs"]))
+                    except OutputsMismatchError as exc:
+                        # a dependency's mismatch is not the strategy's own: no
+                        # structured code, the traceback goes to stderr as before
+                        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
                     indicators[dep["alias"]] = {
                         key: (_align_indicator_to_main(
                             value, source=sub_df, main_index=df.index,
@@ -334,7 +339,10 @@ def main() -> None:
                     if retained is None or retain:
                         raise ValueError("no retained indicator result to reuse")
                     validated = retained
+                    if request.get("release") is True:
+                        retained = None
                 else:
+                    retained = None
                     before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
                     result = fn(df, params)
                     if kind == "indicator":

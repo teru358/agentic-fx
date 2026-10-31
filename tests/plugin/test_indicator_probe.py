@@ -203,7 +203,7 @@ def test_probe_runs_the_four_scalings_and_classifies_columns(tmp_path, settings,
     assert entry.classifications["ma"] == ("proportional", "invariant")
     assert entry.classifications["rng"] == ("invariant", "invariant")
     assert entry.classifications["vol"] == ("invariant", "neither")
-    assert "last" not in entry.classifications
+    assert entry.classifications["last"] == ("proportional", "invariant")
     k100, k1 = res.runs["k100"]["ma"], res.runs["k1"]["ma"]
     assert np.allclose(k100.dropna(), k1.dropna() * 100)
 
@@ -569,15 +569,15 @@ def test_probe_asks_the_first_group_to_retain_and_the_rest_to_reuse(bars_4096):
     outputs = tuple(f"c{i}" for i in range(19))
     fake = _FakeSession(outputs)
     probe.run_probe(fake, _fake_meta(outputs), bars_4096)
-    flags = [(p.get("retain"), p.get("reuse")) for p, _ in fake.calls]
-    assert flags == [(True, None), (None, True), (None, True)] * 4
+    flags = [(p.get("retain"), p.get("reuse"), p.get("release")) for p, _ in fake.calls]
+    assert flags == [(True, None, None), (None, True, None), (None, True, True)] * 4
 
 
 def test_a_single_group_or_undeclared_outputs_need_no_retention(bars_4096):
     for outputs in (("v",), tuple(f"c{i}" for i in range(8)), None):
         fake = _FakeSession(("v",))
         probe.run_probe(fake, _fake_meta(outputs), bars_4096)
-        assert all("retain" not in p and "reuse" not in p for p, _ in fake.calls)
+        assert all("retain" not in p and "reuse" not in p and "release" not in p for p, _ in fake.calls)
 
 
 # --- pinned details -----------------------------------------------------------------
@@ -733,3 +733,118 @@ def test_a_call_timeout_cannot_exceed_the_session_limit(tmp_path, settings, hour
         with pytest.raises(SandboxError) as err:
             session.call({"df": hourly.tail(50), "params": {}}, timeout_sec=1.0)
         assert err.value.code == "timeout" and time.monotonic() - started < 10.0
+
+
+# --- probe consistency, bounds, retention, scalar classes -----------------------------
+
+class _ShiftingSession(_FakeSession):
+    """Answers like _FakeSession, except that the run numbered ``bad_run`` differs."""
+
+    def __init__(self, outputs, bad_run, mode):
+        super().__init__(outputs)
+        self.bad_run, self.mode = bad_run, mode
+
+    def call(self, payload, *, timeout_sec=None):
+        result = super().call(payload, timeout_sec=timeout_sec)
+        if len(self.calls) - 1 == self.bad_run:
+            if self.mode == "extra":
+                result["surprise"] = [1.0] * len(payload["df"])
+            elif self.mode == "missing":
+                result.pop(next(iter(result)))
+            elif self.mode == "scalar":
+                key = next(iter(result))
+                result[key] = 1.0
+        return result
+
+
+@pytest.mark.parametrize("mode", ["extra", "missing", "scalar"])
+@pytest.mark.parametrize("bad_run", [1, 3])
+def test_a_scaled_run_with_other_keys_or_shape_than_k1_is_a_probe_exception(bars_4096, mode, bad_run):
+    fake = _ShiftingSession(("a", "b"), bad_run, mode)
+    res = probe.run_probe(fake, _fake_meta(None), bars_4096)
+    assert res.failure == "probe_exception" and not res.ok
+    assert "k1" in res.runs and list(res.runs)[-1] != ["k100", "k001", "vol100"][bad_run - 1]
+
+
+def test_a_consistent_probe_is_still_ok(bars_4096):
+    res = probe.run_probe(_FakeSession(("a", "b")), _fake_meta(None), bars_4096)
+    assert res.ok and len(res.runs) == 4
+
+
+def test_run_probe_cuts_the_bars_to_the_probe_length_itself(hourly):
+    longer = pd.concat([hourly, hourly]).iloc[-(probe.PROBE_BARS + 500):]
+    assert len(longer) > probe.PROBE_BARS
+    fake = _FakeSession(("v",))
+    probe.run_probe(fake, _fake_meta(("v",)), longer)
+    assert [len(p["df"]) for p, _ in fake.calls] == [probe.PROBE_BARS] * 4
+    assert fake.calls[0][0]["df"].index.equals(longer.index[-probe.PROBE_BARS:])
+
+
+def _scalar_probe(k1, k100, k001, vol100):
+    return probe.ProbeResult(runs={"k1": {"s": k1}, "k100": {"s": k100}, "k001": {"s": k001},
+                                   "vol100": {"s": vol100}})
+
+
+@pytest.mark.parametrize("values,expected", [
+    ((2.0, 2.0, 2.0, 2.0), ("invariant", "invariant")),
+    ((2.0, 200.0, 0.02, 2.0), ("proportional", "invariant")),
+    ((2.0, 3.0, 5.0, 7.0), ("neither", "neither")),
+    ((2.0, 200.0, 0.02, 9.0), ("proportional", "neither")),
+])
+def test_scalar_outputs_are_scale_classified_in_three_values(values, expected):
+    entry = probe.fixture_cache_entry(_scalar_probe(*values))
+    assert entry.classifications == {"s": expected}
+
+
+def test_series_and_scalar_classes_are_both_present():
+    idx = pd.date_range("2026-01-05", periods=30, freq="1h", tz="UTC")
+    base = pd.Series(np.arange(1.0, 31.0), index=idx)
+    runs = {"k1": {"v": base, "s": 2.0}, "k100": {"v": base * 100, "s": 200.0},
+            "k001": {"v": base * 0.01, "s": 0.02}, "vol100": {"v": base, "s": 2.0}}
+    entry = probe.fixture_cache_entry(probe.ProbeResult(runs=runs))
+    assert entry.classifications == {"v": ("proportional", "invariant"),
+                                     "s": ("proportional", "invariant")}
+
+
+RETAIN_RAISES_PY = """
+CALLS = []
+
+def compute(df, params):
+    CALLS.append(1)
+    if len(CALLS) == 2:
+        raise ValueError("second compute fails")
+    return {"a": df["close"], "b": df["close"] * 2.0}
+"""
+
+
+@needs_sandbox
+def test_a_failed_retain_leaves_nothing_to_reuse(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "retfail", RETAIN_RAISES_PY, outputs=("a", "b"))
+    df = bars_4096.tail(50)
+    with probe.open_session(meta, settings) as session:
+        session.call({"df": df, "params": {}, "select": ["a"], "retain": True})
+        with pytest.raises(SandboxError, match="second compute fails"):
+            session.call({"df": df, "params": {}, "select": ["a"], "retain": True})
+        with pytest.raises(SandboxError, match="no retained"):
+            session.call({"df": df, "params": {}, "select": ["b"], "reuse": True})
+
+
+@needs_sandbox
+def test_release_with_the_last_reuse_drops_the_retained_result(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "release", COUNTING_PY, outputs=COUNTING_OUTPUTS)
+    df = bars_4096.tail(50)
+    with probe.open_session(meta, settings) as session:
+        session.call({"df": df, "params": {}, "select": ["c0"], "retain": True})
+        kept = session.call({"df": df, "params": {}, "select": ["c1"], "reuse": True})
+        last = session.call({"df": df, "params": {}, "select": ["c2"], "reuse": True, "release": True})
+        with pytest.raises(SandboxError, match="no retained"):
+            session.call({"df": df, "params": {}, "select": ["c3"], "reuse": True})
+    assert set(kept) == {"c1"} and set(last) == {"c2"}
+
+
+@needs_sandbox
+def test_release_without_reuse_is_refused_by_the_parent(tmp_path, settings, bars_4096):
+    meta = make_meta(tmp_path, "relbad", OK_PY, outputs=OK_OUTPUTS)
+    with probe.open_session(meta, settings) as session:
+        with pytest.raises(SandboxError, match="release is only valid together with reuse"):
+            session.call({"df": bars_4096.tail(50), "params": {}, "release": True})

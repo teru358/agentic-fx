@@ -1131,6 +1131,21 @@ def test_indicator_failure_becomes_sandbox_error(tmp_path, plugin_settings):
             s.call({"df": _df(10), "params": {}})
 
 
+def test_a_dependency_outputs_mismatch_is_not_reported_as_the_strategys_own(
+        tmp_path, plugin_settings):
+    """The structured outputs_mismatch code belongs to an indicator's own compute
+    result; a strategy whose dependency mismatches gets a plain plugin error."""
+    root = tmp_path / "plugins"
+    wrong = _indicator_dir(root, "wrongkeys", "def compute(df, params):\n    return {'zzz': df['close']}\n")
+    meta = _meta(tmp_path, "strat-mm", "strategy", STRATEGY_READS_INDICATORS_PY,
+                 timeframe="1h", pairs=("USDJPY",))
+    resolved = _resolved(root, ("rsi", wrong, ("v",), {}, 200))
+    with PluginSession(meta, settings=plugin_settings, resolved=resolved) as s:
+        with pytest.raises(SandboxError) as err:
+            s.call({"df": _df(10), "params": {}})
+    assert err.value.detail is None and "OutputsMismatchError" in str(err.value)
+
+
 def test_self_indicator_reference_unavailable_value_error_is_a_plugin_error(
         tmp_path, plugin_settings):
     root = tmp_path / "plugins"

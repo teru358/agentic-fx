@@ -1306,7 +1306,7 @@ class PluginSession:
                 raise SandboxError("select must be a non-empty subset of the declared outputs")
             select = list(select)
             request["select"] = select
-        for flag in ("retain", "reuse"):
+        for flag in ("retain", "reuse", "release"):
             value = payload.get(flag)
             if value is None:
                 continue
@@ -1315,6 +1315,8 @@ class PluginSession:
             request[flag] = value
         if request.get("retain") and request.get("reuse"):
             raise SandboxError("retain and reuse cannot be combined")
+        if request.get("release") and not request.get("reuse"):
+            raise SandboxError("release is only valid together with reuse")
         call_timeout = self._settings.sandbox_timeout_sec
         if timeout_sec is not None:
             if (isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float))
