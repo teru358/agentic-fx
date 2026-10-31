@@ -1274,12 +1274,13 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     # (収益床の floor_mode と同じ 2 値)。
     lane = "submit" if floor_mode == "enforce" else "bless"
     static_report = None
+    inventory = None
     if meta.kind == "indicator":
-        inventory_for_static = tools_plugin_loader.approved_plugins(
+        inventory = tools_plugin_loader.approved_plugins(
             conn, plugins_root, settings=settings)
         static_report = indicator_pipeline.check_static(
             meta, candidate_dir, settings=settings,
-            deployed=inventory_for_static.inventory.by_name(name), lane=lane)
+            deployed=inventory.inventory.by_name(name), lane=lane)
         if not static_report.ok:
             raise ValueError(f"plugin {name!r}: {static_report.code}")
 
@@ -1301,8 +1302,9 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         # **ここで 1 回だけ**構築する (submit / bless の両方が通る唯一の
         # 場所)。`run_kind_gate` は `pin_mode="require"` で解決し、
         # 失敗は判別子で返る (raise しない)。
-        inventory = tools_plugin_loader.approved_plugins(
-            conn, plugins_root, settings=settings)
+        if inventory is None:
+            inventory = tools_plugin_loader.approved_plugins(
+                conn, plugins_root, settings=settings)
         outcome = approval.run_kind_gate(  # 手順 7
             conn, meta, settings=settings, now=now, floor_mode=floor_mode,
             sink=rows, inventory=inventory, pin_mode="require")
@@ -1371,12 +1373,12 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         outcome = _run_indicator_fixture_stage(
             conn, meta, name=name, lane=lane, settings=settings,
             plugins_root=plugins_root, inventory=inventory,
-            static_report=static_report, outcome=outcome)
+            static_report=static_report, outcome=outcome, activity=activity)
     return meta, after_content, after_artifact, outcome
 
 
 def _run_indicator_fixture_stage(conn, meta, *, name, lane, settings, plugins_root,
-                                 inventory, static_report, outcome):
+                                 inventory, static_report, outcome, activity=None):
     """kind=indicator の fixture 検査。改善ループと同じ関数を通り、reject は固定語の
     ValueError、結果の warning と類似の相手は `GateOutcome` に載せる。"""
     try:
@@ -1390,6 +1392,11 @@ def _run_indicator_fixture_stage(conn, meta, *, name, lane, settings, plugins_ro
                              if static_report is not None else ()))
     except indicator_pipeline.IndicatorGateUnavailable as exc:
         raise ValueError(f"plugin {name!r}: indicator_gate_unavailable") from exc
+    if activity is not None:
+        for partner, detail in report.unavailable:
+            activity.write(
+                Category.APPROVAL, "indicator_partner_unavailable",
+                f"name={name} partner={partner} detail={detail}")
     if not report.ok:
         raise ValueError(f"plugin {name!r}: {report.code}")
     return dataclass_replace(
@@ -1493,7 +1500,9 @@ def _rejudge_indicator_at_approval(conn: sqlite3.Connection, approval_id: int,
     再判定する。warn では承認画面の warning を更新し、enforce で新たに成立して
     いれば `duplicate_at_approve` で拒否する。probe 出力の参照が無い旧 payload は
     判定しない。"""
-    mode = settings.improve.indicator_duplicate_mode
+    mode = indicator_pipeline.effective_mode(
+        "bless" if payload.get("gate_lane") == "bless" else "submit",
+        settings.improve.indicator_duplicate_mode)
     inventory = tools_plugin_loader.approved_plugins(
         conn, plugins_root, settings=settings)
     try:
@@ -1516,15 +1525,17 @@ def _rejudge_indicator_at_approval(conn: sqlite3.Connection, approval_id: int,
         payload.get("similar_to"), result.similar_to)
     conn.execute("BEGIN IMMEDIATE")
     try:
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE approval_requests SET payload_json=? "
             "WHERE id=? AND status='pending'",
             (json.dumps(updated, ensure_ascii=False), approval_id))
+        written = cursor.rowcount
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    return updated
+    # no longer pending: nothing was written, so the stored payload stays as it was
+    return updated if written else payload
 
 
 def _is_superseded(conn: sqlite3.Connection, row: dict, payload: dict) -> bool:
@@ -2423,6 +2434,8 @@ def bless_candidate(
                                if outcome.resolved is not None else {}),
             **_indicator_payload_fields(outcome),
         }
+        if meta.kind == "indicator":
+            payload["gate_lane"] = "bless"
 
         if old_kind == "plain":
             # 3-B: ジャーナル無し、pending+証跡のみの 1 tx

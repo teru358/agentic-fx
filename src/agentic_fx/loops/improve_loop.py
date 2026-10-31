@@ -2091,12 +2091,9 @@ class ImproveLoop:
                                if m.name == meta.name), None),
                 lane="loop")
             if not static.ok:
-                if static.code == "symbol_in_name":
-                    return _failed_before_pytest(
-                        "symbol_in_name", code="symbol_in_name",
-                        report_detail=static.detail)
+                notice_for_plugin_gate(static.code)
                 return _failed_before_pytest(
-                    "param_price_unit", code="param_price_unit",
+                    static.code, code=static.code,
                     report_detail=static.detail)
 
         try:
@@ -2173,23 +2170,9 @@ class ImproveLoop:
             if not report.ok:
                 found = {"report_detail": report.detail,
                          "indicator_report": report}
-                if report.code == "fixture_run_failed":
-                    return _failed_after_pytest(
-                        "fixture_run_failed", code="fixture_run_failed",
-                        **found)
-                if report.code == "output_not_finite":
-                    return _failed_after_pytest(
-                        "output_not_finite", code="output_not_finite", **found)
-                if report.code == "output_constant":
-                    return _failed_after_pytest(
-                        "output_constant", code="output_constant", **found)
-                if report.code == "indicator_duplicate":
-                    return _failed_after_pytest(
-                        "indicator_duplicate", code="indicator_duplicate",
-                        **found)
+                notice_for_plugin_gate(report.code)
                 return _failed_after_pytest(
-                    "indicator_monotone_duplicate",
-                    code="indicator_monotone_duplicate", **found)
+                    report.code, code=report.code, **found)
             return _PluginGateVerdict(
                 passed=True, content_hash=content_hash_before,
                 artifact_hash=artifact_hash_before,
@@ -2826,6 +2809,16 @@ class ImproveLoop:
             Category.IMPROVE, "indicator_cache",
             f"mission={ctx.mission_id} built={report.built} "
             f"gc_removed={report.gc_removed} gc_skipped={report.gc_skipped}")
+
+    def _write_indicator_partner_activity(self, ctx, verdict) -> None:
+        """比較相手から外した配備済み indicator の名前と理由 (技術ログ)。"""
+        report = getattr(verdict, "indicator_report", None)
+        if report is None or self._activity is None:
+            return
+        for partner, detail in report.unavailable:
+            self._activity.write(
+                Category.IMPROVE, "indicator_partner_unavailable",
+                f"mission={ctx.mission_id} partner={partner} detail={detail}")
 
     @staticmethod
     def _with_relation(candidate: "_FinalCandidate | None", verdict, ctx
@@ -3677,6 +3670,7 @@ class ImproveLoop:
                         tool_calls=tool_calls)
                     return
                 self._write_indicator_cache_activity(ctx, gate_verdict)
+                self._write_indicator_partner_activity(ctx, gate_verdict)
                 # 最終 artifact の材料は staging を消す前に作る。
                 final_candidate = self._final_candidate(
                     candidate_dir, name=artifact["name"],

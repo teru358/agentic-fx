@@ -63,6 +63,9 @@ class IndicatorReport:
     gc_skipped: int = 0
     fixture_data_hash: str = ""
     fixture_timeframe: str = ""
+    # deployed partners dropped from the comparison because their own run failed:
+    # (name, parent-only detail)
+    unavailable: tuple[tuple[str, str], ...] = ()
 
 
 def _clean_warnings(items: Sequence[str]) -> tuple[str, ...]:
@@ -205,15 +208,24 @@ def _probe_entry(meta: "PluginMeta", settings: "Settings", bars: pd.DataFrame,
         with probe_mod.open_session(meta, settings.plugin) as session:
             result = probe_mod.run_probe(session, meta, bars,
                                          wall_clock_max_sec=wall_clock)
-    except (probe_mod.IndicatorEnvironmentError, probe_mod.FixtureFailure) as exc:
-        raise _BuildFailed(str(exc)) from exc
+    except probe_mod.IndicatorEnvironmentError as exc:
+        raise _BuildFailed(str(exc), environment=True) from exc
+    except probe_mod.FixtureFailure as exc:
+        raise _BuildFailed(exc.detail) from exc
     if result.failure:
         raise _BuildFailed(result.failure)
     return probe_mod.fixture_cache_entry(result)
 
 
 class _BuildFailed(Exception):
-    pass
+    """A partner's cache entry could not be built.  ``environment`` separates a
+    sandbox or cache failure (the check cannot be made) from the partner's own run
+    failing (the partner is dropped from the comparison)."""
+
+    def __init__(self, detail: str, *, environment: bool = False) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.environment = environment
 
 
 def _entry_for(data_dir: Path, key: cache.CacheKey, builder: Any, counter: list[int]
@@ -225,7 +237,7 @@ def _entry_for(data_dir: Path, key: cache.CacheKey, builder: Any, counter: list[
     try:
         entry, _built = cache.get_or_build(data_dir, key, counted)
     except (cache.IndicatorCacheError, OSError, ValueError) as exc:
-        raise _BuildFailed(type(exc).__name__) from exc
+        raise _BuildFailed(type(exc).__name__, environment=True) from exc
     return entry
 
 
@@ -281,7 +293,10 @@ def run_fixture_stage(
 
     Raises ``IndicatorGateUnavailable`` when the environment prevents the check."""
     timeframe = settings.datafeed.decision_timeframes[0]
-    bars, data_hash = canonical_bars(timeframe)
+    try:
+        bars, data_hash = canonical_bars(timeframe)
+    except (ValueError, KeyError, OSError) as exc:
+        raise IndicatorGateUnavailable("fixture_data_unavailable") from exc
     wall_clock = settings.improve.indicator_fixture_wall_clock_max_sec
     mode = effective_mode(lane, mode)
     base = dict(fixture_data_hash=data_hash, fixture_timeframe=timeframe)
@@ -325,7 +340,7 @@ def run_fixture_stage(
     try:
         entry, written = cache.get_or_build(data_dir, key, lambda: entry_built)
         counter[0] += int(written)
-    except (cache.IndicatorCacheError, OSError) as exc:
+    except (cache.IndicatorCacheError, OSError, ValueError, KeyError) as exc:
         raise IndicatorGateUnavailable("fixture_cache_unavailable") from exc
     if any("neither" in cls for cls in entry.classifications.values()):
         warnings.append(SCALE_DEPENDENT)
@@ -336,13 +351,15 @@ def run_fixture_stage(
             lambda: _probe_entry(other, settings, bars, wall_clock), counter)
 
     others: dict[str, dict[str, Any]] = {}
+    unavailable: list[tuple[str, str]] = []
     for other in _indicator_metas(deployed_metas, meta.name):
         try:
             others[other.name] = build_for(other).outputs
-        except _BuildFailed:
-            if lane != "bless":
+        except _BuildFailed as exc:
+            if exc.environment and lane != "bless":
                 raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
             warnings.append(DUPLICATE_UNAVAILABLE)
+            unavailable.append((other.name, exc.detail))
     for label, content_hash, pending_name in pending:
         if content_hash == meta.content_hash and pending_name == meta.name:
             continue    # an earlier submission of this very candidate
@@ -375,7 +392,8 @@ def run_fixture_stage(
     except (cache.IndicatorCacheError, OSError):
         gc_removed, gc_skipped = 0, 1
     common = dict(built=counter[0], gc_removed=gc_removed, gc_skipped=gc_skipped,
-                  similar_to=tuple(result.similar_to[:MAX_SIMILAR]), **base)
+                  similar_to=tuple(result.similar_to[:MAX_SIMILAR]),
+                  unavailable=tuple(unavailable), **base)
     if not result.ok:
         return IndicatorReport(
             False, result.code, warnings=_clean_warnings(warnings),
@@ -423,20 +441,25 @@ def rejudge_at_approval(
     if entry is None:
         return None
     try:
-        bars, _ = canonical_bars(timeframe)
+        bars, current_hash = canonical_bars(timeframe)
     except (ValueError, KeyError):
         return None
+    if current_hash != data_hash:
+        return None    # the payload's probe output is of an older fixture generation
     wall_clock = settings.improve.indicator_fixture_wall_clock_max_sec
     counter = [0]
     others: dict[str, dict[str, Any]] = {}
+    dropped = False
     for other in _indicator_metas(deployed_metas, name):
         try:
             others[other.name] = _entry_for(
                 data_dir, cache.CacheKey(other.content_hash, data_hash, timeframe),
                 lambda other=other: _probe_entry(other, settings, bars, wall_clock),
                 counter).outputs
-        except _BuildFailed:
-            raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
+        except _BuildFailed as exc:
+            if exc.environment:
+                raise IndicatorGateUnavailable("fixture_cache_unavailable") from None
+            dropped = True    # the partner's own run failed: leave it out
     result = gate.compare_outputs(
         entry.outputs, others, mode=mode,
         similar_corr=settings.improve.indicator_similar_corr,
@@ -444,6 +467,8 @@ def rejudge_at_approval(
     # only the two findings that approval re-judges
     keep = [row for row in result.similar_to if row["kind"] in ("duplicate", "monotone")]
     warnings: list[str] = []
+    if dropped:
+        warnings.append(DUPLICATE_UNAVAILABLE)
     if keep:
         warnings.append(DUPLICATE_AT_APPROVE)
     if any(row["kind"] == "monotone" for row in keep):
@@ -453,4 +478,4 @@ def rejudge_at_approval(
         rejected = DUPLICATE_AT_APPROVE
     return Rejudgement(warnings=_clean_warnings(warnings),
                        similar_to=tuple(keep[:MAX_SIMILAR]),
-                       rejected_code=rejected, changed=bool(keep))
+                       rejected_code=rejected, changed=bool(keep) or dropped)

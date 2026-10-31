@@ -604,14 +604,33 @@ def test_rejudge_ignores_a_payload_whose_fixture_cannot_be_rebuilt(
 
 
 @pytest.mark.parametrize("mode", ["warn", "enforce"])
-def test_rejudge_fails_retryably_when_a_deployed_cache_cannot_be_built(
+def test_rejudge_fails_retryably_when_the_sandbox_cannot_run_a_deployed_one(
+        tmp_path, monkeypatch, mode):
+    payload = _payload_after_submit(tmp_path, monkeypatch, {"cand": fakes.ratio})
+    fakes.FakeProbe({"cand": fakes.ratio, "twin": fakes.ratio}).install(monkeypatch)
+    real = pipeline.probe_mod.open_session
+
+    def flaky(meta, plugin_settings):
+        if meta.name == "twin":
+            raise pipeline.probe_mod.IndicatorEnvironmentError("sandbox_unavailable")
+        return real(meta, plugin_settings)
+
+    monkeypatch.setattr(pipeline.probe_mod, "open_session", flaky)
+    with pytest.raises(pipeline.IndicatorGateUnavailable) as raised:
+        _rejudge(tmp_path, payload, [_meta(tmp_path, "twin", "b")], mode=mode)
+    assert str(raised.value) == "fixture_cache_unavailable"
+
+
+@pytest.mark.parametrize("mode", ["warn", "enforce"])
+def test_rejudge_drops_a_deployed_one_whose_own_run_failed_and_warns(
         tmp_path, monkeypatch, mode):
     payload = _payload_after_submit(tmp_path, monkeypatch, {"cand": fakes.ratio})
     fakes.FakeProbe({"cand": fakes.ratio, "twin": fakes.ratio},
                     fail_names=frozenset({"twin"})).install(monkeypatch)
-    with pytest.raises(pipeline.IndicatorGateUnavailable) as raised:
-        _rejudge(tmp_path, payload, [_meta(tmp_path, "twin", "b")], mode=mode)
-    assert str(raised.value) == "fixture_cache_unavailable"
+    result = _rejudge(tmp_path, payload, [_meta(tmp_path, "twin", "b")], mode=mode)
+    assert result.warnings == ("duplicate_unavailable",)
+    assert result.rejected_code == "" and result.changed
+    assert result.similar_to == ()
 
 
 @pytest.mark.parametrize("exc", [cache.IndicatorCacheLockTimeout("t"),
@@ -720,3 +739,94 @@ def test_the_detail_lines_pair_each_relation_with_its_numbers():
     bare = gate.CompareResult(similar_to=(_row("a", "duplicate"),))
     assert pipeline._relation_detail(bare) == "- duplicate: a.value"
     assert pipeline._relation_detail(gate.CompareResult()) == ""
+
+
+# --- 想定外例外の分類・世代違い・候補起因の配備済み失敗 -------------------------------
+
+@pytest.mark.parametrize("exc", [ValueError("v"), KeyError("k"), OSError("o")])
+def test_a_failure_building_the_canonical_fixture_is_retryable(
+        tmp_path, monkeypatch, exc):
+    fakes.FakeProbe({"cand": fakes.ratio}).install(monkeypatch)
+
+    def broken(timeframe):
+        raise exc
+
+    monkeypatch.setattr(pipeline, "canonical_bars", broken)
+    with pytest.raises(pipeline.IndicatorGateUnavailable):
+        pipeline.run_fixture_stage(
+            _meta(tmp_path, "cand", "c"), settings=SETTINGS,
+            data_dir=tmp_path / "data", deployed_metas=[], pending=[],
+            mode="warn", lane="loop")
+
+
+@pytest.mark.parametrize("exc", [ValueError("v"), KeyError("k")])
+def test_a_foreign_error_in_the_candidates_own_cache_is_retryable(
+        tmp_path, monkeypatch, exc):
+    fakes.FakeProbe({"cand": fakes.ratio}).install(monkeypatch)
+    _fail_get_or_build(monkeypatch, exc)
+    with pytest.raises(pipeline.IndicatorGateUnavailable):
+        pipeline.run_fixture_stage(
+            _meta(tmp_path, "cand", "c"), settings=SETTINGS,
+            data_dir=tmp_path / "data", deployed_metas=[], pending=[],
+            mode="warn", lane="loop")
+
+
+@pytest.mark.parametrize("lane", ["loop", "submit", "bless"])
+def test_a_deployed_indicator_that_itself_fails_is_dropped_with_a_warning(
+        tmp_path, monkeypatch, lane):
+    report = stage(
+        tmp_path, monkeypatch, {"cand": fakes.ratio, "rsi": fakes.ratio,
+                                "ok": fakes.noise},
+        deployed=[_meta(tmp_path, "rsi", "a"), _meta(tmp_path, "ok", "b")],
+        lane=lane, probe_kw=dict(fail_names=frozenset({"rsi"})))
+    assert report.ok and "duplicate_unavailable" in report.warnings
+    assert report.unavailable == (("rsi", "probe_exception"),)
+    assert report.similar_to == ()
+
+
+def test_a_dropped_partner_is_not_compared_so_the_candidate_passes_its_twin(
+        tmp_path, monkeypatch):
+    report = stage(
+        tmp_path, monkeypatch, {"cand": fakes.ratio, "rsi": fakes.ratio},
+        deployed=[_meta(tmp_path, "rsi", "a")], lane="loop", mode="enforce",
+        probe_kw=dict(fail_names=frozenset({"rsi"})))
+    assert report.ok and report.code == ""
+
+
+def test_an_environment_failure_of_a_deployed_indicator_stays_retryable_in_the_loop(
+        tmp_path, monkeypatch):
+    deployed = [_meta(tmp_path, "rsi", "a")]
+    fakes.FakeProbe({"cand": fakes.ratio, "rsi": fakes.ratio}).install(monkeypatch)
+    real = pipeline.probe_mod.open_session
+
+    def flaky(meta, plugin_settings):
+        if meta.name == "rsi":
+            raise pipeline.probe_mod.IndicatorEnvironmentError("sandbox_unavailable")
+        return real(meta, plugin_settings)
+
+    monkeypatch.setattr(pipeline.probe_mod, "open_session", flaky)
+    with pytest.raises(pipeline.IndicatorGateUnavailable):
+        pipeline.run_fixture_stage(
+            _meta(tmp_path, "cand", "c"), settings=SETTINGS,
+            data_dir=tmp_path / "data", deployed_metas=deployed, pending=[],
+            mode="warn", lane="loop")
+
+
+def test_rejudge_skips_a_payload_of_another_fixture_generation(tmp_path, monkeypatch):
+    payload, deployed = _twin_setup(tmp_path, monkeypatch, fakes.ratio)
+    old_key = cache.CacheKey("c" * 64, payload["fixture_data_hash"], "1h")
+    entry = cache.read(tmp_path / "data", old_key)
+    assert entry is not None
+    cache.get_or_build(tmp_path / "data",
+                       cache.CacheKey("c" * 64, "e" * 64, "1h"), lambda: entry)
+    payload = {**payload, "fixture_data_hash": "e" * 64}
+    built = []
+    real = cache.get_or_build
+
+    def spy(*a, **k):
+        built.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(pipeline.cache, "get_or_build", spy)
+    assert _rejudge(tmp_path, payload, deployed, mode="enforce") is None
+    assert built == []

@@ -310,12 +310,79 @@ def test_environment_failure_is_retryable_not_a_candidate_failure(gate_env):
             {"cand": fakes.ratio}, env_error=True))
 
 
-def test_deployed_cache_build_failure_is_retryable_for_the_loop(tmp_path, gate_env):
+def test_deployed_cache_build_failure_is_retryable_for_the_loop(
+        tmp_path, gate_env, monkeypatch):
+    real = indicator_pipeline.cache.get_or_build
+
+    def wrapper(data_dir, key, builder, **kw):
+        if key.content_hash == "a" * 64:
+            raise OSError("cache unavailable")
+        return real(data_dir, key, builder, **kw)
+
+    monkeypatch.setattr(indicator_pipeline.cache, "get_or_build", wrapper)
     with pytest.raises(indicator_pipeline.IndicatorGateUnavailable):
         gate_env.run(
-            "cand", probe=fakes.FakeProbe(
-                {"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names={"rsi"}),
+            "cand", probe=fakes.FakeProbe({"cand": fakes.ratio, "rsi": fakes.ratio}),
             deployed=[_deployed(tmp_path, "rsi", "a")])
+
+
+def test_a_deployed_indicator_that_itself_fails_is_dropped_and_the_candidate_passes(
+        tmp_path, gate_env):
+    verdict = gate_env.run(
+        "cand", probe=fakes.FakeProbe(
+            {"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names={"rsi"}),
+        deployed=[_deployed(tmp_path, "rsi", "a")], mode="enforce")
+    assert verdict.passed
+    assert "duplicate_unavailable" in verdict.warnings
+    assert verdict.indicator_report.unavailable == (("rsi", "probe_exception"),)
+
+
+def test_an_unreadable_candidate_source_keeps_its_own_word(gate_env, monkeypatch):
+    monkeypatch.setattr(indicator_pipeline, "_read_identity_texts",
+                        lambda directory: None)
+    verdict = gate_env.run("cand", probe=_probe())
+    assert (verdict.passed, verdict.code) == (False, "fixture_run_failed")
+    assert verdict.code != "param_price_unit"
+    assert gate_env.events == []
+
+
+def test_an_unknown_report_word_is_refused_not_folded(gate_env, monkeypatch):
+    def odd(meta, **kw):
+        return indicator_pipeline.IndicatorReport(False, "totally_new_word")
+
+    monkeypatch.setattr(indicator_pipeline, "run_fixture_stage", odd)
+    with pytest.raises(codes.UnknownNoticeCode):
+        gate_env.run("cand", probe=_probe())
+
+
+def test_an_unknown_static_word_is_refused_not_folded(gate_env, monkeypatch):
+    def odd(*a, **kw):
+        return indicator_pipeline.IndicatorReport(False, "totally_new_word")
+
+    monkeypatch.setattr(indicator_pipeline, "check_static", odd)
+    with pytest.raises(codes.UnknownNoticeCode):
+        gate_env.run("cand", probe=_probe())
+
+
+def test_the_dropped_partner_reaches_the_activity(tmp_path, gate_env):
+    written = []
+
+    class Spy:
+        def write(self, category, event, text, *a, **k):
+            written.append((event, text))
+
+    gate_env.loop._activity = Spy()
+    verdict = gate_env.run(
+        "cand", probe=fakes.FakeProbe(
+            {"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names={"rsi"}),
+        deployed=[_deployed(tmp_path, "rsi", "a")])
+
+    class Ctx:
+        mission_id = 7
+
+    gate_env.loop._write_indicator_partner_activity(Ctx(), verdict)
+    assert written == [("indicator_partner_unavailable",
+                        "mission=7 partner=rsi detail=probe_exception")]
 
 
 def test_second_mission_builds_no_cache_for_deployed_indicators(

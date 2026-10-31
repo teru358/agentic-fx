@@ -211,11 +211,64 @@ def test_bless_lane_proceeds_with_duplicate_unavailable_when_only_a_deployed_cac
     assert "duplicate_unavailable" in outcome.gate_warnings
 
 
-def test_submit_lane_fails_retryably_when_a_deployed_cache_fails(env):
+def _fail_cache_of(monkeypatch, content_hash):
+    real = indicator_pipeline.cache.get_or_build
+
+    def wrapper(data_dir, key, builder, **kw):
+        if key.content_hash == content_hash:
+            raise OSError("cache unavailable")
+        return real(data_dir, key, builder, **kw)
+
+    monkeypatch.setattr(indicator_pipeline.cache, "get_or_build", wrapper)
+
+
+def test_submit_lane_fails_retryably_when_a_deployed_cache_cannot_be_built(
+        env, monkeypatch):
     env.deploy("rsi", "a")
-    env.install({"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names=frozenset({"rsi"}))
+    env.install({"cand": fakes.ratio, "rsi": fakes.ratio})
+    _fail_cache_of(monkeypatch, "a" * 64)
     with pytest.raises(ValueError, match="indicator_gate_unavailable"):
         env.gate("cand", floor_mode="enforce")
+
+
+def test_submit_lane_passes_with_a_warning_when_a_deployed_indicator_itself_fails(env):
+    env.deploy("rsi", "a")
+    env.install({"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names=frozenset({"rsi"}))
+    *_, outcome = env.gate("cand", floor_mode="enforce")
+    assert "duplicate_unavailable" in outcome.gate_warnings
+    assert outcome.indicator_report.unavailable == (("rsi", "probe_exception"),)
+
+
+def test_submit_writes_the_dropped_partner_and_its_detail_to_the_activity(env):
+    env.deploy("rsi", "a")
+    env.install({"cand": fakes.ratio, "rsi": fakes.ratio}, fail_names=frozenset({"rsi"}))
+    written = []
+
+    class Spy:
+        def write(self, category, event, text, *a, **k):
+            written.append((event, text))
+
+    d = env.plugins / "_human" / "cand"
+    _write(d)
+    switch._run_full_gate(
+        env.conn, d, name="cand", settings=env.settings, now=NOW,
+        floor_mode="enforce", plugins_root=env.plugins, activity=Spy())
+    assert ("indicator_partner_unavailable",
+            "name=cand partner=rsi detail=probe_exception") in written
+
+
+def test_the_inventory_is_built_once_for_an_indicator_gate(env, monkeypatch):
+    env.install({"cand": fakes.ratio})
+    calls = []
+    real = switch.tools_plugin_loader.approved_plugins
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(switch.tools_plugin_loader, "approved_plugins", counting)
+    env.gate("cand", floor_mode="enforce")
+    assert len(calls) == 1
 
 
 def test_bless_lane_fails_retryably_when_the_candidate_itself_cannot_run(env):
@@ -571,13 +624,14 @@ def _row_status(env, approval_id):
 
 
 @pytest.mark.parametrize("mode", ["warn", "enforce"])
-def test_approve_stays_pending_when_a_deployed_cache_cannot_be_built(env, mode):
+def test_approve_stays_pending_when_a_deployed_cache_cannot_be_built(
+        env, mode, monkeypatch):
     env.install({"cand": fakes.ratio, "twin": fakes.ratio})
     settings = _with_mode(env.settings, mode)
     approval_id = env.submit("cand", settings=settings)
     env.deploy("twin", "b")
-    env.install({"cand": fakes.ratio, "twin": fakes.ratio},
-                fail_names=frozenset({"twin"}))
+    env.install({"cand": fakes.ratio, "twin": fakes.ratio})
+    _fail_cache_of(monkeypatch, "b" * 64)
     with pytest.raises(ValueError, match="^indicator_gate_unavailable$") as raised:
         switch.approve_candidate(
             env.conn, approval_id, decided_by="alice", now=NOW,
@@ -658,3 +712,96 @@ def test_approve_enforce_refuses_a_monotone_twin_too(env):
             env.conn, approval_id, decided_by="alice", now=NOW,
             plugins_root=env.plugins, settings=settings)
     assert _row_status(env, approval_id) == "pending"
+
+
+# --- approve 再判定: 世代違い・由来・書込みの確認 ---------------------------------------
+
+def test_approve_does_not_rejudge_a_payload_of_another_fixture_generation(
+        env, monkeypatch):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "enforce")
+    payload = _payload(env.conn, approval_id)
+    old_key = indicator_pipeline.cache.CacheKey(
+        payload["content_hash"], payload["fixture_data_hash"],
+        payload["fixture_timeframe"])
+    entry = indicator_pipeline.cache.read(env.root / "data", old_key)
+    assert entry is not None
+    indicator_pipeline.cache.get_or_build(
+        env.root / "data", indicator_pipeline.cache.CacheKey(
+            payload["content_hash"], "f" * 64, payload["fixture_timeframe"]),
+        lambda: entry)
+    payload["fixture_data_hash"] = "f" * 64
+    built = []
+    real = indicator_pipeline.cache.get_or_build
+
+    def spy(*a, **k):
+        built.append(a)
+        return real(*a, **k)
+
+    monkeypatch.setattr(indicator_pipeline.cache, "get_or_build", spy)
+    before = env.conn.total_changes
+    assert switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings,
+        plugins_root=env.plugins) == payload
+    assert built == [] and env.conn.total_changes == before
+
+
+def test_approve_of_a_blessed_candidate_warns_and_never_refuses(env):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "enforce")
+    payload = _payload(env.conn, approval_id)
+    payload["gate_lane"] = "bless"
+    updated = switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
+    assert "duplicate_at_approve" in updated["gate_warnings"]
+    assert updated["similar_to"][0]["name"] == "twin"
+
+
+def test_approve_of_a_submitted_candidate_still_refuses_under_enforce(env):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "enforce")
+    payload = _payload(env.conn, approval_id)
+    with pytest.raises(ValueError, match="duplicate_at_approve"):
+        switch._rejudge_indicator_at_approval(
+            env.conn, approval_id, payload, settings=settings,
+            plugins_root=env.plugins)
+
+
+def test_bless_stamps_its_lane_into_the_indicator_payload(env):
+    plain = env.plugins / "cand"
+    _write(plain)
+    env.install({"cand": fakes.ratio})
+    human = env.plugins / "_human" / "cand"
+    _write(human)
+    approval_id = switch.bless_candidate(
+        env.conn, name="cand", human_dir=human, settings=env.settings,
+        now=NOW, decided_by="alice")
+    assert _payload(env.conn, approval_id)["gate_lane"] == "bless"
+
+
+def test_a_submitted_payload_has_no_bless_lane(env):
+    env.install({"cand": fakes.ratio})
+    assert "gate_lane" not in _payload(env.conn, env.submit("cand"))
+
+
+def test_a_rewrite_that_matches_no_pending_row_returns_the_stored_payload(env):
+    approval_id, settings = _submit_then_deploy_a_twin(env, "warn")
+    payload = _payload(env.conn, approval_id)
+    env.conn.execute("UPDATE approval_requests SET status='rejected' WHERE id=?",
+                     (approval_id,))
+    env.conn.commit()
+    assert switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings,
+        plugins_root=env.plugins) == payload
+
+
+@pytest.mark.parametrize("mode", ["warn", "enforce"])
+def test_approve_goes_on_when_a_deployed_indicator_itself_fails(env, mode):
+    env.install({"cand": fakes.ratio, "twin": fakes.ratio})
+    settings = _with_mode(env.settings, mode)
+    approval_id = env.submit("cand", settings=settings)
+    env.deploy("twin", "b")
+    env.install({"cand": fakes.ratio, "twin": fakes.ratio},
+                fail_names=frozenset({"twin"}))
+    updated = switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, _payload(env.conn, approval_id),
+        settings=settings, plugins_root=env.plugins)
+    assert "duplicate_unavailable" in updated["gate_warnings"]
+    assert _payload(env.conn, approval_id) == updated
