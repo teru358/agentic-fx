@@ -1,8 +1,8 @@
 ---
 id: ops-web-502-stuck-cause-unknown
 title: web が Service unavailable (502) を返し続けた原因が未確定
-status: 設計待ち
-priority: 低
+status: 実装待ち
+priority: 高
 kind: 不具合
 opened: 2026-10-30
 closed: null
@@ -10,7 +10,7 @@ related: [ops-web-head-request-loop-error]
 ---
 # [ops-web-502-stuck-cause-unknown] web が Service unavailable (502) を返し続けた原因が未確定
 
-**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
+**状態**: 実装待ち / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -25,3 +25,4 @@ related: [ops-web-head-request-loop-error]
 ## 経緯
 
 - 2026-10-30: 起票。
+- 2026-10-31: 状態: 実装待ち、優先: 高、種別: 不具合 — 原因確定 (2026-10-31): Landlock の path 規則は procfs の inode に付くため、/proc/<pid> と /proc/locks の dentry がキャッシュ回収 (メモリ逼迫、drop_caches=2) で捨てられて作り直されると規則が死ぬ。以後 fdinfo / locks の open が EACCES になり、admission が ops_requires_so_peerpidfd / not_lock_holder に固定される。規則は追加できないので再起動まで直らない。drop_caches=2 で本番 web / bot が 3 回とも 2 秒以内に壊れ、O_PATH で 2 つの path を開いたまま持つ pin 付きプロセスは生き残った (pin 無しは EACCES)。是正: 起動時に /proc/<pid> と /proc/locks を O_PATH で開いたまま保持、観測語に errno と段を添える、pidfd_pid の ENOMEM 系は transient に。

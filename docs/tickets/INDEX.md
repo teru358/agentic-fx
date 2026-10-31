@@ -21,12 +21,13 @@
 | [same-name-candidate-must-beat-deployed-baseline](open/same-name-candidate-must-beat-deployed-baseline.md) | 中 | 2026-10-29 | 同名の戦略候補は配備中の版と同条件で backtest し、改善していなければ gate で却下する |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (11)
+## 実装待ち (12)
 
-### 不具合 (6)
+### 不具合 (7)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [ops-web-502-stuck-cause-unknown](open/ops-web-502-stuck-cause-unknown.md) | 高 | 2026-10-30 | web が Service unavailable (502) を返し続けた原因が未確定 |
 | [legacy-e2e-diag](open/legacy-e2e-diag.md) | 中 | 2026-08-30 | codex 失敗の理由が stderr 最終行だけで、本当のエラーが読めない |
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
@@ -75,9 +76,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (128)
+## 設計待ち (127)
 
-### 不具合 (71)
+### 不具合 (70)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -138,7 +139,6 @@
 | [test-init-guard-order-dependent-on-fetchers](open/test-init-guard-order-dependent-on-fetchers.md) | 低 | 2026-10-25 | offline init test が test_fetchers の後では赤になる (順序依存) |
 | [test-service-app-leaks-fds](open/test-service-app-leaks-fds.md) | 低 | 2026-10-26 | tests/test_service_app.py が fd を 1100 超残し後続 test に波及する |
 | [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
-| [ops-web-502-stuck-cause-unknown](open/ops-web-502-stuck-cause-unknown.md) | 低 | 2026-10-30 | web が Service unavailable (502) を返し続けた原因が未確定 |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |
 | [backtest-scheduler-log-leak](open/backtest-scheduler-log-leak.md) | 低 |  | backtest 内部 Scheduler の `maintain_reservations failed: no c… |
 | [graceful-stop-waits-mission](open/graceful-stop-waits-mission.md) | 低 |  | graceful stop が走行中 improve mission の timeout (最大 60 分) を待つ … |
