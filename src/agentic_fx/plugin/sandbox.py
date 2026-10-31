@@ -1257,7 +1257,8 @@ class PluginSession:
             except OSError:
                 pass
 
-    def call(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def call(self, payload: dict[str, Any], *,
+             timeout_sec: float | None = None) -> dict[str, Any]:
         """1 回の plugin 呼び出し。payload は kind に応じて `df` (pandas
         DataFrame)・`params` (dict)・(strategy のみ) `indicators`/`signals`
         を含む dict。戻り値は kind 別に検証済みの dict:
@@ -1268,9 +1269,10 @@ class PluginSession:
         """
         self._check_owner_thread()
         with self._lock:
-            return self._call_locked(payload)
+            return self._call_locked(payload, timeout_sec=timeout_sec)
 
-    def _call_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call_locked(self, payload: dict[str, Any], *,
+                     timeout_sec: float | None = None) -> dict[str, Any]:
         if self._dead or self._proc is None:
             raise SandboxError(
                 "plugin session is not usable (not started, or a previous "
@@ -1292,6 +1294,21 @@ class PluginSession:
                 frame_id: _df_to_wire(frame)
                 for frame_id, frame in payload["frames"].items()
             }
+        select = payload.get("select")
+        if select is not None:
+            if (kind != "indicator" or self._meta.outputs is None
+                    or not isinstance(select, (list, tuple)) or not select
+                    or not all(isinstance(k, str) for k in select)
+                    or not set(select) <= set(self._meta.outputs)):
+                raise SandboxError("select must be a non-empty subset of the declared outputs")
+            select = list(select)
+            request["select"] = select
+        call_timeout = self._settings.sandbox_timeout_sec
+        if timeout_sec is not None:
+            if (isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float))
+                    or not math.isfinite(timeout_sec) or timeout_sec <= 0):
+                raise SandboxError(f"timeout_sec must be a finite positive number, got {timeout_sec!r}")
+            call_timeout = min(call_timeout, float(timeout_sec))
         request_id = secrets.token_hex(8)
         request["id"] = request_id
         self._check_no_stray_output()
@@ -1306,12 +1323,12 @@ class PluginSession:
 
         # 1 回の call は 1 つの deadline を書き込みと読み取りで共有する
         # (`sandbox_timeout_sec` が call 全体の上限)
-        deadline = time.monotonic() + self._settings.sandbox_timeout_sec
+        deadline = time.monotonic() + call_timeout
         try:
             self._write_line(call_line, deadline=deadline)
         except _WriteDeadlineExpired:
             # load の後なので、読取の期限切れと同じ `timeout`
-            raise self._deadline_expired(self._settings.sandbox_timeout_sec) from None
+            raise self._deadline_expired(call_timeout) from None
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
@@ -1357,7 +1374,8 @@ class PluginSession:
         # SandboxError にし、文言は worker 由来の文字列と同じ規則で整える
         try:
             if kind == "indicator":
-                return _validate_indicator_result(result, outputs=self._meta.outputs,
+                return _validate_indicator_result(result, outputs=(tuple(select) if select is not None
+                                                            else self._meta.outputs),
                                                   df_index=payload["df"].index)
             if kind == "signal":
                 return {"signals": _validate_signal_result(result)}

@@ -37,6 +37,8 @@
 - plugin_ready (worker から): `{"phase": "plugin_ready", "ok": true}` /
   `{"phase": "plugin_ready", "ok": false, "error": "<message>"}`
 - request (call() のたびに親から): `{"df": <df wire>, "params": {...}, "id": "<hex>"}`
+  indicator は任意の `"select": [出力名, ...]` を付けられ、その出力だけを返す
+  (検証は全出力に対して行う。大きな出力を列群に分けて受けるための入口)。
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
 - response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
@@ -333,6 +335,12 @@ def main() -> None:
                         if handshake.get("name") == "ohlcv" else
                         validate_indicator_result(result, df_index=df.index,
                                                   outputs=main_outputs))
+                    select = request.get("select")
+                    if select is not None:
+                        if (not isinstance(select, list) or not select
+                                or not all(isinstance(k, str) and k in validated for k in select)):
+                            raise ValueError("select must name outputs of the indicator result")
+                        validated = {k: validated[k] for k in select}
                     result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
                                       "id": request_id})
