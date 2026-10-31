@@ -13,7 +13,6 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -24,10 +23,17 @@ from agentic_fx.loops.improve_loop import ImproveLoop
 from agentic_fx.plugin import switch as plugin_switch
 from agentic_fx.runners.base import Mission, MissionResult
 from agentic_fx.runners.fake_runner import FakeRunner
-from agentic_fx.service import build_app, run_init
+from agentic_fx.service import build_app
 from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store.db import connect, connect_readonly
 
+from tests.fixtures.improve_world import (
+    FakeImproveWorkerRunner,
+    MIN3_TEST_PY as _MIN3_TEST_PY,
+    install as _install,
+    plugin_artifact as _plugin_artifact,
+    write_staging_plugin as _write_staging_plugin,
+)
 from tests.fixtures.wiring_envs import (
     activity_text as _activity_text,
     improve_env as _improve_env,
@@ -39,38 +45,7 @@ from tests.fixtures.wiring_envs import completed_result as _completed_result
 from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import _no_real_network
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 8, 22, 3, 0, tzinfo=timezone.utc)  # Sat 03:00 UTC
-
-
-class FakeImproveWorkerRunner:
-    """`agentic_fx.runners.worker_runner.WorkerRunner` の差し替え double。
-
-    `ImproveLoop.prepare()` が `WorkerRunner(root=..., settings=..., clock=...,
-    worker_profile="improve", run_context=ctx, stop_event=...)` の形で構築する
-    想定 (Task 10) に合わせ、同じ kwargs を受理し `.run(mission)` だけを
-    実装する。"""
-
-    def __init__(self, *, result: MissionResult, **kwargs) -> None:
-        self._result = result
-        self.kwargs = kwargs
-        self.missions: list[Mission] = []
-
-    def run(self, mission: Mission) -> MissionResult:
-        self.missions.append(mission)
-        return self._result
-
-
-def _plugin_artifact(name: str, *, kind: str = "indicator",
-                     self_test: str = "passed") -> dict:
-    return {
-        "discoveries": [{"idea": f"idea for {name}", "source": "agent",
-                         "evidence": "test evidence", "kind": "task"}],
-        "selected": {"backlog_id": None, "idea": f"idea for {name}"},
-        "artifact": {"type": "plugin", "name": name, "kind": kind,
-                    "self_test": self_test, "summary": f"{name} candidate"},
-        "selection_rationale": "test rationale",
-    }
 
 
 def _report_artifact(proposal_kind: str, *, title: str = "test proposal",
@@ -85,27 +60,6 @@ def _report_artifact(proposal_kind: str, *, title: str = "test proposal",
                     "title": title, "body_md": body_md},
         "selection_rationale": "test rationale",
     }
-
-
-_MIN3_TEST_PY = (
-    "def test_placeholder_a():\n    pass\n\n\n"
-    "def test_placeholder_b():\n    pass\n\n\n"
-    "def test_placeholder_c():\n    pass\n")
-
-
-def _write_staging_plugin(staging_dir: Path, name: str,
-                          plugin_py: str, config_yaml: str,
-                          test_plugin: str) -> Path:
-    """FakeImproveWorkerRunner はサブプロセスを起こさないため、`prepare()` が
-    作った staging_dir へ候補 3 本を直接置く (worker が書くはずの内容を
-    テストが代理で書く)。staging_dir は正規形
-    `plugins/_staging/<mission_id>` (D-15 是正、設計書 §2.2/§2.3) である。"""
-    candidate = staging_dir / name
-    candidate.mkdir(parents=True)
-    (candidate / "plugin.py").write_text(plugin_py, encoding="utf-8")
-    (candidate / "config.yaml").write_text(config_yaml, encoding="utf-8")
-    (candidate / "test_plugin.py").write_text(test_plugin, encoding="utf-8")
-    return candidate
 
 
 _PASSING_INDICATOR_PY = """
@@ -185,19 +139,6 @@ def test_tampers_with_plugin_source():
         f.write('def compute(df, params): return {"value": 999}')
     assert False, 'この候補はゲートで EACCES になるはず'
 """
-
-
-def _install(root: Path) -> None:
-    (root / "config").mkdir()
-    src = (_REPO_ROOT / "config" / "settings.yaml.example").read_text(
-        encoding="utf-8")
-    assert 'eval_source: "none"' in src
-    src = src.replace('eval_source: "none"', 'eval_source: "dukascopy"', 1)
-    (root / "config" / "settings.yaml.example").write_text(src)
-    with patch("agentic_fx.service.PriceProvider") as pp, \
-         patch("agentic_fx.service._check_llama_swap"):
-        pp.return_value.healthcheck.return_value = "yfinance"
-        run_init(root)
 
 
 # precheck 2026-08-22 wave2: T12-B6 T12-B8 T12-B9 T12-M1

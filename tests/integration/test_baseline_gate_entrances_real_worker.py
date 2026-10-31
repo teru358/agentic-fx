@@ -21,7 +21,7 @@ from agentic_fx.loops.improve_context import build_improve_context
 from agentic_fx.ops import client as ops_client
 from agentic_fx.ops.contracts import Principal
 from agentic_fx.runners.base import MissionResult
-from tests.loops.test_improve_e2e import FakeImproveWorkerRunner
+from tests.fixtures.improve_world import FakeImproveWorkerRunner
 from tests.fixtures import baseline_world as bw
 
 pytestmark = pytest.mark.slow
@@ -213,8 +213,9 @@ def test_repeat_does_not_count_not_improved_as_a_failure_and_never_backs_off(
         "SELECT status FROM missions WHERE id IN (?,?) ORDER BY id",
         (first, second))]
     assert statuses == ["completed", "completed"]
-    # 2 本目は 1 本目の終了直後に始まる (BACKOFF_SEC を待たない)
-    assert runs.timings["repeat"] < ir.BACKOFF_SEC / 2
+    # 2 本目は 1 本目の終了直後に始まる。待ちの patch 値 (1 秒) の半分も待たない
+    assert sum(runs.world.backoff_seconds) < bw.PATCHED_BACKOFF_SEC / 2
+    assert runs.world.backoff_seconds == []
 
 
 def test_a_better_candidate_gets_an_approval_with_the_stored_comparison(runs):
@@ -466,6 +467,33 @@ def test_the_monitor_section_counts_terminated_missions_and_says_so(runs):
 
 # === 承認詳細の 3 面 =============================================================
 
+_METRIC_KEYS = ("pf", "trades", "win_rate", "avg_r", "max_drawdown",
+                "total_pnl", "kill_switch_latches", "evaluable")
+_VERSION_LABEL = {"candidate": "候補", "deployed": "配備中の版"}
+
+
+def _text_metric_cells(surface, stage, version):
+    """CLI / シェルの 1 行 `<stage> USDJPY <版>: key=value ...` を指標名で引く。"""
+    prefix = f"{stage} USDJPY {_VERSION_LABEL[version]}: "
+    (line,) = [l.strip() for l in surface.splitlines()
+               if l.strip().startswith(prefix)]
+    cells = dict(re.findall(r"(\w+)=(\S+)", line[len(prefix):]))
+    assert list(cells) == list(_METRIC_KEYS), line
+    return cells
+
+
+def _web_metric_cells(surface, stage, version):
+    """web の表で、`<stage>` の見出しの下の `USDJPY` × 版の行を、列見出しで引く。"""
+    section = surface.split(f"<h3>{stage}</h3>", 1)[1].split("</table>", 1)[0]
+    heads = re.findall(r"<th>(\w+)</th>", section)
+    (row,) = [r for r in re.findall(r"<tr>(.*?)</tr>", section)
+              if f"<td>USDJPY</td><td>{_VERSION_LABEL[version]}</td>" in r]
+    cells = re.findall(r"<td>(.*?)</td>", row)
+    table = dict(zip(heads[2:], cells[2:]))
+    assert list(table)[:len(_METRIC_KEYS)] == list(_METRIC_KEYS), heads
+    return table
+
+
 def test_cli_shell_and_web_show_the_same_stored_values(runs):
     world = runs.world
     conn = world.conn
@@ -488,9 +516,13 @@ def test_cli_shell_and_web_show_the_same_stored_values(runs):
             entry = comparison["stages"][stage]["USDJPY"]
             for version in ("candidate", "deployed"):
                 metrics = entry[version]
+                shown = (_web_metric_cells(surface, stage, version)
+                         if name == "web"
+                         else _text_metric_cells(surface, stage, version))
                 for key in ("pf", "trades", "win_rate", "avg_r",
                             "max_drawdown", "total_pnl"):
-                    assert str(metrics[key]) in surface, (name, stage, version, key)
+                    assert shown[key] == str(metrics[key]), (
+                        name, stage, version, key, shown)
     # 8 指標のうち kill_switch_latches も、保存された実値のまま 3 面に出る
     payload = json.loads(conn.execute(
         "SELECT payload_json FROM approval_requests WHERE id=?",

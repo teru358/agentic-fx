@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import itertools
 import json
+import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.improve_supervisor import ImproveSupervisor
@@ -29,14 +33,16 @@ from agentic_fx.store import backlog as backlog_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store.db import connect, connect_readonly
 from tests.fixtures import indicator_wiring as fx
-from tests.loops.test_improve_e2e import (
-    FakeImproveWorkerRunner, _MIN3_TEST_PY, _install, _plugin_artifact,
-    _write_staging_plugin)
+from tests.fixtures.improve_world import (
+    FakeImproveWorkerRunner, MIN3_TEST_PY as _MIN3_TEST_PY, install as _install,
+    plugin_artifact as _plugin_artifact,
+    write_staging_plugin as _write_staging_plugin)
 from tests.store.test_rag import FakeEmbedding
 from tests.test_service_app import _no_real_network
 
 NOW = fx.NOW
 NAME = "momo"
+PATCHED_BACKOFF_SEC = 1.0
 PAIR = fx.PAIR
 
 CONFIG = (
@@ -84,6 +90,7 @@ class World:
     loop: ImproveLoop
     supervisor: ImproveSupervisor
     runs: list = field(default_factory=list)
+    backoff_seconds: list = field(default_factory=list)
 
     @property
     def conn(self):
@@ -226,8 +233,20 @@ def run_repeat(world: World, files_list, *, max_runs: int | None = None):
     progress: list[dict] = []
     cancel = threading.Event()
     # 失敗の後の待ち (既定 300 秒) を短くしておく。正しい実装は待たない。
+    # patch が効いている間に、待ちに入った回数と所要を `world.backoff_seconds` に残す。
+    real_backoff = ImproveSupervisor._backoff
+
+    def recorded_backoff(self, *args, **kwargs):
+        start = time.monotonic()
+        try:
+            return real_backoff(self, *args, **kwargs)
+        finally:
+            world.backoff_seconds.append(time.monotonic() - start)
+
     with staged(files_list, name=files_list[0][0]), \
-            patch("agentic_fx.core.improve_repeat.BACKOFF_SEC", 1.0):
+            patch("agentic_fx.core.improve_repeat.BACKOFF_SEC",
+                  PATCHED_BACKOFF_SEC), \
+            patch.object(ImproveSupervisor, "_backoff", recorded_backoff):
         result = world.supervisor.submit_repeat(
             duration_sec=3600, max_runs=max_runs or len(files_list),
             comment_holder=None, on_progress=progress.append,
@@ -244,8 +263,8 @@ _PROBE = Path(__file__).resolve().parent / "afx_ops_probe.py"
 
 def afx_ops_render(request: dict) -> dict:
     """afx-ops の venv の python で描画し、`{"text": ...}` を返す。"""
-    import json
-    import subprocess
+    if not AFX_OPS_PYTHON.exists():
+        pytest.skip("afx-ops の venv が無い")
     done = subprocess.run(
         [str(AFX_OPS_PYTHON), str(_PROBE)], input=json.dumps(request),
         capture_output=True, text=True, timeout=60, cwd=str(_REPO / "afx-ops"),
@@ -333,11 +352,10 @@ def run_scenario(root: Path, files, *, deployed_py: str | None = None,
 
 
 @contextmanager
-def timed_backtests(log: list):
+def timed_backtests(log: list, *, after_call=None):
     """gate の in_sample / holdout の各呼び出しを、通したまま実測する。
-    `log` に `{"scope", "content_hash", "seconds", "raised"}` を積む。"""
-    import time
-
+    `log` に `{"scope", "content_hash", "seconds", "raised"}` を積む。
+    `after_call(entry)` があれば、各呼び出しの記録の直後に呼ぶ。"""
     from agentic_fx.backtest import holdout
     real_in, real_ho = holdout.run_in_sample, holdout.run_holdout_gate
 
@@ -351,10 +369,13 @@ def timed_backtests(log: list):
                 raised = type(exc).__name__
                 raise
             finally:
-                log.append({"scope": scope,
-                            "content_hash": kwargs.get("content_hash"),
-                            "seconds": time.monotonic() - start,
-                            "raised": raised})
+                entry = {"scope": scope,
+                         "content_hash": kwargs.get("content_hash"),
+                         "seconds": time.monotonic() - start,
+                         "raised": raised}
+                log.append(entry)
+                if after_call is not None:
+                    after_call(entry)
         return run
 
     with patch("agentic_fx.backtest.holdout.run_in_sample",
@@ -382,3 +403,34 @@ def agent_run_backtest(ctx, name: str, pair: str = PAIR) -> str:
     registry.register_all(defs)
     return registry.execute("run_backtest", {"name": name, "pair": pair},
                             allowed=registry.names())
+
+
+class TickClock:
+    """比較の再生の壁時計を、実時間と切り離して進める時計。
+
+    呼ばれるたびに `tick` 進む。`advance` で任意に進められる (候補の床が
+    長くかかった状況を作る)。"""
+
+    def __init__(self, tick: float = 1.0):
+        self.value = 0.0
+        self.tick = tick
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            now = self.value
+            self.value += self.tick
+            return now
+
+    def advance(self, seconds: float) -> None:
+        with self._lock:
+            self.value += seconds
+
+
+@contextmanager
+def gate_clock(clock):
+    """gate の壁時計を `clock` に差し替える (gate の `clock` 引数の既定値)。"""
+    from agentic_fx.plugin import strategy_gate
+    defaults = strategy_gate.evaluate_strategy_adoption_gate.__kwdefaults__
+    with patch.dict(defaults, {"clock": clock}):
+        yield

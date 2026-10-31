@@ -95,30 +95,36 @@ def test_the_mode_is_fixed_when_the_mission_starts(tmp_path):
 
 def test_a_replay_over_the_wall_clock_limit_is_cancelled_and_falls_to_unavailable(
         tmp_path):
-    """上限は床を通った後から数える。候補の床 (十数秒) は上限より長くても
-    打ち切られず、再生だけが取り消される。"""
+    """上限は床を通った後から数える。候補の床が上限より長くかかっても
+    打ち切られず、再生だけが取り消される。壁時計は実時間と切り離した時計で
+    進める (床の各呼び出しの後に上限の 2 倍進め、再生は呼ばれるたび 1 秒進める)。"""
     limit = 5.0
+    floor_jump = limit * 2
+    clock = bw.TickClock(tick=1.0)
     calls: list[dict] = []
+
+    def long_floor(entry):
+        if entry["content_hash"] != deployed:
+            clock.advance(floor_jump)
+
     with bw.open_world(tmp_path / "w", mode="enforce",
                        wall_clock_max_sec=limit) as world:
         deployed = bw.deploy(world)
-        with bw.timed_backtests(calls):
+        with bw.gate_clock(clock), \
+                bw.timed_backtests(calls, after_call=long_floor):
             mission = bw.run_manual(world, _same("a"))
         snap = bw.snapshot(world, mission)
     candidate_calls = [c for c in calls if c["content_hash"] != deployed]
     replay_calls = [c for c in calls if c["content_hash"] == deployed]
-    floor_seconds = sum(c["seconds"] for c in candidate_calls)
-    print("measured:", [(c["scope"], c["content_hash"] == deployed,
-                         round(c["seconds"], 2), c["raised"]) for c in calls])
-    # 候補の床は上限を超えても完走する (in_sample と holdout が両方残る)
-    assert floor_seconds > limit
+    # 候補の床は、時計が上限を超えて進んでも完走する (in_sample と holdout が両方残る)
     assert [c["raised"] for c in candidate_calls] == [None, None]
     assert [r["scope"] for r in snap.rows if r["variant"] == "candidate"] == [
         "in_sample", "holdout_gate"]
-    # 再生は 1 回だけ始まり、上限の近くで取り消される (床の前に数えていれば 0 秒)
+    # 再生は 1 回だけ始まり、取り消される (上限を床の前から数えていれば 0 回)
     assert len(replay_calls) == 1 and replay_calls[0]["scope"] == "in_sample"
     assert replay_calls[0]["raised"] is not None
-    assert limit * 0.8 <= replay_calls[0]["seconds"] < limit * 3
+    # 時計は床の分と、再生の上限の分以上に進んでいる
+    assert clock.value >= floor_jump * len(candidate_calls) + limit
     # 結果は床のみで通り、baseline 行は 0、比較は gate_timeout の unavailable
     assert snap.notice == ("submitted", None)
     assert _baseline_rows(snap) == []
