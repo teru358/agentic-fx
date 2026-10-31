@@ -53,7 +53,14 @@ class ServerAuthError(Exception):
         self.detail = detail
 
 
+# detail に出てよい段の全部。生成側 (ここ) と表示側 (api_client.with_detail) の両方で閉じる
+DETAIL_STEPS = frozenset({"getsockopt", "fdinfo_open", "fdinfo_read", "locks_open", "locks_read",
+                          "unknown"})
+
+
 def step_detail(step: str, err: int | None) -> str:
+    if step not in DETAIL_STEPS:
+        step = "unknown"
     return f"step={step} errno={err if type(err) is int else 0}"
 
 

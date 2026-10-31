@@ -154,7 +154,8 @@ class FeaturePlan:
     secret_allowed は機能の secret dir に置いてよい file 名の全部、secret_files はそのうち
     隔離前に読む必須の file 名 (dir の外は指せない)。web の必須集合は検証済みの auth だけから
     決まる (`auth = "basic"` のとき `web.password`、`none` のとき空)。
-    保持 fd は 0/1/2 と listener と sd_notify の fd だけで、追加の Landlock 規則は無い。
+    保持 fd は 0/1/2 と listener と sd_notify の fd と procfs の pin 2 本 (`/proc/<pid>`、`/proc/locks`)
+    で、追加の Landlock 規則は無い。
     """
 
     feature: str

@@ -78,7 +78,7 @@ class ApiError(Exception):
         self.detail = detail
 
 
-_DETAIL_SHAPE = re.compile(r"step=[a-z_]{1,16} errno=[0-9]{1,4}")
+_DETAIL_SHAPE = re.compile(r"step=(" + "|".join(sorted(server_auth.DETAIL_STEPS)) + r") errno=[0-9]{1,4}")
 
 
 def with_detail(reason: str, detail: object) -> str:

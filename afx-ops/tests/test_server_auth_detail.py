@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from afx_ops import api_client, server_auth
+from afx_ops.server_auth import step_detail
 from afx_ops.api_client import ApiError, with_detail
 from afx_ops.server_auth import ServerAuthError
 from afx_ops.web.request import Request, handle_request
@@ -115,6 +116,9 @@ def test_with_detail_appends_only_the_fixed_shape():
     assert with_detail("a", "step=fdinfo_open errno=13") == "a detail=step=fdinfo_open errno=13"
     assert with_detail("a", "") == "a"
     assert with_detail("a", "step=x errno=13 /home/u/secret") == "a"
+    assert with_detail("a", "step=x errno=13") == "a"
+    assert with_detail("a", "step=fdinfo_open errno=13") == "a detail=step=fdinfo_open errno=13"
+    assert step_detail("x", 13) == "step=unknown errno=13"
     assert with_detail("a", "step=x errno=123456") == "a"
 
 
