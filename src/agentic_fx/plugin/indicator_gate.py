@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from agentic_fx import improve_notice_codes as notices
 
@@ -130,20 +131,36 @@ def _param_hits(params: Any) -> list[Hit]:
     return hits
 
 
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                found.add(id(body[0].value))
+    return found
+
+
 def _source_hits(source_text: str) -> list[Hit]:
-    try:
-        tree = ast.parse(source_text)
-    except SyntaxError:
-        return []
-    doc_values = {ast.get_docstring(tree, clean=False)}
-    doc_values.update(ast.get_docstring(node, clean=False) for node in ast.walk(tree)
-                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    tree = ast.parse(source_text)
+    docs = _docstring_nodes(tree)
     hits: list[Hit] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            place = "docstring" if node.value in doc_values else "string_constant"
+            place = "docstring" if id(node) in docs else "string_constant"
             hits.extend(Hit(place, token) for token in _tokens(node.value))
     return hits
+
+
+def _config_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [text for item in value.values() for text in _config_strings(item)]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _config_strings(item)]
+    return []
 
 
 def candidate_tokens(meta: Any, source_text: str, config_text: str) -> list[Hit]:
@@ -151,7 +168,8 @@ def candidate_tokens(meta: Any, source_text: str, config_text: str) -> list[Hit]
     hits = [Hit("name", token) for token in _tokens(str(_get(meta, "name", "")))]
     hits.extend(_param_hits(_get(meta, "params", {})))
     hits.extend(_source_hits(source_text))
-    hits.extend(Hit("config_value", token) for token in _tokens(config_text))
+    for text in _config_strings(yaml.safe_load(config_text)):
+        hits.extend(Hit("config_value", token) for token in _tokens(text))
     return hits
 
 
@@ -167,18 +185,47 @@ def check_symbol_in_name(hits: list[Hit], symbols: frozenset[str], *,
     return Verdict(False, "symbol_in_name")
 
 
+def _param_keys(params: Any) -> list[str]:
+    keys: list[str] = []
+    if isinstance(params, Mapping):
+        for key, value in params.items():
+            keys.append(str(key))
+            keys.extend(_param_keys(value))
+    elif isinstance(params, (list, tuple)):
+        for value in params:
+            keys.extend(_param_keys(value))
+    return keys
+
+
+def _key_phrases(key: str) -> list[str]:
+    """Key words plus adjacent word pairs joined by an underscore (``tick_size``)."""
+    words = [w.lower() for w in re.split(r"[^a-zA-Z0-9]+", key) if w]
+    pairs = ["_".join(words[i:i + 2]) for i in range(len(words) - 1)]
+    return _tokens(key) + words + pairs
+
+
 def check_param_price_unit(params: Any) -> Verdict:
-    for hit in _param_hits(params):
-        if hit.place == "param_key" and (hit.token in PRICE_UNIT_TOKENS or
-                                           "price" in hit.token):
-            return Verdict(False, "param_price_unit")
+    for key in _param_keys(params):
+        for phrase in _key_phrases(key):
+            if phrase in PRICE_UNIT_TOKENS or "price" in phrase:
+                return Verdict(False, "param_price_unit")
     return Verdict()
 
 
 def _allclose(a: Any, b: Any, *, rtol: float = EXACT_RTOL) -> bool:
+    """Element-wise |a-b| <= atol + rtol*max(|a|,|b|); NaN positions must coincide."""
     aa, bb = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
-    return aa.shape == bb.shape and np.allclose(aa, bb, rtol=rtol, atol=EXACT_ATOL,
-                                                equal_nan=True)
+    if aa.shape != bb.shape:
+        return False
+    nan_a, nan_b = np.isnan(aa), np.isnan(bb)
+    if not np.array_equal(nan_a, nan_b):
+        return False
+    keep = ~nan_a
+    x, y = aa[keep], bb[keep]
+    same = x == y
+    with np.errstate(invalid="ignore"):
+        near = np.abs(x - y) <= EXACT_ATOL + rtol * np.maximum(np.abs(x), np.abs(y))
+    return bool(np.all(same | (near & np.isfinite(x) & np.isfinite(y))))
 
 
 def classify_scale(base: pd.DataFrame, k100: pd.DataFrame, k001: pd.DataFrame,
@@ -221,7 +268,8 @@ def _as_series(value: Any) -> pd.Series | None:
 
 def _exact(a: Any, b: Any) -> bool:
     if not isinstance(a, pd.Series) or not isinstance(b, pd.Series):
-        return np.isscalar(a) and np.isscalar(b) and bool(np.isfinite(a) and np.isfinite(b) and abs(a - b) <= EXACT_ATOL + EXACT_RTOL * max(abs(a), abs(b)))
+        return bool(np.isscalar(a) and np.isscalar(b) and np.isfinite(a) and np.isfinite(b)
+                    and abs(a - b) <= EXACT_ATOL + EXACT_RTOL * max(abs(a), abs(b)))
     a, b = a.align(b, join="outer")
     mask_a, mask_b = np.isfinite(a), np.isfinite(b)
     return bool(np.array_equal(mask_a, mask_b) and _allclose(a[mask_a], b[mask_b]))
@@ -275,7 +323,7 @@ def compare_outputs(candidate: dict[str, Any], deployed: dict[str, dict[str, Any
         exact_edges = {col: [old for old, value in outputs.items() if _exact(series, value)]
                        for col, series in candidate.items()}
         exact_match = _best_one_to_one(exact_edges, list(candidate))
-        if exact_match:
+        if exact_match and len(outputs) == len(candidate):
             for col, old in exact_match.items(): relations.append((name, old, "duplicate", 1.0))
             continue
         for col, olds in exact_edges.items():
