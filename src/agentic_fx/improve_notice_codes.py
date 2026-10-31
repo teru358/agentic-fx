@@ -160,12 +160,6 @@ _PLUGIN_GATE_NOTICES = {
     "self_test_too_thin": NOTICE_SELF_TEST_TOO_THIN,
     "self_test_mutated": NOTICE_SELF_TEST_MUTATED,
     "sandbox_unavailable": NOTICE_GATE_SANDBOX_UNAVAILABLE,
-}
-PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
-
-# indicator 候補の検査語。gate の不合格 return に配線されたら
-# _PLUGIN_GATE_NOTICES に移す (配線の網羅 test が両者の一致を見る)。
-_INDICATOR_GATE_NOTICES = {
     "symbol_in_name": NOTICE_SYMBOL_IN_NAME,
     "param_price_unit": NOTICE_PARAM_PRICE_UNIT,
     "fixture_run_failed": NOTICE_FIXTURE_RUN_FAILED,
@@ -174,7 +168,16 @@ _INDICATOR_GATE_NOTICES = {
     "indicator_duplicate": NOTICE_INDICATOR_DUPLICATE,
     "indicator_monotone_duplicate": NOTICE_INDICATOR_MONOTONE_DUPLICATE,
 }
-INDICATOR_GATE_CODES = frozenset(_INDICATOR_GATE_NOTICES)
+PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
+
+# agent 面の last_result (`observation:gate_failed:<固定語>`) に通す語。
+INDICATOR_LAST_RESULT_CODES = (
+    INDICATOR_GATE_REJECT_CODES | INDICATOR_GATE_MODE_CODES)
+# bless (人間回廊) は政策検査を reject でなく warning にするので、承認 payload の
+# gate_warnings が取る語はこの全体になる。
+INDICATOR_PAYLOAD_WARNING_CODES = (
+    INDICATOR_GATE_WARNING_CODES | INDICATOR_GATE_MODE_CODES
+    | frozenset({"symbol_in_name", "param_price_unit"}))
 
 _QUALITY_NOTICES = {
     "duplicate_logic": NOTICE_DUPLICATE_LOGIC,
@@ -200,8 +203,6 @@ def _closed_lookup(table: dict[str, NoticeCode], code: object,
 
 
 def notice_for_plugin_gate(code: str) -> NoticeCode:
-    if code in _INDICATOR_GATE_NOTICES:
-        return _INDICATOR_GATE_NOTICES[code]
     return _closed_lookup(_PLUGIN_GATE_NOTICES, code, "plugin gate")
 
 

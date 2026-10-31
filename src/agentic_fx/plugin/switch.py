@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Literal
@@ -36,6 +36,7 @@ from agentic_fx.store import approvals as approvals_store
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.plugin import deploy_ops as deploy_ops_common
+from agentic_fx.plugin import indicator_pipeline
 from agentic_fx.store import plugin_switch_journal as journal_store  # Task 8 produces
 
 _PHASE_ORDER = ["preparing", "versioned", "recorded", "switched", "decided", "reverted"]
@@ -1257,6 +1258,19 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
     if approval.outputs_required_violation(meta):
         raise ValueError("outputs_required")
 
+    # submit は改善ループと同じ reject、bless は政策検査を warning にする
+    # (収益床の floor_mode と同じ 2 値)。
+    lane = "submit" if floor_mode == "enforce" else "bless"
+    static_report = None
+    if meta.kind == "indicator":
+        inventory_for_static = tools_plugin_loader.approved_plugins(
+            conn, plugins_root, settings=settings)
+        static_report = indicator_pipeline.check_static(
+            meta, candidate_dir, settings=settings,
+            deployed=inventory_for_static.inventory.by_name(name), lane=lane)
+        if not static_report.ok:
+            raise ValueError(f"plugin {name!r}: {static_report.code}")
+
     rows: list[dict] = []
     try:
         check_source(candidate_dir / "plugin.py")  # 手順 4
@@ -1353,7 +1367,39 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
         raise ValueError(
             f"plugin {name!r}: unprofitable ({condition}) ({settings_kv})")
 
+    if meta.kind == "indicator":
+        outcome = _run_indicator_fixture_stage(
+            conn, meta, name=name, lane=lane, settings=settings,
+            plugins_root=plugins_root, inventory=inventory,
+            static_report=static_report, outcome=outcome)
     return meta, after_content, after_artifact, outcome
+
+
+def _run_indicator_fixture_stage(conn, meta, *, name, lane, settings, plugins_root,
+                                 inventory, static_report, outcome):
+    """kind=indicator の fixture 検査。改善ループと同じ関数を通り、reject は固定語の
+    ValueError、結果の warning と類似の相手は `GateOutcome` に載せる。"""
+    try:
+        report = indicator_pipeline.run_fixture_stage(
+            meta, settings=settings, data_dir=plugins_root.parent / "data",
+            deployed_metas=[m for m in inventory.inventory.metas
+                            if m.kind == "indicator"],
+            pending=indicator_pipeline.pending_indicator_refs(conn),
+            mode=settings.improve.indicator_duplicate_mode, lane=lane,
+            static_warnings=(static_report.warnings
+                             if static_report is not None else ()))
+    except indicator_pipeline.IndicatorGateUnavailable as exc:
+        raise ValueError(f"plugin {name!r}: indicator_gate_unavailable") from exc
+    if not report.ok:
+        raise ValueError(f"plugin {name!r}: {report.code}")
+    return dataclass_replace(
+        outcome, gate_warnings=report.warnings, similar_to=report.similar_to,
+        indicator_report=report)
+
+
+def _indicator_payload_fields(outcome) -> dict:
+    report = outcome.indicator_report
+    return indicator_pipeline.payload_fields(report) if report is not None else {}
 
 
 def _candidate_locator(*, staging_dir: Path, candidate_origin: str, name: str,
@@ -1421,6 +1467,7 @@ def submit_candidate(
             # **`outcome.resolved` から作る** — ここで再解決しない (P3')。
             "indicator_deps": (outcome.resolved.pin_object()
                                if outcome.resolved is not None else {}),
+            **_indicator_payload_fields(outcome),
         }
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1437,6 +1484,47 @@ def submit_candidate(
             conn.rollback()
             raise
     return approval_id
+
+
+def _rejudge_indicator_at_approval(conn: sqlite3.Connection, approval_id: int,
+                                   payload: dict, *, settings,
+                                   plugins_root: Path) -> dict:
+    """配備の直前に、候補の probe 出力を今の配備済みに対して exact と単調変換だけ
+    再判定する。warn では承認画面の warning を更新し、enforce で新たに成立して
+    いれば `duplicate_at_approve` で拒否する。probe 出力の参照が無い旧 payload は
+    判定しない。"""
+    mode = settings.improve.indicator_duplicate_mode
+    inventory = tools_plugin_loader.approved_plugins(
+        conn, plugins_root, settings=settings)
+    try:
+        result = indicator_pipeline.rejudge_at_approval(
+            payload, settings=settings, data_dir=plugins_root.parent / "data",
+            deployed_metas=[m for m in inventory.inventory.metas
+                            if m.kind == "indicator"], mode=mode)
+    except indicator_pipeline.IndicatorGateUnavailable as exc:
+        raise ValueError("indicator_gate_unavailable") from exc
+    if result is None:
+        return payload
+    if result.rejected_code:
+        raise ValueError(result.rejected_code)
+    if not result.changed:
+        return payload
+    updated = dict(payload)
+    updated["gate_warnings"] = indicator_pipeline.merge_warnings(
+        payload.get("gate_warnings"), result.warnings)
+    updated["similar_to"] = indicator_pipeline.merge_similar(
+        payload.get("similar_to"), result.similar_to)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE approval_requests SET payload_json=? "
+            "WHERE id=? AND status='pending'",
+            (json.dumps(updated, ensure_ascii=False), approval_id))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    return updated
 
 
 def _is_superseded(conn: sqlite3.Connection, row: dict, payload: dict) -> bool:
@@ -1802,6 +1890,10 @@ def approve_candidate(
         # (§5.1 codex 12 周目の early-exit — 未定義の retry_approval を
         # 経由せずここで直接処理する、11c の NameError landmine を踏まない)。
         existing_journal = journal_store.get_open_by_name(conn, name)
+        if payload.get("kind") == "indicator" and existing_journal is None:
+            payload = _rejudge_indicator_at_approval(
+                conn, approval_id, payload, settings=settings,
+                plugins_root=plugins_root)
         op_id = None
         rolled_back_op_id = None  # [switch-ops-hardening] T3 (§3.5)
         if existing_journal is not None and existing_journal["approval_id"] == approval_id:
@@ -2329,6 +2421,7 @@ def bless_candidate(
             # [indicator-consumption-wiring] §2.7: submit と同形。
             "indicator_deps": (outcome.resolved.pin_object()
                                if outcome.resolved is not None else {}),
+            **_indicator_payload_fields(outcome),
         }
 
         if old_kind == "plain":

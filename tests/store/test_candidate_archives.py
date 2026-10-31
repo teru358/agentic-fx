@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from agentic_fx.store import candidate_archives
+from agentic_fx.store import db as db_mod
 from agentic_fx.store.db import connect, init_db
 
 NOW = datetime(2026, 9, 10, tzinfo=timezone.utc)
@@ -31,6 +32,14 @@ def test_insert_and_list_by_mission_returns_decoded_metrics_in_id_order(tmp_path
     assert [r["id"] for r in rows] == [first, second]
     assert rows[0]["metrics"] == {"pf": 1.25, "trades": 40}
     assert "metrics_json" not in rows[0]
+
+
+def test_insert_round_trips_indicator_relation(tmp_path):
+    conn = _conn(tmp_path)
+    archive_id = _insert(
+        conn, relation=[{"name": "rsi", "column": "value", "kind": "similar"}])
+    assert candidate_archives.get(conn, archive_id)["relation"] == [
+        {"name": "rsi", "column": "value", "kind": "similar"}]
 
 
 def test_insert_is_idempotent_for_mission_and_artifact_hash(tmp_path):
@@ -217,3 +226,61 @@ def test_find_by_mission_content_ignores_row_whose_artifact_hash_equals_key(
     assert row is not None
     assert row["archive_path"] == "plugins/_archive/30/a"
     assert row["artifact_hash"] == "ah-a"
+
+
+_PRE_RELATION_DDL = db_mod._CANDIDATE_ARCHIVES_DDL.replace(
+    "  relation TEXT NOT NULL DEFAULT '[]',\n", "")
+
+
+def test_a_table_without_relation_is_rebuilt_and_existing_rows_keep_every_byte(
+        tmp_path):
+    path = tmp_path / "pre.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.execute("DROP TABLE candidate_archives")
+    conn.executescript(_PRE_RELATION_DDL)
+    assert "relation" not in [r[1] for r in conn.execute(
+        "PRAGMA table_info(candidate_archives)")]
+    conn.execute(
+        "INSERT INTO candidate_archives (mission_id,name,content_hash,"
+        "artifact_hash,archive_path,pair,metrics_json,created_at,logic_hash,"
+        "family_key,outcome_class,quality_flags) VALUES "
+        "(1,'n','c','a',NULL,NULL,'{\"pf\": 1}','2026-10-01T00:00:00+00:00','l',"
+        "'indicator:n@1h','gate_failed','[\"family_detected\"]')")
+    conn.commit()
+    columns = ("id,mission_id,name,content_hash,artifact_hash,archive_path,pair,"
+               "metrics_json,created_at,logic_hash,family_key,outcome_class,"
+               "quality_flags")
+    before = [tuple(r) for r in conn.execute(
+        f"SELECT {columns} FROM candidate_archives")]
+    conn.close()
+    migrated = connect(path)
+    init_db(migrated)
+    after = [tuple(r) for r in migrated.execute(
+        f"SELECT {columns} FROM candidate_archives")]
+    assert after == before
+    assert [tuple(r) for r in migrated.execute(
+        "SELECT relation FROM candidate_archives")] == [("[]",)]
+    assert [r[1] for r in migrated.execute(
+        "PRAGMA table_info(candidate_archives)")][-1] == "relation"
+
+
+def test_the_current_table_is_not_rebuilt_again(tmp_path, monkeypatch):
+    path = tmp_path / "cur.db"
+    conn = connect(path)
+    init_db(conn)
+    calls = []
+    real = db_mod._rebuild_candidate_archives
+    with monkeypatch.context() as m:
+        m.setattr(db_mod, "_rebuild_candidate_archives",
+                  lambda c: (calls.append(1), real(c))[1])
+        init_db(conn)
+    assert calls == []
+
+
+def test_relation_defaults_to_an_empty_list(tmp_path):
+    conn = _conn(tmp_path)
+    archive_id = _insert(conn)
+    assert candidate_archives.get(conn, archive_id)["relation"] == []
+    rows = candidate_archives.family_attempt_projection(conn)
+    assert rows[0]["relation"] == "[]"

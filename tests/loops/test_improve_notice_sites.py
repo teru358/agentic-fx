@@ -238,7 +238,6 @@ def test_every_notice_constant_is_placed_by_a_site_or_a_closed_dictionary():
         n.attr for n in ast.walk(missions_tree)
         if isinstance(n, ast.Attribute) and n.attr in _notice_names()}
     dictionary_values = (set(codes._PLUGIN_GATE_NOTICES.values())
-                         | set(codes._INDICATOR_GATE_NOTICES.values())
                          | set(codes._QUALITY_NOTICES.values())
                          | set(codes._UNEVALUABLE_NOTICES.values()))
     unplaced = {name for name in _notice_names() - referenced
@@ -269,9 +268,9 @@ def test_plugin_gate_failures_carry_a_distinct_fixed_code_per_semantic_branch():
             continue
         assert isinstance(value, ast.Constant) and isinstance(value.value, str)
         seen.append(value.value)
-    # 不合格 return は 10 か所、意味分岐ごとに別の語
+    # 不合格 return は 17 か所 (既存 10 + indicator 検査 7)、意味分岐ごとに別の語
     assert sorted(seen) == sorted(codes.PLUGIN_GATE_CODES)
-    assert len(seen) == 10
+    assert len(seen) == 17
 
 
 def test_plugin_gate_wrappers_take_code_without_a_default():

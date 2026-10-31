@@ -120,14 +120,15 @@ def _rows(section):
 
 # --- AC-1: 読取面は 3 列だけ -----------------------------------------------
 
-def test_ac1_projection_returns_exactly_three_columns(conn):
+def test_ac1_projection_returns_exactly_four_columns(conn):
     _plant(conn, "indicator:rsi@1h", metrics={"pf": 0.6283, "trades": 41})
     rows = archives.family_attempt_projection(conn)
     assert len(rows) == 1
-    assert set(rows[0]) == {"family_key", "outcome_class", "created_at"}
+    assert set(rows[0]) == {"family_key", "outcome_class", "created_at",
+                            "relation"}
 
 
-def test_ac1_context_reads_candidate_archives_with_one_three_column_select(
+def test_ac1_context_reads_candidate_archives_with_one_four_column_select(
         conn, tmp_path):
     _plant(conn, "indicator:rsi@1h")
     statements: list[str] = []
@@ -140,7 +141,7 @@ def test_ac1_context_reads_candidate_archives_with_one_three_column_select(
     assert len(touching) == 1
     normalized = " ".join(touching[0].split())
     assert normalized == (
-        "SELECT family_key, outcome_class, created_at "
+        "SELECT family_key, outcome_class, created_at, relation "
         "FROM candidate_archives ORDER BY id")
     assert not [s for s in statements if "metrics_json" in s]
 
@@ -528,7 +529,7 @@ def test_ac8_family_rows_have_exactly_the_public_keys(conn, tmp_path):
     for row in section["rows"]:
         assert set(row) == {"family_key", "attempts", "outcomes",
                             "last_attempt_month", "deployed",
-                            "deployed_names"}
+                            "deployed_names", "relations"}
 
 
 # --- AC-9: 人間の reject 理由 -----------------------------------------------------

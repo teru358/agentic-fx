@@ -56,6 +56,8 @@ def _decode(row: sqlite3.Row) -> dict[str, Any]:
     result["metrics"] = json.loads(result.pop("metrics_json"))
     if "quality_flags" in result:
         result["quality_flags"] = json.loads(result["quality_flags"])
+    if "relation" in result:
+        result["relation"] = json.loads(result["relation"])
     return result
 
 
@@ -64,6 +66,7 @@ def insert(conn: sqlite3.Connection, *, mission_id: int, name: str,
            pair: str | None, metrics: dict, now: datetime,
            logic_hash: str | None = None, family_key: str | None = None,
            quality_flags: Iterable[str] = (),
+           relation: list[dict[str, str]] | None = None,
            commit: bool = False) -> int:
     """行を追加する。同じ Mission/artifact は既存 id を返す。
 
@@ -74,11 +77,11 @@ def insert(conn: sqlite3.Connection, *, mission_id: int, name: str,
     cur = conn.execute(
         "INSERT OR IGNORE INTO candidate_archives "
         "(mission_id,name,content_hash,artifact_hash,archive_path,pair,"
-        "metrics_json,created_at,logic_hash,family_key,quality_flags) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "metrics_json,created_at,logic_hash,family_key,quality_flags,relation) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         (mission_id, name, content_hash, artifact_hash, archive_path, pair,
          json.dumps(metrics, sort_keys=True), now.isoformat(),
-         logic_hash, family_key, json.dumps(flags)))
+         logic_hash, family_key, json.dumps(flags), json.dumps(relation or [])))
     if cur.rowcount == 1:
         archive_id = cur.lastrowid
     else:
@@ -102,15 +105,16 @@ def list_by_mission(conn: sqlite3.Connection, mission_id: int, *,
         query + " ORDER BY id", (mission_id,))]
 
 
-FAMILY_ATTEMPT_COLUMNS = ("family_key", "outcome_class", "created_at")
+FAMILY_ATTEMPT_COLUMNS = ("family_key", "outcome_class", "created_at", "relation")
 
 
 def family_attempt_projection(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     """仮説族ごとの試行履歴の材料。`family_key` / `outcome_class` /
-    `created_at` の 3 列だけを id 順で返し、成績・名前・hash・path・pair・
-    flags は process へ持ち込まない。"""
+    `created_at` の 3 列と、配備済みとの重複・類似を持つ `relation` (JSON、
+    kind と配備済みの名前だけ) を id 順で返し、成績・候補名・hash・path・
+    pair・flags は process へ持ち込まない。"""
     cursor = conn.execute(
-        "SELECT family_key, outcome_class, created_at "
+        "SELECT family_key, outcome_class, created_at, relation "
         "FROM candidate_archives ORDER BY id")
     return [dict(zip(FAMILY_ATTEMPT_COLUMNS, row)) for row in cursor.fetchall()]
 

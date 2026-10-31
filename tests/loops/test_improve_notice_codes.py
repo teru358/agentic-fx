@@ -159,16 +159,17 @@ def test_quality_dictionary(code, name):
 
 
 def test_dictionaries_are_closed_sets():
-    assert codes.PLUGIN_GATE_CODES == set(PLUGIN_GATE)
-    assert codes.INDICATOR_GATE_CODES == set(INDICATOR_GATE)
+    assert codes.PLUGIN_GATE_CODES == set(PLUGIN_GATE) | set(INDICATOR_GATE)
     assert codes.QUALITY_CODES == set(QUALITY)
     assert len(codes.QUALITY_CODES) == 5
 
 
 def test_indicator_gate_vocabulary_is_closed_and_complete():
-    assert codes.INDICATOR_GATE_REJECT_CODES | codes.INDICATOR_GATE_MODE_CODES == codes.INDICATOR_GATE_CODES
-    assert codes.INDICATOR_GATE_CODES.isdisjoint(codes.PLUGIN_GATE_CODES)
-    for code in codes.INDICATOR_GATE_CODES:
+    reject = codes.INDICATOR_GATE_REJECT_CODES | codes.INDICATOR_GATE_MODE_CODES
+    assert reject == set(INDICATOR_GATE)
+    assert reject == codes.INDICATOR_LAST_RESULT_CODES
+    assert reject <= codes.PLUGIN_GATE_CODES
+    for code in reject:
         assert codes.notice_for_plugin_gate(code).reason_code == code
     assert codes.INDICATOR_GATE_WARNING_CODES == {
         "scale_dependent", "indicator_similar",

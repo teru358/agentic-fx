@@ -278,7 +278,7 @@ _CANDIDATE_ARCHIVES_OUTCOMES = (
 _CANDIDATE_ARCHIVES_COLUMNS = (
     "id", "mission_id", "name", "content_hash", "artifact_hash",
     "archive_path", "pair", "metrics_json", "created_at", "logic_hash",
-    "family_key", "outcome_class", "quality_flags")
+    "family_key", "outcome_class", "quality_flags", "relation")
 _CANDIDATE_ARCHIVES_DDL = """
 CREATE TABLE IF NOT EXISTS candidate_archives (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,6 +296,7 @@ CREATE TABLE IF NOT EXISTS candidate_archives (
     CHECK (outcome_class IN (""" + ",".join(
         f"'{v}'" for v in _CANDIDATE_ARCHIVES_OUTCOMES) + """)),
   quality_flags TEXT NOT NULL DEFAULT '[]',
+  relation TEXT NOT NULL DEFAULT '[]',
   UNIQUE(mission_id, artifact_hash)
 );
 """

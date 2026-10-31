@@ -395,6 +395,11 @@ class ImproveSettings(_Strict):
     baseline_gate: Literal["shadow", "enforce"] = "shadow"
     baseline_replay_wall_clock_max_sec: float = Field(
         gt=0, allow_inf_nan=False, strict=True, default=300)
+    indicator_duplicate_mode: Literal["warn", "enforce"] = "warn"
+    indicator_similar_corr: float = Field(
+        ge=0, le=1, allow_inf_nan=False, strict=True, default=0.98)
+    indicator_fixture_wall_clock_max_sec: float = Field(
+        gt=0, allow_inf_nan=False, strict=True, default=60)
     research: ResearchSettings = Field(default_factory=ResearchSettings)
     gate: ImproveGateSettings = Field(default_factory=ImproveGateSettings)
     tool_budget: ImproveToolBudgetSettings = ImproveToolBudgetSettings()
