@@ -62,6 +62,7 @@ def fixture_data_hash(df: pd.DataFrame) -> str:
     if tuple(df.columns) != required:
         raise ValueError("fixture must have canonical OHLCV columns")
     digest = hashlib.sha256()
-    digest.update(np.asarray(df.index.asi8, dtype="<i8").tobytes())
+    index = pd.DatetimeIndex(df.index)
+    digest.update(np.asarray(index.as_unit("ns").asi8, dtype="<i8").tobytes())
     digest.update(np.asarray(df.loc[:, required], dtype="<f8").tobytes())
     return digest.hexdigest()

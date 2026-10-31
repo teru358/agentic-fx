@@ -42,7 +42,7 @@ def _compare(candidate, deployed, **kwargs):
 def _fake_stats(monkeypatch, *, level=None, diff=None, pearson=None, n=40):
     if level is not None or diff is not None:
         monkeypatch.setattr(gate, "_spearman",
-                            lambda a, b: level if len(a) == n else diff)
+                            lambda a, b, **kw: level if len(a) == n else diff)
     if pearson is not None:
         monkeypatch.setattr(gate, "_pearson", lambda a, b: pearson)
 
@@ -267,13 +267,22 @@ def test_hits_with_foreign_tokens_are_ignored_by_the_check():
 
 
 @pytest.mark.parametrize("key", [
-    "pip", "pips", "pipsize", "pipSize", "pip_size", "point", "points", "ticksize", "tickSize",
-    "tick_size", "point_size", "pip_value", "price_level", "absolute_price", "priceThreshold",
-    "price_", "lastPrice", "pricelevel", "pricey",
+    "pip", "pips", "pipsize", "pipSize", "pip_size", "ticksize", "tickSize",
+    "tick_size", "point_size", "pointSize", "pip_value", "price_level", "absolute_price",
+    "priceThreshold", "price_offset", "price_distance", "price_step", "price_delta",
+    "price_unit", "abs_price", "min_price", "maxPrice", "priceLevel",
 ])
 def test_param_price_unit_rejects_each_vocabulary_word_as_key(key):
     assert gate.check_param_price_unit({key: 1}) == gate.Verdict(False, "param_price_unit", ())
     assert gate.check_param_price_unit({"outer": [{"inner": {key: 1}}]}).code == "param_price_unit"
+
+
+@pytest.mark.parametrize("key", [
+    "pivot_point", "n_points", "price_source", "use_typical_price", "point", "points",
+    "pricing", "price", "last_price", "pricey", "tick", "size", "point_count",
+])
+def test_param_price_unit_accepts_each_neutral_key(key):
+    assert gate.check_param_price_unit({key: 1}) == gate.Verdict()
 
 
 def test_param_price_unit_accepts_neutral_keys_and_ignores_values():
@@ -430,15 +439,16 @@ def test_exact_series_alignment_and_mask_rules():
 
 @pytest.mark.parametrize("low, high, expected", [
     (1000.0, 1000.0005, True),
-    (1000.0, 1000.0010000015, True),
+    (1000.0, 1000.0010000005, True),
     (1000.0, 1000.0010000030, False),
     (1000.0, 1000.0011, False),
-    (0.0, 5e-10, True),
+    (0.0, 5e-13, True),
+    (0.0, 5e-10, False),
     (0.0, 1.5e-9, False),
     (0.0, 1e-6, False),
     (1.0, 1.0 + 5e-7, True),
     (1.0, 1.0001, False),
-    (-1000.0, -1000.0010000015, True),
+    (-1000.0, -1000.0010000005, True),
     (-1000.0, -1000.0011, False),
 ])
 def test_exact_tolerance_is_symmetric_for_scalars_and_series(low, high, expected):
@@ -492,7 +502,7 @@ def test_duplicate_needs_every_candidate_column_and_every_deployed_column():
     same = _compare({"x": a, "y": c}, {"one": {"p": a, "q": c}}, classifications=off)
     assert same.code == "indicator_duplicate"
     unclassified = _compare({"x": a}, {"one": {"p": a, "q": c}})
-    assert unclassified.code == "" and unclassified.warnings == ("indicator_monotone_duplicate",)
+    assert unclassified.code == "" and unclassified.warnings == ("indicator_output_overlap",)
 
 
 def test_duplicate_matching_is_one_to_one():
@@ -838,3 +848,88 @@ def test_new_gate_codes_are_known_to_notice_dictionary():
     from agentic_fx import improve_notice_codes as codes
     for code in gate.REJECT_CODES:
         assert codes.notice_for_plugin_gate(code).reason_code == code
+
+
+# ---------------------------------------------------------------- exactness, warnings, vocabulary
+
+
+def test_all_nan_or_empty_candidate_is_not_exact():
+    nan40 = _series([NAN] * 40)
+    assert not gate._exact(nan40, nan40.copy())
+    assert not gate._exact(_series([]), _series([]))
+    assert not gate._exact(_series([NAN] * 40), _series([np.inf] * 40))
+    assert _compare({"x": nan40}, {"one": {"y": nan40.copy()}}).code == ""
+
+
+def test_exact_partial_copy_of_deployed_subset_is_overlap_only_in_both_modes():
+    a, b = _walk(1), _walk(2)
+    for mode in ("warn", "enforce"):
+        res = _compare({"x": a}, {"one": {"a": a, "b": b}}, mode=mode)
+        assert res.ok and res.code == "" and res.warnings == ("indicator_output_overlap",)
+        assert res.similar_to == ({"name": "one", "column": "a", "kind": "overlap"},)
+
+
+def test_warnings_are_all_collected_without_early_return():
+    s, t, plugins = _plugins()
+    a, b = _walk(1), _walk(2)
+    mono = _series(np.linspace(1, 10, 50) ** 2)
+    cand = {"x": s, "y": t}
+    res = _compare(cand, {"asim": plugins["asim"], "zov": plugins["zov"]})
+    assert res.warnings == ("indicator_output_overlap", "indicator_similar")
+    mixed = _compare({"x": mono}, {"m": {"q": mono ** 3}, "o": {"a": mono, "b": b}}, mode="warn")
+    assert mixed.ok and mixed.warnings == ("indicator_monotone_duplicate", "indicator_output_overlap")
+    enforced = _compare({"x": mono}, {"m": {"q": mono ** 3}, "o": {"a": mono, "b": b}}, mode="enforce")
+    assert not enforced.ok and enforced.code == "indicator_monotone_duplicate"
+    assert enforced.warnings == ("indicator_output_overlap",)
+    assert a is not None
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("EURUSDmomentum", {"eurusd", "momentum"}),
+    ("XAUUSDvol", {"xauusd", "vol"}),
+    ("XMLParser", {"xml", "parser"}),
+])
+def test_tokenizer_splits_after_an_acronym_run(value, expected):
+    assert expected <= set(gate._tokens(value))
+
+
+def test_exact_atol_is_tight_and_bad_inputs_are_not_exact():
+    assert not gate._exact(_series([1e-10] * 40), _series([2e-10] * 40))
+    assert not gate._exact("a", "a") and not gate._exact(None, None)
+    assert not gate._exact(pd.Series(["a"] * 3), pd.Series(["a"] * 3))
+    dup = pd.Series([1.0, 2.0, 3.0], index=pd.DatetimeIndex(["2026-01-01"] * 3))
+    assert not gate._exact(dup, dup.copy())
+    assert _compare({"x": dup}, {"one": {"y": dup.copy()}}).code == ""
+
+
+def test_precomputed_candidate_stats_do_not_change_the_outcome(monkeypatch):
+    mono = _series(np.linspace(1, 10, 50) ** 2)
+    deployed = {f"p{i}": {"q": (mono ** 3 if i == 3 else _walk(i))} for i in range(6)}
+    calls = []
+    real = gate._rank
+    monkeypatch.setattr(gate, "_rank", lambda v: (calls.append(len(v)), real(v))[1])
+    res = _compare({"x": mono}, deployed)
+    assert res.warnings == ("indicator_monotone_duplicate",)
+    assert res.similar_to == ({"name": "p3", "column": "q", "kind": "monotone"},)
+    # candidate rank and diff-rank once, then two ranks per deployed column and spearman call
+    assert calls.count(len(mono)) <= 1 + len(deployed)
+    shifted = mono.iloc[5:]
+    assert _compare({"x": mono}, {"p": {"q": shifted ** 3}}).warnings == ("indicator_monotone_duplicate",)
+
+
+def test_gate_mode_code_is_in_neither_reject_nor_warning_set():
+    from agentic_fx import improve_notice_codes as codes
+    mode = codes.INDICATOR_GATE_MODE_CODES
+    assert mode == {"indicator_monotone_duplicate"}
+    assert not mode & codes.INDICATOR_GATE_REJECT_CODES
+    assert not mode & codes.INDICATOR_GATE_WARNING_CODES
+    assert gate.MODE_CODES == mode
+    assert codes.notice_for_plugin_gate("indicator_monotone_duplicate").reason_code in mode
+
+
+def test_warning_codes_never_become_notice_reason_codes():
+    from agentic_fx import improve_notice_codes as codes
+    reasons = {pair[1] for pair in codes.ALLOWED_PAIRS}
+    assert not (codes.INDICATOR_GATE_WARNING_CODES & reasons)
+    assert ("submitted", "scale_dependent") not in codes.ALLOWED_PAIRS
+    assert not hasattr(codes, "INDICATOR_WARNING_NOTICES")

@@ -188,3 +188,12 @@ def test_aggregate_to_uses_project_ohlcv_resampling():
     four = aggregate_to(df, "4h")
     assert len(four) < len(out) and (four.index.hour % 4 == 0).all()
     assert aggregate_to(df, "5m").equals(df) or len(aggregate_to(df, "5m")) == len(df)
+
+
+def test_hash_does_not_depend_on_the_index_unit(full):
+    df = full.iloc[:200].copy()
+    us = df.copy()
+    us.index = df.index.as_unit("us")
+    ns = df.copy()
+    ns.index = df.index.as_unit("ns")
+    assert fixture_data_hash(us) == fixture_data_hash(ns)

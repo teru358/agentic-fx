@@ -165,7 +165,7 @@ def test_dictionaries_are_closed_sets():
 def test_indicator_gate_vocabulary_is_closed_and_complete():
     assert codes.INDICATOR_GATE_REJECT_CODES <= codes.PLUGIN_GATE_CODES
     assert codes.INDICATOR_GATE_WARNING_CODES == {
-        "scale_dependent", "indicator_monotone_duplicate", "indicator_similar",
+        "scale_dependent", "indicator_similar",
         "indicator_output_overlap", "sparse_output", "output_constant_suspect",
         "legacy_symbol_name", "indicator_redefined", "duplicate_unavailable",
     }

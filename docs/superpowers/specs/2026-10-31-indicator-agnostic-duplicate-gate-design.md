@@ -118,7 +118,7 @@
 ### 3.5 重複と単調変換と類似
 
 - 比較相手 = inventory の配備済み kind=indicator 全部 + 承認待ち (pending) の indicator 候補 (候補と同名の配備中の版は除く)。
-- **exact / overlap は全出力に当てる**: 候補の `neither` 列・スカラー・疎な列も、k=1 の生の値で比較する (`neither` を外すのは相関系の比較だけ)。**exact の定義**: 有限 mask の完全一致 + 全評価点で対称 tolerance `|a-b| <= 1e-9 + 1e-6·max(|a|,|b|)`。
+- **exact / overlap は全出力に当てる**: 候補の `neither` 列・スカラー・疎な列も、k=1 の生の値で比較する (`neither` を外すのは相関系の比較だけ)。**exact の定義**: 有限 mask の完全一致 + 全評価点で対称 tolerance `|a-b| <= 1e-12 + 1e-6·max(|a|,|b|)` (詳細は下の exact の定義)。
 - `indicator_duplicate` で **reject** (常時、mode に依らない) = 候補の**全出力列**が、同一の既存 plugin の出力集合に一対一で exact に再現される場合。
 - 一部の列だけ exact なら `indicator_output_overlap` warning (例: `bollinger` は `middle` が `sma.value` と exact だが他の列が固有なので overlap)。
 - **`indicator_monotone_duplicate`**: 候補の全系列列 (すべて `neither` でなく、共通有限点 30 以上) が、同一の既存 plugin の列と「生 Spearman の絶対値 ≥ 0.999 かつ 1 階差分の Spearman の絶対値 ≥ 0.98」で対応するとき。単調変換 (同じ量の言い換え) を捕る。実測の 4 ペアだけが満たす (§0.2)。`improve.indicator_duplicate_mode: warn | enforce` (既定 `warn`、mission 開始時の snapshot、baseline gate の shadow と同型) で、warn なら warning として承認画面と族表に、enforce なら reject。閾値 0.999 / 0.98 は定数で、config にしない。

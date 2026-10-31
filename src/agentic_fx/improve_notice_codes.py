@@ -20,10 +20,11 @@ OBSERVATION_TEXT_MAX = 2000
 INDICATOR_GATE_REJECT_CODES = frozenset({
     "symbol_in_name", "param_price_unit", "fixture_run_failed",
     "output_not_finite", "output_constant", "indicator_duplicate",
-    "indicator_monotone_duplicate",
 })
+# reject in enforce mode, warning in warn mode.
+INDICATOR_GATE_MODE_CODES = frozenset({"indicator_monotone_duplicate"})
 INDICATOR_GATE_WARNING_CODES = frozenset({
-    "scale_dependent", "indicator_monotone_duplicate", "indicator_similar",
+    "scale_dependent", "indicator_similar",
     "indicator_output_overlap", "sparse_output", "output_constant_suspect",
     "legacy_symbol_name", "indicator_redefined", "duplicate_unavailable",
 })
@@ -89,6 +90,10 @@ NOTICE_OUTPUT_CONSTANT = NoticeCode("gate_failed", "output_constant")
 NOTICE_INDICATOR_DUPLICATE = NoticeCode("gate_failed", "indicator_duplicate")
 NOTICE_INDICATOR_MONOTONE_DUPLICATE = NoticeCode(
     "gate_failed", "indicator_monotone_duplicate")
+# warning 語は承認依頼 payload の gate_warnings に載る閉じた語彙で、Discord の
+# 終了通知の reason_code にはならない (提出通知に warning を出さない)。
+# そのため NoticeCode は作らず、ALLOWED_PAIRS にも入れない。
+
 # plugin gate の Landlock 不可。backlog を消費する点が strategy gate の
 # failed/sandbox_unavailable (backlog を open に戻す) と異なるため別の語にする。
 NOTICE_GATE_SANDBOX_UNAVAILABLE = NoticeCode(
