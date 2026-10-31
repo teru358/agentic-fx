@@ -96,7 +96,7 @@
 
 ### 3.3 param 検査 (`param_price_unit`)
 
-`params` のキー (再帰、§3.2 の正規化後) の token に `pip` / `pips` / `pipsize` / `point` / `points` / `ticksize` / `tick_size` / `point_size` / `pip_value` / `price_level` / `absolute_price` が含まれる、`price` を含む、または `price_` で始まるなら reject。値の既定 (例 0.05) は見ない (スケール依存は §3.4 が実測で見る)。語彙は閉じて 1 箇所に置く (§3.7)。
+`params` のキー (再帰、§3.2 の正規化後) について、token が `pip` / `pips` / `pipsize` / `ticksize` のいずれか、または隣接 token を `_` で繋いだ句が `pip_value` / `pip_size` / `tick_size` / `point_size` / `price_level` / `price_threshold` / `price_offset` / `price_distance` / `price_step` / `price_delta` / `price_unit` / `absolute_price` / `abs_price` / `min_price` / `max_price` のいずれかなら reject。bare の `point` / `points` と「`price` を含む」は使わない (`pivot_point` / `n_points` / `price_source` / `use_typical_price` のような銘柄非依存の param を落とすため)。値の既定 (例 0.05) は見ない (スケール依存は §3.4 が実測で見る)。語彙は閉じて 1 箇所に置く (§3.7)。
 
 ### 3.4 fixture 実行 (契約 run と解析 probe)
 
@@ -240,3 +240,4 @@
 | 2026-10-31 | v0.4 C0 | 2 周目の全件反映 (Critical 2 / Important 10 / Minor 7)、J2 / J3 / J5 を技術確定に、J4 を 2 案に、人間回廊を submit=enforce / bless=warn に。単調変換の重複 (`indicator_monotone_duplicate`、mode warn / enforce) と Spearman 実測 (4・5 便目) を追加 | 設計レビュー 2 周目の指摘 | |
 | 2026-10-31 | v0.5 C0 | 閉鎖確認の部分閉鎖 4 件: bless は exact 重複も reject (J5 推奨)、`duplicate_unavailable` の範囲を AC 11 の条件に限定、`last_result` は `observation:gate_failed:<固定語>` の 1 形 (relation は族表のみ)、AC の detail 表記を統一。6 便目 (別 seed 2 本) を §0.2 と J4 に。sol の第二意見で J5 / J6 を追加 | 閉鎖確認と第二意見 | |
 | 2026-10-31 | v0.6 C0 | J1 / J4 / J5 / J6 をユーザー裁定済 (推奨どおり) に。J6 の配線 (approve 時の再判定、`duplicate_at_approve`、AC 15) を §3.5 / §4 / §5 に | ユーザー承認、実装着手 | |
+| 2026-10-31 | v0.6.1 C0 | T1 レビューの追従: param 禁止語を閉じた句の表に (bare `point` と「`price` を含む」を廃止、§3.3)、exact は共通有限 1 以上・atol 1e-12・比較不能は不一致・exact 対は単調/類似から除外・warning は全部集める (§3.5) | /code-review high (T1) の #5 / #6 / #1 / #2 | |
