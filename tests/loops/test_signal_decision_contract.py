@@ -41,18 +41,27 @@ def test_decision_schema_only_allows_the_two_canonical_shapes():
             jsonschema.validate(payload, DECISION_SCHEMA)
 
 
-def test_decision_schema_is_a_single_typed_two_branch_anyof_without_if_then():
-    assert set(DECISION_SCHEMA) == {"anyOf"}
-    branches = DECISION_SCHEMA["anyOf"]
-    assert len(branches) == 2
-    for branch, value in zip(branches, ("accept", "reject")):
-        assert branch["type"] == "object"
-        assert branch["additionalProperties"] is False
-        assert branch["required"] == ["decision", "reject_code"]
-        assert branch["properties"]["decision"]["enum"] == [value]
-    dumped = json.dumps(DECISION_SCHEMA)
-    assert '"if"' not in dumped
-    assert '"allOf"' not in dumped
+def test_decision_schema_is_flat_object_with_if_then_else_and_no_top_level_combinators():
+    assert DECISION_SCHEMA["type"] == "object"
+    assert DECISION_SCHEMA["additionalProperties"] is False
+    assert DECISION_SCHEMA["required"] == ["decision", "reject_code"]
+    for key in ("anyOf", "allOf", "oneOf"):
+        assert key not in DECISION_SCHEMA
+    assert DECISION_SCHEMA["if"] == {"properties": {"decision": {"const": "accept"}}}
+    assert DECISION_SCHEMA["then"] == {"properties": {"reject_code": {"type": "null"}}}
+    assert DECISION_SCHEMA["else"] == {"properties": {"reject_code": {"type": "string"}}}
+    props = DECISION_SCHEMA["properties"]
+    assert props["decision"] == {"type": "string", "enum": ["accept", "reject"]}
+    assert props["reject_code"]["type"] == ["string", "null"]
+    assert props["reject_code"]["enum"] == [None, *REJECT_CODES]
+
+
+def test_if_then_else_correlates_decision_and_code():
+    validator = jsonschema.Draft202012Validator(DECISION_SCHEMA)
+    assert not validator.is_valid({"decision": "accept", "reject_code": "news_shock"})
+    assert not validator.is_valid({"decision": "reject", "reject_code": None})
+    assert validator.is_valid({"decision": "accept", "reject_code": None})
+    assert validator.is_valid({"decision": "reject", "reject_code": "opposite_position"})
 
 
 @pytest.mark.parametrize(

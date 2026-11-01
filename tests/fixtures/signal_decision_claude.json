@@ -1,6 +1,10 @@
 {
-  "status": "未抽出",
-  "note": "実 Claude 応答の抽出前。realbackend job が初回成功したときの出力 (tmp の signal_decision_claude.json) を保存してこの形に置き換える。以下は期待形であり実応答ではない。",
-  "accept": null,
-  "reject": null
+  "accept": {
+    "decision": "accept",
+    "reject_code": null
+  },
+  "reject": {
+    "decision": "reject",
+    "reject_code": "opposite_position"
+  }
 }

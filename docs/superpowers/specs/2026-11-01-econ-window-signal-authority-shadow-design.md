@@ -1,6 +1,6 @@
 # 指標回避帯・シグナル採否契約・shadow 成績・反応統計 — 設計 C0
 
-**版:** v0.9.1 C0（2026-11-01、設計レビュー 8 周を全件反映、J1〜J3 利用者承認済、実装待ち）
+**版:** v0.9.2 C0（2026-11-01、設計レビュー 8 周を全件反映、J1〜J3 利用者承認済、実装待ち）
 **対象:** `econ-event-hold-window-deterministic` / `llm-vs-strategy-signal-authority` / `econ-event-actuals-and-reaction-stats`。実装は束 1 と束 2 に分けるが、本書を共通契約とする。
 
 ## 0. 目的と非目標
@@ -155,7 +155,7 @@ cron mission は signal の有無にかかわらず signal を claim・注入せ
 
 **spread の記録。** 専用 mission は commit-core の前に lock の外で、鮮度と `bid ≤ ask` を検査する既存の quote 取得経路（§1）から対象 pair の quote を 1 回取る。source 関数を直接呼ばない。bid・ask が有限で `ask > bid > 0` なら `(ask-bid)/pip_size` を `spread_source=quote` で、取れない・条件を満たさない（既存の検査が通す bid = ask を含む）なら `risk.pair_rules` の assumed spread を `spread_source=assumed` で shadow に保存する。system reject も同じにする。
 
-Claude backend に渡す schema は最上位を object とし、全 property に型を持たせる。
+Claude backend に渡す schema は最上位を object とし、全 property に型を持たせる。Anthropic API は `--json-schema` の最上位 `anyOf` / `allOf` / `oneOf` を 400（`input_schema does not support oneOf, allOf, or anyOf at the top level`）で拒否し、最上位 `type: object` を要求する。実 CLI で最上位の `if` / `then` / `else` は受理され、accept / reject 両 prompt で正しい構造化出力を得た（実測）。そのため相関は最上位の if/then/else で持つ。
 
 ```json
 {
@@ -168,7 +168,10 @@ Claude backend に渡す schema は最上位を object とし、全 property に
       "enum": [null, "news_shock", "opposite_position"]
     }
   },
-  "required": ["decision", "reject_code"]
+  "required": ["decision", "reject_code"],
+  "if": {"properties": {"decision": {"const": "accept"}}},
+  "then": {"properties": {"reject_code": {"type": "null"}}},
+  "else": {"properties": {"reject_code": {"type": "string"}}}
 }
 ```
 
@@ -452,7 +455,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
 
 2. cron と専用採否 mission を同じ判断足で due にし、cron が先に 1 回受理され watermark が進み、通常 schema で裁量判断すること、cron が signal を claim しないこと、signal が pending のまま次の idle tick で専用 mission に 1 件だけ claim されることを test する。2 mission は同時に runner / commit-core へ入らない。cron mission の tool 一覧に signal 一覧が無く、ask の一覧には残り、専用採否 mission の一覧はニュース検索と建玉一覧だけであることも確かめる。
 3. 専用 schema は accept+null / reject+2 語だけを通す。未知 key/code、相関不一致、hold、通常 intent は schema / Python の片方だけを迂回しても失敗する。逆建玉なしの `opposite_position` も `signal_decision_invalid`、failed、requeue になる。
-4. **Claude 実往復（merge 前必須、`realbackend` profile）。** `runner.trade.backend=claude`、設定済み `runner.claude.bin`、サブスクリプション認証だけを使い、accept と reject を各 1 往復する。reject 入力は同じ pair に逆方向の `OPEN` order がある場面へ固定し、最大 3 往復で正しい reject が 1 回も得られなければ fail とする。両 case で実 CLI に `--json-schema` を渡し、最上位 type、property type、local 条件節の typed const、parser の相関を検証する。sanitized transcript と CLI version / model / schema hash は `tmp/econ-window-acceptance/claude/` にだけ出す。追跡する固定 JSON は T3 が最初の確定時に 1 回だけ抽出して commit 対象へ置き、merge 前 job は tmp の応答をその形と照合するだけで `tests/fixtures/econ_signal_claude_accept.json` / `econ_signal_claude_reject.json` を書き換えない。通常 suite では既存 `realbackend` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` で両 case の成功を必須にする。Anthropic API key は使わない。
+4. **Claude 実往復（merge 前必須、`realbackend` profile）。** `runner.trade.backend=claude`、設定済み `runner.claude.bin`、サブスクリプション認証だけを使い、accept と reject を各 1 往復する。reject 入力は同じ pair に逆方向の `OPEN` order がある場面へ固定し、最大 3 往復で正しい reject が 1 回も得られなければ fail とする。両 case で実 CLI に `--json-schema` を渡し、最上位 type が object で anyOf / allOf / oneOf を持たないこと（実測では最上位 anyOf 等は 400）、property type、最上位 if/then/else による相関、parser の相関を検証する。sanitized transcript と CLI version / model / schema hash は `tmp/econ-window-acceptance/claude/` にだけ出す。追跡する固定 JSON は T3 が最初の確定時に 1 回だけ抽出して commit 対象へ置き、merge 前 job は tmp の応答をその形と照合するだけで `tests/fixtures/econ_signal_claude_accept.json` / `econ_signal_claude_reject.json` を書き換えない。通常 suite では既存 `realbackend` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` で両 case の成功を必須にする。Anthropic API key は使わない。
 5. accept は intent 記録前に window を再判定し、帯へ入っていれば intent 0、system reject、reject shadow、consume、`system_filtered`。帯外なら intent / decision / accept shadow / consume / completed が同じ transaction で確定後に executor が走る。通常の資金 gate 拒否でも decision=accept と accept shadow は残る。
 6. lock timeout、snapshot stale、source inactive、signal stale、data state not ready、未 claim の鮮度切れの表を test し、decision / shadow が 0、signal が指定どおり requeue / abandoned になり、reason が §3.3 の表どおりになる。signal stale は commit-core の時刻 > f で判定し、runner が f 後に戻った場合も abandoned、requeue 歴の有無で `freshness_expired` / `requeued_expired` に分かれる。abandoned は decision 分母に入らない。
 7. 任意の decision / shadow / consume / mission 書込み失敗で transaction 全体が rollback し、finalized / consumed は false。retry しても decision は signal ごとに最大 1 行。DB CHECK は NULL 三値を含む不正形を拒否する。
@@ -612,3 +615,4 @@ J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、
 | 2026-11-01 | v0.8.1 C0 | `abandon_claimed()` に UTC 時刻と reason を引数で渡し、`trade_loop.py` の呼出側 3 箇所を T1a の所有に含めて T2b-1 へ引き渡す | 設計レビュー 8 周目 (閉鎖確認) の残り Critical 1 | — |
 | 2026-11-01 | v0.9 C0 | J1〜J3 を利用者承認済（推奨どおり: reject code 2 語、帯 3 / 30 / 15、方針既定文）に | ユーザー承認、実装着手 | — |
 | 2026-11-01 | v0.9.1 C0 | v3 rebuild の FK 検査を子表 3 本に訂正（他表の違反は warning）、CHECK 正規化の規則、`signal_shadow` の複合 FK、slice set の値域 CHECK を足す | T1a /code-review 2 周目の裁定 | — |
+| 2026-11-01 | v0.9.2 C0 | §3.2 の Claude 向け schema を最上位 object + if/then/else の 1 本にし、§5-4 に最上位 anyOf / allOf / oneOf が 400 になる実測を足す | claude --json-schema の実測で最上位 anyOf/allOf/oneOf は 400、if/then/else は受理 | — |

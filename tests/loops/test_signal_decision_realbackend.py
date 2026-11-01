@@ -3,7 +3,7 @@
 reject 場面は USDJPY short の OPEN order を持つ DB を用意し、`get_positions` だけを
 登録した本番と同じ MCP spool dispatcher を runner に繋いで通す。固定 JSON
 (`tests/fixtures/signal_decision_claude.json`) は実 Claude 応答を一度保存するまで
-「未抽出」で、その間は出力を tmp に書くだけで照合しない。
+実応答は 2026-11-01 に抽出済み (fixture と照合する)。「未抽出」の間は出力を tmp に書くだけで照合しない。
 """
 from __future__ import annotations
 
@@ -92,7 +92,6 @@ def test_signal_decision_claude_accept_and_opposite_position_reject(tmp_path):
     registry.register_all([t for t in account_tools.build(conn, broker)
                            if t.name == "get_positions"])
     assert set(registry.names()) <= set(SIGNAL_DECISION_TOOLS)
-    runner, dispatcher = _runner(tmp_path, settings, registry)
     tools = ["get_positions"]
     missions = {
         "accept": Mission(
@@ -109,15 +108,19 @@ def test_signal_decision_claude_accept_and_opposite_position_reject(tmp_path):
     results: dict[str, object] = {}
     try:
         for name, mission in missions.items():
-            argv = runner._build_argv(mission, mcp_spool=runner.mcp_spool_dir)
-            assert json.loads(argv[argv.index("--json-schema") + 1]) == DECISION_SCHEMA
-            result = runner.run(mission)
-            assert result.status == "completed", result.reason
-            assert result.output is not None
-            jsonschema.validate(result.output, DECISION_SCHEMA)
-            results[name] = result.output
+            # 1 mission の workdir は 1 回の run() でしか使えない (prompt.txt は O_EXCL)
+            runner, dispatcher = _runner(tmp_path / name, settings, registry)
+            try:
+                argv = runner._build_argv(mission, mcp_spool=runner.mcp_spool_dir)
+                assert json.loads(argv[argv.index("--json-schema") + 1]) == DECISION_SCHEMA
+                result = runner.run(mission)
+                assert result.status == "completed", result.reason
+                assert result.output is not None
+                jsonschema.validate(result.output, DECISION_SCHEMA)
+                results[name] = result.output
+            finally:
+                dispatcher.stop()
     finally:
-        dispatcher.stop()
         conn.close()
 
     (tmp_path / "signal_decision_claude.json").write_text(

@@ -15,29 +15,20 @@ from agentic_fx.core.contracts import Direction, OrderStatus
 REJECT_CODES = ("news_shock", "opposite_position")
 SIGNAL_DECISION_TOOLS = ("search_news", "get_positions")
 
-# Two typed, closed branches.  Each branch pins ``decision`` with a single-value
-# enum so the pair is correlated without if/then (not accepted by every backend).
+# Flat object: the Anthropic API rejects a top-level anyOf/allOf/oneOf in
+# ``--json-schema`` and requires ``type: object``.  The accept/reject
+# correlation is carried by top-level if/then/else, which it accepts.
 DECISION_SCHEMA: dict[str, Any] = {
-    "anyOf": [
-        {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "decision": {"type": "string", "enum": ["accept"]},
-                "reject_code": {"type": "null"},
-            },
-            "required": ["decision", "reject_code"],
-        },
-        {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "decision": {"type": "string", "enum": ["reject"]},
-                "reject_code": {"type": "string", "enum": list(REJECT_CODES)},
-            },
-            "required": ["decision", "reject_code"],
-        },
-    ],
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "decision": {"type": "string", "enum": ["accept", "reject"]},
+        "reject_code": {"type": ["string", "null"], "enum": [None, *REJECT_CODES]},
+    },
+    "required": ["decision", "reject_code"],
+    "if": {"properties": {"decision": {"const": "accept"}}},
+    "then": {"properties": {"reject_code": {"type": "null"}}},
+    "else": {"properties": {"reject_code": {"type": "string"}}},
 }
 
 
