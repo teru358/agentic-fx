@@ -329,6 +329,31 @@ def test_run_backtest_handler_returns_json_safe_limited_reply(
     assert "content_hash" not in out
 
 
+def test_run_backtest_reply_carries_skipped_bar_counts_by_reason_only(
+        loop_full, tmp_path, monkeypatch):
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(monkeypatch)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_adapter.build_intent_source",
+        lambda meta, **kw: SimpleNamespace(
+            close=lambda: None,
+            skip_counts={"reference_window_exceeded_at_runtime": 7}))
+    staging_dir = tmp_path / "staging"
+    (staging_dir / "myst").mkdir(parents=True)
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"run_backtest": 600.0})
+    handlers = loop_full._build_rpc_handlers(ledger, staging_dir=staging_dir)
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=handlers["run_backtest"],
+        analyze_corr_handler=handlers["analyze_corr"])}
+
+    out = tools["run_backtest"].func(name="myst", pair="USDJPY")
+
+    json.dumps(out)
+    assert out["skipped_bars_by_reason"] == {
+        "reference_window_exceeded_at_runtime": 7}
+    assert "skipped_bars_by_reason" not in (getattr(out, "save_kwargs", None) or {})
+
+
 def test_run_backtest_handler_source_follows_backtest_settings(
         loop_no_seam, tmp_path, monkeypatch):
     loop, _ = loop_no_seam

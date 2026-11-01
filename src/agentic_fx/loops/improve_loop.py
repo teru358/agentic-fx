@@ -229,7 +229,8 @@ def _current_rpc_abandoned() -> bool:
 
 def _backtest_reply_from_save_kwargs(
         save_kwargs: dict, *, submission_blocked: dict | None = None,
-        started: bool = True) -> dict:
+        started: bool = True,
+        skipped_bars_by_reason: dict | None = None) -> dict:
     """永続化用 save kwargs を JSON-safe な RPC 応答へ限定投影する。
     期間端点 (`period`) と保存時刻 (`now`) は agent に見せない (遮断 7、
     `improve_rpc_tools._FORBIDDEN_KEYS`) — 台帳用の元データは属性で運ぶ。
@@ -242,7 +243,10 @@ def _backtest_reply_from_save_kwargs(
 
     [indicator-consumption-wiring] T5b Step 5-4c: `started` は F4 の裏
     (成功応答にも `started` キーを載せる) — 子が解放しない判定を
-    キーの有無ではなく値で行えるようにする。"""
+    キーの有無ではなく値で行えるようにする。
+
+    `skipped_bars_by_reason` は strategy を評価できなかった足の数を固定 reason
+    ごとに数えた公開面だけの情報 (日時・値は無い)。0 件ならキー自体を作らない。"""
     reply = {
         "scope": save_kwargs["scope"],
         "pair": save_kwargs["pair"],
@@ -253,6 +257,8 @@ def _backtest_reply_from_save_kwargs(
     }
     if submission_blocked is not None:
         reply["submission_blocked"] = submission_blocked
+    if skipped_bars_by_reason:
+        reply["skipped_bars_by_reason"] = dict(skipped_bars_by_reason)
     reply["started"] = started
     return _BacktestReply(reply, save_kwargs)
 
@@ -1683,6 +1689,7 @@ class ImproveLoop:
                     plugin=args["name"], pair=args["pair"],
                     deps=len(meta.indicators))
             save_kwargs = captured[0]
+            skipped_bars = dict(getattr(intent_source, "skip_counts", None) or {})
             # [profitability-floor] T2 Step 2-1 (2026-09-13、設計書 §6
             # T2、codex I7): `submission_blocked` は親 handler (ここ) の
             # 1 箇所だけで導出する — `self._settings` を既に持っている
@@ -1712,7 +1719,8 @@ class ImproveLoop:
                     Category.IMPROVE, "archive_skipped_late",
                     f"mission={staging_dir.name} name={args.get('name')}")
                 return _backtest_reply_from_save_kwargs(
-                    save_kwargs, submission_blocked=submission_blocked)
+                    save_kwargs, submission_blocked=submission_blocked,
+                    skipped_bars_by_reason=skipped_bars)
             artifact_hash = artifact_hash_bytes(
                 plugin_py, config_yaml, test_plugin)
             archive_tmp = (self._root / "plugins" / "_archive" /
@@ -1748,7 +1756,8 @@ class ImproveLoop:
                     save_kwargs["artifact_hash"] = artifact_hash
                     save_kwargs["archive_tmp"] = str(archive_tmp)
             return _backtest_reply_from_save_kwargs(
-                save_kwargs, submission_blocked=submission_blocked)
+                save_kwargs, submission_blocked=submission_blocked,
+                skipped_bars_by_reason=skipped_bars)
 
         def analyze_corr_handler(args: dict) -> dict:
             try:
