@@ -176,3 +176,40 @@ def test_news_keys_are_not_affected_by_the_econ_outcome(conn):
     assert fa.load(conn, key) == (NOW, timedelta(0))
     assert "last_outcome" not in conn.execute(
         "SELECT value FROM alert_state WHERE key=?", (key,)).fetchone()[0]
+
+
+def _put(conn, **fields):
+    import json
+    conn.execute("INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?)",
+                 (fa.ECON_KEY, json.dumps(
+                     {"attempted_at": NOW.isoformat(), "retry_after_sec": 0,
+                      **fields}), NOW.isoformat()))
+    conn.commit()
+
+
+@pytest.mark.parametrize("outcome", [None, "pending", "", 3])
+def test_a_missing_or_unknown_outcome_is_unknown_not_fresh(conn, outcome):
+    fields = {"last_success_at": NOW.isoformat()}
+    if outcome is not None:
+        fields["last_outcome"] = outcome
+    _put(conn, **fields)
+    assert fa.freshness(conn, fa.ECON_KEY, NOW) == "unknown"
+
+
+def test_a_success_in_the_future_is_unknown(conn):
+    _put(conn, last_outcome="success",
+         last_success_at=(NOW + timedelta(microseconds=1)).isoformat())
+    assert fa.freshness(conn, fa.ECON_KEY, NOW) == "unknown"
+    _put_again = (NOW).isoformat()
+    conn.execute("UPDATE alert_state SET value=?", (
+        '{"attempted_at": "%s", "retry_after_sec": 0, "last_outcome": "success",'
+        ' "last_success_at": "%s"}' % (_put_again, _put_again),))
+    conn.commit()
+    assert fa.freshness(conn, fa.ECON_KEY, NOW) == "fresh"
+
+
+def test_the_interval_has_a_single_source_in_the_scheduler():
+    import inspect
+    from agentic_fx.core import scheduler
+    assert scheduler._ECON_INTERVAL is fa.ECON_REFRESH_INTERVAL
+    assert "fetch_attempts.ECON_REFRESH_INTERVAL" in inspect.getsource(scheduler)

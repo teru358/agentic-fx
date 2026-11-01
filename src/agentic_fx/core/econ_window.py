@@ -188,8 +188,9 @@ def components(events: Iterable[EconEvent], rule: WindowRule,
                ) -> tuple[Component, ...]:
     """対象 event の帯を連結成分にまとめる。開始の早い順。
 
-    渡された event だけを見る。query が候補を絞っていれば、その外にある
-    event が成分をさらに延ばしていることがある。
+    渡された event だけを見るので、成分 id を使う呼出しは候補を絞った query
+    の結果を渡してはいけない。`econ_events.active_components` /
+    `bar_components` が連結閉包を取ってから呼ぶ。
     """
     spans = sorted(((*window_of(e, rule.settings), e)
                     for e in _targets(events, rule)),
@@ -205,22 +206,6 @@ def components(events: Iterable[EconEvent], rule: WindowRule,
         Component(id=min(e.id for e in members), events=tuple(members),
                   start=start, end=end)
         for start, end, members in groups)
-
-
-def active_components(now: datetime, events: Iterable[EconEvent],
-                      rule: WindowRule) -> tuple[Component, ...]:
-    now = _utc(now, "now")
-    return tuple(c for c in components(events, rule) if c.start <= now <= c.end)
-
-
-def bar_components(bar_open: datetime, bar_close: datetime,
-                   events: Iterable[EconEvent], rule: WindowRule,
-                   ) -> tuple[Component, ...]:
-    bar_open, bar_close = _utc(bar_open, "bar_open"), _utc(bar_close, "bar_close")
-    if bar_close < bar_open:
-        raise ValueError("bar_close must not precede bar_open")
-    return tuple(c for c in components(events, rule)
-                 if c.start <= bar_close and c.end >= bar_open)
 
 
 def next_event(now: datetime, events: Iterable[EconEvent], rule: WindowRule,

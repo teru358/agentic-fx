@@ -192,7 +192,8 @@ def freshness(conn: sqlite3.Connection, key: str, now: datetime, *,
 
     成功が一度も記録されていなければ unknown。直近の取得が失敗、または最後の
     成功から `refresh_interval` の 2 倍を超えていれば stale (ちょうどは fresh)。
-    それ以外は fresh。値が読めないときも unknown (新しいとは言えない)。
+    それ以外は fresh。値が読めないとき、結果の種別が success / failure でないとき、
+    最後の成功が `now` より未来のときも unknown (新しいとは言えない)。
     """
     now = _utc(now)
     row = conn.execute(
@@ -207,6 +208,8 @@ def freshness(conn: sqlite3.Connection, key: str, now: datetime, *,
         success = _utc(datetime.fromisoformat(raw_success))
         outcome = data.get("last_outcome")
     except (ValueError, TypeError, AttributeError):
+        return FRESHNESS_UNKNOWN
+    if outcome not in (OUTCOME_SUCCESS, OUTCOME_FAILURE) or success > now:
         return FRESHNESS_UNKNOWN
     if outcome == OUTCOME_FAILURE or now - success > refresh_interval * 2:
         return FRESHNESS_STALE

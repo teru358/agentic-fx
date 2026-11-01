@@ -260,20 +260,21 @@ class EconCalendar:
         時刻が変わった event の置換 → 対象 event × pair の set の作成 /
         cancelled 化 / 再有効化、の順に別々の transaction で commit する
         (event の保存と同じ transaction は要求しない)。失敗しても取引は止めず、
-        保存済みの row は次の refresh か起動時の補完 (`sync_sets`) が拾う。
+        保存済みの row と commit されなかった supersede (保留として永続化)
+        は次の refresh か起動時の補完 (`sync_sets`) が拾う。
         """
         self.last_pass = None
         try:
             now = self._now()
-            keys = [(ev["ts"], ev["country"], ev["name"]) for ev in events]
-            done = econ_events.supersede_tx(
-                self.conn, new_ids=new_ids, fetched_keys=keys, now=now,
-                begin=self.begin)
-            if not done.committed:
-                _log.warning("econ supersede not committed (%s)", done.status)
+            econ_events.save_pending_supersede(
+                self.conn, new_ids=new_ids, now=now,
+                fetched_keys=[(ev["ts"], ev["country"], ev["name"])
+                              for ev in events])
+            done = self._run_pending_supersede(now)
+            if done is None:
                 return
             sync = self.sync_sets(now=now)
-            self.last_pass = RefreshPass(tuple(done.value), sync)
+            self.last_pass = RefreshPass(tuple(done), sync)
         except Exception as e:  # noqa: BLE001 — pass の失敗で取引を止めない
             text = safe_error_text(e)
             _log.warning("econ refresh pass failed: %s", text)
@@ -283,6 +284,19 @@ class EconCalendar:
             except Exception:  # noqa: BLE001
                 _log.exception("econ refresh pass failed and activity failed")
 
+    def _run_pending_supersede(self, now: datetime,
+                               ) -> list[tuple[int, int]] | None:
+        """保留中の supersede を実行する。保留が無ければ `[]`、commit
+        されなければ `None` (保留は残り、次の refresh か起動時補完が再試行)。"""
+        result = econ_events.supersede_pending_tx(
+            self.conn, now=now, begin=self.begin)
+        if result is None:
+            return []
+        if not result.committed:
+            _log.warning("econ supersede not committed (%s)", result.status)
+            return None
+        return result.value
+
     def sync_sets(self, *, now: datetime | None = None,
                   ) -> ohlcv_slices.SyncResult | None:
         """対象 event × pair の set 台帳を保存済み row 全体に揃える (冪等)。
@@ -291,10 +305,14 @@ class EconCalendar:
         (superseded・importance 低下・pair 削除)、設定由来の再有効化。supersede
         は含まない。refresh の直後の pass と worker 起動時の補完が使う。
         pair の設定が無ければ何もしない (`None`)。commit されなければ `None`。
+        先に commit されていない supersede の保留を実行する (commit されなければ
+        set は触らず `None`、保留は残る)。
         """
+        now = self._now() if now is None else now
+        if self._run_pending_supersede(now) is None:
+            return None
         if not self.pair_currencies:
             return None
-        now = self._now() if now is None else now
         targets = ohlcv_slices.event_set_targets(
             self.conn, importance_min=self.window.importance_min,
             pair_currencies=self.pair_currencies)

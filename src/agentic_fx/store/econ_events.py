@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Collection, Iterable, NamedTuple
 
 from agentic_fx.core.econ_window import (
-    ALL_COUNTRY, NEXT_EVENT_HORIZON, EconEvent, WindowSettings)
+    ALL_COUNTRY, NEXT_EVENT_HORIZON, Component, EconEvent, WindowRule,
+    WindowSettings, components)
 from agentic_fx.store.short_tx import Begin, TxResult, begin_immediate, short_tx
 
 _log = logging.getLogger("agentic_fx.econ")
@@ -17,6 +19,9 @@ _SQL_SLACK = timedelta(seconds=1)
 
 # 時刻が変わった event の旧 row を置き換える範囲 (新 row との時刻差)。
 SUPERSEDE_RANGE = timedelta(days=7)
+
+# commit されなかった supersede の保留 (alert_state の値は JSON)。
+PENDING_SUPERSEDE_KEY = "econ.supersede_pending"
 
 
 class Upserted(NamedTuple):
@@ -140,6 +145,54 @@ def upcoming_targets(conn: sqlite3.Connection, now: datetime, *,
                           currencies=currencies)
 
 
+def _closure(conn: sqlite3.Connection, *, lo: datetime, hi: datetime,
+             settings: WindowSettings, currencies: Collection[str],
+             ) -> list[EconEvent]:
+    """`[lo, hi]` と帯が交差する event を含む連結成分の、全 event。
+
+    ts の範囲を、取れた event の帯の両端に合わせて広げ直し、広がらなくなる
+    まで繰り返す。
+    """
+    lo, hi = _utc(lo, "lo"), _utc(hi, "hi")
+    ts_lo, ts_hi = lo - settings.after, hi + settings.before
+    while True:
+        events = events_between(
+            conn, lo=ts_lo, hi=ts_hi, importance_min=settings.importance_min,
+            currencies=currencies)
+        if not events:
+            return events
+        new_lo = min(e.ts for e in events) - settings.before - settings.after
+        new_hi = max(e.ts for e in events) + settings.after + settings.before
+        new_lo, new_hi = min(new_lo, ts_lo), max(new_hi, ts_hi)
+        if (new_lo, new_hi) == (ts_lo, ts_hi):
+            return events
+        ts_lo, ts_hi = new_lo, new_hi
+
+
+def active_components(conn: sqlite3.Connection, now: datetime, *,
+                      settings: WindowSettings, currencies: Collection[str],
+                      ) -> tuple[Component, ...]:
+    """`now` が掛かる連結成分。成分は DB の連結閉包から作るので、`id` は
+    now 付近に無い event を含む全体の最小値になる。"""
+    now = _utc(now, "now")
+    return bar_components(conn, now, now, settings=settings,
+                          currencies=currencies)
+
+
+def bar_components(conn: sqlite3.Connection, bar_open: datetime,
+                   bar_close: datetime, *, settings: WindowSettings,
+                   currencies: Collection[str]) -> tuple[Component, ...]:
+    """足 `[bar_open, bar_close]` と交差する連結成分 (開始の早い順)。"""
+    bar_open, bar_close = _utc(bar_open, "bar_open"), _utc(bar_close, "bar_close")
+    if bar_close < bar_open:
+        raise ValueError("bar_close must not precede bar_open")
+    events = _closure(conn, lo=bar_open, hi=bar_close, settings=settings,
+                      currencies=currencies)
+    rule = WindowRule.for_currencies(settings, currencies)
+    return tuple(c for c in components(events, rule)
+                 if c.start <= bar_close and c.end >= bar_open)
+
+
 # --- 時刻が変わった event の置換 -------------------------------------------
 
 def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
@@ -147,7 +200,9 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                     now: datetime) -> list[tuple[int, int]]:
     """今回の取得で新しく入った row が置き換えた旧 row に `superseded_by` を書く。
 
-    commit しない。置換されるのは次をすべて満たす旧 row だけ:
+    commit しない。置き換える側は `new_ids` のうち `fetched_keys` に載っていて
+    superseded でない row だけ (古い保留の row が現在の取得結果から消えていても
+    何も置換しない)。置換されるのは次をすべて満たす旧 row だけ:
     新 row と同じ `(country, name)`、`superseded_by IS NULL`、`ts > now`
     (未発表)、新 row との時刻差が `SUPERSEDE_RANGE` 以内、
     `(ts, country, name)` が今回の取得結果 `fetched_keys` に無い。
@@ -173,7 +228,8 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                 f"FROM econ_events WHERE id IN ({','.join('?' * len(chunk))})",
                 chunk):
             event = _parse(row)
-            if event is not None:
+            if (event is not None and event.superseded_by is None
+                    and (event.ts, event.country, event.name) in fetched):
                 news.append(event)
     olds: dict[tuple[str, str], list[EconEvent]] = {}
     for country, name in sorted({(e.country, e.name) for e in news}):
@@ -215,5 +271,76 @@ def supersede_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
     def body():
         return {"value": supersede_in_tx(
             conn, new_ids=new_ids, fetched_keys=fetched_keys, now=now)}
+
+    return short_tx(conn, begin, body)
+
+
+# --- commit されなかった supersede の保留 ----------------------------------
+
+def save_pending_supersede(conn: sqlite3.Connection, *, new_ids: Iterable[int],
+                           fetched_keys: Collection[tuple[datetime, str, str]],
+                           now: datetime) -> None:
+    """今回の refresh の新規 row と取得結果を保留に足す (commit する)。
+
+    未完の保留があれば new_ids は和集合、取得結果は今回のものに置き換える
+    (最新の feed が正本)。supersede が commit された tx で消える。
+    """
+    ids = set(new_ids)
+    old = load_pending_supersede(conn)
+    if old is not None:
+        ids |= old[0]
+    value = json.dumps({
+        "new_ids": sorted(ids),
+        "fetched": sorted([_utc(ts, "fetched ts").isoformat(), country, name]
+                          for ts, country, name in fetched_keys)})
+    with conn:
+        conn.execute(
+            "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+            "updated_at=excluded.updated_at",
+            (PENDING_SUPERSEDE_KEY, value, _utc(now, "now").isoformat()))
+
+
+def load_pending_supersede(conn: sqlite3.Connection,
+                           ) -> tuple[set[int], list[tuple[datetime, str, str]]] | None:
+    """保留 `(new_ids, fetched_keys)`。無ければ None。壊れていれば警告して None
+    (壊れた保留で supersede が恒久的に止まらないよう、無いものとして扱う)。"""
+    row = conn.execute("SELECT value FROM alert_state WHERE key=?",
+                       (PENDING_SUPERSEDE_KEY,)).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row[0])
+        ids = {int(i) for i in data["new_ids"]}
+        keys = [(datetime.fromisoformat(ts), str(country), str(name))
+                for ts, country, name in data["fetched"]]
+        for ts, _, _ in keys:
+            _utc(ts, "pending ts")
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        _log.warning("econ pending supersede unreadable (%s); dropped", e)
+        with conn:
+            conn.execute("DELETE FROM alert_state WHERE key=?",
+                         (PENDING_SUPERSEDE_KEY,))
+        return None
+    return ids, keys
+
+
+def supersede_pending_tx(conn: sqlite3.Connection, *, now: datetime,
+                         begin: Begin = begin_immediate) -> TxResult | None:
+    """保留を 1 短 transaction で実行し、同じ transaction で保留を消す。
+
+    保留が無ければ None。commit されなければ保留は残る。`value` は
+    `(旧 row id, 新 row id)` の一覧。
+    """
+    pending = load_pending_supersede(conn)
+    if pending is None:
+        return None
+    ids, keys = pending
+
+    def body():
+        done = supersede_in_tx(conn, new_ids=ids, fetched_keys=keys, now=now)
+        conn.execute("DELETE FROM alert_state WHERE key=?",
+                     (PENDING_SUPERSEDE_KEY,))
+        return {"value": done}
 
     return short_tx(conn, begin, body)

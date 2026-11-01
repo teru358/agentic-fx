@@ -418,3 +418,78 @@ def test_a_failing_supersede_rolls_back_every_update(conn):
             fetched_keys=[(t + timedelta(hours=1), "USD", "A"),
                           (t + timedelta(hours=1), "USD", "B")])
     assert _sup(conn, o1) is None and _sup(conn, o2) is None
+
+
+# --- 連結閉包の成分 ---------------------------------------------------------
+
+def _chain(conn):
+    """TS-100m (id 低) → TS-50m → TS: 隣同士の帯が端で重なる 1 成分。"""
+    far = add(conn, ts=TS - timedelta(minutes=90), name="far")
+    mid = add(conn, ts=TS - timedelta(minutes=45), name="mid")
+    near = add(conn, ts=TS, name="near")
+    return far, mid, near
+
+
+def test_active_components_keep_the_minimum_id_of_the_whole_component(conn):
+    near = add(conn, ts=TS, name="near")                  # 先に入れるので id 小
+    far = add(conn, ts=TS - timedelta(minutes=90), name="far")
+    mid = add(conn, ts=TS - timedelta(minutes=45), name="mid")
+    assert near < far < mid
+    # now は near の帯だけに掛かり、候補 (now ± after/before) に far は入らない
+    now = TS + timedelta(minutes=10)
+    assert far not in ids(econ_events.window_candidates(
+        conn, now, settings=S, currencies=USDJPY))
+    comps = econ_events.active_components(conn, now, settings=S,
+                                          currencies=USDJPY)
+    assert len(comps) == 1
+    assert comps[0].id == near
+    assert sorted(ids(comps[0].events)) == sorted([far, mid, near])
+
+
+def test_the_component_id_is_the_older_events_when_it_has_the_minimum(conn):
+    far, mid, near = _chain(conn)
+    comps = econ_events.active_components(
+        conn, TS + timedelta(minutes=10), settings=S, currencies=USDJPY)
+    assert [c.id for c in comps] == [far]
+    assert sorted(ids(comps[0].events)) == [far, mid, near]
+
+
+def test_the_closure_stops_at_a_gap_and_ignores_other_currencies(conn):
+    far, mid, near = _chain(conn)
+    add(conn, ts=TS - timedelta(minutes=150) - US, name="gap")      # 1µs 離れる
+    add(conn, ts=TS - timedelta(minutes=135), country="CAD", name="cad")
+    comps = econ_events.active_components(
+        conn, TS, settings=S, currencies=USDJPY)
+    assert sorted(ids(comps[0].events)) == [far, mid, near]
+
+
+def test_bar_components_use_the_closure_and_the_bar_interval(conn):
+    far, mid, near = _chain(conn)
+    comps = econ_events.bar_components(
+        conn, TS + timedelta(minutes=5), TS + timedelta(minutes=6),
+        settings=S, currencies=USDJPY)
+    assert [c.id for c in comps] == [far]
+    assert econ_events.bar_components(
+        conn, TS + timedelta(hours=3), TS + timedelta(hours=4),
+        settings=S, currencies=USDJPY) == ()
+    with pytest.raises(ValueError):
+        econ_events.bar_components(conn, TS, TS - US, settings=S,
+                                   currencies=USDJPY)
+    with pytest.raises(ValueError):
+        econ_events.active_components(conn, datetime(2026, 1, 1), settings=S,
+                                      currencies=USDJPY)
+
+
+def test_a_new_row_missing_from_the_fetch_or_already_superseded_replaces_nothing(conn):
+    old = add(conn, ts=TS + timedelta(days=1))
+    new = add(conn, ts=TS + timedelta(days=1, hours=2))
+    now = TS
+    assert econ_events.supersede_in_tx(
+        conn, new_ids=[new], fetched_keys=[], now=now) == []
+    other = add(conn, ts=TS + timedelta(days=3), name="other")
+    conn.execute("UPDATE econ_events SET superseded_by=? WHERE id=?", (other, new))
+    key = (TS + timedelta(days=1, hours=2), "USD", "CPI")
+    assert econ_events.supersede_in_tx(
+        conn, new_ids=[new], fetched_keys=[key], now=now) == []
+    assert conn.execute("SELECT superseded_by FROM econ_events WHERE id=?",
+                        (old,)).fetchone()[0] is None

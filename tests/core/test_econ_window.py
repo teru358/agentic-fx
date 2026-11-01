@@ -260,17 +260,6 @@ def test_components_ignore_non_targets_and_do_not_depend_on_input_order():
     assert ew.components([], USDJPY) == ()
 
 
-def test_active_and_bar_components_select_by_now_and_by_bar():
-    a = ev(id=1, ts=TS)
-    z = ev(id=2, ts=TS + timedelta(hours=5))
-    assert [c.id for c in ew.active_components(TS, [a, z], USDJPY)] == [1]
-    assert ew.active_components(TS + timedelta(hours=2), [a, z], USDJPY) == ()
-    m = timedelta(minutes=1)
-    zs = ew.window_of(z, SETTINGS)[0]
-    assert [c.id for c in ew.bar_components(zs - m, zs, [a, z], USDJPY)] == [2]
-    assert ew.bar_components(zs - m - US, zs - US, [a, z], USDJPY) == ()
-
-
 # --- 次 event ---------------------------------------------------------------
 
 def test_next_event_at_seven_days_is_returned_and_one_microsecond_later_is_not():

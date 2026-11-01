@@ -288,6 +288,121 @@ def test_begin_that_yields_skips_the_pass_without_failing(tmp_path):
     assert len(sets(cal)) == 2
 
 
+def _moved(cal):
+    """A を保存して set を作り、B へ動かした refresh の前まで進める。"""
+    refresh(cal, [ff("US CPI", "USD", T1)])
+    old = event_id(cal, "US CPI", T1)
+    return old, T1 + timedelta(hours=2)
+
+
+def _superseded(cal, row_id):
+    return cal.conn.execute("SELECT superseded_by FROM econ_events WHERE id=?",
+                            (row_id,)).fetchone()[0]
+
+
+def _cancelled_for(cal, row_id):
+    return [r[0] for r in cal.conn.execute(
+        "SELECT state FROM ohlcv_slice_sets WHERE event_id=?", (row_id,))]
+
+
+def _pending(cal):
+    return cal.conn.execute(
+        "SELECT COUNT(*) FROM alert_state WHERE key=?",
+        (econ_events.PENDING_SUPERSEDE_KEY,)).fetchone()[0]
+
+
+def test_a_supersede_that_yielded_is_retried_by_the_next_refresh(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", moved)])
+    new = event_id(cal, "US CPI", moved)
+    assert _superseded(cal, old) is None and _pending(cal) == 1
+    assert cal.last_pass is None
+    cal.begin = ohlcv_slices.begin_immediate
+    refresh(cal, [ff("US CPI", "USD", moved)])      # B はもう新規ではない
+    assert _superseded(cal, old) == new and _pending(cal) == 0
+    assert cal.last_pass.superseded == ((old, new),)
+    assert _cancelled_for(cal, old) == ["cancelled", "cancelled"]
+    assert _cancelled_for(cal, new) == ["awaiting", "awaiting"]
+
+
+def test_a_supersede_that_raised_is_retried_by_the_next_refresh(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    with patch("agentic_fx.datafeed.econ_calendar.econ_events."
+               "supersede_pending_tx", side_effect=sqlite_error()):
+        assert refresh(cal, [ff("US CPI", "USD", moved)]) == 1
+    new = event_id(cal, "US CPI", moved)
+    assert _superseded(cal, old) is None and _pending(cal) == 1
+    refresh(cal, [ff("US CPI", "USD", moved)])
+    assert _superseded(cal, old) == new and _pending(cal) == 0
+    assert _cancelled_for(cal, old) == ["cancelled", "cancelled"]
+
+
+def test_a_failure_inside_the_supersede_transaction_keeps_the_pending(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    with patch("agentic_fx.store.econ_events.supersede_in_tx",
+               side_effect=sqlite_error()):
+        refresh(cal, [ff("US CPI", "USD", moved)])
+    assert _superseded(cal, old) is None and _pending(cal) == 1
+    refresh(cal, [ff("US CPI", "USD", moved)])
+    assert _superseded(cal, old) is not None and _pending(cal) == 0
+
+
+def test_the_startup_top_up_retries_a_pending_supersede(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", moved)])
+    assert _superseded(cal, old) is None
+    # 再起動: 新しい EconCalendar が同じ DB で sync_sets (起動時補完) を呼ぶ
+    cal2 = EconCalendar(cal.conn, cal.activity, cal.clock, timeout_sec=10,
+                        pair_currencies=PAIRS)
+    sync = cal2.sync_sets()
+    new = event_id(cal2, "US CPI", moved)
+    assert _superseded(cal2, old) == new and _pending(cal2) == 0
+    assert len(sync.cancelled) == 2
+    assert _cancelled_for(cal2, old) == ["cancelled", "cancelled"]
+
+
+def test_top_up_that_cannot_supersede_keeps_the_pending_and_makes_no_sets(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", moved)])
+    assert cal.sync_sets() is None
+    assert _pending(cal) == 1 and _superseded(cal, old) is None
+
+
+def test_pending_work_accumulates_across_unfinished_refreshes(tmp_path):
+    cal, _ = make(tmp_path)
+    refresh(cal, [ff("A", "USD", T1), ff("B", "EUR", T1)])
+    a, b = event_id(cal, "A"), event_id(cal, "B")
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("A", "USD", T1 + timedelta(hours=1)), ff("B", "EUR", T1)])
+    refresh(cal, [ff("A", "USD", T1 + timedelta(hours=1)),
+                  ff("B", "EUR", T1 + timedelta(hours=2))])
+    cal.begin = ohlcv_slices.begin_immediate
+    cal.sync_sets()
+    assert _superseded(cal, a) == event_id(cal, "A", T1 + timedelta(hours=1))
+    assert _superseded(cal, b) == event_id(cal, "B", T1 + timedelta(hours=2))
+    assert _pending(cal) == 0
+
+
+def test_an_unreadable_pending_is_dropped_with_a_warning(tmp_path, caplog):
+    cal, _ = make(tmp_path)
+    cal.conn.execute(
+        "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?)",
+        (econ_events.PENDING_SUPERSEDE_KEY, "{broken", NOW.isoformat()))
+    cal.conn.commit()
+    with caplog.at_level("WARNING", logger="agentic_fx.econ"):
+        refresh(cal, [ff("A", "USD", T1)])
+    assert "pending supersede unreadable" in caplog.text
+    assert _pending(cal) == 0 and len(sets(cal)) == 2
+
+
 def test_fetch_failure_runs_no_pass(tmp_path):
     cal, _ = make(tmp_path)
     with patch("httpx.get", side_effect=OSError("down")):

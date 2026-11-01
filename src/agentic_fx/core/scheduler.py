@@ -32,7 +32,7 @@ def _always_ready() -> str:
 _NEWS_INTERVAL = timedelta(minutes=30)
 # 経済指標カレンダーは **週次** の JSON なので 30 分ごとに取り直しても無駄。
 # ただし当日の forecast/previous は更新されうるので 1 日 1 回よりは細かく。
-_ECON_INTERVAL = timedelta(hours=6)
+_ECON_INTERVAL = fetch_attempts.ECON_REFRESH_INTERVAL
 _BAR_FRESHNESS = timedelta(minutes=5)
 
 
