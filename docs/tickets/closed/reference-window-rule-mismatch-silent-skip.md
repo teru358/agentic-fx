@@ -1,16 +1,16 @@
 ---
 id: reference-window-rule-mismatch-silent-skip
 title: 参照窓の規則が設定時と実行時で違い strategy が毎バー黙って skip
-status: 設計待ち
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-11-01
-closed: null
+closed: 2026-11-01
 related: []
 ---
 # [reference-window-rule-mismatch-silent-skip] 参照窓の規則が設定時と実行時で違い strategy が毎バー黙って skip
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -22,6 +22,9 @@ related: []
 
 ## 修正内容
 
+- 2026-11-01: 実行時も主 df の窓に入る参照バーの実数 (取引バー) で数え、判定は reference_window_fits の 1 関数を設定時と共有。backtest の agent 応答に skipped_bars_by_reason (件数のみ)、live の reference_unavailable 通知は (strategy, hash, reason) × UTC 日で 1 回。週末跨ぎ 400 本 pin、399 拒否、skip 件数、missing、日次 dedupe の test。spec reference-series v0.6.8。plugin 2693 / core 2299 / backtest+loops 2534 緑。CPU 予算は別チケット
+
 ## 経緯
 
 - 2026-11-01: 起票。
+- 2026-11-01: 是正内容 — 実行時も主 df の窓に入る参照バーの実数 (取引バー) で数え、判定は reference_window_fits の 1 関数を設定時と共有。backtest の agent 応答に skipped_bars_by_reason (件数のみ)、live の reference_unavailable 通知は (strategy, hash, reason) × UTC 日で 1 回。週末跨ぎ 400 本 pin、399 拒否、skip 件数、missing、日次 dedupe の test。spec reference-series v0.6.8。plugin 2693 / core 2299 / backtest+loops 2534 緑。CPU 予算は別チケット
