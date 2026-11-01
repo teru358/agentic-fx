@@ -296,3 +296,19 @@ def test_source_failure_without_retry_after_is_not_blocked(tmp_path):
         col.collect()
         col.collect()
     assert f.call_count == 2
+
+
+def test_feed_with_duplicate_items_is_stored_without_store_failure(tmp_path):
+    """実 feed と同じ形 (50 件中一意 48、重複 2) が保存失敗にならない。"""
+    conn, rag, col = _env(tmp_path)
+    news_sources.add(conn, name="s1", fetcher="feed", url="https://ex.com/rss",
+                     added_by="user", now=NOW, enabled=True)
+    items = [Article(url=f"https://ex.com/n{i}", title=f"t{i}", body=f"b{i}",
+                     published=None, source_name="s1") for i in range(48)]
+    feed = items[:10] + [items[3]] + items[10:30] + [items[20]] + items[30:]
+    assert len(feed) == 50
+    with patch("agentic_fx.datafeed.news_collector.fetch_feed", return_value=feed):
+        total = col.collect()
+    assert total == 48
+    assert rag.count_news() == 48
+    assert "news_store_failed" not in (tmp_path / "a.log").read_text()
