@@ -1875,3 +1875,91 @@ def test_data_migration_limit_row_payload_bytes_include_limit_fields(tmp_path):
         '"expires_in": "4h", "live_source": "mt5", "source": "mt5", '
         '"interval": "15m", "bar_time": "2026-10-30T12:30:00+00:00", '
         '"bars_origin": "mt5:15m"}')
+
+
+# --- migration は live と同じ公開検証を通す ---------------------------------
+
+_VALID_LEGACY = {
+    "action": "open", "rationale": "r", "direction": "long",
+    "entry_type": "market", "limit_price": None, "stop_loss": 151.2,
+    "take_profit": None, "live_source": "mt5", "source": "mt5",
+    "interval": "15m", "bar_time": "2026-10-30T12:00:00+00:00",
+    "bars_origin": "mt5:15m",
+}
+
+
+@pytest.mark.parametrize("override", [
+    {"action": "close"},
+    {"direction": "sideways"},
+    {"direction": None},
+    {"stop_loss": None},
+    {"entry_type": "limit", "limit_price": None},
+    {"entry_type": "stop"},
+    {"stop_loss": -1.0},
+    {"stop_loss": "abc"},
+    {"take_profit": -3.0},
+    {"entry_type": "limit", "limit_price": "x"},
+])
+def test_migration_abandons_payloads_the_live_validation_rejects(tmp_path, override):
+    conn = _v5(tmp_path)
+    mid = _mission(conn, "running")
+    sid = _raw_signal(conn, content_hash="bad", status="claimed", claimed_by=mid,
+                      claimed_at="2026-10-30T12:46:00+00:00")
+    conn.execute("UPDATE signals SET payload_json=? WHERE id=?",
+                 (json.dumps({**_VALID_LEGACY, **override}), sid))
+    conn.commit()
+    init_db(conn)
+    row = conn.execute(
+        "SELECT status, abandon_reason, abandoned_at, claimed_by_mission_id, "
+        "claimed_at, contract_version FROM signals WHERE id=?", (sid,)).fetchone()
+    assert (row[0], row[1]) == ("abandoned", "normalization_failed")
+    assert row[2] is not None and row[3] is None and row[4] is None
+    assert row[5] is None
+
+
+def test_normalize_strategy_result_rejects_unvalidated_shapes():
+    from agentic_fx.plugin.strategy_adapter import normalize_strategy_result
+    base = {"action": "open", "rationale": "r", "direction": "long",
+            "entry_type": "market", "limit_price": None, "stop_loss": 1.0,
+            "take_profit": None}
+    assert normalize_strategy_result(base, "USDJPY")["action"] == "open"
+    for override in ({"action": "close"}, {"direction": None},
+                     {"stop_loss": None}, {"stop_loss": -1.0},
+                     {"entry_type": "limit", "limit_price": None}):
+        with pytest.raises(ValueError):
+            normalize_strategy_result({**base, **override}, "USDJPY")
+
+
+def _abandoned_row(conn, *, plugin, reason, kind="strategy", contract="executable_v1",
+                   at="2026-10-30T12:00:00+00:00", h):
+    conn.execute(
+        "INSERT INTO signals (plugin,content_hash,pair,timeframe,bar_ts,kind,"
+        "payload_json,status,abandon_reason,abandoned_at,contract_version,"
+        "created_at) VALUES (?,?,'USDJPY','15m',?,?,'{}','abandoned',?,?,?,?)",
+        (plugin, h, at, kind, reason, at, contract, NOW_UTC))
+    conn.commit()
+
+
+def test_one_classification_branch_drives_all_abandoned_aggregates(tmp_path):
+    conn = connect(tmp_path / "mixed.db")
+    init_db(conn)
+    _abandoned_row(conn, plugin="a", reason="ineligible_cleanup", kind="signal",
+                   contract=None, h="1")
+    _abandoned_row(conn, plugin="a", reason="normalization_failed",
+                   contract=None, h="2")
+    _abandoned_row(conn, plugin="a", reason="freshness_expired", h="3")
+    _abandoned_row(conn, plugin="b", reason="normalization_failed",
+                   contract=None, h="4")
+    _abandoned_row(conn, plugin="b", reason="legacy_unknown", contract=None,
+                   h="5")
+    since, until = NOW - timedelta(days=2), NOW + timedelta(days=1)
+    assert signals.abandoned_counts(conn, since=since, until=until) == {
+        "normalization_failed": 2, "freshness_expired": 1}
+    assert signals.abandoned_counts_by_strategy(conn, since=since, until=until) == {
+        "a": {"freshness_expired": 1, "normalization_failed": 1},
+        "b": {"normalization_failed": 1}}
+    report = signals.human_signal_aggregates(conn, since=since, until=until)
+    assert report["cleanup"] == 1
+    assert report["legacy_unknown"] == 1
+    assert report["abandoned"] == {"normalization_failed": 2,
+                                   "freshness_expired": 1}

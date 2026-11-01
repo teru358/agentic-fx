@@ -83,14 +83,26 @@ _DEPLOY_LINKED_ANTI_JOIN = (
     "WHERE deploy_links.signal_id=signals.id)"
 )
 
+# signal 行の分類の唯一の出所。abandoned 行は理由が終端の分類を決める
+# (`normalization_failed` は運用者に報告する対象で cleanup ではない、
+# `legacy_unknown` は時刻を持たない別枠)。それ以外は種別と契約版で決める。
 _ELIGIBILITY_CASE = (
     "CASE "
+    "WHEN status='abandoned' AND abandon_reason='normalization_failed' "
+    "THEN 'normalization_failed' "
+    "WHEN status='abandoned' AND abandon_reason='legacy_unknown' "
+    "THEN 'legacy_unknown' "
     "WHEN kind='strategy' AND contract_version='executable_v1' THEN 'eligible' "
     "WHEN kind='signal' OR contract_version IS NULL THEN 'ineligible_cleanup' "
     "ELSE 'ineligible' END"
 )
 _ELIGIBLE_CONDITION = f"({_ELIGIBILITY_CASE})='eligible'"
 _CLEANUP_CONDITION = f"({_ELIGIBILITY_CASE})='ineligible_cleanup'"
+_LEGACY_UNKNOWN_CONDITION = f"({_ELIGIBILITY_CASE})='legacy_unknown'"
+# 運用者に報告する abandoned (cleanup と legacy_unknown を除く)。
+_REPORTABLE_ABANDONED_CONDITION = (
+    f"status='abandoned' AND NOT ({_CLEANUP_CONDITION}) "
+    f"AND NOT ({_LEGACY_UNKNOWN_CONDITION})")
 
 # requeue / reclaim_expired 共有の遷移式 (controller 解決 #6 逐語):
 # requeue_count >= max_requeue なら abandoned (増分なし)、
@@ -424,13 +436,32 @@ def abandoned_counts(conn: sqlite3.Connection, *, since: datetime,
     _require_aware(until, "until")
     rows = conn.execute(
         "SELECT abandon_reason, COUNT(*) FROM signals "
-        "WHERE status='abandoned' AND abandoned_at IS NOT NULL "
-        "AND abandon_reason NOT IN ('ineligible_cleanup','legacy_unknown') "
+        f"WHERE {_REPORTABLE_ABANDONED_CONDITION} AND abandoned_at IS NOT NULL "
         "AND datetime(abandoned_at) >= datetime(:since) "
         "AND datetime(abandoned_at) < datetime(:until) "
         "GROUP BY abandon_reason",
         {"since": since.isoformat(), "until": until.isoformat()}).fetchall()
     return {r[0]: r[1] for r in rows}
+
+
+def abandoned_counts_by_strategy(
+        conn: sqlite3.Connection, *, since: datetime,
+        until: datetime) -> dict[str, dict[str, int]]:
+    """`abandoned_counts` と同じ分類で、strategy (plugin) × 理由に分けて返す。
+    cleanup と legacy_unknown は含めない (別枠)。"""
+    _require_aware(since, "since")
+    _require_aware(until, "until")
+    rows = conn.execute(
+        "SELECT plugin, abandon_reason, COUNT(*) FROM signals "
+        f"WHERE {_REPORTABLE_ABANDONED_CONDITION} AND abandoned_at IS NOT NULL "
+        "AND datetime(abandoned_at) >= datetime(:since) "
+        "AND datetime(abandoned_at) < datetime(:until) "
+        "GROUP BY plugin, abandon_reason ORDER BY plugin, abandon_reason",
+        {"since": since.isoformat(), "until": until.isoformat()}).fetchall()
+    out: dict[str, dict[str, int]] = {}
+    for plugin, reason, count in rows:
+        out.setdefault(plugin, {})[reason] = count
+    return out
 
 
 def human_signal_aggregates(conn: sqlite3.Connection, *, since: datetime,
@@ -451,16 +482,18 @@ def human_signal_aggregates(conn: sqlite3.Connection, *, since: datetime,
         "ORDER BY signals.plugin, signal_decisions.decision, signal_decisions.actor, "
         "signal_decisions.reject_code", params).fetchall()
     cleanup = conn.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='abandoned' "
-        "AND abandon_reason='ineligible_cleanup' "
+        f"SELECT COUNT(*) FROM signals WHERE status='abandoned' "
+        f"AND {_CLEANUP_CONDITION} "
         "AND datetime(abandoned_at) >= datetime(:since) "
         "AND datetime(abandoned_at) < datetime(:until)", params).fetchone()[0]
     legacy_unknown = conn.execute(
-        "SELECT COUNT(*) FROM signals WHERE status='abandoned' "
-        "AND abandon_reason='legacy_unknown'").fetchone()[0]
+        f"SELECT COUNT(*) FROM signals WHERE {_LEGACY_UNKNOWN_CONDITION}"
+        ).fetchone()[0]
     return {
         "decisions": [dict(row) for row in decisions],
         "abandoned": abandoned_counts(conn, since=since, until=until),
+        "abandoned_by_strategy": abandoned_counts_by_strategy(
+            conn, since=since, until=until),
         "cleanup": cleanup,
         "legacy_unknown": legacy_unknown,
     }
@@ -521,6 +554,7 @@ def pending_exists(conn: sqlite3.Connection, *, now: datetime,
 def normalize_legacy_strategy_payloads(
         conn: sqlite3.Connection, *, now: datetime | None = None) -> None:
     """Upgrade pending/claimed legacy strategy payloads without committing."""
+    from agentic_fx.plugin.sandbox import SandboxError, validate_strategy_result
     from agentic_fx.plugin.strategy_adapter import normalize_strategy_payload
 
     migrated_at = utc_iso(now or datetime.now(timezone.utc))
@@ -538,10 +572,14 @@ def normalize_legacy_strategy_payloads(
                 "bar_time": legacy["bar_time"],
                 "bars_origin": legacy["bars_origin"],
             }
-            payload = normalize_strategy_payload(legacy, row["pair"], provenance)
+            if not isinstance(legacy, dict):
+                raise ValueError("legacy payload is not an object")
+            validated = validate_strategy_result(
+                {k: v for k, v in legacy.items() if k not in provenance})
+            payload = normalize_strategy_payload(validated, row["pair"], provenance)
             if payload is None:
                 raise ValueError("hold is not executable")
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (KeyError, TypeError, ValueError, SandboxError, json.JSONDecodeError):
             conn.execute(
                 "UPDATE signals SET status='abandoned', "
                 "abandon_reason='normalization_failed', abandoned_at=?, "

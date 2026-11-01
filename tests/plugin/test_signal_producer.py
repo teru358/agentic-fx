@@ -9,6 +9,7 @@ sandbox サブプロセスは一切起動しない — 全テストで `sandbox_
 from __future__ import annotations
 
 import logging
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -418,6 +419,31 @@ def test_freshness_window_does_not_expand_by_closed_bar_grace(tmp_path):
         resolved_by_identity=_resolved_by_identity(meta))
 
     assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("override", [
+    {"stop_loss": None},
+    {"direction": None},
+    {"action": "close"},
+    {"entry_type": "limit", "limit_price": None},
+    {"stop_loss": -1.0},
+])
+def test_strategy_open_that_cannot_be_normalized_stores_no_row(tmp_path, override):
+    conn = _conn(tmp_path)
+    _seed_flat(conn, H - timedelta(hours=3), 6 * 60 + 1)
+    meta = _meta(name="strat", kind="strategy", timeframe="1h")
+    fake = _FakeSandbox()
+    result = {"action": "open", "rationale": "r", "direction": "long",
+              "entry_type": "market", "limit_price": None,
+              "stop_loss": 99.0, "take_profit": None}
+    result.update(override)
+    fake.queue("strat", result)
+    inserted = SignalProducer().evaluate_due_plugins(
+        conn, plugins=[meta], now=H + timedelta(hours=1),
+        source=SOURCE, sandbox_run=fake, settings=SETTINGS,
+        resolved_by_identity=_resolved_by_identity(meta))
+    assert inserted == 0
+    assert conn.execute("SELECT COUNT(*) c FROM signals").fetchone()["c"] == 0
 
 
 # ---------------------------------------------------------------------

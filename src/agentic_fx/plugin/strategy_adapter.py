@@ -44,6 +44,7 @@ run_replay を続行させたりしない)。
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable, Protocol
@@ -295,6 +296,26 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
         resolved=resolved, session=session, decision_sink=decision_sink)
 
 
+def _require_validated_open(result: dict[str, Any]) -> None:
+    """検証済み入力だけを受ける契約の番人。未検証の形は ValueError。"""
+    def positive(v: Any) -> bool:
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v > 0)
+
+    if result.get("action") != "open":
+        raise ValueError(f"unvalidated action: {result.get('action')!r}")
+    if result.get("direction") not in ("long", "short"):
+        raise ValueError("unvalidated direction")
+    if result.get("entry_type") not in ("market", "limit"):
+        raise ValueError("unvalidated entry_type")
+    if not positive(result.get("stop_loss")):
+        raise ValueError("unvalidated stop_loss")
+    if result.get("take_profit") is not None and not positive(result["take_profit"]):
+        raise ValueError("unvalidated take_profit")
+    if result["entry_type"] == "limit" and not positive(result.get("limit_price")):
+        raise ValueError("unvalidated limit_price")
+
+
 def normalize_strategy_result(result: dict[str, Any], pair: str) -> dict | None:
     """`sandbox._validate_strategy_result` が返す検証済み dict
     (`{"action", "rationale", "direction", "entry_type", "limit_price",
@@ -310,6 +331,7 @@ def normalize_strategy_result(result: dict[str, Any], pair: str) -> dict | None:
     """
     if result["action"] == "hold":
         return None
+    _require_validated_open(result)
 
     intent: dict[str, Any] = {
         "action": "open",
