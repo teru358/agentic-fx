@@ -1777,3 +1777,49 @@ def test_abandoned_counts_group_a_period_regardless_of_clock_offset(tmp_path):
     with pytest.raises(ValueError, match="naive"):
         signals.abandoned_counts(conn, since=since.replace(tzinfo=None),
                                  until=until)
+
+
+# --- guard は UNIQUE index だけを比べる / 規則表は 1 か所 ---------------------
+
+@pytest.mark.parametrize("table,const", GUARD_TARGETS)
+def test_guard_ignores_a_performance_only_index(tmp_path, table, const):
+    template = getattr(db_module, const)
+    conn = _guard_conn(tmp_path, template, table)
+    first_col = conn.execute(f"PRAGMA table_info('{table}')").fetchall()[1][1]
+    conn.execute(f"CREATE INDEX perf_only_idx ON {table}({first_col})")
+    assert db_module._table_definition_matches(conn, table, template)
+
+
+def test_guard_detects_a_unique_constraint_change(tmp_path):
+    base = "CREATE TABLE {ine}{name} (a INTEGER, b INTEGER, UNIQUE(a))"
+    conn = sqlite3.connect(tmp_path / "u.db")
+    conn.execute(base.format(name="t", ine=""))
+    assert db_module._table_definition_matches(conn, "t", base)
+    assert not db_module._table_definition_matches(
+        conn, "t", base.replace("UNIQUE(a)", "UNIQUE(a, b)"))
+    assert not db_module._table_definition_matches(
+        conn, "t", base.replace(", UNIQUE(a)", ""))
+
+
+def test_requeue_rule_table_drives_sql_and_python_identically():
+    swapped = tuple(reversed(signals._REQUEUE_RULES))
+    sql = signals._requeue_set_sql(swapped)
+    assert sql != signals._REQUEUE_SET
+    reason = sql.split("abandon_reason = ")[1]
+    assert reason.index("retry_exhausted") < reason.index("deploy_linked")
+    assert signals.requeue_outcome(
+        requeue_count=5, max_requeue=2, deploy_linked=True,
+        rules=swapped) == ("abandoned", "retry_exhausted")
+    assert signals.requeue_outcome(
+        requeue_count=5, max_requeue=2, deploy_linked=True) == (
+        "abandoned", "deploy_linked")
+
+
+def test_requeue_precedence_literals_exist_only_in_the_rule_table():
+    import ast
+    tree = ast.parse(Path(signals.__file__).read_text(encoding="utf-8"))
+    hits = [n.lineno for n in ast.walk(tree)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+            and ("requeue_count >= " in n.value
+                 or "WHEN requeue_count >=" in n.value)]
+    assert len(hits) == 1

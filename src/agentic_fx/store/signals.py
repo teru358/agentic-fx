@@ -97,31 +97,35 @@ REASON_FRESHNESS_EXPIRED = "freshness_expired"
 
 # deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
 # 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
-# abandoned の理由は deploy に結ばれていれば (上限超過を兼ねても)
-# `deploy_linked`、そうでなければ `retry_exhausted`。時刻は `:abandoned_at`。
-_REQUEUE_STATUS_EXPR = (
-    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
-    "THEN 'abandoned' ELSE 'pending' END"
+# 規則表 (上から最初に当たったものが理由): deploy に結ばれていれば
+# (上限超過を兼ねても) `deploy_linked`、そうでなく上限以上なら
+# `retry_exhausted`。どれにも当たらなければ pending + requeue_count+1。
+# SQL の CASE と `requeue_outcome` はこの表だけから作る。
+# 各行は (理由, SQL 述語, Python 述語(requeue_count, max_requeue, deploy_linked))。
+_REQUEUE_RULES = (
+    (REASON_DEPLOY_LINKED, _DEPLOY_LINKED_EXISTS,
+     lambda count, limit, linked: linked),
+    (REASON_RETRY_EXHAUSTED, "requeue_count >= :max_requeue",
+     lambda count, limit, linked: count >= limit),
 )
-_REQUEUE_COUNT_EXPR = (
-    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
-    "THEN requeue_count ELSE requeue_count + 1 END"
-)
-_REQUEUE_REASON_EXPR = (
-    f"CASE WHEN {_DEPLOY_LINKED_EXISTS} THEN '{REASON_DEPLOY_LINKED}' "
-    f"WHEN requeue_count >= :max_requeue THEN '{REASON_RETRY_EXHAUSTED}' END"
-)
-_REQUEUE_ABANDONED_AT_EXPR = (
-    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
-    "THEN :abandoned_at END"
-)
-_REQUEUE_SET = (
-    f"status = {_REQUEUE_STATUS_EXPR}, "
-    f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
-    f"abandon_reason = {_REQUEUE_REASON_EXPR}, "
-    f"abandoned_at = {_REQUEUE_ABANDONED_AT_EXPR}, "
-    "claimed_by_mission_id=NULL, claimed_at=NULL"
-)
+
+
+def _requeue_set_sql(rules=_REQUEUE_RULES) -> str:
+    """規則表から requeue / reclaim_expired の SET 句を作る。"""
+    any_rule = " OR ".join(sql for _, sql, _ in rules)
+    reason = "CASE " + " ".join(
+        f"WHEN {sql} THEN '{name}'" for name, sql, _ in rules) + " END"
+    return (
+        f"status = CASE WHEN {any_rule} THEN 'abandoned' ELSE 'pending' END, "
+        f"requeue_count = CASE WHEN {any_rule} "
+        "THEN requeue_count ELSE requeue_count + 1 END, "
+        f"abandon_reason = {reason}, "
+        f"abandoned_at = CASE WHEN {any_rule} THEN :abandoned_at END, "
+        "claimed_by_mission_id=NULL, claimed_at=NULL"
+    )
+
+
+_REQUEUE_SET = _requeue_set_sql()
 
 # 鮮度切れの abandoned の理由。requeue 歴が無ければ `freshness_expired`、
 # あれば `requeued_expired`。
@@ -132,18 +136,15 @@ _FRESHNESS_REASON_EXPR = (
 
 
 def requeue_outcome(*, requeue_count: int, max_requeue: int,
-                    deploy_linked: bool) -> tuple[str, str | None]:
+                    deploy_linked: bool,
+                    rules=_REQUEUE_RULES) -> tuple[str, str | None]:
     """claimed の signal を戻すときの `(遷移後 status, abandon_reason)`。
 
-    requeue / reclaim_expired の SQL (`_REQUEUE_STATUS_EXPR` /
-    `_REQUEUE_REASON_EXPR`) と、`missions.recover_interrupted` の Python 側が
-    同じ規則を使うための唯一の定義。deploy に結ばれていれば上限に関係なく
-    abandoned (`deploy_linked`)、そうでなく上限以上なら abandoned
-    (`retry_exhausted`)、それ以外は pending で理由なし。"""
-    if deploy_linked:
-        return "abandoned", REASON_DEPLOY_LINKED
-    if requeue_count >= max_requeue:
-        return "abandoned", REASON_RETRY_EXHAUSTED
+    `_REQUEUE_RULES` を上から評価する。SQL 側 (`_requeue_set_sql`) と
+    `missions.recover_interrupted` が同じ表を使う。"""
+    for name, _, hit in rules:
+        if hit(requeue_count, max_requeue, deploy_linked):
+            return "abandoned", name
     return "pending", None
 
 

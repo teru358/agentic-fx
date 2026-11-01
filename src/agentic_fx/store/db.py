@@ -1883,6 +1883,8 @@ def _table_structure(conn: sqlite3.Connection, table: str) -> tuple | None:
         for r in conn.execute(f"PRAGMA foreign_key_list('{table}')")))
     indexes = []
     for idx in conn.execute(f"PRAGMA index_list('{table}')"):
+        if not idx[2]:
+            continue
         cols = tuple(c[2] for c in conn.execute(
             f"PRAGMA index_info('{idx[1]}')"))
         indexes.append((idx[2], idx[3], idx[4], cols))
@@ -1894,7 +1896,7 @@ def _table_definition_matches(conn: sqlite3.Connection, table: str,
                               ddl_template: str) -> bool:
     """`table` の構造が `ddl_template` (`{ine}{name}` 型) の構造と一致するか。
 
-    比べるのは列 (名前・型・NOT NULL・default・PK)、FK、UNIQUE を含む
+    比べるのは列 (名前・型・NOT NULL・default・PK)、FK、UNIQUE な
     index、CHECK 式 (コメントと空白を除く)。DDL 文字列そのものは比べない
     ので、コメントや空白だけの変更では不一致にならない。列・CHECK・FK の
     どれかの意味が違えば不一致になる。"""

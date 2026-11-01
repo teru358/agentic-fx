@@ -176,7 +176,7 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
     はこの区別を明記すること。
 
     signals の requeue/abandon 判定は `signals.py` の
-    `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則を
+    `signals._REQUEUE_RULES` (規則表) と同じ規則を
     `signals.requeue_outcome` (Python の純関数) 経由で適用する — 現在の
     requeue_count が max_requeue 以上か deploy に結ばれていれば abandoned
     (理由は `deploy_linked` / `retry_exhausted`、時刻は `now`)、そうで
