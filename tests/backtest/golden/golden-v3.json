@@ -17058,6 +17058,7 @@
   ],
   "metrics": {
     "avg_r": -78.4227642276483,
+    "eval_bars": 56,
     "evaluable": false,
     "fallback_spread_used": false,
     "kill_switch_latches": 1,
