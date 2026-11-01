@@ -118,6 +118,12 @@ indicator は銘柄を持たないので、名前・param・説明に銘柄名�
    **無い指標を strategy の中で自前計算しないでください。** 無い指標は、この mission の候補を `kind: indicator` の plugin にして新設できます (self-test のみで提出。`run_backtest` は strategy 専用。strategy と同時には提出できず、承認・配備の後の mission で `indicators:` に書けます)。配備済みに同じ定義があれば別名で作らず再利用してください。今回は strategy を続けるなら、`不足指標: <名前と定義>` として `discoveries` に起票してください。
    **参照系列は `symbol:` 宣言で取り、自前で別 symbol を読まないでください。**
    `symbol:` に書けるのは `list_deployed_plugins()` の `reference_symbols` (取引 pair と `watch_symbols`) だけです。pairs または watch_symbols に無い symbol は解決で拒否されます。`history_available` が false の symbol は backtest で評価できません。
+   ```yaml
+   indicators:
+     ref_ema: {{plugin: ema, symbol: <reference_symbols の 1 つ>, timeframe: 1h, params: {{period: 50}}}}
+     ref_px:  {{plugin: ohlcv, symbol: <reference_symbols の 1 つ>, timeframe: 1h, params: {{}}}}
+   ```
+   `plugin: ohlcv` は参照 symbol の生系列を取る宣言です。`analyze_corr(request=…)` の `request` は次の 3 形のいずれかで、キーは過不足なく一致させます: `{{"kind": "corr_matrix", "timeframe": …}}` / `{{"kind": "rolling_corr_summary", "a": …, "b": …, "timeframe": …, "window": …}}` / `{{"kind": "lead_lag", "a": …, "b": …, "timeframe": …}}` (`a` ≠ `b` は `reference_symbols` から。`timeframe` は 15m / 1h / 4h / 1d、`window` は 20 / 60 / 120)。
 8. **`get_signals` は取引判断 loop 専用で、この改善 mission では利用できません。**
    配備済み strategy の直近 signal の方向・status・payload は、仮説の選択や
    候補評価の材料にしないでください。この不在は設計上の制約なので、課題・

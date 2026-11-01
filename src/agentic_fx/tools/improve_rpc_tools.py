@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from agentic_fx.backtest import analysis as _analysis
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.plugin import loader as plugin_loader
 from agentic_fx.tools.improve_staging_tools import _safe_join
@@ -17,6 +18,29 @@ from agentic_fx.tools.registry import ToolDef
 if TYPE_CHECKING:
     from agentic_fx.config import ImproveToolBudgetSettings
     from agentic_fx.tools.mission_counters import MissionToolCounters
+
+_CORR_PAIR_DESC = (
+    "list_deployed_plugins() の reference_symbols のいずれか、a ≠ b")
+
+
+def _corr_request_schema() -> dict:
+    """analyze_corr の request 形。親の検証表 (`_REQUEST_SCHEMA`) から作るので、
+    受理される形と agent に見せる形が食い違わない。"""
+    field_schema = {
+        "timeframe": {"type": "string", "enum": list(_analysis.TIMEFRAMES)},
+        "window": {"type": "integer", "enum": list(_analysis.WINDOWS)},
+        "a": {"type": "string", "description": _CORR_PAIR_DESC},
+        "b": {"type": "string", "description": _CORR_PAIR_DESC},
+    }
+    branches = []
+    for kind, keys in _analysis._REQUEST_SCHEMA.items():
+        props = {"kind": {"type": "string", "enum": [kind]}}
+        props.update({k: field_schema[k] for k in sorted(keys - {"kind"})})
+        branches.append({"type": "object", "properties": props,
+                         "required": sorted(keys),
+                         "additionalProperties": False})
+    return {"anyOf": branches}
+
 
 _RUN_BACKTEST_KIND_HINT = (
     "indicator/signal plugin はバックテストできません "
@@ -238,9 +262,12 @@ def build_improve_rpc_tooldefs(
                                           "pair": {"type": "string"}},
                             "required": ["name", "pair"]},
                 func=run_backtest),
-        ToolDef(name="analyze_corr", description="親が相関分析を回す。",
+        ToolDef(name="analyze_corr", description=(
+                    "親が相関分析を回す。request は corr_matrix / "
+                    "rolling_corr_summary / lead_lag の 3 形のいずれかで、"
+                    "キーは形と過不足なく一致させる。"),
                 parameters={"type": "object",
-                            "properties": {"request": {"type": "object"}},
+                            "properties": {"request": _corr_request_schema()},
                             "required": ["request"]},
                 func=analyze_corr),
     ]
