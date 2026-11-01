@@ -248,7 +248,7 @@ def test_prompt_indicators_example_parses_through_the_loader(tmp_path):
     from agentic_fx.plugin import loader
     rendered = _render(tmp_path, _settings())
     block = _prompt_indicators_block(rendered)
-    assert any(r.get("plugin") == "ohlcv" for r in block["indicators"].values())
+    assert any(r.get("plugin") == "ema" for r in block["indicators"].values())
     d = tmp_path / "cand"
     d.mkdir()
     (d / "plugin.py").write_text(
@@ -262,6 +262,19 @@ def test_prompt_indicators_example_parses_through_the_loader(tmp_path):
     assert reason is None, reason
     refs = {r.alias: r for r in meta.indicators}
     assert all(r.symbol != "self" and r.timeframe == "1h" for r in refs.values())
+
+
+def test_prompt_names_no_specific_raw_series_plugin(tmp_path):
+    rendered = _render(tmp_path, _settings())
+    assert "plugin: ohlcv" not in rendered
+    assert "通過 indicator を `symbol:` 付きで宣言する" in rendered
+    assert "2 本を同時に受け取る indicator の契約は未対応" in rendered
+
+
+def test_prompt_lock_sentence_runs_backtest_before_self_test(tmp_path):
+    rendered = _render(tmp_path, _settings())
+    i = rendered.index("ロック後に `run_backtest`、続けて `run_plugin_tests`")
+    assert i > rendered.index("lock_staging_deps(name=")
 
 
 def test_prompt_lists_every_analyze_corr_kind_with_exact_keys(tmp_path):
