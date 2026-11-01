@@ -244,21 +244,23 @@ def _extra_sections(data: Mapping[str, object]) -> list[str]:
     return [section for section in (_baseline_section(data), _gate_section(data)) if section]
 
 
+def _unchanged_page(data: Mapping[str, object], message: str) -> bytes:
+    body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
+            + "<section><h2>変更内容</h2><p>" + message + "</p></section>")
+    extra = _fit_extra_sections(len(_document("Approval", "")) + _bytes(body), _extra_sections(data))
+    page = _document("Approval", body + "".join(extra))
+    return page if len(page) < PAGE_LIMIT_BYTES else _page("Approval", "<p>Output clipped</p>")
+
+
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
     """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
     change = data.get("change") if type(data.get("change")) is dict else None
     if type(change_data) is dict and type(change_data.get("change")) is dict:
         change = change_data["change"]
     if change is None:
-        body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>"
-                + "".join(_extra_sections(data)))
-        return _page("Approval", body)
+        return _unchanged_page(data, REASON_TEXT["unavailable"])
     if not _change_is_well_formed(change):
-        body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
-                + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>"
-                + "".join(_extra_sections(data)))
-        return _page("Approval", body)
+        return _unchanged_page(data, INVALID_CHANGE_TEXT)
     return compose_approval_page(data, change, change_data if type(change_data) is dict else None,
                                  extra_sections=_extra_sections(data)).page
 
@@ -540,6 +542,19 @@ def _diff_section(diff: object) -> tuple[str, int, list[FilePlan]]:
 EXTRA_OMITTED_SECTION = "<section><p>省略: 一部の節は表示容量の都合で省きました</p></section>"
 
 
+def _fit_extra_sections(used: int, extra_sections: Sequence[str]) -> list[str]:
+    """``used`` バイトの上に extra 節を足して 15 KiB に収める。収まらないときは先頭から節単位で
+    省き、省いたら「省略」行を先頭に残す。"""
+    kept = list(extra_sections)
+    omitted = EXTRA_OMITTED_SECTION
+    if used + sum(_bytes(x) for x in kept) <= OTHER_BUDGET_BYTES:
+        return kept
+    while kept and used + sum(_bytes(x) for x in kept) + _bytes(omitted) > OTHER_BUDGET_BYTES:
+        kept.pop(0)
+    kept.insert(0, omitted)
+    return kept
+
+
 class ApprovalPage:
     __slots__ = ("page", "diff_bytes", "other_bytes", "plans")
 
@@ -581,19 +596,12 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     candidates += [(0, limit, True) for limit in (1000, 500, 250, 100, 0)]
     candidates += [(0, 0, False)]
     fixed = skeleton + frame
-    kept = list(extra_sections)
     others = ""
     for show, limit, parent in candidates:
         others = build(show, limit, parent)
-        if fixed + _bytes(others) + sum(_bytes(x) for x in kept) <= OTHER_BUDGET_BYTES:
+        if fixed + _bytes(others) + sum(_bytes(x) for x in extra_sections) <= OTHER_BUDGET_BYTES:
             break
-    else:
-        omitted = EXTRA_OMITTED_SECTION
-        while kept and (fixed + _bytes(others) + sum(_bytes(x) for x in kept)
-                        + _bytes(omitted) > OTHER_BUDGET_BYTES):
-            kept.pop(0)
-        if len(kept) < len(extra_sections):
-            kept.insert(0, omitted)
+    kept = _fit_extra_sections(fixed + _bytes(others), extra_sections)
     extra_html = "".join(kept)
     body = others + (diff_html if diff_body else "")
     page = _document("Approval", body + extra_html)

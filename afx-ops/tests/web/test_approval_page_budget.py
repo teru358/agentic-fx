@@ -314,3 +314,23 @@ def test_other_bytes_stay_within_budget_for_the_largest_baseline_and_gate_togeth
         extra_sections=[_baseline_big_section(), render._gate_section(detail)])
     assert built.other_bytes <= render.OTHER_BUDGET_BYTES
     assert "警告: " in built.page.decode()
+
+
+@pytest.mark.parametrize("change", [None, {"bogus": 1}])
+def test_a_missing_or_invalid_change_still_keeps_gate_rows_and_the_omission_line(change):
+    detail = dict(DETAIL)
+    detail["gate_lines"] = _largest_gate_lines()
+    detail["baseline_comparison"] = {"verdict": "x" * 20000}
+    if change is not None:
+        detail["change"] = change
+    big = _baseline_big_section()
+    original = render._baseline_section
+    render._baseline_section = lambda data: big
+    try:
+        page = render.render_approval(detail, None)
+    finally:
+        render._baseline_section = original
+    text = page.decode()
+    assert b"Output clipped" not in page and len(page) < render.PAGE_LIMIT_BYTES
+    assert text.count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
+    assert render.EXTRA_OMITTED_SECTION in text and "bbbbbbbbbb" not in text
