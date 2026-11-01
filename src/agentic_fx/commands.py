@@ -906,6 +906,7 @@ class Commands:
             except (AttributeError, OSError, ValueError):
                 pass
         lines += self._baseline_comparison_lines(baseline, warning)
+        lines += approval_facts.gate_lines(payload)
         lines += approval_facts.render_facts_lines(payload)
         # [reject-reason-leak] T0 (2026-09-12): 人間の却下理由の唯一の
         # 読み出し導線。`approval_requests.reason` は backlog の

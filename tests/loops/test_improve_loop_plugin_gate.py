@@ -12,9 +12,16 @@ from agentic_fx.plugin.noop_gate import (
 )
 
 
+def _fixture_runs_as(monkeypatch, name):
+    """indicator 候補の fixture 実行 (sandbox) を、通る式に差し替える。"""
+    from tests.fixtures import indicator_gate_fakes as fakes
+    fakes.FakeProbe({name: fakes.ratio}).install(monkeypatch)
+
+
 def _write_candidate(staging_dir: Path, name: str, *,
                      plugin_py=b"def compute(df, params):\n    return {}\n",
-                     config_yaml=b"kind: indicator\npairs: []\ntimeframe: 1h\n",
+                     config_yaml=(b"kind: indicator\npairs: []\ntimeframe: 1h\n"
+                              b"outputs: [value]\n"),
                      test_plugin=b"def test_x(): pass\n"):
     d = staging_dir / name
     d.mkdir(parents=True)
@@ -164,6 +171,7 @@ def test_gate_accepts_one_parametrized_function_when_three_cases_pass(
         test_plugin=b"import pytest\n@pytest.mark.parametrize('x', [1,2,3])\ndef test_x(x): assert x\n")
     monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", lambda *a, **k: GateResult(
         passed=True, returncode=0, stdout_tail="3 passed in 0.1s", duration_sec=0.1))
+    _fixture_runs_as(monkeypatch, "candidate")
     assert loop_min._run_plugin_gate(candidate, name="candidate", source_snapshot_dir=source).passed
 
 
@@ -194,6 +202,7 @@ def test_gate_with_five_tests_and_material_change_reaches_pytest(
     pytest_gate = MagicMock(return_value=GateResult(
         passed=True, returncode=0, stdout_tail="5 passed in 0.12s", duration_sec=0.1))
     monkeypatch.setattr("agentic_fx.loops.improve_loop.run_gate_pytest", pytest_gate)
+    _fixture_runs_as(monkeypatch, "candidate")
 
     verdict = loop_min._run_plugin_gate(
         candidate, name="candidate", source_snapshot_dir=source)
@@ -246,7 +255,7 @@ def test_loader_rejection_short_circuits_before_pytest(
         tmp_path,
         "myind",
         config_yaml=(b"kind: indicator\npairs: []\ntimeframe: 1h\n"
-                     b"warmup_bars: 5\n"),
+                     b"outputs: [value]\nwarmup_bars: 5\n"),
     )
     pytest_gate = MagicMock()
     monkeypatch.setattr(

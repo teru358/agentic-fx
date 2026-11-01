@@ -33,7 +33,7 @@ def _write_candidate(staging_dir: Path, name: str) -> None:
     # (実測で確認)。既存の `find_matching_approved_metrics` 等は影響を
     # 受けないため、単に `outputs: ['v']` を足す。
     (candidate_dir / "config.yaml").write_text(
-        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n"
+        "kind: indicator\npairs: []\ntimeframe: '1h'\n"
         "outputs: ['v']\n")
     (candidate_dir / "test_plugin.py").write_text(
         "def test_x():\n    pass\n"

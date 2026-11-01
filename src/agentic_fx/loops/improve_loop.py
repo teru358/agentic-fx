@@ -48,13 +48,13 @@ from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
 from agentic_fx.improve_notice_codes import (
-    NOTICE_APPROVAL_TX_FAILED, NOTICE_BACKTEST_DATA_UNAVAILABLE,
+    INDICATOR_LAST_RESULT_CODES, NOTICE_APPROVAL_TX_FAILED, NOTICE_BACKTEST_DATA_UNAVAILABLE,
     NOTICE_COMMIT_CRASHED, NOTICE_DEMOTED_RECOVERED, NOTICE_DUPLICATE_SKIPPED,
-    NOTICE_INDICATOR_UNRESOLVED, NOTICE_KIND_UNSUPPORTED,
-    NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED, NOTICE_MAX_BARS_LIMIT,
+    NOTICE_INDICATOR_UNRESOLVED,
+    NOTICE_LAUNCH_CRASHED, NOTICE_LOADER_REJECTED,
     NOTICE_MAX_TURNS, NOTICE_NOT_IMPROVED, NOTICE_OBSERVATION,
     NOTICE_OBSERVATION_NOT_SUBMITTED, NOTICE_SAME_NAME_CONTRACT_CHANGED,
-    NOTICE_OUTPUT_INVALID, NOTICE_OUTPUTS_REQUIRED, NOTICE_PREPARE_FAILED,
+    NOTICE_OUTPUT_INVALID, NOTICE_PREPARE_FAILED,
     NOTICE_REPORT_PUBLISHED, NOTICE_REPORT_WRITE_FAILED,
     NOTICE_RISK_GATE_UNSUPPORTED, NOTICE_RUNNER_FAILED,
     NOTICE_SANDBOX_UNAVAILABLE, NOTICE_SUBMITTED, NOTICE_TIMEOUT,
@@ -70,6 +70,7 @@ from agentic_fx.plugin.gate_pytest import (
     run_gate_pytest,
 )
 from agentic_fx.plugin import loader as plugin_loader
+from agentic_fx.plugin import indicator_pipeline
 from agentic_fx.plugin.noop_gate import count_self_test_functions, find_noop_copy
 from agentic_fx.plugin.resolve import InventoryBuildResult, is_relock_transition
 from agentic_fx.plugin.sandbox import (
@@ -340,6 +341,11 @@ class _PluginGateVerdict:  # 新規命名
     artifact_hash: str | None = None
     failure_kind: str | None = None
     code: str | None = None
+    warnings: tuple[str, ...] = ()
+    similar_to: tuple[dict[str, str], ...] = ()
+    # 親専有レポートにだけ出す補足 (ヒットした token・相手名と列など)。
+    report_detail: str = ""
+    indicator_report: "indicator_pipeline.IndicatorReport | None" = None
 
     def __post_init__(self) -> None:
         # 通知側は `code` だけから分類を引く。不合格は固定語を必ず持ち、
@@ -362,6 +368,8 @@ class _FinalCandidate:
     logic_hash: str | None
     family_key: str | None
     candidate_dir: Path | None
+    # indicator の重複・類似の相手 (配備済み名と kind だけ)。族表に残す。
+    relation: tuple[dict[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -633,6 +641,8 @@ class FloorDetail:
 
 
 _BASELINE_REPORT_SECTION = "Baseline comparison detail"
+_INDICATOR_REPORT_SECTION = "Indicator gate detail"
+_INDICATOR_REPORT_DETAIL_MAX = 2000
 _CONTRACT_VIOLATION_REPORT_DETAIL = (
     "意味が変わる変更 (足または pair 集合の変更) は、新しい名前で提出する。")
 
@@ -902,7 +912,9 @@ class ImproveLoop:
                     inventory_result, settings=self._settings, conn=conn),
                 baseline_gate_mode=self._settings.improve.baseline_gate,
                 baseline_replay_wall_clock_max_sec=(
-                    self._settings.improve.baseline_replay_wall_clock_max_sec))
+                    self._settings.improve.baseline_replay_wall_clock_max_sec),
+                indicator_duplicate_mode=(
+                    self._settings.improve.indicator_duplicate_mode))
 
             # precheck 2026-08-22: T8-B8 追随 -- root= が欠落し戻り値キー
             # `prompt_text` も非実在だった (build_improve_context は
@@ -2004,7 +2016,9 @@ class ImproveLoop:
 
     def _run_plugin_gate(self, plugin_dir: Path, *, name: str,
                          source_snapshot_dir: Path,
-                         inventory=None) -> _PluginGateVerdict:
+                         inventory=None, conn=None,
+                         indicator_duplicate_mode: str | None = None,
+                         ) -> _PluginGateVerdict:
         # precheck 2026-08-22 wave2: T10-B14 T10-M5 T10-M6 T10-M7
         try:
             check_candidate_snapshot(plugin_dir)
@@ -2015,16 +2029,19 @@ class ImproveLoop:
         content_hash_before, artifact_hash_before = hashes_of(plugin_dir)
 
         def _failed_before_pytest(reason: str, *, code: str,
-                                  kind: str = "gate_failed") -> _PluginGateVerdict:
+                                  kind: str = "gate_failed",
+                                  report_detail: str = "") -> _PluginGateVerdict:
             # pytest の実行前は staging が変わっていないので、取った hash が
             # そのまま最終 artifact を表す。
             return _PluginGateVerdict(
                 passed=False, reason=reason,
                 content_hash=content_hash_before,
                 artifact_hash=artifact_hash_before, failure_kind=kind,
-                code=code)
+                code=code, report_detail=report_detail)
 
-        def _failed_after_pytest(reason: str, *, code: str) -> _PluginGateVerdict:
+        def _failed_after_pytest(reason: str, *, code: str,
+                                 report_detail: str = "",
+                                 indicator_report=None) -> _PluginGateVerdict:
             # pytest の実行後は候補自身の self-test が staging を書き換えて
             # いる場合があるため、return の直前に取り直す。
             content_hash_final, artifact_hash_final = self._final_hashes(
@@ -2032,7 +2049,10 @@ class ImproveLoop:
             return _PluginGateVerdict(
                 passed=False, reason=reason, content_hash=content_hash_final,
                 artifact_hash=artifact_hash_final, failure_kind="gate_failed",
-                code=code)
+                code=code, report_detail=report_detail,
+                similar_to=(indicator_report.similar_to
+                            if indicator_report is not None else ()),
+                indicator_report=indicator_report)
 
         try:
             check_source(plugin_dir / "plugin.py")
@@ -2045,6 +2065,36 @@ class ImproveLoop:
         if meta is None:
             return _failed_before_pytest(
                 f"loader_rejected: {reason}", code="loader_rejected")
+
+        violation = self._contract_violation(meta)
+        if violation is not None:
+            violation_code, violation_reason = violation
+            if violation_code == "max_bars_limit":
+                return _failed_before_pytest(
+                    violation_reason, code="max_bars_limit")
+            if violation_code == "kind_unsupported":
+                return _failed_before_pytest(
+                    violation_reason, code="kind_unsupported")
+            return _failed_before_pytest(
+                violation_reason, code="outputs_required")
+
+        deployed_indicators: list = []
+        static = None
+        if meta.kind == "indicator":
+            deployed_indicators = [
+                m for m in (inventory.inventory.metas
+                            if inventory is not None else ())
+                if m.kind == "indicator"]
+            static = indicator_pipeline.check_static(
+                meta, plugin_dir, settings=self._settings,
+                deployed=next((m for m in deployed_indicators
+                               if m.name == meta.name), None),
+                lane="loop")
+            if not static.ok:
+                notice_for_plugin_gate(static.code)
+                return _failed_before_pytest(
+                    static.code, code=static.code,
+                    report_detail=static.detail)
 
         try:
             noop_copy = find_noop_copy(
@@ -2108,9 +2158,54 @@ class ImproveLoop:
                 artifact_hash=artifact_hash_after, failure_kind="gate_failed",
                 code="self_test_mutated")
 
+        if meta.kind == "indicator" and static is not None:
+            pending = (indicator_pipeline.pending_indicator_refs(conn)
+                       if conn is not None else [])
+            report = indicator_pipeline.run_fixture_stage(
+                meta, settings=self._settings, data_dir=self._root / "data",
+                deployed_metas=deployed_indicators, pending=pending,
+                mode=(indicator_duplicate_mode
+                      or self._settings.improve.indicator_duplicate_mode),
+                lane="loop", static_warnings=static.warnings)
+            if not report.ok:
+                found = {"report_detail": report.detail,
+                         "indicator_report": report}
+                notice_for_plugin_gate(report.code)
+                return _failed_after_pytest(
+                    report.code, code=report.code, **found)
+            return _PluginGateVerdict(
+                passed=True, content_hash=content_hash_before,
+                artifact_hash=artifact_hash_before,
+                warnings=report.warnings, similar_to=report.similar_to,
+                report_detail=report.detail, indicator_report=report)
+
         return _PluginGateVerdict(
             passed=True, content_hash=content_hash_before,
             artifact_hash=artifact_hash_before)
+
+    def _contract_violation(self, meta) -> tuple[str, str] | None:
+        """max_bars 上限・kind・outputs 宣言の契約検査。違反は (固定語, last_result
+        用の理由) で、plugin gate の前段と commit の再判定が同じこの関数を通る。理由は
+        固定文言 (max_bars の超過量と kind 名だけを含み、`last_result` にそのまま流れる)。"""
+        from agentic_fx.plugin import approval
+        try:
+            approval.assert_max_bars_within_limit(meta, settings=self._settings)
+        except ValueError as exc:
+            return "max_bars_limit", f"max_bars_limit:{exc}"
+        if meta.kind not in {"indicator", "strategy"}:
+            return "kind_unsupported", f"kind_unsupported:{meta.kind}"
+        if approval.outputs_required_violation(meta):
+            return "outputs_required", "outputs_required"
+        return None
+
+    @staticmethod
+    def _gate_failed_reason(verdict, indicator_code: str | None) -> str:
+        """gate 不合格の終端理由 (`last_result` の元)。"""
+        if indicator_code:
+            return indicator_code
+        if verdict.code == "outputs_required":
+            return verdict.reason
+        return f"gate_failed:{verdict.reason}"
 
     @staticmethod
     def _final_hashes(plugin_dir: Path) -> tuple[str | None, str | None]:
@@ -2149,12 +2244,13 @@ class ImproveLoop:
                                 backlog_id, candidate_origin, candidate_path,
                                 gate_metrics, output, now,
                                 resolved: "ResolvedIndicatorSet | None" = None,
+                                indicator_report=None,
                                 ) -> dict:
         entries = accepted_entries(ctx_ledger.entries())
         analysis_entries = [e for e in entries if e["kind"] == "analyze_corr"]
         backtest_entries = [e for e in entries if e["kind"] == "run_backtest"]
         trial_count = sum(e["trial_count"] for e in entries)
-        return {
+        payload = {
             "name": name, "kind": kind,
             "candidate_origin": candidate_origin,
             "candidate_path": candidate_path,
@@ -2191,6 +2287,9 @@ class ImproveLoop:
             "indicator_deps": (resolved.pin_object()
                                if resolved is not None else {}),
         }
+        if kind == "indicator" and indicator_report is not None:
+            payload.update(indicator_pipeline.payload_fields(indicator_report))
+        return payload
 
     def _check_duplicate_metrics(self, conn, *, content_hash, pair, variant,
                                  source, base_interval, metrics,
@@ -2699,6 +2798,45 @@ class ImproveLoop:
                 logic_hash=logic_hash, family_key=family_key,
                 commit=False)
 
+    def _write_indicator_cache_activity(self, ctx, verdict) -> None:
+        """fixture cache の生成本数と GC の掃除しきれなかった本数 (技術ログ)。"""
+        report = getattr(verdict, "indicator_report", None)
+        if (report is None or self._activity is None
+                or not (report.built or report.gc_removed
+                       or report.gc_skipped)):
+            return
+        self._activity.write(
+            Category.IMPROVE, "indicator_cache",
+            f"mission={ctx.mission_id} built={report.built} "
+            f"gc_removed={report.gc_removed} gc_skipped={report.gc_skipped}")
+
+    def _write_indicator_partner_activity(self, ctx, verdict) -> None:
+        """比較相手から外した配備済み indicator の名前と理由 (技術ログ)。"""
+        report = getattr(verdict, "indicator_report", None)
+        if report is None or self._activity is None:
+            return
+        for partner, detail in report.unavailable:
+            self._activity.write(
+                Category.IMPROVE, "indicator_partner_unavailable",
+                f"mission={ctx.mission_id} partner={partner} detail={detail}")
+
+    @staticmethod
+    def _with_relation(candidate: "_FinalCandidate | None", verdict, ctx
+                       ) -> "_FinalCandidate | None":
+        """類似・重複の相手のうち配備済みの名前だけを kind とともに台帳に残す。"""
+        similar_to = getattr(verdict, "similar_to", ())
+        if candidate is None or not similar_to:
+            return candidate
+        deployed = {m.name for m in ctx.inventory.inventory.metas}
+        seen: set[tuple[str, str]] = set()
+        relation: list[dict[str, str]] = []
+        for row in similar_to:
+            key = (row["kind"], row["name"])
+            if row["name"] in deployed and key not in seen:
+                seen.add(key)
+                relation.append({"kind": row["kind"], "name": row["name"]})
+        return dataclass_replace(candidate, relation=tuple(relation))
+
     def _final_candidate(self, candidate_dir: Path, *, name: str,
                          content_hash: str | None,
                          artifact_hash: str | None) -> _FinalCandidate | None:
@@ -2819,7 +2957,7 @@ class ImproveLoop:
             artifact_hash=candidate.artifact_hash, archive_path=archive_path,
             pair=candidate.pair, metrics={}, now=now,
             logic_hash=candidate.logic_hash, family_key=candidate.family_key,
-            commit=False)
+            relation=list(candidate.relation), commit=False)
 
     def _settle_candidate_in_tx(self, conn, *, ctx,
                                 candidate: _FinalCandidate | None,
@@ -3514,25 +3652,54 @@ class ImproveLoop:
 
             if atype == "plugin":
                 candidate_dir = ctx.staging_dir / artifact["name"]
-                gate_verdict = self._run_plugin_gate(                  # 手順3
-                    candidate_dir, name=artifact["name"],
-                    source_snapshot_dir=ctx.source_snapshot_dir,
-                    # [indicator-consumption-wiring] T5b Step 5-5c:
-                    # `commit()` の `ctx` は常に実 `ImproveRunContext`
-                    # (`_inventory_for_gate` フォールバックは撤去)。
-                    inventory=ctx.inventory)
+                try:
+                    gate_verdict = self._run_plugin_gate(              # 手順3
+                        candidate_dir, name=artifact["name"],
+                        source_snapshot_dir=ctx.source_snapshot_dir,
+                        # [indicator-consumption-wiring] T5b Step 5-5c:
+                        # `commit()` の `ctx` は常に実 `ImproveRunContext`
+                        # (`_inventory_for_gate` フォールバックは撤去)。
+                        inventory=ctx.inventory, conn=conn,
+                        indicator_duplicate_mode=ctx.indicator_duplicate_mode)
+                except indicator_pipeline.IndicatorGateUnavailable as exc:
+                    # 環境側の失敗 (sandbox・cache)。候補の良し悪しは未判定なので
+                    # 承認を作らず、staging を残して retryable に終端する。
+                    self._finalize_gate_sandbox_unavailable(
+                        conn, ctx=ctx, backlog_id=selection.backlog_id,
+                        sandbox_reason=str(exc), now=now,
+                        tool_calls=tool_calls)
+                    return
+                self._write_indicator_cache_activity(ctx, gate_verdict)
+                self._write_indicator_partner_activity(ctx, gate_verdict)
                 # 最終 artifact の材料は staging を消す前に作る。
                 final_candidate = self._final_candidate(
                     candidate_dir, name=artifact["name"],
                     content_hash=gate_verdict.content_hash,
                     artifact_hash=gate_verdict.artifact_hash)
+                final_candidate = self._with_relation(
+                    final_candidate, gate_verdict, ctx)
                 if not gate_verdict.passed:
+                    indicator_code = (
+                        gate_verdict.code
+                        if gate_verdict.code in INDICATOR_LAST_RESULT_CODES
+                        else None)
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:{gate_verdict.reason}", now=now,
+                        reason=self._gate_failed_reason(
+                            gate_verdict, indicator_code),
+                        now=now,
                         tool_calls=tool_calls, candidate=final_candidate,
                         candidate_outcome=(
                             gate_verdict.failure_kind or "gate_failed"),
+                        last_result=(
+                            f"observation:gate_failed:{indicator_code}"
+                            if indicator_code else None),
+                        report_detail=(
+                            getattr(gate_verdict, "report_detail", "")
+                            if indicator_code else ""),
+                        report_section=(_INDICATOR_REPORT_SECTION
+                                        if indicator_code
+                                        else "Profitability floor detail"),
                         notice=notice_for_plugin_gate(gate_verdict.code))
                     return
 
@@ -3560,44 +3727,21 @@ class ImproveLoop:
                         candidate_outcome="gate_failed",
                         notice=NOTICE_UNVERIFIED)
                     return
-                try:
-                    approval.assert_max_bars_within_limit(
-                        candidate_meta, settings=self._settings)
-                except ValueError as exc:
+                violation = self._contract_violation(candidate_meta)
+                if violation is not None:
+                    violation_code, violation_reason = violation
                     self._finalize_gate_failed(
                         conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:max_bars_limit:{exc}", now=now,
-                        tool_calls=tool_calls,
+                        reason=(violation_reason
+                                if violation_code == "outputs_required"
+                                else f"gate_failed:{violation_reason}"),
+                        now=now, tool_calls=tool_calls,
                         candidate=final_candidate,
                         candidate_outcome="gate_failed",
-                        notice=NOTICE_MAX_BARS_LIMIT)
+                        notice=notice_for_plugin_gate(violation_code))
                     return
 
                 kind = candidate_meta.kind
-                if kind not in {"indicator", "strategy"}:
-                    self._finalize_gate_failed(
-                        conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason=f"gate_failed:kind_unsupported:{kind}", now=now,
-                        tool_calls=tool_calls,
-                        candidate=final_candidate,
-                        candidate_outcome="gate_failed",
-                        notice=NOTICE_KIND_UNSUPPORTED)
-                    return
-                # [indicator-consumption-wiring] U4a: kind=indicator の
-                # `outputs` 宣言は新規承認で必須。固定文言のみ
-                # (`last_result` にそのまま流れる — 遮断 8)。
-                # /code-review 2 周目 CR7 (2026-09-18): 条件式は
-                # `approval.outputs_required_violation` に一本化
-                # (`switch._run_full_gate` と共有 — 挙動不変)。
-                if approval.outputs_required_violation(candidate_meta):
-                    self._finalize_gate_failed(
-                        conn, ctx=ctx, backlog_id=selection.backlog_id,
-                        reason="outputs_required", now=now,
-                        tool_calls=tool_calls,
-                        candidate=final_candidate,
-                        candidate_outcome="gate_failed",
-                        notice=NOTICE_OUTPUTS_REQUIRED)
-                    return
                 if kind == "strategy":
                     # [indicator-consumption-wiring] §2.8: 解決は commit
                     # gate でも `require` (提出物は必ず pinned)。**alias と
@@ -3803,7 +3947,9 @@ class ImproveLoop:
                     # `resolved` は strategy 分岐でのみ束縛される
                     # (indicator 候補には依存解決が無い、既定 None →
                     # `indicator_deps` は `{}`)。
-                    resolved=(resolved if kind == "strategy" else None))
+                    resolved=(resolved if kind == "strategy" else None),
+                    indicator_report=getattr(
+                        gate_verdict, "indicator_report", None))
                 # /code-review 2 周目 CR1 是正 (2026-09-12): 質検査
                 # (approval-quality 設計書 §A) は check-then-insert のまま
                 # ここ (bare `SELECT` が `_finalize_success` の
@@ -4478,6 +4624,7 @@ class ImproveLoop:
                               candidate_outcome: str = "gate_failed",
                               not_submitted: bool = False,
                               report_section: str = "Profitability floor detail",
+                              last_result: str | None = None,
                               notice: NoticeCode) -> None:
         """§4.2 手順3/4 不合格・評価不能 → §4.3: backlog を `observation`
         (`last_result` は呼び出し元が組み立てた `reason` そのまま —
@@ -4544,6 +4691,8 @@ class ImproveLoop:
             # [profitability-floor] T1 Step 1-3: 親専有レポート本文の
             # 後段にのみ全数値を書く。activity/last_result には流れない
             # (report_detail の呼び出し元は `reason` と混ぜていない)。
+            if report_section == _INDICATOR_REPORT_SECTION:
+                report_detail = report_detail[:_INDICATOR_REPORT_DETAIL_MAX]
             body_md += f"\n## {report_section}\n\n{report_detail}\n"
             if report_section == _BASELINE_REPORT_SECTION:
                 body_md += self._baseline_monitor_report_section(conn)
@@ -4635,7 +4784,8 @@ class ImproveLoop:
                 backlog_transition=(
                     {"backlog_id": backlog_id, "status": "observation",
                      "last_result": (NOT_SUBMITTED_LAST_RESULT
-                                     if not_submitted else reason)}
+                                     if not_submitted
+                                     else (last_result or reason))}
                     if backlog_id is not None else None),
                 notice=notice, tool_calls=tool_calls,
                 observation_text=None, commit=False)

@@ -68,7 +68,7 @@ def compute(df, params):
 """
 _PASSING_INDICATOR_CONFIG = """
 kind: indicator
-pairs: [USDJPY]
+pairs: []
 timeframe: 1h
 params: {}
 outputs: [value]

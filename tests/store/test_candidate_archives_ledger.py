@@ -352,7 +352,7 @@ def test_ac19_legacy_migration_preserves_existing_columns_and_payload_bytes(
         "PRAGMA table_info(candidate_archives)")]
     assert cols[:9] == list(rows_before[0].keys())
     assert cols[9:] == ["logic_hash", "family_key", "outcome_class",
-                        "quality_flags"]
+                        "quality_flags", "relation"]
     rows_after = [dict(r) for r in migrated.execute(
         "SELECT id,mission_id,name,content_hash,artifact_hash,archive_path,"
         "pair,metrics_json,created_at FROM candidate_archives ORDER BY id")]

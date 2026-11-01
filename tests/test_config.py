@@ -1177,6 +1177,15 @@ def test_baseline_gate_settings_defaults_and_example():
     assert ex.baseline_replay_wall_clock_max_sec == 300
 
 
+def test_indicator_gate_settings_defaults_and_example():
+    from agentic_fx.config import ImproveSettings
+    assert ImproveSettings().indicator_duplicate_mode == "warn"
+    assert ImproveSettings().indicator_similar_corr == 0.98
+    assert ImproveSettings().indicator_fixture_wall_clock_max_sec == 60
+    ex = load_settings(EXAMPLE).improve
+    assert ex.indicator_duplicate_mode == "warn"
+
+
 @pytest.mark.parametrize("value", ["off", "Shadow", "ENFORCE", True, 0, None])
 def test_baseline_gate_rejects_other_modes(value):
     from agentic_fx.config import ImproveSettings

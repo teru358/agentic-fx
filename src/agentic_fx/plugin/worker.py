@@ -37,6 +37,8 @@
 - plugin_ready (worker から): `{"phase": "plugin_ready", "ok": true}` /
   `{"phase": "plugin_ready", "ok": false, "error": "<message>"}`
 - request (call() のたびに親から): `{"df": <df wire>, "params": {...}, "id": "<hex>"}`
+  indicator は任意の `"select": [出力名, ...]` を付けられ、その出力だけを返す
+  (検証は全出力に対して行う。大きな出力を列群に分けて受けるための入口)。
   df wire: `{"index": [iso8601 str, ...], "open": [...], "high": [...],
             "low": [...], "close": [...], "volume": [...]}`
 - response: `{"ok": true, "result": <plugin の生の戻り値>, "pid": int, "id": <要求の id>}` /
@@ -267,11 +269,12 @@ def main() -> None:
     import pandas as pd
 
     from agentic_fx.core.plugin_contract import (
-        validate_indicator_result, validate_ohlcv_passthrough,
+        OutputsMismatchError, validate_indicator_result, validate_ohlcv_passthrough,
     )
 
     baseline_chained = pd.get_option("mode.chained_assignment")
     baseline_errstate = dict(np.geterr())
+    retained: dict | None = None
 
     while True:
         request = _read_line()
@@ -297,11 +300,16 @@ def main() -> None:
                     sub_df = source.tail(dep["max_bars"]).copy(deep=True)
                     before = sub_df.copy(deep=True)
                     raw = dep["compute"](sub_df, _deep_copy_json(dep["params"]))
-                    validated = (
-                        validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
-                        if dep["plugin_name"] == "ohlcv" else
-                        validate_indicator_result(
-                            raw, df_index=sub_df.index, outputs=dep["outputs"]))
+                    try:
+                        validated = (
+                            validate_ohlcv_passthrough(raw, df=sub_df, original_df=before)
+                            if dep["plugin_name"] == "ohlcv" else
+                            validate_indicator_result(
+                                raw, df_index=sub_df.index, outputs=dep["outputs"]))
+                    except OutputsMismatchError as exc:
+                        # a dependency's mismatch is not the strategy's own: no
+                        # structured code, the traceback goes to stderr as before
+                        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
                     indicators[dep["alias"]] = {
                         key: (_align_indicator_to_main(
                             value, source=sub_df, main_index=df.index,
@@ -325,14 +333,32 @@ def main() -> None:
                         "indicator mutated shared pandas/numpy global state")
                 result = fn(df, indicators, None, params)
             else:
-                before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
-                result = fn(df, params)
+                retain = request.get("retain") is True
+                reuse = request.get("reuse") is True
+                if kind == "indicator" and reuse:
+                    if retained is None or retain:
+                        raise ValueError("no retained indicator result to reuse")
+                    validated = retained
+                    if request.get("release") is True:
+                        retained = None
+                else:
+                    retained = None
+                    before = df.copy(deep=True) if handshake.get("name") == "ohlcv" else None
+                    result = fn(df, params)
+                    if kind == "indicator":
+                        validated = (
+                            validate_ohlcv_passthrough(result, df=df, original_df=before)
+                            if handshake.get("name") == "ohlcv" else
+                            validate_indicator_result(result, df_index=df.index,
+                                                      outputs=main_outputs))
+                        retained = validated if retain else None
                 if kind == "indicator":
-                    validated = (
-                        validate_ohlcv_passthrough(result, df=df, original_df=before)
-                        if handshake.get("name") == "ohlcv" else
-                        validate_indicator_result(result, df_index=df.index,
-                                                  outputs=main_outputs))
+                    select = request.get("select")
+                    if select is not None:
+                        if (not isinstance(select, list) or not select
+                                or not all(isinstance(k, str) and k in validated for k in select)):
+                            raise ValueError("select must name outputs of the indicator result")
+                        validated = {k: validated[k] for k in select}
                     result = _indicator_result_to_wire(validated)
             _write_line(protocol_fd, {"ok": True, "result": result, "pid": pid,
                                       "id": request_id})
@@ -344,6 +370,10 @@ def main() -> None:
             _write_line(protocol_fd, {"ok": False, "error": "reference unavailable",
                                       "error_code": "reference_unavailable", "pid": pid,
                                       "id": request_id})
+        except OutputsMismatchError as exc:
+            _write_line(protocol_fd, {"ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "error_code": "outputs_mismatch", "pid": pid, "id": request_id})
         except Exception as exc:  # noqa: BLE001 — 構造化 1 行で返し、traceback は stderr へ
             try:
                 traceback.print_exc(file=sys.stderr)

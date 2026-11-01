@@ -176,14 +176,14 @@ def test_ac13b_family_section_reads_only_the_narrow_surface(conn, tmp_path):
     assert "familyrow_h" not in json.dumps(ctx_data, default=str)
     # store が返す列と、族の行が持つ key の集合は公開 schema と完全一致する
     assert set(archives.family_attempt_projection(conn)[0]) == {
-        "family_key", "outcome_class", "created_at"}
+        "family_key", "outcome_class", "created_at", "relation"}
     section = ctx_data["improvement_history"]["family_attempts"]
     assert set(section) == {"rows", "unkeyed_deployed", "entries_omitted",
                           "invalid_name_count"}
     for row in section["rows"]:
         assert set(row) == {
             "family_key", "attempts", "outcomes", "last_attempt_month",
-            "deployed", "deployed_names"}
+            "deployed", "deployed_names", "relations"}
 
 
 def _imported_modules(path: Path) -> set[str]:

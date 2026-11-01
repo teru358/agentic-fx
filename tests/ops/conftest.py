@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -126,9 +127,12 @@ class OpsEnv:
     def connect(self):
         return db.connect(self.db_path)
 
-    def make_plugin_approval(self, name: str = "sma", value: float = 1.0,
+    def make_plugin_approval(self, name: str = "sma", value: float | None = None,
                              mission_id: int = 1) -> int:
-        """fake gate で実 submit_candidate を通した plugin 承認依頼を作る。"""
+        """fake gate で実 submit_candidate を通した plugin 承認依頼を作る。
+        出力の値は名前ごとに違う (同じ値の indicator は重複として拒否されるため)。"""
+        if value is None:
+            value = 1.0 if name == "sma" else 1.0 + zlib.crc32(name.encode()) % 1000
         from agentic_fx.plugin import switch
         from agentic_fx.plugin.gate_pytest import GateResult
         staging = self.plugins_root / "_staging" / str(mission_id)

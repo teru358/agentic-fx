@@ -17,6 +17,22 @@ TRIGGER_SCHEDULED = "scheduled"
 TOOL_CALLS_MAX = 1_000_000
 OBSERVATION_TEXT_MAX = 2000
 
+INDICATOR_GATE_REJECT_CODES = frozenset({
+    "symbol_in_name", "param_price_unit", "fixture_run_failed",
+    "output_not_finite", "output_constant", "indicator_duplicate",
+})
+# reject in enforce mode, warning in warn mode.
+INDICATOR_GATE_MODE_CODES = frozenset({"indicator_monotone_duplicate"})
+INDICATOR_GATE_WARNING_CODES = frozenset({
+    "scale_dependent", "indicator_similar",
+    "indicator_output_overlap", "sparse_output", "output_constant_suspect",
+    "legacy_symbol_name", "indicator_redefined", "duplicate_unavailable",
+})
+INDICATOR_FIXTURE_FAILURE_DETAILS = frozenset({
+    "cpu_limit", "timeout", "exception", "outputs_mismatch", "probe_timeout",
+    "probe_exception",
+})
+
 
 @dataclass(frozen=True)
 class NoticeCode:
@@ -66,6 +82,18 @@ NOTICE_MAX_BARS_LIMIT = NoticeCode("gate_failed", "max_bars_limit")
 NOTICE_KIND_UNSUPPORTED = NoticeCode("gate_failed", "kind_unsupported")
 NOTICE_OUTPUTS_REQUIRED = NoticeCode("gate_failed", "outputs_required")
 NOTICE_INDICATOR_UNRESOLVED = NoticeCode("gate_failed", "indicator_unresolved")
+NOTICE_SYMBOL_IN_NAME = NoticeCode("gate_failed", "symbol_in_name")
+NOTICE_PARAM_PRICE_UNIT = NoticeCode("gate_failed", "param_price_unit")
+NOTICE_FIXTURE_RUN_FAILED = NoticeCode("gate_failed", "fixture_run_failed")
+NOTICE_OUTPUT_NOT_FINITE = NoticeCode("gate_failed", "output_not_finite")
+NOTICE_OUTPUT_CONSTANT = NoticeCode("gate_failed", "output_constant")
+NOTICE_INDICATOR_DUPLICATE = NoticeCode("gate_failed", "indicator_duplicate")
+NOTICE_INDICATOR_MONOTONE_DUPLICATE = NoticeCode(
+    "gate_failed", "indicator_monotone_duplicate")
+# warning 語は承認依頼 payload の gate_warnings に載る閉じた語彙で、Discord の
+# 終了通知の reason_code にはならない (提出通知に warning を出さない)。
+# そのため NoticeCode は作らず、ALLOWED_PAIRS にも入れない。
+
 # plugin gate の Landlock 不可。backlog を消費する点が strategy gate の
 # failed/sandbox_unavailable (backlog を open に戻す) と異なるため別の語にする。
 NOTICE_GATE_SANDBOX_UNAVAILABLE = NoticeCode(
@@ -99,6 +127,9 @@ _ALL_NOTICES = (
     NOTICE_SELF_TEST_TOO_THIN, NOTICE_SELF_TEST_MUTATED, NOTICE_UNVERIFIED,
     NOTICE_MAX_BARS_LIMIT, NOTICE_KIND_UNSUPPORTED, NOTICE_OUTPUTS_REQUIRED,
     NOTICE_INDICATOR_UNRESOLVED, NOTICE_GATE_SANDBOX_UNAVAILABLE,
+    NOTICE_SYMBOL_IN_NAME, NOTICE_PARAM_PRICE_UNIT, NOTICE_FIXTURE_RUN_FAILED,
+    NOTICE_OUTPUT_NOT_FINITE, NOTICE_OUTPUT_CONSTANT, NOTICE_INDICATOR_DUPLICATE,
+    NOTICE_INDICATOR_MONOTONE_DUPLICATE,
     NOTICE_REPORT_WRITE_FAILED, NOTICE_SANDBOX_UNAVAILABLE, NOTICE_TIMEOUT,
     NOTICE_MAX_TURNS, NOTICE_RUNNER_FAILED, NOTICE_TOOL_BUDGET_ABORT,
     NOTICE_OUTPUT_INVALID, NOTICE_APPROVAL_TX_FAILED, NOTICE_COMMIT_CRASHED,
@@ -129,8 +160,66 @@ _PLUGIN_GATE_NOTICES = {
     "self_test_too_thin": NOTICE_SELF_TEST_TOO_THIN,
     "self_test_mutated": NOTICE_SELF_TEST_MUTATED,
     "sandbox_unavailable": NOTICE_GATE_SANDBOX_UNAVAILABLE,
+    "max_bars_limit": NOTICE_MAX_BARS_LIMIT,
+    "kind_unsupported": NOTICE_KIND_UNSUPPORTED,
+    "outputs_required": NOTICE_OUTPUTS_REQUIRED,
+    "symbol_in_name": NOTICE_SYMBOL_IN_NAME,
+    "param_price_unit": NOTICE_PARAM_PRICE_UNIT,
+    "fixture_run_failed": NOTICE_FIXTURE_RUN_FAILED,
+    "output_not_finite": NOTICE_OUTPUT_NOT_FINITE,
+    "output_constant": NOTICE_OUTPUT_CONSTANT,
+    "indicator_duplicate": NOTICE_INDICATOR_DUPLICATE,
+    "indicator_monotone_duplicate": NOTICE_INDICATOR_MONOTONE_DUPLICATE,
 }
 PLUGIN_GATE_CODES = frozenset(_PLUGIN_GATE_NOTICES)
+
+# agent 面の last_result (`observation:gate_failed:<固定語>`) に通す語。
+INDICATOR_LAST_RESULT_CODES = (
+    INDICATOR_GATE_REJECT_CODES | INDICATOR_GATE_MODE_CODES)
+# bless (人間回廊) は政策検査を reject でなく warning にするので、承認 payload の
+# gate_warnings が取る語はこの全体になる (`duplicate_at_approve` は approve 時の
+# 再判定が mode warn で足す語。enforce では approve の失敗語)。
+INDICATOR_PAYLOAD_WARNING_CODES = (
+    INDICATOR_GATE_WARNING_CODES | INDICATOR_GATE_MODE_CODES
+    | frozenset({"symbol_in_name", "param_price_unit", "duplicate_at_approve"}))
+
+# 承認詳細に出す警告文。語 -> 1 行の固定文で、表示の 4 面 (CLI / 対話シェル / ops
+# client / web) が同じ表を読む。web は別 package なので同じ表を写して持ち、test が
+# 突き合わせる。数値 (相関値・出力値) は文に入れない。
+INDICATOR_WARNING_TEXT = {
+    "scale_dependent":
+        "警告: 価格または出来高のスケールに依存する出力 (別銘柄で挙動が変わる可能性)",
+    "indicator_similar": "警告: 配備済みの指標と類似した出力があります",
+    "indicator_monotone_duplicate":
+        "警告: 配備済みの指標の単調変換にあたる出力があります (同じ情報の言い換えの可能性)",
+    "indicator_output_overlap": "警告: 配備済みの指標と一部の出力が重複しています",
+    "sparse_output": "警告: 有限値が少ない出力があります (契約 run で 30 本未満)",
+    "output_constant_suspect":
+        "警告: 定数に見える出力があります (契約 run と解析 run の片方で値が変わりません)",
+    "legacy_symbol_name":
+        "警告: 銘柄名を含む配備済み指標の同名更新です (名前は遡って改めていません)",
+    "indicator_redefined": "警告: 同名の配備済み指標から出力の意味が変わっています",
+    "duplicate_unavailable":
+        "警告: 配備済みの一部と比較できませんでした (その指標は比較から外れています)",
+    "duplicate_at_approve": "警告: 提出後に配備された指標と同じ式になっています",
+    "symbol_in_name": "警告: 名前または設定に銘柄名を含みます (人の提出なので警告で通りました)",
+    "param_price_unit": "警告: params に価格の単位を持つ項目があります (人の提出なので警告で通りました)",
+}
+# similar_to の kind -> 相手との関係の言い方。行は
+# 「警告: 配備済み `<name>` <関係>」(承認待ちの候補が相手なら「警告: 承認待ち #<id> <関係>」)。
+INDICATOR_RELATION_TEXT = {
+    "duplicate": "と同等",
+    "monotone": "の単調変換",
+    "overlap": "と一部重複",
+    "similar": "と類似",
+}
+INDICATOR_DEPLOYED_PARTNER_TEXT = "警告: 配備済み `{name}` {relation}"
+INDICATOR_PENDING_PARTNER_TEXT = "警告: 承認待ち #{id} {relation}"
+INDICATOR_COLUMN_TEXT = " (列: {columns})"
+# 承認依頼 payload の gate_warnings / similar_to / scale_columns の上限。
+INDICATOR_MAX_WARNINGS = 8
+INDICATOR_MAX_SIMILAR = 3
+INDICATOR_MAX_SCALE_COLUMNS = 8
 
 _QUALITY_NOTICES = {
     "duplicate_logic": NOTICE_DUPLICATE_LOGIC,

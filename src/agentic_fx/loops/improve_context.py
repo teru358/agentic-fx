@@ -9,6 +9,7 @@ improvement_backlog、ユーザー方針 = Policy.tail、参照 = RunContext
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, get_args
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES
+from agentic_fx.improve_notice_codes import INDICATOR_LAST_RESULT_CODES
 from agentic_fx.plugin.logic_identity import (
     DEFAULT_FAMILY_TIMEFRAME, FamilyKeyTooLong, ParsedFamilyKey, checked_family_key,
     dependency_of, is_plain_name, is_plain_pair, parse_family_key,
@@ -84,6 +86,9 @@ _MISSION_DIAGNOSTIC = re.compile(
     r"run_backtest=([0-9]{1,6}) analyze_corr=([0-9]{1,6})(?: |$)")
 
 
+_GATE_FAILED_REASON_PREFIX = "observation:gate_failed:"
+
+
 def project_last_result(value: str | None, *,
                         deployed_names: frozenset[str] | set[str] = frozenset()
                         ) -> str | None:
@@ -104,6 +109,11 @@ def project_last_result(value: str | None, *,
                 and deployed_name in deployed_names):
             return value
         return "observation:family_redirect"
+    if value.startswith(_GATE_FAILED_REASON_PREFIX):
+        code = value[len(_GATE_FAILED_REASON_PREFIX):]
+        if code in INDICATOR_LAST_RESULT_CODES:
+            return value
+        return "observation:gate_failed"
     diag = _MISSION_DIAGNOSTIC.match(value)
     if diag is not None:
         return (f"mission_diagnostic run_backtest={diag.group(1)} "
@@ -245,6 +255,7 @@ class FamilyAttemptSummary(TypedDict):
     last_attempt_month: str | None
     deployed: Literal["yes", "no"]
     deployed_names: list[str]
+    relations: list[str]
 
 
 class UnkeyedDeployedSummary(TypedDict):
@@ -347,6 +358,42 @@ def _deployed_view(families: list[dict], allowed_pairs: "set[str]"
             unkeyed, skipped, deployed_indicators)
 
 
+_RELATION_LABELS = {"duplicate": "同等", "monotone": "単調変換",
+                    "overlap": "一部重複", "similar": "類似"}
+_RELATION_ORDER = tuple(_RELATION_LABELS)
+FAMILY_RELATION_MAX = 3
+
+
+def project_relations(raw: object, deployed_indicators: "frozenset[str] | set[str]"
+                      ) -> list[tuple[str, str]]:
+    """台帳の relation 列 (JSON) から (kind, 配備済みの名前) だけを取り出す。
+    形の違うもの・語彙外の kind・配備されていない名前は黙って落とす。"""
+    if not isinstance(raw, str):
+        return []
+    try:
+        rows = json.loads(raw)
+    except ValueError:
+        return []
+    found: list[tuple[str, str]] = []
+    if not isinstance(rows, list):
+        return found
+    for row in rows:
+        if (isinstance(row, dict) and isinstance(row.get("kind"), str)
+                and row["kind"] in _RELATION_LABELS
+                and isinstance(row.get("name"), str)
+                and re.fullmatch(_PLUGIN_NAME_PATTERN, row["name"])
+                and row["name"] in deployed_indicators):
+            found.append((row["kind"], row["name"]))
+    return found
+
+
+def _relation_labels(counts: dict[tuple[str, str], int]) -> list[str]:
+    """kind の強い順 (同じ kind は件数の多い順、名前順) に最大 3 本。"""
+    ordered = sorted(counts, key=lambda kn: (_RELATION_ORDER.index(kn[0]),
+                                             -counts[kn], kn[1]))
+    return [f"{_RELATION_LABELS[k]} {n}" for k, n in ordered[:FAMILY_RELATION_MAX]]
+
+
 def _deployed_cell(row: FamilyAttemptSummary) -> str:
     if row["deployed"] != "yes":
         return "no"
@@ -357,11 +404,15 @@ def _deployed_cell(row: FamilyAttemptSummary) -> str:
     return f"yes ({', '.join(shown)})"
 
 
-def _family_row_line(row: FamilyAttemptSummary) -> str:
+def _family_row_line(row: FamilyAttemptSummary,
+                     with_relations: bool = False) -> str:
     outcomes = ", ".join(f"{label}={count}"
                          for label, count in row["outcomes"].items()) or "-"
-    return (f"| {row['family_key']} | {row['attempts']} | {outcomes} | "
+    line = (f"| {row['family_key']} | {row['attempts']} | {outcomes} | "
             f"{row['last_attempt_month'] or '-'} | {_deployed_cell(row)} |")
+    if with_relations:
+        line += f" {', '.join(row['relations']) or '-'} |"
+    return line
 
 
 def _unkeyed_line(entry: UnkeyedDeployedSummary) -> str:
@@ -374,23 +425,26 @@ def _unkeyed_line(entry: UnkeyedDeployedSummary) -> str:
 
 
 def render_family_attempts(section: FamilyAttemptSection) -> str:
-    """prompt に差し込む族別の試行状況 (表と key なしの残余一覧)。"""
+    """prompt に差し込む族別の試行状況 (表と key なしの残余一覧)。
+    relation (配備済みとの重複・類似) が 1 件でもあれば列を足す。"""
     rows = section["rows"]
+    with_relations = any(r["relations"] for r in rows)
     deployed_rows = [r for r in rows if r["deployed"] == "yes"]
     other_rows = [r for r in rows if r["deployed"] != "yes"]
     header = ("| family_key | attempts | outcomes | last_attempt_month | "
-              "deployed |\n|---|---:|---|---|---|")
+              "deployed |" + (" relation |" if with_relations else "")
+              + "\n|---|---:|---|---|---|" + ("---|" if with_relations else ""))
     blocks: list[str] = []
     if deployed_rows:
-        blocks.append(header + "\n"
-                      + "\n".join(_family_row_line(r) for r in deployed_rows))
+        blocks.append(header + "\n" + "\n".join(
+            _family_row_line(r, with_relations) for r in deployed_rows))
     if section["unkeyed_deployed"]:
         blocks.append(
             "family key なしの配備済み plugin:\n"
             + "\n".join(_unkeyed_line(u) for u in section["unkeyed_deployed"]))
     if other_rows:
-        blocks.append(header + "\n"
-                      + "\n".join(_family_row_line(r) for r in other_rows))
+        blocks.append(header + "\n" + "\n".join(
+            _family_row_line(r, with_relations) for r in other_rows))
     if section["entries_omitted"]:
         blocks.append(f"他 {section['entries_omitted']} 件を省略")
     if section["invalid_name_count"]:
@@ -405,10 +459,14 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
         families, allowed_pairs)
 
     groups: dict[str, dict] = {}
-    unknown = {"attempts": 0, "outcomes": {}, "month": None}
+    unknown = {"attempts": 0, "outcomes": {}, "month": None, "relations": {}}
 
-    def _count(group: dict, outcome: str, month: str | None) -> None:
+    def _count(group: dict, outcome: str, month: str | None,
+               relations: list[tuple[str, str]] = ()) -> None:
         group["attempts"] += 1
+        counts = group.setdefault("relations", {})
+        for pair in relations:
+            counts[pair] = counts.get(pair, 0) + 1
         group["outcomes"][outcome] = group["outcomes"].get(outcome, 0) + 1
         if month is not None and (group["month"] is None
                                   or month > group["month"]):
@@ -419,13 +477,16 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
                                   allowed_pairs=allowed_pairs)
         outcome = project_outcome(record["outcome_class"])
         month = _attempt_month(record["created_at"])
+        relations = project_relations(
+            record.get("relation"), deployed_indicators)
         if parsed is None:
-            _count(unknown, outcome, month)
+            _count(unknown, outcome, month, relations)
             continue
         label = project_family_label(parsed, deployed_indicators)
         _count(groups.setdefault(
-            label, {"attempts": 0, "outcomes": {}, "month": None}),
-            outcome, month)
+            label, {"attempts": 0, "outcomes": {}, "month": None,
+                    "relations": {}}),
+            outcome, month, relations)
 
     def _summary(label: str, group: dict, names: list[str]
                  ) -> FamilyAttemptSummary:
@@ -435,9 +496,10 @@ def _family_attempts(conn: "sqlite3.Connection", settings: "Settings",
                          if group["outcomes"].get(o)},
             "last_attempt_month": group["month"],
             "deployed": "yes" if names else "no",
-            "deployed_names": names}
+            "deployed_names": names,
+            "relations": _relation_labels(group.get("relations", {}))}
 
-    empty = {"attempts": 0, "outcomes": {}, "month": None}
+    empty = {"attempts": 0, "outcomes": {}, "month": None, "relations": {}}
     deployed_rows = [
         _summary(label, groups.get(label, empty), names)
         for label, names in sorted(deployed_by_label.items())]

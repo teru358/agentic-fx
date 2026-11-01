@@ -269,6 +269,12 @@ def test_project_last_result_keeps_family_redirect_only_for_deployed_name():
     ) == "observation:family_redirect"
 
 
+def test_project_last_result_keeps_indicator_gate_reason():
+    from agentic_fx.loops.improve_context import project_last_result
+    assert project_last_result("observation:gate_failed:indicator_duplicate") == (
+        "observation:gate_failed:indicator_duplicate")
+
+
 def test_context_projects_named_redirects_against_its_deployed_families(
         tmp_path):
     c = connect(tmp_path / "t.db"); init_db(c)

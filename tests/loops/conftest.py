@@ -4,13 +4,10 @@
 `init_db(conn)` パターンを踏襲する。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
 from agentic_fx.activity import ActivityLog
-from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.loops.improve_rpc_ledger import ImproveRpcLedger
 from agentic_fx.loops.improve_run_context import ImproveRunContext
@@ -19,20 +16,7 @@ from agentic_fx.store import improve_runs as improve_runs_store
 from agentic_fx.store import improve_waves
 from agentic_fx.store import missions as missions_store
 from agentic_fx.store.db import connect, connect_readonly, init_db
-
-NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
-_EXAMPLE_SETTINGS = load_settings(
-    Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
-# 履歴を要する試験は評価用の履歴源を明示する (example の既定は未設定)。
-SETTINGS = _EXAMPLE_SETTINGS.model_copy(update={
-    "backtest": _EXAMPLE_SETTINGS.backtest.model_copy(
-        update={"eval_source": "dukascopy"})})
-
-
-class _FakeRag:
-    """`ImproveLoop.__init__(rag=...)` (T10-B10) を満たすだけの no-op —
-    本節の private メソッドテストは Rag を経由しない (RAG ツールは
-    research_tools 経由、10.9 節 B17 の registry 配線テストで別途扱う)。"""
+from tests.fixtures.improve_loop_min import NOW, SETTINGS, FakeRag as _FakeRag, build_loop
 
 
 @pytest.fixture
@@ -49,13 +33,7 @@ def clock():
 
 
 def _build_loop(conn, tmp_path, *, clock=None):
-    from agentic_fx.loops.improve_loop import ImproveLoop
-
-    return ImproveLoop(
-        root=tmp_path, settings=SETTINGS, clock=clock or FixedClock(NOW),
-        db_write_conn_factory=lambda: conn,
-        db_readonly_conn_factory=lambda: conn,
-        activity=ActivityLog(tmp_path / "activity.log"), rag=_FakeRag())
+    return build_loop(conn, tmp_path, clock=clock)
 
 
 @pytest.fixture

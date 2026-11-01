@@ -45,3 +45,5 @@ class ImproveRunContext:
     # この mission の挙動は変わらない。直組みの既定 `off` は比較しない。
     baseline_gate_mode: str = "off"
     baseline_replay_wall_clock_max_sec: float = 300.0
+    # indicator の単調変換の扱い。mission 開始時の settings を写す。
+    indicator_duplicate_mode: str = "warn"

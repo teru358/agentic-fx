@@ -272,6 +272,11 @@ class GateOutcome:
     # (scope, pair, cpu_sec|None) — commit gate は adapter を内部生成する
     # ため、CPU 実測は verdict 経由でしか ImproveLoop に届かない (r5 I4)。
     cpu_samples: tuple[tuple[str, str, float | None], ...] = ()
+    # indicator 候補の warning (閉じた語彙) と類似・重複の相手。承認 payload の
+    # `gate_warnings` / `similar_to` の元で、strategy では常に空。
+    gate_warnings: tuple[str, ...] = ()
+    similar_to: tuple[dict[str, str], ...] = ()
+    indicator_report: "object | None" = None
 
 
 # precheck 2026-08-22 wave2: T11-B-11d

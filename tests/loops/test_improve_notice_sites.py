@@ -94,9 +94,7 @@ EXPECTED_GATE_FAILED_CALLS = sorted([
     "notice_for_plugin_gate(gate_verdict.code)",
     "NOTICE_LOADER_REJECTED",
     "NOTICE_UNVERIFIED",
-    "NOTICE_MAX_BARS_LIMIT",
-    "NOTICE_KIND_UNSUPPORTED",
-    "NOTICE_OUTPUTS_REQUIRED",
+    "notice_for_plugin_gate(violation_code)",
     "NOTICE_INDICATOR_UNRESOLVED",
     "NOTICE_BACKTEST_DATA_UNAVAILABLE",
     "notice_for_unevaluable_kind(strategy_verdict.unevaluable_kind)",
@@ -250,6 +248,7 @@ def test_every_notice_constant_is_placed_by_a_site_or_a_closed_dictionary():
 def test_plugin_gate_failures_carry_a_distinct_fixed_code_per_semantic_branch():
     gate = _funcdef("_run_plugin_gate")
     seen: list[str] = []
+    dynamic: list[str] = []
     for call in ast.walk(gate):
         if not isinstance(call, ast.Call):
             continue
@@ -266,11 +265,27 @@ def test_plugin_gate_failures_carry_a_distinct_fixed_code_per_semantic_branch():
             value = _kw(call, "code")
         else:
             continue
+        if (isinstance(value, ast.Attribute) and value.attr == "code"
+                and isinstance(value.value, ast.Name)
+                and value.value.id in ("static", "report")):
+            dynamic.append(value.value.id)
+            continue
         assert isinstance(value, ast.Constant) and isinstance(value.value, str)
         seen.append(value.value)
-    # 不合格 return は 10 か所、意味分岐ごとに別の語
-    assert sorted(seen) == sorted(codes.PLUGIN_GATE_CODES)
-    assert len(seen) == 10
+    # indicator 検査の語は検査の報告 (static / report) の code をそのまま通し、
+    # 通す直前に固定語の表で検証する
+    assert sorted(dynamic) == ["report", "static"]
+    validated = [c for c in ast.walk(gate) if isinstance(c, ast.Call)
+                 and _call_name(c) == "notice_for_plugin_gate"]
+    assert sorted(ast.unparse(c.args[0]) for c in validated) == [
+        "report.code", "static.code"]
+    # 不合格 return のうち literal の語は 13 か所 (既存 10 + 契約 3)、意味分岐ごとに別の語
+    indicator_words = {
+        "symbol_in_name", "param_price_unit", "fixture_run_failed",
+        "output_not_finite", "output_constant", "indicator_duplicate",
+        "indicator_monotone_duplicate"}
+    assert sorted(seen) == sorted(codes.PLUGIN_GATE_CODES - indicator_words)
+    assert len(seen) == 13
 
 
 def test_plugin_gate_wrappers_take_code_without_a_default():

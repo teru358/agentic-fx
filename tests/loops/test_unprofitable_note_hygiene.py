@@ -274,7 +274,7 @@ def _write_indicator_candidate(staging_dir, name: str) -> None:
     # `outputs:` 未宣言の indicator 候補は `outputs_required` で拒否される
     # ようになった (実測で確認)。
     (candidate_dir / "config.yaml").write_text(
-        "kind: indicator\npairs: ['USDJPY']\ntimeframe: '1h'\n"
+        "kind: indicator\npairs: []\ntimeframe: '1h'\n"
         "outputs: ['v']\n")
     (candidate_dir / "test_plugin.py").write_text(
         "def test_x():\n    pass\n"

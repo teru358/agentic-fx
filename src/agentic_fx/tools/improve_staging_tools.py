@@ -248,9 +248,10 @@ def build_improve_staging_tooldefs(
         # 弾かれる。ツールで読めない名前は列挙しない。
         candidates = []
         for d in sorted(p for p in staging_dir.iterdir()
-                        if p.is_dir()
+                        if p.is_dir() and not p.is_symlink()
                         and plugin_loader._PLUGIN_NAME_RE.fullmatch(p.name)):
-            files = sorted(f.name for f in d.iterdir() if f.is_file())
+            files = sorted(f.name for f in d.iterdir()
+                           if f.is_file() and not f.is_symlink())
             candidates.append({"name": d.name, "files": files})
         return {"candidates": candidates}
 

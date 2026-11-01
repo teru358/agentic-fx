@@ -132,9 +132,11 @@ class SandboxError(Exception):
     よい (実装内訳を漏らさない)。"""
 
     def __init__(self, message: str, *, code: str = "backtest_failed",
-                 sandbox_reason: str | None = None) -> None:
+                 sandbox_reason: str | None = None, detail: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        # 固定語の補助分類 (現在は `outputs_mismatch` のみ)。文言からは判別しない
+        self.detail = detail
         # `sandbox_unavailable` の固定 reason、または SIGSYS による `crashed` の
         # `sigsys_unattributed`。技術ログと activity にだけ出す (例外文字列には入れない)
         self.sandbox_reason = sandbox_reason
@@ -684,6 +686,7 @@ _KIND_PAYLOAD_KEYS: dict[str, tuple[str, ...]] = {
     "strategy": ("df", "params"),
 }
 REFERENCE_ERROR_CODES = frozenset({"reference_unavailable", "indicator_unavailable"})
+OUTPUTS_MISMATCH_DETAIL = "outputs_mismatch"
 MAX_CALL_INPUT_BYTES = 3_145_728
 
 # セッション起動 (handshake → ready 応答) を待つ固定タイムアウト。
@@ -1257,7 +1260,8 @@ class PluginSession:
             except OSError:
                 pass
 
-    def call(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def call(self, payload: dict[str, Any], *,
+             timeout_sec: float | None = None) -> dict[str, Any]:
         """1 回の plugin 呼び出し。payload は kind に応じて `df` (pandas
         DataFrame)・`params` (dict)・(strategy のみ) `indicators`/`signals`
         を含む dict。戻り値は kind 別に検証済みの dict:
@@ -1268,9 +1272,10 @@ class PluginSession:
         """
         self._check_owner_thread()
         with self._lock:
-            return self._call_locked(payload)
+            return self._call_locked(payload, timeout_sec=timeout_sec)
 
-    def _call_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _call_locked(self, payload: dict[str, Any], *,
+                     timeout_sec: float | None = None) -> dict[str, Any]:
         if self._dead or self._proc is None:
             raise SandboxError(
                 "plugin session is not usable (not started, or a previous "
@@ -1292,6 +1297,32 @@ class PluginSession:
                 frame_id: _df_to_wire(frame)
                 for frame_id, frame in payload["frames"].items()
             }
+        select = payload.get("select")
+        if select is not None:
+            if (kind != "indicator" or self._meta.outputs is None
+                    or not isinstance(select, (list, tuple)) or not select
+                    or not all(isinstance(k, str) for k in select)
+                    or not set(select) <= set(self._meta.outputs)):
+                raise SandboxError("select must be a non-empty subset of the declared outputs")
+            select = list(select)
+            request["select"] = select
+        for flag in ("retain", "reuse", "release"):
+            value = payload.get(flag)
+            if value is None:
+                continue
+            if kind != "indicator" or not isinstance(value, bool):
+                raise SandboxError(f"{flag} must be a bool and is only valid for indicator calls")
+            request[flag] = value
+        if request.get("retain") and request.get("reuse"):
+            raise SandboxError("retain and reuse cannot be combined")
+        if request.get("release") and not request.get("reuse"):
+            raise SandboxError("release is only valid together with reuse")
+        call_timeout = self._settings.sandbox_timeout_sec
+        if timeout_sec is not None:
+            if (isinstance(timeout_sec, bool) or not isinstance(timeout_sec, (int, float))
+                    or not math.isfinite(timeout_sec) or timeout_sec <= 0):
+                raise SandboxError(f"timeout_sec must be a finite positive number, got {timeout_sec!r}")
+            call_timeout = min(call_timeout, float(timeout_sec))
         request_id = secrets.token_hex(8)
         request["id"] = request_id
         self._check_no_stray_output()
@@ -1306,12 +1337,12 @@ class PluginSession:
 
         # 1 回の call は 1 つの deadline を書き込みと読み取りで共有する
         # (`sandbox_timeout_sec` が call 全体の上限)
-        deadline = time.monotonic() + self._settings.sandbox_timeout_sec
+        deadline = time.monotonic() + call_timeout
         try:
             self._write_line(call_line, deadline=deadline)
         except _WriteDeadlineExpired:
             # load の後なので、読取の期限切れと同じ `timeout`
-            raise self._deadline_expired(self._settings.sandbox_timeout_sec) from None
+            raise self._deadline_expired(call_timeout) from None
         except OSError as exc:
             self._dead = True
             self.error_code = "protocol_error"
@@ -1343,7 +1374,8 @@ class PluginSession:
             self.error_code = code
             raise SandboxError(
                 untrusted_text(response.get("error"), fallback="unknown plugin error"),
-                code=code)
+                code=code,
+                detail=OUTPUTS_MISMATCH_DETAIL if reported == OUTPUTS_MISMATCH_DETAIL else None)
         if self._reap_worker():
             # 応答の後に死んでいた worker の結果は使わない
             self._dead = True
@@ -1357,14 +1389,15 @@ class PluginSession:
         # SandboxError にし、文言は worker 由来の文字列と同じ規則で整える
         try:
             if kind == "indicator":
-                return _validate_indicator_result(result, outputs=self._meta.outputs,
+                return _validate_indicator_result(result, outputs=(tuple(select) if select is not None
+                                                            else self._meta.outputs),
                                                   df_index=payload["df"].index)
             if kind == "signal":
                 return {"signals": _validate_signal_result(result)}
             return _validate_strategy_result(result)
         except SandboxError as exc:
             raise SandboxError(untrusted_text(str(exc), fallback="invalid plugin result"),
-                               code=exc.code) from exc
+                               code=exc.code, detail=exc.detail) from exc
         except Exception as exc:  # noqa: BLE001  OverflowError・RecursionError 等
             raise SandboxError(f"invalid plugin result ({type(exc).__name__})") from exc
 
@@ -1895,7 +1928,7 @@ def _validate_indicator_result(result: Any, *,
     NaN は wire 上で `null` になっている。戻り値は
     `{key: float | list[float | None]}`。
 
-    **codex plan r2 束1 Important**: wire 形式を Python 値
+    wire 形式を Python 値
     (`float | list[float|None]`) へ復元した**後**、
     `core.plugin_contract.validate_indicator_result(out, df_index=None,
     outputs=outputs)` を必ず通す。`df_index=None` なので系列長は検査しない
@@ -1940,8 +1973,9 @@ def _validate_indicator_result(result: Any, *,
         out[key] = float(value)
 
     from agentic_fx.core.plugin_contract import (
-        IndicatorResultError, validate_indicator_result as _validate_common)
-    # codex r1 束1 Important: 共通 validator は **plugin の生の戻り値**を
+        IndicatorResultError, OutputsMismatchError,
+        validate_indicator_result as _validate_common)
+    # 共通 validator は **plugin の生の戻り値**を
     # 見る前提なので、スカラーの `None` は無条件に拒否する (`_check_number`)。
     # 一方 wire では scalar NaN が `null` になり、上のループで `None` へ
     # 復元されている — そのまま渡すと `run_plugin` 経由の scalar NaN が
@@ -1955,6 +1989,8 @@ def _validate_indicator_result(result: Any, *,
     try:
         # 系列の長さは親が渡した df の index でも確かめる (worker の検証に頼らない)
         _validate_common(out, df_index=df_index, outputs=outputs)
+    except OutputsMismatchError as exc:
+        raise SandboxError(str(exc), detail=OUTPUTS_MISMATCH_DETAIL) from exc
     except IndicatorResultError as exc:
         raise SandboxError(str(exc)) from exc
     except (OverflowError, ValueError, TypeError) as exc:
