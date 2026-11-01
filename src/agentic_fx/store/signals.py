@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES, TF_MINUTES
+from agentic_fx.store.db import SIGNAL_ABANDON_REASONS
 
 # timeframe → 分数の CASE 式。鮮度・失効判定はここだけを参照する
 # (式を複製すると将来 timeframe を追加したときに片方だけ更新され乖離する
@@ -89,6 +90,11 @@ _DEPLOY_LINKED_EXISTS = (
     "EXISTS (SELECT 1 FROM plugin_deploy_op_signals AS deploy_links "
     "WHERE deploy_links.signal_id=signals.id)"
 )
+REASON_DEPLOY_LINKED = "deploy_linked"
+REASON_RETRY_EXHAUSTED = "retry_exhausted"
+REASON_REQUEUED_EXPIRED = "requeued_expired"
+REASON_FRESHNESS_EXPIRED = "freshness_expired"
+
 # deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
 # 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
 # abandoned の理由は deploy に結ばれていれば (上限超過を兼ねても)
@@ -102,8 +108,8 @@ _REQUEUE_COUNT_EXPR = (
     "THEN requeue_count ELSE requeue_count + 1 END"
 )
 _REQUEUE_REASON_EXPR = (
-    f"CASE WHEN {_DEPLOY_LINKED_EXISTS} THEN 'deploy_linked' "
-    "WHEN requeue_count >= :max_requeue THEN 'retry_exhausted' END"
+    f"CASE WHEN {_DEPLOY_LINKED_EXISTS} THEN '{REASON_DEPLOY_LINKED}' "
+    f"WHEN requeue_count >= :max_requeue THEN '{REASON_RETRY_EXHAUSTED}' END"
 )
 _REQUEUE_ABANDONED_AT_EXPR = (
     f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
@@ -120,9 +126,25 @@ _REQUEUE_SET = (
 # 鮮度切れの abandoned の理由。requeue 歴が無ければ `freshness_expired`、
 # あれば `requeued_expired`。
 _FRESHNESS_REASON_EXPR = (
-    "CASE WHEN requeue_count > 0 THEN 'requeued_expired' "
-    "ELSE 'freshness_expired' END"
+    f"CASE WHEN requeue_count > 0 THEN '{REASON_REQUEUED_EXPIRED}' "
+    f"ELSE '{REASON_FRESHNESS_EXPIRED}' END"
 )
+
+
+def requeue_outcome(*, requeue_count: int, max_requeue: int,
+                    deploy_linked: bool) -> tuple[str, str | None]:
+    """claimed の signal を戻すときの `(遷移後 status, abandon_reason)`。
+
+    requeue / reclaim_expired の SQL (`_REQUEUE_STATUS_EXPR` /
+    `_REQUEUE_REASON_EXPR`) と、`missions.recover_interrupted` の Python 側が
+    同じ規則を使うための唯一の定義。deploy に結ばれていれば上限に関係なく
+    abandoned (`deploy_linked`)、そうでなく上限以上なら abandoned
+    (`retry_exhausted`)、それ以外は pending で理由なし。"""
+    if deploy_linked:
+        return "abandoned", REASON_DEPLOY_LINKED
+    if requeue_count >= max_requeue:
+        return "abandoned", REASON_RETRY_EXHAUSTED
+    return "pending", None
 
 
 def utc_iso(now: datetime) -> str:
@@ -134,8 +156,8 @@ def utc_iso(now: datetime) -> str:
 def freshness_abandon_reason(signal: dict) -> str:
     """鮮度切れで abandoned にする signal 行の理由 (`_FRESHNESS_REASON_EXPR`
     と同じ規則)。"""
-    return ("requeued_expired" if signal["requeue_count"] > 0
-            else "freshness_expired")
+    return (REASON_REQUEUED_EXPIRED if signal["requeue_count"] > 0
+            else REASON_FRESHNESS_EXPIRED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -351,7 +373,10 @@ def abandon_claimed(conn: sqlite3.Connection, signal_id: int, *,
     claimed でなければ ValueError (fail closed)。鮮度切れや source の失効が
     確定した signal を pending に戻して再 claim の候補にしないために使う。
     理由は store では判別できないので呼び出し側が渡す
-    (鮮度切れは ``freshness_abandon_reason``)。"""
+    (鮮度切れは ``freshness_abandon_reason``)。語彙外の理由は書く前に
+    ValueError にする。"""
+    if reason not in SIGNAL_ABANDON_REASONS:
+        raise ValueError(f"unknown signal abandon reason: {reason!r}")
     abandoned_at = utc_iso(now)
     cur = conn.execute(
         "UPDATE signals SET status='abandoned', "
@@ -361,6 +386,38 @@ def abandon_claimed(conn: sqlite3.Connection, signal_id: int, *,
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"signal {signal_id} is not claimed")
+
+
+def abandoned_counts(conn: sqlite3.Connection, *, since: datetime,
+                     until: datetime) -> dict[str, int]:
+    """`[since, until)` に abandoned になった signal の件数を理由別に返す。
+
+    `abandoned_at` は UTC、`created_at` / `claimed_at` / `bar_ts` は clock の
+    オフセットのままなので、期間の比較や集計は生の文字列でなく必ず
+    ``datetime()`` で両辺を正規化する。この関数と `abandon_lag_seconds` が
+    その規律の置き場で、abandoned の期間 query はここを経由する。"""
+    _require_aware(since, "since")
+    _require_aware(until, "until")
+    rows = conn.execute(
+        "SELECT abandon_reason, COUNT(*) FROM signals "
+        "WHERE status='abandoned' AND abandoned_at IS NOT NULL "
+        "AND datetime(abandoned_at) >= datetime(:since) "
+        "AND datetime(abandoned_at) < datetime(:until) "
+        "GROUP BY abandon_reason",
+        {"since": since.isoformat(), "until": until.isoformat()}).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def abandon_lag_seconds(conn: sqlite3.Connection, signal_id: int) -> int | None:
+    """signal が作られてから abandoned になるまでの秒数。abandoned でない、
+    または時刻を持たない (`legacy_unknown`) ときは None。`created_at` との
+    比較は ``datetime()`` で正規化する (オフセットが違っても正しい)。"""
+    row = conn.execute(
+        "SELECT CAST(strftime('%s', abandoned_at) AS INTEGER) "
+        "- CAST(strftime('%s', created_at) AS INTEGER) "
+        "FROM signals WHERE id=? AND status='abandoned'",
+        (signal_id,)).fetchone()
+    return None if row is None or row[0] is None else row[0]
 
 
 def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from agentic_fx._safe_error import safe_text
 from agentic_fx.core import market_hours
 from agentic_fx import improve_notice_codes as notice_codes
+from agentic_fx.store.signals import requeue_outcome, utc_iso
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -175,10 +176,11 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
     はこの区別を明記すること。
 
     signals の requeue/abandon 判定は `signals.py` の
-    `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則 (現在の
-    requeue_count が max_requeue 以上なら abandoned、未満なら pending +
-    +1、abandoned の理由は deploy に結ばれていれば `deploy_linked`、そう
-    でなければ `retry_exhausted`、時刻は `now`) を Python 側で再現する —
+    `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則を
+    `signals.requeue_outcome` (Python の純関数) 経由で適用する — 現在の
+    requeue_count が max_requeue 以上か deploy に結ばれていれば abandoned
+    (理由は `deploy_linked` / `retry_exhausted`、時刻は `now`)、そうで
+    なければ pending + +1。
     `signals.reclaim_expired` を呼ぶと
     それ自身が `conn.commit()` するため、missions の更新と同一トランザ
     クションを構成できない (この関数専用に単一トランザクションで完結
@@ -204,12 +206,13 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                 "FROM signals WHERE status='claimed' "
                 f"AND claimed_by_mission_id IN ({placeholders})",
                 running_ids).fetchall()
-            from agentic_fx.store.signals import utc_iso
             abandoned_at = utc_iso(now)
             for row in claimed_rows:
-                if row["requeue_count"] >= max_requeue or row["deploy_linked"]:
-                    reason = ("deploy_linked" if row["deploy_linked"]
-                              else "retry_exhausted")
+                outcome, reason = requeue_outcome(
+                    requeue_count=row["requeue_count"],
+                    max_requeue=max_requeue,
+                    deploy_linked=bool(row["deploy_linked"]))
+                if outcome == "abandoned":
                     conn.execute(
                         "UPDATE signals SET status='abandoned', "
                         "abandon_reason=?, abandoned_at=?, "

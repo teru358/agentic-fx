@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS signal_decisions (
   actor TEXT NOT NULL,
   reject_code TEXT,
   decided_at TEXT NOT NULL,
+  UNIQUE(id, signal_id),
   CHECK ((decision='accept' AND actor='llm' AND trade_intent_id IS NOT NULL
           AND reject_code IS NULL)
          OR (decision='reject' AND actor='llm' AND trade_intent_id IS NULL
@@ -196,7 +197,7 @@ CREATE TABLE IF NOT EXISTS signal_decisions (
 _SIGNAL_SHADOW_DDL = """
 CREATE TABLE IF NOT EXISTS signal_shadow (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  decision_id INTEGER NOT NULL UNIQUE REFERENCES signal_decisions(id),
+  decision_id INTEGER NOT NULL UNIQUE,
   signal_id INTEGER NOT NULL UNIQUE REFERENCES signals(id),
   decision TEXT NOT NULL,
   actor TEXT NOT NULL,
@@ -210,6 +211,8 @@ CREATE TABLE IF NOT EXISTS signal_shadow (
   spread_source TEXT NOT NULL CHECK(spread_source IN ('quote','assumed')),
   rule_version INTEGER NOT NULL,
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  FOREIGN KEY (decision_id, signal_id)
+    REFERENCES signal_decisions(id, signal_id),
   CHECK ((decision='accept' AND actor='llm' AND reject_code IS NULL)
          OR (decision='reject' AND actor='llm' AND reject_code IS NOT NULL
              AND reject_code IN ('news_shock','opposite_position'))
@@ -254,7 +257,7 @@ CREATE TABLE IF NOT EXISTS ohlcv_slice_sets (
   shadow_id INTEGER REFERENCES signal_shadow(id),
   pair TEXT NOT NULL,
   range_start TEXT NOT NULL, range_end TEXT NOT NULL,
-  expected_rows INTEGER NOT NULL,
+  expected_rows INTEGER NOT NULL CHECK(expected_rows >= 0),
   state TEXT NOT NULL CHECK(state IN
     ('awaiting','staging','complete','unrecoverable','cancelled')),
   generation INTEGER REFERENCES ohlcv_slice_generations(id),
@@ -263,6 +266,7 @@ CREATE TABLE IF NOT EXISTS ohlcv_slice_sets (
   rule_version INTEGER NOT NULL,
   UNIQUE(event_id, pair),
   UNIQUE(shadow_id),
+  CHECK (range_start < range_end),
   CHECK ((event_id IS NULL) <> (shadow_id IS NULL)),
   CHECK ((state='staging') = (generation IS NOT NULL)),
   CHECK ((state IN ('complete','unrecoverable','cancelled'))
@@ -1779,9 +1783,46 @@ def _strip_sql_comments(sql: str) -> str:
     return "".join(out)
 
 
+def _canonical_sql_tokens(text: str) -> str:
+    """CHECK 式の正規形。文字列リテラル (引用符つき) は 1 文字も変えず、
+    リテラル外は空白を落としてキーワードの大小を畳む。語と語の間にだけ
+    区切りの空白を残す。"""
+    parts: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            parts.append(text[i:j + 1])
+            i = j + 1
+        elif ch.isspace():
+            i += 1
+        elif ch.isalnum() or ch == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word = text[i:j].upper()
+            if parts and (parts[-1][-1].isalnum() or parts[-1][-1] == "_"):
+                parts.append(" ")
+            parts.append(word)
+            i = j
+        else:
+            parts.append(ch)
+            i += 1
+    return "".join(parts)
+
+
 def _normalized_check_clauses(sql: str) -> list[str]:
-    """DDL 本文の `CHECK(...)` 式を、コメントと空白を落として並べ替えた
-    list で返す。文字列リテラルの中の括弧は数えない。"""
+    """DDL 本文の `CHECK(...)` 式を、コメントと空白を落とし、キーワードの
+    大小を畳んで並べ替えた list で返す。列レベルと表レベルは区別せず集合
+    として比べる。文字列リテラルの中は括弧も空白も大小もそのまま扱う。"""
     text = _strip_sql_comments(sql)
     clauses: list[str] = []
     i, n = 0, len(text)
@@ -1819,7 +1860,7 @@ def _normalized_check_clauses(sql: str) -> list[str]:
                         if depth == 0:
                             break
                     j += 1
-                clauses.append("".join(text[k:j + 1].split()))
+                clauses.append(_canonical_sql_tokens(text[k:j + 1]))
                 i = j + 1
                 continue
         i += 1
@@ -1869,6 +1910,12 @@ def _table_definition_matches(conn: sqlite3.Connection, table: str,
     return actual == expected
 
 
+# signals を参照する子表。v3 rebuild の移行後 FK 検査はこの 3 本だけを
+# 失敗の対象にし、他の表の既存違反は数えて警告に留める。
+_SIGNALS_CHILD_TABLES = (
+    "plugin_deploy_op_signals", "signal_decisions", "signal_shadow")
+
+
 def _migrate_signals_v3(conn: sqlite3.Connection) -> None:
     """signals を v3 (`contract_version` / `abandon_reason` / `abandoned_at` と
     その CHECK) へ table rebuild する。
@@ -1876,7 +1923,7 @@ def _migrate_signals_v3(conn: sqlite3.Connection) -> None:
     `signals` は参照される側なので `_migrate_trade_intents_observability` と
     同じ順序を使う: FK を transaction の外で OFF → `BEGIN IMMEDIATE` →
     再検査 → `signals_new` を作る → 全行コピー → 行数照合 → 旧表 DROP →
-    `signals_new` を `signals` へ RENAME → DB 全体の FK 検査 → commit、
+    `signals_new` を `signals` へ RENAME → 子表 3 本の FK 検査 (他表の違反は警告のみ) → commit、
     finally で FK を ON に戻す。子表の `REFERENCES signals` は名前で解決
     されるので、RENAME 後は新表を指す。
 
@@ -1962,10 +2009,19 @@ def _migrate_signals_v3(conn: sqlite3.Connection) -> None:
                         "INSERT INTO sqlite_sequence (name, seq) "
                         "VALUES ('signals', ?)", (seq_row[0],))
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if violations:
+            mine = [tuple(v) for v in violations
+                    if v[0] in _SIGNALS_CHILD_TABLES]
+            if mine:
                 raise RuntimeError(
                     "signals v3 migration: 移行後に FK 違反が残っています "
-                    f"({len(violations)} 行): {[tuple(v) for v in violations]}")
+                    f"({len(mine)} 行): {mine}")
+            if len(violations) > len(mine):
+                _log.warning(
+                    "signals v3 migration: signals と無関係の表に既存の FK "
+                    "違反が %d 行あります (移行は続行): %s",
+                    len(violations) - len(mine),
+                    sorted({v[0] for v in violations
+                            if v[0] not in _SIGNALS_CHILD_TABLES}))
             conn.commit()
         except BaseException:
             conn.rollback()

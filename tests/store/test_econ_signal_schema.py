@@ -240,7 +240,8 @@ def test_v5_init_backs_up_before_the_signals_rebuild(tmp_path):
 def _assert_children_reference_signals(conn):
     for child in CHILDREN_OF_SIGNALS:
         targets = {fk["table"] for fk in conn.execute(
-            f"PRAGMA foreign_key_list({child})") if fk["from"] == "signal_id"}
+            f"PRAGMA foreign_key_list({child})")
+            if fk["from"] == "signal_id" and fk["to"] == "id"}
         assert targets == {"signals"}, child
     for name, sql in conn.execute(
             "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"):
@@ -1465,3 +1466,314 @@ def test_signals_v3_failure_midway_rolls_back_table_children_and_sequence(
     assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='signals_new'"
                         ).fetchone() is None
     _assert_children_reference_signals(conn)
+
+
+# --- v3 rebuild の FK 検査範囲 ----------------------------------------------
+
+def _orders_row(conn, intent_id):
+    conn.execute(
+        "INSERT INTO orders (intent_id,pair,direction,entry_type,horizon,"
+        "status,created_at,updated_at) VALUES (?,'USDJPY','long','market',"
+        "'day','filled',?,?)", (intent_id, NOW_UTC, NOW_UTC))
+    conn.commit()
+
+
+def test_v3_rebuild_ignores_fk_violations_in_unrelated_tables(
+        tmp_path, caplog):
+    conn, _mid, keep, _gone = _rollback_world(tmp_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    _orders_row(conn, 9999)
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    with caplog.at_level("WARNING", logger="agentic_fx.store.db"):
+        db_module._migrate_signals_v3(conn)
+
+    assert "abandon_reason" in {r[1] for r in conn.execute(
+        "PRAGMA table_info(signals)")}
+    assert _row(conn, keep)["status"] == "pending"
+    assert any("orders" in r.getMessage() and "FK" in r.getMessage()
+               for r in caplog.records)
+    for child in CHILDREN_OF_SIGNALS:
+        assert "signals" in {fk["table"] for fk in conn.execute(
+            f"PRAGMA foreign_key_list({child})")}, child
+
+
+def test_v3_rebuild_still_fails_on_violations_in_the_signals_child_tables(
+        tmp_path):
+    conn, _mid, _keep, gone = _rollback_world(tmp_path)
+    conn.execute("PRAGMA foreign_keys=OFF")
+    _link(conn, _deploy_op(conn, "other"), gone)
+    conn.execute("PRAGMA foreign_keys=ON")
+    before = _state(conn)
+
+    with pytest.raises(RuntimeError, match="FK 違反"):
+        db_module._migrate_signals_v3(conn)
+
+    assert _state(conn) == before
+
+
+# --- CHECK 式の正規化 -------------------------------------------------------
+
+_GUARD_TEMPLATE = (
+    "CREATE TABLE {ine}{name} (a TEXT CHECK(a IN ('x y', 'z')), "
+    "b INTEGER, CHECK (b > 0 AND a IS NOT NULL))")
+
+
+def _synthetic_matches(tmp_path, variant):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(_GUARD_TEMPLATE.format(name="t", ine=""))
+    try:
+        return db_module._table_definition_matches(conn, "t", variant)
+    finally:
+        conn.close()
+
+
+def test_guard_treats_whitespace_inside_a_string_literal_as_meaning(tmp_path):
+    changed = _GUARD_TEMPLATE.replace("'x y'", "'x  y'")
+    assert changed != _GUARD_TEMPLATE
+    assert not _synthetic_matches(tmp_path, changed)
+    assert not _synthetic_matches(tmp_path, _GUARD_TEMPLATE.replace(
+        "'x y'", "'xy'"))
+    assert not _synthetic_matches(tmp_path, _GUARD_TEMPLATE.replace(
+        "'z'", "'Z'"))
+
+
+@pytest.mark.parametrize("variant", [
+    "CREATE TABLE {ine}{name} (a TEXT check(a in ('x y', 'z')), "
+    "b INTEGER, check (b>0 and a is not null))",
+    "CREATE TABLE {ine}{name} (a TEXT, b INTEGER, "
+    "CHECK(  b > 0\n AND a IS NOT NULL), CHECK (a IN ('x y','z')))",
+    "CREATE TABLE {ine}{name} (a TEXT, b INTEGER CHECK (b>0 AND a IS NOT NULL),"
+    " check(a In ('x y' , 'z')))",
+])
+def test_guard_ignores_keyword_case_and_check_placement(tmp_path, variant):
+    assert _synthetic_matches(tmp_path, variant)
+
+
+def test_normalized_check_clauses_keep_literals_verbatim():
+    clauses = db_module._normalized_check_clauses(
+        "CREATE TABLE t (a TEXT CHECK(a IN ('a ''b'' (c)', \"Q q\")))")
+    assert clauses == ["(A IN('a ''b'' (c)',\"Q q\"))"]
+
+
+# --- signal_shadow と signal_decisions の結び -------------------------------
+
+def test_signal_shadow_must_point_at_its_own_decision_signal(decided):
+    conn, mid, sid, _ = decided
+    other = _raw_signal(conn, content_hash="other", status="consumed")
+    did = _decision(conn, mission_id=mid, signal_id=sid, decision="reject",
+                    actor="system", reject_code="econ_window", intent_id=None)
+    _decision(conn, mission_id=mid, signal_id=other, decision="reject",
+              actor="system", reject_code="econ_window", intent_id=None)
+    values = {**_SHADOW_BASE}
+    cols = ",".join(values)
+    marks = ",".join("?" * len(values))
+    sql = (f"INSERT INTO signal_shadow (decision_id,signal_id,{cols},"
+           f"created_at,updated_at) VALUES (?,?,{marks},?,?)")
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        conn.execute(sql, (did, other, *values.values(), NOW_UTC, NOW_UTC))
+    conn.execute(sql, (did, sid, *values.values(), NOW_UTC, NOW_UTC))
+
+
+def test_signal_decisions_expose_a_unique_id_signal_pair(tmp_path):
+    conn = _fresh(tmp_path)
+    uniques = [tuple(c["name"] for c in conn.execute(
+        f"PRAGMA index_info('{i['name']}')"))
+        for i in conn.execute("PRAGMA index_list(signal_decisions)")
+        if i["unique"]]
+    assert ("id", "signal_id") in uniques
+    fks = [(r["table"], r["from"], r["to"]) for r in conn.execute(
+        "PRAGMA foreign_key_list(signal_shadow)")
+        if r["table"] == "signal_decisions"]
+    assert sorted(fks) == [("signal_decisions", "decision_id", "id"),
+                           ("signal_decisions", "signal_id", "signal_id")]
+
+
+# --- abandon_claimed の理由検証と naive 拒否 --------------------------------
+
+@pytest.mark.parametrize("reason", db_module.SIGNAL_ABANDON_REASONS)
+def test_abandon_claimed_accepts_every_vocabulary_reason(tmp_path, reason):
+    conn = _store_conn(tmp_path)
+    sid, _ = _claimed(conn, content_hash="x")
+    signals.abandon_claimed(conn, sid, now=NOW, reason=reason)
+    assert _row(conn, sid)["abandon_reason"] == reason
+
+
+@pytest.mark.parametrize("reason", ["normalisation_failed", "", "Source_Inactive"])
+def test_abandon_claimed_rejects_unknown_reason_before_writing(tmp_path, reason):
+    conn = _store_conn(tmp_path)
+    sid, _ = _claimed(conn, content_hash="x")
+    with pytest.raises(ValueError, match="abandon reason"):
+        signals.abandon_claimed(conn, sid, now=NOW, reason=reason)
+    assert _row(conn, sid)["status"] == "claimed"
+
+
+def test_requeue_rejects_naive_time_without_writing(tmp_path):
+    conn = _store_conn(tmp_path)
+    sid, _ = _claimed(conn, content_hash="x")
+    with pytest.raises(ValueError, match="naive"):
+        signals.requeue(conn, sid, now=NOW.replace(tzinfo=None), max_requeue=2)
+    assert _row(conn, sid)["status"] == "claimed"
+
+
+def test_every_source_caller_of_requeue_and_abandon_passes_now():
+    import ast
+    src = Path(db_module.__file__).resolve().parents[1]
+    found = []
+    for path in src.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "signals"
+                    and node.func.attr in ("requeue", "abandon_claimed")):
+                found.append(path.name)
+                kw = {k.arg: k.value for k in node.keywords}
+                assert "now" in kw, (path.name, node.lineno)
+                assert not (isinstance(kw["now"], ast.Call)
+                            and ast.unparse(kw["now"]).startswith(
+                                "datetime.utcnow")), (path.name, node.lineno)
+    assert found.count("trade_loop.py") == 4
+
+
+@pytest.mark.parametrize("abandon_if_stale", [False, True])
+def test_trade_loop_requeue_signal_uses_the_aware_clock(
+        tmp_path, abandon_if_stale):
+    conn, loop, _, sid, loop_now = _loop_world(tmp_path, [])
+    mid = missions.start(conn, "trade", "local", "m", loop_now)
+    claimed = signals.claim_oldest(conn, mission_id=mid, now=loop_now,
+                                   freshness_bars=None)
+    if abandon_if_stale:
+        _jump(loop, loop_now + timedelta(hours=5))
+
+    msg = loop._requeue_signal(claimed, abandon_if_stale=abandon_if_stale)
+
+    assert (msg is not None) == abandon_if_stale
+    row = _row(conn, sid)
+    assert row["status"] == ("abandoned" if abandon_if_stale else "pending")
+    assert row["requeue_count"] == (0 if abandon_if_stale else 1)
+
+
+# --- requeue / abandon の理由規則は 1 か所 ----------------------------------
+
+@pytest.mark.parametrize("requeue_count, linked, expected", [
+    (0, False, ("pending", None)),
+    (1, False, ("pending", None)),
+    (2, False, ("abandoned", "retry_exhausted")),
+    (3, False, ("abandoned", "retry_exhausted")),
+    (0, True, ("abandoned", "deploy_linked")),
+    (2, True, ("abandoned", "deploy_linked")),
+])
+def test_requeue_outcome_is_the_rule_the_sql_paths_follow(
+        tmp_path, requeue_count, linked, expected):
+    assert signals.requeue_outcome(
+        requeue_count=requeue_count, max_requeue=2,
+        deploy_linked=linked) == expected
+    conn = _store_conn(tmp_path)
+    sid, _ = _claimed(conn, content_hash="x", requeue_count=requeue_count)
+    if linked:
+        _link(conn, _deploy_op(conn), sid, "claimed")
+    signals.requeue(conn, sid, now=NOW, max_requeue=2)
+    row = _row(conn, sid)
+    assert (row["status"], row["abandon_reason"]) == expected
+
+
+def test_missions_holds_no_copy_of_the_requeue_reason_rule():
+    import ast
+    path = Path(missions.__file__)
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    keys = {id(n.slice) for n in ast.walk(tree)
+            if isinstance(n, ast.Subscript)}
+    literals = {n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and id(n) not in keys}
+    assert not {"deploy_linked", "retry_exhausted"} & literals
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for n in ast.walk(fn):
+                if isinstance(n, ast.ImportFrom) and n.module and \
+                        n.module.endswith("store.signals"):
+                    raise AssertionError(f"function-local import in {fn.name}")
+
+
+# --- ダミー data migration の機構 -------------------------------------------
+
+def test_registered_data_migration_runs_once_across_inits(tmp_path, monkeypatch):
+    calls = []
+
+    def probe(c):
+        calls.append(c.in_transaction)
+
+    monkeypatch.setattr(db_module, "_signal_data_migrations",
+                        lambda: (("probe_once", probe),))
+    conn = _fresh(tmp_path)
+    init_db(conn)
+    init_db(conn)
+
+    assert calls == [True]
+    assert conn.execute("SELECT COUNT(*) FROM data_migrations "
+                        "WHERE name='probe_once'").fetchone()[0] == 1
+    assert not conn.in_transaction
+
+
+# --- slice set の値域 CHECK -------------------------------------------------
+
+@pytest.mark.parametrize("overrides", [
+    {"expected_rows": -1},
+    {"range_end": "2026-10-30T12:15:00+00:00"},
+    {"range_start": "2026-10-30T16:30:00+00:00",
+     "range_end": "2026-10-30T12:15:00+00:00"},
+])
+def test_slice_sets_reject_negative_rows_and_empty_or_inverted_ranges(
+        slice_world, overrides):
+    conn, eid, _ = slice_world
+    with pytest.raises(sqlite3.IntegrityError):
+        _slice_set(conn, eid, **overrides)
+
+
+def test_slice_sets_accept_zero_expected_rows(slice_world):
+    conn, eid, _ = slice_world
+    _slice_set(conn, eid, expected_rows=0)
+
+
+# --- abandoned_at の期間 query は datetime() で正規化する ---------------------
+
+JST = timezone(timedelta(hours=9))
+
+
+def _abandoned_in_jst(conn, content_hash, created_jst, abandoned_utc):
+    sid = _raw_signal(conn, content_hash=content_hash, status="claimed",
+                      claimed_by=_mission(conn, "running"),
+                      claimed_at=created_jst.isoformat())
+    conn.execute("UPDATE signals SET created_at=? WHERE id=?",
+                 (created_jst.isoformat(), sid))
+    signals.abandon_claimed(conn, sid, now=abandoned_utc,
+                            reason="source_inactive")
+    return sid
+
+
+def test_abandon_lag_compares_across_offsets(tmp_path):
+    conn = _store_conn(tmp_path)
+    created = datetime(2026, 10, 30, 22, 0, tzinfo=JST)  # 13:00Z
+    sid = _abandoned_in_jst(conn, "a", created, NOW + timedelta(minutes=30))
+    # 生の文字列比較では created_at ('...T22:00:00+09:00') の方が後に見える
+    assert _row(conn, sid)["abandoned_at"] < created.isoformat()
+    assert signals.abandon_lag_seconds(conn, sid) == 1800
+    pending = _raw_signal(conn, content_hash="p")
+    assert signals.abandon_lag_seconds(conn, pending) is None
+
+
+def test_abandoned_counts_group_a_period_regardless_of_clock_offset(tmp_path):
+    conn = _store_conn(tmp_path)
+    created = datetime(2026, 10, 30, 22, 0, tzinfo=JST)
+    _abandoned_in_jst(conn, "in1", created, NOW + timedelta(minutes=30))
+    _abandoned_in_jst(conn, "in2", created, NOW + timedelta(minutes=45))
+    _abandoned_in_jst(conn, "out", created, NOW + timedelta(hours=2))
+    since = datetime(2026, 10, 30, 22, 0, tzinfo=JST)   # 13:00Z
+    until = datetime(2026, 10, 30, 23, 0, tzinfo=JST)   # 14:00Z
+
+    assert signals.abandoned_counts(conn, since=since, until=until) == {
+        "source_inactive": 2}
+    with pytest.raises(ValueError, match="naive"):
+        signals.abandoned_counts(conn, since=since.replace(tzinfo=None),
+                                 until=until)

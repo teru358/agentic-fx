@@ -1,6 +1,6 @@
 # 指標回避帯・シグナル採否契約・shadow 成績・反応統計 — 設計 C0
 
-**版:** v0.9 C0（2026-11-01、設計レビュー 8 周を全件反映、J1〜J3 利用者承認済、実装待ち）
+**版:** v0.9.1 C0（2026-11-01、設計レビュー 8 周を全件反映、J1〜J3 利用者承認済、実装待ち）
 **対象:** `econ-event-hold-window-deterministic` / `llm-vs-strategy-signal-authority` / `econ-event-actuals-and-reaction-stats`。実装は束 1 と束 2 に分けるが、本書を共通契約とする。
 
 ## 0. 目的と非目標
@@ -204,7 +204,7 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 
 | 列 | 契約 |
 |---|---|
-| `id` / `decision_id` / `signal_id` | 主キー、decision への UNIQUE FK、signal への UNIQUE FK |
+| `id` / `decision_id` / `signal_id` | 主キー、decision への UNIQUE FK、signal への UNIQUE FK。`(decision_id, signal_id)` は `signal_decisions(id, signal_id)` への複合 FK で、別 signal の decision を指せない |
 | `decision` | `accept` / `reject` snapshot |
 | `actor` | decision と同じ値域 `llm` / `system` の snapshot。accept は常に `llm` |
 | `reject_code` | accept は NULL、reject は decision と同じ固定語 |
@@ -231,8 +231,8 @@ CHECK は全 nullable 列に `IS NULL` / `IS NOT NULL` を明示し、accept、L
 | `id` | 主キー |
 | `event_id` / `shadow_id` | 片方だけ NOT NULL の FK。UNIQUE は `(event_id,pair)` と `shadow_id` |
 | `pair` | settings pair |
-| `range_start` / `range_end` | UTC の半開区間。event は `[ts-15m,ts+4h)`、shadow は §3.4 の区間 |
-| `expected_rows` | 区間の分数 |
+| `range_start` / `range_end` | UTC の半開区間で `range_start < range_end`。event は `[ts-15m,ts+4h)`、shadow は §3.4 の区間 |
+| `expected_rows` | 区間の分数。0 以上 |
 | `state` | `awaiting` / `staging` / `complete` / `unrecoverable` / `cancelled`。`cancelled` は対象外になった event set の状態で、worker の候補にならない。設定変更で再び対象になれば、slice 行が 0 件であることを確認して `completed_at=NULL`、`generation=NULL`、`purged_at=NULL` として `awaiting` に戻す。発表前に記録済みの spread は保持する（§3.5-5） |
 | `generation` | staging 中だけ値を持つ。staging 行を書いた worker 起動の世代で、`ohlcv_slice_generations.id` への FK |
 | `spread_pips` / `spread_source` | event だけ値を持つ（§3.5）。shadow は NULL（shadow 行が持つ） |
@@ -392,7 +392,7 @@ activity 固定語は次の 9 個だけ追加する: `signal_filtered_econ_windo
 | 場所 | 配線 | 所有 |
 |---|---|---|
 | `src/agentic_fx/config.py` / `config/settings.yaml.example` / `tests/fixtures/settings_examples/v5.yaml` | 任意 `econ.window`、3 既定値、任意 `econ.signal_capacity_daily_max`。config 層は容量上書きを整数 1 以上とだけ検査し、`S_producer` との比較はしない。schema_version は 5 のまま、example と v5 fixture は byte 同期し、v4 → v5 migrate chain は `econ` を注入しない | 束1 T1a |
-| `src/agentic_fx/store/db.py` | `signal_decisions`、`signal_shadow`、`ohlcv_slice_sets`、`ohlcv_slices`、`ohlcv_slice_generations`、`econ_reaction_keys`、`econ_reaction_values` の fresh DDL / index / CHECK / table list。`econ_events.superseded_by`。`trade_intents` の `econ_window` CHECK rebuild と、`signals` の rebuild（`contract_version`・`abandon_reason`・`abandoned_at` と CHECK、既存 abandoned は reason=`legacy_unknown` / `abandoned_at=NULL`）。`_SIGNALS_V2_DDL` は変えず `{ine}{name}` 型の v3 DDL を別に置き、fresh は v3、既存は `_migrate_signals_fk` の後に v3 rebuild とする。T1a は §3.3 の PK / UNIQUE だけを作り、候補抽出 index が必要なら T4c bench 前に ownership を戻して追加する。busy timeout は変えない。既存 `data_migrations` に対する name 引数の冪等 helper と `init_db` の呼出し順を T1a が置き、T1b が正規化 migration の lazy-import 呼出し 1 行だけを引き継ぐ | 束1 T1a → T1b（呼出し 1 行）→ T4c（追加 index が必要な場合だけ） |
+| `src/agentic_fx/store/db.py` | `signal_decisions`、`signal_shadow`、`ohlcv_slice_sets`、`ohlcv_slices`、`ohlcv_slice_generations`、`econ_reaction_keys`、`econ_reaction_values` の fresh DDL / index / CHECK / table list。`econ_events.superseded_by`。`trade_intents` の `econ_window` CHECK rebuild と、`signals` の rebuild（`contract_version`・`abandon_reason`・`abandoned_at` と CHECK、既存 abandoned は reason=`legacy_unknown` / `abandoned_at=NULL`）。`_SIGNALS_V2_DDL` は変えず `{ine}{name}` 型の v3 DDL を別に置き、fresh は v3、既存は `_migrate_signals_fk` の後に v3 rebuild とする。`signal_decisions` は `UNIQUE(id, signal_id)` を持ち、`signal_shadow` は `(decision_id, signal_id)` の複合 FK で結ぶ（decision / actor / reject_code の snapshot 一致は T1c の writer 契約）。`ohlcv_slice_sets` は `expected_rows >= 0` と `range_start < range_end` の CHECK を持つ。T1a は §3.3 の PK / UNIQUE だけを作り、候補抽出 index が必要なら T4c bench 前に ownership を戻して追加する。busy timeout は変えない。既存 `data_migrations` に対する name 引数の冪等 helper と `init_db` の呼出し順を T1a が置き、T1b が正規化 migration の lazy-import 呼出し 1 行だけを引き継ぐ | 束1 T1a → T1b（呼出し 1 行）→ T4c（追加 index が必要な場合だけ） |
 | `src/agentic_fx/store/signals.py` | T1a は現存する abandoned 書込み（`expire_stale`、requeue / lease 回収の共有式、claimed 即時 abandoned、deploy op pending abandoned）へ reason と `abandoned_at` を付ける最小変更だけを行う。`abandon_claimed()` は store 側で理由を判別できないので、UTC 時刻と reason を引数で受ける形に変え、reason を知る呼出側 `loops/trade_loop.py` の 3 箇所（source inactive / stale の 2 箇所と maintenance の 1 箇所）の引数追加も同じ T1a が行う（`trade_loop.py` のこの 3 行だけ。T1a → T2b-1 に引き渡す）。T1b は eligibility / migration / cleanup の共通分類 query、tx 合成できる consume、集計、旧 payload の正規化 migration / `normalization_failed` を実装する | 束1 T1a → T1b |
 | `src/agentic_fx/store/missions.py` | T1a は起動時の中断回収で abandoned にする既存経路へ reason と `abandoned_at` を付ける最小変更だけを行う。T1b は `system_filtered` 終端と commit を外側へ委ねる終端、signal rate から `system_filtered` を除外する | 束1 T1a → T1b |
 | `src/agentic_fx/store/signal_decisions.py`（新規） | 3 正規形、signal 一意性、decision / shadow / consume / mission の tx | 束1 T1c |
@@ -428,7 +428,7 @@ activity 固定語は次の 9 個だけ追加する: `signal_filtered_econ_windo
 
 新規の `tests/audit/` と `tests/analytics/` にはそれぞれ `__init__.py` を置き、既存 tests の package 収集規約を保つ。
 
-DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh schema と `CREATE TABLE IF NOT EXISTS` を同じ DDL から作る。列追加は冪等に行う。`trade_intents` と `signals` の rebuild は共通 DDL、事前 backup、FK 無効化を transaction 外で行い、新表作成 → 全行 copy → 行数照合 → 旧表 drop → rename → DB 全体の FK 検査 → commit、finally で FK を戻す。signals は RENAME 先行の `_migrate_signals_fk` ではなく、参照される表を扱う `_migrate_trade_intents_observability`（§1）を前例にする。signals の copy では既存 abandoned に reason=`legacy_unknown` / `abandoned_at=NULL`、それ以外に両方 NULL を入れ、`contract_version` は NULL で写す。CHECK 本文も冪等 guard に含め、2 回目初期化で rebuild しない。`missions.status` は現行に CHECK が無いため DDL rebuild をせず reader と test を更新する。`signals.status` の 4 値は変えない。T1a は v3 rebuild と既存 `data_migrations` 用 helper・呼出し順の枠までを作り、旧 payload の正規化は T1b が live 保存規則と一緒に実装して v3 rebuild の直後に走らせ、key と記録行を所有して 2 回目は何もしない。
+DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh schema と `CREATE TABLE IF NOT EXISTS` を同じ DDL から作る。列追加は冪等に行う。`trade_intents` と `signals` の rebuild は共通 DDL、事前 backup、FK 無効化を transaction 外で行い、新表作成 → 全行 copy → 行数照合 → 旧表 drop → rename → signals を参照する子表 3 本（`plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow`）の FK 検査 → commit、finally で FK を戻す。子表 3 本の違反は失敗、signals と無関係な表の既存違反は数えて技術ログに warning を出し、移行を止めない。CHECK 本文の冪等 guard は文字列リテラルの中を 1 文字も変えず、リテラル外だけ空白を落としてキーワードの大小を畳み、列レベルと表レベルの CHECK を区別せず集合で比べる。signals は RENAME 先行の `_migrate_signals_fk` ではなく、参照される表を扱う `_migrate_trade_intents_observability`（§1）を前例にする。signals の copy では既存 abandoned に reason=`legacy_unknown` / `abandoned_at=NULL`、それ以外に両方 NULL を入れ、`contract_version` は NULL で写す。CHECK 本文も冪等 guard に含め、2 回目初期化で rebuild しない。`missions.status` は現行に CHECK が無いため DDL rebuild をせず reader と test を更新する。`signals.status` の 4 値は変えない。T1a は v3 rebuild と既存 `data_migrations` 用 helper・呼出し順の枠までを作り、旧 payload の正規化は T1b が live 保存規則と一緒に実装して v3 rebuild の直後に走らせ、key と記録行を所有して 2 回目は何もしない。
 
 ## 5. 受入条件
 
@@ -467,7 +467,7 @@ DB migration は `db.py` の既存流儀に従う。新 7 表 / index は fresh 
     共通: scheduler 側 `SQLITE_BUSY` 0、core lock 待ち p99 ≤ 10ms、tick 最大所要 ≤ worker 無し対照 + 100ms、既存接続の busy timeout は 5000ms のまま。worker は要求フラグ時に yield、各 transaction は `BEGIN IMMEDIATE`・240 行以下・commit 前 50ms 以下で、commit 所要が記録される。core lock 50ms 以下、1 cycle 25 owner / DB 作業 250ms 上限を満たす。
 13. calendar は unknown、fresh、直近 failure、12h stale、回復を通す。固定 activity は §3.6 の 9 語だけ。`econ_window` は gate streak / Discord / improve reject_breakdown に入らず、signal mission は hold_rate 分母に入らない。`system_filtered` は status / web / ctl の mission 表示で既知 terminal として表示する。
 14. **履歴 DB 再生成（merge 前必須、`bench` audit profile）。** 入力は本機 DB から追跡する抽出スクリプトで固定した read-only snapshot `tests/fixtures/econ_window_history_20261016_1031.sqlite` とし、test はこの fixture を変更しない。保持するのは missions の `id / loop / trigger / status / started_at`、trade_intents の `id / mission_id / action`、signals の `id / status / kind / claimed_by_mission_id` だけで、payload / output / transcript 列と他の全表は落とす。test は抽出スクリプトの列 allowlist と snapshot schema をこの一覧へ固定する。`[2026-10-16T00:00Z,2026-10-31T00:00Z)` では、trade_intents を missions に結び `missions.started_at` で切った intent が hold 970 / open 3 / 計 973、trade mission は 1,033 本、`signals.claimed_by_mission_id` 基準の signal-linked 57 になることを再生成し、query、fixture SHA-256、母集団別件数を `tmp/econ-window-acceptance/history/summary.json` に出す。signal 57 は全件を移行前 cron 由来 consumed の 1 区分とし、新分類の system reject / LLM accept / LLM reject / abandoned は各 0 と照合する。944 は期待値に使わない。通常 suite では `bench` marker により除外してよいが、§7 の merge 前 job は `--fail-on-skip` でこれらの一致を必須にする。
-15. settings の `econ` 省略時は 3 既定値、範囲外は起動前拒否、`signal_capacity_daily_max` は config 層で整数 1 以上だけを検査し、example と model は同期し、schema_version は 5 のまま。fresh / existing DB の新表・列・CHECK・index が同形で、2 回目 init は行を変えない。signals rebuild 後の `sqlite_master` / FK metadata を検査し、子表 `plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow` の参照先がいずれも `signals` で、`signals_v1` や新表の一時名を指さないことを確かめる。
+15. settings の `econ` 省略時は 3 既定値、範囲外は起動前拒否、`signal_capacity_daily_max` は config 層で整数 1 以上だけを検査し、example と model は同期し、schema_version は 5 のまま。fresh / existing DB の新表・列・CHECK・index が同形で、2 回目 init は行を変えない。signals rebuild 後の `sqlite_master` / FK metadata を検査し、子表 `plugin_deploy_op_signals` / `signal_decisions` / `signal_shadow` の参照先がいずれも `signals` で、`signals_v1` や新表の一時名を指さないことを確かめる。子表 3 本の FK 違反では rebuild が失敗し、無関係な表の既存違反では warning を出して完了する。
 16. agent 面 canary は shadow pnl / 勝率 / 件数、strategy 別率、床未満 n、親 report 固有値を埋め、trade prompt / summary / reflection / RAG / improve / ask / activity を全探索して 0 件。status / web は同じ DTO、壊れた集計は該当節だけ unavailable で取引を止めない。
 17. **起動条件、claim 期限、decision 期限。** 注入時計で次を通す。
     - flat book: 建玉・注文 0 件で eligible signal 1 件 → 次の idle tick に専用 mission が claim する。
@@ -611,3 +611,4 @@ J1〜J3 以外の境界、欠損、CAS、calendar fail-open、limit 非取消、
 | 2026-11-01 | v0.8 C0 | signals v3 rebuild と既存 abandoned 書込みの所有、参照元 FK を保つ移行前例、shadow state 正規形、payload migration / report hook の引渡し、容量算定とブリーフ注記を確定 | 設計レビュー 7 周目 Critical 2 / Important 5 / Minor 4 を全件反映 | — |
 | 2026-11-01 | v0.8.1 C0 | `abandon_claimed()` に UTC 時刻と reason を引数で渡し、`trade_loop.py` の呼出側 3 箇所を T1a の所有に含めて T2b-1 へ引き渡す | 設計レビュー 8 周目 (閉鎖確認) の残り Critical 1 | — |
 | 2026-11-01 | v0.9 C0 | J1〜J3 を利用者承認済（推奨どおり: reject code 2 語、帯 3 / 30 / 15、方針既定文）に | ユーザー承認、実装着手 | — |
+| 2026-11-01 | v0.9.1 C0 | v3 rebuild の FK 検査を子表 3 本に訂正（他表の違反は warning）、CHECK 正規化の規則、`signal_shadow` の複合 FK、slice set の値域 CHECK を足す | T1a /code-review 2 周目の裁定 | — |
