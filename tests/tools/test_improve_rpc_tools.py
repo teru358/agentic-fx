@@ -252,6 +252,24 @@ def test_analyze_corr_records_trial_count_from_handler():
     assert ledger.entries()[0]["trial_count"] == 25
 
 
+def test_analyze_corr_public_drops_trial_count_but_ledger_keeps_it():
+    ledger = ImproveRpcLedger(rpc_timeout_sec_by_kind={"analyze_corr": 60.0})
+    full = {"trial_count": 25, "lags_tested": 25, "n_obs": 400,
+            "peak_lag": 1, "peak_corr": 0.2}
+    tools = {t.name: t for t in build_improve_rpc_tooldefs(
+        ledger=ledger, run_backtest_handler=lambda a: {},
+        analyze_corr_handler=lambda a: dict(full))}
+    out = tools["analyze_corr"].func(request={"kind": "lead_lag"})
+    ledger.freeze()
+    assert "trial_count" not in out
+    assert out["lags_tested"] == 25 and out["n_obs"] == 400
+    assert ledger.entries()[0]["trial_count"] == 25
+    handlers = build_rpc_handlers(
+        {"run_backtest": lambda a: {}, "analyze_corr": lambda a: dict(full)}, None)
+    o = handlers["analyze_corr"]({"request": {"kind": "lead_lag"}})
+    assert "trial_count" not in o.public and o.public["n_obs"] == 400
+
+
 def test_run_backtest_defaults_trial_count_to_one_when_handler_omits_it():
     """L22: `result.get("trial_count", 1)` の既定値 1 を見るテストが無い
     — trial_count を返さない handler を据え、台帳の trial_count==1 を

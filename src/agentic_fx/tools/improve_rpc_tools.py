@@ -114,6 +114,16 @@ def _strip_forbidden(value: object) -> object:
     return value
 
 
+def _strip_analyze_public(result: object) -> object:
+    """analyze_corr の agent 向け投影。`trial_count` は台帳の分母 (呼び出しで
+    計算した相関値の個数) で標本数ではないため、agent には返さない
+    (lead_lag は `lags_tested` / `n_obs` を返す)。台帳は strip 前を読む。"""
+    stripped = _strip_forbidden(result)
+    if isinstance(stripped, dict):
+        stripped.pop("trial_count", None)
+    return stripped
+
+
 def _is_successful_backtest(result: object) -> bool:
     """設計 v4 Tier B の「成功した run_backtest」= error が無く、metrics の
     **trades が 1 以上** (実データで trade が出た) 応答。空 dict / metrics 欠落
@@ -252,7 +262,8 @@ def build_improve_rpc_tooldefs(
                       result_summary=result,
                       trial_count=result.get("trial_count", 1))
         return _RpcToolResult(
-            _strip_forbidden(result), save_kwargs=getattr(result, "save_kwargs", None))
+            _strip_analyze_public(result),
+            save_kwargs=getattr(result, "save_kwargs", None))
 
     return [
         ToolDef(name="run_backtest", description=(
@@ -296,16 +307,19 @@ def build_rpc_handlers(
         analyze_corr_handler=rpc_handlers["analyze_corr"],
         staging_dir=staging_dir)
 
-    def wrap(func: Callable) -> Callable[[dict], RpcOutcome]:
+    def wrap(func: Callable, strip: Callable = _strip_forbidden,
+             ) -> Callable[[dict], RpcOutcome]:
         def call(args: dict) -> RpcOutcome:
             result = func(**args)
             return RpcOutcome(
-                public=_strip_forbidden(result),
+                public=strip(result),
                 private=getattr(result, "save_kwargs", None),
             )
         return call
 
-    return {tool.name: wrap(tool.func) for tool in tools}
+    return {tool.name: wrap(tool.func, _strip_analyze_public
+                            if tool.name == "analyze_corr" else _strip_forbidden)
+            for tool in tools}
 
 
 def build_ledger_wrapped_rpc_handlers(

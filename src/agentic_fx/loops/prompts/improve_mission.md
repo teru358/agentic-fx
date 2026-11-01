@@ -111,8 +111,9 @@ indicator は銘柄を持たないので、名前・param・説明に銘柄名�
 7. **strategy は配備済 indicator を `indicators:` で宣言して使ってください**
    (`list_deployed_plugins()` で一覧。`outputs` が `null` の indicator は
    依存先にできません)。**提出前に `lock_staging_deps(name="<候補名>")` で
-   依存の版をロックし、ロック後に `run_plugin_tests` と `run_backtest` を
-   再実行してください** (テストした artifact == 提出する artifact)。
+   依存の版をロックし、ロック後に `run_backtest`、続けて `run_plugin_tests` を
+   再実行してください** (成功した backtest が無い strategy は 2 回目の
+   self-test を回せません。テストした artifact == 提出する artifact)。
    系列が全 NaN のままなら warmup 不足の兆候です — `max_bars` は
    「依存 indicator の warmup + 自分の lookback」を覆う値を宣言してください。
    **無い指標を strategy の中で自前計算しないでください。** 無い指標は、この mission の候補を `kind: indicator` の plugin にして新設できます (self-test のみで提出。`run_backtest` は strategy 専用。strategy と同時には提出できず、承認・配備の後の mission で `indicators:` に書けます)。配備済みに同じ定義があれば別名で作らず再利用してください。今回は strategy を続けるなら、`不足指標: <名前と定義>` として `discoveries` に起票してください。
@@ -121,9 +122,9 @@ indicator は銘柄を持たないので、名前・param・説明に銘柄名�
    ```yaml
    indicators:
      ref_ema: {{plugin: ema, symbol: <reference_symbols の 1 つ>, timeframe: 1h, params: {{period: 50}}}}
-     ref_px:  {{plugin: ohlcv, symbol: <reference_symbols の 1 つ>, timeframe: 1h, params: {{}}}}
    ```
-   `plugin: ohlcv` は参照 symbol の生系列を取る宣言です。`analyze_corr(request=…)` の `request` は次の 3 形のいずれかで、キーは過不足なく一致させます: `{{"kind": "corr_matrix", "timeframe": …}}` / `{{"kind": "rolling_corr_summary", "a": …, "b": …, "timeframe": …, "window": …}}` / `{{"kind": "lead_lag", "a": …, "b": …, "timeframe": …}}` (`a` ≠ `b` は `reference_symbols` から。`timeframe` は 15m / 1h / 4h / 1d、`window` は 20 / 60 / 120)。
+   生系列が要るときは、`list_deployed_plugins()` の配備済み indicator のうち outputs が open / high / low / close / volume の通過 indicator を `symbol:` 付きで宣言する (無ければ kind: indicator の候補として新設する)。主系列と参照系列の 2 本を同時に受け取る indicator の契約は未対応です。相対リターン差などの 2 銘柄関係の指標は作れないので、課題・note に繰り返し書かず、1 系列の指標と strategy 側の宣言で表せる仮説を選んでください。
+   `analyze_corr(request=…)` の `request` は次の 3 形のいずれかで、キーは過不足なく一致させます: `{{"kind": "corr_matrix", "timeframe": …}}` / `{{"kind": "rolling_corr_summary", "a": …, "b": …, "timeframe": …, "window": …}}` / `{{"kind": "lead_lag", "a": …, "b": …, "timeframe": …}}` (`a` ≠ `b` は `reference_symbols` から。`timeframe` は 15m / 1h / 4h / 1d、`window` は 20 / 60 / 120)。
 8. **`get_signals` は取引判断 loop 専用で、この改善 mission では利用できません。**
    配備済み strategy の直近 signal の方向・status・payload は、仮説の選択や
    候補評価の材料にしないでください。この不在は設計上の制約なので、課題・

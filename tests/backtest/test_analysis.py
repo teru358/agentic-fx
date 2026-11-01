@@ -630,6 +630,21 @@ def test_lead_lag_trial_count_equals_len_lags(tmp_path):
     assert row["trial_count"] == len(LAGS) == 25
 
 
+def test_lead_lag_agent_response_has_lags_tested_and_n_obs_not_trial_count(tmp_path):
+    conn = _conn(tmp_path)
+    _seed_two_series(conn, start=BEFORE_BOUNDARY)
+    req = {"kind": "lead_lag", "a": "USDJPY", "b": "EURUSD", "timeframe": "1h"}
+    out = analyze_for_agent(conn, _settings_watch_eurusd(), req, now=NOW)
+    assert out["lags_tested"] == len(LAGS) == 25
+    assert isinstance(out["n_obs"], int) and out["n_obs"] >= MIN_COMMON_OBS
+    assert out["n_obs"] != out["lags_tested"]
+    # 台帳の分母は不変 (private 側 = persist=False の全量)
+    raw = analyze_for_agent(conn, _settings_watch_eurusd(), req, now=NOW,
+                            persist=False)
+    assert raw["trial_count"] == 25 and raw["lags_tested"] == 25
+    _assert_output_contract_no_leak(out)
+
+
 # --- 変異キラー ⑥: リターンはギャップ (欠損バー) を跨いで作らない ------
 
 def test_load_returns_excludes_gap_crossing_return(tmp_path):

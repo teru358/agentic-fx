@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 156 件。完了分は closed/。
+未完了: 155 件。完了分は closed/。
 
 ## 実装中 (3)
 
@@ -72,9 +72,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (133)
+## 設計待ち (132)
 
-### 不具合 (74)
+### 不具合 (73)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -106,7 +106,6 @@
 | [news-cli-distinguish-permission-from-missing-db](open/news-cli-distinguish-permission-from-missing-db.md) | 中 | 2026-10-25 | afx news が root 未解決・権限不足も「DB がありません」と出す |
 | [safe-error-url-regex-misses-ipv6-host](open/safe-error-url-regex-misses-ipv6-host.md) | 中 | 2026-10-25 | _safe_error の URL 伏せが IPv6 host の URL を全く伏せない |
 | [sandbox-to-datetime-and-staging-precheck](open/sandbox-to-datetime-and-staging-precheck.md) | 中 | 2026-10-25 | 改善 sandbox: to_datetime 拒否と test_plugin.py の事前検査欠如 |
-| [improve-prompt-ohlcv-example-leadlag-field-and-order](open/improve-prompt-ohlcv-example-leadlag-field-and-order.md) | 中 | 2026-11-01 | improve prompt の ohlcv 例・lead_lag の trial_count・lock 後の順序 |
 | [harness-failure-becomes-fact](open/harness-failure-becomes-fact.md) | 中 |  | harness 由来の失敗 (timeout 等) をモデルが「環境制約 fact」として note 化し続ける (#… |
 | [refused-errors-double-count](open/refused-errors-double-count.md) | 中 |  | 予算拒否は terminal streak と tool_error streak の両方に入り `refused=1… |
 | [tier-a-directive-ignored](open/tier-a-directive-ignored.md) | 中 |  | 自己テストの連続失敗の警告が無視され続け、止める仕組みが無い |
