@@ -221,7 +221,9 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
     `current_ids` は今回の refresh の新規 row の id (省略時は `new_ids`)。
     旧 row の候補から外すのはこれだけで、以前の保留に残る新規 row は
     さらに時刻が動いたとき旧 row になれる (B から C への連鎖)。循環する
-    置換は結ばない。
+    置換は結ばない。今回の取得結果に無い保留の row は、同じ処理でさらに別の
+    row に置き換えられる (連鎖) ときだけ置き換える側になれる。取得結果から
+    消えただけなら旧 row は置換されない。
     """
     now = _utc(now, "now")
     fetched = {(_utc(ts, "fetched ts"), country, name)
@@ -274,6 +276,14 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
             used_old.add(old_id)
             used_new.add(new_id)
             done.append((old_id, new_id))
+    ghosts = {e.id for e in news
+              if (e.ts, e.country, e.name) not in fetched}
+    for old_id, new_id in list(done):
+        if new_id in ghosts and new_id not in used_old:
+            conn.execute(
+                "UPDATE econ_events SET superseded_by=NULL "
+                "WHERE id=? AND superseded_by=?", (old_id, new_id))
+            done.remove((old_id, new_id))
     return done
 
 

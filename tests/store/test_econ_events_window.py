@@ -506,3 +506,26 @@ def test_upcoming_skips_superseded_rows_and_hides_the_internal_column(conn):
     assert [r["id"] for r in rows] == [new]
     assert set(rows[0]) == {"id", "ts", "country", "name", "importance",
                             "actual", "forecast", "previous"}
+
+
+def test_a_pending_row_missing_from_the_fetch_is_not_a_successor_without_a_chain(conn):
+    old_ts = NOW + timedelta(days=1)
+    b_ts = old_ts + timedelta(hours=2)
+    a, b = _move(conn, old_ts=old_ts, new_ts=b_ts)
+    other = (NOW + timedelta(days=2), "USD", "NFP")
+    out = econ_events.supersede_in_tx(
+        conn, new_ids=[b], fetched_keys=[other], now=NOW, current_ids=[])
+    assert out == [] and _sup(conn, a) is None and _sup(conn, b) is None
+
+
+def test_a_pending_row_missing_from_the_fetch_chains_when_a_successor_exists(conn):
+    old_ts = NOW + timedelta(days=1)
+    b_ts = old_ts + timedelta(hours=2)
+    c_ts = b_ts + timedelta(hours=1)
+    a, b = _move(conn, old_ts=old_ts, new_ts=b_ts)
+    c = add(conn, ts=c_ts, country="USD", name="CPI")
+    out = econ_events.supersede_in_tx(
+        conn, new_ids=[b, c], fetched_keys=_fetched(c_ts), now=NOW,
+        current_ids=[c])
+    assert sorted(out) == sorted([(a, b), (b, c)])
+    assert _sup(conn, a) == b and _sup(conn, b) == c and _sup(conn, c) is None

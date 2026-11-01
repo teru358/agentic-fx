@@ -677,6 +677,36 @@ def test_a_pending_new_row_that_moves_again_is_superseded_in_a_chain(tmp_path):
     assert [r[0] for r in active] == [c]
 
 
+def test_a_pending_new_row_that_vanishes_from_the_feed_supersedes_nothing(tmp_path):
+    cal, _ = make(tmp_path)
+    a, b_ts = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", b_ts)])         # A -> B は commit されない
+    cal.begin = ohlcv_slices.begin_immediate
+    refresh(cal, [ff("Other", "USD", T1)])            # B は取得結果から消えた
+    assert _superseded(cal, a) is None and _pending(cal) == 0
+    active = [r[0] for r in cal.conn.execute(
+        "SELECT id FROM econ_events WHERE name='US CPI' "
+        "AND superseded_by IS NULL")]
+    assert a in active
+
+
+def test_a_chain_supersedes_both_and_a_later_empty_refresh_changes_nothing(tmp_path):
+    cal, _ = make(tmp_path)
+    a, b_ts = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", b_ts)])
+    b = event_id(cal, "US CPI", b_ts)
+    cal.begin = ohlcv_slices.begin_immediate
+    c_ts = b_ts + timedelta(hours=1)
+    refresh(cal, [ff("US CPI", "USD", c_ts)])
+    c = event_id(cal, "US CPI", c_ts)
+    assert _superseded(cal, a) == b and _superseded(cal, b) == c
+    refresh(cal, [ff("Other", "USD", T1)])
+    assert _superseded(cal, c) is None and _pending(cal) == 0
+    assert _superseded(cal, a) == b and _superseded(cal, b) == c
+
+
 def test_a_steady_refresh_writes_no_pending_record(tmp_path):
     cal, _ = make(tmp_path)
     refresh(cal, [ff("US CPI", "USD", T1)])
