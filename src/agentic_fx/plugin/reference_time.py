@@ -34,6 +34,15 @@ def nominal_reference_bars(strategy_max_bars: int, strategy_timeframe: str,
                      / timeframe_seconds(reference_timeframe)) + 1
 
 
+def reference_window_fits(bars: int, max_bars: int) -> bool:
+    """The one comparison both the config-time and the runtime window rules use.
+
+    ``bars`` is a count of reference bars (trading bars, not wall-clock slots):
+    the nominal count at config time, the aligned rows actually present at runtime.
+    """
+    return bars <= max_bars
+
+
 def native_reference_bars(actual_bars: int, reference_timeframe: str,
                           native_timeframe: str) -> int:
     if actual_bars < 1:

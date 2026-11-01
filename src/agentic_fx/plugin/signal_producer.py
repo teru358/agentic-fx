@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from time import monotonic
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.backtest.timeframes import TF_MINUTES, floor_to_bucket, load_closed_frame
@@ -65,6 +65,7 @@ from agentic_fx.plugin.deploy_ops import acquire_name_locks
 from agentic_fx.plugin.reference_frames import (
     FETCH_STATE_REASONS, RUNTIME_WINDOW_REASON,
     actual_bars_for, judge_reference, latest_native_end, load_reference_frame,
+    window_bars_for,
     native_interval,
 )
 from agentic_fx.plugin.reference import runtime_reference_window_reason
@@ -117,7 +118,7 @@ class SignalProducer:
         self._paused = False
         self._source_notices: dict[tuple[str, str, str], str] = {}
         # reference_unavailable は判断足ごとに 1 回。key ごとに最後に記録した bucket だけ持つ。
-        self._reference_notices: dict[tuple[str, str, str], datetime] = {}
+        self._reference_notices: dict[tuple[str, str, str], date] = {}
         # (strategy, pair, symbol, timeframe) -> 直近に記録した reason。None なら使える。
         self._reference_states: dict[tuple[str, str, str, str], str] = {}
 
@@ -486,44 +487,45 @@ class SignalProducer:
             symbol = pair if item.symbol_mode == "self" else item.literal_symbol
             ref_tf = item.timeframe
             actual = actual_bars_for(df.index, meta.timeframe, ref_tf)
-            if runtime_reference_window_reason(actual, max_bars=item.max_bars):
-                raise _ReferenceUnavailable(RUNTIME_WINDOW_REASON)
-            if item.frame_id in frames:
-                continue
-            fetch_state = (reference_state((symbol, native_interval(ref_tf)))
-                           if reference_state is not None else None)
-            frame = None
-            if item.symbol_mode == "self" or symbol in readable:
-                frame = load_reference_frame(
-                    conn, symbol, reference_timeframe=ref_tf, source=source,
-                    d_last=d_last, now=now, grace=grace,
-                    actual_bars=actual, max_age_seconds=item.max_age_seconds)
-            if frame is None:
-                aligned = None
-            else:
-                aligned = judge_reference(
-                    frame, bucket_start=bucket_start, strategy_timeframe=meta.timeframe,
-                    reference_timeframe=ref_tf, max_age_seconds=item.max_age_seconds)
-            usable = aligned is not None and aligned.row_start is not None and aligned.fresh
-            if not usable:
-                age = (None if aligned is None or aligned.age is None
-                       else int(aligned.age.total_seconds()))
-                if fetch_state in FETCH_STATE_REASONS:
-                    reason = fetch_state
-                elif aligned is not None and aligned.row_start is not None:
-                    reason = "age_exceeded"
-                else:
-                    # 窓の中に行が無い。窓より古い行があれば古すぎる、無ければ missing。
-                    newest = (latest_native_end(
+            if item.frame_id not in frames:
+                fetch_state = (reference_state((symbol, native_interval(ref_tf)))
+                               if reference_state is not None else None)
+                frame = None
+                if item.symbol_mode == "self" or symbol in readable:
+                    frame = load_reference_frame(
                         conn, symbol, reference_timeframe=ref_tf, source=source,
-                        d_last=d_last) if frame is not None else None)
-                    reason = "missing" if newest is None else "age_exceeded"
-                    if newest is not None:
-                        age = int((d_last - newest).total_seconds())
-                self._note_reference_state(meta, pair, symbol, ref_tf, reason, age, activity)
-                raise _ReferenceUnavailable(reason)
-            frames[item.frame_id] = frame
-            coordinates.append((symbol, ref_tf))
+                        d_last=d_last, now=now, grace=grace,
+                        actual_bars=actual, max_age_seconds=item.max_age_seconds)
+                if frame is None:
+                    aligned = None
+                else:
+                    aligned = judge_reference(
+                        frame, bucket_start=bucket_start, strategy_timeframe=meta.timeframe,
+                        reference_timeframe=ref_tf, max_age_seconds=item.max_age_seconds)
+                usable = aligned is not None and aligned.row_start is not None and aligned.fresh
+                if not usable:
+                    age = (None if aligned is None or aligned.age is None
+                           else int(aligned.age.total_seconds()))
+                    if fetch_state in FETCH_STATE_REASONS:
+                        reason = fetch_state
+                    elif aligned is not None and aligned.row_start is not None:
+                        reason = "age_exceeded"
+                    else:
+                        # 窓の中に行が無い。窓より古い行があれば古すぎる、無ければ missing。
+                        newest = (latest_native_end(
+                            conn, symbol, reference_timeframe=ref_tf, source=source,
+                            d_last=d_last) if frame is not None else None)
+                        reason = "missing" if newest is None else "age_exceeded"
+                        if newest is not None:
+                            age = int((d_last - newest).total_seconds())
+                    self._note_reference_state(meta, pair, symbol, ref_tf, reason, age, activity)
+                    raise _ReferenceUnavailable(reason)
+                frames[item.frame_id] = frame
+                coordinates.append((symbol, ref_tf))
+            window = window_bars_for(frames[item.frame_id].index, df.index,
+                                     meta.timeframe, ref_tf)
+            if runtime_reference_window_reason(window, max_bars=item.max_bars):
+                raise _ReferenceUnavailable(RUNTIME_WINDOW_REASON)
         return _References(frames, tuple(coordinates))
 
     def _note_reference_state(self, meta: PluginMeta, pair: str, symbol: str, timeframe: str,
@@ -550,10 +552,11 @@ class SignalProducer:
     def _report_reference_unavailable(self, meta: PluginMeta, pair: str,
                                       bucket: datetime, exc: "_ReferenceUnavailable",
                                       activity) -> None:
-        key = (meta.name, meta.content_hash, pair)
-        if self._reference_notices.get(key) == bucket:
+        key = (meta.name, meta.content_hash, exc.reason)
+        day = bucket.astimezone(timezone.utc).date()
+        if self._reference_notices.get(key) == day:
             return
-        self._reference_notices[key] = bucket
+        self._reference_notices[key] = day
         _write_activity(
             activity, "reference_unavailable",
             "strategy=%s pair=%s bucket=%s reason=%s"

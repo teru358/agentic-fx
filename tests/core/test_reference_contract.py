@@ -14,7 +14,9 @@ from agentic_fx.plugin.reference import (
     complete_reference_buckets,
     native_reference_bars,
     nominal_reference_bars,
+    reference_window_fits,
     runtime_reference_window_reason,
+    window_reference_bars,
 )
 
 
@@ -119,6 +121,42 @@ def test_actual_reference_window_over_limit_has_the_fixed_fail_closed_reason():
     assert runtime_reference_window_reason(actual, max_bars=100) == \
         "reference_window_exceeded_at_runtime"
     assert runtime_reference_window_reason(100, max_bars=100) is None
+
+
+def _trading_hours(count, start="2026-10-12T00:00:00Z"):
+    """``count`` consecutive 1h trading bars that skip every Saturday and Sunday."""
+    stamps = []
+    t = pd.Timestamp(start)
+    while len(stamps) < count:
+        if t.dayofweek < 5:
+            stamps.append(t)
+        t += pd.Timedelta(hours=1)
+    return pd.DatetimeIndex(stamps)
+
+
+def test_a_400_bar_main_window_over_two_weekends_fits_a_400_bar_reference():
+    main = _trading_hours(400)
+    wall_clock_slots = actual_reference_bars(
+        main[0] + pd.Timedelta(hours=1), main[-1] + pd.Timedelta(hours=1), "1h")
+    assert wall_clock_slots > 400
+    window = window_reference_bars(
+        main, decision_first=main[0] + pd.Timedelta(hours=1),
+        decision_last=main[-1] + pd.Timedelta(hours=1), reference_timeframe="1h")
+    assert window == nominal_reference_bars(400, "1h", "1h") == 400
+    assert runtime_reference_window_reason(window, max_bars=400) is None
+
+
+def test_a_reference_window_with_more_bars_than_allowed_is_rejected_at_runtime():
+    main = _trading_hours(400)
+    window = window_reference_bars(
+        main, decision_first=main[0] + pd.Timedelta(hours=1),
+        decision_last=main[-1] + pd.Timedelta(hours=1), reference_timeframe="1h")
+    assert runtime_reference_window_reason(window, max_bars=399) == \
+        "reference_window_exceeded_at_runtime"
+
+
+def test_config_time_and_runtime_use_the_same_fit_comparison():
+    assert reference_window_fits(400, 400) and not reference_window_fits(401, 400)
 
 
 @pytest.mark.parametrize(("reference_tf", "expected"), [

@@ -281,10 +281,23 @@ def _weekend_conn(tmp_path):
     return conn
 
 
-def test_a_span_stretched_by_a_weekend_exceeds_the_window_and_skips_at_runtime(tmp_path):
+def test_a_weekend_inside_the_main_window_does_not_exceed_a_reference_with_enough_bars(tmp_path):
     conn = _weekend_conn(tmp_path)
     meta = _meta(max_bars=60)
-    resolved = _resolved(meta, _item(max_age_hours=200, max_bars=60))
+    now = datetime(2026, 7, 21, 12, 1, tzinfo=timezone.utc)
+    sandbox, activity = _Sandbox(), _Activity()
+    _run(conn, SignalProducer(), [meta],
+         _resolved(meta, _item(max_age_hours=200, max_bars=60)), now, sandbox,
+         activity=activity)
+    assert sandbox.calls
+    assert activity.events("reference_unavailable") == []
+    conn.close()
+
+
+def test_a_reference_with_fewer_bars_than_the_window_covers_skips_at_runtime(tmp_path):
+    conn = _weekend_conn(tmp_path)
+    meta = _meta(max_bars=60)
+    resolved = _resolved(meta, _item(max_age_hours=200, max_bars=59))
     sandbox, activity = _Sandbox(), _Activity()
     now = datetime(2026, 7, 21, 12, 1, tzinfo=timezone.utc)
     producer = SignalProducer()
@@ -295,11 +308,26 @@ def test_a_span_stretched_by_a_weekend_exceeds_the_window_and_skips_at_runtime(t
     assert activity.events("reference_stale") == []
     assert activity.events("plugin_eval_failed") == []
     assert not _evaluated(producer, datetime(2026, 7, 21, 11, tzinfo=timezone.utc))
-    # the same data with a window that covers the stretched span evaluates
-    roomy = _resolved(meta, _item(max_age_hours=200, max_bars=400))
-    sandbox = _Sandbox()
-    _run(conn, SignalProducer(), [meta], roomy, now, sandbox)
-    assert sandbox.calls
+    conn.close()
+
+
+def test_the_window_skip_is_written_once_per_strategy_reason_and_day(tmp_path):
+    conn = _weekend_conn(tmp_path)
+    meta = _meta(max_bars=60)
+    resolved = _resolved(meta, _item(max_age_hours=200, max_bars=59))
+    activity, producer = _Activity(), SignalProducer()
+    for minute in (1, 2, 3):
+        _run(conn, producer, [meta], resolved,
+             datetime(2026, 7, 21, 12, minute, tzinfo=timezone.utc), _Sandbox(),
+             activity=activity)
+    assert len(activity.events("reference_unavailable")) == 1
+    from agentic_fx.plugin.signal_producer import _ReferenceUnavailable
+    other_day = datetime(2026, 7, 22, 3, tzinfo=timezone.utc)
+    producer._report_reference_unavailable(
+        meta, "USDJPY", other_day, _ReferenceUnavailable(RUNTIME_WINDOW_REASON), activity)
+    producer._report_reference_unavailable(
+        meta, "USDJPY", other_day, _ReferenceUnavailable("missing"), activity)
+    assert len(activity.events("reference_unavailable")) == 3
     conn.close()
 
 
