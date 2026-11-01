@@ -261,3 +261,27 @@ def test_added_at_is_kept_per_id_for_rag_id_articles(tmp_path):
     meta = rag._news.get(ids=["web:w"], include=["metadatas"])["metadatas"][0]
     assert meta["added_at"] == t0.isoformat() and meta["body"] == "changed"
     assert rag.cleanup_news(t0 + timedelta(hours=49), hours=48) == 1
+
+
+def test_add_news_collapses_duplicate_ids_in_batch_last_wins(tmp_path):
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    first = {"url": "https://ex.com/dup", "title": "old", "body": "b1",
+             "source_name": "s"}
+    other = {"url": "https://ex.com/other", "title": "o", "body": "b2",
+             "source_name": "s"}
+    last = {"url": "https://ex.com/dup", "title": "new", "body": "b3",
+            "source_name": "s"}
+    assert rag.add_news([first, other, last], NOW) == 2
+    assert rag.count_news() == 2
+    hits = rag.search_news("new b3", n=2)
+    assert [h["title"] for h in hits if h["url"] == "https://ex.com/dup"] == ["new"]
+
+
+def test_add_news_collapses_duplicate_rag_ids_in_batch(tmp_path):
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    a = {"url": "https://ex.com/x1", "rag_id": "k", "title": "a", "body": "b",
+         "source_name": "s"}
+    b = {"url": "https://ex.com/x2", "rag_id": "k", "title": "b", "body": "b",
+         "source_name": "s"}
+    assert rag.add_news([a, b], NOW) == 1
+    assert rag.count_news() == 1

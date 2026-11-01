@@ -103,7 +103,8 @@ class Rag:
         return self._news.count()
 
     def add_news(self, articles: list[dict], now: datetime) -> int:
-        """記事を upsert する (ID は任意の `rag_id`、無ければ url。重複投入は上書き)。追加件数を返す。
+        """記事を upsert する (ID は任意の `rag_id`、無ければ url。重複投入は上書き)。保存件数を返す。
+        同一バッチ内の同じ ID は後勝ちで 1 件に畳む。
 
         metadata の url と検索結果の url は常に表示用の `url` で、`rag_id` は
         内部 ID にだけ使う。
@@ -139,7 +140,11 @@ class Rag:
             if not articles:
                 return 0
             now_utc = _require_utc(now, "add_news now")
-            ids = [a.get("rag_id", a["url"]) for a in articles]
+            # 同一 ID がバッチ内に複数あれば後勝ちで 1 件に畳む (chromadb の upsert は
+            # 同一呼び出し内の重複 ID を拒否するため)
+            by_id = {a.get("rag_id", a["url"]): a for a in articles}
+            ids = list(by_id)
+            articles = list(by_id.values())
             # 既存の added_at をまとめて 1 回で引く (N 件を N 回 get しない)
             existing = self._news.get(ids=ids, include=["metadatas"])
             existing_added_at = {i: m["added_at"] for i, m in
