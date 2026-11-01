@@ -1183,3 +1183,55 @@ def test_sync_handles_more_targets_than_the_variable_limit(tmp_path):
 def test_module_has_no_alias_of_imported_names():
     assert not hasattr(os_, "_Conflict") and not hasattr(os_, "_short_tx")
     assert not hasattr(os_, "_ceil")
+
+
+def _no_set_rows(conn, shadow_id):
+    return conn.execute("SELECT COUNT(*) FROM ohlcv_slice_sets WHERE shadow_id=?",
+                        (shadow_id,)).fetchone()[0]
+
+
+def test_mark_shadow_unrecoverable_refuses_a_pair_mismatch(tmp_path):
+    conn = _conn(tmp_path)
+    shadow_id = _shadow(conn)
+    before = ss.get(conn, shadow_id)
+    cas = ShadowCas(shadow_id, "pending_entry", before["updated_at"],
+                    ss.ShadowOutcome.data_insufficient())
+    with pytest.raises(ValueError, match="pair"):
+        os_.mark_shadow_unrecoverable(
+            conn, shadow=cas, pair="EURUSD", range_start=NOW,
+            range_end=NOW + timedelta(hours=1), now=NOW)
+    assert not conn.in_transaction
+    assert _no_set_rows(conn, shadow_id) == 0
+    assert ss.get(conn, shadow_id) == before
+
+
+def test_mark_shadow_unrecoverable_refuses_a_terminal_shadow(tmp_path):
+    conn = _conn(tmp_path)
+    shadow_id = _shadow(conn)
+    cur = ss.get(conn, shadow_id)
+    conn.execute("UPDATE signal_shadow SET state='resolved', "
+                 "result_code='data_insufficient' WHERE id=?", (shadow_id,))
+    conn.commit()
+    before = ss.get(conn, shadow_id)
+    cas = ShadowCas(shadow_id, "pending_entry", cur["updated_at"],
+                    ss.ShadowOutcome.data_insufficient())
+    out = os_.mark_shadow_unrecoverable(
+        conn, shadow=cas, pair="USDJPY", range_start=NOW,
+        range_end=NOW + timedelta(hours=1), now=NOW)
+    assert out.status == "conflict"
+    assert not conn.in_transaction
+    assert _no_set_rows(conn, shadow_id) == 0
+    assert ss.get(conn, shadow_id) == before
+
+
+def test_short_tx_rolls_back_when_begin_raises_after_starting(tmp_path):
+    from agentic_fx.store.short_tx import short_tx
+    conn = _conn(tmp_path)
+
+    def begin(c):
+        c.execute("BEGIN IMMEDIATE")
+        raise RuntimeError("admission failed")
+
+    with pytest.raises(RuntimeError, match="admission"):
+        short_tx(conn, begin, lambda: {})
+    assert not conn.in_transaction

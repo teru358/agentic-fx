@@ -53,7 +53,13 @@ def short_tx(conn: sqlite3.Connection, begin: Begin, body,
              checkpoint: Checkpoint | None = None) -> TxResult:
     if conn.in_transaction:
         raise RuntimeError("connection already has an open transaction")
-    if not begin(conn):
+    try:
+        started_tx = begin(conn)
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    if not started_tx:
         if conn.in_transaction:
             conn.rollback()
             raise RuntimeError("begin returned False after opening a transaction")

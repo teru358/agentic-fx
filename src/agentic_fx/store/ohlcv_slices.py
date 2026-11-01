@@ -666,6 +666,7 @@ def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
     expected = _shadow_range_minutes(range_start, range_end)
 
     def body():
+        _require_live_shadow(conn, shadow.shadow_id, pair)
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE shadow_id=?",
                         (shadow.shadow_id,)).fetchone() is not None:
             raise Conflict
