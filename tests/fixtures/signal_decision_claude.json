@@ -1,0 +1,10 @@
+{
+  "accept": {
+    "decision": "accept",
+    "reject_code": null
+  },
+  "reject": {
+    "decision": "reject",
+    "reject_code": "opposite_position"
+  }
+}
