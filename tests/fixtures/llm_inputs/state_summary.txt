@@ -9,5 +9,5 @@
   - #3 USDJPY short pnl=-2,000 (sl)
   - #4 EURUSD long pnl=-1,800 (sl)
   - #5 GBPJPY short pnl=+3,100 (llm_close)
-- 24h 以内の経済指標:
-  - 2026-07-22T19:30:00+00:00 USD CPI ★★★
+- 経済指標 (pair view):
+  - USDJPY currencies=JPY/USD in_window=false freshness=fresh active=なし next=2026-07-22T19:30:00+00:00 USD CPI ★★★

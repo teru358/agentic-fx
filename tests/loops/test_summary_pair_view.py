@@ -82,3 +82,13 @@ def test_a_failing_window_view_does_not_stop_the_summary(tmp_path, caplog):
     assert "USDJPY freshness=unknown" in summary
     assert "EURUSD currencies=EUR/USD" in summary
     assert "window_view failed for USDJPY" in caplog.text
+
+
+def test_summary_does_not_read_mission_status():
+    import inspect
+
+    from agentic_fx.loops import summary
+
+    source = inspect.getsource(summary.build_state_summary)
+    assert "missions" not in source
+    assert "mission_status" not in source

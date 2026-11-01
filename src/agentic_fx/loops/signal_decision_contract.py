@@ -15,37 +15,27 @@ from agentic_fx.core.contracts import Direction, OrderStatus
 REJECT_CODES = ("news_shock", "opposite_position")
 SIGNAL_DECISION_TOOLS = ("search_news", "get_positions")
 
+# Two typed, closed branches.  Each branch pins ``decision`` with a single-value
+# enum so the pair is correlated without if/then (not accepted by every backend).
 DECISION_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "decision": {"type": "string", "enum": ["accept", "reject"]},
-        "reject_code": {
-            "type": ["string", "null"],
-            "enum": [None, *REJECT_CODES],
-        },
-    },
-    "required": ["decision", "reject_code"],
-    "allOf": [
+    "anyOf": [
         {
-            "if": {
-                "properties": {"decision": {"type": "string", "const": "accept"}},
-                "required": ["decision"],
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "decision": {"type": "string", "enum": ["accept"]},
+                "reject_code": {"type": "null"},
             },
-            "then": {
-                "properties": {"reject_code": {"type": "null", "const": None}},
-            },
+            "required": ["decision", "reject_code"],
         },
         {
-            "if": {
-                "properties": {"decision": {"type": "string", "const": "reject"}},
-                "required": ["decision"],
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "decision": {"type": "string", "enum": ["reject"]},
+                "reject_code": {"type": "string", "enum": list(REJECT_CODES)},
             },
-            "then": {
-                "properties": {
-                    "reject_code": {"type": "string", "enum": list(REJECT_CODES)},
-                },
-            },
+            "required": ["decision", "reject_code"],
         },
     ],
 }

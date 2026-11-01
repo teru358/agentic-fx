@@ -31,9 +31,28 @@ def test_decision_schema_only_allows_the_two_canonical_shapes():
         {"decision": "hold", "reject_code": None},
         {"action": "open", "pair": "USDJPY", "reasoning": "ordinary intent"},
         {"decision": "accept", "reject_code": None, "extra": True},
+        [],
+        None,
+        "accept",
+        0,
+        True,
     ):
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate(payload, DECISION_SCHEMA)
+
+
+def test_decision_schema_is_a_single_typed_two_branch_anyof_without_if_then():
+    assert set(DECISION_SCHEMA) == {"anyOf"}
+    branches = DECISION_SCHEMA["anyOf"]
+    assert len(branches) == 2
+    for branch, value in zip(branches, ("accept", "reject")):
+        assert branch["type"] == "object"
+        assert branch["additionalProperties"] is False
+        assert branch["required"] == ["decision", "reject_code"]
+        assert branch["properties"]["decision"]["enum"] == [value]
+    dumped = json.dumps(DECISION_SCHEMA)
+    assert '"if"' not in dumped
+    assert '"allOf"' not in dumped
 
 
 @pytest.mark.parametrize(
@@ -72,6 +91,9 @@ def test_parser_rejects_every_noncanonical_shape_even_when_schema_is_bypassed(pa
 def test_parser_does_not_treat_non_object_or_bad_json_as_a_decision():
     assert parse_decision("not json") == Invalid("invalid_json")
     assert parse_decision("[]") == Invalid("invalid_shape")
+    assert parse_decision("null") == Invalid("invalid_shape")
+    assert parse_decision("3") == Invalid("invalid_shape")
+    assert parse_decision('"accept"') == Invalid("invalid_shape")
     assert parse_decision([{"decision": "accept"}]) == Invalid("invalid_shape")
 
 
