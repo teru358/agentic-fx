@@ -121,6 +121,58 @@ def test_the_second_run_starts_no_sandbox_for_the_deployed_indicator(tmp_path, o
     assert len(cache_files(tmp_path)) == 3
 
 
+@pytest.fixture
+def mission_loop(tmp_path, monkeypatch):
+    """実 sandbox の fixture 段を通す `ImproveLoop` (pytest 段だけを素通しにする)。"""
+    from agentic_fx.plugin.gate_pytest import GateResult
+    from tests.fixtures.improve_loop_min import build_loop
+
+    monkeypatch.setattr(
+        "agentic_fx.loops.improve_loop.run_gate_pytest",
+        lambda plugin_dir, *, settings: GateResult(
+            passed=True, returncode=0, stdout_tail="3 passed in 0.1s", duration_sec=0.1))
+    conn = db_store.connect(tmp_path / "t.db")
+    db_store.init_db(conn)
+    (tmp_path / "source").mkdir()
+    yield SimpleNamespace(loop=build_loop(conn, tmp_path, settings=SETTINGS), conn=conn)
+    conn.close()
+
+
+def _mission_gate(env, tmp_path, name, body, deployed, mission_id):
+    candidate = tmp_path / "staging" / str(mission_id) / name
+    write_plugin(candidate, body)
+    (candidate / "test_plugin.py").write_text(
+        "def test_a():\n    pass\n\ndef test_b():\n    pass\n\ndef test_c():\n    pass\n")
+    inventory = InventoryBuildResult(
+        inventory=ApprovedInventory(root=tmp_path, metas=tuple(deployed)),
+        phase1_metas=(), resolved={}, rejected_strategies=())
+    verdict = env.loop._run_plugin_gate(
+        candidate, name=name, source_snapshot_dir=tmp_path / "source",
+        inventory=inventory, conn=env.conn)
+    env.loop._write_indicator_cache_activity(SimpleNamespace(mission_id=mission_id), verdict)
+    return verdict
+
+
+@needs_sandbox
+def test_the_second_mission_starts_a_sandbox_only_for_its_candidate(
+        tmp_path, opened, mission_loop):
+    deployed = write_plugin(tmp_path / "plugins" / "deployed_ratio", WOBBLE)
+    first = _mission_gate(mission_loop, tmp_path, "cand_a", RATIO, [deployed], 1)
+    assert first.passed, first.reason
+    assert sorted(opened) == ["cand_a", "deployed_ratio"]
+    opened.clear()
+    second = _mission_gate(mission_loop, tmp_path, "cand_b",
+                           AFFINE.replace("2.0", "3.0"), [deployed], 2)
+    assert second.passed, second.reason
+    assert opened == ["cand_b"]
+    assert opened.count("deployed_ratio") == 0
+    lines = (tmp_path / "activity.log").read_text().splitlines()
+    cache_lines = [line for line in lines if "indicator_cache" in line]
+    assert len(cache_lines) == 2
+    assert "indicator_cache\tmission=1 built=2 " in cache_lines[0]
+    assert "indicator_cache\tmission=2 built=1 " in cache_lines[1]
+
+
 # --- findings the real worker's outputs produce -------------------------------------
 
 @needs_sandbox
@@ -396,7 +448,7 @@ def test_a_submission_of_a_twin_is_refused_with_no_request_and_the_cache_holds_b
 
 CORPUS = os.environ.get("AFX_INDICATOR_CORPUS")
 needs_corpus = pytest.mark.skipif(
-    not CORPUS, reason="AFX_INDICATOR_CORPUS (a copy of the deployed indicators) is not set")
+    not CORPUS, reason="corpus 未設定 (AFX_INDICATOR_CORPUS に配備済み indicator の複製の置き場を渡す)")
 # The six symbols a production settings file lists: a fixed set, not read from any file.
 SYMBOLS = ["XAUUSD", "USDJPY", "EURUSD", "US500", "USOIL", "JP225"]
 
@@ -405,6 +457,22 @@ def corpus_metas() -> list[loader.PluginMeta]:
     metas = [m for m in loader.discover(Path(CORPUS)) if m.kind == "indicator"]
     assert len(metas) >= 50
     return metas
+
+
+def test_the_reduced_corpus_hits_exactly_the_four_symbol_named_indicators(tmp_path):
+    from tests.fixtures import indicator_corpus_small as small
+
+    settings = SimpleNamespace(pairs=SYMBOLS[:3], datafeed=SimpleNamespace(
+        watch_symbols=SYMBOLS[3:]))
+    hit, passed = [], []
+    for directory in small.materialize(tmp_path):
+        meta, reason = loader.discover_one_with_reason(directory, directory.name)
+        assert meta is not None, reason
+        verdict = pipeline.check_static(meta, directory, settings=settings,
+                                        deployed=None, lane="submit")
+        (passed if verdict.ok else hit).append(meta.name)
+    assert sorted(hit) == sorted(small.SYMBOL_NAMED)
+    assert sorted(passed) == sorted(small.CLEAN)
 
 
 @needs_corpus

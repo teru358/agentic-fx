@@ -239,3 +239,51 @@ def test_tabs_in_a_claim_and_in_a_diff_line_become_four_spaces():
     text = compose(data).page.decode()
     assert "<pre>x    y</pre>" in text and "+a    b\n" in text
     assert "\t" not in text
+
+
+# ---------------------------------------------------------------- indicator gate の警告節の予約
+
+def _largest_gate_fields():
+    words = sorted(render.GATE_WARNING_TEXT, key=lambda w: -len(render.GATE_WARNING_TEXT[w].encode()))
+    words = words[:render.GATE_MAX_WARNINGS]
+    if "scale_dependent" not in words:
+        words[-1] = "scale_dependent"
+    column = "c" * 32
+    return {"gate_warnings": words,
+            "scale_columns": [f"{'c' * 31}{i}" for i in range(render.GATE_MAX_SCALE_COLUMNS)],
+            "similar_to": [{"name": "n" * 64, "column": column, "kind": "monotone"}
+                           for _ in range(render.GATE_MAX_SIMILAR)]}
+
+
+def _full_budget_change_data():
+    # diff も、diff 以外の節 (申告の長文と params の行) も、それぞれの予算いっぱいまで使うページ
+    rows, need = _exact_fit()
+    change, claims = _claims_and_params(rows, 1 + need, 2000)
+    lines = ["+" + "x" * 78] * 2000
+    return change_data(change, claims=claims, files=[entry("plugin.py", lines)])
+
+
+def test_the_largest_gate_section_never_clips_a_page_whose_other_sections_fill_their_budget():
+    data = _full_budget_change_data()
+    detail = dict(DETAIL)
+    plain = render.compose_approval_page(detail, data["change"], data).page
+    assert len(plain) < render.PAGE_LIMIT_BYTES and b"Output clipped" not in plain
+    fields = _largest_gate_fields()
+    detail.update(fields)
+    page = render.render_approval(detail, data)
+    assert b"Output clipped" not in page and len(page) < render.PAGE_LIMIT_BYTES
+    text = page.decode()
+    for word in fields["gate_warnings"]:
+        assert render.GATE_WARNING_TEXT[word].split(" (")[0] in text
+    assert text.count("警告: 配備済み `" + "n" * 64 + "` の単調変換") == render.GATE_MAX_SIMILAR
+    assert "<h3>plugin.py</h3>" in text
+
+
+def test_the_gate_section_is_counted_in_the_budget_of_the_other_sections():
+    data = _full_budget_change_data()
+    detail = dict(DETAIL)
+    detail.update(_largest_gate_fields())
+    built = render.compose_approval_page(detail, data["change"], data,
+                                         extra_html="<section>" + "g" * 3000 + "</section>")
+    assert b"Output clipped" not in built.page
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES

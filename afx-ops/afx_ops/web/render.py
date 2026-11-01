@@ -629,8 +629,8 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
                           extra_html: str = "") -> ApprovalPage:
     """5 節 (概要・params の差分・成績・申告・変更 diff) を組み、ページ全体を 64 KiB 未満に収める。
     diff は 48 KiB 以下、それ以外 (骨格を含む) は 15 KiB 以下。超えるときは params の差分 →
-    申告 → 親の記録 の順で省略する。``extra_html`` は末尾に足す節で、予算の配分には数えないが、
-    ページ全体の上限には含める。"""
+    申告 → 親の記録 の順で省略する。``extra_html`` は末尾に足す節 (配備中の版の比較・indicator gate
+    の警告) で、他の節と同じ 15 KiB の中に数え、先に確保してから他の節を縮める。"""
     claims = change_data.get("claims") if change_data and type(change_data.get("claims")) is dict else {}
     summary = claims.get("summary", change.get("summary"))
     rationale = claims.get("selection_rationale")
@@ -653,14 +653,15 @@ def compose_approval_page(data: Mapping[str, object], change: Mapping[str, objec
     candidates += [(k, CLAIM_CHARS, True) for k in range(params_total - 1, -1, -1)]
     candidates += [(0, limit, True) for limit in (1000, 500, 250, 100, 0)]
     candidates += [(0, 0, False)]
+    extra = _bytes(extra_html)
     others = ""
     for show, limit, parent in candidates:
         others = build(show, limit, parent)
-        if skeleton + _bytes(others) + frame <= OTHER_BUDGET_BYTES:
+        if skeleton + _bytes(others) + frame + extra <= OTHER_BUDGET_BYTES:
             break
     body = others + (diff_html if diff_body else "")
-    other_bytes = len(_document("Approval", body)) - diff_bytes
     page = _document("Approval", body + extra_html)
+    other_bytes = len(page) - diff_bytes
     if len(page) >= PAGE_LIMIT_BYTES:
         page = _page("Approval", "<p>Output clipped</p>")
     return ApprovalPage(page, diff_bytes, other_bytes, plans)
