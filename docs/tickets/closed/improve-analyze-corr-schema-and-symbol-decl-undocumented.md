@@ -1,16 +1,16 @@
 ---
 id: improve-analyze-corr-schema-and-symbol-decl-undocumented
 title: analyze_corr の形と symbol: 宣言が agent に伝わらない
-status: 設計待ち
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-11-01
-closed: null
+closed: 2026-11-01
 related: []
 ---
 # [improve-analyze-corr-schema-and-symbol-decl-undocumented] analyze_corr の形と symbol: 宣言が agent に伝わらない
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -22,6 +22,9 @@ related: []
 
 ## 修正内容
 
+- 2026-11-01: analyze_corr の tool schema を analysis._REQUEST_SCHEMA / TIMEFRAMES / WINDOWS から生成 (anyOf 3 形、additionalProperties false、同期 pin)、tool 層の jsonschema 検証で形違いを拒否。improve_mission.md 7 項に symbol: 宣言 2 例 (ema / ohlcv) と analyze_corr 3 形を追記、loader を通る pin。tests/tools・loops・loader・wiring 緑
+
 ## 経緯
 
 - 2026-11-01: 起票。
+- 2026-11-01: 是正内容 — analyze_corr の tool schema を analysis._REQUEST_SCHEMA / TIMEFRAMES / WINDOWS から生成 (anyOf 3 形、additionalProperties false、同期 pin)、tool 層の jsonschema 検証で形違いを拒否。improve_mission.md 7 項に symbol: 宣言 2 例 (ema / ohlcv) と analyze_corr 3 形を追記、loader を通る pin。tests/tools・loops・loader・wiring 緑
