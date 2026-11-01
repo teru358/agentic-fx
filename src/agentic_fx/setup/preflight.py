@@ -31,6 +31,8 @@ FATAL_CODES: dict[str, str] = {
     "plugin_retention_short": "承認済み plugin が要求する履歴の保持日数を満たせません",
     "cache_retention_inconsistent": "datafeed.cache_retention_days が判断足の要求日数を下回っています",
     "mission_ceiling_violation": "判断足と mission の上限が両立しません",
+    "signal_capacity_override_below_producer":
+        "econ.signal_capacity_daily_max が承認済み strategy から導く日次上限を下回っています",
     "cli_not_elf": "CLI backend の実行ファイルが ELF ではありません",
     "opencode_unverified": "opencode backend は improve.llama_swap_verified が必要です",
     "secret_env_present": "サービスの初期 env に秘密らしい変数名があります (.env に置いてください)",

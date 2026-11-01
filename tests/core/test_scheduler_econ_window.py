@@ -1,0 +1,546 @@
+"""limit 約定の指標回避帯による抑止 (足区間基準) と、親 report の hook。
+
+帯は処理する 1m 足の閉区間 `[b, b+1m]` と inclusive な帯の交差で決め、`now` は使わない。
+抑止は約定だけで、注文は cancel せず期限も延ばさない。SL / TP / cancel は常に通る。
+"""
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from agentic_fx.core import band_notice
+from agentic_fx.core.contracts import Bar
+from agentic_fx.core.econ_window import WindowSettings
+from agentic_fx.core.scheduler import Scheduler
+from agentic_fx.core.writer_admission import WriterAdmission
+from agentic_fx.store import alert_state, econ_events, orders
+
+from tests.core.test_scheduler import SETTINGS, WED, Env
+
+EVENT = "limit_fill_suppressed_econ_window"
+FILL_BAR = dict(open=148.30, high=148.35, low=148.15, close=148.25, volume=100)
+
+
+def _env(tmp_path, *, before=30, after=15, importance_min=3, writer=None):
+    env = Env(tmp_path)
+    env.sched.econ_window = WindowSettings(
+        importance_min=importance_min, before_min=before, after_min=after)
+    env.sched.pair_currencies = {"USDJPY": ("USD", "JPY")}
+    if writer is not None:
+        env.sched.writer_admission = writer
+    return env
+
+
+def _event(env, ts, *, country="USD", name="CPI", importance=3):
+    return econ_events.upsert(env.conn, ts=ts, country=country, name=name,
+                              importance=importance).id
+
+
+def _bar(ts, **kw):
+    values = {**FILL_BAR, **kw}
+    return Bar("USDJPY", "1m", ts, values["open"], values["high"], values["low"],
+               values["close"], values["volume"])
+
+
+def _log(env) -> str:
+    path = env.tmp_path / "a.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def _tick(env, bar_ts, *, delay=1):
+    env.bars["USDJPY"] = _bar(bar_ts)
+    env.sched.tick(bar_ts + timedelta(minutes=delay))
+
+
+def _status(env, oid):
+    return orders.get(env.conn, oid)["status"]
+
+
+# --- 足区間と帯の交差 ------------------------------------------------------
+
+def test_a_bar_inside_the_band_does_not_fill_and_the_order_stays_untouched(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    expires = orders.get(env.conn, oid)["expires_at"]
+    _event(env, WED + timedelta(minutes=20))          # 帯 [WED-10m, WED+35m]
+    _tick(env, WED)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "pending_fill"
+    assert row["expires_at"] == expires               # 期限は延ばさない
+    assert _log(env).count(EVENT) == 1
+
+
+def test_a_band_without_a_price_touch_suppresses_nothing_and_notifies_nothing(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(price=148.20)
+    _event(env, WED + timedelta(minutes=20))
+    env.bars["USDJPY"] = _bar(WED, open=148.60, high=148.70, low=148.50, close=148.55)
+    env.sched.tick(WED + timedelta(minutes=1))          # limit 148.20 に届かない足
+    assert _status(env, oid) == "pending_fill"
+    assert EVENT not in _log(env)
+    assert _record(env, oid) is None
+
+
+def test_without_a_band_the_same_bar_fills(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _tick(env, WED)
+    assert _status(env, oid) == "open"
+    assert EVENT not in _log(env)
+
+
+@pytest.mark.parametrize("event_offset_min, suppressed", [
+    (-15, True),    # 帯の後端 (ts+15m) が足の開始 b にちょうど触れる
+    (-16, False),   # 後端が b の 1 分前
+    (31, True),     # 帯の前端 (ts-30m) が足の終端 b+1m にちょうど触れる
+    (32, False),    # 前端が b+1m の 1 分後
+])
+def test_the_band_and_the_bar_interval_are_both_closed(tmp_path, event_offset_min,
+                                                       suppressed):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=event_offset_min))
+    _tick(env, WED)
+    assert (_status(env, oid) == "pending_fill") is suppressed
+
+
+def test_a_bar_processed_late_still_overlaps_a_band_that_ended_before_now(tmp_path):
+    """帯の後端 (ts+15m = WED+1m) は足 [WED, WED+1m] に触れる。処理が 4 分遅れて
+    now が帯の外に出ていても、足で判定するので抑止する。"""
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED - timedelta(minutes=14))
+    _tick(env, WED, delay=4)
+    assert _status(env, oid) == "pending_fill"
+    assert _log(env).count(EVENT) == 1
+
+
+def test_events_of_other_currencies_or_below_importance_do_not_suppress(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=10), country="EUR", name="ECB")
+    _event(env, WED + timedelta(minutes=10), country="USD", name="Low",
+           importance=2)
+    _tick(env, WED)
+    assert _status(env, oid) == "open"
+
+
+def test_a_superseded_event_makes_no_band(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    old = _event(env, WED + timedelta(minutes=10))
+    new = _event(env, WED + timedelta(hours=3), name="CPI")
+    env.conn.execute("UPDATE econ_events SET superseded_by=? WHERE id=?", (new, old))
+    env.conn.commit()
+    _tick(env, WED)
+    assert _status(env, oid) == "open"
+
+
+def test_all_country_events_suppress_every_pair(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=10), country="All", name="Holiday")
+    _tick(env, WED)
+    assert _status(env, oid) == "pending_fill"
+
+
+def test_without_window_settings_nothing_is_suppressed(tmp_path):
+    env = Env(tmp_path)                                 # econ_window / currencies なし
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=10))
+    _tick(env, WED)
+    assert _status(env, oid) == "open"
+
+
+def test_a_pair_without_known_currencies_is_not_suppressed(tmp_path):
+    env = _env(tmp_path)
+    env.sched.pair_currencies = {"EURUSD": ("EUR", "USD")}
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=10))
+    _tick(env, WED)
+    assert _status(env, oid) == "open"
+
+
+# --- 抑止してよいのは約定だけ --------------------------------------------------
+
+def test_a_suppressed_bar_is_not_reprocessed_and_the_next_bar_can_fill(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=20))
+    _tick(env, WED)
+    # 同じ足を次 tick で再入力しても、判定も activity も繰り返さない
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert _status(env, oid) == "pending_fill"
+    assert _log(env).count(EVENT) == 1
+    # 帯の外に出た新しい足だけが約定できる
+    _tick(env, WED + timedelta(minutes=40))
+    assert _status(env, oid) == "open"
+
+
+def test_sl_and_tp_of_open_positions_run_during_the_band(tmp_path):
+    env = _env(tmp_path)
+    sl = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="market", horizon="swing", status="open",
+                       now=WED, quantity=0.1, avg_fill_price=148.20,
+                       stop_loss=147.80, take_profit=149.00)
+    tp = orders.insert(env.conn, pair="USDJPY", direction="short",
+                       entry_type="market", horizon="swing", status="open",
+                       now=WED, quantity=0.1, avg_fill_price=148.20,
+                       stop_loss=150.00, take_profit=148.00)
+    _event(env, WED + timedelta(minutes=10))
+    env.bars["USDJPY"] = _bar(WED, open=148.20, high=148.30, low=147.70,
+                              close=147.75)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert orders.get(env.conn, sl)["close_reason"] == "sl"
+    env.bars["USDJPY"] = _bar(WED + timedelta(minutes=1), open=148.20, high=148.30,
+                              low=147.90, close=147.95)
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert orders.get(env.conn, tp)["close_reason"] == "tp"
+
+
+def test_cancel_of_a_pending_order_is_allowed_during_the_band(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=10))
+    _tick(env, WED)
+    assert _status(env, oid) == "pending_fill"
+    env.executor.cancel_order(orders.get(env.conn, oid), reason="manual")
+    assert _status(env, oid) == "cancelled"
+
+
+def test_an_order_expires_on_schedule_during_the_band(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=1)
+    _event(env, WED + timedelta(minutes=10))
+    _tick(env, WED)
+    assert _status(env, oid) == "pending_fill"
+    env.bars["USDJPY"] = _bar(WED + timedelta(hours=1, minutes=1))
+    env.sched.tick(WED + timedelta(hours=1, minutes=2))
+    assert _status(env, oid) in ("expired", "cancelled")
+
+
+# --- 通知は order × 連結成分で 1 回 ----------------------------------------------
+
+def _record(env, oid):
+    raw = alert_state.get(env.conn, alert_state.limit_suppress_key(oid))
+    return json.loads(raw) if raw else None
+
+
+def test_the_notice_is_written_once_per_order_and_survives_a_restart(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=30))
+    for minute in (0, 1, 2):
+        _tick(env, WED + timedelta(minutes=minute))
+    assert _log(env).count(EVENT) == 1
+    # 同じ DB を引き継ぐ新しい scheduler (再起動) でも、同じ成分では書かない
+    fresh = Scheduler(
+        conn=env.conn, executor=env.executor, settings=SETTINGS,
+        state_store=env.state, activity=env.sched.activity,
+        bars_fn=lambda p: env.bars.get(p), on_trade_mission=env._trade,
+        on_news_cycle=env._news, on_econ_cycle=env._econ,
+        econ_window=env.sched.econ_window, pair_currencies=env.sched.pair_currencies)
+    env.bars["USDJPY"] = _bar(WED + timedelta(minutes=3))
+    fresh.tick(WED + timedelta(minutes=4))
+    assert _status(env, oid) == "pending_fill"
+    assert _log(env).count(EVENT) == 1
+
+
+def test_the_notice_names_the_order_and_the_component_id(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    eid = _event(env, WED + timedelta(minutes=20))
+    _tick(env, WED)
+    line = [l for l in _log(env).splitlines() if EVENT in l][0]
+    assert f"#{oid}" in line and f"成分 {eid}" in line
+    assert _record(env, oid) == [{"id": eid, "events": [eid]}]
+
+
+def _three_bands(env, base):
+    """A と B、B と C は帯が重なり、A と C は重ならない (before 30 / after 15)。"""
+    a = _event(env, base, name="A")
+    b = _event(env, base + timedelta(minutes=40), name="B")
+    c = _event(env, base + timedelta(minutes=80), name="C")
+    return a, b, c
+
+
+def test_overlapping_bands_are_one_component_whose_id_is_the_smallest_event_id(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=8)
+    a, b, c = _three_bands(env, WED + timedelta(minutes=30))
+    _tick(env, WED)                                      # A の帯の中
+    assert _record(env, oid) == [{"id": a, "events": [a, b, c]}]
+    _tick(env, WED + timedelta(minutes=100))             # C の帯の中 (同じ成分)
+    _tick(env, WED + timedelta(minutes=120))
+    assert _status(env, oid) == "pending_fill"
+    assert _log(env).count(EVENT) == 1
+
+
+def test_a_new_event_joining_the_component_keeps_its_id_and_does_not_renotify(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=8)
+    a = _event(env, WED + timedelta(minutes=30), name="A")
+    _tick(env, WED)
+    assert _record(env, oid) == [{"id": a, "events": [a]}]
+    late = _event(env, WED + timedelta(minutes=60), name="late")   # A と重なる
+    _tick(env, WED + timedelta(minutes=50))
+    assert _log(env).count(EVENT) == 1
+    assert _record(env, oid) == [{"id": a, "events": [a, late]}]
+
+
+def test_the_id_is_fixed_when_the_smallest_event_is_superseded(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=8)
+    a, b, c = _three_bands(env, WED + timedelta(minutes=30))
+    _tick(env, WED)
+    moved = _event(env, WED + timedelta(hours=6), name="A")        # A の新しい時刻
+    env.conn.execute("UPDATE econ_events SET superseded_by=? WHERE id=?", (moved, a))
+    env.conn.commit()
+    _tick(env, WED + timedelta(minutes=50))                        # 残る B の帯の中
+    assert _log(env).count(EVENT) == 1
+    assert [r["id"] for r in _record(env, oid)] == [a]
+
+
+def test_a_separate_band_notifies_again_once(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=8)
+    first = _event(env, WED + timedelta(minutes=30), name="first")
+    second = _event(env, WED + timedelta(hours=4), name="second")
+    _tick(env, WED)
+    _tick(env, WED + timedelta(hours=3, minutes=40))
+    _tick(env, WED + timedelta(hours=3, minutes=41))
+    assert _log(env).count(EVENT) == 2
+    assert [r["id"] for r in _record(env, oid)] == [first, second]
+
+
+def test_two_orders_in_the_same_band_notify_separately(tmp_path):
+    env = _env(tmp_path)
+    one, two = env.place_limit(), env.place_limit()
+    _event(env, WED + timedelta(minutes=20))
+    _tick(env, WED)
+    assert _log(env).count(EVENT) == 2
+    assert _record(env, one) is not None and _record(env, two) is not None
+
+
+def test_the_state_is_pruned_when_the_order_is_no_longer_pending(tmp_path):
+    env = _env(tmp_path)
+    oid = env.place_limit()
+    _event(env, WED + timedelta(minutes=20))
+    _tick(env, WED)
+    assert env.sched.suppressed_limit_count == 1
+    env.executor.cancel_order(orders.get(env.conn, oid), reason="manual")
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert _record(env, oid) is None
+    assert env.sched.suppressed_limit_count == 0
+
+
+def test_a_failure_to_judge_the_band_skips_the_fill_for_that_bar(tmp_path, monkeypatch):
+    """帯を判定できなかった足は約定させない。注文単位の隔離で他の保護は続く。"""
+    env = _env(tmp_path)
+    oid = env.place_limit()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("calendar unreadable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(econ_events, "bar_components", boom)
+        _tick(env, WED)
+    assert _status(env, oid) == "pending_fill"
+    assert "limit_fill_error" in _log(env)
+    _tick(env, WED + timedelta(minutes=1))               # 次の足は判定できて約定
+    assert _status(env, oid) == "open"
+
+
+# --- 書込み要求フラグ ---------------------------------------------------------
+
+def test_the_writer_flag_is_up_during_tick_and_down_afterwards(tmp_path):
+    writer = WriterAdmission()
+    env = _env(tmp_path, writer=writer)
+    seen = []
+    env.sched.bars_fn = lambda p: (seen.append(writer.requested()), None)[1]
+    env.sched.tick(WED)
+    assert seen and all(seen)
+    assert writer.requested() is False
+    assert writer.stats().requests == 1
+
+
+def test_the_writer_flag_is_released_when_tick_raises(tmp_path):
+    writer = WriterAdmission()
+    env = _env(tmp_path, writer=writer)
+
+    def boom(_now):
+        raise RuntimeError("mtm")
+
+    env.sched._mark_to_market = boom
+    with pytest.raises(RuntimeError):
+        env.sched.tick(WED)
+    assert writer.requested() is False
+
+
+# --- 親 report の hook --------------------------------------------------------
+
+MON = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)        # 月曜
+TUE_CLOSE = datetime(2026, 7, 21, 21, 0, tzinfo=timezone.utc)  # 火曜の取引日の終端
+WED_CLOSE = datetime(2026, 7, 22, 21, 0, tzinfo=timezone.utc)
+
+
+def _report_env(tmp_path, calls, *, base=WED):
+    env = Env(tmp_path, base=base)
+    env.sched.register_daily_report(lambda close_at: calls.append(close_at))
+    return env
+
+
+def _run(pending):
+    for hook in pending:
+        hook()
+
+
+def test_the_latest_close_is_the_rollover_after_which_the_market_was_open():
+    close = Scheduler.latest_trading_close
+    assert close(WED) == TUE_CLOSE                   # 水曜昼 → 火曜 21:00 UTC
+    fri_night = datetime(2026, 7, 24, 22, 0, tzinfo=timezone.utc)
+    assert close(fri_night) == datetime(2026, 7, 24, 21, 0, tzinfo=timezone.utc)
+    sat = datetime(2026, 7, 25, 22, 0, tzinfo=timezone.utc)
+    assert close(sat) == datetime(2026, 7, 24, 21, 0, tzinfo=timezone.utc)
+    sun_open = datetime(2026, 7, 26, 22, 0, tzinfo=timezone.utc)
+    assert close(sun_open) == datetime(2026, 7, 24, 21, 0, tzinfo=timezone.utc)
+
+
+def test_the_first_tick_catches_up_once_and_the_callback_runs_after_the_tick(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    pending = env.sched.tick(WED)
+    assert calls == []                               # tick の中では呼ばない
+    _run(pending)
+    assert calls == [TUE_CLOSE]
+    _run(env.sched.tick(WED + timedelta(minutes=1)))
+    _run(env.sched.tick(WED + timedelta(hours=3)))
+    assert calls == [TUE_CLOSE]                      # 同じ取引日では 1 回だけ
+
+
+def test_the_next_trading_day_close_fires_once_more(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    _run(env.sched.tick(WED))
+    _run(env.sched.tick(WED_CLOSE + timedelta(minutes=1)))
+    assert calls == [TUE_CLOSE, WED_CLOSE]
+
+
+def test_a_restart_does_not_repeat_the_same_trading_day(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    _run(env.sched.tick(WED))
+    again = Scheduler(
+        conn=env.conn, executor=env.executor, settings=SETTINGS,
+        state_store=env.state, activity=env.sched.activity,
+        bars_fn=lambda p: None, on_trade_mission=env._trade,
+        on_news_cycle=env._news, on_econ_cycle=env._econ)
+    again.register_daily_report(lambda close_at: calls.append(close_at))
+    _run(again.tick(WED + timedelta(minutes=5)))
+    assert calls == [TUE_CLOSE]
+
+
+def test_missed_days_are_caught_up_as_one_call(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls, base=MON)
+    _run(env.sched.tick(MON))
+    assert len(calls) == 1
+    _run(env.sched.tick(MON + timedelta(days=4)))     # 数日止まっていた
+    assert len(calls) == 2
+
+
+def test_weekend_boundaries_do_not_fire(tmp_path):
+    calls: list = []
+    sat = datetime(2026, 7, 25, 22, 0, tzinfo=timezone.utc)
+    env = _report_env(tmp_path, calls, base=sat)
+    _run(env.sched.tick(sat))
+    assert calls == [datetime(2026, 7, 24, 21, 0, tzinfo=timezone.utc)]
+    _run(env.sched.tick(sat + timedelta(hours=24)))   # 日曜 22:00 (閉場の日の終端)
+    assert len(calls) == 1
+
+
+def test_a_failing_callback_is_logged_and_not_retried(tmp_path):
+    env = Env(tmp_path)
+    attempts = []
+
+    def boom(close_at):
+        attempts.append(close_at)
+        raise RuntimeError("report failed")
+
+    env.sched.register_daily_report(boom)
+    _run(env.sched.tick(WED))
+    _run(env.sched.tick(WED + timedelta(minutes=1)))
+    assert attempts == [TUE_CLOSE]
+    assert "daily_report_cycle_error" in _log(env)
+
+
+def test_no_callback_means_no_state_is_written(tmp_path):
+    env = Env(tmp_path)
+    _run(env.sched.tick(WED))
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+
+
+def test_the_hook_is_not_run_while_stopping(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    stop = threading.Event()
+    stop.set()
+    env.sched._stop_event = stop
+    _run(env.sched.tick(WED))
+    assert calls == []
+
+
+# --- dedupe の純粋部分 --------------------------------------------------------
+
+def test_band_notice_load_ignores_unreadable_values():
+    assert band_notice.load(None) == []
+    assert band_notice.load("not json") == []
+    assert band_notice.load('{"id": 1}') == []
+    assert band_notice.load('[{"id": "x", "events": [1]}]') == []
+    assert band_notice.load('[{"id": 1, "events": [2, 1, 1]}]') == [
+        {"id": 1, "events": [1, 2]}]
+
+
+def test_band_notice_merges_every_record_the_component_touches_into_the_first():
+    records = [{"id": 1, "events": [1, 2]}, {"id": 5, "events": [5]},
+               {"id": 9, "events": [9]}]
+    out, notify = band_notice.record_suppression(records, 2, [2, 5, 7])
+    assert notify is False
+    assert out == [{"id": 1, "events": [1, 2, 5, 7]}, {"id": 9, "events": [9]}]
+    out, notify = band_notice.record_suppression(out, 20, [20])
+    assert notify is True and out[-1] == {"id": 20, "events": [20]}
+
+
+def test_band_notice_matches_by_shared_event_not_by_component_id():
+    records = [{"id": 1, "events": [1, 2]}]
+    _, notify = band_notice.record_suppression(records, 2, [2, 3])   # 最小 id は変わった
+    assert notify is False
+    _, notify = band_notice.record_suppression(records, 1, [4])      # id が同じでも別の帯
+    assert notify is True
+
+
+# --- calendar の鮮度観測 ------------------------------------------------------
+
+def test_the_calendar_observation_hook_runs_on_every_tick(tmp_path):
+    env = Env(tmp_path)
+    seen: list = []
+    env.sched.on_calendar_observe = seen.append
+    env.sched.tick(WED)
+    env.sched.tick(WED + timedelta(minutes=1))
+    assert seen == [WED, WED + timedelta(minutes=1)]
+
+
+def test_a_failing_calendar_observation_does_not_stop_the_tick(tmp_path):
+    env = Env(tmp_path)
+
+    def boom(now):
+        raise RuntimeError("freshness unreadable")
+
+    env.sched.on_calendar_observe = boom
+    oid = env.place_limit()
+    _tick(env, WED)
+    assert _status(env, oid) == "open"                       # 約定処理は止まらない
+    assert "calendar_observe_cycle_error" in _log(env)

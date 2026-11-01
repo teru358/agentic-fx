@@ -214,9 +214,17 @@ class AbandonedRow:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalRow:
+    """`expire_stale` が abandoned にした行の id と理由。"""
+    id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class ExpireResult:
     total: int
     invalid_timeframe: tuple[AbandonedRow, ...]
+    terminal: tuple[TerminalRow, ...] = ()
 
 
 def _require_aware(dt: datetime, label: str) -> None:
@@ -360,7 +368,7 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
         f"abandon_reason={_FRESHNESS_REASON_EXPR}, abandoned_at=:abandoned_at "
         f"WHERE status='pending' AND {_STALE_CONDITION} "
         f"RETURNING id, plugin, timeframe, ({_TF_MINUTES_CASE} IS NULL) "
-        "AS invalid_timeframe",
+        "AS invalid_timeframe, abandon_reason",
         {"now": now.isoformat(), "freshness_bars": freshness_bars,
          "abandoned_at": utc_iso(now)})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
@@ -371,7 +379,9 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
         AbandonedRow(id=row[0], plugin=row[1], timeframe=row[2])
         for row in rows if row[3]
     )
-    return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe)
+    terminal = tuple(TerminalRow(id=row[0], reason=row[4]) for row in rows)
+    return ExpireResult(total=len(rows), invalid_timeframe=invalid_timeframe,
+                        terminal=terminal)
 
 
 def _consume_update(conn: sqlite3.Connection, signal_id: int,

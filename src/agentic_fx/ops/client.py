@@ -642,6 +642,30 @@ def _references_line(rows) -> str | None:
     return "references: " + " ".join(parts) + (f" … 他 {extra} 件" if extra > 0 else "")
 
 
+def _flag(value) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "n/a" if value == "n/a" else "-"
+
+
+def _admission_line(data: dict) -> str | None:
+    """signal 起動と指標回避帯の最小表示。キーが無い (古い daemon) ときは出さない。"""
+    guarantee = data.get("worst_case_guarantee_unavailable")
+    window = data.get("window") if isinstance(data.get("window"), dict) else None
+    if guarantee is None and window is None:
+        return None
+    parts = [f"worst_case_guarantee_unavailable={_flag(guarantee)}",
+             "capacity_override_below_producer="
+             f"{_flag(data.get('capacity_override_below_producer'))}"]
+    if window is not None:
+        parts.append(f"in_window={_flag(window.get('in_window'))} "
+                     f"(event {_num(window.get('active_events'))} 件)")
+    parts.append(f"抑止中 limit={_num(data.get('suppressed_limits'))}")
+    return "signal/指標回避帯: " + " ".join(parts)
+
+
 def format_status(data: dict) -> str:
     kill = data.get("kill_switch") if isinstance(data.get("kill_switch"), dict) else {}
     if kill.get("latched") is True:
@@ -677,6 +701,9 @@ def format_status(data: dict) -> str:
     if isinstance(trade_events, dict):
         lines.append("取引 event の欠落: " + " ".join(
             f"{name}={_num(trade_events.get(name))}" for name in DROP_REASONS))
+    admission = _admission_line(data)
+    if admission is not None:
+        lines.append(admission)
     lines.extend(_deploy_ops_lines(data.get("plugin_deploy_ops")))
     repeat = data.get("improve_repeat")
     if isinstance(repeat, dict):

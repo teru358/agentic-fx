@@ -3198,7 +3198,7 @@ def test_signal_maintenance_callback_integration(tmp_path, monkeypatch):
 
     def spy_run_signal_maintenance(*, conn, signal_producer, approved,
                                       settings, now, resolved_by_identity, activity,
-                                      plugins_root):
+                                      plugins_root, on_terminal):
         calls.append({
             "conn": conn is not None,
             "signal_producer": signal_producer is not None,

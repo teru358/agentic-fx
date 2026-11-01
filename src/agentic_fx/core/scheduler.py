@@ -1,25 +1,29 @@
 """Scheduler — クロック駆動 tick。mark-to-market・reconcile・予約維持・約定・毎時 Mission。"""
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
-from typing import Callable
+from typing import Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
-from agentic_fx.core import accounting, market_hours, transitions
+from agentic_fx.core import accounting, band_notice, market_hours, transitions
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
+from agentic_fx.core.econ_window import WindowSettings
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
 from agentic_fx.core.supervisor import SubmitResult
-from agentic_fx.store import cron_cursor, fetch_attempts, ohlcv, orders
+from agentic_fx.core.writer_admission import WriterAdmission
+from agentic_fx.store import alert_state, cron_cursor, econ_events, fetch_attempts, ohlcv, orders
 from agentic_fx.store.state import StateStore
 
 _log = logging.getLogger("agentic_fx.scheduler")
@@ -34,6 +38,9 @@ _NEWS_INTERVAL = timedelta(minutes=30)
 # ただし当日の forecast/previous は更新されうるので 1 日 1 回よりは細かく。
 _ECON_INTERVAL = fetch_attempts.ECON_REFRESH_INTERVAL
 _BAR_FRESHNESS = timedelta(minutes=5)
+_ONE_MINUTE = timedelta(minutes=1)
+# service の scheduler thread が次の tick を始めるまでの最短間隔。待機上限の式の T。
+TICK_INTERVAL_SEC = 60
 
 
 class Scheduler:
@@ -57,10 +64,14 @@ class Scheduler:
                  on_signal_maintenance: Callable[[datetime], None] | None = None,
                  on_cache_maintenance: Callable[[datetime], None] | None = None,
                  on_improve_tick: Callable[[datetime], None] | None = None,
+                 on_calendar_observe: Callable[[datetime], None] | None = None,
                  signal_due_fn: Callable[[datetime], bool] | None = None,
                  stop_event: threading.Event | None = None,
                  bar_freshness: timedelta = _BAR_FRESHNESS,
-                 state_fn: Callable[[], str] = _always_ready) -> None:
+                 state_fn: Callable[[], str] = _always_ready,
+                 econ_window: WindowSettings | None = None,
+                 pair_currencies: Mapping[str, tuple[str, str]] | None = None,
+                 writer_admission: WriterAdmission | None = None) -> None:
         self.conn = conn
         self.executor = executor
         self.settings = settings
@@ -96,6 +107,8 @@ class Scheduler:
         # 抜けた後にそれらを実行する (検収 B2、2026-08-22)。
         self.on_improve_tick = on_improve_tick
         self.signal_due_fn = signal_due_fn
+        # calendar の鮮度を毎 tick 観測するフック (refresh の周期とは独立)。
+        self.on_calendar_observe = on_calendar_observe
         self._stop_event = stop_event
         self.bar_freshness = bar_freshness
         # `app.outage` (OutageStateMachine) の観測結果を Scheduler へ
@@ -104,6 +117,15 @@ class Scheduler:
         # 無改変で動く)。"ready" 以外の間、新規判断 mission (cron/signal)・
         # signal maintenance・新規ペーパー約定を止める。
         self.state_fn = state_fn
+        # 指標回避帯の設定と pair ごとの対象通貨。どちらかが None なら limit の
+        # 約定抑止は無効 (既存呼び出し元・テストは無改変で動く)。
+        self.econ_window = econ_window
+        self.pair_currencies = pair_currencies
+        # scheduler の DB 書込み要求フラグ。tick の間、立て続ける。
+        self.writer_admission = writer_admission
+        self._daily_report: Callable[[datetime], None] | None = None
+        # 抑止中の limit 件数 (status 用の不変 snapshot。tick ごとに差し替える)
+        self.suppressed_limit_count = 0
         self._cron_watermarks: dict[tuple[str, str], datetime] = {}
         self._pending_cron_watermarks: dict[tuple[str, str], datetime] = {}
         self._cron_hold: set[tuple[str, str]] = set()
@@ -131,8 +153,14 @@ class Scheduler:
         self._cron_cursor_failure_logged_this_tick: set[tuple[str, str]] = set()
         self._restore_cron_cursor()
 
+    def _writer_scope(self):
+        if self.writer_admission is None:
+            return nullcontext()
+        return self.writer_admission.scheduler_write()
+
     def tick(self, now: datetime) -> list[Callable[[], None]]:
-        """1 tick 分の決定論的処理。
+        """1 tick 分の決定論的処理。scheduler の DB 書込み要求フラグは tick の間立てる
+        (遅延 callable の書込みまでの範囲は呼び出し元の service が覆う)。
 
         **戻り値 (検収 B2, 2026-08-22)**: `tick()` は core_lock 保持下で
         呼ばれる (`service._scheduler_tick_once`)。`on_improve_tick` は
@@ -164,6 +192,10 @@ class Scheduler:
         例外経路の保護により、未捕捉例外で tick が抜ける場合でも hooks は
         確実に実行される (プラン 8 レビュー修正 F1)。
         """
+        with self._writer_scope():
+            return self._tick_body(now)
+
+    def _tick_body(self, now: datetime) -> list[Callable[[], None]]:
         pending: list[Callable[[], None]] = []
         self._cron_cursor_failure_logged_this_tick.clear()
         try:
@@ -258,6 +290,7 @@ class Scheduler:
                          if fills_allowed and self.state_fn() == "ready"
                          else set())
             self._process_exits(now, filled_ids)
+            self._refresh_suppressed_count()
         finally:
             # dirty cursor の再試行は `_run_hooks` の成否に
             # 関係なく必ず走る独立した try/finally にする。`_run_hooks` が
@@ -266,6 +299,7 @@ class Scheduler:
             # `_retry_dirty_cron_cursor` がスキップされていた。
             try:
                 pending.extend(self._run_hooks(now))
+                pending.extend(self._daily_report_pending(now))
             finally:
                 self._retry_dirty_cron_cursor(now)
             # 検収 B2 (2026-08-22): improve tick の発火判定。
@@ -346,7 +380,66 @@ class Scheduler:
         if self.on_cache_maintenance is not None:
             self._run_data_hook(
                 "cache_maintenance", lambda: self.on_cache_maintenance(now))
+        if self.on_calendar_observe is not None:
+            self._run_data_hook(
+                "calendar_observe", lambda: self.on_calendar_observe(now))
         return pending
+
+    # ---- 親 report の hook ------------------------------------------------
+
+    def register_daily_report(self, callback: Callable[[datetime], None]) -> None:
+        """市場の取引日が閉じた後に 1 回だけ `callback(close_at)` を呼ぶ。
+
+        `close_at` は閉じた取引日の終端 (21:00 UTC の rollover)。呼出しは tick の
+        遅延 callable として core_lock の外で、scheduler thread 上で行われる。
+        callback は同期で走るので、重い処理は自分で別 thread に渡すこと。
+        起動後の最初の tick で、直近に閉じた取引日の分が未起動なら 1 回だけ追い
+        つく (複数日ぶんを溜めて呼ばない)。起動した取引日は callback を呼ぶ前に
+        `alert_state` へ記録するので、再起動しても同じ取引日では呼ばない。callback
+        が失敗した取引日は再試行しない (失敗は技術ログと activity に残る)。
+        """
+        self._daily_report = callback
+
+    @staticmethod
+    def latest_trading_close(now: datetime) -> datetime | None:
+        """`now` 以前で最後に閉じた取引日の終端 (21:00 UTC)。
+
+        その直前の 1 分に市場が開いていた日だけが取引日。週末と休場日の境界は
+        数えない。直近 14 日に無ければ None。
+        """
+        boundary = market_hours.trading_day_start(now)
+        for _ in range(14):
+            if market_hours.is_market_open(boundary - _ONE_MINUTE):
+                return boundary
+            boundary -= timedelta(days=1)
+        return None
+
+    def _daily_report_pending(self, now: datetime) -> list[Callable[[], None]]:
+        try:
+            return self._daily_report_due(now)
+        except Exception as e:  # noqa: BLE001 — report の都合で tick を止めない
+            _log.warning("daily report check failed: %s", safe_error_text(e))
+            return []
+
+    def _daily_report_due(self, now: datetime) -> list[Callable[[], None]]:
+        callback = self._daily_report
+        if callback is None or self._stopping():
+            return []
+        close_at = self.latest_trading_close(now)
+        if close_at is None:
+            return []
+        day = close_at.isoformat()
+        try:
+            raw = alert_state.get(self.conn, alert_state.DAILY_REPORT_KEY)
+            last = json.loads(raw)["day"] if raw else None
+        except (ValueError, KeyError, TypeError):
+            last = None
+        if isinstance(last, str) and last >= day:
+            return []
+        alert_state.set(self.conn, alert_state.DAILY_REPORT_KEY,
+                        json.dumps({"day": day}), now=now)
+        return [lambda: self._run_data_hook("daily_report",
+                                            lambda: callback(close_at))]
 
     # ---- internal -------------------------------------------------------
 
@@ -364,7 +457,7 @@ class Scheduler:
         `on_trade_mission` には必ず理由を渡す)。
 
         **原子性の注記**: `signal_due_fn` の判定 (`signals.pending_exists`
-        AND `missions.signals_rate_ok` AND D2 条件) から `on_trade_mission`
+        AND `missions.signals_rate_ok`) から `on_trade_mission`
         呼び出しまでの間に他の書き込みが割り込まないことは、`tick()` が
         単一スレッド・単一タイマーからの逐次呼び出しであること (docstring
         参照) にのみ依存する。複数スレッド/プロセスから同時に判定・起動が
@@ -1316,6 +1409,8 @@ class Scheduler:
                                          self._spread_for(row["pair"]))
                 if price is None:
                     continue
+                if self._suppress_fill(row, bar, now):
+                    continue
                 transitions.transition(
                     self.conn, row["id"], S.PROTECTION_PENDING, now,
                     avg_fill_price=price, filled_quantity=row["quantity"],
@@ -1340,6 +1435,64 @@ class Scheduler:
                                     "— 次 tick 再試行", ref_id=str(row["id"]))
                 _log.warning("limit fill failed #%s: %s", row["id"], text)
         return filled_ids
+
+    def _suppress_fill(self, row: dict, bar: Bar, now: datetime) -> bool:
+        """足 `[bar.ts, bar.ts + 1m]` が指標回避帯と交差するなら、約定させない。
+
+        注文は cancel せず期限も延ばさない (期限切れは `_expire_limits` が従来どおり)。
+        帯は足の区間だけで決め、`now` を使わない。通知は order × 連結成分で 1 回
+        (成分は event を共有する限り同じ)。判定や保存が例外を出したときは、
+        呼び出し元の注文単位の隔離に任せ、この足は約定しない。
+        """
+        if self.econ_window is None or self.pair_currencies is None:
+            return False
+        currencies = self.pair_currencies.get(row["pair"])
+        if currencies is None:
+            return False
+        components = econ_events.bar_components(
+            self.conn, bar.ts, bar.ts + _ONE_MINUTE, settings=self.econ_window,
+            currencies=currencies)
+        if not components:
+            return False
+        key = alert_state.limit_suppress_key(row["id"])
+        before = band_notice.load(alert_state.get(self.conn, key))
+        records = before
+        fresh: list = []
+        for component in components:
+            records, notify = band_notice.record_suppression(
+                records, component.id, (e.id for e in component.events))
+            if notify:
+                fresh.append(component)
+        if records != before:
+            alert_state.set(self.conn, key, band_notice.dump(records), now=now)
+        for component in fresh:
+            self.activity.write(
+                Category.TRADE, "limit_fill_suppressed_econ_window",
+                f"#{row['id']} {row['pair']}: 指標回避帯 (成分 {component.id}) "
+                f"と足 {bar.ts.isoformat()} が交差 — 約定を見送り (注文は維持)",
+                ref_id=str(row["id"]))
+        return True
+
+    def _refresh_suppressed_count(self) -> None:
+        try:
+            self.suppressed_limit_count = self._prune_limit_suppress()
+        except Exception as e:  # noqa: BLE001 — 観測の更新で資金保護を止めない
+            _log.warning("limit suppress state refresh failed: %s", safe_error_text(e))
+
+    def _prune_limit_suppress(self) -> int:
+        """約定待ちでなくなった order の抑止通知状態を消し、残りの件数を返す。"""
+        keys = alert_state.keys_with_prefix(self.conn, alert_state.LIMIT_SUPPRESS_PREFIX)
+        if not keys:
+            return 0
+        live = {alert_state.limit_suppress_key(r["id"])
+                for r in orders.list_by_status(self.conn, S.PENDING_FILL)}
+        kept = 0
+        for key in keys:
+            if key in live:
+                kept += 1
+            else:
+                alert_state.delete(self.conn, key)
+        return kept
 
     def _process_exits(self, now: datetime, filled_ids: set[int]) -> None:
         """OPEN ポジションの SL/TP 到達判定。

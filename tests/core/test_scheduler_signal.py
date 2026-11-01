@@ -6,16 +6,15 @@
 直接差し替える — 既存テストの `env.executor.broker.equity = ...` と同じ
 流儀)。
 
-`_signal_due_fn` は service.py の実配線 (D2 AND pending_exists AND
-signals_rate_ok) を模した combinator — 実 store 関数 (signals/missions/
-orders) をそのまま呼ぶので、レート制限・D2 の意味論は store 層のロジック
-そのものを検証している。
+`_signal_due_fn` は service.py の実配線と同じ `signal_admission.signal_due`
+(eligible な pending ∧ 鮮度内 ∧ rate 内。建玉の有無は見ない) を呼ぶ。
 """
 from __future__ import annotations
 
 from datetime import timedelta
 
 from agentic_fx.core.contracts import Bar
+from agentic_fx.signal_admission import signal_due
 from agentic_fx.store import missions, orders, signals
 
 from tests.core.test_scheduler import SAT, SETTINGS, WED, Env
@@ -26,17 +25,8 @@ def _baseline_cron(env, now):
 
 
 def _signal_due_fn(conn, settings):
-    """service.py の signal_due_fn 配線を模した combinator (D2 AND
-    pending_exists AND signals_rate_ok)。"""
-    def fn(now):
-        if not orders.list_by_status(conn, "open", "pending_fill"):
-            return False
-        if not signals.pending_exists(
-                conn, now=now,
-                freshness_bars=settings.plugin.signal_freshness_bars):
-            return False
-        return missions.signals_rate_ok(conn, now, settings)
-    return fn
+    """service.py の signal_due_fn 配線と同じ判定。"""
+    return lambda now: signal_due(conn, settings, now)
 
 
 def _open_position(env, *, pair="USDJPY"):
@@ -70,16 +60,16 @@ def test_signal_fires_when_pending_and_position_exist(tmp_path):
 
 
 # ---------------------------------------------------------------------
-# ② ポジション・pending_fill ゼロで起動しない (D2)
+# ② ポジション・pending_fill ゼロでも起動する
 # ---------------------------------------------------------------------
-def test_signal_does_not_fire_without_open_or_pending_position(tmp_path):
+def test_signal_fires_without_open_or_pending_position(tmp_path):
     env = Env(tmp_path)
     _baseline_cron(env, WED)
     _add_pending_signal(env, bar_ts=WED - timedelta(hours=1))  # pending はある
     env.sched.signal_due_fn = _signal_due_fn(env.conn, SETTINGS)
 
     env.sched.tick(WED + timedelta(minutes=5))
-    assert env.trade_reasons == []  # D2 (ポジション皆無) で起動しない
+    assert env.trade_reasons == ["signal"]  # 建玉の有無を見ない
 
 
 # ---------------------------------------------------------------------
