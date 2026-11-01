@@ -1259,3 +1259,209 @@ def test_v3_rebuild_leaves_legacy_payload_rows_unmigrated(tmp_path):
         assert stored["status"] == row["status"]
         assert stored["contract_version"] is None
         assert stored["abandon_reason"] is None
+
+
+# --- rebuild guard は構造で比べる -----------------------------------------
+
+import hashlib  # noqa: E402
+
+V5_FIXTURE_SHA256 = (
+    "e08f8af0cf2862f030b52d442356f4b9a23474b3feab5d44983683760b50b7a0")
+
+
+def test_v5_fixture_hash_is_pinned_and_changes_only_with_a_deliberate_update():
+    """fixture は回避帯追加前の schema dump そのもの。内容を変えるときは、
+    その意図をこの hash の更新で示す。"""
+    digest = hashlib.sha256(V5_SCHEMA.read_bytes()).hexdigest()
+    assert digest == V5_FIXTURE_SHA256
+
+
+def _guard_conn(tmp_path, template, table):
+    conn = sqlite3.connect(tmp_path / f"guard-{table}.db")
+    conn.execute(template.format(name=table, ine=""))
+    conn.commit()
+    return conn
+
+
+def _with_comment_and_spacing(ddl):
+    return ddl.replace(
+        "CREATE TABLE", "-- 先頭コメント\nCREATE TABLE", 1).replace(
+        "  id INTEGER", "  /* 列の説明 */  id   INTEGER", 1).replace(
+        ",\n", ", -- 行末コメント\n", 3)
+
+
+GUARD_TARGETS = (
+    ("signals", "_SIGNALS_V3_DDL"),
+    ("trade_intents", "_TRADE_INTENTS_DDL"),
+)
+
+
+@pytest.mark.parametrize("table,const", GUARD_TARGETS)
+def test_guard_ignores_comment_and_whitespace_only_ddl_changes(
+        tmp_path, table, const):
+    template = getattr(db_module, const)
+    conn = _guard_conn(tmp_path, template, table)
+    reworded = _with_comment_and_spacing(template)
+    assert reworded != template
+    assert db_module._table_definition_matches(conn, table, template)
+    assert db_module._table_definition_matches(conn, table, reworded)
+
+
+def _semantic_variants(const, template):
+    if const == "_SIGNALS_V3_DDL":
+        return {
+            "column": template.replace(
+                "requeue_count INTEGER NOT NULL DEFAULT 0",
+                "requeue_count INTEGER NOT NULL DEFAULT 1", 1),
+            "check": template.replace("'ineligible_cleanup',", "", 1),
+            "fk": template.replace(
+                "REFERENCES missions(id)", "REFERENCES missions(id) "
+                "ON DELETE CASCADE", 1),
+        }
+    return {
+        "column": template.replace(
+            "payload_json TEXT NOT NULL", "payload_json TEXT", 1),
+        "check": template.replace("'econ_window'", "'other_window'"),
+        "fk": template.replace(
+            "REFERENCES missions(id)", "REFERENCES missions(id) "
+            "ON DELETE CASCADE", 1),
+    }
+
+
+@pytest.mark.parametrize("kind", ("column", "check", "fk"))
+@pytest.mark.parametrize("table,const", GUARD_TARGETS)
+def test_guard_detects_a_meaning_change_in_column_check_or_fk(
+        tmp_path, table, const, kind):
+    template = getattr(db_module, const)
+    conn = _guard_conn(tmp_path, template, table)
+    changed = _semantic_variants(const, template)[kind]
+    assert changed != template
+    assert not db_module._table_definition_matches(conn, table, changed)
+
+
+def test_comment_only_ddl_change_does_not_rebuild_signals(tmp_path, monkeypatch):
+    conn = _fresh(tmp_path)
+    sid = _raw_signal(conn, content_hash="keep")
+    monkeypatch.setattr(
+        db_module, "_SIGNALS_V3_DDL",
+        _with_comment_and_spacing(db_module._SIGNALS_V3_DDL))
+
+    init_db(conn)
+
+    assert not (tmp_path / "fresh.db.bak-signals-v3").exists()
+    assert _row(conn, sid)["status"] == "pending"
+
+
+def test_comment_only_ddl_change_does_not_rebuild_trade_intents(
+        tmp_path, monkeypatch):
+    conn = _fresh(tmp_path)
+    monkeypatch.setattr(
+        db_module, "_TRADE_INTENTS_DDL",
+        _with_comment_and_spacing(db_module._TRADE_INTENTS_DDL))
+
+    init_db(conn)
+
+    assert not list(tmp_path.glob("fresh.db.bak-trade-intents*"))
+
+
+def test_check_change_in_the_template_rebuilds_signals(tmp_path, monkeypatch):
+    conn = _fresh(tmp_path)
+    sid = _raw_signal(conn, content_hash="keep")
+    monkeypatch.setattr(
+        db_module, "_SIGNALS_V3_DDL",
+        db_module._SIGNALS_V3_DDL.replace("'ineligible_cleanup',", "", 1))
+
+    init_db(conn)
+
+    assert (tmp_path / "fresh.db.bak-signals-v3").exists()
+    assert "'ineligible_cleanup'" not in _table_sql(conn, "signals")
+    assert _row(conn, sid)["status"] == "pending"
+
+
+def test_check_change_in_the_template_rebuilds_trade_intents(
+        tmp_path, monkeypatch):
+    conn = _fresh(tmp_path)
+    monkeypatch.setattr(
+        db_module, "_TRADE_INTENTS_DDL",
+        db_module._TRADE_INTENTS_DDL.replace("'econ_window'", "'other_window'"))
+
+    init_db(conn)
+
+    assert list(tmp_path.glob("fresh.db.bak-trade-intents*"))
+    assert "other_window" in _table_sql(conn, "trade_intents")
+
+
+# --- legacy_alter_table の復元 / v3 rebuild の途中失敗 ----------------------
+
+@pytest.mark.parametrize("initial", (1, 0))
+def test_signals_fk_migration_restores_legacy_alter_table(tmp_path, initial):
+    conn = connect(tmp_path / "legacy.db")
+    conn.execute(_legacy_pre_fk_signals_ddl())
+    conn.commit()
+    conn.executescript(db_module._SCHEMA)
+    _raw_signal(conn, content_hash="legacy")
+    conn.execute(f"PRAGMA legacy_alter_table={initial}")
+
+    db_module._migrate_signals_fk(conn)
+
+    assert conn.execute("PRAGMA legacy_alter_table").fetchone()[0] == initial
+    _assert_children_reference_signals(conn)
+
+
+class _FailingConn:
+    """`fail_on` で始まる SQL を実行しようとした時に例外を投げる接続の薄い皮。"""
+
+    def __init__(self, conn, fail_on):
+        self._conn = conn
+        self._fail_on = fail_on
+
+    def execute(self, sql, *args):
+        if sql.strip().startswith(self._fail_on):
+            raise RuntimeError("injected failure")
+        return self._conn.execute(sql, *args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def _rollback_world(tmp_path):
+    conn = _v5(tmp_path)
+    mid = _mission(conn)
+    keep = _raw_signal(conn, content_hash="keep")
+    gone = _raw_signal(conn, content_hash="gone")
+    conn.execute("DELETE FROM signals WHERE id=?", (gone,))
+    conn.commit()
+    conn.executescript(db_module._SCHEMA)
+    _link(conn, _deploy_op(conn), keep)
+    return conn, mid, keep, gone
+
+
+def _state(conn):
+    seq = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='signals'").fetchone()
+    return (_schema_dump(conn), _all_rows(conn, "signals"),
+            seq[0] if seq else None,
+            {c: _shape(conn, c) for c in CHILDREN_OF_SIGNALS
+             if conn.execute("SELECT 1 FROM sqlite_master WHERE name=?",
+                             (c,)).fetchone()})
+
+
+@pytest.mark.parametrize("fail_on", (
+    "DROP TABLE signals",
+    "ALTER TABLE signals_new RENAME",
+), ids=("after_copy_before_drop", "before_rename"))
+def test_signals_v3_failure_midway_rolls_back_table_children_and_sequence(
+        tmp_path, fail_on):
+    conn, _mid, _keep, gone = _rollback_world(tmp_path)
+    before = _state(conn)
+    assert before[2] == gone
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        db_module._migrate_signals_v3(_FailingConn(conn, fail_on))
+
+    assert _state(conn) == before
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert not conn.in_transaction
+    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='signals_new'"
+                        ).fetchone() is None
+    _assert_children_reference_signals(conn)

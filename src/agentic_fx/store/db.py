@@ -1256,11 +1256,14 @@ def _migrate_signals_fk(conn: sqlite3.Connection) -> None:
                 return
 
             if not v1_exists2:
+                prior_legacy = conn.execute(
+                    "PRAGMA legacy_alter_table").fetchone()[0]
                 conn.execute("PRAGMA legacy_alter_table=ON")
                 try:
                     conn.execute("ALTER TABLE signals RENAME TO signals_v1")
                 finally:
-                    conn.execute("PRAGMA legacy_alter_table=OFF")
+                    conn.execute(
+                        f"PRAGMA legacy_alter_table={1 if prior_legacy else 0}")
             conn.execute(_SIGNALS_V2_DDL)
 
             conn.execute(
@@ -1746,24 +1749,124 @@ def _migrate_trade_intents_observability(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
-def _table_definition_matches(conn: sqlite3.Connection, table: str,
-                              ddl_template: str) -> bool:
-    """`table` の `sqlite_master.sql` の本文 (最初の `(` 以降) が
-    `ddl_template` (`{ine}{name}` 型) の本文と空白の違いを除いて一致するか。
+def _strip_sql_comments(sql: str) -> str:
+    """文字列リテラルの外にある `-- ...` と `/* ... */` を落とす。"""
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if sql[j] == ch:
+                    if j + 1 < n and sql[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            out.append(sql[i:j + 1])
+            i = j + 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
-    表名の部分は比べない。fresh の `CREATE TABLE IF NOT EXISTS x (` も
-    rebuild 後の `CREATE TABLE "x" (` も同じ本文を持つ。列・CHECK・FK の
-    どれかが違えば一致しない。"""
+
+def _normalized_check_clauses(sql: str) -> list[str]:
+    """DDL 本文の `CHECK(...)` 式を、コメントと空白を落として並べ替えた
+    list で返す。文字列リテラルの中の括弧は数えない。"""
+    text = _strip_sql_comments(sql)
+    clauses: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            continue
+        prev_ok = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        if prev_ok and text[i:i + 5].upper() == "CHECK":
+            k = i + 5
+            while k < n and text[k].isspace():
+                k += 1
+            if k < n and text[k] == "(":
+                depth, j, quote = 0, k, None
+                while j < n:
+                    c = text[j]
+                    if quote:
+                        if c == quote:
+                            quote = None
+                    elif c in ("'", '"'):
+                        quote = c
+                    elif c == "(":
+                        depth += 1
+                    elif c == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                clauses.append("".join(text[k:j + 1].split()))
+                i = j + 1
+                continue
+        i += 1
+    return sorted(clauses)
+
+
+def _table_structure(conn: sqlite3.Connection, table: str) -> tuple | None:
+    """表の構造 (列・FK・index・CHECK 式) を比較用の tuple にする。
+    DDL 内のコメントや空白は含まない。表が無ければ None。"""
     row = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
         (table,)).fetchone()
     if row is None or row[0] is None:
+        return None
+    columns = tuple(
+        (r[1], (r[2] or "").upper(), r[3], r[4], r[5])
+        for r in conn.execute(f"PRAGMA table_info('{table}')"))
+    fks = tuple(sorted(
+        (r[2], r[3], r[4] or "", r[5], r[6], r[7])
+        for r in conn.execute(f"PRAGMA foreign_key_list('{table}')")))
+    indexes = []
+    for idx in conn.execute(f"PRAGMA index_list('{table}')"):
+        cols = tuple(c[2] for c in conn.execute(
+            f"PRAGMA index_info('{idx[1]}')"))
+        indexes.append((idx[2], idx[3], idx[4], cols))
+    return (columns, fks, tuple(sorted(indexes)),
+            tuple(_normalized_check_clauses(row[0])))
+
+
+def _table_definition_matches(conn: sqlite3.Connection, table: str,
+                              ddl_template: str) -> bool:
+    """`table` の構造が `ddl_template` (`{ine}{name}` 型) の構造と一致するか。
+
+    比べるのは列 (名前・型・NOT NULL・default・PK)、FK、UNIQUE を含む
+    index、CHECK 式 (コメントと空白を除く)。DDL 文字列そのものは比べない
+    ので、コメントや空白だけの変更では不一致にならない。列・CHECK・FK の
+    どれかの意味が違えば不一致になる。"""
+    actual = _table_structure(conn, table)
+    if actual is None:
         return False
-
-    def body(sql: str) -> str:
-        return " ".join(sql[sql.index("("):].split()).rstrip("; ")
-
-    return body(row[0]) == body(ddl_template.format(name=table, ine=""))
+    scratch = sqlite3.connect(":memory:")
+    try:
+        scratch.execute(ddl_template.format(name=table, ine=""))
+        expected = _table_structure(scratch, table)
+    finally:
+        scratch.close()
+    return actual == expected
 
 
 def _migrate_signals_v3(conn: sqlite3.Connection) -> None:
