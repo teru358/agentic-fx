@@ -48,10 +48,6 @@ FINALIZE_GRACE = timedelta(days=1)
 MAX_BATCH_ROWS = 240
 RETENTION_DAYS = 400
 
-_Conflict = Conflict
-_short_tx = short_tx
-
-
 # --- 1m 行と事前検証 ---------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +66,13 @@ class InvalidSliceRow(ValueError):
     """DB の CHECK に当たる前に弾く不正な 1m 行。"""
 
 
+# DDL の CHECK が価格 (high) と volume に課す上限。
+_DDL_VALUE_LIMIT = 1e308
+
+
 def _positive_finite(value) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value > 0)
+            and math.isfinite(value) and 0 < value < _DDL_VALUE_LIMIT)
 
 
 def slice_row_problem(row: SliceRow) -> str | None:
@@ -93,7 +93,7 @@ def slice_row_problem(row: SliceRow) -> str | None:
     if not all(_positive_finite(v) for v in prices):
         return "OHLC must be finite and positive"
     if not (isinstance(row.volume, (int, float)) and math.isfinite(row.volume)
-            and row.volume >= 0):
+            and 0 <= row.volume < _DDL_VALUE_LIMIT):
         return "volume must be finite and >= 0"
     if not (row.low <= row.open <= row.high and row.low <= row.close <= row.high):
         return "OHLC violates low <= open, close <= high"
@@ -122,6 +122,21 @@ def _require_in_range(rows: Sequence[SliceRow], start: str, end: str) -> None:
         if not lo <= row.bar_time < hi:
             raise InvalidSliceRow(
                 f"{row.bar_time!r} is outside the set range [{start}, {end})")
+
+
+IN_CHUNK = 500
+
+
+def _chunks(values: Sequence, size: int = IN_CHUNK):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _check_spread_pips(value, label: str) -> float:
+    if not (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0):
+        raise ValueError(f"{label} must be finite and >= 0: {value!r}")
+    return float(value)
 
 
 def _range_minutes(start: datetime, end: datetime) -> int:
@@ -176,16 +191,18 @@ def event_set_targets(conn: sqlite3.Connection, *, importance_min: int,
     """
     sql = ("SELECT id, country FROM econ_events "
            "WHERE superseded_by IS NULL AND importance >= ?")
-    params: list = [importance_min]
-    if event_ids is not None:
+    if event_ids is None:
+        rows = conn.execute(sql + " ORDER BY id", [importance_min]).fetchall()
+    else:
         ids = sorted(set(event_ids))
-        if not ids:
-            return []
-        sql += f" AND id IN ({','.join('?' * len(ids))})"
-        params.extend(ids)
+        rows = []
+        for chunk in _chunks(ids):
+            rows.extend(conn.execute(
+                sql + f" AND id IN ({','.join('?' * len(chunk))}) ORDER BY id",
+                [importance_min, *chunk]).fetchall())
     currencies = {pair: set(c) for pair, c in pair_currencies.items()}
     out: list[tuple[int, str]] = []
-    for row in conn.execute(sql + " ORDER BY id", params):
+    for row in rows:
         for pair, ccys in currencies.items():
             if row["country"] == "All" or row["country"] in ccys:
                 out.append((row["id"], pair))
@@ -273,36 +290,47 @@ def sync_event_sets_in_tx(conn: sqlite3.Connection, *,
     """
     wanted = list(dict.fromkeys(targets))
     wanted_set = set(wanted)
+    existing: dict[tuple[int, str], tuple[int, str]] = {}
+    for chunk in _chunks(sorted({event_id for event_id, _ in wanted})):
+        for row in conn.execute(
+                "SELECT id, event_id, pair, state FROM ohlcv_slice_sets "
+                f"WHERE event_id IN ({','.join('?' * len(chunk))})", chunk):
+            existing[(row["event_id"], row["pair"])] = (row["id"], row["state"])
     created, reactivated, deferred, skipped = [], [], [], []
     for event_id, pair in wanted:
-        try:
-            new_id = create_event_set_in_tx(conn, event_id=event_id, pair=pair,
-                                            now=now)
-        except EventTsNotOnMinute:
-            if event_id not in skipped:
-                skipped.append(event_id)
+        found = existing.get((event_id, pair))
+        if found is None:
+            try:
+                new_id = create_event_set_in_tx(conn, event_id=event_id,
+                                                pair=pair, now=now)
+            except EventTsNotOnMinute:
+                if event_id not in skipped:
+                    skipped.append(event_id)
+                continue
+            if new_id is not None:
+                created.append(new_id)
             continue
-        if new_id is not None:
-            created.append(new_id)
+        set_id, state = found
+        if state != STATE_CANCELLED:
             continue
-        row = conn.execute(
-            "SELECT id, state FROM ohlcv_slice_sets WHERE event_id=? AND pair=?",
-            (event_id, pair)).fetchone()
-        if row is None or row["state"] != STATE_CANCELLED:
-            continue
-        if reactivate_in_tx(conn, row["id"]):
-            reactivated.append(row["id"])
+        if reactivate_in_tx(conn, set_id):
+            reactivated.append(set_id)
         else:
-            deferred.append(row["id"])
+            deferred.append(set_id)
     sql = ("SELECT id, event_id, pair FROM ohlcv_slice_sets "
            "WHERE event_id IS NOT NULL AND state IN (?,?)")
     params: list = [STATE_AWAITING, STATE_STAGING]
-    if scope_event_ids is not None:
-        ids = sorted(set(scope_event_ids))
-        sql += f" AND event_id IN ({','.join('?' * len(ids))})" if ids else " AND 0"
-        params.extend(ids)
+    if scope_event_ids is None:
+        open_rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+    else:
+        open_rows = []
+        for chunk in _chunks(sorted(set(scope_event_ids))):
+            open_rows.extend(conn.execute(
+                sql + f" AND event_id IN ({','.join('?' * len(chunk))})",
+                [*params, *chunk]).fetchall())
+        open_rows.sort(key=lambda r: r["id"])
     cancelled = []
-    for row in conn.execute(sql + " ORDER BY id", params).fetchall():
+    for row in open_rows:
         if (row["event_id"], row["pair"]) in wanted_set:
             continue
         if cancel_set_in_tx(conn, row["id"], now=now):
@@ -319,7 +347,7 @@ def sync_event_sets_tx(conn: sqlite3.Connection, *,
     def body():
         return {"value": sync_event_sets_in_tx(conn, **kwargs)}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def sync_event_sets(conn: sqlite3.Connection, **kwargs) -> SyncResult | None:
@@ -360,9 +388,7 @@ def record_event_spread(conn: sqlite3.Connection, set_id: int, *,
     if spread_source not in (signal_shadow.SPREAD_QUOTE,
                              signal_shadow.SPREAD_ASSUMED):
         raise ValueError(f"unknown spread_source: {spread_source!r}")
-    if not (isinstance(spread_pips, (int, float)) and math.isfinite(spread_pips)
-            and spread_pips >= 0):
-        raise ValueError(f"spread_pips must be finite and >= 0: {spread_pips!r}")
+    _check_spread_pips(spread_pips, "spread_pips")
 
     def body():
         cur = conn.execute(
@@ -371,10 +397,10 @@ def record_event_spread(conn: sqlite3.Connection, set_id: int, *,
             "AND spread_pips IS NULL",
             (float(spread_pips), spread_source, set_id, STATE_AWAITING))
         if cur.rowcount != 1:
-            raise _Conflict
+            raise Conflict
         return {"set_id": set_id}
 
-    return _short_tx(conn, begin, body, checkpoint).committed
+    return short_tx(conn, begin, body, checkpoint).committed
 
 
 def matured_event_sets(conn: sqlite3.Connection, *, now: datetime,
@@ -401,7 +427,7 @@ def new_generation_tx(conn: sqlite3.Connection, *, now: datetime,
             (utc_iso(now),))
         return {"value": cur.lastrowid}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def new_generation(conn: sqlite3.Connection, *, now: datetime,
@@ -424,33 +450,65 @@ def stale_staging_sets(conn: sqlite3.Connection, *,
 # --- staging と完備 ---------------------------------------------------------
 
 def stage_event_rows(conn: sqlite3.Connection, *, set_id: int, generation: int,
-                     rows: Sequence[SliceRow], max_rows: int = MAX_BATCH_ROWS,
+                     rows: Sequence[SliceRow], assumed_spread_pips: float,
+                     max_rows: int = MAX_BATCH_ROWS,
                      begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                     checkpoint: Checkpoint | None = None) -> TxResult:
     """event set に slice 行の 1 batch を書く。
 
-    最初の batch は `awaiting` を現世代の `staging` へ CAS で移す (spread は
-    残す)。以後の batch は `staging` かつ現世代のときだけ書く。それ以外は
+    最初の batch は `awaiting` を現世代の `staging` へ CAS で移す。spread が
+    記録済みならそのまま残し、未記録なら同じ transaction で
+    `assumed_spread_pips` を `assumed` として固定する (取り逃しは後から quote へ
+    置換しない)。以後の batch は `staging` かつ現世代のときだけ書く。それ以外は
     `conflict`。
     """
     _check_batch(rows, max_rows)
+    assumed = _check_spread_pips(assumed_spread_pips, "assumed_spread_pips")
 
     def body():
         conn.execute(
-            "UPDATE ohlcv_slice_sets SET state=?, generation=? "
+            "UPDATE ohlcv_slice_sets SET state=?, generation=?, "
+            "spread_source=CASE WHEN spread_pips IS NULL THEN ? "
+            "ELSE spread_source END, spread_pips=COALESCE(spread_pips, ?) "
             "WHERE id=? AND event_id IS NOT NULL AND state=?",
-            (STATE_STAGING, generation, set_id, STATE_AWAITING))
+            (STATE_STAGING, generation, signal_shadow.SPREAD_ASSUMED, assumed,
+             set_id, STATE_AWAITING))
         row = conn.execute(
             "SELECT range_start, range_end FROM ohlcv_slice_sets "
             "WHERE id=? AND event_id IS NOT NULL AND state=? AND generation=?",
             (set_id, STATE_STAGING, generation)).fetchone()
         if row is None:
-            raise _Conflict
+            raise Conflict
         _require_in_range(rows, row[0], row[1])
         _insert_rows(conn, set_id, rows)
         return {"set_id": set_id, "rows": len(rows)}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
+
+
+def _shadow_range_minutes(start: datetime, end: datetime) -> int:
+    minutes = _range_minutes(start, end)
+    if minutes > SHADOW_ROWS_PER_OWNER_MAX:
+        raise ValueError(f"a shadow range holds at most "
+                         f"{SHADOW_ROWS_PER_OWNER_MAX} minutes, got {minutes}")
+    return minutes
+
+
+def _require_live_shadow(conn: sqlite3.Connection, shadow_id: int,
+                         pair: str) -> None:
+    """set を作る前に shadow が在り、終端でなく、signal と同じ pair かを確かめる。"""
+    row = conn.execute(
+        "SELECT s.state, g.pair FROM signal_shadow s "
+        "JOIN signals g ON g.id = s.signal_id WHERE s.id=?",
+        (shadow_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"no such shadow: {shadow_id}")
+    if row["pair"] != pair:
+        raise ValueError(f"pair {pair!r} differs from the shadow's "
+                         f"signal pair {row['pair']!r}")
+    if row["state"] not in (signal_shadow.STATE_PENDING_ENTRY,
+                            signal_shadow.STATE_FILLED):
+        raise Conflict
 
 
 def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
@@ -458,17 +516,14 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
                       generation: int, rows: Sequence[SliceRow],
                       now: datetime, max_rows: int = MAX_BATCH_ROWS,
                       begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                      checkpoint: Checkpoint | None = None) -> TxResult:
     """shadow set に slice 行の 1 batch を書く。
 
     set が無ければ現世代の `staging` で作る (行数 = 区間の分数)。あれば
     `staging`・現世代・同じ区間のときだけ書く。それ以外は `conflict`。
     """
     _check_batch(rows, max_rows)
-    expected = _range_minutes(range_start, range_end)
-    if expected > SHADOW_ROWS_PER_OWNER_MAX:
-        raise ValueError(f"a shadow range holds at most "
-                         f"{SHADOW_ROWS_PER_OWNER_MAX} minutes, got {expected}")
+    expected = _shadow_range_minutes(range_start, range_end)
     start_s, end_s = utc_iso(range_start), utc_iso(range_end)
     _require_in_range(rows, start_s, end_s)
 
@@ -477,6 +532,7 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
             "SELECT id, state, generation, range_start, range_end, pair "
             "FROM ohlcv_slice_sets WHERE shadow_id=?", (shadow_id,)).fetchone()
         if row is None:
+            _require_live_shadow(conn, shadow_id, pair)
             set_id = conn.execute(
                 "INSERT INTO ohlcv_slice_sets (shadow_id,pair,range_start,"
                 "range_end,expected_rows,state,generation,created_at,"
@@ -489,11 +545,11 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
               and row["pair"] == pair):
             set_id = row["id"]
         else:
-            raise _Conflict
+            raise Conflict
         _insert_rows(conn, set_id, rows)
         return {"set_id": set_id, "rows": len(rows)}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def staging_rows(conn: sqlite3.Connection, *, set_id: int,
@@ -533,7 +589,7 @@ class ShadowCas:
 def complete_set(conn: sqlite3.Connection, *, set_id: int, generation: int,
                  now: datetime, shadow: ShadowCas | None = None,
                  begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                 checkpoint: Checkpoint | None = None) -> TxResult:
     """`staging`・現世代・行数 = `expected_rows` の set を `complete` にする。
 
     shadow 所有の set は `shadow` (終端 outcome) が必須、event 所有の set は渡せ
@@ -553,14 +609,14 @@ def complete_set(conn: sqlite3.Connection, *, set_id: int, generation: int,
             "SELECT shadow_id FROM ohlcv_slice_sets WHERE id=?",
             (set_id,)).fetchone()
         if owner is None:
-            raise _Conflict
+            raise Conflict
         if owner[0] is not None and shadow is None:
             raise ValueError("a shadow-owned set completes only with its "
                              "shadow end")
         if owner[0] is None and shadow is not None:
             raise ValueError("an event-owned set has no shadow to end")
         if shadow is not None and owner[0] != shadow.shadow_id:
-            raise _Conflict
+            raise Conflict
         cur = conn.execute(
             "UPDATE ohlcv_slice_sets SET state=?, generation=NULL, "
             "completed_at=? WHERE id=? AND state=? AND generation=? "
@@ -569,21 +625,21 @@ def complete_set(conn: sqlite3.Connection, *, set_id: int, generation: int,
             (STATE_COMPLETE, utc_iso(now), set_id, STATE_STAGING, generation,
              set_id))
         if cur.rowcount != 1:
-            raise _Conflict
+            raise Conflict
         if shadow is not None and not signal_shadow.transition_in_tx(
                 conn, shadow.shadow_id, expected_state=shadow.expected_state,
                 expected_updated_at=shadow.expected_updated_at,
                 outcome=shadow.outcome, now=now):
-            raise _Conflict
+            raise Conflict
         return {"set_id": set_id, "done": True}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def mark_event_unrecoverable(conn: sqlite3.Connection, *, set_id: int,
                              now: datetime,
                              begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                             checkpoint: Checkpoint | None = None) -> TxResult:
     """元足が保持範囲より前の `awaiting` event set を `unrecoverable` で終える。"""
     def body():
         cur = conn.execute(
@@ -591,28 +647,28 @@ def mark_event_unrecoverable(conn: sqlite3.Connection, *, set_id: int,
             "WHERE id=? AND event_id IS NOT NULL AND state=?",
             (STATE_UNRECOVERABLE, utc_iso(now), set_id, STATE_AWAITING))
         if cur.rowcount != 1:
-            raise _Conflict
+            raise Conflict
         return {"set_id": set_id, "done": True}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
                               pair: str, range_start: datetime,
                               range_end: datetime, now: datetime,
                               begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                              checkpoint: Checkpoint | None = None) -> TxResult:
     """set の無い shadow に `unrecoverable` の set 行を作り、同じ transaction で
     shadow を `data_insufficient` に終える。set が既にあれば `conflict`。"""
     if shadow.outcome.result_code != signal_shadow.RESULT_DATA_INSUFFICIENT:
         raise ValueError("an unrecoverable shadow ends as data_insufficient")
     signal_shadow.check_transition(shadow.expected_state, shadow.outcome)
-    expected = _range_minutes(range_start, range_end)
+    expected = _shadow_range_minutes(range_start, range_end)
 
     def body():
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE shadow_id=?",
                         (shadow.shadow_id,)).fetchone() is not None:
-            raise _Conflict
+            raise Conflict
         set_id = conn.execute(
             "INSERT INTO ohlcv_slice_sets (shadow_id,pair,range_start,range_end,"
             "expected_rows,state,created_at,completed_at,rule_version) "
@@ -624,10 +680,10 @@ def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
                 conn, shadow.shadow_id, expected_state=shadow.expected_state,
                 expected_updated_at=shadow.expected_updated_at,
                 outcome=shadow.outcome, now=now):
-            raise _Conflict
+            raise Conflict
         return {"set_id": set_id, "done": True}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 # --- 破棄・回収・掃除・purge (行は batch ごとに消す) --------------------------
@@ -648,7 +704,7 @@ def _rows_left(conn: sqlite3.Connection, set_id: int) -> bool:
 def discard_staging_step(conn: sqlite3.Connection, *, set_id: int,
                          generation: int, max_rows: int = MAX_BATCH_ROWS,
                          begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                         checkpoint: Checkpoint | None = None) -> TxResult:
     """`staging`・`generation` の set の行を最大 `max_rows` 消す。
 
     行が尽きた transaction で、event set は spread を残して `awaiting`
@@ -661,7 +717,7 @@ def discard_staging_step(conn: sqlite3.Connection, *, set_id: int,
             "WHERE id=? AND state=? AND generation=?",
             (set_id, STATE_STAGING, generation)).fetchone()
         if row is None:
-            raise _Conflict
+            raise Conflict
         deleted = _delete_rows(conn, set_id, max_rows)
         if _rows_left(conn, set_id):
             return {"set_id": set_id, "rows": deleted}
@@ -673,13 +729,13 @@ def discard_staging_step(conn: sqlite3.Connection, *, set_id: int,
             conn.execute("DELETE FROM ohlcv_slice_sets WHERE id=?", (set_id,))
         return {"set_id": set_id, "rows": deleted, "done": True}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def discard_staging(conn: sqlite3.Connection, *, set_id: int, generation: int,
                     max_rows: int = MAX_BATCH_ROWS,
                     begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                    checkpoint: Checkpoint | None = None) -> TxResult:
     """`discard_staging_step` を終わるか commit されなくなるまで繰り返す。"""
     while True:
         result = discard_staging_step(conn, set_id=set_id, generation=generation,
@@ -700,17 +756,17 @@ def cancelled_sets_with_rows(conn: sqlite3.Connection, *,
 def sweep_cancelled_step(conn: sqlite3.Connection, *, set_id: int,
                          max_rows: int = MAX_BATCH_ROWS,
                          begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+                         checkpoint: Checkpoint | None = None) -> TxResult:
     """`cancelled` set に残る slice 行を最大 `max_rows` 消す。状態は変えない。"""
     def body():
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE id=? AND state=?",
                         (set_id, STATE_CANCELLED)).fetchone() is None:
-            raise _Conflict
+            raise Conflict
         deleted = _delete_rows(conn, set_id, max_rows)
         return {"set_id": set_id, "rows": deleted,
                 "done": not _rows_left(conn, set_id)}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def _purge_cutoff(now: datetime, retention_days: int) -> str:
@@ -737,7 +793,7 @@ def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,
                max_rows: int = MAX_BATCH_ROWS,
                retention_days: int = RETENTION_DAYS,
                begin: Begin = begin_immediate,
-        checkpoint: Checkpoint | None = None) -> TxResult:
+               checkpoint: Checkpoint | None = None) -> TxResult:
     """保持期限を過ぎた set の slice 行を最大 `max_rows` 消し、尽きたら
     `purged_at` を付ける。set 行・shadow 終端・反応値は触らない。"""
     cutoff = _purge_cutoff(now, retention_days)
@@ -748,7 +804,7 @@ def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,
                 "AND purged_at IS NULL AND created_at < ?",
                 (set_id, STATE_COMPLETE, STATE_UNRECOVERABLE,
                  cutoff)).fetchone() is None:
-            raise _Conflict
+            raise Conflict
         deleted = _delete_rows(conn, set_id, max_rows)
         if _rows_left(conn, set_id):
             return {"set_id": set_id, "rows": deleted}
@@ -756,7 +812,7 @@ def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,
                      (utc_iso(now), set_id))
         return {"set_id": set_id, "rows": deleted, "done": True}
 
-    return _short_tx(conn, begin, body, checkpoint)
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def slice_row_count(conn: sqlite3.Connection) -> int:
@@ -780,13 +836,9 @@ WARN_RATIO = Fraction(8, 10)
 FULL_RATIO = Fraction(1)
 
 
-def _ceil(value: Fraction) -> int:
-    return -((-value.numerator) // value.denominator)
-
-
 def events_per_month(importance_min: int) -> int:
     rows = EVENT_ROWS_OBSERVED[importance_min]
-    return _ceil(Fraction(rows, EVENT_OBSERVED_DAYS) * Fraction(365, 12))
+    return math.ceil(Fraction(rows, EVENT_OBSERVED_DAYS) * Fraction(365, 12))
 
 
 class CapacityOverrideBelowProducer(ValueError):
@@ -827,7 +879,7 @@ def row_capacity(*, daily_signals: int, importance_min: int, pair_count: int,
     per_day = (Fraction(daily_signals * SHADOW_ROWS_PER_OWNER_MAX)
                + Fraction(events_per_month(importance_min) * 12, 365)
                * EVENT_ROWS_PER_SET * pair_count)
-    return _ceil(retention_days * per_day)
+    return math.ceil(retention_days * per_day)
 
 
 def byte_capacity(rows: int, *, base_bytes: int = SLICE_BASE_BYTES,

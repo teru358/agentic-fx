@@ -47,10 +47,15 @@ def _event_set(conn, eid, pair="USDJPY"):
     return set_id
 
 
+def _stage_event(conn, **kwargs):
+    kwargs.setdefault("assumed_spread_pips", 1.0)
+    return os_.stage_event_rows(conn, **kwargs)
+
+
 def _stage_all(conn, set_id, gen, rows, step=240):
     for i in range(0, len(rows), step):
-        result = os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                                      rows=rows[i:i + step], max_rows=step)
+        result = _stage_event(conn, set_id=set_id, generation=gen,
+                              rows=rows[i:i + step], max_rows=step)
         assert result.committed, result
     return result
 
@@ -91,6 +96,8 @@ _BAD_OHLC = [
     {"quality": "no_tick_flat", "open": 150.0, "high": 150.0, "low": 150.0,
      "close": 150.0, "volume": 1.0},      # flat の volume は 0
     {"quality": "datafeed_outage_gap"},   # outage が値を持つ
+    {"high": 1e308}, {"high": 1.5e308},   # DDL は high < 1e308
+    {"volume": 1e308}, {"volume": 1.5e308},
 ]
 
 
@@ -338,8 +345,8 @@ def test_staging_moves_awaiting_to_the_current_generation_and_completes(tmp_path
     os_.record_event_spread(conn, set_id, spread_pips=1.1, spread_source="quote")
     gen = os_.new_generation(conn, now=NOW)
     rows = _bars(TS - timedelta(minutes=15), 255)
-    first = os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                                 rows=rows[:240])
+    first = _stage_event(conn, set_id=set_id, generation=gen,
+                         rows=rows[:240])
     assert first.committed and first.rows == 240
     assert first.commit_seconds is not None and first.commit_seconds >= 0
     row = os_.get_set(conn, set_id)
@@ -348,7 +355,7 @@ def test_staging_moves_awaiting_to_the_current_generation_and_completes(tmp_path
     assert os_.complete_rows(conn, set_id) is None
     short = os_.complete_set(conn, set_id=set_id, generation=gen, now=NOW)
     assert short.status == "conflict"
-    os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows[240:])
+    _stage_event(conn, set_id=set_id, generation=gen, rows=rows[240:])
     assert os_.complete_set(conn, set_id=set_id, generation=gen + 1,
                             now=NOW).status == "conflict"
     done = os_.complete_set(conn, set_id=set_id, generation=gen, now=NOW)
@@ -367,18 +374,18 @@ def test_staging_refuses_other_generations_states_and_ranges(tmp_path):
     gen = os_.new_generation(conn, now=NOW)
     start = TS - timedelta(minutes=15)
     _stage_all(conn, set_id, gen, _bars(start, 10))
-    other = os_.stage_event_rows(conn, set_id=set_id, generation=gen + 1,
-                                 rows=_bars(start + timedelta(minutes=10), 5))
+    other = _stage_event(conn, set_id=set_id, generation=gen + 1,
+                         rows=_bars(start + timedelta(minutes=10), 5))
     assert other.status == "conflict" and _rows_of(conn, set_id) == 10
     with pytest.raises(os_.InvalidSliceRow, match="outside"):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                             rows=_bars(start - timedelta(minutes=1), 1))
+        _stage_event(conn, set_id=set_id, generation=gen,
+                     rows=_bars(start - timedelta(minutes=1), 1))
     with pytest.raises(ValueError, match="batch limit"):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                             rows=_bars(start, 11), max_rows=10)
+        _stage_event(conn, set_id=set_id, generation=gen,
+                     rows=_bars(start, 11), max_rows=10)
     with pytest.raises(ValueError, match="max_rows"):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                             rows=_bars(start, 1), max_rows=241)
+        _stage_event(conn, set_id=set_id, generation=gen,
+                     rows=_bars(start, 1), max_rows=241)
     assert not conn.in_transaction and _rows_of(conn, set_id) == 10
 
 
@@ -387,8 +394,8 @@ def test_an_out_of_range_first_batch_leaves_the_set_awaiting(tmp_path):
     set_id = _event_set(conn, _event(conn))
     gen = os_.new_generation(conn, now=NOW)
     with pytest.raises(os_.InvalidSliceRow):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                             rows=_bars(TS + timedelta(hours=4), 1))
+        _stage_event(conn, set_id=set_id, generation=gen,
+                     rows=_bars(TS + timedelta(hours=4), 1))
     assert os_.get_set(conn, set_id)["state"] == "awaiting"
 
 
@@ -402,8 +409,8 @@ def test_an_invalid_bar_in_a_batch_writes_nothing(tmp_path, change):
     rows[1] = replace(rows[1], **change)
     calls = []
     with pytest.raises(os_.InvalidSliceRow):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows,
-                             begin=lambda c: calls.append(c) or True)
+        _stage_event(conn, set_id=set_id, generation=gen, rows=rows,
+                     begin=lambda c: calls.append(c) or True)
     assert calls == [] and not conn.in_transaction
     assert os_.get_set(conn, set_id)["state"] == "awaiting"
     assert _rows_of(conn, set_id) == 0
@@ -420,16 +427,16 @@ def test_begin_hook_can_yield_and_must_open_a_transaction(tmp_path):
         calls.append(c)
         return False
 
-    out = os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows,
-                               begin=flag_up)
+    out = _stage_event(conn, set_id=set_id, generation=gen, rows=rows,
+                       begin=flag_up)
     assert out.status == "yielded" and calls == [conn]
     assert os_.get_set(conn, set_id)["state"] == "awaiting"
     with pytest.raises(RuntimeError, match="without opening"):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows,
-                             begin=lambda c: True)
+        _stage_event(conn, set_id=set_id, generation=gen, rows=rows,
+                     begin=lambda c: True)
     conn.execute("UPDATE missions SET model='x'")
     with pytest.raises(RuntimeError, match="open transaction"):
-        os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows)
+        _stage_event(conn, set_id=set_id, generation=gen, rows=rows)
     conn.rollback()
 
 
@@ -443,6 +450,7 @@ def test_busy_rolls_back_and_raises_without_waiting(tmp_path):
     try:
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             os_.stage_event_rows(worker, set_id=set_id, generation=gen,
+                                 assumed_spread_pips=1.0,
                                  rows=_bars(TS - timedelta(minutes=15), 2))
         assert not worker.in_transaction
     finally:
@@ -961,9 +969,9 @@ def test_checkpoint_runs_after_the_statements_and_before_commit(tmp_path):
     def checkpoint():
         seen.append((conn.in_transaction, _rows_of(conn, set_id)))
 
-    out = os_.stage_event_rows(conn, set_id=set_id, generation=gen,
-                               rows=_bars(TS - timedelta(minutes=15), 3),
-                               checkpoint=checkpoint)
+    out = _stage_event(conn, set_id=set_id, generation=gen,
+                       rows=_bars(TS - timedelta(minutes=15), 3),
+                       checkpoint=checkpoint)
     assert out.committed and seen == [(True, 3)]
 
 
@@ -980,8 +988,8 @@ def test_over_budget_rolls_back_every_worker_write(tmp_path):
         within()
 
     rows = _bars(TS - timedelta(minutes=15), 3)
-    out = os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows,
-                               checkpoint=late)
+    out = _stage_event(conn, set_id=set_id, generation=gen, rows=rows,
+                       checkpoint=late)
     assert out.status == "over_budget" and not out.committed
     assert not conn.in_transaction
     assert os_.get_set(conn, set_id)["state"] == "awaiting"
@@ -1059,3 +1067,119 @@ def test_a_newer_generation_staging_is_not_reclaimed(tmp_path):
     assert os_.stale_staging_sets(conn, current_generation=g1) == []
     assert [r["id"] for r in os_.stale_staging_sets(
         conn, current_generation=g2 + 1)] == [set_id]
+
+
+# --- spread の取り逃し・shadow の前提・範囲上限・多数 target ------------------
+
+def test_staging_an_unrecorded_spread_fixes_it_as_assumed(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    gen = os_.new_generation(conn, now=NOW)
+    rows = _bars(TS - timedelta(minutes=15), 255)
+    with pytest.raises(ValueError, match="assumed_spread_pips"):
+        os_.stage_event_rows(conn, set_id=set_id, generation=gen,
+                             rows=rows[:10], assumed_spread_pips=float("nan"))
+    assert os_.get_set(conn, set_id)["state"] == "awaiting"
+    assert os_.stage_event_rows(conn, set_id=set_id, generation=gen,
+                                rows=rows[:10], assumed_spread_pips=0.7).committed
+    row = os_.get_set(conn, set_id)
+    assert (row["state"], row["spread_pips"], row["spread_source"]) == (
+        "staging", 0.7, "assumed")
+    assert os_.spread_candidates(conn, now=NOW) == []
+    assert not os_.record_event_spread(conn, set_id, spread_pips=1.1,
+                                       spread_source="quote")
+    os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows[10:20],
+                         assumed_spread_pips=9.9)
+    assert os_.get_set(conn, set_id)["spread_pips"] == 0.7
+
+
+def test_a_recorded_quote_spread_survives_staging(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    assert os_.record_event_spread(conn, set_id, spread_pips=1.4,
+                                   spread_source="quote")
+    gen = os_.new_generation(conn, now=NOW)
+    os_.stage_event_rows(conn, set_id=set_id, generation=gen,
+                         rows=_bars(TS - timedelta(minutes=15), 3),
+                         assumed_spread_pips=0.7)
+    row = os_.get_set(conn, set_id)
+    assert (row["spread_pips"], row["spread_source"]) == (1.4, "quote")
+
+
+def _stage_shadow(conn, shadow_id, gen, *, pair="USDJPY"):
+    return os_.stage_shadow_rows(conn, shadow_id=shadow_id, pair=pair,
+                                 range_start=NOW,
+                                 range_end=NOW + timedelta(minutes=5),
+                                 generation=gen, rows=[], now=NOW)
+
+
+def _set_count(conn):
+    return conn.execute("SELECT COUNT(*) FROM ohlcv_slice_sets").fetchone()[0]
+
+
+def test_shadow_staging_needs_a_live_shadow_of_the_same_pair(tmp_path):
+    conn = _conn(tmp_path)
+    gen = os_.new_generation(conn, now=NOW)
+    with pytest.raises(ValueError, match="no such shadow"):
+        _stage_shadow(conn, 999, gen)
+    shadow_id = _shadow(conn)
+    with pytest.raises(ValueError, match="pair"):
+        _stage_shadow(conn, shadow_id, gen, pair="EURUSD")
+    assert _set_count(conn) == 0 and not conn.in_transaction
+    ended = _shadow(conn, n=2)
+    cas = ShadowCas(ended, "pending_entry", ss.get(conn, ended)["updated_at"],
+                    ss.ShadowOutcome.no_fill())
+    assert ss.transition(conn, ended, expected_state=cas.expected_state,
+                         expected_updated_at=cas.expected_updated_at,
+                         outcome=cas.outcome, now=NOW)
+    before = _set_count(conn)
+    assert _stage_shadow(conn, ended, gen).status == "conflict"
+    assert _set_count(conn) == before
+
+
+def test_unrecoverable_shadow_range_has_the_same_cap_as_staging(tmp_path):
+    conn = _conn(tmp_path)
+
+    def cas(n):
+        sid = _shadow(conn, n=n)
+        return ShadowCas(sid, "pending_entry", ss.get(conn, sid)["updated_at"],
+                         ss.ShadowOutcome.data_insufficient())
+
+    assert os_.mark_shadow_unrecoverable(
+        conn, shadow=cas(0), pair="USDJPY", range_start=NOW,
+        range_end=NOW + timedelta(minutes=1680), now=NOW).committed
+    before = _set_count(conn)
+    with pytest.raises(ValueError, match="at most 1680"):
+        os_.mark_shadow_unrecoverable(
+            conn, shadow=cas(1), pair="USDJPY", range_start=NOW,
+            range_end=NOW + timedelta(minutes=1681), now=NOW)
+    assert _set_count(conn) == before and not conn.in_transaction
+
+
+def test_sync_handles_more_targets_than_the_variable_limit(tmp_path):
+    conn = _conn(tmp_path)
+    conn.executemany(
+        "INSERT INTO econ_events (ts,country,name,importance) VALUES (?,?,?,?)",
+        [((TS + timedelta(minutes=i)).isoformat(), "All", f"E{i}", 3)
+         for i in range(1200)])
+    conn.commit()
+    conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+    ids = [r[0] for r in conn.execute("SELECT id FROM econ_events ORDER BY id")]
+    targets = os_.event_set_targets(conn, importance_min=3,
+                                    pair_currencies=PAIRS, event_ids=ids)
+    assert len(targets) == 2400
+    assert [t[0] for t in targets] == sorted(t[0] for t in targets)
+    first = os_.sync_event_sets(conn, targets=targets, scope_event_ids=ids,
+                                now=NOW)
+    assert len(first.created) == 2400
+    again = os_.sync_event_sets(conn, targets=targets, scope_event_ids=ids,
+                                now=NOW)
+    assert (again.created, again.cancelled) == ((), ())
+    kept = targets[:1000]
+    cut = os_.sync_event_sets(conn, targets=kept, scope_event_ids=ids, now=NOW)
+    assert len(cut.cancelled) == 1400
+
+
+def test_module_has_no_alias_of_imported_names():
+    assert not hasattr(os_, "_Conflict") and not hasattr(os_, "_short_tx")
+    assert not hasattr(os_, "_ceil")
