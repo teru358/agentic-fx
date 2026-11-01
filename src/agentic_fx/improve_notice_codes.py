@@ -183,6 +183,44 @@ INDICATOR_PAYLOAD_WARNING_CODES = (
     INDICATOR_GATE_WARNING_CODES | INDICATOR_GATE_MODE_CODES
     | frozenset({"symbol_in_name", "param_price_unit", "duplicate_at_approve"}))
 
+# 承認詳細に出す警告文。語 -> 1 行の固定文で、表示の 4 面 (CLI / 対話シェル / ops
+# client / web) が同じ表を読む。web は別 package なので同じ表を写して持ち、test が
+# 突き合わせる。数値 (相関値・出力値) は文に入れない。
+INDICATOR_WARNING_TEXT = {
+    "scale_dependent":
+        "警告: 価格または出来高のスケールに依存する出力 (別銘柄で挙動が変わる可能性)",
+    "indicator_similar": "警告: 配備済みの指標と類似した出力があります",
+    "indicator_monotone_duplicate":
+        "警告: 配備済みの指標の単調変換にあたる出力があります (同じ情報の言い換えの可能性)",
+    "indicator_output_overlap": "警告: 配備済みの指標と一部の出力が重複しています",
+    "sparse_output": "警告: 有限値が少ない出力があります (契約 run で 30 本未満)",
+    "output_constant_suspect":
+        "警告: 定数に見える出力があります (契約 run と解析 run の片方で値が変わりません)",
+    "legacy_symbol_name":
+        "警告: 銘柄名を含む配備済み指標の同名更新です (名前は遡って改めていません)",
+    "indicator_redefined": "警告: 同名の配備済み指標から出力の意味が変わっています",
+    "duplicate_unavailable":
+        "警告: 配備済みの一部と比較できませんでした (その指標は比較から外れています)",
+    "duplicate_at_approve": "警告: 提出後に配備された指標と同じ式になっています",
+    "symbol_in_name": "警告: 名前または設定に銘柄名を含みます (人の提出なので警告で通りました)",
+    "param_price_unit": "警告: params に価格の単位を持つ項目があります (人の提出なので警告で通りました)",
+}
+# similar_to の kind -> 相手との関係の言い方。行は
+# 「警告: 配備済み `<name>` <関係>」(承認待ちの候補が相手なら「警告: 承認待ち #<id> <関係>」)。
+INDICATOR_RELATION_TEXT = {
+    "duplicate": "と同等",
+    "monotone": "の単調変換",
+    "overlap": "と一部重複",
+    "similar": "と類似",
+}
+INDICATOR_DEPLOYED_PARTNER_TEXT = "警告: 配備済み `{name}` {relation}"
+INDICATOR_PENDING_PARTNER_TEXT = "警告: 承認待ち #{id} {relation}"
+INDICATOR_COLUMN_TEXT = " (列: {columns})"
+# 承認依頼 payload の gate_warnings / similar_to / scale_columns の上限。
+INDICATOR_MAX_WARNINGS = 8
+INDICATOR_MAX_SIMILAR = 3
+INDICATOR_MAX_SCALE_COLUMNS = 8
+
 _QUALITY_NOTICES = {
     "duplicate_logic": NOTICE_DUPLICATE_LOGIC,
     "duplicate_metrics": NOTICE_DUPLICATE_METRICS,

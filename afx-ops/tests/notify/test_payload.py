@@ -81,3 +81,33 @@ def test_decided_by_is_checked_when_present_but_never_sent():
 def test_invalid_or_extra_event_content_fails_closed(event):
     with pytest.raises(PayloadError):
         encode_event(event)
+
+
+GATE_KEYS = ("gate_warnings", "similar_to", "scale_columns")
+
+
+def test_no_event_code_may_carry_an_indicator_gate_field():
+    from afx_ops.notify.payload import ALLOWED_FIELDS
+    for code, fields in ALLOWED_FIELDS.items():
+        assert not set(GATE_KEYS) & set(fields), code
+
+
+@pytest.mark.parametrize("key", GATE_KEYS)
+@pytest.mark.parametrize("code", sorted(EVENTS))
+def test_an_event_carrying_a_gate_field_is_refused_not_forwarded(code, key):
+    ref, fields = EVENTS[code]
+    event = {"id": 9, "ts": "2026-10-11T00:00:00+00:00", "code": code, "ref": ref,
+             "fields": {**fields, key: ["scale_dependent"]}}
+    with pytest.raises(PayloadError):
+        encode_event(event)
+
+
+@pytest.mark.parametrize("key", GATE_KEYS)
+def test_a_submitted_improve_notice_with_a_gate_field_is_refused(key):
+    event = {"id": 9, "ts": "2026-10-11T00:00:00+00:00", "code": "improve_run_changed",
+             "ref": "improve:5",
+             "fields": {"state": "finished", "trigger": "scheduled",
+                        "result_code": "submitted", "reason_code": None,
+                        "tool_calls": 3, key: ["scale_dependent"]}}
+    with pytest.raises(PayloadError):
+        encode_event(event)

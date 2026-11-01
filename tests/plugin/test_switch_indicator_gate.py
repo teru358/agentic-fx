@@ -283,9 +283,11 @@ def test_the_payload_fields_have_one_shape_for_every_entry_point(env):
     env.install({"cand": fakes.absolute_threshold})
     *_, outcome = env.gate("cand", floor_mode="warn")
     assert set(indicator_pipeline.payload_fields(outcome.indicator_report)) == {
-        "gate_warnings", "similar_to", "fixture_data_hash", "fixture_timeframe"}
+        "gate_warnings", "similar_to", "scale_columns", "fixture_data_hash",
+        "fixture_timeframe"}
     assert switch._indicator_payload_fields(outcome)["gate_warnings"] == [
         "scale_dependent"]
+    assert switch._indicator_payload_fields(outcome)["scale_columns"] == ["value"]
 
 
 def test_payload_warnings_are_closed_vocabulary_deduplicated_and_capped():

@@ -846,6 +846,7 @@ def format_approval_detail(data: dict) -> str:
     lines += Commands._metrics_lines("holdout", data.get("holdout"))
     lines += Commands._baseline_comparison_lines(data.get("baseline"),
                                                  data.get("baseline_hash_warning"))
+    lines += approval_facts.gate_lines(data)
     lines += format_change_lines(data.get("change"))
     facts = data.get("facts_lines")
     if isinstance(facts, list):

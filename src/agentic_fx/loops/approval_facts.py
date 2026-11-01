@@ -4,7 +4,8 @@
 受理・計測・状態遷移として記録した構造化値だけを `parent_facts` に組む。agent の
 自由文は `agent_claims` にだけ置く。表示側 (`render_facts_lines` ほか) は保存形式が
 壊れていても例外にせず、読めない欄だけを不正形式表示にする。表示する全文字列は
-`display_text` 1 本を通る。このモジュールは標準ライブラリだけに依存する。
+`display_text` 1 本を通る。このモジュールは標準ライブラリと、同じく標準ライブラリだけに
+依存する `improve_notice_codes` にだけ依存する。
 """
 from __future__ import annotations
 
@@ -12,6 +13,9 @@ import math
 import re
 import sqlite3
 import unicodedata
+from typing import Any
+
+from agentic_fx import improve_notice_codes as _notices
 
 FACTS_VERSION = 1
 
@@ -384,3 +388,82 @@ def render_facts_lines(payload: dict) -> list[str]:
                   for key in ("selection_rationale", "summary")
                   if key in payload}
     return lines + _claims_lines(claims)
+
+
+# --- indicator gate の警告 (承認詳細の 4 面が同じ行を読む) ---------------------------
+
+GATE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+GATE_PENDING_PATTERN = re.compile(r"pending-([0-9]{1,12})\Z")
+GATE_COLUMN_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
+_GATE_ROW_KEYS = frozenset({"name", "column", "kind"})
+
+
+def _gate_warnings_of(value: Any) -> list[str] | None:
+    if (type(value) is not list or len(value) > _notices.INDICATOR_MAX_WARNINGS
+            or len(set(map(str, value))) != len(value)):
+        return None
+    if not all(type(w) is str and w in _notices.INDICATOR_WARNING_TEXT for w in value):
+        return None
+    return list(value)
+
+
+def _gate_row_ok(row: Any) -> bool:
+    if type(row) is not dict or set(row) != _GATE_ROW_KEYS:
+        return False
+    name, column, kind = row["name"], row["column"], row["kind"]
+    return (type(name) is str and type(column) is str and type(kind) is str
+            and kind in _notices.INDICATOR_RELATION_TEXT
+            and GATE_COLUMN_PATTERN.match(column) is not None
+            and (GATE_NAME_PATTERN.match(name) is not None
+                 or GATE_PENDING_PATTERN.match(name) is not None))
+
+
+def _gate_similar_of(value: Any) -> list[dict[str, str]] | None:
+    if (type(value) is not list or len(value) > _notices.INDICATOR_MAX_SIMILAR
+            or not all(_gate_row_ok(row) for row in value)):
+        return None
+    return [dict(row) for row in value]
+
+
+def _gate_columns_of(value: Any) -> list[str] | None:
+    if (type(value) is not list or len(value) > _notices.INDICATOR_MAX_SCALE_COLUMNS
+            or len(set(map(str, value))) != len(value)
+            or not all(type(c) is str and GATE_COLUMN_PATTERN.match(c) for c in value)):
+        return None
+    return list(value)
+
+
+def gate_fields(source: Any) -> dict[str, Any]:
+    """承認依頼 payload (または ops DTO) の `gate_warnings` / `similar_to` /
+    `scale_columns` のうち、約束の形を満たすものだけ。満たさない欄は `None`
+    (節ごと出さない)。数値や未知の key を持つ行は満たさない扱いで、その欄ごと落ちる。
+    例外にしない。"""
+    if type(source) is not dict:
+        source = {}
+    return {"gate_warnings": _gate_warnings_of(source.get("gate_warnings")),
+            "similar_to": _gate_similar_of(source.get("similar_to")),
+            "scale_columns": _gate_columns_of(source.get("scale_columns"))}
+
+
+def gate_lines(source: Any) -> list[str]:
+    """承認詳細の警告行。語ごとの固定文、続けて `similar_to` の行ごとに相手と関係。
+    数値 (相関値・出力値) は出さない。CLI / 対話シェル / ops client が呼ぶ。"""
+    fields = gate_fields(source)
+    lines: list[str] = []
+    columns = fields["scale_columns"]
+    for word in fields["gate_warnings"] or ():
+        text = _notices.INDICATOR_WARNING_TEXT[word]
+        if word == "scale_dependent" and columns:
+            text += _notices.INDICATOR_COLUMN_TEXT.format(columns=", ".join(columns))
+        lines.append(text)
+    for row in fields["similar_to"] or ():
+        relation = _notices.INDICATOR_RELATION_TEXT[row["kind"]]
+        pending = GATE_PENDING_PATTERN.match(row["name"])
+        if pending:
+            text = _notices.INDICATOR_PENDING_PARTNER_TEXT.format(
+                id=int(pending.group(1)), relation=relation)
+        else:
+            text = _notices.INDICATOR_DEPLOYED_PARTNER_TEXT.format(
+                name=row["name"], relation=relation)
+        lines.append(text + _notices.INDICATOR_COLUMN_TEXT.format(columns=row["column"]))
+    return lines

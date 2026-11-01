@@ -33,8 +33,9 @@ if TYPE_CHECKING:
     from agentic_fx.plugin.loader import PluginMeta
 
 Lane = Literal["loop", "submit", "bless"]
-MAX_WARNINGS = 8
-MAX_SIMILAR = 3
+MAX_WARNINGS = notices.INDICATOR_MAX_WARNINGS
+MAX_SIMILAR = notices.INDICATOR_MAX_SIMILAR
+MAX_SCALE_COLUMNS = notices.INDICATOR_MAX_SCALE_COLUMNS
 DUPLICATE_UNAVAILABLE = "duplicate_unavailable"
 DUPLICATE_AT_APPROVE = "duplicate_at_approve"
 SCALE_DEPENDENT = "scale_dependent"
@@ -57,6 +58,8 @@ class IndicatorReport:
     code: str = ""
     warnings: tuple[str, ...] = ()
     similar_to: tuple[dict[str, str], ...] = ()
+    # output columns whose value depends on the price or volume scale (sorted)
+    scale_columns: tuple[str, ...] = ()
     detail: str = ""
     built: int = 0
     gc_removed: int = 0
@@ -82,6 +85,7 @@ def payload_fields(report: IndicatorReport) -> dict[str, Any]:
     return {
         "gate_warnings": list(_clean_warnings(report.warnings)),
         "similar_to": [dict(row) for row in report.similar_to[:MAX_SIMILAR]],
+        "scale_columns": sorted(report.scale_columns)[:MAX_SCALE_COLUMNS],
         "fixture_data_hash": report.fixture_data_hash,
         "fixture_timeframe": report.fixture_timeframe,
     }
@@ -342,7 +346,9 @@ def run_fixture_stage(
         counter[0] += int(written)
     except (cache.IndicatorCacheError, OSError, ValueError, KeyError) as exc:
         raise IndicatorGateUnavailable("fixture_cache_unavailable") from exc
-    if any("neither" in cls for cls in entry.classifications.values()):
+    scale_columns = tuple(sorted(
+        col for col, cls in entry.classifications.items() if "neither" in cls))
+    if scale_columns:
         warnings.append(SCALE_DEPENDENT)
 
     def build_for(other: "PluginMeta") -> cache.CacheEntry:
@@ -393,6 +399,7 @@ def run_fixture_stage(
         gc_removed, gc_skipped = 0, 1
     common = dict(built=counter[0], gc_removed=gc_removed, gc_skipped=gc_skipped,
                   similar_to=tuple(result.similar_to[:MAX_SIMILAR]),
+                  scale_columns=scale_columns,
                   unavailable=tuple(unavailable), **base)
     if not result.ok:
         return IndicatorReport(

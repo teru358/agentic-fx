@@ -842,6 +842,7 @@ class OpsService:
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
                 "baseline": payload.get("baseline"),
+                **approval_facts.gate_fields(payload),
                 "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root,
                                                               row["status"]),
                 "payload_sha256": payload_sha256(row["payload_json"]),

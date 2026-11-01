@@ -61,11 +61,13 @@ def test_payload_fields_have_exactly_the_documented_keys_and_copy_rows():
     rows = tuple(_row(f"n{i}", "similar") for i in range(5))
     report = pipeline.IndicatorReport(
         warnings=("bogus", "scale_dependent"), similar_to=rows,
+        scale_columns=("gap",),
         fixture_data_hash="h" * 64, fixture_timeframe="1h")
     fields = pipeline.payload_fields(report)
     assert fields == {
         "gate_warnings": ["scale_dependent"],
         "similar_to": [dict(r) for r in rows[:3]],
+        "scale_columns": ["gap"],
         "fixture_data_hash": "h" * 64, "fixture_timeframe": "1h"}
     assert fields["similar_to"][0] is not rows[0]
 
@@ -830,3 +832,24 @@ def test_rejudge_skips_a_payload_of_another_fixture_generation(tmp_path, monkeyp
     monkeypatch.setattr(pipeline.cache, "get_or_build", spy)
     assert _rejudge(tmp_path, payload, deployed, mode="enforce") is None
     assert built == []
+
+
+# --- scale_dependent の列名 ---------------------------------------------------------
+
+def test_scale_columns_name_only_the_columns_that_depend_on_the_scale(tmp_path, monkeypatch):
+    report = stage(tmp_path, monkeypatch, {"cand": fakes.absolute_threshold})
+    assert "scale_dependent" in report.warnings
+    assert report.scale_columns == ("value",)
+
+
+def test_a_candidate_without_scale_dependence_has_no_scale_columns(tmp_path, monkeypatch):
+    report = stage(tmp_path, monkeypatch, {"cand": fakes.ratio})
+    assert "scale_dependent" not in report.warnings
+    assert report.scale_columns == ()
+
+
+def test_scale_columns_are_capped_sorted_and_kept_off_the_payload_when_empty():
+    many = tuple(f"c{i:02d}" for i in range(12))[::-1]
+    report = pipeline.IndicatorReport(warnings=("scale_dependent",), scale_columns=many)
+    assert pipeline.payload_fields(report)["scale_columns"] == sorted(many)[:8]
+    assert pipeline.payload_fields(pipeline.IndicatorReport())["scale_columns"] == []

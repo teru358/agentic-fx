@@ -222,6 +222,105 @@ def _baseline_section(data: Mapping[str, object]) -> str:
     return "<section><h2>配備中の版 (同条件で再評価)</h2>" + "".join(rows) + "</section>"
 
 
+# indicator gate の警告。語・文・上限・名前の形は daemon の定義 (agentic_fx/improve_notice_codes.py と
+# loops/approval_facts.py) の写しで、別 package なので写して持ち、本体側の test が突き合わせる。
+# 数値は一切扱わない。
+GATE_WARNING_TEXT = {
+    "scale_dependent":
+        "警告: 価格または出来高のスケールに依存する出力 (別銘柄で挙動が変わる可能性)",
+    "indicator_similar": "警告: 配備済みの指標と類似した出力があります",
+    "indicator_monotone_duplicate":
+        "警告: 配備済みの指標の単調変換にあたる出力があります (同じ情報の言い換えの可能性)",
+    "indicator_output_overlap": "警告: 配備済みの指標と一部の出力が重複しています",
+    "sparse_output": "警告: 有限値が少ない出力があります (契約 run で 30 本未満)",
+    "output_constant_suspect":
+        "警告: 定数に見える出力があります (契約 run と解析 run の片方で値が変わりません)",
+    "legacy_symbol_name":
+        "警告: 銘柄名を含む配備済み指標の同名更新です (名前は遡って改めていません)",
+    "indicator_redefined": "警告: 同名の配備済み指標から出力の意味が変わっています",
+    "duplicate_unavailable":
+        "警告: 配備済みの一部と比較できませんでした (その指標は比較から外れています)",
+    "duplicate_at_approve": "警告: 提出後に配備された指標と同じ式になっています",
+    "symbol_in_name": "警告: 名前または設定に銘柄名を含みます (人の提出なので警告で通りました)",
+    "param_price_unit": "警告: params に価格の単位を持つ項目があります (人の提出なので警告で通りました)",
+}
+GATE_RELATION_TEXT = {
+    "duplicate": "と同等",
+    "monotone": "の単調変換",
+    "overlap": "と一部重複",
+    "similar": "と類似",
+}
+GATE_DEPLOYED_PARTNER_TEXT = "警告: 配備済み `{name}` {relation}"
+GATE_PENDING_PARTNER_TEXT = "警告: 承認待ち #{id} {relation}"
+GATE_COLUMN_TEXT = " (列: {columns})"
+GATE_MAX_WARNINGS = 8
+GATE_MAX_SIMILAR = 3
+GATE_MAX_SCALE_COLUMNS = 8
+GATE_NAME_PATTERN = "[a-z][a-z0-9_]{0,63}\\Z"
+GATE_PENDING_PATTERN = "pending-([0-9]{1,12})\\Z"
+GATE_COLUMN_PATTERN = "[a-z][a-z0-9_]{0,31}\\Z"
+_GATE_NAME = re.compile(GATE_NAME_PATTERN)
+_GATE_PENDING = re.compile(GATE_PENDING_PATTERN)
+_GATE_COLUMN = re.compile(GATE_COLUMN_PATTERN)
+
+
+def _gate_warning_words(value: object) -> list[str]:
+    if (type(value) is not list or len(value) > GATE_MAX_WARNINGS
+            or len(set(map(str, value))) != len(value)
+            or not all(type(w) is str and w in GATE_WARNING_TEXT for w in value)):
+        return []
+    return list(value)
+
+
+def _gate_scale_columns(value: object) -> list[str]:
+    if (type(value) is not list or len(value) > GATE_MAX_SCALE_COLUMNS
+            or len(set(map(str, value))) != len(value)
+            or not all(type(c) is str and _GATE_COLUMN.match(c) for c in value)):
+        return []
+    return list(value)
+
+
+def _gate_row_text(row: object) -> str | None:
+    if type(row) is not dict or set(row) != {"name", "column", "kind"}:
+        return None
+    name, column, kind = row["name"], row["column"], row["kind"]
+    if not (type(name) is str and type(column) is str and type(kind) is str
+            and kind in GATE_RELATION_TEXT and _GATE_COLUMN.match(column)):
+        return None
+    relation = GATE_RELATION_TEXT[kind]
+    pending = _GATE_PENDING.match(name)
+    if pending:
+        text = GATE_PENDING_PARTNER_TEXT.format(id=int(pending.group(1)), relation=relation)
+    elif _GATE_NAME.match(name):
+        text = GATE_DEPLOYED_PARTNER_TEXT.format(name=name, relation=relation)
+    else:
+        return None
+    return text + GATE_COLUMN_TEXT.format(columns=column)
+
+
+def _gate_similar_texts(value: object) -> list[str]:
+    if type(value) is not list or len(value) > GATE_MAX_SIMILAR:
+        return []
+    texts = [_gate_row_text(row) for row in value]
+    return [t for t in texts if t is not None] if None not in texts else []
+
+
+def _gate_section(data: Mapping[str, object]) -> str:
+    columns = _gate_scale_columns(data.get("scale_columns"))
+    items = []
+    for word in _gate_warning_words(data.get("gate_warnings")):
+        text = GATE_WARNING_TEXT[word]
+        if word == "scale_dependent" and columns:
+            text += GATE_COLUMN_TEXT.format(columns=", ".join(columns))
+        items.append(text)
+    items += _gate_similar_texts(data.get("similar_to"))
+    if not items:
+        return ""
+    return ("<section><h2>indicator gate の警告</h2><ul>"
+            + "".join("<li>" + html.escape(text, quote=True) + "</li>" for text in items)
+            + "</ul></section>")
+
+
 def render_approval(data: Mapping[str, object], change_data: Mapping[str, object] | None = None) -> bytes:
     """承認 #N。``change_data`` は daemon の変更内容 endpoint の応答 (取れなければ None)。"""
     change = data.get("change") if type(data.get("change")) is dict else None
@@ -230,15 +329,15 @@ def render_approval(data: Mapping[str, object], change_data: Mapping[str, object
     if change is None:
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
                 + "<section><h2>変更内容</h2><p>" + REASON_TEXT["unavailable"] + "</p></section>"
-                + _baseline_section(data))
+                + _baseline_section(data) + _gate_section(data))
         return _page("Approval", body)
     if not _change_is_well_formed(change):
         body = (_pairs(data, DETAIL_FIELDS, nested_allowed=NESTED_FIELDS)
                 + "<section><h2>変更内容</h2><p>" + INVALID_CHANGE_TEXT + "</p></section>"
-                + _baseline_section(data))
+                + _baseline_section(data) + _gate_section(data))
         return _page("Approval", body)
     return compose_approval_page(data, change, change_data if type(change_data) is dict else None,
-                                 extra_html=_baseline_section(data)).page
+                                 extra_html=_baseline_section(data) + _gate_section(data)).page
 
 
 # ---------------------------------------------------------------- 承認の変更内容
