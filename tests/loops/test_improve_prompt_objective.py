@@ -232,3 +232,43 @@ def test_prompt_has_no_forbidden_comparison_words(tmp_path, mode):
 def test_shadow_prompt_is_byte_identical_to_off(tmp_path):
     assert _render(tmp_path, _settings(), mode="shadow") \
         == _render(tmp_path, _settings(), mode="off")
+
+
+def _prompt_indicators_block(rendered):
+    import re
+    import textwrap
+    import yaml
+    m = re.search(r"```yaml\n(\s*indicators:\n.*?)```", rendered, re.S)
+    assert m, "indicators example block missing"
+    return yaml.safe_load(textwrap.dedent(m.group(1)))
+
+
+def test_prompt_indicators_example_parses_through_the_loader(tmp_path):
+    import yaml
+    from agentic_fx.plugin import loader
+    rendered = _render(tmp_path, _settings())
+    block = _prompt_indicators_block(rendered)
+    assert any(r.get("plugin") == "ohlcv" for r in block["indicators"].values())
+    d = tmp_path / "cand"
+    d.mkdir()
+    (d / "plugin.py").write_text(
+        "def evaluate(df, indicators, signals, params):\n"
+        "    return {'action': 'hold', 'rationale': 'x'}\n")
+    (d / "test_plugin.py").write_text("def test_x():\n    pass\n")
+    cfg = {"kind": "strategy", "timeframe": "1h", "pairs": ["USDJPY"],
+           "exit_mode": "levels", "max_bars": 200, **block}
+    (d / "config.yaml").write_text(yaml.safe_dump(cfg))
+    meta, reason = loader.discover_one_with_reason(d, "cand")
+    assert reason is None, reason
+    refs = {r.alias: r for r in meta.indicators}
+    assert all(r.symbol != "self" and r.timeframe == "1h" for r in refs.values())
+
+
+def test_prompt_lists_every_analyze_corr_kind_with_exact_keys(tmp_path):
+    from agentic_fx.backtest.analysis import _REQUEST_SCHEMA
+    rendered = _render(tmp_path, _settings())
+    for kind, keys in _REQUEST_SCHEMA.items():
+        line = next(ln for ln in rendered.splitlines()
+                    if f'"kind": "{kind}"' in ln)
+        for k in keys:
+            assert f'"{k}"' in line
