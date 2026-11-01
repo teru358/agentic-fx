@@ -1,16 +1,16 @@
 ---
 id: improve-prompt-ohlcv-example-leadlag-field-and-order
 title: improve prompt の ohlcv 例・lead_lag の trial_count・lock 後の順序
-status: 設計待ち
+status: 是正済
 priority: 中
 kind: 不具合
 opened: 2026-11-01
-closed: null
+closed: 2026-11-01
 related: []
 ---
 # [improve-prompt-ohlcv-example-leadlag-field-and-order] improve prompt の ohlcv 例・lead_lag の trial_count・lock 後の順序
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 中 / **種別**: 不具合
 
 ## 現象
 
@@ -22,6 +22,9 @@ related: []
 
 ## 修正内容
 
+- 2026-11-01: prompt 7 項の例から plugin: ohlcv を外し「配備済みの通過 indicator (outputs が OHLCV) を symbol: 付きで宣言」に、lock 後の順序を run_backtest → run_plugin_tests に、2 系列同時入力の indicator は未対応と明記。lead_lag の agent 応答は trial_count を外し lags_tested (25) と n_obs (ピーク lag の整列観測数) を返す。loops / tools / backtest 2977 緑
+
 ## 経緯
 
 - 2026-11-01: 起票。
+- 2026-11-01: 是正内容 — prompt 7 項の例から plugin: ohlcv を外し「配備済みの通過 indicator (outputs が OHLCV) を symbol: 付きで宣言」に、lock 後の順序を run_backtest → run_plugin_tests に、2 系列同時入力の indicator は未対応と明記。lead_lag の agent 応答は trial_count を外し lags_tested (25) と n_obs (ピーク lag の整列観測数) を返す。loops / tools / backtest 2977 緑
