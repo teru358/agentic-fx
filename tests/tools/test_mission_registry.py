@@ -543,3 +543,26 @@ def test_improve_registry_has_no_tool_or_path_that_reads_the_human_logs(tmp_path
     for out in outputs:
         assert marker not in out
         assert "59.97" not in out
+
+
+def test_build_mission_registry_wires_the_pair_view_into_the_calendar(tmp_path):
+    from unittest.mock import patch
+
+    from agentic_fx.core.econ_window import WindowSettings
+    conn = connect(tmp_path / "x.db")
+    init_db(conn)
+    rag = Rag(tmp_path / "rag", embedding_function=FakeEmbedding())
+    activity = ActivityLog(tmp_path / "logs" / "activity.log")
+    seen = {}
+    from agentic_fx.datafeed.econ_calendar import EconCalendar as Real
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return Real(*a, **kw)
+
+    with patch("agentic_fx.tools.mission_registry.EconCalendar", side_effect=spy):
+        build_mission_registry("trade", conn, SETTINGS, _clock(), rag,
+                               activity=activity)
+    assert list(seen["pair_currencies"]) == list(SETTINGS.pairs)
+    assert all(len(v) == 2 for v in seen["pair_currencies"].values())
+    assert seen["window"] == WindowSettings.from_config(SETTINGS.econ.window)

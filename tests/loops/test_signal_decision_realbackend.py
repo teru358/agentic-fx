@@ -86,6 +86,7 @@ def test_signal_decision_claude_accept_and_opposite_position_reject(tmp_path):
     reject = parse_decision(results["reject"])
     assert isinstance(reject, Reject)
     assert verify_opposite_position(
-        Reject(reject.code, pair="USDJPY", direction="long"),
+        reject,
         [{"pair": "USDJPY", "direction": "short", "status": "open"}],
+        pair="USDJPY", direction="long",
     )

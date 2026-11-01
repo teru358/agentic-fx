@@ -34,6 +34,7 @@ from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
+from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
 from agentic_fx.core.notifier import Notifier
@@ -1370,8 +1371,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 max_skew_min=settings.datafeed.conversion_skew_max_min,
                 deadline_check=deadline_check)
 
-        econ = EconCalendar(conn_core, activity, clock,
-                            timeout_sec=settings.worker.data_hook_timeout_sec)
+        econ = EconCalendar(
+            conn_core, activity, clock,
+            timeout_sec=settings.worker.data_hook_timeout_sec,
+            window=WindowSettings.from_config(settings.econ.window),
+            # 注入された spec_fn ではなく定義表そのものを引く
+            pair_currencies=currencies_by_pair(
+                settings.pairs, lambda pair: PriceProvider.spec(provider, pair)))
         rag = Rag(root / "data" / "rag", embedding_function=embedding_fn,
                  lock_timeout_sec=settings.worker.rpc_timeout_sec)
         collector = NewsCollector(conn_core, rag, activity, clock,

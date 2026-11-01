@@ -58,7 +58,9 @@ def upsert(conn: sqlite3.Connection, *, ts: datetime, country: str, name: str,
 def upcoming(conn: sqlite3.Connection, now: datetime, hours: int) -> list[dict]:
     end = now + timedelta(hours=hours)
     return [dict(r) for r in conn.execute(
-        "SELECT * FROM econ_events WHERE ts >= ? AND ts <= ? ORDER BY ts",
+        "SELECT id, ts, country, name, importance, actual, forecast, previous "
+        "FROM econ_events WHERE superseded_by IS NULL AND ts >= ? AND ts <= ? "
+        "ORDER BY ts",
         (now.isoformat(), end.isoformat()))]
 
 
@@ -197,12 +199,15 @@ def bar_components(conn: sqlite3.Connection, bar_open: datetime,
 
 def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                     fetched_keys: Collection[tuple[datetime, str, str]],
-                    now: datetime) -> list[tuple[int, int]]:
+                    now: datetime,
+                    current_ids: Iterable[int] | None = None,
+                    ) -> list[tuple[int, int]]:
     """今回の取得で新しく入った row が置き換えた旧 row に `superseded_by` を書く。
 
     commit しない。置き換える側は `new_ids` のうち `fetched_keys` に載っていて
-    superseded でない row だけ (古い保留の row が現在の取得結果から消えていても
-    何も置換しない)。置換されるのは次をすべて満たす旧 row だけ:
+    superseded でない row だけ。ただし `current_ids` を渡したときは、それに
+    含まれない (以前の保留に残るだけで取得結果から消えた) superseded でない
+    row も、連鎖の途中として置き換える側になれる。置換されるのは次をすべて満たす旧 row だけ:
     新 row と同じ `(country, name)`、`superseded_by IS NULL`、`ts > now`
     (未発表)、新 row との時刻差が `SUPERSEDE_RANGE` 以内、
     `(ts, country, name)` が今回の取得結果 `fetched_keys` に無い。
@@ -212,6 +217,11 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
     新 row は旧 row を 1 行だけ、旧 row は新 row 1 行にだけ結ばれる。割当ては
     時刻差の小さい順 (同差は旧 row id、新 row id の小さい順)。戻り値は
     `(旧 row id, 新 row id)`。削除はしない。
+
+    `current_ids` は今回の refresh の新規 row の id (省略時は `new_ids`)。
+    旧 row の候補から外すのはこれだけで、以前の保留に残る新規 row は
+    さらに時刻が動いたとき旧 row になれる (B から C への連鎖)。循環する
+    置換は結ばない。
     """
     now = _utc(now, "now")
     fetched = {(_utc(ts, "fetched ts"), country, name)
@@ -219,6 +229,7 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
     ids = set(new_ids)
     if not ids:
         return []
+    current = ids if current_ids is None else set(current_ids)
     news = []
     ordered = sorted(ids)
     for i in range(0, len(ordered), 500):
@@ -229,7 +240,8 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                 chunk):
             event = _parse(row)
             if (event is not None and event.superseded_by is None
-                    and (event.ts, event.country, event.name) in fetched):
+                    and ((event.ts, event.country, event.name) in fetched
+                         or event.id not in current)):
                 news.append(event)
     olds: dict[tuple[str, str], list[EconEvent]] = {}
     for country, name in sorted({(e.country, e.name) for e in news}):
@@ -238,21 +250,22 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                 "FROM econ_events WHERE country=? AND name=? "
                 "AND superseded_by IS NULL", (country, name)):
             event = _parse(row)
-            if (event is not None and event.id not in ids and event.ts > now
+            if (event is not None and event.id not in current and event.ts > now
                     and (event.ts, event.country, event.name) not in fetched):
                 olds.setdefault((country, name), []).append(event)
     pairs = []
     for new in news:
         for old in olds.get((new.country, new.name), ()):
             diff = abs(old.ts - new.ts)
-            if diff <= SUPERSEDE_RANGE:
+            if old.id != new.id and diff <= SUPERSEDE_RANGE:
                 pairs.append((diff, old.id, new.id))
     pairs.sort()
     used_old: set[int] = set()
     used_new: set[int] = set()
     done: list[tuple[int, int]] = []
     for _, old_id, new_id in pairs:
-        if old_id in used_old or new_id in used_new:
+        if (old_id in used_old or new_id in used_new
+                or _leads_to(conn, new_id, old_id)):
             continue
         cur = conn.execute(
             "UPDATE econ_events SET superseded_by=? "
@@ -262,6 +275,23 @@ def supersede_in_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
             used_new.add(new_id)
             done.append((old_id, new_id))
     return done
+
+
+def _leads_to(conn: sqlite3.Connection, start: int, target: int) -> bool:
+    """`superseded_by` を辿って `start` から `target` に着くか (循環の防止)。"""
+    seen = {start}
+    current = start
+    while True:
+        row = conn.execute("SELECT superseded_by FROM econ_events WHERE id=?",
+                           (current,)).fetchone()
+        if row is None or row[0] is None:
+            return False
+        current = row[0]
+        if current == target:
+            return True
+        if current in seen:
+            return False
+        seen.add(current)
 
 
 def supersede_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
@@ -279,18 +309,24 @@ def supersede_tx(conn: sqlite3.Connection, *, new_ids: Iterable[int],
 
 def save_pending_supersede(conn: sqlite3.Connection, *, new_ids: Iterable[int],
                            fetched_keys: Collection[tuple[datetime, str, str]],
-                           now: datetime) -> None:
+                           now: datetime) -> bool:
     """今回の refresh の新規 row と取得結果を保留に足す (commit する)。
 
-    未完の保留があれば new_ids は和集合、取得結果は今回のものに置き換える
-    (最新の feed が正本)。supersede が commit された tx で消える。
+    `new_ids` は今回の refresh でここまでに入った新規 row の全部。未完の保留
+    があれば保留側の id は和集合、取得結果と「今回の新規」は今回のものに
+    置き換える (最新の feed が正本)。新規が無く保留も無いときは何も書かず
+    False を返す。supersede が commit された tx で消える。
     """
-    ids = set(new_ids)
+    current = set(new_ids)
     old = load_pending_supersede(conn)
+    if not current and old is None:
+        return False
+    ids = set(current)
     if old is not None:
         ids |= old[0]
     value = json.dumps({
         "new_ids": sorted(ids),
+        "current": sorted(current),
         "fetched": sorted([_utc(ts, "fetched ts").isoformat(), country, name]
                           for ts, country, name in fetched_keys)})
     with conn:
@@ -299,12 +335,10 @@ def save_pending_supersede(conn: sqlite3.Connection, *, new_ids: Iterable[int],
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
             "updated_at=excluded.updated_at",
             (PENDING_SUPERSEDE_KEY, value, _utc(now, "now").isoformat()))
+    return True
 
 
-def load_pending_supersede(conn: sqlite3.Connection,
-                           ) -> tuple[set[int], list[tuple[datetime, str, str]]] | None:
-    """保留 `(new_ids, fetched_keys)`。無ければ None。壊れていれば警告して None
-    (壊れた保留で supersede が恒久的に止まらないよう、無いものとして扱う)。"""
+def _load_pending_full(conn: sqlite3.Connection):
     row = conn.execute("SELECT value FROM alert_state WHERE key=?",
                        (PENDING_SUPERSEDE_KEY,)).fetchone()
     if row is None:
@@ -312,6 +346,8 @@ def load_pending_supersede(conn: sqlite3.Connection,
     try:
         data = json.loads(row[0])
         ids = {int(i) for i in data["new_ids"]}
+        current = ({int(i) for i in data["current"]}
+                   if "current" in data else set(ids))
         keys = [(datetime.fromisoformat(ts), str(country), str(name))
                 for ts, country, name in data["fetched"]]
         for ts, _, _ in keys:
@@ -322,7 +358,15 @@ def load_pending_supersede(conn: sqlite3.Connection,
             conn.execute("DELETE FROM alert_state WHERE key=?",
                          (PENDING_SUPERSEDE_KEY,))
         return None
-    return ids, keys
+    return ids, keys, current
+
+
+def load_pending_supersede(conn: sqlite3.Connection,
+                           ) -> tuple[set[int], list[tuple[datetime, str, str]]] | None:
+    """保留 `(new_ids, fetched_keys)`。無ければ None。壊れていれば警告して None
+    (壊れた保留で supersede が恒久的に止まらないよう、無いものとして扱う)。"""
+    full = _load_pending_full(conn)
+    return None if full is None else (full[0], full[1])
 
 
 def supersede_pending_tx(conn: sqlite3.Connection, *, now: datetime,
@@ -332,13 +376,14 @@ def supersede_pending_tx(conn: sqlite3.Connection, *, now: datetime,
     保留が無ければ None。commit されなければ保留は残る。`value` は
     `(旧 row id, 新 row id)` の一覧。
     """
-    pending = load_pending_supersede(conn)
+    pending = _load_pending_full(conn)
     if pending is None:
         return None
-    ids, keys = pending
+    ids, keys, current = pending
 
     def body():
-        done = supersede_in_tx(conn, new_ids=ids, fetched_keys=keys, now=now)
+        done = supersede_in_tx(conn, new_ids=ids, fetched_keys=keys, now=now,
+                               current_ids=current)
         conn.execute("DELETE FROM alert_state WHERE key=?",
                      (PENDING_SUPERSEDE_KEY,))
         return {"value": done}

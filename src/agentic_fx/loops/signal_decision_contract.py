@@ -58,11 +58,9 @@ class Accept:
 
 @dataclass(frozen=True, slots=True)
 class Reject:
-    """A permitted LLM rejection and optional signal identity for order checking."""
+    """A permitted LLM rejection."""
 
     code: str
-    pair: str | None = None
-    direction: Direction | str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,17 +110,20 @@ def _value(value: object) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
-def verify_opposite_position(reject: Reject, orders_for_pair: object) -> bool:
+def verify_opposite_position(reject: Reject, orders_for_pair: object, *,
+                             pair: str | None, direction: Direction | str | None,
+                             ) -> bool:
     """Validate the only order-dependent reject code deterministically.
 
-    ``Reject`` must carry the claimed signal's pair and direction for
-    ``opposite_position``.  Any absent or malformed identity fails closed.
-    Other reject codes intentionally require no orders validation.
+    ``pair`` and ``direction`` are the claimed signal's identity, supplied by
+    the caller.  For ``opposite_position`` any absent or malformed identity
+    fails closed.  Other reject codes intentionally require no orders
+    validation.
     """
     if reject.code != "opposite_position":
         return reject.code == "news_shock"
-    signal_direction = _value(reject.direction)
-    if reject.pair is None or signal_direction not in {"long", "short"}:
+    signal_direction = _value(direction)
+    if pair is None or signal_direction not in {"long", "short"}:
         return False
     inverse = "short" if signal_direction == "long" else "long"
     active = {
@@ -135,7 +136,7 @@ def verify_opposite_position(reject: Reject, orders_for_pair: object) -> bool:
     except TypeError:
         return False
     return any(
-        _field(order, "pair") == reject.pair
+        _field(order, "pair") == pair
         and _value(_field(order, "direction")) == inverse
         and _value(_field(order, "status")) in active
         for order in iterator

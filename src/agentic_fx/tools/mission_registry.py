@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable
 
 from agentic_fx.activity import ActivityLog
 from agentic_fx.core.contracts import Clock
+from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.price_provider import PriceProvider
@@ -127,8 +128,13 @@ def build_mission_registry(
     if provider is None:
         provider = PriceProvider(conn, settings, clock, readonly=readonly,
                                  activity=activity)
-    econ = EconCalendar(conn, activity, clock,
-                        timeout_sec=settings.worker.data_hook_timeout_sec)
+    econ = EconCalendar(
+        conn, activity, clock,
+        timeout_sec=settings.worker.data_hook_timeout_sec,
+        window=WindowSettings.from_config(settings.econ.window),
+        # 注入された provider の spec ではなく定義表そのものを引く
+        pair_currencies=currencies_by_pair(
+            settings.pairs, lambda pair: PriceProvider.spec(provider, pair)))
     broker = PaperBroker(conn, settings, clock)
 
     registry = ToolRegistry(on_result=on_tool_result)

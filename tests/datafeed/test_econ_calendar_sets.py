@@ -237,7 +237,7 @@ def test_a_cancelled_set_with_slice_rows_is_deferred_not_reactivated(tmp_path):
 
 # --- 保存の途中失敗・pass の失敗 -------------------------------------------
 
-def test_a_failed_store_runs_no_pass_and_the_next_refresh_catches_up(tmp_path):
+def test_a_failed_store_still_runs_the_pass_for_stored_rows_and_catches_up(tmp_path):
     cal, _ = make(tmp_path)
     payload = [ff("A", "USD", T1), ff("B", "USD", T1 + timedelta(hours=1))]
     real = econ_events.upsert
@@ -251,8 +251,8 @@ def test_a_failed_store_runs_no_pass_and_the_next_refresh_catches_up(tmp_path):
 
     with patch("agentic_fx.datafeed.econ_calendar.econ_events.upsert", flaky):
         assert refresh(cal, payload) == 1          # 保存できた件数
-    assert sets(cal) == []                          # pass は走らない
-    assert cal.last_pass is None
+    assert sets(cal) == [("A", "USDJPY", "awaiting"),
+                         ("A", "EURUSD", "awaiting")]   # 入った分だけ pass が走る
     assert refresh(cal, payload) == 2
     assert len(sets(cal)) == 4                      # A, B × 2 pair
 
@@ -616,3 +616,85 @@ def test_freshness_that_cannot_be_read_is_unknown_and_never_raises(tmp_path):
 def test_the_refresh_interval_default_matches_the_scheduler():
     from agentic_fx.core import scheduler
     assert fetch_attempts.ECON_REFRESH_INTERVAL == scheduler._ECON_INTERVAL
+
+
+def test_rows_stored_before_a_mid_refresh_failure_still_supersede(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    real = econ_events.upsert
+    calls = []
+
+    def flaky(conn, **kw):
+        calls.append(kw["name"])
+        if kw["name"] == "Other":
+            raise sqlite_error()
+        return real(conn, **kw)
+
+    with patch("agentic_fx.datafeed.econ_calendar.econ_events.upsert",
+               side_effect=flaky):
+        refresh(cal, [ff("US CPI", "USD", moved), ff("Other", "USD", T1)])
+    assert calls == ["US CPI", "Other"]
+    assert _superseded(cal, old) == event_id(cal, "US CPI", moved)
+    assert _pending(cal) == 0
+
+
+def test_the_new_ids_survive_a_failure_between_upserts(tmp_path):
+    cal, _ = make(tmp_path)
+    old, moved = _moved(cal)
+    real = econ_events.upsert
+
+    def flaky(conn, **kw):
+        if kw["name"] == "Other":
+            raise sqlite_error()
+        return real(conn, **kw)
+
+    cal.begin = lambda conn: False
+    with patch("agentic_fx.datafeed.econ_calendar.econ_events.upsert",
+               side_effect=flaky):
+        refresh(cal, [ff("US CPI", "USD", moved), ff("Other", "USD", T1)])
+    assert _superseded(cal, old) is None and _pending(cal) == 1
+    cal.begin = ohlcv_slices.begin_immediate
+    refresh(cal, [ff("US CPI", "USD", moved), ff("Other", "USD", T1)])
+    assert _superseded(cal, old) == event_id(cal, "US CPI", moved)
+
+
+def test_a_pending_new_row_that_moves_again_is_superseded_in_a_chain(tmp_path):
+    cal, _ = make(tmp_path)
+    a, b_ts = _moved(cal)
+    cal.begin = lambda conn: False
+    refresh(cal, [ff("US CPI", "USD", b_ts)])         # A -> B は commit されない
+    b = event_id(cal, "US CPI", b_ts)
+    assert _superseded(cal, a) is None
+    cal.begin = ohlcv_slices.begin_immediate
+    c_ts = b_ts + timedelta(hours=1)
+    refresh(cal, [ff("US CPI", "USD", c_ts)])         # B -> C
+    c = event_id(cal, "US CPI", c_ts)
+    assert _superseded(cal, b) == c
+    assert _superseded(cal, a) is not None
+    assert _superseded(cal, c) is None and _pending(cal) == 0
+    active = cal.conn.execute(
+        "SELECT id FROM econ_events WHERE superseded_by IS NULL").fetchall()
+    assert [r[0] for r in active] == [c]
+
+
+def test_a_steady_refresh_writes_no_pending_record(tmp_path):
+    cal, _ = make(tmp_path)
+    refresh(cal, [ff("US CPI", "USD", T1)])
+    seen = []
+    real = econ_events.save_pending_supersede
+
+    def spy(conn, **kw):
+        out = real(conn, **kw)
+        seen.append(out)
+        return out
+
+    with patch("agentic_fx.datafeed.econ_calendar.econ_events."
+               "save_pending_supersede", side_effect=spy):
+        refresh(cal, [ff("US CPI", "USD", T1)])
+    assert seen == [False] and _pending(cal) == 0
+    writes = []
+    cal.conn.set_trace_callback(writes.append)
+    refresh(cal, [ff("US CPI", "USD", T1)])
+    cal.conn.set_trace_callback(None)
+    assert not [w for w in writes if "econ.supersede_pending" in w
+                and w.lstrip().split()[0] in ("INSERT", "UPDATE", "DELETE")]

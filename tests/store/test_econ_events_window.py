@@ -493,3 +493,16 @@ def test_a_new_row_missing_from_the_fetch_or_already_superseded_replaces_nothing
         conn, new_ids=[new], fetched_keys=[key], now=now) == []
     assert conn.execute("SELECT superseded_by FROM econ_events WHERE id=?",
                         (old,)).fetchone()[0] is None
+
+
+# --- upcoming は superseded を返さない ---------------------------------------
+
+def test_upcoming_skips_superseded_rows_and_hides_the_internal_column(conn):
+    old = add(conn, ts=TS)
+    new = add(conn, ts=TS + timedelta(hours=1))
+    conn.execute("UPDATE econ_events SET superseded_by=? WHERE id=?", (new, old))
+    conn.commit()
+    rows = econ_events.upcoming(conn, TS - timedelta(hours=1), hours=6)
+    assert [r["id"] for r in rows] == [new]
+    assert set(rows[0]) == {"id", "ts", "country", "name", "importance",
+                            "actual", "forecast", "previous"}

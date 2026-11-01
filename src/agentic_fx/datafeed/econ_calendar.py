@@ -228,6 +228,7 @@ class EconCalendar:
                 "the upstream format may have changed"))
         stored = 0
         new_ids: list[int] = []
+        keys = [(ev["ts"], ev["country"], ev["name"]) for ev in events]
         try:
             for ev in events:
                 saved = econ_events.upsert(self.conn, ts=ev["ts"],
@@ -238,6 +239,10 @@ class EconCalendar:
                                            previous=ev["previous"])
                 if saved.inserted or saved.revived:
                     new_ids.append(saved.id)
+                    # 途中で落ちても、ここまでの新規 row は保留に残す
+                    econ_events.save_pending_supersede(
+                        self.conn, new_ids=new_ids, now=self._now(),
+                        fetched_keys=keys)
                 stored += 1
         except Exception as e:  # noqa: BLE001 — DB 障害でも取引を止めない
             # ここまでに保存できた分は DB に残る (upsert は 1 件ずつ commit
@@ -245,7 +250,9 @@ class EconCalendar:
             # 「1 件も入っていない」と読めてしまい、戻り値が嘘になる。
             # 失敗そのものは activity / 技術ログ側で可視化する。
             self._record_failure("store", e)
-            return stored       # 成功行 (econ_refreshed) は書かない
+            # 成功行 (econ_refreshed) は書かない。入った新規 row の置換だけは行う
+            self._after_refresh(events, new_ids)
+            return stored
         # drop 件数も残す: 0 件なら「全部読めた」ことの記録になり、
         # 増え始めたら仕様変更の予兆として人が気づける
         self.activity.write(Category.NEWS, "econ_refreshed",

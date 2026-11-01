@@ -83,11 +83,12 @@ def test_schema_and_parser_are_independent_defences():
 
 
 def test_opposite_position_reject_requires_an_active_order_in_the_inverse_direction():
-    reject = Reject("opposite_position", pair="USDJPY", direction=Direction.LONG)
+    reject = Reject("opposite_position")
     orders = [
         {"pair": "USDJPY", "direction": "short", "status": OrderStatus.OPEN},
     ]
-    assert verify_opposite_position(reject, orders) is True
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction=Direction.LONG) is True
 
 
 @pytest.mark.parametrize(
@@ -100,24 +101,48 @@ def test_opposite_position_reject_requires_an_active_order_in_the_inverse_direct
     ],
 )
 def test_opposite_position_reject_rejects_missing_or_non_opposite_active_orders(orders):
-    reject = Reject("opposite_position", pair="USDJPY", direction="long")
-    assert verify_opposite_position(reject, orders) is False
+    reject = Reject("opposite_position")
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction="long") is False
 
 
 def test_pending_fill_opposite_position_is_an_active_inverse_order():
-    reject = Reject("opposite_position", pair="USDJPY", direction="short")
+    reject = Reject("opposite_position")
     orders = [{"pair": "USDJPY", "direction": "long", "status": "pending_fill"}]
-    assert verify_opposite_position(reject, orders) is True
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction="short") is True
 
 
 def test_protection_pending_opposite_position_is_an_active_inverse_order():
-    reject = Reject("opposite_position", pair="USDJPY", direction="short")
+    reject = Reject("opposite_position")
     orders = [{"pair": "USDJPY", "direction": "long", "status": "protection_pending"}]
-    assert verify_opposite_position(reject, orders) is True
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction="short") is True
 
 
 def test_news_shock_does_not_require_orders_verification():
-    assert verify_opposite_position(Reject("news_shock"), []) is True
+    assert verify_opposite_position(
+        Reject("news_shock"), [], pair=None, direction=None) is True
+
+
+def test_opposite_position_without_a_signal_identity_fails_closed():
+    orders = [{"pair": "USDJPY", "direction": "short", "status": "open"}]
+    reject = Reject("opposite_position")
+    assert verify_opposite_position(
+        reject, orders, pair=None, direction="long") is False
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction=None) is False
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction="flat") is False
+
+
+def test_a_parsed_reject_verifies_with_the_caller_supplied_signal():
+    reject = parse_decision({"decision": "reject",
+                             "reject_code": "opposite_position"})
+    assert isinstance(reject, Reject)
+    orders = [{"pair": "USDJPY", "direction": "short", "status": "open"}]
+    assert verify_opposite_position(
+        reject, orders, pair="USDJPY", direction="long") is True
 
 
 def test_signal_decision_tools_are_limited_to_news_search_and_positions():

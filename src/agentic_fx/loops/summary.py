@@ -2,15 +2,19 @@
 from __future__ import annotations
 
 import copy
+import logging
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime
 
+from agentic_fx._safe_error import safe_error_text
 from agentic_fx.core.contracts import Clock, OrderStatus
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.accounting import daily_start_equity
 from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.store import orders
+
+_log = logging.getLogger(__name__)
 
 TRADE_INTENT_SCHEMA: dict = {
     "type": "object",
@@ -97,7 +101,13 @@ def build_state_summary(conn: sqlite3.Connection, broker: PaperBroker,
     if isinstance(pair_currencies, Mapping):
         lines.append("- 経済指標 (pair view):")
         for pair in pair_currencies:
-            view = econ.window_view(pair, now)
+            try:
+                view = econ.window_view(pair, now)
+            except Exception as e:  # noqa: BLE001 — 指標の表示で prompt 構築を止めない
+                _log.warning("econ window_view failed for %s: %s", pair,
+                             safe_error_text(e))
+                lines.append(f"  - {pair} freshness=unknown (取得できませんでした)")
+                continue
             active = ", ".join(
                 f"{event.ts.isoformat()} {event.country} {event.name} "
                 f"{'★' * event.importance}"
