@@ -18,7 +18,7 @@
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (13)
+## 実装待ち (16)
 
 ### 不具合 (7)
 
@@ -32,10 +32,13 @@
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
-### 機能 (2)
+### 機能 (5)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
+| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
+| [econ-event-hold-window-deterministic](open/econ-event-hold-window-deterministic.md) | 中 | 2026-10-30 | 指標前の様子見を tool 側で重要イベントと回避帯に絞る |
+| [llm-vs-strategy-signal-authority](open/llm-vs-strategy-signal-authority.md) | 中 | 2026-10-30 | LLM と戦略シグナルの役割分担 (シグナルの最終審査員にするか) |
 | [indicator-symbol-agnostic-and-duplicate-gate](open/indicator-symbol-agnostic-and-duplicate-gate.md) | 中 | 2026-10-31 | indicator の銘柄非依存と重複を決定論 gate で検査する |
 | [legacy-oc-tool-not-found](open/legacy-oc-tool-not-found.md) | 低 |  | 存在しない候補名を読むときの誘導が足りない |
 
@@ -48,7 +51,7 @@
 | [subprocess-allowlist-by-line-number](open/subprocess-allowlist-by-line-number.md) | 低 | 2026-09-18 | subprocess の stdin 方針テストが行番号固定で壊れやすい |
 | [switch-ops-r2b-low-unpinned](open/switch-ops-r2b-low-unpinned.md) | 低 | 2026-09-20 | 版ディレクトリ検証の変異 3 本が未 pin、テスト名に旧版の名残 |
 
-## 裁定待ち (9)
+## 裁定待ち (6)
 
 ### 不具合 (2)
 
@@ -57,14 +60,11 @@
 | [improve-catchup-runs-at-startup](open/improve-catchup-runs-at-startup.md) | 低 | 2026-09-20 | 起動直後に改善 mission が自動起動する (catch-up と推定) |
 | [mt5-import-window-before-data-start](open/mt5-import-window-before-data-start.md) | 低 |  | --from がデータ開始より前だと importer が停止する |
 
-### 機能 (6)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [escape-probe-manual-measurement](open/escape-probe-manual-measurement.md) | 中 | 2026-10-04 | 改善 agent の檻からの脱出可否を人手で実測する |
-| [econ-event-actuals-and-reaction-stats](open/econ-event-actuals-and-reaction-stats.md) | 中 | 2026-10-30 | 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する |
-| [econ-event-hold-window-deterministic](open/econ-event-hold-window-deterministic.md) | 中 | 2026-10-30 | 指標前の様子見を tool 側で重要イベントと回避帯に絞る |
-| [llm-vs-strategy-signal-authority](open/llm-vs-strategy-signal-authority.md) | 中 | 2026-10-30 | LLM と戦略シグナルの役割分担 (シグナルの最終審査員にするか) |
 | [legacy-e2e-ttl](open/legacy-e2e-ttl.md) | 低 |  | llama-swap の TTL 120 秒で mission 中にモデルが unload される |
 | [seed-priority](open/seed-priority.md) | 低 |  | ユーザーの種まきより古い observation が選ばれ指示が無視された |
 

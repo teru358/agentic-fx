@@ -1,7 +1,7 @@
 ---
 id: econ-event-actuals-and-reaction-stats
 title: 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する
-status: 裁定待ち
+status: 実装待ち
 priority: 中
 kind: 機能
 opened: 2026-10-30
@@ -10,7 +10,7 @@ related: [econ-event-hold-window-deterministic, llm-vs-strategy-signal-authority
 ---
 # [econ-event-actuals-and-reaction-stats] 指標の発表実績を取得し、種別ごとの価格反応を決定論的に集計する
 
-**状態**: 裁定待ち / **優先**: 中 / **種別**: 機能
+**状態**: 実装待ち / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -26,3 +26,4 @@ econ_events は forecast / previous だけで actual が 1026 件中 0 件 (econ
 
 - 2026-10-30: 起票。
 - 2026-10-30: 状態: 裁定待ち — ブレスト → sol 前提確認 → 設計 C0 の順 (3 件を一束で)
+- 2026-11-01: 状態: 実装待ち — 設計 C0 v0.9 (docs/superpowers/specs/2026-11-01-econ-window-signal-authority-shadow-design.md) を 8 周のレビューで清書、J1〜J3 をユーザーが推奨どおり承認。3 件は束 1 (回避帯・採否契約・shadow、T1a〜T5) と束 2 (反応統計、T1〜T4) で実装。actual 取得は対象外 (源に無い)
