@@ -15,12 +15,11 @@ commit し、途中のどの書込みが失敗しても rollback して例外を
 """
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
-from agentic_fx.store import missions, signals
+from agentic_fx.store import intents, missions, signals
 from agentic_fx.store.signal_shadow import ShadowSpread, start_in_tx
 from agentic_fx.store.signals import utc_iso
 
@@ -109,17 +108,6 @@ def record_in_tx(conn: sqlite3.Connection, *, mission_id: int, signal_id: int,
     return cur.lastrowid
 
 
-def _insert_open_intent_in_tx(conn: sqlite3.Connection, *, mission_id: int,
-                              payload: dict, now: datetime) -> int:
-    # `intents.insert` と同じ列・同じ値の形。commit しないため同じ文をここで出す。
-    cur = conn.execute(
-        "INSERT INTO trade_intents "
-        "(mission_id,payload_json,action,created_at) VALUES (?,?,?,?)",
-        (mission_id, json.dumps(payload, ensure_ascii=False), "open",
-         now.isoformat()))
-    return cur.lastrowid
-
-
 def _consume_and_finish(conn: sqlite3.Connection, *, mission_id: int,
                         signal_id: int, actor: str, output: dict | None,
                         transcript: list, now: datetime) -> str:
@@ -162,8 +150,11 @@ def finalize_accept_in_tx(conn: sqlite3.Connection, *, mission_id: int,
     intent はこの transaction の中で作り、その id を decision に結ぶ。executor は
     この transaction の commit 後にだけ呼ぶ (呼び出し側の責務)。
     """
-    intent_id = _insert_open_intent_in_tx(
-        conn, mission_id=mission_id, payload=intent_payload, now=now)
+    if intent_payload.get("action", "open") != "open":
+        raise DecisionShapeError(
+            f"an accept intent is an open intent, got {intent_payload['action']!r}")
+    intent_id = intents.insert_in_tx(conn, mission_id, intent_payload, now,
+                                     action="open")
     decision_id = record_in_tx(
         conn, mission_id=mission_id, signal_id=signal_id,
         decision=DECISION_ACCEPT, actor=ACTOR_LLM, reject_code=None,

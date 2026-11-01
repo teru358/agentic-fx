@@ -343,3 +343,12 @@ def test_get_for_signal(tmp_path):
     assert sd.get_for_signal(conn, sid) is None
     result = _reject(conn, mid, sid)
     assert sd.get_for_signal(conn, sid)["id"] == result.decision_id
+
+
+def test_accept_refuses_a_payload_whose_action_is_not_open(tmp_path):
+    conn, mid, sid = _world(tmp_path)
+    with pytest.raises(sd.DecisionShapeError):
+        sd.commit_accept(conn, mission_id=mid, signal_id=sid,
+                         intent_payload={**INTENT, "action": "hold"},
+                         spread=SPREAD, output=None, transcript=[], now=NOW)
+    _assert_untouched(conn, mid, sid)

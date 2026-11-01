@@ -799,3 +799,263 @@ def test_slice_row_count(tmp_path):
     _stage_all(conn, set_id, os_.new_generation(conn, now=NOW),
                _bars(TS - timedelta(minutes=15), 7))
     assert os_.slice_row_count(conn) == 7
+
+
+# --- shadow set の完備は shadow の終端と一緒にだけ -----------------------------
+
+def _staged_shadow_set(conn):
+    shadow_id = _shadow(conn)
+    gen = os_.new_generation(conn, now=NOW)
+    start, end = NOW, NOW + timedelta(minutes=5)
+    staged = os_.stage_shadow_rows(conn, shadow_id=shadow_id, pair="USDJPY",
+                                   range_start=start, range_end=end,
+                                   generation=gen, rows=_bars(start, 5), now=NOW)
+    return shadow_id, staged.set_id, gen, start, end
+
+
+def _terminal(shadow_id, conn, start, end):
+    return ShadowCas(shadow_id, "pending_entry",
+                     ss.get(conn, shadow_id)["updated_at"],
+                     ss.ShadowOutcome.resolved(
+                         "tp", exit_price=150.2, pnl_pips=20.0, resolved_at=end,
+                         entry_price=150.0, entry_at=start))
+
+
+def test_a_shadow_set_never_completes_without_a_terminal_shadow_end(tmp_path):
+    conn = _conn(tmp_path)
+    shadow_id, set_id, gen, start, end = _staged_shadow_set(conn)
+    later = NOW + timedelta(days=2)
+    with pytest.raises(ValueError, match="shadow-owned"):
+        os_.complete_set(conn, set_id=set_id, generation=gen, now=later)
+    seen = ss.get(conn, shadow_id)["updated_at"]
+    filled = ShadowCas(shadow_id, "pending_entry", seen,
+                       ss.ShadowOutcome.filled(entry_price=150.0, entry_at=start))
+    with pytest.raises(ss.ShadowTransitionError, match="terminal"):
+        os_.complete_set(conn, set_id=set_id, generation=gen, now=later,
+                         shadow=filled)
+    assert not conn.in_transaction
+    assert os_.get_set(conn, set_id)["state"] == "staging"
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+    assert os_.complete_set(conn, set_id=set_id, generation=gen, now=later,
+                            shadow=_terminal(shadow_id, conn, start, end)
+                            ).committed
+
+
+def test_an_event_set_refuses_a_shadow_end(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    gen = os_.new_generation(conn, now=NOW)
+    _stage_all(conn, set_id, gen, _bars(TS - timedelta(minutes=15), 255))
+    shadow_id = _shadow(conn)
+    cas = _terminal(shadow_id, conn, NOW, NOW + timedelta(minutes=5))
+    with pytest.raises(ValueError, match="event-owned"):
+        os_.complete_set(conn, set_id=set_id, generation=gen, now=NOW,
+                         shadow=cas)
+    assert os_.get_set(conn, set_id)["state"] == "staging"
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+
+
+# --- 開いた transaction と writer admission -----------------------------------
+
+def _dirty(conn):
+    conn.execute("UPDATE missions SET model='dirty'")
+
+
+def _dirty_kept(conn):
+    return conn.execute("SELECT COUNT(*) FROM missions WHERE model='dirty'"
+                        ).fetchone()[0]
+
+
+def test_worker_writes_refuse_a_connection_with_an_open_transaction(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    shadow_id = _shadow(conn)
+    cas = ShadowCas(shadow_id, "pending_entry",
+                    ss.get(conn, shadow_id)["updated_at"],
+                    ss.ShadowOutcome.no_fill())
+    calls = (
+        lambda: os_.record_event_spread(conn, set_id, spread_pips=1.0,
+                                        spread_source="quote"),
+        lambda: os_.new_generation(conn, now=NOW),
+        lambda: os_.sync_event_sets(conn, targets=[], scope_event_ids=None,
+                                    now=NOW),
+        lambda: ss.transition(conn, shadow_id, expected_state=cas.expected_state,
+                              expected_updated_at=cas.expected_updated_at,
+                              outcome=cas.outcome, now=NOW),
+    )
+    for call in calls:
+        _dirty(conn)
+        with pytest.raises(RuntimeError, match="open transaction"):
+            call()
+        assert conn.in_transaction and _dirty_kept(conn) == 1
+        conn.rollback()
+    assert os_.get_set(conn, set_id)["spread_pips"] is None
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+
+
+def test_begin_that_yields_stops_every_worker_write(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    shadow_id = _shadow(conn)
+    asked = []
+
+    def flag_up(c):
+        asked.append(c)
+        return False
+
+    assert os_.record_event_spread(conn, set_id, spread_pips=1.0,
+                                   spread_source="quote",
+                                   begin=flag_up) is False
+    assert os_.new_generation(conn, now=NOW, begin=flag_up) is None
+    assert os_.sync_event_sets(conn, targets=[], scope_event_ids=None, now=NOW,
+                               begin=flag_up) is None
+    out = ss.transition_tx(
+        conn, shadow_id, expected_state="pending_entry",
+        expected_updated_at=ss.get(conn, shadow_id)["updated_at"],
+        outcome=ss.ShadowOutcome.no_fill(), now=NOW, begin=flag_up)
+    assert out.status == "yielded"
+    assert len(asked) == 4 and not conn.in_transaction
+    assert os_.get_set(conn, set_id)["spread_pips"] is None
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_slice_generations"
+                        ).fetchone()[0] == 0
+
+
+def test_cas_mismatch_through_the_worker_paths_is_a_conflict(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    assert os_.record_event_spread(conn, set_id, spread_pips=1.0,
+                                   spread_source="quote")
+    assert os_.record_event_spread(conn, set_id, spread_pips=2.0,
+                                   spread_source="quote") is False
+    assert os_.get_set(conn, set_id)["spread_pips"] == 1.0
+    assert not conn.in_transaction
+
+
+# --- 50ms 予算の差込口 -------------------------------------------------------
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def _deadline(clock, budget=0.05):
+    started = clock()
+
+    def checkpoint():
+        if clock() - started > budget:
+            raise os_.OverBudget
+
+    return checkpoint
+
+
+def test_checkpoint_runs_after_the_statements_and_before_commit(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    gen = os_.new_generation(conn, now=NOW)
+    seen = []
+
+    def checkpoint():
+        seen.append((conn.in_transaction, _rows_of(conn, set_id)))
+
+    out = os_.stage_event_rows(conn, set_id=set_id, generation=gen,
+                               rows=_bars(TS - timedelta(minutes=15), 3),
+                               checkpoint=checkpoint)
+    assert out.committed and seen == [(True, 3)]
+
+
+def test_over_budget_rolls_back_every_worker_write(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    gen = os_.new_generation(conn, now=NOW)
+    clock = _Clock()
+
+    within = _deadline(clock)
+
+    def late():
+        clock.now = 0.2  # 文を流した後に予算を超えた
+        within()
+
+    rows = _bars(TS - timedelta(minutes=15), 3)
+    out = os_.stage_event_rows(conn, set_id=set_id, generation=gen, rows=rows,
+                               checkpoint=late)
+    assert out.status == "over_budget" and not out.committed
+    assert not conn.in_transaction
+    assert os_.get_set(conn, set_id)["state"] == "awaiting"
+    assert _rows_of(conn, set_id) == 0
+    assert os_.record_event_spread(conn, set_id, spread_pips=1.0,
+                                   spread_source="quote",
+                                   checkpoint=late) is False
+    assert os_.get_set(conn, set_id)["spread_pips"] is None
+    clock.now = 0.0
+    assert os_.record_event_spread(conn, set_id, spread_pips=1.0,
+                                   spread_source="quote", checkpoint=within)
+    clock.now = 0.06
+    shadow_id = _shadow(conn)
+    assert ss.transition_tx(
+        conn, shadow_id, expected_state="pending_entry",
+        expected_updated_at=ss.get(conn, shadow_id)["updated_at"],
+        outcome=ss.ShadowOutcome.no_fill(), now=NOW,
+        checkpoint=within).status == "over_budget"
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+    assert os_.new_generation_tx(conn, now=NOW,
+                                 checkpoint=within).status == "over_budget"
+
+
+def test_over_budget_complete_leaves_set_and_shadow_untouched(tmp_path):
+    conn = _conn(tmp_path)
+    shadow_id, set_id, gen, start, end = _staged_shadow_set(conn)
+
+    def over():
+        raise os_.OverBudget
+
+    out = os_.complete_set(conn, set_id=set_id, generation=gen,
+                           now=NOW + timedelta(days=2),
+                           shadow=_terminal(shadow_id, conn, start, end),
+                           checkpoint=over)
+    assert out.status == "over_budget"
+    assert os_.get_set(conn, set_id)["state"] == "staging"
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+
+
+# --- Minor ------------------------------------------------------------------
+
+def test_an_event_off_the_minute_is_skipped_without_blocking_the_others(tmp_path):
+    conn = _conn(tmp_path)
+    good = _event(conn)
+    odd = _event(conn, ts=TS + timedelta(seconds=30), name="odd")
+    one = {"USDJPY": ("USD", "JPY")}
+    out = os_.sync_event_sets(
+        conn, targets=os_.event_set_targets(conn, importance_min=3,
+                                            pair_currencies=one),
+        scope_event_ids=None, now=NOW)
+    assert out.skipped == (odd,) and len(out.created) == 1
+    assert os_.get_set(conn, out.created[0])["event_id"] == good
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_slice_sets WHERE event_id=?",
+                        (odd,)).fetchone()[0] == 0
+
+
+def test_a_purged_set_does_not_read_as_a_complete_empty_set(tmp_path):
+    conn = _conn(tmp_path)
+    cutoff = NOW - timedelta(days=os_.RETENTION_DAYS)
+    old = _complete_event_set(conn, _event(conn),
+                              created_at=cutoff - timedelta(days=1))
+    assert len(os_.complete_rows(conn, old)) == 255
+    while not os_.purge_step(conn, set_id=old, now=NOW).done:
+        pass
+    assert os_.get_set(conn, old)["state"] == "complete"
+    assert os_.complete_rows(conn, old) is None
+
+
+def test_a_newer_generation_staging_is_not_reclaimed(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, _event(conn))
+    g1 = os_.new_generation(conn, now=NOW)
+    g2 = os_.new_generation(conn, now=NOW)
+    _stage_all(conn, set_id, g2, _bars(TS - timedelta(minutes=15), 3))
+    assert os_.stale_staging_sets(conn, current_generation=g1) == []
+    assert [r["id"] for r in os_.stale_staging_sets(
+        conn, current_generation=g2 + 1)] == [set_id]

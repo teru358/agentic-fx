@@ -12,6 +12,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from agentic_fx.store.short_tx import (
+    Begin, Checkpoint, Conflict, TxResult, begin_immediate, short_tx)
 from agentic_fx.store.signals import utc_iso
 
 RULE_VERSION = 1
@@ -239,22 +241,32 @@ def transition_in_tx(conn: sqlite3.Connection, shadow_id: int, *,
     return cur.rowcount == 1
 
 
+def transition_tx(conn: sqlite3.Connection, shadow_id: int, *,
+                  expected_state: str, expected_updated_at: str,
+                  outcome: ShadowOutcome, now: datetime,
+                  begin: Begin = begin_immediate,
+                  checkpoint: Checkpoint | None = None) -> TxResult:
+    """`transition_in_tx` を 1 短 transaction で commit する。
+
+    CAS 不一致は `conflict`。開いた transaction の上では呼べない。
+    """
+    def body():
+        if not transition_in_tx(conn, shadow_id, expected_state=expected_state,
+                                expected_updated_at=expected_updated_at,
+                                outcome=outcome, now=now):
+            raise Conflict
+        return {}
+
+    return short_tx(conn, begin, body, checkpoint)
+
+
 def transition(conn: sqlite3.Connection, shadow_id: int, *,
                expected_state: str, expected_updated_at: str,
-               outcome: ShadowOutcome, now: datetime) -> bool:
-    """`transition_in_tx` を 1 transaction で commit する (CAS 不一致は rollback)。"""
-    try:
-        ok = transition_in_tx(conn, shadow_id, expected_state=expected_state,
-                              expected_updated_at=expected_updated_at,
-                              outcome=outcome, now=now)
-        if ok:
-            conn.commit()
-        else:
-            conn.rollback()
-        return ok
-    except BaseException:
-        conn.rollback()
-        raise
+               outcome: ShadowOutcome, now: datetime, **kwargs) -> bool:
+    """`transition_tx` が commit したか。"""
+    return transition_tx(conn, shadow_id, expected_state=expected_state,
+                         expected_updated_at=expected_updated_at,
+                         outcome=outcome, now=now, **kwargs).committed
 
 
 def get(conn: sqlite3.Connection, shadow_id: int) -> dict | None:

@@ -5,15 +5,22 @@ import sqlite3
 from datetime import datetime
 
 
-def insert(conn: sqlite3.Connection, mission_id: int, payload: dict,
-           now: datetime, *, action: str) -> int:
+def insert_in_tx(conn: sqlite3.Connection, mission_id: int, payload: dict,
+                 now: datetime, *, action: str) -> int:
+    """intent 1 行を書く。commit しない。"""
     cur = conn.execute(
         "INSERT INTO trade_intents "
         "(mission_id,payload_json,action,created_at) VALUES (?,?,?,?)",
         (mission_id, json.dumps(payload, ensure_ascii=False),
          action, now.isoformat()))
-    conn.commit()
     return cur.lastrowid
+
+
+def insert(conn: sqlite3.Connection, mission_id: int, payload: dict,
+           now: datetime, *, action: str) -> int:
+    intent_id = insert_in_tx(conn, mission_id, payload, now, action=action)
+    conn.commit()
+    return intent_id
 
 
 def set_gate_result(conn: sqlite3.Connection, intent_id: int, *,
