@@ -2136,3 +2136,58 @@ def test_the_status_constant_is_bound_not_interpolated():
 def test_the_replay_adapter_keeps_one_name_for_the_intent_mapping():
     from agentic_fx.plugin import strategy_adapter
     assert not hasattr(strategy_adapter, "_strategy_result_to_intent")
+
+
+# --- store の writer 契約と DDL の CHECK の一致 --------------------------------
+
+@pytest.mark.parametrize("decision", ["accept", "reject", "hold"])
+@pytest.mark.parametrize("actor", ["llm", "system", "human"])
+@pytest.mark.parametrize("code", [None, "news_shock", "opposite_position",
+                                  "econ_window", "other"])
+@pytest.mark.parametrize("with_intent", [False, True])
+def test_decision_shape_check_agrees_with_the_ddl(
+        decided, decision, actor, code, with_intent):
+    from agentic_fx.store import signal_decisions
+    conn, mid, sid, iid = decided
+    intent = iid if with_intent else None
+    try:
+        signal_decisions.validate_shape(decision=decision, actor=actor,
+                                        reject_code=code,
+                                        trade_intent_id=intent)
+        python_ok = True
+    except signal_decisions.DecisionShapeError:
+        python_ok = False
+    try:
+        _decision(conn, mission_id=mid, signal_id=sid, decision=decision,
+                  actor=actor, reject_code=code, intent_id=intent)
+        db_ok = True
+    except sqlite3.IntegrityError:
+        db_ok = False
+    conn.rollback()
+    assert python_ok == db_ok
+
+
+@pytest.mark.parametrize("quality", ["observed", "no_tick_flat",
+                                     "datafeed_outage_gap"])
+@pytest.mark.parametrize("o, h, l, c", [
+    (2.0, 3.0, 1.0, 2.0), (2.0, 2.0, 2.0, 2.0), (3.0, 2.0, 1.0, 2.0),
+    (2.0, 1.0, 3.0, 2.0), (2.0, 3.0, 1.0, 3.5), (0.0, 3.0, 0.0, 2.0),
+    (-1.0, 3.0, -1.0, 2.0), (math.nan, 3.0, 1.0, 2.0), (2.0, math.inf, 1.0, 2.0),
+    (None, None, None, None), (2.0, None, 1.0, 2.0)])
+@pytest.mark.parametrize("volume", [None, 0.0, 5.0, -1.0, math.inf])
+def test_slice_row_check_agrees_with_the_ddl(slice_world, quality, o, h, l, c,
+                                             volume):
+    from agentic_fx.store import ohlcv_slices
+    conn, eid, _ = slice_world
+    set_id = _slice_set(conn, eid)
+    row = ohlcv_slices.SliceRow(
+        datetime(2026, 10, 30, 12, 15, tzinfo=timezone.utc), o, h, l, c,
+        volume, "mt5-live", quality)
+    python_ok = ohlcv_slices.slice_row_problem(row) is None
+    try:
+        ohlcv_slices._insert_rows(conn, set_id, [row])
+        db_ok = True
+    except sqlite3.IntegrityError:
+        db_ok = False
+    conn.rollback()
+    assert python_ok == db_ok
