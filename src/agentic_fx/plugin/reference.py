@@ -9,13 +9,18 @@ import pandas as pd
 
 from agentic_fx.plugin.reference_time import (
     canonical_duration_seconds, native_reference_bars, nominal_reference_bars,
-    timeframe_seconds,
+    reference_window_fits, timeframe_seconds,
 )
 
 
 def actual_reference_bars(decision_first: pd.Timestamp, decision_last: pd.Timestamp,
                           reference_timeframe: str) -> int:
-    """Return the inclusive effective-reference window for actual decision times."""
+    """Return the wall-clock slot count of the decision span, ends included.
+
+    This sizes how far back a reference frame must be read; it is not the window
+    rule (weekends have slots but no rows).  The rule counts rows, see
+    ``window_reference_bars``.
+    """
     first = pd.Timestamp(decision_first)
     last = pd.Timestamp(decision_last)
     if first.tz is None or last.tz is None:
@@ -26,12 +31,31 @@ def actual_reference_bars(decision_first: pd.Timestamp, decision_last: pd.Timest
     return math.ceil(span_seconds / timeframe_seconds(reference_timeframe)) + 1
 
 
-def runtime_reference_window_reason(actual_bars: int, *, max_bars: int) -> str | None:
+def window_reference_bars(reference_index: pd.DatetimeIndex, *,
+                          decision_first: pd.Timestamp, decision_last: pd.Timestamp,
+                          reference_timeframe: str) -> int:
+    """Count the reference bars (rows) that closed inside the decision window.
+
+    A row counts when its end lies in ``[decision_first, decision_last]``; this is
+    the number of trading bars the strategy window really covers, the quantity
+    ``nominal_reference_bars`` estimates at config time.
+    """
+    first = pd.Timestamp(decision_first)
+    last = pd.Timestamp(decision_last)
+    if first.tz is None or last.tz is None:
+        raise ValueError("reference decision times must be timezone-aware")
+    if len(reference_index) == 0:
+        return 0
+    ends = reference_index + pd.Timedelta(seconds=timeframe_seconds(reference_timeframe))
+    return int(((ends >= first) & (ends <= last)).sum())
+
+
+def runtime_reference_window_reason(window_bars: int, *, max_bars: int) -> str | None:
     """Return the one fail-closed reason for a runtime reference-window excess."""
-    if actual_bars < 1 or max_bars < 1:
-        raise ValueError("reference bar counts must be positive")
-    return ("reference_window_exceeded_at_runtime"
-            if actual_bars > max_bars else None)
+    if window_bars < 0 or max_bars < 1:
+        raise ValueError("reference bar counts must be non-negative / positive")
+    return (None if reference_window_fits(window_bars, max_bars)
+            else "reference_window_exceeded_at_runtime")
 
 
 def complete_reference_buckets(native: pd.DataFrame, *,

@@ -55,7 +55,7 @@ from agentic_fx.plugin.loader import PluginMeta
 from agentic_fx.plugin.reference import runtime_reference_window_reason
 from agentic_fx.plugin.reference_frames import (
     actual_bars_for, history_reference_frame, judge_reference,
-    load_history_native_frame, window_lower,
+    load_history_native_frame, window_bars_for, window_lower,
 )
 from agentic_fx.plugin.sandbox import PluginSession, REFERENCE_ERROR_CODES, SandboxError
 from agentic_fx.symbols import readable_symbols
@@ -138,6 +138,9 @@ class PluginStrategyIntentSource:
         # 非空で実際に plugin を評価した回数。CLI はバックテスト完走後に
         # これが 0 なら「plugin が一度も発火しなかった」警告を出せる。
         self.eval_count = 0
+        # 発火格子に乗り df が非空なのに strategy を評価しなかった足の数を、
+        # 固定 reason ごとに数える (日時・値は持たない)。backtest の応答に出る。
+        self.skip_counts: dict[str, int] = {}
 
     @property
     def cpu_sec(self) -> float | None:
@@ -165,9 +168,11 @@ class PluginStrategyIntentSource:
             return None  # 発火格子に乗っていてもデータが無ければ評価しない
 
         payload: dict[str, Any] = {"df": df, "params": self._meta.params}
-        frames = self._reference_frames(df)
+        frames, skip_reason = self._reference_frames(df)
         if frames is None:
-            return None  # 参照 frame が使えない足は live と同じく strategy skip
+            # 参照 frame が使えない足は live と同じく strategy skip
+            self._count_skip(skip_reason)
+            return None
         if frames:
             payload["frames"] = frames
 
@@ -178,21 +183,26 @@ class PluginStrategyIntentSource:
             result = session.call(payload)
         except SandboxError as exc:
             if exc.code in REFERENCE_ERROR_CODES:
+                self._count_skip("indicator_unavailable")
                 return None
             raise
         if self._decision_sink is not None:
             self._decision_sink(bucket_end, result)
         return _strategy_result_to_intent(result, self._pair)
 
-    def _reference_frames(self, df) -> "dict | None":
+    def _count_skip(self, reason: str) -> None:
+        self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
+
+    def _reference_frames(self, df) -> "tuple[dict | None, str]":
         """live の producer と同じ整列規則で参照 frame を作る。
 
-        使えない参照 (窓超過・行なし・age 超過) があれば `None` (skip)。参照を
-        宣言しない strategy では常に空 dict で、payload は変わらない。
+        使えない参照 (窓超過・行なし・age 超過) があれば ``(None, reason)``
+        (skip)。reason は live と同じ固定語彙。参照を宣言しない strategy では
+        常に空 dict で、payload は変わらない。
         """
         items = [item for item in self._resolved.items if item.frame_id is not None]
         if not items:
-            return {}
+            return {}, ""
         if self._readable is None:
             self._readable = frozenset(readable_symbols(self._settings))
         readable = self._readable
@@ -202,23 +212,27 @@ class PluginStrategyIntentSource:
         frames: dict = {}
         for item in items:
             symbol = self._pair if item.symbol_mode == "self" else item.literal_symbol
-            actual = actual_bars_for(df.index, self._meta.timeframe, item.timeframe)
-            if runtime_reference_window_reason(actual, max_bars=item.max_bars):
-                return None
-            if item.frame_id in frames:
-                continue
-            if item.symbol_mode != "self" and symbol not in readable:
-                return None
-            frame = self._frame(symbol, item, d_last, actual)
-            aligned = judge_reference(
-                frame, bucket_start=bucket_start,
-                strategy_timeframe=self._meta.timeframe,
-                reference_timeframe=item.timeframe,
-                max_age_seconds=item.max_age_seconds)
-            if aligned.row_start is None or not aligned.fresh:
-                return None
-            frames[item.frame_id] = frame
-        return frames
+            if item.frame_id not in frames:
+                if item.symbol_mode != "self" and symbol not in readable:
+                    return None, "missing"
+                lookback = actual_bars_for(df.index, self._meta.timeframe, item.timeframe)
+                frame = self._frame(symbol, item, d_last, lookback)
+                aligned = judge_reference(
+                    frame, bucket_start=bucket_start,
+                    strategy_timeframe=self._meta.timeframe,
+                    reference_timeframe=item.timeframe,
+                    max_age_seconds=item.max_age_seconds)
+                if aligned.row_start is None:
+                    return None, "missing"
+                if not aligned.fresh:
+                    return None, "age_exceeded"
+                frames[item.frame_id] = frame
+            window = window_bars_for(frames[item.frame_id].index, df.index,
+                                     self._meta.timeframe, item.timeframe)
+            reason = runtime_reference_window_reason(window, max_bars=item.max_bars)
+            if reason:
+                return None, reason
+        return frames, ""
 
     def _frame(self, symbol: str, item, d_last, actual: int):
         d_last_dt = d_last.to_pydatetime()

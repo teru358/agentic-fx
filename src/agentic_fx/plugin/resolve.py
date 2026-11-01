@@ -26,7 +26,7 @@ import yaml
 from agentic_fx.plugin.loader import PluginMeta, _check_json_safe, content_hash
 from agentic_fx.plugin.reference_time import (DEFAULT_MAX_AGE_FACTOR,
                                               canonical_duration_seconds,
-                                              nominal_reference_bars,
+                                              nominal_reference_bars, reference_window_fits,
                                               timeframe_seconds)
 from agentic_fx.symbols import readable_symbols
 
@@ -237,7 +237,7 @@ def resolve_indicator_deps(meta: PluginMeta, inventory: ApprovedInventory, *,
         if not is_main_frame:
             required_bars = nominal_reference_bars(meta.max_bars, meta.timeframe,
                                                    reference_timeframe)
-            if required_bars > dep.max_bars:
+            if not reference_window_fits(required_bars, dep.max_bars):
                 raise IndicatorResolutionError(ref.alias, "reference_window_exceeds_max_bars")
         frame_id = None if is_main_frame else f"{literal_symbol or 'self'}@{reference_timeframe}"
         items.append(ResolvedIndicator(

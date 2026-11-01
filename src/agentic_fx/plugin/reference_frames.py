@@ -12,7 +12,7 @@ from agentic_fx.backtest.timeframes import (
 from agentic_fx.datafeed.requirements import native_interval
 from agentic_fx.plugin.reference import (
     AlignedReference, actual_reference_bars, align_reference,
-    complete_reference_buckets,
+    complete_reference_buckets, window_reference_bars,
 )
 from agentic_fx.plugin.reference_time import timeframe_seconds
 
@@ -27,9 +27,19 @@ RUNTIME_WINDOW_REASON = "reference_window_exceeded_at_runtime"
 
 def actual_bars_for(df_index: pd.DatetimeIndex, strategy_timeframe: str,
                     reference_timeframe: str) -> int:
+    """Wall-clock slots the main window spans: how far back to read a frame."""
     tf = pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
     return actual_reference_bars(df_index[0] + tf, df_index[-1] + tf,
                                  reference_timeframe)
+
+
+def window_bars_for(frame_index: pd.DatetimeIndex, df_index: pd.DatetimeIndex,
+                    strategy_timeframe: str, reference_timeframe: str) -> int:
+    """Reference bars of ``frame_index`` that closed inside the main window."""
+    tf = pd.Timedelta(seconds=timeframe_seconds(strategy_timeframe))
+    return window_reference_bars(
+        frame_index, decision_first=df_index[0] + tf, decision_last=df_index[-1] + tf,
+        reference_timeframe=reference_timeframe)
 
 
 def window_lower(d_last_dt: datetime, reference_timeframe: str, actual_bars: int,

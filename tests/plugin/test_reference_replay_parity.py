@@ -178,6 +178,36 @@ def test_a_window_the_replay_stretches_past_max_bars_skips_like_live(tmp_path):
     conn.close()
 
 
+def test_a_replay_counts_skipped_bars_by_fixed_reason_without_times(tmp_path):
+    conn = _world(tmp_path)
+    meta = _meta(timeframe="1h", max_bars=3)
+    source = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", dataset=HISTORY, settings=SETTINGS_WITH_WATCH,
+        resolved=ResolvedIndicatorSet(inventory_root=Path("/nonexistent"),
+                                      items=(_item(max_bars=1),), all_pinned=True),
+        session=_Session())
+    for hour in (3, 4, 5):
+        source(Bar("USDJPY", "1h", datetime(2026, 10, 26, hour, tzinfo=timezone.utc),
+                   1.0, 1.0, 1.0, 1.0, 1.0))
+    assert source.skip_counts == {RUNTIME_WINDOW_REASON: 3}
+    assert source.eval_count == 0
+    conn.close()
+
+
+def test_a_reference_with_no_row_in_the_window_is_counted_as_missing(tmp_path):
+    conn = _world(tmp_path)
+    meta = _meta(timeframe="1h", max_bars=3)
+    source = strategy_adapter.build_intent_source(
+        meta, conn=conn, pair="USDJPY", dataset=HISTORY, settings=SETTINGS_WITH_WATCH,
+        resolved=ResolvedIndicatorSet(inventory_root=Path("/nonexistent"),
+                                      items=(_item(),), all_pinned=True),
+        session=_Session())
+    source(Bar("USDJPY", "1h", datetime(2026, 10, 23, 19, tzinfo=timezone.utc),
+               1.0, 1.0, 1.0, 1.0, 1.0))
+    assert source.skip_counts == {"missing": 1}
+    conn.close()
+
+
 def test_a_replay_without_reference_dependencies_keeps_the_two_key_payload(tmp_path):
     conn = _world(tmp_path)
     meta = _meta(timeframe="1h", max_bars=3)
