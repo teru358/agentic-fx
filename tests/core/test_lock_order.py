@@ -85,7 +85,7 @@ def test_open_takes_name_lock_before_core_lock(tmp_path, monkeypatch):
     signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     loop._plugins_root = tmp_path / "plugins"
     tracked = TrackedRLock()
     loop._core_lock = tracked
@@ -132,7 +132,7 @@ def test_scheduler_protection_precedes_open_core_and_deferred_name_lock(tmp_path
     signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     loop._plugins_root = loop_root / "plugins"
     loop._plugins_root.mkdir()
     monkeypatch.setattr(

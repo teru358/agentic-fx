@@ -189,7 +189,7 @@ class PluginStrategyIntentSource:
             raise
         if self._decision_sink is not None:
             self._decision_sink(bucket_end, result)
-        return _strategy_result_to_intent(result, self._pair)
+        return normalize_strategy_result(result, self._pair)
 
     def _count_skip(self, reason: str) -> None:
         self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
@@ -363,11 +363,6 @@ def normalize_strategy_result(result: dict[str, Any], pair: str) -> dict | None:
         intent["limit_price"] = result["limit_price"]
         intent["expires_in"] = "4h"
     return intent
-
-
-def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
-    """Compatibility name for the replay adapter's executable mapping."""
-    return normalize_strategy_result(result, pair)
 
 
 def normalize_strategy_payload(result: dict[str, Any], pair: str,

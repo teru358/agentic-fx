@@ -76,7 +76,7 @@ def test_revoke_is_idempotent_after_rejected_decision(tmp_path):
     approvals_store.apply_decision(conn, aid, "approved", decided_by="human", now=NOW)
     signal_id = signals_store.add(
         conn, plugin=name, content_hash=content, pair="USDJPY", timeframe="1h",
-        bar_ts=NOW.isoformat(), kind="strategy", payload={"direction": "long"}, now=NOW)
+        bar_ts=NOW.isoformat(), kind="strategy", payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
     first = deploy_disable.revoke_version(conn, root, name, content_hash=content, now=NOW)
     second = deploy_disable.revoke_version(conn, root, name, content_hash=content, now=NOW)

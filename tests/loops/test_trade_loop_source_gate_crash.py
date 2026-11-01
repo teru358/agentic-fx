@@ -50,7 +50,7 @@ def _loop_on(world, tmp_path, results):
 def _claimable_signal(conn, content):
     return signals.add(
         conn, plugin="strat", content_hash=content, pair="USDJPY", timeframe="1h",
-        bar_ts=NOW.isoformat(), kind="strategy", payload={"direction": "long"}, now=NOW)
+        bar_ts=NOW.isoformat(), kind="strategy", payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
 
 def _before_the_source_lock(monkeypatch, action):
@@ -299,7 +299,7 @@ def _claimed(world, plugin, content, mission_id, *, count=0, bar_minute=0):
     sid = signals.add(
         world.conn, plugin=plugin, content_hash=content, pair="USDJPY", timeframe="1h",
         bar_ts=(NOW + timedelta(minutes=bar_minute)).isoformat(), kind="strategy",
-        payload={}, now=NOW)
+        payload={}, now=NOW, contract_version="executable_v1")
     world.conn.execute(
         "UPDATE signals SET status='claimed', claimed_by_mission_id=?, claimed_at=?, "
         "requeue_count=? WHERE id=?", (mission_id, NOW.isoformat(), count, sid))

@@ -38,7 +38,8 @@ def _add_signal(conn, *, hours_ago: float, kind: str = "signal",
         timeframe=timeframe,
         bar_ts=(NOW - timedelta(hours=hours_ago)).isoformat(),
         kind=kind, payload=payload if payload is not None else {"x": 1},
-        now=NOW)
+        now=NOW,
+        contract_version="executable_v1" if kind == "strategy" else None)
 
 
 def _tool(conn, settings=SETTINGS, clock=None):
@@ -369,7 +370,7 @@ def test_row_shows_strategy_timeframe_bar_close_and_fresh_until(tmp_path):
     assert SETTINGS.plugin.signal_freshness_bars == 2  # 前提
     signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
                 timeframe="1h", bar_ts="2026-08-03T10:00:00+00:00",
-                kind="strategy", payload={"direction": "long"}, now=NOW)
+                kind="strategy", payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
                 timeframe="15m", bar_ts="2026-08-03T11:30:00+00:00",
                 kind="signal", payload={"direction": "short"}, now=NOW)
@@ -398,7 +399,7 @@ def test_row_fresh_until_follows_configured_freshness_bars(tmp_path):
     settings3.plugin.signal_freshness_bars = 3
     signals.add(conn, plugin="sig1", content_hash="h", pair="USDJPY",
                 timeframe="1h", bar_ts="2026-08-03T10:00:00+00:00",
-                kind="strategy", payload={"direction": "long"}, now=NOW)
+                kind="strategy", payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
     out = _tool(conn, settings=settings3).func(pair="USDJPY")
 

@@ -235,9 +235,9 @@ def test_append_revocation_is_ordered_idempotent_and_has_only_audit_payload(tmp_
 
 def test_linked_signals_are_excluded_and_pending_requires_freshness(tmp_path):
     conn = _conn(tmp_path)
-    pending = signals.add(conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy", payload={}, now=NOW)
-    claimed = signals.add(conn, plugin="alpha", content_hash="b", pair="USDJPY", timeframe="1h", bar_ts=(NOW + timedelta(minutes=1)).isoformat(), kind="strategy", payload={}, now=NOW)
-    stale = signals.add(conn, plugin="alpha", content_hash="c", pair="USDJPY", timeframe="1h", bar_ts=(NOW - timedelta(hours=3)).isoformat(), kind="strategy", payload={}, now=NOW)
+    pending = signals.add(conn, plugin="alpha", content_hash="a", pair="USDJPY", timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
+    claimed = signals.add(conn, plugin="alpha", content_hash="b", pair="USDJPY", timeframe="1h", bar_ts=(NOW + timedelta(minutes=1)).isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
+    stale = signals.add(conn, plugin="alpha", content_hash="c", pair="USDJPY", timeframe="1h", bar_ts=(NOW - timedelta(hours=3)).isoformat(), kind="strategy", payload={}, now=NOW, contract_version="executable_v1")
     mission_id = missions.start(conn, "trade", "local", "model", NOW)
     second_mission_id = missions.start(conn, "trade", "local", "model", NOW)
     claim = signals.claim_oldest(conn, mission_id=mission_id, now=NOW, freshness_bars=1)

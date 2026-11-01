@@ -587,9 +587,10 @@ def test_abandon_claimed_rejects_naive_time_without_writing(tmp_path):
 
 
 def test_freshness_abandon_reason_follows_the_requeue_history():
-    assert signals.freshness_abandon_reason({"requeue_count": 0}) == \
+    base = {"kind": "strategy", "contract_version": "executable_v1"}
+    assert signals.freshness_abandon_reason({**base, "requeue_count": 0}) == \
         "freshness_expired"
-    assert signals.freshness_abandon_reason({"requeue_count": 1}) == \
+    assert signals.freshness_abandon_reason({**base, "requeue_count": 1}) == \
         "requeued_expired"
 
 
@@ -1960,6 +1961,178 @@ def test_one_classification_branch_drives_all_abandoned_aggregates(tmp_path):
         "b": {"normalization_failed": 1}}
     report = signals.human_signal_aggregates(conn, since=since, until=until)
     assert report["cleanup"] == 1
-    assert report["legacy_unknown"] == 1
+    assert report["legacy_unknown_total"] == 1
     assert report["abandoned"] == {"normalization_failed": 2,
                                    "freshness_expired": 1}
+
+
+# --- T1b 是正: add / consume / 理由規則 / 集計 / 移行 ----------------------
+
+def test_add_never_stamps_a_contract_version_on_its_own(tmp_path):
+    conn = _fresh(tmp_path)
+    sid = signals.add(
+        conn, plugin="p", content_hash="h", pair="USDJPY", timeframe="1h",
+        bar_ts=NOW_UTC, kind="strategy", payload={"x": 1}, now=NOW)
+    assert _row(conn, sid)["contract_version"] is None
+    explicit = signals.add(
+        conn, plugin="p", content_hash="h2", pair="USDJPY", timeframe="1h",
+        bar_ts=NOW_UTC, kind="strategy", payload={"x": 1}, now=NOW,
+        contract_version="executable_v1")
+    assert _row(conn, explicit)["contract_version"] == "executable_v1"
+
+
+def _claimed_for_consume(conn):
+    sid, mid = _claimed(conn, content_hash="c")
+    return sid, mid
+
+
+def test_consume_wrapper_keeps_other_uncommitted_work_when_the_cas_misses(tmp_path):
+    conn = _store_conn(tmp_path)
+    sid, mid = _claimed_for_consume(conn)
+    conn.execute("INSERT INTO alert_state (key,value,updated_at) "
+                 "VALUES ('k','v',?)", (NOW_UTC,))
+    with pytest.raises(ValueError, match="not claimed"):
+        signals.consume(conn, sid, mission_id=mid + 99, now=NOW)
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM alert_state").fetchone()[0] == 1
+
+
+def test_consume_in_tx_leaves_the_commit_to_the_outer_transaction(tmp_path):
+    conn = _store_conn(tmp_path)
+    sid, mid = _claimed_for_consume(conn)
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO alert_state (key,value,updated_at) "
+                 "VALUES ('k','v',?)", (NOW_UTC,))
+    with pytest.raises(ValueError, match="not claimed"):
+        signals.consume_in_tx(conn, sid, mission_id=mid + 99, now=NOW)
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM alert_state").fetchone()[0] == 0
+
+
+_FRESHNESS_CASES = [
+    # (kind, contract_version, requeue_count, expected)
+    ("strategy", "executable_v1", 0, "freshness_expired"),
+    ("strategy", "executable_v1", 2, "requeued_expired"),
+    ("signal", None, 0, "ineligible_cleanup"),
+    ("signal", None, 2, "ineligible_cleanup"),
+    ("strategy", None, 1, "ineligible_cleanup"),
+    ("weird", "executable_v1", 0, "ineligible_cleanup"),
+]
+
+
+@pytest.mark.parametrize("kind, version, requeues, expected", _FRESHNESS_CASES)
+def test_both_freshness_paths_write_the_same_reason(
+        tmp_path, kind, version, requeues, expected):
+    conn = _store_conn(tmp_path)
+    pending = _raw_signal(conn, content_hash="p", kind=kind,
+                          requeue_count=requeues)
+    claimed, _ = _claimed(conn, content_hash="c", requeue_count=requeues)
+    for sid in (pending, claimed):
+        conn.execute("UPDATE signals SET kind=?, contract_version=? WHERE id=?",
+                     (kind, version, sid))
+    conn.commit()
+    row = dict(conn.execute("SELECT * FROM signals WHERE id=?", (claimed,)
+                            ).fetchone())
+    assert signals.freshness_abandon_reason(row) == expected
+
+    signals.expire_stale(conn, now=NOW + timedelta(hours=3), freshness_bars=1)
+    assert _row(conn, pending)["abandon_reason"] == expected
+
+
+def test_no_pending_row_is_left_outside_claim_and_expiry(tmp_path):
+    conn = _store_conn(tmp_path)
+    odd = _raw_signal(conn, content_hash="odd", kind="weird")
+    conn.execute("UPDATE signals SET contract_version='executable_v1' "
+                 "WHERE id=?", (odd,))
+    conn.commit()
+    assert not signals.pending_exists(conn, now=NOW, freshness_bars=None)
+    result = signals.expire_stale(conn, now=NOW + timedelta(hours=3),
+                                  freshness_bars=1)
+    assert result.total == 1
+    assert _row(conn, odd)["abandon_reason"] == "ineligible_cleanup"
+    assert conn.execute("SELECT COUNT(*) FROM signals WHERE status='pending'"
+                        ).fetchone()[0] == 0
+
+
+def test_aggregates_qualify_columns_and_keep_legacy_out_of_the_period(tmp_path):
+    conn = connect(tmp_path / "agg.db")
+    init_db(conn)
+    _abandoned_row(conn, plugin="a", reason="freshness_expired", h="1")
+    _abandoned_row(conn, plugin="a", reason="retry_exhausted", h="2")
+    _abandoned_row(conn, plugin="b", reason="freshness_expired", h="3")
+    _abandoned_row(conn, plugin="b", reason="legacy_unknown", contract=None,
+                   h="4")
+    since, until = NOW + timedelta(days=5), NOW + timedelta(days=6)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    report = signals.human_signal_aggregates(conn, since=since, until=until)
+    conn.set_trace_callback(None)
+    assert report["abandoned"] == {} and report["abandoned_by_strategy"] == {}
+    assert "legacy_unknown" not in report
+    assert report["legacy_unknown_total"] == 1
+
+    since, until = NOW - timedelta(days=2), NOW + timedelta(days=1)
+    statements.clear()
+    conn.set_trace_callback(statements.append)
+    report = signals.human_signal_aggregates(conn, since=since, until=until)
+    conn.set_trace_callback(None)
+    assert report["abandoned"] == {"freshness_expired": 2, "retry_exhausted": 1}
+    assert sum(1 for s in statements if "GROUP BY plugin, abandon_reason" in s) == 1
+    assert not any("GROUP BY abandon_reason" in s for s in statements)
+    joined = [s for s in statements if "FROM signal_decisions JOIN signals" in s]
+    assert joined and all("signals.status" in s and "signals.kind" in s
+                          and "signals.contract_version" in s for s in joined)
+    assert not any(" status=" in s.replace("signals.status", "")
+                   for s in joined)
+
+
+def _legacy_pending(conn, h, payload_json):
+    cur = conn.execute(
+        "INSERT INTO signals (plugin,content_hash,pair,timeframe,bar_ts,kind,"
+        "payload_json,created_at) VALUES ('p',?,'USDJPY','15m',?,'strategy',?,?)",
+        (h, NOW_UTC, payload_json, NOW_UTC))
+    conn.commit()
+    return cur.lastrowid
+
+
+@pytest.mark.parametrize("payload_json", ['"text"', "[1, 2]", "null", "5"])
+def test_non_object_legacy_payloads_are_abandoned_as_normalization_failed(
+        tmp_path, payload_json):
+    conn = _fresh(tmp_path)
+    sid = _legacy_pending(conn, "h", payload_json)
+    signals.normalize_legacy_strategy_payloads(conn, now=NOW)
+    assert _row(conn, sid)["abandon_reason"] == "normalization_failed"
+
+
+def test_an_unexpected_exception_abandons_only_that_row(tmp_path, monkeypatch):
+    from agentic_fx.plugin import sandbox
+    conn = _fresh(tmp_path)
+    good = json.loads(LEGACY_PAYLOADS.read_text(encoding="utf-8"))["rows"]
+    normalizable = next(r for r in good
+                        if r["expected_after_normalization"] == "normalize")
+    first = _legacy_pending(conn, "boom", json.dumps(normalizable["payload"]))
+    second = _legacy_pending(conn, "ok", json.dumps(normalizable["payload"]))
+    real = sandbox.validate_strategy_result
+    calls = []
+
+    def flaky(result):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("unexpected")
+        return real(result)
+
+    monkeypatch.setattr(sandbox, "validate_strategy_result", flaky)
+    signals.normalize_legacy_strategy_payloads(conn, now=NOW)
+    assert _row(conn, first)["abandon_reason"] == "normalization_failed"
+    assert _row(conn, second)["contract_version"] == "executable_v1"
+
+
+def test_the_status_constant_is_bound_not_interpolated():
+    import inspect
+    src = inspect.getsource(missions.signals_rate_ok)
+    assert "{STATUS_SYSTEM_FILTERED}" not in src
+
+
+def test_the_replay_adapter_keeps_one_name_for_the_intent_mapping():
+    from agentic_fx.plugin import strategy_adapter
+    assert not hasattr(strategy_adapter, "_strategy_result_to_intent")

@@ -49,8 +49,10 @@ def _open_position(env, *, pair="USDJPY"):
 def _add_pending_signal(env, *, bar_ts):
     return signals.add(
         env.conn, plugin="p", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=bar_ts.isoformat(), kind="signal",
-        payload={"direction": "long"}, now=bar_ts)
+        timeframe="1h", bar_ts=bar_ts.isoformat(), kind="strategy",
+        payload={"action": "open", "direction": "long", "entry_type": "market",
+                 "stop_loss": 147.80, "take_profit": 149.00, "horizon": "day"},
+        now=bar_ts, contract_version="executable_v1")
 
 
 # ---------------------------------------------------------------------

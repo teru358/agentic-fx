@@ -50,7 +50,7 @@ def _add_signal(conn, *, plugin="sig1", pair="USDJPY", timeframe="1h",
         conn, plugin=plugin, content_hash="h1", pair=pair, timeframe=timeframe,
         bar_ts=bar_ts.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=bar_ts)
+        now=bar_ts, contract_version="executable_v1")
 
 
 # ---------------------------------------------------------------------
@@ -294,7 +294,7 @@ def _add_at(conn, *, pair, bar_ts, plugin="sma_cross_10_30", timeframe="1h",
         kind="strategy",
         payload={"direction": direction, "stop_loss": 147.0,
                  "take_profit": 150.0},
-        now=bar_ts)
+        now=bar_ts, contract_version="executable_v1")
 
 
 def _signal_row(conn, sid):

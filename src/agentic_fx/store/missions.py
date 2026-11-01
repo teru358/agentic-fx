@@ -334,7 +334,7 @@ def signals_rate_ok(conn: sqlite3.Connection, now: datetime,
     """
     rows = conn.execute(
         "SELECT started_at FROM missions WHERE trigger LIKE 'signal%' "
-        f"AND status <> '{STATUS_SYSTEM_FILTERED}'"
+        "AND status <> ?", (STATUS_SYSTEM_FILTERED,)
     ).fetchall()
     if not rows:
         return True

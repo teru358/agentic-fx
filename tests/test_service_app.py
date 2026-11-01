@@ -1278,7 +1278,7 @@ def test_signal_not_taken_by_any_mission_is_abandoned_only_after_fresh_until(tmp
         app.conn_core, plugin="sma_cross_10_30", content_hash="h",
         pair="USDJPY", timeframe="1h",
         bar_ts=datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc).isoformat(),
-        kind="strategy", payload={"direction": "long"}, now=clock.current)
+        kind="strategy", payload={"direction": "long"}, now=clock.current, contract_version="executable_v1")
     _seed_decision_bar(app.conn_core,
                        datetime(2026, 9, 24, 13, 0, tzinfo=timezone.utc))
     try:
@@ -1326,7 +1326,7 @@ def test_default_1h_cron_claims_signal_and_keeps_existing_prompt_and_rhythm(tmp_
         app.conn_core, plugin="sma_cross_10_30", content_hash="h",
         pair="USDJPY", timeframe="1h",
         bar_ts=(NOW - timedelta(hours=1)).isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     app.supervisor.start()
     try:
         assert _run_tick_and_wait(app, NOW) == 1
@@ -1877,7 +1877,7 @@ def test_startup_recover_interrupted_requeues_signal_claimed_by_running_cron_mis
         app1.conn_core, plugin="sma_cross_10_30", content_hash="h1",
         pair="USDJPY", timeframe="1h",
         bar_ts=(NOW - timedelta(hours=1)).isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
     mid = missions_module.start(app1.conn_core, "trade", "local", "m", NOW,
                                 trigger="cron")
     claimed = signals_store.claim_oldest(app1.conn_core, mission_id=mid,

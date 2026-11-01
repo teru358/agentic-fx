@@ -830,7 +830,7 @@ def test_requeue_signal_happens_under_core_lock(tmp_path):
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW)
+        now=NOW, contract_version="executable_v1")
 
     entered = threading.Event()
     proceed = threading.Event()

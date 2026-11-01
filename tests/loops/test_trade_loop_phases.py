@@ -174,7 +174,7 @@ def test_requeue_signal_does_not_send_notification_itself(tmp_path):
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW)
+        now=NOW, contract_version="executable_v1")
     # Task 13: claimed_by_mission_id に missions(id) への FK が付くため、
     # 実在する mission 行が必要 (以前はダミー整数 1 だった)。
     mid = missions.start(conn, "trade", "local", "m", NOW)
@@ -205,7 +205,7 @@ def test_signal_prepare_exception_after_claim_requeues_signal(tmp_path):
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW)
+        now=NOW, contract_version="executable_v1")
 
     with patch("agentic_fx.loops.trade_loop.missions.set_trigger",
               side_effect=RuntimeError("set_trigger_boom")):
@@ -416,7 +416,7 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW)
+        now=NOW, contract_version="executable_v1")
 
     with patch.object(loop.executor, "open_from_snapshot",
                       wraps=loop.executor.open_from_snapshot) as open_, \
@@ -471,7 +471,7 @@ def test_signals_consume_operational_error_uses_outer_failure_path(tmp_path):
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW)
+        now=NOW, contract_version="executable_v1")
 
     with patch("agentic_fx.loops.trade_loop.signals.consume",
                side_effect=sqlite3.OperationalError("database is locked")):

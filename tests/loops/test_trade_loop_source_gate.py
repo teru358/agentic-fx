@@ -25,7 +25,7 @@ def _add(conn, *, bar_ts=NOW):
     return signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=bar_ts.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=NOW)
+        payload={"direction": "long"}, now=NOW, contract_version="executable_v1")
 
 
 def _last_intent(conn):

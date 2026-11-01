@@ -132,7 +132,7 @@ def test_a_claimed_open_signal_is_rejected_by_the_commit_core_only_for_an_open_o
     signal_id = signals_store.add(
         conn, plugin="strat", content_hash=world.content(strategy), pair="USDJPY",
         timeframe="1h", bar_ts=LOOP_NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=LOOP_NOW)
+        payload={"direction": "long"}, now=LOOP_NOW, contract_version="executable_v1")
     loop._plugins_root = world.root
 
     out = loop.run_once("signal")
