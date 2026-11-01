@@ -3,7 +3,7 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 156 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (4)
 
 ### 不具合 (1)
 
@@ -11,11 +11,12 @@
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 
-### 機能 (2)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
+| [floor-add-selectivity-drawdown-killswitch](open/floor-add-selectivity-drawdown-killswitch.md) | 中 | 2026-11-01 | 収益性フロアに選別度・max DD・kill switch 回数を加える |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
 ## 実装待ち (14)
@@ -72,7 +73,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (133)
+## 設計待ち (132)
 
 ### 不具合 (73)
 
@@ -152,7 +153,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (39)
+### 機能 (38)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -166,7 +167,6 @@
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
-| [floor-add-selectivity-drawdown-killswitch](open/floor-add-selectivity-drawdown-killswitch.md) | 中 | 2026-11-01 | 収益性フロアに選別度・max DD・kill switch 回数を加える |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
