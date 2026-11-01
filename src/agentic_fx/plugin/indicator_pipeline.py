@@ -82,10 +82,12 @@ def _clean_warnings(items: Sequence[str]) -> tuple[str, ...]:
 def payload_fields(report: IndicatorReport) -> dict[str, Any]:
     """The approval payload keys every entry point (improve mission, submit, bless)
     writes for an indicator, in one shape."""
+    warnings = _clean_warnings(report.warnings)
     return {
-        "gate_warnings": list(_clean_warnings(report.warnings)),
+        "gate_warnings": list(warnings),
         "similar_to": [dict(row) for row in report.similar_to[:MAX_SIMILAR]],
-        "scale_columns": sorted(report.scale_columns)[:MAX_SCALE_COLUMNS],
+        "scale_columns": (sorted(report.scale_columns)[:MAX_SCALE_COLUMNS]
+                          if "scale_dependent" in warnings else []),
         "fixture_data_hash": report.fixture_data_hash,
         "fixture_timeframe": report.fixture_timeframe,
     }
@@ -95,9 +97,10 @@ _KIND_RANK = {"duplicate": 4, "monotone": 3, "overlap": 2, "similar": 1}
 
 
 def merge_warnings(old: Any, new: Sequence[str]) -> list[str]:
-    """Existing payload warnings followed by new ones; closed vocabulary only."""
+    """New warnings first, then the existing ones, so that when the cap is hit the
+    oldest are the ones dropped; closed vocabulary only."""
     base = [w for w in old if isinstance(w, str)] if isinstance(old, list) else []
-    return list(_clean_warnings([*base, *new]))
+    return list(_clean_warnings([*new, *base]))
 
 
 def merge_similar(old: Any, new: Sequence[dict[str, str]]) -> list[dict[str, str]]:

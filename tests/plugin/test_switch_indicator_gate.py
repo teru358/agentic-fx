@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agentic_fx import improve_notice_codes as codes
 from agentic_fx.config import load_settings
 from agentic_fx.plugin import indicator_fixture_cache as cache
 from agentic_fx.plugin import indicator_pipeline, switch
@@ -674,10 +675,33 @@ def test_approve_warn_merges_the_new_findings_into_the_existing_payload(env):
     env.install({"cand": fakes.absolute_threshold, "twin": fakes.absolute_threshold})
     updated = switch._rejudge_indicator_at_approval(
         env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
-    assert updated["gate_warnings"] == ["scale_dependent", "duplicate_at_approve"]
+    assert updated["gate_warnings"] == ["duplicate_at_approve", "scale_dependent"]
     assert updated["similar_to"] == [
         {"name": "twin", "column": "value", "kind": "duplicate"},
         {"name": "older", "column": "v", "kind": "similar"}]
+    assert _payload(env.conn, approval_id) == updated
+
+
+def test_approve_keeps_duplicate_at_approve_when_eight_warnings_are_already_stored(env):
+    env.install({"cand": fakes.absolute_threshold, "twin": fakes.absolute_threshold})
+    settings = _with_mode(env.settings, "warn")
+    approval_id = env.submit("cand", settings=settings)
+    payload = _payload(env.conn, approval_id)
+    others = sorted(set(codes.INDICATOR_PAYLOAD_WARNING_CODES)
+                    - {"duplicate_at_approve", "scale_dependent"})
+    payload["gate_warnings"] = others[:7] + ["scale_dependent"]
+    payload["scale_columns"] = ["value"]
+    env.conn.execute("UPDATE approval_requests SET payload_json=? WHERE id=?",
+                     (json.dumps(payload), approval_id))
+    env.conn.commit()
+    env.deploy("twin", "b")
+    env.install({"cand": fakes.absolute_threshold, "twin": fakes.absolute_threshold})
+    updated = switch._rejudge_indicator_at_approval(
+        env.conn, approval_id, payload, settings=settings, plugins_root=env.plugins)
+    assert updated["gate_warnings"][0] == "duplicate_at_approve"
+    assert len(updated["gate_warnings"]) == 8
+    assert "scale_dependent" not in updated["gate_warnings"]
+    assert updated["scale_columns"] == []
     assert _payload(env.conn, approval_id) == updated
 
 

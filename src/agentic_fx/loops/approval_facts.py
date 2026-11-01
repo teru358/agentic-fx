@@ -398,13 +398,25 @@ GATE_COLUMN_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 _GATE_ROW_KEYS = frozenset({"name", "column", "kind"})
 
 
-def _gate_warnings_of(value: Any) -> list[str] | None:
-    if (type(value) is not list or len(value) > _notices.INDICATOR_MAX_WARNINGS
-            or len(set(map(str, value))) != len(value)):
-        return None
-    if not all(type(w) is str and w in _notices.INDICATOR_WARNING_TEXT for w in value):
-        return None
-    return list(value)
+GATE_UNREADABLE_WARNINGS_TEXT = "判読できない警告 {count} 件"
+GATE_UNREADABLE_SIMILAR_TEXT = "判読できない関連 {count} 件"
+
+
+def _gate_warning_parts(value: Any) -> tuple[list[str], int]:
+    """読める語 (重複なし・上限まで) と、読めなかった件数。`None` は無いのと同じ。"""
+    if value is None:
+        return [], 0
+    if type(value) is not list:
+        return [], 1
+    words: list[str] = []
+    unreadable = 0
+    for item in value:
+        if (type(item) is str and item in _notices.INDICATOR_WARNING_TEXT
+                and item not in words and len(words) < _notices.INDICATOR_MAX_WARNINGS):
+            words.append(item)
+        else:
+            unreadable += 1
+    return words, unreadable
 
 
 def _gate_row_ok(row: Any) -> bool:
@@ -418,11 +430,20 @@ def _gate_row_ok(row: Any) -> bool:
                  or GATE_PENDING_PATTERN.match(name) is not None))
 
 
-def _gate_similar_of(value: Any) -> list[dict[str, str]] | None:
-    if (type(value) is not list or len(value) > _notices.INDICATOR_MAX_SIMILAR
-            or not all(_gate_row_ok(row) for row in value)):
-        return None
-    return [dict(row) for row in value]
+def _gate_similar_parts(value: Any) -> tuple[list[dict[str, str]], int]:
+    """読める行 (上限まで) と、読めなかった件数。`None` は無いのと同じ。"""
+    if value is None:
+        return [], 0
+    if type(value) is not list:
+        return [], 1
+    rows: list[dict[str, str]] = []
+    unreadable = 0
+    for row in value:
+        if _gate_row_ok(row) and len(rows) < _notices.INDICATOR_MAX_SIMILAR:
+            rows.append(dict(row))
+        else:
+            unreadable += 1
+    return rows, unreadable
 
 
 def _gate_columns_of(value: Any) -> list[str] | None:
@@ -434,29 +455,48 @@ def _gate_columns_of(value: Any) -> list[str] | None:
 
 
 def gate_fields(source: Any) -> dict[str, Any]:
-    """承認依頼 payload (または ops DTO) の `gate_warnings` / `similar_to` /
-    `scale_columns` のうち、約束の形を満たすものだけ。満たさない欄は `None`
-    (節ごと出さない)。数値や未知の key を持つ行は満たさない扱いで、その欄ごと落ちる。
+    """承認依頼 payload の `gate_warnings` / `similar_to` / `scale_columns` のうち、
+    payload にキーがあるものだけ、読める分に絞って返す (キーが無ければ載せない)。
+    読めない値があれば `gate_unreadable: True` を併載して、不在と区別する。
     例外にしない。"""
     if type(source) is not dict:
-        source = {}
-    return {"gate_warnings": _gate_warnings_of(source.get("gate_warnings")),
-            "similar_to": _gate_similar_of(source.get("similar_to")),
-            "scale_columns": _gate_columns_of(source.get("scale_columns"))}
+        return {}
+    out: dict[str, Any] = {}
+    unreadable = False
+    if "gate_warnings" in source:
+        out["gate_warnings"], dropped = _gate_warning_parts(source["gate_warnings"])
+        unreadable |= dropped > 0
+    if "similar_to" in source:
+        out["similar_to"], dropped = _gate_similar_parts(source["similar_to"])
+        unreadable |= dropped > 0
+    if "scale_columns" in source:
+        raw = source["scale_columns"]
+        columns = [] if raw is None else _gate_columns_of(raw)
+        out["scale_columns"] = columns if columns is not None else []
+        unreadable |= columns is None
+    if unreadable:
+        out["gate_unreadable"] = True
+    return out
 
 
 def gate_lines(source: Any) -> list[str]:
     """承認詳細の警告行。語ごとの固定文、続けて `similar_to` の行ごとに相手と関係。
-    数値 (相関値・出力値) は出さない。CLI / 対話シェル / ops client が呼ぶ。"""
-    fields = gate_fields(source)
+    読めない語・行は落とし、件数を 1 行で示す。数値 (相関値・出力値) は出さない。
+    CLI / 対話シェルが呼び、ops DTO はこの結果を `gate_lines` として運ぶ。"""
+    if type(source) is not dict:
+        source = {}
+    words, bad_words = _gate_warning_parts(source.get("gate_warnings"))
+    rows, bad_rows = _gate_similar_parts(source.get("similar_to"))
+    columns = _gate_columns_of(source.get("scale_columns")) or []
     lines: list[str] = []
-    columns = fields["scale_columns"]
-    for word in fields["gate_warnings"] or ():
+    for word in words:
         text = _notices.INDICATOR_WARNING_TEXT[word]
         if word == "scale_dependent" and columns:
             text += _notices.INDICATOR_COLUMN_TEXT.format(columns=", ".join(columns))
         lines.append(text)
-    for row in fields["similar_to"] or ():
+    if bad_words:
+        lines.append(GATE_UNREADABLE_WARNINGS_TEXT.format(count=bad_words))
+    for row in rows:
         relation = _notices.INDICATOR_RELATION_TEXT[row["kind"]]
         pending = GATE_PENDING_PATTERN.match(row["name"])
         if pending:
@@ -466,4 +506,6 @@ def gate_lines(source: Any) -> list[str]:
             text = _notices.INDICATOR_DEPLOYED_PARTNER_TEXT.format(
                 name=row["name"], relation=relation)
         lines.append(text + _notices.INDICATOR_COLUMN_TEXT.format(columns=row["column"]))
+    if bad_rows:
+        lines.append(GATE_UNREADABLE_SIMILAR_TEXT.format(count=bad_rows))
     return lines

@@ -243,16 +243,8 @@ def test_tabs_in_a_claim_and_in_a_diff_line_become_four_spaces():
 
 # ---------------------------------------------------------------- indicator gate の警告節の予約
 
-def _largest_gate_fields():
-    words = sorted(render.GATE_WARNING_TEXT, key=lambda w: -len(render.GATE_WARNING_TEXT[w].encode()))
-    words = words[:render.GATE_MAX_WARNINGS]
-    if "scale_dependent" not in words:
-        words[-1] = "scale_dependent"
-    column = "c" * 32
-    return {"gate_warnings": words,
-            "scale_columns": [f"{'c' * 31}{i}" for i in range(render.GATE_MAX_SCALE_COLUMNS)],
-            "similar_to": [{"name": "n" * 64, "column": column, "kind": "monotone"}
-                           for _ in range(render.GATE_MAX_SIMILAR)]}
+def _largest_gate_lines():
+    return ["警告: " + "あ" * 80] * render.MAX_GATE_LINES
 
 
 def _full_budget_change_data():
@@ -263,27 +255,62 @@ def _full_budget_change_data():
     return change_data(change, claims=claims, files=[entry("plugin.py", lines)])
 
 
+def _baseline_big_section():
+    return "<section><h2>配備中の版</h2>" + "".join(
+        "<p>" + "b" * 200 + "</p>" for _ in range(200)) + "</section>"
+
+
 def test_the_largest_gate_section_never_clips_a_page_whose_other_sections_fill_their_budget():
     data = _full_budget_change_data()
     detail = dict(DETAIL)
     plain = render.compose_approval_page(detail, data["change"], data).page
     assert len(plain) < render.PAGE_LIMIT_BYTES and b"Output clipped" not in plain
-    fields = _largest_gate_fields()
-    detail.update(fields)
+    detail["gate_lines"] = _largest_gate_lines()
     page = render.render_approval(detail, data)
     assert b"Output clipped" not in page and len(page) < render.PAGE_LIMIT_BYTES
     text = page.decode()
-    for word in fields["gate_warnings"]:
-        assert render.GATE_WARNING_TEXT[word].split(" (")[0] in text
-    assert text.count("警告: 配備済み `" + "n" * 64 + "` の単調変換") == render.GATE_MAX_SIMILAR
+    assert text.count("警告: " + "あ" * 80) == render.MAX_GATE_LINES
     assert "<h3>plugin.py</h3>" in text
 
 
-def test_the_gate_section_is_counted_in_the_budget_of_the_other_sections():
+def test_the_extra_sections_are_counted_in_the_budget_of_the_other_sections():
     data = _full_budget_change_data()
     detail = dict(DETAIL)
-    detail.update(_largest_gate_fields())
     built = render.compose_approval_page(detail, data["change"], data,
-                                         extra_html="<section>" + "g" * 3000 + "</section>")
+                                         extra_sections=["<section>" + "g" * 3000 + "</section>"])
     assert b"Output clipped" not in built.page
     assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+
+
+def test_other_sections_shrink_before_the_extra_sections_are_clipped():
+    data = _full_budget_change_data()
+    built = render.compose_approval_page(
+        dict(DETAIL), data["change"], data,
+        extra_sections=["<section>" + "g" * 1000 + "</section>"])
+    assert b"g" * 1000 in built.page
+    assert render.EXTRA_OMITTED_SECTION.encode() not in built.page
+
+
+def test_an_oversized_baseline_section_is_clipped_whole_with_an_omission_line():
+    data = _full_budget_change_data()
+    detail = dict(DETAIL)
+    gate_section = "<section><h2>indicator gate の警告</h2><ul><li>GATE-LINE</li></ul></section>"
+    built = render.compose_approval_page(
+        detail, data["change"], data,
+        extra_sections=[_baseline_big_section(), gate_section])
+    text = built.page.decode()
+    assert "GATE-LINE" in text and "bbbbbbbbbb" not in text
+    assert render.EXTRA_OMITTED_SECTION in text
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+    assert b"Output clipped" not in built.page
+
+
+def test_other_bytes_stay_within_budget_for_the_largest_baseline_and_gate_together():
+    data = _full_budget_change_data()
+    detail = dict(DETAIL)
+    detail["gate_lines"] = _largest_gate_lines()
+    built = render.compose_approval_page(
+        detail, data["change"], data,
+        extra_sections=[_baseline_big_section(), render._gate_section(detail)])
+    assert built.other_bytes <= render.OTHER_BUDGET_BYTES
+    assert "警告: " in built.page.decode()

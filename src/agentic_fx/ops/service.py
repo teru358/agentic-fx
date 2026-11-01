@@ -835,14 +835,17 @@ class OpsService:
             raise OpsError(ErrorCode.INVALID_STATE)
         change = self._change_of(approval_id, row["status"], payload, journals,
                                  include_diff=False).summary
-        return {"id": approval_id, "kind": display_text(row["kind"]),
+        gate = approval_facts.gate_fields(payload)
+        if gate:
+            gate["gate_lines"] = approval_facts.gate_lines(payload)
+        return {**gate,
+                "id": approval_id, "kind": display_text(row["kind"]),
                 "status": row["status"], "change": change,
                 "parent_facts": payload.get("parent_facts"),
                 "agent_claims": payload.get("agent_claims"),
                 "facts_lines": approval_facts.render_facts_lines(payload),
                 "in_sample": payload.get("in_sample"), "holdout": payload.get("holdout"),
                 "baseline": payload.get("baseline"),
-                **approval_facts.gate_fields(payload),
                 "baseline_hash_warning": _baseline_hash_warning(payload, self._plugins_root,
                                                               row["status"]),
                 "payload_sha256": payload_sha256(row["payload_json"]),

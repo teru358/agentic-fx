@@ -1521,6 +1521,8 @@ def _rejudge_indicator_at_approval(conn: sqlite3.Connection, approval_id: int,
     updated = dict(payload)
     updated["gate_warnings"] = indicator_pipeline.merge_warnings(
         payload.get("gate_warnings"), result.warnings)
+    if "scale_columns" in updated and "scale_dependent" not in updated["gate_warnings"]:
+        updated["scale_columns"] = []
     updated["similar_to"] = indicator_pipeline.merge_similar(
         payload.get("similar_to"), result.similar_to)
     conn.execute("BEGIN IMMEDIATE")

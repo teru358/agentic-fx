@@ -72,10 +72,10 @@ def test_payload_fields_have_exactly_the_documented_keys_and_copy_rows():
     assert fields["similar_to"][0] is not rows[0]
 
 
-def test_merge_warnings_keeps_old_first_then_new_in_the_closed_vocabulary():
+def test_merge_warnings_puts_new_first_then_old_in_the_closed_vocabulary():
     out = pipeline.merge_warnings(
         ["scale_dependent", 3, "foreign", None], ["duplicate_at_approve", "scale_dependent"])
-    assert out == ["scale_dependent", "duplicate_at_approve"]
+    assert out == ["duplicate_at_approve", "scale_dependent"]
 
 
 def test_merge_warnings_drops_old_items_that_are_not_hashable_words():
@@ -88,9 +88,15 @@ def test_merge_warnings_ignores_an_old_value_that_is_not_a_list(old):
     assert pipeline.merge_warnings(old, ["sparse_output"]) == ["sparse_output"]
 
 
-def test_merge_warnings_caps_at_eight_keeping_the_old_ones():
+def test_merge_warnings_caps_at_eight_dropping_the_oldest_first():
     out = pipeline.merge_warnings(VOCAB[:6], VOCAB[6:10])
-    assert out == VOCAB[:8]
+    assert out == VOCAB[6:10] + VOCAB[:4]
+
+
+def test_merge_warnings_keeps_a_new_word_when_eight_old_ones_are_stored():
+    old = [w for w in VOCAB if w != "duplicate_at_approve"][:8]
+    out = pipeline.merge_warnings(old, ["duplicate_at_approve"])
+    assert out == ["duplicate_at_approve"] + old[:7]
 
 
 def test_merge_similar_orders_by_kind_strength_and_keeps_three():
@@ -848,8 +854,13 @@ def test_a_candidate_without_scale_dependence_has_no_scale_columns(tmp_path, mon
     assert report.scale_columns == ()
 
 
-def test_scale_columns_are_capped_sorted_and_kept_off_the_payload_when_empty():
+def test_scale_columns_are_capped_sorted_and_an_empty_list_when_there_are_none():
     many = tuple(f"c{i:02d}" for i in range(12))[::-1]
     report = pipeline.IndicatorReport(warnings=("scale_dependent",), scale_columns=many)
     assert pipeline.payload_fields(report)["scale_columns"] == sorted(many)[:8]
     assert pipeline.payload_fields(pipeline.IndicatorReport())["scale_columns"] == []
+
+
+def test_scale_columns_are_left_out_when_scale_dependent_is_not_a_stored_warning():
+    report = pipeline.IndicatorReport(warnings=("sparse_output",), scale_columns=("gap",))
+    assert pipeline.payload_fields(report)["scale_columns"] == []

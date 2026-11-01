@@ -1,6 +1,6 @@
 # indicator 候補の銘柄非依存と重複を決定論 gate で検査する — 設計 C0
 
-**版:** v0.6 C0 (裁定済、実装待ち。実測 [meas-indgate] 6 便を反映)
+**版:** v0.6.5 C0 (裁定済、実装待ち。実測 [meas-indgate] 6 便を反映)
 **チケット:** `indicator-symbol-agnostic-and-duplicate-gate` (中、機能)。`indicator-reference-oracle-gate` (低、参照値一致) は対象外だが、本束の fixture 実行経路を後で流用できる。
 **正本の関係:** 改善ループの質は `2026-10-19-improve-loop-quality-design.md`、族表と注入面は `2026-10-24-improve-feedback-structure-design.md`、承認画面の事実欄は `2026-10-19-approval-content-design.md`、参照系列は `2026-10-25-reference-series-design.md`。いずれも変えず、indicator の gate に段を足す (族表の読み取り列だけ §4 で広げる)。多入力 indicator (`multi-input-indicator-relations`) は本束の後。
 
@@ -66,7 +66,7 @@
 
 **agent に見えるもの。** 落ちた理由は strategy の床と違い holdout 数値を含まないので、**固定語を agent に返す** (`last_result` = `observation:gate_failed:<固定語>`。現行は `gate_failed` に畳まれるので固定語を通す分岐を足す)。重複・単調変換の重複で落ちたときの相手名は `last_result` には載せず、次 mission の族表 (relation、§3.6) だけで返す (名前は inventory で既に見える語、`family_redirect` と同じ配備済み名 allowlist、§3.7)。次の mission の族表 (`family_attempts`) には indicator 行にも relation (「同等」「単調変換」「一部重複」「類似」+ 相手名) が残る。数値 (相関値・出力値)・候補名・列値・fixture の情報は agent に出さない。
 
-**warning で通るとき。** `scale_dependent`・`indicator_monotone_duplicate` (mode warn のとき)・`indicator_similar`・`indicator_output_overlap`・`sparse_output`・`output_constant_suspect`・`legacy_symbol_name`・`indicator_redefined` の候補は承認に進み、承認依頼 payload に `gate_warnings` と `similar_to` (§3.6) が付く。CLI (`afx ctl approvals <id>`)・対話シェル・ops API+client・web の承認詳細に「警告: 価格または出来高のスケールに依存する出力 (別銘柄で挙動が変わる可能性)」「警告: 配備済み `ema` と類似」の行を出す (数値は親専有レポートにだけ)。Discord の提出通知には出さない。reject 語は終了通知の reason_code になるため、新 code を `improve_notice_codes.py` に足す (2026-10-25 裁定の固定語への追加、§4)。
+**warning で通るとき。** `scale_dependent`・`indicator_monotone_duplicate` (mode warn のとき)・`indicator_similar`・`indicator_output_overlap`・`sparse_output`・`output_constant_suspect`・`legacy_symbol_name`・`indicator_redefined` の候補は承認に進み、承認依頼 payload に `gate_warnings` と `similar_to` (§3.6) が付く。CLI (`afx ctl approvals <id>`)・対話シェル・ops API+client・web の承認詳細に「警告: 価格または出来高のスケールに依存する出力 (別銘柄で挙動が変わる可能性)」「警告: 配備済み `ema` と類似」の行を出す (数値は親専有レポートにだけ)。Discord の提出通知には出さない。読めない語・行 (語彙外・型違い・上限超過) は、読める行だけを出し、落とした分は「判読できない警告 N 件」「判読できない関連 N 件」の 1 行で示す (無警告と区別がつく)。reject 語は終了通知の reason_code になるため、新 code を `improve_notice_codes.py` に足す (2026-10-25 裁定の固定語への追加、§4)。
 
 **同名更新。** 配備中の同名 indicator がある候補は、重複比較の相手から自分の配備中の版を除く。承認待ち (pending) の indicator 候補は比較相手に加わる (repeat で同じ式の別名が並ぶ経路を閉じる)。名前検査は新名と同じだが、配備済みの銘柄名入り 4 本の同名更新だけは `legacy_symbol_name` warning で通す (§8 J1)。outputs 契約が変わる、旧版との類似が低い、全列を再定義している候補は `indicator_redefined` warning を承認者に出す (同名更新を別物の差し替えに使えないようにする、§3.5)。
 
@@ -135,7 +135,7 @@
 - `gate_warnings: list[str]` — §3.7 の warning 語彙のみ、重複なし、最大 8。
 - `similar_to: list[{name, column, kind}]` — 最大 3、`name` は配備済み名、`column` は識別子、`kind` ∈ {`duplicate`, `monotone`, `overlap`, `similar`}。承認待ちの候補が相手のときは、承認者の画面にだけ候補の id を出し、agent 面には出さない。
 
-生成入口 3 (改善 mission / `submit_candidate` / `bless_candidate`) が同じ形を作り、表示 4 面 (CLI / 対話シェル / ops API+client / web) が同じ語彙を読む。warning は `GateOutcome` に載せる (`_run_full_gate` の 4 要素 tuple は変えない)。キー無しの旧 payload と壊れた payload (型違い・語彙外) は fail-soft (表示しない、承認操作は妨げない)。
+生成入口 3 (改善 mission / `submit_candidate` / `bless_candidate`) が同じ形を作り、表示 4 面 (CLI / 対話シェル / ops API+client / web) が同じ語彙を読む。warning は `GateOutcome` に載せる (`_run_full_gate` の 4 要素 tuple は変えない)。キー無しの旧 payload は何も出さない。壊れた値 (型違い・語彙外・上限超過) は行単位で fail-soft にし、壊れた行だけを落として件数を 1 行で示す (承認操作は妨げない)。ops DTO は payload にキーがあるものだけ `gate_warnings` / `similar_to` / `scale_columns` を読める分に絞って載せ、読めない値があれば `gate_unreadable: true` を併載し、描画済みの行を `gate_lines` として運ぶ (web は語表を持たずその行を表示するだけ)。`scale_columns` は `scale_dependent` が保存された warning にあるときだけ中身を持ち、無ければ `[]`。承認時の再判定の merge は新しい warning を先頭に置き、上限 8 を超える分は古い語から落とす。
 
 族表の relation: `candidate_archives` に `relation` 列 (JSON: `kind` ∈ {`duplicate`, `monotone`, `overlap`, `similar`}、`name` = 配備済み名のみ) を足す。`improve_context` の族表読み取りは 3 列 + `relation` に広げ、`project_last_result` と同じ配備済み名 allowlist を通して投影する。未配備の相手名は出さない。族表の行 `indicator (未配備) @<足>` は複数候補をまとめた行なので、relation が複数あるときは kind の強い順に 1 行へまとめ、相手名は 3 本まで。公開 schema (2026-10-24 設計の族表節) の改訂は本 spec §4 に書き、正本の改訂は実装時に指揮者が行う。
 
@@ -244,3 +244,4 @@
 | 2026-10-31 | v0.6.2 C0 | §3.7 の warning 語彙に bless 限定の `symbol_in_name` / `param_price_unit` と、approve 再判定の `duplicate_at_approve` (warn では warning、enforce では失敗語) を明示 | T3 レビュー 1 周目 (閉語彙外の語) | |
 | 2026-10-31 | v0.6.3 C0 | 配備済み 1 本の候補起因の probe 失敗は環境事象でなく、その 1 本を比較から外して `duplicate_unavailable` warning (改善ループでも候補は通す) に (§3.4)。壊れた配備済み 1 本で indicator の改善が永久停止するのを防ぐ | T3 レビュー 2 周目 #5 | |
 | 2026-10-31 | v0.6.4 C0 | `duplicate_unavailable` の注記を v0.6.3 の規則に揃え、approve 再判定にも同じ規則を明示 (§3.4 / §3.7) | T3 cr 是正の申し送り | |
+| 2026-11-01 | v0.6.5 C0 | 表示は壊れた行だけ落として件数を 1 行で示す (§2 / §3.6)。ops DTO は payload にあるキーだけ載せ `gate_unreadable` と描画済みの `gate_lines` を運び、web は表を持たない。`scale_columns` は `scale_dependent` があるときだけ中身を持つ。再判定の merge は新語を先頭に | T4 /code-review high の #1〜#7 | |

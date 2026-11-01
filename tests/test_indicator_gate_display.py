@@ -1,10 +1,9 @@
 """承認詳細に出す indicator gate の警告 (`gate_warnings` / `similar_to` /
 `scale_columns`): 語 -> 文の表、共有の行生成、CLI / ops DTO / ops client の 3 面が
-同じ文を出すこと、壊れた値は節ごと出さず例外にしないこと、数値を出さないこと。
-web 面は別 package なので `ast` で表を読んで突き合わせる。"""
+同じ文を出すこと、壊れた行だけ落として件数を 1 行で示し例外にしないこと、数値を出さないこと。
+web 面は daemon が描画した行 (DTO の `gate_lines`) を表示するだけで、表を持たない。"""
 from __future__ import annotations
 
-import ast
 import json
 import re
 from datetime import datetime, timezone
@@ -28,8 +27,6 @@ from agentic_fx.store.state import StateStore
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=timezone.utc)
 SETTINGS = load_settings(
     Path(__file__).resolve().parents[1] / "config" / "settings.yaml.example")
-WEB_RENDER = (Path(__file__).resolve().parents[1] / "afx-ops" / "afx_ops" / "web"
-              / "render.py")
 
 SCALE_LINE = ("警告: 価格または出来高のスケールに依存する出力 "
               "(別銘柄で挙動が変わる可能性)")
@@ -117,46 +114,80 @@ def test_a_payload_without_findings_prints_nothing(payload):
     assert approval_facts.gate_lines(_payload(**payload)) == []
 
 
-# --- 壊れた値は節ごと出さず、例外にしない -------------------------------------
+# --- 壊れた行だけ落とし、件数を 1 行で示す。例外にしない -----------------------
+
+UNREADABLE_WARNINGS = "判読できない警告 {} 件"
+UNREADABLE_SIMILAR = "判読できない関連 {} 件"
 
 BAD_WARNINGS = [
-    "scale_dependent", {"scale_dependent": 1}, 7, [1], [None], [["scale_dependent"]],
-    ["unknown_word"], ["scale_dependent", "unknown_word"],
-    ["scale_dependent", "scale_dependent"],
-    [list(codes.INDICATOR_WARNING_TEXT)[0]] * 2,
-    list(codes.INDICATOR_WARNING_TEXT)[:9] + ["sparse_output"],
+    ("scale_dependent", 1), ({"scale_dependent": 1}, 1), (7, 1), ([1], 1), ([None], 1),
+    ([["scale_dependent"]], 1), (["unknown_word"], 1),
 ]
 
 
-@pytest.mark.parametrize("bad", BAD_WARNINGS)
-def test_a_broken_gate_warnings_section_prints_nothing_and_keeps_the_other(bad):
+@pytest.mark.parametrize("bad,count", BAD_WARNINGS)
+def test_a_broken_gate_warnings_value_is_one_unreadable_line_and_keeps_the_other(bad, count):
     payload = _payload(gate_warnings=bad, similar_to=[_row()])
     assert approval_facts.gate_lines(payload) == [
-        "警告: 配備済み `ema` と類似 (列: value)"]
-    assert approval_facts.gate_fields(payload)["gate_warnings"] is None
+        UNREADABLE_WARNINGS.format(count), "警告: 配備済み `ema` と類似 (列: value)"]
+    assert approval_facts.gate_fields(payload)["gate_warnings"] == []
+    assert approval_facts.gate_fields(payload)["gate_unreadable"] is True
 
 
-BAD_SIMILAR = [
-    "ema", {"name": "ema"}, 3, [1], ["ema"], [None],
-    [{"name": "ema", "column": "value"}],
-    [{"name": "ema", "column": "value", "kind": "similar", "corr": 0.99}],
-    [{"name": "ema", "column": "value", "kind": "unknown"}],
-    [{"name": "ema", "column": "value", "kind": 1}],
-    [{"name": 1, "column": "value", "kind": "similar"}],
-    [{"name": "EMA bad", "column": "value", "kind": "similar"}],
-    [{"name": "ema", "column": "va lue", "kind": "similar"}],
-    [{"name": "pending-x", "column": "value", "kind": "similar"}],
-    [_row(), 1], [_row()] * 4,
-    [{"name": "ema", "column": "value", "kind": "similar", "x": 1}],
+def test_known_words_are_shown_and_only_the_unknown_ones_are_counted():
+    payload = _payload(gate_warnings=["scale_dependent", "future_code", 5,
+                                      "scale_dependent", "sparse_output"])
+    assert approval_facts.gate_lines(payload) == [
+        SCALE_LINE, codes.INDICATOR_WARNING_TEXT["sparse_output"],
+        UNREADABLE_WARNINGS.format(3)]
+
+
+def test_words_over_the_cap_are_counted_not_dropped_silently():
+    words = list(codes.INDICATOR_WARNING_TEXT)[:9]
+    lines = approval_facts.gate_lines(_payload(gate_warnings=words))
+    assert lines == [codes.INDICATOR_WARNING_TEXT[w] for w in words[:8]] + [
+        UNREADABLE_WARNINGS.format(1)]
+
+
+BAD_SIMILAR_VALUES = ["ema", {"name": "ema"}, 3]
+BAD_SIMILAR_ROWS = [
+    1, "ema", None,
+    {"name": "ema", "column": "value"},
+    {"name": "ema", "column": "value", "kind": "similar", "corr": 0.99},
+    {"name": "ema", "column": "value", "kind": "unknown"},
+    {"name": "ema", "column": "value", "kind": 1},
+    {"name": 1, "column": "value", "kind": "similar"},
+    {"name": "EMA bad", "column": "value", "kind": "similar"},
+    {"name": "ema", "column": "va lue", "kind": "similar"},
+    {"name": "pending-x", "column": "value", "kind": "similar"},
 ]
 
 
-@pytest.mark.parametrize("bad", BAD_SIMILAR)
-def test_a_broken_similar_to_section_prints_nothing_and_keeps_the_other(bad):
+@pytest.mark.parametrize("bad", BAD_SIMILAR_VALUES)
+def test_a_similar_to_value_that_is_not_a_list_is_one_unreadable_line(bad):
     payload = _payload(gate_warnings=["sparse_output"], similar_to=bad)
     assert approval_facts.gate_lines(payload) == [
-        codes.INDICATOR_WARNING_TEXT["sparse_output"]]
-    assert approval_facts.gate_fields(payload)["similar_to"] is None
+        codes.INDICATOR_WARNING_TEXT["sparse_output"], UNREADABLE_SIMILAR.format(1)]
+    assert approval_facts.gate_fields(payload)["similar_to"] == []
+
+
+@pytest.mark.parametrize("bad", BAD_SIMILAR_ROWS)
+def test_one_broken_similar_row_does_not_hide_the_good_ones(bad):
+    payload = _payload(gate_warnings=["sparse_output"],
+                       similar_to=[_row("a", "x", "duplicate"), bad,
+                                   _row("b", "y", "monotone")])
+    assert approval_facts.gate_lines(payload) == [
+        codes.INDICATOR_WARNING_TEXT["sparse_output"],
+        "警告: 配備済み `a` と同等 (列: x)", "警告: 配備済み `b` の単調変換 (列: y)",
+        UNREADABLE_SIMILAR.format(1)]
+    fields = approval_facts.gate_fields(payload)
+    assert [r["name"] for r in fields["similar_to"]] == ["a", "b"]
+    assert fields["gate_unreadable"] is True
+
+
+def test_similar_rows_over_the_cap_are_counted():
+    lines = approval_facts.gate_lines(_payload(similar_to=[_row(f"n{i}") for i in range(5)]))
+    assert lines[-1] == UNREADABLE_SIMILAR.format(2) and len(lines) == 4
 
 
 @pytest.mark.parametrize("bad", [
@@ -170,8 +201,18 @@ def test_broken_scale_columns_are_left_off_the_sentence(bad):
 @pytest.mark.parametrize("payload", [None, 3, "x", [], [1]])
 def test_a_value_that_is_not_a_mapping_prints_nothing(payload):
     assert approval_facts.gate_lines(payload) == []
-    assert approval_facts.gate_fields(payload) == {
-        "gate_warnings": None, "similar_to": None, "scale_columns": None}
+    assert approval_facts.gate_fields(payload) == {}
+
+
+def test_gate_fields_carry_only_the_keys_the_payload_has():
+    assert approval_facts.gate_fields(_payload()) == {}
+    assert approval_facts.gate_fields(_payload(similar_to=[])) == {"similar_to": []}
+    assert approval_facts.gate_fields(_payload(**FULL)) == FULL
+
+
+def test_a_broken_scale_columns_value_is_marked_unreadable():
+    fields = approval_facts.gate_fields(_payload(scale_columns="gap"))
+    assert fields == {"scale_columns": [], "gate_unreadable": True}
 
 
 def test_numbers_never_reach_the_lines():
@@ -232,46 +273,22 @@ def test_cli_legacy_payload_without_the_keys_prints_no_warning_line(tmp_path):
 def test_cli_survives_broken_values_in_every_key(tmp_path, bad):
     out = _show(tmp_path, _payload(gate_warnings=bad, similar_to=bad,
                                    scale_columns=bad))
-    assert "警告" not in out and out.startswith("approval #")
+    assert out.startswith("approval #")
+    assert "判読できない警告 1 件" in out and "判読できない関連 1 件" in out
+    assert "警告: 配備済み" not in out
 
 
-# --- web (別 package) の表との一致 ---------------------------------------------
+# --- web は daemon の行を表示するだけ (表の複製を持たない) ----------------------
 
-def _web_literals() -> dict:
-    found: dict = {}
-    for node in ast.parse(WEB_RENDER.read_text(encoding="utf-8")).body:
-        if isinstance(node, ast.AnnAssign):
-            targets, value = [node.target], node.value
-        elif isinstance(node, ast.Assign):
-            targets, value = node.targets, node.value
-        else:
-            continue
-        for target in targets:
-            if isinstance(target, ast.Name) and target.id.startswith("GATE_"):
-                try:
-                    found[target.id] = ast.literal_eval(value)
-                except (ValueError, SyntaxError):
-                    pass
-    return found
+WEB_RENDER = (Path(__file__).resolve().parents[1] / "afx-ops" / "afx_ops" / "web"
+              / "render.py")
 
 
-def test_the_web_tables_are_the_same_words_and_sentences_as_the_daemon_tables():
-    web = _web_literals()
-    assert web["GATE_WARNING_TEXT"] == codes.INDICATOR_WARNING_TEXT
-    assert web["GATE_RELATION_TEXT"] == codes.INDICATOR_RELATION_TEXT
-    assert web["GATE_DEPLOYED_PARTNER_TEXT"] == codes.INDICATOR_DEPLOYED_PARTNER_TEXT
-    assert web["GATE_PENDING_PARTNER_TEXT"] == codes.INDICATOR_PENDING_PARTNER_TEXT
-    assert web["GATE_COLUMN_TEXT"] == codes.INDICATOR_COLUMN_TEXT
-    assert web["GATE_MAX_WARNINGS"] == codes.INDICATOR_MAX_WARNINGS
-    assert web["GATE_MAX_SIMILAR"] == codes.INDICATOR_MAX_SIMILAR
-    assert web["GATE_MAX_SCALE_COLUMNS"] == codes.INDICATOR_MAX_SCALE_COLUMNS
-
-
-def test_the_web_patterns_are_the_same_as_the_daemon_patterns():
-    web = _web_literals()
-    assert web["GATE_NAME_PATTERN"] == approval_facts.GATE_NAME_PATTERN.pattern
-    assert web["GATE_PENDING_PATTERN"] == approval_facts.GATE_PENDING_PATTERN.pattern
-    assert web["GATE_COLUMN_PATTERN"] == approval_facts.GATE_COLUMN_PATTERN.pattern
+def test_the_web_package_holds_no_copy_of_the_warning_tables():
+    source = WEB_RENDER.read_text(encoding="utf-8")
+    assert "GATE_WARNING_TEXT" not in source and "GATE_RELATION_TEXT" not in source
+    for sentence in codes.INDICATOR_WARNING_TEXT.values():
+        assert sentence not in source
 
 
 def test_the_shell_has_no_approval_rendering_of_its_own():
