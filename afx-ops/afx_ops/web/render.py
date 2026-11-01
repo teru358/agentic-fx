@@ -6,6 +6,7 @@ import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 
+from afx_ops.metric_words import metric_items
 from afx_ops.web.routes import ROUTE_TABLE, resolve_route
 
 MAX_TEXT = 512
@@ -411,7 +412,8 @@ def _performance_section(change: Mapping[str, object]) -> str:
             pair = row.get("pair")
             tag = f"{scope} {_cut(pair, 16)}" if pair else scope
             pairs.append((tag, f"trades={_num(row.get('trades'))} PF={_num(row.get('pf'))} "
-                               f"avg_r={_num(row.get('avg_r'))}"))
+                               f"avg_r={_num(row.get('avg_r'))}"
+                               + "".join(" " + _text(item) for item in metric_items(row))))
     return "<section><h2>成績</h2>" + _rows(pairs) + "</section>"
 
 

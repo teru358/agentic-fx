@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agentic_fx._safe_error import one_line_error, safe_error_text
+from agentic_fx import metric_words
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.core.contracts import Clock
 from agentic_fx.core.idea_check import idea_looks_unintended, normalize_idea_display
@@ -682,6 +683,7 @@ class Commands:
                 cells.append(f"{key}={approval_facts.num_text(v)}")
             else:
                 return f"{prefix}: {approval_facts.INVALID_FORMAT_TEXT}"
+        cells += metric_words.metric_items(metrics)
         return f"{prefix}: " + " ".join(cells)
 
     _METRIC_KEYS = frozenset({"pf", "trades", "avg_r", "max_drawdown"})

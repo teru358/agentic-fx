@@ -471,3 +471,14 @@ def test_a_degraded_diff_file_says_the_computation_was_skipped():
     entry["diff_degraded"] = "too_many_lines"
     text = render.compose_approval_page(DETAIL, make_change(), make_change_data([entry])).page.decode()
     assert render.DIFF_DEGRADED_TEXT in text
+
+
+def test_performance_rows_show_win_rate_max_dd_and_kill_switch_for_both_scopes():
+    from afx_ops.web.render import _performance_section
+    row = {"pair": "USDJPY", "trades": 20, "pf": 1.18, "avg_r": 0.08, "win_rate": 0.4067,
+           "max_drawdown": 0.2903, "kill_switch_latches": 55}
+    text = _performance_section({"performance": {"in_sample": [row], "holdout": [row]}})
+    assert text.count("勝率 40.7% max DD 29.0% kill switch 55回") == 2
+    old = _performance_section({"performance": {"in_sample": [{"pair": "USDJPY", "trades": 1}],
+                                                "holdout": []}})
+    assert "勝率" not in old

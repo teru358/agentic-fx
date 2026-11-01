@@ -538,3 +538,28 @@ def test_a_params_key_cannot_start_a_markdown_block(key):
                if s.startswith("変更:")][0]
     row = section.split("\n")[1]
     assert not re.match(r"\s*(?:-#|[-+*#>]|\d+[.)])(?:\s|$)", row)
+
+
+def test_in_sample_line_carries_win_rate_max_dd_and_kill_switch_but_holdout_stays_hidden():
+    row = {"pair": "USDJPY", "trades": 864, "pf": 1.002, "avg_r": 0.004158,
+           "win_rate": 0.429, "max_drawdown": 0.263, "kill_switch_latches": 55}
+    change = _change(performance={"in_sample": [row],
+                                  "holdout": [dict(row, pair="HOLDOUT_PAIR", win_rate=0.777)]})
+    content = render_approval(_record(), _detail(change))
+    assert ("成績 (in-sample):\nUSDJPY / trades 864 / PF 1.002 / avg R 0.004158 / "
+            "勝率 42.9% / max DD 26.3% / kill switch 55回") in content
+    assert "HOLDOUT_PAIR" not in content and "77.7" not in content
+    assert len(content) <= 2000
+
+
+def test_old_row_without_the_new_keys_renders_as_before():
+    content = render_approval(_record(), _detail())
+    assert "勝率" not in content and "kill switch" not in content
+
+
+def test_the_new_items_stay_inside_the_body_limit_at_the_row_cap():
+    row = {"trades": 864, "pf": 1.002, "avg_r": 0.004158, "win_rate": 0.429,
+           "max_drawdown": 0.263, "kill_switch_latches": 55}
+    rows = [dict(row, pair=f"PAIR{i}") for i in range(12)]
+    content = render_approval(_record(), _detail(_change(performance={"in_sample": rows})))
+    assert len(content) <= 2000 and "ほか 8 件" in content

@@ -119,7 +119,7 @@ def test_new_format_shows_parent_section_before_claims_with_fixed_note(
         "  引用: 選んだ課題の文面 (agent 起票): IDEA"]
     # 親欄は metrics の後、自己申告欄は reason 行の前
     assert lines.index("holdout: pf=0.9 trades=40 avg_r=-0.1 "
-                       "max_drawdown=0.06") < parent
+                       "max_drawdown=0.06 max DD 6.0%") < parent
     assert claims < next(i for i, ln in enumerate(lines)
                          if ln.startswith("reason="))
 
