@@ -1,16 +1,16 @@
 ---
 id: news-store-duplicate-id-in-batch
 title: 同一 feed 内の重複 URL で news の保存バッチが丸ごと失敗する (DuplicateIDError)
-status: 実装待ち
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-10-31
-closed: null
+closed: 2026-11-01
 related: []
 ---
 # [news-store-duplicate-id-in-batch] 同一 feed 内の重複 URL で news の保存バッチが丸ごと失敗する (DuplicateIDError)
 
-**状態**: 実装待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -26,6 +26,9 @@ add_news がバッチ内 ID の一意化をしていない。chromadb の upsert
 
 ## 修正内容
 
+- 2026-11-01: add_news がバッチ内の同一 ID (rag_id、無ければ url) を後勝ちで 1 件に畳んでから upsert する。test 3 本 (同 URL 2 件、同 rag_id 2 件、実 feed 形 50 件中一意 48 が collector 経由で news_store_failed を出さない)。rag/news 693、datafeed 662、store 1140 緑
+
 ## 経緯
 
 - 2026-10-31: 起票 (ログの DuplicateIDError をユーザーが発見、原因は指揮者が実 feed で確認)。
+- 2026-11-01: 是正内容 — add_news がバッチ内の同一 ID (rag_id、無ければ url) を後勝ちで 1 件に畳んでから upsert する。test 3 本 (同 URL 2 件、同 rag_id 2 件、実 feed 形 50 件中一意 48 が collector 経由で news_store_failed を出さない)。rag/news 693、datafeed 662、store 1140 緑
