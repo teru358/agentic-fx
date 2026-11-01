@@ -276,12 +276,15 @@ def _lead_lag_impl(conn: sqlite3.Connection, a: str, b: str, *,
     ret_b = _load_returns(conn, b, timeframe, dataset=dataset,
                           in_sample_until=in_sample_until, since=since)
     corrs: dict[int, float] = {}
+    n_obs_by_lag: dict[int, int] = {}
     for k in LAGS:
         xs, ys = _align_lagged(ret_a, ret_b, lag_bars=k, width_minutes=width)
         # 全 lag のうち 1 つでも観測不足なら ValueError (分母 25 を固定 — §C)
         corrs[k] = _pearson(xs, ys)
+        n_obs_by_lag[k] = len(xs)
     peak_lag = _pick_peak(corrs)
-    return {"peak_lag": peak_lag, "peak_corr": corrs[peak_lag]}, len(LAGS)
+    return ({"peak_lag": peak_lag, "peak_corr": corrs[peak_lag],
+             "n_obs": n_obs_by_lag[peak_lag]}, len(LAGS))
 
 
 def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
@@ -299,7 +302,7 @@ def lead_lag(conn: sqlite3.Connection, a: str, b: str, *, timeframe: str,
     """
     result, _ = _lead_lag_impl(conn, a, b, timeframe=timeframe, dataset=dataset,
                                in_sample_until=in_sample_until, since=since)
-    return result
+    return {"peak_lag": result["peak_lag"], "peak_corr": result["peak_corr"]}
 
 
 # --- coverage_report (人間 CLI 用 — Task 11) ---------------------------
@@ -541,7 +544,9 @@ def analyze_for_agent(conn: sqlite3.Connection, settings: Settings,
                 conn, a, b, timeframe=timeframe,
                 dataset=dataset,
                 in_sample_until=in_sample_until, since=since)
-            payload_body = dict(result)
+            # agent 向けには走査したラグ本数 (lags_tested) と peak ラグの整列
+            # 観測数 (n_obs) を返す。trial_count は台帳の分母で、標本数ではない。
+            payload_body = {**result, "lags_tested": trial_count}
     except (ValueError, ArithmeticError):
         # データ不足 (相関計算に必要な共通観測が閾値未満) は in-sample 境界
         # の前後どちら起因でも同一の insufficient_data (サイドチャネル遮断
