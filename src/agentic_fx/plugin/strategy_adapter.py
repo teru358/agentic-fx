@@ -295,7 +295,7 @@ def build_intent_source(meta: PluginMeta, *, conn: sqlite3.Connection,
         resolved=resolved, session=session, decision_sink=decision_sink)
 
 
-def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
+def normalize_strategy_result(result: dict[str, Any], pair: str) -> dict | None:
     """`sandbox._validate_strategy_result` が返す検証済み dict
     (`{"action", "rationale", "direction", "entry_type", "limit_price",
     "stop_loss", "take_profit"}`) を LLM 出力と同形の intent dict へ写像
@@ -327,3 +327,24 @@ def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None
         intent["limit_price"] = result["limit_price"]
         intent["expires_in"] = "4h"
     return intent
+
+
+def _strategy_result_to_intent(result: dict[str, Any], pair: str) -> dict | None:
+    """Compatibility name for the replay adapter's executable mapping."""
+    return normalize_strategy_result(result, pair)
+
+
+def normalize_strategy_payload(result: dict[str, Any], pair: str,
+                               provenance: dict[str, Any]) -> dict | None:
+    """Return the executable stored payload shared by live and deployment paths."""
+    intent = normalize_strategy_result(result, pair)
+    if intent is None:
+        return None
+    return {
+        **intent,
+        "live_source": provenance["live_source"],
+        "source": provenance["source"],
+        "interval": provenance["interval"],
+        "bar_time": provenance["bar_time"],
+        "bars_origin": provenance["bars_origin"],
+    }

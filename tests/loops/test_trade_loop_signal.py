@@ -48,7 +48,7 @@ def _add_signal(conn, *, plugin="sig1", pair="USDJPY", timeframe="1h",
     bar_ts = bar_ts or (NOW - timedelta(hours=1))
     return signals.add(
         conn, plugin=plugin, content_hash="h1", pair=pair, timeframe=timeframe,
-        bar_ts=bar_ts.isoformat(), kind="signal",
+        bar_ts=bar_ts.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=bar_ts)
 

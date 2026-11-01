@@ -172,7 +172,7 @@ def test_requeue_signal_does_not_send_notification_itself(tmp_path):
     max_requeue = SETTINGS.plugin.signal_requeue_max
     sid = signals.add(
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
     # Task 13: claimed_by_mission_id に missions(id) への FK が付くため、
@@ -203,7 +203,7 @@ def test_signal_prepare_exception_after_claim_requeues_signal(tmp_path):
     conn, loop, runner, tp = _loop(tmp_path, [])
     sid = signals.add(
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
 
@@ -414,7 +414,7 @@ def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
         "completed", {"action": "hold", "reasoning": "x"}, [])])
     sid = signals.add(
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
 
@@ -469,7 +469,7 @@ def test_signals_consume_operational_error_uses_outer_failure_path(tmp_path):
         "completed", {"action": "hold", "reasoning": "x"}, [])])
     sid = signals.add(
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
 

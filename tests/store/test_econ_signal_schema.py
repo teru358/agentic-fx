@@ -68,6 +68,11 @@ def _raw_signal(conn, *, content_hash, status="pending", kind="strategy",
         (content_hash, timeframe, bar_ts, kind, status, claimed_by, claimed_at,
          requeue_count, NOW_UTC))
     conn.commit()
+    if kind == "strategy" and "contract_version" in {
+            r[1] for r in conn.execute("PRAGMA table_info(signals)")}:
+        conn.execute("UPDATE signals SET contract_version='executable_v1' WHERE id=?",
+                     (cur.lastrowid,))
+        conn.commit()
     return cur.lastrowid
 
 
@@ -341,13 +346,20 @@ def test_existing_abandoned_rows_all_become_legacy_unknown(tmp_path):
 
     after = {r["id"]: tuple(r) for r in conn.execute(
         f"SELECT {columns} FROM signals")}
-    assert after == before
+    assert {sid: after[sid] for key, sid in ids.items()
+            if key.startswith("ab_") or key == "consumed"} == {
+        sid: before[sid] for key, sid in ids.items()
+        if key.startswith("ab_") or key == "consumed"}
     for key, sid in ids.items():
         row = _row(conn, sid)
         assert row["contract_version"] is None
         if key.startswith("ab_"):
             assert (row["abandon_reason"], row["abandoned_at"]) == (
                 "legacy_unknown", None), key
+        elif key in {"pending", "claimed"}:
+            assert (row["status"], row["abandon_reason"]) == (
+                "abandoned", "normalization_failed")
+            assert row["abandoned_at"] is not None
         else:
             assert (row["abandon_reason"], row["abandoned_at"]) == (
                 None, None), key
@@ -548,7 +560,7 @@ def test_expire_stale_writes_the_freshness_reason_by_requeue_history(tmp_path):
         assert _row(conn, sid)["abandoned_at"] == later.isoformat()
     assert _row(conn, alive) == {
         "status": "pending", "requeue_count": 0, "abandon_reason": None,
-        "abandoned_at": None, "contract_version": None}
+        "abandoned_at": None, "contract_version": "executable_v1"}
 
 
 @pytest.mark.parametrize("reason", ["freshness_expired", "requeued_expired",
@@ -562,7 +574,7 @@ def test_abandon_claimed_records_the_given_reason_and_utc_time(tmp_path, reason)
 
     assert _row(conn, sid) == {
         "status": "abandoned", "requeue_count": 0, "abandon_reason": reason,
-        "abandoned_at": NOW_UTC, "contract_version": None}
+        "abandoned_at": NOW_UTC, "contract_version": "executable_v1"}
 
 
 def test_abandon_claimed_rejects_naive_time_without_writing(tmp_path):
@@ -668,7 +680,8 @@ def _loop_world(tmp_path, results):
     sid = signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
         timeframe="1h", bar_ts=LOOP_NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=LOOP_NOW)
+        payload={"direction": "long"}, contract_version="executable_v1",
+        now=LOOP_NOW)
     return conn, loop, runner, sid, LOOP_NOW
 
 
@@ -797,8 +810,9 @@ def test_signal_data_migrations_run_after_the_v3_rebuild(tmp_path, monkeypatch):
     assert seen == [(True, "legacy_unknown")]
 
 
-def test_signal_data_migrations_are_empty_until_the_payload_rule_lands():
-    assert db_module._signal_data_migrations() == ()
+def test_signal_data_migrations_register_the_payload_normalizer():
+    names = [name for name, _ in db_module._signal_data_migrations()]
+    assert names == ["normalize_strategy_payloads_v1"]
 
 
 # --- 新表の CHECK -----------------------------------------------------------
@@ -1243,23 +1257,33 @@ def test_legacy_payload_fixture_covers_the_migration_inputs():
     assert limit["payload"]["limit_price"] is not None
 
 
-def test_v3_rebuild_leaves_legacy_payload_rows_unmigrated(tmp_path):
+def test_data_migration_normalizes_legacy_payload_rows_once(tmp_path):
     conn = _v5(tmp_path)
     rows, ids = _load_legacy_rows(conn)
-    columns = ",".join(V2_COLUMNS)
-    before = {r["id"]: tuple(r) for r in conn.execute(
-        f"SELECT {columns} FROM signals")}
-
     init_db(conn)
-
-    after = {r["id"]: tuple(r) for r in conn.execute(
-        f"SELECT {columns} FROM signals")}
-    assert after == before
+    expected = {
+        "pending_normalizable": ("pending", "executable_v1", None),
+        "pending_missing_stop_loss": ("abandoned", None, "normalization_failed"),
+        "claimed_limit_normalizable": ("claimed", "executable_v1", None),
+        "pending_reference_signal": ("pending", None, None),
+    }
     for row in rows:
         stored = _row(conn, ids[row["key"]])
-        assert stored["status"] == row["status"]
-        assert stored["contract_version"] is None
-        assert stored["abandon_reason"] is None
+        assert (stored["status"], stored["contract_version"],
+                stored["abandon_reason"]) == expected[row["key"]]
+    assert _row(conn, ids["pending_missing_stop_loss"])["abandoned_at"] is not None
+
+    normal = conn.execute("SELECT payload_json FROM signals WHERE id=?", (
+        ids["pending_normalizable"],)).fetchone()[0]
+    assert normal == (
+        '{"action": "open", "pair": "USDJPY", "direction": "long", '
+        '"entry_type": "market", "horizon": "day", "stop_loss": 151.2, '
+        '"confidence": 0.5, "reasoning": "breakout", "take_profit": 152.4, '
+        '"live_source": "mt5", "source": "mt5", "interval": "15m", '
+        '"bar_time": "2026-10-30T12:00:00+00:00", "bars_origin": "mt5:15m"}')
+    before = {r["id"]: tuple(r) for r in conn.execute("SELECT * FROM signals")}
+    init_db(conn)
+    assert {r["id"]: tuple(r) for r in conn.execute("SELECT * FROM signals")} == before
 
 
 # --- rebuild guard は構造で比べる -----------------------------------------
@@ -1823,3 +1847,31 @@ def test_requeue_precedence_literals_exist_only_in_the_rule_table():
             and ("requeue_count >= " in n.value
                  or "WHEN requeue_count >=" in n.value)]
     assert len(hits) == 1
+
+
+def test_migration_abandon_of_a_claimed_unnormalizable_row_clears_the_claim(tmp_path):
+    conn = _v5(tmp_path)
+    mid = _mission(conn, "running")
+    sid = _raw_signal(conn, content_hash="bad", status="claimed", claimed_by=mid,
+                      claimed_at="2026-10-30T12:46:00+00:00")
+    init_db(conn)
+    row = conn.execute(
+        "SELECT status, abandon_reason, abandoned_at, claimed_by_mission_id, "
+        "claimed_at FROM signals WHERE id=?", (sid,)).fetchone()
+    assert (row[0], row[1]) == ("abandoned", "normalization_failed")
+    assert row[2] is not None and row[3] is None and row[4] is None
+
+
+def test_data_migration_limit_row_payload_bytes_include_limit_fields(tmp_path):
+    conn = _v5(tmp_path)
+    rows, ids = _load_legacy_rows(conn)
+    init_db(conn)
+    limit = conn.execute("SELECT payload_json FROM signals WHERE id=?", (
+        ids["claimed_limit_normalizable"],)).fetchone()[0]
+    assert limit == (
+        '{"action": "open", "pair": "USDJPY", "direction": "long", '
+        '"entry_type": "limit", "horizon": "day", "stop_loss": 150.6, '
+        '"confidence": 0.5, "reasoning": "pullback", "limit_price": 151.05, '
+        '"expires_in": "4h", "live_source": "mt5", "source": "mt5", '
+        '"interval": "15m", "bar_time": "2026-10-30T12:30:00+00:00", '
+        '"bars_origin": "mt5:15m"}')

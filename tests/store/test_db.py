@@ -49,8 +49,8 @@ def test_init_purges_pre_closed_cache_once_and_preserves_history(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 1
     assert tuple(conn.execute("SELECT * FROM ohlcv_history").fetchone()) == history_before
-    assert conn.execute("SELECT name FROM data_migrations").fetchone()[0] == \
-        "ohlcv_cache_purge_pre_closed_v1"
+    assert "ohlcv_cache_purge_pre_closed_v1" in {
+        row[0] for row in conn.execute("SELECT name FROM data_migrations")}
     conn.execute("INSERT INTO ohlcv_cache VALUES ('USDJPY','1m','x',1,1,1,1,0,'yfinance')")
     conn.commit()
     init_db(conn)
@@ -453,8 +453,8 @@ def test_init_db_migrates_legacy_v1_ohlcv_into_cache_table(tmp_path):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(ohlcv_cache)")}
     assert "source" in cols and "spread" not in cols
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_cache").fetchone()[0] == 0
-    assert conn.execute("SELECT name FROM data_migrations").fetchone()[0] == \
-        "ohlcv_cache_purge_pre_closed_v1"
+    assert "ohlcv_cache_purge_pre_closed_v1" in {
+        row[0] for row in conn.execute("SELECT name FROM data_migrations")}
 
 
 def test_init_db_ohlcv_migration_is_idempotent(tmp_path):

@@ -24,9 +24,11 @@ def start(conn: sqlite3.Connection, loop: str, runner: str, model: str,
     return cur.lastrowid
 
 
-def finish(conn: sqlite3.Connection, mission_id: int, status: str,
-           output: dict | None, transcript: list, now: datetime,
-           *, commit: bool = True) -> bool:
+STATUS_SYSTEM_FILTERED = "system_filtered"
+
+
+def finish_in_tx(conn: sqlite3.Connection, mission_id: int, status: str,
+                 output: dict | None, transcript: list, now: datetime) -> bool:
     """missions 行を終端状態へ CAS 更新する (設計書 §4.7)。
 
     `WHERE status='running'` を満たさない (= 既に終端済み) 場合は影響行数
@@ -38,6 +40,26 @@ def finish(conn: sqlite3.Connection, mission_id: int, status: str,
     だった (二重終端防止) — **呼び出し元はこの場合 activity 警告を残し、
     この結果を上書きしたと誤認しないこと**。
     """
+    if status == STATUS_SYSTEM_FILTERED:
+        raise ValueError(
+            "system_filtered is written only by finish_system_filtered_in_tx")
+    return _finish_cas(conn, mission_id, status, output, transcript, now)
+
+
+def finish_system_filtered_in_tx(
+        conn: sqlite3.Connection, mission_id: int, output: dict | None,
+        transcript: list, now: datetime) -> bool:
+    """帯内で LLM を呼ばずに終えた専用 mission を `system_filtered` で終端する。
+
+    commit は呼び出し側 (consume と同じ transaction) に委ねる。CAS の意味は
+    `finish_in_tx` と同じ。
+    """
+    return _finish_cas(conn, mission_id, STATUS_SYSTEM_FILTERED, output,
+                       transcript, now)
+
+
+def _finish_cas(conn: sqlite3.Connection, mission_id: int, status: str,
+                output: dict | None, transcript: list, now: datetime) -> bool:
     cur = conn.execute(
         "UPDATE missions SET status=?, output_json=?, transcript_json=?, "
         "finished_at=? WHERE id=? AND status='running'",
@@ -45,9 +67,17 @@ def finish(conn: sqlite3.Connection, mission_id: int, status: str,
          json.dumps(output, ensure_ascii=False) if output is not None else None,
          json.dumps(transcript, ensure_ascii=False),
          now.isoformat(), mission_id))
+    return cur.rowcount > 0
+
+
+def finish(conn: sqlite3.Connection, mission_id: int, status: str,
+           output: dict | None, transcript: list, now: datetime,
+           *, commit: bool = True) -> bool:
+    """Finish a mission, optionally leaving the transaction to the caller."""
+    ok = finish_in_tx(conn, mission_id, status, output, transcript, now)
     if commit:
         conn.commit()
-    return cur.rowcount > 0
+    return ok
 
 
 def finish_improve_mission(
@@ -84,8 +114,7 @@ def finish_improve_mission(
 
     notice_codes.validate_notice_fields(
         notice.result_code, notice.reason_code, tool_calls)
-    ok = finish(conn, mission_id, mission_status, output, transcript or [], now,
-               commit=False)
+    ok = finish_in_tx(conn, mission_id, mission_status, output, transcript or [], now)
     if not ok:
         raise RuntimeError(
             f"finish_improve_mission: mission {mission_id} is not 'running' "
@@ -304,7 +333,8 @@ def signals_rate_ok(conn: sqlite3.Connection, now: datetime,
     ``settings.plugin.signal_daily_max`` 以上なら False。
     """
     rows = conn.execute(
-        "SELECT started_at FROM missions WHERE trigger LIKE 'signal%'"
+        "SELECT started_at FROM missions WHERE trigger LIKE 'signal%' "
+        f"AND status <> '{STATUS_SYSTEM_FILTERED}'"
     ).fetchall()
     if not rows:
         return True

@@ -828,7 +828,7 @@ def test_requeue_signal_happens_under_core_lock(tmp_path):
         "timeout", None, [])])  # runner 失敗 → requeue 経路 (consume 前)
     sid = signals.add(
         conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="signal",
+        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
         payload={"direction": "long", "strength": 0.7, "rationale": "up"},
         now=NOW)
 

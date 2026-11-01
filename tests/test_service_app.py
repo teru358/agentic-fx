@@ -962,9 +962,14 @@ def test_cron_mission_consumes_strategy_signal_on_the_next_tick(tmp_path):
         def call(self, payload: dict) -> dict:
             df = payload["df"]
             if df.index[-1] == bucket:
-                return {"action": "open", "direction": "long",
-                        "stop_loss": 147.0, "take_profit": 150.0}
-            return {"action": "hold"}
+                return {"action": "open", "rationale": "cross",
+                        "direction": "long", "entry_type": "market",
+                        "limit_price": None, "stop_loss": 147.0,
+                        "take_profit": 150.0}
+            return {"action": "hold", "rationale": "none",
+                    "direction": None, "entry_type": None,
+                    "limit_price": None, "stop_loss": None,
+                    "take_profit": None}
 
         def close(self) -> None:
             pass
@@ -1144,9 +1149,14 @@ def test_cron_mission_claims_signal_through_real_ingest_at_first_tick(tmp_path):
         def call(self, payload: dict) -> dict:
             df = payload["df"]
             if df.index[-1] == bucket:
-                return {"action": "open", "direction": "long",
-                        "stop_loss": 147.0, "take_profit": 150.0}
-            return {"action": "hold"}
+                return {"action": "open", "rationale": "cross",
+                        "direction": "long", "entry_type": "market",
+                        "limit_price": None, "stop_loss": 147.0,
+                        "take_profit": 150.0}
+            return {"action": "hold", "rationale": "none",
+                    "direction": None, "entry_type": None,
+                    "limit_price": None, "stop_loss": None,
+                    "take_profit": None}
 
         def close(self) -> None:
             pass
@@ -1788,7 +1798,8 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
     sid = signals_store.add(
         app1.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
         timeframe="1h", bar_ts=(NOW - timedelta(hours=1)).isoformat(),
-        kind="signal", payload={"direction": "long"}, now=NOW)
+        kind="strategy", payload={"action": "open", "direction": "long"}, now=NOW,
+        contract_version="executable_v1")
     # Task 13: claimed_by_mission_id に missions(id) への FK が付くため、
     # 実在する mission 行が必要 (以前はダミー整数 999 だった)。
     mid = missions_module.start(app1.conn_core, "trade", "local", "m", NOW)
@@ -1819,6 +1830,34 @@ def test_f1c_startup_reclaim_recovers_claimed_signal(tmp_path):
     row = app2.conn_core.execute(
         "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
     assert row["status"] == "pending"  # 起動時 reclaim が回収した
+
+
+def test_reference_signal_is_never_claimed_and_is_cleaned_up_at_startup(tmp_path):
+    """kind="signal" の行は claim 母集団に入らず、cleanup として数えられる。"""
+    from agentic_fx.store import missions as missions_module
+    from agentic_fx.store import signals as signals_store
+
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    sid = signals_store.add(
+        app.conn_core, plugin="sig1", content_hash="h1", pair="USDJPY",
+        timeframe="1h", bar_ts=(NOW - timedelta(hours=4)).isoformat(),
+        kind="signal", payload={"direction": "long"}, now=NOW)
+    mid = missions_module.start(app.conn_core, "trade", "local", "m", NOW)
+    assert signals_store.claim_oldest(
+        app.conn_core, mission_id=mid, now=NOW, freshness_bars=None) is None
+    assert signals_store.pending_exists(
+        app.conn_core, now=NOW, freshness_bars=None) is False
+    signals_store.expire_stale(app.conn_core, now=NOW, freshness_bars=1)
+    row = app.conn_core.execute(
+        "SELECT status, abandon_reason FROM signals WHERE id=?", (sid,)).fetchone()
+    assert (row["status"], row["abandon_reason"]) == (
+        "abandoned", "ineligible_cleanup")
+    report = signals_store.human_signal_aggregates(
+        app.conn_core, since=NOW - timedelta(days=1),
+        until=NOW + timedelta(days=1))
+    assert report["cleanup"] == 1 and report["abandoned"] == {}
 
 
 def test_startup_recover_interrupted_requeues_signal_claimed_by_running_cron_mission(

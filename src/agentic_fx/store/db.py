@@ -2065,7 +2065,8 @@ def _signal_data_migrations() -> tuple[
     migration の `(name, 関数)`。各関数は commit せず、
     `_apply_data_migration_once` が name を記録して 2 回目を no-op にする。
     store 側の関数は循環 import を避けるためここで import する。"""
-    return ()
+    from agentic_fx.store.signals import normalize_legacy_strategy_payloads
+    return (("normalize_strategy_payloads_v1", normalize_legacy_strategy_payloads),)
 
 
 def _migrate_signals(conn: sqlite3.Connection) -> None:
