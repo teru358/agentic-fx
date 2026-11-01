@@ -1200,3 +1200,102 @@ def test_baseline_replay_wall_clock_rejects_bad_values(value):
 
     with pytest.raises(ValidationError):
         ImproveSettings(baseline_replay_wall_clock_max_sec=value)
+
+
+def _example_raw_without_econ() -> dict:
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw.pop("econ")
+    return raw
+
+
+def test_econ_section_is_optional_and_defaults_to_the_window_rule():
+    s = Settings.model_validate(_example_raw_without_econ())
+    assert (s.econ.window.importance_min, s.econ.window.before_min,
+            s.econ.window.after_min) == (3, 30, 15)
+    assert s.econ.signal_capacity_daily_max is None
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"signal_capacity_daily_max": 5}
+    s = Settings.model_validate(raw)
+    assert s.econ.window.importance_min == 3
+    assert s.econ.signal_capacity_daily_max == 5
+
+
+def test_example_states_the_econ_window_defaults_and_the_schema_stays_v5():
+    import yaml
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == CURRENT_SCHEMA_VERSION == 5
+    assert raw["econ"] == {"window": {"importance_min": 3, "before_min": 30,
+                                      "after_min": 15}}
+    s = load_settings(EXAMPLE)
+    assert s.econ.model_dump() == Settings.model_validate(
+        _example_raw_without_econ()).econ.model_dump()
+    assert "  # signal_capacity_daily_max:" in EXAMPLE.read_text(encoding="utf-8")
+
+
+def test_v4_to_v5_migration_does_not_inject_econ():
+    from agentic_fx.setup.settings_migrate import migrate
+    v4 = (Path(__file__).resolve().parent / "fixtures" / "settings_examples"
+          / "v4.yaml").read_text(encoding="utf-8")
+    result = migrate(v4)
+    assert result.ok
+    import yaml
+    assert "econ" not in yaml.safe_load(result.text)
+    assert "econ:" not in result.text
+
+
+@pytest.mark.parametrize("window", [
+    {"importance_min": 0}, {"importance_min": 4}, {"before_min": -1},
+    {"after_min": -1}, {"importance_min": 2.0}, {"before_min": "30"},
+    {"after_min": True}, {"importance_min": None}, {"unknown_key": 1},
+])
+def test_econ_window_out_of_range_is_rejected_before_start(tmp_path, window):
+    import yaml
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"window": window}
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+@pytest.mark.parametrize("window", [
+    {"importance_min": 1, "before_min": 0, "after_min": 0},
+    {"importance_min": 3, "before_min": 240, "after_min": 240},
+])
+def test_econ_window_accepts_boundary_values(window):
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"window": window}
+    s = Settings.model_validate(raw)
+    assert s.econ.window.model_dump() == window
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, 2.0, "10", True, False])
+def test_signal_capacity_daily_max_must_be_an_integer_of_at_least_one(
+        tmp_path, value):
+    import yaml
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"signal_capacity_daily_max": value}
+    p = tmp_path / "s.yaml"
+    p.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ConfigError):
+        load_settings(p)
+
+
+def test_signal_capacity_daily_max_accepts_one_and_is_not_compared_here():
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"signal_capacity_daily_max": 1}
+    assert Settings.model_validate(raw).econ.signal_capacity_daily_max == 1
+    raw["econ"] = {"signal_capacity_daily_max": 10_000_000}
+    assert (Settings.model_validate(raw).econ.signal_capacity_daily_max
+            == 10_000_000)
+
+
+def test_econ_settings_survive_the_worker_model_dump_round_trip():
+    raw = _example_raw_without_econ()
+    raw["econ"] = {"window": {"importance_min": 2, "before_min": 5,
+                              "after_min": 7},
+                   "signal_capacity_daily_max": 300}
+    s = Settings.model_validate(raw)
+    again = Settings.model_validate(s.model_dump())
+    assert again.econ == s.econ

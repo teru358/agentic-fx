@@ -220,13 +220,13 @@ def test_abandon_claimed_ends_the_signal_without_spending_a_requeue(tmp_path):
     sid = _add(conn, bar_ts=NOW)
     signals.claim_oldest(conn, mission_id=_mid(conn), now=NOW, freshness_bars=None)
 
-    signals.abandon_claimed(conn, sid)
+    signals.abandon_claimed(conn, sid, now=NOW, reason="freshness_expired")
 
     row = conn.execute("SELECT status, requeue_count, claimed_by_mission_id, claimed_at "
                        "FROM signals WHERE id=?", (sid,)).fetchone()
     assert tuple(row) == ("abandoned", 0, None, None)
     with pytest.raises(ValueError, match="is not claimed"):
-        signals.abandon_claimed(conn, sid)
+        signals.abandon_claimed(conn, sid, now=NOW, reason="freshness_expired")
 
 
 # ---------------------------------------------------------------------

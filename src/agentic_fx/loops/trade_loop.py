@@ -402,7 +402,7 @@ class TradeLoop:
                             if signal_stale:
                                 source_rejected = True
                                 reason = "signal stale"
-                                signals.abandon_claimed(self.conn, claimed["id"])
+                                signals.abandon_claimed(self.conn, claimed["id"], now=gate_now, reason=signals.freshness_abandon_reason(claimed))
                                 consumed = True
                             elif snapshot_reason is not None:
                                 source_rejected = True
@@ -416,7 +416,7 @@ class TradeLoop:
                                         resolved):
                                     source_rejected = True
                                     reason = "signal_source_inactive"
-                                    signals.abandon_claimed(self.conn, claimed["id"])
+                                    signals.abandon_claimed(self.conn, claimed["id"], now=gate_now, reason="source_inactive")
                                     consumed = True
                         if source_rejected:
                             intents_store.set_gate_result(
@@ -715,7 +715,7 @@ class TradeLoop:
             if abandon_if_stale and self._claimed_signal_is_stale(claimed):
                 # 新規リスクが止まっている間に鮮度が切れた signal は、
                 # requeue 回数を使って pending に戻さず、その場で終端する。
-                signals.abandon_claimed(self.conn, claimed["id"])
+                signals.abandon_claimed(self.conn, claimed["id"], now=self.clock.now(), reason=signals.freshness_abandon_reason(claimed))
                 return (f"[agentic-fx] signal #{claimed['id']} "
                         f"({claimed['plugin']}) は鮮度切れのため "
                         "abandoned になりました")

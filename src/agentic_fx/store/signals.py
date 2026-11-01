@@ -43,7 +43,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from agentic_fx.backtest.timeframes import PLUGIN_TIMEFRAMES, TF_MINUTES
 
@@ -91,6 +91,8 @@ _DEPLOY_LINKED_EXISTS = (
 )
 # deploy 付随表に結ばれた signal は pending に戻すと anti-join で永久に
 # 不可視になるので、上限に関係なく abandoned で終端する (増分なし)。
+# abandoned の理由は deploy に結ばれていれば (上限超過を兼ねても)
+# `deploy_linked`、そうでなければ `retry_exhausted`。時刻は `:abandoned_at`。
 _REQUEUE_STATUS_EXPR = (
     f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
     "THEN 'abandoned' ELSE 'pending' END"
@@ -99,6 +101,41 @@ _REQUEUE_COUNT_EXPR = (
     f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
     "THEN requeue_count ELSE requeue_count + 1 END"
 )
+_REQUEUE_REASON_EXPR = (
+    f"CASE WHEN {_DEPLOY_LINKED_EXISTS} THEN 'deploy_linked' "
+    "WHEN requeue_count >= :max_requeue THEN 'retry_exhausted' END"
+)
+_REQUEUE_ABANDONED_AT_EXPR = (
+    f"CASE WHEN requeue_count >= :max_requeue OR {_DEPLOY_LINKED_EXISTS} "
+    "THEN :abandoned_at END"
+)
+_REQUEUE_SET = (
+    f"status = {_REQUEUE_STATUS_EXPR}, "
+    f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
+    f"abandon_reason = {_REQUEUE_REASON_EXPR}, "
+    f"abandoned_at = {_REQUEUE_ABANDONED_AT_EXPR}, "
+    "claimed_by_mission_id=NULL, claimed_at=NULL"
+)
+
+# 鮮度切れの abandoned の理由。requeue 歴が無ければ `freshness_expired`、
+# あれば `requeued_expired`。
+_FRESHNESS_REASON_EXPR = (
+    "CASE WHEN requeue_count > 0 THEN 'requeued_expired' "
+    "ELSE 'freshness_expired' END"
+)
+
+
+def utc_iso(now: datetime) -> str:
+    """abandoned_at 等に書く UTC の ISO 文字列。naive は拒否する。"""
+    _require_aware(now, "now")
+    return now.astimezone(timezone.utc).isoformat()
+
+
+def freshness_abandon_reason(signal: dict) -> str:
+    """鮮度切れで abandoned にする signal 行の理由 (`_FRESHNESS_REASON_EXPR`
+    と同じ規則)。"""
+    return ("requeued_expired" if signal["requeue_count"] > 0
+            else "freshness_expired")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,11 +288,13 @@ def expire_stale(conn: sqlite3.Connection, *, now: datetime,
     """
     _require_aware(now, "now")
     cur = conn.execute(
-        "UPDATE signals SET status='abandoned' "
+        "UPDATE signals SET status='abandoned', "
+        f"abandon_reason={_FRESHNESS_REASON_EXPR}, abandoned_at=:abandoned_at "
         f"WHERE status='pending' AND {_STALE_CONDITION} "
         f"RETURNING id, plugin, timeframe, ({_TF_MINUTES_CASE} IS NULL) "
         "AS invalid_timeframe",
-        {"now": now.isoformat(), "freshness_bars": freshness_bars})
+        {"now": now.isoformat(), "freshness_bars": freshness_bars,
+         "abandoned_at": utc_iso(now)})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     # RETURNING 列は位置で読む — row_factory を設定していない素の接続でも
@@ -290,20 +329,15 @@ def requeue(conn: sqlite3.Connection, signal_id: int, *, now: datetime,
 
     上限判定: 現在の requeue_count が max_requeue 以上なら abandoned
     (増分なし)、未満なら pending + requeue_count+1。対象が claimed で
-    なければ ValueError (fail closed)。
-
-    ``now`` は他 store モジュールとの呼び出し規約統一のため受け取るが、
-    signals テーブルに updated_at 相当の列が無いため未使用 (brief 逐語の
-    シグネチャを保つ)。
+    なければ ValueError (fail closed)。abandoned にしたときは ``now`` を
+    ``abandoned_at`` に書く。
     """
     cur = conn.execute(
-        "UPDATE signals SET "
-        f"status = {_REQUEUE_STATUS_EXPR}, "
-        f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
-        "claimed_by_mission_id=NULL, claimed_at=NULL "
+        f"UPDATE signals SET {_REQUEUE_SET} "
         "WHERE id=:id AND status='claimed' "
         "RETURNING status",
-        {"id": signal_id, "max_requeue": max_requeue})
+        {"id": signal_id, "max_requeue": max_requeue,
+         "abandoned_at": utc_iso(now)})
     row = cur.fetchone()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     if row is None:
@@ -311,14 +345,19 @@ def requeue(conn: sqlite3.Connection, signal_id: int, *, now: datetime,
     return row["status"]
 
 
-def abandon_claimed(conn: sqlite3.Connection, signal_id: int) -> None:
+def abandon_claimed(conn: sqlite3.Connection, signal_id: int, *,
+                    now: datetime, reason: str) -> None:
     """claimed の行を requeue_count を増やさず abandoned にする。対象が
-    claimed でなければ ValueError (fail closed)。鮮度切れが確定した signal を
-    pending に戻して再 claim の候補にしないために使う。"""
+    claimed でなければ ValueError (fail closed)。鮮度切れや source の失効が
+    確定した signal を pending に戻して再 claim の候補にしないために使う。
+    理由は store では判別できないので呼び出し側が渡す
+    (鮮度切れは ``freshness_abandon_reason``)。"""
+    abandoned_at = utc_iso(now)
     cur = conn.execute(
         "UPDATE signals SET status='abandoned', "
+        "abandon_reason=?, abandoned_at=?, "
         "claimed_by_mission_id=NULL, claimed_at=NULL "
-        "WHERE id=? AND status='claimed'", (signal_id,))
+        "WHERE id=? AND status='claimed'", (reason, abandoned_at, signal_id))
     conn.commit()
     if cur.rowcount == 0:
         raise ValueError(f"signal {signal_id} is not claimed")
@@ -334,15 +373,12 @@ def reclaim_expired(conn: sqlite3.Connection, *, now: datetime,
     """
     _require_aware(now, "now")
     cur = conn.execute(
-        "UPDATE signals SET "
-        f"status = {_REQUEUE_STATUS_EXPR}, "
-        f"requeue_count = {_REQUEUE_COUNT_EXPR}, "
-        "claimed_by_mission_id=NULL, claimed_at=NULL "
+        f"UPDATE signals SET {_REQUEUE_SET} "
         "WHERE status='claimed' AND datetime(claimed_at) <= "
         "datetime(:now, '-' || :lease_min || ' minutes') "
         "RETURNING status",
         {"now": now.isoformat(), "lease_min": lease_min,
-         "max_requeue": max_requeue})
+         "max_requeue": max_requeue, "abandoned_at": utc_iso(now)})
     rows = cur.fetchall()  # RETURNING を伴う文は commit 前に fetch する
     conn.commit()
     return [r["status"] for r in rows]
@@ -386,7 +422,8 @@ def recent(conn: sqlite3.Connection, pair: str, *, since: datetime,
 
 
 def _abandon_pending_where(conn: sqlite3.Connection, predicate: str, params: tuple,
-                           *, op_id: int, commit: bool) -> None:
+                           *, op_id: int, now: datetime, commit: bool) -> None:
+    abandoned_at = utc_iso(now)
     rows = conn.execute(
         "SELECT id, status FROM signals WHERE status IN ('pending','claimed') "
         f"AND ({predicate})", params).fetchall()
@@ -396,8 +433,9 @@ def _abandon_pending_where(conn: sqlite3.Connection, predicate: str, params: tup
         ((op_id, row["id"], row["status"]) for row in rows),
     )
     conn.execute(
-        "UPDATE signals SET status='abandoned' WHERE status='pending' "
-        f"AND ({predicate})", params)
+        "UPDATE signals SET status='abandoned', abandon_reason='deploy_op', "
+        "abandoned_at=? WHERE status='pending' "
+        f"AND ({predicate})", (abandoned_at, *params))
     if commit:
         conn.commit()
 
@@ -409,9 +447,11 @@ def abandon_pending_for_identities(
         return
     predicate = " OR ".join("(plugin=? AND content_hash=?)" for _ in identities)
     params = tuple(value for identity in identities for value in identity)
-    _abandon_pending_where(conn, predicate, params, op_id=op_id, commit=commit)
+    _abandon_pending_where(conn, predicate, params, op_id=op_id, now=now,
+                           commit=commit)
 
 
 def abandon_pending_for_name(conn: sqlite3.Connection, name: str, *, op_id: int,
-                             commit: bool = True) -> None:
-    _abandon_pending_where(conn, "plugin=?", (name,), op_id=op_id, commit=commit)
+                             now: datetime, commit: bool = True) -> None:
+    _abandon_pending_where(conn, "plugin=?", (name,), op_id=op_id, now=now,
+                           commit=commit)

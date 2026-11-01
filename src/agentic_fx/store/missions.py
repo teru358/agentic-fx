@@ -177,7 +177,9 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
     signals の requeue/abandon 判定は `signals.py` の
     `_REQUEUE_STATUS_EXPR`/`_REQUEUE_COUNT_EXPR` と同じ規則 (現在の
     requeue_count が max_requeue 以上なら abandoned、未満なら pending +
-    +1) を Python 側で再現する — `signals.reclaim_expired` を呼ぶと
+    +1、abandoned の理由は deploy に結ばれていれば `deploy_linked`、そう
+    でなければ `retry_exhausted`、時刻は `now`) を Python 側で再現する —
+    `signals.reclaim_expired` を呼ぶと
     それ自身が `conn.commit()` するため、missions の更新と同一トランザ
     クションを構成できない (この関数専用に単一トランザクションで完結
     させる必要がある)。
@@ -202,12 +204,17 @@ def recover_interrupted(conn: sqlite3.Connection, *, now: datetime,
                 "FROM signals WHERE status='claimed' "
                 f"AND claimed_by_mission_id IN ({placeholders})",
                 running_ids).fetchall()
+            from agentic_fx.store.signals import utc_iso
+            abandoned_at = utc_iso(now)
             for row in claimed_rows:
                 if row["requeue_count"] >= max_requeue or row["deploy_linked"]:
+                    reason = ("deploy_linked" if row["deploy_linked"]
+                              else "retry_exhausted")
                     conn.execute(
                         "UPDATE signals SET status='abandoned', "
+                        "abandon_reason=?, abandoned_at=?, "
                         "claimed_by_mission_id=NULL, claimed_at=NULL "
-                        "WHERE id=?", (row["id"],))
+                        "WHERE id=?", (reason, abandoned_at, row["id"]))
                     signals_abandoned += 1
                 else:
                     conn.execute(
