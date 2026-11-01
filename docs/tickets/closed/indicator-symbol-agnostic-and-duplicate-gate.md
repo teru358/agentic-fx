@@ -1,16 +1,16 @@
 ---
 id: indicator-symbol-agnostic-and-duplicate-gate
 title: indicator の銘柄非依存と重複を決定論 gate で検査する
-status: 実装待ち
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-10-31
-closed: null
+closed: 2026-11-01
 related: [multi-input-indicator-relations, reference-symbols-as-indicator-inputs]
 ---
 # [indicator-symbol-agnostic-and-duplicate-gate] indicator の銘柄非依存と重複を決定論 gate で検査する
 
-**状態**: 実装待ち / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -29,8 +29,11 @@ related: [multi-input-indicator-relations, reference-symbols-as-indicator-inputs
 
 ## 修正内容
 
+- 2026-11-01: T1〜T4 を実装し 223948aa で main に取り込み配備 (settings に improve.indicator_duplicate_mode: warn / indicator_similar_corr 0.98 / indicator_fixture_wall_clock_max_sec 60 を明示、relation 列 migration、afx 再起動)。名前・param 検査、契約 run と解析 probe、親専有 fixture cache (56 本 初回 31.5 秒 / 2 回目 0.39 秒)、exact 重複 reject・単調変換 warn・類似 warning、approve 時の再判定、承認詳細 4 面の表示。レビュー: 各 task で codex 1 周目 → /code-review high → terra 閉鎖
+
 ## 経緯
 
 - 2026-10-31: 起票。
 - 2026-10-31: 状態: 設計待ち — 2026-10-31 ユーザー裁定で起票。C0 は baseline T4 / ref-literal の閉鎖後、multi-input より先
 - 2026-10-31: 状態: 実装待ち — 2026-10-31: 設計 C0 v0.6 (docs/superpowers/specs/2026-10-31-indicator-agnostic-duplicate-gate-design.md)。sol / opus / terra の 3 周、実測 6 便。ユーザー裁定 J1 grandfather / J4 既定 warn / J5 bless でも exact は reject / J6 approve 時再判定。チケット (4) の『相関 0.99 超で reject』は実測で否定され exact + 単調変換 (Spearman 2 条件) に変更
+- 2026-11-01: 是正内容 — T1〜T4 を実装し 223948aa で main に取り込み配備 (settings に improve.indicator_duplicate_mode: warn / indicator_similar_corr 0.98 / indicator_fixture_wall_clock_max_sec 60 を明示、relation 列 migration、afx 再起動)。名前・param 検査、契約 run と解析 probe、親専有 fixture cache (56 本 初回 31.5 秒 / 2 回目 0.39 秒)、exact 重複 reject・単調変換 warn・類似 warning、approve 時の再判定、承認詳細 4 面の表示。レビュー: 各 task で codex 1 周目 → /code-review high → terra 閉鎖
