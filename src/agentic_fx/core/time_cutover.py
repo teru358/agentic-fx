@@ -203,7 +203,7 @@ def _dump(capture: dict) -> str:
 
 def _begin_write(conn: sqlite3.Connection) -> None:
     if conn.in_transaction:
-        conn.commit()
+        raise RuntimeError("time rule cutover needs a connection without a pending transaction")
     conn.execute("BEGIN IMMEDIATE")
 
 
@@ -256,6 +256,23 @@ def _mark_activity_logged(conn: sqlite3.Connection, capture: dict,
     conn.commit()
 
 
+INVALID_CAPTURE_EVENT = "time_rule_cutover_capture_invalid"
+INVALID_CAPTURE_NOTE = "time rule capture is unreadable; start continues, audit record skipped"
+
+
+def _note_capture_invalid(activity, t_c: datetime) -> None:
+    """Tell the reader of the activity log, once, that the capture is unusable."""
+    ref = f"{INVALID_CAPTURE_EVENT}:{as_utc(t_c).isoformat()}"
+    try:
+        if activity.contains(INVALID_CAPTURE_EVENT, ref):
+            return
+        activity.end_partial_line()
+        activity.write(Category.SYSTEM, INVALID_CAPTURE_EVENT,
+                       INVALID_CAPTURE_NOTE, ref_id=ref)
+    except OSError as exc:
+        _log.warning("time rule capture notice failed: %s", exc)
+
+
 def _log_activity_once(conn: sqlite3.Connection, activity, t_c: datetime,
                        now: datetime) -> None:
     """Record the capture in the activity log exactly once.
@@ -271,7 +288,10 @@ def _log_activity_once(conn: sqlite3.Connection, activity, t_c: datetime,
     try:
         capture = json.loads(raw)
     except ValueError:
-        _log.warning("time rule capture is not valid JSON; activity skipped")
+        capture = None
+    if not isinstance(capture, dict):
+        _log.warning("time rule capture is unusable; activity skipped")
+        _note_capture_invalid(activity, t_c)
         return
     if capture.get("activity_logged") is True:
         return
@@ -279,6 +299,7 @@ def _log_activity_once(conn: sqlite3.Connection, activity, t_c: datetime,
     try:
         present = activity.contains(ACTIVITY_EVENT, ref)
         if not present:
+            activity.end_partial_line()
             body = {k: v for k, v in capture.items() if k != "activity_logged"}
             activity.write(Category.SYSTEM, ACTIVITY_EVENT, _dump(body),
                            ref_id=ref)

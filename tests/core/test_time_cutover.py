@@ -64,6 +64,9 @@ class FakeActivity:
             raise OSError("readback failed")
         return any(e == event and r == ref_id for e, r, _ in self.lines)
 
+    def end_partial_line(self):
+        pass
+
     def cutover_lines(self):
         return [line for line in self.lines if line[0] == time_cutover.ACTIVITY_EVENT]
 
@@ -213,7 +216,7 @@ def test_daily_label_is_the_later_label_inside_the_window(tmp_path):
     assert time_cutover.daily_label(c, _dt(2026, 11, 3, 10, 0)).isoformat() == "2026-11-03"
 
 
-# ---- first start: marker + capture together (AC 17) -------------------------
+# ---- first start: marker and capture are written together -------------------------
 
 def _open_day_order(conn, filled_at, *, status="open", horizon="day"):
     conn.execute(
@@ -455,7 +458,7 @@ def test_real_activity_log_that_cannot_be_written_stays_unlogged(tmp_path):
     assert _capture(c)["activity_logged"] is True
 
 
-# ---- day positions through the scheduler (AC 18) ----------------------------
+# ---- day positions through the scheduler ----------------------------
 
 def _filled_day_env(tmp_path, *, name, placed_at, filled_at, cutover_at=None):
     home = tmp_path / name
@@ -528,7 +531,7 @@ def test_position_opened_after_the_cutover_follows_the_new_rule_only(tmp_path):
     assert orders.get(env.conn, oid)["status"] == "closed"
 
 
-# ---- daily loss base (AC 19) --------------------------------------------------
+# ---- daily loss base --------------------------------------------------
 
 def test_daily_loss_base_does_not_fail_open_across_the_cutover(tmp_path):
     c = _conn(tmp_path)
@@ -566,7 +569,7 @@ def test_daily_loss_base_is_unknown_when_either_reference_is_missing(tmp_path):
     assert old is None
 
 
-# ---- signal daily cap (AC 20) --------------------------------------------------
+# ---- signal daily cap --------------------------------------------------
 
 def test_signal_cap_counts_from_the_earlier_start_across_the_cutover(tmp_path):
     c = _conn(tmp_path)
@@ -584,7 +587,7 @@ def test_signal_cap_counts_from_the_earlier_start_across_the_cutover(tmp_path):
     assert missions.signals_rate_ok(c, _dt(2026, 11, 4, 22, 1), SETTINGS) is True
 
 
-# ---- limit expiry is untouched (AC 21) ------------------------------------------
+# ---- limit expiry is untouched ------------------------------------------
 
 def test_limit_expiry_is_the_same_across_the_cutover(tmp_path):
     env = Env(tmp_path, base=_dt(2026, 11, 3, 21, 0))
@@ -598,7 +601,7 @@ def test_limit_expiry_is_the_same_across_the_cutover(tmp_path):
     assert (tmp_path / "a.log").read_text(encoding="utf-8").count("limit_expired") == 1
 
 
-# ---- Friday close (AC 23) --------------------------------------------------------
+# ---- Friday close --------------------------------------------------------
 
 def test_friday_limit_is_cancelled_once_at_the_new_york_close(tmp_path):
     fri = _dt(2026, 11, 6, 20, 30)
@@ -635,7 +638,7 @@ def test_friday_cutover_after_the_old_close_cancel_adds_no_second_cancel(tmp_pat
     assert (tmp_path / "a.log").read_text(encoding="utf-8").count("limit_cancelled") == 1
 
 
-# ---- end of the window and no rollback (AC 24) --------------------------------------
+# ---- end of the window and no rollback --------------------------------------
 
 def test_legacy_functions_are_not_called_after_the_window(tmp_path, monkeypatch):
     env, oid = _filled_day_env(
@@ -696,8 +699,11 @@ def test_a_forward_fix_restart_keeps_the_cutover_instant(tmp_path):
 
 
 def test_no_source_path_removes_the_marker():
-    pattern = re.compile(r"delete\s+from\s+data_migrations|drop\s+table[^;\"']*data_migrations",
-                         re.IGNORECASE)
+    pattern = re.compile(
+        r"delete\s+from\s+data_migrations|drop\s+table[^;\"']*data_migrations"
+        r"|update\s+data_migrations|replace\s+into\s+data_migrations"
+        r"|insert\s+or\s+replace\s+into\s+data_migrations",
+        re.IGNORECASE)
     offenders = [str(path.relative_to(SRC)) for path in SRC.rglob("*.py")
                  if pattern.search(path.read_text(encoding="utf-8"))]
     assert offenders == []
@@ -705,3 +711,81 @@ def test_no_source_path_removes_the_marker():
     writers = [str(path.relative_to(SRC)) for path in SRC.rglob("*.py")
                if time_cutover.MARKER_NAME in path.read_text(encoding="utf-8")]
     assert writers == ["agentic_fx/core/time_cutover.py"]
+
+
+# ---- audit data that is damaged must not stop the start -----------------------
+
+def _cutover_lines_in(path):
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return [l for l in text.splitlines() if "\ttime_rule_cutover\t" in l]
+
+
+def test_activity_log_with_invalid_utf8_does_not_stop_the_start(tmp_path):
+    c = _conn(tmp_path)
+    path = tmp_path / "logs" / "activity.log"
+    path.parent.mkdir()
+    path.write_bytes(b"2026-11-01T00:00:00\tSYSTEM\tolder\tbroken \xff\xfe\t-\n")
+    log = ActivityLog(path)
+    time_cutover.ensure_cutover(c, now=T_C, activity=log)
+    time_cutover.ensure_cutover(c, now=T_C + timedelta(minutes=5), activity=log)
+    assert len(_cutover_lines_in(path)) == 1
+    assert _capture(c)["activity_logged"] is True
+
+
+def test_activity_log_without_a_final_newline_still_gets_one_line_only(tmp_path):
+    c = _conn(tmp_path)
+    path = tmp_path / "logs" / "activity.log"
+    path.parent.mkdir()
+    path.write_bytes(b"2026-11-01T00:00:00\tSYSTEM\tolder\thalf written")
+    log = ActivityLog(path)
+    time_cutover.ensure_cutover(c, now=T_C, activity=log)
+    assert _capture(c)["activity_logged"] is True
+    time_cutover.ensure_cutover(c, now=T_C + timedelta(minutes=5), activity=log)
+    assert len(_cutover_lines_in(path)) == 1
+
+
+@pytest.mark.parametrize("damaged", ["null", "[1]", "not json"])
+def test_unusable_capture_keeps_the_start_and_reports_it_once(tmp_path, damaged):
+    c = _conn(tmp_path)
+    log = ActivityLog(tmp_path / "logs" / "activity.log")
+    time_cutover.ensure_cutover(c, now=T_C, activity=FakeActivity())
+    c.execute("UPDATE alert_state SET value=? WHERE key=?",
+              (damaged, time_cutover.CAPTURE_KEY))
+    c.commit()
+    time_cutover.ensure_cutover(c, now=T_C + timedelta(minutes=5), activity=log)
+    time_cutover.ensure_cutover(c, now=T_C + timedelta(minutes=9), activity=log)
+    text = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    notes = [l for l in text.splitlines() if "\ttime_rule_cutover_capture_invalid\t" in l]
+    assert len(notes) == 1
+    assert _cutover_lines_in(tmp_path / "logs" / "activity.log") == []
+    assert _marker(c) == T_C
+
+
+# ---- the capture row has one writer ------------------------------------------
+
+def test_the_generic_alert_state_api_cannot_reach_the_capture(tmp_path):
+    from agentic_fx.store import alert_state
+
+    c = _conn(tmp_path)
+    time_cutover.ensure_cutover(c, now=T_C, activity=FakeActivity())
+    before = _capture(c)
+    with pytest.raises(ValueError):
+        alert_state.set(c, time_cutover.CAPTURE_KEY, "{}", now=T_C)
+    with pytest.raises(ValueError):
+        alert_state.get(c, time_cutover.CAPTURE_KEY)
+    assert _capture(c) == before
+    assert time_cutover.CAPTURE_KEY not in (SRC / "agentic_fx/store/alert_state.py").read_text(
+        encoding="utf-8")
+
+
+# ---- the write helper never commits somebody else's work ----------------------
+
+def test_marker_write_refuses_to_run_inside_an_open_transaction(tmp_path):
+    c = _conn(tmp_path)
+    c.execute("INSERT INTO alert_state(key, value, updated_at) VALUES ('other', 'x', 'y')")
+    assert c.in_transaction
+    with pytest.raises(RuntimeError):
+        time_cutover._write_marker_and_capture(c, T_C)
+    assert c.in_transaction  # the caller's pending write was neither committed nor dropped
+    assert _marker(c) is None
+    c.rollback()

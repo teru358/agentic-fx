@@ -74,7 +74,7 @@ class ActivityLog:
         caller can tell "absent" from "could not check".
         """
         try:
-            text = self._path.read_text(encoding="utf-8")
+            text = self._path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
             return False
         for line in text.splitlines():
@@ -82,6 +82,23 @@ class ActivityLog:
             if len(fields) >= 5 and fields[2] == event and fields[4] == ref_id:
                 return True
         return False
+
+    def end_partial_line(self) -> None:
+        """Terminate a last line left without its newline (a torn append).
+
+        Without this the next appended line would join the torn one.  A missing
+        or empty file needs nothing; other failures are raised.
+        """
+        try:
+            with self._path.open("rb+") as f:
+                f.seek(0, 2)
+                if f.tell() == 0:
+                    return
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+        except FileNotFoundError:
+            return
 
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():

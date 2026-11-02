@@ -111,15 +111,32 @@ def test_capture_without_marker_stops_the_start_before_any_tick(tmp_path):
     assert marker == []
 
 
+def _run_with_tick_that_stops(root: Path):
+    stopped = threading.Event()
+
+    def tick(self, *args, **kwargs):
+        stopped.set()
+
+    with patch("agentic_fx.core.scheduler.Scheduler.tick", autospec=True,
+               side_effect=tick) as mock_tick:
+        code = run_service(root, daemon=True, _stop_event=stopped)
+    return code, mock_tick
+
+
 def test_run_service_reports_the_missing_marker_and_exits_nonzero(tmp_path, capsys):
     _init(tmp_path)
     _build(tmp_path).close()
     _remove_marker(tmp_path)
-    stopped = threading.Event()
-    stopped.set()
     capsys.readouterr()
-    with patch("agentic_fx.core.scheduler.Scheduler.tick") as tick:
-        code = run_service(tmp_path, daemon=True, _stop_event=stopped)
+    code, tick = _run_with_tick_that_stops(tmp_path)
     assert code == 1
     tick.assert_not_called()
     assert "time_rule_marker_missing" in capsys.readouterr().err
+
+
+def test_run_service_with_the_marker_does_reach_the_first_tick(tmp_path):
+    _init(tmp_path)
+    _build(tmp_path).close()
+    code, tick = _run_with_tick_that_stops(tmp_path)
+    assert code == 0
+    assert tick.call_count >= 1
