@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agentic_fx.store.db import connect, init_db
+from tests.plugin.conftest import SETTINGS
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 SCRIPT = REPOSITORY / "scripts" / "floor_remeasure.py"
@@ -95,7 +96,7 @@ def test_deep_drawdown_candidate_needs_floor_pass_and_dd_over_limit(tmp_path):
     wanted = _run(conn, content_hash="1" * 64, dd=0.31,
                   plugin_ref="plugins/_staging/9/deep_one")
     target = floor.select_deep_drawdown_candidate(
-        conn, now=NOW, exclude_hashes=set())
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS)
     assert target is not None
     assert (target.content_hash, target.name, target.source_row_id,
             target.label, target.role) == (
@@ -106,10 +107,10 @@ def test_deep_drawdown_candidate_dd_boundary_is_strictly_over(tmp_path):
     conn = _conn(tmp_path)
     _run(conn, content_hash="a" * 64, dd=0.20)
     assert floor.select_deep_drawdown_candidate(
-        conn, now=NOW, exclude_hashes=set()) is None
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS) is None
     _run(conn, content_hash="b" * 64, dd=0.2000001)
     found = floor.select_deep_drawdown_candidate(
-        conn, now=NOW, exclude_hashes=set())
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS)
     assert found is not None and found.content_hash == "b" * 64
 
 
@@ -119,7 +120,7 @@ def test_deep_drawdown_candidate_skips_excluded_hash_and_picks_newest(tmp_path):
     _run(conn, content_hash="b" * 64, dd=0.30)
     _run(conn, content_hash="c" * 64, dd=0.30)
     target = floor.select_deep_drawdown_candidate(
-        conn, now=NOW, exclude_hashes={"c" * 64})
+        conn, now=NOW, exclude_hashes={"c" * 64}, settings=SETTINGS)
     assert target is not None and target.content_hash == "b" * 64
 
 
@@ -128,7 +129,41 @@ def test_deep_drawdown_candidate_judges_every_pair_of_a_hash(tmp_path):
     _run(conn, content_hash="a" * 64, pair="USDJPY", dd=0.30)
     _run(conn, content_hash="a" * 64, pair="EURUSD", dd=0.05, pf=0.8)
     assert floor.select_deep_drawdown_candidate(
-        conn, now=NOW, exclude_hashes=set()) is None
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS) is None
+
+
+def test_deep_drawdown_limit_and_floor_come_from_the_gate_settings(tmp_path):
+    conn = _conn(tmp_path)
+    _run(conn, content_hash="a" * 64, dd=0.30)
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.max_drawdown = 0.35
+    assert floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=settings) is None
+    settings.improve.gate.max_drawdown = 0.10
+    assert floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=settings) is not None
+    settings.improve.gate.min_pf = 1.5
+    assert floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=settings) is None
+
+
+def test_deep_drawdown_candidate_skips_unreadable_rows_and_reports_them(tmp_path):
+    conn = _conn(tmp_path)
+    bad_json = _run(conn, content_hash="a" * 64, dd=0.30)
+    conn.execute("UPDATE backtest_runs SET metrics_json='not json' WHERE id=?",
+                 (bad_json,))
+    no_pf = _run(conn, content_hash="b" * 64, dd=0.30)
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE id=?",
+                 (json.dumps({"trades": 100, "avg_r": 0.1, "max_drawdown": 0.3}), no_pf))
+    not_dict = _run(conn, content_hash="c" * 64, dd=0.30)
+    conn.execute("UPDATE backtest_runs SET metrics_json='[1]' WHERE id=?", (not_dict,))
+    wanted = _run(conn, content_hash="d" * 64, dd=0.30)
+    conn.commit()
+    skipped: list[int] = []
+    target = floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS, skipped=skipped)
+    assert target is not None and target.source_row_id == wanted
+    assert sorted(skipped) == sorted([bad_json, no_pf, not_dict])
 
 
 def _artifact(root: Path, *parts: str, meta: dict | None = None) -> Path:
@@ -258,3 +293,99 @@ def test_render_command_rebuilds_manifest_from_results_file(tmp_path):
     assert floor.main(["render", "--results", str(results), "--out", str(out)]) == 0
     text = out.read_text(encoding="utf-8")
     assert "0.030" in text and "0.900" not in text
+
+
+# ---- run_target (依存を差し替えた配線 test) ---------------------------------
+
+def _fake_environment(monkeypatch, tmp_path, *, pairs, fail_pair=None):
+    from types import SimpleNamespace
+
+    from agentic_fx.backtest import holdout
+    from agentic_fx.plugin import loader as plugin_loader
+    from agentic_fx.plugin import sandbox as plugin_sandbox
+    from agentic_fx.plugin import strategy_adapter
+    from agentic_fx.plugin import resolve
+    from agentic_fx.store import backtest_runs
+    from agentic_fx.tools import plugin_loader as tools_plugin_loader
+
+    meta = SimpleNamespace(
+        path=tmp_path, name="s", content_hash="h" * 64, artifact_hash="a" * 64,
+        kind="strategy", timeframe="1h", pairs=pairs)
+    monkeypatch.setattr(floor, "locate_artifact", lambda root, t: (tmp_path, "versions"))
+    monkeypatch.setattr(plugin_loader, "discover_one_with_reason",
+                        lambda path, name: (meta, None))
+    monkeypatch.setattr(plugin_sandbox, "check_source", lambda path: None)
+    monkeypatch.setattr(tools_plugin_loader, "approved_plugins",
+                        lambda *a, **k: SimpleNamespace(inventory={}))
+    monkeypatch.setattr(resolve, "resolve_indicator_deps", lambda *a, **k: {})
+    monkeypatch.setattr(holdout, "require_reference_history", lambda *a, **k: None)
+    monkeypatch.setattr(strategy_adapter, "build_intent_source",
+                        lambda *a, **k: SimpleNamespace(close=lambda: None))
+    saved: list[str] = []
+    next_id = iter(range(500, 600))
+
+    def fake_save(conn, **kwargs):
+        saved.append(kwargs["pair"])
+        return next(next_id)
+
+    monkeypatch.setattr(backtest_runs, "save_human_run", fake_save)
+
+    def fake_run_in_sample(settings, *, symbol, record_fn, now, **kwargs):
+        if symbol == fail_pair:
+            raise RuntimeError("boom")
+        record_fn({
+            "scope": "in_sample", "pair": symbol, "source": "mt5",
+            "base_interval": "5m", "now": now,
+            "period": (now - timedelta(days=30), now),
+            "settings_hash": "s", "core_commit": "c",
+            "metrics": {"trades": 10, "max_drawdown": 0.1, "pf": 1.2,
+                        "avg_r": 0.1, "eval_bars": 100}})
+
+    monkeypatch.setattr(holdout, "run_in_sample", fake_run_in_sample)
+    settings = SimpleNamespace(backtest=SimpleNamespace(
+        dataset=lambda: SimpleNamespace(unconfigured=False)))
+    return settings, saved
+
+
+def _target():
+    return floor.Target(label="approval-1", name="s", content_hash="h" * 64,
+                        mission_id=1, artifact_hash="a" * 64, approval_id=1)
+
+
+def test_run_target_records_the_id_the_sink_received_not_a_table_maximum(
+        monkeypatch, tmp_path):
+    ro = _conn(tmp_path)
+    settings, saved = _fake_environment(monkeypatch, tmp_path,
+                                        pairs=["USDJPY", "EURUSD"])
+    record = floor.run_target(_target(), root=tmp_path, settings=settings,
+                              ro_conn=ro, write_conn=object(), now=NOW)
+    assert record["exclusion"] is None
+    assert [r["run_id"] for r in record["runs"]] == [500, 501]
+    assert saved == ["USDJPY", "EURUSD"]
+
+
+def test_run_target_failure_after_a_saved_pair_lists_the_saved_rows(
+        monkeypatch, tmp_path):
+    ro = _conn(tmp_path)
+    settings, saved = _fake_environment(
+        monkeypatch, tmp_path, pairs=["USDJPY", "EURUSD"], fail_pair="EURUSD")
+    record = floor.run_target(_target(), root=tmp_path, settings=settings,
+                              ro_conn=ro, write_conn=object(), now=NOW)
+    assert saved == ["USDJPY"]
+    assert record["partial_saved"] is True
+    assert "部分保存" in record["exclusion"]
+    assert [r["run_id"] for r in record["runs"]] == [500]
+    text = floor.render_manifest([record], header={"mode": "write"})
+    assert "| 500 |" in text and "部分保存" in text
+    assert floor.frequency_summary([record])["approved"] is None
+
+
+def test_run_target_failure_in_dry_run_is_not_marked_partial(monkeypatch, tmp_path):
+    ro = _conn(tmp_path)
+    settings, saved = _fake_environment(
+        monkeypatch, tmp_path, pairs=["USDJPY", "EURUSD"], fail_pair="EURUSD")
+    record = floor.run_target(_target(), root=tmp_path, settings=settings,
+                              ro_conn=ro, write_conn=None, now=NOW)
+    assert saved == [] and record["partial_saved"] is False
+    assert "部分保存" not in record["exclusion"]
+    assert "500" not in floor.render_manifest([record], header={})

@@ -78,12 +78,14 @@ from agentic_fx.plugin.sandbox import (
     SandboxError, allowed_to_conversions, check_source, denied_names,
 )
 from agentic_fx.plugin.strategy_gate import (
+    FLOOR_CONDITION_KINDS,
     _check_profitability_floor,
     _eval_timeframe as _strategy_gate_eval_timeframe,
     _floor_fail_items,
     evaluate_strategy_adoption_gate,
     floor_rule_text as _strategy_gate_floor_rule_text,
     floor_settings_kv,
+    trades_per_eval_bar,
 )
 from agentic_fx.runners.base import Mission
 from agentic_fx.tools.plugin_loader import approved_plugins
@@ -669,7 +671,6 @@ _FLOOR_FLOAT_RE = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _FLOOR_REPORT_NO_APPROVAL = "No approval request was produced by this mission."
 _FLOOR_REPORT_DETAIL_HEADING = "## Profitability floor detail"
 _FLOOR_STAGES = ("in_sample", "holdout")
-_FLOOR_CONDITION_KINDS = ("drawdown_too_deep", "too_frequent")
 _FLOOR_CONDITIONS_HEADER = (
     "| pair | max_drawdown | eval_bars | trades_per_eval_bar | failed_kinds |")
 _FLOOR_CONDITIONS_SEPARATOR = "|---|---|---|---|---|"
@@ -790,6 +791,8 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
         try:
             i = lines.index("### floor_conditions", i)
         except ValueError:
+            if with_failed:
+                raise ValueError("conditions missing") from None
             i = len(lines)
     while i < len(lines) and lines[i] == "":
         i += 1
@@ -819,8 +822,8 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
             else:
                 kinds = tuple(cells[4].split(", "))
                 if (not kinds or len(set(kinds)) != len(kinds)
-                        or any(kind not in _FLOOR_CONDITION_KINDS for kind in kinds)
-                        or kinds != tuple(kind for kind in _FLOOR_CONDITION_KINDS
+                        or any(kind not in FLOOR_CONDITION_KINDS for kind in kinds)
+                        or kinds != tuple(kind for kind in FLOOR_CONDITION_KINDS
                                           if kind in kinds)):
                     raise ValueError("condition kinds")
                 if in_sample_pairs[cells[0]] is not True:
@@ -838,6 +841,8 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
                 i += 1
         if i != len(lines):
             raise ValueError("condition trailing")
+    elif with_failed:
+        raise ValueError("conditions missing")
     stages: list[FloorStage] = []
     seen: set[str] = set()
     for name in (n for n in _FLOOR_STAGES if n in stage_names):
@@ -1771,9 +1776,7 @@ class ImproveLoop:
                 {args["pair"]: save_kwargs["metrics"]},
                 settings=self._settings, scope="in_sample", audience="agent")
             submission_blocked = (
-                {"reason": "unprofitable",
-                 "detail": (f"{floor_detail_text} — " if floor_detail_text else "")
-                           + "この成績では親ゲートが承認申請を出さず observation になります"}
+                {"reason": "unprofitable", "detail": floor_detail_text}
                 if floor_label else None)
             if ledger.state() != "OPEN" or _current_rpc_abandoned():
                 # /code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した
@@ -4695,10 +4698,8 @@ class ImproveLoop:
             dd = m.get("max_drawdown")
             bars = m.get("eval_bars")
             trades = m.get("trades")
-            frequency = (trades / bars if type(trades) is int and trades >= 0
-                         and type(bars) in (int, float) and not isinstance(bars, bool)
-                         and math.isfinite(bars) and bars >= 1 else None)
-            kinds = tuple(kind for kind in _FLOOR_CONDITION_KINDS if any(
+            frequency = trades_per_eval_bar(trades, bars)
+            kinds = tuple(kind for kind in FLOOR_CONDITION_KINDS if any(
                 item.kind == kind for item in by_pair.get(pair, [])))
             condition_rows.append(
                 f"| {pair} | {measured(dd)} | {measured(bars)} | "

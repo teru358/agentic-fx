@@ -295,11 +295,11 @@ def test_holdout_table_is_ignored_when_in_sample_failed(loop_min):
     clean = ("in_sample", [("USDJPY", 20, 0.5, 0.2, True)])
     assert _summary(parse_floor_report(text, mission_id=MID)) == clean
     before, _, _ = text.partition("### holdout")
-    with_holdout = before + "### holdout\n\nnot a table\nnan nan\n"
+    conditions = text[text.index("### floor_conditions"):]
+    with_holdout = before + "### holdout\n\nnot a table\nnan nan\n\n" + conditions
     assert with_holdout != text
     assert _summary(parse_floor_report(with_holdout, mission_id=MID)) == clean
-    assert _summary(parse_floor_report(before.rstrip("\n") + "\n",
-                                       mission_id=MID)) == clean
+    assert parse_floor_report(before.rstrip("\n") + "\n", mission_id=MID) is None
 
 
 def test_in_sample_table_is_validated_when_holdout_fails(loop_min):
@@ -358,12 +358,15 @@ def test_conditions_section_rejects_inconsistent_rows(loop_min, mutation):
     assert parse_floor_report(mutated, mission_id=MID) is None
 
 
-def test_old_report_without_conditions_section_gives_empty_conditions_for_all_pairs(
-        loop_min):
+def test_new_format_report_without_conditions_section_is_rejected(loop_min):
     text = _two_pair_conditions_text(loop_min, second_fails=True)
-    old = text[:text.index("### floor_conditions")].rstrip("\n") + "\n"
-    detail = parse_floor_report(old, mission_id=MID)
+    cut = text[:text.index("### floor_conditions")].rstrip("\n") + "\n"
+    assert parse_floor_report(cut, mission_id=MID) is None
+    assert parse_floor_report(cut.rstrip("\n"), mission_id=MID) is None
+    assert parse_floor_report(cut + "\n", mission_id=MID) is None
+
+
+def test_legacy_report_gives_empty_conditions_for_all_pairs():
+    detail = parse_floor_report(_real("improve-2026-10-25-2043.md"), mission_id=2043)
     assert detail is not None
-    pairs = detail.stages[0].pairs
-    assert {p.pair for p in pairs} == {"USDJPY", "EURUSD"}
-    assert all(p.conditions == () for p in pairs)
+    assert all(p.conditions == () for s in detail.stages for p in s.pairs)

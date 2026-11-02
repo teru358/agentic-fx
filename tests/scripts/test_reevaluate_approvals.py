@@ -189,3 +189,30 @@ def test_query_only_connection_rejects_writes(tmp_path: Path):
             conn.execute("DELETE FROM approval_requests")
     finally:
         conn.close()
+
+
+def _verdict_for(in_sample: dict, holdout: dict) -> str:
+    sys.path.insert(0, str(REPOSITORY))
+    try:
+        from scripts.reevaluate_approvals import _SETTINGS, _verdict
+    finally:
+        sys.path.pop(0)
+    return _verdict(in_sample, holdout, settings=_SETTINGS)
+
+
+def _pair(pf, *, dd=0.05, trades=40, evaluable=True, eval_bars=1000):
+    return {"USDJPY": {"trades": trades, "pf": pf, "avg_r": 0.1,
+                       "evaluable": evaluable, "max_drawdown": dd,
+                       "eval_bars": eval_bars}}
+
+
+def test_verdict_lists_every_failed_condition_independently():
+    assert _verdict_for(_pair(0.8, dd=0.3), _pair(1.2)) == "PF 不足 + DD 超過"
+    assert _verdict_for(_pair(1.2, dd=0.3), _pair(1.2, trades=4, evaluable=False)) \
+        == "holdout 評価不能 + DD 超過"
+    assert _verdict_for(_pair(0.8, dd=0.3), _pair(1.2, trades=4, evaluable=False)) \
+        == "両方 + DD 超過"
+    assert _verdict_for(_pair(1.2, dd=0.3, trades=400, eval_bars=1000), _pair(1.2)) \
+        == "DD 超過 + 高頻度"
+    assert _verdict_for(_pair(1.2, trades=400), _pair(1.2)) == "高頻度"
+    assert _verdict_for(_pair(1.2), _pair(1.2)) == "合格"

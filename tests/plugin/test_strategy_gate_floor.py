@@ -12,8 +12,11 @@ import pytest
 
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
+    AGENT_BLOCKED_NOTICE,
+    FLOOR_CONDITION_KINDS,
     _floor_fail_items,
     floor_settings_kv,
+    trades_per_eval_bar,
 )
 
 from tests.plugin.conftest import SETTINGS
@@ -244,7 +247,7 @@ def test_pf_and_drawdown_both_return_kind_but_agent_detail_hides_new_kind():
     label, detail = _check_profitability_floor(
         {"USDJPY": _m2(50, 1.5, 0.1, max_drawdown=0.99)},
         settings=SETTINGS, scope="in_sample", audience="agent")
-    assert label == "unprofitable" and detail == ""
+    assert label == "unprofitable" and detail == AGENT_BLOCKED_NOTICE
 
 
 # ---- F 番号 gap 充足 (2026-09-13、コーディネータ指示): F1-2/F1-5/F1-7 --
@@ -352,3 +355,46 @@ def test_non_int_trades_skip_only_frequency_and_still_judge_pf_dd():
     assert _floor_fail_items(
         {"USDJPY": _m2(0, 0.5, -0.1, max_drawdown=0.99, eval_bars=100)},
         settings=SETTINGS, scope="in_sample") == []
+
+
+def test_agent_detail_is_the_fixed_notice_when_only_new_conditions_fail():
+    label, detail = _check_profitability_floor(
+        {"USDJPY": _m2(50, 1.5, 0.1, max_drawdown=0.99)},
+        settings=SETTINGS, scope="in_sample", audience="agent")
+    assert (label, detail) == ("unprofitable", AGENT_BLOCKED_NOTICE)
+
+
+def test_agent_detail_for_pf_failure_ends_with_the_fixed_notice():
+    _, detail = _check_profitability_floor(
+        {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99)},
+        settings=SETTINGS, scope="in_sample", audience="agent")
+    assert detail.startswith("in_sample: USDJPY: pf=0.5")
+    assert detail.endswith(" — " + AGENT_BLOCKED_NOTICE)
+    assert "drawdown_too_deep" not in detail
+
+
+def test_human_detail_has_one_entry_per_pair_listing_every_kind():
+    metrics = {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99, eval_bars=1),
+               "EURUSD": _m2(50, 1.5, 0.1, max_drawdown=0.99)}
+    _, detail = _check_profitability_floor(
+        metrics, settings=SETTINGS, scope="in_sample")
+    assert detail.count("USDJPY:") == 1 and detail.count("EURUSD:") == 1
+    first = detail.split(", EURUSD:")[0]
+    assert "pf=" in first and "drawdown_too_deep" in first and "too_frequent" in first
+
+
+def test_trades_per_eval_bar_is_the_single_validity_rule():
+    assert trades_per_eval_bar(25, 100) == 0.25
+    assert trades_per_eval_bar(0, 1) == 0.0
+    assert trades_per_eval_bar(5, 2.5) == 2.0
+    for trades, bars in ((True, 100), ("5", 100), (5.0, 100), (-1, 100),
+                         (5, 0), (5, 0.5), (5, True), (5, "10"), (5, None),
+                         (5, float("nan")), (5, float("inf"))):
+        assert trades_per_eval_bar(trades, bars) is None
+
+
+def test_condition_kinds_are_the_gate_kinds():
+    metrics = {"USDJPY": _m2(99, 1.5, 0.1, max_drawdown=0.99, eval_bars=100)}
+    kinds = tuple(i.kind for i in _floor_fail_items(
+        metrics, settings=SETTINGS, scope="in_sample"))
+    assert kinds == FLOOR_CONDITION_KINDS

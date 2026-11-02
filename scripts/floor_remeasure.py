@@ -22,9 +22,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-EVALUABLE_MIN_TRADES = 30
+from agentic_fx.backtest.metrics import EVALUABLE_MIN_TRADES
+from agentic_fx.plugin.strategy_gate import _floor_fail_items, trades_per_eval_bar
+
 RECENT_DAYS = 60
-DD_LIMIT = 0.20
 REJECTED_REFERENCE_APPROVAL = 84
 
 
@@ -84,25 +85,34 @@ def select_approved_targets(conn, *, rejected_ids=(REJECTED_REFERENCE_APPROVAL,)
     return targets
 
 
-def _passes_floor(rows: list[dict], *, min_pf: float, positive_avg_r: bool) -> bool:
-    if sum(m["trades"] for m in rows) < EVALUABLE_MIN_TRADES:
+def _usable_metrics(raw: object) -> dict | None:
+    """床の判定に要る最小のキーが揃った dict だけを返す。それ以外は None。"""
+    try:
+        m = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(m, dict) or not {"trades", "pf", "avg_r"} <= set(m):
+        return None
+    return m
+
+
+def _is_deep_drawdown_candidate(per_pair: dict, *, settings) -> bool:
+    """pf / avg_r / 取引数の床は通るが、DD の上限だけ超える。判定は実際の床と同じ関数。"""
+    trades = [m["trades"] for m in per_pair.values()]
+    if any(type(t) is not int for t in trades) or sum(trades) < EVALUABLE_MIN_TRADES:
         return False
-    for m in rows:
-        if m["trades"] == 0:
-            continue
-        if m["pf"] is not None and m["pf"] < min_pf:
-            return False
-        if positive_avg_r and m["avg_r"] is not None and m["avg_r"] <= 0.0:
-            return False
-    return True
+    kinds = {item.kind for item in _floor_fail_items(
+        per_pair, settings=settings, scope="in_sample")}
+    return "drawdown_too_deep" in kinds and not kinds & {"pf", "avg_r"}
 
 
 def select_deep_drawdown_candidate(
-        conn, *, now: datetime, exclude_hashes, min_pf: float = 1.0,
-        positive_avg_r: bool = True, window_days: int = RECENT_DAYS,
-        dd_limit: float = DD_LIMIT) -> Target | None:
+        conn, *, now: datetime, exclude_hashes, settings,
+        window_days: int = RECENT_DAYS,
+        skipped: list[int] | None = None) -> Target | None:
     """直近 window_days の candidate in-sample 行から、pf / avg_r / 取引数の床は
-    通るが max DD が dd_limit を超える候補 (content_hash 単位) のうち最新の 1 本。"""
+    通るが max DD が床の上限を超える候補 (content_hash 単位) のうち最新の 1 本。
+    読めない行は行ごとに飛ばし、その id を `skipped` に足す。"""
     since = (now - timedelta(days=window_days)).isoformat()
     groups: dict[str, list] = {}
     for row in conn.execute(
@@ -114,13 +124,19 @@ def select_deep_drawdown_candidate(
     for content_hash, rows in groups.items():
         if content_hash in exclude_hashes:
             continue
-        metrics = [json.loads(r["metrics_json"]) for r in rows]
-        if not _passes_floor(metrics, min_pf=min_pf, positive_avg_r=positive_avg_r):
+        per_pair: dict[str, dict] = {}
+        usable = []
+        for r in rows:
+            m = _usable_metrics(r["metrics_json"])
+            if m is None:
+                if skipped is not None:
+                    skipped.append(r["id"])
+                continue
+            per_pair[r["pair"]] = m
+            usable.append(r)
+        if not usable or not _is_deep_drawdown_candidate(per_pair, settings=settings):
             continue
-        if not any(isinstance(m.get("max_drawdown"), (int, float))
-                   and m["max_drawdown"] > dd_limit for m in metrics):
-            continue
-        last = max(rows, key=lambda r: r["id"])
+        last = max(usable, key=lambda r: r["id"])
         ref = last["plugin_ref"]
         name = ref.rstrip("/").rsplit("/", 1)[-1]
         target = Target(
@@ -176,14 +192,6 @@ def reference_row(conn, content_hash: str, pair: str) -> dict | None:
             "max_drawdown": metrics.get("max_drawdown")}
 
 
-def trades_per_eval_bar(trades: object, eval_bars: object) -> float | None:
-    if type(trades) is not int or type(eval_bars) is not int:
-        return None
-    if trades < 0 or eval_bars <= 0:
-        return None
-    return trades / eval_bars
-
-
 # ---- manifest 整形 (純粋部分) ----------------------------------------------
 
 def _num(value: object, digits: int = 3) -> str:
@@ -212,7 +220,8 @@ def _table(header: list[str], rows: list[list[object]]) -> list[str]:
 
 def _results_by_pair(results: list[dict]) -> list[tuple[int, dict, dict]]:
     return [(number, item, run) for number, item in enumerate(results, 1)
-            if not item.get("exclusion") for run in item["runs"]]
+            if not item.get("exclusion") or item.get("partial_saved")
+            for run in item["runs"]]
 
 
 def frequency_summary(results: list[dict]) -> dict:
@@ -220,6 +229,8 @@ def frequency_summary(results: list[dict]) -> dict:
     summary: dict[str, list[float]] = {"approved": [], "rejected_reference": [],
                                        "deep_drawdown": []}
     for _n, item, run in _results_by_pair(results):
+        if item.get("exclusion"):
+            continue
         freq = run.get("frequency")
         if freq is not None:
             summary.setdefault(item["role"], []).append(freq)
@@ -302,6 +313,7 @@ def run_target(target: Target, *, root: Path, settings, ro_conn, write_conn,
     from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
     record = {**asdict(target), "runs": [], "exclusion": None,
+              "partial_saved": False,
               "artifact_path": None, "artifact_kind": None}
 
     def excluded(reason: str) -> dict:
@@ -345,13 +357,16 @@ def run_target(target: Target, *, root: Path, settings, ro_conn, write_conn,
     timeframe = _eval_timeframe(meta.timeframe)
     for pair in meta.pairs:
         captured: list[dict] = []
+        saved_ids: list[int] = []
 
-        def sink(kwargs: dict, _captured=captured) -> int:
+        def sink(kwargs: dict, _captured=captured, _saved=saved_ids) -> int:
             _captured.append(kwargs)
             if write_conn is None:
                 return 0
             saved = {k: v for k, v in kwargs.items() if k != "scope"}
-            return backtest_runs.save_human_run(write_conn, **saved)
+            run_id = backtest_runs.save_human_run(write_conn, **saved)
+            _saved.append(run_id)
+            return run_id
 
         source = strategy_adapter.build_intent_source(
             meta, conn=ro_conn, pair=pair, dataset=dataset,
@@ -364,8 +379,17 @@ def run_target(target: Target, *, root: Path, settings, ro_conn, write_conn,
                 kind="strategy", now=now, record_fn=sink)
         except Exception as exc:
             source.close()
-            return excluded(
-                f"{pair}: 再生に失敗 ({type(exc).__name__}: {str(exc)[:200]})")
+            reason = f"{pair}: 再生に失敗 ({type(exc).__name__}: {str(exc)[:200]})"
+            if write_conn is not None and record["runs"]:
+                record["partial_saved"] = True
+                reason = (f"部分保存 (保存済み {len(record['runs'])} pair は下表に"
+                          f"載せた。DB に残っている): {reason}")
+            if saved_ids:
+                partial = f"{pair} の行 id={saved_ids[-1]} も保存済み"
+                record["partial_saved"] = True
+                reason = f"部分保存 ({partial}): {reason}" \
+                    if not reason.startswith("部分保存") else f"{reason} / {partial}"
+            return excluded(reason)
         source.close()
         kwargs = captured[0]
         metrics = kwargs["metrics"]
@@ -373,7 +397,7 @@ def run_target(target: Target, *, root: Path, settings, ro_conn, write_conn,
         record["runs"].append({
             "pair": pair, "timeframe": timeframe, "source": kwargs["source"],
             "base_interval": kwargs["base_interval"],
-            "run_id": None if write_conn is None else _last_run_id(write_conn),
+            "run_id": saved_ids[-1] if saved_ids else None,
             "now": kwargs["now"].isoformat(), "start": start.isoformat(),
             "end": end.isoformat(), "settings_hash": kwargs["settings_hash"],
             "core_commit": kwargs["core_commit"],
@@ -385,16 +409,15 @@ def run_target(target: Target, *, root: Path, settings, ro_conn, write_conn,
     return record
 
 
-def _last_run_id(conn) -> int:
-    return conn.execute("SELECT MAX(id) FROM backtest_runs").fetchone()[0]
-
-
 def build_targets(ro_conn, *, now: datetime, settings) -> list[Target]:
     approved = select_approved_targets(ro_conn)
-    gate = settings.improve.gate
+    skipped: list[int] = []
     deep = select_deep_drawdown_candidate(
         ro_conn, now=now, exclude_hashes={t.content_hash for t in approved},
-        min_pf=gate.min_pf, positive_avg_r=gate.require_positive_avg_r)
+        settings=settings, skipped=skipped)
+    if skipped:
+        print(f"読めない backtest_runs 行を {len(skipped)} 件飛ばしました",
+              file=sys.stderr)
     return approved + ([deep] if deep is not None else [])
 
 

@@ -22,6 +22,11 @@ _DTO_KEYS = frozenset({"id", "backend", "model", "elapsed_sec", "snapshot", "rep
 REPORT_STATES = frozenset({"none", "prepared", "published", "failed"})
 STAGES = ("in_sample", "holdout")
 STAGE_LABELS = {"in_sample": "in-sample", "holdout": "holdout"}
+CONDITION_LABELS = {
+    "drawdown_too_deep": "DD が深すぎる",
+    "too_frequent": "取引頻度が高すぎる",
+}
+FLOOR_CONDITION_KINDS = tuple(CONDITION_LABELS)
 TRIGGER_LABELS = {"manual": "手動", "scheduled": "週次"}
 MAX_PAIR_LINES = 3
 IMPROVE_BODY_LIMIT = 2000
@@ -104,9 +109,9 @@ def _pair_row(value: object) -> dict | bool:
     if (type(conditions) not in (list, tuple)
             or any(type(kind) is not str for kind in conditions)):
         return False
-    allowed = ("drawdown_too_deep", "too_frequent")
     if (len(set(conditions)) != len(conditions)
-            or tuple(conditions) != tuple(kind for kind in allowed if kind in conditions)):
+            or tuple(conditions) != tuple(
+                kind for kind in FLOOR_CONDITION_KINDS if kind in conditions)):
         return False
     return {"pair": value["pair"], "trades": value["trades"], "pf": pf, "avg_r": avg_r,
             "evaluable": value["evaluable"], "conditions": list(conditions)}
@@ -259,12 +264,8 @@ def _floor_lines(floor: dict) -> list[str]:
             line = (f"{label}: {cut_escaped(row['pair'], FIELD_CHARS)} pf {_pf(row['pf'])} "
                     f"avg_r {_avg_r(row['avg_r'])} 取引 {row['trades']}")
             conditions = row.get("conditions", ())
-            labels = {
-                "drawdown_too_deep": "DD が深すぎる",
-                "too_frequent": "取引頻度が高すぎる",
-            }
             suffix = "" if row["evaluable"] else " (評価不能)"
-            rendered = [labels[kind] for kind in conditions if kind in labels]
+            rendered = [CONDITION_LABELS[kind] for kind in conditions if kind in CONDITION_LABELS]
             if rendered:
                 suffix += " (" + "、".join(rendered) + ")"
             lines.append(line + suffix)

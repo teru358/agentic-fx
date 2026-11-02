@@ -52,3 +52,16 @@ def test_cli_line_carries_the_items_for_a_full_and_an_old_payload():
     assert old == ["holdout: pf=1.0 trades=3 avg_r=0.1 max_drawdown=0.5 max DD 50.0%"]
     per_pair = Commands._metrics_lines("holdout", {"USDJPY": FULL})
     assert per_pair[0].endswith("勝率 42.9% max DD 26.3% kill switch 55回")
+
+
+def test_afx_ops_floor_condition_kinds_match_the_gate():
+    from agentic_fx.plugin.strategy_gate import FLOOR_CONDITION_KINDS
+
+    path = AFX_OPS.with_name("gate") / "improve_render.py"
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name) \
+                and node.targets[0].id == "CONDITION_LABELS":
+            assert tuple(ast.literal_eval(node.value)) == FLOOR_CONDITION_KINDS
+            return
+    raise AssertionError("CONDITION_LABELS not found")

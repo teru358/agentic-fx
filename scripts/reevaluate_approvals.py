@@ -106,19 +106,20 @@ def _verdict(in_sample: dict, holdout: dict, *, settings) -> str:
     in_items = _floor_fail_items(in_sample, settings=settings, scope="in_sample")
     holdout_items = _floor_fail_items(holdout, settings=settings, scope="holdout")
     kinds = {item.kind for item in (*in_items, *holdout_items)}
-    pf_failed = bool(kinds - {"holdout_not_evaluable"})
+    profit_failed = bool(kinds & {"pf", "avg_r"})
     holdout_unavailable = "holdout_not_evaluable" in kinds
+    parts: list[str] = []
+    if profit_failed and holdout_unavailable:
+        parts.append("両方")
+    elif profit_failed:
+        parts.append("PF 不足")
+    elif holdout_unavailable:
+        parts.append("holdout 評価不能")
     if "drawdown_too_deep" in kinds:
-        return "DD 超過"
+        parts.append("DD 超過")
     if "too_frequent" in kinds:
-        return "高頻度"
-    if pf_failed and holdout_unavailable:
-        return "両方"
-    if pf_failed:
-        return "PF 不足"
-    if holdout_unavailable:
-        return "holdout 評価不能"
-    return "合格"
+        parts.append("高頻度")
+    return " + ".join(parts) if parts else "合格"
 
 
 def _ids(text: str | None) -> list[int] | None:
