@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 157 件。完了分は closed/。
+未完了: 160 件。完了分は closed/。
 
 ## 実装中 (3)
 
@@ -72,9 +72,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (134)
+## 設計待ち (137)
 
-### 不具合 (74)
+### 不具合 (76)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -82,6 +82,8 @@
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
 | [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 高 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
+| [market-hours-fixed-21utc-ignores-dst](open/market-hours-fixed-21utc-ignores-dst.md) | 高 | 2026-11-02 | market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる |
+| [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -153,7 +155,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (39)
+### 機能 (40)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -168,6 +170,7 @@
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
 | [floor-add-selectivity-drawdown-killswitch](open/floor-add-selectivity-drawdown-killswitch.md) | 中 | 2026-11-01 | 収益性フロアに選別度・max DD・kill switch 回数を加える |
+| [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
