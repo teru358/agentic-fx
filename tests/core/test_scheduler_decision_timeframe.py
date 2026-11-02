@@ -227,18 +227,18 @@ def test_holiday_not_joined_to_weekend_skips_pre_holiday_bar(tmp_path):
     _seed_bar(env, _dt(2025, 12, 24, 20, 30))
     _tick(env, slot, _dt(2025, 12, 24, 20, 45, 30))
     assert len(slot.accepted_at) == 1
-    _tick(env, slot, _dt(2025, 12, 24, 21, 0, 30))         # 取引日 12/25 (祝日) へ
+    _tick(env, slot, _dt(2025, 12, 24, 22, 0, 30))         # 取引日 12/25 (祝日) へ
     _tick(env, slot, _dt(2025, 12, 25, 12, 0))
     assert env.sched._was_open is False
     _seed_bar(env, _dt(2025, 12, 24, 20, 45))
-    _tick(env, slot, _dt(2025, 12, 25, 21, 0, 30))
+    _tick(env, slot, _dt(2025, 12, 25, 22, 0, 30))
     assert env.sched._was_open is True and len(slot.accepted_at) == 1
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2025-12-24T20:45 session_start=2025-12-25T21:00"]
-    _seed_bar(env, _dt(2025, 12, 25, 21, 0))
-    _tick(env, slot, _dt(2025, 12, 25, 21, 15, 30))
+        "USDJPY 15m bar=2025-12-24T20:45 session_start=2025-12-25T22:00"]
+    _seed_bar(env, _dt(2025, 12, 25, 22, 0))
+    _tick(env, slot, _dt(2025, 12, 25, 22, 15, 30))
     assert len(slot.accepted_at) == 2
-    assert env.sched._cron_watermarks[KEY] == _dt(2025, 12, 25, 21, 0)
+    assert env.sched._cron_watermarks[KEY] == _dt(2025, 12, 25, 22, 0)
 
 
 def test_new_year_joined_to_weekend_skips_until_sunday_open(tmp_path):
@@ -247,19 +247,19 @@ def test_new_year_joined_to_weekend_skips_until_sunday_open(tmp_path):
     _seed_bar(env, _dt(2026, 12, 31, 20, 30))
     _tick(env, slot, _dt(2026, 12, 31, 20, 45, 30))
     assert env.sched._cron_watermarks[KEY] == _dt(2026, 12, 31, 20, 30)
-    for closed in (_dt(2026, 12, 31, 21, 0, 30), _dt(2027, 1, 1, 21, 0, 30),
+    for closed in (_dt(2026, 12, 31, 22, 0, 30), _dt(2027, 1, 1, 22, 0, 30),
                    _dt(2027, 1, 2, 12, 0)):
         _tick(env, slot, closed)
         assert env.sched._was_open is False
     assert len(slot.accepted_at) == 1
     _seed_bar(env, _dt(2026, 12, 31, 20, 45))
-    _tick(env, slot, _dt(2027, 1, 3, 21, 0, 30))
+    _tick(env, slot, _dt(2027, 1, 3, 22, 0, 30))
     assert len(slot.accepted_at) == 1
     assert env.sched._cron_watermarks[KEY] == _dt(2026, 12, 31, 20, 45)
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-12-31T20:45 session_start=2027-01-03T21:00"]
-    _seed_bar(env, _dt(2027, 1, 3, 21, 0))
-    _tick(env, slot, _dt(2027, 1, 3, 21, 15, 30))
+        "USDJPY 15m bar=2026-12-31T20:45 session_start=2027-01-03T22:00"]
+    _seed_bar(env, _dt(2027, 1, 3, 22, 0))
+    _tick(env, slot, _dt(2027, 1, 3, 22, 15, 30))
     assert len(slot.accepted_at) == 2
 
 
@@ -268,19 +268,19 @@ def test_christmas_friday_joined_to_weekend_is_not_a_session_start(tmp_path):
     env, slot = _env(tmp_path, base)
     _seed_bar(env, _dt(2026, 12, 24, 20, 30))
     _tick(env, slot, _dt(2026, 12, 24, 20, 45, 30))
-    for closed in (_dt(2026, 12, 24, 21, 0, 30), _dt(2026, 12, 25, 21, 0, 30),
+    for closed in (_dt(2026, 12, 24, 22, 0, 30), _dt(2026, 12, 25, 22, 0, 30),
                    _dt(2026, 12, 26, 12, 0)):
         _tick(env, slot, closed)
         assert env.sched._was_open is False
     assert len(slot.accepted_at) == 1
     _seed_bar(env, _dt(2026, 12, 24, 20, 45))
-    _tick(env, slot, _dt(2026, 12, 27, 21, 0, 30))
+    _tick(env, slot, _dt(2026, 12, 27, 22, 0, 30))
     assert len(slot.accepted_at) == 1
     assert env.sched._cron_watermarks[KEY] == _dt(2026, 12, 24, 20, 45)
     assert _activity(env, "cron_previous_session_bar_skipped") == [
-        "USDJPY 15m bar=2026-12-24T20:45 session_start=2026-12-27T21:00"]
-    _seed_bar(env, _dt(2026, 12, 27, 21, 0))
-    _tick(env, slot, _dt(2026, 12, 27, 21, 15, 30))
+        "USDJPY 15m bar=2026-12-24T20:45 session_start=2026-12-27T22:00"]
+    _seed_bar(env, _dt(2026, 12, 27, 22, 0))
+    _tick(env, slot, _dt(2026, 12, 27, 22, 15, 30))
     assert len(slot.accepted_at) == 2
 
 

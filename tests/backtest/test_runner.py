@@ -386,6 +386,44 @@ def test_pending_proposal_opens_when_execution_bar_exists(tmp_path):
     assert res.orders[0]["status"] == "open"
 
 
+def test_winter_weekend_replay_skips_closed_hour_and_drops_unbacked_friday_proposal(
+        tmp_path, monkeypatch):
+    """Repair 前の旧ラベルでも冬季週末 replay は発注せず完走する。"""
+    hist = _conn(tmp_path)
+    friday = datetime(2026, 11, 6, 20, 59, tzinfo=timezone.utc)
+    sunday = datetime(2026, 11, 1, 20, 59, tzinfo=timezone.utc)
+    ohlcv.import_history_bars(
+        hist,
+        [
+            _row_at(friday, o=148.5, h=148.6, l=148.4, c=148.5),
+            _row_at(sunday + timedelta(hours=1, minutes=1),
+                    o=148.5, h=148.6, l=148.4, c=148.5),
+        ],
+        source="dukascopy")
+    recorded = []
+    real_write = runner_module._RecordingActivity.write
+
+    def capture(self, category, event, summary, ref_id=None):
+        real_write(self, category, event, summary, ref_id)
+        recorded.extend(self.entries[-1:])
+
+    monkeypatch.setattr(runner_module._RecordingActivity, "write", capture)
+    friday_result = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=friday, end=friday + timedelta(minutes=3),
+        intent_source=lambda bar: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+    sunday_result = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=sunday, end=sunday + timedelta(hours=1, minutes=3),
+        intent_source=lambda bar: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+
+    assert friday_result.orders == []
+    assert any(entry["kind"] == "proposal_dropped_no_bar" for entry in recorded)
+    assert sunday_result.orders == []
+
+
 def test_quote_error_names_5m_base_interval(tmp_path, monkeypatch):
     """M8: quoteの最後の網はdatasetの5m粒度を正確に報告する。"""
     hist = _conn(tmp_path)

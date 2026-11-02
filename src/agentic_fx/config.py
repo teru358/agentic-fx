@@ -64,8 +64,8 @@ class RiskSettings(_Strict):
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
     max_slippage_pct: float = Field(gt=0)
-    # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)
-    # なので、通年でクローズより前になる範囲だけを受け入れる。
+    # NY 現地時間。市場クローズは NY 17:00 (夏 21:00 UTC / 冬 22:00 UTC)。
+    # cutoff はクローズの 1 時間以上前に限る。
     friday_swing_cutoff_ny: str = "14:00"
     commission_per_lot: float = Field(ge=0)
     pair_rules: dict[str, PairRule]

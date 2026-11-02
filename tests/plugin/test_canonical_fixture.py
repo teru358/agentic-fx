@@ -45,9 +45,22 @@ def test_weekend_hole_boundaries_are_exact():
 
 
 def test_default_arguments_are_the_documented_ones(full):
-    assert fixture_data_hash(build_canonical_5m()) == fixture_data_hash(full)
+    assert fixture_data_hash(build_canonical_5m()) == "dc010588fc44ff4516eb783be6142c69289fb6e7d07a011860f7a080344975de"
     assert full.index[0] == _ts("2026-01-01 00:00")
     assert full.index[-1] == _ts("2026-12-06 23:55")
+
+
+@pytest.mark.parametrize(("timeframe", "expected"), [
+    ("5m", "dc010588fc44ff4516eb783be6142c69289fb6e7d07a011860f7a080344975de"),
+    ("15m", "ed41035a113b39b5a6c041a72003c1bee88699b64317f416f8733f3b022f9c76"),
+    ("1h", "7881c93a468ee967bf9d6e06f04469a8803e98af832d231088b78fa26a58161d"),
+    ("4h", "ef92d788da7348ab13fa821c78e90adec33805635a89920ab799a0c27dba7a95"),
+    ("1d", "5e156fad4ca4b98af28aa478df89d4e3c524293225369ea0ef65b330dfccf2c6"),
+])
+def test_canonical_fixture_hashes_are_compatibility_pins(timeframe, expected):
+    from agentic_fx.plugin.indicator_pipeline import canonical_bars
+
+    assert canonical_bars(timeframe)[1] == expected
 
 
 @pytest.mark.parametrize("days", [0, -1])
