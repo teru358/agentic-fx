@@ -28,6 +28,7 @@ from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.backtest.timeframes import TF_MINUTES
 from agentic_fx.core import econ_window, market_hours, mission_ceiling
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC
+from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.store import (
     alert_state, econ_events, fetch_attempts, missions, ohlcv_slices, orders, signals,
 )
@@ -130,6 +131,46 @@ def static_guarantee(settings, strategies: Sequence) -> StaticGuarantee:
     return StaticGuarantee(
         by_budget or by_decision, w, k, cd, tick, rate, cw, pl, decision_width,
         total, budget, by_budget, by_decision)
+
+
+# --- 配備済み strategy の実行時の正本 -------------------------------------
+
+class DeployedStrategies:
+    """S と評価器が見る「いま配備済みの strategy 集合」。
+
+    `current()` は直近に読んだ集合 (起動時は起動時の承認集合) を返すだけで、DB に
+    触れない。`refresh(now)` は scheduler thread が毎 tick 呼び、運用日の境界を
+    越えたとき、または deploy op の表が前回から変わったとき (最大 op_id と最大
+    updated_at を見る 1 本の SQL) にだけ `load_fn` で集合を取り直す。取り直しに失敗
+    したら前の集合を保ち、次の tick で再び試す。
+    """
+
+    def __init__(self, initial: Sequence, *, load_fn: Callable[[], Sequence],
+                 version_fn: Callable[[], object]) -> None:
+        self._current = tuple(initial)
+        self._load_fn = load_fn
+        self._version_fn = version_fn
+        self._seen: tuple[str, object] | None = None
+        self._lock = threading.Lock()
+
+    def current(self) -> list:
+        with self._lock:
+            return list(self._current)
+
+    def refresh(self, now: datetime) -> bool:
+        """集合を取り直したら True。"""
+        try:
+            marker = (operating_day(now), self._version_fn())
+            if self._seen == marker:
+                return False
+            loaded = tuple(self._load_fn())
+        except Exception as exc:  # noqa: BLE001 — 取り直しの失敗で tick を止めない
+            _log.warning("deployed strategies refresh failed: %s", safe_error_text(exc))
+            return False
+        with self._lock:
+            self._current = loaded
+        self._seen = marker
+        return True
 
 
 # --- 容量 ----------------------------------------------------------------
@@ -251,8 +292,10 @@ class WaitBudgetEvaluator:
 
     def __init__(self, *, conn: sqlite3.Connection, settings,
                  strategies_fn: Callable[[], Sequence], activity: ActivityLog,
-                 now_fn: Callable[[], datetime]) -> None:
+                 now_fn: Callable[[], datetime],
+                 writer_admission: WriterAdmission | None = None) -> None:
         self._conn = conn
+        self._writer = writer_admission
         self._settings = settings
         self._strategies_fn = strategies_fn
         self._activity = activity
@@ -298,17 +341,67 @@ class WaitBudgetEvaluator:
         snapshot = self._compute(now, trigger)
         self._seen = (snapshot.op_day, self._identity())
         try:
-            alert_state.set(self._conn, alert_state.WAIT_BUDGET_SNAPSHOT_KEY,
-                            json.dumps(snapshot.to_dict(), sort_keys=True), now=now)
-        except Exception as exc:  # noqa: BLE001 — 表示用の保存で評価を失敗にしない
-            _log.warning("wait budget snapshot not saved: %s", safe_error_text(exc))
-        if snapshot.state == STATE_ACTIVE:
-            try:
-                self._notify_once(snapshot, now)
-            except Exception as exc:  # noqa: BLE001 — 記録できなければ通知しない
-                _log.warning("wait budget notice not recorded: %s",
-                             safe_error_text(exc))
+            saved, notify = self._persist(snapshot, now)
+        except Exception as exc:  # noqa: BLE001 — 記録できなければ通知しない
+            _log.warning("wait budget not recorded: %s", safe_error_text(exc))
+            saved, notify = True, False
+        if not saved:
+            # scheduler の書込み要求中は始めない。次の tick の `tick()` で取り直す
+            self._seen = None
+            return snapshot
+        if notify:
+            self._write_warning(snapshot)
         return snapshot
+
+    def _persist(self, snapshot: WaitBudgetSnapshot, now: datetime,
+                 ) -> tuple[bool, bool]:
+        """snapshot と通知済みの記録を 1 つの transaction で書く。
+
+        戻り値は (書いた, 今回初めて通知する)。scheduler の書込み要求フラグが立って
+        いれば `BEGIN IMMEDIATE` を出さず (False, False)。
+        """
+        conn = self._conn
+
+        def begin() -> None:
+            conn.execute("BEGIN IMMEDIATE")
+
+        if self._writer is not None:
+            if not self._writer.admit(begin):
+                return False, False
+        else:
+            begin()
+        try:
+            alert_state.set(conn, alert_state.WAIT_BUDGET_SNAPSHOT_KEY,
+                            json.dumps(snapshot.to_dict(), sort_keys=True),
+                            now=now, commit=False)
+            notify = (snapshot.state == STATE_ACTIVE
+                      and self._record_notice(snapshot, now))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return True, notify
+
+    def _record_notice(self, snapshot: WaitBudgetSnapshot, now: datetime) -> bool:
+        """(運用日, fingerprint) 1 組ごとの永続 key で dedupe する。初めての組なら
+        記録して True。過去の運用日の key はここで消す。"""
+        conn = self._conn
+        key = alert_state.wait_budget_notified_key(snapshot.op_day, snapshot.fingerprint)
+        if alert_state.get(conn, key) is not None:
+            return False
+        stale = [k for k in alert_state.keys_with_prefix(
+            conn, alert_state.WAIT_BUDGET_NOTIFIED_PREFIX)
+            if not k.startswith(
+                alert_state.WAIT_BUDGET_NOTIFIED_PREFIX + snapshot.op_day + "|")]
+        for old in stale:
+            alert_state.delete(conn, old, commit=False)
+        record = json.dumps({"fingerprint": snapshot.fingerprint,
+                             "day": snapshot.op_day, "at": now.isoformat()},
+                            sort_keys=True)
+        alert_state.set(conn, key, record, now=now, commit=False)
+        alert_state.set(conn, alert_state.WAIT_BUDGET_NOTIFIED_KEY, record,
+                        now=now, commit=False)
+        return True
 
     def _compute(self, now: datetime, trigger: str) -> WaitBudgetSnapshot:
         s = self._settings
@@ -431,28 +524,16 @@ class WaitBudgetEvaluator:
                 out.append(seconds)
         return out
 
-    def _notify_once(self, snapshot: WaitBudgetSnapshot, now: datetime) -> bool:
-        """同じ (fingerprint, 運用日) では 1 回だけ activity を書く。記録を先に commit
-        し、記録できなければ書かない (再起動で増やさない)。"""
-        key = {"fingerprint": snapshot.fingerprint, "day": snapshot.op_day}
-        raw = alert_state.get(self._conn, alert_state.WAIT_BUDGET_NOTIFIED_KEY)
+    def _write_warning(self, snapshot: WaitBudgetSnapshot) -> None:
         try:
-            last = json.loads(raw) if raw else {}
-        except ValueError:
-            last = {}
-        if (last.get("fingerprint"), last.get("day")) == (
-                key["fingerprint"], key["day"]):
-            return False
-        alert_state.set(self._conn, alert_state.WAIT_BUDGET_NOTIFIED_KEY,
-                        json.dumps({**key, "at": now.isoformat()}, sort_keys=True),
-                        now=now)
-        self._activity.write(
-            Category.SYSTEM, WARNING_EVENT,
-            f"採否の待機が鮮度の余地に収まりません: 判定={snapshot.basis} "
-            f"標本={snapshot.samples} 推定={_fmt(snapshot.estimate_sec)} 秒 / "
-            f"余地={_fmt(snapshot.budget_sec)} 秒 / freshness 系 abandoned="
-            f"{snapshot.freshness_abandoned} ({', '.join(snapshot.reasons)})")
-        return True
+            self._activity.write(
+                Category.SYSTEM, WARNING_EVENT,
+                f"採否の待機が鮮度の余地に収まりません: 判定={snapshot.basis} "
+                f"標本={snapshot.samples} 推定={_fmt(snapshot.estimate_sec)} 秒 / "
+                f"余地={_fmt(snapshot.budget_sec)} 秒 / freshness 系 abandoned="
+                f"{snapshot.freshness_abandoned} ({', '.join(snapshot.reasons)})")
+        except Exception as exc:  # noqa: BLE001 — 記録は済んでいる。再送はしない
+            _log.warning("wait budget warning not written: %s", safe_error_text(exc))
 
 
 def _fmt(value: float | None) -> str:

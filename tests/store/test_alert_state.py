@@ -79,3 +79,34 @@ def test_prefix_listing_does_not_treat_underscore_as_a_wildcard(tmp_path):
     conn.commit()
     assert alert_state.keys_with_prefix(conn, alert_state.LIMIT_SUPPRESS_PREFIX) == []
     conn.close()
+
+
+def test_wait_budget_pair_keys_are_a_known_prefix_and_the_bare_key_is_separate(tmp_path):
+    conn = connect(tmp_path / "a.db")
+    init_db(conn)
+    key = alert_state.wait_budget_notified_key("2026-07-21T21:00:00+00:00", "abcd")
+    assert key == "signal_wait_budget.notified.2026-07-21T21:00:00+00:00|abcd"
+    alert_state.set(conn, key, "{}", now=NOW)
+    alert_state.set(conn, alert_state.WAIT_BUDGET_NOTIFIED_KEY, "{}", now=NOW)
+    assert alert_state.keys_with_prefix(
+        conn, alert_state.WAIT_BUDGET_NOTIFIED_PREFIX) == [key]   # 末尾の key は含まない
+    with pytest.raises(ValueError):
+        alert_state.get(conn, alert_state.WAIT_BUDGET_NOTIFIED_PREFIX)
+    conn.close()
+
+
+def test_set_and_delete_can_defer_the_commit_to_the_caller(tmp_path):
+    conn = connect(tmp_path / "a.db")
+    init_db(conn)
+    key = alert_state.limit_suppress_key(3)
+    conn.execute("BEGIN IMMEDIATE")
+    alert_state.set(conn, key, "[]", now=NOW, commit=False)
+    assert conn.in_transaction
+    conn.rollback()
+    assert alert_state.get(conn, key) is None               # commit していない
+    alert_state.set(conn, key, "[]", now=NOW)
+    conn.execute("BEGIN IMMEDIATE")
+    alert_state.delete(conn, key, commit=False)
+    conn.rollback()
+    assert alert_state.get(conn, key) == "[]"
+    conn.close()

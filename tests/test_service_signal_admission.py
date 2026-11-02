@@ -1,6 +1,8 @@
 """signal 専用 mission の起動条件・静的保証・容量比較・calendar 鮮度・status の配線。"""
 from __future__ import annotations
 
+import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +21,8 @@ from agentic_fx.service import (
 )
 from agentic_fx.setup.preflight import FATAL_CODES, PreflightFailure
 from agentic_fx.signal_admission import (
-    CalendarFreshnessNotice, CapacityMonitor, static_guarantee, signal_due,
+    CalendarFreshnessNotice, CapacityMonitor, DeployedStrategies, static_guarantee,
+    signal_due,
 )
 from agentic_fx.store import alert_state, econ_events, fetch_attempts, missions, orders, signals
 from agentic_fx.store.db import connect, init_db
@@ -271,7 +274,7 @@ def test_an_override_equal_to_or_above_the_producer_maximum_starts():
     assert _startup_signal_capacity(SETTINGS, _ctx([_strategy("15m")])) is SETTINGS
 
 
-def test_an_inventory_change_while_running_raises_the_flag_and_lifts_s_to_the_producer():
+def test_the_capacity_monitor_reads_the_deployed_set_each_time():
     approved = [_strategy("1h")]                       # 24 件 / 日
     settings = SETTINGS.model_copy(update={"econ": SETTINGS.econ.model_copy(
         update={"signal_capacity_daily_max": 30})})
@@ -286,6 +289,116 @@ def test_an_inventory_change_while_running_raises_the_flag_and_lifts_s_to_the_pr
     assert snap["signal_daily"] == 120 and snap["producer_daily"] == 120
     approved.clear()
     assert monitor.snapshot()["capacity_override_below_producer"] is False
+
+
+class _Loader:
+    def __init__(self, *sets):
+        self.sets = list(sets)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        value = self.sets[min(self.calls, len(self.sets)) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def test_the_deployed_set_is_reread_only_at_a_new_day_or_a_changed_version():
+    loader, version = _Loader([_strategy("15m")]), ["v1"]
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=loader,
+                                  version_fn=lambda: version[0])
+    assert [m.timeframe for m in deployed.current()] == ["1h"]      # 起動時の集合
+    assert loader.calls == 0
+    assert deployed.refresh(NOW) is True and loader.calls == 1       # 初回
+    assert [m.timeframe for m in deployed.current()] == ["15m"]
+    assert deployed.refresh(NOW + timedelta(minutes=5)) is False
+    assert loader.calls == 1                                         # 同じ日・同じ版
+    version[0] = "v2"                                                # deploy op が動いた
+    assert deployed.refresh(NOW + timedelta(minutes=6)) is True
+    assert loader.calls == 2
+    assert deployed.refresh(NOW + timedelta(hours=9, minutes=1)) is True   # 運用日境界
+    assert loader.calls == 3
+
+
+def test_a_failed_reread_keeps_the_previous_set_and_is_retried():
+    loader = _Loader(RuntimeError("inventory unreadable"), [_strategy("15m")])
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=loader,
+                                  version_fn=lambda: "v1")
+    assert deployed.refresh(NOW) is False
+    assert [m.timeframe for m in deployed.current()] == ["1h"]
+    assert deployed.refresh(NOW + timedelta(minutes=1)) is True
+    assert [m.timeframe for m in deployed.current()] == ["15m"]
+
+
+def test_a_failing_version_probe_leaves_the_set_alone():
+    def broken():
+        raise RuntimeError("db busy")
+
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=lambda: [],
+                                  version_fn=broken)
+    assert deployed.refresh(NOW) is False
+    assert len(deployed.current()) == 1
+
+
+def test_a_deploy_op_while_running_lifts_s_to_the_producer_through_the_real_path(
+        tmp_path, monkeypatch):
+    """承認集合の正本を実行時に読む: deploy op の行が増えると評価器の tick が配備済み
+    集合を取り直し、status の S と `capacity_override_below_producer` が切り替わる。"""
+    from agentic_fx import service
+    from tests.store.test_plugin_deploy_ops import _insert_intent
+    _init(tmp_path)
+    cfg = tmp_path / "config" / "settings.yaml"
+    text = cfg.read_text(encoding="utf-8")
+    assert "  # signal_capacity_daily_max:" in text
+    cfg.write_text(text.replace("  # signal_capacity_daily_max:",
+                                "  signal_capacity_daily_max: 30  #", 1),
+                   encoding="utf-8")
+    (tmp_path / "plugins").mkdir()
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    app.scheduler.on_improve_tick = None
+    deployed_now = [_strategy("1h", name="a")]            # 24 件 / 日
+    loads = []
+
+    def fake_inventory(conn, root, *, settings):
+        # status の組立も同じ関数を呼ぶ。配備済み集合の取り直しだけを数える
+        if sys._getframe(1).f_code.co_name == "_load_deployed":
+            loads.append(1)
+        return SimpleNamespace(inventory=SimpleNamespace(metas=list(deployed_now)))
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(service.plugin_loader, "approved_plugins", fake_inventory)
+            app.scheduler.state_fn = lambda: "ready"
+            hook = app.scheduler.on_signal_maintenance
+            hook(NOW + timedelta(minutes=1))                  # 初回: 運用日の読み
+            assert loads == [1]
+            status = app.ops._status_provider()
+            assert status["capacity_override_below_producer"] is False
+            assert status["signal_capacity"]["producer"] == 24
+            deployed_now.append(_strategy("15m", name="b"))   # 24 + 96 = 120 件 / 日
+            hook(NOW + timedelta(minutes=2))                  # op の行は未追加: 読まない
+            assert loads == [1]
+            assert app.ops._status_provider()[
+                "capacity_override_below_producer"] is False
+            op_id = _insert_intent(app.conn_core)             # deploy op が動いた
+            hook(NOW + timedelta(minutes=3))
+            assert loads == [1, 1]
+            status = app.ops._status_provider()
+            assert status["capacity_override_below_producer"] is True
+            assert status["signal_capacity"] == {
+                "daily": 120, "producer": 120, "override": 30}
+            deployed_now.pop()                                # op の完了で集合が戻る
+            from agentic_fx.store import plugin_deploy_ops
+            plugin_deploy_ops.set_phase(app.conn_core, op_id, "done",
+                                        now=NOW + timedelta(minutes=4),
+                                        fail_reason=None)
+            hook(NOW + timedelta(minutes=5))
+            assert app.ops._status_provider()[
+                "capacity_override_below_producer"] is False
+    finally:
+        app.close()
 
 
 # --- calendar の鮮度 activity ------------------------------------------------
@@ -442,29 +555,124 @@ def test_the_status_line_is_formatted_with_the_minimal_keys(tmp_path):
     assert "signal/指標回避帯" not in client.format_status({})
 
 
-def test_the_writer_flag_covers_the_deferred_maintenance_of_a_tick(tmp_path):
+def test_the_writer_flag_covers_only_the_transactions_a_tick_opens(tmp_path, monkeypatch):
+    """フラグは ingest の commit、tick 本体、signal maintenance の書込みだけを覆う。
+    ingest の取得、improve の発火、評価境界 (自前の接続) は覆わない。"""
     app = _app(tmp_path)
     try:
-        seen = {}
-        real = app.scheduler.on_signal_maintenance
+        writer = app.writer_admission
+        seen: dict[str, list[bool]] = {}
 
-        def spy(now):
-            seen["during_maintenance"] = app.writer_admission.requested()
-            real(now)
+        def note(name):
+            seen.setdefault(name, []).append(writer.requested())
 
-        app.scheduler.on_signal_maintenance = spy
-        seen["during_tick"] = []
+        app.ingest = SimpleNamespace(
+            prepare=lambda now: (note("prepare"), (None, "report"))[1],
+            commit=lambda conn: note("commit"))
+        app.outage = None
+        app.scheduler.state_fn = lambda: "ready"
+        app.scheduler.on_improve_tick = lambda now: note("improve")
         real_bars = app.scheduler.bars_fn
-        app.scheduler.bars_fn = lambda p: (
-            seen["during_tick"].append(app.writer_admission.requested()),
-            real_bars(p))[1]
+        app.scheduler.bars_fn = lambda p: (note("tick"), real_bars(p))[1]
+        _signal(app.conn_core, bar_ts=NOW - timedelta(hours=3))      # 鮮度切れ
+        wait_budget = app.admission.wait_budget
+        real_eval = wait_budget.evaluate_wait_budget
+
+        def eval_spy(*args, **kwargs):
+            note("evaluate")
+            return real_eval(*args, **kwargs)
+
+        wait_budget.evaluate_wait_budget = eval_spy
+        for name in ("reclaim_expired", "expire_stale"):
+            real = getattr(signals, name)
+
+            def spy(*args, __real=real, __name=name, **kwargs):
+                note(__name)
+                return __real(*args, **kwargs)
+
+            monkeypatch.setattr(signals, name, spy)
         _scheduler_tick_once(app)
-        assert seen["during_maintenance"] is True
+        assert seen["prepare"] == [False]
+        assert seen["commit"] == [True]
+        assert seen["tick"] and all(seen["tick"])
+        assert seen["reclaim_expired"] == [True] and seen["expire_stale"] == [True]
+        assert seen["improve"] == [False]
+        assert seen["evaluate"] and not any(seen["evaluate"])
         assert app.writer_admission.requested() is False
         stats = app.writer_admission.stats()
-        assert stats.requests == 1 and stats.last_hold_sec is not None
+        assert stats.requests >= 3 and stats.last_hold_sec is not None
         assert stats.tick_active is False
     finally:
+        app.close()
+
+
+def _core_lock_is_free_for_others(app) -> bool:
+    """別 thread から core lock を non-blocking で取れるか (呼んだ thread が握っていれば取れない)。"""
+    import threading
+    got: list[bool] = []
+
+    def probe():
+        ok = app.core_lock.acquire(blocking=False)
+        got.append(ok)
+        if ok:
+            app.core_lock.release()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(5)
+    return got == [True]
+
+
+def test_the_terminal_evaluation_runs_after_the_commit_and_outside_the_core_lock(tmp_path):
+    """実 app の tick が freshness 系の終端を commit したあと、実 core_lock を握らずに
+    評価境界を呼ぶ (呼出し時点で lock と DB の状態を見る)。"""
+    app = _app(tmp_path)
+    try:
+        sid = _signal(app.conn_core, bar_ts=NOW - timedelta(hours=3))
+        app.scheduler.state_fn = lambda: "ready"
+        calls = []
+
+        def spy(signal_id, kind):
+            calls.append((signal_id, kind, _core_lock_is_free_for_others(app),
+                          app.conn_core.execute(
+                              "SELECT status FROM signals WHERE id=?",
+                              (signal_id,)).fetchone()[0]))
+
+        app.admission.wait_budget.on_signal_terminal = spy
+        _scheduler_tick_once(app)
+        assert calls == [(sid, "freshness_abandoned", True, "abandoned")]
+        assert not _core_lock_is_free_for_others_when_held(app)
+    finally:
+        app.close()
+
+
+def _core_lock_is_free_for_others_when_held(app) -> bool:
+    """検出器の自己確認: 自分が握っている間は『空き』と判定されない。"""
+    with app.core_lock:
+        return _core_lock_is_free_for_others(app)
+
+
+def test_a_slow_daily_report_does_not_hold_the_writer_flag(tmp_path):
+    import threading
+    app = _app(tmp_path)
+    release = threading.Event()
+    held: list[bool] = []
+    try:
+        def slow(close_at):
+            held.append(app.writer_admission.requested())
+            release.wait(10)
+
+        app.scheduler.register_daily_report(slow)
+        _scheduler_tick_once(app)                        # 取りこぼしの catch-up が積まれる
+        assert app.writer_admission.requested() is False
+        deadline = time.monotonic() + 5
+        while not held and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert held == [False]
+        _scheduler_tick_once(app)                        # report が走っていても次 tick は通る
+    finally:
+        release.set()
+        assert app.scheduler.join_daily_report(5)
         app.close()
 
 

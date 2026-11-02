@@ -54,7 +54,8 @@ class Harness:
             conn=overrides.get("conn", self.conn),
             settings=overrides.get("settings", self.settings),
             strategies_fn=lambda: self.strategies, activity=ActivityLog(self.log),
-            now_fn=lambda: self.now)
+            now_fn=lambda: self.now,
+            writer_admission=overrides.get("writer_admission"))
 
     def lines(self) -> list[str]:
         if not self.log.exists():
@@ -420,6 +421,44 @@ def test_a_changed_setting_fingerprint_notifies_again_within_the_day(tmp_path):
     h.conn.close()
 
 
+def _with_rate(minutes):
+    return SETTINGS.model_copy(update={"plugin": SETTINGS.plugin.model_copy(
+        update={"signal_min_interval_min": minutes})})
+
+
+def test_returning_to_an_earlier_setting_within_the_day_does_not_notify_again(tmp_path):
+    """A → B → A: 当日に通知済みの (fingerprint, 運用日) の組は、戻っても再通知しない。"""
+    h = _active(tmp_path)
+    h.evaluate()
+    assert len(h.lines()) == 1                              # A
+    h.settings = _with_rate(5)
+    h.evaluator = h.make()
+    h.evaluate()
+    assert len(h.lines()) == 2                              # B
+    h.settings = SETTINGS
+    h.evaluator = h.make()
+    h.evaluate()
+    h.evaluate()
+    assert len(h.lines()) == 2                              # A に戻っても増えない
+    h.conn.close()
+
+
+def test_each_notified_pair_is_its_own_durable_key_and_old_days_are_dropped(tmp_path):
+    h = _active(tmp_path)
+    h.evaluate()
+    h.settings = _with_rate(5)
+    h.evaluator = h.make()
+    h.evaluate()
+    prefix = alert_state.WAIT_BUDGET_NOTIFIED_PREFIX
+    keys = alert_state.keys_with_prefix(h.conn, prefix)
+    assert len(keys) == 2 and all("|" in k for k in keys)
+    h.now = NOW + timedelta(hours=9, minutes=1)             # 次の運用日
+    h.evaluate()
+    after = alert_state.keys_with_prefix(h.conn, prefix)
+    assert len(after) == 1 and after[0] not in keys         # 古い日の key は消える
+    h.conn.close()
+
+
 def test_the_fingerprint_depends_on_each_value_the_judgement_uses():
     base = dict(width_sec=900, freshness_bars=2, rate_sec=600.0, worker_sec=405.0)
     seen = {settings_fingerprint(**base)}
@@ -445,6 +484,48 @@ def test_the_note_is_not_written_when_the_state_cannot_be_saved(tmp_path):
     h.conn.commit()
     assert h.evaluate().state == "active"                   # 保存に失敗しても評価は返す
     assert h.lines() == []                                  # 記録できなければ書かない
+    h.conn.close()
+
+
+# --- 書込み要求との調整 -------------------------------------------------------
+
+def test_an_evaluation_does_not_begin_a_transaction_while_the_scheduler_has_requested(
+        tmp_path):
+    """評価器の書込み (conn_admission) も admit を通る。要求中は BEGIN を出さず、
+    何も記録せず通知もしない。次の tick で取り直す。"""
+    from agentic_fx.core.writer_admission import WriterAdmission
+    writer = WriterAdmission()
+    h = _active(tmp_path)
+    h.evaluator = h.make(writer_admission=writer)
+    began = []
+    h.conn.set_trace_callback(lambda sql: began.append(sql) if "BEGIN" in sql else None)
+    writer.request()
+    try:
+        snap = h.evaluate()
+        assert snap.state == "active"                       # 評価結果は返す
+        assert began == []                                  # BEGIN を出していない
+        assert alert_state.get(h.conn, alert_state.WAIT_BUDGET_SNAPSHOT_KEY) is None
+        assert h.lines() == []
+        h.evaluator.tick(NOW)                               # 要求中の tick も何も書かない
+        assert h.lines() == []
+    finally:
+        writer.release()
+    again = h.evaluator.tick(NOW)                           # 要求が下りたあとの tick
+    assert again is not None and again.state == "active"
+    assert len(h.lines()) == 1
+    assert [q for q in began if "BEGIN IMMEDIATE" in q]     # 今度は admit を通って始まる
+    assert writer.stats().yielded >= 1 and writer.stats().admitted == 1
+    h.conn.close()
+
+
+def test_a_tick_does_not_reevaluate_after_a_successful_admitted_write(tmp_path):
+    from agentic_fx.core.writer_admission import WriterAdmission
+    writer = WriterAdmission()
+    h = _active(tmp_path)
+    h.evaluator = h.make(writer_admission=writer)
+    assert h.evaluator.tick(NOW) is not None
+    assert h.evaluator.tick(NOW) is None
+    assert writer.stats().admitted == 1
     h.conn.close()
 
 

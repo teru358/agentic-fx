@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 from datetime import datetime, timedelta, timezone
@@ -70,7 +71,8 @@ from agentic_fx.runners.base import AgentRunner
 from agentic_fx.runners.local_runner import LocalRunner
 from agentic_fx.runners.worker_runner import WorkerRunner
 from agentic_fx.signal_admission import (
-    CalendarFreshnessNotice, CapacityMonitor, SignalAdmission, WaitBudgetEvaluator,
+    CalendarFreshnessNotice, CapacityMonitor, DeployedStrategies, SignalAdmission,
+    WaitBudgetEvaluator,
     FRESHNESS_ABANDON_REASONS, TERMINAL_FRESHNESS_ABANDONED, signal_due,
 )
 from agentic_fx.setup.checks import (CheckReason, CheckResult, check_cli_backend,
@@ -1167,7 +1169,8 @@ class _SupervisorAsk:
 
 def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                             now: datetime, resolved_by_identity, activity=None,
-                            plugins_root=None, on_terminal=None) -> None:
+                            plugins_root=None, on_terminal=None,
+                            write_scope=None) -> None:
     """`on_signal_maintenance` の実体 (裁定書 F-16/IM-10 — module レベル
     関数として抽出し、`build_app()` 全体を構築せずに単体テスト可能に
     する)。
@@ -1190,12 +1193,18 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
     requeued_expired) の abandoned が commit された pass で 1 回だけ呼ぶ。
     実測 warning の評価境界で、core_lock の外 (この関数の呼び出し元) で走る。
     評価の失敗はこの pass を止めない。
+
+    `write_scope` は scheduler の書込み要求フラグを立てる context manager の
+    factory。`conn` が transaction を開く reclaim / expire / producer の範囲だけを
+    覆い、評価境界 (`on_terminal`) と activity の書込みは覆わない。
     """
-    signals.reclaim_expired(conn, now=now,
-                            lease_min=settings.plugin.signal_lease_min,
-                            max_requeue=settings.plugin.signal_requeue_max)
-    expired = signals.expire_stale(
-        conn, now=now, freshness_bars=settings.plugin.signal_freshness_bars)
+    scope = write_scope if write_scope is not None else nullcontext
+    with scope():
+        signals.reclaim_expired(conn, now=now,
+                                lease_min=settings.plugin.signal_lease_min,
+                                max_requeue=settings.plugin.signal_requeue_max)
+        expired = signals.expire_stale(
+            conn, now=now, freshness_bars=settings.plugin.signal_freshness_bars)
     if on_terminal is not None:
         # 鮮度系の終端が確定した (commit 済み) ので、実測 warning の評価境界へ 1 回渡す。
         freshness = [row for row in expired.terminal
@@ -1214,11 +1223,12 @@ def _run_signal_maintenance(*, conn, signal_producer, approved, settings,
                 ref_id=str(row.id))
     # producer はライブ cache を読む。保存名は primary と異なり得る (mt5 → mt5-live)。
     source = "mt5-live" if settings.datafeed.primary == "mt5" else settings.datafeed.primary
-    signal_producer.evaluate_due_plugins(
-        conn=conn, plugins=approved, now=now,
-        source=source, settings=settings,
-        resolved_by_identity=resolved_by_identity, activity=activity,
-        plugins_root=plugins_root)
+    with scope():
+        signal_producer.evaluate_due_plugins(
+            conn=conn, plugins=approved, now=now,
+            source=source, settings=settings,
+            resolved_by_identity=resolved_by_identity, activity=activity,
+            plugins_root=plugins_root)
 
 
 def _raise_if_start_marker_present(root: Path) -> None:
@@ -1676,6 +1686,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         def on_signal_maintenance(now: datetime) -> None:
             # 運用日境界の通過と承認 strategy 集合の変更で、実測 warning を再評価する
+            deployed.refresh(now)
             wait_budget.tick(now)
             if not _repair_signal_connection(app):
                 return
@@ -1691,23 +1702,54 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                         approved=approved, settings=settings, now=now,
                         resolved_by_identity=dict(inventory_result.resolved),
                         activity=activity, plugins_root=plugins_dir,
-                        on_terminal=wait_budget.on_signal_terminal)
+                        on_terminal=wait_budget.on_signal_terminal,
+                        write_scope=writer_admission.scheduler_write)
             except Exception:  # noqa: BLE001
                 _log.exception("signal maintenance failed")
             finally:
                 _repair_signal_connection(app)
 
-        capacity_monitor = CapacityMonitor(settings, lambda: approved)
+        writer_admission = WriterAdmission()
+        # 実行中の S と評価器が見る配備済み strategy 集合。起動時は承認集合そのもの。
+        # 運用日境界と deploy op の表の変化で、既存の inventory 読みから取り直す
+        # (起動時の retention 検査で外した plugin は取り直しでも外す)。
+        startup_removed = {getattr(m, "name", None)
+                           for m in inventory_result.inventory.metas} - {
+            getattr(m, "name", None) for m in approved}
+
+        def _load_deployed() -> list:
+            if not plugins_dir.is_dir():
+                return []
+            conn = connect_readonly(root / "data" / "agentic.db")
+            try:
+                metas = plugin_loader.approved_plugins(
+                    conn, plugins_dir, settings=settings).inventory.metas
+            finally:
+                conn.close()
+            return [m for m in metas if m.name not in startup_removed]
+
+        def _deploy_ops_version() -> tuple:
+            conn = connect_readonly(root / "data" / "agentic.db")
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(op_id), 0), COALESCE(MAX(updated_at), '') "
+                    "FROM plugin_deploy_ops").fetchone()
+            finally:
+                conn.close()
+            return (row[0], row[1])
+
+        deployed = DeployedStrategies(
+            approved, load_fn=_load_deployed, version_fn=_deploy_ops_version)
+        capacity_monitor = CapacityMonitor(settings, deployed.current)
         wait_budget = WaitBudgetEvaluator(
-            conn=conn_admission, settings=settings, strategies_fn=lambda: approved,
-            activity=activity, now_fn=clock.now)
+            conn=conn_admission, settings=settings, strategies_fn=deployed.current,
+            activity=activity, now_fn=clock.now, writer_admission=writer_admission)
         calendar_notice = CalendarFreshnessNotice(
             conn=conn_core, freshness_fn=econ.freshness, activity=activity)
         admission = SignalAdmission(
-            settings=settings, strategies_fn=lambda: approved,
+            settings=settings, strategies_fn=deployed.current,
             pair_currencies=pair_currencies, capacity=capacity_monitor,
             wait_budget=wait_budget, calendar_notice=calendar_notice)
-        writer_admission = WriterAdmission()
 
         requirement_registry = build_registry(settings, approved)
         retention_plan = ohlcv.build_retention_plan(
@@ -2244,24 +2286,29 @@ def _all_hard_keys_failed(app: App, exc: Exception) -> IngestTickReport:
 
 
 def _scheduler_tick_once(app: App) -> None:
-    """`_scheduler_tick_body` を scheduler の書込み要求フラグで覆う (単体テスト用シーム)。
+    """`_scheduler_tick_body` を tick の観測印で覆う (単体テスト用シーム)。
 
-    フラグはこの tick で書く可能性のある範囲 (core lock 内の書込みと、lock 解放後に
-    走る maintenance 等の遅延 callable、tick が例外で抜けたときの maintenance) を
-    すべて覆い、最後に下ろす。worker はフラグが立っている間、新しい transaction を
-    始めない。
+    scheduler の DB 書込み要求フラグは、ここでは立てない。フラグは `conn_core` /
+    `conn_signal` が実際に write transaction を開く範囲 (ingest の commit、
+    `Scheduler.tick` の本体、signal maintenance の書込み) だけを、それぞれの場所で
+    覆う。ingest の取得 (network)、日次 report の callback、improve の発火、
+    deferred な通知はフラグの外で走る。
     """
     writer = getattr(app, "writer_admission", None)
     if writer is None:
         _scheduler_tick_body(app)
         return
-    writer.request()
     writer.tick_started()
     try:
         _scheduler_tick_body(app)
     finally:
-        writer.release()
         writer.tick_finished()
+
+
+def _writer_scope(app: App):
+    """scheduler の書込み要求フラグを立てる範囲。writer_admission が無ければ何もしない。"""
+    writer = getattr(app, "writer_admission", None)
+    return nullcontext() if writer is None else writer.scheduler_write()
 
 
 def _scheduler_tick_body(app: App) -> None:
@@ -2313,7 +2360,8 @@ def _scheduler_tick_body(app: App) -> None:
                 # commit が例外を出した tick も同じ扱いにする。
                 try:
                     if not prepare_failed:
-                        app.ingest.commit(app.conn_core)
+                        with _writer_scope(app):
+                            app.ingest.commit(app.conn_core)
                 except Exception as exc:  # noqa: BLE001 -- protection must still tick
                     _log.warning("ingest commit failed: %s", safe_error_text(exc))
                     if app.outage is not None:

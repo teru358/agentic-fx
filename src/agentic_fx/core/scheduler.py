@@ -1,6 +1,7 @@
 """Scheduler — クロック駆動 tick。mark-to-market・reconcile・予約維持・約定・毎時 Mission。"""
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import re
@@ -124,6 +125,12 @@ class Scheduler:
         # scheduler の DB 書込み要求フラグ。tick の間、立て続ける。
         self.writer_admission = writer_admission
         self._daily_report: Callable[[datetime], None] | None = None
+        # 日次 report は scheduler thread で同期実行せず、専用の 1 本の thread に渡す
+        self._report_queue: collections.deque = collections.deque()
+        self._report_lock = threading.Lock()
+        self._report_thread: threading.Thread | None = None
+        # 帯判定の例外を (order, 運用日) ごとに 1 回だけ技術ログへ出す記録
+        self._band_error_logged: set[tuple[int, str]] = set()
         # 抑止中の limit 件数 (status 用の不変 snapshot。tick ごとに差し替える)
         self.suppressed_limit_count = 0
         self._cron_watermarks: dict[tuple[str, str], datetime] = {}
@@ -159,8 +166,8 @@ class Scheduler:
         return self.writer_admission.scheduler_write()
 
     def tick(self, now: datetime) -> list[Callable[[], None]]:
-        """1 tick 分の決定論的処理。scheduler の DB 書込み要求フラグは tick の間立てる
-        (遅延 callable の書込みまでの範囲は呼び出し元の service が覆う)。
+        """1 tick 分の決定論的処理。scheduler の DB 書込み要求フラグは tick 本体の間だけ
+        立てる (遅延 callable の書込みは、呼び出し元の service がそれぞれ覆う)。
 
         **戻り値 (検収 B2, 2026-08-22)**: `tick()` は core_lock 保持下で
         呼ばれる (`service._scheduler_tick_once`)。`on_improve_tick` は
@@ -390,9 +397,9 @@ class Scheduler:
     def register_daily_report(self, callback: Callable[[datetime], None]) -> None:
         """市場の取引日が閉じた後に 1 回だけ `callback(close_at)` を呼ぶ。
 
-        `close_at` は閉じた取引日の終端 (21:00 UTC の rollover)。呼出しは tick の
-        遅延 callable として core_lock の外で、scheduler thread 上で行われる。
-        callback は同期で走るので、重い処理は自分で別 thread に渡すこと。
+        `close_at` は閉じた取引日の終端 (21:00 UTC の rollover)。
+        callback は scheduler thread では走らず、この hook が持つ専用の 1 本の thread
+        で順に呼ばれる (遅い callback が次 tick の kill switch・SL / TP を遅らせない)。
         起動後の最初の tick で、直近に閉じた取引日の分が未起動なら 1 回だけ追い
         つく (複数日ぶんを溜めて呼ばない)。起動した取引日は callback を呼ぶ前に
         `alert_state` へ記録するので、再起動しても同じ取引日では呼ばない。callback
@@ -438,8 +445,38 @@ class Scheduler:
             return []
         alert_state.set(self.conn, alert_state.DAILY_REPORT_KEY,
                         json.dumps({"day": day}), now=now)
-        return [lambda: self._run_data_hook("daily_report",
-                                            lambda: callback(close_at))]
+        return [lambda: self._enqueue_daily_report(callback, close_at)]
+
+    def _enqueue_daily_report(self, callback: Callable[[datetime], None],
+                              close_at: datetime) -> None:
+        """callback を専用 thread の queue に積む。thread は queue が空になると終わり、
+        次に積まれたときに起こし直す。"""
+        with self._report_lock:
+            self._report_queue.append((callback, close_at))
+            if self._report_thread is not None and self._report_thread.is_alive():
+                return
+            thread = threading.Thread(target=self._drain_daily_reports,
+                                      name="daily-report", daemon=True)
+            self._report_thread = thread
+            thread.start()
+
+    def _drain_daily_reports(self) -> None:
+        while True:
+            with self._report_lock:
+                if not self._report_queue:
+                    self._report_thread = None
+                    return
+                callback, close_at = self._report_queue.popleft()
+            self._run_data_hook("daily_report", lambda: callback(close_at))
+
+    def join_daily_report(self, timeout: float | None = None) -> bool:
+        """report thread が止まる (queue が空になる) まで待つ。止まれば True。"""
+        with self._report_lock:
+            thread = self._report_thread
+        if thread is None:
+            return True
+        thread.join(timeout)
+        return not thread.is_alive()
 
     # ---- internal -------------------------------------------------------
 
@@ -1449,9 +1486,13 @@ class Scheduler:
         currencies = self.pair_currencies.get(row["pair"])
         if currencies is None:
             return False
-        components = econ_events.bar_components(
-            self.conn, bar.ts, bar.ts + _ONE_MINUTE, settings=self.econ_window,
-            currencies=currencies)
+        try:
+            components = econ_events.bar_components(
+                self.conn, bar.ts, bar.ts + _ONE_MINUTE, settings=self.econ_window,
+                currencies=currencies)
+        except Exception as e:
+            self._log_band_error_once(row, now, e)
+            raise
         if not components:
             return False
         key = alert_state.limit_suppress_key(row["id"])
@@ -1472,6 +1513,18 @@ class Scheduler:
                 f"と足 {bar.ts.isoformat()} が交差 — 約定を見送り (注文は維持)",
                 ref_id=str(row["id"]))
         return True
+
+    def _log_band_error_once(self, row: dict, now: datetime, exc: Exception) -> None:
+        """帯判定の例外で足の約定を見送っていることを、(order, 運用日) ごとに 1 回だけ
+        技術ログの warning に出す。activity の語は増やさない。"""
+        day = market_hours.trading_day_start(now).isoformat()
+        self._band_error_logged = {k for k in self._band_error_logged if k[1] == day}
+        key = (row["id"], day)
+        if key in self._band_error_logged:
+            return
+        self._band_error_logged.add(key)
+        _log.warning("limit fill held: band judgement failed #%s %s day=%s: %s",
+                     row["id"], row["pair"], day, safe_error_text(exc))
 
     def _refresh_suppressed_count(self) -> None:
         try:

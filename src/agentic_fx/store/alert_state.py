@@ -9,6 +9,8 @@ LIMIT_SUPPRESS_PREFIX = "limit_suppress."
 DAILY_REPORT_KEY = "daily_report.state"
 # 稼働 warning の dedupe と直近の評価結果 (JSON)
 WAIT_BUDGET_NOTIFIED_KEY = "signal_wait_budget.notified"
+# 通知済みの (運用日, 設定 fingerprint) 1 組ごとの key: `<prefix><day>|<fingerprint>`
+WAIT_BUDGET_NOTIFIED_PREFIX = "signal_wait_budget.notified."
 WAIT_BUDGET_SNAPSHOT_KEY = "signal_wait_budget.snapshot"
 # 最後に通知した calendar の鮮度 (stale / fresh)
 CALENDAR_FRESHNESS_KEY = "econ_calendar.notified_freshness"
@@ -16,7 +18,7 @@ CALENDAR_FRESHNESS_KEY = "econ_calendar.notified_freshness"
 _KNOWN_KEYS = frozenset({
     GATE_REJECT_STREAK_KEY, DAILY_REPORT_KEY, WAIT_BUDGET_NOTIFIED_KEY,
     WAIT_BUDGET_SNAPSHOT_KEY, CALENDAR_FRESHNESS_KEY})
-_KNOWN_PREFIXES = (LIMIT_SUPPRESS_PREFIX,)
+_KNOWN_PREFIXES = (LIMIT_SUPPRESS_PREFIX, WAIT_BUDGET_NOTIFIED_PREFIX)
 
 
 def _check(key: str) -> None:
@@ -31,25 +33,32 @@ def limit_suppress_key(order_id: int) -> str:
     return f"{LIMIT_SUPPRESS_PREFIX}{int(order_id)}"
 
 
+def wait_budget_notified_key(day: str, fingerprint: str) -> str:
+    return f"{WAIT_BUDGET_NOTIFIED_PREFIX}{day}|{fingerprint}"
+
+
 def get(conn: sqlite3.Connection, key: str) -> str | None:
     _check(key)
     row = conn.execute("SELECT value FROM alert_state WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
 
 
-def set(conn: sqlite3.Connection, key: str, value: str, *, now: datetime) -> None:
+def set(conn: sqlite3.Connection, key: str, value: str, *, now: datetime,
+        commit: bool = True) -> None:
     _check(key)
     conn.execute(
         "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
         "updated_at=excluded.updated_at", (key, value, now.isoformat()))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def delete(conn: sqlite3.Connection, key: str) -> None:
+def delete(conn: sqlite3.Connection, key: str, *, commit: bool = True) -> None:
     _check(key)
     conn.execute("DELETE FROM alert_state WHERE key=?", (key,))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def keys_with_prefix(conn: sqlite3.Connection, prefix: str) -> list[str]:

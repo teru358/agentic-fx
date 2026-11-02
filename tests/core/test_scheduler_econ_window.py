@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -354,6 +355,50 @@ def test_a_failure_to_judge_the_band_skips_the_fill_for_that_bar(tmp_path, monke
     assert _status(env, oid) == "open"
 
 
+def _bar_error_warnings(caplog):
+    return [r for r in caplog.records
+            if "band judgement failed" in r.getMessage()]
+
+
+def test_a_repeated_band_failure_warns_once_per_order_and_operating_day(
+        tmp_path, monkeypatch, caplog):
+    """毎足の例外で limit が黙って約定しなくならないよう、技術ログに warning を
+    (order, 運用日) で 1 回出す。activity の語は増えず、SL / TP と期限は続く。"""
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=20)
+    other = env.place_limit(hours=20)
+    sl = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="market", horizon="swing", status="open",
+                       now=WED, quantity=0.1, avg_fill_price=148.20,
+                       stop_loss=147.80, take_profit=149.00)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("calendar unreadable")
+
+    with monkeypatch.context() as patch, caplog.at_level("WARNING"):
+        patch.setattr(econ_events, "bar_components", boom)
+        _tick(env, WED)
+        _tick(env, WED + timedelta(minutes=1))
+        _tick(env, WED + timedelta(minutes=2))
+        same_day = _bar_error_warnings(caplog)
+        env.bars["USDJPY"] = _bar(WED + timedelta(minutes=3), low=147.70)
+        env.sched.tick(WED + timedelta(minutes=4))
+        # 次の運用日 (21:00 UTC の rollover の後) は同じ order でも 1 回出す
+        next_day = WED + timedelta(hours=10)
+        _tick(env, next_day)
+        _tick(env, next_day + timedelta(minutes=1))
+    assert len(same_day) == 2                            # order 2 本 × 1 回
+    assert {r.getMessage().split()[6] for r in same_day} == {f"#{oid}", f"#{other}"}
+    assert _status(env, oid) == "pending_fill" and _status(env, other) == "pending_fill"
+    assert orders.get(env.conn, sl)["close_reason"] == "sl"      # 資金保護は続く
+    assert len(_bar_error_warnings(caplog)) == 4          # 運用日が変われば 1 回ずつ
+    assert _log(env).count("limit_fill_error") >= 5       # activity は従来どおり
+    assert "band_judgement" not in _log(env)             # 新しい固定語は無い
+    env.bars["USDJPY"] = _bar(WED + timedelta(hours=21))
+    env.sched.tick(WED + timedelta(hours=21, minutes=1))
+    assert _status(env, oid) in ("expired", "cancelled")  # 自然期限は止まらない
+
+
 # --- 書込み要求フラグ ---------------------------------------------------------
 
 def test_the_writer_flag_is_up_during_tick_and_down_afterwards(tmp_path):
@@ -393,9 +438,11 @@ def _report_env(tmp_path, calls, *, base=WED):
     return env
 
 
-def _run(pending):
+def _run(env, pending):
+    """遅延 callable を順に走らせ、report の専用 thread が空になるまで待つ。"""
     for hook in pending:
         hook()
+    assert env.sched.join_daily_report(5)
 
 
 def test_the_latest_close_is_the_rollover_after_which_the_market_was_open():
@@ -414,41 +461,42 @@ def test_the_first_tick_catches_up_once_and_the_callback_runs_after_the_tick(tmp
     env = _report_env(tmp_path, calls)
     pending = env.sched.tick(WED)
     assert calls == []                               # tick の中では呼ばない
-    _run(pending)
+    _run(env, pending)
     assert calls == [TUE_CLOSE]
-    _run(env.sched.tick(WED + timedelta(minutes=1)))
-    _run(env.sched.tick(WED + timedelta(hours=3)))
+    _run(env, env.sched.tick(WED + timedelta(minutes=1)))
+    _run(env, env.sched.tick(WED + timedelta(hours=3)))
     assert calls == [TUE_CLOSE]                      # 同じ取引日では 1 回だけ
 
 
 def test_the_next_trading_day_close_fires_once_more(tmp_path):
     calls: list = []
     env = _report_env(tmp_path, calls)
-    _run(env.sched.tick(WED))
-    _run(env.sched.tick(WED_CLOSE + timedelta(minutes=1)))
+    _run(env, env.sched.tick(WED))
+    _run(env, env.sched.tick(WED_CLOSE + timedelta(minutes=1)))
     assert calls == [TUE_CLOSE, WED_CLOSE]
 
 
 def test_a_restart_does_not_repeat_the_same_trading_day(tmp_path):
     calls: list = []
     env = _report_env(tmp_path, calls)
-    _run(env.sched.tick(WED))
+    _run(env, env.sched.tick(WED))
     again = Scheduler(
         conn=env.conn, executor=env.executor, settings=SETTINGS,
         state_store=env.state, activity=env.sched.activity,
         bars_fn=lambda p: None, on_trade_mission=env._trade,
         on_news_cycle=env._news, on_econ_cycle=env._econ)
     again.register_daily_report(lambda close_at: calls.append(close_at))
-    _run(again.tick(WED + timedelta(minutes=5)))
+    _run(env, again.tick(WED + timedelta(minutes=5)))
+    assert again.join_daily_report(5)
     assert calls == [TUE_CLOSE]
 
 
 def test_missed_days_are_caught_up_as_one_call(tmp_path):
     calls: list = []
     env = _report_env(tmp_path, calls, base=MON)
-    _run(env.sched.tick(MON))
+    _run(env, env.sched.tick(MON))
     assert len(calls) == 1
-    _run(env.sched.tick(MON + timedelta(days=4)))     # 数日止まっていた
+    _run(env, env.sched.tick(MON + timedelta(days=4)))     # 数日止まっていた
     assert len(calls) == 2
 
 
@@ -456,10 +504,103 @@ def test_weekend_boundaries_do_not_fire(tmp_path):
     calls: list = []
     sat = datetime(2026, 7, 25, 22, 0, tzinfo=timezone.utc)
     env = _report_env(tmp_path, calls, base=sat)
-    _run(env.sched.tick(sat))
+    _run(env, env.sched.tick(sat))
     assert calls == [datetime(2026, 7, 24, 21, 0, tzinfo=timezone.utc)]
-    _run(env.sched.tick(sat + timedelta(hours=24)))   # 日曜 22:00 (閉場の日の終端)
+    _run(env, env.sched.tick(sat + timedelta(hours=24)))   # 日曜 22:00 (閉場の日の終端)
     assert len(calls) == 1
+
+
+def test_a_slow_report_callback_does_not_delay_the_next_tick(tmp_path):
+    """callback は scheduler thread で走らない。遅い callback (ここでは止めたまま) を
+    登録しても、hook 自体も次 tick も待たされず、SL / TP の判定も通る。"""
+    env = Env(tmp_path)
+    release = threading.Event()
+    started = threading.Event()
+    threads: list = []
+
+    def slow(close_at):
+        threads.append(threading.current_thread())
+        started.set()
+        release.wait(10)
+
+    env.sched.register_daily_report(slow)
+    sl = orders.insert(env.conn, pair="USDJPY", direction="long",
+                       entry_type="market", horizon="swing", status="open",
+                       now=WED, quantity=0.1, avg_fill_price=148.20,
+                       stop_loss=147.80, take_profit=149.00)
+    env.bars["USDJPY"] = _bar(WED, open=148.20, high=148.30, low=147.70, close=147.75)
+    try:
+        for hook in env.sched.tick(WED + timedelta(minutes=1)):
+            hook()                       # 戻ってくる = callback を待っていない
+        assert started.wait(5)
+        assert threads[0] is not threading.current_thread()
+        assert orders.get(env.conn, sl)["close_reason"] == "sl"
+        before = time.monotonic()
+        env.sched.tick(WED + timedelta(minutes=2))           # callback が走っている最中
+        assert time.monotonic() - before < 2
+        assert env.sched.join_daily_report(0.05) is False     # まだ走っている
+    finally:
+        release.set()
+    assert env.sched.join_daily_report(5)
+
+
+def test_queued_reports_run_in_order_on_one_thread(tmp_path):
+    env = Env(tmp_path)
+    gate = threading.Event()
+    seen: list = []
+
+    def cb(close_at):
+        seen.append((close_at, threading.current_thread().name))
+        gate.wait(10)
+
+    first, second = datetime(2026, 7, 21, 21, 0, tzinfo=timezone.utc), WED_CLOSE
+    try:
+        env.sched._enqueue_daily_report(cb, first)
+        env.sched._enqueue_daily_report(cb, second)
+        time.sleep(0.05)
+        assert [c for c, _ in seen] == [first]               # 2 本目は待つ
+    finally:
+        gate.set()
+    assert env.sched.join_daily_report(5)
+    assert [c for c, _ in seen] == [first, second]
+    assert len({name for _, name in seen}) == 1
+
+
+@pytest.mark.parametrize("holiday_eve, holiday_night, monday, monday_close", [
+    # 12/24 の取引日が閉じた後、12/25 は休場。月曜 12/28 の終端で次に動く
+    (datetime(2026, 12, 24, 22, 0, tzinfo=timezone.utc),
+     datetime(2026, 12, 25, 22, 0, tzinfo=timezone.utc),
+     datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc),
+     datetime(2026, 12, 28, 21, 0, tzinfo=timezone.utc)),
+    (datetime(2026, 12, 31, 22, 0, tzinfo=timezone.utc),
+     datetime(2027, 1, 1, 22, 0, tzinfo=timezone.utc),
+     datetime(2027, 1, 4, 12, 0, tzinfo=timezone.utc),
+     datetime(2027, 1, 4, 21, 0, tzinfo=timezone.utc)),
+])
+def test_holiday_boundaries_do_not_fire_and_survive_a_restart(
+        tmp_path, holiday_eve, holiday_night, monday, monday_close):
+    """12/25 と 1/1 の 21:00 UTC の境界 (直前の 1 分は休場) では起動しない。
+    休場日をまたぐ再起動でも、閉じた取引日の分を 1 回しか呼ばない。"""
+    calls: list = []
+    env = _report_env(tmp_path, calls, base=holiday_eve)
+    _run(env, env.sched.tick(holiday_eve))
+    closed = Scheduler.latest_trading_close(holiday_eve)
+    assert calls == [closed]
+    assert closed.date() == holiday_eve.date() and closed.hour == 21
+    _run(env, env.sched.tick(holiday_night))                # 休場日の境界は数えない
+    assert calls == [closed]
+    again = Scheduler(
+        conn=env.conn, executor=env.executor, settings=SETTINGS,
+        state_store=env.state, activity=env.sched.activity,
+        bars_fn=lambda p: None, on_trade_mission=env._trade,
+        on_news_cycle=env._news, on_econ_cycle=env._econ)
+    again.register_daily_report(lambda close_at: calls.append(close_at))
+    _run(env, again.tick(monday))
+    assert again.join_daily_report(5)
+    assert calls == [closed]                                # 再起動後も増えない
+    _run(env, again.tick(monday_close + timedelta(minutes=1)))
+    assert again.join_daily_report(5)
+    assert calls == [closed, monday_close]
 
 
 def test_a_failing_callback_is_logged_and_not_retried(tmp_path):
@@ -471,15 +612,15 @@ def test_a_failing_callback_is_logged_and_not_retried(tmp_path):
         raise RuntimeError("report failed")
 
     env.sched.register_daily_report(boom)
-    _run(env.sched.tick(WED))
-    _run(env.sched.tick(WED + timedelta(minutes=1)))
+    _run(env, env.sched.tick(WED))
+    _run(env, env.sched.tick(WED + timedelta(minutes=1)))
     assert attempts == [TUE_CLOSE]
     assert "daily_report_cycle_error" in _log(env)
 
 
 def test_no_callback_means_no_state_is_written(tmp_path):
     env = Env(tmp_path)
-    _run(env.sched.tick(WED))
+    _run(env, env.sched.tick(WED))
     assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
 
 
@@ -489,7 +630,7 @@ def test_the_hook_is_not_run_while_stopping(tmp_path):
     stop = threading.Event()
     stop.set()
     env.sched._stop_event = stop
-    _run(env.sched.tick(WED))
+    _run(env, env.sched.tick(WED))
     assert calls == []
 
 
