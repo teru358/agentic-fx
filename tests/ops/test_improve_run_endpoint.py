@@ -237,6 +237,15 @@ def test_floor_from_the_real_2045_report_returns_raw_floats(ops_env, reports):
          "avg_r": -0.2772392430083411, "evaluable": False}]}]
 
 
+def test_floor_conditions_appear_only_on_pairs_that_have_them(ops_env, reports):
+    mission_id = _floor_mission(
+        ops_env, reports, "improve-2026-11-02-2043-conditions.md")
+    floor = service(ops_env, reports).improve_run(OPERATOR, mission_id)["floor"]
+    first, second = floor["stages"][0]["pairs"]
+    assert first["pair"] == "USDJPY" and first["conditions"] == ["drawdown_too_deep"]
+    assert second["pair"] == "EURUSD" and "conditions" not in second
+
+
 @pytest.mark.parametrize("state", ["none", "prepared", "failed"])
 def test_report_is_not_opened_unless_published(ops_env, reports, state, monkeypatch):
     from agentic_fx.ops import safe_open

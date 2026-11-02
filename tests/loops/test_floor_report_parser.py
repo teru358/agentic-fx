@@ -330,3 +330,40 @@ def test_values_are_finite_floats():
     detail = parse_floor_report(_real("improve-2026-10-25-2043.md"), mission_id=2043)
     assert all(isinstance(p.pf, float) and math.isfinite(p.pf)
                for st in detail.stages for p in st.pairs)
+
+
+def _two_pair_conditions_text(loop, *, second_fails=False):
+    first = _m(trades=50, pf=1.5)
+    first.update(max_drawdown=0.263, eval_bars=1000)
+    second = _m(trades=50, pf=0.5 if second_fails else 1.5)
+    second.update(max_drawdown=0.05, eval_bars=1000)
+    return _render(loop, {"USDJPY": first, "EURUSD": second}, {})
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda t: t.replace("| 0.050 | 1000.000 | 0.050 | - |",
+                        "| 0.050 | 1000.000 | 0.050 | bogus_kind |"),
+    lambda t: t.replace("| drawdown_too_deep |\n",
+                        "| drawdown_too_deep, drawdown_too_deep |\n"),
+    lambda t: t.replace("| EURUSD | 0.050 |", "| GBPUSD | 0.050 |"),
+    lambda t: t.replace("| 0.050 | 1000.000 | 0.050 | - |",
+                        "| 0.050 | 1000.000 | 0.050 | drawdown_too_deep |"),
+], ids=["unknown_kind", "duplicate_kind", "pair_mismatch",
+        "kinds_on_not_failed_pair"])
+def test_conditions_section_rejects_inconsistent_rows(loop_min, mutation):
+    text = _two_pair_conditions_text(loop_min)
+    assert parse_floor_report(text, mission_id=MID) is not None
+    mutated = mutation(text)
+    assert mutated != text
+    assert parse_floor_report(mutated, mission_id=MID) is None
+
+
+def test_old_report_without_conditions_section_gives_empty_conditions_for_all_pairs(
+        loop_min):
+    text = _two_pair_conditions_text(loop_min, second_fails=True)
+    old = text[:text.index("### floor_conditions")].rstrip("\n") + "\n"
+    detail = parse_floor_report(old, mission_id=MID)
+    assert detail is not None
+    pairs = detail.stages[0].pairs
+    assert {p.pair for p in pairs} == {"USDJPY", "EURUSD"}
+    assert all(p.conditions == () for p in pairs)

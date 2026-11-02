@@ -333,3 +333,22 @@ def test_floor_fail_items_agrees_with_check_profitability_floor_string():
     for item in items:
         assert item.pair in detail
         assert item.message in detail
+
+
+def test_non_int_trades_skip_only_frequency_and_still_judge_pf_dd():
+    for trades in (False, 0.0):
+        failing_dd = {"USDJPY": _m2(trades, 1.5, 0.1, max_drawdown=0.99,
+                                    eval_bars=100)}
+        items = _floor_fail_items(failing_dd, settings=SETTINGS,
+                                  scope="in_sample")
+        assert [i.kind for i in items] == ["drawdown_too_deep"]
+        failing_pf = {"USDJPY": _m2(trades, 0.5, -0.1, eval_bars=100)}
+        items = _floor_fail_items(failing_pf, settings=SETTINGS,
+                                  scope="in_sample")
+        assert [i.kind for i in items] == ["pf"]
+        assert _check_profitability_floor(
+            failing_dd, settings=SETTINGS, scope="in_sample")[0] \
+            == "unprofitable"
+    assert _floor_fail_items(
+        {"USDJPY": _m2(0, 0.5, -0.1, max_drawdown=0.99, eval_bars=100)},
+        settings=SETTINGS, scope="in_sample") == []

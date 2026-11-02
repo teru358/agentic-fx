@@ -378,6 +378,30 @@ def test_the_known_rounding_values_differ_from_a_naive_round_half_up():
     assert "pf 2.67 avg_r +0.01" in text
 
 
+def test_the_two_condition_words_are_shown_as_japanese_labels():
+    row = pair(trades=40, pf=0.80, avg_r=-0.10, evaluable=True)
+    row["conditions"] = ["drawdown_too_deep", "too_frequent"]
+    checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
+                                       report_state="published",
+                                       floor=_floor(("in_sample", [row]))), 2040)
+    text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), checked)
+    assert "in-sample: USDJPY pf 0.80 avg_r -0.10 取引 40 (DD が深すぎる、取引頻度が高すぎる)" in text
+    assert "drawdown_too_deep" not in text and "too_frequent" not in text
+
+
+def test_an_unknown_condition_word_is_never_shown():
+    for conditions in (["new_condition"], ["drawdown_too_deep", "new_condition"],
+                       ["too_frequent", "drawdown_too_deep"]):
+        row = pair(trades=40, pf=0.80, avg_r=-0.10, evaluable=True)
+        row["conditions"] = conditions
+        checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
+                                           report_state="published",
+                                           floor=_floor(("in_sample", [row]))), 2040)
+        text = render_improve_finish(finished(2040, "gate_failed", "unprofitable"), checked)
+        assert "new_condition" not in text
+        assert "DD が深すぎる" not in text and "取引頻度が高すぎる" not in text
+
+
 def test_a_pair_name_outside_the_grammar_drops_only_the_floor():
     checked = validate_improve_run(dto(2040, result="gate_failed", reason="unprofitable",
                                        report_state="published",

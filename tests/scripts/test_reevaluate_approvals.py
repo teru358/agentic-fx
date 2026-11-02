@@ -125,6 +125,30 @@ def test_drawdown_is_normalized_and_reported_only_by_new_floor(tmp_path: Path):
     assert completed.stdout.splitlines()[1].endswith("| 合格 | DD 超過")
 
 
+_MISSING = object()
+
+
+@pytest.mark.parametrize("value", [
+    _MISSING, True, False, float("nan"), float("inf"), float("-inf"), "0.99"],
+    ids=["missing", "true", "false", "nan", "inf", "neg_inf", "string"])
+def test_unusable_drawdown_is_skipped_under_the_new_basis(tmp_path: Path, value):
+    path = _database(tmp_path)
+    payload = _payload("dd-unusable")
+    if value is _MISSING:
+        del payload["in_sample"]["USDJPY"]["max_drawdown"]
+    else:
+        payload["in_sample"]["USDJPY"]["max_drawdown"] = value
+    payload["in_sample"]["USDJPY"]["eval_bars"] = 1000
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO approval_requests VALUES (?, 'plugin', ?, 'approved', ?)",
+                 (98, json.dumps(payload), "2026-10-05T00:00:00+00:00"))
+    conn.commit()
+    conn.close()
+    completed = _run(path, "--ids", "98")
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines()[1].endswith("| 合格 | 合格")
+
+
 def test_missing_saved_values_are_reported_without_failure(tmp_path: Path):
     completed = _run(_database(tmp_path), "--ids", "26")
 

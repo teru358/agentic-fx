@@ -121,7 +121,8 @@ def _floor_fail_items(
                                        "holdout_not_evaluable"))
             continue
         # ② 成績が無い pair は通常モードでは判定から除外する。
-        if m.get("trades") == 0:
+        _t = m.get("trades")
+        if type(_t) is int and _t == 0:
             continue
         # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
         if scope == "holdout" and not m.get("evaluable"):

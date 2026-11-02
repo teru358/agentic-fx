@@ -1062,6 +1062,50 @@ def test_f5_6_submission_blocked_has_no_holdout_language_or_period_endpoints(
     assert "period_end" not in dumped
 
 
+_FIXED_BLOCK_DETAIL = (
+    "この成績では親ゲートが承認申請を出さず observation になります")
+
+
+def _run_backtest_with_metrics(loop_min, tmp_path, monkeypatch, metrics):
+    _patch_strategy_lookup(monkeypatch)
+    _patch_run_in_sample(
+        monkeypatch, save_kwargs={**_SAVE_KWARGS, "metrics": metrics})
+    staging = tmp_path / "staging" / "myst"
+    staging.mkdir(parents=True)
+    return loop_min._build_rpc_handlers(
+        ImproveRpcLedger(rpc_timeout_sec_by_kind={}),
+        staging_dir=staging.parent)["run_backtest"](
+            {"name": "myst", "pair": "USDJPY"})
+
+
+def _assert_fixed_blocked_reply(result):
+    assert result["submission_blocked"] == {
+        "reason": "unprofitable", "detail": _FIXED_BLOCK_DETAIL}
+    blocked = json.dumps(result["submission_blocked"])
+    for word in ("drawdown_too_deep", "too_frequent", "eval_bars",
+                 "max_drawdown", "0.99", "0.4", "USDJPY"):
+        assert word not in blocked
+    assert "eval_bars" not in json.dumps(dict(result))
+
+
+def test_drawdown_only_failure_gives_fixed_detail_through_real_rpc(
+        loop_min, tmp_path, monkeypatch):
+    result = _run_backtest_with_metrics(
+        loop_min, tmp_path, monkeypatch,
+        {"trades": 40, "pf": 1.3, "avg_r": 0.1, "evaluable": True,
+         "max_drawdown": 0.99, "eval_bars": 1000})
+    _assert_fixed_blocked_reply(result)
+
+
+def test_frequency_only_failure_gives_fixed_detail_through_real_rpc(
+        loop_min, tmp_path, monkeypatch):
+    result = _run_backtest_with_metrics(
+        loop_min, tmp_path, monkeypatch,
+        {"trades": 400, "pf": 1.3, "avg_r": 0.1, "evaluable": True,
+         "max_drawdown": 0.05, "eval_bars": 1000})
+    _assert_fixed_blocked_reply(result)
+
+
 # --- /code-review 2 周目 CR6 (2026-09-18、却下の根拠 pin) ---
 
 
