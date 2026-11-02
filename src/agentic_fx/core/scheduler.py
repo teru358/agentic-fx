@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
-from agentic_fx.core import accounting, market_hours, transitions
+from agentic_fx.core import accounting, market_hours, time_cutover, transitions
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.paper_fills import check_exit, check_limit_fill
@@ -1247,8 +1247,8 @@ class Scheduler:
             # (レビュアー実測)。
             try:
                 anchor = row["filled_at"] or row["created_at"]
-                deadline = market_hours.next_rollover(
-                    datetime.fromisoformat(anchor))
+                deadline = time_cutover.day_close_rollover(
+                    self.conn, datetime.fromisoformat(anchor), now)
                 if now < deadline - market_hours.DAY_CLOSE_BUFFER:
                     continue
                 try:

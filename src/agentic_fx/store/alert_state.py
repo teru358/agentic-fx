@@ -3,7 +3,8 @@ import sqlite3
 from datetime import datetime
 
 GATE_REJECT_STREAK_KEY = "gate_reject.last_notified_streak_id"
-_KNOWN_KEYS = frozenset({GATE_REJECT_STREAK_KEY})
+TIME_RULE_CAPTURE_KEY = "time_rule_cutover.capture"
+_KNOWN_KEYS = frozenset({GATE_REJECT_STREAK_KEY, TIME_RULE_CAPTURE_KEY})
 
 
 def get(conn: sqlite3.Connection, key: str) -> str | None:

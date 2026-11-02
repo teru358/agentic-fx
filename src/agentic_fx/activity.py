@@ -67,6 +67,22 @@ class ActivityLog:
                 except Exception:  # noqa: BLE001 — write remains non-throwing
                     _log.exception("activity write failure callback failed")
 
+    def contains(self, event: str, ref_id: str) -> bool:
+        """Whether a line with this event and ref_id is already in the log.
+
+        A missing file is simply "no"; any other read failure is raised so the
+        caller can tell "absent" from "could not check".
+        """
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return False
+        for line in text.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 5 and fields[2] == event and fields[4] == ref_id:
+                return True
+        return False
+
     def tail(self, n: int = 20, category: Category | None = None) -> list[str]:
         if not self._path.exists():
             return []
