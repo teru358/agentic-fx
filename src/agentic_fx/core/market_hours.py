@@ -1,8 +1,9 @@
 """FX market hours derived from the New York 17:00 daily boundary.
 
 The market closes at New York 17:00: 21:00 UTC in summer and 22:00 UTC in
-winter.  ``friday_swing_cutoff_ny`` remains earlier than 16:00 NY to leave a
-conservative one-hour margin before that close.
+winter.  ``friday_swing_cutoff_ny`` must stay earlier than
+``fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY`` (the rollover minus
+``fx_time.SWING_CUTOFF_MARGIN``) to leave a margin before that close.
 """
 from __future__ import annotations
 

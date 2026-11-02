@@ -113,3 +113,15 @@ def test_every_minute_round_trips_except_the_autumn_repeated_hour():
         instant += step
 
     assert skipped == 180
+
+
+def test_utc_to_server_epoch_accepts_any_zero_offset_tzinfo():
+    from zoneinfo import ZoneInfo
+
+    from agentic_fx.core.fx_time import utc_to_server_epoch
+
+    expected = utc_to_server_epoch(datetime(2026, 7, 24, 20, 59, tzinfo=UTC))
+    for tz in (ZoneInfo("UTC"), timezone(timedelta(0)), timezone.utc,
+               timezone(timedelta(0), "other")):
+        assert utc_to_server_epoch(
+            datetime(2026, 7, 24, 20, 59, tzinfo=tz)) == expected

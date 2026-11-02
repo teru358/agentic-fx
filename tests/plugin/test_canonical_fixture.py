@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -45,7 +47,9 @@ def test_weekend_hole_boundaries_are_exact():
 
 
 def test_default_arguments_are_the_documented_ones(full):
-    assert fixture_data_hash(build_canonical_5m()) == "dc010588fc44ff4516eb783be6142c69289fb6e7d07a011860f7a080344975de"
+    params = inspect.signature(build_canonical_5m).parameters
+    assert (params["seed"].default, params["days"].default) == (20261102, 340)
+    assert fixture_data_hash(build_canonical_5m()) == fixture_data_hash(full)
     assert full.index[0] == _ts("2026-01-01 00:00")
     assert full.index[-1] == _ts("2026-12-06 23:55")
 

@@ -15,6 +15,11 @@ UTC = timezone.utc
 NY = ZoneInfo("America/New_York")
 SERVER_AHEAD_OF_NY = timedelta(hours=7)
 ROLLOVER_NY = time(17, 0)
+SWING_CUTOFF_MARGIN = timedelta(hours=1)
+# Exclusive upper bound for the Friday swing cutoff, in NY wall time.
+FRIDAY_SWING_CUTOFF_LIMIT_NY = (
+    datetime.combine(date(2000, 1, 1), ROLLOVER_NY) - SWING_CUTOFF_MARGIN
+).time()
 
 _log = logging.getLogger(__name__)
 
@@ -51,8 +56,8 @@ def server_epoch_to_utc(server_epoch: int) -> datetime:
 
 def utc_to_server_epoch(utc: datetime) -> int:
     """Encode an aware UTC instant as the MT5 server-wall-clock epoch."""
-    if utc.tzinfo is not UTC:
-        raise TypeError("utc must be an aware datetime with timezone.utc")
+    if utc.tzinfo is None or utc.utcoffset() != timedelta(0):
+        raise TypeError("utc must be an aware datetime with a zero UTC offset")
     server_wall = utc.astimezone(NY).replace(tzinfo=None) + SERVER_AHEAD_OF_NY
     return int(server_wall.replace(tzinfo=UTC).timestamp())
 
