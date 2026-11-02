@@ -987,9 +987,9 @@ def test_f9_1_run_backtest_handler_calls_shared_floor_helper_in_sample_only(
     calls = []
     real_fn = improve_loop_module._check_profitability_floor
 
-    def _spy(per_pair, *, settings, scope):
-        calls.append((scope, per_pair))
-        return real_fn(per_pair, settings=settings, scope=scope)
+    def _spy(per_pair, *, settings, scope, audience="human"):
+        calls.append((scope, audience, per_pair))
+        return real_fn(per_pair, settings=settings, scope=scope, audience=audience)
 
     monkeypatch.setattr(
         improve_loop_module, "_check_profitability_floor", _spy)
@@ -1003,7 +1003,8 @@ def test_f9_1_run_backtest_handler_calls_shared_floor_helper_in_sample_only(
 
     assert len(calls) == 1
     assert calls[0][0] == "in_sample"
-    assert calls[0][1] == {"USDJPY": {"pf": 1.3, "trades": 40,
+    assert calls[0][1] == "agent"
+    assert calls[0][2] == {"USDJPY": {"pf": 1.3, "trades": 40,
                                       "avg_r": 0.1, "evaluable": True}}
 
 
@@ -1019,7 +1020,8 @@ def test_f9_2_run_backtest_handler_helper_not_duplicated_inline(
 
     monkeypatch.setattr(
         improve_loop_module, "_check_profitability_floor",
-        lambda per_pair, *, settings, scope: ("unprofitable", "forced-by-spy"))
+        lambda per_pair, *, settings, scope, audience="human": (
+            "unprofitable", "forced-by-spy"))
 
     staging = tmp_path / "staging" / "myst"
     staging.mkdir(parents=True)

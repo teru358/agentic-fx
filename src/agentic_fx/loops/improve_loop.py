@@ -7,6 +7,7 @@ import ctypes
 import errno
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -252,7 +253,8 @@ def _backtest_reply_from_save_kwargs(
         "pair": save_kwargs["pair"],
         "timeframe": save_kwargs["timeframe"],
         "source": save_kwargs["source"],
-        "metrics": save_kwargs["metrics"],
+        "metrics": {key: value for key, value in save_kwargs["metrics"].items()
+                    if key != "eval_bars"},
         "trial_count": 1,
     }
     if submission_blocked is not None:
@@ -633,6 +635,7 @@ class FloorPairRow:
     pf: float | None
     avg_r: float | None
     evaluable: bool
+    conditions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -666,6 +669,10 @@ _FLOOR_FLOAT_RE = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 _FLOOR_REPORT_NO_APPROVAL = "No approval request was produced by this mission."
 _FLOOR_REPORT_DETAIL_HEADING = "## Profitability floor detail"
 _FLOOR_STAGES = ("in_sample", "holdout")
+_FLOOR_CONDITION_KINDS = ("drawdown_too_deep", "too_frequent")
+_FLOOR_CONDITIONS_HEADER = (
+    "| pair | max_drawdown | eval_bars | trades_per_eval_bar | failed_kinds |")
+_FLOOR_CONDITIONS_SEPARATOR = "|---|---|---|---|---|"
 
 
 def _floor_float(cell: str) -> float | None:
@@ -777,6 +784,60 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
     tables = {"in_sample": in_sample}
     if "holdout" in stage_names:
         tables["holdout"], i = _floor_table(lines, i, "holdout", keys)
+    elif i < len(lines) and lines[i:i + 1] == [""]:
+        # in-sample で止まった旧 report は holdout の任意の末尾を読み捨てた。
+        # 新形式だけ、その後ろの conditions 節を読む。
+        try:
+            i = lines.index("### floor_conditions", i)
+        except ValueError:
+            i = len(lines)
+    while i < len(lines) and lines[i] == "":
+        i += 1
+    conditions: dict[str, tuple[str, ...]] = {}
+    if i < len(lines):
+        if lines.count("### floor_conditions") != 1 or lines[i] != "### floor_conditions":
+            raise ValueError("conditions heading")
+        i += 1
+        while i < len(lines) and lines[i] == "":
+            i += 1
+        if lines[i:i + 2] != [_FLOOR_CONDITIONS_HEADER, _FLOOR_CONDITIONS_SEPARATOR]:
+            raise ValueError("conditions columns")
+        i += 2
+        in_sample_pairs = {row.pair: failed for row, failed in tables["in_sample"]}
+        while i < len(lines) and lines[i].startswith("|"):
+            line = lines[i]
+            if not (line.startswith("| ") and line.endswith(" |")):
+                raise ValueError("condition row shape")
+            cells = line[2:-2].split(" | ")
+            if len(cells) != 5 or cells[0] not in in_sample_pairs or cells[0] in conditions:
+                raise ValueError("condition pair")
+            for cell in cells[1:4]:
+                if cell != "未計測":
+                    _floor_float(cell)
+            if cells[4] == "-":
+                kinds: tuple[str, ...] = ()
+            else:
+                kinds = tuple(cells[4].split(", "))
+                if (not kinds or len(set(kinds)) != len(kinds)
+                        or any(kind not in _FLOOR_CONDITION_KINDS for kind in kinds)
+                        or kinds != tuple(kind for kind in _FLOOR_CONDITION_KINDS
+                                          if kind in kinds)):
+                    raise ValueError("condition kinds")
+                if in_sample_pairs[cells[0]] is not True:
+                    raise ValueError("condition failed mismatch")
+            conditions[cells[0]] = kinds
+            i += 1
+        if set(conditions) != set(in_sample_pairs):
+            raise ValueError("condition pairs")
+        while i < len(lines) and lines[i] == "":
+            i += 1
+        for pair, kinds in conditions.items():
+            for kind in kinds:
+                if i >= len(lines) or not lines[i].startswith(f"floor_failed: {pair} {kind} ("):
+                    raise ValueError("condition detail")
+                i += 1
+        if i != len(lines):
+            raise ValueError("condition trailing")
     stages: list[FloorStage] = []
     seen: set[str] = set()
     for name in (n for n in _FLOOR_STAGES if n in stage_names):
@@ -788,7 +849,13 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
         if not picked:
             raise ValueError("no failed pair in the failed stage")
         seen.update(row.pair for row in picked)
-        stages.append(FloorStage(stage=name, pairs=tuple(picked)))
+        stages.append(FloorStage(
+            stage=name,
+            pairs=tuple(FloorPairRow(
+                pair=row.pair, trades=row.trades, pf=row.pf, avg_r=row.avg_r,
+                evaluable=row.evaluable,
+                conditions=conditions.get(row.pair, ()) if name == "in_sample" else ())
+                        for row in picked)))
     if stage_names != [s.stage for s in stages]:
         raise ValueError("failed_stage order")
     if with_failed:
@@ -1702,11 +1769,11 @@ class ImproveLoop:
             # コード禁止、T1 と同じ関数)。
             floor_label, floor_detail_text = _check_profitability_floor(
                 {args["pair"]: save_kwargs["metrics"]},
-                settings=self._settings, scope="in_sample")
+                settings=self._settings, scope="in_sample", audience="agent")
             submission_blocked = (
                 {"reason": "unprofitable",
-                 "detail": f"{floor_detail_text} — この成績では親ゲートが"
-                           "承認申請を出さず observation になります"}
+                 "detail": (f"{floor_detail_text} — " if floor_detail_text else "")
+                           + "この成績では親ゲートが承認申請を出さず observation になります"}
                 if floor_label else None)
             if ledger.state() != "OPEN" or _current_rpc_abandoned():
                 # /code-review 2 周目 CR4 (2026-09-11): timeout 後に完了した
@@ -1732,7 +1799,9 @@ class ImproveLoop:
                     test_plugin=test_plugin, metadata={
                         "name": meta.name, "content_hash": meta.content_hash,
                         "artifact_hash": artifact_hash, "pair": args["pair"],
-                        "metrics": save_kwargs["metrics"],
+                        "metrics": {key: value for key, value
+                                    in save_kwargs["metrics"].items()
+                                    if key != "eval_bars"},
                         "created_at": self._clock.now().isoformat(),
                     })
             except Exception as exc:
@@ -4589,10 +4658,11 @@ class ImproveLoop:
                 per_pair, settings=self._settings, scope=scope)
             if fail_items:
                 failed_scopes.append(scope)
-                for pair, _msg in fail_items:
+                for item in fail_items:
+                    pair = item.pair
                     if pair not in failed_pairs:
                         failed_pairs.append(pair)
-            scope_failed = {pair for pair, _msg in fail_items}
+            scope_failed = {item.pair for item in fail_items}
             header = "| pair | " + " | ".join(
                 self._FLOOR_REPORT_METRIC_KEYS + ("failed",)) + " |"
             separator = "|---" * (len(self._FLOOR_REPORT_METRIC_KEYS) + 2) + "|"
@@ -4610,7 +4680,42 @@ class ImproveLoop:
             f"thresholds: {floor_settings_kv(self._settings.improve.gate)}",
             "",
         ]
-        return "\n".join(lines) + "\n\n".join(tables)
+        condition_rows = [_FLOOR_CONDITIONS_HEADER, _FLOOR_CONDITIONS_SEPARATOR]
+        condition_detail: list[str] = []
+        failures = _floor_fail_items(
+            in_sample_metrics, settings=self._settings, scope="in_sample")
+        by_pair: dict[str, list] = {}
+        for item in failures:
+            by_pair.setdefault(item.pair, []).append(item)
+
+        def measured(value: object) -> str:
+            return f"{value:.3f}" if type(value) in (int, float) and math.isfinite(value) else "未計測"
+
+        for pair, m in in_sample_metrics.items():
+            dd = m.get("max_drawdown")
+            bars = m.get("eval_bars")
+            trades = m.get("trades")
+            frequency = (trades / bars if type(trades) is int and trades >= 0
+                         and type(bars) in (int, float) and not isinstance(bars, bool)
+                         and math.isfinite(bars) and bars >= 1 else None)
+            kinds = tuple(kind for kind in _FLOOR_CONDITION_KINDS if any(
+                item.kind == kind for item in by_pair.get(pair, [])))
+            condition_rows.append(
+                f"| {pair} | {measured(dd)} | {measured(bars)} | "
+                f"{measured(frequency)} | {', '.join(kinds) if kinds else '-'} |")
+            for kind in kinds:
+                if kind == "drawdown_too_deep":
+                    condition_detail.append(
+                        f"floor_failed: {pair} {kind} (max_drawdown={dd:.3f} > "
+                        f"{self._settings.improve.gate.max_drawdown:g})")
+                else:
+                    condition_detail.append(
+                        f"floor_failed: {pair} {kind} (trades_per_eval_bar={frequency:.3f} > "
+                        f"{self._settings.improve.gate.max_trades_per_eval_bar:g})")
+        condition_section = "### floor_conditions\n\n" + "\n".join(condition_rows)
+        if condition_detail:
+            condition_section += "\n\n" + "\n".join(condition_detail)
+        return "\n".join(lines) + "\n\n".join(tables) + "\n\n" + condition_section
 
     @staticmethod
     def _baseline_monitor_report_section(conn) -> str:

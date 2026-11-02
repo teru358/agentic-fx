@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 from agentic_fx.config import ImproveGateSettings
-from agentic_fx.plugin.strategy_gate import _check_profitability_floor
+from agentic_fx.plugin.strategy_gate import _floor_fail_items
 
 
 MIN_TRADES = 30
@@ -21,6 +21,14 @@ _GATE = ImproveGateSettings(
     require_holdout_evaluable=True,
 )
 _SETTINGS = SimpleNamespace(improve=SimpleNamespace(gate=_GATE))
+_OLD_GATE = ImproveGateSettings(
+    min_pf=1.0,
+    require_positive_avg_r=True,
+    require_holdout_evaluable=True,
+    max_drawdown=None,
+    max_trades_per_eval_bar=None,
+)
+_OLD_SETTINGS = SimpleNamespace(improve=SimpleNamespace(gate=_OLD_GATE))
 
 
 def open_readonly(path: Path) -> sqlite3.Connection:
@@ -33,7 +41,7 @@ def open_readonly(path: Path) -> sqlite3.Connection:
 
 
 def _number(value: object) -> bool:
-    return type(value) in (int, float)
+    return type(value) in (int, float) and value == value and value not in (float("inf"), float("-inf"))
 
 
 def _metric(raw: object) -> dict | None:
@@ -54,6 +62,10 @@ def _metric(raw: object) -> dict | None:
         "pf": pf,
         "avg_r": avg_r,
         "evaluable": trades >= MIN_TRADES if evaluable is None else evaluable,
+        "max_drawdown": (raw.get("max_drawdown")
+                         if _number(raw.get("max_drawdown")) else None),
+        "eval_bars": (raw.get("eval_bars")
+                      if _number(raw.get("eval_bars")) else None),
     }
 
 
@@ -90,14 +102,16 @@ def _strategy(payload: dict) -> str:
     return f"{name}@{content_hash[:12]}"
 
 
-def _verdict(in_sample: dict, holdout: dict) -> str:
-    in_label, _ = _check_profitability_floor(
-        in_sample, settings=_SETTINGS, scope="in_sample")
-    holdout_label, holdout_detail = _check_profitability_floor(
-        holdout, settings=_SETTINGS, scope="holdout")
-    pf_failed = bool(in_label) or (bool(holdout_label)
-                                  and "holdout_not_evaluable" not in holdout_detail)
-    holdout_unavailable = "holdout_not_evaluable" in holdout_detail
+def _verdict(in_sample: dict, holdout: dict, *, settings) -> str:
+    in_items = _floor_fail_items(in_sample, settings=settings, scope="in_sample")
+    holdout_items = _floor_fail_items(holdout, settings=settings, scope="holdout")
+    kinds = {item.kind for item in (*in_items, *holdout_items)}
+    pf_failed = bool(kinds - {"holdout_not_evaluable"})
+    holdout_unavailable = "holdout_not_evaluable" in kinds
+    if "drawdown_too_deep" in kinds:
+        return "DD 超過"
+    if "too_frequent" in kinds:
+        return "高頻度"
     if pf_failed and holdout_unavailable:
         return "両方"
     if pf_failed:
@@ -136,7 +150,7 @@ def rows(conn: sqlite3.Connection, ids: list[int] | None):
 
 
 def render(conn: sqlite3.Connection, ids: list[int] | None) -> list[str]:
-    output = ["承認 id | 戦略名と版 | in-sample pf / avg_r | holdout pf / 取引数 | 判定"]
+    output = ["承認 id | 戦略名と版 | in-sample pf / avg_r | holdout pf / 取引数 | 旧3条件 | 新基準"]
     for row in rows(conn, ids):
         try:
             payload = json.loads(row["payload_json"])
@@ -152,7 +166,9 @@ def render(conn: sqlite3.Connection, ids: list[int] | None) -> list[str]:
         output.append(
             f"{row['id']} | {_strategy(payload)} | pf={_value(in_sample, 'pf')} / "
             f"avg_r={_value(in_sample, 'avg_r')} | pf={_value(holdout, 'pf')} / "
-            f"trades={_value(holdout, 'trades')} | {_verdict(in_sample, holdout)}")
+            f"trades={_value(holdout, 'trades')} | "
+            f"{_verdict(in_sample, holdout, settings=_OLD_SETTINGS)} | "
+            f"{_verdict(in_sample, holdout, settings=_SETTINGS)}")
     return output
 
 

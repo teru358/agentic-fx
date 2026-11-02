@@ -1366,8 +1366,9 @@ def _run_full_gate(conn: sqlite3.Connection, candidate_dir: Path, *, name: str,
             activity.write(
                 Category.APPROVAL, "submit_floor_rejected",
                 f"name={name} unprofitable ({condition}) {settings_kv}")
+        detail = f" {outcome.floor_detail}" if outcome.floor_detail else ""
         raise ValueError(
-            f"plugin {name!r}: unprofitable ({condition}) ({settings_kv})")
+            f"plugin {name!r}: unprofitable ({condition}) ({settings_kv}){detail}")
 
     if meta.kind == "indicator":
         outcome = _run_indicator_fixture_stage(

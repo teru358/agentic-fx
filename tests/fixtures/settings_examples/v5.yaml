@@ -115,6 +115,8 @@ improve:
     min_pf: 1.0                     # in_sample/holdout の pf 下限 (pf が None = gross_loss 0 は PASS)
     require_positive_avg_r: true    # avg_r <= 0.0 を不合格にするか
     require_holdout_evaluable: false  # holdout evaluable=false を不合格にするか (既定: 標本不足は continue)
+    max_drawdown: 0.20              # in_sample の pair 別 max_drawdown 上限。null で無効
+    max_trades_per_eval_bar: 0.25   # in_sample の trades / eval_bars 上限。null で無効
 
 logging:
   level: INFO

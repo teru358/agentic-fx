@@ -68,6 +68,31 @@ def test_roundtrip_in_sample_failure_has_no_holdout_table(loop_min):
         "in_sample", [("USDJPY", 30, 0.8, -0.1, True)])
 
 
+def test_conditions_section_roundtrips_only_new_floor_kinds(loop_min):
+    metrics = _m(trades=50, pf=0.5, avg_r=-0.1)
+    metrics.update(max_drawdown=0.263, eval_bars=100)
+    text = _render(loop_min, {"USDJPY": metrics}, {})
+    assert "### floor_conditions" in text
+    assert "floor_failed: USDJPY drawdown_too_deep (max_drawdown=0.263 > 0.2)" in text
+    assert "floor_failed: USDJPY too_frequent (trades_per_eval_bar=0.500 > 0.25)" in text
+    detail = parse_floor_report(text, mission_id=MID)
+    assert detail is not None
+    assert detail.stages[0].pairs[0].conditions == (
+        "drawdown_too_deep", "too_frequent")
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda text: text.replace("### floor_conditions", "### floor_conditions\n\n### floor_conditions"),
+    lambda text: text.replace("failed_kinds", "bad_kinds"),
+    lambda text: text.replace("drawdown_too_deep, too_frequent", "too_frequent, drawdown_too_deep"),
+])
+def test_conditions_section_is_strict(loop_min, mutation):
+    metrics = _m(trades=50, pf=0.5)
+    metrics.update(max_drawdown=0.263, eval_bars=100)
+    assert parse_floor_report(mutation(_render(loop_min, {"USDJPY": metrics}, {})),
+                              mission_id=MID) is None
+
+
 def test_roundtrip_holdout_failure_returns_the_holdout_rows(strict_loop):
     text = _render(
         strict_loop, {"USDJPY": _m(pf=1.2)},
@@ -115,6 +140,7 @@ def test_rendered_tables_carry_a_failed_column_per_pair_and_stage(loop_min):
     in_part, _, hold_part = text.partition("### holdout")
     assert [l.rsplit(" | ", 1)[1] for l in in_part.split("\n") if l.startswith("| ")
             and "pair" not in l] == ["True |", "False |"]
+    hold_part = hold_part.split("### floor_conditions", 1)[0]
     assert [l.rsplit(" | ", 1)[1] for l in hold_part.split("\n") if l.startswith("| ")
             and "pair" not in l] == ["False |", "True |"]
 

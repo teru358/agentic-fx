@@ -100,8 +100,16 @@ def _pair_row(value: object) -> dict | bool:
     pf, avg_r = _number_or_none(value["pf"]), _number_or_none(value["avg_r"])
     if pf is False or avg_r is False:
         return False
+    conditions = value.get("conditions", ())
+    if (type(conditions) not in (list, tuple)
+            or any(type(kind) is not str for kind in conditions)):
+        return False
+    allowed = ("drawdown_too_deep", "too_frequent")
+    if (len(set(conditions)) != len(conditions)
+            or tuple(conditions) != tuple(kind for kind in allowed if kind in conditions)):
+        return False
     return {"pair": value["pair"], "trades": value["trades"], "pf": pf, "avg_r": avg_r,
-            "evaluable": value["evaluable"]}
+            "evaluable": value["evaluable"], "conditions": list(conditions)}
 
 
 class _DropFloor:
@@ -250,7 +258,16 @@ def _floor_lines(floor: dict) -> list[str]:
         for row in pairs[:MAX_PAIR_LINES]:
             line = (f"{label}: {cut_escaped(row['pair'], FIELD_CHARS)} pf {_pf(row['pf'])} "
                     f"avg_r {_avg_r(row['avg_r'])} 取引 {row['trades']}")
-            lines.append(line + ("" if row["evaluable"] else " (評価不能)"))
+            conditions = row.get("conditions", ())
+            labels = {
+                "drawdown_too_deep": "DD が深すぎる",
+                "too_frequent": "取引頻度が高すぎる",
+            }
+            suffix = "" if row["evaluable"] else " (評価不能)"
+            rendered = [labels[kind] for kind in conditions if kind in labels]
+            if rendered:
+                suffix += " (" + "、".join(rendered) + ")"
+            lines.append(line + suffix)
         if len(pairs) > MAX_PAIR_LINES:
             lines.append(f"ほか {len(pairs) - MAX_PAIR_LINES} 本")
     return lines

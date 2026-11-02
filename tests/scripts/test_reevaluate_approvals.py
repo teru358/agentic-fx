@@ -21,11 +21,14 @@ _SPEC.loader.exec_module(_FIXTURE)
 
 def _payload(name: str, *, in_pf: float = 1.2, holdout_pf: float = 1.2,
              holdout_trades: int = 30) -> dict:
-    return _FIXTURE.approval_payload(
+    payload = _FIXTURE.approval_payload(
         name=name,
         in_sample={"USDJPY": _FIXTURE.metrics(40, in_pf, 0.12)},
         holdout={"USDJPY": _FIXTURE.metrics(holdout_trades, holdout_pf, 0.08)},
     )
+    payload["in_sample"]["USDJPY"]["max_drawdown"] = 0.035
+    payload["holdout"]["USDJPY"]["max_drawdown"] = 0.035
+    return payload
 
 
 def _database(tmp_path: Path) -> Path:
@@ -81,9 +84,9 @@ def test_prints_saved_fixture_shape_under_fixed_floor(tmp_path: Path):
     assert completed.returncode == 0
     lines = completed.stdout.splitlines()
     assert len(lines) == 4
-    assert "21" in lines[1] and "passing@cccccccccccc" in lines[1] and "合格" in lines[1]
-    assert "24" in lines[2] and "PF 不足" in lines[2]
-    assert "25" in lines[3] and "holdout 評価不能" in lines[3]
+    assert "21" in lines[1] and "passing@cccccccccccc" in lines[1] and "合格 | 合格" in lines[1]
+    assert "24" in lines[2] and "PF 不足 | PF 不足" in lines[2]
+    assert "25" in lines[3] and "holdout 評価不能 | holdout 評価不能" in lines[3]
 
 
 def test_prints_real_flat_holdout_shape_under_fixed_floor(tmp_path: Path):
@@ -96,15 +99,30 @@ def test_prints_real_flat_holdout_shape_under_fixed_floor(tmp_path: Path):
     assert lines[1] == (
         "21 | real-21@cccccccccccc | pf=USDJPY:1.4440572139303938 / "
         "avg_r=USDJPY:0.18095898178667616 | pf=USDJPY:0.7624153836938286 / "
-        "trades=USDJPY:48 | PF 不足")
+        "trades=USDJPY:48 | PF 不足 | PF 不足")
     assert lines[2] == (
         "24 | real-24@cccccccccccc | pf=USDJPY:1.0699268738574357 / "
         "avg_r=USDJPY:0.04121428459537167 | pf=USDJPY:3.3747323340475135 / "
-        "trades=USDJPY:4 | holdout 評価不能")
+        "trades=USDJPY:4 | holdout 評価不能 | holdout 評価不能")
     assert lines[3] == (
         "25 | real-25@cccccccccccc | pf=USDJPY:1.1193967065100916 / "
         "avg_r=USDJPY:0.0622021839480993 | pf=USDJPY:4.617164898746958 / "
-        "trades=USDJPY:4 | holdout 評価不能")
+        "trades=USDJPY:4 | holdout 評価不能 | holdout 評価不能")
+
+
+def test_drawdown_is_normalized_and_reported_only_by_new_floor(tmp_path: Path):
+    path = _database(tmp_path)
+    conn = sqlite3.connect(path)
+    payload = _payload("dd")
+    payload["in_sample"]["USDJPY"].update({"max_drawdown": 0.263,
+                                                "eval_bars": 1000})
+    conn.execute("INSERT INTO approval_requests VALUES (?, 'plugin', ?, 'approved', ?)",
+                 (99, json.dumps(payload), "2026-10-05T00:00:00+00:00"))
+    conn.commit()
+    conn.close()
+    completed = _run(path, "--ids", "99")
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines()[1].endswith("| 合格 | DD 超過")
 
 
 def test_missing_saved_values_are_reported_without_failure(tmp_path: Path):

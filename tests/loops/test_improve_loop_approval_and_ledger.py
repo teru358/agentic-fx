@@ -52,7 +52,9 @@ def test_payload_profitability_floor_snapshot_f6_8_like(loop_min, conn):
     assert payload["profitability_floor"] == {
         "min_pf": g.min_pf,
         "require_positive_avg_r": g.require_positive_avg_r,
-        "require_holdout_evaluable": g.require_holdout_evaluable}
+        "require_holdout_evaluable": g.require_holdout_evaluable,
+        "max_drawdown": g.max_drawdown,
+        "max_trades_per_eval_bar": g.max_trades_per_eval_bar}
 
 
 def test_payload_analysis_fields_come_from_ledger_not_agent_output(

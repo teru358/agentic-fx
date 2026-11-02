@@ -1363,7 +1363,7 @@ def test_strategy_profitability_floor_reroutes_to_gate_failed_unprofitable(
     assert not re.search(r"(?<!require_)holdout", line)  # require_holdout_evaluable= は許容
     assert "in_sample" not in line
     assert "USDJPY" not in line  # pair 名
-    assert "trades" not in line
+    assert not re.search(r"(?<!max_)trades(?!_per_eval_bar)", line)  # 閾値キー max_trades_per_eval_bar= だけ許容
     assert not re.search(r"(?<!min_)pf=", line)  # 閾値の min_pf= だけ許容
     assert not re.search(r"(?<!require_positive_)avg_r", line)
     assert "failed_stage" not in line
@@ -1471,7 +1471,7 @@ def test_f2_6_f4_series_holdout_only_failure_marks_all_gate_rows_unprofitable(
     assert not re.search(r"(?<!require_)holdout", line)  # require_holdout_evaluable= は許容
     assert "in_sample" not in line
     assert "USDJPY" not in line  # pair 名
-    assert "trades" not in line
+    assert not re.search(r"(?<!max_)trades(?!_per_eval_bar)", line)  # 閾値キー max_trades_per_eval_bar= だけ許容
     assert not re.search(r"(?<!min_)pf=", line)  # 閾値の min_pf= だけ許容
     assert not re.search(r"(?<!require_positive_)avg_r", line)
     assert "failed_stage" not in line
