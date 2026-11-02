@@ -445,8 +445,8 @@ def test_the_writer_flag_is_up_during_tick_and_down_afterwards(tmp_path):
 
 
 def test_the_writer_flag_is_down_during_the_network_hooks_and_cache_prune(tmp_path):
-    """news / econ の取得と cache prune はフラグの外。決定論ブロックと mission の
-    起動 (DB に書く範囲) はフラグの中。"""
+    """news / econ の取得と cache prune、mission の起動はフラグの外。決定論ブロックと
+    cron cursor の永続化 (DB に書く範囲) はフラグの中。"""
     writer = WriterAdmission()
     env = _env(tmp_path, writer=writer)
     seen: dict[str, list] = {"news": [], "econ": [], "cache": [], "bars": [],
@@ -461,7 +461,7 @@ def test_the_writer_flag_is_down_during_the_network_hooks_and_cache_prune(tmp_pa
     assert seen["news"] == [False] and seen["econ"] == [False]
     assert seen["cache"] == [False]
     assert seen["bars"] and all(seen["bars"])
-    assert seen["mission"] == [True]
+    assert seen["mission"] == [False]                   # 起動は transaction ではない
     assert writer.requested() is False
     assert writer.stats().requests >= 2                 # 決定論ブロックと後段は別の保持
 
@@ -765,7 +765,7 @@ def test_a_restart_before_the_marker_is_written_calls_the_day_again(tmp_path):
     assert calls == [TUE_CLOSE, TUE_CLOSE]
 
 
-def test_a_failing_callback_is_logged_and_not_retried(tmp_path):
+def test_a_failing_callback_is_logged_and_retried_without_a_marker(tmp_path):
     env = Env(tmp_path)
     attempts = []
 
@@ -776,8 +776,43 @@ def test_a_failing_callback_is_logged_and_not_retried(tmp_path):
     env.sched.register_daily_report(boom)
     _run(env, env.sched.tick(WED))
     _run(env, env.sched.tick(WED + timedelta(minutes=1)))
-    assert attempts == [TUE_CLOSE]
+    assert attempts == [TUE_CLOSE, TUE_CLOSE]
     assert "daily_report_cycle_error" in _log(env)
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+
+
+def test_a_report_that_succeeds_on_retry_gets_its_marker(tmp_path):
+    env = Env(tmp_path)
+    attempts = []
+
+    def flaky(close_at):
+        attempts.append(close_at)
+        if len(attempts) == 1:
+            raise RuntimeError("transient")
+
+    env.sched.register_daily_report(flaky)
+    for minute in range(4):
+        _run(env, env.sched.tick(WED + timedelta(minutes=minute)))
+    assert attempts == [TUE_CLOSE, TUE_CLOSE]
+    raw = alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY)
+    assert json.loads(raw)["day"] == TUE_CLOSE.isoformat()
+
+
+def test_a_report_gives_up_after_three_attempts_with_a_warning(tmp_path, caplog):
+    env = Env(tmp_path)
+    attempts = []
+
+    def boom(close_at):
+        attempts.append(close_at)
+        raise RuntimeError("report failed")
+
+    env.sched.register_daily_report(boom)
+    with caplog.at_level("WARNING"):
+        for minute in range(6):
+            _run(env, env.sched.tick(WED + timedelta(minutes=minute)))
+    assert len(attempts) == 3
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+    assert sum("gave up" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_no_callback_means_no_state_is_written(tmp_path):

@@ -104,6 +104,12 @@ def test_startup_dispositions_reject_core_for_insufficient_retention():
         _startup_plugin_dispositions(settings, [], MagicMock())
 
 
+def test_exit_code_is_failure_while_the_report_thread_is_alive():
+    app = MagicMock(fatal_reason=None)
+    assert _exit_code(app, False, False, False, True) == 1
+    assert _exit_code(app, False, False, False, False) == 0
+
+
 def test_exit_code_is_failure_while_improve_thread_is_alive():
     app = MagicMock(fatal_reason=None)
     assert _exit_code(app, False, False, True) == 1
@@ -2538,7 +2544,11 @@ def test_run_service_joins_the_daily_report_thread_and_keeps_resources_while_it_
     with _no_real_network(), \
          patch("agentic_fx.service.build_app", return_value=app), \
          patch("agentic_fx.service.signal.signal"):
-        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    assert rc == 1                                   # 残った report thread は非 graceful
+    act = (tmp_path / "logs" / "activity.log").read_text(encoding="utf-8")
+    assert "service_stopped" in act and "shutdown_timeout" in act
+    assert "graceful" not in act.split("service_stopped", 1)[1]
     assert len(joins) == 1 and joins[0] is not None
     assert {"conn_core", "conn_signal", "conn_admission"} <= closed["busy"]
 
@@ -2561,9 +2571,10 @@ def test_run_service_closes_normally_when_the_daily_report_thread_has_stopped(tm
     with _no_real_network(), \
          patch("agentic_fx.service.build_app", return_value=app), \
          patch("agentic_fx.service.signal.signal"):
-        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+        rc = run_service(tmp_path, daemon=True, _stop_event=stop_event)
     assert len(joins) == 1
     assert "conn_core" not in closed["busy"]
+    assert rc == 0
 
 
 def test_scheduler_tick_actually_invokes_the_watchdog_health_check(tmp_path):

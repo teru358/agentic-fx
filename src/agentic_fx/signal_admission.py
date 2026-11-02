@@ -320,6 +320,8 @@ class WaitBudgetEvaluator:
         self._seen: tuple[str, frozenset] | None = None
         # 書けずに取り直す評価の、元の trigger
         self._retry_trigger: str | None = None
+        # BUSY の技術 warning を出した運用日
+        self._busy_warned_day: str | None = None
 
     # --- 公開 API ---
 
@@ -362,7 +364,11 @@ class WaitBudgetEvaluator:
         try:
             saved, notify = self._persist(snapshot, now)
         except Exception as exc:  # noqa: BLE001 — 記録できなければ通知しない
-            _log.warning("wait budget not recorded: %s", safe_error_text(exc))
+            if not self._is_busy(exc) or self._busy_warned_day != snapshot.op_day:
+                _log.warning("wait budget not recorded: %s", safe_error_text(exc))
+            if self._is_busy(exc):
+                # BUSY の再評価は毎 tick 続けるが、技術ログは運用日に 1 回
+                self._busy_warned_day = snapshot.op_day
             saved, notify = False, False
         if not saved:
             # scheduler の書込み要求中、または書込みの失敗。次の tick の `tick()` で、
@@ -374,6 +380,12 @@ class WaitBudgetEvaluator:
         if notify:
             self._write_warning(snapshot)
         return snapshot
+
+    @staticmethod
+    def _is_busy(exc: BaseException) -> bool:
+        text = str(exc).lower()
+        return isinstance(exc, sqlite3.OperationalError) and (
+            "locked" in text or "busy" in text)
 
     def _persist(self, snapshot: WaitBudgetSnapshot, now: datetime,
                  ) -> tuple[bool, bool]:
@@ -387,11 +399,21 @@ class WaitBudgetEvaluator:
         def begin() -> None:
             conn.execute("BEGIN IMMEDIATE")
 
-        if self._writer is not None:
-            if not self._writer.admit(begin):
+        if self._writer is None:
+            return self._write(snapshot, now, begin)
+        with self._writer.lease(begin) as admitted:
+            if not admitted:
                 return False, False
-        else:
-            begin()
+            return self._write_in_tx(snapshot, now)
+
+    def _write(self, snapshot: WaitBudgetSnapshot, now: datetime,
+               begin: Callable[[], None]) -> tuple[bool, bool]:
+        begin()
+        return self._write_in_tx(snapshot, now)
+
+    def _write_in_tx(self, snapshot: WaitBudgetSnapshot, now: datetime,
+                     ) -> tuple[bool, bool]:
+        conn = self._conn
         try:
             alert_state.set(conn, alert_state.WAIT_BUDGET_SNAPSHOT_KEY,
                             json.dumps(snapshot.to_dict(), sort_keys=True),

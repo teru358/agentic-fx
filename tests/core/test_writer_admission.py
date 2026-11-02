@@ -103,8 +103,9 @@ def test_a_failing_begin_propagates_and_leaves_the_mutex_usable():
 
 def test_a_request_is_not_blocked_by_a_begin_in_progress():
     """admit は begin を mutex の外で呼ぶ。begin (BEGIN IMMEDIATE の待ち) の最中でも、
-    scheduler の request() はすぐ登録できる。進行中の begin は観測値に数える。"""
-    wa = WriterAdmission()
+    scheduler の request() は待ちの上限で戻って登録できる。進行中の begin は lease で
+    数え、上限を超えた待ちは観測値に残る。"""
+    wa = WriterAdmission(drain_wait_sec=0.05)
     in_begin = threading.Event()
     finish_begin = threading.Event()
     registered = threading.Event()
@@ -137,7 +138,10 @@ def test_a_request_is_not_blocked_by_a_begin_in_progress():
     sched.join(10)
     assert order == ["begin-start", "registered", "begin-end"]
     stats = wa.stats()
-    assert stats.beginning == 0 and stats.admitted == 1
+    assert stats.beginning == 1 and stats.admitted == 1    # lease は commit まで続く
+    assert stats.wait_overruns == 1
+    wa.end()
+    assert wa.stats().beginning == 0
 
 
 def test_a_failed_begin_leaves_no_transaction_in_progress():
@@ -175,3 +179,74 @@ def test_tick_observation_is_recorded_but_does_not_affect_admission():
     assert wa.admit(lambda: None) is True                  # 印は排他に使わない
     wa.tick_finished()
     assert wa.stats().tick_active is False and wa.stats().next_tick_at == 160.0
+
+
+# --- transaction lease ---------------------------------------------------------
+
+def test_a_request_waits_for_a_transaction_already_started_and_then_proceeds():
+    """hold.down 後に worker が BEGIN 済みなら、request は lease の終了を待つ。"""
+    wa = WriterAdmission(drain_wait_sec=5.0)
+    assert wa.admit(lambda: None) is True                 # BEGIN 済み (まだ commit 前)
+    started = threading.Event()
+    done = threading.Event()
+
+    def scheduler():
+        started.set()
+        wa.request()
+        done.set()
+
+    t = threading.Thread(target=scheduler)
+    t.start()
+    assert started.wait(5)
+    assert done.wait(0.1) is False                        # lease が残る間は待つ
+    assert wa.admit(lambda: pytest.fail("begin")) is False  # 新規開始は閉じている
+    wa.end()                                              # commit / rollback
+    assert done.wait(5)
+    t.join(5)
+    wa.release()
+    stats = wa.stats()
+    assert stats.beginning == 0 and stats.wait_overruns == 0
+    assert stats.last_wait_sec is not None and stats.last_wait_sec > 0
+
+
+def test_a_request_gives_up_waiting_after_the_limit_and_records_the_overrun():
+    wa = WriterAdmission(drain_wait_sec=0.05)
+    assert wa.admit(lambda: None) is True
+    wa.request()                                          # 戻ってくる (待ち続けない)
+    stats = wa.stats()
+    assert stats.wait_overruns == 1 and stats.max_wait_sec >= 0.05
+    wa.release()
+    wa.end()
+
+
+def test_the_default_wait_limit_is_200_ms():
+    from agentic_fx.core.writer_admission import DRAIN_WAIT_SEC
+    assert DRAIN_WAIT_SEC == 0.2
+
+
+def test_a_request_with_no_transaction_does_not_wait():
+    wa = WriterAdmission(drain_wait_sec=5.0)
+    wa.request()
+    wa.release()
+    assert wa.stats().wait_overruns == 0 and wa.stats().last_wait_sec < 1.0
+
+
+def test_lease_returns_the_slot_on_commit_and_on_exception():
+    wa = WriterAdmission()
+    with wa.lease(lambda: None) as ok:
+        assert ok is True and wa.stats().beginning == 1
+    assert wa.stats().beginning == 0
+    with pytest.raises(ValueError):
+        with wa.lease(lambda: None):
+            raise ValueError("rollback")
+    assert wa.stats().beginning == 0
+    wa.request()
+    with wa.lease(lambda: pytest.fail("begin")) as ok:
+        assert ok is False
+    wa.release()
+    assert wa.stats().beginning == 0
+
+
+def test_end_without_a_lease_is_a_bug():
+    with pytest.raises(RuntimeError):
+        WriterAdmission().end()

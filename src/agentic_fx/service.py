@@ -2626,10 +2626,12 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
 
 
 def _exit_code(app: App, scheduler_alive: bool,
-               supervisor_alive: bool, improve_alive: bool = False) -> int:
+               supervisor_alive: bool, improve_alive: bool = False,
+               report_alive: bool = False) -> int:
     if app.fatal_reason is not None:
         return 1
-    return 1 if scheduler_alive or supervisor_alive or improve_alive else 0
+    return 1 if (scheduler_alive or supervisor_alive or improve_alive
+                 or report_alive) else 0
 
 
 #: 起動時診断 thread の shutdown 時の join 上限。通常は即座に終わる。集合外で自己試験が
@@ -2942,14 +2944,14 @@ def run_service(root: Path, *, daemon: bool = False,
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")
         if (th.is_alive() or app.supervisor.is_alive()
-                or app.improve_supervisor.is_alive()):
+                or app.improve_supervisor.is_alive() or report_still_busy):
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
     if _exit_code(app, th.is_alive(), app.supervisor.is_alive(),
-                  app.improve_supervisor.is_alive()):
+                  app.improve_supervisor.is_alive(), report_still_busy):
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")

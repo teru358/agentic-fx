@@ -572,6 +572,68 @@ def test_a_refused_write_keeps_the_first_trigger_across_several_refusals(tmp_pat
     h.conn.close()
 
 
+def test_a_scheduler_request_waits_for_an_evaluator_transaction_already_begun(tmp_path):
+    """hold.down 後に評価器が BEGIN 済みなら、request() はその commit まで待つ
+    (評価器の lease は commit / rollback まで続く)。"""
+    import threading
+    from unittest import mock
+    from agentic_fx.core.writer_admission import WriterAdmission
+    writer = WriterAdmission(drain_wait_sec=10.0)
+    h = _active(tmp_path)
+    h.evaluator = h.make(writer_admission=writer)
+    inside = threading.Event()
+    release = threading.Event()
+    original = alert_state.set
+
+    def slow(conn, key, value, **kw):
+        if key == alert_state.WAIT_BUDGET_SNAPSHOT_KEY:
+            inside.set()
+            assert release.wait(10)
+        return original(conn, key, value, **kw)
+
+    requested = threading.Event()
+    with mock.patch.object(alert_state, "set", slow):
+        worker = threading.Thread(target=h.evaluator.evaluate_wait_budget)
+        worker.start()
+        assert inside.wait(10)                              # BEGIN 済み・commit 前
+        assert writer.stats().beginning == 1
+
+        def scheduler():
+            writer.request()
+            requested.set()
+
+        sched = threading.Thread(target=scheduler)
+        sched.start()
+        assert requested.wait(0.2) is False                 # lease の終了を待っている
+        release.set()
+        assert requested.wait(10)
+        worker.join(10)
+        sched.join(10)
+    writer.release()
+    assert writer.stats().beginning == 0 and writer.stats().wait_overruns == 0
+    assert alert_state.get(h.conn, alert_state.WAIT_BUDGET_SNAPSHOT_KEY) is not None
+    h.conn.close()
+
+
+def test_a_busy_write_warns_once_per_operating_day_but_keeps_reevaluating(
+        tmp_path, caplog):
+    from unittest import mock
+    h = _active(tmp_path)
+    calls = []
+
+    def busy(conn, key, value, **kw):
+        calls.append(key)
+        raise sqlite3.OperationalError("database is locked")
+
+    with caplog.at_level("WARNING"), mock.patch.object(alert_state, "set", busy):
+        for _ in range(3):
+            h.evaluator.tick(NOW)
+    assert len(calls) == 3                                  # 再評価は毎 tick
+    warned = [r for r in caplog.records if "not recorded" in r.getMessage()]
+    assert len(warned) == 1
+    h.conn.close()
+
+
 # --- 評価時点 ----------------------------------------------------------------
 
 def test_a_final_decision_or_a_freshness_abandon_triggers_an_evaluation(tmp_path):

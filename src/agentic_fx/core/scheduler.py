@@ -61,6 +61,10 @@ class _FlagHold:
             self._scope.__exit__(None, None, None)
 
 
+#: 日次 report の callback を同一取引日に試す上限 (失敗の再試行を含む)
+_REPORT_MAX_ATTEMPTS = 3
+
+
 class Scheduler:
     """クロック駆動 tick。
 
@@ -150,6 +154,7 @@ class Scheduler:
         # alert_state への記録を待つ取引日 (次の tick が書く)
         self._report_enqueued: set[str] = set()
         self._report_done: list[str] = []
+        self._report_attempts: dict[str, int] = {}
         # 帯判定の例外を (order, 運用日) ごとに 1 回だけ技術ログへ出す記録
         self._band_error_logged: set[tuple[int, str]] = set()
         # 抑止中の limit 件数 (status 用の不変 snapshot。tick ごとに差し替える)
@@ -352,25 +357,25 @@ class Scheduler:
                 hook = self.on_improve_tick
                 pending.append(lambda hook=hook, now=now: hook(now))
 
-        with self._writer_scope():
-            reason = None if self._stopping() else self._trade_mission_due(now)
-            if reason is not None:
-                # その tick で前進した pair だけの確定足を不変の snapshot にして渡す。
-                # 次 tick で _due_cron_watermarks が上書きされても受理済み mission
-                # が見る値は変わらない。signal 起動では空。
-                snapshot = MappingProxyType(
-                    dict(self._due_cron_watermarks) if reason == "cron" else {})
-                result = self.on_trade_mission(reason, decision_bars=snapshot)
-                if reason == "cron":
-                    if result.accepted:
-                        previous = dict(self._cron_watermarks)
-                        advanced = self._advance_cron_watermarks(
-                            self._pending_cron_watermarks)
-                        self._cron_deferred_logged.clear()
+        reason = None if self._stopping() else self._trade_mission_due(now)
+        if reason is not None:
+            # その tick で前進した pair だけの確定足を不変の snapshot にして渡す。
+            # 次 tick で _due_cron_watermarks が上書きされても受理済み mission
+            # が見る値は変わらない。signal 起動では空。
+            snapshot = MappingProxyType(
+                dict(self._due_cron_watermarks) if reason == "cron" else {})
+            result = self.on_trade_mission(reason, decision_bars=snapshot)
+            if reason == "cron":
+                if result.accepted:
+                    previous = dict(self._cron_watermarks)
+                    advanced = self._advance_cron_watermarks(
+                        self._pending_cron_watermarks)
+                    self._cron_deferred_logged.clear()
+                    with self._writer_scope():
                         self._persist_cron_cursor(advanced, now)
-                        self._record_cron_coalesced(previous)
-                    else:
-                        self._record_cron_deferred(result)
+                    self._record_cron_coalesced(previous)
+                else:
+                    self._record_cron_deferred(result)
         return pending
 
     def _stopping(self) -> bool:
@@ -425,7 +430,12 @@ class Scheduler:
     # ---- 親 report の hook ------------------------------------------------
 
     def register_daily_report(self, callback: Callable[[datetime], None]) -> None:
-        """市場の取引日が閉じた後に 1 回だけ `callback(close_at)` を呼ぶ。
+        """市場の取引日が閉じた後に、取引日ごとに少なくとも 1 回 `callback(close_at)` を呼ぶ。
+
+        契約は at-least-once: callback は冪等であること (report 生成側が取引日で一意化
+        する)。callback が正常に return したときだけ記録を書く。例外なら記録せず次の
+        tick で再試行する (同一取引日で最大 3 回、超えたら技術ログ warning で諦める)。
+        再起動による同日の再実行も契約の内。
 
         `close_at` は閉じた取引日の終端 (21:00 UTC の rollover)。
         callback は scheduler thread では走らず、この hook が持つ専用の 1 本の thread
@@ -434,8 +444,8 @@ class Scheduler:
         つく (複数日ぶんを溜めて呼ばない)。取引日の記録 (`alert_state`) は、callback
         の実行が終わった後に次の tick が書く。tick が例外で抜けて callback が queue に
         渡らなかった日は記録されず、次の tick で再試行する。プロセス内では同じ取引日を
-        2 回 queue に渡さない。実行が終わってから記録までの間に再起動すると、その日を
-        もう一度呼ぶ (最低 1 回)。callback の失敗は技術ログと activity に残り、再試行しない。
+        2 回 queue に渡さない (失敗の再試行を除く)。実行が終わってから記録までの間に再起動すると、その日を
+        もう一度呼ぶ。callback の失敗は技術ログと activity に残る。
         """
         self._daily_report = callback
 
@@ -508,9 +518,20 @@ class Scheduler:
                     self._report_thread = None
                     return
                 callback, close_at = self._report_queue.popleft()
-            self._run_data_hook("daily_report", lambda: callback(close_at))
+            ok = self._run_data_hook("daily_report", lambda: callback(close_at))
+            day = close_at.isoformat()
             with self._report_lock:
-                self._report_done.append(close_at.isoformat())
+                if ok:
+                    self._report_done.append(day)
+                    continue
+                attempts = self._report_attempts.get(day, 0) + 1
+                self._report_attempts[day] = attempts
+                if attempts < _REPORT_MAX_ATTEMPTS:
+                    # 記録せず、次の tick で再試行する
+                    self._report_enqueued.discard(day)
+                    continue
+            _log.warning("daily report for %s gave up after %d failed attempts",
+                         day, _REPORT_MAX_ATTEMPTS)
 
     def join_daily_report(self, timeout: float | None = None) -> bool:
         """report thread が止まる (queue が空になる) まで待つ。止まれば True。"""
@@ -832,7 +853,7 @@ class Scheduler:
             return
         self._run_data_hook("signal_maintenance", lambda: hook(now))
 
-    def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> None:
+    def _run_data_hook(self, kind: str, fn: Callable[[], None]) -> bool:
         """ニュース / econ の収集フックを fail-open で呼ぶ。
 
         cross-plan 修正②: これらは tick の冒頭 = `_process_exits`
@@ -852,6 +873,7 @@ class Scheduler:
         """
         try:
             fn()
+            return True
         except Exception as e:  # noqa: BLE001 — 資金保護を止めない (fail-open)
             text = safe_error_text(e)
             _log.warning("%s cycle failed: %s", kind, text)
@@ -867,6 +889,7 @@ class Scheduler:
             except Exception:  # noqa: BLE001 — 資金保護を止めない
                 _log.exception(
                     "%s cycle failed and activity.write also failed", kind)
+            return False
 
     def _fresh_bar(self, pair: str, now: datetime) -> Bar | None:
         """鮮度検証 + 同一バー再処理防止を通ったバーのみ返す。"""
