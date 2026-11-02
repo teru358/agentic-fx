@@ -107,13 +107,15 @@ _INDICATOR_PARAMS = {"sma": {"period": 20}, "rsi": {"period": RSI_PERIOD},
                      "adx": {"period": 14}}
 
 
-def _closes() -> list[float]:
-    return [150.0 + 2.0 * math.sin(2 * math.pi * k / 288)
-            + 0.5 * math.sin(2 * math.pi * k / 2016) for k in range(BARS_COUNT)]
+def _closes(phase_bars: int = 0) -> list[float]:
+    """`phase_bars` 本ぶん波形を後ろへずらす (時計に対する波の位相だけが変わる)。"""
+    return [150.0 + 2.0 * math.sin(2 * math.pi * (k - phase_bars) / 288)
+            + 0.5 * math.sin(2 * math.pi * (k - phase_bars) / 2016)
+            for k in range(BARS_COUNT)]
 
 
-def synthetic_rows() -> list[tuple]:
-    closes = _closes()
+def synthetic_rows(phase_bars: int = 0) -> list[tuple]:
+    closes = _closes(phase_bars)
     rows = []
     prev_close = 150.0
     for k, close in enumerate(closes):
@@ -126,9 +128,9 @@ def synthetic_rows() -> list[tuple]:
     return rows
 
 
-def seed_history(conn) -> None:
+def seed_history(conn, *, phase_bars: int = 0) -> None:
     from agentic_fx.store import ohlcv
-    ohlcv.import_history_bars(conn, synthetic_rows(), source=SOURCE)
+    ohlcv.import_history_bars(conn, synthetic_rows(phase_bars), source=SOURCE)
 
 
 def write_indicator(base: Path, name: str) -> Path:

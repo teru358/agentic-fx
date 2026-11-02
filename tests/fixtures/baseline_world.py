@@ -45,6 +45,12 @@ NAME = "momo"
 PATCHED_BACKOFF_SEC = 1.0
 PAIR = fx.PAIR
 
+# 合成履歴は周期 24 時間の波で、成績は日次の境界 (kill switch の解除など) と
+# 波の位相の関係で決まる。評価窓 (NOW の直前、2 月) の日次境界は NY 17:00 =
+# 22:00 UTC なので、波も 1 時間 (5 分足 12 本) 後ろへずらして、境界との
+# 位相を 21:00 UTC 境界で組んだ元の履歴と同じに保つ。
+WINTER_PHASE_BARS = 12
+
 CONFIG = (
     "kind: strategy\ntimeframe: 1h\npairs: [USDJPY]\nexit_mode: levels\n"
     "max_bars: 50\nparams: {}\n")
@@ -124,7 +130,7 @@ def open_world(root: Path, *, mode: str = "enforce",
                 setattr(s.plugin, key, value)
             for key, value in (gate_updates or {}).items():
                 setattr(s.improve.gate, key, value)
-            fx.seed_history(app.conn_core)
+            fx.seed_history(app.conn_core, phase_bars=WINTER_PHASE_BARS)
             db_path = root / "data" / "agentic.db"
             loop = ImproveLoop(
                 root=root, settings=s, clock=FixedClock(NOW),
