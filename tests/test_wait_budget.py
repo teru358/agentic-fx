@@ -529,6 +529,49 @@ def test_a_tick_does_not_reevaluate_after_a_successful_admitted_write(tmp_path):
     h.conn.close()
 
 
+def test_a_failed_write_is_retried_by_the_next_tick_with_its_original_trigger(tmp_path):
+    """BEGIN が BUSY などで書けなかった評価は、_seen を戻して次の tick で取り直し、
+    警告を落とさない。trigger も元のまま。"""
+    h = _active(tmp_path)
+    original = alert_state.set
+
+    state = {"fail": True}
+
+    def flaky(conn, key, value, **kw):
+        if state["fail"] and key == alert_state.WAIT_BUDGET_SNAPSHOT_KEY:
+            raise sqlite3.OperationalError("database is locked")
+        return original(conn, key, value, **kw)
+
+    from unittest import mock
+    with mock.patch.object(alert_state, "set", flaky):
+        snap = h.evaluator.on_signal_terminal(1, "freshness_abandoned")
+        assert snap is not None and snap.state == "active"
+        assert h.lines() == []                              # 記録できなければ通知しない
+        state["fail"] = False
+        again = h.evaluator.tick(NOW)                       # 次の tick で取り直す
+    assert again is not None
+    assert again.trigger == "freshness_abandoned"          # 元の trigger を保つ
+    assert len(h.lines()) == 1                              # 警告は落とさない
+    assert h.evaluator.tick(NOW) is None                    # 書けたあとは取り直さない
+    h.conn.close()
+
+
+def test_a_refused_write_keeps_the_first_trigger_across_several_refusals(tmp_path):
+    from agentic_fx.core.writer_admission import WriterAdmission
+    writer = WriterAdmission()
+    h = _active(tmp_path)
+    h.evaluator = h.make(writer_admission=writer)
+    writer.request()
+    try:
+        h.evaluator.on_signal_terminal(1, "freshness_abandoned")
+        h.evaluator.on_signal_terminal(1, "decision")      # 2 回目も拒否される
+    finally:
+        writer.release()
+    snap = h.evaluator.tick(NOW)
+    assert snap is not None and snap.trigger == "freshness_abandoned"
+    h.conn.close()
+
+
 # --- 評価時点 ----------------------------------------------------------------
 
 def test_a_final_decision_or_a_freshness_abandon_triggers_an_evaluation(tmp_path):

@@ -1340,6 +1340,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # 待機上限の実測 warning の評価器だけが使う書込み接続 (評価は mission の
         # thread からも呼ばれるので、core / signal の接続は共有しない)
         conn_admission = connect(root / "data" / "agentic.db")
+        # BEGIN が他の writer を待たない (BUSY は即 rollback して次の機会に取り直す)
+        conn_admission.execute("PRAGMA busy_timeout=0")
         if settings.notify.trade_events is True:
             # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
             trade_sink, trade_token = _start_trade_events(root, conn_core, settings, state, clock)
@@ -1686,8 +1688,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
 
         def on_signal_maintenance(now: datetime) -> None:
             # 運用日境界の通過と承認 strategy 集合の変更で、実測 warning を再評価する
-            deployed.refresh(now)
-            wait_budget.tick(now)
+            # 観測機能の例外で、後続の reclaim / expire / producer を止めない
+            try:
+                deployed.refresh(now)
+            except Exception:  # noqa: BLE001
+                _log.exception("deployed strategies refresh failed")
+            try:
+                wait_budget.tick(now)
+            except Exception:  # noqa: BLE001
+                _log.exception("wait budget tick failed")
             if not _repair_signal_connection(app):
                 return
             # codex plan r2 束2 Critical: キーは `InventoryBuildResult.
@@ -1749,7 +1758,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         admission = SignalAdmission(
             settings=settings, strategies_fn=deployed.current,
             pair_currencies=pair_currencies, capacity=capacity_monitor,
-            wait_budget=wait_budget, calendar_notice=calendar_notice)
+            wait_budget=wait_budget, calendar_notice=calendar_notice,
+            suppressed_limits_fn=lambda: scheduler.suppressed_limit_count)
 
         requirement_registry = build_registry(settings, approved)
         retention_plan = ohlcv.build_retention_plan(
@@ -2578,9 +2588,11 @@ def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
 
 def _busy_resources_after_join(scheduler_still_busy: bool,
                                supervisor_still_busy: bool,
-                               improve_still_busy: bool = False) -> frozenset[str]:
+                               improve_still_busy: bool = False,
+                               report_still_busy: bool = False) -> frozenset[str]:
     busy: set[str] = set()
-    if scheduler_still_busy or supervisor_still_busy or improve_still_busy:
+    if (scheduler_still_busy or supervisor_still_busy or improve_still_busy
+            or report_still_busy):
         busy.add("conn_core")
         busy.add("conn_signal")
         busy.add("conn_admission")
@@ -2904,6 +2916,10 @@ def run_service(root: Path, *, daemon: bool = False,
         app.supervisor.join(timeout=supervisor_join_timeout_sec)
         supervisor_still_busy = app.supervisor.is_alive()
         improve_still_busy = app.improve_supervisor.is_alive()
+        # 日次 report の thread。scheduler thread が止まった後は新しく積まれない
+        join_report = getattr(app.scheduler, "join_daily_report", None)
+        report_still_busy = (join_report is not None
+                             and not join_report(timeout=supervisor_join_timeout_sec))
         # F3 (fix round 1): watchdog の join を service_stopped 記録より前に
         # 行う。notifier は最大 10 秒ブロックしうるため、記録を先にすると
         # 「graceful」記録の後に watchdog がまだ activity へ書き込める窓が
@@ -2917,7 +2933,7 @@ def run_service(root: Path, *, daemon: bool = False,
         # シーケンスを止めない。
         skipped = app.close(busy_resources=_busy_resources_after_join(
             scheduler_still_busy, supervisor_still_busy,
-            improve_still_busy))
+            improve_still_busy, report_still_busy))
         try:
             reap_orphans()
         except Exception:

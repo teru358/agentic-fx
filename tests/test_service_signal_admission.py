@@ -331,6 +331,53 @@ def test_a_failed_reread_keeps_the_previous_set_and_is_retried():
     assert [m.timeframe for m in deployed.current()] == ["15m"]
 
 
+def test_a_persistent_failure_backs_off_exponentially_up_to_fifteen_minutes():
+    loader = _Loader(RuntimeError("hash mismatch"))
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=loader,
+                                  version_fn=lambda: "v1")
+    at, waits = NOW, []
+    for _ in range(7):
+        calls = loader.calls
+        assert deployed.refresh(at) is False                 # 失敗する
+        assert loader.calls == calls + 1
+        wait = (deployed._retry_at - at).total_seconds()
+        waits.append(wait)
+        # 間隔の手前では読み直さず、間隔ちょうどで読み直す
+        assert deployed.refresh(at + timedelta(seconds=wait - 1)) is False
+        assert loader.calls == calls + 1
+        at += timedelta(seconds=wait)
+    assert waits == [60, 120, 240, 480, 900, 900, 900]
+
+
+def test_the_refresh_warning_is_not_repeated_for_the_same_error(caplog):
+    loader = _Loader(RuntimeError("hash mismatch"))
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=loader,
+                                  version_fn=lambda: "v1")
+    at = NOW
+    with caplog.at_level("WARNING"):
+        for _ in range(4):
+            deployed.refresh(at)
+            at += timedelta(minutes=20)
+    assert loader.calls == 4
+    assert len([r for r in caplog.records
+                if "deployed strategies refresh failed" in r.getMessage()]) == 1
+
+
+def test_a_success_resets_the_backoff():
+    loader = _Loader(RuntimeError("busy"), [_strategy("15m")], RuntimeError("again"))
+    version = ["v1"]
+    deployed = DeployedStrategies([_strategy("1h")], load_fn=loader,
+                                  version_fn=lambda: version[0])
+    assert deployed.refresh(NOW) is False
+    assert deployed.refresh(NOW + timedelta(seconds=59)) is False
+    assert loader.calls == 1                                  # 間隔の手前
+    assert deployed.refresh(NOW + timedelta(seconds=60)) is True
+    version[0] = "v2"
+    t = NOW + timedelta(seconds=61)
+    assert deployed.refresh(t) is False                       # 失敗。間隔は 60 秒から
+    assert (deployed._retry_at - t).total_seconds() == 60
+
+
 def test_a_failing_version_probe_leaves_the_set_alone():
     def broken():
         raise RuntimeError("db busy")
@@ -534,10 +581,70 @@ def test_status_shows_the_current_window_and_the_suppressed_limit_count(tmp_path
                         '[{"id":1,"events":[1]}]', now=NOW)
         alert_state.set(app.conn_core, alert_state.limit_suppress_key(oid + 99),
                         '[{"id":1,"events":[1]}]', now=NOW)    # 約定待ちでない order
+        app.scheduler._refresh_suppressed_count()              # 件数は scheduler の snapshot
         status = app.ops._status_provider()
         assert status["window"]["in_window"] is True
         assert status["window"]["active_events"] == 1          # EUR は USDJPY の対象外
         assert status["suppressed_limits"] == 1
+    finally:
+        app.close()
+
+
+def test_the_suppressed_count_in_status_is_the_schedulers_snapshot(tmp_path):
+    """件数の実装は scheduler の 1 か所。status は snapshot をそのまま読む。"""
+    app = _app(tmp_path)
+    try:
+        app.scheduler.suppressed_limit_count = 7
+        assert app.ops._status_provider()["suppressed_limits"] == 7
+    finally:
+        app.close()
+
+
+def test_a_failing_observation_does_not_stop_the_signal_pipeline(tmp_path):
+    """配備集合の取り直しと待機上限の評価の例外で、expire / reclaim / producer を止めない。"""
+    app = _app(tmp_path)
+    try:
+        app.scheduler.state_fn = lambda: "ready"
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("observation broke")
+
+        app.admission.wait_budget.tick = boom
+        sid = _signal(app.conn_signal, bar_ts=NOW - timedelta(hours=3))
+        app.scheduler.on_signal_maintenance(NOW)
+        row = app.conn_core.execute(
+            "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "abandoned"                     # expire は走った
+    finally:
+        app.close()
+
+
+def test_a_failing_deployed_refresh_does_not_stop_the_signal_pipeline(
+        tmp_path, monkeypatch):
+    import agentic_fx.signal_admission as sa
+    app = _app(tmp_path)
+    try:
+        app.scheduler.state_fn = lambda: "ready"
+        sid = _signal(app.conn_signal, bar_ts=NOW - timedelta(hours=3))
+
+        def boom(self, now):
+            raise RuntimeError("refresh broke")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(sa.DeployedStrategies, "refresh", boom)
+            app.scheduler.on_signal_maintenance(NOW)
+        row = app.conn_core.execute(
+            "SELECT status FROM signals WHERE id=?", (sid,)).fetchone()
+        assert row[0] == "abandoned"
+    finally:
+        app.close()
+
+
+def test_the_admission_connection_does_not_wait_for_another_writer(tmp_path):
+    """評価器の接続は busy_timeout 0。他の writer の BEGIN を待たず BUSY で戻る。"""
+    app = _app(tmp_path)
+    try:
+        assert app.conn_admission.execute("PRAGMA busy_timeout").fetchone()[0] == 0
     finally:
         app.close()
 

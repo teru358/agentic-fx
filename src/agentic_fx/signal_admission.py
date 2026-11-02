@@ -30,13 +30,16 @@ from agentic_fx.core import econ_window, market_hours, mission_ceiling
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.store import (
-    alert_state, econ_events, fetch_attempts, missions, ohlcv_slices, orders, signals,
+    alert_state, econ_events, fetch_attempts, missions, ohlcv_slices, signals,
 )
 
 _log = logging.getLogger("agentic_fx.signal_admission")
 
 WAIT_WINDOW_DAYS = 14
 DIRECT_MIN_SAMPLES = 100
+# 配備済み strategy の取り直しが失敗し続けるときの間隔 (指数、上限 15 分)
+REFRESH_BACKOFF_BASE_SEC = 60.0
+REFRESH_BACKOFF_MAX_SEC = 900.0
 FRESHNESS_ABANDON_REASONS = (signals.REASON_FRESHNESS_EXPIRED,
                              signals.REASON_REQUEUED_EXPIRED)
 
@@ -152,6 +155,9 @@ class DeployedStrategies:
         self._version_fn = version_fn
         self._seen: tuple[str, object] | None = None
         self._lock = threading.Lock()
+        self._failures = 0
+        self._retry_at: datetime | None = None
+        self._last_error: str | None = None
 
     def current(self) -> list:
         with self._lock:
@@ -159,14 +165,24 @@ class DeployedStrategies:
 
     def refresh(self, now: datetime) -> bool:
         """集合を取り直したら True。"""
+        if self._retry_at is not None and now < self._retry_at:
+            return False
         try:
             marker = (operating_day(now), self._version_fn())
             if self._seen == marker:
                 return False
             loaded = tuple(self._load_fn())
         except Exception as exc:  # noqa: BLE001 — 取り直しの失敗で tick を止めない
-            _log.warning("deployed strategies refresh failed: %s", safe_error_text(exc))
+            self._failures += 1
+            self._retry_at = now + timedelta(
+                seconds=min(REFRESH_BACKOFF_BASE_SEC * 2 ** (self._failures - 1),
+                            REFRESH_BACKOFF_MAX_SEC))
+            text = safe_error_text(exc)
+            if text != self._last_error:
+                _log.warning("deployed strategies refresh failed: %s", text)
+            self._last_error = text
             return False
+        self._failures, self._retry_at, self._last_error = 0, None, None
         with self._lock:
             self._current = loaded
         self._seen = marker
@@ -302,6 +318,8 @@ class WaitBudgetEvaluator:
         self._now_fn = now_fn
         self._lock = threading.Lock()
         self._seen: tuple[str, frozenset] | None = None
+        # 書けずに取り直す評価の、元の trigger
+        self._retry_trigger: str | None = None
 
     # --- 公開 API ---
 
@@ -329,7 +347,8 @@ class WaitBudgetEvaluator:
         current = (operating_day(now), self._identity())
         if self._seen is not None and self._seen == current:
             return None
-        return self.evaluate_wait_budget(now, trigger="boundary")
+        return self.evaluate_wait_budget(
+            now, trigger=self._retry_trigger or "boundary")
 
     # --- 内部 ---
 
@@ -344,11 +363,14 @@ class WaitBudgetEvaluator:
             saved, notify = self._persist(snapshot, now)
         except Exception as exc:  # noqa: BLE001 — 記録できなければ通知しない
             _log.warning("wait budget not recorded: %s", safe_error_text(exc))
-            saved, notify = True, False
+            saved, notify = False, False
         if not saved:
-            # scheduler の書込み要求中は始めない。次の tick の `tick()` で取り直す
+            # scheduler の書込み要求中、または書込みの失敗。次の tick の `tick()` で、
+            # 元の trigger のまま取り直す
             self._seen = None
+            self._retry_trigger = self._retry_trigger or trigger
             return snapshot
+        self._retry_trigger = None
         if notify:
             self._write_warning(snapshot)
         return snapshot
@@ -603,15 +625,6 @@ class CalendarFreshnessNotice:
 
 # --- status --------------------------------------------------------------
 
-def suppressed_limit_count(conn: sqlite3.Connection) -> int:
-    """回避帯で約定を見送った履歴があり、いまも約定待ちの limit の数。"""
-    keys = set(alert_state.keys_with_prefix(conn, alert_state.LIMIT_SUPPRESS_PREFIX))
-    if not keys:
-        return 0
-    return sum(1 for row in orders.list_by_status(conn, "pending_fill")
-               if alert_state.limit_suppress_key(row["id"]) in keys)
-
-
 def window_status(conn: sqlite3.Connection, now: datetime, *,
                   window: econ_window.WindowSettings,
                   pair_currencies: Mapping[str, tuple[str, str]]) -> dict:
@@ -637,8 +650,10 @@ class SignalAdmission:
                  pair_currencies: Mapping[str, tuple[str, str]],
                  capacity: CapacityMonitor,
                  wait_budget: WaitBudgetEvaluator | None = None,
-                 calendar_notice: CalendarFreshnessNotice | None = None) -> None:
+                 calendar_notice: CalendarFreshnessNotice | None = None,
+                 suppressed_limits_fn: Callable[[], int] | None = None) -> None:
         self.settings = settings
+        self.suppressed_limits_fn = suppressed_limits_fn
         self.strategies_fn = strategies_fn
         self.pair_currencies = dict(pair_currencies)
         self.capacity = capacity
@@ -680,7 +695,9 @@ class SignalAdmission:
             _log.warning("window status unavailable: %s", safe_error_text(exc))
             out["window"] = {"unavailable": True}
         try:
-            out["suppressed_limits"] = suppressed_limit_count(conn)
+            out["suppressed_limits"] = (
+                None if self.suppressed_limits_fn is None
+                else self.suppressed_limits_fn())
         except Exception as exc:  # noqa: BLE001
             _log.warning("suppressed limits unavailable: %s", safe_error_text(exc))
             out["suppressed_limits"] = None

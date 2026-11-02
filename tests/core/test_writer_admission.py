@@ -101,9 +101,9 @@ def test_a_failing_begin_propagates_and_leaves_the_mutex_usable():
     wa.release()
 
 
-def test_a_request_cannot_slip_between_the_flag_check_and_begin():
-    """admit は確認と begin を同じ mutex の中で行う。begin の最中に始まった要求は、
-    begin が終わるまで登録できない (確認と BEGIN の間の割込みが無い)。"""
+def test_a_request_is_not_blocked_by_a_begin_in_progress():
+    """admit は begin を mutex の外で呼ぶ。begin (BEGIN IMMEDIATE の待ち) の最中でも、
+    scheduler の request() はすぐ登録できる。進行中の begin は観測値に数える。"""
     wa = WriterAdmission()
     in_begin = threading.Event()
     finish_begin = threading.Event()
@@ -127,12 +127,28 @@ def test_a_request_cannot_slip_between_the_flag_check_and_begin():
     sched = threading.Thread(target=scheduler)
     worker.start()
     sched.start()
-    assert in_begin.wait(10)
-    assert not registered.wait(0.3)                        # begin の間は登録できない
-    finish_begin.set()
+    try:
+        assert in_begin.wait(10)
+        assert registered.wait(5)                          # begin の間でも登録できる
+        assert wa.stats().beginning == 1
+    finally:
+        finish_begin.set()
     worker.join(10)
     sched.join(10)
-    assert order == ["begin-start", "begin-end", "registered"]
+    assert order == ["begin-start", "registered", "begin-end"]
+    stats = wa.stats()
+    assert stats.beginning == 0 and stats.admitted == 1
+
+
+def test_a_failed_begin_leaves_no_transaction_in_progress():
+    wa = WriterAdmission()
+
+    def boom():
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        wa.admit(boom)
+    assert wa.stats().beginning == 0 and wa.stats().admitted == 0
 
 
 def test_a_registered_request_makes_a_later_admit_yield_without_opening_a_transaction(tmp_path):

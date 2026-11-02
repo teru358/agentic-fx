@@ -339,7 +339,7 @@ def test_the_state_is_pruned_when_the_order_is_no_longer_pending(tmp_path):
 
 
 def test_a_failure_to_judge_the_band_skips_the_fill_for_that_bar(tmp_path, monkeypatch):
-    """帯を判定できなかった足は約定させない。注文単位の隔離で他の保護は続く。"""
+    """帯を判定できなかった足は約定させない (fail-closed)。例外は吸収する。"""
     env = _env(tmp_path)
     oid = env.place_limit()
 
@@ -350,7 +350,7 @@ def test_a_failure_to_judge_the_band_skips_the_fill_for_that_bar(tmp_path, monke
         patch.setattr(econ_events, "bar_components", boom)
         _tick(env, WED)
     assert _status(env, oid) == "pending_fill"
-    assert "limit_fill_error" in _log(env)
+    assert "limit_fill_error" not in _log(env)            # 吸収する。毎足の activity は出さない
     _tick(env, WED + timedelta(minutes=1))               # 次の足は判定できて約定
     assert _status(env, oid) == "open"
 
@@ -392,11 +392,43 @@ def test_a_repeated_band_failure_warns_once_per_order_and_operating_day(
     assert _status(env, oid) == "pending_fill" and _status(env, other) == "pending_fill"
     assert orders.get(env.conn, sl)["close_reason"] == "sl"      # 資金保護は続く
     assert len(_bar_error_warnings(caplog)) == 4          # 運用日が変われば 1 回ずつ
-    assert _log(env).count("limit_fill_error") >= 5       # activity は従来どおり
+    assert "limit_fill_error" not in _log(env)            # 毎足の activity は出さない
     assert "band_judgement" not in _log(env)             # 新しい固定語は無い
     env.bars["USDJPY"] = _bar(WED + timedelta(hours=21))
     env.sched.tick(WED + timedelta(hours=21, minutes=1))
     assert _status(env, oid) in ("expired", "cancelled")  # 自然期限は止まらない
+
+
+@pytest.mark.parametrize("target", ["alert_state_get", "alert_state_set", "activity"])
+def test_a_failure_in_the_notice_path_holds_the_fill_and_warns_once(
+        tmp_path, monkeypatch, caplog, target):
+    """alert_state や通知の例外も吸収する。足は約定させず、limit_fill_error は出さず、
+    warning は (order, 運用日) で 1 回。"""
+    env = _env(tmp_path)
+    oid = env.place_limit(hours=20)
+    _event(env, WED + timedelta(minutes=20))
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+    with monkeypatch.context() as patch, caplog.at_level("WARNING"):
+        if target == "alert_state_get":
+            real = alert_state.get
+            patch.setattr(alert_state, "get", lambda conn, key, *a, **k: (
+                boom() if key.startswith(alert_state.LIMIT_SUPPRESS_PREFIX)
+                else real(conn, key, *a, **k)))
+        elif target == "alert_state_set":
+            real_set = alert_state.set
+            patch.setattr(alert_state, "set", lambda conn, key, *a, **k: (
+                boom() if key.startswith(alert_state.LIMIT_SUPPRESS_PREFIX)
+                else real_set(conn, key, *a, **k)))
+        else:
+            patch.setattr(env.sched.activity, "write", boom)
+        for minute in range(3):
+            _tick(env, WED + timedelta(minutes=minute))
+    assert _status(env, oid) == "pending_fill"
+    assert "limit_fill_error" not in _log(env)
+    assert len(_bar_error_warnings(caplog)) == 1
 
 
 # --- 書込み要求フラグ ---------------------------------------------------------
@@ -409,7 +441,44 @@ def test_the_writer_flag_is_up_during_tick_and_down_afterwards(tmp_path):
     env.sched.tick(WED)
     assert seen and all(seen)
     assert writer.requested() is False
-    assert writer.stats().requests == 1
+    assert writer.stats().requests >= 1
+
+
+def test_the_writer_flag_is_down_during_the_network_hooks_and_cache_prune(tmp_path):
+    """news / econ の取得と cache prune はフラグの外。決定論ブロックと mission の
+    起動 (DB に書く範囲) はフラグの中。"""
+    writer = WriterAdmission()
+    env = _env(tmp_path, writer=writer)
+    seen: dict[str, list] = {"news": [], "econ": [], "cache": [], "bars": [],
+                             "mission": []}
+    env._news_fn = lambda: seen["news"].append(writer.requested())
+    env._econ_fn = lambda: seen["econ"].append(writer.requested())
+    env.sched.on_cache_maintenance = lambda now: seen["cache"].append(writer.requested())
+    env.sched.bars_fn = lambda p: (seen["bars"].append(writer.requested()), None)[1]
+    env.sched._trade_mission_due = lambda now: (
+        seen["mission"].append(writer.requested()), None)[1]
+    env.sched.tick(WED)
+    assert seen["news"] == [False] and seen["econ"] == [False]
+    assert seen["cache"] == [False]
+    assert seen["bars"] and all(seen["bars"])
+    assert seen["mission"] == [True]
+    assert writer.requested() is False
+    assert writer.stats().requests >= 2                 # 決定論ブロックと後段は別の保持
+
+
+def test_a_slow_news_fetch_does_not_hold_the_flag(tmp_path):
+    writer = WriterAdmission()
+    env = _env(tmp_path, writer=writer)
+    held = []
+
+    def slow_news():
+        held.append(writer.requested())
+        time.sleep(0.05)
+
+    env._news_fn = slow_news
+    env.sched.tick(WED)
+    assert held == [False]
+    assert writer.stats().max_hold_sec < 0.05
 
 
 def test_the_writer_flag_is_released_when_tick_raises(tmp_path):
@@ -480,6 +549,7 @@ def test_a_restart_does_not_repeat_the_same_trading_day(tmp_path):
     calls: list = []
     env = _report_env(tmp_path, calls)
     _run(env, env.sched.tick(WED))
+    _run(env, env.sched.tick(WED + timedelta(minutes=1)))     # 終わった日の記録を書く
     again = Scheduler(
         conn=env.conn, executor=env.executor, settings=SETTINGS,
         state_store=env.state, activity=env.sched.activity,
@@ -587,6 +657,7 @@ def test_holiday_boundaries_do_not_fire_and_survive_a_restart(
     closed = Scheduler.latest_trading_close(holiday_eve)
     assert calls == [closed]
     assert closed.date() == holiday_eve.date() and closed.hour == 21
+    _run(env, env.sched.tick(holiday_eve + timedelta(minutes=1)))   # 記録を書く
     _run(env, env.sched.tick(holiday_night))                # 休場日の境界は数えない
     assert calls == [closed]
     again = Scheduler(
@@ -601,6 +672,97 @@ def test_holiday_boundaries_do_not_fire_and_survive_a_restart(
     _run(env, again.tick(monday_close + timedelta(minutes=1)))
     assert again.join_daily_report(5)
     assert calls == [closed, monday_close]
+
+
+def test_the_marker_is_written_after_the_callback_finished_not_before(tmp_path):
+    env = Env(tmp_path)
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow(close_at):
+        started.set()
+        gate.wait(10)
+
+    env.sched.register_daily_report(slow)
+    try:
+        for hook in env.sched.tick(WED):
+            hook()
+        assert started.wait(5)
+        env.sched.tick(WED + timedelta(minutes=1))        # 実行中の tick
+        assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+    finally:
+        gate.set()
+    assert env.sched.join_daily_report(5)
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None  # 次の tick が書く
+    env.sched.tick(WED + timedelta(minutes=2))
+    assert json.loads(alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY)) == {
+        "day": TUE_CLOSE.isoformat()}
+
+
+def test_a_report_is_queued_at_most_once_while_it_runs_and_before_the_marker(tmp_path):
+    """実行中・実行後で記録がまだでも、同じ取引日を 2 回 queue に渡さない。"""
+    calls: list = []
+    gate = threading.Event()
+
+    def cb(close_at):
+        calls.append(close_at)
+        gate.wait(10)
+
+    env = Env(tmp_path)
+    env.sched.register_daily_report(cb)
+    try:
+        _run_pending_without_join(env, WED)
+        for minute in (1, 2, 3):
+            _run_pending_without_join(env, WED + timedelta(minutes=minute))
+    finally:
+        gate.set()
+    assert env.sched.join_daily_report(5)
+    _run(env, env.sched.tick(WED + timedelta(minutes=30)))
+    assert calls == [TUE_CLOSE]
+
+
+def _run_pending_without_join(env, now):
+    for hook in env.sched.tick(now):
+        hook()
+
+
+def test_a_tick_that_raises_loses_no_report_and_the_next_tick_retries(tmp_path):
+    """tick が例外で抜けて遅延 callable を失っても、記録は書かれず次 tick で再試行する。"""
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    original = env.sched._trade_mission_due
+
+    def boom(now):
+        raise RuntimeError("tick failed after the report was scheduled")
+
+    env.sched._trade_mission_due = boom
+    with pytest.raises(RuntimeError):
+        env.sched.tick(WED)                              # pending は呼び出し元へ渡らない
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+    assert calls == []
+    env.sched._trade_mission_due = original
+    _run(env, env.sched.tick(WED + timedelta(minutes=1)))
+    assert calls == [TUE_CLOSE]                          # 最低 1 回
+    _run(env, env.sched.tick(WED + timedelta(minutes=2)))
+    _run(env, env.sched.tick(WED + timedelta(minutes=3)))
+    assert calls == [TUE_CLOSE]                          # 最大 1 回
+
+
+def test_a_restart_before_the_marker_is_written_calls_the_day_again(tmp_path):
+    """実行が終わってから記録までの間に再起動すれば、その日はもう一度呼ぶ (最低 1 回)。"""
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    _run(env, env.sched.tick(WED))
+    assert alert_state.get(env.conn, alert_state.DAILY_REPORT_KEY) is None
+    again = Scheduler(
+        conn=env.conn, executor=env.executor, settings=SETTINGS,
+        state_store=env.state, activity=env.sched.activity,
+        bars_fn=lambda p: None, on_trade_mission=env._trade,
+        on_news_cycle=env._news, on_econ_cycle=env._econ)
+    again.register_daily_report(lambda close_at: calls.append(close_at))
+    _run(env, again.tick(WED + timedelta(minutes=5)))
+    assert again.join_daily_report(5)
+    assert calls == [TUE_CLOSE, TUE_CLOSE]
 
 
 def test_a_failing_callback_is_logged_and_not_retried(tmp_path):

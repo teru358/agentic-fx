@@ -187,6 +187,8 @@ def test_busy_resource_mapping_and_exit_code():
     assert _busy_resources_after_join(True, False) == frozenset(held)
     assert _busy_resources_after_join(False, True) == frozenset(held | {"conn_supervisor"})
     assert _busy_resources_after_join(False, False) == frozenset()
+    # 日次 report の thread が残っている間も同じ集合を残す
+    assert _busy_resources_after_join(False, False, False, True) == frozenset(held)
     app = _minimal_app(); app.fatal_reason = "fatal"
     assert _exit_code(app, False, False) == 1
 

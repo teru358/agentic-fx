@@ -2518,6 +2518,54 @@ def test_run_service_derives_supervisor_join_timeout_from_dispatch_ceiling(
     assert recorded.get("timeout") == pytest.approx(112.0 * 4 + 10.0 + 60.0)
 
 
+def test_run_service_joins_the_daily_report_thread_and_keeps_resources_while_it_runs(
+        tmp_path):
+    """停止手順は日次 report の thread を待ち、終わらなければ conn_core 等を閉じない。"""
+    app = _seam_app(tmp_path, FakeRunner([]))
+    joins: list = []
+    app.scheduler.join_daily_report = lambda timeout=None: (
+        joins.append(timeout), False)[1]
+    closed: dict = {}
+    original_close = app.close
+
+    def spy_close(*, busy_resources=frozenset()):
+        closed["busy"] = busy_resources
+        return original_close(busy_resources=busy_resources)
+
+    app.close = spy_close
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    assert len(joins) == 1 and joins[0] is not None
+    assert {"conn_core", "conn_signal", "conn_admission"} <= closed["busy"]
+
+
+def test_run_service_closes_normally_when_the_daily_report_thread_has_stopped(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    joins: list = []
+    app.scheduler.join_daily_report = lambda timeout=None: (
+        joins.append(timeout), True)[1]
+    closed: dict = {}
+    original_close = app.close
+
+    def spy_close(*, busy_resources=frozenset()):
+        closed["busy"] = busy_resources
+        return original_close(busy_resources=busy_resources)
+
+    app.close = spy_close
+    stop_event = threading.Event()
+    stop_event.set()
+    with _no_real_network(), \
+         patch("agentic_fx.service.build_app", return_value=app), \
+         patch("agentic_fx.service.signal.signal"):
+        run_service(tmp_path, daemon=True, _stop_event=stop_event)
+    assert len(joins) == 1
+    assert "conn_core" not in closed["busy"]
+
+
 def test_scheduler_tick_actually_invokes_the_watchdog_health_check(tmp_path):
     """相互監視の scheduler→watchdog 方向が**実際に配線されている**ことを
     確認する (2周目 ローカル LLM 指摘 — 指揮者が変異で CONFIRMED)。

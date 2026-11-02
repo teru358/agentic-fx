@@ -44,6 +44,23 @@ _ONE_MINUTE = timedelta(minutes=1)
 TICK_INTERVAL_SEC = 60
 
 
+class _FlagHold:
+    """書込み要求フラグを途中で下ろせるようにする覆い。`down` は何度呼んでもよい。"""
+
+    def __init__(self, scope) -> None:
+        self._scope = scope
+        self._up = False
+
+    def up(self) -> None:
+        self._scope.__enter__()
+        self._up = True
+
+    def down(self) -> None:
+        if self._up:
+            self._up = False
+            self._scope.__exit__(None, None, None)
+
+
 class Scheduler:
     """クロック駆動 tick。
 
@@ -129,6 +146,10 @@ class Scheduler:
         self._report_queue: collections.deque = collections.deque()
         self._report_lock = threading.Lock()
         self._report_thread: threading.Thread | None = None
+        # 日次 report: queue に渡した取引日 (プロセス内で最大 1 回) と、実行が終わって
+        # alert_state への記録を待つ取引日 (次の tick が書く)
+        self._report_enqueued: set[str] = set()
+        self._report_done: list[str] = []
         # 帯判定の例外を (order, 運用日) ごとに 1 回だけ技術ログへ出す記録
         self._band_error_logged: set[tuple[int, str]] = set()
         # 抑止中の limit 件数 (status 用の不変 snapshot。tick ごとに差し替える)
@@ -166,8 +187,10 @@ class Scheduler:
         return self.writer_admission.scheduler_write()
 
     def tick(self, now: datetime) -> list[Callable[[], None]]:
-        """1 tick 分の決定論的処理。scheduler の DB 書込み要求フラグは tick 本体の間だけ
-        立てる (遅延 callable の書込みは、呼び出し元の service がそれぞれ覆う)。
+        """1 tick 分の決定論的処理。scheduler の DB 書込み要求フラグは、tick が DB に
+        書く範囲 (決定論ブロック、日次 report の記録、cron cursor の再試行、mission の
+        起動) だけ立てる。news / econ の取得 (network) と cache prune は外で走る
+        (遅延 callable の書込みは、呼び出し元の service がそれぞれ覆う)。
 
         **戻り値 (検収 B2, 2026-08-22)**: `tick()` は core_lock 保持下で
         呼ばれる (`service._scheduler_tick_once`)。`on_improve_tick` は
@@ -199,12 +222,15 @@ class Scheduler:
         例外経路の保護により、未捕捉例外で tick が抜ける場合でも hooks は
         確実に実行される (プラン 8 レビュー修正 F1)。
         """
-        with self._writer_scope():
-            return self._tick_body(now)
+        return self._tick_body(now)
 
     def _tick_body(self, now: datetime) -> list[Callable[[], None]]:
         pending: list[Callable[[], None]] = []
         self._cron_cursor_failure_logged_this_tick.clear()
+        # 書込み要求フラグは DB に書く範囲だけ立てる。決定論ブロックの間は立て、
+        # ネットワーク hook (news / econ の取得) と cache prune の間は下ろす。
+        hold = _FlagHold(self._writer_scope())
+        hold.up()
         try:
             open_now = market_hours.is_market_open(now)
             if not open_now:
@@ -299,6 +325,7 @@ class Scheduler:
             self._process_exits(now, filled_ids)
             self._refresh_suppressed_count()
         finally:
+            hold.down()
             # dirty cursor の再試行は `_run_hooks` の成否に
             # 関係なく必ず走る独立した try/finally にする。`_run_hooks` が
             # (signal maintenance ゲートの `state_fn()` 等で) 例外を
@@ -306,9 +333,11 @@ class Scheduler:
             # `_retry_dirty_cron_cursor` がスキップされていた。
             try:
                 pending.extend(self._run_hooks(now))
-                pending.extend(self._daily_report_pending(now))
+                with self._writer_scope():
+                    pending.extend(self._daily_report_pending(now))
             finally:
-                self._retry_dirty_cron_cursor(now)
+                with self._writer_scope():
+                    self._retry_dirty_cron_cursor(now)
             # 検収 B2 (2026-08-22): improve tick の発火判定。
             # `on_improve_tick` が None (未配線、Task 9 単独では常にこれ) な
             # ら何も積まない。停止中 (`_stopping()`) も判定のみで発火しない
@@ -323,24 +352,25 @@ class Scheduler:
                 hook = self.on_improve_tick
                 pending.append(lambda hook=hook, now=now: hook(now))
 
-        reason = None if self._stopping() else self._trade_mission_due(now)
-        if reason is not None:
-            # その tick で前進した pair だけの確定足を不変の snapshot にして渡す。
-            # 次 tick で _due_cron_watermarks が上書きされても受理済み mission
-            # が見る値は変わらない。signal 起動では空。
-            snapshot = MappingProxyType(
-                dict(self._due_cron_watermarks) if reason == "cron" else {})
-            result = self.on_trade_mission(reason, decision_bars=snapshot)
-            if reason == "cron":
-                if result.accepted:
-                    previous = dict(self._cron_watermarks)
-                    advanced = self._advance_cron_watermarks(
-                        self._pending_cron_watermarks)
-                    self._cron_deferred_logged.clear()
-                    self._persist_cron_cursor(advanced, now)
-                    self._record_cron_coalesced(previous)
-                else:
-                    self._record_cron_deferred(result)
+        with self._writer_scope():
+            reason = None if self._stopping() else self._trade_mission_due(now)
+            if reason is not None:
+                # その tick で前進した pair だけの確定足を不変の snapshot にして渡す。
+                # 次 tick で _due_cron_watermarks が上書きされても受理済み mission
+                # が見る値は変わらない。signal 起動では空。
+                snapshot = MappingProxyType(
+                    dict(self._due_cron_watermarks) if reason == "cron" else {})
+                result = self.on_trade_mission(reason, decision_bars=snapshot)
+                if reason == "cron":
+                    if result.accepted:
+                        previous = dict(self._cron_watermarks)
+                        advanced = self._advance_cron_watermarks(
+                            self._pending_cron_watermarks)
+                        self._cron_deferred_logged.clear()
+                        self._persist_cron_cursor(advanced, now)
+                        self._record_cron_coalesced(previous)
+                    else:
+                        self._record_cron_deferred(result)
         return pending
 
     def _stopping(self) -> bool:
@@ -401,9 +431,11 @@ class Scheduler:
         callback は scheduler thread では走らず、この hook が持つ専用の 1 本の thread
         で順に呼ばれる (遅い callback が次 tick の kill switch・SL / TP を遅らせない)。
         起動後の最初の tick で、直近に閉じた取引日の分が未起動なら 1 回だけ追い
-        つく (複数日ぶんを溜めて呼ばない)。起動した取引日は callback を呼ぶ前に
-        `alert_state` へ記録するので、再起動しても同じ取引日では呼ばない。callback
-        が失敗した取引日は再試行しない (失敗は技術ログと activity に残る)。
+        つく (複数日ぶんを溜めて呼ばない)。取引日の記録 (`alert_state`) は、callback
+        の実行が終わった後に次の tick が書く。tick が例外で抜けて callback が queue に
+        渡らなかった日は記録されず、次の tick で再試行する。プロセス内では同じ取引日を
+        2 回 queue に渡さない。実行が終わってから記録までの間に再起動すると、その日を
+        もう一度呼ぶ (最低 1 回)。callback の失敗は技術ログと activity に残り、再試行しない。
         """
         self._daily_report = callback
 
@@ -441,10 +473,18 @@ class Scheduler:
             last = json.loads(raw)["day"] if raw else None
         except (ValueError, KeyError, TypeError):
             last = None
-        if isinstance(last, str) and last >= day:
+        with self._report_lock:
+            finished = sorted(self._report_done)
+        if finished and not (isinstance(last, str) and last >= finished[-1]):
+            alert_state.set(self.conn, alert_state.DAILY_REPORT_KEY,
+                            json.dumps({"day": finished[-1]}), now=now)
+            last = finished[-1]
+        with self._report_lock:
+            self._report_done = [d for d in self._report_done
+                                 if not (isinstance(last, str) and d <= last)]
+            queued = day in self._report_enqueued
+        if queued or (isinstance(last, str) and last >= day):
             return []
-        alert_state.set(self.conn, alert_state.DAILY_REPORT_KEY,
-                        json.dumps({"day": day}), now=now)
         return [lambda: self._enqueue_daily_report(callback, close_at)]
 
     def _enqueue_daily_report(self, callback: Callable[[datetime], None],
@@ -452,6 +492,7 @@ class Scheduler:
         """callback を専用 thread の queue に積む。thread は queue が空になると終わり、
         次に積まれたときに起こし直す。"""
         with self._report_lock:
+            self._report_enqueued.add(close_at.isoformat())
             self._report_queue.append((callback, close_at))
             if self._report_thread is not None and self._report_thread.is_alive():
                 return
@@ -468,6 +509,8 @@ class Scheduler:
                     return
                 callback, close_at = self._report_queue.popleft()
             self._run_data_hook("daily_report", lambda: callback(close_at))
+            with self._report_lock:
+                self._report_done.append(close_at.isoformat())
 
     def join_daily_report(self, timeout: float | None = None) -> bool:
         """report thread が止まる (queue が空になる) まで待つ。止まれば True。"""
@@ -1478,8 +1521,9 @@ class Scheduler:
 
         注文は cancel せず期限も延ばさない (期限切れは `_expire_limits` が従来どおり)。
         帯は足の区間だけで決め、`now` を使わない。通知は order × 連結成分で 1 回
-        (成分は event を共有する限り同じ)。判定や保存が例外を出したときは、
-        呼び出し元の注文単位の隔離に任せ、この足は約定しない。
+        (成分は event を共有する限り同じ)。判定、保存、通知のどれかが例外を出したときは
+        この足を約定させず (fail-closed)、(order, 運用日) ごとに 1 回だけ warning を出す。
+        `limit_fill_error` は書かない。
         """
         if self.econ_window is None or self.pair_currencies is None:
             return False
@@ -1487,12 +1531,15 @@ class Scheduler:
         if currencies is None:
             return False
         try:
-            components = econ_events.bar_components(
-                self.conn, bar.ts, bar.ts + _ONE_MINUTE, settings=self.econ_window,
-                currencies=currencies)
-        except Exception as e:
+            return self._judge_band(row, bar, now, currencies)
+        except Exception as e:  # noqa: BLE001 — 判定できない足は約定させない (fail-closed)
             self._log_band_error_once(row, now, e)
-            raise
+            return True
+
+    def _judge_band(self, row: dict, bar: Bar, now: datetime, currencies) -> bool:
+        components = econ_events.bar_components(
+            self.conn, bar.ts, bar.ts + _ONE_MINUTE, settings=self.econ_window,
+            currencies=currencies)
         if not components:
             return False
         key = alert_state.limit_suppress_key(row["id"])
@@ -1515,7 +1562,7 @@ class Scheduler:
         return True
 
     def _log_band_error_once(self, row: dict, now: datetime, exc: Exception) -> None:
-        """帯判定の例外で足の約定を見送っていることを、(order, 運用日) ごとに 1 回だけ
+        """帯判定・通知の例外で足の約定を見送っていることを、(order, 運用日) ごとに 1 回だけ
         技術ログの warning に出す。activity の語は増やさない。"""
         day = market_hours.trading_day_start(now).isoformat()
         self._band_error_logged = {k for k in self._band_error_logged if k[1] == day}
