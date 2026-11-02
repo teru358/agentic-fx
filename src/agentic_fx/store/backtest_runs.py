@@ -49,10 +49,21 @@ _HARNESS_SCOPES = frozenset({"in_sample", "holdout_gate"})
 _SCALAR_TYPES = (int, float, bool, str, type(None))
 
 
+# 型規則を持つキー。値が規則に合わなければキーごと落とす (未計測として読ませる)。
+# bool は int の部分型なので別に弾く。
+_COUNT_KEYS = frozenset({"eval_bars"})
+
+
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
 def _filter_metrics(raw_metrics: dict) -> dict:
-    """METRIC_KEYS 白リスト濾過 + スカラー値限定 (fix round 1 F1)。"""
+    """METRIC_KEYS 白リスト濾過 + スカラー値限定 (fix round 1 F1)。
+    ``_COUNT_KEYS`` は bool を除く非負 int だけを通す。"""
     return {k: v for k, v in raw_metrics.items()
-            if k in METRIC_KEYS and isinstance(v, _SCALAR_TYPES)}
+            if k in METRIC_KEYS and isinstance(v, _SCALAR_TYPES)
+            and (k not in _COUNT_KEYS or _is_count(v))}
 
 _VIEW_COLUMNS = (
     "id, plugin_ref, content_hash, kind, pair, timeframe, source, "

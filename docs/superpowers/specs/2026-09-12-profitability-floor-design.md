@@ -1,4 +1,4 @@
-# 収益性フロア + reject reason 漏洩の是正 設計書 v1.5
+# 収益性フロア + reject reason 漏洩の是正 設計書 v1.6.4
 
 束 [profitability-floor] + T0 [reject-reason-leak]。起案 2026-09-12、ユーザー裁定済 (U1〜U5)、codex 設計レビュー 1 周目 18 件 (v1.1) / 2 周目 5 件 (v1.2) / 3 周目 3 件 (v1.3) を全件反映。**v1.3 で実装着手可** (codex 収束判定)。v1.4 = 変更履歴のとおり実装レビューでの設計微修正。
 
@@ -31,6 +31,7 @@
 - `evaluable` は pair ごとの値 (`metrics.py:141`)。in-sample の標本門は pair 合計で判定している (`strategy_gate.py:151`)。**holdout は pair ごとに `evaluable` を見る** (§3 T1-b、指揮者既定)。
 - `kill_switch_latches` は実測で approval 候補が全件 `2` (pf 1.498 の最良候補も 2)。既定 0 の門にすると全滅 → 門にしない (U3)。
 - `max_drawdown` は in_sample で 3.7%〜23%。閾値の根拠が無い → 門にしない (U3)。
+- (§0〜§9 は v1.0〜v1.5 時点の歴史記述。DD の扱いだけ v1.6 で変わり、**現行規則は §10**: DD は in-sample のみ門 (既定 0.20)、`kill_switch_latches` は今も門にしない。)
 - `backtest_runs.mission_outcome` は `TEXT` で CHECK 制約なし (`store/db.py:299,406`) → 新終端名の追加に migration 不要。`latest_in_sample_metrics` は `mission_outcome IS NULL OR 'approval'` で絞る (`backtest_runs.py:231`) ので新しい値は live 表示から自動的に外れる。
 - `in_sample_view` の本番呼び出し元は **src に 0 件** (テストのみ)。`mission_outcome` 列を返すが改善 worker からは到達しない = フロア結果の side channel 漏洩は無い。
 - `settings_snapshot_hash` は `{"risk":…, "backtest":…}` のみ (`backtest_runs.py:315-320`) → **`improve.gate` を緩めても `backtest_runs.settings_hash` は変わらない**。監査痕跡は別に作る (§3 T3)。
@@ -88,7 +89,7 @@
 |---|---|
 | U1 holdout をフロアに入れるか | **入れる**。ラベルは固定文言 `unprofitable` のみ — 数値も「どちら側で落ちたか」も書かない。全数値は人間向けレポートにだけ出す |
 | U2 人間経路 | **submit は課す** (raise)、**bless は警告のみ** (続行し、警告を残す) |
-| U3 `max_drawdown` / `kill_switch_latches` | **門にしない**。ただしレポートには出す |
+| U3 `max_drawdown` / `kill_switch_latches` | **門にしない** (2026-09-12 時点の裁定)。ただしレポートには出す。**現行 (v1.6〜): `max_drawdown` は §10 で in-sample のみ門に改訂、latches は不変** |
 | U4 baseline 再生の未実装 | 別起票 [baseline-replay-unimplemented] (指揮者が tickets に記載) |
 | U5 除染 | スクリプト更新済、ユーザー実行待ち |
 | C1 legacy submit | `afx plugin submit <name>` (live plugin 回廊) は **kind=strategy のとき拒否**し `materialize` → `submit --from _human` を案内する。indicator/signal は従来どおり。共有ゲートへの統合・回廊廃止は別起票 [legacy-submit-corridor-bypasses-gate] |
@@ -151,7 +152,8 @@ _check_profitability_floor(per_pair: dict[str, dict], *, settings, scope: str) -
 - `min_pf` 既定 1.0 → `pf == 1.0` は PASS (`<` であって `<=` ではない)
 - `require_positive_avg_r` 既定 True → `avg_r == 0.0` は FAIL
 - `avg_r is None` は `trades == 0` のときだけ起こる (`metrics.py:123`) ので ② で吸収される
-- **`max_drawdown` / `kill_switch_latches` は判定式に一切現れない** (U3)。極端値でも verdict は不変 (pin F10)
+- **v1.5 までの規則 (歴史記述)**: `max_drawdown` / `kill_switch_latches` は判定式に一切現れない (U3)。極端値でも verdict は不変 (pin F10)
+  - **現行規則 (v1.6〜、§10)**: 上の疑似コードは pf / avg_r / `holdout_not_evaluable` の部分で、DD は in-sample のときだけ §10.3 の判定が同じループで追加される (既定 `improve.gate.max_drawdown` 0.20)。holdout では DD は判定に現れない。`kill_switch_latches` は判定式に現れない (不変)
 - **順序 ①→②→③ が契約** — ① を ② の後に置くと `require_holdout_evaluable=True` でも `trades=0` の pair が通ってしまう (codex I9)
 
 ### ラベルと数値の分離 (遮断 8)
@@ -482,6 +484,7 @@ agent は `run_backtest` の返却で in_sample の `pf`/`avg_r` を見ている
 ### F10 U3 の直接 pin (codex M2)
 
 - F10-1 PF / avg_r が合格する fixture で `max_drawdown` を 0.99 に、`kill_switch_latches` を 999 に変えても **verdict が変わらない** (合格のまま)。変異: DD / latches 門を追加 → killer
+  - v1.6 注記: DD の部分は §10.5 の 3・5 で置き換わる (latches の部分は不変。DD は holdout、または `max_drawdown: null` のとき不変)
 
 ### 段 0 (指揮者の変異スイープ) の最優先 6 件
 
@@ -502,6 +505,243 @@ F1-4 (`trades>0, pf=None`) / F1-8 (enforce で holdout を回さない) / F2-4 (
 
 ---
 
+## 10. 追補 v1.6 [floor-add-selectivity-drawdown-killswitch] — max DD と取引頻度を床に足す
+
+チケット `floor-add-selectivity-drawdown-killswitch`。状態: C0 v1.6.2 (レビュー 2 周目反映済み、ユーザー承認前)。U3 / F10 を **DD だけ**部分改訂する。kill switch 回数は床に入れない (§10.1)。
+
+### 10.0 目的
+
+承認 #84 (us500_lagged_return_fx: pf 1.002 / avg_r 0.004 / trades 864 / max DD 26% / kill switch 55 回) は、床 (pf ≥ 1.0 かつ avg_r > 0) を形式上通って承認依頼になった。床が「運用上の危うさ」と「ほぼ毎バー建てる戦略」を見ていない。これを決定論で止める。止める対象は次の 2 つ。
+
+- in-sample の max DD が深い候補 (既定で有効、上限 0.20)。
+- in-sample の取引頻度が高すぎる候補 (キーだけ用意し、閾値は再実測後に別裁定。それまで無効)。
+
+### 10.1 前提の再検討
+
+元の床は意図して「pf と avg_r だけ」(U3、F10)。チケットは DD / kill switch 回数 / 建玉率 / 最小 trades の 4 条件を提案した。1 件 (#84) の観測で床を足すのは危ういので、実 DB で承認済み戦略と並べて前提を確かめた。
+
+#### 実測 (実 DB、read-only、`backtest_runs` の `variant='candidate'`、直近 60 日)
+
+in_sample 322 行 / holdout_gate 54 行 (いずれも trades > 0)。取引頻度は暫定の近似 (`trades / (期間日数 × 1440 × 5/7 / 足分)`)。分母は T1 の `eval_bars` で置き換える。
+
+| scope | 指標 | min | median | p90 | max |
+|---|---|---|---|---|---|
+| in_sample | trades | 1 | 97 | 535 | 1065 |
+| in_sample | max_drawdown | 0.000 | 0.056 | 0.173 | 0.417 |
+| in_sample | kill_switch_latches | 0 | 5 | 46 | 77 |
+| in_sample | 取引頻度 (近似) | 0.0001 | 0.013 | 0.069 | 0.468 |
+| holdout | trades | 1 | 25 | 63 | 93 |
+| holdout | max_drawdown | 0.002 | 0.028 | 0.041 | 0.088 |
+| holdout | kill_switch_latches | 0 | 1 | 3 | 6 |
+| holdout | 取引頻度 (近似) | 0.0006 | 0.016 | 0.040 | 0.208 |
+
+現行の床を通った in-sample 候補は 110 件 (content_hash 単位、全 pair 合計 trades ≥ 30 かつ全 pair が pf ≥ 1.0 / avg_r > 0)。案ごとの不合格数:
+
+| 案 | 不合格 | 備考 |
+|---|---|---|
+| max DD > 0.20 | 2 | #84 を含む |
+| kill switch > 1 (チケット案) | 98 | 承認済み 11 本は全滅 |
+| kill switch > 0 | 105 | |
+| 取引頻度 > 0.5 (チケット案) | 0 | #84 (0.446) も通る |
+| 取引頻度 > 0.25 | 2 | #84 を含む。承認済みの最大は 0.110 |
+| pair 別 trades < 30 | 6 | 承認済みの最小は 39 |
+
+人間承認済みの strategy 11 本 (承認 #21〜#74、9/20〜10/28) と #84:
+
+| 承認 # | 戦略 | in-sample DD | 取引頻度 (近似) | latches | trades |
+|---|---|---|---|---|---|
+| 21 | sma_cross_10_30 | 0.038 | 0.029 | 3 | 201 |
+| 23 | bb_ema_breakout | 0.133 | 0.038 | 19 | 277 |
+| 24 | rsi_bb_reversion_200 | 0.039 | 0.005 | 2 | 39 |
+| 25 | rsi6_bb200_rr2 | 0.034 | 0.006 | 3 | 42 |
+| 32 | ichimoku_rsi_cloud_reentry | 0.049 | 0.033 | 7 | 250 |
+| 39 | asym_shock_breakout | 0.150 | 0.093 | 58 | 710 |
+| 65 | volume_close_pressure | 0.104 | 0.093 | 51 | 715 |
+| 71〜74 | close_pressure_followthrough ほか | 0.08〜0.15 | 0.037〜0.110 | 20〜75 | 287〜851 |
+| (84) | us500_lagged_return_fx (人間が reject) | **0.263** | **0.446** | 55 | 864 |
+
+上の 2 表は直近 60 日窓の暫定近似で、戦略名は一部省略、取引頻度は週末だけ除いた概算である。**再現可能な根拠ではない**: `run_in_sample` (`backtest/holdout.py:180`) は現在時刻から in-sample 期間を再計算するため、承認当時と同じ replay にならない。J1 の根拠は T1 の manifest (§10.7) を正本とし、上の表は方向づけにしか使わない。
+
+#### T1 の再測定は「元行の再現」ではなく「現行条件での新規 in-sample 実行」
+
+元の backtest_runs 行を再現することは求めない。理由 (現物):
+
+- `run_in_sample` は保存済みの `period_start/end` を使わない。`now` を正規化し `holdout_months` (現在の settings) から end を再計算し、start は現在の履歴 DB の最古バーから取る (`backtest/holdout.py:180` 付近)。履歴の追記や settings の変更で、同じ `now` を渡しても期間は元と一致しない。
+- 元行に残る設定の痕跡は不可逆な `settings_hash` だけで、設定の snapshot は無い。`core_commit` は再測定時の HEAD になる (`store/backtest_runs.py:332`)。元の設定・実行コードの復元や一致確認の手順は作らない。
+
+そこで T1 の再測定は、13 件 (承認済み 11 本 + #84 + DD 超過の 1 本) を**現在の runner・現在の settings・現在の履歴で in-sample だけ**新規に回し、`eval_bars` 付きの新しい backtest_runs 行を作る (variant は `human_custom` か新 variant。holdout には触れない)。J1 の根拠は、この新規実行の値 (`eval_bars` / trades / 頻度 / DD) である。元行の値は参考列として並べるだけで、一致は求めない。manifest の形は §10.7。
+
+#### 設定値は strict float
+
+`improve.gate` の 2 キーは bool・文字列・nan / inf を受け付けない。現行の `_Strict` (`config.py:33`) は `extra="forbid"` だけで型強制を止めないため、何もしなければ `"0.2"` が 0.2 に、`true` が 1.0 に受理され、`max_drawdown: true` で DD の門が実質無効 (1.0 = 上限なし) になる。2 キーは strict (`float | None`、`strict=True`、`allow_inf_nan=False`、範囲 (0, 1]) で定義し、bool・文字列・nan / inf は `ValidationError`。YAML の整数 `1` は float として可。
+
+#### 疑った前提と結論
+
+1. **「kill switch ≤ 1」は弁別力が無い。床に入れない。** 110 件中 98 件が落ち、承認済み 11 本は全滅。latches は取引数にほぼ比例して増え (backtest の日次 DD kill が頻繁に立つ)、#84 (55) は承認済みの 51〜75 と重なる。latches ÷ trades の比も #84 0.064 / 承認済み 0.081〜0.088 で逆転する。DD 条件とも分離できない。→ **floor に入れず、親専有レポートへの表示 (現状) を維持**。U3 のうち latches 部分と F10 の latches pin は不変。
+2. **「建玉率 ≤ 0.5」は #84 を捕まえない。** 弁別するのは 0.25 付近。ただし「建玉率」は誤称で、実体は「判定機会のあったバーのうち何割で建てたか」= **取引頻度** `trades / eval_bars`。分母は評価されたバー数で、上の近似 (週末除外 5/7) は祝日・データ欠損で誤差が出る。`eval_bars` は metrics に無いので、**閾値は T1 の再実測 (§10.7) の後に決めた (J1: 0.25、§10.8)**。
+3. **max DD は閾値の根拠が出来た。** U3 (2026-09-12) の根拠は「in_sample 3.7〜23%、閾値の根拠が無い」だった。今は 60 日の実測で、承認済み 11 本の最大 0.150、#84 が 0.263、床通過 110 件のうち 0.20 超は 2 件。→ **DD は U3 を部分改訂して床に入れる**。ただし reject 側の観測は #84 の 1 件で、0.20 は当てはめでなく判断である (§10.6 に残す)。ユーザー裁定 (2026-11-01): 既定 0.20 で有効、設定で変更可。
+4. **pair 別 `min_trades` は床に入れない。** 収益性でなく評価可能性の条件で、閾値の前後で不連続 (29 は落ち 30 は通る)。標本不足は既存の合計 30 件ルール (`insufficient_trades`) が受け持つ。別ゲートの候補として §10.6 に残す。
+5. **scope は in-sample のみ。** holdout は 92 日・trades 中央値 25 で DD / 頻度の統計力が無く (実測: holdout の DD 最大 0.088、頻度最大 0.208)、新しい合否ビットを holdout 段から運ぶことにもなる (遮断 8、§4)。
+6. **agent に返す語・数値・閾値は増やさない (J2 裁定済、§10.8)。** 遮断契約は 1 bit (`unprofitable`)。条件別の語を agent に返すと 1 bit が条件ごとに増える (§4 の受容範囲外)。DD の値そのものは agent が in-sample の `metrics` で既に見ているが、そこへ閾値や条件節まで返すと「どの値をどちらへ動かせば通るか」を教える決定論的な oracle になり、条件語を伏せても数値と閾値で同じ漏れになる。条件別の理由は親専有レポートと人間面だけに出す。
+
+### 10.2 利用者から見た動き
+
+- **改善ループが床で落ちたとき**: 候補の DD が上限 (既定 0.20) を超えていれば、pf / avg_r が合格でも承認依頼は作られず `unprofitable` で終わる (backlog は `observation`、従来の床不合格と同じ終端)。Discord には従来どおり `gate_failed` / `unprofitable` が届く。
+- **人間が見る面**:
+  - 親専有レポート (`data/improve_reports/`) に、落ちた条件ごとの 1 行 (`floor_failed: USDJPY drawdown_too_deep (max_drawdown=0.263 > 0.2)`、書式は §10.4) と、pair ごとの `max_drawdown` / `eval_bars` / 取引頻度の表が付く。`eval_bars` が無い旧 metrics は「未計測」と出て、頻度は検査されない。
+  - `afx plugin submit` は `ValueError` の文に、落ちた pair ごとの条件語・値・閾値 (`outcome.floor_detail`) を入れて拒否する。現状 `ValueError` は規則文と閾値 kv しか持たないので、これは新しい配線である (§10.4)。`afx plugin bless` は警告つきで承認依頼を作り、承認詳細の `floor_warning=unprofitable` / `floor_detail=…` に条件語が見える (payload は既に `floor_detail` を持つので追従は自動)。
+  - `activity.log` の `submit_floor_rejected` / `gate_failed` 行は候補ごとの理由を載せない。出るのは従来の規則文と閾値 kv (5 キー) だけ。
+  - Discord の床未達 pair 行への条件語 (`drawdown_too_deep` / `too_frequent` の 2 語だけ) の追加は T2 の末尾 sub-step (§10.7)。通知 code は増やさない。
+- **agent に見えるもの**: `run_backtest` の `submission_blocked` が `{"reason": "unprofitable", "detail": …}`。DD だけで落ちたときの `detail` は数値・閾値・条件語を含まない固定文 (「この成績では親ゲートが承認申請を出さず observation になります」)。pf / avg_r で落ちたときの `detail` は従来どおり。プロンプトの床の規則文にも DD / 頻度は載らない (J2)。agent に届く経路は RPC の `submission_blocked.reason == unprofitable` で、`improvement_backlog.last_result` は従来どおり `observation:not_submitted` のまま (床不合格は `project_last_result` が `not_submitted` に畳む既存の挙動。`unprofitable` を last_result に出さない)。
+- **既定の効き方**: キーを書いていない settings でも、DD 0.20 超の候補は今日から落ちる。許すなら `improve.gate.max_drawdown: null` か大きい値を書く。
+
+### 10.3 規則
+
+#### キー (`improve.gate`、任意キー、`schema_version` は上げない)
+
+| キー | 型 | 意味 | 既定 |
+|---|---|---|---|
+| `max_drawdown` | strict float (0, 1] または null | in-sample の pair 別 `max_drawdown` がこれを**超えたら**不合格。null で無効 | **0.20** |
+| `max_trades_per_eval_bar` | strict float (0, 1] または null | in-sample の pair 別 `trades / eval_bars` がこれを**超えたら**不合格。null で無効 | **0.25** (J1、2026-11-01 ユーザー裁定。null で無効) |
+
+- 値ちょうどは合格 (`pf < min_pf` と同じ向き)。範囲外 (0 以下、1 超)、bool、文字列、nan / inf は `ValidationError` (strict、§10.1)。
+- 取引頻度の上限が 1 なのは、1 評価バーで建てられるのが最大 1 件のため。
+- 「drawdown kill switch は config で無効化不可」(`risk.*`) とは別物。これは採用判断の品質基準で、緩めても実資金は動かない (§6 T3 と同じ整理)。
+
+#### 判定 (`_floor_fail_items`、`plugin/strategy_gate.py:89-123`)
+
+- 判定場所は既存の 1 箇所のまま。①→②→③の skip 順 (`strategy_gate.py:104-114`) は変えない。③を通った pair について、同じループの中で pf / avg_r / DD / 頻度を**互いに独立に**判定して項目を足す。現行は pf 不合格で `continue` するため (:119)、そのまま DD / 頻度を後ろに足すと pf も落ちた pair の DD / 頻度が記録されない。これを避けるため `continue` を外す。ただし avg_r は従来どおり pf が合格のときだけ見る (pf と avg_r の排他は維持。agent 面の `detail` が変わらないようにするため)。
+- 掛かるのは `scope == "in_sample"` だけ (holdout は掛けない)。`trades == 0` の pair は②で除外済みなので掛からない。
+- **測定値の型**: DD と `eval_bars` は、`bool` を除いた有限の数値 (int / float、nan / inf でない) のときだけ評価する。それ以外 (キー無し、`None`、`True` / `False`、文字列、nan / inf) は「未計測」として skip する (通す)。頻度の分子 `trades` も、`bool` を除く**非負の整数** (`int`) のときだけ使う。それ以外 (`True`、`"864"`、`864.0`、負数、`None`) のときは**頻度の判定だけ**を「未計測」として skip する (pf / avg_r / DD は従来どおり判定)。`True / 1938` を 1 取引と読んだり、`"864" / 1938` が例外になったりしないようにする`backtest_runs` の読み側の白リスト (`store/backtest_runs.py:49`) は bool / str も通すため、旧行や手編集 metrics の `eval_bars=True` や `"1938"` でここが曖昧になったり例外になったりしないようにする。
+- DD: `max_drawdown` キーが null でなく、測定値が有効で上限を超えたら不合格 (kind = `drawdown_too_deep`)。
+- 頻度: `max_trades_per_eval_bar` が null でなく、`eval_bars` が有効で 1 以上、かつ `trades` が上の型で `trades / eval_bars` が上限を超えたら不合格 (kind = `too_frequent`)。**未計測の pair は skip し、親専有レポートに「未計測」と出す** (通す)。
+- pf が不合格の pair でも DD / 頻度は判定して項目を足す (pf と DD が同時に落ちる pair は、両方の kind がレポートに出る)。
+- 戻り値の各項目に **kind** (閉じた集合: `pf` / `avg_r` / `holdout_not_evaluable` / `drawdown_too_deep` / `too_frequent`) を持たせる。現行の `(pair, message)` の 2 要素 tuple を kind つきの名前付き型に広げ、呼び出し元 (`_check_profitability_floor`、`improve_loop._render_floor_report_detail`) と既存 test の 2 要素 unpack を同じ task で更新する。**文字列の前置一致で分類しない**。
+- `floor_mode` は既存のまま: 改善ループと `submit` は enforce、`bless` は warn (落ちても警告つきで承認依頼を作る)。warn で in_sample が落ちた候補も holdout・baseline まで完走する (C2)。
+
+#### 固定語は人間面だけ、agent は `unprofitable`
+
+- `_check_profitability_floor(per_pair, *, settings, scope, audience="human")` に `audience` を足す。label は常に `""` か `"unprofitable"` (新条件でも同じ)。
+  - `audience="human"` の `detail` は全 kind の理由 (条件語・値・閾値)。`GateOutcome.floor_detail` を通して `ValueError` 文 (submit)、bless の approval payload (`floor_detail`)、親専有レポートに使う。**`ValueError` 文への配線は新規**: `switch.py:1369-1370` は今 `floor_rule_text` と `floor_settings_kv` しか使わず `outcome.floor_detail` を読まないので、このままでは条件語は表示されない。`outcome.floor_detail` を文に足す。**activity (`submit_floor_rejected` / `gate_failed`) には使わない**: 行は従来の規則文と閾値 kv だけで、候補ごとの値や条件語は載せない。
+  - `audience="agent"` の `detail` は kind が `pf` / `avg_r` の理由だけ。新条件だけで落ちたときは空文字になり、`run_backtest_handler` (`improve_loop.py:1703-1710`) が固定文 (数値なし) を `detail` にする。label は新条件だけで落ちても `unprofitable` を返すので、`submission_blocked` は出る。
+- `run_backtest` の返却 `metrics` (`_backtest_reply_from_save_kwargs`、`improve_loop.py:255`) から **`eval_bars` を除く**。in-sample 期間の長さ (遮断 7: 期間端点を見せない) を足数から推定させないため。台帳 (`save_kwargs`) には残す。
+- `floor_rule_text(audience="agent")` (`strategy_gate.py:281-320`) は新条件を含めない (`require_holdout_evaluable` と同じ扱い)。`audience="human"` は含める。
+
+#### 閾値の記録
+
+- `ImproveGateSettings.snapshot()` (`config.py:347-361`) を 3 キー → 5 キーに広げる (末尾に `max_drawdown` / `max_trades_per_eval_bar`)。`floor_settings_kv` (`strategy_gate.py:266-278`) はその順で出す。approval payload の `profitability_floor`、activity の `gate_failed` 行 (と `submit_floor_rejected` 行の kv)、レポートの `thresholds:` 行は `snapshot()` / `floor_settings_kv` が唯一の所有者のまま。
+
+### 10.4 配線表
+
+| ファイル | 変更 |
+|---|---|
+| `plugin/strategy_gate.py` | `_floor_fail_items` (:89-123) に 2 条件と kind。pf 不合格の `continue` (:119) を外し、pf / avg_r / DD / 頻度を独立に append (avg_r は pf 合格時のみ)。DD / `eval_bars` は bool 除外の有限数値だけ評価。`_check_profitability_floor` (:126-148) に `audience`。`floor_settings_kv` (:266) / `floor_rule_text` (:281) の追従 (human のみ新条件) |
+| `config.py` | `ImproveGateSettings` (:335-361) に 2 キー (範囲検査)、`snapshot()` を 5 キーへ |
+| `config/settings.yaml.example` | `improve.gate` (:110-117) に 2 キーをコメント付きで追記 (DD は既定 0.20 と無効化の書き方、頻度は null と「再実測後に決める」旨)。`tests/fixtures/settings_examples/v5.yaml` は example と byte 一致を保つので同じ追記。`config/settings.yaml` (gitignore) は指揮者が配備時に同期 |
+| `backtest/runner.py` | `BacktestResult` (:136-147) に `eval_bars: int = 0`。`pending_proposal = intent_source(closed_bar)` (:476) を実行した回数を数え、`BacktestResult` (:500-507) に載せる |
+| `backtest/metrics.py` | `compute_metrics` (:109-144) が trades 0 の分岐を含め両方で `eval_bars` を返す。`METRIC_KEYS` (:28-31) に追加 |
+| `store/backtest_runs.py` | 保存は `metrics` dict をそのまま JSON 化。読み側の白リスト (`_filter_metrics` :52-55、`in_sample_view` :190、`latest_in_sample_metrics` :217) は `METRIC_KEYS` 経由なので自動で追従 (旧行はキー欠落のまま)。`_COMPARE_METRIC_KEYS` (`strategy_gate.py`) は広げない |
+| `tests/backtest/golden/golden-v3.json` | 再生成。差分は metrics ブロックの `eval_bars` 1 キーの追加だけ |
+| `loops/improve_loop.py` | `run_backtest_handler` (:1703-1710) が `audience="agent"` で固定文を組む。返却 `metrics` から `eval_bars` を除く (:255)。`_render_floor_report_detail` (:4563-4614) に条件別 1 行と `### floor_conditions` 表を、**最後の表の後ろに**追記。`_FLOOR_REPORT_METRIC_KEYS` (:4559) は 8 キーのまま |
+| `loops/improve_loop.py` の `FloorPairRow` (:629) / `parse_floor_report` (:736-800) | `FloorPairRow` に `conditions: tuple[str, ...] = ()` を足す。`parse_floor_report` は最後の表の後ろから `### floor_conditions` を探して下記の形式で strict に読む。節が無ければ全 pair が空条件 (現状は末尾を未検査で捨てる。旧レポートと既存 fixture は同じ `FloorDetail` に読める) |
+| `plugin/switch.py` | `ValueError` 文 (:1369-1370) に `outcome.floor_detail` を足す (**新規配線**。今は `floor_rule_text` と `floor_settings_kv` だけ)。`submit_floor_rejected` activity (:1366-1368) は変えない (規則文 + kv、候補ごとの detail は載せない)。payload `profitability_floor` (:1471, :2433) は `snapshot()` で追従、bless の `floor_detail` (:2432) は既に配線済みで human detail に追従 |
+| `commands.py` (:918-931) | 承認詳細は `floor_detail` をそのまま出すので変更なし (表示確認の test のみ) |
+| `ops/service.py` (`_floor_of` :960-997) と afx-ops (`gate/improve_render.py:244-252`) | **T2 の末尾 sub-step**: `_floor_of` は pair の dict に `conditions` を**空でないときだけ**足す (旧レポートは出力が byte 同一)。afx-ops の `_floor_lines` は `conditions` があれば pair 行の末尾に固定の日本語ラベルを付ける。kind は閉じた集合 `{drawdown_too_deep, too_frequent}` で、afx-ops は語一致 test で同期し、集合外の語は表示しない。通知 code (`NOTICE_UNPROFITABLE`、`improve_notice_codes.py:60`) は増やさない |
+| `scripts/reevaluate_approvals.py` (:18-24, :52-70, :89-105) | 現状は `_GATE` が新既定 (DD 0.20) を継承する一方、`_metric` が `max_drawdown` を落とすので、DD を含む旧 payload でも DD 判定だけ黙って skip する。**DD を正規化して (bool 除外の有限数値、無ければ未計測) 新基準で再評価し、出力に旧 3 条件の判定と新基準の判定を別の列で並べる**。`_verdict` の `holdout_not_evaluable` 文字列一致は kind に置き換える。read-only は維持 |
+
+#### `### floor_conditions` の形式 (親専有レポート、strict)
+
+最後の表 (holdout 段があれば holdout 表、無ければ in_sample 表) の後ろに、見出し `### floor_conditions` を**ちょうど 1 回**置く。続けて空行、下の表、その後ろに条件別 1 行 (`floor_failed: …`) を並べる。この行は人間向けの補助文で、**parser は読まない・契約にも含めない**が、複数 pair でも一意に読めるよう書式を固定する (下記)。
+
+```
+### floor_conditions
+
+| pair | max_drawdown | eval_bars | trades_per_eval_bar | failed_kinds |
+|---|---|---|---|---|
+| USDJPY | 0.263 | 1938 | 0.446 | drawdown_too_deep, too_frequent |
+
+floor_failed: USDJPY drawdown_too_deep (max_drawdown=0.263 > 0.2)
+floor_failed: USDJPY too_frequent (trades_per_eval_bar=0.446 > 0.25)
+```
+
+`floor_failed:` 行の書式: `floor_failed: <pair> <kind> (<名>=<値> > <閾値>)`。落ちた (pair, kind) ごとに 1 行。並びは表の pair 順、同じ pair 内は `drawdown_too_deep`、`too_frequent` の順。名は `max_drawdown` / `trades_per_eval_bar`。値は小数 3 桁 (`{:.3f}`)、閾値は設定値を `{:g}` で書く。pf / avg_r の不合格は従来の行のままで、この書式には入れない。
+
+- 行は in_sample 表の pair と同じ順・同じ集合 (trades 0 の pair も含む)。列は上の 5 列固定。
+- `max_drawdown` / `eval_bars` / `trades_per_eval_bar` は有限数値、または未計測のとき `未計測`。`failed_kinds` は閉じた集合 `drawdown_too_deep` / `too_frequent` をこの順に `, ` で連結、無ければ `-`。同じ pair の pf / avg_r の不合格は別の列 (`failed`) が持つので、ここには入れない。
+- parser は、節が無ければ空条件。節があって形が崩れている (見出し 2 回、列違い、集合外の語、重複、行の pair が in_sample 表と食い違う、`failed_kinds` が空でない pair が in_sample 表の `failed` 列で False) ときは**全体を `None`** にする (部分出力しない)。`failed` 列の無い旧形式に節があるのも崩れとして扱う。
+- 読んだ `failed_kinds` は in_sample 段の `FloorPairRow.conditions` に入る。holdout 段の行は常に空。
+
+レポートの追記を最後の表の後ろに置くのは、`parse_floor_report` が `thresholds:` の直後から `### in_sample` を要求し、表の見出しを `_FLOOR_REPORT_METRIC_KEYS` で検査するため。途中に行を足す・列を増やすと、公開済みレポートも含めて `None` になり (`ops/service.py:979`)、web / Discord の床の数値が消える。
+
+### 10.5 受入条件 (観測可能)
+
+1. `improve.gate` の 2 キーを省いた settings が読め、`max_drawdown == 0.20` / `max_trades_per_eval_bar == 0.25`。範囲外 (0、負、1 超) は `ValidationError`、null は通る。**strict**: `max_drawdown` / `max_trades_per_eval_bar` に `true` / `false`、`"0.2"`、`.nan`、`.inf` を書くと `ValidationError` (`true` が 1.0 として DD の門を無効にしない)。整数 `1` は通る。example 追記後も v5.yaml と byte 一致。
+2. 既定 0.20 で、#84 相当 (pf 1.002 / avg_r 0.004 / DD 0.263 / trades 864) の in-sample 行: 改善ループは承認依頼を作らず (agent への経路は `run_backtest` の `submission_blocked.reason == unprofitable`、backlog `last_result` は既存どおり `observation:not_submitted` で `unprofitable` は出ない)、`submit` は `ValueError` で、その文に `drawdown_too_deep` と値 (`max_drawdown=0.263`) が入る (`outcome.floor_detail` の配線)、`bless` は承認依頼を作って `floor_warning == "unprofitable"` / `floor_detail` に `drawdown_too_deep`。
+3. 承認済み 11 本相当 (DD ≤ 0.150) は通る。DD 0.20 ちょうどは通り、0.2000001 は落ちる。`max_drawdown: null` なら DD 0.99 でも通る。
+4. 既定 (`max_trades_per_eval_bar: 0.25`) で `trades / eval_bars == 0.25` は通り、超えで落ちる。null を明示すると `eval_bars` が極端でも verdict 不変。`eval_bars` の無い metrics は通り、レポートに「未計測」が出る。DD と `eval_bars` が bool (`True`)、文字列 (`"1938"`)、nan / inf、`None` のときも例外にならず「未計測」として通る (bool は 1 とみなされない)。`trades` が bool (`True`)、文字列 (`"864"`)、float、負数、`None` のときも、頻度だけが「未計測」で skip され例外にならず、pf / avg_r / DD の判定は変わらない (`True` は 1 取引と評価されない)。
+5. holdout 段には掛からない: holdout の `max_drawdown` / `eval_bars` / `trades` を極端値にしても verdict 不変 (F10 の分割、§8)。
+6. agent 面: DD のみ不合格のとき `submission_blocked == {"reason": "unprofitable", "detail": <固定文と完全一致>}`。`detail` に数字・閾値・pair 名・`drawdown_too_deep` / `too_frequent`・「holdout」が無い。pf / avg_r 不合格の `detail` は従来の文のまま。`run_backtest` 返却の `metrics` に `eval_bars` が無い。`floor_rule_text(audience="agent")` と改善プロンプトに DD / 頻度の閾値・語が無い。`audience="human"` には現れる。`last_result`・activity の `gate_failed` 行の理由・INDEX に新語が無い (閾値 kv の `max_drawdown=` は除く)。`submit_floor_rejected` と `gate_failed` の activity 行は候補ごとの値・pair・条件語を持たず、規則文と閾値 kv だけである (DD で落ちた候補と pf で落ちた候補で行の形が変わらない)。
+7. 親専有レポートに条件別 1 行と `### floor_conditions` 表 (max_drawdown / eval_bars / 取引頻度 / 落ちた条件) が出る。`_FLOOR_REPORT_METRIC_KEYS` は 8 キーのまま。`tests/fixtures/improve_reports` の既存レポートが無改変で同じ `FloorDetail` に読め (全 pair の `conditions` が空)、新形式のレポートも読める。形式は §10.4「`### floor_conditions` の形式」。
+8. activity の `gate_failed` 行 (`floor_settings_kv`) と approval payload の `profitability_floor` が 5 キーになる。**3 キー固定の既存 pin を更新する**: `tests/plugin/test_strategy_gate_floor.py:261` (`floor_settings_kv` の順と書式)、`tests/loops/test_improve_prompt_objective.py:206` と `tests/loops/test_improve_loop_approval_and_ledger.py:52` (`profitability_floor` payload)、`tests/test_config.py:1024-1046` (F8-1 の既定値、F8-2 の example キー集合)、`tests/backtest/test_metrics.py:62-66` (trades 0 の返却 dict に `eval_bars`)、`tests/backtest/test_golden_diff_v2_v3.py:28` (classifier が追加 metric を `kill_switch_latches` 1 個と固定しているので、許容集合を `{kill_switch_latches, eval_bars}`、`added_metric_keys` を 2 に直し、`eval_bars` の型 int の変異 case を足す)、F6-11a / F8-6 / `test_improve_e2e` の閾値行。**旧 approval payload を使う fixture (3 キーの `profitability_floor`) は歴史データなので 3 キーのまま残す** (旧 payload が読めることの pin)。
+9. 通知: 新条件の不合格は (`gate_failed`, `unprofitable`) で届き、`ALLOWED_PAIRS` が増えない。afx-ops の語表同期 test が緑。
+10. **`eval_bars` は runner が `intent_source` を呼んだ回数と一致する**: 週末・市場クローズ・`closed_bar is None` を含む replay fixture で、`intent_source` の spy の呼び出し回数 == `BacktestResult.eval_bars` == `metrics["eval_bars"]`。trades 0 の run でも `eval_bars` が入る。`METRIC_KEYS` と `compute_metrics` の返却キーが一致 (既存の集合一致 test)。保存→`in_sample_view` の読み戻しで残り、旧行 (キー無し) は欠落のまま読める。
+11. golden: `golden-v3.json` を再生成し、旧との機械 diff が metrics ブロックの `eval_bars` 1 キーの追加だけ。byte 一致 test が緑。
+12. **T1 の新規 in-sample 実行と manifest**: 13 件それぞれに、現行条件で新規に回した in-sample 実行の manifest 項目があり (§10.7)、その行は `eval_bars` を持つ新しい backtest_runs 行である。manifest は新規実行の run id / `content_hash` / artifact の場所 / pair・timeframe / `source`・`base_interval` / 実行時 `now` と算出された start・end / `settings_hash` / `core_commit` を持つ。元行は参考列で、一致は求めない。再実行できなかった項目 (artifact 欠落、履歴不足) は理由つきで列挙し、J1 の根拠から外す。manifest と表は in-sample の値だけで、holdout の値・期間を含まない。実行は holdout の行を作らない。
+13. 単一所有者 (F9): `_check_profitability_floor` の 3 呼び出し元 spy が `audience` も含めて通る。
+14. **pf と DD の同時不合格**: pf < `min_pf` かつ DD が上限超の pair の fixture で、`_floor_fail_items` が両 kind を返し、親専有レポートの `failed_kinds` に `drawdown_too_deep` が出て、agent 面の `detail` は pf の理由だけである。pf と avg_r が両方落ちる pair は従来どおり pf だけが項目になる。
+15. **`### floor_conditions` の strict 読み**: §10.4 の形式で、(a) 節なしの旧レポートは全 pair 空条件、(b) 正しい新形式は `conditions` が入る、(c) 見出し 2 回・列違い・集合外の語・重複・pair 不一致・`failed` 列と食い違う `failed_kinds` は全体 `None`。`ops/service._floor_of` は空条件の pair に `conditions` キーを出さない (旧レポートの出力が byte 同一)。afx-ops は 2 語の日本語ラベルを語一致 test で同期し、集合外の語を表示しない。
+16. **`scripts/reevaluate_approvals.py`**: DD を含む旧 payload (DD 0.263) で、旧 3 条件の列は合格、新基準の列は DD 超過と出る。DD が無い・bool・非有限の payload は新基準でも未計測として skip する。read-only は維持。`tests/scripts/test_reevaluate_approvals.py` を更新。
+17. 変異 (すべて pin が赤になること): (a) `>` を `>=` にする、(b) 新条件を判定する場所を呼ばず複製する、(c) in_sample 以外にも掛ける、(d) agent 面の `detail` に数値・条件語を入れる、(e) `eval_bars` を agent 返却 `metrics` に残す、(f) レポートの追記を最後の表の前に置く (parser pin)、(g) `eval_bars` 無しを不合格にする、(h) pf 不合格の `continue` を戻して DD / 頻度を判定しない、(i) bool / 文字列 / nan の `eval_bars` を数値として評価する、(j) `ValueError` 文に `floor_detail` を入れない、(k) `submit_floor_rejected` / `gate_failed` activity に候補ごとの detail を入れる、(l) `reevaluate_approvals` が `max_drawdown` を落とす、(m) bool / 文字列の `trades` を頻度の分子に使う、(n) 設定 2 キーの strict を外し bool / 文字列を受理する。
+
+### 10.6 残余
+
+- **選択バイアス**: 閾値は承認済み 11 本 (人間が選んだ生存者) と reject 1 件 (#84) の間に置いた。DD 0.20 が通る/落ちる境界は 1 件の観測に依存し、別の形の薄い戦略には効かないかもしれない。T1 の新規 in-sample 実行の 13 本で多少は確かめる (実行できなかった項目は数えない)。
+- **pf 1.002 / avg_r 0.004 という薄さ**は床 (pf ≥ 1.0) の仕様どおりで、本節の対象外。`min_pf` を上げる案は別 (`min_pf` は既に任意キー)。
+- **pair 別 `min_trades`** は評価可能性の条件で、別ゲートの候補 (収益性の床とは混ぜない)。実測では床通過 110 件中 6 件が pair 別 30 未満、承認済みの最小は 39。
+- **kill switch 回数**は床に入れない。承認済み 11 本は latches 2〜75 で、取引数に比例する。選別の代理にならない限り、表示だけを続ける。
+- **agent が理由を知らない**: DD だけで落ちた候補は、agent から見ると pf / avg_r が合格なのに `unprofitable` になる。mission 内の再試験 (上限 6 回) を無駄にしうる。これは遮断契約を 1 bit に保つ代償として受け入れる (J2 裁定済、§10.8)。
+- **頻度の分母は評価バー全体**: 市場オープンで `closed_bar` が得られたバーだけを数える。戦略が内部で skip したバー (`skipped_bars_by_reason`) も分母に入る (判定機会はあったが戦略が見送ったバー)。
+
+### 10.7 task 表
+
+| # | task | 担当 | 触るもの | 規模 | 依存 |
+|---|---|---|---|---|---|
+| T1 | **eval_bars 計測 + 再実測**: `BacktestResult` / `compute_metrics` / `METRIC_KEYS` / golden 契約 (§10.5 の 10・11)。再実測は承認済み 11 本 + #84 + DD で落ちるもう 1 本の計 13 本を、現行条件で in-sample だけ新規に回す **driver** と、その **manifest** (下記) を成果物にする (元行の再現は求めない、§10.1)。manifest の新規実行の値 (`eval_bars` / trades / 頻度 / DD) の表で J1 の頻度閾値を提示する | codex terra | `backtest/{runner,metrics}.py`、golden、test、`scripts/` の driver | 約 260 / 330 | なし |
+| T2 | **床 / 設定 / レポート / 漏洩 pin**: 2 キー、`_floor_fail_items` の 2 条件と kind、`audience`、agent 面の固定文、`eval_bars` の返却除外、`snapshot()` 5 キー、example / v5.yaml、`ValueError` への `floor_detail` 配線、レポート追記と parser (`FloorPairRow.conditions`)、`scripts/reevaluate_approvals.py` の新基準化、3 キー固定 pin の更新 (§10.5 の 8)、§10.5 の 1〜9・13〜17。末尾 sub-step: ops / Discord の条件語 (肥大したら T3 に切る。床の動作は不変) | codex terra | `config.py`、`plugin/strategy_gate.py`、`plugin/switch.py`、`loops/improve_loop.py`、`config/settings.yaml.example`、`tests/fixtures/settings_examples/v5.yaml`、`scripts/reevaluate_approvals.py`、(末尾) `ops/service.py`・afx-ops | 約 220 / 400 | T1 |
+
+判定 (pytest) は指揮者が回す。実 kernel / systemd は触らないので sonnet は不要。T1 の再実測は in-sample の replay を回し、backtest_runs に新規行を足すだけで、plugin・approval・backlog を変更しない。
+
+#### T1 の manifest (J1 の根拠表)
+
+13 件それぞれについて、次を 1 項目として列挙する。成果物は `tmp/` 配下 (gitignore、戦略名と hash を含むためコミットしない)。driver は `scripts/` に置く。plugin と履歴 DB は read-only で開き、書くのは新規の in-sample 行だけ。
+
+- 識別: 戦略名、`content_hash`、immutable な artifact の場所 (`plugins/_archive` 等) とその hash、承認 # (#84 と DD で落ちるもう 1 本は元の backtest_runs の id)。
+- 新規実行の条件: 新しい backtest_runs 行の run id、pair 集合と timeframe、履歴源 (`source`) と `base_interval`、**実行時の `now` と、そこから `run_in_sample` が算出した start / end** (算出結果を記録する。入力として指定しない)、現在の `settings_hash`、現在の `core_commit`。
+- 結果 (新規実行): `eval_bars` / trades / 頻度 / DD。J1 の根拠はこの値。
+- 参考列 (元行): 元の in_sample 行の `trades` / `max_drawdown` / `created_at`。並べるだけで、一致の判定はしない。
+- 除外: artifact 欠落、履歴の不足など再実行できない理由。除外した項目は J1 の根拠に使わない。
+
+出力は in-sample だけで、holdout の値・期間は含めない。
+
+### 10.8 裁定
+
+**裁定済み**
+
+- DD の既定は **0.20 で有効、設定で変更可** (2026-11-01 ユーザー)。
+- **J2 agent に DD の条件を見せるか: 見せない** (裁定済 2026-11-01、指揮者: 既存遮断契約の維持)。agent は in-sample の DD 値を既に見るが、閾値や条件節まで返すと値をどちらへ動かせば通るかを教える決定論的 oracle になる。条件語を伏せても数値と閾値で同じ漏れで、1 bit (`unprofitable`) の維持ではなく遮断契約の変更になる。旧推奨 (A: DD の数値と閾値だけの条件節を agent に見せる) は採らない。A を採るなら実装の小変更でなく、§4 の脅威モデルと §10.2 / §10.5 の 6 を改訂する利用者裁定として扱う。頻度の閾値と条件語も同じく見せない。
+
+**指揮者の既定 (裁定不要と判断)**
+
+- kill switch 回数は床に入れない (report-only 維持、U3 の latches 部分と F10 の latches pin は不変)。
+- scope は in-sample のみ。pair 別 `min_trades` は床に入れない。
+- 通知 code は増やさず `unprofitable` に束ねる。
+
+- **J1 取引頻度の閾値: 0.25 で有効、設定で変更可** (2026-11-01 ユーザー裁定)。T1 の新規 in-sample 実行 13 本 (除外 0) で、承認済み 11 本は 0.005〜0.113 (最大 #72)、#84 は 0.447 (864 / 1931)。0.25 は承認済み最大の約 2.2 倍、#84 の約 0.56 倍。落ちる側の観測は #84 の 1 件だけ (13 本目は #84 の lock 前の同一戦略)。承認済みは 1h 足、#84 は 4h 足で分母が違う。
+
+**未裁定**: なし。
+
+---
+
 ## 変更履歴
 
 | 日付 | 版 | 変更 | 理由 | commit |
@@ -512,3 +752,8 @@ F1-4 (`trades>0, pf=None`) / F1-8 (enforce で holdout を回さない) / F2-4 (
 | 2026-09-12 | v1.3 | codex 設計レビュー 3 周目 3 件 (Important 2 / Minor 1) を全件反映。**v1.3 で実装着手可** (codex 収束判定)。R3-I1 = T1-c に残っていた旧契約「`run_kind_gate(..., floor_mode="enforce")` が `floor_reason` 時に `ValueError`」を削除し「`run_kind_gate` は `GateOutcome` を返し raise しない / `_run_full_gate` が `verdict_kind` と `floor_mode` から決める」に統一 (enforce/warn の対応表は T1-d に一本化、`floor_mode` を evaluator へ渡す理由 = C2 の完走のためと明記。同旨の残存を grep で 0 件確認) / R3-I2 = F6-11 を (a) `submit_candidate` 層 (イベント・閾値 3 値・`activity=None` 後方互換) と (b) **CLI 層 spy pin** (`_plugin_submit --from _human` が `ActivityLog(root/"logs"/"activity.log")` 相当を `activity=` に渡す) に二分 — (a) だけでは CLI 配線欠落を検出できない / R3-M1 = F6-12 新設 (`run_kind_gate` の fake が `record_fn` に 1 行積んだ後に contract 外例外を投げるケースで、その行が `gate_failed` で保存され元例外が伝播 / 規定 `ValueError` へ変換され、`unprofitable` にならない) | codex 設計レビュー 3 周目 `tmp/design-profitability-floor/codex-design-r3.md` (gpt-5.6-sol、v1.2 = 8ef4694)、指揮者裁定 2026-09-12 (全件採用) | - |
 | 2026-09-13 | v1.4 | 実装レビューでの設計微修正: `GateOutcome.floor_failed` を削除し判別子は `verdict_kind` のみ (冗長) / 閾値 snapshot は `ImproveGateSettings.snapshot()` が所有 / フロア規則の文言は `strategy_gate.floor_rule_text(gate, audience="agent"|"human")` が所有し、**agent 向けには `require_holdout_evaluable` 条件を出さない** (遮断 8、§4)、human 向け (CLI 警告・ValueError・activity) には出す / `run_kind_gate(sink=)` で呼び出し元が行 sink を渡せる | `/code-review high` 2 周目 8 件 (`tmp/review-20260912-pf/code-review-r2.md`) の裁定 | 684fb31 |
 | 2026-09-13 | v1.5 | §4 ただし書きの**再評価を実施 (ユーザー指示)、例外は維持**。根拠: run17〜19 (#81〜#84) で `holdout` の語・数値・段名は prompt に 0 件、run19 観測 D (#84 が #83 とビット一致の候補を再提出) は「holdout 寄りへの体系的収束」ではなく無差別な再現 — 1 bit は agent 自筆 note (#74「提出条件を満たした」) に負けて学習に使われなかった。是正は note 衛生 / 再提出抑止の側 ([floor-path-skips-duplicate-metrics] 裁定へ)、質検査母集団の拡張は偽陽性再導入のため採らない。追加観測点: `unprofitable` 後の候補がパラメータ空間で単調変化しているか (二分探索の形) | `tmp/floor-dup-ticket/{materials,reevaluation}.md` | - |
+| 2026-11-01 | v1.6 | §10 追加: 床に in-sample の max DD 上限 (`improve.gate.max_drawdown` 既定 0.20、有効、null で無効) と取引頻度上限 (`max_trades_per_eval_bar` 既定 null、`eval_bars` 計測後に別裁定) を任意キーで追加。**U3 / F10 の部分改訂** (DD のみ。kill switch 回数は床に入れず report-only、latches の不変 pin は残す)。pair 別 `min_trades` は床に入れない。agent 面は `unprofitable` 1 語のまま、条件別の語は親専有レポートと人間面だけ。レポートの追記は `parse_floor_report` を壊さないよう最後の表の後ろ。2 task (T1 計測 → T2 床) | #84 (承認依頼、人間が reject) の実測 (DD 0.263、頻度 0.446)、直近 60 日の実 DB 分布 (床通過 110 件、承認済み 11 本)、sol の前提確認、ユーザー裁定 2026-11-01 (DD 既定 0.20 有効) | - |
+| 2026-11-01 | v1.6.1 | §10 に床拡張レビュー 1 周目 (Critical 1 / Important 5 / Minor 1) を全件反映。T1 は 13 件の read-only manifest + 再測定 driver を成果物にし、非再現は J1 の根拠から外す (§10.1 / §10.7) / `_floor_fail_items` は pf 不合格の `continue` を外して pf・DD・頻度を独立に append (avg_r は pf 合格時のみで agent 面の `detail` は不変) / `ValueError` に `floor_detail` を配線、`submit_floor_rejected` と `gate_failed` activity は規則文と閾値 kv だけ (§10.3 と §10.5 の 6 の矛盾を解消) / `### floor_conditions` の strict 形式と `FloorPairRow.conditions`、`_floor_of` / afx-ops は閉じた 2 語 (§10.4) / 3 キー固定 pin の更新一覧 (§10.5 の 8) / `reevaluate_approvals.py` は DD を正規化して新基準で再評価し旧 3 条件の列と並べる / DD・`eval_bars` は bool 除外の有限数値だけ評価、他は未計測で skip / **J2 は裁定済: DD の条件語・閾値を agent に見せない** | `tmp/review-floor/r1-terra.md` (terra)、`r1-rulings.md` (指揮者裁定 2026-11-01、全件採用) | - |
+| 2026-11-01 | v1.6.2 | §10 に床拡張レビュー 2 周目 (Critical 1 / Important 2 / Minor 3) を全件反映。**T1 の再測定を「元行の再現」から「現行条件での新規 in-sample 実行」に再定義** (`run_in_sample` が now と現在の settings から期間を再計算する事実を §10.1 に、元行との一致は求めず参考列にする。manifest は新規実行の条件を記録、§10.5 の 12・§10.7) / 頻度の分子 `trades` も bool 除外の非負整数に限定し、不正値は頻度だけ未計測 skip (§10.3、§10.5 の 4・17m) / 設定 2 キーは strict float (bool・文字列・nan / inf は ValidationError、`_Strict` が型強制を止めない事実を §10.1 に、§10.5 の 1・17n) / `floor_failed:` 行の書式を固定し parser は読まない補助文と明記 (§10.4) / 文書タイトルを v1.6.2 に / §0・§2・§3 の「DD は門にしない」を歴史記述と現行規則 (§10) に分けて書き直し | `tmp/review-floor/r2-sol.md` (sol)、`rev2-brief.md` (指揮者裁定 2026-11-01、全件採用) | - |
+| 2026-11-01 | v1.6.3 | J1 裁定: `max_trades_per_eval_bar` 既定 0.25 で有効 (設定可)。T1 再実測 13 本の分布を §10.8 に。`get_signals` (tools/signal_tools.py:147) も `eval_bars` の除外対象に加える (T2) | T1 の再実測、ユーザー裁定 | - |
+| 2026-11-02 | v1.6.4 | 床拡張 T2 レビュー 1 周目: agent に見える経路は `submission_blocked.reason == unprofitable` (RPC) であり、`last_result` は既存の `observation:not_submitted` のまま、と §10.2 / §10.5-2 の文言を実装側 (`improve_context.project_last_result`) に合わせて訂正 | `tmp/review-floor/t2-r1-terra.md` (指揮者裁定 2026-11-02、コードは変えない) | - |

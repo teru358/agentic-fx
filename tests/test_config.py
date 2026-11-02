@@ -1029,6 +1029,25 @@ def test_floor_config_defaults_f8_1():
     assert s.min_pf == 1.0
     assert s.require_positive_avg_r is True
     assert s.require_holdout_evaluable is False
+    assert s.max_drawdown == 0.20
+    assert s.max_trades_per_eval_bar == 0.25
+
+
+@pytest.mark.parametrize("key", ["max_drawdown", "max_trades_per_eval_bar"])
+@pytest.mark.parametrize("value", [0, -0.1, 1.0001, True, False, "0.2",
+                                    float("nan"), float("inf")])
+def test_floor_config_new_limits_are_strict_optional_unit_floats(key, value):
+    from agentic_fx.config import ImproveGateSettings
+    with pytest.raises(ValidationError):
+        ImproveGateSettings(**{key: value})
+
+
+def test_floor_config_new_limits_accept_null_and_yaml_integer_one():
+    from agentic_fx.config import ImproveGateSettings
+    assert ImproveGateSettings(max_drawdown=None,
+                               max_trades_per_eval_bar=None).snapshot()["max_drawdown"] is None
+    assert ImproveGateSettings(max_drawdown=1,
+                               max_trades_per_eval_bar=1).max_drawdown == 1.0
 
 
 def test_floor_config_example_keys_match_settings_type_f8_2():
