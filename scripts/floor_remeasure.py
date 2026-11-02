@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -93,17 +94,26 @@ def _usable_metrics(raw: object) -> dict | None:
         return None
     if not isinstance(m, dict) or not {"trades", "pf", "avg_r"} <= set(m):
         return None
+    trades = m["trades"]
+    if type(trades) is not int or trades < 0:
+        return None
+    for key in ("pf", "avg_r"):
+        value = m[key]
+        if value is None:
+            continue
+        if type(value) not in (int, float) or not math.isfinite(value):
+            return None
     return m
 
 
 def _is_deep_drawdown_candidate(per_pair: dict, *, settings) -> bool:
-    """pf / avg_r / 取引数の床は通るが、DD の上限だけ超える。判定は実際の床と同じ関数。"""
+    """DD の上限だけ超え、他の床 (pf / avg_r / 取引頻度など) は通る。判定は実際の床と同じ関数。"""
     trades = [m["trades"] for m in per_pair.values()]
     if any(type(t) is not int for t in trades) or sum(trades) < EVALUABLE_MIN_TRADES:
         return False
     kinds = {item.kind for item in _floor_fail_items(
         per_pair, settings=settings, scope="in_sample")}
-    return "drawdown_too_deep" in kinds and not kinds & {"pf", "avg_r"}
+    return kinds == {"drawdown_too_deep"}
 
 
 def select_deep_drawdown_candidate(

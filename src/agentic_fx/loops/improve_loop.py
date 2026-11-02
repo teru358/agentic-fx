@@ -832,15 +832,6 @@ def _parse_floor_report(text: str, mission_id: int) -> FloorDetail:
             i += 1
         if set(conditions) != set(in_sample_pairs):
             raise ValueError("condition pairs")
-        while i < len(lines) and lines[i] == "":
-            i += 1
-        for pair, kinds in conditions.items():
-            for kind in kinds:
-                if i >= len(lines) or not lines[i].startswith(f"floor_failed: {pair} {kind} ("):
-                    raise ValueError("condition detail")
-                i += 1
-        if i != len(lines):
-            raise ValueError("condition trailing")
     elif with_failed:
         raise ValueError("conditions missing")
     stages: list[FloorStage] = []

@@ -358,6 +358,21 @@ def test_conditions_section_rejects_inconsistent_rows(loop_min, mutation):
     assert parse_floor_report(mutated, mission_id=MID) is None
 
 
+@pytest.mark.parametrize("mutation", [
+    lambda t: "\n".join(l for l in t.split("\n") if not l.startswith("floor_failed:")),
+    lambda t: t.replace("max_drawdown=0.263 > 0.2", "edited by hand"),
+    lambda t: t.rstrip("\n") + "\nfree-form note\n",
+], ids=["lines_missing", "lines_edited", "trailing_text"])
+def test_floor_failed_helper_lines_are_not_part_of_the_contract(loop_min, mutation):
+    text = _two_pair_conditions_text(loop_min)
+    assert "floor_failed: USDJPY drawdown_too_deep" in text
+    mutated = mutation(text)
+    assert mutated != text
+    detail = parse_floor_report(mutated, mission_id=MID)
+    assert detail is not None
+    assert detail.stages[0].pairs[0].conditions == ("drawdown_too_deep",)
+
+
 def test_new_format_report_without_conditions_section_is_rejected(loop_min):
     text = _two_pair_conditions_text(loop_min, second_fails=True)
     cut = text[:text.index("### floor_conditions")].rstrip("\n") + "\n"

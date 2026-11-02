@@ -103,6 +103,25 @@ def test_deep_drawdown_candidate_needs_floor_pass_and_dd_over_limit(tmp_path):
         "1" * 64, "deep_one", wanted, f"run-{wanted}", "deep_drawdown")
 
 
+def test_deep_drawdown_candidate_excludes_a_hash_that_also_fails_frequency(tmp_path):
+    conn = _conn(tmp_path)
+    both = _run(conn, content_hash="a" * 64, dd=0.30, trades=100)
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE id=?", (json.dumps(
+        {"trades": 100, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.30,
+         "eval_bars": 100}), both))
+    conn.commit()
+    assert floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS) is None
+    only_dd = _run(conn, content_hash="b" * 64, dd=0.30, trades=100)
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE id=?", (json.dumps(
+        {"trades": 100, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.30,
+         "eval_bars": 100000}), only_dd))
+    conn.commit()
+    target = floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS)
+    assert target is not None and target.source_row_id == only_dd
+
+
 def test_deep_drawdown_candidate_dd_boundary_is_strictly_over(tmp_path):
     conn = _conn(tmp_path)
     _run(conn, content_hash="a" * 64, dd=0.20)
@@ -389,3 +408,35 @@ def test_run_target_failure_in_dry_run_is_not_marked_partial(monkeypatch, tmp_pa
     assert saved == [] and record["partial_saved"] is False
     assert "部分保存" not in record["exclusion"]
     assert "500" not in floor.render_manifest([record], header={})
+
+
+@pytest.mark.parametrize("metrics_json", [
+    '{"trades": 100, "pf": "bad", "avg_r": 0.1, "max_drawdown": 0.3}',
+    '{"trades": true, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.3}',
+    '{"trades": -1, "pf": 1.2, "avg_r": 0.1, "max_drawdown": 0.3}',
+    '{"trades": 100, "pf": 1.2, "avg_r": NaN, "max_drawdown": 0.3}',
+    '{"trades": 100, "pf": Infinity, "avg_r": 0.1, "max_drawdown": 0.3}',
+    '{"trades": 100, "pf": true, "avg_r": 0.1, "max_drawdown": 0.3}',
+], ids=["pf_str", "trades_bool", "trades_negative", "avg_r_nan", "pf_inf", "pf_bool"])
+def test_deep_drawdown_candidate_skips_rows_with_invalid_metric_values(
+        tmp_path, metrics_json):
+    conn = _conn(tmp_path)
+    bad = _run(conn, content_hash="a" * 64, dd=0.30)
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE id=?", (metrics_json, bad))
+    conn.commit()
+    skipped: list[int] = []
+    assert floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS, skipped=skipped) is None
+    assert skipped == [bad]
+
+
+def test_deep_drawdown_candidate_accepts_none_pf_and_avg_r(tmp_path):
+    conn = _conn(tmp_path)
+    row = _run(conn, content_hash="a" * 64, dd=0.30)
+    conn.execute("UPDATE backtest_runs SET metrics_json=? WHERE id=?", (json.dumps(
+        {"trades": 100, "pf": None, "avg_r": None, "max_drawdown": 0.3}), row))
+    conn.commit()
+    skipped: list[int] = []
+    floor.select_deep_drawdown_candidate(
+        conn, now=NOW, exclude_hashes=set(), settings=SETTINGS, skipped=skipped)
+    assert skipped == []
