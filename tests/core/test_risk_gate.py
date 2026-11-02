@@ -96,6 +96,23 @@ def test_drawdown_triggers_kill():
     assert any("kill" in x for x in r.reasons)
 
 
+@pytest.mark.parametrize("equity", [979_000.0, 995_000.0])
+@pytest.mark.parametrize("latched", [False, True])
+def test_capital_protection_does_not_depend_on_the_winter_rollover(equity, latched):
+    results = []
+    for now in (datetime(2026, 11, 4, 21, 30, tzinfo=timezone.utc),
+                datetime(2026, 11, 4, 22, 30, tzinfo=timezone.utc)):
+        quote = Quote(symbol="USDJPY", bid=148.49, ask=148.51, ts=now, source="test")
+        r = evaluate(_intent(), _ctx(now=now, quote=quote, equity=equity,
+                                     kill_switch_latched=latched), RISK)
+        results.append((r.accepted, r.reasons))
+
+    assert results[0] == results[1]
+    reasons = results[0][1]
+    assert any("kill switch latched" in x for x in reasons) is latched
+    assert any("drawdown" in x for x in reasons) is (equity == 979_000.0)
+
+
 def test_daily_loss_rejects():
     r = evaluate(_intent(), _ctx(equity=989_000.0,
                                  daily_start_equity=1_000_000.0), RISK)  # -1.1%

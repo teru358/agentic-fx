@@ -1226,9 +1226,10 @@ class Scheduler:
         return ok
 
     def _force_close_day(self, now: datetime) -> None:
-        """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
+        """期限は注文毎に (filled_at 起点の next_rollover で) 導出
         する。tick 全体の「次の rollover まで 5 分以内」だけを条件にすると、
-        20:55-20:59 に quote 障害が続き 21:00 を過ぎた途端に
+        rollover (NY 17:00 = 夏 21:00 UTC / 冬 22:00 UTC) の 5 分前から
+        quote 障害が続き rollover を過ぎた途端に
         next_rollover(now) が翌日を指してしまい、day ポジションが対象から
         外れて約 24 時間 (金曜なら週末) 残ってしまう。注文毎の期限を過ぎた
         後もこの条件は真であり続けるため、quote が復旧し次第、毎 tick

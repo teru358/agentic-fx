@@ -160,7 +160,7 @@ def test_validate_bars_rejects_naive_bar_ts():
 
 
 # --- 修正ラウンド 2: 祝日隣接週の回帰 再現・修正 ---
-# market_hours が扱わない祝日の平日時間帯も「開場中」と判定しうる。修正ラウンド 1 でバー列全体を走査する
+# market_hours は 12/25 と 1/1 を取引日ラベルで休場として扱う。バー列全体を走査する
 # ようにしたことで、祝日を挟んだ「開場中の欠損」が誤検出され、しかも
 # その穴がバー列の窓に残っている間 (フィードが正常に回復した後も) ずっと
 # 健全性判定が落ち続けていた。gap 検査の対象を末尾直近の窓
@@ -169,12 +169,13 @@ def test_validate_bars_rejects_naive_bar_ts():
 
 
 def test_holiday_gap_with_recovery_data_is_not_flagged():
-    # market_hours が扱わない休場日は「開場中の欠損」として検出されうる。休場明け
-    # (12/27 日 21:00) から 30h 分 (窓の 24h を超える) の連続データが
+    # 12/25 (金) は取引日ラベルで休場だが、12/24 (木) の最終足から休場明けまでは
+    # 長い穴になり、欠損として検出されうる。休場明け
+    # (冬の 12/27 日 22:00) から 30h 分 (窓の 24h を超える) の連続データが
     # 積み上がった時点では、この穴は gap 検査の窓の外に出ているはずで、
     # フィードは健全と判定されなければならない。
     last_before = datetime(2026, 12, 24, 21, 0, tzinfo=timezone.utc)  # 木 (通常営業日扱い)
-    reopen = datetime(2026, 12, 27, 21, 0, tzinfo=timezone.utc)       # 日 (再開)
+    reopen = datetime(2026, 12, 27, 22, 0, tzinfo=timezone.utc)       # 日 (冬の再開)
     bars = [
         Bar("USDJPY", "1h", last_before, 148.0, 148.1, 147.9, 148.05, 100),
         Bar("USDJPY", "1h", reopen, 148.0, 148.1, 147.9, 148.05, 100),
@@ -285,3 +286,47 @@ def test_fine_grained_interval_window_has_wall_clock_floor():
     now = bars[-1].ts
     with pytest.raises(DataUnhealthy, match="gap"):
         validate_bars(bars, now, freshness_max_min=90, interval_min=1)
+
+
+# --- 冬の週明けの休場時間 ---
+
+
+def _bar15(ts):
+    return Bar("USDJPY", "15m", ts, 148.0, 148.1, 147.9, 148.05, 100)
+
+
+def test_closed_minutes_subtracts_the_closed_winter_hour_on_sunday():
+    from agentic_fx.datafeed.health import _closed_minutes
+
+    a = datetime(2026, 11, 8, 21, 0, tzinfo=timezone.utc)
+    b = datetime(2026, 11, 8, 22, 0, tzinfo=timezone.utc)
+
+    # 1 分刻みの標本 61 点のうち 21:00-21:59Z の 60 点が閉場
+    assert _closed_minutes(a, b, 1) == pytest.approx(60 / 61 * 60)
+    # 22:00Z 以降は開場なので引かない
+    assert _closed_minutes(b, b + timedelta(hours=1), 1) == 0.0
+
+
+def test_missing_bars_after_the_winter_reopen_count_as_open_gap():
+    reopen = datetime(2026, 11, 8, 22, 0, tzinfo=timezone.utc)
+    bars = [_bar15(reopen), _bar15(reopen + timedelta(minutes=75))]  # 22:15-23:00Z が欠損
+    now = bars[-1].ts + timedelta(minutes=5)
+
+    with pytest.raises(DataUnhealthy, match="open-market"):
+        validate_bars(bars, now, freshness_max_min=90, interval_min=15)
+
+
+def test_weekend_between_summer_friday_and_winter_sunday_is_not_a_gap():
+    bars = [_bar15(datetime(2026, 10, 30, 20, 45, tzinfo=timezone.utc)),
+            _bar15(datetime(2026, 11, 1, 22, 0, tzinfo=timezone.utc))]
+    now = datetime(2026, 11, 1, 22, 47, tzinfo=timezone.utc)
+
+    validate_bars(bars, now, freshness_max_min=90, interval_min=15)
+
+
+def test_winter_weekend_between_last_friday_bar_and_sunday_reopen_is_not_a_gap():
+    bars = [_bar15(datetime(2026, 11, 6, 21, 45, tzinfo=timezone.utc)),
+            _bar15(datetime(2026, 11, 8, 22, 0, tzinfo=timezone.utc))]
+    now = datetime(2026, 11, 8, 22, 47, tzinfo=timezone.utc)
+
+    validate_bars(bars, now, freshness_max_min=90, interval_min=15)

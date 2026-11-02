@@ -43,6 +43,16 @@ def test_session_boundary_utc_follows_new_york_dst(day, expected):
     (_dt(2026, 11, 1, 22, 0), True),
     (_dt(2027, 3, 14, 20, 59), False),
     (_dt(2027, 3, 14, 21, 0), True),
+    (_dt(2026, 3, 6, 21, 59), True),
+    (_dt(2026, 3, 6, 22, 0), False),
+    (_dt(2026, 3, 8, 20, 59), False),
+    (_dt(2026, 3, 8, 21, 0), True),
+    (_dt(2026, 3, 13, 20, 59), True),
+    (_dt(2026, 3, 13, 21, 0), False),
+    (_dt(2026, 10, 25, 20, 59), False),
+    (_dt(2026, 10, 25, 21, 0), True),
+    (_dt(2026, 11, 8, 21, 59), False),
+    (_dt(2026, 11, 8, 22, 0), True),
 ])
 def test_weekend_open_and_close_follow_new_york_1700(instant, open_):
     assert is_market_open(instant) is open_
@@ -52,6 +62,8 @@ def test_weekend_open_and_close_follow_new_york_1700(instant, open_):
     (_dt(2026, 11, 4, 12, 0), _dt(2026, 11, 3, 22, 0), _dt(2026, 11, 4, 22, 0), "2026-11-04"),
     (_dt(2026, 7, 22, 12, 0), _dt(2026, 7, 21, 21, 0), _dt(2026, 7, 22, 21, 0), "2026-07-22"),
     (_dt(2026, 11, 4, 22, 0), _dt(2026, 11, 4, 22, 0), _dt(2026, 11, 5, 22, 0), "2026-11-05"),
+    (_dt(2026, 11, 4, 3, 0), _dt(2026, 11, 3, 22, 0), _dt(2026, 11, 4, 22, 0), "2026-11-04"),
+    (_dt(2026, 7, 22, 2, 0), _dt(2026, 7, 21, 21, 0), _dt(2026, 7, 22, 21, 0), "2026-07-22"),
     (_dt(2026, 11, 1, 23, 0), _dt(2026, 11, 1, 22, 0), _dt(2026, 11, 2, 22, 0), "2026-11-02"),
     (_dt(2026, 3, 8, 21, 30), _dt(2026, 3, 8, 21, 0), _dt(2026, 3, 9, 21, 0), "2026-03-09"),
 ])
@@ -73,12 +85,39 @@ def test_holidays_follow_the_trading_date_at_winter_boundary():
     assert is_market_open(_dt(2025, 12, 25, 22, 0)) is True
     assert is_market_open(_dt(2026, 12, 27, 21, 59)) is False
     assert is_market_open(_dt(2026, 12, 27, 22, 0)) is True
+    assert is_market_open(_dt(2026, 12, 24, 21, 59)) is True
+    assert is_market_open(_dt(2026, 12, 24, 22, 0)) is False
+    assert is_market_open(_dt(2026, 12, 31, 21, 59)) is True
+    assert is_market_open(_dt(2026, 12, 31, 22, 0)) is False
+    assert is_market_open(_dt(2027, 1, 3, 21, 59)) is False
+    assert is_market_open(_dt(2027, 1, 3, 22, 0)) is True
 
 
 def test_session_start_and_next_expected_bar_use_dst_boundaries():
     assert session_start(_dt(2026, 11, 4, 12, 0)) == _dt(2026, 11, 1, 22, 0)
     assert session_start(_dt(2026, 3, 10, 12, 0)) == _dt(2026, 3, 8, 21, 0)
     assert next_expected_trading_time(_dt(2026, 11, 6, 21, 55), timedelta(minutes=5)) == _dt(2026, 11, 8, 22, 0)
+    assert session_start(_dt(2026, 12, 28, 3, 0)) == _dt(2026, 12, 27, 22, 0)
+    assert session_start(_dt(2027, 1, 4, 3, 0)) == _dt(2027, 1, 3, 22, 0)
+
+
+def test_next_expected_trading_time_crosses_a_dst_change_over_the_weekend():
+    assert next_expected_trading_time(
+        _dt(2026, 10, 30, 20, 45), timedelta(minutes=15)) == _dt(2026, 11, 1, 22, 0)
+    assert next_expected_trading_time(
+        _dt(2026, 3, 6, 21, 55), timedelta(minutes=5)) == _dt(2026, 3, 8, 21, 0)
+
+
+def test_daily_boundaries_are_24_hours_apart_inside_the_winter_week():
+    expected = [_dt(2026, 11, 2, 22, 0), _dt(2026, 11, 3, 22, 0),
+                _dt(2026, 11, 4, 22, 0), _dt(2026, 11, 5, 22, 0)]
+    actual = []
+    instant = _dt(2026, 11, 2, 12, 0)
+    for _ in expected:
+        instant = next_rollover(instant)
+        actual.append(instant)
+    assert actual == expected
+    assert [b - a for a, b in zip(actual, actual[1:])] == [timedelta(hours=24)] * 3
 
 
 def test_winter_friday_cutoff_is_still_new_york_local_time():
