@@ -46,7 +46,7 @@ TimeoutStopSec=630
 KillMode=control-group
 Restart=on-failure
 RestartSec=30
-RestartPreventExitStatus=75 76
+RestartPreventExitStatus=75 76 78
 StandardOutput=journal
 StandardError=journal
 Environment=LANG={lang}

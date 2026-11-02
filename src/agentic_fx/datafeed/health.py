@@ -103,9 +103,16 @@ def _closed_minutes(a: datetime, b: datetime, interval_min: float) -> float | No
     cur = a
     closed = 0
     samples = 0
+    # 開閉は NY 17:00 から次の 17:00 までの区間で一定なので、区間ごとに 1 度だけ引く。
+    seg_start = seg_end = None
+    is_open = True
     while cur <= b:
         samples += 1
-        if not market_hours.is_market_open(cur):
+        if seg_start is None or not (seg_start <= cur < seg_end):
+            seg_start = market_hours.trading_day_start(cur)
+            seg_end = market_hours.next_rollover(cur)
+            is_open = market_hours.is_market_open(cur)
+        if not is_open:
             closed += 1
         cur += step
     if samples == 0:

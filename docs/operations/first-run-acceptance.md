@@ -842,7 +842,7 @@ Claude CLI を PATH から外した状態 (`bin_not_found`)、またはログイ
 
 | 項目 | 期待 |
 |---|---|
-| 1. 実効の unit | 設置した本文と一致。`Type=exec`、`NotifyAccess=none`、`KillMode=control-group`、`DelegateControllers` に `pids` と `memory`、`MainPID` が `python main.py --daemon`、`TimeoutStopUSec=10min 30s`、`RestartPreventExitStatus=75 76` |
+| 1. 実効の unit | 設置した本文と一致。`Type=exec`、`NotifyAccess=none`、`KillMode=control-group`、`DelegateControllers` に `pids` と `memory`、`MainPID` が `python main.py --daemon`、`TimeoutStopUSec=10min 30s`、`RestartPreventExitStatus=75 76 78` |
 | 2. cgroup の形 | afx が unit root から `supervisor/` へ自己移動した位置にあり、mission ごとの cgroup が作られる |
 | 3. linger とログアウト後の存続 | `Linger=yes` なら存続。`no` ならログアウトで止まり、ウィザードが案内を出していたこと |
 | 4. 今回の起動の journal | 今回の起動の admission 行が読め、前回の起動の行と区別できる。`admitted=yes`。field が契約と違えば契約の field 名を直す |

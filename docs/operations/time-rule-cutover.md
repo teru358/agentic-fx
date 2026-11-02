@@ -36,7 +36,7 @@ T_b 以後は新規則だけです。夏の切替では旧新の境界が同じ�
    ```
 
 6. 当日 21:00〜22:00 UTC の日次損失の基準は旧新の大きい方 (上がることはあっても下がらない)。22:00 UTC (冬) で新しい日次に切り替わることを観測する。夏は 21:00 UTC で切り替わる。
-7. 不具合が出たら: `systemctl --user stop afx` で止める。marker 欠落で起動拒否 (`time_rule_marker_missing`) になった場合も、systemd が再起動を繰り返すので同じコマンドで止める。新規発注が止まる。停止中は afx の監視、つまり day close と SL / TP の判定も止まるので、`afx status` と OPEN / PENDING_FILL を手で確かめる。修正を足した新版 (新規則と marker を保つ版) で起動する。
+7. 不具合が出たら: `systemctl --user stop afx` で止める。marker 欠落で起動拒否 (`time_rule_marker_missing`) になると終了コード 78 で終わる。unit の `RestartPreventExitStatus` に 78 が入っていれば再起動されない (雛形は `75 76 78`、既に入っている unit には手で `RestartPreventExitStatus=75 76 78` に直して `systemctl --user daemon-reload`)。入っていなければ systemd が再起動を繰り返すので、同じ `systemctl --user stop afx` で止める。新規発注が止まる。停止中は afx の監視、つまり day close と SL / TP の判定も止まるので、`afx status` と OPEN / PENDING_FILL を手で確かめる。修正を足した新版 (新規則と marker を保つ版) で起動する。
 
 ## rollback はしない (forward-fix だけ)
 

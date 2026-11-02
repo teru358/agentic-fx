@@ -123,15 +123,24 @@ def _run_with_tick_that_stops(root: Path):
     return code, mock_tick
 
 
-def test_run_service_reports_the_missing_marker_and_exits_nonzero(tmp_path, capsys):
+def test_run_service_reports_the_missing_marker_with_a_dedicated_exit_code(tmp_path, capsys):
     _init(tmp_path)
     _build(tmp_path).close()
     _remove_marker(tmp_path)
     capsys.readouterr()
     code, tick = _run_with_tick_that_stops(tmp_path)
-    assert code == 1
+    assert code == 78 == time_cutover.EXIT_MARKER_MISSING
     tick.assert_not_called()
     assert "time_rule_marker_missing" in capsys.readouterr().err
+
+
+def test_other_preflight_failures_keep_exit_code_one(tmp_path, capsys):
+    _init(tmp_path)
+    with patch("agentic_fx.service.build_app",
+               side_effect=PreflightFailure("db_unreadable", "x")):
+        code = run_service(tmp_path, daemon=True, _stop_event=threading.Event())
+    assert code == 1
+    assert "db_unreadable" in capsys.readouterr().err
 
 
 def test_run_service_with_the_marker_does_reach_the_first_tick(tmp_path):

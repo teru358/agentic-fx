@@ -330,3 +330,45 @@ def test_winter_weekend_between_last_friday_bar_and_sunday_reopen_is_not_a_gap()
     now = datetime(2026, 11, 8, 22, 47, tzinfo=timezone.utc)
 
     validate_bars(bars, now, freshness_max_min=90, interval_min=15)
+
+
+def _sampled_closed_minutes(a, b, interval_min):
+    from agentic_fx.core import market_hours
+
+    step = timedelta(minutes=max(interval_min, 1.0))
+    cur, closed, samples = a, 0, 0
+    while cur <= b:
+        samples += 1
+        if not market_hours.is_market_open(cur):
+            closed += 1
+        cur += step
+    return closed / samples * ((b - a).total_seconds() / 60)
+
+
+@pytest.mark.parametrize("a, hours, interval", [
+    (datetime(2026, 1, 9, 21, 0, tzinfo=timezone.utc), 49, 1),    # winter weekend
+    (datetime(2026, 7, 10, 20, 0, tzinfo=timezone.utc), 49, 1),   # summer weekend
+    (datetime(2026, 3, 6, 21, 0, tzinfo=timezone.utc), 120, 5),   # US DST start week
+    (datetime(2026, 10, 30, 20, 0, tzinfo=timezone.utc), 120, 5), # US DST end week
+    (datetime(2026, 12, 23, 12, 0, tzinfo=timezone.utc), 240, 15),  # holidays
+    (datetime(2026, 11, 3, 10, 0, tzinfo=timezone.utc), 20, 1),   # no closed time
+])
+def test_closed_minutes_matches_the_per_sample_estimate(a, hours, interval):
+    from agentic_fx.datafeed.health import _closed_minutes
+
+    b = a + timedelta(hours=hours)
+    assert _closed_minutes(a, b, interval) == pytest.approx(
+        _sampled_closed_minutes(a, b, interval))
+
+
+def test_closed_minutes_asks_the_calendar_per_session_not_per_sample(monkeypatch):
+    from agentic_fx.core import market_hours
+    from agentic_fx.datafeed.health import _closed_minutes
+
+    calls = []
+    real = market_hours.is_market_open
+    monkeypatch.setattr(market_hours, "is_market_open",
+                        lambda now: calls.append(now) or real(now))
+    a = datetime(2026, 1, 9, 21, 0, tzinfo=timezone.utc)
+    _closed_minutes(a, a + timedelta(hours=49), 1)
+    assert len(calls) <= 5

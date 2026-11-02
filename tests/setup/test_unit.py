@@ -98,7 +98,7 @@ def test_fixed_lines_match_the_provisional_production_unit(tmp_path):
                            ["/x/bin", "/usr/bin"], "ja_JP.UTF-8", True)
     assert (_lines(rendered, skip_prefixes=_VALUE_LINES)
             == _lines(FIXTURE.read_text(encoding="utf-8"), skip_prefixes=_VALUE_LINES))
-    assert "RestartPreventExitStatus=75 76" in rendered
+    assert "RestartPreventExitStatus=75 76 78" in rendered
 
 
 def test_unit_has_the_required_lines_and_no_screen_remnants(tmp_path):
@@ -106,7 +106,7 @@ def test_unit_has_the_required_lines_and_no_screen_remnants(tmp_path):
     python = root / ".venv" / "bin" / "python"
     text = render_unit(root, python, ["/usr/bin"], "C.UTF-8", False)
     for line in ("Type=exec", f"ExecStart={python} main.py --daemon", "Delegate=pids memory",
-                 "RestartPreventExitStatus=75 76", "TimeoutStopSec=630",
+                 "RestartPreventExitStatus=75 76 78", "TimeoutStopSec=630",
                  f"WorkingDirectory={root}"):
         assert line in text.splitlines()
     for forbidden in ("ExecStop", "screen", "afx-start", "EnvironmentFile"):

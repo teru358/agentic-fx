@@ -2568,7 +2568,8 @@ def run_service(root: Path, *, daemon: bool = False,
         return EXIT_SETUP_IN_PROGRESS
     except PreflightFailure as exc:
         print(f"afx: {exc.code}: {exc}", file=sys.stderr)
-        return 1
+        # marker 欠落は手で直すまで直らないので、専用の終了コードで再起動を止める。
+        return time_cutover.EXIT_MARKER_MISSING if exc.code == time_cutover.MARKER_MISSING else 1
 
     warning = Policy(directives_path(root)).size_warning()
     if warning:

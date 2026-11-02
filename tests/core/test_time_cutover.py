@@ -108,6 +108,10 @@ class FaultConn:
         return getattr(self._real, name)
 
 
+def _rollover(conn, anchor, now):
+    return time_cutover.day_close_rollover(time_cutover.active_window(conn, now), anchor)
+
+
 # ---- legacy copies and the window ------------------------------------------
 
 def test_legacy_boundaries_are_the_fixed_2100_utc_rule():
@@ -134,7 +138,7 @@ def test_summer_cutover_has_equal_boundaries_so_the_rules_change_nothing(tmp_pat
     now = _dt(2026, 7, 22, 20, 30)
     time_cutover.ensure_cutover(c, now=now, activity=FakeActivity())
     anchor = _dt(2026, 7, 22, 10, 0)
-    assert time_cutover.day_close_rollover(c, anchor, now) == _dt(2026, 7, 22, 21, 0)
+    assert _rollover(c, anchor, now) == _dt(2026, 7, 22, 21, 0)
     assert time_cutover.signal_day_start(c, now) == _dt(2026, 7, 21, 21, 0)
     assert time_cutover.daily_label(c, now).isoformat() == "2026-07-22"
 
@@ -145,20 +149,20 @@ def test_day_deadline_before_cutover_takes_the_earlier_boundary(tmp_path):
     c = _conn(tmp_path)
     time_cutover.ensure_cutover(c, now=T_C, activity=FakeActivity())
     # opened 10:00Z: old boundary 21:00Z, new boundary 22:00Z -> the old one
-    assert time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 10, 0), T_C) == _dt(2026, 11, 3, 21, 0)
+    assert _rollover(c, _dt(2026, 11, 3, 10, 0), T_C) == _dt(2026, 11, 3, 21, 0)
     # opened 21:10Z: old boundary is tomorrow 21:00Z, new is 22:00Z today -> the new one
-    assert time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 21, 10), T_C) == _dt(2026, 11, 3, 22, 0)
+    assert _rollover(c, _dt(2026, 11, 3, 21, 10), T_C) == _dt(2026, 11, 3, 22, 0)
     # opened at/after T_c: new rule only
-    assert time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 21, 40), T_C) == _dt(2026, 11, 3, 22, 0)
-    assert time_cutover.day_close_rollover(c, T_C, T_C) == _dt(2026, 11, 3, 22, 0)
+    assert _rollover(c, _dt(2026, 11, 3, 21, 40), T_C) == _dt(2026, 11, 3, 22, 0)
+    assert _rollover(c, T_C, T_C) == _dt(2026, 11, 3, 22, 0)
 
 
 def test_day_deadline_for_a_position_opened_exactly_at_the_cutover_is_the_new_rule(tmp_path):
     c = _conn(tmp_path)
     early = _dt(2026, 11, 3, 20, 30)  # old boundary 21:00Z is earlier than the new 22:00Z
     time_cutover.ensure_cutover(c, now=early, activity=FakeActivity())
-    assert time_cutover.day_close_rollover(c, early, early) == _dt(2026, 11, 3, 22, 0)
-    assert time_cutover.day_close_rollover(
+    assert _rollover(c, early, early) == _dt(2026, 11, 3, 22, 0)
+    assert _rollover(
         c, early - timedelta(seconds=1), early) == _dt(2026, 11, 3, 21, 0)
 
 
@@ -166,7 +170,7 @@ def test_day_deadline_after_the_window_is_the_new_rule_alone(tmp_path):
     c = _conn(tmp_path)
     time_cutover.ensure_cutover(c, now=T_C, activity=FakeActivity())
     after = T_B + timedelta(minutes=1)
-    assert time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 10, 0), after) == _dt(2026, 11, 3, 22, 0)
+    assert _rollover(c, _dt(2026, 11, 3, 10, 0), after) == _dt(2026, 11, 3, 22, 0)
 
 
 def test_daily_base_is_the_larger_of_old_and_new_and_none_fails_closed(tmp_path):
@@ -681,7 +685,7 @@ def test_legacy_functions_are_the_ones_called_inside_the_window(tmp_path, monkey
         missions.signals_rate_ok(c, inside, SETTINGS)
     monkeypatch.setattr(time_cutover, "legacy_next_rollover", boom)
     with pytest.raises(AssertionError, match="reached"):
-        time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 10, 0), inside)
+        _rollover(c, _dt(2026, 11, 3, 10, 0), inside)
     monkeypatch.setattr(time_cutover, "legacy_trading_date", boom)
     with pytest.raises(AssertionError, match="reached"):
         time_cutover.daily_label(c, inside)
@@ -695,7 +699,7 @@ def test_a_forward_fix_restart_keeps_the_cutover_instant(tmp_path):
     time_cutover.ensure_cutover(c, now=restart, activity=activity)
     assert _marker(c) == T_C
     assert time_cutover.active_window(c, restart) is None
-    assert time_cutover.day_close_rollover(c, _dt(2026, 11, 3, 10, 0), restart) == T_B
+    assert _rollover(c, _dt(2026, 11, 3, 10, 0), restart) == T_B
 
 
 def test_no_source_path_removes_the_marker():
@@ -789,3 +793,77 @@ def test_marker_write_refuses_to_run_inside_an_open_transaction(tmp_path):
     assert c.in_transaction  # the caller's pending write was neither committed nor dropped
     assert _marker(c) is None
     c.rollback()
+
+
+# ---- a damaged anchor does not stop the start -----------------------------------
+
+@pytest.mark.parametrize("anchor", [
+    "2026-11-03T10:00:00",       # naive
+    "not a timestamp",
+    "",                           # empty
+])
+def test_a_damaged_anchor_is_recorded_and_the_start_continues(tmp_path, anchor):
+    c = _conn(tmp_path)
+    _open_day_order(c, _dt(2026, 11, 3, 10, 0))
+    c.execute(
+        "INSERT INTO orders (pair, direction, entry_type, horizon, status, "
+        "quantity, created_at, updated_at, filled_at) VALUES "
+        "('EURUSD','long','limit','day','open',1000,?,?,NULL)",
+        (anchor, anchor))
+    c.commit()
+    time_cutover.ensure_cutover(c, now=T_C, activity=FakeActivity())
+    assert _marker(c) == T_C
+    by_id = {row["id"]: row for row in _capture(c)["orders"]}
+    assert by_id[1]["day_deadline"]["applied"] == "2026-11-03T20:55:00+00:00"
+    assert "anchor_invalid" not in by_id[1]
+    assert by_id[2]["anchor_invalid"] is True and by_id[2]["day_deadline"] is None
+    assert by_id[2]["anchor"] == anchor
+
+
+def test_a_damaged_anchor_does_not_stop_the_supplemental_capture(tmp_path):
+    c = _conn(tmp_path)
+    c.execute("INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
+              (time_cutover.MARKER_NAME, T_C.isoformat()))
+    c.execute(
+        "INSERT INTO orders (pair, direction, entry_type, horizon, status, "
+        "quantity, created_at, updated_at, filled_at) VALUES "
+        "('EURUSD','long','limit','day','open',1000,'bad','bad',NULL)")
+    c.commit()
+    time_cutover.ensure_cutover(c, now=T_C + timedelta(minutes=3), activity=FakeActivity())
+    assert _capture(c)["orders"][0]["anchor_invalid"] is True
+
+
+# ---- the marker is read once per scan --------------------------------------------
+
+def test_force_close_reads_the_marker_once_however_many_day_positions(tmp_path):
+    env, _ = _filled_day_env(
+        tmp_path, name="q", placed_at=_dt(2026, 11, 3, 9, 59),
+        filled_at=_dt(2026, 11, 3, 10, 0))
+    for _ in range(3):
+        _open_day_order(env.conn, _dt(2026, 11, 3, 10, 5))
+    time_cutover.ensure_cutover(env.conn, now=T_C,
+                                activity=ActivityLog(tmp_path / "q" / "cut.log"))
+    seen: list[str] = []
+    env.conn.set_trace_callback(seen.append)
+    env.sched._force_close_day(T_C - timedelta(hours=5))
+    env.conn.set_trace_callback(None)
+    reads = [s for s in seen if "FROM data_migrations" in s]
+    assert len(reads) == 1
+
+
+def test_force_close_survives_a_marker_read_failure_and_retries_next_tick(tmp_path, monkeypatch):
+    env, oid = _filled_day_env(
+        tmp_path, name="r", placed_at=_dt(2026, 11, 3, 9, 59),
+        filled_at=_dt(2026, 11, 3, 10, 0))
+    time_cutover.ensure_cutover(env.conn, now=T_C,
+                                activity=ActivityLog(tmp_path / "r" / "cut.log"))
+    def broken(conn, now):
+        raise sqlite3.OperationalError("database is locked")
+
+    with monkeypatch.context() as m:
+        m.setattr(time_cutover, "active_window", broken)
+        env.sched._force_close_day(T_C)
+    assert orders.get(env.conn, oid)["status"] == "open"
+    assert "day_close_error" in (tmp_path / "r" / "a.log").read_text(encoding="utf-8")
+    env.sched._force_close_day(T_C + timedelta(seconds=30))
+    assert orders.get(env.conn, oid)["status"] == "closed"

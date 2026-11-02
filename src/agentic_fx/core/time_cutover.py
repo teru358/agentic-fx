@@ -30,6 +30,8 @@ CAPTURE_KEY = "time_rule_cutover.capture"
 ACTIVITY_EVENT = "time_rule_cutover"
 REFUSED_EVENT = "time_rule_cutover_refused"
 MARKER_MISSING = "time_rule_marker_missing"
+# systemd の RestartPreventExitStatus で再起動を止めるための専用値 (75 / 76 の隣)。
+EXIT_MARKER_MISSING = 78
 
 _LEGACY_ROLLOVER_UTC = time(21, 0)
 _LEGACY_SERVER_AHEAD = timedelta(hours=3)
@@ -93,15 +95,15 @@ def active_window(conn: sqlite3.Connection,
 
 # ---- transitional rules ---------------------------------------------------
 
-def day_close_rollover(conn: sqlite3.Connection, anchor: datetime,
-                       now: datetime) -> datetime:
+def day_close_rollover(window: tuple[datetime, datetime] | None,
+                       anchor: datetime) -> datetime:
     """Boundary that closes a day position opened at ``anchor``.
 
-    A position that started before ``T_c`` takes the earlier of the two
+    ``window`` is ``active_window(conn, now)``, read once by the caller.  A
+    position that started before ``T_c`` takes the earlier of the two
     boundaries so the cutover never extends its life.
     """
     new = market_hours.next_rollover(anchor)
-    window = active_window(conn, now)
     if window is None or as_utc(anchor) >= window[0]:
         return new
     return min(legacy_next_rollover(anchor), new)
@@ -171,13 +173,16 @@ def build_capture(conn: sqlite3.Connection, t_c: datetime,
         entry = {"id": order_id, "pair": pair, "horizon": horizon,
                  "status": status, "anchor": anchor, "day_deadline": None}
         if horizon == "day":
-            started = datetime.fromisoformat(anchor)
-            legacy = legacy_next_rollover(started) - buffer
-            new = market_hours.next_rollover(started) - buffer
-            applied = min(legacy, new) if as_utc(started) < t_c else new
-            entry["day_deadline"] = {"legacy": legacy.isoformat(),
-                                     "new": new.isoformat(),
-                                     "applied": applied.isoformat()}
+            try:
+                started = as_utc(datetime.fromisoformat(anchor))
+                legacy = legacy_next_rollover(started) - buffer
+                new = market_hours.next_rollover(started) - buffer
+                applied = min(legacy, new) if started < t_c else new
+                entry["day_deadline"] = {"legacy": legacy.isoformat(),
+                                         "new": new.isoformat(),
+                                         "applied": applied.isoformat()}
+            except (TypeError, ValueError):
+                entry["anchor_invalid"] = True
         rows.append(entry)
     legacy_base = accounting.daily_start_snapshot(
         conn, now, legacy_trading_day_start(now))

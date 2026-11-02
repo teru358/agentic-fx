@@ -58,7 +58,8 @@ def test_strategy_timeframe_mismatch_warns_once_and_prompt_has_decision_metadata
         paper=SimpleNamespace(starting_balance=1),
     )
     loop.policy = SimpleNamespace(tail=lambda _limit: "")
-    loop.conn = loop.econ = loop.clock = object()
+    loop.econ = loop.clock = object()
+    loop.conn = sqlite3.connect(":memory:")
     loop.executor = SimpleNamespace(broker=object())
     monkeypatch.setattr("agentic_fx.loops.trade_loop.build_state_summary",
                         lambda *_args: "state")

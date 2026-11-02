@@ -1235,9 +1235,22 @@ class Scheduler:
         後もこの条件は真であり続けるため、quote が復旧し次第、毎 tick
         再試行される。quote 取得失敗時に架空価格で閉じない挙動は維持する。
         """
-        for row in orders.list_by_status(self.conn, S.OPEN):
-            if row["horizon"] != "day":
-                continue
+        day_rows = [row for row in orders.list_by_status(self.conn, S.OPEN)
+                    if row["horizon"] == "day"]
+        if not day_rows:
+            return
+        # 切替の窓は tick の間変わらないので 1 度だけ引く。読めなければ緩めずに
+        # この tick の day 強制決済を見送り、次 tick で再試行する。
+        try:
+            window = time_cutover.active_window(self.conn, now)
+        except Exception as e:  # noqa: BLE001 — 後続の _process_exits を止めない
+            text = safe_error_text(e)
+            self.activity.write(
+                Category.TRADE, "day_close_error",
+                f"切替の窓を読めない: {text} — 次 tick 再試行")
+            _log.warning("day close window unreadable: %s", text)
+            return
+        for row in day_rows:
             # site 2 (fix round 3): ポジション単位で隔離する。以前は
             # datetime.fromisoformat(anchor) (I1 と同型の欠陥) も
             # self.executor.close_order(...) も無保護で、1 件のポジション
@@ -1248,7 +1261,7 @@ class Scheduler:
             try:
                 anchor = row["filled_at"] or row["created_at"]
                 deadline = time_cutover.day_close_rollover(
-                    self.conn, datetime.fromisoformat(anchor), now)
+                    window, datetime.fromisoformat(anchor))
                 if now < deadline - market_hours.DAY_CLOSE_BUFFER:
                     continue
                 try:
