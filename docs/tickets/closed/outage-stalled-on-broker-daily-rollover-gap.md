@@ -26,3 +26,7 @@ source_section: 未完了
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 - 2026-10-01: 状態: 実装中、題名: 静かな市場で 1m 足が欠けると degraded になる (restricted 状態を追加) — spec docs/superpowers/specs/2026-10-01-quiet-market-restricted-state-design.md v1.0。原因は broker が無 tick の分の足を作らないこと (bridge・取得の失敗ではない、60 日実測で USDJPY 96 分・他銘柄は時間帯を問わず)。時間帯規則・固定銘柄群・気配は使わず、建玉なしの停滞は restricted (新規リスク停止、上限 30 分)、建玉ありは現行どおり degraded
 - 2026-10-02: 是正内容 — main af64a11..1079ecb。建玉も未約定指値も無いときの停滞は restricted (新規リスク停止、datafeed.outage.flat_stall_max_sec 既定 1800 秒、健全 3 tick で ready) に留め、建玉あり・取得失敗・空の応答・期限超過は degraded。state と gap は 1 transaction、発注は consume 前・入口・submit 直前で state を再検査、停止判定の保存失敗時も新規リスクを止める。spec docs/superpowers/specs/2026-10-01-quiet-market-restricted-state-design.md v1.2。レビュー: 設計 sol 2 周、実装は変異 66 本 (pin 10)・ローカル LLM 3 本・/code-review high・sol 2 周 + terra 1 周。フルスイート 4992 passed (既知 flake 1)。実データ 3 本 (9/29・9/13・9/30) の遷移を受入テストで固定。実機受入は再起動後のロールオーバーで確認
+
+## 後続の実測 (2026-11-02)
+
+DST 切替の実測で、サーバ時刻は UTC+3 固定ではなく NY + 7h (夏 UTC+3 / 冬 UTC+2) と判明。週末境界は夏 21:00Z / 冬 22:00Z。→ market-hours-fixed-21utc-ignores-dst

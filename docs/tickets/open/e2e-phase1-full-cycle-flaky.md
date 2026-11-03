@@ -25,3 +25,4 @@ related: []
 ## 経緯
 
 - 2026-10-30: 起票。
+- 2026-11-03: 再観測。main d00c1db0 と DST branch で各 6 回中 2 回失敗 (tick 4 の `time.sleep(0.5)` で supervisor の reflection 完了を待つ競合)。DST 是正とは無関係。

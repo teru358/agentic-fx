@@ -25,3 +25,4 @@ MT5 サーバ時刻は NY+7h (夏 UTC+3 / 冬 UTC+2、2026-11-01 22:05 UTC に 1
 ## 経緯
 
 - 2026-11-02: 起票。
+- 2026-11-03: 設計 docs/superpowers/specs/2026-11-02-utc-time-rules-dst-design.md。bridge の足ごとの換算と規則検査は T3、履歴と cache の修復は T4 で、R1 には入らない。bridge 是正までは `afx history import` を走らせない。
