@@ -3,14 +3,15 @@
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
 未完了: 163 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (5)
 
-### 不具合 (2)
+### 不具合 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 | [market-hours-fixed-21utc-ignores-dst](open/market-hours-fixed-21utc-ignores-dst.md) | 高 | 2026-11-02 | market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる |
+| [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 
 ### 機能 (2)
 
@@ -73,16 +74,15 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (139)
+## 設計待ち (138)
 
-### 不具合 (78)
+### 不具合 (77)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
