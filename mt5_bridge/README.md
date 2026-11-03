@@ -88,30 +88,32 @@ afx の価格取得だけが目的なら、API キーなしでも動く (発注�
 
    MT5 の 1m 足は約 3 か月分しか遡れないので、基底足は `5m` を勧める。
 
-## サーバ時刻オフセット
+## 時刻規則と検査
 
 MT5 が返す時刻 (`tick.time` / `position.time` / `deal.time` / `rates["time"]`) はブローカーの**サーバ時間帯**のエポック秒で、UTC ではない (例: UTC+3 のブローカーもある)。`copy_rates_range` の `date_from` / `date_to` も同じ時間帯で解釈される。
 
-bridge は `symbol_info_tick(symbol).time` と UTC 時計の差からオフセットを実測し、送受信の両方向で補正する。
+bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計 + 7 時間」から、要求範囲と返却された各足を個別に UTC へ換算する。実測 offset は換算には使わない。
 
-- 検出のガード: `|raw| > 12h` は棄却 / 30 分単位に丸める / 丸め残差 > 120s は棄却 (市場が閉まっている間は tick が古いため)。
-- 再計算は最短 300 秒間隔。棄却されたら直前の良い値を使う。
-- 良い値は `SERVER_OFFSET_PATH` (既定 `logs/server_offset.json`) に永続化され、週末をまたぐ再起動でも残る。
-- **良い値が 1 つも無ければ fail closed**。read 系 endpoint は **503** を返す (ずれた時刻で動くより止まる方が安全)。
-- 夏時間の切り替わりは定期再計算で追随する。
+- 時刻付き endpoint が開場中に呼ばれたとき、60 秒以上間隔を空けて probe symbol と要求 symbol の tick を検査する。±12 時間、30 分丸め、残差 120 秒のガードを通った値だけを受理する。
+- 受理値が規則と違えば `mismatch`。規則と一致する受理が 3 回連続するまで市場データは戻らない。起動直後、受理から 300 秒超、閉場中は `unverified`。
+- `GET /quote/{symbol}` と `GET /ohlcv/{symbol}` は `ok` のときだけ返す。`mismatch` は 503 `time_rule_mismatch`、`unverified` は 503 `time_rule_unverified`。口座・建玉・決済照合は止めない。
+- 起動時に 2026 年の夏・冬の `America/New_York` offset を自己検査する。Windows では `tzdata` が必須依存として入る。自己検査に失敗した bridge は起動しない。
 
 `GET /server-time` で確認できる:
 
 ```json
 {
   "server_offset_sec": 10800,
-  "server_time": "2026-07-28T14:12:04+00:00",
-  "utc_time": "2026-07-28T11:12:04+00:00",
-  "offset_source": "live"
+  "offset_source": "rule",
+  "measured_offset_sec": 10800,
+  "measured_age_sec": 12,
+  "offset_matches_rule": true,
+  "match_streak": 1,
+  "time_rule_state": "ok"
 }
 ```
 
-`offset_source` は `"live"` (直近の検出が成功) か `"cached"` (直近は棄却され前回の値を使用中)。
+`/health` にも `time_rule_state` と `measured_at` が出る。`/health` は検査を起動しないため、市場データの利用可否は `/server-time` の `time_rule_state` で確認する。
 
 ## 常駐化 (任意)
 
@@ -133,7 +135,8 @@ bridge は `symbol_info_tick(symbol).time` と UTC 時計の差からオフセ�
 | `MT5 login failed: (-6, ...)` | 認証情報の誤り。MT5 端末で手動ログインが通ることを先に確認する |
 | `mt5_connected: false` が続く | MT5 端末の自動売買ボタンと AlgoTrading の許可を確認する |
 | 別マシンから接続できない | `BRIDGE_HOST` (と API キー) の設定、ファイアウォールで TCP 8812 の許可を確認する |
-| quote・OHLCV が 503 | サーバ時刻オフセットが未確定 (市場が閉まっている間の初回起動など)。開場後に再試行する |
+| quote・OHLCV が 503 `time_rule_unverified` | 起動直後、閉場中、または直近の受理から 300 秒を超えた。開場後の新しい tick を待つ |
+| quote・OHLCV が 503 `time_rule_mismatch` | MT5 の実測 offset が規則と異なる。broker の DST / server 設定を確認し、規則一致の受理が 3 回続くまで待つ |
 
 ## セキュリティ
 

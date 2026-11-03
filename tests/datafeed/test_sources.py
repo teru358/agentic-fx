@@ -4,9 +4,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+import httpx
 
 from agentic_fx.datafeed.sources import (
-    INTERVAL_MIN, MT5RawSymbol, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
+    BridgeTimeRuleMismatch, BridgeTimeUnverified, INTERVAL_MIN, MT5RawSymbol, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
     td_bars, td_quote, vendor_symbol, yf_bars, yf_quote,
 )
 
@@ -120,6 +121,18 @@ def test_mt5_quote_parses_bridge_response():
         q = mt5_quote("http://localhost:8812", "USDJPY")
     assert "quote" in g.call_args[0][0]
     assert q.bid == 148.49 and q.source == "mt5"
+
+
+@pytest.mark.parametrize(("detail", "error"), [
+    ("time_rule_mismatch", BridgeTimeRuleMismatch),
+    ("time_rule_unverified", BridgeTimeUnverified),
+])
+def test_mt5_quote_maps_time_rule_503_to_a_typed_error(detail, error):
+    response = httpx.Response(503, json={"detail": detail},
+                              request=httpx.Request("GET", "http://bridge/quote/USDJPY"))
+    with patch("httpx.get", return_value=response):
+        with pytest.raises(error):
+            mt5_quote("http://bridge", "USDJPY")
 
 
 def test_mt5_health_reads_connected_flag_only():

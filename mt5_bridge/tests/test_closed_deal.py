@@ -78,7 +78,7 @@ def test_get_closed_deal_uses_out_deals_weighted_price_and_total_pnl():
     assert deal.profit == pytest.approx(-500.0)
     assert deal.swap == pytest.approx(-1.0)
     assert deal.commission == pytest.approx(-1.0)
-    assert deal.closed_at.startswith("2023-11-14T22:15:20")
+    assert deal.closed_at.startswith("2023-11-14T20:15:20")
 
 
 def test_get_closed_deal_returns_none_when_no_out_deal():

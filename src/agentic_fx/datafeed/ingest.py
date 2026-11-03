@@ -243,6 +243,14 @@ class Ingest:
                     delay = min(sources.INTERVAL_MIN[interval] * 60, 2 ** attempt)
                     self.next_probe_at[key] = now + timedelta(seconds=delay)
             except Exception as exc:  # one broken key must not suppress protection
+                if isinstance(exc, sources.BridgeTimeUnverified):
+                    (soft_attempted if soft else attempted).discard(key)
+                    attempt = self._backoff.get(key, 0) + 1
+                    self._backoff[key] = attempt
+                    delay = min(sources.INTERVAL_MIN[interval] * 60, 2 ** attempt)
+                    self.next_probe_at[key] = now + timedelta(seconds=delay)
+                    _log.info("ingest deferred for %s %s: %s", pair, interval, exc)
+                    continue
                 self.last_request_count += 1
                 self.last_errors[key] = str(exc)
                 if soft:

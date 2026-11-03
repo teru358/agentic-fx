@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse
 
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, is_loopback_host, load_settings
-from mt5_client import Mt5Client, PreflightError, ServerTimeUnknownError
+from mt5_client import Mt5Client, PreflightError, ServerTimeUnknownError, TimeRuleUnavailableError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
     ClosedDealResponse,
@@ -169,7 +169,6 @@ async def lifespan(app: FastAPI):
         login=_settings.mt5_login,
         password=_settings.mt5_password,
         server=_settings.mt5_server,
-        offset_cache_path=Path(__file__).parent / _settings.server_offset_path,
         probe_symbol=_settings.server_time_symbol,
     )
     logger.warning(
@@ -270,6 +269,8 @@ class HealthResponse(BaseModel):
     dry_run: bool
     server: str | None = None
     login: int | None = None
+    time_rule_state: str | None = None
+    measured_at: str | None = None
 
 
 # ── endpoints ────────────────────────────────────────────────────
@@ -278,12 +279,17 @@ class HealthResponse(BaseModel):
 def health():
     """ブリッジ生存確認 (heartbeat 用、無認証)。"""
     connected = _client is not None and _client.ping()
+    time_rule_state = measured_at = None
+    if connected and _client is not None and hasattr(_client, "time_rule_status"):
+        time_rule_state, measured_at = _client.time_rule_status()
     return HealthResponse(
         status="ok",
         mt5_connected=connected,
         dry_run=_runtime.dry_run if _runtime else True,
         server=_settings.mt5_server if _settings else None,
         login=_settings.mt5_login if _settings else None,
+        time_rule_state=time_rule_state,
+        measured_at=measured_at,
     )
 
 
@@ -315,6 +321,8 @@ def quote(symbol: str):
         raise HTTPException(503, "MT5 not connected")
     try:
         return asdict(_client.get_quote(symbol))
+    except TimeRuleUnavailableError as e:
+        raise HTTPException(503, e.detail)
     except ServerTimeUnknownError as e:
         # RuntimeError のサブクラスなので 404 に落ちる前に捕まえる。
         # 時刻が確定しないのは「見つからない」ではなく一時的な利用不能 = 503
@@ -387,6 +395,8 @@ def ohlcv(
     except ServerTimeUnknownError as e:
         # オフセット未確定のまま足を返すと、ずれた時刻でサイジングされる
         raise HTTPException(503, str(e))
+    except TimeRuleUnavailableError as e:
+        raise HTTPException(503, e.detail)
     except RuntimeError as e:
         raise HTTPException(404, str(e))
 

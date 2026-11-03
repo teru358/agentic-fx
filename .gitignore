@@ -16,6 +16,8 @@ policy/directives.md
 
 # Local data / logs / personal notes
 data/
+!mt5_bridge/tests/data/
+!mt5_bridge/tests/data/dst_rule_table.json
 logs/
 reports/
 CLAUDE.md
