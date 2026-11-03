@@ -87,6 +87,7 @@ EXPECTED = (
     ('news enable', G.MARKET, "LOCAL", 'afx news enable <name>', None, "CHANGE", False, False, None, None, False, '次の収集周期で反映'),
     ('news disable', G.MARKET, "LOCAL", 'afx news disable <name>', None, "CHANGE", False, False, None, None, False, '次の収集周期で反映'),
     ('history import', G.MARKET, "LOCAL", 'afx history import …', None, "CHANGE", False, False, None, None, False, None),
+    ('history repair-time', G.MARKET, "LOCAL", 'afx history repair-time --indicator-pending <keep|invalidate> [--out <plan.json>]', None, "CHANGE", True, False, None, None, False, 'apply は daemon 停止中'),
     ('history compare', G.MARKET, "LOCAL", 'afx history compare …', None, "READ", False, False, None, None, False, None),
     ('history coverage', G.MARKET, "LOCAL", 'afx history coverage …', None, "READ", False, False, None, None, False, None),
     ('backtest run', G.RESEARCH, "LOCAL", 'afx backtest run …', None, "CHANGE", False, False, None, None, False, None),

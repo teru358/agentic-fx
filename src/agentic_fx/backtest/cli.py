@@ -32,6 +32,7 @@ from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
     ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest import plugin_deploy_cli
+from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
@@ -107,6 +108,13 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
+
+    repair = history_sub.add_parser("repair-time", **_surface_parser_kw("history repair-time", leaf=True))
+    repair.add_argument("--indicator-pending", choices=("keep", "invalidate"), required=True)
+    repair.add_argument("--out", type=Path)
+    repair.add_argument("--apply", action="store_true")
+    repair.add_argument("--plan", type=Path)
+    repair.add_argument("--confirm")
 
     news = sub.add_parser("news", **_surface_parser_kw("news"))
     news_sub = news.add_subparsers(dest="news_command", required=True)
@@ -313,6 +321,25 @@ def _history_coverage(conn, args: argparse.Namespace) -> int:
                              dataset=dataset, start=args.from_,
                              end=args.to)
     print(result)
+    return 0
+
+
+def _history_repair_time(conn, args: argparse.Namespace, root: Path) -> int:
+    if args.apply:
+        if args.out is not None or args.plan is None or args.confirm is None:
+            raise time_repair.RepairError("--apply requires --plan and --confirm", 2)
+        try:
+            plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise time_repair.RepairError(f"cannot read plan: {exc}", 2) from exc
+        time_repair.apply_plan(conn, root / "data" / "agentic.db", plan, confirm=args.confirm)
+        print("time repair applied")
+        return 0
+    plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending)
+    out = args.out or root / "data" / "time-repair" / f"plan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps({"plan": str(out), "plan_hash": plan["plan_hash"], "targets": plan["targets"]}, ensure_ascii=False))
     return 0
 
 
@@ -890,6 +917,8 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                     return _history_import(conn, settings, args)
                 if args.history_command == "compare":
                     return _history_compare(conn, settings, args)
+                if args.history_command == "repair-time":
+                    return _history_repair_time(conn, args, root)
                 return _history_coverage(conn, args)
             if args.command == "backtest":
                 return _backtest_run(conn, settings, args, root)
@@ -914,6 +943,9 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             return _analyze_corr(conn, args)
         finally:
             conn.close()
+    except time_repair.RepairError as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return e.exit_code
     except (ValueError, KeyError, OSError, sqlite3.Error,
            VerifyBackendGateError) as e:
         print(f"エラー: {e}", file=sys.stderr)
