@@ -920,7 +920,7 @@ rm -- data/state/setup_in_progress                           # 印を消す
 systemctl --user reset-failed afx
 ```
 
-期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76`)。終了コード 75 は `afx ops <feature> enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
+期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76 78`)。終了コード 75 は `afx ops <feature> enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
 
 ### 6.6 依存の実効値
 

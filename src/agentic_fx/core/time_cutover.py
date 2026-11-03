@@ -109,6 +109,11 @@ def day_close_rollover(window: tuple[datetime, datetime] | None,
     return min(legacy_next_rollover(anchor), new)
 
 
+def earliest_day_close_rollover(anchor: datetime) -> datetime:
+    """Boundary used when the window cannot be read: the earlier of the rules."""
+    return min(legacy_next_rollover(anchor), market_hours.next_rollover(anchor))
+
+
 def daily_base(conn: sqlite3.Connection, now: datetime,
                compute: Callable[[datetime], float | None]) -> float | None:
     """Daily-loss reference equity; ``compute`` maps a day start to equity.

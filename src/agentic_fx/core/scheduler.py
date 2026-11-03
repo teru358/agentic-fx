@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -120,6 +120,7 @@ class Scheduler:
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
         self._closed_bar_unavailable_pairs: set[str] = set()
+        self._day_close_window_logged: set[date] = set()
         # 永続化に失敗した (pair, interval)。同一プロセスが生きている間は
         # tick の finally で再試行する (at-least-once)。
         self._dirty_cron_cursor: set[tuple[str, str]] = set()
@@ -1239,17 +1240,23 @@ class Scheduler:
                     if row["horizon"] == "day"]
         if not day_rows:
             return
-        # 切替の窓は tick の間変わらないので 1 度だけ引く。読めなければ緩めずに
-        # この tick の day 強制決済を見送り、次 tick で再試行する。
+        # 切替の窓は tick の間変わらないので 1 度だけ引く。読めなければ
+        # 旧規則と新規則の早い方で閉じる (期限を延ばさない側に倒す)。
+        window_readable = True
+        window = None
         try:
             window = time_cutover.active_window(self.conn, now)
         except Exception as e:  # noqa: BLE001 — 後続の _process_exits を止めない
+            window_readable = False
             text = safe_error_text(e)
-            self.activity.write(
-                Category.TRADE, "day_close_error",
-                f"切替の窓を読めない: {text} — 次 tick 再試行")
+            day = market_hours.trading_date(now)
+            if day not in self._day_close_window_logged:
+                self._day_close_window_logged.add(day)
+                self.activity.write(
+                    Category.TRADE, "day_close_window_unreadable",
+                    f"切替の窓を読めない: {text} — 旧規則と新規則の早い方の"
+                    "期限で day 建玉を閉じる", ref_id=day.isoformat())
             _log.warning("day close window unreadable: %s", text)
-            return
         for row in day_rows:
             # site 2 (fix round 3): ポジション単位で隔離する。以前は
             # datetime.fromisoformat(anchor) (I1 と同型の欠陥) も
@@ -1260,8 +1267,11 @@ class Scheduler:
             # (レビュアー実測)。
             try:
                 anchor = row["filled_at"] or row["created_at"]
-                deadline = time_cutover.day_close_rollover(
-                    window, datetime.fromisoformat(anchor))
+                opened = datetime.fromisoformat(anchor)
+                deadline = (
+                    time_cutover.day_close_rollover(window, opened)
+                    if window_readable
+                    else time_cutover.earliest_day_close_rollover(opened))
                 if now < deadline - market_hours.DAY_CLOSE_BUFFER:
                     continue
                 try:

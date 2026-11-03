@@ -851,19 +851,54 @@ def test_force_close_reads_the_marker_once_however_many_day_positions(tmp_path):
     assert len(reads) == 1
 
 
-def test_force_close_survives_a_marker_read_failure_and_retries_next_tick(tmp_path, monkeypatch):
-    env, oid = _filled_day_env(
-        tmp_path, name="r", placed_at=_dt(2026, 11, 3, 9, 59),
-        filled_at=_dt(2026, 11, 3, 10, 0))
-    time_cutover.ensure_cutover(env.conn, now=T_C,
-                                activity=ActivityLog(tmp_path / "r" / "cut.log"))
-    def broken(conn, now):
-        raise sqlite3.OperationalError("database is locked")
+def _broken_window(conn, now):
+    raise sqlite3.OperationalError("database is locked")
 
+
+def _failsafe_env(tmp_path, name, day, filled_hour):
+    return _filled_day_env(
+        tmp_path, name=name, placed_at=_dt(*day, filled_hour - 1, 59),
+        filled_at=_dt(*day, filled_hour, 0))
+
+
+def test_unreadable_window_closes_at_the_earlier_legacy_deadline_in_winter(tmp_path, monkeypatch):
+    env, oid = _failsafe_env(tmp_path, "r", (2026, 11, 3), 10)
     with monkeypatch.context() as m:
-        m.setattr(time_cutover, "active_window", broken)
-        env.sched._force_close_day(T_C)
+        m.setattr(time_cutover, "active_window", _broken_window)
+        env.sched._force_close_day(_dt(2026, 11, 3, 20, 54))
+        assert orders.get(env.conn, oid)["status"] == "open"
+        env.sched._force_close_day(_dt(2026, 11, 3, 20, 55))
+    row = orders.get(env.conn, oid)
+    assert (row["status"], row["close_reason"]) == ("closed", "day_rollover")
+
+
+def test_unreadable_window_closes_at_the_shared_deadline_in_summer(tmp_path, monkeypatch):
+    env, oid = _failsafe_env(tmp_path, "s", (2026, 7, 1), 10)
+    with monkeypatch.context() as m:
+        m.setattr(time_cutover, "active_window", _broken_window)
+        env.sched._force_close_day(_dt(2026, 7, 1, 20, 54))
+        assert orders.get(env.conn, oid)["status"] == "open"
+        env.sched._force_close_day(_dt(2026, 7, 1, 20, 55))
+    assert orders.get(env.conn, oid)["status"] == "closed"
+
+
+def test_unreadable_window_is_logged_once_per_trading_day(tmp_path, monkeypatch):
+    env, _ = _failsafe_env(tmp_path, "t", (2026, 11, 3), 10)
+    with monkeypatch.context() as m:
+        m.setattr(time_cutover, "active_window", _broken_window)
+        env.sched._force_close_day(_dt(2026, 11, 3, 12, 0))
+        env.sched._force_close_day(_dt(2026, 11, 3, 12, 0, 30))
+    text = (tmp_path / "t" / "a.log").read_text(encoding="utf-8")
+    assert text.count("day_close_window_unreadable") == 1
+    assert "day_close_error" not in text
+
+
+def test_window_read_recovery_returns_to_the_new_rule(tmp_path, monkeypatch):
+    env, oid = _failsafe_env(tmp_path, "u", (2026, 11, 3), 10)
+    with monkeypatch.context() as m:
+        m.setattr(time_cutover, "active_window", _broken_window)
+        env.sched._force_close_day(_dt(2026, 11, 3, 12, 0))
+    env.sched._force_close_day(_dt(2026, 11, 3, 20, 55))
     assert orders.get(env.conn, oid)["status"] == "open"
-    assert "day_close_error" in (tmp_path / "r" / "a.log").read_text(encoding="utf-8")
-    env.sched._force_close_day(T_C + timedelta(seconds=30))
+    env.sched._force_close_day(_dt(2026, 11, 3, 21, 55))
     assert orders.get(env.conn, oid)["status"] == "closed"
