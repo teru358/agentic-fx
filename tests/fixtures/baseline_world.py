@@ -128,6 +128,8 @@ def open_world(root: Path, *, mode: str = "enforce",
                 s.improve.baseline_replay_wall_clock_max_sec = wall_clock_max_sec
             for key, value in (plugin_updates or {}).items():
                 setattr(s.plugin, key, value)
+            # この world は baseline 比較を見る。新しい床は床の test が見る。
+            s.improve.gate.max_trades_per_eval_bar = None
             for key, value in (gate_updates or {}).items():
                 setattr(s.improve.gate, key, value)
             fx.seed_history(app.conn_core, phase_bars=WINTER_PHASE_BARS)
