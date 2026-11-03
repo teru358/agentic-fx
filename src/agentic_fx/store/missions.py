@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from agentic_fx._safe_error import safe_text
-from agentic_fx.core import market_hours
+from agentic_fx.core import time_cutover
 from agentic_fx import improve_notice_codes as notice_codes
 
 if TYPE_CHECKING:
@@ -290,7 +290,7 @@ def signals_rate_ok(conn: sqlite3.Connection, now: datetime,
 
     最短間隔: 直近の signal% 行 (started_at 最大) から
     ``settings.plugin.signal_min_interval_min`` 分未満なら False。
-    日次上限: ``market_hours.trading_day_start(now)`` 以降の signal% 行数が
+    日次上限: ``time_cutover.signal_day_start(conn, now)`` 以降の signal% 行数が
     ``settings.plugin.signal_daily_max`` 以上なら False。
     """
     rows = conn.execute(
@@ -302,7 +302,7 @@ def signals_rate_ok(conn: sqlite3.Connection, now: datetime,
     plugin = settings.plugin
     if now - started_ats[-1] < timedelta(minutes=plugin.signal_min_interval_min):
         return False
-    day_start = market_hours.trading_day_start(now)
+    day_start = time_cutover.signal_day_start(conn, now)
     today_count = sum(1 for ts in started_ats if ts >= day_start)
     return today_count < plugin.signal_daily_max
 

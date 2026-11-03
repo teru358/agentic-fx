@@ -24,3 +24,7 @@ source_section: 完了ログ
 
 - 2026-09-29: `.superpowers/sdd/plan10-plan/tickets.md` から機械移行 (backfilled)。状態は移行時の判定。
 
+
+## 後続の実測 (2026-11-02)
+
+DST 切替の実測で、サーバ時刻は UTC+3 固定ではなく NY + 7h (夏 UTC+3 / 冬 UTC+2) と判明。週末境界は夏 21:00Z / 冬 22:00Z。→ market-hours-fixed-21utc-ignores-dst

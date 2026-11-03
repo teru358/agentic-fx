@@ -1219,3 +1219,14 @@ def test_baseline_replay_wall_clock_rejects_bad_values(value):
 
     with pytest.raises(ValidationError):
         ImproveSettings(baseline_replay_wall_clock_max_sec=value)
+
+
+def test_friday_swing_cutoff_limit_is_derived_from_rollover_and_margin():
+    from datetime import date, datetime
+
+    from agentic_fx.core import fx_time
+
+    rollover = datetime.combine(date(2026, 1, 1), fx_time.ROLLOVER_NY)
+    assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY == (
+        rollover - fx_time.SWING_CUTOFF_MARGIN).time()
+    assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY.hour == 16

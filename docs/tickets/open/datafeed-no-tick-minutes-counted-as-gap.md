@@ -25,3 +25,4 @@ related: []
 ## 経緯
 
 - 2026-11-02: 起票。
+- 2026-11-03: 原因の注記。2026-11-02 の hold 多発の主因は tick 無しではなく、冬の日曜 21:00〜22:00 UTC を開場と誤判定していたこと (market-hours-fixed-21utc-ignores-dst)。残る論点は read tool の欠損注記の設計 (2026-11-02-read-tool-gap-annotate-design、未 commit) で、DST 是正の後に v0.2。

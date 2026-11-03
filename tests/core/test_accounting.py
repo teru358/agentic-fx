@@ -54,6 +54,17 @@ def test_daily_start_equity(tmp_path):
     assert daily_start_equity(c, NOW) == 101.0
 
 
+def test_daily_start_equity_uses_winter_new_york_boundary(tmp_path):
+    c = _conn(tmp_path)
+    before_new_boundary = datetime(2026, 11, 3, 21, 30, tzinfo=timezone.utc)
+    after_new_boundary = datetime(2026, 11, 3, 22, 1, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 4, 21, 30, tzinfo=timezone.utc)
+    record_snapshot(c, now=before_new_boundary, balance=100, equity=90.0)
+    record_snapshot(c, now=after_new_boundary, balance=100, equity=101.0)
+
+    assert daily_start_equity(c, now) == 101.0
+
+
 def test_daily_start_falls_back_to_last_before(tmp_path):
     c = _conn(tmp_path)
     record_snapshot(c, now=datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),

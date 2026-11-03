@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import timedelta
+from datetime import time, timedelta
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,6 +15,8 @@ from pydantic import (
     BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator,
     model_validator,
 )
+
+from agentic_fx.core.fx_time import FRIDAY_SWING_CUTOFF_LIMIT_NY
 
 _log = logging.getLogger("agentic_fx.config")
 
@@ -64,8 +66,8 @@ class RiskSettings(_Strict):
     limit_deviation_pct: float = Field(gt=0)
     limit_expiry_max_h: float = Field(gt=0, le=24)
     max_slippage_pct: float = Field(gt=0)
-    # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)
-    # なので、通年でクローズより前になる範囲だけを受け入れる。
+    # NY 現地時間。市場クローズは NY 17:00 (夏 21:00 UTC / 冬 22:00 UTC)。
+    # cutoff は fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY (クローズの余裕を引いた時刻) 未満に限る。
     friday_swing_cutoff_ny: str = "14:00"
     commission_per_lot: float = Field(ge=0)
     pair_rules: dict[str, PairRule]
@@ -73,15 +75,14 @@ class RiskSettings(_Strict):
     @field_validator("friday_swing_cutoff_ny")
     @classmethod
     def _friday_swing_cutoff_before_close(cls, value: str) -> str:
+        limit = FRIDAY_SWING_CUTOFF_LIMIT_NY.strftime("%H:%M")
+        message = ("friday_swing_cutoff_ny must be ASCII HH:MM in range "
+                   f"00:00 <= cutoff < {limit}; got {value!r}")
         if not re.fullmatch(r"\d{2}:\d{2}", value, flags=re.ASCII):
-            raise ValueError(
-                "friday_swing_cutoff_ny must be ASCII HH:MM in range "
-                f"00:00 <= cutoff < 16:00; got {value!r}")
+            raise ValueError(message)
         hour, minute = map(int, value.split(":"))
-        if hour > 23 or minute > 59 or hour >= 16:
-            raise ValueError(
-                "friday_swing_cutoff_ny must be in range "
-                f"00:00 <= cutoff < 16:00; got {value!r}")
+        if hour > 23 or minute > 59 or time(hour, minute) >= FRIDAY_SWING_CUTOFF_LIMIT_NY:
+            raise ValueError(message)
         return value
 
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 
-from agentic_fx.core.market_hours import trading_day_start
+from agentic_fx.core import time_cutover
 from agentic_fx.core.timeutil import as_utc
 from agentic_fx.store import snapshots
 
@@ -47,10 +47,12 @@ def drawdown_pct(equity: float, hwm: float) -> float:
     return max(0.0, (hwm - equity) / hwm * 100.0)
 
 
-def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
-                       max_age_hours: float = 48.0) -> float | None:
+def daily_start_snapshot(conn: sqlite3.Connection, now: datetime,
+                         day_start: datetime, *,
+                         max_age_hours: float = 48.0
+                         ) -> tuple[float, str] | None:
+    """Reference equity for a day beginning at ``day_start`` and its snapshot ts."""
     now = as_utc(now)
-    day_start = trading_day_start(now)
     row = snapshots.first_since(conn, day_start)
     if row is None:
         row = snapshots.last_before(conn, day_start)
@@ -64,7 +66,19 @@ def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
         "SELECT COALESCE(SUM(cashflow), 0) AS cf FROM account_snapshots "
         "WHERE ts > ? AND ts <= ?",
         (row["ts"], now.isoformat())).fetchone()["cf"]
-    return row["equity"] + cf
+    return row["equity"] + cf, row["ts"]
+
+
+def daily_start_equity(conn: sqlite3.Connection, now: datetime, *,
+                       max_age_hours: float = 48.0) -> float | None:
+    now = as_utc(now)
+
+    def reference(day_start: datetime) -> float | None:
+        found = daily_start_snapshot(conn, now, day_start,
+                                     max_age_hours=max_age_hours)
+        return None if found is None else found[0]
+
+    return time_cutover.daily_base(conn, now, reference)
 
 
 def current_account(conn: sqlite3.Connection, now: datetime, *,

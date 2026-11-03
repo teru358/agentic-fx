@@ -577,6 +577,32 @@ def test_day_forced_close_uses_quote_side(tmp_path):
     assert row["close_price"] == QUOTE.bid  # long は bid (保守側)
 
 
+@pytest.mark.parametrize(("base", "last_open", "close_at"), [
+    (datetime(2026, 11, 4, 10, 0, tzinfo=timezone.utc),
+     datetime(2026, 11, 4, 21, 54, tzinfo=timezone.utc),
+     datetime(2026, 11, 4, 21, 55, tzinfo=timezone.utc)),
+    (datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc),
+     datetime(2026, 7, 22, 20, 54, tzinfo=timezone.utc),
+     datetime(2026, 7, 22, 20, 55, tzinfo=timezone.utc)),
+])
+def test_day_close_deadline_is_five_minutes_before_new_york_close(
+        tmp_path, base, last_open, close_at):
+    env = Env(tmp_path, base=base)
+    oid = env.place_limit()
+    env.bars["USDJPY"] = Bar("USDJPY", "1m", base, 148.30, 148.35, 148.15,
+                             148.25, 100)
+    env.sched.tick(base + timedelta(minutes=1))
+    assert orders.get(env.conn, oid)["status"] == "open"
+
+    env.sched._force_close_day(last_open)
+    assert orders.get(env.conn, oid)["status"] == "open"
+
+    env.sched._force_close_day(close_at)
+    row = orders.get(env.conn, oid)
+    assert row["status"] == "closed"
+    assert row["close_reason"] == "day_rollover"
+
+
 def test_day_close_deferred_on_quote_failure(tmp_path):
     def bad_quote(pair):
         raise RuntimeError("quote down")

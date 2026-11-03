@@ -181,8 +181,8 @@ def _mtm(conn, ts, *, equity=98_000.0, hwm=100_000.0):
 @pytest.mark.parametrize(("now", "expected"), [
     (datetime(2026, 9, 5, 21, tzinfo=UTC), False),
     (datetime(2026, 9, 6, 21, tzinfo=UTC), True),
-    (datetime(2025, 12, 25, 20, 59, tzinfo=UTC), False),
-    (datetime(2025, 12, 25, 21, tzinfo=UTC), True),
+    (datetime(2025, 12, 25, 21, 59, tzinfo=UTC), False),
+    (datetime(2025, 12, 25, 22, tzinfo=UTC), True),
 ])
 def test_release_due_waits_for_real_market_open(now, expected):
     latched_at = (datetime(2026, 9, 4, 20, tzinfo=UTC)

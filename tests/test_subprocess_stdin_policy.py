@@ -14,7 +14,7 @@ def test_subprocess_calls_explicitly_define_stdin_policy():
     # 初めて — `git log -S` で確認) が、「どの呼び出しを許すか」
     # を関数名で書くと同名の別呼び出しを取り違えるので、位置固定のまま
     # ずれたら直す運用を維持する。
-    allowed = {("agentic_fx/store/backtest_runs.py", 351)}
+    allowed = {("agentic_fx/store/backtest_runs.py", 362)}
     missing = []
     seen_allowed = set()
     for path in src.rglob("*.py"):

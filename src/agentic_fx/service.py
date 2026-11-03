@@ -32,6 +32,7 @@ from agentic_fx.config import (
 )
 from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
+from agentic_fx.core import time_cutover
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
 from agentic_fx.core.executor import Executor
@@ -1287,6 +1288,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 "新規 OPEN は止まる。`killswitch reconcile` で確認")
         conn_core = connect(root / "data" / "agentic.db")
         init_db(conn_core, root=root)
+        # instance lock を持ったまま、最初の tick より前に時刻規則の切替を判定する。
+        time_cutover.ensure_cutover(conn_core, now=clock.now(), activity=activity)
         conn_signal = connect(root / "data" / "agentic.db")
         if settings.notify.trade_events is True:
             # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
@@ -2563,6 +2566,10 @@ def run_service(root: Path, *, daemon: bool = False,
     except SetupInProgress:
         print(f"afx: {SETUP_IN_PROGRESS}", file=sys.stderr)
         return EXIT_SETUP_IN_PROGRESS
+    except PreflightFailure as exc:
+        print(f"afx: {exc.code}: {exc}", file=sys.stderr)
+        # marker 欠落は手で直すまで直らないので、専用の終了コードで再起動を止める。
+        return time_cutover.EXIT_MARKER_MISSING if exc.code == time_cutover.MARKER_MISSING else 1
 
     warning = Policy(directives_path(root)).size_warning()
     if warning:

@@ -334,7 +334,7 @@ config/settings.yaml を読めません (通常ファイルで UTF-8 のもの�
   価格源 [既定: 1]: 
   ```
 
-  `1` を選ぶと「yfinance は週明けの開場直後 (日曜 21:00〜23:00 UTC ごろの足が来ない) に、毎週しばらく取引判断を止めます (degraded)。既知の問題です。」と表示され、`yfinance に USDJPY の価格を 1 回問い合わせて確認します。実行しますか [Y/n] ` を尋ねます。`y` で成功なら `yfinance OK`、失敗なら「yfinance の確認に失敗しました (…)。後で再確認できます。」で、どちらでも先へ進みます。`n` で断ると未確認 (`user_declined_probe`) で記録します。`2` (Twelve Data) は `.env` と環境のどちらにも `TWELVEDATA_API_KEY` が無いと選び直しになります (値はここでは入力しません)。
+  `1` を選ぶと「yfinance は週明けの開場直後に足が来ないことがあり、毎週しばらく取引判断を止めます (degraded)。既知の問題です。」と表示され、`yfinance に USDJPY の価格を 1 回問い合わせて確認します。実行しますか [Y/n] ` を尋ねます。`y` で成功なら `yfinance OK`、失敗なら「yfinance の確認に失敗しました (…)。後で再確認できます。」で、どちらでも先へ進みます。`n` で断ると未確認 (`user_declined_probe`) で記録します。`2` (Twelve Data) は `.env` と環境のどちらにも `TWELVEDATA_API_KEY` が無いと選び直しになります (値はここでは入力しません)。
 - **1 (bridge は動いている)** を選ぶと `bridge の URL [http://localhost:8812]: `、`bridge 側で API キーを設定しましたか (1 はい / 2 いいえ / 3 分からない) [既定: 3]: ` の順に尋ね、成功なら `MT5 bridge OK: USDJPY (bridge の時刻 <時刻>)`。失敗すると理由を表示し、`[r] 再試行 / [2] 『使う予定・未準備』として進む / [u] URL を入れ直す: ` を尋ねます。
 - **2 (使う予定)** は bridge の配置手順 (7 項目) を表示し、`bridge の URL …` を尋ねて、今接続を試すかを尋ねます (既定: 試さない)。
 
@@ -842,7 +842,7 @@ Claude CLI を PATH から外した状態 (`bin_not_found`)、またはログイ
 
 | 項目 | 期待 |
 |---|---|
-| 1. 実効の unit | 設置した本文と一致。`Type=exec`、`NotifyAccess=none`、`KillMode=control-group`、`DelegateControllers` に `pids` と `memory`、`MainPID` が `python main.py --daemon`、`TimeoutStopUSec=10min 30s`、`RestartPreventExitStatus=75 76` |
+| 1. 実効の unit | 設置した本文と一致。`Type=exec`、`NotifyAccess=none`、`KillMode=control-group`、`DelegateControllers` に `pids` と `memory`、`MainPID` が `python main.py --daemon`、`TimeoutStopUSec=10min 30s`、`RestartPreventExitStatus=75 76 78` |
 | 2. cgroup の形 | afx が unit root から `supervisor/` へ自己移動した位置にあり、mission ごとの cgroup が作られる |
 | 3. linger とログアウト後の存続 | `Linger=yes` なら存続。`no` ならログアウトで止まり、ウィザードが案内を出していたこと |
 | 4. 今回の起動の journal | 今回の起動の admission 行が読め、前回の起動の行と区別できる。`admitted=yes`。field が契約と違えば契約の field 名を直す |
@@ -920,7 +920,7 @@ rm -- data/state/setup_in_progress                           # 印を消す
 systemctl --user reset-failed afx
 ```
 
-期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76`)。終了コード 75 は `afx ops <feature> enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
+期待: `ExecMainStatus=76`、`NRestarts=0`。再起動されない (`RestartPreventExitStatus=75 76 78`)。終了コード 75 は `afx ops <feature> enable` の途中で止まった状態 (`data/ops/enroll_in_progress` がある間) の起動拒否で、通常は再現しません。確かめるなら ops の有効化を途中で中断した状態が要ります。
 
 ### 6.6 依存の実効値
 
