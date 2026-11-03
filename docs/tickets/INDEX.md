@@ -82,7 +82,6 @@
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 高 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
 | [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
@@ -142,6 +141,7 @@
 | [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
 | [plugin-ast-open-attribute-false-positive](open/plugin-ast-open-attribute-false-positive.md) | 低 | 2026-10-31 | plugin AST 検査が df.open (OHLCV 列の属性参照) を reject する |
 | [wizard-codex-model-list-fetch-failed](open/wizard-codex-model-list-fetch-failed.md) | 低 | 2026-10-31 | afx init: codex のモデル一覧取得に失敗する |
+| [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 低 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
 | [approval-no-history-passthrough](open/approval-no-history-passthrough.md) | 低 |  | `plugin/approval.py` の `_validate_kind`/`_validate_strategy… |

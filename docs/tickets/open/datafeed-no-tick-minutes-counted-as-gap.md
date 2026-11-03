@@ -2,7 +2,7 @@
 id: datafeed-no-tick-minutes-counted-as-gap
 title: 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗
 status: 設計待ち
-priority: 高
+priority: 低
 kind: 不具合
 opened: 2026-11-02
 closed: null
@@ -10,7 +10,7 @@ related: []
 ---
 # [datafeed-no-tick-minutes-counted-as-gap] 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗
 
-**状態**: 設計待ち / **優先**: 高 / **種別**: 不具合
+**状態**: 設計待ち / **優先**: 低 / **種別**: 不具合
 
 ## 現象
 
@@ -26,3 +26,4 @@ related: []
 
 - 2026-11-02: 起票。
 - 2026-11-03: 原因の注記。2026-11-02 の hold 多発の主因は tick 無しではなく、冬の日曜 21:00〜22:00 UTC を開場と誤判定していたこと (market-hours-fixed-21utc-ignores-dst)。残る論点は read tool の欠損注記の設計 (2026-11-02-read-tool-gap-annotate-design、未 commit) で、DST 是正の後に v0.2。
+- 2026-11-03: 状態: 設計待ち、優先: 低 — 2026-11-03: ユーザー裁定で保留。DST 是正後の実測で 15m / 1h の gap は 0、残るのは 1m / 5m の 27 日で 7 区間 (日曜開場 5、rollover 1、平日 1)。設計 v0.2 は docs/superpowers/specs/2026-11-02-read-tool-gap-annotate-design.md (r1 指摘反映済み、実装は econ 束と T4 の後に再判断)
