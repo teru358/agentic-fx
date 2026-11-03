@@ -610,7 +610,7 @@ def test_import_mt5_two_window_failure_keeps_no_window(tmp_path):
     assert ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5") == []
 
 
-def test_import_mt5_validation_error_reports_failed_window_and_last_success(
+def test_import_mt5_validation_error_reports_failed_window_and_that_nothing_was_written(
         tmp_path):
     conn = _conn(tmp_path)
 
@@ -625,7 +625,9 @@ def test_import_mt5_validation_error_reports_failed_window_and_last_success(
                    base_url="http://x", fetch=fetch)
     message = str(raised.value)
     assert f"failed window [{(H + timedelta(days=1)).isoformat()}" in message
-    assert f"last successful window end={ (H + timedelta(days=1)).isoformat()}" in message
+    assert "何も書き込んでいません" in message
+    assert f"開始 {H.isoformat()} から取り直" in message
+    assert "last successful" not in message
 
 
 def test_import_mt5_same_payload_rerun_is_unchanged_only(tmp_path):
@@ -655,13 +657,14 @@ def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_pat
     with pytest.raises(ImportConflictError) as raised:
         import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                    base_url="http://x", fetch=fetch)
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert raised.value.conflicts == (
         ("USDJPY", "1m", H.isoformat(),
          (148.0, 148.2, 147.9, 148.1, 10.0, None),
          (149.0, 149.2, 148.9, 149.1, 20, None)),
     )
     stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert [b.ts for b in stored] == [H]
     assert stored[0].close == 148.1
 
 
@@ -954,3 +957,24 @@ def test_import_history_bars_without_commit_needs_a_transaction(tmp_path):
             conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9, 148.1, 10, None)],
             source="mt5", commit=False)
     assert _stored_row_count(conn) == 0
+
+
+def test_import_mt5_does_not_hold_the_write_lock_while_fetching(tmp_path):
+    from agentic_fx.store.db import connect
+    conn = _conn(tmp_path)
+    other = connect(tmp_path / "t.db")
+    other.execute("PRAGMA busy_timeout=0")
+    seen = []
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        assert not conn.in_transaction
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+        seen.append(start)
+        return _payload(_bar(start))
+
+    result = import_mt5(conn, "USDJPY", H, H + timedelta(days=3),
+                        base_url="http://x", fetch=fetch)
+    assert len(seen) == 3
+    assert result.inserted == 3

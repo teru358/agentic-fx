@@ -26,6 +26,10 @@ _log = logging.getLogger("agentic_fx.ingest")
 SOFT_BACKOFF_BASE_SEC = 60
 
 
+UNVERIFIED_ALERT_AFTER = timedelta(seconds=300)
+UNVERIFIED_ERROR_TEXT = "bridge time rule unverified while market open"
+
+
 def soft_backoff_delay(attempt: int, width_sec: float) -> float:
     """Capped exponential delay after the ``attempt``-th consecutive miss (1-based)."""
     return min(width_sec, SOFT_BACKOFF_BASE_SEC * 2 ** (attempt - 1))
@@ -33,6 +37,9 @@ def soft_backoff_delay(attempt: int, width_sec: float) -> float:
 
 def classify_fetch_error(exc: BaseException) -> str:
     """``source_unavailable`` for transport faults and 5xx, otherwise ``fetch_failed``."""
+    if isinstance(exc, (sources.BridgeTimeRuleMismatch,
+                        sources.BridgeTimeUnverified)):
+        return "source_unavailable"
     if isinstance(exc, httpx.HTTPStatusError):
         return ("source_unavailable" if exc.response.status_code >= 500
                 else "fetch_failed")
@@ -67,6 +74,8 @@ class Ingest:
         self.last_request_count = 0
         self.budget_exhausted = False
         self.last_errors: dict[tuple[str, str], str] = {}
+        self._unverified_since: dict[tuple[str, str], datetime] = {}
+        self._unverified_reported: set[tuple[str, str]] = set()
         # Replaced wholesale by the scheduler thread each prepare; other threads
         # only read the reference, so no lock is needed.
         self.reference_fetch_state: Mapping[tuple[str, str], str] = MappingProxyType({})
@@ -148,6 +157,8 @@ class Ingest:
         self.last_request_count = 0
         self.budget_exhausted = False
         if not market_hours.is_market_open(now):
+            self._unverified_since.clear()
+            self._unverified_reported.clear()
             return 0, EMPTY_REPORT
         started = self.monotonic()
         budget = self.settings.datafeed.ingest_budget_sec
@@ -208,6 +219,8 @@ class Ingest:
             width = timedelta(minutes=sources.INTERVAL_MIN[interval])
             try:
                 raw = self._request(pair, interval, start, now, timeout)
+                self._unverified_since.pop(key, None)
+                self._unverified_reported.discard(key)
                 bars = normalize_closed_range(raw, interval=interval, start=start,
                                               end=now, cutoff=now, grace=grace)
                 self._pending[key] = bars
@@ -250,7 +263,18 @@ class Ingest:
                     delay = min(sources.INTERVAL_MIN[interval] * 60, 2 ** attempt)
                     self.next_probe_at[key] = now + timedelta(seconds=delay)
                     _log.info("ingest deferred for %s %s: %s", pair, interval, exc)
+                    since = self._unverified_since.setdefault(key, now)
+                    if (now - since >= UNVERIFIED_ALERT_AFTER
+                            and key not in self._unverified_reported):
+                        self._unverified_reported.add(key)
+                        self.last_errors[key] = UNVERIFIED_ERROR_TEXT
+                        _log.warning(
+                            "ingest still deferred for %s %s: bridge time rule "
+                            "unverified for %d sec while the market is open",
+                            pair, interval, int((now - since).total_seconds()))
                     continue
+                self._unverified_since.pop(key, None)
+                self._unverified_reported.discard(key)
                 self.last_request_count += 1
                 self.last_errors[key] = str(exc)
                 if soft:

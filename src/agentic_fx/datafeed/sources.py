@@ -145,6 +145,7 @@ def _mt5_headers() -> dict[str, str]:
 def _raise_mt5_time_rule_error(response: httpx.Response) -> None:
     if response.status_code != 503:
         response.raise_for_status()
+        return
     try:
         detail = response.json().get("detail")
     except (ValueError, AttributeError):

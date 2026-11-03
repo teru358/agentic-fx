@@ -502,3 +502,56 @@ def test_positions_and_deal_requests_log_a_state_change_without_blocking(caplog)
         assert client.get_closed_deal(1) is None
     assert _state_lines(caplog) == ["MT5 time rule state: mismatch",
                                     "MT5 time rule state: ok"]
+
+
+# ── 古い tick の誤受理 / 閉場中の取得 ──────────────────────────────
+
+def test_frozen_half_hour_old_tick_does_not_latch_a_mismatch():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    assert _ohlcv(client) == []                              # 規則どおりで ok
+    now_epoch = int(client.clock.now.timestamp())
+    client._mt5.frozen["USDJPY"] = now_epoch + 10800 - 1800  # 30 分前から止まった tick
+    for _ in range(4):
+        client.clock.advance(seconds=60)
+        client.get_server_time()
+    info = client.get_server_time()
+    assert info["time_rule_state"] != "mismatch"
+    assert info["measured_offset_sec"] == 10800
+
+
+def test_stale_tick_measurement_is_ignored_until_the_tick_moves():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    assert _ohlcv(client) == []
+    first_measured_at = client.get_server_time()["measured_at"]
+    client.clock.advance(seconds=60)
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 10800
+    client.get_server_time()                                 # 新しい値: 受理
+    accepted_at = client.get_server_time()["measured_at"]
+    assert accepted_at != first_measured_at
+    client.clock.advance(seconds=60)
+    client.get_server_time()                                 # 同じ値のまま: 採らない
+    assert client.get_server_time()["measured_at"] == accepted_at
+    del client._mt5.frozen["USDJPY"]
+    client.clock.advance(seconds=60)
+    assert client.get_server_time()["measured_at"] != accepted_at
+
+
+def test_new_tick_one_hour_off_the_rule_still_latches_a_mismatch():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    assert _ohlcv(client) == []
+    client._mt5.offset = 7200
+    client.clock.advance(seconds=60)
+    assert client.get_server_time()["time_rule_state"] == "mismatch"
+
+
+def test_closed_market_range_request_is_refused_before_fetching():
+    client = _client(_at(2026, 7, 25, 12, 0), 10800)         # 土曜
+    with pytest.raises(TimeRuleUnavailableError, match="time_rule_unverified"):
+        _ohlcv(client)
+    assert client._mt5.range_args == []
+
+
+def test_open_market_range_request_still_fetches_then_checks():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    assert _ohlcv(client) == []
+    assert len(client._mt5.range_args) == 1

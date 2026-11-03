@@ -238,43 +238,48 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     naive_count = 0
     right_edge_drops = 0
 
-    # 全窓が取れたときだけ書き込みを確定する。途中の窓で bridge が拒否したり
-    # 応答が不正だったりしたら、それまでの窓も残さない。既存行との食い違い
-    # (conflict) だけは、人が確認する停止としてそこまでの窓を確定してから上げる。
+    # 全窓を先に取得して検証し、メモリに溜める (HTTP を待つ間は DB の書き込み
+    # lock を握らない)。どれかの窓で bridge が拒否したり応答が不正だったり
+    # したら、何も書かずに止める。書込みは最後に 1 回の短い transaction で行い、
+    # 既存行との食い違い (conflict) だけは、人が確認する停止としてそこまでの
+    # 窓を確定してから上げる。
+    pending: list[list[tuple]] = []
+    current = start
+    while current < end:
+        window_end = min(current + timedelta(days=1), end)
+        url = _window_url(base_url, symbol, current, window_end, interval)
+        payload = fetch(url)
+        try:
+            rows, window_naive, window_right_edges = _validated_window_rows(
+                payload, symbol=symbol, interval=interval, current=current,
+                window_end=window_end)
+        except ValueError as exc:
+            raise ValueError(
+                f"import_mt5: failed window [{current.isoformat()}, "
+                f"{window_end.isoformat()}): {exc}. 何も書き込んでいません。"
+                f"開始 {start.isoformat()} から取り直してください") from exc
+        naive_count += window_naive
+        right_edge_drops += window_right_edges
+        if rows:
+            pending.append(rows)
+        current = window_end
+
     owns_transaction = not conn.in_transaction
     if owns_transaction:
         conn.execute("BEGIN")
     try:
-        current = start
-        while current < end:
-            window_end = min(current + timedelta(days=1), end)
-            url = _window_url(base_url, symbol, current, window_end, interval)
-            payload = fetch(url)
-            try:
-                rows, window_naive, window_right_edges = _validated_window_rows(
-                    payload, symbol=symbol, interval=interval, current=current,
-                    window_end=window_end)
-            except ValueError as exc:
-                raise ValueError(
-                    f"import_mt5: failed window [{current.isoformat()}, "
-                    f"{window_end.isoformat()}); last successful window end="
-                    f"{current.isoformat()}: {exc}") from exc
-            naive_count += window_naive
-            right_edge_drops += window_right_edges
-            if rows:
-                result = import_history_bars(
-                    conn, rows, source="mt5", commit=False)
-                total_inserted += result.inserted
-                total_unchanged += result.unchanged
-                total_conflicted += result.conflicted
-                if result.conflicted > 0:
-                    partial = ImportResult(
-                        total_inserted, total_unchanged, total_conflicted)
-                    if owns_transaction:
-                        conn.commit()
-                    raise ImportConflictError(result.conflicts, partial=partial)
-
-            current = window_end
+        for rows in pending:
+            result = import_history_bars(
+                conn, rows, source="mt5", commit=False)
+            total_inserted += result.inserted
+            total_unchanged += result.unchanged
+            total_conflicted += result.conflicted
+            if result.conflicted > 0:
+                partial = ImportResult(
+                    total_inserted, total_unchanged, total_conflicted)
+                if owns_transaction:
+                    conn.commit()
+                raise ImportConflictError(result.conflicts, partial=partial)
     except ImportConflictError:
         raise
     except BaseException:

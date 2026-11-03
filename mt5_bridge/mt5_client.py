@@ -116,11 +116,15 @@ def snap_server_offset(raw_sec: float) -> int | None:
        丸めることで tick とこちらの時計の秒単位のずれを吸収する
        (実測 raw = 10799.3s → 10800 = 3h ちょうど)
     3. |raw - snapped| > 120s → 棄却。残差が大きいのも tick が古い証拠
+    4. 1 時間の倍数でないものは棄却。30 分前の古い tick は raw が規則の
+       オフセットから 30 分ずれ、ガード 2・3 を通ってしまう
     """
     if abs(raw_sec) > _OFFSET_MAX_ABS_SEC:
         return None
     snapped = int(round(raw_sec / _OFFSET_SNAP_SEC) * _OFFSET_SNAP_SEC)
     if abs(raw_sec - snapped) > _OFFSET_MAX_RESIDUAL_SEC:
+        return None
+    if snapped % 3600 != 0:
         return None
     return snapped
 
@@ -225,6 +229,7 @@ class Mt5Client:
         self._lock = threading.Lock()  # MT5 単一接続への並行アクセスを直列化
         self._probe_symbol = probe_symbol
         self._last_measure_attempt_at = 0.0
+        self._last_tick_time = {}
         self._measured_offset_sec = None
         self._measured_at = None
         self._match_streak = 0
@@ -289,9 +294,6 @@ class Mt5Client:
     def offset_source(self) -> str:
         return "rule"
 
-    def get_server_offset_sec(self) -> int:
-        return _expected_offset(self._now())
-
     def get_server_time(self) -> dict:
         """Return rule-derived server time and the latest measurement evidence."""
         with self._lock:
@@ -335,10 +337,23 @@ class Mt5Client:
         if now_epoch - self._last_measure_attempt_at < _MEASURE_INTERVAL_SEC:
             return
         self._last_measure_attempt_at = now_epoch
-        ticks = [tick_time] if tick_time is not None else []
+        observed: dict[str, int] = {}
+        if tick_time is not None and symbol is not None:
+            observed[symbol] = tick_time
         for candidate in {self._probe_symbol, symbol} - {None}:
+            if candidate in observed:
+                continue
             value = self._probe_tick_time_locked(candidate)
             if value is not None:
+                observed[candidate] = value
+        # 同じ symbol の tick 時刻が前回の測定から変わっていなければ古い tick なので採らない。
+        # (大小は問わない: サーバ側の規則が動けば新しい tick の時刻は戻りうる。)
+        ticks = []
+        last_ticks = self.__dict__.setdefault("_last_tick_time", {})
+        for name, value in observed.items():
+            previous = last_ticks.get(name)
+            last_ticks[name] = value
+            if previous is None or value != previous:
                 ticks.append(value)
         if not ticks:
             return
@@ -624,7 +639,11 @@ class Mt5Client:
                     f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
                 )
 
-            self._maybe_measure_locked(self._now(), symbol=symbol)
+            now = self._now()
+            self._maybe_measure_locked(now, symbol=symbol)
+            if not _market_is_open(now):
+                # 閉場中は時刻規則を検査できない。取得してから捨てずに先に断る。
+                self._require_market_data_time_rule_locked(now)
 
             rates = self._mt5.copy_rates_range(
                 symbol, tf,

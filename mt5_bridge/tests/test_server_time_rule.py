@@ -103,10 +103,16 @@ def test_snap_accepts_zero_offset_when_server_is_utc():
     assert snap_server_offset(-1.2) == 0
 
 
-def test_snap_accepts_negative_and_half_hour_offsets():
-    """負のオフセットと 30 分単位のオフセットも採用対象。"""
+def test_snap_accepts_negative_whole_hour_offsets():
     assert snap_server_offset(-7200.4) == -7200
-    assert snap_server_offset(5400.5) == 5400
+    assert snap_server_offset(3600.5) == 3600
+
+
+def test_snap_rejects_offsets_that_are_not_whole_hours():
+    """30 分前の古い tick は規則のオフセットから 30 分ずれる。採らない。"""
+    assert snap_server_offset(5400.5) is None
+    assert snap_server_offset(10800 - 1800 + 0.4) is None
+    assert snap_server_offset(7200 - 1800 - 0.4) is None
 
 
 # ── 2. 受信方向の換算 (MT5 → こちら): 真の UTC になる ─────────────────

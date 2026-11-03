@@ -340,3 +340,26 @@ def test_trading_pair_adapter_still_resolves_through_the_vendor_table():
     assert seen[0].url.path == "/ohlcv/USDJPY" and bars[0].symbol == "USDJPY"
     with pytest.raises(KeyError):
         mt5_bars_range("http://bridge:8812", "JP225", "1h", START, END)
+
+
+def test_non_503_response_is_not_parsed_for_time_rule_detail():
+    from agentic_fx.datafeed.sources import _raise_mt5_time_rule_error
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise AssertionError("body must not be parsed")
+
+    _raise_mt5_time_rule_error(_Response())
+
+
+def test_non_503_error_status_raises_without_parsing_the_body():
+    from agentic_fx.datafeed.sources import _raise_mt5_time_rule_error
+    response = httpx.Response(500, content=b"not json",
+                              request=httpx.Request("GET", "http://bridge/x"))
+    with pytest.raises(httpx.HTTPStatusError):
+        _raise_mt5_time_rule_error(response)

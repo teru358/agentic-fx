@@ -707,7 +707,8 @@ def test_closed_market_time_rule_wait_is_reported_as_information_and_setup_goes_
     price = record_of(root)["price"]
     assert price["result"] == "unverified" and price["reason_code"] == "time_rule_unchecked"
     assert record_of(root)["bridge_plan"] == "connected"
-    assert "閉場中のため時刻規則は未検査です (開場後に検査されます)" in io.text
+    assert "価格は未確認 (閉場中、開場後に `afx init` か `afx check` で再確認)" in io.text
+    assert "MT5 bridge OK" not in io.text
     assert not io.asked_with("[r] 再試行")
 
 
