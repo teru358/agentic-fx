@@ -902,3 +902,25 @@ def test_window_read_recovery_returns_to_the_new_rule(tmp_path, monkeypatch):
     assert orders.get(env.conn, oid)["status"] == "open"
     env.sched._force_close_day(_dt(2026, 11, 3, 21, 55))
     assert orders.get(env.conn, oid)["status"] == "closed"
+
+
+@pytest.mark.parametrize("t_c, expected_fallback", [
+    (_dt(2026, 11, 5, 10, 0), _dt(2026, 11, 5, 21, 0)),
+    (_dt(2027, 6, 10, 10, 0), _dt(2027, 6, 10, 21, 0)),
+], ids=["winter", "summer"])
+@pytest.mark.parametrize("now_name", ["before_cutover", "at_cutover", "before_boundary", "at_boundary"])
+@pytest.mark.parametrize("anchor_name", ["anchor_before_cutover", "anchor_at_cutover"])
+def test_unreadable_window_deadline_is_never_later_than_the_readable_one(
+        tmp_path, t_c, expected_fallback, now_name, anchor_name):
+    c = _conn(tmp_path)
+    time_cutover.ensure_cutover(c, now=t_c, activity=FakeActivity())
+    t_b = time_cutover.transition_end(t_c)
+    now = {"before_cutover": t_c - timedelta(minutes=1), "at_cutover": t_c,
+           "before_boundary": t_b - timedelta(minutes=1), "at_boundary": t_b}[now_name]
+    anchor = t_c - timedelta(hours=1) if anchor_name == "anchor_before_cutover" else t_c
+    window = time_cutover.active_window(c, now)
+    assert (window is not None) == (now_name in ("at_cutover", "before_boundary"))
+    fallback = time_cutover.earliest_day_close_rollover(anchor)
+    assert fallback <= time_cutover.day_close_rollover(window, anchor)
+    if anchor_name == "anchor_before_cutover":
+        assert fallback == expected_fallback
