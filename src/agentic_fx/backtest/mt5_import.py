@@ -123,6 +123,13 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
             f"import_mt5: payload interval={payload['interval']!r} does not "
             f"match requested interval={interval!r}")
 
+    width_sec = _INTERVAL_SECONDS[interval]
+    capacity = int((window_end - current).total_seconds()) // width_sec
+    if len(payload["bars"]) > capacity + 1:       # 格子数 + 右端 1 行
+        raise ValueError(
+            f"import_mt5: bar count {len(payload['bars'])} exceeds window capacity "
+            f"{capacity} for interval={interval}")
+
     normalized = []
     naive_count = 0
     for idx, bar in enumerate(payload["bars"]):
@@ -174,8 +181,6 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
                 f"が要求窓 [{current.isoformat()}, {window_end.isoformat()}) "
                 "の外です (bridge の不具合の可能性)")
 
-    width_sec = _INTERVAL_SECONDS[interval]
-    capacity = int((window_end - current).total_seconds()) // width_sec
     if len(remaining) > capacity:
         raise ValueError(
             f"import_mt5: bar count {len(remaining)} exceeds window capacity "

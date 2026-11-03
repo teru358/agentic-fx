@@ -511,6 +511,32 @@ def test_import_mt5_rejects_count_over_interval_capacity(tmp_path):
                    base_url="http://x", fetch=lambda _url: _payload(*bars))
 
 
+@pytest.mark.parametrize("kind", ["duplicates", "off_grid"])
+def test_import_mt5_rejects_oversized_window_before_validating_its_rows(tmp_path, kind):
+    conn = _conn(tmp_path)
+    end = H + timedelta(days=2)
+    capacity = 1440
+    if kind == "duplicates":
+        oversized = [_bar(H + timedelta(days=1)) for _ in range(capacity + 2)]
+    else:
+        oversized = [_bar(H + timedelta(days=1, seconds=1 + i))
+                     for i in range(capacity + 2)]
+    calls = []
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        calls.append(start)
+        if start == H:
+            return _payload(_bar(H))
+        # 先頭に壊れた行を置く: 上限の検査が行の検査より先なら、上限の理由で拒否される。
+        return _payload(None, *oversized)
+
+    with pytest.raises(ValueError, match="exceeds window capacity"):
+        import_mt5(conn, "USDJPY", H, end, base_url="http://x", fetch=fetch)
+    assert len(calls) == 2
+    assert _stored_row_count(conn) == 0
+
+
 def test_import_mt5_final_partial_window_uses_partial_capacity(tmp_path):
     conn = _conn(tmp_path)
     end = H + timedelta(days=1, minutes=5)

@@ -65,12 +65,20 @@ class _FakeMt5:
         return (0, "ok")
 
 
+class _EarlierTicks(dict):
+    """どの symbol にも、現在より前の観測が 1 回あった状態。"""
+
+    def get(self, key, default=None):
+        return super().get(key, 1)
+
+
 def _make_client(now, offset, **kw) -> Mt5Client:
     """MT5 に触らない Mt5Client を組み立てる。測定は規則と一致する tick を返す。"""
     c = Mt5Client(login=1, password="x", server="OANDA-Test")
     c._mt5 = _FakeMt5(now, offset, **kw)
     c._connected = True
     c._now = lambda: now
+    c._last_tick_time = _EarlierTicks()
     return c
 
 

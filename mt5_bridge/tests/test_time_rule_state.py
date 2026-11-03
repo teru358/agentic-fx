@@ -81,9 +81,19 @@ class _Mt5:
         return (0, "ok")
 
 
-def _client(now: datetime, offset: int | None = 10800, rates=()) -> Mt5Client:
+class _EarlierTicks(dict):
+    """どの symbol にも、現在より前の観測が 1 回あった状態。"""
+
+    def get(self, key, default=None):
+        return super().get(key, 1)
+
+
+def _client(now: datetime, offset: int | None = 10800, rates=(), *,
+            observed_before: bool = True) -> Mt5Client:
     clock = _Clock(now)
     client = Mt5Client(login=1, password="x", server="test")
+    if observed_before:
+        client._last_tick_time = _EarlierTicks()
     client._mt5 = _Mt5(clock, offset, rates)
     client._connected = True
     client._now = lambda: clock.now
@@ -549,7 +559,7 @@ def test_new_tick_one_hour_off_the_rule_still_latches_a_mismatch():
 
 
 def test_first_observation_one_hour_off_the_rule_is_not_accepted_as_a_mismatch():
-    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    client = _client(_at(2026, 7, 28, 12, 0), 10800, observed_before=False)
     client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200  # 1 時間古い凍結 tick
     for _ in range(3):
         client.clock.advance(seconds=60)
@@ -560,7 +570,7 @@ def test_first_observation_one_hour_off_the_rule_is_not_accepted_as_a_mismatch()
 
 
 def test_frozen_first_tick_then_moving_tick_on_the_rule_becomes_ok():
-    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    client = _client(_at(2026, 7, 28, 12, 0), 10800, observed_before=False)
     client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200
     client.get_server_time()
     del client._mt5.frozen["USDJPY"]
@@ -571,12 +581,51 @@ def test_frozen_first_tick_then_moving_tick_on_the_rule_becomes_ok():
 
 
 def test_moving_ticks_one_hour_off_the_rule_latch_a_mismatch_on_the_second_observation():
-    client = _client(_at(2026, 7, 28, 12, 0), 7200)          # 規則は 10800
+    client = _client(_at(2026, 7, 28, 12, 0), 7200, observed_before=False)          # 規則は 10800
     assert client.get_server_time()["time_rule_state"] == "unverified"
     client.clock.advance(seconds=60)
     info = client.get_server_time()
     assert info["time_rule_state"] == "mismatch"
     assert info["measured_offset_sec"] == 7200
+
+
+def test_frozen_tick_at_the_old_offset_right_after_start_keeps_market_data_closed():
+    client = _client(_at(2026, 11, 4, 12, 0), 10800, observed_before=False)   # 規則は冬 = 7200
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 10800
+    for _ in range(3):
+        with pytest.raises(TimeRuleUnavailableError, match="time_rule_unverified"):
+            _ohlcv(client)
+        client.clock.advance(seconds=60)
+    assert client.get_server_time()["time_rule_state"] == "unverified"
+
+
+def test_frozen_tick_that_agrees_with_the_rule_right_after_start_is_not_ok():
+    client = _client(_at(2026, 11, 4, 12, 0), 7200, observed_before=False)
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200
+    for _ in range(3):
+        with pytest.raises(TimeRuleUnavailableError, match="time_rule_unverified"):
+            _ohlcv(client)
+        client.clock.advance(seconds=60)
+    assert client._measured_at is None
+
+
+def test_tick_that_moves_and_agrees_with_the_rule_becomes_ok_after_start():
+    client = _client(_at(2026, 11, 4, 12, 0), 7200, observed_before=False)
+    with pytest.raises(TimeRuleUnavailableError, match="time_rule_unverified"):
+        _ohlcv(client)                                       # 初回の観測は候補にとどまる
+    client.clock.advance(seconds=60)
+    assert _ohlcv(client) == []
+    assert client.get_server_time()["time_rule_state"] == "ok"
+
+
+def test_friday_tick_then_a_moving_tick_at_the_sunday_open_is_ok_at_once():
+    client = _client(_at(2026, 11, 6, 21, 59, second=30), 7200, observed_before=False)
+    client.get_server_time()                                 # 金曜の最後の観測
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200
+    client.clock.now = _at(2026, 11, 8, 22, 0, second=5)     # 日曜の開場
+    del client._mt5.frozen["USDJPY"]
+    assert _ohlcv(client) == []
+    assert client.get_server_time()["time_rule_state"] == "ok"
 
 
 def test_closed_market_range_request_is_refused_before_fetching():

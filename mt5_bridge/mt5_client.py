@@ -354,11 +354,10 @@ class Mt5Client:
             previous = last_ticks.get(name)
             last_ticks[name] = value
             if previous is None:
-                # 初回の観測には比較対象がない。規則と食い違う値は古い tick かもしれないので棄却し、
-                # 次に tick 時刻が動いた観測を待つ。
-                if snap_server_offset(value - now_epoch) == _expected_offset(now):
-                    ticks.append(value)
-            elif value != previous:
+                # 初回の観測には比較対象がない。規則と一致していても古い tick かもしれないので受理せず、
+                # 次に同じ symbol の tick 時刻が動いた観測を待つ。
+                continue
+            if value != previous:
                 ticks.append(value)
         if not ticks:
             return

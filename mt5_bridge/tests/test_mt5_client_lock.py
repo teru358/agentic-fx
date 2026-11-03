@@ -354,6 +354,7 @@ def test_time_rule_measurement_is_serialized_with_other_calls():
     c._lock = threading.Lock()
     c._probe_symbol = "USDJPY"
     c._now = lambda: _OPEN_NOW
+    c._last_tick_time = {"USDJPY": 1}      # 現在より前の観測が 1 回ある
     d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
