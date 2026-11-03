@@ -154,6 +154,31 @@ def test_the_window_is_the_latest_14_operating_days_including_today():
         - timedelta(days=13)
 
 
+@pytest.mark.parametrize("now, expected", [
+    (datetime(2026, 11, 3, 12, tzinfo=timezone.utc), datetime(2026, 10, 20, 21, tzinfo=timezone.utc)),
+    (datetime(2026, 3, 10, 12, tzinfo=timezone.utc), datetime(2026, 2, 24, 22, tzinfo=timezone.utc)),
+    (datetime(2026, 7, 22, 12, tzinfo=timezone.utc), datetime(2026, 7, 8, 21, tzinfo=timezone.utc)),
+])
+def test_window_start_uses_new_york_calendar_dates(now, expected):
+    assert window_start(now) == expected
+
+
+@pytest.mark.parametrize("now, sample_at, expected_count, expected_state", [
+    (datetime(2026, 11, 3, 12, tzinfo=timezone.utc), datetime(2026, 10, 20, 21, 30, tzinfo=timezone.utc), 1, "active"),
+    (datetime(2026, 3, 10, 12, tzinfo=timezone.utc), datetime(2026, 2, 24, 21, 30, tzinfo=timezone.utc), 0, "ok"),
+])
+def test_warning_counts_follow_calendar_window(tmp_path, now, sample_at, expected_count, expected_state):
+    h = Harness(tmp_path, now=now)
+    h.many(100, 10, 10, decided=now)
+    h.decision(10, 10, decided=sample_at + timedelta(seconds=60))
+    h.abandon("freshness_expired", at=sample_at)
+    snap = h.evaluate()
+    assert snap.direct_samples == 100 + expected_count
+    assert snap.freshness_abandoned == expected_count
+    assert snap.state == expected_state
+    h.conn.close()
+
+
 # --- 直接観測 (100 件以上) ----------------------------------------------------
 
 def test_no_approved_strategy_is_inactive_and_silent(tmp_path):

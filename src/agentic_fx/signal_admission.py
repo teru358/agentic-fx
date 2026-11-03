@@ -274,7 +274,8 @@ def legacy_operating_day(value: str) -> str:
 
 def window_start(now: datetime) -> datetime:
     """直近 14 運用日の始点 (当日を含む 14 取引日の先頭)。"""
-    return market_hours.trading_day_start(now) - timedelta(days=WAIT_WINDOW_DAYS - 1)
+    day = market_hours.trading_day_start(now).astimezone(market_hours.NY).date()
+    return market_hours.session_boundary_utc(day - timedelta(days=WAIT_WINDOW_DAYS - 1))
 
 
 @dataclass(frozen=True, slots=True)
