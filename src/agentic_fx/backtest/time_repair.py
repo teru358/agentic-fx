@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from agentic_fx.store.db import FLOAT_TOL
 
 REPAIR_ID = "time_repair_dst_v1"
 
@@ -75,6 +76,11 @@ CACHE_SETS: tuple[CacheSet, ...] = (
 )
 C1_K_MINUTES = 900
 C1_MATCH_COUNTS = {"1m": 633, "15m": 39, "1h": 7}
+
+
+def _ohlcv_matches(left, right) -> bool:
+    return (all(abs(float(left[i]) - float(right[i])) < FLOAT_TOL for i in range(4))
+            and float(left[4]) == float(right[4]))
 
 
 def _rows_digest(rows, *, values: bool) -> str:
@@ -137,8 +143,9 @@ def _cache_status(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         instant = datetime.fromisoformat(row["bar_time"])
         if is_market_open(instant):
             continue
-        if not any(row["interval"] == item.interval and item.start <= row["bar_time"] <= item.end
-                   for item in CACHE_SETS):
+        if not any(row["source"] == "mt5-live" and row["symbol"] == "USDJPY"
+                   and row["interval"] == item.interval
+                   and item.start <= row["bar_time"] <= item.end for item in CACHE_SETS):
             raise RepairError("unexplained closed-market cache row", 3)
     return answer
 
@@ -216,7 +223,7 @@ def _bridge_check(conn: sqlite3.Connection, bridge_url: str, fetch=None) -> dict
         try:
             payload = get("/server-time")
         except Exception as exc:
-            raise RepairError(f"bridge server-time unavailable: {exc}", 1) from exc
+            raise RepairError("bridge server-time unavailable", 1) from exc
         age = payload.get("measured_age_sec")
         if (payload.get("offset_source") != "rule" or payload.get("time_rule_state") != "ok"
                 or not isinstance(age, (int, float)) or not math.isfinite(age) or age < 0 or age > 300):
@@ -234,34 +241,36 @@ def _bridge_check(conn: sqlite3.Connection, bridge_url: str, fetch=None) -> dict
             try:
                 payload = get(f"/ohlcv/{symbol}", {"from": start, "to": end, "interval": "5m"})
             except Exception as exc:
-                raise RepairError(f"bridge OHLCV request failed: {exc}", 1) from exc
-            # bridge の /ohlcv は to を含めて返すので、窓の右端ちょうどの足は外す。
-            remote = [bar for bar in payload.get("bars", [])
-                      if datetime.fromisoformat(bar["time"]) < actual_end]
-            for bar in remote:
+                raise RepairError("bridge OHLCV request failed", 1) from exc
+            remote_by_time = {}
+            for bar in payload.get("bars", []):
                 stamp = datetime.fromisoformat(bar["time"])
                 if stamp.tzinfo is None or stamp.utcoffset() is None:
                     raise RepairError("bridge returned a naive bar time", 3)
                 stamp = stamp.astimezone(timezone.utc)
-                hist_stamp = (stamp - timedelta(seconds=shift)).isoformat()
-                local = conn.execute("SELECT open,high,low,close,volume FROM ohlcv_history WHERE source='mt5' "
-                                     "AND symbol=? AND interval='5m' AND bar_time=?", (symbol, hist_stamp)).fetchone()
+                if stamp < actual_start or stamp > actual_end:
+                    raise RepairError("bridge returned a bar outside the requested window", 3)
+                if stamp in remote_by_time:
+                    raise RepairError("bridge returned duplicate bar times", 3)
+                if stamp == actual_end:
+                    continue
+                remote_by_time[stamp] = bar
+            expected_start = actual_start - timedelta(seconds=shift)
+            expected_end = actual_end - timedelta(seconds=shift)
+            local_rows = conn.execute("SELECT bar_time,open,high,low,close,volume FROM ohlcv_history "
+                                      "WHERE source='mt5' AND symbol=? AND interval='5m' "
+                                      "AND bar_time>=? AND bar_time<?", (symbol, expected_start.isoformat(),
+                                                                          expected_end.isoformat())).fetchall()
+            expected_by_time = {(datetime.fromisoformat(row["bar_time"]) + timedelta(seconds=shift)):
+                                tuple(row[i] for i in range(1, 6)) for row in local_rows}
+            if set(remote_by_time) != set(expected_by_time):
+                raise RepairError(f"bridge window times differ for {symbol} {start}", 3)
+            for stamp, bar in remote_by_time.items():
+                local = expected_by_time[stamp]
+                remote_values = tuple(bar[k] for k in ("open", "high", "low", "close", "volume"))
                 bars += 1
-                if local is not None and all(float(local[i]) == float(bar[k]) for i, k in
-                                             enumerate(("open", "high", "low", "close", "volume"))):
+                if _ohlcv_matches(local, remote_values):
                     matched += 1
-            if shift == 0:
-                expected = conn.execute("SELECT count(*) FROM ohlcv_history WHERE source='mt5' AND symbol=? "
-                                        "AND interval='5m' AND bar_time>=? AND bar_time<?",
-                                        (symbol, start, end)).fetchone()[0]
-            else:
-                expected = conn.execute("SELECT count(*) FROM ohlcv_history WHERE source='mt5' AND symbol=? "
-                                        "AND interval='5m' AND bar_time>=? AND bar_time<?",
-                                        (symbol, (actual_start - timedelta(seconds=shift)).isoformat(),
-                                         (actual_end - timedelta(seconds=shift)).isoformat())).fetchone()[0]
-            remote_count = sum(1 for bar in remote)
-            if remote_count != expected:
-                raise RepairError(f"bridge window count differs for {symbol} {start}", 3)
             if matched != bars:
                 raise RepairError(f"bridge window OHLC differs: {symbol} {start}", 3)
             windows.append({"symbol": symbol, "from": start, "to": end,
@@ -297,7 +306,8 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
                 match = conn.execute("SELECT open,high,low,close,volume FROM ohlcv_cache "
                                      "WHERE source='mt5-live' AND symbol='USDJPY' AND interval=? AND bar_time=?",
                                      (item.interval, prior)).fetchone()
-                if match and tuple(match) == tuple(row[k] for k in ("open", "high", "low", "close", "volume")):
+                if match and _ohlcv_matches(match, tuple(row[k] for k in
+                                                         ("open", "high", "low", "close", "volume"))):
                     matches += 1
             if matches != C1_MATCH_COUNTS[item.interval]:
                 raise RepairError(f"cache set {item.name} offset matches differ", 3)
@@ -327,7 +337,8 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
                     raise RepairError("C3 delayed 1m evidence is missing", 3)
                 expected_old = (old_minutes[0][0], max(x[1] for x in old_minutes), min(x[2] for x in old_minutes),
                                 old_minutes[-1][3], sum(x[4] for x in old_minutes))
-                if tuple(row[k] for k in ("open", "high", "low", "close", "volume")) != expected_old:
+                if not _ohlcv_matches(tuple(row[k] for k in ("open", "high", "low", "close", "volume")),
+                                      expected_old):
                     raise RepairError("C3 delayed aggregate differs", 3)
                 if (stamp.hour, stamp.minute) in {(20, 30), (20, 45)}:
                     minutes = conn.execute("SELECT open,high,low,close,volume FROM ohlcv_cache "
@@ -338,7 +349,8 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
                         raise RepairError("C3 replacement 1m rows are incomplete", 3)
                     agg = (minutes[0][0], max(x[1] for x in minutes), min(x[2] for x in minutes),
                            minutes[-1][3], sum(x[4] for x in minutes))
-                    if agg == tuple(row[k] for k in ("open", "high", "low", "close", "volume")):
+                    if _ohlcv_matches(agg, tuple(row[k] for k in
+                                                ("open", "high", "low", "close", "volume"))):
                         raise RepairError("C3 row is not stale relative to same-label 1m bars", 3)
                     replacements.append((row["symbol"], row["interval"], row["bar_time"], *agg, row["source"]))
                     replace_count += 1
@@ -351,7 +363,8 @@ def _cache_changes(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list
                         same_agg = (same_minutes[0][0], max(x[1] for x in same_minutes),
                                     min(x[2] for x in same_minutes), same_minutes[-1][3],
                                     sum(x[4] for x in same_minutes))
-                        if same_agg == tuple(row[k] for k in ("open", "high", "low", "close", "volume")):
+                        if _ohlcv_matches(same_agg, tuple(row[k] for k in
+                                                          ("open", "high", "low", "close", "volume"))):
                             raise RepairError("C3 closed row has valid same-label 1m evidence", 3)
             changes.append({"name": item.name, "status": "present", "delete": len(rows) - replace_count,
                             "replace": replace_count, "key_sha256": item.key_sha256,
@@ -441,18 +454,21 @@ def _post_state_matches(conn: sqlite3.Connection, plan: dict[str, Any]) -> bool:
                 friday = sunday + timedelta(days=5)
                 closing = session_boundary_utc(friday) - timedelta(minutes=5)
                 for symbol in symbols:
+                    symbol_opening = opening + (timedelta(hours=1)
+                                                if symbol in {"JP225", "US500", "USOIL", "XAUUSD"}
+                                                else timedelta())
                     symbol_bounds = conn.execute("SELECT min(bar_time), max(bar_time) FROM ohlcv_history "
                                                  "WHERE source='mt5' AND symbol=? AND interval='5m'",
                                                  (symbol,)).fetchone()
-                    if (symbol_bounds[0] is None or symbol_bounds[0] > opening.isoformat()
+                    if (symbol_bounds[0] is None or symbol_bounds[0] > symbol_opening.isoformat()
                             or symbol_bounds[1] < closing.isoformat()):
                         continue
                     exists = conn.execute("SELECT 1 FROM ohlcv_history WHERE source='mt5' AND symbol=? "
                                           "AND interval='5m' AND bar_time>=? AND bar_time<=? LIMIT 1",
-                                          (symbol, opening.isoformat(), closing.isoformat())).fetchone()
+                                          (symbol, symbol_opening.isoformat(), closing.isoformat())).fetchone()
                     if exists:
                         has_open = conn.execute("SELECT 1 FROM ohlcv_history WHERE source='mt5' AND symbol=? "
-                                                "AND interval='5m' AND bar_time=?", (symbol, opening.isoformat())).fetchone()
+                                                "AND interval='5m' AND bar_time=?", (symbol, symbol_opening.isoformat())).fetchone()
                         has_close = conn.execute("SELECT 1 FROM ohlcv_history WHERE source='mt5' AND symbol=? "
                                                  "AND interval='5m' AND bar_time=?", (symbol, closing.isoformat())).fetchone()
                         if not has_open or not has_close:
@@ -478,6 +494,7 @@ def _post_state_matches(conn: sqlite3.Connection, plan: dict[str, Any]) -> bool:
 def build_plan(conn: sqlite3.Connection, *, indicator_pending: str, bridge_url: str | None = None,
                bridge_fetch=None, db_path: Path | None = None) -> dict[str, Any]:
     """Inspect only; no mutation is permitted in this dry-run path."""
+    _validate_schema(conn)
     if indicator_pending not in {"keep", "invalidate"}:
         raise RepairError("--indicator-pending is required", 2)
     rows = _history_rows(conn)
@@ -537,10 +554,10 @@ def build_plan(conn: sqlite3.Connection, *, indicator_pending: str, bridge_url: 
         target_groups[prefix] = {"sets": sets,
             "delete": sum(item["delete"] for item in sets),
             "replace": sum(item["replace"] for item in sets)}
-    targets = {"H1": {"count": len(rows), "key_sha256": _rows_digest(rows, values=False),
-                       "by_symbol": {symbol: sum(1 for row in rows if row["symbol"] == symbol)
-                                     for symbol in sorted({row["symbol"] for row in rows})},
-                       "value_sha256": _rows_digest(rows, values=True),
+    targets = {"H1": {"count": len(moving_rows), "key_sha256": _rows_digest(moving_rows, values=False),
+                       "by_symbol": {symbol: sum(1 for row in moving_rows if row["symbol"] == symbol)
+                                     for symbol in sorted({row["symbol"] for row in moving_rows})},
+                       "value_sha256": _rows_digest(moving_rows, values=True),
                        "post_key_sha256": _rows_digest(shifted, values=False),
                        "post_value_sha256": _rows_digest(shifted, values=True), "shift_seconds": 3600},
                **target_groups}
@@ -570,12 +587,25 @@ def build_plan(conn: sqlite3.Connection, *, indicator_pending: str, bridge_url: 
     return plan
 
 
+def _validate_schema(conn: sqlite3.Connection) -> None:
+    required = {
+        "ohlcv_history": {"symbol", "interval", "bar_time", "open", "high", "low", "close", "volume", "source"},
+        "ohlcv_cache": {"symbol", "interval", "bar_time", "open", "high", "low", "close", "volume", "source"},
+        "data_migrations": {"name"},
+        "approval_requests": {"id", "kind", "payload_json", "status"},
+    }
+    for table, columns in required.items():
+        found = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not columns <= found:
+            raise RepairError("database schema is incomplete for time repair", 3)
+
+
 def _shift(iso: str) -> str:
     return (datetime.fromisoformat(iso) + timedelta(hours=1)).isoformat()
 
 
 def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *, confirm: str,
-               root: Path | None = None, hook=None) -> None:
+               root: Path | None = None, hook=None, instance_lock=None) -> None:
     expected = plan.get("plan_hash")
     payload = {key: value for key, value in plan.items() if key != "plan_hash"}
     if not isinstance(expected, str) or confirm != expected or plan_hash(payload) != expected:
@@ -586,10 +616,12 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
     from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
     from agentic_fx.plugin.switch import deploy_guard
     root = root or db_path.parent.parent
-    try:
-        instance_lock = acquire_instance_lock(db_path.parent)
-    except InstanceAlreadyRunning as exc:
-        raise RepairError(str(exc), 1) from exc
+    owns_lock = instance_lock is None
+    if owns_lock:
+        try:
+            instance_lock = acquire_instance_lock(db_path.parent)
+        except InstanceAlreadyRunning as exc:
+            raise RepairError(str(exc), 1) from exc
     try:
         with deploy_guard(root / "plugins", exclusive=True):
             marked = conn.execute("SELECT 1 FROM data_migrations WHERE name=?", (REPAIR_ID,)).fetchone()
@@ -695,5 +727,6 @@ def apply_plan(conn: sqlite3.Connection, db_path: Path, plan: dict[str, Any], *,
             except BaseException as exc:
                 raise RepairError(f"post-commit verification failed: {exc}", 5) from exc
     finally:
-        instance_lock.close()
+        if owns_lock:
+            instance_lock.close()
 

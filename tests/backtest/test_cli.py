@@ -51,6 +51,56 @@ def test_parse_date_ignores_explicit_offset():
         2026, 7, 1, tzinfo=timezone.utc)
 
 
+def test_repair_dry_run_keeps_database_file_unchanged(tmp_path, monkeypatch):
+    import argparse
+    root = tmp_path
+    (root / "data").mkdir()
+    _install_settings(root)
+    db_path = root / "data" / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "ensure_initialized", lambda _root: None)
+    monkeypatch.setattr(cli, "connect", lambda *_a, **_k: pytest.fail("writable connection opened"))
+    monkeypatch.setattr(cli, "init_db", lambda *_a, **_k: pytest.fail("database initialized"))
+    args = argparse.Namespace(command="history", history_command="repair-time", apply=False,
+                              out=root / "plan.json", plan=None, confirm=None,
+                              indicator_pending="keep")
+    assert cli.dispatch(args, root) == 3
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_repair_apply_opens_writable_connection_after_instance_lock(tmp_path, monkeypatch):
+    import argparse
+    from agentic_fx.backtest import time_repair
+    root = tmp_path
+    (root / "data").mkdir()
+    db_path = root / "data" / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+    plan_path = root / "plan.json"
+    plan_path.write_text('{"plan_hash":"p"}')
+    events = []
+    class Lock:
+        def close(self):
+            events.append("close")
+    from agentic_fx.store import instance_lock
+    monkeypatch.setattr(instance_lock, "acquire_instance_lock",
+                        lambda _path: (events.append("lock") or Lock()))
+    real_connect = cli.connect_existing_rw
+    def open_db(path):
+        events.append("connect")
+        return real_connect(path)
+    monkeypatch.setattr(cli, "connect_existing_rw", open_db)
+    monkeypatch.setattr(time_repair, "apply_plan", lambda conn, *a, **kw:
+                        events.append("apply"))
+    args = argparse.Namespace(apply=True, out=None, plan=plan_path, confirm="p")
+    assert cli._history_repair_time(None, args, root, None) == 0
+    assert events == ["lock", "connect", "apply", "close"]
+
+
 def test_cli_plugin_list_skips_initialization_and_does_not_create_a_tree(
         tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)

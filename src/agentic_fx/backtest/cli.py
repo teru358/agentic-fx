@@ -52,7 +52,7 @@ from agentic_fx.plugin.resolve import (
 )
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_existing_rw, connect_observer_readonly, init_db
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
 # analyze corr で --to 未指定時の in_sample_until (aware far-future 定数 —
@@ -332,7 +332,26 @@ def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -
             plan = json.loads(args.plan.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise time_repair.RepairError(f"cannot read plan: {exc}", 2) from exc
-        time_repair.apply_plan(conn, root / "data" / "agentic.db", plan, confirm=args.confirm, root=root)
+        db_path = root / "data" / "agentic.db"
+        from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
+        try:
+            lock = acquire_instance_lock(db_path.parent)
+        except InstanceAlreadyRunning as exc:
+            raise time_repair.RepairError(str(exc), 1) from exc
+        opened_here = conn is None
+        if opened_here:
+            try:
+                conn = connect_existing_rw(db_path)
+            except BaseException:
+                lock.close()
+                raise
+        try:
+            time_repair.apply_plan(conn, db_path, plan, confirm=args.confirm, root=root,
+                                   instance_lock=lock)
+        finally:
+            if opened_here:
+                conn.close()
+            lock.close()
         print("time repair applied")
         return 0
     plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending,
@@ -911,10 +930,15 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     try:
         if args.command == "plugin" and args.plugin_command == "versions":
             return plugin_deploy_cli.plugin_versions(settings, args, root)
-        conn = connect(root / "data" / "agentic.db")
         repair_apply = (args.command == "history" and args.history_command == "repair-time"
                         and args.apply)
-        if not repair_apply:
+        if repair_apply:
+            return _history_repair_time(None, args, root, settings)
+        repair_dry_run = (args.command == "history" and args.history_command == "repair-time"
+                          and not args.apply)
+        db_path = root / "data" / "agentic.db"
+        conn = connect_observer_readonly(db_path) if repair_dry_run else connect(db_path)
+        if not repair_apply and not repair_dry_run:
             init_db(conn)
         try:
             if args.command == "history":

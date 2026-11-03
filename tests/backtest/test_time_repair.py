@@ -28,6 +28,8 @@ def test_weekly_anchors_detect_cash_open_and_continuity(tmp_path):
         for index in range(198):
             stamp = (sunday_open + timedelta(minutes=5 * index)).isoformat()
             eur.append(("EURUSD", "5m", stamp, 1., 1., 1., 1., 1., "mt5", None))
+        endpoint = (sunday_open + timedelta(minutes=5 * 198)).isoformat()
+        eur.append(("EURUSD", "5m", endpoint, 1., 1., 1., 1., 1., "mt5", None))
         for day in range(3):
             current = datetime.combine(monday + timedelta(days=day), datetime.min.time(), timezone.utc)
             for step in range(7):
@@ -166,6 +168,73 @@ def test_unrecognized_history_fingerprint_is_read_only(tmp_path, monkeypatch, mu
     assert conn.serialize() == before
 
 
+def test_closed_cache_row_for_another_symbol_is_rejected(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "cache-symbol.db")
+    init_db(conn)
+    item = time_repair.CACHE_SETS[0]
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("EURUSD", item.interval, item.start, 1, 2, .5, 1.5, 7, "mt5-live"))
+    with pytest.raises(time_repair.RepairError):
+        time_repair._cache_status(conn)
+
+
+def test_ohlcv_comparison_tolerates_prices_and_requires_equal_volume():
+    assert time_repair._ohlcv_matches((1, 2, .5, 1.5, 7),
+                                      (1 + 1e-10, 2, .5, 1.5, 7))
+    assert not time_repair._ohlcv_matches((1, 2, .5, 1.5, 7),
+                                          (1, 2, .5, 1.5, 7 + 1e-10))
+
+
+def test_bridge_rejects_duplicate_remote_times(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    bar = {"time": "2025-11-02T22:00:00+00:00", "open": 1, "high": 2,
+           "low": .5, "close": 1.5, "volume": 1}
+    def fetch(route, params):
+        return ({"offset_source": "rule", "time_rule_state": "ok", "measured_age_sec": 1}
+                if route == "/server-time" else {"bars": [bar, dict(bar)]})
+    with pytest.raises(time_repair.RepairError):
+        time_repair._bridge_check(conn, "http://fake", fetch)
+
+
+def test_bridge_rejects_rows_before_window_start(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    def fetch(route, params):
+        if route == "/server-time":
+            return {"offset_source": "rule", "time_rule_state": "ok", "measured_age_sec": 1}
+        return {"bars": [{"time": "2025-11-02T21:55:00+00:00", "open": 1, "high": 2,
+                           "low": .5, "close": 1.5, "volume": 1}]}
+    with pytest.raises(time_repair.RepairError, match="outside the requested window"):
+        time_repair._bridge_check(conn, "http://fake", fetch)
+
+
+def test_bridge_accepts_float_tolerance_and_inclusive_right_edge(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    from datetime import datetime, timedelta
+    symbols = ("EURUSD", "USDJPY", "JP225", "US500", "USOIL", "XAUUSD")
+    # Four verification windows each carry one representative bar per instrument.
+    windows = time_repair._BRIDGE_WINDOWS[:4]
+    monkeypatch.setattr(time_repair, "_BRIDGE_WINDOWS", windows)
+    remote_by_request = {}
+    conn.execute("DELETE FROM ohlcv_history")
+    for start, end, shift in windows:
+        for i, symbol in enumerate(symbols):
+            stamp = (datetime.fromisoformat(start) - timedelta(seconds=shift)).isoformat()
+            conn.execute("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (symbol, "5m", stamp, 1, 2, .5, 1.5, 7, "mt5", None))
+            remote_stamp = (datetime.fromisoformat(stamp) + timedelta(seconds=shift)).isoformat()
+            bars = [{"time": remote_stamp, "open": 1 + 1e-10, "high": 2, "low": .5,
+                     "close": 1.5, "volume": 7},
+                    {"time": end, "open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}]
+            remote_by_request[(symbol, start)] = bars
+    conn.commit()
+    def fetch(route, params):
+        if route == "/server-time":
+            return {"offset_source": "rule", "time_rule_state": "ok", "measured_age_sec": 1}
+        return {"bars": remote_by_request[(route.rsplit("/", 1)[1], params["from"])]}
+    result = time_repair._bridge_check(conn, "http://fake", fetch)
+    assert result["count"] == result["matched"] == 24
+
+
 def _digest(rows, values=False):
     fields = ("symbol", "interval", "bar_time", "source")
     lines = ["|".join(str(row[name]) for name in fields) + (
@@ -228,6 +297,22 @@ def test_apply_requires_confirmation_then_moves_rows_and_is_idempotent(tmp_path,
     assert hashlib.sha256(Path(manifest["path"]).read_bytes()).hexdigest() == manifest["sha256"]
 
 
+def test_excluded_week_is_removed_from_h1_counts_and_digests(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    monkeypatch.setattr(time_repair, "_anchors", lambda _: [{"week": "2026-01-05", "passed": False,
+                                                               "reasons": ["synthetic"]}])
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    assert plan["excluded_weeks"] == [{"week": "2026-01-05", "reason": "synthetic"}]
+    assert plan["targets"]["H1"]["count"] == 0
+    assert plan["targets"]["H1"]["by_symbol"] == {}
+    assert plan["targets"]["H1"]["key_sha256"] == time_repair._rows_digest([], values=False)
+    time_repair.apply_plan(conn, _db_path(conn), plan, confirm=plan["plan_hash"])
+
+
+def _db_path(conn):
+    return Path(conn.execute("PRAGMA database_list").fetchone()[2])
+
+
 def test_six_symbol_synthetic_history_repair_checks_database_invariants(tmp_path, monkeypatch):
     from datetime import date, datetime, timedelta, timezone
     from agentic_fx.core.fx_time import session_boundary_utc
@@ -240,7 +325,10 @@ def test_six_symbol_synthetic_history_repair_checks_database_invariants(tmp_path
         sunday_open = session_boundary_utc(sunday)
         friday_close = session_boundary_utc(sunday + timedelta(days=5)) - timedelta(minutes=5)
         for symbol in symbols:
-            for actual in (sunday_open, friday_close):
+            symbol_open = sunday_open + (timedelta(hours=1)
+                                         if symbol in {"JP225", "US500", "USOIL", "XAUUSD"}
+                                         else timedelta())
+            for actual in (symbol_open, friday_close):
                 label = (actual - timedelta(hours=1)).isoformat()
                 high = 10. if symbol == "USDJPY" and actual.date() == date(2026, 1, 9) else 2.
                 rows.append((symbol, "5m", label, 1., high, .5, 1.5, 1., "mt5", None))
@@ -250,7 +338,9 @@ def test_six_symbol_synthetic_history_repair_checks_database_invariants(tmp_path
         rows.append(("USDJPY", "5m", (nfp - timedelta(hours=1)).isoformat(), 1., 20., .5, 1.5, 1., "mt5", None))
     summer_sunday = date(2026, 7, 5)
     for symbol in symbols:
-        for actual in (session_boundary_utc(summer_sunday),
+        summer_open = session_boundary_utc(summer_sunday) + (timedelta(hours=1)
+                      if symbol in {"JP225", "US500", "USOIL", "XAUUSD"} else timedelta())
+        for actual in (summer_open,
                        session_boundary_utc(summer_sunday + timedelta(days=5)) - timedelta(minutes=5)):
             rows.append((symbol, "5m", actual.isoformat(), 1., 2., .5, 1.5, 1., "mt5", None))
     conn.executemany("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
@@ -261,22 +351,25 @@ def test_six_symbol_synthetic_history_repair_checks_database_invariants(tmp_path
         "2025-11-02T20:00:00+00:00", "2026-03-06T20:55:00+00:00",
         {symbol: sum(row["symbol"] == symbol for row in selected) for symbol in symbols},
         time_repair._rows_digest(selected, values=False), time_repair._rows_digest(selected, values=True)))
-    absent = [{"name": item.name, "status": "absent_before_cache_window"} for item in time_repair.CACHE_SETS]
-    monkeypatch.setattr(time_repair, "_cache_status", lambda _: absent)
-    monkeypatch.setattr(time_repair, "_cache_changes", lambda _: ([
-        {"name": item.name, "status": "absent_before_cache_window", "delete": 0, "replace": 0}
-        for item in time_repair.CACHE_SETS], []))
+    for interval, stamp in (("1m", "2026-11-03T12:00:00+00:00"),
+                            ("15m", "2026-11-03T12:00:00+00:00"),
+                            ("1h", "2026-11-03T12:00:00+00:00")):
+        conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("USDJPY", interval, stamp, 1, 2, .5, 1.5, 1, "mt5-live"))
+    conn.commit()
     monkeypatch.setattr(time_repair, "_anchors", lambda _: [{"week": "synthetic", "passed": True}])
     plan = time_repair.build_plan(conn, indicator_pending="keep", db_path=tmp_path / "synthetic.db")
     time_repair.apply_plan(conn, tmp_path / "synthetic.db", plan, confirm=plan["plan_hash"], root=tmp_path)
-    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-02T22:00:00+00:00'").fetchone()[0] == 6
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-02T22:00:00+00:00'").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-02T23:00:00+00:00'").fetchone()[0] == 4
     assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-07T21:55:00+00:00'").fetchone()[0] == 6
-    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-05T21:00:00+00:00'").fetchone()[0] == 6
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-05T21:00:00+00:00'").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-05T22:00:00+00:00'").fetchone()[0] == 4
     for day in ("2025-12-16", "2026-01-09", "2026-03-06"):
         assert conn.execute("SELECT max(high-low) FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
                             (day + "T13:30:00+00:00",)).fetchone()[0] == 19.5
     assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-10T20:55:00+00:00'").fetchone()[0] == 6
-    assert conn.execute("SELECT count(*) FROM ohlcv_cache WHERE source='mt5-live' AND NOT (bar_time LIKE '2026-07-%')").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM ohlcv_cache WHERE source='mt5-live'").fetchone()[0] == 3
     assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE interval='5m' AND bar_time='2026-01-09T13:30:00+00:00'").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM data_migrations WHERE name=?", (time_repair.REPAIR_ID,)).fetchone()[0] == 1
     assert time_repair.apply_plan(conn, tmp_path / "synthetic.db", plan,
@@ -310,6 +403,23 @@ def test_bridge_check_reads_rule_state_before_and_after_all_windows(tmp_path, mo
     assert plan["bridge_check"]["matched"] == 0
     assert calls[0][0] == calls[-1][0] == "/server-time"
     assert sum(route != "/server-time" for route, _ in calls) == 24
+
+
+def test_bridge_http_uses_mt5_auth_headers_and_hides_request_details(monkeypatch):
+    import httpx
+    from agentic_fx.datafeed import sources
+    captured = []
+    monkeypatch.setattr(sources, "_mt5_headers", lambda: {"X-API-Key": "secret"})
+    def forbidden(*args, **kwargs):
+        captured.append(kwargs.get("headers"))
+        raise httpx.ConnectError("secret-key leaked")
+    monkeypatch.setattr(httpx, "get", forbidden)
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._bridge_check(__import__("sqlite3").connect(":memory:"), "http://fake")
+    assert error.value.exit_code == 1
+    assert "secret-key" not in str(error.value)
+    assert str(error.value) == "bridge server-time unavailable"
+    assert captured == [{"X-API-Key": "secret"}]
 
 
 def test_plan_stops_when_bridge_rule_check_fails(tmp_path, monkeypatch):
