@@ -302,6 +302,10 @@ class Mt5Client:
             age = None if measured_at is None else int(now.timestamp() - measured_at)
             measured_offset = self._measured_offset_sec
             expected = _expected_offset(now)
+            streak = self._match_streak
+            measured_expected = (None if measured_at is None else
+                                 _expected_offset(datetime.fromtimestamp(
+                                     measured_at, timezone.utc)))
         return {
             "server_offset_sec": expected,
             "server_time": datetime.fromtimestamp(
@@ -312,10 +316,10 @@ class Mt5Client:
             "measured_at": (None if measured_at is None else
                             datetime.fromtimestamp(measured_at, timezone.utc).isoformat()),
             "measured_age_sec": age,
-            "expected_offset_sec": (None if measured_at is None else expected),
+            "expected_offset_sec": measured_expected,
             "offset_matches_rule": (None if measured_offset is None else
-                                    measured_offset == expected),
-            "match_streak": (None if measured_at is None else self._match_streak),
+                                    measured_offset == measured_expected),
+            "match_streak": (None if measured_at is None else streak),
             "time_rule_state": state,
         }
 
@@ -497,7 +501,9 @@ class Mt5Client:
     def get_positions(self) -> list[Position]:
         with self._lock:
             positions = self._mt5.positions_get()
-            self._maybe_measure_locked(self._now())
+            now = self._now()
+            self._maybe_measure_locked(now)
+            self._time_rule_state_locked(now)
         if positions is None:
             return []
         result: list[Position] = []
@@ -525,7 +531,9 @@ class Mt5Client:
                 deals = self._mt5.history_deals_get(position=ticket)
             except TypeError:
                 deals = None
-            self._maybe_measure_locked(self._now())
+            now = self._now()
+            self._maybe_measure_locked(now)
+            self._time_rule_state_locked(now)
         if not deals:
             return None
 
@@ -616,8 +624,7 @@ class Mt5Client:
                     f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
                 )
 
-            now = self._now()
-            self._maybe_measure_locked(now, symbol=symbol)
+            self._maybe_measure_locked(self._now(), symbol=symbol)
 
             rates = self._mt5.copy_rates_range(
                 symbol, tf,
@@ -644,6 +651,9 @@ class Mt5Client:
                     "close": float(r["close"]),
                     "volume": float(r["tick_volume"]),
                 })
+            # 取得の間に時計が進んでいても、応答時点で検査が新しいことを保つ。
+            now = self._now()
+            self._maybe_measure_locked(now, symbol=symbol)
             self._require_market_data_time_rule_locked(now)
             return bars
 

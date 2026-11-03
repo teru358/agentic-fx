@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import sys
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -79,6 +80,9 @@ class _FakeMt5:
     def symbol_select(self, symbol, enabled):
         return True
 
+    def symbol_info(self, symbol):
+        return SimpleNamespace(spread=1)
+
     def symbol_info_tick(self, symbol):
         at = self.clock.now if self.clock.now >= self.first_tick else self.frozen_tick
         return SimpleNamespace(time=int(at.timestamp()) + self.offset, bid=150.0, ask=150.01)
@@ -106,7 +110,7 @@ class _Rig:
     """Fake MT5 + 本物の `Mt5Client` + HTTP の代わりの関数 + afx の ingest / outage。"""
 
     def __init__(self, tmp_path, monkeypatch, *, start: datetime, mt5_kwargs: dict,
-                 cache_until: datetime) -> None:
+                 cache_until: datetime, conn=None) -> None:
         self.clock = _Clock(start)
         self.client = bridge.Mt5Client(login=1, password="x", server="test")
         self.mt5 = _FakeMt5(self.clock, **mt5_kwargs)
@@ -116,8 +120,10 @@ class _Rig:
         self.statuses: list[tuple[datetime, int]] = []
         monkeypatch.setattr(sources.httpx, "get", self._http_get)
 
-        self.conn = connect(tmp_path / "bars.db")
-        init_db(self.conn)
+        if conn is None:
+            conn = connect(tmp_path / "bars.db")
+            init_db(conn)
+        self.conn = conn
         minute = cache_until - timedelta(minutes=9)
         while minute <= cache_until:
             upsert_cache_bars(self.conn, [Bar(PAIR, "1m", minute, 150, 150, 150, 150, 1)],
@@ -140,6 +146,14 @@ class _Rig:
 
     def _http_get(self, url, params=None, headers=None, timeout=None):
         request = httpx.Request("GET", url)
+        if "/quote/" in url:
+            try:
+                quote = self.client.get_quote(url.rsplit("/", 1)[1])
+            except bridge.TimeRuleUnavailableError as exc:
+                self.statuses.append((self.clock.now, 503))
+                return httpx.Response(503, json={"detail": exc.detail}, request=request)
+            self.statuses.append((self.clock.now, 200))
+            return httpx.Response(200, json=asdict(quote), request=request)
         assert "/ohlcv/" in url
         start = datetime.fromisoformat(params["from"])
         end = datetime.fromisoformat(params["to"])
@@ -286,3 +300,191 @@ def test_quote_refusal_reaches_exit_checks_as_a_data_error(tmp_path, monkeypatch
     with pytest.raises(DataUnhealthy):
         provider.get_quote(PAIR)
     conn.close()
+
+
+# ── 資金保護・通知との結合 (Scheduler / Executor / StateStore / 取引 event の observer) ──────────
+
+class _RecordingSink:
+    """`TradeEventEmitter` の送り先。本番の sink と同じ 2 つの入口だけを持つ。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.drops: list[str] = []
+
+    def submit(self, *event) -> None:
+        self.events.append(event)
+
+    def note_drop(self, reason: str) -> None:
+        self.drops.append(reason)
+
+
+class _RecordingNotifier:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def send(self, text: str) -> None:
+        self.messages.append(text)
+
+
+class _WireClock:
+    def __init__(self, clock: _Clock) -> None:
+        self._clock = clock
+
+    def now(self) -> datetime:
+        return self._clock.now
+
+
+SUNDAY_START = _at(2026, 11, 8, 22, 1, second=30)
+
+
+class _ProductionRig:
+    """`_Rig` (bridge + ingest + outage) の DB に、本物の Scheduler / Executor / StateStore を載せる。
+
+    quote は本物の `PriceProvider` が bridge の `/quote` を読み、取引 event は本番と同じ
+    `TradeEventEmitter` が `transitions.observe` で受ける。
+    """
+
+    def __init__(self, tmp_path, monkeypatch) -> None:
+        from tests.core.test_scheduler import Env
+
+        (tmp_path / "sched").mkdir()
+        (tmp_path / "rig").mkdir()
+        holder: dict = {}
+        self.env = Env(tmp_path / "sched", base=SUNDAY_START,
+                       state_fn=lambda: holder["rig"].outage.state,
+                       quote_fn=lambda pair: holder["provider"].get_quote(pair))
+        self.rig = _Rig(
+            tmp_path / "rig", monkeypatch, start=SUNDAY_START,
+            mt5_kwargs=dict(offset=7200, first_tick=_at(2026, 11, 8, 22, 3, second=10),
+                            frozen_tick=_at(2026, 11, 6, 21, 59, second=59),
+                            bars_from=_at(2026, 11, 6, 21, 50)),
+            cache_until=_at(2026, 11, 6, 21, 59), conn=self.env.conn)
+        holder["rig"] = self.rig
+        settings = load_settings(
+            Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example"
+        ).model_copy(deep=True)
+        settings.datafeed.mt5.enabled = True
+        settings.datafeed.primary = "mt5"
+        settings.datafeed.fallbacks = []
+        holder["provider"] = PriceProvider(self.env.conn, settings,
+                                           _WireClock(self.rig.clock))
+        self.sink = _RecordingSink()
+        self.notifier = _RecordingNotifier()
+        self.env.executor.notifier = self.notifier
+        from agentic_fx.core import transitions
+        from agentic_fx.ops.trade_event_sink import TradeEventEmitter
+        self.observer_token = transitions.observe(
+            self.env.conn, TradeEventEmitter(self.env.conn, self.sink, state_mode="trading",
+                                             ccy="JPY"))
+        self.transitions = transitions
+        self.kill_switch_seen: list[tuple[bool, int]] = []
+
+    def close(self) -> None:
+        self.transitions.unobserve(self.observer_token)
+        self.rig.conn.close()
+
+    def tick(self, now: datetime) -> str:
+        """本番と同じ順: ingest → outage → scheduler。"""
+        state = self.rig.tick(now)
+        self.env.sched.tick(now)
+        latched = self.env.state.load()
+        self.kill_switch_seen.append((latched.kill_switch_latched,
+                                      latched.kill_switch_generation))
+        return state
+
+    def scheduler_events(self) -> list[str]:
+        from agentic_fx.activity import ActivityLog as _Log
+        log = _Log(self.env.tmp_path / "a.log")
+        return [line.split("\t")[2] for line in log.tail(500)]
+
+    def open_position(self, **fields) -> int:
+        values = dict(pair="USDJPY", direction="long", entry_type="market", horizon="swing",
+                      status="open", quantity=0.1, avg_fill_price=148.2, stop_loss=140.0,
+                      take_profit=160.0, filled_at=_at(2026, 11, 6, 15, 0).isoformat())
+        values.update(fields)
+        return orders.insert(self.env.conn, now=_at(2026, 11, 6, 15, 0), **values)
+
+
+@pytest.fixture
+def production_rig(tmp_path, monkeypatch):
+    rig = _ProductionRig(tmp_path, monkeypatch)
+    yield rig
+    rig.close()
+
+
+def test_sunday_open_with_a_position_never_latches_the_kill_switch_and_waits_for_resume(
+        production_rig):
+    rig = production_rig
+    rig.open_position()
+
+    states = []
+    missions_when_degraded = None
+    for minute in range(1, 11):
+        states.append((minute, rig.tick(_at(2026, 11, 8, 22, minute, second=30))))
+        if minute == 2:
+            missions_when_degraded = rig.env.trade_calls
+
+    assert [s for m, s in states if m in (1, 2)] == ["ready", "degraded"]
+    assert states[-1][1] == "degraded"                          # 人の resume 待ち
+    assert set(rig.kill_switch_seen) == {(False, 0)}            # latch も世代の更新も無い
+    assert rig.sink.events == [] and rig.sink.drops == []       # 注文の状態遷移の通知は 0 件
+    assert rig.notifier.messages == []                          # 運用通知も 0 件
+    assert rig.env.trade_calls == missions_when_degraded        # degraded の間は新規判断を起こさない
+    assert orders.list_by_status(rig.env.conn, "open")          # 建玉は触られない
+
+    # 隙間の足を建玉の SL / TP で見ていないので、確認なしの resume は断られて degraded のまま
+    rig.rig.outage.request_resume(_at(2026, 11, 8, 22, 10, second=40))
+    assert rig.tick(_at(2026, 11, 8, 22, 11, second=30)) == "degraded"
+    assert orders.list_by_status(rig.env.conn, "open")
+    rig.rig.outage.request_resume(_at(2026, 11, 8, 22, 11, second=40), acknowledge=True)
+    assert rig.tick(_at(2026, 11, 8, 22, 12, second=30)) == "ready"
+
+    assert rig.scheduler_events().count("day_close_deferred") == 0
+    assert rig.rig.events("datafeed_") == ["datafeed_degraded",
+                                           "datafeed_recovered_awaiting_resume"]
+    rig_events = [line.split("\t")[2] for line in rig.rig.activity.tail(200)]
+    assert rig_events.count("data_resume_rejected") == 1
+    assert rig_events.count("data_resume_accepted") == 1
+    assert set(rig.kill_switch_seen) == {(False, 0)}
+    assert rig.sink.events == [] and rig.notifier.messages == []
+
+
+def test_refused_quotes_never_close_at_an_invented_price_and_protection_keeps_running(
+        production_rig):
+    rig = production_rig
+    day_a = rig.open_position(horizon="day")
+    day_b = rig.open_position(horizon="day", pair="EURUSD", avg_fill_price=1.10,
+                              stop_loss=1.0, take_profit=1.2)
+    swing_sl = rig.open_position(avg_fill_price=148.60, stop_loss=148.30)
+    rig.env.bars["USDJPY"] = Bar("USDJPY", "1m", _at(2026, 11, 8, 22, 0), 148.4, 148.5, 148.15,
+                                 148.2, 10)
+    rig.env.bars["EURUSD"] = Bar("EURUSD", "1m", _at(2026, 11, 8, 22, 0), 1.10, 1.101, 1.099,
+                                 1.10, 10)
+
+    rig.tick(_at(2026, 11, 8, 22, 1, second=30))          # /quote は 503 time_rule_unverified
+
+    assert (_at(2026, 11, 8, 22, 1, second=30), 503) in rig.rig.statuses     # /quote も /ohlcv も拒否
+    assert orders.get(rig.env.conn, day_a)["status"] == "open"
+    assert orders.get(rig.env.conn, day_b)["status"] == "open"
+    protected = orders.get(rig.env.conn, swing_sl)
+    assert (protected["status"], protected["close_reason"]) == ("closed", "sl")
+    assert protected["close_price"] == pytest.approx(148.30, abs=0.01)   # 他の建玉の SL は同じ tick で執行
+    events = rig.scheduler_events()
+    assert events.count("day_close_deferred") == 2
+    assert "day_close_error" not in events and "exit_check_error" not in events
+    assert [e[0] for e in rig.sink.events] == ["position_closed"]    # 通知は SL の 1 件だけ
+    assert rig.notifier.messages == []
+
+    rig.tick(_at(2026, 11, 8, 22, 2, second=30))          # まだ検査できない
+    assert orders.get(rig.env.conn, day_a)["status"] == "open"
+    assert orders.get(rig.env.conn, day_b)["status"] == "open"
+    assert rig.scheduler_events().count("day_close_deferred") == 4    # 毎 tick 再試行して見送る
+
+    rig.tick(_at(2026, 11, 8, 22, 3, second=30))          # 最初の新しい tick を測れた後
+    for oid in (day_a, day_b):
+        closed = orders.get(rig.env.conn, oid)
+        assert (closed["status"], closed["close_reason"]) == ("closed", "day_rollover")
+        assert closed["close_price"] == 150.0              # bridge が返した bid (long)
+    assert [e[0] for e in rig.sink.events] == ["position_closed"] * 3
+    assert rig.sink.drops == []
+    assert set(rig.kill_switch_seen) == {(False, 0)}

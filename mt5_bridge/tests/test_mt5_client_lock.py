@@ -28,6 +28,14 @@ def _seed_verified_time_rule(client: Mt5Client) -> None:
     client._match_streak = 3
 
 
+def _join(*threads: threading.Thread, timeout: float = 10.0) -> None:
+    """lock が壊れて止まっても、スイート全体を止めずに失敗として報告する。"""
+    for t in threads:
+        t.join(timeout)
+    for t in threads:
+        assert not t.is_alive(), "worker thread is still blocked (deadlock?)"
+
+
 class _SlowFakeMt5:
     """各 MT5 呼び出しに sleep を入れ、interleave を観測可能にする Fake。"""
     def __init__(self, call_log, lock_for_log):
@@ -69,9 +77,9 @@ def test_copy_rates_range_is_serialized_across_threads():
     def worker(sym):
         client.copy_rates_range(sym, "1h", d0, d1)
 
-    t1 = threading.Thread(target=worker, args=("USDJPY",))
-    t2 = threading.Thread(target=worker, args=("EURUSD",))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=worker, args=("USDJPY",), daemon=True)
+    t2 = threading.Thread(target=worker, args=("EURUSD",), daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     assert len(call_log) == 4
     for i in (0, 2):
@@ -116,11 +124,11 @@ def test_disconnect_does_not_interleave_with_copy_rates():
     def data_worker():
         c.copy_rates_range("USDJPY", "1h", d0, d1)
 
-    t = threading.Thread(target=data_worker)
+    t = threading.Thread(target=data_worker, daemon=True)
     t.start()
     time.sleep(0.01)
     c.disconnect()
-    t.join()
+    _join(t)
 
     assert "shutdown" in log
     ci_start, ci_end = log.index("copy_start"), log.index("copy_end")
@@ -255,9 +263,9 @@ def test_copy_rates_and_preflight_do_not_interleave():
     def order_worker():
         c.preflight_order_margin("EURUSD", "buy", 0.1)
 
-    t1 = threading.Thread(target=data_worker)
-    t2 = threading.Thread(target=order_worker)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=data_worker, daemon=True)
+    t2 = threading.Thread(target=order_worker, daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     # どちらかのブロックが完全に先行する (interleave しない)。
     data_block = ["select:USDJPY", "copy:USDJPY"]
@@ -306,9 +314,9 @@ def test_last_error_failure_path_is_serialized():
     def ok_worker():
         c.copy_rates_range("OKSYM", "1h", d0, d1)
 
-    t1 = threading.Thread(target=fail_worker)
-    t2 = threading.Thread(target=ok_worker)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=fail_worker, daemon=True)
+    t2 = threading.Thread(target=ok_worker, daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     assert len(errors) == 1
     fail_block = ["select:FAILSYM", "copy:FAILSYM", "last_error"]
@@ -349,12 +357,11 @@ def test_time_rule_measurement_is_serialized_with_other_calls():
     d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
     d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
-    threads = [threading.Thread(target=c.copy_rates_range, args=(sym, "1h", d0, d1))
+    threads = [threading.Thread(target=c.copy_rates_range, args=(sym, "1h", d0, d1), daemon=True)
                for sym in ("USDJPY", "USDJPY")]
     for t in threads:
         t.start()
-    for t in threads:
-        t.join()
+    _join(*threads)
 
     first = ["select:USDJPY", "select:USDJPY", "tick:USDJPY", "copy:USDJPY"]  # 測定が要る呼び出し
     second = ["select:USDJPY", "copy:USDJPY"]                      # 60 秒以内なので測らない

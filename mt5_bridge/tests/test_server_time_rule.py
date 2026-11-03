@@ -296,3 +296,43 @@ def test_get_server_time_reads_clocks_and_state_in_one_lock_section():
     assert info["measured_offset_sec"] == SUMMER
     assert info["offset_matches_rule"] is True
     assert info["time_rule_state"] == "ok"
+
+
+def test_get_server_time_reads_the_match_streak_in_the_same_lock_section():
+    now = _at(2026, 7, 28, 12)
+    c = _make_client(now, SUMMER)
+
+    class _BumpOnExitLock:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.release()
+            c._match_streak += 5
+            return False
+
+    c._lock = _BumpOnExitLock(threading.Lock())
+
+    assert c.get_server_time()["match_streak"] == 1
+
+
+def test_evidence_uses_the_rule_in_force_when_the_measurement_was_accepted():
+    """測定した後で規則が切り替わっても、受理時点の規則値と比べて表示する。"""
+    clock = {"now": _at(2026, 10, 30, 20)}          # 夏 (規則 10800)
+    c = _make_client(clock["now"], SUMMER)
+    c._now = lambda: clock["now"]
+    assert c.get_server_time()["offset_matches_rule"] is True
+
+    clock["now"] = _at(2026, 11, 2, 12)              # 冬へ切替後の閉場でない時刻
+    c._mt5.now = clock["now"]
+    c._last_measure_attempt_at = clock["now"].timestamp()     # 再測定させない
+    info = c.get_server_time()
+
+    assert info["server_offset_sec"] == WINTER
+    assert info["measured_offset_sec"] == SUMMER
+    assert info["expected_offset_sec"] == SUMMER
+    assert info["offset_matches_rule"] is True

@@ -238,33 +238,51 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     naive_count = 0
     right_edge_drops = 0
 
-    current = start
-    while current < end:
-        window_end = min(current + timedelta(days=1), end)
-        url = _window_url(base_url, symbol, current, window_end, interval)
-        payload = fetch(url)
-        try:
-            rows, window_naive, window_right_edges = _validated_window_rows(
-                payload, symbol=symbol, interval=interval, current=current,
-                window_end=window_end)
-        except ValueError as exc:
-            raise ValueError(
-                f"import_mt5: failed window [{current.isoformat()}, "
-                f"{window_end.isoformat()}); last successful window end="
-                f"{current.isoformat()}: {exc}") from exc
-        naive_count += window_naive
-        right_edge_drops += window_right_edges
-        if rows:
-            result = import_history_bars(conn, rows, source="mt5")
-            total_inserted += result.inserted
-            total_unchanged += result.unchanged
-            total_conflicted += result.conflicted
-            if result.conflicted > 0:
-                partial = ImportResult(
-                    total_inserted, total_unchanged, total_conflicted)
-                raise ImportConflictError(result.conflicts, partial=partial)
+    # 全窓が取れたときだけ書き込みを確定する。途中の窓で bridge が拒否したり
+    # 応答が不正だったりしたら、それまでの窓も残さない。既存行との食い違い
+    # (conflict) だけは、人が確認する停止としてそこまでの窓を確定してから上げる。
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        current = start
+        while current < end:
+            window_end = min(current + timedelta(days=1), end)
+            url = _window_url(base_url, symbol, current, window_end, interval)
+            payload = fetch(url)
+            try:
+                rows, window_naive, window_right_edges = _validated_window_rows(
+                    payload, symbol=symbol, interval=interval, current=current,
+                    window_end=window_end)
+            except ValueError as exc:
+                raise ValueError(
+                    f"import_mt5: failed window [{current.isoformat()}, "
+                    f"{window_end.isoformat()}); last successful window end="
+                    f"{current.isoformat()}: {exc}") from exc
+            naive_count += window_naive
+            right_edge_drops += window_right_edges
+            if rows:
+                result = import_history_bars(
+                    conn, rows, source="mt5", commit=False)
+                total_inserted += result.inserted
+                total_unchanged += result.unchanged
+                total_conflicted += result.conflicted
+                if result.conflicted > 0:
+                    partial = ImportResult(
+                        total_inserted, total_unchanged, total_conflicted)
+                    if owns_transaction:
+                        conn.commit()
+                    raise ImportConflictError(result.conflicts, partial=partial)
 
-        current = window_end
+            current = window_end
+    except ImportConflictError:
+        raise
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
+    if owns_transaction:
+        conn.commit()
 
     if right_edge_drops > 0:
         # 期待どおりの挙動なので debug。ただし**件数は残す** — bridge が

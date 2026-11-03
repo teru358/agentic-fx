@@ -107,6 +107,8 @@ _PRICE_FAILURE_TEXT = {
                              "端末のログイン・自動売買の許可を確認してください。"),
     "invalid_response": "bridge の応答が想定した形ではありません。bridge のバージョンを確認してください。",
 }
+_TIME_RULE_UNCHECKED_TEXT = ("bridge は応答しています。閉場中のため時刻規則は未検査です "
+                             "(開場後に検査されます)。")
 _BRIDGE_GUIDE = (
     "bridge を配置して afx とつなげるまでの手順 (Wine・MT5 本体の導入はここでは扱いません):",
     "  1. MT5 端末が動いてログイン済みの Windows (または Wine) 環境を用意する。",
@@ -960,6 +962,11 @@ def _stage3_price_choose(sess: _Session, st: _Start, a: Answers) -> None:
                 a.price = _check_record(result)
                 a.bridge_plan = "connected"
                 _stage3_watch_symbols(sess, st, a, url)
+            elif result.reason_code is checks.CheckReason.TIME_RULE_UNCHECKED:
+                sess.say(_TIME_RULE_UNCHECKED_TEXT)
+                a.price = _check_record(result)
+                a.bridge_plan = "connected"
+                _stage3_watch_symbols(sess, st, a, url)
             else:
                 sess.say(_PRICE_FAILURE_TEXT.get(
                     result.reason_code.value if result.reason_code else "", "接続できませんでした。"))
@@ -975,6 +982,12 @@ def _stage3_price_choose(sess: _Session, st: _Start, a: Answers) -> None:
             _stage3_watch_symbols(sess, st, a, url)
             return
         reason = result.reason_code.value if result.reason_code else "connect_error"
+        if result.reason_code is checks.CheckReason.TIME_RULE_UNCHECKED:
+            sess.say(_TIME_RULE_UNCHECKED_TEXT)
+            a.price = _check_record(result)
+            a.bridge_plan = "connected"
+            _stage3_watch_symbols(sess, st, a, url)
+            return
         if (not _may_send_bridge_key(url) and reason == checks.CheckReason.AUTH_REQUIRED.value):
             a.price = _plain_record("unverified", sess.now_iso(), checks.CheckReason.KEY_WITHHELD_PLAIN_HTTP.value)
             a.bridge_plan = "connected"

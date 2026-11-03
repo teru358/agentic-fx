@@ -306,7 +306,7 @@ def _validate_and_normalize_row(idx: int, row: tuple) -> tuple:
 
 
 def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
-                        source: str) -> ImportResult:
+                        source: str, commit: bool = True) -> ImportResult:
     """一括インポータ用。既存行は不変 — 同一キー同一値は無変更 (unchanged)、
     値が異なる既存行は入力をスキップして件数だけ計上する (conflicted)。
 
@@ -319,12 +319,19 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
     バッチ原子性: (1) 書き込み前に全行を検証・正規化し、(2) 実際の書き込みは
     `SAVEPOINT` で明示的に囲み、例外時は `ROLLBACK TO SAVEPOINT` してから
     再送出する。
+
+    `commit=False` は呼び出し側の transaction の中で複数回に分けて書くとき
+    の指定で、commit も rollback もしない (呼び出し側が決める)。transaction
+    の外で指定すると最外の SAVEPOINT の RELEASE が commit になるので拒否する。
     """
     if source not in IMPORT_SOURCES:
         raise ValueError(
             f"import_history_bars: source={source!r} は IMPORT_SOURCES "
             f"{sorted(IMPORT_SOURCES)} に含まれません "
             "(ライブ由来の source は upsert_cache_bars を使うこと)")
+    if not commit and not conn.in_transaction:
+        raise ValueError(
+            "import_history_bars: commit=False requires an open transaction")
     normalized_rows = [_validate_and_normalize_row(i, row)
                        for i, row in enumerate(rows)]
 
@@ -378,7 +385,8 @@ def import_history_bars(conn: sqlite3.Connection, rows: list[tuple], *,
         conn.execute("ROLLBACK TO SAVEPOINT import_history_bars")
         conn.execute("RELEASE import_history_bars")
         raise
-    conn.commit()
+    if commit:
+        conn.commit()
     if conflicted > 0:
         _log.warning(
             "import_history_bars: %d row(s) conflicted with existing data "

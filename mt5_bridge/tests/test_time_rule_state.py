@@ -442,3 +442,63 @@ def test_health_stays_200_and_reports_the_state(monkeypatch):
 
     assert (body.status, body.time_rule_state, body.measured_at) == (
         "ok", "mismatch", "2026-07-28T12:00:00+00:00")
+
+
+# ── 応答時点の鮮度 ─────────────────────────────────────────────────
+
+class _SlowRatesMt5(_Mt5):
+    """copy_rates_range の呼び出し中に時計が進む (MT5 が長くブロックした状況)。"""
+
+    def __init__(self, *args, stall_seconds: int, break_probe_after: bool, **kw):
+        super().__init__(*args, **kw)
+        self.stall_seconds = stall_seconds
+        self.break_probe_after = break_probe_after
+
+    def copy_rates_range(self, symbol, timeframe, start, end):
+        self.clock.advance(seconds=self.stall_seconds)
+        if self.break_probe_after:
+            self.broken.add("USDJPY")
+        return super().copy_rates_range(symbol, timeframe, start, end)
+
+
+def _slow_client(*, break_probe_after: bool) -> Mt5Client:
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    client._mt5 = _SlowRatesMt5(client.clock, 10800, stall_seconds=301,
+                                break_probe_after=break_probe_after)
+    return client
+
+
+def test_ohlcv_that_blocked_past_five_minutes_is_not_served_without_a_fresh_check():
+    client = _slow_client(break_probe_after=True)
+
+    with pytest.raises(TimeRuleUnavailableError, match="time_rule_unverified"):
+        _ohlcv(client)
+
+
+def test_ohlcv_that_blocked_past_five_minutes_measures_again_before_answering():
+    client = _slow_client(break_probe_after=False)
+
+    assert _ohlcv(client) == []
+
+    info = client.get_server_time()
+    assert info["measured_age_sec"] == 0
+    assert info["time_rule_state"] == "ok"
+    assert client._mt5.tick_calls.count("USDJPY") >= 2     # 取得前と取得後
+
+
+# ── 建玉・約定の endpoint でも状態遷移を直ちに記録する ───────────────
+
+def test_positions_and_deal_requests_log_a_state_change_without_blocking(caplog):
+    caplog.set_level(logging.WARNING, logger=STATE_LOGGER)
+    client = _client(_at(2026, 7, 28, 12, 0), 7200)      # 規則は夏 = 10800
+    client._mt5.history_deals_get = lambda position: []
+
+    assert client.get_positions() == []
+    assert _state_lines(caplog) == ["MT5 time rule state: mismatch"]
+
+    client._mt5.offset = 10800
+    for _ in range(3):
+        client.clock.advance(seconds=60)
+        assert client.get_closed_deal(1) is None
+    assert _state_lines(caplog) == ["MT5 time rule state: mismatch",
+                                    "MT5 time rule state: ok"]

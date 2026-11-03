@@ -52,3 +52,26 @@ def test_history_import_stops_with_rc1_and_no_rows_when_the_bridge_refuses(
     assert word in captured.err
     assert "inserted=" not in captured.out
     store.assert_not_called()
+
+
+def test_history_import_leaves_zero_rows_when_a_later_window_is_refused(tmp_path, monkeypatch, capsys):
+    from agentic_fx.store.db import connect
+
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    answers = iter([
+        httpx.Response(200, json={"symbol": "USDJPY", "interval": "1m", "bars": [{
+            "time": "2026-11-04T00:00:00+00:00", "open": 148.0, "high": 148.2,
+            "low": 147.9, "close": 148.1, "volume": 10}]},
+            request=httpx.Request("GET", "http://bridge/x")),
+        _response(503, "time_rule_unverified"),
+    ])
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch.object(mt5_import.httpx, "get", side_effect=lambda *a, **k: next(answers)):
+        rc = main(["history", "import", "--source", "mt5", "--symbol", "USDJPY",
+                   "--from", "2026-11-04", "--to", "2026-11-06"])
+
+    assert rc == 1
+    assert "time_rule_unverified" in capsys.readouterr().err
+    conn = connect(tmp_path / "data" / "agentic.db")
+    assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 0
