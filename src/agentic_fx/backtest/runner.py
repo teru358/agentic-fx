@@ -145,6 +145,8 @@ class BacktestResult:
     kill_switch_events: list[dict] = field(default_factory=list)
     kill_switch_latches: int = 0
     first_decision_at: datetime | None = None
+    # intent_source を評価した回数 (確定バーがあり市場オープンの境界だけ)。
+    eval_bars: int = 0
 
 
 def parse_timeframe(tf: str) -> timedelta:
@@ -426,6 +428,7 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
     equity_curve: list[tuple[str, float]] = [
         (start.isoformat(), initial_balance)]
     pending_proposal: dict | None = None
+    eval_bars = 0
     now = first_decision_at
     while now < end:
         current_ts = now
@@ -473,6 +476,7 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
             closed_bar = _aggregate_bucket(feed, symbol, eval_timeframe,
                                            bucket_start, tf)
             if closed_bar is not None and market_hours.is_market_open(now):
+                eval_bars += 1
                 pending_proposal = intent_source(closed_bar)
         # fix round 1 F7 (sonnet M1): 先頭の seed 点 (start, initial_balance)
         # と初回ループの tail 追記が同一 ts になり二重記録されるため、その
@@ -503,4 +507,4 @@ def run_replay(settings: Settings, *, symbol: str, dataset: HistoryDataset,
         snapshots=snapshots, kill_switch_events=kill_switch_events,
         kill_switch_latches=sum(
             t["kind"] == "latched" for t in state.kill_switch_transitions),
-        first_decision_at=first_decision_at)
+        first_decision_at=first_decision_at, eval_bars=eval_bars)

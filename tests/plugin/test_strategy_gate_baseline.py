@@ -42,6 +42,8 @@ def _settings():
     s.improve.gate.min_pf = 1.0
     s.improve.gate.require_positive_avg_r = True
     s.improve.gate.require_holdout_evaluable = False
+    s.improve.gate.max_drawdown = 0.20
+    s.improve.gate.max_trades_per_eval_bar = 0.25
     s.backtest.eval_source = "dukascopy"
     s.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
     return s

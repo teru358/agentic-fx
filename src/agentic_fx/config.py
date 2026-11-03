@@ -344,6 +344,10 @@ class ImproveGateSettings(_Strict):
     min_pf: float = Field(ge=0.0, default=1.0)
     require_positive_avg_r: bool = True
     require_holdout_evaluable: bool = False
+    max_drawdown: float | None = Field(
+        default=0.20, gt=0, le=1, strict=True, allow_inf_nan=False)
+    max_trades_per_eval_bar: float | None = Field(
+        default=0.25, gt=0, le=1, strict=True, allow_inf_nan=False)
 
     def snapshot(self) -> dict:
         """[profitability-floor] codex 2 周目レビュー CR4 (2026-09-13):
@@ -359,6 +363,8 @@ class ImproveGateSettings(_Strict):
             "min_pf": self.min_pf,
             "require_positive_avg_r": self.require_positive_avg_r,
             "require_holdout_evaluable": self.require_holdout_evaluable,
+            "max_drawdown": self.max_drawdown,
+            "max_trades_per_eval_bar": self.max_trades_per_eval_bar,
         }
 
 

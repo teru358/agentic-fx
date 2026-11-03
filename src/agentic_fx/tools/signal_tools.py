@@ -148,6 +148,8 @@ def build(conn: sqlite3.Connection, settings: Settings,
                         conn, row["content_hash"], pair=row["pair"],
                         variant="candidate", source=dataset.source,
                         base_interval=dataset.base_interval))
+                if item["in_sample_metrics"] is not None:
+                    item["in_sample_metrics"].pop("eval_bars", None)
                 item["note"] = _ANNOTATION
             result.append(item)
         return result

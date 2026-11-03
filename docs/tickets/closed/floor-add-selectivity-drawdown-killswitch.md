@@ -1,16 +1,16 @@
 ---
 id: floor-add-selectivity-drawdown-killswitch
 title: 収益性フロアに選別度・max DD・kill switch 回数を加える
-status: 設計待ち
+status: 是正済
 priority: 中
 kind: 機能
 opened: 2026-11-01
-closed: null
+closed: 2026-11-02
 related: []
 ---
 # [floor-add-selectivity-drawdown-killswitch] 収益性フロアに選別度・max DD・kill switch 回数を加える
 
-**状態**: 設計待ち / **優先**: 中 / **種別**: 機能
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -22,6 +22,10 @@ us500_lagged_return_fx (承認 #84) はほぼ毎バー建てる戦略で in-samp
 
 ## 修正内容
 
+- 2026-11-02: 3ee97e18 (merge): max DD 既定 0.20 と取引頻度 0.25 を床に、eval_bars 計測、再実測 driver
+
 ## 経緯
 
 - 2026-11-01: 起票。
+- 2026-11-01: 状態: 実装中 — 設計 C0 = 収益性フロア設計 v1.6.2 §10 (terra → sol の 2 周、ユーザー承認 2026-11-01: max DD 既定 0.20 有効・設定可、取引頻度は eval_bars 計測後に閾値、kill switch と最小 trades は床に入れない、agent 面は unprofitable のまま)。T1 (eval_bars + manifest) → T2 (床)
+- 2026-11-02: 是正内容 — 3ee97e18 (merge): max DD 既定 0.20 と取引頻度 0.25 を床に、eval_bars 計測、再実測 driver

@@ -48,11 +48,11 @@ v2 は保持する。v3 は replay kill-switch 評価規約を正とし、既存
 
 | 分類 | 件数 |
 | --- | ---: |
-| added_metric_keys | 1 |
+| added_metric_keys | 2 |
 | removed_duplicate_activity_events | 1 |
 | changed_existing_values | 0 |
 | unexpected_added_rows | 0 |
 | unclassified | 0 |
 
-`tests/backtest/test_golden_diff_v2_v3.py` が上表と、6 種の不許可差分を
+`tests/backtest/test_golden_diff_v2_v3.py` が上表と、9 種の不許可差分を
 機械検証する。分類不能が 1 件でもあれば golden は更新しない。

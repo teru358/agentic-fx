@@ -791,3 +791,67 @@ def test_human_corridor_never_compares(env, monkeypatch):
 
     assert len(seen) == 1
     assert seen[0].get("compare_mode", "off") == "off"
+
+
+# ---- 床拡張: DD のみ不合格の submit / bless 配線 -----------------------
+
+def _dd_only_fail_gate(conn, *, meta, settings, now, floor_mode="enforce",
+                       record_fn=None, **_unused_kwargs):
+    """pf / avg_r は合格、DD だけが上限超。floor_detail は実判定関数の出力。"""
+    metrics = {"USDJPY": {"trades": 864, "pf": 1.002, "avg_r": 0.004,
+                          "max_drawdown": 0.263, "eval_bars": 5000,
+                          "evaluable": True}}
+    label, detail = strategy_gate._check_profitability_floor(
+        metrics, settings=settings, scope="in_sample")
+    assert label == "unprofitable"
+    return StrategyGateVerdict(
+        evaluable=True, baseline_variant="no_strategy",
+        baseline_row={"plugin_ref": f"no_strategy:{meta.name}",
+                      "variant": "no_strategy"},
+        candidate_metrics=metrics,
+        floor_reason=label, floor_detail=detail)
+
+
+def test_submit_value_error_carries_drawdown_floor_detail(env, monkeypatch):
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_staging" / "1" / "st"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _dd_only_fail_gate)
+
+    with pytest.raises(ValueError) as exc:
+        switch.submit_candidate(
+            conn, name="st", staging_dir=plugins_dir / "_staging" / "1",
+            candidate_origin="staging", mission_id=1, backlog_id=None,
+            settings=settings, now=NOW)
+    assert "drawdown_too_deep" in str(exc.value)
+    assert "max_drawdown=0.263" in str(exc.value)
+    assert approvals_store.pending(conn, kind="plugin") == []
+
+
+def test_bless_payload_carries_drawdown_floor_warning_and_detail(
+        env, monkeypatch):
+    import json
+    root, plugins_dir, conn, settings = env
+    d = plugins_dir / "_human" / "st"
+    _write_strategy_candidate(d)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.switch.run_gate_pytest", _fake_pytest_ok)
+    monkeypatch.setattr(
+        "agentic_fx.plugin.strategy_gate.evaluate_strategy_adoption_gate",
+        _dd_only_fail_gate)
+
+    approval_id = switch.bless_candidate(
+        conn, name="st", human_dir=d, settings=settings, now=NOW,
+        decided_by="human_cli", on_floor_warning=lambda label, detail: None,
+        activity=ActivityLog(root / "logs" / "activity.log"))
+    row = conn.execute(
+        "SELECT payload_json FROM approval_requests WHERE id=?",
+        (approval_id,)).fetchone()
+    payload = json.loads(row["payload_json"])
+    assert payload["floor_warning"] == "unprofitable"
+    assert "drawdown_too_deep" in payload["floor_detail"]
+    assert "max_drawdown=0.263" in payload["floor_detail"]

@@ -1,7 +1,7 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 160 件。完了分は closed/。
+未完了: 159 件。完了分は closed/。
 
 ## 実装中 (3)
 
@@ -72,7 +72,7 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (137)
+## 設計待ち (136)
 
 ### 不具合 (76)
 
@@ -155,7 +155,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (40)
+### 機能 (39)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -169,7 +169,6 @@
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
-| [floor-add-selectivity-drawdown-killswitch](open/floor-add-selectivity-drawdown-killswitch.md) | 中 | 2026-11-01 | 収益性フロアに選別度・max DD・kill switch 回数を加える |
 | [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |

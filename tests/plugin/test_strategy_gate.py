@@ -36,6 +36,8 @@ def _configure_gate_mock(settings: MagicMock) -> MagicMock:
     settings.improve.gate.min_pf = 1.0
     settings.improve.gate.require_positive_avg_r = True
     settings.improve.gate.require_holdout_evaluable = False
+    settings.improve.gate.max_drawdown = 0.20
+    settings.improve.gate.max_trades_per_eval_bar = 0.25
     settings.backtest.eval_source = "dukascopy"
     settings.backtest.dataset.return_value = HistoryDataset("dukascopy", "1m")
     return settings
