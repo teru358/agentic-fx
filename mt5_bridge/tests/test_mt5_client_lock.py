@@ -3,23 +3,37 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 
 from mt5_client import Mt5Client
 
 
-def _seed_utc_server_offset(client: Mt5Client) -> None:
-    """サーバ時刻 = UTC (offset 0) を「たった今検出済み」として仕込む。
+_OPEN_NOW = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
-    Mt5Client は MT5 の時刻をサーバ時間帯のエポック秒として扱い、オフセットが
-    未確定なら fail closed で例外を上げる。本ファイルのテストは lock による
-    直列化の検証が目的なので、offset 0 (= 移植前とまったく同じ挙動) を置いて
-    再検出 (MT5 への probe) が走らないようにする。probe が走ると call_log に
-    余分な tick 呼び出しが混じり、検証したい直列化と無関係な差分が出る。
+
+def _seed_verified_time_rule(client: Mt5Client) -> None:
+    """時刻規則を「たった今、規則と一致を受理済み」として仕込む。
+
+    Mt5Client は市場データを返す前に規則の検査状態 (ok) を要求する。本ファイルの
+    テストは lock による直列化の検証が目的なので、検査済みの状態を置いて測定
+    (MT5 への tick probe) が走らないようにする。probe が走ると call_log に余分な
+    tick 呼び出しが混じり、検証したい直列化と無関係な差分が出る。測定そのものが
+    lock の下で直列化されることは別のテストで見る。
     """
-    client._server_offset_sec = 0
-    client._offset_checked_at = time.time()
-    client._offset_source = "cached"
-    client._offset_disk_loaded = True
+    client._now = lambda: _OPEN_NOW
+    stamp = _OPEN_NOW.timestamp()
+    client._last_measure_attempt_at = stamp
+    client._measured_at = stamp
+    client._measured_offset_sec = 10800
+    client._match_streak = 3
+
+
+def _join(*threads: threading.Thread, timeout: float = 10.0) -> None:
+    """lock が壊れて止まっても、スイート全体を止めずに失敗として報告する。"""
+    for t in threads:
+        t.join(timeout)
+    for t in threads:
+        assert not t.is_alive(), "worker thread is still blocked (deadlock?)"
 
 
 class _SlowFakeMt5:
@@ -51,23 +65,21 @@ class _SlowFakeMt5:
 def test_copy_rates_range_is_serialized_across_threads():
     """2スレッドが copy_rates_range を同時に呼んでも select→copy ペアが
     他スレッドの呼び出しで割り込まれない (lock で直列化される)。"""
-    from datetime import datetime, timezone
-
     call_log: list[str] = []
     client = Mt5Client.__new__(Mt5Client)
     client._mt5 = _SlowFakeMt5(call_log, threading.Lock())
     client._lock = threading.Lock()
-    _seed_utc_server_offset(client)
+    _seed_verified_time_rule(client)
 
-    d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
-    d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
+    d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
+    d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
     def worker(sym):
         client.copy_rates_range(sym, "1h", d0, d1)
 
-    t1 = threading.Thread(target=worker, args=("USDJPY",))
-    t2 = threading.Thread(target=worker, args=("EURUSD",))
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=worker, args=("USDJPY",), daemon=True)
+    t2 = threading.Thread(target=worker, args=("EURUSD",), daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     assert len(call_log) == 4
     for i in (0, 2):
@@ -81,8 +93,6 @@ def test_copy_rates_range_is_serialized_across_threads():
 def test_disconnect_does_not_interleave_with_copy_rates():
     """copy_rates_range 実行中に disconnect() (shutdown) が割り込まない
     (lifecycle も lock 対象)。"""
-    from datetime import datetime, timezone
-
     log: list[str] = []
     log_lock = threading.Lock()
 
@@ -106,19 +116,19 @@ def test_disconnect_does_not_interleave_with_copy_rates():
     c._mt5 = _Fake()
     c._lock = threading.Lock()
     c._connected = True
-    _seed_utc_server_offset(c)
+    _seed_verified_time_rule(c)
 
-    d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
-    d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
+    d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
+    d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
     def data_worker():
         c.copy_rates_range("USDJPY", "1h", d0, d1)
 
-    t = threading.Thread(target=data_worker)
+    t = threading.Thread(target=data_worker, daemon=True)
     t.start()
     time.sleep(0.01)
     c.disconnect()
-    t.join()
+    _join(t)
 
     assert "shutdown" in log
     ci_start, ci_end = log.index("copy_start"), log.index("copy_end")
@@ -167,7 +177,7 @@ def _preflight_client(fake):
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = fake
     c._lock = threading.Lock()
-    _seed_utc_server_offset(c)
+    _seed_verified_time_rule(c)
     return c
 
 
@@ -208,8 +218,6 @@ def test_preflight_does_not_deadlock_calling_locked_helpers():
 def test_copy_rates_and_preflight_do_not_interleave():
     """copy_rates_range (data) と preflight_order_margin (order前処理) が
     同時に走っても、各々の symbol_select→次のMT5呼び出しが割り込まれない。"""
-    from datetime import datetime, timezone
-
     order_log: list[str] = []
     log_lock = threading.Lock()
 
@@ -244,10 +252,10 @@ def test_copy_rates_and_preflight_do_not_interleave():
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = _Fake()
     c._lock = threading.Lock()
-    _seed_utc_server_offset(c)
+    _seed_verified_time_rule(c)
 
-    d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
-    d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
+    d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
+    d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
     def data_worker():
         c.copy_rates_range("USDJPY", "1h", d0, d1)
@@ -255,9 +263,9 @@ def test_copy_rates_and_preflight_do_not_interleave():
     def order_worker():
         c.preflight_order_margin("EURUSD", "buy", 0.1)
 
-    t1 = threading.Thread(target=data_worker)
-    t2 = threading.Thread(target=order_worker)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=data_worker, daemon=True)
+    t2 = threading.Thread(target=order_worker, daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     # どちらかのブロックが完全に先行する (interleave しない)。
     data_block = ["select:USDJPY", "copy:USDJPY"]
@@ -271,8 +279,6 @@ def test_copy_rates_and_preflight_do_not_interleave():
 def test_last_error_failure_path_is_serialized():
     """copy_rates_range が None を返し last_error() を読む失敗パスが、別 call と
     並行しても lock 内で完結する (last_error race の検証)。"""
-    from datetime import datetime, timezone
-
     log: list[str] = []
     log_lock = threading.Lock()
 
@@ -295,9 +301,9 @@ def test_last_error_failure_path_is_serialized():
     c = Mt5Client.__new__(Mt5Client)
     c._mt5 = _FailFake()
     c._lock = threading.Lock()
-    _seed_utc_server_offset(c)
-    d0 = datetime(2026, 6, 30, tzinfo=timezone.utc)
-    d1 = datetime(2026, 6, 30, 1, tzinfo=timezone.utc)
+    _seed_verified_time_rule(c)
+    d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
+    d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
 
     errors: list[Exception] = []
     def fail_worker():
@@ -308,9 +314,9 @@ def test_last_error_failure_path_is_serialized():
     def ok_worker():
         c.copy_rates_range("OKSYM", "1h", d0, d1)
 
-    t1 = threading.Thread(target=fail_worker)
-    t2 = threading.Thread(target=ok_worker)
-    t1.start(); t2.start(); t1.join(); t2.join()
+    t1 = threading.Thread(target=fail_worker, daemon=True)
+    t2 = threading.Thread(target=ok_worker, daemon=True)
+    t1.start(); t2.start(); _join(t1, t2)
 
     assert len(errors) == 1
     fail_block = ["select:FAILSYM", "copy:FAILSYM", "last_error"]
@@ -318,3 +324,46 @@ def test_last_error_failure_path_is_serialized():
     assert log in (fail_block + ok_block, ok_block + fail_block), (
         f"last_error race / interleave detected: {log}"
     )
+
+
+def test_time_rule_measurement_is_serialized_with_other_calls():
+    """測定 (symbol_info_tick の probe) が必要な呼び出しでも、select -> probe (select, tick) -> copy の
+    組が他スレッドの呼び出しで割り込まれない (測定は lock の内側)。"""
+    log: list[str] = []
+    log_lock = threading.Lock()
+    fresh_server_tick = int(_OPEN_NOW.timestamp()) + 10800
+
+    class _Fake:
+        TIMEFRAME_H1 = 16385
+        def _rec(self, n):
+            with log_lock:
+                log.append(n)
+        def symbol_select(self, s, e):
+            self._rec(f"select:{s}"); time.sleep(0.02); return True
+        def symbol_info_tick(self, s):
+            self._rec(f"tick:{s}"); time.sleep(0.02)
+            return type("T", (), {"time": fresh_server_tick})()
+        def copy_rates_range(self, s, tf, a, b):
+            self._rec(f"copy:{s}"); time.sleep(0.02)
+            return []
+        def last_error(self):
+            return (0, "ok")
+
+    c = Mt5Client.__new__(Mt5Client)
+    c._mt5 = _Fake()
+    c._lock = threading.Lock()
+    c._probe_symbol = "USDJPY"
+    c._now = lambda: _OPEN_NOW
+    c._last_tick_time = {"USDJPY": 1}      # 現在より前の観測が 1 回ある
+    d0 = datetime(2026, 6, 30, 11, tzinfo=timezone.utc)
+    d1 = datetime(2026, 6, 30, 12, tzinfo=timezone.utc)
+
+    threads = [threading.Thread(target=c.copy_rates_range, args=(sym, "1h", d0, d1), daemon=True)
+               for sym in ("USDJPY", "USDJPY")]
+    for t in threads:
+        t.start()
+    _join(*threads)
+
+    first = ["select:USDJPY", "select:USDJPY", "tick:USDJPY", "copy:USDJPY"]  # 測定が要る呼び出し
+    second = ["select:USDJPY", "copy:USDJPY"]                      # 60 秒以内なので測らない
+    assert log == first + second, f"interleave or repeated measurement: {log}"

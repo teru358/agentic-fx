@@ -15,6 +15,20 @@ import yfinance
 
 from agentic_fx.core.contracts import Bar, Quote
 
+
+class BridgeTimeRuleMismatch(RuntimeError):
+    """The bridge measured a broker offset that conflicts with its time rule."""
+
+    def __init__(self, message: str = "MT5 bridge time rule mismatch") -> None:
+        super().__init__(message)
+
+
+class BridgeTimeUnverified(RuntimeError):
+    """The bridge has not recently verified the broker clock against its rule."""
+
+    def __init__(self, message: str = "MT5 bridge time rule is unverified") -> None:
+        super().__init__(message)
+
 INTERVAL_MIN: dict[str, float] = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 
@@ -128,6 +142,21 @@ def _mt5_headers() -> dict[str, str]:
     return {"X-Bridge-Api-Key": key} if key else {}
 
 
+def _raise_mt5_time_rule_error(response: httpx.Response) -> None:
+    if response.status_code != 503:
+        response.raise_for_status()
+        return
+    try:
+        detail = response.json().get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if detail == "time_rule_mismatch":
+        raise BridgeTimeRuleMismatch()
+    if detail == "time_rule_unverified":
+        raise BridgeTimeUnverified()
+    response.raise_for_status()
+
+
 def mt5_health(bridge_url: str, *, timeout: float = 10) -> bool:
     """Return whether the bridge reports an attached MT5 terminal."""
     response = httpx.get(f"{bridge_url.rstrip('/')}/health",
@@ -141,7 +170,7 @@ def mt5_quote(bridge_url: str, pair: str) -> Quote:
     sym = vendor_symbol(pair, "mt5")
     r = httpx.get(f"{bridge_url}/quote/{sym}",
                   headers=_mt5_headers(), timeout=10)
-    r.raise_for_status()
+    _raise_mt5_time_rule_error(r)
     d = r.json()   # {symbol, bid, ask, spread_points, time}
     # bridge は現行 +00:00 付き ISO を返すが、_to_utc を通すことで
     # 非 UTC オフセット・naive を無言で受けない形にしておく
@@ -162,7 +191,7 @@ def mt5_bars_range(bridge_url: str, pair: str, interval: str,
                   params={"from": start.isoformat(), "to": end.isoformat(),
                           "interval": interval},
                   headers=_mt5_headers(), timeout=timeout)
-    r.raise_for_status()
+    _raise_mt5_time_rule_error(r)
     payload = r.json()          # {symbol, interval, bars: [...]}
     # bar の出来高キーは "volume" (bridge が MT5 の tick_volume を変換済み)。
     # "tick_volume" を読むと全バーが 0 になる
@@ -185,7 +214,7 @@ def mt5_raw_bars_range(bridge_url: str, symbol: MT5RawSymbol, interval: str,
                   params={"from": start.isoformat(), "to": end.isoformat(),
                           "interval": interval},
                   headers=_mt5_headers(), timeout=timeout)
-    r.raise_for_status()
+    _raise_mt5_time_rule_error(r)
     payload = r.json()
     return [Bar(symbol.value, interval,
                 _to_utc(datetime.fromisoformat(x["time"]), "mt5"),

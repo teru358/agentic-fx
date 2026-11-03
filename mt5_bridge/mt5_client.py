@@ -8,15 +8,13 @@ import エラーにならないよう lazy import + skeleton stub を提供す�
 """
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import threading
-import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from datetime import date, datetime, time as wall_time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -33,17 +31,76 @@ logger = logging.getLogger(__name__)
 _OFFSET_MAX_ABS_SEC = 12 * 3600      # ガード 1: ±12h 超は tick が古い証拠
 _OFFSET_SNAP_SEC = 1800              # ガード 2: 30 分単位に丸める
 _OFFSET_MAX_RESIDUAL_SEC = 120       # ガード 3: 丸め残差の許容
-_OFFSET_RECALC_INTERVAL_SEC = 300    # 再計算の最短間隔 (毎リクエスト叩かない)
+_MEASURE_INTERVAL_SEC = 60
+_MEASURE_MAX_AGE_SEC = 300
+NY = ZoneInfo("America/New_York")
+SERVER_AHEAD_OF_NY = timedelta(hours=7)
 
 
-class ServerTimeUnknownError(RuntimeError):
-    """サーバ時刻オフセットが一度も確定していない (fail closed)。
+class TimeRuleUnavailableError(RuntimeError):
+    """Market data is unavailable until the broker clock matches the rule."""
 
-    推測値で時刻を返すと、ずれた足でサイジングしたり誤った時刻で発注したり
-    する。止まる方が安全なので例外を上げ、server 側は 503 に map する。
-    RuntimeError を継承しているのは、まだ個別 except を持たない呼出元でも
-    「無言で誤った値が返る」ことだけは起きないようにするため。
-    """
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _new_york_wall_to_utc(wall: datetime) -> datetime:
+    first = wall.replace(tzinfo=NY, fold=0)
+    second = wall.replace(tzinfo=NY, fold=1)
+    first_utc = first.astimezone(timezone.utc)
+    second_utc = second.astimezone(timezone.utc)
+    first_round_trip = first_utc.astimezone(NY).replace(tzinfo=None) == wall
+    second_round_trip = second_utc.astimezone(NY).replace(tzinfo=None) == wall
+    if first_round_trip and second_round_trip and first_utc != second_utc:
+        logger.warning("ambiguous New York server wall time: %s", wall.isoformat())
+        return first_utc
+    if not first_round_trip or not second_round_trip:
+        logger.warning("nonexistent New York server wall time: %s", wall.isoformat())
+        return first_utc
+    return first_utc
+
+
+def server_epoch_to_utc(server_epoch: int) -> datetime:
+    """Convert an MT5 server-wall-clock epoch to an aware UTC datetime."""
+    server_wall = datetime.fromtimestamp(server_epoch, timezone.utc).replace(tzinfo=None)
+    return _new_york_wall_to_utc(server_wall - SERVER_AHEAD_OF_NY)
+
+
+def utc_to_server_epoch(utc: datetime) -> int:
+    """Encode an aware UTC instant as an MT5 server-wall-clock epoch."""
+    if utc.tzinfo is None or utc.utcoffset() != timedelta(0):
+        raise TypeError("utc must be an aware datetime with a zero UTC offset")
+    server_wall = utc.astimezone(NY).replace(tzinfo=None) + SERVER_AHEAD_OF_NY
+    return int(server_wall.replace(tzinfo=timezone.utc).timestamp())
+
+
+def _market_is_open(now: datetime) -> bool:
+    local = now.astimezone(NY)
+    trading_day = (local.replace(tzinfo=None) + SERVER_AHEAD_OF_NY).date()
+    if (trading_day.month, trading_day.day) in {(12, 25), (1, 1)}:
+        return False
+    if local.weekday() == 4:
+        return local.time() < wall_time(17)
+    if local.weekday() == 5:
+        return False
+    if local.weekday() == 6:
+        return local.time() >= wall_time(17)
+    return True
+
+
+def _expected_offset(now: datetime) -> int:
+    return utc_to_server_epoch(now) - int(now.timestamp())
+
+
+def _validate_time_rule_data() -> None:
+    try:
+        summer = datetime(2026, 7, 1, tzinfo=NY).utcoffset()
+        winter = datetime(2026, 1, 15, tzinfo=NY).utcoffset()
+    except Exception as exc:  # pragma: no cover - platform zoneinfo failure
+        raise RuntimeError("America/New_York time-zone data is unavailable") from exc
+    if summer != timedelta(hours=-4) or winter != timedelta(hours=-5):
+        raise RuntimeError("America/New_York time-zone data failed self-check")
 
 
 def snap_server_offset(raw_sec: float) -> int | None:
@@ -59,25 +116,17 @@ def snap_server_offset(raw_sec: float) -> int | None:
        丸めることで tick とこちらの時計の秒単位のずれを吸収する
        (実測 raw = 10799.3s → 10800 = 3h ちょうど)
     3. |raw - snapped| > 120s → 棄却。残差が大きいのも tick が古い証拠
+    4. 1 時間の倍数でないものは棄却。30 分前の古い tick は raw が規則の
+       オフセットから 30 分ずれ、ガード 2・3 を通ってしまう
     """
     if abs(raw_sec) > _OFFSET_MAX_ABS_SEC:
         return None
     snapped = int(round(raw_sec / _OFFSET_SNAP_SEC) * _OFFSET_SNAP_SEC)
     if abs(raw_sec - snapped) > _OFFSET_MAX_RESIDUAL_SEC:
         return None
+    if snapped % 3600 != 0:
+        return None
     return snapped
-
-
-def to_server_datetime(utc_dt: datetime, offset_sec: int) -> datetime:
-    """送信 (こちら→MT5): 真の UTC をサーバ時刻空間へずらす。"""
-    return utc_dt + timedelta(seconds=offset_sec)
-
-
-def from_server_epoch(server_epoch: int, offset_sec: int) -> datetime:
-    """受信 (MT5→こちら): サーバ時刻のエポック秒を真の UTC の datetime に直す。"""
-    return datetime.fromtimestamp(
-        int(server_epoch) - offset_sec, tz=timezone.utc,
-    )
 
 
 def _import_mt5():
@@ -158,34 +207,34 @@ class Mt5Client:
     # サーバ時刻オフセットの状態。クラス属性として既定値を持たせているのは、
     # 既存テストが `Mt5Client.__new__(Mt5Client)` で __init__ を経由せずに
     # インスタンスを組み立てているため (AttributeError にしない)。
-    _server_offset_sec: int | None = None
-    _offset_checked_at: float = 0.0      # 最後に「検出を試みた」時刻 (time.time())
-    _offset_source: str = "unknown"      # "live" | "cached" | "unknown"
-    _offset_cache_path: Path | None = None
-    _offset_disk_loaded: bool = False
     _probe_symbol: str = "USDJPY"        # オフセット検出だけに使う symbol
+    _last_measure_attempt_at: float = 0.0
+    _measured_offset_sec: int | None = None
+    _measured_at: float | None = None
+    _match_streak: int = 0
+    _mismatch_latched: bool = False
+    _last_time_rule_state: str = "unverified"   # 起動直後の状態。最初の遷移から WARNING を出す
 
     def __init__(
         self, login: int, password: str, server: str,
         *,
-        offset_cache_path: Path | str | None = None,
         probe_symbol: str = "USDJPY",
     ) -> None:
+        _validate_time_rule_data()
         self._login = login
         self._password = password
         self._server = server
         self._mt5: Any = None  # MetaTrader5 module
         self._connected = False
         self._lock = threading.Lock()  # MT5 単一接続への並行アクセスを直列化
-        # オフセットは週末をまたぐ再起動でも残るようディスクにも置く
-        self._offset_cache_path = (
-            Path(offset_cache_path) if offset_cache_path is not None else None
-        )
         self._probe_symbol = probe_symbol
-        self._server_offset_sec = None
-        self._offset_checked_at = 0.0
-        self._offset_source = "unknown"
-        self._offset_disk_loaded = False
+        self._last_measure_attempt_at = 0.0
+        self._last_tick_time = {}
+        self._measured_offset_sec = None
+        self._measured_at = None
+        self._match_streak = 0
+        self._mismatch_latched = False
+        self._last_time_rule_state = "unverified"
 
     def connect(self) -> None:
         """MT5 ターミナルを起動 (or 既起動なら attach) し、必要なときだけログインする。
@@ -239,147 +288,133 @@ class Mt5Client:
         except Exception:  # noqa: BLE001
             return False
 
-    # ── サーバ時刻オフセット ──────────────────────────────────────
-    # 検出は必ず lock の内側で行う (`self._mt5` を lock 外で触らない)。
-    # 公開 API は get_server_offset_sec() / get_server_time() の 2 つ。
+    # ── サーバ時刻規則の検査 ──────────────────────────────────────
 
     @property
     def offset_source(self) -> str:
-        """直近の値の出所。"live" = 直近の検出が成功、"cached" = 前回の good 値。"""
-        return self._offset_source
-
-    def get_server_offset_sec(self) -> int:
-        """サーバ時刻オフセット (秒)。確定できなければ ServerTimeUnknownError。"""
-        with self._lock:
-            return self._ensure_offset_locked()
+        return "rule"
 
     def get_server_time(self) -> dict:
-        """こちらの UTC とブローカーのサーバ時刻を並べて返す (観測・切り分け用)。"""
+        """Return rule-derived server time and the latest measurement evidence."""
         with self._lock:
-            offset = self._ensure_offset_locked()
-            # source も同じ lock 区間で読む。lock を離してから読むと、その隙に
-            # 別リクエストが再検出して source だけ書き換わり、返した offset とは
-            # 別の解決結果が混ざる (/server-time は検証の窓口なので対を崩さない)
-            source = self._offset_source
-        now = datetime.now(tz=timezone.utc)
+            now = self._now()
+            self._maybe_measure_locked(now)
+            state = self._time_rule_state_locked(now)
+            measured_at = self._measured_at
+            age = None if measured_at is None else int(now.timestamp() - measured_at)
+            measured_offset = self._measured_offset_sec
+            expected = _expected_offset(now)
+            streak = self._match_streak
+            measured_expected = (None if measured_at is None else
+                                 _expected_offset(datetime.fromtimestamp(
+                                     measured_at, timezone.utc)))
         return {
-            "server_offset_sec": offset,
-            "server_time": to_server_datetime(now, offset).isoformat(),
+            "server_offset_sec": expected,
+            "server_time": datetime.fromtimestamp(
+                utc_to_server_epoch(now), timezone.utc).isoformat(),
             "utc_time": now.isoformat(),
-            "offset_source": source,
+            "offset_source": "rule",
+            "measured_offset_sec": measured_offset,
+            "measured_at": (None if measured_at is None else
+                            datetime.fromtimestamp(measured_at, timezone.utc).isoformat()),
+            "measured_age_sec": age,
+            "expected_offset_sec": measured_expected,
+            "offset_matches_rule": (None if measured_offset is None else
+                                    measured_offset == measured_expected),
+            "match_streak": (None if measured_at is None else streak),
+            "time_rule_state": state,
         }
 
-    def _load_offset_from_disk(self) -> None:
-        """起動後 1 回だけディスクの good 値を読む (週末をまたぐ再起動用)。
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(tz=timezone.utc)
 
-        読めた値も ±12h ガードにかける。壊れていれば無視するだけで、
-        推測値は決して採用しない (good 値なしのまま fail closed に倒す)。
-        """
-        self._offset_disk_loaded = True
-        path = self._offset_cache_path
-        if path is None or not path.exists():
+    def _maybe_measure_locked(self, now: datetime, *, symbol: str | None = None,
+                              tick_time: int | None = None) -> None:
+        if not _market_is_open(now):
             return
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            value = int(data["server_offset_sec"])
-        except Exception as e:  # noqa: BLE001 — 壊れたキャッシュは黙って捨てる
-            logger.warning(f"server offset cache unreadable ({path}): {e}")
+        now_epoch = now.timestamp()
+        if now_epoch - self._last_measure_attempt_at < _MEASURE_INTERVAL_SEC:
             return
-        if abs(value) > _OFFSET_MAX_ABS_SEC:
-            logger.warning(
-                f"server offset cache out of range: {value}s (ignored)"
-            )
+        self._last_measure_attempt_at = now_epoch
+        observed: dict[str, int] = {}
+        if tick_time is not None and symbol is not None:
+            observed[symbol] = tick_time
+        for candidate in {self._probe_symbol, symbol} - {None}:
+            if candidate in observed:
+                continue
+            value = self._probe_tick_time_locked(candidate)
+            if value is not None:
+                observed[candidate] = value
+        # 同じ symbol の tick 時刻が前回の測定から変わっていなければ古い tick なので採らない。
+        # (大小は問わない: サーバ側の規則が動けば新しい tick の時刻は戻りうる。)
+        ticks = []
+        last_ticks = self.__dict__.setdefault("_last_tick_time", {})
+        for name, value in observed.items():
+            previous = last_ticks.get(name)
+            last_ticks[name] = value
+            if previous is None:
+                # 初回の観測には比較対象がない。規則と一致していても古い tick かもしれないので受理せず、
+                # 次に同じ symbol の tick 時刻が動いた観測を待つ。
+                continue
+            if value != previous:
+                ticks.append(value)
+        if not ticks:
             return
-        self._server_offset_sec = value
-        self._offset_source = "cached"
-        # _offset_checked_at は 0 のまま = 起動直後に必ず実測を試みる。
-        # (夏時間切替をまたぐ再起動でディスクの古い値に居座らないため)
-        logger.info(f"server offset loaded from cache: {value}s ({path})")
+        accepted = [(value, snap_server_offset(value - now_epoch)) for value in ticks]
+        accepted = [(value, offset) for value, offset in accepted if offset is not None]
+        if not accepted:
+            return
+        _newest_tick, snapped = max(accepted)
+        self._measured_offset_sec = snapped
+        self._measured_at = now_epoch
+        if snapped == _expected_offset(now):
+            self._match_streak += 1
+            if self._mismatch_latched and self._match_streak >= 3:
+                self._mismatch_latched = False
+        else:
+            self._mismatch_latched = True
+            self._match_streak = 0
 
-    def _save_offset_to_disk(self, offset_sec: int) -> None:
-        path = self._offset_cache_path
-        if path is None:
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({
-                    "server_offset_sec": offset_sec,
-                    "updated_at": datetime.now(tz=timezone.utc).isoformat(),
-                    "mt5_server": self._server,
-                }, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as e:
-            # 永続化に失敗してもメモリ上の good 値では動ける (取引は止めない)
-            logger.warning(f"failed to persist server offset to {path}: {e}")
+    def _time_rule_state_locked(self, now: datetime) -> str:
+        if not _market_is_open(now):
+            state = "unverified"
+        elif self._mismatch_latched:
+            state = "mismatch"
+        elif self._measured_at is None or now.timestamp() - self._measured_at > _MEASURE_MAX_AGE_SEC:
+            state = "unverified"
+        else:
+            state = "ok"
+        if state != self._last_time_rule_state:
+            logger.warning("MT5 time rule state: %s", state)
+            self._last_time_rule_state = state
+        return state
+
+    def _require_market_data_time_rule_locked(self, now: datetime) -> None:
+        state = self._time_rule_state_locked(now)
+        if state != "ok":
+            raise TimeRuleUnavailableError(f"time_rule_{state}")
+
+    def time_rule_status(self) -> tuple[str, str | None]:
+        with self._lock:
+            now = self._now()
+            state = self._time_rule_state_locked(now)
+            measured_at = (None if self._measured_at is None else
+                           datetime.fromtimestamp(self._measured_at, timezone.utc).isoformat())
+            return state, measured_at
 
     def _probe_tick_time_locked(self, symbol: str) -> int | None:
-        """オフセット検出用に tick を 1 本取り、そのサーバ時刻 (epoch) を返す。
-
-        失敗しても例外にしない。検出できなかった扱い (= 直前の good 値へ
-        フォールバック、good 値が無ければ呼出側で fail closed) にする。
-        """
+        """Return a tick timestamp for rule verification, or ``None`` on failure."""
         try:
             if not self._mt5.symbol_select(symbol, True):
                 return None
             tick = self._mt5.symbol_info_tick(symbol)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"server offset probe failed on {symbol}: {e}")
+            logger.warning(f"time-rule probe failed on {symbol}: {e}")
             return None
         if tick is None:
             return None
         return int(tick.time)
-
-    def _ensure_offset_locked(
-        self, *, tick_time: int | None = None, probe_symbol: str | None = None,
-    ) -> int:
-        """オフセットを返す。必要なら再検出する。lock 保持下で呼ぶこと。
-
-        tick_time: 呼出側が既に取得済みの tick のサーバ時刻 (get_quote 用)。
-                   渡されていれば MT5 を余分に叩かない。
-        probe_symbol: tick_time が無いときに probe する symbol。
-        """
-        if not self._offset_disk_loaded:
-            self._load_offset_from_disk()
-
-        now = time.time()
-        # 再計算は最短 _OFFSET_RECALC_INTERVAL_SEC 間隔。窓が開いていなければ
-        # MT5 を一切叩かずキャッシュを返す (毎リクエスト probe しない)。
-        if (self._server_offset_sec is not None
-                and now - self._offset_checked_at < _OFFSET_RECALC_INTERVAL_SEC):
-            return self._server_offset_sec
-
-        if tick_time is None:
-            tick_time = self._probe_tick_time_locked(
-                probe_symbol or self._probe_symbol,
-            )
-        self._offset_checked_at = now
-
-        snapped = (
-            snap_server_offset(float(tick_time) - now)
-            if tick_time is not None else None
-        )
-        if snapped is not None:
-            if snapped != self._server_offset_sec:
-                logger.info(
-                    f"MT5 server time offset detected: {snapped}s "
-                    f"(was {self._server_offset_sec})"
-                )
-                self._server_offset_sec = snapped
-                self._save_offset_to_disk(snapped)
-            self._offset_source = "live"
-            return snapped
-
-        # 棄却 (tick が古い / 取れない)。直前の good 値でしのぐ (週末はこの経路)。
-        self._offset_source = "cached"
-        if self._server_offset_sec is None:
-            raise ServerTimeUnknownError(
-                "MT5 server time offset is unknown: no fresh tick and no cached "
-                "value. Refusing to report times rather than guessing "
-                "(fail closed)."
-            )
-        return self._server_offset_sec
 
     def get_account(self) -> AccountInfo:
         with self._lock:
@@ -412,12 +447,10 @@ class Mt5Client:
                 raise RuntimeError(f"symbol_info_tick({symbol}) failed: {self._mt5.last_error()}")
             info = self._mt5.symbol_info(symbol)
             spread = int(info.spread) if info is not None else 0
-            # tick.time はサーバ時刻。ここで取れた tick はオフセット検出の
-            # 材料としても使える (MT5 を余分に叩かずに済む)。
-            offset = self._ensure_offset_locked(
-                tick_time=int(tick.time), probe_symbol=symbol,
-            )
-            ts = from_server_epoch(tick.time, offset).isoformat()
+            now = self._now()
+            self._maybe_measure_locked(now, symbol=symbol, tick_time=int(tick.time))
+            self._require_market_data_time_rule_locked(now)
+            ts = server_epoch_to_utc(int(tick.time)).isoformat()
             return Quote(
                 symbol=symbol, bid=float(tick.bid), ask=float(tick.ask),
                 spread_points=spread, time=ts,
@@ -487,9 +520,9 @@ class Mt5Client:
     def get_positions(self) -> list[Position]:
         with self._lock:
             positions = self._mt5.positions_get()
-            # offset の解決は lock の内側で行う (probe が MT5 を叩くため)。
-            # 整形自体は lock の外でよいので、値だけ持ち出す。
-            offset = self._ensure_offset_locked()
+            now = self._now()
+            self._maybe_measure_locked(now)
+            self._time_rule_state_locked(now)
         if positions is None:
             return []
         result: list[Position] = []
@@ -497,7 +530,7 @@ class Mt5Client:
             # MT5 type: 0=buy, 1=sell
             ptype = "buy" if p.type == 0 else "sell"
             # p.time はサーバ時刻の epoch
-            ts = from_server_epoch(p.time, offset).isoformat()
+            ts = server_epoch_to_utc(int(p.time)).isoformat()
             result.append(Position(
                 ticket=p.ticket, symbol=p.symbol, type=ptype, volume=p.volume,
                 price_open=p.price_open, price_current=p.price_current,
@@ -517,8 +550,9 @@ class Mt5Client:
                 deals = self._mt5.history_deals_get(position=ticket)
             except TypeError:
                 deals = None
-            # offset の解決は lock の内側で (probe が MT5 を叩くため)
-            offset = self._ensure_offset_locked()
+            now = self._now()
+            self._maybe_measure_locked(now)
+            self._time_rule_state_locked(now)
         if not deals:
             return None
 
@@ -556,7 +590,7 @@ class Mt5Client:
             swap=swap,
             commission=commission,
             # d.time はサーバ時刻の epoch
-            closed_at=from_server_epoch(closed_ts, offset).isoformat(),
+            closed_at=server_epoch_to_utc(closed_ts).isoformat(),
             reason=reason,
         )
 
@@ -577,9 +611,8 @@ class Mt5Client:
         date_from / date_to: tz-aware datetime (naive は拒否)
 
         MT5 は date_from / date_to も**サーバ時刻空間**で解釈するため、送信前に
-        +offset し、返ってきたバー時刻からは -offset する。片方向だけ直すと
-        範囲が静かに切り詰められる (実測: to を実 UTC のままにすると末尾 3 時間分の
-        足が返らない)。
+        規則の逆 (UTC -> NY 壁時計 + 7h) で変換し、返ってきた足の時刻は足ごとに
+        規則で UTC に戻す。片方向だけ直すと範囲が静かに切り詰められる。
         """
         # naive datetime は「どの時間帯の壁時計か」が決まらない。ここで +offset
         # しても意味が定まらないので受け取らない (プロジェクト制約: tz-aware UTC)。
@@ -610,13 +643,18 @@ class Mt5Client:
                     f"symbol_select({symbol}) failed: {self._mt5.last_error()}"
                 )
 
-            # symbol_select 済みなので、この symbol をそのまま probe に使える
-            offset = self._ensure_offset_locked(probe_symbol=symbol)
+            now = self._now()
+            self._maybe_measure_locked(now, symbol=symbol)
+            if not _market_is_open(now):
+                # 閉場中は時刻規則を検査できない。取得してから捨てずに先に断る。
+                self._require_market_data_time_rule_locked(now)
 
             rates = self._mt5.copy_rates_range(
                 symbol, tf,
-                to_server_datetime(date_from, offset),
-                to_server_datetime(date_to, offset),
+                datetime.fromtimestamp(
+                    utc_to_server_epoch(date_from.astimezone(timezone.utc)), timezone.utc),
+                datetime.fromtimestamp(
+                    utc_to_server_epoch(date_to.astimezone(timezone.utc)), timezone.utc),
             )
             if rates is None:
                 raise RuntimeError(
@@ -627,7 +665,7 @@ class Mt5Client:
             for r in rates:
                 # rates fields: time, open, high, low, close, tick_volume, spread, real_volume
                 # r["time"] はサーバ時刻の epoch
-                ts = from_server_epoch(int(r["time"]), offset).isoformat()
+                ts = server_epoch_to_utc(int(r["time"])).isoformat()
                 bars.append({
                     "time": ts,
                     "open": float(r["open"]),
@@ -636,6 +674,10 @@ class Mt5Client:
                     "close": float(r["close"]),
                     "volume": float(r["tick_volume"]),
                 })
+            # 取得の間に時計が進んでいても、応答時点で検査が新しいことを保つ。
+            now = self._now()
+            self._maybe_measure_locked(now, symbol=symbol)
+            self._require_market_data_time_rule_locked(now)
             return bars
 
     def calc_required_margin(

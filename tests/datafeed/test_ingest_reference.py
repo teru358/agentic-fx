@@ -425,6 +425,8 @@ def test_a_four_hour_declaration_asks_the_source_for_one_hour_bars_only(tmp_path
 def test_the_transport_vs_http_classification_of_a_failed_fetch():
     request = httpx.Request("GET", "http://bridge/ohlcv/JP225")
     assert classify_fetch_error(httpx.ConnectError("x")) == "source_unavailable"
+    assert classify_fetch_error(sources.BridgeTimeRuleMismatch()) == "source_unavailable"
+    assert classify_fetch_error(sources.BridgeTimeUnverified()) == "source_unavailable"
     assert classify_fetch_error(httpx.ReadTimeout("x")) == "source_unavailable"
     assert classify_fetch_error(OSError("x")) == "source_unavailable"
     assert classify_fetch_error(httpx.HTTPStatusError(

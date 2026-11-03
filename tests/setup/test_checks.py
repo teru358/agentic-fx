@@ -774,3 +774,45 @@ def test_model_identifiers_are_a_parameter_only_of_the_listing_checks():
     with pytest.raises(ValueError):
         CheckResult("bridge", "ok", None, now, {"models": ["a/x"]})
     assert {"model_list_unavailable", "verify_failed"} <= REASON_CODES
+
+
+# ---- bridge: 時刻規則の検査待ち ----
+
+_SATURDAY = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)      # 閉場中
+_WEDNESDAY = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)     # 開場中
+
+
+def _quote_refused(detail):
+    def fetch(url, **k):
+        if url.endswith("/health"):
+            return _Response({"mt5_connected": True})
+        return _Response({"detail": detail}, status_code=503)
+    return fetch
+
+
+def test_closed_market_time_rule_unverified_is_not_a_connection_failure():
+    result = check_bridge("http://b", "USDJPY", fetch=_quote_refused("time_rule_unverified"),
+                          now=lambda: _SATURDAY)
+
+    assert result.reason_code is CheckReason.TIME_RULE_UNCHECKED
+    assert result.result == "unverified"
+    assert "server_time" not in result.params
+
+
+@pytest.mark.parametrize(("detail", "when"), [
+    ("time_rule_unverified", _WEDNESDAY),       # 開場中は従来どおり失敗
+    ("time_rule_mismatch", _WEDNESDAY),
+    ("time_rule_mismatch", _SATURDAY),          # 食い違いは閉場中でも失敗
+    ("MT5 not connected", _SATURDAY),           # 別の 503 も失敗
+])
+def test_other_time_rule_refusals_stay_connection_failures(detail, when):
+    result = check_bridge("http://b", "USDJPY", fetch=_quote_refused(detail),
+                          now=lambda: when)
+
+    assert result.reason_code is CheckReason.CONNECT_ERROR
+
+
+def test_time_rule_unchecked_is_a_recordable_reason():
+    from agentic_fx.store.setup_record import REASON_CODES
+
+    assert "time_rule_unchecked" in REASON_CODES
