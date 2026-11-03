@@ -15,6 +15,7 @@ import argparse
 import difflib
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -324,6 +325,20 @@ def _history_coverage(conn, args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_plan_path_over_db(out: Path, db_path: Path) -> None:
+    """plan の出力先が DB 本体・WAL・SHM・修復の manifest や backup と同じファイルなら拒否する。"""
+    target = out.resolve()
+    protected = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"),
+                 Path(f"{db_path}.time-repair.manifest.json")]
+    for path in protected:
+        if target == path.resolve():
+            raise time_repair.RepairError("plan output path collides with the database", 2)
+        if out.exists() and path.exists() and os.path.samefile(out, path):
+            raise time_repair.RepairError("plan output path collides with the database", 2)
+    if target.name.startswith(db_path.name + ".bak-"):
+        raise time_repair.RepairError("plan output path collides with the database", 2)
+
+
 def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -> int:
     if args.apply:
         if args.out is not None or args.plan is None or args.confirm is None:
@@ -332,6 +347,9 @@ def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -
             plan = json.loads(args.plan.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise time_repair.RepairError(f"cannot read plan: {exc}", 2) from exc
+        bridge = plan.get("bridge_check") if isinstance(plan, dict) else None
+        if not isinstance(bridge, dict) or len(bridge.get("windows") or []) != 24:
+            raise time_repair.RepairError("plan has no bridge verification", 4)
         db_path = root / "data" / "agentic.db"
         from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
         try:
@@ -354,12 +372,22 @@ def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -
             lock.close()
         print("time repair applied")
         return 0
+    if not settings.datafeed.mt5.bridge_url:
+        raise time_repair.RepairError("bridge url is not configured", 1)
+    db_path = root / "data" / "agentic.db"
+    out = args.out or root / "data" / "time-repair" / f"plan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    _refuse_plan_path_over_db(out, db_path)
     plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending,
                                   bridge_url=settings.datafeed.mt5.bridge_url,
-                                  db_path=root / "data" / "agentic.db")
-    out = args.out or root / "data" / "time-repair" / f"plan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+                                  db_path=db_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # 既存のファイルは上書きしない (DB や別の plan を誤って潰さない)。
+    try:
+        fh = open(out, "x", encoding="utf-8")
+    except FileExistsError as exc:
+        raise time_repair.RepairError("plan output file already exists", 2) from exc
+    with fh:
+        fh.write(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"plan": str(out), "plan_hash": plan["plan_hash"], "targets": plan["targets"]}, ensure_ascii=False))
     return 0
 
