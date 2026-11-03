@@ -419,6 +419,9 @@ def _write_manifest(path: Path, body: dict[str, Any]) -> None:
             os.unlink(tmpname)
 
 
+_WEEKLY_BOUNDARY_SYMBOLS = frozenset({"EURUSD", "USDJPY"})
+
+
 def _post_state_matches(conn: sqlite3.Connection, plan: dict[str, Any]) -> bool:
     h1_all = conn.execute("SELECT * FROM ohlcv_history WHERE source='mt5' AND interval='5m' "
                       "AND bar_time>? AND bar_time<=? ORDER BY symbol,interval,bar_time",
@@ -441,7 +444,10 @@ def _post_state_matches(conn: sqlite3.Connection, plan: dict[str, Any]) -> bool:
     if any(not is_market_open(datetime.fromisoformat(r[0])) and _row_week(r[0]) not in excluded for r in
            conn.execute("SELECT bar_time FROM ohlcv_history WHERE source='mt5' AND interval='5m'")):
         return False
-    symbols = [r[0] for r in conn.execute("SELECT DISTINCT symbol FROM ohlcv_history WHERE source='mt5' AND interval='5m'")]
+    # 週の開場・閉場の足は FX だけで検める。指数・金・原油は米国の祝日に早く閉じ、
+    # 開場直後の足が無い週もあるので、閉場時刻の足が無いことと digest の一致で見る。
+    symbols = [r[0] for r in conn.execute("SELECT DISTINCT symbol FROM ohlcv_history WHERE source='mt5' AND interval='5m'")
+               if r[0] in _WEEKLY_BOUNDARY_SYMBOLS]
     bounds = conn.execute("SELECT min(bar_time), max(bar_time) FROM ohlcv_history WHERE source='mt5' AND interval='5m'").fetchone()
     if bounds[0] and bounds[1]:
         first_day = datetime.fromisoformat(bounds[0]).date()
