@@ -17,7 +17,7 @@ risk:
   limit_deviation_pct: 0.5    # 指値の現値乖離上限
   limit_expiry_max_h: 24
   max_slippage_pct: 0.1
-  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズは 21:00 UTC 固定 (NY 17:00 EDT / 16:00 EST)。この時刻以降の新規 swing 建て禁止
+  friday_swing_cutoff_ny: "14:00"  # NY 現地時間。市場クローズは NY 17:00 (夏 21:00 UTC / 冬 22:00 UTC)。cutoff はクローズの 1 時間以上前
   commission_per_lot: 0.0     # 往復手数料 (口座通貨建て、sizing のリスク額に算入)
   pair_rules:                 # ペア毎の SL 距離制約 + 想定 spread (設計書 §5: SL 距離は pair 毎 config)
     USDJPY: {sl_distance_min_pips: 5, sl_distance_max_pips: 200, assumed_spread_pips: 1.0}
@@ -115,6 +115,8 @@ improve:
     min_pf: 1.0                     # in_sample/holdout の pf 下限 (pf が None = gross_loss 0 は PASS)
     require_positive_avg_r: true    # avg_r <= 0.0 を不合格にするか
     require_holdout_evaluable: false  # holdout evaluable=false を不合格にするか (既定: 標本不足は continue)
+    max_drawdown: 0.20              # in_sample の pair 別 max_drawdown 上限。null で無効
+    max_trades_per_eval_bar: 0.25   # in_sample の trades / eval_bars 上限。null で無効
 
 logging:
   level: INFO

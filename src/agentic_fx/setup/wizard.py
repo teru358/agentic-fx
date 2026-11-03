@@ -1090,7 +1090,7 @@ def _stage3_without_bridge(sess: _Session, a: Answers) -> None:
             return
         a.source = "yfinance"
         break
-    sess.say("yfinance は週明けの開場直後 (日曜 21:00〜23:00 UTC ごろの足が来ない) に、毎週しばらく取引判断を止めます "
+    sess.say("yfinance は週明けの開場直後に足が来ないことがあり、毎週しばらく取引判断を止めます "
              "(degraded)。既知の問題です。")
     if not sess.yesno(f"yfinance に {a.pairs[0]} の価格を 1 回問い合わせて確認します。実行しますか", True):
         a.price = _plain_record("unverified", now_iso, "user_declined_probe")

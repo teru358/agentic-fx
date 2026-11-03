@@ -69,16 +69,16 @@ def test_timezone_normalization():
     assert is_friday_after(utc_time, "21:00") is False
 
 
-# --- OANDA Japan MT5 実測: 夏冬とも 21:00 UTC 固定 ---
+# --- NY 17:00 規則: 夏 21:00 UTC / 冬 22:00 UTC ---
 
-def test_winter_weekend_boundary_is_fixed_at_21_00_utc():
-    """M1/M2: 冬も金曜 close / 日曜 open は 21:00 UTC 固定。"""
-    fri_open = _dt(2026, 1, 16, 20, 55)
-    fri_close = _dt(2026, 1, 16, 21, 0)
+def test_winter_weekend_boundary_is_at_22_00_utc():
+    """冬の金曜 close / 日曜 open は NY 17:00 = 22:00 UTC。"""
+    fri_open = _dt(2026, 1, 16, 21, 59)
+    fri_close = _dt(2026, 1, 16, 22, 0)
     assert is_market_open(fri_open) is True
     assert is_market_open(fri_close) is False
-    assert is_market_open(_dt(2026, 1, 18, 20, 55)) is False
-    assert is_market_open(_dt(2026, 1, 18, 21, 0)) is True
+    assert is_market_open(_dt(2026, 1, 18, 21, 59)) is False
+    assert is_market_open(_dt(2026, 1, 18, 22, 0)) is True
 
 
 def test_utc_holidays_are_closed():
@@ -88,26 +88,23 @@ def test_utc_holidays_are_closed():
 
 
 def test_holiday_follows_trading_day_label_not_utc_calendar_day():
-    """codex 1 周目 [重要]: 祝日は取引日ラベル (21:00 UTC 起点) で判定する。
-    実測: 12/24 21:00 UTC 閉場 → 12/25 21:00 UTC 再開 (1/1 も同型)。"""
-    assert is_market_open(_dt(2025, 12, 24, 20, 55)) is True
-    assert is_market_open(_dt(2025, 12, 24, 21, 0)) is False   # 取引日 12/25 開始
-    assert is_market_open(_dt(2025, 12, 25, 20, 59)) is False
-    assert is_market_open(_dt(2025, 12, 25, 21, 0)) is True    # 取引日 12/26 開始
-    assert is_market_open(_dt(2025, 12, 31, 21, 0)) is False   # 取引日 1/1
-    assert is_market_open(_dt(2026, 1, 1, 21, 0)) is True      # 取引日 1/2
+    """祝日は NY 17:00 起点の取引日ラベルで判定する。"""
+    assert is_market_open(_dt(2025, 12, 24, 21, 59)) is True
+    assert is_market_open(_dt(2025, 12, 24, 22, 0)) is False
+    assert is_market_open(_dt(2025, 12, 25, 21, 59)) is False
+    assert is_market_open(_dt(2025, 12, 25, 22, 0)) is True
+    assert is_market_open(_dt(2025, 12, 31, 22, 0)) is False
+    assert is_market_open(_dt(2026, 1, 1, 22, 0)) is True
 
 
-def test_trading_day_start_uses_fixed_21_00_utc_boundary():
-    """M4: 日次開始は冬も直前の 21:00 UTC。"""
-    assert trading_day_start(_dt(2026, 1, 13, 20, 59)) == _dt(2026, 1, 12, 21, 0)
-    assert trading_day_start(_dt(2026, 1, 13, 21, 0)) == _dt(2026, 1, 13, 21, 0)
+def test_trading_day_start_uses_winter_22_00_utc_boundary():
+    assert trading_day_start(_dt(2026, 1, 13, 21, 59)) == _dt(2026, 1, 12, 22, 0)
+    assert trading_day_start(_dt(2026, 1, 13, 22, 0)) == _dt(2026, 1, 13, 22, 0)
 
 
-def test_next_rollover_uses_fixed_21_00_utc_boundary():
-    """M5: 次回ロールオーバーは冬も次の 21:00 UTC。"""
-    assert next_rollover(_dt(2026, 1, 13, 20, 59)) == _dt(2026, 1, 13, 21, 0)
-    assert next_rollover(_dt(2026, 1, 13, 21, 0)) == _dt(2026, 1, 14, 21, 0)
+def test_next_rollover_uses_winter_22_00_utc_boundary():
+    assert next_rollover(_dt(2026, 1, 13, 21, 59)) == _dt(2026, 1, 13, 22, 0)
+    assert next_rollover(_dt(2026, 1, 13, 22, 0)) == _dt(2026, 1, 14, 22, 0)
 
 
 def test_friday_cutoff_dst_invariant():
@@ -132,12 +129,12 @@ def test_friday_cutoff_utc_ny_weekday_mismatch():
     assert is_friday_after(sat_utc, "20:00") is True  # NY では金曜 20:30
 
 
-def test_market_boundary_does_not_follow_fall_back():
-    """夏時間終了後も境界を22:00へ動かさず21:00 UTCを維持する。"""
+def test_market_boundary_follows_fall_back():
+    """夏時間終了後は NY 17:00 が 22:00 UTC になる。"""
     fri_close = _dt(2026, 10, 30, 21, 0)   # 金 17:00 EDT → close
     fri_open = _dt(2026, 10, 30, 20, 59)   # 金 16:59 EDT → まだ open
-    sun_open = _dt(2026, 11, 1, 21, 0)
-    sun_closed = _dt(2026, 11, 1, 20, 59)
+    sun_open = _dt(2026, 11, 1, 22, 0)
+    sun_closed = _dt(2026, 11, 1, 21, 59)
     assert is_market_open(fri_open) is True
     assert is_market_open(fri_close) is False
     assert is_market_open(sun_closed) is False
@@ -167,27 +164,27 @@ def test_next_expected_trading_time_ordinary_weekday_is_just_after_width():
 
 
 def test_next_expected_trading_time_skips_the_weekend_gap():
-    # 金 20:59 の次の 1m 足は週末を飛ばして日 21:00 になる
+    # 夏の金 20:59 の次の 1m 足は週末を飛ばして日 21:00 になる
     after = _dt(2026, 7, 24, 20, 59)
     assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 7, 26, 21, 0)
 
 
 def test_next_expected_trading_time_skips_the_dec25_holiday():
     # 2025 年は 12/25 が木曜 (週末と重ならない孤立した祝日) — 純粋な祝日区間の検証
-    after = _dt(2025, 12, 24, 20, 59)
-    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 12, 25, 21, 0)
+    after = _dt(2025, 12, 24, 21, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 12, 25, 22, 0)
 
 
 def test_next_expected_trading_time_skips_the_jan1_holiday():
     # 2025 年は 1/1 が水曜 (週末と重ならない孤立した祝日)
-    after = _dt(2024, 12, 31, 20, 59)
-    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 1, 1, 21, 0)
+    after = _dt(2024, 12, 31, 21, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2025, 1, 1, 22, 0)
 
 
 def test_next_expected_trading_time_holiday_merged_with_weekend_extends_through_it():
     # 2026 年は 12/25 が金曜 — 祝日と週末が連続し、日曜 21:00 まで一体で閉場する
-    after = _dt(2026, 12, 24, 20, 59)
-    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 12, 27, 21, 0)
+    after = _dt(2026, 12, 24, 21, 59)
+    assert next_expected_trading_time(after, timedelta(minutes=1)) == _dt(2026, 12, 27, 22, 0)
 
 
 def test_next_bar_confirmation_skips_closed_hours_and_matches_continuous_session():
@@ -197,8 +194,8 @@ def test_next_bar_confirmation_skips_closed_hours_and_matches_continuous_session
     weekday = _dt(2026, 9, 23, 10, 0)
     assert next_bar_confirmation(weekday, timedelta(minutes=15), grace) == _dt(2026, 9, 23, 10, 30, 30)
     assert next_bar_confirmation(weekday, timedelta(minutes=15), grace) == weekday + 2 * timedelta(minutes=15) + grace
-    assert next_bar_confirmation(_dt(2025, 12, 31, 20, 45), timedelta(minutes=15), grace) == _dt(2026, 1, 1, 21, 15, 30)
-    assert next_bar_confirmation(_dt(2026, 12, 24, 20, 45), timedelta(minutes=15), grace) == _dt(2026, 12, 27, 21, 15, 30)
+    assert next_bar_confirmation(_dt(2025, 12, 31, 21, 45), timedelta(minutes=15), grace) == _dt(2026, 1, 1, 22, 15, 30)
+    assert next_bar_confirmation(_dt(2026, 12, 24, 21, 45), timedelta(minutes=15), grace) == _dt(2026, 12, 27, 22, 15, 30)
 
 
 _U = timezone.utc
@@ -211,22 +208,21 @@ _U = timezone.utc
     (datetime(2026, 9, 27, 21, 0, tzinfo=_U), datetime(2026, 9, 27, 21, 0, tzinfo=_U)),
     # 金曜 20:59:59 はまだ同じセッション
     (datetime(2026, 9, 25, 20, 59, 59, tzinfo=_U), datetime(2026, 9, 20, 21, 0, tzinfo=_U)),
-    # 祝日 (2025-12-25 木) が週末と連結しない: 祝日明けの 21:00
-    (datetime(2025, 12, 26, 12, 0, tzinfo=_U), datetime(2025, 12, 25, 21, 0, tzinfo=_U)),
-    # 2026-12-25 (金) は週末と連結: 金 21:00 ではなく日 27 21:00
-    (datetime(2026, 12, 28, 12, 0, tzinfo=_U), datetime(2026, 12, 27, 21, 0, tzinfo=_U)),
-    # 2027-01-01 (金) も連結: 日 2027-01-03 21:00
-    (datetime(2027, 1, 4, 12, 0, tzinfo=_U), datetime(2027, 1, 3, 21, 0, tzinfo=_U)),
+    # 祝日 (2025-12-25 木) が週末と連結しない: 祝日明けの冬季 22:00
+    (datetime(2025, 12, 26, 12, 0, tzinfo=_U), datetime(2025, 12, 25, 22, 0, tzinfo=_U)),
+    # 2026-12-25 (金) は週末と連結: 日 27 の冬季 22:00
+    (datetime(2026, 12, 28, 12, 0, tzinfo=_U), datetime(2026, 12, 27, 22, 0, tzinfo=_U)),
+    # 2027-01-01 (金) も連結: 日 2027-01-03 の冬季 22:00
+    (datetime(2027, 1, 4, 12, 0, tzinfo=_U), datetime(2027, 1, 3, 22, 0, tzinfo=_U)),
 ])
 def test_session_start_is_last_closed_to_open_transition(now, expected):
     assert market_hours.session_start(now) == expected
 
 
 def test_session_start_from_inside_joined_closure_is_previous_open():
-    """閉場中 (2026-12-31 21:00 〜 2027-01-03 21:00 の連結閉場の途中) に
-    呼ぶと、閉場中の境界ではなく直前の開場遷移 (日 2026-12-27 21:00) を返す。"""
+    """連結休場中は閉場境界でなく直前の開場遷移を返す。"""
     now = datetime(2027, 1, 2, 12, 0, tzinfo=_U)
-    assert market_hours.session_start(now) == datetime(2026, 12, 27, 21, 0, tzinfo=_U)
+    assert market_hours.session_start(now) == datetime(2026, 12, 27, 22, 0, tzinfo=_U)
 
 
 def test_session_start_raises_when_no_transition_is_found(monkeypatch):

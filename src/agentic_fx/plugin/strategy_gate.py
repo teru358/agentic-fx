@@ -86,9 +86,38 @@ class StrategyGateVerdict:  # 新規命名 (元 _StrategyGateVerdict — 独立
     baseline_rows: tuple[dict, ...] = ()
 
 
+@dataclass(frozen=True)
+class FloorFailItem:
+    pair: str
+    kind: Literal["pf", "avg_r", "holdout_not_evaluable",
+                  "drawdown_too_deep", "too_frequent"]  # FLOOR_CONDITION_KINDS 参照
+    message: str
+
+
+FLOOR_CONDITION_KINDS = ("drawdown_too_deep", "too_frequent")
+
+# agent に返す固定文。数値・閾値・条件語を含めない。
+AGENT_BLOCKED_NOTICE = (
+    "この成績では親ゲートが承認申請を出さず observation になります")
+
+
+def _finite_number(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def trades_per_eval_bar(trades: object, eval_bars: object) -> float | None:
+    """取引数 / 評価バー数。取引数が 0 以上の int で、評価バー数が 1 以上の
+    有限数値のときだけ値を返し、それ以外は `None` (未計測)。床の判定・
+    レポート・再測定が同じ規則を共有する。"""
+    if (type(trades) is int and trades >= 0 and _finite_number(eval_bars)
+            and eval_bars >= 1):
+        return trades / eval_bars
+    return None
+
+
 def _floor_fail_items(
         per_pair: dict, *, settings: "Settings",
-        scope: str) -> list[tuple[str, str]]:
+        scope: str) -> list[FloorFailItem]:
     """[profitability-floor-fix] G2 (2026-09-13): `_check_profitability_
     floor` の判定条件だけを取り出した内部 helper — pair ごとの不合格理由
     を `(pair, message)` のリストで返す (`_check_profitability_floor` は
@@ -99,32 +128,50 @@ def _floor_fail_items(
     が通ってしまう。
     """
     g = settings.improve.gate
-    items: list[tuple[str, str]] = []
+    items: list[FloorFailItem] = []
     for pair, m in per_pair.items():
         # ① strict holdout 判定は zero-trade shortcut より前 (trades==0
         # でも FAIL する)。
         if scope == "holdout" and g.require_holdout_evaluable \
                 and not m.get("evaluable"):
-            items.append((pair, "holdout_not_evaluable"))
+            items.append(FloorFailItem(pair, "holdout_not_evaluable",
+                                       "holdout_not_evaluable"))
             continue
         # ② 成績が無い pair は通常モードでは判定から除外する。
-        if m["trades"] == 0:
+        _t = m.get("trades")
+        if type(_t) is int and _t == 0:
             continue
         # ③ 既定: holdout の標本不足は「悪いとは言わない」(R8)。
         if scope == "holdout" and not m.get("evaluable"):
             continue
         pf = m["pf"]
-        if pf is not None and pf < g.min_pf:  # pf is None (gross_loss==0) は PASS
-            items.append((pair, f"pf={pf}"))
-            continue
+        pf_failed = pf is not None and pf < g.min_pf
+        if pf_failed:  # pf is None (gross_loss==0) は PASS
+            items.append(FloorFailItem(pair, "pf", f"pf={pf}"))
         avg_r = m["avg_r"]
-        if g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
-            items.append((pair, f"avg_r={avg_r}"))
+        if not pf_failed and g.require_positive_avg_r and avg_r is not None and avg_r <= 0.0:
+            items.append(FloorFailItem(pair, "avg_r", f"avg_r={avg_r}"))
+        if scope == "in_sample":
+            max_drawdown = m.get("max_drawdown")
+            if (g.max_drawdown is not None and _finite_number(max_drawdown)
+                    and max_drawdown > g.max_drawdown):
+                items.append(FloorFailItem(
+                    pair, "drawdown_too_deep",
+                    "drawdown_too_deep "
+                    f"(max_drawdown={max_drawdown} > {g.max_drawdown})"))
+            frequency = trades_per_eval_bar(m.get("trades"), m.get("eval_bars"))
+            if (g.max_trades_per_eval_bar is not None and frequency is not None
+                    and frequency > g.max_trades_per_eval_bar):
+                items.append(FloorFailItem(
+                    pair, "too_frequent", "too_frequent "
+                    f"(trades_per_eval_bar={frequency} > "
+                    f"{g.max_trades_per_eval_bar})"))
     return items
 
 
 def _check_profitability_floor(
-        per_pair: dict, *, settings: "Settings", scope: str) -> tuple[str, str]:
+        per_pair: dict, *, settings: "Settings", scope: str,
+        audience: Literal["human", "agent"] = "human") -> tuple[str, str]:
     """[profitability-floor] T1 Step 1-1 (設計書 §3「判定規則 (逐語)」)。
 
     戻り値 `(label, detail)`。`label` は `""` (合格) か `"unprofitable"`
@@ -139,7 +186,19 @@ def _check_profitability_floor(
     """
     items = _floor_fail_items(per_pair, settings=settings, scope=scope)
     if items:
-        detail = ", ".join(f"{pair}: {msg}" for pair, msg in items)
+        if audience == "agent":
+            items = [item for item in items if item.kind in ("pf", "avg_r")]
+        by_pair: dict[str, list[str]] = {}
+        for item in items:
+            by_pair.setdefault(item.pair, []).append(item.message)
+        detail = ", ".join(
+            f"{pair}: {'; '.join(messages)}" for pair, messages in by_pair.items())
+        if audience == "agent":
+            # agent には条件別の理由を返さない。pf / avg_r が無い (新条件
+            # だけの) 不合格は固定文だけを返す。
+            return "unprofitable", (
+                f"{scope}: {detail} — {AGENT_BLOCKED_NOTICE}" if detail
+                else AGENT_BLOCKED_NOTICE)
         return "unprofitable", f"{scope}: {detail}"
     return "", ""
 
@@ -317,6 +376,11 @@ def floor_rule_text(gate_settings: "ImproveGateSettings", *,
         parts.append("`avg_r <= 0`")
     if audience == "human" and g.require_holdout_evaluable:
         parts.append("holdout が評価可能 (30 trades 以上) でない")
+    if audience == "human" and g.max_drawdown is not None:
+        parts.append(f"`max_drawdown > {g.max_drawdown}`")
+    if audience == "human" and g.max_trades_per_eval_bar is not None:
+        parts.append(
+            f"`trades / eval_bars > {g.max_trades_per_eval_bar}`")
     return " または ".join(parts)
 
 

@@ -9,7 +9,7 @@ import sqlite3
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import MappingProxyType
 from typing import Callable, Mapping
 from zoneinfo import ZoneInfo
@@ -17,7 +17,8 @@ from zoneinfo import ZoneInfo
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx._safe_error import safe_error_text, safe_text
 from agentic_fx.config import Settings
-from agentic_fx.core import accounting, band_notice, market_hours, transitions
+from agentic_fx.core import (
+    accounting, band_notice, market_hours, time_cutover, transitions)
 from agentic_fx.core.contracts import Bar, ConversionRate, Mode, OrderStatus as S
 from agentic_fx.core.executor import Executor, open_risk_and_notional
 from agentic_fx.core.econ_window import WindowSettings
@@ -175,6 +176,7 @@ class Scheduler:
         self._was_open: bool | None = None
         self._processed_bar_ts: dict[str, datetime] = {}
         self._closed_bar_unavailable_pairs: set[str] = set()
+        self._day_close_window_logged: set[date] = set()
         # 永続化に失敗した (pair, interval)。同一プロセスが生きている間は
         # tick の finally で再試行する (at-least-once)。
         self._dirty_cron_cursor: set[tuple[str, str]] = set()
@@ -437,7 +439,7 @@ class Scheduler:
         tick で再試行する (同一取引日で最大 3 回、超えたら技術ログ warning で諦める)。
         再起動による同日の再実行も契約の内。
 
-        `close_at` は閉じた取引日の終端 (21:00 UTC の rollover)。
+        `close_at` は閉じた取引日の終端 (NY 17:00 の rollover、夏 21:00 UTC / 冬 22:00 UTC)。
         callback は scheduler thread では走らず、この hook が持つ専用の 1 本の thread
         で順に呼ばれる (遅い callback が次 tick の kill switch・SL / TP を遅らせない)。
         起動後の最初の tick で、直近に閉じた取引日の分が未起動なら 1 回だけ追い
@@ -451,17 +453,41 @@ class Scheduler:
 
     @staticmethod
     def latest_trading_close(now: datetime) -> datetime | None:
-        """`now` 以前で最後に閉じた取引日の終端 (21:00 UTC)。
+        """`now` 以前で最後に閉じた取引日の終端 (NY 17:00 の rollover)。
 
         その直前の 1 分に市場が開いていた日だけが取引日。週末と休場日の境界は
-        数えない。直近 14 日に無ければ None。
+        数えない。境界は NY の日付で 1 日ずつ遡る (夏冬の切替をまたいでも 24 時間の
+        固定幅にしない)。直近 14 日に無ければ None。
         """
         boundary = market_hours.trading_day_start(now)
         for _ in range(14):
             if market_hours.is_market_open(boundary - _ONE_MINUTE):
                 return boundary
-            boundary -= timedelta(days=1)
+            boundary = market_hours.trading_day_start(boundary - _ONE_MINUTE)
         return None
+
+    @staticmethod
+    def _report_label(close_at: datetime) -> date:
+        """閉じた境界の 1 分前の取引日ラベル。旧 21:00Z と新 22:00Z の終端は同じ日になる。"""
+        return market_hours.trading_date(close_at - _ONE_MINUTE)
+
+    @classmethod
+    def _marker_label(cls, value: object, legacy: bool = False) -> date | None:
+        """記録された終端 (ISO 文字列) の取引日ラベル。読めなければ None。
+
+        `legacy` (切替の過渡期間) では旧規則の読みと新規則の読みの遅い方を返す。"""
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        label = cls._report_label(parsed)
+        if legacy:
+            label = max(label, time_cutover.legacy_trading_date(parsed - _ONE_MINUTE))
+        return label
 
     def _daily_report_pending(self, now: datetime) -> list[Callable[[], None]]:
         try:
@@ -478,6 +504,9 @@ class Scheduler:
         if close_at is None:
             return []
         day = close_at.isoformat()
+        label = self._report_label(close_at)
+        # 過渡期間は記録の日付を旧新の遅い方で読み、切替日に同じ日を出し直さない
+        legacy = time_cutover.active_window(self.conn, now) is not None
         try:
             raw = alert_state.get(self.conn, alert_state.DAILY_REPORT_KEY)
             last = json.loads(raw)["day"] if raw else None
@@ -485,15 +514,19 @@ class Scheduler:
             last = None
         with self._report_lock:
             finished = sorted(self._report_done)
-        if finished and not (isinstance(last, str) and last >= finished[-1]):
+        last_label = self._marker_label(last, legacy)
+        if finished and not (last_label is not None
+                             and last_label >= self._marker_label(finished[-1], legacy)):
             alert_state.set(self.conn, alert_state.DAILY_REPORT_KEY,
                             json.dumps({"day": finished[-1]}), now=now)
             last = finished[-1]
+            last_label = self._marker_label(last, legacy)
         with self._report_lock:
             self._report_done = [d for d in self._report_done
-                                 if not (isinstance(last, str) and d <= last)]
+                                 if not (last_label is not None
+                                         and self._marker_label(d, legacy) <= last_label)]
             queued = day in self._report_enqueued
-        if queued or (isinstance(last, str) and last >= day):
+        if queued or (last_label is not None and last_label >= label):
             return []
         return [lambda: self._enqueue_daily_report(callback, close_at)]
 
@@ -1422,17 +1455,37 @@ class Scheduler:
         return ok
 
     def _force_close_day(self, now: datetime) -> None:
-        """codex 3: 期限は注文毎に (filled_at 起点の next_rollover で) 導出
+        """期限は注文毎に (filled_at 起点の next_rollover で) 導出
         する。tick 全体の「次の rollover まで 5 分以内」だけを条件にすると、
-        20:55-20:59 に quote 障害が続き 21:00 を過ぎた途端に
+        rollover (NY 17:00 = 夏 21:00 UTC / 冬 22:00 UTC) の 5 分前から
+        quote 障害が続き rollover を過ぎた途端に
         next_rollover(now) が翌日を指してしまい、day ポジションが対象から
         外れて約 24 時間 (金曜なら週末) 残ってしまう。注文毎の期限を過ぎた
         後もこの条件は真であり続けるため、quote が復旧し次第、毎 tick
         再試行される。quote 取得失敗時に架空価格で閉じない挙動は維持する。
         """
-        for row in orders.list_by_status(self.conn, S.OPEN):
-            if row["horizon"] != "day":
-                continue
+        day_rows = [row for row in orders.list_by_status(self.conn, S.OPEN)
+                    if row["horizon"] == "day"]
+        if not day_rows:
+            return
+        # 切替の窓は tick の間変わらないので 1 度だけ引く。読めなければ
+        # 旧規則と新規則の早い方で閉じる (期限を延ばさない側に倒す)。
+        window_readable = True
+        window = None
+        try:
+            window = time_cutover.active_window(self.conn, now)
+        except Exception as e:  # noqa: BLE001 — 後続の _process_exits を止めない
+            window_readable = False
+            text = safe_error_text(e)
+            day = market_hours.trading_date(now)
+            if day not in self._day_close_window_logged:
+                self._day_close_window_logged.add(day)
+                self.activity.write(
+                    Category.TRADE, "day_close_window_unreadable",
+                    f"切替の窓を読めない: {text} — 旧規則と新規則の早い方の"
+                    "期限で day 建玉を閉じる", ref_id=day.isoformat())
+            _log.warning("day close window unreadable: %s", text)
+        for row in day_rows:
             # site 2 (fix round 3): ポジション単位で隔離する。以前は
             # datetime.fromisoformat(anchor) (I1 と同型の欠陥) も
             # self.executor.close_order(...) も無保護で、1 件のポジション
@@ -1442,8 +1495,11 @@ class Scheduler:
             # (レビュアー実測)。
             try:
                 anchor = row["filled_at"] or row["created_at"]
-                deadline = market_hours.next_rollover(
-                    datetime.fromisoformat(anchor))
+                opened = datetime.fromisoformat(anchor)
+                deadline = (
+                    time_cutover.day_close_rollover(window, opened)
+                    if window_readable
+                    else time_cutover.earliest_day_close_rollover(opened))
                 if now < deadline - market_hours.DAY_CLOSE_BUFFER:
                     continue
                 try:

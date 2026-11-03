@@ -25,9 +25,12 @@ def _classify_golden_diff(v2: dict, v3: dict) -> dict:
     assert set(v3) == set(v2)
     for key in UNCHANGED:
         assert _canonical(v3[key]) == _canonical(v2[key]), key
-    assert set(v3["metrics"]) == set(v2["metrics"]) | {"kill_switch_latches"}
+    assert set(v3["metrics"]) == (
+        set(v2["metrics"]) | {"kill_switch_latches", "eval_bars"})
     assert type(v3["metrics"]["kill_switch_latches"]) is int
     assert v3["metrics"]["kill_switch_latches"] == 1
+    assert type(v3["metrics"]["eval_bars"]) is int
+    assert v3["metrics"]["eval_bars"] > 0
     for key, value in v2["metrics"].items():
         assert _canonical(v3["metrics"][key]) == _canonical(value), key
 
@@ -37,7 +40,7 @@ def _classify_golden_diff(v2: dict, v3: dict) -> dict:
     assert _canonical(v3["kill_switch_events"]) == _canonical(expected)
     assert sum(e["kind"] == "latched" for e in v3["kill_switch_events"]) == 1
     assert not any(e["kind"] == "released" for e in v3["kill_switch_events"])
-    return {"added_metric_keys": 1,
+    return {"added_metric_keys": 2,
             "removed_duplicate_activity_events": 1,
             "changed_existing_values": 0, "unexpected_added_rows": 0,
             "unclassified": 0}
@@ -46,14 +49,15 @@ def _classify_golden_diff(v2: dict, v3: dict) -> dict:
 def test_v2_to_v3_diff_is_fully_classified():
     assert _classify_golden_diff(_load("golden-v2.json"),
                                  _load("golden-v3.json")) == {
-        "added_metric_keys": 1, "removed_duplicate_activity_events": 1,
+        "added_metric_keys": 2, "removed_duplicate_activity_events": 1,
         "changed_existing_values": 0, "unexpected_added_rows": 0,
         "unclassified": 0}
 
 
 @pytest.mark.parametrize("mutation", [
     "existing_metric", "snapshot", "released", "wrong_latched",
-    "unknown_top_level", "float_latches",
+    "unknown_top_level", "float_latches", "float_eval_bars",
+    "missing_eval_bars", "extra_metric_key",
 ])
 def test_classifier_rejects_each_unapproved_difference(mutation):
     v2, v3 = _load("golden-v2.json"), _load("golden-v3.json")
@@ -64,6 +68,10 @@ def test_classifier_rejects_each_unapproved_difference(mutation):
         "ts": bad["end"], "kind": "released", "reason": "x", "drawdown_pct": 0})
     elif mutation == "wrong_latched": bad["kill_switch_events"].clear()
     elif mutation == "unknown_top_level": bad["unknown"] = 1
-    else: bad["metrics"]["kill_switch_latches"] = 1.0
+    elif mutation == "float_latches": bad["metrics"]["kill_switch_latches"] = 1.0
+    elif mutation == "float_eval_bars":
+        bad["metrics"]["eval_bars"] = float(bad["metrics"]["eval_bars"])
+    elif mutation == "missing_eval_bars": del bad["metrics"]["eval_bars"]
+    else: bad["metrics"]["unexpected"] = 1
     with pytest.raises(AssertionError):
         _classify_golden_diff(v2, bad)

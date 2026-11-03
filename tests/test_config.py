@@ -1029,6 +1029,25 @@ def test_floor_config_defaults_f8_1():
     assert s.min_pf == 1.0
     assert s.require_positive_avg_r is True
     assert s.require_holdout_evaluable is False
+    assert s.max_drawdown == 0.20
+    assert s.max_trades_per_eval_bar == 0.25
+
+
+@pytest.mark.parametrize("key", ["max_drawdown", "max_trades_per_eval_bar"])
+@pytest.mark.parametrize("value", [0, -0.1, 1.0001, True, False, "0.2",
+                                    float("nan"), float("inf")])
+def test_floor_config_new_limits_are_strict_optional_unit_floats(key, value):
+    from agentic_fx.config import ImproveGateSettings
+    with pytest.raises(ValidationError):
+        ImproveGateSettings(**{key: value})
+
+
+def test_floor_config_new_limits_accept_null_and_yaml_integer_one():
+    from agentic_fx.config import ImproveGateSettings
+    assert ImproveGateSettings(max_drawdown=None,
+                               max_trades_per_eval_bar=None).snapshot()["max_drawdown"] is None
+    assert ImproveGateSettings(max_drawdown=1,
+                               max_trades_per_eval_bar=1).max_drawdown == 1.0
 
 
 def test_floor_config_example_keys_match_settings_type_f8_2():
@@ -1299,3 +1318,14 @@ def test_econ_settings_survive_the_worker_model_dump_round_trip():
     s = Settings.model_validate(raw)
     again = Settings.model_validate(s.model_dump())
     assert again.econ == s.econ
+
+
+def test_friday_swing_cutoff_limit_is_derived_from_rollover_and_margin():
+    from datetime import date, datetime
+
+    from agentic_fx.core import fx_time
+
+    rollover = datetime.combine(date(2026, 1, 1), fx_time.ROLLOVER_NY)
+    assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY == (
+        rollover - fx_time.SWING_CUTOFF_MARGIN).time()
+    assert fx_time.FRIDAY_SWING_CUTOFF_LIMIT_NY.hour == 16

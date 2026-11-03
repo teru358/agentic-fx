@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 
 from afx_ops.notify.payload import encode_event
 
+from afx_ops.metric_words import metric_items
+
 from .state import ApprovalRecord
 from .types import ViewComponent, ViewModel, encode_custom_id
 
@@ -189,6 +191,7 @@ def _performance_paragraph(change: dict) -> str:
         for label, key in (("trades", "trades"), ("PF", "pf"), ("avg R", "avg_r")):
             shown = _number(row.get(key))
             parts.append(f"{label} {shown if shown is not None else '-'}")
+        parts += metric_items(row)
         lines.append(" / ".join(parts))
     if len(rows) > PERFORMANCE_ROWS:
         lines.append(f"ほか {len(rows) - PERFORMANCE_ROWS} 件")

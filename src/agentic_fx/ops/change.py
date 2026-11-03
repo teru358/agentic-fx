@@ -404,7 +404,10 @@ def _metric_row(pair: object, metrics: object) -> dict | None:
     return {"pair": (pair if type(pair) is str and _PAIR_RE.fullmatch(pair) else None),
             "trades": _metric_number(metrics.get("trades")),
             "pf": _metric_number(metrics.get("pf")),
-            "avg_r": _metric_number(metrics.get("avg_r"))}
+            "avg_r": _metric_number(metrics.get("avg_r")),
+            "win_rate": _metric_number(metrics.get("win_rate")),
+            "max_drawdown": _metric_number(metrics.get("max_drawdown")),
+            "kill_switch_latches": _metric_number(metrics.get("kill_switch_latches"))}
 
 
 def _performance(value: object) -> list[dict]:

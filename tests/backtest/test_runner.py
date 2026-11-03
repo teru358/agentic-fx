@@ -27,6 +27,7 @@ from agentic_fx.store.state import StateStore
 from agentic_fx.activity import ActivityLog
 
 from agentic_fx.backtest.replay import BarFeed
+from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.runner import _aggregate_bucket, run_replay
 from agentic_fx.backtest.dataset import HistoryDataset
 
@@ -384,6 +385,56 @@ def test_pending_proposal_opens_when_execution_bar_exists(tmp_path):
         history_conn=hist)
     assert len(res.orders) == 1
     assert res.orders[0]["status"] == "open"
+
+
+def test_winter_weekend_replay_skips_closed_hour_and_drops_unbacked_friday_proposal(
+        tmp_path, monkeypatch):
+    """冬の週末は旧ラベルの履歴でも replay が発注せず完走する。
+
+    旧ラベルの履歴では、金曜の最終足は 20:59Z で 21:00-21:55Z に足が無く、
+    日曜は 21:00-21:59Z のラベルで足が並ぶ。新しい規則では日曜 22:00Z より前は閉場。
+    """
+    hist = _conn(tmp_path)
+    friday = datetime(2026, 11, 6, 20, 59, tzinfo=timezone.utc)
+    sunday = datetime(2026, 11, 1, 21, 0, tzinfo=timezone.utc)
+    reopen = datetime(2026, 11, 1, 22, 0, tzinfo=timezone.utc)
+    ohlcv.import_history_bars(
+        hist,
+        [_row_at(friday, o=148.5, h=148.6, l=148.4, c=148.5)]
+        + [_row_at(sunday + timedelta(minutes=i), o=148.5, h=148.6,
+                   l=148.4, c=148.5) for i in range(66)],
+        source="dukascopy")
+    recorded = []
+    real_write = runner_module._RecordingActivity.write
+
+    def capture(self, category, event, summary, ref_id=None):
+        real_write(self, category, event, summary, ref_id)
+        recorded.extend(self.entries[-1:])
+
+    monkeypatch.setattr(runner_module._RecordingActivity, "write", capture)
+    friday_result = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=friday, end=friday + timedelta(minutes=3),
+        intent_source=lambda bar: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+    closed_result = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=sunday, end=reopen - timedelta(minutes=1),
+        intent_source=lambda bar: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+    reopened_result = run_replay(
+        SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+        start=sunday, end=reopen + timedelta(minutes=5),
+        intent_source=lambda bar: dict(OPEN_MARKET), eval_timeframe="1m",
+        history_conn=hist)
+
+    assert friday_result.orders == []
+    assert any(entry["kind"] == "proposal_dropped_no_bar" for entry in recorded)
+    assert closed_result.orders == []
+    assert reopened_result.orders != []
+    assert all(datetime.fromisoformat(o["created_at"]) >= reopen
+               for o in reopened_result.orders)
+    assert reopened_result.orders[0]["created_at"] == "2026-11-01T22:01:00+00:00"
 
 
 def test_quote_error_names_5m_base_interval(tmp_path, monkeypatch):
@@ -849,3 +900,69 @@ def test_kill_switch_events_use_kind_as_same_timestamp_tiebreak(
         (WED.isoformat(), "latched"),
         (WED.isoformat(), "released"),
     ]
+
+
+def _flat_rows(start, minutes):
+    return [_row_at(start + timedelta(minutes=i), o=148.5, h=148.6,
+                    l=148.4, c=148.5) for i in range(minutes)]
+
+
+def test_eval_bars_equals_intent_source_call_count(tmp_path):
+    """eval_bars は runner が intent_source を評価した回数そのもの。
+
+    水曜 12:00 から 5 時間の 1h 再生。先頭の 12:00 境界は first_decision_at
+    の 13:00 より前なので数えず、13:00 / 14:00 / 15:00 / 16:00 の 4 回。
+    """
+    hist = _conn(tmp_path)
+    ohlcv.import_history_bars(hist, _flat_rows(WED, 5 * 60), source="dukascopy")
+    calls = []
+
+    def source(bar):
+        calls.append(bar.ts)
+        return None
+
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+                     start=WED, end=WED + timedelta(hours=5),
+                     intent_source=source, eval_timeframe="1h",
+                     history_conn=hist)
+    assert len(calls) == 4
+    assert res.eval_bars == len(calls)
+    assert compute_metrics(res)["eval_bars"] == len(calls)
+
+
+def test_eval_bars_excludes_closed_market_and_missing_bar_boundaries(tmp_path):
+    """市場クローズ中の境界と、集約できる 1m が無い境界は数えない。
+
+    金曜 21:00 UTC (夏時間でクローズ) をまたぐ再生。spy の呼び出し回数と
+    eval_bars が一致し、クローズ後の境界は含まれない。
+    """
+    start = datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)
+    hist = _conn(tmp_path)
+    # 19:00 台の 1m は欠損させる (20:00 境界の集約は 19:00 台が空)
+    rows = (_flat_rows(start, 60)
+            + _flat_rows(start + timedelta(hours=2), 4 * 60))
+    ohlcv.import_history_bars(hist, rows, source="dukascopy")
+    calls = []
+
+    def source(bar):
+        calls.append(bar.ts)
+        return None
+
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+                     start=start, end=start + timedelta(hours=6),
+                     intent_source=source, eval_timeframe="1h",
+                     history_conn=hist)
+    assert res.eval_bars == len(calls) == 1
+    assert compute_metrics(res)["eval_bars"] == 1
+    assert calls == [datetime(2026, 7, 24, 18, 0, tzinfo=timezone.utc)]
+
+
+def test_eval_bars_is_zero_when_intent_source_never_called(tmp_path):
+    start = datetime(2026, 7, 25, 6, 0, tzinfo=timezone.utc)  # 土曜: クローズ
+    hist = _conn(tmp_path)
+    ohlcv.import_history_bars(hist, _flat_rows(start, 180), source="dukascopy")
+    res = run_replay(SETTINGS, symbol="USDJPY", dataset=DATASET_1M,
+                     start=start, end=start + timedelta(hours=3),
+                     intent_source=lambda b: None, eval_timeframe="1h",
+                     history_conn=hist)
+    assert res.eval_bars == 0

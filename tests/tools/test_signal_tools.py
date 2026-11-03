@@ -100,6 +100,19 @@ def test_strategy_row_gets_in_sample_metrics_and_annotation(tmp_path):
     assert row["note"] == "バックテスト成績は実運用成績の予測値ではない"
 
 
+def test_strategy_row_hides_eval_bars_from_agent_metrics(tmp_path):
+    conn = _conn(tmp_path)
+    _add_signal(conn, hours_ago=1, kind="strategy", content_hash="hidden-bars")
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", plugin_ref="p.py", content_hash="hidden-bars",
+        kind="strategy", pair="USDJPY", timeframe="1h", source="dukascopy",
+        base_interval="1m", period=(NOW, NOW),
+        metrics={"trades": 40, "pf": 1.3, "eval_bars": 1938},
+        settings_hash="s", core_commit="c", initial_balance=1e6, now=NOW)
+    metrics = _tool(conn).func(pair="USDJPY")[0]["in_sample_metrics"]
+    assert metrics == {"trades": 40, "pf": 1.3}
+
+
 def test_strategy_row_uses_dataset_derived_source_and_base_interval(
         tmp_path):
     """段階 2 レビュー是正 c4b-1: `latest_in_sample_metrics` へ渡す

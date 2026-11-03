@@ -1054,3 +1054,50 @@ def test_find_matching_approved_metrics_float_tol_is_frozen_at_import(
     assert backtest_runs.find_matching_approved_metrics(
         conn, pair="USDJPY", variant="candidate", source="test",
         base_interval="1m", trades=1, pf=5e-10, avg_r=0.0) == "approved-hash"
+
+
+_EVAL_BARS_KW = dict(plugin_ref="p", content_hash="h", kind="strategy",
+                     pair="USDJPY", timeframe="1h", source="dukascopy",
+                     base_interval="1m", period=(H, H), settings_hash="s",
+                     core_commit="c", initial_balance=1.0, now=H)
+
+
+def test_eval_bars_round_trips_through_both_read_surfaces(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 3, "eval_bars": 1938},
+        **_EVAL_BARS_KW)
+    assert backtest_runs.in_sample_view(conn)[0]["metrics"]["eval_bars"] == 1938
+    latest = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m")
+    assert latest["eval_bars"] == 1938
+
+
+def test_rows_without_eval_bars_read_back_without_the_key(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 3}, **_EVAL_BARS_KW)
+    assert "eval_bars" not in backtest_runs.in_sample_view(conn)[0]["metrics"]
+
+
+@pytest.mark.parametrize("bad", [True, False, "1938", 1938.0, -1, None, [1]])
+def test_eval_bars_only_non_negative_int_survives_the_read_whitelist(
+        tmp_path, bad):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 3, "eval_bars": bad},
+        **_EVAL_BARS_KW)
+    assert "eval_bars" not in backtest_runs.in_sample_view(conn)[0]["metrics"]
+    latest = backtest_runs.latest_in_sample_metrics(
+        conn, "h", pair="USDJPY", variant="candidate", source="dukascopy",
+        base_interval="1m")
+    assert "eval_bars" not in latest
+
+
+def test_eval_bars_zero_is_kept(tmp_path):
+    conn = _conn(tmp_path)
+    backtest_runs.save_harness_run(
+        conn, scope="in_sample", metrics={"trades": 0, "eval_bars": 0},
+        **_EVAL_BARS_KW)
+    assert backtest_runs.in_sample_view(conn)[0]["metrics"]["eval_bars"] == 0

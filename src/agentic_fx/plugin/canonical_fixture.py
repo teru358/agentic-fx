@@ -27,7 +27,7 @@ def build_canonical_5m(*, seed: int = 20261102, days: int = 340) -> pd.DataFrame
         raise ValueError("days must be positive")
     grid = pd.date_range("2026-01-01", periods=days * 24 * 12,
                          freq="5min", tz="UTC")
-    # FX closes Friday 21:00 UTC and resumes Sunday 21:00 UTC.
+    # Synthetic fixed UTC weekend grid; intentionally does not follow DST.
     closed = ((grid.weekday == 4) & (grid.hour >= 21)) | (grid.weekday == 5) | (
         (grid.weekday == 6) & (grid.hour < 21))
     k = np.arange(len(grid))[~closed]

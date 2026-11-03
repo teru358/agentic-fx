@@ -721,3 +721,43 @@ def test_the_warning_line_does_not_leak_decision_content(tmp_path):
     h.evaluate()
     line = h.lines()[0]
     assert "news_shock" not in line and "pnl" not in line
+
+
+def test_a_notice_keyed_by_the_old_rule_is_not_repeated_after_the_cutover(tmp_path):
+    prefix = alert_state.WAIT_BUDGET_NOTIFIED_PREFIX
+    before = datetime(2026, 11, 3, 21, 10, tzinfo=timezone.utc)
+    h = _active(tmp_path, now=before)
+    h.evaluate()
+    assert len(h.lines()) == 1
+    (key,) = alert_state.keys_with_prefix(h.conn, prefix)
+    fingerprint = key.rpartition("|")[2]
+    # 旧版は取引日の開始 (21:00 UTC) の ISO を運用日の key にしていた
+    h.conn.execute("UPDATE alert_state SET key=? WHERE key=?",
+                   (f"{prefix}2026-11-03T21:00:00+00:00|{fingerprint}", key))
+    h.conn.execute("INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
+                   ("market_hours_ny_rule_v1",
+                    datetime(2026, 11, 3, 21, 15, tzinfo=timezone.utc).isoformat()))
+    h.conn.commit()
+    for at in (datetime(2026, 11, 3, 21, 30, tzinfo=timezone.utc),
+               datetime(2026, 11, 3, 22, 0, tzinfo=timezone.utc),
+               datetime(2026, 11, 3, 22, 1, tzinfo=timezone.utc),
+               datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)):
+        h.now = at
+        h.evaluate()
+        assert len(h.lines()) == 1, at                      # 同じ取引日では 2 回出さない
+    h.now = datetime(2026, 11, 4, 22, 1, tzinfo=timezone.utc)
+    h.evaluate()
+    assert len(h.lines()) == 2                              # 次の取引日は 1 回
+    assert alert_state.keys_with_prefix(h.conn, prefix) == [
+        f"{prefix}2026-11-05|{fingerprint}"]
+
+
+def test_the_operating_day_is_the_trading_date_label_in_both_seasons():
+    from agentic_fx.signal_admission import legacy_operating_day, operating_day
+    assert operating_day(datetime(2026, 7, 22, 12, 0, tzinfo=timezone.utc)) == "2026-07-22"
+    assert operating_day(datetime(2026, 7, 22, 21, 0, tzinfo=timezone.utc)) == "2026-07-23"
+    assert operating_day(datetime(2026, 12, 2, 21, 59, tzinfo=timezone.utc)) == "2026-12-02"
+    assert operating_day(datetime(2026, 12, 2, 22, 0, tzinfo=timezone.utc)) == "2026-12-03"
+    assert legacy_operating_day("2026-07-21T21:00:00+00:00") == "2026-07-22"
+    assert legacy_operating_day("2026-12-02T21:00:00+00:00") == "2026-12-03"
+    assert legacy_operating_day("2026-12-03") == "2026-12-03"

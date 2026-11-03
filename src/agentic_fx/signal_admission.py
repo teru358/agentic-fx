@@ -26,7 +26,7 @@ from typing import Callable, Mapping, Sequence
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.backtest.timeframes import TF_MINUTES
-from agentic_fx.core import econ_window, market_hours, mission_ceiling
+from agentic_fx.core import econ_window, market_hours, mission_ceiling, time_cutover
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.store import (
@@ -247,9 +247,29 @@ def _aware(value: str | None) -> datetime | None:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
-def operating_day(now: datetime) -> str:
-    """signal の日次上限と同じ境界 (取引日の開始) の運用日ラベル。"""
-    return market_hours.trading_day_start(now).isoformat()
+def operating_day(now: datetime, conn: sqlite3.Connection | None = None) -> str:
+    """signal の日次上限と同じ取引日の運用日ラベル (取引日の日付 `YYYY-MM-DD`)。
+
+    `conn` があれば切替の過渡期間は旧新の遅い方のラベルを返す。"""
+    if conn is None:
+        return market_hours.trading_date(now).isoformat()
+    return time_cutover.daily_label(conn, now).isoformat()
+
+
+def legacy_operating_day(value: str) -> str:
+    """旧版が書いた運用日 key (取引日の開始 ISO) を現行のラベルへ読み替える。
+
+    開始 + 24 時間 - 1 分の取引日。現行のラベル (日付だけ) はそのまま返す。"""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if len(value) <= 10:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return market_hours.trading_date(
+        parsed + timedelta(hours=24) - timedelta(minutes=1)).isoformat()
 
 
 def window_start(now: datetime) -> datetime:
@@ -346,7 +366,7 @@ class WaitBudgetEvaluator:
 
     def tick(self, now: datetime) -> WaitBudgetSnapshot | None:
         """運用日境界の通過と承認 strategy 集合の変更で再評価する。"""
-        current = (operating_day(now), self._identity())
+        current = (operating_day(now, self._conn), self._identity())
         if self._seen is not None and self._seen == current:
             return None
         return self.evaluate_wait_budget(
@@ -431,12 +451,17 @@ class WaitBudgetEvaluator:
         記録して True。過去の運用日の key はここで消す。"""
         conn = self._conn
         key = alert_state.wait_budget_notified_key(snapshot.op_day, snapshot.fingerprint)
-        if alert_state.get(conn, key) is not None:
-            return False
-        stale = [k for k in alert_state.keys_with_prefix(
-            conn, alert_state.WAIT_BUDGET_NOTIFIED_PREFIX)
-            if not k.startswith(
-                alert_state.WAIT_BUDGET_NOTIFIED_PREFIX + snapshot.op_day + "|")]
+        prefix = alert_state.WAIT_BUDGET_NOTIFIED_PREFIX
+        existing = alert_state.keys_with_prefix(conn, prefix)
+        # 旧版は取引日の開始 ISO を運用日にしていた。同じ取引日の key なら通知済み
+        for old in existing:
+            day, _, fingerprint = old[len(prefix):].rpartition("|")
+            if (fingerprint == snapshot.fingerprint
+                    and legacy_operating_day(day) == snapshot.op_day):
+                return False
+        stale = [k for k in existing
+                 if legacy_operating_day(k[len(prefix):].rpartition("|")[0])
+                 != snapshot.op_day]
         for old in stale:
             alert_state.delete(conn, old, commit=False)
         record = json.dumps({"fingerprint": snapshot.fingerprint,
@@ -450,7 +475,7 @@ class WaitBudgetEvaluator:
     def _compute(self, now: datetime, trigger: str) -> WaitBudgetSnapshot:
         s = self._settings
         widths = strategy_widths_sec(self._strategies_fn())
-        day = operating_day(now)
+        day = operating_day(now, self._conn)
         stamp = now.isoformat()
         if not widths:
             return WaitBudgetSnapshot(

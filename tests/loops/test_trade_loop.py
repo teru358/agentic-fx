@@ -1431,3 +1431,35 @@ def test_intent_execution_failed_line_carries_market_tool_calls(tmp_path):
              if "\tintent_execution_failed\t" in ln]
     assert len(lines) == 1, lines
     assert lines[0].split("\t")[3].endswith(" market_tool_calls=3")
+
+
+def test_prompt_day_deadline_is_the_one_the_forced_close_uses_inside_the_cutover_window(tmp_path):
+    from agentic_fx.core import market_hours, time_cutover
+
+    conn, loop, _, _ = _loop(tmp_path, [])
+    t_c = datetime(2026, 11, 3, 21, 30, tzinfo=timezone.utc)
+    time_cutover.ensure_cutover(conn, now=t_c, activity=loop.activity)
+    now = datetime(2026, 11, 3, 21, 40, tzinfo=timezone.utc)
+    window = time_cutover.active_window(conn, now)
+    assert window is not None
+    expected = time_cutover.day_close_rollover(window, now) - market_hours.DAY_CLOSE_BUFFER
+    prompt = loop._build_prompt("system", now)
+    assert f"day 建玉の強制決済 {expected:%H:%M:%S} UTC" in prompt
+    assert "21:55:00 UTC" in prompt
+
+
+def test_prompt_day_deadline_goes_through_the_cutover_rule(tmp_path, monkeypatch):
+    from agentic_fx.core import time_cutover
+
+    _, loop, _, _ = _loop(tmp_path, [])
+    seen: list = []
+    real = time_cutover.day_close_rollover
+
+    def spy(window, anchor):
+        seen.append(anchor)
+        return real(window, anchor)
+
+    monkeypatch.setattr(time_cutover, "day_close_rollover", spy)
+    now = datetime(2026, 7, 22, 20, 45, 29, tzinfo=timezone.utc)
+    loop._build_prompt("system", now)
+    assert seen == [now]

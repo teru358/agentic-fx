@@ -12,8 +12,11 @@ import pytest
 
 from agentic_fx.plugin.strategy_gate import (
     _check_profitability_floor,
+    AGENT_BLOCKED_NOTICE,
+    FLOOR_CONDITION_KINDS,
     _floor_fail_items,
     floor_settings_kv,
+    trades_per_eval_bar,
 )
 
 from tests.plugin.conftest import SETTINGS
@@ -21,6 +24,13 @@ from tests.plugin.conftest import SETTINGS
 
 def _m(trades, pf, avg_r, *, evaluable=True):
     return {"trades": trades, "pf": pf, "avg_r": avg_r, "evaluable": evaluable}
+
+
+def _m2(trades, pf, avg_r, *, max_drawdown=0.1, eval_bars=100,
+        evaluable=True):
+    return {"trades": trades, "pf": pf, "avg_r": avg_r,
+            "max_drawdown": max_drawdown, "eval_bars": eval_bars,
+            "evaluable": evaluable}
 
 
 # ---- F1: in_sample 段の境界 --------------------------------------------
@@ -190,18 +200,54 @@ def test_f3_2_all_pairs_passing_passes():
     assert label == ""
 
 
-# ---- F10: DD / kill_switch_latches は判定に無関係 -----------------------
+def test_drawdown_boundary_and_disable_are_independent_from_profitability():
+    at_limit = _m2(50, 1.5, 0.1, max_drawdown=0.20, eval_bars=200)
+    over_limit = _m2(50, 1.5, 0.1, max_drawdown=0.2000001, eval_bars=200)
+    assert _check_profitability_floor({"USDJPY": at_limit}, settings=SETTINGS,
+                                      scope="in_sample")[0] == ""
+    assert _check_profitability_floor({"USDJPY": over_limit}, settings=SETTINGS,
+                                      scope="in_sample")[0] == "unprofitable"
+    settings = SETTINGS.model_copy(deep=True)
+    settings.improve.gate.max_drawdown = None
+    assert _check_profitability_floor(
+        {"USDJPY": _m2(50, 1.5, 0.1, max_drawdown=0.99, eval_bars=200)},
+        settings=settings, scope="in_sample")[0] == ""
 
-def test_f10_1_extreme_drawdown_and_latches_do_not_change_verdict():
-    m_extreme = {"trades": 50, "pf": 1.5, "avg_r": 0.1, "evaluable": True,
-                 "max_drawdown": 0.99, "kill_switch_latches": 999}
-    m_zero = {"trades": 50, "pf": 1.5, "avg_r": 0.1, "evaluable": True,
-              "max_drawdown": 0.0, "kill_switch_latches": 0}
-    label_extreme, _ = _check_profitability_floor(
-        {"USDJPY": m_extreme}, settings=SETTINGS, scope="in_sample")
-    label_zero, _ = _check_profitability_floor(
-        {"USDJPY": m_zero}, settings=SETTINGS, scope="in_sample")
-    assert label_extreme == label_zero == ""
+
+def test_frequency_boundary_invalid_measurements_and_holdout_are_skipped():
+    assert _check_profitability_floor(
+        {"USDJPY": _m2(25, 1.5, 0.1, eval_bars=100)}, settings=SETTINGS,
+        scope="in_sample")[0] == ""
+    assert _check_profitability_floor(
+        {"USDJPY": _m2(26, 1.5, 0.1, eval_bars=100)}, settings=SETTINGS,
+        scope="in_sample")[0] == "unprofitable"
+    for value in (True, "100", float("nan"), float("inf"), None):
+        assert _check_profitability_floor(
+            {"USDJPY": _m2(99, 1.5, 0.1, max_drawdown=value,
+                              eval_bars=value)}, settings=SETTINGS,
+            scope="in_sample")[0] == ""
+    for trades in (True, "99", 99.0, -1, None):
+        assert _check_profitability_floor(
+            {"USDJPY": _m2(trades, 1.5, 0.1, eval_bars=100)},
+            settings=SETTINGS, scope="in_sample")[0] == ""
+    assert _check_profitability_floor(
+        {"USDJPY": _m2(99, 1.5, 0.1, max_drawdown=0.99, eval_bars=1)},
+        settings=SETTINGS, scope="holdout")[0] == ""
+
+
+def test_pf_and_drawdown_both_return_kind_but_agent_detail_hides_new_kind():
+    metrics = {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99, eval_bars=1)}
+    items = _floor_fail_items(metrics, settings=SETTINGS, scope="in_sample")
+    assert [item.kind for item in items] == ["pf", "drawdown_too_deep", "too_frequent"]
+    label, detail = _check_profitability_floor(
+        metrics, settings=SETTINGS, scope="in_sample", audience="agent")
+    assert label == "unprofitable"
+    assert "pf=" in detail
+    assert "drawdown_too_deep" not in detail
+    label, detail = _check_profitability_floor(
+        {"USDJPY": _m2(50, 1.5, 0.1, max_drawdown=0.99)},
+        settings=SETTINGS, scope="in_sample", audience="agent")
+    assert label == "unprofitable" and detail == AGENT_BLOCKED_NOTICE
 
 
 # ---- F 番号 gap 充足 (2026-09-13、コーディネータ指示): F1-2/F1-5/F1-7 --
@@ -264,7 +310,9 @@ def test_floor_settings_kv_matches_snapshot_order_and_format():
         f"min_pf={SETTINGS.improve.gate.min_pf} "
         f"require_positive_avg_r={SETTINGS.improve.gate.require_positive_avg_r} "
         f"require_holdout_evaluable="
-        f"{SETTINGS.improve.gate.require_holdout_evaluable}")
+        f"{SETTINGS.improve.gate.require_holdout_evaluable} "
+        f"max_drawdown={SETTINGS.improve.gate.max_drawdown} "
+        f"max_trades_per_eval_bar={SETTINGS.improve.gate.max_trades_per_eval_bar}")
 
 
 # ---- [profitability-floor-fix] G2: 落ちた pair を構造化して取り出す -----
@@ -276,7 +324,7 @@ def test_floor_fail_items_returns_failing_pairs_only():
     items = _floor_fail_items(
         {"USDJPY": _m(50, 0.5, 0.1), "EURUSD": _m(50, 1.5, 0.1)},
         settings=SETTINGS, scope="in_sample")
-    assert [pair for pair, _ in items] == ["USDJPY"]
+    assert [item.pair for item in items] == ["USDJPY"]
 
 
 def test_floor_fail_items_agrees_with_check_profitability_floor_string():
@@ -285,6 +333,68 @@ def test_floor_fail_items_agrees_with_check_profitability_floor_string():
         per_pair, settings=SETTINGS, scope="in_sample")
     items = _floor_fail_items(per_pair, settings=SETTINGS, scope="in_sample")
     assert label == "unprofitable"
-    for pair, msg in items:
-        assert pair in detail
-        assert msg in detail
+    for item in items:
+        assert item.pair in detail
+        assert item.message in detail
+
+
+def test_non_int_trades_skip_only_frequency_and_still_judge_pf_dd():
+    for trades in (False, 0.0):
+        failing_dd = {"USDJPY": _m2(trades, 1.5, 0.1, max_drawdown=0.99,
+                                    eval_bars=100)}
+        items = _floor_fail_items(failing_dd, settings=SETTINGS,
+                                  scope="in_sample")
+        assert [i.kind for i in items] == ["drawdown_too_deep"]
+        failing_pf = {"USDJPY": _m2(trades, 0.5, -0.1, eval_bars=100)}
+        items = _floor_fail_items(failing_pf, settings=SETTINGS,
+                                  scope="in_sample")
+        assert [i.kind for i in items] == ["pf"]
+        assert _check_profitability_floor(
+            failing_dd, settings=SETTINGS, scope="in_sample")[0] \
+            == "unprofitable"
+    assert _floor_fail_items(
+        {"USDJPY": _m2(0, 0.5, -0.1, max_drawdown=0.99, eval_bars=100)},
+        settings=SETTINGS, scope="in_sample") == []
+
+
+def test_agent_detail_is_the_fixed_notice_when_only_new_conditions_fail():
+    label, detail = _check_profitability_floor(
+        {"USDJPY": _m2(50, 1.5, 0.1, max_drawdown=0.99)},
+        settings=SETTINGS, scope="in_sample", audience="agent")
+    assert (label, detail) == ("unprofitable", AGENT_BLOCKED_NOTICE)
+
+
+def test_agent_detail_for_pf_failure_ends_with_the_fixed_notice():
+    _, detail = _check_profitability_floor(
+        {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99)},
+        settings=SETTINGS, scope="in_sample", audience="agent")
+    assert detail.startswith("in_sample: USDJPY: pf=0.5")
+    assert detail.endswith(" — " + AGENT_BLOCKED_NOTICE)
+    assert "drawdown_too_deep" not in detail
+
+
+def test_human_detail_has_one_entry_per_pair_listing_every_kind():
+    metrics = {"USDJPY": _m2(50, 0.5, -0.1, max_drawdown=0.99, eval_bars=1),
+               "EURUSD": _m2(50, 1.5, 0.1, max_drawdown=0.99)}
+    _, detail = _check_profitability_floor(
+        metrics, settings=SETTINGS, scope="in_sample")
+    assert detail.count("USDJPY:") == 1 and detail.count("EURUSD:") == 1
+    first = detail.split(", EURUSD:")[0]
+    assert "pf=" in first and "drawdown_too_deep" in first and "too_frequent" in first
+
+
+def test_trades_per_eval_bar_is_the_single_validity_rule():
+    assert trades_per_eval_bar(25, 100) == 0.25
+    assert trades_per_eval_bar(0, 1) == 0.0
+    assert trades_per_eval_bar(5, 2.5) == 2.0
+    for trades, bars in ((True, 100), ("5", 100), (5.0, 100), (-1, 100),
+                         (5, 0), (5, 0.5), (5, True), (5, "10"), (5, None),
+                         (5, float("nan")), (5, float("inf"))):
+        assert trades_per_eval_bar(trades, bars) is None
+
+
+def test_condition_kinds_are_the_gate_kinds():
+    metrics = {"USDJPY": _m2(99, 1.5, 0.1, max_drawdown=0.99, eval_bars=100)}
+    kinds = tuple(i.kind for i in _floor_fail_items(
+        metrics, settings=SETTINGS, scope="in_sample"))
+    assert kinds == FLOOR_CONDITION_KINDS

@@ -22,7 +22,7 @@ from datetime import datetime
 from agentic_fx._safe_error import safe_error_text
 from agentic_fx.activity import ActivityLog, Category
 from agentic_fx.config import Settings
-from agentic_fx.core import market_hours
+from agentic_fx.core import market_hours, time_cutover
 from agentic_fx.core.contracts import (
     Action, Clock, IntentParseError, Origin, OrderStatus as S, TradeIntent,
 )
@@ -891,7 +891,8 @@ class TradeLoop:
                 "実際の期限は約定時刻で決まる。"
             )
         else:
-            rollover = market_hours.next_rollover(utc_now)
+            rollover = time_cutover.day_close_rollover(
+                time_cutover.active_window(self.conn, utc_now), utc_now)
             deadline = rollover - market_hours.DAY_CLOSE_BUFFER
             if utc_now < deadline:
                 remaining = int((deadline - utc_now).total_seconds() // 60)

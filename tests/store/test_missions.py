@@ -56,3 +56,40 @@ def test_system_filtered_is_written_only_by_its_own_terminal_helper(tmp_path):
                        (mid,)).fetchone()
     assert (row["status"], row["finished_at"]) == ("system_filtered", now.isoformat())
     assert missions.finish_system_filtered_in_tx(conn, mid, None, [], now) is False
+
+
+def _signal_rows(path, times):
+    c = connect(path)
+    init_db(c)
+    for t in times:
+        missions.start(c, "trade", "local", "m", t, trigger="signal")
+    return c
+
+
+def _settings():
+    from pathlib import Path
+
+    from agentic_fx.config import load_settings
+
+    return load_settings(
+        Path(__file__).resolve().parents[2] / "config" / "settings.yaml.example")
+
+
+def test_signal_daily_limit_starts_at_the_winter_new_york_close(tmp_path):
+    from datetime import timedelta
+
+    settings = _settings()
+    assert settings.plugin.signal_daily_max == 12
+    after_close = [datetime(2026, 11, 3, 22, 1, tzinfo=timezone.utc)
+                   + timedelta(minutes=11 * i) for i in range(11)]
+    before_close = datetime(2026, 11, 3, 21, 30, tzinfo=timezone.utc)
+    at_close = datetime(2026, 11, 3, 22, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 11, 4, 21, 30, tzinfo=timezone.utc)
+
+    # 21:30Z の行は前の取引日に属し、当日の枠 (11 件) に数えない。
+    c1 = _signal_rows(tmp_path / "a.db", [before_close, *after_close])
+    assert missions.signals_rate_ok(c1, now, settings) is True
+
+    # 22:00Z ちょうどの行は当日の枠に入り、12 件で上限に達する。
+    c2 = _signal_rows(tmp_path / "b.db", [at_close, *after_close])
+    assert missions.signals_rate_ok(c2, now, settings) is False

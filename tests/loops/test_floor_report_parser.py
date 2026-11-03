@@ -68,6 +68,31 @@ def test_roundtrip_in_sample_failure_has_no_holdout_table(loop_min):
         "in_sample", [("USDJPY", 30, 0.8, -0.1, True)])
 
 
+def test_conditions_section_roundtrips_only_new_floor_kinds(loop_min):
+    metrics = _m(trades=50, pf=0.5, avg_r=-0.1)
+    metrics.update(max_drawdown=0.263, eval_bars=100)
+    text = _render(loop_min, {"USDJPY": metrics}, {})
+    assert "### floor_conditions" in text
+    assert "floor_failed: USDJPY drawdown_too_deep (max_drawdown=0.263 > 0.2)" in text
+    assert "floor_failed: USDJPY too_frequent (trades_per_eval_bar=0.500 > 0.25)" in text
+    detail = parse_floor_report(text, mission_id=MID)
+    assert detail is not None
+    assert detail.stages[0].pairs[0].conditions == (
+        "drawdown_too_deep", "too_frequent")
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda text: text.replace("### floor_conditions", "### floor_conditions\n\n### floor_conditions"),
+    lambda text: text.replace("failed_kinds", "bad_kinds"),
+    lambda text: text.replace("drawdown_too_deep, too_frequent", "too_frequent, drawdown_too_deep"),
+])
+def test_conditions_section_is_strict(loop_min, mutation):
+    metrics = _m(trades=50, pf=0.5)
+    metrics.update(max_drawdown=0.263, eval_bars=100)
+    assert parse_floor_report(mutation(_render(loop_min, {"USDJPY": metrics}, {})),
+                              mission_id=MID) is None
+
+
 def test_roundtrip_holdout_failure_returns_the_holdout_rows(strict_loop):
     text = _render(
         strict_loop, {"USDJPY": _m(pf=1.2)},
@@ -115,6 +140,7 @@ def test_rendered_tables_carry_a_failed_column_per_pair_and_stage(loop_min):
     in_part, _, hold_part = text.partition("### holdout")
     assert [l.rsplit(" | ", 1)[1] for l in in_part.split("\n") if l.startswith("| ")
             and "pair" not in l] == ["True |", "False |"]
+    hold_part = hold_part.split("### floor_conditions", 1)[0]
     assert [l.rsplit(" | ", 1)[1] for l in hold_part.split("\n") if l.startswith("| ")
             and "pair" not in l] == ["False |", "True |"]
 
@@ -269,11 +295,11 @@ def test_holdout_table_is_ignored_when_in_sample_failed(loop_min):
     clean = ("in_sample", [("USDJPY", 20, 0.5, 0.2, True)])
     assert _summary(parse_floor_report(text, mission_id=MID)) == clean
     before, _, _ = text.partition("### holdout")
-    with_holdout = before + "### holdout\n\nnot a table\nnan nan\n"
+    conditions = text[text.index("### floor_conditions"):]
+    with_holdout = before + "### holdout\n\nnot a table\nnan nan\n\n" + conditions
     assert with_holdout != text
     assert _summary(parse_floor_report(with_holdout, mission_id=MID)) == clean
-    assert _summary(parse_floor_report(before.rstrip("\n") + "\n",
-                                       mission_id=MID)) == clean
+    assert parse_floor_report(before.rstrip("\n") + "\n", mission_id=MID) is None
 
 
 def test_in_sample_table_is_validated_when_holdout_fails(loop_min):
@@ -304,3 +330,58 @@ def test_values_are_finite_floats():
     detail = parse_floor_report(_real("improve-2026-10-25-2043.md"), mission_id=2043)
     assert all(isinstance(p.pf, float) and math.isfinite(p.pf)
                for st in detail.stages for p in st.pairs)
+
+
+def _two_pair_conditions_text(loop, *, second_fails=False):
+    first = _m(trades=50, pf=1.5)
+    first.update(max_drawdown=0.263, eval_bars=1000)
+    second = _m(trades=50, pf=0.5 if second_fails else 1.5)
+    second.update(max_drawdown=0.05, eval_bars=1000)
+    return _render(loop, {"USDJPY": first, "EURUSD": second}, {})
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda t: t.replace("| 0.050 | 1000.000 | 0.050 | - |",
+                        "| 0.050 | 1000.000 | 0.050 | bogus_kind |"),
+    lambda t: t.replace("| drawdown_too_deep |\n",
+                        "| drawdown_too_deep, drawdown_too_deep |\n"),
+    lambda t: t.replace("| EURUSD | 0.050 |", "| GBPUSD | 0.050 |"),
+    lambda t: t.replace("| 0.050 | 1000.000 | 0.050 | - |",
+                        "| 0.050 | 1000.000 | 0.050 | drawdown_too_deep |"),
+], ids=["unknown_kind", "duplicate_kind", "pair_mismatch",
+        "kinds_on_not_failed_pair"])
+def test_conditions_section_rejects_inconsistent_rows(loop_min, mutation):
+    text = _two_pair_conditions_text(loop_min)
+    assert parse_floor_report(text, mission_id=MID) is not None
+    mutated = mutation(text)
+    assert mutated != text
+    assert parse_floor_report(mutated, mission_id=MID) is None
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda t: "\n".join(l for l in t.split("\n") if not l.startswith("floor_failed:")),
+    lambda t: t.replace("max_drawdown=0.263 > 0.2", "edited by hand"),
+    lambda t: t.rstrip("\n") + "\nfree-form note\n",
+], ids=["lines_missing", "lines_edited", "trailing_text"])
+def test_floor_failed_helper_lines_are_not_part_of_the_contract(loop_min, mutation):
+    text = _two_pair_conditions_text(loop_min)
+    assert "floor_failed: USDJPY drawdown_too_deep" in text
+    mutated = mutation(text)
+    assert mutated != text
+    detail = parse_floor_report(mutated, mission_id=MID)
+    assert detail is not None
+    assert detail.stages[0].pairs[0].conditions == ("drawdown_too_deep",)
+
+
+def test_new_format_report_without_conditions_section_is_rejected(loop_min):
+    text = _two_pair_conditions_text(loop_min, second_fails=True)
+    cut = text[:text.index("### floor_conditions")].rstrip("\n") + "\n"
+    assert parse_floor_report(cut, mission_id=MID) is None
+    assert parse_floor_report(cut.rstrip("\n"), mission_id=MID) is None
+    assert parse_floor_report(cut + "\n", mission_id=MID) is None
+
+
+def test_legacy_report_gives_empty_conditions_for_all_pairs():
+    detail = parse_floor_report(_real("improve-2026-10-25-2043.md"), mission_id=2043)
+    assert detail is not None
+    assert all(p.conditions == () for s in detail.stages for p in s.pairs)

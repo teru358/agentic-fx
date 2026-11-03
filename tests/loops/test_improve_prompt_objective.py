@@ -205,7 +205,8 @@ def test_ac17_approval_payload_floor_snapshot_carries_the_new_values(
 
     assert payload["profitability_floor"] == {
         "min_pf": 1.0, "require_positive_avg_r": True,
-        "require_holdout_evaluable": True}
+        "require_holdout_evaluable": True,
+        "max_drawdown": 0.20, "max_trades_per_eval_bar": 0.25}
 
 
 _SAME_NAME_SENTENCE = "同名で更新する候補は、配備中の版を上回ることが採用の条件である。"

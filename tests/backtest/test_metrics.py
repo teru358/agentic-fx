@@ -63,6 +63,7 @@ def test_zero_trades_returns_none_metrics_but_not_evaluable():
         "trades": 0, "pf": None, "win_rate": None, "avg_r": None,
         "total_pnl": 0.0, "max_drawdown": 0.0, "evaluable": False,
         "fallback_spread_used": True, "kill_switch_latches": 0,
+        "eval_bars": 0,
     }
 
 
@@ -271,3 +272,22 @@ def test_fail_closed_on_inf_realized_pnl():
         end=H, source="dukascopy", fallback_spread_used=False)
     with pytest.raises(ValueError):
         compute_metrics(res)
+
+
+def test_eval_bars_is_exposed_for_zero_and_nonzero_trades():
+    zero = BacktestResult(
+        orders=[], equity_curve=[(H.isoformat(), 1_000_000.0)], start=H,
+        end=H, source="dukascopy", fallback_spread_used=False, eval_bars=7)
+    assert compute_metrics(zero)["eval_bars"] == 7
+    res = _result_with_closed([100.0])
+    res.eval_bars = 1938
+    m = compute_metrics(res)
+    assert m["eval_bars"] == 1938 and type(m["eval_bars"]) is int
+
+
+def test_metric_keys_match_compute_metrics_output_for_both_branches():
+    assert set(compute_metrics(_result_with_closed([100.0]))) == METRIC_KEYS
+    empty = BacktestResult(
+        orders=[], equity_curve=[(H.isoformat(), 1_000_000.0)], start=H,
+        end=H, source="dukascopy", fallback_spread_used=False)
+    assert set(compute_metrics(empty)) == METRIC_KEYS

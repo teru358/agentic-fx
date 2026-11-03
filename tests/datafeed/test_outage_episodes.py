@@ -98,6 +98,23 @@ def test_friday_restricted_expires_over_the_weekend_then_recovers_after_three_he
     assert _row(conn)["updated_at"] == "2026-09-27T21:05:00+00:00"
 
 
+def test_winter_sunday_2100_to_2200_is_closed_for_outage_failures(tmp_path):
+    conn, machine = _rig(tmp_path)
+    failed = IngestTickReport(
+        attempted=frozenset({KEY}), succeeded=frozenset(),
+        failed=frozenset({(KEY, "x")}), deferred=frozenset(), empty=frozenset())
+
+    for now in (
+        datetime(2026, 11, 8, 21, 0, tzinfo=UTC),
+        datetime(2026, 11, 8, 21, 59, tzinfo=UTC),
+    ):
+        assert machine.observe(now, failed) == "ready"
+        assert _row(conn)["epoch"] == 0
+
+    assert machine.observe(datetime(2026, 11, 8, 22, 1, tzinfo=UTC), failed) == "degraded"
+    assert _row(conn)["epoch"] == 1
+
+
 # ---- 原子性 ---------------------------------------------------------------
 
 

@@ -986,7 +986,8 @@ class OpsService:
         return {"stages": [
             {"stage": stage.stage,
              "pairs": [{"pair": row.pair, "trades": row.trades, "pf": row.pf,
-                        "avg_r": row.avg_r, "evaluable": row.evaluable}
+                        "avg_r": row.avg_r, "evaluable": row.evaluable,
+                        **({"conditions": list(row.conditions)} if row.conditions else {})}
                        for row in stage.pairs]}
             for stage in detail.stages]}
 

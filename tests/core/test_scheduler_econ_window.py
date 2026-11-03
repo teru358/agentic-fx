@@ -641,22 +641,22 @@ def test_queued_reports_run_in_order_on_one_thread(tmp_path):
     (datetime(2026, 12, 24, 22, 0, tzinfo=timezone.utc),
      datetime(2026, 12, 25, 22, 0, tzinfo=timezone.utc),
      datetime(2026, 12, 28, 12, 0, tzinfo=timezone.utc),
-     datetime(2026, 12, 28, 21, 0, tzinfo=timezone.utc)),
+     datetime(2026, 12, 28, 22, 0, tzinfo=timezone.utc)),
     (datetime(2026, 12, 31, 22, 0, tzinfo=timezone.utc),
      datetime(2027, 1, 1, 22, 0, tzinfo=timezone.utc),
      datetime(2027, 1, 4, 12, 0, tzinfo=timezone.utc),
-     datetime(2027, 1, 4, 21, 0, tzinfo=timezone.utc)),
+     datetime(2027, 1, 4, 22, 0, tzinfo=timezone.utc)),
 ])
 def test_holiday_boundaries_do_not_fire_and_survive_a_restart(
         tmp_path, holiday_eve, holiday_night, monday, monday_close):
-    """12/25 と 1/1 の 21:00 UTC の境界 (直前の 1 分は休場) では起動しない。
+    """12/25 と 1/1 の NY 17:00 の境界 (直前の 1 分は休場) では起動しない。
     休場日をまたぐ再起動でも、閉じた取引日の分を 1 回しか呼ばない。"""
     calls: list = []
     env = _report_env(tmp_path, calls, base=holiday_eve)
     _run(env, env.sched.tick(holiday_eve))
     closed = Scheduler.latest_trading_close(holiday_eve)
     assert calls == [closed]
-    assert closed.date() == holiday_eve.date() and closed.hour == 21
+    assert closed == holiday_eve
     _run(env, env.sched.tick(holiday_eve + timedelta(minutes=1)))   # 記録を書く
     _run(env, env.sched.tick(holiday_night))                # 休場日の境界は数えない
     assert calls == [closed]
@@ -882,3 +882,81 @@ def test_a_failing_calendar_observation_does_not_stop_the_tick(tmp_path):
     _tick(env, WED)
     assert _status(env, oid) == "open"                       # 約定処理は止まらない
     assert "calendar_observe_cycle_error" in _log(env)
+
+
+# --- 取引日の終端は NY 日付で決める (冬は 22:00 UTC) ----------------------------
+
+WINTER_TUE = datetime(2026, 12, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _utc(*args):
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+def test_the_latest_close_steps_back_by_new_york_dates_in_winter():
+    close = Scheduler.latest_trading_close
+    assert close(WINTER_TUE) == _utc(2026, 11, 30, 22, 0)
+    assert close(_utc(2026, 12, 1, 21, 59)) == _utc(2026, 11, 30, 22, 0)
+    assert close(_utc(2026, 12, 1, 22, 0)) == _utc(2026, 12, 1, 22, 0)
+    # 週末をまたぐ: 金曜の終端 (22:00 UTC) へ戻る
+    assert close(_utc(2026, 12, 5, 22, 0)) == _utc(2026, 12, 4, 22, 0)
+    assert close(_utc(2026, 12, 6, 21, 30)) == _utc(2026, 12, 4, 22, 0)
+    assert close(_utc(2026, 12, 6, 22, 0)) == _utc(2026, 12, 4, 22, 0)
+    assert close(_utc(2026, 12, 6, 23, 0)) == _utc(2026, 12, 4, 22, 0)
+    assert close(_utc(2026, 12, 7, 22, 0)) == _utc(2026, 12, 7, 22, 0)
+
+
+def test_the_latest_close_crosses_the_daylight_saving_change_by_date():
+    close = Scheduler.latest_trading_close
+    # 2026-11-01 (日) に夏時間が終わる。月曜 11-02 の終端は 22:00 UTC。
+    assert close(_utc(2026, 11, 2, 21, 30)) == _utc(2026, 10, 30, 21, 0)
+    assert close(_utc(2026, 11, 3, 12, 0)) == _utc(2026, 11, 2, 22, 0)
+    # 2027-03-14 (日) に夏時間が始まる。火曜 03-16 は 21:00 UTC。
+    assert close(_utc(2027, 3, 16, 12, 0)) == _utc(2027, 3, 15, 21, 0)
+    assert close(_utc(2027, 3, 12, 21, 30)) == _utc(2027, 3, 11, 22, 0)
+
+
+def _write_marker(env, day_iso):
+    alert_state.set(env.conn, alert_state.DAILY_REPORT_KEY,
+                    json.dumps({"day": day_iso}), now=_utc(2026, 11, 3, 21, 0))
+
+
+def _cutover_at(env, t_c):
+    env.conn.execute("INSERT INTO data_migrations(name, applied_at) VALUES (?, ?)",
+                     ("market_hours_ny_rule_v1", t_c.isoformat()))
+    env.conn.commit()
+
+
+def test_a_winter_marker_from_the_old_rule_is_the_same_trading_day_as_the_new_close(
+        tmp_path):
+    calls: list = []
+    base = _utc(2026, 11, 3, 21, 30)
+    env = _report_env(tmp_path, calls, base=base)
+    _write_marker(env, "2026-11-03T21:00:00+00:00")        # 旧版が出した 1 本
+    _cutover_at(env, _utc(2026, 11, 3, 21, 15))
+    for at in (base, _utc(2026, 11, 3, 22, 0), _utc(2026, 11, 3, 22, 1),
+               _utc(2026, 11, 4, 12, 0)):
+        _run(env, env.sched.tick(at))
+    assert calls == []                                     # 切替日は出し直さない
+    _run(env, env.sched.tick(_utc(2026, 11, 4, 22, 1)))
+    _run(env, env.sched.tick(_utc(2026, 11, 4, 23, 0)))
+    assert calls == [_utc(2026, 11, 4, 22, 0)]             # 翌日の分が 1 回
+
+
+def test_a_summer_marker_from_the_old_rule_reads_as_its_own_trading_day(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    _write_marker(env, "2026-07-21T21:00:00+00:00")
+    _run(env, env.sched.tick(WED))
+    assert calls == []
+    _run(env, env.sched.tick(WED_CLOSE + timedelta(minutes=1)))
+    assert calls == [WED_CLOSE]
+
+
+def test_an_unreadable_marker_value_catches_up_once(tmp_path):
+    calls: list = []
+    env = _report_env(tmp_path, calls)
+    _write_marker(env, "not-a-date")
+    _run(env, env.sched.tick(WED))
+    _run(env, env.sched.tick(WED + timedelta(minutes=1)))
+    assert calls == [TUE_CLOSE]

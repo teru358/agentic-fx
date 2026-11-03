@@ -74,7 +74,8 @@ def test_ac1_new_candidate_reports_name_kind_class_performance_and_summary(ops_e
     assert change["params"]["items"] == []
     assert change["summary"] == "期間を 5 から 8 に変更"
     assert change["performance"]["in_sample"] == [
-        {"pair": "USDJPY", "trades": 40, "pf": 1.31, "avg_r": 0.12}]
+        {"pair": "USDJPY", "trades": 40, "pf": 1.31, "avg_r": 0.12, "win_rate": None,
+         "max_drawdown": 3.5, "kill_switch_latches": None}]
     assert change["performance"]["holdout"][0]["trades"] == 20
     assert detail["payload_sha256"] == before == digest_of(ops_env, approval_id)
 
@@ -652,3 +653,13 @@ def test_ac23a_redaction_runs_before_any_cut_so_a_trailing_token_cannot_survive(
     items = _items(_detail(ops_env, approval_id)["change"])
     assert token not in items["params.note"][1]
     assert items["params.note"][1] == "&" * 70 + " " + L.REDACTED
+
+
+def test_performance_rows_pass_the_three_metrics_through_and_drop_bad_types():
+    from agentic_fx.ops import change as change_mod
+    rows = change_mod._performance({"trades": 3, "pf": 1.0, "avg_r": 0.1, "win_rate": 0.5,
+                                    "max_drawdown": 0.25, "kill_switch_latches": 2})
+    assert rows[0]["win_rate"] == 0.5 and rows[0]["max_drawdown"] == 0.25
+    assert rows[0]["kill_switch_latches"] == 2
+    old = change_mod._performance({"trades": 3, "pf": 1.0, "avg_r": 0.1})
+    assert old[0]["win_rate"] is None and old[0]["kill_switch_latches"] is None
