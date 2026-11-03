@@ -9,7 +9,7 @@ import pytest
 from mt5_client import server_epoch_to_utc, utc_to_server_epoch
 
 UTC = timezone.utc
-TABLE = json.loads((Path(__file__).parent / "data" / "dst_rule_table.json").read_text())
+TABLE = json.loads((Path(__file__).parent / "fixtures" / "dst_rule_table.json").read_text())
 
 
 def _epoch(value: str) -> int:

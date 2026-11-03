@@ -119,7 +119,7 @@ C3 は gap-annotate 設計 §7-6 (10/30 の 15m cache に 21:00-21:45 の 4 本)
 1. **broker サーバ時刻 → UTC** `server_epoch_to_utc(server_epoch: int) -> datetime` (aware UTC)。`server_epoch` は MT5 が返すサーバ時刻のエポック秒。`datetime.fromtimestamp(server_epoch, UTC)` の壁時計から 7h 引いた値を NY の壁時計として解釈し、UTC にする。逆 `utc_to_server_epoch(utc: datetime) -> int` は aware UTC だけを受け (naive と UTC 以外の aware は `TypeError`)、`utc.astimezone(NY)` の壁時計 + 7h をエポック秒にする。
 2. **市場の日次境界 → UTC** `session_boundary_utc(day: date) -> datetime`: NY の `day` の 17:00 を UTC にする。日次の境界はすべてこの 1 つから作る (§3.3)。
 
-主: `core/fx_time.py` (新規)。bridge は別 package で `agentic_fx` を import できないので、同じ規則を `mt5_client.py` 内に複製する。一致は**同じ金表**で守る: `mt5_bridge/tests/data/dst_rule_table.json`。値は実装から生成せず、tz の規則から手で固定した期待値を書く (レビュー対象のリテラル)。必須の件: 夏冬の通常日、3 つの切替 (2026-03-08、2026-11-01、2027-03-14) の前後 1 分、二重の時刻、存在しない時刻、金曜の閉場と日曜の開場の前後 1 分 (夏冬)、12/24-12/26 と 12/31-1/2。bridge 側の test と本体側の test がどちらもこの表を読む。
+主: `core/fx_time.py` (新規)。bridge は別 package で `agentic_fx` を import できないので、同じ規則を `mt5_client.py` 内に複製する。一致は**同じ金表**で守る: `mt5_bridge/tests/fixtures/dst_rule_table.json`。値は実装から生成せず、tz の規則から手で固定した期待値を書く (レビュー対象のリテラル)。必須の件: 夏冬の通常日、3 つの切替 (2026-03-08、2026-11-01、2027-03-14) の前後 1 分、二重の時刻、存在しない時刻、金曜の閉場と日曜の開場の前後 1 分 (夏冬)、12/24-12/26 と 12/31-1/2。bridge 側の test と本体側の test がどちらもこの表を読む。
 
 **曖昧な時刻。** DST の切替は日曜 NY 02:00 (閉場中)。壁時計 (NY = サーバ − 7h) が秋は 01:00-01:59 で二重、春は 02:00-02:59 で存在しない。判定は fold だけに頼らず UTC 往復で行う: fold=0 と fold=1 の UTC が違い、両方とも往復で同じ壁時計に戻れば**二重**、往復で戻らなければ**存在しない**。二重は fold=0 (夏時間側)、存在しないは切替前の offset (fold=0) で換算し、どちらも warning を出す (足は捨てない。ラベルの誤りより欠落の方が気づきにくい)。足がそこに来るのは規則と実機が食い違ったときだけ。
 

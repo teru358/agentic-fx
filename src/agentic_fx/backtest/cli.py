@@ -37,6 +37,7 @@ from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
                                     render_epilog)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
+from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
@@ -277,6 +278,14 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
                   f"unchanged={exc.partial.unchanged} "
                   f"conflicted={exc.partial.conflicted}", file=sys.stderr)
             return 3
+        except BridgeTimeRuleMismatch:
+            print("bridge の時刻規則が broker の時計と一致しません (time_rule_mismatch)。"
+                  "取り込みを中止しました", file=sys.stderr)
+            return 1
+        except BridgeTimeUnverified:
+            print("bridge の時刻規則を検査できていません (time_rule_unverified)。"
+                  "開場中にもう一度実行してください。取り込みを中止しました", file=sys.stderr)
+            return 1
     print(f"inserted={result.inserted} unchanged={result.unchanged} "
          f"conflicted={result.conflicted}")
     return 0

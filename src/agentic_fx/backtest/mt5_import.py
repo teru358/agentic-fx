@@ -20,7 +20,7 @@ import httpx
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.core.contracts import Bar
-from agentic_fx.datafeed.sources import _mt5_headers
+from agentic_fx.datafeed.sources import _mt5_headers, _raise_mt5_time_rule_error
 from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
@@ -38,12 +38,15 @@ class ImportConflictError(ValueError):
 def _default_fetch(url: str) -> dict:
     """既定 fetch。httpx.get + `X-Bridge-Api-Key` ヘッダ + `raise_for_status`。
 
+    bridge の 503 `time_rule_mismatch` / `time_rule_unverified` は型つきの例外
+    (`BridgeTimeRuleMismatch` / `BridgeTimeUnverified`) にして上げる。
+
     Dukascopy と異なり 404 は MT5 bridge では想定外 (欠損日は
     `bars: []` の 200 で返る実測仕様) — 素通しで raise する。
     URL・ヘッダ (API キー) はログに出さない。
     """
     resp = httpx.get(url, headers=_mt5_headers(), timeout=30)
-    resp.raise_for_status()
+    _raise_mt5_time_rule_error(resp)
     return resp.json()
 
 

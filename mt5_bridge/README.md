@@ -97,6 +97,7 @@ bridge は `America/New_York` の DST 規則と「サーバ時刻 = NY 壁時計
 - 時刻付き endpoint が開場中に呼ばれたとき、60 秒以上間隔を空けて probe symbol と要求 symbol の tick を検査する。±12 時間、30 分丸め、残差 120 秒のガードを通った値だけを受理する。
 - 受理値が規則と違えば `mismatch`。規則と一致する受理が 3 回連続するまで市場データは戻らない。起動直後、受理から 300 秒超、閉場中は `unverified`。
 - `GET /quote/{symbol}` と `GET /ohlcv/{symbol}` は `ok` のときだけ返す。`mismatch` は 503 `time_rule_mismatch`、`unverified` は 503 `time_rule_unverified`。口座・建玉・決済照合は止めない。
+- 測定値はメモリにだけ置く。`logs/server_offset.json` と環境変数 `SERVER_OFFSET_PATH` は使わない (残っていても読まない)。
 - 起動時に 2026 年の夏・冬の `America/New_York` offset を自己検査する。Windows では `tzdata` が必須依存として入る。自己検査に失敗した bridge は起動しない。
 
 `GET /server-time` で確認できる:

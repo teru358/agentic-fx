@@ -8,7 +8,7 @@ import pytest
 
 from agentic_fx.core.fx_time import server_epoch_to_utc, session_boundary_utc
 
-TABLE = json.loads((Path(__file__).parents[2] / "mt5_bridge" / "tests" / "data" /
+TABLE = json.loads((Path(__file__).parents[2] / "mt5_bridge" / "tests" / "fixtures" /
                     "dst_rule_table.json").read_text())
 
 

@@ -21,7 +21,7 @@ from starlette.responses import JSONResponse
 
 from admin_models import AdminStatus, HaltRequest
 from config import BridgeSettings, is_loopback_host, load_settings
-from mt5_client import Mt5Client, PreflightError, ServerTimeUnknownError, TimeRuleUnavailableError
+from mt5_client import Mt5Client, PreflightError, TimeRuleUnavailableError
 from ohlcv_models import OhlcvBar, OhlcvResponse
 from order_models import (
     ClosedDealResponse,
@@ -304,15 +304,13 @@ def account():
 def server_time():
     """こちらの UTC とブローカーのサーバ時刻を並べて返す (検証・運用の切り分け用)。
 
-    MT5 の時刻はすべてサーバ時間帯のエポック秒なので、bridge は tick から
-    オフセットを実測して補正している。その実測値をここから覗ける。
+    MT5 の時刻はすべてサーバ時間帯のエポック秒で、bridge は NY の規則から換算する。
+    tick から測った offset は換算には使わず、規則との一致の検査にだけ使う。
+    両方の時計、測定値、検査の状態をここから覗ける。
     """
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
-    try:
-        return _client.get_server_time()
-    except ServerTimeUnknownError as e:
-        raise HTTPException(503, str(e))
+    return _client.get_server_time()
 
 
 @app.get("/quote/{symbol}", dependencies=[Depends(require_api_key)])
@@ -323,10 +321,6 @@ def quote(symbol: str):
         return asdict(_client.get_quote(symbol))
     except TimeRuleUnavailableError as e:
         raise HTTPException(503, e.detail)
-    except ServerTimeUnknownError as e:
-        # RuntimeError のサブクラスなので 404 に落ちる前に捕まえる。
-        # 時刻が確定しないのは「見つからない」ではなく一時的な利用不能 = 503
-        raise HTTPException(503, str(e))
     except RuntimeError as e:
         raise HTTPException(404, str(e))
 
@@ -335,10 +329,7 @@ def quote(symbol: str):
 def positions():
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
-    try:
-        return [asdict(p) for p in _client.get_positions()]
-    except ServerTimeUnknownError as e:
-        raise HTTPException(503, str(e))
+    return [asdict(p) for p in _client.get_positions()]
 
 
 @app.get("/positions/{ticket}/closed-deal", response_model=ClosedDealResponse,
@@ -346,10 +337,7 @@ def positions():
 def closed_deal(ticket: int):
     if _client is None or not _client.is_connected:
         raise HTTPException(503, "MT5 not connected")
-    try:
-        deal = _client.get_closed_deal(ticket)
-    except ServerTimeUnknownError as e:
-        raise HTTPException(503, str(e))
+    deal = _client.get_closed_deal(ticket)
     if deal is None:
         raise HTTPException(404, f"closed deal not found for ticket={ticket}")
     return ClosedDealResponse(**asdict(deal))
@@ -392,9 +380,6 @@ def ohlcv(
         bars_raw = _client.copy_rates_range(symbol, interval, date_from, date_to)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    except ServerTimeUnknownError as e:
-        # オフセット未確定のまま足を返すと、ずれた時刻でサイジングされる
-        raise HTTPException(503, str(e))
     except TimeRuleUnavailableError as e:
         raise HTTPException(503, e.detail)
     except RuntimeError as e:

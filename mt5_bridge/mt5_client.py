@@ -37,16 +37,6 @@ NY = ZoneInfo("America/New_York")
 SERVER_AHEAD_OF_NY = timedelta(hours=7)
 
 
-class ServerTimeUnknownError(RuntimeError):
-    """サーバ時刻オフセットが一度も確定していない (fail closed)。
-
-    推測値で時刻を返すと、ずれた足でサイジングしたり誤った時刻で発注したり
-    する。止まる方が安全なので例外を上げ、server 側は 503 に map する。
-    RuntimeError を継承しているのは、まだ個別 except を持たない呼出元でも
-    「無言で誤った値が返る」ことだけは起きないようにするため。
-    """
-
-
 class TimeRuleUnavailableError(RuntimeError):
     """Market data is unavailable until the broker clock matches the rule."""
 
@@ -219,7 +209,7 @@ class Mt5Client:
     _measured_at: float | None = None
     _match_streak: int = 0
     _mismatch_latched: bool = False
-    _last_time_rule_state: str | None = None
+    _last_time_rule_state: str = "unverified"   # 起動直後の状態。最初の遷移から WARNING を出す
 
     def __init__(
         self, login: int, password: str, server: str,
@@ -239,7 +229,7 @@ class Mt5Client:
         self._measured_at = None
         self._match_streak = 0
         self._mismatch_latched = False
-        self._last_time_rule_state = None
+        self._last_time_rule_state = "unverified"
 
     def connect(self) -> None:
         """MT5 ターミナルを起動 (or 既起動なら attach) し、必要なときだけログインする。
@@ -594,9 +584,8 @@ class Mt5Client:
         date_from / date_to: tz-aware datetime (naive は拒否)
 
         MT5 は date_from / date_to も**サーバ時刻空間**で解釈するため、送信前に
-        +offset し、返ってきたバー時刻からは -offset する。片方向だけ直すと
-        範囲が静かに切り詰められる (実測: to を実 UTC のままにすると末尾 3 時間分の
-        足が返らない)。
+        規則の逆 (UTC -> NY 壁時計 + 7h) で変換し、返ってきた足の時刻は足ごとに
+        規則で UTC に戻す。片方向だけ直すと範囲が静かに切り詰められる。
         """
         # naive datetime は「どの時間帯の壁時計か」が決まらない。ここで +offset
         # しても意味が定まらないので受け取らない (プロジェクト制約: tz-aware UTC)。
@@ -632,8 +621,10 @@ class Mt5Client:
 
             rates = self._mt5.copy_rates_range(
                 symbol, tf,
-                datetime.fromtimestamp(utc_to_server_epoch(date_from), timezone.utc),
-                datetime.fromtimestamp(utc_to_server_epoch(date_to), timezone.utc),
+                datetime.fromtimestamp(
+                    utc_to_server_epoch(date_from.astimezone(timezone.utc)), timezone.utc),
+                datetime.fromtimestamp(
+                    utc_to_server_epoch(date_to.astimezone(timezone.utc)), timezone.utc),
             )
             if rates is None:
                 raise RuntimeError(
