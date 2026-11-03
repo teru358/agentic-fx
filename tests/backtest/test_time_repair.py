@@ -228,16 +228,59 @@ def test_apply_requires_confirmation_then_moves_rows_and_is_idempotent(tmp_path,
     assert hashlib.sha256(Path(manifest["path"]).read_bytes()).hexdigest() == manifest["sha256"]
 
 
-def test_apply_leaves_non_mt5_cache_sources_untouched(tmp_path, monkeypatch):
-    conn, path = _db(tmp_path, monkeypatch)
-    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
-                 ("USDJPY", "1m", "2026-10-03T02:00:00+00:00", 1, 2, .5, 1.5, 7, "yfinance"))
+def test_six_symbol_synthetic_history_repair_checks_database_invariants(tmp_path, monkeypatch):
+    from datetime import date, datetime, timedelta, timezone
+    from agentic_fx.core.fx_time import session_boundary_utc
+    symbols = ("EURUSD", "USDJPY", "JP225", "US500", "USOIL", "XAUUSD")
+    conn = connect(tmp_path / "synthetic.db")
+    init_db(conn)
+    rows = []
+    for week in range(18):
+        sunday = date(2025, 11, 2) + timedelta(days=7 * week)
+        sunday_open = session_boundary_utc(sunday)
+        friday_close = session_boundary_utc(sunday + timedelta(days=5)) - timedelta(minutes=5)
+        for symbol in symbols:
+            for actual in (sunday_open, friday_close):
+                label = (actual - timedelta(hours=1)).isoformat()
+                high = 10. if symbol == "USDJPY" and actual.date() == date(2026, 1, 9) else 2.
+                rows.append((symbol, "5m", label, 1., high, .5, 1.5, 1., "mt5", None))
+    for nfp in (datetime(2025, 12, 16, 13, 30, tzinfo=timezone.utc),
+                datetime(2026, 1, 9, 13, 30, tzinfo=timezone.utc),
+                datetime(2026, 3, 6, 13, 30, tzinfo=timezone.utc)):
+        rows.append(("USDJPY", "5m", (nfp - timedelta(hours=1)).isoformat(), 1., 20., .5, 1.5, 1., "mt5", None))
+    summer_sunday = date(2026, 7, 5)
+    for symbol in symbols:
+        for actual in (session_boundary_utc(summer_sunday),
+                       session_boundary_utc(summer_sunday + timedelta(days=5)) - timedelta(minutes=5)):
+            rows.append((symbol, "5m", actual.isoformat(), 1., 2., .5, 1.5, 1., "mt5", None))
+    conn.executemany("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     conn.commit()
-    before = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
-    plan = time_repair.build_plan(conn, indicator_pending="keep")
-    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
-    after = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
-    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+    selected = conn.execute("SELECT * FROM ohlcv_history WHERE bar_time>=? AND bar_time<=?",
+        ("2025-11-02T20:00:00+00:00", "2026-03-06T20:55:00+00:00")).fetchall()
+    monkeypatch.setattr(time_repair, "HISTORY_FINGERPRINT", time_repair.HistoryFingerprint(
+        "2025-11-02T20:00:00+00:00", "2026-03-06T20:55:00+00:00",
+        {symbol: sum(row["symbol"] == symbol for row in selected) for symbol in symbols},
+        time_repair._rows_digest(selected, values=False), time_repair._rows_digest(selected, values=True)))
+    absent = [{"name": item.name, "status": "absent_before_cache_window"} for item in time_repair.CACHE_SETS]
+    monkeypatch.setattr(time_repair, "_cache_status", lambda _: absent)
+    monkeypatch.setattr(time_repair, "_cache_changes", lambda _: ([
+        {"name": item.name, "status": "absent_before_cache_window", "delete": 0, "replace": 0}
+        for item in time_repair.CACHE_SETS], []))
+    monkeypatch.setattr(time_repair, "_anchors", lambda _: [{"week": "synthetic", "passed": True}])
+    plan = time_repair.build_plan(conn, indicator_pending="keep", db_path=tmp_path / "synthetic.db")
+    time_repair.apply_plan(conn, tmp_path / "synthetic.db", plan, confirm=plan["plan_hash"], root=tmp_path)
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-02T22:00:00+00:00'").fetchone()[0] == 6
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2025-11-07T21:55:00+00:00'").fetchone()[0] == 6
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-05T21:00:00+00:00'").fetchone()[0] == 6
+    for day in ("2025-12-16", "2026-01-09", "2026-03-06"):
+        assert conn.execute("SELECT max(high-low) FROM ohlcv_history WHERE symbol='USDJPY' AND bar_time=?",
+                            (day + "T13:30:00+00:00",)).fetchone()[0] == 19.5
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE bar_time='2026-07-10T20:55:00+00:00'").fetchone()[0] == 6
+    assert conn.execute("SELECT count(*) FROM ohlcv_cache WHERE source='mt5-live' AND NOT (bar_time LIKE '2026-07-%')").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM ohlcv_history WHERE interval='5m' AND bar_time='2026-01-09T13:30:00+00:00'").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM data_migrations WHERE name=?", (time_repair.REPAIR_ID,)).fetchone()[0] == 1
+    assert time_repair.apply_plan(conn, tmp_path / "synthetic.db", plan,
+                                  confirm=plan["plan_hash"], root=tmp_path) is None
 
 
 def test_apply_leaves_non_mt5_cache_sources_untouched(tmp_path, monkeypatch):
@@ -343,7 +386,7 @@ def test_external_commit_after_data_version_snapshot_is_rejected(tmp_path, monke
         nonlocal changed
         if at == point and not changed:
             other = connect(path)
-            other.execute("UPDATE ohlcv_history SET close=close+0.1 WHERE symbol='EURUSD'")
+            other.execute("INSERT INTO data_migrations(name, applied_at) VALUES ('unrelated_commit', '2026-01-01T00:00:00+00:00')")
             other.commit()
             other.close()
             changed = True
@@ -405,7 +448,11 @@ def test_instance_lock_and_backup_failures_have_exit_one(tmp_path, monkeypatch):
 
 
 def test_postcommit_fault_and_corrupt_marker_fail_closed(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from agentic_fx.store import approvals
     conn, path = _db(tmp_path, monkeypatch)
+    approval_id = approvals.create(conn, "plugin", {"kind": "strategy", "eval_source": "mt5"},
+                                   datetime.now(timezone.utc))
     plan = time_repair.build_plan(conn, indicator_pending="keep")
     def fail(at):
         if at == "after_commit":
@@ -415,6 +462,141 @@ def test_postcommit_fault_and_corrupt_marker_fail_closed(tmp_path, monkeypatch):
     assert error.value.exit_code == 5
     assert conn.execute("SELECT 1 FROM data_migrations WHERE name=?", (time_repair.REPAIR_ID,)).fetchone()
     assert conn.execute("SELECT bar_time FROM ohlcv_history WHERE symbol='EURUSD'").fetchone()[0] == "2026-01-05T13:00:00+00:00"
+    assert conn.execute("SELECT status FROM approval_requests WHERE id=?", (approval_id,)).fetchone()[0] == "invalidated"
+
+
+def test_postcommit_fault_restores_manifest_backup_and_original_fingerprint(tmp_path, monkeypatch):
+    import json
+    import shutil
+    conn, path = _db(tmp_path, monkeypatch)
+    original_rows = [tuple(row) for row in conn.execute(
+        "SELECT * FROM ohlcv_history ORDER BY symbol, interval, bar_time")]
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    def fail(at):
+        if at == "after_commit":
+            raise RuntimeError("committed fault")
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=fail)
+    assert error.value.exit_code == 5
+    manifest = json.loads(path.with_name(path.name + ".time-repair.manifest.json").read_text())
+    assert manifest["committed"] is True
+    assert hashlib.sha256(Path(manifest["path"]).read_bytes()).hexdigest() == manifest["sha256"]
+    conn.close()
+    shutil.copyfile(manifest["path"], path)
+    restored = connect(path)
+    assert [tuple(row) for row in restored.execute(
+        "SELECT * FROM ohlcv_history ORDER BY symbol, interval, bar_time")] == original_rows
+    assert not restored.execute("SELECT 1 FROM data_migrations WHERE name=?",
+                                (time_repair.REPAIR_ID,)).fetchone()
+
+
+def test_pending_strategy_invalidation_updates_backlog_and_archive_rows(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from agentic_fx.store import approvals, backlog, candidate_archives
+    conn, path = _db(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    backlog_id = backlog.add(conn, "repair dependent candidate", "agent", now)
+    archive_id = candidate_archives.insert(conn, mission_id=91, name="candidate",
+        content_hash="content", artifact_hash="artifact", archive_path="plugins/_archive/91/candidate",
+        pair="EURUSD", metrics={}, now=now)
+    candidate_archives.settle(conn, archive_id, "pending", expected_from="not_submitted")
+    payload = {"kind": "strategy", "eval_source": "mt5", "base_interval": "5m",
+               "backlog_id": backlog_id, "mission_id": 91, "name": "candidate",
+               "content_hash": "content", "artifact_hash": "artifact"}
+    approval_id = approvals.create(conn, "plugin", payload, now)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    assert [item["id"] for item in plan["approval_changes"]] == [approval_id]
+    assert plan["approval_changes"][0]["payload_kind"] == "strategy"
+    assert plan["approval_changes"][0]["status"] == "invalidated"
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert conn.execute("SELECT status FROM improvement_backlog WHERE id=?", (backlog_id,)).fetchone()[0] == "observation"
+    assert candidate_archives.get(conn, archive_id)["outcome_class"] == "invalidated"
+
+
+def test_deploy_operations_wait_for_repair_guard(tmp_path, monkeypatch):
+    import threading
+    import time
+    from contextlib import contextmanager
+    from datetime import datetime, timezone
+    from agentic_fx.plugin import switch
+    from agentic_fx.store import approvals
+
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    plugins = tmp_path / "plugins"
+    human = plugins / "_human" / "demo"
+    human.mkdir(parents=True)
+    (human / "plugin.py").write_text("PLUGIN = True\n")
+    (human / "config.yaml").write_text("name: demo\nkind: indicator\n")
+    now = datetime.now(timezone.utc)
+    approval_id = approvals.create(conn, "plugin", {"kind": "indicator", "name": "demo",
+        "candidate_origin": "human", "candidate_path": "plugins/_human/demo"}, now)
+
+    class ReachedGuard(Exception):
+        pass
+
+    original = switch._plugin_locks
+    @contextmanager
+    def entered_locks(*args, **kwargs):
+        with original(*args, **kwargs):
+            raise ReachedGuard()
+            yield
+    monkeypatch.setattr(switch, "_plugin_locks", entered_locks)
+
+    repair_has_guard = threading.Event()
+    release_repair = threading.Event()
+    outcomes = {}
+    def run_repair():
+        repair_conn = connect(path)
+        def pause(point):
+            if point == "after_recalculate":
+                repair_has_guard.set()
+                if not release_repair.wait(5):
+                    raise TimeoutError("repair guard release timed out")
+        try:
+            time_repair.apply_plan(repair_conn, path, plan, confirm=plan["plan_hash"],
+                                   root=tmp_path, hook=pause)
+            outcomes["repair"] = "completed"
+        except BaseException as exc:
+            outcomes["repair"] = exc
+        finally:
+            repair_conn.close()
+    repair_thread = threading.Thread(target=run_repair)
+    repair_thread.start()
+    assert repair_has_guard.wait(3)
+
+    def run_approve():
+        api_conn = connect(path)
+        try:
+            switch.approve_candidate(api_conn, approval_id, decided_by="test", now=now,
+                plugins_root=plugins, settings=None, deadline=time.monotonic() + 5)
+        except BaseException as exc:
+            outcomes["approve"] = exc
+        finally:
+            api_conn.close()
+    def run_bless():
+        api_conn = connect(path)
+        try:
+            switch.bless_candidate(api_conn, name="demo", human_dir=human,
+                                   settings=None, now=now, decided_by="test")
+        except BaseException as exc:
+            outcomes["bless"] = exc
+        finally:
+            api_conn.close()
+    operations = [threading.Thread(target=run_approve), threading.Thread(target=run_bless)]
+    for operation in operations:
+        operation.start()
+    time.sleep(.15)
+    assert all(operation.is_alive() for operation in operations)
+    release_repair.set()
+    repair_thread.join(5)
+    for operation in operations:
+        operation.join(5)
+    assert not repair_thread.is_alive()
+    assert all(not operation.is_alive() for operation in operations)
+    assert isinstance(outcomes["approve"], ReachedGuard)
+    assert isinstance(outcomes["bless"], ReachedGuard)
+    assert outcomes["repair"] == "completed"
 
 
 @pytest.mark.parametrize("indicator_mode", ["keep", "invalidate"])
