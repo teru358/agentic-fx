@@ -190,18 +190,14 @@ def test_prompt_friday_elapsed_deadline_does_not_show_saturday(tmp_path):
     assert "翌日" not in prompt
 
 
-def test_run_once_mission_tools_include_get_signals(tmp_path):
-    """⑧プラン 7 Task 9: _TRADE_TOOLS への get_signals 追加が実際に
-    Mission.tools まで届くことのピン (registry 登録だけでは Mission から
-    使えない — codex R3 I3)。"""
+def test_cron_mission_tools_exclude_signal_reads(tmp_path):
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"action": "hold", "reasoning": "w"}, [])])
     loop.run_once()
-    assert "get_signals" in runner.missions[0].tools
+    assert "get_signals" not in runner.missions[0].tools
 
 
-def test_ask_once_mission_tools_include_get_signals(tmp_path):
-    """⑧ask Mission にも get_signals が露出する (brief どおり意図的)。"""
+def test_ask_mission_uses_its_signal_aware_tool_list(tmp_path):
     conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
         "completed", {"answer": "test"}, [])])
     loop.ask_once("今どう見てる？")

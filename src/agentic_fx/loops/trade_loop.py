@@ -34,6 +34,10 @@ from agentic_fx.datafeed.econ_calendar import EconCalendar
 from agentic_fx.datafeed.health import DataUnhealthy
 from agentic_fx.datafeed.price_provider import PriceProvider
 from agentic_fx.loops.mission_finalize import finalize_mission
+from agentic_fx.loops.signal_decision_contract import (
+    Accept, Invalid, Reject, DECISION_SCHEMA, SIGNAL_DECISION_TOOLS,
+    parse_decision, verify_opposite_position,
+)
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.prompts_loader import load_prompt
 from agentic_fx.loops.summary import (
@@ -42,6 +46,8 @@ from agentic_fx.loops.summary import (
 from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
+from agentic_fx.store import signal_decisions
+from agentic_fx.store.signal_shadow import spread_from_quote
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import mission_decision_bars, missions, signals
 from agentic_fx.plugin import switch
@@ -54,13 +60,24 @@ import logging
 
 _log = logging.getLogger("agentic_fx.trade_loop")
 
-_TRADE_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
-                "get_econ_calendar", "get_positions", "get_account",
-                "get_recent_reflections", "search_reflections",
-                "get_signals"]
+_CRON_TOOLS = ["get_ohlcv", "get_indicators", "search_news",
+               "get_econ_calendar", "get_positions", "get_account",
+               "get_recent_reflections", "search_reflections"]
+_ASK_TOOLS = [*_CRON_TOOLS, "get_signals"]
+# Full registry-facing set retained for service validation; missions use the
+# explicit cron, ask, or signal list above.
+_TRADE_TOOLS = _ASK_TOOLS
 
-# 最古の pending signal を 1 件 claim する trigger (判断足の cron と signal 起動)。
-_CLAIMING_TRIGGERS = frozenset({"cron", "signal"})
+# 最古の pending signal を 1 件 claim する trigger。
+_CLAIMING_TRIGGERS = frozenset({"signal"})
+_SIGNAL_DECISION_INSTRUCTIONS = (
+    "\n\n## Signal 採否\n"
+    "この専用 Mission では signal を採用するか拒否するかだけを判断します。"
+    "発注内容・方向・価格・SL/TP は signal の固定 payload が正本です。"
+    "それらを変更せず、JSON の decision を accept または reject にし、"
+    "reject の場合だけ reject_code を news_shock / opposite_position の"
+    "どちらかにしてください。ほかの操作や理由コードは返しません。\n"
+)
 
 
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
@@ -183,6 +200,9 @@ class TradeLoop:
             self.activity.write(Category.SYSTEM, "data_unhealthy", str(e))
             self.notifier.send(f"[agentic-fx] データ不健全のため判断をスキップ: {e}")
             return None
+
+        if trigger == "signal":
+            return self._run_signal_mission(signal_max_id)
 
         # レビュー 1 周目 codex A2/A3: 以下の try/finally は
         # `with self._core_lock:` (prepare) の**中**まで含めてメソッド全体を
@@ -591,6 +611,197 @@ class TradeLoop:
                     finalize_mission(self.conn, self.activity, self.clock,
                                      mid, MissionResult("failed", None, []))
 
+    def _run_signal_mission(self, signal_max_id: int | None) -> dict | None:
+        """専用 signal 採否経路。採否 transaction が確定するまで発注しない。"""
+        now = self.clock.now()
+        mid: int | None = None
+        claimed: dict | None = None
+        finalized = False
+        consumed = False
+        result = MissionResult("failed", None, [])
+        try:
+            with self._core_lock:
+                mid = missions.start(
+                    self.conn, "trade", self.settings.runner.trade.backend,
+                    self.settings.runner.trade.model, now, trigger="signal")
+                kwargs = {"mission_id": mid, "now": now,
+                          "freshness_bars": self.settings.plugin.signal_freshness_bars}
+                if signal_max_id is not None:
+                    kwargs["max_id"] = signal_max_id
+                claimed = signals.claim_oldest(self.conn, **kwargs)
+                if claimed is None:
+                    missions.finish(self.conn, mid, "skipped", None, [], now)
+                    finalized = True
+                    return None
+                missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
+                prompt = (self._build_prompt(load_prompt("trade_mission"), now)
+                          + _SIGNAL_DECISION_INSTRUCTIONS
+                          + self._format_signal_injection(claimed, "signal"))
+                mission = Mission(
+                    prompt=prompt, tools=list(SIGNAL_DECISION_TOOLS),
+                    output_schema=DECISION_SCHEMA,
+                    max_turns=self.settings.llama_swap.max_turns,
+                    timeout_sec=self.settings.llama_swap.timeout_sec)
+
+            self.watch.begin(mid, "trade", mission.timeout_sec)
+            try:
+                run_result = self.runner.run(mission)
+                result = (run_result if isinstance(run_result, MissionResult)
+                          else MissionResult("failed", None, []))
+            except Exception:  # noqa: BLE001
+                _log.exception("signal decision runner raised")
+            finally:
+                self.watch.end(mid)
+
+            if result.status != "completed":
+                with self._core_lock:
+                    finalize_mission(self.conn, self.activity, self.clock, mid, result)
+                finalized = True
+                return None
+
+            parsed = parse_decision(result.output if isinstance(result.output, dict)
+                                    else "")
+            if isinstance(parsed, Invalid):
+                failed = MissionResult("failed", {"detail": parsed.detail},
+                                       result.transcript)
+                with self._core_lock:
+                    finalize_mission(self.conn, self.activity, self.clock, mid, failed)
+                finalized = True
+                return None
+
+            signal_id = int(claimed["id"])
+
+            payload = json.loads(claimed["payload_json"])
+            if not isinstance(payload, dict) or claimed.get("contract_version") != "executable_v1":
+                raise ValueError("claimed signal is not executable_v1")
+            executable = {**payload, "action": "open", "origin": Origin.SCHEDULER.value}
+            intent = TradeIntent.from_llm_dict(executable, origin=Origin.SCHEDULER)
+            if (intent.action is not Action.OPEN or intent.pair != claimed["pair"]
+                    or intent.origin is not Origin.SCHEDULER
+                    or missions.loop_of(self.conn, mid) != "trade"):
+                raise ValueError("signal intent failed origin/loop validation")
+
+            reject_code = parsed.code if isinstance(parsed, Reject) else None
+            if reject_code == "opposite_position":
+                from agentic_fx.store import orders as orders_store
+                active_orders = orders_store.list_by_status(
+                    self._conn_supervisor, S.OPEN, S.PENDING_FILL,
+                    S.PROTECTION_PENDING)
+                if not verify_opposite_position(
+                        parsed, active_orders, pair=claimed["pair"],
+                        direction=claimed.get("direction")):
+                    failed = MissionResult("failed", {"detail": "invalid_reject_code"},
+                                           result.transcript)
+                    with self._core_lock:
+                        finalize_mission(self.conn, self.activity, self.clock,
+                                         mid, failed)
+                    finalized = True
+                    return None
+
+            spec = self.executor.spec_fn(intent.pair)
+            pair_rule = self.settings.risk.pair_rules.get(intent.pair)
+            assumed_spread = pair_rule.assumed_spread_pips if pair_rule else 0.0
+            spread = spread_from_quote(None, None, pip_size=spec.pip_size,
+                                       assumed_spread_pips=assumed_spread)
+            output = result.output if isinstance(result.output, dict) else None
+            snapshot = None
+            if isinstance(parsed, Accept):
+                exposure_pairs = self._read_exposure_pairs()
+                snapshot = self.executor.gather_open_snapshot(
+                    intent, exposure_pairs=exposure_pairs)
+                if self.executor.state_fn() != "ready":
+                    return None
+            from agentic_fx.core.executor import _intent_payload
+            intent_payload = _intent_payload(intent)
+            with contextlib.ExitStack() as locks, self._core_lock:
+                resolved = self._resolved_by_identity.get(
+                    (claimed["plugin"], claimed["content_hash"]))
+                if self._plugins_root is not None:
+                    source_names = {claimed["plugin"]}
+                    if resolved is not None:
+                        source_names.update(item.plugin_name
+                                            for item in resolved.items)
+                    locks.enter_context(acquire_name_locks(
+                        self._plugins_root, source_names,
+                        deadline=monotonic()
+                        + self.settings.worker.plugin_lock_timeout_sec))
+                gate_now = self.clock.now()
+                _, fresh_until = signals.freshness_window(
+                    claimed["timeframe"], claimed["bar_ts"],
+                    self.settings.plugin.signal_freshness_bars)
+                if gate_now > datetime.fromisoformat(fresh_until):
+                    signals.abandon_claimed(
+                        self.conn, signal_id, now=gate_now,
+                        reason=signals.freshness_abandon_reason(claimed))
+                    missions.finish(self.conn, mid, "failed", None, [], gate_now)
+                    consumed = finalized = True
+                    return None
+                if self.executor.state_fn() != "ready":
+                    return None
+                if snapshot is not None:
+                    snapshot_reason = snapshot_age_exceeded(
+                        snapshot, gate_now,
+                        self.settings.worker.snapshot_max_age_sec)
+                    if snapshot_reason is not None:
+                        return None
+                if (self._plugins_root is not None
+                        and not signal_source_active(
+                            self.conn, self._plugins_root, claimed["plugin"],
+                            claimed["content_hash"], resolved)):
+                    signals.abandon_claimed(
+                        self.conn, signal_id, now=gate_now,
+                        reason="source_inactive")
+                    missions.finish(self.conn, mid, "failed", None, [], gate_now)
+                    consumed = finalized = True
+                    return None
+                if isinstance(parsed, Accept):
+                    if self.econ.window_view(intent.pair, gate_now).in_window:
+                        committed = signal_decisions.commit_reject(
+                            self.conn, mission_id=mid, signal_id=signal_id,
+                            actor=signal_decisions.ACTOR_SYSTEM,
+                            reject_code=signal_decisions.SYSTEM_REJECT_CODE,
+                            spread=spread, output=output,
+                            transcript=result.transcript, now=gate_now)
+                        consumed = finalized = True
+                        return {"result": "rejected", "order_id": None,
+                                "reasons": ["econ_window"]}
+                    committed = signal_decisions.commit_accept(
+                        self.conn, mission_id=mid, signal_id=signal_id,
+                        intent_payload=intent_payload, spread=spread,
+                        output=output, transcript=result.transcript,
+                        now=gate_now)
+                else:
+                    committed = signal_decisions.commit_reject(
+                        self.conn, mission_id=mid, signal_id=signal_id,
+                        actor=signal_decisions.ACTOR_LLM, reject_code=reject_code,
+                        spread=spread, output=output, transcript=result.transcript,
+                        now=gate_now)
+            if isinstance(parsed, Accept):
+                consumed = finalized = True
+                out = self.executor.open_from_snapshot(
+                    intent, committed.trade_intent_id, snapshot,
+                    max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
+                return out
+            consumed = finalized = True
+            return {"result": "rejected", "order_id": None,
+                    "reasons": [reject_code]}
+        except Exception:  # noqa: BLE001
+            _log.exception("signal decision flow failed")
+            return None
+        finally:
+            if claimed is not None and not consumed:
+                with self._core_lock:
+                    message = self._requeue_signal(claimed)
+                if message:
+                    try:
+                        self.notifier.send(message)
+                    except Exception:  # noqa: BLE001
+                        _log.exception("signal requeue notification failed")
+            if mid is not None and not finalized:
+                with self._core_lock:
+                    finalize_mission(self.conn, self.activity, self.clock, mid,
+                                     MissionResult("failed", None, []))
+
     def _start_cron_mission(self, now, decision_bars) -> int:
         """missions 行と mission_decision_bars 行を 1 transaction で確定する
         (core_lock 保持中に呼ぶ)。例外時は両方を rollback して再送出する —
@@ -657,7 +868,7 @@ class TradeLoop:
 
     def _build_mission(self, prompt: str) -> Mission:
         return Mission(
-            prompt=prompt, tools=_TRADE_TOOLS,
+            prompt=prompt, tools=_CRON_TOOLS,
             output_schema=trade_intent_schema(self.settings.pairs),
             max_turns=self.settings.llama_swap.max_turns,
             timeout_sec=self.settings.llama_swap.timeout_sec)
@@ -766,7 +977,7 @@ class TradeLoop:
                 prompt = self._build_prompt(load_prompt("ask_mission"), now) \
                     + f"\n\n## ユーザーの質問\n{question}"
                 mission = Mission(
-                    prompt=prompt, tools=_TRADE_TOOLS,
+                    prompt=prompt, tools=_ASK_TOOLS,
                     output_schema=ANSWER_SCHEMA,
                     max_turns=self.settings.llama_swap.max_turns,
                     timeout_sec=self.settings.llama_swap.timeout_sec)
