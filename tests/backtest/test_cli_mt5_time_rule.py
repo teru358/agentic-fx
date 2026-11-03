@@ -50,6 +50,8 @@ def test_history_import_stops_with_rc1_and_no_rows_when_the_bridge_refuses(
     captured = capsys.readouterr()
     assert rc == 1
     assert word in captured.err
+    assert "0 行" in captured.err
+    assert "--from" in captured.err
     assert "inserted=" not in captured.out
     store.assert_not_called()
 
@@ -72,6 +74,24 @@ def test_history_import_leaves_zero_rows_when_a_later_window_is_refused(tmp_path
                    "--from", "2026-11-04", "--to", "2026-11-06"])
 
     assert rc == 1
-    assert "time_rule_unverified" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "time_rule_unverified" in err
+    assert "0 行" in err
+    assert "--from" in err
     conn = connect(tmp_path / "data" / "agentic.db")
     assert conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0] == 0
+
+
+def test_history_import_refuses_an_oversized_period_with_rc2_and_no_request(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    _install_settings(tmp_path)
+    monkeypatch.setattr(mt5_import, "MAX_IMPORT_ROWS", 100)
+    with patch("agentic_fx.backtest.cli.ensure_initialized"), \
+         patch.object(mt5_import.httpx, "get") as get:
+        rc = main(["history", "import", "--source", "mt5", "--symbol", "USDJPY",
+                   "--from", "2026-11-04", "--to", "2026-11-05"])
+
+    assert rc == 2
+    assert "期間を分けて" in capsys.readouterr().err
+    get.assert_not_called()

@@ -978,3 +978,24 @@ def test_import_mt5_does_not_hold_the_write_lock_while_fetching(tmp_path):
                         base_url="http://x", fetch=fetch)
     assert len(seen) == 3
     assert result.inserted == 3
+
+
+def test_import_mt5_refuses_a_period_too_large_before_fetching(tmp_path, monkeypatch):
+    monkeypatch.setattr(mt5_import, "MAX_IMPORT_ROWS", 100)
+    conn = _conn(tmp_path)
+    calls = []
+
+    with pytest.raises(mt5_import.ImportTooLargeError, match="期間を分けて"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=101),
+                   base_url="http://x", fetch=lambda url: calls.append(url))
+
+    assert calls == []
+    assert ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5") == []
+
+
+def test_import_mt5_accepts_a_period_exactly_at_the_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(mt5_import, "MAX_IMPORT_ROWS", 100)
+    conn = _conn(tmp_path)
+    r = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=100), base_url="http://x",
+                   fetch=lambda url: {"symbol": "USDJPY", "interval": "1m", "bars": []})
+    assert r.inserted == 0

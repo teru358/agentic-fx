@@ -264,15 +264,16 @@ def test_mismatch_degrades_in_one_tick_and_a_flat_account_recovers_by_itself(
                         frozen_tick=_at(2026, 11, 3, 23, 0), bars_from=_at(2026, 11, 4, 11, 0)),
         cache_until=_at(2026, 11, 4, 11, 58))
 
-    first = rig.tick(_at(2026, 11, 4, 12, 0, second=30))
+    assert rig.tick(_at(2026, 11, 4, 12, 0, second=30)) == "ready"   # 初回の食い違いは未確認 (300 秒までは待つ)
+    second = rig.tick(_at(2026, 11, 4, 12, 1, second=30))               # tick が動いて確定
 
-    assert first == "degraded"
+    assert second == "degraded"
     assert rig.ingest.last_errors[KEY] == FIXED_MISMATCH_TEXT
-    assert dict(rig.reports[0].failed)[KEY] == FIXED_MISMATCH_TEXT
+    assert dict(rig.reports[-1].failed)[KEY] == FIXED_MISMATCH_TEXT
     assert rig.events("datafeed_degraded") == ["datafeed_degraded"]
 
     rig.mt5.offset = 7200                                              # broker の時計が規則に戻る
-    states = [rig.tick(_at(2026, 11, 4, 12, minute, second=30)) for minute in range(1, 10)]
+    states = [rig.tick(_at(2026, 11, 4, 12, minute, second=30)) for minute in range(2, 11)]
 
     assert states[-1] == "ready"
     assert rig.events("datafeed_degraded") == ["datafeed_degraded"]

@@ -150,6 +150,8 @@ def test_first_bar_after_the_switch_is_labelled_by_the_new_rule_without_waiting(
 
 def _mismatching_client():
     client = _client(_at(2026, 7, 28, 12, 0), 7200)     # 規則は夏 = 10800
+    client.get_server_time()                            # 初回の観測は食い違いでも採らない
+    client.clock.advance(seconds=60)
     with pytest.raises(TimeRuleUnavailableError, match="time_rule_mismatch"):
         client.get_quote("USDJPY")
     return client
@@ -167,9 +169,9 @@ def test_mismatch_blocks_market_data_and_reports_the_evidence():
     assert info["time_rule_state"] == "mismatch"
     assert info["server_offset_sec"] == 10800
     assert info["offset_source"] == "rule"
-    assert info["measured_at"] == "2026-07-28T12:00:00+00:00"
+    assert info["measured_at"] == "2026-07-28T12:01:00+00:00"
     assert info["measured_age_sec"] == 0
-    assert client.time_rule_status() == ("mismatch", "2026-07-28T12:00:00+00:00")
+    assert client.time_rule_status() == ("mismatch", "2026-07-28T12:01:00+00:00")
     assert client.get_positions() == []          # 口座・建玉の endpoint は止めない
 
 
@@ -494,6 +496,8 @@ def test_positions_and_deal_requests_log_a_state_change_without_blocking(caplog)
     client._mt5.history_deals_get = lambda position: []
 
     assert client.get_positions() == []
+    client.clock.advance(seconds=60)
+    assert client.get_positions() == []
     assert _state_lines(caplog) == ["MT5 time rule state: mismatch"]
 
     client._mt5.offset = 10800
@@ -542,6 +546,37 @@ def test_new_tick_one_hour_off_the_rule_still_latches_a_mismatch():
     client._mt5.offset = 7200
     client.clock.advance(seconds=60)
     assert client.get_server_time()["time_rule_state"] == "mismatch"
+
+
+def test_first_observation_one_hour_off_the_rule_is_not_accepted_as_a_mismatch():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200  # 1 時間古い凍結 tick
+    for _ in range(3):
+        client.clock.advance(seconds=60)
+        info = client.get_server_time()
+    assert info["time_rule_state"] == "unverified"
+    assert info["measured_offset_sec"] is None
+    assert info["measured_at"] is None
+
+
+def test_frozen_first_tick_then_moving_tick_on_the_rule_becomes_ok():
+    client = _client(_at(2026, 7, 28, 12, 0), 10800)
+    client._mt5.frozen["USDJPY"] = int(client.clock.now.timestamp()) + 7200
+    client.get_server_time()
+    del client._mt5.frozen["USDJPY"]
+    client.clock.advance(seconds=60)
+    info = client.get_server_time()
+    assert info["time_rule_state"] == "ok"
+    assert info["measured_offset_sec"] == 10800
+
+
+def test_moving_ticks_one_hour_off_the_rule_latch_a_mismatch_on_the_second_observation():
+    client = _client(_at(2026, 7, 28, 12, 0), 7200)          # 規則は 10800
+    assert client.get_server_time()["time_rule_state"] == "unverified"
+    client.clock.advance(seconds=60)
+    info = client.get_server_time()
+    assert info["time_rule_state"] == "mismatch"
+    assert info["measured_offset_sec"] == 7200
 
 
 def test_closed_market_range_request_is_refused_before_fetching():

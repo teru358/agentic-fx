@@ -30,7 +30,7 @@ from agentic_fx.backtest.holdout import (
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
+    ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest import plugin_deploy_cli
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
@@ -278,13 +278,19 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
                   f"unchanged={exc.partial.unchanged} "
                   f"conflicted={exc.partial.conflicted}", file=sys.stderr)
             return 3
+        except ImportTooLargeError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 2
         except BridgeTimeRuleMismatch:
             print("bridge の時刻規則が broker の時計と一致しません (time_rule_mismatch)。"
-                  "取り込みを中止しました", file=sys.stderr)
+                  "取り込みを中止しました。何も書き込んでいません (0 行)。"
+                  "元の --from から取り直してください", file=sys.stderr)
             return 1
         except BridgeTimeUnverified:
             print("bridge の時刻規則を検査できていません (time_rule_unverified)。"
-                  "開場中にもう一度実行してください。取り込みを中止しました", file=sys.stderr)
+                  "開場中にもう一度実行してください。取り込みを中止しました。"
+                  "何も書き込んでいません (0 行)。元の --from から取り直してください",
+                  file=sys.stderr)
             return 1
     print(f"inserted={result.inserted} unchanged={result.unchanged} "
          f"conflicted={result.conflicted}")

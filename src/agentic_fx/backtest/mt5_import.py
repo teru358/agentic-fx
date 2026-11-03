@@ -35,6 +35,21 @@ class ImportConflictError(ValueError):
         super().__init__(message or f"MT5 import conflicts: {len(conflicts)} row(s)")
 
 
+# 1 回の取り込みでメモリに溜める行数の上限。全窓を取得・検証してから 1 回で書くため、
+# 行はすべて書込み前に保持される。1 行 (9 要素の tuple、float 5 個、ISO 文字列) は
+# 約 0.4 KB なので、100 万行で約 0.4 GB。1m の 1 年分 (約 37 万行) の 2.7 倍にあたる。
+MAX_IMPORT_ROWS = 1_000_000
+
+
+class ImportTooLargeError(ValueError):
+    """The requested import would hold more rows than MAX_IMPORT_ROWS."""
+
+
+def _too_large_message(start: datetime, end: datetime, detail: str) -> str:
+    return (f"import_mt5: {detail} (上限 {MAX_IMPORT_ROWS} 行)。何も書き込んでいません。"
+            f"期間を分けて取り込んでください (開始 {start.isoformat()})")
+
+
 def _default_fetch(url: str) -> dict:
     """既定 fetch。httpx.get + `X-Bridge-Api-Key` ヘッダ + `raise_for_status`。
 
@@ -231,6 +246,12 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
 
     if fetch is None:
         fetch = _default_fetch
+
+    # 窓ごとの行数は窓の格子数を超えられない (検証済み) ので、期間の格子数で保持行数の上限が決まる。
+    slots = int((end - start).total_seconds()) // width_sec
+    if slots > MAX_IMPORT_ROWS:
+        raise ImportTooLargeError(_too_large_message(
+            start, end, f"期間が最大 {slots} 本分で多すぎます"))
 
     total_inserted = 0
     total_unchanged = 0
