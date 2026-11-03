@@ -172,7 +172,7 @@ def _anchors(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 if volume is not None and all(x is not None for x in prior) and volume >= 2 * (sum(prior) / 6):
                     hits.append(current.isoformat())
         eur = conn.execute("SELECT count(*) FROM ohlcv_history WHERE source='mt5' AND symbol='EURUSD' "
-                           "AND interval='5m' AND bar_time>=? AND bar_time<=?",
+                           "AND interval='5m' AND bar_time>=? AND bar_time<?",
                            (f"{sunday.isoformat()}T21:00:00+00:00", f"{monday.isoformat()}T13:30:00+00:00")).fetchone()[0]
         ok = len(cash_hits) >= 3 and not wrong_hits and eur == 198
         reasons = []
@@ -204,10 +204,12 @@ _BRIDGE_WINDOWS = (
 
 def _bridge_check(conn: sqlite3.Connection, bridge_url: str, fetch=None) -> dict[str, Any]:
     import httpx
+    from agentic_fx.datafeed.sources import _mt5_headers
     def get(path: str, params=None):
         if fetch is not None:
             return fetch(path, params or {})
-        response = httpx.get(bridge_url.rstrip("/") + path, params=params, timeout=30)
+        response = httpx.get(bridge_url.rstrip("/") + path, params=params,
+                             headers=_mt5_headers(), timeout=30)
         response.raise_for_status()
         return response.json()
     def server_time():
@@ -233,7 +235,9 @@ def _bridge_check(conn: sqlite3.Connection, bridge_url: str, fetch=None) -> dict
                 payload = get(f"/ohlcv/{symbol}", {"from": start, "to": end, "interval": "5m"})
             except Exception as exc:
                 raise RepairError(f"bridge OHLCV request failed: {exc}", 1) from exc
-            remote = payload.get("bars", [])
+            # bridge の /ohlcv は to を含めて返すので、窓の右端ちょうどの足は外す。
+            remote = [bar for bar in payload.get("bars", [])
+                      if datetime.fromisoformat(bar["time"]) < actual_end]
             for bar in remote:
                 stamp = datetime.fromisoformat(bar["time"])
                 if stamp.tzinfo is None or stamp.utcoffset() is None:
