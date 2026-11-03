@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agentic_fx.runners.base import Mission, MissionResult
-from agentic_fx.store import missions, orders, signals
+from agentic_fx.store import missions, orders, signals, signal_decisions
 from tests.loops.test_trade_loop import NOW, QUOTE, SETTINGS, _loop
+from tests.loops.test_trade_loop_signal import _add_signal
 
 
 class _RecordingNotifier:
@@ -201,16 +202,11 @@ def test_signal_prepare_exception_after_claim_requeues_signal(tmp_path):
     running のまま残らないことを確認する (以前は try/finally が prepare の
     外側にしか無く、この区間の例外は回収されなかった)。"""
     conn, loop, runner, tp = _loop(tmp_path, [])
-    sid = signals.add(
-        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW, contract_version="executable_v1")
+    sid = _add_signal(conn)
 
     with patch("agentic_fx.loops.trade_loop.missions.set_trigger",
               side_effect=RuntimeError("set_trigger_boom")):
-        with pytest.raises(RuntimeError):
-            loop._run_once_impl("signal")
+        loop.run_once("signal")
 
     row = conn.execute(
         "SELECT status, requeue_count FROM signals WHERE id=?",
@@ -402,95 +398,27 @@ def test_ask_prepare_phase_holds_core_lock(tmp_path):
         assert not t.is_alive()
 
 
-def test_signals_consume_failure_is_caught_and_recorded(tmp_path):
-    """レビュー 2 周目 codex D3: `signals.consume` (fail-closed — CAS
-    不一致で ValueError) が commit-core の `try:` の**外**にあると、
-    例外が `with self._core_lock, defer_notifications():` ブロックを
-    丸ごと素通りし、`record_and_validate_intent` すら呼ばれないまま
-    completed した有効な intent が DB に痕跡を残さず捨てられていた。
-    consume より先に intent を記録した後は、CAS 失敗を記録済みの signal
-    gate 拒否として確定し、執行せず signal を requeue することを確認する。"""
-    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
-        "completed", {"action": "hold", "reasoning": "x"}, [])])
-    sid = signals.add(
-        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW, contract_version="executable_v1")
+def test_accept_commit_failure_requeues_without_partial_decision(tmp_path):
+    """採否 transaction が失敗した場合、再試行可能な claim に戻す。"""
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    sid = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: type(
+        "Snapshot", (), {"captured_at": NOW})()
+    with patch.object(signal_decisions, "commit_accept",
+                      side_effect=RuntimeError("decision write failed")), \
+         patch.object(loop.executor, "open_from_snapshot") as open_:
+        loop.run_once("signal")
 
-    with patch.object(loop.executor, "open_from_snapshot",
-                      wraps=loop.executor.open_from_snapshot) as open_, \
-         patch.object(loop.executor, "close_from_snapshot",
-                      wraps=loop.executor.close_from_snapshot) as close_, \
-         patch("agentic_fx.loops.trade_loop.signals.consume",
-               side_effect=ValueError("signal not claimed by mission")):
-        out = loop.run_once("signal")
-
-    reason = ("signal not claimed by this mission: "
-              "ValueError: signal not claimed by mission")
-    assert out == {"result": "rejected", "order_id": None,
-                   "reasons": [reason]}
-    intent_row = conn.execute(
-        "SELECT gate_result, reject_reason, reject_category "
-        "FROM trade_intents ORDER BY id DESC LIMIT 1").fetchone()
-    assert intent_row is not None, "consume 失敗前に intent が記録されていない"
-    assert dict(intent_row) == {
-        "gate_result": "rejected",
-        "reject_reason": reason,
-        "reject_category": "signal",
-    }
-    act_text = (tp / "a.log").read_text(encoding="utf-8")
-    assert "gate_rejected" in act_text
-    assert reason in act_text
-    assert "intent_execution_failed" not in act_text
-    open_.assert_not_called()
-    close_.assert_not_called()
     row = conn.execute(
-        "SELECT status, requeue_count FROM signals WHERE id=?",
-        (sid,)).fetchone()
-    assert row["status"] == "pending", "claimed signal が回収されていない"
-    assert row["requeue_count"] == 1
-    m = conn.execute(
-        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
-    # 注: _finalize_mission は runner の MissionResult.status (ここでは
-    # FakeRunner が返した "completed") で finalize する — 失敗したのは
-    # 「completed した Mission の intent 執行」であって Mission 自体の
-    # 判断ではないため、mission 行は "completed" になる。ここでの主張は
-    # 「running のまま残らない」こと。
-    assert m["status"] != "running", "mission が running のまま残っている"
-    assert m["status"] == "completed"
-
-
-def test_signals_consume_operational_error_uses_outer_failure_path(tmp_path):
-    """非 ValueError の consume 障害は signal 拒否へ変換せず外側で扱う。"""
-    import sqlite3
-
-    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
-        "completed", {"action": "hold", "reasoning": "x"}, [])])
-    sid = signals.add(
-        conn, plugin="sig1", content_hash="h1", pair="USDJPY",
-        timeframe="1h", bar_ts=NOW.isoformat(), kind="strategy",
-        payload={"direction": "long", "strength": 0.7, "rationale": "up"},
-        now=NOW, contract_version="executable_v1")
-
-    with patch("agentic_fx.loops.trade_loop.signals.consume",
-               side_effect=sqlite3.OperationalError("database is locked")):
-        out = loop.run_once("signal")
-
-    assert out is None
-    intent_row = conn.execute(
-        "SELECT gate_result, reject_category FROM trade_intents "
-        "ORDER BY id DESC LIMIT 1").fetchone()
-    assert intent_row is not None
-    assert dict(intent_row) == {"gate_result": None, "reject_category": None}
-    act_text = (tp / "a.log").read_text(encoding="utf-8")
-    assert "intent_execution_failed" in act_text
-    signal_row = conn.execute(
-        "SELECT status, requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
-    assert dict(signal_row) == {"status": "pending", "requeue_count": 1}
-    mission = conn.execute(
-        "SELECT status FROM missions ORDER BY id DESC LIMIT 1").fetchone()
-    assert mission["status"] != "running"
+        "SELECT status,requeue_count FROM signals WHERE id=?", (sid,)).fetchone()
+    assert tuple(row) == ("pending", 1)
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
+    assert conn.execute("SELECT status FROM missions").fetchone()[0] == "failed"
+    open_.assert_not_called()
 
 
 # ---- `_finalize_mission` の lock 保持 (指揮者の変異スイープ・レビュー 3 周目)

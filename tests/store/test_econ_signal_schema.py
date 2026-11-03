@@ -668,11 +668,9 @@ def test_every_new_abandoned_row_has_reason_and_time(tmp_path):
         "SELECT COUNT(*) FROM signals WHERE status='abandoned'").fetchone()[0] == 2
 
 
-# --- trade loop の呼出側 3 箇所 ---------------------------------------------
+# --- 専用採否 loop の claim 終端 ---------------------------------------------
 
-_OPEN = {"action": "open", "pair": "USDJPY", "direction": "long",
-         "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-         "take_profit": 149.0, "reasoning": "x"}
+_ACCEPT = {"decision": "accept", "reject_code": None}
 
 
 def _loop_world(tmp_path, results):
@@ -680,9 +678,18 @@ def _loop_world(tmp_path, results):
     conn, loop, runner, _ = _loop(tmp_path, results)
     sid = signals.add(
         conn, plugin="strategy", content_hash="a" * 64, pair="USDJPY",
-        timeframe="1h", bar_ts=LOOP_NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, contract_version="executable_v1",
+        timeframe="1h", bar_ts=(LOOP_NOW - timedelta(hours=1)).isoformat(),
+        kind="strategy", payload={"action": "open", "pair": "USDJPY",
+        "direction": "long", "entry_type": "market", "horizon": "day",
+        "stop_loss": 147.0, "take_profit": 150.0},
+        contract_version="executable_v1",
         now=LOOP_NOW)
+    from types import SimpleNamespace
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda *args, **kwargs: SimpleNamespace(
+        captured_at=LOOP_NOW)
+    loop.executor.open_from_snapshot = lambda *args, **kwargs: {
+        "result": "submitted", "order_id": None, "reasons": []}
     return conn, loop, runner, sid, LOOP_NOW
 
 
@@ -695,7 +702,7 @@ def _jump(loop, when):
 def test_trade_loop_source_inactive_abandons_with_source_inactive(
         tmp_path, monkeypatch):
     conn, loop, _, sid, loop_now = _loop_world(
-        tmp_path, [MissionResult("completed", _OPEN, [])])
+        tmp_path, [MissionResult("completed", _ACCEPT, [])])
     loop._plugins_root = tmp_path / "plugins"
     monkeypatch.setattr(
         "agentic_fx.loops.trade_loop.signal_source_active", lambda *_a: False)
@@ -720,7 +727,7 @@ def test_trade_loop_commit_core_stale_abandons_with_freshness_reason(
     class AdvancingRunner:
         def run(self, _mission):
             _jump(loop, late)
-            return MissionResult("completed", _OPEN, [])
+            return MissionResult("completed", _ACCEPT, [])
 
     loop.runner = AdvancingRunner()
     loop.run_once("signal")
@@ -1658,7 +1665,7 @@ def test_every_source_caller_of_requeue_and_abandon_passes_now():
                 assert not (isinstance(kw["now"], ast.Call)
                             and ast.unparse(kw["now"]).startswith(
                                 "datetime.utcnow")), (path.name, node.lineno)
-    assert found.count("trade_loop.py") == 4
+    assert found.count("trade_loop.py") == 6
 
 
 @pytest.mark.parametrize("abandon_if_stale", [False, True])

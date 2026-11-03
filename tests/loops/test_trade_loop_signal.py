@@ -1,6 +1,7 @@
 """専用 signal mission の claim・採否 transaction・実行境界。"""
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,8 @@ from unittest.mock import patch
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.store import signals
+from agentic_fx.core import transitions
+from agentic_fx.ops.trade_event_sink import TradeEventEmitter, TradeEventSink
 
 from tests.loops.test_trade_loop import NOW, SETTINGS, _loop
 
@@ -20,7 +23,7 @@ def _add_signal(conn, *, plugin="sig1", pair="USDJPY", timeframe="1h",
         pair=pair, timeframe=timeframe, bar_ts=bar_ts.isoformat(), kind="strategy",
         payload={"action": "open", "pair": pair, "direction": direction,
                  "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
-                 "take_profit": 150.0, "confidence": 0.5,
+                 "take_profit": 151.5, "confidence": 0.5,
                  "reasoning": "strategy payload"},
         now=bar_ts, contract_version="executable_v1")
 
@@ -84,6 +87,30 @@ def test_signal_accept_commits_fixed_payload_before_executor(tmp_path):
     assert _status(conn, signal_id)["status"] == "consumed"
 
 
+def test_snapshot_aging_after_accept_commit_does_not_reopen_claim(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    real_open = loop.executor.open_from_snapshot
+
+    def age_snapshot(intent, iid, snapshot, **kwargs):
+        loop.executor.clock = FixedClock(NOW + timedelta(seconds=31))
+        return real_open(intent, iid, snapshot, **kwargs)
+
+    loop.executor.open_from_snapshot = age_snapshot
+    out = loop.run_once("signal")
+
+    assert out["result"] == "rejected"
+    assert "execution snapshot is stale" in out["reasons"][0]
+    assert _status(conn, signal_id)["status"] == "consumed"
+    assert conn.execute(
+        "SELECT decision,actor FROM signal_decisions WHERE signal_id=?",
+        (signal_id,)).fetchone()[:] == ("accept", "llm")
+
+
 def test_accept_rechecked_inside_window_becomes_system_reject(tmp_path):
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"decision": "accept", "reject_code": None}, [])])
@@ -103,6 +130,34 @@ def test_accept_rechecked_inside_window_becomes_system_reject(tmp_path):
     assert tuple(decision) == ("reject", "system", "econ_window", None)
     assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
     assert conn.execute("SELECT status FROM missions").fetchone()[0] == "system_filtered"
+
+
+def test_signal_accept_event_keeps_signal_origin_through_sink(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+    sink = TradeEventSink(tmp_path / "t.db", wall_clock=lambda: NOW,
+                          busy_retry_sec=0.1)
+    sink.start()
+    observer = TradeEventEmitter(conn, sink, state_mode=None, ccy="JPY")
+    token = transitions.observe(conn, observer)
+    try:
+        out = loop.run_once("signal")
+    finally:
+        transitions.unobserve(token)
+        sink.stop()
+
+    assert out["result"] == "opened", out
+    event = conn.execute(
+        "SELECT fields_json FROM ops_events WHERE code='order_state_changed' "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    assert event is not None
+    assert '"origin_code":"signal:sig1"' in event[0]
+    intent = conn.execute(
+        "SELECT payload_json FROM trade_intents WHERE id=(SELECT trade_intent_id "
+        "FROM signal_decisions WHERE signal_id=?)", (signal_id,)).fetchone()
+    assert json.loads(intent[0])["origin"] == "scheduler"
 
 
 def test_cron_does_not_claim_or_inject_pending_signal(tmp_path):

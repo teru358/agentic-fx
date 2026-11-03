@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +15,7 @@ from agentic_fx.config import load_settings
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.econ_window import WindowSettings
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC
+from agentic_fx.core.supervisor import MissionSupervisor
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.service import (
     STARTUP_CHECKS, StartupContext, _run_signal_maintenance, _scheduler_tick_once,
@@ -551,6 +553,102 @@ def test_the_wired_signal_due_fn_ignores_the_book(tmp_path):
         _position(app.conn_core)
         assert app.scheduler.signal_due_fn(NOW) is True
     finally:
+        app.close()
+
+
+def test_data_outage_keeps_pending_signal_until_ready_maintenance(tmp_path):
+    app = _app(tmp_path)
+    try:
+        signal_id = _signal(app.conn_core, bar_ts=NOW - timedelta(hours=1))
+        after_deadline = NOW + timedelta(hours=1, seconds=TICK_INTERVAL_SEC + 1)
+        app.scheduler.state_fn = lambda: "restricted"
+        app.scheduler.on_signal_maintenance(after_deadline)
+        row = app.conn_core.execute(
+            "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+            (signal_id,)).fetchone()
+        assert tuple(row) == ("pending", None, None)
+
+        app.scheduler.state_fn = lambda: "ready"
+        app.scheduler.on_signal_maintenance(after_deadline)
+        row = app.conn_core.execute(
+            "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+            (signal_id,)).fetchone()
+        assert tuple(row) == (
+            "abandoned", "freshness_expired", after_deadline.isoformat())
+        assert signal_due(app.conn_core, app.settings, after_deadline) is False
+    finally:
+        app.close()
+
+
+def test_reflection_holds_a_due_signal_until_deadline_and_dispatch_ceiling(tmp_path):
+    app = _app(tmp_path)
+    clock = [0.0]
+    trade_started = threading.Event()
+    reflection_started = threading.Event()
+    reflection_release = threading.Event()
+    calls = []
+
+    def trade(trigger):
+        calls.append(("trade", trigger))
+        trade_started.set()
+        return "done"
+
+    def reflect():
+        calls.append(("reflection", None))
+        reflection_started.set()
+        assert reflection_release.wait(5)
+        return 3
+
+    try:
+        # f は signal の鮮度終点。supervisor の reflection 中に f+T へ達する。
+        fresh_until = NOW + timedelta(minutes=5)
+        signal_id = _signal(
+            app.conn_core, bar_ts=NOW - timedelta(minutes=115))
+        assert app.scheduler.signal_due_fn(NOW) is True
+        supervisor = MissionSupervisor(
+            trade_fn=trade, reflection_fn=reflect, ask_fn=lambda question: question,
+            heartbeat_pump_interval_sec=30, clock_fn=lambda: clock[0])
+        supervisor.start()
+        first = supervisor.try_submit("trade", trigger="cron")
+        assert first.accepted and trade_started.wait(5)
+        assert reflection_started.wait(5)
+        busy = supervisor.try_submit("trade", trigger="signal")
+        assert not busy.accepted and busy.reason == "running"
+        assert calls == [("trade", "cron"), ("reflection", None)]
+
+        deadline = fresh_until + timedelta(seconds=TICK_INTERVAL_SEC)
+        clock[0] = (deadline - NOW).total_seconds()
+        app.scheduler.state_fn = lambda: "ready"
+        app.scheduler.on_signal_maintenance(deadline)
+        row = app.conn_core.execute(
+            "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+            (signal_id,)).fetchone()
+        assert tuple(row) == (
+            "abandoned", "freshness_expired", deadline.isoformat())
+        assert app.scheduler.signal_due_fn(deadline) is False
+
+        # Supervisor の設定上限まで slot を占有している時点でも新しい
+        # signal mission を受けず、上限到達まで reflection を含む dispatch 中。
+        clock[0] = 1630.0
+        at_ceiling = supervisor.try_submit("trade", trigger="signal")
+        assert not at_ceiling.accepted and at_ceiling.reason == "running"
+        assert at_ceiling.busy_elapsed_sec == 1630.0
+
+        reflection_release.set()
+        assert first.future.result(timeout=5) == {
+            "trade": "done", "reflection_count": 3}
+        next_signal = supervisor.try_submit("trade", trigger="signal")
+        assert next_signal.accepted
+        assert next_signal.future.result(timeout=5) == {
+            "trade": "done", "reflection_count": 3}
+        assert calls == [("trade", "cron"), ("reflection", None),
+                         ("trade", "signal"), ("reflection", None)]
+    finally:
+        reflection_release.set()
+        if "supervisor" in locals():
+            supervisor.shutdown(drain_exc=RuntimeError("test complete"))
+            supervisor.join(5)
+            assert not supervisor.is_alive()
         app.close()
 
 
