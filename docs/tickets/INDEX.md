@@ -1,17 +1,16 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 164 件。完了分は closed/。
+未完了: 163 件。完了分は closed/。
 
-## 実装中 (5)
+## 実装中 (4)
 
-### 不具合 (3)
+### 不具合 (2)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 | [market-hours-fixed-21utc-ignores-dst](open/market-hours-fixed-21utc-ignores-dst.md) | 高 | 2026-11-02 | market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる |
-| [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 
 ### 機能 (2)
 
