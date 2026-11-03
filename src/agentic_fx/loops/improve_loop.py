@@ -45,6 +45,7 @@ from agentic_fx.loops.improve_context import (
     family_redirect_last_result, family_redirect_reason,
     render_family_attempts)
 from agentic_fx.core.improve_repeat import render_oneoff_section
+from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.loops.improve_run_context import ImproveRunContext
 from agentic_fx.loops import approval_facts
 from agentic_fx.loops import improve_quality
@@ -2334,6 +2335,7 @@ class ImproveLoop:
             "eval_timeframe": (_strategy_gate_eval_timeframe(
                                    getattr(gate_metrics.get("meta"), "timeframe", None))
                                if kind == "strategy" else None),
+            **({"history_epoch": history_epoch(conn)} if kind == "strategy" else {}),
             "live_source": self._settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             "in_sample": gate_metrics.get("in_sample"),

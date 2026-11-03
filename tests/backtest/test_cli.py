@@ -9,6 +9,7 @@ importer/runner/metrics/analysis 自体は Task 4-10 で既にテスト済みな
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import sqlite3
 from dataclasses import replace
@@ -49,6 +50,56 @@ _OPEN_MARKET_LINE = (
 def test_parse_date_ignores_explicit_offset():
     assert cli._parse_date("2026-07-01T00:00:00+09:00") == datetime(
         2026, 7, 1, tzinfo=timezone.utc)
+
+
+def test_repair_dry_run_keeps_database_file_unchanged(tmp_path, monkeypatch):
+    import argparse
+    root = tmp_path
+    (root / "data").mkdir()
+    _install_settings(root)
+    db_path = root / "data" / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(cli, "ensure_initialized", lambda _root: None)
+    monkeypatch.setattr(cli, "connect", lambda *_a, **_k: pytest.fail("writable connection opened"))
+    monkeypatch.setattr(cli, "init_db", lambda *_a, **_k: pytest.fail("database initialized"))
+    args = argparse.Namespace(command="history", history_command="repair-time", apply=False,
+                              out=root / "plan.json", plan=None, confirm=None,
+                              indicator_pending="keep")
+    assert cli.dispatch(args, root) == 3
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_repair_apply_opens_writable_connection_after_instance_lock(tmp_path, monkeypatch):
+    import argparse
+    from agentic_fx.backtest import time_repair
+    root = tmp_path
+    (root / "data").mkdir()
+    db_path = root / "data" / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+    plan_path = root / "plan.json"
+    plan_path.write_text(json.dumps({"plan_hash": "p", "bridge_check": {"windows": [{}] * 24}}))
+    events = []
+    class Lock:
+        def close(self):
+            events.append("close")
+    from agentic_fx.store import instance_lock
+    monkeypatch.setattr(instance_lock, "acquire_instance_lock",
+                        lambda _path: (events.append("lock") or Lock()))
+    real_connect = cli.connect_existing_rw
+    def open_db(path):
+        events.append("connect")
+        return real_connect(path)
+    monkeypatch.setattr(cli, "connect_existing_rw", open_db)
+    monkeypatch.setattr(time_repair, "apply_plan", lambda conn, *a, **kw:
+                        events.append("apply"))
+    args = argparse.Namespace(apply=True, out=None, plan=plan_path, confirm="p")
+    assert cli._history_repair_time(None, args, root, None) == 0
+    assert events == ["lock", "connect", "apply", "close"]
 
 
 def test_cli_plugin_list_skips_initialization_and_does_not_create_a_tree(
@@ -2321,3 +2372,71 @@ def test_cli_backtest_run_plugin_refuses_a_reference_without_any_history(
     conn = connect(root / "data" / "agentic.db")
     assert conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0] == 0
     conn.close()
+
+
+def _repair_args(root, **kw):
+    import argparse
+    base = dict(command="history", history_command="repair-time", apply=False,
+                out=root / "plan.json", plan=None, confirm=None, indicator_pending="keep")
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _repair_root(tmp_path, monkeypatch):
+    root = tmp_path
+    (root / "data").mkdir()
+    _install_settings(root)
+    db_path = root / "data" / "agentic.db"
+    conn = connect(db_path)
+    init_db(conn)
+    conn.close()
+    monkeypatch.setattr(cli, "ensure_initialized", lambda _root: None)
+    return root, db_path
+
+
+@pytest.mark.parametrize("name", ["agentic.db", "agentic.db-wal", "agentic.db-shm",
+                                  "agentic.db.time-repair.manifest.json"])
+def test_repair_plan_output_never_lands_on_the_database(tmp_path, monkeypatch, name):
+    from agentic_fx.backtest import time_repair
+    root, db_path = _repair_root(tmp_path, monkeypatch)
+    before = hashlib.sha256(db_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(time_repair, "build_plan",
+                        lambda *a, **k: pytest.fail("plan built before the output path was checked"))
+    assert cli.dispatch(_repair_args(root, out=root / "data" / name), root) == 2
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+
+
+def test_repair_plan_output_does_not_overwrite_an_existing_file(tmp_path, monkeypatch):
+    from agentic_fx.backtest import time_repair
+    root, _db = _repair_root(tmp_path, monkeypatch)
+    existing = root / "plan.json"
+    existing.write_text("keep me")
+    monkeypatch.setattr(time_repair, "build_plan", lambda *a, **k: {"plan_hash": "h", "targets": {}})
+    assert cli.dispatch(_repair_args(root, out=existing), root) == 2
+    assert existing.read_text() == "keep me"
+
+
+def test_repair_dry_run_requires_a_bridge_url(tmp_path, monkeypatch):
+    from agentic_fx.backtest import time_repair
+    root, _db = _repair_root(tmp_path, monkeypatch)
+    real_load = cli.load_settings
+    def no_bridge(*a, **k):
+        s = real_load(*a, **k)
+        s.datafeed.mt5.bridge_url = ""
+        return s
+    monkeypatch.setattr(cli, "load_settings", no_bridge)
+    monkeypatch.setattr(time_repair, "build_plan", lambda *a, **k: pytest.fail("plan built without a bridge"))
+    assert cli.dispatch(_repair_args(root), root) == 1
+
+
+def test_repair_apply_refuses_a_plan_without_bridge_verification(tmp_path):
+    import argparse
+    root = tmp_path
+    (root / "data").mkdir()
+    plan_path = root / "plan.json"
+    plan_path.write_text(json.dumps({"plan_hash": "p", "bridge_check": None}))
+    args = argparse.Namespace(apply=True, out=None, plan=plan_path, confirm="p")
+    from agentic_fx.backtest import time_repair
+    with pytest.raises(time_repair.RepairError) as err:
+        cli._history_repair_time(None, args, root, None)
+    assert err.value.exit_code == 4
