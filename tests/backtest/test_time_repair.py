@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+from pathlib import Path
 
 import pytest
+import re
 
 from agentic_fx.backtest import time_repair
 from agentic_fx.store.db import connect, init_db
@@ -11,6 +13,157 @@ from agentic_fx.store.db import connect, init_db
 
 def test_time_repair_module_is_available():
     assert importlib.util.find_spec("agentic_fx.backtest.time_repair") is not None
+
+
+def test_weekly_anchors_detect_cash_open_and_continuity(tmp_path):
+    from datetime import date, datetime, timedelta, timezone
+    conn = connect(tmp_path / "anchors.db")
+    init_db(conn)
+    monday0 = date(2025, 11, 3)
+    eur = []
+    us = []
+    for week in range(18):
+        monday = monday0 + timedelta(days=7 * week)
+        sunday_open = datetime.combine(monday - timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(hours=21)
+        for index in range(198):
+            stamp = (sunday_open + timedelta(minutes=5 * index)).isoformat()
+            eur.append(("EURUSD", "5m", stamp, 1., 1., 1., 1., 1., "mt5", None))
+        for day in range(3):
+            current = datetime.combine(monday + timedelta(days=day), datetime.min.time(), timezone.utc)
+            for step in range(7):
+                stamp = (current + timedelta(hours=13, minutes=5 * step)).isoformat()
+                volume = 3. if step == 6 else 1.
+                us.append(("US500", "5m", stamp, 1., 1., 1., 1., volume, "mt5", None))
+    conn.executemany("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)", eur + us)
+    conn.commit()
+    anchors = time_repair._anchors(conn)
+    assert len(anchors) == 18
+    assert all(item["passed"] and item["us500_1330_days"] == 3 and
+               item["eurusd_opening_window_bars"] == 198 for item in anchors)
+    conn.execute("DELETE FROM ohlcv_history WHERE symbol='EURUSD' AND bar_time=?",
+                 ((datetime.combine(monday0 - timedelta(days=1), datetime.min.time(), timezone.utc)
+                   + timedelta(hours=21, minutes=5)).isoformat(),))
+    conn.commit()
+    assert time_repair._anchors(conn)[0]["reasons"] == ["eurusd_opening_window_not_contiguous"]
+
+
+def test_cache_fingerprint_literals_match_design_table():
+    from pathlib import Path
+    design = Path(__file__).parents[2] / "docs/superpowers/specs/2026-11-02-utc-time-rules-dst-design.md"
+    text = design.read_text(encoding="utf-8")
+    expected = []
+    for line in text.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) == 5 and re.fullmatch(r"C[123] (?:1m|15m|1h)", cells[0]):
+            expected.append(cells)
+    assert len(expected) == 6
+    for row, item in zip(expected, time_repair.CACHE_SETS):
+        assert row[0] == f"{item.name.split('-')[0]} {item.interval}"
+        assert row[2] == str(item.count)
+        assert row[3].strip("`") == item.key_sha256
+        assert row[4].strip("`") == item.value_sha256
+        parts = row[1].split(" 〜 ")
+        start = parts[0]
+        assert item.start.replace("T", " ")[:16] == start
+        if len(parts) == 2:
+            actual_end = item.end[5:10] + " " + item.end[11:16]
+            assert actual_end.endswith(parts[1])
+        else:
+            assert item.end == item.start
+
+
+def test_cache_fingerprint_collection_is_not_empty():
+    assert len(time_repair.CACHE_SETS) == 6
+    assert {item.name for item in time_repair.CACHE_SETS} == {
+        "C1-1m", "C1-15m", "C1-1h", "C2-1m", "C2-1h", "C3-15m"}
+
+
+def test_cache_groups_before_window_and_other_sources_are_ignored(tmp_path):
+    conn = connect(tmp_path / "cache.db")
+    init_db(conn)
+    for interval in ("1m", "15m", "1h"):
+        conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                     ("USDJPY", interval, "2026-12-31T12:00:00+00:00", 1, 1, 1, 1, 1, "mt5-live"))
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("USDJPY", "1m", "2026-10-03T02:00:00+00:00", 1, 1, 1, 1, 1, "yfinance"))
+    conn.commit()
+    assert [item["status"] for item in time_repair._cache_status(conn)] == ["absent_before_cache_window"] * 6
+
+
+def test_partial_cache_group_is_rejected(tmp_path):
+    conn = connect(tmp_path / "cache.db")
+    init_db(conn)
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("USDJPY", "1m", "2026-10-02T21:00:00+00:00", 1, 1, 1, 1, 1, "mt5-live"))
+    conn.commit()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._cache_status(conn)
+    assert error.value.exit_code == 3
+
+
+def test_complete_cache_group_with_changed_value_is_rejected(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "cache.db")
+    init_db(conn)
+    values = ("USDJPY", "1m", "2026-10-02T21:00:00+00:00", 1., 1., 1., 1., 1., "mt5-live")
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)", values)
+    conn.commit()
+    row = conn.execute("SELECT * FROM ohlcv_cache").fetchone()
+    item = time_repair.CacheSet("C1-1m", "1m", row["bar_time"], row["bar_time"], 1,
+                                time_repair._rows_digest([row], values=False),
+                                time_repair._rows_digest([row], values=True))
+    monkeypatch.setattr(time_repair, "CACHE_SETS", (item,))
+    conn.execute("UPDATE ohlcv_cache SET close=2")
+    conn.commit()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._cache_status(conn)
+    assert error.value.exit_code == 3
+
+
+def test_cache_absence_inside_retained_window_is_rejected(tmp_path):
+    conn = connect(tmp_path / "cache.db")
+    init_db(conn)
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("USDJPY", "1m", "2026-10-02T12:00:00+00:00", 1, 1, 1, 1, 1, "mt5-live"))
+    conn.commit()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._cache_status(conn)
+    assert error.value.exit_code == 3
+
+
+def test_closed_cache_row_outside_pinned_sets_is_rejected(tmp_path, monkeypatch):
+    conn = connect(tmp_path / "cache.db")
+    init_db(conn)
+    conn.executemany("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)", [
+        ("USDJPY", "1m", "2026-10-04T22:00:00+00:00", 1, 1, 1, 1, 1, "mt5-live"),
+        ("USDJPY", "1m", "2026-10-03T12:00:00+00:00", 1, 1, 1, 1, 1, "mt5-live")])
+    conn.commit()
+    monkeypatch.setattr(time_repair, "CACHE_SETS", (time_repair.CacheSet(
+        "C1-1m", "1m", "2026-10-02T21:00:00+00:00", "2026-10-03T11:59:00+00:00", 900,
+        "0" * 64, "0" * 64),))
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._cache_status(conn)
+    assert error.value.exit_code == 3
+
+
+@pytest.mark.parametrize("mutation", ["close", "delete", "other_interval", "extra_row"])
+def test_unrecognized_history_fingerprint_is_read_only(tmp_path, monkeypatch, mutation):
+    conn, _ = _db(tmp_path, monkeypatch)
+    if mutation == "close":
+        conn.execute("UPDATE ohlcv_history SET close=close+1 WHERE symbol='EURUSD'")
+    elif mutation == "delete":
+        conn.execute("DELETE FROM ohlcv_history WHERE symbol='EURUSD'")
+    elif mutation == "other_interval":
+        conn.execute("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         ("EURUSD", "15m", "2026-01-05T12:05:00+00:00", 1, 1, 1, 1, 1, "mt5", None))
+    else:
+        conn.execute("INSERT INTO ohlcv_history VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         ("AUDUSD", "5m", "2026-01-05T12:05:00+00:00", 1, 1, 1, 1, 1, "mt5", None))
+    conn.commit()
+    before = conn.serialize()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.build_plan(conn, indicator_pending="keep")
+    assert error.value.exit_code == 3
+    assert conn.serialize() == before
 
 
 def _digest(rows, values=False):
@@ -32,17 +185,29 @@ def _db(tmp_path, monkeypatch):
     monkeypatch.setattr(time_repair, "HISTORY_FINGERPRINT", time_repair.HistoryFingerprint(
         "2026-01-05T12:00:00+00:00", "2026-01-05T12:05:00+00:00",
         {"EURUSD": 1, "USDJPY": 1}, _digest(rows), _digest(rows, True)))
-    monkeypatch.setattr(time_repair, "CACHE_SETS", ())
+    monkeypatch.setattr(time_repair, "_cache_status", lambda _: [
+        {"name": item.name, "status": "absent_before_cache_window"}
+        for item in time_repair.CACHE_SETS])
+    monkeypatch.setattr(time_repair, "_cache_changes", lambda _: ([
+        {"name": item.name, "status": "absent_before_cache_window", "delete": 0, "replace": 0}
+        for item in time_repair.CACHE_SETS], []))
+    monkeypatch.setattr(time_repair, "_anchors", lambda _: [{"week": "synthetic", "passed": True}])
     conn.commit()
     return conn, path
 
 
 def test_plan_is_read_only_and_hashes_all_fields(tmp_path, monkeypatch):
-    conn, _ = _db(tmp_path, monkeypatch)
+    conn, path = _db(tmp_path, monkeypatch)
+    before_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     before = conn.serialize()
-    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    plan = time_repair.build_plan(conn, indicator_pending="keep", db_path=path)
     assert conn.serialize() == before
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before_hash
     assert plan["schema"] == "afx.time_repair.plan/1"
+    assert {"db", "fingerprint", "cache_sets", "anchors", "excluded_weeks", "bridge_check",
+            "targets", "samples", "collisions", "unexplained", "indicator_pending",
+            "approval_changes", "estimate_sec", "plan_hash"} <= plan.keys()
+    assert {"H1", "C1", "C2", "C3"} <= plan["targets"].keys()
     assert plan["plan_hash"] == time_repair.plan_hash({k: v for k, v in plan.items() if k != "plan_hash"})
 
 
@@ -56,3 +221,238 @@ def test_apply_requires_confirmation_then_moves_rows_and_is_idempotent(tmp_path,
     assert [r[0] for r in conn.execute("SELECT bar_time FROM ohlcv_history ORDER BY bar_time")] == [
         "2026-01-05T13:00:00+00:00", "2026-01-05T13:05:00+00:00"]
     assert time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"]) is None
+    manifest_path = path.with_name(path.name + ".time-repair.manifest.json")
+    manifest = __import__("json").loads(manifest_path.read_text())
+    assert manifest["committed"] is True
+    assert manifest["plan_hash"] == plan["plan_hash"]
+    assert hashlib.sha256(Path(manifest["path"]).read_bytes()).hexdigest() == manifest["sha256"]
+
+
+def test_apply_leaves_non_mt5_cache_sources_untouched(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("USDJPY", "1m", "2026-10-03T02:00:00+00:00", 1, 2, .5, 1.5, 7, "yfinance"))
+    conn.commit()
+    before = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    after = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
+    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+
+
+def test_apply_leaves_non_mt5_cache_sources_untouched(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    conn.execute("INSERT INTO ohlcv_cache VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("USDJPY", "1m", "2026-10-03T02:00:00+00:00", 1, 2, .5, 1.5, 7, "yfinance"))
+    conn.commit()
+    before = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    after = conn.execute("SELECT * FROM ohlcv_cache WHERE source='yfinance'").fetchall()
+    assert [tuple(row) for row in after] == [tuple(row) for row in before]
+
+
+def test_bridge_check_reads_rule_state_before_and_after_all_windows(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    calls = []
+    def fetch(route, params):
+        calls.append((route, params))
+        if route == "/server-time":
+            return {"offset_source": "rule", "time_rule_state": "ok", "measured_age_sec": 1}
+        return {"bars": []}
+    plan = time_repair.build_plan(conn, indicator_pending="keep", bridge_url="http://fake",
+                                  bridge_fetch=fetch, db_path=path)
+    assert plan["bridge_check"]["count"] == 24
+    assert len(plan["bridge_check"]["windows"]) == 24
+    assert plan["bridge_check"]["matched"] == 0
+    assert calls[0][0] == calls[-1][0] == "/server-time"
+    assert sum(route != "/server-time" for route, _ in calls) == 24
+
+
+def test_plan_stops_when_bridge_rule_check_fails(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    def fetch(route, params):
+        return {"offset_source": "measured", "time_rule_state": "ok", "measured_age_sec": 1}
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.build_plan(conn, indicator_pending="keep", bridge_url="http://fake",
+                               bridge_fetch=fetch, db_path=path)
+    assert error.value.exit_code == 1
+
+
+@pytest.mark.parametrize("state", ["unverified", "mismatch"])
+def test_bridge_check_rejects_unverified_states(tmp_path, monkeypatch, state):
+    conn, _ = _db(tmp_path, monkeypatch)
+    def fetch(route, params):
+        return {"offset_source": "rule", "time_rule_state": state, "measured_age_sec": 1}
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._bridge_check(conn, "http://fake", fetch)
+    assert error.value.exit_code == 1
+
+
+def test_bridge_check_rechecks_age_after_fetches(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    seen = 0
+    def fetch(route, params):
+        nonlocal seen
+        if route == "/server-time":
+            seen += 1
+            return {"offset_source": "rule", "time_rule_state": "ok",
+                    "measured_age_sec": 301 if seen == 2 else 1}
+        return {"bars": []}
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._bridge_check(conn, "http://fake", fetch)
+    assert error.value.exit_code == 1
+
+
+def test_bridge_window_with_unmatched_rows_is_rejected(tmp_path, monkeypatch):
+    conn, _ = _db(tmp_path, monkeypatch)
+    def fetch(route, params):
+        if route == "/server-time":
+            return {"offset_source": "rule", "time_rule_state": "ok", "measured_age_sec": 1}
+        return {"bars": [{"time": "2025-11-02T22:00:00+00:00", "open": 1, "high": 1,
+                           "low": 1, "close": 1, "volume": 1}]}
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair._bridge_check(conn, "http://fake", fetch)
+    assert error.value.exit_code == 3
+
+
+@pytest.mark.parametrize("point", ["after_backup", "after_H1", "after_C1", "after_C2",
+                                    "after_C3", "after_approvals", "after_marker", "before_commit"])
+def test_precommit_faults_leave_database_unchanged(tmp_path, monkeypatch, point):
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    def fail(at):
+        if at == point:
+            raise RuntimeError("injected")
+    with pytest.raises(RuntimeError, match="injected"):
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=fail)
+    assert conn.serialize() == before
+    if point == "after_backup":
+        manifest = __import__("json").loads(path.with_name(path.name + ".time-repair.manifest.json").read_text())
+        assert manifest["committed"] is False
+        assert Path(manifest["path"]).is_file()
+
+
+@pytest.mark.parametrize("point", ["after_recalculate", "after_backup", "before_begin"])
+def test_external_commit_after_data_version_snapshot_is_rejected(tmp_path, monkeypatch, point):
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    changed = False
+    def commit_elsewhere(at):
+        nonlocal changed
+        if at == point and not changed:
+            other = connect(path)
+            other.execute("UPDATE ohlcv_history SET close=close+0.1 WHERE symbol='EURUSD'")
+            other.commit()
+            other.close()
+            changed = True
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=commit_elsewhere)
+    assert error.value.exit_code == 4
+    assert conn.execute("SELECT bar_time FROM ohlcv_history WHERE symbol='EURUSD'").fetchone()[0].startswith("2026-01-05T12:")
+
+
+def test_transaction_digest_change_is_rolled_back(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    before = conn.serialize()
+    def change_inside(at):
+        if at == "before_transaction_digest":
+            conn.execute("UPDATE ohlcv_history SET close=close+0.1 WHERE symbol='EURUSD'")
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=change_inside)
+    assert error.value.exit_code == 4
+    assert conn.serialize() == before
+
+
+def test_plan_change_after_dry_run_is_rejected(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    conn.execute("UPDATE ohlcv_history SET close=close+0.1 WHERE symbol='EURUSD'")
+    conn.commit()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert error.value.exit_code == 4
+
+
+def test_pending_approval_added_after_dry_run_is_rejected(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from agentic_fx.store import approvals
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    approvals.create(conn, "plugin", {"kind": "strategy", "eval_source": "mt5"}, datetime.now(timezone.utc))
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert error.value.exit_code == 4
+
+
+def test_instance_lock_and_backup_failures_have_exit_one(tmp_path, monkeypatch):
+    from agentic_fx.store.instance_lock import acquire_instance_lock
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    held = acquire_instance_lock(path.parent)
+    try:
+        with pytest.raises(time_repair.RepairError) as error:
+            time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+        assert error.value.exit_code == 1
+    finally:
+        held.close()
+    monkeypatch.setattr(time_repair, "_backup_database", lambda *args: (_ for _ in ()).throw(OSError("backup")))
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert error.value.exit_code == 1
+
+
+def test_postcommit_fault_and_corrupt_marker_fail_closed(tmp_path, monkeypatch):
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    def fail(at):
+        if at == "after_commit":
+            raise RuntimeError("committed fault")
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"], hook=fail)
+    assert error.value.exit_code == 5
+    assert conn.execute("SELECT 1 FROM data_migrations WHERE name=?", (time_repair.REPAIR_ID,)).fetchone()
+    assert conn.execute("SELECT bar_time FROM ohlcv_history WHERE symbol='EURUSD'").fetchone()[0] == "2026-01-05T13:00:00+00:00"
+
+
+@pytest.mark.parametrize("indicator_mode", ["keep", "invalidate"])
+def test_pending_strategy_is_invalidated_in_the_repair_transaction(tmp_path, monkeypatch, indicator_mode):
+    from datetime import datetime, timezone
+    from agentic_fx.store import approvals
+    conn, path = _db(tmp_path, monkeypatch)
+    strategy_id = approvals.create(conn, "plugin", {"kind": "strategy", "eval_source": "mt5",
+        "base_interval": "5m", "name": "strat"}, datetime.now(timezone.utc))
+    indicator_id = approvals.create(conn, "plugin", {"kind": "indicator", "eval_source": None,
+        "name": "ind"}, datetime.now(timezone.utc))
+    plan = time_repair.build_plan(conn, indicator_pending=indicator_mode)
+    assert [item["id"] for item in plan["approval_changes"]] == (
+        [strategy_id] if indicator_mode == "keep" else [strategy_id, indicator_id])
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    strategy = conn.execute("SELECT status, reason, decided_by FROM approval_requests WHERE id=?",
+                            (strategy_id,)).fetchone()
+    indicator = conn.execute("SELECT status FROM approval_requests WHERE id=?", (indicator_id,)).fetchone()
+    assert tuple(strategy) == ("invalidated", "history_time_repaired", "system:time_repair")
+    assert indicator[0] == ("pending" if indicator_mode == "keep" else "invalidated")
+
+
+def test_strategy_approval_from_old_history_epoch_stays_pending(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from agentic_fx.store import approvals
+    from agentic_fx.plugin import switch
+    conn, path = _db(tmp_path, monkeypatch)
+    plan = time_repair.build_plan(conn, indicator_pending="keep")
+    time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    approval_id = approvals.create(conn, "plugin", {"kind": "strategy", "eval_source": "mt5",
+        "name": "strat", "candidate_origin": "human", "candidate_path": "plugins/_human/strat"},
+        datetime.now(timezone.utc))
+    outcome = switch.approve_candidate(conn, approval_id, decided_by="test", now=datetime.now(timezone.utc),
+                                       plugins_root=tmp_path / "plugins", settings=None)
+    assert outcome.outcome == "history_epoch_changed"
+    assert conn.execute("SELECT status FROM approval_requests WHERE id=?", (approval_id,)).fetchone()[0] == "pending"
+    conn.execute("UPDATE ohlcv_history SET close=close+0.1 WHERE symbol='EURUSD'")
+    conn.commit()
+    with pytest.raises(time_repair.RepairError) as error:
+        time_repair.apply_plan(conn, path, plan, confirm=plan["plan_hash"])
+    assert error.value.exit_code == 5

@@ -110,7 +110,7 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
 
     repair = history_sub.add_parser("repair-time", **_surface_parser_kw("history repair-time", leaf=True))
-    repair.add_argument("--indicator-pending", choices=("keep", "invalidate"), required=True)
+    repair.add_argument("--indicator-pending", choices=("keep", "invalidate"))
     repair.add_argument("--out", type=Path)
     repair.add_argument("--apply", action="store_true")
     repair.add_argument("--plan", type=Path)
@@ -324,7 +324,7 @@ def _history_coverage(conn, args: argparse.Namespace) -> int:
     return 0
 
 
-def _history_repair_time(conn, args: argparse.Namespace, root: Path) -> int:
+def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -> int:
     if args.apply:
         if args.out is not None or args.plan is None or args.confirm is None:
             raise time_repair.RepairError("--apply requires --plan and --confirm", 2)
@@ -332,10 +332,12 @@ def _history_repair_time(conn, args: argparse.Namespace, root: Path) -> int:
             plan = json.loads(args.plan.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise time_repair.RepairError(f"cannot read plan: {exc}", 2) from exc
-        time_repair.apply_plan(conn, root / "data" / "agentic.db", plan, confirm=args.confirm)
+        time_repair.apply_plan(conn, root / "data" / "agentic.db", plan, confirm=args.confirm, root=root)
         print("time repair applied")
         return 0
-    plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending)
+    plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending,
+                                  bridge_url=settings.datafeed.mt5.bridge_url,
+                                  db_path=root / "data" / "agentic.db")
     out = args.out or root / "data" / "time-repair" / f"plan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -910,7 +912,10 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
         if args.command == "plugin" and args.plugin_command == "versions":
             return plugin_deploy_cli.plugin_versions(settings, args, root)
         conn = connect(root / "data" / "agentic.db")
-        init_db(conn)
+        repair_apply = (args.command == "history" and args.history_command == "repair-time"
+                        and args.apply)
+        if not repair_apply:
+            init_db(conn)
         try:
             if args.command == "history":
                 if args.history_command == "import":
@@ -918,7 +923,7 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
                 if args.history_command == "compare":
                     return _history_compare(conn, settings, args)
                 if args.history_command == "repair-time":
-                    return _history_repair_time(conn, args, root)
+                    return _history_repair_time(conn, args, root, settings)
                 return _history_coverage(conn, args)
             if args.command == "backtest":
                 return _backtest_run(conn, settings, args, root)

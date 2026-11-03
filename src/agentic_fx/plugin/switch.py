@@ -33,6 +33,7 @@ from agentic_fx.plugin.resolve import (  # [indicator-consumption-wiring] T4b St
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 from agentic_fx.store import approvals as approvals_store
+from agentic_fx.core.history_epoch import history_epoch
 from agentic_fx.store import backtest_runs as backtest_runs_store  # [profitability-floor] T1 Step 1-6: 人間 corridor の gate 行保存
 from agentic_fx.store import candidate_archives as candidate_archives_store  # T4 §1 L4 の archive GC が使う
 from agentic_fx.plugin import deploy_ops as deploy_ops_common
@@ -46,7 +47,7 @@ _TERMINAL_PHASES = ("decided", "reverted")
 # [switch-ops-hardening] T5: lock の内側で確定した結果 (設計書 §3.5)。
 APPROVAL_OUTCOMES = frozenset({
     "deployed", "deployed_after_rollback", "already_decided", "foreign_waiting",
-    "still_pending", "legacy_plain_present", "invalidated",
+    "still_pending", "legacy_plain_present", "invalidated", "history_epoch_changed",
 })
 
 
@@ -1464,6 +1465,7 @@ def submit_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
+            **({"history_epoch": history_epoch(conn)} if meta.kind == "strategy" else {}),
             "live_source": settings.datafeed.primary,
             "mission_id": mission_id, "backlog_id": backlog_id,
             # [profitability-floor] T1 Step 1-8 (codex I3): 適用した閾値
@@ -1850,6 +1852,8 @@ def approve_candidate(
             # [switch-ops-hardening] T5: status の出所は **read** (この行の SELECT)。
             return ApprovalOutcome(outcome="already_decided", name=name,
                                   status=row["status"])
+        if payload.get("kind") == "strategy" and payload.get("history_epoch", "none") != history_epoch(conn):
+            return ApprovalOutcome(outcome="history_epoch_changed", name=name, status="pending")
         if candidate_dir_pre is None:
             try:
                 resolve_candidate_dir(
@@ -2427,6 +2431,7 @@ def bless_candidate(
                               if meta.kind == "strategy" else None),
             "eval_timeframe": (strategy_gate._eval_timeframe(meta.timeframe)
                               if meta.kind == "strategy" else None),
+            **({"history_epoch": history_epoch(conn)} if meta.kind == "strategy" else {}),
             "live_source": settings.datafeed.primary,
             "mission_id": None, "backlog_id": None,
             "floor_warning": outcome.floor_warning,
