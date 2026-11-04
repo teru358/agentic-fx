@@ -15,7 +15,6 @@ from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import signals as signals_store
 from tests.loops.test_trade_loop import NOW as LOOP_NOW
 from tests.loops.test_trade_loop import _loop
-from tests.loops.test_trade_loop_source_gate import OPEN
 from tests.plugin._conc_support import FIRST_TICK, Activity as ProducerActivity, ConcWorld, Sandbox
 from tests.plugin.conftest import SETTINGS
 from tests.plugin.deploy_world import World, at
@@ -24,6 +23,7 @@ from tests.plugin.test_signal_producer import _open_result
 
 
 NOW = at(183)
+ACCEPT = {"decision": "accept", "reject_code": None}
 
 
 @pytest.fixture
@@ -128,22 +128,26 @@ def test_a_claimed_open_signal_is_rejected_by_the_commit_core_only_for_an_open_o
     world.link("strat", strategy)
     _row(world, "strat", strategy, other, phase, reason)
     conn, loop, _runner, _ = _loop(
-        tmp_path, [MissionResult("completed", OPEN, [])], conn=world.conn)
+        tmp_path, [MissionResult("completed", ACCEPT, [])], conn=world.conn)
     signal_id = signals_store.add(
         conn, plugin="strat", content_hash=world.content(strategy), pair="USDJPY",
         timeframe="1h", bar_ts=LOOP_NOW.isoformat(), kind="strategy",
-        payload={"direction": "long"}, now=LOOP_NOW, contract_version="executable_v1")
+        payload={"action": "open", "pair": "USDJPY", "direction": "long",
+                 "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+                 "take_profit": 151.5}, now=LOOP_NOW,
+        contract_version="executable_v1")
     loop._plugins_root = world.root
 
     out = loop.run_once("signal")
 
     status = conn.execute("SELECT status FROM signals WHERE id=?", (signal_id,)).fetchone()[0]
     if blocking:
-        assert out == {"result": "rejected", "order_id": None,
-                       "reasons": ["signal_source_inactive"]}
+        assert out is None
         assert status == "abandoned"
+        assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
     else:
-        assert "signal_source_inactive" not in out.get("reasons", [])
+        assert out is not None
+        assert status == "consumed"
 
 
 # a rollback or retire attempt meets a disable row; a disable meets a rollback row
