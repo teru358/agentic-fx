@@ -1,16 +1,15 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 163 件。完了分は closed/。
+未完了: 162 件。完了分は closed/。
 
-## 実装中 (4)
+## 実装中 (3)
 
-### 不具合 (2)
+### 不具合 (1)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
-| [market-hours-fixed-21utc-ignores-dst](open/market-hours-fixed-21utc-ignores-dst.md) | 高 | 2026-11-02 | market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる |
 
 ### 機能 (2)
 
@@ -75,14 +74,13 @@
 
 ## 設計待ち (139)
 
-### 不具合 (78)
+### 不具合 (77)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [gate-pytest-dev-writable-and-ldso-exec](open/gate-pytest-dev-writable-and-ldso-exec.md) | 高 | 2026-10-03 | gate の pytest は /dev 全体が書き込み可で ld.so 経由で任意の ELF を起動できる |
 | [ops-bot-exits-not-lock-holder](open/ops-bot-exits-not-lock-holder.md) | 高 | 2026-10-22 | afx-ops bot が稼働中に not_lock_holder で終了し systemd が再起動する |
 | [approval-base-identity-cas](open/approval-base-identity-cas.md) | 高 | 2026-10-27 | 承認時に候補の土台版を照合し、同名候補の上書き (lost update) を防ぐ |
-| [mt5-bridge-applies-current-offset-to-all-history](open/mt5-bridge-applies-current-offset-to-all-history.md) | 高 | 2026-11-02 | bridge がいまの offset を全履歴に当て、DST 切替前の足が 1 時間ずれる |
 | [human-corridor-gate-rows-null-outcome](open/human-corridor-gate-rows-null-outcome.md) | 中 | 2026-09-12 | 人間回廊 (`submit_candidate` / `bless_candidate` → `_run_full_g… |
 | [backtest-worker-cpu-budget-shrinks-with-timeframe](open/backtest-worker-cpu-budget-shrinks-with-timeframe.md) | 中 | 2026-09-20 | strategy の backtest は plugin worker 1 プロセスを再生全体で使い回すので、`plu… |
 | [backtest-rpc-timeout-does-not-stop-parent-work](open/backtest-rpc-timeout-does-not-stop-parent-work.md) | 中 | 2026-09-21 | backtest の待ち時間超過後も親の処理と worker が走り続ける |
@@ -158,7 +156,7 @@
 | [settings-hash-excludes-improve-gate](open/settings-hash-excludes-improve-gate.md) | 低 |  | `settings_snapshot_hash` は `risk` + `backtest` のみ → `improv… |
 | [test-isolation](open/test-isolation.md) | 低 |  | 特定 4 ファイルの部分実行で loops の fixture が見えなくなる |
 
-### 機能 (39)
+### 機能 (40)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -199,6 +197,7 @@
 | [init-news-source-remove-on-revisit](open/init-news-source-remove-on-revisit.md) | 低 | 2026-10-25 | afx init 段 3 の再入時に入力済みのニュース源を取り消せない |
 | [reference-series-additional-sources](open/reference-series-additional-sources.md) | 低 | 2026-10-28 | 参照系列の取得先を MT5 以外に広げる (金利など) |
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
+| [datafeed-fetch-evidence-and-bridge-completeness](open/datafeed-fetch-evidence-and-bridge-completeness.md) | 低 | 2026-11-03 | 価格取得の証跡と bridge の過去区間の完全性保証 (tick 無しの証明) |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 

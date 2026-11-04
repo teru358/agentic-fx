@@ -4,9 +4,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
+import httpx
 
 from agentic_fx.datafeed.sources import (
-    INTERVAL_MIN, MT5RawSymbol, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
+    BridgeTimeRuleMismatch, BridgeTimeUnverified, INTERVAL_MIN, MT5RawSymbol, NATIVE_INTERVALS, mt5_bars, mt5_bars_range, mt5_health, mt5_quote,
     td_bars, td_quote, vendor_symbol, yf_bars, yf_quote,
 )
 
@@ -120,6 +121,18 @@ def test_mt5_quote_parses_bridge_response():
         q = mt5_quote("http://localhost:8812", "USDJPY")
     assert "quote" in g.call_args[0][0]
     assert q.bid == 148.49 and q.source == "mt5"
+
+
+@pytest.mark.parametrize(("detail", "error"), [
+    ("time_rule_mismatch", BridgeTimeRuleMismatch),
+    ("time_rule_unverified", BridgeTimeUnverified),
+])
+def test_mt5_quote_maps_time_rule_503_to_a_typed_error(detail, error):
+    response = httpx.Response(503, json={"detail": detail},
+                              request=httpx.Request("GET", "http://bridge/quote/USDJPY"))
+    with patch("httpx.get", return_value=response):
+        with pytest.raises(error):
+            mt5_quote("http://bridge", "USDJPY")
 
 
 def test_mt5_health_reads_connected_flag_only():
@@ -327,3 +340,26 @@ def test_trading_pair_adapter_still_resolves_through_the_vendor_table():
     assert seen[0].url.path == "/ohlcv/USDJPY" and bars[0].symbol == "USDJPY"
     with pytest.raises(KeyError):
         mt5_bars_range("http://bridge:8812", "JP225", "1h", START, END)
+
+
+def test_non_503_response_is_not_parsed_for_time_rule_detail():
+    from agentic_fx.datafeed.sources import _raise_mt5_time_rule_error
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise AssertionError("body must not be parsed")
+
+    _raise_mt5_time_rule_error(_Response())
+
+
+def test_non_503_error_status_raises_without_parsing_the_body():
+    from agentic_fx.datafeed.sources import _raise_mt5_time_rule_error
+    response = httpx.Response(500, content=b"not json",
+                              request=httpx.Request("GET", "http://bridge/x"))
+    with pytest.raises(httpx.HTTPStatusError):
+        _raise_mt5_time_rule_error(response)

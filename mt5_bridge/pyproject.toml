@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic>=2.5",
     "python-dotenv>=1.0",
+    "tzdata>=2025.2; sys_platform == 'win32'",
     # MetaTrader5 は Windows でのみインストール (Linux/Mac では skip)
     "MetaTrader5>=5.0.45; sys_platform == 'win32'",
 ]

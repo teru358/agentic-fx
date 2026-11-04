@@ -8,6 +8,7 @@ from agentic_fx.backtest import mt5_import
 from agentic_fx.backtest.mt5_import import (
     ImportConflictError, _default_fetch, compare_sources, import_mt5)
 from agentic_fx.core.contracts import Bar
+from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.store import ohlcv
 from tests.backtest.factories import H, SETTINGS, _conn
@@ -510,6 +511,32 @@ def test_import_mt5_rejects_count_over_interval_capacity(tmp_path):
                    base_url="http://x", fetch=lambda _url: _payload(*bars))
 
 
+@pytest.mark.parametrize("kind", ["duplicates", "off_grid"])
+def test_import_mt5_rejects_oversized_window_before_validating_its_rows(tmp_path, kind):
+    conn = _conn(tmp_path)
+    end = H + timedelta(days=2)
+    capacity = 1440
+    if kind == "duplicates":
+        oversized = [_bar(H + timedelta(days=1)) for _ in range(capacity + 2)]
+    else:
+        oversized = [_bar(H + timedelta(days=1, seconds=1 + i))
+                     for i in range(capacity + 2)]
+    calls = []
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        calls.append(start)
+        if start == H:
+            return _payload(_bar(H))
+        # 先頭に壊れた行を置く: 上限の検査が行の検査より先なら、上限の理由で拒否される。
+        return _payload(None, *oversized)
+
+    with pytest.raises(ValueError, match="exceeds window capacity"):
+        import_mt5(conn, "USDJPY", H, end, base_url="http://x", fetch=fetch)
+    assert len(calls) == 2
+    assert _stored_row_count(conn) == 0
+
+
 def test_import_mt5_final_partial_window_uses_partial_capacity(tmp_path):
     conn = _conn(tmp_path)
     end = H + timedelta(days=1, minutes=5)
@@ -594,7 +621,7 @@ def test_grid_alignment_accepts_aligned_time_before_epoch():
     assert mt5_import._is_grid_aligned(dt, 60) is True
 
 
-def test_import_mt5_two_window_failure_keeps_first_window(tmp_path):
+def test_import_mt5_two_window_failure_keeps_no_window(tmp_path):
     conn = _conn(tmp_path)
 
     def fetch(url):
@@ -606,11 +633,10 @@ def test_import_mt5_two_window_failure_keeps_first_window(tmp_path):
     with pytest.raises(ValueError):
         import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                    base_url="http://x", fetch=fetch)
-    bars = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
-    assert [bar.ts for bar in bars] == [H]
+    assert ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5") == []
 
 
-def test_import_mt5_validation_error_reports_failed_window_and_last_success(
+def test_import_mt5_validation_error_reports_failed_window_and_that_nothing_was_written(
         tmp_path):
     conn = _conn(tmp_path)
 
@@ -625,7 +651,9 @@ def test_import_mt5_validation_error_reports_failed_window_and_last_success(
                    base_url="http://x", fetch=fetch)
     message = str(raised.value)
     assert f"failed window [{(H + timedelta(days=1)).isoformat()}" in message
-    assert f"last successful window end={ (H + timedelta(days=1)).isoformat()}" in message
+    assert "何も書き込んでいません" in message
+    assert f"開始 {H.isoformat()} から取り直" in message
+    assert "last successful" not in message
 
 
 def test_import_mt5_same_payload_rerun_is_unchanged_only(tmp_path):
@@ -655,13 +683,14 @@ def test_import_mt5_conflict_raises_with_existing_and_incoming_and_stops(tmp_pat
     with pytest.raises(ImportConflictError) as raised:
         import_mt5(conn, "USDJPY", H, H + timedelta(days=2),
                    base_url="http://x", fetch=fetch)
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert raised.value.conflicts == (
         ("USDJPY", "1m", H.isoformat(),
          (148.0, 148.2, 147.9, 148.1, 10.0, None),
          (149.0, 149.2, 148.9, 149.1, 20, None)),
     )
     stored = ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5")
+    assert [b.ts for b in stored] == [H]
     assert stored[0].close == 148.1
 
 
@@ -893,3 +922,106 @@ def test_default_fetch_raises_on_500(monkeypatch):
     monkeypatch.setattr(mt5_import.httpx, "get", fake_get)
     with pytest.raises(httpx.HTTPStatusError):
         _default_fetch("http://x/ohlcv/USDJPY?from=a&to=b&interval=1m")
+
+
+def _stored_row_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0]
+
+
+@pytest.mark.parametrize("error", [
+    BridgeTimeRuleMismatch("time_rule_mismatch"),
+    BridgeTimeUnverified("time_rule_unverified"),
+    ValueError("broken window"),
+], ids=["mismatch", "unverified", "invalid"])
+def test_import_mt5_keeps_nothing_when_a_later_window_fails(tmp_path, error):
+    conn = _conn(tmp_path)
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if len(calls) == 2:
+            raise error
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        return _payload(_bar(start))
+
+    with pytest.raises(type(error)):
+        import_mt5(conn, "USDJPY", H, H + timedelta(days=3),
+                   base_url="http://x", fetch=fetch)
+
+    assert len(calls) == 2
+    assert _stored_row_count(conn) == 0
+    assert not conn.in_transaction
+
+
+def test_import_mt5_commits_once_after_every_window_succeeds(tmp_path):
+    conn = _conn(tmp_path)
+    commits = []
+
+    class _Spy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def commit(self):
+            commits.append(self._inner.execute("SELECT COUNT(*) FROM ohlcv_history").fetchone()[0])
+            self._inner.commit()
+
+    result = import_mt5(
+        _Spy(conn), "USDJPY", H, H + timedelta(days=3), base_url="http://x",
+        fetch=lambda url: _payload(_bar(datetime.fromisoformat(_query_param(url, "from")))))
+
+    assert result.inserted == 3
+    assert commits == [3]
+
+
+def test_import_history_bars_without_commit_needs_a_transaction(tmp_path):
+    conn = _conn(tmp_path)
+    with pytest.raises(ValueError, match="open transaction"):
+        ohlcv.import_history_bars(
+            conn, [("USDJPY", "1m", H.isoformat(), 148.0, 148.2, 147.9, 148.1, 10, None)],
+            source="mt5", commit=False)
+    assert _stored_row_count(conn) == 0
+
+
+def test_import_mt5_does_not_hold_the_write_lock_while_fetching(tmp_path):
+    from agentic_fx.store.db import connect
+    conn = _conn(tmp_path)
+    other = connect(tmp_path / "t.db")
+    other.execute("PRAGMA busy_timeout=0")
+    seen = []
+
+    def fetch(url):
+        start = datetime.fromisoformat(_query_param(url, "from"))
+        assert not conn.in_transaction
+        other.execute("BEGIN IMMEDIATE")
+        other.rollback()
+        seen.append(start)
+        return _payload(_bar(start))
+
+    result = import_mt5(conn, "USDJPY", H, H + timedelta(days=3),
+                        base_url="http://x", fetch=fetch)
+    assert len(seen) == 3
+    assert result.inserted == 3
+
+
+def test_import_mt5_refuses_a_period_too_large_before_fetching(tmp_path, monkeypatch):
+    monkeypatch.setattr(mt5_import, "MAX_IMPORT_ROWS", 100)
+    conn = _conn(tmp_path)
+    calls = []
+
+    with pytest.raises(mt5_import.ImportTooLargeError, match="期間を分けて"):
+        import_mt5(conn, "USDJPY", H, H + timedelta(minutes=101),
+                   base_url="http://x", fetch=lambda url: calls.append(url))
+
+    assert calls == []
+    assert ohlcv.load_history_bars(conn, "USDJPY", "1m", source="mt5") == []
+
+
+def test_import_mt5_accepts_a_period_exactly_at_the_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(mt5_import, "MAX_IMPORT_ROWS", 100)
+    conn = _conn(tmp_path)
+    r = import_mt5(conn, "USDJPY", H, H + timedelta(minutes=100), base_url="http://x",
+                   fetch=lambda url: {"symbol": "USDJPY", "interval": "1m", "bars": []})
+    assert r.inserted == 0

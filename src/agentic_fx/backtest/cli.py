@@ -15,6 +15,7 @@ import argparse
 import difflib
 import hashlib
 import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -30,13 +31,15 @@ from agentic_fx.backtest.holdout import (
 from agentic_fx.backtest.importer import import_dukascopy
 from agentic_fx.backtest.metrics import compute_metrics
 from agentic_fx.backtest.mt5_import import (
-    ImportConflictError, _is_grid_aligned, compare_sources, import_mt5)
+    ImportConflictError, ImportTooLargeError, _is_grid_aligned, compare_sources, import_mt5)
 from agentic_fx.backtest import plugin_deploy_cli
+from agentic_fx.backtest import time_repair
 from agentic_fx.backtest.runner import run_replay
 from agentic_fx.config import ConfigError, load_env_file, load_settings
 from agentic_fx.cli_surface import (HelpFormatter, argument_help, leaf_help, parser_description, parser_help,
                                     render_epilog)
 from agentic_fx.core.contracts import Bar, Origin, TradeIntent
+from agentic_fx.datafeed.sources import BridgeTimeRuleMismatch, BridgeTimeUnverified
 from agentic_fx.loops.verify_backend import VerifyBackendGateError
 from agentic_fx.plugin.history_git import HistoryGitError
 from agentic_fx.plugin import loader as plugin_loader
@@ -50,7 +53,7 @@ from agentic_fx.plugin.resolve import (
 )
 from agentic_fx.service import ensure_initialized
 from agentic_fx.store import backtest_runs, ohlcv
-from agentic_fx.store.db import connect, init_db
+from agentic_fx.store.db import connect, connect_existing_rw, connect_observer_readonly, init_db
 from agentic_fx.tools import plugin_loader as tools_plugin_loader
 
 # analyze corr で --to 未指定時の in_sample_until (aware far-future 定数 —
@@ -106,6 +109,13 @@ def register_subparsers(sub: "argparse._SubParsersAction") -> None:
     cov.add_argument("--base-interval", default="1m", choices=("1m", "5m", "15m"))
     cov.add_argument("--from", dest="from_", type=_parse_date, required=True)
     cov.add_argument("--to", dest="to", type=_parse_date, required=True)
+
+    repair = history_sub.add_parser("repair-time", **_surface_parser_kw("history repair-time", leaf=True))
+    repair.add_argument("--indicator-pending", choices=("keep", "invalidate"))
+    repair.add_argument("--out", type=Path)
+    repair.add_argument("--apply", action="store_true")
+    repair.add_argument("--plan", type=Path)
+    repair.add_argument("--confirm")
 
     news = sub.add_parser("news", **_surface_parser_kw("news"))
     news_sub = news.add_subparsers(dest="news_command", required=True)
@@ -277,6 +287,20 @@ def _history_import(conn, settings, args: argparse.Namespace) -> int:
                   f"unchanged={exc.partial.unchanged} "
                   f"conflicted={exc.partial.conflicted}", file=sys.stderr)
             return 3
+        except ImportTooLargeError as exc:
+            print(f"エラー: {exc}", file=sys.stderr)
+            return 2
+        except BridgeTimeRuleMismatch:
+            print("bridge の時刻規則が broker の時計と一致しません (time_rule_mismatch)。"
+                  "取り込みを中止しました。何も書き込んでいません (0 行)。"
+                  "元の --from から取り直してください", file=sys.stderr)
+            return 1
+        except BridgeTimeUnverified:
+            print("bridge の時刻規則を検査できていません (time_rule_unverified)。"
+                  "開場中にもう一度実行してください。取り込みを中止しました。"
+                  "何も書き込んでいません (0 行)。元の --from から取り直してください",
+                  file=sys.stderr)
+            return 1
     print(f"inserted={result.inserted} unchanged={result.unchanged} "
          f"conflicted={result.conflicted}")
     return 0
@@ -298,6 +322,73 @@ def _history_coverage(conn, args: argparse.Namespace) -> int:
                              dataset=dataset, start=args.from_,
                              end=args.to)
     print(result)
+    return 0
+
+
+def _refuse_plan_path_over_db(out: Path, db_path: Path) -> None:
+    """plan の出力先が DB 本体・WAL・SHM・修復の manifest や backup と同じファイルなら拒否する。"""
+    target = out.resolve()
+    protected = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"),
+                 Path(f"{db_path}.time-repair.manifest.json")]
+    for path in protected:
+        if target == path.resolve():
+            raise time_repair.RepairError("plan output path collides with the database", 2)
+        if out.exists() and path.exists() and os.path.samefile(out, path):
+            raise time_repair.RepairError("plan output path collides with the database", 2)
+    if target.name.startswith(db_path.name + ".bak-"):
+        raise time_repair.RepairError("plan output path collides with the database", 2)
+
+
+def _history_repair_time(conn, args: argparse.Namespace, root: Path, settings) -> int:
+    if args.apply:
+        if args.out is not None or args.plan is None or args.confirm is None:
+            raise time_repair.RepairError("--apply requires --plan and --confirm", 2)
+        try:
+            plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise time_repair.RepairError(f"cannot read plan: {exc}", 2) from exc
+        bridge = plan.get("bridge_check") if isinstance(plan, dict) else None
+        if not isinstance(bridge, dict) or len(bridge.get("windows") or []) != 24:
+            raise time_repair.RepairError("plan has no bridge verification", 4)
+        db_path = root / "data" / "agentic.db"
+        from agentic_fx.store.instance_lock import InstanceAlreadyRunning, acquire_instance_lock
+        try:
+            lock = acquire_instance_lock(db_path.parent)
+        except InstanceAlreadyRunning as exc:
+            raise time_repair.RepairError(str(exc), 1) from exc
+        opened_here = conn is None
+        if opened_here:
+            try:
+                conn = connect_existing_rw(db_path)
+            except BaseException:
+                lock.close()
+                raise
+        try:
+            time_repair.apply_plan(conn, db_path, plan, confirm=args.confirm, root=root,
+                                   instance_lock=lock)
+        finally:
+            if opened_here:
+                conn.close()
+            lock.close()
+        print("time repair applied")
+        return 0
+    if not settings.datafeed.mt5.bridge_url:
+        raise time_repair.RepairError("bridge url is not configured", 1)
+    db_path = root / "data" / "agentic.db"
+    out = args.out or root / "data" / "time-repair" / f"plan-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.json"
+    _refuse_plan_path_over_db(out, db_path)
+    plan = time_repair.build_plan(conn, indicator_pending=args.indicator_pending,
+                                  bridge_url=settings.datafeed.mt5.bridge_url,
+                                  db_path=db_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # 既存のファイルは上書きしない (DB や別の plan を誤って潰さない)。
+    try:
+        fh = open(out, "x", encoding="utf-8")
+    except FileExistsError as exc:
+        raise time_repair.RepairError("plan output file already exists", 2) from exc
+    with fh:
+        fh.write(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"plan": str(out), "plan_hash": plan["plan_hash"], "targets": plan["targets"]}, ensure_ascii=False))
     return 0
 
 
@@ -867,14 +958,24 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
     try:
         if args.command == "plugin" and args.plugin_command == "versions":
             return plugin_deploy_cli.plugin_versions(settings, args, root)
-        conn = connect(root / "data" / "agentic.db")
-        init_db(conn)
+        repair_apply = (args.command == "history" and args.history_command == "repair-time"
+                        and args.apply)
+        if repair_apply:
+            return _history_repair_time(None, args, root, settings)
+        repair_dry_run = (args.command == "history" and args.history_command == "repair-time"
+                          and not args.apply)
+        db_path = root / "data" / "agentic.db"
+        conn = connect_observer_readonly(db_path) if repair_dry_run else connect(db_path)
+        if not repair_apply and not repair_dry_run:
+            init_db(conn)
         try:
             if args.command == "history":
                 if args.history_command == "import":
                     return _history_import(conn, settings, args)
                 if args.history_command == "compare":
                     return _history_compare(conn, settings, args)
+                if args.history_command == "repair-time":
+                    return _history_repair_time(conn, args, root, settings)
                 return _history_coverage(conn, args)
             if args.command == "backtest":
                 return _backtest_run(conn, settings, args, root)
@@ -899,6 +1000,9 @@ def dispatch(args: argparse.Namespace, root: Path) -> int:
             return _analyze_corr(conn, args)
         finally:
             conn.close()
+    except time_repair.RepairError as e:
+        print(f"エラー: {e}", file=sys.stderr)
+        return e.exit_code
     except (ValueError, KeyError, OSError, sqlite3.Error,
            VerifyBackendGateError) as e:
         print(f"エラー: {e}", file=sys.stderr)

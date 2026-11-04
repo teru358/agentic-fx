@@ -801,6 +801,8 @@ class Commands:
                     "(先に afx plugin retire が要ります)")
         if kind in ("already_decided", "invalidated"):
             return f"この承認は既に決着しています (status={outcome.status})"
+        if kind == "history_epoch_changed":
+            return "履歴修復後の評価でないため承認できません (history_epoch_changed)"
         raise ValueError(f"unknown approval outcome: {kind!r}")
 
     def _approval_list(self, limit_arg: "str | None") -> str:

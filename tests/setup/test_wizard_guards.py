@@ -680,3 +680,47 @@ def test_one_line_error_stops_on_a_cause_cycle():
     first, second = MigrationRecordUnknown(), MigrationRecordUnknown()
     first.__cause__, second.__cause__ = second, first
     assert commands_module.one_line_error(first) == "MigrationRecordUnknown:"
+
+
+def _refusing_quote_fetch(default_fetch, detail):
+    def fetch(url, **kwargs):
+        if url.endswith("/health"):
+            return FakeResponse({"mt5_connected": True})
+        if "/quote/" in url:
+            return FakeResponse({"detail": detail}, 503)
+        return default_fetch(url, **kwargs)
+    return fetch
+
+
+def test_closed_market_time_rule_wait_is_reported_as_information_and_setup_goes_on(tmp_path):
+    from datetime import datetime, timezone
+
+    root = make_root(tmp_path)
+    deps, _, default_fetch, _ = make_deps(tmp_path)
+    deps = replace(deps, fetch=_refusing_quote_fetch(default_fetch, "time_rule_unverified"),
+                   now=lambda: datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc))
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "http://127.0.0.1:8812"), ("[r] 再試行", "2")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    price = record_of(root)["price"]
+    assert price["result"] == "unverified" and price["reason_code"] == "time_rule_unchecked"
+    assert record_of(root)["bridge_plan"] == "connected"
+    assert "価格は未確認 (閉場中、開場後に `afx init` か `afx check` で再確認)" in io.text
+    assert "MT5 bridge OK" not in io.text
+    assert not io.asked_with("[r] 再試行")
+
+
+def test_open_market_time_rule_refusal_still_fails_the_connection_check(tmp_path):
+    root = make_root(tmp_path)
+    deps, _, default_fetch, _ = make_deps(tmp_path)         # 既定の時刻は開場中
+    deps = replace(deps, fetch=_refusing_quote_fetch(default_fetch, "time_rule_unverified"))
+    io = ScriptedWizardIO(responder=fresh_responder(
+        ("bridge の URL", "http://127.0.0.1:8812"), ("[r] 再試行", "2")))
+
+    assert run_wizard(root, io, deps) == 0, io.text
+
+    assert record_of(root)["price"]["result"] == "planned"
+    assert io.asked_with("[r] 再試行")
+    assert "未検査です" not in io.text

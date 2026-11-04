@@ -1,16 +1,16 @@
 ---
 id: market-hours-fixed-21utc-ignores-dst
 title: market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる
-status: 実装中
+status: 是正済
 priority: 高
 kind: 不具合
 opened: 2026-11-02
-closed: null
+closed: 2026-11-04
 related: []
 ---
 # [market-hours-fixed-21utc-ignores-dst] market_hours の 21:00 UTC 固定が DST を無視し冬は境界が 1 時間ずれる
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -22,7 +22,10 @@ related: []
 
 ## 修正内容
 
+- 2026-11-04: f3591e48 (R1: NY 17:00 tz 規則、稼働中の切替 T_c 2026-11-03T07:56:52Z)。11-03 は 21:00Z で日次が切り替わらず 22:00Z で切り替わり、過渡期間は 22:00Z で終了を DB で確認
+
 ## 経緯
 
 - 2026-11-02: 起票。
 - 2026-11-03: 状態: 実装中 — 実装済 (本番切替の配備待ち)。是正: 週の開場・閉場、取引日ラベル、祝日、day 強制決済、日次基準を NY 17:00 (America/New_York) の tz 規則 1 箇所から UTC に換算し、内部は UTC のまま。稼働中の切替は手順書 docs/operations/time-rule-cutover.md。設計 docs/superpowers/specs/2026-11-02-utc-time-rules-dst-design.md。close は本番切替の後
+- 2026-11-04: 是正内容 — f3591e48 (R1: NY 17:00 tz 規則、稼働中の切替 T_c 2026-11-03T07:56:52Z)。11-03 は 21:00Z で日次が切り替わらず 22:00Z で切り替わり、過渡期間は 22:00Z で終了を DB で確認

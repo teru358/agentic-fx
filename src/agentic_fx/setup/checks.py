@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from agentic_fx.core import market_hours
 from agentic_fx.core.cli_bin import resolve_cli_bin
 
 
@@ -39,6 +40,7 @@ class CheckReason(StrEnum):
     PYTEST_UNAVAILABLE = "pytest_unavailable"
     SERVER_TIME_UNKNOWN = "server_time_unknown"
     TERMINAL_DISCONNECTED = "terminal_disconnected"
+    TIME_RULE_UNCHECKED = "time_rule_unchecked"
     USER_SESSION_MISSING = "user_session_missing"
     USER_DECLINED_PROBE = "user_declined_probe"
     VERIFY_FAILED = "verify_failed"
@@ -219,6 +221,21 @@ def _bridge_json(response: Any) -> dict[str, Any]:
     return _bridge_payload(response, dict)
 
 
+def _time_rule_unchecked_while_closed(response: Any, now: datetime) -> bool:
+    """bridge が閉場中に返す 503 `time_rule_unverified` か。
+
+    閉場中の bridge は時刻規則を測らないので、この応答は接続の失敗ではない。
+    開場中の `time_rule_unverified` と `time_rule_mismatch` はここでは偽 (失敗のまま)。
+    """
+    if getattr(response, "status_code", None) != 503 or market_hours.is_market_open(now):
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("detail") == "time_rule_unverified"
+
+
 def check_bridge(base_url: str, pair: str, *, fetch: Callable[..., Any],
                  timeout: float = 10, headers: dict[str, str] | None = None,
                  now: Callable[[], datetime] | None = None) -> CheckResult:
@@ -231,8 +248,10 @@ def check_bridge(base_url: str, pair: str, *, fetch: Callable[..., Any],
             return _result("bridge", "unverified", CheckReason.INVALID_RESPONSE, now=now)
         if not connected:
             return _result("bridge", "unverified", CheckReason.BRIDGE_NOT_CONNECTED, now=now)
-        quote = _bridge_json(fetch(f"{base}/quote/{pair}", timeout=timeout,
-                                   headers=headers or {}))
+        quote_response = fetch(f"{base}/quote/{pair}", timeout=timeout, headers=headers or {})
+        if _time_rule_unchecked_while_closed(quote_response, _now(now)):
+            return _result("bridge", "unverified", CheckReason.TIME_RULE_UNCHECKED, now=now)
+        quote = _bridge_json(quote_response)
     except _BridgeFailure as failure:
         return _result("bridge", "unverified", failure.reason, now=now)
     except httpx.HTTPStatusError as error:

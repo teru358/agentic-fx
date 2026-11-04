@@ -76,6 +76,7 @@ from agentic_fx.plugin.resolve import (
 from agentic_fx.plugin.sandbox import SandboxError, check_source
 from agentic_fx.plugin.signal_eval import SandboxRunFn, evaluate_detection
 from agentic_fx.store import approvals as approvals_store
+from agentic_fx.core.history_epoch import history_epoch
 
 if TYPE_CHECKING:
     from agentic_fx.config import Settings
@@ -528,6 +529,7 @@ def submit_plugin(conn: sqlite3.Connection, meta: PluginMeta, *,
                           if meta.kind == "strategy" else None),
         "eval_timeframe": (_eval_timeframe(meta.timeframe)
                            if meta.kind == "strategy" else None),
+        **({"history_epoch": history_epoch(conn)} if meta.kind == "strategy" else {}),
         "live_source": settings.datafeed.primary,
         "note": _NOTE,
     }

@@ -20,7 +20,7 @@ import httpx
 from agentic_fx.datafeed.price_provider import _SPECS
 from agentic_fx.datafeed.closed_bars import normalize_closed_range
 from agentic_fx.core.contracts import Bar
-from agentic_fx.datafeed.sources import _mt5_headers
+from agentic_fx.datafeed.sources import _mt5_headers, _raise_mt5_time_rule_error
 from agentic_fx.store.ohlcv import ImportResult, import_history_bars
 
 _log = logging.getLogger(__name__)
@@ -35,15 +35,33 @@ class ImportConflictError(ValueError):
         super().__init__(message or f"MT5 import conflicts: {len(conflicts)} row(s)")
 
 
+# 1 回の取り込みでメモリに溜める行数の上限。全窓を取得・検証してから 1 回で書くため、
+# 行はすべて書込み前に保持される。1 行 (9 要素の tuple、float 5 個、ISO 文字列) は
+# 約 0.4 KB なので、100 万行で約 0.4 GB。1m の 1 年分 (約 37 万行) の 2.7 倍にあたる。
+MAX_IMPORT_ROWS = 1_000_000
+
+
+class ImportTooLargeError(ValueError):
+    """The requested import would hold more rows than MAX_IMPORT_ROWS."""
+
+
+def _too_large_message(start: datetime, end: datetime, detail: str) -> str:
+    return (f"import_mt5: {detail} (上限 {MAX_IMPORT_ROWS} 行)。何も書き込んでいません。"
+            f"期間を分けて取り込んでください (開始 {start.isoformat()})")
+
+
 def _default_fetch(url: str) -> dict:
     """既定 fetch。httpx.get + `X-Bridge-Api-Key` ヘッダ + `raise_for_status`。
+
+    bridge の 503 `time_rule_mismatch` / `time_rule_unverified` は型つきの例外
+    (`BridgeTimeRuleMismatch` / `BridgeTimeUnverified`) にして上げる。
 
     Dukascopy と異なり 404 は MT5 bridge では想定外 (欠損日は
     `bars: []` の 200 で返る実測仕様) — 素通しで raise する。
     URL・ヘッダ (API キー) はログに出さない。
     """
     resp = httpx.get(url, headers=_mt5_headers(), timeout=30)
-    resp.raise_for_status()
+    _raise_mt5_time_rule_error(resp)
     return resp.json()
 
 
@@ -105,6 +123,13 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
             f"import_mt5: payload interval={payload['interval']!r} does not "
             f"match requested interval={interval!r}")
 
+    width_sec = _INTERVAL_SECONDS[interval]
+    capacity = int((window_end - current).total_seconds()) // width_sec
+    if len(payload["bars"]) > capacity + 1:       # 格子数 + 右端 1 行
+        raise ValueError(
+            f"import_mt5: bar count {len(payload['bars'])} exceeds window capacity "
+            f"{capacity} for interval={interval}")
+
     normalized = []
     naive_count = 0
     for idx, bar in enumerate(payload["bars"]):
@@ -156,8 +181,6 @@ def _validated_window_rows(payload, *, symbol: str, interval: str,
                 f"が要求窓 [{current.isoformat()}, {window_end.isoformat()}) "
                 "の外です (bridge の不具合の可能性)")
 
-    width_sec = _INTERVAL_SECONDS[interval]
-    capacity = int((window_end - current).total_seconds()) // width_sec
     if len(remaining) > capacity:
         raise ValueError(
             f"import_mt5: bar count {len(remaining)} exceeds window capacity "
@@ -229,12 +252,24 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
     if fetch is None:
         fetch = _default_fetch
 
+    # 窓ごとの行数は窓の格子数を超えられない (検証済み) ので、期間の格子数で保持行数の上限が決まる。
+    slots = int((end - start).total_seconds()) // width_sec
+    if slots > MAX_IMPORT_ROWS:
+        raise ImportTooLargeError(_too_large_message(
+            start, end, f"期間が最大 {slots} 本分で多すぎます"))
+
     total_inserted = 0
     total_unchanged = 0
     total_conflicted = 0
     naive_count = 0
     right_edge_drops = 0
 
+    # 全窓を先に取得して検証し、メモリに溜める (HTTP を待つ間は DB の書き込み
+    # lock を握らない)。どれかの窓で bridge が拒否したり応答が不正だったり
+    # したら、何も書かずに止める。書込みは最後に 1 回の短い transaction で行い、
+    # 既存行との食い違い (conflict) だけは、人が確認する停止としてそこまでの
+    # 窓を確定してから上げる。
+    pending: list[list[tuple]] = []
     current = start
     while current < end:
         window_end = min(current + timedelta(days=1), end)
@@ -247,21 +282,38 @@ def import_mt5(conn, symbol: str, start: datetime, end: datetime, *,
         except ValueError as exc:
             raise ValueError(
                 f"import_mt5: failed window [{current.isoformat()}, "
-                f"{window_end.isoformat()}); last successful window end="
-                f"{current.isoformat()}: {exc}") from exc
+                f"{window_end.isoformat()}): {exc}. 何も書き込んでいません。"
+                f"開始 {start.isoformat()} から取り直してください") from exc
         naive_count += window_naive
         right_edge_drops += window_right_edges
         if rows:
-            result = import_history_bars(conn, rows, source="mt5")
+            pending.append(rows)
+        current = window_end
+
+    owns_transaction = not conn.in_transaction
+    if owns_transaction:
+        conn.execute("BEGIN")
+    try:
+        for rows in pending:
+            result = import_history_bars(
+                conn, rows, source="mt5", commit=False)
             total_inserted += result.inserted
             total_unchanged += result.unchanged
             total_conflicted += result.conflicted
             if result.conflicted > 0:
                 partial = ImportResult(
                     total_inserted, total_unchanged, total_conflicted)
+                if owns_transaction:
+                    conn.commit()
                 raise ImportConflictError(result.conflicts, partial=partial)
-
-        current = window_end
+    except ImportConflictError:
+        raise
+    except BaseException:
+        if owns_transaction and conn.in_transaction:
+            conn.rollback()
+        raise
+    if owns_transaction:
+        conn.commit()
 
     if right_edge_drops > 0:
         # 期待どおりの挙動なので debug。ただし**件数は残す** — bridge が
