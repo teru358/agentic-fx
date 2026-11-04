@@ -467,7 +467,7 @@ class Executor:
         """
         now = self.clock.now()
         iid = intents_store.insert(self.conn, mission_id,
-                                   _intent_payload(intent), now,
+                                   intent_payload(intent), now,
                                    action=intent.action.value)
         if intent.action is Action.HOLD:
             self.activity.write(Category.AGGREGATE, "hold",
@@ -1184,7 +1184,7 @@ class Executor:
         return {"result": result, "order_id": row["id"], "reasons": []}
 
 
-def _intent_payload(intent: TradeIntent) -> dict:
+def intent_payload(intent: TradeIntent) -> dict:
     return {
         "action": intent.action.value, "origin": intent.origin.value,
         "pair": intent.pair,

@@ -15,7 +15,7 @@ from agentic_fx.core.contracts import (
 )
 from agentic_fx.core.executor import (
     CloseSnapshot, ExecutionSnapshot, Executor, NotTradableSymbol, SnapshotCoverageError,
-    _intent_payload, open_risk_and_notional_from_snapshot,
+    intent_payload, open_risk_and_notional_from_snapshot,
 )
 from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
@@ -88,7 +88,7 @@ def _start_trade_mission(conn) -> int:
 
 
 def _insert_intent(conn, mid: int, intent: TradeIntent) -> int:
-    return intents_store.insert(conn, mid, _intent_payload(intent), NOW,
+    return intents_store.insert(conn, mid, intent_payload(intent), NOW,
                                 action=intent.action.value)
 
 

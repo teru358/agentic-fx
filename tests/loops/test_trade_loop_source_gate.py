@@ -73,6 +73,26 @@ def test_source_lock_timeout_requeues_without_a_decision(tmp_path, monkeypatch):
     assert _row(conn, signal_id)["requeue_count"] == 1
     assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+    assert "signal_source_lock_timeout" in (tmp_path / "a.log").read_text()
+
+
+@pytest.mark.parametrize("error", ["NotTradableSymbol", "ExposureNotTradableSymbol", "DataUnhealthy"])
+def test_snapshot_failure_requeues_and_records_the_reason(tmp_path, monkeypatch, error):
+    conn, loop, signal_id = _prepare(tmp_path)
+    exc_type = getattr(trade_loop, error)
+
+    def fail(*_args, **_kwargs):
+        raise exc_type("unavailable")
+
+    monkeypatch.setattr(loop.executor, "gather_open_snapshot", fail)
+    loop.run_once("signal")
+
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert _row(conn, signal_id)["requeue_count"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    log = (tmp_path / "a.log").read_text()
+    assert "signal_snapshot_requeue" in log and error in log
+    assert "unavailable" not in log
 
 
 def test_retry_limit_abandons_claim_with_reason_and_time(tmp_path, monkeypatch):
@@ -478,3 +498,4 @@ def test_lock_error_requeues_and_fails_closed(tmp_path, monkeypatch, error):
     assert _row(conn, signal_id)["status"] == "pending"
     assert _row(conn, signal_id)["requeue_count"] == 1
     assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert "signal_source_lock_requeue" in (tmp_path / "a.log").read_text()

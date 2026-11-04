@@ -1665,7 +1665,7 @@ def test_every_source_caller_of_requeue_and_abandon_passes_now():
                 assert not (isinstance(kw["now"], ast.Call)
                             and ast.unparse(kw["now"]).startswith(
                                 "datetime.utcnow")), (path.name, node.lineno)
-    assert found.count("trade_loop.py") == 6
+    assert found.count("trade_loop.py") == 4
 
 
 @pytest.mark.parametrize("abandon_if_stale", [False, True])

@@ -12,6 +12,7 @@ import pytest
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.runners.base import MissionResult
 from agentic_fx.store import signals
+from agentic_fx.store import missions
 from agentic_fx.core import transitions
 from agentic_fx.ops.trade_event_sink import TradeEventEmitter, TradeEventSink
 
@@ -59,6 +60,22 @@ def test_signal_reject_commits_decision_shadow_and_consumes(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
 
 
+def test_signal_validation_does_not_read_mission_on_shared_connection(
+        tmp_path, monkeypatch):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("mission lookup must not use the shared connection")
+
+    monkeypatch.setattr(missions, "loop_of", forbidden)
+    loop.run_once("signal")
+
+    assert _status(conn, signal_id)["status"] == "consumed"
+
+
 def test_signal_accept_commits_fixed_payload_before_executor(tmp_path):
     conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
         "completed", {"decision": "accept", "reject_code": None}, [])])
@@ -87,6 +104,31 @@ def test_signal_accept_commits_fixed_payload_before_executor(tmp_path):
     assert '"pair": "USDJPY"' in payload
     assert '"direction": "long"' in payload
     assert "signal" not in payload
+    assert _status(conn, signal_id)["status"] == "consumed"
+
+
+def test_executor_failure_after_accept_is_recorded_and_notified(tmp_path):
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = False
+    loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    loop.executor.open_from_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("broker unavailable"))
+    loop.notifier.send = lambda message: (tp / "notice.log").write_text(message)
+
+    out = loop.run_once("signal")
+
+    assert out is None
+    row = conn.execute(
+        "SELECT gate_result,reject_reason,reject_category FROM trade_intents "
+        "WHERE id=(SELECT trade_intent_id FROM signal_decisions WHERE signal_id=?)",
+        (signal_id,)).fetchone()
+    assert tuple(row) == (
+        "rejected", "RuntimeError: broker unavailable", "execution")
+    assert "intent_execution_failed" in (tp / "a.log").read_text()
+    assert "注文処理失敗" in (tp / "notice.log").read_text()
     assert _status(conn, signal_id)["status"] == "consumed"
 
 
@@ -229,8 +271,10 @@ def test_signal_with_no_claimable_row_is_skipped_without_runner_call(tmp_path):
 
 
 def test_signal_runner_failure_requeues_and_finishes_mission(tmp_path):
-    conn, loop, runner, _ = _loop(tmp_path, [MissionResult("timeout", None, [])])
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult("timeout", None, [])])
     signal_id = _add_signal(conn)
+    notices = []
+    loop.notifier.send = notices.append
 
     loop.run_once("signal")
 
@@ -238,18 +282,24 @@ def test_signal_runner_failure_requeues_and_finishes_mission(tmp_path):
     assert _status(conn, signal_id)["requeue_count"] == 1
     assert conn.execute("SELECT status FROM missions").fetchone()[0] == "timeout"
     assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert "mission_failed" in (tp / "a.log").read_text()
+    assert any("判断 Mission 失敗" in message for message in notices)
 
 
 def test_invalid_decision_code_fails_and_requeues_without_decision(tmp_path):
-    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
         "completed", {"decision": "reject", "reject_code": "sell_now"}, [])])
     signal_id = _add_signal(conn)
+    notices = []
+    loop.notifier.send = notices.append
 
     loop.run_once("signal")
 
     assert _status(conn, signal_id)["status"] == "pending"
     assert conn.execute("SELECT status FROM missions").fetchone()[0] == "failed"
     assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert "mission_failed" in (tp / "a.log").read_text()
+    assert any("判断 Mission 失敗" in message for message in notices)
 
 
 @pytest.mark.parametrize("status", ["open", "pending_fill", "protection_pending"])
