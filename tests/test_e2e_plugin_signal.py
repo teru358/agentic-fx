@@ -38,6 +38,7 @@ from unittest.mock import patch
 import pytest
 
 from agentic_fx.core.contracts import Bar, FixedClock, InstrumentSpec, Quote
+from agentic_fx.loops.signal_decision_contract import DECISION_SCHEMA
 from agentic_fx.plugin import approval, strategy_gate
 from agentic_fx.plugin.gate_pytest import GateResult
 from agentic_fx.plugin.loader import discover
@@ -173,7 +174,7 @@ def _seed_crossover_history(conn, *, source: str) -> None:
     ohlcv_store.upsert_cache_bars(conn, bars, source=source)
     ohlcv_store.upsert_cache_bars(
         conn, [Bar("USDJPY", "1m", NOW_TICK - timedelta(minutes=1),
-                   145.0, 145.1, 145.0, 145.05, 10.0)], source=source)
+                   200.0, 200.0, 200.0, 200.0, 10.0)], source=source)
 
 
 def _seed_open_position(conn) -> int:
@@ -189,7 +190,7 @@ def _seed_open_position(conn) -> int:
 def _build_app(tmp_path, *, runner, bars: dict):
     return build_app(
         tmp_path, runner=runner, clock=FixedClock(NOW_TICK),
-        quote_fn=lambda p: Quote(p, 148.49, 148.51, NOW_TICK, "test"),
+        quote_fn=lambda p: Quote(p, 199.99, 200.01, NOW_TICK, "test"),
         spec_fn=lambda p: InstrumentSpec(p, 0.01, 0.01, 50.0, 0.01,
                                          100_000, "USD", "JPY"),
         bars_fn=lambda p: bars.get(p), embedding_fn=FakeEmbedding())
@@ -201,8 +202,9 @@ def test_approved_strategy_signal_starts_dedicated_mission(tmp_path):
 
     fake = FakeRunner([MissionResult(
         "completed", {"decision": "accept", "reject_code": None}, [])])
-    bars = {"USDJPY": Bar("USDJPY", "1m", NOW_TICK, 145.05, 145.10, 145.00,
-                          145.05, 10.0)}
+    # 発注の基準は signal の SL / TP (最後の終値 200.0 ± pips) と同じ価格帯にする。
+    bars = {"USDJPY": Bar("USDJPY", "1m", NOW_TICK, 200.0, 200.0, 200.0,
+                          200.0, 10.0)}
 
     app = _build_app(tmp_path, runner=fake, bars=bars)
     # Verify that the approved strategy is included in the inventory.
@@ -266,8 +268,10 @@ def test_approved_strategy_signal_starts_dedicated_mission(tmp_path):
     assert mission_row["status"] == "completed"
 
     # The claimed signal is included in the dedicated mission prompt.
-    assert len(fake.missions) == 1
-    prompt = fake.missions[0].prompt
+    # 注文の後には reflection の mission も走るので、採否の mission だけを数える。
+    decision_missions = [m for m in fake.missions if m.output_schema is DECISION_SCHEMA]
+    assert len(decision_missions) == 1
+    prompt = decision_missions[0].prompt
     assert "sma_cross" in prompt
     assert "USDJPY" in prompt
     assert H.isoformat() in prompt
