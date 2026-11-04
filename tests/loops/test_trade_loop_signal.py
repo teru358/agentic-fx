@@ -60,6 +60,21 @@ def test_signal_reject_commits_decision_shadow_and_consumes(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
 
 
+def test_signal_mission_gets_the_dedicated_decision_prompt_not_the_cron_one(tmp_path):
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    _add_signal(conn)
+
+    loop.run_once("signal")
+
+    prompt = runner.missions[0].prompt
+    assert "signal 採否エージェント" in prompt
+    assert "FX 取引判断エージェント" not in prompt
+    assert '"action": "hold"' not in prompt
+    assert "get_ohlcv" not in prompt
+    assert "get_indicators" not in prompt
+
+
 def test_signal_validation_does_not_read_mission_on_shared_connection(
         tmp_path, monkeypatch):
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
@@ -370,3 +385,124 @@ def test_decision_after_freshness_boundary_is_abandoned_without_decision(tmp_pat
 
     assert _status(conn, signal_id)["status"] == "abandoned"
     assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+
+
+def test_signal_inside_window_never_reaches_the_runner(tmp_path):
+    conn, loop, runner, tp = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.return_value.in_window = True
+
+    out = loop.run_once("signal")
+
+    assert runner.missions == []
+    assert out["reasons"] == ["econ_window"]
+    decision = conn.execute(
+        "SELECT decision,actor,reject_code,trade_intent_id FROM signal_decisions "
+        "WHERE signal_id=?", (signal_id,)).fetchone()
+    assert tuple(decision) == ("reject", "system", "econ_window", None)
+    assert conn.execute(
+        "SELECT state FROM signal_shadow WHERE signal_id=?", (signal_id,)
+    ).fetchone()[0] == "pending_entry"
+    assert _status(conn, signal_id)["status"] == "consumed"
+    assert conn.execute("SELECT status FROM missions").fetchone()[0] == "system_filtered"
+    assert "signal_filtered_econ_window" in (tp / "a.log").read_text(encoding="utf-8")
+
+
+def test_llm_reject_shadow_spread_comes_from_the_live_quote(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    signal_id = _add_signal(conn)
+
+    loop.run_once("signal")
+
+    spread_pips, source = conn.execute(
+        "SELECT spread_pips,spread_source FROM signal_shadow WHERE signal_id=?",
+        (signal_id,)).fetchone()
+    assert source == "quote"
+    assert spread_pips == pytest.approx((148.51 - 148.49) / 0.01)
+
+
+def test_llm_reject_shadow_spread_is_assumed_when_the_quote_is_unusable(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    signal_id = _add_signal(conn)
+
+    def unavailable(pair):
+        raise RuntimeError("quote unavailable")
+
+    loop.executor.quote_fn = unavailable
+    loop.run_once("signal")
+
+    assert conn.execute(
+        "SELECT spread_source FROM signal_shadow WHERE signal_id=?", (signal_id,)
+    ).fetchone()[0] == "assumed"
+
+
+def test_accept_shadow_spread_comes_from_the_snapshot_quote(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.executor.open_from_snapshot = lambda *args, **kwargs: {"result": "ok"}
+
+    loop.run_once("signal")
+
+    assert conn.execute(
+        "SELECT spread_source FROM signal_shadow WHERE signal_id=?", (signal_id,)
+    ).fetchone()[0] == "quote"
+
+
+def test_terminal_decision_is_reported_after_commit(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    seen = []
+    loop.signal_terminal = lambda sid, kind: seen.append((sid, kind))
+    signal_id = _add_signal(conn)
+
+    loop.run_once("signal")
+
+    assert seen == [(signal_id, "decision")]
+
+
+def test_decision_after_freshness_boundary_reports_the_abandon_terminal(tmp_path):
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    seen = []
+    loop.signal_terminal = lambda sid, kind: seen.append((sid, kind))
+    signal_id = _add_signal(conn)
+    runner_before = runner.run
+
+    def run_and_advance(mission):
+        result = runner_before(mission)
+        later = NOW + timedelta(hours=2, seconds=1)
+        loop.clock = FixedClock(later)
+        loop.executor.clock = loop.clock
+        return result
+
+    runner.run = run_and_advance
+    loop.run_once("signal")
+
+    row = conn.execute(
+        "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+        (signal_id,)).fetchone()
+    assert tuple(row)[:2] == ("abandoned", "freshness_expired")
+    assert row["abandoned_at"] is not None
+    assert seen == [(signal_id, "freshness_abandoned")]
+
+
+def test_a_failing_terminal_evaluation_never_changes_the_decision(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+
+    def broken(sid, kind):
+        raise RuntimeError("evaluation failed")
+
+    loop.signal_terminal = broken
+    signal_id = _add_signal(conn)
+
+    loop.run_once("signal")
+
+    assert _status(conn, signal_id)["status"] == "consumed"
+    assert conn.execute(
+        "SELECT decision FROM signal_decisions WHERE signal_id=?", (signal_id,)
+    ).fetchone()[0] == "reject"

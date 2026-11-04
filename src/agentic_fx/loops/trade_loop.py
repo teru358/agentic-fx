@@ -47,6 +47,9 @@ from agentic_fx.policy import Policy
 from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
 from agentic_fx.store import signal_decisions
+from agentic_fx.signal_admission import (
+    TERMINAL_DECISION, TERMINAL_FRESHNESS_ABANDONED,
+)
 from agentic_fx.store.signal_shadow import spread_from_quote
 from agentic_fx.store import intents as intents_store
 from agentic_fx.store import orders as orders_store
@@ -68,15 +71,6 @@ _ASK_TOOLS = [*_CRON_TOOLS, "get_signals"]
 # Full registry-facing set retained for service validation; missions use the
 # explicit cron, ask, or signal list above.
 _TRADE_TOOLS = _ASK_TOOLS
-
-_SIGNAL_DECISION_INSTRUCTIONS = (
-    "\n\n## Signal 採否\n"
-    "この専用 Mission では signal を採用するか拒否するかだけを判断します。"
-    "発注内容・方向・価格・SL/TP は signal の固定 payload が正本です。"
-    "それらを変更せず、JSON の decision を accept または reject にし、"
-    "reject の場合だけ reject_code を news_shock / opposite_position の"
-    "どちらかにしてください。ほかの操作や理由コードは返しません。\n"
-)
 
 
 def signal_source_active(conn, plugins_root: Path, plugin: str, content_hash: str,
@@ -100,10 +94,12 @@ def gate_reject_streak(conn: sqlite3.Connection) -> tuple[int, int, str | None]:
         "WHERE action='open' AND gate_result='accepted'").fetchone()[0])
     count = int(conn.execute(
         "SELECT COUNT(*) FROM trade_intents WHERE action='open' "
-        "AND gate_result='rejected' AND id > ?", (streak_id,)).fetchone()[0])
+        "AND gate_result='rejected' AND reject_category IS NOT 'econ_window' "
+        "AND id > ?", (streak_id,)).fetchone()[0])
     row = conn.execute(
         "SELECT reject_category,COUNT(*) c FROM trade_intents "
-        "WHERE action='open' AND gate_result='rejected' AND id > ? "
+        "WHERE action='open' AND gate_result='rejected' "
+        "AND reject_category IS NOT 'econ_window' AND id > ? "
         "GROUP BY reject_category ORDER BY c DESC,reject_category ASC LIMIT 1",
         (streak_id,)).fetchone()
     return streak_id, count, row["reject_category"] if row else None
@@ -118,7 +114,8 @@ class TradeLoop:
                  conn_supervisor: sqlite3.Connection,
                  watch: MissionWatch | None = None,
                  plugins_root: Path | None = None,
-                 resolved_by_identity=None) -> None:
+                 resolved_by_identity=None,
+                 signal_terminal=None) -> None:
         self.conn = conn
         self.runner = runner
         self.settings = settings
@@ -133,6 +130,8 @@ class TradeLoop:
         self._conn_supervisor = conn_supervisor
         self._plugins_root = plugins_root
         self._resolved_by_identity = resolved_by_identity or {}
+        # commit 後に終端を渡す warning 評価境界 (core lock の外で呼ぶ)
+        self.signal_terminal = signal_terminal
         self.watch = watch if watch is not None else MissionWatch()
         self._market_tool_daily: dict = {}
 
@@ -420,6 +419,7 @@ class TradeLoop:
         claimed: dict | None = None
         finalized = False
         consumed = False
+        terminal: str | None = None
         deferred_notifications: list[str] = []
         result = MissionResult("failed", None, [])
         try:
@@ -437,8 +437,11 @@ class TradeLoop:
                     finalized = True
                     return None
                 missions.set_trigger(self.conn, mid, f"signal:{claimed['plugin']}")
-                prompt = (self._build_prompt(load_prompt("trade_mission"), now)
-                          + _SIGNAL_DECISION_INSTRUCTIONS
+                # 帯内の signal は LLM を起動せず、commit 段で system reject にする
+                pre_filtered = self.econ.window_view(
+                    claimed["pair"], now).in_window
+                prompt = (self._build_prompt(
+                              load_prompt("signal_decision_mission"), now)
                           + self._format_signal_injection(claimed))
                 mission = Mission(
                     prompt=prompt, tools=list(SIGNAL_DECISION_TOOLS),
@@ -446,33 +449,40 @@ class TradeLoop:
                     max_turns=self.settings.llama_swap.max_turns,
                     timeout_sec=self.settings.llama_swap.timeout_sec)
 
-            self.watch.begin(mid, "trade", mission.timeout_sec)
-            try:
-                run_result = self.runner.run(mission)
-                result = (run_result if isinstance(run_result, MissionResult)
-                          else MissionResult("failed", None, []))
-            except Exception:  # noqa: BLE001
-                _log.exception("signal decision runner raised")
-            finally:
-                self.watch.end(mid)
+            parsed = None
+            if not pre_filtered:
+                self.watch.begin(mid, "trade", mission.timeout_sec)
+                try:
+                    run_result = self.runner.run(mission)
+                    result = (run_result if isinstance(run_result, MissionResult)
+                              else MissionResult("failed", None, []))
+                except Exception:  # noqa: BLE001
+                    _log.exception("signal decision runner raised")
+                finally:
+                    self.watch.end(mid)
 
-            if result.status != "completed":
-                with self._core_lock:
-                    finalize_mission(self.conn, self.activity, self.clock, mid, result)
-                finalized = True
-                self._record_signal_mission_failure(mid, result)
-                return None
+                if result.status != "completed":
+                    with self._core_lock:
+                        finalize_mission(self.conn, self.activity, self.clock, mid,
+                                         result)
+                    finalized = True
+                    self._record_signal_mission_failure(mid, result)
+                    return None
 
-            parsed = parse_decision(result.output if isinstance(result.output, dict)
-                                    else "")
-            if isinstance(parsed, Invalid):
-                failed = MissionResult("failed", {"detail": parsed.detail},
-                                       result.transcript)
-                with self._core_lock:
-                    finalize_mission(self.conn, self.activity, self.clock, mid, failed)
-                finalized = True
-                self._record_signal_mission_failure(mid, failed)
-                return None
+                parsed = parse_decision(result.output
+                                        if isinstance(result.output, dict) else "")
+                if isinstance(parsed, Invalid):
+                    failed = MissionResult("failed", {"detail": parsed.detail},
+                                           result.transcript)
+                    with self._core_lock:
+                        finalize_mission(self.conn, self.activity, self.clock, mid,
+                                         failed)
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_decision_invalid",
+                            parsed.detail, ref_id=str(claimed["id"]))
+                    finalized = True
+                    self._record_signal_mission_failure(mid, failed)
+                    return None
 
             signal_id = int(claimed["id"])
 
@@ -495,10 +505,6 @@ class TradeLoop:
                     Category.AGGREGATE, "signal_snapshot_requeue",
                     type(exc).__name__, ref_id=str(mid))
                 raise
-            pair_rule = self.settings.risk.pair_rules.get(intent.pair)
-            assumed_spread = pair_rule.assumed_spread_pips if pair_rule else 0.0
-            spread = spread_from_quote(None, None, pip_size=spec.pip_size,
-                                       assumed_spread_pips=assumed_spread)
             output = result.output if isinstance(result.output, dict) else None
             snapshot = None
             if isinstance(parsed, Accept):
@@ -514,6 +520,10 @@ class TradeLoop:
                     raise
                 if self.executor.state_fn() != "ready":
                     return None
+                quote = getattr(snapshot, "quote", None)
+            else:
+                quote = self._quote_for_spread(intent.pair)
+            spread = self._shadow_spread(intent.pair, spec.pip_size, quote)
             payload_for_commit = intent_payload(intent)
             with contextlib.ExitStack() as locks:
                 resolved = self._resolved_by_identity.get(
@@ -555,6 +565,7 @@ class TradeLoop:
                             reason=signals.freshness_abandon_reason(claimed))
                         missions.finish(self.conn, mid, "failed", None, [], gate_now)
                         consumed = finalized = True
+                        terminal = TERMINAL_FRESHNESS_ABANDONED
                         return None
                     if snapshot_reason is not None:
                         return None
@@ -569,6 +580,7 @@ class TradeLoop:
                             reason="source_inactive")
                         missions.finish(self.conn, mid, "failed", None, [], gate_now)
                         consumed = finalized = True
+                        terminal = TERMINAL_FRESHNESS_ABANDONED
                         return None
                     if reject_code == "opposite_position":
                         active_orders = orders_store.list_by_status(
@@ -582,25 +594,39 @@ class TradeLoop:
                                 result.transcript)
                             finalize_mission(self.conn, self.activity, self.clock,
                                              mid, failed)
+                            self.activity.write(
+                                Category.AGGREGATE, "signal_decision_invalid",
+                                "invalid_reject_code", ref_id=str(signal_id))
                             finalized = True
                             return None
+                    if pre_filtered or (
+                            isinstance(parsed, Accept)
+                            and self.econ.window_view(intent.pair, gate_now).in_window):
+                        signal_decisions.commit_reject(
+                            self.conn, mission_id=mid, signal_id=signal_id,
+                            actor=signal_decisions.ACTOR_SYSTEM,
+                            reject_code=signal_decisions.SYSTEM_REJECT_CODE,
+                            spread=spread, output=output,
+                            transcript=result.transcript, now=gate_now)
+                        consumed = finalized = True
+                        terminal = TERMINAL_DECISION
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_filtered_econ_window",
+                            signal_decisions.SYSTEM_REJECT_CODE,
+                            ref_id=str(signal_id))
+                        return {"result": "rejected", "order_id": None,
+                                "reasons": ["econ_window"]}
                     if isinstance(parsed, Accept):
-                        if self.econ.window_view(intent.pair, gate_now).in_window:
-                            signal_decisions.commit_reject(
-                                self.conn, mission_id=mid, signal_id=signal_id,
-                                actor=signal_decisions.ACTOR_SYSTEM,
-                                reject_code=signal_decisions.SYSTEM_REJECT_CODE,
-                                spread=spread, output=output,
-                                transcript=result.transcript, now=gate_now)
-                            consumed = finalized = True
-                            return {"result": "rejected", "order_id": None,
-                                    "reasons": ["econ_window"]}
                         committed = signal_decisions.commit_accept(
                             self.conn, mission_id=mid, signal_id=signal_id,
                             intent_payload=payload_for_commit, spread=spread,
                             output=output, transcript=result.transcript,
                             now=gate_now)
                         consumed = finalized = True
+                        terminal = TERMINAL_DECISION
+                        self.activity.write(
+                            Category.AGGREGATE, "signal_accepted", "accept",
+                            ref_id=str(signal_id))
                         try:
                             out = self.executor.open_from_snapshot(
                                 intent, committed.trade_intent_id, snapshot,
@@ -625,6 +651,10 @@ class TradeLoop:
                         spread=spread, output=output, transcript=result.transcript,
                         now=gate_now)
                     consumed = finalized = True
+                    terminal = TERMINAL_DECISION
+                    self.activity.write(
+                        Category.AGGREGATE, "signal_rejected_by_llm",
+                        reject_code, ref_id=str(signal_id))
                     return {"result": "rejected", "order_id": None,
                             "reasons": [reject_code]}
         except Exception:  # noqa: BLE001
@@ -649,6 +679,32 @@ class TradeLoop:
                 with self._core_lock:
                     finalize_mission(self.conn, self.activity, self.clock, mid,
                                      MissionResult("failed", None, []))
+            if terminal is not None and claimed is not None:
+                self._report_signal_terminal(int(claimed["id"]), terminal)
+
+    def _quote_for_spread(self, pair: str):
+        """shadow の spread 用の quote。取れなければ None (assumed になる)。"""
+        try:
+            return self.executor.quote_fn(pair)
+        except Exception:  # noqa: BLE001 — spread の取得失敗で採否を止めない
+            return None
+
+    def _shadow_spread(self, pair: str, pip_size: float, quote):
+        pair_rule = self.settings.risk.pair_rules.get(pair)
+        assumed = pair_rule.assumed_spread_pips if pair_rule else 0.0
+        bid = getattr(quote, "bid", None)
+        ask = getattr(quote, "ask", None)
+        return spread_from_quote(bid, ask, pip_size=pip_size,
+                                 assumed_spread_pips=assumed)
+
+    def _report_signal_terminal(self, signal_id: int, kind: str) -> None:
+        """commit 後、core lock の外で warning 評価境界へ終端を渡す。"""
+        if self.signal_terminal is None:
+            return
+        try:
+            self.signal_terminal(signal_id, kind)
+        except Exception:  # noqa: BLE001 — 評価の失敗で採否を変えない
+            _log.exception("signal terminal evaluation failed")
 
     def _record_signal_mission_failure(self, mission_id: int,
                                        result: MissionResult) -> None:

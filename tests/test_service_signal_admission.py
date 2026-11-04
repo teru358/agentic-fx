@@ -1000,3 +1000,16 @@ def test_a_failing_evaluation_does_not_stop_the_producer(conn):
         conn=conn, signal_producer=producer, approved=[], settings=SETTINGS,
         now=NOW, resolved_by_identity={}, activity=None, on_terminal=boom)
     assert ran == [1]
+
+
+def test_trade_loop_reports_signal_terminals_to_the_wait_budget(tmp_path):
+    _init(tmp_path)
+    app = build_app(tmp_path, runner=FakeRunner([]), clock=FixedClock(NOW),
+                    embedding_fn=FakeEmbedding())
+    try:
+        hook = app.trade_loop.signal_terminal
+        assert hook is not None
+        assert hook.__name__ == "on_signal_terminal"
+        assert hook.__self__ is not None
+    finally:
+        app.close()

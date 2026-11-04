@@ -207,6 +207,15 @@ def test_streak_count_does_not_filter_reject_category(tmp_path):
     assert gate_reject_streak(c)[1] == 2
 
 
+def test_econ_window_rejections_do_not_count_in_the_streak(tmp_path):
+    c = _conn(tmp_path)
+    anchor = _intent(c, "open", "accepted", None)
+    _intent(c, "open", "rejected", "risk_gate")
+    _intent(c, "open", "rejected", "econ_window")
+    _intent(c, "open", "rejected", "econ_window")
+    assert gate_reject_streak(c) == (anchor, 1, "risk_gate")
+
+
 def test_close_rejection_is_not_counted(tmp_path):
     c = _conn(tmp_path)
     _intent(c, "close", "rejected", "execution")

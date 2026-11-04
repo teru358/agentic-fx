@@ -65,6 +65,7 @@ def _loop(tmp_path, results, healthy=True, monotonic_fn=None, conn=None):
         provider.healthcheck.side_effect = DataUnhealthy("all down")
     econ = MagicMock()
     econ.upcoming.return_value = []
+    econ.window_view.return_value.in_window = False
     runner = FakeRunner(results)
     policy_path = tmp_path / "directives.md"
     policy_path.write_text("USDJPY は月末は控えめに", encoding="utf-8")

@@ -1756,6 +1756,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         wait_budget = WaitBudgetEvaluator(
             conn=conn_admission, settings=settings, strategies_fn=deployed.current,
             activity=activity, now_fn=clock.now, writer_admission=writer_admission)
+        trade_loop.signal_terminal = wait_budget.on_signal_terminal
         calendar_notice = CalendarFreshnessNotice(
             conn=conn_core, freshness_fn=econ.freshness, activity=activity)
         admission = SignalAdmission(
