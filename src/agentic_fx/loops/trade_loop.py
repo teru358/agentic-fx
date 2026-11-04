@@ -49,6 +49,7 @@ from agentic_fx.store import alert_state
 from agentic_fx.store import signal_decisions
 from agentic_fx.store.signal_shadow import spread_from_quote
 from agentic_fx.store import intents as intents_store
+from agentic_fx.store import orders as orders_store
 from agentic_fx.store import mission_decision_bars, missions, signals
 from agentic_fx.plugin import switch
 from agentic_fx.plugin.deploy_ops import acquire_name_locks
@@ -486,7 +487,14 @@ class TradeLoop:
 
             reject_code = parsed.code if isinstance(parsed, Reject) else None
 
-            spec = self.executor.spec_fn(intent.pair)
+            try:
+                spec = self.executor.spec_fn(intent.pair)
+            except (NotTradableSymbol, ExposureNotTradableSymbol, DataUnhealthy) as exc:
+                # decision は書かず requeue する (上限で終わる)。理由は固定語で残す。
+                self.activity.write(
+                    Category.AGGREGATE, "signal_snapshot_requeue",
+                    type(exc).__name__, ref_id=str(mid))
+                raise
             pair_rule = self.settings.risk.pair_rules.get(intent.pair)
             assumed_spread = pair_rule.assumed_spread_pips if pair_rule else 0.0
             spread = spread_from_quote(None, None, pip_size=spec.pip_size,
@@ -563,7 +571,6 @@ class TradeLoop:
                         consumed = finalized = True
                         return None
                     if reject_code == "opposite_position":
-                        from agentic_fx.store import orders as orders_store
                         active_orders = orders_store.list_by_status(
                             self._conn_supervisor, S.OPEN, S.PENDING_FILL,
                             S.PROTECTION_PENDING)

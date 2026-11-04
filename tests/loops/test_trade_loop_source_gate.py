@@ -95,6 +95,22 @@ def test_snapshot_failure_requeues_and_records_the_reason(tmp_path, monkeypatch,
     assert "unavailable" not in log
 
 
+def test_spec_lookup_failure_requeues_and_records_the_reason(tmp_path, monkeypatch):
+    conn, loop, signal_id = _prepare(tmp_path)
+
+    def unknown(_pair):
+        raise trade_loop.DataUnhealthy("no spec for pair")
+
+    monkeypatch.setattr(loop.executor, "spec_fn", unknown)
+    loop.run_once("signal")
+
+    assert _row(conn, signal_id)["status"] == "pending"
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    log = (tmp_path / "a.log").read_text()
+    assert "signal_snapshot_requeue" in log and "DataUnhealthy" in log
+    assert "no spec for pair" not in log
+
+
 def test_retry_limit_abandons_claim_with_reason_and_time(tmp_path, monkeypatch):
     conn, loop, signal_id = _prepare(tmp_path, requeue_count=2)
     loop.settings = SETTINGS.model_copy(deep=True)
