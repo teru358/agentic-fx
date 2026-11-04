@@ -673,6 +673,46 @@ def test_lease_recovery_linked_signal_cannot_be_claimed_again(tmp_path):
         conn, mission_id=next_mission, now=NOW, freshness_bars=2) is None
 
 
+def test_lease_boundary_keeps_linked_claims_terminal_and_reclaims_only_unlinked(
+        tmp_path):
+    conn = _conn(tmp_path)
+    mission_id = missions.start(conn, "trade", "local", "model", NOW)
+    linked_before = _linked_claimed(conn, mission_id, link=True)
+    conn.execute("UPDATE signals SET content_hash='linked-before' WHERE id=?",
+                 (linked_before,))
+    linked_equal = _linked_claimed(conn, mission_id, link=True)
+    conn.execute("UPDATE signals SET content_hash='linked-equal' WHERE id=?",
+                 (linked_equal,))
+    unlinked_expired = _linked_claimed(conn, mission_id, link=False)
+    lease_min = 15
+    boundary = NOW - timedelta(minutes=lease_min)
+    conn.execute(
+        "UPDATE signals SET claimed_by_mission_id=NULL, claimed_at=? WHERE id=?",
+        ((boundary + timedelta(seconds=1)).isoformat(), linked_before))
+    conn.execute(
+        "UPDATE signals SET claimed_by_mission_id=NULL, claimed_at=? WHERE id=?",
+        (boundary.isoformat(), linked_equal))
+    conn.execute(
+        "UPDATE signals SET claimed_at=?, bar_ts=?, kind='strategy', "
+        "contract_version='executable_v1' WHERE id=?",
+        ((boundary - timedelta(hours=1)).isoformat(),
+         (NOW - timedelta(hours=1)).isoformat(), unlinked_expired))
+    conn.commit()
+
+    statuses = signals.reclaim_expired(
+        conn, now=NOW, lease_min=lease_min, max_requeue=3)
+
+    assert statuses == ["abandoned", "pending"]
+    assert _status(conn, linked_before) == "claimed"
+    assert _status(conn, linked_equal) == "abandoned"
+    assert _status(conn, unlinked_expired) == "pending"
+    next_mission = missions.start(conn, "trade", "local", "model", NOW)
+    claimed = signals.claim_oldest(
+        conn, mission_id=next_mission, now=NOW, freshness_bars=2)
+    assert claimed is not None
+    assert claimed["id"] == unlinked_expired
+
+
 def test_expire_stale_abandons_linked_pending_signal(tmp_path):
     conn = _conn(tmp_path)
     stale = signals.add(

@@ -618,6 +618,7 @@ class TradeLoop:
         claimed: dict | None = None
         finalized = False
         consumed = False
+        deferred_notifications: list[str] = []
         result = MissionResult("failed", None, [])
         try:
             with self._core_lock:
@@ -682,21 +683,6 @@ class TradeLoop:
                 raise ValueError("signal intent failed origin/loop validation")
 
             reject_code = parsed.code if isinstance(parsed, Reject) else None
-            if reject_code == "opposite_position":
-                from agentic_fx.store import orders as orders_store
-                active_orders = orders_store.list_by_status(
-                    self._conn_supervisor, S.OPEN, S.PENDING_FILL,
-                    S.PROTECTION_PENDING)
-                if not verify_opposite_position(
-                        parsed, active_orders, pair=claimed["pair"],
-                        direction=claimed.get("direction")):
-                    failed = MissionResult("failed", {"detail": "invalid_reject_code"},
-                                           result.transcript)
-                    with self._core_lock:
-                        finalize_mission(self.conn, self.activity, self.clock,
-                                         mid, failed)
-                    finalized = True
-                    return None
 
             spec = self.executor.spec_fn(intent.pair)
             pair_rule = self.settings.risk.pair_rules.get(intent.pair)
@@ -713,7 +699,7 @@ class TradeLoop:
                     return None
             from agentic_fx.core.executor import _intent_payload
             intent_payload = _intent_payload(intent)
-            with contextlib.ExitStack() as locks, self._core_lock:
+            with contextlib.ExitStack() as locks:
                 resolved = self._resolved_by_identity.get(
                     (claimed["plugin"], claimed["content_hash"]))
                 if self._plugins_root is not None:
@@ -725,73 +711,96 @@ class TradeLoop:
                         self._plugins_root, source_names,
                         deadline=monotonic()
                         + self.settings.worker.plugin_lock_timeout_sec))
-                gate_now = self.clock.now()
-                _, fresh_until = signals.freshness_window(
-                    claimed["timeframe"], claimed["bar_ts"],
-                    self.settings.plugin.signal_freshness_bars)
-                if gate_now > datetime.fromisoformat(fresh_until):
-                    signals.abandon_claimed(
-                        self.conn, signal_id, now=gate_now,
-                        reason=signals.freshness_abandon_reason(claimed))
-                    missions.finish(self.conn, mid, "failed", None, [], gate_now)
-                    consumed = finalized = True
-                    return None
-                if self.executor.state_fn() != "ready":
-                    return None
-                if snapshot is not None:
-                    snapshot_reason = snapshot_age_exceeded(
+                with self._core_lock, self.executor.defer_notifications() as deferred:
+                    deferred_notifications = deferred
+                    gate_now = self.clock.now()
+                    _, fresh_until = signals.freshness_window(
+                        claimed["timeframe"], claimed["bar_ts"],
+                        self.settings.plugin.signal_freshness_bars)
+                    signal_stale = gate_now > datetime.fromisoformat(fresh_until)
+                    snapshot_reason = (snapshot_age_exceeded(
                         snapshot, gate_now,
                         self.settings.worker.snapshot_max_age_sec)
+                        if snapshot is not None else None)
+                    if signal_stale:
+                        signals.abandon_claimed(
+                            self.conn, signal_id, now=gate_now,
+                            reason=signals.freshness_abandon_reason(claimed))
+                        missions.finish(self.conn, mid, "failed", None, [], gate_now)
+                        consumed = finalized = True
+                        return None
                     if snapshot_reason is not None:
                         return None
-                if (self._plugins_root is not None
-                        and not signal_source_active(
-                            self.conn, self._plugins_root, claimed["plugin"],
-                            claimed["content_hash"], resolved)):
-                    signals.abandon_claimed(
-                        self.conn, signal_id, now=gate_now,
-                        reason="source_inactive")
-                    missions.finish(self.conn, mid, "failed", None, [], gate_now)
-                    consumed = finalized = True
-                    return None
-                if isinstance(parsed, Accept):
-                    if self.econ.window_view(intent.pair, gate_now).in_window:
-                        committed = signal_decisions.commit_reject(
-                            self.conn, mission_id=mid, signal_id=signal_id,
-                            actor=signal_decisions.ACTOR_SYSTEM,
-                            reject_code=signal_decisions.SYSTEM_REJECT_CODE,
-                            spread=spread, output=output,
-                            transcript=result.transcript, now=gate_now)
+                    if self.executor.state_fn() != "ready":
+                        return None
+                    if (self._plugins_root is not None
+                            and not signal_source_active(
+                                self.conn, self._plugins_root, claimed["plugin"],
+                                claimed["content_hash"], resolved)):
+                        signals.abandon_claimed(
+                            self.conn, signal_id, now=gate_now,
+                            reason="source_inactive")
+                        missions.finish(self.conn, mid, "failed", None, [], gate_now)
                         consumed = finalized = True
-                        return {"result": "rejected", "order_id": None,
-                                "reasons": ["econ_window"]}
-                    committed = signal_decisions.commit_accept(
-                        self.conn, mission_id=mid, signal_id=signal_id,
-                        intent_payload=intent_payload, spread=spread,
-                        output=output, transcript=result.transcript,
-                        now=gate_now)
-                else:
-                    committed = signal_decisions.commit_reject(
+                        return None
+                    if reject_code == "opposite_position":
+                        from agentic_fx.store import orders as orders_store
+                        active_orders = orders_store.list_by_status(
+                            self._conn_supervisor, S.OPEN, S.PENDING_FILL,
+                            S.PROTECTION_PENDING)
+                        if not verify_opposite_position(
+                                parsed, active_orders, pair=intent.pair,
+                                direction=intent.direction):
+                            failed = MissionResult(
+                                "failed", {"detail": "invalid_reject_code"},
+                                result.transcript)
+                            finalize_mission(self.conn, self.activity, self.clock,
+                                             mid, failed)
+                            finalized = True
+                            return None
+                    if isinstance(parsed, Accept):
+                        if self.econ.window_view(intent.pair, gate_now).in_window:
+                            signal_decisions.commit_reject(
+                                self.conn, mission_id=mid, signal_id=signal_id,
+                                actor=signal_decisions.ACTOR_SYSTEM,
+                                reject_code=signal_decisions.SYSTEM_REJECT_CODE,
+                                spread=spread, output=output,
+                                transcript=result.transcript, now=gate_now)
+                            consumed = finalized = True
+                            return {"result": "rejected", "order_id": None,
+                                    "reasons": ["econ_window"]}
+                        committed = signal_decisions.commit_accept(
+                            self.conn, mission_id=mid, signal_id=signal_id,
+                            intent_payload=intent_payload, spread=spread,
+                            output=output, transcript=result.transcript,
+                            now=gate_now)
+                        consumed = finalized = True
+                        out = self.executor.open_from_snapshot(
+                            intent, committed.trade_intent_id, snapshot,
+                            max_snapshot_age_sec=(
+                                self.settings.worker.snapshot_max_age_sec))
+                        return out
+                    signal_decisions.commit_reject(
                         self.conn, mission_id=mid, signal_id=signal_id,
                         actor=signal_decisions.ACTOR_LLM, reject_code=reject_code,
                         spread=spread, output=output, transcript=result.transcript,
                         now=gate_now)
-            if isinstance(parsed, Accept):
-                consumed = finalized = True
-                out = self.executor.open_from_snapshot(
-                    intent, committed.trade_intent_id, snapshot,
-                    max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
-                return out
-            consumed = finalized = True
-            return {"result": "rejected", "order_id": None,
-                    "reasons": [reject_code]}
+                    consumed = finalized = True
+                    return {"result": "rejected", "order_id": None,
+                            "reasons": [reject_code]}
         except Exception:  # noqa: BLE001
             _log.exception("signal decision flow failed")
             return None
         finally:
+            for message in deferred_notifications:
+                try:
+                    self.notifier.send(message)
+                except Exception:  # noqa: BLE001 — notification failure is non-fatal
+                    _log.exception("signal notification failed")
             if claimed is not None and not consumed:
                 with self._core_lock:
-                    message = self._requeue_signal(claimed)
+                    message = self._requeue_signal(
+                        claimed, abandon_if_stale=True)
                 if message:
                     try:
                         self.notifier.send(message)
