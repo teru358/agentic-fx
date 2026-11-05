@@ -101,9 +101,6 @@ def day_close_deadline(origin: datetime) -> datetime:
     return market_hours.next_rollover(origin) - market_hours.DAY_CLOSE_BUFFER
 
 
-_deadline = day_close_deadline
-
-
 def _range_rows(rows, start: datetime, end: datetime) -> list:
     """区間 [start,end) の開場 minute が 1 行ずつ揃っていることを確かめ、区間内の行を返す。
 
@@ -172,7 +169,7 @@ def select_limit_entry(rows: Sequence, *, t0: datetime, requested_price: float,
             return LimitEntrySelection(None, None, expiry, True)
         price = check_limit_fill(order, _as_bar(row), spread)
         if price is not None:
-            deadline = _deadline(at)
+            deadline = day_close_deadline(at)
             bar_end = at + timedelta(minutes=1)
             return LimitEntrySelection(row, price,
                                        bar_end if bar_end > deadline else deadline)
@@ -222,7 +219,7 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
         raise ValueError("limit entry requires requested_price")
     unrecoverable = bool(getattr(rows, "unrecoverable", False))
     if unrecoverable:
-        end = _deadline(t0) if kind == "market" else t0 + timedelta(hours=4)
+        end = day_close_deadline(t0) if kind == "market" else t0 + timedelta(hours=4)
         return _insufficient(direction, pip_size, end)
     raw_rows = rows.rows if hasattr(rows, "rows") else rows
     ordered = sorted(raw_rows, key=lambda row: _utc(
@@ -233,7 +230,7 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
     entry_row = None
     entry_price = None
     if kind == "market":
-        deadline = _deadline(t0)
+        deadline = day_close_deadline(t0)
         ordered = sorted(_range_rows(rows, t0, deadline), key=times)
         marker_times = {times(row) for row in ordered if _is_marker(row)}
         for row in ordered:

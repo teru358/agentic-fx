@@ -1436,6 +1436,7 @@ def test_a_staged_shadow_whose_source_bars_leave_retention_ends_as_data_insuffic
     world.db.execute("DELETE FROM ohlcv_cache WHERE bar_time < ?",
                      (datetime(2026, 11, 2, 13, 0, tzinfo=UTC).isoformat(),))
     world.db.commit()
+    w = _worker(world, _Clock(LATE))
     for _ in range(3):
         w.run_cycle()
         if ss.get(world.db, shadow)["state"] != "pending_entry":
@@ -1634,3 +1635,190 @@ def test_the_next_owner_reads_what_another_connection_wrote_between_owners(world
     read = world.open(read_only=True)
     rows = {r.bar_time: r for r in os_.complete_rows(read, second)}
     assert rows[datetime(2026, 11, 3, 7, 0, tzinfo=UTC)].close == 155.0
+
+
+# --- 保持・再試行・巡回・読込みの量 ------------------------------------------------------------
+
+def _count_normalize(monkeypatch, clock=None, cost=0.0, fail_before=None):
+    calls = []
+    real = worker_mod.normalize_1m
+
+    def counting(conn, pair, start, end):
+        calls.append((start, end))
+        if fail_before is not None and start < fail_before:
+            raise RuntimeError("normalize failed")
+        if clock is not None:
+            clock.t += cost
+        return real(conn, pair, start, end)
+
+    monkeypatch.setattr(worker_mod, "normalize_1m", counting)
+    return calls
+
+
+def test_an_event_whose_read_uses_the_whole_cycle_budget_still_completes(world, monkeypatch):
+    _seed(world.db)
+    set_id = _event_set(world.db)
+    clock = _Clock(LATE)
+    calls = _count_normalize(monkeypatch, clock, cost=0.3)
+    w = _worker(world, clock, monotonic=clock.monotonic)
+    for _ in range(5):
+        w.run_cycle()
+        if os_.get_set(world.db, set_id)["state"] == "complete":
+            break
+    assert os_.get_set(world.db, set_id)["state"] == "complete"
+    assert len(calls) == 1
+
+
+def test_a_shadow_whose_read_uses_the_whole_cycle_budget_still_completes(world, monkeypatch):
+    _seed(world.db)
+    shadow = _shadow(world.db, 0)
+    clock = _Clock(LATE)
+    calls = _count_normalize(monkeypatch, clock, cost=0.3)
+    w = _worker(world, clock, monotonic=clock.monotonic)
+    for _ in range(5):
+        w.run_cycle()
+        if ss.get(world.db, shadow)["state"] != "pending_entry":
+            break
+    assert ss.get(world.db, shadow)["state"] == "resolved"
+    assert len(calls) == 1
+
+
+def test_a_limit_shadow_waiting_for_its_final_point_is_not_read_again(world, monkeypatch):
+    fill = (150.0, 150.05, 149.8, 150.0)
+    late_fill = datetime(2026, 11, 2, 22, 1, tzinfo=UTC)
+    decided = datetime(2026, 11, 2, 18, 5, tzinfo=UTC)
+    _seed(world.db, {late_fill: fill})
+    shadow = _shadow(world.db, 0, entry_type="limit", limit_price=149.9,
+                     decided=decided)
+    waiting = datetime(2026, 11, 3, 22, 30, tzinfo=UTC)
+    clock = _Clock(waiting)
+    calls = _count_normalize(monkeypatch)
+    w = _worker(world, clock)
+    for minutes in (0, 1, 2):
+        clock.now = waiting + timedelta(minutes=minutes)
+        w.run_cycle()
+        assert ss.get(world.db, shadow)["state"] == "pending_entry"
+    assert len(calls) == 1
+    clock.now = datetime(2026, 11, 4, 22, 0, tzinfo=UTC)
+    w.run_cycle()
+    assert ss.get(world.db, shadow)["state"] == "resolved"
+    assert len(calls) == 2
+
+
+class _FailStartOnce(EconSliceWorker):
+    failures = 1
+
+    def _write(self, *args, **kwargs):
+        if self.failures:
+            self.failures -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return super()._write(*args, **kwargs)
+
+
+def test_a_non_busy_error_at_startup_is_logged_and_retried(world, caplog):
+    _seed(world.db)
+    set_id = _event_set(world.db)
+    read, write = world.pair()
+    w = _FailStartOnce(
+        read_conn=read, write_conn=write, core_lock=threading.RLock(),
+        admission=WriterAdmission(), quote_fn=_unavailable,
+        pip_size_fn=lambda pair: 0.01, assumed_spread_pips_fn=lambda pair: 1.5,
+        now_fn=_Clock(LATE), interval_sec=0.01)
+    stop = threading.Event()
+    thread = _run_in_thread(w, stop)
+    try:
+        deadline = time.monotonic() + 20
+        while (os_.get_set(world.db, set_id)["state"] != "complete"
+               and time.monotonic() < deadline):
+            time.sleep(0.01)
+    finally:
+        assert _stop_and_join(thread, stop)
+    assert w.failures == 0
+    assert os_.get_set(world.db, set_id)["state"] == "complete"
+    assert "econ slice worker start failed" in caplog.text
+
+
+def test_one_quote_is_taken_per_pair_in_a_cycle(world):
+    ids = [_event_set(world.db, SPREAD_TS, name=f"NFP{i}") for i in range(3)]
+    clock = _Clock(SPREAD_TS - timedelta(minutes=4))
+    calls = []
+
+    def quote(pair):
+        calls.append(pair)
+        return _quote()
+
+    w = _worker(world, clock, quote_fn=quote)
+    clock.now = SPREAD_TS - timedelta(minutes=4)
+    report = w.run_cycle()
+    assert calls == ["USDJPY"] and report.spreads == 3
+    rows = [os_.get_set(world.db, i) for i in ids]
+    assert {r["spread_source"] for r in rows} == {"quote"}
+    assert [r["spread_pips"] for r in rows] == [pytest.approx(2.0)] * 3
+
+
+def test_a_failed_quote_is_not_retried_within_the_cycle(world):
+    ids = [_event_set(world.db, SPREAD_TS, name=f"NFP{i}") for i in range(3)]
+    clock = _Clock(SPREAD_TS - timedelta(minutes=4))
+    calls = []
+
+    def quote(pair):
+        calls.append(pair)
+        raise RuntimeError("no quote")
+
+    w = _worker(world, clock, quote_fn=quote)
+    clock.now = SPREAD_TS - timedelta(minutes=4)
+    report = w.run_cycle()
+    assert calls == ["USDJPY"] and report.spreads == 0
+    assert all(os_.get_set(world.db, i)["spread_source"] is None for i in ids)
+    w.run_cycle()
+    assert calls == ["USDJPY", "USDJPY"]
+
+
+def test_events_that_cannot_complete_do_not_hold_back_a_later_mature_one(world, monkeypatch):
+    _seed(world.db)
+    ids = [_event_set(world.db, EVENT_TS + timedelta(minutes=i), name=f"E{i}")
+           for i in range(worker_mod.MAX_OWNERS_PER_CYCLE)]
+    good = _event_set(world.db, EVENT_TS + timedelta(minutes=30), name="late")
+    boundary = _at(os_.get_set(world.db, good)["range_start"])
+    _count_normalize(monkeypatch, fail_before=boundary)
+    w = _worker(world, _Clock(LATE))
+    for _ in range(4):
+        w.run_cycle()
+        if os_.get_set(world.db, good)["state"] == "complete":
+            break
+    assert os_.get_set(world.db, good)["state"] == "complete"
+    assert all(os_.get_set(world.db, i)["state"] == "awaiting" for i in ids)
+
+
+def test_staging_a_long_range_does_not_reread_every_row_per_batch(world, monkeypatch):
+    fill = (150.0, 150.05, 149.8, 150.0)
+    late_fill = datetime(2026, 11, 2, 22, 1, tzinfo=UTC)
+    decided = datetime(2026, 11, 2, 18, 5, tzinfo=UTC)
+    _seed(world.db, {late_fill: fill})
+    shadow = _shadow(world.db, 0, entry_type="limit", limit_price=149.9,
+                     decided=decided)
+    reads, writes = [], []
+    real_read, real_write = os_.staging_rows, os_.stage_shadow_rows
+    monkeypatch.setattr(os_, "staging_rows",
+                        lambda *a, **k: reads.append(1) or real_read(*a, **k))
+    monkeypatch.setattr(os_, "stage_shadow_rows",
+                        lambda *a, **k: writes.append(1) or real_write(*a, **k))
+    w = _worker(world, _Clock(datetime(2026, 11, 4, 22, 0, tzinfo=UTC)))
+    w.run_cycle()
+    assert ss.get(world.db, shadow)["state"] == "resolved"
+    assert len(writes) >= 6
+    assert len(reads) <= 2
+
+
+def test_kept_state_is_bounded_and_dropped_when_an_owner_ends(world):
+    _seed(world.db)
+    memo = worker_mod._Memo(worker_mod.OWNER_MEMO_MAX)
+    for i in range(worker_mod.OWNER_MEMO_MAX + 5):
+        memo.put(i, i)
+    assert len(memo) == worker_mod.OWNER_MEMO_MAX
+    assert memo.get(0) is None and memo.get(worker_mod.OWNER_MEMO_MAX + 4) is not None
+    set_id = _event_set(world.db)
+    w = _worker(world, _Clock(LATE))
+    w.run_cycle()
+    assert os_.get_set(world.db, set_id)["state"] == "complete"
+    assert len(w._event_norms) == 0

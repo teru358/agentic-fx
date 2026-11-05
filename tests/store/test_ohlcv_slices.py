@@ -338,6 +338,42 @@ def test_matured_event_sets_wait_for_four_hours_and_a_day(tmp_path):
                                                     limit=5)] == [set_id]
 
 
+def test_matured_event_sets_continue_after_a_key_in_the_same_order(tmp_path):
+    conn = _conn(tmp_path)
+    ids = [_event_set(conn, _event(conn, ts=TS + timedelta(minutes=i),
+                                   name=f"E{i}")) for i in range(5)]
+    late = TS + timedelta(days=3)
+    everything = os_.matured_event_sets(conn, now=late, limit=10)
+    assert [r["id"] for r in everything] == ids
+    key = (everything[1]["ts"], everything[1]["id"])
+    rest = os_.matured_event_sets(conn, now=late, limit=10, after=key)
+    assert [r["id"] for r in rest] == ids[2:]
+    assert os_.matured_event_sets(
+        conn, now=late, limit=10,
+        after=(everything[-1]["ts"], everything[-1]["id"])) == []
+
+
+def test_marking_a_shadow_unrecoverable_checks_the_budget_before_its_first_read(tmp_path):
+    conn = _conn(tmp_path)
+    shadow_id = _shadow(conn)
+    cas = ShadowCas(shadow_id, "pending_entry",
+                    ss.get(conn, shadow_id)["updated_at"],
+                    ss.ShadowOutcome.data_insufficient())
+    statements = []
+    conn.set_trace_callback(statements.append)
+
+    def over():
+        raise os_.OverBudget
+
+    out = os_.mark_shadow_unrecoverable(
+        conn, shadow=cas, pair="USDJPY", range_start=NOW,
+        range_end=NOW + timedelta(hours=1), now=NOW, checkpoint=over)
+    conn.set_trace_callback(None)
+    assert out.status == "over_budget"
+    assert not any("signal_shadow" in st for st in statements)
+    assert ss.get(conn, shadow_id)["state"] == "pending_entry"
+
+
 # --- staging と完備 ---------------------------------------------------------
 
 def test_staging_moves_awaiting_to_the_current_generation_and_completes(tmp_path):

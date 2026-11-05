@@ -437,15 +437,22 @@ def record_event_spread_tx(conn: sqlite3.Connection, set_id: int, *,
 
 
 def matured_event_sets(conn: sqlite3.Connection, *, now: datetime,
-                       limit: int) -> list[dict]:
-    """`ts+4h+1 日` を過ぎて complete / unrecoverable / cancelled でない event set。"""
+                       limit: int,
+                       after: tuple[str, int] | None = None) -> list[dict]:
+    """`ts+4h+1 日` を過ぎて complete / unrecoverable / cancelled でない event set。
+
+    `after` = (event の ts, set id) を渡すと、その key の次から返す。"""
     cutoff = utc_iso(now - EVENT_RANGE_AFTER - FINALIZE_GRACE)
-    return [dict(r) for r in conn.execute(
-        "SELECT ss.*, e.ts FROM ohlcv_slice_sets ss "
-        "JOIN econ_events e ON e.id = ss.event_id "
-        "WHERE ss.state IN (?,?) AND julianday(e.ts) <= julianday(?) "
-        "ORDER BY julianday(e.ts), ss.id LIMIT ?",
-        (STATE_AWAITING, STATE_STAGING, cutoff, int(limit)))]
+    sql = ("SELECT ss.*, e.ts FROM ohlcv_slice_sets ss "
+           "JOIN econ_events e ON e.id = ss.event_id "
+           "WHERE ss.state IN (?,?) AND julianday(e.ts) <= julianday(?) ")
+    args: list = [STATE_AWAITING, STATE_STAGING, cutoff]
+    if after is not None:
+        sql += "AND (julianday(e.ts), ss.id) > (julianday(?), ?) "
+        args += [after[0], int(after[1])]
+    sql += "ORDER BY julianday(e.ts), ss.id LIMIT ?"
+    args.append(int(limit))
+    return [dict(r) for r in conn.execute(sql, args)]
 
 
 # --- 世代 ----------------------------------------------------------------
@@ -705,7 +712,7 @@ def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
     expected = _shadow_range_minutes(range_start, range_end)
 
     def body():
-        _require_live_shadow(conn, shadow.shadow_id, pair)
+        _require_live_shadow(conn, shadow.shadow_id, pair, checkpoint)
         _step(checkpoint)
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE shadow_id=?",
                         (shadow.shadow_id,)).fetchone() is not None:
