@@ -87,7 +87,7 @@ def _utc(dt: datetime) -> datetime:
 def _as_bar(row) -> Bar:
     if isinstance(row, Bar):
         return row
-    return Bar("USDJPY", "1m", row.bar_time, row.open, row.high, row.low,
+    return Bar("econ", "1m", row.bar_time, row.open, row.high, row.low,
                row.close, row.volume or 0.0)
 
 
@@ -100,6 +100,31 @@ def _deadline(origin: datetime) -> datetime:
     return market_hours.next_rollover(origin) - market_hours.DAY_CLOSE_BUFFER
 
 
+def _range_rows(rows, start: datetime, end: datetime) -> list:
+    """区間 [start,end) の開場 minute が 1 行ずつ揃っていることを確かめ、区間内の行を返す。
+
+    正規化結果 (`range_start` / `range_end` を持つもの) は区間が要求を覆うことも
+    確かめる。読み戻した行の列などの素の列も同じ網羅を要求する。
+    """
+    if hasattr(rows, "range_start") or hasattr(rows, "range_end"):
+        if rows.range_start is None or rows.range_end is None:
+            raise ValueError("normalized bars must include range_start and range_end")
+        if _utc(rows.range_start) > start or _utc(rows.range_end) < end:
+            raise ValueError("normalized range does not cover requested interval")
+    raw = rows.rows if hasattr(rows, "rows") else rows
+    if start >= end:
+        return []
+    selected = [row for row in raw if start <= _utc(
+        row.ts if isinstance(row, Bar) else row.bar_time) < end]
+    present = {_utc(row.ts if isinstance(row, Bar) else row.bar_time)
+               for row in selected}
+    missing = next((minute for minute in ohlcv_slices.open_minutes(start, end)
+                    if minute not in present), None)
+    if missing is not None:
+        raise ValueError(f"missing open minute {missing.isoformat()}")
+    return selected
+
+
 def select_limit_entry(rows: Sequence, *, t0: datetime, requested_price: float,
                        direction: str, spread: float) -> LimitEntrySelection:
     """Choose the first limit fill in [t0,t0+4h), or report a marker gap."""
@@ -107,8 +132,9 @@ def select_limit_entry(rows: Sequence, *, t0: datetime, requested_price: float,
     if direction not in ("long", "short"):
         raise ValueError(f"unknown direction: {direction!r}")
     expiry = t0 + timedelta(hours=4)
+    checked_rows = _range_rows(rows, t0, expiry)
     order = {"direction": direction, "requested_price": requested_price}
-    for row in sorted(rows, key=lambda item: _utc(item.ts if isinstance(item, Bar)
+    for row in sorted(checked_rows, key=lambda item: _utc(item.ts if isinstance(item, Bar)
                                                     else item.bar_time)):
         at = _utc(row.ts if isinstance(row, Bar) else row.bar_time)
         if not t0 <= at < expiry:
@@ -117,7 +143,10 @@ def select_limit_entry(rows: Sequence, *, t0: datetime, requested_price: float,
             return LimitEntrySelection(None, None, expiry, True)
         price = check_limit_fill(order, _as_bar(row), spread)
         if price is not None:
-            return LimitEntrySelection(row, price, _deadline(at))
+            deadline = _deadline(at)
+            bar_end = at + timedelta(minutes=1)
+            return LimitEntrySelection(row, price,
+                                       bar_end if bar_end > deadline else deadline)
     return LimitEntrySelection(None, None, expiry)
 
 
@@ -138,9 +167,8 @@ def _result(result_code: str, *, direction: str, entry_price: float | None,
 def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                    requested_price: float | None, stop_loss: float,
                    take_profit: float | None, spread: float, t0: datetime,
-                   pip_size: float,
-                   markers: set[datetime] | None = None) -> ShadowResolution:
-    """Resolve normalized rows (or their normalization result) without storage writes."""
+                   pip_size: float) -> ShadowResolution:
+    """前段は [t0,t0+4h)、解決は [t0,区間終端) の正規化結果を渡す。"""
     t0 = signal_shadow.observation_start(_utc(t0))
     if kind not in ("market", "limit"):
         raise ValueError(f"unknown entry kind: {kind!r}")
@@ -152,24 +180,24 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
     if kind == "limit" and requested_price is None:
         raise ValueError("limit entry requires requested_price")
     unrecoverable = bool(getattr(rows, "unrecoverable", False))
-    if hasattr(rows, "rows"):
-        rows = rows.rows
     if unrecoverable:
         end = _deadline(t0) if kind == "market" else t0 + timedelta(hours=4)
         return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
                        direction=direction, entry_price=None, entry_at=None,
                        exit_price=None, exit_at=None, range_end=end,
                        pip_size=pip_size)
-    markers = {_utc(ts) for ts in (markers or set())}
-    ordered = sorted(rows, key=lambda row: _utc(
+    raw_rows = rows.rows if hasattr(rows, "rows") else rows
+    ordered = sorted(raw_rows, key=lambda row: _utc(
         row.ts if isinstance(row, Bar) else row.bar_time))
     times = lambda row: _utc(row.ts if isinstance(row, Bar) else row.bar_time)
-    marker_times = {times(row) for row in ordered if _is_marker(row)} | markers
+    marker_times = {times(row) for row in ordered if _is_marker(row)}
 
     entry_row = None
     entry_price = None
     if kind == "market":
         deadline = _deadline(t0)
+        ordered = sorted(_range_rows(rows, t0, deadline), key=times)
+        marker_times = {times(row) for row in ordered if _is_marker(row)}
         for row in ordered:
             at = times(row)
             if at < t0 or at >= deadline:
@@ -194,6 +222,7 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                            entry_price=None, entry_at=None, exit_price=None,
                            exit_at=None, range_end=deadline, pip_size=pip_size)
     else:
+        _range_rows(rows, t0, t0 + timedelta(hours=4))
         selection = select_limit_entry(ordered, t0=t0,
                                        requested_price=requested_price,
                                        direction=direction, spread=spread)
@@ -214,6 +243,9 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                            pip_size=pip_size)
         entry_row, entry_price = selection.fill_bar, selection.entry_price
         deadline = selection.range_end
+        if deadline > t0 + timedelta(hours=4):
+            ordered = sorted(_range_rows(rows, t0, deadline), key=times)
+            marker_times = {times(row) for row in ordered if _is_marker(row)}
         entry_at = times(entry_row)
         if any(t0 <= at <= entry_at for at in marker_times):
             return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,

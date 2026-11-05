@@ -76,6 +76,20 @@ def test_invalid_source_ohlc_becomes_an_invalid_data_marker(tmp_path):
     assert result.invalid_minutes == (start,)
 
 
+def test_ohlc_at_database_price_limit_becomes_invalid_marker(tmp_path):
+    start = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    conn = _conn(tmp_path)
+    _put(conn, "ohlcv_cache", "mt5-live", start - timedelta(minutes=1), 150)
+    conn.execute(
+        "INSERT INTO ohlcv_cache (symbol,interval,bar_time,open,high,low,close,volume,source) "
+        "VALUES ('USDJPY','1m',?,?,?,?,?,?,?)",
+        (start.isoformat(), 1e308, 1e308, 1e308, 1e308, 1, "mt5-live"))
+    conn.commit()
+    result = normalize_1m(conn, "USDJPY", start, start + timedelta(minutes=1))
+    assert result.rows[0].quality == ohlcv_slices.QUALITY_OUTAGE
+    assert result.invalid_minutes == (start,)
+
+
 def test_normalized_row_count_matches_open_minute_count(tmp_path):
     start = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
     end = start + timedelta(minutes=255)

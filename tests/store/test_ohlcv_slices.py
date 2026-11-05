@@ -569,6 +569,18 @@ def test_a_shadow_range_holds_at_most_1680_minutes(tmp_path):
                               generation=gen, rows=[], now=NOW)
 
 
+def test_a_shadow_range_over_1680_elapsed_minutes_is_rejected_across_closure(tmp_path):
+    conn = _conn(tmp_path)
+    start = datetime(2026, 11, 6, 20, 0, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1681)
+    assert os_.open_minute_count(start, end) < 1680
+    with pytest.raises(ValueError, match="at most 1680"):
+        os_.stage_shadow_rows(conn, shadow_id=_shadow(conn), pair="USDJPY",
+                              range_start=start, range_end=end,
+                              generation=os_.new_generation(conn, now=NOW),
+                              rows=[], now=NOW)
+
+
 def test_weekend_crossing_ranges_complete_from_normalized_open_minutes(tmp_path):
     conn = _conn(tmp_path)
     start = datetime(2026, 11, 6, 21, 15, tzinfo=timezone.utc)
