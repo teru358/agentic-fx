@@ -48,7 +48,7 @@ from agentic_fx.runners.base import AgentRunner, Mission, MissionResult
 from agentic_fx.store import alert_state
 from agentic_fx.store import signal_decisions
 from agentic_fx.signal_admission import (
-    TERMINAL_DECISION, TERMINAL_FRESHNESS_ABANDONED,
+    FRESHNESS_ABANDON_REASONS, TERMINAL_DECISION, TERMINAL_FRESHNESS_ABANDONED,
 )
 from agentic_fx.store.signal_shadow import spread_from_quote
 from agentic_fx.store import intents as intents_store
@@ -310,9 +310,7 @@ class TradeLoop:
                     econ_window_error: Exception | None = None
                     # signal trigger は上で専用 mission へ分岐済みなので、
                     # ここに来る OPEN はすべて裁量判断として帯を判定する。
-                    if (intent.action is Action.OPEN
-                            and snapshot_error is None
-                            and intent.origin is Origin.SCHEDULER):
+                    if intent.action is Action.OPEN and snapshot_error is None:
                         try:
                             view = self.econ.window_view(
                                 intent.pair, self.clock.now())
@@ -883,12 +881,8 @@ class TradeLoop:
                 message = (f"[agentic-fx] signal #{claimed['id']} "
                            f"({claimed['plugin']}) は鮮度切れのため "
                            "abandoned になりました")
-                freshness_reasons = {
-                    signals.REASON_FRESHNESS_EXPIRED,
-                    signals.REASON_REQUEUED_EXPIRED,
-                }
                 terminal = (TERMINAL_FRESHNESS_ABANDONED
-                            if reason in freshness_reasons else None)
+                            if reason in FRESHNESS_ABANDON_REASONS else None)
                 return message, terminal
             status = signals.requeue(
                 self.conn, claimed["id"], now=self.clock.now(),

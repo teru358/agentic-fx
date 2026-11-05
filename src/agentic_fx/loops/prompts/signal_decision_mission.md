@@ -6,7 +6,7 @@ signal を採用 (accept) するか拒否 (reject) するかだけを判断し�
 - 採否の材料は、ニュース (search_news) と現在の建玉・未約定注文 (get_positions) だけです。
 - 重大なニュースが signal の前提を破壊していると判断したときだけ、reject_code に
   news_shock を選びます。
-- 同じ pair に逆方向の建玉・未約定注文・決済中の注文が実際にあるときだけ、
+- 同じ pair に逆方向の建玉・未約定注文 (保護注文の設定待ちを含む) が実際にあるときだけ、
   reject_code に opposite_position を選べます。無いのに選ぶと契約違反になります。
 - 上の 2 つに当たらなければ accept です。
 
