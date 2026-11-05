@@ -607,7 +607,6 @@ class TradeLoop:
                             reason="source_inactive")
                         missions.finish(self.conn, mid, "failed", None, [], gate_now)
                         consumed = finalized = True
-                        terminal = TERMINAL_FRESHNESS_ABANDONED
                         return None
                     if reject_code == "opposite_position":
                         active_orders = orders_store.list_by_status(
@@ -695,8 +694,10 @@ class TradeLoop:
                     _log.exception("signal notification failed")
             if claimed is not None and not consumed:
                 with self._core_lock:
-                    message = self._requeue_signal(
+                    message, requeue_terminal = self._requeue_signal(
                         claimed, abandon_if_stale=True)
+                if terminal is None and requeue_terminal is not None:
+                    terminal = requeue_terminal
                 if message:
                     try:
                         self.notifier.send(message)
@@ -858,14 +859,15 @@ class TradeLoop:
             f"- payload: {json.dumps(payload, ensure_ascii=False)}\n")
 
     def _requeue_signal(self, claimed: dict, *,
-                        abandon_if_stale: bool = False) -> str | None:
+                        abandon_if_stale: bool = False
+                        ) -> tuple[str | None, str | None]:
         """claim した signal を pending へ戻す (**core_lock 保持中に呼ぶ** —
         signals.requeue は conn_core を書き込むため)。
 
         **通知はここで送らない** (レビュー 1 周目 codex A1)。Notifier.send は
         urlopen(timeout=10) の同期実行なので、lock 保持中に呼ぶと SL/TP
-        監視が最大 10 秒止まる。送るべき文面を返すだけにし、呼び出し元が
-        lock 解放後に送る。
+        監視が最大 10 秒止まる。通知文と freshness 系終端種別を返し、呼び出し元が
+        lock 解放後に通知・評価する。
 
         保守処理そのものの失敗で `_run_once_impl` の本流 (既に確定した
         結果/例外) を上書きしないよう、例外は握りつぶしログのみに残す。
@@ -874,23 +876,31 @@ class TradeLoop:
             if abandon_if_stale and self._claimed_signal_is_stale(claimed):
                 # 新規リスクが止まっている間に鮮度が切れた signal は、
                 # requeue 回数を使って pending に戻さず、その場で終端する。
+                reason = signals.freshness_abandon_reason(claimed)
                 signals.abandon_claimed(
                     self.conn, claimed["id"], now=self.clock.now(),
-                    reason=signals.freshness_abandon_reason(claimed))
-                return (f"[agentic-fx] signal #{claimed['id']} "
-                        f"({claimed['plugin']}) は鮮度切れのため "
-                        "abandoned になりました")
+                    reason=reason)
+                message = (f"[agentic-fx] signal #{claimed['id']} "
+                           f"({claimed['plugin']}) は鮮度切れのため "
+                           "abandoned になりました")
+                freshness_reasons = {
+                    signals.REASON_FRESHNESS_EXPIRED,
+                    signals.REASON_REQUEUED_EXPIRED,
+                }
+                terminal = (TERMINAL_FRESHNESS_ABANDONED
+                            if reason in freshness_reasons else None)
+                return message, terminal
             status = signals.requeue(
                 self.conn, claimed["id"], now=self.clock.now(),
                 max_requeue=self.settings.plugin.signal_requeue_max)
             if status == "abandoned":
                 return (f"[agentic-fx] signal #{claimed['id']} "
                         f"({claimed['plugin']}) は requeue 上限超過のため "
-                        "abandoned になりました")
+                        "abandoned になりました", None)
         except Exception:  # noqa: BLE001 — 保守処理の失敗で本流を止めない
             _log.exception("signal requeue failed for signal_id=%s",
                            claimed["id"])
-        return None
+        return None, None
 
     def _claimed_signal_is_stale(self, claimed: dict) -> bool:
         """鮮度の境界は `expire_stale` と同じ (`freshness_window` の

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -221,7 +222,8 @@ def test_accept_rechecked_inside_window_becomes_system_reject(tmp_path):
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"decision": "accept", "reject_code": None}, [])])
     signal_id = _add_signal(conn)
-    loop.econ.window_view.return_value.in_window = True
+    loop.econ.window_view.side_effect = [
+        SimpleNamespace(in_window=False), SimpleNamespace(in_window=True)]
     loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
         captured_at=NOW)
     loop.executor.open_from_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -229,13 +231,42 @@ def test_accept_rechecked_inside_window_becomes_system_reject(tmp_path):
 
     out = loop.run_once("signal")
 
+    assert len(loop.runner.missions) == 1
+    assert out is not None
     assert out["reasons"] == ["econ_window"]
     decision = conn.execute(
         "SELECT decision,actor,reject_code,trade_intent_id FROM signal_decisions "
         "WHERE signal_id=?", (signal_id,)).fetchone()
     assert tuple(decision) == ("reject", "system", "econ_window", None)
     assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
     assert conn.execute("SELECT status FROM missions").fetchone()[0] == "system_filtered"
+    assert conn.execute(
+        "SELECT state FROM signal_shadow WHERE signal_id=?", (signal_id,)
+    ).fetchone()[0] == "pending_entry"
+    assert _status(conn, signal_id)["status"] == "consumed"
+
+
+def test_accept_window_recheck_failure_does_not_commit_or_execute(tmp_path):
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "accept", "reject_code": None}, [])])
+    signal_id = _add_signal(conn)
+    loop.econ.window_view.side_effect = [
+        SimpleNamespace(in_window=False), RuntimeError("window unavailable")]
+    loop.executor.gather_open_snapshot = lambda intent, **kwargs: SimpleNamespace(
+        captured_at=NOW)
+    loop.executor.open_from_snapshot = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("window check failure must not reach the executor"))
+
+    out = loop.run_once("signal")
+
+    assert out is None
+    assert len(runner.missions) == 1
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM trade_intents").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+    assert _status(conn, signal_id)["status"] == "pending"
+    assert conn.execute("SELECT status FROM missions").fetchone()[0] == "failed"
 
 
 def test_signal_accept_event_keeps_signal_origin_through_sink(tmp_path):
@@ -459,12 +490,36 @@ def test_terminal_decision_is_reported_after_commit(tmp_path):
     conn, loop, _, _ = _loop(tmp_path, [MissionResult(
         "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
     seen = []
-    loop.signal_terminal = lambda sid, kind: seen.append((sid, kind))
+    db_path = tmp_path / "t.db"
+
+    def report(sid, kind):
+        observer = sqlite3.connect(db_path)
+        try:
+            row = observer.execute(
+                "SELECT decision FROM signal_decisions WHERE signal_id=?",
+                (sid,)).fetchone()
+            seen.append((sid, kind, row[0] if row else None))
+        finally:
+            observer.close()
+        acquired = []
+
+        def acquire_from_other_thread():
+            got_lock = loop._core_lock.acquire(timeout=1)
+            acquired.append(got_lock)
+            if got_lock:
+                loop._core_lock.release()
+
+        worker = threading.Thread(target=acquire_from_other_thread)
+        worker.start()
+        worker.join(timeout=2)
+        seen.append(("lock", not worker.is_alive(), acquired))
+
+    loop.signal_terminal = report
     signal_id = _add_signal(conn)
 
     loop.run_once("signal")
 
-    assert seen == [(signal_id, "decision")]
+    assert seen == [(signal_id, "decision", "reject"), ("lock", True, [True])]
 
 
 def test_decision_after_freshness_boundary_reports_the_abandon_terminal(tmp_path):
@@ -491,6 +546,92 @@ def test_decision_after_freshness_boundary_reports_the_abandon_terminal(tmp_path
     assert tuple(row)[:2] == ("abandoned", "freshness_expired")
     assert row["abandoned_at"] is not None
     assert seen == [(signal_id, "freshness_abandoned")]
+
+
+def test_failed_runner_that_expires_signal_reports_committed_abandonment(tmp_path):
+    conn, loop, runner, _ = _loop(tmp_path, [MissionResult("timeout", None, [])])
+    signal_id = _add_signal(conn)
+    observer_path = tmp_path / "t.db"
+    seen = []
+
+    def report(sid, kind):
+        observer = sqlite3.connect(observer_path)
+        try:
+            row = observer.execute(
+                "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+                (sid,)).fetchone()
+            decisions = observer.execute(
+                "SELECT COUNT(*) FROM signal_decisions WHERE signal_id=?",
+                (sid,)).fetchone()[0]
+            shadows = observer.execute(
+                "SELECT COUNT(*) FROM signal_shadow WHERE signal_id=?",
+                (sid,)).fetchone()[0]
+            seen.append((sid, kind, row, decisions, shadows))
+        finally:
+            observer.close()
+        acquired = []
+
+        def acquire_from_other_thread():
+            got_lock = loop._core_lock.acquire(timeout=1)
+            acquired.append(got_lock)
+            if got_lock:
+                loop._core_lock.release()
+
+        worker = threading.Thread(target=acquire_from_other_thread)
+        worker.start()
+        worker.join(timeout=2)
+        seen.append(("lock", not worker.is_alive(), acquired))
+
+    loop.signal_terminal = report
+    runner_before = runner.run
+
+    def fail_after_expiry(mission):
+        result = runner_before(mission)
+        loop.clock = FixedClock(NOW + timedelta(hours=2, seconds=1))
+        loop.executor.clock = loop.clock
+        return result
+
+    runner.run = fail_after_expiry
+    loop.run_once("signal")
+
+    assert len(runner.missions) == 1
+    row = conn.execute(
+        "SELECT status,abandon_reason,abandoned_at FROM signals WHERE id=?",
+        (signal_id,)).fetchone()
+    assert tuple(row)[:2] == ("abandoned", "freshness_expired")
+    assert row["abandoned_at"] is not None
+    assert conn.execute("SELECT COUNT(*) FROM signal_decisions").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM signal_shadow").fetchone()[0] == 0
+    assert len([item for item in seen if item[0] == signal_id]) == 1
+    assert seen[0][:2] == (signal_id, "freshness_abandoned")
+    assert tuple(seen[0][2][:2]) == ("abandoned", "freshness_expired")
+    assert seen[0][2][2] is not None
+    assert seen[0][3:] == (0, 0)
+    assert seen[1] == ("lock", True, [True])
+
+
+def test_source_inactive_abandonment_does_not_report_freshness_terminal(
+        tmp_path, monkeypatch):
+    import contextlib
+    import agentic_fx.loops.trade_loop as trade_loop
+
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed", {"decision": "reject", "reject_code": "news_shock"}, [])])
+    signal_id = _add_signal(conn)
+    seen = []
+    loop.signal_terminal = lambda sid, kind: seen.append((sid, kind))
+    loop._plugins_root = tmp_path / "plugins"
+    monkeypatch.setattr(trade_loop, "acquire_name_locks",
+                        lambda *args, **kwargs: contextlib.nullcontext())
+    monkeypatch.setattr(trade_loop, "signal_source_active", lambda *args: False)
+
+    loop.run_once("signal")
+
+    row = conn.execute(
+        "SELECT status,abandon_reason FROM signals WHERE id=?", (signal_id,)
+    ).fetchone()
+    assert tuple(row) == ("abandoned", "source_inactive")
+    assert seen == []
 
 
 def test_a_failing_terminal_evaluation_never_changes_the_decision(tmp_path):

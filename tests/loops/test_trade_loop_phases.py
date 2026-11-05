@@ -188,9 +188,10 @@ def test_requeue_signal_does_not_send_notification_itself(tmp_path):
                                    freshness_bars=None)
     assert claimed is not None
 
-    msg = loop._requeue_signal(claimed)
+    msg, terminal = loop._requeue_signal(claimed)
 
     assert msg is not None and "abandoned" in msg
+    assert terminal is None
     assert recording.sent == [], (
         "_requeue_signal 自体は通知を送ってはならない (呼び出し元が"
         "lock 解放後に送る)")

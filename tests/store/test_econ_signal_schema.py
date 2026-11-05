@@ -753,9 +753,10 @@ def test_trade_loop_data_state_cleanup_abandons_stale_claim_with_freshness_reaso
     late = loop_now + timedelta(hours=5)
     _jump(loop, late)
 
-    msg = loop._requeue_signal(claimed, abandon_if_stale=True)
+    msg, terminal = loop._requeue_signal(claimed, abandon_if_stale=True)
 
     assert msg is not None and "鮮度切れ" in msg
+    assert terminal == "freshness_abandoned"
     row = _row(conn, sid)
     assert (row["status"], row["requeue_count"], row["abandon_reason"],
             row["abandoned_at"]) == ("abandoned", requeue_count, reason,
@@ -1678,9 +1679,11 @@ def test_trade_loop_requeue_signal_uses_the_aware_clock(
     if abandon_if_stale:
         _jump(loop, loop_now + timedelta(hours=5))
 
-    msg = loop._requeue_signal(claimed, abandon_if_stale=abandon_if_stale)
+    msg, terminal = loop._requeue_signal(
+        claimed, abandon_if_stale=abandon_if_stale)
 
     assert (msg is not None) == abandon_if_stale
+    assert (terminal == "freshness_abandoned") == abandon_if_stale
     row = _row(conn, sid)
     assert row["status"] == ("abandoned" if abandon_if_stale else "pending")
     assert row["requeue_count"] == (0 if abandon_if_stale else 1)
