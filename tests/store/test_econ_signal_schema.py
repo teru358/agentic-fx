@@ -1121,7 +1121,6 @@ def _bar(conn, set_id, *, bar_time="2026-10-30T12:15:00+00:00",
     ("observed", (150.0, 150.2, 149.9, 150.1, 12.0)),
     ("observed", (150.0, 150.0, 150.0, 150.0, 0.0)),
     ("observed", (149.9, 150.2, 149.9, 150.2, 1.0)),
-    ("no_tick_flat", (150.1, 150.1, 150.1, 150.1, 0.0)),
     ("datafeed_outage_gap", (None, None, None, None, None)),
 ])
 def test_slices_accept_valid_bars(slice_world, quality, ohlcv):

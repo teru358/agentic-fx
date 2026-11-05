@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from typing import Callable, Iterable, Mapping, Sequence
 
+from agentic_fx.core import market_hours
 from agentic_fx.store import signal_shadow
 from agentic_fx.store.short_tx import (  # noqa: F401
     Begin, Checkpoint, Conflict, OverBudget, TxResult, begin_immediate, short_tx)
@@ -37,9 +38,8 @@ STATE_UNRECOVERABLE = "unrecoverable"
 STATE_CANCELLED = "cancelled"
 
 QUALITY_OBSERVED = "observed"
-QUALITY_NO_TICK_FLAT = "no_tick_flat"
 QUALITY_OUTAGE = "datafeed_outage_gap"
-QUALITIES = (QUALITY_OBSERVED, QUALITY_NO_TICK_FLAT, QUALITY_OUTAGE)
+QUALITIES = (QUALITY_OBSERVED, QUALITY_OUTAGE)
 
 EVENT_RANGE_BEFORE = timedelta(minutes=15)
 EVENT_RANGE_AFTER = timedelta(hours=4)
@@ -88,7 +88,7 @@ def slice_row_problem(row: SliceRow) -> str | None:
         if any(v is not None for v in (*prices, row.volume)):
             return "an outage marker carries no OHLC or volume"
         return None
-    if row.quality not in (QUALITY_OBSERVED, QUALITY_NO_TICK_FLAT):
+    if row.quality != QUALITY_OBSERVED:
         return f"unknown quality {row.quality!r}"
     if not all(_positive_finite(v) for v in prices):
         return "OHLC must be finite and positive"
@@ -97,9 +97,6 @@ def slice_row_problem(row: SliceRow) -> str | None:
         return "volume must be finite and >= 0"
     if not (row.low <= row.open <= row.high and row.low <= row.close <= row.high):
         return "OHLC violates low <= open, close <= high"
-    if row.quality == QUALITY_NO_TICK_FLAT and (
-            len(set(prices)) != 1 or row.volume != 0):
-        return "a no-tick flat bar repeats one price with volume 0"
     return None
 
 
@@ -148,6 +145,24 @@ def _range_minutes(start: datetime, end: datetime) -> int:
     if not start < end:
         raise ValueError("range_start must be before range_end")
     return int((end - start) / timedelta(minutes=1))
+
+
+def open_minutes(start: datetime, end: datetime) -> list[datetime]:
+    """Return open UTC minute starts in the half-open interval [start, end)."""
+    _range_minutes(start, end)
+    start = start.astimezone(timezone.utc)
+    end = end.astimezone(timezone.utc)
+    minutes = []
+    current = start
+    while current < end:
+        if market_hours.is_market_open(current):
+            minutes.append(current)
+        current += timedelta(minutes=1)
+    return minutes
+
+
+def open_minute_count(start: datetime, end: datetime) -> int:
+    return len(open_minutes(start, end))
 
 
 def _insert_rows(conn: sqlite3.Connection, set_id: int,
@@ -243,7 +258,7 @@ def create_event_set_in_tx(conn: sqlite3.Connection, *, event_id: int,
         "expected_rows,state,created_at,rule_version) VALUES (?,?,?,?,?,?,?,?) "
         "ON CONFLICT(event_id,pair) DO NOTHING",
         (event_id, pair, utc_iso(start), utc_iso(end),
-         _range_minutes(start, end), STATE_AWAITING, utc_iso(now),
+         open_minute_count(start, end), STATE_AWAITING, utc_iso(now),
          RULE_VERSION))
     return cur.lastrowid if cur.rowcount == 1 else None
 
@@ -491,7 +506,7 @@ def _shadow_range_minutes(start: datetime, end: datetime) -> int:
     if minutes > SHADOW_ROWS_PER_OWNER_MAX:
         raise ValueError(f"a shadow range holds at most "
                          f"{SHADOW_ROWS_PER_OWNER_MAX} minutes, got {minutes}")
-    return minutes
+    return open_minute_count(start, end)
 
 
 def _require_live_shadow(conn: sqlite3.Connection, shadow_id: int,
@@ -519,7 +534,7 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
                       checkpoint: Checkpoint | None = None) -> TxResult:
     """shadow set に slice 行の 1 batch を書く。
 
-    set が無ければ現世代の `staging` で作る (行数 = 区間の分数)。あれば
+    set が無ければ現世代の `staging` で作る (行数 = 開場 minute 数)。あれば
     `staging`・現世代・同じ区間のときだけ書く。それ以外は `conflict`。
     """
     _check_batch(rows, max_rows)

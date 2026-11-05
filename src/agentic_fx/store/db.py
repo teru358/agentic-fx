@@ -278,9 +278,9 @@ CREATE TABLE IF NOT EXISTS ohlcv_slice_sets (
 );
 """
 
-# 退避した 1m 足。observed / no_tick_flat は OHLC と volume を持ち、有限正数で
-# low <= open, close <= high を満たす (no_tick_flat は前値保持の 4 値同一・
-# volume 0)。datafeed_outage_gap は障害欠損の印で、OHLC と volume を持たない。
+# 退避した 1m 足。observed は OHLC と volume を持ち、有限正数で
+# low <= open, close <= high を満たす。datafeed_outage_gap は障害欠損の印で、
+# OHLC と volume を持たない。
 # 1e308 未満は無限を弾くため (NaN は SQLite が NULL として格納する)。
 _OHLCV_SLICES_DDL = """
 CREATE TABLE IF NOT EXISTS ohlcv_slices (
@@ -289,20 +289,18 @@ CREATE TABLE IF NOT EXISTS ohlcv_slices (
   open REAL, high REAL, low REAL, close REAL, volume REAL,
   source TEXT NOT NULL,
   quality TEXT NOT NULL CHECK(quality IN
-    ('observed','no_tick_flat','datafeed_outage_gap')),
+    ('observed','datafeed_outage_gap')),
   UNIQUE(set_id, bar_time),
   CHECK ((quality='datafeed_outage_gap'
           AND open IS NULL AND high IS NULL AND low IS NULL
           AND close IS NULL AND volume IS NULL)
-         OR (quality IN ('observed','no_tick_flat')
+         OR (quality='observed'
              AND open IS NOT NULL AND high IS NOT NULL AND low IS NOT NULL
              AND close IS NOT NULL AND volume IS NOT NULL
              AND low > 0 AND high < 1e308
              AND low <= open AND open <= high
              AND low <= close AND close <= high
-             AND volume >= 0 AND volume < 1e308)),
-  CHECK (quality<>'no_tick_flat'
-         OR (open=high AND high=low AND low=close AND volume=0))
+             AND volume >= 0 AND volume < 1e308))
 );
 """
 

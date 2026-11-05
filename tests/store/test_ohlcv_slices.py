@@ -9,7 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentic_fx.core.contracts import Bar
+from agentic_fx.datafeed.econ_bars import normalize_1m
 from agentic_fx.store import ohlcv_slices as os_
+from agentic_fx.store import ohlcv as ohlcv_store
 from agentic_fx.store import signal_decisions as sd
 from agentic_fx.store import signal_shadow as ss
 from agentic_fx.store.db import connect, init_db
@@ -92,9 +95,8 @@ _BAD_OHLC = [
     {"open": 150.3},                      # open > high
     {"close": 149.8},                     # close < low
     {"volume": -1.0}, {"volume": float("inf")},
-    {"quality": "no_tick_flat"},          # flat なのに 4 値が違う
     {"quality": "no_tick_flat", "open": 150.0, "high": 150.0, "low": 150.0,
-     "close": 150.0, "volume": 1.0},      # flat の volume は 0
+     "close": 150.0, "volume": 0.0},      # 未対応 quality
     {"quality": "datafeed_outage_gap"},   # outage が値を持つ
     {"high": 1e308}, {"high": 1.5e308},   # DDL は high < 1e308
     {"volume": 1e308}, {"volume": 1.5e308},
@@ -116,7 +118,6 @@ def test_invalid_bars_are_refused_before_and_by_the_database(tmp_path, change):
 
 @pytest.mark.parametrize("row", [
     _GOOD,
-    SliceRow(TS, 150.0, 150.0, 150.0, 150.0, 0.0, "mt5-live", "no_tick_flat"),
     SliceRow(TS, None, None, None, None, None, "mt5-live", "datafeed_outage_gap"),
 ])
 def test_valid_bars_pass(row):
@@ -559,12 +560,54 @@ def test_a_shadow_range_holds_at_most_1680_minutes(tmp_path):
                                range_start=NOW,
                                range_end=NOW + timedelta(minutes=1680),
                                generation=gen, rows=[], now=NOW)
-    assert os_.get_set(conn, ok.set_id)["expected_rows"] == 1680
+    assert os_.get_set(conn, ok.set_id)["expected_rows"] == os_.open_minute_count(
+        NOW, NOW + timedelta(minutes=1680))
     with pytest.raises(ValueError, match="at most 1680"):
         os_.stage_shadow_rows(conn, shadow_id=_shadow(conn, n=1), pair="USDJPY",
                               range_start=NOW,
                               range_end=NOW + timedelta(minutes=1681),
                               generation=gen, rows=[], now=NOW)
+
+
+def test_weekend_crossing_ranges_complete_from_normalized_open_minutes(tmp_path):
+    conn = _conn(tmp_path)
+    start = datetime(2026, 11, 6, 21, 15, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 7, 1, 30, tzinfo=timezone.utc)
+    minutes = os_.open_minutes(start, end)
+    assert len(minutes) == 45
+    source_bars = [Bar("USDJPY", "1m", at, 150.0, 150.1, 149.9, 150.0, 1.0)
+                   for at in minutes]
+    ohlcv_store.upsert_cache_bars(conn, source_bars, source="mt5-live")
+    normalized = normalize_1m(conn, "USDJPY", start, end)
+    assert normalized.expected_rows == len(normalized.rows) == 45
+
+    event_id = _event(conn, ts=datetime(2026, 11, 6, 21, 30,
+                                        tzinfo=timezone.utc))
+    event_set = os_.create_event_set_in_tx(conn, event_id=event_id,
+                                           pair="USDJPY", now=NOW)
+    assert os_.get_set(conn, event_set)["expected_rows"] == 45
+    conn.commit()
+    generation = os_.new_generation(conn, now=NOW)
+    staged = os_.stage_event_rows(conn, set_id=event_set, generation=generation,
+                                  rows=normalized.rows,
+                                  assumed_spread_pips=1.0)
+    assert staged.committed
+    assert os_.complete_set(conn, set_id=event_set, generation=generation,
+                             now=NOW).committed
+    assert os_.get_set(conn, event_set)["state"] == "complete"
+
+    shadow_id = _shadow(conn, n=900)
+    shadow_staged = os_.stage_shadow_rows(
+        conn, shadow_id=shadow_id, pair="USDJPY", range_start=start,
+        range_end=end, generation=generation, rows=normalized.rows, now=NOW)
+    assert os_.get_set(conn, shadow_staged.set_id)["expected_rows"] == 45
+    shadow_row = ss.get(conn, shadow_id)
+    outcome = ss.ShadowOutcome.data_insufficient()
+    cas = os_.ShadowCas(shadow_id, ss.STATE_PENDING_ENTRY,
+                        shadow_row["updated_at"], outcome)
+    assert os_.complete_set(conn, set_id=shadow_staged.set_id,
+                             generation=generation, now=NOW,
+                             shadow=cas).committed
 
 
 def test_complete_commits_the_shadow_end_in_the_same_transaction(tmp_path):
