@@ -66,8 +66,6 @@ def normalize_1m(conn: sqlite3.Connection, pair: str, start: datetime,
     minutes = ohlcv_slices.open_minutes(start, end)
     minute_set = set(minutes)
     expected = len(minutes)
-    if start >= end:
-        raise ValueError("range_start must be before range_end")
     oldest = _oldest(conn, pair)
     if oldest is None or start < oldest:
         return NormalizedBars((), expected, False, unrecoverable=True,
@@ -115,11 +113,6 @@ def normalize_1m(conn: sqlite3.Connection, pair: str, start: datetime,
         row = ohlcv_slices.SliceRow(
             minute, bar.open, bar.high, bar.low, bar.close, bar.volume,
             source, ohlcv_slices.QUALITY_OBSERVED)
-        if ohlcv_slices.slice_row_problem(row) is not None:
-            row = ohlcv_slices.SliceRow(
-                minute, None, None, None, None, None, _MARKER_SOURCE,
-                ohlcv_slices.QUALITY_OUTAGE)
-            invalid_minutes.append(minute)
         rows.append(row)
     return NormalizedBars(tuple(rows), expected,
                           any(r.quality == ohlcv_slices.QUALITY_OUTAGE for r in rows),

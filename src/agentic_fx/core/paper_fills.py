@@ -116,8 +116,12 @@ def _range_rows(rows, start: datetime, end: datetime) -> list:
         return []
     selected = [row for row in raw if start <= _utc(
         row.ts if isinstance(row, Bar) else row.bar_time) < end]
-    present = {_utc(row.ts if isinstance(row, Bar) else row.bar_time)
-               for row in selected}
+    stamps = [_utc(row.ts if isinstance(row, Bar) else row.bar_time)
+              for row in selected]
+    present = set(stamps)
+    if len(present) != len(stamps):
+        duplicate = next(at for at in stamps if stamps.count(at) > 1)
+        raise ValueError(f"duplicate minute {duplicate.isoformat()}")
     missing = next((minute for minute in ohlcv_slices.open_minutes(start, end)
                     if minute not in present), None)
     if missing is not None:
@@ -164,6 +168,14 @@ def _result(result_code: str, *, direction: str, entry_price: float | None,
                             exit_price, exit_at, range_end, pnl)
 
 
+def _insufficient(direction: str, pip_size: float, range_end: datetime, *,
+                  entry_price: float | None = None,
+                  entry_at: datetime | None = None) -> ShadowResolution:
+    return _result(signal_shadow.RESULT_DATA_INSUFFICIENT, direction=direction,
+                   entry_price=entry_price, entry_at=entry_at, exit_price=None,
+                   exit_at=None, range_end=range_end, pip_size=pip_size)
+
+
 def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                    requested_price: float | None, stop_loss: float,
                    take_profit: float | None, spread: float, t0: datetime,
@@ -182,10 +194,7 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
     unrecoverable = bool(getattr(rows, "unrecoverable", False))
     if unrecoverable:
         end = _deadline(t0) if kind == "market" else t0 + timedelta(hours=4)
-        return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                       direction=direction, entry_price=None, entry_at=None,
-                       exit_price=None, exit_at=None, range_end=end,
-                       pip_size=pip_size)
+        return _insufficient(direction, pip_size, end)
     raw_rows = rows.rows if hasattr(rows, "rows") else rows
     ordered = sorted(raw_rows, key=lambda row: _utc(
         row.ts if isinstance(row, Bar) else row.bar_time))
@@ -203,21 +212,13 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
             if at < t0 or at >= deadline:
                 continue
             if at in marker_times:
-                return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                               direction=direction, entry_price=None, entry_at=None,
-                               exit_price=None, exit_at=None,
-                               range_end=deadline, pip_size=pip_size)
+                return _insufficient(direction, pip_size, deadline)
             entry_row = row
             half = spread / 2
             bar = _as_bar(row)
             entry_price = bar.open + half if direction == "long" else bar.open - half
             break
         if entry_row is None:
-            if any(t0 <= at < deadline for at in marker_times):
-                return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                               direction=direction, entry_price=None, entry_at=None,
-                               exit_price=None, exit_at=None,
-                               range_end=deadline, pip_size=pip_size)
             return _result(signal_shadow.RESULT_NO_FILL, direction=direction,
                            entry_price=None, entry_at=None, exit_price=None,
                            exit_at=None, range_end=deadline, pip_size=pip_size)
@@ -227,16 +228,8 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                                        requested_price=requested_price,
                                        direction=direction, spread=spread)
         if selection.indeterminate:
-            return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                           direction=direction, entry_price=None, entry_at=None,
-                           exit_price=None, exit_at=None,
-                           range_end=selection.range_end, pip_size=pip_size)
+            return _insufficient(direction, pip_size, selection.range_end)
         if selection.fill_bar is None:
-            if any(t0 <= at < selection.range_end for at in marker_times):
-                return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                               direction=direction, entry_price=None,
-                               entry_at=None, exit_price=None, exit_at=None,
-                               range_end=selection.range_end, pip_size=pip_size)
             return _result(signal_shadow.RESULT_NO_FILL, direction=direction,
                            entry_price=None, entry_at=None, exit_price=None,
                            exit_at=None, range_end=selection.range_end,
@@ -246,12 +239,6 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
         if deadline > t0 + timedelta(hours=4):
             ordered = sorted(_range_rows(rows, t0, deadline), key=times)
             marker_times = {times(row) for row in ordered if _is_marker(row)}
-        entry_at = times(entry_row)
-        if any(t0 <= at <= entry_at for at in marker_times):
-            return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                           direction=direction, entry_price=None, entry_at=None,
-                           exit_price=None, exit_at=None, range_end=deadline,
-                           pip_size=pip_size)
 
     entry_at = times(entry_row)
     order = {"direction": direction, "requested_price": requested_price,
@@ -263,29 +250,22 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
     for index, row in enumerate(eligible):
         at = times(row)
         if at in marker_times:
-            return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                           direction=direction, entry_price=entry_price,
-                           entry_at=entry_at, exit_price=None, exit_at=None,
-                           range_end=deadline, pip_size=pip_size)
+            return _insufficient(direction, pip_size, deadline,
+                                 entry_price=entry_price, entry_at=entry_at)
         hit = check_exit(order, _as_bar(row), spread,
-                         entry_same_bar=(index == 0))
+                         entry_same_bar=(index == 0 and kind == "limit"))
         if hit is not None:
             code, price = hit
             return _result(code, direction=direction, entry_price=entry_price,
                            entry_at=entry_at, exit_price=price,
                            exit_at=at + timedelta(minutes=1),
                            range_end=deadline, pip_size=pip_size)
-    if eligible:
-        last = eligible[-1]
-        close = _as_bar(last).close
-        half = spread / 2
-        close_price = close - half if direction == "long" else close + half
-        return _result(signal_shadow.RESULT_DAY_CLOSE, direction=direction,
-                       entry_price=entry_price, entry_at=entry_at,
-                       exit_price=close_price,
-                       exit_at=times(last) + timedelta(minutes=1),
-                       range_end=deadline, pip_size=pip_size)
-    return _result(signal_shadow.RESULT_DATA_INSUFFICIENT,
-                   direction=direction, entry_price=entry_price,
-                   entry_at=entry_at, exit_price=None, exit_at=None,
+    last = eligible[-1]
+    close = _as_bar(last).close
+    half = spread / 2
+    close_price = close - half if direction == "long" else close + half
+    return _result(signal_shadow.RESULT_DAY_CLOSE, direction=direction,
+                   entry_price=entry_price, entry_at=entry_at,
+                   exit_price=close_price,
+                   exit_at=times(last) + timedelta(minutes=1),
                    range_end=deadline, pip_size=pip_size)

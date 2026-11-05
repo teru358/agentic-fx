@@ -119,6 +119,8 @@ def _require_in_range(rows: Sequence[SliceRow], start: str, end: str) -> None:
         if not lo <= row.bar_time < hi:
             raise InvalidSliceRow(
                 f"{row.bar_time!r} is outside the set range [{start}, {end})")
+        if not market_hours.is_market_open(row.bar_time.astimezone(timezone.utc)):
+            raise InvalidSliceRow(f"{row.bar_time!r} is in a closed minute")
 
 
 IN_CHUNK = 500

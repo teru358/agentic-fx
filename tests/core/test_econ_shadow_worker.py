@@ -87,6 +87,43 @@ def test_fill_bar_tp_only_is_not_resolved_until_following_bar():
     assert result.exit_at == t0 + timedelta(minutes=2)
 
 
+def test_market_entry_bar_take_profit_resolves_on_that_bar():
+    t0 = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    bars = _span(t0, datetime(2026, 11, 2, 21, 55, tzinfo=timezone.utc),
+                 {t0: _bar(t0, h=151, l=149.5, c=150)}, l=150.0)
+    result = resolve_shadow(bars, direction="long", kind="market",
+                            requested_price=None, stop_loss=149,
+                            take_profit=150.5, spread=0, t0=t0, pip_size=.01)
+    assert result.result_code == "tp"
+    assert result.exit_at == t0 + timedelta(minutes=1)
+
+
+def test_market_entry_bar_touching_both_stop_and_target_is_a_stop():
+    t0 = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    bars = _span(t0, datetime(2026, 11, 2, 21, 55, tzinfo=timezone.utc),
+                 {t0: _bar(t0, h=151, l=148.5, c=150)}, l=150.0)
+    result = resolve_shadow(bars, direction="long", kind="market",
+                            requested_price=None, stop_loss=149,
+                            take_profit=150.5, spread=0, t0=t0, pip_size=.01)
+    assert result.result_code == "sl"
+    assert result.exit_at == t0 + timedelta(minutes=1)
+
+
+def test_duplicate_minute_in_plain_rows_is_rejected():
+    t0 = datetime(2026, 11, 2, 12, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 2, 21, 55, tzinfo=timezone.utc)
+    rows = [_bar(ts) for ts in open_minutes(t0, end)]
+    rows.append(_bar(t0 + timedelta(minutes=5)))
+    with pytest.raises(ValueError, match="duplicate minute"):
+        resolve_shadow(rows, direction="long", kind="market",
+                       requested_price=None, stop_loss=149, take_profit=None,
+                       spread=0, t0=t0, pip_size=.01)
+    with pytest.raises(ValueError, match="duplicate minute"):
+        resolve_shadow(rows, direction="long", kind="limit",
+                       requested_price=140, stop_loss=139, take_profit=None,
+                       spread=0, t0=t0, pip_size=.01)
+
+
 @pytest.mark.parametrize("direction, open_price, expected", [
     ("long", 149.8, 149.8), ("short", 150.2, 150.2),
 ])

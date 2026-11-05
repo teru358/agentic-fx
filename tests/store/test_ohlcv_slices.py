@@ -622,6 +622,37 @@ def test_weekend_crossing_ranges_complete_from_normalized_open_minutes(tmp_path)
                              shadow=cas).committed
 
 
+def test_a_closed_minute_row_is_refused_so_a_gap_cannot_hide_behind_it(tmp_path):
+    conn = _conn(tmp_path)
+    start = datetime(2026, 11, 6, 21, 15, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 7, 1, 30, tzinfo=timezone.utc)
+    minutes = os_.open_minutes(start, end)
+    closed_at = datetime(2026, 11, 6, 22, 30, tzinfo=timezone.utc)
+    assert closed_at not in minutes
+    rows = [SliceRow(at, 150.0, 150.1, 149.9, 150.0, 1.0, "mt5-live", "observed")
+            for at in minutes[1:]]
+    rows.append(SliceRow(closed_at, 150.0, 150.1, 149.9, 150.0, 1.0,
+                         "mt5-live", "observed"))
+    assert len(rows) == len(minutes)
+    generation = os_.new_generation(conn, now=NOW)
+
+    shadow_id = _shadow(conn, n=900)
+    with pytest.raises(os_.InvalidSliceRow, match="closed"):
+        os_.stage_shadow_rows(conn, shadow_id=shadow_id, pair="USDJPY",
+                              range_start=start, range_end=end,
+                              generation=generation, rows=rows, now=NOW)
+
+    event_id = _event(conn, ts=datetime(2026, 11, 6, 21, 30, tzinfo=timezone.utc))
+    event_set = os_.create_event_set_in_tx(conn, event_id=event_id,
+                                           pair="USDJPY", now=NOW)
+    conn.commit()
+    with pytest.raises(os_.InvalidSliceRow, match="closed"):
+        _stage_event(conn, set_id=event_set, generation=generation, rows=rows,
+                     max_rows=len(rows))
+    assert os_.get_set(conn, event_set)["state"] == "awaiting"
+    assert _rows_of(conn, event_set) == 0
+
+
 def test_complete_commits_the_shadow_end_in_the_same_transaction(tmp_path):
     conn = _conn(tmp_path)
     shadow_id = _shadow(conn)
