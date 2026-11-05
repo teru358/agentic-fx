@@ -96,8 +96,12 @@ def _is_marker(row) -> bool:
             and row.quality == ohlcv_slices.QUALITY_OUTAGE)
 
 
-def _deadline(origin: datetime) -> datetime:
+def day_close_deadline(origin: datetime) -> datetime:
+    """起点の次の rollover から day close の buffer を引いた時刻 (shadow の期限)。"""
     return market_hours.next_rollover(origin) - market_hours.DAY_CLOSE_BUFFER
+
+
+_deadline = day_close_deadline
 
 
 def _range_rows(rows, start: datetime, end: datetime) -> list:
@@ -131,18 +135,39 @@ def _range_rows(rows, start: datetime, end: datetime) -> list:
 
 def select_limit_entry(rows: Sequence, *, t0: datetime, requested_price: float,
                        direction: str, spread: float) -> LimitEntrySelection:
-    """Choose the first limit fill in [t0,t0+4h), or report a marker gap."""
+    """[t0,t0+4h) の開場 minute を順に見て、最初の約定か marker を返す。
+
+    入力は約定 (または marker) の足までの開場 minute を 1 行ずつ全部持つこと。約定も
+    marker も無ければ [t0,t0+4h) 全体を要求する。欠け・重複は `ValueError`。
+    """
     t0 = _utc(t0)
     if direction not in ("long", "short"):
         raise ValueError(f"unknown direction: {direction!r}")
     expiry = t0 + timedelta(hours=4)
-    checked_rows = _range_rows(rows, t0, expiry)
-    order = {"direction": direction, "requested_price": requested_price}
-    for row in sorted(checked_rows, key=lambda item: _utc(item.ts if isinstance(item, Bar)
-                                                    else item.bar_time)):
+    if hasattr(rows, "range_start") or hasattr(rows, "range_end"):
+        if rows.range_start is None or rows.range_end is None:
+            raise ValueError("normalized bars must include range_start and range_end")
+        if _utc(rows.range_start) > t0:
+            raise ValueError("normalized range does not cover requested interval")
+        covered_until = _utc(rows.range_end)
+    else:
+        covered_until = None
+    raw = rows.rows if hasattr(rows, "rows") else rows
+    by_minute: dict[datetime, object] = {}
+    for row in raw:
         at = _utc(row.ts if isinstance(row, Bar) else row.bar_time)
         if not t0 <= at < expiry:
             continue
+        if at in by_minute:
+            raise ValueError(f"duplicate minute {at.isoformat()}")
+        by_minute[at] = row
+    order = {"direction": direction, "requested_price": requested_price}
+    for at in ohlcv_slices.open_minutes(t0, expiry):
+        if covered_until is not None and at >= covered_until:
+            raise ValueError("normalized range does not cover requested interval")
+        row = by_minute.get(at)
+        if row is None:
+            raise ValueError(f"missing open minute {at.isoformat()}")
         if _is_marker(row):
             return LimitEntrySelection(None, None, expiry, True)
         price = check_limit_fill(order, _as_bar(row), spread)
@@ -180,7 +205,11 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                    requested_price: float | None, stop_loss: float,
                    take_profit: float | None, spread: float, t0: datetime,
                    pip_size: float) -> ShadowResolution:
-    """前段は [t0,t0+4h)、解決は [t0,区間終端) の正規化結果を渡す。"""
+    """前段 (`select_limit_entry`) は [t0,t0+4h)、解決は [t0,区間終端) の正規化結果を渡す。
+
+    limit の区間終端が t0+4h より前 (約定後の day close が早い) なら、解決の入力は
+    [t0,区間終端) だけでよい。
+    """
     t0 = signal_shadow.observation_start(_utc(t0))
     if kind not in ("market", "limit"):
         raise ValueError(f"unknown entry kind: {kind!r}")
@@ -223,8 +252,7 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                            entry_price=None, entry_at=None, exit_price=None,
                            exit_at=None, range_end=deadline, pip_size=pip_size)
     else:
-        _range_rows(rows, t0, t0 + timedelta(hours=4))
-        selection = select_limit_entry(ordered, t0=t0,
+        selection = select_limit_entry(rows, t0=t0,
                                        requested_price=requested_price,
                                        direction=direction, spread=spread)
         if selection.indeterminate:
@@ -236,9 +264,8 @@ def resolve_shadow(rows: Sequence, *, direction: str, kind: str,
                            pip_size=pip_size)
         entry_row, entry_price = selection.fill_bar, selection.entry_price
         deadline = selection.range_end
-        if deadline > t0 + timedelta(hours=4):
-            ordered = sorted(_range_rows(rows, t0, deadline), key=times)
-            marker_times = {times(row) for row in ordered if _is_marker(row)}
+        ordered = sorted(_range_rows(rows, t0, deadline), key=times)
+        marker_times = {times(row) for row in ordered if _is_marker(row)}
 
     entry_at = times(entry_row)
     order = {"direction": direction, "requested_price": requested_price,

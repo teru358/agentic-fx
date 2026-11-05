@@ -402,6 +402,16 @@ def record_event_spread(conn: sqlite3.Connection, set_id: int, *,
 
     保存できなければ (記録済み・状態違い・`begin` が見送り・予算超過) `False`。
     """
+    return record_event_spread_tx(
+        conn, set_id, spread_pips=spread_pips, spread_source=spread_source,
+        begin=begin, checkpoint=checkpoint).committed
+
+
+def record_event_spread_tx(conn: sqlite3.Connection, set_id: int, *,
+                           spread_pips: float, spread_source: str,
+                           begin: Begin = begin_immediate,
+                           checkpoint: Checkpoint | None = None) -> TxResult:
+    """`record_event_spread` の transaction 結果 (COMMIT 所要を含む)。"""
     if spread_source not in (signal_shadow.SPREAD_QUOTE,
                              signal_shadow.SPREAD_ASSUMED):
         raise ValueError(f"unknown spread_source: {spread_source!r}")
@@ -417,7 +427,7 @@ def record_event_spread(conn: sqlite3.Connection, set_id: int, *,
             raise Conflict
         return {"set_id": set_id}
 
-    return short_tx(conn, begin, body, checkpoint).committed
+    return short_tx(conn, begin, body, checkpoint)
 
 
 def matured_event_sets(conn: sqlite3.Connection, *, now: datetime,
