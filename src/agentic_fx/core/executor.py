@@ -641,7 +641,10 @@ class Executor:
         if not result.accepted:
             intents_store.set_gate_result(self.conn, iid, accepted=False,
                                           reject_reason="; ".join(result.reasons),
-                                          reject_category="risk_gate")
+                                          reject_category=(
+                                              "econ_window"
+                                              if result.econ_window_rejected
+                                              else "risk_gate"))
             if any("kill switch" in r and "latched" not in r
                    for r in result.reasons):
                 try:
@@ -659,7 +662,9 @@ class Executor:
                     self.activity.write(
                         Category.SYSTEM, "kill_switch_latched",
                         "drawdown threshold hit — 新規停止 (解除は明示操作)")
-            self.activity.write(Category.TRADE, "gate_rejected",
+            event = ("open_rejected_econ_window"
+                     if result.econ_window_rejected else "gate_rejected")
+            self.activity.write(Category.TRADE, event,
                                 "; ".join(result.reasons)[:200], ref_id=str(iid))
             return {"result": "rejected", "order_id": None,
                     "reasons": result.reasons}
@@ -812,7 +817,9 @@ class Executor:
 
     def open_from_snapshot(self, intent: TradeIntent, iid: int,
                            snapshot: ExecutionSnapshot, *,
-                           max_snapshot_age_sec: float) -> dict:
+                           max_snapshot_age_sec: float,
+                           econ_window: tuple[bool, tuple[int, ...]] | None = None
+                           ) -> dict:
         """commit-core 相専用 (設計書 §3.1) — **core_lock 保持中に呼ぶ
         こと**。①スナップショットの鮮度再検証 (lock 内での再取得はしない)
         ②DB 状態を読み直して GateContext を確定 ③Risk Gate 判定・paper
@@ -910,7 +917,11 @@ class Executor:
             account_currency=self.settings.account_currency,
             quote_to_account=quote_to_account,
             base_to_account=base_to_account,
-            now=now)
+            now=now,
+            econ_window_in_window=(econ_window[0]
+                                   if econ_window is not None else None),
+            econ_window_event_ids=(econ_window[1]
+                                   if econ_window is not None else ()))
         return self._evaluate_and_execute_open(intent, iid, ctx)
 
     # ---- close / cancel -------------------------------------------------

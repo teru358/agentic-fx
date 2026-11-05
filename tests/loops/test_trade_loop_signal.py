@@ -73,6 +73,7 @@ def test_signal_mission_gets_the_dedicated_decision_prompt_not_the_cron_one(tmp_
     assert '"action": "hold"' not in prompt
     assert "get_ohlcv" not in prompt
     assert "get_indicators" not in prompt
+    assert "get_signals は" not in prompt
 
 
 def test_signal_validation_does_not_read_mission_on_shared_connection(
@@ -172,7 +173,8 @@ def test_signal_executor_runs_while_other_threads_are_excluded_by_core_lock(tmp_
 
     loop.notifier = NotifierProbe()
 
-    def execute(*_args, **_kwargs):
+    def execute(*_args, **kwargs):
+        assert "econ_window" not in kwargs
         def check():
             acquired = loop._core_lock.acquire(blocking=False)
             observed.append(acquired)
@@ -274,6 +276,7 @@ def test_cron_does_not_claim_or_inject_pending_signal(tmp_path):
     assert _status(conn, signal_id)["status"] == "pending"
     assert "この判断で扱う signal" not in runner.missions[0].prompt
     assert "get_signals" not in runner.missions[0].tools
+    assert "get_signals は" not in runner.missions[0].prompt
 
 
 def test_signal_with_no_claimable_row_is_skipped_without_runner_call(tmp_path):

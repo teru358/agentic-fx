@@ -4,6 +4,7 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from types import MappingProxyType
 from unittest.mock import MagicMock, call, patch
 
@@ -95,6 +96,7 @@ def test_hold_mission_recorded(tmp_path):
     prompt = runner.missions[0].prompt
     assert "月末は控えめに" in prompt
     assert "現在の状態" in prompt
+    assert "get_signals は" not in prompt
 
 
 def test_five_phase_not_tradable_snapshot_uses_the_shared_fixed_reason(tmp_path):
@@ -113,6 +115,103 @@ def test_five_phase_not_tradable_snapshot_uses_the_shared_fixed_reason(tmp_path)
     assert dict(row) == {"reject_reason": "not_tradable_symbol",
                          "reject_category": "execution"}
     assert "not_tradable_symbol" in (tmp_path / "a.log").read_text(encoding="utf-8")
+
+
+def test_cron_open_in_economic_window_is_rejected_without_gate_streak(tmp_path):
+    from agentic_fx.loops.trade_loop import gate_reject_streak
+
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+         "take_profit": 151.5, "reasoning": "x"}, [])])
+    loop.econ.window_view.return_value = SimpleNamespace(
+        in_window=True, active=(SimpleNamespace(id=17),))
+
+    out = loop.run_once("cron")
+
+    row = conn.execute(
+        "SELECT gate_result,reject_category,reject_reason FROM trade_intents"
+    ).fetchone()
+    assert out["result"] == "rejected"
+    assert row["gate_result"] == "rejected"
+    assert row["reject_category"] == "econ_window"
+    assert "economic event avoidance window" in row["reject_reason"]
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("open_rejected_econ_window") == 1
+    assert "gate_rejected" not in activity
+    assert gate_reject_streak(conn)[1] == 0
+
+
+def test_cron_open_outside_economic_window_executes(tmp_path):
+    conn, loop, _, _ = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+         "take_profit": 151.5, "reasoning": "x"}, [])])
+    loop.econ.window_view.return_value = SimpleNamespace(
+        in_window=False, active=())
+
+    out = loop.run_once("cron")
+
+    assert out["result"] in {"opened", "pending"}
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+
+
+def test_cron_economic_window_check_failure_is_recorded_as_execution_rejection(
+        tmp_path):
+    from agentic_fx.loops.trade_loop import gate_reject_streak
+
+    conn, loop, _, tp = _loop(tmp_path, [MissionResult(
+        "completed",
+        {"action": "open", "pair": "USDJPY", "direction": "long",
+         "entry_type": "market", "horizon": "day", "stop_loss": 147.0,
+         "take_profit": 151.5, "reasoning": "x"}, [])])
+    loop.econ.window_view.side_effect = RuntimeError("calendar db unavailable")
+
+    out = loop.run_once("cron")
+
+    row = conn.execute(
+        "SELECT gate_result,reject_category,reject_reason FROM trade_intents"
+    ).fetchone()
+    assert out["result"] == "rejected"
+    assert row["gate_result"] == "rejected"
+    assert row["reject_category"] == "execution"
+    assert row["reject_reason"].startswith(
+        "econ window check failed (fail closed): ")
+    activity = (tp / "a.log").read_text(encoding="utf-8")
+    assert activity.count("gate_rejected") == 1
+    assert "open_rejected_econ_window" not in activity
+    assert gate_reject_streak(conn)[1] == 1
+
+
+@pytest.mark.parametrize("action", ["close", "cancel", "hold"])
+def test_cron_non_open_actions_do_not_check_economic_window(tmp_path, action):
+    conn, loop, _, _ = _loop(
+        tmp_path, [MissionResult("completed", None, [])])
+    if action == "hold":
+        payload = {"action": "hold", "reasoning": "x"}
+    else:
+        status = S.OPEN if action == "close" else S.PENDING_FILL
+        oid = orders.insert(
+            conn, pair="USDJPY", direction="long", entry_type="market",
+            horizon="day", status=status, now=NOW, quantity=0.1,
+            remaining_quantity=0.0 if action == "close" else 0.1,
+            requested_price=148.2, stop_loss=147.8, take_profit=149.0)
+        payload = ({"action": "close", "order_id": oid, "reasoning": "x"}
+                   if action == "close" else
+                   {"action": "cancel", "order_id": oid, "reasoning": "x"})
+        loop.executor.gather_close_snapshot = lambda row: object()
+        loop.executor.close_from_snapshot = MagicMock(return_value={
+            "result": "closed", "order_id": oid, "reasons": []})
+        loop.executor.cancel_intent = MagicMock(return_value={
+            "result": "cancelled", "order_id": oid, "reasons": []})
+    loop.runner = FakeRunner([MissionResult("completed", payload, [])])
+
+    loop.run_once("cron")
+
+    loop.econ.window_view.assert_not_called()
 
 
 def test_five_phase_out_of_pairs_exposure_uses_its_fixed_reason(tmp_path):
@@ -203,6 +302,7 @@ def test_ask_mission_uses_its_signal_aware_tool_list(tmp_path):
         "completed", {"answer": "test"}, [])])
     loop.ask_once("今どう見てる？")
     assert "get_signals" in runner.missions[0].tools
+    assert "get_signals は" in runner.missions[0].prompt
 
 
 def test_fail_closed_on_unhealthy_data(tmp_path):
@@ -1259,9 +1359,7 @@ def test_prompt_timeframe_section_is_exact_and_precedes_day_horizon(tmp_path):
     section = (
         "## 判断足\n"
         "decision_timeframe: 15m\n"
-        "context_timeframes: 1h, 4h (参考足。発注判断の足ではない。確定足だけ)\n"
-        "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
-        "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
+        "context_timeframes: 1h, 4h (参考足。発注判断の足ではない。確定足だけ)"
     )
     assert f"system\n\n{section}\n\n## day 建玉期限\n" in prompt
 

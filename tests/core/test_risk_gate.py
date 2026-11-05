@@ -188,6 +188,51 @@ def test_quote_symbol_mismatch_fail_closed():
     assert not r.accepted and any("symbol" in x for x in r.reasons)
 
 
+def test_economic_window_rejects_with_active_event_identifier():
+    r = evaluate(_intent(), _ctx(econ_window_in_window=True,
+                                 econ_window_event_ids=(17,)), RISK)
+    assert not r.accepted
+    assert r.econ_window_rejected is True
+    assert any("economic event avoidance window" in x and "17" in x
+               for x in r.reasons)
+
+
+def test_economic_window_and_other_gate_reasons_are_both_reported():
+    r = evaluate(_intent(stop_loss=148.90),
+                 _ctx(econ_window_in_window=True,
+                      econ_window_event_ids=(17,)), RISK)
+    assert not r.accepted
+    assert r.econ_window_rejected is True
+    assert any("economic event avoidance window" in x for x in r.reasons)
+    assert any("stop-loss side" in x for x in r.reasons)
+
+
+def test_economic_window_none_preserves_existing_gate_result():
+    expected = evaluate(_intent(), _ctx(), RISK)
+    actual = evaluate(_intent(), _ctx(econ_window_in_window=None), RISK)
+    assert actual.accepted == expected.accepted
+    assert actual.reasons == expected.reasons
+    assert actual.econ_window_rejected is False
+
+
+def test_economic_window_does_not_short_circuit_drawdown_reason():
+    r = evaluate(_intent(), _ctx(econ_window_in_window=True,
+                                 equity=979_000.0), RISK)
+    assert not r.accepted
+    assert r.econ_window_rejected is True
+    assert any("economic event avoidance window" in x for x in r.reasons)
+    assert any("drawdown" in x for x in r.reasons)
+
+
+def test_invalid_context_still_short_circuits_economic_window_evaluation():
+    r = evaluate(_intent(), _ctx(econ_window_in_window=True,
+                                 equity=float("nan")), RISK)
+    assert not r.accepted
+    assert r.econ_window_rejected is False
+    assert any("invalid context" in x for x in r.reasons)
+    assert not any("economic event avoidance window" in x for x in r.reasons)
+
+
 # --- レビュー指摘対応 (task-5 修正: A/B/C/D/E) ---
 
 def test_daily_start_equity_nan_fail_closed():

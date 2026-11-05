@@ -306,6 +306,21 @@ class TradeLoop:
             with self._core_lock, \
                     self.executor.defer_notifications() as deferred:
                 try:
+                    econ_window: tuple[bool, tuple[int, ...]] | None = None
+                    econ_window_error: Exception | None = None
+                    # signal trigger は上で専用 mission へ分岐済みなので、
+                    # ここに来る OPEN はすべて裁量判断として帯を判定する。
+                    if (intent.action is Action.OPEN
+                            and snapshot_error is None
+                            and intent.origin is Origin.SCHEDULER):
+                        try:
+                            view = self.econ.window_view(
+                                intent.pair, self.clock.now())
+                            econ_window = (
+                                view.in_window,
+                                tuple(event.id for event in view.active))
+                        except Exception as e:  # noqa: BLE001 — OPEN は fail closed
+                            econ_window_error = e
                     # intent は執行前に必ず記録し、以降の拒否理由を iid に
                     # 結び付ける。record_and_validate_intent 自体は発注しない。
                     iid, early = self.executor.record_and_validate_intent(
@@ -347,12 +362,24 @@ class TradeLoop:
                                                 reasons[0], ref_id=str(iid))
                             out = {"result": "rejected", "order_id": None,
                                    "reasons": reasons}
+                    elif econ_window_error is not None and early is None:
+                        reasons = ["econ window check failed (fail closed): "
+                                   + safe_error_text(econ_window_error)]
+                        intents_store.set_gate_result(
+                            self.conn, iid, accepted=False,
+                            reject_reason=reasons[0],
+                            reject_category="execution")
+                        self.activity.write(Category.TRADE, "gate_rejected",
+                                            reasons[0], ref_id=str(iid))
+                        out = {"result": "rejected", "order_id": None,
+                               "reasons": reasons}
                     elif early is not None:
                         out = early
                     elif intent.action is Action.OPEN:
                         out = self.executor.open_from_snapshot(
                             intent, iid, open_snapshot,
-                            max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec)
+                            max_snapshot_age_sec=self.settings.worker.snapshot_max_age_sec,
+                            econ_window=econ_window)
                     elif intent.action is Action.CLOSE:
                         out = self.executor.close_from_snapshot(
                             intent, iid, close_snapshot,
@@ -889,7 +916,8 @@ class TradeLoop:
         try:
             with self._core_lock:
                 now = self.clock.now()
-                prompt = self._build_prompt(load_prompt("ask_mission"), now) \
+                prompt = self._build_prompt(load_prompt("ask_mission"), now,
+                                            include_signals=True) \
                     + f"\n\n## ユーザーの質問\n{question}"
                 mission = Mission(
                     prompt=prompt, tools=_ASK_TOOLS,
@@ -994,7 +1022,8 @@ class TradeLoop:
         total = calls.get("get_ohlcv", 0) + calls.get("get_indicators", 0)
         return f" market_tool_calls={total}"
 
-    def _build_prompt(self, system: str, now: datetime) -> str:
+    def _build_prompt(self, system: str, now: datetime, *,
+                      include_signals: bool = False) -> str:
         """システムプロンプト + policy + サマリを結合する。"""
         timeframe_section = (
             "## 判断足\n"
@@ -1006,10 +1035,12 @@ class TradeLoop:
                 f"{', '.join(self.settings.datafeed.context_timeframes)} "
                 "(参考足。発注判断の足ではない。確定足だけ)\n"
             )
-        timeframe_section += (
-            "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
-            "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
-        )
+        if include_signals:
+            timeframe_section += (
+                "signal は strategy の足（例: 1h）でしか更新されず、get_signals は "
+                "status を問わず 24h 分を返す。consumed / abandoned の行は再提案しない。"
+            )
+        timeframe_section = timeframe_section.rstrip()
         utc_now = as_utc(now)
         if not market_hours.is_market_open(utc_now):
             day_horizon = (

@@ -299,6 +299,69 @@ def test_open_from_snapshot_matches_handle_intent_on_gate_rejection(tmp_path):
             == ex2.state.load().kill_switch_latched)
 
 
+def test_open_from_snapshot_records_economic_window_rejection_only(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent()
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    out = ex.open_from_snapshot(
+        intent, iid, snapshot, max_snapshot_age_sec=999.0,
+        econ_window=(True, (17,)))
+
+    assert out["result"] == "rejected"
+    row = ex.conn.execute(
+        "SELECT reject_category,reject_reason FROM trade_intents WHERE id=?",
+        (iid,)).fetchone()
+    assert row["reject_category"] == "econ_window"
+    assert "economic event avoidance window" in row["reject_reason"]
+    assert orders.list_by_status(ex.conn, S.SUBMITTING, S.OPEN,
+                                 S.PENDING_FILL) == []
+    activity = (tmp_path / "activity.log").read_text(encoding="utf-8")
+    assert activity.count("open_rejected_econ_window") == 1
+    assert "gate_rejected" not in activity
+
+
+def test_open_from_snapshot_economic_window_keeps_other_gate_reasons(tmp_path):
+    ex = _make_executor(tmp_path)
+    intent = _open_intent(stop_loss=148.90)
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    ex.open_from_snapshot(intent, iid, snapshot, max_snapshot_age_sec=999.0,
+                          econ_window=(True, (17,)))
+
+    row = ex.conn.execute(
+        "SELECT reject_category,reject_reason FROM trade_intents WHERE id=?",
+        (iid,)).fetchone()
+    assert row["reject_category"] == "econ_window"
+    assert "economic event avoidance window" in row["reject_reason"]
+    assert "stop-loss side invalid" in row["reject_reason"]
+
+
+def test_open_from_snapshot_still_latches_drawdown_during_economic_window(
+        tmp_path):
+    ex = _make_executor(tmp_path)
+    record_snapshot(ex.conn, now=NOW, balance=970_000, equity=970_000)
+    intent = _open_intent()
+    mid = _start_trade_mission(ex.conn)
+    iid = _insert_intent(ex.conn, mid, intent)
+    snapshot = ex.gather_open_snapshot(intent, exposure_pairs=[])
+
+    out = ex.open_from_snapshot(
+        intent, iid, snapshot, max_snapshot_age_sec=999.0,
+        econ_window=(True, (17,)))
+
+    assert out["result"] == "rejected"
+    assert any("kill switch: drawdown" in reason for reason in out["reasons"])
+    assert ex.state.load().kill_switch_latched is True
+    activity = (tmp_path / "activity.log").read_text(encoding="utf-8")
+    assert activity.count("open_rejected_econ_window") == 1
+    assert "gate_rejected" not in activity
+
+
 def test_open_from_snapshot_rejects_when_intent_currency_not_in_rates(tmp_path):
     """intent の pair の spec はあるが換算レートが欠けている場合の fail-closed。
 

@@ -65,7 +65,9 @@ def test_strategy_timeframe_mismatch_warns_once_and_prompt_has_decision_metadata
                         lambda *_args: "state")
     prompt = loop._build_prompt("system", NOW)
     assert "decision_timeframe: 15m" in prompt
-    assert "consumed / abandoned の行は再提案しない" in prompt
+    assert "get_signals" not in prompt
+    ask_prompt = loop._build_prompt("system", NOW, include_signals=True)
+    assert "consumed / abandoned の行は再提案しない" in ask_prompt
     loop.settings.datafeed.decision_timeframe = "1h"
     assert "decision_timeframe: 1h" in loop._build_prompt("system", NOW)
 
