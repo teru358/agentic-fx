@@ -562,8 +562,8 @@ class _CrashingWorker(EconSliceWorker):
     """n 本目の書込みの commit 直後に落ちる (処理の途中で止まる)。"""
     crash_after = None
 
-    def _write(self, op, *, locked=False):
-        result = super()._write(op, locked=locked)
+    def _write(self, op, **kwargs):
+        result = super()._write(op, **kwargs)
         if self.crash_after is not None:
             self.crash_after -= 1
             if self.crash_after <= 0:
@@ -1297,3 +1297,340 @@ def test_the_complete_step_does_not_touch_the_core_lock_while_a_write_is_request
     w.run_cycle()
     assert lock.attempts == 1
     assert os_.get_set(world.db, set_id)["state"] == "complete"
+
+
+# --- 停止要求・時刻・走査・文の境界 ------------------------------------------------------------
+
+class _HoldWriterAfterGeneration(EconSliceWorker):
+    """世代を登録した直後に別接続が書込み lock を握る。"""
+    holder = None
+
+    def _write(self, *args, **kwargs):
+        result = super()._write(*args, **kwargs)
+        if (self.holder is not None and getattr(result, "committed", False)):
+            holder, self.holder = self.holder, None
+            holder.execute("BEGIN IMMEDIATE")
+        return result
+
+
+def _run_in_thread(w, stop):
+    thread = threading.Thread(target=w.run, args=(stop,))
+    thread.start()
+    return thread
+
+
+def _stop_and_join(thread, stop):
+    stop.set()
+    thread.join(timeout=10)
+    return not thread.is_alive()
+
+
+def test_a_stop_request_ends_the_startup_while_another_connection_holds_the_writer(world):
+    busy_seen = threading.Event()
+
+    def sleep(seconds):
+        busy_seen.set()
+        time.sleep(0.005)
+
+    read, write = world.pair()
+    w = _worker(world, _Clock(LATE), rw=(read, write), sleep=sleep, start=False)
+    holder = world.open(busy=0)
+    holder.execute("BEGIN IMMEDIATE")
+    stop = threading.Event()
+    thread = _run_in_thread(w, stop)
+    try:
+        assert busy_seen.wait(10)
+        assert _stop_and_join(thread, stop)
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+        holder.rollback()
+    assert w.generation is None
+
+
+def test_a_stop_request_ends_the_old_generation_reclaim_while_the_writer_is_held(world):
+    _seed(world.db)
+    set_id = _event_set(world.db)
+    os_.record_event_spread(world.db, set_id, spread_pips=1.7,
+                            spread_source="quote")
+    first = _worker(world, _Clock(LATE), cls=_CrashingWorker)
+    first.crash_after = 1
+    with pytest.raises(_Crash):
+        first.run_cycle()
+    assert os_.get_set(world.db, set_id)["state"] == "staging"
+    busy_seen = threading.Event()
+
+    def sleep(seconds):
+        busy_seen.set()
+        time.sleep(0.005)
+
+    holder = world.open(busy=0)
+    read, write = world.pair()
+    w = _worker(world, _Clock(LATE), rw=(read, write), sleep=sleep, start=False,
+                cls=_HoldWriterAfterGeneration)
+    w.holder = holder
+    stop = threading.Event()
+    thread = _run_in_thread(w, stop)
+    try:
+        assert busy_seen.wait(10)
+        assert _stop_and_join(thread, stop)
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+        if holder.in_transaction:
+            holder.rollback()
+    assert w.generation is not None
+    assert os_.get_set(world.db, set_id)["state"] == "staging"
+
+
+def test_a_later_candidate_after_ts_is_recorded_as_assumed_even_if_the_cycle_began_before(world):
+    upcoming = [_event_set(world.db, SPREAD_TS, name=f"NFP{i}") for i in range(2)]
+    clock = _Clock(SPREAD_TS - timedelta(seconds=1))
+    calls = []
+
+    def quote(pair):
+        calls.append(pair)
+        return _quote()
+
+    read, write = world.pair()
+
+    def trace(statement):
+        if statement.startswith("UPDATE ohlcv_slice_sets SET spread_pips"):
+            clock.now = SPREAD_TS + timedelta(seconds=1)
+
+    write.set_trace_callback(trace)
+    w = _worker(world, clock, rw=(read, write), quote_fn=quote)
+    clock.now = SPREAD_TS - timedelta(seconds=1)
+    w.run_cycle()
+    sources = sorted(os_.get_set(world.db, i)["spread_source"] for i in upcoming)
+    assert sources == ["assumed", "quote"]
+    assert calls == ["USDJPY"]
+
+
+def test_a_quote_taken_across_ts_is_dropped_and_assumed_is_recorded(world):
+    upcoming = _event_set(world.db, SPREAD_TS, name="NFP")
+    clock = _Clock(SPREAD_TS - timedelta(seconds=1))
+
+    def quote(pair):
+        clock.now = SPREAD_TS + timedelta(milliseconds=1)
+        return _quote(150.0, 150.05)
+
+    w = _worker(world, clock, quote_fn=quote)
+    clock.now = SPREAD_TS - timedelta(seconds=1)
+    w.run_cycle()
+    row = os_.get_set(world.db, upcoming)
+    assert (row["spread_source"], row["spread_pips"]) == ("assumed", 1.5)
+
+
+def test_a_staged_shadow_whose_source_bars_leave_retention_ends_as_data_insufficient(world):
+    _seed(world.db)
+    shadow = _shadow(world.db, 0)
+    w = _worker(world, _Clock(LATE), cls=_CrashingWorker)
+    w.crash_after = 1
+    with pytest.raises(_Crash):
+        w.run_cycle()
+    w.crash_after = None
+    staged = [s for s in _sets(world.db) if s["shadow_id"] == shadow]
+    assert staged and staged[0]["state"] == "staging"
+    assert _rows_in(world.db, staged[0]["id"]) > 0
+    world.db.execute("DELETE FROM ohlcv_cache WHERE bar_time < ?",
+                     (datetime(2026, 11, 2, 13, 0, tzinfo=UTC).isoformat(),))
+    world.db.commit()
+    for _ in range(3):
+        w.run_cycle()
+        if ss.get(world.db, shadow)["state"] != "pending_entry":
+            break
+    row = ss.get(world.db, shadow)
+    assert row["result_code"] == "data_insufficient"
+    sets = [s for s in _sets(world.db) if s["shadow_id"] == shadow]
+    assert [s["state"] for s in sets] == ["unrecoverable"]
+    assert world.db.execute(
+        "SELECT COUNT(*) FROM ohlcv_slices").fetchone()[0] == 0
+
+
+def test_candidates_after_a_key_continue_in_the_same_order(world):
+    ids = [_shadow(world.db, i, decided=DECIDED + timedelta(seconds=i))
+           for i in range(5)]
+    everything = ss.unresolved_candidates(world.db, decided_before=LATE, limit=10)
+    assert [r["id"] for r in everything] == ids
+    key = (everything[1]["decided_at"], everything[1]["id"])
+    rest = ss.unresolved_candidates(world.db, decided_before=LATE, limit=10,
+                                    after=key)
+    assert [r["id"] for r in rest] == ids[2:]
+
+
+def test_broken_candidates_filling_the_window_do_not_hide_a_later_mature_one(world):
+    _seed(world.db)
+    broken = [_shadow(world.db, i) for i in range(worker_mod.SHADOW_CANDIDATE_LIMIT)]
+    good = _shadow(world.db, worker_mod.SHADOW_CANDIDATE_LIMIT)
+    world.db.execute(
+        "UPDATE signals SET payload_json='not json' WHERE id IN "
+        "(SELECT signal_id FROM signal_shadow WHERE id IN (%s))"
+        % ",".join("?" * len(broken)), broken)
+    world.db.commit()
+    w = _worker(world, _Clock(LATE))
+    for _ in range(3):
+        w.run_cycle()
+        if ss.get(world.db, good)["state"] != "pending_entry":
+            break
+    assert ss.get(world.db, good)["state"] == "resolved"
+    assert all(ss.get(world.db, i)["state"] == "pending_entry" for i in broken)
+    w.run_cycle()
+    assert ss.get(world.db, good)["state"] == "resolved"
+
+
+def _slow_statement_clock(write, clock, trigger):
+    issued = []
+
+    def trace(statement):
+        issued.append(statement)
+        if trigger(statement):
+            clock.t += 0.06
+
+    write.set_trace_callback(trace)
+    return issued
+
+
+@pytest.mark.parametrize("trigger", [
+    lambda s: s.startswith("BEGIN"),
+    lambda s: s.startswith("UPDATE ohlcv_slice_sets SET state="),
+])
+def test_no_statement_is_issued_after_the_transaction_ran_over_50ms(world, trigger):
+    _seed(world.db)
+    set_id = _event_set(world.db)
+    clock = _Clock(LATE)
+    read, write = world.pair()
+    w = _worker(world, clock, rw=(read, write), monotonic=clock.monotonic)
+    issued = _slow_statement_clock(write, clock, trigger)
+    report = w.run_cycle()
+    assert not any(s.startswith("INSERT INTO ohlcv_slices") for s in issued)
+    assert not any(s.startswith("SELECT range_start") for s in issued)
+    assert _rows_in(world.db, set_id) == 0
+    assert os_.get_set(world.db, set_id)["state"] == "awaiting"
+    assert report.completed == []
+
+
+def test_the_complete_step_issues_nothing_after_the_transaction_ran_over_50ms(world):
+    _seed(world.db)
+    shadow = _shadow(world.db, 0)
+    clock = _Clock(LATE)
+    read, write = world.pair()
+    w = _worker(world, clock, rw=(read, write), monotonic=clock.monotonic)
+    issued = _slow_statement_clock(
+        write, clock, lambda s: "generation=NULL" in s and s.startswith("UPDATE"))
+    w.run_cycle()
+    assert not any(s.startswith("UPDATE signal_shadow") for s in issued)
+    assert ss.get(world.db, shadow)["state"] == "pending_entry"
+    assert [s["state"] for s in _sets(world.db)] == ["staging"]
+
+
+def test_a_store_operation_gives_up_between_statements_when_the_checkpoint_raises(world):
+    from agentic_fx.store.short_tx import OverBudget
+    set_id = _event_set(world.db)
+    gen = os_.new_generation(world.db, now=LATE)
+    seen = []
+
+    def checkpoint():
+        seen.append(1)
+        if len(seen) == 1:
+            raise OverBudget
+
+    start = EVENT_TS - timedelta(minutes=15)
+    rows = [SliceRow(ts, 150.0, 150.1, 149.9, 150.0, 1.0, "mt5-live", "observed")
+            for ts in open_minutes(start, start + timedelta(minutes=3))]
+    issued = []
+    world.db.set_trace_callback(issued.append)
+    result = os_.stage_event_rows(world.db, set_id=set_id, generation=gen,
+                                  rows=rows, assumed_spread_pips=1.0,
+                                  checkpoint=checkpoint)
+    world.db.set_trace_callback(None)
+    assert result.status == "over_budget"
+    assert not any(s.startswith("INSERT INTO ohlcv_slices") for s in issued)
+    assert _rows_in(world.db, set_id) == 0
+    assert os_.get_set(world.db, set_id)["state"] == "awaiting"
+
+
+# --- 競合 ------------------------------------------------------------------------------------
+
+class _RivalFirst(EconSliceWorker):
+    """候補を取得した後、自分の処理の前に相手の worker に cycle を回させる。"""
+    rival = None
+
+    def _shadow_owner(self, row, now):
+        if self.rival is not None:
+            rival, self.rival = self.rival, None
+            rival.run_cycle()
+        super()._shadow_owner(row, now)
+
+
+def test_a_worker_holding_a_candidate_another_worker_finished_ends_nothing_twice(world):
+    _seed(world.db)
+    shadow = _shadow(world.db, 0)
+    done = []
+    clock = _Clock(LATE)
+    rival = _worker(world, clock, on_complete=done.append)
+    mine = _worker(world, clock, cls=_RivalFirst, on_complete=done.append)
+    mine.rival = rival
+    report = mine.run_cycle()
+    assert ss.get(world.db, shadow)["state"] == "resolved"
+    assert report.completed == []
+    assert len(done) == 1
+    assert [s["state"] for s in _sets(world.db)] == ["complete"]
+    first = _shadow_fields(world.db, shadow)
+    mine.run_cycle()
+    rival.run_cycle()
+    assert _shadow_fields(world.db, shadow) == first
+    assert len(done) == 1
+
+
+def test_the_shadow_ended_elsewhere_after_staging_is_not_ended_again(world):
+    _seed(world.db)
+    shadow = _shadow(world.db, 0)
+    other = world.open(busy=5000)
+
+    class _Racing(EconSliceWorker):
+        def _before_readback(self, set_id):
+            row = ss.get(other, shadow)
+            assert ss.transition(
+                other, shadow, expected_state=row["state"],
+                expected_updated_at=row["updated_at"],
+                outcome=ss.ShadowOutcome.no_fill(), now=LATE)
+
+    done = []
+    w = _worker(world, _Clock(LATE), cls=_Racing, on_complete=done.append)
+    report = w.run_cycle()
+    assert report.completed == [] and done == []
+    row = ss.get(world.db, shadow)
+    assert (row["state"], row["result_code"]) == ("expired", "no_fill")
+    assert [s["state"] for s in _sets(world.db)] == ["staging"]
+
+
+class _UpdateBetweenOwners(EconSliceWorker):
+    other = None
+    owners = 0
+
+    def _event_owner(self, row, now):
+        super()._event_owner(row, now)
+        self.owners += 1
+        if self.owners == 1:
+            self.other.execute(
+                "UPDATE ohlcv_cache SET open=155.0, high=155.2, low=154.8, "
+                "close=155.0 WHERE symbol='USDJPY' AND interval='1m' "
+                "AND bar_time=?", ("2026-11-03T07:00:00+00:00",))
+            self.other.commit()
+
+
+def test_the_next_owner_reads_what_another_connection_wrote_between_owners(world):
+    _seed(world.db)
+    first = _event_set(world.db)
+    second = _event_set(world.db, datetime(2026, 11, 3, 6, 0, tzinfo=UTC),
+                        name="NFP")
+    w = _worker(world, _Clock(datetime(2026, 11, 4, 12, 0, tzinfo=UTC)),
+                cls=_UpdateBetweenOwners)
+    w.other = world.open(busy=5000)
+    w.run_cycle()
+    assert os_.get_set(world.db, first)["state"] == "complete"
+    assert os_.get_set(world.db, second)["state"] == "complete"
+    read = world.open(read_only=True)
+    rows = {r.bar_time: r for r in os_.complete_rows(read, second)}
+    assert rows[datetime(2026, 11, 3, 7, 0, tzinfo=UTC)].close == 155.0

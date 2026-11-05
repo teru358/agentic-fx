@@ -196,7 +196,8 @@ def check_transition(from_state: str, outcome: ShadowOutcome):
 
 def transition_in_tx(conn: sqlite3.Connection, shadow_id: int, *,
                      expected_state: str, expected_updated_at: str,
-                     outcome: ShadowOutcome, now: datetime) -> bool:
+                     outcome: ShadowOutcome, now: datetime,
+                     checkpoint: Checkpoint | None = None) -> bool:
     """`expected_state` / `expected_updated_at` が一致するときだけ遷移を書く。
 
     表に無い遷移は SQL を出す前に `ShadowTransitionError`。CAS 不一致は
@@ -226,6 +227,8 @@ def transition_in_tx(conn: sqlite3.Connection, shadow_id: int, *,
             raise ShadowTransitionError(
                 f"{outcome.state}/{outcome.result_code} has no exit values")
         exit_cols = (None, None, None)
+    if checkpoint is not None:
+        checkpoint()
     entry_sql = ("" if fill == "kept"
                  else "entry_price=:entry_price, entry_at=:entry_at, ")
     cur = conn.execute(
@@ -253,7 +256,7 @@ def transition_tx(conn: sqlite3.Connection, shadow_id: int, *,
     def body():
         if not transition_in_tx(conn, shadow_id, expected_state=expected_state,
                                 expected_updated_at=expected_updated_at,
-                                outcome=outcome, now=now):
+                                outcome=outcome, now=now, checkpoint=checkpoint):
             raise Conflict
         return {}
 
@@ -277,7 +280,8 @@ def get(conn: sqlite3.Connection, shadow_id: int) -> dict | None:
 
 def unresolved_candidates(conn: sqlite3.Connection, *,
                           decided_before: datetime,
-                          limit: int) -> list[dict]:
+                          limit: int,
+                          after: tuple[str, int] | None = None) -> list[dict]:
     """解決候補: 未終端 (`pending_entry` / `filled`) で、slice set が
     complete / unrecoverable でなく、decision が `decided_before` 以前の行。
 
@@ -285,8 +289,15 @@ def unresolved_candidates(conn: sqlite3.Connection, *,
     が計算する。この query は「最も早い確定点より前の行は返さない」前段の
     絞り込みだけを行う。古い decision から返す。`decided_at` は utc_iso で
     書かれるので文字列比較で時刻順に比べる。
+
+    `after=(decided_at, shadow_id)` を渡すと、その key より後ろ (同じ順序で
+    次) の行から返す。既定 `None` は先頭から。
     """
     cutoff = utc_iso(decided_before)
+    keyset, extra = "", ()
+    if after is not None:
+        keyset = "AND (d.decided_at > ? OR (d.decided_at = ? AND sh.id > ?)) "
+        extra = (after[0], after[0], int(after[1]))
     return [dict(r) for r in conn.execute(
         "SELECT sh.*, d.decided_at, d.mission_id, d.trade_intent_id, "
         "s.plugin, s.pair, s.timeframe, s.bar_ts, s.payload_json, "
@@ -297,9 +308,9 @@ def unresolved_candidates(conn: sqlite3.Connection, *,
         "LEFT JOIN ohlcv_slice_sets ss ON ss.shadow_id = sh.id "
         "WHERE sh.state IN (?, ?) "
         "AND (ss.id IS NULL OR ss.state NOT IN ('complete','unrecoverable')) "
-        "AND d.decided_at <= ? "
+        "AND d.decided_at <= ? " + keyset +
         "ORDER BY d.decided_at, sh.id LIMIT ?",
-        (STATE_PENDING_ENTRY, STATE_FILLED, cutoff, int(limit)))]
+        (STATE_PENDING_ENTRY, STATE_FILLED, cutoff, *extra, int(limit)))]
 
 
 def period_summary(conn: sqlite3.Connection, *, since: datetime,

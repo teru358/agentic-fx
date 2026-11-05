@@ -1058,7 +1058,10 @@ def test_checkpoint_runs_after_the_statements_and_before_commit(tmp_path):
     out = _stage_event(conn, set_id=set_id, generation=gen,
                        rows=_bars(TS - timedelta(minutes=15), 3),
                        checkpoint=checkpoint)
-    assert out.committed and seen == [(True, 3)]
+    assert out.committed
+    assert seen[-1] == (True, 3)
+    assert len(seen) > 1 and all(in_tx for in_tx, _ in seen)
+    assert [rows for _, rows in seen] == sorted(rows for _, rows in seen)
 
 
 def test_over_budget_rolls_back_every_worker_write(tmp_path):

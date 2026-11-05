@@ -161,6 +161,7 @@ class EconSliceWorker:
         self._bounded = True
         self._abort = False
         self._report = CycleReport()
+        self._shadow_cursor: tuple[str, int] | None = None
 
     # --- 観測 ---------------------------------------------------------------
 
@@ -183,7 +184,8 @@ class EconSliceWorker:
                 result = self._write(lambda begin, checkpoint:
                                      ohlcv_slices.new_generation_tx(
                                          self._write_conn, now=self._now(),
-                                         begin=begin, checkpoint=checkpoint))
+                                         begin=begin, checkpoint=checkpoint),
+                                     stop=stop)
                 if isinstance(result, TxResult) and result.committed:
                     self._generation = result.value
                     break
@@ -255,16 +257,20 @@ class EconSliceWorker:
                 self._read.rollback()
             self._spent += max(0.0, self._monotonic() - started)
 
-    def _write(self, op, *, locked: bool = False):
+    def _write(self, op, *, locked: bool = False,
+               stop: threading.Event | None = None):
         """書込み 1 本を admission の lease の中で行う。
 
         `op(begin, checkpoint)` の結果を返す。予算切れ・見送り (書込み要求中・
         core lock が取れない) は `None`。BUSY は rollback して backoff し、予算の
         中で再試行する。lease は BEGIN の前から commit / rollback の後まで保つ。
+        `stop` が立てば、試行の前と backoff の前で抜けて `None`。
         """
         delays = _backoff()
         while True:
             if self._exhausted():
+                return None
+            if stop is not None and stop.is_set():
                 return None
             if locked:
                 if self._admission.requested():
@@ -277,11 +283,11 @@ class EconSliceWorker:
             result = None
             try:
                 def begin(conn: sqlite3.Connection) -> bool:
+                    attempt.tx_start = self._monotonic()
                     admitted = self._admission.admit(
                         lambda: conn.execute("BEGIN IMMEDIATE"))
                     attempt.leased = admitted
                     attempt.yielded = not admitted
-                    attempt.tx_start = self._monotonic()
                     return admitted
 
                 def checkpoint() -> None:
@@ -302,6 +308,8 @@ class EconSliceWorker:
                     self._core_lock.release()
             self._spent += max(0.0, self._monotonic() - started)
             if busy:
+                if stop is not None and stop.is_set():
+                    return None
                 delay = next(delays)
                 self._sleep(delay)
                 self._spent += delay
@@ -328,17 +336,21 @@ class EconSliceWorker:
             if self._stopped():
                 return
             try:
-                if self._record_spread(cand, now):
+                if self._record_spread(cand):
                     self._report.spreads += 1
             except Exception:
                 _log.exception("econ spread record failed: set %s",
                                cand["set_id"])
 
-    def _record_spread(self, cand: dict, now: datetime) -> bool:
+    def _record_spread(self, cand: dict) -> bool:
+        """候補ごとに現在時刻で判定する。発表時刻 (ts) 以後に取った quote は
+        発表前の値と言えないので捨て、assumed を記録する。"""
         pair = cand["pair"]
         pip_size = self._pip_size_fn(pair)
         assumed = self._assumed_fn(pair)
-        if now < _parse(cand["ts"]):
+        ts = _parse(cand["ts"])
+        quote = None
+        if self._now() < ts:
             try:
                 quote = self._quote_fn(pair)
             except Exception:
@@ -347,6 +359,9 @@ class EconSliceWorker:
                 return False
             if quote is None:
                 return False
+            if self._now() >= ts:
+                quote = None
+        if quote is not None:
             spread = signal_shadow.spread_from_quote(
                 quote.bid, quote.ask, pip_size=pip_size,
                 assumed_spread_pips=assumed)
@@ -394,8 +409,7 @@ class EconSliceWorker:
             return
         events = self._reading(lambda c: ohlcv_slices.matured_event_sets(
             c, now=now, limit=MAX_OWNERS_PER_CYCLE))
-        shadows = self._reading(lambda c: signal_shadow.unresolved_candidates(
-            c, decided_before=now, limit=SHADOW_CANDIDATE_LIMIT))
+        shadows = self._shadow_candidates(now)
         queue: list[tuple[str, dict]] = []
         for i in range(max(len(events), len(shadows))):
             if i < len(events):
@@ -413,6 +427,20 @@ class EconSliceWorker:
             except Exception:
                 _log.exception("econ slice owner failed: %s %s", kind,
                                row.get("id"))
+            if kind == "shadow" and not self._stopped():
+                self._shadow_cursor = (row["decided_at"], row["id"])
+
+    def _shadow_candidates(self, now: datetime) -> list[dict]:
+        """前の cycle が見た最後の key の次から読み、末尾まで来たら先頭へ戻る。
+        壊れた行や未成熟の行が固定枠を占めても、走査は先へ進む。"""
+        after = self._shadow_cursor
+        rows = self._reading(lambda c: signal_shadow.unresolved_candidates(
+            c, decided_before=now, limit=SHADOW_CANDIDATE_LIMIT, after=after))
+        if not rows and after is not None:
+            self._shadow_cursor = None
+            rows = self._reading(lambda c: signal_shadow.unresolved_candidates(
+                c, decided_before=now, limit=SHADOW_CANDIDATE_LIMIT))
+        return rows
 
     # --- event ------------------------------------------------------------------------
 
@@ -472,6 +500,15 @@ class EconSliceWorker:
                 self._report.expired_empty += 1
             return
         if plan.unrecoverable:
+            set_id = row["set_id"]
+            if set_id is not None:
+                stored = self._reading(lambda c: ohlcv_slices.get_set(c, set_id))
+                if stored is not None:
+                    if stored["generation"] != self._generation:
+                        return
+                    if not self._discard(set_id, self._generation):
+                        return
+                    self._report.discarded += 1
             if self._finish(lambda begin, checkpoint:
                             ohlcv_slices.mark_shadow_unrecoverable(
                                 self._write_conn, shadow=cas, pair=row["pair"],
@@ -626,7 +663,8 @@ class EconSliceWorker:
                                  ohlcv_slices.discard_staging_step(
                                      self._write_conn, set_id=set_id,
                                      generation=generation, max_rows=size,
-                                     begin=begin, checkpoint=checkpoint))
+                                     begin=begin, checkpoint=checkpoint),
+                                 stop=stop)
             if not isinstance(result, TxResult):
                 if self._bounded:
                     return False

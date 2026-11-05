@@ -167,6 +167,12 @@ def open_minute_count(start: datetime, end: datetime) -> int:
     return len(open_minutes(start, end))
 
 
+def _step(checkpoint: Checkpoint | None) -> None:
+    """文と文の間で予算超過を見る。`None` なら何もしない。"""
+    if checkpoint is not None:
+        checkpoint()
+
+
 def _insert_rows(conn: sqlite3.Connection, set_id: int,
                  rows: Sequence[SliceRow]) -> None:
     if not rows:
@@ -500,6 +506,7 @@ def stage_event_rows(conn: sqlite3.Connection, *, set_id: int, generation: int,
             "WHERE id=? AND event_id IS NOT NULL AND state=?",
             (STATE_STAGING, generation, signal_shadow.SPREAD_ASSUMED, assumed,
              set_id, STATE_AWAITING))
+        _step(checkpoint)
         row = conn.execute(
             "SELECT range_start, range_end FROM ohlcv_slice_sets "
             "WHERE id=? AND event_id IS NOT NULL AND state=? AND generation=?",
@@ -507,6 +514,7 @@ def stage_event_rows(conn: sqlite3.Connection, *, set_id: int, generation: int,
         if row is None:
             raise Conflict
         _require_in_range(rows, row[0], row[1])
+        _step(checkpoint)
         _insert_rows(conn, set_id, rows)
         return {"set_id": set_id, "rows": len(rows)}
 
@@ -522,8 +530,9 @@ def _shadow_range_minutes(start: datetime, end: datetime) -> int:
 
 
 def _require_live_shadow(conn: sqlite3.Connection, shadow_id: int,
-                         pair: str) -> None:
+                         pair: str, checkpoint: Checkpoint | None = None) -> None:
     """set を作る前に shadow が在り、終端でなく、signal と同じ pair かを確かめる。"""
+    _step(checkpoint)
     row = conn.execute(
         "SELECT s.state, g.pair FROM signal_shadow s "
         "JOIN signals g ON g.id = s.signal_id WHERE s.id=?",
@@ -559,7 +568,8 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
             "SELECT id, state, generation, range_start, range_end, pair "
             "FROM ohlcv_slice_sets WHERE shadow_id=?", (shadow_id,)).fetchone()
         if row is None:
-            _require_live_shadow(conn, shadow_id, pair)
+            _require_live_shadow(conn, shadow_id, pair, checkpoint)
+            _step(checkpoint)
             set_id = conn.execute(
                 "INSERT INTO ohlcv_slice_sets (shadow_id,pair,range_start,"
                 "range_end,expected_rows,state,generation,created_at,"
@@ -573,6 +583,7 @@ def stage_shadow_rows(conn: sqlite3.Connection, *, shadow_id: int, pair: str,
             set_id = row["id"]
         else:
             raise Conflict
+        _step(checkpoint)
         _insert_rows(conn, set_id, rows)
         return {"set_id": set_id, "rows": len(rows)}
 
@@ -644,6 +655,7 @@ def complete_set(conn: sqlite3.Connection, *, set_id: int, generation: int,
             raise ValueError("an event-owned set has no shadow to end")
         if shadow is not None and owner[0] != shadow.shadow_id:
             raise Conflict
+        _step(checkpoint)
         cur = conn.execute(
             "UPDATE ohlcv_slice_sets SET state=?, generation=NULL, "
             "completed_at=? WHERE id=? AND state=? AND generation=? "
@@ -656,7 +668,7 @@ def complete_set(conn: sqlite3.Connection, *, set_id: int, generation: int,
         if shadow is not None and not signal_shadow.transition_in_tx(
                 conn, shadow.shadow_id, expected_state=shadow.expected_state,
                 expected_updated_at=shadow.expected_updated_at,
-                outcome=shadow.outcome, now=now):
+                outcome=shadow.outcome, now=now, checkpoint=checkpoint):
             raise Conflict
         return {"set_id": set_id, "done": True}
 
@@ -694,9 +706,11 @@ def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
 
     def body():
         _require_live_shadow(conn, shadow.shadow_id, pair)
+        _step(checkpoint)
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE shadow_id=?",
                         (shadow.shadow_id,)).fetchone() is not None:
             raise Conflict
+        _step(checkpoint)
         set_id = conn.execute(
             "INSERT INTO ohlcv_slice_sets (shadow_id,pair,range_start,range_end,"
             "expected_rows,state,created_at,completed_at,rule_version) "
@@ -707,7 +721,7 @@ def mark_shadow_unrecoverable(conn: sqlite3.Connection, *, shadow: ShadowCas,
         if not signal_shadow.transition_in_tx(
                 conn, shadow.shadow_id, expected_state=shadow.expected_state,
                 expected_updated_at=shadow.expected_updated_at,
-                outcome=shadow.outcome, now=now):
+                outcome=shadow.outcome, now=now, checkpoint=checkpoint):
             raise Conflict
         return {"set_id": set_id, "done": True}
 
@@ -746,9 +760,12 @@ def discard_staging_step(conn: sqlite3.Connection, *, set_id: int,
             (set_id, STATE_STAGING, generation)).fetchone()
         if row is None:
             raise Conflict
+        _step(checkpoint)
         deleted = _delete_rows(conn, set_id, max_rows)
+        _step(checkpoint)
         if _rows_left(conn, set_id):
             return {"set_id": set_id, "rows": deleted}
+        _step(checkpoint)
         if row[0] is not None:
             conn.execute(
                 "UPDATE ohlcv_slice_sets SET state=?, generation=NULL "
@@ -790,7 +807,9 @@ def sweep_cancelled_step(conn: sqlite3.Connection, *, set_id: int,
         if conn.execute("SELECT 1 FROM ohlcv_slice_sets WHERE id=? AND state=?",
                         (set_id, STATE_CANCELLED)).fetchone() is None:
             raise Conflict
+        _step(checkpoint)
         deleted = _delete_rows(conn, set_id, max_rows)
+        _step(checkpoint)
         return {"set_id": set_id, "rows": deleted,
                 "done": not _rows_left(conn, set_id)}
 
