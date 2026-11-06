@@ -886,11 +886,11 @@ EVENT_ROWS_PER_SET = 255
 # して切り上げた値を E (event / 月) とする。
 EVENT_ROWS_OBSERVED = {3: 117, 2: 238, 1: 1004}
 EVENT_OBSERVED_DAYS = 66
-# slice 関連 7 表の空 DDL の bytes (B0) と 1 行あたりの上側 bytes (β)。
-# 実ディスクの測定で上包絡を確かめた値に置き換えるまでの仮値で、式だけを
-# test で固定している。
-SLICE_BASE_BYTES = 1_048_576
-SLICE_BYTES_PER_ROW = 128
+# 空 DDL の DB + WAL の bytes (B0) と 1 行あたりの上側 bytes (β)。実ディスクの bench
+# (tests/core/test_econ_shadow_worker.py の `bench`) が、固定例 C の 1/1000・1/100・
+# 1/10 の各点で測った大きさを `B0 + 行数 × β` が上から覆うことを確かめた値。
+SLICE_BASE_BYTES = 348_160
+SLICE_BYTES_PER_ROW = 177
 WARN_RATIO = Fraction(8, 10)
 FULL_RATIO = Fraction(1)
 

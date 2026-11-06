@@ -1,8 +1,15 @@
+import contextlib
+import dataclasses
 import json
+import math
+import os
+import random
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -2020,3 +2027,796 @@ def test_a_set_that_keeps_going_over_budget_does_not_hold_back_later_sets(world,
     calls.clear()
     w.run_cycle()
     assert calls and calls[0] == (first, 240)
+
+
+# --- 実ディスクの bench (writer 優先と容量) ------------------------------------------
+#
+# 本番の data/ と同じ filesystem の実 SQLite file で測る。`AFX_BENCH_DATA_DIR` に本番の
+# data/ の場所を渡す (stat だけで、中身には触れない)。通常 suite では bench marker で除外される。
+
+DISK_OUT = Path(__file__).resolve().parents[2] / "tmp" / "econ-window-acceptance" / "disk"
+FIXED_CAPACITY_ROWS = 64_693_085
+JOB_LIMIT_SEC = 4 * 3600
+JOB_LIMIT_BYTES = 4 * 1024 ** 3
+# first-statement がこれを超えたら待ちが起きたと数える。worker が BEGIN を出さなかったことは
+# 別に、BEGIN を出した時刻とフラグの立っていた区間の突き合わせで決定的に確かめる。
+WAIT_EPSILON_SEC = 0.005
+BENCH_FILL_AT = datetime(2026, 11, 2, 22, 0, tzinfo=UTC)
+BENCH_DECIDED = datetime(2026, 11, 2, 18, 0, 30, tzinfo=UTC)
+BENCH_NOW = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
+BENCH_FILL_BAR = (150.0, 150.05, 149.8, 150.0)
+
+
+def _env_int(name, default):
+    raw = os.environ.get(name)
+    return default if raw in (None, "") else int(raw)
+
+
+def _dist(values):
+    ordered = sorted(values)
+    if not ordered:
+        return {"count": 0, "p50": None, "p99": None, "max": None}
+    n = len(ordered)
+    return {"count": n,
+            "p50": ordered[max(0, math.ceil(0.50 * n) - 1)],
+            "p99": ordered[max(0, math.ceil(0.99 * n) - 1)],
+            "max": ordered[-1]}
+
+
+def _dir_bytes(path):
+    return sum(e.stat().st_size for e in os.scandir(path) if e.is_file())
+
+
+class _Peak:
+    def __init__(self, work):
+        self.work = work
+        self.bytes = 0
+
+    def sample(self):
+        total = _dir_bytes(self.work)
+        if DISK_OUT.is_dir():
+            total += sum(e.stat().st_size for e in os.scandir(DISK_OUT)
+                         if e.is_file())
+        self.bytes = max(self.bytes, total)
+        return self.bytes
+
+
+@pytest.fixture(scope="module")
+def disk_job(tmp_path_factory):
+    raw = os.environ.get("AFX_BENCH_DATA_DIR")
+    if not raw:
+        pytest.fail("AFX_BENCH_DATA_DIR is not set (the production data/ location)")
+    data = Path(raw)
+    if not data.is_dir():
+        pytest.fail(f"AFX_BENCH_DATA_DIR does not exist: {data}")
+    base = tmp_path_factory.getbasetemp()
+    if os.stat(data).st_dev != os.stat(base).st_dev:
+        pytest.fail(f"basetemp {base} is not on the same filesystem as {data}")
+    DISK_OUT.mkdir(parents=True, exist_ok=True)
+    work = tmp_path_factory.mktemp("disk")
+    return {"work": work, "started": time.monotonic(), "peak": _Peak(work),
+            "data_dev": os.stat(data).st_dev}
+
+
+def _write_json(name, payload):
+    target = DISK_OUT / name
+    target.write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+class _ProbeConn:
+    """worker の write 接続を包み、transaction ごとの BEGIN から COMMIT 直前までの経過・
+    COMMIT の所要・挿入行数を記録する。他の属性はそのまま通す。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.begins = []
+        self.busy = []
+        self.txs = []
+        self._open = None
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def execute(self, sql, *args):
+        text = sql.lstrip().upper()
+        if text.startswith("BEGIN IMMEDIATE"):
+            issued = time.perf_counter()
+            self.begins.append(issued)
+            try:
+                cur = self._conn.execute(sql, *args)
+            except sqlite3.OperationalError:
+                self.busy.append(issued)
+                raise
+            self._open = {"begin": issued, "rows": 0}
+            return cur
+        cur = self._conn.execute(sql, *args)
+        if self._open is not None and text.startswith("INSERT INTO OHLCV_SLICES ("):
+            self._open["rows"] += cur.rowcount
+        return cur
+
+    def commit(self):
+        before = time.perf_counter()
+        self._conn.commit()
+        after = time.perf_counter()
+        if self._open is not None:
+            self.txs.append({"outcome": "commit", "begin": self._open["begin"],
+                             "pre": before - self._open["begin"],
+                             "commit": after - before, "end": after,
+                             "rows": self._open["rows"]})
+            self._open = None
+
+    def rollback(self):
+        before = time.perf_counter()
+        self._conn.rollback()
+        if self._open is not None:
+            self.txs.append({"outcome": "rollback", "begin": self._open["begin"],
+                             "pre": before - self._open["begin"], "commit": 0.0,
+                             "end": time.perf_counter(), "rows": self._open["rows"]})
+            self._open = None
+
+
+class _TimedLock:
+    """core lock の代わり。worker の保持時間 (スレッド名ごと) を記録する。"""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._since = {}
+        self.holds = []
+
+    def acquire(self, blocking=True, timeout=-1):
+        ok = self._lock.acquire(blocking, timeout)
+        if ok:
+            self._since[threading.get_ident()] = time.perf_counter()
+        return ok
+
+    def release(self):
+        began = self._since.pop(threading.get_ident(), None)
+        if began is not None:
+            self.holds.append((threading.current_thread().name,
+                               time.perf_counter() - began))
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def _bench_world(work, name, owners):
+    world = _World(work / f"{name}.db")
+    _seed(world.db, {BENCH_FILL_AT: BENCH_FILL_BAR},
+          start=datetime(2026, 11, 2, 17, 0, tzinfo=UTC),
+          end=datetime(2026, 11, 4, 0, 0, tzinfo=UTC))
+    for n in range(owners):
+        _shadow(world.db, n, decided=BENCH_DECIDED, entry_type="limit",
+                limit_price=149.9)
+    return world
+
+
+def _long_writer(conn, path, *, holds, hold_sec, gap_sec, out, stop):
+    """フラグを持たない長い writer (BEGIN IMMEDIATE の中で file I/O をして保持する)。"""
+    chunk = os.urandom(1 << 16)
+    with open(path, "wb") as fh:
+        for _ in range(holds):
+            if stop.is_set():
+                break
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                out["busy"] += 1
+                continue
+            began = time.perf_counter()
+            conn.execute(
+                "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("bench_long_writer", "held", "t"))
+            while time.perf_counter() - began < hold_sec:
+                fh.write(chunk)
+                fh.flush()
+                os.fsync(fh.fileno())
+                time.sleep(0.01)
+            conn.commit()
+            out["holds"].append((began, time.perf_counter()))
+            time.sleep(gap_sec)
+    out["done"] = True
+
+
+def _scheduler_txn(conn, label, serial, record):
+    started = time.perf_counter()
+    try:
+        conn.execute(
+            "INSERT INTO account_snapshots (ts,balance,equity,hwm,cashflow,source) "
+            "VALUES (?,?,?,?,?,?)",
+            (f"2026-11-05T00:00:{serial % 60:02d}+00:00", 1e6, 1e6, 1e6, 0.0, "paper"))
+        first = time.perf_counter() - started
+        conn.execute(
+            "INSERT INTO alert_state (key,value,updated_at) VALUES (?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"bench_{label}", str(serial), "t"))
+        conn.commit()
+        record.append({"label": label, "start": started, "first": first,
+                       "busy": False})
+    except sqlite3.OperationalError:
+        if conn.in_transaction:
+            conn.rollback()
+        record.append({"label": label, "start": started,
+                       "first": time.perf_counter() - started, "busy": True})
+
+
+def _signal_txn(conn, serial, record):
+    started = time.perf_counter()
+    try:
+        conn.execute(
+            "INSERT INTO signals (plugin,content_hash,pair,timeframe,bar_ts,kind,"
+            "payload_json,status,created_at) VALUES ('bench',?,'USDJPY','15m',?,"
+            "'strategy','{}','pending','2026-11-05T00:00:00+00:00')",
+            (f"m{serial}", f"2026-11-05T00:00:{serial % 60:02d}+00:00"))
+        first = time.perf_counter() - started
+        conn.execute("UPDATE signals SET requeue_count=requeue_count+1 "
+                     "WHERE plugin='bench' AND content_hash=?", (f"m{serial}",))
+        conn.commit()
+        record.append({"label": "signal", "start": started, "first": first,
+                       "busy": False})
+    except sqlite3.OperationalError:
+        if conn.in_transaction:
+            conn.rollback()
+        record.append({"label": "signal", "start": started,
+                       "first": time.perf_counter() - started, "busy": True})
+
+
+def _run_round(work, label, *, with_worker, long_writer, signal_writes, owners,
+               seed, duration=None):
+    world = _bench_world(work, label, owners)
+    core = world.open()
+    signal = world.open()
+    holder_conn = world.open()
+    admission = WriterAdmission()
+    lock = _TimedLock()
+    rng = random.Random(seed)
+    stop = threading.Event()
+    ticks = []
+    cycles = []
+    holder = {"holds": [], "busy": 0, "done": not long_writer}
+    probe = worker = None
+    if with_worker:
+        read, write = world.pair()
+        probe = _ProbeConn(write)
+        worker = _worker(world, _Clock(BENCH_NOW), rw=(read, probe), lock=lock,
+                         admission=admission, monotonic=time.monotonic,
+                         sleep=time.sleep)
+    worker_done = threading.Event()
+    if not with_worker:
+        worker_done.set()
+    errors = []
+
+    def worker_main():
+        try:
+            finished = 0
+            while not stop.is_set():
+                report = worker.run_cycle(stop)
+                cycles.append(report)
+                finished += len(report.completed)
+                if finished >= owners:
+                    break
+                stop.wait(0.002)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            worker_done.set()
+
+    def tick_once(serial, aim):
+        began = time.perf_counter()
+        record = []
+        with contextlib.ExitStack() as stack:
+            before = time.perf_counter()
+            lock.acquire()
+            lock_wait = time.perf_counter() - before
+            stack.callback(lock.release)
+            before = time.perf_counter()
+            stack.enter_context(admission.scheduler_write())
+            register = time.perf_counter() - before
+            up = time.perf_counter()
+            for k in range(3):
+                _scheduler_txn(core, f"core{k}", serial * 4 + k, record)
+            if signal_writes:
+                time.sleep(0.003)
+                _signal_txn(signal, serial, record)
+            down = time.perf_counter()
+        ticks.append({"start": began, "duration": time.perf_counter() - began,
+                      "lock_wait": lock_wait, "register": register, "up": up,
+                      "down": down, "aimed": aim, "txns": record})
+
+    def scheduler_main():
+        serial = 0
+        try:
+            while not stop.is_set():
+                aim = with_worker and rng.random() < 0.5
+                if aim:
+                    spin = time.perf_counter() + 0.05
+                    while (time.perf_counter() < spin and not stop.is_set()
+                           and admission.stats().beginning == 0):
+                        time.sleep(0.0002)
+                else:
+                    time.sleep(rng.uniform(0.002, 0.03))
+                serial += 1
+                tick_once(serial, aim)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=scheduler_main, name="bench-scheduler")]
+    if with_worker:
+        threads.append(threading.Thread(target=worker_main, name="bench-worker"))
+    if long_writer:
+        threads.append(threading.Thread(
+            target=_long_writer, name="bench-long-writer",
+            kwargs=dict(conn=holder_conn, path=work / f"{label}.hold", holds=3,
+                        hold_sec=2.0, gap_sec=0.3, out=holder, stop=stop)))
+    started = time.perf_counter()
+    for t in threads:
+        t.start()
+    try:
+        deadline = started + 600
+        while time.perf_counter() < deadline:
+            if errors:
+                break
+            if worker_done.is_set() and holder["done"] and (
+                    with_worker or duration is None
+                    or time.perf_counter() - started >= duration):
+                break
+            time.sleep(0.01)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=120)
+    elapsed = time.perf_counter() - started
+    assert not errors, errors
+    assert not any(t.is_alive() for t in threads)
+    result = {"elapsed": elapsed, "ticks": ticks, "cycles": cycles,
+              "holder": holder, "probe": probe, "lock": lock,
+              "admission": admission.stats(),
+              "recorded_commits": worker.commit_seconds if worker else ()}
+    if with_worker:
+        check = connect_readonly(world.path)
+        try:
+            sets = check.execute(
+                "SELECT s.state, (SELECT COUNT(*) FROM ohlcv_slices x "
+                "WHERE x.set_id=s.id) FROM ohlcv_slice_sets s").fetchall()
+        finally:
+            check.close()
+        result["sets"] = [(r[0], r[1]) for r in sets]
+    world.close()
+    for suffix in ("", "-wal", "-shm"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{world.path}{suffix}")
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(work / f"{label}.hold")
+    return result
+
+
+def _round_waits(result):
+    """tick 内の各 write transaction の待ち。長い writer の保持と重なった時間は引く。"""
+    holds = result["holder"]["holds"]
+    waits = []
+    for tick in result["ticks"]:
+        per_tick = []
+        for tx in tick["txns"]:
+            end = tx["start"] + tx["first"]
+            overlap = sum(max(0.0, min(end, h1) - max(tx["start"], h0))
+                          for h0, h1 in holds)
+            per_tick.append({"raw": tx["first"],
+                             "residual": max(0.0, tx["first"] - overlap),
+                             "busy": tx["busy"]})
+        waits.append(per_tick)
+    return waits
+
+
+def _summarize(rounds):
+    waits = [w for r in rounds for tick in _round_waits(r) for w in tick]
+    ticks = [t for r in rounds for t in r["ticks"]]
+    per_tick_waits = [sum(1 for w in tick if w["residual"] > WAIT_EPSILON_SEC)
+                      for r in rounds for tick in _round_waits(r)]
+    out = {
+        "rounds": len(rounds),
+        "ticks": len(ticks),
+        "aimed_ticks": sum(1 for t in ticks if t["aimed"]),
+        "write_transactions": len(waits),
+        "sqlite_busy": sum(1 for w in waits if w["busy"]),
+        "wait_residual_sec": _dist([w["residual"] for w in waits]),
+        "wait_raw_sec": _dist([w["raw"] for w in waits]),
+        "waits_per_tick_max": max(per_tick_waits, default=0),
+        "core_lock_wait_sec": _dist([t["lock_wait"] for t in ticks]),
+        "register_sec": _dist([t["register"] for t in ticks]),
+        "ticks_that_drained_a_lease": sum(1 for t in ticks if t["register"] > 0.001),
+        "tick_duration_sec": _dist([t["duration"] for t in ticks]),
+        "elapsed_sec": [r["elapsed"] for r in rounds],
+    }
+    return out
+
+
+def _worker_summary(rounds, owners):
+    txs = [tx for r in rounds for tx in r["probe"].txs]
+    commits = [tx for tx in txs if tx["outcome"] == "commit"]
+    cycles = [c for r in rounds for c in r["cycles"]]
+    holds = [h for r in rounds for name, h in r["lock"].holds
+             if name == "bench-worker"]
+    flag_violations = 0
+    held_commits = 0
+    busy_during_hold = 0
+    for r in rounds:
+        ups = [(t["up"], t["down"]) for t in r["ticks"]]
+        for issued in r["probe"].begins:
+            if any(a < issued < b for a, b in ups):
+                flag_violations += 1
+        for tx in commits_of(r):
+            if any(h0 < tx["end"] < h1 for h0, h1 in r["holder"]["holds"]):
+                held_commits += 1
+        busy_during_hold += sum(
+            1 for issued in r["probe"].busy
+            if any(h0 < issued < h1 for h0, h1 in r["holder"]["holds"]))
+    stats = [r["admission"] for r in rounds]
+    return {
+        "transactions": len(txs),
+        "committed": len(commits),
+        "rolled_back": len(txs) - len(commits),
+        "rows_per_transaction_max": max((tx["rows"] for tx in commits), default=0),
+        "rows_staged": sum(tx["rows"] for tx in commits),
+        "before_commit_sec": _dist([tx["pre"] for tx in commits]),
+        "rolled_back_before_commit_sec": _dist(
+            [tx["pre"] for tx in txs if tx["outcome"] == "rollback"]),
+        "commit_sec": _dist([tx["commit"] for tx in commits]),
+        "recorded_commit_sec": _dist([x for r in rounds
+                                      for x in r["recorded_commits"]]),
+        "core_lock_hold_sec": _dist(holds),
+        "cycles": len(cycles),
+        "cycle_owners_max": max((c.owners for c in cycles), default=0),
+        "cycle_spent_sec": _dist([c.spent_sec for c in cycles]),
+        "cycle_spent_bound_sec": 0.25 + 0.05 + max(
+            (tx["pre"] + tx["commit"] for tx in txs), default=0.0),
+        "begin_inside_flag_interval": flag_violations,
+        "commits_inside_long_writer_hold": held_commits,
+        "busy_begins": sum(len(r["probe"].busy) for r in rounds),
+        "busy_begins_during_long_writer": busy_during_hold,
+        "yielded": sum(s.yielded for s in stats),
+        "admitted": sum(s.admitted for s in stats),
+        "drain_overruns": sum(s.wait_overruns for s in stats),
+        "drain_wait_max_sec": max((s.max_wait_sec or 0.0 for s in stats),
+                                  default=0.0),
+        "owners_complete": [sum(1 for st, _ in r["sets"] if st == "complete")
+                            for r in rounds],
+        "rows_per_owner": sorted({n for r in rounds for st, n in r["sets"]}),
+    }
+
+
+def commits_of(result):
+    return [tx for tx in result["probe"].txs if tx["outcome"] == "commit"]
+
+
+LATENCY_SCENARIOS = (
+    ("worker_and_scheduler", dict(long_writer=False, signal_writes=False)),
+    ("with_long_writer", dict(long_writer=True, signal_writes=False)),
+    ("signal_connection_tick", dict(long_writer=False, signal_writes=True)),
+)
+
+
+@pytest.mark.bench
+def test_scheduler_writes_stay_prompt_while_the_worker_stages_the_largest_load(disk_job):
+    owners = _env_int("AFX_BENCH_OWNERS", 25)
+    rounds_n = _env_int("AFX_BENCH_ROUNDS", 3)
+    report = {"filesystem_dev": disk_job["data_dev"], "owners": owners,
+              "rounds_per_scenario": rounds_n, "wait_epsilon_sec": WAIT_EPSILON_SEC,
+              "scenarios": {}}
+    problems = []
+    # 待ちを DB の待ちとして数えるため、interpreter の GIL 切替 (既定 5ms) による
+    # 遅延が first-statement の時間に混ざらないよう切替間隔を縮める。
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.0005)
+    report["gil_switch_interval_sec"] = 0.0005
+    try:
+        _latency_scenarios(disk_job, owners, rounds_n, report, problems)
+    finally:
+        sys.setswitchinterval(interval)
+    report["peak_bytes"] = disk_job["peak"].sample()
+    report["problems"] = problems
+    _write_json("latency.json", report)
+    assert not problems, problems
+
+
+def _latency_scenarios(disk_job, owners, rounds_n, report, problems):
+    work, peak = disk_job["work"], disk_job["peak"]
+    for name, opts in LATENCY_SCENARIOS:
+        with_worker, control = [], []
+        for i in range(rounds_n):
+            seed = 1000 * (i + 1) + len(name)
+            got = _run_round(work, f"{name}-w{i}", with_worker=True, owners=owners,
+                             seed=seed, **opts)
+            peak.sample()
+            with_worker.append(got)
+            control.append(_run_round(work, f"{name}-c{i}", with_worker=False,
+                                      owners=owners, seed=seed,
+                                      duration=got["elapsed"], **opts))
+        sched, base = _summarize(with_worker), _summarize(control)
+        worker = _worker_summary(with_worker, owners)
+        verdict = {
+            "wait_p99_le_50ms": (sched["wait_residual_sec"]["p99"] or 0) <= 0.050,
+            "wait_max_le_100ms": (sched["wait_residual_sec"]["max"] or 0) <= 0.100,
+            "waits_per_tick_le_1": sched["waits_per_tick_max"] <= 1,
+            "sqlite_busy_zero": sched["sqlite_busy"] == 0 and base["sqlite_busy"] == 0,
+            "core_lock_wait_p99_le_10ms":
+                (sched["core_lock_wait_sec"]["p99"] or 0) <= 0.010,
+            "tick_max_le_control_plus_100ms":
+                (sched["tick_duration_sec"]["max"] or 0)
+                <= (base["tick_duration_sec"]["max"] or 0) + 0.100,
+            "rows_per_transaction_le_240": worker["rows_per_transaction_max"] <= 240,
+            "before_commit_le_50ms": (worker["before_commit_sec"]["max"] or 0) <= 0.050,
+            "worker_core_lock_hold_le_50ms":
+                (worker["core_lock_hold_sec"]["max"] or 0) <= 0.050,
+            "cycle_owners_le_25": worker["cycle_owners_max"] <= 25,
+            "cycle_work_within_budget_and_last_transaction":
+                (worker["cycle_spent_sec"]["max"] or 0)
+                <= worker["cycle_spent_bound_sec"],
+            "commit_seconds_recorded": worker["recorded_commit_sec"]["count"] > 0,
+            "no_begin_while_flag_up": worker["begin_inside_flag_interval"] == 0,
+            "no_commit_during_long_writer": worker["commits_inside_long_writer_hold"] == 0,
+            "all_owners_complete": all(n == owners for n in worker["owners_complete"]),
+        }
+        report["scenarios"][name] = {"scheduler": sched, "control": base,
+                                     "worker": worker, "verdict": verdict}
+        problems += [f"{name}: {k}" for k, ok in verdict.items() if not ok]
+
+
+# --- 容量 (byte 容量 B = B0 + C × β の実測) -------------------------------------------
+
+SLICE_RELATED_TABLES = (
+    "signal_decisions", "signal_shadow", "ohlcv_slice_sets", "ohlcv_slices",
+    "ohlcv_slice_generations", "econ_reaction_keys", "econ_reaction_values")
+SHADOW_ROWS_FIXED = 400 * 96 * 1680
+SHADOW_RANGE_START = datetime(2026, 11, 2, 0, 0, tzinfo=UTC)
+EVENT_FIRST_TS = datetime(2026, 11, 3, 12, 30, tzinfo=UTC)
+
+
+def _bar_template(start, count, seed):
+    rng = random.Random(seed)
+    rows, price = [], 150.0
+    for i in range(count):
+        o = round(price, 3)
+        c = round(o + rng.uniform(-0.03, 0.03), 3)
+        h = round(max(o, c) + rng.uniform(0, 0.02), 3)
+        low = round(min(o, c) - rng.uniform(0, 0.02), 3)
+        rows.append(SliceRow(start + timedelta(minutes=i), o, h, low, c,
+                             float(rng.randint(5, 400)), "mt5-live", "observed"))
+        price = c
+    return rows
+
+
+def _file_sizes(path):
+    sizes = {}
+    for key, suffix in (("db", ""), ("wal", "-wal")):
+        try:
+            sizes[key] = os.stat(f"{path}{suffix}").st_size
+        except FileNotFoundError:
+            sizes[key] = 0
+    sizes["total"] = sizes["db"] + sizes["wal"]
+    return sizes
+
+
+def _slice_related_bytes(conn):
+    """slice 関連 7 表とその index の bytes (dbstat)。"""
+    owner = {r[0]: r[1] for r in conn.execute(
+        "SELECT name, tbl_name FROM sqlite_master WHERE type IN ('table','index')")}
+    total = 0
+    for name, size in conn.execute("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name"):
+        if owner.get(name) in SLICE_RELATED_TABLES:
+            total += size
+    return total
+
+
+def _fresh_empty_db(work, label):
+    path = work / f"{label}.db"
+    conn = connect(path)
+    init_db(conn)
+    conn.commit()
+    return path, conn
+
+
+def _remove_db(path):
+    for suffix in ("", "-wal", "-shm"):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{path}{suffix}")
+
+
+def _measure_empty(work, index):
+    path, conn = _fresh_empty_db(work, f"base{index}")
+    try:
+        truncate = tuple(conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())
+        out = _file_sizes(path)
+        out["wal_checkpoint_truncate"] = list(truncate)
+        out["slice_related_bytes"] = _slice_related_bytes(conn)
+        out["journal_mode"] = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        out["synchronous"] = conn.execute("PRAGMA synchronous").fetchone()[0]
+        out["wal_autocheckpoint"] = conn.execute(
+            "PRAGMA wal_autocheckpoint").fetchone()[0]
+    finally:
+        conn.close()
+        _remove_db(path)
+    return out
+
+
+def _fill_run(work, label, rows_target, shadow_fraction, peak):
+    """fresh DB に signal / event 比で `rows_target` 行を、240 行以下の transaction に
+    分けて投入し、最後の COMMIT 直後・明示 checkpoint 前の大きさを測る。"""
+    path, conn = _fresh_empty_db(work, label)
+    counts = {"commits": 0}
+
+    def trace(statement):
+        if statement == "COMMIT":
+            counts["commits"] += 1
+            if counts["commits"] % 200 == 0:
+                peak.sample()
+
+    started = time.monotonic()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        conn.set_trace_callback(trace)
+        generation = os_.new_generation(conn, now=BENCH_NOW)
+        shadow_rows = round(rows_target * shadow_fraction)
+        event_rows = rows_target - shadow_rows
+        shadow_template = _bar_template(SHADOW_RANGE_START, 1680, 11)
+        event_template = _bar_template(EVENT_FIRST_TS - timedelta(minutes=15), 255, 12)
+        inserted = shadow_sets = event_sets = 0
+        remaining, n = shadow_rows, 0
+        while remaining > 0:
+            take = min(1680, remaining)
+            remaining -= take
+            shadow_id = _shadow(conn, n, decided=BENCH_DECIDED,
+                                entry_type="limit", limit_price=149.9)
+            n += 1
+            end = SHADOW_RANGE_START + timedelta(minutes=take)
+            set_id = None
+            for i in range(0, take, MAX_BATCH):
+                out = os_.stage_shadow_rows(
+                    conn, shadow_id=shadow_id, pair="USDJPY",
+                    range_start=SHADOW_RANGE_START, range_end=end,
+                    generation=generation, rows=shadow_template[i:min(i + MAX_BATCH, take)],
+                    now=BENCH_NOW)
+                assert out.committed
+                set_id = out.set_id
+            stamp = ss.get(conn, shadow_id)["updated_at"]
+            assert os_.complete_set(
+                conn, set_id=set_id, generation=generation, now=BENCH_NOW,
+                shadow=os_.ShadowCas(shadow_id, "pending_entry", stamp,
+                                     ss.ShadowOutcome.no_fill())).committed
+            inserted += take
+            shadow_sets += 1
+        remaining, k = event_rows, 0
+        while remaining > 0:
+            take = min(255, remaining)
+            remaining -= take
+            ts = EVENT_FIRST_TS + timedelta(days=7 * k)
+            k += 1
+            event_id = conn.execute(
+                "INSERT INTO econ_events (ts,country,name,importance) "
+                "VALUES (?,?,?,3)", (ts.isoformat(), "USD", f"bench{k}")).lastrowid
+            set_id = os_.create_event_set_in_tx(conn, event_id=event_id,
+                                                pair="USDJPY", now=BENCH_NOW)
+            conn.commit()
+            start = ts - timedelta(minutes=15)
+            rows = [dataclasses.replace(r, bar_time=start + timedelta(minutes=j))
+                    for j, r in enumerate(event_template[:take])]
+            for i in range(0, take, MAX_BATCH):
+                assert os_.stage_event_rows(
+                    conn, set_id=set_id, generation=generation,
+                    rows=rows[i:i + MAX_BATCH], assumed_spread_pips=1.0).committed
+            if take == 255:
+                assert os_.complete_set(conn, set_id=set_id, generation=generation,
+                                        now=BENCH_NOW).committed
+                for window in (15, 60, 240):
+                    conn.execute(
+                        "INSERT INTO econ_reaction_values (set_id,window_min,status,"
+                        "range_pips,close_change_pips,abs_close_change_pips,"
+                        "net_abs_close_change_pips,rule_version,computed_at) "
+                        "VALUES (?,?,'resolved',12.5,-3.25,3.25,1.75,1,?)",
+                        (set_id, window, BENCH_NOW.isoformat()))
+                for currency in ("USD", "JPY"):
+                    conn.execute(
+                        "INSERT INTO econ_reaction_keys (event_id,currency,set_id,"
+                        "decided_at) VALUES (?,?,?,?)",
+                        (event_id, currency, set_id, BENCH_NOW.isoformat()))
+                conn.commit()
+                event_sets += 1
+            inserted += take
+        stored = conn.execute("SELECT COUNT(*) FROM ohlcv_slices").fetchone()[0]
+        assert stored == inserted == rows_target
+        sizes = _file_sizes(path)
+        sizes["slice_related_bytes"] = _slice_related_bytes(conn)
+        sizes["rows"] = stored
+        sizes["commits"] = counts["commits"]
+        sizes["shadow_sets"] = shadow_sets
+        sizes["complete_event_sets"] = event_sets
+        sizes["elapsed_sec"] = time.monotonic() - started
+        peak.sample()
+    finally:
+        conn.set_trace_callback(None)
+        conn.close()
+        _remove_db(path)
+    return sizes
+
+
+MAX_BATCH = os_.MAX_BATCH_ROWS
+
+
+@pytest.mark.bench
+def test_byte_capacity_constants_cover_the_measured_sizes_on_the_real_disk(disk_job):
+    work, peak = disk_job["work"], disk_job["peak"]
+    os.sync()
+    fixed_rows = os_.row_capacity(daily_signals=96, importance_min=3, pair_count=1)
+    assert fixed_rows == FIXED_CAPACITY_ROWS
+    capacity_rows = _env_int("AFX_BENCH_CAPACITY_C", FIXED_CAPACITY_ROWS)
+    runs_each = _env_int("AFX_BENCH_CAPACITY_RUNS", 3)
+    points = sorted({math.ceil(capacity_rows / 1000), math.ceil(capacity_rows / 100),
+                     math.ceil(capacity_rows / 10)})
+    fraction = SHADOW_ROWS_FIXED / FIXED_CAPACITY_ROWS
+    started = time.monotonic()
+
+    bases = [_measure_empty(work, i) for i in range(runs_each)]
+    base_bytes = max(b["total"] for b in bases)
+    measured = {}
+    for rows in points:
+        measured[rows] = [_fill_run(work, f"fill{rows}-{i}", rows, fraction, peak)
+                          for i in range(runs_each)]
+    beta = max(math.ceil((m["total"] - base_bytes) / m["rows"])
+               for runs in measured.values() for m in runs)
+    envelope = all(base_bytes + m["rows"] * beta >= m["total"]
+                   for runs in measured.values() for m in runs)
+    top = max(points)
+    low = max(p for p in points if p < top) if len(points) > 1 else None
+    size_of = {p: max(m["total"] for m in measured[p]) for p in points}
+    if low is not None:
+        slope = (size_of[top] - size_of[low]) / (top - low)
+        trend = size_of[top] + slope * (capacity_rows - top)
+    else:
+        slope, trend = None, None
+    extrapolated = base_bytes + capacity_rows * beta
+    elapsed = time.monotonic() - disk_job["started"]
+    code = {"SLICE_BASE_BYTES": os_.SLICE_BASE_BYTES,
+            "SLICE_BYTES_PER_ROW": os_.SLICE_BYTES_PER_ROW}
+    code_covers = (
+        os_.SLICE_BASE_BYTES >= base_bytes
+        and all(os_.byte_capacity(m["rows"]) >= m["total"]
+                for runs in measured.values() for m in runs)
+        and (trend is None or os_.byte_capacity(capacity_rows) >= trend))
+    full_scale = capacity_rows == FIXED_CAPACITY_ROWS and runs_each >= 3
+    peak_bytes = peak.sample()
+    report = {
+        "full_scale": full_scale,
+        "capacity_rows": capacity_rows,
+        "checkpoint": {"before_empty_measure": "wal_checkpoint(TRUNCATE) after the DDL commit",
+                       "before_fill_measure": "none (production auto-checkpoint only)",
+                       "journal_mode": bases[0]["journal_mode"],
+                       "synchronous": bases[0]["synchronous"],
+                       "wal_autocheckpoint": bases[0]["wal_autocheckpoint"]},
+        "shadow_row_fraction": fraction,
+        "empty_measurements": bases,
+        "B0": base_bytes,
+        "points": {str(p): measured[p] for p in points},
+        "beta": beta,
+        "upper_envelope_holds": envelope,
+        "trend_slope_bytes_per_row": slope,
+        "trend_prediction_at_C": trend,
+        "extrapolated_at_C": extrapolated,
+        "extrapolation_covers_trend": trend is None or extrapolated >= trend,
+        "code_constants": code,
+        "code_constants_cover": code_covers,
+        "job_elapsed_sec": elapsed,
+        "capacity_elapsed_sec": time.monotonic() - started,
+        "peak_bytes": peak_bytes,
+        "limits": {"seconds": JOB_LIMIT_SEC, "bytes": JOB_LIMIT_BYTES},
+    }
+    _write_json("capacity.json", report)
+    assert envelope
+    assert report["extrapolation_covers_trend"]
+    assert elapsed <= JOB_LIMIT_SEC
+    assert peak_bytes <= JOB_LIMIT_BYTES
+    if full_scale:
+        assert code_covers, (code, base_bytes, beta)
