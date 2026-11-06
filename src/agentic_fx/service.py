@@ -36,7 +36,7 @@ from agentic_fx.core import mission_ceiling
 from agentic_fx.core import time_cutover
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
-from agentic_fx.core.econ_slice_worker import EconSliceWorker
+from agentic_fx.core.econ_slice_worker import CapacityMeasurer, EconSliceWorker
 from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
@@ -779,6 +779,8 @@ class App:
     trade_event_token: object | None = None
     # slice worker と、その専用の読取接続・書込み接続 (書込みは busy_timeout 0)。
     econ_worker: object | None = None
+    # 容量測定の thread (専用の読取接続はその thread が開いて閉じる)。
+    econ_measurer: object | None = None
     conn_econ_read: object | None = None
     conn_econ_write: object | None = None
     econ_health: object | None = None
@@ -1912,7 +1914,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         conn_ops = connect(root / "data" / "agentic.db")
         econ_health = econ_signal_report.WorkerHealth()
         capacity_reader = econ_signal_report.CapacityReader(
-            capacity_monitor.plan, root / "data" / "agentic.db")
+            capacity_monitor.plan, root / "data" / "agentic.db", clock=clock.now)
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
@@ -1937,9 +1939,11 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             quote_fn=lambda pair: executor.quote_fn(pair),
             pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
             assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
-            now_fn=clock.now,
-            measure_fn=econ_signal_report.slice_related_bytes)
-        capacity_reader.attach_bytes_source(lambda: econ_worker.measurement)
+            now_fn=clock.now)
+        econ_measurer = CapacityMeasurer(
+            open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
+            measure_fn=econ_signal_report.slice_related_bytes, now_fn=clock.now)
+        capacity_reader.attach_bytes_source(lambda: econ_measurer.measurement)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1960,7 +1964,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    conn_admission=conn_admission, admission=admission,
                    writer_admission=writer_admission,
                    trade_event_sink=trade_sink, trade_event_token=trade_token,
-                   econ_worker=econ_worker, conn_econ_read=conn_econ_read,
+                   econ_worker=econ_worker, econ_measurer=econ_measurer,
+                   conn_econ_read=conn_econ_read,
                    conn_econ_write=conn_econ_write, econ_health=econ_health)
         wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
@@ -2775,6 +2780,14 @@ def _run_econ_slice_worker(app: App, stop_event: threading.Event) -> None:
         _log.exception("econ slice worker stopped")
 
 
+def _run_econ_capacity_measurer(app: App, stop_event: threading.Event) -> None:
+    """停止まで容量を定期に測る。例外で抜けても daemon は止めない。"""
+    try:
+        app.econ_measurer.run(stop_event)
+    except Exception:  # noqa: BLE001
+        _log.exception("econ capacity measurer stopped")
+
+
 def run_service(root: Path, *, daemon: bool = False,
                _stop_event: threading.Event | None = None) -> int:
     """`_stop_event` はテスト用のシーム (fix round 1 F4)。省略時は内部で
@@ -2917,8 +2930,19 @@ def run_service(root: Path, *, daemon: bool = False,
     # 待たせない)。起動時回復と schema の初期化は build_app で済んでいる。
     econ_thread: threading.Thread | None = None
     econ_still_busy = False
+    measure_thread: threading.Thread | None = None
 
     try:
+        if app.econ_measurer is not None:
+            try:
+                measure_thread = threading.Thread(
+                    target=_run_econ_capacity_measurer, args=(app, stop_event),
+                    daemon=True, name="afx-econ-capacity")
+                measure_thread.start()
+            except Exception:  # noqa: BLE001 — 測れなくてもサービスは続ける
+                if measure_thread is not None and measure_thread.ident is None:
+                    measure_thread = None
+                _log.exception("econ capacity measurer could not start")
         try:
             econ_thread = threading.Thread(
                 target=_run_econ_slice_worker, args=(app, stop_event),
@@ -3035,6 +3059,9 @@ def run_service(root: Path, *, daemon: bool = False,
         if econ_thread is not None:
             econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
             econ_still_busy = econ_thread.is_alive()
+        if measure_thread is not None:
+            measure_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+            econ_still_busy = econ_still_busy or measure_thread.is_alive()
         # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
         # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、

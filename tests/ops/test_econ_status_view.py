@@ -71,6 +71,66 @@ def test_status_drops_fields_and_values_outside_the_allowlist(ops_env):
     assert out["shadow"][0]["actor"] is None and "extra" not in out["shadow"][0]
 
 
+@pytest.mark.parametrize("bad", [[], {"a": 1}, 7, None])
+def test_unhashable_or_wrongly_typed_values_never_break_status(ops_env, bad):
+    hostile = _econ()
+    hostile["slice_worker"] = bad
+    hostile["slice_capacity"]["level"] = bad
+    hostile["slice_capacity"]["row_level"] = bad
+    hostile["shadow"][0]["actor"] = bad
+    out = _status(ops_env, {"econ_signal": hostile})["econ_signal"]
+    assert out["slice_worker"] == "unknown"
+    assert out["slice_capacity"]["level"] is None
+    assert out["shadow"][0]["actor"] is None
+    assert out["decisions"]["total"] == 5
+
+
+def test_status_survives_a_list_where_a_section_is_expected(ops_env):
+    out = _status(ops_env, {"econ_signal": {"slice_worker": []}})["econ_signal"]
+    assert out["slice_worker"] == "unknown"
+    assert out["decisions"] is None and out["slice_capacity"] is None
+
+
+def test_one_broken_section_does_not_drop_the_others(ops_env, monkeypatch):
+    from agentic_fx.ops import service as svc
+
+    def boom(raw):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(svc, "_econ_abandoned", boom)
+    out = _status(ops_env, {"econ_signal": _econ()})["econ_signal"]
+    assert out["abandoned"] is None
+    assert out["decisions"]["total"] == 5
+
+
+def test_values_outside_the_known_sets_or_ranges_are_dropped(ops_env):
+    hostile = _econ()
+    hostile["shadow"][0].update(actor="banana", decision="unknown", state="weird",
+                                result_code="zzz", reject_code="nope", n=-1)
+    hostile["decisions"]["by_kind"]["reject:banana:econ_window"] = 1
+    hostile["decisions"]["by_kind"]["accept"] = -3
+    hostile["slice_capacity"]["rows"] = -1
+    hostile["slice_capacity"]["slice_bytes_measured_at"] = "not-a-time"
+    hostile["abandoned"]["latest_day_start"] = "xxxxxxxxxxxx"
+    out = _status(ops_env, {"econ_signal": hostile})["econ_signal"]
+    row = out["shadow"][0]
+    assert (row["actor"], row["decision"], row["state"], row["result_code"],
+            row["reject_code"], row["n"]) == (None,) * 6
+    assert out["decisions"]["by_kind"] == {"reject:system:econ_window": 2}
+    assert out["slice_capacity"]["rows"] is None
+    assert out["slice_capacity"]["slice_bytes_measured_at"] is None
+    assert out["abandoned"]["latest_day_start"] is None
+
+
+def test_known_shadow_words_match_the_stored_vocabulary(ops_env):
+    row = {"decision": "reject", "actor": "llm", "reject_code": "news_shock",
+           "state": "resolved", "result_code": "data_insufficient", "n": 1,
+           "avg_pnl_pips": None}
+    out = _status(ops_env, {"econ_signal": _econ(shadow=[row])})["econ_signal"]
+    assert {k: out["shadow"][0][k] for k in row if k not in ("n", "avg_pnl_pips")} == {
+        k: row[k] for k in row if k not in ("n", "avg_pnl_pips")}
+
+
 def test_a_malformed_econ_section_is_left_out(ops_env):
     assert "econ_signal" not in _status(ops_env, {"econ_signal": "junk"})
 

@@ -726,75 +726,100 @@ def test_recorded_commit_times_are_kept(world):
     assert all(seconds >= 0 for seconds in w.commit_seconds)
 
 
-def test_worker_measures_on_its_own_read_connection_every_ten_minutes(world):
-    clock = _Clock(LATE)
-    rw = world.pair()
-    calls = []
+_BIG_QUERY = ("WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c "
+              "WHERE x < 2000000000) SELECT COUNT(*) FROM c")
+
+
+def _measurer(**kw):
+    kw.setdefault("open_conn", lambda: sqlite3.connect(":memory:", check_same_thread=False))
+    kw.setdefault("measure_fn", lambda conn: 1)
+    kw.setdefault("now_fn", lambda: LATE)
+    return worker_mod.CapacityMeasurer(**kw)
+
+
+def test_measurer_runs_on_its_own_thread_and_connection_every_interval():
+    opened, seen = [], []
+    stop = threading.Event()
+    done = threading.Event()
+
+    def open_conn():
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        opened.append(conn)
+        return conn
 
     def measure(conn):
-        calls.append(conn)
-        return len(calls) * 100
+        seen.append((conn, threading.current_thread().name))
+        if len(seen) == 2:
+            done.set()
+        return len(seen) * 100
 
-    w = _worker(world, clock, rw=rw, monotonic=clock.monotonic, measure_fn=measure)
-    assert w.measurement is None
-    w.run_cycle()
-    assert calls == [rw[0]] and w.measurement == (100, LATE)
-    clock.t = 599.0
-    w.run_cycle()
-    assert len(calls) == 1
-    clock.t = 600.0
-    clock.now = LATE + timedelta(seconds=600)
-    w.run_cycle()
-    assert len(calls) == 2 and w.measurement == (200, clock.now)
+    m = _measurer(open_conn=open_conn, measure_fn=measure, interval_sec=0.01)
+    assert m.measurement is None
+    thread = threading.Thread(target=m.run, args=(stop,), name="measurer-under-test")
+    thread.start()
+    try:
+        assert done.wait(5)
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(opened) == 1 and all(c is opened[0] for c, _ in seen)
+    assert seen[0][1] == "measurer-under-test"
+    assert m.measurement[0] >= 200 and m.last_outcome in ("ok", "aborted")
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
 
 
-def test_a_failing_measurement_keeps_the_last_value_and_waits_for_the_next_interval(world):
-    clock = _Clock(LATE)
-    outcomes = [5, RuntimeError("busy"), 7]
-    calls = []
+def test_stop_during_a_measurement_ends_it_within_a_short_time():
+    started = threading.Event()
+    stop = threading.Event()
+    m = _measurer(measure_fn=lambda conn: (started.set(),
+                                           conn.execute(_BIG_QUERY).fetchone())[1][0])
+    thread = threading.Thread(target=m.run, args=(stop,))
+    thread.start()
+    assert started.wait(5)
+    stop.set()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert m.last_outcome == "aborted" and m.measurement is None
+
+
+def test_time_limit_aborts_a_measurement_and_keeps_the_previous_value():
+    ticks = iter(range(0, 10**9, 7))
+    conn = sqlite3.connect(":memory:")
+    outcomes = iter([lambda c: 5, lambda c: c.execute(_BIG_QUERY).fetchone()[0]])
+    m = _measurer(measure_fn=lambda c: next(outcomes)(c), time_limit_sec=100,
+                  monotonic=lambda: next(ticks) / 1.0)
+    stop = threading.Event()
+    assert m.measure_once(conn, stop) == "ok"
+    assert m.measurement == (5, LATE)
+    assert m.measure_once(conn, stop) == "aborted"
+    assert m.measurement == (5, LATE) and m.last_outcome == "aborted"
+    assert conn.in_transaction is False
+    conn.close()
+
+
+def test_a_failing_measurement_keeps_the_last_value():
+    results = iter([5, RuntimeError("busy"), 7])
 
     def measure(conn):
-        calls.append(1)
-        value = outcomes[len(calls) - 1]
+        value = next(results)
         if isinstance(value, Exception):
             raise value
         return value
 
-    w = _worker(world, clock, monotonic=clock.monotonic, measure_fn=measure)
-    w.run_cycle()
-    clock.t = 600.0
-    w.run_cycle()
-    assert w.measurement == (5, LATE)
-    clock.t = 601.0
-    w.run_cycle()
-    assert len(calls) == 2
-    clock.t = 1200.0
-    w.run_cycle()
-    assert w.measurement[0] == 7
-
-
-def test_measurement_is_outside_the_cycle_budget_and_skipped_when_stopping(world):
-    clock = _Clock(LATE)
-    calls = []
-
-    def slow(conn):
-        clock.t += 100.0
-        calls.append(1)
-        return 1
-
-    w = _worker(world, clock, monotonic=clock.monotonic, measure_fn=slow)
+    m = _measurer(measure_fn=measure)
+    conn = sqlite3.connect(":memory:")
     stop = threading.Event()
-    stop.set()
-    w.run_cycle(stop)
-    assert calls == []
-    report = w.run_cycle()
-    assert calls == [1] and report.budget_exhausted is False
+    assert m.measure_once(conn, stop) == "ok"
+    assert m.measure_once(conn, stop) == "failed"
+    assert m.measurement == (5, LATE)
+    assert m.measure_once(conn, stop) == "ok" and m.measurement[0] == 7
+    conn.close()
 
 
-def test_without_a_measure_hook_there_is_no_measurement(world):
-    w = _worker(world, _Clock(LATE))
-    w.run_cycle()
-    assert w.measurement is None
+def test_the_worker_itself_no_longer_measures():
+    assert not hasattr(EconSliceWorker, "measurement")
 
 
 # --- 発表前 spread と event の退避 --------------------------------------------------

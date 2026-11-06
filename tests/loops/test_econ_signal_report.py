@@ -225,6 +225,56 @@ def test_complete_set_row_count_equals_its_expected_rows(tmp_path):
     assert staged == esr.stored_slice_rows(conn) == 4
 
 
+def _fill(conn, set_id, count, *, start=0):
+    conn.executemany(
+        "INSERT INTO ohlcv_slices (set_id,bar_time,open,high,low,close,volume,"
+        "source,quality) VALUES (?,?,1,1,1,1,0,'s','observed')",
+        [(set_id, f"2026-10-30T00:00:00+00:00#{i}") for i in range(start, start + count)])
+
+
+def test_a_complete_set_in_the_middle_of_purge_counts_its_remaining_rows(tmp_path):
+    conn = _conn(tmp_path)
+    old = _event_set(conn, "complete", expected=1680)
+    _fill(conn, old, 1440)
+    young = _event_set(conn, "complete", expected=10)
+    conn.commit()
+    later = NOW + timedelta(days=ohlcv_slices.RETENTION_DAYS + 1)
+    conn.execute("UPDATE ohlcv_slice_sets SET created_at=? WHERE id=?",
+                 ((later - timedelta(days=1)).isoformat(), young))
+    conn.commit()
+    assert esr.stored_slice_rows(conn, now=later) == 1440 + 10
+    assert esr.stored_slice_rows(conn, now=NOW) == 1680 + 10
+
+
+def test_purge_progress_lowers_the_level_below_the_threshold(tmp_path):
+    conn = _conn(tmp_path)
+    old = _event_set(conn, "complete", expected=1680)
+    _fill(conn, old, 1680)
+    conn.commit()
+    later = NOW + timedelta(days=ohlcv_slices.RETENTION_DAYS + 1)
+    reader = esr.CapacityReader(lambda: _Plan(2000, 10**9), tmp_path / "d.db",
+                                clock=lambda: later)
+    assert reader.status(conn)["row_level"] == "warn"
+    conn.execute("DELETE FROM ohlcv_slices WHERE bar_time >= ?",
+                 ("2026-10-30T00:00:00+00:00#800",))
+    conn.commit()
+    status = reader.status(conn)
+    assert status["rows"] == sum(1 for _ in conn.execute(
+        "SELECT 1 FROM ohlcv_slices WHERE set_id=?", (old,)))
+    assert status["row_level"] == "ok" and status["level"] == "ok"
+
+
+def test_row_count_reads_both_sums_in_one_statement(tmp_path):
+    conn = _conn(tmp_path)
+    _event_set(conn, "complete", expected=3)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    esr.stored_slice_rows(conn, now=NOW)
+    conn.set_trace_callback(None)
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 1
+
+
 def test_capacity_reader_does_not_scan_slice_rows_or_dbstat(tmp_path, monkeypatch):
     conn = _conn(tmp_path)
     _event_set(conn, "complete", expected=3)
@@ -319,6 +369,72 @@ def test_report_file_is_owner_only_unique_per_trading_day_and_atomic(tmp_path):
     assert sorted(p.name for p in reports.iterdir()) == ["econ-signal-2026-10-30.md"]
 
 
+def test_report_directory_that_is_a_symlink_is_refused(tmp_path):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    reports = tmp_path / "econ_signal"
+    reports.symlink_to(target)
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n")
+    assert list(target.iterdir()) == []
+    with pytest.raises(esr.ReportStoreError):
+        esr.report_exists(reports, label=date(2026, 10, 30))
+
+
+def _prepared_dir(tmp_path):
+    reports = tmp_path / "econ_signal"
+    reports.mkdir(mode=0o700)
+    return reports, reports / "econ-signal-2026-10-30.md"
+
+
+def test_final_name_that_is_a_symlink_is_a_failure_not_a_generated_report(tmp_path):
+    reports, final = _prepared_dir(tmp_path)
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    final.symlink_to(victim)
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n")
+    with pytest.raises(esr.ReportStoreError):
+        esr.report_exists(reports, label=date(2026, 10, 30))
+    assert victim.read_text() == "keep"
+
+
+def test_final_name_that_is_a_directory_is_a_failure(tmp_path):
+    reports, final = _prepared_dir(tmp_path)
+    final.mkdir()
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n")
+
+
+def test_final_name_with_a_loose_mode_is_a_failure(tmp_path):
+    reports, final = _prepared_dir(tmp_path)
+    final.write_text("old")
+    os.chmod(final, 0o644)
+    with pytest.raises(esr.ReportStoreError):
+        esr.write_report_once(reports, label=date(2026, 10, 30), body="a\n")
+    assert final.read_text() == "old"
+
+
+def test_final_name_owned_by_someone_else_is_a_failure(tmp_path, monkeypatch):
+    reports, final = _prepared_dir(tmp_path)
+    final.write_text("old")
+    os.chmod(final, 0o600)
+    other = os.getuid() + 1
+    monkeypatch.setattr(esr.os, "getuid", lambda: other)
+    with pytest.raises(esr.ReportStoreError):
+        esr.report_exists(reports, label=date(2026, 10, 30))
+
+
+def test_daily_callback_does_not_advance_on_a_bad_final_name(tmp_path):
+    conn = _conn(tmp_path)
+    reports, final = _prepared_dir(tmp_path)
+    final.mkdir()
+    callback = esr.make_daily_report_callback(
+        reports_dir=reports, open_conn=lambda: conn, capacity=None, worker=None)
+    with pytest.raises(esr.ReportStoreError):
+        callback(datetime(2026, 10, 30, 21, 0, tzinfo=timezone.utc))
+
+
 def test_old_and_new_close_boundaries_share_one_label():
     summer_close = datetime(2026, 10, 30, 21, 0, tzinfo=timezone.utc)
     winter_close = datetime(2026, 11, 2, 22, 0, tzinfo=timezone.utc)
@@ -362,3 +478,29 @@ def test_daily_callback_failure_leaves_no_final_file(tmp_path):
         cb(datetime(2026, 10, 30, 21, 0, tzinfo=timezone.utc))
     assert not list((tmp_path / "econ_signal").glob("econ-signal-*")) if (
         tmp_path / "econ_signal").exists() else True
+
+
+def test_slice_bytes_are_read_per_target_name_and_match_a_full_scan(tmp_path):
+    conn = _conn(tmp_path)
+    _event_set(conn, "complete", expected=3)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    measured = esr.slice_related_bytes(conn)
+    conn.set_trace_callback(None)
+    dbstat = [s for s in statements if "dbstat" in s.lower()]
+    assert dbstat and all("name" in s.lower() and "where" in s.lower() for s in dbstat)
+    assert not any("group by" in s.lower() for s in dbstat)
+    owner = dict(conn.execute("SELECT name, tbl_name FROM sqlite_master "
+                              "WHERE type IN ('table','index')"))
+    expected = sum(size for name, size in conn.execute(
+        "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name")
+        if owner.get(name) in esr.SLICE_RELATED_TABLES)
+    assert measured == expected > 0
+
+
+def test_slice_bytes_stop_midway_when_a_progress_handler_asks(tmp_path):
+    conn = _conn(tmp_path)
+    conn.set_progress_handler(lambda: 1, 1)
+    with pytest.raises(Exception, match="interrupted"):
+        esr.slice_related_bytes(conn)
+    conn.set_progress_handler(None, 0)

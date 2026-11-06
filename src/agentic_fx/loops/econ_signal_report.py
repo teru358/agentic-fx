@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import stat
 import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -71,15 +72,21 @@ class WorkerHealth:
 # --- 容量 --------------------------------------------------------------------
 
 def slice_related_bytes(conn: sqlite3.Connection) -> int:
-    """slice 関連 7 表とその index の bytes (`dbstat` の集計)。"""
-    owner = {name: table for name, table in conn.execute(
-        "SELECT name, tbl_name FROM sqlite_master WHERE type IN ('table','index')")}
+    """slice 関連 7 表とその index の bytes (`dbstat` を対象の名前で絞って合計)。
+
+    全 DB を走査せず、対象の表と index の名前ごとに読む。`dbstat` は page 単位の行を
+    返すので、呼び出し側の progress handler で途中から打ち切れる (集計 mode では
+    1 つの b-tree を 1 回の呼出しで走査し切るため、打ち切れない)。"""
+    marks = ",".join("?" * len(SLICE_RELATED_TABLES))
+    names = [name for (name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','index') "
+        f"AND tbl_name IN ({marks})", tuple(sorted(SLICE_RELATED_TABLES)))]
     total = 0
-    for name, size in conn.execute(
-            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name"):
-        if owner.get(name) in SLICE_RELATED_TABLES:
-            total += size or 0
-    return total
+    for name in names:
+        total += conn.execute(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?",
+            (name,)).fetchone()[0]
+    return int(total)
 
 
 _EMPTY_BASELINE: list[int] = []
@@ -153,19 +160,23 @@ def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path |
     }
 
 
-def stored_slice_rows(conn: sqlite3.Connection) -> int:
+def stored_slice_rows(conn: sqlite3.Connection, *, now: datetime | None = None) -> int:
     """purge していない set が持つ slice 行数。
 
-    complete の set は `expected_rows` の合計 (set の表は小さく、slice 行の全走査を
-    しない)、それ以外 (staging など) は今ある行数。"""
-    complete = conn.execute(
-        "SELECT COALESCE(SUM(expected_rows), 0) FROM ohlcv_slice_sets "
-        "WHERE purged_at IS NULL AND state = 'complete'").fetchone()[0]
-    partial = conn.execute(
-        "SELECT COUNT(*) FROM ohlcv_slices WHERE set_id IN "
-        "(SELECT id FROM ohlcv_slice_sets WHERE purged_at IS NULL "
-        "AND state != 'complete')").fetchone()[0]
-    return int(complete) + int(partial)
+    保持期限内の complete は `expected_rows` (set の表は小さく、slice 行の全走査を
+    しない)。保持期限を過ぎて purge 中の complete / unrecoverable と、complete でない
+    set (staging など) は今ある行数。1 つの SELECT で読むので同じ snapshot になる。"""
+    cutoff = signals.utc_iso((now or datetime.now(timezone.utc))
+                             - timedelta(days=ohlcv_slices.RETENTION_DAYS))
+    row = conn.execute(
+        "SELECT "
+        "(SELECT COALESCE(SUM(expected_rows), 0) FROM ohlcv_slice_sets "
+        " WHERE purged_at IS NULL AND state = 'complete' AND created_at >= :cutoff) "
+        "+ (SELECT COUNT(*) FROM ohlcv_slices WHERE set_id IN "
+        "   (SELECT id FROM ohlcv_slice_sets WHERE purged_at IS NULL "
+        "    AND (state != 'complete' OR created_at < :cutoff)))",
+        {"cutoff": cutoff}).fetchone()
+    return int(row[0])
 
 
 class CapacityReader:
@@ -175,7 +186,9 @@ class CapacityReader:
 
     def __init__(self, plan_fn: Callable[[], object], db_path: Path, *,
                  bytes_source: Callable[[], tuple[object, datetime] | None]
-                 | None = None) -> None:
+                 | None = None,
+                 clock: Callable[[], datetime] | None = None) -> None:
+        self._clock = clock
         self._plan_fn = plan_fn
         self._db_path = Path(db_path)
         self._bytes_source = bytes_source
@@ -196,7 +209,8 @@ class CapacityReader:
     def status(self, conn: sqlite3.Connection) -> dict:
         plan = self._plan_fn()
         size, at = self._measured()
-        return capacity_status(plan, rows=stored_slice_rows(conn),
+        return capacity_status(plan, rows=stored_slice_rows(
+            conn, now=None if self._clock is None else self._clock()),
                                slice_bytes=size, db_path=self._db_path,
                                slice_bytes_measured_at=at)
 
@@ -443,35 +457,104 @@ def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
     return facts
 
 
+class ReportStoreError(OSError):
+    """report の保存先・最終名が親専有の通常形でない (symlink・dir・他 owner・mode 違い)。"""
+
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _report_name(label: date) -> str:
+    return f"econ-signal-{label.isoformat()}.md"
+
+
+def _open_reports_dir(reports_dir: Path, *, create: bool) -> int:
+    """保存 dir を symlink を辿らずに開く。作るときも末尾を辿らない。"""
+    reports_dir = Path(reports_dir)
+    if create:
+        reports_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_fd = os.open(reports_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            try:
+                os.mkdir(reports_dir.name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            return _open_nofollow(reports_dir.name, parent_fd)
+        finally:
+            os.close(parent_fd)
+    return _open_nofollow(str(reports_dir), None)
+
+
+def _open_nofollow(name: str, dir_fd: int | None) -> int:
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise ReportStoreError(f"report directory is not a plain directory: {exc}") from exc
+
+
+def _final_is_generated(dir_fd: int, name: str) -> bool:
+    """最終名が無ければ False、親専有の通常 file なら True、それ以外は失敗。"""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+            and stat.S_IMODE(st.st_mode) == 0o600):
+        raise ReportStoreError("existing report is not an owner-only regular file")
+    return True
+
+
+def report_exists(reports_dir: Path, *, label: date) -> bool:
+    """その取引日の report が生成済みか。保存 dir が無ければ False、形が不正なら例外。"""
+    try:
+        dir_fd = _open_reports_dir(reports_dir, create=False)
+    except FileNotFoundError:
+        return False
+    try:
+        return _final_is_generated(dir_fd, _report_name(label))
+    finally:
+        os.close(dir_fd)
+
+
 def write_report_once(reports_dir: Path, *, label: date, body: str) -> Path | None:
     """取引日ごとに 1 file。既にあれば何もせず None。親専有 (dir 0700 / file 0600)。
 
-    part file に書き切ってから `link` で最終名にするので、途中で落ちても最終名の
-    欠けた file は残らない (次の試行がやり直せる)。"""
+    保存 dir は symlink を辿らずに開き、以降は dir fd 相対で作る。part file に書き切って
+    から `link` で最終名にするので、途中で落ちても最終名の欠けた file は残らない
+    (次の試行がやり直せる)。最終名が通常 file でない・owner が違う・mode が違うときは
+    生成済みとみなさず `ReportStoreError` を上げる。"""
     reports_dir = Path(reports_dir)
-    reports_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(reports_dir, 0o700)
-    final = reports_dir / f"econ-signal-{label.isoformat()}.md"
-    if os.path.lexists(final):
-        return None
-    part = reports_dir / f".econ-signal-{label.isoformat()}.{os.getpid()}.part"
-    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    dir_fd = _open_reports_dir(reports_dir, create=True)
     try:
-        try:
-            os.write(fd, body.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        try:
-            os.link(part, final)
-        except FileExistsError:
+        os.fchmod(dir_fd, 0o700)
+        name = _report_name(label)
+        if _final_is_generated(dir_fd, name):
             return None
-    finally:
+        part = f".econ-signal-{label.isoformat()}.{os.getpid()}.part"
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+                     dir_fd=dir_fd)
         try:
-            os.unlink(part)
-        except FileNotFoundError:
-            pass
-    return final
+            try:
+                os.fchmod(fd, 0o600)
+                os.write(fd, body.encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            try:
+                os.link(part, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except FileExistsError:
+                _final_is_generated(dir_fd, name)
+                return None
+        finally:
+            try:
+                os.unlink(part, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
+        return reports_dir / name
+    finally:
+        os.close(dir_fd)
 
 
 def make_daily_report_callback(*, reports_dir: Path,
@@ -486,7 +569,7 @@ def make_daily_report_callback(*, reports_dir: Path,
     読み取り接続を callback の中で開いて閉じる。例外は呼び出し側 (scheduler) が数える。"""
     def callback(close_at: datetime) -> None:
         label = report_label(close_at)
-        if os.path.lexists(Path(reports_dir) / f"econ-signal-{label.isoformat()}.md"):
+        if report_exists(reports_dir, label=label):
             return
         conn = open_conn()
         try:

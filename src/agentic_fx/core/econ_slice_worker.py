@@ -48,8 +48,10 @@ _LIMIT_WINDOW = timedelta(hours=4)
 _BUSY_BACKOFF_SEC = (0.01, 0.02, 0.04)
 _BUSY_BACKOFF_STEADY_SEC = 0.05
 OWNER_MEMO_MAX = 64
-#: 注入された測定 (表の全域を読む重い集計) を回す間隔。cycle の DB 予算の外で行う。
+#: 容量測定 (表の全域を読む重い集計) を回す間隔と、1 回の測定の時間上限。
 MEASURE_INTERVAL_SEC = 600.0
+MEASURE_TIME_LIMIT_SEC = 30.0
+MEASURE_PROGRESS_STEPS = 1000
 LIMIT_MEMO_MAX = 256
 
 
@@ -173,9 +175,7 @@ class EconSliceWorker:
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  on_complete: Callable[[dict], None] | None = None,
-                 interval_sec: float = CYCLE_INTERVAL_SEC,
-                 measure_fn: Callable[[sqlite3.Connection], object] | None = None,
-                 measure_interval_sec: float = MEASURE_INTERVAL_SEC) -> None:
+                 interval_sec: float = CYCLE_INTERVAL_SEC) -> None:
         self._read = read_conn
         self._write_conn = write_conn
         self._core_lock = core_lock
@@ -188,10 +188,6 @@ class EconSliceWorker:
         self._sleep = sleep
         self._on_complete = on_complete
         self._interval = interval_sec
-        self._measure_fn = measure_fn
-        self._measure_interval = measure_interval_sec
-        self._measure_due: float | None = None
-        self._measurement: tuple[object, datetime] | None = None
         self._generation: int | None = None
         self._commit_seconds: deque[float] = deque(maxlen=256)
         self._spent = 0.0
@@ -218,11 +214,6 @@ class EconSliceWorker:
     def commit_seconds(self) -> tuple[float, ...]:
         """直近の COMMIT 所要 (観測値)。"""
         return tuple(self._commit_seconds)
-
-    @property
-    def measurement(self) -> tuple[object, datetime] | None:
-        """直近の測定値と測った時刻。まだ測っていなければ `None`。"""
-        return self._measurement
 
     # --- 起動と loop ----------------------------------------------------------
 
@@ -299,29 +290,7 @@ class EconSliceWorker:
         self._report.yielded = self._abort and not self._exhausted()
         self._report.budget_exhausted = self._exhausted()
         self._report.spent_sec = self._spent
-        self._measure_if_due(stop)
         return self._report
-
-    def _measure_if_due(self, stop: threading.Event | None) -> None:
-        """注入された測定を `measure_interval_sec` に 1 回、自分の読取接続で行う。
-
-        read-only で WAL の writer を止めない。cycle の DB 予算には数えず、失敗は
-        記録して次の間隔まで再試行しない (直前の測定値は残す)。"""
-        if self._measure_fn is None or (stop is not None and stop.is_set()):
-            return
-        now = self._monotonic()
-        if self._measure_due is not None and now < self._measure_due:
-            return
-        self._measure_due = now + self._measure_interval
-        try:
-            value = self._measure_fn(self._read)
-        except Exception:
-            _log.exception("econ slice worker measurement failed")
-            return
-        finally:
-            if self._read.in_transaction:
-                self._read.rollback()
-        self._measurement = (value, self._now())
 
     def _exhausted(self) -> bool:
         return (self._bounded and not self._reserved
@@ -926,3 +895,90 @@ class EconSliceWorker:
         except Exception:
             _log.exception("econ slice on_complete failed: set %s", set_id)
 
+
+
+class CapacityMeasurer:
+    """容量 (slice 関連 bytes) を専用の読取接続で定期に測る thread の本体。
+
+    slice worker の cycle とは独立に動く。測定中は sqlite の progress handler で
+    停止要求と時間上限を見て、超えたら打ち切る (前の測定値は残し、結果は
+    `last_outcome` に `aborted` と記録する)。接続はこの thread が開いて閉じるので、
+    thread が終わらないうちは外から閉じない。"""
+
+    def __init__(self, *, open_conn: Callable[[], sqlite3.Connection],
+                 measure_fn: Callable[[sqlite3.Connection], object],
+                 now_fn: Callable[[], datetime],
+                 interval_sec: float = MEASURE_INTERVAL_SEC,
+                 time_limit_sec: float = MEASURE_TIME_LIMIT_SEC,
+                 monotonic: Callable[[], float] = time.monotonic,
+                 progress_steps: int = MEASURE_PROGRESS_STEPS) -> None:
+        self._open_conn = open_conn
+        self._measure_fn = measure_fn
+        self._now = now_fn
+        self._interval = interval_sec
+        self._time_limit = time_limit_sec
+        self._monotonic = monotonic
+        self._progress_steps = progress_steps
+        self._measurement: tuple[object, datetime] | None = None
+        self._last_outcome: str | None = None
+
+    @property
+    def measurement(self) -> tuple[object, datetime] | None:
+        """直近に成功した測定値と測った時刻。まだ測れていなければ `None`。"""
+        return self._measurement
+
+    @property
+    def last_outcome(self) -> str | None:
+        """直近の測定の結果: `ok` / `aborted` (停止・時間上限) / `failed`。"""
+        return self._last_outcome
+
+    def run(self, stop: threading.Event) -> None:
+        """停止されるまで `interval_sec` ごとに測る。接続は最後にここで閉じる。"""
+        try:
+            conn = self._open_conn()
+        except Exception:
+            _log.exception("econ capacity measurement connection failed")
+            self._last_outcome = "failed"
+            return
+        try:
+            while not stop.is_set():
+                self.measure_once(conn, stop)
+                if stop.wait(self._interval):
+                    break
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                _log.exception("econ capacity measurement connection close failed")
+
+    def measure_once(self, conn: sqlite3.Connection, stop: threading.Event) -> str:
+        deadline = self._monotonic() + self._time_limit
+        interrupted: list[str] = []
+
+        def should_abort() -> int:
+            if stop.is_set():
+                interrupted.append("stop")
+                return 1
+            if self._monotonic() >= deadline:
+                interrupted.append("time_limit")
+                return 1
+            return 0
+
+        conn.set_progress_handler(should_abort, self._progress_steps)
+        try:
+            value = self._measure_fn(conn)
+        except Exception:
+            if interrupted:
+                _log.warning("econ capacity measurement aborted (%s)", interrupted[0])
+                self._last_outcome = "aborted"
+            else:
+                _log.exception("econ capacity measurement failed")
+                self._last_outcome = "failed"
+            return self._last_outcome
+        finally:
+            conn.set_progress_handler(None, 0)
+            if conn.in_transaction:
+                conn.rollback()
+        self._measurement = (value, self._now())
+        self._last_outcome = "ok"
+        return "ok"

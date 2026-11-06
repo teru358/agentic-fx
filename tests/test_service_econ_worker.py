@@ -10,7 +10,7 @@ import pytest
 
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.ops.contracts import ShellCaller
-from agentic_fx.core.econ_slice_worker import EconSliceWorker
+from agentic_fx.core.econ_slice_worker import CapacityMeasurer, EconSliceWorker
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.store.instance_lock import (
     InstanceAlreadyRunning, acquire_instance_lock)
@@ -302,7 +302,9 @@ def test_status_reads_the_workers_bytes_measurement_and_never_measures_itself(tm
         assert before["slice_bytes"] is None
         assert before["slice_bytes_measured_at"] is None
         stamp = datetime(2026, 11, 6, 1, 2, 3, tzinfo=timezone.utc)
-        app.econ_worker._measurement = (4321, stamp)
+        app.econ_measurer._measurement = (4321, stamp)
+        from agentic_fx.loops import econ_signal_report
+        econ_signal_report.empty_slice_bytes()
         with patch("agentic_fx.loops.econ_signal_report.slice_related_bytes") as probe:
             after = app.ops.status(ShellCaller.SHELL)["econ_signal"]["slice_capacity"]
         assert probe.call_count == 0
@@ -357,3 +359,79 @@ def test_build_app_registers_the_parent_only_daily_report(tmp_path):
         assert "## slice capacity" in (reports / "econ-signal-2026-07-21.md").read_text()
     finally:
         app.close()
+
+
+MEASURE_THREAD = "afx-econ-capacity"
+
+
+class _FakeMeasurer:
+    measurement = None
+
+    def __init__(self, on_run=None):
+        self.runs = []
+        self.on_run = on_run
+
+    def run(self, stop):
+        self.runs.append((threading.current_thread().name, stop))
+        if self.on_run is not None:
+            self.on_run(stop)
+
+
+def test_build_app_builds_a_measurer_that_feeds_the_capacity_status(tmp_path):
+    app = _build(tmp_path)
+    try:
+        assert isinstance(app.econ_measurer, CapacityMeasurer)
+        assert not hasattr(app.econ_worker, "measurement")
+    finally:
+        app.close()
+
+
+def test_the_measurer_runs_on_its_own_thread_and_stops_with_the_service(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    seen = threading.Event()
+
+    def on_run(stop):
+        seen.set()
+        stop_event.set()
+        stop.wait(5)
+
+    app.econ_measurer = _FakeMeasurer(on_run)
+    app.econ_worker = _FakeWorker()
+    assert _serve(tmp_path, app, stop_event) == 0
+    assert seen.is_set()
+    assert app.econ_measurer.runs[0][0] == MEASURE_THREAD
+    assert MEASURE_THREAD not in {t.name for t in threading.enumerate()}
+
+
+def test_a_measurer_that_does_not_stop_is_reported_as_a_shutdown_timeout(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    release = threading.Event()
+    written = []
+    original_write = app.activity.write
+
+    def spy_write(category, kind, *args, **kwargs):
+        written.append((kind, args))
+        return original_write(category, kind, *args, **kwargs)
+
+    def stuck(stop):
+        stop_event.set()
+        release.wait(timeout=30)
+
+    app.activity.write = spy_write
+    app.econ_measurer = _FakeMeasurer(stuck)
+    app.econ_worker = _FakeWorker()
+    try:
+        with patch("agentic_fx.service._ECON_WORKER_JOIN_TIMEOUT_SEC", 0.2):
+            assert _serve(tmp_path, app, stop_event) == 1
+        assert [a for k, a in written if k == "service_stopped"][0][0].startswith(
+            "shutdown_timeout")
+    finally:
+        release.set()
+        for t in threading.enumerate():
+            if t.name == MEASURE_THREAD:
+                t.join(timeout=30)
+        for conn in (app.conn_econ_read, app.conn_econ_write):
+            conn.close()
+        app.instance_lock.close()
