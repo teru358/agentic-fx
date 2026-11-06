@@ -1,0 +1,1284 @@
+{
+ "version": 1,
+ "cases": [
+  {
+   "id": "tokyo_second",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_minute",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "minute",
+   "expect": "2026-11-06 19:04 +09:00"
+  },
+  {
+   "id": "tokyo_millisecond",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05.123456Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "millisecond",
+   "expect": "2026-11-06 19:04:05,123 +09:00"
+  },
+  {
+   "id": "tokyo_millisecond_no_fraction",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "millisecond",
+   "expect": "2026-11-06 19:04:05,000 +09:00"
+  },
+  {
+   "id": "tokyo_second_drops_fraction",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05.987654Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_minute_drops_seconds",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:59Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "minute",
+   "expect": "2026-11-06 19:04 +09:00"
+  },
+  {
+   "id": "tokyo_offset_input",
+   "kind": "convert",
+   "input": "2026-11-06T19:04:05+09:00",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_negative_offset_input",
+   "kind": "convert",
+   "input": "2026-11-06T05:04:05-05:00",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_plus0000_input",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05+00:00",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_datetime_input",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05+00:00",
+   "input_form": "datetime",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "tokyo_day_rollover",
+   "kind": "convert",
+   "input": "2026-12-31T20:00:00Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": "2027-01-01 05:00:00 +09:00"
+  },
+  {
+   "id": "utc_second",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "UTC",
+   "precision": "second",
+   "expect": "2026-11-06 10:04:05 +00:00"
+  },
+  {
+   "id": "utc_minute",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "UTC",
+   "precision": "minute",
+   "expect": "2026-11-06 10:04 +00:00"
+  },
+  {
+   "id": "utc_millisecond",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05.5+00:00",
+   "input_form": "string",
+   "tz": "UTC",
+   "precision": "millisecond",
+   "expect": "2026-11-06 10:04:05,500 +00:00"
+  },
+  {
+   "id": "utc_from_offset_input",
+   "kind": "convert",
+   "input": "2026-11-06T19:04:05+09:00",
+   "input_form": "string",
+   "tz": "UTC",
+   "precision": "second",
+   "expect": "2026-11-06 10:04:05 +00:00"
+  },
+  {
+   "id": "compat_name_japan",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Japan",
+   "precision": "second",
+   "expect": "2026-11-06 19:04:05 +09:00",
+   "needs_pip_tzdata": true
+  },
+  {
+   "id": "kolkata_half_hour",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Kolkata",
+   "precision": "second",
+   "expect": "2026-11-06 15:34:05 +05:30"
+  },
+  {
+   "id": "st_johns_negative_half_hour",
+   "kind": "convert",
+   "input": "2026-01-15T12:00:00Z",
+   "input_form": "string",
+   "tz": "America/St_Johns",
+   "precision": "second",
+   "expect": "2026-01-15 08:30:00 -03:30"
+  },
+  {
+   "id": "new_york_winter",
+   "kind": "convert",
+   "input": "2026-01-15T12:00:00Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-01-15 07:00:00 -05:00"
+  },
+  {
+   "id": "new_york_summer",
+   "kind": "convert",
+   "input": "2026-07-15T12:00:00Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-07-15 08:00:00 -04:00"
+  },
+  {
+   "id": "new_york_spring_before",
+   "kind": "convert",
+   "input": "2026-03-08T06:59:59Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-03-08 01:59:59 -05:00"
+  },
+  {
+   "id": "new_york_spring_after",
+   "kind": "convert",
+   "input": "2026-03-08T07:00:00Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-03-08 03:00:00 -04:00"
+  },
+  {
+   "id": "new_york_fall_first_1_30",
+   "kind": "convert",
+   "input": "2026-11-01T05:30:00Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-11-01 01:30:00 -04:00"
+  },
+  {
+   "id": "new_york_fall_second_1_30",
+   "kind": "convert",
+   "input": "2026-11-01T06:30:00Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "second",
+   "expect": "2026-11-01 01:30:00 -05:00"
+  },
+  {
+   "id": "new_york_fall_milli",
+   "kind": "convert",
+   "input": "2026-11-01T06:30:00.250Z",
+   "input_form": "string",
+   "tz": "America/New_York",
+   "precision": "millisecond",
+   "expect": "2026-11-01 01:30:00,250 -05:00"
+  },
+  {
+   "id": "london_summer",
+   "kind": "convert",
+   "input": "2026-07-15T12:00:00Z",
+   "input_form": "string",
+   "tz": "Europe/London",
+   "precision": "second",
+   "expect": "2026-07-15 13:00:00 +01:00"
+  },
+  {
+   "id": "london_winter",
+   "kind": "convert",
+   "input": "2026-01-15T12:00:00Z",
+   "input_form": "string",
+   "tz": "Europe/London",
+   "precision": "second",
+   "expect": "2026-01-15 12:00:00 +00:00"
+  },
+  {
+   "id": "naive_string",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "naive_datetime",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05",
+   "input_form": "datetime",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "date_only",
+   "kind": "convert",
+   "input": "2026-11-06",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "garbage_string",
+   "kind": "convert",
+   "input": "not a time",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "empty_string",
+   "kind": "convert",
+   "input": "",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "leading_space",
+   "kind": "convert",
+   "input": " 2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "overflow_max_year",
+   "kind": "convert",
+   "input": "9999-12-31T23:59:59Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "input_null",
+   "kind": "convert",
+   "input": null,
+   "input_form": "raw",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "input_number",
+   "kind": "convert",
+   "input": 1762423445,
+   "input_form": "raw",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "input_list",
+   "kind": "convert",
+   "input": [
+    "2026-11-06T10:04:05Z"
+   ],
+   "input_form": "raw",
+   "tz": "Asia/Tokyo",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_empty",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_null",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": null,
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_number",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": 5,
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_list",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": [
+    "Asia/Tokyo"
+   ],
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_zone_tab",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "zone.tab",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_too_long",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_unknown",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Nowhere/City",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_directory",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "America",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_traversal",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "../../etc/passwd",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_nul",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo\u0000",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "tz_html",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "<script>",
+   "precision": "second",
+   "expect": null
+  },
+  {
+   "id": "precision_unknown",
+   "kind": "convert",
+   "input": "2026-11-06T10:04:05Z",
+   "input_form": "string",
+   "tz": "Asia/Tokyo",
+   "precision": "hour",
+   "expect": null
+  },
+  {
+   "id": "token_z",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05Z ok",
+   "tz": "Asia/Tokyo",
+   "expect": "until 2026-11-06 19:04:05 +09:00 ok"
+  },
+  {
+   "id": "token_plus0000",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05+00:00 ok",
+   "tz": "Asia/Tokyo",
+   "expect": "until 2026-11-06 19:04:05 +09:00 ok"
+  },
+  {
+   "id": "token_minus0000",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05-00:00 ok",
+   "tz": "Asia/Tokyo",
+   "expect": "until 2026-11-06 19:04:05 +09:00 ok"
+  },
+  {
+   "id": "token_fraction",
+   "kind": "token",
+   "text": "x=2026-11-06T10:04:05.123456+00:00 y",
+   "tz": "Asia/Tokyo",
+   "expect": "x=2026-11-06 19:04:05 +09:00 y"
+  },
+  {
+   "id": "token_one_digit_fraction",
+   "kind": "token",
+   "text": "2026-11-06T10:04:05.5Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "token_before_period",
+   "kind": "token",
+   "text": "待つ 2026-11-06T10:04:05Z.",
+   "tz": "Asia/Tokyo",
+   "expect": "待つ 2026-11-06 19:04:05 +09:00."
+  },
+  {
+   "id": "token_before_colon_space",
+   "kind": "token",
+   "text": "at 2026-11-06T10:04:05Z: next",
+   "tz": "Asia/Tokyo",
+   "expect": "at 2026-11-06 19:04:05 +09:00: next"
+  },
+  {
+   "id": "token_before_colon_end",
+   "kind": "token",
+   "text": "at 2026-11-06T10:04:05Z:",
+   "tz": "Asia/Tokyo",
+   "expect": "at 2026-11-06 19:04:05 +09:00:"
+  },
+  {
+   "id": "token_before_maru",
+   "kind": "token",
+   "text": "2026-11-06T10:04:05Z。次",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:05 +09:00。次"
+  },
+  {
+   "id": "token_line_end",
+   "kind": "token",
+   "text": "deadline 2026-11-06T10:04:05Z",
+   "tz": "Asia/Tokyo",
+   "expect": "deadline 2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "token_alone",
+   "kind": "token",
+   "text": "2026-11-06T10:04:05Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:05 +09:00"
+  },
+  {
+   "id": "token_after_equals",
+   "kind": "token",
+   "text": "expected=2026-11-06T10:04:05Z deadline=2026-11-06T12:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "expected=2026-11-06 19:04:05 +09:00 deadline=2026-11-06 21:00:00 +09:00"
+  },
+  {
+   "id": "token_in_parens",
+   "kind": "token",
+   "text": "(2026-11-06T10:04:05Z)",
+   "tz": "Asia/Tokyo",
+   "expect": "(2026-11-06 19:04:05 +09:00)"
+  },
+  {
+   "id": "token_in_json",
+   "kind": "token",
+   "text": "{\"t_c\": \"2026-11-06T10:04:05+00:00\"}",
+   "tz": "Asia/Tokyo",
+   "expect": "{\"t_c\": \"2026-11-06 19:04:05 +09:00\"}"
+  },
+  {
+   "id": "token_comma",
+   "kind": "token",
+   "text": "2026-11-06T10:04:05Z, next",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:05 +09:00, next"
+  },
+  {
+   "id": "token_utc_target",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05Z ok",
+   "tz": "UTC",
+   "expect": "until 2026-11-06 10:04:05 +00:00 ok"
+  },
+  {
+   "id": "token_new_york_fall",
+   "kind": "token",
+   "text": "2026-11-01T06:30:00Z",
+   "tz": "America/New_York",
+   "expect": "2026-11-01 01:30:00 -05:00"
+  },
+  {
+   "id": "token_mixed_offsets",
+   "kind": "token",
+   "text": "a 2026-11-06T10:04:05Z b 2026-11-06T10:04:05+09:00 c",
+   "tz": "Asia/Tokyo",
+   "expect": "a 2026-11-06 19:04:05 +09:00 b 2026-11-06T10:04:05+09:00 c"
+  },
+  {
+   "id": "token_neg_offset_then_fraction",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00+00:00.5",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00+00:00.5"
+  },
+  {
+   "id": "token_neg_z_then_offset",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00Z+09:00",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00Z+09:00"
+  },
+  {
+   "id": "token_neg_offset_seconds",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00+00:00:30",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00+00:00:30"
+  },
+  {
+   "id": "token_neg_seven_digit_fraction",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00.1234567Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00.1234567Z"
+  },
+  {
+   "id": "token_neg_nonzero_offset",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00+09:00",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00+09:00"
+  },
+  {
+   "id": "token_neg_negative_offset",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00-05:00",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00-05:00"
+  },
+  {
+   "id": "token_neg_word_before",
+   "kind": "token",
+   "text": "x2026-11-06T10:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "x2026-11-06T10:00:00Z"
+  },
+  {
+   "id": "token_neg_colon_before",
+   "kind": "token",
+   "text": "naive:2026-11-06T10:00:00+00:00",
+   "tz": "Asia/Tokyo",
+   "expect": "naive:2026-11-06T10:00:00+00:00"
+  },
+  {
+   "id": "token_neg_plus_before",
+   "kind": "token",
+   "text": "+2026-11-06T10:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "+2026-11-06T10:00:00Z"
+  },
+  {
+   "id": "token_neg_word_after",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00Zulu",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00Zulu"
+  },
+  {
+   "id": "token_neg_space_separator",
+   "kind": "token",
+   "text": "2026-11-06 10:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:00:00Z"
+  },
+  {
+   "id": "token_neg_no_seconds",
+   "kind": "token",
+   "text": "2026-11-06T10:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00Z"
+  },
+  {
+   "id": "token_neg_no_offset",
+   "kind": "token",
+   "text": "2026-11-06T10:00:00",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:00:00"
+  },
+  {
+   "id": "token_neg_compact",
+   "kind": "token",
+   "text": "20261106T100000Z",
+   "tz": "Asia/Tokyo",
+   "expect": "20261106T100000Z"
+  },
+  {
+   "id": "token_neg_invalid_month",
+   "kind": "token",
+   "text": "2026-13-45T10:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-13-45T10:00:00Z"
+  },
+  {
+   "id": "token_neg_invalid_hour",
+   "kind": "token",
+   "text": "2026-11-06T25:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T25:00:00Z"
+  },
+  {
+   "id": "token_neg_bar_label",
+   "kind": "token",
+   "text": "bar=2026-11-06T10:00 UTC",
+   "tz": "Asia/Tokyo",
+   "expect": "bar=2026-11-06T10:00 UTC"
+  },
+  {
+   "id": "token_neg_digits_only",
+   "kind": "token",
+   "text": "1762423445",
+   "tz": "Asia/Tokyo",
+   "expect": "1762423445"
+  },
+  {
+   "id": "token_neg_empty",
+   "kind": "token",
+   "text": "",
+   "tz": "Asia/Tokyo",
+   "expect": ""
+  },
+  {
+   "id": "token_neg_plain_text",
+   "kind": "token",
+   "text": "前回の取得から間もないので次回は 10:00 UTC",
+   "tz": "Asia/Tokyo",
+   "expect": "前回の取得から間もないので次回は 10:00 UTC"
+  },
+  {
+   "id": "token_tz_invalid_unchanged",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05Z ok",
+   "tz": "Nowhere/City",
+   "expect": "until 2026-11-06T10:04:05Z ok"
+  },
+  {
+   "id": "token_tz_null_unchanged",
+   "kind": "token",
+   "text": "until 2026-11-06T10:04:05Z ok",
+   "tz": null,
+   "expect": "until 2026-11-06T10:04:05Z ok"
+  },
+  {
+   "id": "activity_head_converted",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tTRADE\torder_submitted\tbuy EURUSD\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tTRADE\torder_submitted\tbuy EURUSD\t-"
+  },
+  {
+   "id": "activity_head_all_categories_news",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tNEWS\tnews_collected\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tNEWS\tnews_collected\tx\t-"
+  },
+  {
+   "id": "activity_head_all_categories_tech",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tTECH\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tTECH\te\tx\t-"
+  },
+  {
+   "id": "activity_head_all_categories_aggregate",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tAGGREGATE\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tAGGREGATE\te\tx\t-"
+  },
+  {
+   "id": "activity_head_all_categories_improve",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tIMPROVE\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tIMPROVE\te\tx\t-"
+  },
+  {
+   "id": "activity_head_all_categories_approval",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tAPPROVAL\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tAPPROVAL\te\tx\t-"
+  },
+  {
+   "id": "activity_head_all_categories_system",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_head_z_suffix",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17Z\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_head_fraction",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17.9+00:00\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_head_new_york_dst",
+   "kind": "activity_line",
+   "line": "2026-11-01T06:30:00+00:00\tSYSTEM\te\tx\t-",
+   "tz": "America/New_York",
+   "expect": "2026-11-01 01:30:00 -05:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_head_utc_target",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-",
+   "tz": "UTC",
+   "expect": "2026-11-06 10:04:17 +00:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_trailing_newline_kept",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-\n",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\t-\n"
+  },
+  {
+   "id": "activity_ref_untouched",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\tref:2026-11-06T10:04:17+00:00",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\tref:2026-11-06T10:04:17+00:00"
+  },
+  {
+   "id": "activity_body_converted_datafeed_restricted",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\tdatafeed_restricted\tepoch=3 stalled=['EURUSD'] expected=2026-11-06T10:00:00Z deadline=2026-11-06T12:00:00Z\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\tdatafeed_restricted\tepoch=3 stalled=['EURUSD'] expected=2026-11-06 19:00:00 +09:00 deadline=2026-11-06 21:00:00 +09:00\t-"
+  },
+  {
+   "id": "activity_body_converted_news_source_skipped",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tNEWS\tnews_source_skipped\tsrc: 連続 3 回失敗のため 2026-11-06T10:30:00Z まで待つ\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tNEWS\tnews_source_skipped\tsrc: 連続 3 回失敗のため 2026-11-06 19:30:00 +09:00 まで待つ\t-"
+  },
+  {
+   "id": "activity_body_converted_news_fetch_skipped",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tNEWS\tnews_fetch_skipped\t前回の取得から間もないので次回は 2026-11-06T10:30:00Z\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tNEWS\tnews_fetch_skipped\t前回の取得から間もないので次回は 2026-11-06 19:30:00 +09:00\t-"
+  },
+  {
+   "id": "activity_body_converted_econ_fetch_skipped",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tNEWS\tecon_fetch_skipped\t前回の取得から間もないので次回は 2026-11-06T10:30:00Z\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tNEWS\tecon_fetch_skipped\t前回の取得から間もないので次回は 2026-11-06 19:30:00 +09:00\t-"
+  },
+  {
+   "id": "activity_body_converted_kill_switch_reset",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\tkill_switch_reset\thuman explicit reset via shell gen=4 latched_at=2026-11-06T09:00:00Z\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\tkill_switch_reset\thuman explicit reset via shell gen=4 latched_at=2026-11-06 18:00:00 +09:00\t-"
+  },
+  {
+   "id": "activity_body_converted_time_rule_cutover",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\ttime_rule_cutover\t{\"captured_at\": \"2026-11-06T10:00:00+00:00\", \"t_c\": \"2026-11-06T10:00:00+00:00\"}\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\ttime_rule_cutover\t{\"captured_at\": \"2026-11-06 19:00:00 +09:00\", \"t_c\": \"2026-11-06 19:00:00 +09:00\"}\t-"
+  },
+  {
+   "id": "activity_body_nonzero_offset_kept",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\tkill_switch_reset\tgen=4 latched_at=2026-11-06T09:00:00+09:00\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\tkill_switch_reset\tgen=4 latched_at=2026-11-06T09:00:00+09:00\t-"
+  },
+  {
+   "id": "activity_body_naive_prefix_kept",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\tkill_switch_reset\tgen=4 latched_at=naive:2026-11-06T09:00:00\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\tkill_switch_reset\tgen=4 latched_at=naive:2026-11-06T09:00:00\t-"
+  },
+  {
+   "id": "activity_llm_body_untouched",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tAGGREGATE\taggregate_decision\tENTER at 2026-11-06T10:00:00Z because\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tAGGREGATE\taggregate_decision\tENTER at 2026-11-06T10:00:00Z because\t-"
+  },
+  {
+   "id": "activity_event_not_in_table_untouched",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\tcron_mission_deferred\tx 2026-11-06T10:00:00Z y\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\tcron_mission_deferred\tx 2026-11-06T10:00:00Z y\t-"
+  },
+  {
+   "id": "activity_same_event_other_category_untouched",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tTECH\tnews_source_skipped\tx 2026-11-06T10:00:00Z y\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tTECH\tnews_source_skipped\tx 2026-11-06T10:00:00Z y\t-"
+  },
+  {
+   "id": "activity_event_in_ref_not_body",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\tkill_switch_reset",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:04:17 +09:00\tSYSTEM\te\tx\tkill_switch_reset"
+  },
+  {
+   "id": "activity_neg_four_fields",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx"
+  },
+  {
+   "id": "activity_neg_six_fields_tab_in_body",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\ta\tb\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM\te\ta\tb\t-"
+  },
+  {
+   "id": "activity_neg_unknown_category",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tFOO\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tFOO\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_lowercase_category",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tsystem\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tsystem\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_head_not_iso",
+   "kind": "activity_line",
+   "line": "hello\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "hello\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_head_naive",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_head_nonzero_offset",
+   "kind": "activity_line",
+   "line": "2026-11-06T19:04:17+09:00\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T19:04:17+09:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_head_date_only",
+   "kind": "activity_line",
+   "line": "2026-11-06\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_head_trailing_text",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00 x\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00 x\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_neg_traceback_continuation",
+   "kind": "activity_line",
+   "line": "  File \"/x/y.py\", line 3, in f",
+   "tz": "Asia/Tokyo",
+   "expect": "  File \"/x/y.py\", line 3, in f"
+  },
+  {
+   "id": "activity_neg_truncated_mid_head",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:1",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:1"
+  },
+  {
+   "id": "activity_neg_truncated_after_category",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM"
+  },
+  {
+   "id": "activity_neg_empty",
+   "kind": "activity_line",
+   "line": "",
+   "tz": "Asia/Tokyo",
+   "expect": ""
+  },
+  {
+   "id": "activity_neg_only_newline",
+   "kind": "activity_line",
+   "line": "\n",
+   "tz": "Asia/Tokyo",
+   "expect": "\n"
+  },
+  {
+   "id": "activity_neg_log_line",
+   "kind": "activity_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "activity_tz_invalid_unchanged",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-",
+   "tz": "Nowhere/City",
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "activity_tz_null_unchanged",
+   "kind": "activity_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-",
+   "tz": null,
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "log_info_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.activity: hello",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,090 +09:00 INFO agentic_fx.activity: hello"
+  },
+  {
+   "id": "log_warning_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,001 UTC WARNING agentic_fx.core.scheduler: x y",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,001 +09:00 WARNING agentic_fx.core.scheduler: x y"
+  },
+  {
+   "id": "log_error_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,999 UTC ERROR agentic_fx: boom",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,999 +09:00 ERROR agentic_fx: boom"
+  },
+  {
+   "id": "log_debug_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,000 UTC DEBUG agentic_fx.x: d",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,000 +09:00 DEBUG agentic_fx.x: d"
+  },
+  {
+   "id": "log_critical_empty_message",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,000 UTC CRITICAL agentic_fx.x:",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,000 +09:00 CRITICAL agentic_fx.x:"
+  },
+  {
+   "id": "log_new_york_dst_fall",
+   "kind": "log_line",
+   "line": "2026-11-01 06:30:00,500 UTC INFO agentic_fx.x: m",
+   "tz": "America/New_York",
+   "expect": "2026-11-01 01:30:00,500 -05:00 INFO agentic_fx.x: m"
+  },
+  {
+   "id": "log_utc_target",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: m",
+   "tz": "UTC",
+   "expect": "2026-11-06 10:14:23,090 +00:00 INFO agentic_fx.x: m"
+  },
+  {
+   "id": "log_body_iso_not_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: until 2026-11-06T10:00:00Z",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,090 +09:00 INFO agentic_fx.x: until 2026-11-06T10:00:00Z"
+  },
+  {
+   "id": "log_trailing_newline_kept",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: m\n",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,090 +09:00 INFO agentic_fx.x: m\n"
+  },
+  {
+   "id": "log_neg_traceback_continuation",
+   "kind": "log_line",
+   "line": "  File \"/x/y.py\", line 3, in f",
+   "tz": "Asia/Tokyo",
+   "expect": "  File \"/x/y.py\", line 3, in f"
+  },
+  {
+   "id": "log_neg_traceback_header",
+   "kind": "log_line",
+   "line": "Traceback (most recent call last):",
+   "tz": "Asia/Tokyo",
+   "expect": "Traceback (most recent call last):"
+  },
+  {
+   "id": "log_neg_truncated_mid_time",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:2",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:2"
+  },
+  {
+   "id": "log_neg_truncated_before_logger",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23,090 UTC INFO"
+  },
+  {
+   "id": "log_neg_no_logger_colon",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x hello",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x hello"
+  },
+  {
+   "id": "log_neg_unknown_level",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC LOUD agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23,090 UTC LOUD agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_dot_instead_of_comma",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23.090 UTC INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23.090 UTC INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_no_utc_word",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 10:14:23,090 INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_already_converted",
+   "kind": "log_line",
+   "line": "2026-11-06 19:14:23,090 +09:00 INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06 19:14:23,090 +09:00 INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_invalid_month",
+   "kind": "log_line",
+   "line": "2026-13-06 10:14:23,090 UTC INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-13-06 10:14:23,090 UTC INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_indented",
+   "kind": "log_line",
+   "line": " 2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi",
+   "tz": "Asia/Tokyo",
+   "expect": " 2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "log_neg_activity_row",
+   "kind": "log_line",
+   "line": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-",
+   "tz": "Asia/Tokyo",
+   "expect": "2026-11-06T10:04:17+00:00\tSYSTEM\te\tx\t-"
+  },
+  {
+   "id": "log_neg_empty",
+   "kind": "log_line",
+   "line": "",
+   "tz": "Asia/Tokyo",
+   "expect": ""
+  },
+  {
+   "id": "log_tz_invalid_unchanged",
+   "kind": "log_line",
+   "line": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi",
+   "tz": "Nowhere/City",
+   "expect": "2026-11-06 10:14:23,090 UTC INFO agentic_fx.x: hi"
+  },
+  {
+   "id": "header_tokyo",
+   "kind": "header",
+   "tz": "Asia/Tokyo",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: Asia/Tokyo (+09:00)"
+  },
+  {
+   "id": "header_new_york_summer",
+   "kind": "header",
+   "tz": "America/New_York",
+   "now": "2026-07-15T12:00:00Z",
+   "expect": "表示 tz: America/New_York (-04:00)"
+  },
+  {
+   "id": "header_new_york_winter",
+   "kind": "header",
+   "tz": "America/New_York",
+   "now": "2026-01-15T12:00:00Z",
+   "expect": "表示 tz: America/New_York (-05:00)"
+  },
+  {
+   "id": "header_new_york_spring_boundary_before",
+   "kind": "header",
+   "tz": "America/New_York",
+   "now": "2026-03-08T06:59:59Z",
+   "expect": "表示 tz: America/New_York (-05:00)"
+  },
+  {
+   "id": "header_new_york_spring_boundary_after",
+   "kind": "header",
+   "tz": "America/New_York",
+   "now": "2026-03-08T07:00:00Z",
+   "expect": "表示 tz: America/New_York (-04:00)"
+  },
+  {
+   "id": "header_kolkata",
+   "kind": "header",
+   "tz": "Asia/Kolkata",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: Asia/Kolkata (+05:30)"
+  },
+  {
+   "id": "header_st_johns",
+   "kind": "header",
+   "tz": "America/St_Johns",
+   "now": "2026-01-15T12:00:00Z",
+   "expect": "表示 tz: America/St_Johns (-03:30)"
+  },
+  {
+   "id": "header_utc",
+   "kind": "header",
+   "tz": "UTC",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_unknown",
+   "kind": "header",
+   "tz": "Nowhere/City",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_null",
+   "kind": "header",
+   "tz": null,
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_empty",
+   "kind": "header",
+   "tz": "",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_html",
+   "kind": "header",
+   "tz": "<script>alert(1)</script>",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_too_long",
+   "kind": "header",
+   "tz": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  },
+  {
+   "id": "header_fallback_number",
+   "kind": "header",
+   "tz": 5,
+   "now": "2026-11-06T10:00:00Z",
+   "expect": "表示 tz: UTC (+00:00)"
+  }
+ ]
+}
