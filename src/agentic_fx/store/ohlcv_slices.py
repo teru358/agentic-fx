@@ -859,9 +859,12 @@ def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,
                 (set_id, STATE_COMPLETE, STATE_UNRECOVERABLE,
                  cutoff)).fetchone() is None:
             raise Conflict
+        _step(checkpoint)
         deleted = _delete_rows(conn, set_id, max_rows)
+        _step(checkpoint)
         if _rows_left(conn, set_id):
             return {"set_id": set_id, "rows": deleted}
+        _step(checkpoint)
         conn.execute("UPDATE ohlcv_slice_sets SET purged_at=? WHERE id=?",
                      (utc_iso(now), set_id))
         return {"set_id": set_id, "rows": deleted, "done": True}

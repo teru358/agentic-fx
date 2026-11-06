@@ -11,6 +11,8 @@ import pytest
 from agentic_fx.core.contracts import FixedClock
 from agentic_fx.core.econ_slice_worker import EconSliceWorker
 from agentic_fx.runners.fake_runner import FakeRunner
+from agentic_fx.store.instance_lock import (
+    InstanceAlreadyRunning, acquire_instance_lock)
 from agentic_fx.service import (
     _busy_resources_after_join, build_app, run_service)
 from tests.store.test_rag import FakeEmbedding
@@ -83,14 +85,15 @@ def test_close_leaves_the_worker_connections_open_while_the_worker_is_busy(tmp_p
     read, write = app.conn_econ_read, app.conn_econ_write
     try:
         busy = _busy_resources_after_join(False, False, econ_still_busy=True)
-        assert busy == {"conn_econ_read", "conn_econ_write"}
+        assert busy == {"conn_econ_read", "conn_econ_write", "instance_lock"}
         assert sorted(app.close(busy_resources=busy)) == [
-            "conn_econ_read", "conn_econ_write"]
+            "conn_econ_read", "conn_econ_write", "instance_lock"]
         assert read.execute("SELECT 1").fetchone()[0] == 1
         assert write.execute("SELECT 1").fetchone()[0] == 1
     finally:
         read.close()
         write.close()
+        app.instance_lock.close()
     assert _busy_resources_after_join(False, False) == frozenset()
 
 
@@ -164,33 +167,114 @@ def test_the_real_worker_stops_on_the_stop_event_and_run_service_closes_cleanly(
         app.conn_econ_write.execute("SELECT 1")
 
 
-def test_a_worker_that_does_not_stop_keeps_its_connections_open(tmp_path):
+def test_a_worker_that_does_not_stop_keeps_its_connections_and_the_lock(tmp_path):
     app = _seam_app(tmp_path, FakeRunner([]))
     stop_event = threading.Event()
     release = threading.Event()
     closed = {}
     original_close = app.close
+    original_write = app.activity.write
+    stopped = []
 
     def spy_close(*, busy_resources=frozenset()):
         closed["busy"] = busy_resources
         return original_close(busy_resources=busy_resources)
+
+    def spy_write(category, kind, *args, **kwargs):
+        if kind == "service_stopped":
+            stopped.append(args[0] if args else kwargs)
+        return original_write(category, kind, *args, **kwargs)
 
     def stuck(stop):
         stop_event.set()
         release.wait(timeout=30)
 
     app.close = spy_close
+    app.activity.write = spy_write
     app.econ_worker = _FakeWorker(stuck)
     try:
         with patch("agentic_fx.service._ECON_WORKER_JOIN_TIMEOUT_SEC", 0.2):
-            assert _serve(tmp_path, app, stop_event) == 0
-        assert {"conn_econ_read", "conn_econ_write"} <= closed["busy"]
+            assert _serve(tmp_path, app, stop_event) == 1
+        assert {"conn_econ_read", "conn_econ_write",
+                "instance_lock"} <= closed["busy"]
         assert "conn_core" not in closed["busy"]
         assert app.conn_econ_write.execute("SELECT 1").fetchone()[0] == 1
+        assert len(stopped) == 1 and stopped[0].startswith("shutdown_timeout")
+        with pytest.raises(InstanceAlreadyRunning):
+            acquire_instance_lock(tmp_path / "data")
     finally:
         release.set()
         for t in _alive():
             t.join(timeout=30)
         app.conn_econ_read.close()
         app.conn_econ_write.close()
+        app.instance_lock.close()
     assert _alive() == []
+
+
+def test_a_worker_that_cannot_start_does_not_stop_the_service_or_skip_the_stop(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    original_start = threading.Thread.start
+    written = []
+    original_write = app.activity.write
+
+    def start(self):
+        if self.name == THREAD:
+            raise RuntimeError("can't start new thread")
+        return original_start(self)
+
+    def spy_write(category, kind, *args, **kwargs):
+        written.append(kind)
+        return original_write(category, kind, *args, **kwargs)
+
+    app.activity.write = spy_write
+    with patch.object(threading.Thread, "start", start), \
+         patch("agentic_fx.service._log") as log:
+        assert _serve(tmp_path, app, stop_event) == 0
+    assert "econ slice worker could not start" in [
+        c.args[0] for c in log.exception.call_args_list]
+    assert "econ_slice_worker_start_failed" in written
+    assert written[-1] == "service_stopped"
+    names = {t.name for t in threading.enumerate()}
+    assert not names & {"scheduler", "watchdog", THREAD}
+    with pytest.raises(sqlite3.ProgrammingError):
+        app.conn_econ_write.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError):
+        app.conn_core.execute("SELECT 1")
+
+
+def test_the_real_worker_runs_cycles_and_then_stops_on_the_stop_event(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    cycled = threading.Event()
+    cycle_threads = []
+    original_cycle = app.econ_worker.run_cycle
+
+    def run_cycle(*args, **kwargs):
+        cycle_threads.append(threading.current_thread().name)
+        try:
+            return original_cycle(*args, **kwargs)
+        finally:
+            cycled.set()
+
+    def stopper():
+        if cycled.wait(timeout=60):
+            stop_event.set()
+
+    app.econ_worker.run_cycle = run_cycle
+    helper = threading.Thread(target=stopper, name="test-stopper")
+    helper.start()
+    try:
+        assert not stop_event.is_set()
+        assert _serve(tmp_path, app, stop_event) == 0
+    finally:
+        cycled.set()
+        stop_event.set()
+        helper.join(timeout=30)
+    assert not helper.is_alive()
+    assert cycle_threads and set(cycle_threads) == {THREAD}
+    assert _alive() == []
+    with pytest.raises(sqlite3.ProgrammingError):
+        app.conn_econ_write.execute("SELECT 1")

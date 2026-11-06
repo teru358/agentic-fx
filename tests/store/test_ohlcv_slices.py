@@ -1138,6 +1138,31 @@ def test_over_budget_rolls_back_every_worker_write(tmp_path):
                                  checkpoint=within).status == "over_budget"
 
 
+def test_purge_issues_no_further_statement_once_the_budget_is_over(tmp_path):
+    conn = _conn(tmp_path)
+    cutoff = NOW - timedelta(days=os_.RETENTION_DAYS)
+    old = _complete_event_set(conn, _event(conn),
+                              created_at=cutoff - timedelta(days=1))
+    clock = _Clock()
+    within = _deadline(clock)
+    calls = []
+
+    def late():
+        calls.append(1)
+        clock.now = 0.2  # 最初の文を流した後に予算を超えた
+        within()
+
+    issued = []
+    conn.set_trace_callback(issued.append)
+    out = os_.purge_step(conn, set_id=old, now=NOW, checkpoint=late)
+    conn.set_trace_callback(None)
+    assert out.status == "over_budget" and not out.committed
+    assert len(calls) == 1
+    assert not any("DELETE" in sql.upper() for sql in issued)
+    assert _rows_of(conn, old) == 255
+    assert os_.get_set(conn, old)["purged_at"] is None
+
+
 def test_over_budget_complete_leaves_set_and_shadow_untouched(tmp_path):
     conn = _conn(tmp_path)
     shadow_id, set_id, gen, start, end = _staged_shadow_set(conn)

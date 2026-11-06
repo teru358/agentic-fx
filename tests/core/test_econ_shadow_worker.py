@@ -1877,8 +1877,21 @@ def test_a_cycle_deletes_only_the_rows_of_a_set_past_the_retention_days(world):
     event_set, shadow = _completed_world(world)
     sets_before = {s["id"]: s for s in _sets(world.db)}
     shadow_before = ss.get(world.db, shadow)
-    reaction_n = world.db.execute(
-        "SELECT COUNT(*) FROM econ_reaction_values").fetchone()[0]
+    world.db.execute(
+        "INSERT INTO econ_reaction_values (set_id,window_min,status,range_pips,"
+        "close_change_pips,abs_close_change_pips,net_abs_close_change_pips,"
+        "rule_version,computed_at) VALUES (?,15,'resolved',1,1,1,0,1,?)",
+        (event_set, LATE.isoformat()))
+    world.db.execute(
+        "INSERT INTO econ_reaction_keys (event_id,currency,set_id,decided_at) "
+        "SELECT event_id,'USD',id,? FROM ohlcv_slice_sets WHERE id=?",
+        (LATE.isoformat(), event_set))
+    world.db.commit()
+    values_before = world.db.execute(
+        "SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall()
+    keys_before = world.db.execute(
+        "SELECT * FROM econ_reaction_keys ORDER BY 1,2").fetchall()
+    assert values_before and keys_before
     clock = _Clock(_retention_end(world.db, event_set) + timedelta(seconds=1))
     w = _worker(world, clock)
     report = w.run_cycle()
@@ -1893,7 +1906,9 @@ def test_a_cycle_deletes_only_the_rows_of_a_set_past_the_retention_days(world):
         assert after["expected_rows"] == before["expected_rows"]
     assert ss.get(world.db, shadow) == shadow_before
     assert world.db.execute(
-        "SELECT COUNT(*) FROM econ_reaction_values").fetchone()[0] == reaction_n
+        "SELECT * FROM econ_reaction_values ORDER BY 1,2").fetchall() == values_before
+    assert world.db.execute(
+        "SELECT * FROM econ_reaction_keys ORDER BY 1,2").fetchall() == keys_before
     assert w.run_cycle().purged == 0
 
 

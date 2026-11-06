@@ -2634,6 +2634,8 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
     if econ_still_busy:
         busy.add("conn_econ_read")
         busy.add("conn_econ_write")
+        # 残った worker は旧 App の DB に書ける。単一起動の所有権は離さない。
+        busy.add("instance_lock")
     if (scheduler_still_busy or supervisor_still_busy or improve_still_busy
             or report_still_busy):
         busy.add("conn_core")
@@ -2670,11 +2672,11 @@ def _busy_resources_after_join(scheduler_still_busy: bool,
 
 def _exit_code(app: App, scheduler_alive: bool,
                supervisor_alive: bool, improve_alive: bool = False,
-               report_alive: bool = False) -> int:
+               report_alive: bool = False, econ_alive: bool = False) -> int:
     if app.fatal_reason is not None:
         return 1
     return 1 if (scheduler_alive or supervisor_alive or improve_alive
-                 or report_alive) else 0
+                 or report_alive or econ_alive) else 0
 
 
 #: 起動時診断 thread の shutdown 時の join 上限。通常は即座に終わる。集合外で自己試験が
@@ -2891,12 +2893,22 @@ def run_service(root: Path, *, daemon: bool = False,
     wd.start()
     # 資金保護の scheduler と watchdog の後に起こす (worker の起動時補完は資金保護を
     # 待たせない)。起動時回復と schema の初期化は build_app で済んでいる。
-    econ_thread = threading.Thread(
-        target=_run_econ_slice_worker, args=(app, stop_event), daemon=True,
-        name="afx-econ-slices")
-    econ_thread.start()
+    econ_thread: threading.Thread | None = None
+    econ_still_busy = False
 
     try:
+        try:
+            econ_thread = threading.Thread(
+                target=_run_econ_slice_worker, args=(app, stop_event),
+                daemon=True, name="afx-econ-slices")
+            econ_thread.start()
+        except Exception as exc:  # noqa: BLE001 — worker を起こせなくてもサービスは続ける
+            started = econ_thread is not None and econ_thread.ident is not None
+            if not started:
+                econ_thread = None
+            _log.exception("econ slice worker could not start")
+            app.activity.write(Category.SYSTEM, "econ_slice_worker_start_failed",
+                               safe_error_text(exc))
         # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
         start_ops_api(app, root)
         if daemon:
@@ -2996,8 +3008,9 @@ def run_service(root: Path, *, daemon: bool = False,
         # 生じる。判定権威は th.join(30) + supervisor.join(...) — wd は
         # ここで待つだけで graceful/timeout の判定には関与しない。
         wd.join(timeout=15)
-        econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
-        econ_still_busy = econ_thread.is_alive()
+        if econ_thread is not None:
+            econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+            econ_still_busy = econ_thread.is_alive()
         # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
         # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、
@@ -3014,14 +3027,16 @@ def run_service(root: Path, *, daemon: bool = False,
             app.activity.write(Category.SYSTEM, "close_skipped_resources",
                                f"{skipped} (join timeout — used-in-flight)")
         if (th.is_alive() or app.supervisor.is_alive()
-                or app.improve_supervisor.is_alive() or report_still_busy):
+                or app.improve_supervisor.is_alive() or report_still_busy
+                or econ_still_busy):
             app.activity.write(Category.SYSTEM, "service_stopped",
                                "shutdown_timeout (Mission 継続中の可能性)")
         else:
             app.activity.write(Category.SYSTEM, "service_stopped", "graceful")
 
     if _exit_code(app, th.is_alive(), app.supervisor.is_alive(),
-                  app.improve_supervisor.is_alive(), report_still_busy):
+                  app.improve_supervisor.is_alive(), report_still_busy,
+                  econ_still_busy):
         print("警告: 停止タイムアウト。実行中の処理が残っている可能性があります。")
         return 1
     print("停止しました。")
