@@ -1937,7 +1937,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             quote_fn=lambda pair: executor.quote_fn(pair),
             pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
             assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
-            now_fn=clock.now)
+            now_fn=clock.now,
+            measure_fn=econ_signal_report.slice_related_bytes)
+        capacity_reader.attach_bytes_source(lambda: econ_worker.measurement)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,

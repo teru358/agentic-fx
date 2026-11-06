@@ -135,8 +135,108 @@ def _page(title: str, body: str) -> bytes:
 
 
 def render_status(data: Mapping[str, object]) -> bytes:
-    return _page("Status", _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS,
-                                  emphasis=_EMPHASIS))
+    body = _pairs(data, STATUS_FIELDS, nested_allowed=NESTED_FIELDS, emphasis=_EMPHASIS)
+    return _page("Status", body + _calendar_section(data) + _econ_section(data))
+
+
+# daemon 側 (agentic_fx.loops.econ_signal_report) の定義の写し。test が突き合わせる。
+ECON_ABANDON_REASONS = ("freshness_expired", "requeued_expired", "retry_exhausted",
+                        "source_inactive", "normalization_failed", "deploy_op",
+                        "deploy_linked")
+_CALENDAR_STATES = ("unknown", "fresh", "stale")
+_WORKER_STATES = ("alive", "stopped", "start_failed", "not_started", "unknown")
+_LEVELS = ("ok", "warn", "full")
+_MISSION_KEYS = ("system_filtered", "failed", "running")
+_CAPACITY_KEYS = ("signal_daily", "signal_producer", "signal_override", "rows",
+                  "row_capacity", "row_level", "slice_bytes", "slice_bytes_measured_at",
+                  "used_bytes", "byte_capacity", "byte_level", "base_bytes",
+                  "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes", "level")
+_ECON_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+
+
+def _word(value: object, allowed: Sequence[str]) -> str:
+    return html.escape(value, quote=True) if type(value) is str and value in allowed else "-"
+
+
+def _dict(value: object) -> dict:
+    return value if type(value) is dict else {}
+
+
+def _calendar_section(data: Mapping[str, object]) -> str:
+    if type(data.get("window")) is not dict:
+        return ""
+    window = data["window"]
+    state = _word(window.get("freshness"), _CALENDAR_STATES)
+    pairs = [("calendar", state if state != "-" else "unknown")]
+    if "in_window" in window:
+        pairs.append(("in_window", _text(window.get("in_window")) or "-"))
+    return "<section><h2>Economic calendar</h2>" + _rows(pairs) + "</section>"
+
+
+def _count_text(value: object) -> str:
+    return _num(value) if type(value) is int else "-"
+
+
+def _econ_section(data: Mapping[str, object]) -> str:
+    econ = data.get("econ_signal")
+    if type(econ) is not dict:
+        return ""
+    pairs: list[tuple[str, str]] = [("worker", _word(econ.get("slice_worker"), _WORKER_STATES))]
+    decisions = econ.get("decisions")
+    if type(decisions) is dict:
+        pairs.append(("decisions", _count_text(decisions.get("total"))))
+        by_kind = _dict(decisions.get("by_kind"))
+        for key in sorted(by_kind)[:MAX_ITEMS]:
+            if type(key) is str and _ECON_WORD.match(key):
+                pairs.append((f"decision {html.escape(key, quote=True)}", _count_text(by_kind[key])))
+    else:
+        pairs.append(("decisions", "unavailable"))
+    abandoned = econ.get("abandoned")
+    if type(abandoned) is dict:
+        total, day = _dict(abandoned.get("total")), _dict(abandoned.get("latest_day"))
+        for reason in ECON_ABANDON_REASONS:
+            pairs.append((f"abandoned {reason} (latest day / total)",
+                          f"{_count_text(day.get(reason))} / {_count_text(total.get(reason))}"))
+        cleanup = _dict(abandoned.get("cleanup"))
+        pairs.append(("abandoned ineligible_cleanup (latest day / total)",
+                      f"{_count_text(cleanup.get('latest_day'))} / {_count_text(cleanup.get('total'))}"))
+        pairs.append(("abandoned legacy_unknown (total)",
+                      _count_text(abandoned.get("legacy_unknown_total"))))
+    else:
+        pairs.append(("abandoned", "unavailable"))
+    missions = econ.get("missions_latest_day")
+    if type(missions) is dict:
+        for key in _MISSION_KEYS:
+            pairs.append((f"missions latest day {key}", _count_text(missions.get(key))
+                          + (" (filtered, not failed)" if key == "system_filtered" else "")))
+    shadow = econ.get("shadow")
+    if type(shadow) is list:
+        for row in shadow[:MAX_ITEMS]:
+            row = _dict(row)
+            label = "/".join(_text(row.get(k)) or "-" for k in
+                             ("decision", "actor", "reject_code", "state", "result_code"))
+            pairs.append((f"shadow {label}",
+                          f"n={_count_text(row.get('n'))} avg_pnl_pips={_num(row.get('avg_pnl_pips'))}"))
+    capacity = econ.get("slice_capacity")
+    if type(capacity) is dict:
+        for key in _CAPACITY_KEYS:
+            value = capacity.get(key)
+            if key.endswith("_level") or key == "level":
+                shown = _word(value, _LEVELS)
+            elif key == "slice_bytes_measured_at":
+                shown = _text(value) or "-"
+            else:
+                shown = _count_text(value)
+            if key == "slice_bytes" and value is None:
+                shown = "未測定"
+            pairs.append((f"slice {key}", shown))
+        below = capacity.get("capacity_override_below_producer")
+        pairs.append(("slice capacity_override_below_producer", _text(below) or "-"))
+        if capacity.get("level") in ("warn", "full"):
+            pairs.append(("slice capacity warning", _word(capacity.get("level"), _LEVELS)))
+    else:
+        pairs.append(("slice capacity", "unavailable"))
+    return "<section><h2>Economic signal</h2>" + _rows(pairs) + "</section>"
 
 
 def _detail_link(item: dict) -> str:

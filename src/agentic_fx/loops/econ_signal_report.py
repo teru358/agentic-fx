@@ -9,7 +9,6 @@ import logging
 import os
 import sqlite3
 import threading
-import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -119,10 +118,12 @@ def _free_bytes(path: Path) -> int | None:
 
 
 def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path | None,
-                    free_bytes: int | None = None, base_bytes: int | None = None) -> dict:
+                    free_bytes: int | None = None, base_bytes: int | None = None,
+                    slice_bytes_measured_at: datetime | None = None) -> dict:
     """容量の表示項目。`plan` は `ohlcv_slices.CapacityPlan`。
 
-    byte の比較値は B0 に、空 DDL からの slice 関連 bytes の増分だけを足したもの。"""
+    byte の比較値は B0 に、空 DDL からの slice 関連 bytes の増分だけを足したもの。
+    `slice_bytes` が None は未測定 (測る側がまだ測っていない)。"""
     level_rows = ohlcv_slices.capacity_level(rows, plan.rows)
     used_bytes = None
     level_bytes = None
@@ -140,6 +141,8 @@ def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path |
         "capacity_override_below_producer": plan.signals.below_producer,
         "rows": rows, "row_capacity": plan.rows, "row_level": level_rows,
         "slice_bytes": slice_bytes, "used_bytes": used_bytes,
+        "slice_bytes_measured_at": (None if slice_bytes_measured_at is None
+                                    else slice_bytes_measured_at.isoformat()),
         "byte_capacity": plan.bytes, "byte_level": level_bytes,
         "base_bytes": ohlcv_slices.SLICE_BASE_BYTES,
         "bytes_per_row": ohlcv_slices.SLICE_BYTES_PER_ROW,
@@ -150,40 +153,52 @@ def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path |
     }
 
 
+def stored_slice_rows(conn: sqlite3.Connection) -> int:
+    """purge していない set が持つ slice 行数。
+
+    complete の set は `expected_rows` の合計 (set の表は小さく、slice 行の全走査を
+    しない)、それ以外 (staging など) は今ある行数。"""
+    complete = conn.execute(
+        "SELECT COALESCE(SUM(expected_rows), 0) FROM ohlcv_slice_sets "
+        "WHERE purged_at IS NULL AND state = 'complete'").fetchone()[0]
+    partial = conn.execute(
+        "SELECT COUNT(*) FROM ohlcv_slices WHERE set_id IN "
+        "(SELECT id FROM ohlcv_slice_sets WHERE purged_at IS NULL "
+        "AND state != 'complete')").fetchone()[0]
+    return int(complete) + int(partial)
+
+
 class CapacityReader:
-    """容量の表示値の読み手。行数と slice 関連 bytes は表の全域を数えるので、
-    `ttl_sec` の間は直前の値を返す (status の呼出しごとに全走査しない)。"""
+    """容量の表示値の読み手。行数は set の表から出す。slice 関連 bytes は表の全域を
+    読む重い集計なので status の要求では測らず、`bytes_source` (slice worker が定期に
+    測って保持した値と時刻) を読むだけにする。"""
 
     def __init__(self, plan_fn: Callable[[], object], db_path: Path, *,
-                 ttl_sec: float = 300.0,
-                 monotonic: Callable[[], float] = time.monotonic) -> None:
+                 bytes_source: Callable[[], tuple[object, datetime] | None]
+                 | None = None) -> None:
         self._plan_fn = plan_fn
         self._db_path = Path(db_path)
-        self._ttl = ttl_sec
-        self._monotonic = monotonic
-        self._lock = threading.Lock()
-        self._cached: tuple[float, int, int | None] | None = None
+        self._bytes_source = bytes_source
 
-    def _measure(self, conn: sqlite3.Connection) -> tuple[int, int | None]:
-        with self._lock:
-            now = self._monotonic()
-            if self._cached is not None and now - self._cached[0] < self._ttl:
-                return self._cached[1], self._cached[2]
-        rows = ohlcv_slices.slice_row_count(conn)
-        try:
-            size: int | None = slice_related_bytes(conn)
-        except sqlite3.Error as exc:
-            _log.warning("slice bytes unavailable: %s", safe_error_text(exc))
-            size = None
-        with self._lock:
-            self._cached = (self._monotonic(), rows, size)
-        return rows, size
+    def attach_bytes_source(
+            self, source: Callable[[], tuple[object, datetime] | None]) -> None:
+        self._bytes_source = source
+
+    def _measured(self) -> tuple[int | None, datetime | None]:
+        measured = None if self._bytes_source is None else self._bytes_source()
+        if measured is None:
+            return None, None
+        value, at = measured
+        if type(value) is not int:
+            return None, None
+        return value, at
 
     def status(self, conn: sqlite3.Connection) -> dict:
         plan = self._plan_fn()
-        rows, size = self._measure(conn)
-        return capacity_status(plan, rows=rows, slice_bytes=size,
-                               db_path=self._db_path)
+        size, at = self._measured()
+        return capacity_status(plan, rows=stored_slice_rows(conn),
+                               slice_bytes=size, db_path=self._db_path,
+                               slice_bytes_measured_at=at)
 
 
 # --- abandoned と mission の終端 -------------------------------------------
@@ -268,6 +283,7 @@ def econ_signal_status(conn: sqlite3.Connection, *, now: datetime,
     section("decisions", lambda: decision_status(conn, since=_EPOCH, until=until))
     section("missions_latest_day",
             lambda: mission_status_counts(conn, since=day_start, until=until))
+    section("shadow", lambda: shadow_status(conn))
     section("slice_capacity",
             lambda: None if capacity is None else capacity.status(conn))
     out["slice_worker"] = "unknown" if worker is None else worker.state()
@@ -290,34 +306,48 @@ def format_econ_lines(econ: dict | None) -> list[str]:
                               if "slice_worker" in econ else "")]
     dec = econ.get("decisions")
     lines.append("  decisions: " + ("unavailable" if dec is None else
-                 f"{dec['total']} " + ", ".join(
+                 f"{_fmt(dec['total'])} " + ", ".join(
                      f"{k}={v}" for k, v in sorted(dec["by_kind"].items()))).rstrip())
     ab = econ.get("abandoned")
     if ab is None:
         lines.append("  abandoned: unavailable")
     else:
-        parts = [f"{r}={ab['latest_day'][r]}/{ab['total'][r]}"
-                 for r in ABANDON_REASONS if ab["total"][r] or ab["latest_day"][r]]
+        day, total = ab.get("latest_day") or {}, ab.get("total") or {}
+        parts = [f"{r}={_fmt(day.get(r))}/{_fmt(total.get(r))}"
+                 for r in ABANDON_REASONS if total.get(r) or day.get(r)]
         lines.append("  abandoned (latest day/total): "
                      + (", ".join(parts) if parts else "none"))
-        lines.append(f"  cleanup={ab['cleanup']['latest_day']}/{ab['cleanup']['total']} "
-                     f"legacy_unknown={ab['legacy_unknown_total']}")
+        cleanup = ab.get("cleanup") or {}
+        lines.append(f"  cleanup={_fmt(cleanup.get('latest_day'))}/{_fmt(cleanup.get('total'))} "
+                     f"legacy_unknown={_fmt(ab.get('legacy_unknown_total'))}")
     miss = econ.get("missions_latest_day")
     if miss is not None:
-        lines.append(f"  missions (latest day): system_filtered={miss['system_filtered']} "
-                     f"failed={miss['failed']} running={miss['running']}")
+        lines.append(f"  missions (latest day): "
+                     f"system_filtered={_fmt(miss.get('system_filtered'))} "
+                     f"failed={_fmt(miss.get('failed'))} running={_fmt(miss.get('running'))}")
+    shadow = econ.get("shadow")
+    if shadow is not None:
+        lines.append("  shadow: " + (", ".join(
+            f"{_shadow_label(row)}={row['n']}" for row in shadow) or "none"))
     cap = econ.get("slice_capacity")
     if "slice_capacity" not in econ:
         pass
     elif cap is None:
         lines.append("  slice capacity: unavailable")
     else:
+        unmeasured = cap.get("slice_bytes") is None
         lines.append(
             f"  slice capacity: rows {cap['rows']}/{cap['row_capacity']} "
-            f"({cap['row_level']}) bytes {_fmt(cap['used_bytes'])}/{cap['byte_capacity']} "
-            f"({_fmt(cap['byte_level'])}) S={cap['signal_daily']} "
+            f"({cap['row_level']}) bytes "
+            + ("未測定" if unmeasured else
+               f"{_fmt(cap['used_bytes'])}/{cap['byte_capacity']} ({_fmt(cap['byte_level'])})")
+            + f" S={cap['signal_daily']} (producer={_fmt(cap.get('signal_producer'))} "
+            f"override={_fmt(cap.get('signal_override'))}) "
             f"B0={cap['base_bytes']} beta={cap['bytes_per_row']} db={_fmt(cap['db_bytes'])} "
             f"wal={_fmt(cap['wal_bytes'])} free={_fmt(cap['free_bytes'])}")
+        if not unmeasured:
+            lines.append(f"  slice bytes: {cap['slice_bytes']} "
+                         f"(measured_at={_fmt(cap.get('slice_bytes_measured_at'))})")
         if cap["capacity_override_below_producer"]:
             lines.append("  warning: capacity_override_below_producer")
         if cap["level"] != "ok":
@@ -326,6 +356,11 @@ def format_econ_lines(econ: dict | None) -> list[str]:
 
 
 # --- 日次 report -----------------------------------------------------------
+
+def _shadow_label(row: dict) -> str:
+    return (f"{row['decision']}/{row['actor']}/{_fmt(row['reject_code'])}"
+            f":{row['state']}/{_fmt(row['result_code'])}")
+
 
 def _fmt(value) -> str:
     return "-" if value is None else str(value)
@@ -379,7 +414,7 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
     else:
         for key in ("signal_daily", "signal_producer", "signal_override",
                     "capacity_override_below_producer", "rows", "row_capacity",
-                    "row_level", "slice_bytes", "used_bytes", "byte_capacity",
+                    "row_level", "slice_bytes", "slice_bytes_measured_at", "used_bytes", "byte_capacity",
                     "byte_level", "base_bytes", "bytes_per_row", "db_bytes",
                     "wal_bytes", "free_bytes", "level"):
             lines.append(f"- {key}: {_fmt(cap.get(key))}")
@@ -396,11 +431,6 @@ def collect_report_facts(conn: sqlite3.Connection, *, now: datetime,
                          admission_status: Callable[[sqlite3.Connection, datetime], dict]
                          | None = None) -> dict:
     facts = econ_signal_status(conn, now=now, capacity=capacity, worker=worker)
-    try:
-        facts["shadow"] = shadow_status(conn)
-    except Exception as exc:  # noqa: BLE001
-        _log.warning("econ signal report shadow unavailable: %s", safe_error_text(exc))
-        facts["shadow"] = None
     if admission_status is not None:
         try:
             snap = admission_status(conn, now)

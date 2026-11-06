@@ -48,6 +48,8 @@ _LIMIT_WINDOW = timedelta(hours=4)
 _BUSY_BACKOFF_SEC = (0.01, 0.02, 0.04)
 _BUSY_BACKOFF_STEADY_SEC = 0.05
 OWNER_MEMO_MAX = 64
+#: 注入された測定 (表の全域を読む重い集計) を回す間隔。cycle の DB 予算の外で行う。
+MEASURE_INTERVAL_SEC = 600.0
 LIMIT_MEMO_MAX = 256
 
 
@@ -171,7 +173,9 @@ class EconSliceWorker:
                  monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
                  on_complete: Callable[[dict], None] | None = None,
-                 interval_sec: float = CYCLE_INTERVAL_SEC) -> None:
+                 interval_sec: float = CYCLE_INTERVAL_SEC,
+                 measure_fn: Callable[[sqlite3.Connection], object] | None = None,
+                 measure_interval_sec: float = MEASURE_INTERVAL_SEC) -> None:
         self._read = read_conn
         self._write_conn = write_conn
         self._core_lock = core_lock
@@ -184,6 +188,10 @@ class EconSliceWorker:
         self._sleep = sleep
         self._on_complete = on_complete
         self._interval = interval_sec
+        self._measure_fn = measure_fn
+        self._measure_interval = measure_interval_sec
+        self._measure_due: float | None = None
+        self._measurement: tuple[object, datetime] | None = None
         self._generation: int | None = None
         self._commit_seconds: deque[float] = deque(maxlen=256)
         self._spent = 0.0
@@ -210,6 +218,11 @@ class EconSliceWorker:
     def commit_seconds(self) -> tuple[float, ...]:
         """直近の COMMIT 所要 (観測値)。"""
         return tuple(self._commit_seconds)
+
+    @property
+    def measurement(self) -> tuple[object, datetime] | None:
+        """直近の測定値と測った時刻。まだ測っていなければ `None`。"""
+        return self._measurement
 
     # --- 起動と loop ----------------------------------------------------------
 
@@ -286,7 +299,29 @@ class EconSliceWorker:
         self._report.yielded = self._abort and not self._exhausted()
         self._report.budget_exhausted = self._exhausted()
         self._report.spent_sec = self._spent
+        self._measure_if_due(stop)
         return self._report
+
+    def _measure_if_due(self, stop: threading.Event | None) -> None:
+        """注入された測定を `measure_interval_sec` に 1 回、自分の読取接続で行う。
+
+        read-only で WAL の writer を止めない。cycle の DB 予算には数えず、失敗は
+        記録して次の間隔まで再試行しない (直前の測定値は残す)。"""
+        if self._measure_fn is None or (stop is not None and stop.is_set()):
+            return
+        now = self._monotonic()
+        if self._measure_due is not None and now < self._measure_due:
+            return
+        self._measure_due = now + self._measure_interval
+        try:
+            value = self._measure_fn(self._read)
+        except Exception:
+            _log.exception("econ slice worker measurement failed")
+            return
+        finally:
+            if self._read.in_transaction:
+                self._read.rollback()
+        self._measurement = (value, self._now())
 
     def _exhausted(self) -> bool:
         return (self._bounded and not self._reserved

@@ -167,23 +167,113 @@ def test_content_hash_update_extra_signals_count_toward_the_warning_ratio():
     assert after["row_level"] == "warn"
 
 
-def test_capacity_reader_measures_real_tables_and_caches(tmp_path, monkeypatch):
+_EVENT_SEQ = [0]
+
+
+def _event_set(conn, state, *, expected, purged=False):
+    """event set 1 本 (event を 1 件足して結ぶ)。staging は世代を持つ。"""
+    _EVENT_SEQ[0] += 1
+    event_id = conn.execute(
+        "INSERT INTO econ_events (ts,country,name,importance) VALUES (?,?,?,3)",
+        (NOW.isoformat(), "US", f"e{_EVENT_SEQ[0]}")).lastrowid
+    generation = None
+    if state == "staging":
+        generation = conn.execute(
+            "INSERT INTO ohlcv_slice_generations (started_at) VALUES (?)",
+            (NOW.isoformat(),)).lastrowid
+    done = None if state in ("awaiting", "staging") else NOW.isoformat()
+    return conn.execute(
+        "INSERT INTO ohlcv_slice_sets (event_id,pair,range_start,range_end,"
+        "expected_rows,state,generation,created_at,completed_at,purged_at,rule_version) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,1)",
+        (event_id, "USDJPY", "2026-10-30T12:00:00+00:00", "2026-10-30T13:00:00+00:00",
+         expected, state, generation, NOW.isoformat(), done,
+         NOW.isoformat() if purged else None)).lastrowid
+
+
+def test_capacity_reader_counts_rows_from_the_set_table(tmp_path):
     conn = _conn(tmp_path)
-    clock = [0.0]
-    counts = iter([5, 7, 9])
+    _event_set(conn, "complete", expected=7)
+    _event_set(conn, "complete", expected=5)
+    _event_set(conn, "complete", expected=100, purged=True)
+    _event_set(conn, "awaiting", expected=50)
+    staging = _event_set(conn, "staging", expected=60)
+    for minute in range(3):
+        conn.execute(
+            "INSERT INTO ohlcv_slices (set_id,bar_time,open,high,low,close,volume,"
+            "source,quality) VALUES (?,?,1,1,1,1,0,'s','observed')",
+            (staging, f"2026-10-30T12:0{minute}:00+00:00"))
+    conn.commit()
+    assert esr.stored_slice_rows(conn) == 7 + 5 + 3
+    reader = esr.CapacityReader(lambda: _Plan(1000, 10**9), tmp_path / "d.db")
+    assert reader.status(conn)["rows"] == 15
+
+
+def test_complete_set_row_count_equals_its_expected_rows(tmp_path):
+    conn = _conn(tmp_path)
+    set_id = _event_set(conn, "staging", expected=4)
+    for minute in range(4):
+        conn.execute(
+            "INSERT INTO ohlcv_slices (set_id,bar_time,open,high,low,close,volume,"
+            "source,quality) VALUES (?,?,1,1,1,1,0,'s','observed')",
+            (set_id, f"2026-10-30T12:0{minute}:00+00:00"))
+    conn.commit()
+    staged = esr.stored_slice_rows(conn)
+    conn.execute("UPDATE ohlcv_slice_sets SET state='complete', generation=NULL, "
+                 "completed_at=? WHERE id=?", (NOW.isoformat(), set_id))
+    conn.commit()
+    assert staged == esr.stored_slice_rows(conn) == 4
+
+
+def test_capacity_reader_does_not_scan_slice_rows_or_dbstat(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    _event_set(conn, "complete", expected=3)
+    statements = []
+    conn.set_trace_callback(statements.append)
     calls = []
-    monkeypatch.setattr(ohlcv_slices, "slice_row_count",
-                        lambda c: calls.append(1) or next(counts))
+    monkeypatch.setattr(esr, "slice_related_bytes",
+                        lambda c: calls.append(1) or 1)
+    reader = esr.CapacityReader(lambda: _Plan(1000, 10**9), tmp_path / "d.db")
+    for _ in range(3):
+        out = reader.status(conn)
+    assert calls == []
+    assert not any("dbstat" in text.lower() for text in statements)
+    assert not any("COUNT(*) FROM ohlcv_slices" in text and "WHERE" not in text
+                   for text in statements)
+    assert out["slice_bytes"] is None and out["slice_bytes_measured_at"] is None
+
+
+def test_capacity_reader_shows_the_workers_measurement_and_its_time(tmp_path):
+    conn = _conn(tmp_path)
+    held = []
     reader = esr.CapacityReader(lambda: _Plan(1000, 10**9), tmp_path / "d.db",
-                                ttl_sec=60, monotonic=lambda: clock[0])
-    first = reader.status(conn)
-    assert first["rows"] == 5
-    assert first["slice_bytes"] == esr.slice_related_bytes(conn) > 0
-    clock[0] = 10
-    assert reader.status(conn)["rows"] == 5
-    assert len(calls) == 1
-    clock[0] = 100
-    assert reader.status(conn)["rows"] == 7
+                                bytes_source=lambda: held[-1] if held else None)
+    assert reader.status(conn)["slice_bytes"] is None
+    held.append((12_345, NOW))
+    out = reader.status(conn)
+    assert out["slice_bytes"] == 12_345
+    assert out["slice_bytes_measured_at"] == NOW.isoformat()
+    assert out["used_bytes"] >= ohlcv_slices.SLICE_BASE_BYTES
+    held.append(("junk", NOW))
+    assert reader.status(conn)["slice_bytes"] is None
+
+
+def test_format_econ_lines_says_unmeasured_bytes_and_shows_shadow():
+    econ = {"slice_worker": "alive", "decisions": None, "abandoned": None,
+            "shadow": [{"decision": "accept", "actor": "system", "reject_code": None,
+                        "state": "resolved", "result_code": "tp", "n": 3,
+                        "avg_pnl_pips": 1.5}],
+            "slice_capacity": {
+                "rows": 1, "row_capacity": 10, "row_level": "ok", "slice_bytes": None,
+                "slice_bytes_measured_at": None, "used_bytes": None,
+                "byte_capacity": 100, "byte_level": None, "signal_daily": 96,
+                "signal_producer": 96, "signal_override": None, "base_bytes": 5,
+                "bytes_per_row": 6, "db_bytes": 7, "wal_bytes": 8, "free_bytes": 9,
+                "level": "ok", "capacity_override_below_producer": False}}
+    text = "\n".join(esr.format_econ_lines(econ))
+    assert "bytes 未測定" in text
+    assert "S=96 (producer=96 override=-)" in text
+    assert "shadow: accept/system/-:resolved/tp=3" in text
 
 
 @pytest.mark.parametrize("setup,expected", [

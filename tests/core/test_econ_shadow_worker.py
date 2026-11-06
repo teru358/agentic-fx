@@ -490,13 +490,13 @@ def _unavailable(pair):
 
 def _worker(world, clock, *, rw=None, quote_fn=_unavailable, admission=None,
             lock=None, cls=EconSliceWorker, sleep=None, monotonic=None,
-            on_complete=None, start=True):
+            on_complete=None, start=True, **extra):
     read, write = rw or world.pair()
     w = cls(read_conn=read, write_conn=write, core_lock=lock or threading.RLock(),
             admission=admission or WriterAdmission(), quote_fn=quote_fn,
             pip_size_fn=lambda pair: 0.01, assumed_spread_pips_fn=lambda pair: 1.5,
             now_fn=clock, monotonic=monotonic or (lambda: 0.0),
-            sleep=sleep or (lambda seconds: None), on_complete=on_complete)
+            sleep=sleep or (lambda seconds: None), on_complete=on_complete, **extra)
     if start:
         assert w.start()
     return w
@@ -724,6 +724,77 @@ def test_recorded_commit_times_are_kept(world):
     w.run_cycle()
     assert len(w.commit_seconds) > 1
     assert all(seconds >= 0 for seconds in w.commit_seconds)
+
+
+def test_worker_measures_on_its_own_read_connection_every_ten_minutes(world):
+    clock = _Clock(LATE)
+    rw = world.pair()
+    calls = []
+
+    def measure(conn):
+        calls.append(conn)
+        return len(calls) * 100
+
+    w = _worker(world, clock, rw=rw, monotonic=clock.monotonic, measure_fn=measure)
+    assert w.measurement is None
+    w.run_cycle()
+    assert calls == [rw[0]] and w.measurement == (100, LATE)
+    clock.t = 599.0
+    w.run_cycle()
+    assert len(calls) == 1
+    clock.t = 600.0
+    clock.now = LATE + timedelta(seconds=600)
+    w.run_cycle()
+    assert len(calls) == 2 and w.measurement == (200, clock.now)
+
+
+def test_a_failing_measurement_keeps_the_last_value_and_waits_for_the_next_interval(world):
+    clock = _Clock(LATE)
+    outcomes = [5, RuntimeError("busy"), 7]
+    calls = []
+
+    def measure(conn):
+        calls.append(1)
+        value = outcomes[len(calls) - 1]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    w = _worker(world, clock, monotonic=clock.monotonic, measure_fn=measure)
+    w.run_cycle()
+    clock.t = 600.0
+    w.run_cycle()
+    assert w.measurement == (5, LATE)
+    clock.t = 601.0
+    w.run_cycle()
+    assert len(calls) == 2
+    clock.t = 1200.0
+    w.run_cycle()
+    assert w.measurement[0] == 7
+
+
+def test_measurement_is_outside_the_cycle_budget_and_skipped_when_stopping(world):
+    clock = _Clock(LATE)
+    calls = []
+
+    def slow(conn):
+        clock.t += 100.0
+        calls.append(1)
+        return 1
+
+    w = _worker(world, clock, monotonic=clock.monotonic, measure_fn=slow)
+    stop = threading.Event()
+    stop.set()
+    w.run_cycle(stop)
+    assert calls == []
+    report = w.run_cycle()
+    assert calls == [1] and report.budget_exhausted is False
+
+
+def test_without_a_measure_hook_there_is_no_measurement(world):
+    w = _worker(world, _Clock(LATE))
+    w.run_cycle()
+    assert w.measurement is None
 
 
 # --- 発表前 spread と event の退避 --------------------------------------------------

@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.loops.econ_signal_report import ABANDON_REASONS, KNOWN_MISSION_TERMINALS
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.policy_projection import (POLICY_TEXT_LIMIT, MigrationRecordUnknown, insert_policy,
                                           inspect_policy_file, reconcile_policy_file,
@@ -265,6 +267,95 @@ class _PatientConnection:
 
 
 IMPROVE_OUTBOX_WINDOW = timedelta(days=7)
+
+
+_ECON_WORKER_STATES = frozenset({"alive", "stopped", "start_failed", "not_started", "unknown"})
+_ECON_LEVELS = frozenset({"ok", "warn", "full"})
+_ECON_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
+_ECON_CAPACITY_INTS = ("signal_daily", "signal_producer", "signal_override", "rows",
+                       "row_capacity", "slice_bytes", "used_bytes", "byte_capacity",
+                       "base_bytes", "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes")
+_ECON_SHADOW_WORDS = ("decision", "actor", "reject_code", "state", "result_code")
+
+
+def _econ_int(value: object) -> int | None:
+    return value if type(value) is int else None
+
+
+def _econ_word(value: object) -> str | None:
+    return value if type(value) is str and _ECON_WORD.match(value) else None
+
+
+def _econ_counts(value: object, keys: tuple[str, ...]) -> dict | None:
+    if type(value) is not dict:
+        return None
+    return {key: _econ_int(value.get(key)) for key in keys}
+
+
+def _econ_abandoned(raw: object) -> dict | None:
+    if type(raw) is not dict:
+        return None
+    cleanup = raw.get("cleanup") if type(raw.get("cleanup")) is dict else {}
+    start = raw.get("latest_day_start")
+    return {"total": _econ_counts(raw.get("total"), ABANDON_REASONS),
+            "latest_day": _econ_counts(raw.get("latest_day"), ABANDON_REASONS),
+            "latest_day_start": start if type(start) is str and len(start) <= 40 else None,
+            "cleanup": {"total": _econ_int(cleanup.get("total")),
+                        "latest_day": _econ_int(cleanup.get("latest_day"))},
+            "legacy_unknown_total": _econ_int(raw.get("legacy_unknown_total"))}
+
+
+def _econ_decisions(raw: object) -> dict | None:
+    if type(raw) is not dict or type(raw.get("by_kind")) is not dict:
+        return None
+    by_kind = {key: value for key, value in raw["by_kind"].items()
+               if _econ_word(key) is not None and type(value) is int}
+    return {"total": _econ_int(raw.get("total")), "by_kind": by_kind}
+
+
+def _econ_shadow(raw: object) -> list | None:
+    if type(raw) is not list:
+        return None
+    rows = []
+    for row in raw[:64]:
+        if type(row) is not dict:
+            continue
+        item = {key: _econ_word(row.get(key)) for key in _ECON_SHADOW_WORDS}
+        item["n"] = _econ_int(row.get("n"))
+        avg = row.get("avg_pnl_pips")
+        item["avg_pnl_pips"] = avg if type(avg) in (int, float) and math.isfinite(avg) else None
+        rows.append(item)
+    return rows
+
+
+def _econ_capacity(raw: object) -> dict | None:
+    if type(raw) is not dict:
+        return None
+    out = {key: _econ_int(raw.get(key)) for key in _ECON_CAPACITY_INTS}
+    for key in ("row_level", "byte_level", "level"):
+        out[key] = raw.get(key) if raw.get(key) in _ECON_LEVELS else None
+    below = raw.get("capacity_override_below_producer")
+    out["capacity_override_below_producer"] = below if type(below) is bool else None
+    at = raw.get("slice_bytes_measured_at")
+    out["slice_bytes_measured_at"] = at if type(at) is str and len(at) <= 40 else None
+    return out
+
+
+def econ_signal_view(raw: object) -> dict | None:
+    """status に載せる econ_signal の許可投影。数値・固定語・短い識別子だけを通す。"""
+    if type(raw) is not dict:
+        return None
+    missions = raw.get("missions_latest_day")
+    state = raw.get("slice_worker")
+    return {
+        "slice_worker": state if state in _ECON_WORKER_STATES else "unknown",
+        "decisions": _econ_decisions(raw.get("decisions")),
+        "abandoned": _econ_abandoned(raw.get("abandoned")),
+        "missions_latest_day": _econ_counts(
+            missions, (*KNOWN_MISSION_TERMINALS, "running", "other")),
+        "shadow": _econ_shadow(raw.get("shadow")),
+        "slice_capacity": _econ_capacity(raw.get("slice_capacity")),
+    }
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -695,6 +786,12 @@ class OpsService:
         _authorize(principal, "status")
         deadline = self._deadline(deadline)
         data = dict(self._status_provider() if self._status_provider is not None else {})
+        if "econ_signal" in data:
+            view = econ_signal_view(data["econ_signal"])
+            if view is None:
+                del data["econ_signal"]
+            else:
+                data["econ_signal"] = view
         if self._state_store is not None:
             try:
                 state = self._state_store.load(deadline=self._foreign(deadline), stop_event=self.stop_event)

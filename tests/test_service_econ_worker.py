@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from agentic_fx.core.contracts import FixedClock
+from agentic_fx.ops.contracts import ShellCaller
 from agentic_fx.core.econ_slice_worker import EconSliceWorker
 from agentic_fx.runners.fake_runner import FakeRunner
 from agentic_fx.store.instance_lock import (
@@ -290,6 +291,23 @@ def test_status_shows_econ_signal_capacity_and_a_worker_not_started_yet(tmp_path
         assert cap["row_capacity"] > 0 and cap["byte_capacity"] > cap["row_capacity"]
         assert cap["free_bytes"] > 0 and cap["db_bytes"] > 0
         assert set(econ["abandoned"]["total"]) >= {"freshness_expired", "deploy_linked"}
+    finally:
+        app.close()
+
+
+def test_status_reads_the_workers_bytes_measurement_and_never_measures_itself(tmp_path):
+    app = _build(tmp_path)
+    try:
+        before = app.ops._status_provider()["econ_signal"]["slice_capacity"]
+        assert before["slice_bytes"] is None
+        assert before["slice_bytes_measured_at"] is None
+        stamp = datetime(2026, 11, 6, 1, 2, 3, tzinfo=timezone.utc)
+        app.econ_worker._measurement = (4321, stamp)
+        with patch("agentic_fx.loops.econ_signal_report.slice_related_bytes") as probe:
+            after = app.ops.status(ShellCaller.SHELL)["econ_signal"]["slice_capacity"]
+        assert probe.call_count == 0
+        assert after["slice_bytes"] == 4321
+        assert after["slice_bytes_measured_at"] == stamp.isoformat()
     finally:
         app.close()
 
