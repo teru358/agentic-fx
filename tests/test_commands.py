@@ -1850,3 +1850,53 @@ def test_killswitch_reset_accepts_any_non_negative_generation_and_compares_it(tm
     assert not out.startswith("usage:")
     assert "更新された" in out
     assert state.load().kill_switch_latched is True
+
+
+# --- signal 採否の既存 reader ---
+
+_ECON = {"slice_worker": "alive", "decisions": {"total": 3, "by_kind": {"accept": 3}},
+         "abandoned": {"total": {r: 0 for r in (
+             "freshness_expired", "requeued_expired", "retry_exhausted",
+             "source_inactive", "normalization_failed", "deploy_op", "deploy_linked")}
+             | {"retry_exhausted": 4},
+             "latest_day": {r: 0 for r in (
+                 "freshness_expired", "requeued_expired", "retry_exhausted",
+                 "source_inactive", "normalization_failed", "deploy_op",
+                 "deploy_linked")} | {"retry_exhausted": 1},
+             "latest_day_start": "x", "cleanup": {"total": 2, "latest_day": 0},
+             "legacy_unknown_total": 5},
+         "missions_latest_day": {"system_filtered": 2, "failed": 0, "running": 0},
+         "slice_capacity": {"rows": 80, "row_capacity": 100, "row_level": "warn",
+                            "used_bytes": 1, "byte_capacity": 10, "byte_level": "ok",
+                            "signal_daily": 96, "base_bytes": 5, "bytes_per_row": 6,
+                            "db_bytes": 7, "wal_bytes": 8, "free_bytes": 9,
+                            "level": "warn", "capacity_override_below_producer": False}}
+
+
+def test_status_shows_system_filtered_as_a_known_terminal(tmp_path):
+    conn, _, _, cmds = _commands(tmp_path)
+    conn.execute("INSERT INTO missions (loop,runner,model,status,started_at) "
+                 "VALUES ('trade','local','m','system_filtered',?)", (NOW.isoformat(),))
+    conn.commit()
+    out = cmds.dispatch("status")
+    assert "trade:system_filtered (filtered, not failed)" in out
+
+
+def test_status_adds_econ_signal_lines_from_the_ops_status(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    cmds.ops_service = MagicMock()
+    cmds.ops_service.status.return_value = {"econ_signal": _ECON}
+    out = cmds.dispatch("status")
+    assert "econ signal: worker=alive" in out
+    assert "retry_exhausted=1/4" in out
+    assert "cleanup=0/2 legacy_unknown=5" in out
+    assert "system_filtered=2 failed=0 running=0" in out
+    assert "rows 80/100 (warn)" in out
+    assert "warning: slice capacity warn" in out
+
+
+def test_status_survives_an_ops_status_that_has_no_econ_section(tmp_path):
+    _, _, _, cmds = _commands(tmp_path)
+    cmds.ops_service = MagicMock()
+    cmds.ops_service.status.side_effect = RuntimeError("busy")
+    assert "econ signal" not in cmds.dispatch("status")

@@ -278,3 +278,64 @@ def test_the_real_worker_runs_cycles_and_then_stops_on_the_stop_event(tmp_path):
     assert _alive() == []
     with pytest.raises(sqlite3.ProgrammingError):
         app.conn_econ_write.execute("SELECT 1")
+
+
+def test_status_shows_econ_signal_capacity_and_a_worker_not_started_yet(tmp_path):
+    app = _build(tmp_path)
+    try:
+        econ = app.ops._status_provider()["econ_signal"]
+        assert econ["slice_worker"] == "not_started"
+        cap = econ["slice_capacity"]
+        assert cap["rows"] == 0 and cap["row_level"] == "ok"
+        assert cap["row_capacity"] > 0 and cap["byte_capacity"] > cap["row_capacity"]
+        assert cap["free_bytes"] > 0 and cap["db_bytes"] > 0
+        assert set(econ["abandoned"]["total"]) >= {"freshness_expired", "deploy_linked"}
+    finally:
+        app.close()
+
+
+def test_status_follows_the_worker_thread_from_alive_to_stopped(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    seen = []
+
+    def watch(stop):
+        seen.append(app.ops._status_provider()["econ_signal"]["slice_worker"])
+        stop_event.set()
+
+    app.econ_worker = _FakeWorker(watch)
+    assert _serve(tmp_path, app, stop_event) == 0
+    assert seen == ["alive"]
+    assert app.econ_health.state() == "stopped"
+
+
+def test_status_shows_a_worker_that_could_not_start(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    stop_event.set()
+    original_start = threading.Thread.start
+
+    def start(self):
+        if self.name == THREAD:
+            raise RuntimeError("can't start new thread")
+        return original_start(self)
+
+    with patch.object(threading.Thread, "start", start), \
+         patch("agentic_fx.service._log"):
+        assert _serve(tmp_path, app, stop_event) == 0
+    assert app.econ_health.state() == "start_failed"
+
+
+def test_build_app_registers_the_parent_only_daily_report(tmp_path):
+    app = _build(tmp_path)
+    try:
+        callback = app.scheduler._daily_report
+        assert callback is not None
+        close_at = datetime(2026, 7, 21, 21, 0, tzinfo=timezone.utc)
+        callback(close_at)
+        callback(close_at)
+        reports = tmp_path / "data" / "improve_reports" / "econ_signal"
+        assert [p.name for p in reports.iterdir()] == ["econ-signal-2026-07-21.md"]
+        assert "## slice capacity" in (reports / "econ-signal-2026-07-21.md").read_text()
+    finally:
+        app.close()

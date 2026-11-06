@@ -25,6 +25,7 @@ from agentic_fx.store import (approvals, backlog, candidate_archives,
 from agentic_fx.store.approvals import AlreadyDecidedError, ApprovalNotFoundError
 from agentic_fx.store.state import (
     GenerationMismatch, NotLatched, ResetNotApplied, StateStore, StateUncertain)
+from agentic_fx.loops import econ_signal_report
 from agentic_fx.ops.contracts import ErrorCode, OpsError, ShellCaller
 from agentic_fx.policy_projection import (
     POLICY_TEXT_LIMIT, MigrationRecordUnknown, ProjectionReconcileBlocked, insert_policy,
@@ -597,7 +598,8 @@ class Commands:
         active = orders.list_by_status(self.conn, "open", "pending_fill",
                                        "protection_pending")
         recent = missions.recent(self.conn, 1)
-        last = (f"{recent[0]['loop']}:{recent[0]['status']} "
+        last = (f"{recent[0]['loop']}:"
+                f"{econ_signal_report.display_mission_status(recent[0]['status'])} "
                 f"({recent[0]['started_at']})") if recent else "なし"
         ks = ("LATCHED" + (f" gen={s.kill_switch_generation}"
                            f" since={s.kill_switch_latched_at}")
@@ -616,7 +618,20 @@ class Commands:
             result += f"\nhealth: LATCHED ({reasons})"
         if self.outage is not None:
             result += "\n" + self._data_state_line()
+        result += self._econ_signal_lines()
         return result
+
+    def _econ_signal_lines(self) -> str:
+        """signal 採否・abandoned・slice 容量・worker の行。取れなければ何も足さない。"""
+        if self.ops_service is None:
+            return ""
+        try:
+            econ = self.ops_service.status(ShellCaller.SHELL).get("econ_signal")
+            lines = econ_signal_report.format_econ_lines(
+                econ if isinstance(econ, dict) else None)
+        except Exception:  # noqa: BLE001 - 補助表示は status を止めない
+            return ""
+        return "".join("\n" + line for line in lines)
 
     def _data_state_line(self) -> str:
         """`status` 表示に足す 1 行: state / epoch / gap / 未処理建玉数 /

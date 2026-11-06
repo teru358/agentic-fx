@@ -111,6 +111,7 @@ def build_mission_registry(
             ledger=ledger, run_backtest_handler=rpc_handlers["run_backtest"],
             analyze_corr_handler=rpc_handlers["analyze_corr"],
             staging_dir=staging_dir, counters=counters, budget=budget))
+        signal_tools.assert_improve_allowlist(registry.names())
         return registry
 
     if counters is not None:

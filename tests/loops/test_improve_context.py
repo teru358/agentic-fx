@@ -296,3 +296,59 @@ def test_context_projects_named_redirects_against_its_deployed_families(
         alpha: "observation:family_redirect:alpha",
         other: "observation:family_redirect",
     }
+
+
+def _mission(c, trigger, started=NOW - timedelta(days=1)):
+    cur = c.execute(
+        "INSERT INTO missions (loop, runner, model, status, started_at, trigger) "
+        "VALUES ('trade','local','m','completed',?,?)", (started.isoformat(), trigger))
+    return cur.lastrowid
+
+
+def _intent(c, mission_id, action, gate=None, category=None):
+    c.execute(
+        "INSERT INTO trade_intents (mission_id, payload_json, action, "
+        "gate_result, reject_category, created_at) VALUES (?,?,?,?,?,?)",
+        (mission_id, "{}", action, gate, category,
+         (NOW - timedelta(days=1)).isoformat()))
+
+
+def test_performance_report_excludes_signal_missions_from_hold_rate(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    cron = _mission(c, "cron")
+    named = _mission(c, "signal:rsi_div")
+    bare = _mission(c, "signal")
+    _intent(c, cron, "hold")
+    _intent(c, cron, "open", "accepted")
+    for mission in (named, bare):
+        _intent(c, mission, "open", "accepted")
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["hold_rate"] == 0.5
+
+
+def test_performance_report_keeps_cron_and_unlinked_intents_in_hold_rate(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    cron = _mission(c, "cron")
+    ask = _mission(c, None)
+    _intent(c, cron, "hold")
+    _intent(c, ask, "hold")
+    _intent(c, ask, "open", "accepted")
+    _intent(c, cron, "open", "accepted")
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["hold_rate"] == 0.5
+
+
+def test_performance_report_reject_breakdown_omits_econ_window(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    cron = _mission(c, "cron")
+    _intent(c, cron, "open", "rejected", "econ_window")
+    _intent(c, cron, "open", "rejected", "econ_window")
+    _intent(c, cron, "open", "rejected", "risk_gate")
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["reject_breakdown"] == {"risk_gate": 1}

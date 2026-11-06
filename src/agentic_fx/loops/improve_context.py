@@ -132,9 +132,14 @@ def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
     # precheck 2026-08-22: T8-m7 -- 未使用の `timezone` import / `since_30`
     # ローカル変数を削除 (window_days=[30, 90] の表示のみで実集計は 90 日窓)。
     since_90 = (now - timedelta(days=90)).isoformat()
+    # 専用の signal 採否 mission の intent は裁量判断ではないので hold 率の母集団に
+    # 入れない。mission を持たない intent は裁量側に数える。
     rows_90 = conn.execute(
-        "SELECT payload_json, action, gate_result, reject_category, "
-        "created_at FROM trade_intents WHERE created_at >= ?",
+        "SELECT i.payload_json, i.action, i.gate_result, i.reject_category, "
+        "i.created_at FROM trade_intents i LEFT JOIN missions m "
+        "ON m.id = i.mission_id WHERE i.created_at >= ? "
+        "AND (m.trigger IS NULL OR (m.trigger != 'signal' "
+        "AND m.trigger NOT LIKE 'signal:%'))",
         (since_90,)).fetchall()
     closed_orders = conn.execute(
         "SELECT pair, realized_pnl, created_at FROM orders "
@@ -159,7 +164,8 @@ def _performance_report(conn: "sqlite3.Connection", now: datetime) -> dict:
     for r in rows_90:
         if r["action"] == "hold":
             hold_count += 1
-        if r["gate_result"] == "rejected" and r["reject_category"]:
+        if (r["gate_result"] == "rejected" and r["reject_category"]
+                and r["reject_category"] != "econ_window"):
             reject_breakdown[r["reject_category"]] = (
                 reject_breakdown.get(r["reject_category"], 0) + 1)
     return {

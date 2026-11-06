@@ -60,7 +60,7 @@ from agentic_fx.ops import keys as ops_keys
 from agentic_fx.ops.api_server import ApiLimits, ApiServer, ApiStartError
 from agentic_fx.ops.service import OpsLimits, OpsService
 from agentic_fx.ops.trade_event_sink import BUSY_RETRY_SEC, TradeEventEmitter, TradeEventSink
-from agentic_fx.loops import reflection_cycle
+from agentic_fx.loops import econ_signal_report, reflection_cycle
 from agentic_fx.loops.mission_watch import MissionWatch
 from agentic_fx.loops.reflection_cycle import ReflectionCycle
 from agentic_fx.loops.summary import ANSWER_SCHEMA, trade_intent_schema
@@ -781,6 +781,7 @@ class App:
     econ_worker: object | None = None
     conn_econ_read: object | None = None
     conn_econ_write: object | None = None
+    econ_health: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -1909,11 +1910,22 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         # ops 層は reconcile → sweep → expire (上) の後に作り、対話シェルにも同じ
         # レーンを使わせる。回復は listener を開く前 (run_service) に済ませる。
         conn_ops = connect(root / "data" / "agentic.db")
+        econ_health = econ_signal_report.WorkerHealth()
+        capacity_reader = econ_signal_report.CapacityReader(
+            capacity_monitor.plan, root / "data" / "agentic.db")
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
-            trade_event_sink=trade_sink, ingest=ingest, admission=admission)
+            trade_event_sink=trade_sink, ingest=ingest, admission=admission,
+            econ_health=econ_health, capacity_reader=capacity_reader)
+        # 親専有の日次 report。市場の当日 close 後に 1 回、起動時は当日分が無ければ 1 回
+        # (scheduler が呼ぶ。生成側が取引日で一意にする)。
+        scheduler.register_daily_report(econ_signal_report.make_daily_report_callback(
+            reports_dir=root / "data" / "improve_reports" / econ_signal_report.REPORT_DIR_NAME,
+            open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
+            capacity=capacity_reader, worker=econ_health,
+            admission_status=admission.status))
         # 取りこぼした改善通知の event を、listener を開く前・supervisor の開始前に出す。
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
@@ -1947,7 +1959,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    writer_admission=writer_admission,
                    trade_event_sink=trade_sink, trade_event_token=trade_token,
                    econ_worker=econ_worker, conn_econ_read=conn_econ_read,
-                   conn_econ_write=conn_econ_write)
+                   conn_econ_write=conn_econ_write, econ_health=econ_health)
         wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
     except BaseException:
@@ -2078,7 +2090,8 @@ def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] 
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
-                       admission=None) -> OpsService:
+                       admission=None, econ_health=None,
+                       capacity_reader=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -2108,6 +2121,9 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                     if ingest is not None else None)
                 admission_status = (admission.status(conn, clock.now())
                                     if admission is not None else None)
+                econ_signal = (econ_signal_report.econ_signal_status(
+                    conn, now=clock.now(), capacity=capacity_reader,
+                    worker=econ_health) if capacity_reader is not None else None)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
@@ -2136,6 +2152,8 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
             status["references"] = references
         if admission_status is not None:
             status.update(admission_status)
+        if econ_signal is not None:
+            status["econ_signal"] = econ_signal
         if trade_event_sink is not None:
             # 理由別の件数だけ。理由の文言や event の中身は載せない
             status["trade_events"] = trade_event_sink.counters()
@@ -2904,11 +2922,13 @@ def run_service(root: Path, *, daemon: bool = False,
                 target=_run_econ_slice_worker, args=(app, stop_event),
                 daemon=True, name="afx-econ-slices")
             econ_thread.start()
+            app.econ_health.attach(econ_thread)
         except Exception as exc:  # noqa: BLE001 — worker を起こせなくてもサービスは続ける
             started = econ_thread is not None and econ_thread.ident is not None
             if not started:
                 econ_thread = None
             _log.exception("econ slice worker could not start")
+            app.econ_health.mark_start_failed()
             app.activity.write(Category.SYSTEM, "econ_slice_worker_start_failed",
                                safe_error_text(exc))
         # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
