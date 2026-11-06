@@ -19,9 +19,9 @@
 | [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
-## 実装待ち (14)
+## 実装待ち (15)
 
-### 不具合 (6)
+### 不具合 (7)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -29,6 +29,7 @@
 | [legacy-2026-08-23-c-0](open/legacy-2026-08-23-c-0.md) | 低 | 2026-08-23 | datafeed テスト 11 件が実 TCP 接続を試みる疑い |
 | [backtest-available-lists-over-max-bars](open/backtest-available-lists-over-max-bars.md) | 低 | 2026-09-18 | bars 上限で拒否した指標が代替候補として返る |
 | [improve-add-fullwidth-placeholder](open/improve-add-fullwidth-placeholder.md) | 低 | 2026-09-27 | improve add で全角プレースホルダが警告されない |
+| [wizard-codex-model-list-fetch-failed](open/wizard-codex-model-list-fetch-failed.md) | 低 | 2026-10-31 | afx init: codex のモデル一覧取得に失敗する |
 | [flaky-tool-schemas](open/flaky-tool-schemas.md) | 低 |  | 全ツールのスキーマテストがフル suite でだけ ERROR になる |
 | [improve-add-quotes](open/improve-add-quotes.md) | 低 |  | improve add がクォートを剥がさず表示が崩れる |
 
@@ -73,9 +74,9 @@
 |---|---|---|---|
 | [legacy-2026-08-23-e-11-m3-m7](open/legacy-2026-08-23-e-11-m3-m7.md) | 低 | 2026-08-23 | apply_decision のキー方向と crash point A の縮退が未裁定 |
 
-## 設計待ち (140)
+## 設計待ち (139)
 
-### 不具合 (78)
+### 不具合 (77)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
@@ -139,7 +140,6 @@
 | [test-service-app-leaks-fds](open/test-service-app-leaks-fds.md) | 低 | 2026-10-26 | tests/test_service_app.py が fd を 1100 超残し後続 test に波及する |
 | [improve-gpt6-models-fail-isolated-selftest](open/improve-gpt6-models-fail-isolated-selftest.md) | 低 | 2026-10-27 | gpt-6 系モデルで improve 隔離の自己試験が通らない |
 | [plugin-ast-open-attribute-false-positive](open/plugin-ast-open-attribute-false-positive.md) | 低 | 2026-10-31 | plugin AST 検査が df.open (OHLCV 列の属性参照) を reject する |
-| [wizard-codex-model-list-fetch-failed](open/wizard-codex-model-list-fetch-failed.md) | 低 | 2026-10-31 | afx init: codex のモデル一覧取得に失敗する |
 | [datafeed-no-tick-minutes-counted-as-gap](open/datafeed-no-tick-minutes-counted-as-gap.md) | 低 | 2026-11-02 | 週明けの tick 無し時間を欠損と数え 15m 取得が約 1 日失敗 |
 | [first-run-acceptance-doc-quotes-drift](open/first-run-acceptance-doc-quotes-drift.md) | 低 | 2026-11-03 | 初回受入手順書の逐語引用 test 3 件が main で落ちる |
 | [mission-worker-improve-rpc-frame-test-fails](open/mission-worker-improve-rpc-frame-test-fails.md) | 低 | 2026-11-03 | mission_worker の improve RPC frame test が main で落ちる |
