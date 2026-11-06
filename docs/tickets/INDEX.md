@@ -1,9 +1,9 @@
 # チケット一覧
 
 自動生成: `ticket.py index` (tickets skill)。手で編集しない。
-未完了: 163 件。完了分は closed/。
+未完了: 164 件。完了分は closed/。
 
-## 実装中 (3)
+## 実装中 (4)
 
 ### 不具合 (1)
 
@@ -11,11 +11,12 @@
 |---|---|---|---|
 | [executor-pair-membership-guard](open/executor-pair-membership-guard.md) | 高 | 2026-10-25 | 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い |
 
-### 機能 (2)
+### 機能 (3)
 
 | id | 優先 | 起票 | 概要 |
 |---|---|---|---|
 | [improve-mission-indicator-creation-path](open/improve-mission-indicator-creation-path.md) | 中 | 2026-10-25 | 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突) |
+| [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [multi-timeframe-indicator-deps](open/multi-timeframe-indicator-deps.md) | 低 | 2026-09-15 | 1 つの strategy が複数時間足の指標を同時に使えない |
 
 ## 実装待ち (14)
@@ -171,7 +172,6 @@
 | [weekly-plugin-inventory-notice](open/weekly-plugin-inventory-notice.md) | 中 | 2026-10-29 | 週次の棚卸し: 未使用の指標と成績の悪い戦略を停止の提案として通知する |
 | [datafeed-outage-discord-notice](open/datafeed-outage-discord-notice.md) | 中 | 2026-10-31 | MT5 不通 (degraded) と復帰待ちを Discord に通知する |
 | [multi-input-indicator-relations](open/multi-input-indicator-relations.md) | 中 | 2026-10-31 | 多入力 indicator: 2 銘柄の生系列から関係 (相関・スプレッド・β) を指標として計算する |
-| [display-timestamps-in-local-timezone](open/display-timestamps-in-local-timezone.md) | 中 | 2026-11-02 | 人が読む面の時刻を現地 tz で表示し、bridge.log も UTC に揃える |
 | [improve-targeted-run](open/improve-targeted-run.md) | 低 | 2026-09-12 | 現状は `improve add <text>` + 引数なし `improve` で LLM が open から自分… |
 | [pine-script-to-plugin](open/pine-script-to-plugin.md) | 低 | 2026-09-12 | Pine script を plugin に変換する手段が無い |
 | [indicator-reference-oracle-gate](open/indicator-reference-oracle-gate.md) | 低 | 2026-09-15 | indicator の正しさを確かめる門が無い |
@@ -199,6 +199,7 @@
 | [reference-series-additional-sources](open/reference-series-additional-sources.md) | 低 | 2026-10-28 | 参照系列の取得先を MT5 以外に広げる (金利など) |
 | [settings-hot-reload-safe-keys](open/settings-hot-reload-safe-keys.md) | 低 | 2026-10-28 | 設定の一部を daemon 再起動なしで反映する (安全なキーに限定) |
 | [datafeed-fetch-evidence-and-bridge-completeness](open/datafeed-fetch-evidence-and-bridge-completeness.md) | 低 | 2026-11-03 | 価格取得の証跡と bridge の過去区間の完全性保証 (tick 無しの証明) |
+| [cli-datetime-input-in-display-timezone](open/cli-datetime-input-in-display-timezone.md) | 低 | 2026-11-06 | CLI の日時入力 (--from / --to) を表示 tz で解釈する |
 | [legacy-e2e-model](open/legacy-e2e-model.md) | 低 |  | backend を切り替えるたびにモデル名の手編集が要る |
 | [legacy-oc-qwen3-8-toolcall](open/legacy-oc-qwen3-8-toolcall.md) | 低 |  | モデルが壊れた引数でツールを連打し予算を焼く |
 
