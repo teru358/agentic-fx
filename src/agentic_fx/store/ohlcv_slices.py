@@ -832,15 +832,17 @@ def _purge_cutoff(now: datetime, retention_days: int) -> str:
 
 
 def purgeable_sets(conn: sqlite3.Connection, *, now: datetime, limit: int,
-                   retention_days: int = RETENTION_DAYS) -> list[int]:
+                   retention_days: int = RETENTION_DAYS,
+                   after: int | None = None) -> list[int]:
     """`created_at` から保持日数を過ぎ、まだ purge していない complete /
-    unrecoverable set。"""
+    unrecoverable set。`after` を与えると、その set id より後ろだけを id 順に返す。"""
     return [r[0] for r in conn.execute(
         "SELECT id FROM ohlcv_slice_sets WHERE state IN (?,?) "
-        "AND purged_at IS NULL AND created_at < ? "
+        "AND purged_at IS NULL AND created_at < ? AND id > ? "
         "ORDER BY id LIMIT ?",
         (STATE_COMPLETE, STATE_UNRECOVERABLE,
-         _purge_cutoff(now, retention_days), int(limit)))]
+         _purge_cutoff(now, retention_days),
+         -1 if after is None else int(after), int(limit)))]
 
 
 def purge_step(conn: sqlite3.Connection, *, set_id: int, now: datetime,

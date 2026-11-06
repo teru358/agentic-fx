@@ -31,11 +31,12 @@ from agentic_fx.commands import Commands
 from agentic_fx.config import (
     load_env_file, load_settings, load_settings_text, warn_surplus_pair_rules,
 )
-from agentic_fx.core import mission_ceiling
 from agentic_fx.core import landlock
+from agentic_fx.core import mission_ceiling
 from agentic_fx.core import time_cutover
 from agentic_fx.core import transitions
 from agentic_fx.core.contracts import Clock, Mode, SystemClock
+from agentic_fx.core.econ_slice_worker import EconSliceWorker
 from agentic_fx.core.econ_window import WindowSettings, currencies_by_pair
 from agentic_fx.core.executor import Executor
 from agentic_fx.core.health_latch import HealthLatch
@@ -43,7 +44,6 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC, Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
-from agentic_fx.core.econ_slice_worker import EconSliceWorker
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
@@ -2739,8 +2739,10 @@ def _wait_for_improve_host_start(isolation_thread: threading.Thread) -> None:
 
 
 #: slice worker の thread の shutdown 時の join 上限。worker は 1 本の短い transaction
-#: ごとに停止要求を見るので通常は即座に返る。
-_ECON_WORKER_JOIN_TIMEOUT_SEC = 15.0
+#: ごとに、また quote を取りに行く前に停止要求を見る。待つ可能性があるのは取得中の
+#: quote 1 回だけで、これは止められない。quote の source 連鎖は最大 3 つ (mt5 /
+#: twelvedata / yfinance) で各 10 秒の timeout なので最悪 30 秒、余白を足して 45 秒。
+_ECON_WORKER_JOIN_TIMEOUT_SEC = 45.0
 
 
 def _run_econ_slice_worker(app: App, stop_event: threading.Event) -> None:

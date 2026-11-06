@@ -825,6 +825,18 @@ def test_purge_removes_rows_only_after_the_retention_days(tmp_path):
         os_.purgeable_sets(conn, now=NOW, limit=10, retention_days=399)
 
 
+def test_purgeable_sets_after_returns_only_later_ids_in_order(tmp_path):
+    conn = _conn(tmp_path)
+    old = NOW - timedelta(days=os_.RETENTION_DAYS + 1)
+    ids = [_complete_event_set(conn, _event(conn, name=f"E{i}"), created_at=old)
+           for i in range(3)]
+    assert os_.purgeable_sets(conn, now=NOW, limit=10) == ids
+    assert os_.purgeable_sets(conn, now=NOW, limit=10, after=None) == ids
+    assert os_.purgeable_sets(conn, now=NOW, limit=10, after=ids[0]) == ids[1:]
+    assert os_.purgeable_sets(conn, now=NOW, limit=1, after=ids[0]) == [ids[1]]
+    assert os_.purgeable_sets(conn, now=NOW, limit=10, after=ids[2]) == []
+
+
 def test_purge_keeps_the_shadow_end_of_an_unrecoverable_owner(tmp_path):
     conn = _conn(tmp_path)
     shadow_id = _shadow(conn)

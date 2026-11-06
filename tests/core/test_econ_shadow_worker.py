@@ -1936,3 +1936,87 @@ def test_purge_does_not_take_the_core_lock(world):
         release.set()
         thread.join(timeout=30)
     assert not thread.is_alive()
+
+
+# --- 停止要求と purge の巡回 ------------------------------------------------------------
+
+def test_a_stop_request_during_a_quote_fetch_ends_the_cycle_before_the_next_quote(world):
+    first = _event_set(world.db, SPREAD_TS, name="NFP")
+    second = _event_set(world.db, SPREAD_TS, pair="EURUSD", name="NFP2")
+    clock = _Clock(SPREAD_TS - timedelta(minutes=4))
+    stop = threading.Event()
+    calls = []
+
+    def quote(pair):
+        calls.append(pair)
+        stop.set()
+        return _quote()
+
+    w = _worker(world, clock, quote_fn=quote)
+    w.run_cycle(stop)
+    assert len(calls) == 1
+    sources = {i: os_.get_set(world.db, i)["spread_source"] for i in (first, second)}
+    assert sorted(v for v in sources.values() if v) == ["quote"]
+
+
+def test_a_cycle_started_with_a_stop_request_already_set_fetches_no_quote(world):
+    _event_set(world.db, SPREAD_TS, name="NFP")
+    clock = _Clock(SPREAD_TS - timedelta(minutes=4))
+    stop = threading.Event()
+    stop.set()
+    calls = []
+    w = _worker(world, clock, quote_fn=lambda pair: calls.append(pair))
+    w.run_cycle(stop)
+    assert calls == []
+
+
+def _two_expired_sets(world):
+    _seed(world.db)
+    first = _event_set(world.db, EVENT_TS, name="A")
+    second = _event_set(world.db, EVENT_TS + timedelta(minutes=1), name="B")
+    _worker(world, _Clock(LATE)).run_cycle()
+    assert {os_.get_set(world.db, i)["state"] for i in (first, second)} == {"complete"}
+    return first, second
+
+
+def test_purge_advances_every_cycle_even_when_owners_use_the_whole_budget(world):
+    _seed(world.db)
+    old = _event_set(world.db, EVENT_TS, name="OLD")
+    _worker(world, _Clock(LATE)).run_cycle()
+    assert os_.get_set(world.db, old)["state"] == "complete"
+    for i in range(4):
+        _event_set(world.db, EVENT_TS + timedelta(minutes=i + 1), name=f"E{i}")
+    clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
+    read, write = world.pair()
+    _step_clock(write, clock, lambda statement: 0.045)
+    w = _worker(world, clock, rw=(read, write), monotonic=clock.monotonic)
+    first = w.run_cycle()
+    assert first.budget_exhausted and first.purged == 240
+    assert os_.get_set(world.db, old)["purged_at"] is None
+    clock.t = 0.0
+    second = w.run_cycle()
+    assert second.purged == 15
+    assert os_.get_set(world.db, old)["purged_at"] is not None
+
+
+def test_a_set_that_keeps_going_over_budget_does_not_hold_back_later_sets(world, monkeypatch):
+    first, second = _two_expired_sets(world)
+    clock = _Clock(_retention_end(world.db, second) + timedelta(seconds=1))
+    real = os_.purge_step
+    calls = []
+
+    def purge_step(conn, *, set_id, **kwargs):
+        calls.append((set_id, kwargs["max_rows"]))
+        if set_id == first:
+            return worker_mod.TxResult(status="over_budget")
+        return real(conn, set_id=set_id, **kwargs)
+
+    monkeypatch.setattr(os_, "purge_step", purge_step)
+    w = _worker(world, clock)
+    w.run_cycle()
+    assert calls[:3] == [(first, 240), (second, 240), (second, 240)]
+    assert os_.get_set(world.db, second)["purged_at"] is not None
+    assert os_.get_set(world.db, first)["purged_at"] is None
+    calls.clear()
+    w.run_cycle()
+    assert calls and calls[0] == (first, 240)

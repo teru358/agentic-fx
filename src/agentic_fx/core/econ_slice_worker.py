@@ -6,7 +6,9 @@
 2. `cancelled` set に残る slice 行の掃除 (状態は変えない)
 3. 成熟した owner (event set と shadow) を最大 25 件: 正規化 (read-only) →
    staging 書込み → 読戻し → 完備 CAS
-4. 保持期間を過ぎた set の slice 行の削除 (set 行・shadow 終端は残す)
+4. 保持期間を過ぎた set の slice 行の削除 (set 行・shadow 終端は残す)。
+   cancelled 掃除の後に 1 transaction だけ必ず試し (owner が予算を使い切っても
+   進む)、owner の後に予算の中で続ける。対象は set id の順に巡回する
 
 書込みは専用の write 接続 (busy timeout 0) で行う。どの transaction も writer
 admission の lease の中で始め、`SQLITE_BUSY` は即 rollback して 10 / 20 / 40 /
@@ -190,6 +192,8 @@ class EconSliceWorker:
         self._report = CycleReport()
         self._shadow_cursor: tuple[str, int] | None = None
         self._event_cursor: tuple[str, int] | None = None
+        self._purge_cursor: int | None = None
+        self._stop: threading.Event | None = None
         self._event_norms = _Memo(OWNER_MEMO_MAX)
         self._shadow_plans = _Memo(OWNER_MEMO_MAX)
         self._limit_first = _Memo(LIMIT_MEMO_MAX)
@@ -244,7 +248,7 @@ class EconSliceWorker:
                     return
         while not stop.is_set():
             try:
-                self.run_cycle()
+                self.run_cycle(stop)
             except Exception:
                 _log.exception("econ slice worker cycle failed")
             if stop.wait(self._interval):
@@ -263,15 +267,18 @@ class EconSliceWorker:
 
     # --- 1 cycle ------------------------------------------------------------
 
-    def run_cycle(self) -> CycleReport:
+    def run_cycle(self, stop: threading.Event | None = None) -> CycleReport:
+        """`stop` が立てば、次の transaction や quote 取得を始めず cycle を抜ける。"""
         if self._generation is None:
             raise RuntimeError("start() must run before run_cycle()")
         self._spent = 0.0
         self._abort = False
+        self._stop = stop
         self._report = CycleReport()
         now = self._now()
         self._record_spreads(now)
         self._sweep_cancelled()
+        self._purge_once(now)
         self._resolve_owners(now)
         self._purge(now)
         self._report.yielded = self._abort and not self._exhausted()
@@ -283,7 +290,8 @@ class EconSliceWorker:
         return self._bounded and self._spent >= CYCLE_BUDGET_SEC
 
     def _stopped(self) -> bool:
-        return self._abort or self._exhausted()
+        return (self._abort or self._exhausted()
+                or (self._stop is not None and self._stop.is_set()))
 
     # --- DB の入口 ------------------------------------------------------------
 
@@ -428,49 +436,73 @@ class EconSliceWorker:
         set_ids = self._reading(lambda c: ohlcv_slices.cancelled_sets_with_rows(
             c, limit=MAX_OWNERS_PER_CYCLE))
         for set_id in set_ids:
-            size = MAX_BATCH_ROWS
-            while not self._stopped():
-                result = self._write(lambda begin, checkpoint:
-                                     ohlcv_slices.sweep_cancelled_step(
-                                         self._write_conn, set_id=set_id,
-                                         max_rows=size, begin=begin,
-                                         checkpoint=checkpoint))
-                if not isinstance(result, TxResult):
-                    break
-                if result.status == "over_budget" and size > 1:
-                    size = max(1, size // 2)
-                    continue
-                if not result.committed:
-                    break
-                self._report.swept += result.rows
-                if result.done:
-                    break
+            self._drain(set_id, lambda size, begin, checkpoint:
+                        ohlcv_slices.sweep_cancelled_step(
+                            self._write_conn, set_id=set_id, max_rows=size,
+                            begin=begin, checkpoint=checkpoint), "swept")
+
+    def _drain(self, set_id: int, step, counter: str, *,
+               once: bool = False) -> str:
+        """1 つの set を `step(size, begin, checkpoint)` で尽きるまで進める。
+        `over_budget` は batch を半分にして再試行する。`once` なら 1 transaction
+        だけ試す。結果は `done` / `progress` (消したが残りがある) / `failed`。"""
+        size = MAX_BATCH_ROWS
+        outcome = "failed"
+        while not self._stopped():
+            result = self._write(lambda begin, checkpoint:
+                                 step(size, begin, checkpoint))
+            if not isinstance(result, TxResult):
+                break
+            if result.status == "over_budget" and size > 1 and not once:
+                size = max(1, size // 2)
+                continue
+            if not result.committed:
+                break
+            setattr(self._report, counter,
+                    getattr(self._report, counter) + result.rows)
+            if result.done:
+                return "done"
+            outcome = "progress"
+            if once:
+                break
+        return outcome
 
     # --- 保持期間を過ぎた set ---------------------------------------------------------
+
+    def _purge_candidates(self, now: datetime, limit: int) -> list[int]:
+        """cursor の後ろから。末尾まで来ていたら先頭から取り直す。"""
+        def pick(after):
+            return self._reading(lambda c: ohlcv_slices.purgeable_sets(
+                c, now=now, limit=limit, after=after))
+        ids = pick(self._purge_cursor)
+        if not ids and self._purge_cursor is not None:
+            self._purge_cursor = None
+            ids = pick(None)
+        return ids
+
+    def _purge_drain(self, set_id: int, now: datetime, *, once: bool) -> None:
+        outcome = self._drain(
+            set_id, lambda size, begin, checkpoint: ohlcv_slices.purge_step(
+                self._write_conn, set_id=set_id, now=now, max_rows=size,
+                begin=begin, checkpoint=checkpoint), "purged", once=once)
+        # 消せたが残りがある set は次の cycle も同じ set から続ける。
+        self._purge_cursor = set_id - 1 if outcome == "progress" else set_id
+
+    def _purge_once(self, now: datetime) -> None:
+        """owner の前に 1 transaction だけ試す。owner が予算を使い切る cycle でも
+        purge が進む。"""
+        if self._stopped():
+            return
+        for set_id in self._purge_candidates(now, 1):
+            self._purge_drain(set_id, now, once=True)
 
     def _purge(self, now: datetime) -> None:
         if self._stopped():
             return
-        set_ids = self._reading(lambda c: ohlcv_slices.purgeable_sets(
-            c, now=now, limit=MAX_OWNERS_PER_CYCLE))
-        for set_id in set_ids:
-            size = MAX_BATCH_ROWS
-            while not self._stopped():
-                result = self._write(lambda begin, checkpoint:
-                                     ohlcv_slices.purge_step(
-                                         self._write_conn, set_id=set_id,
-                                         now=now, max_rows=size, begin=begin,
-                                         checkpoint=checkpoint))
-                if not isinstance(result, TxResult):
-                    break
-                if result.status == "over_budget" and size > 1:
-                    size = max(1, size // 2)
-                    continue
-                if not result.committed:
-                    break
-                self._report.purged += result.rows
-                if result.done:
-                    break
+        for set_id in self._purge_candidates(now, MAX_OWNERS_PER_CYCLE):
+            if self._stopped():
+                return
+            self._purge_drain(set_id, now, once=False)
 
     # --- 3. 成熟した owner -------------------------------------------------------------
 
