@@ -6,6 +6,7 @@
 2. `cancelled` set に残る slice 行の掃除 (状態は変えない)
 3. 成熟した owner (event set と shadow) を最大 25 件: 正規化 (read-only) →
    staging 書込み → 読戻し → 完備 CAS
+4. 保持期間を過ぎた set の slice 行の削除 (set 行・shadow 終端は残す)
 
 書込みは専用の write 接続 (busy timeout 0) で行う。どの transaction も writer
 admission の lease の中で始め、`SQLITE_BUSY` は即 rollback して 10 / 20 / 40 /
@@ -94,6 +95,7 @@ class CycleReport:
     """1 cycle の観測。"""
     spreads: int = 0
     swept: int = 0
+    purged: int = 0
     owners: int = 0
     completed: list[int] = field(default_factory=list)
     unrecoverable: int = 0
@@ -271,6 +273,7 @@ class EconSliceWorker:
         self._record_spreads(now)
         self._sweep_cancelled()
         self._resolve_owners(now)
+        self._purge(now)
         self._report.yielded = self._abort and not self._exhausted()
         self._report.budget_exhausted = self._exhausted()
         self._report.spent_sec = self._spent
@@ -440,6 +443,32 @@ class EconSliceWorker:
                 if not result.committed:
                     break
                 self._report.swept += result.rows
+                if result.done:
+                    break
+
+    # --- 保持期間を過ぎた set ---------------------------------------------------------
+
+    def _purge(self, now: datetime) -> None:
+        if self._stopped():
+            return
+        set_ids = self._reading(lambda c: ohlcv_slices.purgeable_sets(
+            c, now=now, limit=MAX_OWNERS_PER_CYCLE))
+        for set_id in set_ids:
+            size = MAX_BATCH_ROWS
+            while not self._stopped():
+                result = self._write(lambda begin, checkpoint:
+                                     ohlcv_slices.purge_step(
+                                         self._write_conn, set_id=set_id,
+                                         now=now, max_rows=size, begin=begin,
+                                         checkpoint=checkpoint))
+                if not isinstance(result, TxResult):
+                    break
+                if result.status == "over_budget" and size > 1:
+                    size = max(1, size // 2)
+                    continue
+                if not result.committed:
+                    break
+                self._report.purged += result.rows
                 if result.done:
                     break
 

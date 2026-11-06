@@ -1840,3 +1840,84 @@ def test_kept_state_is_bounded_and_dropped_when_an_owner_ends(world):
     w.run_cycle()
     assert os_.get_set(world.db, set_id)["state"] == "complete"
     assert len(w._event_norms) == 0
+
+
+# --- 保持期間を過ぎた set の削除 ---------------------------------------------------------
+
+def _completed_world(world):
+    """event set と shadow を 1 つずつ完備まで進めた状態。"""
+    _seed(world.db)
+    event_set = _event_set(world.db)
+    shadow = _shadow(world.db, 0)
+    w = _worker(world, _Clock(LATE))
+    w.run_cycle()
+    assert os_.get_set(world.db, event_set)["state"] == "complete"
+    assert ss.get(world.db, shadow)["state"] == "resolved"
+    return event_set, shadow
+
+
+def _retention_end(db, set_id):
+    created = _at(os_.get_set(db, set_id)["created_at"])
+    return created + timedelta(days=os_.RETENTION_DAYS)
+
+
+def test_a_cycle_keeps_every_set_younger_than_the_retention_days(world):
+    event_set, shadow = _completed_world(world)
+    before = [_rows_in(world.db, s["id"]) for s in _sets(world.db)]
+    assert before and all(before)
+    clock = _Clock(_retention_end(world.db, event_set))
+    w = _worker(world, clock)
+    report = w.run_cycle()
+    assert report.purged == 0
+    assert [_rows_in(world.db, s["id"]) for s in _sets(world.db)] == before
+    assert all(s["purged_at"] is None for s in _sets(world.db))
+
+
+def test_a_cycle_deletes_only_the_rows_of_a_set_past_the_retention_days(world):
+    event_set, shadow = _completed_world(world)
+    sets_before = {s["id"]: s for s in _sets(world.db)}
+    shadow_before = ss.get(world.db, shadow)
+    reaction_n = world.db.execute(
+        "SELECT COUNT(*) FROM econ_reaction_values").fetchone()[0]
+    clock = _Clock(_retention_end(world.db, event_set) + timedelta(seconds=1))
+    w = _worker(world, clock)
+    report = w.run_cycle()
+    assert report.purged == 255
+    row = os_.get_set(world.db, event_set)
+    assert (row["state"], row["purged_at"]) == (
+        "complete", clock.now.isoformat())
+    assert _rows_in(world.db, event_set) == 0
+    for set_id, before in sets_before.items():
+        after = os_.get_set(world.db, set_id)
+        assert after["state"] == before["state"]
+        assert after["expected_rows"] == before["expected_rows"]
+    assert ss.get(world.db, shadow) == shadow_before
+    assert world.db.execute(
+        "SELECT COUNT(*) FROM econ_reaction_values").fetchone()[0] == reaction_n
+    assert w.run_cycle().purged == 0
+
+
+def test_purge_does_not_take_the_core_lock(world):
+    event_set, shadow = _completed_world(world)
+    lock = threading.RLock()
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with lock:
+            held.set()
+            release.wait(timeout=30)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    try:
+        assert held.wait(timeout=10)
+        clock = _Clock(_retention_end(world.db, event_set)
+                       + timedelta(seconds=1))
+        w = _worker(world, clock, lock=lock)
+        w.run_cycle()
+        assert _rows_in(world.db, event_set) == 0
+        assert os_.get_set(world.db, event_set)["purged_at"] is not None
+    finally:
+        release.set()
+        thread.join(timeout=30)
+    assert not thread.is_alive()

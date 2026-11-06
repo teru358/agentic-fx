@@ -43,6 +43,7 @@ from agentic_fx.core.notifier import Notifier
 from agentic_fx.core.paper_broker import PaperBroker
 from agentic_fx.core.scheduler import TICK_INTERVAL_SEC, Scheduler
 from agentic_fx.core.supervisor import MissionSupervisor, SubmitResult
+from agentic_fx.core.econ_slice_worker import EconSliceWorker
 from agentic_fx.core.writer_admission import WriterAdmission
 from agentic_fx.datafeed import cache_window, sources
 from agentic_fx.datafeed.ingest import Ingest
@@ -776,6 +777,10 @@ class App:
     # 取引 event の observer 登録と書き込み thread (settings の notify.trade_events が真のときだけ)。
     trade_event_sink: object | None = None
     trade_event_token: object | None = None
+    # slice worker と、その専用の読取接続・書込み接続 (書込みは busy_timeout 0)。
+    econ_worker: object | None = None
+    conn_econ_read: object | None = None
+    conn_econ_write: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -796,6 +801,10 @@ class App:
              if self.conn_signal is not None else None),
             ("conn_admission", lambda: self.conn_admission.close()
              if self.conn_admission is not None else None),
+            ("conn_econ_read", lambda: self.conn_econ_read.close()
+             if self.conn_econ_read is not None else None),
+            ("conn_econ_write", lambda: self.conn_econ_write.close()
+             if self.conn_econ_write is not None else None),
             ("conn_core", self.conn_core.close),
             ("conn_shell", self.conn_shell.close),
             ("instance_lock", self.instance_lock.close),
@@ -1263,6 +1272,11 @@ def _acquire_lock_unless_enrolling(root: Path):
     return lock
 
 
+def _assumed_spread_pips(settings, pair: str) -> float:
+    rule = settings.risk.pair_rules.get(pair)
+    return rule.assumed_spread_pips if rule else 0.0
+
+
 def build_app(root: Path, *, runner: AgentRunner | None = None,
               clock: Clock | None = None, quote_fn=None, spec_fn=None,
               bars_fn=None, embedding_fn=None,
@@ -1325,6 +1339,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
     conn_ops = None
     conn_signal = None
     conn_admission = None
+    conn_econ_read = None
+    conn_econ_write = None
     ops_service = None
     trade_sink = None
     trade_token = None
@@ -1345,6 +1361,10 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         conn_admission = connect(root / "data" / "agentic.db")
         # BEGIN が他の writer を待たない (BUSY は即 rollback して次の機会に取り直す)
         conn_admission.execute("PRAGMA busy_timeout=0")
+        # slice worker の接続。読取は mode=ro、書込みは他の writer を待たない。
+        conn_econ_read = connect_readonly(root / "data" / "agentic.db")
+        conn_econ_write = connect(root / "data" / "agentic.db")
+        conn_econ_write.execute("PRAGMA busy_timeout=0")
         if settings.notify.trade_events is True:
             # scheduler / supervisor / ops listener の起動前。失敗したら build_app ごと失敗させる。
             trade_sink, trade_token = _start_trade_events(root, conn_core, settings, state, clock)
@@ -1899,6 +1919,13 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
+        econ_worker = EconSliceWorker(
+            read_conn=conn_econ_read, write_conn=conn_econ_write,
+            core_lock=core_lock, admission=writer_admission,
+            quote_fn=lambda pair: executor.quote_fn(pair),
+            pip_size_fn=lambda pair: executor.spec_fn(pair).pip_size,
+            assumed_spread_pips_fn=lambda pair: _assumed_spread_pips(settings, pair),
+            now_fn=clock.now)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1918,7 +1945,9 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    root=root, conn_signal=conn_signal,
                    conn_admission=conn_admission, admission=admission,
                    writer_admission=writer_admission,
-                   trade_event_sink=trade_sink, trade_event_token=trade_token)
+                   trade_event_sink=trade_sink, trade_event_token=trade_token,
+                   econ_worker=econ_worker, conn_econ_read=conn_econ_read,
+                   conn_econ_write=conn_econ_write)
         wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
     except BaseException:
@@ -1960,6 +1989,12 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                 conn_admission.close()
             except Exception:  # noqa: BLE001
                 pass
+        for econ_conn in (conn_econ_read, conn_econ_write):
+            if econ_conn is not None:
+                try:
+                    econ_conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
         try:
             instance_lock.close()
         except Exception:  # noqa: BLE001 — 元の例外を握り潰さないための抑制
@@ -2593,8 +2628,12 @@ def _check_watchdog_health(app: App, watchdog_thread_obj: threading.Thread,
 def _busy_resources_after_join(scheduler_still_busy: bool,
                                supervisor_still_busy: bool,
                                improve_still_busy: bool = False,
-                               report_still_busy: bool = False) -> frozenset[str]:
+                               report_still_busy: bool = False,
+                               econ_still_busy: bool = False) -> frozenset[str]:
     busy: set[str] = set()
+    if econ_still_busy:
+        busy.add("conn_econ_read")
+        busy.add("conn_econ_write")
     if (scheduler_still_busy or supervisor_still_busy or improve_still_busy
             or report_still_busy):
         busy.add("conn_core")
@@ -2695,6 +2734,21 @@ def _wait_for_improve_host_start(isolation_thread: threading.Thread) -> None:
             _log.warning("improve isolation: host start did not finish within 10s; continuing")
             return
         isolation_thread.join(timeout=min(_IMPROVE_HOST_START_POLL_SEC, remaining))
+
+
+#: slice worker の thread の shutdown 時の join 上限。worker は 1 本の短い transaction
+#: ごとに停止要求を見るので通常は即座に返る。
+_ECON_WORKER_JOIN_TIMEOUT_SEC = 15.0
+
+
+def _run_econ_slice_worker(app: App, stop_event: threading.Event) -> None:
+    """停止まで worker を回す。set 台帳の起動時補完は `build_app` が scheduler の
+    起動前に済ませている。worker が例外で抜けても daemon は止めない。
+    """
+    try:
+        app.econ_worker.run(stop_event)
+    except Exception:  # noqa: BLE001
+        _log.exception("econ slice worker stopped")
 
 
 def run_service(root: Path, *, daemon: bool = False,
@@ -2835,6 +2889,12 @@ def run_service(root: Path, *, daemon: bool = False,
     wd = threading.Thread(target=watchdog_thread, daemon=True, name="watchdog")
     th.start()
     wd.start()
+    # 資金保護の scheduler と watchdog の後に起こす (worker の起動時補完は資金保護を
+    # 待たせない)。起動時回復と schema の初期化は build_app で済んでいる。
+    econ_thread = threading.Thread(
+        target=_run_econ_slice_worker, args=(app, stop_event), daemon=True,
+        name="afx-econ-slices")
+    econ_thread.start()
 
     try:
         # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
@@ -2936,6 +2996,8 @@ def run_service(root: Path, *, daemon: bool = False,
         # 生じる。判定権威は th.join(30) + supervisor.join(...) — wd は
         # ここで待つだけで graceful/timeout の判定には関与しない。
         wd.join(timeout=15)
+        econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
+        econ_still_busy = econ_thread.is_alive()
         # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
         # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、
@@ -2943,7 +3005,7 @@ def run_service(root: Path, *, daemon: bool = False,
         # シーケンスを止めない。
         skipped = app.close(busy_resources=_busy_resources_after_join(
             scheduler_still_busy, supervisor_still_busy,
-            improve_still_busy, report_still_busy))
+            improve_still_busy, report_still_busy, econ_still_busy))
         try:
             reap_orphans()
         except Exception:
