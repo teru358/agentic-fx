@@ -626,6 +626,7 @@ DST 是正（`2026-11-02-utc-time-rules-dst-design.md` §3.6）の引渡しの�
 ### 配備手順
 
 1. **merge 前必須 job を 3 本とも成功させる。** skip / xfail / 成果物欠落は不合格。
+   - 実行前に成果物と `--basetemp` の親 directory を作る: `mkdir -p tmp/econ-window-acceptance/claude tmp/econ-window-acceptance/history tmp/econ-window-acceptance/disk`
    - Claude 実往復: `uv run pytest tests/loops/test_signal_decision_flow.py -m realbackend -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/claude/basetemp`
    - 履歴 DB 再生成: `uv run pytest tests/audit/test_econ_history_regeneration.py -m bench -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/history/basetemp`
    - 実ディスク writer / 容量: `uv run pytest tests/core/test_econ_shadow_worker.py -m bench -p no:cacheprovider -rs --fail-on-skip --basetemp=tmp/econ-window-acceptance/disk/basetemp`
