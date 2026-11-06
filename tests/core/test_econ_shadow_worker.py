@@ -1962,8 +1962,9 @@ def test_a_stop_request_during_a_quote_fetch_ends_the_cycle_before_the_next_quot
     w = _worker(world, clock, quote_fn=quote)
     w.run_cycle(stop)
     assert len(calls) == 1
+    # 停止要求の後は、取れた quote も書かない (次の起動で同区間なら取り直す)
     sources = {i: os_.get_set(world.db, i)["spread_source"] for i in (first, second)}
-    assert sorted(v for v in sources.values() if v) == ["quote"]
+    assert all(v is None for v in sources.values())
 
 
 def test_a_cycle_started_with_a_stop_request_already_set_fetches_no_quote(world):
@@ -1975,6 +1976,47 @@ def test_a_cycle_started_with_a_stop_request_already_set_fetches_no_quote(world)
     w = _worker(world, clock, quote_fn=lambda pair: calls.append(pair))
     w.run_cycle(stop)
     assert calls == []
+
+
+def test_the_purge_slot_runs_even_when_the_spread_stage_used_the_whole_budget(world):
+    _seed(world.db)
+    old = _event_set(world.db, EVENT_TS, name="OLD")
+    _worker(world, _Clock(LATE)).run_cycle()
+    assert os_.get_set(world.db, old)["state"] == "complete"
+    clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
+    w = _worker(world, clock)
+    real = w._record_spreads
+
+    def spend_everything(now):
+        real(now)
+        w._spent = worker_mod.CYCLE_BUDGET_SEC + 1.0
+
+    w._record_spreads = spend_everything
+    report = w.run_cycle()
+    assert report.purged == 240
+    assert report.budget_exhausted
+
+
+def test_the_purge_slot_does_not_wait_on_busy(world):
+    _seed(world.db)
+    old = _event_set(world.db, EVENT_TS, name="OLD")
+    _worker(world, _Clock(LATE)).run_cycle()
+    clock = _Clock(_retention_end(world.db, old) + timedelta(seconds=1))
+    sleeps = []
+    w = _worker(world, clock, sleep=sleeps.append)
+    w._spent = 0.0
+    holder = sqlite3.connect(world.path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        w._reserved = True
+        w._purge_drain(os_.purgeable_sets(world.db, now=clock.now, limit=1)[0],
+                       clock.now, once=True)
+    finally:
+        w._reserved = False
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert sleeps == []
+    assert os_.get_set(world.db, old)["purged_at"] is None
 
 
 def _two_expired_sets(world):

@@ -188,6 +188,8 @@ class EconSliceWorker:
         self._commit_seconds: deque[float] = deque(maxlen=256)
         self._spent = 0.0
         self._bounded = True
+        # cycle の予算とは別に 1 transaction だけ許す区間 (purge の毎 cycle 枠)
+        self._reserved = False
         self._abort = False
         self._report = CycleReport()
         self._shadow_cursor: tuple[str, int] | None = None
@@ -287,7 +289,8 @@ class EconSliceWorker:
         return self._report
 
     def _exhausted(self) -> bool:
-        return self._bounded and self._spent >= CYCLE_BUDGET_SEC
+        return (self._bounded and not self._reserved
+                and self._spent >= CYCLE_BUDGET_SEC)
 
     def _stopped(self) -> bool:
         return (self._abort or self._exhausted()
@@ -318,6 +321,9 @@ class EconSliceWorker:
             if self._exhausted():
                 return None
             if stop is not None and stop.is_set():
+                return None
+            # cycle の停止要求 (quote 取得の後など) も書込みの前に見る
+            if self._stop is not None and self._stop.is_set():
                 return None
             if locked:
                 if self._admission.requested():
@@ -356,6 +362,9 @@ class EconSliceWorker:
             self._spent += max(0.0, self._monotonic() - started)
             if busy:
                 if stop is not None and stop.is_set():
+                    return None
+                if self._reserved:
+                    # 予算外の 1 transaction は待たない (次の cycle で試す)
                     return None
                 delay = next(delays)
                 self._sleep(delay)
@@ -489,12 +498,22 @@ class EconSliceWorker:
         self._purge_cursor = set_id - 1 if outcome == "progress" else set_id
 
     def _purge_once(self, now: datetime) -> None:
-        """owner の前に 1 transaction だけ試す。owner が予算を使い切る cycle でも
-        purge が進む。"""
-        if self._stopped():
+        """owner の前に 1 transaction だけ試す。cycle の予算を先の段が使い切って
+        いても試す (書込み要求と停止要求には従い、BUSY は再試行しない)。"""
+        if self._stopped() and not self._exhausted_only():
             return
-        for set_id in self._purge_candidates(now, 1):
-            self._purge_drain(set_id, now, once=True)
+        self._reserved = True
+        try:
+            for set_id in self._purge_candidates(now, 1):
+                self._purge_drain(set_id, now, once=True)
+        finally:
+            self._reserved = False
+
+    def _exhausted_only(self) -> bool:
+        """止まっている理由が予算だけか (書込み要求の yield・停止要求ではない)。"""
+        return (not self._abort
+                and not (self._stop is not None and self._stop.is_set())
+                and self._bounded and self._spent >= CYCLE_BUDGET_SEC)
 
     def _purge(self, now: datetime) -> None:
         if self._stopped():
