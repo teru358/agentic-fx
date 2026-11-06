@@ -1422,6 +1422,24 @@ def test_a_quote_taken_across_ts_is_dropped_and_assumed_is_recorded(world):
     assert (row["spread_source"], row["spread_pips"]) == ("assumed", 1.5)
 
 
+@pytest.mark.parametrize("outcome", ["none", "raise"])
+def test_a_quote_that_fails_after_ts_still_records_assumed(world, outcome):
+    upcoming = _event_set(world.db, SPREAD_TS, name="NFP")
+    clock = _Clock(SPREAD_TS - timedelta(seconds=1))
+
+    def quote(pair):
+        clock.now = SPREAD_TS + timedelta(milliseconds=1)
+        if outcome == "raise":
+            raise RuntimeError("quote unavailable")
+        return None
+
+    w = _worker(world, clock, quote_fn=quote)
+    clock.now = SPREAD_TS - timedelta(seconds=1)
+    w.run_cycle()
+    row = os_.get_set(world.db, upcoming)
+    assert (row["spread_source"], row["spread_pips"]) == ("assumed", 1.5)
+
+
 def test_a_staged_shadow_whose_source_bars_leave_retention_ends_as_data_insufficient(world):
     _seed(world.db)
     shadow = _shadow(world.db, 0)

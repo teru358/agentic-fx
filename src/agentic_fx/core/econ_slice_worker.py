@@ -397,10 +397,11 @@ class EconSliceWorker:
                                  "cycle", pair, exc_info=True)
                     quotes[pair] = None
             quote = quotes[pair]
-            if quote is None:
-                return False
             if self._now() >= ts:
+                # 取得の成否にかかわらず ts を越えたら発表前の値は取れない。
                 quote = None
+            elif quote is None:
+                return False
         if quote is not None:
             spread = signal_shadow.spread_from_quote(
                 quote.bid, quote.ask, pip_size=pip_size,
