@@ -149,8 +149,11 @@ _LEVELS = ("ok", "warn", "full")
 _MISSION_KEYS = ("system_filtered", "failed", "running")
 _CAPACITY_KEYS = ("signal_daily", "signal_producer", "signal_override", "rows",
                   "row_capacity", "row_level", "slice_bytes", "slice_bytes_measured_at",
+                  "slice_bytes_stale", "measure_outcome", "measure_elapsed_sec",
                   "used_bytes", "byte_capacity", "byte_level", "base_bytes",
                   "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes", "level")
+_MEASURE_OUTCOMES = ("ok", "aborted", "failed")
+_OTHER_KIND = "other"
 _ECON_WORD = re.compile(r"[A-Za-z0-9_.:-]{1,64}\Z")
 
 
@@ -186,9 +189,14 @@ def _econ_section(data: Mapping[str, object]) -> str:
     if type(decisions) is dict:
         pairs.append(("decisions", _count_text(decisions.get("total"))))
         by_kind = _dict(decisions.get("by_kind"))
-        for key in sorted(by_kind)[:MAX_ITEMS]:
-            if type(key) is str and _ECON_WORD.match(key):
+        kinds = sorted(key for key in by_kind if type(key) is str)
+        for key in kinds[:MAX_ITEMS]:
+            if key == _OTHER_KIND:
+                pairs.append(("decision その他", _count_text(by_kind[key])))
+            elif _ECON_WORD.match(key):
                 pairs.append((f"decision {html.escape(key, quote=True)}", _count_text(by_kind[key])))
+        if len(kinds) > MAX_ITEMS:
+            pairs.append(("decision 省略", f"{len(kinds) - MAX_ITEMS} 種"))
     else:
         pairs.append(("decisions", "unavailable"))
     abandoned = econ.get("abandoned")
@@ -217,6 +225,10 @@ def _econ_section(data: Mapping[str, object]) -> str:
                              ("decision", "actor", "reject_code", "state", "result_code"))
             pairs.append((f"shadow {label}",
                           f"n={_count_text(row.get('n'))} avg_pnl_pips={_num(row.get('avg_pnl_pips'))}"))
+        omitted = (econ.get("shadow_omitted") if type(econ.get("shadow_omitted")) is int
+                   else 0) + max(0, len(shadow) - MAX_ITEMS)
+        if omitted > 0:
+            pairs.append(("shadow 省略", f"{omitted} 組"))
     capacity = econ.get("slice_capacity")
     if type(capacity) is dict:
         for key in _CAPACITY_KEYS:
@@ -225,6 +237,12 @@ def _econ_section(data: Mapping[str, object]) -> str:
                 shown = _word(value, _LEVELS)
             elif key == "slice_bytes_measured_at":
                 shown = _text(value) or "-"
+            elif key == "slice_bytes_stale":
+                shown = "古い" if value is True else ("-" if value is None else "新しい")
+            elif key == "measure_outcome":
+                shown = _word(value, _MEASURE_OUTCOMES)
+            elif key == "measure_elapsed_sec":
+                shown = _num(value) if type(value) in (int, float) else "-"
             else:
                 shown = _count_text(value)
             if key == "slice_bytes" and value is None:

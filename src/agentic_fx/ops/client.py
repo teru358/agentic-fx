@@ -33,6 +33,7 @@ import httpcore
 import httpx
 
 from agentic_fx.core import improve_repeat as ir
+from agentic_fx.core.econ_window import FRESHNESS_UNKNOWN, FRESHNESS_VALUES
 from agentic_fx.datafeed.reference_status import REFERENCE_STATES
 from agentic_fx.loops.econ_signal_report import format_econ_lines
 from agentic_fx.loops import approval_facts
@@ -654,7 +655,7 @@ def _flag(value) -> str:
 def _calendar_word(window) -> str:
     """経済指標 calendar の鮮度。unknown / fresh / stale 以外は unknown に倒す。"""
     state = window.get("freshness") if isinstance(window, dict) else None
-    return state if state in ("unknown", "fresh", "stale") else "unknown"
+    return state if state in FRESHNESS_VALUES else FRESHNESS_UNKNOWN
 
 
 def _econ_lines(econ) -> list[str]:

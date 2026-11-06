@@ -5,11 +5,15 @@ status と日次 report が同じ集計を使う。agent の prompt・tool・wor
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import re
+import secrets
 import sqlite3
 import stat
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -35,6 +39,10 @@ SLICE_RELATED_TABLES = frozenset({
 
 REPORT_DIR_NAME = "econ_signal"
 
+#: 未知の decision 種別をまとめる内訳の key と表示語。
+OTHER_KIND = "other"
+OTHER_LABEL = "その他"
+
 _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 
@@ -43,7 +51,8 @@ _EPOCH = datetime(2000, 1, 1, tzinfo=timezone.utc)
 class WorkerHealth:
     """slice worker の thread を status から観測するための入れ物。
 
-    thread を作る側 (`run_service`) が `attach` / `start_failed` を呼ぶ。"""
+    thread を作る側 (`run_service`) が、thread を start する直前に `attach` を呼ぶ。
+    `mark_start_failed` は thread が起動していないときだけ呼ぶ。"""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -64,7 +73,7 @@ class WorkerHealth:
             thread, failed = self._thread, self._start_failed
         if failed:
             return "start_failed"
-        if thread is None:
+        if thread is None or thread.ident is None:
             return "not_started"
         return "alive" if thread.is_alive() else "stopped"
 
@@ -78,14 +87,25 @@ def slice_related_bytes(conn: sqlite3.Connection) -> int:
     返すので、呼び出し側の progress handler で途中から打ち切れる (集計 mode では
     1 つの b-tree を 1 回の呼出しで走査し切るため、打ち切れない)。"""
     marks = ",".join("?" * len(SLICE_RELATED_TABLES))
-    names = [name for (name,) in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type IN ('table','index') "
-        f"AND tbl_name IN ({marks})", tuple(sorted(SLICE_RELATED_TABLES)))]
-    total = 0
-    for name in names:
-        total += conn.execute(
-            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?",
-            (name,)).fetchone()[0]
+    began = not conn.in_transaction
+    if began:
+        # 名前ごとの query が同じ snapshot を読むよう、1 つの読取 transaction で囲む。
+        conn.execute("BEGIN")
+    try:
+        names = [name for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index') "
+            f"AND tbl_name IN ({marks})", tuple(sorted(SLICE_RELATED_TABLES)))]
+        total = 0
+        for name in names:
+            total += conn.execute(
+                "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?",
+                (name,)).fetchone()[0]
+    except BaseException:
+        if began and conn.in_transaction:
+            conn.rollback()
+        raise
+    if began:
+        conn.execute("COMMIT")
     return int(total)
 
 
@@ -126,11 +146,16 @@ def _free_bytes(path: Path) -> int | None:
 
 def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path | None,
                     free_bytes: int | None = None, base_bytes: int | None = None,
-                    slice_bytes_measured_at: datetime | None = None) -> dict:
+                    slice_bytes_measured_at: datetime | None = None,
+                    measure_outcome: str | None = None,
+                    measure_elapsed_sec: float | None = None,
+                    bytes_stale: bool | None = None) -> dict:
     """容量の表示項目。`plan` は `ohlcv_slices.CapacityPlan`。
 
     byte の比較値は B0 に、空 DDL からの slice 関連 bytes の増分だけを足したもの。
-    `slice_bytes` が None は未測定 (測る側がまだ測っていない)。"""
+    `slice_bytes` が None は未測定 (測る側がまだ測っていない)。`bytes_stale` は測った値が
+    測定間隔の 2 倍より古いこと、`measure_outcome` / `measure_elapsed_sec` は直近の測定の
+    結果 (ok / aborted / failed) と経過時間。"""
     level_rows = ohlcv_slices.capacity_level(rows, plan.rows)
     used_bytes = None
     level_bytes = None
@@ -150,6 +175,9 @@ def capacity_status(plan, *, rows: int, slice_bytes: int | None, db_path: Path |
         "slice_bytes": slice_bytes, "used_bytes": used_bytes,
         "slice_bytes_measured_at": (None if slice_bytes_measured_at is None
                                     else slice_bytes_measured_at.isoformat()),
+        "slice_bytes_stale": bytes_stale,
+        "measure_outcome": measure_outcome,
+        "measure_elapsed_sec": measure_elapsed_sec,
         "byte_capacity": plan.bytes, "byte_level": level_bytes,
         "base_bytes": ohlcv_slices.SLICE_BASE_BYTES,
         "bytes_per_row": ohlcv_slices.SLICE_BYTES_PER_ROW,
@@ -187,8 +215,11 @@ class CapacityReader:
     def __init__(self, plan_fn: Callable[[], object], db_path: Path, *,
                  bytes_source: Callable[[], tuple[object, datetime] | None]
                  | None = None,
-                 clock: Callable[[], datetime] | None = None) -> None:
+                 clock: Callable[[], datetime] | None = None,
+                 measure_info_source: Callable[[], dict | None] | None = None
+                 ) -> None:
         self._clock = clock
+        self._measure_info_source = measure_info_source
         self._plan_fn = plan_fn
         self._db_path = Path(db_path)
         self._bytes_source = bytes_source
@@ -196,6 +227,17 @@ class CapacityReader:
     def attach_bytes_source(
             self, source: Callable[[], tuple[object, datetime] | None]) -> None:
         self._bytes_source = source
+
+    def attach_measure_info_source(
+            self, source: Callable[[], dict | None]) -> None:
+        self._measure_info_source = source
+
+    def _measure_info(self) -> dict:
+        try:
+            info = None if self._measure_info_source is None else self._measure_info_source()
+        except Exception:  # noqa: BLE001
+            return {}
+        return info if type(info) is dict else {}
 
     def _measured(self) -> tuple[int | None, datetime | None]:
         measured = None if self._bytes_source is None else self._bytes_source()
@@ -209,22 +251,34 @@ class CapacityReader:
     def status(self, conn: sqlite3.Connection) -> dict:
         plan = self._plan_fn()
         size, at = self._measured()
-        return capacity_status(plan, rows=stored_slice_rows(
-            conn, now=None if self._clock is None else self._clock()),
+        info = self._measure_info()
+        now = datetime.now(timezone.utc) if self._clock is None else self._clock()
+        interval = info.get("interval_sec")
+        stale = None
+        if at is not None and type(interval) in (int, float) and interval > 0:
+            stale = (now - at).total_seconds() > 2 * interval
+        elapsed = info.get("elapsed_sec")
+        return capacity_status(plan, rows=stored_slice_rows(conn, now=now),
                                slice_bytes=size, db_path=self._db_path,
-                               slice_bytes_measured_at=at)
+                               slice_bytes_measured_at=at,
+                               measure_outcome=info.get("last_outcome"),
+                               measure_elapsed_sec=(
+                                   elapsed if type(elapsed) in (int, float) else None),
+                               bytes_stale=stale)
 
 
 # --- abandoned と mission の終端 -------------------------------------------
 
-def abandoned_status(conn: sqlite3.Connection, *, now: datetime) -> dict:
+def abandoned_status(conn: sqlite3.Connection, *, now: datetime,
+                     total_agg: dict | None = None) -> dict:
     """abandoned を `abandoned_at` で帰属させた理由別件数。
 
     `total` は累計 (時刻の無い `legacy_unknown` を除く)、`latest_day` は直近運用日。
     `cleanup` と `legacy_unknown` は別枠で、decision の母数には合算しない。"""
     day_start = market_hours.trading_day_start(now)
     until = now + timedelta(minutes=1)
-    total = signals.human_signal_aggregates(conn, since=_EPOCH, until=until)
+    total = total_agg if total_agg is not None else signals.human_signal_aggregates(
+        conn, since=_EPOCH, until=until)
     latest = signals.human_signal_aggregates(conn, since=day_start, until=until)
 
     def by_reason(counts: dict) -> dict:
@@ -240,9 +294,10 @@ def abandoned_status(conn: sqlite3.Connection, *, now: datetime) -> dict:
 
 
 def decision_status(conn: sqlite3.Connection, *, since: datetime,
-                    until: datetime) -> dict:
+                    until: datetime, agg: dict | None = None) -> dict:
     """decision 行だけを母数にした accept / reject の件数。abandoned は入れない。"""
-    agg = signals.human_signal_aggregates(conn, since=since, until=until)
+    if agg is None:
+        agg = signals.human_signal_aggregates(conn, since=since, until=until)
     counts: dict[str, int] = {}
     for row in agg["decisions"]:
         key = row["decision"] if row["decision"] == "accept" else (
@@ -293,8 +348,19 @@ def econ_signal_status(conn: sqlite3.Connection, *, now: datetime,
 
     day_start = market_hours.trading_day_start(now)
     until = now + timedelta(minutes=1)
-    section("abandoned", lambda: abandoned_status(conn, now=now))
-    section("decisions", lambda: decision_status(conn, since=_EPOCH, until=until))
+    # 全期間の集計は 1 回だけ走らせ、abandoned と decisions が同じ結果を読む。
+    total_agg: dict = {}
+
+    def shared_total() -> dict:
+        if "agg" not in total_agg:
+            total_agg["agg"] = signals.human_signal_aggregates(
+                conn, since=_EPOCH, until=until)
+        return total_agg["agg"]
+
+    section("abandoned",
+            lambda: abandoned_status(conn, now=now, total_agg=shared_total()))
+    section("decisions", lambda: decision_status(
+        conn, since=_EPOCH, until=until, agg=shared_total()))
     section("missions_latest_day",
             lambda: mission_status_counts(conn, since=day_start, until=until))
     section("shadow", lambda: shadow_status(conn))
@@ -320,8 +386,9 @@ def format_econ_lines(econ: dict | None) -> list[str]:
                               if "slice_worker" in econ else "")]
     dec = econ.get("decisions")
     lines.append("  decisions: " + ("unavailable" if dec is None else
-                 f"{_fmt(dec['total'])} " + ", ".join(
-                     f"{k}={v}" for k, v in sorted(dec["by_kind"].items()))).rstrip())
+                 f"{_fmt(dec.get('total'))} " + ", ".join(
+                     f"{OTHER_LABEL if k == OTHER_KIND else k}={_fmt(v)}"
+                     for k, v in sorted((dec.get("by_kind") or {}).items()))).rstrip())
     ab = econ.get("abandoned")
     if ab is None:
         lines.append("  abandoned: unavailable")
@@ -342,7 +409,10 @@ def format_econ_lines(econ: dict | None) -> list[str]:
     shadow = econ.get("shadow")
     if shadow is not None:
         lines.append("  shadow: " + (", ".join(
-            f"{_shadow_label(row)}={row['n']}" for row in shadow) or "none"))
+            f"{_shadow_label(row)}={_fmt(row.get('n'))}" for row in shadow) or "none"))
+        omitted = econ.get("shadow_omitted")
+        if type(omitted) is int and omitted > 0:
+            lines.append(f"  shadow: 省略 {omitted} 組")
     cap = econ.get("slice_capacity")
     if "slice_capacity" not in econ:
         pass
@@ -350,23 +420,59 @@ def format_econ_lines(econ: dict | None) -> list[str]:
         lines.append("  slice capacity: unavailable")
     else:
         unmeasured = cap.get("slice_bytes") is None
+        stale = cap.get("slice_bytes_stale") is True
+        byte_level = _fmt(cap.get("byte_level")) + (", 古い" if stale else "")
         lines.append(
-            f"  slice capacity: rows {cap['rows']}/{cap['row_capacity']} "
-            f"({cap['row_level']}) bytes "
+            f"  slice capacity: rows {_fmt(cap.get('rows'))}/{_fmt(cap.get('row_capacity'))} "
+            f"({_fmt(cap.get('row_level'))}) bytes "
             + ("未測定" if unmeasured else
-               f"{_fmt(cap['used_bytes'])}/{cap['byte_capacity']} ({_fmt(cap['byte_level'])})")
-            + f" S={cap['signal_daily']} (producer={_fmt(cap.get('signal_producer'))} "
+               f"{_fmt(cap.get('used_bytes'))}/{_fmt(cap.get('byte_capacity'))} ({byte_level})")
+            + f" S={_fmt(cap.get('signal_daily'))} "
+            f"(producer={_fmt(cap.get('signal_producer'))} "
             f"override={_fmt(cap.get('signal_override'))}) "
-            f"B0={cap['base_bytes']} beta={cap['bytes_per_row']} db={_fmt(cap['db_bytes'])} "
-            f"wal={_fmt(cap['wal_bytes'])} free={_fmt(cap['free_bytes'])}")
+            f"B0={_fmt(cap.get('base_bytes'))} beta={_fmt(cap.get('bytes_per_row'))} "
+            f"db={_fmt(cap.get('db_bytes'))} wal={_fmt(cap.get('wal_bytes'))} "
+            f"free={_fmt(cap.get('free_bytes'))}")
         if not unmeasured:
-            lines.append(f"  slice bytes: {cap['slice_bytes']} "
+            lines.append(f"  slice bytes: {_fmt(cap.get('slice_bytes'))} "
                          f"(measured_at={_fmt(cap.get('slice_bytes_measured_at'))})")
-        if cap["capacity_override_below_producer"]:
+        if cap.get("measure_outcome") is not None or cap.get("measure_elapsed_sec") is not None:
+            lines.append(f"  slice measure: last={_fmt(cap.get('measure_outcome'))} "
+                         f"elapsed={_fmt(cap.get('measure_elapsed_sec'))}s")
+        if cap.get("capacity_override_below_producer") is True:
             lines.append("  warning: capacity_override_below_producer")
-        if cap["level"] != "ok":
+        if cap.get("level") in ("warn", "full"):
             lines.append(f"  warning: slice capacity {cap['level']}")
     return lines
+
+
+class EconStatusCache:
+    """`econ_signal_status` の結果を `ttl_sec` の間共有する。
+
+    status / 対話 shell / web が同じ値を読み、重い集計を要求ごとに走らせない。
+    計算は 1 度に 1 つで、同時に来た要求は同じ結果を待つ。"""
+
+    def __init__(self, compute: Callable[[], dict], *, ttl_sec: float = 30.0,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
+        self._compute = compute
+        self._ttl = ttl_sec
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._value: dict | None = None
+        self._at = 0.0
+
+    def invalidate(self) -> None:
+        """次の `get` で計算し直させる。"""
+        with self._lock:
+            self._value = None
+
+    def get(self) -> dict:
+        with self._lock:
+            now = self._monotonic()
+            if self._value is None or now - self._at >= self._ttl:
+                self._value = self._compute()
+                self._at = self._monotonic()
+            return copy.deepcopy(self._value)
 
 
 # --- 日次 report -----------------------------------------------------------
@@ -428,7 +534,9 @@ def render_report(facts: dict, *, label: date, close_at: datetime) -> str:
     else:
         for key in ("signal_daily", "signal_producer", "signal_override",
                     "capacity_override_below_producer", "rows", "row_capacity",
-                    "row_level", "slice_bytes", "slice_bytes_measured_at", "used_bytes", "byte_capacity",
+                    "row_level", "slice_bytes", "slice_bytes_measured_at",
+                    "slice_bytes_stale", "measure_outcome", "measure_elapsed_sec",
+                    "used_bytes", "byte_capacity",
                     "byte_level", "base_bytes", "bytes_per_row", "db_bytes",
                     "wal_bytes", "free_bytes", "level"):
             lines.append(f"- {key}: {_fmt(cap.get(key))}")
@@ -518,13 +626,58 @@ def report_exists(reports_dir: Path, *, label: date) -> bool:
         os.close(dir_fd)
 
 
+#: これより古い part file は前回の異常終了の残りとして掃除する。
+STALE_PART_AGE_SEC = 3600.0
+_PART_NAME = re.compile(r"\.econ-signal-.+\.part\Z")
+
+
+def sweep_dir_stale_parts(dir_fd: int, *, now: float | None = None) -> int:
+    """保存 dir にある `.econ-signal-*.part` のうち、`STALE_PART_AGE_SEC` 以上前の
+    自分の通常 file を消す。消した数を返す。失敗は無視する (掃除は report の生成を
+    妨げない)。"""
+    removed = 0
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(dir_fd)
+    except OSError:
+        return 0
+    for name in names:
+        if not _PART_NAME.match(name):
+            continue
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                    and now - st.st_mtime >= STALE_PART_AGE_SEC):
+                os.unlink(name, dir_fd=dir_fd)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def sweep_stale_parts(reports_dir: Path, *, now: float | None = None) -> int:
+    """`sweep_dir_stale_parts` を保存 dir の path から行う。dir が無ければ 0。"""
+    try:
+        dir_fd = _open_reports_dir(Path(reports_dir), create=False)
+    except OSError:
+        return 0
+    try:
+        return sweep_dir_stale_parts(dir_fd, now=now)
+    finally:
+        os.close(dir_fd)
+
+
 def write_report_once(reports_dir: Path, *, label: date, body: str) -> Path | None:
     """取引日ごとに 1 file。既にあれば何もせず None。親専有 (dir 0700 / file 0600)。
 
     保存 dir は symlink を辿らずに開き、以降は dir fd 相対で作る。part file に書き切って
     から `link` で最終名にするので、途中で落ちても最終名の欠けた file は残らない
     (次の試行がやり直せる)。最終名が通常 file でない・owner が違う・mode が違うときは
-    生成済みとみなさず `ReportStoreError` を上げる。"""
+    生成済みとみなさず `ReportStoreError` を上げる。
+
+    part 名は pid と乱数で一意にし、前回の異常終了で残った古い part は書く前に掃除する。
+    最終名への `os.link` が使えない filesystem (hard link 非対応) は対象外で、
+    本番の保存先は local fs である。"""
     reports_dir = Path(reports_dir)
     dir_fd = _open_reports_dir(reports_dir, create=True)
     try:
@@ -532,7 +685,9 @@ def write_report_once(reports_dir: Path, *, label: date, body: str) -> Path | No
         name = _report_name(label)
         if _final_is_generated(dir_fd, name):
             return None
-        part = f".econ-signal-{label.isoformat()}.{os.getpid()}.part"
+        sweep_dir_stale_parts(dir_fd)
+        part = (f".econ-signal-{label.isoformat()}.{os.getpid()}."
+                f"{secrets.token_hex(8)}.part")
         fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                      dir_fd=dir_fd)
         try:
@@ -566,7 +721,10 @@ def make_daily_report_callback(*, reports_dir: Path,
     """scheduler の日次 hook (`register_daily_report`) に渡す callback。
 
     取引日 (`report_label`) で一意なので、at-least-once で呼ばれても 2 つ目は作らない。
-    読み取り接続を callback の中で開いて閉じる。例外は呼び出し側 (scheduler) が数える。"""
+    読み取り接続を callback の中で開いて閉じる。例外は呼び出し側 (scheduler) が数える。
+    作った時点 (起動時) に、保存 dir の古い part file を掃除する。"""
+    sweep_stale_parts(reports_dir)
+
     def callback(close_at: datetime) -> None:
         label = report_label(close_at)
         if report_exists(reports_dir, label=label):

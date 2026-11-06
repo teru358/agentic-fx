@@ -784,6 +784,7 @@ class App:
     conn_econ_read: object | None = None
     conn_econ_write: object | None = None
     econ_health: object | None = None
+    econ_status_cache: object | None = None
 
     def close(self, *, busy_resources: frozenset[str] = frozenset()) -> list[str]:
         skipped: list[str] = []
@@ -1915,12 +1916,15 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         econ_health = econ_signal_report.WorkerHealth()
         capacity_reader = econ_signal_report.CapacityReader(
             capacity_monitor.plan, root / "data" / "agentic.db", clock=clock.now)
+        econ_status_cache = econ_signal_report.EconStatusCache(
+            lambda: _compute_econ_signal(root, clock, capacity_reader, econ_health))
         ops_service = _build_ops_service(
             root, settings, clock, conn_ops=conn_ops, state=state, activity=activity,
             health_latch=health_latch, supervisor=supervisor,
             improve_supervisor=improve_supervisor, plugins_dir=plugins_dir, outage=outage,
             trade_event_sink=trade_sink, ingest=ingest, admission=admission,
-            econ_health=econ_health, capacity_reader=capacity_reader)
+            econ_health=econ_health, capacity_reader=capacity_reader,
+            econ_status_cache=econ_status_cache)
         # 親専有の日次 report。市場の当日 close 後に 1 回、起動時は当日分が無ければ 1 回
         # (scheduler が呼ぶ。生成側が取引日で一意にする)。
         scheduler.register_daily_report(econ_signal_report.make_daily_report_callback(
@@ -1932,6 +1936,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
         ops_service.emit_pending_improve_notices(
             enabled=settings.notify.improve_events)
         commands.use_ops_service(ops_service)
+        commands.use_econ_status_source(econ_status_cache.get)
         ops_recovered = _recover_ops(ops_service, conn_ops, activity)
         econ_worker = EconSliceWorker(
             read_conn=conn_econ_read, write_conn=conn_econ_write,
@@ -1944,6 +1949,7 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
             open_conn=lambda: connect_readonly(root / "data" / "agentic.db"),
             measure_fn=econ_signal_report.slice_related_bytes, now_fn=clock.now)
         capacity_reader.attach_bytes_source(lambda: econ_measurer.measurement)
+        capacity_reader.attach_measure_info_source(econ_measurer.info)
         app = App(conn_core=conn_core, conn_shell=conn_shell, settings=settings,
                    state=state, activity=activity, broker=broker,
                    executor=executor, provider=provider, econ=econ,
@@ -1966,7 +1972,8 @@ def build_app(root: Path, *, runner: AgentRunner | None = None,
                    trade_event_sink=trade_sink, trade_event_token=trade_token,
                    econ_worker=econ_worker, econ_measurer=econ_measurer,
                    conn_econ_read=conn_econ_read,
-                   conn_econ_write=conn_econ_write, econ_health=econ_health)
+                   conn_econ_write=conn_econ_write, econ_health=econ_health,
+                   econ_status_cache=econ_status_cache)
         wait_budget.evaluate_wait_budget(clock.now(), trigger="startup")
         return app
     except BaseException:
@@ -2094,11 +2101,21 @@ def _reference_status_rows(conn, ingest, now: datetime, settings) -> list[dict] 
         return None
 
 
+def _compute_econ_signal(root: Path, clock, capacity_reader, econ_health) -> dict:
+    """status 用の econ 集計。専用の短命な読取接続で、他の lock を持たずに計算する。"""
+    conn = connect_readonly(root / "data" / "agentic.db")
+    try:
+        return econ_signal_report.econ_signal_status(
+            conn, now=clock.now(), capacity=capacity_reader, worker=econ_health)
+    finally:
+        conn.close()
+
+
 def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity,
                        health_latch, supervisor, improve_supervisor, plugins_dir,
                        outage, trade_event_sink=None, ingest=None,
                        admission=None, econ_health=None,
-                       capacity_reader=None) -> OpsService:
+                       capacity_reader=None, econ_status_cache=None) -> OpsService:
     db_path = root / "data" / "agentic.db"
     status_lock = threading.Lock()
     landlock_cache: list[bool] = []
@@ -2128,9 +2145,6 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                     if ingest is not None else None)
                 admission_status = (admission.status(conn, clock.now())
                                     if admission is not None else None)
-                econ_signal = (econ_signal_report.econ_signal_status(
-                    conn, now=clock.now(), capacity=capacity_reader,
-                    worker=econ_health) if capacity_reader is not None else None)
             try:
                 landlock_ok = landlock_state()
                 # 配備先が無いときは approved_plugins の存在しない旨の log を出さない。
@@ -2146,6 +2160,13 @@ def _build_ops_service(root: Path, settings, clock, *, conn_ops, state, activity
                 setup = {"record_state": "unknown", "pending_steps": []}
         finally:
             conn.close()
+        # 重い集計は status_lock の外で、共有 cache から読む。
+        econ_signal = None
+        if econ_status_cache is not None:
+            try:
+                econ_signal = econ_status_cache.get()
+            except Exception as exc:  # noqa: BLE001 — 補助表示は status を止めない
+                _log.warning("econ signal status unavailable: %s", type(exc).__name__)
         mission = None
         if recent:
             mission = {"loop": recent[0]["loop"], "status": recent[0]["status"],
@@ -2947,14 +2968,14 @@ def run_service(root: Path, *, daemon: bool = False,
             econ_thread = threading.Thread(
                 target=_run_econ_slice_worker, args=(app, stop_event),
                 daemon=True, name="afx-econ-slices")
-            econ_thread.start()
             app.econ_health.attach(econ_thread)
+            econ_thread.start()
         except Exception as exc:  # noqa: BLE001 — worker を起こせなくてもサービスは続ける
             started = econ_thread is not None and econ_thread.ident is not None
+            _log.exception("econ slice worker could not start")
             if not started:
                 econ_thread = None
-            _log.exception("econ slice worker could not start")
-            app.econ_health.mark_start_failed()
+                app.econ_health.mark_start_failed()
             app.activity.write(Category.SYSTEM, "econ_slice_worker_start_failed",
                                safe_error_text(exc))
         # 起動時回復 (build_app 内) の後に listener を開く。tick の起動は待たせない。
@@ -3060,8 +3081,12 @@ def run_service(root: Path, *, daemon: bool = False,
             econ_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
             econ_still_busy = econ_thread.is_alive()
         if measure_thread is not None:
+            # 測定 thread は自分の読取接続だけを持ち自分で閉じる。止まらなくても
+            # worker の接続・単一起動 lock は閉じてよく、終了コードにも数えない。
             measure_thread.join(timeout=_ECON_WORKER_JOIN_TIMEOUT_SEC)
-            econ_still_busy = econ_still_busy or measure_thread.is_alive()
+            if measure_thread.is_alive():
+                _log.warning("econ capacity measurer did not stop within %.0fs",
+                             _ECON_WORKER_JOIN_TIMEOUT_SEC)
         # **(レビュー 3 周目 codex E2)** タイムアウトでも runner.close()
         # は呼ぶ — 子プロセス/接続の leak は停止の目的に反する
         # (以前は join 成功時のみ close していた「上書き 7」の判断を、

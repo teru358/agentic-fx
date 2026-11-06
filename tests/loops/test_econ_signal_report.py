@@ -504,3 +504,250 @@ def test_slice_bytes_stop_midway_when_a_progress_handler_asks(tmp_path):
     with pytest.raises(Exception, match="interrupted"):
         esr.slice_related_bytes(conn)
     conn.set_progress_handler(None, 0)
+
+
+# --- 測定の状態と鮮度 -----------------------------------------------------------------
+
+def _reader_with(tmp_path, at, *, info, now=NOW):
+    return esr.CapacityReader(
+        lambda: _Plan(1000, 10**9), tmp_path / "d.db", clock=lambda: now,
+        bytes_source=lambda: (12_345, at), measure_info_source=lambda: info)
+
+
+def test_capacity_status_shows_the_last_outcome_and_the_elapsed_time(tmp_path):
+    conn = _conn(tmp_path)
+    reader = _reader_with(tmp_path, NOW, info={
+        "last_outcome": "aborted", "elapsed_sec": 30.2, "interval_sec": 600.0})
+    out = reader.status(conn)
+    assert out["measure_outcome"] == "aborted"
+    assert out["measure_elapsed_sec"] == 30.2
+    assert out["slice_bytes_stale"] is False
+
+
+@pytest.mark.parametrize("age_sec,stale", [(1199, False), (1200, False), (1201, True)])
+def test_a_measurement_older_than_twice_the_interval_is_stale(tmp_path, age_sec, stale):
+    conn = _conn(tmp_path)
+    reader = _reader_with(tmp_path, NOW - timedelta(seconds=age_sec), info={
+        "last_outcome": "ok", "elapsed_sec": 1.0, "interval_sec": 600.0})
+    assert reader.status(conn)["slice_bytes_stale"] is stale
+
+
+def test_an_unmeasured_capacity_still_shows_why(tmp_path):
+    conn = _conn(tmp_path)
+    reader = esr.CapacityReader(
+        lambda: _Plan(1000, 10**9), tmp_path / "d.db", clock=lambda: NOW,
+        measure_info_source=lambda: {"last_outcome": "failed", "elapsed_sec": 0.0,
+                                     "interval_sec": 600.0})
+    out = reader.status(conn)
+    assert out["slice_bytes"] is None and out["slice_bytes_stale"] is None
+    assert out["measure_outcome"] == "failed"
+    text = "\n".join(esr.format_econ_lines({"slice_capacity": out}))
+    assert "bytes 未測定" in text and "slice measure: last=failed" in text
+
+
+def test_a_stale_bytes_level_carries_the_stale_word_in_every_line_format(tmp_path):
+    conn = _conn(tmp_path)
+    reader = _reader_with(tmp_path, NOW - timedelta(hours=1), info={
+        "last_outcome": "failed", "elapsed_sec": 2.5, "interval_sec": 600.0})
+    cap = reader.status(conn)
+    text = "\n".join(esr.format_econ_lines({"slice_capacity": cap}))
+    assert ", 古い)" in text
+    assert "slice measure: last=failed elapsed=2.5s" in text
+    fresh = _reader_with(tmp_path, NOW, info={
+        "last_outcome": "ok", "elapsed_sec": 1.0, "interval_sec": 600.0}).status(conn)
+    assert "古い" not in "\n".join(esr.format_econ_lines({"slice_capacity": fresh}))
+    report = esr.render_report({"slice_capacity": cap}, label=date(2026, 10, 30),
+                               close_at=NOW)
+    assert "- slice_bytes_stale: True" in report
+    assert "- measure_outcome: failed" in report
+    assert "- measure_elapsed_sec: 2.5" in report
+
+
+# --- 集計の重複と共有 cache -------------------------------------------------------------
+
+def test_the_all_time_aggregate_runs_once_for_abandoned_and_decisions(tmp_path, monkeypatch):
+    conn = _conn(tmp_path)
+    calls = []
+    original = esr.signals.human_signal_aggregates
+
+    def counting(c, **kw):
+        calls.append(kw["since"])
+        return original(c, **kw)
+
+    monkeypatch.setattr(esr.signals, "human_signal_aggregates", counting)
+    out = esr.econ_signal_status(conn, now=NOW, capacity=None, worker=None)
+    assert out["abandoned"] is not None and out["decisions"] is not None
+    assert calls.count(esr._EPOCH) == 1 and len(calls) == 2
+
+
+class _Mono:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_the_status_cache_computes_once_per_ttl_and_shares_the_value():
+    mono, runs = _Mono(), []
+    cache = esr.EconStatusCache(lambda: runs.append(1) or {"n": len(runs)},
+                                ttl_sec=30.0, monotonic=mono)
+    assert cache.get() == {"n": 1}
+    mono.t = 29.9
+    assert cache.get() == {"n": 1} and len(runs) == 1
+    mono.t = 30.0
+    assert cache.get() == {"n": 2}
+    cache.invalidate()
+    assert cache.get() == {"n": 3}
+
+
+def test_the_status_cache_hands_out_copies():
+    cache = esr.EconStatusCache(lambda: {"a": {"b": 1}}, ttl_sec=30.0)
+    cache.get()["a"]["b"] = 99
+    assert cache.get() == {"a": {"b": 1}}
+
+
+def test_concurrent_readers_wait_for_one_computation():
+    started, release, runs = threading.Event(), threading.Event(), []
+
+    def compute():
+        runs.append(1)
+        started.set()
+        release.wait(5)
+        return {"v": 1}
+
+    cache = esr.EconStatusCache(compute, ttl_sec=30.0)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(cache.get()))
+               for _ in range(3)]
+    try:
+        for t in threads:
+            t.start()
+        assert started.wait(5)
+    finally:
+        release.set()
+        for t in threads:
+            t.join(5)
+    assert results == [{"v": 1}] * 3 and len(runs) == 1
+
+
+# --- 表示の欠けと省略 -----------------------------------------------------------------
+
+def test_format_econ_lines_never_prints_none_for_a_broken_capacity_section():
+    econ = {"slice_worker": "alive", "decisions": {"total": 1, "by_kind": {"other": 1}},
+            "slice_capacity": {"rows": None, "row_capacity": None, "row_level": None,
+                               "slice_bytes": 1, "used_bytes": None, "byte_capacity": None,
+                               "byte_level": None, "signal_daily": None,
+                               "base_bytes": None, "bytes_per_row": None,
+                               "level": None, "capacity_override_below_producer": None}}
+    text = "\n".join(esr.format_econ_lines(econ))
+    assert "None" not in text
+    assert "warning" not in text
+    assert "その他=1" in text
+
+
+def test_format_econ_lines_reports_omitted_shadow_groups():
+    econ = {"slice_worker": "alive", "shadow": [], "shadow_omitted": 7}
+    assert "shadow: 省略 7 組" in "\n".join(esr.format_econ_lines(econ))
+
+
+# --- slice bytes は 1 つの読取 transaction で ------------------------------------------
+
+def test_slice_bytes_are_read_inside_one_read_transaction(tmp_path):
+    conn = _conn(tmp_path)
+    statements = []
+    conn.set_trace_callback(statements.append)
+    esr.slice_related_bytes(conn)
+    conn.set_trace_callback(None)
+    statements = [s for s in statements if not s.lstrip().startswith("--")]
+    kinds = [s.strip().split()[0].upper() for s in statements]
+    first = next(i for i, s in enumerate(statements) if "sqlite_master" in s)
+    last = max(i for i, s in enumerate(statements) if "dbstat" in s.lower())
+    assert kinds[first - 1] == "BEGIN"
+    assert kinds[last + 1] == "COMMIT"
+    assert "COMMIT" not in kinds[first:last + 1] and kinds.count("BEGIN") == 1
+    assert conn.in_transaction is False
+
+
+def test_slice_bytes_roll_back_when_interrupted(tmp_path):
+    conn = _conn(tmp_path)
+    conn.set_progress_handler(lambda: 1, 1)
+    with pytest.raises(Exception, match="interrupted"):
+        esr.slice_related_bytes(conn)
+    conn.set_progress_handler(None, 0)
+    assert conn.in_transaction is False
+
+
+def test_slice_bytes_inside_the_callers_transaction_leave_it_open(tmp_path):
+    conn = _conn(tmp_path)
+    conn.execute("BEGIN")
+    esr.slice_related_bytes(conn)
+    assert conn.in_transaction is True
+    conn.rollback()
+
+
+# --- part file ---------------------------------------------------------------------
+
+def test_a_part_left_with_the_same_pid_does_not_block_the_next_write(tmp_path, monkeypatch):
+    reports = tmp_path / "econ_signal"
+    label = date(2026, 10, 30)
+    reports.mkdir(mode=0o700)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    (reports / f".econ-signal-{label.isoformat()}.4242.part").write_text("junk")
+    written = esr.write_report_once(reports, label=label, body="ok\n")
+    assert written is not None and written.read_text() == "ok\n"
+
+
+def test_part_names_differ_between_writes_of_the_same_pid(tmp_path, monkeypatch):
+    names = []
+    original = os.open
+
+    def spy(path, flags, *args, **kwargs):
+        if isinstance(path, str) and path.endswith(".part"):
+            names.append(path)
+        return original(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", spy)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    reports = tmp_path / "econ_signal"
+    esr.write_report_once(reports, label=date(2026, 10, 29), body="a")
+    esr.write_report_once(reports, label=date(2026, 10, 30), body="b")
+    assert len(names) == 2 and len({n.split(".")[-2] for n in names}) == 2
+
+
+def test_old_part_files_are_swept_and_fresh_ones_kept(tmp_path):
+    reports = tmp_path / "econ_signal"
+    reports.mkdir(mode=0o700)
+    old = reports / ".econ-signal-2026-10-01.1.aa.part"
+    fresh = reports / ".econ-signal-2026-10-02.2.bb.part"
+    other = reports / "keep.txt"
+    for p in (old, fresh, other):
+        p.write_text("x")
+    long_ago = os.stat(old).st_mtime - 2 * 3600
+    os.utime(old, (long_ago, long_ago))
+    os.utime(other, (long_ago, long_ago))
+    assert esr.sweep_stale_parts(reports) == 1
+    assert not old.exists() and fresh.exists() and other.exists()
+
+
+def test_the_daily_callback_sweeps_old_parts_when_it_is_built(tmp_path):
+    reports = tmp_path / "econ_signal"
+    reports.mkdir(mode=0o700)
+    old = reports / ".econ-signal-2026-10-01.1.aa.part"
+    old.write_text("x")
+    long_ago = os.stat(old).st_mtime - 2 * 3600
+    os.utime(old, (long_ago, long_ago))
+    esr.make_daily_report_callback(reports_dir=reports, open_conn=lambda: None,
+                                   capacity=None, worker=None)
+    assert not old.exists()
+
+
+def test_sweeping_a_missing_directory_is_harmless(tmp_path):
+    assert esr.sweep_stale_parts(tmp_path / "nope") == 0
+
+
+def test_worker_health_calls_an_attached_but_unstarted_thread_not_started():
+    health = esr.WorkerHealth()
+    thread = threading.Thread(target=lambda: None)
+    health.attach(thread)
+    assert health.state() == "not_started"

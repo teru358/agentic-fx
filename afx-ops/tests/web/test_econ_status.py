@@ -137,3 +137,42 @@ def test_unavailable_econ_sections_are_marked():
 def test_the_copied_abandon_reasons_match_the_daemon_definition():
     # 値の正本は agentic_fx.loops.econ_signal_report.ABANDON_REASONS (別 package なので写し)
     assert render.ECON_ABANDON_REASONS == REASONS
+
+
+def test_status_page_shows_the_other_decision_count_in_words():
+    econ = _econ(decisions={"total": 9, "by_kind": {"accept": 2, "other": 7}})
+    cells = _cells(_page({"econ_signal": econ}))
+    assert cells["decision その他"] == "7"
+    assert cells["decision accept"] == "2"
+
+
+def test_status_page_says_how_many_shadow_groups_were_left_out():
+    row = _econ()["shadow"][0]
+    shadow = [dict(row, result_code=f"r{i}") for i in range(render.MAX_ITEMS + 3)]
+    cells = _cells(_page({"econ_signal": _econ(shadow=shadow, shadow_omitted=4)}))
+    assert cells["shadow 省略"] == "7 組"
+    plain = _cells(_page({"econ_signal": _econ(shadow_omitted=0)}))
+    assert "shadow 省略" not in plain
+
+
+def test_status_page_says_how_many_decision_kinds_were_left_out():
+    by_kind = {f"reject:llm:code_{i:03d}": 1 for i in range(render.MAX_ITEMS + 2)}
+    cells = _cells(_page({"econ_signal": _econ(decisions={
+        "total": len(by_kind), "by_kind": by_kind})}))
+    assert cells["decision 省略"] == "2 種"
+
+
+def test_status_page_shows_the_measurement_state_and_staleness():
+    capacity = dict(_econ()["slice_capacity"], measure_outcome="aborted",
+                    measure_elapsed_sec=30.2, slice_bytes_stale=True)
+    cells = _cells(_page({"econ_signal": _econ(slice_capacity=capacity)}))
+    assert cells["slice measure_outcome"] == "aborted"
+    assert cells["slice measure_elapsed_sec"] == "30.2"
+    assert cells["slice slice_bytes_stale"] == "古い"
+    fresh = dict(capacity, slice_bytes_stale=False, measure_outcome="ok")
+    cells = _cells(_page({"econ_signal": _econ(slice_capacity=fresh)}))
+    assert cells["slice slice_bytes_stale"] == "新しい"
+    hostile = dict(capacity, measure_outcome="<b>x</b>")
+    page = _page({"econ_signal": _econ(slice_capacity=hostile)})
+    assert "<b>x" not in page
+    assert _cells(page)["slice measure_outcome"] == "-"

@@ -15,7 +15,7 @@
 - ペア別成績: {by_pair}
 - 時間帯別分布: {by_hour}
 - 却下内訳 (reject_category 別。指標回避帯の却下 `econ_window` は含めない): {reject_breakdown}
-- hold 率 (裁量判断のみ。strategy signal の採否 mission は含めない): {hold_rate}
+- hold 率 (裁量判断のみ。strategy signal の採否 mission と指標回避帯の却下 `econ_window` は母数に含めない): {hold_rate}
 
 ## 改善履歴
 

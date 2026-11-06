@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -303,6 +303,7 @@ def test_status_reads_the_workers_bytes_measurement_and_never_measures_itself(tm
         assert before["slice_bytes_measured_at"] is None
         stamp = datetime(2026, 11, 6, 1, 2, 3, tzinfo=timezone.utc)
         app.econ_measurer._measurement = (4321, stamp)
+        app.econ_status_cache.invalidate()
         from agentic_fx.loops import econ_signal_report
         econ_signal_report.empty_slice_bytes()
         with patch("agentic_fx.loops.econ_signal_report.slice_related_bytes") as probe:
@@ -404,7 +405,8 @@ def test_the_measurer_runs_on_its_own_thread_and_stops_with_the_service(tmp_path
     assert MEASURE_THREAD not in {t.name for t in threading.enumerate()}
 
 
-def test_a_measurer_that_does_not_stop_is_reported_as_a_shutdown_timeout(tmp_path):
+def test_a_measurer_that_does_not_stop_does_not_hold_the_workers_resources_or_the_exit_code(
+        tmp_path):
     app = _seam_app(tmp_path, FakeRunner([]))
     stop_event = threading.Event()
     release = threading.Event()
@@ -423,10 +425,13 @@ def test_a_measurer_that_does_not_stop_is_reported_as_a_shutdown_timeout(tmp_pat
     app.econ_measurer = _FakeMeasurer(stuck)
     app.econ_worker = _FakeWorker()
     try:
-        with patch("agentic_fx.service._ECON_WORKER_JOIN_TIMEOUT_SEC", 0.2):
-            assert _serve(tmp_path, app, stop_event) == 1
-        assert [a for k, a in written if k == "service_stopped"][0][0].startswith(
-            "shutdown_timeout")
+        with patch("agentic_fx.service._ECON_WORKER_JOIN_TIMEOUT_SEC", 0.2), \
+             patch("agentic_fx.service._log") as log:
+            assert _serve(tmp_path, app, stop_event) == 0
+        assert [a for k, a in written if k == "service_stopped"][0][0] == "graceful"
+        assert not [k for k, _ in written if k == "close_skipped_resources"]
+        assert any("measurer did not stop" in str(c.args[0])
+                   for c in log.warning.call_args_list)
     finally:
         release.set()
         for t in threading.enumerate():
@@ -435,3 +440,112 @@ def test_a_measurer_that_does_not_stop_is_reported_as_a_shutdown_timeout(tmp_pat
         for conn in (app.conn_econ_read, app.conn_econ_write):
             conn.close()
         app.instance_lock.close()
+
+
+def test_a_worker_that_started_before_start_raised_is_not_called_start_failed(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    seen = []
+
+    def watch(stop):
+        seen.append(app.econ_health.state())
+        stop_event.set()
+
+    app.econ_worker = _FakeWorker(watch)
+    original_start = threading.Thread.start
+
+    def start_then_raise(self):
+        original_start(self)
+        if self.name == THREAD:
+            self.join(5)
+            raise RuntimeError("late failure")
+
+    with patch.object(threading.Thread, "start", start_then_raise), \
+         patch("agentic_fx.service._log"):
+        assert _serve(tmp_path, app, stop_event) == 0
+    assert seen == ["alive"]
+    assert app.econ_health.state() == "stopped"
+
+
+def test_the_health_is_attached_before_the_thread_starts(tmp_path):
+    app = _seam_app(tmp_path, FakeRunner([]))
+    stop_event = threading.Event()
+    at_start = []
+    original_start = threading.Thread.start
+
+    def spy(self):
+        if self.name == THREAD:
+            at_start.append(app.econ_health._thread is self)
+        return original_start(self)
+
+    app.econ_worker = _FakeWorker(lambda stop: stop_event.set())
+    with patch.object(threading.Thread, "start", spy):
+        assert _serve(tmp_path, app, stop_event) == 0
+    assert at_start == [True]
+
+
+def test_status_computes_the_econ_section_outside_the_status_lock(tmp_path):
+    app = _build(tmp_path)
+    in_econ, release, second_in_lock = threading.Event(), threading.Event(), threading.Event()
+    equity_calls = []
+    original = app.econ_status_cache._compute
+
+    def blocking():
+        in_econ.set()
+        release.wait(10)
+        return original()
+
+    from agentic_fx.core.paper_broker import PaperBroker
+    real_equity = PaperBroker.equity
+
+    def counting_equity(self):
+        equity_calls.append(1)
+        if len(equity_calls) == 2:
+            second_in_lock.set()
+        return real_equity(self)
+
+    app.econ_status_cache._compute = blocking
+    first = threading.Thread(target=app.ops._status_provider)
+    second = threading.Thread(target=app.ops._status_provider)
+    try:
+        with patch.object(PaperBroker, "equity", counting_equity):
+            first.start()
+            assert in_econ.wait(10)
+            second.start()
+            assert second_in_lock.wait(5), "econ 集計が status_lock を持ったまま走っている"
+    finally:
+        release.set()
+        first.join(10)
+        second.join(10)
+        app.close()
+
+
+def test_the_shell_and_the_status_read_the_same_econ_cache(tmp_path):
+    app = _build(tmp_path)
+    try:
+        assert app.commands.econ_status_source == app.econ_status_cache.get
+        runs = []
+        original = app.econ_status_cache._compute
+        app.econ_status_cache._compute = lambda: runs.append(1) or original()
+        app.ops._status_provider()
+        app.ops._status_provider()
+        app.commands.econ_status_source()
+        assert len(runs) == 1
+    finally:
+        app.close()
+
+
+def test_status_shows_the_measurers_last_outcome_and_age(tmp_path):
+    app = _build(tmp_path)
+    try:
+        app.econ_measurer._last_outcome = "aborted"
+        app.econ_measurer._last_elapsed = 30.4
+        interval = app.econ_measurer.info()["interval_sec"]
+        app.econ_measurer._measurement = (4321, NOW - timedelta(seconds=interval * 3))
+        app.econ_status_cache.invalidate()
+        cap = app.ops.status(ShellCaller.SHELL)["econ_signal"]["slice_capacity"]
+        assert cap["measure_outcome"] == "aborted"
+        assert cap["measure_elapsed_sec"] == 30.4
+        assert cap["slice_bytes_stale"] is True
+    finally:
+        app.close()

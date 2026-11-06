@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import Callable
 
 from agentic_fx.core import improve_repeat as ir
-from agentic_fx.loops.econ_signal_report import ABANDON_REASONS, KNOWN_MISSION_TERMINALS
+from agentic_fx.loops.econ_signal_report import (ABANDON_REASONS, KNOWN_MISSION_TERMINALS,
+                                                  OTHER_KIND)
 from agentic_fx.store import plugin_deploy_ops as deploy_store
 from agentic_fx.store import signal_decisions as _sig_dec
 from agentic_fx.store import signal_shadow as _sig_shadow
@@ -273,6 +274,7 @@ IMPROVE_OUTBOX_WINDOW = timedelta(days=7)
 
 _ECON_WORKER_STATES = frozenset({"alive", "stopped", "start_failed", "not_started", "unknown"})
 _ECON_LEVELS = frozenset({"ok", "warn", "full"})
+_ECON_MEASURE_OUTCOMES = frozenset({"ok", "aborted", "failed"})
 _ECON_CAPACITY_INTS = ("signal_daily", "signal_producer", "signal_override", "rows",
                        "row_capacity", "slice_bytes", "used_bytes", "byte_capacity",
                        "base_bytes", "bytes_per_row", "db_bytes", "wal_bytes", "free_bytes")
@@ -331,17 +333,37 @@ def _econ_abandoned(raw: object) -> dict | None:
 def _econ_decisions(raw: object) -> dict | None:
     if type(raw) is not dict or type(raw.get("by_kind")) is not dict:
         return None
-    by_kind = {key: value for key, value in raw["by_kind"].items()
-               if type(key) is str and key in _ECON_DECISION_KINDS
-               and _econ_int(value) is not None}
+    by_kind: dict[str, int] = {}
+    other = 0
+    for key, value in raw["by_kind"].items():
+        count = _econ_int(value)
+        if count is None:
+            continue
+        if type(key) is str and key in _ECON_DECISION_KINDS:
+            by_kind[key] = count
+        else:
+            other += count
+    if other:
+        by_kind[OTHER_KIND] = other
     return {"total": _econ_int(raw.get("total")), "by_kind": by_kind}
+
+
+_ECON_SHADOW_MAX = 64
+
+
+def _econ_shadow_omitted(raw: object) -> int | None:
+    """投影で表に載せなかった組の数 (上限を超えた分と、形の崩れた行)。"""
+    if type(raw) is not list:
+        return None
+    shown = _econ_shadow(raw)
+    return len(raw) - len(shown or [])
 
 
 def _econ_shadow(raw: object) -> list | None:
     if type(raw) is not list:
         return None
     rows = []
-    for row in raw[:64]:
+    for row in raw[:_ECON_SHADOW_MAX]:
         if type(row) is not dict:
             continue
         item = {key: _econ_known(row.get(key), allowed)
@@ -362,6 +384,14 @@ def _econ_capacity(raw: object) -> dict | None:
     below = raw.get("capacity_override_below_producer")
     out["capacity_override_below_producer"] = below if type(below) is bool else None
     out["slice_bytes_measured_at"] = _econ_time(raw.get("slice_bytes_measured_at"))
+    stale = raw.get("slice_bytes_stale")
+    out["slice_bytes_stale"] = stale if type(stale) is bool else None
+    out["measure_outcome"] = _econ_known(raw.get("measure_outcome"), _ECON_MEASURE_OUTCOMES)
+    elapsed = raw.get("measure_elapsed_sec")
+    out["measure_elapsed_sec"] = (
+        round(float(elapsed), 1)
+        if type(elapsed) in (int, float) and math.isfinite(elapsed) and elapsed >= 0
+        else None)
     return out
 
 
@@ -386,6 +416,7 @@ def econ_signal_view(raw: object) -> dict | None:
         "missions_latest_day": _econ_section(lambda: _econ_counts(
             raw.get("missions_latest_day"), (*KNOWN_MISSION_TERMINALS, "running", "other"))),
         "shadow": _econ_section(lambda: _econ_shadow(raw.get("shadow"))),
+        "shadow_omitted": _econ_section(lambda: _econ_shadow_omitted(raw.get("shadow"))),
         "slice_capacity": _econ_section(lambda: _econ_capacity(raw.get("slice_capacity"))),
     }
 

@@ -1882,10 +1882,10 @@ def test_status_shows_system_filtered_as_a_known_terminal(tmp_path):
     assert "trade:system_filtered (filtered, not failed)" in out
 
 
-def test_status_adds_econ_signal_lines_from_the_ops_status(tmp_path):
+def test_status_adds_econ_signal_lines_from_the_shared_cache_not_the_ops_status(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
     cmds.ops_service = MagicMock()
-    cmds.ops_service.status.return_value = {"econ_signal": _ECON}
+    cmds.use_econ_status_source(lambda: _ECON)
     out = cmds.dispatch("status")
     assert "econ signal: worker=alive" in out
     assert "retry_exhausted=1/4" in out
@@ -1893,10 +1893,14 @@ def test_status_adds_econ_signal_lines_from_the_ops_status(tmp_path):
     assert "system_filtered=2 failed=0 running=0" in out
     assert "rows 80/100 (warn)" in out
     assert "warning: slice capacity warn" in out
+    cmds.ops_service.status.assert_not_called()
 
 
-def test_status_survives_an_ops_status_that_has_no_econ_section(tmp_path):
+def test_status_survives_an_econ_source_that_fails(tmp_path):
     _, _, _, cmds = _commands(tmp_path)
-    cmds.ops_service = MagicMock()
-    cmds.ops_service.status.side_effect = RuntimeError("busy")
+
+    def broken():
+        raise RuntimeError("busy")
+
+    cmds.use_econ_status_source(broken)
     assert "econ signal" not in cmds.dispatch("status")

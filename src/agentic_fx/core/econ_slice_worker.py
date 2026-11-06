@@ -921,6 +921,7 @@ class CapacityMeasurer:
         self._progress_steps = progress_steps
         self._measurement: tuple[object, datetime] | None = None
         self._last_outcome: str | None = None
+        self._last_elapsed: float | None = None
 
     @property
     def measurement(self) -> tuple[object, datetime] | None:
@@ -932,27 +933,48 @@ class CapacityMeasurer:
         """直近の測定の結果: `ok` / `aborted` (停止・時間上限) / `failed`。"""
         return self._last_outcome
 
+    @property
+    def last_elapsed_sec(self) -> float | None:
+        """直近の測定 (成功・打切り・失敗のいずれも) にかかった経過時間。"""
+        return self._last_elapsed
+
+    def info(self) -> dict:
+        """status に出す測定の状態: 直近の結果・経過時間・測定間隔。"""
+        return {"last_outcome": self._last_outcome,
+                "elapsed_sec": self._last_elapsed, "interval_sec": self._interval}
+
     def run(self, stop: threading.Event) -> None:
-        """停止されるまで `interval_sec` ごとに測る。接続は最後にここで閉じる。"""
-        try:
-            conn = self._open_conn()
-        except Exception:
-            _log.exception("econ capacity measurement connection failed")
-            self._last_outcome = "failed"
-            return
+        """停止されるまで `interval_sec` ごとに測る。接続を開けない・測定が例外で
+        終わるときも thread は終わらず、次の間隔でもう一度試す。接続は最後にここで閉じる。"""
+        conn: sqlite3.Connection | None = None
         try:
             while not stop.is_set():
-                self.measure_once(conn, stop)
+                try:
+                    if conn is None:
+                        conn = self._open_conn()
+                    self.measure_once(conn, stop)
+                except Exception:
+                    _log.exception("econ capacity measurement attempt failed")
+                    self._last_outcome = "failed"
+                    self._close(conn)
+                    conn = None
                 if stop.wait(self._interval):
                     break
         finally:
-            try:
-                conn.close()
-            except Exception:
-                _log.exception("econ capacity measurement connection close failed")
+            self._close(conn)
+
+    @staticmethod
+    def _close(conn: sqlite3.Connection | None) -> None:
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            _log.exception("econ capacity measurement connection close failed")
 
     def measure_once(self, conn: sqlite3.Connection, stop: threading.Event) -> str:
-        deadline = self._monotonic() + self._time_limit
+        started = self._monotonic()
+        deadline = started + self._time_limit
         interrupted: list[str] = []
 
         def should_abort() -> int:
@@ -976,6 +998,7 @@ class CapacityMeasurer:
                 self._last_outcome = "failed"
             return self._last_outcome
         finally:
+            self._last_elapsed = max(0.0, self._monotonic() - started)
             conn.set_progress_handler(None, 0)
             if conn.in_transaction:
                 conn.rollback()

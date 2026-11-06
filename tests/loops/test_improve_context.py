@@ -352,3 +352,16 @@ def test_performance_report_reject_breakdown_omits_econ_window(tmp_path):
     ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
                                 allowed_backlog_ids=None)
     assert ctx["performance_report"]["reject_breakdown"] == {"risk_gate": 1}
+
+
+def test_performance_report_hold_rate_denominator_omits_econ_window_rejections(tmp_path):
+    c = connect(tmp_path / "t.db"); init_db(c)
+    cron = _mission(c, "cron")
+    _intent(c, cron, "hold")
+    _intent(c, cron, "open", "accepted")
+    for _ in range(4):
+        _intent(c, cron, "open", "rejected", "econ_window")
+    c.commit()
+    ctx = build_improve_context(c, settings=SETTINGS, now=NOW, root=tmp_path,
+                                allowed_backlog_ids=None)
+    assert ctx["performance_report"]["hold_rate"] == 0.5

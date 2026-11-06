@@ -818,6 +818,105 @@ def test_a_failing_measurement_keeps_the_last_value():
     conn.close()
 
 
+def test_a_connection_that_cannot_be_opened_is_retried_at_the_next_interval():
+    attempts, done = [], threading.Event()
+
+    def open_conn():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise sqlite3.OperationalError("unable to open database file")
+        return sqlite3.connect(":memory:", check_same_thread=False)
+
+    def measure(conn):
+        done.set()
+        return 9
+
+    m = _measurer(open_conn=open_conn, measure_fn=measure, interval_sec=0.01)
+    stop = threading.Event()
+    thread = threading.Thread(target=m.run, args=(stop,))
+    thread.start()
+    try:
+        assert done.wait(5)
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert len(attempts) == 3 and m.measurement[0] == 9
+
+
+def test_an_open_failure_is_recorded_as_failed_while_it_lasts():
+    seen = []
+    stop = threading.Event()
+
+    def open_conn():
+        seen.append(m.last_outcome)
+        if len(seen) == 2:
+            stop.set()
+        raise sqlite3.OperationalError("nope")
+
+    m = _measurer(open_conn=open_conn, interval_sec=0.01)
+    thread = threading.Thread(target=m.run, args=(stop,))
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive()
+    assert seen[1] == "failed" and m.measurement is None
+
+
+def test_an_unexpected_error_in_a_measurement_does_not_end_the_thread():
+    opened, done = [], threading.Event()
+
+    def open_conn():
+        opened.append(sqlite3.connect(":memory:", check_same_thread=False))
+        return opened[-1]
+
+    m = _measurer(open_conn=open_conn, measure_fn=lambda c: 3, interval_sec=0.01)
+    real = m.measure_once
+    calls = []
+
+    def flaky(conn, stop):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom outside the measurement")
+        result = real(conn, stop)
+        done.set()
+        return result
+
+    m.measure_once = flaky
+    stop = threading.Event()
+    thread = threading.Thread(target=m.run, args=(stop,))
+    thread.start()
+    try:
+        assert done.wait(5)
+    finally:
+        stop.set()
+        thread.join(5)
+    assert not thread.is_alive() and m.measurement[0] == 3
+    assert len(opened) == 2
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+
+
+def test_info_reports_outcome_elapsed_time_and_interval():
+    ticks = iter([100.0, 103.5])
+    m = _measurer(interval_sec=600.0, monotonic=lambda: next(ticks))
+    assert m.info() == {"last_outcome": None, "elapsed_sec": None, "interval_sec": 600.0}
+    conn = sqlite3.connect(":memory:")
+    assert m.measure_once(conn, threading.Event()) == "ok"
+    info = m.info()
+    assert info["last_outcome"] == "ok" and info["elapsed_sec"] == 3.5
+    conn.close()
+
+
+def test_elapsed_time_is_kept_for_an_aborted_measurement():
+    ticks = iter(range(0, 10**9, 7))
+    conn = sqlite3.connect(":memory:")
+    m = _measurer(measure_fn=lambda c: c.execute(_BIG_QUERY).fetchone()[0],
+                  time_limit_sec=100, monotonic=lambda: float(next(ticks)))
+    assert m.measure_once(conn, threading.Event()) == "aborted"
+    assert m.info()["last_outcome"] == "aborted" and m.info()["elapsed_sec"] >= 100
+    conn.close()
+
+
 def test_the_worker_itself_no_longer_measures():
     assert not hasattr(EconSliceWorker, "measurement")
 

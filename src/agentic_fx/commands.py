@@ -110,6 +110,11 @@ class Commands:
         # 操作 API と同じ ops / 決定レーンを共有するときに use_ops_service で
         # 注入する。未注入の間は従来の直接経路のまま動く。
         self.ops_service = None
+        self.econ_status_source = None
+
+    def use_econ_status_source(self, source) -> None:
+        """status 行に足す econ 集計の読み口 (共有 cache)。status 全体は走らせない。"""
+        self.econ_status_source = source
 
     def use_ops_service(self, ops_service) -> None:
         """操作 API と同じレーンを使うよう切り替える。
@@ -623,10 +628,10 @@ class Commands:
 
     def _econ_signal_lines(self) -> str:
         """signal 採否・abandoned・slice 容量・worker の行。取れなければ何も足さない。"""
-        if self.ops_service is None:
+        if self.econ_status_source is None:
             return ""
         try:
-            econ = self.ops_service.status(ShellCaller.SHELL).get("econ_signal")
+            econ = self.econ_status_source()
             lines = econ_signal_report.format_econ_lines(
                 econ if isinstance(econ, dict) else None)
         except Exception:  # noqa: BLE001 - 補助表示は status を止めない

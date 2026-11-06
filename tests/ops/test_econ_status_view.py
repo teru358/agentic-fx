@@ -1,6 +1,8 @@
 """status の econ_signal は許可投影を通り、ctl の表示に calendar と容量が出る。"""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agentic_fx.loops import econ_signal_report as esr
@@ -116,7 +118,7 @@ def test_values_outside_the_known_sets_or_ranges_are_dropped(ops_env):
     row = out["shadow"][0]
     assert (row["actor"], row["decision"], row["state"], row["result_code"],
             row["reject_code"], row["n"]) == (None,) * 6
-    assert out["decisions"]["by_kind"] == {"reject:system:econ_window": 2}
+    assert out["decisions"]["by_kind"] == {"reject:system:econ_window": 2, "other": 1}
     assert out["slice_capacity"]["rows"] is None
     assert out["slice_capacity"]["slice_bytes_measured_at"] is None
     assert out["abandoned"]["latest_day_start"] is None
@@ -169,7 +171,8 @@ def test_ctl_status_says_unmeasured_when_the_worker_has_not_measured(ops_env):
 def test_ctl_status_survives_a_broken_econ_section():
     assert "econ signal" not in client.format_status({"econ_signal": "junk"})
     text = client.format_status({"econ_signal": {"slice_worker": "alive",
-                                                 "decisions": {"total": 1}}})
+                                                 "decisions": {"total": 1,
+                                                               "by_kind": 5}}})
     assert "econ signal: 表示できません" in text
 
 
@@ -236,3 +239,100 @@ def test_web_copy_of_the_abandon_reasons_matches_the_daemon():
                   if isinstance(node, ast.Assign)
                   and node.targets[0].id == "ECON_ABANDON_REASONS")
     assert tuple(copied) == esr.ABANDON_REASONS
+
+
+# --- 未知の語・省略・測定の状態 ---------------------------------------------------------
+
+def test_unknown_decision_kinds_are_counted_as_other_and_the_sum_matches_the_total(ops_env):
+    econ = _econ(decisions={"total": 10, "by_kind": {
+        "accept": 3, "reject:llm:brand_new_code": 4, "mystery": 3}})
+    out = _status(ops_env, {"econ_signal": econ})["econ_signal"]["decisions"]
+    assert out["by_kind"] == {"accept": 3, "other": 7}
+    assert sum(out["by_kind"].values()) == out["total"]
+    text = client.format_status({"econ_signal": _status(
+        ops_env, {"econ_signal": econ})["econ_signal"]})
+    assert "その他=7" in text
+
+
+def test_shadow_groups_beyond_the_cap_are_counted_as_omitted(ops_env):
+    row = _econ()["shadow"][0]
+    out = _status(ops_env, {"econ_signal": _econ(shadow=[dict(row) for _ in range(70)])}
+                  )["econ_signal"]
+    assert len(out["shadow"]) == 64 and out["shadow_omitted"] == 6
+    few = _status(ops_env, {"econ_signal": _econ()})["econ_signal"]
+    assert few["shadow_omitted"] == 0
+    text = client.format_status({"econ_signal": out})
+    assert "shadow: 省略 6 組" in text
+
+
+def test_measurement_state_passes_the_projection_and_unknown_words_do_not(ops_env):
+    capacity = dict(_econ()["slice_capacity"], measure_outcome="aborted",
+                    measure_elapsed_sec=30.04, slice_bytes_stale=True)
+    out = _status(ops_env, {"econ_signal": _econ(slice_capacity=capacity)}
+                  )["econ_signal"]["slice_capacity"]
+    assert out["measure_outcome"] == "aborted"
+    assert out["measure_elapsed_sec"] == 30.0
+    assert out["slice_bytes_stale"] is True
+    bad = dict(capacity, measure_outcome="exploded", measure_elapsed_sec=-1,
+               slice_bytes_stale="yes")
+    out = _status(ops_env, {"econ_signal": _econ(slice_capacity=bad)}
+                  )["econ_signal"]["slice_capacity"]
+    assert (out["measure_outcome"], out["measure_elapsed_sec"],
+            out["slice_bytes_stale"]) == (None, None, None)
+
+
+# --- web の写しとの突き合わせ ----------------------------------------------------------
+
+def _web_constants():
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[2] / "afx-ops" / "afx_ops" / "web"
+              / "render.py").read_text(encoding="utf-8")
+    return {node.targets[0].id: ast.literal_eval(node.value)
+            for node in ast.parse(source).body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.isupper() | node.targets[0].id.startswith("_")
+            and isinstance(node.value, (ast.Tuple, ast.Constant))}
+
+
+def test_web_copies_of_the_daemon_vocabulary_match():
+    from agentic_fx.core import econ_window
+    from agentic_fx.ops import service as ops_service
+
+    web = _web_constants()
+    assert tuple(web["ECON_ABANDON_REASONS"]) == esr.ABANDON_REASONS
+    assert tuple(web["_CALENDAR_STATES"]) == econ_window.FRESHNESS_VALUES
+    assert set(web["_WORKER_STATES"]) == set(ops_service._ECON_WORKER_STATES)
+    assert set(web["_WORKER_STATES"]) - {"unknown"} == {
+        "alive", "stopped", "start_failed", "not_started"}
+    assert set(web["_LEVELS"]) == set(ops_service._ECON_LEVELS)
+    assert set(web["_MEASURE_OUTCOMES"]) == set(ops_service._ECON_MEASURE_OUTCOMES)
+    assert web["_OTHER_KIND"] == esr.OTHER_KIND
+    assert set(web["_MISSION_KEYS"]) <= {*esr.KNOWN_MISSION_TERMINALS, "running"}
+
+
+def test_web_capacity_keys_are_exactly_what_the_daemon_reports(tmp_path):
+    web = _web_constants()
+    plan = SimpleNamespace(rows=10, bytes=10**6, signals=SimpleNamespace(
+        value=1, producer=1, override=None, below_producer=False))
+    reported = set(esr.capacity_status(plan, rows=1, slice_bytes=1, db_path=tmp_path / "d.db",
+                                       free_bytes=1, base_bytes=0))
+    assert reported == set(web["_CAPACITY_KEYS"]) | {"capacity_override_below_producer"}
+
+
+def test_the_client_has_no_second_copy_of_the_calendar_words():
+    import ast
+    from pathlib import Path
+
+    from agentic_fx.core import econ_window
+
+    source = (Path(client.__file__)).read_text(encoding="utf-8")
+    words = set(econ_window.FRESHNESS_VALUES)
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            literal = {e.value for e in node.elts if isinstance(e, ast.Constant)}
+            assert not words <= literal, f"line {node.lineno}"
+    for word in econ_window.FRESHNESS_VALUES:
+        assert client._calendar_word({"freshness": word}) == word
+    assert client._calendar_word({"freshness": "bogus"}) == "unknown"
