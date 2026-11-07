@@ -1,4 +1,4 @@
-# 配備中 strategy の評価を修復後の履歴でやり直す — 設計 C2.3
+# 配備中 strategy の評価を修復後の履歴でやり直す — 設計 C2.4
 
 チケット: `redo-deployed-strategy-evaluation-after-time-repair` (保守 / 中)。関連: DST 設計 `2026-11-02-utc-time-rules-dst-design.md` §8 J2 (c)。
 
@@ -129,7 +129,7 @@ symlink が外れる前に「配備解除済み」とは表示しない (op の 
 |---|---|---|
 | `in_sample_view` (改善ループの成績面) | 対象外。条件は `(mission_outcome IS NULL OR mission_outcome <> 'reevaluation')` (NULL の行を落とさない) | 再評価は改善の試行ではない。改善ループの入力を変えない |
 | `baseline_monitor._adoption_windows` (採用時の holdout 期間) | 対象外 (NULL は残す) | 採用時の期間を再評価の期間で上書きしない |
-| `latest_in_sample_metrics` (get_signals の成績添付) | 承認済み再評価だけ。name は signal 行の `plugin` 列 (`tools/signal_tools.py:153,166`) を新しい引数で渡し、`(name, content_hash)` の最新承認が再評価ならその `run_ids` の pair の行、そうでなければ今の SQL | 根拠の差し替え (J1) を取引判断に見せる数値にも及ぼす |
+| `latest_in_sample_metrics` (get_signals の成績添付) | 承認済み再評価だけ。name は signal 行の `plugin` 列 (`tools/signal_tools.py:153,166`) を新しい引数で渡し、`(name, content_hash)` の最新承認が再評価ならその `run_ids` の pair の行、そうでなければ今の SQL。承認を読めない・その pair の行が無い・壊れているときは成績を添えない (再評価前の数値に戻さない) | 根拠の差し替え (J1) を取引判断に見せる数値にも及ぼす |
 | `find_matching_approved_metrics` (質検査) | 再評価全件を母集団に入れる | 修復後の履歴で回る候補の複製は修復後の数値でしか一致しない。既存も承認の status を問わない |
 | `baseline_monitor.monitor_summary` | 対象外 (`compare_mode="off"` で baseline 行を書かない) | — |
 | `family_attempt_projection` / 台帳 | 対象外 (台帳に行を作らない) | 試行に数えない |
@@ -222,3 +222,4 @@ symlink が外れる前に「配備解除済み」とは表示しない (op の 
 | 2026-11-07 | C2.1 | ops の retry を `retry_approval` へ振り分け (T1、§5-16)、通常 reject の `False → INVALID_STATE` を保つ、通知の回復保証を既存 disable の契約に限定、評価不能の行は生成済みの分だけ (2 ケースを別 test)、epoch 変更の受入条件を fixture と実修復に分ける | sol 閉鎖確認 (Important 1 + Minor 3) | — |
 | 2026-11-07 | C2.2 | `--all-deployed` の `not_strategy` は終了コードに数えない。payload の `previous` は `{approval_id, in_sample/holdout: {pair: {metrics, source: payload\|run\|unknown, run_id}}}`、`pairs` を持つ | T2 の実装で確定 | — |
 | 2026-11-07 | C2.3 | §3.7 に `baseline_monitor._adoption_windows` を追加。`--all-deployed` は配備中の strategy でない skipped (plain_plugin / not_approved / not_deployed / not_strategy) を終了コードに数えない | /code-review (T1+T2) | — |
+| 2026-11-07 | C2.4 | get_signals の成績は、再評価の承認を読めない・行が欠ける・壊れているとき再評価前の数値に戻さず添えない | 古い数値を今の成績として取引判断に渡さない | — |

@@ -62,7 +62,7 @@ def _approved_reevaluation(conn, name, run_id):
     return approval_id
 
 
-def test_a_broken_approval_row_leaves_the_earlier_numbers_in_place(tmp_path, caplog):
+def test_a_broken_approval_row_attaches_no_numbers_rather_than_the_earlier_ones(tmp_path, caplog):
     conn = connect(tmp_path / "t.db")
     init_db(conn)
     _run(conn, "approval", {"trades": 40, "pf": 1.3})
@@ -76,7 +76,7 @@ def test_a_broken_approval_row_leaves_the_earlier_numbers_in_place(tmp_path, cap
     with caplog.at_level("WARNING"):
         attached = _attached(conn)
 
-    assert attached["mine"] == {"trades": 40, "pf": 1.3}
+    assert attached["mine"] is None
     assert sum("reevaluation lookup failed" in r.getMessage() for r in caplog.records) == 1
 
 
@@ -103,3 +103,26 @@ def test_one_call_scans_the_approvals_once_per_plugin(tmp_path, monkeypatch):
     _attached(conn)
 
     assert sorted(calls) == ["mine", "other"]
+
+
+def test_a_re_evaluation_whose_row_is_missing_attaches_no_numbers(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    _run(conn, "approval", {"trades": 40, "pf": 1.3})
+    _approved_reevaluation(conn, "mine", 999_999)
+    _signal(conn, "mine")
+
+    assert _attached(conn)["mine"] is None
+
+
+def test_a_re_evaluation_whose_row_cannot_be_read_attaches_no_numbers(tmp_path):
+    conn = connect(tmp_path / "t.db")
+    init_db(conn)
+    _run(conn, "approval", {"trades": 40, "pf": 1.3})
+    new = _run(conn, "reevaluation", {"trades": 41, "pf": 0.9})
+    _approved_reevaluation(conn, "mine", new)
+    conn.execute("UPDATE backtest_runs SET metrics_json='{broken' WHERE id=?", (new,))
+    conn.commit()
+    _signal(conn, "mine")
+
+    assert _attached(conn)["mine"] is None

@@ -126,20 +126,20 @@ def test_run_ids_in_an_ordinary_approval_are_not_followed(conn):
     assert _latest(conn, name=NAME) == {"trades": 40, "pf": 1.3}
 
 
-def test_a_pair_the_re_evaluation_did_not_run_keeps_the_old_numbers(conn):
+def test_a_pair_the_re_evaluation_did_not_run_gets_no_numbers(conn):
     _run(conn, outcome="approval", metrics={"trades": 40, "pf": 1.3})
     new = _run(conn, outcome="reevaluation", pair="EURUSD", metrics={"trades": 7})
     _reevaluation(conn, new, pair="EURUSD")
 
-    assert _latest(conn, name=NAME) == {"trades": 40, "pf": 1.3}
+    assert _latest(conn, name=NAME) is None
 
 
-def test_a_run_id_that_names_another_identity_is_not_followed(conn):
+def test_a_run_id_that_names_another_identity_is_not_followed_and_gives_no_numbers(conn):
     _run(conn, outcome="approval", metrics={"trades": 40, "pf": 1.3})
     foreign = _run(conn, outcome="reevaluation", content="d" * 64, metrics={"trades": 99})
     _reevaluation(conn, foreign)
 
-    assert _latest(conn, name=NAME) == {"trades": 40, "pf": 1.3}
+    assert _latest(conn, name=NAME) is None
 
 
 # ------------------------------------------------------------------ find_matching_approved_metrics
