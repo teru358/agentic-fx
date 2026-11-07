@@ -1,16 +1,16 @@
 ---
 id: executor-pair-membership-guard
 title: 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い
-status: 実装中
+status: 是正済
 priority: 高
 opened: 2026-10-25
-closed: null
+closed: 2026-11-07
 related: [reference-symbols-as-indicator-inputs]
 kind: 不具合
 ---
 # [executor-pair-membership-guard] 発注経路に Order.pair ∈ settings.pairs の決定論的検査が無い
 
-**状態**: 実装中 / **優先**: 高 / **種別**: 不具合
+**状態**: 是正済 / **優先**: 高 / **種別**: 不具合
 
 ## 現象
 
@@ -22,8 +22,11 @@ kind: 不具合
 
 ## 修正内容
 
+- 2026-11-07: 参照系列の束 (main 3e78ea15) の T1 で実装済み。executor の open 経路 (_open / gather_open_snapshot / open_from_snapshot) が quote・spec・broker を呼ぶ前に Order.pair ∈ settings.pairs を検査し、外れは not_tradable_symbol (executor.py:546, :790)。2026-11-07 に tests/core/test_executor_membership.py ほか 52 件の緑を確認
+
 ## 経緯
 
 - 2026-10-25: 起票。
 - 2026-10-25: 種別: 不具合 — 種別を付与
 - 2026-10-28: 状態: 実装中 — 2026-10-28: 参照系列 T1 に含めて実装 (設計 2026-10-25-reference-series-design.md §2.1、AC-11)
+- 2026-11-07: 是正内容 — 参照系列の束 (main 3e78ea15) の T1 で実装済み。executor の open 経路 (_open / gather_open_snapshot / open_from_snapshot) が quote・spec・broker を呼ぶ前に Order.pair ∈ settings.pairs を検査し、外れは not_tradable_symbol (executor.py:546, :790)。2026-11-07 に tests/core/test_executor_membership.py ほか 52 件の緑を確認

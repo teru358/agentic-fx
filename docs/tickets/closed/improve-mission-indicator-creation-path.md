@@ -1,15 +1,15 @@
 ---
 id: improve-mission-indicator-creation-path
 title: 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突)
-status: 実装中
+status: 是正済
 priority: 中
 opened: 2026-10-25
-closed: null
+closed: 2026-11-07
 related: [improve-objective-filtered-signal-quality, improve-run-summary-for-humans]
 ---
 # [improve-mission-indicator-creation-path] 改善 mission に indicator 新設の経路を開く (規律 7 と方針の衝突)
 
-**状態**: 実装中 / **優先**: 中
+**状態**: 是正済 / **優先**: 中 / **種別**: 機能
 
 ## 現象
 
@@ -21,7 +21,10 @@ related: [improve-objective-filtered-signal-quality, improve-run-summary-for-hum
 
 ## 修正内容
 
+- 2026-11-07: 2026-10-25 に prompt と pin test を実装済み。AC-32 は本番で観測済み: 2026-10-25 以降、改善 mission が kind=indicator の候補を継続して提出している (承認依頼 #28〜#88 の間に indicator 50 本超、2026-11-07 時点)
+
 ## 経緯
 
 - 2026-10-25: 起票。
 - 2026-10-25: 状態: 実装中 — 2026-10-25: feedback spec v0.4 §9.5 で設計、prompt と pin test を実装 (terra)、判定 tests/loops + integration + 直下 2766 green。AC-32 (方針文だけで indicator 候補が出るか) は次の手動 improve と 10/31 週次で観測。本番反映は次の daemon 再起動 (prompt は起動時に読む)
+- 2026-11-07: 是正内容 — 2026-10-25 に prompt と pin test を実装済み。AC-32 は本番で観測済み: 2026-10-25 以降、改善 mission が kind=indicator の候補を継続して提出している (承認依頼 #28〜#88 の間に indicator 50 本超、2026-11-07 時点)

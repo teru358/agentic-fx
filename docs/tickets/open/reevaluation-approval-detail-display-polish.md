@@ -6,7 +6,7 @@ priority: 低
 kind: 保守
 opened: 2026-11-07
 closed: null
-related: [redo-deployed-strategy-evaluation-after-time-repair]
+related: [redo-deployed-strategy-evaluation-after-time-repair, backtest-scheduler-log-leak]
 ---
 # [reevaluation-approval-detail-display-polish] 再評価の承認詳細の数値が丸められず、旧形式の注記と分類「不明」が出る
 
@@ -25,3 +25,4 @@ related: [redo-deployed-strategy-evaluation-after-time-repair]
 ## 経緯
 
 - 2026-11-07: 起票。
+- 2026-11-07: 関連: [redo-deployed-strategy-evaluation-after-time-repair, backtest-scheduler-log-leak] — 4 点目 (換算の警告) は backtest-scheduler-log-leak に統合。残り 3 点の原因: (1) 再評価の表示 (ops/reevaluation_view.py:110-113、afx-ops reevaluation_text.py:59-63) が数値を丸めない (通常経路の ctl / web も丸めない、丸めは Discord の gate/render.py:104-108 だけ) (2) 再評価の依頼は facts_version を持たず approval_facts.py:367-386 で旧形式扱い (3) 決定後の分類は自分の approval id の切替 journal を前提にし (ops/change.py:122-124)、再評価の承認は journal を作らないので承認した 4 本 (#89・91・92・94) すべて不明
