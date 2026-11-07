@@ -1,6 +1,6 @@
 """gate の ViewModel を discord.py の persistent View へ写す。
 
-View の中身 (custom_id、label、破壊的操作か) は gate の ViewModel だけから作り、ここで補わない。
+View の中身 (custom_id、label、色の意味) は gate の ViewModel だけから作り、ここで補わない。
 View は timeout を持たない (期限は gate の確認 record が 10 分で決める)。button の callback は
 押された component と、この View を付けた投稿 (表示起点) を adapter へ渡すだけで、認可も
 状態遷移もしない。
@@ -18,11 +18,16 @@ from afx_ops.gate.types import ViewModel
 OnClick = Callable[[discord.Interaction], Awaitable[None]]
 
 
+_STYLES = {
+    "neutral": discord.ButtonStyle.secondary,
+    "positive": discord.ButtonStyle.success,
+    "destructive": discord.ButtonStyle.danger,
+}
+
+
 class _GateButton(discord.ui.Button):
-    def __init__(self, *, custom_id: str, label: str, destructive: bool, on_click: OnClick) -> None:
-        super().__init__(custom_id=custom_id, label=label,
-                         style=discord.ButtonStyle.danger if destructive
-                         else discord.ButtonStyle.secondary)
+    def __init__(self, *, custom_id: str, label: str, tone: str, on_click: OnClick) -> None:
+        super().__init__(custom_id=custom_id, label=label, style=_STYLES[tone])
         self._on_click = on_click
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -36,7 +41,7 @@ class GateView(discord.ui.View):
         super().__init__(timeout=None)
         for component in model.components:
             self.add_item(_GateButton(custom_id=component.custom_id, label=component.label,
-                                      destructive=component.destructive, on_click=on_click))
+                                      tone=component.tone, on_click=on_click))
 
     @property
     def custom_ids(self) -> frozenset[str]:
